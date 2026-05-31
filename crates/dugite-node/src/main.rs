@@ -564,12 +564,14 @@ async fn run_dump_snapshot(args: DumpSnapshotArgs) -> Result<()> {
         dugite_primitives::protocol_params::ProtocolParameters::mainnet_defaults();
 
     let mut byron_epoch_length: u64 = 0;
+    let mut byron_slot_duration_ms: u64 = 20_000; // default 20s; overridden by Byron genesis
     let mut byron_initial_funds: u64 = 0;
     if let Some(ref genesis_path) = node_config.byron_genesis_file {
         let genesis_path = config_dir.join(genesis_path);
         if let Ok((genesis, _hash)) = genesis::ByronGenesis::load_with_hash(&genesis_path) {
             let k = genesis.security_param();
             byron_epoch_length = 10 * k;
+            byron_slot_duration_ms = genesis.slot_duration_ms();
             // Sum initial fund distribution (nonAvvmBalances + avvmDistr)
             // These funds are distributed at genesis and must be subtracted
             // from reserves to match the Haskell reference implementation.
@@ -577,6 +579,7 @@ async fn run_dump_snapshot(args: DumpSnapshotArgs) -> Result<()> {
             info!(
                 k,
                 epoch_len = byron_epoch_length,
+                slot_duration_ms = byron_slot_duration_ms,
                 initial_funds = byron_initial_funds,
                 "Byron genesis loaded"
             );
@@ -712,14 +715,16 @@ async fn run_dump_snapshot(args: DumpSnapshotArgs) -> Result<()> {
     // Store Conway genesis init data on ledger for era-transition rules.
     ledger.conway_genesis_init = conway_genesis_init;
 
-    // Apply Shelley genesis configuration (epoch length, slot config, reserves)
+    // Apply Shelley genesis configuration (epoch length, reserves).
     // Must use set_epoch_length() (not direct field assignment) to compute the
     // correct stability windows (3k/f for Alonzo/Babbage, 4k/f for Conway+)
     // from the network's security parameter k.  With direct assignment the
     // windows default to mainnet values, which are larger than preview's epoch
     // length and cause candidate_nonce to never update.
+    // NOTE: set_slot_config() is called AFTER network_magic / shelley_transition_epoch
+    // are known (see below), so that the Shelley-anchored SlotConfig can be derived
+    // correctly (zero_slot = transition_epoch * byron_epoch_size, not 0).
     if let Some(ref sg) = shelley_genesis_opt {
-        ledger.set_slot_config(sg.slot_config());
         ledger.set_epoch_length(sg.epoch_length, sg.security_param);
         ledger.update_quorum = sg.update_quorum;
         // reserves = maxLovelaceSupply - initial fund distribution (Byron genesis)
@@ -768,6 +773,15 @@ async fn run_dump_snapshot(args: DumpSnapshotArgs) -> Result<()> {
     let shelley_transition_epoch =
         crate::node::epoch::shelley_transition_epoch_for_magic(network_magic);
     ledger.set_shelley_transition(shelley_transition_epoch, byron_epoch_length);
+    // Apply Plutus SlotConfig anchored at the Shelley hard-fork boundary.
+    // Must happen after shelley_transition_epoch is computed (needs network_magic).
+    if let Some(ref sg) = shelley_genesis_opt {
+        ledger.set_slot_config(sg.slot_config(
+            shelley_transition_epoch,
+            byron_epoch_length,
+            byron_slot_duration_ms,
+        ));
+    }
     info!(
         network_magic,
         shelley_transition_epoch, byron_epoch_length, "HFC epoch configuration set"

@@ -445,19 +445,62 @@ impl ShelleyGenesis {
         params.d = float_to_rational(gp.decentralisation_param);
     }
 
-    /// Derive the SlotConfig for Plutus time conversion from Shelley genesis.
+    /// Derive the SlotConfig for Plutus time conversion, anchored at the
+    /// Shelley hard-fork boundary.
     ///
-    /// system_start is an ISO-8601 timestamp (e.g. "2022-10-25T00:00:00Z").
-    /// On mainnet, Shelley started at a later slot; for testnets zero_slot is typically 0.
-    pub fn slot_config(&self) -> SlotConfig {
-        let zero_time = chrono::DateTime::parse_from_rfc3339(&self.system_start)
+    /// Cardano's Plutus `slotToPOSIXTime` (and the Ouroboros HardFork history
+    /// `slotToWallclock`) translate Shelley-era slots relative to the Shelley
+    /// era's *own* start, NOT relative to the Byron network genesis.  For
+    /// mainnet, Byron used 20-second slots from 2017-09-23; the Shelley hard
+    /// fork occurred at epoch 208, absolute slot 4,492,800 (2020-07-29
+    /// 21:44:51 UTC).  A linear conversion anchored at the Byron network start
+    /// with zero_slot=0 places a Shelley slot roughly 2.75 years too early,
+    /// causing every time/deadline-checking script to spuriously fail.
+    ///
+    /// Cross-validated against Haskell `Ouroboros.Consensus.HardFork.History
+    /// .Qry.slotToWallclock`: the formula uses `boundTime eraStart` as the
+    /// anchor — i.e. the era's start boundary, not the network genesis.
+    ///
+    /// Parameters:
+    /// - `shelley_transition_epoch`: The epoch at which Byron ended and Shelley
+    ///   started (e.g. 208 for mainnet, 4 for preprod, 0 for preview/devnets).
+    /// - `byron_epoch_size`: Slots per Byron epoch (10 * security_param k, e.g.
+    ///   21600 for mainnet/preprod, 0 for preview since Byron never existed).
+    /// - `byron_slot_duration_ms`: Duration of a Byron slot in milliseconds
+    ///   (20000 for mainnet/preprod, unused when transition_epoch == 0).
+    ///
+    /// For networks where `shelley_transition_epoch == 0` (preview, devnets),
+    /// the Shelley era starts at slot 0 so this collapses to the simpler
+    /// `(system_start, 0)` anchor, which is correct.
+    ///
+    /// Mainnet verification:
+    ///   zero_slot = 208 * 21600 = 4_492_800
+    ///   zero_time = 1_506_203_091_000 + 4_492_800 * 20_000 = 1_596_059_091_000
+    pub fn slot_config(
+        &self,
+        shelley_transition_epoch: u64,
+        byron_epoch_size: u64,
+        byron_slot_duration_ms: u64,
+    ) -> SlotConfig {
+        let network_start_ms = chrono::DateTime::parse_from_rfc3339(&self.system_start)
             .map(|dt| dt.timestamp_millis() as u64)
             .unwrap_or(0);
-        // slot_length in genesis is in seconds; SlotConfig needs milliseconds
+
+        // First absolute slot of the Shelley era.
+        // For instant-transition networks (epoch 0) this is 0.
+        let zero_slot = shelley_transition_epoch.saturating_mul(byron_epoch_size);
+
+        // Wall-clock time (POSIX ms) at the Shelley era start.
+        // For instant-transition networks zero_slot==0 so zero_time==network_start_ms.
+        let zero_time =
+            network_start_ms.saturating_add(zero_slot.saturating_mul(byron_slot_duration_ms));
+
+        // slot_length in genesis is in seconds; SlotConfig needs milliseconds.
         let slot_length_ms = (self.slot_length * 1000) as u32;
+
         SlotConfig {
             zero_time,
-            zero_slot: 0,
+            zero_slot,
             slot_length: slot_length_ms,
             // Per-tx safe-zone horizon is injected by the tx validator
             // (`LedgerTxValidator::validate`) using
@@ -2003,5 +2046,121 @@ mod tests {
             msg.contains("securityParam"),
             "Error must mention securityParam, got: {msg}"
         );
+    }
+
+    // ── SlotConfig anchoring tests ────────────────────────────────────────────
+
+    /// Build a minimal ShelleyGenesis for slot_config tests.
+    fn shelley_genesis_for_slot_config(system_start: &str, slot_length_s: u64) -> ShelleyGenesis {
+        ShelleyGenesis {
+            network_magic: 764824073,
+            network_id: "Mainnet".to_string(),
+            system_start: system_start.to_string(),
+            active_slots_coeff: 0.05,
+            security_param: 2160,
+            epoch_length: 432000,
+            slot_length: slot_length_s,
+            max_lovelace_supply: 45_000_000_000_000_000,
+            max_k_e_s_evolutions: 62,
+            slots_per_k_e_s_period: 129600,
+            update_quorum: 5,
+            protocol_params: ShelleyGenesisProtocolParams {
+                min_fee_a: 44,
+                min_fee_b: 155381,
+                max_block_body_size: 65536,
+                max_tx_size: 16384,
+                max_block_header_size: 1100,
+                key_deposit: 2000000,
+                pool_deposit: 500000000,
+                e_max: 18,
+                n_opt: 150,
+                a0: 0.3,
+                rho: 0.003,
+                tau: 0.2,
+                decentralisation_param: 0.0,
+                min_pool_cost: 340000000,
+                min_u_tx_o_value: 1000000,
+                protocol_version: ProtocolVersion { major: 8, minor: 0 },
+            },
+            gen_delegs: Default::default(),
+            initial_funds: Default::default(),
+            staking: None,
+        }
+    }
+
+    /// Mainnet: systemStart = "2017-09-23T21:44:51Z" (Byron network start).
+    /// Shelley hard fork occurred at epoch 208, slot 4_492_800.
+    /// Byron epoch size = 21_600 slots (10 * k=2160).
+    /// Byron slot duration = 20_000 ms.
+    ///
+    /// Expected Shelley anchor:
+    ///   zero_slot = 208 * 21_600 = 4_492_800
+    ///   zero_time = 1_506_203_091_000 + 4_492_800 * 20_000 = 1_596_059_091_000
+    ///
+    /// This matches the known-correct SlotConfig::default() mainnet constants and
+    /// the proof-of-correctness test in crates/dugite-uplc/tests/zz_slotcfg_probe.rs.
+    #[test]
+    fn slot_config_mainnet_anchors_at_shelley_start() {
+        let sg = shelley_genesis_for_slot_config("2017-09-23T21:44:51Z", 1);
+        // Mainnet: k=2160, epoch_size=10*k=21600, Byron slot=20s, transition epoch 208
+        let shelley_transition_epoch = 208u64;
+        let byron_epoch_size = 21_600u64; // 10 * k
+        let byron_slot_duration_ms = 20_000u64; // 20 seconds
+
+        let sc = sg.slot_config(
+            shelley_transition_epoch,
+            byron_epoch_size,
+            byron_slot_duration_ms,
+        );
+
+        assert_eq!(
+            sc.zero_slot, 4_492_800,
+            "zero_slot must be the first Shelley slot (208 * 21600)"
+        );
+        assert_eq!(
+            sc.zero_time, 1_596_059_091_000,
+            "zero_time must be the Shelley hard-fork POSIX time in ms \
+             (2020-07-29 21:44:51 UTC), not the Byron network start"
+        );
+        assert_eq!(sc.slot_length, 1_000, "Shelley slot length must be 1000 ms");
+    }
+
+    /// Preview testnet: shelley_transition_epoch=0, so the Shelley era starts
+    /// at slot 0 and zero_time == system_start.  Byron params are irrelevant.
+    #[test]
+    fn slot_config_preview_zero_transition() {
+        // Preview system_start = "2022-10-25T00:00:00Z" = 1666656000_000 ms
+        let sg = shelley_genesis_for_slot_config("2022-10-25T00:00:00Z", 1);
+        let sc = sg.slot_config(0, 0, 20_000);
+
+        assert_eq!(
+            sc.zero_slot, 0,
+            "Preview: zero_slot must be 0 (instant Shelley transition)"
+        );
+        assert_eq!(
+            sc.zero_time, 1_666_656_000_000,
+            "Preview: zero_time must equal system_start ms"
+        );
+        assert_eq!(sc.slot_length, 1_000);
+    }
+
+    /// Preprod testnet: shelley_transition_epoch=4, byron_epoch_size=21600,
+    /// byron_slot_duration_ms=20000. system_start = "2022-06-01T00:00:00Z".
+    ///
+    ///   zero_slot = 4 * 21600 = 86400
+    ///   zero_time = 1654041600000 + 86400 * 20000 = 1654041600000 + 1728000000 = 1655769600000
+    ///
+    /// Cross-check: Shelley hard fork on preprod = 2022-06-21 00:00:00 UTC = 1655769600 s.
+    #[test]
+    fn slot_config_preprod_anchors_at_shelley_start() {
+        let sg = shelley_genesis_for_slot_config("2022-06-01T00:00:00Z", 1);
+        let sc = sg.slot_config(4, 21_600, 20_000);
+
+        assert_eq!(sc.zero_slot, 86_400, "Preprod: zero_slot = 4 * 21600");
+        assert_eq!(
+            sc.zero_time, 1_655_769_600_000,
+            "Preprod: zero_time must be 2022-06-21 00:00:00 UTC in ms"
+        );
+        assert_eq!(sc.slot_length, 1_000);
     }
 }
