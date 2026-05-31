@@ -35,7 +35,7 @@ use crate::populate_gov::{
 use crate::script_context::TxInfoV3;
 use crate::tx_info_populate::{
     datums_to_plutus, inputs_to_txininfos, mint_to_plutus, output_to_plutus,
-    required_signers_to_plutus_padded, tx_hash_to_array, valid_range_to_posix,
+    required_signers_to_plutus_padded, sort_inputs, tx_hash_to_array, valid_range_to_posix,
 };
 use dugite_primitives::transaction::{
     Transaction as PrimTransaction, TransactionInput as PrimTxIn, TransactionOutput as PrimTxOut,
@@ -55,8 +55,12 @@ pub fn populate_tx_info_v3(
     resolved: &[(PrimTxIn, PrimTxOut, Vec<u8>)],
     slot_config: &SlotConfig,
 ) -> Result<TxInfoV3, PhaseTwoError> {
-    let inputs = inputs_to_txininfos(&tx.body.inputs, resolved)?;
-    let reference_inputs = inputs_to_txininfos(&tx.body.reference_inputs, resolved)?;
+    // Both `inputsTxBodyL` and `refInputsTxBodyL` are `Set TxIn` in
+    // cardano-ledger — presented in ascending `Ord TxIn` order.
+    let sorted = sort_inputs(&tx.body.inputs);
+    let inputs = inputs_to_txininfos(&sorted, resolved)?;
+    let sorted_refs = sort_inputs(&tx.body.reference_inputs);
+    let reference_inputs = inputs_to_txininfos(&sorted_refs, resolved)?;
     let outputs: Vec<_> = tx
         .body
         .outputs

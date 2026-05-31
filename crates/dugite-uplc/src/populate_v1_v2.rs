@@ -18,7 +18,7 @@ use crate::populate_gov::certificates_to_plutus;
 use crate::script_context::{TxCert, TxInfoV1, TxInfoV2};
 use crate::tx_info_populate::{
     datums_to_plutus, inputs_to_txininfos, mint_to_plutus, output_to_plutus,
-    required_signers_to_plutus_padded, tx_hash_to_array, valid_range_to_posix,
+    required_signers_to_plutus_padded, sort_inputs, tx_hash_to_array, valid_range_to_posix,
     withdrawals_to_plutus,
 };
 use dugite_primitives::transaction::{
@@ -38,7 +38,12 @@ pub fn populate_tx_info_v1(
     resolved: &[(PrimTxIn, PrimTxOut, Vec<u8>)],
     slot_config: &SlotConfig,
 ) -> Result<TxInfoV1, PhaseTwoError> {
-    let inputs = inputs_to_txininfos(&tx.body.inputs, resolved)?;
+    // cardano-ledger's `inputsTxBodyL :: Set TxIn` is presented to Plutus
+    // validators in ascending `Ord TxIn` order (TxId raw bytes, then TxIx).
+    // The on-wire CBOR `array` has no ordering guarantee; sort here so
+    // `txInfoInputs` is byte-exact with Haskell.
+    let sorted = sort_inputs(&tx.body.inputs);
+    let inputs = inputs_to_txininfos(&sorted, resolved)?;
     let outputs: Vec<_> = tx
         .body
         .outputs
@@ -80,8 +85,12 @@ pub fn populate_tx_info_v2(
     resolved: &[(PrimTxIn, PrimTxOut, Vec<u8>)],
     slot_config: &SlotConfig,
 ) -> Result<TxInfoV2, PhaseTwoError> {
-    let inputs = inputs_to_txininfos(&tx.body.inputs, resolved)?;
-    let reference_inputs = inputs_to_txininfos(&tx.body.reference_inputs, resolved)?;
+    // Both `inputsTxBodyL` and `refInputsTxBodyL` are `Set TxIn` in
+    // cardano-ledger — presented in ascending `Ord TxIn` order.
+    let sorted = sort_inputs(&tx.body.inputs);
+    let inputs = inputs_to_txininfos(&sorted, resolved)?;
+    let sorted_refs = sort_inputs(&tx.body.reference_inputs);
+    let reference_inputs = inputs_to_txininfos(&sorted_refs, resolved)?;
     let outputs: Vec<_> = tx
         .body
         .outputs
