@@ -101,7 +101,7 @@ async-trait = "0.1"
 # when the RPC server is disabled.
 tonic = { version = "0.12", features = ["transport", "tls", "gzip"] }
 tonic-web = "0.12"
-tonic-reflection = "0.12"
+tonic-reflection = "0.14"
 prost = "0.13"
 prost-types = "0.13"
 tonic-build = { version = "0.12", features = ["prost"] }
