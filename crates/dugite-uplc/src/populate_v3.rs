@@ -74,7 +74,10 @@ pub fn populate_tx_info_v3(
         slot_config,
     )?;
     let signatories = required_signers_to_plutus_padded(&tx.body.required_signers);
-    let datums = datums_to_plutus(&tx.witness_set.plutus_data)?;
+    let datums = datums_to_plutus(
+        &tx.witness_set.plutus_data,
+        tx.witness_set.raw_plutus_data_cbor.as_deref(),
+    )?;
     let votes = voting_procedures_to_plutus(&tx.body.voting_procedures);
     let proposal_procedures = proposals_to_plutus(&tx.body.proposal_procedures)?;
     // `certificates` are observable from `TxInfo.txCerts` (V3-only) and
