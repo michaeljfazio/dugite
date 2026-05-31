@@ -121,6 +121,40 @@ fn encode_input_cbor(input: &dugite_primitives::transaction::TransactionInput) -
     buf
 }
 
+/// Build the standalone tx CBOR `[body, witness_set, is_valid, aux]` that the
+/// phase-2 evaluator decodes, for a tx whose full `raw_cbor` was not preserved.
+///
+/// **Prefers the ORIGINAL `raw_body_cbor` + `raw_witness_cbor` wire bytes**
+/// (captured per-tx by the block decoder) so that non-canonically-encoded
+/// witness datums survive verbatim. Many on-chain datums use the general
+/// `Constr` form (CBOR tag 102) for small constructor indices, which does NOT
+/// round-trip through `encode_transaction` (it canonicalises to tag 121). A
+/// datum hash is `blake2b_256` over the datum's *original* bytes, so a
+/// re-encode changes the hash and phase-2 datum resolution fails with
+/// "datum not found for V1/V2 spending redeemer" — the dominant phase-2
+/// divergence during Alonzo sync (the Alonzo block decoder sets `raw_cbor =
+/// None` but does capture `raw_body_cbor`/`raw_witness_cbor`).
+///
+/// Auxiliary data is emitted as CBOR `null` — phase-2 does not consume it (the
+/// body's `auxiliary_data_hash` is already inside `raw_body_cbor`). Falls back
+/// to a full `encode_transaction` re-encode only when the raw spans are
+/// unavailable (e.g. a tx round-tripped through the LSM store, which drops the
+/// `#[serde(skip)]` raw fields).
+fn reassemble_phase_two_tx_cbor(tx: &Transaction) -> Vec<u8> {
+    match (tx.raw_body_cbor.as_ref(), tx.raw_witness_cbor.as_ref()) {
+        (Some(body), Some(wits)) => {
+            let mut buf = Vec::with_capacity(body.len() + wits.len() + 4);
+            buf.push(0x84); // array(4): [body, witness_set, is_valid, aux]
+            buf.extend_from_slice(body);
+            buf.extend_from_slice(wits);
+            buf.push(if tx.is_valid { 0xf5 } else { 0xf4 }); // is_valid bool
+            buf.push(0xf6); // auxiliary_data = null (unused by phase-2)
+            buf
+        }
+        _ => dugite_serialization::encode_transaction(tx),
+    }
+}
+
 /// Evaluate Plutus scripts in a transaction using the uplc CEK machine
 ///
 /// `max_tx_ex_units` is `(cpu_steps, mem_units)` — this matches the uplc
@@ -163,7 +197,7 @@ pub fn evaluate_plutus_scripts(
     let tx_cbor: &[u8] = match tx.raw_cbor.as_ref() {
         Some(bytes) => bytes.as_slice(),
         None => {
-            owned_cbor = dugite_serialization::encode_transaction(tx);
+            owned_cbor = reassemble_phase_two_tx_cbor(tx);
             &owned_cbor
         }
     };
@@ -326,7 +360,7 @@ pub fn evaluate_plutus_scripts_with_reports(
     let tx_cbor: &[u8] = match tx.raw_cbor.as_ref() {
         Some(bytes) => bytes.as_slice(),
         None => {
-            owned_cbor = dugite_serialization::encode_transaction(tx);
+            owned_cbor = reassemble_phase_two_tx_cbor(tx);
             &owned_cbor
         }
     };
@@ -412,6 +446,56 @@ pub fn has_plutus_scripts(tx: &Transaction) -> bool {
 mod tests {
     use super::*;
     use dugite_primitives::hash::Hash32;
+
+    fn hexd(s: &str) -> Vec<u8> {
+        let s = s.trim();
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Phase-2 must be fed the ORIGINAL tx wire bytes, not a re-encode. Real
+    /// mainnet Alonzo tx 3cb59645… carries a witness datum encoded in the
+    /// general `Constr` form (CBOR tag 102) whose hash is `a44f0b1a…`. When the
+    /// tx is round-tripped through `encode_transaction` (the old fallback) that
+    /// datum is canonicalised to tag 121, its hash changes, and phase-2 datum
+    /// resolution fails ("datum not found"). `reassemble_phase_two_tx_cbor` must
+    /// preserve the original bytes via `raw_body_cbor`/`raw_witness_cbor` so the
+    /// datum hash survives.
+    #[test]
+    fn reassemble_phase_two_preserves_noncanonical_datum() {
+        let needed = "a44f0b1a7efd4d212e5dad5bcff2050be0e309840bfafc3b716aac7bc48e9ab7";
+        let tx_cbor = hexd(include_str!("../test_data/phase2_datum_tag102_tx.hex"));
+        // Decode standalone; the decoder captures raw_body_cbor + raw_witness_cbor.
+        let mut tx = dugite_serialization::decode_transaction(6, &tx_cbor).unwrap();
+        assert!(tx.raw_body_cbor.is_some() && tx.raw_witness_cbor.is_some());
+        // Simulate the live block-apply path where the full raw_cbor is absent.
+        tx.raw_cbor = None;
+
+        let datum_present = |cbor: &[u8]| -> bool {
+            let tx2 = dugite_serialization::decode_transaction(6, cbor).unwrap();
+            let raw = tx2
+                .witness_set
+                .raw_plutus_data_cbor
+                .expect("plutus_data present");
+            dugite_serialization::plutus_data_element_spans(&raw)
+                .unwrap()
+                .iter()
+                .any(|s| dugite_primitives::hash::blake2b_256(s).to_hex() == needed)
+        };
+
+        // The fix: reassembly from original body+witness preserves the datum.
+        assert!(
+            datum_present(&reassemble_phase_two_tx_cbor(&tx)),
+            "reassembled tx must preserve the tag-102 datum hash"
+        );
+        // The bug it replaces: a full re-encode canonicalises and loses it.
+        assert!(
+            !datum_present(&dugite_serialization::encode_transaction(&tx)),
+            "encode_transaction must mangle the non-canonical datum (proves the bug)"
+        );
+    }
 
     #[test]
     fn test_encode_input_cbor() {
