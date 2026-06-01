@@ -34,10 +34,12 @@
 use dugite_uplc::machine::cost::BudgetTracker;
 use dugite_uplc::machine::env::Env;
 use dugite_uplc::machine::step::evaluate_with_budget;
+use dugite_uplc::machine::value::rc_into_term;
 use dugite_uplc::machine::Value;
 use dugite_uplc::syn::{parse_program, ParseError};
 use dugite_uplc::term::Term;
 use dugite_uplc::Program;
+use std::rc::Rc;
 
 /// Sentinel strings used by the Haskell conformance harness for
 /// negative tests (`PlutusConformance.Common.shownParseError` /
@@ -195,29 +197,34 @@ fn readback(value: Value) -> Result<Term, String> {
             // Entering the Lam binder bumps the local depth to 1: Var(1)
             // inside `body` is the lambda's own parameter (not in `env`),
             // and Var(i) for i > 1 indexes the captured environment.
-            Ok(Term::Lam(Box::new(quote_term(*body, &env, 1)?)))
+            // `Rc::try_unwrap` moves the Term out if this is the sole
+            // reference; otherwise clones once — same semantics, avoids
+            // the heap indirection.
+            let body_term = dugite_uplc::machine::value::rc_into_term(body);
+            Ok(Term::Lam(Rc::new(quote_term(body_term, &env, 1)?)))
         }
         Value::Delay { body, env } => {
             // `Delay` does not introduce a binder, so depth starts at 0:
             // every Var(i) in `body` indexes into `env` directly.
-            Ok(Term::Delay(Box::new(quote_term(*body, &env, 0)?)))
+            let body_term = dugite_uplc::machine::value::rc_into_term(body);
+            Ok(Term::Delay(Rc::new(quote_term(body_term, &env, 0)?)))
         }
         Value::Builtin { id, forces, args } => {
             // Reconstruct as `Force...Force (builtin id) arg0 arg1 ...`.
             let mut t = Term::Builtin(id);
             for _ in 0..forces {
-                t = Term::Force(Box::new(t));
+                t = Term::Force(Rc::new(t));
             }
             for arg in args {
                 let arg_term = readback(arg)?;
-                t = Term::App(Box::new(t), Box::new(arg_term));
+                t = Term::App(Rc::new(t), Rc::new(arg_term));
             }
             Ok(t)
         }
         Value::Constr { tag, args } => {
-            let mut out = Vec::with_capacity(args.len());
+            let mut out: Vec<Rc<Term>> = Vec::with_capacity(args.len());
             for a in args {
-                out.push(readback(a)?);
+                out.push(Rc::new(readback(a)?));
             }
             Ok(Term::Constr { tag, args: out })
         }
@@ -245,20 +252,20 @@ fn quote_term(term: Term, env: &Env, depth: u64) -> Result<Term, String> {
                 readback(captured)?
             }
         }
-        Term::Lam(body) => Term::Lam(Box::new(quote_term(*body, env, depth + 1)?)),
+        Term::Lam(body) => Term::Lam(Rc::new(quote_term(rc_into_term(body), env, depth + 1)?)),
         Term::App(f, a) => Term::App(
-            Box::new(quote_term(*f, env, depth)?),
-            Box::new(quote_term(*a, env, depth)?),
+            Rc::new(quote_term(rc_into_term(f), env, depth)?),
+            Rc::new(quote_term(rc_into_term(a), env, depth)?),
         ),
         Term::Const(c) => Term::Const(c),
-        Term::Delay(body) => Term::Delay(Box::new(quote_term(*body, env, depth)?)),
-        Term::Force(body) => Term::Force(Box::new(quote_term(*body, env, depth)?)),
+        Term::Delay(body) => Term::Delay(Rc::new(quote_term(rc_into_term(body), env, depth)?)),
+        Term::Force(body) => Term::Force(Rc::new(quote_term(rc_into_term(body), env, depth)?)),
         Term::Error => Term::Error,
         Term::Builtin(id) => Term::Builtin(id),
         Term::Constr { tag, args } => {
-            let mut out = Vec::with_capacity(args.len());
+            let mut out: Vec<Rc<Term>> = Vec::with_capacity(args.len());
             for a in args {
-                out.push(quote_term(a, env, depth)?);
+                out.push(Rc::new(quote_term(rc_into_term(a), env, depth)?));
             }
             Term::Constr { tag, args: out }
         }
@@ -266,10 +273,10 @@ fn quote_term(term: Term, env: &Env, depth: u64) -> Result<Term, String> {
             scrutinee,
             branches,
         } => {
-            let scrutinee = Box::new(quote_term(*scrutinee, env, depth)?);
-            let mut out = Vec::with_capacity(branches.len());
+            let scrutinee = Rc::new(quote_term(rc_into_term(scrutinee), env, depth)?);
+            let mut out: Vec<Rc<Term>> = Vec::with_capacity(branches.len());
             for b in branches {
-                out.push(quote_term(b, env, depth)?);
+                out.push(Rc::new(quote_term(rc_into_term(b), env, depth)?));
             }
             Term::Case {
                 scrutinee,

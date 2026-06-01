@@ -21,6 +21,7 @@
 //! `#[ignore]` attribute should be removed.
 
 use dugite_uplc::{Constant, Data, Program, Term};
+use std::rc::Rc;
 
 /// Inner flat bytes (post-CBOR-unwrap) of the canonical Aiken-built
 /// PlutusV3 always-true validator. Source:
@@ -67,8 +68,8 @@ fn cek_reaches_body_no_var_lookup_failure() {
         .expect("decode canonical Aiken V3 always-true");
     let stub_ctx = Data::Constr(0, vec![Data::Constr(0, vec![]); 4]);
     let applied = Term::App(
-        Box::new(p.term),
-        Box::new(Term::Const(Constant::Data(stub_ctx))),
+        Rc::new(p.term),
+        Rc::new(Term::Const(Constant::Data(stub_ctx))),
     );
 
     let err = dugite_uplc::machine::step::evaluate(applied).expect_err(

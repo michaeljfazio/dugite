@@ -3,6 +3,7 @@
 use crate::machine::env::Env;
 use crate::machine::value::Value;
 use crate::term::Term;
+use std::rc::Rc;
 
 #[derive(Debug, Clone)]
 pub enum Frame {
@@ -11,7 +12,7 @@ pub enum Frame {
         env: Env,
     },
     AwaitFunTerm {
-        argument: Term,
+        argument: Rc<Term>,
         env: Env,
     },
     Force,
@@ -32,7 +33,7 @@ pub enum Frame {
     /// the SoP arg-count is small).
     Constr {
         tag: u64,
-        pending: Vec<Term>,
+        pending: Vec<Rc<Term>>,
         evaluated: Vec<Value>,
         env: Env,
     },
@@ -40,7 +41,7 @@ pub enum Frame {
     /// `Constr`; we pick a branch from `branches` indexed by the
     /// constr tag, apply the constr args, and evaluate.
     Cases {
-        branches: Vec<Term>,
+        branches: Vec<Rc<Term>>,
         env: Env,
     },
 }

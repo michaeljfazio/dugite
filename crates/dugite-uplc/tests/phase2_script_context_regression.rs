@@ -62,6 +62,7 @@ use dugite_uplc::script_context::{
     ScriptPurpose, StakingCredential, TxInInfo, TxInfoV1, TxInfoV2, TxInfoV3, TxOut, TxOutRef,
 };
 use num_bigint::BigInt;
+use std::rc::Rc;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Bug A: ADA policy key
@@ -265,7 +266,7 @@ fn flat_round_trips_data_constant() {
     let data_val = Data::I(BigInt::from(42i64));
     let program = Program {
         version: (1, 0, 0),
-        term: Term::Lam(Box::new(Term::Const(Constant::Data(data_val.clone())))),
+        term: Term::Lam(Rc::new(Term::Const(Constant::Data(data_val.clone())))),
     };
 
     let flat = program.to_flat().expect("encode Data constant program");
@@ -275,7 +276,8 @@ fn flat_round_trips_data_constant() {
     let Term::Lam(body) = decoded.term else {
         panic!("expected Lam");
     };
-    let Term::Const(Constant::Data(d)) = *body else {
+    // body is Rc<Term>; clone to get an owned Term for pattern matching.
+    let Term::Const(Constant::Data(d)) = (*body).clone() else {
         panic!("expected Const(Data(_))");
     };
     assert_eq!(d, data_val, "Data constant must survive flat round-trip");

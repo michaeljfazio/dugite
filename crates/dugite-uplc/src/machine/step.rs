@@ -2,9 +2,10 @@
 
 use crate::machine::context::{Frame, Kont};
 use crate::machine::env::Env;
-use crate::machine::value::Value;
+use crate::machine::value::{rc_into_term, Value};
 use crate::term::Term;
 use crate::UplcError;
+use std::rc::Rc;
 
 #[derive(Debug)]
 pub enum State {
@@ -81,16 +82,27 @@ fn compute(term: Term, env: Env, mut kont: Kont) -> Result<State, UplcError> {
             Ok(State::Return { value: v, kont })
         }
         Term::Lam(body) => {
-            let v = Value::Lambda { body, env };
+            // body is already Rc<Term> (iter5: Term sub-terms are Rc-wrapped).
+            // Clone the Rc (O(1) refcount bump) to put the body into the
+            // Lambda value; no allocation or copy of the term tree.
+            let v = Value::Lambda {
+                body: Rc::clone(&body),
+                env,
+            };
             Ok(State::Return { value: v, kont })
         }
         Term::App(fun, arg) => {
+            // fun and arg are Rc<Term>; cloning each is O(1) (refcount bump).
+            // Frame::AwaitFunTerm holds Rc<Term>, and compute needs Term.
+            // rc_into_term on an Rc<Term> where the Term's sub-terms are ALSO Rc
+            // is O(1): the fallback clone copies only the discriminant + inner Rc
+            // pointers (no recursive heap allocation).
             kont.push(Frame::AwaitFunTerm {
-                argument: *arg,
+                argument: Rc::clone(&arg),
                 env: env.clone(),
             })?;
             Ok(State::Compute {
-                term: *fun,
+                term: rc_into_term(fun),
                 env,
                 kont,
             })
@@ -100,13 +112,20 @@ fn compute(term: Term, env: Env, mut kont: Kont) -> Result<State, UplcError> {
             kont,
         }),
         Term::Delay(body) => Ok(State::Return {
-            value: Value::Delay { body, env },
+            // body is already Rc<Term>; clone is O(1).
+            value: Value::Delay {
+                body: Rc::clone(&body),
+                env,
+            },
             kont,
         }),
         Term::Force(body) => {
+            // rc_into_term: if sole owner (refcount=1), moves term out for free;
+            // otherwise clones the Term — but since sub-terms are Rc, the clone
+            // is O(1) (only enum discriminant + Rc pointer copies, no recursion).
             kont.push(Frame::Force)?;
             Ok(State::Compute {
-                term: *body,
+                term: rc_into_term(body),
                 env,
                 kont,
             })
@@ -150,10 +169,11 @@ fn compute(term: Term, env: Env, mut kont: Kont) -> Result<State, UplcError> {
                 });
             }
             // Otherwise: push a Constr frame and evaluate the first arg.
-            let mut pending: Vec<Term> = args.into_iter().rev().collect();
+            // args is Vec<Rc<Term>>; rev().collect() is O(n) pointer copies.
+            let mut pending: Vec<Rc<Term>> = args.into_iter().rev().collect();
             // SAFETY: just confirmed args.is_empty() == false, so pop
             // is Some. Surfaced as Internal for the no-panic invariant.
-            let first = pending.pop().ok_or_else(|| {
+            let first_rc = pending.pop().ok_or_else(|| {
                 UplcError::Internal("Constr args empty after non-empty check".into())
             })?;
             kont.push(Frame::Constr {
@@ -163,7 +183,9 @@ fn compute(term: Term, env: Env, mut kont: Kont) -> Result<State, UplcError> {
                 env: env.clone(),
             })?;
             Ok(State::Compute {
-                term: first,
+                // rc_into_term: O(1) if sole owner; O(1) clone otherwise
+                // (sub-terms are Rc, so clone is shallow).
+                term: rc_into_term(first_rc),
                 env,
                 kont,
             })
@@ -175,12 +197,14 @@ fn compute(term: Term, env: Env, mut kont: Kont) -> Result<State, UplcError> {
             // Evaluate the scrutinee; save the branches for the
             // `Cases` frame to dispatch on once the scrutinee value
             // (a `Constr`) lands.
+            // branches: Vec<Rc<Term>> — moved into frame for free (Rc pointers).
             kont.push(Frame::Cases {
                 branches,
                 env: env.clone(),
             })?;
             Ok(State::Compute {
-                term: *scrutinee,
+                // rc_into_term: O(1) if sole owner; O(1) clone otherwise.
+                term: rc_into_term(scrutinee),
                 env,
                 kont,
             })
@@ -205,7 +229,9 @@ fn return_compute(
                 env: env.clone(),
             })?;
             Ok(State::Compute {
-                term: argument,
+                // argument is Rc<Term>; rc_into_term is O(1) since sub-terms
+                // are Rc (fallback clone is shallow even if refcount > 1).
+                term: rc_into_term(argument),
                 env,
                 kont,
             })
@@ -223,7 +249,7 @@ fn return_compute(
             // remain, evaluate the next one; else emit the Constr
             // value.
             evaluated.push(value);
-            if let Some(next) = pending.pop() {
+            if let Some(next_rc) = pending.pop() {
                 kont.push(Frame::Constr {
                     tag,
                     pending,
@@ -231,7 +257,8 @@ fn return_compute(
                     env: env.clone(),
                 })?;
                 Ok(State::Compute {
-                    term: next,
+                    // rc_into_term: O(1) since sub-terms are Rc.
+                    term: rc_into_term(next_rc),
                     env,
                     kont,
                 })
@@ -349,7 +376,9 @@ fn return_compute(
             }
             // Pick the branch term by tag. Mismatched tag = script
             // error (Haskell `MissingCaseBranch`).
-            let branch = branches
+            // Clone the selected branch Rc — O(1) refcount bump regardless
+            // of the branch term's size (sub-terms are Rc).
+            let branch_rc = branches
                 .get(tag as usize)
                 .ok_or(UplcError::ScriptError)?
                 .clone();
@@ -360,7 +389,8 @@ fn return_compute(
                 kont.push(Frame::ApplyValue { argument: arg })?;
             }
             Ok(State::Compute {
-                term: branch,
+                // rc_into_term: O(1) move if sole owner, O(1) shallow clone otherwise.
+                term: rc_into_term(branch_rc),
                 env,
                 kont,
             })
@@ -377,7 +407,14 @@ fn apply(
 ) -> Result<State, UplcError> {
     match function {
         Value::Lambda { body, env } => Ok(State::Compute {
-            term: *body,
+            // rc_into_term: moves the body out if uniquely owned (O(1)),
+            // otherwise clones once. The env node still holds a reference
+            // when this lambda was looked up from the env, so for closures
+            // called more than once the clone happens at apply time
+            // (bounded: once per apply site) rather than at lookup time
+            // (once per call). Net savings: N-1 deep-clone cycles for N
+            // calls to the same lambda from the same env.
+            term: rc_into_term(body),
             env: env.extend(argument),
             kont,
         }),
@@ -404,7 +441,7 @@ fn force_value(
 ) -> Result<State, UplcError> {
     match value {
         Value::Delay { body, env } => Ok(State::Compute {
-            term: *body,
+            term: rc_into_term(body),
             env,
             kont,
         }),
@@ -459,8 +496,8 @@ mod tests {
     fn identity_lambda_applied_returns_arg() {
         // (lam x. x) 7  ⇒  7
         let id_app = Term::App(
-            Box::new(Term::Lam(Box::new(Term::Var(1)))),
-            Box::new(int_term(7)),
+            Rc::new(Term::Lam(Rc::new(Term::Var(1)))),
+            Rc::new(int_term(7)),
         );
         assert_eq!(evaluate(id_app).unwrap(), int_val(7));
     }
@@ -468,10 +505,10 @@ mod tests {
     #[test]
     fn const_function_applied_returns_first() {
         // (lam x. (lam y. x)) 1 2  ⇒  1
-        let k = Term::Lam(Box::new(Term::Lam(Box::new(Term::Var(2)))));
+        let k = Term::Lam(Rc::new(Term::Lam(Rc::new(Term::Var(2)))));
         let applied = Term::App(
-            Box::new(Term::App(Box::new(k), Box::new(int_term(1)))),
-            Box::new(int_term(2)),
+            Rc::new(Term::App(Rc::new(k), Rc::new(int_term(1)))),
+            Rc::new(int_term(2)),
         );
         assert_eq!(evaluate(applied).unwrap(), int_val(1));
     }
@@ -479,19 +516,19 @@ mod tests {
     #[test]
     fn delay_then_force_recovers_value() {
         // (force (delay 42))  ⇒  42
-        let dt = Term::Force(Box::new(Term::Delay(Box::new(int_term(42)))));
+        let dt = Term::Force(Rc::new(Term::Delay(Rc::new(int_term(42)))));
         assert_eq!(evaluate(dt).unwrap(), int_val(42));
     }
 
     #[test]
     fn force_of_non_delay_errors() {
-        let bad = Term::Force(Box::new(int_term(42)));
+        let bad = Term::Force(Rc::new(int_term(42)));
         assert!(matches!(evaluate(bad), Err(UplcError::Internal(_))));
     }
 
     #[test]
     fn apply_non_function_errors() {
-        let bad = Term::App(Box::new(int_term(1)), Box::new(int_term(2)));
+        let bad = Term::App(Rc::new(int_term(1)), Rc::new(int_term(2)));
         assert!(matches!(evaluate(bad), Err(UplcError::Internal(_))));
     }
 
@@ -506,7 +543,7 @@ mod tests {
     // ── Builtin dispatch (UPLC-4 part 2) ───────────────────────────────────
 
     fn app(f: Term, a: Term) -> Term {
-        Term::App(Box::new(f), Box::new(a))
+        Term::App(Rc::new(f), Rc::new(a))
     }
 
     #[test]
@@ -554,7 +591,7 @@ mod tests {
         let t = app(
             app(
                 app(
-                    Term::Force(Box::new(Term::Builtin(crate::term::BuiltinId::IfThenElse))),
+                    Term::Force(Rc::new(Term::Builtin(crate::term::BuiltinId::IfThenElse))),
                     Term::Const(Constant::Bool(true)),
                 ),
                 int_term(1),
@@ -599,7 +636,7 @@ mod tests {
         // Constr 3 [1, 2]
         let t = Term::Constr {
             tag: 3,
-            args: vec![int_term(1), int_term(2)],
+            args: vec![Rc::new(int_term(1)), Rc::new(int_term(2))],
         };
         let v = evaluate(t).unwrap();
         assert_eq!(
@@ -614,10 +651,10 @@ mod tests {
     #[test]
     fn constr_arg_evaluates_to_lambda() {
         // Constr 0 [(lam x. x)]
-        let id = Term::Lam(Box::new(Term::Var(1)));
+        let id = Term::Lam(Rc::new(Term::Var(1)));
         let t = Term::Constr {
             tag: 0,
-            args: vec![id.clone()],
+            args: vec![Rc::new(id.clone())],
         };
         let v = evaluate(t).unwrap();
         match v {
@@ -638,8 +675,8 @@ mod tests {
             args: vec![],
         };
         let case = Term::Case {
-            scrutinee: Box::new(scrutinee),
-            branches: vec![int_term(42), int_term(99)],
+            scrutinee: Rc::new(scrutinee),
+            branches: vec![Rc::new(int_term(42)), Rc::new(int_term(99))],
         };
         let v = evaluate(case).unwrap();
         assert_eq!(v, int_val(99));
@@ -651,13 +688,13 @@ mod tests {
         // i.e. the branch is a 2-arg lambda returning the second arg.
         let scrutinee = Term::Constr {
             tag: 0,
-            args: vec![int_term(1), int_term(2)],
+            args: vec![Rc::new(int_term(1)), Rc::new(int_term(2))],
         };
         // (lam (lam (var 1)))  — index 1 = innermost (= second arg)
-        let branch = Term::Lam(Box::new(Term::Lam(Box::new(Term::Var(1)))));
+        let branch = Term::Lam(Rc::new(Term::Lam(Rc::new(Term::Var(1)))));
         let case = Term::Case {
-            scrutinee: Box::new(scrutinee),
-            branches: vec![branch],
+            scrutinee: Rc::new(scrutinee),
+            branches: vec![Rc::new(branch)],
         };
         let v = evaluate(case).unwrap();
         assert_eq!(v, int_val(2));
@@ -670,12 +707,12 @@ mod tests {
         // index 2 from inside the inner lambda).
         let scrutinee = Term::Constr {
             tag: 0,
-            args: vec![int_term(10), int_term(20)],
+            args: vec![Rc::new(int_term(10)), Rc::new(int_term(20))],
         };
-        let branch = Term::Lam(Box::new(Term::Lam(Box::new(Term::Var(2)))));
+        let branch = Term::Lam(Rc::new(Term::Lam(Rc::new(Term::Var(2)))));
         let case = Term::Case {
-            scrutinee: Box::new(scrutinee),
-            branches: vec![branch],
+            scrutinee: Rc::new(scrutinee),
+            branches: vec![Rc::new(branch)],
         };
         let v = evaluate(case).unwrap();
         assert_eq!(v, int_val(10));
@@ -689,8 +726,8 @@ mod tests {
             args: vec![],
         };
         let case = Term::Case {
-            scrutinee: Box::new(scrutinee),
-            branches: vec![int_term(1), int_term(2)],
+            scrutinee: Rc::new(scrutinee),
+            branches: vec![Rc::new(int_term(1)), Rc::new(int_term(2))],
         };
         assert!(matches!(evaluate(case), Err(UplcError::ScriptError)));
     }
@@ -701,8 +738,8 @@ mod tests {
         // into branches by the scrutinee value; 42 is out of range
         // for a single-branch list → ScriptError.
         let case = Term::Case {
-            scrutinee: Box::new(int_term(42)),
-            branches: vec![int_term(99)],
+            scrutinee: Rc::new(int_term(42)),
+            branches: vec![Rc::new(int_term(99))],
         };
         assert!(matches!(evaluate(case), Err(UplcError::ScriptError)));
     }
@@ -712,8 +749,8 @@ mod tests {
         // ByteString is not enumerable by case → Internal error.
         use crate::term::Constant;
         let case = Term::Case {
-            scrutinee: Box::new(Term::Const(Constant::ByteString(vec![1, 2]))),
-            branches: vec![int_term(99)],
+            scrutinee: Rc::new(Term::Const(Constant::ByteString(vec![1, 2]))),
+            branches: vec![Rc::new(int_term(99))],
         };
         assert!(matches!(evaluate(case), Err(UplcError::Internal(_))));
     }

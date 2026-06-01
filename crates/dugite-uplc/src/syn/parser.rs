@@ -11,6 +11,7 @@ use crate::data::Data;
 use crate::term::{Constant, Term, TypeTag};
 use crate::Program;
 use num_bigint::BigInt;
+use std::rc::Rc;
 
 /// Stateful cursor over the source plus a binder stack for named
 /// → De-Bruijn conversion.
@@ -138,7 +139,7 @@ impl<'a> Parser<'a> {
                 }
                 Some(_) => {
                     let arg = self.parse_term()?;
-                    term = Term::App(Box::new(term), Box::new(arg));
+                    term = Term::App(Rc::new(term), Rc::new(arg));
                 }
                 None => {
                     return Err(ParseError::at(
@@ -185,17 +186,17 @@ impl<'a> Parser<'a> {
         let body = self.parse_term();
         self.binders.pop();
         let body = body?;
-        Ok(Term::Lam(Box::new(body)))
+        Ok(Term::Lam(Rc::new(body)))
     }
 
     fn parse_delay(&mut self) -> Result<Term, ParseError> {
         let body = self.parse_term()?;
-        Ok(Term::Delay(Box::new(body)))
+        Ok(Term::Delay(Rc::new(body)))
     }
 
     fn parse_force(&mut self) -> Result<Term, ParseError> {
         let body = self.parse_term()?;
-        Ok(Term::Force(Box::new(body)))
+        Ok(Term::Force(Rc::new(body)))
     }
 
     fn parse_builtin(&mut self) -> Result<Term, ParseError> {
@@ -223,7 +224,7 @@ impl<'a> Parser<'a> {
             if matches!(self.peek_char(), Some(')')) {
                 break;
             }
-            args.push(self.parse_term()?);
+            args.push(Rc::new(self.parse_term()?));
         }
         Ok(Term::Constr { tag, args })
     }
@@ -242,10 +243,10 @@ impl<'a> Parser<'a> {
             if matches!(self.peek_char(), Some(')')) {
                 break;
             }
-            branches.push(self.parse_term()?);
+            branches.push(Rc::new(self.parse_term()?));
         }
         Ok(Term::Case {
-            scrutinee: Box::new(scrutinee),
+            scrutinee: Rc::new(scrutinee),
             branches,
         })
     }
