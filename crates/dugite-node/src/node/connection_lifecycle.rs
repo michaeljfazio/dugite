@@ -1420,7 +1420,18 @@ impl ConnectionLifecycleManager {
                 // so ChainSync/TxSubmission data arrives before the first KeepAlive.
                 //
                 // We delay 2 seconds to ensure Hot protocols are active first.
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                //
+                // CANCELLATION: The sleep must be guarded so that warm→cold demotion
+                // (stop_warm_protocols / shutdown) completes within spsDeactivateTimeout
+                // (5 s) even when cancellation fires during the startup delay.
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        debug!(%addr, "keepalive task cancelled during startup delay");
+                        return;
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                }
 
                 // Per-peer RTT channel: each pong sends the RTT here, which the
                 // spawned forwarder relays to the main loop with the peer address.
@@ -1649,26 +1660,40 @@ impl ConnectionLifecycleManager {
         Box::new(move |channel, cancel| {
             Box::pin(async move {
                 info!(%addr, "chainsync task started");
-                let result = super::sync::chainsync_client_task(
-                    channel,
-                    addr,
-                    candidate_chains,
-                    chain_db,
-                    ledger_state,
-                    ledger_view,
-                    ledger_tip_rx,
-                    consensus_seed,
-                    eagerly_validated_headers,
-                    byron_epoch_length,
-                    security_param,
-                    active_slots_coeff,
-                    metrics,
-                    cancel.clone(),
-                    gsm_event_tx,
-                    peer_intersection_established,
-                    peer_manager,
-                )
-                .await;
+                // CANCELLATION: Wrap the entire chainsync_client_task call in a
+                // select so that demotion (cancel.cancelled()) exits promptly even
+                // when the task is blocked on a bare channel.recv().await during
+                // the pre-loop intersection-finding phase (try_find_intersect).
+                // The main message loop already has per-recv cancel checks, but
+                // Phase 1/2 (build_known_points → try_find_intersect retries)
+                // do not — without this outer guard those awaits can block for
+                // the full spsDeactivateTimeout (5 s) if the peer is slow.
+                let result = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        debug!(%addr, "chainsync task cancelled before/during intersection");
+                        return;
+                    }
+                    r = super::sync::chainsync_client_task(
+                        channel,
+                        addr,
+                        candidate_chains,
+                        chain_db,
+                        ledger_state,
+                        ledger_view,
+                        ledger_tip_rx,
+                        consensus_seed,
+                        eagerly_validated_headers,
+                        byron_epoch_length,
+                        security_param,
+                        active_slots_coeff,
+                        metrics,
+                        cancel.clone(),
+                        gsm_event_tx,
+                        peer_intersection_established,
+                        peer_manager,
+                    ) => r
+                };
                 // Report any non-cancel failure to the peer manager so the
                 // governor can demote-and-re-promote the peer — without this,
                 // a chainsync death (bearer close, decode error, stale
@@ -2353,15 +2378,21 @@ impl ConnectionLifecycleManager {
         Box::new(move |mut channel, cancel| {
             Box::pin(async move {
                 let source = MempoolTxSource::new(mempool);
+                // Pass cancel directly into run() so every inner await — including
+                // channel.recv() and the blocking-mode mempool poll loop — is cancel-
+                // aware.  run() returns Ok(()) on cancellation so we don't need the
+                // outer select! anymore, but we keep it as defence-in-depth for any
+                // future await paths added to run() that might miss the token.
                 tokio::select! {
-                    result = dugite_network::TxSubmissionClient::run(&mut channel, &source) => {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        debug!(%addr, "txsubmission2 task cancelled (outer guard)");
+                    }
+                    result = dugite_network::TxSubmissionClient::run(&mut channel, &source, &cancel) => {
                         match result {
                             Ok(()) => debug!(%addr, "txsubmission2 client completed"),
                             Err(e) => debug!(%addr, "txsubmission2 client error: {e}"),
                         }
-                    }
-                    _ = cancel.cancelled() => {
-                        debug!(%addr, "txsubmission2 task cancelled");
                     }
                 }
             })
@@ -4703,6 +4734,281 @@ mod tests {
             result.is_ok(),
             "blockfetch task must exit within 1s of cancellation during recv_batch inner loop; \
              elapsed={elapsed:?}"
+        );
+    }
+
+    // ── KeepAlive task prompt-cancellation tests ──────────────────────────────
+    //
+    // Root cause: the initial 2-second startup delay in `make_keepalive_task`
+    // was a bare `tokio::time::sleep(2s).await` with no cancel-token guard.
+    // When warm→cold demotion (or full shutdown) fired during this window,
+    // `stop_warm_protocols` had to wait the full 2 s before the KeepAlive
+    // client started and could honour its own cancel logic.
+    //
+    // Fix: the startup sleep is now wrapped in:
+    //   `select! { biased; _ = cancel.cancelled() => return; _ = sleep(2s) => {} }`
+
+    /// KeepAlive task must exit within 1 second when cancelled during its
+    /// initial 2-second startup delay.
+    ///
+    /// Without the fix, cancel during the bare `sleep(2s)` made the task
+    /// block for the remainder of that window, always tripping the
+    /// `stop_warm_protocols` timeout and forcing a TCP close instead of
+    /// a graceful warm channel recovery.
+    #[tokio::test(start_paused = false)]
+    async fn keepalive_task_cancels_promptly_during_startup_delay() {
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+
+        let lc = ConnectionLifecycleManager::new_for_test();
+        let addr: std::net::SocketAddr = "10.0.0.3:3001".parse().unwrap();
+
+        // Build a channel that never delivers messages (so the task parks on recv).
+        let (channel, _ingress_tx, _egress_rx) = make_mux_channel_pair();
+
+        let cancel = CancellationToken::new();
+        let task_fn = lc.make_keepalive_task(addr);
+
+        // Spawn the task — it will start sleeping for 2 seconds immediately.
+        let cancel_clone = cancel.clone();
+        let handle = tokio::spawn(task_fn(channel, cancel_clone));
+
+        // Give the task just enough time to enter the startup sleep.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Fire cancellation — must exit well under the 2s sleep duration.
+        let cancel_start = std::time::Instant::now();
+        cancel.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle).await;
+        let elapsed = cancel_start.elapsed();
+
+        assert!(
+            result.is_ok(),
+            "keepalive task must exit within 1s of cancellation during startup delay; \
+             elapsed={elapsed:?} (2s sleep was un-guarded before fix)"
+        );
+    }
+
+    // ── ChainSync task prompt-cancellation tests ──────────────────────────────
+    //
+    // Root cause: `chainsync_client_task` has cancel checks in its main message
+    // loop, but the pre-loop Phase 1/2 (intersection finding via bare
+    // `channel.recv().await` in `try_find_intersect`) did not check the token.
+    // If cancel fired during intersection finding, the task blocked until the
+    // peer responded (potentially seconds or until TCP timeout).
+    //
+    // Fix: `make_chainsync_task` now wraps the entire `chainsync_client_task`
+    // call in `tokio::select! { biased; _ = cancel.cancelled() => return; r = ... => r }`.
+
+    /// ChainSync task must exit within 1 second when cancelled while blocked
+    /// on `channel.recv()` during intersection finding (Phase 2).
+    ///
+    /// The channel ingress is permanently closed (no peer response) so the task
+    /// blocks immediately on the first `try_find_intersect` recv. The outer
+    /// select in `make_chainsync_task` must unblock it when cancel fires.
+    ///
+    /// NOTE: Because the chainsync task first sends `MsgFindIntersect` and then
+    /// awaits a response, the channel.recv() in `try_find_intersect` will fail
+    /// with a channel-closed error when the ingress sender is dropped — which
+    /// already causes a quick exit. This test verifies that cancel also provides
+    /// prompt exit independent of channel closure, by using a half-open channel
+    /// (egress open, ingress sender held but sends no data).
+    #[tokio::test(start_paused = false)]
+    async fn chainsync_task_cancels_promptly_during_intersection() {
+        use dugite_network::mux::channel::MuxChannel;
+        use dugite_network::mux::Direction;
+        use std::sync::{atomic::AtomicUsize, Arc};
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+        use tokio_util::sync::CancellationToken;
+
+        let lc = ConnectionLifecycleManager::new_for_test();
+        let addr: std::net::SocketAddr = "10.0.0.4:3001".parse().unwrap();
+
+        // Build a channel: egress works (so MsgFindIntersect can be sent),
+        // but ingress sender is held without sending — task blocks on recv.
+        let (egress_tx, _egress_rx) =
+            mpsc::channel::<(u16, Direction, tokio_util::bytes::Bytes)>(64);
+        let (ingress_tx, ingress_rx) = mpsc::channel::<tokio_util::bytes::Bytes>(64);
+        let channel = MuxChannel::new(
+            2, // ChainSync protocol ID
+            Direction::InitiatorDir,
+            egress_tx,
+            ingress_rx,
+            64 * 1024,
+            Arc::new(AtomicUsize::new(0)),
+        );
+
+        let cancel = CancellationToken::new();
+        let task_fn = lc.make_chainsync_task(addr);
+
+        // Spawn the task — it will:
+        //   1. Build known points (fast, no I/O)
+        //   2. Send MsgFindIntersect (fast, egress works)
+        //   3. Block on channel.recv() waiting for MsgIntersectFound
+        let cancel_clone = cancel.clone();
+        let handle = tokio::spawn(task_fn(channel, cancel_clone));
+
+        // Wait for the task to reach the recv() inside try_find_intersect.
+        // MsgFindIntersect is sent synchronously before the first recv.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Fire cancellation — outer select in make_chainsync_task must unblock recv.
+        let cancel_start = std::time::Instant::now();
+        cancel.cancel();
+
+        // Keep ingress_tx alive past the cancel so the channel isn't already
+        // closed (we want to test cancel, not channel-close early exit).
+        let result = tokio::time::timeout(Duration::from_secs(1), handle).await;
+        let elapsed = cancel_start.elapsed();
+        drop(ingress_tx);
+
+        assert!(
+            result.is_ok(),
+            "chainsync task must exit within 1s of cancellation during intersection recv; \
+             elapsed={elapsed:?} (pre-loop awaits were un-guarded before fix)"
+        );
+    }
+
+    // ── TxSubmission2 task prompt-cancellation tests ──────────────────────────
+    //
+    // The outer `tokio::select!` in `make_txsubmission_task` already provided
+    // cancellation for the top-level `TxSubmissionClient::run()` future, but
+    // the two inner blocking awaits were not individually cancel-aware:
+    //   1. `channel.recv().await` — waiting for MsgRequestTxIds / MsgRequestTxs
+    //   2. The blocking-mode mempool poll (500 ms sleep when notified=None)
+    //
+    // Fix: `TxSubmissionClient::run()` now accepts a `CancellationToken` and
+    // guards both awaits with `select! { biased; _ = cancel.cancelled() => return Ok(()); ... }`.
+    // The outer select in `make_txsubmission_task` is kept as defence-in-depth.
+
+    /// TxSubmission2 task must exit within 1 second when cancelled while
+    /// blocked on `channel.recv()` waiting for `MsgRequestTxIds`.
+    ///
+    /// The channel sends `MsgInit` (fast) then waits for the server to request
+    /// tx IDs. The ingress sender is held but sends no messages — task blocks.
+    #[tokio::test(start_paused = false)]
+    async fn txsubmission_task_cancels_promptly_during_recv() {
+        use dugite_network::mux::channel::MuxChannel;
+        use dugite_network::mux::Direction;
+        use std::sync::{atomic::AtomicUsize, Arc};
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+        use tokio_util::sync::CancellationToken;
+
+        let lc = ConnectionLifecycleManager::new_for_test();
+        let addr: std::net::SocketAddr = "10.0.0.5:3001".parse().unwrap();
+
+        // Egress works (MsgInit will be sent); ingress held but silent.
+        let (egress_tx, _egress_rx) =
+            mpsc::channel::<(u16, Direction, tokio_util::bytes::Bytes)>(64);
+        let (ingress_tx, ingress_rx) = mpsc::channel::<tokio_util::bytes::Bytes>(64);
+        let channel = MuxChannel::new(
+            4, // TxSubmission2 protocol ID
+            Direction::InitiatorDir,
+            egress_tx,
+            ingress_rx,
+            1_000_000,
+            Arc::new(AtomicUsize::new(0)),
+        );
+
+        let cancel = CancellationToken::new();
+        let task_fn = lc.make_txsubmission_task(addr);
+
+        let cancel_clone = cancel.clone();
+        let handle = tokio::spawn(task_fn(channel, cancel_clone));
+
+        // Give the task time to send MsgInit and enter channel.recv().
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Fire cancellation.
+        let cancel_start = std::time::Instant::now();
+        cancel.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle).await;
+        let elapsed = cancel_start.elapsed();
+        drop(ingress_tx);
+
+        assert!(
+            result.is_ok(),
+            "txsubmission2 task must exit within 1s of cancellation during channel.recv(); \
+             elapsed={elapsed:?}"
+        );
+    }
+
+    /// TxSubmission2 task must exit within 1 second when cancelled while
+    /// blocked in the blocking-mode mempool poll loop (empty mempool,
+    /// blocking=true `MsgRequestTxIds` received, no Notify — 500ms sleep path).
+    ///
+    /// This exercises the inner `tokio::time::sleep(500ms)` in the blocking
+    /// mempool wait that previously had no cancel arm.
+    #[tokio::test(start_paused = false)]
+    async fn txsubmission_task_cancels_promptly_during_blocking_poll() {
+        use dugite_network::mux::channel::MuxChannel;
+        use dugite_network::mux::Direction;
+        use dugite_network::protocol::txsubmission::{encode_message, TxSubmissionMessage};
+        use std::sync::{atomic::AtomicUsize, Arc};
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+        use tokio_util::sync::CancellationToken;
+
+        let lc = ConnectionLifecycleManager::new_for_test();
+        let addr: std::net::SocketAddr = "10.0.0.6:3001".parse().unwrap();
+
+        let (egress_tx, mut egress_rx) =
+            mpsc::channel::<(u16, Direction, tokio_util::bytes::Bytes)>(64);
+        let (ingress_tx, ingress_rx) = mpsc::channel::<tokio_util::bytes::Bytes>(64);
+        let channel = MuxChannel::new(
+            4,
+            Direction::InitiatorDir,
+            egress_tx,
+            ingress_rx,
+            1_000_000,
+            Arc::new(AtomicUsize::new(0)),
+        );
+
+        let cancel = CancellationToken::new();
+        let task_fn = lc.make_txsubmission_task(addr);
+
+        let cancel_clone = cancel.clone();
+        let handle = tokio::spawn(task_fn(channel, cancel_clone));
+
+        // Consume MsgInit from egress.
+        let _init = tokio::time::timeout(Duration::from_secs(2), egress_rx.recv())
+            .await
+            .expect("MsgInit must arrive within 2s");
+
+        // Send a blocking MsgRequestTxIds with empty mempool → task enters
+        // the inner polling loop (no Notify, so 500ms sleep path).
+        let req = encode_message(&TxSubmissionMessage::MsgRequestTxIds {
+            blocking: true,
+            ack_count: 0,
+            req_count: 10,
+        });
+        ingress_tx
+            .send(tokio_util::bytes::Bytes::from(req))
+            .await
+            .expect("ingress send failed");
+
+        // Give the task time to enter the inner blocking loop.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Fire cancellation — must exit promptly (no 500ms sleep wait).
+        let cancel_start = std::time::Instant::now();
+        cancel.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle).await;
+        let elapsed = cancel_start.elapsed();
+
+        assert!(
+            result.is_ok(),
+            "txsubmission2 task must exit within 1s of cancellation during blocking mempool poll; \
+             elapsed={elapsed:?} (500ms sleep was un-guarded before fix)"
         );
     }
 }
