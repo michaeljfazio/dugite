@@ -606,34 +606,35 @@ mod tests {
     fn build_script_cbor(uplc_src: &str) -> Vec<u8> {
         use dugite_uplc::term::{Constant, Term};
         use dugite_uplc::Program;
+        use std::rc::Rc;
         let (version, term) = match uplc_src {
             // V1/V2 always-succeeds: 3 lambdas around a Unit constant.
             "(program 1.0.0 (lam _ (lam _ (lam _ (con unit ())))))" => (
                 (1, 0, 0),
-                Term::Lam(Box::new(Term::Lam(Box::new(Term::Lam(Box::new(
+                Term::Lam(Rc::new(Term::Lam(Rc::new(Term::Lam(Rc::new(
                     Term::Const(Constant::Unit),
                 )))))),
             ),
             // V3 always-succeeds: 1 lambda around a Unit constant.
             "(program 1.1.0 (lam _ (con unit ())))" => {
-                ((1, 1, 0), Term::Lam(Box::new(Term::Const(Constant::Unit))))
+                ((1, 1, 0), Term::Lam(Rc::new(Term::Const(Constant::Unit))))
             }
             // V2 single-arg "always-succeeds" (used by tests that confirm
             // the V3 Unit-check doesn't bleed into V2 evaluation).
             "(program 1.0.0 (lam _ (con unit ())))" => {
-                ((1, 0, 0), Term::Lam(Box::new(Term::Const(Constant::Unit))))
+                ((1, 0, 0), Term::Lam(Rc::new(Term::Const(Constant::Unit))))
             }
             // V3 returns integer 42 — used by tests that verify the V3
             // non-Unit-return rejection path.
             "(program 1.1.0 (lam _ (con integer 42)))" => (
                 (1, 1, 0),
-                Term::Lam(Box::new(Term::Const(Constant::Integer(42.into())))),
+                Term::Lam(Rc::new(Term::Const(Constant::Integer(42.into())))),
             ),
             // V1/V2 returns integer 42 — used by tests that verify
             // non-Error returns are accepted for V1/V2.
             "(program 1.0.0 (lam _ (lam _ (lam _ (con integer 42)))))" => (
                 (1, 0, 0),
-                Term::Lam(Box::new(Term::Lam(Box::new(Term::Lam(Box::new(
+                Term::Lam(Rc::new(Term::Lam(Rc::new(Term::Lam(Rc::new(
                     Term::Const(Constant::Integer(42.into())),
                 )))))),
             ),

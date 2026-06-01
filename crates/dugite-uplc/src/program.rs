@@ -88,6 +88,7 @@ impl Program {
 mod tests {
     use super::*;
     use crate::term::{Constant, Term};
+    use std::rc::Rc;
 
     #[test]
     fn round_trips_through_flat_with_error_body() {
@@ -116,8 +117,8 @@ mod tests {
         let p = Program {
             version: (1, 1, 0),
             term: Term::App(
-                Box::new(Term::Lam(Box::new(Term::Var(0)))),
-                Box::new(Term::Const(Constant::Integer(num_bigint::BigInt::from(7)))),
+                Rc::new(Term::Lam(Rc::new(Term::Var(0)))),
+                Rc::new(Term::Const(Constant::Integer(num_bigint::BigInt::from(7)))),
             ),
         };
         let flat = p.to_flat().unwrap();

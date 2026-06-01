@@ -54,7 +54,9 @@ use super::bits::{BitReader, BitWriter};
 use super::{FlatResult, FLAT_MAX_DEPTH};
 use crate::data::Data;
 use crate::term::{BuiltinId, Constant, Term, TypeTag};
+
 use crate::UplcError;
+use std::rc::Rc;
 
 use num_bigint::{BigInt, Sign};
 
@@ -124,19 +126,19 @@ fn decode_term_inner(r: &mut BitReader<'_>, depth: usize) -> FlatResult<Term> {
         }
         1 => {
             let body = decode_term_depth(r, depth + 1)?;
-            Ok(Term::Delay(Box::new(body)))
+            Ok(Term::Delay(Rc::new(body)))
         }
         2 => {
             // Binder is encoded as zero bits for De Bruijn UPLC — see
             // `instance Flat (Binder DeBruijn)` in Haskell. Read
             // nothing and recurse straight into the body.
             let body = decode_term_depth(r, depth + 1)?;
-            Ok(Term::Lam(Box::new(body)))
+            Ok(Term::Lam(Rc::new(body)))
         }
         3 => {
             let fun = decode_term_depth(r, depth + 1)?;
             let arg = decode_term_depth(r, depth + 1)?;
-            Ok(Term::App(Box::new(fun), Box::new(arg)))
+            Ok(Term::App(Rc::new(fun), Rc::new(arg)))
         }
         4 => {
             let c = decode_constant(r)?;
@@ -144,7 +146,7 @@ fn decode_term_inner(r: &mut BitReader<'_>, depth: usize) -> FlatResult<Term> {
         }
         5 => {
             let body = decode_term_depth(r, depth + 1)?;
-            Ok(Term::Force(Box::new(body)))
+            Ok(Term::Force(Rc::new(body)))
         }
         6 => Ok(Term::Error),
         7 => {
@@ -171,7 +173,7 @@ fn decode_term_inner(r: &mut BitReader<'_>, depth: usize) -> FlatResult<Term> {
             let scrutinee = decode_term_depth(r, depth + 1)?;
             let branches = decode_term_list(r, depth + 1)?;
             Ok(Term::Case {
-                scrutinee: Box::new(scrutinee),
+                scrutinee: Rc::new(scrutinee),
                 branches,
             })
         }
@@ -184,10 +186,10 @@ fn decode_term_inner(r: &mut BitReader<'_>, depth: usize) -> FlatResult<Term> {
 /// Decode a `Flat`-encoded cons-list of terms.  Each element is prefixed
 /// by a `1` continuation bit; a `0` terminates the list.  Mirrors
 /// Haskell `decodeListWith decode`.
-fn decode_term_list(r: &mut BitReader<'_>, depth: usize) -> FlatResult<Vec<Term>> {
+fn decode_term_list(r: &mut BitReader<'_>, depth: usize) -> FlatResult<Vec<Rc<Term>>> {
     let mut out = Vec::new();
     while r.read_bit()? {
-        out.push(decode_term_depth(r, depth)?);
+        out.push(Rc::new(decode_term_depth(r, depth)?));
     }
     Ok(out)
 }
@@ -260,7 +262,7 @@ fn encode_term_depth(w: &mut BitWriter, t: &Term, depth: usize) -> FlatResult<()
 
 /// Encode a slice of terms as a `Flat` cons-list (each element prefixed
 /// by a `1` bit; terminator `0`).
-fn encode_term_list(w: &mut BitWriter, terms: &[Term], depth: usize) -> FlatResult<()> {
+fn encode_term_list(w: &mut BitWriter, terms: &[Rc<Term>], depth: usize) -> FlatResult<()> {
     for t in terms {
         w.write_bit(true);
         encode_term_depth(w, t, depth)?;
@@ -769,17 +771,17 @@ mod tests {
 
     #[test]
     fn delay_force_roundtrip() {
-        let t = Term::Delay(Box::new(Term::Force(Box::new(Term::Error))));
+        let t = Term::Delay(Rc::new(Term::Force(Rc::new(Term::Error))));
         assert_eq!(rt_term(t.clone()), t);
     }
 
     #[test]
     fn lam_app_roundtrip() {
         // (lam (var 1)) — innermost binder reference (1-based).
-        let t = Term::Lam(Box::new(Term::Var(1)));
+        let t = Term::Lam(Rc::new(Term::Var(1)));
         assert_eq!(rt_term(t.clone()), t);
 
-        let app = Term::App(Box::new(t.clone()), Box::new(Term::Var(2)));
+        let app = Term::App(Rc::new(t.clone()), Rc::new(Term::Var(2)));
         assert_eq!(rt_term(app.clone()), app);
     }
 
@@ -832,8 +834,8 @@ mod tests {
     fn nested_structure_roundtrip() {
         // (app (lam (var 1)) (const #t))
         let t = Term::App(
-            Box::new(Term::Lam(Box::new(Term::Var(1)))),
-            Box::new(Term::Const(Constant::Bool(true))),
+            Rc::new(Term::Lam(Rc::new(Term::Var(1)))),
+            Rc::new(Term::Const(Constant::Bool(true))),
         );
         assert_eq!(rt_term(t.clone()), t);
     }
@@ -850,7 +852,7 @@ mod tests {
         let depth = 128;
         let mut t = Term::Error;
         for _ in 0..depth {
-            t = Term::Force(Box::new(t));
+            t = Term::Force(Rc::new(t));
         }
         assert_eq!(rt_term(t.clone()), t);
     }

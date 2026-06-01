@@ -11,12 +11,14 @@
 //!    through the evaluator. This avoids the `NamedDeBruijn` /
 //!    `FakeNamedDeBruijn` shuffling that aiken-uplc has to do.
 //!
-//!  - Term recursion uses `Box<Term>` rather than `Rc`/`Arc`/arena.
-//!    The CEK machine evaluates by stepping through an explicit context
-//!    stack (heap-allocated) so the term tree is never recursively
-//!    walked. This keeps the AST sharing-free and trivially
-//!    `Send + Sync + Clone` without arena lifetimes leaking into
-//!    consumer APIs.
+//!  - Term recursion uses `Rc<Term>` for recursive sub-terms. Cloning a
+//!    `Term` is therefore O(1) (refcount bumps only), avoiding the
+//!    O(subtree-size) deep-copy that `Box<Term>` would require when the
+//!    CEK machine looks up a lambda closure stored in the shared
+//!    environment. The CEK machine evaluates by stepping through an
+//!    explicit context stack (heap-allocated) so the term tree is never
+//!    recursively walked. `Term` is NOT `Send + Sync` (Rc is not
+//!    thread-safe), but CEK evaluation is single-threaded by design.
 //!
 //!  - The `Constant` enum carries discriminants in the order the Haskell
 //!    reference's `DefaultUni` enum uses, so flat-tag decoding is a
@@ -27,11 +29,24 @@
 //! `tests/term_roundtrip.rs` (to be added with the flat decoder).
 
 use crate::data::Data;
+use std::rc::Rc;
 
 /// A UPLC term — a single AST node.
 ///
-/// The `Box` wrapping makes every recursive variant heap-allocated, so
-/// the enum size stays a fixed 8 bytes for the discriminant + pointers.
+/// Recursive sub-terms are wrapped in `Rc<Term>` rather than `Box<Term>`.
+/// This makes `Term::clone()` an O(1) operation (a series of reference-count
+/// bumps) instead of an O(size-of-subtree) deep copy. The CEK machine exploits
+/// this when it looks up a lambda closure from the environment: the body `Rc`
+/// has refcount >= 2 (env node + current usage), so `rc_into_term` previously
+/// fell back to a full deep clone of the body tree. With `Rc` sub-terms, that
+/// fallback clone copies only the discriminant + inner `Rc` pointers — O(1).
+///
+/// The semantic contract is unchanged: all `Term` values are immutable after
+/// construction, so sharing via `Rc` is equivalent to copying (no aliasing
+/// hazard). The CEK machine's ExUnit accounting is also unchanged: step counts
+/// and builtin costs depend only on the abstract machine's reduction sequence,
+/// not on the physical representation.
+///
 /// Stack overflow on deeply-nested terms is avoided by never recursing
 /// over the term tree directly: the CEK machine carries an explicit
 /// continuation stack instead.
@@ -43,20 +58,23 @@ pub enum Term {
     Var(u64),
 
     /// `Lam body` — a lambda abstraction. The body is open under one
-    /// additional binder.
-    Lam(Box<Term>),
+    /// additional binder. `Rc<Term>` so that cloning a lambda closure
+    /// (e.g. on env lookup) is a refcount bump rather than a deep copy.
+    Lam(Rc<Term>),
 
-    /// `App fun arg` — function application.
-    App(Box<Term>, Box<Term>),
+    /// `App fun arg` — function application. Both sub-terms are `Rc`
+    /// so that pushing the argument into a continuation frame is O(1).
+    App(Rc<Term>, Rc<Term>),
 
     /// `Constant c` — a primitive value lifted into a term.
     Const(Constant),
 
     /// `Delay t` — wraps `t` into a thunk; reduced only by `Force`.
-    Delay(Box<Term>),
+    /// `Rc<Term>` so that cloning a delay thunk is a refcount bump.
+    Delay(Rc<Term>),
 
     /// `Force t` — forces a `Delay`-wrapped thunk.
-    Force(Box<Term>),
+    Force(Rc<Term>),
 
     /// `Error` — script failure (the CEK machine raises
     /// [`UplcError::ScriptError`](crate::UplcError::ScriptError)).
@@ -67,14 +85,16 @@ pub enum Term {
     Builtin(BuiltinId),
 
     /// `Constr tag args` — Plutus-Core SOP constructor (introduced for
-    /// PlutusV3; CIP-0085).
-    Constr { tag: u64, args: Vec<Term> },
+    /// PlutusV3; CIP-0085). Args are `Rc<Term>` so the pending-arg Vec
+    /// in the Constr frame can be filled with O(1) refcount bumps.
+    Constr { tag: u64, args: Vec<Rc<Term>> },
 
     /// `Case scrutinee branches` — Plutus-Core SOP case expression
-    /// (introduced for PlutusV3; CIP-0085).
+    /// (introduced for PlutusV3; CIP-0085). `Rc` so that picking a
+    /// branch from the Cases frame is an O(1) refcount bump.
     Case {
-        scrutinee: Box<Term>,
-        branches: Vec<Term>,
+        scrutinee: Rc<Term>,
+        branches: Vec<Rc<Term>>,
     },
 }
 

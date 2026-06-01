@@ -43,6 +43,7 @@ use crate::UplcError;
 use dugite_primitives::transaction::{
     Transaction, TransactionInput as PrimTxIn, TransactionOutput as PrimTxOut,
 };
+use std::rc::Rc;
 
 /// The outcome of evaluating a single redeemer's script.
 ///
@@ -113,18 +114,18 @@ pub fn eval_resolved_redeemer(
                     let datum_term = data_const_term(plutus_data_to_data(datum));
                     // script(datum)(redeemer)(ctx)
                     Term::App(
-                        Box::new(Term::App(
-                            Box::new(Term::App(Box::new(term), Box::new(datum_term))),
-                            Box::new(redeemer_term),
+                        Rc::new(Term::App(
+                            Rc::new(Term::App(Rc::new(term), Rc::new(datum_term))),
+                            Rc::new(redeemer_term),
                         )),
-                        Box::new(ctx_term),
+                        Rc::new(ctx_term),
                     )
                 }
                 RedeemerTag::Mint | RedeemerTag::Cert | RedeemerTag::Reward => {
                     // script(redeemer)(ctx)
                     Term::App(
-                        Box::new(Term::App(Box::new(term), Box::new(redeemer_term))),
-                        Box::new(ctx_term),
+                        Rc::new(Term::App(Rc::new(term), Rc::new(redeemer_term))),
+                        Rc::new(ctx_term),
                     )
                 }
                 RedeemerTag::Vote | RedeemerTag::Propose | RedeemerTag::Guarding => {
@@ -137,7 +138,7 @@ pub fn eval_resolved_redeemer(
         }
         ScriptLanguage::PlutusV3 => {
             let ctx_term = data_const_term(ctx_data);
-            Term::App(Box::new(term), Box::new(ctx_term))
+            Term::App(Rc::new(term), Rc::new(ctx_term))
         }
     };
 
@@ -407,7 +408,7 @@ mod tests {
             version: (1, 0, 0),
             // `lam x. const_unit` — `Lam(Const Unit)`. The bound var
             // `x` is unused, so the CEK just returns the constant.
-            term: Term::Lam(Box::new(Term::Const(Constant::Unit))),
+            term: Term::Lam(Rc::new(Term::Const(Constant::Unit))),
         };
         program.to_cbor().unwrap()
     }
@@ -561,16 +562,16 @@ mod tests {
         use crate::term::BuiltinId;
         // (force builtin(trace)) "msg" (con unit ())
         let trace_call = Term::App(
-            Box::new(Term::App(
-                Box::new(Term::Force(Box::new(Term::Builtin(BuiltinId::Trace)))),
-                Box::new(Term::Const(Constant::String(msg.to_string()))),
+            Rc::new(Term::App(
+                Rc::new(Term::Force(Rc::new(Term::Builtin(BuiltinId::Trace)))),
+                Rc::new(Term::Const(Constant::String(msg.to_string()))),
             )),
-            Box::new(Term::Const(Constant::Unit)),
+            Rc::new(Term::Const(Constant::Unit)),
         );
         // Wrap in lam so the V3 single-arg calling convention is satisfied.
         let program = Program {
             version: (1, 0, 0),
-            term: Term::Lam(Box::new(trace_call)),
+            term: Term::Lam(Rc::new(trace_call)),
         };
         program.to_cbor().unwrap()
     }
@@ -603,31 +604,31 @@ mod tests {
         use crate::term::BuiltinId;
         fn trace_call(msg: &str) -> Term {
             Term::App(
-                Box::new(Term::App(
-                    Box::new(Term::Force(Box::new(Term::Builtin(BuiltinId::Trace)))),
-                    Box::new(Term::Const(Constant::String(msg.to_string()))),
+                Rc::new(Term::App(
+                    Rc::new(Term::Force(Rc::new(Term::Builtin(BuiltinId::Trace)))),
+                    Rc::new(Term::Const(Constant::String(msg.to_string()))),
                 )),
-                Box::new(Term::Const(Constant::Unit)),
+                Rc::new(Term::Const(Constant::Unit)),
             )
         }
         // (lam _ (lam _ (lam _ ()) trace("third")) trace("second")) trace("first")
         //   → evaluates trace("first") → enters body → evaluates trace("second")
         //   → enters body → evaluates trace("third") → returns ()
         let body = Term::App(
-            Box::new(Term::App(
-                Box::new(Term::App(
-                    Box::new(Term::Lam(Box::new(Term::Lam(Box::new(Term::Lam(
-                        Box::new(Term::Const(Constant::Unit)),
-                    )))))),
-                    Box::new(trace_call("first")),
+            Rc::new(Term::App(
+                Rc::new(Term::App(
+                    Rc::new(Term::Lam(Rc::new(Term::Lam(Rc::new(Term::Lam(Rc::new(
+                        Term::Const(Constant::Unit),
+                    ))))))),
+                    Rc::new(trace_call("first")),
                 )),
-                Box::new(trace_call("second")),
+                Rc::new(trace_call("second")),
             )),
-            Box::new(trace_call("third")),
+            Rc::new(trace_call("third")),
         );
         let program = Program {
             version: (1, 0, 0),
-            term: Term::Lam(Box::new(body)),
+            term: Term::Lam(Rc::new(body)),
         };
         program.to_cbor().unwrap()
     }
@@ -647,21 +648,21 @@ mod tests {
         use crate::term::BuiltinId;
         // (force trace) "msg" () → fires trace, returns ()
         let trace_call = Term::App(
-            Box::new(Term::App(
-                Box::new(Term::Force(Box::new(Term::Builtin(BuiltinId::Trace)))),
-                Box::new(Term::Const(Constant::String(msg.to_string()))),
+            Rc::new(Term::App(
+                Rc::new(Term::Force(Rc::new(Term::Builtin(BuiltinId::Trace)))),
+                Rc::new(Term::Const(Constant::String(msg.to_string()))),
             )),
-            Box::new(Term::Const(Constant::Unit)),
+            Rc::new(Term::Const(Constant::Unit)),
         );
         // (lam _. error) trace_call → evaluates trace_call (fires trace),
         //   binds result to _, then reduces body to error → ScriptError
         let body = Term::App(
-            Box::new(Term::Lam(Box::new(Term::Error))),
-            Box::new(trace_call),
+            Rc::new(Term::Lam(Rc::new(Term::Error))),
+            Rc::new(trace_call),
         );
         let program = Program {
             version: (1, 0, 0),
-            term: Term::Lam(Box::new(body)),
+            term: Term::Lam(Rc::new(body)),
         };
         program.to_cbor().unwrap()
     }
