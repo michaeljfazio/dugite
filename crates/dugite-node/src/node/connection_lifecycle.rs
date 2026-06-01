@@ -576,6 +576,21 @@ pub struct ConnectionLifecycleManager {
     /// port number of the active peer (0 = none active). Workers compete for
     /// this flag — the first to claim it becomes the sole fetcher.
     active_fetcher: Arc<std::sync::atomic::AtomicU64>,
+    /// Socket address of the peer that currently holds the `active_fetcher`
+    /// slot, or `None` if no peer is actively fetching.
+    ///
+    /// Kept in sync with `active_fetcher` by `make_blockfetch_task`: set to
+    /// `Some(addr)` when a worker claims the CAS slot and cleared (set to
+    /// `None`) on every release path — normal post-batch, no-headers early
+    /// exit, error, timeout, and `cancel.cancelled()`.  The governor reads
+    /// this via `get_active_fetch_peer()` to exclude the live downloader from
+    /// `aboveTargetOther` demotion (Fix 1 — fetch-floor bug).
+    ///
+    /// A plain `std::sync::Mutex<Option<SocketAddr>>` is used (not async):
+    /// the critical sections are tiny (one assignment) and never held across
+    /// an `.await`, so a blocking lock is correct and cheaper than a tokio
+    /// `Mutex`.
+    active_fetch_peer: Arc<std::sync::Mutex<Option<SocketAddr>>>,
     /// Highest slot that has been fetched or is being fetched.
     /// Used to skip duplicate fetches from other peers.
     max_fetched_slot: Arc<std::sync::atomic::AtomicU64>,
@@ -769,6 +784,7 @@ impl ConnectionLifecycleManager {
             security_param,
             active_slots_coeff,
             active_fetcher: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            active_fetch_peer: Arc::new(std::sync::Mutex::new(None)),
             max_fetched_slot: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             blockfetch_max_range,
             metrics,
@@ -791,6 +807,19 @@ impl ConnectionLifecycleManager {
     /// duplex-paired source-port binding. Call once after construction.
     pub fn set_local_listen_addr(&mut self, addr: SocketAddr) {
         self.local_listen_addr = Some(addr);
+    }
+
+    /// Return the `SocketAddr` of the peer currently holding the
+    /// `active_fetcher` slot, or `None` if no fetch is in progress.
+    ///
+    /// Used by the governor call site in `mod.rs` to thread the identity of
+    /// the active downloader into `compute_actions_with_blp` so that
+    /// `aboveTargetOther` never demotes it mid-download.
+    pub fn get_active_fetch_peer(&self) -> Option<SocketAddr> {
+        *self
+            .active_fetch_peer
+            .lock()
+            .expect("active_fetch_peer lock")
     }
 
     // ─── Temperature Transitions ────────────────────────────────────────────
@@ -1725,6 +1754,10 @@ impl ConnectionLifecycleManager {
         // Shared flag: only ONE BlockFetch worker is active at a time.
         // Matches Haskell's bfcMaxConcurrencyBulkSync = 1.
         let active_fetcher = self.active_fetcher.clone();
+        // Companion SocketAddr tracker — kept in sync with `active_fetcher`
+        // so the governor can identify and protect the live downloader from
+        // `aboveTargetOther` demotion (fetch-floor fix).
+        let active_fetch_peer = self.active_fetch_peer.clone();
         let _max_fetched_slot = self.max_fetched_slot.clone();
         let metrics_clone = self.metrics.clone();
         let peer_failure_tx = self.peer_failure_tx.clone();
@@ -1749,15 +1782,26 @@ impl ConnectionLifecycleManager {
                 struct ActiveFetcherGuard {
                     fetcher: std::sync::Arc<std::sync::atomic::AtomicU64>,
                     id: u64,
+                    /// Companion SocketAddr companion cleared in tandem with the
+                    /// u64 CAS flag so the governor always sees a consistent view.
+                    peer_slot: std::sync::Arc<std::sync::Mutex<Option<SocketAddr>>>,
                 }
                 impl Drop for ActiveFetcherGuard {
                     fn drop(&mut self) {
-                        let _ = self.fetcher.compare_exchange(
+                        let swapped = self.fetcher.compare_exchange(
                             self.id,
                             0,
                             std::sync::atomic::Ordering::SeqCst,
                             std::sync::atomic::Ordering::SeqCst,
                         );
+                        // Only clear the SocketAddr companion when WE were the ones
+                        // holding the slot (compare_exchange succeeded).  This avoids
+                        // clearing a different peer's address if we lost a CAS race.
+                        if swapped.is_ok() {
+                            if let Ok(mut guard) = self.peer_slot.lock() {
+                                *guard = None;
+                            }
+                        }
                     }
                 }
 
@@ -1837,12 +1881,18 @@ impl ConnectionLifecycleManager {
                             let mut hasher = std::collections::hash_map::DefaultHasher::new();
                             addr.hash(&mut hasher);
                             let cancel_id = hasher.finish() | 1; // ensure non-zero
-                            let _ = active_fetcher.compare_exchange(
+                            let swapped = active_fetcher.compare_exchange(
                                 cancel_id,
                                 0,
                                 std::sync::atomic::Ordering::SeqCst,
                                 std::sync::atomic::Ordering::SeqCst,
                             );
+                            // Clear the SocketAddr companion only when we held the slot.
+                            if swapped.is_ok() {
+                                if let Ok(mut guard) = active_fetch_peer.lock() {
+                                    *guard = None;
+                                }
+                            }
                             debug!(%addr, "blockfetch worker cancelled");
                             break;
                         }
@@ -1872,9 +1922,17 @@ impl ConnectionLifecycleManager {
                             // It is idempotent with the explicit post-batch /
                             // no-headers releases below (its `compare_exchange`
                             // is a no-op once the slot has already been cleared).
+                            // Publish the SocketAddr companion so the governor can
+                            // exclude this peer from aboveTargetOther demotion.
+                            if claimed {
+                                if let Ok(mut guard) = active_fetch_peer.lock() {
+                                    *guard = Some(addr);
+                                }
+                            }
                             let _fetch_guard = ActiveFetcherGuard {
                                 fetcher: active_fetcher.clone(),
                                 id: my_id,
+                                peer_slot: active_fetch_peer.clone(),
                             };
 
                             // Build the list of headers to fetch from this peer.

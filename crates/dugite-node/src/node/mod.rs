@@ -4018,11 +4018,20 @@ impl Node {
                             .collect();
                         let big_ledger = pm.big_ledger_peers().clone();
                         let fresh_inbound = pm.fresh_inbound_set(std::time::Instant::now());
+                        // Fetch-floor fix: read the identity of the peer currently
+                        // holding the BlockFetch slot so the governor can exclude it
+                        // from aboveTargetOther demotion (prevents killing an active
+                        // download every ~5 s during a post-restart connect burst).
+                        let active_fetch_peer = self
+                            .connection_lifecycle
+                            .as_ref()
+                            .and_then(|lc| lc.get_active_fetch_peer());
                         governor.compute_actions_with_blp(
                             &pm.inner,
                             &local_root_targets,
                             &big_ledger,
                             &fresh_inbound,
+                            active_fetch_peer,
                         )
                     };
 
