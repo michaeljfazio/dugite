@@ -18,6 +18,7 @@ use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::time::EpochNo;
 use dugite_primitives::transaction::{ProtocolParamUpdate, Rational};
 use dugite_primitives::value::Lovelace;
+use imbl::HashMap as ImblHashMap;
 
 use crate::utxo::UtxoSet;
 use crate::utxo_diff::DiffSeq;
@@ -39,21 +40,32 @@ pub struct UtxoSubState {
 /// Delegation and pool state: stake credentials, pool registrations, reward accounts.
 #[derive(Debug, Clone)]
 pub struct CertSubState {
-    pub delegations: Arc<HashMap<Hash32, Hash28>>,
+    /// Stake credential → pool ID delegation map.
+    ///
+    /// Uses `imbl::HashMap` (persistent HAMT) so that per-block validation
+    /// snapshots (cloned at block start) are O(1) structural shares instead
+    /// of O(N) deep clones of ~784K entries.  Mutations (`insert`/`remove`)
+    /// are O(log N) ≈ 20 hash-table ops for mainnet delegation counts.
+    /// The net effect is eliminating a ~31 MB memcpy per cert-block — the
+    /// #1 apply hotspot at Alonzo/Mary era scales (see perf issue #698).
+    pub delegations: ImblHashMap<Hash32, Hash28>,
     pub pool_params: Arc<HashMap<Hash28, PoolRegistration>>,
     pub future_pool_params: HashMap<Hash28, PoolRegistration>,
     pub pending_retirements: HashMap<Hash28, EpochNo>,
-    pub reward_accounts: Arc<HashMap<Hash32, Lovelace>>,
+    /// Reward account balances: stake credential hash → accumulated rewards.
+    ///
+    /// Uses `imbl::HashMap` for O(1) clone semantics — see `delegations`
+    /// comment.  ~784K entries on mainnet; each entry ~40 bytes.  The
+    /// per-block `block_reward_accounts` snapshot held in `apply_block`'s
+    /// validation path is now a structural-share clone (O(1)) that sees the
+    /// pre-block state, while mid-block mutations build a new version
+    /// independently.  No `Arc::make_mut` CoW needed.
+    pub reward_accounts: ImblHashMap<Hash32, Lovelace>,
     /// Per-credential stake-key deposit balances.
     ///
-    /// Wrapped in `Arc` so the per-block ValidationContext build can share the
-    /// map via `Arc::clone` (refcount bump) instead of deep-cloning ~90 k
-    /// entries on Conway+ preview.  Mutations go through `Arc::make_mut`,
-    /// which is O(1) when the refcount is 1 (the apply path's normal case)
-    /// and triggers a one-shot CoW clone only when a reader view is also
-    /// holding a reference — same pattern as `reward_accounts` /
-    /// `delegations` / `pool_params`.
-    pub stake_key_deposits: Arc<HashMap<Hash32, u64>>,
+    /// Uses `imbl::HashMap` for O(1) clone semantics — see `delegations`
+    /// comment.  ~90K entries on mainnet at Conway.
+    pub stake_key_deposits: ImblHashMap<Hash32, u64>,
     pub pool_deposits: HashMap<Hash28, u64>,
     pub total_stake_key_deposits: u64,
     pub pointer_map: HashMap<dugite_primitives::credentials::Pointer, Hash32>,

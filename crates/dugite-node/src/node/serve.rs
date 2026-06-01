@@ -450,7 +450,7 @@ impl TxValidator for LedgerTxValidator {
             // forged the block, and cardano-bp rejected with
             // `ConwayCertsFailure (WithdrawalsNotInRewardsCERTS ...)`.
             // See audit-findings/2026-05-28-round1-retry.md.
-            .with_reward_accounts_arc(Arc::clone(&ledger.certs.reward_accounts))
+            .with_reward_accounts_imbl(ledger.certs.reward_accounts.clone())
             .with_network(self.network);
 
         // Compute the per-tx safe-zone horizon and inject it into the

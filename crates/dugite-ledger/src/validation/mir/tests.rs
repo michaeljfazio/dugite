@@ -329,15 +329,14 @@ fn ledger_for_accumulator_test(
     pv: u64,
     reward_accounts: Vec<(dugite_primitives::hash::Hash32, u64)>,
 ) -> crate::state::LedgerState {
-    use std::sync::Arc;
     let mut params = ProtocolParameters::mainnet_defaults();
     params.protocol_version_major = pv;
     let mut state = crate::state::LedgerState::new(params);
-    let map: std::collections::HashMap<dugite_primitives::hash::Hash32, Lovelace> = reward_accounts
+    let map: imbl::HashMap<dugite_primitives::hash::Hash32, Lovelace> = reward_accounts
         .into_iter()
         .map(|(k, v)| (k, Lovelace(v)))
         .collect();
-    state.certs.reward_accounts = Arc::new(map);
+    state.certs.reward_accounts = map;
     state
 }
 

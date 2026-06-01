@@ -41,6 +41,7 @@ use dugite_primitives::transaction::{
     VotingProcedure,
 };
 use dugite_primitives::value::Lovelace;
+use imbl::HashMap as ImblHashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -602,12 +603,12 @@ impl LedgerState {
                 pending_donations: Lovelace(0),
             },
             certs: CertSubState {
-                delegations: Arc::new(HashMap::new()),
+                delegations: ImblHashMap::new(),
                 pool_params: Arc::new(HashMap::new()),
                 future_pool_params: HashMap::new(),
                 pending_retirements: HashMap::new(),
-                reward_accounts: Arc::new(HashMap::new()),
-                stake_key_deposits: Arc::new(HashMap::new()),
+                reward_accounts: ImblHashMap::new(),
+                stake_key_deposits: ImblHashMap::new(),
                 pool_deposits: HashMap::new(),
                 total_stake_key_deposits: 0,
                 pointer_map: HashMap::new(),
@@ -1084,12 +1085,15 @@ impl LedgerState {
                 pending_donations: Lovelace(hs.new_epoch_state.donation),
             },
             certs: CertSubState {
-                delegations: Arc::new(delegations),
+                // Convert std::HashMap (built above) → imbl::HashMap for CertSubState.
+                delegations: delegations.into_iter().collect::<ImblHashMap<_, _>>(),
                 pool_params: Arc::new(pool_params_map),
                 future_pool_params,
                 pending_retirements,
-                reward_accounts: Arc::new(reward_accounts),
-                stake_key_deposits: Arc::new(stake_key_deposits),
+                reward_accounts: reward_accounts.into_iter().collect::<ImblHashMap<_, _>>(),
+                stake_key_deposits: stake_key_deposits
+                    .into_iter()
+                    .collect::<ImblHashMap<_, _>>(),
                 pool_deposits,
                 total_stake_key_deposits,
                 pointer_map: HashMap::new(), // Conway era: pointers excluded
@@ -1708,8 +1712,10 @@ impl LedgerState {
             let mut cred = [0u8; 32];
             cred[..28].copy_from_slice(&reward_account[1..29]);
             let cred_hash = Hash32::from_bytes(cred);
-            let reward_accounts = Arc::make_mut(&mut self.certs.reward_accounts);
-            reward_accounts.entry(cred_hash).or_insert(Lovelace(0));
+            self.certs
+                .reward_accounts
+                .entry(cred_hash)
+                .or_insert(Lovelace(0));
         }
 
         debug!("Ledger: seeded genesis pool {}", pool_id.to_hex());
@@ -1720,12 +1726,10 @@ impl LedgerState {
     /// Maps a stake credential (as padded Hash32) to a pool ID (Hash28).
     /// Registers the credential in reward accounts with zero balance.
     pub fn seed_genesis_delegation(&mut self, stake_credential: Hash32, pool_id: Hash28) {
-        let delegations = Arc::make_mut(&mut self.certs.delegations);
-        delegations.insert(stake_credential, pool_id);
-
-        // Register stake credential in reward accounts if not present
-        let reward_accounts = Arc::make_mut(&mut self.certs.reward_accounts);
-        reward_accounts
+        self.certs.delegations.insert(stake_credential, pool_id);
+        // Register stake credential in reward accounts if not present.
+        self.certs
+            .reward_accounts
             .entry(stake_credential)
             .or_insert(Lovelace(0));
     }
@@ -1809,9 +1813,17 @@ impl LedgerState {
             "Genesis: seeded initial stake/pool snapshot for cold-start leader election"
         );
 
+        // Convert imbl::HashMap delegations → Arc<std::HashMap> for StakeSnapshot.
+        let genesis_delegations = Arc::new(
+            self.certs
+                .delegations
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect::<HashMap<_, _>>(),
+        );
         let snap = StakeSnapshot {
             epoch: self.epoch,
-            delegations: Arc::clone(&self.certs.delegations),
+            delegations: genesis_delegations,
             pool_stake,
             pool_params: Arc::clone(&self.certs.pool_params),
             stake_distribution: Arc::new(snapshot_stake),

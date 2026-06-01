@@ -1406,12 +1406,12 @@ mod tests {
 
     fn make_cert_sub() -> CertSubState {
         CertSubState {
-            delegations: Arc::new(HashMap::new()),
+            delegations: imbl::HashMap::new(),
             pool_params: Arc::new(HashMap::new()),
             future_pool_params: HashMap::new(),
             pending_retirements: HashMap::new(),
-            reward_accounts: Arc::new(HashMap::new()),
-            stake_key_deposits: std::sync::Arc::new(HashMap::new()),
+            reward_accounts: imbl::HashMap::new(),
+            stake_key_deposits: imbl::HashMap::new(),
             pool_deposits: HashMap::new(),
             total_stake_key_deposits: 0,
             pointer_map: HashMap::new(),

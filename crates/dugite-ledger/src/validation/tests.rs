@@ -395,7 +395,7 @@ mod tests {
         );
         let key = cred.to_typed_hash32();
         // Stored deposit was 2M when credential was registered
-        let mut stored = std::collections::HashMap::new();
+        let mut stored = imbl::HashMap::new();
         stored.insert(key, 2_000_000u64);
         let certs = vec![Certificate::StakeDeregistration(cred)];
         let (_, refunds) = calculate_deposits_and_refunds(&certs, &params, None, Some(&stored));
@@ -8729,11 +8729,11 @@ mod tests {
     fn make_reward_accounts(
         cred_bytes: [u8; 28],
         balance: u64,
-    ) -> std::collections::HashMap<Hash32, dugite_primitives::value::Lovelace> {
+    ) -> imbl::HashMap<Hash32, dugite_primitives::value::Lovelace> {
         use dugite_primitives::hash::Hash28;
         let h28 = Hash28::from_bytes(cred_bytes);
         let key = h28.to_hash32_padded();
-        let mut map = std::collections::HashMap::new();
+        let mut map = imbl::HashMap::new();
         map.insert(key, dugite_primitives::value::Lovelace(balance));
         map
     }
@@ -9679,13 +9679,11 @@ mod tests {
     }
 
     /// Helper: build a registered reward-accounts map containing a stake credential.
-    fn make_reward_accounts_with_cred(
-        cred_bytes: [u8; 28],
-    ) -> std::collections::HashMap<Hash32, Lovelace> {
+    fn make_reward_accounts_with_cred(cred_bytes: [u8; 28]) -> imbl::HashMap<Hash32, Lovelace> {
         use dugite_primitives::credentials::Credential;
         let cred = Credential::VerificationKey(Hash28::from_bytes(cred_bytes));
         let key = cred.to_typed_hash32();
-        let mut accounts = std::collections::HashMap::new();
+        let mut accounts = imbl::HashMap::new();
         accounts.insert(key, Lovelace(0));
         accounts
     }
@@ -9992,8 +9990,7 @@ mod tests {
         let mut registered_pools: std::collections::HashSet<Hash28> = HashSet::new();
         registered_pools.insert(pool_id);
         // reward_accounts is provided but does NOT contain the stake credential
-        let reward_accounts: std::collections::HashMap<Hash32, Lovelace> =
-            std::collections::HashMap::new();
+        let reward_accounts: imbl::HashMap<Hash32, Lovelace> = imbl::HashMap::new();
 
         let result = validate_transaction_with_pools(
             &tx,
@@ -10114,8 +10111,7 @@ mod tests {
             std::collections::HashSet::new();
         registered_dreps.insert(drep_hash);
         // reward_accounts is provided but stake credential is NOT in it
-        let reward_accounts: std::collections::HashMap<Hash32, Lovelace> =
-            std::collections::HashMap::new();
+        let reward_accounts: imbl::HashMap<Hash32, Lovelace> = imbl::HashMap::new();
 
         let result = validate_transaction_with_pools(
             &tx,
@@ -10197,8 +10193,7 @@ mod tests {
         let mut registered_pools: std::collections::HashSet<Hash28> = HashSet::new();
         registered_pools.insert(pool_id);
         // reward_accounts does NOT contain the stake credential (unregistered)
-        let reward_accounts: std::collections::HashMap<Hash32, Lovelace> =
-            std::collections::HashMap::new();
+        let reward_accounts: imbl::HashMap<Hash32, Lovelace> = imbl::HashMap::new();
 
         let result = validate_transaction_with_pools(
             &tx,
@@ -13240,7 +13235,7 @@ mod tests {
         let vote_delegations: HashSet<Hash32> = HashSet::new();
 
         // Also provide a matching reward account balance so withdrawal amount check passes
-        let mut reward_accounts = std::collections::HashMap::new();
+        let mut reward_accounts = imbl::HashMap::new();
         let cred_hash = Hash28::from_bytes(cred_bytes).to_hash32_padded();
         reward_accounts.insert(cred_hash, Lovelace(1_000_000));
 
@@ -13288,7 +13283,7 @@ mod tests {
         vote_delegations.insert(cred_hash);
 
         // Provide a matching reward account balance
-        let mut reward_accounts = std::collections::HashMap::new();
+        let mut reward_accounts = imbl::HashMap::new();
         reward_accounts.insert(cred_hash, Lovelace(1_000_000));
 
         let result = validate_transaction_with_pools(
@@ -13334,7 +13329,7 @@ mod tests {
         let vote_delegations: HashSet<Hash32> = HashSet::new();
 
         // Provide matching reward account balance
-        let mut reward_accounts = std::collections::HashMap::new();
+        let mut reward_accounts = imbl::HashMap::new();
         let cred_hash = Hash28::from_bytes(cred_bytes).to_hash32_padded();
         reward_accounts.insert(cred_hash, Lovelace(1_000_000));
 

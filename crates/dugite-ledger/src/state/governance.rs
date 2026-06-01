@@ -2261,9 +2261,7 @@ pub(crate) fn enact_gov_action_impl(
                 }
                 let key = LedgerState::reward_account_to_hash(reward_addr);
                 if certs.reward_accounts.contains_key(&key) {
-                    *Arc::make_mut(&mut certs.reward_accounts)
-                        .entry(key)
-                        .or_insert(Lovelace(0)) += *amount;
+                    *certs.reward_accounts.entry(key).or_insert(Lovelace(0)) += *amount;
                     disbursed = disbursed.saturating_add(amount.0);
                 } else {
                     debug!(
@@ -2831,9 +2829,7 @@ pub(crate) fn ratify_proposals_impl(
                 if return_addr.len() >= 29 {
                     let key = LedgerState::reward_account_to_hash(return_addr);
                     if certs.reward_accounts.contains_key(&key) {
-                        *Arc::make_mut(&mut certs.reward_accounts)
-                            .entry(key)
-                            .or_insert(Lovelace(0)) += deposit;
+                        *certs.reward_accounts.entry(key).or_insert(Lovelace(0)) += deposit;
                     } else {
                         epochs.treasury += deposit;
                         debug!(
@@ -2888,9 +2884,7 @@ pub(crate) fn ratify_proposals_impl(
                     if return_addr.len() >= 29 {
                         let key = LedgerState::reward_account_to_hash(return_addr);
                         if certs.reward_accounts.contains_key(&key) {
-                            *Arc::make_mut(&mut certs.reward_accounts)
-                                .entry(key)
-                                .or_insert(Lovelace(0)) += deposit;
+                            *certs.reward_accounts.entry(key).or_insert(Lovelace(0)) += deposit;
                         } else {
                             epochs.treasury += deposit;
                             debug!(
@@ -2944,9 +2938,7 @@ pub(crate) fn ratify_proposals_impl(
                         if return_addr.len() >= 29 {
                             let key = LedgerState::reward_account_to_hash(return_addr);
                             if certs.reward_accounts.contains_key(&key) {
-                                *Arc::make_mut(&mut certs.reward_accounts)
-                                    .entry(key)
-                                    .or_insert(Lovelace(0)) += deposit;
+                                *certs.reward_accounts.entry(key).or_insert(Lovelace(0)) += deposit;
                             } else {
                                 epochs.treasury += deposit;
                             }
@@ -3923,7 +3915,7 @@ mod tests {
                 },
             );
             let stake_key = Hash32::from_bytes([150 + i as u8; 32]);
-            Arc::make_mut(&mut state.certs.delegations).insert(stake_key, pool_id);
+            state.certs.delegations.insert(stake_key, pool_id);
             state
                 .certs
                 .stake_distribution
@@ -5143,7 +5135,10 @@ mod tests {
         // Per Haskell `applyEnactedWithdrawals`, withdrawals to unregistered
         // reward accounts are silently dropped.
         let withdrawal_key = LedgerState::reward_account_to_hash(&[0u8; 29]);
-        Arc::make_mut(&mut state.certs.reward_accounts).insert(withdrawal_key, Lovelace(0));
+        state
+            .certs
+            .reward_accounts
+            .insert(withdrawal_key, Lovelace(0));
 
         let mut withdrawals = BTreeMap::new();
         withdrawals.insert(vec![0u8; 29], Lovelace(5_000_000_000));
@@ -5239,7 +5234,7 @@ mod tests {
             let mut addr = vec![0u8; 29];
             addr[0] = addr_byte;
             let key = LedgerState::reward_account_to_hash(&addr);
-            Arc::make_mut(&mut state.certs.reward_accounts).insert(key, Lovelace(0));
+            state.certs.reward_accounts.insert(key, Lovelace(0));
         }
 
         // Two withdrawal proposals: 400M each (total 800M > 600M treasury)
@@ -5499,7 +5494,7 @@ mod tests {
         let return_key = LedgerState::reward_account_to_hash(&return_addr);
         // Register the return credential so the deposit refund goes to the
         // reward account (not treasury, per Haskell `returnProposalDeposits`).
-        Arc::make_mut(&mut state.certs.reward_accounts).insert(return_key, Lovelace(0));
+        state.certs.reward_accounts.insert(return_key, Lovelace(0));
 
         let tx_hash = Hash32::from_bytes([50u8; 32]);
         state.process_proposal(
@@ -5539,7 +5534,7 @@ mod tests {
         let return_key = LedgerState::reward_account_to_hash(&return_addr);
         // Register the return credential so the deposit refund goes to the
         // reward account (not treasury, per Haskell `returnProposalDeposits`).
-        Arc::make_mut(&mut state.certs.reward_accounts).insert(return_key, Lovelace(0));
+        state.certs.reward_accounts.insert(return_key, Lovelace(0));
 
         let tx_hash = Hash32::from_bytes([50u8; 32]);
         state.process_proposal(
@@ -6094,8 +6089,8 @@ mod tests {
         // entries (the lovelace remains in the treasury).
         let key_a = LedgerState::reward_account_to_hash(&[0u8; 29]);
         let key_b = LedgerState::reward_account_to_hash(&[1u8; 29]);
-        Arc::make_mut(&mut state.certs.reward_accounts).insert(key_a, Lovelace(0));
-        Arc::make_mut(&mut state.certs.reward_accounts).insert(key_b, Lovelace(0));
+        state.certs.reward_accounts.insert(key_a, Lovelace(0));
+        state.certs.reward_accounts.insert(key_b, Lovelace(0));
 
         let mut withdrawals = BTreeMap::new();
         withdrawals.insert(vec![0u8; 29], Lovelace(3_000_000_000));
@@ -6129,7 +6124,10 @@ mod tests {
         state.epochs.treasury = Lovelace(10_000_000_000);
 
         let registered_key = LedgerState::reward_account_to_hash(&[2u8; 29]);
-        Arc::make_mut(&mut state.certs.reward_accounts).insert(registered_key, Lovelace(0));
+        state
+            .certs
+            .reward_accounts
+            .insert(registered_key, Lovelace(0));
 
         let mut withdrawals = BTreeMap::new();
         // Registered: should be credited, treasury debited.
@@ -6618,7 +6616,7 @@ mod tests {
         assert!(state.epochs.snapshots.set.is_none());
 
         // With a delegation pointing to pool_id and some stake
-        Arc::make_mut(&mut state.certs.delegations).insert(stake_cred, pool_id);
+        state.certs.delegations.insert(stake_cred, pool_id);
         state
             .certs
             .stake_distribution
@@ -6670,7 +6668,7 @@ mod tests {
         mark_pool_stake.insert(pool_id, Lovelace(10_000_000_000));
         state.epochs.snapshots.mark = Some(StakeSnapshot {
             epoch: EpochNo(2),
-            delegations: Arc::new(HashMap::new()),
+            delegations: Arc::new(std::collections::HashMap::new()),
             pool_stake: mark_pool_stake,
             pool_params: Arc::clone(&state.certs.pool_params),
             stake_distribution: Arc::new(HashMap::new()),
@@ -6772,7 +6770,7 @@ mod tests {
 
         state.epochs.snapshots.mark = Some(StakeSnapshot {
             epoch: EpochNo(0),
-            delegations: Arc::new(HashMap::new()),
+            delegations: Arc::new(std::collections::HashMap::new()),
             pool_stake: mark_pool_stake,
             pool_params: Arc::clone(&state.certs.pool_params),
             stake_distribution: Arc::new(HashMap::new()),
@@ -7388,8 +7386,11 @@ mod tests {
         // Register two of the three accounts.  The middle one stays UNregistered
         // so its refund must flow to treasury (mirroring B_ret on preview at
         // boundary 735→736, which had no Registration certificate before e784).
-        Arc::make_mut(&mut state.certs.reward_accounts).insert(key_enacted, Lovelace(0));
-        Arc::make_mut(&mut state.certs.reward_accounts).insert(key_sibling_reg, Lovelace(0));
+        state.certs.reward_accounts.insert(key_enacted, Lovelace(0));
+        state
+            .certs
+            .reward_accounts
+            .insert(key_sibling_reg, Lovelace(0));
 
         let initial_treasury = state.epochs.treasury.0;
         let deposit = 100_000_000_000u64; // 100K ADA
@@ -7670,7 +7671,10 @@ mod tests {
 
         // Register the withdrawal target so the disbursement actually credits.
         let withdrawal_key = LedgerState::reward_account_to_hash(&[0u8; 29]);
-        Arc::make_mut(&mut state.certs.reward_accounts).insert(withdrawal_key, Lovelace(0));
+        state
+            .certs
+            .reward_accounts
+            .insert(withdrawal_key, Lovelace(0));
 
         let mut withdrawals = BTreeMap::new();
         withdrawals.insert(vec![0u8; 29], Lovelace(1_000_000_000));
@@ -8192,7 +8196,7 @@ mod tests {
         // and deposit refund both credit it (per Haskell, unregistered targets
         // are silently dropped / forfeited to treasury).
         let script_key = LedgerState::reward_account_to_hash(&script_reward_addr);
-        Arc::make_mut(&mut state.certs.reward_accounts).insert(script_key, Lovelace(0));
+        state.certs.reward_accounts.insert(script_key, Lovelace(0));
 
         let withdrawal_amount = Lovelace(1_000_000_000);
         let mut withdrawals = BTreeMap::new();

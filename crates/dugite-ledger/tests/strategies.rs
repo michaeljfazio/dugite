@@ -612,10 +612,13 @@ pub fn arb_ledger_state(config: LedgerStateConfig) -> impl Strategy<Value = Ledg
                     state.utxo.utxo_set.insert(input, output);
                 }
 
-                state.certs.reward_accounts = Arc::new(reward_accounts.clone());
-                state.certs.delegations = Arc::new(delegations.clone());
+                state.certs.reward_accounts =
+                    reward_accounts.into_iter().collect::<imbl::HashMap<_, _>>();
+                state.certs.delegations = delegations.into_iter().collect::<imbl::HashMap<_, _>>();
                 state.certs.total_stake_key_deposits = (n_delegations as u64) * key_deposit;
-                state.certs.stake_key_deposits = std::sync::Arc::new(stake_key_deposits);
+                state.certs.stake_key_deposits = stake_key_deposits
+                    .into_iter()
+                    .collect::<imbl::HashMap<_, _>>();
                 state.certs.stake_distribution = StakeDistributionState { stake_map };
 
                 // ── Mark / set / go snapshots ────────────────────────────────
@@ -623,7 +626,14 @@ pub fn arb_ledger_state(config: LedgerStateConfig) -> impl Strategy<Value = Ledg
                 // so that reward and leader-election code has consistent data.
                 let snapshot = StakeSnapshot {
                     epoch: EpochNo(cfg.epoch.saturating_sub(1)),
-                    delegations: Arc::new(delegations.clone()),
+                    delegations: Arc::new(
+                        state
+                            .certs
+                            .delegations
+                            .iter()
+                            .map(|(k, v)| (*k, *v))
+                            .collect::<std::collections::HashMap<_, _>>(),
+                    ),
                     pool_stake: {
                         let mut ps = HashMap::new();
                         for pool_id in &pool_ids {

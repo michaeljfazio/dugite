@@ -60,8 +60,7 @@ pub(crate) fn apply_pending_mir(
             // Only credit registered accounts. Payments to deregistered credentials
             // are silently dropped — the coin vanishes (NOT returned to the pot).
             // See `Cardano.Ledger.Shelley.Rules.Mir.applyMIR` and shelley-certs.md §6.
-            let reward_accounts = Arc::make_mut(&mut certs.reward_accounts);
-            if let Some(entry) = reward_accounts.get_mut(&cred) {
+            if let Some(entry) = certs.reward_accounts.get_mut(&cred) {
                 let new_balance = entry.0 as i128 + delta;
                 if new_balance < 0 {
                     panic!(
@@ -191,15 +190,14 @@ impl LedgerState {
                     .stake_map
                     .entry(key)
                     .or_insert(Lovelace(0));
-                Arc::make_mut(&mut self.certs.reward_accounts)
-                    .entry(key)
-                    .or_insert(Lovelace(0));
+                self.certs.reward_accounts.entry(key).or_insert(Lovelace(0));
                 // Track script credentials so N2C query responses can set credential_type correctly.
                 if matches!(credential, Credential::Script(_)) {
                     self.certs.script_stake_credentials.insert(key);
                 }
                 self.certs.total_stake_key_deposits += self.epochs.protocol_params.key_deposit.0;
-                std::sync::Arc::make_mut(&mut self.certs.stake_key_deposits)
+                self.certs
+                    .stake_key_deposits
                     .insert(key, self.epochs.protocol_params.key_deposit.0);
                 debug!("Stake key registered: {}", key.to_hex());
             }
@@ -211,15 +209,17 @@ impl LedgerState {
                 // (rebuild_stake_distribution) sums ALL UTxOs by credential regardless
                 // of registration status.
                 // Use the stored deposit for correct refund when key_deposit changes.
-                let stored_deposit = std::sync::Arc::make_mut(&mut self.certs.stake_key_deposits)
+                let stored_deposit = self
+                    .certs
+                    .stake_key_deposits
                     .remove(&key)
                     .unwrap_or(self.epochs.protocol_params.key_deposit.0);
                 self.certs.total_stake_key_deposits = self
                     .certs
                     .total_stake_key_deposits
                     .saturating_sub(stored_deposit);
-                Arc::make_mut(&mut self.certs.delegations).remove(&key);
-                Arc::make_mut(&mut self.certs.reward_accounts).remove(&key);
+                self.certs.delegations.remove(&key);
+                self.certs.reward_accounts.remove(&key);
                 // Remove DRep delegation — Haskell's unified map clears all credential
                 // data on deregistration, including vote delegations.
                 Arc::make_mut(&mut self.gov.governance)
@@ -241,14 +241,13 @@ impl LedgerState {
                     .stake_map
                     .entry(key)
                     .or_insert(Lovelace(0));
-                Arc::make_mut(&mut self.certs.reward_accounts)
-                    .entry(key)
-                    .or_insert(Lovelace(0));
+                self.certs.reward_accounts.entry(key).or_insert(Lovelace(0));
                 if matches!(credential, Credential::Script(_)) {
                     self.certs.script_stake_credentials.insert(key);
                 }
                 self.certs.total_stake_key_deposits += self.epochs.protocol_params.key_deposit.0;
-                std::sync::Arc::make_mut(&mut self.certs.stake_key_deposits)
+                self.certs
+                    .stake_key_deposits
                     .insert(key, self.epochs.protocol_params.key_deposit.0);
                 debug!("Stake key registered (Conway): {}", key.to_hex());
             }
@@ -263,15 +262,17 @@ impl LedgerState {
                 // UTxOs may still exist at this credential.
                 let key = credential_to_hash(credential);
                 // Use the stored deposit for correct refund when key_deposit changes.
-                let stored_deposit = std::sync::Arc::make_mut(&mut self.certs.stake_key_deposits)
+                let stored_deposit = self
+                    .certs
+                    .stake_key_deposits
                     .remove(&key)
                     .unwrap_or(self.epochs.protocol_params.key_deposit.0);
                 self.certs.total_stake_key_deposits = self
                     .certs
                     .total_stake_key_deposits
                     .saturating_sub(stored_deposit);
-                Arc::make_mut(&mut self.certs.delegations).remove(&key);
-                Arc::make_mut(&mut self.certs.reward_accounts).remove(&key);
+                self.certs.delegations.remove(&key);
+                self.certs.reward_accounts.remove(&key);
                 // Remove DRep delegation — Haskell's unified map clears all credential
                 // data on deregistration, including vote delegations.
                 Arc::make_mut(&mut self.gov.governance)
@@ -289,7 +290,7 @@ impl LedgerState {
                 pool_hash,
             } => {
                 let key = credential_to_hash(credential);
-                Arc::make_mut(&mut self.certs.delegations).insert(key, *pool_hash);
+                self.certs.delegations.insert(key, *pool_hash);
                 debug!("Stake delegated to pool: {}", pool_hash.to_hex());
             }
             Certificate::PoolRegistration(params) => {
@@ -361,12 +362,11 @@ impl LedgerState {
                     .stake_map
                     .entry(key)
                     .or_insert(Lovelace(0));
-                Arc::make_mut(&mut self.certs.reward_accounts)
-                    .entry(key)
-                    .or_insert(Lovelace(0));
-                Arc::make_mut(&mut self.certs.delegations).insert(key, *pool_hash);
+                self.certs.reward_accounts.entry(key).or_insert(Lovelace(0));
+                self.certs.delegations.insert(key, *pool_hash);
                 self.certs.total_stake_key_deposits += self.epochs.protocol_params.key_deposit.0;
-                std::sync::Arc::make_mut(&mut self.certs.stake_key_deposits)
+                self.certs
+                    .stake_key_deposits
                     .insert(key, self.epochs.protocol_params.key_deposit.0);
                 if matches!(credential, Credential::Script(_)) {
                     self.certs.script_stake_credentials.insert(key);
@@ -459,7 +459,7 @@ impl LedgerState {
             } => {
                 let key = credential_to_hash(credential);
                 // Stake delegation
-                Arc::make_mut(&mut self.certs.delegations).insert(key, *pool_hash);
+                self.certs.delegations.insert(key, *pool_hash);
                 // Vote delegation
                 Arc::make_mut(&mut self.gov.governance)
                     .vote_delegations
@@ -530,17 +530,16 @@ impl LedgerState {
                     .stake_map
                     .entry(key)
                     .or_insert(Lovelace(0));
-                Arc::make_mut(&mut self.certs.reward_accounts)
-                    .entry(key)
-                    .or_insert(Lovelace(0));
+                self.certs.reward_accounts.entry(key).or_insert(Lovelace(0));
                 // Stake delegation
-                Arc::make_mut(&mut self.certs.delegations).insert(key, *pool_hash);
+                self.certs.delegations.insert(key, *pool_hash);
                 // Vote delegation
                 Arc::make_mut(&mut self.gov.governance)
                     .vote_delegations
                     .insert(key, drep.clone());
                 self.certs.total_stake_key_deposits += self.epochs.protocol_params.key_deposit.0;
-                std::sync::Arc::make_mut(&mut self.certs.stake_key_deposits)
+                self.certs
+                    .stake_key_deposits
                     .insert(key, self.epochs.protocol_params.key_deposit.0);
                 if matches!(credential, Credential::Script(_)) {
                     self.certs.script_stake_credentials.insert(key);
@@ -561,15 +560,14 @@ impl LedgerState {
                     .stake_map
                     .entry(key)
                     .or_insert(Lovelace(0));
-                Arc::make_mut(&mut self.certs.reward_accounts)
-                    .entry(key)
-                    .or_insert(Lovelace(0));
+                self.certs.reward_accounts.entry(key).or_insert(Lovelace(0));
                 // Vote delegation
                 Arc::make_mut(&mut self.gov.governance)
                     .vote_delegations
                     .insert(key, drep.clone());
                 self.certs.total_stake_key_deposits += self.epochs.protocol_params.key_deposit.0;
-                std::sync::Arc::make_mut(&mut self.certs.stake_key_deposits)
+                self.certs
+                    .stake_key_deposits
                     .insert(key, self.epochs.protocol_params.key_deposit.0);
                 if matches!(credential, Credential::Script(_)) {
                     self.certs.script_stake_credentials.insert(key);
@@ -667,7 +665,7 @@ impl LedgerState {
     #[allow(dead_code)]
     pub(crate) fn process_withdrawal(&mut self, reward_account: &[u8], amount: Lovelace) {
         let key = Self::reward_account_to_hash(reward_account);
-        if let Some(balance) = Arc::make_mut(&mut self.certs.reward_accounts).get_mut(&key) {
+        if let Some(balance) = self.certs.reward_accounts.get_mut(&key) {
             // Per Cardano spec, withdrawal amount must exactly equal the reward balance.
             // During sync from genesis, we may not have accumulated all rewards yet,
             // so we only warn and process as best-effort.
@@ -806,7 +804,7 @@ mod tests {
         // Pre-register
         state.process_certificate(&Certificate::StakeRegistration(cred.clone()));
         // Also add a delegation so we can verify it gets removed
-        Arc::make_mut(&mut state.certs.delegations).insert(key, test_pool_hash());
+        state.certs.delegations.insert(key, test_pool_hash());
         // Manually plant a stake_map entry (simulating a UTxO at this credential)
         state
             .certs
@@ -1011,7 +1009,7 @@ mod tests {
             credential: cred.clone(),
             deposit: Lovelace(2_000_000),
         });
-        Arc::make_mut(&mut state.certs.delegations).insert(key, test_pool_hash());
+        state.certs.delegations.insert(key, test_pool_hash());
 
         // Deregister
         state.process_certificate(&Certificate::ConwayStakeDeregistration {
@@ -1434,7 +1432,9 @@ mod tests {
 
         state.process_certificate(&Certificate::StakeRegistration(cred.clone()));
         // Manually credit some rewards to prove or_insert doesn't reset them.
-        Arc::make_mut(&mut state.certs.reward_accounts)
+        state
+            .certs
+            .reward_accounts
             .entry(key)
             .and_modify(|b| b.0 = 5_000_000);
 
@@ -2088,7 +2088,9 @@ mod tests {
 
         state.process_certificate(&Certificate::StakeRegistration(cred));
         // Manually credit rewards.
-        Arc::make_mut(&mut state.certs.reward_accounts)
+        state
+            .certs
+            .reward_accounts
             .entry(key)
             .and_modify(|b| b.0 = 10_000_000);
 

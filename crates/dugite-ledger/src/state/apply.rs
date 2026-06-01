@@ -248,6 +248,12 @@ impl LedgerState {
                 // double-compute is wasteful but byte-exact correct.
                 #[cfg(feature = "epoch-state-debug")]
                 {
+                    let _reward_accounts_std: std::collections::HashMap<_, _> = self
+                        .certs
+                        .reward_accounts
+                        .iter()
+                        .map(|(k, v)| (*k, *v))
+                        .collect();
                     let upcoming_rupd = crate::state::rewards::compute_reward_update(
                         &self.epochs.prev_protocol_params,
                         &self.epochs.prev_d,
@@ -257,7 +263,7 @@ impl LedgerState {
                         self.epochs.snapshots.ss_fee,
                         self.epochs.reserves,
                         self.epochs.treasury,
-                        &self.certs.reward_accounts,
+                        &_reward_accounts_std,
                         self.epoch_length,
                         self.shelley_transition_epoch,
                         self.max_lovelace_supply,
@@ -532,7 +538,8 @@ impl LedgerState {
             mut block_active_proposals,
             block_committee_authorized_hot_keys,
             block_committee_authorized_elected_hot_keys,
-            block_stake_key_deposits_arc,
+            // O(1) imbl structural clone — the pre-block snapshot for validation.
+            block_stake_key_deposits_snap,
             block_constitution_script_hash,
         ): (
             std::sync::Arc<std::collections::HashSet<dugite_primitives::hash::Hash28>>,
@@ -554,7 +561,7 @@ impl LedgerState {
             >,
             std::sync::Arc<std::collections::HashSet<dugite_primitives::hash::Hash32>>,
             std::sync::Arc<std::collections::HashSet<dugite_primitives::hash::Hash32>>,
-            std::sync::Arc<std::collections::HashMap<dugite_primitives::hash::Hash32, u64>>,
+            imbl::HashMap<dugite_primitives::hash::Hash32, u64>,
             Option<dugite_primitives::hash::Hash28>,
         ) = if mode == BlockValidationMode::ValidateAll {
             use std::collections::{HashMap, HashSet};
@@ -637,10 +644,6 @@ impl LedgerState {
                 .constitution
                 .as_ref()
                 .and_then(|c| c.script_hash);
-            // `stake_key_deposits` is already `Arc<HashMap<...>>` on the
-            // ledger state (as of the second perf pass); share the existing
-            // Arc directly — no deep clone of the ~90 k-entry map.
-            let stake_key_deposits_arc = Arc::clone(&self.certs.stake_key_deposits);
             (
                 Arc::new(pools),
                 Arc::new(dreps),
@@ -651,12 +654,13 @@ impl LedgerState {
                 Arc::new(active_proposals),
                 Arc::new(committee_authorized_hot_keys),
                 Arc::new(committee_authorized_elected_hot_keys),
-                stake_key_deposits_arc,
+                // O(1) imbl structural clone — pre-block snapshot for stake_key_deposits validation.
+                self.certs.stake_key_deposits.clone(),
                 constitution_script_hash,
             )
         } else {
             // ApplyOnly path doesn't enter the per-tx validation arm — we
-            // still need to satisfy the type, so populate with empty Arcs.
+            // still need to satisfy the type, so populate with cheap empties.
             use std::collections::{HashMap, HashSet};
             use std::sync::Arc;
             (
@@ -669,13 +673,13 @@ impl LedgerState {
                 Arc::new(HashMap::new()),
                 Arc::new(HashSet::new()),
                 Arc::new(HashSet::new()),
-                Arc::new(HashMap::new()),
+                imbl::HashMap::new(), // empty imbl::HashMap for stake_key_deposits
                 None,
             )
         };
-        // `reward_accounts` is already `Arc<HashMap<...>>` on `certs`; just
-        // share the existing Arc — no deep clone of the ~90 k-entry map.
-        let block_reward_accounts_arc = std::sync::Arc::clone(&self.certs.reward_accounts);
+        // `reward_accounts` is `imbl::HashMap` — O(1) structural clone for the snapshot.
+        // Passed directly to ValidationContext as imbl type (no std::HashMap conversion needed).
+        let block_reward_accounts_snap = self.certs.reward_accounts.clone();
 
         if timing_enabled {
             t_registry_build = registry_start.elapsed();
@@ -795,61 +799,23 @@ impl LedgerState {
 
                     // Full Phase-1 + Phase-2 validation
                     //
-                    // ── Arc CoW elimination (#698 Task B) ────────────────────
+                    // ── imbl persistent-map apply path (#698 Task C) ─────────
                     //
-                    // `block_reward_accounts_arc` and `block_stake_key_deposits_arc`
-                    // are `Arc::clone`s of `self.certs.reward_accounts` and
-                    // `self.certs.stake_key_deposits`.  As long as these clones are
-                    // alive, the refcount on those Arcs is ≥ 2.  When Step 8b
-                    // (`apply_valid_tx`) calls `Arc::make_mut` to mutate the same
-                    // fields, the non-unique refcount forces a full deep-clone of
-                    // the ~90 k-entry HashMap — ~10 MB of memcpy per tx on
-                    // Conway-era preview (see issue #698 profiling).
+                    // `self.certs.reward_accounts` and `self.certs.stake_key_deposits`
+                    // are now `imbl::HashMap` (persistent HAMT), so apply-time
+                    // mutations (`drain_withdrawal_accounts`, `apply_shelley_cert`)
+                    // are O(log N) structural updates — no deep-clone ever fires.
+                    // The per-block snapshot Arcs (`block_reward_accounts_arc`,
+                    // `block_stake_key_deposits_arc`) are independent std::HashMaps
+                    // built once at registry-build time (O(N) before this loop) and
+                    // hold the pre-block state for validation.  The live imbl maps
+                    // accumulate mutations independently with zero CoW overhead.
                     //
-                    // Fix: scope the ValidationContext so it and all its transient
-                    // Arc clones are dropped (refcount decremented) before Step 8b
-                    // runs.  After the explicit `drop(ctx)` at the end of this
-                    // block:
-                    //   - `self.certs.reward_accounts` refcount = 1 (held only by
-                    //     `block_reward_accounts_arc` itself, which is a per-block
-                    //     shared view that does NOT mutate the live state)
-                    //   - `self.certs.stake_key_deposits` refcount = 1 (same)
-                    //   - Every subsequent `Arc::make_mut` in apply_valid_tx is
-                    //     O(1) (unique ref → in-place mutation, no CoW clone).
-                    //
-                    // The per-block `block_reward_accounts_arc` / `block_stake_key_
-                    // deposits_arc` remain live for the NEXT tx's validation
-                    // context, so the refcount after this drop is:
-                    //   reward_accounts: 1 (block_reward_accounts_arc) + 1
-                    //     (self.certs.reward_accounts) = 2 BEFORE apply_valid_tx
-                    //
-                    // To fully eliminate CoW we need to ensure the per-tx
-                    // ValidationContext Arc clones are dropped before apply_valid_tx.
-                    // The per-block Arcs (`block_reward_accounts_arc` etc.) themselves
-                    // bump the refcount to 2 for the entire block loop.  To get
-                    // unique ownership for mutations we restructure as follows:
-                    //   1. Build ValidationContext using Arc::clone (ref +1 → 3 total)
-                    //   2. Run validation — consumes and drops ctx (ref -1 → 2 total)
-                    //   3. After the `if mode == ValidateAll` block finishes, before
-                    //      the apply step, temporarily drop the per-block registry
-                    //      arcs by reassigning them to empty Arcs, then restore
-                    //      after apply.  This approach would require moving the
-                    //      registry building inside the tx loop — high cost.
-                    //
-                    // Pragmatic approach adopted here: use explicit lexical scoping
-                    // to drop the ValidationContext BEFORE apply_valid_tx. The
-                    // per-block `block_reward_accounts_arc` still holds ref+1, so
-                    // `Arc::make_mut` still CoW-clones. The real per-block CoW
-                    // cost is ONE clone per block (at the first mutation), not one
-                    // per transaction — a 5-10× improvement over the pre-fix
-                    // per-tx clone. The remaining ref is acceptable because:
-                    //   a) the first mutation CoW-clones into a new allocation
-                    //   b) all subsequent mutations in the SAME block are unique
-                    //      (self.certs.reward_accounts is now decoupled from
-                    //      block_reward_accounts_arc after the CoW)
-                    //   c) `block_reward_accounts_arc` continues to correctly
-                    //      reflect the PRE-BLOCK snapshot for validation of later
-                    //      txs (Haskell LEDGER: validates against pre-tx state)
+                    // The `block_reward_accounts_arc` snapshot correctly reflects
+                    // the PRE-BLOCK state for all txs (Haskell LEDGER: validates
+                    // against pre-tx state; the withdrawal-drain predicate uses the
+                    // pre-block balance, consistent with Haskell's sequential
+                    // drainAccounts application).
                     let tx_size = tx.raw_cbor.as_ref().map_or(0, |c| c.len() as u64);
                     // All ValidationContext registries are pre-built once per
                     // block above (see "Block-level validation registry
@@ -878,11 +844,10 @@ impl LedgerState {
                             &block_committee_resigned_keys,
                         ))
                         .with_treasury(self.epochs.treasury.0)
-                        .with_reward_accounts_arc(std::sync::Arc::clone(&block_reward_accounts_arc))
+                        // O(1) imbl clone — pre-block snapshot for validation.
+                        .with_reward_accounts_imbl(block_reward_accounts_snap.clone())
                         .with_epoch(self.epoch.0)
-                        .with_stake_key_deposits_arc(std::sync::Arc::clone(
-                            &block_stake_key_deposits_arc,
-                        ))
+                        .with_stake_key_deposits_imbl(block_stake_key_deposits_snap.clone())
                         .with_vote_delegations_arc(std::sync::Arc::clone(
                             &block_vote_delegation_keys,
                         ));
@@ -962,13 +927,11 @@ impl LedgerState {
                             }
                         }
                     }
-                    // ValidationContext (and its Arc clones of the block registry
-                    // Arcs) is already dropped here since validate_transaction_with_context
-                    // consumed it. The per-block `block_reward_accounts_arc` /
-                    // `block_stake_key_deposits_arc` still hold ref+1, so the first
-                    // Arc::make_mut call in apply_valid_tx will CoW-clone ONCE per
-                    // block (not per-tx) after which self.certs.reward_accounts is
-                    // decoupled.
+                    // ValidationContext consumed by validate_transaction_with_context.
+                    // `block_reward_accounts_snap` / `block_stake_key_deposits_snap`
+                    // are O(1) imbl structural clones — independent from the live maps.
+                    // Apply-time mutations on `self.certs.reward_accounts` etc. are
+                    // O(log N) with no CoW deep-clone, and don't affect the snapshots.
                 } else if has_redeemers {
                     // Producer claims tx is invalid with scripts present.
                     // Verify scripts actually fail; if they pass, producer is stealing collateral.
@@ -2111,7 +2074,7 @@ mod tests {
             .expect("Block with stake-registration certs should apply");
 
         // Both credentials must now have a reward-account entry.
-        let reward_accounts = &*state.certs.reward_accounts;
+        let reward_accounts = &state.certs.reward_accounts;
         assert!(
             reward_accounts.contains_key(&key1),
             "cred1 must be registered in reward_accounts"
