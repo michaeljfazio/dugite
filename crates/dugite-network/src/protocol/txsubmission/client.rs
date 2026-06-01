@@ -12,6 +12,8 @@
 
 use std::sync::Arc;
 
+use tokio_util::sync::CancellationToken;
+
 use crate::error::ProtocolError;
 use crate::mux::channel::MuxChannel;
 
@@ -52,9 +54,24 @@ impl TxSubmissionClient {
     /// Run the TxSubmission2 client protocol.
     ///
     /// Sends `MsgInit`, then responds to server requests until `MsgDone`.
+    ///
+    /// The `cancel` token is checked at every blocking await so that hot→warm
+    /// demotion (`stop_hot_protocols_and_recover`) always completes within
+    /// `spsDeactivateTimeout` (5 s). The two await points that need guarding:
+    ///
+    /// 1. `channel.recv()` — waiting for `MsgRequestTxIds` / `MsgRequestTxs`.
+    ///    Returns `Ok(None)` on cancel so the caller's outer `select!` arm can
+    ///    resolve. Actually we return `Err(Cancelled)` which the outer select
+    ///    handles by returning without a failure report.
+    ///
+    /// 2. The blocking-mode mempool poll (500 ms fallback sleep or Notify wait)
+    ///    when the peer sends a blocking `MsgRequestTxIds` with an empty mempool.
+    ///    Without cancel, this loop sleeps 500 ms per iteration and the task
+    ///    cannot be stopped faster than that.
     pub async fn run<S: TxSource>(
         channel: &mut MuxChannel,
         source: &S,
+        cancel: &CancellationToken,
     ) -> Result<(), ProtocolError> {
         // Send MsgInit
         let init = encode_message(&TxSubmissionMessage::MsgInit);
@@ -62,8 +79,16 @@ impl TxSubmissionClient {
         tracing::debug!("txsubmission2 client: MsgInit sent, awaiting server requests");
 
         loop {
-            // Wait for server request
-            let msg_bytes = channel.recv().await.map_err(ProtocolError::from)?;
+            // Wait for server request — guarded by cancel so hot→warm demotion
+            // can stop this task promptly even when the peer is silent.
+            let msg_bytes = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    tracing::debug!("txsubmission2 client: cancelled while waiting for server request");
+                    return Ok(());
+                }
+                result = channel.recv() => result.map_err(ProtocolError::from)?
+            };
             let msg = decode_message(&msg_bytes).map_err(|e| ProtocolError::CborDecode {
                 protocol: "TxSubmission2",
                 reason: e,
@@ -136,9 +161,20 @@ impl TxSubmissionClient {
                             // fallback so we still re-poll periodically if a
                             // TxSource impl doesn't provide a Notify (test
                             // mocks) or to provide defence-in-depth.
+                            //
+                            // CANCELLATION: both branches guard against cancel so
+                            // that hot→warm demotion exits this inner loop
+                            // immediately rather than waiting up to 500 ms.
                             match notified {
                                 Some(fut) => {
                                     tokio::select! {
+                                        biased;
+                                        _ = cancel.cancelled() => {
+                                            tracing::debug!(
+                                                "txsubmission2 client: cancelled while waiting for mempool txs (notify path)"
+                                            );
+                                            return Ok(());
+                                        }
                                         _ = fut => {}
                                         _ = tokio::time::sleep(
                                             std::time::Duration::from_millis(500),
@@ -146,7 +182,18 @@ impl TxSubmissionClient {
                                     }
                                 }
                                 None => {
-                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                    tokio::select! {
+                                        biased;
+                                        _ = cancel.cancelled() => {
+                                            tracing::debug!(
+                                                "txsubmission2 client: cancelled while waiting for mempool txs (sleep path)"
+                                            );
+                                            return Ok(());
+                                        }
+                                        _ = tokio::time::sleep(
+                                            std::time::Duration::from_millis(500),
+                                        ) => {}
+                                    }
                                 }
                             }
                         }
@@ -244,8 +291,10 @@ mod tests {
             txs: vec![([0xAA; 32], vec![0x01, 0x02])],
         };
 
-        let handle =
-            tokio::spawn(async move { TxSubmissionClient::run(&mut channel, &source).await });
+        let handle = tokio::spawn(async move {
+            let cancel = CancellationToken::new();
+            TxSubmissionClient::run(&mut channel, &source, &cancel).await
+        });
 
         // Read MsgInit
         let (_, _, init) = egress_rx.recv().await.unwrap();
@@ -296,8 +345,10 @@ mod tests {
             txs: vec![],
         };
 
-        let handle =
-            tokio::spawn(async move { TxSubmissionClient::run(&mut channel, &source).await });
+        let handle = tokio::spawn(async move {
+            let cancel = CancellationToken::new();
+            TxSubmissionClient::run(&mut channel, &source, &cancel).await
+        });
 
         // Read MsgInit
         let _ = egress_rx.recv().await.unwrap();
@@ -376,8 +427,10 @@ mod tests {
             txs: vec![([0xDD; 32], vec![0x99])],
         };
 
-        let handle =
-            tokio::spawn(async move { TxSubmissionClient::run(&mut channel, &source).await });
+        let handle = tokio::spawn(async move {
+            let cancel = CancellationToken::new();
+            TxSubmissionClient::run(&mut channel, &source, &cancel).await
+        });
 
         // Read MsgInit
         let _ = egress_rx.recv().await.unwrap();
@@ -457,8 +510,10 @@ mod tests {
             txs: vec![([0xEE; 32], vec![0x77])],
         };
 
-        let handle =
-            tokio::spawn(async move { TxSubmissionClient::run(&mut channel, &source).await });
+        let handle = tokio::spawn(async move {
+            let cancel = CancellationToken::new();
+            TxSubmissionClient::run(&mut channel, &source, &cancel).await
+        });
 
         // Drain MsgInit (sent immediately on startup).
         let _ = egress_rx.recv().await.unwrap();
@@ -558,8 +613,10 @@ mod tests {
             txs: vec![([0xCC; 32], vec![0x44])],
         };
 
-        let handle =
-            tokio::spawn(async move { TxSubmissionClient::run(&mut channel, &source).await });
+        let handle = tokio::spawn(async move {
+            let cancel = CancellationToken::new();
+            TxSubmissionClient::run(&mut channel, &source, &cancel).await
+        });
 
         // Drain MsgInit.
         let _ = egress_rx.recv().await.unwrap();
