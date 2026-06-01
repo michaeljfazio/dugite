@@ -26,7 +26,7 @@
 //! - Rule 13 — native script evaluation
 //! - Rule 14 — Ed25519 vkey/bootstrap witness signature verification
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use dugite_primitives::credentials::Credential;
 use dugite_primitives::hash::{Hash28, Hash32};
@@ -603,7 +603,7 @@ pub(super) fn run_phase1_rules(
     registered_pools: Option<&std::collections::HashSet<Hash28>>,
     current_epoch: Option<u64>,
     node_network: Option<dugite_primitives::network::NetworkId>,
-    stake_key_deposits: Option<&HashMap<Hash32, u64>>,
+    stake_key_deposits: Option<&imbl::HashMap<Hash32, u64>>,
     errors: &mut Vec<ValidationError>,
 ) {
     let body = &tx.body;
@@ -3011,7 +3011,6 @@ mod tests {
     #[test]
     fn test_conway_stake_dereg_refund_mismatch_rejected() {
         use dugite_primitives::transaction::Certificate;
-        use std::collections::HashMap;
 
         let (utxo_set, mut tx, _) = make_valid_tx();
         let mut params = ProtocolParameters::mainnet_defaults();
@@ -3024,7 +3023,7 @@ mod tests {
         let cred_hash = cred.to_typed_hash32();
 
         // Record the stored deposit for this credential.
-        let mut stake_key_deposits = HashMap::new();
+        let mut stake_key_deposits = imbl::HashMap::new();
         stake_key_deposits.insert(cred_hash, 2_000_000u64);
 
         tx.body

@@ -454,27 +454,27 @@ pub(crate) fn apply_shelley_cert(
                 .stake_map
                 .entry(key)
                 .or_insert(Lovelace(0));
-            Arc::make_mut(&mut certs.reward_accounts)
-                .entry(key)
-                .or_insert(Lovelace(0));
+            certs.reward_accounts.entry(key).or_insert(Lovelace(0));
             if matches!(credential, Credential::Script(_)) {
                 certs.script_stake_credentials.insert(key);
             }
             certs.total_stake_key_deposits += epochs.protocol_params.key_deposit.0;
-            Arc::make_mut(&mut certs.stake_key_deposits)
+            certs
+                .stake_key_deposits
                 .insert(key, epochs.protocol_params.key_deposit.0);
             debug!("Stake key registered: {}", key.to_hex());
         }
         Certificate::StakeDeregistration(credential) => {
             let key = credential_to_hash(credential);
-            let stored_deposit = Arc::make_mut(&mut certs.stake_key_deposits)
+            let stored_deposit = certs
+                .stake_key_deposits
                 .remove(&key)
                 .unwrap_or(epochs.protocol_params.key_deposit.0);
             certs.total_stake_key_deposits = certs
                 .total_stake_key_deposits
                 .saturating_sub(stored_deposit);
-            Arc::make_mut(&mut certs.delegations).remove(&key);
-            Arc::make_mut(&mut certs.reward_accounts).remove(&key);
+            certs.delegations.remove(&key);
+            certs.reward_accounts.remove(&key);
             // Remove DRep delegation -- Haskell's unified map clears all credential
             // data on deregistration, including vote delegations.
             Arc::make_mut(&mut gov.governance)
@@ -489,7 +489,7 @@ pub(crate) fn apply_shelley_cert(
             pool_hash,
         } => {
             let key = credential_to_hash(credential);
-            Arc::make_mut(&mut certs.delegations).insert(key, *pool_hash);
+            certs.delegations.insert(key, *pool_hash);
             debug!("Stake delegated to pool: {}", pool_hash.to_hex());
         }
         Certificate::PoolRegistration(params) => {
@@ -616,7 +616,7 @@ pub(crate) fn apply_shelley_cert(
 pub(crate) fn drain_withdrawal_accounts(tx: &Transaction, certs: &mut CertSubState) {
     for (reward_account, amount) in &tx.body.withdrawals {
         let key = reward_account_to_hash(reward_account);
-        if let Some(balance) = Arc::make_mut(&mut certs.reward_accounts).get_mut(&key) {
+        if let Some(balance) = certs.reward_accounts.get_mut(&key) {
             if balance.0 != amount.0 {
                 debug!(
                     account = %key.to_hex(),
@@ -954,12 +954,12 @@ mod tests {
     /// Create a minimal CertSubState for testing.
     fn empty_cert_sub() -> CertSubState {
         CertSubState {
-            delegations: Arc::new(HashMap::new()),
+            delegations: imbl::HashMap::new(),
             pool_params: Arc::new(HashMap::new()),
             future_pool_params: HashMap::new(),
             pending_retirements: HashMap::new(),
-            reward_accounts: Arc::new(HashMap::new()),
-            stake_key_deposits: Arc::new(HashMap::new()),
+            reward_accounts: imbl::HashMap::new(),
+            stake_key_deposits: imbl::HashMap::new(),
             pool_deposits: HashMap::new(),
             total_stake_key_deposits: 0,
             pointer_map: HashMap::new(),
@@ -1403,9 +1403,9 @@ mod tests {
         let cred = Credential::VerificationKey(Hash28::from_bytes([6u8; 28]));
         let key = credential_to_hash(&cred);
 
-        Arc::make_mut(&mut certs.reward_accounts).insert(key, Lovelace(500));
-        Arc::make_mut(&mut certs.delegations).insert(key, Hash28::from_bytes([7u8; 28]));
-        Arc::make_mut(&mut certs.stake_key_deposits).insert(key, 2_000_000);
+        certs.reward_accounts.insert(key, Lovelace(500));
+        certs.delegations.insert(key, Hash28::from_bytes([7u8; 28]));
+        certs.stake_key_deposits.insert(key, 2_000_000);
         certs.total_stake_key_deposits = 2_000_000;
 
         let mut tx = make_tx(Hash32::from_bytes([51u8; 32]), vec![], vec![], 0);
@@ -1483,7 +1483,7 @@ mod tests {
         let mut reward_addr = vec![0xe0u8];
         reward_addr.extend_from_slice(&[11u8; 28]);
         let key = reward_account_to_hash(&reward_addr);
-        Arc::make_mut(&mut certs.reward_accounts).insert(key, Lovelace(500));
+        certs.reward_accounts.insert(key, Lovelace(500));
 
         let mut tx = make_tx(Hash32::from_bytes([60u8; 32]), vec![], vec![], 0);
         tx.body.withdrawals = BTreeMap::from([(reward_addr, Lovelace(500))]);
@@ -1500,7 +1500,7 @@ mod tests {
         let mut reward_addr = vec![0xe0u8];
         reward_addr.extend_from_slice(&[12u8; 28]);
         let key = reward_account_to_hash(&reward_addr);
-        Arc::make_mut(&mut certs.reward_accounts).insert(key, Lovelace(1000));
+        certs.reward_accounts.insert(key, Lovelace(1000));
 
         let mut tx = make_tx(Hash32::from_bytes([61u8; 32]), vec![], vec![], 0);
         tx.body.withdrawals = BTreeMap::from([(reward_addr, Lovelace(500))]);

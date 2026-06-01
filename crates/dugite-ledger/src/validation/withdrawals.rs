@@ -20,7 +20,7 @@
 //!   withdrawals. Reference: Haskell
 //!   `Cardano.Ledger.Conway.Rules.Ledger.testIncompleteAndMissingWithdrawals`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use dugite_primitives::hash::Hash32;
 use dugite_primitives::value::Lovelace;
@@ -47,7 +47,7 @@ pub struct WithdrawalSplit {
 pub fn withdrawals_that_do_not_drain_accounts(
     withdrawals: &BTreeMap<Vec<u8>, Lovelace>,
     network_id: u8,
-    reward_accounts: &HashMap<Hash32, Lovelace>,
+    reward_accounts: &imbl::HashMap<Hash32, Lovelace>,
 ) -> Option<WithdrawalSplit> {
     let mut missing = Vec::new();
     let mut incomplete = Vec::new();
@@ -133,7 +133,7 @@ mod tests {
         let addr = key_addr(1, 0xab);
         withdrawals.insert(addr.clone(), Lovelace(100));
 
-        let mut accounts = HashMap::new();
+        let mut accounts = imbl::HashMap::new();
         accounts.insert(make_key(&addr), Lovelace(100));
 
         assert_eq!(
@@ -148,7 +148,7 @@ mod tests {
         let addr = key_addr(1, 0xcd);
         withdrawals.insert(addr.clone(), Lovelace(50));
 
-        let accounts = HashMap::new(); // empty — addr is unregistered
+        let accounts = imbl::HashMap::new(); // empty — addr is unregistered
         let split =
             withdrawals_that_do_not_drain_accounts(&withdrawals, 1, &accounts).expect("err");
         assert_eq!(split.missing, vec![(hex_encode(&addr), 50)]);
@@ -163,7 +163,7 @@ mod tests {
 
         // Even if the credential is "registered" with the same bytes, mainnet
         // (bit=1) won't see this as matching network.
-        let mut accounts = HashMap::new();
+        let mut accounts = imbl::HashMap::new();
         accounts.insert(make_key(&testnet_addr), Lovelace(75));
 
         let split =
@@ -178,7 +178,7 @@ mod tests {
         let addr = key_addr(1, 0x11);
         withdrawals.insert(addr.clone(), Lovelace(40));
 
-        let mut accounts = HashMap::new();
+        let mut accounts = imbl::HashMap::new();
         accounts.insert(make_key(&addr), Lovelace(100)); // expected 100, supplied 40
 
         let split =
@@ -197,7 +197,7 @@ mod tests {
         withdrawals.insert(addr_b.clone(), Lovelace(20));
         withdrawals.insert(addr_c.clone(), Lovelace(30));
 
-        let mut accounts = HashMap::new();
+        let mut accounts = imbl::HashMap::new();
         accounts.insert(make_key(&addr_b), Lovelace(99));
         accounts.insert(make_key(&addr_c), Lovelace(30));
 
@@ -218,7 +218,7 @@ mod tests {
         withdrawals.insert(script.clone(), Lovelace(5));
 
         let key = key_addr(1, 0x77);
-        let mut accounts = HashMap::new();
+        let mut accounts = imbl::HashMap::new();
         accounts.insert(make_key(&key), Lovelace(5));
 
         let split =

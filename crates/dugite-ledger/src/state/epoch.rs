@@ -126,7 +126,9 @@ impl LedgerState {
             for (cred_hash, reward) in &rupd.rewards {
                 if reward.0 > 0 {
                     if self.certs.reward_accounts.contains_key(cred_hash) {
-                        *Arc::make_mut(&mut self.certs.reward_accounts)
+                        *self
+                            .certs
+                            .reward_accounts
                             .entry(*cred_hash)
                             .or_insert(Lovelace(0)) += *reward;
                         total_applied += reward.0;
@@ -320,9 +322,17 @@ impl LedgerState {
             "Epoch snapshot: stake distribution rebuilt from UTxO set"
         );
 
+        // Convert imbl::HashMap delegations → Arc<std::HashMap> for StakeSnapshot.
+        let mark_delegations_epoch = std::sync::Arc::new(
+            self.certs
+                .delegations
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect::<std::collections::HashMap<_, _>>(),
+        );
         self.epochs.snapshots.mark = Some(StakeSnapshot {
             epoch: new_epoch,
-            delegations: Arc::clone(&self.certs.delegations),
+            delegations: mark_delegations_epoch,
             pool_stake,
             pool_params: Arc::clone(&self.certs.pool_params),
             stake_distribution: Arc::new(snapshot_stake),
@@ -416,7 +426,9 @@ impl LedgerState {
                     // If unregistered, refund goes to treasury (matching Haskell's POOLREAP
                     // which filters unclaimed refunds to treasury).
                     if self.certs.reward_accounts.contains_key(&op_key) {
-                        *Arc::make_mut(&mut self.certs.reward_accounts)
+                        *self
+                            .certs
+                            .reward_accounts
                             .entry(op_key)
                             .or_insert(Lovelace(0)) += pool_deposit;
                     } else {
@@ -433,7 +445,8 @@ impl LedgerState {
                         );
                     }
                     // Remove delegations to the retired pool
-                    Arc::make_mut(&mut self.certs.delegations)
+                    self.certs
+                        .delegations
                         .retain(|_, delegated_pool| delegated_pool != pool_id);
                     debug!(
                         "Pool retired at epoch {}: {} (deposit {} refunded)",
@@ -1147,7 +1160,10 @@ mod tests {
 
         // Register the delegator's reward account so rewards are credited (not
         // forwarded to treasury as unregistered).
-        Arc::make_mut(&mut state.certs.reward_accounts).insert(delegator_hash, Lovelace(0));
+        state
+            .certs
+            .reward_accounts
+            .insert(delegator_hash, Lovelace(0));
 
         let before = *state.certs.reward_accounts.get(&delegator_hash).unwrap();
 
@@ -1278,7 +1294,7 @@ mod tests {
 
         let go_snap = StakeSnapshot {
             epoch: EpochNo(0),
-            delegations: Arc::new(HashMap::new()),
+            delegations: Arc::new(std::collections::HashMap::new()),
             pool_stake: pool_stake_map,
             pool_params: Arc::new(pool_params_map),
             stake_distribution: Arc::new(HashMap::new()),
@@ -1339,7 +1355,7 @@ mod tests {
         let mut reward_account = vec![0xe0u8];
         reward_account.extend_from_slice(&[0x77u8; 28]);
         let op_key = LedgerState::reward_account_to_hash(&reward_account);
-        Arc::make_mut(&mut state.certs.reward_accounts).insert(op_key, Lovelace(0));
+        state.certs.reward_accounts.insert(op_key, Lovelace(0));
 
         state.process_certificate(&Certificate::PoolRegistration(pool_params_for(
             pool_id,

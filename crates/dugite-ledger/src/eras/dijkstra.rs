@@ -736,9 +736,8 @@ fn validate_direct_deposits_registration(
 /// 2^64 lovelace cap (well above Cardano's circulating supply).
 fn apply_direct_deposits(tx: &Transaction, certs: &mut CertSubState) {
     use dugite_primitives::value::Lovelace;
-    use std::sync::Arc;
 
-    let accounts = Arc::make_mut(&mut certs.reward_accounts);
+    let accounts = &mut certs.reward_accounts;
     for (reward_account, amount) in &tx.body.direct_deposits {
         let Some(key) = reward_account_bytes_to_typed_hash32(reward_account) else {
             tracing::warn!(
@@ -800,12 +799,12 @@ mod tests {
     }
     fn make_cert_sub() -> CertSubState {
         CertSubState {
-            delegations: Arc::new(HashMap::new()),
+            delegations: imbl::HashMap::new(),
             pool_params: Arc::new(HashMap::new()),
             future_pool_params: HashMap::new(),
             pending_retirements: HashMap::new(),
-            reward_accounts: Arc::new(HashMap::new()),
-            stake_key_deposits: std::sync::Arc::new(HashMap::new()),
+            reward_accounts: imbl::HashMap::new(),
+            stake_key_deposits: imbl::HashMap::new(),
             pool_deposits: HashMap::new(),
             total_stake_key_deposits: 0,
             pointer_map: HashMap::new(),
@@ -1424,12 +1423,12 @@ mod tests {
 
             // ---- ledger state shell ----------------------------------
             let mut certs = CertSubState {
-                delegations: Arc::new(HashMap::new()),
+                delegations: imbl::HashMap::new(),
                 pool_params: Arc::new(HashMap::new()),
                 future_pool_params: HashMap::new(),
                 pending_retirements: HashMap::new(),
-                reward_accounts: Arc::new(HashMap::new()),
-                stake_key_deposits: std::sync::Arc::new(HashMap::new()),
+                reward_accounts: imbl::HashMap::new(),
+                stake_key_deposits: imbl::HashMap::new(),
                 pool_deposits: HashMap::new(),
                 total_stake_key_deposits: 0,
                 pointer_map: HashMap::new(),
@@ -1731,12 +1730,12 @@ mod tests {
                 pending_donations: Lovelace(0),
             };
             let mut certs = CertSubState {
-                delegations: Arc::new(HashMap::new()),
+                delegations: imbl::HashMap::new(),
                 pool_params: Arc::new(HashMap::new()),
                 future_pool_params: HashMap::new(),
                 pending_retirements: HashMap::new(),
-                reward_accounts: Arc::new(HashMap::new()),
-                stake_key_deposits: std::sync::Arc::new(HashMap::new()),
+                reward_accounts: imbl::HashMap::new(),
+                stake_key_deposits: imbl::HashMap::new(),
                 pool_deposits: HashMap::new(),
                 total_stake_key_deposits: 0,
                 pointer_map: HashMap::new(),
@@ -1950,12 +1949,12 @@ mod tests {
                 }
 
                 let certs = CertSubState {
-                    delegations: Arc::new(HashMap::new()),
+                    delegations: imbl::HashMap::new(),
                     pool_params: Arc::new(HashMap::new()),
                     future_pool_params: HashMap::new(),
                     pending_retirements: HashMap::new(),
-                    reward_accounts: Arc::new(reward_accounts),
-                    stake_key_deposits: std::sync::Arc::new(HashMap::new()),
+                    reward_accounts: reward_accounts.into_iter().collect::<imbl::HashMap<_, _>>(),
+                    stake_key_deposits: imbl::HashMap::new(),
                     pool_deposits: HashMap::new(),
                     total_stake_key_deposits: 0,
                     pointer_map: HashMap::new(),
@@ -2350,12 +2349,12 @@ mod tests {
                 }
 
                 let certs = CertSubState {
-                    delegations: Arc::new(HashMap::new()),
+                    delegations: imbl::HashMap::new(),
                     pool_params: Arc::new(HashMap::new()),
                     future_pool_params: HashMap::new(),
                     pending_retirements: HashMap::new(),
-                    reward_accounts: Arc::new(reward_accounts),
-                    stake_key_deposits: std::sync::Arc::new(HashMap::new()),
+                    reward_accounts: reward_accounts.into_iter().collect::<imbl::HashMap<_, _>>(),
+                    stake_key_deposits: imbl::HashMap::new(),
                     pool_deposits: HashMap::new(),
                     total_stake_key_deposits: 0,
                     pointer_map: HashMap::new(),
@@ -2735,12 +2734,12 @@ mod tests {
                         pending_donations: Lovelace(0),
                     },
                     CertSubState {
-                        delegations: Arc::new(HashMap::new()),
+                        delegations: imbl::HashMap::new(),
                         pool_params: Arc::new(HashMap::new()),
                         future_pool_params: HashMap::new(),
                         pending_retirements: HashMap::new(),
-                        reward_accounts: Arc::new(HashMap::new()),
-                        stake_key_deposits: std::sync::Arc::new(HashMap::new()),
+                        reward_accounts: imbl::HashMap::new(),
+                        stake_key_deposits: imbl::HashMap::new(),
                         pool_deposits: HashMap::new(),
                         total_stake_key_deposits: 0,
                         pointer_map: HashMap::new(),

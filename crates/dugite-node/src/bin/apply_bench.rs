@@ -11,7 +11,7 @@
 //! # Build with profiling symbols (release-prof = release + line tables, no strip):
 //! cargo build --profile release-prof --bin apply_bench -p dugite-node
 //!
-//! # Run (defaults use db-mainnet-pre-alonzo at ep287, Mary-era blocks):
+//! # Run (defaults use db-mainnet-pre-alonzo at ep287, Mary-era blocks, 3000 blocks):
 //! ./target/release-prof/apply_bench
 //!
 //! # Run against a custom DB slice:
@@ -20,12 +20,12 @@
 //!     --utxo-store /path/to/db/utxo-store \
 //!     --immutable-dir /path/to/db/immutable \
 //!     --start-slot <slot_after_snapshot> \
-//!     --block-count 500
+//!     --block-count 3000
 //!
 //! # Profile with samply (macOS):
 //! samply record ./target/release-prof/apply_bench \
 //!     --snapshot ... --utxo-store ... --immutable-dir ... \
-//!     --start-slot ... --block-count 500
+//!     --start-slot ... --block-count 3000
 //! ```
 //!
 //! ## Regression check
@@ -41,6 +41,11 @@
 //! ## Design notes
 //!
 //! - Reads ImmutableDB files OFFLINE (no writes, no ChainDB, no network).
+//! - After each apply, replicates the per-block `publish_ledger_view` cost:
+//!   structural clone of imbl maps (delegations, reward_accounts), Arc-clones
+//!   of pool_params / governance / opcert_counters, ProtocolParameters clone.
+//!   This ensures the benchmark measures the FULL per-block cost the live node
+//!   incurs, not just `apply_block` in isolation.
 //! - `DUGITE_BLOCK_APPLY_TIMING=1` activates per-phase breakdown logging.
 //! - `RUST_LOG=warn` suppresses verbose ledger trace during profiling runs.
 
@@ -51,6 +56,9 @@ use dugite_storage::ImmutableDB;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
+
+// Needed to replicate publish_ledger_view cost (structural clones, Arc-clones)
+use std::sync::Arc;
 
 // ── CLI argument parsing ──────────────────────────────────────────────────
 
@@ -74,7 +82,7 @@ impl Args {
         let mut utxo_store: Option<PathBuf> = None;
         let mut immutable_dir: Option<PathBuf> = None;
         let mut start_slot: Option<u64> = None;
-        let mut block_count = 500usize;
+        let mut block_count = 3_000usize;
         let mut verbose = false;
 
         let mut i = 1;
@@ -116,15 +124,16 @@ impl Args {
             i += 1;
         }
 
-        // Defaults: use db-mainnet-pre-alonzo checkpoint at epoch 287.
-        // Chunk 5 of that DB starts at slot 38653855 (Mary era, epoch 287-288).
+        // Defaults: use db-mainnet-pre-alonzo checkpoint at epoch 286.
+        // Blocks start immediately after the snapshot slot 38472727 (Mary era, epoch 286).
+        // Expected fingerprint: 53d8e6dc015a95f36ccd76d38b300a0b44c52dd48251732e916c67b64d6da389
         let base = PathBuf::from("./db-mainnet-pre-alonzo");
         Args {
             snapshot: snapshot
-                .unwrap_or_else(|| base.join("ledger-snapshot-epoch287-slot38697264.bin")),
+                .unwrap_or_else(|| base.join("ledger-snapshot-epoch286-slot38472727.bin")),
             utxo_store: utxo_store.unwrap_or_else(|| base.join("utxo-store")),
             immutable_dir: immutable_dir.unwrap_or_else(|| base.join("immutable")),
-            start_slot: start_slot.unwrap_or(38_653_855),
+            start_slot: start_slot.unwrap_or(38_472_728),
             block_count,
             verbose,
         }
@@ -140,8 +149,8 @@ OPTIONS:
   --snapshot <path>       Ledger snapshot (.bin) to start from
   --utxo-store <path>     LSM UTxO store directory
   --immutable-dir <path>  ImmutableDB directory (immutable/*.chunk files)
-  --start-slot <n>        First slot to include (default: 38653855)
-  --block-count <n>       Number of blocks to apply (default: 500, 0=all)
+  --start-slot <n>        First slot to include (default: 38472728)
+  --block-count <n>       Number of blocks to apply (default: 3000, 0=all)
   --timing / -v           Print per-block timings to stderr
   --help / -h             This message
 
@@ -149,8 +158,8 @@ DEFAULTS (pre-alonzo Mary-era benchmark):
   snapshot     ./db-mainnet-pre-alonzo/ledger-snapshot-epoch287-slot38697264.bin
   utxo-store   ./db-mainnet-pre-alonzo/utxo-store
   immutable    ./db-mainnet-pre-alonzo/immutable
-  start-slot   38653855  (first block of chunk 5, Mary era)
-  block-count  500
+  start-slot   38472728  (block after epoch286 snapshot, Mary era)
+  block-count  3000
 
 PROFILING:
   Build: cargo build --profile release-prof --bin apply_bench -p dugite-node
@@ -159,6 +168,50 @@ PROFILING:
 REGRESSION:
   The FINGERPRINT on stdout must be identical across optimization iterations.
 "#;
+
+// ── publish_ledger_view cost simulation ──────────────────────────────────
+//
+// Replicates the per-block work that `publish_ledger_view` does in the live
+// node.  Called after every `apply_block` in the benchmark loop so the
+// reported timing includes the FULL per-block cost, not just apply.
+//
+// The live node calls `LedgerView::from_state` which does:
+//   1. ProtocolParameters::clone (~few hundred bytes)
+//   2. Arc::clone for pool_params, governance, epoch_blocks_by_pool,
+//      opcert_counters (after fix: opcert_counters remains std HashMap)
+//   3. imbl::HashMap::clone for delegations + reward_accounts (O(1) after fix;
+//      was O(784K) iterate+collect in iteration-2)
+//   4. EpochSnapshots::clone (Arc-clone chain)
+//   5. Scalar copies
+//
+// We cannot call the actual `LedgerView::from_state` here because the
+// `node::ledger_view` module is only compiled into `dugite-node` binary, not
+// the lib.  We replicate the identical operations directly on `LedgerState`
+// fields (all pub) and `std::hint::black_box` the results to prevent the
+// optimizer from eliding the work.
+#[inline(never)]
+fn simulate_publish_ledger_view(state: &LedgerState) {
+    // 1. ProtocolParameters clone (curPParams + prevPParams)
+    let _pp = std::hint::black_box(state.epochs.protocol_params.clone());
+    let _pp_prev = std::hint::black_box(state.epochs.prev_protocol_params.clone());
+
+    // 2. Arc::clone for Arc-shared maps (O(1) reference-count bump)
+    let _pool_params = std::hint::black_box(Arc::clone(&state.certs.pool_params));
+    let _governance = std::hint::black_box(Arc::clone(&state.gov.governance));
+
+    // 3. imbl::HashMap::clone for the two hot maps — O(1) structural clone
+    //    (was the O(N) iterate+collect bottleneck in iteration-2)
+    let _delegations = std::hint::black_box(state.certs.delegations.clone());
+    let _reward_accounts = std::hint::black_box(state.certs.reward_accounts.clone());
+
+    // 4. EpochSnapshots::clone — internally a chain of Arc-clones
+    let _snapshots = std::hint::black_box(state.epochs.snapshots.clone());
+
+    // 5. Scalar copies (nonces, tip, slot config — a few cache lines)
+    let _epoch_nonce = std::hint::black_box(state.consensus.epoch_nonce);
+    let _candidate_nonce = std::hint::black_box(state.consensus.candidate_nonce);
+    let _evolving_nonce = std::hint::black_box(state.consensus.evolving_nonce);
+}
 
 // ── Ledger fingerprint ────────────────────────────────────────────────────
 
@@ -346,9 +399,15 @@ fn main() {
         let tx_count = block.transactions.len();
 
         // ── THE HOT PATH ──────────────────────────────────────────────
+        // Includes apply_block + publish_ledger_view simulation so we measure
+        // the full per-block cost the live node incurs at tip.
         let t_block = Instant::now();
         match ledger.apply_block(&block, BlockValidationMode::ValidateAll) {
             Ok(()) => {
+                // Replicate publish_ledger_view cost INSIDE the timing window.
+                // This is the fix: iteration-2 had an O(784K) iterate+collect
+                // here that the original apply_bench never measured.
+                simulate_publish_ledger_view(&ledger);
                 let elapsed_us = t_block.elapsed().as_micros() as u64;
                 timings_us.push(elapsed_us);
                 total_txs += tx_count;
@@ -401,9 +460,14 @@ fn main() {
 
     writeln!(err).unwrap();
     writeln!(err, "╔══════════════════════════════════════════════════╗").unwrap();
-    writeln!(err, "║          apply_bench — iteration 0 results       ║").unwrap();
+    writeln!(err, "║   apply_bench — imbl + publish_ledger_view       ║").unwrap();
     writeln!(err, "╚══════════════════════════════════════════════════╝").unwrap();
     writeln!(err, "  blocks applied : {applied}").unwrap();
+    writeln!(
+        err,
+        "  publish_view   : included per block (simulate_publish_ledger_view)"
+    )
+    .unwrap();
     writeln!(err, "  decode errors  : {decode_errors}").unwrap();
     writeln!(err, "  apply errors   : {apply_errors}").unwrap();
     writeln!(err, "  total txs      : {total_txs}").unwrap();

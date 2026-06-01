@@ -833,7 +833,9 @@ fn apply_delegation_change(state: &mut LedgerState, change: &DelegationChange) {
             pointer,
         } => {
             // Ensure reward account exists (registered with 0 balance).
-            Arc::make_mut(&mut state.certs.reward_accounts)
+            state
+                .certs
+                .reward_accounts
                 .entry(*credential_hash)
                 .or_insert(Lovelace(0));
             if *is_script {
@@ -850,8 +852,8 @@ fn apply_delegation_change(state: &mut LedgerState, change: &DelegationChange) {
             credential_hash,
             pointer,
         } => {
-            Arc::make_mut(&mut state.certs.delegations).remove(credential_hash);
-            Arc::make_mut(&mut state.certs.reward_accounts).remove(credential_hash);
+            state.certs.delegations.remove(credential_hash);
+            state.certs.reward_accounts.remove(credential_hash);
             state.certs.script_stake_credentials.remove(credential_hash);
             if let Some(ptr) = pointer {
                 state.certs.pointer_map.remove(ptr);
@@ -861,10 +863,10 @@ fn apply_delegation_change(state: &mut LedgerState, change: &DelegationChange) {
             credential_hash,
             pool_id,
         } => {
-            Arc::make_mut(&mut state.certs.delegations).insert(*credential_hash, *pool_id);
+            state.certs.delegations.insert(*credential_hash, *pool_id);
         }
         DelegationChange::Undelegate { credential_hash } => {
-            Arc::make_mut(&mut state.certs.delegations).remove(credential_hash);
+            state.certs.delegations.remove(credential_hash);
         }
     }
 }
@@ -899,7 +901,7 @@ fn apply_reward_change(state: &mut LedgerState, change: &RewardChange) {
             credential_hash,
             amount,
         } => {
-            let accounts = Arc::make_mut(&mut state.certs.reward_accounts);
+            let accounts = &mut state.certs.reward_accounts;
             let entry = accounts.entry(*credential_hash).or_insert(Lovelace(0));
             entry.0 = entry.0.saturating_add(amount.0);
         }
@@ -907,18 +909,20 @@ fn apply_reward_change(state: &mut LedgerState, change: &RewardChange) {
             credential_hash,
             amount,
         } => {
-            let accounts = Arc::make_mut(&mut state.certs.reward_accounts);
+            let accounts = &mut state.certs.reward_accounts;
             if let Some(bal) = accounts.get_mut(credential_hash) {
                 bal.0 = bal.0.saturating_sub(amount.0);
             }
         }
         RewardChange::Create { credential_hash } => {
-            Arc::make_mut(&mut state.certs.reward_accounts)
+            state
+                .certs
+                .reward_accounts
                 .entry(*credential_hash)
                 .or_insert(Lovelace(0));
         }
         RewardChange::Destroy { credential_hash } => {
-            Arc::make_mut(&mut state.certs.reward_accounts).remove(credential_hash);
+            state.certs.reward_accounts.remove(credential_hash);
         }
     }
 }
@@ -1073,7 +1077,7 @@ fn apply_epoch_transition_delta(state: &mut LedgerState, et: &EpochTransitionDel
 
     // Apply reward credits.
     {
-        let accounts = Arc::make_mut(&mut state.certs.reward_accounts);
+        let accounts = &mut state.certs.reward_accounts;
         for (cred, amount) in &et.reward_credits {
             let bal = accounts.entry(*cred).or_insert(Lovelace(0));
             bal.0 = bal.0.saturating_add(amount.0);

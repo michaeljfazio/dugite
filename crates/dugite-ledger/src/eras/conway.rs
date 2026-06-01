@@ -561,7 +561,8 @@ impl EraRules for ConwayRules {
             for (cred_hash, reward) in &rupd.rewards {
                 if reward.0 > 0 {
                     if certs.reward_accounts.contains_key(cred_hash) {
-                        *Arc::make_mut(&mut certs.reward_accounts)
+                        *certs
+                            .reward_accounts
                             .entry(*cred_hash)
                             .or_insert(Lovelace(0)) += *reward;
                     } else {
@@ -610,6 +611,12 @@ impl EraRules for ConwayRules {
             // where n_opt change 150→500 caused dugite max_pool to shrink
             // by ratio 0.728, missing 60.679K ADA per boundary.
             let rupd_pp = &epochs.prev_protocol_params;
+            // compute_reward_update expects &std::HashMap; convert once per epoch boundary.
+            let reward_accounts_std: std::collections::HashMap<_, _> = certs
+                .reward_accounts
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect();
             let rupd = crate::compute_reward_update(
                 rupd_pp,
                 &epochs.prev_d,
@@ -619,7 +626,7 @@ impl EraRules for ConwayRules {
                 epochs.snapshots.ss_fee,
                 epochs.reserves,
                 epochs.treasury,
-                &certs.reward_accounts,
+                &reward_accounts_std,
                 ctx.epoch_length,
                 ctx.shelley_transition_epoch,
                 ctx.max_lovelace_supply,
@@ -664,7 +671,8 @@ impl EraRules for ConwayRules {
             for (cred_hash, reward) in &rupd.rewards {
                 if reward.0 > 0 {
                     if certs.reward_accounts.contains_key(cred_hash) {
-                        *Arc::make_mut(&mut certs.reward_accounts)
+                        *certs
+                            .reward_accounts
                             .entry(*cred_hash)
                             .or_insert(Lovelace(0)) += *reward;
                     } else {
@@ -756,9 +764,17 @@ impl EraRules for ConwayRules {
         }
 
         // Create the new mark snapshot.
+        // Convert imbl::HashMap delegations → Arc<std::HashMap> for StakeSnapshot.
+        let mark_delegations = std::sync::Arc::new(
+            certs
+                .delegations
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect::<std::collections::HashMap<_, _>>(),
+        );
         epochs.snapshots.mark = Some(StakeSnapshot {
             epoch: new_epoch,
-            delegations: Arc::clone(&certs.delegations),
+            delegations: mark_delegations,
             pool_stake,
             pool_params: Arc::clone(&certs.pool_params),
             stake_distribution: Arc::new(snapshot_stake),
@@ -802,9 +818,7 @@ impl EraRules for ConwayRules {
                         .unwrap_or(epochs.protocol_params.pool_deposit);
                     let op_key = reward_account_to_hash(&pool_reg.reward_account);
                     if certs.reward_accounts.contains_key(&op_key) {
-                        *Arc::make_mut(&mut certs.reward_accounts)
-                            .entry(op_key)
-                            .or_insert(Lovelace(0)) += pool_deposit;
+                        *certs.reward_accounts.entry(op_key).or_insert(Lovelace(0)) += pool_deposit;
                     } else {
                         epochs.treasury.0 = epochs
                             .treasury
@@ -812,7 +826,8 @@ impl EraRules for ConwayRules {
                             .checked_add(pool_deposit.0)
                             .expect("treasury overflow on pool deposit refund");
                     }
-                    Arc::make_mut(&mut certs.delegations)
+                    certs
+                        .delegations
                         .retain(|_, delegated_pool| delegated_pool != pool_id);
                     debug!(
                         "Pool retired at epoch {}: {} (deposit {} refunded)",
@@ -1423,28 +1438,24 @@ fn apply_conway_cert(
                 .stake_map
                 .entry(key)
                 .or_insert(Lovelace(0));
-            Arc::make_mut(&mut certs.reward_accounts)
-                .entry(key)
-                .or_insert(Lovelace(0));
+            certs.reward_accounts.entry(key).or_insert(Lovelace(0));
             if matches!(credential, Credential::Script(_)) {
                 certs.script_stake_credentials.insert(key);
             }
             certs.total_stake_key_deposits += deposit.0;
-            Arc::make_mut(&mut certs.stake_key_deposits).insert(key, deposit.0);
+            certs.stake_key_deposits.insert(key, deposit.0);
             debug!("Conway stake key registered: {}", key.to_hex());
         }
 
         // Conway stake deregistration with explicit refund (cert tag 8).
         Certificate::ConwayStakeDeregistration { credential, refund } => {
             let key = credential.to_typed_hash32();
-            let stored_deposit = Arc::make_mut(&mut certs.stake_key_deposits)
-                .remove(&key)
-                .unwrap_or(refund.0);
+            let stored_deposit = certs.stake_key_deposits.remove(&key).unwrap_or(refund.0);
             certs.total_stake_key_deposits = certs
                 .total_stake_key_deposits
                 .saturating_sub(stored_deposit);
-            Arc::make_mut(&mut certs.delegations).remove(&key);
-            Arc::make_mut(&mut certs.reward_accounts).remove(&key);
+            certs.delegations.remove(&key);
+            certs.reward_accounts.remove(&key);
             governance.vote_delegations.remove(&key);
             certs.script_stake_credentials.remove(&key);
             certs.pointer_map.retain(|_, v| *v != key);
@@ -1510,7 +1521,7 @@ fn apply_conway_cert(
             drep,
         } => {
             let key = credential.to_typed_hash32();
-            Arc::make_mut(&mut certs.delegations).insert(key, *pool_hash);
+            certs.delegations.insert(key, *pool_hash);
             governance.vote_delegations.insert(key, drep.clone());
             debug!(
                 "Stake+vote delegated: {} -> pool {} + DRep",
@@ -1532,16 +1543,14 @@ fn apply_conway_cert(
                 .stake_map
                 .entry(key)
                 .or_insert(Lovelace(0));
-            Arc::make_mut(&mut certs.reward_accounts)
-                .entry(key)
-                .or_insert(Lovelace(0));
+            certs.reward_accounts.entry(key).or_insert(Lovelace(0));
             if matches!(credential, Credential::Script(_)) {
                 certs.script_stake_credentials.insert(key);
             }
             certs.total_stake_key_deposits += deposit.0;
-            Arc::make_mut(&mut certs.stake_key_deposits).insert(key, deposit.0);
+            certs.stake_key_deposits.insert(key, deposit.0);
             // Delegate to pool.
-            Arc::make_mut(&mut certs.delegations).insert(key, *pool_hash);
+            certs.delegations.insert(key, *pool_hash);
             debug!(
                 "RegStakeDeleg: {} -> pool {}",
                 key.to_hex(),
@@ -1563,16 +1572,14 @@ fn apply_conway_cert(
                 .stake_map
                 .entry(key)
                 .or_insert(Lovelace(0));
-            Arc::make_mut(&mut certs.reward_accounts)
-                .entry(key)
-                .or_insert(Lovelace(0));
+            certs.reward_accounts.entry(key).or_insert(Lovelace(0));
             if matches!(credential, Credential::Script(_)) {
                 certs.script_stake_credentials.insert(key);
             }
             certs.total_stake_key_deposits += deposit.0;
-            Arc::make_mut(&mut certs.stake_key_deposits).insert(key, deposit.0);
+            certs.stake_key_deposits.insert(key, deposit.0);
             // Delegate to pool + DRep.
-            Arc::make_mut(&mut certs.delegations).insert(key, *pool_hash);
+            certs.delegations.insert(key, *pool_hash);
             governance.vote_delegations.insert(key, drep.clone());
             debug!(
                 "RegStakeVoteDeleg: {} -> pool {} + DRep",
@@ -1594,14 +1601,12 @@ fn apply_conway_cert(
                 .stake_map
                 .entry(key)
                 .or_insert(Lovelace(0));
-            Arc::make_mut(&mut certs.reward_accounts)
-                .entry(key)
-                .or_insert(Lovelace(0));
+            certs.reward_accounts.entry(key).or_insert(Lovelace(0));
             if matches!(credential, Credential::Script(_)) {
                 certs.script_stake_credentials.insert(key);
             }
             certs.total_stake_key_deposits += deposit.0;
-            Arc::make_mut(&mut certs.stake_key_deposits).insert(key, deposit.0);
+            certs.stake_key_deposits.insert(key, deposit.0);
             // Delegate vote.
             governance.vote_delegations.insert(key, drep.clone());
             debug!("VoteRegDeleg: {} + DRep", key.to_hex());
@@ -1837,12 +1842,12 @@ use dugite_primitives::protocol_params::ProtocolParameters;
 #[cfg(test)]
 fn make_empty_cert_sub() -> CertSubState {
     CertSubState {
-        delegations: Arc::new(HashMap::new()),
+        delegations: imbl::HashMap::new(),
         pool_params: Arc::new(HashMap::new()),
         future_pool_params: HashMap::new(),
         pending_retirements: HashMap::new(),
-        reward_accounts: Arc::new(HashMap::new()),
-        stake_key_deposits: std::sync::Arc::new(HashMap::new()),
+        reward_accounts: imbl::HashMap::new(),
+        stake_key_deposits: imbl::HashMap::new(),
         pool_deposits: HashMap::new(),
         total_stake_key_deposits: 0,
         pointer_map: HashMap::new(),
@@ -1949,12 +1954,12 @@ mod tests {
 
     fn make_cert_sub() -> CertSubState {
         CertSubState {
-            delegations: Arc::new(HashMap::new()),
+            delegations: imbl::HashMap::new(),
             pool_params: Arc::new(HashMap::new()),
             future_pool_params: HashMap::new(),
             pending_retirements: HashMap::new(),
-            reward_accounts: Arc::new(HashMap::new()),
-            stake_key_deposits: std::sync::Arc::new(HashMap::new()),
+            reward_accounts: imbl::HashMap::new(),
+            stake_key_deposits: imbl::HashMap::new(),
             pool_deposits: HashMap::new(),
             total_stake_key_deposits: 0,
             pointer_map: HashMap::new(),
@@ -2836,7 +2841,7 @@ mod tests {
 
         // Create the reward account so the deposit can be refunded.
         let op_key = reward_account_to_hash(&reward_addr);
-        Arc::make_mut(&mut certs.reward_accounts).insert(op_key, Lovelace(0));
+        certs.reward_accounts.insert(op_key, Lovelace(0));
 
         let result = rules.process_epoch_transition(
             EpochNo(6),
@@ -3043,9 +3048,9 @@ mod tests {
         let mut certs = make_cert_sub();
         // Pre-state: credential is registered + delegated to the pool (as it
         // would be at the start of the suspect tx on-chain).
-        Arc::make_mut(&mut certs.delegations).insert(key, pool_id);
-        Arc::make_mut(&mut certs.reward_accounts).insert(key, Lovelace(0));
-        Arc::make_mut(&mut certs.stake_key_deposits).insert(key, 2_000_000);
+        certs.delegations.insert(key, pool_id);
+        certs.reward_accounts.insert(key, Lovelace(0));
+        certs.stake_key_deposits.insert(key, 2_000_000);
         certs.total_stake_key_deposits = 2_000_000;
         certs.script_stake_credentials.insert(key);
         certs
@@ -3708,7 +3713,7 @@ mod tests {
         let cred_hash = key_cred_hash(cred);
 
         let mut certs = make_cert_sub();
-        Arc::make_mut(&mut certs.reward_accounts).insert(cred_hash, Lovelace(500_000));
+        certs.reward_accounts.insert(cred_hash, Lovelace(500_000));
 
         // Add vote delegation for this credential.
         let mut gov = make_gov_sub();
@@ -3763,7 +3768,7 @@ mod tests {
         let cred_hash = key_cred_hash(cred);
 
         let mut certs = make_cert_sub();
-        Arc::make_mut(&mut certs.reward_accounts).insert(cred_hash, Lovelace(200_000));
+        certs.reward_accounts.insert(cred_hash, Lovelace(200_000));
 
         // No vote delegation — but PV < 10 so check should be skipped.
         let mut gov = make_gov_sub();
@@ -3824,7 +3829,7 @@ mod tests {
         let cred_hash = key_cred_hash(cred);
 
         let mut certs = make_cert_sub();
-        Arc::make_mut(&mut certs.reward_accounts).insert(cred_hash, Lovelace(4_127_037));
+        certs.reward_accounts.insert(cred_hash, Lovelace(4_127_037));
 
         // The credential IS delegated (satisfying step 3) but the amount differs.
         let mut gov = make_gov_sub();
@@ -3886,7 +3891,7 @@ mod tests {
         let cred_hash = key_cred_hash(cred);
 
         let mut certs = make_cert_sub();
-        Arc::make_mut(&mut certs.reward_accounts).insert(cred_hash, Lovelace(100_000));
+        certs.reward_accounts.insert(cred_hash, Lovelace(100_000));
 
         let mut gov = make_gov_sub();
         Arc::make_mut(&mut gov.governance)
@@ -3946,7 +3951,7 @@ mod tests {
         let cred_hash = key_cred_hash(cred);
 
         let mut certs = make_cert_sub();
-        Arc::make_mut(&mut certs.reward_accounts).insert(cred_hash, Lovelace(500_000));
+        certs.reward_accounts.insert(cred_hash, Lovelace(500_000));
 
         // No DRep delegation.
         let mut gov = make_gov_sub();
@@ -4005,7 +4010,7 @@ mod tests {
         let cred_hash = key_cred_hash(cred);
 
         let mut certs = make_cert_sub();
-        Arc::make_mut(&mut certs.reward_accounts).insert(cred_hash, Lovelace(400_000));
+        certs.reward_accounts.insert(cred_hash, Lovelace(400_000));
 
         // No DRep delegation — must be rejected unconditionally per Haskell.
         let mut gov = make_gov_sub();
@@ -4063,7 +4068,9 @@ mod tests {
         let script_cred_hash = Hash32::from_bytes(script_key_bytes);
 
         let mut certs = make_cert_sub();
-        Arc::make_mut(&mut certs.reward_accounts).insert(script_cred_hash, Lovelace(300_000));
+        certs
+            .reward_accounts
+            .insert(script_cred_hash, Lovelace(300_000));
 
         // No vote delegation for this script credential — should still succeed
         // because script credentials skip the delegation check.
@@ -4202,7 +4209,7 @@ mod tests {
                 },
             );
             let stake_key = Hash32::from_bytes([150u8 + i; 32]);
-            Arc::make_mut(&mut certs.delegations).insert(stake_key, pool_id);
+            certs.delegations.insert(stake_key, pool_id);
             certs
                 .stake_distribution
                 .stake_map
@@ -4217,7 +4224,7 @@ mod tests {
         let pool_params_snap = certs.pool_params.clone();
         let make_snap = || crate::state::StakeSnapshot {
             epoch: ctx.current_epoch,
-            delegations: Arc::new(HashMap::new()),
+            delegations: Arc::new(std::collections::HashMap::new()),
             pool_stake: mark_pool_stake.clone(),
             pool_params: pool_params_snap.clone(),
             stake_distribution: Arc::new(HashMap::new()),
@@ -4446,7 +4453,7 @@ mod tests {
                 },
             );
             let stake_key = Hash32::from_bytes([150u8 + i; 32]);
-            Arc::make_mut(&mut certs.delegations).insert(stake_key, pool_id);
+            certs.delegations.insert(stake_key, pool_id);
             certs
                 .stake_distribution
                 .stake_map
@@ -4458,7 +4465,7 @@ mod tests {
         let pool_params_snap = certs.pool_params.clone();
         let make_snap = || crate::state::StakeSnapshot {
             epoch: ctx.current_epoch,
-            delegations: Arc::new(HashMap::new()),
+            delegations: Arc::new(std::collections::HashMap::new()),
             pool_stake: pool_stake_snap.clone(),
             pool_params: pool_params_snap.clone(),
             stake_distribution: Arc::new(HashMap::new()),
@@ -4675,7 +4682,7 @@ mod tests {
                 },
             );
             let stake_key = Hash32::from_bytes([150u8 + i; 32]);
-            Arc::make_mut(&mut certs.delegations).insert(stake_key, pool_id);
+            certs.delegations.insert(stake_key, pool_id);
             certs
                 .stake_distribution
                 .stake_map
@@ -4691,7 +4698,7 @@ mod tests {
         let pool_params_snap = certs.pool_params.clone();
         let make_snap = || crate::state::StakeSnapshot {
             epoch: ctx.current_epoch,
-            delegations: Arc::new(HashMap::new()),
+            delegations: Arc::new(std::collections::HashMap::new()),
             pool_stake: mark_pool_stake.clone(),
             pool_params: pool_params_snap.clone(),
             stake_distribution: Arc::new(HashMap::new()),

@@ -297,7 +297,8 @@ impl EraRules for ShelleyRules {
             for (cred_hash, reward) in &rupd.rewards {
                 if reward.0 > 0 {
                     if certs.reward_accounts.contains_key(cred_hash) {
-                        *Arc::make_mut(&mut certs.reward_accounts)
+                        *certs
+                            .reward_accounts
                             .entry(*cred_hash)
                             .or_insert(Lovelace(0)) += *reward;
                     } else {
@@ -356,6 +357,12 @@ impl EraRules for ShelleyRules {
             // where n_opt change 150→500 caused dugite max_pool to shrink
             // by ratio 0.728, missing 60.679K ADA per boundary.
             let rupd_pp = &epochs.prev_protocol_params;
+            // compute_reward_update expects &std::HashMap; convert once per epoch boundary.
+            let reward_accounts_std: std::collections::HashMap<_, _> = certs
+                .reward_accounts
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect();
             let rupd = crate::compute_reward_update(
                 rupd_pp,
                 &epochs.prev_d,
@@ -365,7 +372,7 @@ impl EraRules for ShelleyRules {
                 epochs.snapshots.ss_fee,
                 epochs.reserves,
                 epochs.treasury,
-                &certs.reward_accounts,
+                &reward_accounts_std,
                 ctx.epoch_length,
                 ctx.shelley_transition_epoch,
                 ctx.max_lovelace_supply,
@@ -409,7 +416,8 @@ impl EraRules for ShelleyRules {
             for (cred_hash, reward) in &rupd.rewards {
                 if reward.0 > 0 {
                     if certs.reward_accounts.contains_key(cred_hash) {
-                        *Arc::make_mut(&mut certs.reward_accounts)
+                        *certs
+                            .reward_accounts
                             .entry(*cred_hash)
                             .or_insert(Lovelace(0)) += *reward;
                     } else {
@@ -541,9 +549,17 @@ impl EraRules for ShelleyRules {
         }
 
         // Create the new mark snapshot.
+        // Convert imbl::HashMap delegations → Arc<std::HashMap> for StakeSnapshot.
+        let mark_delegations = std::sync::Arc::new(
+            certs
+                .delegations
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect::<std::collections::HashMap<_, _>>(),
+        );
         epochs.snapshots.mark = Some(StakeSnapshot {
             epoch: new_epoch,
-            delegations: Arc::clone(&certs.delegations),
+            delegations: mark_delegations,
             pool_stake,
             pool_params: Arc::clone(&certs.pool_params),
             stake_distribution: Arc::new(snapshot_stake),
@@ -588,9 +604,7 @@ impl EraRules for ShelleyRules {
                         .unwrap_or(epochs.protocol_params.pool_deposit);
                     let op_key = reward_account_to_hash(&pool_reg.reward_account);
                     if certs.reward_accounts.contains_key(&op_key) {
-                        *Arc::make_mut(&mut certs.reward_accounts)
-                            .entry(op_key)
-                            .or_insert(Lovelace(0)) += pool_deposit;
+                        *certs.reward_accounts.entry(op_key).or_insert(Lovelace(0)) += pool_deposit;
                     } else {
                         epochs.treasury.0 = epochs
                             .treasury
@@ -598,7 +612,8 @@ impl EraRules for ShelleyRules {
                             .checked_add(pool_deposit.0)
                             .expect("treasury overflow on pool deposit refund");
                     }
-                    Arc::make_mut(&mut certs.delegations)
+                    certs
+                        .delegations
                         .retain(|_, delegated_pool| delegated_pool != pool_id);
                     debug!(
                         "Pool retired at epoch {}: {} (deposit {} refunded)",
@@ -1166,12 +1181,12 @@ mod tests {
 
     fn make_cert_sub() -> CertSubState {
         CertSubState {
-            delegations: Arc::new(HashMap::new()),
+            delegations: imbl::HashMap::new(),
             pool_params: Arc::new(HashMap::new()),
             future_pool_params: HashMap::new(),
             pending_retirements: HashMap::new(),
-            reward_accounts: Arc::new(HashMap::new()),
-            stake_key_deposits: std::sync::Arc::new(HashMap::new()),
+            reward_accounts: imbl::HashMap::new(),
+            stake_key_deposits: imbl::HashMap::new(),
             pool_deposits: HashMap::new(),
             total_stake_key_deposits: 0,
             pointer_map: HashMap::new(),
@@ -1692,7 +1707,7 @@ mod tests {
 
         // Register the operator's reward account.
         let op_key = reward_account_to_hash(&[0xe0; 29]);
-        Arc::make_mut(&mut certs.reward_accounts).insert(op_key, Lovelace(0));
+        certs.reward_accounts.insert(op_key, Lovelace(0));
 
         // Schedule retirement at epoch 6.
         certs.pending_retirements.insert(pool_id, EpochNo(6));
@@ -1882,10 +1897,10 @@ mod tests {
 
         // Register the pool and set up delegation.
         Arc::make_mut(&mut certs.pool_params).insert(pool_id, pool_reg.clone());
-        Arc::make_mut(&mut certs.delegations).insert(delegator_cred, pool_id);
+        certs.delegations.insert(delegator_cred, pool_id);
 
         // Register a reward account for the delegator.
-        Arc::make_mut(&mut certs.reward_accounts).insert(delegator_cred, Lovelace(0));
+        certs.reward_accounts.insert(delegator_cred, Lovelace(0));
 
         // Build a GO snapshot with the pool having stake.
         let mut pool_stake = HashMap::new();
@@ -1895,7 +1910,13 @@ mod tests {
 
         let go_snapshot = crate::state::StakeSnapshot {
             epoch: EpochNo(3),
-            delegations: Arc::clone(&certs.delegations),
+            delegations: std::sync::Arc::new(
+                certs
+                    .delegations
+                    .iter()
+                    .map(|(k, v)| (*k, *v))
+                    .collect::<std::collections::HashMap<_, _>>(),
+            ),
             pool_stake,
             pool_params: Arc::clone(&certs.pool_params),
             stake_distribution: Arc::new(stake_dist),

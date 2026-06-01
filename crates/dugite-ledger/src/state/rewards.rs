@@ -5,7 +5,6 @@ use dugite_primitives::value::Lovelace;
 use num_bigint::BigInt;
 use num_traits::{Signed, Zero};
 use std::collections::HashMap;
-use std::sync::Arc;
 use tracing::{debug, warn};
 
 /// Arbitrary-precision rational number matching Haskell's `Rational`.
@@ -578,7 +577,9 @@ impl LedgerState {
             for (cred_hash, reward) in &rupd.rewards {
                 if reward.0 > 0 {
                     if self.certs.reward_accounts.contains_key(cred_hash) {
-                        *Arc::make_mut(&mut self.certs.reward_accounts)
+                        *self
+                            .certs
+                            .reward_accounts
                             .entry(*cred_hash)
                             .or_insert(Lovelace(0)) += *reward;
                         total_applied += reward.0;
@@ -660,6 +661,13 @@ impl LedgerState {
         block_snapshot: &StakeSnapshot,
         epoch_fees: u64,
     ) -> PendingRewardUpdate {
+        // compute_reward_update expects &std::HashMap; convert at call site.
+        let reward_accounts_std: std::collections::HashMap<_, _> = self
+            .certs
+            .reward_accounts
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect();
         compute_reward_update(
             &self.epochs.prev_protocol_params,
             &self.epochs.prev_d,
@@ -669,7 +677,7 @@ impl LedgerState {
             Lovelace(epoch_fees),
             self.epochs.reserves,
             self.epochs.treasury,
-            &self.certs.reward_accounts,
+            &reward_accounts_std,
             self.epoch_length,
             self.shelley_transition_epoch,
             self.max_lovelace_supply,
@@ -702,7 +710,9 @@ impl LedgerState {
             .expect("RUPD delta_treasury overflows treasury u64");
         for (cred_hash, reward) in &rupd.rewards {
             if reward.0 > 0 {
-                *Arc::make_mut(&mut self.certs.reward_accounts)
+                *self
+                    .certs
+                    .reward_accounts
                     .entry(*cred_hash)
                     .or_insert(Lovelace(0)) += *reward;
             }

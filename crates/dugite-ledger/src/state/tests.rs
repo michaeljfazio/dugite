@@ -148,7 +148,7 @@ fn setup_spos_with_stake(state: &mut LedgerState, count: usize, stake_per_spo: u
         );
         // Add delegation and stake
         let stake_key = Hash32::from_bytes([150 + i as u8; 32]);
-        Arc::make_mut(&mut state.certs.delegations).insert(stake_key, pool_id);
+        state.certs.delegations.insert(stake_key, pool_id);
         state
             .certs
             .stake_distribution
@@ -1525,7 +1525,7 @@ fn test_governance_proposal_deposit_refund() {
     let reward_key = Hash28::from_bytes([42u8; 28]).to_hash32_padded();
     // Register the return credential so the deposit refund goes to the
     // reward account (not treasury, per Haskell `returnProposalDeposits`).
-    Arc::make_mut(&mut state.certs.reward_accounts).insert(reward_key, Lovelace(0));
+    state.certs.reward_accounts.insert(reward_key, Lovelace(0));
 
     // Submit a proposal with deposit
     let proposal = ProposalProcedure {
@@ -1577,7 +1577,7 @@ fn test_treasury_withdrawal_credits_reward_account() {
     // Per Haskell `applyEnactedWithdrawals`, withdrawals to unregistered
     // reward accounts are silently dropped — pre-register so the disbursement
     // actually credits.
-    std::sync::Arc::make_mut(&mut state.certs.reward_accounts).insert(reward_key, Lovelace(0));
+    state.certs.reward_accounts.insert(reward_key, Lovelace(0));
 
     let mut withdrawals = std::collections::BTreeMap::new();
     withdrawals.insert(reward_addr, Lovelace(50_000_000_000));
@@ -2311,7 +2311,10 @@ fn test_treasury_withdrawal_ratification() {
     // Pre-register withdrawal target so disbursement actually fires
     // (Haskell silently drops withdrawals to unregistered reward accounts).
     let withdrawal_key = LedgerState::reward_account_to_hash(&[0u8; 29]);
-    Arc::make_mut(&mut state.certs.reward_accounts).insert(withdrawal_key, Lovelace(0));
+    state
+        .certs
+        .reward_accounts
+        .insert(withdrawal_key, Lovelace(0));
 
     let mut withdrawals = BTreeMap::new();
     withdrawals.insert(vec![0u8; 29], Lovelace(5_000_000_000));
@@ -2896,7 +2899,7 @@ fn test_arc_cow_snapshot_shares_data() {
     // Populate with some data
     let cred_hash = Hash32::from_bytes([1u8; 32]);
     let pool_id = Hash28::from_bytes([2u8; 28]);
-    Arc::make_mut(&mut state.certs.delegations).insert(cred_hash, pool_id);
+    state.certs.delegations.insert(cred_hash, pool_id);
     Arc::make_mut(&mut state.certs.pool_params).insert(
         pool_id,
         PoolRegistration {
@@ -2913,24 +2916,28 @@ fn test_arc_cow_snapshot_shares_data() {
             metadata_hash: None,
         },
     );
-    Arc::make_mut(&mut state.certs.reward_accounts).insert(cred_hash, Lovelace(5_000_000));
+    state
+        .certs
+        .reward_accounts
+        .insert(cred_hash, Lovelace(5_000_000));
     Arc::make_mut(&mut state.consensus.epoch_blocks_by_pool).insert(pool_id, 42);
 
     // Clone the state (should be cheap — Arc bumps refcount)
     let snapshot = state.clone();
 
-    // Verify the Arc pointers are the same (data is shared, not deep-copied)
-    assert!(Arc::ptr_eq(
-        &state.certs.delegations,
-        &snapshot.certs.delegations
-    ));
+    // Verify the data is shared (imbl structural sharing; pool_params is still Arc)
+    // For imbl maps, we verify equal contents after clone (O(1) structural share).
+    assert_eq!(
+        state.certs.delegations.len(),
+        snapshot.certs.delegations.len()
+    );
+    assert_eq!(
+        state.certs.reward_accounts.len(),
+        snapshot.certs.reward_accounts.len()
+    );
     assert!(Arc::ptr_eq(
         &state.certs.pool_params,
         &snapshot.certs.pool_params
-    ));
-    assert!(Arc::ptr_eq(
-        &state.certs.reward_accounts,
-        &snapshot.certs.reward_accounts
     ));
     assert!(Arc::ptr_eq(
         &state.consensus.epoch_blocks_by_pool,
@@ -2961,26 +2968,24 @@ fn test_arc_cow_mutation_does_not_affect_snapshot() {
 
     let cred_hash = Hash32::from_bytes([1u8; 32]);
     let pool_id = Hash28::from_bytes([2u8; 28]);
-    Arc::make_mut(&mut state.certs.delegations).insert(cred_hash, pool_id);
-    Arc::make_mut(&mut state.certs.reward_accounts).insert(cred_hash, Lovelace(5_000_000));
+    state.certs.delegations.insert(cred_hash, pool_id);
+    state
+        .certs
+        .reward_accounts
+        .insert(cred_hash, Lovelace(5_000_000));
 
-    // Take a snapshot
+    // Take a snapshot (O(1) imbl structural clone)
     let snapshot = state.clone();
-    assert!(Arc::ptr_eq(
-        &state.certs.delegations,
-        &snapshot.certs.delegations
-    ));
+    assert_eq!(
+        state.certs.delegations.len(),
+        snapshot.certs.delegations.len(),
+        "snapshot should have same contents after O(1) imbl clone"
+    );
 
-    // Mutate the original via Arc::make_mut — this should trigger a clone
+    // Mutate the original — imbl creates a new version (structural sharing)
     let cred_hash_2 = Hash32::from_bytes([3u8; 32]);
     let pool_id_2 = Hash28::from_bytes([4u8; 28]);
-    Arc::make_mut(&mut state.certs.delegations).insert(cred_hash_2, pool_id_2);
-
-    // The Arcs should no longer point to the same data
-    assert!(!Arc::ptr_eq(
-        &state.certs.delegations,
-        &snapshot.certs.delegations
-    ));
+    state.certs.delegations.insert(cred_hash_2, pool_id_2);
 
     // Original has the new entry, snapshot does not
     assert_eq!(state.certs.delegations.len(), 2);
@@ -2989,7 +2994,10 @@ fn test_arc_cow_mutation_does_not_affect_snapshot() {
     assert!(!snapshot.certs.delegations.contains_key(&cred_hash_2));
 
     // Mutate reward_accounts on original
-    Arc::make_mut(&mut state.certs.reward_accounts).insert(cred_hash, Lovelace(10_000_000));
+    state
+        .certs
+        .reward_accounts
+        .insert(cred_hash, Lovelace(10_000_000));
     assert_eq!(
         state.certs.reward_accounts.get(&cred_hash),
         Some(&Lovelace(10_000_000))
@@ -3047,7 +3055,7 @@ fn test_arc_cow_serialization_roundtrip() {
 
     let cred_hash = Hash32::from_bytes([1u8; 32]);
     let pool_id = Hash28::from_bytes([2u8; 28]);
-    Arc::make_mut(&mut state.certs.delegations).insert(cred_hash, pool_id);
+    state.certs.delegations.insert(cred_hash, pool_id);
     Arc::make_mut(&mut state.certs.pool_params).insert(
         pool_id,
         PoolRegistration {
@@ -3064,7 +3072,10 @@ fn test_arc_cow_serialization_roundtrip() {
             metadata_hash: None,
         },
     );
-    Arc::make_mut(&mut state.certs.reward_accounts).insert(cred_hash, Lovelace(5_000_000));
+    state
+        .certs
+        .reward_accounts
+        .insert(cred_hash, Lovelace(5_000_000));
     Arc::make_mut(&mut state.gov.governance).drep_registration_count = 42;
     state.epoch = EpochNo(100);
 
@@ -3098,7 +3109,7 @@ fn test_arc_cow_epoch_snapshot_shares_arcs() {
 
     let cred_hash = Hash32::from_bytes([1u8; 32]);
     let pool_id = Hash28::from_bytes([2u8; 28]);
-    Arc::make_mut(&mut state.certs.delegations).insert(cred_hash, pool_id);
+    state.certs.delegations.insert(cred_hash, pool_id);
     Arc::make_mut(&mut state.certs.pool_params).insert(
         pool_id,
         PoolRegistration {
@@ -3124,15 +3135,21 @@ fn test_arc_cow_epoch_snapshot_shares_arcs() {
     // Trigger epoch transition to create a "mark" snapshot
     state.process_epoch_transition(EpochNo(1));
 
-    // The mark snapshot should share the same Arc as the live state's delegations/pool_params
+    // The mark snapshot should reflect the live state's delegations/pool_params at snapshot time.
+    // (delegations is now imbl::HashMap; mark.delegations is Arc<std::HashMap> — different types,
+    // content equality is the correct invariant.)
     let mark = state.epochs.snapshots.mark.as_ref().unwrap();
-    assert!(Arc::ptr_eq(&state.certs.delegations, &mark.delegations));
+    assert_eq!(
+        state.certs.delegations.len(),
+        mark.delegations.len(),
+        "mark snapshot should have same delegation count as live state"
+    );
     assert!(Arc::ptr_eq(&state.certs.pool_params, &mark.pool_params));
 
     // Now mutate live state — should not affect the snapshot
     let new_cred = Hash32::from_bytes([5u8; 32]);
     let new_pool = Hash28::from_bytes([6u8; 28]);
-    Arc::make_mut(&mut state.certs.delegations).insert(new_cred, new_pool);
+    state.certs.delegations.insert(new_cred, new_pool);
 
     // Live state has 2 delegations, snapshot still has 1
     assert_eq!(state.certs.delegations.len(), 2);
@@ -4099,7 +4116,10 @@ fn test_withdrawal_sets_balance_to_zero() {
 
     // reward_account_to_hash pads 28 bytes to Hash32
     let hash_key = LedgerState::reward_account_to_hash(&reward_account);
-    Arc::make_mut(&mut state.certs.reward_accounts).insert(hash_key, Lovelace(5_000_000));
+    state
+        .certs
+        .reward_accounts
+        .insert(hash_key, Lovelace(5_000_000));
 
     state.process_withdrawal(&reward_account, Lovelace(5_000_000));
     assert_eq!(
@@ -5158,9 +5178,7 @@ fn test_stake_deregistration_rejected_with_nonzero_balance() {
     assert!(state.certs.reward_accounts.contains_key(&key));
 
     // Add some rewards
-    *Arc::make_mut(&mut state.certs.reward_accounts)
-        .get_mut(&key)
-        .unwrap() = Lovelace(500_000);
+    *state.certs.reward_accounts.get_mut(&key).unwrap() = Lovelace(500_000);
 
     // Deregister — applied unconditionally during block application
     state.process_certificate(&Certificate::StakeDeregistration(cred.clone()));
@@ -5208,9 +5226,7 @@ fn test_conway_stake_deregistration_with_nonzero_balance() {
     assert!(state.certs.reward_accounts.contains_key(&key));
 
     // Add rewards
-    *Arc::make_mut(&mut state.certs.reward_accounts)
-        .get_mut(&key)
-        .unwrap() = Lovelace(1_000_000);
+    *state.certs.reward_accounts.get_mut(&key).unwrap() = Lovelace(1_000_000);
 
     // Conway deregistration — should succeed even with non-zero balance
     state.process_certificate(&Certificate::ConwayStakeDeregistration {
@@ -6111,7 +6127,7 @@ fn test_reward_expansion_no_i128_overflow() {
     // Set up minimal structures for calculate_and_distribute_rewards
     let go_snapshot = StakeSnapshot {
         epoch: EpochNo(0),
-        delegations: Arc::new(HashMap::new()),
+        delegations: Arc::new(std::collections::HashMap::new()),
         pool_stake: HashMap::new(),
         pool_params: Arc::new(HashMap::new()),
         stake_distribution: Arc::new(HashMap::new()),
@@ -6158,7 +6174,7 @@ fn test_reward_expansion_large_rho_numerator() {
 
     let go_snapshot = StakeSnapshot {
         epoch: EpochNo(0),
-        delegations: Arc::new(HashMap::new()),
+        delegations: Arc::new(std::collections::HashMap::new()),
         pool_stake: HashMap::new(),
         pool_params: Arc::new(HashMap::new()),
         stake_distribution: Arc::new(HashMap::new()),
@@ -6210,7 +6226,7 @@ fn test_treasury_cut_no_overflow() {
 
     let go_snapshot = StakeSnapshot {
         epoch: EpochNo(0),
-        delegations: Arc::new(HashMap::new()),
+        delegations: Arc::new(std::collections::HashMap::new()),
         pool_stake: HashMap::new(),
         pool_params: Arc::new(HashMap::new()),
         stake_distribution: Arc::new(HashMap::new()),
@@ -6568,7 +6584,7 @@ fn test_reward_zero_reserves_no_expansion() {
     // Only fees are distributed
     let snapshot = StakeSnapshot {
         epoch: EpochNo(1),
-        delegations: Arc::new(HashMap::new()),
+        delegations: Arc::new(std::collections::HashMap::new()),
         pool_stake: HashMap::new(),
         pool_params: Arc::new(HashMap::new()),
         stake_distribution: Arc::new(HashMap::new()),
@@ -6597,7 +6613,7 @@ fn test_reward_rho_zero_no_expansion() {
 
     let snapshot = StakeSnapshot {
         epoch: EpochNo(1),
-        delegations: Arc::new(HashMap::new()),
+        delegations: Arc::new(std::collections::HashMap::new()),
         pool_stake: HashMap::new(),
         pool_params: Arc::new(HashMap::new()),
         stake_distribution: Arc::new(HashMap::new()),
@@ -6622,7 +6638,7 @@ fn test_reward_tau_zero_no_treasury_cut() {
 
     let snapshot = StakeSnapshot {
         epoch: EpochNo(1),
-        delegations: Arc::new(HashMap::new()),
+        delegations: Arc::new(std::collections::HashMap::new()),
         pool_stake: HashMap::new(),
         pool_params: Arc::new(HashMap::new()),
         stake_distribution: Arc::new(HashMap::new()),
@@ -6653,7 +6669,7 @@ fn test_reward_tau_one_all_to_treasury() {
 
     let snapshot = StakeSnapshot {
         epoch: EpochNo(1),
-        delegations: Arc::new(HashMap::new()),
+        delegations: Arc::new(std::collections::HashMap::new()),
         pool_stake: HashMap::new(),
         pool_params: Arc::new(HashMap::new()),
         stake_distribution: Arc::new(HashMap::new()),
@@ -6689,7 +6705,7 @@ fn test_reward_reserves_decrease_treasury_increase() {
 
     let snapshot = StakeSnapshot {
         epoch: EpochNo(1),
-        delegations: Arc::new(HashMap::new()),
+        delegations: Arc::new(std::collections::HashMap::new()),
         pool_stake: HashMap::new(),
         pool_params: Arc::new(HashMap::new()),
         stake_distribution: Arc::new(HashMap::new()),
@@ -6736,7 +6752,7 @@ fn test_reward_max_reserves_no_overflow() {
 
     let snapshot = StakeSnapshot {
         epoch: EpochNo(1),
-        delegations: Arc::new(HashMap::new()),
+        delegations: Arc::new(std::collections::HashMap::new()),
         pool_stake: HashMap::new(),
         pool_params: Arc::new(HashMap::new()),
         stake_distribution: Arc::new(HashMap::new()),
@@ -6765,7 +6781,7 @@ fn test_reward_treasury_tax_correct_amount() {
 
     let snapshot = StakeSnapshot {
         epoch: EpochNo(1),
-        delegations: Arc::new(HashMap::new()),
+        delegations: Arc::new(std::collections::HashMap::new()),
         pool_stake: HashMap::new(),
         pool_params: Arc::new(HashMap::new()),
         stake_distribution: Arc::new(HashMap::new()),
@@ -7619,7 +7635,7 @@ fn test_pool_retirement_at_scheduled_epoch() {
     // Register the operator's reward account so pool deposit refund goes there
     // (unregistered accounts have their refund sent to treasury per Haskell POOLREAP).
     let hash_key = LedgerState::reward_account_to_hash(&reward_addr);
-    Arc::make_mut(&mut state.certs.reward_accounts).insert(hash_key, Lovelace(0));
+    state.certs.reward_accounts.insert(hash_key, Lovelace(0));
 
     // Schedule retirement at epoch 5
     state.certs.pending_retirements.insert(pool_id, EpochNo(5));
@@ -7833,13 +7849,13 @@ fn governance_test_state() -> LedgerState {
         // Create a synthetic delegator for each pool so the epoch-transition
         // mark builder picks up this stake.
         let spo_cred = Hash32::from_bytes([200 + i as u8; 32]);
-        Arc::make_mut(&mut state.certs.delegations).insert(spo_cred, pool_id);
+        state.certs.delegations.insert(spo_cred, pool_id);
         state
             .certs
             .stake_distribution
             .stake_map
             .insert(spo_cred, Lovelace(2_000_000_000_000));
-        Arc::make_mut(&mut state.certs.reward_accounts).insert(spo_cred, Lovelace(0));
+        state.certs.reward_accounts.insert(spo_cred, Lovelace(0));
     }
 
     // Pre-seed the mark snapshot so SPO voting power is available even before
@@ -7853,7 +7869,14 @@ fn governance_test_state() -> LedgerState {
     }
     state.epochs.snapshots.mark = Some(StakeSnapshot {
         epoch: EpochNo(0),
-        delegations: Arc::clone(&state.certs.delegations),
+        delegations: Arc::new(
+            state
+                .certs
+                .delegations
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect::<std::collections::HashMap<_, _>>(),
+        ),
         pool_stake,
         pool_params: Arc::clone(&state.certs.pool_params),
         stake_distribution: Arc::new(HashMap::new()),
@@ -10096,7 +10119,7 @@ fn test_spo_voting_power_prefers_mark_over_set() {
     mark_pool_stake.insert(pool_id, Lovelace(100_000_000));
     state.epochs.snapshots.mark = Some(StakeSnapshot {
         epoch: EpochNo(10),
-        delegations: Arc::new(HashMap::new()),
+        delegations: Arc::new(std::collections::HashMap::new()),
         pool_stake: mark_pool_stake,
         pool_params: Arc::new(HashMap::new()),
         stake_distribution: Arc::new(HashMap::new()),
@@ -10110,7 +10133,7 @@ fn test_spo_voting_power_prefers_mark_over_set() {
     set_pool_stake.insert(pool_id, Lovelace(200_000_000));
     state.epochs.snapshots.set = Some(StakeSnapshot {
         epoch: EpochNo(9),
-        delegations: Arc::new(HashMap::new()),
+        delegations: Arc::new(std::collections::HashMap::new()),
         pool_stake: set_pool_stake,
         pool_params: Arc::new(HashMap::new()),
         stake_distribution: Arc::new(HashMap::new()),
@@ -10139,7 +10162,7 @@ fn test_spo_voting_power_no_mark_entry_falls_back_not_to_set() {
     // Mark snapshot exists but does NOT contain this pool
     state.epochs.snapshots.mark = Some(StakeSnapshot {
         epoch: EpochNo(10),
-        delegations: Arc::new(HashMap::new()),
+        delegations: Arc::new(std::collections::HashMap::new()),
         pool_stake: std::collections::HashMap::new(), // no pool_id entry
         pool_params: Arc::new(HashMap::new()),
         stake_distribution: Arc::new(HashMap::new()),
@@ -10153,7 +10176,7 @@ fn test_spo_voting_power_no_mark_entry_falls_back_not_to_set() {
     set_pool_stake.insert(pool_id, Lovelace(200_000_000));
     state.epochs.snapshots.set = Some(StakeSnapshot {
         epoch: EpochNo(9),
-        delegations: Arc::new(HashMap::new()),
+        delegations: Arc::new(std::collections::HashMap::new()),
         pool_stake: set_pool_stake,
         pool_params: Arc::new(HashMap::new()),
         stake_distribution: Arc::new(HashMap::new()),
@@ -10981,7 +11004,9 @@ fn test_recompute_snapshot_pool_stakes_includes_reward_accounts() {
         .unwrap();
 
     // Manually add a reward balance for the delegator (simulating earned rewards)
-    *std::sync::Arc::make_mut(&mut state.certs.reward_accounts)
+    *state
+        .certs
+        .reward_accounts
         .entry(cred_key)
         .or_insert(Lovelace(0)) = Lovelace(reward_amount);
 
@@ -12867,7 +12892,7 @@ fn test_reward_cross_validation_epoch_1239() {
 
     let go_snapshot = StakeSnapshot {
         epoch: EpochNo(1239),
-        delegations: Arc::new(HashMap::new()),
+        delegations: Arc::new(std::collections::HashMap::new()),
         pool_stake: HashMap::new(),
         pool_params: Arc::new(HashMap::new()),
         stake_distribution: Arc::new(HashMap::new()),
@@ -14389,7 +14414,10 @@ fn test_treasury_withdrawal_via_governance_reduces_treasury() {
     let withdrawal_target_cred = Credential::VerificationKey(Hash28::from_bytes([0x55u8; 28]));
     let withdrawal_target_key = credential_to_hash(&withdrawal_target_cred);
     // Ensure the target has a reward account (even at 0)
-    Arc::make_mut(&mut state.certs.reward_accounts).insert(withdrawal_target_key, Lovelace(0));
+    state
+        .certs
+        .reward_accounts
+        .insert(withdrawal_target_key, Lovelace(0));
 
     let withdrawal_amount = 1_000_000_000u64; // 1B lovelace
                                               // Encode the withdrawal target as a reward account bytes (network byte + credential hash)
@@ -14400,7 +14428,10 @@ fn test_treasury_withdrawal_via_governance_reduces_treasury() {
     // to the reward account (not treasury, per Haskell `returnProposalDeposits`).
     let proposal_return_addr = vec![0u8; 29];
     let proposal_return_key = LedgerState::reward_account_to_hash(&proposal_return_addr);
-    Arc::make_mut(&mut state.certs.reward_accounts).insert(proposal_return_key, Lovelace(0));
+    state
+        .certs
+        .reward_accounts
+        .insert(proposal_return_key, Lovelace(0));
 
     // Submit a TreasuryWithdrawals governance proposal
     let tx_hash = Hash32::from_bytes([0xCCu8; 32]);
@@ -15344,7 +15375,7 @@ fn test_snapshot_roundtrip_preserves_deposit_maps() {
     let key = cred.to_typed_hash32();
     let pool_id = Hash28::from_bytes([0x55; 28]);
 
-    std::sync::Arc::make_mut(&mut state.certs.stake_key_deposits).insert(key, 2_000_000);
+    state.certs.stake_key_deposits.insert(key, 2_000_000);
     state.certs.pool_deposits.insert(pool_id, 500_000_000);
 
     let dir = tempfile::tempdir().unwrap();
@@ -15476,7 +15507,7 @@ fn finalize_genesis_state_no_op_on_mithril_restored_state() {
     let sentinel_pool = Hash28::from_bytes([0x11; 28]);
     let sentinel_snap = StakeSnapshot {
         epoch: EpochNo(0),
-        delegations: Arc::new(HashMap::new()),
+        delegations: Arc::new(std::collections::HashMap::new()),
         pool_stake: {
             let mut m = HashMap::new();
             m.insert(sentinel_pool, Lovelace(999_999_999));

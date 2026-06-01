@@ -41,15 +41,19 @@
 //! - a `Copy` primitive (u64, Hash32),
 //! - a small `Clone` value (ProtocolParameters ~few hundred bytes,
 //!   StakeSnapshot has Arc-shared inner maps),
-//! - an `Arc<...>` (delegations, pool_params, reward_accounts,
-//!   governance, epoch_blocks_by_pool, opcert_counters snapshot).
+//! - an `Arc<...>` (pool_params, governance, epoch_blocks_by_pool,
+//!   opcert_counters snapshot),
+//! - an `imbl::HashMap` (delegations, reward_accounts) — O(1) structural
+//!   clone via persistent HAMT structural sharing.
 //!
 //! Net cost of constructing one view ≈ ProtocolParameters clone + several
-//! `Arc::clone` + a few `EpochSnapshots::clone` (which is mostly Arc-clones
-//! itself). Sub-millisecond at preview/preprod-scale.
+//! `Arc::clone` + two `imbl::HashMap::clone` (O(1)) + one
+//! `EpochSnapshots::clone` (mostly Arc-clones). Sub-millisecond at any scale.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use imbl::HashMap as ImblHashMap;
 
 use dugite_ledger::state::substates::{ConsensusSubState, EpochSubState};
 use dugite_ledger::LedgerState;
@@ -102,10 +106,12 @@ pub struct LedgerView {
     /// Pool registrations (current active map). Mirrors
     /// `LedgerState.certs.pool_params`. Shared via Arc.
     pub pool_params: Arc<HashMap<Hash28, dugite_ledger::state::PoolRegistration>>,
-    /// Delegations: credential -> pool (current active map). Arc-shared.
-    pub delegations: Arc<HashMap<Hash32, Hash28>>,
-    /// Reward accounts: credential -> accumulated rewards. Arc-shared.
-    pub reward_accounts: Arc<HashMap<Hash32, Lovelace>>,
+    /// Delegations: credential -> pool (current active map).
+    /// `imbl::HashMap` so `from_state` is O(1) structural clone — no iterate+collect.
+    pub delegations: ImblHashMap<Hash32, Hash28>,
+    /// Reward accounts: credential -> accumulated rewards.
+    /// `imbl::HashMap` so `from_state` is O(1) structural clone — no iterate+collect.
+    pub reward_accounts: ImblHashMap<Hash32, Lovelace>,
     /// Epoch snapshots (mark / set / go). Used by reward calculations and
     /// by the eager-validation forecast path (issue #652) for the active
     /// stake distribution at a header's slot — the *set* snapshot is the
@@ -181,8 +187,9 @@ impl LedgerView {
             prev_protocol_version_major: epochs.prev_protocol_version_major,
             prev_d: epochs.prev_d.clone(),
             pool_params: Arc::clone(&ls.certs.pool_params),
-            delegations: Arc::clone(&ls.certs.delegations),
-            reward_accounts: Arc::clone(&ls.certs.reward_accounts),
+            // O(1) imbl structural clone — no iterate+collect; see field docs.
+            delegations: ls.certs.delegations.clone(),
+            reward_accounts: ls.certs.reward_accounts.clone(),
             snapshots: Arc::new(epochs.snapshots.clone()),
             governance: Arc::clone(&ls.gov.governance),
             treasury: epochs.treasury,

@@ -319,6 +319,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // per-pool loop is correctly producing rewards for our pool/cred.
     println!("\n=== Recomputed RUPD (would apply at next boundary) ===");
     {
+        let reward_accounts_std: std::collections::HashMap<_, _> = state
+            .certs
+            .reward_accounts
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect();
         let rupd = dugite_ledger::compute_reward_update(
             &state.epochs.prev_protocol_params,
             &state.epochs.prev_d,
@@ -328,7 +334,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             state.epochs.snapshots.ss_fee,
             state.epochs.reserves,
             state.epochs.treasury,
-            &state.certs.reward_accounts,
+            &reward_accounts_std,
             state.epoch_length,
             state.shelley_transition_epoch,
             state.max_lovelace_supply,

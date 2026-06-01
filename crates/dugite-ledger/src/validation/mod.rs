@@ -49,6 +49,7 @@ pub(crate) use collateral::plutus_script_version_map;
 // redeemer executes, allowing the Unit check to be applied only to V3 redeemers.
 pub(crate) use collateral::redeemer_script_version_map;
 
+use imbl::HashMap as ImblMap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -94,7 +95,13 @@ pub struct ActiveProposal {
 pub struct ValidationContext {
     pub registered_pools: Option<Arc<HashSet<Hash28>>>,
     pub current_treasury: Option<u64>,
-    pub reward_accounts: Option<Arc<HashMap<Hash32, Lovelace>>>,
+    /// Reward account balances for validation (pre-block snapshot).
+    ///
+    /// Uses `imbl::HashMap` so that the per-block snapshot built in
+    /// `apply_block` is an O(1) structural clone (not an O(N) deep copy).
+    /// Apply-path mutations use the live `CertSubState.reward_accounts` imbl
+    /// map independently — no Arc CoW contention, no per-block deep-clone.
+    pub reward_accounts: Option<ImblMap<Hash32, Lovelace>>,
     pub current_epoch: Option<u64>,
     /// Set of registered DRep credentials, keyed by
     /// [`Credential::to_typed_hash32`].  Byte 28 of the key encodes the
@@ -116,7 +123,10 @@ pub struct ValidationContext {
     pub node_network: Option<NetworkId>,
     pub committee_members: Option<Arc<HashSet<Hash32>>>,
     pub committee_resigned: Option<Arc<HashSet<Hash32>>>,
-    pub stake_key_deposits: Option<Arc<HashMap<Hash32, u64>>>,
+    /// Per-credential stake key deposits.
+    ///
+    /// Uses `imbl::HashMap` for the same O(1) clone reason as `reward_accounts`.
+    pub stake_key_deposits: Option<ImblMap<Hash32, u64>>,
     /// The constitution's guardrail script hash, if any.
     ///
     /// When `Some`, governance proposals of type `ParameterChange` or
@@ -258,13 +268,24 @@ impl ValidationContext {
         self
     }
 
+    /// Set reward accounts from a std::HashMap (converts via collect — O(N)).
+    /// Use `with_reward_accounts_imbl` for the O(1) imbl path.
     pub fn with_reward_accounts(mut self, accounts: HashMap<Hash32, Lovelace>) -> Self {
-        self.reward_accounts = Some(Arc::new(accounts));
+        self.reward_accounts = Some(accounts.into_iter().collect());
         self
     }
 
-    pub fn with_reward_accounts_arc(mut self, accounts: Arc<HashMap<Hash32, Lovelace>>) -> Self {
+    /// Set reward accounts from an imbl::HashMap (O(1) clone).
+    pub fn with_reward_accounts_imbl(mut self, accounts: ImblMap<Hash32, Lovelace>) -> Self {
         self.reward_accounts = Some(accounts);
+        self
+    }
+
+    /// Legacy builder accepting Arc<HashMap>; converts to imbl (O(N)).
+    /// Prefer `with_reward_accounts_imbl` for performance.
+    #[allow(dead_code)]
+    pub fn with_reward_accounts_arc(mut self, accounts: Arc<HashMap<Hash32, Lovelace>>) -> Self {
+        self.reward_accounts = Some(accounts.iter().map(|(k, v)| (*k, *v)).collect());
         self
     }
 
@@ -318,13 +339,22 @@ impl ValidationContext {
         self
     }
 
+    /// Set stake_key_deposits from a std::HashMap (O(N) conversion).
     pub fn with_stake_key_deposits(mut self, deposits: HashMap<Hash32, u64>) -> Self {
-        self.stake_key_deposits = Some(Arc::new(deposits));
+        self.stake_key_deposits = Some(deposits.into_iter().collect());
         self
     }
 
-    pub fn with_stake_key_deposits_arc(mut self, deposits: Arc<HashMap<Hash32, u64>>) -> Self {
+    /// Set stake_key_deposits from an imbl::HashMap (O(1) clone).
+    pub fn with_stake_key_deposits_imbl(mut self, deposits: ImblMap<Hash32, u64>) -> Self {
         self.stake_key_deposits = Some(deposits);
+        self
+    }
+
+    /// Legacy builder accepting Arc<HashMap>; converts to imbl (O(N)).
+    #[allow(dead_code)]
+    pub fn with_stake_key_deposits_arc(mut self, deposits: Arc<HashMap<Hash32, u64>>) -> Self {
+        self.stake_key_deposits = Some(deposits.iter().map(|(k, v)| (*k, *v)).collect());
         self
     }
 
@@ -507,7 +537,7 @@ impl ValidationContext {
     ) -> Self {
         self.registered_pools = Some(Arc::new(pools));
         self.current_treasury = Some(treasury);
-        self.reward_accounts = Some(Arc::new(accounts));
+        self.reward_accounts = Some(accounts.into_iter().collect());
         self.current_epoch = Some(epoch);
         self.registered_dreps = Some(Arc::new(dreps));
         self.registered_vrf_keys = Some(Arc::new(vrf_keys));
@@ -1921,14 +1951,14 @@ pub fn validate_transaction_with_context(
         slot_config,
         context.registered_pools.as_deref(),
         context.current_treasury,
-        context.reward_accounts.as_deref(),
+        context.reward_accounts.as_ref(),
         context.current_epoch,
         context.registered_dreps.as_deref(),
         context.registered_vrf_keys.as_deref(),
         context.node_network,
         context.committee_members.as_deref(),
         context.committee_resigned.as_deref(),
-        context.stake_key_deposits.as_deref(),
+        context.stake_key_deposits.as_ref(),
         context.constitution_script_hash,
         context.vote_delegations.as_deref(),
     );
@@ -2376,7 +2406,7 @@ pub fn validate_transaction_with_context(
         // staking credential → account info). When `reward_accounts` is
         // `None`, the predicate is silently skipped (lenient default).
         // -------------------------------------------------------------------
-        if let Some(reward_accounts) = context.reward_accounts.as_deref() {
+        if let Some(reward_accounts) = context.reward_accounts.as_ref() {
             let mut bad_withdrawal_addrs: Vec<String> = Vec::new();
             for proposal in &tx.body.proposal_procedures {
                 if let GovAction::TreasuryWithdrawals { withdrawals, .. } = &proposal.gov_action {
@@ -2672,14 +2702,14 @@ pub fn validate_transaction_with_pools(
     slot_config: Option<&SlotConfig>,
     registered_pools: Option<&HashSet<Hash28>>,
     current_treasury: Option<u64>,
-    reward_accounts: Option<&HashMap<Hash32, Lovelace>>,
+    reward_accounts: Option<&ImblMap<Hash32, Lovelace>>,
     current_epoch: Option<u64>,
     registered_dreps: Option<&HashSet<Hash32>>,
     registered_vrf_keys: Option<&HashMap<Hash32, Hash28>>,
     node_network: Option<dugite_primitives::network::NetworkId>,
     committee_members: Option<&HashSet<Hash32>>,
     committee_resigned: Option<&HashSet<Hash32>>,
-    stake_key_deposits: Option<&HashMap<Hash32, u64>>,
+    stake_key_deposits: Option<&ImblMap<Hash32, u64>>,
     constitution_script_hash: Option<Hash28>,
     vote_delegations: Option<&HashSet<Hash32>>,
 ) -> Result<(), Vec<ValidationError>> {

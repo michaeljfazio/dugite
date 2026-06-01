@@ -7,7 +7,7 @@
 //! - Calculating the net deposit and refund amounts for all certificate types
 //!   across eras, including pool re-registration logic.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::protocol_params::ProtocolParameters;
@@ -117,7 +117,7 @@ pub(super) fn calculate_deposits_and_refunds(
     certificates: &[Certificate],
     params: &ProtocolParameters,
     registered_pools: Option<&HashSet<Hash28>>,
-    stake_key_deposits: Option<&HashMap<Hash32, u64>>,
+    stake_key_deposits: Option<&imbl::HashMap<Hash32, u64>>,
 ) -> (u64, u64) {
     let mut deposits = 0u64;
     let mut refunds = 0u64;
@@ -1359,7 +1359,7 @@ mod tests {
 
         // The deposit map is not consulted for ConwayStakeDeregistration because
         // the refund amount is encoded inline in the certificate itself.
-        let mut deposit_map: HashMap<Hash32, u64> = HashMap::new();
+        let mut deposit_map: imbl::HashMap<Hash32, u64> = imbl::HashMap::new();
         deposit_map.insert(credential.to_typed_hash32(), stored_deposit);
 
         let (deposits, refunds) =
@@ -1684,7 +1684,7 @@ mod tests {
         let credential = test_credential(0x20);
         let key = credential.to_typed_hash32();
 
-        let mut deposit_map: HashMap<Hash32, u64> = HashMap::new();
+        let mut deposit_map: imbl::HashMap<Hash32, u64> = imbl::HashMap::new();
         deposit_map.insert(key, original_deposit);
 
         let cert = Certificate::StakeDeregistration(credential.clone());

@@ -789,7 +789,6 @@ mod tests {
     #[test]
     fn diff_hashmap_is_order_insensitive() {
         use dugite_primitives::hash::{Hash, Hash32};
-        use std::sync::Arc;
 
         let mut state_a = fresh_state();
         let mut state_b = fresh_state();
@@ -805,8 +804,8 @@ mod tests {
         accounts_b.insert(Hash::<32>::from_bytes([1u8; 32]), Lovelace(100));
         accounts_b.insert(Hash::<32>::from_bytes([2u8; 32]), Lovelace(200));
 
-        state_a.certs.reward_accounts = Arc::new(accounts_a);
-        state_b.certs.reward_accounts = Arc::new(accounts_b);
+        state_a.certs.reward_accounts = accounts_a.into_iter().collect();
+        state_b.certs.reward_accounts = accounts_b.into_iter().collect();
 
         let va = LedgerStateSnapshot::from(&state_a);
         let vb = LedgerStateSnapshot::from(&state_b);
@@ -824,7 +823,6 @@ mod tests {
     #[test]
     fn diff_hashmap_value_mismatch() {
         use dugite_primitives::hash::{Hash, Hash32};
-        use std::sync::Arc;
 
         let mut state_a = fresh_state();
         let mut state_b = fresh_state();
@@ -834,8 +832,8 @@ mod tests {
         let mut b: HashMap<Hash32, Lovelace> = HashMap::new();
         b.insert(Hash::<32>::from_bytes([1u8; 32]), Lovelace(999));
 
-        state_a.certs.reward_accounts = Arc::new(a);
-        state_b.certs.reward_accounts = Arc::new(b);
+        state_a.certs.reward_accounts = a.into_iter().collect();
+        state_b.certs.reward_accounts = b.into_iter().collect();
 
         let va = LedgerStateSnapshot::from(&state_a);
         let vb = LedgerStateSnapshot::from(&state_b);
@@ -854,7 +852,6 @@ mod tests {
     #[test]
     fn diff_hashmap_missing_key_directions() {
         use dugite_primitives::hash::{Hash, Hash32};
-        use std::sync::Arc;
 
         let mut state_a = fresh_state();
         let mut state_b = fresh_state();
@@ -866,8 +863,8 @@ mod tests {
         b.insert(Hash::<32>::from_bytes([2u8; 32]), Lovelace(2));
         b.insert(Hash::<32>::from_bytes([3u8; 32]), Lovelace(3));
 
-        state_a.certs.reward_accounts = Arc::new(a);
-        state_b.certs.reward_accounts = Arc::new(b);
+        state_a.certs.reward_accounts = a.into_iter().collect();
+        state_b.certs.reward_accounts = b.into_iter().collect();
 
         let va = LedgerStateSnapshot::from(&state_a);
         let vb = LedgerStateSnapshot::from(&state_b);

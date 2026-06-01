@@ -846,7 +846,7 @@ impl Node {
                     // mempool tx whose declared withdrawal no longer
                     // matches the new balance. Same fix-pattern as
                     // serve.rs:LedgerTxValidator.
-                    .with_reward_accounts_arc(std::sync::Arc::clone(&ledger.certs.reward_accounts));
+                    .with_reward_accounts_imbl(ledger.certs.reward_accounts.clone());
                 if let Some(net) = node_network {
                     ctx = ctx.with_network(net);
                 }

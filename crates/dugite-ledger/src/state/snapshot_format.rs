@@ -10,6 +10,7 @@
 //! There is no migration path between versions.  Pre-1.0 dugite makes no
 //! snapshot back-compat guarantee.
 
+use imbl::HashMap as ImblHashMap;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -224,12 +225,24 @@ impl From<&super::LedgerState> for LedgerStateSnapshot {
             // per map = ~60 MB total transient (held inside
             // `spawn_blocking` until file write completes), then dropped.
             // Negligible compared to the per-block savings.
-            delegations: (*s.certs.delegations).clone(),
+            // imbl::HashMap → std::HashMap for the snapshot wire format.
+            // The bincode positional field order is unchanged; no version bump needed.
+            delegations: s.certs.delegations.iter().map(|(k, v)| (*k, *v)).collect(),
             pool_params: (*s.certs.pool_params).clone(),
             future_pool_params: s.certs.future_pool_params.clone(),
             pending_retirements: s.certs.pending_retirements.clone(),
-            reward_accounts: (*s.certs.reward_accounts).clone(),
-            stake_key_deposits: (*s.certs.stake_key_deposits).clone(),
+            reward_accounts: s
+                .certs
+                .reward_accounts
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect(),
+            stake_key_deposits: s
+                .certs
+                .stake_key_deposits
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect(),
             pool_deposits: s.certs.pool_deposits.clone(),
             total_stake_key_deposits: s.certs.total_stake_key_deposits,
             pointer_map: s.certs.pointer_map.clone(),
@@ -302,15 +315,17 @@ impl From<LedgerStateSnapshot> for super::LedgerState {
                 pending_donations: s.pending_donations,
             },
             certs: CertSubState {
-                // Snapshot view owns its data (no Arc); wrap into Arc
-                // on the way back into LedgerState to restore the
-                // copy-on-write semantics the apply path expects.
-                delegations: Arc::new(s.delegations),
+                // std::HashMap → imbl::HashMap on load.
+                // The conversion is O(N) once at startup — not in the hot path.
+                delegations: s.delegations.into_iter().collect::<ImblHashMap<_, _>>(),
                 pool_params: Arc::new(s.pool_params),
                 future_pool_params: s.future_pool_params,
                 pending_retirements: s.pending_retirements,
-                reward_accounts: Arc::new(s.reward_accounts),
-                stake_key_deposits: Arc::new(s.stake_key_deposits),
+                reward_accounts: s.reward_accounts.into_iter().collect::<ImblHashMap<_, _>>(),
+                stake_key_deposits: s
+                    .stake_key_deposits
+                    .into_iter()
+                    .collect::<ImblHashMap<_, _>>(),
                 pool_deposits: s.pool_deposits,
                 total_stake_key_deposits: s.total_stake_key_deposits,
                 pointer_map: s.pointer_map,
