@@ -263,15 +263,16 @@ impl Governor {
     /// first, then three independent churn timers, then peer discovery.
     ///
     /// Backwards-compatible wrapper that calls [`compute_actions_with_blp`]
-    /// with an empty big-ledger set. Existing callers (and unit tests) that
-    /// don't track BLPs separately can keep using this entry point.
+    /// with an empty big-ledger set and no active-fetch-peer exclusion.
+    /// Existing callers (and unit tests) that don't track BLPs separately
+    /// can keep using this entry point.
     pub fn compute_actions(
         &mut self,
         peer_manager: &PeerManager,
         local_root_groups: &[LocalRootGroupTarget],
     ) -> Vec<GovernorAction> {
         let empty: HashSet<SocketAddr> = HashSet::new();
-        self.compute_actions_with_blp(peer_manager, local_root_groups, &empty, &empty)
+        self.compute_actions_with_blp(peer_manager, local_root_groups, &empty, &empty, None)
     }
 
     /// Like [`compute_actions`] but with explicit knowledge of which peers
@@ -292,12 +293,25 @@ impl Governor {
     /// every inbound connect that completes handshake is immediately
     /// promoted to Hot, exceeding `target_hot` and triggering
     /// `aboveTargetOther` demotions that drove the at-tip OOM.
+    ///
+    /// `active_fetch_peer` is the `SocketAddr` of the peer currently holding
+    /// the BlockFetch slot (i.e. actively downloading blocks), or `None`.
+    /// When set, that peer is EXCLUDED from the `aboveTargetOther`
+    /// hot→warm demotion candidates regardless of score. This prevents the
+    /// governor from killing a mid-download fetch every ~5 s when the hot
+    /// count temporarily exceeds `target_hot` after a post-restart connect
+    /// burst.  The peer is still subject to `aboveTargetLocal`, BLP-aggregate,
+    /// and hot-churn demotion paths — those are lower-frequency and either
+    /// topology-mandatory or long-interval (55 min churn); only the
+    /// high-frequency `aboveTargetOther` path that fires every 2-second
+    /// governor tick is guarded.
     pub fn compute_actions_with_blp(
         &mut self,
         peer_manager: &PeerManager,
         local_root_groups: &[LocalRootGroupTarget],
         big_ledger_peers: &HashSet<SocketAddr>,
         fresh_inbound: &HashSet<SocketAddr>,
+        active_fetch_peer: Option<SocketAddr>,
     ) -> Vec<GovernorAction> {
         use rand::seq::IndexedRandom;
 
@@ -636,6 +650,15 @@ impl Governor {
             // demotion is handled by aboveTargetBigLedgerPeers below).
             // Excluding BLPs from the non-BLP demote path mirrors Haskell's
             // `aboveTargetOther` which uses `activeNonBig`.
+            //
+            // Fetch-floor fix: also exclude the peer that is currently the
+            // active BlockFetch downloader.  Without this exclusion the governor
+            // fires every ~2 s, kills the in-progress fetch, and collapses
+            // sustained throughput to ~5-10 blk/s (1 range every 5 s instead
+            // of sustained back-to-back batches).  The exclusion only protects
+            // the peer for the duration of a single download; as soon as it
+            // releases the slot (after each batch) another peer may claim it and
+            // receive the same protection on the next tick.
             let mut scored: Vec<(SocketAddr, f64)> = peer_manager
                 .peers_in_state(PeerState::Hot)
                 .into_iter()
@@ -644,6 +667,12 @@ impl Governor {
                         return None;
                     }
                     if big_ledger_peers.contains(&addr) {
+                        return None;
+                    }
+                    // Never demote the peer currently holding the BlockFetch slot —
+                    // killing a mid-download fetch resets throughput to near zero
+                    // until another peer claims the slot after its 10ms poll tick.
+                    if active_fetch_peer == Some(addr) {
                         return None;
                     }
                     peer_manager
@@ -851,7 +880,7 @@ mod tests {
         };
         let mut gov = Governor::new(config);
 
-        let actions = gov.compute_actions_with_blp(&pm, &[], &HashSet::new(), &fresh);
+        let actions = gov.compute_actions_with_blp(&pm, &[], &HashSet::new(), &fresh, None);
         let promote_hot_count = actions
             .iter()
             .filter(|a| matches!(a, GovernorAction::PromoteToHot(_)))
@@ -888,7 +917,7 @@ mod tests {
         };
         let mut gov = Governor::new(config);
 
-        let actions = gov.compute_actions_with_blp(&pm, &[], &HashSet::new(), &fresh);
+        let actions = gov.compute_actions_with_blp(&pm, &[], &HashSet::new(), &fresh, None);
         let promote_hot_count = actions
             .iter()
             .filter(|a| matches!(a, GovernorAction::PromoteToHot(_)))
@@ -1774,8 +1803,13 @@ mod tests {
         };
         let mut gov = Governor::new(config);
         let blp_set: HashSet<SocketAddr> = blp_addrs.iter().copied().collect();
-        let actions =
-            gov.compute_actions_with_blp(&pm, &[], &blp_set, &::std::collections::HashSet::new());
+        let actions = gov.compute_actions_with_blp(
+            &pm,
+            &[],
+            &blp_set,
+            &::std::collections::HashSet::new(),
+            None,
+        );
 
         let promoted_warm: Vec<SocketAddr> = actions
             .iter()
@@ -1823,8 +1857,13 @@ mod tests {
         };
         let mut gov = Governor::new(config);
         let blp_set: HashSet<SocketAddr> = blp_addrs.iter().copied().collect();
-        let actions =
-            gov.compute_actions_with_blp(&pm, &[], &blp_set, &::std::collections::HashSet::new());
+        let actions = gov.compute_actions_with_blp(
+            &pm,
+            &[],
+            &blp_set,
+            &::std::collections::HashSet::new(),
+            None,
+        );
 
         let promoted_hot: Vec<SocketAddr> = actions
             .iter()
@@ -1866,7 +1905,8 @@ mod tests {
             demote_cooldown: Duration::from_secs(3600),
         };
         let mut gov = Governor::new(config);
-        let actions = gov.compute_actions_with_blp(&pm, &[], &HashSet::new(), &HashSet::new());
+        let actions =
+            gov.compute_actions_with_blp(&pm, &[], &HashSet::new(), &HashSet::new(), None);
 
         let promoted_warm = actions
             .iter()
@@ -1960,8 +2000,13 @@ mod tests {
         };
         let mut gov = Governor::new(config);
 
-        let actions =
-            gov.compute_actions_with_blp(&pm, &[], &blp_set, &::std::collections::HashSet::new());
+        let actions = gov.compute_actions_with_blp(
+            &pm,
+            &[],
+            &blp_set,
+            &::std::collections::HashSet::new(),
+            None,
+        );
 
         let demotes: Vec<_> = actions
             .iter()
@@ -2023,8 +2068,13 @@ mod tests {
         let mut gov = Governor::new(config);
 
         // Tick 1: BLP promotes 5 (hot=20), aboveTargetOther demotes 5 non-BLPs.
-        let actions =
-            gov.compute_actions_with_blp(&pm, &[], &blp_set, &::std::collections::HashSet::new());
+        let actions = gov.compute_actions_with_blp(
+            &pm,
+            &[],
+            &blp_set,
+            &::std::collections::HashSet::new(),
+            None,
+        );
         let blp_promotes = actions
             .iter()
             .filter(|a| matches!(a, GovernorAction::PromoteToHot(addr) if blp_set.contains(addr)))
@@ -2070,8 +2120,13 @@ mod tests {
         // Tick 2: cooldown blocks the demoted peers from reconnecting.
         // Governor should NOT emit any cold→warm promotion for them, and
         // should NOT emit any demote (hot is back at target).
-        let actions2 =
-            gov.compute_actions_with_blp(&pm, &[], &blp_set, &::std::collections::HashSet::new());
+        let actions2 = gov.compute_actions_with_blp(
+            &pm,
+            &[],
+            &blp_set,
+            &::std::collections::HashSet::new(),
+            None,
+        );
         let bad_reconnects = actions2
             .iter()
             .filter(|a| match a {
@@ -2138,6 +2193,7 @@ mod tests {
                 &[],
                 &blp_set,
                 &::std::collections::HashSet::new(),
+                None,
             );
             let demotes = actions
                 .iter()
@@ -2196,8 +2252,13 @@ mod tests {
         let mut gov = Governor::new(config);
 
         // Tick 1: governor sees 16 hot, target 15 — demote one.
-        let actions =
-            gov.compute_actions_with_blp(&pm, &[], &blp_set, &::std::collections::HashSet::new());
+        let actions = gov.compute_actions_with_blp(
+            &pm,
+            &[],
+            &blp_set,
+            &::std::collections::HashSet::new(),
+            None,
+        );
         let victims: Vec<SocketAddr> = actions
             .iter()
             .filter_map(|a| match a {
@@ -2214,8 +2275,13 @@ mod tests {
         // Tick 2: governor sees only 15 hot. belowTargetOther cold→warm
         // would normally reconnect the cold peer to satisfy target_warm.
         // The cooldown filter MUST prevent that.
-        let actions2 =
-            gov.compute_actions_with_blp(&pm, &[], &blp_set, &::std::collections::HashSet::new());
+        let actions2 = gov.compute_actions_with_blp(
+            &pm,
+            &[],
+            &blp_set,
+            &::std::collections::HashSet::new(),
+            None,
+        );
         let victim_reconnects: Vec<_> = actions2
             .iter()
             .filter(|a| matches!(a, GovernorAction::PromoteToWarm(addr) if *addr == victim))
@@ -2290,6 +2356,7 @@ mod tests {
                 &[],
                 &blp_set,
                 &::std::collections::HashSet::new(),
+                None,
             );
             // Mirror lifecycle: apply promotions, treat DemoteToWarm as
             // Cold (the #516 single-use-channel workaround).
@@ -2319,5 +2386,186 @@ mod tests {
             total_demotes, 0,
             "1000-tick steady-state run produced {total_demotes} demote(s) — flap regression"
         );
+    }
+
+    // ── Fetch-floor fix tests ─────────────────────────────────────────────────
+    //
+    // These tests lock in the behaviour that `aboveTargetOther` does NOT demote
+    // the peer currently holding the BlockFetch slot, while still demoting other
+    // excess hot peers.  A regression here would re-introduce the ~5-second
+    // fetch interruption that caps mainnet sync at ~5-10 blk/s.
+
+    /// aboveTargetOther must NOT demote the active fetcher when hot_count is
+    /// above target_hot, but MUST still demote other excess hot peers.
+    ///
+    /// Scenario: 3 hot peers, target_hot=2.  One peer is the active fetcher.
+    /// Expected: the non-fetching excess peer is demoted; the fetcher is spared.
+    #[test]
+    fn above_target_other_spares_active_fetcher() {
+        let mut pm = PeerManager::new();
+        let fetcher_addr = test_addr(3001);
+        let excess_addr = test_addr(3002);
+        let kept_addr = test_addr(3003);
+
+        for addr in [fetcher_addr, excess_addr, kept_addr] {
+            pm.add_peer(addr, PeerSource::Dns);
+            pm.promote_to_warm(&addr);
+            pm.promote_to_hot(&addr);
+        }
+        // Give all peers identical latency/reputation so the only distinguishing
+        // factor is the active-fetcher exclusion.
+        for addr in [fetcher_addr, excess_addr, kept_addr] {
+            pm.get_peer_mut(&addr).unwrap().update_latency(100.0);
+            pm.get_peer_mut(&addr).unwrap().reputation = 0.5;
+        }
+
+        let config = GovernorConfig {
+            targets: PeerTargets {
+                target_warm: 10,
+                target_hot: 2,
+                max_cold: 100,
+                ..Default::default()
+            },
+            hot_churn_interval: Duration::from_secs(3600),
+            cold_churn_interval: Duration::from_secs(3600),
+            warm_churn_interval: Duration::from_secs(3600),
+            demote_cooldown: Duration::from_secs(3600),
+        };
+        let mut gov = Governor::new(config);
+
+        let actions = gov.compute_actions_with_blp(
+            &pm,
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            Some(fetcher_addr), // active fetcher
+        );
+
+        let demoted: Vec<SocketAddr> = actions
+            .iter()
+            .filter_map(|a| match a {
+                GovernorAction::DemoteToWarm(addr) => Some(*addr),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            demoted.len(),
+            1,
+            "exactly one excess peer should be demoted"
+        );
+        assert!(
+            !demoted.contains(&fetcher_addr),
+            "active fetcher must NOT be demoted by aboveTargetOther"
+        );
+    }
+
+    /// When `active_fetch_peer` is `None` (no fetch in progress), `aboveTargetOther`
+    /// demotes excess peers normally — the fix must not suppress legitimate demotions.
+    #[test]
+    fn above_target_other_demotes_normally_when_no_active_fetcher() {
+        let mut pm = PeerManager::new();
+        for i in 0..3u16 {
+            pm.add_peer(test_addr(3000 + i), PeerSource::Dns);
+            pm.promote_to_warm(&test_addr(3000 + i));
+            pm.promote_to_hot(&test_addr(3000 + i));
+        }
+
+        let config = GovernorConfig {
+            targets: PeerTargets {
+                target_warm: 10,
+                target_hot: 1,
+                max_cold: 100,
+                ..Default::default()
+            },
+            hot_churn_interval: Duration::from_secs(3600),
+            cold_churn_interval: Duration::from_secs(3600),
+            warm_churn_interval: Duration::from_secs(3600),
+            demote_cooldown: Duration::from_secs(3600),
+        };
+        let mut gov = Governor::new(config);
+
+        let actions = gov.compute_actions_with_blp(
+            &pm,
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            None, // no active fetcher
+        );
+
+        let demoted: Vec<SocketAddr> = actions
+            .iter()
+            .filter_map(|a| match a {
+                GovernorAction::DemoteToWarm(addr) => Some(*addr),
+                _ => None,
+            })
+            .collect();
+
+        // 3 hot, target 1 → 2 excess should be demoted.
+        assert_eq!(
+            demoted.len(),
+            2,
+            "without an active fetcher, all excess hot peers should be demoted"
+        );
+    }
+
+    /// When the active fetcher is the ONLY hot peer above target, the governor
+    /// emits NO demotion (can't demote the fetcher, no other excess).
+    #[test]
+    fn above_target_other_emits_no_demotion_when_only_fetcher_is_excess() {
+        let mut pm = PeerManager::new();
+        let fetcher_addr = test_addr(3001);
+        pm.add_peer(fetcher_addr, PeerSource::Dns);
+        pm.promote_to_warm(&fetcher_addr);
+        pm.promote_to_hot(&fetcher_addr);
+        // One additional hot peer at target.
+        let ok_addr = test_addr(3002);
+        pm.add_peer(ok_addr, PeerSource::Dns);
+        pm.promote_to_warm(&ok_addr);
+        pm.promote_to_hot(&ok_addr);
+
+        let config = GovernorConfig {
+            targets: PeerTargets {
+                target_warm: 10,
+                target_hot: 1, // 2 hot, target 1 → 1 excess, but it's the fetcher
+                max_cold: 100,
+                ..Default::default()
+            },
+            hot_churn_interval: Duration::from_secs(3600),
+            cold_churn_interval: Duration::from_secs(3600),
+            warm_churn_interval: Duration::from_secs(3600),
+            demote_cooldown: Duration::from_secs(3600),
+        };
+        let mut gov = Governor::new(config);
+
+        let actions = gov.compute_actions_with_blp(
+            &pm,
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            Some(fetcher_addr),
+        );
+
+        let demoted: Vec<SocketAddr> = actions
+            .iter()
+            .filter_map(|a| match a {
+                GovernorAction::DemoteToWarm(addr) => Some(*addr),
+                _ => None,
+            })
+            .collect();
+
+        // The excess is the fetcher (protected) and the non-fetcher (ok_addr).
+        // Since excess=1 and the first candidate is excluded (fetcher), the next
+        // candidate ok_addr should be demoted instead.
+        assert_eq!(
+            demoted.len(),
+            1,
+            "the non-fetcher excess peer should be demoted"
+        );
+        assert!(
+            !demoted.contains(&fetcher_addr),
+            "fetcher must not be demoted"
+        );
+        assert!(demoted.contains(&ok_addr), "non-fetcher should be demoted");
     }
 }
