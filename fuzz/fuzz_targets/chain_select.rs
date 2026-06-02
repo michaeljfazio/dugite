@@ -84,6 +84,7 @@ fn make_header(slot: SlotNo, block_no: BlockNo, era: Era) -> BlockHeader {
         nonce_vrf_output: vec![],
         nonce_vrf_proof: vec![],
         prev_nonce: None,
+        raw_header_body: None,
     }
 }
 

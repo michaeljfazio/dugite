@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 bincode = "1"
 minicbor = { version = "0.25", features = ["std"] }
+imbl = { version = "7.0.0", features = ["serde"] }
 dugite-serialization = { path = "../crates/dugite-serialization" }
 dugite-network = { path = "../crates/dugite-network" }
 dugite-primitives = { path = "../crates/dugite-primitives" }
