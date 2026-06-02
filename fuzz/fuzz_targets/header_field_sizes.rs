@@ -110,6 +110,7 @@ fuzz_target!(|data: &[u8]| {
         },
         kes_signature: vec![0u8; kes_sig_len],
         prev_nonce: None,
+        raw_header_body: None,
     };
 
     // The structural pre-flight must never panic.

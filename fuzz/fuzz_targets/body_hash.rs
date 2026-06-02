@@ -96,6 +96,7 @@ fuzz_target!(|data: &[u8]| {
         protocol_version: ProtocolVersion { major: 9, minor: 0 },
         kes_signature: vec![0u8; 448],
         prev_nonce: None,
+        raw_header_body: None,
     };
 
     let result = validate_block_body_hash(&header, body_bytes);

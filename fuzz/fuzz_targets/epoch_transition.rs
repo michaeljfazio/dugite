@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use dugite_ledger::state::{LedgerState, PoolRegistration};
+use imbl::HashMap as ImblHashMap;
 use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::protocol_params::ProtocolParameters;
 use dugite_primitives::time::EpochNo;
@@ -116,8 +117,8 @@ fuzz_target!(|data: &[u8]| {
     // Seed delegations (1-16 delegators)
     let num_delegators =
         ((data.get(33 + num_pools).copied().unwrap_or(0) % 16) + 1) as usize;
-    let mut delegations = HashMap::new();
-    let mut reward_accounts = HashMap::new();
+    let mut delegations: ImblHashMap<_, _> = ImblHashMap::new();
+    let mut reward_accounts: ImblHashMap<_, _> = ImblHashMap::new();
 
     for i in 0..num_delegators {
         let staker = hash32_from_seed(100 + i as u8);
@@ -133,8 +134,8 @@ fuzz_target!(|data: &[u8]| {
         ) % 10_000_000_000_000;
         reward_accounts.insert(staker, Lovelace(stake));
     }
-    state.certs.delegations = Arc::new(delegations);
-    state.certs.reward_accounts = Arc::new(reward_accounts);
+    state.certs.delegations = delegations;
+    state.certs.reward_accounts = reward_accounts;
 
     // Trigger epoch transition — must never panic.
     // The transition processes: RUPD (rewards), SNAP (snapshot rotation),
