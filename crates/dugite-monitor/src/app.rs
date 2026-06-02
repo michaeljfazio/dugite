@@ -733,6 +733,28 @@ impl App {
             .filter(|s| !s.is_empty())
     }
 
+    /// Return the active UTxO storage backend (`"lsm"` or `"in-memory"`) as
+    /// reported by the node via `dugite_utxo_backend_info{backend="..."}`, or
+    /// `None` if the node does not export it (older nodes).
+    pub fn utxo_backend(&self) -> Option<&str> {
+        self.metrics
+            .string_labels
+            .get("dugite_utxo_backend_info.backend")
+            .map(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// A short display label for the active UTxO backend: `"LSM"`, `"Mem"`, or
+    /// the raw tag for forward-compatibility; `"—"` when unknown.
+    pub fn utxo_backend_label(&self) -> &str {
+        match self.utxo_backend() {
+            Some("lsm") => "LSM",
+            Some("in-memory") => "Mem",
+            Some(other) => other,
+            None => "—",
+        }
+    }
+
     /// Return a short (12-char) abbreviation of the pool ID for display in tight panels.
     ///
     /// Format: first 6 hex chars + ".." + last 6 hex chars.
