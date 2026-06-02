@@ -5223,6 +5223,12 @@ impl Node {
                 slot = block_slot.0,
                 block = block_number.0,
                 hash = %block_hash.to_hex(),
+                // Era + protocol_version + is_tpraos help diagnose hard-fork
+                // transition issues (e.g. a PV7 block still in a TPraos/Alonzo
+                // structure at the Vasil boundary — see BlockHeader::is_tpraos).
+                hfc_era = %block.era,
+                proto_major = block.header.protocol_version.major,
+                is_tpraos = block.header.is_tpraos(),
                 "Praos header validation FAILED — rejecting peer block: {reason}"
             );
             self.metrics
