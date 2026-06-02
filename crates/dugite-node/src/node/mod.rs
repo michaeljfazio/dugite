@@ -2218,6 +2218,52 @@ impl Node {
             return Ok(());
         }
 
+        // Reseed the consensus validator's opcert counters from the post-replay
+        // ledger state.
+        //
+        // During replay (both chunk-file and LSM paths) every block is applied
+        // with `BlockValidationMode::ApplyOnly`, which skips
+        // `validate_header_full` and therefore does NOT call
+        // `check_opcert_counter`. As a result `self.consensus.opcert_counters`
+        // stays frozen at the snapshot values while `ls.consensus.opcert_counters`
+        // is updated on every applied block via `compute_shelley_nonce`.
+        //
+        // Without this reseed, the live-block validation that follows uses the
+        // stale snapshot counters: a pool that rotated its opcert during the
+        // replayed range (counter M→N, N>M+1) appears to "over-increment" even
+        // though the intermediate block with counter M+1 was applied and accepted.
+        // The false-positive `CounterOverIncrementedOCERT` then marks the block
+        // invalid, poisons the entire downstream chain in the InvalidBlockCache,
+        // and stalls the node permanently (observed at preprod block 718744,
+        // slot 22975227: got=31, last_seen=29).
+        //
+        // Fix: take the per-pool max of (snapshot value, ledger post-replay value)
+        // for every pool, mirroring the `merge_opcert_counters_from_praos` logic
+        // already used in `replay_from_lsm`.
+        {
+            let ls = self.ledger_state.read().await;
+            let ledger_counters = &ls.consensus.opcert_counters;
+            let praos_counters = self.consensus.opcert_counters().clone();
+            // Build the merged map: per-pool max of both sources.
+            let mut merged = praos_counters;
+            for (pool_id, &ledger_seq) in ledger_counters {
+                merged
+                    .entry(*pool_id)
+                    .and_modify(|cur| {
+                        if ledger_seq > *cur {
+                            *cur = ledger_seq;
+                        }
+                    })
+                    .or_insert(ledger_seq);
+            }
+            let count = merged.len();
+            self.consensus.set_opcert_counters(merged);
+            info!(
+                count,
+                "Reseeded consensus opcert counters from post-replay ledger state"
+            );
+        }
+
         // Enable strict verification (full crypto checks for new blocks).
         // After replay, we're at the chain tip from storage — enable strict
         // mode so live blocks are fully validated. The epoch nonce loaded from
