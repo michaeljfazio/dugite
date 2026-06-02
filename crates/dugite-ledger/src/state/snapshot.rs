@@ -23,10 +23,219 @@
 //! positional and not self-describing, structural changes break existing
 //! snapshots.  This is acceptable — snapshots are an optimization, not critical
 //! data.  The node can always reconstruct state from the chain.
+//!
+//! # Backend meta sidecar
+//!
+//! Each snapshot file `foo.bin` is accompanied by a JSON sidecar `foo.meta.json`
+//! that records the UTxO backend used when the snapshot was taken.  On load,
+//! callers use [`check_snapshot_backend_match`] to reject snapshots made with
+//! a different backend before loading the full bincode payload — mirroring
+//! Haskell's `MetadataBackendMismatch` in `InitFailureRead`.  Missing sidecars
+//! are handled via [`infer_backend_from_snapshot`] (back-compat for existing
+//! `db-mainnet` snapshots that pre-date this feature).
 
 use super::{LedgerError, LedgerState, MAX_SNAPSHOT_SIZE};
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
+
+// ─── Backend tag ─────────────────────────────────────────────────────────────
+
+/// UTxO storage backend tag embedded in a snapshot's `.meta.json` sidecar.
+///
+/// Mirrors Haskell's `UTxOHDMemSnapshot` / `UTxOHDLSMSnapshot` in
+/// `Ouroboros.Consensus.Storage.LedgerDB.Snapshots` — a discriminant that
+/// lets the loader detect backend mismatches before touching the bincode
+/// payload (which is observationally equivalent across backends but
+/// structurally incompatible: LSM snapshots have an empty `utxo_set`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SnapshotBackend {
+    /// In-memory HashMap backend (`utxo_set` is non-empty in the `.bin`).
+    DugiteMem,
+    /// LSM on-disk backend (`utxo_set` is empty in the `.bin`; UTxOs live
+    /// in the adjacent `utxo-store/` LSM directory).
+    DugiteLsm,
+}
+
+impl SnapshotBackend {
+    /// The canonical string tag written into `meta.json`.
+    pub fn as_tag(self) -> &'static str {
+        match self {
+            SnapshotBackend::DugiteMem => "dugite-mem",
+            SnapshotBackend::DugiteLsm => "dugite-lsm",
+        }
+    }
+
+    /// Parse a tag string back to a [`SnapshotBackend`].
+    pub fn from_tag(s: &str) -> Option<Self> {
+        match s {
+            "dugite-mem" => Some(SnapshotBackend::DugiteMem),
+            "dugite-lsm" => Some(SnapshotBackend::DugiteLsm),
+            _ => None,
+        }
+    }
+}
+
+// ─── Meta sidecar ────────────────────────────────────────────────────────────
+
+/// JSON sidecar written next to each `.bin` snapshot file.
+///
+/// Written atomically (tmp + rename) after every successful `.bin` write so
+/// that a crash between the two leaves the `.bin` consistent (the next start
+/// will either find a matching `.meta.json` or fall through to
+/// [`infer_backend_from_snapshot`] for back-compat).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotMeta {
+    /// Backend tag — must match the running node's configured backend.
+    pub backend: String,
+    /// Snapshot format version (`SNAPSHOT_VERSION`) at write time.
+    pub snapshot_version: u8,
+    /// Ledger tip slot (0 = origin).
+    pub slot: u64,
+    /// Ledger epoch number.
+    pub epoch: u64,
+    /// Number of UTxO entries at snapshot time (for diagnostics).
+    pub utxo_count: u64,
+    /// Blake2b-256 checksum of the bincode payload (hex, matches header bytes 5..37).
+    pub state_checksum: String,
+}
+
+impl SnapshotMeta {
+    /// Derive the sidecar path for a given snapshot `.bin` path.
+    ///
+    /// `ledger-snapshot-epoch5-slot12345.bin` → `ledger-snapshot-epoch5-slot12345.meta.json`
+    pub fn sidecar_path(bin_path: &Path) -> PathBuf {
+        let mut s = bin_path.as_os_str().to_owned();
+        s.push(".meta.json");
+        PathBuf::from(s)
+    }
+
+    /// Write `self` atomically as the sidecar next to `bin_path`.
+    ///
+    /// Uses a `.meta.json.tmp` staging file + rename for crash-safety.  A
+    /// partial write never replaces an existing consistent sidecar.
+    pub fn write_atomic(&self, bin_path: &Path) -> std::io::Result<()> {
+        let meta_path = Self::sidecar_path(bin_path);
+        let tmp_path = {
+            let mut s = meta_path.as_os_str().to_owned();
+            s.push(".tmp");
+            PathBuf::from(s)
+        };
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(&tmp_path, json.as_bytes())?;
+        std::fs::rename(&tmp_path, &meta_path)
+    }
+
+    /// Load the sidecar for `bin_path`, or `None` if the file does not exist.
+    ///
+    /// Returns `None` (not `Err`) for missing sidecars so callers can apply
+    /// the back-compat inference path ([`infer_backend_from_snapshot`]).
+    pub fn load(bin_path: &Path) -> Option<SnapshotMeta> {
+        let meta_path = Self::sidecar_path(bin_path);
+        let raw = std::fs::read(&meta_path).ok()?;
+        serde_json::from_slice(&raw)
+            .map_err(|e| {
+                warn!(
+                    path = %meta_path.display(),
+                    "Failed to parse snapshot meta sidecar: {e} — treating as absent"
+                );
+                e
+            })
+            .ok()
+    }
+}
+
+// ─── Infer backend from snapshot bytes (back-compat) ─────────────────────────
+
+/// Infer the backend from a loaded `LedgerState` and the adjacent filesystem.
+///
+/// Used when no `.meta.json` sidecar exists (snapshots written before this
+/// feature was added — e.g. `db-mainnet` epoch-329 LSM snapshot).
+///
+/// Rule:
+/// - If `utxo_set` is non-empty → `DugiteMem` (UTxOs are in the bincode).
+/// - If `utxo_set` is empty AND a `utxo-store` directory exists in `db_path`
+///   → `DugiteLsm` (UTxOs live in the LSM tree).
+/// - If `utxo_set` is empty AND no `utxo-store` exists → cannot determine;
+///   return `None` (caller should accept provisionally).
+pub fn infer_backend_from_snapshot(state: &LedgerState, db_path: &Path) -> Option<SnapshotBackend> {
+    if !state.utxo.utxo_set.is_empty() {
+        return Some(SnapshotBackend::DugiteMem);
+    }
+    let utxo_store_path = db_path.join("utxo-store");
+    if utxo_store_path.exists() {
+        return Some(SnapshotBackend::DugiteLsm);
+    }
+    // Empty utxo_set and no utxo-store: fresh ledger or unknown — cannot infer.
+    None
+}
+
+// ─── Backend mismatch guard ───────────────────────────────────────────────────
+
+/// Outcome of a backend-mismatch check.  The caller decides how to handle
+/// each variant; typically `Mismatch` → skip the snapshot and try the next.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BackendCheckResult {
+    /// Backend matches the configured one (or cannot be determined). Safe to use.
+    Ok,
+    /// The snapshot was made with a different backend. Must not be loaded.
+    Mismatch {
+        snapshot_backend: SnapshotBackend,
+        configured_backend: SnapshotBackend,
+    },
+}
+
+/// Check whether the meta sidecar's backend matches `configured_backend`.
+///
+/// `bin_path` is the path to the `.bin` snapshot file.  The sidecar is read
+/// lazily inside this function.  If the sidecar is absent, `state` and
+/// `db_path` are used for inference via [`infer_backend_from_snapshot`].
+///
+/// Returns [`BackendCheckResult::Ok`] when:
+/// - The sidecar matches the configured backend.
+/// - No sidecar exists and inference yields the same backend or is indeterminate.
+///
+/// Returns [`BackendCheckResult::Mismatch`] when the sidecar (or inference)
+/// conclusively identifies a *different* backend from `configured_backend`.
+pub fn check_snapshot_backend_match(
+    bin_path: &Path,
+    state: &LedgerState,
+    db_path: &Path,
+    configured_backend: SnapshotBackend,
+) -> BackendCheckResult {
+    // Try explicit sidecar first.
+    if let Some(meta) = SnapshotMeta::load(bin_path) {
+        if let Some(snap_backend) = SnapshotBackend::from_tag(&meta.backend) {
+            if snap_backend != configured_backend {
+                return BackendCheckResult::Mismatch {
+                    snapshot_backend: snap_backend,
+                    configured_backend,
+                };
+            }
+            return BackendCheckResult::Ok;
+        }
+        // Unknown tag string — treat as indeterminate; accept provisionally.
+        warn!(
+            backend_tag = %meta.backend,
+            "Unknown snapshot backend tag in meta sidecar — accepting provisionally"
+        );
+        return BackendCheckResult::Ok;
+    }
+
+    // No sidecar — fall back to inference (back-compat for pre-meta snapshots).
+    if let Some(inferred) = infer_backend_from_snapshot(state, db_path) {
+        if inferred != configured_backend {
+            return BackendCheckResult::Mismatch {
+                snapshot_backend: inferred,
+                configured_backend,
+            };
+        }
+    }
+    // Either inferred matches or could not be determined — accept.
+    BackendCheckResult::Ok
+}
 
 /// Quarantine extension applied to snapshot files whose on-disk format
 /// version is older than [`LedgerState::SNAPSHOT_VERSION`] and for which
@@ -167,7 +376,14 @@ impl LedgerState {
         // performs `write_snapshot_view_to_path` from a `spawn_blocking`
         // task — see crates/dugite-node/src/node/epoch.rs.
         let snapshot = super::snapshot_format::LedgerStateSnapshot::from(self);
-        let total_bytes = Self::write_snapshot_view_to_path(&snapshot, path)?;
+        // The in-memory `utxo_set` is empty exactly when an LSM store is
+        // attached (UTxOs live on-disk); derive the backend tag from that.
+        let backend = if self.utxo.utxo_set.has_store() {
+            SnapshotBackend::DugiteLsm
+        } else {
+            SnapshotBackend::DugiteMem
+        };
+        let total_bytes = Self::write_snapshot_view_to_path(&snapshot, path, backend)?;
         info!(
             "Snapshot     saved (epoch={}, {} UTxOs, {:.1} MB)",
             self.epoch.0,
@@ -196,6 +412,7 @@ impl LedgerState {
     pub fn write_snapshot_view_to_path(
         snapshot: &super::snapshot_format::LedgerStateSnapshot,
         path: &Path,
+        backend: SnapshotBackend,
     ) -> Result<u64, LedgerError> {
         use dugite_primitives::hash::Blake2b256Hasher;
         use std::io::{Seek, SeekFrom, Write};
@@ -257,6 +474,34 @@ impl LedgerState {
 
         std::fs::rename(&tmp_path, path)
             .map_err(|e| LedgerError::EpochTransition(format!("Failed to rename snapshot: {e}")))?;
+
+        // Write the backend meta sidecar (mirrors Haskell's per-snapshot
+        // `SnapshotMetadata` with its backend tag). Emitted AFTER the atomic
+        // `.bin` rename so a crash between the two leaves a consistent `.bin`
+        // that `load_snapshot` can still read — a missing sidecar is handled
+        // by the back-compat inference path in `check_snapshot_backend_match`.
+        let state_checksum: String = checksum
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let meta = SnapshotMeta {
+            backend: backend.as_tag().to_string(),
+            snapshot_version: Self::SNAPSHOT_VERSION,
+            slot: snapshot.tip.point.slot().map(|s| s.0).unwrap_or(0),
+            epoch: snapshot.epoch.0,
+            utxo_count: snapshot.utxo_set.len() as u64,
+            state_checksum,
+        };
+        if let Err(e) = meta.write_atomic(path) {
+            // Non-fatal: the `.bin` is consistent on disk; a missing sidecar
+            // falls through to backend inference on load. Log loudly so the
+            // operator notices a half-written snapshot dir.
+            warn!(
+                path = %path.display(),
+                "Failed to write snapshot meta sidecar: {e}"
+            );
+        }
         Ok(total_bytes)
     }
 
@@ -433,8 +678,9 @@ mod tests {
         state.era = Era::Conway;
 
         let view = LedgerStateSnapshot::from(&state);
-        let bytes = LedgerState::write_snapshot_view_to_path(&view, &path)
-            .expect("static write must succeed");
+        let bytes =
+            LedgerState::write_snapshot_view_to_path(&view, &path, SnapshotBackend::DugiteMem)
+                .expect("static write must succeed");
         assert!(bytes > 0, "writer must report payload bytes written");
 
         let loaded = LedgerState::load_snapshot(&path).unwrap();
@@ -461,13 +707,99 @@ mod tests {
 
         state.save_snapshot(&p1).unwrap();
         let view = LedgerStateSnapshot::from(&state);
-        LedgerState::write_snapshot_view_to_path(&view, &p2).unwrap();
+        LedgerState::write_snapshot_view_to_path(&view, &p2, SnapshotBackend::DugiteMem).unwrap();
 
         let bytes1 = std::fs::read(&p1).unwrap();
         let bytes2 = std::fs::read(&p2).unwrap();
         assert_eq!(
             bytes1, bytes2,
             "static write must produce byte-identical output to save_snapshot"
+        );
+    }
+
+    // ── Backend meta-tag + mismatch guard (Haskell-mirror, Phase 1) ──────
+
+    #[test]
+    fn test_snapshot_backend_tag_roundtrip() {
+        for b in [SnapshotBackend::DugiteMem, SnapshotBackend::DugiteLsm] {
+            assert_eq!(SnapshotBackend::from_tag(b.as_tag()), Some(b));
+        }
+        assert_eq!(SnapshotBackend::from_tag("not-a-backend"), None);
+    }
+
+    #[test]
+    fn test_meta_sidecar_written_and_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger-snapshot-epoch5-slot999.bin");
+        let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        state.epoch = EpochNo(5);
+        let view = LedgerStateSnapshot::from(&state);
+        LedgerState::write_snapshot_view_to_path(&view, &path, SnapshotBackend::DugiteLsm).unwrap();
+
+        // The `.bin.meta.json` sidecar must exist and roundtrip.
+        let meta = SnapshotMeta::load(&path).expect("sidecar must exist after write");
+        assert_eq!(meta.backend, "dugite-lsm");
+        assert_eq!(meta.snapshot_version, LedgerState::SNAPSHOT_VERSION);
+        // blake2b-256 → 64 hex chars.
+        assert_eq!(meta.state_checksum.len(), 64);
+    }
+
+    #[test]
+    fn test_guard_rejects_backend_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger-snapshot.bin");
+        let state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        let view = LedgerStateSnapshot::from(&state);
+        // Snapshot tagged as the LSM backend.
+        LedgerState::write_snapshot_view_to_path(&view, &path, SnapshotBackend::DugiteLsm).unwrap();
+
+        // Loading under the in-memory backend is a mismatch (must be rejected).
+        assert!(matches!(
+            check_snapshot_backend_match(&path, &state, dir.path(), SnapshotBackend::DugiteMem),
+            BackendCheckResult::Mismatch { .. }
+        ));
+        // Loading under the matching LSM backend is fine.
+        assert_eq!(
+            check_snapshot_backend_match(&path, &state, dir.path(), SnapshotBackend::DugiteLsm),
+            BackendCheckResult::Ok
+        );
+    }
+
+    #[test]
+    fn test_guard_backcompat_missing_sidecar_infers_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger-snapshot.bin");
+        let state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        let view = LedgerStateSnapshot::from(&state);
+        LedgerState::write_snapshot_view_to_path(&view, &path, SnapshotBackend::DugiteLsm).unwrap();
+        // Simulate a pre-meta snapshot (e.g. existing db-mainnet): drop the sidecar.
+        std::fs::remove_file(SnapshotMeta::sidecar_path(&path)).unwrap();
+        // Empty in-mem utxo_set + a `utxo-store` dir ⇒ inferred DugiteLsm.
+        std::fs::create_dir_all(dir.path().join("utxo-store")).unwrap();
+        assert_eq!(
+            check_snapshot_backend_match(&path, &state, dir.path(), SnapshotBackend::DugiteLsm),
+            BackendCheckResult::Ok,
+            "no-sidecar LSM db must still load under LSM (back-compat)"
+        );
+        assert!(matches!(
+            check_snapshot_backend_match(&path, &state, dir.path(), SnapshotBackend::DugiteMem),
+            BackendCheckResult::Mismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn test_guard_backcompat_indeterminate_is_accepted() {
+        // Empty utxo_set, no utxo-store dir, no sidecar ⇒ cannot infer ⇒
+        // accept provisionally under any backend (do not reject).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger-snapshot.bin");
+        let state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        let view = LedgerStateSnapshot::from(&state);
+        LedgerState::write_snapshot_view_to_path(&view, &path, SnapshotBackend::DugiteMem).unwrap();
+        std::fs::remove_file(SnapshotMeta::sidecar_path(&path)).unwrap();
+        assert_eq!(
+            check_snapshot_backend_match(&path, &state, dir.path(), SnapshotBackend::DugiteLsm),
+            BackendCheckResult::Ok
         );
     }
 

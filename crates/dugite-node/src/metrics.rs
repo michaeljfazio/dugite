@@ -602,6 +602,10 @@ pub struct NodeMetrics {
     /// with a `pool_id` label so operators can identify the producing pool at a
     /// glance in the TUI without opening the logs.
     pool_id_hex: std::sync::Mutex<String>,
+    /// Active UTxO storage backend (`"lsm"` or `"in-memory"`). Emitted as the
+    /// info metric `dugite_utxo_backend_info{backend="..."}` and set once at
+    /// startup so dugite-monitor can show which backend the node is running.
+    utxo_backend: std::sync::Mutex<String>,
     /// When true, emit additional `cardano_node_metrics_*` aliases alongside the
     /// native `dugite_*` metrics.  Allows existing cardano-node Grafana dashboards
     /// to work without modification.  Controlled by `--compat-metrics` CLI flag.
@@ -829,6 +833,7 @@ impl NodeMetrics {
             liveness_threshold_secs: AtomicU64::new(600),
             is_block_producer: AtomicU64::new(0),
             pool_id_hex: std::sync::Mutex::new(String::new()),
+            utxo_backend: std::sync::Mutex::new(String::new()),
             compat_metrics: std::sync::atomic::AtomicBool::new(false),
             diffusion_mode: AtomicU64::new(0),
             peer_sharing_enabled: AtomicU64::new(1),
@@ -1304,6 +1309,15 @@ impl NodeMetrics {
     pub fn set_consensus_mode_genesis(&self, genesis: bool) {
         self.consensus_mode_genesis
             .store(genesis as u64, Ordering::Relaxed);
+    }
+
+    /// Record the active UTxO storage backend (`"lsm"` or `"in-memory"`),
+    /// emitted as `dugite_utxo_backend_info{backend="..."}`. Call once at
+    /// startup.
+    pub fn set_utxo_backend(&self, backend: &str) {
+        if let Ok(mut guard) = self.utxo_backend.lock() {
+            *guard = backend.to_string();
+        }
     }
 
     /// Record P2P networking configuration state.
@@ -1947,6 +1961,21 @@ impl NodeMetrics {
                         *guard
                     ));
                 }
+            }
+        }
+
+        // UTxO storage backend, as a Prometheus info metric: a gauge fixed at 1
+        // with a `backend` label ("lsm" or "in-memory"). Always emitted (unlike
+        // pool_id, which is block-producer-only) so dugite-monitor can show the
+        // active backend on every node.
+        if let Ok(guard) = self.utxo_backend.lock() {
+            if !guard.is_empty() {
+                out.push_str(&format!(
+                    "# HELP dugite_utxo_backend_info Active UTxO storage backend\n\
+                     # TYPE dugite_utxo_backend_info gauge\n\
+                     dugite_utxo_backend_info{{backend=\"{}\"}} 1\n",
+                    *guard
+                ));
             }
         }
 
@@ -2899,6 +2928,37 @@ mod tests {
         );
         // The resident-memory metric should still be present alongside CPU.
         assert!(output.contains("dugite_mem_resident_bytes "));
+    }
+
+    #[test]
+    fn test_utxo_backend_info_metric() {
+        // Unset: the info metric must be absent (no empty-label line).
+        let metrics = NodeMetrics::new();
+        assert!(
+            !metrics.to_prometheus().contains("dugite_utxo_backend_info"),
+            "backend info metric must not be emitted before it is set"
+        );
+
+        // LSM backend.
+        metrics.set_utxo_backend("lsm");
+        let out = metrics.to_prometheus();
+        assert!(out.contains("# TYPE dugite_utxo_backend_info gauge"));
+        assert!(
+            out.contains("dugite_utxo_backend_info{backend=\"lsm\"} 1"),
+            "expected lsm backend info line, got:\n{out}"
+        );
+
+        // In-memory backend (set-once semantics: last write wins).
+        metrics.set_utxo_backend("in-memory");
+        let out = metrics.to_prometheus();
+        assert!(
+            out.contains("dugite_utxo_backend_info{backend=\"in-memory\"} 1"),
+            "expected in-memory backend info line, got:\n{out}"
+        );
+        assert!(
+            !out.contains("backend=\"lsm\""),
+            "stale lsm label must be replaced"
+        );
     }
 
     #[test]
