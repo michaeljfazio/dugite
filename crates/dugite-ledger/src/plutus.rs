@@ -251,6 +251,49 @@ pub fn capture_phase2_work_item(
     }
 }
 
+/// When `DUGITE_PHASE2_DUMP_DIR` is set, write the exact CEK inputs of a tx to
+/// `<dir>/phase2-divergence-tx<idx>-<txid>.json` so a Phase-2 evaluation
+/// divergence (on-chain `is_valid=false` but dugite says the scripts pass — a
+/// `ValidationTagMismatch`) can be reproduced byte-for-byte offline. No-op when
+/// the env var is unset, so it is safe to leave wired in permanently.
+pub fn maybe_dump_phase2_divergence(item: &Phase2WorkItem) {
+    let dir = match std::env::var("DUGITE_PHASE2_DUMP_DIR") {
+        Ok(d) if !d.is_empty() => d,
+        _ => return,
+    };
+    let hex = |b: &[u8]| -> String { b.iter().map(|x| format!("{x:02x}")).collect() };
+    let pairs: Vec<serde_json::Value> = item
+        .utxo_pairs
+        .iter()
+        .map(|(i, o)| serde_json::json!({ "input": hex(i), "output": hex(o) }))
+        .collect();
+    let doc = serde_json::json!({
+        "tx_idx": item.tx_idx,
+        "is_valid": item.is_valid,
+        "tx_cbor": hex(&item.tx_cbor),
+        "utxo_pairs": pairs,
+        "cost_models_cbor": item.cost_models_cbor.as_deref().map(&hex),
+        "max_ex_cpu": item.max_ex.0,
+        "max_ex_mem": item.max_ex.1,
+        // dugite SlotConfig -> dugite_uplc SlotConfig mapping (see apply.rs).
+        "sc_network_start_unix_seconds": item.slot_config.zero_time / 1_000,
+        "sc_slot_zero_offset": item.slot_config.zero_slot,
+        "sc_slot_length_ms": item.slot_config.slot_length,
+        "sc_safe_zone_horizon_slot": item.slot_config.safe_zone_horizon_slot,
+    });
+    let path = format!("{dir}/phase2-divergence-tx{}.json", item.tx_idx);
+    match serde_json::to_vec_pretty(&doc) {
+        Ok(bytes) => {
+            if let Err(e) = std::fs::write(&path, bytes) {
+                tracing::warn!(error = %e, path, "failed to write phase2 divergence repro");
+            } else {
+                tracing::warn!(path, tx_idx = item.tx_idx, "wrote phase2 divergence repro");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "failed to serialise phase2 divergence repro"),
+    }
+}
+
 /// Result of one parallel Phase-2 evaluation.
 #[derive(Debug)]
 pub struct Phase2Outcome {
@@ -291,6 +334,12 @@ pub fn run_phase2_parallel(items: Vec<Phase2WorkItem>) -> Vec<Phase2Outcome> {
                 item.max_ex,
                 dugite_slot_config,
             );
+            // A tx the producer marked is_valid=false whose scripts pass here is
+            // a Phase-2 divergence (ValidationTagMismatch) — capture the exact
+            // CEK inputs for offline reproduction when dumping is enabled.
+            if result.is_ok() && !item.is_valid {
+                maybe_dump_phase2_divergence(&item);
+            }
             Phase2Outcome {
                 tx_idx: item.tx_idx,
                 is_valid: item.is_valid,
@@ -322,6 +371,9 @@ pub fn run_phase2_parallel(items: Vec<Phase2WorkItem>) -> Vec<Phase2Outcome> {
                 item.max_ex,
                 dugite_slot_config,
             );
+            if result.is_ok() && !item.is_valid {
+                maybe_dump_phase2_divergence(&item);
+            }
             Phase2Outcome {
                 tx_idx: item.tx_idx,
                 is_valid: item.is_valid,
