@@ -3448,7 +3448,17 @@ pub(crate) async fn forecast_park_or_disconnect(
     use dugite_consensus::forecast::forecast_for;
     use dugite_primitives::time::SlotNo;
 
-    let park_started = std::time::Instant::now();
+    // Measure the timeout from the last LEDGER PROGRESS, not from when parking
+    // began. A header far beyond the forecast horizon legitimately takes many
+    // blocks of catch-up apply to come into range (the gap can be ~a stability
+    // window ≈ thousands of blocks). As long as the ledger keeps advancing the
+    // peer is doing its job — disconnecting it would starve the very blockfetch
+    // that closes the gap, wedging the whole sync (all peers churn on
+    // "beyond forecast horizon", ledger can never advance). Only a genuinely
+    // stalled ledger (no apply progress at all for FORECAST_PARK_TIMEOUT) drops
+    // the peer. Mirrors cardano-node, which blocks ChainSync at the forecast
+    // horizon and waits for the ledger rather than dropping the upstream peer.
+    let mut last_progress = std::time::Instant::now();
     let mut wakes: u32 = 0;
     loop {
         let view = ledger_view.load();
@@ -3475,11 +3485,11 @@ pub(crate) async fn forecast_park_or_disconnect(
         match forecast_for(tip_slot_no, stability_window, SlotNo(header_slot)) {
             Ok(()) => return Ok(()),
             Err(out) => {
-                let elapsed = park_started.elapsed();
+                let elapsed = last_progress.elapsed();
                 if elapsed >= FORECAST_PARK_TIMEOUT {
                     return Err(anyhow::anyhow!(
                         "ChainSync: {peer_addr} header slot {} beyond forecast horizon \
-                         (tip {:?}, max_for {}) — exceeded {:?} suspension; disconnecting",
+                         (tip {:?}, max_for {}) — no ledger progress for {:?}; disconnecting",
                         header_slot,
                         out.at,
                         out.max_for.0,
@@ -3505,12 +3515,14 @@ pub(crate) async fn forecast_park_or_disconnect(
                             return Ok(());
                         }
                         wakes = wakes.saturating_add(1);
-                        // Loop and re-check.
+                        // The ledger advanced — the peer is helping close the
+                        // gap. Reset the no-progress timer and re-check.
+                        last_progress = std::time::Instant::now();
                     }
                     _ = tokio::time::sleep(remaining) => {
                         return Err(anyhow::anyhow!(
                             "ChainSync: {peer_addr} header slot {} beyond forecast horizon \
-                             after {:?} suspension; disconnecting",
+                             — no ledger progress for {:?}; disconnecting",
                             header_slot,
                             FORECAST_PARK_TIMEOUT
                         ));
