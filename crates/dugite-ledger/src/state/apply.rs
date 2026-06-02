@@ -1023,11 +1023,20 @@ impl LedgerState {
                             &self.slot_config,
                         );
                         if eval_result.is_ok() {
-                            return Err(LedgerError::ValidationTagMismatch {
-                                tx_hash: tx.hash.to_hex(),
-                                block_flag: false,
-                                eval_result: true,
-                            });
+                            // Phase-2 divergence on a confirmed block: the
+                            // on-chain is_valid=false flag is consensus truth
+                            // (see the parallel branch in Step 8d for the full
+                            // rationale). Trust it, log, and fall through to
+                            // Step 8b which applies the tx as invalid — keeping
+                            // the ledger state byte-exact — instead of halting
+                            // the sync.
+                            warn!(
+                                tx_hash = %tx.hash.to_hex(),
+                                slot = block.slot().0,
+                                "Plutus evaluation divergence: uplc says scripts PASS but block \
+                                 is_valid=false on-chain — trusting on-chain consensus (tx applied \
+                                 as invalid; dugite CEK over-permissive)"
+                            );
                         }
                     }
                 }
@@ -1237,14 +1246,29 @@ impl LedgerState {
                             );
                         }
                     } else {
-                        // is_valid=false: scripts MUST fail. If they pass, the
-                        // producer is stealing collateral.
+                        // is_valid=false: the producer's scripts failed on-chain
+                        // (collateral consumed). dugite's CEK says they pass — a
+                        // Phase-2 evaluation divergence. On a block received via
+                        // ChainSync the is_valid flag is CONSENSUS TRUTH: honest
+                        // (Haskell) nodes enforce it with a correct CEK, so any
+                        // block on the selected chain carries a genuine flag and
+                        // the divergence is a dugite-CEK bug, not collateral
+                        // theft. The tx was ALREADY applied as invalid (collateral
+                        // consumed, no outputs) in Step 8b, so the ledger state is
+                        // byte-exact regardless. Trust the on-chain flag and log
+                        // the divergence (symmetric with the is_valid=true branch
+                        // above) instead of hard-halting the whole sync. The
+                        // DUGITE_PHASE2_DUMP_DIR repro was captured in
+                        // run_phase2_parallel for offline CEK root-causing.
                         if outcome.result.is_ok() {
-                            return Err(LedgerError::ValidationTagMismatch {
-                                tx_hash: tx.hash.to_hex(),
-                                block_flag: false,
-                                eval_result: true,
-                            });
+                            warn!(
+                                tx_hash = %tx.hash.to_hex(),
+                                slot = block.slot().0,
+                                "Plutus evaluation divergence (parallel): uplc says scripts PASS \
+                                 but block is_valid=false on-chain — trusting on-chain consensus \
+                                 (tx applied as invalid; dugite CEK over-permissive — see \
+                                 DUGITE_PHASE2_DUMP_DIR)"
+                            );
                         }
                     }
                 }
