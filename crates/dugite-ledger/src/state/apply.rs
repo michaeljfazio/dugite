@@ -20,7 +20,10 @@ use super::{credential_to_hash, BlockValidationMode, LedgerError, LedgerState};
 use crate::eras::byron::{apply_byron_block, ByronApplyMode, ByronFeePolicy};
 use crate::eras::{EraRules, EraRulesImpl, RuleContext};
 use crate::ledger_seq::{BlockFieldsDelta, LedgerDelta};
+#[cfg(not(feature = "parallel-verification"))]
 use crate::plutus::evaluate_plutus_scripts;
+#[cfg(feature = "parallel-verification")]
+use crate::plutus::{capture_phase2_work_item, run_phase2_parallel, Phase2WorkItem};
 use crate::utxo_diff::UtxoDiff;
 use crate::validation::{calculate_ref_script_size, ValidationError};
 use dugite_primitives::block::{Block, Point};
@@ -464,6 +467,36 @@ impl LedgerState {
         // Track processed tx hashes to skip duplicates within a block
         let mut processed_tx_hashes =
             std::collections::HashSet::with_capacity(block.transactions.len());
+
+        // ── Deferred-parallel Phase-2 work items ─────────────────────────
+        //
+        // When `parallel-verification` is enabled, the per-tx loop resolves
+        // Plutus inputs sequentially (ordering-dependent: a tx may spend
+        // outputs produced by an earlier tx in the same block) and defers the
+        // expensive `eval_phase_two_raw` call to a parallel post-loop pass.
+        //
+        // Each work item is a self-contained struct (tx CBOR + resolved UTxO
+        // pairs + budget params) captured while the UTxO set still reflects
+        // the correct apply-point state for that transaction.
+        //
+        // The `SKIP_PHASE2_EVAL` thread-local is set to `true` before the
+        // loop so `validate_transaction_with_pools` suppresses its own phase-2
+        // call. Callers outside `apply_block` (mempool, tests) are unaffected.
+        // Typically only a small fraction of txs have redeemers, so we start
+        // with a zero-allocation Vec and let it grow on demand.
+        #[cfg(feature = "parallel-verification")]
+        let mut phase2_work_items: Vec<Phase2WorkItem> = Vec::new();
+        // Activate the phase-2 skip flag only in ValidateAll mode (the only
+        // mode that calls `validate_transaction_with_context`). In ApplyOnly
+        // mode, the flag would never be read, but we still set it for safety.
+        // The guard holds the previous flag value so we can restore it after
+        // the loop — critical for nested calls (e.g. forging path).
+        #[cfg(feature = "parallel-verification")]
+        let _phase2_skip_guard: bool = if mode == BlockValidationMode::ValidateAll {
+            crate::validation::suppress_phase2_eval()
+        } else {
+            false
+        };
 
         // Cache block-level values for RuleContext construction inside the loop.
         // We cannot call self.build_rule_context() inside the loop because it
@@ -932,26 +965,70 @@ impl LedgerState {
                     // are O(1) imbl structural clones — independent from the live maps.
                     // Apply-time mutations on `self.certs.reward_accounts` etc. are
                     // O(log N) with no CoW deep-clone, and don't affect the snapshots.
+                    //
+                    // ── Deferred Phase-2 work item capture ───────────────────
+                    //
+                    // When `parallel-verification` is enabled, `validate_transaction_with_context`
+                    // ran with the SKIP_PHASE2_EVAL flag set, so phase-2 was suppressed
+                    // above. Capture the work item now — while the UTxO set still
+                    // reflects the apply-point state for this transaction. The actual
+                    // `eval_phase_two_raw` call runs in the parallel pass after the loop.
+                    #[cfg(feature = "parallel-verification")]
+                    if has_redeemers {
+                        let max_ex = (
+                            self.epochs.protocol_params.max_tx_ex_units.steps,
+                            self.epochs.protocol_params.max_tx_ex_units.mem,
+                        );
+                        phase2_work_items.push(capture_phase2_work_item(
+                            tx_idx,
+                            tx,
+                            &self.utxo.utxo_set,
+                            cost_models_cbor.clone(),
+                            max_ex,
+                            self.slot_config,
+                        ));
+                    }
                 } else if has_redeemers {
                     // Producer claims tx is invalid with scripts present.
                     // Verify scripts actually fail; if they pass, producer is stealing collateral.
-                    let max_ex = (
-                        self.epochs.protocol_params.max_tx_ex_units.steps,
-                        self.epochs.protocol_params.max_tx_ex_units.mem,
-                    );
-                    let eval_result = evaluate_plutus_scripts(
-                        tx,
-                        &self.utxo.utxo_set,
-                        cost_models_cbor.as_deref(),
-                        max_ex,
-                        &self.slot_config,
-                    );
-                    if eval_result.is_ok() {
-                        return Err(LedgerError::ValidationTagMismatch {
-                            tx_hash: tx.hash.to_hex(),
-                            block_flag: false,
-                            eval_result: true,
-                        });
+                    //
+                    // ── Parallel path: defer eval, capture work item ──────────
+                    #[cfg(feature = "parallel-verification")]
+                    {
+                        let max_ex = (
+                            self.epochs.protocol_params.max_tx_ex_units.steps,
+                            self.epochs.protocol_params.max_tx_ex_units.mem,
+                        );
+                        phase2_work_items.push(capture_phase2_work_item(
+                            tx_idx,
+                            tx,
+                            &self.utxo.utxo_set,
+                            cost_models_cbor.clone(),
+                            max_ex,
+                            self.slot_config,
+                        ));
+                    }
+                    // ── Sequential fallback (feature disabled) ────────────────
+                    #[cfg(not(feature = "parallel-verification"))]
+                    {
+                        let max_ex = (
+                            self.epochs.protocol_params.max_tx_ex_units.steps,
+                            self.epochs.protocol_params.max_tx_ex_units.mem,
+                        );
+                        let eval_result = evaluate_plutus_scripts(
+                            tx,
+                            &self.utxo.utxo_set,
+                            cost_models_cbor.as_deref(),
+                            max_ex,
+                            &self.slot_config,
+                        );
+                        if eval_result.is_ok() {
+                            return Err(LedgerError::ValidationTagMismatch {
+                                tx_hash: tx.hash.to_hex(),
+                                block_flag: false,
+                                eval_result: true,
+                            });
+                        }
                     }
                 }
             }
@@ -1106,6 +1183,68 @@ impl LedgerState {
                                 .entry(EpochNo(update.epoch))
                                 .or_default()
                                 .push((*genesis_hash, ppu.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Step 8d: Parallel Phase-2 evaluation ─────────────────────────
+        //
+        // Restore the SKIP_PHASE2_EVAL flag and run all deferred Plutus evals
+        // in parallel via rayon. Results are collected in tx_idx order (rayon
+        // `par_iter` + `sort_by_key` in `run_phase2_parallel`).
+        //
+        // Error semantics (per-result):
+        //   is_valid=true  → ScriptFailed warning (trusting on-chain consensus)
+        //   is_valid=false → ValidationTagMismatch → early-return Err (fatal)
+        //
+        // This mirrors the sequential path exactly: same checks, same error
+        // precedence, same result per transaction. The fingerprint is unaffected
+        // because ledger state is determined by the UTxO apply (Step 8b), which
+        // already ran sequentially above.
+        #[cfg(feature = "parallel-verification")]
+        {
+            crate::validation::restore_phase2_eval(_phase2_skip_guard);
+            if mode == BlockValidationMode::ValidateAll && !phase2_work_items.is_empty() {
+                let t_phase2_start = if timing_enabled {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                let outcomes = run_phase2_parallel(phase2_work_items);
+                if let Some(start) = t_phase2_start {
+                    t_validate += start.elapsed();
+                }
+                for outcome in outcomes {
+                    // Look up the transaction by index. Duplicate txs were
+                    // skipped during the loop (not added to work_items), so
+                    // every outcome.tx_idx is a valid index.
+                    let tx = match block.transactions.get(outcome.tx_idx) {
+                        Some(t) => t,
+                        None => continue,
+                    };
+                    if outcome.is_valid {
+                        // is_valid=true: phase-2 failure is a ScriptFailed on a
+                        // confirmed block — log a warning and trust on-chain consensus.
+                        if let Err(e) = outcome.result {
+                            warn!(
+                                tx_hash = %tx.hash.to_hex(),
+                                slot = block.slot().0,
+                                error = %e,
+                                "Plutus evaluation divergence (parallel): uplc says scripts fail \
+                                 but block is_valid=true on-chain — trusting on-chain consensus"
+                            );
+                        }
+                    } else {
+                        // is_valid=false: scripts MUST fail. If they pass, the
+                        // producer is stealing collateral.
+                        if outcome.result.is_ok() {
+                            return Err(LedgerError::ValidationTagMismatch {
+                                tx_hash: tx.hash.to_hex(),
+                                block_flag: false,
+                                eval_result: true,
+                            });
                         }
                     }
                 }

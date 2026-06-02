@@ -59,10 +59,46 @@ use dugite_primitives::protocol_params::ProtocolParameters;
 use dugite_primitives::time::EpochNo;
 use dugite_primitives::transaction::{GovAction, GovActionId, Transaction, Voter};
 use dugite_primitives::value::Lovelace;
+use std::cell::Cell;
 use tracing::{debug, trace, warn};
 
 use crate::plutus::{evaluate_plutus_scripts, SlotConfig};
 use crate::utxo::UtxoLookup;
+
+// ---------------------------------------------------------------------------
+// Per-thread phase-2 skip gate
+//
+// When the block-apply path uses the deferred-parallel Phase-2 strategy
+// (feature = "parallel-verification"), it sets this flag to `true` before
+// calling `validate_transaction_with_context` so that the sequential phase-2
+// eval inside `validate_transaction_with_pools` is suppressed. The parallel
+// eval runs separately via `crate::plutus::run_phase2_parallel`.
+//
+// The flag is thread-local so it cannot leak across block-apply calls on
+// different threads, and cannot interfere with the mempool path (which calls
+// `validate_transaction*` on its own thread and never sets the flag).
+// ---------------------------------------------------------------------------
+thread_local! {
+    static SKIP_PHASE2_EVAL: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Set the thread-local phase-2 skip flag and return the previous value.
+///
+/// Used by the block-apply parallel-phase-2 path. Always restore the returned
+/// value with [`restore_phase2_eval`] (even on error) to avoid leaking the
+/// skip state across invocations.
+pub(crate) fn suppress_phase2_eval() -> bool {
+    SKIP_PHASE2_EVAL.with(|c| {
+        let prev = c.get();
+        c.set(true);
+        prev
+    })
+}
+
+/// Restore the thread-local phase-2 skip flag to a previously-saved value.
+pub(crate) fn restore_phase2_eval(prev: bool) {
+    SKIP_PHASE2_EVAL.with(|c| c.set(prev));
+}
 
 /// On-chain governance proposal record used by validation rules that need
 /// access to a proposal's full state (not just the action itself).
@@ -3555,52 +3591,67 @@ pub fn validate_transaction_with_pools(
         }
 
         if errors.is_empty() && has_redeemers {
-            if slot_config.is_none() {
-                debug!(
-                    tx_hash = %tx.hash.to_hex(),
-                    "Plutus transaction missing slot configuration for script evaluation"
-                );
-                errors.push(ValidationError::MissingSlotConfig);
-            }
-            if errors.is_empty() {
-                if let Some(sc) = slot_config {
-                    let cost_models_cbor = params.cost_models.to_cbor();
-                    // uplc::tx::eval_phase_two_raw expects initial_budget as (cpu_steps, mem_units).
-                    // Our ExUnits struct uses { mem, steps } where mem=memory_units and steps=cpu_steps.
-                    // Swap the fields to match the uplc convention: (steps, mem) = (cpu, mem).
-                    let max_ex = (params.max_tx_ex_units.steps, params.max_tx_ex_units.mem);
-                    let eval_result = evaluate_plutus_scripts(
-                        tx,
-                        utxo_set,
-                        cost_models_cbor.as_deref(),
-                        max_ex,
-                        sc,
+            // ── Parallel-phase-2 gate ─────────────────────────────────────
+            //
+            // When the block-apply path uses deferred-parallel Phase-2
+            // (feature = "parallel-verification"), it sets the thread-local
+            // `SKIP_PHASE2_EVAL` flag before calling validation so that the
+            // expensive `eval_phase_two_raw` is suppressed here. The actual
+            // evaluation runs in parallel via
+            // `crate::plutus::run_phase2_parallel` after the sequential loop.
+            //
+            // For all other callers (mempool admission, `validate_transaction`,
+            // `validate_transaction_with_pools`, tests), the flag is `false`
+            // (its default) and this branch executes normally.
+            let skip_phase2 = SKIP_PHASE2_EVAL.with(|c| c.get());
+            if !skip_phase2 {
+                if slot_config.is_none() {
+                    debug!(
+                        tx_hash = %tx.hash.to_hex(),
+                        "Plutus transaction missing slot configuration for script evaluation"
                     );
-                    if tx.is_valid {
-                        // Tx claims scripts pass — reject if they actually fail.
-                        if let Err(e) = eval_result {
-                            errors.push(ValidationError::ScriptFailed(e.to_string()));
+                    errors.push(ValidationError::MissingSlotConfig);
+                }
+                if errors.is_empty() {
+                    if let Some(sc) = slot_config {
+                        let cost_models_cbor = params.cost_models.to_cbor();
+                        // uplc::tx::eval_phase_two_raw expects initial_budget as (cpu_steps, mem_units).
+                        // Our ExUnits struct uses { mem, steps } where mem=memory_units and steps=cpu_steps.
+                        // Swap the fields to match the uplc convention: (steps, mem) = (cpu, mem).
+                        let max_ex = (params.max_tx_ex_units.steps, params.max_tx_ex_units.mem);
+                        let eval_result = evaluate_plutus_scripts(
+                            tx,
+                            utxo_set,
+                            cost_models_cbor.as_deref(),
+                            max_ex,
+                            sc,
+                        );
+                        if tx.is_valid {
+                            // Tx claims scripts pass — reject if they actually fail.
+                            if let Err(e) = eval_result {
+                                errors.push(ValidationError::ScriptFailed(e.to_string()));
+                            }
+                        } else {
+                            // Tx claims scripts fail (is_valid=false) — reject if they
+                            // actually pass.  This is the "DoS-class" attack vector:
+                            // an attacker marks is_valid=false on a tx whose Plutus
+                            // script evaluates to True.  Cardano mempool (`applyTx`)
+                            // catches this with `ValidationTagMismatch`; we mirror
+                            // that check here so BPs never admit such txs.
+                            // Haskell rule: `Cardano.Ledger.Conway.Rules.Utxos`
+                            // predicate `ConwayUtxos`:
+                            //   IsValid True vs eval False → `TagMismatch False`
+                            //   IsValid False vs eval True → `TagMismatch True`
+                            if eval_result.is_ok() {
+                                errors.push(ValidationError::IsValidTagMismatch {
+                                    declared: false,
+                                    evaluated: true,
+                                });
+                            }
+                            // If eval also fails (both agree scripts fail), the
+                            // is_valid=false path is legitimate — collateral is
+                            // consumed at block apply time. No error here.
                         }
-                    } else {
-                        // Tx claims scripts fail (is_valid=false) — reject if they
-                        // actually pass.  This is the "DoS-class" attack vector:
-                        // an attacker marks is_valid=false on a tx whose Plutus
-                        // script evaluates to True.  Cardano mempool (`applyTx`)
-                        // catches this with `ValidationTagMismatch`; we mirror
-                        // that check here so BPs never admit such txs.
-                        // Haskell rule: `Cardano.Ledger.Conway.Rules.Utxos`
-                        // predicate `ConwayUtxos`:
-                        //   IsValid True vs eval False → `TagMismatch False`
-                        //   IsValid False vs eval True → `TagMismatch True`
-                        if eval_result.is_ok() {
-                            errors.push(ValidationError::IsValidTagMismatch {
-                                declared: false,
-                                evaluated: true,
-                            });
-                        }
-                        // If eval also fails (both agree scripts fail), the
-                        // is_valid=false path is legitimate — collateral is
-                        // consumed at block apply time. No error here.
                     }
                 }
             }
