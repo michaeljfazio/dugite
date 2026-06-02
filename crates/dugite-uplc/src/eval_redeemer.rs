@@ -255,17 +255,17 @@ fn resolve_applied_costs(
     }
 }
 
-/// Per-thread memoization of `script-bytes -> decoded Program`.
-///
-/// Flat decoding (`flat::term::decode_term_inner`) is the single dominant
-/// apply-path cost on Plutus-dense mainnet blocks (profiling: ~1350/16800
-/// apply samples, allocation-bound), and the same popular validators recur
-/// across thousands of transactions — each carrying the full script in its
-/// witness. Decoding is a *pure, deterministic* function of the bytes, so
-/// memoizing it changes nothing observable (the `apply_bench` regression
-/// fingerprint must stay identical). Keyed by the exact input bytes, so there
-/// is no weak-hash collision risk. `Rc<Term>`-based `Program` is not `Send`,
-/// hence a `thread_local` cache (each apply/rayon thread keeps its own).
+// Per-thread memoization of `script-bytes -> decoded Program`.
+//
+// Flat decoding (`flat::term::decode_term_inner`) is the single dominant
+// apply-path cost on Plutus-dense mainnet blocks (profiling: ~1350/16800
+// apply samples, allocation-bound), and the same popular validators recur
+// across thousands of transactions — each carrying the full script in its
+// witness. Decoding is a *pure, deterministic* function of the bytes, so
+// memoizing it changes nothing observable (the `apply_bench` regression
+// fingerprint must stay identical). Keyed by the exact input bytes, so there
+// is no weak-hash collision risk. `Rc<Term>`-based `Program` is not `Send`,
+// hence a `thread_local` cache (each apply/rayon thread keeps its own).
 thread_local! {
     static SCRIPT_DECODE_CACHE: std::cell::RefCell<std::collections::HashMap<Vec<u8>, Program>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
