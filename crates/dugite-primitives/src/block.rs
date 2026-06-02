@@ -136,6 +136,34 @@ pub struct BlockHeader {
     pub raw_header_body: Option<Vec<u8>>,
 }
 
+impl BlockHeader {
+    /// Whether this header uses the **TPraos** consensus protocol (Shelley
+    /// through Alonzo) as opposed to **Praos** (Babbage onward).
+    ///
+    /// The consensus protocol is a function of the block's ERA / header
+    /// STRUCTURE, **not** its `protocol_version`. A TPraos header carries two
+    /// VRF certificates (a leader VRF and a separate nonce VRF); a Praos header
+    /// carries a single VRF certificate and derives the nonce by hashing its
+    /// output, leaving `nonce_vrf_proof` empty. So the presence of a separate
+    /// nonce-VRF proof is the authoritative discriminator.
+    ///
+    /// This matters at the Vasil hard-fork transition: on a from-genesis sync
+    /// the `protocol_version` bumps to 7 *mid-epoch* while blocks are still
+    /// structurally TPraos/Alonzo (15-field header, separate nonce VRF). Gating
+    /// VRF-seed construction / leader checks on `protocol_version >= 7` would
+    /// mis-verify those transition blocks (a Praos seed applied to a TPraos
+    /// header) and wedge the node. Gate on this instead.
+    ///
+    /// A header is TPraos iff its protocol version is pre-Babbage (`< 7`) OR it
+    /// carries a separate nonce-VRF certificate. The second clause is what
+    /// catches the Vasil transition block (PV7 but still a TPraos structure);
+    /// the first keeps the classification correct for any pre-Babbage block
+    /// regardless of how the nonce field is populated.
+    pub fn is_tpraos(&self) -> bool {
+        self.protocol_version.major < 7 || !self.nonce_vrf_proof.is_empty()
+    }
+}
+
 /// VRF output
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VrfOutput {

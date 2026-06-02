@@ -410,7 +410,7 @@ impl OuroborosPraos {
         // Issue #545 E2: add to pre-flight to close the non-strict silent-skip gap
         // that existed for Shelley/Allegra/Mary/Alonzo blocks with a malformed
         // nonce VRF proof.  Matches Haskell's `decodeVerKeyVRF` `failSizeCheck`.
-        if header.protocol_version.major < 7 {
+        if header.is_tpraos() {
             check_field!("nonce_vrf_proof", header.nonce_vrf_proof, 80);
             check_field!("nonce_vrf_output", header.nonce_vrf_output, 64);
         }
@@ -861,7 +861,7 @@ impl OuroborosPraos {
             if header.vrf_result.output.len() == 64 {
                 // Praos (Babbage/Conway, protocol >= 7): Blake2b-256("L" || vrf_output), certNatMax = 2^256
                 // TPraos (Shelley-Alonzo, protocol < 7): raw 64-byte vrf_output, certNatMax = 2^512
-                let is_praos = header.protocol_version.major >= 7;
+                let is_praos = !header.is_tpraos();
                 let (f_num, f_den) = self.active_slot_coeff_rational;
                 let is_leader = if is_praos {
                     let leader_value =
@@ -1140,7 +1140,7 @@ impl OuroborosPraos {
                     last_seen = m,
                     "Praos: opcert counter regression (non-fatal during sync)"
                 );
-            } else if header.protocol_version.major >= 7 && n > m.saturating_add(1) {
+            } else if !header.is_tpraos() && n > m.saturating_add(1) {
                 // CounterOverIncrementedOCERT — Praos ONLY (PV >= 7). The Praos
                 // consensus layer's `doValidateKESSignature` adds the upper
                 // bound `n <= m + 1`, but the TPraos `OCERT.ocertTransition`
@@ -1207,7 +1207,9 @@ impl OuroborosPraos {
         // Construct the VRF seed:
         // TPraos (Shelley–Alonzo, proto < 7): domain-separated seed with TAG_L XOR.
         // Praos (Babbage/Conway, proto >= 7): plain hash, no domain tag.
-        let seed = if header.protocol_version.major < 7 {
+        // Gate on the header STRUCTURE (is_tpraos), not protocol_version: at the
+        // Vasil transition PV bumps to 7 while blocks are still TPraos/Alonzo.
+        let seed = if header.is_tpraos() {
             crate::slot_leader::tpraos_leader_vrf_input(&header.epoch_nonce, header.slot)
         } else {
             crate::slot_leader::vrf_input(&header.epoch_nonce, header.slot)
@@ -1251,7 +1253,11 @@ impl OuroborosPraos {
                 if vrf_is_fatal {
                     error!(
                         slot = header.slot.0,
+                        proto_major = header.protocol_version.major,
+                        seed_kind = if header.is_tpraos() { "tpraos" } else { "praos" },
                         epoch_nonce = %header.epoch_nonce.to_hex(),
+                        vrf_vkey_len = header.vrf_vkey.len(),
+                        vrf_proof_len = header.vrf_result.proof.len(),
                         error = %e,
                         "VRF verification failed (fatal)"
                     );
@@ -1278,7 +1284,7 @@ impl OuroborosPraos {
     /// nonce contribution deterministically, so this check is skipped for them.
     fn verify_nonce_vrf_proof(&self, header: &BlockHeader) -> Result<(), ConsensusError> {
         // Only TPraos blocks carry a separate nonce VRF proof.
-        if header.protocol_version.major >= 7 || header.nonce_vrf_proof.is_empty() {
+        if !header.is_tpraos() {
             return Ok(());
         }
 
@@ -1668,8 +1674,9 @@ impl OuroborosPraos {
     ) -> Result<(), ConsensusError> {
         let vrf_is_fatal = params.strict_verification;
 
-        // Era-correct seed construction (issue #545 E3).
-        let seed = if header.protocol_version.major < 7 {
+        // Era-correct seed construction (issue #545 E3). Gate on the header
+        // STRUCTURE (is_tpraos), not protocol_version — see verify_vrf_proof.
+        let seed = if header.is_tpraos() {
             crate::slot_leader::tpraos_leader_vrf_input(&header.epoch_nonce, header.slot)
         } else {
             crate::slot_leader::vrf_input(&header.epoch_nonce, header.slot)
@@ -4513,14 +4520,20 @@ mod tests {
         use dugite_primitives::block::ProtocolVersion;
         let mut header = make_tpraos_header();
         header.protocol_version = ProtocolVersion { major: 9, minor: 0 };
-        header.nonce_vrf_proof = vec![0xFFu8; 80]; // would be invalid
+        // A real Praos/Conway header has a SINGLE VRF cert and no separate nonce
+        // VRF — `nonce_vrf_proof` is empty. With it empty the header is Praos by
+        // structure (`is_tpraos == false`) and the separate-nonce-VRF check is
+        // skipped. (A header that *did* carry a nonce VRF cert would be treated
+        // as TPraos by structure and the cert WOULD be verified — see is_tpraos.)
+        header.nonce_vrf_proof = vec![];
+        assert!(!header.is_tpraos());
 
         let mut praos = OuroborosPraos::new(11);
         praos.strict_verification = true;
 
         assert!(
             praos.verify_nonce_vrf_proof(&header).is_ok(),
-            "Praos blocks must skip nonce VRF check"
+            "Praos blocks (no separate nonce VRF) must skip the nonce VRF check"
         );
     }
 
@@ -5258,19 +5271,33 @@ mod tests {
         );
     }
 
-    /// E2: Praos-era (proto >= 7) headers are NOT checked for nonce_vrf_proof
-    /// (field is empty/absent in Praos; the check is TPraos-gated).
+    /// E2: real Praos blocks carry NO separate nonce VRF proof, so the
+    /// nonce_vrf_proof size check is skipped (gated on the header STRUCTURE via
+    /// `is_tpraos`, not on protocol_version — see `BlockHeader::is_tpraos`,
+    /// which matters at the Vasil transition where PV7 blocks are still TPraos).
     #[test]
     fn issue_545_e2_praos_era_nonce_vrf_proof_not_checked() {
         let mut header = make_valid_header(100);
         header.protocol_version.major = 9; // Conway
-                                           // Even if nonce_vrf_proof has a weird length, it should not be checked
-                                           // for Praos-era blocks (the field is always empty).
-        header.nonce_vrf_proof = vec![0u8; 42];
+                                           // A real Praos/Conway header has an EMPTY nonce_vrf_proof
+                                           // (single VRF cert), so it is not size-checked.
+        header.nonce_vrf_proof = vec![];
+        assert!(!header.is_tpraos());
         let result = OuroborosPraos::check_header_field_sizes(&header, true);
         assert!(
             result.is_ok(),
-            "Praos era: nonce_vrf_proof length should not be checked: {result:?}"
+            "Praos era (empty nonce_vrf_proof): not checked: {result:?}"
+        );
+
+        // Conversely, a header that DOES carry a nonce VRF proof is treated as
+        // TPraos (by structure) and IS size-checked — a malformed length is
+        // rejected regardless of the protocol_version claimed in the header.
+        header.nonce_vrf_proof = vec![0u8; 42];
+        assert!(header.is_tpraos());
+        let result = OuroborosPraos::check_header_field_sizes(&header, true);
+        assert!(
+            result.is_err(),
+            "header with a present (malformed) nonce_vrf_proof must be rejected: {result:?}"
         );
     }
 
