@@ -255,6 +255,27 @@ fn resolve_applied_costs(
     }
 }
 
+/// Per-thread memoization of `script-bytes -> decoded Program`.
+///
+/// Flat decoding (`flat::term::decode_term_inner`) is the single dominant
+/// apply-path cost on Plutus-dense mainnet blocks (profiling: ~1350/16800
+/// apply samples, allocation-bound), and the same popular validators recur
+/// across thousands of transactions — each carrying the full script in its
+/// witness. Decoding is a *pure, deterministic* function of the bytes, so
+/// memoizing it changes nothing observable (the `apply_bench` regression
+/// fingerprint must stay identical). Keyed by the exact input bytes, so there
+/// is no weak-hash collision risk. `Rc<Term>`-based `Program` is not `Send`,
+/// hence a `thread_local` cache (each apply/rayon thread keeps its own).
+thread_local! {
+    static SCRIPT_DECODE_CACHE: std::cell::RefCell<std::collections::HashMap<Vec<u8>, Program>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Bound on distinct cached scripts per thread (popular mainnet validators
+/// number in the hundreds; the cap is a memory backstop, not a working-set
+/// limit). On overflow the cache is cleared and repopulated.
+const SCRIPT_DECODE_CACHE_CAP: usize = 4096;
+
 /// Decode the script bytes the wire / reference-input provides.
 ///
 /// On-chain Plutus scripts are CBOR-encoded byte-strings holding the
@@ -265,7 +286,26 @@ fn resolve_applied_costs(
 /// If the outer byte looks like a CBOR byte-string (major type 2) and
 /// `from_cbor` fails, we propagate that error directly — the bytes are
 /// structurally CBOR and it makes no sense to re-attempt as raw flat.
+///
+/// The decode is memoized per thread (see [`SCRIPT_DECODE_CACHE`]) — a pure
+/// performance optimisation that does not change the decoded program.
 fn decode_script_bytes(bytes: &[u8]) -> Result<Program, PhaseTwoError> {
+    if let Some(prog) = SCRIPT_DECODE_CACHE.with(|c| c.borrow().get(bytes).cloned()) {
+        return Ok(prog);
+    }
+    let prog = decode_script_bytes_uncached(bytes)?;
+    SCRIPT_DECODE_CACHE.with(|c| {
+        let mut m = c.borrow_mut();
+        if m.len() >= SCRIPT_DECODE_CACHE_CAP {
+            m.clear();
+        }
+        m.insert(bytes.to_vec(), prog.clone());
+    });
+    Ok(prog)
+}
+
+/// The uncached decode (the actual flat/CBOR deserialization).
+fn decode_script_bytes_uncached(bytes: &[u8]) -> Result<Program, PhaseTwoError> {
     // CBOR major-type 2 (byte-string) = 0x40-0x5f (short) or 0x58/0x59/0x5a/0x5b (extended).
     let looks_like_cbor_bytes = bytes.first().is_some_and(|&b| b >> 5 == 2);
 
