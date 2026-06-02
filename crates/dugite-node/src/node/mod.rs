@@ -630,6 +630,46 @@ pub(crate) struct GsmActorParts {
 // ─── Node impl: new() ────────────────────────────────────────────────────────
 
 impl Node {
+    /// Load a ledger snapshot and enforce the backend-tag guard before the
+    /// node commits to it. Mirrors Haskell's `MetadataBackendMismatch`: a
+    /// snapshot written with a *different* UTxO backend is rejected (→ `Err`)
+    /// so the caller falls through to the from-chain rebuild rather than
+    /// loading an empty or structurally-incompatible UTxO set. A missing
+    /// sidecar (pre-meta snapshots, e.g. an existing `db-mainnet`) is handled
+    /// by backend inference and loads normally.
+    fn load_snapshot_with_backend_guard(
+        snapshot_path: &std::path::Path,
+        database_path: &std::path::Path,
+        configured: dugite_ledger::SnapshotBackend,
+    ) -> std::result::Result<LedgerState, String> {
+        let state = LedgerState::load_snapshot(snapshot_path).map_err(|e| e.to_string())?;
+        match dugite_ledger::check_snapshot_backend_match(
+            snapshot_path,
+            &state,
+            database_path,
+            configured,
+        ) {
+            dugite_ledger::BackendCheckResult::Ok => Ok(state),
+            dugite_ledger::BackendCheckResult::Mismatch {
+                snapshot_backend,
+                configured_backend,
+            } => {
+                warn!(
+                    snapshot_backend = snapshot_backend.as_tag(),
+                    configured_backend = configured_backend.as_tag(),
+                    "Ledger snapshot was created with a different UTxO backend — ignoring it \
+                     and rebuilding from chain. Run the snapshot converter to migrate without \
+                     a replay."
+                );
+                Err(format!(
+                    "snapshot backend `{}` does not match configured backend `{}`",
+                    snapshot_backend.as_tag(),
+                    configured_backend.as_tag()
+                ))
+            }
+        }
+    }
+
     pub fn new(args: NodeArgs) -> Result<Self> {
         let mut protocol_params = ProtocolParameters::mainnet_defaults();
 
@@ -903,9 +943,15 @@ impl Node {
             }
         }
 
-        // Try to load existing ledger snapshot
+        // Try to load existing ledger snapshot (with the backend-mismatch
+        // guard — a snapshot tagged for a different UTxO backend is rejected
+        // here and the node rebuilds from chain).
         let mut ledger = if snapshot_path.exists() {
-            match LedgerState::load_snapshot(&snapshot_path) {
+            match Self::load_snapshot_with_backend_guard(
+                &snapshot_path,
+                &args.database_path,
+                epoch::snapshot_backend_of(args.storage_config.utxo.backend),
+            ) {
                 Ok(mut state) => {
                     // Re-apply genesis config in case it changed
                     let ste = epoch::shelley_transition_epoch_for_magic(network_magic);
@@ -1803,6 +1849,10 @@ impl Node {
             let m = crate::metrics::NodeMetrics::new();
             m.set_network_magic(network_magic);
             m.set_consensus_mode_genesis(args.consensus_mode == "genesis");
+            m.set_utxo_backend(match args.storage_config.utxo.backend {
+                dugite_storage::UtxoBackend::Lsm => "lsm",
+                dugite_storage::UtxoBackend::InMemory => "in-memory",
+            });
             m.set_compat_metrics(args.compat_metrics);
             m.liveness_threshold_secs.store(
                 args.liveness_threshold_secs,

@@ -9,6 +9,7 @@ pub mod config_reload;
 pub mod csj_orchestrator;
 pub mod forge;
 pub mod gsm;
+pub mod snapshot_convert;
 pub mod verify_snapshot;
 
 /// `peer_connection` module exposed for the `test-utils` integration-test

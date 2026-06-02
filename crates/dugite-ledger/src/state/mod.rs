@@ -22,6 +22,10 @@ pub(crate) use governance::{
 pub use rewards::compute_reward_update;
 #[doc(hidden)]
 pub use rewards::Rat;
+pub use snapshot::{
+    check_snapshot_backend_match, infer_backend_from_snapshot, BackendCheckResult, SnapshotBackend,
+    SnapshotMeta,
+};
 pub use snapshot_format::LedgerStateSnapshot;
 pub use substates::{CertSubState, ConsensusSubState, EpochSubState, GovSubState, UtxoSubState};
 

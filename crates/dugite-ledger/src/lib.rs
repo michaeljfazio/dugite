@@ -17,8 +17,9 @@ pub use plutus::{
 #[doc(hidden)]
 pub use state::Rat;
 pub use state::{
-    compute_reward_update, BlockValidationMode, CertSubState, ConsensusSubState, EpochSubState,
-    GovSubState, LedgerState, LedgerStateSnapshot, UtxoSubState,
+    check_snapshot_backend_match, compute_reward_update, infer_backend_from_snapshot,
+    BackendCheckResult, BlockValidationMode, CertSubState, ConsensusSubState, EpochSubState,
+    GovSubState, LedgerState, LedgerStateSnapshot, SnapshotBackend, SnapshotMeta, UtxoSubState,
 };
 pub use utxo::{CompositeUtxoView, UtxoLookup, UtxoSet};
 pub use utxo_diff::{DiffSeq, UtxoDiff};

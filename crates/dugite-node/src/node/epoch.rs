@@ -182,6 +182,32 @@ impl SnapshotPolicy {
 
 // ─── Snapshot helpers ────────────────────────────────────────────────────────
 
+/// Map the storage-layer UTxO backend onto the snapshot backend tag written
+/// into each snapshot's `.meta.json` sidecar (mirrors Haskell's
+/// `SnapshotBackend` / `UTxOHD{Mem,LSM}Snapshot`).
+pub(crate) fn snapshot_backend_of(
+    backend: dugite_storage::UtxoBackend,
+) -> dugite_ledger::SnapshotBackend {
+    match backend {
+        dugite_storage::UtxoBackend::Lsm => dugite_ledger::SnapshotBackend::DugiteLsm,
+        dugite_storage::UtxoBackend::InMemory => dugite_ledger::SnapshotBackend::DugiteMem,
+    }
+}
+
+/// Derive the snapshot backend tag from a live ledger state's *actual* UTxO
+/// store attachment (LSM store attached ⇒ `dugite-lsm`, else `dugite-mem`).
+/// This reflects the true runtime backend rather than the configured one and
+/// matches the rule `LedgerState::save_snapshot` applies internally.
+pub(crate) fn snapshot_backend_for_ledger(
+    ls: &dugite_ledger::LedgerState,
+) -> dugite_ledger::SnapshotBackend {
+    if ls.utxo.utxo_set.has_store() {
+        dugite_ledger::SnapshotBackend::DugiteLsm
+    } else {
+        dugite_ledger::SnapshotBackend::DugiteMem
+    }
+}
+
 /// Remove old epoch snapshots in `database_path`, keeping only the `keep`
 /// most recent. Free function so it is reachable from a `spawn_blocking`
 /// task without `&Node` (issue #649 — Phase B of the offloaded snapshot
@@ -211,6 +237,14 @@ pub(crate) fn prune_old_snapshots_in_dir(database_path: &std::path::Path, keep: 
                 warn!(epoch, "Failed to remove old snapshot: {e}");
             } else {
                 debug!(epoch, "Pruned old ledger snapshot");
+            }
+            // Remove the backend meta sidecar alongside the `.bin` (a missing
+            // sidecar — e.g. a pre-meta snapshot — is benign: NotFound ignored).
+            let meta_path = dugite_ledger::SnapshotMeta::sidecar_path(&path);
+            match std::fs::remove_file(&meta_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!(epoch, "Failed to remove old snapshot meta sidecar: {e}"),
             }
         }
     }
@@ -248,7 +282,23 @@ pub(crate) fn link_latest_snapshot(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    std::fs::hard_link(epoch_path, latest_path)
+    std::fs::hard_link(epoch_path, latest_path)?;
+
+    // Mirror the `.meta.json` sidecar onto the latest hardlink so the startup
+    // load guard reads the backend tag from `ledger-snapshot.bin.meta.json`.
+    // Best-effort: a missing source sidecar (pre-meta snapshot) is benign —
+    // load falls through to backend inference.
+    let epoch_meta = dugite_ledger::SnapshotMeta::sidecar_path(epoch_path);
+    if epoch_meta.exists() {
+        let latest_meta = dugite_ledger::SnapshotMeta::sidecar_path(latest_path);
+        match std::fs::remove_file(&latest_meta) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        std::fs::hard_link(&epoch_meta, &latest_meta)?;
+    }
+    Ok(())
 }
 
 // ─── Node impl: snapshot persistence ─────────────────────────────────────────
@@ -267,7 +317,7 @@ impl Node {
         // Once the `LedgerStateSnapshot` is constructed it captures a
         // point-in-time consistent view; the lock can be dropped and the
         // CPU + disk-bound write moves to a `spawn_blocking` worker.
-        let (snapshot, epoch, slot, utxo_count) = {
+        let (snapshot, epoch, slot, utxo_count, backend) = {
             let mut ls = self.ledger_state.write().await;
             let epoch = ls.epoch.0;
 
@@ -290,13 +340,17 @@ impl Node {
 
             let slot = ls.tip.point.slot().map(|s| s.0).unwrap_or(0);
             let utxo_count = ls.utxo.utxo_set.len();
+            // Derive the backend tag from the *actual* runtime store attachment
+            // (LSM store attached ⇒ `dugite-lsm`, else `dugite-mem`) — the same
+            // rule `LedgerState::save_snapshot` uses internally.
+            let backend = snapshot_backend_for_ledger(&ls);
             // Cheap snapshot view: Arc::clone for the big shared maps
             // (delegations, pool_params, reward_accounts, governance,
             // epoch_blocks_by_pool); HashMap::clone for the bounded ones.
             // For the LSM backend `utxo_set` is empty in the snapshot —
             // UTxOs are persisted via the LSM SST flush above.
             let snapshot = dugite_ledger::LedgerStateSnapshot::from(&*ls);
-            (snapshot, epoch, slot, utxo_count)
+            (snapshot, epoch, slot, utxo_count, backend)
             // ── LOCK RELEASED HERE ──
         };
 
@@ -312,9 +366,12 @@ impl Node {
         // (multi-second on preview/preprod-scale state) and stall every
         // co-scheduled task.
         let join_result = tokio::task::spawn_blocking(move || -> Result<u64, String> {
-            let bytes =
-                dugite_ledger::LedgerState::write_snapshot_view_to_path(&snapshot, &epoch_path)
-                    .map_err(|e| format!("write snapshot: {e}"))?;
+            let bytes = dugite_ledger::LedgerState::write_snapshot_view_to_path(
+                &snapshot,
+                &epoch_path,
+                backend,
+            )
+            .map_err(|e| format!("write snapshot: {e}"))?;
             if let Err(e) = link_latest_snapshot(&epoch_path, &latest_path) {
                 // Non-fatal: epoch-N snapshot is on disk; startup will
                 // enumerate it via `find_best_snapshot_for_rollback` if
@@ -395,6 +452,7 @@ impl Node {
                 epoch: ls.epoch.0,
                 slot: ls.tip.point.slot().map(|s| s.0).unwrap_or(0),
                 utxo_count: ls.utxo.utxo_set.len(),
+                backend: snapshot_backend_for_ledger(&ls),
             }
             // ── LOCK RELEASED HERE ──
         };
