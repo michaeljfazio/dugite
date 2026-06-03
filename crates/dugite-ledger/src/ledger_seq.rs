@@ -45,7 +45,7 @@
 //! `rollbackN`, `extend`.
 
 use crate::state::{
-    DRepRegistration, EpochSnapshots, LedgerState, PoolRegistration, ProposalState,
+    DRepRegistration, EpochSnapshots, GovSubState, LedgerState, PoolRegistration, ProposalState,
     StakeDistributionState,
 };
 use crate::utxo_diff::UtxoDiff;
@@ -131,6 +131,18 @@ pub struct LedgerDelta {
     pub delegations_snapshot: Option<imbl::HashMap<Hash32, Hash28>>,
     /// See [`Self::reward_accounts_snapshot`].
     pub stake_key_deposits_snapshot: Option<imbl::HashMap<Hash32, u64>>,
+    /// Post-block snapshot of the governance substate (`Arc<GovernanceState>`,
+    /// so the clone is O(1)). Like the cert maps above, `gov` is mutated in
+    /// place by `apply_block` (DRep registration, vote delegations, proposal
+    /// ingestion, votes, ratification/enactment) and is NOT captured by
+    /// `governance_changes` (which is never populated). Without this snapshot,
+    /// `rollback_via_seq` (`self.gov = seq.tip_state().gov`) restored the stale
+    /// anchor governance on every fork — wiping DReps/vote_delegations/proposals
+    /// registered since the anchor. That zeroed DRep voting power, so real
+    /// ParameterChanges never ratified (V3 cost model frozen at the genesis
+    /// model → V3 script_data_hash divergence; `deposits_proposal: 0`). Same
+    /// fork-reconstruction class as the reward-account fix.
+    pub gov_snapshot: Option<GovSubState>,
 }
 
 impl LedgerDelta {
@@ -150,6 +162,7 @@ impl LedgerDelta {
             reward_accounts_snapshot: None,
             delegations_snapshot: None,
             stake_key_deposits_snapshot: None,
+            gov_snapshot: None,
         }
     }
 }
@@ -832,6 +845,9 @@ pub fn apply_delta_to_state(state: &mut LedgerState, delta: &LedgerDelta) {
     if let Some(sk) = &delta.stake_key_deposits_snapshot {
         state.certs.stake_key_deposits = sk.clone();
     }
+    if let Some(g) = &delta.gov_snapshot {
+        state.gov = g.clone();
+    }
 
     // ── 5. Governance changes ─────────────────────────────────────────────────
     for change in &delta.governance_changes {
@@ -1328,6 +1344,44 @@ mod tests {
             Some(Lovelace(0)),
             "after rollback the balance must be the per-block snapshot (0, \
              withdrawn), NOT the stale anchor value (100)"
+        );
+    }
+
+    /// Regression for #22/#481: a rollback must restore the governance substate
+    /// (DReps, vote delegations, proposals) from the per-block snapshot, NOT the
+    /// stale anchor. Before the `gov_snapshot` fix, `rollback_via_seq` reset
+    /// `self.gov` to the anchor governance on every fork — wiping DReps so DRep
+    /// voting power went to 0, real ParameterChanges never ratified, and the V3
+    /// cost model stayed frozen at the genesis model (V3 script_data_hash
+    /// divergence; `deposits_proposal: 0`).
+    #[test]
+    fn rollback_restores_gov_from_snapshot_not_stale_anchor() {
+        // Anchor governance has proposal_count = 0 (a stand-in for "empty gov").
+        let mut seq = LedgerSeq::with_defaults(make_anchor(), 2160);
+
+        // Two blocks mutate governance: proposal_count 5 then 9 (the live apply
+        // path captures gov post-block via `gov_snapshot`).
+        for pc in [5u64, 9] {
+            let mut d = make_delta(pc * 10, pc as u8, 0);
+            let mut gov = make_anchor().gov;
+            Arc::make_mut(&mut gov.governance).proposal_count = pc;
+            d.gov_snapshot = Some(gov);
+            seq.push(d);
+        }
+
+        assert_eq!(
+            seq.tip_state().gov.governance.proposal_count,
+            9,
+            "tip must reflect the latest gov snapshot"
+        );
+
+        // Roll back one block → proposal_count 5 (the snapshot), not 0 (anchor).
+        seq.rollback(1);
+        assert_eq!(
+            seq.tip_state().gov.governance.proposal_count,
+            5,
+            "after rollback the governance must be the per-block snapshot (5), \
+             NOT the stale anchor (0) — the #22/#481 fork-wipe bug"
         );
     }
 

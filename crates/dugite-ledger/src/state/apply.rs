@@ -1385,6 +1385,12 @@ impl LedgerState {
         delta.reward_accounts_snapshot = Some(self.certs.reward_accounts.clone());
         delta.delegations_snapshot = Some(self.certs.delegations.clone());
         delta.stake_key_deposits_snapshot = Some(self.certs.stake_key_deposits.clone());
+        // gov is `Arc<GovernanceState>` → O(1) clone. Captures DReps, vote
+        // delegations, proposals, votes and enacted roots so a fork rollback
+        // restores them instead of the stale anchor governance (which left
+        // DRep power at 0 → ParameterChanges never ratified → V3 cost model
+        // frozen → script_data_hash divergence + deposits_proposal=0).
+        delta.gov_snapshot = Some(self.gov.clone());
 
         // Extract the UTxO diff from the DiffSeq entry that apply_block just pushed.
         if let Some((_slot, _hash, utxo_diff)) = self.utxo.diff_seq.diffs.back() {
