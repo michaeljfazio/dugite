@@ -420,6 +420,47 @@ mod tests {
         );
     }
 
+    /// Confirms the V3 `script_data_hash` divergence observed live at preprod
+    /// ep292 (tx `bc000168…`, slot 124831208) is purely a cost-model COUNT
+    /// issue, not an encoding bug. dugite's `encode_language_views` is correct
+    /// for V3 — feeding the REAL ep292 V3 cost model (350 entries; the PV10
+    /// Plomin hard fork expanded it from the 251-entry Conway genesis model)
+    /// reproduces the on-chain hash exactly. The live divergence
+    /// (dugite computed a85cfe40…) was caused by dugite still using its 251-entry
+    /// genesis V3 cost model at ep292 — i.e. the V3 cost-model expansion was not
+    /// applied. Fixing that (the protocol/cost-model update path) makes the live
+    /// path produce this same hash.
+    #[test]
+    fn test_v3_script_data_hash_ep292_with_real_costmodel() {
+        let expected =
+            Hash32::from_hex("2852bd63c702b3e99d3ef9d5e9e8b1802fc12ccbfccb82c7ce7d1f77bbf7fd7e")
+                .unwrap();
+        let tx_cbor =
+            hex::decode(include_str!("../../test_data/sdh_divergence_ep292_tx.hex").trim())
+                .unwrap();
+        let v3: Vec<i64> = include_str!("../../test_data/sdh_v3_costmodel_ep292.txt")
+            .trim()
+            .split(',')
+            .map(|s| s.trim().parse::<i64>().unwrap())
+            .collect();
+        assert_eq!(v3.len(), 350, "real ep292 V3 cost model has 350 entries");
+        let cost_models = CostModels {
+            plutus_v1: None,
+            plutus_v2: None,
+            plutus_v3: Some(v3),
+            plutus_v4: None,
+        };
+        // V3-only tx (witness keys {0 vkey, 5 redeemers, 7 plutusV3}, no datums).
+        let result = compute_script_data_hash_from_cbor(&tx_cbor, &cost_models, false, false, true);
+        assert_eq!(
+            result,
+            Some(expected),
+            "V3 script_data_hash must match on-chain when the correct 350-entry \
+             cost model is used — proves the encoding is correct and the live \
+             divergence is dugite using the stale 251-entry genesis V3 cost model"
+        );
+    }
+
     // The earlier `test_script_data_hash_survives_reencode` test was removed
     // because it relied on a byte-exact decode-then-re-encode round-trip
     // that the dugite encoder does not guarantee (it intentionally
