@@ -2255,9 +2255,13 @@ fn decode_conway_witness_set(
 fn read_redeemers(r: &mut Reader<'_>) -> Result<Vec<Redeemer>, SerializationError> {
     let ty = r.peek_major()?;
     match ty {
-        Type::Map => {
+        Type::Map | Type::MapIndef => {
             // Conway map form: { [tag, index] => [data, ex_units] }
             // Use read_map to handle both definite- and indefinite-length maps.
+            // Both the definite (0xA_) and indefinite (0xBF) map headers occur
+            // on-chain (e.g. preprod block 4149070, epoch 253, encodes the
+            // redeemers map indefinitely); read_map handles both internally,
+            // so the outer type check must accept MapIndef too.
             let pairs = r.read_map(
                 |r| {
                     let key_arr = r.read_array_header()?;
@@ -2293,7 +2297,7 @@ fn read_redeemers(r: &mut Reader<'_>) -> Result<Vec<Redeemer>, SerializationErro
                 .collect();
             Ok(out)
         }
-        Type::Array => {
+        Type::Array | Type::ArrayIndef => {
             // Pre-Conway array form: [* [tag, index, data, ex_units]]
             r.read_array(|r| {
                 let arr_len = r.read_array_header()?;
@@ -4082,5 +4086,34 @@ mod tests {
             msg.contains("unknown script type"),
             "error must surface the rejection reason, got: {msg}"
         );
+    }
+
+    #[test]
+    fn redeemers_map_decodes_both_definite_and_indefinite() {
+        // One redeemer: key [tag=0(Spend), index=0], value [data=int 0, exunits [0,0]].
+        // value = array(2)[ 0x00 (int 0), array(2)[0,0] ] = 82 00 82 00 00
+        // key   = array(2)[ 0x00, 0x00 ]                  = 82 00 00
+        let body = [0x82, 0x00, 0x00, 0x82, 0x00, 0x82, 0x00, 0x00];
+
+        // Definite map (0xA1 = map(1)).
+        let mut def = vec![0xA1];
+        def.extend_from_slice(&body);
+        let mut rd = Reader::new(&def);
+        let rs = read_redeemers(&mut rd).expect("definite map redeemers must decode");
+        assert_eq!(rs.len(), 1);
+        assert_eq!(rs[0].tag, RedeemerTag::Spend);
+        assert_eq!(rs[0].index, 0);
+
+        // Indefinite map (0xBF … 0xFF) — the on-chain form that wedged the
+        // preprod sync at block 4149070 / epoch 253 before this fix.
+        let mut indef = vec![0xBF];
+        indef.extend_from_slice(&body);
+        indef.push(0xFF);
+        let mut ri = Reader::new(&indef);
+        let rs2 = read_redeemers(&mut ri).expect("indefinite map redeemers must decode");
+        assert_eq!(rs2.len(), 1);
+        assert_eq!(rs2[0].tag, RedeemerTag::Spend);
+        assert_eq!(rs2[0].index, 0);
+        assert_eq!(rs2[0], rs[0]);
     }
 }
