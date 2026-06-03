@@ -111,6 +111,26 @@ pub struct LedgerDelta {
 
     /// Scalar nonce / block production field updates for this block.
     pub block_fields: BlockFieldsDelta,
+
+    /// Post-block snapshot of the directly-mutated `imbl` cert maps
+    /// (`reward_accounts`, `delegations`, `stake_key_deposits`).
+    ///
+    /// These fields are mutated in place by `apply_block` (drain on withdrawal,
+    /// epoch-boundary reward credit, registration/delegation certs) and were
+    /// NOT captured by the `*_changes` delta vecs (which are never populated).
+    /// Without a snapshot, `apply_delta_to_state` left them at the stale anchor
+    /// value, so `rollback_via_seq` corrupted reward balances on a fork
+    /// (preprod ep292 `WithdrawalAmountMismatch` halt). `imbl::HashMap` clones
+    /// are O(1) (structural sharing), so snapshotting per block is cheap.
+    ///
+    /// `None` on deltas not produced by `apply_block_with_delta` (e.g. test
+    /// fixtures) — `apply_delta_to_state` then leaves the fields untouched,
+    /// preserving the previous behaviour for those paths.
+    pub reward_accounts_snapshot: Option<imbl::HashMap<Hash32, Lovelace>>,
+    /// See [`Self::reward_accounts_snapshot`].
+    pub delegations_snapshot: Option<imbl::HashMap<Hash32, Hash28>>,
+    /// See [`Self::reward_accounts_snapshot`].
+    pub stake_key_deposits_snapshot: Option<imbl::HashMap<Hash32, u64>>,
 }
 
 impl LedgerDelta {
@@ -127,6 +147,9 @@ impl LedgerDelta {
             governance_changes: Vec::new(),
             epoch_transition: None,
             block_fields: BlockFieldsDelta::default(),
+            reward_accounts_snapshot: None,
+            delegations_snapshot: None,
+            stake_key_deposits_snapshot: None,
         }
     }
 }
@@ -792,6 +815,24 @@ pub fn apply_delta_to_state(state: &mut LedgerState, delta: &LedgerDelta) {
         apply_reward_change(state, change);
     }
 
+    // ── 4b. Directly-mutated imbl cert maps (snapshot restore) ────────────────
+    //
+    // `reward_accounts`, `delegations` and `stake_key_deposits` are mutated in
+    // place by `apply_block` and are NOT represented by the `*_changes` vecs
+    // above (those are never populated). Restore them from the post-block
+    // snapshot captured in `apply_block_with_delta` so state reconstruction
+    // (anchor advance, `state_at_index`, `rollback_via_seq`) is exact rather
+    // than inheriting the stale anchor value. `imbl::HashMap` clone is O(1).
+    if let Some(ra) = &delta.reward_accounts_snapshot {
+        state.certs.reward_accounts = ra.clone();
+    }
+    if let Some(dl) = &delta.delegations_snapshot {
+        state.certs.delegations = dl.clone();
+    }
+    if let Some(sk) = &delta.stake_key_deposits_snapshot {
+        state.certs.stake_key_deposits = sk.clone();
+    }
+
     // ── 5. Governance changes ─────────────────────────────────────────────────
     for change in &delta.governance_changes {
         apply_governance_change(state, change);
@@ -1245,6 +1286,49 @@ mod tests {
             pool_block_increment: None,
         };
         delta
+    }
+
+    /// Regression for the preprod ep292 `WithdrawalAmountMismatch` halt: a
+    /// rollback must restore `reward_accounts` from the per-block snapshot, NOT
+    /// inherit the stale anchor value. The `reward_changes`/`delegation_changes`
+    /// delta vecs are never populated, so before the `*_snapshot` fix
+    /// `apply_delta_to_state` left reward_accounts at the anchor — and
+    /// `rollback_via_seq` therefore corrupted reward balances on a fork.
+    #[test]
+    fn rollback_restores_reward_accounts_from_snapshot_not_stale_anchor() {
+        let cred = Hash32::from_bytes([0xAB; 32]);
+        // Anchor: account holds 100 (its balance at the last snapshot).
+        let mut anchor = make_anchor();
+        anchor.certs.reward_accounts.insert(cred, Lovelace(100));
+        let mut seq = LedgerSeq::with_defaults(anchor, 2160);
+
+        // Three blocks mutate the balance directly: credit→150, withdraw→0,
+        // credit→50. Each carries the post-block snapshot the live apply path
+        // (`apply_block_with_delta`) captures.
+        for (slot, bal) in [(10u64, 150u64), (20, 0), (30, 50)] {
+            let mut d = make_delta(slot, slot as u8, 0);
+            let mut ra = imbl::HashMap::new();
+            ra.insert(cred, Lovelace(bal));
+            d.reward_accounts_snapshot = Some(ra);
+            seq.push(d);
+        }
+
+        // Tip reflects the latest snapshot (50), not the anchor's 100.
+        assert_eq!(
+            seq.tip_state().certs.reward_accounts.get(&cred).copied(),
+            Some(Lovelace(50)),
+            "tip must reflect the latest per-block reward_accounts snapshot"
+        );
+
+        // Roll back one block → the withdrawal block, balance 0. Before the fix
+        // this returned the stale anchor value (100) — the ep292 corruption.
+        seq.rollback(1);
+        assert_eq!(
+            seq.tip_state().certs.reward_accounts.get(&cred).copied(),
+            Some(Lovelace(0)),
+            "after rollback the balance must be the per-block snapshot (0, \
+             withdrawn), NOT the stale anchor value (100)"
+        );
     }
 
     // ── Construction ──────────────────────────────────────────────────────────

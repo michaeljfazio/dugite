@@ -1376,6 +1376,16 @@ impl LedgerState {
         // Apply the block (all state mutations happen here).
         self.apply_block(block, mode)?;
 
+        // Capture the post-block `imbl` cert maps so state reconstruction
+        // (rollback_via_seq / state_at_index / anchor advance) restores them
+        // exactly instead of inheriting the stale anchor value. These are
+        // mutated in place by `apply_block` and are not represented by the
+        // `*_changes` delta vecs. `imbl::HashMap` clone is O(1). This fixes the
+        // fork-induced reward-account corruption behind the preprod ep292 halt.
+        delta.reward_accounts_snapshot = Some(self.certs.reward_accounts.clone());
+        delta.delegations_snapshot = Some(self.certs.delegations.clone());
+        delta.stake_key_deposits_snapshot = Some(self.certs.stake_key_deposits.clone());
+
         // Extract the UTxO diff from the DiffSeq entry that apply_block just pushed.
         if let Some((_slot, _hash, utxo_diff)) = self.utxo.diff_seq.diffs.back() {
             delta.utxo_diff = utxo_diff.clone();
