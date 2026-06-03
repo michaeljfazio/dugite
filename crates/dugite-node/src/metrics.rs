@@ -360,9 +360,25 @@ fn get_total_memory_bytes_impl() -> u64 {
 /// only ~1.3% (the bug this replaces — dugite-monitor showed 1.2% at block
 /// ~2.3M where the chain is ~18% synced by time/block count).
 pub fn compute_sync_progress(tip_time_ms: i64, genesis_ms: i64, now_ms: i64) -> f64 {
-    let span = (now_ms - genesis_ms).max(1) as f64;
-    let elapsed = (tip_time_ms - genesis_ms).max(0) as f64;
-    ((elapsed / span) * 100.0).clamp(0.0, 100.0)
+    // Byte-faithful mirror of `cardano-cli query tip`'s `percentage`
+    // (cardano-cli `Cardano.CLI.EraBased.Query.Run.percentage`): a time-based
+    // ratio of the tip block's wall-clock time to now — both as RelativeTime
+    // from the system start (`genesis_ms`) — with a **600-second tolerance**
+    // that snaps to exactly 100.0 when the tip is within 600 s of now. This is
+    // why a caught-up node reports 100.00% even though the latest block is
+    // always ~20 s old (preprod/mainnet block time), instead of 99.99%.
+    //
+    // All arithmetic is in integer seconds (floored, matching Haskell's
+    // `floor . nominalDiffTimeToSeconds`), with `+1` on both terms to keep them
+    // strictly positive and avoid 0/0 at genesis.
+    const TOLERANCE_SECS: i64 = 600;
+    let tip_secs = (tip_time_ms - genesis_ms).max(0) / 1000;
+    let now_secs = (now_ms - genesis_ms).max(0) / 1000;
+    let sa = tip_secs + 1;
+    let sb = now_secs + 1;
+    // Fast-forward the tip by the tolerance, but never past now.
+    let ua = (sa + TOLERANCE_SECS).min(sb);
+    ((ua as f64 / sb as f64) * 100.0).clamp(0.0, 100.0)
 }
 
 /// Node metrics for monitoring
@@ -2518,10 +2534,26 @@ mod tests {
         let now = 273_000_000_000i64;
         // Tip time == now → 100% (we are at the chain tip).
         assert_eq!(compute_sync_progress(now, genesis, now), 100.0);
-        // Tip == genesis (no progress yet) → 0%.
-        assert_eq!(compute_sync_progress(genesis, genesis, now), 0.0);
+        // Tip == genesis (no progress yet) → ~0% (the +1/+600 guards leave a
+        // negligible residue that renders as "0.00"; cardano-cli's `percentage`
+        // behaves identically — it is not exactly 0).
+        assert!(compute_sync_progress(genesis, genesis, now) < 0.01);
         // Tip ahead of now (clock skew / just forged) is clamped to 100%.
         assert_eq!(compute_sync_progress(now + 5_000, genesis, now), 100.0);
+    }
+
+    #[test]
+    fn test_compute_sync_progress_600s_tolerance_snaps_to_100() {
+        // Mirrors cardano-cli: when `now - tip <= 600 s` the formula reports
+        // exactly 100.00, so an at-tip node (latest block ~20 s old) reads 100%.
+        let genesis = 0i64;
+        let now = 100_000_000_000i64; // 100M s, expressed in ms
+                                      // 300 s behind → inside the 600 s tolerance → 100%.
+        assert_eq!(compute_sync_progress(now - 300_000, genesis, now), 100.0);
+        // Exactly 600 s behind → boundary → still 100%.
+        assert_eq!(compute_sync_progress(now - 600_000, genesis, now), 100.0);
+        // 900 s behind → outside the tolerance → strictly below 100%.
+        assert!(compute_sync_progress(now - 900_000, genesis, now) < 100.0);
     }
 
     #[test]
