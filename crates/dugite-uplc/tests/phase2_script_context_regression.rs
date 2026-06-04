@@ -1088,3 +1088,53 @@ fn script_context_v1_spend_purpose_has_wrapped_txid() {
         "TxId inner field must be B32"
     );
 }
+
+// Bug (#22) — V1/V2 `Rewarding StakingCredential` was missing the `StakingHash`
+// wrapper. `Rewarding (Credential)` was emitted as `Constr 2 [Credential]`
+// instead of `Constr 2 [StakingHash Credential]` = `Constr 2 [Constr 0 [Cred]]`.
+// A staking-script deserializer then read the inner `ScriptCredential`'s
+// `Constr 1` tag as `StakingPtr` (StakingCredential: StakingHash=0, StakingPtr=1)
+// and `unIData`'d the 28-byte hash → "unIData on non-I". V3 (`Rewarding
+// Credential`, no StakingCredential) keeps the bare form.
+#[test]
+fn v1v2_rewarding_purpose_wraps_credential_in_staking_hash() {
+    let p = ScriptPurpose::Rewarding(Credential::Script([0xab; 28]));
+    let d = p.to_data();
+    // Constr 2 [ Constr 0 [ Constr 1 [B28] ] ]
+    let Data::Constr(2, outer) = &d else {
+        panic!("Rewarding must be Constr 2, got {d:?}");
+    };
+    assert_eq!(
+        outer.len(),
+        1,
+        "Rewarding has one field (StakingCredential)"
+    );
+    let Data::Constr(0, sh) = &outer[0] else {
+        panic!(
+            "V1/V2 Rewarding field must be StakingHash = Constr 0, got {:?}",
+            outer[0]
+        );
+    };
+    assert_eq!(sh.len(), 1, "StakingHash wraps one Credential");
+    let Data::Constr(1, cred) = &sh[0] else {
+        panic!("inner must be ScriptCredential = Constr 1, got {:?}", sh[0]);
+    };
+    assert!(matches!(&cred[0], Data::B(b) if b.len() == 28));
+}
+
+#[test]
+fn v3_rewarding_purpose_uses_bare_credential() {
+    let p = ScriptPurpose::Rewarding(Credential::Script([0xab; 28]));
+    let d = p.to_data_v3();
+    // V3: Constr 2 [ Constr 1 [B28] ]  (Credential directly, NO StakingHash)
+    let Data::Constr(2, outer) = &d else {
+        panic!("Rewarding must be Constr 2, got {d:?}");
+    };
+    let Data::Constr(1, cred) = &outer[0] else {
+        panic!(
+            "V3 Rewarding field must be the bare Credential = Constr 1, got {:?}",
+            outer[0]
+        );
+    };
+    assert!(matches!(&cred[0], Data::B(b) if b.len() == 28));
+}

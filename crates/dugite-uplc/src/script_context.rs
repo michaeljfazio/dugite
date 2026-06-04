@@ -619,7 +619,14 @@ impl ScriptPurpose {
         match self {
             ScriptPurpose::Minting(h) => data_constr(0, vec![data_bs28(h)]),
             ScriptPurpose::Spending(r) => data_constr(1, vec![r.to_data()]),
-            ScriptPurpose::Rewarding(c) => data_constr(2, vec![c.to_data()]),
+            // V1/V2 `Rewarding StakingCredential`: the credential must be wrapped
+            // in `StakingHash` (Constr 0) — `Rewarding (StakingHash cred)` =
+            // `Constr 2 [Constr 0 [Constr {0|1} [B28]]]`. Omitting the StakingHash
+            // wrapper makes a deserializer read the inner `Credential`'s Constr-1
+            // (ScriptCredential) tag as `StakingPtr` and `unIData` the 28-byte hash
+            // → "unIData on non-I". (#22; PlutusLedgerApi.V{1,2}.Credential:
+            // StakingHash=0/StakingPtr=1, PubKeyCredential=0/ScriptCredential=1.)
+            ScriptPurpose::Rewarding(c) => data_constr(2, vec![data_constr(0, vec![c.to_data()])]),
             ScriptPurpose::Certifying(i, c) => {
                 data_constr(3, vec![data_i((*i).into()), c.0.clone()])
             }
@@ -658,6 +665,10 @@ impl ScriptPurpose {
             // Spending: bare-txid TxOutRef (V3 form).
             // Constr 1 [Constr 0 [B txid32, I idx]]
             ScriptPurpose::Spending(r) => data_constr(1, vec![r.to_data_v3()]),
+            // V3 `Rewarding Credential` takes the credential DIRECTLY (no
+            // StakingHash wrapper — V3 dropped StakingCredential), so override the
+            // V1/V2 `to_data` arm which now adds the wrapper. Constr 2 [Credential].
+            ScriptPurpose::Rewarding(c) => data_constr(2, vec![c.to_data()]),
             // All other variants: same encoding in V1/V2/V3.
             other => other.to_data(),
         }
