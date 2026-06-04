@@ -603,15 +603,21 @@ impl GovActionId {
 }
 
 impl ScriptPurpose {
+    /// Encode this `ScriptPurpose` as Plutus V1/V2 `Data`.
+    ///
+    /// Used for:
+    /// - `scriptContextPurpose` in V1/V2 `ScriptContext`
+    /// - `txInfoRedeemers` map keys in V2 `TxInfo`
+    ///
+    /// `Spending` uses the **wrapped** `TxId` form:
+    /// `Constr 1 [Constr 0 [Constr 0 [B txid32], I idx]]`.
+    ///
+    /// Haskell: `makeIsDataSchemaIndexed ''ScriptPurpose`
+    /// in `PlutusLedgerApi.V{1,2}.Contexts`:
+    /// `[('Minting,0), ('Spending,1), ('Rewarding,2), ('Certifying,3)]`
     pub fn to_data(&self) -> Data {
         match self {
             ScriptPurpose::Minting(h) => data_constr(0, vec![data_bs28(h)]),
-            // NOTE: `ScriptPurpose` is shared by the V1/V2 `scriptContextPurpose`
-            // (wrapped TxId) and the V3 `txInfoRedeemers` map keys (bare TxId).
-            // The default arm keeps the V1/V2 wrapped form, which is the only live
-            // consumer today. When the V3 redeemers map is populated
-            // (TODO task-13f), that path must encode `Spending` via the bare-txid
-            // `TxOutRef::to_data_v3` instead.
             ScriptPurpose::Spending(r) => data_constr(1, vec![r.to_data()]),
             ScriptPurpose::Rewarding(c) => data_constr(2, vec![c.to_data()]),
             ScriptPurpose::Certifying(i, c) => {
@@ -624,6 +630,36 @@ impl ScriptPurpose {
             // Dijkstra `DijkstraGuarding(ScriptHash)` — Sum 6.
             // Issue #475 Phase 3.5.
             ScriptPurpose::Guarding(h) => data_constr(6, vec![data_bs28(h)]),
+        }
+    }
+
+    /// Encode this `ScriptPurpose` as Plutus **V3** `Data`.
+    ///
+    /// Used for `txInfoRedeemers` map keys in V3 `TxInfo`.
+    ///
+    /// The **only** difference from [`Self::to_data`] is that `Spending`
+    /// uses the **bare** txid form introduced in V3:
+    /// `Constr 1 [Constr 0 [B txid32, I idx]]`
+    /// (NOT the double-wrapped V1/V2 `Constr 1 [Constr 0 [Constr 0 [B32], I]]`).
+    ///
+    /// All other variants are identical to the V1/V2 encoding — their
+    /// Constr tags and field shapes are unchanged across versions.
+    ///
+    /// Haskell: `PlutusLedgerApi.V3.Contexts`:
+    /// ```haskell
+    /// makeIsDataSchemaIndexed ''ScriptPurpose
+    ///   [('Minting,0), ('Spending,1), ('Rewarding,2), ('Certifying,3),
+    ///    ('Voting,4), ('Proposing,5)]
+    /// ```
+    /// `Spending V3.TxOutRef` where `TxId` is `newtype … deriving newtype ToData`
+    /// from `BuiltinByteString` → bare B(32) in the `TxOutRef` payload.
+    pub fn to_data_v3(&self) -> Data {
+        match self {
+            // Spending: bare-txid TxOutRef (V3 form).
+            // Constr 1 [Constr 0 [B txid32, I idx]]
+            ScriptPurpose::Spending(r) => data_constr(1, vec![r.to_data_v3()]),
+            // All other variants: same encoding in V1/V2/V3.
+            other => other.to_data(),
         }
     }
 }
@@ -710,12 +746,17 @@ impl TxInfoV3 {
                 data_list(self.signatories.iter().map(data_bs28).collect()),
                 // 9 — redeemers :: Map ScriptPurpose Redeemer
                 // TODO(task-13f): redeemers map not yet populated — wired as
-                // empty map. Field POSITION is correct (index 9). Full
-                // per-redeemer resolution ships as task #13 follow-up.
+                // 9 — redeemers :: Map ScriptPurpose Redeemer
+                // V3 map keys use `ScriptPurpose::to_data_v3()` so that the
+                // `Spending` variant encodes with the bare-txid `TxOutRef`
+                // form introduced in V3 (V1/V2 use `Constr 0 [B bytes]`
+                // inside TxOutRef; V3 uses bare `B bytes`).
+                // Reference: PlutusLedgerApi.V3.Contexts — `TxId` changed to
+                // `newtype TxId … deriving newtype ToData` from `BuiltinByteString`.
                 data_map(
                     self.redeemers
                         .iter()
-                        .map(|(p, d)| (p.to_data(), d.clone()))
+                        .map(|(p, d)| (p.to_data_v3(), d.clone()))
                         .collect(),
                 ),
                 // 10 — datums :: Map DatumHash Datum

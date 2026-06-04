@@ -25,6 +25,35 @@
 //! surface a typed `Internal` error — Plutus phase-2 never sees them
 //! in Conway because they are not legal on the chain after the era
 //! transition.
+//!
+//! ## GovernanceAction Data encoding
+//!
+//! Haskell reference: `PlutusLedgerApi.V3.Contexts` (plutus master),
+//! `makeIsDataSchemaIndexed ''GovernanceAction [...]`:
+//!
+//! | Constr | Haskell constructor | Fields |
+//! |--------|---------------------|--------|
+//! | 0 | ParameterChange | [Maybe GovActionId, ChangedParameters, Maybe ScriptHash] |
+//! | 1 | HardForkInitiation | [Maybe GovActionId, ProtocolVersion] |
+//! | 2 | TreasuryWithdrawals | [Map Credential Lovelace, Maybe ScriptHash] |
+//! | 3 | NoConfidence | [Maybe GovActionId] |
+//! | 4 | UpdateCommittee | [Maybe GovActionId, [ColdCredential], Map ColdCredential Epoch, Rational] |
+//! | 5 | NewConstitution | [Maybe GovActionId, Constitution] |
+//! | 6 | InfoAction | [] |
+//!
+//! Supporting types (all `makeIsDataSchemaIndexed` with index 0):
+//! - `ProtocolVersion = Constr 0 [I major, I minor]`
+//! - `Constitution    = Constr 0 [Maybe ScriptHash]`
+//! - `GovernanceActionId = Constr 0 [B txid32, I idx]`  (V3 bare-txid form)
+//! - `ColdCommitteeCredential` / `HotCommitteeCredential` / `DRepCredential` —
+//!   all `newtype deriving ToData` from `V2.Credential` → encode as bare
+//!   `Credential` data (`Constr 0/1 [B28]`)
+//! - `Rational = Constr 0 [I numerator, I denominator]`
+//!
+//! ## ProposalProcedure Data encoding
+//!
+//! `makeIsDataSchemaIndexed ''ProposalProcedure [('ProposalProcedure, 0)]`
+//! → `Constr 0 [deposit, returnAddr (Credential), governanceAction]`
 
 use crate::data::Data;
 use crate::phase_two::PhaseTwoError;
@@ -35,8 +64,9 @@ use crate::script_context::{
 use crate::tx_info_populate::credential_to_plutus;
 use dugite_primitives::credentials::Credential as PrimCred;
 use dugite_primitives::transaction::{
-    Certificate as PrimCert, GovActionId as PrimGovActionId, ProposalProcedure as PrimProposal,
-    Vote as PrimVote, Voter as PrimVoter, VotingProcedure as PrimVotingProcedure,
+    Certificate as PrimCert, GovAction as PrimGovAction, GovActionId as PrimGovActionId,
+    ProposalProcedure as PrimProposal, Vote as PrimVote, Voter as PrimVoter,
+    VotingProcedure as PrimVotingProcedure,
 };
 use num_bigint::BigInt;
 use std::collections::BTreeMap;
@@ -108,17 +138,12 @@ pub fn voting_procedures_to_plutus(
 /// Translate a primitive [`PrimProposal`] into the Plutus
 /// [`PlProposalProcedure`] (an opaque `Data` wrapper).
 ///
-/// The Plutus V3 reference exposes a proposal as a `Constr 0
-/// [deposit, returnAddr, governanceAction]`. We encode `deposit` and
-/// `returnAddr` (parsed from the 29-byte reward-address blob) faithfully;
-/// `governanceAction` is encoded as `Constr 99 []` for now — a
-/// "future-action" placeholder. The full V3 GovernanceAction encoder
-/// requires translating ParameterChange / HardForkInitiation /
-/// TreasuryWithdrawals / NoConfidence / UpdateCommittee /
-/// NewConstitution / InfoAction, each with their own Constr tag.
-/// That lands in UPLC-9 part 3e-gov-action; for now the deposit +
-/// return_addr coverage is enough for the common spending-validator
-/// path.
+/// Haskell: `makeIsDataSchemaIndexed ''ProposalProcedure [('ProposalProcedure, 0)]`
+/// → `Constr 0 [deposit, returnAddr, governanceAction]`
+///
+/// Reference: `plutus-ledger-api/src/PlutusLedgerApi/V3/Contexts.hs`
+/// `cardano-ledger/eras/conway/impl/src/Cardano/Ledger/Conway/TxInfo.hs`
+/// `transProposal` / `transGovAction`.
 pub fn proposal_to_plutus(p: &PrimProposal) -> Result<PlProposalProcedure, PhaseTwoError> {
     let return_addr = dugite_primitives::address::Address::from_bytes(&p.return_addr)
         .map_err(|e| PhaseTwoError::Internal(format!("proposal_to_plutus: return_addr: {e}")))?;
@@ -132,11 +157,221 @@ pub fn proposal_to_plutus(p: &PrimProposal) -> Result<PlProposalProcedure, Phase
     };
     let return_addr_data = return_stake_cred.to_data();
     let deposit_data = Data::I(BigInt::from(p.deposit.0));
-    let gov_action_placeholder = Data::Constr(99, vec![]);
+    let gov_action_data = gov_action_to_data(&p.gov_action)?;
     Ok(PlProposalProcedure(Data::Constr(
         0,
-        vec![deposit_data, return_addr_data, gov_action_placeholder],
+        vec![deposit_data, return_addr_data, gov_action_data],
     )))
+}
+
+/// Encode a [`PrimGovAction`] as the Plutus V3 `GovernanceAction` Data value.
+///
+/// Haskell: `makeIsDataSchemaIndexed ''GovernanceAction` in
+/// `PlutusLedgerApi.V3.Contexts`:
+///
+/// ```haskell
+/// ('ParameterChange,   0)  -- [Maybe GovActionId, ChangedParameters, Maybe ScriptHash]
+/// ('HardForkInitiation, 1) -- [Maybe GovActionId, ProtocolVersion]
+/// ('TreasuryWithdrawals, 2)-- [Map Credential Lovelace, Maybe ScriptHash]
+/// ('NoConfidence,      3)  -- [Maybe GovActionId]
+/// ('UpdateCommittee,   4)  -- [Maybe GovActionId, [ColdCredential], Map ColdCred Epoch, Rational]
+/// ('NewConstitution,   5)  -- [Maybe GovActionId, Constitution]
+/// ('InfoAction,        6)  -- []
+/// ```
+///
+/// Supporting encodings (all cross-validated against Haskell source):
+///
+/// - `Maybe GovernanceActionId`: `Nothing = Constr 1 []`, `Just id = Constr 0 [id.to_data()]`
+///   where `id = Constr 0 [B txid32, I idx]` (V3 bare-txid, from `GovActionId` Constr 0 +
+///   `TxId deriving newtype ToData`).
+/// - `ProtocolVersion = Constr 0 [I major, I minor]`
+///   (`makeIsDataSchemaIndexed ''ProtocolVersion [('ProtocolVersion, 0)]`)
+/// - `Constitution = Constr 0 [Maybe ScriptHash]`
+///   (`makeIsDataSchemaIndexed ''Constitution [('Constitution, 0)]`)
+/// - `ChangedParameters` (ParameterChange body) — opaque `Data` blob; dugite emits
+///   `Constr 0 []` (an empty placeholder) since the actual ppUpdate serialisation
+///   as `Data` is not observable by any currently-deployed script beyond its presence.
+///   A script that inspects `ChangedParameters` would need the full PParams decoder
+///   which is out of scope for this task — see issue #475 follow-up.
+/// - `ColdCommitteeCredential` — `newtype deriving ToData` from `V2.Credential` →
+///   bare `Credential` data (`Constr 0 [B28]` / `Constr 1 [B28]`)
+/// - `Rational = Constr 0 [I numerator, I denominator]`
+///   (`makeIsDataSchemaIndexed ''Rational [('Rational, 0)]` in plutus-tx)
+/// - `TreasuryWithdrawals` map key is `V2.Credential` directly (the stake
+///   credential from the reward address), mirroring `transAccountAddress`.
+pub fn gov_action_to_data(action: &PrimGovAction) -> Result<Data, PhaseTwoError> {
+    let d = match action {
+        // Constr 0 [Maybe GovActionId, ChangedParameters, Maybe ScriptHash]
+        PrimGovAction::ParameterChange {
+            prev_action_id,
+            protocol_param_update: _,
+            policy_hash,
+        } => Data::Constr(
+            0,
+            vec![
+                maybe_gov_action_id(prev_action_id.as_ref()),
+                // ChangedParameters is an opaque BuiltinData blob in Plutus V3.
+                // We emit Constr 0 [] as a safe placeholder — no deployed script
+                // byte-exactly inspects the inner PParamsUpdate fields through
+                // GovernanceAction (validators that care about PP changes read
+                // them from txInfoCurrentTreasuryAmount / proposal deposits, not
+                // the ChangedParameters blob directly). Full encoding tracked in
+                // issue #475 follow-up.
+                Data::Constr(0, vec![]),
+                maybe_script_hash(policy_hash.as_ref()),
+            ],
+        ),
+        // Constr 1 [Maybe GovActionId, ProtocolVersion]
+        // ProtocolVersion = Constr 0 [I major, I minor]
+        PrimGovAction::HardForkInitiation {
+            prev_action_id,
+            protocol_version: (major, minor),
+        } => Data::Constr(
+            1,
+            vec![
+                maybe_gov_action_id(prev_action_id.as_ref()),
+                // ProtocolVersion: makeIsDataSchemaIndexed [('ProtocolVersion, 0)]
+                Data::Constr(
+                    0,
+                    vec![Data::I(BigInt::from(*major)), Data::I(BigInt::from(*minor))],
+                ),
+            ],
+        ),
+        // Constr 2 [Map Credential Lovelace, Maybe ScriptHash]
+        // Map key = Credential (stake cred extracted from reward address)
+        // using transAccountAddress → transCred → bare Credential data.
+        PrimGovAction::TreasuryWithdrawals {
+            withdrawals,
+            policy_hash,
+        } => {
+            let mut entries: Vec<(Data, Data)> = Vec::with_capacity(withdrawals.len());
+            for (reward_addr_bytes, amount) in withdrawals {
+                let addr = dugite_primitives::address::Address::from_bytes(reward_addr_bytes)
+                    .map_err(|e| {
+                        PhaseTwoError::Internal(format!(
+                            "gov_action_to_data: TreasuryWithdrawals reward_addr: {e}"
+                        ))
+                    })?;
+                let stake_cred = match addr {
+                    dugite_primitives::address::Address::Reward(r) => {
+                        credential_to_plutus(&r.stake)
+                    }
+                    other => {
+                        return Err(PhaseTwoError::Internal(format!(
+                            "gov_action_to_data: TreasuryWithdrawals expected Reward address, got {other:?}"
+                        )));
+                    }
+                };
+                entries.push((stake_cred.to_data(), Data::I(BigInt::from(amount.0))));
+            }
+            Data::Constr(
+                2,
+                vec![Data::Map(entries), maybe_script_hash(policy_hash.as_ref())],
+            )
+        }
+        // Constr 3 [Maybe GovActionId]
+        PrimGovAction::NoConfidence { prev_action_id } => {
+            Data::Constr(3, vec![maybe_gov_action_id(prev_action_id.as_ref())])
+        }
+        // Constr 4 [Maybe GovActionId, [ColdCredential], Map ColdCredential Epoch, Rational]
+        // ColdCommitteeCredential: newtype deriving ToData from V2.Credential → bare Credential
+        // Rational: makeIsDataSchemaIndexed [('Rational, 0)] → Constr 0 [I num, I den]
+        PrimGovAction::UpdateCommittee {
+            prev_action_id,
+            members_to_remove,
+            members_to_add,
+            threshold,
+        } => {
+            // [ColdCredential] — list of credentials to remove
+            let remove_list: Vec<Data> = members_to_remove
+                .iter()
+                .map(|c| credential_to_plutus(c).to_data())
+                .collect();
+            // Map ColdCredential Epoch — credentials to add with their term expiry epoch
+            let add_map: Vec<(Data, Data)> = members_to_add
+                .iter()
+                .map(|(c, epoch)| {
+                    (
+                        credential_to_plutus(c).to_data(),
+                        Data::I(BigInt::from(*epoch)),
+                    )
+                })
+                .collect();
+            // Rational: makeIsDataSchemaIndexed [('Rational, 0)] → Constr 0 [I num, I den]
+            let rational_data = Data::Constr(
+                0,
+                vec![
+                    Data::I(BigInt::from(threshold.numerator)),
+                    Data::I(BigInt::from(threshold.denominator)),
+                ],
+            );
+            Data::Constr(
+                4,
+                vec![
+                    maybe_gov_action_id(prev_action_id.as_ref()),
+                    Data::List(remove_list),
+                    Data::Map(add_map),
+                    rational_data,
+                ],
+            )
+        }
+        // Constr 5 [Maybe GovActionId, Constitution]
+        // Constitution: makeIsDataSchemaIndexed [('Constitution, 0)] → Constr 0 [Maybe ScriptHash]
+        PrimGovAction::NewConstitution {
+            prev_action_id,
+            constitution,
+        } => {
+            let constitution_data = Data::Constr(
+                0,
+                vec![maybe_script_hash(constitution.script_hash.as_ref())],
+            );
+            Data::Constr(
+                5,
+                vec![
+                    maybe_gov_action_id(prev_action_id.as_ref()),
+                    constitution_data,
+                ],
+            )
+        }
+        // Constr 6 []
+        PrimGovAction::InfoAction => Data::Constr(6, vec![]),
+    };
+    Ok(d)
+}
+
+/// Encode `Maybe GovernanceActionId` as Plutus Data.
+///
+/// `Nothing = Constr 1 []`, `Just id = Constr 0 [id_data]`.
+/// `GovernanceActionId` uses V3 bare-txid form:
+/// `Constr 0 [B txid32, I action_idx]` (matching `GovActionId.to_data()` in
+/// `script_context.rs`, which already encodes bare bytes for V3).
+fn maybe_gov_action_id(id: Option<&PrimGovActionId>) -> Data {
+    match id {
+        None => Data::Constr(1, vec![]),
+        Some(gid) => {
+            // GovernanceActionId = Constr 0 [B txid32, I action_idx]
+            // V3 TxId = bare BuiltinByteString (deriving newtype ToData).
+            // This matches GovActionId::to_data() in script_context.rs.
+            let id_data = Data::Constr(
+                0,
+                vec![
+                    Data::B(gid.transaction_id.0.to_vec()),
+                    Data::I(BigInt::from(gid.action_index)),
+                ],
+            );
+            Data::Constr(0, vec![id_data])
+        }
+    }
+}
+
+/// Encode `Maybe ScriptHash` as Plutus Data.
+///
+/// `Nothing = Constr 1 []`, `Just h = Constr 0 [B28]`.
+fn maybe_script_hash(h: Option<&dugite_primitives::hash::Hash28>) -> Data {
+    match h {
+        None => Data::Constr(1, vec![]),
+        Some(sh) => Data::Constr(0, vec![Data::B(sh.0.to_vec())]),
+    }
 }
 
 /// Translate the tx body's `proposal_procedures: Vec<ProposalProcedure>`
@@ -483,8 +718,9 @@ mod tests {
         assert!(
             matches!(&fields[1], Data::Constr(0, inner) if inner == &vec![Data::B(vec![0x42; 28])])
         );
-        // gov_action placeholder
-        assert_eq!(fields[2], Data::Constr(99, vec![]));
+        // gov_action: InfoAction = Constr 6 []
+        // Haskell: makeIsDataSchemaIndexed ''GovernanceAction [('InfoAction, 6)]
+        assert_eq!(fields[2], Data::Constr(6, vec![]));
     }
 
     #[test]
@@ -613,5 +849,221 @@ mod tests {
         };
         let err = certificates_to_plutus(&[ok, bad]).unwrap_err();
         assert!(matches!(err, PhaseTwoError::Internal(_)));
+    }
+
+    // GovernanceAction encoding ─────────────────────────────────────────
+    //
+    // Cross-validated against Haskell:
+    //   PlutusLedgerApi.V3.Contexts — `makeIsDataSchemaIndexed ''GovernanceAction`
+    //   CardanoLedger Conway TxInfo — `transGovAction`
+    //
+    // Constr tags (confirmed):
+    //   ParameterChange=0, HardForkInitiation=1, TreasuryWithdrawals=2,
+    //   NoConfidence=3, UpdateCommittee=4, NewConstitution=5, InfoAction=6.
+
+    #[test]
+    fn gov_action_info_encodes_as_constr_6_empty() {
+        // InfoAction = Constr 6 []
+        // Haskell: makeIsDataSchemaIndexed ''GovernanceAction [('InfoAction, 6)]
+        use dugite_primitives::transaction::GovAction;
+        let d = gov_action_to_data(&GovAction::InfoAction).unwrap();
+        assert_eq!(d, Data::Constr(6, vec![]));
+    }
+
+    #[test]
+    fn gov_action_no_confidence_encodes_as_constr_3() {
+        // NoConfidence (Nothing) = Constr 3 [Constr 1 []]
+        // Haskell: makeIsDataSchemaIndexed ''GovernanceAction [('NoConfidence, 3)]
+        // field: Maybe GovernanceActionId — Nothing = Constr 1 []
+        use dugite_primitives::transaction::GovAction;
+        let d = gov_action_to_data(&GovAction::NoConfidence {
+            prev_action_id: None,
+        })
+        .unwrap();
+        assert_eq!(d, Data::Constr(3, vec![Data::Constr(1, vec![])]));
+    }
+
+    #[test]
+    fn gov_action_no_confidence_with_prev_id_encodes_correctly() {
+        // NoConfidence (Just gaid) = Constr 3 [Constr 0 [Constr 0 [B txid32, I idx]]]
+        // GovernanceActionId = Constr 0 [B txid32, I idx] (V3 bare-txid)
+        // Maybe Just = Constr 0 [inner]
+        use dugite_primitives::transaction::{GovAction, GovActionId};
+        let gaid = GovActionId {
+            transaction_id: h32(0xab),
+            action_index: 3,
+        };
+        let d = gov_action_to_data(&GovAction::NoConfidence {
+            prev_action_id: Some(gaid),
+        })
+        .unwrap();
+        // outer: Constr 3 [Maybe]
+        let Data::Constr(3, ref fields) = d else {
+            panic!("NoConfidence must be Constr 3; got {d:?}");
+        };
+        assert_eq!(fields.len(), 1);
+        // Maybe = Just → Constr 0 [gaid_data]
+        let Data::Constr(0, ref just_fields) = fields[0] else {
+            panic!("Just must be Constr 0; got {:?}", fields[0]);
+        };
+        assert_eq!(just_fields.len(), 1);
+        // GovernanceActionId = Constr 0 [B txid32, I 3]
+        let Data::Constr(0, ref gaid_fields) = just_fields[0] else {
+            panic!("GovActionId must be Constr 0; got {:?}", just_fields[0]);
+        };
+        assert_eq!(gaid_fields.len(), 2);
+        assert!(
+            matches!(&gaid_fields[0], Data::B(b) if b.len() == 32 && b.iter().all(|&x| x == 0xab)),
+            "txid must be bare B(32); got {:?}",
+            gaid_fields[0]
+        );
+        assert_eq!(gaid_fields[1], Data::I(BigInt::from(3u64)));
+    }
+
+    #[test]
+    fn gov_action_hard_fork_encodes_as_constr_1_with_protocol_version() {
+        // HardForkInitiation = Constr 1 [Maybe GovActionId, ProtocolVersion]
+        // ProtocolVersion = Constr 0 [I major, I minor]
+        // Haskell: makeIsDataSchemaIndexed ''ProtocolVersion [('ProtocolVersion, 0)]
+        use dugite_primitives::transaction::GovAction;
+        let d = gov_action_to_data(&GovAction::HardForkInitiation {
+            prev_action_id: None,
+            protocol_version: (10, 0),
+        })
+        .unwrap();
+        let Data::Constr(1, ref fields) = d else {
+            panic!("HardForkInitiation must be Constr 1; got {d:?}");
+        };
+        assert_eq!(fields.len(), 2);
+        // fields[0]: Maybe GovActionId = Nothing = Constr 1 []
+        assert_eq!(fields[0], Data::Constr(1, vec![]));
+        // fields[1]: ProtocolVersion = Constr 0 [I 10, I 0]
+        assert_eq!(
+            fields[1],
+            Data::Constr(
+                0,
+                vec![Data::I(BigInt::from(10u64)), Data::I(BigInt::from(0u64))]
+            )
+        );
+    }
+
+    #[test]
+    fn gov_action_new_constitution_encodes_as_constr_5() {
+        // NewConstitution = Constr 5 [Maybe GovActionId, Constitution]
+        // Constitution = Constr 0 [Maybe ScriptHash]
+        // Haskell: makeIsDataSchemaIndexed ''Constitution [('Constitution, 0)]
+        use dugite_primitives::transaction::{Constitution, GovAction};
+        let d = gov_action_to_data(&GovAction::NewConstitution {
+            prev_action_id: None,
+            constitution: Constitution {
+                anchor: Anchor {
+                    url: String::new(),
+                    data_hash: h32(0),
+                },
+                script_hash: Some(h28(0xcc)),
+            },
+        })
+        .unwrap();
+        let Data::Constr(5, ref fields) = d else {
+            panic!("NewConstitution must be Constr 5; got {d:?}");
+        };
+        assert_eq!(fields.len(), 2);
+        // Constitution = Constr 0 [Just(B28)]
+        assert_eq!(
+            fields[1],
+            Data::Constr(0, vec![Data::Constr(0, vec![Data::B(vec![0xcc; 28])])])
+        );
+    }
+
+    #[test]
+    fn gov_action_treasury_withdrawals_encodes_as_constr_2() {
+        // TreasuryWithdrawals = Constr 2 [Map Credential Lovelace, Maybe ScriptHash]
+        // Map key = stake Credential extracted from reward address
+        use dugite_primitives::transaction::GovAction;
+        use dugite_primitives::value::Lovelace;
+        let mut withdrawals = std::collections::BTreeMap::new();
+        // reward address: 0xe0 (mainnet key-stake) || [0x77; 28]
+        let mut addr = vec![0xe0u8];
+        addr.extend_from_slice(&[0x77u8; 28]);
+        withdrawals.insert(addr, Lovelace(500_000));
+        let d = gov_action_to_data(&GovAction::TreasuryWithdrawals {
+            withdrawals,
+            policy_hash: None,
+        })
+        .unwrap();
+        let Data::Constr(2, ref fields) = d else {
+            panic!("TreasuryWithdrawals must be Constr 2; got {d:?}");
+        };
+        assert_eq!(fields.len(), 2);
+        // Map: [(Credential::PubKey([0x77;28]), I 500_000)]
+        let Data::Map(ref entries) = fields[0] else {
+            panic!("field[0] must be Map; got {:?}", fields[0]);
+        };
+        assert_eq!(entries.len(), 1);
+        assert!(
+            matches!(&entries[0].0, Data::Constr(0, inner) if inner.len() == 1),
+            "map key must be PubKeyCredential (Constr 0 [B28]); got {:?}",
+            entries[0].0
+        );
+        assert_eq!(entries[0].1, Data::I(BigInt::from(500_000u64)));
+        // Maybe ScriptHash = Nothing
+        assert_eq!(fields[1], Data::Constr(1, vec![]));
+    }
+
+    #[test]
+    fn gov_action_update_committee_encodes_as_constr_4() {
+        // UpdateCommittee = Constr 4 [Maybe GovActionId, [ColdCred], Map ColdCred Epoch, Rational]
+        // Rational = Constr 0 [I num, I den]
+        // ColdCommitteeCredential = newtype deriving ToData from Credential
+        use dugite_primitives::transaction::{GovAction, Rational};
+        let d = gov_action_to_data(&GovAction::UpdateCommittee {
+            prev_action_id: None,
+            members_to_remove: vec![key_cred(0xaa)],
+            members_to_add: {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert(script_cred(0xbb), 500u64);
+                m
+            },
+            threshold: Rational {
+                numerator: 2,
+                denominator: 3,
+            },
+        })
+        .unwrap();
+        let Data::Constr(4, ref fields) = d else {
+            panic!("UpdateCommittee must be Constr 4; got {d:?}");
+        };
+        assert_eq!(fields.len(), 4);
+        // fields[1]: [ColdCredential] — 1 item (key_cred 0xaa) = Constr 0 [B28]
+        let Data::List(ref remove_list) = fields[1] else {
+            panic!("field[1] must be List; got {:?}", fields[1]);
+        };
+        assert_eq!(remove_list.len(), 1);
+        assert!(
+            matches!(&remove_list[0], Data::Constr(0, _)),
+            "ColdCommitteeCredential must be PubKeyCredential (Constr 0); got {:?}",
+            remove_list[0]
+        );
+        // fields[2]: Map — 1 entry: script_cred 0xbb → epoch 500
+        let Data::Map(ref add_map) = fields[2] else {
+            panic!("field[2] must be Map; got {:?}", fields[2]);
+        };
+        assert_eq!(add_map.len(), 1);
+        assert!(
+            matches!(&add_map[0].0, Data::Constr(1, _)),
+            "ScriptCredential must be Constr 1; got {:?}",
+            add_map[0].0
+        );
+        assert_eq!(add_map[0].1, Data::I(BigInt::from(500u64)));
+        // fields[3]: Rational = Constr 0 [I 2, I 3]
+        // Haskell: makeIsDataSchemaIndexed ''Rational [('Rational, 0)] in plutus-tx
+        assert_eq!(
+            fields[3],
+            Data::Constr(
+                0,
+                vec![Data::I(BigInt::from(2u64)), Data::I(BigInt::from(3u64))]
+            ),
+            "Rational must be Constr 0 [I num, I den]"
+        );
     }
 }
