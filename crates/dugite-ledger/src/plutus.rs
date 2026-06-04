@@ -334,10 +334,12 @@ pub fn run_phase2_parallel(items: Vec<Phase2WorkItem>) -> Vec<Phase2Outcome> {
                 item.max_ex,
                 dugite_slot_config,
             );
-            // A tx the producer marked is_valid=false whose scripts pass here is
-            // a Phase-2 divergence (ValidationTagMismatch) — capture the exact
-            // CEK inputs for offline reproduction when dumping is enabled.
-            if result.is_ok() && !item.is_valid {
+            // Capture EITHER divergence direction for offline reproduction when
+            // dumping is enabled: (a) dugite PASSES but on-chain is_valid=false
+            // (ValidationTagMismatch, over-permissive CEK), or (b) dugite FAILS
+            // but on-chain is_valid=true (over-strict CEK — e.g. the #22 unIData /
+            // budget classes). Both are dugite-CEK bugs worth reproducing.
+            if (result.is_ok() && !item.is_valid) || (result.is_err() && item.is_valid) {
                 maybe_dump_phase2_divergence(&item);
             }
             Phase2Outcome {
@@ -371,7 +373,7 @@ pub fn run_phase2_parallel(items: Vec<Phase2WorkItem>) -> Vec<Phase2Outcome> {
                 item.max_ex,
                 dugite_slot_config,
             );
-            if result.is_ok() && !item.is_valid {
+            if (result.is_ok() && !item.is_valid) || (result.is_err() && item.is_valid) {
                 maybe_dump_phase2_divergence(&item);
             }
             Phase2Outcome {
