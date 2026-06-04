@@ -13,11 +13,14 @@
 //! Transaction here rather than projecting from V3 so each version
 //! reads cleanly in isolation.
 
+use crate::data::Data;
 use crate::phase_two::{PhaseTwoError, SlotConfig};
 use crate::populate_gov::certificates_to_plutus;
-use crate::script_context::{TxCert, TxInfoV1, TxInfoV2};
+use crate::populate_v3::purpose_rank;
+use crate::redeemer_resolve::resolve_redeemers;
+use crate::script_context::{ScriptPurpose, TxCert, TxInfoV1, TxInfoV2};
 use crate::tx_info_populate::{
-    datums_to_plutus, inputs_to_txininfos, mint_to_plutus, output_to_plutus,
+    datums_to_plutus, inputs_to_txininfos, mint_to_plutus, output_to_plutus, plutus_data_to_data,
     required_signers_to_plutus_padded, sort_inputs, tx_hash_to_array, valid_range_to_posix,
     withdrawals_to_plutus,
 };
@@ -113,6 +116,23 @@ pub fn populate_tx_info_v2(
         &tx.witness_set.plutus_data,
         tx.witness_set.raw_plutus_data_cbor.as_deref(),
     )?;
+    // V2 `txInfoRedeemers :: Map ScriptPurpose Redeemer` (added in PlutusV2).
+    // Leaving it empty makes scripts that look up a redeemer by purpose (the
+    // "forwarding"/multi-validator pattern) trace "Could not find redeemer" and
+    // return Error. Resolve every witness redeemer to (ScriptPurpose, data) and
+    // sort by `(purpose_rank, index)` to match Haskell `transTxRedeemers`'
+    // `Map.toList` order (Babbage RdmrPtr Ord = Spend<Mint<Cert<Reward, identical
+    // to the Conway AsIx ranks). The V2 `TxInfoV2::to_data` encodes the keys with
+    // V2 conventions (wrapped TxId for Spending). (#22 Error-term class.)
+    let redeemers: Vec<(ScriptPurpose, Data)> = if tx.witness_set.redeemers.is_empty() {
+        Vec::new()
+    } else {
+        let mut rs = resolve_redeemers(tx, resolved)?;
+        rs.sort_by_key(|rr| (purpose_rank(&rr.tag), rr.index));
+        rs.into_iter()
+            .map(|rr| (rr.purpose, plutus_data_to_data(&rr.redeemer_data)))
+            .collect()
+    };
     Ok(TxInfoV2 {
         inputs,
         reference_inputs,
@@ -123,8 +143,7 @@ pub fn populate_tx_info_v2(
         wdrl,
         valid_range,
         signatories,
-        // Filled by UPLC-9 part 3g (redeemers map).
-        redeemers: Vec::new(),
+        redeemers,
         data,
         txid: tx_hash_to_array(&tx.hash),
     })
@@ -302,7 +321,7 @@ mod tests {
         let info = populate_tx_info_v2(&tx, &[], &slot_cfg()).unwrap();
         assert_eq!(info.fee, BigInt::from(123));
         assert!(info.reference_inputs.is_empty());
-        assert!(info.redeemers.is_empty()); // deferred to part 3g
+        assert!(info.redeemers.is_empty()); // minimal tx has no redeemers
     }
 
     #[test]
