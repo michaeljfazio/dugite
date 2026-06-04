@@ -329,20 +329,17 @@ pub fn compute_reward_update(
             None => continue,
         };
 
-        {
-            let prefilter_active = prev_protocol_version_major <= 6;
-            if prefilter_active {
-                let op_key = LedgerState::reward_account_to_hash(&pool_reg.reward_account);
-                if !reward_accounts.contains_key(&op_key) {
-                    debug!(
-                        pool = ?pool_id.as_bytes()[..4],
-                        "Pool excluded: pre-Babbage prefilter (proto <= 6, unregistered reward account)"
-                    );
-                    continue;
-                }
-            }
-        }
-
+        // NOTE: the pre-Babbage (pv<=6) reward-account registration prefilter
+        // gates ONLY the LEADER (operator) reward, NOT the whole pool. Haskell
+        // `collectLRs` (Cardano/Ledger/Shelley/Rewards.hs): the leader reward is
+        // included iff `hardforkBabbageForgoRewardPrefilter pv || isAccountRegistered
+        // account accounts`; member rewards are gated separately by their own
+        // per-member prefilter (`hk ∈ addrsRew`) in `rewardOnePoolMember`. A
+        // previous whole-pool `continue` here dropped the MEMBER rewards too,
+        // under-distributing them back into reserves (mainnet ep213: 4 pools with
+        // unregistered operators but registered members → +180,457,654,009 lovelace
+        // reserves divergence, cross-checked byte-exact vs Koios). The leader gate
+        // now lives at the operator-credit site below.
         let self_delegated = owner_stake_by_pool.get(pool_id).copied().unwrap_or(0);
         if self_delegated < pool_reg.pledge.0 {
             debug!(
@@ -477,8 +474,19 @@ pub fn compute_reward_update(
 
         if operator_reward > 0 {
             let op_key = LedgerState::reward_account_to_hash(&pool_reg.reward_account);
-            *reward_map.entry(op_key).or_insert(Lovelace(0)) += Lovelace(operator_reward);
-            total_distributed += operator_reward;
+            // Pre-Babbage (pv<=6) leader-reward prefilter (Haskell `collectLRs`,
+            // Cardano/Ledger/Shelley/Rewards.hs): include the leader reward iff
+            // `hardforkBabbageForgoRewardPrefilter pv || isAccountRegistered op`.
+            // For pv>=7 (Babbage+, errata 17.2) the check is bypassed. A dropped
+            // leader reward is never credited → stays in the pot → undistributed →
+            // returned to reserves (matches Haskell deltaR2). Member rewards are
+            // gated independently by the per-member prefilter above.
+            let leader_included =
+                prev_protocol_version_major >= 7 || reward_accounts.contains_key(&op_key);
+            if leader_included {
+                *reward_map.entry(op_key).or_insert(Lovelace(0)) += Lovelace(operator_reward);
+                total_distributed += operator_reward;
+            }
         }
     }
 
