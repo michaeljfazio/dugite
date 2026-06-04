@@ -804,8 +804,16 @@ impl LedgerState {
                         }
                     }
 
-                    // Conway LEDGERS: unelected committee member check
+                    // Conway LEDGERS: unelected committee member check.
+                    //
+                    // Aggregate one WARN per tx, not one per cert: a single
+                    // CommitteeHotAuth tx can carry 30+ certs, and dugite does not
+                    // yet enact the network's UpdateCommittee gov actions, so its
+                    // committee stays at the genesis set and EVERY elected member's
+                    // hot-key auth fails this lookup. Per-cert logging produced a
+                    // 186K-line / 1GB+ log over a single Conway sync (#22 follow-up).
                     if self.epochs.protocol_params.protocol_version_major >= 9 {
+                        let mut unelected: Vec<String> = Vec::new();
                         for cert in &tx.body.certificates {
                             if let Certificate::CommitteeHotAuth {
                                 cold_credential, ..
@@ -818,15 +826,20 @@ impl LedgerState {
                                     .committee_expiration
                                     .contains_key(&cold_key)
                                 {
-                                    warn!(
-                                        tx_hash = %tx.hash.to_hex(),
-                                        slot = block.slot().0,
-                                        cold_key = %cold_key.to_hex(),
-                                        "UnelectedCommitteeMember on confirmed block — \
-                                         trusting on-chain consensus (committee state may be stale)"
-                                    );
+                                    unelected.push(cold_key.to_hex());
                                 }
                             }
+                        }
+                        if !unelected.is_empty() {
+                            warn!(
+                                tx_hash = %tx.hash.to_hex(),
+                                slot = block.slot().0,
+                                count = unelected.len(),
+                                first_cold_key = %unelected[0],
+                                "CommitteeHotAuth for non-current CC member(s) on confirmed \
+                                 block — dugite has not enacted the network's UpdateCommittee, \
+                                 so its committee is stale; trusting on-chain consensus"
+                            );
                         }
                     }
 
@@ -1372,6 +1385,9 @@ impl LedgerState {
 
         // Snapshot pre-block epoch to detect epoch transitions.
         let pre_epoch = self.epoch;
+        // Capture the pre-block governance Arc so we can detect (by pointer)
+        // whether this block mutated governance at all.
+        let gov_before = std::sync::Arc::clone(&self.gov.governance);
 
         // Apply the block (all state mutations happen here).
         self.apply_block(block, mode)?;
@@ -1385,12 +1401,23 @@ impl LedgerState {
         delta.reward_accounts_snapshot = Some(self.certs.reward_accounts.clone());
         delta.delegations_snapshot = Some(self.certs.delegations.clone());
         delta.stake_key_deposits_snapshot = Some(self.certs.stake_key_deposits.clone());
-        // gov is `Arc<GovernanceState>` → O(1) clone. Captures DReps, vote
-        // delegations, proposals, votes and enacted roots so a fork rollback
-        // restores them instead of the stale anchor governance (which left
-        // DRep power at 0 → ParameterChanges never ratified → V3 cost model
-        // frozen → script_data_hash divergence + deposits_proposal=0).
-        delta.gov_snapshot = Some(self.gov.clone());
+        // Snapshot gov ONLY when this block actually mutated it. gov is
+        // `Arc<GovernanceState>` backed by std HashMaps (not imbl), so an
+        // `Arc::make_mut` after a retained snapshot deep-clones the whole
+        // GovernanceState; capturing it unconditionally in every one of the
+        // k=2160 retained deltas blew memory up at deep Conway (OOM). Most
+        // blocks don't touch governance, so `gov_before` and the post-block Arc
+        // are pointer-equal → no snapshot, no cost. On reconstruction,
+        // `apply_delta_to_state` leaves gov untouched for `None` deltas, so it
+        // is carried forward from the most recent delta that DID change it (or
+        // the anchor) — which is exactly the gov state at that point. Captures
+        // DReps, vote delegations, proposals, votes and enacted roots so a fork
+        // rollback restores them instead of the stale anchor governance (which
+        // left DRep power at 0 → ParameterChanges never ratified → V3 cost
+        // model frozen → script_data_hash divergence + deposits_proposal=0).
+        if !std::sync::Arc::ptr_eq(&gov_before, &self.gov.governance) {
+            delta.gov_snapshot = Some(self.gov.clone());
+        }
 
         // Extract the UTxO diff from the DiffSeq entry that apply_block just pushed.
         if let Some((_slot, _hash, utxo_diff)) = self.utxo.diff_seq.diffs.back() {
