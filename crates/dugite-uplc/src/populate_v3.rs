@@ -191,7 +191,7 @@ pub fn populate_tx_info_v3(
 ///   deriving (Eq, Ord, …)`).
 /// The `Redeemers` witness map is `Map (ConwayPlutusPurpose AsIx) _`;
 /// `Map.toList` iterates in this derived `Ord` order.
-fn purpose_rank(tag: &RedeemerTag) -> u8 {
+pub(crate) fn purpose_rank(tag: &RedeemerTag) -> u8 {
     match tag {
         RedeemerTag::Spend => 0,
         RedeemerTag::Mint => 1,
