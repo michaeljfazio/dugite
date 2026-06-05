@@ -515,6 +515,15 @@ pub fn datums_to_plutus(
         };
         out.push((h, translated));
     }
+    // `txInfoData` is built from the witness `TxDats = Map DataHash (Data era)`
+    // in cardano-ledger, so the datum entries are ordered ascending by datum
+    // hash (lexicographic over the 32 raw hash bytes — `Ord DataHash`), NOT in
+    // witness-set wire order. A script that folds/looks-up the datum map pays a
+    // different ExUnit cost when the order differs, so emit it sorted to match
+    // cardano-node byte-exact. Cf. cardano-ledger `transTxInfoData` over
+    // `Map.toList (unTxDats …)`. (V1 AssocList and V2 AssocMap both consume
+    // this ordering.)
+    out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
 }
 
@@ -1044,6 +1053,35 @@ mod tests {
     // ────────────────────────────────────────────────────────────
     // OutputDatum / TransactionOutput translation
     // ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn datums_to_plutus_sorts_by_datum_hash_ascending() {
+        // cardano-ledger builds txInfoData from the witness `TxDats =
+        // Map DataHash (Data era)`, so entries are ordered ascending by the
+        // 32-byte datum hash regardless of witness-set wire order. Feed several
+        // distinct datums and assert the output is hash-sorted.
+        let data: Vec<PrimPlutusData> = (0..6)
+            .map(|n| PrimPlutusData::Integer(BigInt::from(n * 7 + 1)))
+            .collect();
+        let out = datums_to_plutus(&data, None).unwrap();
+        assert_eq!(out.len(), 6);
+        for w in out.windows(2) {
+            assert!(
+                w[0].0 <= w[1].0,
+                "datums must be sorted ascending by hash: {:?} !<= {:?}",
+                w[0].0,
+                w[1].0
+            );
+        }
+        // Sanity: the set of hashes equals the per-datum hashes (no loss).
+        use std::collections::BTreeSet;
+        let got: BTreeSet<[u8; 32]> = out.iter().map(|(h, _)| *h).collect();
+        let expect: BTreeSet<[u8; 32]> = data
+            .iter()
+            .map(|d| datum_hash(&plutus_data_to_data(d)).unwrap())
+            .collect();
+        assert_eq!(got, expect);
+    }
 
     #[test]
     fn output_datum_to_plutus_covers_all_three_variants() {
