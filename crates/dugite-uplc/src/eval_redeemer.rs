@@ -262,10 +262,20 @@ fn resolve_applied_costs(
                 }
             }
         }
-        // PlutusV3 byte-exact applier lands in a follow-up (251/350-param
-        // Conway ordering with the changed integer-division shapes); until
-        // then it falls back to the latest reference model.
-        ScriptLanguage::PlutusV3 => None,
+        ScriptLanguage::PlutusV3 => {
+            let params = cm.plutus_v3.as_deref()?;
+            match crate::cost_apply::apply_v3(params) {
+                Ok(applied) => Some(applied),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "PlutusV3 cost model could not be applied; \
+                         falling back to reference model"
+                    );
+                    None
+                }
+            }
+        }
     }
 }
 
