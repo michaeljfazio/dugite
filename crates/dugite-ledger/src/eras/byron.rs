@@ -1451,6 +1451,7 @@ mod tests {
                 numerator: 1,
                 denominator: 1,
             },
+            rupd_addrs_rew: None,
         }
     }
 

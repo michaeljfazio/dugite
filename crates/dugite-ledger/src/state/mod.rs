@@ -661,6 +661,7 @@ impl LedgerState {
                     numerator: 1,
                     denominator: 1,
                 }, // Genesis: d=1
+                rupd_addrs_rew: None,           // #11: captured at startStep during apply
             },
             tip: Tip::origin(),
             era: Era::Conway,
@@ -1145,6 +1146,7 @@ impl LedgerState {
                 prev_protocol_params: prev_pparams,
                 prev_protocol_version_major,
                 prev_d,
+                rupd_addrs_rew: None, // #11: captured at startStep during apply
             },
             tip,
             era: Era::Conway,

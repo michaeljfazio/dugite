@@ -335,6 +335,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             state.epochs.reserves,
             state.epochs.treasury,
             &reward_accounts_std,
+            state.epochs.rupd_addrs_rew.as_deref(),
             state.epoch_length,
             state.shelley_transition_epoch,
             state.max_lovelace_supply,

@@ -373,6 +373,9 @@ impl EraRules for ShelleyRules {
                 epochs.reserves,
                 epochs.treasury,
                 &reward_accounts_std,
+                // #11: pv≤6 prefilter uses the startStep-frozen fvAddrsRew set,
+                // not boundary-time accounts (None ⇒ fall back to boundary).
+                epochs.rupd_addrs_rew.as_deref(),
                 ctx.epoch_length,
                 ctx.shelley_transition_epoch,
                 ctx.max_lovelace_supply,
@@ -1233,6 +1236,7 @@ mod tests {
                 numerator: 1,
                 denominator: 1,
             },
+            rupd_addrs_rew: None,
         }
     }
 

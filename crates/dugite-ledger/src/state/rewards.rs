@@ -142,10 +142,23 @@ pub fn compute_reward_update(
     reserves: Lovelace,
     _treasury: Lovelace,
     reward_accounts: &HashMap<Hash32, Lovelace>,
+    startstep_addrs_rew: Option<&std::collections::HashSet<Hash32>>,
     epoch_length: u64,
     _shelley_transition_epoch: u64,
     max_lovelace_supply: u64,
 ) -> PendingRewardUpdate {
+    // pv≤6 reward prefilter source set (`fvAddrsRew`). Haskell freezes
+    // `Map.keysSet(accounts)` at `startStep` (mid-epoch, before that block's
+    // certs); both the per-member (`rewardOnePoolMember`) and leader
+    // (`collectLRs`) prefilters test THIS frozen set. We use it when captured;
+    // otherwise fall back to the boundary-time `reward_accounts` keys (mirrors
+    // Haskell's `RewardsTooLate` path that forces startStep at the boundary).
+    let registered_at_startstep = |cred: &Hash32| -> bool {
+        match startstep_addrs_rew {
+            Some(set) => set.contains(cred),
+            None => reward_accounts.contains_key(cred),
+        }
+    };
     // Issue #438 fix: compute expansion + treasury_cut BEFORE checking go.
     //
     // Haskell `Cardano.Ledger.Shelley.LedgerState.PulsingReward.startStep`
@@ -437,7 +450,7 @@ pub fn compute_reward_update(
                 // (Babbage onward, ledger errata 17.2) the prefilter is
                 // bypassed; routing of unregistered rewards happens at
                 // applyRUpd time (frTotalUnregistered → treasury).
-                if prev_protocol_version_major <= 6 && !reward_accounts.contains_key(cred_hash) {
+                if prev_protocol_version_major <= 6 && !registered_at_startstep(cred_hash) {
                     continue;
                 }
 
@@ -482,7 +495,7 @@ pub fn compute_reward_update(
             // returned to reserves (matches Haskell deltaR2). Member rewards are
             // gated independently by the per-member prefilter above.
             let leader_included =
-                prev_protocol_version_major >= 7 || reward_accounts.contains_key(&op_key);
+                prev_protocol_version_major >= 7 || registered_at_startstep(&op_key);
             if leader_included {
                 *reward_map.entry(op_key).or_insert(Lovelace(0)) += Lovelace(operator_reward);
                 total_distributed += operator_reward;
@@ -686,6 +699,7 @@ impl LedgerState {
             self.epochs.reserves,
             self.epochs.treasury,
             &reward_accounts_std,
+            self.epochs.rupd_addrs_rew.as_deref(),
             self.epoch_length,
             self.shelley_transition_epoch,
             self.max_lovelace_supply,
@@ -1154,6 +1168,7 @@ mod tests {
             dugite_primitives::value::Lovelace(0), // reserves
             dugite_primitives::value::Lovelace(0), // treasury
             &reward_accounts,
+            None,  // startstep_addrs_rew (fall back to boundary accounts)
             86400, // epoch_length
             0,     // shelley_transition_epoch
             super::super::MAX_LOVELACE_SUPPLY,
