@@ -523,7 +523,7 @@ pub fn datums_to_plutus(
     // cardano-node byte-exact. Cf. cardano-ledger `transTxInfoData` over
     // `Map.toList (unTxDats …)`. (V1 AssocList and V2 AssocMap both consume
     // this ordering.)
-    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out.sort_by_key(|(hash, _)| *hash);
     Ok(out)
 }
 

@@ -184,6 +184,10 @@ pub struct Phase2WorkItem {
     pub max_ex: (u64, u64),
     /// Slot configuration for Plutus time translation.
     pub slot_config: SlotConfig,
+    /// Major protocol version at evaluation time. Selects the PlutusV1/V2
+    /// `BuiltinSemanticsVariant` (VariantA pre-Conway, VariantB at PV9+) for the
+    /// per-builtin cost model — see `dugite_uplc::cost_apply`.
+    pub protocol_major: u32,
 }
 
 /// Resolve a transaction's Plutus inputs into `(input_cbor, output_cbor)` pairs
@@ -234,6 +238,7 @@ pub fn capture_phase2_work_item(
     cost_models_cbor: Option<Vec<u8>>,
     max_ex: (u64, u64),
     slot_config: SlotConfig,
+    protocol_major: u32,
 ) -> Phase2WorkItem {
     let tx_cbor = match tx.raw_cbor.as_ref() {
         Some(bytes) => bytes.clone(),
@@ -248,6 +253,7 @@ pub fn capture_phase2_work_item(
         cost_models_cbor,
         max_ex,
         slot_config,
+        protocol_major,
     }
 }
 
@@ -333,6 +339,7 @@ pub fn run_phase2_parallel(items: Vec<Phase2WorkItem>) -> Vec<Phase2Outcome> {
                 item.cost_models_cbor.as_deref(),
                 item.max_ex,
                 dugite_slot_config,
+                item.protocol_major,
             );
             // Capture EITHER divergence direction for offline reproduction when
             // dumping is enabled: (a) dugite PASSES but on-chain is_valid=false
@@ -372,6 +379,7 @@ pub fn run_phase2_parallel(items: Vec<Phase2WorkItem>) -> Vec<Phase2Outcome> {
                 item.cost_models_cbor.as_deref(),
                 item.max_ex,
                 dugite_slot_config,
+                item.protocol_major,
             );
             if (result.is_ok() && !item.is_valid) || (result.is_err() && item.is_valid) {
                 maybe_dump_phase2_divergence(&item);
@@ -398,6 +406,7 @@ fn run_single_phase2_eval(
     cost_models_cbor: Option<&[u8]>,
     max_tx_ex_units: (u64, u64),
     slot_config: dugite_uplc::phase_two::SlotConfig,
+    protocol_major: u32,
 ) -> Result<(), PlutusError> {
     let eval_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         dugite_uplc::phase_two::eval_phase_two_raw(
@@ -406,6 +415,7 @@ fn run_single_phase2_eval(
             cost_models_cbor,
             max_tx_ex_units,
             slot_config,
+            protocol_major,
             false, // run_phase_one = false
             &mut (),
         )
@@ -464,6 +474,7 @@ pub fn evaluate_plutus_scripts(
     cost_models_cbor: Option<&[u8]>,
     max_tx_ex_units: (u64, u64),
     slot_config: &SlotConfig,
+    protocol_major: u32,
 ) -> Result<(), PlutusError> {
     // Use the original wire bytes when available — that path preserves the
     // exact TxId of network-submitted transactions (which is the hash of the
@@ -550,6 +561,7 @@ pub fn evaluate_plutus_scripts(
         cost_models_cbor,
         max_tx_ex_units,
         dugite_slot_config,
+        protocol_major,
     );
     if let Err(ref e) = result {
         debug!(
@@ -587,6 +599,7 @@ pub fn evaluate_plutus_scripts_with_reports(
     cost_models_cbor: Option<&[u8]>,
     max_tx_ex_units: (u64, u64),
     slot_config: &SlotConfig,
+    protocol_major: u32,
 ) -> Result<Vec<RedeemerReport>, PlutusError> {
     let owned_cbor: Vec<u8>;
     let tx_cbor: &[u8] = match tx.raw_cbor.as_ref() {
@@ -636,6 +649,7 @@ pub fn evaluate_plutus_scripts_with_reports(
             cost_models_cbor,
             max_tx_ex_units,
             dugite_slot_config,
+            protocol_major,
             false,
             &mut (),
         )
@@ -788,8 +802,14 @@ mod tests {
         let utxo_set = UtxoSet::new();
         let slot_config = SlotConfig::default();
 
-        let result =
-            evaluate_plutus_scripts(&tx, &utxo_set, None, (10_000_000, 10_000_000), &slot_config);
+        let result = evaluate_plutus_scripts(
+            &tx,
+            &utxo_set,
+            None,
+            (10_000_000, 10_000_000),
+            &slot_config,
+            9,
+        );
         assert!(
             result.is_ok(),
             "Evaluator must accept a locally-built tx via the re-encode fallback: {:?}",
@@ -1301,6 +1321,7 @@ mod tests {
             None, // no cost models — script is so simple it needs no builtins
             (14_000_000, 2_000_000),
             &slot_config,
+            9,
         );
 
         assert!(
@@ -1332,8 +1353,14 @@ mod tests {
         tx.witness_set.plutus_v2_scripts = vec![script_cbor];
 
         let slot_config = SlotConfig::preview();
-        let result =
-            evaluate_plutus_scripts(&tx, &utxo_set, None, (14_000_000, 2_000_000), &slot_config);
+        let result = evaluate_plutus_scripts(
+            &tx,
+            &utxo_set,
+            None,
+            (14_000_000, 2_000_000),
+            &slot_config,
+            9,
+        );
 
         // The error term must produce a script failure, not a parse or
         // infrastructure error.
@@ -1388,7 +1415,7 @@ mod tests {
 
         // Pass an impossibly small budget to the evaluator (1 step, 1 mem).
         let result =
-            evaluate_plutus_scripts(&tx, &utxo_set, Some(&cost_models), (1, 1), &slot_config);
+            evaluate_plutus_scripts(&tx, &utxo_set, Some(&cost_models), (1, 1), &slot_config, 9);
 
         assert!(
             result.is_err(),
@@ -1474,6 +1501,7 @@ mod tests {
                 None,
                 (14_000_000, 2_000_000),
                 &slot_config,
+                9,
             );
 
             assert!(
@@ -1629,8 +1657,14 @@ mod tests {
         tx.witness_set.plutus_data = vec![PlutusData::Constr(0, vec![])];
 
         let slot_config = SlotConfig::preview();
-        let result =
-            evaluate_plutus_scripts(&tx, &utxo_set, None, (14_000_000, 2_000_000), &slot_config);
+        let result = evaluate_plutus_scripts(
+            &tx,
+            &utxo_set,
+            None,
+            (14_000_000, 2_000_000),
+            &slot_config,
+            9,
+        );
         assert!(
             result.is_ok(),
             "Always-succeeds V1 script should pass Phase-2: {:?}",
@@ -1683,8 +1717,14 @@ mod tests {
         let tx = Transaction::empty_with_hash(Hash32::ZERO);
         assert!(tx.raw_cbor.is_none(), "precondition: locally-built tx");
         let slot_config = SlotConfig::default();
-        let result =
-            evaluate_plutus_scripts(&tx, &utxo_set, None, (10_000_000, 10_000_000), &slot_config);
+        let result = evaluate_plutus_scripts(
+            &tx,
+            &utxo_set,
+            None,
+            (10_000_000, 10_000_000),
+            &slot_config,
+            9,
+        );
         assert!(
             result.is_ok(),
             "Locally-built tx with no redeemers must succeed via the re-encode fallback: {:?}",
@@ -1742,6 +1782,7 @@ mod tests {
             Some(&cost_models),
             (budget_steps, budget_mem),
             &slot_config,
+            9,
         );
         assert!(
             result_correct.is_ok(),
@@ -1763,6 +1804,7 @@ mod tests {
             Some(&cost_models),
             (1, budget_mem),
             &slot_config,
+            9,
         );
         assert!(
             result_exhausted.is_err(),
@@ -1811,6 +1853,7 @@ mod tests {
             Some(&cost_models),
             (14_000_000, 2_000_000),
             &slot_config,
+            9,
         );
 
         assert!(
@@ -1921,8 +1964,14 @@ mod tests {
         tx.witness_set.plutus_v3_scripts = vec![script_cbor];
 
         let slot_config = SlotConfig::preview();
-        let result =
-            evaluate_plutus_scripts(&tx, &utxo_set, None, (14_000_000, 2_000_000), &slot_config);
+        let result = evaluate_plutus_scripts(
+            &tx,
+            &utxo_set,
+            None,
+            (14_000_000, 2_000_000),
+            &slot_config,
+            9,
+        );
 
         assert!(
             result.is_ok(),
@@ -1948,8 +1997,14 @@ mod tests {
         tx.witness_set.plutus_v3_scripts = vec![script_cbor];
 
         let slot_config = SlotConfig::preview();
-        let result =
-            evaluate_plutus_scripts(&tx, &utxo_set, None, (14_000_000, 2_000_000), &slot_config);
+        let result = evaluate_plutus_scripts(
+            &tx,
+            &utxo_set,
+            None,
+            (14_000_000, 2_000_000),
+            &slot_config,
+            9,
+        );
 
         assert!(
             matches!(result, Err(PlutusError::EvalFailed(_))),
@@ -2186,6 +2241,7 @@ mod tests {
             Some(&cbor),
             (14_000_000, 2_000_000),
             &slot_config,
+            9,
         );
 
         assert!(
@@ -2361,6 +2417,7 @@ mod tests {
             None, // no cost models needed for this simple script
             (14_000_000, 2_000_000),
             &slot_config,
+            9,
         );
 
         assert!(

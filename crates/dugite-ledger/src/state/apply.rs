@@ -999,6 +999,7 @@ impl LedgerState {
                             cost_models_cbor.clone(),
                             max_ex,
                             self.slot_config,
+                            self.epochs.protocol_params.protocol_version_major as u32,
                         ));
                     }
                 } else if has_redeemers {
@@ -1019,6 +1020,7 @@ impl LedgerState {
                             cost_models_cbor.clone(),
                             max_ex,
                             self.slot_config,
+                            self.epochs.protocol_params.protocol_version_major as u32,
                         ));
                     }
                     // ── Sequential fallback (feature disabled) ────────────────
@@ -1034,6 +1036,7 @@ impl LedgerState {
                             cost_models_cbor.as_deref(),
                             max_ex,
                             &self.slot_config,
+                            self.epochs.protocol_params.protocol_version_major as u32,
                         );
                         if eval_result.is_ok() {
                             // Phase-2 divergence on a confirmed block: the
