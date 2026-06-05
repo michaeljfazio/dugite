@@ -257,6 +257,15 @@ impl LedgerState {
                         .iter()
                         .map(|(k, v)| (*k, *v))
                         .collect();
+                    // Mirror the boundary handler's pre-AVVM-reserves adjustment at
+                    // the Shelley→Allegra boundary (see `pending_avvm_return`); a
+                    // non-consuming read so `process_epoch_transition` still applies it.
+                    let dbg_reward_reserves = Lovelace(
+                        self.epochs
+                            .reserves
+                            .0
+                            .saturating_sub(self.epochs.pending_avvm_return),
+                    );
                     let upcoming_rupd = crate::state::rewards::compute_reward_update(
                         &self.epochs.prev_protocol_params,
                         &self.epochs.prev_d,
@@ -264,7 +273,7 @@ impl LedgerState {
                         self.epochs.snapshots.go.as_ref(),
                         &self.epochs.snapshots.bprev_blocks_by_pool,
                         self.epochs.snapshots.ss_fee,
-                        self.epochs.reserves,
+                        dbg_reward_reserves,
                         self.epochs.treasury,
                         &_reward_accounts_std,
                         self.epochs.rupd_addrs_rew.as_deref(),
