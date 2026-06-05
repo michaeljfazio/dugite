@@ -1018,6 +1018,7 @@ mod tests {
                 numerator: 0,
                 denominator: 1,
             },
+            rupd_addrs_rew: None,
         }
     }
 

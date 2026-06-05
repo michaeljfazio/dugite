@@ -267,6 +267,7 @@ impl LedgerState {
                         self.epochs.reserves,
                         self.epochs.treasury,
                         &_reward_accounts_std,
+                        self.epochs.rupd_addrs_rew.as_deref(),
                         self.epoch_length,
                         self.shelley_transition_epoch,
                         self.max_lovelace_supply,
@@ -289,6 +290,34 @@ impl LedgerState {
                     &mut self.consensus,
                 )?;
                 self.epoch = next_epoch;
+                // #11: the startStep-frozen fvAddrsRew set just consumed by this
+                // boundary's RUPD is cleared so the new epoch re-captures it.
+                // (Subsequent skipped-epoch boundaries see None → fall back to
+                // boundary accounts, matching Haskell's forced startStep.)
+                self.epochs.rupd_addrs_rew = None;
+            }
+        }
+
+        // #11 startStep capture: the first time this (Shelley+, pv≤6) epoch's
+        // block slot crosses `epoch_first_slot + randomness_stabilisation_window`
+        // (4k/f), freeze the registered reward-account credential set — BEFORE
+        // applying this block's certificates. Mirrors Haskell's RUPD pulser
+        // `FreeVars.fvAddrsRew = Map.keysSet(accounts)`, captured during TICK
+        // (which precedes the block body). The next epoch boundary's
+        // `compute_reward_update` uses this frozen set for the pv≤6 member +
+        // leader reward prefilters instead of boundary-time accounts. pv≥7
+        // bypasses the prefilter, so we skip the (potentially large) snapshot.
+        if block.era != Era::Byron
+            && self.epochs.protocol_params.protocol_version_major <= 6
+            && self.epochs.rupd_addrs_rew.is_none()
+        {
+            let startstep_slot = self
+                .first_slot_of_epoch(self.epoch.0)
+                .saturating_add(self.randomness_stabilisation_window);
+            if block.slot().0 > startstep_slot {
+                let frozen: std::collections::HashSet<dugite_primitives::hash::Hash32> =
+                    self.certs.reward_accounts.keys().copied().collect();
+                self.epochs.rupd_addrs_rew = Some(std::sync::Arc::new(frozen));
             }
         }
 

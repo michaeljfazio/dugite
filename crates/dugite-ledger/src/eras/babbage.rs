@@ -359,6 +359,7 @@ fn make_empty_epoch_sub() -> EpochSubState {
             numerator: 0,
             denominator: 1,
         },
+        rupd_addrs_rew: None,
     }
 }
 
@@ -473,6 +474,7 @@ mod tests {
                 numerator: 0,
                 denominator: 1,
             },
+            rupd_addrs_rew: None,
         }
     }
 
