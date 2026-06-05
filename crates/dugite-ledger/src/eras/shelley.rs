@@ -384,6 +384,13 @@ impl EraRules for ShelleyRules {
             // set at runtime.  Only fires when GO is non-empty.
             #[cfg(feature = "reward-debug-dump")]
             if let Some(go) = go_ref {
+                // `certs.reward_accounts` is an imbl map (k-window sharing); the
+                // debug dumper takes a plain `&HashMap`, so collect a snapshot.
+                let ra_std: std::collections::HashMap<Hash32, Lovelace> = certs
+                    .reward_accounts
+                    .iter()
+                    .map(|(k, v)| (*k, *v))
+                    .collect();
                 crate::state::reward_debug::maybe_dump(
                     ctx.current_epoch.0,
                     new_epoch.0,
@@ -395,7 +402,7 @@ impl EraRules for ShelleyRules {
                     epochs.snapshots.ss_fee,
                     go,
                     &epochs.snapshots.bprev_blocks_by_pool,
-                    &certs.reward_accounts,
+                    &ra_std,
                     &rupd,
                 );
             }
