@@ -374,6 +374,7 @@ impl From<LedgerStateSnapshot> for super::LedgerState {
                 // #11: transient startStep capture — not persisted; a mid-epoch
                 // snapshot resume re-captures (or falls back to boundary accounts).
                 rupd_addrs_rew: None,
+                pending_avvm_return: 0,
             },
             tip: s.tip,
             era: s.era,

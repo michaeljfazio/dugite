@@ -139,6 +139,11 @@ fn return_redeem_addrs_to_reserves(utxo: &mut UtxoSubState, epochs: &mut EpochSu
     // `<+>` is `Coin` addition (saturating).
     epochs.reserves = Lovelace(epochs.reserves.0.saturating_add(redeem_coin));
 
+    // Record the AVVM return so the SAME-boundary reward update is computed from
+    // PRE-AVVM reserves (Haskell `nesRu` was pulsed in the previous epoch, before
+    // the era-translation AVVM return). See `EpochSubState::pending_avvm_return`.
+    epochs.pending_avvm_return = redeem_coin;
+
     let redeem_ada = redeem_coin / 1_000_000;
     info!(
         redeem_utxo_count = redeem_count,
@@ -363,6 +368,18 @@ impl EraRules for ShelleyRules {
                 .iter()
                 .map(|(k, v)| (*k, *v))
                 .collect();
+            // #11/AVVM: at the Shelley→Allegra boundary the era translation already
+            // added the unredeemed-AVVM coin to `epochs.reserves` (on_era_transition
+            // runs before this). Haskell computed `nesRu` from PRE-AVVM reserves, so
+            // compute the reward update from reserves with that return removed (then
+            // it is applied to the post-AVVM reserves below). `take` resets to 0 so
+            // only this first boundary is adjusted. Non-AVVM boundaries see 0.
+            let reward_reserves = Lovelace(
+                epochs
+                    .reserves
+                    .0
+                    .saturating_sub(std::mem::take(&mut epochs.pending_avvm_return)),
+            );
             let rupd = crate::compute_reward_update(
                 rupd_pp,
                 &epochs.prev_d,
@@ -370,7 +387,7 @@ impl EraRules for ShelleyRules {
                 go_ref,
                 &epochs.snapshots.bprev_blocks_by_pool,
                 epochs.snapshots.ss_fee,
-                epochs.reserves,
+                reward_reserves,
                 epochs.treasury,
                 &reward_accounts_std,
                 // #11: pv≤6 prefilter uses the startStep-frozen fvAddrsRew set,
@@ -1237,6 +1254,7 @@ mod tests {
                 denominator: 1,
             },
             rupd_addrs_rew: None,
+            pending_avvm_return: 0,
         }
     }
 
