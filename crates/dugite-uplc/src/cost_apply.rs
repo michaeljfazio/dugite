@@ -48,7 +48,8 @@
 //! | `multiplyInteger`  | `added_sizes`                             | `added_sizes`      |
 
 use crate::builtin::cost::{
-    BuiltinCosts, ConstAboveDiagMulP, CostPair, CostingFun, DiagLinearP, Linear1, SubtractedSizesP,
+    BuiltinCosts, ConstAboveDiagMulP, ConstAboveDiagP, CostPair, CostingFun, DiagLinearP, Linear1,
+    LinearYZP, QuadXY, Quadratic1, SubtractedSizesP,
 };
 use crate::machine::cost::MachineCosts;
 use crate::machine::ExBudget;
@@ -425,6 +426,300 @@ pub fn apply_v2(p: &[i64]) -> Result<AppliedCosts, CostModelApplyError> {
     })
 }
 
+/// Number of parameters in a PlutusV3 cost model at the Conway/PV9 launch
+/// (`PlutusLedgerApi.V3.ParamName`): 251 entries. This is the 175 V2 params
+/// restructured (the four integer-division builtins each gain the quadratic
+/// CPU coefficients, +5 each = +20; serialiseData/secp unchanged) plus the
+/// `cekConstr`/`cekCase` machine costs (4) and the batch-4 builtins
+/// (BLS12-381, keccak_256, blake2b_224, integerToByteString,
+/// byteStringToInteger). Per `tagWithParamNames`' `zip`-truncation rule a
+/// longer on-chain array (Plomin PV10 = 297, van Rossem PV11 = 350) is
+/// accepted: the bitwise batch (251..=296) is consumed when present and any
+/// PV11 tail is ignored (those builtins are not yet implemented).
+pub const V3_PARAM_COUNT_BASE: usize = 251;
+
+/// PlutusV3 cost-model parameter count after the Plomin (PV10) bitwise batch.
+pub const V3_PARAM_COUNT_BITWISE: usize = 297;
+
+/// V3 integer-division CPU: `const_above_diagonal` wrapping
+/// `quadratic_in_x_and_y`. Flat sub-order is the `ParamName` declaration
+/// order: `constant`, then the quadratic coefficients `c00, c01, c02, c10,
+/// c11, c20`, then `minimum`. Mirrors `builtinCostModelC.json` —
+/// `if size1 < size2 then constant else max(minimum, c00 + c10·x + c01·y +
+/// c20·x² + c11·x·y + c02·y²)`.
+fn v3_division_cpu(cur: &mut Cursor<'_>) -> CostingFun {
+    let constant = cur.next();
+    let c00 = cur.next();
+    let c01 = cur.next();
+    let c02 = cur.next();
+    let c10 = cur.next();
+    let c11 = cur.next();
+    let c20 = cur.next();
+    let minimum = cur.next();
+    CostingFun::ConstAboveDiagonal(ConstAboveDiagP {
+        constant,
+        model: QuadXY {
+            c00,
+            c10,
+            c01,
+            c20,
+            c11,
+            c02,
+            minimum,
+        },
+    })
+}
+
+/// V3 `divideInteger` / `quotientInteger`: quadratic CPU + `subtracted_sizes`
+/// memory (`-intercept`, `-minimum`, `-slope`).
+fn v3_division_div_quot(cur: &mut Cursor<'_>) -> CostPair {
+    let cpu = v3_division_cpu(cur);
+    let mem = CostingFun::SubtractedSizes(SubtractedSizesP {
+        intercept: cur.next(),
+        minimum: cur.next(),
+        slope: cur.next(),
+    });
+    CostPair { cpu, mem }
+}
+
+/// V3 `modInteger` / `remainderInteger`: quadratic CPU + `linear_in_y`
+/// memory (no minimum — the result is bounded by the divisor `y`).
+fn v3_division_mod_rem(cur: &mut Cursor<'_>) -> CostPair {
+    let cpu = v3_division_cpu(cur);
+    let mem = CostingFun::LinearInY(cur.linear());
+    CostPair { cpu, mem }
+}
+
+/// V3 `integerToByteString`: CPU `quadratic_in_z` (`c0, c1, c2`); memory
+/// `literal_in_y_or_linear_in_z` (`intercept, slope`).
+fn v3_integer_to_bytestring(cur: &mut Cursor<'_>) -> CostPair {
+    let cpu = CostingFun::QuadraticInZ(Quadratic1 {
+        c0: cur.next(),
+        c1: cur.next(),
+        c2: cur.next(),
+    });
+    let mem = CostingFun::LiteralInYOrLinearInZ(cur.linear());
+    CostPair { cpu, mem }
+}
+
+/// V3 `byteStringToInteger`: CPU `quadratic_in_y` (`c0, c1, c2`); memory
+/// `linear_in_y` (`intercept, slope`).
+fn v3_bytestring_to_integer(cur: &mut Cursor<'_>) -> CostPair {
+    let cpu = CostingFun::QuadraticInY(Quadratic1 {
+        c0: cur.next(),
+        c1: cur.next(),
+        c2: cur.next(),
+    });
+    let mem = CostingFun::LinearInY(cur.linear());
+    CostPair { cpu, mem }
+}
+
+/// V3 bitwise `andByteString`/`orByteString`/`xorByteString` (Plomin batch):
+/// CPU `linear_in_y_and_z` (`intercept, slope1, slope2`); memory
+/// `linear_in_max_yz` (`intercept, slope`).
+fn v3_bitwise_logical(cur: &mut Cursor<'_>) -> CostPair {
+    let cpu = CostingFun::LinearYZ(LinearYZP {
+        intercept: cur.next(),
+        slope1: cur.next(),
+        slope2: cur.next(),
+    });
+    let mem = CostingFun::LinearMaxYZ(cur.linear());
+    CostPair { cpu, mem }
+}
+
+/// Apply a flat PlutusV3 cost-model array (Conway: 251 entries at PV9,
+/// canonical `PlutusLedgerApi.V3.ParamName` order; 297 at Plomin PV10) to a
+/// fresh [`AppliedCosts`].
+///
+/// V3 differs from V2 in three structural ways (cf. `cardano-haskell-oracle`,
+/// `IntersectMBO/plutus` `PlutusLedgerApi.V3.ParamName` + `builtinCostModelC.json`):
+///   1. the four integer-division builtins use a `const_above_diagonal` CPU
+///      model over `quadratic_in_x_and_y` (8 CPU params each) instead of the
+///      V1/V2 `multiplied_sizes` (3); `mod`/`remainder` lose the memory
+///      `minimum` (`linear_in_y` instead of `subtracted_sizes`);
+///   2. `multiplyInteger` CPU becomes `multiplied_sizes` (V1/V2 used
+///      `added_sizes`); this is the reference-default shape, so `refill_builtin`
+///      reuses it;
+///   3. `cekConstr`/`cekCase` machine costs appear at flat indices 193..=196
+///      (between the secp builtins and the BLS batch), followed by the
+///      BLS12-381 / keccak_256 / blake2b_224 / integerToByteString /
+///      byteStringToInteger builtins.
+pub fn apply_v3(p: &[i64]) -> Result<AppliedCosts, CostModelApplyError> {
+    if p.len() < V3_PARAM_COUNT_BASE {
+        return Err(CostModelApplyError::WrongLength {
+            expected: V3_PARAM_COUNT_BASE,
+            got: p.len(),
+        });
+    }
+    use BuiltinId::*;
+    let mut b = BuiltinCosts::DEFAULT.clone();
+    let mut m = MachineCosts::DEFAULT;
+    let cur = &mut Cursor { p, i: 0 };
+
+    // [0..=16] addInteger, appendByteString, appendString, bData, blake2b_256
+    refill_builtin(&mut b, AddInteger, cur)?;
+    refill_builtin(&mut b, AppendByteString, cur)?;
+    refill_builtin(&mut b, AppendString, cur)?;
+    refill_builtin(&mut b, BData, cur)?;
+    refill_builtin(&mut b, Blake2b_256, cur)?;
+
+    // [17..=32] CEK machine-step costs, alphabetical: apply, builtin, const,
+    // delay, force, lam, startup, var — each (exBudgetCPU, exBudgetMemory).
+    m.apply = cur.exbudget();
+    m.builtin = cur.exbudget();
+    m.constant = cur.exbudget();
+    m.delay = cur.exbudget();
+    m.force = cur.exbudget();
+    m.lam = cur.exbudget();
+    m.startup = cur.exbudget();
+    m.var = cur.exbudget();
+
+    // [33..=48] chooseData … decodeUtf8.
+    refill_builtin(&mut b, ChooseData, cur)?;
+    refill_builtin(&mut b, ChooseList, cur)?;
+    refill_builtin(&mut b, ChooseUnit, cur)?;
+    refill_builtin(&mut b, ConsByteString, cur)?;
+    refill_builtin(&mut b, ConstrData, cur)?;
+    refill_builtin(&mut b, DecodeUtf8, cur)?;
+    // [49..=59] divideInteger (V3 quadratic CPU + subtracted_sizes memory).
+    let div = v3_division_div_quot(cur);
+    b.set_cost_pair(DivideInteger, div);
+    // [60..=113] encodeUtf8 … mkPairData.
+    refill_builtin(&mut b, EncodeUtf8, cur)?;
+    refill_builtin(&mut b, EqualsByteString, cur)?;
+    refill_builtin(&mut b, EqualsData, cur)?;
+    refill_builtin(&mut b, EqualsInteger, cur)?;
+    refill_builtin(&mut b, EqualsString, cur)?;
+    refill_builtin(&mut b, FstPair, cur)?;
+    refill_builtin(&mut b, HeadList, cur)?;
+    refill_builtin(&mut b, IData, cur)?;
+    refill_builtin(&mut b, IfThenElse, cur)?;
+    refill_builtin(&mut b, IndexByteString, cur)?;
+    refill_builtin(&mut b, LengthOfByteString, cur)?;
+    refill_builtin(&mut b, LessThanByteString, cur)?;
+    refill_builtin(&mut b, LessThanEqualsByteString, cur)?;
+    refill_builtin(&mut b, LessThanEqualsInteger, cur)?;
+    refill_builtin(&mut b, LessThanInteger, cur)?;
+    refill_builtin(&mut b, ListData, cur)?;
+    refill_builtin(&mut b, MapData, cur)?;
+    refill_builtin(&mut b, MkCons, cur)?;
+    refill_builtin(&mut b, MkNilData, cur)?;
+    refill_builtin(&mut b, MkNilPairData, cur)?;
+    refill_builtin(&mut b, MkPairData, cur)?;
+    // [114..=123] modInteger (V3 quadratic CPU + linear_in_y memory).
+    let modi = v3_division_mod_rem(cur);
+    b.set_cost_pair(ModInteger, modi);
+    // [124..=127] multiplyInteger — V3 cpu `multiplied_sizes` / mem
+    // `added_sizes` (= reference default shape).
+    refill_builtin(&mut b, MultiplyInteger, cur)?;
+    // [128..=129] nullList.
+    refill_builtin(&mut b, NullList, cur)?;
+    // [130..=140] quotientInteger (V3 quadratic CPU + subtracted_sizes memory).
+    let quot = v3_division_div_quot(cur);
+    b.set_cost_pair(QuotientInteger, quot);
+    // [141..=150] remainderInteger (V3 quadratic CPU + linear_in_y memory).
+    let rem = v3_division_mod_rem(cur);
+    b.set_cost_pair(RemainderInteger, rem);
+    // [151..=154] serialiseData.
+    refill_builtin(&mut b, SerialiseData, cur)?;
+    // [155..=192] sha2_256 … verifySchnorrSecp256k1Signature.
+    refill_builtin(&mut b, Sha2_256, cur)?;
+    refill_builtin(&mut b, Sha3_256, cur)?;
+    refill_builtin(&mut b, SliceByteString, cur)?;
+    refill_builtin(&mut b, SndPair, cur)?;
+    refill_builtin(&mut b, SubtractInteger, cur)?;
+    refill_builtin(&mut b, TailList, cur)?;
+    refill_builtin(&mut b, Trace, cur)?;
+    refill_builtin(&mut b, UnBData, cur)?;
+    refill_builtin(&mut b, UnConstrData, cur)?;
+    refill_builtin(&mut b, UnIData, cur)?;
+    refill_builtin(&mut b, UnListData, cur)?;
+    refill_builtin(&mut b, UnMapData, cur)?;
+    refill_builtin(&mut b, VerifyEcdsaSecp256k1Signature, cur)?;
+    refill_builtin(&mut b, VerifyEd25519Signature, cur)?;
+    refill_builtin(&mut b, VerifySchnorrSecp256k1Signature, cur)?;
+    // [193..=196] cekConstrCost, cekCaseCost (Conway-specific machine steps).
+    m.constr = cur.exbudget();
+    m.case_ = cur.exbudget();
+    // [197..=234] BLS12-381 batch (alphabetical: G1 ops, G2 ops, finalVerify,
+    // millerLoop, mulMlResult). All Constant or linear_in_x shapes.
+    refill_builtin(&mut b, Bls12_381_G1_Add, cur)?;
+    refill_builtin(&mut b, Bls12_381_G1_Compress, cur)?;
+    refill_builtin(&mut b, Bls12_381_G1_Equal, cur)?;
+    refill_builtin(&mut b, Bls12_381_G1_HashToGroup, cur)?;
+    refill_builtin(&mut b, Bls12_381_G1_Neg, cur)?;
+    refill_builtin(&mut b, Bls12_381_G1_ScalarMul, cur)?;
+    refill_builtin(&mut b, Bls12_381_G1_Uncompress, cur)?;
+    refill_builtin(&mut b, Bls12_381_G2_Add, cur)?;
+    refill_builtin(&mut b, Bls12_381_G2_Compress, cur)?;
+    refill_builtin(&mut b, Bls12_381_G2_Equal, cur)?;
+    refill_builtin(&mut b, Bls12_381_G2_HashToGroup, cur)?;
+    refill_builtin(&mut b, Bls12_381_G2_Neg, cur)?;
+    refill_builtin(&mut b, Bls12_381_G2_ScalarMul, cur)?;
+    refill_builtin(&mut b, Bls12_381_G2_Uncompress, cur)?;
+    refill_builtin(&mut b, Bls12_381_FinalVerify, cur)?;
+    refill_builtin(&mut b, Bls12_381_MillerLoop, cur)?;
+    refill_builtin(&mut b, Bls12_381_MulMlResult, cur)?;
+    // [235..=240] keccak_256, blake2b_224.
+    refill_builtin(&mut b, Keccak_256, cur)?;
+    refill_builtin(&mut b, Blake2b_224, cur)?;
+    // [241..=250] integerToByteString, byteStringToInteger (special shapes).
+    let i2b = v3_integer_to_bytestring(cur);
+    b.set_cost_pair(IntegerToByteString, i2b);
+    let b2i = v3_bytestring_to_integer(cur);
+    b.set_cost_pair(ByteStringToInteger, b2i);
+
+    debug_assert_eq!(
+        cur.i, V3_PARAM_COUNT_BASE,
+        "V3 base cost-model walk must consume exactly {V3_PARAM_COUNT_BASE} params"
+    );
+    if cur.i != V3_PARAM_COUNT_BASE {
+        return Err(CostModelApplyError::WrongLength {
+            expected: V3_PARAM_COUNT_BASE,
+            got: cur.i,
+        });
+    }
+
+    // [251..=296] Plomin (PV10) bitwise batch — only present when the on-chain
+    // array advertises them. Consumed when `p.len() >= 297`; a PV11 (350) tail
+    // beyond index 296 is ignored (those builtins are not yet implemented, so
+    // they retain the reference default and a script calling one fails
+    // elsewhere rather than mis-costing).
+    if p.len() >= V3_PARAM_COUNT_BITWISE {
+        let and = v3_bitwise_logical(cur);
+        b.set_cost_pair(AndByteString, and);
+        let or = v3_bitwise_logical(cur);
+        b.set_cost_pair(OrByteString, or);
+        let xor = v3_bitwise_logical(cur);
+        b.set_cost_pair(XorByteString, xor);
+        refill_builtin(&mut b, ComplementByteString, cur)?;
+        refill_builtin(&mut b, ReadBit, cur)?;
+        refill_builtin(&mut b, WriteBits, cur)?;
+        refill_builtin(&mut b, ReplicateByte, cur)?;
+        refill_builtin(&mut b, ShiftByteString, cur)?;
+        refill_builtin(&mut b, RotateByteString, cur)?;
+        refill_builtin(&mut b, CountSetBits, cur)?;
+        refill_builtin(&mut b, FindFirstSetBit, cur)?;
+        refill_builtin(&mut b, Ripemd_160, cur)?;
+
+        debug_assert_eq!(
+            cur.i, V3_PARAM_COUNT_BITWISE,
+            "V3 bitwise batch must consume exactly {V3_PARAM_COUNT_BITWISE} params"
+        );
+        if cur.i != V3_PARAM_COUNT_BITWISE {
+            return Err(CostModelApplyError::WrongLength {
+                expected: V3_PARAM_COUNT_BITWISE,
+                got: cur.i,
+            });
+        }
+    }
+
+    Ok(AppliedCosts {
+        machine: m,
+        builtins: b,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,6 +834,166 @@ mod tests {
             .builtins
             .cost_for(BuiltinId::VerifySchnorrSecp256k1Signature, 0, 2, 0);
         assert_eq!((schnorr.cpu, schnorr.mem), (172 + 173 * 2, 174));
+    }
+
+    #[test]
+    fn v3_wrong_length_is_rejected() {
+        assert_eq!(
+            apply_v3(&[0i64; 10]).unwrap_err(),
+            CostModelApplyError::WrongLength {
+                expected: 251,
+                got: 10,
+            }
+        );
+        // Exactly 251 (PV9) succeeds; 297 (PV10 bitwise) succeeds; a longer
+        // (PV11, 350) array is accepted and the tail beyond 296 ignored.
+        assert!(apply_v3(&[0i64; 251]).is_ok());
+        assert!(apply_v3(&[0i64; 297]).is_ok());
+        assert!(apply_v3(&[0i64; 350]).is_ok());
+        // 251 < len < 297 still consumes only the base 251 (no bitwise batch).
+        assert!(apply_v3(&[0i64; 280]).is_ok());
+    }
+
+    /// Feed `p[i] = i` and pin the V3-specific index→shape mapping: the
+    /// canonical `PlutusLedgerApi.V3.ParamName` order with the changed
+    /// integer-division quadratic shapes, `cekConstr`/`cekCase` at 193–196,
+    /// the BLS batch, and integerToByteString/byteStringToInteger.
+    #[test]
+    fn v3_synthetic_index_mapping_is_canonical() {
+        let p: Vec<i64> = (0..251).collect();
+        let a = apply_v3(&p).unwrap();
+
+        // Machine costs: shared block at 17–32, Conway constr/case at 193–196.
+        assert_eq!((a.machine.apply.cpu, a.machine.apply.mem), (17, 18));
+        assert_eq!((a.machine.startup.cpu, a.machine.startup.mem), (29, 30));
+        assert_eq!((a.machine.var.cpu, a.machine.var.mem), (31, 32));
+        assert_eq!((a.machine.constr.cpu, a.machine.constr.mem), (193, 194));
+        assert_eq!((a.machine.case_.cpu, a.machine.case_.mem), (195, 196));
+
+        // divideInteger cpu: const_above_diagonal(quadratic_in_x_and_y).
+        //   constant=p49; c00=p50,c01=p51,c02=p52,c10=p53,c11=p54,c20=p55,min=p56.
+        //   below diagonal (x<y): constant=49.
+        let d_below = a.builtins.cost_for(BuiltinId::DivideInteger, 1, 2, 0);
+        assert_eq!(d_below.cpu, 49);
+        //   above/on diagonal (x>=y) at (2,1):
+        //   c00 + c10*x + c01*y + c20*x² + c11*x*y + c02*y²
+        //   = 50 + 53*2 + 51*1 + 55*4 + 54*2 + 52*1 = 587 (> min 56).
+        let d_above = a.builtins.cost_for(BuiltinId::DivideInteger, 2, 1, 0);
+        assert_eq!(d_above.cpu, 50 + 53 * 2 + 51 + 55 * 4 + 54 * 2 + 52);
+        // divideInteger mem: subtracted_sizes(intercept=p57,min=p58,slope=p59).
+        //   at (2,1): max(58, 57 + 59*(2-1)) = 116.
+        assert_eq!(d_above.mem, 116);
+
+        // modInteger cpu quad at 114–121; mem linear_in_y(p122,p123) — NO minimum.
+        let m_mod = a.builtins.cost_for(BuiltinId::ModInteger, 3, 2, 0);
+        assert_eq!(m_mod.mem, 122 + 123 * 2);
+
+        // multiplyInteger: cpu multiplied_sizes(p124,p125), mem added_sizes(p126,p127).
+        //   at (2,3): cpu = 124 + 125*(2*3); mem = 126 + 127*(2+3).
+        let mul = a.builtins.cost_for(BuiltinId::MultiplyInteger, 2, 3, 0);
+        assert_eq!((mul.cpu, mul.mem), (124 + 125 * 6, 126 + 127 * 5));
+
+        // quotientInteger mem: subtracted_sizes(intercept=p138,min=p139,slope=p140).
+        //   at (2,1): max(139, 138 + 140*(2-1)) = 278.
+        let quot = a.builtins.cost_for(BuiltinId::QuotientInteger, 2, 1, 0);
+        assert_eq!(quot.mem, 278);
+        // remainderInteger mem: linear_in_y(p149,p150) — NO minimum.
+        let rem = a.builtins.cost_for(BuiltinId::RemainderInteger, 3, 2, 0);
+        assert_eq!(rem.mem, 149 + 150 * 2);
+
+        // serialiseData: cpu linear_in_x(p151,p152), mem linear_in_x(p153,p154).
+        let ser = a.builtins.cost_for(BuiltinId::SerialiseData, 2, 0, 0);
+        assert_eq!((ser.cpu, ser.mem), (151 + 152 * 2, 153 + 154 * 2));
+
+        // BLS12-381 G1_add: constant cpu(p197) / constant mem(p198).
+        let g1 = a.builtins.cost_for(BuiltinId::Bls12_381_G1_Add, 1, 1, 0);
+        assert_eq!((g1.cpu, g1.mem), (197, 198));
+
+        // integerToByteString: cpu quadratic_in_z(c0=p241,c1=p242,c2=p243);
+        //   mem literal_in_y_or_linear_in_z(p244,p245), y==0 → linear_in_z.
+        let i2b = a.builtins.cost_for(BuiltinId::IntegerToByteString, 0, 0, 2);
+        assert_eq!(i2b.cpu, 241 + 242 * 2 + 243 * 4);
+        assert_eq!(i2b.mem, 244 + 245 * 2);
+
+        // byteStringToInteger: cpu quadratic_in_y(c0=p246,c1=p247,c2=p248);
+        //   mem linear_in_y(p249,p250).
+        let b2i = a.builtins.cost_for(BuiltinId::ByteStringToInteger, 0, 2, 0);
+        assert_eq!(b2i.cpu, 246 + 247 * 2 + 248 * 4);
+        assert_eq!(b2i.mem, 249 + 250 * 2);
+    }
+
+    /// With the Plomin (PV10, 297-param) batch present, the bitwise builtins
+    /// land at 251–296 with their `linear_in_y_and_z` / `linear_in_max_yz`
+    /// shapes.
+    #[test]
+    fn v3_synthetic_bitwise_batch_mapping() {
+        let p: Vec<i64> = (0..297).collect();
+        let a = apply_v3(&p).unwrap();
+
+        // andByteString: cpu linear_in_y_and_z(intercept=p251,slope1=p252,
+        //   slope2=p253) at (y=2,z=3) = 251 + 252*2 + 253*3; mem
+        //   linear_in_max_yz(p254,p255) at max(2,3)=3 = 254 + 255*3.
+        let and = a.builtins.cost_for(BuiltinId::AndByteString, 0, 2, 3);
+        assert_eq!(and.cpu, 251 + 252 * 2 + 253 * 3);
+        assert_eq!(and.mem, 254 + 255 * 3);
+
+        // ripemd_160 (last bitwise builtin): cpu linear_in_x(p294,p295),
+        //   mem constant(p296).
+        let rip = a.builtins.cost_for(BuiltinId::Ripemd_160, 2, 0, 0);
+        assert_eq!((rip.cpu, rip.mem), (294 + 295 * 2, 296));
+    }
+
+    /// The actual mainnet PlutusV3 cost model (297 params, Plomin/PV10),
+    /// captured from Koios `epoch_params`. Validates `apply_v3` against a real
+    /// on-chain array end-to-end: it must apply cleanly and the V3-specific
+    /// builtins must evaluate to the values implied by the real coefficients.
+    #[test]
+    fn mainnet_v3_reference_costs() {
+        let raw = include_str!("../tests/fixtures/mainnet_plutus_v3_costmodel.json");
+        let p: Vec<i64> = raw
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .split(',')
+            .map(|s| s.trim().parse::<i64>().expect("int"))
+            .collect();
+        assert_eq!(p.len(), 297, "real mainnet V3 model is 297 params (PV10)");
+        let a = apply_v3(&p).unwrap();
+
+        // cekConstr / cekCase machine costs (193..=196) = (16000,100).
+        assert_eq!((a.machine.constr.cpu, a.machine.constr.mem), (16000, 100));
+        assert_eq!((a.machine.case_.cpu, a.machine.case_.mem), (16000, 100));
+
+        // divideInteger [49..=59] = 85848,123203,7305,-900,1716,549,57,85848,0,1,1.
+        //   below diagonal (x<y) → constant 85848.
+        let d_below = a.builtins.cost_for(BuiltinId::DivideInteger, 1, 2, 0);
+        assert_eq!(d_below.cpu, 85848);
+        //   above diagonal at (2,1): c00 + c10·2 + c01·1 + c20·4 + c11·2 + c02·1
+        //     = 123203 + 1716*2 + 7305 + 57*4 + 549*2 + (-900) = 134366.
+        let d_above = a.builtins.cost_for(BuiltinId::DivideInteger, 2, 1, 0);
+        assert_eq!(
+            d_above.cpu,
+            123203 + 1716 * 2 + 7305 + 57 * 4 + 549 * 2 - 900
+        );
+        //   mem subtracted_sizes(intercept=0,min=1,slope=1) at (2,1): max(1,1)=1.
+        assert_eq!(d_above.mem, 1);
+
+        // multiplyInteger [124..=127] = 90434,519,0,1 (multiplied_sizes/added_sizes).
+        //   at (2,3): cpu = 90434 + 519*(2*3); mem = 0 + 1*(2+3).
+        let mul = a.builtins.cost_for(BuiltinId::MultiplyInteger, 2, 3, 0);
+        assert_eq!((mul.cpu, mul.mem), (90434 + 519 * 6, 5));
+
+        // integerToByteString [241..=245] = 1293828,28716,63,0,1.
+        //   cpu quadratic_in_z at z=2: 1293828 + 28716*2 + 63*4; mem (y=0) 0+1*2.
+        let i2b = a.builtins.cost_for(BuiltinId::IntegerToByteString, 0, 0, 2);
+        assert_eq!(i2b.cpu, 1293828 + 28716 * 2 + 63 * 4);
+        assert_eq!(i2b.mem, 2);
+
+        // andByteString [251..=255] = 100181,726,719,0,1 (PV10 bitwise batch).
+        //   cpu linear_yz at (y=2,z=3): 100181 + 726*2 + 719*3; mem max(2,3) → 3.
+        let and = a.builtins.cost_for(BuiltinId::AndByteString, 0, 2, 3);
+        assert_eq!(and.cpu, 100181 + 726 * 2 + 719 * 3);
+        assert_eq!(and.mem, 3);
     }
 
     /// The actual mainnet Alonzo PlutusV1 cost model (the 166 values from
