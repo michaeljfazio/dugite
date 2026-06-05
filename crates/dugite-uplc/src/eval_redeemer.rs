@@ -248,10 +248,24 @@ fn resolve_applied_costs(
                 }
             }
         }
-        // PlutusV2/V3 byte-exact appliers land in follow-up commits; until
-        // then these fall back to the latest reference model (the prior
-        // behaviour). No V2/V3 scripts exist before the Babbage/Conway eras.
-        ScriptLanguage::PlutusV2 | ScriptLanguage::PlutusV3 => None,
+        ScriptLanguage::PlutusV2 => {
+            let params = cm.plutus_v2.as_deref()?;
+            match crate::cost_apply::apply_v2(params) {
+                Ok(applied) => Some(applied),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "PlutusV2 cost model could not be applied; \
+                         falling back to reference model"
+                    );
+                    None
+                }
+            }
+        }
+        // PlutusV3 byte-exact applier lands in a follow-up (251/350-param
+        // Conway ordering with the changed integer-division shapes); until
+        // then it falls back to the latest reference model.
+        ScriptLanguage::PlutusV3 => None,
     }
 }
 

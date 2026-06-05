@@ -57,6 +57,14 @@ use crate::term::BuiltinId;
 /// Number of parameters in a PlutusV1 cost model (`ParamName` enum size).
 pub const V1_PARAM_COUNT: usize = 166;
 
+/// Number of parameters in a PlutusV2 cost model at the Vasil/Babbage
+/// deployment (`PlutusLedgerApi.V2.ParamName`): the 166 V1 params plus the
+/// nine added by `serialiseData` (4), `verifyEcdsaSecp256k1Signature` (2),
+/// and `verifySchnorrSecp256k1Signature` (3). Per `tagWithParamNames`'
+/// `zip`-truncation rule, a longer on-chain array (Plomin-era V2) is
+/// accepted and the trailing params are ignored.
+pub const V2_PARAM_COUNT: usize = 175;
+
 /// A cost model resolved from on-chain parameters, ready to drive a CEK run.
 #[derive(Debug, Clone)]
 pub struct AppliedCosts {
@@ -291,6 +299,132 @@ pub fn apply_v1(p: &[i64]) -> Result<AppliedCosts, CostModelApplyError> {
     })
 }
 
+/// Apply a flat PlutusV2 cost-model array (Vasil/Babbage: 175 entries,
+/// canonical `PlutusLedgerApi.V2.ParamName` order) to a fresh
+/// [`AppliedCosts`].
+///
+/// V2 is V1's walk with three builtins added at their alphabetical
+/// positions (none of the 163 shared builtins changed shape between V1 and
+/// V2, confirmed against `IntersectMBO/plutus`):
+///   * `serialiseData` (linear_in_x / linear_in_x) — between
+///     `remainderInteger` and `sha2_256`;
+///   * `verifyEcdsaSecp256k1Signature` (constant / constant) — between
+///     `unMapData` and `verifyEd25519Signature`;
+///   * `verifySchnorrSecp256k1Signature` (linear_in_y / constant) — after
+///     `verifyEd25519Signature`.
+///
+/// A longer on-chain array (Plomin-era V2 appends `integerToByteString`,
+/// the bitwise group, …) is accepted: only the leading 175 params are
+/// consumed and the rest ignored, exactly as `tagWithParamNames`' `zip`
+/// truncates for a node whose `ParamName` enum predates those additions.
+/// Builtins beyond index 174 therefore retain the reference default — a
+/// no-op for any V2 script that does not call a Plomin-era builtin.
+pub fn apply_v2(p: &[i64]) -> Result<AppliedCosts, CostModelApplyError> {
+    if p.len() < V2_PARAM_COUNT {
+        return Err(CostModelApplyError::WrongLength {
+            expected: V2_PARAM_COUNT,
+            got: p.len(),
+        });
+    }
+    use BuiltinId::*;
+    let mut b = BuiltinCosts::DEFAULT.clone();
+    let mut m = MachineCosts::DEFAULT;
+    let cur = &mut Cursor { p, i: 0 };
+
+    // [0..=16] addInteger, appendByteString, appendString, bData, blake2b_256
+    refill_builtin(&mut b, AddInteger, cur)?;
+    refill_builtin(&mut b, AppendByteString, cur)?;
+    refill_builtin(&mut b, AppendString, cur)?;
+    refill_builtin(&mut b, BData, cur)?;
+    refill_builtin(&mut b, Blake2b_256, cur)?;
+
+    // [17..=32] CEK machine-step costs, alphabetical: apply, builtin, const,
+    // delay, force, lam, startup, var — each (exBudgetCPU, exBudgetMemory).
+    m.apply = cur.exbudget();
+    m.builtin = cur.exbudget();
+    m.constant = cur.exbudget();
+    m.delay = cur.exbudget();
+    m.force = cur.exbudget();
+    m.lam = cur.exbudget();
+    m.startup = cur.exbudget();
+    m.var = cur.exbudget();
+
+    // [33..] chooseData … verifySchnorrSecp256k1Signature, alphabetical.
+    refill_builtin(&mut b, ChooseData, cur)?;
+    refill_builtin(&mut b, ChooseList, cur)?;
+    refill_builtin(&mut b, ChooseUnit, cur)?;
+    refill_builtin(&mut b, ConsByteString, cur)?;
+    refill_builtin(&mut b, ConstrData, cur)?;
+    refill_builtin(&mut b, DecodeUtf8, cur)?;
+    b.set_cost_pair(DivideInteger, v1_division(cur));
+    refill_builtin(&mut b, EncodeUtf8, cur)?;
+    refill_builtin(&mut b, EqualsByteString, cur)?;
+    refill_builtin(&mut b, EqualsData, cur)?;
+    refill_builtin(&mut b, EqualsInteger, cur)?;
+    refill_builtin(&mut b, EqualsString, cur)?;
+    refill_builtin(&mut b, FstPair, cur)?;
+    refill_builtin(&mut b, HeadList, cur)?;
+    refill_builtin(&mut b, IData, cur)?;
+    refill_builtin(&mut b, IfThenElse, cur)?;
+    refill_builtin(&mut b, IndexByteString, cur)?;
+    refill_builtin(&mut b, LengthOfByteString, cur)?;
+    refill_builtin(&mut b, LessThanByteString, cur)?;
+    refill_builtin(&mut b, LessThanEqualsByteString, cur)?;
+    refill_builtin(&mut b, LessThanEqualsInteger, cur)?;
+    refill_builtin(&mut b, LessThanInteger, cur)?;
+    refill_builtin(&mut b, ListData, cur)?;
+    refill_builtin(&mut b, MapData, cur)?;
+    refill_builtin(&mut b, MkCons, cur)?;
+    refill_builtin(&mut b, MkNilData, cur)?;
+    refill_builtin(&mut b, MkNilPairData, cur)?;
+    refill_builtin(&mut b, MkPairData, cur)?;
+    b.set_cost_pair(ModInteger, v1_division(cur));
+    // multiplyInteger — V2 cpu+mem are both `added_sizes` (same as V1).
+    {
+        let cpu = CostingFun::AddedSizes(cur.linear());
+        let mem = CostingFun::AddedSizes(cur.linear());
+        b.set_cost_pair(MultiplyInteger, CostPair { cpu, mem });
+    }
+    refill_builtin(&mut b, NullList, cur)?;
+    b.set_cost_pair(QuotientInteger, v1_division(cur));
+    b.set_cost_pair(RemainderInteger, v1_division(cur));
+    // serialiseData — new in V2, alphabetically before sha2_256.
+    refill_builtin(&mut b, SerialiseData, cur)?;
+    refill_builtin(&mut b, Sha2_256, cur)?;
+    refill_builtin(&mut b, Sha3_256, cur)?;
+    refill_builtin(&mut b, SliceByteString, cur)?;
+    refill_builtin(&mut b, SndPair, cur)?;
+    refill_builtin(&mut b, SubtractInteger, cur)?;
+    refill_builtin(&mut b, TailList, cur)?;
+    refill_builtin(&mut b, Trace, cur)?;
+    refill_builtin(&mut b, UnBData, cur)?;
+    refill_builtin(&mut b, UnConstrData, cur)?;
+    refill_builtin(&mut b, UnIData, cur)?;
+    refill_builtin(&mut b, UnListData, cur)?;
+    refill_builtin(&mut b, UnMapData, cur)?;
+    // verifyEcdsaSecp256k1Signature — new in V2, before verifyEd25519Signature.
+    refill_builtin(&mut b, VerifyEcdsaSecp256k1Signature, cur)?;
+    refill_builtin(&mut b, VerifyEd25519Signature, cur)?;
+    // verifySchnorrSecp256k1Signature — new in V2, last param block.
+    refill_builtin(&mut b, VerifySchnorrSecp256k1Signature, cur)?;
+
+    debug_assert_eq!(
+        cur.i, V2_PARAM_COUNT,
+        "V2 cost-model walk must consume exactly {V2_PARAM_COUNT} params"
+    );
+    if cur.i != V2_PARAM_COUNT {
+        return Err(CostModelApplyError::WrongLength {
+            expected: V2_PARAM_COUNT,
+            got: cur.i,
+        });
+    }
+
+    Ok(AppliedCosts {
+        machine: m,
+        builtins: b,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,6 +487,58 @@ mod tests {
             .builtins
             .cost_for(BuiltinId::VerifyEd25519Signature, 0, 2, 0);
         assert_eq!((vfy.cpu, vfy.mem), (163 + 164 * 2, 165));
+    }
+
+    #[test]
+    fn v2_wrong_length_is_rejected() {
+        assert_eq!(
+            apply_v2(&[0i64; 10]).unwrap_err(),
+            CostModelApplyError::WrongLength {
+                expected: 175,
+                got: 10,
+            }
+        );
+        // Exactly 175 succeeds; a longer (Plomin-era) array is truncated.
+        assert!(apply_v2(&[0i64; 175]).is_ok());
+        assert!(apply_v2(&[0i64; 332]).is_ok());
+    }
+
+    /// Feed `p[i] = i` and pin the V2-specific index→shape mapping: the
+    /// shared builtins keep their V1 positions through `decodeUtf8`, then the
+    /// three V2-new builtins land at their canonical alphabetical slots
+    /// (serialiseData 133–136, verifyEcdsa 167–168, verifySchnorr 172–174).
+    #[test]
+    fn v2_synthetic_index_mapping_is_canonical() {
+        let p: Vec<i64> = (0..175).collect();
+        let a = apply_v2(&p).unwrap();
+
+        // Shared machine costs sit at the same indices as V1.
+        assert_eq!((a.machine.apply.cpu, a.machine.apply.mem), (17, 18));
+        assert_eq!((a.machine.startup.cpu, a.machine.startup.mem), (29, 30));
+        assert_eq!((a.machine.var.cpu, a.machine.var.mem), (31, 32));
+
+        // serialiseData: cpu linear_in_x(p133,p134), mem linear_in_x(p135,p136).
+        //   at x=2: cpu = 133 + 134*2; mem = 135 + 136*2.
+        let ser = a.builtins.cost_for(BuiltinId::SerialiseData, 2, 0, 0);
+        assert_eq!((ser.cpu, ser.mem), (133 + 134 * 2, 135 + 136 * 2));
+
+        // verifyEcdsaSecp256k1Signature: cpu const(p167), mem const(p168).
+        let ecdsa = a
+            .builtins
+            .cost_for(BuiltinId::VerifyEcdsaSecp256k1Signature, 1, 1, 1);
+        assert_eq!((ecdsa.cpu, ecdsa.mem), (167, 168));
+
+        // verifyEd25519Signature: cpu linear_in_y(p169,p170), mem const(p171).
+        let ed = a
+            .builtins
+            .cost_for(BuiltinId::VerifyEd25519Signature, 0, 2, 0);
+        assert_eq!((ed.cpu, ed.mem), (169 + 170 * 2, 171));
+
+        // verifySchnorrSecp256k1Signature: cpu linear_in_y(p172,p173), mem const(p174).
+        let schnorr = a
+            .builtins
+            .cost_for(BuiltinId::VerifySchnorrSecp256k1Signature, 0, 2, 0);
+        assert_eq!((schnorr.cpu, schnorr.mem), (172 + 173 * 2, 174));
     }
 
     /// The actual mainnet Alonzo PlutusV1 cost model (the 166 values from
