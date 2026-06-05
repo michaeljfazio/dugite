@@ -126,6 +126,7 @@ fn render_header(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     } else {
         "Praos"
     };
+    let utxo_backend = app.utxo_backend_label();
 
     let is_offline = app.node_status == NodeStatus::Offline;
 
@@ -238,6 +239,10 @@ fn render_header(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         // Consensus mode (Praos vs Ouroboros Genesis).
         Span::styled("Mode ", Style::default().fg(theme.muted)),
         Span::styled(consensus_mode, Style::default().fg(theme.info)),
+        sep_spaced(theme),
+        // UTxO storage backend (on-disk LSM vs in-memory).
+        Span::styled("UTxO ", Style::default().fg(theme.muted)),
+        Span::styled(utxo_backend, Style::default().fg(theme.info)),
         sep_spaced(theme),
         // Tip age with colored indicator icon.  Bold when the state signals
         // a problem (Stale or Stuck) to draw the operator's attention.

@@ -77,6 +77,7 @@ pub fn eval_resolved_redeemer(
     slot_config: &SlotConfig,
     initial_budget: ExBudget,
     cost_models: Option<&CostModels>,
+    major_pv: u32,
 ) -> Result<RedeemerEvalOutcome, PhaseTwoError> {
     // 1. Decode script bytes → typed Term.
     //
@@ -151,7 +152,7 @@ pub fn eval_resolved_redeemer(
     // so callers (dugite-ledger Phase-2 error path and the CLI EvalTx
     // response) can mirror that behaviour.
     let mut trace_log: Vec<String> = Vec::new();
-    let mut tracker = match resolve_applied_costs(cost_models, r.language) {
+    let mut tracker = match resolve_applied_costs(cost_models, r.language, major_pv) {
         Some(applied) => BudgetTracker::with_applied(initial_budget, applied),
         None => BudgetTracker::new(initial_budget),
     };
@@ -231,12 +232,13 @@ fn data_const_term(d: crate::data::Data) -> Term {
 fn resolve_applied_costs(
     cost_models: Option<&CostModels>,
     language: ScriptLanguage,
+    major_pv: u32,
 ) -> Option<crate::cost_apply::AppliedCosts> {
     let cm = cost_models?;
     match language {
         ScriptLanguage::PlutusV1 => {
             let params = cm.plutus_v1.as_deref()?;
-            match crate::cost_apply::apply_v1(params) {
+            match crate::cost_apply::apply_v1(params, major_pv) {
                 Ok(applied) => Some(applied),
                 Err(e) => {
                     tracing::warn!(
@@ -248,12 +250,57 @@ fn resolve_applied_costs(
                 }
             }
         }
-        // PlutusV2/V3 byte-exact appliers land in follow-up commits; until
-        // then these fall back to the latest reference model (the prior
-        // behaviour). No V2/V3 scripts exist before the Babbage/Conway eras.
-        ScriptLanguage::PlutusV2 | ScriptLanguage::PlutusV3 => None,
+        ScriptLanguage::PlutusV2 => {
+            let params = cm.plutus_v2.as_deref()?;
+            match crate::cost_apply::apply_v2(params, major_pv) {
+                Ok(applied) => Some(applied),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "PlutusV2 cost model could not be applied; \
+                         falling back to reference model"
+                    );
+                    None
+                }
+            }
+        }
+        ScriptLanguage::PlutusV3 => {
+            let params = cm.plutus_v3.as_deref()?;
+            match crate::cost_apply::apply_v3(params) {
+                Ok(applied) => Some(applied),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "PlutusV3 cost model could not be applied; \
+                         falling back to reference model"
+                    );
+                    None
+                }
+            }
+        }
     }
 }
+
+// Per-thread memoization of `script-bytes -> decoded Program`.
+//
+// Flat decoding (`flat::term::decode_term_inner`) is the single dominant
+// apply-path cost on Plutus-dense mainnet blocks (profiling: ~1350/16800
+// apply samples, allocation-bound), and the same popular validators recur
+// across thousands of transactions — each carrying the full script in its
+// witness. Decoding is a *pure, deterministic* function of the bytes, so
+// memoizing it changes nothing observable (the `apply_bench` regression
+// fingerprint must stay identical). Keyed by the exact input bytes, so there
+// is no weak-hash collision risk. `Rc<Term>`-based `Program` is not `Send`,
+// hence a `thread_local` cache (each apply/rayon thread keeps its own).
+thread_local! {
+    static SCRIPT_DECODE_CACHE: std::cell::RefCell<std::collections::HashMap<Vec<u8>, Program>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Bound on distinct cached scripts per thread (popular mainnet validators
+/// number in the hundreds; the cap is a memory backstop, not a working-set
+/// limit). On overflow the cache is cleared and repopulated.
+const SCRIPT_DECODE_CACHE_CAP: usize = 4096;
 
 /// Decode the script bytes the wire / reference-input provides.
 ///
@@ -265,7 +312,26 @@ fn resolve_applied_costs(
 /// If the outer byte looks like a CBOR byte-string (major type 2) and
 /// `from_cbor` fails, we propagate that error directly — the bytes are
 /// structurally CBOR and it makes no sense to re-attempt as raw flat.
+///
+/// The decode is memoized per thread (see [`SCRIPT_DECODE_CACHE`]) — a pure
+/// performance optimisation that does not change the decoded program.
 fn decode_script_bytes(bytes: &[u8]) -> Result<Program, PhaseTwoError> {
+    if let Some(prog) = SCRIPT_DECODE_CACHE.with(|c| c.borrow().get(bytes).cloned()) {
+        return Ok(prog);
+    }
+    let prog = decode_script_bytes_uncached(bytes)?;
+    SCRIPT_DECODE_CACHE.with(|c| {
+        let mut m = c.borrow_mut();
+        if m.len() >= SCRIPT_DECODE_CACHE_CAP {
+            m.clear();
+        }
+        m.insert(bytes.to_vec(), prog.clone());
+    });
+    Ok(prog)
+}
+
+/// The uncached decode (the actual flat/CBOR deserialization).
+fn decode_script_bytes_uncached(bytes: &[u8]) -> Result<Program, PhaseTwoError> {
     // CBOR major-type 2 (byte-string) = 0x40-0x5f (short) or 0x58/0x59/0x5a/0x5b (extended).
     let looks_like_cbor_bytes = bytes.first().is_some_and(|&b| b >> 5 == 2);
 
@@ -531,6 +597,7 @@ mod tests {
             &slot_cfg(),
             budget,
             None,
+            9,
         )
         .expect("V3 unit script runs");
         assert!(matches!(outcome.result_term, Term::Const(Constant::Unit)));
@@ -792,7 +859,7 @@ mod tests {
             cpu: 100_000_000,
             mem: 1_000_000,
         };
-        let outcome = eval_resolved_redeemer(&tx, &resolved, &r, &slot_cfg(), budget, None)
+        let outcome = eval_resolved_redeemer(&tx, &resolved, &r, &slot_cfg(), budget, None, 9)
             .expect("trace+unit script should succeed");
         assert_eq!(
             outcome.logs,
@@ -809,7 +876,7 @@ mod tests {
             cpu: 100_000_000,
             mem: 1_000_000,
         };
-        let outcome = eval_resolved_redeemer(&tx, &resolved, &r, &slot_cfg(), budget, None)
+        let outcome = eval_resolved_redeemer(&tx, &resolved, &r, &slot_cfg(), budget, None, 9)
             .expect("triple-trace script should succeed");
         assert_eq!(
             outcome.logs,
@@ -826,7 +893,7 @@ mod tests {
             cpu: 100_000_000,
             mem: 1_000_000,
         };
-        let err = eval_resolved_redeemer(&tx, &resolved, &r, &slot_cfg(), budget, None)
+        let err = eval_resolved_redeemer(&tx, &resolved, &r, &slot_cfg(), budget, None, 9)
             .expect_err("trace+error script must fail");
         // The error variant must carry the trace log.
         match err {

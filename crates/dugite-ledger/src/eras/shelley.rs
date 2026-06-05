@@ -139,6 +139,11 @@ fn return_redeem_addrs_to_reserves(utxo: &mut UtxoSubState, epochs: &mut EpochSu
     // `<+>` is `Coin` addition (saturating).
     epochs.reserves = Lovelace(epochs.reserves.0.saturating_add(redeem_coin));
 
+    // Record the AVVM return so the SAME-boundary reward update is computed from
+    // PRE-AVVM reserves (Haskell `nesRu` was pulsed in the previous epoch, before
+    // the era-translation AVVM return). See `EpochSubState::pending_avvm_return`.
+    epochs.pending_avvm_return = redeem_coin;
+
     let redeem_ada = redeem_coin / 1_000_000;
     info!(
         redeem_utxo_count = redeem_count,
@@ -363,6 +368,18 @@ impl EraRules for ShelleyRules {
                 .iter()
                 .map(|(k, v)| (*k, *v))
                 .collect();
+            // #11/AVVM: at the Shelley→Allegra boundary the era translation already
+            // added the unredeemed-AVVM coin to `epochs.reserves` (on_era_transition
+            // runs before this). Haskell computed `nesRu` from PRE-AVVM reserves, so
+            // compute the reward update from reserves with that return removed (then
+            // it is applied to the post-AVVM reserves below). `take` resets to 0 so
+            // only this first boundary is adjusted. Non-AVVM boundaries see 0.
+            let reward_reserves = Lovelace(
+                epochs
+                    .reserves
+                    .0
+                    .saturating_sub(std::mem::take(&mut epochs.pending_avvm_return)),
+            );
             let rupd = crate::compute_reward_update(
                 rupd_pp,
                 &epochs.prev_d,
@@ -370,9 +387,12 @@ impl EraRules for ShelleyRules {
                 go_ref,
                 &epochs.snapshots.bprev_blocks_by_pool,
                 epochs.snapshots.ss_fee,
-                epochs.reserves,
+                reward_reserves,
                 epochs.treasury,
                 &reward_accounts_std,
+                // #11: pv≤6 prefilter uses the startStep-frozen fvAddrsRew set,
+                // not boundary-time accounts (None ⇒ fall back to boundary).
+                epochs.rupd_addrs_rew.as_deref(),
                 ctx.epoch_length,
                 ctx.shelley_transition_epoch,
                 ctx.max_lovelace_supply,
@@ -384,6 +404,13 @@ impl EraRules for ShelleyRules {
             // set at runtime.  Only fires when GO is non-empty.
             #[cfg(feature = "reward-debug-dump")]
             if let Some(go) = go_ref {
+                // `certs.reward_accounts` is an imbl map (k-window sharing); the
+                // debug dumper takes a plain `&HashMap`, so collect a snapshot.
+                let ra_std: std::collections::HashMap<Hash32, Lovelace> = certs
+                    .reward_accounts
+                    .iter()
+                    .map(|(k, v)| (*k, *v))
+                    .collect();
                 crate::state::reward_debug::maybe_dump(
                     ctx.current_epoch.0,
                     new_epoch.0,
@@ -395,7 +422,7 @@ impl EraRules for ShelleyRules {
                     epochs.snapshots.ss_fee,
                     go,
                     &epochs.snapshots.bprev_blocks_by_pool,
-                    &certs.reward_accounts,
+                    &ra_std,
                     &rupd,
                 );
             }
@@ -1226,6 +1253,8 @@ mod tests {
                 numerator: 1,
                 denominator: 1,
             },
+            rupd_addrs_rew: None,
+            pending_avvm_return: 0,
         }
     }
 

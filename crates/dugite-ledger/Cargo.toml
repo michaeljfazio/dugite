@@ -11,7 +11,7 @@ dugite-serialization = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true, optional = true }
+serde_json = { workspace = true }
 num-bigint = { workspace = true }
 num-rational = { workspace = true }
 num-traits = { workspace = true }
@@ -33,14 +33,14 @@ parallel-verification = ["rayon"]
 # snapshot, reward-account balances, and computed RUPD credits.  Used to
 # bisect path-dependent reward divergences (see issue #438 / #471).
 # Off by default — production builds incur zero overhead.
-reward-debug-dump = ["dep:serde_json"]
+reward-debug-dump = []
 # Compile in the per-epoch-boundary FULL ledger-state dumper.
 # When this feature is enabled, setting `DUGITE_EPOCH_STATE_DUMP=<dir>` at
 # runtime writes one JSON file per epoch boundary capturing nonce, UTxO,
 # stake-snapshot, pool, reward, and governance state for cross-validation
 # against `cardano-cli debug log-epoch-state` (tasks #21/#22/#23).
 # Off by default — production builds incur zero overhead.
-epoch-state-debug = ["dep:serde_json"]
+epoch-state-debug = []
 
 [dev-dependencies]
 serde_json = { workspace = true }

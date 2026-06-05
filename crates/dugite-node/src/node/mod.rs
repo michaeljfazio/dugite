@@ -630,6 +630,46 @@ pub(crate) struct GsmActorParts {
 // ─── Node impl: new() ────────────────────────────────────────────────────────
 
 impl Node {
+    /// Load a ledger snapshot and enforce the backend-tag guard before the
+    /// node commits to it. Mirrors Haskell's `MetadataBackendMismatch`: a
+    /// snapshot written with a *different* UTxO backend is rejected (→ `Err`)
+    /// so the caller falls through to the from-chain rebuild rather than
+    /// loading an empty or structurally-incompatible UTxO set. A missing
+    /// sidecar (pre-meta snapshots, e.g. an existing `db-mainnet`) is handled
+    /// by backend inference and loads normally.
+    fn load_snapshot_with_backend_guard(
+        snapshot_path: &std::path::Path,
+        database_path: &std::path::Path,
+        configured: dugite_ledger::SnapshotBackend,
+    ) -> std::result::Result<LedgerState, String> {
+        let state = LedgerState::load_snapshot(snapshot_path).map_err(|e| e.to_string())?;
+        match dugite_ledger::check_snapshot_backend_match(
+            snapshot_path,
+            &state,
+            database_path,
+            configured,
+        ) {
+            dugite_ledger::BackendCheckResult::Ok => Ok(state),
+            dugite_ledger::BackendCheckResult::Mismatch {
+                snapshot_backend,
+                configured_backend,
+            } => {
+                warn!(
+                    snapshot_backend = snapshot_backend.as_tag(),
+                    configured_backend = configured_backend.as_tag(),
+                    "Ledger snapshot was created with a different UTxO backend — ignoring it \
+                     and rebuilding from chain. Run the snapshot converter to migrate without \
+                     a replay."
+                );
+                Err(format!(
+                    "snapshot backend `{}` does not match configured backend `{}`",
+                    snapshot_backend.as_tag(),
+                    configured_backend.as_tag()
+                ))
+            }
+        }
+    }
+
     pub fn new(args: NodeArgs) -> Result<Self> {
         let mut protocol_params = ProtocolParameters::mainnet_defaults();
 
@@ -903,9 +943,15 @@ impl Node {
             }
         }
 
-        // Try to load existing ledger snapshot
+        // Try to load existing ledger snapshot (with the backend-mismatch
+        // guard — a snapshot tagged for a different UTxO backend is rejected
+        // here and the node rebuilds from chain).
         let mut ledger = if snapshot_path.exists() {
-            match LedgerState::load_snapshot(&snapshot_path) {
+            match Self::load_snapshot_with_backend_guard(
+                &snapshot_path,
+                &args.database_path,
+                epoch::snapshot_backend_of(args.storage_config.utxo.backend),
+            ) {
                 Ok(mut state) => {
                     // Re-apply genesis config in case it changed
                     let ste = epoch::shelley_transition_epoch_for_magic(network_magic);
@@ -1803,6 +1849,10 @@ impl Node {
             let m = crate::metrics::NodeMetrics::new();
             m.set_network_magic(network_magic);
             m.set_consensus_mode_genesis(args.consensus_mode == "genesis");
+            m.set_utxo_backend(match args.storage_config.utxo.backend {
+                dugite_storage::UtxoBackend::Lsm => "lsm",
+                dugite_storage::UtxoBackend::InMemory => "in-memory",
+            });
             m.set_compat_metrics(args.compat_metrics);
             m.liveness_threshold_secs.store(
                 args.liveness_threshold_secs,
@@ -2166,6 +2216,52 @@ impl Node {
         if *shutdown_rx.borrow() {
             info!("Shutdown requested during replay, exiting");
             return Ok(());
+        }
+
+        // Reseed the consensus validator's opcert counters from the post-replay
+        // ledger state.
+        //
+        // During replay (both chunk-file and LSM paths) every block is applied
+        // with `BlockValidationMode::ApplyOnly`, which skips
+        // `validate_header_full` and therefore does NOT call
+        // `check_opcert_counter`. As a result `self.consensus.opcert_counters`
+        // stays frozen at the snapshot values while `ls.consensus.opcert_counters`
+        // is updated on every applied block via `compute_shelley_nonce`.
+        //
+        // Without this reseed, the live-block validation that follows uses the
+        // stale snapshot counters: a pool that rotated its opcert during the
+        // replayed range (counter M→N, N>M+1) appears to "over-increment" even
+        // though the intermediate block with counter M+1 was applied and accepted.
+        // The false-positive `CounterOverIncrementedOCERT` then marks the block
+        // invalid, poisons the entire downstream chain in the InvalidBlockCache,
+        // and stalls the node permanently (observed at preprod block 718744,
+        // slot 22975227: got=31, last_seen=29).
+        //
+        // Fix: take the per-pool max of (snapshot value, ledger post-replay value)
+        // for every pool, mirroring the `merge_opcert_counters_from_praos` logic
+        // already used in `replay_from_lsm`.
+        {
+            let ls = self.ledger_state.read().await;
+            let ledger_counters = &ls.consensus.opcert_counters;
+            let praos_counters = self.consensus.opcert_counters().clone();
+            // Build the merged map: per-pool max of both sources.
+            let mut merged = praos_counters;
+            for (pool_id, &ledger_seq) in ledger_counters {
+                merged
+                    .entry(*pool_id)
+                    .and_modify(|cur| {
+                        if ledger_seq > *cur {
+                            *cur = ledger_seq;
+                        }
+                    })
+                    .or_insert(ledger_seq);
+            }
+            let count = merged.len();
+            self.consensus.set_opcert_counters(merged);
+            info!(
+                count,
+                "Reseeded consensus opcert counters from post-replay ledger state"
+            );
         }
 
         // Enable strict verification (full crypto checks for new blocks).
@@ -5173,6 +5269,12 @@ impl Node {
                 slot = block_slot.0,
                 block = block_number.0,
                 hash = %block_hash.to_hex(),
+                // Era + protocol_version + is_tpraos help diagnose hard-fork
+                // transition issues (e.g. a PV7 block still in a TPraos/Alonzo
+                // structure at the Vasil boundary — see BlockHeader::is_tpraos).
+                hfc_era = %block.era,
+                proto_major = block.header.protocol_version.major,
+                is_tpraos = block.header.is_tpraos(),
                 "Praos header validation FAILED — rejecting peer block: {reason}"
             );
             self.metrics

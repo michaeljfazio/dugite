@@ -10,7 +10,10 @@ use dugite_primitives::transaction::{
     Anchor, DRep, GovAction, GovActionId, ProposalProcedure, Rational, Vote, Voter, VotingProcedure,
 };
 use dugite_primitives::value::Lovelace;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use imbl::HashMap as ImblHashMap;
+use imbl::OrdMap as ImblOrdMap;
+use imbl::OrdSet as ImblOrdSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
 
@@ -719,16 +722,16 @@ impl LedgerState {
         state: &ProposalState,
         _total_drep_stake: u64,
         total_spo_stake: u64,
-        drep_power_cache: &HashMap<Hash32, u64>,
+        drep_power_cache: &ImblHashMap<Hash32, u64>,
         no_confidence_stake: u64,
-        votes_by_action: &BTreeMap<GovActionId, Vec<(Voter, VotingProcedure)>>,
-        committee_hot_keys: &HashMap<Hash32, Hash32>,
-        committee_expiration: &HashMap<Hash32, EpochNo>,
-        committee_resigned: &HashMap<Hash32, Option<Anchor>>,
+        votes_by_action: &ImblOrdMap<GovActionId, Vec<(Voter, VotingProcedure)>>,
+        committee_hot_keys: &ImblHashMap<Hash32, Hash32>,
+        committee_expiration: &ImblHashMap<Hash32, EpochNo>,
+        committee_resigned: &ImblHashMap<Hash32, Option<Anchor>>,
         committee_threshold: &Option<Rational>,
         remaining_treasury: u64,
         pool_stake_override: Option<&HashMap<Hash28, Lovelace>>,
-        vote_delegations_override: Option<&HashMap<Hash32, DRep>>,
+        vote_delegations_override: Option<&ImblHashMap<Hash32, DRep>>,
     ) -> bool {
         // Count votes by voter type (uses pre-computed DRep power cache).
         // SPO votes iterate ALL pools in the provided pool stake distribution,
@@ -989,11 +992,11 @@ impl LedgerState {
         &self,
         action_id: &GovActionId,
         action: &GovAction,
-        drep_power_cache: &HashMap<Hash32, u64>,
+        drep_power_cache: &ImblHashMap<Hash32, u64>,
         no_confidence_stake: u64,
-        votes_by_action: &BTreeMap<GovActionId, Vec<(Voter, VotingProcedure)>>,
+        votes_by_action: &ImblOrdMap<GovActionId, Vec<(Voter, VotingProcedure)>>,
         pool_stake_override: Option<&HashMap<Hash28, Lovelace>>,
-        vote_delegations_override: Option<&HashMap<Hash32, DRep>>,
+        vote_delegations_override: Option<&ImblHashMap<Hash32, DRep>>,
     ) -> (u64, u64, u64, u64, u64, u64) {
         let mut cc_yes = 0u64;
         let mut cc_total = 0u64;
@@ -1160,7 +1163,7 @@ impl LedgerState {
     fn default_spo_vote(
         &self,
         pool_id: &Hash28,
-        vote_delegations_override: Option<&HashMap<Hash32, DRep>>,
+        vote_delegations_override: Option<&ImblHashMap<Hash32, DRep>>,
     ) -> DefaultVote {
         // Look up the pool's reward account from pool_params
         let pool_reg = self.certs.pool_params.get(pool_id);
@@ -1222,7 +1225,7 @@ impl LedgerState {
     /// Used by both `proposal_deposits_by_credential` (live proposals) and
     /// `build_drep_power_cache` (ratification snapshot proposals).
     fn proposal_deposits_from(
-        proposals: &std::collections::BTreeMap<GovActionId, ProposalState>,
+        proposals: &ImblOrdMap<GovActionId, ProposalState>,
     ) -> HashMap<Hash32, u64> {
         let mut deposits: HashMap<Hash32, u64> = HashMap::new();
         for proposal in proposals.values() {
@@ -1241,7 +1244,7 @@ impl LedgerState {
     /// (first epoch, or nodes upgrading from older snapshots without this field).
     ///
     /// Returns `(drep_power_cache, always_no_confidence_stake, always_abstain_stake)`.
-    pub fn build_drep_power_cache(&self) -> (HashMap<Hash32, u64>, u64, u64) {
+    pub fn build_drep_power_cache(&self) -> (ImblHashMap<Hash32, u64>, u64, u64) {
         // Use epoch-boundary snapshot when available (preferred — matches Haskell).
         if !self.gov.governance.drep_distribution_snapshot.is_empty()
             || self.gov.governance.drep_snapshot_no_confidence > 0
@@ -1296,8 +1299,8 @@ impl LedgerState {
     /// Iterates vote_delegations once, O(n), instead of per-DRep O(n) lookups.
     /// Only includes active DReps (inactive DReps are excluded from voting power).
     /// Returns (drep_power_cache, always_no_confidence_stake, always_abstain_stake).
-    pub(crate) fn build_drep_power_cache_live(&self) -> (HashMap<Hash32, u64>, u64, u64) {
-        let mut cache: HashMap<Hash32, u64> = HashMap::new();
+    pub(crate) fn build_drep_power_cache_live(&self) -> (ImblHashMap<Hash32, u64>, u64, u64) {
+        let mut cache: ImblHashMap<Hash32, u64> = ImblHashMap::new();
         let mut no_confidence_stake = 0u64;
         let mut abstain_stake = 0u64;
         // Precompute proposal deposits per credential (Haskell: proposalDeposits
@@ -1511,14 +1514,20 @@ pub(crate) fn update_drep_activity(
     if epochs.protocol_params.protocol_version_major >= 9 {
         let mut newly_inactive = 0u64;
         let mut reactivated = 0u64;
-        for drep in Arc::make_mut(&mut gov.governance).dreps.values_mut() {
-            let expired = new_epoch.0 > drep.drep_expiry.0;
-            if expired && drep.active {
-                drep.active = false;
-                newly_inactive += 1;
-            } else if !expired && !drep.active {
-                drep.active = true;
-                reactivated += 1;
+        // imbl::HashMap has no values_mut (persistent); collect keys, then
+        // get_mut each (CoW per touched DRep — fine for the ~tens of DReps).
+        let gov_mut = Arc::make_mut(&mut gov.governance);
+        let drep_keys: Vec<Hash32> = gov_mut.dreps.keys().cloned().collect();
+        for k in drep_keys {
+            if let Some(drep) = gov_mut.dreps.get_mut(&k) {
+                let expired = new_epoch.0 > drep.drep_expiry.0;
+                if expired && drep.active {
+                    drep.active = false;
+                    newly_inactive += 1;
+                } else if !expired && !drep.active {
+                    drep.active = true;
+                    reactivated += 1;
+                }
             }
         }
         if newly_inactive > 0 || reactivated > 0 {
@@ -1585,7 +1594,7 @@ pub(crate) fn capture_governance_snapshots(
 
 /// Build the DRep distribution snapshot from live state.
 fn capture_drep_distribution_snapshot_impl(certs: &CertSubState, gov: &mut GovSubState) {
-    let mut cache: HashMap<Hash32, u64> = HashMap::new();
+    let mut cache: ImblHashMap<Hash32, u64> = ImblHashMap::new();
     let mut no_confidence = 0u64;
     let mut abstain = 0u64;
     for (stake_cred, drep) in &gov.governance.vote_delegations {
@@ -1668,8 +1677,8 @@ fn credential_stake_from(cred_hash: &Hash32, certs: &CertSubState) -> u64 {
 fn default_spo_vote_from(
     pool_id: &Hash28,
     certs: &CertSubState,
-    vote_delegations: &HashMap<Hash32, DRep>,
-    vote_delegations_override: Option<&HashMap<Hash32, DRep>>,
+    vote_delegations: &ImblHashMap<Hash32, DRep>,
+    vote_delegations_override: Option<&ImblHashMap<Hash32, DRep>>,
 ) -> DefaultVote {
     let pool_reg = certs.pool_params.get(pool_id);
     let reward_account = match pool_reg {
@@ -1693,11 +1702,11 @@ fn default_spo_vote_from(
 fn count_votes_by_type_impl(
     action_id: &GovActionId,
     action: &GovAction,
-    drep_power_cache: &HashMap<Hash32, u64>,
+    drep_power_cache: &ImblHashMap<Hash32, u64>,
     no_confidence_stake: u64,
-    votes_by_action: &BTreeMap<GovActionId, Vec<(Voter, VotingProcedure)>>,
+    votes_by_action: &ImblOrdMap<GovActionId, Vec<(Voter, VotingProcedure)>>,
     pool_stake_override: Option<&HashMap<Hash28, Lovelace>>,
-    vote_delegations_override: Option<&HashMap<Hash32, DRep>>,
+    vote_delegations_override: Option<&ImblHashMap<Hash32, DRep>>,
     bootstrap: bool,
     mark_pool_stake: Option<&HashMap<Hash28, Lovelace>>,
     certs: &CertSubState,
@@ -1851,16 +1860,16 @@ fn check_ratification_impl(
     state: &ProposalState,
     _total_drep_stake: u64,
     total_spo_stake: u64,
-    drep_power_cache: &HashMap<Hash32, u64>,
+    drep_power_cache: &ImblHashMap<Hash32, u64>,
     no_confidence_stake: u64,
-    votes_by_action: &BTreeMap<GovActionId, Vec<(Voter, VotingProcedure)>>,
-    committee_hot_keys: &HashMap<Hash32, Hash32>,
-    committee_expiration: &HashMap<Hash32, EpochNo>,
-    committee_resigned: &HashMap<Hash32, Option<Anchor>>,
+    votes_by_action: &ImblOrdMap<GovActionId, Vec<(Voter, VotingProcedure)>>,
+    committee_hot_keys: &ImblHashMap<Hash32, Hash32>,
+    committee_expiration: &ImblHashMap<Hash32, EpochNo>,
+    committee_resigned: &ImblHashMap<Hash32, Option<Anchor>>,
     committee_threshold: &Option<Rational>,
     remaining_treasury: u64,
     pool_stake_override: Option<&HashMap<Hash28, Lovelace>>,
-    vote_delegations_override: Option<&HashMap<Hash32, DRep>>,
+    vote_delegations_override: Option<&ImblHashMap<Hash32, DRep>>,
     epoch: EpochNo,
     epochs: &EpochSubState,
     certs: &CertSubState,
@@ -2112,7 +2121,7 @@ fn compute_total_drep_stake_from(gov: &GovSubState, certs: &CertSubState) -> u64
 
 /// Compute proposal deposits per credential from a proposals map.
 fn proposal_deposits_from_map(
-    proposals: &std::collections::BTreeMap<GovActionId, ProposalState>,
+    proposals: &ImblOrdMap<GovActionId, ProposalState>,
 ) -> HashMap<Hash32, u64> {
     let mut deposits: HashMap<Hash32, u64> = HashMap::new();
     for proposal in proposals.values() {
@@ -2128,7 +2137,7 @@ fn proposal_deposits_from_map(
 fn build_drep_power_cache_from(
     gov: &GovSubState,
     certs: &CertSubState,
-) -> (HashMap<Hash32, u64>, u64, u64) {
+) -> (ImblHashMap<Hash32, u64>, u64, u64) {
     if !gov.governance.drep_distribution_snapshot.is_empty()
         || gov.governance.drep_snapshot_no_confidence > 0
         || gov.governance.drep_snapshot_abstain > 0
@@ -2171,8 +2180,8 @@ fn build_drep_power_cache_from(
 fn build_drep_power_cache_live_from(
     gov: &GovSubState,
     certs: &CertSubState,
-) -> (HashMap<Hash32, u64>, u64, u64) {
-    let mut cache: HashMap<Hash32, u64> = HashMap::new();
+) -> (ImblHashMap<Hash32, u64>, u64, u64) {
+    let mut cache: ImblHashMap<Hash32, u64> = ImblHashMap::new();
     let mut no_confidence_stake = 0u64;
     let mut abstain_stake = 0u64;
     let prop_deposits = proposal_deposits_from_map(&gov.governance.proposals);
@@ -2647,7 +2656,8 @@ pub(crate) fn ratify_proposals_impl(
         )
     };
 
-    let snap_vote_delegations: Option<HashMap<Hash32, DRep>> = if let Some(ref snap) = snapshot {
+    let snap_vote_delegations: Option<ImblHashMap<Hash32, DRep>> = if let Some(ref snap) = snapshot
+    {
         if snap.vote_delegations.is_empty() {
             None
         } else {
@@ -3243,10 +3253,10 @@ pub(crate) fn check_threshold(yes: u64, total: u64, threshold: &Rational) -> boo
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn check_cc_approval(
     action_id: &GovActionId,
-    votes_by_action: &BTreeMap<GovActionId, Vec<(Voter, VotingProcedure)>>,
-    committee_hot_keys: &HashMap<Hash32, Hash32>,
-    committee_expiration: &HashMap<Hash32, EpochNo>,
-    committee_resigned: &HashMap<Hash32, Option<Anchor>>,
+    votes_by_action: &ImblOrdMap<GovActionId, Vec<(Voter, VotingProcedure)>>,
+    committee_hot_keys: &ImblHashMap<Hash32, Hash32>,
+    committee_expiration: &ImblHashMap<Hash32, EpochNo>,
+    committee_resigned: &ImblHashMap<Hash32, Option<Anchor>>,
     committee_threshold: &Option<Rational>,
     current_epoch: EpochNo,
     committee_min_size: u64,
@@ -3581,7 +3591,7 @@ pub(crate) fn forest_add_proposal(
         // Create PEdges for the new node.
         let edges = super::PEdges {
             parent: prev_action_id.cloned(),
-            children: BTreeSet::new(),
+            children: ImblOrdSet::new(),
         };
         g.nodes.insert(action_id.clone(), edges);
 
@@ -3595,7 +3605,7 @@ pub(crate) fn forest_add_proposal(
                 let parent_edges = super::PEdges {
                     parent: None, // Parent's parent is the root
                     children: {
-                        let mut s = BTreeSet::new();
+                        let mut s = ImblOrdSet::new();
                         s.insert(action_id.clone());
                         s
                     },
@@ -3618,10 +3628,10 @@ pub(crate) fn forest_add_proposal(
 /// nodes) for O(k) traversal where k is the subtree size.
 pub(crate) fn forest_remove_with_descendants(
     ids: &[GovActionId],
-    proposals: &mut BTreeMap<GovActionId, ProposalState>,
+    proposals: &mut ImblOrdMap<GovActionId, ProposalState>,
     roots: &mut GovRelation<PRoot>,
     graph: &mut GovRelation<PGraph>,
-    votes_by_action: &mut BTreeMap<GovActionId, Vec<(Voter, VotingProcedure)>>,
+    votes_by_action: &mut ImblOrdMap<GovActionId, Vec<(Voter, VotingProcedure)>>,
 ) -> Vec<(GovActionId, ProposalState)> {
     if ids.is_empty() {
         return Vec::new();
@@ -3751,7 +3761,7 @@ pub(crate) fn forest_promote_root(
         }
         edges.children
     } else {
-        BTreeSet::new()
+        ImblOrdSet::new()
     };
 
     // Remove enacted_id from old root's children (it was a root-level child).
@@ -3768,7 +3778,7 @@ pub(crate) fn forest_promote_root(
 /// Iterates all proposals once, determines each proposal's purpose and `prev_action_id`,
 /// and reconstructs the complete `GovRelation<PRoot>` and `GovRelation<PGraph>`.
 pub(crate) fn rebuild_forest_from_flat(
-    proposals: &BTreeMap<GovActionId, ProposalState>,
+    proposals: &ImblOrdMap<GovActionId, ProposalState>,
     enacted_pparam: &Option<GovActionId>,
     enacted_hard_fork: &Option<GovActionId>,
     enacted_committee: &Option<GovActionId>,
@@ -6691,10 +6701,10 @@ mod tests {
             vote: Vote::Yes,
             anchor: None,
         };
-        let mut votes = BTreeMap::new();
+        let mut votes = ImblOrdMap::new();
         votes.insert(action_id.clone(), vec![(voter, procedure)]);
 
-        let cache = HashMap::new();
+        let cache = ImblHashMap::new();
 
         // WITHOUT override: should use mark (10B)
         let (_, _, spo_yes_mark, _, _, _) = state.count_votes_by_type(
@@ -6803,7 +6813,7 @@ mod tests {
             protocol_version: (10, 0),
         };
 
-        let mut votes = BTreeMap::new();
+        let mut votes = ImblOrdMap::new();
         votes.insert(
             action_id.clone(),
             vec![
@@ -6824,7 +6834,7 @@ mod tests {
             ],
         );
 
-        let cache = HashMap::new();
+        let cache = ImblHashMap::new();
         let (_, _, spo_yes, spo_abstain, _, _) =
             state.count_votes_by_type(&action_id, &action, &cache, 0, &votes, None, None);
 
@@ -6857,7 +6867,7 @@ mod tests {
             policy_hash: None,
         };
 
-        let mut votes = BTreeMap::new();
+        let mut votes = ImblOrdMap::new();
         votes.insert(
             action_id.clone(),
             vec![(
@@ -6869,7 +6879,7 @@ mod tests {
             )],
         );
 
-        let cache = HashMap::new();
+        let cache = ImblHashMap::new();
         let (_, _, spo_yes, spo_abstain, _, _) =
             state.count_votes_by_type(&action_id, &action, &cache, 0, &votes, None, None);
 
@@ -6894,7 +6904,7 @@ mod tests {
             protocol_version: (10, 0),
         };
 
-        let mut votes = BTreeMap::new();
+        let mut votes = ImblOrdMap::new();
         votes.insert(
             action_id.clone(),
             vec![(
@@ -6906,7 +6916,7 @@ mod tests {
             )],
         );
 
-        let cache = HashMap::new();
+        let cache = ImblHashMap::new();
         let (_, _, spo_yes, spo_abstain, _, _) =
             state.count_votes_by_type(&action_id, &action, &cache, 0, &votes, None, None);
 
@@ -6936,7 +6946,7 @@ mod tests {
             protocol_version: (11, 0),
         };
 
-        let mut votes = BTreeMap::new();
+        let mut votes = ImblOrdMap::new();
         votes.insert(
             action_id.clone(),
             vec![
@@ -6964,7 +6974,7 @@ mod tests {
             ],
         );
 
-        let cache = HashMap::new();
+        let cache = ImblHashMap::new();
         let (_, _, spo_yes, spo_abstain, _, _) =
             state.count_votes_by_type(&action_id, &action, &cache, 0, &votes, None, None);
 
@@ -7011,8 +7021,8 @@ mod tests {
             policy_hash: None,
         };
 
-        let cache = HashMap::new();
-        let votes = BTreeMap::new();
+        let cache = ImblHashMap::new();
+        let votes = ImblOrdMap::new();
         let (_, _, spo_yes, spo_abstain, _, _) =
             state.count_votes_by_type(&action_id, &action, &cache, 0, &votes, None, None);
 
@@ -7050,8 +7060,8 @@ mod tests {
             prev_action_id: None,
         };
 
-        let cache = HashMap::new();
-        let votes = BTreeMap::new();
+        let cache = ImblHashMap::new();
+        let votes = ImblOrdMap::new();
         let (_, _, spo_yes, spo_abstain, _, _) =
             state.count_votes_by_type(&action_id, &action, &cache, 0, &votes, None, None);
 
@@ -7171,8 +7181,8 @@ mod tests {
         forest_add_proposal(&d_id, Some(&c_id), 0, &mut roots, &mut graph);
 
         // Build proposals map with matching actions.
-        let mut proposals = BTreeMap::new();
-        let mut votes = BTreeMap::new();
+        let mut proposals = ImblOrdMap::new();
+        let mut votes = ImblOrdMap::new();
         for (id, prev) in [
             (&a_id, Some(root_id.clone())),
             (&b_id, Some(root_id.clone())),
@@ -7261,7 +7271,7 @@ mod tests {
         let a_id = make_action_id(0x0a, 0);
         let c_id = make_action_id(0x0c, 0);
 
-        let mut proposals = BTreeMap::new();
+        let mut proposals = ImblOrdMap::new();
         for (id, prev) in [(&a_id, Some(root_id.clone())), (&c_id, Some(a_id.clone()))] {
             proposals.insert(
                 id.clone(),

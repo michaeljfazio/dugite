@@ -170,10 +170,23 @@ pub(crate) fn apply_utxo_changes(
     //
     // Collect (input, output) pairs for inputs that exist in the UTxO set.
     // Missing inputs (pre-replay gaps) are silently skipped.
+    //
+    // DEDUPLICATE first: in the Cardano ledger `TxBody.inputs` is a `Set TxIn`,
+    // so an input the wire CBOR lists more than once is spent — and has its
+    // stake subtracted — exactly ONCE. Iterating the raw decoded Vec with
+    // duplicates double-subtracts from `stake_distribution` (Phase 2); the UTxO
+    // removal/insert (Phase 3/4) is idempotent so the UTxO set looks correct,
+    // masking the drift, but the per-credential stake (and every downstream
+    // reward / pool-stake / treasury calculation) silently diverges. Real
+    // preprod txs do carry duplicate inputs (e.g. tx b6ce541006… at epoch 35
+    // lists d94cc73b…#0 and #1 twice each), which compounded into the
+    // +1-lovelace Conway PV10 withdrawal-amount halt at epoch 181.
+    let mut seen_inputs = std::collections::HashSet::new();
     let spent_outputs: Vec<_> = tx
         .body
         .inputs
         .iter()
+        .filter(|input| seen_inputs.insert((*input).clone()))
         .filter_map(|input| {
             utxo.utxo_set
                 .lookup(input)
@@ -302,7 +315,17 @@ pub(crate) fn apply_collateral_consumption(
     let mut collateral_input_value: u64 = 0;
 
     // Consume collateral inputs and update stake distribution.
-    for col_input in &tx.body.collateral {
+    // Deduplicate: collateral is a `Set TxIn` in the ledger, so a collateral
+    // input listed more than once on the wire is consumed (and stake-subtracted)
+    // exactly once — same rationale as the regular-input dedup in
+    // `apply_utxo_changes`.
+    let mut seen_collateral = std::collections::HashSet::new();
+    for col_input in tx
+        .body
+        .collateral
+        .iter()
+        .filter(|c| seen_collateral.insert((*c).clone()))
+    {
         if let Some(spent) = utxo.utxo_set.lookup(col_input) {
             collateral_input_value += spent.value.coin.0;
             let coin = spent.value.coin.0;
@@ -995,6 +1018,8 @@ mod tests {
                 numerator: 0,
                 denominator: 1,
             },
+            rupd_addrs_rew: None,
+            pending_avvm_return: 0,
         }
     }
 

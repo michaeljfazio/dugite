@@ -95,14 +95,8 @@ pub fn resolve_redeemer(
         RedeemerTag::Mint => resolve_mint(tx, r, resolved),
         RedeemerTag::Cert => resolve_cert(tx, r, resolved),
         RedeemerTag::Reward => resolve_reward(tx, r, resolved),
-        RedeemerTag::Vote => Err(PhaseTwoError::Internal(format!(
-            "resolve_redeemer: Vote redeemers not yet wired (tag {:?}, idx {})",
-            r.tag, r.index
-        ))),
-        RedeemerTag::Propose => Err(PhaseTwoError::Internal(format!(
-            "resolve_redeemer: Propose redeemers not yet wired (tag {:?}, idx {})",
-            r.tag, r.index
-        ))),
+        RedeemerTag::Vote => resolve_vote(tx, r, resolved),
+        RedeemerTag::Propose => resolve_propose(tx, r, resolved),
         // Dijkstra `DijkstraGuarding` — credential-based guard
         // satisfied by a Plutus script.
         RedeemerTag::Guarding => resolve_guarding(tx, r, resolved),
@@ -296,6 +290,104 @@ fn resolve_reward(
     })
 }
 
+/// Resolve a `Vote` redeemer.
+///
+/// A `Vote` redeemer with index `i` refers to the `i`-th voter in the
+/// tx body's `voting_procedures` map (iterated in `BTreeMap` order —
+/// `Voter` is `Ord` by constructor tag first, then credential bytes).
+///
+/// Haskell reference: `Cardano.Ledger.Conway.Scripts.ConwayPlutusPurpose`
+/// (`ConwayVoting !(f Word32 Voter)`) — the `Word32` index is the key into
+/// the sorted `VotingProcedures` map via `redeemerPointerInverse`.
+/// `transPlutusPurposeV3` → `VotingPurpose (AsIxItem _ voter) → PV3.Voting (transVoter voter)`.
+/// Conway TxInfo.hs `transVoter`: CommitteeVoter=0, DRepVoter=1, StakePoolVoter=2.
+fn resolve_vote(
+    tx: &Transaction,
+    r: &Redeemer,
+    resolved: &[(PrimTxIn, PrimTxOut, Vec<u8>)],
+) -> Result<ResolvedRedeemer, PhaseTwoError> {
+    let idx = r.index as usize;
+    // `voting_procedures` is `BTreeMap<Voter, BTreeMap<GovActionId, VotingProcedure>>`.
+    // `Voter` derives `Ord` by constructor order: ConstitutionalCommittee < DRep < StakePool
+    // (matching the CBOR wire tags 0/2/4). Iteration in `Map.toList` order is the canonical
+    // index space for `ConwayVoting` redeemers.
+    let (voter, _) = tx.body.voting_procedures.iter().nth(idx).ok_or_else(|| {
+        PhaseTwoError::Internal(format!(
+            "vote redeemer references voting_procedures[{idx}] but tx has {n}",
+            n = tx.body.voting_procedures.len()
+        ))
+    })?;
+    // Extract the script hash from the voter's credential.
+    let script_hash = voter_script_hash(voter).ok_or_else(|| {
+        PhaseTwoError::Internal(format!(
+            "vote redeemer #{idx}: voter is not script-credentialed (StakePool voters \
+             are key-only; only DRep and CommitteeVoter with Script credential can run Plutus)"
+        ))
+    })?;
+    let (script_bytes, language) = find_script_bytes(tx, resolved, &script_hash)?;
+    let purpose = ScriptPurpose::Voting(crate::populate_gov::voter_to_plutus(voter));
+    Ok(ResolvedRedeemer {
+        tag: r.tag.clone(),
+        index: r.index,
+        script_hash,
+        script_bytes,
+        language,
+        purpose,
+        datum: None,
+        redeemer_data: r.data.clone(),
+        declared_ex_units: (r.ex_units.mem, r.ex_units.steps),
+    })
+}
+
+/// Resolve a `Propose` redeemer.
+///
+/// A `Propose` redeemer with index `i` refers to the `i`-th proposal
+/// in `tx.body.proposal_procedures` (a `Vec` preserving insertion/wire
+/// order — Haskell's `OSet ProposalProcedure` preserves insertion order).
+///
+/// Haskell reference: `ConwayProposing !(f Word32 (ProposalProcedure era))`.
+/// `transPlutusPurposeV3` → `ProposingPurpose (AsIxItem ix proposal) →
+///   PV3.Proposing (toInteger ix) (transProposal proxy proposal)`.
+/// The `ScriptPurpose::Proposing(idx, ProposalProcedure)` shape carries the
+/// proposal index and the proposal's Data encoding as a `PlProposalProcedure`.
+fn resolve_propose(
+    tx: &Transaction,
+    r: &Redeemer,
+    resolved: &[(PrimTxIn, PrimTxOut, Vec<u8>)],
+) -> Result<ResolvedRedeemer, PhaseTwoError> {
+    let idx = r.index as usize;
+    let proposal = tx.body.proposal_procedures.get(idx).ok_or_else(|| {
+        PhaseTwoError::Internal(format!(
+            "propose redeemer references proposal_procedures[{idx}] but tx has {n}",
+            n = tx.body.proposal_procedures.len()
+        ))
+    })?;
+    // The script hash for a proposal redeemer comes from the gov action's guardrail script.
+    // In practice, only ParameterChange and TreasuryWithdrawals carry a policy_hash that
+    // makes a Plutus script mandatory. However, the redeemer index was encoded on-chain
+    // regardless — extract the policy hash or error if absent.
+    let script_hash = proposal_script_hash(proposal).ok_or_else(|| {
+        PhaseTwoError::Internal(format!(
+            "propose redeemer #{idx}: proposal does not carry a guardrail script hash \
+             (only ParameterChange and TreasuryWithdrawals can have a mandatory Plutus script)"
+        ))
+    })?;
+    let (script_bytes, language) = find_script_bytes(tx, resolved, &script_hash)?;
+    let pl_proposal = crate::populate_gov::proposal_to_plutus(proposal)?;
+    let purpose = ScriptPurpose::Proposing(idx as u64, pl_proposal);
+    Ok(ResolvedRedeemer {
+        tag: r.tag.clone(),
+        index: r.index,
+        script_hash,
+        script_bytes,
+        language,
+        purpose,
+        datum: None,
+        redeemer_data: r.data.clone(),
+        declared_ex_units: (r.ex_units.mem, r.ex_units.steps),
+    })
+}
+
 /// Dijkstra `DijkstraGuarding` redeemer — resolves the script
 /// dispatched by a credential-based guard at `tx.body.guards[index]`.
 ///
@@ -388,6 +480,40 @@ fn cert_script_hash(cert: &dugite_primitives::transaction::Certificate) -> Optio
     match cred {
         PrimCred::Script(h) => Some(h.0),
         PrimCred::VerificationKey(_) => None,
+    }
+}
+
+/// Extract the script-credential hash from a `Voter`, or `None` if the
+/// voter type / credential does not invoke a Plutus script.
+///
+/// Only `ConstitutionalCommittee(Script(_))` and `DRep(Script(_))` can
+/// carry script credentials. `StakePool` voters are always key-only.
+fn voter_script_hash(voter: &dugite_primitives::transaction::Voter) -> Option<[u8; 28]> {
+    use dugite_primitives::transaction::Voter::*;
+    let cred = match voter {
+        ConstitutionalCommittee(c) => c,
+        DRep(c) => c,
+        StakePool(_) => return None,
+    };
+    match cred {
+        PrimCred::Script(h) => Some(h.0),
+        PrimCred::VerificationKey(_) => None,
+    }
+}
+
+/// Extract the mandatory guardrail script hash from a `ProposalProcedure`,
+/// or `None` if the proposal does not carry one.
+///
+/// Only `ParameterChange` and `TreasuryWithdrawals` carry a `policy_hash`
+/// field. All other gov-action types cannot have a mandatory Plutus script
+/// and should not appear with a `Propose` redeemer (the chain would have
+/// rejected the tx in phase-1).
+fn proposal_script_hash(p: &dugite_primitives::transaction::ProposalProcedure) -> Option<[u8; 28]> {
+    use dugite_primitives::transaction::GovAction::*;
+    match &p.gov_action {
+        ParameterChange { policy_hash, .. } => policy_hash.as_ref().map(|h| h.0),
+        TreasuryWithdrawals { policy_hash, .. } => policy_hash.as_ref().map(|h| h.0),
+        _ => None,
     }
 }
 
@@ -993,11 +1119,44 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────
-    // Vote / Propose redeemers are explicitly not wired yet
+    // Vote / Propose redeemers
     // ────────────────────────────────────────────────────────────
 
+    /// Vote redeemer with out-of-range index should return Internal error.
     #[test]
-    fn vote_redeemers_currently_error_with_internal() {
+    fn vote_redeemer_out_of_range_errors() {
+        let mut ws = empty_witness();
+        ws.redeemers = vec![Redeemer {
+            tag: RedeemerTag::Vote,
+            index: 0, // tx has no voting_procedures
+            data: PrimPlutusData::Integer(num_bigint::BigInt::from(0)),
+            ex_units: ExUnits { mem: 1, steps: 1 },
+        }];
+        let tx = build_tx(minimal_body(), ws);
+        let err = resolve_redeemers(&tx, &[]).unwrap_err();
+        assert!(matches!(err, PhaseTwoError::Internal(_)));
+    }
+
+    /// Vote redeemer pointing to a key-credentialed voter (not a Plutus script)
+    /// should return Internal error.
+    #[test]
+    fn vote_redeemer_with_key_voter_errors() {
+        use dugite_primitives::transaction::{GovActionId, Vote, Voter, VotingProcedure};
+        let mut body = minimal_body();
+        // Add a voting procedure keyed by a key-credentialed DRep.
+        let mut inner = std::collections::BTreeMap::new();
+        inner.insert(
+            GovActionId {
+                transaction_id: h32(0xab),
+                action_index: 0,
+            },
+            VotingProcedure {
+                vote: Vote::Yes,
+                anchor: None,
+            },
+        );
+        body.voting_procedures
+            .insert(Voter::DRep(PrimCred::VerificationKey(h28(0xcc))), inner);
         let mut ws = empty_witness();
         ws.redeemers = vec![Redeemer {
             tag: RedeemerTag::Vote,
@@ -1005,11 +1164,110 @@ mod tests {
             data: PrimPlutusData::Integer(num_bigint::BigInt::from(0)),
             ex_units: ExUnits { mem: 1, steps: 1 },
         }];
+        let tx = build_tx(body, ws);
+        let err = resolve_redeemers(&tx, &[]).unwrap_err();
+        // Key voter cannot dispatch Plutus → Internal
+        assert!(matches!(err, PhaseTwoError::Internal(_)));
+    }
+
+    /// Vote redeemer with a script-credentialed DRep voter resolves correctly.
+    #[test]
+    fn vote_redeemer_with_script_drep_voter_resolves() {
+        use dugite_primitives::transaction::{GovActionId, Vote, Voter, VotingProcedure};
+        let script_bytes = vec![0xde, 0xad];
+        let script_hash = {
+            let mut buf = vec![3u8];
+            buf.extend_from_slice(&script_bytes);
+            dugite_primitives::hash::blake2b_224(&buf).0
+        };
+        let mut body = minimal_body();
+        let mut inner = std::collections::BTreeMap::new();
+        inner.insert(
+            GovActionId {
+                transaction_id: h32(0x10),
+                action_index: 0,
+            },
+            VotingProcedure {
+                vote: Vote::Yes,
+                anchor: None,
+            },
+        );
+        body.voting_procedures
+            .insert(Voter::DRep(PrimCred::Script(h28(0))), inner.clone());
+        // Second voter with the script credential
+        let mut inner2 = std::collections::BTreeMap::new();
+        inner2.insert(
+            GovActionId {
+                transaction_id: h32(0x20),
+                action_index: 0,
+            },
+            VotingProcedure {
+                vote: Vote::No,
+                anchor: None,
+            },
+        );
+        body.voting_procedures.insert(
+            Voter::DRep(PrimCred::Script(Hash::<28>(script_hash))),
+            inner2,
+        );
+        let mut ws = empty_witness();
+        ws.plutus_v3_scripts = vec![script_bytes.clone()];
+        ws.redeemers = vec![Redeemer {
+            tag: RedeemerTag::Vote,
+            index: 1, // BTreeMap iteration order: Script([0;28]) < Script([script_hash])
+            data: PrimPlutusData::Integer(num_bigint::BigInt::from(0)),
+            ex_units: ExUnits { mem: 1, steps: 1 },
+        }];
+        let tx = build_tx(body, ws);
+        let r = resolve_redeemers(&tx, &[]).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].script_hash, script_hash);
+        assert!(matches!(r[0].purpose, ScriptPurpose::Voting(_)));
+    }
+
+    /// Propose redeemer with out-of-range index errors.
+    #[test]
+    fn propose_redeemer_out_of_range_errors() {
+        let mut ws = empty_witness();
+        ws.redeemers = vec![Redeemer {
+            tag: RedeemerTag::Propose,
+            index: 0,
+            data: PrimPlutusData::Integer(num_bigint::BigInt::from(0)),
+            ex_units: ExUnits { mem: 1, steps: 1 },
+        }];
         let tx = build_tx(minimal_body(), ws);
         let err = resolve_redeemers(&tx, &[]).unwrap_err();
-        let PhaseTwoError::Internal(msg) = err else {
-            panic!();
-        };
-        assert!(msg.contains("Vote redeemers not yet wired"));
+        assert!(matches!(err, PhaseTwoError::Internal(_)));
+    }
+
+    /// Propose redeemer on InfoAction (no policy_hash) errors.
+    #[test]
+    fn propose_redeemer_on_info_action_errors() {
+        use dugite_primitives::transaction::{Anchor, GovAction, ProposalProcedure};
+        use dugite_primitives::value::Lovelace;
+        let mut body = minimal_body();
+        // reward address: mainnet key-stake 0xe0 || [0x42; 28]
+        let mut return_addr = vec![0xe0u8];
+        return_addr.extend_from_slice(&[0x42u8; 28]);
+        body.proposal_procedures.push(ProposalProcedure {
+            deposit: Lovelace(0),
+            return_addr,
+            gov_action: GovAction::InfoAction,
+            anchor: Anchor {
+                url: String::new(),
+                data_hash: h32(0),
+            },
+        });
+        let mut ws = empty_witness();
+        ws.redeemers = vec![Redeemer {
+            tag: RedeemerTag::Propose,
+            index: 0,
+            data: PrimPlutusData::Integer(num_bigint::BigInt::from(0)),
+            ex_units: ExUnits { mem: 1, steps: 1 },
+        }];
+        let tx = build_tx(body, ws);
+        let err = resolve_redeemers(&tx, &[]).unwrap_err();
+        // InfoAction has no policy_hash → Internal
+        assert!(matches!(err, PhaseTwoError::Internal(_)));
     }
 }

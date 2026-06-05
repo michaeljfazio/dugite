@@ -59,6 +59,10 @@ pub struct SnapshotRequest {
     pub epoch: u64,
     pub slot: u64,
     pub utxo_count: usize,
+    /// UTxO backend the snapshot was taken with — written into the
+    /// `.meta.json` sidecar so a backend-mismatched snapshot is rejected
+    /// on load (mirrors Haskell's `SnapshotMetadata` backend tag).
+    pub backend: dugite_ledger::SnapshotBackend,
 }
 
 /// Construct the channel + spawn the worker task.
@@ -143,9 +147,12 @@ fn process_request(
     ));
     let latest_path = database_path.join("ledger-snapshot.bin");
 
-    let total_bytes =
-        dugite_ledger::LedgerState::write_snapshot_view_to_path(&req.view, &epoch_path)
-            .map_err(|e| format!("write snapshot: {e}"))?;
+    let total_bytes = dugite_ledger::LedgerState::write_snapshot_view_to_path(
+        &req.view,
+        &epoch_path,
+        req.backend,
+    )
+    .map_err(|e| format!("write snapshot: {e}"))?;
 
     if let Err(e) = link_latest_snapshot(&epoch_path, &latest_path) {
         // Non-fatal: the epoch-tagged snapshot is on disk and startup
@@ -228,6 +235,7 @@ mod tests {
             epoch: 42,
             slot: 1234,
             utxo_count: 0,
+            backend: dugite_ledger::SnapshotBackend::DugiteMem,
         })
         .await
         .unwrap();
@@ -276,6 +284,7 @@ mod tests {
             epoch: 1,
             slot: 0,
             utxo_count: 0,
+            backend: dugite_ledger::SnapshotBackend::DugiteMem,
         })
         .unwrap();
         assert!(
@@ -327,6 +336,7 @@ mod tests {
                 epoch,
                 slot: epoch * 1000,
                 utxo_count: 0,
+                backend: dugite_ledger::SnapshotBackend::DugiteMem,
             })
             .await
             .unwrap();

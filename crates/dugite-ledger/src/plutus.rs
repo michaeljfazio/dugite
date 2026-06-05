@@ -155,6 +155,311 @@ fn reassemble_phase_two_tx_cbor(tx: &Transaction) -> Vec<u8> {
     }
 }
 
+/// A resolved, self-contained work item for parallel Phase-2 evaluation.
+///
+/// Created during the sequential per-tx pass (where UTxO input resolution must
+/// happen in order because a tx may spend outputs produced by an earlier tx in
+/// the same block). Once captured, the item carries everything `eval_phase_two_raw`
+/// needs and is completely independent of the UTxO set — safe to `Send` across
+/// rayon threads.
+///
+/// `tx_idx` preserves the original transaction order so that error reporting
+/// after parallel evaluation stays deterministic (errors are re-sorted by
+/// `tx_idx` before application).
+#[derive(Debug)]
+pub struct Phase2WorkItem {
+    /// Original position of this transaction in the block (for deterministic
+    /// error ordering after parallel evaluation).
+    pub tx_idx: usize,
+    /// The `is_valid` flag from the transaction (determines the post-eval check).
+    pub is_valid: bool,
+    /// Pre-assembled transaction CBOR (wire bytes or deterministic re-encoding).
+    pub tx_cbor: Vec<u8>,
+    /// Resolved `(input_cbor, output_cbor)` pairs — captured from the UTxO set
+    /// at the sequential resolution point.
+    pub utxo_pairs: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Serialised cost-model CBOR (from `params.cost_models.to_cbor()`).
+    pub cost_models_cbor: Option<Vec<u8>>,
+    /// `(cpu_steps, mem_units)` budget ceiling.
+    pub max_ex: (u64, u64),
+    /// Slot configuration for Plutus time translation.
+    pub slot_config: SlotConfig,
+    /// Major protocol version at evaluation time. Selects the PlutusV1/V2
+    /// `BuiltinSemanticsVariant` (VariantA pre-Conway, VariantB at PV9+) for the
+    /// per-builtin cost model — see `dugite_uplc::cost_apply`.
+    pub protocol_major: u32,
+}
+
+/// Resolve a transaction's Plutus inputs into `(input_cbor, output_cbor)` pairs
+/// from the provided UTxO set.
+///
+/// This is the ordering-dependent step that must run sequentially during the
+/// block-apply loop (a tx may spend outputs created by an earlier tx in the
+/// same block). The returned pairs are completely self-contained and can be
+/// passed to `eval_phase_two_raw` on any thread.
+pub fn resolve_phase2_utxo_pairs(
+    tx: &Transaction,
+    utxo_set: &dyn UtxoLookup,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut utxo_pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+
+    let all_inputs = tx.body.inputs.iter().chain(tx.body.reference_inputs.iter());
+    for input in all_inputs {
+        if let Some(output) = utxo_set.lookup(input) {
+            let output_cbor = match &output.raw_cbor {
+                Some(cbor) => cbor.clone(),
+                None => dugite_serialization::encode_transaction_output(&output),
+            };
+            utxo_pairs.push((encode_input_cbor(input), output_cbor));
+        }
+    }
+    for col_input in &tx.body.collateral {
+        if let Some(output) = utxo_set.lookup(col_input) {
+            let output_cbor = match &output.raw_cbor {
+                Some(cbor) => cbor.clone(),
+                None => dugite_serialization::encode_transaction_output(&output),
+            };
+            utxo_pairs.push((encode_input_cbor(col_input), output_cbor));
+        }
+    }
+    utxo_pairs
+}
+
+/// Capture a [`Phase2WorkItem`] for a transaction during the sequential per-tx
+/// pass without running the evaluator.
+///
+/// The caller is responsible for the ordering invariant: inputs must be
+/// resolved while `utxo_set` still reflects the state *at this transaction's
+/// apply point* (i.e., after all preceding txs in the block have been applied).
+pub fn capture_phase2_work_item(
+    tx_idx: usize,
+    tx: &Transaction,
+    utxo_set: &dyn UtxoLookup,
+    cost_models_cbor: Option<Vec<u8>>,
+    max_ex: (u64, u64),
+    slot_config: SlotConfig,
+    protocol_major: u32,
+) -> Phase2WorkItem {
+    let tx_cbor = match tx.raw_cbor.as_ref() {
+        Some(bytes) => bytes.clone(),
+        None => reassemble_phase_two_tx_cbor(tx),
+    };
+    let utxo_pairs = resolve_phase2_utxo_pairs(tx, utxo_set);
+    Phase2WorkItem {
+        tx_idx,
+        is_valid: tx.is_valid,
+        tx_cbor,
+        utxo_pairs,
+        cost_models_cbor,
+        max_ex,
+        slot_config,
+        protocol_major,
+    }
+}
+
+/// When `DUGITE_PHASE2_DUMP_DIR` is set, write the exact CEK inputs of a tx to
+/// `<dir>/phase2-divergence-tx<idx>-<txid>.json` so a Phase-2 evaluation
+/// divergence (on-chain `is_valid=false` but dugite says the scripts pass — a
+/// `ValidationTagMismatch`) can be reproduced byte-for-byte offline. No-op when
+/// the env var is unset, so it is safe to leave wired in permanently.
+pub fn maybe_dump_phase2_divergence(item: &Phase2WorkItem) {
+    let dir = match std::env::var("DUGITE_PHASE2_DUMP_DIR") {
+        Ok(d) if !d.is_empty() => d,
+        _ => return,
+    };
+    let hex = |b: &[u8]| -> String { b.iter().map(|x| format!("{x:02x}")).collect() };
+    let pairs: Vec<serde_json::Value> = item
+        .utxo_pairs
+        .iter()
+        .map(|(i, o)| serde_json::json!({ "input": hex(i), "output": hex(o) }))
+        .collect();
+    let doc = serde_json::json!({
+        "tx_idx": item.tx_idx,
+        "is_valid": item.is_valid,
+        "tx_cbor": hex(&item.tx_cbor),
+        "utxo_pairs": pairs,
+        "cost_models_cbor": item.cost_models_cbor.as_deref().map(&hex),
+        "max_ex_cpu": item.max_ex.0,
+        "max_ex_mem": item.max_ex.1,
+        // dugite SlotConfig -> dugite_uplc SlotConfig mapping (see apply.rs).
+        "sc_network_start_unix_seconds": item.slot_config.zero_time / 1_000,
+        "sc_slot_zero_offset": item.slot_config.zero_slot,
+        "sc_slot_length_ms": item.slot_config.slot_length,
+        "sc_safe_zone_horizon_slot": item.slot_config.safe_zone_horizon_slot,
+    });
+    let path = format!("{dir}/phase2-divergence-tx{}.json", item.tx_idx);
+    match serde_json::to_vec_pretty(&doc) {
+        Ok(bytes) => {
+            if let Err(e) = std::fs::write(&path, bytes) {
+                tracing::warn!(error = %e, path, "failed to write phase2 divergence repro");
+            } else {
+                tracing::warn!(path, tx_idx = item.tx_idx, "wrote phase2 divergence repro");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "failed to serialise phase2 divergence repro"),
+    }
+}
+
+/// Result of one parallel Phase-2 evaluation.
+#[derive(Debug)]
+pub struct Phase2Outcome {
+    /// Original transaction index (matches [`Phase2WorkItem::tx_idx`]).
+    pub tx_idx: usize,
+    /// `is_valid` flag from the transaction (copied from work item for convenience).
+    pub is_valid: bool,
+    /// The evaluation result: `Ok(())` = all scripts pass, `Err(msg)` = failure.
+    pub result: Result<(), PlutusError>,
+}
+
+/// Execute a batch of pre-resolved Phase-2 work items IN PARALLEL via rayon,
+/// preserving result order by `tx_idx`.
+///
+/// The script-decode cache inside `dugite_uplc` is `thread_local` — each rayon
+/// worker thread keeps its own cache, which is still correct (byte-exact identical
+/// results, slightly less cache reuse across txs). This is the same semantics as
+/// the existing sequential path.
+///
+/// The returned `Vec<Phase2Outcome>` is sorted by `tx_idx` so that error
+/// application in the caller is deterministic regardless of rayon scheduling.
+#[cfg(feature = "parallel-verification")]
+pub fn run_phase2_parallel(items: Vec<Phase2WorkItem>) -> Vec<Phase2Outcome> {
+    use rayon::prelude::*;
+    let mut outcomes: Vec<Phase2Outcome> = items
+        .into_par_iter()
+        .map(|item| {
+            let dugite_slot_config = dugite_uplc::phase_two::SlotConfig {
+                network_start_unix_seconds: item.slot_config.zero_time / 1_000,
+                slot_zero_offset: item.slot_config.zero_slot,
+                slot_length_ms: item.slot_config.slot_length,
+                safe_zone_horizon_slot: item.slot_config.safe_zone_horizon_slot,
+            };
+            let result = run_single_phase2_eval(
+                &item.tx_cbor,
+                &item.utxo_pairs,
+                item.cost_models_cbor.as_deref(),
+                item.max_ex,
+                dugite_slot_config,
+                item.protocol_major,
+            );
+            // Capture EITHER divergence direction for offline reproduction when
+            // dumping is enabled: (a) dugite PASSES but on-chain is_valid=false
+            // (ValidationTagMismatch, over-permissive CEK), or (b) dugite FAILS
+            // but on-chain is_valid=true (over-strict CEK — e.g. the #22 unIData /
+            // budget classes). Both are dugite-CEK bugs worth reproducing.
+            if (result.is_ok() && !item.is_valid) || (result.is_err() && item.is_valid) {
+                maybe_dump_phase2_divergence(&item);
+            }
+            Phase2Outcome {
+                tx_idx: item.tx_idx,
+                is_valid: item.is_valid,
+                result,
+            }
+        })
+        .collect();
+    // Sort by tx_idx so error application order is deterministic.
+    outcomes.sort_by_key(|o| o.tx_idx);
+    outcomes
+}
+
+/// Sequential fallback (feature gate off).
+#[cfg(not(feature = "parallel-verification"))]
+pub fn run_phase2_parallel(items: Vec<Phase2WorkItem>) -> Vec<Phase2Outcome> {
+    let mut outcomes: Vec<Phase2Outcome> = items
+        .into_iter()
+        .map(|item| {
+            let dugite_slot_config = dugite_uplc::phase_two::SlotConfig {
+                network_start_unix_seconds: item.slot_config.zero_time / 1_000,
+                slot_zero_offset: item.slot_config.zero_slot,
+                slot_length_ms: item.slot_config.slot_length,
+                safe_zone_horizon_slot: item.slot_config.safe_zone_horizon_slot,
+            };
+            let result = run_single_phase2_eval(
+                &item.tx_cbor,
+                &item.utxo_pairs,
+                item.cost_models_cbor.as_deref(),
+                item.max_ex,
+                dugite_slot_config,
+                item.protocol_major,
+            );
+            if (result.is_ok() && !item.is_valid) || (result.is_err() && item.is_valid) {
+                maybe_dump_phase2_divergence(&item);
+            }
+            Phase2Outcome {
+                tx_idx: item.tx_idx,
+                is_valid: item.is_valid,
+                result,
+            }
+        })
+        .collect();
+    outcomes.sort_by_key(|o| o.tx_idx);
+    outcomes
+}
+
+/// Core single-tx Phase-2 evaluation — operates on pre-resolved CBOR bytes.
+///
+/// Shared by both `evaluate_plutus_scripts` (sequential path) and
+/// `run_phase2_parallel` (deferred-parallel path).  Wrapped in `catch_unwind`
+/// as defense-in-depth against adversarial Plutus scripts.
+fn run_single_phase2_eval(
+    tx_cbor: &[u8],
+    utxo_pairs: &[(Vec<u8>, Vec<u8>)],
+    cost_models_cbor: Option<&[u8]>,
+    max_tx_ex_units: (u64, u64),
+    slot_config: dugite_uplc::phase_two::SlotConfig,
+    protocol_major: u32,
+) -> Result<(), PlutusError> {
+    let eval_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        dugite_uplc::phase_two::eval_phase_two_raw(
+            tx_cbor,
+            utxo_pairs,
+            cost_models_cbor,
+            max_tx_ex_units,
+            slot_config,
+            protocol_major,
+            false, // run_phase_one = false
+            &mut (),
+        )
+    }));
+    let eval_result = match eval_outcome {
+        Ok(r) => r,
+        Err(payload) => {
+            let msg = panic_payload_to_string(&payload);
+            return Err(PlutusError::EvalFailed(format!(
+                "dugite-uplc panic on malformed script: {msg}"
+            )));
+        }
+    };
+    match eval_result {
+        Ok(results) => {
+            for r in &results {
+                trace!(
+                    cpu = r.consumed.cpu,
+                    mem = r.consumed.mem,
+                    "Plutus script passed (parallel)"
+                );
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let error_msg = match &e {
+                dugite_uplc::phase_two::PhaseTwoError::ScriptEvaluationFailedWithLogs {
+                    error,
+                    logs,
+                } => {
+                    let joined = logs
+                        .iter()
+                        .map(|s| format!("[{s}]"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("eval_phase_two_raw error: {error}; Trace logs: {joined}")
+                }
+                _ => format!("eval_phase_two_raw error: {e}"),
+            };
+            Err(PlutusError::EvalFailed(error_msg))
+        }
+    }
+}
+
 /// Evaluate Plutus scripts in a transaction using the uplc CEK machine
 ///
 /// `max_tx_ex_units` is `(cpu_steps, mem_units)` — this matches the uplc
@@ -169,6 +474,7 @@ pub fn evaluate_plutus_scripts(
     cost_models_cbor: Option<&[u8]>,
     max_tx_ex_units: (u64, u64),
     slot_config: &SlotConfig,
+    protocol_major: u32,
 ) -> Result<(), PlutusError> {
     // Use the original wire bytes when available — that path preserves the
     // exact TxId of network-submitted transactions (which is the hash of the
@@ -243,90 +549,28 @@ pub fn evaluate_plutus_scripts(
         "Evaluating Plutus scripts"
     );
 
-    // Dugite's in-house phase-2 evaluator. Replaces the
-    // `aiken-lang/uplc` crate.
-    //
-    // The new API does V1/V2/V3 success classification + per-redeemer
-    // declared-budget enforcement internally and surfaces failures as
-    // typed `PhaseTwoError` variants. We still wrap the call in
-    // `catch_unwind` as a defense-in-depth measure: even though
-    // `dugite-uplc` is panic-free by contract (lib.rs §1), the catch
-    // unwind ensures any future regression cannot crash the node.
     let dugite_slot_config = dugite_uplc::phase_two::SlotConfig {
         network_start_unix_seconds: slot_config.zero_time / 1_000,
         slot_zero_offset: slot_config.zero_slot,
         slot_length_ms: slot_config.slot_length,
-        // Plumb the safe-zone horizon into the inner evaluator so its
-        // `slot_to_posix_ms` rejects past-horizon validity bounds with
-        // `TimeTranslationPastHorizon`. When the caller leaves the field
-        // unset (tests, legacy on-disk SlotConfig), the evaluator falls
-        // back to its pre-fix unbounded semantics.
         safe_zone_horizon_slot: slot_config.safe_zone_horizon_slot,
     };
-    let eval_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        dugite_uplc::phase_two::eval_phase_two_raw(
-            tx_cbor,
-            &utxo_pairs,
-            cost_models_cbor,
-            max_tx_ex_units,
-            dugite_slot_config,
-            false, // don't run phase one (we already do our own phase 1 validation)
-            &mut (),
-        )
-    }));
-    let eval_result = match eval_outcome {
-        Ok(r) => r,
-        Err(payload) => {
-            let msg = panic_payload_to_string(&payload);
-            debug!(
-                tx_hash = %tx.hash.to_hex(),
-                panic = %msg,
-                "Plutus evaluator panicked on adversarial input — rejecting tx"
-            );
-            return Err(PlutusError::EvalFailed(format!(
-                "dugite-uplc panic on malformed script: {msg}"
-            )));
-        }
-    };
-    match eval_result {
-        Ok(results) => {
-            for r in &results {
-                trace!(
-                    tx_hash = %tx.hash.to_hex(),
-                    cpu = r.consumed.cpu,
-                    mem = r.consumed.mem,
-                    "Plutus script passed"
-                );
-            }
-            Ok(())
-        }
-        Err(e) => {
-            // Surface trace logs in the error message when the script emitted
-            // `trace` strings before failing — mirrors `cardano-cli`'s
-            // "Trace logs: [...]" output (Haskell `evalTxExUnitsWithLogs`,
-            // `Cardano.Ledger.Alonzo.Plutus.Evaluate`).
-            let error_msg = match &e {
-                dugite_uplc::phase_two::PhaseTwoError::ScriptEvaluationFailedWithLogs {
-                    error,
-                    logs,
-                } => {
-                    let joined = logs
-                        .iter()
-                        .map(|s| format!("[{s}]"))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!("eval_phase_two_raw error: {error}; Trace logs: {joined}")
-                }
-                _ => format!("eval_phase_two_raw error: {e}"),
-            };
-            debug!(
-                tx_hash = %tx.hash.to_hex(),
-                error = %error_msg,
-                "Plutus evaluation error"
-            );
-            Err(PlutusError::EvalFailed(error_msg))
-        }
+    let result = run_single_phase2_eval(
+        tx_cbor,
+        &utxo_pairs,
+        cost_models_cbor,
+        max_tx_ex_units,
+        dugite_slot_config,
+        protocol_major,
+    );
+    if let Err(ref e) = result {
+        debug!(
+            tx_hash = %tx.hash.to_hex(),
+            error = %e,
+            "Plutus evaluation error"
+        );
     }
+    result
 }
 
 /// Per-redeemer report extracted from a Phase-2 evaluation. Mirrors
@@ -355,6 +599,7 @@ pub fn evaluate_plutus_scripts_with_reports(
     cost_models_cbor: Option<&[u8]>,
     max_tx_ex_units: (u64, u64),
     slot_config: &SlotConfig,
+    protocol_major: u32,
 ) -> Result<Vec<RedeemerReport>, PlutusError> {
     let owned_cbor: Vec<u8>;
     let tx_cbor: &[u8] = match tx.raw_cbor.as_ref() {
@@ -404,6 +649,7 @@ pub fn evaluate_plutus_scripts_with_reports(
             cost_models_cbor,
             max_tx_ex_units,
             dugite_slot_config,
+            protocol_major,
             false,
             &mut (),
         )
@@ -556,8 +802,14 @@ mod tests {
         let utxo_set = UtxoSet::new();
         let slot_config = SlotConfig::default();
 
-        let result =
-            evaluate_plutus_scripts(&tx, &utxo_set, None, (10_000_000, 10_000_000), &slot_config);
+        let result = evaluate_plutus_scripts(
+            &tx,
+            &utxo_set,
+            None,
+            (10_000_000, 10_000_000),
+            &slot_config,
+            9,
+        );
         assert!(
             result.is_ok(),
             "Evaluator must accept a locally-built tx via the re-encode fallback: {:?}",
@@ -1069,6 +1321,7 @@ mod tests {
             None, // no cost models — script is so simple it needs no builtins
             (14_000_000, 2_000_000),
             &slot_config,
+            9,
         );
 
         assert!(
@@ -1100,8 +1353,14 @@ mod tests {
         tx.witness_set.plutus_v2_scripts = vec![script_cbor];
 
         let slot_config = SlotConfig::preview();
-        let result =
-            evaluate_plutus_scripts(&tx, &utxo_set, None, (14_000_000, 2_000_000), &slot_config);
+        let result = evaluate_plutus_scripts(
+            &tx,
+            &utxo_set,
+            None,
+            (14_000_000, 2_000_000),
+            &slot_config,
+            9,
+        );
 
         // The error term must produce a script failure, not a parse or
         // infrastructure error.
@@ -1156,7 +1415,7 @@ mod tests {
 
         // Pass an impossibly small budget to the evaluator (1 step, 1 mem).
         let result =
-            evaluate_plutus_scripts(&tx, &utxo_set, Some(&cost_models), (1, 1), &slot_config);
+            evaluate_plutus_scripts(&tx, &utxo_set, Some(&cost_models), (1, 1), &slot_config, 9);
 
         assert!(
             result.is_err(),
@@ -1242,6 +1501,7 @@ mod tests {
                 None,
                 (14_000_000, 2_000_000),
                 &slot_config,
+                9,
             );
 
             assert!(
@@ -1397,8 +1657,14 @@ mod tests {
         tx.witness_set.plutus_data = vec![PlutusData::Constr(0, vec![])];
 
         let slot_config = SlotConfig::preview();
-        let result =
-            evaluate_plutus_scripts(&tx, &utxo_set, None, (14_000_000, 2_000_000), &slot_config);
+        let result = evaluate_plutus_scripts(
+            &tx,
+            &utxo_set,
+            None,
+            (14_000_000, 2_000_000),
+            &slot_config,
+            9,
+        );
         assert!(
             result.is_ok(),
             "Always-succeeds V1 script should pass Phase-2: {:?}",
@@ -1451,8 +1717,14 @@ mod tests {
         let tx = Transaction::empty_with_hash(Hash32::ZERO);
         assert!(tx.raw_cbor.is_none(), "precondition: locally-built tx");
         let slot_config = SlotConfig::default();
-        let result =
-            evaluate_plutus_scripts(&tx, &utxo_set, None, (10_000_000, 10_000_000), &slot_config);
+        let result = evaluate_plutus_scripts(
+            &tx,
+            &utxo_set,
+            None,
+            (10_000_000, 10_000_000),
+            &slot_config,
+            9,
+        );
         assert!(
             result.is_ok(),
             "Locally-built tx with no redeemers must succeed via the re-encode fallback: {:?}",
@@ -1510,6 +1782,7 @@ mod tests {
             Some(&cost_models),
             (budget_steps, budget_mem),
             &slot_config,
+            9,
         );
         assert!(
             result_correct.is_ok(),
@@ -1531,6 +1804,7 @@ mod tests {
             Some(&cost_models),
             (1, budget_mem),
             &slot_config,
+            9,
         );
         assert!(
             result_exhausted.is_err(),
@@ -1579,6 +1853,7 @@ mod tests {
             Some(&cost_models),
             (14_000_000, 2_000_000),
             &slot_config,
+            9,
         );
 
         assert!(
@@ -1689,8 +1964,14 @@ mod tests {
         tx.witness_set.plutus_v3_scripts = vec![script_cbor];
 
         let slot_config = SlotConfig::preview();
-        let result =
-            evaluate_plutus_scripts(&tx, &utxo_set, None, (14_000_000, 2_000_000), &slot_config);
+        let result = evaluate_plutus_scripts(
+            &tx,
+            &utxo_set,
+            None,
+            (14_000_000, 2_000_000),
+            &slot_config,
+            9,
+        );
 
         assert!(
             result.is_ok(),
@@ -1716,8 +1997,14 @@ mod tests {
         tx.witness_set.plutus_v3_scripts = vec![script_cbor];
 
         let slot_config = SlotConfig::preview();
-        let result =
-            evaluate_plutus_scripts(&tx, &utxo_set, None, (14_000_000, 2_000_000), &slot_config);
+        let result = evaluate_plutus_scripts(
+            &tx,
+            &utxo_set,
+            None,
+            (14_000_000, 2_000_000),
+            &slot_config,
+            9,
+        );
 
         assert!(
             matches!(result, Err(PlutusError::EvalFailed(_))),
@@ -1954,6 +2241,7 @@ mod tests {
             Some(&cbor),
             (14_000_000, 2_000_000),
             &slot_config,
+            9,
         );
 
         assert!(
@@ -2129,6 +2417,7 @@ mod tests {
             None, // no cost models needed for this simple script
             (14_000_000, 2_000_000),
             &slot_config,
+            9,
         );
 
         assert!(

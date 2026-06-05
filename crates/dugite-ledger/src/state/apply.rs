@@ -20,7 +20,10 @@ use super::{credential_to_hash, BlockValidationMode, LedgerError, LedgerState};
 use crate::eras::byron::{apply_byron_block, ByronApplyMode, ByronFeePolicy};
 use crate::eras::{EraRules, EraRulesImpl, RuleContext};
 use crate::ledger_seq::{BlockFieldsDelta, LedgerDelta};
+#[cfg(not(feature = "parallel-verification"))]
 use crate::plutus::evaluate_plutus_scripts;
+#[cfg(feature = "parallel-verification")]
+use crate::plutus::{capture_phase2_work_item, run_phase2_parallel, Phase2WorkItem};
 use crate::utxo_diff::UtxoDiff;
 use crate::validation::{calculate_ref_script_size, ValidationError};
 use dugite_primitives::block::{Block, Point};
@@ -254,6 +257,15 @@ impl LedgerState {
                         .iter()
                         .map(|(k, v)| (*k, *v))
                         .collect();
+                    // Mirror the boundary handler's pre-AVVM-reserves adjustment at
+                    // the Shelley→Allegra boundary (see `pending_avvm_return`); a
+                    // non-consuming read so `process_epoch_transition` still applies it.
+                    let dbg_reward_reserves = Lovelace(
+                        self.epochs
+                            .reserves
+                            .0
+                            .saturating_sub(self.epochs.pending_avvm_return),
+                    );
                     let upcoming_rupd = crate::state::rewards::compute_reward_update(
                         &self.epochs.prev_protocol_params,
                         &self.epochs.prev_d,
@@ -261,9 +273,10 @@ impl LedgerState {
                         self.epochs.snapshots.go.as_ref(),
                         &self.epochs.snapshots.bprev_blocks_by_pool,
                         self.epochs.snapshots.ss_fee,
-                        self.epochs.reserves,
+                        dbg_reward_reserves,
                         self.epochs.treasury,
                         &_reward_accounts_std,
+                        self.epochs.rupd_addrs_rew.as_deref(),
                         self.epoch_length,
                         self.shelley_transition_epoch,
                         self.max_lovelace_supply,
@@ -286,6 +299,34 @@ impl LedgerState {
                     &mut self.consensus,
                 )?;
                 self.epoch = next_epoch;
+                // #11: the startStep-frozen fvAddrsRew set just consumed by this
+                // boundary's RUPD is cleared so the new epoch re-captures it.
+                // (Subsequent skipped-epoch boundaries see None → fall back to
+                // boundary accounts, matching Haskell's forced startStep.)
+                self.epochs.rupd_addrs_rew = None;
+            }
+        }
+
+        // #11 startStep capture: the first time this (Shelley+, pv≤6) epoch's
+        // block slot crosses `epoch_first_slot + randomness_stabilisation_window`
+        // (4k/f), freeze the registered reward-account credential set — BEFORE
+        // applying this block's certificates. Mirrors Haskell's RUPD pulser
+        // `FreeVars.fvAddrsRew = Map.keysSet(accounts)`, captured during TICK
+        // (which precedes the block body). The next epoch boundary's
+        // `compute_reward_update` uses this frozen set for the pv≤6 member +
+        // leader reward prefilters instead of boundary-time accounts. pv≥7
+        // bypasses the prefilter, so we skip the (potentially large) snapshot.
+        if block.era != Era::Byron
+            && self.epochs.protocol_params.protocol_version_major <= 6
+            && self.epochs.rupd_addrs_rew.is_none()
+        {
+            let startstep_slot = self
+                .first_slot_of_epoch(self.epoch.0)
+                .saturating_add(self.randomness_stabilisation_window);
+            if block.slot().0 > startstep_slot {
+                let frozen: std::collections::HashSet<dugite_primitives::hash::Hash32> =
+                    self.certs.reward_accounts.keys().copied().collect();
+                self.epochs.rupd_addrs_rew = Some(std::sync::Arc::new(frozen));
             }
         }
 
@@ -464,6 +505,36 @@ impl LedgerState {
         // Track processed tx hashes to skip duplicates within a block
         let mut processed_tx_hashes =
             std::collections::HashSet::with_capacity(block.transactions.len());
+
+        // ── Deferred-parallel Phase-2 work items ─────────────────────────
+        //
+        // When `parallel-verification` is enabled, the per-tx loop resolves
+        // Plutus inputs sequentially (ordering-dependent: a tx may spend
+        // outputs produced by an earlier tx in the same block) and defers the
+        // expensive `eval_phase_two_raw` call to a parallel post-loop pass.
+        //
+        // Each work item is a self-contained struct (tx CBOR + resolved UTxO
+        // pairs + budget params) captured while the UTxO set still reflects
+        // the correct apply-point state for that transaction.
+        //
+        // The `SKIP_PHASE2_EVAL` thread-local is set to `true` before the
+        // loop so `validate_transaction_with_pools` suppresses its own phase-2
+        // call. Callers outside `apply_block` (mempool, tests) are unaffected.
+        // Typically only a small fraction of txs have redeemers, so we start
+        // with a zero-allocation Vec and let it grow on demand.
+        #[cfg(feature = "parallel-verification")]
+        let mut phase2_work_items: Vec<Phase2WorkItem> = Vec::new();
+        // Activate the phase-2 skip flag only in ValidateAll mode (the only
+        // mode that calls `validate_transaction_with_context`). In ApplyOnly
+        // mode, the flag would never be read, but we still set it for safety.
+        // The guard holds the previous flag value so we can restore it after
+        // the loop — critical for nested calls (e.g. forging path).
+        #[cfg(feature = "parallel-verification")]
+        let _phase2_skip_guard: bool = if mode == BlockValidationMode::ValidateAll {
+            crate::validation::suppress_phase2_eval()
+        } else {
+            false
+        };
 
         // Cache block-level values for RuleContext construction inside the loop.
         // We cannot call self.build_rule_context() inside the loop because it
@@ -771,8 +842,16 @@ impl LedgerState {
                         }
                     }
 
-                    // Conway LEDGERS: unelected committee member check
+                    // Conway LEDGERS: unelected committee member check.
+                    //
+                    // Aggregate one WARN per tx, not one per cert: a single
+                    // CommitteeHotAuth tx can carry 30+ certs, and dugite does not
+                    // yet enact the network's UpdateCommittee gov actions, so its
+                    // committee stays at the genesis set and EVERY elected member's
+                    // hot-key auth fails this lookup. Per-cert logging produced a
+                    // 186K-line / 1GB+ log over a single Conway sync (#22 follow-up).
                     if self.epochs.protocol_params.protocol_version_major >= 9 {
+                        let mut unelected: Vec<String> = Vec::new();
                         for cert in &tx.body.certificates {
                             if let Certificate::CommitteeHotAuth {
                                 cold_credential, ..
@@ -785,15 +864,20 @@ impl LedgerState {
                                     .committee_expiration
                                     .contains_key(&cold_key)
                                 {
-                                    warn!(
-                                        tx_hash = %tx.hash.to_hex(),
-                                        slot = block.slot().0,
-                                        cold_key = %cold_key.to_hex(),
-                                        "UnelectedCommitteeMember on confirmed block — \
-                                         trusting on-chain consensus (committee state may be stale)"
-                                    );
+                                    unelected.push(cold_key.to_hex());
                                 }
                             }
+                        }
+                        if !unelected.is_empty() {
+                            warn!(
+                                tx_hash = %tx.hash.to_hex(),
+                                slot = block.slot().0,
+                                count = unelected.len(),
+                                first_cold_key = %unelected[0],
+                                "CommitteeHotAuth for non-current CC member(s) on confirmed \
+                                 block — dugite has not enacted the network's UpdateCommittee, \
+                                 so its committee is stale; trusting on-chain consensus"
+                            );
                         }
                     }
 
@@ -932,26 +1016,82 @@ impl LedgerState {
                     // are O(1) imbl structural clones — independent from the live maps.
                     // Apply-time mutations on `self.certs.reward_accounts` etc. are
                     // O(log N) with no CoW deep-clone, and don't affect the snapshots.
+                    //
+                    // ── Deferred Phase-2 work item capture ───────────────────
+                    //
+                    // When `parallel-verification` is enabled, `validate_transaction_with_context`
+                    // ran with the SKIP_PHASE2_EVAL flag set, so phase-2 was suppressed
+                    // above. Capture the work item now — while the UTxO set still
+                    // reflects the apply-point state for this transaction. The actual
+                    // `eval_phase_two_raw` call runs in the parallel pass after the loop.
+                    #[cfg(feature = "parallel-verification")]
+                    if has_redeemers {
+                        let max_ex = (
+                            self.epochs.protocol_params.max_tx_ex_units.steps,
+                            self.epochs.protocol_params.max_tx_ex_units.mem,
+                        );
+                        phase2_work_items.push(capture_phase2_work_item(
+                            tx_idx,
+                            tx,
+                            &self.utxo.utxo_set,
+                            cost_models_cbor.clone(),
+                            max_ex,
+                            self.slot_config,
+                            self.epochs.protocol_params.protocol_version_major as u32,
+                        ));
+                    }
                 } else if has_redeemers {
                     // Producer claims tx is invalid with scripts present.
                     // Verify scripts actually fail; if they pass, producer is stealing collateral.
-                    let max_ex = (
-                        self.epochs.protocol_params.max_tx_ex_units.steps,
-                        self.epochs.protocol_params.max_tx_ex_units.mem,
-                    );
-                    let eval_result = evaluate_plutus_scripts(
-                        tx,
-                        &self.utxo.utxo_set,
-                        cost_models_cbor.as_deref(),
-                        max_ex,
-                        &self.slot_config,
-                    );
-                    if eval_result.is_ok() {
-                        return Err(LedgerError::ValidationTagMismatch {
-                            tx_hash: tx.hash.to_hex(),
-                            block_flag: false,
-                            eval_result: true,
-                        });
+                    //
+                    // ── Parallel path: defer eval, capture work item ──────────
+                    #[cfg(feature = "parallel-verification")]
+                    {
+                        let max_ex = (
+                            self.epochs.protocol_params.max_tx_ex_units.steps,
+                            self.epochs.protocol_params.max_tx_ex_units.mem,
+                        );
+                        phase2_work_items.push(capture_phase2_work_item(
+                            tx_idx,
+                            tx,
+                            &self.utxo.utxo_set,
+                            cost_models_cbor.clone(),
+                            max_ex,
+                            self.slot_config,
+                            self.epochs.protocol_params.protocol_version_major as u32,
+                        ));
+                    }
+                    // ── Sequential fallback (feature disabled) ────────────────
+                    #[cfg(not(feature = "parallel-verification"))]
+                    {
+                        let max_ex = (
+                            self.epochs.protocol_params.max_tx_ex_units.steps,
+                            self.epochs.protocol_params.max_tx_ex_units.mem,
+                        );
+                        let eval_result = evaluate_plutus_scripts(
+                            tx,
+                            &self.utxo.utxo_set,
+                            cost_models_cbor.as_deref(),
+                            max_ex,
+                            &self.slot_config,
+                            self.epochs.protocol_params.protocol_version_major as u32,
+                        );
+                        if eval_result.is_ok() {
+                            // Phase-2 divergence on a confirmed block: the
+                            // on-chain is_valid=false flag is consensus truth
+                            // (see the parallel branch in Step 8d for the full
+                            // rationale). Trust it, log, and fall through to
+                            // Step 8b which applies the tx as invalid — keeping
+                            // the ledger state byte-exact — instead of halting
+                            // the sync.
+                            warn!(
+                                tx_hash = %tx.hash.to_hex(),
+                                slot = block.slot().0,
+                                "Plutus evaluation divergence: uplc says scripts PASS but block \
+                                 is_valid=false on-chain — trusting on-chain consensus (tx applied \
+                                 as invalid; dugite CEK over-permissive)"
+                            );
+                        }
                     }
                 }
             }
@@ -1112,6 +1252,83 @@ impl LedgerState {
             }
         }
 
+        // ── Step 8d: Parallel Phase-2 evaluation ─────────────────────────
+        //
+        // Restore the SKIP_PHASE2_EVAL flag and run all deferred Plutus evals
+        // in parallel via rayon. Results are collected in tx_idx order (rayon
+        // `par_iter` + `sort_by_key` in `run_phase2_parallel`).
+        //
+        // Error semantics (per-result):
+        //   is_valid=true  → ScriptFailed warning (trusting on-chain consensus)
+        //   is_valid=false → ValidationTagMismatch → early-return Err (fatal)
+        //
+        // This mirrors the sequential path exactly: same checks, same error
+        // precedence, same result per transaction. The fingerprint is unaffected
+        // because ledger state is determined by the UTxO apply (Step 8b), which
+        // already ran sequentially above.
+        #[cfg(feature = "parallel-verification")]
+        {
+            crate::validation::restore_phase2_eval(_phase2_skip_guard);
+            if mode == BlockValidationMode::ValidateAll && !phase2_work_items.is_empty() {
+                let t_phase2_start = if timing_enabled {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                let outcomes = run_phase2_parallel(phase2_work_items);
+                if let Some(start) = t_phase2_start {
+                    t_validate += start.elapsed();
+                }
+                for outcome in outcomes {
+                    // Look up the transaction by index. Duplicate txs were
+                    // skipped during the loop (not added to work_items), so
+                    // every outcome.tx_idx is a valid index.
+                    let tx = match block.transactions.get(outcome.tx_idx) {
+                        Some(t) => t,
+                        None => continue,
+                    };
+                    if outcome.is_valid {
+                        // is_valid=true: phase-2 failure is a ScriptFailed on a
+                        // confirmed block — log a warning and trust on-chain consensus.
+                        if let Err(e) = outcome.result {
+                            warn!(
+                                tx_hash = %tx.hash.to_hex(),
+                                slot = block.slot().0,
+                                error = %e,
+                                "Plutus evaluation divergence (parallel): uplc says scripts fail \
+                                 but block is_valid=true on-chain — trusting on-chain consensus"
+                            );
+                        }
+                    } else {
+                        // is_valid=false: the producer's scripts failed on-chain
+                        // (collateral consumed). dugite's CEK says they pass — a
+                        // Phase-2 evaluation divergence. On a block received via
+                        // ChainSync the is_valid flag is CONSENSUS TRUTH: honest
+                        // (Haskell) nodes enforce it with a correct CEK, so any
+                        // block on the selected chain carries a genuine flag and
+                        // the divergence is a dugite-CEK bug, not collateral
+                        // theft. The tx was ALREADY applied as invalid (collateral
+                        // consumed, no outputs) in Step 8b, so the ledger state is
+                        // byte-exact regardless. Trust the on-chain flag and log
+                        // the divergence (symmetric with the is_valid=true branch
+                        // above) instead of hard-halting the whole sync. The
+                        // DUGITE_PHASE2_DUMP_DIR repro was captured in
+                        // run_phase2_parallel for offline CEK root-causing.
+                        if outcome.result.is_ok() {
+                            warn!(
+                                tx_hash = %tx.hash.to_hex(),
+                                slot = block.slot().0,
+                                "Plutus evaluation divergence (parallel): uplc says scripts PASS \
+                                 but block is_valid=false on-chain — trusting on-chain consensus \
+                                 (tx applied as invalid; dugite CEK over-permissive — see \
+                                 DUGITE_PHASE2_DUMP_DIR)"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         // ── Step 9: Nonce evolution and block production tracking ─────────
         //
         // Dispatched to era rules via `evolve_nonce`. Each era's implementation
@@ -1209,9 +1426,39 @@ impl LedgerState {
 
         // Snapshot pre-block epoch to detect epoch transitions.
         let pre_epoch = self.epoch;
+        // Capture the pre-block governance Arc so we can detect (by pointer)
+        // whether this block mutated governance at all.
+        let gov_before = std::sync::Arc::clone(&self.gov.governance);
 
         // Apply the block (all state mutations happen here).
         self.apply_block(block, mode)?;
+
+        // Capture the post-block `imbl` cert maps so state reconstruction
+        // (rollback_via_seq / state_at_index / anchor advance) restores them
+        // exactly instead of inheriting the stale anchor value. These are
+        // mutated in place by `apply_block` and are not represented by the
+        // `*_changes` delta vecs. `imbl::HashMap` clone is O(1). This fixes the
+        // fork-induced reward-account corruption behind the preprod ep292 halt.
+        delta.reward_accounts_snapshot = Some(self.certs.reward_accounts.clone());
+        delta.delegations_snapshot = Some(self.certs.delegations.clone());
+        delta.stake_key_deposits_snapshot = Some(self.certs.stake_key_deposits.clone());
+        // Snapshot gov ONLY when this block actually mutated it. gov is
+        // `Arc<GovernanceState>` backed by std HashMaps (not imbl), so an
+        // `Arc::make_mut` after a retained snapshot deep-clones the whole
+        // GovernanceState; capturing it unconditionally in every one of the
+        // k=2160 retained deltas blew memory up at deep Conway (OOM). Most
+        // blocks don't touch governance, so `gov_before` and the post-block Arc
+        // are pointer-equal → no snapshot, no cost. On reconstruction,
+        // `apply_delta_to_state` leaves gov untouched for `None` deltas, so it
+        // is carried forward from the most recent delta that DID change it (or
+        // the anchor) — which is exactly the gov state at that point. Captures
+        // DReps, vote delegations, proposals, votes and enacted roots so a fork
+        // rollback restores them instead of the stale anchor governance (which
+        // left DRep power at 0 → ParameterChanges never ratified → V3 cost
+        // model frozen → script_data_hash divergence + deposits_proposal=0).
+        if !std::sync::Arc::ptr_eq(&gov_before, &self.gov.governance) {
+            delta.gov_snapshot = Some(self.gov.clone());
+        }
 
         // Extract the UTxO diff from the DiffSeq entry that apply_block just pushed.
         if let Some((_slot, _hash, utxo_diff)) = self.utxo.diff_seq.diffs.back() {
