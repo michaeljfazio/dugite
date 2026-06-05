@@ -131,6 +131,32 @@ pub struct LedgerDelta {
     pub delegations_snapshot: Option<imbl::HashMap<Hash32, Hash28>>,
     /// See [`Self::reward_accounts_snapshot`].
     pub stake_key_deposits_snapshot: Option<imbl::HashMap<Hash32, u64>>,
+
+    /// Post-block snapshot of pool-related cert state (`pool_params`,
+    /// `future_pool_params`, `pending_retirements`, `pool_deposits`).
+    ///
+    /// These fields are mutated in place by `apply_block` when the block
+    /// contains `PoolRegistration` or `PoolRetirement` certificates, and are
+    /// NOT represented by the `pool_changes` delta vec (which is never
+    /// populated). Without a snapshot, `apply_delta_to_state` would leave
+    /// them at the stale anchor value so a fork rollback would resurrect
+    /// retired pools or forget newly registered pools from the volatile window.
+    ///
+    /// `pool_params` is `Arc<HashMap>` so `Arc::clone()` is O(1) — just a
+    /// refcount bump. `future_pool_params`, `pending_retirements`, and
+    /// `pool_deposits` are small plain `HashMap`s (at most a few entries
+    /// per block), so cloning them is negligible. Only emitted when
+    /// `pool_params` was mutated (detected via `Arc::ptr_eq`). Blocks that
+    /// contain no pool certs carry `None` and `apply_delta_to_state` leaves
+    /// the fields untouched.
+    pub pool_params_snapshot: Option<Arc<HashMap<Hash28, PoolRegistration>>>,
+    /// See [`Self::pool_params_snapshot`].
+    pub future_pool_params_snapshot: Option<HashMap<Hash28, PoolRegistration>>,
+    /// See [`Self::pool_params_snapshot`].
+    pub pending_retirements_snapshot: Option<HashMap<Hash28, EpochNo>>,
+    /// See [`Self::pool_params_snapshot`].
+    pub pool_deposits_snapshot: Option<HashMap<Hash28, u64>>,
+
     /// Post-block snapshot of the governance substate (`Arc<GovernanceState>`,
     /// so the clone is O(1)). Like the cert maps above, `gov` is mutated in
     /// place by `apply_block` (DRep registration, vote delegations, proposal
@@ -162,6 +188,10 @@ impl LedgerDelta {
             reward_accounts_snapshot: None,
             delegations_snapshot: None,
             stake_key_deposits_snapshot: None,
+            pool_params_snapshot: None,
+            future_pool_params_snapshot: None,
+            pending_retirements_snapshot: None,
+            pool_deposits_snapshot: None,
             gov_snapshot: None,
         }
     }
@@ -844,6 +874,20 @@ pub fn apply_delta_to_state(state: &mut LedgerState, delta: &LedgerDelta) {
     }
     if let Some(sk) = &delta.stake_key_deposits_snapshot {
         state.certs.stake_key_deposits = sk.clone();
+    }
+    // Pool state snapshots: pool_params (Arc clone = O(1)), and the small
+    // plain-HashMap pool fields that change on pool cert blocks.
+    if let Some(pp) = &delta.pool_params_snapshot {
+        state.certs.pool_params = Arc::clone(pp);
+    }
+    if let Some(fpp) = &delta.future_pool_params_snapshot {
+        state.certs.future_pool_params = fpp.clone();
+    }
+    if let Some(pr) = &delta.pending_retirements_snapshot {
+        state.certs.pending_retirements = pr.clone();
+    }
+    if let Some(pd) = &delta.pool_deposits_snapshot {
+        state.certs.pool_deposits = pd.clone();
     }
     if let Some(g) = &delta.gov_snapshot {
         state.gov = g.clone();
@@ -1840,5 +1884,351 @@ mod tests {
         let tip = seq.tip_state();
         assert_eq!(tip.utxo.epoch_fees.0, 88_000);
         assert_eq!(seq.len(), 3);
+    }
+
+    // ── Issue #728: snapshot-based cert/gov reconstruction ───────────────────
+    //
+    // These tests exercise the real bug: before the `*_snapshot` fix, every call
+    // to `apply_delta_to_state` left `reward_accounts`, `delegations`,
+    // `pool_params`, and `gov` at the stale anchor value because the
+    // `*_changes` delta vecs are never populated.  A fork rollback therefore
+    // silently reset all cert/gov state to the anchor, corrupting reward
+    // balances (preprod ep292 `WithdrawalAmountMismatch`), losing pool
+    // registrations, and wiping DRep state.
+
+    /// Reward account credit + withdrawal within the volatile window must be
+    /// visible after a rollback that lands AFTER those changes (#728 regression).
+    #[test]
+    fn rollback_mid_window_restores_reward_accounts_exactly() {
+        let cred_a = Hash32::from_bytes([0x01; 32]);
+        let cred_b = Hash32::from_bytes([0x02; 32]);
+
+        // Anchor: both accounts have zero balance.
+        let anchor = make_anchor();
+        let mut seq = LedgerSeq::with_defaults(anchor, 10);
+
+        // Block 1: credit cred_a to 1000.
+        {
+            let mut d = make_delta(1, 1, 0);
+            let mut ra = imbl::HashMap::new();
+            ra.insert(cred_a, Lovelace(1000));
+            d.reward_accounts_snapshot = Some(ra);
+            seq.push(d);
+        }
+        // Block 2: cred_a withdraws all (→ 0), cred_b credited 500.
+        {
+            let mut d = make_delta(2, 2, 0);
+            let mut ra = imbl::HashMap::new();
+            ra.insert(cred_a, Lovelace(0));
+            ra.insert(cred_b, Lovelace(500));
+            d.reward_accounts_snapshot = Some(ra);
+            seq.push(d);
+        }
+        // Block 3: cred_b credited further to 700.
+        {
+            let mut d = make_delta(3, 3, 0);
+            let mut ra = imbl::HashMap::new();
+            ra.insert(cred_a, Lovelace(0));
+            ra.insert(cred_b, Lovelace(700));
+            d.reward_accounts_snapshot = Some(ra);
+            seq.push(d);
+        }
+
+        // Tip: cred_a=0, cred_b=700.
+        {
+            let tip = seq.tip_state();
+            assert_eq!(
+                tip.certs.reward_accounts.get(&cred_a).copied(),
+                Some(Lovelace(0)),
+                "tip: cred_a must be 0 after withdrawal"
+            );
+            assert_eq!(
+                tip.certs.reward_accounts.get(&cred_b).copied(),
+                Some(Lovelace(700)),
+                "tip: cred_b must be 700"
+            );
+        }
+
+        // Roll back to block 1 (remove blocks 2 and 3).
+        seq.rollback(2);
+        {
+            let tip = seq.tip_state();
+            assert_eq!(
+                tip.certs.reward_accounts.get(&cred_a).copied(),
+                Some(Lovelace(1000)),
+                "after rollback to block 1: cred_a must be 1000 (pre-withdrawal), \
+                 NOT the stale anchor value 0 (the #728 ep292 bug)"
+            );
+            assert_eq!(
+                tip.certs.reward_accounts.get(&cred_b).copied(),
+                None,
+                "after rollback to block 1: cred_b must not exist yet"
+            );
+        }
+    }
+
+    /// Delegation map changes within the volatile window must survive rollback.
+    #[test]
+    fn rollback_restores_delegations_from_snapshot() {
+        let cred = Hash32::from_bytes([0xCC; 32]);
+        let pool_a = Hash28::from_bytes([0xAA; 28]);
+        let pool_b = Hash28::from_bytes([0xBB; 28]);
+
+        let anchor = make_anchor();
+        let mut seq = LedgerSeq::with_defaults(anchor, 10);
+
+        // Block 1: cred delegates to pool_a.
+        {
+            let mut d = make_delta(10, 1, 0);
+            let mut dl = imbl::HashMap::new();
+            dl.insert(cred, pool_a);
+            d.delegations_snapshot = Some(dl);
+            seq.push(d);
+        }
+        // Block 2: cred re-delegates to pool_b.
+        {
+            let mut d = make_delta(20, 2, 0);
+            let mut dl = imbl::HashMap::new();
+            dl.insert(cred, pool_b);
+            d.delegations_snapshot = Some(dl);
+            seq.push(d);
+        }
+
+        assert_eq!(
+            seq.tip_state().certs.delegations.get(&cred).copied(),
+            Some(pool_b),
+            "tip must show delegation to pool_b"
+        );
+
+        seq.rollback(1);
+        assert_eq!(
+            seq.tip_state().certs.delegations.get(&cred).copied(),
+            Some(pool_a),
+            "after rollback delegation must revert to pool_a, not the anchor (None)"
+        );
+    }
+
+    /// Pool registration and retirement within the volatile window must survive
+    /// rollback (#728: pool_changes never populated, pool_params not snapshotted).
+    #[test]
+    fn rollback_restores_pool_params_from_snapshot() {
+        let pool_id = Hash28::from_bytes([0xDE; 28]);
+        let anchor = make_anchor();
+        let mut seq = LedgerSeq::with_defaults(anchor, 10);
+
+        // Helper to build a minimal PoolRegistration for tests.
+        fn make_pool_reg(pool_id: Hash28) -> PoolRegistration {
+            PoolRegistration {
+                pool_id,
+                vrf_keyhash: Hash32::from_bytes([0x01; 32]),
+                pledge: Lovelace(1_000_000_000),
+                cost: Lovelace(340_000_000),
+                margin_numerator: 1,
+                margin_denominator: 20,
+                reward_account: vec![0u8; 29],
+                owners: Vec::new(),
+                relays: Vec::new(),
+                metadata_url: None,
+                metadata_hash: None,
+            }
+        }
+
+        // Block 1: pool registered (pool_params_snapshot captures it).
+        {
+            let mut d = make_delta(10, 1, 0);
+            let mut pp = HashMap::new();
+            pp.insert(pool_id, make_pool_reg(pool_id));
+            d.pool_params_snapshot = Some(Arc::new(pp));
+            d.future_pool_params_snapshot = Some(HashMap::new());
+            d.pending_retirements_snapshot = Some(HashMap::new());
+            d.pool_deposits_snapshot = Some(HashMap::new());
+            seq.push(d);
+        }
+        // Block 2: pool scheduled for retirement.
+        {
+            let mut d = make_delta(20, 2, 0);
+            let mut pp = HashMap::new();
+            pp.insert(pool_id, make_pool_reg(pool_id));
+            d.pool_params_snapshot = Some(Arc::new(pp));
+            d.future_pool_params_snapshot = Some(HashMap::new());
+            let mut pr = HashMap::new();
+            pr.insert(pool_id, EpochNo(99));
+            d.pending_retirements_snapshot = Some(pr);
+            d.pool_deposits_snapshot = Some(HashMap::new());
+            seq.push(d);
+        }
+
+        // Tip: pool exists in pool_params AND has a pending retirement.
+        {
+            let tip = seq.tip_state();
+            assert!(
+                tip.certs.pool_params.contains_key(&pool_id),
+                "tip must contain the registered pool"
+            );
+            assert_eq!(
+                tip.certs.pending_retirements.get(&pool_id).map(|e| e.0),
+                Some(99),
+                "tip must have the pending retirement at epoch 99"
+            );
+        }
+
+        // Roll back block 2 (retirement block).
+        seq.rollback(1);
+        {
+            let tip = seq.tip_state();
+            assert!(
+                tip.certs.pool_params.contains_key(&pool_id),
+                "after rollback pool must still be registered (block 1 snapshot)"
+            );
+            assert!(
+                !tip.certs.pending_retirements.contains_key(&pool_id),
+                "after rollback the retirement must be gone (not in block 1 snapshot); \
+                 stale anchor would have also had no retirement, but this confirms the \
+                 block-1 snapshot is used, not the empty anchor"
+            );
+        }
+
+        // Roll back block 1 (registration block) — tip is now the anchor.
+        seq.rollback(1);
+        {
+            let tip = seq.tip_state();
+            assert!(
+                !tip.certs.pool_params.contains_key(&pool_id),
+                "after full rollback pool must not exist (anchor had no pool)"
+            );
+        }
+    }
+
+    /// Governance state changes within the volatile window must survive rollback
+    /// including a mid-window rollback that lands between two governance mutations.
+    #[test]
+    fn rollback_mid_window_restores_governance_exactly() {
+        let anchor = make_anchor();
+        let mut seq = LedgerSeq::with_defaults(anchor, 10);
+
+        // Block 1: proposal_count = 3.
+        {
+            let mut d = make_delta(10, 1, 0);
+            let mut gov = make_anchor().gov;
+            std::sync::Arc::make_mut(&mut gov.governance).proposal_count = 3;
+            d.gov_snapshot = Some(gov);
+            seq.push(d);
+        }
+        // Block 2: no gov change (no gov_snapshot).
+        seq.push(make_delta(20, 2, 0));
+
+        // Block 3: proposal_count = 7.
+        {
+            let mut d = make_delta(30, 3, 0);
+            let mut gov = make_anchor().gov;
+            std::sync::Arc::make_mut(&mut gov.governance).proposal_count = 7;
+            d.gov_snapshot = Some(gov);
+            seq.push(d);
+        }
+
+        assert_eq!(
+            seq.tip_state().gov.governance.proposal_count,
+            7,
+            "tip must have proposal_count 7"
+        );
+
+        // Roll back block 3: tip is block 2 (no gov change) — gov should carry
+        // forward from the most recent snapshot, which is block 1's snapshot (3).
+        seq.rollback(1);
+        assert_eq!(
+            seq.tip_state().gov.governance.proposal_count,
+            3,
+            "after rollback of block 3, gov must revert to block 1's snapshot value (3), \
+             not the stale anchor (0)"
+        );
+    }
+
+    /// A stake_key_deposits change within the volatile window must survive rollback.
+    #[test]
+    fn rollback_restores_stake_key_deposits_from_snapshot() {
+        let cred = Hash32::from_bytes([0xD1; 32]);
+        let anchor = make_anchor();
+        let mut seq = LedgerSeq::with_defaults(anchor, 10);
+
+        // Block 1: register cred (deposit = 2_000_000).
+        {
+            let mut d = make_delta(5, 1, 0);
+            let mut sk = imbl::HashMap::new();
+            sk.insert(cred, 2_000_000u64);
+            d.stake_key_deposits_snapshot = Some(sk);
+            seq.push(d);
+        }
+        // Block 2: deregister cred (deposit = 0, entry removed).
+        {
+            let mut d = make_delta(10, 2, 0);
+            d.stake_key_deposits_snapshot = Some(imbl::HashMap::new());
+            seq.push(d);
+        }
+
+        assert_eq!(
+            seq.tip_state().certs.stake_key_deposits.get(&cred).copied(),
+            None,
+            "tip: deposit must be gone after deregistration"
+        );
+
+        seq.rollback(1);
+        assert_eq!(
+            seq.tip_state().certs.stake_key_deposits.get(&cred).copied(),
+            Some(2_000_000),
+            "after rollback deposit must be restored from block 1 snapshot"
+        );
+    }
+
+    /// `advance_anchor` must carry snapshot state into the anchor correctly so
+    /// that the anchor itself reflects all cert changes from consumed deltas.
+    #[test]
+    fn advance_anchor_carries_reward_accounts_forward() {
+        let cred = Hash32::from_bytes([0xE1; 32]);
+        let anchor = make_anchor();
+        let k = 3u64;
+        let mut seq = LedgerSeq::with_defaults(anchor, k);
+
+        // Push k+1 deltas — the first is consumed into the anchor via advance_anchor.
+        // Delta 0 (slot 1): credit cred to 500.
+        {
+            let mut d = make_delta(1, 1, 0);
+            let mut ra = imbl::HashMap::new();
+            ra.insert(cred, Lovelace(500));
+            d.reward_accounts_snapshot = Some(ra);
+            seq.push(d);
+        }
+        // Delta 1 (slot 2): credit cred to 800.
+        {
+            let mut d = make_delta(2, 2, 0);
+            let mut ra = imbl::HashMap::new();
+            ra.insert(cred, Lovelace(800));
+            d.reward_accounts_snapshot = Some(ra);
+            seq.push(d);
+        }
+        // Delta 2 (slot 3): cred unchanged (no snapshot).
+        seq.push(make_delta(3, 3, 0));
+        // Delta 3 (slot 4): triggers advance_anchor (consumes delta 0).
+        {
+            let mut d = make_delta(4, 4, 0);
+            let mut ra = imbl::HashMap::new();
+            ra.insert(cred, Lovelace(800));
+            d.reward_accounts_snapshot = Some(ra);
+            seq.push(d);
+        }
+
+        // After advance_anchor, the anchor should reflect delta 0's reward
+        // accounts (500). The volatile window holds deltas 1-3.
+        assert_eq!(
+            seq.anchor_state().certs.reward_accounts.get(&cred).copied(),
+            Some(Lovelace(500)),
+            "anchor must reflect the consumed delta's reward_accounts snapshot"
+        );
+
+        // tip_state must reflect the newest snapshot: 800.
+        assert_eq!(
+            seq.tip_state().certs.reward_accounts.get(&cred).copied(),
+            Some(Lovelace(800)),
+            "tip must reflect the most recent reward_accounts snapshot (800)"
+        );
     }
 }
