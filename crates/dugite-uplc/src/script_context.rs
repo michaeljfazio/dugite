@@ -420,6 +420,43 @@ impl PlutusValue {
                 .collect(),
         )
     }
+
+    /// V1/V2 `txInfoMint :: Value` encoding.
+    ///
+    /// Identical to [`to_data`](Self::to_data) but with the mandatory
+    /// ada(0) entry `(b"", Map [(b"", I 0)])` prepended. cardano-ledger
+    /// builds the mint Value as
+    /// `transMintValue m = transCoinToValue zero <> transMultiAsset m`
+    /// (`eras/alonzo/impl/.../Plutus/TxInfo.hs`) — the ada symbol is ALWAYS
+    /// present with quantity 0 even though minting ada is impossible
+    /// ("hysterical raisins" backward-compat: scripts that inspected the
+    /// pre-Mary mint Value must keep seeing the ada key). The native-token
+    /// policies follow in ascending policy-id order (matching
+    /// `transMultiAsset`'s `Map.foldrWithKey'` over the sorted `Data.Map`).
+    ///
+    /// PlutusV3 `txInfoMint :: MintValue` OMITS this entry — use
+    /// [`to_data`](Self::to_data) there.
+    pub fn to_mint_data_v1v2(&self) -> Data {
+        let ada_entry = (
+            Data::B(Vec::new()),
+            data_map(vec![(Data::B(Vec::new()), data_i(BigInt::from(0)))]),
+        );
+        let mut entries: Vec<(Data, Data)> = Vec::with_capacity(self.policies.len() + 1);
+        entries.push(ada_entry);
+        for (policy, assets) in &self.policies {
+            let token_entries: Vec<(Data, Data)> = assets
+                .iter()
+                .map(|(name, amt)| (Data::B(name.clone()), data_i(amt.clone())))
+                .collect();
+            let key = if policy == &[0u8; 28] {
+                Data::B(Vec::new())
+            } else {
+                data_bs28(policy)
+            };
+            entries.push((key, data_map(token_entries)));
+        }
+        data_map(entries)
+    }
 }
 
 impl TxOutRef {
@@ -856,7 +893,8 @@ impl TxInfoV1 {
                 data_list(self.outputs.iter().map(TxOut::to_data_v1).collect()),
                 // fee :: Value — ADA-only map, NOT bare Integer
                 data_ada_value(self.fee.clone()),
-                self.mint.to_data(),
+                // mint :: Value — INCLUDES the ada(0) entry (transMintValue).
+                self.mint.to_mint_data_v1v2(),
                 data_list(self.dcert.iter().map(|c| c.0.clone()).collect()),
                 // V1 wdrl :: [(StakingCredential, Integer)] — AssocList, not Map.
                 // Encoded as List[Constr 0 [cred.to_data(), I(amt)]].
@@ -918,7 +956,8 @@ impl TxInfoV2 {
                 data_list(self.outputs.iter().map(TxOut::to_data).collect()),
                 // fee :: Value — ADA-only map, NOT bare Integer
                 data_ada_value(self.fee.clone()),
-                self.mint.to_data(),
+                // mint :: Value — INCLUDES the ada(0) entry (transMintValue).
+                self.mint.to_mint_data_v1v2(),
                 data_list(self.dcert.iter().map(|c| c.0.clone()).collect()),
                 // V2 wdrl :: Map StakingCredential Integer — Data::Map.
                 // Reference: PlutusLedgerApi/V2/Contexts.hs TxInfo.txInfoWdrl.
@@ -963,6 +1002,41 @@ mod tests {
 
     fn pk(b: u8) -> Credential {
         Credential::PubKey([b; 28])
+    }
+
+    #[test]
+    fn v1v2_mint_value_prepends_ada_zero_entry() {
+        // A mint with one native policy. V1/V2 `txInfoMint :: Value` must
+        // include the ada(0) entry (b"", Map[(b"", 0)]) FIRST, per
+        // cardano-ledger `transMintValue m = transCoinToValue zero <>
+        // transMultiAsset m`. V3 `MintValue` omits it.
+        let v = PlutusValue {
+            policies: vec![([0x5d; 28], vec![(b"tok".to_vec(), BigInt::from(-1))])],
+        };
+        // V1/V2: ada entry present and first.
+        let m = v.to_mint_data_v1v2();
+        let Data::Map(entries) = m else {
+            panic!("expected Map");
+        };
+        assert_eq!(entries.len(), 2, "ada + 1 native policy");
+        // entry[0] = (b"", Map[(b"", I 0)])
+        assert!(matches!(&entries[0].0, Data::B(b) if b.is_empty()));
+        let Data::Map(ada_tokens) = &entries[0].1 else {
+            panic!("ada inner must be a Map");
+        };
+        assert_eq!(ada_tokens.len(), 1);
+        assert!(matches!(&ada_tokens[0].0, Data::B(b) if b.is_empty()));
+        assert!(matches!(&ada_tokens[0].1, Data::I(n) if *n == BigInt::from(0)));
+        // entry[1] = the native policy (28-byte key).
+        assert!(matches!(&entries[1].0, Data::B(b) if b.len() == 28));
+
+        // V3 (to_data): NO ada entry — just the native policy.
+        let v3 = v.to_data();
+        let Data::Map(v3_entries) = v3 else {
+            panic!("expected Map");
+        };
+        assert_eq!(v3_entries.len(), 1, "V3 MintValue omits ada");
+        assert!(matches!(&v3_entries[0].0, Data::B(b) if b.len() == 28));
     }
 
     #[test]
