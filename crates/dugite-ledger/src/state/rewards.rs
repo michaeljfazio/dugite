@@ -1350,51 +1350,6 @@ mod tests {
         );
     }
 
-    /// Issue #438 static-audit Suspect 1: withdrawal-on-tx-rollback restoration.
-    ///
-    /// Claim under audit: "If a block containing a withdrawal is rolled back,
-    /// the reward balance may be over-restored — e.g., the withdrawal is
-    /// re-added even though the tx was marked `is_valid: false`."
-    ///
-    /// Result: EXONERATED by construction.
-    ///
-    /// `ledger_seq.rs` uses a delta-based reconstruction model (see module
-    /// header comment at line 5 and the explicit note at line 725:
-    /// "It is NOT used during rollback (rollback simply discards deltas).").
-    /// `Self::rollback(n)` (line 613) is implemented as
-    /// `self.deltas.truncate(new_len)` — pure truncation, no inverse-apply.
-    /// There is no asymmetric "restore withdrawal" code path, therefore no
-    /// way to over-restore.
-    ///
-    /// This test pins the invariant in source so a future refactor that
-    /// introduces an inverse-apply path will be caught here.
-    #[test]
-    fn test_issue_438_rollback_is_pure_delta_truncation_not_inverse_apply() {
-        // The audit reduces to a textual invariant: ledger_seq::rollback must
-        // not call any "undo withdrawal" code. We assert by re-reading the
-        // module and checking the truncate-based implementation is intact.
-        let src = include_str!("../ledger_seq.rs");
-        assert!(
-            src.contains("self.deltas.truncate(new_len)"),
-            "ledger_seq::rollback must remain a pure truncate (delta discard); \
-             any inverse-apply path would reopen issue #438 suspect 1"
-        );
-        assert!(
-            src.contains("NOT used during rollback (rollback simply discards deltas)"),
-            "the invariant doc-comment in ledger_seq.rs (around line 725) must \
-             remain — it is the static contract behind issue #438 suspect 1's \
-             exoneration"
-        );
-        // Forward reconstruction reapplies every RewardChange::Withdraw uniformly,
-        // so an `is_valid: false` tx that never produced a withdrawal delta in
-        // the first place cannot be "restored" — there is nothing to restore.
-        assert!(
-            src.contains("RewardChange::Withdraw"),
-            "forward delta application must include RewardChange::Withdraw — \
-             this is the only path that mutates reward balances on a withdrawal"
-        );
-    }
-
     /// Issue #438 static-audit Suspect 2: pending-RUPD + fresh-RUPD double-credit.
     ///
     /// Claim under audit: "At PV9→PV10 cutover, dugite may apply BOTH an

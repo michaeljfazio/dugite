@@ -1429,6 +1429,17 @@ impl LedgerState {
         // Capture the pre-block governance Arc so we can detect (by pointer)
         // whether this block mutated governance at all.
         let gov_before = std::sync::Arc::clone(&self.gov.governance);
+        // Capture the pre-block pool_params Arc pointer so we can detect
+        // whether this block mutated pool state (PoolRegistration / PoolRetirement
+        // certs). `pool_params` is mutated via `Arc::make_mut` on first-time pool
+        // registration — that CoW breaks pointer equality, giving us a cheap
+        // "did pool state change?" signal without scanning block contents.
+        let pool_params_before = std::sync::Arc::clone(&self.certs.pool_params);
+        // Also capture pre-block sizes of the plain-HashMap pool fields so we can
+        // detect changes that don't go through pool_params (e.g. retirement-only
+        // blocks where a pending retirement is added but pool_params is unchanged).
+        let pending_retirements_len_before = self.certs.pending_retirements.len();
+        let future_pool_params_len_before = self.certs.future_pool_params.len();
 
         // Apply the block (all state mutations happen here).
         self.apply_block(block, mode)?;
@@ -1442,6 +1453,24 @@ impl LedgerState {
         delta.reward_accounts_snapshot = Some(self.certs.reward_accounts.clone());
         delta.delegations_snapshot = Some(self.certs.delegations.clone());
         delta.stake_key_deposits_snapshot = Some(self.certs.stake_key_deposits.clone());
+
+        // Snapshot pool state when this block mutated it (pool_params Arc pointer
+        // changed = first-time registration; or plain-map sizes changed = retirement
+        // or re-registration). `pool_params` Arc::clone is O(1); the plain HashMaps
+        // hold at most a few entries per block. On reconstruction,
+        // `apply_delta_to_state` restores these instead of inheriting the stale
+        // anchor value — fixes fork rollback corrupting pool registrations.
+        let pool_state_changed =
+            !std::sync::Arc::ptr_eq(&pool_params_before, &self.certs.pool_params)
+                || self.certs.pending_retirements.len() != pending_retirements_len_before
+                || self.certs.future_pool_params.len() != future_pool_params_len_before;
+        if pool_state_changed {
+            delta.pool_params_snapshot = Some(std::sync::Arc::clone(&self.certs.pool_params));
+            delta.future_pool_params_snapshot = Some(self.certs.future_pool_params.clone());
+            delta.pending_retirements_snapshot = Some(self.certs.pending_retirements.clone());
+            delta.pool_deposits_snapshot = Some(self.certs.pool_deposits.clone());
+        }
+
         // Snapshot gov ONLY when this block actually mutated it. gov is
         // `Arc<GovernanceState>` backed by std HashMaps (not imbl), so an
         // `Arc::make_mut` after a retained snapshot deep-clones the whole
