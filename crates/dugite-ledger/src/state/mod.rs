@@ -22,6 +22,10 @@ pub(crate) use governance::{
 pub use rewards::compute_reward_update;
 #[doc(hidden)]
 pub use rewards::Rat;
+pub use snapshot::{
+    check_snapshot_backend_match, infer_backend_from_snapshot, BackendCheckResult, SnapshotBackend,
+    SnapshotMeta,
+};
 pub use snapshot_format::LedgerStateSnapshot;
 pub use substates::{CertSubState, ConsensusSubState, EpochSubState, GovSubState, UtxoSubState};
 
@@ -42,8 +46,11 @@ use dugite_primitives::transaction::{
 };
 use dugite_primitives::value::Lovelace;
 use imbl::HashMap as ImblHashMap;
+use imbl::HashSet as ImblHashSet;
+use imbl::OrdMap as ImblOrdMap;
+use imbl::OrdSet as ImblOrdSet;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tracing::{debug, info, trace};
 
@@ -181,7 +188,7 @@ pub struct PEdges {
     /// Parent proposal ID (None if this proposal is a direct child of the root).
     pub parent: Option<GovActionId>,
     /// Direct children — proposals whose `prev_action_id` points to this one.
-    pub children: BTreeSet<GovActionId>,
+    pub children: ImblOrdSet<GovActionId>,
 }
 
 /// Root of a governance purpose tree — tracks the last enacted action and its
@@ -193,7 +200,7 @@ pub struct PRoot {
     /// Last enacted GovActionId for this purpose (None = genesis / no enactment yet).
     pub root: Option<GovActionId>,
     /// Direct children of the root (proposals whose `prev_action_id == root`).
-    pub children: BTreeSet<GovActionId>,
+    pub children: ImblOrdSet<GovActionId>,
 }
 
 /// Per-purpose DAG of proposal parent-child relationships for non-root proposals.
@@ -202,7 +209,7 @@ pub struct PRoot {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct PGraph {
     /// Map from proposal ID to its edges (parent + children).
-    pub nodes: HashMap<GovActionId, PEdges>,
+    pub nodes: ImblHashMap<GovActionId, PEdges>,
 }
 
 /// One value per governance purpose (4 purposes).
@@ -270,30 +277,30 @@ pub struct GovernanceState {
     /// Use [`GovernanceState::active_drep_count`] to obtain the count of DReps
     /// whose activity flag is still `true` (i.e. those that contribute voting
     /// power and that external tools like Koios report as "registered").
-    pub dreps: HashMap<Hash32, DRepRegistration>,
+    pub dreps: ImblHashMap<Hash32, DRepRegistration>,
     /// Vote delegations: stake credential hash -> DRep
-    pub vote_delegations: HashMap<Hash32, DRep>,
+    pub vote_delegations: ImblHashMap<Hash32, DRep>,
     /// Constitutional committee: cold credential -> hot credential
-    pub committee_hot_keys: HashMap<Hash32, Hash32>,
+    pub committee_hot_keys: ImblHashMap<Hash32, Hash32>,
     /// Committee member expiration epochs (cold credential -> expiration epoch)
-    pub committee_expiration: HashMap<Hash32, EpochNo>,
+    pub committee_expiration: ImblHashMap<Hash32, EpochNo>,
     /// Resigned committee members
-    pub committee_resigned: HashMap<Hash32, Option<Anchor>>,
+    pub committee_resigned: ImblHashMap<Hash32, Option<Anchor>>,
     /// Script-type cold committee credentials (credential_type = 1 for N2C queries).
     /// Populated from CommitteeHotAuth and CommitteeColdResign certificates when the cold
     /// credential is a Credential::Script variant.  Used to correctly set cold_credential_type
     /// in GetCommitteeState responses without changing the Hash32-keyed committee maps.
-    pub script_committee_credentials: std::collections::HashSet<Hash32>,
+    pub script_committee_credentials: ImblHashSet<Hash32>,
     /// Script-type hot committee credentials (hot_credential_type = 1 for N2C queries).
     /// Populated from CommitteeHotAuth certificates when the hot credential is a
     /// Credential::Script variant.  Maps cold_credential_hash -> hot_credential_hash for
     /// script hot keys, so a re-authorization with a key hot key correctly removes the entry.
     /// Used to correctly set hot_credential_type in GetCommitteeState responses.
-    pub script_committee_hot_credentials: std::collections::HashSet<Hash32>,
+    pub script_committee_hot_credentials: ImblHashSet<Hash32>,
     /// Active governance proposals indexed by GovActionId
-    pub proposals: BTreeMap<GovActionId, ProposalState>,
+    pub proposals: ImblOrdMap<GovActionId, ProposalState>,
     /// Votes cast, indexed by action ID for efficient ratification lookup
-    pub votes_by_action: BTreeMap<GovActionId, Vec<(Voter, VotingProcedure)>>,
+    pub votes_by_action: ImblOrdMap<GovActionId, Vec<(Voter, VotingProcedure)>>,
     /// Proposal forest roots: last enacted action per governance purpose + direct children.
     ///
     /// Per Haskell `pRoots :: GovRelation PRoot`.  Each of the 4 purposes tracks the
@@ -348,7 +355,7 @@ pub struct GovernanceState {
     /// affecting in-flight governance ratification.
     ///
     /// Populated by `process_epoch_transition` at each epoch boundary.
-    pub drep_distribution_snapshot: HashMap<Hash32, u64>,
+    pub drep_distribution_snapshot: ImblHashMap<Hash32, u64>,
     /// Snapshot of total `AlwaysNoConfidence`-delegated stake at the last epoch boundary.
     /// Companion to `drep_distribution_snapshot`.
     pub drep_snapshot_no_confidence: u64,
@@ -377,15 +384,15 @@ pub struct GovernanceState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RatificationSnapshot {
     /// Proposals active at snapshot time.
-    pub proposals: BTreeMap<GovActionId, ProposalState>,
+    pub proposals: ImblOrdMap<GovActionId, ProposalState>,
     /// Votes indexed by action ID at snapshot time.
-    pub votes_by_action: BTreeMap<GovActionId, Vec<(Voter, VotingProcedure)>>,
+    pub votes_by_action: ImblOrdMap<GovActionId, Vec<(Voter, VotingProcedure)>>,
     /// Committee hot key authorizations (cold → hot) at snapshot time.
-    pub committee_hot_keys: HashMap<Hash32, Hash32>,
+    pub committee_hot_keys: ImblHashMap<Hash32, Hash32>,
     /// Committee member expiration epochs at snapshot time.
-    pub committee_expiration: HashMap<Hash32, EpochNo>,
+    pub committee_expiration: ImblHashMap<Hash32, EpochNo>,
     /// Resigned committee members at snapshot time.
-    pub committee_resigned: HashMap<Hash32, Option<Anchor>>,
+    pub committee_resigned: ImblHashMap<Hash32, Option<Anchor>>,
     /// Committee quorum threshold at snapshot time.
     pub committee_threshold: Option<Rational>,
     /// Whether the committee was in a no-confidence state at snapshot time.
@@ -403,7 +410,7 @@ pub struct RatificationSnapshot {
     /// Used by `default_spo_vote()` during ratification to determine the
     /// implicit vote for non-voting SPOs, matching Haskell's
     /// `dpDefaultDRepVoteDelegs` captured in the DRep pulser.
-    pub vote_delegations: HashMap<Hash32, DRep>,
+    pub vote_delegations: ImblHashMap<Hash32, DRep>,
 }
 
 /// Registration state for a DRep
@@ -654,6 +661,8 @@ impl LedgerState {
                     numerator: 1,
                     denominator: 1,
                 }, // Genesis: d=1
+                rupd_addrs_rew: None,           // #11: captured at startStep during apply
+                pending_avvm_return: 0,
             },
             tip: Tip::origin(),
             era: Era::Conway,
@@ -857,7 +866,7 @@ impl LedgerState {
         }
 
         // Vote delegations
-        gov.vote_delegations = vote_delegations_map;
+        gov.vote_delegations = vote_delegations_map.into_iter().collect();
 
         // Committee state
         for ((tag, hash28), auth) in &hs.new_epoch_state.cert_state.vstate.committee_state {
@@ -1138,6 +1147,8 @@ impl LedgerState {
                 prev_protocol_params: prev_pparams,
                 prev_protocol_version_major,
                 prev_d,
+                rupd_addrs_rew: None, // #11: captured at startStep during apply
+                pending_avvm_return: 0,
             },
             tip,
             era: Era::Conway,

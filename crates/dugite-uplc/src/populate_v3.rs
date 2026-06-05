@@ -15,31 +15,46 @@
 //! - datums (from witness set, hashed)
 //! - txid (= tx.hash)
 //! - current_treasury / treasury_donation
+//! - certificates → `Vec<TxCert>` (all Conway cert variants)
+//! - votes / proposal_procedures (governance fields)
+//! - redeemers map (all six purpose types: Spend/Mint/Cert/Reward/Vote/Propose)
 //!
-//! Fields **deferred to later UPLC-9 parts**:
+//! ## Redeemers Map Ordering
 //!
-//! - certificates → `Vec<TxCert>` ─ UPLC-9 part 3e
-//! - votes / proposal_procedures ─ UPLC-9 part 3e
-//! - redeemers map ─ UPLC-9 part 3f
+//! Haskell reference: `Cardano.Ledger.Babbage.TxInfo.transTxRedeemers`:
+//! ```haskell
+//! transTxRedeemers proxy pv tx =
+//!   PV2.unsafeFromList <$> mapM (transRedeemerPtr …)
+//!     (Map.toList $ tx ^. witsTxL . rdmrsTxWitsL . unRedeemersL)
+//! ```
 //!
-//! Those remain `Vec::new()` / `None` here so the V3 builder is
-//! reviewable in isolation. Plutus scripts that don't consult those
-//! fields (the common case for fresh deployments) already see a
-//! complete-enough context; scripts that do will progressively
-//! pick up the missing pieces as the follow-on PRs land.
+//! The `Redeemers` witness map is `Map (ConwayPlutusPurpose AsIx era) (Data, ExUnits)`.
+//! `ConwayPlutusPurpose AsIx` derives `Ord` from constructor order:
+//!   0=ConwaySpending, 1=ConwayMinting, 2=ConwayCertifying,
+//!   3=ConwayRewarding, 4=ConwayVoting, 5=ConwayProposing.
+//! Within each constructor, the key is a `Word32` index (numeric ascending).
+//! `Map.toList` iterates in this order. `PV2.unsafeFromList` preserves it.
+//!
+//! In dugite we replicate this by sorting `ResolvedRedeemer`s by
+//! `(purpose_rank, redeemer.index)` before building the Vec, where
+//! `purpose_rank` mirrors the Haskell constructor order above.
 
+use crate::data::Data;
 use crate::phase_two::{PhaseTwoError, SlotConfig};
 use crate::populate_gov::{
     certificates_to_plutus, proposals_to_plutus, voting_procedures_to_plutus,
 };
-use crate::script_context::{Credential, TxInfoV3};
+use crate::redeemer_resolve::resolve_redeemers;
+use crate::script_context::{Credential, ScriptPurpose, TxInfoV3};
 use crate::tx_info_populate::{
     credential_to_plutus, datums_to_plutus, inputs_to_txininfos, mint_to_plutus, output_to_plutus,
-    required_signers_to_plutus_padded, sort_inputs, tx_hash_to_array, valid_range_to_posix,
+    plutus_data_to_data, required_signers_to_plutus_padded, sort_inputs, tx_hash_to_array,
+    valid_range_to_posix,
 };
 use dugite_primitives::address::Address as PrimAddress;
 use dugite_primitives::transaction::{
-    Transaction as PrimTransaction, TransactionInput as PrimTxIn, TransactionOutput as PrimTxOut,
+    RedeemerTag, Transaction as PrimTransaction, TransactionInput as PrimTxIn,
+    TransactionOutput as PrimTxOut,
 };
 use num_bigint::BigInt;
 
@@ -108,6 +123,37 @@ pub fn populate_tx_info_v3(
         out
     };
 
+    // Populate the V3 txInfoRedeemers map.
+    //
+    // Haskell: `transTxRedeemers` builds `Map.toList` of the witness-set
+    // `Redeemers` map (keyed by `ConwayPlutusPurpose AsIx`). The `Ord` for
+    // `ConwayPlutusPurpose AsIx` is derived from constructor order:
+    //   0=Spending, 1=Minting, 2=Certifying, 3=Rewarding, 4=Voting, 5=Proposing
+    // then by `Word32` index within each constructor (ascending numeric).
+    //
+    // In dugite we resolve all redeemers, then sort by `(purpose_rank, index)`
+    // to match `Map.toList` order before constructing the map Vec.
+    let redeemers: Vec<(ScriptPurpose, Data)> = if tx.witness_set.redeemers.is_empty() {
+        Vec::new()
+    } else {
+        let mut resolved = resolve_redeemers(tx, resolved)?;
+        // Sort by (purpose_rank, redeemer_index) to replicate Haskell's
+        // `Map (ConwayPlutusPurpose AsIx) _` toList order.
+        resolved.sort_by_key(|rr| (purpose_rank(&rr.tag), rr.index));
+        resolved
+            .into_iter()
+            .map(|rr| {
+                // Use V3 encoding for the map key: Spending uses bare txid.
+                // Non-Spending purposes are identical between V1/V2/V3.
+                (rr.purpose, plutus_data_to_data(&rr.redeemer_data))
+            })
+            .collect()
+    };
+    tracing::trace!(
+        count = redeemers.len(),
+        "populate_tx_info_v3: redeemers resolved"
+    );
+
     Ok(TxInfoV3 {
         inputs,
         reference_inputs,
@@ -118,8 +164,7 @@ pub fn populate_tx_info_v3(
         wdrl,
         valid_range,
         signatories,
-        // TODO(task-13f): redeemers map not yet populated — wired as empty Vec.
-        redeemers: Vec::new(),
+        redeemers,
         datums,
         txid: tx_hash_to_array(&tx.hash),
         votes,
@@ -127,6 +172,39 @@ pub fn populate_tx_info_v3(
         current_treasury: tx.body.treasury_value.map(|v| BigInt::from(v.0)),
         treasury_donation: tx.body.donation.map(|v| BigInt::from(v.0)),
     })
+}
+
+/// Map a [`RedeemerTag`] to the sort rank matching `ConwayPlutusPurpose`'s
+/// derived `Ord` (constructor order in the data type definition):
+///
+/// ```text
+/// ConwaySpending   = 0  (Spending redeemer)
+/// ConwayMinting    = 1  (Mint redeemer)
+/// ConwayCertifying = 2  (Cert redeemer)
+/// ConwayRewarding  = 3  (Reward redeemer)
+/// ConwayVoting     = 4  (Vote redeemer)
+/// ConwayProposing  = 5  (Propose redeemer)
+/// ```
+///
+/// Haskell source: `Cardano.Ledger.Conway.Scripts`
+/// (`data ConwayPlutusPurpose f era = ConwaySpending | ConwayMinting | …
+///   deriving (Eq, Ord, …)`).
+/// The `Redeemers` witness map is `Map (ConwayPlutusPurpose AsIx) _`;
+/// `Map.toList` iterates in this derived `Ord` order.
+pub(crate) fn purpose_rank(tag: &RedeemerTag) -> u8 {
+    match tag {
+        RedeemerTag::Spend => 0,
+        RedeemerTag::Mint => 1,
+        RedeemerTag::Cert => 2,
+        RedeemerTag::Reward => 3,
+        RedeemerTag::Vote => 4,
+        RedeemerTag::Propose => 5,
+        // Dijkstra Guarding — not a Conway-era purpose; assign a high rank so
+        // it sorts after the standard 6 and doesn't corrupt the canonical map
+        // ordering. In practice, V3 scripts on Conway (PV9-PV11) never see
+        // Guarding redeemers; this is a no-op placeholder for PV12+ Dijkstra.
+        RedeemerTag::Guarding => 6,
+    }
 }
 
 #[cfg(test)]
@@ -260,7 +338,8 @@ mod tests {
         assert!(info.certs.is_empty());
         assert!(info.wdrl.is_empty());
         assert!(info.datums.is_empty());
-        assert!(info.redeemers.is_empty()); // TODO(task-13f): deferred
+        // Tx has no redeemers in its witness set → map is empty.
+        assert!(info.redeemers.is_empty());
         assert!(info.votes.is_empty());
         assert!(info.proposal_procedures.is_empty());
         assert_eq!(info.current_treasury, None);
@@ -551,5 +630,236 @@ mod tests {
         let tx = build_tx(body, empty_witness_set());
         let err = populate_tx_info_v3(&tx, &[], &slot_cfg()).unwrap_err();
         assert!(matches!(err, PhaseTwoError::Internal(_)));
+    }
+
+    // ────────────────────────────────────────────────────────────
+    // Redeemers map population tests (task-13f)
+    //
+    // Cross-validated against Haskell:
+    //   transTxRedeemers (Babbage.TxInfo) + ConwayPlutusPurpose Ord
+    //   PlutusLedgerApi.V3.Contexts: ScriptPurpose makeIsDataSchemaIndexed
+    //     [('Minting,0), ('Spending,1), ('Rewarding,2), ('Certifying,3),
+    //      ('Voting,4), ('Proposing,5)]
+    //   Map.toList order: ConwayPlutusPurpose AsIx Ord =
+    //     Spending(0) < Minting(1) < Certifying(2) < Rewarding(3) < Voting(4) < Proposing(5)
+    // ────────────────────────────────────────────────────────────
+
+    /// Helper: build a V3 script hash deterministically.
+    fn v3_script_hash(seed: u8) -> ([u8; 28], Vec<u8>) {
+        let bytes = vec![seed; 4];
+        let mut buf = vec![3u8];
+        buf.extend_from_slice(&bytes);
+        let hash = dugite_primitives::hash::blake2b_224(&buf).0;
+        (hash, bytes)
+    }
+
+    /// Mint + Spend redeemers: Haskell Ord puts Spending before Minting in the
+    /// `ConwayPlutusPurpose` constructor order (Spending=0, Minting=1), so in
+    /// `txInfoRedeemers` Spending comes first even if the on-wire redeemer array
+    /// listed Mint before Spend.
+    ///
+    /// The Plutus `ScriptPurpose` Data encoding for the map KEYS uses different
+    /// tag assignments: Minting=0, Spending=1. The MAP ORDERING however is driven
+    /// by the internal `ConwayPlutusPurpose AsIx` Ord, not the Data key tag.
+    #[test]
+    fn populate_tx_info_v3_redeemers_spend_then_mint_ordering() {
+        use dugite_primitives::credentials::Credential as PrimCred;
+        use dugite_primitives::hash::Hash;
+        use dugite_primitives::transaction::{ExUnits, PlutusData, Redeemer, RedeemerTag};
+        use dugite_primitives::value::AssetName;
+        use std::collections::BTreeMap;
+
+        let (spend_script_hash, spend_bytes) = v3_script_hash(0xaa);
+        let (mint_script_hash, mint_bytes) = v3_script_hash(0xbb);
+
+        // Build an input locked by spend_script_hash.
+        let input = TransactionInput {
+            transaction_id: h32(0xcc),
+            index: 0,
+        };
+        let spent_out = TransactionOutput {
+            address: PrimAddress::Enterprise(dugite_primitives::address::EnterpriseAddress {
+                network: dugite_primitives::network::NetworkId::Testnet,
+                payment: PrimCred::Script(Hash::<28>(spend_script_hash)),
+            }),
+            value: Value::lovelace(5_000_000),
+            datum: PrimOutputDatum::None,
+            script_ref: None,
+            is_legacy: false,
+            raw_cbor: None,
+        };
+
+        let mut body = minimal_tx_body(vec![input.clone()], vec![], 200_000);
+        // Add a mint for the mint policy.
+        let mut policy_assets = BTreeMap::new();
+        policy_assets.insert(AssetName::new(b"T".to_vec()).unwrap(), 1i64);
+        body.mint
+            .insert(Hash::<28>(mint_script_hash), policy_assets);
+
+        let mut ws = empty_witness_set();
+        ws.plutus_v3_scripts = vec![spend_bytes, mint_bytes];
+        // On-wire: Mint redeemer first (index 0 for policy), Spend second.
+        // The canonical sorted order should be Spend first, then Mint.
+        ws.redeemers = vec![
+            Redeemer {
+                tag: RedeemerTag::Mint,
+                index: 0,
+                data: PlutusData::Integer(BigInt::from(42i64)),
+                ex_units: ExUnits {
+                    mem: 100,
+                    steps: 100,
+                },
+            },
+            Redeemer {
+                tag: RedeemerTag::Spend,
+                index: 0,
+                data: PlutusData::Integer(BigInt::from(7i64)),
+                ex_units: ExUnits {
+                    mem: 200,
+                    steps: 200,
+                },
+            },
+        ];
+        let tx = build_tx(body, ws);
+        let resolved = vec![(input, spent_out, vec![])];
+        let info = populate_tx_info_v3(&tx, &resolved, &slot_cfg()).unwrap();
+
+        // txInfoRedeemers must have 2 entries.
+        assert_eq!(info.redeemers.len(), 2, "must have 2 redeemers");
+
+        // Entry 0 must be Spending (ConwayPlutusPurpose rank 0 < Minting rank 1).
+        // ScriptPurpose::Spending = Constr 1 [TxOutRef]
+        // (makeIsDataSchemaIndexed ''ScriptPurpose [('Spending, 1)])
+        assert!(
+            matches!(
+                &info.redeemers[0].0,
+                crate::script_context::ScriptPurpose::Spending(_)
+            ),
+            "first redeemer must be Spending (ConwayPlutusPurpose Ord rank 0); got {:?}",
+            info.redeemers[0].0
+        );
+        // Entry 1 must be Minting.
+        assert!(
+            matches!(
+                &info.redeemers[1].0,
+                crate::script_context::ScriptPurpose::Minting(_)
+            ),
+            "second redeemer must be Minting (ConwayPlutusPurpose Ord rank 1); got {:?}",
+            info.redeemers[1].0
+        );
+
+        // The redeemer Data values must correspond to the respective redeemer data.
+        // Spending redeemer data = PlutusData::Integer(7)
+        assert_eq!(
+            info.redeemers[0].1,
+            crate::data::Data::I(BigInt::from(7i64)),
+            "Spending redeemer data must be I(7)"
+        );
+        // Minting redeemer data = PlutusData::Integer(42)
+        assert_eq!(
+            info.redeemers[1].1,
+            crate::data::Data::I(BigInt::from(42i64)),
+            "Minting redeemer data must be I(42)"
+        );
+
+        // The Spending ScriptPurpose key must use the V3 BARE-txid TxOutRef form
+        // when serialized via to_data_v3().
+        // ScriptPurpose::Spending.to_data_v3() = Constr 1 [Constr 0 [B32, I idx]]
+        //   where B32 is bare bytes (NOT the V1/V2 double-wrapped Constr 0 [B32]).
+        // Haskell: PlutusLedgerApi.V3.Contexts — TxId newtype deriving ToData from
+        //   BuiltinByteString → bare B(32) in the TxOutRef payload.
+        let spend_data = info.redeemers[0].0.to_data_v3();
+        let Data::Constr(1, ref spend_fields) = spend_data else {
+            panic!("Spending ScriptPurpose must be Constr 1; got {spend_data:?}");
+        };
+        // TxOutRef = Constr 0 [B32 (bare), I idx]  — V3 bare-txid form
+        let Data::Constr(0, ref txoutref_fields) = spend_fields[0] else {
+            panic!("TxOutRef must be Constr 0; got {:?}", spend_fields[0]);
+        };
+        assert_eq!(txoutref_fields.len(), 2);
+        // V3: txid must be BARE B(32), NOT Constr 0 [B(32)]
+        assert!(
+            matches!(&txoutref_fields[0], Data::B(b) if b.len() == 32),
+            "V3 Spending TxOutRef txid must be bare B(32); got {:?}",
+            txoutref_fields[0]
+        );
+        // Must NOT be the double-wrapped V1/V2 Constr 0 [B32] form
+        assert!(
+            !matches!(&txoutref_fields[0], Data::Constr(0, _)),
+            "V3 TxOutRef txid must NOT be Constr-wrapped (that is V1/V2 form)"
+        );
+    }
+
+    /// Voting redeemer: Constr 4 [Voter] in the ScriptPurpose Data encoding.
+    /// Voter encoding: CommitteeVoter=0, DRepVoter=1, StakePoolVoter=2
+    /// (from makeIsDataSchemaIndexed ''Voter in PlutusLedgerApi.V3.Contexts).
+    #[test]
+    fn populate_tx_info_v3_voting_redeemer_encodes_correctly() {
+        use dugite_primitives::credentials::Credential as PrimCred;
+        use dugite_primitives::hash::Hash;
+        use dugite_primitives::transaction::{
+            ExUnits, GovActionId, PlutusData, Redeemer, RedeemerTag, Vote, Voter, VotingProcedure,
+        };
+
+        let (script_hash, script_bytes) = v3_script_hash(0xdd);
+
+        let mut body = minimal_tx_body(vec![], vec![], 1);
+        let mut inner = std::collections::BTreeMap::new();
+        inner.insert(
+            GovActionId {
+                transaction_id: h32(0x10),
+                action_index: 0,
+            },
+            VotingProcedure {
+                vote: Vote::Yes,
+                anchor: None,
+            },
+        );
+        // DRep voter with script credential — this is the only kind that can
+        // dispatch a Plutus Voting redeemer.
+        body.voting_procedures.insert(
+            Voter::DRep(PrimCred::Script(Hash::<28>(script_hash))),
+            inner,
+        );
+
+        let mut ws = empty_witness_set();
+        ws.plutus_v3_scripts = vec![script_bytes];
+        ws.redeemers = vec![Redeemer {
+            tag: RedeemerTag::Vote,
+            index: 0,
+            data: PlutusData::Integer(BigInt::from(99i64)),
+            ex_units: ExUnits { mem: 1, steps: 1 },
+        }];
+        let tx = build_tx(body, ws);
+        let info = populate_tx_info_v3(&tx, &[], &slot_cfg()).unwrap();
+
+        assert_eq!(info.redeemers.len(), 1, "must have 1 voting redeemer");
+        // ScriptPurpose::Voting = Constr 4 [Voter]
+        // makeIsDataSchemaIndexed ''ScriptPurpose [('Voting, 4)]
+        // Use to_data_v3() to reflect actual serialization path (same for Voting).
+        let purpose_data = info.redeemers[0].0.to_data_v3();
+        let Data::Constr(4, ref voter_fields) = purpose_data else {
+            panic!("Voting ScriptPurpose must be Constr 4; got {purpose_data:?}");
+        };
+        assert_eq!(voter_fields.len(), 1);
+        // Voter::DRepVoter(DRepCredential(Script(...))) = Constr 1 [Constr 1 [B28]]
+        // DRepCredential is newtype deriving ToData from Credential → bare Credential
+        // ScriptCredential = Constr 1 [B28]
+        let Data::Constr(1, ref drep_fields) = voter_fields[0] else {
+            panic!("DRepVoter must be Constr 1; got {:?}", voter_fields[0]);
+        };
+        assert_eq!(drep_fields.len(), 1);
+        // DRepCredential passes through to Credential (Constr 1 for Script)
+        assert!(
+            matches!(&drep_fields[0], Data::Constr(1, inner) if inner.len() == 1),
+            "DRepCredential(ScriptCredential) must be Constr 1 [B28]; got {:?}",
+            drep_fields[0]
+        );
+        // The redeemer Data value
+        assert_eq!(
+            info.redeemers[0].1,
+            Data::I(BigInt::from(99i64)),
+            "Voting redeemer data must be I(99)"
+        );
     }
 }

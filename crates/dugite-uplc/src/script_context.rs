@@ -420,6 +420,43 @@ impl PlutusValue {
                 .collect(),
         )
     }
+
+    /// V1/V2 `txInfoMint :: Value` encoding.
+    ///
+    /// Identical to [`to_data`](Self::to_data) but with the mandatory
+    /// ada(0) entry `(b"", Map [(b"", I 0)])` prepended. cardano-ledger
+    /// builds the mint Value as
+    /// `transMintValue m = transCoinToValue zero <> transMultiAsset m`
+    /// (`eras/alonzo/impl/.../Plutus/TxInfo.hs`) — the ada symbol is ALWAYS
+    /// present with quantity 0 even though minting ada is impossible
+    /// ("hysterical raisins" backward-compat: scripts that inspected the
+    /// pre-Mary mint Value must keep seeing the ada key). The native-token
+    /// policies follow in ascending policy-id order (matching
+    /// `transMultiAsset`'s `Map.foldrWithKey'` over the sorted `Data.Map`).
+    ///
+    /// PlutusV3 `txInfoMint :: MintValue` OMITS this entry — use
+    /// [`to_data`](Self::to_data) there.
+    pub fn to_mint_data_v1v2(&self) -> Data {
+        let ada_entry = (
+            Data::B(Vec::new()),
+            data_map(vec![(Data::B(Vec::new()), data_i(BigInt::from(0)))]),
+        );
+        let mut entries: Vec<(Data, Data)> = Vec::with_capacity(self.policies.len() + 1);
+        entries.push(ada_entry);
+        for (policy, assets) in &self.policies {
+            let token_entries: Vec<(Data, Data)> = assets
+                .iter()
+                .map(|(name, amt)| (Data::B(name.clone()), data_i(amt.clone())))
+                .collect();
+            let key = if policy == &[0u8; 28] {
+                Data::B(Vec::new())
+            } else {
+                data_bs28(policy)
+            };
+            entries.push((key, data_map(token_entries)));
+        }
+        data_map(entries)
+    }
 }
 
 impl TxOutRef {
@@ -603,17 +640,30 @@ impl GovActionId {
 }
 
 impl ScriptPurpose {
+    /// Encode this `ScriptPurpose` as Plutus V1/V2 `Data`.
+    ///
+    /// Used for:
+    /// - `scriptContextPurpose` in V1/V2 `ScriptContext`
+    /// - `txInfoRedeemers` map keys in V2 `TxInfo`
+    ///
+    /// `Spending` uses the **wrapped** `TxId` form:
+    /// `Constr 1 [Constr 0 [Constr 0 [B txid32], I idx]]`.
+    ///
+    /// Haskell: `makeIsDataSchemaIndexed ''ScriptPurpose`
+    /// in `PlutusLedgerApi.V{1,2}.Contexts`:
+    /// `[('Minting,0), ('Spending,1), ('Rewarding,2), ('Certifying,3)]`
     pub fn to_data(&self) -> Data {
         match self {
             ScriptPurpose::Minting(h) => data_constr(0, vec![data_bs28(h)]),
-            // NOTE: `ScriptPurpose` is shared by the V1/V2 `scriptContextPurpose`
-            // (wrapped TxId) and the V3 `txInfoRedeemers` map keys (bare TxId).
-            // The default arm keeps the V1/V2 wrapped form, which is the only live
-            // consumer today. When the V3 redeemers map is populated
-            // (TODO task-13f), that path must encode `Spending` via the bare-txid
-            // `TxOutRef::to_data_v3` instead.
             ScriptPurpose::Spending(r) => data_constr(1, vec![r.to_data()]),
-            ScriptPurpose::Rewarding(c) => data_constr(2, vec![c.to_data()]),
+            // V1/V2 `Rewarding StakingCredential`: the credential must be wrapped
+            // in `StakingHash` (Constr 0) — `Rewarding (StakingHash cred)` =
+            // `Constr 2 [Constr 0 [Constr {0|1} [B28]]]`. Omitting the StakingHash
+            // wrapper makes a deserializer read the inner `Credential`'s Constr-1
+            // (ScriptCredential) tag as `StakingPtr` and `unIData` the 28-byte hash
+            // → "unIData on non-I". (#22; PlutusLedgerApi.V{1,2}.Credential:
+            // StakingHash=0/StakingPtr=1, PubKeyCredential=0/ScriptCredential=1.)
+            ScriptPurpose::Rewarding(c) => data_constr(2, vec![data_constr(0, vec![c.to_data()])]),
             ScriptPurpose::Certifying(i, c) => {
                 data_constr(3, vec![data_i((*i).into()), c.0.clone()])
             }
@@ -624,6 +674,40 @@ impl ScriptPurpose {
             // Dijkstra `DijkstraGuarding(ScriptHash)` — Sum 6.
             // Issue #475 Phase 3.5.
             ScriptPurpose::Guarding(h) => data_constr(6, vec![data_bs28(h)]),
+        }
+    }
+
+    /// Encode this `ScriptPurpose` as Plutus **V3** `Data`.
+    ///
+    /// Used for `txInfoRedeemers` map keys in V3 `TxInfo`.
+    ///
+    /// The **only** difference from [`Self::to_data`] is that `Spending`
+    /// uses the **bare** txid form introduced in V3:
+    /// `Constr 1 [Constr 0 [B txid32, I idx]]`
+    /// (NOT the double-wrapped V1/V2 `Constr 1 [Constr 0 [Constr 0 [B32], I]]`).
+    ///
+    /// All other variants are identical to the V1/V2 encoding — their
+    /// Constr tags and field shapes are unchanged across versions.
+    ///
+    /// Haskell: `PlutusLedgerApi.V3.Contexts`:
+    /// ```haskell
+    /// makeIsDataSchemaIndexed ''ScriptPurpose
+    ///   [('Minting,0), ('Spending,1), ('Rewarding,2), ('Certifying,3),
+    ///    ('Voting,4), ('Proposing,5)]
+    /// ```
+    /// `Spending V3.TxOutRef` where `TxId` is `newtype … deriving newtype ToData`
+    /// from `BuiltinByteString` → bare B(32) in the `TxOutRef` payload.
+    pub fn to_data_v3(&self) -> Data {
+        match self {
+            // Spending: bare-txid TxOutRef (V3 form).
+            // Constr 1 [Constr 0 [B txid32, I idx]]
+            ScriptPurpose::Spending(r) => data_constr(1, vec![r.to_data_v3()]),
+            // V3 `Rewarding Credential` takes the credential DIRECTLY (no
+            // StakingHash wrapper — V3 dropped StakingCredential), so override the
+            // V1/V2 `to_data` arm which now adds the wrapper. Constr 2 [Credential].
+            ScriptPurpose::Rewarding(c) => data_constr(2, vec![c.to_data()]),
+            // All other variants: same encoding in V1/V2/V3.
+            other => other.to_data(),
         }
     }
 }
@@ -710,12 +794,17 @@ impl TxInfoV3 {
                 data_list(self.signatories.iter().map(data_bs28).collect()),
                 // 9 — redeemers :: Map ScriptPurpose Redeemer
                 // TODO(task-13f): redeemers map not yet populated — wired as
-                // empty map. Field POSITION is correct (index 9). Full
-                // per-redeemer resolution ships as task #13 follow-up.
+                // 9 — redeemers :: Map ScriptPurpose Redeemer
+                // V3 map keys use `ScriptPurpose::to_data_v3()` so that the
+                // `Spending` variant encodes with the bare-txid `TxOutRef`
+                // form introduced in V3 (V1/V2 use `Constr 0 [B bytes]`
+                // inside TxOutRef; V3 uses bare `B bytes`).
+                // Reference: PlutusLedgerApi.V3.Contexts — `TxId` changed to
+                // `newtype TxId … deriving newtype ToData` from `BuiltinByteString`.
                 data_map(
                     self.redeemers
                         .iter()
-                        .map(|(p, d)| (p.to_data(), d.clone()))
+                        .map(|(p, d)| (p.to_data_v3(), d.clone()))
                         .collect(),
                 ),
                 // 10 — datums :: Map DatumHash Datum
@@ -804,7 +893,8 @@ impl TxInfoV1 {
                 data_list(self.outputs.iter().map(TxOut::to_data_v1).collect()),
                 // fee :: Value — ADA-only map, NOT bare Integer
                 data_ada_value(self.fee.clone()),
-                self.mint.to_data(),
+                // mint :: Value — INCLUDES the ada(0) entry (transMintValue).
+                self.mint.to_mint_data_v1v2(),
                 data_list(self.dcert.iter().map(|c| c.0.clone()).collect()),
                 // V1 wdrl :: [(StakingCredential, Integer)] — AssocList, not Map.
                 // Encoded as List[Constr 0 [cred.to_data(), I(amt)]].
@@ -866,7 +956,8 @@ impl TxInfoV2 {
                 data_list(self.outputs.iter().map(TxOut::to_data).collect()),
                 // fee :: Value — ADA-only map, NOT bare Integer
                 data_ada_value(self.fee.clone()),
-                self.mint.to_data(),
+                // mint :: Value — INCLUDES the ada(0) entry (transMintValue).
+                self.mint.to_mint_data_v1v2(),
                 data_list(self.dcert.iter().map(|c| c.0.clone()).collect()),
                 // V2 wdrl :: Map StakingCredential Integer — Data::Map.
                 // Reference: PlutusLedgerApi/V2/Contexts.hs TxInfo.txInfoWdrl.
@@ -911,6 +1002,41 @@ mod tests {
 
     fn pk(b: u8) -> Credential {
         Credential::PubKey([b; 28])
+    }
+
+    #[test]
+    fn v1v2_mint_value_prepends_ada_zero_entry() {
+        // A mint with one native policy. V1/V2 `txInfoMint :: Value` must
+        // include the ada(0) entry (b"", Map[(b"", 0)]) FIRST, per
+        // cardano-ledger `transMintValue m = transCoinToValue zero <>
+        // transMultiAsset m`. V3 `MintValue` omits it.
+        let v = PlutusValue {
+            policies: vec![([0x5d; 28], vec![(b"tok".to_vec(), BigInt::from(-1))])],
+        };
+        // V1/V2: ada entry present and first.
+        let m = v.to_mint_data_v1v2();
+        let Data::Map(entries) = m else {
+            panic!("expected Map");
+        };
+        assert_eq!(entries.len(), 2, "ada + 1 native policy");
+        // entry[0] = (b"", Map[(b"", I 0)])
+        assert!(matches!(&entries[0].0, Data::B(b) if b.is_empty()));
+        let Data::Map(ada_tokens) = &entries[0].1 else {
+            panic!("ada inner must be a Map");
+        };
+        assert_eq!(ada_tokens.len(), 1);
+        assert!(matches!(&ada_tokens[0].0, Data::B(b) if b.is_empty()));
+        assert!(matches!(&ada_tokens[0].1, Data::I(n) if *n == BigInt::from(0)));
+        // entry[1] = the native policy (28-byte key).
+        assert!(matches!(&entries[1].0, Data::B(b) if b.len() == 28));
+
+        // V3 (to_data): NO ada entry — just the native policy.
+        let v3 = v.to_data();
+        let Data::Map(v3_entries) = v3 else {
+            panic!("expected Map");
+        };
+        assert_eq!(v3_entries.len(), 1, "V3 MintValue omits ada");
+        assert!(matches!(&v3_entries[0].0, Data::B(b) if b.len() == 28));
     }
 
     #[test]

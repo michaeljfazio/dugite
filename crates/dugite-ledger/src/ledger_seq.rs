@@ -45,7 +45,7 @@
 //! `rollbackN`, `extend`.
 
 use crate::state::{
-    DRepRegistration, EpochSnapshots, LedgerState, PoolRegistration, ProposalState,
+    DRepRegistration, EpochSnapshots, GovSubState, LedgerState, PoolRegistration, ProposalState,
     StakeDistributionState,
 };
 use crate::utxo_diff::UtxoDiff;
@@ -111,6 +111,38 @@ pub struct LedgerDelta {
 
     /// Scalar nonce / block production field updates for this block.
     pub block_fields: BlockFieldsDelta,
+
+    /// Post-block snapshot of the directly-mutated `imbl` cert maps
+    /// (`reward_accounts`, `delegations`, `stake_key_deposits`).
+    ///
+    /// These fields are mutated in place by `apply_block` (drain on withdrawal,
+    /// epoch-boundary reward credit, registration/delegation certs) and were
+    /// NOT captured by the `*_changes` delta vecs (which are never populated).
+    /// Without a snapshot, `apply_delta_to_state` left them at the stale anchor
+    /// value, so `rollback_via_seq` corrupted reward balances on a fork
+    /// (preprod ep292 `WithdrawalAmountMismatch` halt). `imbl::HashMap` clones
+    /// are O(1) (structural sharing), so snapshotting per block is cheap.
+    ///
+    /// `None` on deltas not produced by `apply_block_with_delta` (e.g. test
+    /// fixtures) — `apply_delta_to_state` then leaves the fields untouched,
+    /// preserving the previous behaviour for those paths.
+    pub reward_accounts_snapshot: Option<imbl::HashMap<Hash32, Lovelace>>,
+    /// See [`Self::reward_accounts_snapshot`].
+    pub delegations_snapshot: Option<imbl::HashMap<Hash32, Hash28>>,
+    /// See [`Self::reward_accounts_snapshot`].
+    pub stake_key_deposits_snapshot: Option<imbl::HashMap<Hash32, u64>>,
+    /// Post-block snapshot of the governance substate (`Arc<GovernanceState>`,
+    /// so the clone is O(1)). Like the cert maps above, `gov` is mutated in
+    /// place by `apply_block` (DRep registration, vote delegations, proposal
+    /// ingestion, votes, ratification/enactment) and is NOT captured by
+    /// `governance_changes` (which is never populated). Without this snapshot,
+    /// `rollback_via_seq` (`self.gov = seq.tip_state().gov`) restored the stale
+    /// anchor governance on every fork — wiping DReps/vote_delegations/proposals
+    /// registered since the anchor. That zeroed DRep voting power, so real
+    /// ParameterChanges never ratified (V3 cost model frozen at the genesis
+    /// model → V3 script_data_hash divergence; `deposits_proposal: 0`). Same
+    /// fork-reconstruction class as the reward-account fix.
+    pub gov_snapshot: Option<GovSubState>,
 }
 
 impl LedgerDelta {
@@ -127,6 +159,10 @@ impl LedgerDelta {
             governance_changes: Vec::new(),
             epoch_transition: None,
             block_fields: BlockFieldsDelta::default(),
+            reward_accounts_snapshot: None,
+            delegations_snapshot: None,
+            stake_key_deposits_snapshot: None,
+            gov_snapshot: None,
         }
     }
 }
@@ -792,6 +828,27 @@ pub fn apply_delta_to_state(state: &mut LedgerState, delta: &LedgerDelta) {
         apply_reward_change(state, change);
     }
 
+    // ── 4b. Directly-mutated imbl cert maps (snapshot restore) ────────────────
+    //
+    // `reward_accounts`, `delegations` and `stake_key_deposits` are mutated in
+    // place by `apply_block` and are NOT represented by the `*_changes` vecs
+    // above (those are never populated). Restore them from the post-block
+    // snapshot captured in `apply_block_with_delta` so state reconstruction
+    // (anchor advance, `state_at_index`, `rollback_via_seq`) is exact rather
+    // than inheriting the stale anchor value. `imbl::HashMap` clone is O(1).
+    if let Some(ra) = &delta.reward_accounts_snapshot {
+        state.certs.reward_accounts = ra.clone();
+    }
+    if let Some(dl) = &delta.delegations_snapshot {
+        state.certs.delegations = dl.clone();
+    }
+    if let Some(sk) = &delta.stake_key_deposits_snapshot {
+        state.certs.stake_key_deposits = sk.clone();
+    }
+    if let Some(g) = &delta.gov_snapshot {
+        state.gov = g.clone();
+    }
+
     // ── 5. Governance changes ─────────────────────────────────────────────────
     for change in &delta.governance_changes {
         apply_governance_change(state, change);
@@ -1245,6 +1302,87 @@ mod tests {
             pool_block_increment: None,
         };
         delta
+    }
+
+    /// Regression for the preprod ep292 `WithdrawalAmountMismatch` halt: a
+    /// rollback must restore `reward_accounts` from the per-block snapshot, NOT
+    /// inherit the stale anchor value. The `reward_changes`/`delegation_changes`
+    /// delta vecs are never populated, so before the `*_snapshot` fix
+    /// `apply_delta_to_state` left reward_accounts at the anchor — and
+    /// `rollback_via_seq` therefore corrupted reward balances on a fork.
+    #[test]
+    fn rollback_restores_reward_accounts_from_snapshot_not_stale_anchor() {
+        let cred = Hash32::from_bytes([0xAB; 32]);
+        // Anchor: account holds 100 (its balance at the last snapshot).
+        let mut anchor = make_anchor();
+        anchor.certs.reward_accounts.insert(cred, Lovelace(100));
+        let mut seq = LedgerSeq::with_defaults(anchor, 2160);
+
+        // Three blocks mutate the balance directly: credit→150, withdraw→0,
+        // credit→50. Each carries the post-block snapshot the live apply path
+        // (`apply_block_with_delta`) captures.
+        for (slot, bal) in [(10u64, 150u64), (20, 0), (30, 50)] {
+            let mut d = make_delta(slot, slot as u8, 0);
+            let mut ra = imbl::HashMap::new();
+            ra.insert(cred, Lovelace(bal));
+            d.reward_accounts_snapshot = Some(ra);
+            seq.push(d);
+        }
+
+        // Tip reflects the latest snapshot (50), not the anchor's 100.
+        assert_eq!(
+            seq.tip_state().certs.reward_accounts.get(&cred).copied(),
+            Some(Lovelace(50)),
+            "tip must reflect the latest per-block reward_accounts snapshot"
+        );
+
+        // Roll back one block → the withdrawal block, balance 0. Before the fix
+        // this returned the stale anchor value (100) — the ep292 corruption.
+        seq.rollback(1);
+        assert_eq!(
+            seq.tip_state().certs.reward_accounts.get(&cred).copied(),
+            Some(Lovelace(0)),
+            "after rollback the balance must be the per-block snapshot (0, \
+             withdrawn), NOT the stale anchor value (100)"
+        );
+    }
+
+    /// Regression for #22/#481: a rollback must restore the governance substate
+    /// (DReps, vote delegations, proposals) from the per-block snapshot, NOT the
+    /// stale anchor. Before the `gov_snapshot` fix, `rollback_via_seq` reset
+    /// `self.gov` to the anchor governance on every fork — wiping DReps so DRep
+    /// voting power went to 0, real ParameterChanges never ratified, and the V3
+    /// cost model stayed frozen at the genesis model (V3 script_data_hash
+    /// divergence; `deposits_proposal: 0`).
+    #[test]
+    fn rollback_restores_gov_from_snapshot_not_stale_anchor() {
+        // Anchor governance has proposal_count = 0 (a stand-in for "empty gov").
+        let mut seq = LedgerSeq::with_defaults(make_anchor(), 2160);
+
+        // Two blocks mutate governance: proposal_count 5 then 9 (the live apply
+        // path captures gov post-block via `gov_snapshot`).
+        for pc in [5u64, 9] {
+            let mut d = make_delta(pc * 10, pc as u8, 0);
+            let mut gov = make_anchor().gov;
+            Arc::make_mut(&mut gov.governance).proposal_count = pc;
+            d.gov_snapshot = Some(gov);
+            seq.push(d);
+        }
+
+        assert_eq!(
+            seq.tip_state().gov.governance.proposal_count,
+            9,
+            "tip must reflect the latest gov snapshot"
+        );
+
+        // Roll back one block → proposal_count 5 (the snapshot), not 0 (anchor).
+        seq.rollback(1);
+        assert_eq!(
+            seq.tip_state().gov.governance.proposal_count,
+            5,
+            "after rollback the governance must be the per-block snapshot (5), \
+             NOT the stale anchor (0) — the #22/#481 fork-wipe bug"
+        );
     }
 
     // ── Construction ──────────────────────────────────────────────────────────

@@ -151,4 +151,36 @@ pub struct EpochSubState {
     /// that `d >= 4/5` (overlay gate) and `(1 - d) * f * slotsPerEpoch`
     /// (expected-blocks calc) are byte-exact with Haskell — see issue #629.
     pub prev_d: Rational,
+    /// #11 — pre-Babbage (pv≤6) reward prefilter: the registered reward-account
+    /// credential set frozen at `startStep`. Haskell's RUPD pulser FreeVars sets
+    /// `fvAddrsRew = Map.keysSet (accounts)` during TICK at the first block whose
+    /// slot is `> epoch_first_slot + randomness_stabilisation_window` (4k/f), and
+    /// that capture happens BEFORE the triggering block's certs are applied
+    /// (TICK precedes the block body). Both the per-member prefilter
+    /// (`rewardOnePoolMember`) and the leader/operator prefilter (`collectLRs`
+    /// `isAccountRegistered`) test membership of THIS frozen set, NOT the
+    /// boundary-time accounts. Captured during epoch N, consumed by
+    /// `compute_reward_update` at the N→N+1 boundary, then cleared. `None` ⇒ not
+    /// captured this epoch ⇒ fall back to boundary-time `reward_accounts`
+    /// (matches Haskell's `RewardsTooLate` forced-startStep-at-boundary path).
+    /// Transient within an epoch; intentionally NOT serialized in snapshots — a
+    /// mid-epoch snapshot resume falls back to boundary accounts for one epoch.
+    /// pv≥7 never reads it (the prefilter is bypassed).
+    pub rupd_addrs_rew: Option<Arc<HashSet<Hash32>>>,
+
+    /// AVVM coin returned to reserves by `returnRedeemAddrsToReserves` at the
+    /// Shelley→Allegra era boundary, captured so the SAME-boundary reward update
+    /// is computed from PRE-AVVM reserves. In Haskell the reward update applied
+    /// entering the Allegra epoch (`nesRu`) was computed mid-previous-epoch via
+    /// `startStep` BEFORE the AVVM return (which happens at the era translation,
+    /// `TranslateEra AllegraEra NewEpochState`), so its `deltaR1 = rho*reserves`
+    /// and `totalStake = maxSupply - reserves` use pre-AVVM reserves; the reward
+    /// is then APPLIED to post-AVVM reserves. dugite's `on_era_transition` adds
+    /// the AVVM to `reserves` BEFORE `process_epoch_transition` computes the
+    /// reward, so without this the reward calc would see post-AVVM reserves
+    /// (mainnet ep236: +318.2M ADA inflated reserves → deltaR1 over by ~954K ADA
+    /// → -561K ADA reserves / +184K ADA treasury divergence). Set in
+    /// `return_redeem_addrs_to_reserves`, consumed (and reset) by the first
+    /// `compute_reward_update` of the boundary. Transient; NOT serialized.
+    pub pending_avvm_return: u64,
 }

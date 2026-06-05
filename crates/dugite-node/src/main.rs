@@ -46,6 +46,35 @@ enum Command {
     /// ancillary-imported state equals the state produced by a
     /// from-genesis replay to the same chain tip.
     VerifyLedgerSnapshot(VerifyLedgerSnapshotArgs),
+    /// Convert a ledger snapshot between the in-memory and LSM UTxO backends
+    /// without a chain replay (the dugite mirror of cardano-node's
+    /// `snapshot-converter`). The non-UTxO state is carried over verbatim;
+    /// only the UTxO tables are re-encoded. The result is observationally
+    /// equivalent to the source (same UTxO set → same ledger → same hashes).
+    SnapshotConvert(SnapshotConvertArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct SnapshotConvertArgs {
+    /// Source database directory containing `ledger-snapshot.bin` (and, for an
+    /// LSM source, a `utxo-store/` with a `ledger` snapshot). Read-only; never
+    /// modified. Safe to run against a live node's db — the source LSM is read
+    /// through its consistent point-in-time `ledger` snapshot.
+    #[arg(long)]
+    source_db: PathBuf,
+
+    /// Target database directory to write the converted snapshot into
+    /// (`ledger-snapshot.bin` + `.meta.json`, plus `utxo-store/` for an LSM
+    /// target). Created if absent.
+    #[arg(long)]
+    target_db: PathBuf,
+
+    /// Target UTxO backend: `mem` (in-memory) or `lsm` (on-disk).
+    #[arg(long, value_parser = ["mem", "lsm"])]
+    to_backend: String,
+
+    #[command(flatten)]
+    log: LogArgs,
 }
 
 #[derive(clap::Args, Debug)]
@@ -494,6 +523,7 @@ async fn main() -> Result<()> {
         Command::DumpSnapshot(ref args) => Some(&args.log),
         Command::Db(_) => None,
         Command::VerifyLedgerSnapshot(ref args) => Some(&args.log),
+        Command::SnapshotConvert(ref args) => Some(&args.log),
     };
     let log_handle = if let Some(log_args) = log_args {
         Some(logging::init(&build_logging_opts(log_args)?)?)
@@ -507,6 +537,7 @@ async fn main() -> Result<()> {
         Command::DumpSnapshot(args) => run_dump_snapshot(args).await,
         Command::Db(args) => run_db_command(args).await,
         Command::VerifyLedgerSnapshot(args) => run_verify_ledger_snapshot(args).await,
+        Command::SnapshotConvert(args) => run_snapshot_convert(args).await,
     }
 }
 
@@ -532,6 +563,49 @@ async fn run_verify_ledger_snapshot(args: VerifyLedgerSnapshotArgs) -> Result<()
     if n > 0 {
         anyhow::bail!("{n} field(s) differ — see report above");
     }
+    Ok(())
+}
+
+/// Convert a ledger snapshot between the in-memory and LSM UTxO backends
+/// without a chain replay (mirror of cardano-node's `snapshot-converter`).
+async fn run_snapshot_convert(args: SnapshotConvertArgs) -> Result<()> {
+    use dugite_ledger::SnapshotBackend;
+    use dugite_node::snapshot_convert::convert_snapshot;
+
+    let target_backend = match args.to_backend.as_str() {
+        "mem" => SnapshotBackend::DugiteMem,
+        "lsm" => SnapshotBackend::DugiteLsm,
+        other => anyhow::bail!("unknown --to-backend `{other}` (expected mem|lsm)"),
+    };
+
+    info!(
+        source_db = %args.source_db.display(),
+        target_db = %args.target_db.display(),
+        to_backend = %args.to_backend,
+        "snapshot-convert"
+    );
+
+    // The conversion is CPU + disk bound (a full UTxO-set scan) — run it off
+    // the async runtime so it doesn't stall the reactor.
+    let source_db = args.source_db.clone();
+    let target_db = args.target_db.clone();
+    let stats = tokio::task::spawn_blocking(move || {
+        convert_snapshot(&source_db, &target_db, target_backend)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("conversion task panicked: {e}"))??;
+
+    info!(
+        source_backend = stats.source_backend.as_tag(),
+        target_backend = stats.target_backend.as_tag(),
+        utxo_count = stats.utxo_count,
+        slot = stats.slot,
+        "snapshot-convert: done — converted {} UTxOs at slot {} ({} → {})",
+        stats.utxo_count,
+        stats.slot,
+        stats.source_backend.as_tag(),
+        stats.target_backend.as_tag(),
+    );
     Ok(())
 }
 

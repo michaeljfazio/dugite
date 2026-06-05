@@ -449,12 +449,14 @@ impl LedgerContext for NodeRpcAdapter {
                 // existing mempool view if available; otherwise the
                 // live set.
                 let utxo_view = &ledger.utxo.utxo_set;
+                let protocol_major = ledger.epochs.protocol_params.protocol_version_major as u32;
                 let report_outcome = dugite_ledger::evaluate_plutus_scripts_with_reports(
                     tx,
                     utxo_view,
                     None, // cost models — phase-2 evaluator falls back to per-step defaults
                     max_units,
                     &self.slot_config,
+                    protocol_major,
                 );
                 drop(ledger);
                 if let Ok(reports) = report_outcome {

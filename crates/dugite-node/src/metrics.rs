@@ -360,9 +360,25 @@ fn get_total_memory_bytes_impl() -> u64 {
 /// only ~1.3% (the bug this replaces — dugite-monitor showed 1.2% at block
 /// ~2.3M where the chain is ~18% synced by time/block count).
 pub fn compute_sync_progress(tip_time_ms: i64, genesis_ms: i64, now_ms: i64) -> f64 {
-    let span = (now_ms - genesis_ms).max(1) as f64;
-    let elapsed = (tip_time_ms - genesis_ms).max(0) as f64;
-    ((elapsed / span) * 100.0).clamp(0.0, 100.0)
+    // Byte-faithful mirror of `cardano-cli query tip`'s `percentage`
+    // (cardano-cli `Cardano.CLI.EraBased.Query.Run.percentage`): a time-based
+    // ratio of the tip block's wall-clock time to now — both as RelativeTime
+    // from the system start (`genesis_ms`) — with a **600-second tolerance**
+    // that snaps to exactly 100.0 when the tip is within 600 s of now. This is
+    // why a caught-up node reports 100.00% even though the latest block is
+    // always ~20 s old (preprod/mainnet block time), instead of 99.99%.
+    //
+    // All arithmetic is in integer seconds (floored, matching Haskell's
+    // `floor . nominalDiffTimeToSeconds`), with `+1` on both terms to keep them
+    // strictly positive and avoid 0/0 at genesis.
+    const TOLERANCE_SECS: i64 = 600;
+    let tip_secs = (tip_time_ms - genesis_ms).max(0) / 1000;
+    let now_secs = (now_ms - genesis_ms).max(0) / 1000;
+    let sa = tip_secs + 1;
+    let sb = now_secs + 1;
+    // Fast-forward the tip by the tolerance, but never past now.
+    let ua = (sa + TOLERANCE_SECS).min(sb);
+    ((ua as f64 / sb as f64) * 100.0).clamp(0.0, 100.0)
 }
 
 /// Node metrics for monitoring
@@ -602,6 +618,10 @@ pub struct NodeMetrics {
     /// with a `pool_id` label so operators can identify the producing pool at a
     /// glance in the TUI without opening the logs.
     pool_id_hex: std::sync::Mutex<String>,
+    /// Active UTxO storage backend (`"lsm"` or `"in-memory"`). Emitted as the
+    /// info metric `dugite_utxo_backend_info{backend="..."}` and set once at
+    /// startup so dugite-monitor can show which backend the node is running.
+    utxo_backend: std::sync::Mutex<String>,
     /// When true, emit additional `cardano_node_metrics_*` aliases alongside the
     /// native `dugite_*` metrics.  Allows existing cardano-node Grafana dashboards
     /// to work without modification.  Controlled by `--compat-metrics` CLI flag.
@@ -829,6 +849,7 @@ impl NodeMetrics {
             liveness_threshold_secs: AtomicU64::new(600),
             is_block_producer: AtomicU64::new(0),
             pool_id_hex: std::sync::Mutex::new(String::new()),
+            utxo_backend: std::sync::Mutex::new(String::new()),
             compat_metrics: std::sync::atomic::AtomicBool::new(false),
             diffusion_mode: AtomicU64::new(0),
             peer_sharing_enabled: AtomicU64::new(1),
@@ -1304,6 +1325,15 @@ impl NodeMetrics {
     pub fn set_consensus_mode_genesis(&self, genesis: bool) {
         self.consensus_mode_genesis
             .store(genesis as u64, Ordering::Relaxed);
+    }
+
+    /// Record the active UTxO storage backend (`"lsm"` or `"in-memory"`),
+    /// emitted as `dugite_utxo_backend_info{backend="..."}`. Call once at
+    /// startup.
+    pub fn set_utxo_backend(&self, backend: &str) {
+        if let Ok(mut guard) = self.utxo_backend.lock() {
+            *guard = backend.to_string();
+        }
     }
 
     /// Record P2P networking configuration state.
@@ -1950,6 +1980,21 @@ impl NodeMetrics {
             }
         }
 
+        // UTxO storage backend, as a Prometheus info metric: a gauge fixed at 1
+        // with a `backend` label ("lsm" or "in-memory"). Always emitted (unlike
+        // pool_id, which is block-producer-only) so dugite-monitor can show the
+        // active backend on every node.
+        if let Ok(guard) = self.utxo_backend.lock() {
+            if !guard.is_empty() {
+                out.push_str(&format!(
+                    "# HELP dugite_utxo_backend_info Active UTxO storage backend\n\
+                     # TYPE dugite_utxo_backend_info gauge\n\
+                     dugite_utxo_backend_info{{backend=\"{}\"}} 1\n",
+                    *guard
+                ));
+            }
+        }
+
         // CPU metrics — emitted as both a gauge (current %) and a counter
         // (cumulative seconds of CPU time consumed since node start).
         //
@@ -2489,10 +2534,26 @@ mod tests {
         let now = 273_000_000_000i64;
         // Tip time == now → 100% (we are at the chain tip).
         assert_eq!(compute_sync_progress(now, genesis, now), 100.0);
-        // Tip == genesis (no progress yet) → 0%.
-        assert_eq!(compute_sync_progress(genesis, genesis, now), 0.0);
+        // Tip == genesis (no progress yet) → ~0% (the +1/+600 guards leave a
+        // negligible residue that renders as "0.00"; cardano-cli's `percentage`
+        // behaves identically — it is not exactly 0).
+        assert!(compute_sync_progress(genesis, genesis, now) < 0.01);
         // Tip ahead of now (clock skew / just forged) is clamped to 100%.
         assert_eq!(compute_sync_progress(now + 5_000, genesis, now), 100.0);
+    }
+
+    #[test]
+    fn test_compute_sync_progress_600s_tolerance_snaps_to_100() {
+        // Mirrors cardano-cli: when `now - tip <= 600 s` the formula reports
+        // exactly 100.00, so an at-tip node (latest block ~20 s old) reads 100%.
+        let genesis = 0i64;
+        let now = 100_000_000_000i64; // 100M s, expressed in ms
+                                      // 300 s behind → inside the 600 s tolerance → 100%.
+        assert_eq!(compute_sync_progress(now - 300_000, genesis, now), 100.0);
+        // Exactly 600 s behind → boundary → still 100%.
+        assert_eq!(compute_sync_progress(now - 600_000, genesis, now), 100.0);
+        // 900 s behind → outside the tolerance → strictly below 100%.
+        assert!(compute_sync_progress(now - 900_000, genesis, now) < 100.0);
     }
 
     #[test]
@@ -2899,6 +2960,37 @@ mod tests {
         );
         // The resident-memory metric should still be present alongside CPU.
         assert!(output.contains("dugite_mem_resident_bytes "));
+    }
+
+    #[test]
+    fn test_utxo_backend_info_metric() {
+        // Unset: the info metric must be absent (no empty-label line).
+        let metrics = NodeMetrics::new();
+        assert!(
+            !metrics.to_prometheus().contains("dugite_utxo_backend_info"),
+            "backend info metric must not be emitted before it is set"
+        );
+
+        // LSM backend.
+        metrics.set_utxo_backend("lsm");
+        let out = metrics.to_prometheus();
+        assert!(out.contains("# TYPE dugite_utxo_backend_info gauge"));
+        assert!(
+            out.contains("dugite_utxo_backend_info{backend=\"lsm\"} 1"),
+            "expected lsm backend info line, got:\n{out}"
+        );
+
+        // In-memory backend (set-once semantics: last write wins).
+        metrics.set_utxo_backend("in-memory");
+        let out = metrics.to_prometheus();
+        assert!(
+            out.contains("dugite_utxo_backend_info{backend=\"in-memory\"} 1"),
+            "expected in-memory backend info line, got:\n{out}"
+        );
+        assert!(
+            !out.contains("backend=\"lsm\""),
+            "stale lsm label must be replaced"
+        );
     }
 
     #[test]

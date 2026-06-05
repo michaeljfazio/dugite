@@ -299,18 +299,22 @@ fn encode_term_list(w: &mut BitWriter, terms: &[Rc<Term>], depth: usize) -> Flat
 /// | 10   | `DefaultUniBls12_381_G2_Element` | BLS12-381 G2        |
 /// | 11   | `DefaultUniBls12_381_MlResult`   | BLS12-381 MlResult |
 ///
-/// Compound type atom sequences:
+/// Compound type atom sequences are a PRE-ORDER (root-first) serialisation of
+/// the application tree, so the `Apply` atom (7) comes FIRST:
 ///
-/// * `List(a)` → `[1-bit][5][1-bit][7][…type-a…][0-bit]`
-/// * `Pair(a,b)` → `[1-bit][6][1-bit][7][…a…][1-bit][7][…b…][0-bit]`
-/// * `Data`      → `[1-bit][8][0-bit]`
+/// * `List(a)`   → `[1][7][1][5][…type-a…][0]`              (`Apply(ProtoList, a)`)
+/// * `Pair(a,b)` → `[1][7][1][7][1][6][…a…][…b…][0]`        (`Apply(Apply(ProtoPair, a), b)`)
+/// * `Data`      → `[1][8][0]`
 ///
-/// The Apply atom (7) is a "connector" and carries no type information
-/// by itself — it signals that the next atom(s) are the argument to the
-/// preceding type constructor.
+/// The Apply atom (7) is the application node: reading it consumes two
+/// sub-universes (function then argument). The higher-kinded constructors
+/// `ProtoList` (5) / `ProtoPair` (6) are only valid as the function side of
+/// an Apply.
 ///
-/// Reference: `IntersectMBO/plutus`, `plutus-core/plutus-core/src/
-/// PlutusCore/Default/Uni.hs` (`encodeUni` / `decodeUni`).
+/// Reference: `IntersectMBO/plutus`,
+/// `plutus-core/plutus-core/src/PlutusCore/Default/Universe.hs`
+/// (`encodeUni`: `DefaultUniApply f a = 7 : encodeUni f ++ encodeUni a`;
+/// `withDecodedUni`).
 fn decode_type_tag(r: &mut BitReader<'_>) -> FlatResult<TypeTag> {
     // Read the cons-list of atoms into a flat Vec.
     // Each element: 1-bit cons (must be 1), 4-bit atom; terminated by 0 bit.
@@ -346,78 +350,98 @@ fn read_atom_list(r: &mut BitReader<'_>) -> FlatResult<Vec<u8>> {
     Ok(atoms)
 }
 
-/// Parse a single [`TypeTag`] from a flat slice of 4-bit atoms starting at
-/// `pos`. Returns `(tag, next_pos)`.
+/// Intermediate node while parsing the pre-order universe-tag atom list.
 ///
-/// The grammar (recursive):
-/// ```text
-/// type := atom           -- for atoms 0..=4 and 8..=11 (atomic)
-///       | [5][7][type]   -- List(type)
-///       | [6][7][type][7][type]  -- Pair(type, type)
-/// ```
-fn parse_type_from_atoms(atoms: &[u8], pos: usize) -> FlatResult<(TypeTag, usize)> {
+/// Mirrors Haskell `withDecodedUni` (PlutusCore.Default.Universe): the
+/// `Apply` atom (7) is the ROOT of a compound type, and the higher-kinded
+/// constructors `ProtoList` (5) / `ProtoPair` (6) only become a concrete
+/// [`TypeTag`] once fully applied. `encodeUni` is a pre-order (root-first)
+/// serialisation of the application tree, so `List a = Apply(ProtoList, a)`
+/// encodes as `[7, 5, …a]` and `Pair a b = Apply(Apply(ProtoPair, a), b)`
+/// encodes as `[7, 7, 6, …a, …b]` — the Apply tag(s) come FIRST.
+enum UniNode {
+    /// A fully-applied, concrete type.
+    Complete(TypeTag),
+    /// `DefaultUniProtoList` — awaits one argument.
+    ProtoList,
+    /// `DefaultUniProtoPair` — awaits two arguments.
+    ProtoPair,
+    /// `DefaultUniProtoPair` applied to its first argument — awaits the second.
+    ProtoPair1(TypeTag),
+}
+
+/// Parse one universe node from the pre-order atom list at `pos`.
+/// Returns `(node, next_pos)`. Mirrors Haskell `withDecodedUni`: reading an
+/// `Apply` (7) recursively decodes the function side then the argument side,
+/// then applies them (the `withApplicable` kind check).
+fn parse_uni_from_atoms(atoms: &[u8], pos: usize) -> FlatResult<(UniNode, usize)> {
     let atom = *atoms
         .get(pos)
         .ok_or_else(|| UplcError::FlatDecode("unexpected end of universe-tag atom list".into()))?;
     match atom {
-        0 => Ok((TypeTag::Integer, pos + 1)),
-        1 => Ok((TypeTag::ByteString, pos + 1)),
-        2 => Ok((TypeTag::String, pos + 1)),
-        3 => Ok((TypeTag::Unit, pos + 1)),
-        4 => Ok((TypeTag::Bool, pos + 1)),
-        5 => {
-            // List — expect Apply (7) then element type.
-            let next = *atoms
-                .get(pos + 1)
-                .ok_or_else(|| UplcError::FlatDecode("ProtoList: missing Apply atom".into()))?;
-            if next != 7 {
-                return Err(UplcError::FlatDecode(format!(
-                    "ProtoList: expected Apply(7), got {next}"
-                )));
-            }
-            let (elem, after) = parse_type_from_atoms(atoms, pos + 2)?;
-            Ok((TypeTag::List(Box::new(elem)), after))
+        0 => Ok((UniNode::Complete(TypeTag::Integer), pos + 1)),
+        1 => Ok((UniNode::Complete(TypeTag::ByteString), pos + 1)),
+        2 => Ok((UniNode::Complete(TypeTag::String), pos + 1)),
+        3 => Ok((UniNode::Complete(TypeTag::Unit), pos + 1)),
+        4 => Ok((UniNode::Complete(TypeTag::Bool), pos + 1)),
+        5 => Ok((UniNode::ProtoList, pos + 1)),
+        6 => Ok((UniNode::ProtoPair, pos + 1)),
+        7 => {
+            // Apply: decode the function side, then the argument side, then
+            // apply (mirrors Haskell `withDecodedUni`/`withApplicable`).
+            let (func, after_f) = parse_uni_from_atoms(atoms, pos + 1)?;
+            let (arg, after_a) = parse_uni_from_atoms(atoms, after_f)?;
+            let arg_tag = match arg {
+                UniNode::Complete(t) => t,
+                _ => {
+                    return Err(UplcError::FlatDecode(
+                        "universe-tag Apply argument is an unapplied type constructor".into(),
+                    ))
+                }
+            };
+            let applied = match func {
+                UniNode::ProtoList => UniNode::Complete(TypeTag::List(Box::new(arg_tag))),
+                UniNode::ProtoPair => UniNode::ProtoPair1(arg_tag),
+                UniNode::ProtoPair1(first) => {
+                    UniNode::Complete(TypeTag::Pair(Box::new(first), Box::new(arg_tag)))
+                }
+                UniNode::Complete(_) => {
+                    return Err(UplcError::FlatDecode(
+                        "universe-tag Apply of a fully-applied (non-constructor) type".into(),
+                    ))
+                }
+            };
+            Ok((applied, after_a))
         }
-        6 => {
-            // Pair — expect Apply(7) + first type, Apply(7) + second type.
-            let a1 = *atoms.get(pos + 1).ok_or_else(|| {
-                UplcError::FlatDecode("ProtoPair: missing first Apply atom".into())
-            })?;
-            if a1 != 7 {
-                return Err(UplcError::FlatDecode(format!(
-                    "ProtoPair: expected Apply(7) before first type, got {a1}"
-                )));
-            }
-            let (ta, after_a) = parse_type_from_atoms(atoms, pos + 2)?;
-            let a2 = *atoms.get(after_a).ok_or_else(|| {
-                UplcError::FlatDecode("ProtoPair: missing second Apply atom".into())
-            })?;
-            if a2 != 7 {
-                return Err(UplcError::FlatDecode(format!(
-                    "ProtoPair: expected Apply(7) before second type, got {a2}"
-                )));
-            }
-            let (tb, after_b) = parse_type_from_atoms(atoms, after_a + 1)?;
-            Ok((TypeTag::Pair(Box::new(ta), Box::new(tb)), after_b))
-        }
-        7 => Err(UplcError::FlatDecode(
-            "Apply atom (7) encountered outside of List/Pair context".into(),
-        )),
-        8 => Ok((TypeTag::Data, pos + 1)),
-        9 => Ok((TypeTag::Bls12_381G1Element, pos + 1)),
-        10 => Ok((TypeTag::Bls12_381G2Element, pos + 1)),
-        11 => Ok((TypeTag::Bls12_381MlResult, pos + 1)),
+        8 => Ok((UniNode::Complete(TypeTag::Data), pos + 1)),
+        9 => Ok((UniNode::Complete(TypeTag::Bls12_381G1Element), pos + 1)),
+        10 => Ok((UniNode::Complete(TypeTag::Bls12_381G2Element), pos + 1)),
+        11 => Ok((UniNode::Complete(TypeTag::Bls12_381MlResult), pos + 1)),
         _ => Err(UplcError::FlatDecode(format!(
             "unknown universe tag atom {atom:#06b}"
         ))),
     }
 }
 
+/// Parse a single concrete [`TypeTag`] from the pre-order atom list starting at
+/// `pos`. Returns `(tag, next_pos)`. The top-level node must be fully applied
+/// (an unapplied `ProtoList`/`ProtoPair` is a malformed constant type).
+fn parse_type_from_atoms(atoms: &[u8], pos: usize) -> FlatResult<(TypeTag, usize)> {
+    let (node, next) = parse_uni_from_atoms(atoms, pos)?;
+    match node {
+        UniNode::Complete(t) => Ok((t, next)),
+        _ => Err(UplcError::FlatDecode(
+            "universe-tag list is an unapplied type constructor (List/Pair without argument)"
+                .into(),
+        )),
+    }
+}
+
 /// Encode a full [`TypeTag`] as a flat cons-list of 4-bit atoms.
 ///
-/// The atom sequence for compound types:
-/// - `List(a)` → `[1-cons][5][1-cons][7][…atoms for a…][0-term]`
-/// - `Pair(a,b)` → `[1-cons][6][1-cons][7][…a atoms…][1-cons][7][…b atoms…][0-term]`
+/// The atom sequence for compound types is pre-order (Apply tag 7 first):
+/// - `List(a)` → `[1-cons][7][1-cons][5][…atoms for a…][0-term]`
+/// - `Pair(a,b)` → `[1-cons][7][1-cons][7][1-cons][6][…a atoms…][…b atoms…][0-term]`
 /// - `Data` → `[1-cons][8][0-term]`
 fn encode_type_tag(w: &mut BitWriter, t: &TypeTag) -> FlatResult<()> {
     // Collect all atoms for this type tag, then write them as a cons-list.
@@ -440,15 +464,17 @@ fn collect_type_atoms(t: &TypeTag, atoms: &mut Vec<u8>) -> FlatResult<()> {
         TypeTag::Unit => atoms.push(3),
         TypeTag::Bool => atoms.push(4),
         TypeTag::List(elem) => {
-            atoms.push(5); // ProtoList
+            // List a = Apply(ProtoList, a) → pre-order [7, 5, …a].
             atoms.push(7); // Apply
+            atoms.push(5); // ProtoList
             collect_type_atoms(elem, atoms)?;
         }
         TypeTag::Pair(a, b) => {
+            // Pair a b = Apply(Apply(ProtoPair, a), b) → pre-order [7, 7, 6, …a, …b].
+            atoms.push(7); // Apply (outer)
+            atoms.push(7); // Apply (inner)
             atoms.push(6); // ProtoPair
-            atoms.push(7); // Apply
             collect_type_atoms(a, atoms)?;
-            atoms.push(7); // Apply
             collect_type_atoms(b, atoms)?;
         }
         TypeTag::Data => atoms.push(8),
@@ -754,6 +780,86 @@ mod tests {
         let bytes = w.finish();
         let mut r = BitReader::new(&bytes);
         decode_term(&mut r).expect("decode")
+    }
+
+    fn atoms(t: &TypeTag) -> Vec<u8> {
+        let mut v = Vec::new();
+        collect_type_atoms(t, &mut v).expect("collect");
+        v
+    }
+
+    // Byte-exact universe-tag atom order must match Haskell `encodeUni`
+    // (pre-order, Apply tag 7 first):
+    //   List a   = Apply(ProtoList, a)          → [7, 5, …a]
+    //   Pair a b = Apply(Apply(ProtoPair,a), b) → [7, 7, 6, …a, …b]
+    // Reference (cardano-haskell-oracle, verified against IntersectMBO/plutus
+    // PlutusCore/Default/Universe.hs `encodeUni`):
+    //   encodeUni (DefaultUniApply f a) = 7 : encodeUni f ++ encodeUni a
+    // Regression for the 69×/block "Apply atom (7) outside List/Pair" decode
+    // failures on real preprod Babbage scripts (decoder had the order reversed).
+    #[test]
+    fn universe_tag_atom_order_matches_haskell() {
+        assert_eq!(atoms(&TypeTag::Integer), vec![0]);
+        assert_eq!(atoms(&TypeTag::Data), vec![8]);
+        // List Integer = [7, 5, 0]
+        assert_eq!(
+            atoms(&TypeTag::List(Box::new(TypeTag::Integer))),
+            vec![7, 5, 0]
+        );
+        // Pair Integer ByteString = [7, 7, 6, 0, 1]
+        assert_eq!(
+            atoms(&TypeTag::Pair(
+                Box::new(TypeTag::Integer),
+                Box::new(TypeTag::ByteString)
+            )),
+            vec![7, 7, 6, 0, 1]
+        );
+        // Nested: List (Pair Data Data) = [7, 5, 7, 7, 6, 8, 8]
+        assert_eq!(
+            atoms(&TypeTag::List(Box::new(TypeTag::Pair(
+                Box::new(TypeTag::Data),
+                Box::new(TypeTag::Data)
+            )))),
+            vec![7, 5, 7, 7, 6, 8, 8]
+        );
+    }
+
+    #[test]
+    fn parse_type_from_haskell_atom_order() {
+        // Apply-first sequences (as emitted by Haskell encodeUni) must decode.
+        let (t, n) = parse_type_from_atoms(&[7, 5, 0], 0).expect("List Integer");
+        assert_eq!(t, TypeTag::List(Box::new(TypeTag::Integer)));
+        assert_eq!(n, 3);
+
+        let (t, n) = parse_type_from_atoms(&[7, 7, 6, 0, 1], 0).expect("Pair Int BS");
+        assert_eq!(
+            t,
+            TypeTag::Pair(Box::new(TypeTag::Integer), Box::new(TypeTag::ByteString))
+        );
+        assert_eq!(n, 5);
+
+        // The old (reversed) order [5, 7, 0] is now an unapplied ProtoList → error.
+        assert!(parse_type_from_atoms(&[5, 7, 0], 0).is_err());
+    }
+
+    #[test]
+    fn type_tag_atoms_roundtrip() {
+        for t in [
+            TypeTag::Integer,
+            TypeTag::Bool,
+            TypeTag::Data,
+            TypeTag::List(Box::new(TypeTag::Integer)),
+            TypeTag::Pair(Box::new(TypeTag::Integer), Box::new(TypeTag::ByteString)),
+            TypeTag::List(Box::new(TypeTag::Pair(
+                Box::new(TypeTag::Data),
+                Box::new(TypeTag::Data),
+            ))),
+        ] {
+            let a = atoms(&t);
+            let (decoded, n) = parse_type_from_atoms(&a, 0).expect("decode");
+            assert_eq!(decoded, t, "roundtrip {t:?}");
+            assert_eq!(n, a.len(), "consumed all atoms for {t:?}");
+        }
     }
 
     #[test]

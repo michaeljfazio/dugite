@@ -627,6 +627,9 @@ impl EraRules for ConwayRules {
                 epochs.reserves,
                 epochs.treasury,
                 &reward_accounts_std,
+                // #11: pv≤6 prefilter uses the startStep-frozen fvAddrsRew set,
+                // not boundary-time accounts (None ⇒ fall back to boundary).
+                epochs.rupd_addrs_rew.as_deref(),
                 ctx.epoch_length,
                 ctx.shelley_transition_epoch,
                 ctx.max_lovelace_supply,
@@ -639,6 +642,13 @@ impl EraRules for ConwayRules {
             // diagnostic only makes sense when there are pools to inspect).
             #[cfg(feature = "reward-debug-dump")]
             if let Some(go) = go_ref {
+                // `certs.reward_accounts` is an imbl map (k-window sharing); the
+                // debug dumper takes a plain `&HashMap`, so collect a snapshot.
+                let ra_std: std::collections::HashMap<Hash32, Lovelace> = certs
+                    .reward_accounts
+                    .iter()
+                    .map(|(k, v)| (*k, *v))
+                    .collect();
                 crate::state::reward_debug::maybe_dump(
                     ctx.current_epoch.0,
                     new_epoch.0,
@@ -650,7 +660,7 @@ impl EraRules for ConwayRules {
                     epochs.snapshots.ss_fee,
                     go,
                     &epochs.snapshots.bprev_blocks_by_pool,
-                    &certs.reward_accounts,
+                    &ra_std,
                     &rupd,
                 );
             }
@@ -1883,6 +1893,8 @@ fn make_empty_epoch_sub() -> EpochSubState {
             numerator: 0,
             denominator: 1,
         },
+        rupd_addrs_rew: None,
+        pending_avvm_return: 0,
     }
 }
 
@@ -1999,6 +2011,8 @@ mod tests {
                 numerator: 0,
                 denominator: 1,
             },
+            rupd_addrs_rew: None,
+            pending_avvm_return: 0,
         }
     }
 

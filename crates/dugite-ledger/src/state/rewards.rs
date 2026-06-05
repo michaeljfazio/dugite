@@ -142,10 +142,23 @@ pub fn compute_reward_update(
     reserves: Lovelace,
     _treasury: Lovelace,
     reward_accounts: &HashMap<Hash32, Lovelace>,
+    startstep_addrs_rew: Option<&std::collections::HashSet<Hash32>>,
     epoch_length: u64,
     _shelley_transition_epoch: u64,
     max_lovelace_supply: u64,
 ) -> PendingRewardUpdate {
+    // pv≤6 reward prefilter source set (`fvAddrsRew`). Haskell freezes
+    // `Map.keysSet(accounts)` at `startStep` (mid-epoch, before that block's
+    // certs); both the per-member (`rewardOnePoolMember`) and leader
+    // (`collectLRs`) prefilters test THIS frozen set. We use it when captured;
+    // otherwise fall back to the boundary-time `reward_accounts` keys (mirrors
+    // Haskell's `RewardsTooLate` path that forces startStep at the boundary).
+    let registered_at_startstep = |cred: &Hash32| -> bool {
+        match startstep_addrs_rew {
+            Some(set) => set.contains(cred),
+            None => reward_accounts.contains_key(cred),
+        }
+    };
     // Issue #438 fix: compute expansion + treasury_cut BEFORE checking go.
     //
     // Haskell `Cardano.Ledger.Shelley.LedgerState.PulsingReward.startStep`
@@ -292,8 +305,16 @@ pub fn compute_reward_update(
 
     let n_opt = pp.n_opt.max(1);
 
-    let mut total_distributed: u64 = 0;
-    let mut reward_map: HashMap<Hash32, Lovelace> = HashMap::new();
+    // Per-credential reward entries (leader + member), collected UNAGGREGATED so we
+    // can apply Haskell's `filterRewards` single-selection at pv<=2 (Shelley era).
+    // At pv<=2 a credential earning from multiple sources/pools is paid only ONE
+    // reward (`Set.deleteFindMin`, min by Ord: LeaderReward < MemberReward, then
+    // ascending pool-id); the rest are dropped (frShelleyIgnored) and return to
+    // reserves via deltaR2. At pv>=3 (Allegra+) all rewards aggregate (sum). See
+    // eras/shelley/impl/src/Cardano/Ledger/Shelley/Rewards.hs `filterRewards` +
+    // `hardforkAllegraAggregatedRewards pv = pvMajor pv > natVersion @2`.
+    // Entry = (is_member, producing_pool_id, amount).
+    let mut reward_entries: HashMap<Hash32, Vec<(bool, Hash28, u64)>> = HashMap::new();
 
     let mut delegators_by_pool: HashMap<Hash28, Vec<Hash32>> = HashMap::new();
     for (cred_hash, pool_id) in go.delegations.iter() {
@@ -329,20 +350,17 @@ pub fn compute_reward_update(
             None => continue,
         };
 
-        {
-            let prefilter_active = prev_protocol_version_major <= 6;
-            if prefilter_active {
-                let op_key = LedgerState::reward_account_to_hash(&pool_reg.reward_account);
-                if !reward_accounts.contains_key(&op_key) {
-                    debug!(
-                        pool = ?pool_id.as_bytes()[..4],
-                        "Pool excluded: pre-Babbage prefilter (proto <= 6, unregistered reward account)"
-                    );
-                    continue;
-                }
-            }
-        }
-
+        // NOTE: the pre-Babbage (pv<=6) reward-account registration prefilter
+        // gates ONLY the LEADER (operator) reward, NOT the whole pool. Haskell
+        // `collectLRs` (Cardano/Ledger/Shelley/Rewards.hs): the leader reward is
+        // included iff `hardforkBabbageForgoRewardPrefilter pv || isAccountRegistered
+        // account accounts`; member rewards are gated separately by their own
+        // per-member prefilter (`hk ∈ addrsRew`) in `rewardOnePoolMember`. A
+        // previous whole-pool `continue` here dropped the MEMBER rewards too,
+        // under-distributing them back into reserves (mainnet ep213: 4 pools with
+        // unregistered operators but registered members → +180,457,654,009 lovelace
+        // reserves divergence, cross-checked byte-exact vs Koios). The leader gate
+        // now lives at the operator-credit site below.
         let self_delegated = owner_stake_by_pool.get(pool_id).copied().unwrap_or(0);
         if self_delegated < pool_reg.pledge.0 {
             debug!(
@@ -440,7 +458,7 @@ pub fn compute_reward_update(
                 // (Babbage onward, ledger errata 17.2) the prefilter is
                 // bypassed; routing of unregistered rewards happens at
                 // applyRUpd time (frTotalUnregistered → treasury).
-                if prev_protocol_version_major <= 6 && !reward_accounts.contains_key(cred_hash) {
+                if prev_protocol_version_major <= 6 && !registered_at_startstep(cred_hash) {
                     continue;
                 }
 
@@ -469,16 +487,57 @@ pub fn compute_reward_update(
                 };
 
                 if member_share > 0 {
-                    *reward_map.entry(*cred_hash).or_insert(Lovelace(0)) += Lovelace(member_share);
-                    total_distributed += member_share;
+                    reward_entries.entry(*cred_hash).or_default().push((
+                        true,
+                        *pool_id,
+                        member_share,
+                    ));
                 }
             }
         }
 
         if operator_reward > 0 {
             let op_key = LedgerState::reward_account_to_hash(&pool_reg.reward_account);
-            *reward_map.entry(op_key).or_insert(Lovelace(0)) += Lovelace(operator_reward);
-            total_distributed += operator_reward;
+            // Pre-Babbage (pv<=6) leader-reward prefilter (Haskell `collectLRs`,
+            // Cardano/Ledger/Shelley/Rewards.hs): include the leader reward iff
+            // `hardforkBabbageForgoRewardPrefilter pv || isAccountRegistered op`.
+            // For pv>=7 (Babbage+, errata 17.2) the check is bypassed. A dropped
+            // leader reward is never credited → stays in the pot → undistributed →
+            // returned to reserves (matches Haskell deltaR2). Member rewards are
+            // gated independently by the per-member prefilter above.
+            let leader_included =
+                prev_protocol_version_major >= 7 || registered_at_startstep(&op_key);
+            if leader_included {
+                reward_entries
+                    .entry(op_key)
+                    .or_default()
+                    .push((false, *pool_id, operator_reward));
+            }
+        }
+    }
+
+    // Apply Haskell `filterRewards` (eras/shelley/.../Rewards.hs): at pv>2 sum all
+    // rewards per credential (Allegra+ aggregation); at pv<=2 keep only the single
+    // minimum reward per credential (`Set.deleteFindMin`: LeaderReward < MemberReward,
+    // then ascending pool-id) and drop the rest. `total_distributed` counts only the
+    // DELIVERED rewards so the dropped amounts flow back to reserves via `undistributed`
+    // below — mirrors `sumRewards = fold (aggregateRewards pv rs)`, which sums only
+    // the selected reward per credential (cardano-ledger master, verified).
+    let aggregate_rewards = prev_protocol_version_major > 2;
+    let mut reward_map: HashMap<Hash32, Lovelace> = HashMap::with_capacity(reward_entries.len());
+    let mut total_distributed: u64 = 0;
+    for (cred, mut entries) in reward_entries {
+        let delivered = if aggregate_rewards {
+            entries.iter().map(|(_, _, amt)| *amt).sum::<u64>()
+        } else {
+            // Set.deleteFindMin: leader (is_member=false) sorts before member, then
+            // ascending pool-id; the minimum entry is the single delivered reward.
+            entries.sort_unstable_by_key(|e| (e.0, e.1));
+            entries.first().map(|(_, _, amt)| *amt).unwrap_or(0)
+        };
+        if delivered > 0 {
+            reward_map.insert(cred, Lovelace(delivered));
+            total_distributed += delivered;
         }
     }
 
@@ -678,6 +737,7 @@ impl LedgerState {
             self.epochs.reserves,
             self.epochs.treasury,
             &reward_accounts_std,
+            self.epochs.rupd_addrs_rew.as_deref(),
             self.epoch_length,
             self.shelley_transition_epoch,
             self.max_lovelace_supply,
@@ -1146,6 +1206,7 @@ mod tests {
             dugite_primitives::value::Lovelace(0), // reserves
             dugite_primitives::value::Lovelace(0), // treasury
             &reward_accounts,
+            None,  // startstep_addrs_rew (fall back to boundary accounts)
             86400, // epoch_length
             0,     // shelley_transition_epoch
             super::super::MAX_LOVELACE_SUPPLY,
