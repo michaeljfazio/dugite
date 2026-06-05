@@ -305,8 +305,16 @@ pub fn compute_reward_update(
 
     let n_opt = pp.n_opt.max(1);
 
-    let mut total_distributed: u64 = 0;
-    let mut reward_map: HashMap<Hash32, Lovelace> = HashMap::new();
+    // Per-credential reward entries (leader + member), collected UNAGGREGATED so we
+    // can apply Haskell's `filterRewards` single-selection at pv<=2 (Shelley era).
+    // At pv<=2 a credential earning from multiple sources/pools is paid only ONE
+    // reward (`Set.deleteFindMin`, min by Ord: LeaderReward < MemberReward, then
+    // ascending pool-id); the rest are dropped (frShelleyIgnored) and return to
+    // reserves via deltaR2. At pv>=3 (Allegra+) all rewards aggregate (sum). See
+    // eras/shelley/impl/src/Cardano/Ledger/Shelley/Rewards.hs `filterRewards` +
+    // `hardforkAllegraAggregatedRewards pv = pvMajor pv > natVersion @2`.
+    // Entry = (is_member, producing_pool_id, amount).
+    let mut reward_entries: HashMap<Hash32, Vec<(bool, Hash28, u64)>> = HashMap::new();
 
     let mut delegators_by_pool: HashMap<Hash28, Vec<Hash32>> = HashMap::new();
     for (cred_hash, pool_id) in go.delegations.iter() {
@@ -479,8 +487,11 @@ pub fn compute_reward_update(
                 };
 
                 if member_share > 0 {
-                    *reward_map.entry(*cred_hash).or_insert(Lovelace(0)) += Lovelace(member_share);
-                    total_distributed += member_share;
+                    reward_entries.entry(*cred_hash).or_default().push((
+                        true,
+                        *pool_id,
+                        member_share,
+                    ));
                 }
             }
         }
@@ -497,9 +508,36 @@ pub fn compute_reward_update(
             let leader_included =
                 prev_protocol_version_major >= 7 || registered_at_startstep(&op_key);
             if leader_included {
-                *reward_map.entry(op_key).or_insert(Lovelace(0)) += Lovelace(operator_reward);
-                total_distributed += operator_reward;
+                reward_entries
+                    .entry(op_key)
+                    .or_default()
+                    .push((false, *pool_id, operator_reward));
             }
+        }
+    }
+
+    // Apply Haskell `filterRewards` (eras/shelley/.../Rewards.hs): at pv>2 sum all
+    // rewards per credential (Allegra+ aggregation); at pv<=2 keep only the single
+    // minimum reward per credential (`Set.deleteFindMin`: LeaderReward < MemberReward,
+    // then ascending pool-id) and drop the rest. `total_distributed` counts only the
+    // DELIVERED rewards so the dropped amounts flow back to reserves via `undistributed`
+    // below — mirrors `sumRewards = fold (aggregateRewards pv rs)`, which sums only
+    // the selected reward per credential (cardano-ledger master, verified).
+    let aggregate_rewards = prev_protocol_version_major > 2;
+    let mut reward_map: HashMap<Hash32, Lovelace> = HashMap::with_capacity(reward_entries.len());
+    let mut total_distributed: u64 = 0;
+    for (cred, mut entries) in reward_entries {
+        let delivered = if aggregate_rewards {
+            entries.iter().map(|(_, _, amt)| *amt).sum::<u64>()
+        } else {
+            // Set.deleteFindMin: leader (is_member=false) sorts before member, then
+            // ascending pool-id; the minimum entry is the single delivered reward.
+            entries.sort_unstable_by_key(|e| (e.0, e.1));
+            entries.first().map(|(_, _, amt)| *amt).unwrap_or(0)
+        };
+        if delivered > 0 {
+            reward_map.insert(cred, Lovelace(delivered));
+            total_distributed += delivered;
         }
     }
 
