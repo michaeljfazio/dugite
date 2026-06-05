@@ -198,9 +198,57 @@ fn v1_division(cur: &mut Cursor<'_>) -> CostPair {
     CostPair { cpu, mem }
 }
 
+/// Protocol-version-dependent `BuiltinSemanticsVariant` for PlutusV1/V2.
+///
+/// Per IntersectMBO/plutus `PlutusLedgerApi.Common.ProtocolVersions`
+/// (Note [Mapping of protocol versions and ledger languages to semantics
+/// variants]) + `V2/EvaluationContext.hs`: PlutusV1 and PlutusV2 both use
+/// `DefaultFunSemanticsVariantA` before the Chang/Conway hard fork
+/// (`changPV = 9`) and `DefaultFunSemanticsVariantB` from PV9 onward. The
+/// flat-array PARAM COUNT is identical across the variants (175 for V2); only
+/// the cost-function SHAPE of two builtins changes — `multiplyInteger` cpu
+/// (`added_sizes` → `multiplied_sizes`) and `verifyEd25519Signature` cpu
+/// (`linear_in_z` → `linear_in_y`). (PV11/van Rossem introduces VariantD with
+/// further text-builtin changes — a future follow-up.)
+#[inline]
+fn is_variant_b(major_pv: u32) -> bool {
+    major_pv >= 9
+}
+
+/// `multiplyInteger` cost pair for the given semantics variant. Consumes 4
+/// flat params (cpu intercept+slope, mem intercept+slope) regardless of
+/// variant — only the cpu SHAPE differs. VariantA: cpu `added_sizes`;
+/// VariantB (PV9+): cpu `multiplied_sizes`. mem is `added_sizes` in both.
+fn multiply_integer(cur: &mut Cursor<'_>, variant_b: bool) -> CostPair {
+    let cpu_lin = cur.linear();
+    let cpu = if variant_b {
+        CostingFun::MultipliedSizes(cpu_lin)
+    } else {
+        CostingFun::AddedSizes(cpu_lin)
+    };
+    let mem = CostingFun::AddedSizes(cur.linear());
+    CostPair { cpu, mem }
+}
+
+/// `verifyEd25519Signature` cost pair for the given semantics variant.
+/// Consumes 3 flat params (cpu intercept+slope, mem constant). VariantA: cpu
+/// `linear_in_z` (costs on the signature size, arg3); VariantB (PV9+): cpu
+/// `linear_in_y` (costs on the message size, arg2). mem is `constant` in both.
+fn verify_ed25519(cur: &mut Cursor<'_>, variant_b: bool) -> CostPair {
+    let cpu_lin = cur.linear();
+    let cpu = if variant_b {
+        CostingFun::LinearInY(cpu_lin)
+    } else {
+        CostingFun::LinearInZ(cpu_lin)
+    };
+    let mem = CostingFun::Constant(cur.next());
+    CostPair { cpu, mem }
+}
+
 /// Apply a flat PlutusV1 cost-model array (166 entries, canonical
 /// `ParamName` order) to a fresh [`AppliedCosts`].
-pub fn apply_v1(p: &[i64]) -> Result<AppliedCosts, CostModelApplyError> {
+pub fn apply_v1(p: &[i64], major_pv: u32) -> Result<AppliedCosts, CostModelApplyError> {
+    let variant_b = is_variant_b(major_pv);
     if p.len() != V1_PARAM_COUNT {
         return Err(CostModelApplyError::WrongLength {
             expected: V1_PARAM_COUNT,
@@ -260,12 +308,10 @@ pub fn apply_v1(p: &[i64]) -> Result<AppliedCosts, CostModelApplyError> {
     refill_builtin(&mut b, MkNilPairData, cur)?;
     refill_builtin(&mut b, MkPairData, cur)?;
     b.set_cost_pair(ModInteger, v1_division(cur));
-    // multiplyInteger — V1 cpu+mem are both `added_sizes`.
-    {
-        let cpu = CostingFun::AddedSizes(cur.linear());
-        let mem = CostingFun::AddedSizes(cur.linear());
-        b.set_cost_pair(MultiplyInteger, CostPair { cpu, mem });
-    }
+    // multiplyInteger — VariantA cpu `added_sizes`; VariantB (PV9+)
+    // `multiplied_sizes`.
+    let mul = multiply_integer(cur, variant_b);
+    b.set_cost_pair(MultiplyInteger, mul);
     refill_builtin(&mut b, NullList, cur)?;
     b.set_cost_pair(QuotientInteger, v1_division(cur));
     b.set_cost_pair(RemainderInteger, v1_division(cur));
@@ -281,7 +327,10 @@ pub fn apply_v1(p: &[i64]) -> Result<AppliedCosts, CostModelApplyError> {
     refill_builtin(&mut b, UnIData, cur)?;
     refill_builtin(&mut b, UnListData, cur)?;
     refill_builtin(&mut b, UnMapData, cur)?;
-    refill_builtin(&mut b, VerifyEd25519Signature, cur)?;
+    // verifyEd25519Signature — VariantA cpu `linear_in_z`; VariantB (PV9+)
+    // `linear_in_y`.
+    let vfy = verify_ed25519(cur, variant_b);
+    b.set_cost_pair(VerifyEd25519Signature, vfy);
 
     debug_assert_eq!(
         cur.i, V1_PARAM_COUNT,
@@ -320,7 +369,8 @@ pub fn apply_v1(p: &[i64]) -> Result<AppliedCosts, CostModelApplyError> {
 /// truncates for a node whose `ParamName` enum predates those additions.
 /// Builtins beyond index 174 therefore retain the reference default — a
 /// no-op for any V2 script that does not call a Plomin-era builtin.
-pub fn apply_v2(p: &[i64]) -> Result<AppliedCosts, CostModelApplyError> {
+pub fn apply_v2(p: &[i64], major_pv: u32) -> Result<AppliedCosts, CostModelApplyError> {
+    let variant_b = is_variant_b(major_pv);
     if p.len() < V2_PARAM_COUNT {
         return Err(CostModelApplyError::WrongLength {
             expected: V2_PARAM_COUNT,
@@ -380,12 +430,11 @@ pub fn apply_v2(p: &[i64]) -> Result<AppliedCosts, CostModelApplyError> {
     refill_builtin(&mut b, MkNilPairData, cur)?;
     refill_builtin(&mut b, MkPairData, cur)?;
     b.set_cost_pair(ModInteger, v1_division(cur));
-    // multiplyInteger — V2 cpu+mem are both `added_sizes` (same as V1).
-    {
-        let cpu = CostingFun::AddedSizes(cur.linear());
-        let mem = CostingFun::AddedSizes(cur.linear());
-        b.set_cost_pair(MultiplyInteger, CostPair { cpu, mem });
-    }
+    // multiplyInteger — VariantA cpu `added_sizes`; VariantB (PV9+)
+    // `multiplied_sizes`. (Division shapes are unchanged A↔B — only the
+    // coefficients differ — so they stay on `v1_division`.)
+    let mul = multiply_integer(cur, variant_b);
+    b.set_cost_pair(MultiplyInteger, mul);
     refill_builtin(&mut b, NullList, cur)?;
     b.set_cost_pair(QuotientInteger, v1_division(cur));
     b.set_cost_pair(RemainderInteger, v1_division(cur));
@@ -405,7 +454,10 @@ pub fn apply_v2(p: &[i64]) -> Result<AppliedCosts, CostModelApplyError> {
     refill_builtin(&mut b, UnMapData, cur)?;
     // verifyEcdsaSecp256k1Signature — new in V2, before verifyEd25519Signature.
     refill_builtin(&mut b, VerifyEcdsaSecp256k1Signature, cur)?;
-    refill_builtin(&mut b, VerifyEd25519Signature, cur)?;
+    // verifyEd25519Signature — VariantA cpu `linear_in_z`; VariantB (PV9+)
+    // `linear_in_y`.
+    let vfy = verify_ed25519(cur, variant_b);
+    b.set_cost_pair(VerifyEd25519Signature, vfy);
     // verifySchnorrSecp256k1Signature — new in V2, last param block.
     refill_builtin(&mut b, VerifySchnorrSecp256k1Signature, cur)?;
 
@@ -727,14 +779,14 @@ mod tests {
     #[test]
     fn wrong_length_is_rejected() {
         assert_eq!(
-            apply_v1(&[0i64; 10]).unwrap_err(),
+            apply_v1(&[0i64; 10], 8).unwrap_err(),
             CostModelApplyError::WrongLength {
                 expected: 166,
                 got: 10,
             }
         );
         // 166 succeeds.
-        assert!(apply_v1(&[0i64; 166]).is_ok());
+        assert!(apply_v1(&[0i64; 166], 8).is_ok());
     }
 
     /// Feed `p[i] = i` so every flat index is a distinct value, then assert
@@ -743,7 +795,8 @@ mod tests {
     #[test]
     fn synthetic_index_mapping_is_canonical() {
         let p: Vec<i64> = (0..166).collect();
-        let a = apply_v1(&p).unwrap();
+        // pre-Conway (VariantA): multiplyInteger=added_sizes, verifyEd25519=linear_in_z.
+        let a = apply_v1(&p, 8).unwrap();
 
         // addInteger: cpu max_size(intercept=p0, slope=p1); mem max_size(p2,p3).
         // at sizes (1,1): cpu = 0 + 1*max(1,1) = 1; mem = 2 + 3*1 = 5.
@@ -776,26 +829,26 @@ mod tests {
         let mul = a.builtins.cost_for(BuiltinId::MultiplyInteger, 1, 1, 0);
         assert_eq!((mul.cpu, mul.mem), (115 + 116 * 2, 117 + 118 * 2));
 
-        // verifyEd25519Signature cpu: linear_in_y (p163,p164); mem const(p165).
-        //   at y=2: cpu = 163 + 164*2.
+        // verifyEd25519Signature cpu: VariantA linear_in_z (p163,p164); mem const(p165).
+        //   at z=2: cpu = 163 + 164*2.
         let vfy = a
             .builtins
-            .cost_for(BuiltinId::VerifyEd25519Signature, 0, 2, 0);
+            .cost_for(BuiltinId::VerifyEd25519Signature, 0, 0, 2);
         assert_eq!((vfy.cpu, vfy.mem), (163 + 164 * 2, 165));
     }
 
     #[test]
     fn v2_wrong_length_is_rejected() {
         assert_eq!(
-            apply_v2(&[0i64; 10]).unwrap_err(),
+            apply_v2(&[0i64; 10], 9).unwrap_err(),
             CostModelApplyError::WrongLength {
                 expected: 175,
                 got: 10,
             }
         );
         // Exactly 175 succeeds; a longer (Plomin-era) array is truncated.
-        assert!(apply_v2(&[0i64; 175]).is_ok());
-        assert!(apply_v2(&[0i64; 332]).is_ok());
+        assert!(apply_v2(&[0i64; 175], 9).is_ok());
+        assert!(apply_v2(&[0i64; 332], 9).is_ok());
     }
 
     /// Feed `p[i] = i` and pin the V2-specific index→shape mapping: the
@@ -805,7 +858,8 @@ mod tests {
     #[test]
     fn v2_synthetic_index_mapping_is_canonical() {
         let p: Vec<i64> = (0..175).collect();
-        let a = apply_v2(&p).unwrap();
+        // pre-Conway (VariantA): verifyEd25519=linear_in_z.
+        let a = apply_v2(&p, 8).unwrap();
 
         // Shared machine costs sit at the same indices as V1.
         assert_eq!((a.machine.apply.cpu, a.machine.apply.mem), (17, 18));
@@ -823,10 +877,11 @@ mod tests {
             .cost_for(BuiltinId::VerifyEcdsaSecp256k1Signature, 1, 1, 1);
         assert_eq!((ecdsa.cpu, ecdsa.mem), (167, 168));
 
-        // verifyEd25519Signature: cpu linear_in_y(p169,p170), mem const(p171).
+        // verifyEd25519Signature: VariantA cpu linear_in_z(p169,p170), mem const(p171).
+        //   at z=2: cpu = 169 + 170*2.
         let ed = a
             .builtins
-            .cost_for(BuiltinId::VerifyEd25519Signature, 0, 2, 0);
+            .cost_for(BuiltinId::VerifyEd25519Signature, 0, 0, 2);
         assert_eq!((ed.cpu, ed.mem), (169 + 170 * 2, 171));
 
         // verifySchnorrSecp256k1Signature: cpu linear_in_y(p172,p173), mem const(p174).
@@ -1016,7 +1071,9 @@ mod tests {
             1, 150000, 32, 197209, 0, 1, 1, 150000, 32, 150000, 32, 150000, 32, 150000, 32, 150000,
             32, 150000, 32, 150000, 32, 3345831, 1, 1,
         ];
-        let a = apply_v1(&p).unwrap();
+        // Alonzo = PV5 (pre-Conway VariantA): multiplyInteger=added_sizes,
+        // verifyEd25519=linear_in_z.
+        let a = apply_v1(&p, 5).unwrap();
 
         // addInteger cpu max_size(197209, 0) → flat 197209 at any size.
         assert_eq!(
@@ -1041,12 +1098,49 @@ mod tests {
             a.builtins.cost_for(BuiltinId::MultiplyInteger, 2, 3, 0).cpu,
             61516 + 11218 * 5
         );
-        // verifyEd25519Signature cpu linear_in_y(3345831, 1) at y=64 = 3345831 + 64.
+        // verifyEd25519Signature cpu VariantA linear_in_z(3345831, 1) at z=64 = 3345831 + 64.
         assert_eq!(
             a.builtins
-                .cost_for(BuiltinId::VerifyEd25519Signature, 0, 64, 0)
+                .cost_for(BuiltinId::VerifyEd25519Signature, 0, 0, 64)
                 .cpu,
             3345831 + 64
         );
+    }
+
+    /// The V1/V2 BuiltinSemanticsVariant switch at Chang/Conway (PV9): both
+    /// multiplyInteger (added_sizes → multiplied_sizes) and
+    /// verifyEd25519Signature (linear_in_z → linear_in_y) change shape, while
+    /// the flat-array param positions are identical. Validated against the real
+    /// current mainnet V2 coefficients (multiplyInteger 90434/519).
+    #[test]
+    fn v2_semantics_variant_switches_at_pv9() {
+        // Real mainnet V2 multiplyInteger coefficients live at flat [115,116].
+        let mut p: Vec<i64> = (0..175).collect();
+        p[115] = 90434; // cpu intercept
+        p[116] = 519; // cpu slope
+
+        // VariantA (PV8): cpu = added_sizes → 90434 + 519*(x+y).
+        let a8 = apply_v2(&p, 8).unwrap();
+        let m8 = a8.builtins.cost_for(BuiltinId::MultiplyInteger, 4, 5, 0);
+        assert_eq!(m8.cpu, 90434 + 519 * (4 + 5));
+        // verifyEd25519: VariantA linear_in_z (costs on z, p169/p170).
+        let v8 = a8
+            .builtins
+            .cost_for(BuiltinId::VerifyEd25519Signature, 0, 7, 3);
+        assert_eq!(v8.cpu, 169 + 170 * 3); // uses z=3, ignores y
+
+        // VariantB (PV9): cpu = multiplied_sizes → 90434 + 519*(x*y).
+        let a9 = apply_v2(&p, 9).unwrap();
+        let m9 = a9.builtins.cost_for(BuiltinId::MultiplyInteger, 4, 5, 0);
+        assert_eq!(m9.cpu, 90434 + 519 * (4 * 5));
+        // verifyEd25519: VariantB linear_in_y (costs on y, p169/p170).
+        let v9 = a9
+            .builtins
+            .cost_for(BuiltinId::VerifyEd25519Signature, 0, 7, 3);
+        assert_eq!(v9.cpu, 169 + 170 * 7); // uses y=7, ignores z
+
+        // The two variants genuinely differ for the same array.
+        assert_ne!(m8.cpu, m9.cpu);
+        assert_ne!(v8.cpu, v9.cpu);
     }
 }

@@ -3625,6 +3625,7 @@ pub fn validate_transaction_with_pools(
                             cost_models_cbor.as_deref(),
                             max_ex,
                             sc,
+                            params.protocol_version_major as u32,
                         );
                         if tx.is_valid {
                             // Tx claims scripts pass — reject if they actually fail.

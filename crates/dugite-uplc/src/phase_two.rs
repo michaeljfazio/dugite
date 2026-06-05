@@ -16,6 +16,7 @@
 //!     cost_models_cbor: Option<&[u8]>,
 //!     initial_budget: (u64, u64),       // (cpu, mem)
 //!     slot_config: SlotConfig,
+//!     major_pv: u32,                    // selects V1/V2 BuiltinSemanticsVariant
 //!     run_phase_one: bool,
 //!     with_redeemer: impl FnMut(&Redeemer),
 //! ) -> Result<Vec<RedeemerResult>, PhaseTwoError>;
@@ -199,15 +200,21 @@ impl RedeemerObserver for () {
 ///
 /// `observer` is invoked once per redeemer with its raw CBOR bytes,
 /// before the CEK evaluation. Pass `()` if you don't need this.
+#[allow(clippy::too_many_arguments)] // mirrors the aiken-uplc interface + the protocol-version selector
 pub fn eval_phase_two_raw<O: RedeemerObserver>(
     tx_cbor: &[u8],
     utxos: &[(Vec<u8>, Vec<u8>)],
     cost_models_cbor: Option<&[u8]>,
     initial_budget: (u64, u64),
     slot_config: SlotConfig,
+    major_pv: u32,
     _run_phase_one: bool,
     observer: &mut O,
 ) -> Result<Vec<RedeemerResult>, PhaseTwoError> {
+    // `major_pv` selects the PlutusV1/V2 `BuiltinSemanticsVariant` (VariantA
+    // pre-Conway, VariantB at PV9+) for the per-builtin cost model — see
+    // `cost_apply::apply_v1`/`apply_v2`. Threaded through to
+    // `resolve_applied_costs`.
     // Wire-up checklist:
     //   1. Decode tx via dugite-serialization                ── DONE (UPLC-9 part 1)
     //   2. Decode UTxO entries                               ── DONE (UPLC-9 part 1)
@@ -287,6 +294,7 @@ pub fn eval_phase_two_raw<O: RedeemerObserver>(
             &slot_config,
             redeemer_budget,
             decoded.cost_models.as_ref(),
+            major_pv,
         )?;
 
         // The restricting cap above already guarantees `consumed <= declared`
@@ -617,6 +625,7 @@ mod tests {
             Some(&[0xff]),
             (1, 1),
             default_slot_config(),
+            9,
             true,
             &mut (),
         );
@@ -639,6 +648,7 @@ mod tests {
             None,
             (10_000_000, 10_000_000),
             default_slot_config(),
+            9,
             true,
             &mut (),
         )
@@ -651,8 +661,16 @@ mod tests {
         // Empty/garbage tx must surface as TxDecode (not NotImplemented and
         // not a panic). This is the adversarial-input guarantee from
         // lib.rs §1.
-        let result =
-            eval_phase_two_raw(&[], &[], None, (1, 1), default_slot_config(), true, &mut ());
+        let result = eval_phase_two_raw(
+            &[],
+            &[],
+            None,
+            (1, 1),
+            default_slot_config(),
+            9,
+            true,
+            &mut (),
+        );
         assert!(matches!(result, Err(PhaseTwoError::TxDecode(_))));
     }
 
@@ -666,6 +684,7 @@ mod tests {
             None,
             (1, 1),
             default_slot_config(),
+            9,
             true,
             &mut (),
         );

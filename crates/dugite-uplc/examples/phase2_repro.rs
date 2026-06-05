@@ -57,12 +57,16 @@ fn main() {
         max_ex.1
     );
 
+    // `protocol_major` selects the V1/V2 BuiltinSemanticsVariant. The dump may
+    // carry it; default 8 (pre-Conway VariantA) for older divergence dumps.
+    let major_pv = doc["protocol_major"].as_u64().unwrap_or(8) as u32;
     match eval_phase_two_raw(
         &tx_cbor,
         &utxos,
         cost_models_cbor.as_deref(),
         max_ex,
         slot_config,
+        major_pv,
         false,
         &mut (),
     ) {

@@ -77,6 +77,7 @@ pub fn eval_resolved_redeemer(
     slot_config: &SlotConfig,
     initial_budget: ExBudget,
     cost_models: Option<&CostModels>,
+    major_pv: u32,
 ) -> Result<RedeemerEvalOutcome, PhaseTwoError> {
     // 1. Decode script bytes → typed Term.
     //
@@ -151,7 +152,7 @@ pub fn eval_resolved_redeemer(
     // so callers (dugite-ledger Phase-2 error path and the CLI EvalTx
     // response) can mirror that behaviour.
     let mut trace_log: Vec<String> = Vec::new();
-    let mut tracker = match resolve_applied_costs(cost_models, r.language) {
+    let mut tracker = match resolve_applied_costs(cost_models, r.language, major_pv) {
         Some(applied) => BudgetTracker::with_applied(initial_budget, applied),
         None => BudgetTracker::new(initial_budget),
     };
@@ -231,12 +232,13 @@ fn data_const_term(d: crate::data::Data) -> Term {
 fn resolve_applied_costs(
     cost_models: Option<&CostModels>,
     language: ScriptLanguage,
+    major_pv: u32,
 ) -> Option<crate::cost_apply::AppliedCosts> {
     let cm = cost_models?;
     match language {
         ScriptLanguage::PlutusV1 => {
             let params = cm.plutus_v1.as_deref()?;
-            match crate::cost_apply::apply_v1(params) {
+            match crate::cost_apply::apply_v1(params, major_pv) {
                 Ok(applied) => Some(applied),
                 Err(e) => {
                     tracing::warn!(
@@ -250,7 +252,7 @@ fn resolve_applied_costs(
         }
         ScriptLanguage::PlutusV2 => {
             let params = cm.plutus_v2.as_deref()?;
-            match crate::cost_apply::apply_v2(params) {
+            match crate::cost_apply::apply_v2(params, major_pv) {
                 Ok(applied) => Some(applied),
                 Err(e) => {
                     tracing::warn!(
@@ -595,6 +597,7 @@ mod tests {
             &slot_cfg(),
             budget,
             None,
+            9,
         )
         .expect("V3 unit script runs");
         assert!(matches!(outcome.result_term, Term::Const(Constant::Unit)));
@@ -856,7 +859,7 @@ mod tests {
             cpu: 100_000_000,
             mem: 1_000_000,
         };
-        let outcome = eval_resolved_redeemer(&tx, &resolved, &r, &slot_cfg(), budget, None)
+        let outcome = eval_resolved_redeemer(&tx, &resolved, &r, &slot_cfg(), budget, None, 9)
             .expect("trace+unit script should succeed");
         assert_eq!(
             outcome.logs,
@@ -873,7 +876,7 @@ mod tests {
             cpu: 100_000_000,
             mem: 1_000_000,
         };
-        let outcome = eval_resolved_redeemer(&tx, &resolved, &r, &slot_cfg(), budget, None)
+        let outcome = eval_resolved_redeemer(&tx, &resolved, &r, &slot_cfg(), budget, None, 9)
             .expect("triple-trace script should succeed");
         assert_eq!(
             outcome.logs,
@@ -890,7 +893,7 @@ mod tests {
             cpu: 100_000_000,
             mem: 1_000_000,
         };
-        let err = eval_resolved_redeemer(&tx, &resolved, &r, &slot_cfg(), budget, None)
+        let err = eval_resolved_redeemer(&tx, &resolved, &r, &slot_cfg(), budget, None, 9)
             .expect_err("trace+error script must fail");
         // The error variant must carry the trace log.
         match err {
