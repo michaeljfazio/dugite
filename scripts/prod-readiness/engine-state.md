@@ -840,6 +840,16 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake122 2026-06-07: POLL #10 re-gauntlet w8t0ro3f6 — 1/3 refuters reported (compounding-feedback refuted=TRUE,
+  but NARROW). It CONFIRMS the primary path is correct + #10 genuinely resolved (Some(1)=>Big, 0 phase-1) AND
+  resolves my wake121 meta-absent concern in the fix's favor (V2-InMemory ALWAYS writes meta w/ codec version;
+  no legit meta-absent legacy). REAL narrow divergence: upstream FromJSON uses REQUIRED non-nullable
+  `.: tablesCodecVersion`, so a meta that parses but lacks the field / is null = HARD upstream parse failure;
+  dugite returns Ok(None)=>Little (silently accepted as LE) = too lenient. Remediation: absent/null field => ERR
+  (collapse to {Some(1)=>Big, else=>Err}); drop the 2 None=>LE tests. Edge case (real preprod meta has field=1)
+  but cardinal-rule-relevant. DECISION: WAIT for the full aggregate (2 refuters still running) before launching
+  ONE remediation that addresses all findings — don't act on a partial gauntlet for a narrow point. #10 stays
+  GAUNTLET-PENDING. next: read aggregate -> remediation muscle (absent/null=>Err) -> re-verify -> commit.
 - wake121 2026-06-07: *** #10 FULL VERIFYING PASS (authoritative path) *** verify10g re-soak: 0 phase-1
   transaction rejections (all classes), codec_version=Some(1)->Big authoritative, cross-val no contradiction,
   only 281 #15 Error-term. Synced past all failing slots. SIGTERM'd verify10g (kept db for #15). Launched
