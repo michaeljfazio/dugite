@@ -90,8 +90,11 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- infra-muscle  workflow=whzzl2vls  (Opus, worktree) — adding per-credential stake to the epoch-state-debug
-  dump (env DUGITE_TRACE_CREDS). Shared diagnostic infra that unblocks #1/#3/#11 (all per-cred divergences).
+- infra-build  pid-file=.jobs/infra-build.pid  (node build; per-cred dump infra APPLIED to main
+  [uncommitted, Tier B]). NEXT: replay db-preprod-sync to ep57 with
+  DUGITE_EPOCH_STATE_DUMP_CRED_FILTER=630472f7,7d3e2b31 -> read per_credential entries from the JSON
+  dump -> compare dugite stake vs Koios 9957549164/9815680998. If JSON works -> commit infra (Tier B,
+  verified-working) and finally settle ep57.
 
 ## VERIFY FINDING (CORRECTED after gauntlet — my wake9 analysis was WRONG)
 - The apply_utxo_diff fix is INERT for ep57. Gauntlet wm055td32 REFUTED 2/3 (haskell-semantics +
@@ -192,3 +195,9 @@
   stake (utxo_stake/reward_balance/total/pool) to the epoch-state-debug dump gated on DUGITE_TRACE_CREDS.
   Once verified+committed, ALL ledger byte-exactness items become measurable from a replay's JSON. This
   is the engine investing in tooling to unblock a whole frontier rather than tunneling.
+- wake21 2026-06-06T14:11Z: infra muscle whzzl2vls delivered per-credential dump (PerCredentialSummary +
+  CredentialEntry joining GO-snapshot stake_distribution + delegations + rupd.rewards, env-filterable via
+  DUGITE_EPOCH_STATE_DUMP_CRED_FILTER, top-200 + pinned-filter, 5 unit tests, fields aligned to cardano-cli
+  debug log-epoch-state). Tier B, checks_green, 1 file (epoch_state_debug.rs, feature-gated, no ledger
+  semantics). Applied to main (uncommitted); building. Next wake replays + reads per-cred JSON to settle
+  ep57 and arm the same tooling for #3 ep213 / #11.
