@@ -162,7 +162,17 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:FIXING (float-parse byte-exactness). *** re-
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-BUILDING (FINAL-DONE). *** muscle
+  w3cxa15va COMPLETE wake147, checks_green, 2 crates ***. json_number_to_word8_codec_version mirrors Aeson
+  toBoundedInteger@Word8 EXACTLY: 1.0/1e0/100e-2=>1=>Big (accepted like upstream); 1.5=>Err(non-integral);
+  256/-1=>Err(out-of-Word8); 2.0=>Err(unknown version); "1"=>Err(string); then enforceVersion narrows to ==1.
+  Field-absent/null/file-absent/wrong-backend=>Err unchanged. Narrowed overclaim comments + scope-noted CRC as
+  #17 + corrected cross_validate 'live not dead' wording. Resolves BOTH gauntlet refutations (float-parse byte-
+  exact; CRC separate). The real preprod meta is integer 1 -> import UNCHANGED from STRICT (verify10i = 0 phase-1).
+  FINAL-DONE patch saved candidate-fix-10-FINAL-DONE-codecversion-aeson.patch (3856 lines, applies clean) +
+  applied to MAIN + build pid 62684 (.jobs/verify-build-10j.log). NEXT WAKE: BUILD_EXIT=0 -> re-import re-soak
+  (confirm 0 phase-1, identical to STRICT) -> RE-GAUNTLET (should PASS: parse byte-exact, claim accurate, CRC=#17)
+  -> COMMIT #10. was: state:FIXING (float-parse byte-exactness). *** re-
   gauntlet w3upqlq0y = 2/3 refuted, but ALL 3 CONFIRM the endianness/backend/version decision is byte-exact for
   real inputs — NO endianness refutation ***. Refutes: (a) haskell-semantics — parse_tables_codec_version
   as_u64() REJECTS float-form 1.0/1e0/100e-2 that Aeson toBoundedInteger FLOORS to 1 and ACCEPTS -> over-strict
@@ -580,12 +590,12 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- fix-muscle w3cxa15va (#10 float-parse byte-exactness + claim narrowing; abs-path STRICT base; Opus, worktree,
-  Tier A') — /workflows-visible. Poll next wake for FIX.
-- re-gauntlet w3upqlq0y — DONE 2/3 refuted (endianness CONFIRMED byte-exact; refutes = float-parse over-strict +
-  CRC overclaim). STRICT patch = base for the float remediation.
-- verify10i-resoak — STOPPED. db-clones/preprod-verify10i RETAINED for #15.
-- DISK: 37GB free. Watch.
+- verify-build-10j  pid 62684  log .jobs/verify-build-10j.log — release build of dugite-node with the FINAL-DONE
+  #10 fix (STRICT + Aeson float-parse parity) on MAIN. Poll BUILD_EXIT=0 -> re-import re-verify.
+- fix-muscle w3cxa15va — COMPLETE (Aeson float-parse parity + claim narrowing). patch
+  candidate-fix-10-FINAL-DONE-codecversion-aeson.patch + worktree wf_1e767a9c-484-1.
+- db-clones/preprod-verify10i RETAINED for #15. DISK 37GB — GC verify10i after the FINAL re-soak supersedes it.
+- Patch history: ...STRICT(float-parse over-strict, 2/3 refuted) -> FINAL-DONE(Aeson float parity, current candidate).
 - fix-muscle wh8n6ip92 — COMPLETE (strict meta; verified legacy-LE drop safe). patch
   candidate-fix-10-STRICT-codecversion.patch + worktree wf_e4a069c7-99f-1.
 - db-clones/preprod-verify10h RETAINED for #15.
@@ -941,6 +951,12 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake147 2026-06-07 (notification): #10 FLOAT-PARSE fix COMPLETE (muscle w3cxa15va, checks_green, 2 crates).
+  json_number_to_word8_codec_version = Aeson toBoundedInteger@Word8 parity (1.0/1e0=>Big; 1.5/256/2.0/"1"=>Err) +
+  enforceVersion ==1. Narrowed overclaim comments + CRC=#17 scope note + cross_validate live-not-dead. Resolves
+  both refutes. Real preprod (integer 1) import unchanged from STRICT. Assembled FINAL-DONE patch (3856 lines, 2
+  crates), applied to main, build pid 62684. #10 FIXING -> VERIFYING-BUILDING. next: BUILD_EXIT=0 -> re-soak
+  (0 phase-1) -> re-gauntlet (should pass) -> COMMIT #10. Did NOT commit.
 - wake146 2026-06-07: POLL #10 float-parse fix-muscle w3cxa15va — in VERIFY phase (clippy clean, running
   codec_version targeted tests then full nextest). Near completion. Not disturbed. #10 stays FIXING. next
   (notif/poll): read FIX -> re-import re-soak (real preprod integer 1, 0 phase-1) -> re-gauntlet -> commit.
