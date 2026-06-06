@@ -271,3 +271,9 @@
   is the first genuine non-stale bug the engine has found -> the broad-validation pivot works. ep246=Allegra
   PV3. dugite under-removed ~82.27M from reserves at the 245->246 reward transition. Fired analyze muscle to
   diagnose via haskell-ledger-cross-validation (reward-pot / reserves-expansion / undistributed-return / MIR).
+- wake29 2026-06-06T14:52Z: characterized the ep246 divergence trajectory (lock-free while analyze runs):
+  reserves_diff ep246=+82.27M, ep250=+81.6M, ep255=+81.8M, ep260=+81.0M, ep265=+80.2M, ep270=+79.4M,
+  ep275=+88.1M. So it is a DISCRETE one-time ~82.27M reserves error at the ep245->246 boundary (slowly
+  self-amortizes as the extra reserves generate slightly more expansion), NOT a per-epoch systematic drift,
+  PLUS a second discrete event near ep271-275 (+~9M). Narrows diagnosis to a specific reward/MIR/pot event
+  at the ep246 Allegra boundary. analyze muscle w93yngoj8 still running; mainnet replay at ep275.
