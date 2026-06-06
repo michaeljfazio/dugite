@@ -505,10 +505,14 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- fix-muscle w5vke699f (#10 meta-absent tolerance: missing/field-absent meta => legacy LE not error; end-to-end
-  importer test, Opus, worktree, Tier A') — /workflows-visible. Poll next wake for FIX.
+- fix-muscle wx76r15y3 (#10 meta-absent tolerance, RE-LAUNCHED with absolute-path base patch; Opus, worktree,
+  Tier A') — /workflows-visible. Poll next wake for FIX. (w5vke699f was STOPPED — see infra note.)
 - re-gauntlet w8t0ro3f6 — DONE 3/3 refuted (refuters disagreed; resolution = tolerate meta-absent as LE).
 - db-clones/preprod-verify10g RETAINED for #15. AUTHORITATIVE patch = base (meta-absent too strict; superseded by remediation).
+- *** INFRA NOTE (muscle worktree staleness) ***: isolation worktrees branch from a base commit that LAGS the
+  engine-state/patch-file commits (crates/ identical to HEAD, but scripts/prod-readiness/*.patch FILES missing).
+  => ALWAYS give muscles the base patch by ABSOLUTE path (/Users/michaelfazio/Source/dugite/scripts/prod-readiness/...),
+  never a worktree-relative path. w5vke699f failed STEP-0 on a relative path; re-launched as wx76r15y3 with abs path.
 - fix-muscle wjnl2t2ib — COMPLETE (authoritative codec-version endianness; addresses all 3 gauntlet refutes).
   patch candidate-fix-10-AUTHORITATIVE-codecversion.patch + worktree wf_fc714d5e-a00-1.
 - re-gauntlet wmpyis3tx — DONE 3/3 REFUTED (drove this rework). db-clones/preprod-verify10f kept for #15.
@@ -851,6 +855,13 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake124 2026-06-07: CAUGHT + FIXED an INFRA blocker. The remediation muscle w5vke699f reported "base patch
+  does not exist" — diagnosed: its worktree (ca50afd9ef) branches from a base that LAGS the wake119 patch-file
+  commit (7a28f46dbc), so scripts/prod-readiness/*.patch FILES are absent in the worktree (crates/ identical to
+  HEAD though). The relative-path STEP-0 git apply couldn't find the base. TaskStop'd w5vke699f, re-launched as
+  wx76r15y3 with the base patch by ABSOLUTE path + an infra note (patch applies to crates/ which match HEAD).
+  Recorded the worktree-staleness rule for all future muscles (abs-path base patches). #10 stays FIXING. LESSON:
+  poll muscle TEXT not just completion — a muscle floundering on a wrong premise needs orchestrator intervention.
 - wake123 2026-06-07 (notification): re-gauntlet w8t0ro3f6 FULLY COMPLETE = 3/3 refuted BUT refuters DISAGREED on
   meta-absent -> wake122's WAIT-for-aggregate decision VINDICATED (the lone wake122 refutation said absent=>Err;
   the 2-of-3 aggregate + correct offline-importer analog says absent=>tolerate-as-LE — OPPOSITE). dugite is TOO
