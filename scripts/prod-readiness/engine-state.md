@@ -9,7 +9,7 @@
 - reference_node_socket: none        # Koios-first; set if a cn node is up
 
 ## Frontiers  (advance these; zero open divergence behind each)
-- ledger.preprod:   epoch 56  (first open divergence at ep57 stake-dist)
+- ledger.preprod:   ep57 BYTE-EXACT CORRECT on clean HEAD replay (dugite 9957549164/9815680998 == Koios); advancing — testing ep181 halt
 - ledger.mainnet:   epoch 212 (open: ep213 reward divergence)
 - sync.preprod:     halts at ep181 (WithdrawalAmountMismatch, downstream of ep57)
 - sync.mainnet:     ~ep331 (last known good db-mainnet)
@@ -47,7 +47,7 @@
 
 ## In-progress
 - item: #1 ep57 preprod stake-distribution -10 ADA
-- state: PARKED (after 8 wakes of measurement plumbing; needs PROPER per-cred instrumentation, not ad-hoc eprintlns — see next-action). Rotating to other backlog items.
+- state: VERIFYING (RESOLVED on clean HEAD? per-cred dump proves ep57 byte-exact vs Koios; replay climbing to test the ep181 WithdrawalAmountMismatch halt)
 - attempts: 1
 - ANALYZE RESULT (w6lsvu2p2, Opus): canonical Haskell active-stake =
   resolveActiveInstantStakeCredentials (Stake.hs @52ef3d5) — per registered+delegated
@@ -90,11 +90,10 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- infra-build  pid-file=.jobs/infra-build.pid  (node build; per-cred dump infra APPLIED to main
-  [uncommitted, Tier B]). NEXT: replay db-preprod-sync to ep57 with
-  DUGITE_EPOCH_STATE_DUMP_CRED_FILTER=630472f7,7d3e2b31 -> read per_credential entries from the JSON
-  dump -> compare dugite stake vs Koios 9957549164/9815680998. If JSON works -> commit infra (Tier B,
-  verified-working) and finally settle ep57.
+- replay-measure  pid-file=.jobs/replay-measure.pid  (clean HEAD from-genesis replay climbing past ep93
+  toward ep181). TEST: does it hit the original WithdrawalAmountMismatch halt at ep181? If it CROSSES
+  ep181 cleanly -> ep57/ep181 RESOLVED on HEAD (prior finding stale); sync.preprod frontier unblocks. If
+  it HALTS -> bug is fork-induced (vindicates refuted #6 apply_utxo_diff fix; gauntlet trusted stale doc).
 
 ## VERIFY FINDING (CORRECTED after gauntlet — my wake9 analysis was WRONG)
 - The apply_utxo_diff fix is INERT for ep57. Gauntlet wm055td32 REFUTED 2/3 (haskell-semantics +
@@ -115,9 +114,11 @@
 
 ## Gauntlet ledger  (passed/refuted approaches — never silently retry a REFUTED)
 - REFUTED 2026-06-06 (wm055td32, 2/3): "fix apply_utxo_diff reconstruction path to replay stake_map".
-  INERT for ep57 (the bug is in the LIVE apply_utxo_changes path; clean local replay reproduces it and
-  never reaches apply_utxo_diff). DO NOT re-propose this as the ep57 fix. The patch is itself a valid
-  LATENT fork-path fix -> tracked as backlog #6, needs its own verification (re-sync past ep181 first).
+  *** REFUTAL PREMISE NOW DISPROVEN: the refuters (and the findings doc) claimed a clean local replay
+  reproduces the ep57 -5 ADA. DIRECT MEASUREMENT (per-cred dump, wake22) proves clean HEAD replay is
+  byte-exact CORRECT at ep57 (9957549164/9815680998 == Koios). So the bug is NOT in the live path and IS
+  likely fork-induced -> the apply_utxo_diff reconstruction fix (#6) may be the REAL fix after all. The
+  ep181-halt replay test decides. Lesson: the findings doc was stale; trust live measurement over docs. ***
 
 ## Token spend  (rolling; UTC-dated lines)
 - 2026-06-06T11:41Z wake1 ~ build+mithril launch (assess+drive)
@@ -201,3 +202,10 @@
   debug log-epoch-state). Tier B, checks_green, 1 file (epoch_state_debug.rs, feature-gated, no ledger
   semantics). Applied to main (uncommitted); building. Next wake replays + reads per-cred JSON to settle
   ep57 and arm the same tooling for #3 ep213 / #11.
+- wake22 2026-06-06T14:14Z: *** BREAKTHROUGH *** per-cred dump infra VERIFIED + COMMITTED (62db548471).
+  Direct measurement: clean HEAD from-genesis replay computes ep57 per-cred stake BYTE-EXACT vs Koios
+  (630472f7=9957549164, 7d3e2b31=9815680998; appear in ep58-dump GO snapshot due to mark/set/go lag).
+  The -5 ADA is NOT reproduced on clean HEAD -> prior REWARD-DIVERGENCE-FINDINGS.md is STALE (old code or
+  fork-affected db). 8 wakes of 'stalled measurement' actually produced the answer: dugite is already
+  correct on clean replay. Left the replay climbing to ep181 to test the original halt (decides
+  fork-induced-bug-real vs fully-resolved). Lesson banked: stale findings docs misled the gauntlet.
