@@ -624,6 +624,10 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake80 2026-06-07: POLL #10 fix muscle wagcpug42 — STILL RUNNING, healthy (5GB RAM, no nodes, 0 completed).
+  Currently researching the canonical Haskell CompactValue multi-asset layout to correctly reconstruct
+  multi-asset Values for the secondary fix (mod.rs:6435) — thorough (the primary endianness flip is the
+  one-liner). Not disturbed; no competing heavy work. #10 stays FIXING; next: poll wagcpug42 -> re-import re-verify.
 - wake79 2026-06-07: DRIVE #10 endianness FIX. Analyze muscle wxuwzffyl fully complete (rootcause confidence
   0.96). Launched fix muscle wagcpug42 (Tier 1, worktree): apply COMPLETE refscript+datum patch as base, then
   flip mod.rs:68 TxIx from_le_bytes->from_be_bytes (with #461 reconciliation: determine decoder scope + explain
