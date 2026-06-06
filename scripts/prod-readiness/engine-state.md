@@ -65,7 +65,7 @@
 
 ## In-progress
 - item: #8 NEW (real, found by broad sweep): mainnet ep246 reserves +82,270,482 divergence (Allegra)
-- state: ANALYZING (re-aimed) — fix muscle REFUTED the deltaR1/d hypothesis (already byte-exact); correct cause = per-pool/per-member reward UNDER-DISTRIBUTION (ep213-class, undistributed->reserves)
+- state: ANALYZING/localize — direction CONFIRMED via ep213 doc: member reward prefilter rewards.rs:461 (registered_at_startstep / frozen addrsRew set) drops ~82M of member rewards at ep246 that Haskell pays
 - attempts: 1
 - ANALYZE RESULT (w6lsvu2p2, Opus): canonical Haskell active-stake =
   resolveActiveInstantStakeCredentials (Stake.hs @52ef3d5) — per registered+delegated
@@ -299,3 +299,11 @@
   ep246 by comparing the dump's rewards.per_pool_top20 + per_credential rewards vs Koios pool_history /
   account_reward_history (mind the mark/set/go reward-timing lag), then fix the prefilter/distribution.
   GREAT discipline: the muscle refused a speculative fix that would have regressed byte-exact ep209-245.
+- wake34 2026-06-06T15:13Z: ep213 doc confirms the class precisely: dugite UNDER-distributes MEMBER rewards
+  (treasury-neutral, undistributed->reserves). Drop site = member loop rewards.rs:427-476; the pv<=6
+  registration prefilter rewards.rs:461 (if !registered_at_startstep(cred) -> skip member reward), mirroring
+  Haskell rewardOnePoolMember.prefilter (hk in addrsRew). The +82M = dugite's frozen reward-account set
+  (startstep_addrs_rew capture, rewards.rs:150-160) drops members Haskell pays — likely a capture-timing or
+  de/re-registration edge. The 4 'creds' I filtered ARE the 4 top pools (af22f959/d9812f8d/53215c47/6184f6e7).
+  Fired localize+fix muscle with strict pinpoint-first orders (find the exact dropped members via Koios
+  account_reward_history before any fix).
