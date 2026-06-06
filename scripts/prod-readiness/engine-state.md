@@ -9,7 +9,7 @@
 - reference_node_socket: none        # Koios-first; set if a cn node is up
 
 ## Frontiers  (advance these; zero open divergence behind each)
-- ledger.preprod:   BYTE-EXACT vs Koios — total active_stake matches at ep100/150/200/230 (Shelley→Conway) + ep57 per-cred exact; clean replay ep0-233 zero halts; finishing to ep293
+- ledger.preprod:   BYTE-EXACT vs Koios at ep100/150/200/230 (Shelley→Conway) + ep57 per-cred exact; clean replay ep0-233 zero halts. *** OPEN CANDIDATE (item 2b, wake61) ***: ep292 active_stake -100 ADA constant across mark/set/go vs Koios (from a Jun-3 STALE dump — MUST reproduce on HEAD before real; could be stale/already-fixed). Frontier holds ep0-230; ep231-293 NOT yet HEAD-verified byte-exact
 - ledger.mainnet:   BYTE-EXACT vs Koios — reserves+treasury exact at ep212-221 (doc's +180.4B ep213 divergence GONE on HEAD); replay validating further
 - sync.preprod:     from-genesis REPLAY clean + #9 snapshot-backend fix LANDED + LIVE-SOAK reached tip healthy (wake57): clone db-clones/preprod-soak fast-started via #9 Convertible mem->lsm path (NO genesis replay, utxo_count=4116338), caught up to live tip (node block 4793022 hash-matched koios, 1 block/28s behind live 4793023), 0 panic/0 OOM/0 wedge, RSS 4.8GB, CPU 1.5% idle-at-tip. *** SUSTAINED-WINDOW CONFIRMED wake60 ***: node tracks live tip in lockstep ~18min (block 4793042 == koios live 4793042, extends within seconds of each new block), 0 anomalies => GATE (2) live-sync-to-tip VALIDATED on preprod. Residual is GATE (3) only: #10 ref-script independent validation on the fast-start path (in FIXING via muscle we0nz74zr; node trusts consensus meanwhile, no wedge)
 - sync.mainnet:     ~ep331 (last known good db-mainnet)
@@ -51,6 +51,19 @@
    fork/original-sync hypothesis).
 2. [H][ledger] #11 mainnet stake-dereg residual (4 no-withdrawal cases diverge).
    state:NEW attempts:0  (replayable from db-mainnet; verify its epoch first)
+2b. [H][ledger][NEW-CANDIDATE wake61] preprod ep292 active_stake -100 ADA vs Koios, CONSTANT across all 3
+   snapshot phases. Phase mapping PINNED (dugite go(292)==Koios as(291), set(292)==as(292), mark(292)==as(293)):
+   dugite go 886066022703096 / set 886346899253790 / mark 911941407323655 vs Koios as 886166022703096 /
+   886446899253790 / 912041407323655 — EXACTLY -100,000,000 lovelace in every phase. A single stake entity
+   under-counted by 100 ADA in the base stake distribution propagating identically into mark/set/go. Found by
+   lock-free spot-check of epoch-dumps-dugite/epoch_000292.json. *** PROVENANCE CAVEAT (the #481 lesson) ***:
+   that dump is from Jun-3 (pre-HEAD); MUST reproduce on HEAD before treating as real — several fixes landed
+   since. VERIFY: either (a) query the LIVE soak node (pid 99162, on HEAD code, currently at ep293) for its
+   ep292 stake snapshot via dugite-cli/epoch-state-debug, or (b) HEAD from-genesis replay to ep292 with the
+   dump. If HEAD still shows -100 ADA -> real (likely same instant-stake-attribution CLASS as #1 ep57's -5 ADA,
+   but at a Conway PV10 epoch; introduced somewhere in ep231-292 since ep230 was byte-exact wake24). If gone ->
+   stale, close. state:NEW-CANDIDATE attempts:0  (do NOT fix before HEAD repro — round-100-ADA could be a single
+   UTxO/deposit attribution; localize the exact credential first via per-cred dump, as ep57 required)
 3. [DONE-on-HEAD][ledger] mainnet ep213 reserves divergence (== #11): RESOLVED. dugite reserves+treasury
    BYTE-EXACT vs Koios at ep212-221 (the doc's +180.4B ep213 divergence is GONE; fix landed in last 2 days).
    Stake-dereg reward attribution correct (reserves exact). OLD (stale) context: mainnet ep213 reward divergence (== #11; doc dated 2026-06-04, RECENT -> likely REAL,
@@ -491,6 +504,14 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake61 2026-06-07: #10 fix-muscle we0nz74zr STILL RUNNING (agent mid-rewrite of decode_tag5; not disturbed,
+  no competing heavy work launched — 4GB free RAM during its compile). Advanced a DIFFERENT item via a lock-free
+  spot-check: discovered NEW ledger candidate 2b — preprod ep292 active_stake -100 ADA vs Koios, CONSTANT across
+  all 3 snapshot phases (mapping pinned: go/set/mark(292) == Koios as(291/292/293), each exactly -100,000,000
+  lovelace). Found in epoch-dumps-dugite/epoch_000292.json. Flagged the PROVENANCE caveat (Jun-3 stale dump,
+  #481 lesson) — MUST reproduce on HEAD (query live soak node @ep293 or HEAD replay) before treating as real;
+  likely same instant-stake-attribution class as ep57 if it survives. Recorded item 2b + annotated
+  ledger.preprod frontier (holds ep0-230; ep231-293 not yet HEAD-verified). #10 stays FIXING.
 - wake60 2026-06-07: POLL #10 muscle (we0nz74zr STILL RUNNING — agent jsonl live, journal shows started not
   completed; mid two-part MemPack fix + nextest --workspace). Did NOT disturb it / did NOT launch competing
   heavy work. Advanced the OTHER in-progress item instead: sync-gate live-soak -> VALIDATED. Soak node tracks
