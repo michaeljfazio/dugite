@@ -22,6 +22,16 @@ the next and stop.
 - Helpers live in `scripts/prod-readiness/lib/`. Prefer them over improvising
   shell. Run them from the repo root.
 
+## Observability
+
+Route **every analytical step** (diagnose / analyze / fix / gauntlet) through the
+muscle Workflow so it appears live in `/workflows` while the engine is reasoning.
+Keep **mechanical steps** (clone / launch / poll / commit) as direct shell — a
+Workflow can only spawn subagents, so wrapping a trivial `poll-job.sh` in one
+would waste a subagent. Net effect: `/workflows` shows the engine whenever it is
+*thinking*; the per-wake `git log` of `engine-state.md` and the `.jobs/*.log`
+files show it *waiting/working* on out-of-band replays.
+
 ---
 
 ## Phase 1 — ASSESS
@@ -110,19 +120,23 @@ Branch on the item's state-machine state:
 5. Record the job under *Running jobs* in STATE with pid + log path + the
    epoch/account it is chasing. The item is now REPRODUCING (or VERIFYING).
    **Do not wait** — RESCHEDULE and poll it next wake.
-6. When ASSESS later reports the job `done`: REPRODUCING → diff the dump vs Koios
-   (use the Koios MCP tools: `koios_account_reward_history`, `koios_pool_history`,
-   `koios_pool_delegators_history`, `koios_pool_stake_snapshot`, `koios_epoch_info`)
-   to localize the first divergence → move to ANALYZING. VERIFYING → move to
-   GAUNTLET. Release the lock either way.
+6. When ASSESS later reports the job `done`: release the lock, then:
+   - **REPRODUCING done** → run the muscle in `diagnose` mode (this is the
+     dump-vs-Koios localization, as a `/workflows`-visible parallel fan-out):
+     `Workflow({ scriptPath: "scripts/prod-readiness/muscle.workflow.js",
+     args: { item, mode:"diagnose", net, reference, dumpPath:"<DUGITE_EPOCH_STATE_DUMP dir>" } })`.
+     Record the localized divergence; move to ANALYZING.
+   - **VERIFYING done** → move to GAUNTLET.
 
-### ANALYZING / FIXING / GAUNTLET  (in-turn, Workflow muscle)
-Spawn the muscle with the right mode (one Workflow call):
+### DIAGNOSE / ANALYZING / FIXING / GAUNTLET  (in-turn, Workflow muscle)
+ALL analytical work runs through the muscle so it is visible in `/workflows`
+(mechanical steps — clone/launch/poll — stay as direct shell above). Spawn the
+muscle with the right mode (one Workflow call):
 ```
 Workflow({ scriptPath: "scripts/prod-readiness/muscle.workflow.js",
-           args: { item: "<backlog line>", mode: "<analyze|fix|gauntlet>",
+           args: { item: "<backlog line>", mode: "<diagnose|analyze|fix|gauntlet>",
                    net: "<preprod|mainnet>", reference: "<Koios/dump locator>",
-                   tokenBudget: <remaining> } })
+                   dumpPath: "<dump dir, for diagnose>", tokenBudget: <remaining> } })
 ```
 - **ANALYZING** (`mode:"analyze"`) → returns research (Haskell source + spec) +
   a structured root-cause. **Read the in-project refs FIRST** inside the muscle:

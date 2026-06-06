@@ -86,6 +86,18 @@ tail -f scripts/prod-readiness/.jobs/*.log
 sed -n '/## Frontiers/,/## Last node state/p' scripts/prod-readiness/engine-state.md
 ```
 
+### What shows in `/workflows`
+
+The engine is a `ScheduleWakeup`/`CronCreate` self-loop, **not** a single
+`Workflow`, so the overall loop does not appear in `/workflows`. What *does*
+appear: every **analytical** step — `diagnose` (dump-vs-Koios localization),
+`analyze` (research + root-cause), `fix`, and `gauntlet` — runs through
+`muscle.workflow.js` (a real Workflow) and shows a live progress tree in
+`/workflows` while it runs. Mechanical/waiting steps (clone, launch-replay,
+poll, commit) are direct shell and don't — watch those via `git log` and the
+`.jobs/*.log` files. In short: **`/workflows` = the engine thinking; `git log` +
+job logs = the engine waiting/working.**
+
 ## Test
 
 ```bash
