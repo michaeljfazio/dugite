@@ -89,10 +89,13 @@ if (mode === 'diagnose') {
     agent(
       `Item: ${item} (network ${net}). The replay dump is at: ${dumpPath || '(see engine-state.md Running jobs)'}. `
       + `Reference: ${reference}. Compare the dump to the reference along this dimension: ${dim}. `
-      + `Use the Koios MCP tools (koios_account_reward_history, koios_pool_history, `
-      + `koios_pool_delegators_history, koios_pool_stake_snapshot, koios_epoch_info). `
-      + `Report the EARLIEST epoch where they diverge, the exact entity (account/pool), the field, `
-      + `and the lovelace delta (dugite - reference). If none diverge on this dimension, found=false.`,
+      + `Ground truth: use scripts/prod-readiness/lib/koios.sh ${net} <endpoint> '<json-body>' via Bash `
+      + `(per-network REST: pool_history, pool_delegators_history, pool_stake_snapshot, `
+      + `account_reward_history, epoch_info). Do NOT use the koios_* MCP tools — they were observed `
+      + `serving the WRONG network (Preview when preprod was expected), which silently breaks `
+      + `byte-exact comparison. Report the EARLIEST epoch where they diverge, the exact entity `
+      + `(account/pool), the field, and the lovelace delta (dugite - reference). `
+      + `If none diverge on this dimension, found=false.`,
       { label: `diff:${dim.split(' ')[1] || dim.slice(0, 12)}`, phase: 'Diagnose', schema: DIVERGENCE, model: MODEL_DIAGNOSE },
     ).then((d) => d || { found: false, epoch: 0, entity: '', field: dim, delta_lovelace: 0, evidence: 'agent-skipped' })))
 
