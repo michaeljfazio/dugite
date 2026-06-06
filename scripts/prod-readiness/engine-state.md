@@ -153,7 +153,18 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:GAUNTLET-PENDING (FINAL2). *** FULL VERIFYING
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:FIXING (STRICT meta semantics). *** re-gauntlet
+  w4007sv2k = 2/3 refuted (haskell-semantics + edge-epoch agree; compounding-feedback ran importer tests
+  empirically + did NOT refute) ***. DEFINITIVE truth table (source-cited): FromJSON uses MANDATORY
+  `.: tablesCodecVersion` -> present-meta-field-absent/null => MetadataInvalid => HARD ERROR (both converter +
+  loader); enforceVersion 1=>BE else fail; loadSnapshot decodes BigEndianTxIx UNCONDITIONALLY (no version=>LE
+  branch) + checks backend==utxohd-mem; getMetadata's MetadataFileDoesNotExist=>Nothing means SKIP-CRC not
+  decode-LE. UNANIMOUS must-fix: FINAL2 maps field-absent/null=>LE but upstream THROWS (too lenient, violates
+  default-to-rejection). DECISION (end the meta-absent flip-flop): STRICT — only {meta present + version=1 +
+  backend=utxohd-mem} => Big; EVERYTHING else (field-absent/null, version-other, meta-file-absent, malformed,
+  backend-mismatch) => ERROR. None unrepresentable from an accepted meta. Launched strict remediation wh8n6ip92
+  (abs-path base patch; verify all current mithril snapshots are modern before dropping the legacy-LE path;
+  STOP+report if a real network needs meta-less LE rather than guess). was: state:GAUNTLET-PENDING (FINAL2). *** FULL VERIFYING
   PASS wake131 *** verify10h re-soak (synced 124999612->125100373): 0 phase-1 transaction rejections (all
   classes), codec_version=Some(1)->Big, only 292 #15 Error-term residual. Launched RE-GAUNTLET w4007sv2k on
   FINAL2 (= authoritative codec-version [addressed 3 prior refutes] + meta-absent tolerance [addressed the latest
@@ -527,11 +538,11 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- re-gauntlet w4007sv2k (#10 FINAL2 fix adversarial refutation, refuterN=3) — /workflows-visible. Poll next wake:
-  pass -> COMMIT the FINAL2 patch via gh/HTTPS; refuted -> address.
-- verify10h-resoak — STOPPED CLEAN wake131 (FULL PASS: 0 phase-1 rejections; only 292 #15 Error-term).
-  db-clones/preprod-verify10h RETAINED for #15 diagnosis.
-- FINAL2 #10 fix on MAIN uncommitted (candidate-fix-10-FINAL2-authoritative-metaabsent.patch); commit on gauntlet pass.
+- fix-muscle wh8n6ip92 (#10 STRICT meta semantics: only version=1+backend=mem=>BE, else ERROR; abs-path base
+  FINAL2; Opus, worktree, Tier A') — /workflows-visible. Poll next wake for FIX.
+- re-gauntlet w4007sv2k — DONE 2/3 refuted (field-absent must ERROR; meta-absent strict). Drove strict remediation.
+- db-clones/preprod-verify10h RETAINED for #15.
+- Patch history: ...FINAL2(meta-absent too lenient, 2/3 refuted) -> STRICT(version=1-only-BE, current candidate).
 - DISK: 51GB free (db-clones/mainnet-ep213 48G is the big one; GC if mainnet work not imminent).
 - fix-muscle wx76r15y3 — COMPLETE (meta-absent=>LE tolerance + end-to-end tests). patch
   candidate-fix-10-FINAL2-authoritative-metaabsent.patch + worktree wf_a2048ce6-581-1.
@@ -883,6 +894,14 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake135 2026-06-07 (notification): re-gauntlet w4007sv2k COMPLETE = 2/3 refuted (compounding-feedback ran the
+  importer tests empirically + did NOT refute; the other 2 agree). DEFINITIVE source-cited truth table obtained
+  (mandatory `.:` => field-absent THROWS; loadSnapshot decodes BE unconditionally + backend check). Made the
+  EXECUTIVE call to END the meta-absent flip-flop: STRICT — only {meta present + version=1 + backend=utxohd-mem}
+  => Big, everything else => ERROR (default-to-rejection). Reset main, launched strict remediation wh8n6ip92
+  (verify-then-drop legacy-LE path; stop+report if a network needs meta-less LE). #10 GAUNTLET-PENDING -> FIXING.
+  This is the 6th gauntlet round on #10's endianness edge-handling — each caught a real byte-exactness divergence;
+  STRICT is the maximally-conservative terminal that no refuter can call too-lenient.
 - wake134 2026-06-07: POLL #10 re-gauntlet — still 2/3, but 3rd refuter (compounding-feedback) is genuinely
   busy: it's RUNNING the actual importer_ tests (cargo nextest -p dugite-node, 480s timeout) to EMPIRICALLY
   verify the meta-absent behavior, not just reason. Worth waiting (the contested meta-file-absent case deserves
