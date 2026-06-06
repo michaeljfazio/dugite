@@ -951,6 +951,10 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake148 2026-06-07: POLL #10 FINAL-DONE build verify-build-10j (pid 62684) — STILL RUNNING (final crate
+  dugite-node compiling/linking). Not done; can't re-verify yet. No competing CPU during link. #10 stays
+  VERIFYING-BUILDING; next: BUILD_EXIT=0 -> clone db-preprod-sync -> re-import re-soak (0 phase-1) -> re-gauntlet
+  -> COMMIT #10.
 - wake147 2026-06-07 (notification): #10 FLOAT-PARSE fix COMPLETE (muscle w3cxa15va, checks_green, 2 crates).
   json_number_to_word8_codec_version = Aeson toBoundedInteger@Word8 parity (1.0/1e0=>Big; 1.5/256/2.0/"1"=>Err) +
   enforceVersion ==1. Narrowed overclaim comments + CRC=#17 scope note + cross_validate live-not-dead. Resolves
