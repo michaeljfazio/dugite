@@ -10,11 +10,13 @@ export const meta = {
   ],
 }
 
-// args = { item, mode, net, reference, dumpPath, suspects?, refuterN?, tokenBudget? }
+// A = { item, mode, net, reference, dumpPath, suspects?, refuterN?, tokenBudget? }
 // mode ∈ { diagnose, analyze, fix, gauntlet }.  Every ANALYTICAL step of the engine
 // runs through here so it is visible in /workflows; mechanical steps (clone, launch,
 // poll) stay as direct shell in the runbook.
-const { item, mode, net, reference, dumpPath } = args || {}
+// `args` may arrive as an object OR a JSON string depending on the caller — parse defensively.
+const A = (typeof args === 'string' ? (() => { try { return JSON.parse(args) } catch (e) { return {} } })() : args) || {}
+const { item, mode, net, reference, dumpPath } = A
 
 // ---- structured-output schemas ----
 const DIVERGENCE = {
@@ -69,7 +71,7 @@ if (mode === 'diagnose') {
   // (Koios, or a cardano-node dump). Parallel fan-out over candidate dimensions —
   // this is the REPRODUCING→ANALYZING work, now visible in /workflows.
   phase('Diagnose')
-  const dims = (args && args.dimensions) || [
+  const dims = (A.dimensions) || [
     'per-epoch reserves/treasury/fees vs Koios totals',
     'per-account reward_history vs Koios account_reward_history',
     'per-pool stake_distribution / active_stake vs Koios pool_delegators_history + pool_stake_snapshot',
@@ -129,7 +131,7 @@ if (mode === 'fix') {
 if (mode === 'gauntlet') {
   // Only reached AFTER a VERIFYING replay reproduced `reference` with the divergence gone.
   phase('Gauntlet')
-  const N = (args && args.refuterN) || 3
+  const N = (A.refuterN) || 3
   const lensPool = ['haskell-semantics', 'edge-epoch', 'compounding-feedback', 'integer-rounding']
   const lenses = lensPool.slice(0, Math.max(3, Math.min(N, lensPool.length)))
   const votes = await parallel(lenses.map((lens) => () =>
