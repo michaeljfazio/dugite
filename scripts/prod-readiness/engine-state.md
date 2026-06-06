@@ -136,7 +136,23 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:FIXING-EXPANDED. *** VERIFYING VERDICT wake67
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-BUILDING (complete fix). *** muscle
+  wnqthg8c8 COMPLETE wake73, BOTH byte-exact oracles PASS, checks_green, 2 crates (7 files +1060/-115) ***.
+  KEY DISCOVERY: the real datum bug was tag-4 CORRUPTION, not just a drop — BinaryData era = bare
+  ShortByteString (VarLen||cbor), and the old decoder neither stripped the VarLen prefix (stored 1e581c... vs
+  581c...) for ADA-only NOR kept the datum for multi-asset. Fixed: decode_tag4 uses decode_compact_value_exact
+  (ADA-only+multi-asset) + new decode_binary_data() to yield bare Plutus Data CBOR; corrupt 132,148 ->
+  correct 778,015 inline-datum outputs. era_conway.rs decode_plutus_data_cbor() (reuses the SAME read_plutus_data
+  as tag-24 block decode); mod.rs import -> OutputDatum::InlineDatum{data,raw_cbor} (was None) = fixes the 290
+  "Error term". GAP B residual-11: DIAGNOSED already-covered by the refscript base (all 4 scripts 7afbde08/
+  23d3717e/bb4e5521/86820a34 decode from tag-5 MULTI-ASSET high-txix outputs, PlutusV3, hash byte-exact;
+  tag5-without-script_ref = 0 across all 59,872 tag-5 entries) -> no further change, added oracle asserts. ORACLES
+  (DUGITE_PREPROD_TABLES-gated, green vs real 885MB blob): refscript CIP-hash for all 4 gap-B + datum oracle
+  (decoded tag-4 datums blake2b-256 == Koios on-chain datum hashes aafa39eb.../54cfb9d3...). COMPLETE patch saved
+  scripts/prod-readiness/candidate-fix-10-COMPLETE-refscript-datum.patch (applies clean) + applied to MAIN
+  (uncommitted) + release build pid 98554 (.jobs/verify-build-10b.log). NEXT WAKE: on BUILD_EXIT=0, fresh import
+  from db-preprod-sync (NOT a reused db) -> re-soak -> the 290 Error-term + 41 budget + 11 not-found must ALL be
+  GONE (full-replay byte-exact = oracle) -> gauntlet (refuterN=3) -> commit via gh/HTTPS. Old sub-state notes: *** VERIFYING VERDICT wake67
   (fix correct but INSUFFICIENT — gate correctly BLOCKS commit) ***: fresh fixed-binary re-import re-soak
   (db-clones/preprod-verify10) measured vs the OLD soak: "script not found for redeemer purpose" 379 -> 11
   (97% gone), MissingScriptWitness present -> 0, and the hash-oracle target txs (578069c6/0d325a6e/759eab17/
@@ -238,11 +254,11 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- fix-muscle wnqthg8c8 (#10 EXPANDED: inline-datum decode + residual-11 refscript, Opus, worktree, Tier A') —
-  /workflows-visible. Applies refscript patch first, then extends. Poll next wake for FIX result (datum oracle +
-  refscript hash-oracle). On pass -> fresh re-import re-verify (clears 290 Error-term + 41 budget + 11 not-found).
-- MAIN is CLEAN (refscript changes reverted; preserved as candidate-fix-10-mempack-refscript.patch, applies clean).
-- verify10-resoak — STOPPED CLEAN wake67. db-clones/preprod-verify10 retained for reference.
+- verify-build-10b  pid 98554  log .jobs/verify-build-10b.log — release build of dugite-node with the COMPLETE
+  #10 fix (refscript+datum) applied to MAIN (uncommitted). Poll for BUILD_EXIT=0 -> fresh-import re-verify.
+- fix-muscle wnqthg8c8 — COMPLETE (both oracles pass). COMPLETE patch candidate-fix-10-COMPLETE-refscript-datum.patch
+  + worktree wf_17ccaf91-99f-1. (Base refscript-only patch candidate-fix-10-mempack-refscript.patch also retained.)
+- import source: db-preprod-sync/haskell-ledger/ INTACT (124995007+124999169) for the re-verify.
 - fix-muscle we0nz74zr — COMPLETE (hash-oracle PASSED). Patch candidate-fix-10-mempack-refscript.patch + worktree.
 - live-soak — STOPPED CLEAN wake65 (SIGTERM; ep293 snapshot saved; gate-2 VALIDATED banked).
 - replay-measure  pid-file=.jobs/replay-measure.pid  (clean HEAD from-genesis replay climbing past ep93
@@ -550,6 +566,15 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake73 2026-06-07 (notification-triggered): #10 EXPANDED FIX COMPLETE (muscle wnqthg8c8, Tier A', checks_green,
+  2 crates). MAJOR: the datum bug was tag-4 CORRUPTION (BinaryData VarLen not stripped + multi-asset dropped),
+  not just a drop -> 132,148 corrupt -> 778,015 correct inline-datum outputs. Fix = decode_binary_data +
+  decode_plutus_data_cbor (reuses tag-24 block decoder) + OutputDatum::InlineDatum on import. GAP B residual-11
+  diagnosed already-covered (tag-5 multi-asset, 0 missing script_ref, byte-exact hashes). BOTH byte-exact oracles
+  pass (refscript CIP-hash + datum blake2b-256 == Koios datum hashes). Preserved COMPLETE patch (1365 lines, 2
+  crates, applies clean), applied to main, launched release build pid 98554. Advanced #10 FIXING-EXPANDED ->
+  VERIFYING-BUILDING. next: BUILD_EXIT=0 -> fresh import from db-preprod-sync -> re-soak -> 290+41+11 WARNs GONE
+  -> gauntlet -> commit. Did NOT commit (end-to-end divergence not yet confirmed gone; unit oracles != chain proof).
 - wake72 2026-06-07: POLL #10 muscle wnqthg8c8 — at FINAL verification (clippy CLIPPY_EXIT=0; running
   `cargo nextest run --workspace` now = last gate before it returns the FIX result). Imminent completion;
   not disturbed, no competing work. Verify-prep from wake71 stands (db-preprod-sync import source intact, disk

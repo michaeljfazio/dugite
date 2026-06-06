@@ -1,0 +1,1365 @@
+diff --git a/crates/dugite-node/src/node/mod.rs b/crates/dugite-node/src/node/mod.rs
+index 4023c4253e..66da510a17 100644
+--- a/crates/dugite-node/src/node/mod.rs
++++ b/crates/dugite-node/src/node/mod.rs
+@@ -248,6 +248,47 @@ pub(crate) fn apply_peer_metrics(
+         .store(active_connection_count as u64, Relaxed);
+ }
+ 
++/// Convert a MemPack-classified reference script ([`ScriptRefKind`]) into a
++/// typed [`ScriptRef`](dugite_primitives::transaction::ScriptRef).
++///
++/// Used by the Haskell/Mithril UTxO importer to reconstruct reference scripts
++/// from a tag-5 (`TxOutCompactRefScript`) MemPack TxOut. The Plutus language tag
++/// is era-relative in MemPack, but its mapping is monotonic across every Cardano
++/// era (Babbage/Conway/Dijkstra `PlutusScript` MemPack instances all agree:
++/// 0→V1, 1→V2, 2→V3, 3→V4), so this mapping is byte-exact regardless of the
++/// snapshot era. Returns `None` for malformed blobs (the script is then restored
++/// during gap replay from canonical CBOR).
++fn decode_imported_script_ref(
++    kind: dugite_serialization::mempack::txout::ScriptRefKind,
++) -> Option<dugite_primitives::transaction::ScriptRef> {
++    use dugite_primitives::transaction::ScriptRef;
++    use dugite_serialization::mempack::txout::ScriptRefKind;
++    match kind {
++        ScriptRefKind::Native(cbor) => {
++            match dugite_serialization::decode_native_script_cbor(&cbor) {
++                Ok(ns) => Some(ScriptRef::NativeScript(ns)),
++                Err(e) => {
++                    warn!(error = %e, "Failed to decode native reference-script CBOR; skipping");
++                    None
++                }
++            }
++        }
++        ScriptRefKind::Plutus { lang_tag, body } => match lang_tag {
++            0 => Some(ScriptRef::PlutusV1(body)),
++            1 => Some(ScriptRef::PlutusV2(body)),
++            2 => Some(ScriptRef::PlutusV3(body)),
++            3 => Some(ScriptRef::PlutusV4(body)),
++            other => {
++                warn!(
++                    lang_tag = other,
++                    "Unknown Plutus language tag in MemPack reference script; skipping"
++                );
++                None
++            }
++        },
++    }
++}
++
+ /// Flatten a `LedgerState` into the primitive [`GovernanceSnapshot`] consumed
+ /// by [`crate::metrics::NodeMetrics::set_governance_snapshot`].
+ ///
+@@ -6369,20 +6410,66 @@ impl Node {
+ 
+                 let datum = if let Some(ref hash_bytes) = txout.datum_hash {
+                     OutputDatum::DatumHash(Hash32::from_bytes(*hash_bytes))
++                } else if let Some(ref inline_cbor) = txout.datum {
++                    // Inline datum (MemPack `Datum binaryData`): `BinaryData` is a
++                    // newtype over `ShortByteString` carrying the ORIGINAL on-chain
++                    // CBOR of the Plutus `Data`. The tag-5/tag-4 decoder already
++                    // stripped the MemPack VarLen length wrapper, so `inline_cbor`
++                    // is the bare datum CBOR — decode it with the SAME decoder used
++                    // for tag-24 inline datums during normal block decode and keep
++                    // the verbatim bytes for byte-exact re-encoding.
++                    //
++                    // Dropping this (importing `OutputDatum::None`) builds a wrong
++                    // `ScriptContext` for any resolved script spending the output,
++                    // producing spurious phase-2 "script returned Error term"
++                    // failures at the live tip (#10 import-completeness).
++                    match dugite_serialization::decode_plutus_data_cbor(inline_cbor) {
++                        Ok(data) => OutputDatum::InlineDatum {
++                            data,
++                            raw_cbor: Some(inline_cbor.clone()),
++                        },
++                        Err(e) => {
++                            warn!(
++                                error = %e,
++                                "Failed to decode imported inline datum CBOR; \
++                                 leaving datum unset (will be restored on gap replay)"
++                            );
++                            OutputDatum::None
++                        }
++                    }
+                 } else {
+-                    // Inline datums require PlutusData parsing from raw MemPack
+-                    // bytes. Skip for now — the datum will be restored during gap
+-                    // replay from the canonical CBOR block. For UTxO set membership
+-                    // and stake distribution, the datum is not needed.
+                     OutputDatum::None
+                 };
+ 
+-                // Script references from MemPack are raw bytes; skip for now as
+-                // they require CBOR decoding to determine the script type. The
+-                // output will still be valid for UTxO set membership and stake
+-                // distribution; reference scripts are only needed for Phase-2
+-                // evaluation which occurs during block validation (gap replay).
+-                let script_ref: Option<dugite_primitives::transaction::ScriptRef> = None;
++                // Reference scripts: the MemPack `AlonzoScript` blob recovered by
++                // the tag-5 (`TxOutCompactRefScript`) decoder. Classify it into a
++                // typed `ScriptRef` so a Mithril-fast-started node can resolve
++                // reference scripts at the live tip (without this, every imported
++                // UTxO dropped its script bytes — see #10/#495 follow-up).
++                //
++                // The Plutus language tag is era-relative in MemPack but the
++                // mapping is monotonic across all eras (Babbage/Conway/Dijkstra:
++                // 0→V1, 1→V2, 2→V3, 3→V4 — see `PlutusScript` MemPack instances in
++                // cardano-ledger), so the same mapping is byte-exact regardless of
++                // the snapshot era.
++                let script_ref: Option<dugite_primitives::transaction::ScriptRef> =
++                    match txout.script_ref.as_deref() {
++                        Some(blob) => {
++                            match dugite_serialization::mempack::txout::parse_script_ref_kind(blob)
++                            {
++                                Ok(kind) => decode_imported_script_ref(kind),
++                                Err(e) => {
++                                    warn!(
++                                        error = %e,
++                                        "Failed to classify MemPack reference-script blob; \
++                                         leaving script_ref unset (will be restored on gap replay)"
++                                    );
++                                    None
++                                }
++                            }
++                        }
++                        None => None,
++                    };
+ 
+                 let output = TransactionOutput {
+                     address,
+@@ -7871,6 +7958,62 @@ mod tests {
+     use dugite_primitives::hash::Hash32;
+     use dugite_primitives::time::{BlockNo, SlotNo};
+ 
++    use dugite_primitives::transaction::ScriptRef;
++    use dugite_serialization::mempack::txout::ScriptRefKind;
++
++    #[test]
++    fn decode_imported_script_ref_maps_plutus_language_tags_to_global_versions() {
++        // The MemPack Plutus language tag is era-relative but monotonic across
++        // all eras (0→V1, 1→V2, 2→V3, 3→V4). decode_imported_script_ref must map
++        // it to the global ScriptRef variant so compute_script_ref_hash produces
++        // the correct CIP prefix (0x01/0x02/0x03/0x04).
++        let body = vec![0xAB, 0xCD, 0xEF];
++        assert_eq!(
++            super::decode_imported_script_ref(ScriptRefKind::Plutus {
++                lang_tag: 0,
++                body: body.clone()
++            }),
++            Some(ScriptRef::PlutusV1(body.clone()))
++        );
++        assert_eq!(
++            super::decode_imported_script_ref(ScriptRefKind::Plutus {
++                lang_tag: 1,
++                body: body.clone()
++            }),
++            Some(ScriptRef::PlutusV2(body.clone()))
++        );
++        assert_eq!(
++            super::decode_imported_script_ref(ScriptRefKind::Plutus {
++                lang_tag: 2,
++                body: body.clone()
++            }),
++            Some(ScriptRef::PlutusV3(body.clone()))
++        );
++        assert_eq!(
++            super::decode_imported_script_ref(ScriptRefKind::Plutus {
++                lang_tag: 3,
++                body: body.clone()
++            }),
++            Some(ScriptRef::PlutusV4(body.clone()))
++        );
++        // Unknown language tag → None (skipped, restored on gap replay).
++        assert_eq!(
++            super::decode_imported_script_ref(ScriptRefKind::Plutus { lang_tag: 9, body }),
++            None
++        );
++    }
++
++    #[test]
++    fn decode_imported_script_ref_decodes_native_timelock_cbor() {
++        // Native (timelock) script-ref body is the raw native-script CBOR:
++        // array(2) [0, bytes(28)] — a ScriptPubkey.
++        let mut cbor = vec![0x82, 0x00, 0x58, 28];
++        cbor.extend_from_slice(&[0x42u8; 28]);
++        let sr = super::decode_imported_script_ref(ScriptRefKind::Native(cbor))
++            .expect("native script must decode");
++        assert!(matches!(sr, ScriptRef::NativeScript(_)));
++    }
++
+     use super::serve::ChainDBBlockProvider;
+     use super::sync::validate_genesis_blocks;
+     use super::{next_forged_block_number, resolve_inmemory_tables_path, ForgeMode, Point};
+diff --git a/crates/dugite-serialization/src/decode/era_conway.rs b/crates/dugite-serialization/src/decode/era_conway.rs
+index f61fe22a96..850f3c4fda 100644
+--- a/crates/dugite-serialization/src/decode/era_conway.rs
++++ b/crates/dugite-serialization/src/decode/era_conway.rs
+@@ -2347,6 +2347,38 @@ fn read_redeemer_tag(r: &mut Reader<'_>) -> Result<RedeemerTag, SerializationErr
+ // Native script decoder
+ // ============================================================================
+ 
++/// Decode a native (timelock) script from its raw CBOR encoding.
++///
++/// The input is the bare native-script CBOR array (NOT tag-24-wrapped). This is
++/// the body stored by a MemPack `AlonzoScript`'s `NativeScript` (timelock)
++/// variant, whose MemoBytes hold exactly this CBOR. Exposed so the Mithril /
++/// Haskell-import UTxO loader can reconstruct a typed `ScriptRef::NativeScript`
++/// from a MemPack reference-script blob and hash it via the ledger's
++/// `compute_script_ref_hash`.
++pub fn decode_native_script_cbor(cbor: &[u8]) -> Result<NativeScript, SerializationError> {
++    let mut r = Reader::new(cbor);
++    read_native_script(&mut r)
++}
++
++/// Decode an inline-datum `PlutusData` from its bare CBOR encoding.
++///
++/// The input is the raw CBOR-encoded Plutus `Data` (NOT tag-24-wrapped). This is
++/// exactly the body carried by a MemPack `Datum era` inline (`Datum binaryData`)
++/// variant: `BinaryData` is a newtype over `ShortByteString` holding the
++/// *original on-chain CBOR* of the datum, so the bytes are identical to the
++/// `inner_bytes` extracted from a tag-24 datum_option during normal block decode
++/// (see [`read_datum_option`]).
++///
++/// Exposed so the Mithril / Haskell-import UTxO loader can reconstruct a typed
++/// `OutputDatum::InlineDatum` from a MemPack TxOut (tags 4/5). Dropping the datum
++/// (importing `OutputDatum::None`) builds a *wrong* `ScriptContext` for any
++/// resolved script that spends the output, producing spurious "script returned
++/// Error term" phase-2 failures at the live tip.
++pub fn decode_plutus_data_cbor(cbor: &[u8]) -> Result<PlutusData, SerializationError> {
++    let mut r = Reader::new(cbor);
++    read_plutus_data(&mut r)
++}
++
+ fn read_native_script(r: &mut Reader<'_>) -> Result<NativeScript, SerializationError> {
+     let arr_len = r.read_array_header()?;
+     if arr_len.is_none() {
+diff --git a/crates/dugite-serialization/src/decode/mod.rs b/crates/dugite-serialization/src/decode/mod.rs
+index 533c755971..5447e38fa1 100644
+--- a/crates/dugite-serialization/src/decode/mod.rs
++++ b/crates/dugite-serialization/src/decode/mod.rs
+@@ -70,6 +70,16 @@ use dugite_primitives::transaction::{Transaction, TransactionInput, TransactionO
+ /// Conway keys 0-33 and Dijkstra keys 34-37 are all handled.
+ pub use era_conway::ppu_from_cbor;
+ 
++/// Decode a native (timelock) script from its bare CBOR array encoding.
++/// Re-exported so the Mithril / Haskell-import UTxO loader can reconstruct a
++/// typed `ScriptRef::NativeScript` from a MemPack reference-script blob.
++pub use era_conway::decode_native_script_cbor;
++
++/// Decode an inline-datum `PlutusData` from its bare CBOR encoding.
++/// Re-exported so the Mithril / Haskell-import UTxO loader can reconstruct a
++/// typed `OutputDatum::InlineDatum` from a MemPack TxOut (tags 4/5).
++pub use era_conway::decode_plutus_data_cbor;
++
+ /// Recover per-element original CBOR byte spans from a preserved `plutus_data`
+ /// witness array, so datum hashes can be computed over the original bytes
+ /// (matching Haskell `MemoBytes`) rather than a non-reproducible re-encoding.
+diff --git a/crates/dugite-serialization/src/lib.rs b/crates/dugite-serialization/src/lib.rs
+index e7bbf21873..fae24f71a9 100644
+--- a/crates/dugite-serialization/src/lib.rs
++++ b/crates/dugite-serialization/src/lib.rs
+@@ -19,8 +19,9 @@ pub use decode::cbor_helpers::{
+ pub use decode::{
+     decode_block, decode_block_minimal, decode_block_minimal_with_byron_epoch_length,
+     decode_block_with_byron_epoch_length, decode_byron_ebb_block, decode_byron_main_block,
+-    decode_transaction, decode_transaction_input, decode_transaction_output,
+-    decode_wrapped_block_header, plutus_data_element_spans,
++    decode_native_script_cbor, decode_plutus_data_cbor, decode_transaction,
++    decode_transaction_input, decode_transaction_output, decode_wrapped_block_header,
++    plutus_data_element_spans,
+ };
+ 
+ // Helper exposed by the existing in-house pipeline; used by mithril chunk-file
+diff --git a/crates/dugite-serialization/src/mempack/compact.rs b/crates/dugite-serialization/src/mempack/compact.rs
+index baf1586227..2c2ad2834a 100644
+--- a/crates/dugite-serialization/src/mempack/compact.rs
++++ b/crates/dugite-serialization/src/mempack/compact.rs
+@@ -153,6 +153,75 @@ pub fn decode_compact_value(
+     }
+ }
+ 
++/// Decode a CompactValue, fully parsing the multi-asset payload so the exact
++/// number of bytes consumed is known.
++///
++/// Unlike [`decode_compact_value`] (which treats multi-asset bytes as opaque
++/// "everything to the end of the blob"), this matches the byte-exact MemPack
++/// `instance MemPack CompactValue` from cardano-ledger
++/// (`eras/mary/impl/src/Cardano/Ledger/Mary/Value.hs`):
++///
++/// ```text
++/// CompactValueAdaOnly     c       → packTagM 0 >> packM (VarLen c)
++/// CompactValueMultiAsset  c n rep → packTagM 1 >> packM (VarLen c)
++///                                        >> packM (VarLen n)
++///                                        >> packM rep      -- ShortByteString
++/// ```
++///
++/// `rep` is a `ShortByteString`, so it is itself serialized as
++/// `VarLen(rep_len) ‖ rep_bytes`. This lets us recover the exact extent of the
++/// value field even when it is followed by a Datum + Script tail (tag-5
++/// `TxOutCompactRefScript`).
++pub fn decode_compact_value_exact(data: &[u8]) -> Result<CompactValueDecoded, SerializationError> {
++    if data.is_empty() {
++        return Err(SerializationError::CborDecode(
++            "compact_value_exact: empty input".into(),
++        ));
++    }
++
++    let tag = data[0];
++    let mut off = 1usize;
++
++    // VarLen(coin).
++    let (coin, n) = decode_varlen(&data[off..])?;
++    off += n;
++
++    match tag {
++        0 => Ok(CompactValueDecoded {
++            coin,
++            multi_asset_raw: None,
++            consumed: off,
++        }),
++        1 => {
++            // VarLen(numMA) — Word32 count, value not needed for byte accounting.
++            let (_num_ma, n_num) = decode_varlen(&data[off..])?;
++            off += n_num;
++            // rep : ShortByteString = VarLen(rep_len) ‖ rep_bytes.
++            let (rep_len, n_rep_len) = decode_varlen(&data[off..])?;
++            off += n_rep_len;
++            let rep_len = rep_len as usize;
++            let rep_start = off;
++            let rep_end = off.checked_add(rep_len).ok_or_else(|| {
++                SerializationError::CborDecode("compact_value_exact: rep length overflow".into())
++            })?;
++            if rep_end > data.len() {
++                return Err(SerializationError::CborDecode(format!(
++                    "compact_value_exact: multi-asset rep needs {rep_end} bytes, have {}",
++                    data.len()
++                )));
++            }
++            Ok(CompactValueDecoded {
++                coin,
++                multi_asset_raw: Some(data[rep_start..rep_end].to_vec()),
++                consumed: rep_end,
++            })
++        }
++        other => Err(SerializationError::CborDecode(format!(
++            "compact_value_exact: unknown tag {other}"
++        ))),
++    }
++}
++
+ #[cfg(test)]
+ mod unit_tests {
+     use super::*;
+diff --git a/crates/dugite-serialization/src/mempack/tests.rs b/crates/dugite-serialization/src/mempack/tests.rs
+index 9a2f1f5948..4aef8e497d 100644
+--- a/crates/dugite-serialization/src/mempack/tests.rs
++++ b/crates/dugite-serialization/src/mempack/tests.rs
+@@ -344,15 +344,18 @@ fn test_decode_mempack_txout_tag3_with_datum_hash() {
+ 
+ #[test]
+ fn test_decode_mempack_txout_tag4_ada_only() {
+-    // Construct a synthetic tag-4 ADA-only entry:
+-    // tag(4) + addr_len(29) + addr(29 bytes) + value_tag(0) + coin_varlen + datum
++    // Construct a synthetic tag-4 ADA-only entry. The datum is a `BinaryData`
++    // (NOT a Datum option), serialized as a ShortByteString:
++    //   tag(4) + addr_len(29) + addr(29) + value_tag(0) + coin_varlen
++    //         + VarLen(datum_len) ‖ datum_cbor
++    let datum_cbor = [0xd8u8, 0x79, 0x9f, 0xff]; // 4 bytes of CBOR datum
+     let mut val = Vec::new();
+     val.push(4); // tag
+     val.push(29); // addr len VarLen
+     val.extend_from_slice(&[0x70; 29]); // 29-byte enterprise script address
+     val.push(0); // value tag = 0 (ADA-only)
+     val.extend_from_slice(&[0xee, 0xdd, 0x01]); // coin = 1_814_145 (MSB-first)
+-    val.extend_from_slice(&[0xd8, 0x79, 0x9f, 0xff]); // 4 bytes of CBOR datum
++    val.extend_from_slice(&mempack_sbs(&datum_cbor)); // BinaryData VarLen wrapper
+ 
+     let (txout, consumed) = decode_mempack_txout(&val).unwrap();
+     assert_eq!(consumed, val.len());
+@@ -361,7 +364,8 @@ fn test_decode_mempack_txout_tag4_ada_only() {
+     assert_eq!(txout.coin, 1_814_145);
+     assert!(txout.multi_asset.is_none());
+     let datum = txout.datum.unwrap();
+-    assert_eq!(datum, &[0xd8, 0x79, 0x9f, 0xff]);
++    // The VarLen prefix is stripped: bare on-chain Plutus Data CBOR remains.
++    assert_eq!(datum, &datum_cbor);
+ }
+ 
+ #[test]
+@@ -584,17 +588,24 @@ fn test_decode_mempack_txout_tag4_no_value_data() {
+ 
+ #[test]
+ fn test_decode_mempack_txout_tag4_multi_asset() {
+-    // tag(4) + addr(29 bytes) + value_tag=1 (multi-asset) + coin + opaque tail
++    // tag(4) + addr(29) + value_tag=1 (multi-asset) + coin + numMA + SBS(rep)
++    //   + BinaryData inline datum. The multi-asset value is parsed exactly so the
++    // datum tail is recovered from the correct offset (the old decoder dropped
++    // the datum here entirely — gap A of #10).
++    let rep = [0xAAu8, 0xBB, 0xCC];
++    let datum_cbor = [0xd8u8, 0x79, 0x80]; // tag(121) [] constructor
+     let mut val = vec![4, 29];
+     val.extend_from_slice(&[0x70u8; 29]);
+     val.push(1); // value tag = 1 (multi-asset)
+     val.push(0x00); // VarLen coin = 0
+-    val.extend_from_slice(&[0xAA, 0xBB, 0xCC]); // some opaque trailing bytes
++    val.extend_from_slice(&encode_varlen(1)); // numMA
++    val.extend_from_slice(&mempack_sbs(&rep)); // multi-asset rep
++    val.extend_from_slice(&mempack_sbs(&datum_cbor)); // BinaryData inline datum
+     let (txout, consumed) = decode_mempack_txout(&val).unwrap();
+     assert_eq!(consumed, val.len());
+     assert_eq!(txout.tag, 4);
+-    assert!(txout.multi_asset.is_some());
+-    assert!(txout.datum.is_none());
++    assert_eq!(txout.multi_asset.as_deref(), Some(&rep[..]));
++    assert_eq!(txout.datum.as_deref(), Some(&datum_cbor[..]));
+ }
+ 
+ #[test]
+@@ -611,29 +622,52 @@ fn test_decode_mempack_txout_tag5_no_value_data() {
+ }
+ 
+ #[test]
+-fn test_decode_mempack_txout_tag5_ada_only_with_opaque_tail() {
++fn test_decode_mempack_txout_tag5_ada_only_parses_datum_and_script() {
++    // ADA-only tag-5 now fully parses the Datum + Script tail (the old behaviour
++    // dumped these into `opaque_tail`). NoDatum + PlutusV1 (era tag 0) script.
++    let flat = [0xDEu8, 0xAD];
+     let mut val = vec![5, 29];
+     val.extend_from_slice(&[0x70u8; 29]);
+     val.push(0); // ADA-only value tag
+     val.push(0x00); // VarLen coin = 0
+-    val.extend_from_slice(&[0xDE, 0xAD]); // opaque datum + script bytes
++    val.push(0); // Datum option: NoDatum
++    val.push(1); // AlonzoScript::PlutusScript
++    val.push(0); // era-relative lang tag 0 (V1)
++    val.extend_from_slice(&mempack_sbs(&flat));
+     let (txout, consumed) = decode_mempack_txout(&val).unwrap();
+     assert_eq!(consumed, val.len());
+     assert_eq!(txout.tag, 5);
+-    assert_eq!(txout.opaque_tail.as_deref(), Some(&[0xDE, 0xAD][..]));
++    assert!(txout.opaque_tail.is_none());
++    match parse_script_ref_kind(&txout.script_ref.unwrap()).unwrap() {
++        ScriptRefKind::Plutus { lang_tag, body } => {
++            assert_eq!(lang_tag, 0);
++            assert_eq!(body, flat);
++        }
++        other => panic!("expected Plutus V1, got {other:?}"),
++    }
+ }
+ 
+ #[test]
+ fn test_decode_mempack_txout_tag5_multi_asset() {
++    // Multi-asset tag-5: rep ShortByteString is parsed exactly, then NoDatum +
++    // PlutusV1 script.
++    let rep = [0xCAu8, 0xFE];
++    let flat = [0x01u8];
+     let mut val = vec![5, 29];
+     val.extend_from_slice(&[0x70u8; 29]);
+     val.push(1); // multi-asset value tag
+     val.push(0x00); // VarLen coin
+-    val.extend_from_slice(&[0xCA, 0xFE]);
++    val.extend_from_slice(&encode_varlen(1)); // numMA
++    val.extend_from_slice(&mempack_sbs(&rep));
++    val.push(0); // Datum NoDatum
++    val.push(1); // Plutus
++    val.push(0); // V1
++    val.extend_from_slice(&mempack_sbs(&flat));
+     let (txout, consumed) = decode_mempack_txout(&val).unwrap();
+     assert_eq!(consumed, val.len());
+     assert_eq!(txout.tag, 5);
+-    assert!(txout.multi_asset.is_some());
++    assert_eq!(txout.multi_asset.as_deref(), Some(&rep[..]));
++    assert!(txout.script_ref.is_some());
+ }
+ 
+ // ── TvarIterator: definite-length map handling ────────────────────────────────
+@@ -684,3 +718,427 @@ fn test_decode_mempack_txin_short_length_returns_invalid_length_error() {
+ 
+ // Re-import for the SerializationError type used above.
+ use crate::error::SerializationError;
++
++// ── Tag-5 reference-script (TxOutCompactRefScript) decode ─────────────────────
++
++use super::txout::{parse_script_ref_kind, ScriptRefKind};
++
++/// Encode a u64 as a MemPack VarLen (7-bit, MSB-first base-128).
++fn encode_varlen(mut v: u64) -> Vec<u8> {
++    // Collect 7-bit groups, least-significant first, then reverse.
++    let mut groups = vec![(v & 0x7f) as u8];
++    v >>= 7;
++    while v > 0 {
++        groups.push((v & 0x7f) as u8);
++        v >>= 7;
++    }
++    groups.reverse();
++    let n = groups.len();
++    for (i, g) in groups.iter_mut().enumerate() {
++        if i + 1 < n {
++            *g |= 0x80; // continuation bit on all but the last
++        }
++    }
++    groups
++}
++
++/// Build a MemPack ShortByteString: VarLen(len) ‖ bytes.
++fn mempack_sbs(bytes: &[u8]) -> Vec<u8> {
++    let mut v = encode_varlen(bytes.len() as u64);
++    v.extend_from_slice(bytes);
++    v
++}
++
++#[test]
++fn test_encode_varlen_roundtrips_decode_varlen() {
++    for v in [
++        0u64,
++        1,
++        127,
++        128,
++        150,
++        300,
++        1_814_145,
++        u32::MAX as u64,
++        u64::MAX,
++    ] {
++        let enc = encode_varlen(v);
++        let (dec, n) = decode_varlen(&enc).unwrap();
++        assert_eq!(dec, v, "roundtrip value");
++        assert_eq!(n, enc.len(), "consumed all bytes for {v}");
++    }
++}
++
++#[test]
++fn test_decode_tag5_ada_only_plutus_v3_refscript() {
++    // Construct a synthetic tag-5 (TxOutCompactRefScript) entry, ADA-only, with
++    // a NoDatum option and a Conway-era PlutusV3 reference script, matching the
++    // cardano-ledger MemPack layout:
++    //   packTagM 5 >> packM cAddr >> packM cValue >> packM datum >> packM script
++    let flat_program = b"\x01\x00\x00\x20\xfe\xed"; // arbitrary flat-encoded bytes
++    let mut val = Vec::new();
++    val.push(5); // outer TxOut tag
++                 // CompactAddr: VarLen(29) + 29-byte enterprise script address.
++    val.push(29);
++    val.extend_from_slice(&[0x71; 29]);
++    // CompactValue ADA-only: tag(0) + VarLen(coin).
++    val.push(0);
++    val.extend_from_slice(&encode_varlen(2_000_000));
++    // Datum option: NoDatum = tag 0.
++    val.push(0);
++    // Script (AlonzoScript): tag 1 (Plutus) + era-relative lang tag 2 (Conway V3)
++    //   + ShortByteString(flat_program).
++    val.push(1); // AlonzoScript::PlutusScript
++    val.push(2); // ConwayPlutusV3
++    val.extend_from_slice(&mempack_sbs(flat_program));
++
++    let (txout, consumed) = decode_mempack_txout(&val).unwrap();
++    assert_eq!(consumed, val.len(), "tag-5 must consume the whole blob");
++    assert_eq!(txout.tag, 5);
++    assert_eq!(txout.coin, 2_000_000);
++    assert!(txout.datum_hash.is_none());
++    assert!(txout.datum.is_none());
++    assert!(txout.opaque_tail.is_none());
++
++    let blob = txout.script_ref.expect("script_ref must be populated");
++    let kind = parse_script_ref_kind(&blob).expect("classify");
++    match kind {
++        ScriptRefKind::Plutus { lang_tag, body } => {
++            assert_eq!(lang_tag, 2, "Conway era-relative V3 tag");
++            assert_eq!(body, flat_program, "flat program bytes recovered exactly");
++        }
++        other => panic!("expected Plutus, got {other:?}"),
++    }
++}
++
++#[test]
++fn test_decode_tag5_datumhash_and_native_refscript() {
++    // tag-5 with a DatumHash option (32 bytes, stored big-endian directly) and a
++    // native (timelock) reference script. The native body is the raw CBOR of a
++    // single ScriptPubkey (timelock): [0, h28].
++    let datum_hash = [0xABu8; 32];
++    // Native script CBOR: array(2) [0, bytes(28)] — a ScriptPubkey timelock.
++    //   0x82 array(2), 0x00 uint 0 (ScriptPubkey), 0x58 28 bytes-header.
++    let mut native_cbor = vec![0x82, 0x00, 0x58, 28];
++    native_cbor.extend_from_slice(&[0xCD; 28]);
++
++    let mut val = Vec::new();
++    val.push(5);
++    val.push(29);
++    val.extend_from_slice(&[0x71; 29]);
++    val.push(0); // ADA-only
++    val.extend_from_slice(&encode_varlen(10));
++    // Datum option: DatumHash = tag 1 + 32 raw bytes.
++    val.push(1);
++    val.extend_from_slice(&datum_hash);
++    // Script: AlonzoScript::NativeScript = tag 0 + ShortByteString(native_cbor).
++    val.push(0);
++    val.extend_from_slice(&mempack_sbs(&native_cbor));
++
++    let (txout, consumed) = decode_mempack_txout(&val).unwrap();
++    assert_eq!(consumed, val.len());
++    assert_eq!(txout.tag, 5);
++    assert_eq!(txout.coin, 10);
++    assert_eq!(
++        txout.datum_hash,
++        Some(datum_hash),
++        "datum hash stored verbatim"
++    );
++
++    let blob = txout.script_ref.expect("script_ref");
++    match parse_script_ref_kind(&blob).expect("classify") {
++        ScriptRefKind::Native(cbor) => assert_eq!(cbor, native_cbor),
++        other => panic!("expected Native, got {other:?}"),
++    }
++}
++
++#[test]
++fn test_decode_tag5_multi_asset_refscript() {
++    // tag-5 with a multi-asset CompactValue (tag 1) + rep ShortByteString, then
++    // NoDatum + PlutusV2 ref script. Exercises the exact CompactValue parser.
++    let rep = [0x11u8, 0x22, 0x33, 0x44, 0x55]; // opaque multi-asset rep
++    let flat = b"\xaa\xbb";
++    let mut val = Vec::new();
++    val.push(5);
++    val.push(29);
++    val.extend_from_slice(&[0x71; 29]);
++    // CompactValue multi-asset: tag(1) + VarLen(coin) + VarLen(numMA) + SBS(rep).
++    val.push(1);
++    val.extend_from_slice(&encode_varlen(1_500_000));
++    val.extend_from_slice(&encode_varlen(2)); // numMA
++    val.extend_from_slice(&mempack_sbs(&rep));
++    // Datum NoDatum.
++    val.push(0);
++    // Plutus V2 (Conway era-relative tag 1).
++    val.push(1);
++    val.push(1);
++    val.extend_from_slice(&mempack_sbs(flat));
++
++    let (txout, consumed) = decode_mempack_txout(&val).unwrap();
++    assert_eq!(consumed, val.len());
++    assert_eq!(txout.coin, 1_500_000);
++    assert_eq!(txout.multi_asset.as_deref(), Some(&rep[..]));
++    match parse_script_ref_kind(&txout.script_ref.unwrap()).unwrap() {
++        ScriptRefKind::Plutus { lang_tag, body } => {
++            assert_eq!(lang_tag, 1);
++            assert_eq!(body, flat);
++        }
++        other => panic!("expected Plutus V2, got {other:?}"),
++    }
++}
++
++#[test]
++fn test_decode_tag4_ada_only_inline_datum_strips_varlen() {
++    // tag-4 (TxOutCompactDatum): CompactAddr + CompactValue + BinaryData.
++    //   packTagM 4 >> packM cAddr >> packM cValue >> packM datum
++    // The datum is a `BinaryData` (NOT a Datum option), serialized as a bare
++    // ShortByteString: VarLen(len) ‖ raw_cbor. The decoder MUST strip the VarLen
++    // prefix so `txout.datum` is the bare on-chain Plutus Data CBOR.
++    //
++    // Use a real-shape datum: d87a80 = CBOR tag(122) [] (an empty constructor),
++    // exactly the 3-byte body observed in the preprod blob.
++    let datum_cbor = [0xd8u8, 0x7a, 0x80];
++    let mut val = Vec::new();
++    val.push(4);
++    val.push(29);
++    val.extend_from_slice(&[0x71; 29]);
++    // CompactValue ADA-only: tag(0) + VarLen(coin).
++    val.push(0);
++    val.extend_from_slice(&encode_varlen(1_234_567));
++    // BinaryData: VarLen(3) ‖ datum_cbor.
++    val.extend_from_slice(&mempack_sbs(&datum_cbor));
++
++    let (txout, consumed) = decode_mempack_txout(&val).unwrap();
++    assert_eq!(consumed, val.len(), "tag-4 must consume the whole blob");
++    assert_eq!(txout.tag, 4);
++    assert_eq!(txout.coin, 1_234_567);
++    assert!(txout.datum_hash.is_none());
++    assert!(txout.script_ref.is_none());
++    assert!(txout.multi_asset.is_none());
++    assert_eq!(
++        txout.datum.as_deref(),
++        Some(&datum_cbor[..]),
++        "BinaryData VarLen prefix must be stripped; bare datum CBOR recovered"
++    );
++}
++
++#[test]
++fn test_decode_tag4_multi_asset_inline_datum() {
++    // tag-4 with a multi-asset CompactValue (tag 1) followed by a BinaryData
++    // inline datum. Exercises the exact CompactValue parser so the datum tail is
++    // recovered from the correct offset.
++    let rep = [0xAAu8, 0xBB, 0xCC];
++    let datum_cbor = [0xd8u8, 0x79, 0x80]; // tag(121) [] constructor
++    let mut val = Vec::new();
++    val.push(4);
++    val.push(29);
++    val.extend_from_slice(&[0x71; 29]);
++    // CompactValue multi-asset: tag(1) + VarLen(coin) + VarLen(numMA) + SBS(rep).
++    val.push(1);
++    val.extend_from_slice(&encode_varlen(777_000));
++    val.extend_from_slice(&encode_varlen(1)); // numMA
++    val.extend_from_slice(&mempack_sbs(&rep));
++    // BinaryData inline datum.
++    val.extend_from_slice(&mempack_sbs(&datum_cbor));
++
++    let (txout, consumed) = decode_mempack_txout(&val).unwrap();
++    assert_eq!(
++        consumed,
++        val.len(),
++        "tag-4 multi-asset must consume the blob"
++    );
++    assert_eq!(txout.tag, 4);
++    assert_eq!(txout.coin, 777_000);
++    assert_eq!(txout.multi_asset.as_deref(), Some(&rep[..]));
++    assert!(txout.datum_hash.is_none());
++    assert_eq!(
++        txout.datum.as_deref(),
++        Some(&datum_cbor[..]),
++        "multi-asset tag-4 inline datum recovered byte-exact"
++    );
++}
++
++/// Byte-exact correctness oracle against a REAL preprod `tables` MemPack blob.
++///
++/// Gated behind `DUGITE_PREPROD_TABLES` (path to a Haskell `tables`/`tvar` blob)
++/// because the multi-hundred-MB snapshot is not checked in. Asserts the decoded
++/// reference-script CIP-tagged blake2b-224 hashes for known preprod UTxOs match
++/// the values observed on the real chain — this is the chain-critical proof that
++/// the MemPack reference-script decode is byte-exact (green tests on synthetic
++/// data are NOT sufficient).
++///
++/// The second group (`7afbde08…`, `23d3717e…`, `bb4e5521…`, `86820a34…`) are the
++/// four residual "script not found for redeemer purpose" scripts from the #10
++/// verification re-soak. They live on tag-5 (`TxOutCompactRefScript`)
++/// **multi-asset** outputs at high indices; this oracle confirms the
++/// `decode_compact_value_exact` multi-asset branch lands on the Datum + Script
++/// tail so the script is recovered and hashes byte-exact.
++#[test]
++fn test_real_preprod_refscript_hashes() {
++    let Ok(path) = std::env::var("DUGITE_PREPROD_TABLES") else {
++        eprintln!("skipping: set DUGITE_PREPROD_TABLES to a real tables/tvar blob");
++        return;
++    };
++    let data = std::fs::read(&path).expect("read tables blob");
++    // (txid_prefix_hex, mempack_txix, expected CIP-tagged blake2b-224 hash, required).
++    //
++    // `required` targets MUST be present in the snapshot (the #10 gap-B residual
++    // scripts, live in the captured epoch). The legacy fixtures may have been
++    // spent in newer snapshots, so they are verified *if present* but not
++    // required to be found. Either way, every found target is asserted byte-exact.
++    let targets: &[(&str, u16, &str, bool)] = &[
++        // Legacy verified fixtures (tag-5, txix 0) — may be spent in newer dumps.
++        (
++            "f08f73509b0d3b4a",
++            0,
++            "744837b0a352566983276e1fb256e428d96eab87cc42972261e0c88b",
++            false,
++        ),
++        (
++            "e2766b4eb2b8d4da",
++            0,
++            "d55eb689d83301fb3797720278404adae39501cb8dbafa4da7bd9f3b",
++            false,
++        ),
++        // #10 gap-B residual scripts (tag-5 multi-asset, high txix). Matched by
++        // full txid AND mempack-txix because these txs have many outputs.
++        (
++            "dca0e8d51c6453bb16d303e5e3a3a2eede8a7cdf5c63bd4e52bfe1f9575fcdd4",
++            512,
++            "7afbde082796cfa6ed6ba87728c57f111815340af03e1897094163b3",
++            true,
++        ),
++        (
++            "354e08ab4979b74b650c3b5ff20c9847fa3d13cfdecc9e9c1c7d63d46ad9e3f0",
++            1024,
++            "23d3717e95f5ced3689a22cf2c8297e92505813264ee36fe8f6f4fc1",
++            true,
++        ),
++        (
++            "b1c7c9fa088686ab45563149f8a59c9b0cb8494c120462de60b905bfcc7460e6",
++            512,
++            "bb4e5521a62840eed81c2da2d3394b8cb6a7c6a99ecb95ffc9e498a7",
++            true,
++        ),
++        (
++            "95117915c169e8106ac3f1c8ba0c690882ec9034208de253d7fc247618199548",
++            256,
++            "86820a349e45e1a38a7e18750377393c6c2a4635964142db074ea250",
++            true,
++        ),
++    ];
++    let mut found = vec![false; targets.len()];
++    let mut without_script = 0u64;
++    for entry in TvarIterator::new(&data).unwrap() {
++        let Ok((txin, txout)) = entry else { continue };
++        // Defensive: after the #10 fix every tag-5 output must carry a script.
++        if txout.tag == 5 && txout.script_ref.is_none() {
++            without_script += 1;
++        }
++        let txid_hex = hex::encode(txin.txid.as_bytes());
++        for (i, (want_txid_prefix, want_ix, want_hash, _required)) in targets.iter().enumerate() {
++            if !txid_hex.starts_with(want_txid_prefix) || txin.txix != *want_ix {
++                continue;
++            }
++            let blob = txout
++                .script_ref
++                .as_deref()
++                .expect("fixture UTxO must carry a reference script");
++            let kind = parse_script_ref_kind(blob).expect("classify");
++            // Build the CIP-tagged preimage exactly as the ledger's
++            // compute_script_ref_hash does (Plutus: (lang_tag+1) ‖ body).
++            let tagged: Vec<u8> = match &kind {
++                ScriptRefKind::Native(cbor) => {
++                    let mut v = vec![0x00];
++                    v.extend_from_slice(cbor);
++                    v
++                }
++                ScriptRefKind::Plutus { lang_tag, body } => {
++                    let mut v = vec![lang_tag + 1];
++                    v.extend_from_slice(body);
++                    v
++                }
++            };
++            let got = hex::encode(dugite_primitives::hash::blake2b_224(&tagged).as_bytes());
++            assert_eq!(&got, want_hash, "CIP hash mismatch for {want_txid_prefix}");
++            found[i] = true;
++        }
++    }
++    assert_eq!(
++        without_script, 0,
++        "every tag-5 (TxOutCompactRefScript) output must decode a reference script"
++    );
++    for (i, (prefix, _ix, _hash, required)) in targets.iter().enumerate() {
++        if *required {
++            assert!(
++                found[i],
++                "required #10 gap-B fixture {prefix} not found in snapshot"
++            );
++        }
++    }
++}
++
++/// Byte-exact correctness oracle for **inline datums** against a REAL preprod
++/// `tables` MemPack blob (gap A of #10).
++///
++/// Asserts that the decoded `Datum`/`BinaryData` CBOR for known tag-4
++/// (`TxOutCompactDatum`) outputs blake2b-256-hashes to the on-chain datum hash
++/// recorded by the chain (cross-checked against preprod Koios `tx_info`). This is
++/// the chain-critical proof that the MemPack `BinaryData` `VarLen` length prefix
++/// is stripped byte-exact: a wrong inline datum builds a wrong `ScriptContext`
++/// and produces spurious phase-2 "script returned Error term" failures at the
++/// live tip.
++///
++/// The datum hashes are NOT `txout.datum_hash` (tag 4 carries no hash field);
++/// they are the values returned by `cardano-cli`/Koios for these exact outputs,
++/// i.e. an independent oracle of the original on-chain Plutus `Data` bytes.
++#[test]
++fn test_real_preprod_inline_datum_bytes() {
++    let Ok(path) = std::env::var("DUGITE_PREPROD_TABLES") else {
++        eprintln!("skipping: set DUGITE_PREPROD_TABLES to a real tables/tvar blob");
++        return;
++    };
++    let data = std::fs::read(&path).expect("read tables blob");
++    // (full_txid_hex, mempack_txix, expected blake2b-256 of the inline datum).
++    // Oracle: preprod Koios tx_info datum_hash for these outputs of tx
++    // 0001459f… (idx0 → aafa39eb…, idx1/mempack-256 → 54cfb9d3…).
++    let targets: &[(&str, u16, &str)] = &[
++        (
++            "0001459f22668acbc6955e38b3c312e7992bedc97c72769cd0a445f7698a7778",
++            0,
++            "aafa39ebc25447a60777ce2a7fd05fada3a05b2f2c04a2061d72fd2ba4a6e2c7",
++        ),
++        (
++            "0001459f22668acbc6955e38b3c312e7992bedc97c72769cd0a445f7698a7778",
++            256,
++            "54cfb9d3d091ecf4430e0f60c93bc41477b125a28068fec8fda80f50d16aaa51",
++        ),
++    ];
++    let mut matched = 0;
++    for entry in TvarIterator::new(&data).unwrap() {
++        let Ok((txin, txout)) = entry else { continue };
++        let txid_hex = hex::encode(txin.txid.as_bytes());
++        for (want_txid, want_ix, want_hash) in targets {
++            if &txid_hex != want_txid || txin.txix != *want_ix {
++                continue;
++            }
++            let datum = txout
++                .datum
++                .as_deref()
++                .expect("fixture UTxO must carry an inline datum");
++            // The decoded bytes must be the BARE on-chain Plutus Data CBOR
++            // (VarLen prefix stripped) so the datum hash matches the chain.
++            let got = hex::encode(dugite_primitives::hash::blake2b_256(datum).as_bytes());
++            assert_eq!(
++                &got, want_hash,
++                "inline-datum byte-exactness failed for {want_txid}#{want_ix}"
++            );
++            matched += 1;
++        }
++    }
++    assert_eq!(
++        matched,
++        targets.len(),
++        "all fixture inline-datum UTxOs must be found and verified"
++    );
++}
+diff --git a/crates/dugite-serialization/src/mempack/txout.rs b/crates/dugite-serialization/src/mempack/txout.rs
+index 8e01377c92..dcd340d027 100644
+--- a/crates/dugite-serialization/src/mempack/txout.rs
++++ b/crates/dugite-serialization/src/mempack/txout.rs
+@@ -71,7 +71,9 @@
+ //!   `writeWord64BE`/`writeWord32BE`)
+ 
+ use crate::error::SerializationError;
+-use crate::mempack::compact::{decode_compact_addr, decode_compact_value, decode_varlen};
++use crate::mempack::compact::{
++    decode_compact_addr, decode_compact_value, decode_compact_value_exact, decode_varlen,
++};
+ 
+ /// A decoded MemPack TxOut.
+ ///
+@@ -94,7 +96,12 @@ pub struct MemPackTxOut {
+     pub datum_hash: Option<[u8; 32]>,
+     /// Inline datum bytes (tags 4, 5).
+     pub datum: Option<Vec<u8>>,
+-    /// Reference script bytes (tag 5).
++    /// Reference script as a MemPack-encoded `AlonzoScript` blob (tag 5).
++    ///
++    /// The bytes are the raw MemPack serialization of the Haskell `Script era`:
++    /// a 1-byte `AlonzoScript` tag (`0` = native/timelock, `1` = Plutus) followed
++    /// by the script body. See [`decode_mempack_script`] for the exact layout and
++    /// [`ScriptRefKind`] for a fully-classified decode.
+     pub script_ref: Option<Vec<u8>>,
+     /// Opaque remaining bytes for variants we cannot fully split yet (tag 5
+     /// multi-asset payloads, etc.). For tags 0–3 this is always `None`.
+@@ -378,73 +385,104 @@ fn decode_tag3(data: &[u8]) -> Result<(MemPackTxOut, usize), SerializationError>
+ 
+ /// Tag 4: `TxOutCompactDatum` — CompactAddr + CompactValue + inline datum.
+ ///
+-/// The datum occupies all remaining bytes after CompactAddr + CompactValue.
+-/// There is no explicit length prefix for the datum.
++/// Matches the byte-exact MemPack layout from cardano-ledger
++/// (`eras/babbage/impl/src/Cardano/Ledger/Babbage/TxOut.hs`):
++///
++/// ```haskell
++/// TxOutCompactDatum cAddr cValue datum ->
++///   packTagM 4 >> packM cAddr >> packM cValue >> packM datum
++/// ```
++///
++/// Unlike tag 5's `Datum era` *option*, the tag-4 `datum` field is a
++/// `BinaryData era` **directly** (an inline datum is always present), i.e. a
++/// newtype over `ShortByteString` whose MemPack form is
++/// `VarLen(len) ‖ raw_cbor_datum`. The `VarLen` length prefix MUST be stripped
++/// so `datum` carries the bare on-chain Plutus `Data` CBOR — the same bytes a
++/// tag-24 inline datum yields during normal block decode. (The previous decoder
++/// stored the length-prefixed bytes for ADA-only and dropped the datum entirely
++/// for multi-asset; both produced a wrong inline datum on import — gap A of #10.)
++///
++/// Both the ADA-only and multi-asset CompactValue cases are parsed exactly (via
++/// [`decode_compact_value_exact`]) so the `BinaryData` datum tail is recovered
++/// from the correct offset.
+ fn decode_tag4(data: &[u8]) -> Result<(MemPackTxOut, usize), SerializationError> {
+     let mut off = 1;
+ 
+     let (address, addr_consumed) = decode_compact_addr(&data[off..])?;
+     off += addr_consumed;
+ 
+-    // For ADA-only (value tag 0): coin VarLen, then datum is the rest.
+-    // For multi-asset (value tag 1): coin VarLen + multi-asset, then datum.
+-    // Since multi-asset has no self-delimiting length in this context, for
+-    // multi-asset we store value + datum together as opaque remaining bytes.
+     if off >= data.len() {
+         return Err(SerializationError::CborDecode(
+             "mempack_txout tag 4: no value data".into(),
+         ));
+     }
+ 
+-    let value_tag = data[off];
+-    if value_tag == 0 {
+-        // ADA-only: parse coin, rest is datum.
+-        let val = decode_compact_value(&data[off..], None)?;
+-        off += val.consumed;
+-        let datum = if off < data.len() {
+-            Some(data[off..].to_vec())
+-        } else {
+-            None
+-        };
+-        Ok((
+-            MemPackTxOut {
+-                tag: 4,
+-                address,
+-                coin: val.coin,
+-                multi_asset: None,
+-                datum_hash: None,
+-                datum,
+-                script_ref: None,
+-                opaque_tail: None,
+-            },
+-            data.len(),
+-        ))
+-    } else {
+-        // Multi-asset: the boundary between multi-asset and datum is ambiguous
+-        // without fully parsing the multi-asset structure.  Store all remaining
+-        // bytes as opaque tail; coin is extracted from the VarLen.
+-        let val = decode_compact_value(&data[off..], Some(data.len() - off))?;
+-        Ok((
+-            MemPackTxOut {
+-                tag: 4,
+-                address,
+-                coin: val.coin,
+-                multi_asset: val.multi_asset_raw,
+-                datum_hash: None,
+-                datum: None, // Datum is interleaved in multi_asset/opaque_tail.
+-                script_ref: None,
+-                opaque_tail: None,
+-            },
+-            data.len(),
+-        ))
++    // CompactValue (ADA-only or multi-asset), parsed exactly so we land on the
++    // BinaryData length prefix.
++    let val = decode_compact_value_exact(&data[off..])?;
++    off += val.consumed;
++
++    // BinaryData : ShortByteString = VarLen(len) ‖ raw_cbor.
++    let (datum, datum_consumed) = decode_binary_data(&data[off..])?;
++    off += datum_consumed;
++
++    Ok((
++        MemPackTxOut {
++            tag: 4,
++            address,
++            coin: val.coin,
++            multi_asset: val.multi_asset_raw,
++            datum_hash: None,
++            datum: Some(datum),
++            script_ref: None,
++            opaque_tail: None,
++        },
++        off,
++    ))
++}
++
++/// Decode a MemPack `BinaryData era` field: a newtype over `ShortByteString`
++/// serialized as `VarLen(len) ‖ raw_bytes`. Returns the bare bytes (the original
++/// on-chain Plutus `Data` CBOR) and the total bytes consumed (prefix + body).
++///
++/// `deriving newtype MemPack` on `BinaryData` (see
++/// `libs/cardano-ledger-core/src/Cardano/Ledger/Plutus/Data.hs`) means it
++/// inherits the `MemPack ShortByteString` instance.
++fn decode_binary_data(data: &[u8]) -> Result<(Vec<u8>, usize), SerializationError> {
++    let (len, len_bytes) = decode_varlen(data)?;
++    let len = len as usize;
++    let start = len_bytes;
++    let end = start.checked_add(len).ok_or_else(|| {
++        SerializationError::CborDecode("mempack_txout: BinaryData length overflow".into())
++    })?;
++    if end > data.len() {
++        return Err(SerializationError::CborDecode(format!(
++            "mempack_txout: BinaryData needs {end} bytes, have {}",
++            data.len()
++        )));
+     }
++    Ok((data[start..end].to_vec(), end))
+ }
+ 
+ /// Tag 5: `TxOutCompactRefScript` — CompactAddr + CompactValue + Datum + Script.
+ ///
+-/// Similar to tag 4 but with an additional reference script after the datum.
+-/// Without fully parsing each sub-field boundary, we store the address and coin,
+-/// and put the remaining bytes into opaque_tail.
++/// Matches the byte-exact MemPack layout from cardano-ledger
++/// (`eras/babbage/impl/src/Cardano/Ledger/Babbage/TxOut.hs`):
++///
++/// ```haskell
++/// TxOutCompactRefScript cAddr cValue datum script ->
++///   packTagM 5 >> packM cAddr >> packM cValue >> packM datum >> packM script
++/// ```
++///
++/// where:
++/// * `datum :: Datum era`  — option, see [`decode_datum_option`]:
++///   `packTagM 0` (NoDatum) / `packTagM 1 >> packM dataHash` (DatumHash) /
++///   `packTagM 2 >> packM binaryData` (inline Datum).
++/// * `script :: Script era` — `AlonzoScript`, see [`decode_mempack_script`].
++///
++/// Both the ADA-only and multi-asset CompactValue cases are now parsed exactly
++/// (via [`decode_compact_value_exact`]) so the Datum + Script tail is recovered
++/// rather than dumped into `opaque_tail`.
+ fn decode_tag5(data: &[u8]) -> Result<(MemPackTxOut, usize), SerializationError> {
+     let mut off = 1;
+ 
+@@ -457,45 +495,239 @@ fn decode_tag5(data: &[u8]) -> Result<(MemPackTxOut, usize), SerializationError>
+         ));
+     }
+ 
+-    let value_tag = data[off];
+-    if value_tag == 0 {
+-        // ADA-only value.
+-        let val = decode_compact_value(&data[off..], None)?;
+-        off += val.consumed;
+-        // Everything remaining is datum + script (opaque).
+-        let opaque = if off < data.len() {
+-            Some(data[off..].to_vec())
+-        } else {
+-            None
+-        };
+-        Ok((
+-            MemPackTxOut {
+-                tag: 5,
+-                address,
+-                coin: val.coin,
+-                multi_asset: None,
+-                datum_hash: None,
++    // CompactValue (ADA-only or multi-asset) — exact length so we land on the
++    // Datum option byte.
++    let val = decode_compact_value_exact(&data[off..])?;
++    off += val.consumed;
++
++    // Datum option.
++    let datum_opt = decode_datum_option(&data[off..])?;
++    off += datum_opt.consumed;
++
++    // Reference script (raw MemPack AlonzoScript blob). We validate that it
++    // decodes to a known shape but store the raw bytes for the caller to
++    // reconstruct a typed ScriptRef.
++    let (script_blob, script_consumed) = decode_mempack_script(&data[off..])?;
++    off += script_consumed;
++
++    Ok((
++        MemPackTxOut {
++            tag: 5,
++            address,
++            coin: val.coin,
++            multi_asset: val.multi_asset_raw,
++            datum_hash: datum_opt.datum_hash,
++            datum: datum_opt.datum,
++            script_ref: Some(script_blob),
++            opaque_tail: None,
++        },
++        off,
++    ))
++}
++
++/// A decoded MemPack `Datum era` option.
++struct DatumOption {
++    /// 32-byte datum hash (the `DatumHash` branch).
++    datum_hash: Option<[u8; 32]>,
++    /// Inline datum CBOR bytes (the `Datum`/`BinaryData` branch).
++    datum: Option<Vec<u8>>,
++    /// Bytes consumed by the option.
++    consumed: usize,
++}
++
++/// Decode a MemPack `Datum era` option.
++///
++/// Matches `instance Era era => MemPack (Datum era)` from cardano-ledger
++/// (`libs/cardano-ledger-core/src/Cardano/Ledger/Plutus/Data.hs`):
++///
++/// ```haskell
++/// packM = \case
++///   NoDatum            -> packTagM 0
++///   DatumHash dataHash -> packTagM 1 >> packM dataHash
++///   Datum binaryData   -> packTagM 2 >> packM binaryData
++/// ```
++///
++/// * `DataHash` is `Hash Blake2b_256 ... = PackedBytes32`, packed via
++///   `writeWord64BE` (`Cardano.Crypto.PackedBytes.Internal`). That byteswaps to
++///   produce **big-endian on-disk bytes directly**, so the 32 stored bytes ARE
++///   the datum hash, contiguous and untransformed. (This differs from the
++///   `DataHash32`/`Addr28Extra` ledger types used by tags 2/3, which pack four
++///   plain native-endian `Word64`s and therefore require the LE→BE slot
++///   recovery in [`decode_tag3`]/[`decode_addr28_payload`].)
++/// * `BinaryData` is a newtype over `ShortByteString`, so it is serialized as
++///   `VarLen(len) ‖ raw_cbor_datum_bytes`.
++fn decode_datum_option(data: &[u8]) -> Result<DatumOption, SerializationError> {
++    if data.is_empty() {
++        return Err(SerializationError::CborDecode(
++            "mempack_txout tag 5: truncated Datum option".into(),
++        ));
++    }
++    match data[0] {
++        0 => Ok(DatumOption {
++            datum_hash: None,
++            datum: None,
++            consumed: 1,
++        }),
++        1 => {
++            if data.len() < 1 + 32 {
++                return Err(SerializationError::CborDecode(
++                    "mempack_txout tag 5: truncated DatumHash".into(),
++                ));
++            }
++            let mut dh = [0u8; 32];
++            dh.copy_from_slice(&data[1..1 + 32]);
++            Ok(DatumOption {
++                datum_hash: Some(dh),
+                 datum: None,
+-                script_ref: None,
+-                opaque_tail: opaque,
+-            },
+-            data.len(),
+-        ))
+-    } else {
+-        // Multi-asset: store coin + opaque remaining.
+-        let val = decode_compact_value(&data[off..], Some(data.len() - off))?;
+-        Ok((
+-            MemPackTxOut {
+-                tag: 5,
+-                address,
+-                coin: val.coin,
+-                multi_asset: val.multi_asset_raw,
++                consumed: 1 + 32,
++            })
++        }
++        2 => {
++            // BinaryData : ShortByteString = VarLen(len) ‖ bytes.
++            let (len, len_bytes) = decode_varlen(&data[1..])?;
++            let len = len as usize;
++            let start = 1 + len_bytes;
++            let end = start.checked_add(len).ok_or_else(|| {
++                SerializationError::CborDecode("mempack_txout tag 5: datum length overflow".into())
++            })?;
++            if end > data.len() {
++                return Err(SerializationError::CborDecode(
++                    "mempack_txout tag 5: truncated inline Datum".into(),
++                ));
++            }
++            Ok(DatumOption {
+                 datum_hash: None,
+-                datum: None,
+-                script_ref: None,
+-                opaque_tail: None,
+-            },
+-            data.len(),
+-        ))
++                datum: Some(data[start..end].to_vec()),
++                consumed: end,
++            })
++        }
++        other => Err(SerializationError::CborDecode(format!(
++            "mempack_txout tag 5: unknown Datum option tag {other}"
++        ))),
++    }
++}
++
++/// Decode a MemPack `Script era` (= `AlonzoScript`) blob, returning the raw
++/// blob bytes (tag + body) and the number of bytes consumed.
++///
++/// Matches `instance ... => MemPack (AlonzoScript era)` from cardano-ledger
++/// (`eras/alonzo/impl/src/Cardano/Ledger/Alonzo/Scripts.hs`):
++///
++/// ```haskell
++/// packM = \case
++///   NativeScript script -> packTagM 0 >> packM script
++///   PlutusScript script -> packTagM 1 >> packM script
++/// ```
++///
++/// * NativeScript (`Timelock`) is a `MemoBytes`, packed via `packMemoBytesM` as
++///   its memoized CBOR `ShortByteString` = `VarLen(len) ‖ raw_cbor`.
++/// * PlutusScript is era-relative (`PlutusScript era`): a further `packTagM`
++///   selects the language (Babbage: 0=V1, 1=V2; Conway: 0=V1, 1=V2, 2=V3) and
++///   the body is the `Plutus l` newtype over `ShortByteString` =
++///   `VarLen(len) ‖ flat_program`.
++///
++/// We do not interpret the language tag here (it is era-relative); we only need
++/// the total byte length to delimit the blob. The full blob (outer tag onward)
++/// is returned so the caller can reconstruct a typed `ScriptRef`.
++fn decode_mempack_script(data: &[u8]) -> Result<(Vec<u8>, usize), SerializationError> {
++    if data.is_empty() {
++        return Err(SerializationError::CborDecode(
++            "mempack_txout tag 5: truncated Script".into(),
++        ));
++    }
++    let outer_tag = data[0];
++    let body_off = match outer_tag {
++        0 => 1, // NativeScript: body is the MemoBytes ShortByteString.
++        1 => {
++            // PlutusScript: one era-relative language tag byte, then ShortByteString.
++            if data.len() < 2 {
++                return Err(SerializationError::CborDecode(
++                    "mempack_txout tag 5: truncated PlutusScript language tag".into(),
++                ));
++            }
++            2
++        }
++        other => {
++            return Err(SerializationError::CborDecode(format!(
++                "mempack_txout tag 5: unknown AlonzoScript tag {other}"
++            )));
++        }
++    };
++
++    // ShortByteString body: VarLen(len) ‖ bytes.
++    let (len, len_bytes) = decode_varlen(&data[body_off..])?;
++    let len = len as usize;
++    let body_start = body_off + len_bytes;
++    let total = body_start.checked_add(len).ok_or_else(|| {
++        SerializationError::CborDecode("mempack_txout tag 5: script length overflow".into())
++    })?;
++    if total > data.len() {
++        return Err(SerializationError::CborDecode(format!(
++            "mempack_txout tag 5: script needs {total} bytes, have {}",
++            data.len()
++        )));
++    }
++    Ok((data[..total].to_vec(), total))
++}
++
++/// Classified view of a MemPack `AlonzoScript` reference-script blob.
++///
++/// Produced by [`parse_script_ref_kind`]. The language tag carried by Plutus
++/// scripts is **era-relative** (Babbage: 0=V1, 1=V2; Conway: 0=V1, 1=V2, 2=V3),
++/// so the caller must map it to a global script language using the snapshot era.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum ScriptRefKind {
++    /// Native (timelock) script — body is the raw CBOR of the native script.
++    Native(Vec<u8>),
++    /// Plutus script — `(era_relative_language_tag, flat_program_bytes)`.
++    Plutus { lang_tag: u8, body: Vec<u8> },
++}
++
++/// Classify a raw MemPack `AlonzoScript` blob (as stored in
++/// [`MemPackTxOut::script_ref`]) into a [`ScriptRefKind`].
++///
++/// See [`decode_mempack_script`] for the byte layout this re-parses.
++pub fn parse_script_ref_kind(blob: &[u8]) -> Result<ScriptRefKind, SerializationError> {
++    if blob.is_empty() {
++        return Err(SerializationError::CborDecode(
++            "script_ref blob: empty".into(),
++        ));
++    }
++    match blob[0] {
++        0 => {
++            // Native: VarLen(len) ‖ cbor.
++            let (len, len_bytes) = decode_varlen(&blob[1..])?;
++            let start = 1 + len_bytes;
++            let end = start + len as usize;
++            if end > blob.len() {
++                return Err(SerializationError::CborDecode(
++                    "script_ref blob: truncated native body".into(),
++                ));
++            }
++            Ok(ScriptRefKind::Native(blob[start..end].to_vec()))
++        }
++        1 => {
++            if blob.len() < 2 {
++                return Err(SerializationError::CborDecode(
++                    "script_ref blob: truncated plutus language tag".into(),
++                ));
++            }
++            let lang_tag = blob[1];
++            let (len, len_bytes) = decode_varlen(&blob[2..])?;
++            let start = 2 + len_bytes;
++            let end = start + len as usize;
++            if end > blob.len() {
++                return Err(SerializationError::CborDecode(
++                    "script_ref blob: truncated plutus body".into(),
++                ));
++            }
++            Ok(ScriptRefKind::Plutus {
++                lang_tag,
++                body: blob[start..end].to_vec(),
++            })
++        }
++        other => Err(SerializationError::CborDecode(format!(
++            "script_ref blob: unknown AlonzoScript tag {other}"
++        ))),
+     }
+ }
