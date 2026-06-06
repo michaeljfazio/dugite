@@ -20,8 +20,13 @@ job="${1:?job id}"; db="${2:?db dir}"; shift 2 || true
 bin="$REPO_ROOT/target/release/dugite-node"
 [ -x "$bin" ] || die "dugite-node binary not found at $bin (build it first)"
 
-# Force from-genesis replay: remove snapshot(s) + utxo-store INSIDE the clone.
-find "$db" -maxdepth 2 -name 'snapshot*' -prune -exec rm -rf {} + 2>/dev/null || true
+# Force from-genesis replay: remove ALL ledger snapshots + the utxo-store INSIDE
+# the clone, leaving only immutable/ (genesis blocks) + volatile/ + mithril/.
+# A dugite/mithril db carries the ledger state as `ledger-snapshot.bin` (+ .meta.json)
+# and an LSM `utxo-store/`; if these survive, the node loads that epoch's state and
+# SKIPS the from-genesis replay (it would never produce early-epoch dumps).
+rm -f  "$db"/ledger-snapshot.bin "$db"/ledger-snapshot.bin.meta.json 2>/dev/null || true
+find "$db" -maxdepth 1 -iname '*snapshot*' -exec rm -rf {} + 2>/dev/null || true
 rm -rf "$db/utxo-store" 2>/dev/null || true
 
 # Default an epoch-state dump dir unless the runbook chose a phase-2 dump instead.
