@@ -136,7 +136,27 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:DIAGNOSING (residual). *** VERIFYING VERDICT
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:ROOT-CAUSED (residual). *** wake78: analyze
+  muscle wxuwzffyl found THE BUG, triple-confirmed empirically *** ROOT CAUSE = crates/dugite-serialization/
+  src/mempack/mod.rs:68 decodes TxIn output index (TxIx) as `u16::from_le_bytes` but the on-disk UTxO-HD tables
+  KEY is BIG-ENDIAN -> every imported UTxO at output index >=1 stored under a CORRUPTED key (index 1->256,
+  2->512). At phase-2, utxo_set.lookup(input) by the REAL index MISSES -> 11 "not found" (script-locked input
+  at idx>=1) + 291 "Error term" (co-input/value at idx>=1 absent -> malformed ScriptContext txInfoInputs) + 41
+  "budget" (same wrong context). THIS is why the byte-exact-PROVEN datum/refscript decode fix was a RUNTIME
+  NO-OP: data decodes correctly but is filed under the WRONG KEY, so phase-2 lookup never finds it (the
+  static-decode-vs-runtime disconnect). RECONCILES with ledger byte-exactness (wake62/63): stake/reserves
+  summing ITERATES all entries (key-independent) so totals stayed exact; only LOOKUP-by-index broke. PROOF
+  (triple): 3 Koios samples store at #256 not #1 (value matches); index-0 entries correct; raw-blob probe
+  txix_bytes=0001 (BE=1, LE=256). CAUTION: flips a PINNED test test_mempack_txix_endianness_pinned_le_v11 tied
+  to issue #461 — #461's LE assumption is contradicted by real preprod v11 data; the tables KEY is BE (likely
+  for sort-order in the ordered store), distinct from generic MemPack Word16 host-native -> reconcile carefully,
+  don't just delete the test. FIX (next wake, fix-muscle, builds on the refscript+datum base which becomes
+  effective once keys are correct): (1) mod.rs:68 from_le_bytes->from_be_bytes; (2) fix test+fixture
+  tests.rs:42-49,95-130 (fixture uses 0100 for "index 1"; real on-disk is 0001); (3) secondary multi-asset drop
+  mod.rs:6435 Value::lovelace(coin) discards txout.multi_asset (decoder recovers it, txout.rs:94; only 1269
+  UTxOs, not the #10 cause but fix same pass). Still 2 crates (dugite-serialization + dugite-node). VERIFY:
+  re-import re-soak must drop 291/41/11 to ~0. Haskell: Cardano.Ledger.TxIn MemPack TxIn = TxId then TxIx
+  (Word16). Was: state:DIAGNOSING (residual). *** VERIFYING VERDICT
   wake75: FAILED end-to-end — the divergence is NOT gone *** The complete-fix re-soak (verify10b) shows IDENTICAL
   counts to before the datum fix: 291 "script returned Error term" + 41 "budget exhausted" + 11 "script not
   found" (was 290/41/11). So the datum+refscript DECODE fix (unit-oracles PROVEN byte-exact) did NOT change
@@ -278,8 +298,9 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- analyze-muscle wxuwzffyl (#10 residual root-cause: why corrected import data doesn't reach runtime phase-2,
-  Opus, ROOTCAUSE schema) — /workflows-visible. Poll next wake for the file:line where datum/script_ref is lost.
+- analyze-muscle wxuwzffyl — ROOT CAUSE DELIVERED (agent1 result in journal; agent2 RootCause-schema finalizing).
+  Bug = mempack/mod.rs:68 TxIx LE-vs-BE -> idx>=1 UTxOs mis-keyed. Next wake: launch FIX muscle for endianness +
+  multi-asset drop (on the refscript+datum base).
 - verify10b-resoak — STOPPED CLEAN wake75 (SIGTERM; verdict: 549 divergences UNCHANGED by datum fix). RAM freed.
   db-clones/preprod-verify10b retains the COMPLETE-fix imported state for the analyze muscle.
 - COMPLETE #10 fix (refscript+datum) on MAIN uncommitted (correct oracle-proven base; commit gated on residual
@@ -594,6 +615,17 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake78 2026-06-07: *** #10 ROOT CAUSE FOUND (analyze muscle wxuwzffyl) *** = mempack/mod.rs:68 decodes TxIx
+  little-endian but the on-disk UTxO-HD tables key is BIG-ENDIAN -> imported UTxOs at output index >=1 are
+  mis-keyed (idx1->256) -> phase-2 lookup-by-real-index misses -> the 11 not-found + 291 Error-term + 41 budget.
+  Explains why the byte-exact-proven datum/refscript decode was a RUNTIME NO-OP (right data, wrong key) and why
+  ledger totals stayed exact (summing is key-independent; only lookup broke). Triple-confirmed: 3 Koios samples
+  (#1 stored at #256), index-0 correct, raw-blob probe 0001=BE. The engine's discipline FORCED this: the datum
+  fix not moving the counts is what drove the diagnosis to the real one-line endianness bug that two "correct"
+  decode fixes had masked. Advanced #10 DIAGNOSING -> ROOT-CAUSED. Fix (next wake): from_le_bytes->from_be_bytes
+  at mod.rs:68 + reconcile pinned #461 LE test (contradicted by real data) + secondary multi-asset drop
+  mod.rs:6435. Did NOT launch fix muscle this wake (analyze muscle's agent2 still finalizing; avoid 2-muscle
+  contention). NON-chain-critical (trust-on-consensus) but a real fast-start UTxO-key-integrity bug.
 - wake77 2026-06-07: POLL #10 analyze muscle wxuwzffyl — STILL RUNNING, healthy (4GB RAM, no nodes, 0 completed).
   Significant interim lead: verify10b snapshot meta = backend dugite-lsm, utxo_count=0 (UTxOs in the LSM store
   not inline); muscle now verifying whether the LSM `active` store (2.7GB, has data) carries datum/script_ref at
