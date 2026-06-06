@@ -80,7 +80,9 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-(none — gauntlet wm055td32 returned REFUTED; inert fix reverted from main)
+- analyze-muscle  workflow=wo8nuypp6  (Opus, re-aimed at LIVE apply_utxo_changes UTxO-set-content
+  mechanism; engine pre-confirmed both stake_routing fns identical + snapshot=full-rebuild, so the
+  bug is a missing/mis-credited UTxO surfacing as a STAKE_CLAMP underflow for these 2 creds).
 
 ## VERIFY FINDING (CORRECTED after gauntlet — my wake9 analysis was WRONG)
 - The apply_utxo_diff fix is INERT for ep57. Gauntlet wm055td32 REFUTED 2/3 (haskell-semantics +
@@ -139,3 +141,7 @@
   Real cause = live apply_utxo_changes base-script-address attribution (findings doc rules out
   reconstruction). Reverted inert fix from main; preserved as latent-fix patch (backlog #6).
   Item -> ANALYZING with corrected target. The gauntlet PREVENTED a #438-class wrong commit.
+- wake11 2026-06-06T13:00Z: re-ANALYZE. Engine confirmed directly: common.rs:72 and mod.rs:2224
+  stake_routing are identical (no routing discrepancy); snapshot is full UTxO-set rebuild -> bug is
+  UTxO-set content (a ~5ADA UTxO missing/mis-credited per cred, STAKE_CLAMP underflow). Fired analyze
+  wo8nuypp6 to pinpoint the exact live-path defect + enable STAKE_CLAMP logging for targeted re-replay.
