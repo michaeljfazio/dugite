@@ -9,17 +9,20 @@
 - reference_node_socket: none        # Koios-first; set if a cn node is up
 
 ## Frontiers  (advance these; zero open divergence behind each)
-- ledger.preprod:   ep57 BYTE-EXACT CORRECT on clean HEAD replay (dugite 9957549164/9815680998 == Koios); advancing — testing ep181 halt
+- ledger.preprod:   RESOLVED on HEAD — ep57 byte-exact vs Koios; clean replay crossed ep181 (no WithdrawalAmountMismatch); verified through ep192+, climbing to db tip ep293
 - ledger.mainnet:   epoch 212 (open: ep213 reward divergence)
-- sync.preprod:     halts at ep181 (WithdrawalAmountMismatch, downstream of ep57)
+- sync.preprod:     ep181 HALT GONE on HEAD (clean replay past ep192); the original blocker is resolved
 - sync.mainnet:     ~ep331 (last known good db-mainnet)
 - phase2.preprod:   open buckets: budget ~398, Error ~186, unIData ~44 (Babbage V1/V2)
 - phase2.mainnet:   inert until ep507 (V3)
 - perf:             at-tip CPU bounded (15 hot peers); sync ~300 blk/s Byron
 
 ## Backlog  (ranked by impact; one advanced per wake)
-1. [H][ledger] ep57 preprod stake-distribution -10 ADA (2 delegators 630472f7/7d3e2b31 each EXACTLY
-   -5 ADA). state:PARKED attempts:1 (1 refuted fix + 2 valid latent fixes banked #6/#7). UNRESOLVED.
+1. [H][ledger] ep57 preprod stake-distribution -10 ADA. *** RESOLVED on clean HEAD (wake22-23): ***
+   per-cred dump proves dugite ep57 = Koios 9957549164/9815680998 BYTE-EXACT; clean from-genesis replay
+   crosses ep181 with NO WithdrawalAmountMismatch (verified to ep192+). Prior findings doc was STALE.
+   state:DONE-on-clean-replay. RESIDUAL: the fork-induced variant is still real -> land #6 (apply_utxo_diff
+   reconstruction fix) for production fork-robustness, with its own verification. Old context below:
    CONFIRMED so far: NOT reconstruction path (inert), NOT Dijkstra (inert/pre-era), reward_balance IS
    folded (epoch.rs:215). Measurement stalled: epoch.rs has MULTIPLE stake loops (live pool_stake ~205,
    per-cred ~267, snapshot pool_stake recompute ~852, mark construct ~326) and ad-hoc eprintlns kept
@@ -37,17 +40,19 @@
    state:NEW attempts:0
 5. [L][phase2] #14 V3 TxInfo deferred fields (inert until mainnet ep507).
    state:NEW attempts:0
-6. [M][ledger] LATENT fork-path bug: apply_utxo_diff reconstruction didn't replay stake_map (valid
-   fix preserved in scripts/prod-readiness/candidate-latent-fix-apply_utxo_diff.patch + worktree
-   wf_9be2125b-d01-1). Land separately AFTER its own verification (re-sync past ep181). state:NEW attempts:0
+6. [H][ledger] FORK-ROBUSTNESS (elevated M->H, now vindicated): apply_utxo_diff reconstruction didn't
+   replay stake_map -> the FORK-INDUCED variant of the ep57 bug. Clean HEAD replay is correct, but a live
+   sync hitting a rollback could still corrupt stake. The refuted gauntlet trusted a STALE doc; this IS a
+   real fix. Patch: scripts/prod-readiness/candidate-latent-fix-apply_utxo_diff.patch + worktree
+   wf_9be2125b-d01-1. Verify via a fork-exercising scenario, then land. state:NEW attempts:0
 7. [M][ledger] LATENT Dijkstra SUBUTXO bug: apply_sub_transactions mutated utxo_set but NOT stake_map/
    ptr_stake (asymmetry). Valid fix + add_instant_stake/delete_instant_stake helper refactor preserved in
    scripts/prod-readiness/candidate-latent-fix-dijkstra-subutxo.patch + worktree wf_dcc190ba-a5c-1. Inert
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #1 ep57 preprod stake-distribution -10 ADA
-- state: VERIFYING (RESOLVED on clean HEAD? per-cred dump proves ep57 byte-exact vs Koios; replay climbing to test the ep181 WithdrawalAmountMismatch halt)
+- item: (#1 RESOLVED — see below; selecting next item next wake)
+- state: IDLE/ROTATE — #1 resolved on HEAD; replay-measure finishing to ep293 to lock the frontier
 - attempts: 1
 - ANALYZE RESULT (w6lsvu2p2, Opus): canonical Haskell active-stake =
   resolveActiveInstantStakeCredentials (Stake.hs @52ef3d5) — per registered+delegated
@@ -209,3 +214,9 @@
   fork-affected db). 8 wakes of 'stalled measurement' actually produced the answer: dugite is already
   correct on clean replay. Left the replay climbing to ep181 to test the original halt (decides
   fork-induced-bug-real vs fully-resolved). Lesson banked: stale findings docs misled the gauntlet.
+- wake23 2026-06-06T14:22Z: *** ITEM #1 RESOLVED *** clean HEAD replay reached ep192 having CROSSED
+  ep181 with ZERO WithdrawalAmountMismatch (the original halt). With ep57 per-cred byte-exact (wake22),
+  the ep57/ep181 divergence is RESOLVED on HEAD; prior findings doc confirmed STALE. ledger.preprod +
+  sync.preprod frontiers UNBLOCKED. Residual: land #6 for fork-robustness (the fork-induced variant).
+  Next wake: let replay finish to ep293 (lock frontier), then rotate to #3 ep213 / #11 — NOW ARMED with
+  the per-cred dump tool that made this resolution possible.
