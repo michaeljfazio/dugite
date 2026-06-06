@@ -995,6 +995,9 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake153 2026-06-07: POLL #10 DIAGNOSE wuoecuy7o (297-residual provenance) — still RUNNING (koios input-resolve
+  fan-out). No transition. Health: verify10j node (pid 63671, 15min) at slot 125105734 block 4793935, still 0
+  phase-1 rejections; disk 28G stable. #10 stays DIAGNOSING. NEXT WAKE: act on diagnose verdict.
 - wake152 2026-06-07: #10 RE-GAUNTLET wetwroth8 = pass=false REFUTED 3/3. GAUNTLET-PENDING -> DIAGNOSING. R1+R2
   converge: 297 'Error term' residual attribution to #15 is UNPROVEN; viable #10 alt-cause = imported tag-4 inline
   datum re-encoded canonically (resolve_spend_datum ignores raw_cbor) + tag-4/5 silent-None on decode err. R3:
