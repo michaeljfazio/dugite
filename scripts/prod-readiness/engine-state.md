@@ -806,6 +806,15 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake116 2026-06-07 (notification): re-gauntlet wmpyis3tx FULLY COMPLETE = UNANIMOUS 3/3 REFUTED (haskell-
+  semantics + edge-epoch + compounding-feedback). Confirms wake114's action. haskell-semantics added a CONCRETE
+  extra hole for the rework to fix: observe_txix IGNORES index 0 + samples only first 2000 keys -> an
+  index-0-dominated sample gives nonzero==0 for BOTH endiannesses -> is_sane() short-circuits TRUE for both ->
+  "both sane -> default Big" -> SILENTLY wrong for a legacy-LE index-0-dominated snapshot; the safety net's
+  nonzero==0 short-circuit is a false-pass. Value/datum/refscript/multi-asset reaffirmed SOUND by all refuters.
+  REWORK REQUIREMENT (add to wjnl2t2ib's outcome bar): an uninformative/empty sample must NOT default Big — it
+  must force the authoritative signal or ERROR, never guess. Rework muscle wjnl2t2ib still running (it already
+  found 9ac9388 doesn't bump tablesCodecVersion -> verifying whether version disambiguates at all). #10 FIXING.
 - wake115 2026-06-07: POLL #10 rework muscle wjnl2t2ib — RUNNING, healthy (5GB RAM, no nodes, 0 completed).
   *** CRITICAL interim finding (the verify-don't-assume paying off) ***: commit 9ac9388 (BigEndianTxIn flip) does
   NOT itself bump TablesCodecVersion -> tablesCodecVersion may NOT reliably encode endianness (the refuter
