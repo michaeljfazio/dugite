@@ -941,6 +941,10 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake145 2026-06-07: POLL #10 float-parse fix-muscle w3cxa15va — RUNNING, healthy (4GB RAM, no nodes, 0
+  completed). Implementing the small float-parse byte-exactness (accept integral JSON Number==1 like Aeson
+  toBoundedInteger) + narrowing the overclaim/dead-code comments. Not disturbed; no competing work. #10 stays
+  FIXING; next: poll -> build+nextest -> re-verify (real preprod integer 1, 0 phase-1) -> re-gauntlet -> commit.
 - wake144 2026-06-07 (notification): re-gauntlet w3upqlq0y COMPLETE = 2/3 refuted but ALL 3 CONFIRM the
   endianness decision is byte-exact (no endianness refutation — a milestone after 7 rounds). The 2 refutes are
   narrow: (a) float-form Word8 parse over-strict (1.0/1e0 rejected vs Aeson-accepts) -> small byte-exact fix;
