@@ -127,11 +127,15 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (real, phase-2 mithril-fast-start ref-script gap) state:ROOT-CAUSED — mod.rs:6411 drops
-  script_ref on import; two-part fix (decode_tag5 tail-parse + ScriptRef decode). next:FIX via fix-muscle (Tier A')
+- item: #10 (real, phase-2 mithril-fast-start ref-script gap) state:FIXING — fix-muscle we0nz74zr launched
+  (Opus, isolated worktree, Tier A'). Two-part fix: (1) decode_tag5 tail-parse -> script_ref:Some;
+  (2) mod.rs:6411 decode bytes -> ScriptRef. Given a BUILT-IN HASH ORACLE (decoded refscript for UTxO
+  f08f73509b0d3b4a#0 must hash to 744837b0a3...) so the agent self-verifies its MemPack Script decoding, not
+  guesses. next:poll muscle -> if checks_green + hash-oracle PASSES, VERIFYING (re-soak: failing slots must
+  stop WARNing) -> gauntlet -> commit. Do NOT commit on green tests alone (hash match is the proof).
 - item: #0 ep246 reserves +82,270,482 (Allegra/PV3) state:PARKED-WITH-ROOT-CAUSE — structural member-reward fold
-- item: live soak (sync-gate) state:AT-TIP CONFIRMED — soak node block 4793026 == koios live tip 4793026,
-  sustained ~12min, 0 panic/OOM/wedge, RSS 4.8GB, CPU 1.9% idle-at-tip. Sync-gate live-soak portion HOLDING.
+- item: live soak (sync-gate) state:AT-TIP CONFIRMED — soak node block 4793035 == koios live tip 4793035,
+  sustained ~17min, 0 panic/OOM/wedge, RSS 4.8GB, CPU 1.7% idle-at-tip. Sync-gate live-soak portion HOLDING.
 - attempts: 1
 - ANALYZE RESULT (w6lsvu2p2, Opus): canonical Haskell active-stake =
   resolveActiveInstantStakeCredentials (Stake.hs @52ef3d5) — per registered+delegated
@@ -174,6 +178,9 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
+- fix-muscle we0nz74zr (#10 phase-2 ref-script fix, Opus, worktree) — /workflows-visible. Poll next wake;
+  on completion read FIX result (files/tier/checks_green/hash-oracle). If hash-oracle PASSES -> VERIFYING re-soak.
+- live-soak pid 99162 (db-clones/preprod-soak) — at-tip soak, .jobs/live-soak.{pid,log}. SIGTERM-only to stop.
 - replay-measure  pid-file=.jobs/replay-measure.pid  (clean HEAD from-genesis replay climbing past ep93
   toward ep181). TEST: does it hit the original WithdrawalAmountMismatch halt at ep181? If it CROSSES
   ep181 cleanly -> ep57/ep181 RESOLVED on HEAD (prior finding stale); sync.preprod frontier unblocks. If
@@ -479,6 +486,15 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake59 2026-06-07: DRIVE #10 FIX. Soak still EXACTLY at tip (block 4793035 == koios live 4793035, ~17min,
+  0 panic/OOM/wedge, 1.7% CPU) — sync-gate live-soak holding. Cheap pre-check already satisfied last wake
+  (root-cause is definitive), so advanced #10 ROOT-CAUSED -> FIXING: launched fix-muscle we0nz74zr (Opus,
+  isolated worktree, Tier A') for the two-part fix (decode_tag5 tail-parse populating script_ref:Some +
+  mod.rs:6411 ScriptRef decode). Gave the agent a built-in HASH ORACLE (decoded refscript for UTxO
+  f08f73509b0d3b4a#0 must hash to 744837b0a3...; e2766b4eb2b8d4da#0 -> d55eb689d8...) so it self-verifies the
+  MemPack Script decoding instead of guessing — flagged the tvar blob is MemPack-encoded (not CBOR) and to
+  reuse existing ScriptRef/compute_script_ref_hash. Did NOT block the wake on the long build+nextest; next wake
+  polls we0nz74zr. Commit ONLY after re-soak proves the failing slots stop WARNing (green tests != proof).
 - wake58 2026-06-07: *** #10 ROOT-CAUSED (deviated from stale standing-prompt's #1 ep57, which is RESOLVED per
   engine-state) ***. (a) Soak node now EXACTLY at tip (block 4793026 == koios live 4793026, sustained ~12min,
   0 panic/OOM/wedge, 1.9% CPU). (b) Reproduced #10 via Koios tx_info: failing tx 0d325a6e... supplies 5 scripts
