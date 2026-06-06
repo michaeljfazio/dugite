@@ -65,7 +65,7 @@
 
 ## In-progress
 - item: #8 NEW (real, found by broad sweep): mainnet ep246 reserves +82,270,482 divergence (Allegra)
-- state: REPRODUCING-pinpoint — prefilter LOCATION byte-exact (2nd muscle refuted a patch); bug = dugite reward_accounts MISSING cred(s) Haskell has at ep245 startStep; added DROP_TRACE, building to capture the dropped creds
+- state: REPRODUCING-pinpoint — DROP_TRACE replay running (db-mainnet, DUGITE_DROP_TRACE=1) capturing prefilter-dropped creds; climbing to ep246 to isolate the ep245-RUPD drop burst
 - attempts: 1
 - ANALYZE RESULT (w6lsvu2p2, Opus): canonical Haskell active-stake =
   resolveActiveInstantStakeCredentials (Stake.hs @52ef3d5) — per registered+delegated
@@ -322,3 +322,10 @@
   grep the dropped creds near ep245, cross-ref Koios to find the one(s) Koios pays -> trace why reward_accounts
   misses it -> byte-exact fix. NOTE: dugite SNAP(epoch.rs:333) runs BEFORE apply_pending_mir(479) vs Haskell
   applyRUpd->MIR->SNAP — flagged as a separate class to check.
+- wake38 2026-06-06T15:?? : DROP_TRACE instrumentation WORKS — captures DROP_PREFILTER cred=<typedhash32> pool=<id>.
+  Replay climbing (ep219); 43 drops for the 4 target pools so far (mostly pool 53215c47). NEXT (when replay
+  passes ep246): isolate the ep245->246 RUPD drop burst (correlate with epoch markers in the log), and for
+  each dropped cred cross-ref Koios pool_delegators_history/account_reward_history at ep244 -> the dropped
+  cred(s) Koios PAYS (summing ~82.27M) are the bug = creds in Haskell accounts but missing from dugite
+  reward_accounts at ep245 startStep. Then trace the registration-tracking gap (reg/dereg/re-reg or MIR order)
+  -> byte-exact fix. Replay job: .jobs/replay-droptrace.{pid,log}.
