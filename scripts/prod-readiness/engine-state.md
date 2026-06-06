@@ -594,6 +594,12 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake77 2026-06-07: POLL #10 analyze muscle wxuwzffyl — STILL RUNNING, healthy (4GB RAM, no nodes, 0 completed).
+  Significant interim lead: verify10b snapshot meta = backend dugite-lsm, utxo_count=0 (UTxOs in the LSM store
+  not inline); muscle now verifying whether the LSM `active` store (2.7GB, has data) carries datum/script_ref at
+  runtime READ time — i.e. the LSM bincode roundtrip / phase-2 resolution read path is the suspect for the
+  decode-vs-runtime disconnect (recall utxo_store.rs uses bincode of the FULL TransactionOutput, so it SHOULD
+  preserve them — muscle is confirming empirically). Not disturbed; no competing work. #10 stays DIAGNOSING.
 - wake76 2026-06-07: POLL #10 analyze muscle wxuwzffyl — STILL RUNNING, healthy (5GB RAM, no nodes, 0 completed
   events). Interim trace findings worth noting: the snapshot ENCODE is faithful for datum/script_ref (post-Alonzo
   output keys 2/3 emitted) so the snapshot roundtrip is NOT the loss point; muscle now inspecting the actual
