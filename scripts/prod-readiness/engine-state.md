@@ -87,7 +87,7 @@
 
 ## In-progress
 - item: #8 NEW (real, found by broad sweep): mainnet ep246 reserves +82,270,482 divergence (Allegra)
-- (#0 ep246 PARKED-WITH-ROOT-CAUSE). NOW: phase-2 frontier (#22) — replay validating is_valid agreement + capturing ExBudget dumps
+- item: #9 snapshot backend mismatch (sync/perf, tractable). state:FIXING — fix muscle making mithril-import save in the configured utxo-backend so run fast-starts
 - attempts: 1
 - ANALYZE RESULT (w6lsvu2p2, Opus): canonical Haskell active-stake =
   resolveActiveInstantStakeCredentials (Stake.hs @52ef3d5) — per registered+delegated
@@ -410,3 +410,9 @@
   no stall/wedge/chain_diverged/OOM). The LIVE-NETWORK-SYNC + at-tip SOAK portion is not cleanly testable
   under 1GB free RAM -> SIGTERMed the node; flag for a clean-RAM re-run (or after the #9 backend fix lets it
   fast-start). Sync gate = replay-clean ✓ + live-soak DEFERRED (RAM-bound). Added watch: volatile connect-WARNs.
+- wake50 2026-06-07: SCHEDULE picked #9 (tractable real perf fix; ep246 parked as hard/structural). PINPOINT:
+  the haskell-import path saves the native snapshot via state.save_snapshot (node/mod.rs:6421) WITHOUT the
+  configured utxo-backend -> tagged in-memory -> run --utxo-backend lsm rejects it (mod.rs:660) -> FULL
+  genesis replay. Fix: persist+tag the snapshot in the CONFIGURED backend during mithril/haskell import so a
+  mithril-import->run cycle fast-starts. Fired fix muscle. Verification = operational: after fix, run a
+  mithril-imported db and confirm it loads the snapshot (no 'backend does not match' / no full replay).
