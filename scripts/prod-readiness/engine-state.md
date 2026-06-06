@@ -34,10 +34,14 @@
 6. [M][ledger] LATENT fork-path bug: apply_utxo_diff reconstruction didn't replay stake_map (valid
    fix preserved in scripts/prod-readiness/candidate-latent-fix-apply_utxo_diff.patch + worktree
    wf_9be2125b-d01-1). Land separately AFTER its own verification (re-sync past ep181). state:NEW attempts:0
+7. [M][ledger] LATENT Dijkstra SUBUTXO bug: apply_sub_transactions mutated utxo_set but NOT stake_map/
+   ptr_stake (asymmetry). Valid fix + add_instant_stake/delete_instant_stake helper refactor preserved in
+   scripts/prod-readiness/candidate-latent-fix-dijkstra-subutxo.patch + worktree wf_dcc190ba-a5c-1. Inert
+   for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
 - item: #1 ep57 preprod stake-distribution -10 ADA
-- state: FIXING (root cause DISAMBIGUATED + code-confirmed: incremental stake_map under-credit via missing ADD)
+- state: REPRODUCING-pinpoint (2nd fix also INERT for ep57 [Dijkstra path, pre-Babbage]; orchestrator running clamp-instrumented replay to find the exact offending tx)
 - attempts: 1
 - ANALYZE RESULT (w6lsvu2p2, Opus): canonical Haskell active-stake =
   resolveActiveInstantStakeCredentials (Stake.hs @52ef3d5) — per registered+delegated
@@ -80,8 +84,9 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- fix-muscle  workflow=w01lpkz0o  (Opus, worktree) — missing-ADD fix in live stake_map path +
-  per-cred stake instrumentation for byte-exact verify (Koios 9957549164 / 9815680998).
+- pinpoint-build  pid-file=.jobs/pinpoint-build.pid  (node build + epoch-state-debug + STAKE_CLAMP/SKIP
+  logging added to common.rs Phase-2 subtract, UNCOMMITTED diagnostic). NEXT: replay db-clones to ep57
+  with RUST_LOG=dugite_ledger::stake_clamp=warn, grep for creds 630472f7 / 7d3e2b31 to find offending tx.
 
 ## VERIFY FINDING (CORRECTED after gauntlet — my wake9 analysis was WRONG)
 - The apply_utxo_diff fix is INERT for ep57. Gauntlet wm055td32 REFUTED 2/3 (haskell-semantics +
@@ -152,3 +157,8 @@
   Phase-2 subtract clamped (common.rs:202-204 saturating_sub + skip-if-absent). Haskell instant-stake
   never underflows on a valid chain -> the REAL bug is a MISSING ADD in some output-creation path; the
   clamp is the symptom. Fired fix muscle with this confirmed non-conflicted target.
+- wake15 2026-06-06T13:35Z: fix w01lpkz0o found+fixed a REAL ADD/SUB asymmetry but in the DIJKSTRA
+  SUBUTXO path -> INERT for ep57 (Babbage/Alonzo, pre-Dijkstra). 2nd inert-but-valid fix (latent #7).
+  KEY PROCESS INSIGHT: worktree muscles CANNOT run the replay harness, so they cannot pinpoint the exact
+  ep57 tx; the ORCHESTRATOR must. Added STAKE_CLAMP/SKIP logging to common.rs Phase-2 (uncommitted),
+  building node+epoch-state-debug; next wake replays to ep57 and greps the 2 creds to find the offender.
