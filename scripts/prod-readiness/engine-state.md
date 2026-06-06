@@ -65,7 +65,7 @@
 
 ## In-progress
 - item: #8 NEW (real, found by broad sweep): mainnet ep246 reserves +82,270,482 divergence (Allegra)
-- state: FIXING — diagnosis in (deltaR1 too small); rho/tau RULED OUT (unchanged); d changed 0.24->0.22 at ep246; fix muscle pinpointing d-source/blocksMade/eta
+- state: ANALYZING (re-aimed) — fix muscle REFUTED the deltaR1/d hypothesis (already byte-exact); correct cause = per-pool/per-member reward UNDER-DISTRIBUTION (ep213-class, undistributed->reserves)
 - attempts: 1
 - ANALYZE RESULT (w6lsvu2p2, Opus): canonical Haskell active-stake =
   resolveActiveInstantStakeCredentials (Stake.hs @52ef3d5) — per registered+delegated
@@ -138,6 +138,12 @@
 - db-clones/preprod-ep57-fixed   (fixed-binary replay, in progress)
 
 ## Gauntlet ledger  (passed/refuted approaches — never silently retry a REFUTED)
+- REFUTED 2026-06-06 (whr4t971m, fix muscle self-refuted, NO code change): "ep246 reserves +82M is deltaR1
+  too small from d-source". WRONG: RUPD at 245->246 uses prevPParams=ep244 d=0.26 (dugite correct);
+  eta=1 (blocksMade>expectedBlocks) so deltaR1 identical for all candidate d; treasury -55K != 0.2*82M so
+  NOT a pot/deltaR1 error. CORRECT cause: per-pool/per-member reward UNDER-distribution -> undistributed
+  rewards return to reserves (treasury ~neutral). Same class as REWARD-DIVERGENCE-MAINNET-ep213.md's
+  documented OPEN residual (whole-pool vs per-member prefilter). DO NOT retry a deltaR1/d fix.
 - REFUTED 2026-06-06 (wm055td32, 2/3): "fix apply_utxo_diff reconstruction path to replay stake_map".
   *** REFUTAL PREMISE NOW DISPROVEN: the refuters (and the findings doc) claimed a clean local replay
   reproduces the ep57 -5 ADA. DIRECT MEASUREMENT (per-cred dump, wake22) proves clean HEAD replay is
@@ -286,3 +292,10 @@
   OR eta Rational arithmetic. Fired fix muscle to read the call site (which epoch's d/blocks passed),
   compute Haskell-correct eta from Koios ep244 d + ep245 pool_blocks, pinpoint the exact wrong input, fix
   (Tier A), and ADD RUPD-component dump (eta/expected_blocks/actual_blocks/deltaR1) for byte-exact verify.
+- wake33 2026-06-06T15:?? : fix muscle whr4t971m SELF-REFUTED my deltaR1/d diagnosis (made NO code change,
+  cited the #438 trap). Correct cause: ep246 +82.27M reserves = per-pool/per-member reward UNDER-distribution
+  (undistributed pot returns to reserves; treasury near-neutral, NOT tau*X). This is the ep213-doc's OPEN
+  residual class (per-member prefilter). NEXT: localize WHICH pool(s)/member(s) dugite under-distributes at
+  ep246 by comparing the dump's rewards.per_pool_top20 + per_credential rewards vs Koios pool_history /
+  account_reward_history (mind the mark/set/go reward-timing lag), then fix the prefilter/distribution.
+  GREAT discipline: the muscle refused a speculative fix that would have regressed byte-exact ep209-245.
