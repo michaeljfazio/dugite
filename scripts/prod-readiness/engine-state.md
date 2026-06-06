@@ -550,6 +550,13 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake69 2026-06-07: POLL #10 muscle wnqthg8c8 — STILL RUNNING, healthy (actively building a real-blob
+  diagnostic to locate the residual-11 refscript; no errors; 4GB RAM free). Not disturbed; no competing heavy
+  work. Light lock-free support: Koios script_info confirms residual script 7afbde082796cfa6ed6ba87728c57f-
+  111815340af03e1897094163b3 IS a real preprod plutusV3 reference script (size 4751, creation tx dca0e8d5...).
+  SAME lang (V3) as the target 744837b0a3 that already resolves -> the residual failure is in the TxOut ENCODING
+  holding it, NOT the script type — consistent with the multi-asset tag-5 sub-branch hypothesis given to the
+  muscle. Validates the muscle is chasing a real target. #10 stays FIXING-EXPANDED. next: poll wnqthg8c8.
 - wake68 2026-06-07: DRIVE #10 EXPANDED FIX. Reverted main's refscript changes CLEAN (patch preserved + applies
   clean to HEAD), then launched expanded fix-muscle wnqthg8c8 (Opus, worktree, Tier A') to: git-apply the
   refscript patch as the base, then (A) decode inline datums (MemPackTxOut.datum -> OutputDatum::Inline at
