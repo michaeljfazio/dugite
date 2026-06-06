@@ -894,6 +894,12 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake136 2026-06-07: POLL #10 strict remediation muscle wh8n6ip92 — RUNNING, healthy (5GB RAM, no nodes, 0
+  completed). Doing the verify-before-strict investigation: found the legacy-LE test (build_legacy_le_tvar) uses
+  SYNTHETIC tvar blobs, not a real meta-less network snapshot (preview_tvar_head_64k.bin is doc-referenced).
+  Supports the strict choice — no real target-network mithril snapshot needs meta-less LE -> safe to drop the LE
+  import path. Not disturbed; no competing work. #10 stays FIXING; next: poll -> build+nextest -> re-verify ->
+  re-gauntlet -> commit.
 - wake135 2026-06-07 (notification): re-gauntlet w4007sv2k COMPLETE = 2/3 refuted (compounding-feedback ran the
   importer tests empirically + did NOT refute; the other 2 agree). DEFINITIVE source-cited truth table obtained
   (mandatory `.:` => field-absent THROWS; loadSnapshot decodes BE unconditionally + backend check). Made the
