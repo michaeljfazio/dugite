@@ -136,7 +136,16 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:ROOT-CAUSED (residual). *** wake78: analyze
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:FIXING (endianness). wake79: analyze muscle
+  wxuwzffyl FULLY COMPLETE (rootcause confidence 0.96: "TxIx decoded LE not BE at mempack mod.rs:68"). Launched
+  FIX muscle wagcpug42 (Opus, worktree, Tier 1) to: STEP0 apply candidate-fix-10-COMPLETE-refscript-datum.patch
+  (base), then (1) mod.rs:68 from_le_bytes->from_be_bytes with #461 RECONCILIATION (determine decoder scope:
+  tables-only=flip vs shared=tables-specific BE path; explain BE = ordered-store key sort-order) + fix the pinned
+  test/fixture (0100 false-LE -> real 0001 BE), (2) multi-asset drop mod.rs:6435. Key-correctness oracle
+  (a UNIT test is NOT enough — last fix passed unit oracles but was a runtime no-op): gated blob-decode test that
+  a real idx-1 entry decodes to index==1 + store lookup of 00000c0c...#1 yields coin 1750000 (Koios). VERIFY
+  (next, chain-level): re-import re-soak drops 291/41/11 to ~0. Once keys are correct the refscript+datum decode
+  finally takes runtime effect. Old residual notes below. was: state:ROOT-CAUSED (residual). *** wake78: analyze
   muscle wxuwzffyl found THE BUG, triple-confirmed empirically *** ROOT CAUSE = crates/dugite-serialization/
   src/mempack/mod.rs:68 decodes TxIn output index (TxIx) as `u16::from_le_bytes` but the on-disk UTxO-HD tables
   KEY is BIG-ENDIAN -> every imported UTxO at output index >=1 stored under a CORRUPTED key (index 1->256,
@@ -298,9 +307,9 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- analyze-muscle wxuwzffyl — ROOT CAUSE DELIVERED (agent1 result in journal; agent2 RootCause-schema finalizing).
-  Bug = mempack/mod.rs:68 TxIx LE-vs-BE -> idx>=1 UTxOs mis-keyed. Next wake: launch FIX muscle for endianness +
-  multi-asset drop (on the refscript+datum base).
+- fix-muscle wagcpug42 (#10 endianness TxIx LE->BE + multi-asset drop, on refscript+datum base, Opus, worktree,
+  Tier 1) — /workflows-visible. Poll next wake for FIX result (key-correctness oracle). On pass -> re-import re-verify.
+- analyze-muscle wxuwzffyl — COMPLETE (rootcause confidence 0.96). Bug = mempack/mod.rs:68 TxIx LE vs BE.
 - verify10b-resoak — STOPPED CLEAN wake75 (SIGTERM; verdict: 549 divergences UNCHANGED by datum fix). RAM freed.
   db-clones/preprod-verify10b retains the COMPLETE-fix imported state for the analyze muscle.
 - COMPLETE #10 fix (refscript+datum) on MAIN uncommitted (correct oracle-proven base; commit gated on residual
@@ -615,6 +624,13 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake79 2026-06-07: DRIVE #10 endianness FIX. Analyze muscle wxuwzffyl fully complete (rootcause confidence
+  0.96). Launched fix muscle wagcpug42 (Tier 1, worktree): apply COMPLETE refscript+datum patch as base, then
+  flip mod.rs:68 TxIx from_le_bytes->from_be_bytes (with #461 reconciliation: determine decoder scope + explain
+  ordered-store BE key) + fix pinned test/fixture + multi-asset drop mod.rs:6435. Emphasized a KEY-CORRECTNESS
+  oracle (not just unit test — the last fix passed units but was a runtime no-op): idx-1 entry must decode to
+  index==1 and store-lookup 00000c0c...#1 -> coin 1750000. 5GB RAM, no nodes. #10 ROOT-CAUSED -> FIXING. next:
+  poll wagcpug42 -> re-import re-soak (291/41/11 -> ~0) -> gauntlet -> commit.
 - wake78 2026-06-07: *** #10 ROOT CAUSE FOUND (analyze muscle wxuwzffyl) *** = mempack/mod.rs:68 decodes TxIx
   little-endian but the on-disk UTxO-HD tables key is BIG-ENDIAN -> imported UTxOs at output index >=1 are
   mis-keyed (idx1->256) -> phase-2 lookup-by-real-index misses -> the 11 not-found + 291 Error-term + 41 budget.
