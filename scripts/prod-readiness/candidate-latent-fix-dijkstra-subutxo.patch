@@ -1,0 +1,435 @@
+36c36
+<     Certificate, MIRSource, MIRTarget, Transaction, TransactionInput,
+---
+>     Certificate, MIRSource, MIRTarget, Transaction, TransactionInput, TransactionOutput,
+137a138,214
+> // 0. InstantStake single-UTxO add / delete (Haskell addInstantStake / deleteInstantStake)
+> // ============================================================================
+> 
+> /// Add a single produced output's coin to the incremental stake distribution.
+> ///
+> /// Mirrors Haskell `EraStake::addInstantStake`, documented as
+> /// *"Add new UTxO to the InstantStake. This is invoked for every new TxOut that
+> /// is added to the ledger state"*
+> /// (`Cardano.Ledger.State.Stake`). The canonical UTXO rule applies it via
+> /// `updateUTxOStateNoFees`:
+> ///
+> /// ```haskell
+> /// utxosInstantStake =
+> ///     deleteInstantStake deletedUTxO (addInstantStake utxoAdd (utxos ^. instantStakeL))
+> /// ```
+> ///
+> /// Routing follows `stake_routing`: base/reward → `stake_map` (eager), pointer →
+> /// `ptr_stake` (deferred), enterprise/Byron → no stake. Sharing this one helper
+> /// across EVERY UTxO-producing path (top-level `apply_utxo_changes`, collateral
+> /// return, and the Dijkstra SUBUTXO rule) is what guarantees the
+> /// produce/consume symmetry the Haskell class enforces — any path that inserts a
+> /// UTxO without calling this under-credits the credential's incremental stake.
+> pub(crate) fn add_instant_stake(
+>     output: &TransactionOutput,
+>     certs: &mut CertSubState,
+>     epochs: &mut EpochSubState,
+> ) {
+>     let coin = output.value.coin.0;
+>     match stake_routing(&output.address, epochs.ptr_stake_excluded) {
+>         StakeRouting::Credential(cred_hash) => {
+>             *certs
+>                 .stake_distribution
+>                 .stake_map
+>                 .entry(cred_hash)
+>                 .or_insert(Lovelace(0)) += Lovelace(coin);
+>         }
+>         StakeRouting::Pointer(ptr) => {
+>             *epochs.ptr_stake.entry(ptr).or_insert(0) += coin;
+>         }
+>         StakeRouting::None => {}
+>     }
+> }
+> 
+> /// Subtract a single consumed (spent) output's coin from the incremental stake
+> /// distribution.
+> ///
+> /// Mirrors Haskell `EraStake::deleteInstantStake`, documented as
+> /// *"Delete spent UTxO from the InstantStake. This is invoked for every TxOut
+> /// that is removed from the ledger state"* (`Cardano.Ledger.State.Stake`).
+> ///
+> /// Uses `saturating_sub`: during a from-genesis replay an input may resolve to a
+> /// credential whose tracked stake was not yet fully accumulated, and Haskell's
+> /// `Map`-of-`CompactForm Coin` subtraction never goes negative in a well-formed
+> /// chain. Callers are responsible for de-duplicating a `Set TxIn` so each spent
+> /// UTxO is removed exactly once.
+> pub(crate) fn delete_instant_stake(
+>     spent_output: &TransactionOutput,
+>     certs: &mut CertSubState,
+>     epochs: &mut EpochSubState,
+> ) {
+>     let coin = spent_output.value.coin.0;
+>     match stake_routing(&spent_output.address, epochs.ptr_stake_excluded) {
+>         StakeRouting::Credential(cred_hash) => {
+>             if let Some(stake) = certs.stake_distribution.stake_map.get_mut(&cred_hash) {
+>                 stake.0 = stake.0.saturating_sub(coin);
+>             }
+>         }
+>         StakeRouting::Pointer(ptr) => {
+>             if let Some(entry) = epochs.ptr_stake.get_mut(&ptr) {
+>                 *entry = entry.saturating_sub(coin);
+>             }
+>         }
+>         StakeRouting::None => {}
+>     }
+> }
+> 
+> // ============================================================================
+197a275
+>     // Haskell `deleteInstantStake` — applied once per (deduped) spent UTxO.
+199,212c277
+<         let coin = spent_output.value.coin.0;
+<         match stake_routing(&spent_output.address, epochs.ptr_stake_excluded) {
+<             StakeRouting::Credential(cred_hash) => {
+<                 if let Some(stake) = certs.stake_distribution.stake_map.get_mut(&cred_hash) {
+<                     stake.0 = stake.0.saturating_sub(coin);
+<                 }
+<             }
+<             StakeRouting::Pointer(ptr) => {
+<                 if let Some(entry) = epochs.ptr_stake.get_mut(&ptr) {
+<                     *entry = entry.saturating_sub(coin);
+<                 }
+<             }
+<             StakeRouting::None => {}
+<         }
+---
+>         delete_instant_stake(spent_output, certs, epochs);
+256a322
+>     // Haskell `addInstantStake` — applied once per produced UTxO.
+258,271c324
+<         let coin = output.value.coin.0;
+<         match stake_routing(&output.address, epochs.ptr_stake_excluded) {
+<             StakeRouting::Credential(cred_hash) => {
+<                 *certs
+<                     .stake_distribution
+<                     .stake_map
+<                     .entry(cred_hash)
+<                     .or_insert(Lovelace(0)) += Lovelace(coin);
+<             }
+<             StakeRouting::Pointer(ptr) => {
+<                 *epochs.ptr_stake.entry(ptr).or_insert(0) += coin;
+<             }
+<             StakeRouting::None => {}
+<         }
+---
+>         add_instant_stake(output, certs, epochs);
+331,344c384
+<             let coin = spent.value.coin.0;
+<             match stake_routing(&spent.address, epochs.ptr_stake_excluded) {
+<                 StakeRouting::Credential(cred) => {
+<                     if let Some(stake) = certs.stake_distribution.stake_map.get_mut(&cred) {
+<                         stake.0 = stake.0.saturating_sub(coin);
+<                     }
+<                 }
+<                 StakeRouting::Pointer(ptr) => {
+<                     if let Some(entry) = epochs.ptr_stake.get_mut(&ptr) {
+<                         *entry = entry.saturating_sub(coin);
+<                     }
+<                 }
+<                 StakeRouting::None => {}
+<             }
+---
+>             delete_instant_stake(&spent, certs, epochs);
+352,365c392
+<         let coin = col_return.value.coin.0;
+<         match stake_routing(&col_return.address, epochs.ptr_stake_excluded) {
+<             StakeRouting::Credential(cred) => {
+<                 *certs
+<                     .stake_distribution
+<                     .stake_map
+<                     .entry(cred)
+<                     .or_insert(Lovelace(0)) += Lovelace(coin);
+<             }
+<             StakeRouting::Pointer(ptr) => {
+<                 *epochs.ptr_stake.entry(ptr).or_insert(0) += coin;
+<             }
+<             StakeRouting::None => {}
+<         }
+---
+>         add_instant_stake(col_return, certs, epochs);
+70a71
+> use super::common;
+222c223
+<             let sub_diff = apply_sub_transactions(tx, utxo);
+---
+>             let sub_diff = apply_sub_transactions(tx, utxo, certs, epochs);
+398,399c399,407
+< /// at the cert layer; its UTxO effect is still applied correctly.
+< fn apply_sub_transactions(tx: &Transaction, utxo: &mut UtxoSubState) -> UtxoDiff {
+---
+> /// at the cert layer; its UTxO effect — including the incremental
+> /// `InstantStake` add/delete (`addInstantStake`/`deleteInstantStake`) on
+> /// every produced/consumed UTxO — is applied correctly.
+> fn apply_sub_transactions(
+>     tx: &Transaction,
+>     utxo: &mut UtxoSubState,
+>     certs: &mut CertSubState,
+>     epochs: &mut EpochSubState,
+> ) -> UtxoDiff {
+435a444,451
+>         //
+>         // The incremental InstantStake MUST be decremented for every removed
+>         // UTxO here, exactly as the top-level UTXO rule does. Haskell's
+>         // `updateUTxOStateNoFees` runs `deleteInstantStake deletedUTxO ...` over
+>         // ALL consumed UTxOs regardless of which (sub-)ledger removed them;
+>         // omitting it for sub-tx spends would leave the spent credential's
+>         // tracked stake too high (a produce/consume asymmetry that diverges the
+>         // per-credential snapshot and every downstream reward/pool-stake calc).
+436a453
+>             common::delete_instant_stake(output, certs, epochs);
+443a461,464
+>         //
+>         // Symmetric to Step 2: every produced UTxO is added to InstantStake via
+>         // Haskell `addInstantStake utxoAdd ...`, so a sub-tx output paying a
+>         // base/reward address credits that credential's incremental stake.
+448a470
+>             common::add_instant_stake(output, certs, epochs);
+1553a1576,1818
+>         }
+> 
+>         /// SUBUTXO incremental `InstantStake` tracking (the produce/consume
+>         /// symmetry that `Cardano.Ledger.Shelley.Rules.Utxo.updateUTxOStateNoFees`
+>         /// enforces via `deleteInstantStake deletedUTxO (addInstantStake utxoAdd ...)`).
+>         ///
+>         /// Regression for the class of bug where a UTxO-mutating path updates
+>         /// the UTxO set but NOT the per-credential `stake_map`, leaving the
+>         /// spent credential's incremental stake too high and the produced
+>         /// credential's too low (an asymmetric under-credit that diverges the
+>         /// epoch snapshot and every downstream reward / pool-stake calc — the
+>         /// ep57-preprod "−5 ADA per credential" symptom).
+>         ///
+>         /// Fixture: a sub-tx that spends a 10-ADA base-address UTxO at stake
+>         /// credential `STAKE_IN` and produces a 4-ADA base-address output at a
+>         /// DIFFERENT stake credential `STAKE_OUT`. After apply:
+>         ///   * `stake_map[STAKE_IN]`  must drop by 10 ADA (deleteInstantStake)
+>         ///   * `stake_map[STAKE_OUT]` must rise by 4 ADA  (addInstantStake)
+>         #[test]
+>         fn sub_transactions_track_instant_stake() {
+>             use super::super::*;
+>             use crate::eras::EraRules;
+>             use crate::state::{BlockValidationMode, StakeDistributionState};
+>             use crate::utxo::UtxoSet;
+>             use crate::utxo_diff::DiffSeq;
+>             use dugite_primitives::address::Address;
+>             use dugite_primitives::credentials::Credential;
+>             use dugite_primitives::era::Era;
+>             use dugite_primitives::hash::{Hash28, Hash32};
+>             use dugite_primitives::protocol_params::ProtocolParameters;
+>             use dugite_primitives::time::EpochNo;
+>             use dugite_primitives::transaction::{
+>                 OutputDatum, SubTransaction, Transaction, TransactionBody, TransactionInput,
+>                 TransactionOutput, TransactionWitnessSet,
+>             };
+>             use dugite_primitives::value::{Lovelace, Value};
+>             use std::collections::{BTreeMap, HashMap, HashSet};
+>             use std::sync::Arc;
+> 
+>             // Two distinct KEY stake credentials.
+>             let stake_in_kh = Hash28::from_bytes([0x11; 28]);
+>             let stake_out_kh = Hash28::from_bytes([0x22; 28]);
+>             let pay_kh = Hash28::from_bytes([0x33; 28]);
+>             let stake_in_key = Credential::VerificationKey(stake_in_kh).to_typed_hash32();
+>             let stake_out_key = Credential::VerificationKey(stake_out_kh).to_typed_hash32();
+> 
+>             // Base address, key-payment + key-stake, testnet: header 0x00,
+>             // then 28-byte payment hash, then 28-byte stake hash (57 bytes).
+>             let base_addr = |stake_kh: Hash28| -> Address {
+>                 let mut b = Vec::with_capacity(57);
+>                 b.push(0x00);
+>                 b.extend_from_slice(pay_kh.as_bytes());
+>                 b.extend_from_slice(stake_kh.as_bytes());
+>                 Address::from_bytes(&b).expect("base addr")
+>             };
+>             let make_output = |addr: Address, coin: u64| TransactionOutput {
+>                 address: addr,
+>                 value: Value::lovelace(coin),
+>                 datum: OutputDatum::None,
+>                 script_ref: None,
+>                 is_legacy: true,
+>                 raw_cbor: None,
+>             };
+> 
+>             // Seed UTxO IN — 10 ADA at base(STAKE_IN), to be spent by the sub-tx.
+>             let utxo_in = TransactionInput {
+>                 transaction_id: Hash32::from_bytes([0xA1; 32]),
+>                 index: 0,
+>             };
+>             let utxo_in_out = make_output(base_addr(stake_in_kh), 10_000_000);
+> 
+>             let mut utxo_set = UtxoSet::new();
+>             utxo_set.insert(utxo_in.clone(), utxo_in_out.clone());
+>             let mut utxo = UtxoSubState {
+>                 utxo_set,
+>                 diff_seq: DiffSeq::new(),
+>                 epoch_fees: Lovelace(0),
+>                 pending_donations: Lovelace(0),
+>             };
+> 
+>             // Sub-tx: spend UTxO IN, produce 4 ADA at base(STAKE_OUT).
+>             let sub_out = make_output(base_addr(stake_out_kh), 4_000_000);
+>             let sub = SubTransaction {
+>                 tx_id: Hash32::from_bytes([0xAA; 32]),
+>                 inputs: vec![utxo_in.clone()],
+>                 outputs: vec![sub_out.clone()],
+>                 ttl: None,
+>                 validity_interval_start: None,
+>                 reference_inputs: vec![],
+>                 auxiliary_data_hash: None,
+>                 raw_body_cbor: None,
+>             };
+> 
+>             let parent_body = TransactionBody {
+>                 inputs: vec![],
+>                 outputs: vec![],
+>                 fee: Lovelace(0),
+>                 ttl: None,
+>                 certificates: vec![],
+>                 withdrawals: BTreeMap::new(),
+>                 auxiliary_data_hash: None,
+>                 validity_interval_start: None,
+>                 mint: BTreeMap::new(),
+>                 script_data_hash: None,
+>                 collateral: vec![],
+>                 required_signers: vec![],
+>                 network_id: None,
+>                 collateral_return: None,
+>                 total_collateral: None,
+>                 reference_inputs: vec![],
+>                 update: None,
+>                 voting_procedures: BTreeMap::new(),
+>                 proposal_procedures: vec![],
+>                 treasury_value: None,
+>                 donation: None,
+>                 sub_transactions: vec![sub.clone()],
+>                 account_balance_intervals: vec![],
+>                 direct_deposits: ::std::collections::BTreeMap::new(),
+>                 guards: Vec::new(),
+>             };
+>             let parent_tx = Transaction {
+>                 era: Era::Dijkstra,
+>                 hash: Hash32::from_bytes([0xDE; 32]),
+>                 body: parent_body,
+>                 witness_set: TransactionWitnessSet {
+>                     vkey_witnesses: vec![],
+>                     native_scripts: vec![],
+>                     bootstrap_witnesses: vec![],
+>                     plutus_v1_scripts: vec![],
+>                     plutus_v2_scripts: vec![],
+>                     plutus_v3_scripts: vec![],
+>                     plutus_data: vec![],
+>                     redeemers: vec![],
+>                     raw_redeemers_cbor: None,
+>                     raw_plutus_data_cbor: None,
+>                     original_script_data_hash: None,
+>                 },
+>                 is_valid: true,
+>                 auxiliary_data: None,
+>                 raw_cbor: None,
+>                 raw_body_cbor: None,
+>                 raw_witness_cbor: None,
+>             };
+> 
+>             // Pre-seed stake_map: STAKE_IN already holds the 10 ADA UTxO's
+>             // stake (as the live incremental map would after that UTxO was
+>             // produced). STAKE_OUT starts at zero.
+>             let mut stake_map = HashMap::new();
+>             stake_map.insert(stake_in_key, Lovelace(10_000_000));
+>             let mut certs = CertSubState {
+>                 delegations: imbl::HashMap::new(),
+>                 pool_params: Arc::new(HashMap::new()),
+>                 future_pool_params: HashMap::new(),
+>                 pending_retirements: HashMap::new(),
+>                 reward_accounts: imbl::HashMap::new(),
+>                 stake_key_deposits: imbl::HashMap::new(),
+>                 pool_deposits: HashMap::new(),
+>                 total_stake_key_deposits: 0,
+>                 pointer_map: HashMap::new(),
+>                 stake_distribution: StakeDistributionState { stake_map },
+>                 script_stake_credentials: HashSet::new(),
+>                 pending_mir_reserves: std::collections::HashMap::new(),
+>                 pending_mir_treasury: std::collections::HashMap::new(),
+>                 pending_mir_delta_reserves: 0,
+>                 pending_mir_delta_treasury: 0,
+>             };
+>             let mut gov = super::make_gov_sub();
+>             let mut epochs = EpochSubState {
+>                 snapshots: crate::state::EpochSnapshots::default(),
+>                 treasury: Lovelace(0),
+>                 reserves: Lovelace(0),
+>                 pending_reward_update: None,
+>                 last_applied_rupd: None,
+>                 pending_pp_updates: BTreeMap::new(),
+>                 future_pp_updates: BTreeMap::new(),
+>                 needs_stake_rebuild: false,
+>                 ptr_stake: HashMap::new(),
+>                 ptr_stake_excluded: true,
+>                 protocol_params: ProtocolParameters::mainnet_defaults(),
+>                 prev_protocol_params: ProtocolParameters::mainnet_defaults(),
+>                 prev_protocol_version_major: 12,
+>                 prev_d: dugite_primitives::transaction::Rational {
+>                     numerator: 0,
+>                     denominator: 1,
+>                 },
+>                 rupd_addrs_rew: None,
+>                 pending_avvm_return: 0,
+>             };
+>             let params = ProtocolParameters::mainnet_defaults();
+>             let delegates: HashMap<Hash28, (Hash28, Hash32)> = HashMap::new();
+>             let ctx = RuleContext {
+>                 params: &params,
+>                 current_slot: 2_000_000,
+>                 current_epoch: EpochNo(700),
+>                 era: Era::Dijkstra,
+>                 slot_config: None,
+>                 node_network: None,
+>                 genesis_delegates: &delegates,
+>                 update_quorum: 5,
+>                 epoch_length: 432_000,
+>                 shelley_transition_epoch: 0,
+>                 byron_epoch_length: 21_600,
+>                 stability_window: 129_600,
+>                 stability_window_3kf: 129_600,
+>                 randomness_stabilisation_window: 129_600,
+>                 tx_index: 0,
+>                 conway_genesis: None,
+>                 max_lovelace_supply: crate::state::MAX_LOVELACE_SUPPLY,
+>             };
+> 
+>             let rules = DijkstraRules::new();
+>             rules
+>                 .apply_valid_tx(
+>                     &parent_tx,
+>                     BlockValidationMode::ApplyOnly,
+>                     &ctx,
+>                     &mut utxo,
+>                     &mut certs,
+>                     &mut gov,
+>                     &mut epochs,
+>                 )
+>                 .expect("Dijkstra apply must succeed");
+> 
+>             // deleteInstantStake: STAKE_IN dropped by the full 10 ADA → 0.
+>             assert_eq!(
+>                 certs
+>                     .stake_distribution
+>                     .stake_map
+>                     .get(&stake_in_key)
+>                     .copied(),
+>                 Some(Lovelace(0)),
+>                 "SUBUTXO must subtract the spent UTxO's coin from STAKE_IN's incremental stake"
+>             );
+>             // addInstantStake: STAKE_OUT credited the 4 ADA output.
+>             assert_eq!(
+>                 certs
+>                     .stake_distribution
+>                     .stake_map
+>                     .get(&stake_out_key)
+>                     .copied(),
+>                 Some(Lovelace(4_000_000)),
+>                 "SUBUTXO must add the produced UTxO's coin to STAKE_OUT's incremental stake"
+>             );
