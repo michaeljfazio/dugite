@@ -11,7 +11,7 @@
 ## Frontiers  (advance these; zero open divergence behind each)
 - ledger.preprod:   BYTE-EXACT vs Koios — total active_stake matches at ep100/150/200/230 (Shelley→Conway) + ep57 per-cred exact; clean replay ep0-233 zero halts; finishing to ep293
 - ledger.mainnet:   BYTE-EXACT vs Koios — reserves+treasury exact at ep212-221 (doc's +180.4B ep213 divergence GONE on HEAD); replay validating further
-- sync.preprod:     LIVE SYNC+SOAK running — node from ep293 snapshot syncing ~620 blocks to live tip (ep293 b4792907) then at-tip soak; watch stalls/wedges/chain_diverged
+- sync.preprod:     LIVE node REBUILDING from genesis (snapshot backend mismatch dugite-mem vs dugite-lsm -> snapshot discarded). FOUND a perf gap (#9). Replay clean (no stall/wedge/OOM); will reach tip + soak
 - sync.mainnet:     ~ep331 (last known good db-mainnet)
 - phase2.preprod:   BYTE-EXACT (is_valid) — full preprod replay ep0-293 (V1/V2/V3, Alonzo->Babbage->Conway): 0 ValidationTagMismatch, 0 divergence dumps. #22 RESOLVED on HEAD (was 628 stale divergences)
 - phase2.mainnet:   inert until ep507 (V3)
@@ -69,6 +69,12 @@
    divergence means no script flipped validity.)
 5. [L][phase2] #14 V3 TxInfo deferred fields (inert until mainnet ep507).
    state:NEW attempts:0
+9. [M][sync/perf][REAL] Snapshot UTxO-backend mismatch: mithril-import/haskell-conversion saves the native
+   ledger snapshot with backend `dugite-mem`, but `run` defaults to `dugite-lsm` -> "snapshot backend does not
+   match configured backend" -> snapshot DISCARDED -> FULL genesis replay on every restart instead of
+   fast-start. Real robustness/perf gap (not byte-exactness). Fix: save the snapshot in the configured backend
+   (or auto-run the snapshot converter, or make mithril-import honor --utxo-backend). Found via the sync-gate
+   live-node test (wake48). state:NEW attempts:0
 6. [H][ledger] FORK-ROBUSTNESS (elevated M->H, now vindicated): apply_utxo_diff reconstruction didn't
    replay stake_map -> the FORK-INDUCED variant of the ep57 bug. Clean HEAD replay is correct, but a live
    sync hitting a rollback could still corrupt stake. The refuted gauntlet trusted a STALE doc; this IS a
@@ -391,3 +397,9 @@
   CAUTION free_ram=1GB at launch (live node ~7GB) — watch for OOM. Next wakes: confirm it reaches tip and
   soaks clean for a sustained window. This rounds out the 4th readiness gate (correctness gates ledger+phase2
   already byte-exact).
+- wake48 2026-06-07: SYNC-gate live-node test FOUND a real perf gap (#9): the node discards its ep293 native
+  snapshot on `run` due to a UTxO-backend mismatch (snapshot saved as dugite-mem, run configured dugite-lsm)
+  -> "snapshot backend does not match" -> FULL genesis replay instead of fast-start. Real robustness/perf
+  issue (a mithril-import->run cycle always full-replays). The replay itself is clean (no stall/wedge/OOM,
+  ~88% at slot 109M). Once it completes it syncs the ~620-block gap to live tip + soaks. Next wake: confirm
+  tip + clean soak. The engine's broadening keeps finding REAL issues (ledger ep246, now sync/perf #9).
