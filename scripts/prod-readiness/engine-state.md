@@ -153,7 +153,19 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:GAUNTLET-PENDING (AUTHORITATIVE fix). *** FULL
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:FIXING (meta-absent tolerance). *** re-gauntlet
+  w8t0ro3f6 = 3/3 refuted, but refuters DISAGREED -> waiting for the aggregate (wake122) was VINDICATED ***.
+  Resolution (2-of-3 + correct upstream analog): dugite is TOO STRICT — hard-errors on meta-FILE-absent, which
+  REGRESSES legitimate legacy LE snapshot imports. PROOF: dugite's mithril-import is the OFFLINE-conversion analog
+  (upstream SnapshotConversion.getMetadata: MetadataFileDoesNotExist->Nothing->STILL decodes), legacy tvar
+  snapshots predate the meta file (introduced 2025-04-16), and dugite SHIPS a legacy LE fixture + supports the
+  legacy layout. The hard-error fires before from_tables_codec_version(None)=>Little can run. (compounding-feedback
+  cited the ONLINE node-load path which rejects meta-absent — wrong analog for an offline import.) Some(1)=>Big is
+  byte-exact (version added 17min before BE flip, same merge batch). FIX (muscle w5vke699f): meta-absent => None
+  => Little (NOT error), same as field-absent; keep Some(1)=>Big/Some(other)=>Err; cross_validate+safety-net guard
+  the None=>LE path; ADD the missing END-TO-END importer test (legacy dir, no meta => imports as LE). My earlier
+  "error on missing meta" instinct (wake114/119) was too strict — gauntlet corrected it. was:
+  state:GAUNTLET-PENDING (AUTHORITATIVE fix). *** FULL
   VERIFYING PASS wake121 (via byte-exact authoritative path) *** verify10g re-soak (synced 124999612->125098044):
   ZERO phase-1 transaction rejections (MultiAssetNotConserved 0, InputNotFound 0, MissingScriptWitness 0,
   not-found 0, budget 0); import used codec_version=Some(1)->Big (authoritative, NOT heuristic); cross-val no
@@ -493,11 +505,10 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- re-gauntlet w8t0ro3f6 (#10 AUTHORITATIVE fix adversarial refutation, refuterN=3) — /workflows-visible. Poll
-  next wake: pass -> COMMIT the AUTHORITATIVE patch via gh/HTTPS; refuted -> address.
-- verify10g-resoak — STOPPED CLEAN wake121 (FULL PASS: 0 phase-1 rejections; only 281 #15 Error-term).
-  db-clones/preprod-verify10g RETAINED for #15 diagnosis.
-- AUTHORITATIVE #10 fix on MAIN uncommitted (candidate-fix-10-AUTHORITATIVE-codecversion.patch); commit on gauntlet pass.
+- fix-muscle w5vke699f (#10 meta-absent tolerance: missing/field-absent meta => legacy LE not error; end-to-end
+  importer test, Opus, worktree, Tier A') — /workflows-visible. Poll next wake for FIX.
+- re-gauntlet w8t0ro3f6 — DONE 3/3 refuted (refuters disagreed; resolution = tolerate meta-absent as LE).
+- db-clones/preprod-verify10g RETAINED for #15. AUTHORITATIVE patch = base (meta-absent too strict; superseded by remediation).
 - fix-muscle wjnl2t2ib — COMPLETE (authoritative codec-version endianness; addresses all 3 gauntlet refutes).
   patch candidate-fix-10-AUTHORITATIVE-codecversion.patch + worktree wf_fc714d5e-a00-1.
 - re-gauntlet wmpyis3tx — DONE 3/3 REFUTED (drove this rework). db-clones/preprod-verify10f kept for #15.
@@ -840,6 +851,14 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake123 2026-06-07 (notification): re-gauntlet w8t0ro3f6 FULLY COMPLETE = 3/3 refuted BUT refuters DISAGREED on
+  meta-absent -> wake122's WAIT-for-aggregate decision VINDICATED (the lone wake122 refutation said absent=>Err;
+  the 2-of-3 aggregate + correct offline-importer analog says absent=>tolerate-as-LE — OPPOSITE). dugite is TOO
+  STRICT: hard-errors on meta-FILE-absent, regressing legacy LE imports (upstream SnapshotConversion tolerates
+  it; dugite ships a legacy LE fixture). Some(1)=>Big confirmed byte-exact. Reset main, launched remediation
+  muscle w5vke699f (meta-absent=>None=>Little not error; add end-to-end importer test). #10 GAUNTLET-PENDING ->
+  FIXING. LESSONS: (1) my wake114/119 "error on missing meta" was too strict — the gauntlet corrected it; (2)
+  on a NARROW refutation, waiting for the full panel prevented a wrong remediation (the refuters contradicted).
 - wake122 2026-06-07: POLL #10 re-gauntlet w8t0ro3f6 — 1/3 refuters reported (compounding-feedback refuted=TRUE,
   but NARROW). It CONFIRMS the primary path is correct + #10 genuinely resolved (Some(1)=>Big, 0 phase-1) AND
   resolves my wake121 meta-absent concern in the fix's favor (V2-InMemory ALWAYS writes meta w/ codec version;
