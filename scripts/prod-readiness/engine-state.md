@@ -37,7 +37,7 @@
 
 ## In-progress
 - item: #1 ep57 preprod stake-distribution -10 ADA
-- state: ANALYZING (gauntlet REFUTED the apply_utxo_diff fix as INERT for ep57; re-aiming at the LIVE path)
+- state: FIXING (root cause DISAMBIGUATED + code-confirmed: incremental stake_map under-credit via missing ADD)
 - attempts: 1
 - ANALYZE RESULT (w6lsvu2p2, Opus): canonical Haskell active-stake =
   resolveActiveInstantStakeCredentials (Stake.hs @52ef3d5) — per registered+delegated
@@ -80,9 +80,8 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- analyze-muscle  workflow=wo8nuypp6  (Opus, re-aimed at LIVE apply_utxo_changes UTxO-set-content
-  mechanism; engine pre-confirmed both stake_routing fns identical + snapshot=full-rebuild, so the
-  bug is a missing/mis-credited UTxO surfacing as a STAKE_CLAMP underflow for these 2 creds).
+- fix-muscle  workflow=w01lpkz0o  (Opus, worktree) — missing-ADD fix in live stake_map path +
+  per-cred stake instrumentation for byte-exact verify (Koios 9957549164 / 9815680998).
 
 ## VERIFY FINDING (CORRECTED after gauntlet — my wake9 analysis was WRONG)
 - The apply_utxo_diff fix is INERT for ep57. Gauntlet wm055td32 REFUTED 2/3 (haskell-semantics +
@@ -145,3 +144,11 @@
   stake_routing are identical (no routing discrepancy); snapshot is full UTxO-set rebuild -> bug is
   UTxO-set content (a ~5ADA UTxO missing/mis-credited per cred, STAKE_CLAMP underflow). Fired analyze
   wo8nuypp6 to pinpoint the exact live-path defect + enable STAKE_CLAMP logging for targeted re-replay.
+- wake13 2026-06-06T13:15Z: analyze wo8nuypp6 returned a SELF-CONTRADICTORY result (research head:
+  'snapshot omits reward_balance'; root-cause head: 'snapshot folds reward_balance, loss is stake_map
+  clamp'). Engine DISAMBIGUATED from code: epoch.rs:215 total_stake = utxo_stake + reward_balance
+  (reward_balance IS folded -> research head WRONG); snapshot uses the INCREMENTAL stake_map (epoch.rs:187,
+  not rebuild_stake_distribution). So -5 ADA is in utxo_stake (stake_map), under-credited because a
+  Phase-2 subtract clamped (common.rs:202-204 saturating_sub + skip-if-absent). Haskell instant-stake
+  never underflows on a valid chain -> the REAL bug is a MISSING ADD in some output-creation path; the
+  clamp is the symptom. Fired fix muscle with this confirmed non-conflicted target.
