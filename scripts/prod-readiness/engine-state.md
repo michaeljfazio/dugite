@@ -13,7 +13,7 @@
 - ledger.mainnet:   BYTE-EXACT vs Koios — reserves+treasury exact at ep212-221 (doc's +180.4B ep213 divergence GONE on HEAD); replay validating further
 - sync.preprod:     from-genesis REPLAY clean + #9 snapshot-backend fix LANDED + LIVE-SOAK reached tip healthy (wake57): clone db-clones/preprod-soak fast-started via #9 Convertible mem->lsm path (NO genesis replay, utxo_count=4116338), caught up to live tip (node block 4793022 hash-matched koios, 1 block/28s behind live 4793023), 0 panic/0 OOM/0 wedge, RSS 4.8GB, CPU 1.5% idle-at-tip. REMAINING: sustained-window confirm (next wake) + investigate #10 reference-script WARNs (below) which may be a regression in the #9 fast-start path
 - sync.mainnet:     ~ep331 (last known good db-mainnet)
-- phase2.preprod:   BYTE-EXACT (is_valid) — full preprod replay ep0-293 (V1/V2/V3, Alonzo->Babbage->Conway): 0 ValidationTagMismatch, 0 divergence dumps. #22 RESOLVED on HEAD (was 628 stale divergences)
+- phase2.preprod:   BYTE-EXACT (is_valid) on FULL-REPLAY — full preprod replay ep0-293 (V1/V2/V3, Alonzo->Babbage->Conway): 0 ValidationTagMismatch, 0 divergence dumps. #22 RESOLVED on HEAD. OPEN GAP on MITHRIL-FAST-START path: #10 (mod.rs:6411 drops reference-script bytes on import -> ref-input scripts unresolved at tip; ledger-exactness unaffected). Frontier holds for replay; fast-start ref-scripts blocked on #10 fix.
 - phase2.mainnet:   inert until ep507 (V3)
 - perf:             at-tip CPU bounded (15 hot peers); sync ~300 blk/s Byron
 
@@ -95,7 +95,27 @@
    reference-script resolution from converted UTxOs in the Convertible arm). Present on both => genuine
    reference-script-from-UTxO resolution gap independent of snapshot. Cheaper pre-check: dump whether the
    UTxO entry holding script 744837b0a3...  has its reference-script bytes after the mem->lsm conversion.
-   state:NEW attempts:0  (do NOT guess a fix — run the experiment first, this is exactly the #438-class trap)
+   *** ROOT-CAUSED wake58 (NOT a #9 regression — #9 EXPOSED a latent mithril-import gap) ***:
+   Reproduced via Koios tx_info on failing tx 0d325a6e... — it supplies 5 scripts via REFERENCE INPUTS, and
+   the exact hashes dugite reports Missing/not-found (744837b0a3=ref-UTxO f08f73509b0d3b4a#0, d55eb689d8=
+   e2766b4eb2b8d4da#0, ec80112317=44cdaca0dd0fa27a#0, d0adeb2053=cbe7a6c5e9b92eb2#0) are reference scripts
+   held in OLD (pre-snapshot) UTxOs. THE BUG: mithril/haskell-import UTxO loader at
+   crates/dugite-node/src/node/mod.rs:6411 HARD-SETS `script_ref = None` for every output, on the FALSE premise
+   (comment 6406-6410) that "reference scripts are only needed for Phase-2 ... during gap replay" — but
+   ref-script UTxOs created LONG before the snapshot are never re-created in the bounded gap replay, so their
+   script_ref stays None forever -> dugite can't resolve them as reference inputs at the live tip. Before #9 the
+   snapshot was DISCARDED + full-replayed from genesis (rebuilding all script_refs from block data) so it never
+   manifested; #9 made the node USE the snapshot, inheriting script_ref=None. SCOPE: ledger byte-exactness
+   UNAFFECTED (UTxO membership + stake distribution don't need script_ref; phase2.preprod full-replay result
+   stands). It's a phase-2 INDEPENDENT-validation gap SPECIFIC to mithril-fast-start nodes; masked by
+   trust-on-consensus (no wedge), but a real correctness gap (esp. for a block producer / trustless validator).
+   FIX (TWO-PART, exactly 2 crates — within commit limit): (1) dugite-serialization
+   src/mempack/txout.rs::decode_tag5 currently dumps the datum+script tail into opaque_tail (line 466-467) and
+   sets script_ref:None (479) — must PARSE the tail and populate script_ref:Some(raw_bytes) (struct already has
+   the field, line 98); (2) dugite-node mod.rs:6411 — decode MemPackTxOut.script_ref raw bytes into a ScriptRef
+   enum (CBOR script tag 0=Native/1=V1/2=V2/3=V3). VERIFY: re-run the mithril-fast-start soak; the failing slots
+   125081911/125081937/125081958/125082000/125082081 must NO LONGER emit MissingScriptWitness / "script not
+   found for redeemer purpose". Tier A' (phase-2). state:ROOT-CAUSED attempts:0  next:FIX via fix-muscle
 6. [H][ledger] FORK-ROBUSTNESS (elevated M->H, now vindicated): apply_utxo_diff reconstruction didn't
    replay stake_map -> the FORK-INDUCED variant of the ep57 bug. Clean HEAD replay is correct, but a live
    sync hitting a rollback could still corrupt stake. The refuted gauntlet trusted a STALE doc; this IS a
@@ -107,8 +127,11 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #8 NEW (real, found by broad sweep): mainnet ep246 reserves +82,270,482 divergence (Allegra)
-- item: live soak (sync-gate, RAM now 5GB). state:SOAKING — live preprod node (fixed fast-start binary) syncing to tip then soaking; watch stall/wedge/chain_diverged
+- item: #10 (real, phase-2 mithril-fast-start ref-script gap) state:ROOT-CAUSED — mod.rs:6411 drops
+  script_ref on import; two-part fix (decode_tag5 tail-parse + ScriptRef decode). next:FIX via fix-muscle (Tier A')
+- item: #0 ep246 reserves +82,270,482 (Allegra/PV3) state:PARKED-WITH-ROOT-CAUSE — structural member-reward fold
+- item: live soak (sync-gate) state:AT-TIP CONFIRMED — soak node block 4793026 == koios live tip 4793026,
+  sustained ~12min, 0 panic/OOM/wedge, RSS 4.8GB, CPU 1.9% idle-at-tip. Sync-gate live-soak portion HOLDING.
 - attempts: 1
 - ANALYZE RESULT (w6lsvu2p2, Opus): canonical Haskell active-stake =
   resolveActiveInstantStakeCredentials (Stake.hs @52ef3d5) — per registered+delegated
@@ -456,6 +479,17 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake58 2026-06-07: *** #10 ROOT-CAUSED (deviated from stale standing-prompt's #1 ep57, which is RESOLVED per
+  engine-state) ***. (a) Soak node now EXACTLY at tip (block 4793026 == koios live 4793026, sustained ~12min,
+  0 panic/OOM/wedge, 1.9% CPU). (b) Reproduced #10 via Koios tx_info: failing tx 0d325a6e... supplies 5 scripts
+  via REFERENCE INPUTS; the hashes dugite reports Missing (744837b0a3/d55eb689d8/ec80112317/d0adeb2053) are the
+  reference scripts on pre-snapshot UTxOs. ROOT CAUSE = mithril/haskell-import UTxO loader (mod.rs:6411) hard-
+  sets script_ref=None on a FALSE 'only-needed-in-gap-replay' premise; #9 EXPOSED this latent gap (pre-#9 the
+  snapshot was discarded + full-replayed, rebuilding script_refs). Localized the fix: decode_tag5
+  (mempack/txout.rs) dumps the script tail into opaque_tail instead of populating script_ref:Some; + mod.rs:6411
+  must decode those bytes into ScriptRef. Two-part, 2 crates, Tier A'. Ledger byte-exactness UNAFFECTED (membership/
+  stake don't need script_ref). Updated backlog #10 (NEW->ROOT-CAUSED), In-progress, phase2.preprod frontier
+  (annotated mithril-fast-start gap). next wake: FIX via fix-muscle then re-soak to confirm the WARNs are gone.
 - wake57 2026-06-07: *** LIVE-SOAK REACHED TIP HEALTHY (#9 fast-start validated end-to-end) ***. The soak node
   (pid 99162, clone db-clones/preprod-soak) fast-started via the #9 Convertible mem->lsm path (NO genesis
   replay, utxo_count=4116338, 8min elapsed) and caught up to the live preprod tip: node block 4793022 slot
