@@ -153,7 +153,20 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:FIXING (STRICT meta semantics). *** re-gauntlet
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-BUILDING (STRICT). *** muscle
+  wh8n6ip92 COMPLETE wake140, checks_green, 2 crates ***. Strict semantics: from_tables_codec_version ->
+  {Some(1)=>Big, else=>Err}; parse_tables_codec_version -> Result<u64> (field absent/null => Err, mandatory `.:`);
+  added enforce_snapshot_backend_is_utxohd_mem (backend!=utxohd-mem => Err, mirrors loadSnapshot
+  MetadataBackendMismatch); resolve_snapshot_txix_endianness: meta-FILE-absent => bail (no silent LE), enforce
+  backend then version, always Big on success. None unrepresentable from an accepted meta; the LE/auto-detect
+  path is now DEAD for the import decision (Big only). VERIFIED safe: all current target networks (mainnet/preview/
+  preprod PV9-PV11+) ship modern flat-tables meta+version=1 BE snapshots; no network has meta-less legacy-LE ->
+  legacy import path dropped, lenient tests replaced with strict *_is_error. Quotes upstream FromJSON mandatory
+  `.:` + enforceVersion + loadSnapshot backend-guard + unconditional BigEndianTxIx + getMetadata-Nothing-is-CRC.
+  STRICT patch saved candidate-fix-10-STRICT-codecversion.patch (3725 lines, applies clean) + applied to MAIN +
+  build pid 31837 (.jobs/verify-build-10i.log). NEXT WAKE: BUILD_EXIT=0 -> re-import re-soak (preprod=version1=BE,
+  0 phase-1 full rejection-class scan) -> RE-GAUNTLET (strict terminal, rejects all upstream rejects) -> commit.
+  was: state:FIXING (STRICT meta semantics). *** re-gauntlet
   w4007sv2k = 2/3 refuted (haskell-semantics + edge-epoch agree; compounding-feedback ran importer tests
   empirically + did NOT refute) ***. DEFINITIVE truth table (source-cited): FromJSON uses MANDATORY
   `.: tablesCodecVersion` -> present-meta-field-absent/null => MetadataInvalid => HARD ERROR (both converter +
@@ -538,11 +551,12 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- fix-muscle wh8n6ip92 (#10 STRICT meta semantics: only version=1+backend=mem=>BE, else ERROR; abs-path base
-  FINAL2; Opus, worktree, Tier A') — /workflows-visible. Poll next wake for FIX.
-- re-gauntlet w4007sv2k — DONE 2/3 refuted (field-absent must ERROR; meta-absent strict). Drove strict remediation.
+- verify-build-10i  pid 31837  log .jobs/verify-build-10i.log — release build of dugite-node with the STRICT #10
+  fix on MAIN. Poll BUILD_EXIT=0 -> re-import re-verify.
+- fix-muscle wh8n6ip92 — COMPLETE (strict meta; verified legacy-LE drop safe). patch
+  candidate-fix-10-STRICT-codecversion.patch + worktree wf_e4a069c7-99f-1.
 - db-clones/preprod-verify10h RETAINED for #15.
-- Patch history: ...FINAL2(meta-absent too lenient, 2/3 refuted) -> STRICT(version=1-only-BE, current candidate).
+- Patch history: ...FINAL2(too lenient, 2/3 refuted) -> STRICT(version=1+backend-only-BE, else ERROR; current candidate).
 - DISK: 51GB free (db-clones/mainnet-ep213 48G is the big one; GC if mainnet work not imminent).
 - fix-muscle wx76r15y3 — COMPLETE (meta-absent=>LE tolerance + end-to-end tests). patch
   candidate-fix-10-FINAL2-authoritative-metaabsent.patch + worktree wf_a2048ce6-581-1.
@@ -894,6 +908,12 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake140 2026-06-07 (notification): #10 STRICT meta fix COMPLETE (muscle wh8n6ip92, checks_green, 2 crates).
+  from_tables_codec_version={Some(1)=>Big, else=>Err}; field-absent/null=>Err (mandatory `.:`); backend check
+  added; meta-file-absent=>bail. Muscle VERIFIED all current networks ship modern meta+version=1 BE snapshots ->
+  legacy-LE import path safely dropped (lenient tests -> strict *_is_error). Quotes upstream verbatim. Assembled
+  STRICT patch (3725 lines, 2 crates), applied to main, build pid 31837. #10 FIXING -> VERIFYING-BUILDING. next:
+  BUILD_EXIT=0 -> re-soak (0 phase-1) -> re-gauntlet (strict terminal) -> commit. Did NOT commit.
 - wake139 2026-06-07: POLL #10 strict remediation muscle wh8n6ip92 — at the VERY FINAL step (doc tests, after
   fmt/clippy/nextest). Imminent completion. Not disturbed. #10 stays FIXING. next (notif/poll): read FIX ->
   re-import re-soak (modern-BE 0 phase-1) -> re-gauntlet (strict terminal) -> commit.
