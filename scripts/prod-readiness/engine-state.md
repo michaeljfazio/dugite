@@ -33,26 +33,29 @@
 
 ## In-progress
 - item: #1 ep57 preprod stake-distribution -10 ADA
-- state: REPRODUCING (precondition: build epoch-state-debug binary + acquire preprod db)
+- state: ANALYZING (diagnose muscle Workflow w2ci9weas running — localizing vs Koios)
 - attempts: 1
-- next: when both jobs are `done`, wipe snapshot/utxo in db-preprod-sync, launch a
-  from-genesis replay with DUGITE_EPOCH_STATE_DUMP + DUGITE_REWARD_DBG, target ep57,
-  diff stake_distribution vs Koios pool_delegators_history for pool1n84mel6 ep57.
+- reproduced: YES. db-preprod-sync (mithril ep293) cloned -> preprod-ep57, from-genesis
+  replay produced epoch-state dumps ep0..ep62 at epoch-dumps-engine/preprod-ep57/.
+  ep56/57/58 present with stake_snapshot/pools/rewards. Replay SIGTERMed at ep63.
+- next: when diagnose Workflow returns the localized divergence, run analyze (research
+  Haskell source + spec) -> fix (worktree, Tier A) -> VERIFYING replay -> gauntlet.
 
 ## Running jobs
-- build-epoch-debug  pid=7191  log=scripts/prod-readiness/.jobs/build-epoch-debug.log
-  (cargo build --release -p dugite-node --features dugite-ledger/epoch-state-debug)
-- mithril-preprod    pid=7284  log=scripts/prod-readiness/.jobs/mithril-preprod.log
-  (mithril-import magic=1 -> db-preprod-sync; snapshot epoch=293 immutable=5786 ~3.3GB)
+- diagnose-muscle  workflow=w2ci9weas  (Diagnose phase, 3 parallel agents vs Koios)
+  (build-epoch-debug + mithril-preprod completed in wake1/early-wake2; binary built,
+   db-preprod-sync ready at 17G ep293)
 
 ## DB clones on disk
-(none yet — will clone db-preprod-sync after mithril import completes)
+- db-clones/preprod-ep57  (CoW clone of db-preprod-sync; snapshot/haskell-ledger wiped
+  for from-genesis replay; reusable for re-verification)
 
 ## Gauntlet ledger  (passed/refuted approaches — never silently retry a REFUTED)
 (none)
 
 ## Token spend  (rolling; UTC-dated lines)
 - 2026-06-06T11:41Z wake1 ~ build+mithril launch (assess+drive)
+- 2026-06-06T11:52Z wake2 ~ replay reproduce + 2 launch-replay fixes + diagnose Workflow
 
 ## Last node state
 - sampled: 2026-06-06T11:40Z  node_pids="" rss_mb=0 free_disk_gb=205 free_ram_gb=5 jobs=0 halt=false
@@ -63,3 +66,9 @@
   db + the epoch-state-debug binary. DRIVE launched both as background jobs under the heavy-op
   lock (build=CPU, mithril=IO — recorded concurrency: different resource classes, both blocking
   prerequisites). RESCHEDULE ~1200s to let both finish.
+- wake2 2026-06-06T11:52Z (early; prereqs finished fast): REPRODUCE. Found+fixed 2 launch-replay
+  bugs (wipe must remove ledger-snapshot.bin AND haskell-ledger/ import dir, else node loads
+  ep293 state and skips from-genesis replay). Clean from-genesis replay produced dumps ep0..62;
+  ep56/57/58 captured. Fired diagnose muscle Workflow w2ci9weas (/workflows-visible) to localize
+  the ep57 divergence vs Koios. Also committed observability change (diagnose mode routes all
+  analytical work through the muscle for /workflows visibility).
