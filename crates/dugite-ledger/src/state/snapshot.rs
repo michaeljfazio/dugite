@@ -29,10 +29,15 @@
 //! Each snapshot file `foo.bin` is accompanied by a JSON sidecar `foo.meta.json`
 //! that records the UTxO backend used when the snapshot was taken.  On load,
 //! callers use [`check_snapshot_backend_match`] to reject snapshots made with
-//! a different backend before loading the full bincode payload — mirroring
-//! Haskell's `MetadataBackendMismatch` in `InitFailureRead`.  Missing sidecars
-//! are handled via [`infer_backend_from_snapshot`] (back-compat for existing
-//! `db-mainnet` snapshots that pre-date this feature).
+//! a structurally-incompatible backend before loading the full bincode payload
+//! — mirroring Haskell's `MetadataBackendMismatch` in `InitFailureRead`.  The
+//! one asymmetric exception is a `dugite-mem` snapshot loaded under the
+//! `dugite-lsm` backend: its inline UTxOs are *convertible* into the LSM store
+//! at attach time (see [`BackendCheckResult::Convertible`]), so it is loaded
+//! and migrated inline rather than discarded — the dugite analogue of Haskell's
+//! offline `snapshot-converter` (`SnapshotConversion`, mem → LSM).  Missing
+//! sidecars are handled via [`infer_backend_from_snapshot`] (back-compat for
+//! existing `db-mainnet` snapshots that pre-date this feature).
 
 use super::{LedgerError, LedgerState, MAX_SNAPSHOT_SIZE};
 use serde::{Deserialize, Serialize};
@@ -180,11 +185,63 @@ pub fn infer_backend_from_snapshot(state: &LedgerState, db_path: &Path) -> Optio
 pub enum BackendCheckResult {
     /// Backend matches the configured one (or cannot be determined). Safe to use.
     Ok,
-    /// The snapshot was made with a different backend. Must not be loaded.
+    /// The snapshot was made with the in-memory backend (`dugite-mem`, UTxOs
+    /// inline in the `.bin`) but the node is configured for the LSM backend
+    /// (`dugite-lsm`). This asymmetric pair is *convertible at load time*: the
+    /// inline `utxo_set` is migrated into the freshly-opened LSM store by the
+    /// node's existing `attach_utxo_store` drain, so the snapshot can be loaded
+    /// rather than discarded.
+    ///
+    /// This is the dugite analogue of Haskell's offline `snapshot-converter`
+    /// (`Ouroboros.Consensus.Cardano.SnapshotConversion`, which converts a
+    /// `UTxOHDMemSnapshot` to a `UTxOHDLSMSnapshot`). Because dugite's `.bin`
+    /// payload is backend-agnostic (the only structural difference is whether
+    /// `utxo_set` is populated inline), the conversion is performed inline on
+    /// the first `run --utxo-backend lsm` after a `mithril-import` instead of
+    /// forcing a full from-genesis replay.
+    ///
+    /// The reverse pairing (an LSM snapshot under the in-memory backend) is
+    /// **not** convertible at load — those UTxOs live in the adjacent
+    /// `utxo-store/` LSM tree, not inline — and remains a [`Mismatch`].
+    ///
+    /// [`Mismatch`]: BackendCheckResult::Mismatch
+    Convertible {
+        snapshot_backend: SnapshotBackend,
+        configured_backend: SnapshotBackend,
+    },
+    /// The snapshot was made with a different backend and cannot be converted
+    /// at load time. Must not be loaded.
     Mismatch {
         snapshot_backend: SnapshotBackend,
         configured_backend: SnapshotBackend,
     },
+}
+
+/// Classify a concrete `(snapshot_backend, configured_backend)` pair into the
+/// load-time outcome. Centralised so the explicit-sidecar path and the
+/// inference fallback share one rule.
+///
+/// * Equal backends → [`BackendCheckResult::Ok`].
+/// * `DugiteMem` snapshot under a `DugiteLsm` node → [`BackendCheckResult::Convertible`]
+///   (inline UTxOs are drained into the LSM store at attach time).
+/// * Any other unequal pair → [`BackendCheckResult::Mismatch`].
+fn classify_backend_pair(
+    snapshot_backend: SnapshotBackend,
+    configured_backend: SnapshotBackend,
+) -> BackendCheckResult {
+    match (snapshot_backend, configured_backend) {
+        (a, b) if a == b => BackendCheckResult::Ok,
+        (SnapshotBackend::DugiteMem, SnapshotBackend::DugiteLsm) => {
+            BackendCheckResult::Convertible {
+                snapshot_backend,
+                configured_backend,
+            }
+        }
+        _ => BackendCheckResult::Mismatch {
+            snapshot_backend,
+            configured_backend,
+        },
+    }
 }
 
 /// Check whether the meta sidecar's backend matches `configured_backend`.
@@ -197,8 +254,13 @@ pub enum BackendCheckResult {
 /// - The sidecar matches the configured backend.
 /// - No sidecar exists and inference yields the same backend or is indeterminate.
 ///
+/// Returns [`BackendCheckResult::Convertible`] when the snapshot is a
+/// `dugite-mem` snapshot loaded under a `dugite-lsm` node — the inline UTxOs
+/// can be migrated into the LSM store at attach time (see the variant docs).
+///
 /// Returns [`BackendCheckResult::Mismatch`] when the sidecar (or inference)
-/// conclusively identifies a *different* backend from `configured_backend`.
+/// conclusively identifies a *different*, non-convertible backend from
+/// `configured_backend`.
 pub fn check_snapshot_backend_match(
     bin_path: &Path,
     state: &LedgerState,
@@ -208,13 +270,7 @@ pub fn check_snapshot_backend_match(
     // Try explicit sidecar first.
     if let Some(meta) = SnapshotMeta::load(bin_path) {
         if let Some(snap_backend) = SnapshotBackend::from_tag(&meta.backend) {
-            if snap_backend != configured_backend {
-                return BackendCheckResult::Mismatch {
-                    snapshot_backend: snap_backend,
-                    configured_backend,
-                };
-            }
-            return BackendCheckResult::Ok;
+            return classify_backend_pair(snap_backend, configured_backend);
         }
         // Unknown tag string — treat as indeterminate; accept provisionally.
         warn!(
@@ -226,14 +282,9 @@ pub fn check_snapshot_backend_match(
 
     // No sidecar — fall back to inference (back-compat for pre-meta snapshots).
     if let Some(inferred) = infer_backend_from_snapshot(state, db_path) {
-        if inferred != configured_backend {
-            return BackendCheckResult::Mismatch {
-                snapshot_backend: inferred,
-                configured_backend,
-            };
-        }
+        return classify_backend_pair(inferred, configured_backend);
     }
-    // Either inferred matches or could not be determined — accept.
+    // Could not be determined — accept provisionally.
     BackendCheckResult::Ok
 }
 
@@ -763,6 +814,56 @@ mod tests {
             check_snapshot_backend_match(&path, &state, dir.path(), SnapshotBackend::DugiteLsm),
             BackendCheckResult::Ok
         );
+    }
+
+    #[test]
+    fn test_guard_mem_snapshot_under_lsm_is_convertible() {
+        // The mithril-import path always writes a `dugite-mem` snapshot (inline
+        // UTxOs). Loading it under the LSM backend must NOT be a hard mismatch
+        // (which would force a from-genesis replay); it is `Convertible`, and
+        // the node migrates the inline UTxOs into the LSM store at attach time.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger-snapshot.bin");
+        let state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        let view = LedgerStateSnapshot::from(&state);
+        LedgerState::write_snapshot_view_to_path(&view, &path, SnapshotBackend::DugiteMem).unwrap();
+
+        assert!(
+            matches!(
+                check_snapshot_backend_match(&path, &state, dir.path(), SnapshotBackend::DugiteLsm),
+                BackendCheckResult::Convertible {
+                    snapshot_backend: SnapshotBackend::DugiteMem,
+                    configured_backend: SnapshotBackend::DugiteLsm,
+                }
+            ),
+            "a dugite-mem snapshot under the LSM backend must be convertible, not rejected"
+        );
+        // The same mem snapshot under the mem backend is a plain match.
+        assert_eq!(
+            check_snapshot_backend_match(&path, &state, dir.path(), SnapshotBackend::DugiteMem),
+            BackendCheckResult::Ok
+        );
+    }
+
+    #[test]
+    fn test_guard_lsm_snapshot_under_mem_is_hard_mismatch() {
+        // The reverse direction is NOT convertible: an LSM snapshot keeps its
+        // UTxOs in the adjacent `utxo-store/` tree, not inline, so loading it
+        // under the in-memory backend must be a hard mismatch (matches Haskell
+        // `V2/InMemory.hs`, which rejects any non-`UTxOHDMemSnapshot`).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger-snapshot.bin");
+        let state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        let view = LedgerStateSnapshot::from(&state);
+        LedgerState::write_snapshot_view_to_path(&view, &path, SnapshotBackend::DugiteLsm).unwrap();
+
+        assert!(matches!(
+            check_snapshot_backend_match(&path, &state, dir.path(), SnapshotBackend::DugiteMem),
+            BackendCheckResult::Mismatch {
+                snapshot_backend: SnapshotBackend::DugiteLsm,
+                configured_backend: SnapshotBackend::DugiteMem,
+            }
+        ));
     }
 
     #[test]
