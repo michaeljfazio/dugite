@@ -136,17 +136,19 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (real, phase-2 mithril-fast-start ref-script gap) state:VERIFYING-BUILDING — soak SIGTERM'd clean
-  (ep293 snapshot saved, RAM freed); #10 patch APPLIED TO MAIN (uncommitted, working-tree only — commit gated on
-  gauntlet); release build launched bg pid 45661 log .jobs/verify-build-10.log. *** CRITICAL for next wake ***:
-  do NOT reuse db-clones/preprod-soak to verify — it was IMPORTED BY THE OLD BINARY so its on-disk UTxO store
-  already has script_ref=None baked in; loading it with the fixed binary does NOT re-import -> FALSE NEGATIVE.
-  VERIFYING must RE-EXERCISE THE IMPORT PATH with the fixed binary: fresh import from the raw Haskell tables
-  (db-preprod-haskell/db/ledger/<slot>/tables, the same blob the hash-oracle test read) -> confirm the imported
-  UTxO store now has script_ref populated for f08f73509b0d3b4a#0 (-> 744837b0a3...) -> run node -> ref-script
-  txs validate independently / WARNs gone. (The muscle's DUGITE_PREPROD_TABLES-gated unit test already proved
-  the decode at unit level; this end-to-end step confirms the mod.rs:6411 wiring into phase-2 resolution.)
-  was: fix-muscle we0nz74zr COMPLETE (Tier A', checks_green=true, EXACTLY 2 crates: dugite-serialization + dugite-node, 7 files/+732-56).
+- item: #10 (real, phase-2 mithril-fast-start ref-script gap) state:VERIFYING-RESOAK — build DONE (BUILD_EXIT=0,
+  fixed binary target/release/dugite-node @01:37 w/ #10 patch on MAIN uncommitted). DROVE the fresh import with
+  the FIXED binary: cloned db-preprod-sync (had haskell-ledger/ + immutable/, NO dugite snapshot = import state)
+  -> db-clones/preprod-verify10, ran fixed binary (pid 46355, /tmp/engine-verify10.sock, port 4204). Log
+  CONFIRMS the fixed import path ran: "Loading UTxO set from MemPack tables blob ...124999169/tables
+  bytes=887932877" -> "UTxO loading complete utxo_count=4116338 skipped=0" -> "Haskell ledger import complete;
+  native snapshot saved". So script_ref is now decoded via the fixed path. Node syncing from import point slot
+  124999169 toward tip. *** NEXT-WAKE VERIFY (definitive) ***: the previously-failing slots 125081911/125081937/
+  125081958/125082000/125082081 are AHEAD of 124999169, so the node RE-PROCESSES them on the way to tip ->
+  grep verify10-resoak.log for MissingScriptWitness / "script not found for redeemer purpose" at those slots/
+  their tx hashes (578069c6.../0d325a6e...). GONE = #10 end-to-end VERIFIED -> gauntlet -> commit. STILL present
+  = fix incomplete (decode ok at unit level but mod.rs:6411 wiring or phase-2 resolution gap) -> back to FIXING.
+  Direct alt-check: dugite-cli query the imported UTxO f08f73509b0d3b4a#0 for populated script_ref.
   *** HASH-ORACLE PASSED (chain-critical proof, not just green tests) ***: decoded the REAL on-disk preprod
   tables blob — input f08f73509b0d3b4a#0 -> Plutus(lang_tag2->global V3) -> blake2b_224(0x03||body) =
   744837b0a352566983276e1fb256e428d96eab87cc42972261e0c88b EXACT; e2766b4eb2b8d4da#0 -> d55eb689d8... EXACT.
@@ -212,11 +214,13 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- verify-build-10  pid 45661  log .jobs/verify-build-10.log  — release build of dugite-node with #10 patch
-  applied to MAIN (uncommitted). Poll for "BUILD_EXIT=0" -> then VERIFYING re-import (see In-progress #10).
-- fix-muscle we0nz74zr — COMPLETE (hash-oracle PASSED). Fix preserved: candidate-fix-10-mempack-refscript.patch
-  + worktree wf_41bd7059-365-1. Patch now applied to main for the verification build.
-- live-soak — STOPPED CLEAN wake65 (SIGTERM; ep293 snapshot saved, 4118241 UTxOs; gate-2 VALIDATED banked).
+- verify10-resoak  pid 46355  log .jobs/verify10-resoak.log  socket /tmp/engine-verify10.sock port 4204
+  db-clones/preprod-verify10 — FIXED-binary node that RE-IMPORTED (script_ref now decoded), syncing import-point
+  124999169 -> tip. NEXT WAKE: grep for ref-script WARNs at slots 125081911..125082081 (GONE=#10 verified).
+  SIGTERM-only to stop.
+- verify-build-10 — DONE (BUILD_EXIT=0). Fixed binary built. #10 patch still on MAIN uncommitted (gated on gauntlet).
+- fix-muscle we0nz74zr — COMPLETE (hash-oracle PASSED). Patch candidate-fix-10-mempack-refscript.patch + worktree.
+- live-soak — STOPPED CLEAN wake65 (SIGTERM; ep293 snapshot saved; gate-2 VALIDATED banked).
 - replay-measure  pid-file=.jobs/replay-measure.pid  (clean HEAD from-genesis replay climbing past ep93
   toward ep181). TEST: does it hit the original WithdrawalAmountMismatch halt at ep181? If it CROSSES
   ep181 cleanly -> ep57/ep181 RESOLVED on HEAD (prior finding stale); sync.preprod frontier unblocks. If
@@ -522,6 +526,15 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake66 2026-06-07: #10 VERIFYING-BUILDING -> VERIFYING-RESOAK. Build finished BUILD_EXIT=0 (fixed binary).
+  DROVE the fresh import with the fixed binary: db-preprod-sync was already in import-state (haskell-ledger/ +
+  immutable/, no dugite snapshot), so APFS-cloned it -> db-clones/preprod-verify10 and ran the fixed binary
+  (pid 46355). Log CONFIRMS the import path executed ("Loading UTxO set from MemPack tables blob ...124999169/
+  tables 887932877 bytes" -> "complete utxo_count=4116338 skipped=0" -> "Haskell ledger import complete") —
+  so script_ref is now decoded through the fixed decode_tag5 + decode_imported_script_ref. Node syncing from
+  124999169 toward tip; it will RE-PROCESS the previously-failing slots (all > 124999169), which IS the
+  reproduction. Next wake greps verify10-resoak.log for the ref-script WARNs at those slots: GONE = end-to-end
+  verified -> gauntlet -> commit. No competing heavy work (only this node + idle build process exiting).
 - wake65 2026-06-07: START VERIFYING #10. SIGTERM'd the soak cleanly (4s; "Snapshot saved epoch=293, 4118241
   UTxOs" + "Shutdown complete" — ImmutableDB flushed, no corruption); RAM freed. git-apply'd the #10 patch to
   MAIN (applies clean; uncommitted working-tree only — commit still gated on gauntlet). Launched bg release
