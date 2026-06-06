@@ -806,6 +806,11 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake117 2026-06-07: POLL #10 rework muscle wjnl2t2ib — RUNNING, healthy (4GB RAM, no nodes, 0 completed).
+  Implementing authoritative META-derived endianness (test_parse_tables_codec_version_real_preprod_meta added;
+  updating the gated key-correctness oracle to derive endianness from the sibling meta file + cross-validate) ->
+  found a workable meta-based mapping. Not disturbed; no competing work. #10 stays FIXING; next: poll -> build+
+  nextest -> re-import re-verify (0 phase-1 rejections) -> re-gauntlet -> commit.
 - wake116 2026-06-07 (notification): re-gauntlet wmpyis3tx FULLY COMPLETE = UNANIMOUS 3/3 REFUTED (haskell-
   semantics + edge-epoch + compounding-feedback). Confirms wake114's action. haskell-semantics added a CONCRETE
   extra hole for the rework to fix: observe_txix IGNORES index 0 + samples only first 2000 keys -> an
