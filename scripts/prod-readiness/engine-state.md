@@ -153,7 +153,19 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:GAUNTLET-PENDING (CONDITIONAL fix). *** VERIFYING
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:FIXING (ROBUST endianness). *** RE-GAUNTLET
+  wj0pzgzaq REFUTED 2/3 — layout-proxy is WRONG (gauntlet's 2nd correct catch) ***. Upstream history (2 refuters,
+  convergent commit cites): flat-`tables` layout (~oc 0.25.0.0 Apr-2025) and the BE TxIx flip (BigEndianTxIn
+  byteSwap16, commit 9ac9388 Aug-2025) and the flat-tables MOVE (286ad7ec8 Oct-2025) landed in DIFFERENT
+  releases -> layout is NOT a proxy for endianness. Real shipped snapshots exist as flat+LE AND nested+BE, both
+  mis-keyed by the conditional layout mapping (idx1<->256). BE-flip added no version byte; flat-LE vs flat-BE are
+  byte+layout identical -> resolver CANNOT branch on layout. Authoritative disambiguator = snapshot CODEC VERSION
+  (snapshotTablesCodecVersion/TablesCodecVersion1, da3934cf8), layout-independent. DID NOT COMMIT; main reset
+  clean. Launched ROBUST fix-muscle w1m4bxztw: determine endianness by (1) authoritative codec version if
+  accessible, else (2) EMPIRICAL auto-detect from index distribution (version/layout-independent: wrong
+  endianness maps true 1..255 -> multiples of 256), + (3) HARD post-decode sanity assertion (error-loud on
+  mis-key, never silent). Keep multi-asset+refscript+datum carry-over (gauntlet-approved). Oracles on BOTH
+  fixtures + a mis-key-trips-safety-net test. was: state:GAUNTLET-PENDING (CONDITIONAL fix). *** VERIFYING
   PASS wake96 *** conditional-fix re-soak (verify10d, new format=Big) MATCHES the unconditional run: not-found 0,
   budget 0, MissingScriptWitness 0, ~279 Error-term (=#15 residual), 4/5 target slots clean. So conditional fix
   is chain-equivalent for the NEW format (BE) AND fixes the legacy regression (LE, unit-proven via
@@ -387,8 +399,9 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- re-gauntlet wj0pzgzaq (#10 CONDITIONAL fix adversarial refutation, refuterN=3) — /workflows-visible. Poll next
-  wake: pass -> COMMIT the CONDITIONAL patch via gh/HTTPS; refuted -> address.
+- fix-muscle w1m4bxztw (#10 ROBUST endianness: codec-version/empirical auto-detect + safety net, Opus, worktree,
+  Tier A') — /workflows-visible. Poll next wake for FIX (both-fixture oracles + mis-key safety-net test).
+- re-gauntlet wj0pzgzaq — DONE (REFUTED 2/3: layout!=endianness; intermediate flat-LE & nested-BE formats exist).
 - verify10d-resoak — STOPPED CLEAN wake96 (VERIFYING PASS: not-found 0, budget 0, ~279 Error-term=#15).
   db-clones/preprod-verify10d RETAINED (conditional-fix import state) for #15 (277 Error-term) diagnosis.
 - verify10c GC'd. CONDITIONAL #10 fix on MAIN uncommitted (commit on re-gauntlet pass). 94GB disk free.
@@ -714,6 +727,16 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake98 2026-06-07 (notification-triggered): *** RE-GAUNTLET REFUTED 2/3 — gauntlet's SECOND correct catch ***.
+  wj0pzgzaq: 2 refuters (edge-epoch+compounding-feedback) proved layout!=endianness via upstream history (flat-
+  tables and BE-flip in different oc releases months apart; intermediate flat-LE & nested-BE snapshots shipped).
+  My conditional layout-proxy would mis-key those. 3rd refuter (haskell-semantics, refuted=false) corroborated the
+  timeline (called it comment-only) but the 2 are right: intermediate combos exist. DID NOT COMMIT; reset main
+  clean. Relaunched ROBUST fix w1m4bxztw: endianness via codec-version-if-available else empirical auto-detect
+  (index distribution) + hard mis-key safety-net (error-loud, never silent). #10 GAUNTLET-PENDING -> FIXING.
+  LESSON: serialization-format assumptions need upstream-history verification; the gauntlet's adversarial panel
+  caught a subtle version-vs-layout conflation twice. #10 is deep (28 wakes) but every gauntlet catch was a REAL
+  correctness bug avoided. Empirical auto-detect makes the fix version-independent -> gauntlet-proof by construction.
 - wake97 2026-06-07: POLL #10 re-gauntlet wj0pzgzaq — RUNNING (3 refuters active, 0 completed; 5GB RAM, no
   nodes). Adversarially probing the CONDITIONAL fix (layout=>endianness mapping completeness/reliability,
   default-Big-on-legacy, carry-over integrity). Not disturbed; no competing work. #10 stays GAUNTLET-PENDING;
