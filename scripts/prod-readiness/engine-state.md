@@ -127,7 +127,7 @@
   non-Phase-5 output-creation path / an era-boundary path. The next ANALYZE/FIX targets THAT.
 
 ## Active job
-- analyze-muscle  workflow=w93yngoj8  (Opus, diagnosing ep246 reserves +82.27M via haskell-ledger-cross-validation)
+- fix-muscle  workflow=whr4t971m  (Opus, pinpoint+fix ep246 deltaR1 + RUPD-component dump for byte-exact verify)
 - replay-mainnet  pid-file=.jobs/replay-mainnet.pid  (mainnet from-genesis replay, db-mainnet clone,
   4-cred filter, DUGITE_EPOCH_STATE_DUMP=epoch-dumps-engine/mainnet-ep213). Climbing through Byron->ep214.
   CAUTION: free_ram=1GB at launch -> watch for OOM. When at ep213+: diff dugite reserves/treasury vs
