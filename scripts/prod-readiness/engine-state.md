@@ -153,7 +153,12 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-BUILDING (STRICT). *** muscle
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-RESOAK (STRICT). Build DONE
+  (BUILD_EXIT=0). DROVE re-verify: cloned db-preprod-sync -> verify10i, ran STRICT binary (pid 32304, port 4212).
+  Import log: "(strict: only version 1 => big-endian is accepted) codec_version=1 txix_endianness=Big", sane
+  distribution, utxo_count=4116338 skipped=0. Node syncing 124999169->tip. NEXT WAKE FULL-VERDICT: scan ALL
+  rejection classes -> 0 phase-1 -> RE-GAUNTLET (strict terminal) -> commit. GC'd verify10h (disk 38GB -> GC
+  aggressively next: mainnet-ep213 48G if mainnet not imminent). was: state:VERIFYING-BUILDING (STRICT). *** muscle
   wh8n6ip92 COMPLETE wake140, checks_green, 2 crates ***. Strict semantics: from_tables_codec_version ->
   {Some(1)=>Big, else=>Err}; parse_tables_codec_version -> Result<u64> (field absent/null => Err, mandatory `.:`);
   added enforce_snapshot_backend_is_utxohd_mem (backend!=utxohd-mem => Err, mirrors loadSnapshot
@@ -551,8 +556,10 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- verify-build-10i  pid 31837  log .jobs/verify-build-10i.log — release build of dugite-node with the STRICT #10
-  fix on MAIN. Poll BUILD_EXIT=0 -> re-import re-verify.
+- verify10i-resoak  pid 32304  log .jobs/verify10i-resoak.log  socket /tmp/engine-verify10i.sock port 4212
+  db-clones/preprod-verify10i — STRICT-fix node (codec_version=1->Big, strict), syncing. NEXT WAKE FULL-VERDICT:
+  scan ALL rejection classes (0 phase-1 expected). SIGTERM-only. Retain for #15.
+- verify-build-10i — DONE (BUILD_EXIT=0). STRICT #10 fix on MAIN uncommitted (gated on re-verify+re-gauntlet).
 - fix-muscle wh8n6ip92 — COMPLETE (strict meta; verified legacy-LE drop safe). patch
   candidate-fix-10-STRICT-codecversion.patch + worktree wf_e4a069c7-99f-1.
 - db-clones/preprod-verify10h RETAINED for #15.
@@ -908,6 +915,11 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake141 2026-06-07: #10 VERIFYING-BUILDING -> VERIFYING-RESOAK. STRICT build BUILD_EXIT=0. Cloned
+  db-preprod-sync -> verify10i, ran STRICT binary (pid 32304): import "(strict: only version 1 => big-endian
+  accepted) codec_version=1 txix_endianness=Big", sane distribution, utxo_count=4116338 skipped=0. Node syncing.
+  GC'd verify10h (disk 38GB). Deferred full-verdict grep (one-step). next: scan ALL rejection classes -> 0 phase-1
+  -> re-gauntlet -> commit.
 - wake140 2026-06-07 (notification): #10 STRICT meta fix COMPLETE (muscle wh8n6ip92, checks_green, 2 crates).
   from_tables_codec_version={Some(1)=>Big, else=>Err}; field-absent/null=>Err (mandatory `.:`); backend check
   added; meta-file-absent=>bail. Muscle VERIFIED all current networks ship modern meta+version=1 BE snapshots ->
