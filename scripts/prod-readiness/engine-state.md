@@ -922,6 +922,21 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake143 2026-06-07: POLL #10 re-gauntlet w3upqlq0y — 2/3 reported, QUALITATIVELY DIFFERENT (no endianness
+  refutation). compounding-feedback refuted=TRUE but CONFIRMS the endianness/backend/version truth table is
+  byte-exact; it refutes only the OVERCLAIM "rejects everything upstream rejects" because dugite skips the
+  snapshotChecksum/CRC check upstream loadSnapshot does (crcOfConcat==snapshotChecksum -> ReadSnapshotData
+  Corruption) -> a valid-meta-but-corrupt-tables snapshot is accepted; ALSO notes cross_validate is LIVE not
+  dead. It RECOMMENDS filing the CRC gap separately. edge-epoch refuted=FALSE ("no case produces a WRONG import
+  on a real network"); found only a fail-CLOSED over-strict edge (rejects float-form 1.0/1e0 that Aeson floors to
+  1; unreachable since ToJSON emits integer 1 + Mithril delivers verbatim). 3rd refuter (haskell-semantics)
+  converging on the same float-edge. SETTLED RESOLUTION (regardless of 3rd's label): the #10 endianness fix is
+  byte-exact correct -> (1) tone down the overclaim comment to "endianness decision byte-exact" + fix the "dead
+  code" wording (cross_validate is live); (2) FILE the CRC-verification gap as NEW #17 (corrupt-snapshot
+  acceptance; integrity, separate from #10's TxIx scope; dugite import never verified CRC); (3) file the
+  float-form Word8 parse as minor #18 (floor integral JSON numbers per Aeson parseIntegralFromScientific); (4)
+  COMMIT the endianness fix. WAITING for the 3rd refuter per the wake122/132 lesson before executing. #10 stays
+  GAUNTLET-PENDING.
 - wake142 2026-06-07: *** #10 FULL VERIFYING PASS (STRICT) *** verify10i re-soak: 0 phase-1 transaction
   rejections (all classes), strict codec_version=1->Big, only 294 #15 Error-term. Synced past all failing slots.
   SIGTERM'd verify10i (kept db for #15), GC'd mainnet-ep213 (re-clonable). Launched RE-GAUNTLET w3upqlq0y on the
