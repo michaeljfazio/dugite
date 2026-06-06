@@ -153,7 +153,15 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-BUILDING (AUTHORITATIVE fix). ***
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-RESOAK (AUTHORITATIVE fix). Build DONE
+  (BUILD_EXIT=0). DROVE re-verify: cloned db-preprod-sync -> verify10g, ran AUTHORITATIVE binary (pid 24240, port
+  4210). Import log CONFIRMS the authoritative path: "Authoritatively determined MemPack TxIx endianness from
+  snapshot meta tablesCodecVersion codec_version=Some(1) txix_endianness=Big" (NOT auto-detect); cross-validation
+  distribution sane (low 3131782 vs mult256 62, no contradiction); utxo_count=4116338 skipped=0. Node syncing
+  124999169->tip. NEXT WAKE FULL-VERDICT: scan ALL rejection classes -> 0 phase-1 rejections (MultiAssetNotConserved
+  0, not-found 0, budget 0, no new class) -> RE-GAUNTLET (authoritative codec-version, error-on-ambiguity,
+  independent cross-val) -> commit. GC'd verify10f (verify10g supersedes for #15). was:
+  state:VERIFYING-BUILDING (AUTHORITATIVE fix). ***
   rework muscle wjnl2t2ib COMPLETE wake119, checks_green, addresses ALL 3 gauntlet refutations, 2 crates ***.
   UPSTREAM PROOF (resolves wake115): Ouroboros.Consensus...Snapshots `data TablesCodecVersion=TablesCodecVersion1`
   Haddock LITERALLY "Used in cardano-node 10.7. Previous versions have no codec version. [(txid, big-endian
@@ -478,9 +486,10 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- verify-build-10g  pid 23735  log .jobs/verify-build-10g.log — release build of dugite-node with the
-  AUTHORITATIVE #10 fix (codec-version endianness + error-on-ambiguity + independent cross-val) on MAIN.
-  Poll BUILD_EXIT=0 -> re-import re-verify.
+- verify10g-resoak  pid 24240  log .jobs/verify10g-resoak.log  socket /tmp/engine-verify10g.sock port 4210
+  db-clones/preprod-verify10g — AUTHORITATIVE-fix node (meta codec_version=Some(1)->Big, cross-val sane), syncing.
+  NEXT WAKE FULL-VERDICT: scan ALL rejection classes (0 phase-1 expected). SIGTERM-only. Retain for #15.
+- verify-build-10g — DONE (BUILD_EXIT=0). AUTHORITATIVE #10 fix on MAIN uncommitted (gated on re-verify+re-gauntlet).
 - fix-muscle wjnl2t2ib — COMPLETE (authoritative codec-version endianness; addresses all 3 gauntlet refutes).
   patch candidate-fix-10-AUTHORITATIVE-codecversion.patch + worktree wf_fc714d5e-a00-1.
 - re-gauntlet wmpyis3tx — DONE 3/3 REFUTED (drove this rework). db-clones/preprod-verify10f kept for #15.
@@ -823,6 +832,12 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake120 2026-06-07: #10 VERIFYING-BUILDING -> VERIFYING-RESOAK. AUTHORITATIVE-fix build BUILD_EXIT=0. Cloned
+  db-preprod-sync -> verify10g, ran AUTHORITATIVE binary (pid 24240): import log confirms "Authoritatively
+  determined ... from snapshot meta tablesCodecVersion codec_version=Some(1) txix_endianness=Big" (NOT
+  auto-detect) + cross-val sane (no contradiction). utxo_count=4116338 skipped=0. Node syncing. GC'd verify10f
+  (66GB disk). Deferred full-verdict grep (one-step). next: scan ALL rejection classes -> 0 phase-1 -> re-gauntlet
+  -> commit.
 - wake119 2026-06-07 (notification): #10 AUTHORITATIVE endianness fix COMPLETE (muscle wjnl2t2ib, Tier A',
   checks_green). Resolved wake115: upstream Haddock proves TablesCodecVersion1 = "big-endian txix" (cardano-node
   10.7+; absent=legacy LE; else ERROR) — version IS authoritative despite the BE-flip commit not bumping it
