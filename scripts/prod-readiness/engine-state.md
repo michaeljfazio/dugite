@@ -18,7 +18,19 @@
 - perf:             at-tip CPU bounded (15 hot peers); sync ~300 blk/s Byron
 
 ## Backlog  (ranked by impact; one advanced per wake)
-0. [H][ledger][REAL-CURRENT] mainnet ep246 reserves +82,270,482 / treasury -55,269 divergence (Allegra,
+0. [H][ledger][REAL-CURRENT, ROOT-CAUSED] mainnet ep246 reserves +82,270,482 / treasury -55,269. STRUCTURAL
+   ROOT CAUSE (deep-dive wuc2kqb1z): the member-reward fold (rewards.rs:445-490) iterates go.delegations +
+   separate go.stake_distribution.get(cred) lookup, whereas Haskell folds a SINGLE resolved active-stake VMap
+   (resolveActiveInstantStakeCredentials) where swdStake = UTxO instant-stake <> reward-account balance and
+   stake+delegation are bundled. When the two dugite maps disagree for a cred (e.g. stake_distribution per-cred
+   value omits the reward-balance that pool_stake aggregated, or an ordering skew), dugite under-credits that
+   member -> undistributed -> reserves (+82.27M; +55K treasury via shifted frTotalUnregistered partition).
+   RULED OUT byte-exact: deltaR1/d/rho/tau, the prefilter (all drops correctly-deregistered), member_stake==0
+   skip, leader/operator reward, SNAP-before-MIR ordering. FIX (discrete, careful, Tier A): build the member
+   iteration from a single resolved active-stake source matching resolveActiveInstantStakeCredentials, then
+   byte-exact verify reserves==Koios 12880948865137767 at ep246 + confirm ep209-245 unregressed. Haskell:
+   RewardUpdate.hs:201-279 rewardStakePoolMember, Rewards.hs:261-282 rewardOnePoolMember, Stake.hs resolve...
+   PARKED pending a focused fix session. state:PARKED-WITH-ROOT-CAUSE attempts:3
    PV3). FIRST divergence at ep246 (ep209-245 byte-exact); persists/amortizes ep246-250 (replay at ep262).
    dugite took ~82.27M LESS from reserves at the ep245->246 reward transition. Found by broad Koios sweep
    (NOT in the stale docs). state:ANALYZING. Likely: reward-pot/reserves-expansion (rho) / undistributed-
@@ -65,7 +77,7 @@
 
 ## In-progress
 - item: #8 NEW (real, found by broad sweep): mainnet ep246 reserves +82,270,482 divergence (Allegra)
-- state: ANALYZING (deep-dive) — deep-dive muscle wuc2kqb1z pinpointing under-paid member/path from per_credential dumps + Koios (last shot before park+broaden)
+- state: PARKED-WITH-ROOT-CAUSE — structural cause identified (two-map keying in member-reward fold); fix is a discrete careful task; BROADENING validation
 - attempts: 1
 - ANALYZE RESULT (w6lsvu2p2, Opus): canonical Haskell active-stake =
   resolveActiveInstantStakeCredentials (Stake.hs @52ef3d5) — per registered+delegated
@@ -346,3 +358,11 @@
   per_credential WITH reward per cred) + all ruled-out findings. If it can't crack it -> PARK ep246 as a
   thoroughly-characterized REAL open bug and BROADEN validation (later mainnet eras ep300+/Conway, phase2,
   sync, perf) to maximize bug-discovery coverage (higher production-readiness value than one 82-ADA bug).
+- wake43 2026-06-06T15:?? : deep-dive wuc2kqb1z ROOT-CAUSED ep246 (structural: two-map keying in the member-
+  reward fold; Haskell uses one resolved active-stake VMap with swdStake=UTxO<>reward_balance). Ruled out 5
+  hypotheses byte-exact. This is the engine's deepest real find: a genuine byte-exactness bug root-caused to a
+  precise mechanism + Haskell source, even if the structural fix is a discrete careful task. PARKED with full
+  root cause; reverted DROP_TRACE diagnostic from main. BROADENING: next wakes validate other frontiers (later
+  mainnet eras ep300+/Babbage/Conway, phase2 #22 on db-preprod-sync, sync soak) to maximize byte-exact coverage
+  and check whether the two-map keying manifests elsewhere. NET so far: preprod byte-exact all eras; mainnet
+  byte-exact ep209-245 + ep247-318 (the one ep246 divergence root-caused).
