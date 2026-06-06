@@ -894,6 +894,9 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake139 2026-06-07: POLL #10 strict remediation muscle wh8n6ip92 — at the VERY FINAL step (doc tests, after
+  fmt/clippy/nextest). Imminent completion. Not disturbed. #10 stays FIXING. next (notif/poll): read FIX ->
+  re-import re-soak (modern-BE 0 phase-1) -> re-gauntlet (strict terminal) -> commit.
 - wake138 2026-06-07: POLL #10 strict remediation muscle wh8n6ip92 — in VERIFY phase (serialization clippy clean,
   running node clippy then nextest). Near completion. Not disturbed. #10 stays FIXING. next (notif/poll): read FIX
   -> re-import re-soak (modern-BE 0 phase-1) -> re-gauntlet (strict terminal) -> commit.
