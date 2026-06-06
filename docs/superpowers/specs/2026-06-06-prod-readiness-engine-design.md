@@ -1,8 +1,18 @@
 # Production-Readiness Engine — Design
 
 **Date:** 2026-06-06
-**Status:** Approved (design); pending implementation plan
+**Status:** Approved (design); self-review revision applied; pending implementation plan
 **Author:** Ralph loop (brainstormed with Michael Fazio)
+
+> **Self-review revision (2026-06-06):** seven design flaws found and fixed —
+> (1) the synchronous-Workflow fallacy (items are now multi-wake state machines;
+> reproduce/verify are out-of-band, polled across wakes), (2) session-bound
+> scheduling (added `CronCreate` durable substrate), (3) unbounded mainnet gate
+> (replaced binary gates with an advancing-frontier model), (4) missing kill
+> switch (halt sentinel), (5) no token-budget governor (added), (6) phase-2
+> tiering gap (added Tier A′ for ScriptContext schema), (7) node-kill thrash +
+> heavy-op contention (anti-thrash policy + single heavy-op lock). Plus
+> Git/GitHub rules: all ops via `gh`, push over HTTPS, never SSH.
 
 ## Purpose
 
@@ -21,30 +31,62 @@ already exists in this repo (the `haskell-ledger-cross-validation` and
 
 ## Execution model
 
-A **perpetual self-pacing loop** driven by `ScheduleWakeup` (dynamic mode).
-Each wake runs exactly **one iteration** then reschedules. The heavy parallel
-work of an iteration is delegated to a scoped `Workflow` (the *muscle*).
-Long-running node processes (syncs, replays, soaks) run **out-of-band** as
-background processes; the loop observes and steers them but never blocks a
-turn waiting on them.
+A **perpetual self-pacing loop**. Each wake runs exactly **one iteration** then
+reschedules. The in-turn analysis/fix work of an iteration is delegated to a
+scoped `Workflow` (the *muscle*). Long-running node processes (syncs, replays,
+soaks) run **out-of-band** as background processes; the loop observes and steers
+them across wakes but never blocks a turn waiting on them.
+
+### Scheduler substrate: ScheduleWakeup vs Cron
+- **`ScheduleWakeup` (dynamic mode)** — in-session. Simple, but **session-bound**:
+  if the conversation ends, the loop stops. Use for an attended run.
+- **`CronCreate` (remote scheduled agent)** — **durable across sessions/days/host
+  restarts**. The engine's true "perpetual" form re-launches itself on a cron
+  cadence, reading `engine-state.md` as its only memory. Recommended for an
+  unattended multi-day drive. The two are interchangeable because **all
+  cross-wake state lives in `engine-state.md`, never in conversation context** —
+  a fresh cron invocation reconstructs full working state from that file.
+
+### An "item" is a multi-wake state machine, NOT one synchronous pass
+A backlog item's lifecycle spans **several wakes**, because reproduce/verify are
+node runs that outlive any single turn. The loop advances each item through:
+```
+  NEW → REPRODUCING (launch replay bg, poll across wakes)
+      → ANALYZING   (dump ready → Workflow muscle: research + root-cause)
+      → FIXING      (Workflow muscle: patch in worktree)
+      → VERIFYING   (launch verify-replay bg, poll across wakes)
+      → GAUNTLET    (Workflow muscle: refutation panel over the verified result)
+      → DONE | BLOCKED | REFUTED(→back to ANALYZING)
+```
+Only ANALYZING / FIXING / GAUNTLET run inside a synchronous Workflow. REPRODUCING
+and VERIFYING are out-of-band background jobs the loop launches once and **polls**
+on later wakes — it does not sit in a turn waiting for them.
 
 ```
-ScheduleWakeup (dynamic, perpetual)
-  └─ each wake = ONE iteration:
-       1. ASSESS     read engine-state.md + sample node health + gate status
-       2. SCHEDULE   pick highest-impact gap whose harness FITS resources
-       3. DRIVE      spawn Workflow(muscle): research → reproduce → fix → gauntlet
-       4. RECORD     rewrite engine-state.md
-       5. RESCHEDULE ScheduleWakeup(next), cadence tuned to what it waits on
-  └─ terminates only when all 4 gates green; else perpetual (stop anytime)
+each wake = ONE step of the active item's state machine:
+  1. ASSESS     read engine-state.md + sample node health + gate status
+                + CHECK HALT SENTINEL
+  2. SCHEDULE   advance current item, OR pick highest-impact gap that FITS
+                resources + token budget
+  3. DRIVE      run the phase appropriate to the item's state (launch/poll a
+                bg replay, OR spawn a Workflow for analysis/fix/gauntlet)
+  4. RECORD     rewrite + COMMIT engine-state.md (git audit trail)
+  5. RESCHEDULE next wake, cadence tuned to what it waits on
+gate model: advance a continuously-verified FRONTIER (not binary green);
+            run perpetually until all 4 frontiers reach tip; stop on sentinel
 ```
 
 ## The five iteration phases
 
 ### 1. ASSESS
+- **Check the halt sentinel FIRST.** If `engine-state.md` carries `HALT: true`
+  (or a `.engine-halt` file exists), finish recording and do **not** reschedule
+  — clean stop between iterations, no mid-replay kill. This is the kill switch.
 - Read `engine-state.md` (durable backlog + cross-wake memory).
 - Sample live node(s): tip, stall-watch, `chain_diverged`, `ledger_tip` vs
-  `immutable_tip`, blk/s, process RSS.
+  `immutable_tip`, blk/s, process RSS, free system RAM.
+- Poll any out-of-band job launched on a prior wake (a REPRODUCING/VERIFYING
+  replay): is it still running, finished, or wedged? Advance its item's state.
 - Pull fresh gate status: latest epoch-diff dump, last conformance run, open
   `prod-readiness`/`epoch-diff` GitHub issues.
 - Detect *new* divergences (a sync halt / `WithdrawalAmountMismatch` becomes a
@@ -52,37 +94,58 @@ ScheduleWakeup (dynamic, perpetual)
 - **Never SIGKILL** — SIGTERM only. `pkill -9` corrupts the append-only
   ImmutableDB and causes permanent deadlock.
 
-### 2. SCHEDULE (resource- AND impact-aware)
-- Rank open gaps by impact.
-- Filter by *fit*: a gap needing a from-genesis replay cannot be picked while
-  a live node holds the RAM (live preprod node ≈ 7.5 GB RSS leaves ≈ 2.5 GB
-  free — heavy replay cannot run concurrently). The scheduler either:
-  - (a) picks an **analysis-only** item that fits current resources, or
-  - (b) if the top item needs the resource and is worth it, cleanly
-    **SIGTERMs** the live node (writes a clean v21 snapshot → fast restart
-    later) to free RAM, exactly as `POST-HOLD-PLAN.md` prescribes.
-- Exactly **one item per iteration**.
+### 2. SCHEDULE (resource-, impact-, AND budget-aware)
+- If the current item is mid-state-machine, default to **advancing it** rather
+  than starting a new one (avoid leaving replays/worktrees half-done).
+- Otherwise rank open gaps by impact, then filter by **three** constraints:
+  - **Token budget** — if the per-day budget is near-exhausted, prefer a
+    cheap analysis/poll step or extend the wake cadence; never start a fresh
+    fan-out Workflow when the budget can't cover it. (See Budget governor.)
+  - **Heavy-op lock** — at most **one** heavy local operation (cargo build,
+    replay, sync) runs at a time, guarded by a `.engine-heavyop.lock`. An item
+    needing a heavy op that's already held waits; the loop picks a lock-free
+    item instead.
+  - **RAM fit** — a from-genesis replay cannot run while a live node holds the
+    RAM (live preprod node ≈ 7.5 GB RSS leaves ≈ 2.5 GB free). The scheduler:
+    - (a) picks an **analysis-only / lock-free** item that fits, or
+    - (b) only if the top item strictly dominates, cleanly **SIGTERMs** the
+      live node (clean v21 snapshot → fast restart) to free RAM.
+- **Anti-thrash policy:** never SIGTERM a node that is *actively advancing a
+  gate frontier* (sync climbing, soak accruing clean minutes) merely to free
+  RAM for a lower- or equal-impact replay. Record the dominance decision +
+  the frontier cost in `engine-state.md`; if a kill would regress a green-ish
+  gate, defer the replay until the node next reaches a natural checkpoint.
+- Exactly **one item advanced per iteration**.
 
-### 3. DRIVE
-Spawn a scoped `Workflow` for the picked item. Internal shape varies by gap
-class (see Playbooks) but always:
-- **Research** — `cardano-*-oracle` for canonical `IntersectMBO/cardano-ledger`
-  Haskell source + ledger-spec citation. **Read the in-project
-  `.claude/skills/haskell-ledger-cross-validation/references/era-rules/*.md`
-  files FIRST** (they cover most ledger-rule questions with verbatim Haskell +
-  permalinks before any live oracle query).
-- **Reproduce** — APFS-clone the relevant db (`cp -Rc`, copy-on-write so the
-  live sync db is untouched), targeted replay/dump with instrumentation, diff
-  vs Koios / `cardano-cli debug log-epoch-state`.
-- **Fix** — in a git worktree for isolation (`worktree` isolation in the
-  Workflow, or the `validate-runner` worktree convention).
-- **Gauntlet** — Section "Verification gauntlet". Commit + push **iff** all
-  checks pass.
+### 3. DRIVE — run the phase appropriate to the item's STATE
+The action depends on which state-machine state the item is in (not one fixed
+synchronous pass):
+
+- **REPRODUCING / VERIFYING (out-of-band, loop-owned):** acquire the heavy-op
+  lock, APFS-clone the relevant db (`cp -Rc`, copy-on-write so the live sync db
+  is untouched), launch the instrumented replay/dump as a **background** job,
+  record its PID + log path, and return. On later wakes, **poll** it (ASSESS);
+  when the dump is ready, diff vs Koios / `cardano-cli debug log-epoch-state`
+  and advance the state. Release the lock when the job ends.
+- **ANALYZING / FIXING / GAUNTLET (in-turn, Workflow muscle):** spawn a scoped
+  `Workflow`. Shape varies by gap class (see Playbooks):
+  - **Research** — `cardano-*-oracle` for canonical `IntersectMBO/cardano-ledger`
+    Haskell source + ledger-spec citation. **Read the in-project
+    `.claude/skills/haskell-ledger-cross-validation/references/era-rules/*.md`
+    files FIRST** (verbatim Haskell + permalinks, before any live oracle query).
+  - **Fix** — in a git worktree for isolation (`worktree` isolation in the
+    Workflow, or the `validate-runner` worktree convention).
+  - **Gauntlet** — runs over the *already-produced* verify-replay result from
+    the VERIFYING state. Commit + push **iff** all gauntlet checks pass (push
+    over HTTPS via `gh` auth — see Git/GitHub rules).
 
 ### 4. RECORD
-Rewrite `engine-state.md`: move the item to done/blocked/in-progress, bump
+Rewrite **and commit** `engine-state.md`: move the item to its new state, bump
 attempt count, capture root-cause + evidence links, update last-known
-node/replay state and which db-clones currently exist on disk.
+node/replay state and which db-clones currently exist on disk, and append the
+token spend for this wake. **Committing each wake** gives a git audit trail and
+makes the state recoverable if a rewrite is interrupted — the file is the
+engine's whole memory, so it is never left only in working-tree limbo.
 
 ### 5. RESCHEDULE
 Pick the next wake delay from what it waits on:
@@ -107,11 +170,25 @@ to the backlog with the failure recorded:
    window reproduces Koios / `cardano-cli debug log-epoch-state` with the
    divergence gone. **Tests passing is explicitly NOT sufficient** (the #438
    lesson: tests get rewritten to match wrong behavior).
-4. **Adversarial refutation panel** — N independent skeptic agents each try to
-   *refute* the fix from a distinct lens (Haskell-semantics, edge-epoch,
+4. **Adversarial refutation panel** — `N` independent skeptic agents each try
+   to *refute* the fix from a distinct lens (Haskell-semantics, edge-epoch,
    compounding-feedback, integer-rounding). Majority-refute → rejected.
+   Default `N = 3` (majority = 2); tunable in `engine-state.md`.
 
-### Tier B — non-ledger (perf, network, CLI-format, decoder, tests, docs)
+### Tier A′ — phase-2 / ScriptContext schema fixes
+A wrong `ScriptContext` field can make a script pass `is_valid` *by luck*, so
+phase-2 schema changes (`script_context.rs`, `populate_v1_v2.rs`, cost models)
+get a Tier-A-strength gate, adapted:
+1. **Oracle Haskell-source match** — the field encoding/order matches the
+   canonical Plutus `ScriptContext`/`TxInfo` builder.
+2. **Field-diff vs a Haskell ScriptContext dump** — not just `is_valid` parity:
+   the reconstructed context matches Haskell field-by-field for the repro case.
+3. **`phase2_repro` reproduces byte-exact ExBudget + `is_valid`** across the
+   bucket's representatives (budget / Error / unIData classes).
+4. **Refutation panel** as Tier A (lens set: schema-nesting, era-fallback,
+   builtin-cost, data-encoding).
+
+### Tier B — other non-ledger (perf, network, CLI-format, decoder, tests, docs)
 `fmt + clippy --all-targets -D warnings + nextest` all green + one focused
 verifier agent + the relevant devnet/soak harness shows no regression.
 
@@ -136,40 +213,83 @@ not reinvent.
   (stale-binary rule); rebuild before re-test.
 - Health-check cadence ≤ 10 min during active node runs.
 
-## Readiness gates (definition of done)
+### Git/GitHub rules (encoded in the loop)
+- **All GitHub operations go through the `gh` CLI** — issues, PR creation/
+  review, releases, status, API reads. Never raw GitHub web/API flows that need
+  separate auth.
+- **Push over HTTPS using `gh` credentials, never an SSH remote.** The engine
+  is unattended, so an interactive SSH key authorization would wedge it. Ensure
+  the `origin` remote is HTTPS and `gh auth` is the credential helper before the
+  first push; if `origin` is SSH, the loop switches it to HTTPS (or pushes to an
+  HTTPS-configured remote) rather than prompting.
+- Focused commits only: stage explicit filenames (no `git add -A` / `-a`); keep
+  each commit within ≤ 2 crates (`DUGITE_PRECOMMIT_STRICT=1` for the agent run).
+- Work happens off `main` on a feature branch; integration via `gh pr` when a
+  fix is gauntlet-green.
 
-All four must be green, with evidence in `engine-state.md`, for the engine to
-declare production-ready:
+## Readiness gates — the FRONTIER model (definition of done)
 
-1. **Ledger byte-exactness** — per-epoch reward/treasury/reserves/fees/
-   deposits/snapshots/pool-state/governance byte-exact vs Haskell + Koios
-   across full preprod AND mainnet history; zero `WithdrawalAmountMismatch`
-   halts.
-2. **Live sync to tip (both nets)** — from-genesis full-validation sync to
-   current tip on preprod AND mainnet, then a sustained at-tip soak with no
-   stall / wedge / `chain_diverged`, `ledger_tip == immutable_tip`, correct
-   fork handling.
-3. **Phase-2 / UPLC exactness** — every on-chain redeemer (V1/V2/V3) evaluates
-   with byte-exact ExBudget + `is_valid` agreement vs Haskell across all
-   captured mainnet/preprod redeemers.
-4. **Performance & robustness** — acceptable sync throughput, bounded at-tip
-   CPU/mem, security-audit findings closed, adversarial inputs rejected (not
-   crashed), clean SIGTERM snapshot/restart.
+Each gate is tracked as a **continuously-advancing verified frontier**, not a
+binary flag. "Byte-exact across full mainnet history" is days of compute and
+can regress as the chain grows, so the honest measure is *how far the verified
+frontier has advanced, with zero open divergence behind it*. The engine's job
+each iteration is to **advance a frontier or close a divergence behind one**.
 
-Until all four are green the loop runs perpetually; it can be stopped at any
+Frontier per gate (recorded with evidence in `engine-state.md`):
+
+1. **Ledger byte-exactness** — "byte-exact vs Haskell + Koios through epoch N"
+   for preprod and for mainnet (two frontiers): per-epoch reward/treasury/
+   reserves/fees/deposits/snapshots/pool-state/governance, zero open divergence
+   and zero `WithdrawalAmountMismatch` halt behind the frontier.
+2. **Live sync to tip (both nets)** — "from-genesis full-validation sync reached
+   slot S, sustained at-tip soak of D hours clean" per net: no stall / wedge /
+   `chain_diverged`, `ledger_tip == immutable_tip`, correct fork handling.
+3. **Phase-2 / UPLC exactness** — "every captured redeemer through epoch N
+   evaluates byte-exact ExBudget + `is_valid` vs Haskell" per net; open
+   divergence buckets (budget / Error / unIData) tracked to zero.
+4. **Performance & robustness** — sync blk/s ≥ target, at-tip CPU/mem within
+   bound, security-audit findings closed, adversarial inputs rejected (not
+   crashed), clean SIGTERM snapshot/restart verified.
+
+**Production-ready** = all four frontiers reach current tip on both nets with
+zero open divergence behind them and the perf/robustness checks green. Until
+then the loop runs perpetually; it stops cleanly on the halt sentinel at any
 wake.
+
+## Budget governor
+
+A perpetual Workflow-spawning loop has unbounded cost, so the engine is
+budget-aware:
+- A configurable **per-day output-token budget** in `engine-state.md`. Each
+  wake records its spend (RECORD phase); ASSESS sums the rolling 24 h.
+- When the day's budget is ≥ ~80 % spent, SCHEDULE prefers cheap poll/analysis
+  steps and **extends the wake cadence** rather than launching fresh fan-out
+  Workflows. At 100 % it only polls in-flight out-of-band jobs and otherwise
+  idles at the long cadence until the window rolls.
+- Workflow muscles scale their finder/refuter fan-out to remaining budget
+  (`budget.remaining()` in the script), shrinking panels when tight.
 
 ## Persistent artifacts the engine owns
 
 1. **`engine-state.md`** — durable backlog + cross-wake memory. Single source
-   of truth. Sections: ranked backlog (impact-tagged), in-progress item
-   (attempts, blocked-on), gate-status board, last node/replay state, db-clones
-   on disk, gauntlet ledger (passed/refuted approaches). Seeded once from
-   existing docs/issues (`POST-HOLD-PLAN.md`, `REWARD-DIVERGENCE-*.md`,
-   `MEMORY.md`, open GitHub issues), then self-maintained.
+   of truth; **committed every wake**. Sections: `HALT` flag + tunables
+   (refuter `N`, daily token budget, cadence floor/ceiling), ranked backlog
+   (impact-tagged), per-item state-machine status (attempts, blocked-on,
+   current state), the four gate **frontiers**, last node/replay state +
+   running-job PIDs/logs, db-clones on disk, heavy-op lock holder, rolling 24 h
+   token spend, and the gauntlet ledger (passed/refuted approaches — so a
+   refuted fix is never silently retried). Seeded once from existing
+   docs/issues (`POST-HOLD-PLAN.md`, `REWARD-DIVERGENCE-*.md`, `MEMORY.md`,
+   open GitHub issues), then self-maintained.
 2. **Engine playbook** — the per-wake instruction set the loop re-reads each
-   iteration (this design realized as an executable runbook).
-3. **Running node/replay processes** — managed out-of-band per the
+   iteration (this design realized as an executable runbook the cron/loop
+   invokes). Stateless w.r.t. context: everything it needs it reloads from
+   `engine-state.md`.
+3. **Halt sentinel** — `HALT: true` in `engine-state.md` (or a `.engine-halt`
+   file). Checked first in ASSESS; the clean kill switch.
+4. **Heavy-op lock** — `.engine-heavyop.lock` naming the single in-flight heavy
+   local operation; enforces the one-heavy-op-at-a-time invariant.
+5. **Running node/replay processes** — managed out-of-band per the
    node-management rules.
 
 ## Out of scope (YAGNI)
