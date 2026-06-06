@@ -764,6 +764,13 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake109 2026-06-07: POLL #10 multi-asset fix-muscle w34va8uxf — RUNNING, healthy (4GB RAM, no nodes). *** META
+  DISCOVERY ***: db/ledger/<slot>/meta contains {"backend":"utxohd-mem","checksum":...,"tablesCodecVersion":1} —
+  the AUTHORITATIVE endianness disambiguator (tablesCodecVersion, the gauntlet's prescribed signal) IS accessible
+  next to the tables blob. The robust fix used empirical auto-detect (worked, verified); reading tablesCodecVersion
+  from meta is a cleaner principled upgrade -> note as #10 hardening follow-up (auto-detect + safety-net already
+  correct, so not blocking). Muscle currently diagnosing multi-asset + reconciling gated-test state. Not disturbed.
+  #10 stays FIXING; next: poll -> re-import re-verify (MultiAssetNotConserved -> baseline) -> re-gauntlet -> commit.
 - wake108 2026-06-07: POLL #10 multi-asset fix-muscle w34va8uxf — RUNNING, healthy (4GB RAM, no nodes, 0
   completed). Building a diag_scan example to inspect the real blob + locate the reconstruction bug (diagnose-
   first, good). Not disturbed; no competing work. #10 stays FIXING; next: poll -> build+nextest -> re-import
