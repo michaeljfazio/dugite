@@ -153,7 +153,14 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-RESOAK (AUTHORITATIVE fix). Build DONE
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:GAUNTLET-PENDING (AUTHORITATIVE fix). *** FULL
+  VERIFYING PASS wake121 (via byte-exact authoritative path) *** verify10g re-soak (synced 124999612->125098044):
+  ZERO phase-1 transaction rejections (MultiAssetNotConserved 0, InputNotFound 0, MissingScriptWitness 0,
+  not-found 0, budget 0); import used codec_version=Some(1)->Big (authoritative, NOT heuristic); cross-val no
+  contradiction; only 281 #15 Error-term residual. Launched RE-GAUNTLET w8t0ro3f6 on the authoritative fix —
+  key adversarial angle (4th-catch guard): does meta-FILE-absent wrongly ERROR on legitimate legacy (pre-10.7)
+  snapshots that have no meta file (should be None=>Little, not error)? On PASS -> commit the AUTHORITATIVE patch
+  via gh/HTTPS. was: state:VERIFYING-RESOAK (AUTHORITATIVE fix). Build DONE
   (BUILD_EXIT=0). DROVE re-verify: cloned db-preprod-sync -> verify10g, ran AUTHORITATIVE binary (pid 24240, port
   4210). Import log CONFIRMS the authoritative path: "Authoritatively determined MemPack TxIx endianness from
   snapshot meta tablesCodecVersion codec_version=Some(1) txix_endianness=Big" (NOT auto-detect); cross-validation
@@ -486,10 +493,11 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- verify10g-resoak  pid 24240  log .jobs/verify10g-resoak.log  socket /tmp/engine-verify10g.sock port 4210
-  db-clones/preprod-verify10g — AUTHORITATIVE-fix node (meta codec_version=Some(1)->Big, cross-val sane), syncing.
-  NEXT WAKE FULL-VERDICT: scan ALL rejection classes (0 phase-1 expected). SIGTERM-only. Retain for #15.
-- verify-build-10g — DONE (BUILD_EXIT=0). AUTHORITATIVE #10 fix on MAIN uncommitted (gated on re-verify+re-gauntlet).
+- re-gauntlet w8t0ro3f6 (#10 AUTHORITATIVE fix adversarial refutation, refuterN=3) — /workflows-visible. Poll
+  next wake: pass -> COMMIT the AUTHORITATIVE patch via gh/HTTPS; refuted -> address.
+- verify10g-resoak — STOPPED CLEAN wake121 (FULL PASS: 0 phase-1 rejections; only 281 #15 Error-term).
+  db-clones/preprod-verify10g RETAINED for #15 diagnosis.
+- AUTHORITATIVE #10 fix on MAIN uncommitted (candidate-fix-10-AUTHORITATIVE-codecversion.patch); commit on gauntlet pass.
 - fix-muscle wjnl2t2ib — COMPLETE (authoritative codec-version endianness; addresses all 3 gauntlet refutes).
   patch candidate-fix-10-AUTHORITATIVE-codecversion.patch + worktree wf_fc714d5e-a00-1.
 - re-gauntlet wmpyis3tx — DONE 3/3 REFUTED (drove this rework). db-clones/preprod-verify10f kept for #15.
@@ -832,6 +840,12 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake121 2026-06-07: *** #10 FULL VERIFYING PASS (authoritative path) *** verify10g re-soak: 0 phase-1
+  transaction rejections (all classes), codec_version=Some(1)->Big authoritative, cross-val no contradiction,
+  only 281 #15 Error-term. Synced past all failing slots. SIGTERM'd verify10g (kept db for #15). Launched
+  RE-GAUNTLET w8t0ro3f6 on the authoritative fix (key probe: meta-file-absent legacy snapshot handling). #10
+  VERIFYING-RESOAK -> GAUNTLET-PENDING. next: poll -> on pass COMMIT the AUTHORITATIVE patch via gh/HTTPS (lands
+  #10 at last). This iteration is grounded in upstream Haddock proof -> should clear the gauntlet.
 - wake120 2026-06-07: #10 VERIFYING-BUILDING -> VERIFYING-RESOAK. AUTHORITATIVE-fix build BUILD_EXIT=0. Cloned
   db-preprod-sync -> verify10g, ran AUTHORITATIVE binary (pid 24240): import log confirms "Authoritatively
   determined ... from snapshot meta tablesCodecVersion codec_version=Some(1) txix_endianness=Big" (NOT
