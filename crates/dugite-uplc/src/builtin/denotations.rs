@@ -561,7 +561,12 @@ pub fn denote(
             let d = unwrap_data(take_one(args, id)?, id)?;
             match d {
                 crate::data::Data::I(i) => Ok(Value::Const(Constant::Integer(i))),
-                _ => Err(builtin_failure(id, "unIData on non-I Data")),
+                other => {
+                    if std::env::var("DUGITE_DUMP_CTX").is_ok() {
+                        eprintln!("!!! unIData on non-I: {other:?}");
+                    }
+                    Err(builtin_failure(id, "unIData on non-I Data"))
+                }
             }
         }
         UnBData => {
