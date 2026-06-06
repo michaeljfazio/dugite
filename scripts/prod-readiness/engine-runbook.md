@@ -16,9 +16,12 @@ the next and stop.
   reproduces Koios / a cardano-node dump with the divergence gone counts.
 - **All GitHub ops via `gh`. Push over HTTPS** (never SSH). Focused commits,
   explicit filenames, ≤ 2 crates per commit, `DUGITE_PRECOMMIT_STRICT=1`.
-- **Koios is the default ground truth** (no local node needed). Use a
-  `cardano-cli debug log-epoch-state` dump only when `reference_node_socket` in
-  STATE is not `none`.
+- **Koios is the default ground truth** (no local node needed), reached via
+  `scripts/prod-readiness/lib/koios.sh <net> <endpoint> '<json-body>'` (per-network
+  REST). **Do NOT use the `koios_*` MCP tools** — they were observed serving the
+  wrong network (Preview epoch 1320 when preprod ep293 was expected), which
+  silently breaks byte-exact comparison. Use a `cardano-cli debug log-epoch-state`
+  dump only when `reference_node_socket` in STATE is not `none`.
 - Helpers live in `scripts/prod-readiness/lib/`. Prefer them over improvising
   shell. Run them from the repo root.
 
@@ -216,7 +219,7 @@ devnet/soak harness shows no regression.
 
 | Gate | Playbook |
 |---|---|
-| Ledger byte-exactness | `haskell-ledger-cross-validation` skill + clone-db replay + Koios MCP + `DUGITE_EPOCH_STATE_DUMP` |
+| Ledger byte-exactness | `haskell-ledger-cross-validation` skill + clone-db replay + `lib/koios.sh` (REST, not MCP) + `DUGITE_EPOCH_STATE_DUMP` |
 | Live sync to tip | `scripts/dev/{sync-to-tip,stall,passive-sync}-watch.sh` + `soak-sample` + `health-sample.sh` |
 | Phase-2 / UPLC | `phase2_repro` example + `DUGITE_PHASE2_DUMP_DIR` + ScriptContext field-diff vs Haskell |
 | Perf & robustness | `devnet-validate` skill + `prof-run`/`soak-sample` + security tooling |
