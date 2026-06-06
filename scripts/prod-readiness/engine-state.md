@@ -666,6 +666,17 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake88 2026-06-07: POLL #10 gauntlet wqwgen1p0 — 1/3 refuters DONE (edge-epoch: refuted=FALSE, DECISIVE
+  validation). Found the canonical upstream source confirming the BE fix WORD-FOR-WORD: on-disk tables key is
+  consensus-layer BigEndianTxIn, MemPack `packM (BigEndianTxIx (TxIx w)) = packM (byteSwap16 w)`
+  (ouroboros-consensus Shelley/Ledger/Ledger.hs); #461 reconciliation matches upstream rationale verbatim.
+  Cleared all angles: decode_mempack_txin has exactly ONE caller (TvarIterator, BE keys only); module is
+  DECODE-ONLY (no encoder -> re-save concern moot); multi-asset rep uses host-LE cells (distinct from BE key)
+  with correct name-length/dedup/empty/last edge cases; decode-failures degrade safely w/ warnings. LATENT
+  FOLLOW-UP (not a current bug, didn't refute): decode_imported_script_ref hard-codes 0->V1,1->V2,2->V3,3->V4 as
+  'global' but the MemPack PlutusScript tag is ERA-RELATIVE; byte-exact today only via the strict-prefix language
+  property; patch comments self-contradict ('era-relative' vs 'global') -> file as #16 follow-up after commit.
+  2/3 refuters still running -> aggregated verdict not final -> CANNOT commit yet. #10 stays GAUNTLET-PENDING.
 - wake87 2026-06-07: POLL #10 gauntlet wqwgen1p0 — RUNNING (3 parallel refuters active, 0 completed; 5GB RAM,
   no nodes). Adversarially refuting the FULL fix (BE-key correctness across all callers, multi-asset rep edge
   cases, #461 LE-context, re-save roundtrip). Not disturbed; no competing work. #10 stays GAUNTLET-PENDING; next:
