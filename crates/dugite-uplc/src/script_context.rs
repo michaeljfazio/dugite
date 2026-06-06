@@ -554,7 +554,7 @@ impl TxInInfo {
 }
 
 impl PosixTimeRange {
-    pub fn to_data(&self) -> Data {
+    pub fn to_data(&self, v3_semantics: bool) -> Data {
         // Plutus `Interval POSIXTime` is encoded as:
         //   Interval (LowerBound (Extended POSIXTime) Bool)
         //            (UpperBound (Extended POSIXTime) Bool)
@@ -574,15 +574,26 @@ impl PosixTimeRange {
         //   UpperBound ext closed = Constr 0 [ext.to_data(), bool.to_data()]
         //   Interval   lb  ub    = Constr 0 [lb.to_data(), ub.to_data()]
         //
-        // Translating cardano-ledger's `transValidityInterval`:
-        //   validity_start = None     => LowerBound NegInf True
-        //   validity_start = Some(ms) => LowerBound (Finite ms) True  -- closed lower
-        //   ttl = None                => UpperBound PosInf True
-        //   ttl = Some(ms)            => UpperBound (Finite ms) False -- open upper
+        // cardano-ledger `transValidityInterval` (verbatim — Alonzo
+        // `eras/alonzo/impl/src/Cardano/Ledger/Alonzo/Plutus/TxInfo.hs`,
+        // Conway `eras/conway/impl/src/Cardano/Ledger/Conway/TxInfo.hs`):
         //
-        // Reference:
-        //   IntersectMBO/cardano-ledger: eras/alonzo/impl/.../TxInfo.hs
-        //   `transValidityInterval` / `transVITime`
+        //   SNothing SNothing      => always
+        //   (SJust i) SNothing     => PV1.from t  = LowerBound (Finite t) True
+        //                                           UpperBound PosInf      True
+        //   SNothing (SJust i)     => -- THE ERA-DEPENDENT CASE --
+        //       Alonzo/Babbage (V1/V2): PV1.to t  = UpperBound (Finite t) True   (CLOSED)
+        //       Conway (V3):  strictUpperBound t  = UpperBound (Finite t) False  (OPEN)
+        //   (SJust i) (SJust j)    => lowerBound t1      = LowerBound (Finite t1) True
+        //                             strictUpperBound t2 = UpperBound (Finite t2) False (OPEN, all eras)
+        //
+        // So the LOWER bound closure is ALWAYS True (NegInf, Finite, or PosInf).
+        // The UPPER bound closure for a *finite* upper is True only in the
+        // Alonzo/Babbage upper-only case; every other finite-upper case
+        // (V3 upper-only, or both-bounds in any era) is False. PosInf upper
+        // is always True. `to` (V1/V2) calls `upperBound s = UpperBound
+        // (Finite s) True`; Conway/both-bounds calls `strictUpperBound s =
+        // UpperBound (Finite s) False`.
 
         let data_false = data_constr(0, vec![]); // Bool False = Constr 0 []
         let data_true = data_constr(1, vec![]); // Bool True  = Constr 1 []
@@ -594,17 +605,23 @@ impl PosixTimeRange {
         };
         let lower_bound = data_constr(0, vec![lower_ext, data_true.clone()]);
 
-        // upper bound: None => PosInf, closed (True); Some => Finite ms, open (False)
+        // upper bound: None => PosInf (closed/True); Some => Finite ms (closure
+        // is era-dependent — see table above).
         let upper_ext = match self.upper {
             None => data_constr(2, vec![]), // PosInf = Constr 2 []
             Some(t) => data_constr(1, vec![data_i(t.into())]), // Finite t = Constr 1 [I(t)]
         };
-        let upper_closed = if self.upper.is_none() {
-            data_true // PosInf bound is closed (True)
-        } else {
-            data_false // Finite upper bound is open (False) — half-open interval [a, b)
+        let upper_closed = match self.upper {
+            None => true, // PosInf upper bound is always closed (True)
+            // Finite upper: CLOSED (True) only for Alonzo/Babbage (V1/V2)
+            // with no lower bound (`PV1.to` path); OPEN (False) for V3
+            // (Conway `strictUpperBound`) and for any both-bounds interval.
+            Some(_) => !v3_semantics && self.lower.is_none(),
         };
-        let upper_bound = data_constr(0, vec![upper_ext, upper_closed]);
+        let upper_bound = data_constr(
+            0,
+            vec![upper_ext, if upper_closed { data_true } else { data_false }],
+        );
 
         data_constr(0, vec![lower_bound, upper_bound])
     }
@@ -788,8 +805,9 @@ impl TxInfoV3 {
                         .map(|(cred, amt)| (cred.to_data(), data_i(amt.clone())))
                         .collect(),
                 ),
-                // 7 — txInfoValidRange :: POSIXTimeRange
-                self.valid_range.to_data(),
+                // 7 — txInfoValidRange :: POSIXTimeRange (V3/Conway semantics:
+                // finite upper bound is always strict/open)
+                self.valid_range.to_data(true),
                 // 8 — signatories :: [PubKeyHash]
                 data_list(self.signatories.iter().map(data_bs28).collect()),
                 // 9 — redeemers :: Map ScriptPurpose Redeemer
@@ -907,7 +925,9 @@ impl TxInfoV1 {
                         })
                         .collect(),
                 ),
-                self.valid_range.to_data(),
+                // txInfoValidRange (V1/Alonzo semantics: a ttl-only finite
+                // upper bound is CLOSED via `PV1.to`).
+                self.valid_range.to_data(false),
                 data_list(self.signatories.iter().map(data_bs28).collect()),
                 // V1 data :: [(DatumHash, Datum)] — AssocList, not Map.
                 // Encoded as List[Constr 0 [B32(hash), datum]].
@@ -967,7 +987,9 @@ impl TxInfoV2 {
                         .map(|(cred, amt)| (cred.to_data(), data_i(amt.clone())))
                         .collect(),
                 ),
-                self.valid_range.to_data(),
+                // txInfoValidRange (V2/Babbage semantics: a ttl-only finite
+                // upper bound is CLOSED via `PV1.to`).
+                self.valid_range.to_data(false),
                 data_list(self.signatories.iter().map(data_bs28).collect()),
                 // V2 redeemers :: Map ScriptPurpose Redeemer — Data::Map.
                 data_map(
@@ -1002,6 +1024,63 @@ mod tests {
 
     fn pk(b: u8) -> Credential {
         Credential::PubKey([b; 28])
+    }
+
+    /// Extract the `(lower_closure, upper_closure)` Bool constructor tags
+    /// from a `PosixTimeRange::to_data()` result: `Constr 0 [LowerBound,
+    /// UpperBound]` where each bound is `Constr 0 [Extended, Bool]` and a
+    /// `Bool` is `Constr 0 []` (False) / `Constr 1 []` (True).
+    fn closures(d: &Data) -> (u64, u64) {
+        let Data::Constr(0, bounds) = d else {
+            panic!("interval is not Constr 0")
+        };
+        let tag = |b: &Data| -> u64 {
+            let Data::Constr(0, parts) = b else {
+                panic!("bound is not Constr 0")
+            };
+            let Data::Constr(t, _) = &parts[1] else {
+                panic!("closure is not a Constr")
+            };
+            *t
+        };
+        (tag(&bounds[0]), tag(&bounds[1]))
+    }
+
+    #[test]
+    fn valid_range_upper_closure_matches_cardano_ledger_per_era() {
+        // cardano-ledger `transValidityInterval`:
+        //   SNothing (SJust i)  [ttl only]:
+        //     Alonzo/Babbage (V1/V2): PV1.to t        => UpperBound (Finite t) True  (CLOSED)
+        //     Conway (V3):  strictUpperBound t          => UpperBound (Finite t) False (OPEN)
+        //   (SJust i) (SJust j) [both bounds]:
+        //     all eras:     strictUpperBound t2         => UpperBound (Finite t2) False (OPEN)
+        // The lower-bound closure is ALWAYS True.
+
+        // ttl-only, V1/V2 (v3_semantics = false): upper CLOSED (True = tag 1).
+        let ttl_only = PosixTimeRange {
+            lower: None,
+            upper: Some(1_000),
+        };
+        assert_eq!(closures(&ttl_only.to_data(false)), (1, 1));
+
+        // ttl-only, V3 (v3_semantics = true): upper OPEN (False = tag 0).
+        assert_eq!(closures(&ttl_only.to_data(true)), (1, 0));
+
+        // both bounds: upper OPEN in every era (strictUpperBound).
+        let both = PosixTimeRange {
+            lower: Some(500),
+            upper: Some(1_000),
+        };
+        assert_eq!(closures(&both.to_data(false)), (1, 0));
+        assert_eq!(closures(&both.to_data(true)), (1, 0));
+
+        // PosInf upper (no ttl): always CLOSED (True), both eras.
+        let lower_only = PosixTimeRange {
+            lower: Some(500),
+            upper: None,
+        };
+        assert_eq!(closures(&lower_only.to_data(false)), (1, 1));
+        assert_eq!(closures(&lower_only.to_data(true)), (1, 1));
     }
 
     #[test]
