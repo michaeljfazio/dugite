@@ -28,6 +28,8 @@ NEEDED=(
   "Bash(scripts/prod-readiness/lib/clone-db.sh:*)"
   "Bash(scripts/prod-readiness/lib/launch-replay.sh:*)"
   "Bash(scripts/prod-readiness/lib/poll-job.sh:*)"
+  "Bash(scripts/prod-readiness/lib/koios.sh:*)"
+  "Bash(scripts/prod-readiness/lib/wake-lock.sh:*)"
   "Bash(bash scripts/prod-readiness/test/test-smoke-wake.sh)"
   "mcp__koios__koios_account_reward_history" "mcp__koios__koios_account_updates"
   "mcp__koios__koios_pool_history" "mcp__koios__koios_pool_delegators_history"

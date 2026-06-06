@@ -39,6 +39,12 @@ files show it *waiting/working* on out-of-band replays.
 
 ## Phase 1 — ASSESS
 
+0. **Acquire the wake-lock FIRST (before anything else).** Run
+   `bash scripts/prod-readiness/lib/wake-lock.sh acquire`. If it prints `busy`,
+   another wake is already mid-flight (can happen under cron if a long
+   fix+nextest wake overran the period) — **STOP immediately: do nothing and do
+   NOT reschedule.** The active wake owns the loop. Proceed only on `acquired`,
+   and release it in Phase 5.
 1. **Halt check FIRST.** Run `bash scripts/prod-readiness/lib/health-sample.sh`.
    If `"halt":true` (or `scripts/prod-readiness/.engine-halt` exists, or STATE
    `Control: HALT: true`): write a final RECORD note "halted by sentinel" and
@@ -180,8 +186,13 @@ Choose the next wake delay from what you're waiting on, honoring
 
 Then either `ScheduleWakeup(delay, prompt: "Execute one wake of
 scripts/prod-readiness/engine-runbook.md")` for an in-session loop, OR rely on the
-standing `CronCreate` schedule for an unattended run. Then **stop** — this wake is
-complete.
+standing `CronCreate` schedule for an unattended run.
+
+**Finally, release the wake-lock** so the next fire can run:
+`bash scripts/prod-readiness/lib/wake-lock.sh release`. Then **stop** — this wake
+is complete. (If you STOPPED early at the halt sentinel or a `busy` wake-lock, do
+the appropriate thing: on halt, release nothing extra and don't reschedule; on
+`busy`, you never acquired it, so release nothing.)
 
 ---
 
