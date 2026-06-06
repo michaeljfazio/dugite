@@ -806,6 +806,14 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake115 2026-06-07: POLL #10 rework muscle wjnl2t2ib — RUNNING, healthy (5GB RAM, no nodes, 0 completed).
+  *** CRITICAL interim finding (the verify-don't-assume paying off) ***: commit 9ac9388 (BigEndianTxIn flip) does
+  NOT itself bump TablesCodecVersion -> tablesCodecVersion may NOT reliably encode endianness (the refuter
+  ASSUMED it does). Muscle now checking if the BE flip shipped in the same release as a version bump (reading
+  SnapshotMetadata + BigEndianTxIn upstream source). If version does NOT disambiguate endianness, neither layout
+  NOR codec version is authoritative -> the resolution may be: error-on-ambiguity, OR a bounded/cross-validated
+  detection. Not disturbed; no competing work. #10 stays FIXING; next: poll for the muscle's version->endianness
+  determination + fix.
 - wake114 2026-06-07: *** GAUNTLET'S 3RD CORRECT CATCH (the most important) *** re-gauntlet wmpyis3tx edge-epoch
   REFUTED the FINAL fix: TxIx endianness uses an empirical HEURISTIC (cardinal-rule violation), safety-net re-runs
   the SAME is_sane predicate (not independent), and the authoritative tablesCodecVersion (which I found wake109
