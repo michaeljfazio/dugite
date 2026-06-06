@@ -153,7 +153,14 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-RESOAK (FINAL combined fix). Build
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:GAUNTLET-PENDING (FINAL combined fix). *** FULL
+  VERIFYING PASS wake113 (first clean verdict) *** verify10f re-soak (synced 124999612->125096298, past all failing
+  slots): ZERO phase-1 transaction rejections (was 986: 600 InputNotFound+174 MissingScriptWitness+163 InvalidMint
+  +32 MultiAssetNotConserved+17 CollateralNotFound -> ALL 0); script-not-found 0, budget 0, MultiAssetNotConserved
+  316->0; auto-detect=Big sane (low 3131782 vs mult256 62), safety net did NOT trip. ONLY residual: 281 phase-2
+  "Error term" = the separately-filed #15 (distinct ScriptContext-eval cause). Launched RE-GAUNTLET wmpyis3tx on
+  the FINAL fix (auto-detect + multi-asset never adversarially reviewed). On PASS -> commit the FINAL patch via
+  gh/HTTPS. was: state:VERIFYING-RESOAK (FINAL combined fix). Build
   DONE (BUILD_EXIT=0). DROVE re-verify: cloned db-preprod-sync -> verify10f, ran FINAL binary (pid 78267, port
   4209). Import: auto-detect=Big, distribution sane (low 3131782 vs mult256 62), utxo_count=4116338 skipped=0,
   multi-asset now populated all tags. Node syncing 124999169->tip. NEXT WAKE FULL-VERDICT (scan ALL rejection
@@ -445,11 +452,11 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- verify10f-resoak  pid 78267  log .jobs/verify10f-resoak.log  socket /tmp/engine-verify10f.sock port 4209
-  db-clones/preprod-verify10f — FINAL-fix node (auto-detect Big, multi-asset all-tags), syncing. NEXT WAKE
-  FULL-VERDICT: scan ALL rejection classes (MultiAssetNotConserved->baseline + not-found/budget 0 + no new class).
-  SIGTERM-only. Retain for #15 (277 Error-term) diagnosis.
-- verify-build-10f — DONE (BUILD_EXIT=0). FINAL #10 fix on MAIN uncommitted (gated on re-verify+re-gauntlet).
+- re-gauntlet wmpyis3tx (#10 FINAL fix adversarial refutation, refuterN=3) — /workflows-visible. Poll next wake:
+  pass -> COMMIT the FINAL patch via gh/HTTPS; refuted -> address.
+- verify10f-resoak — STOPPED CLEAN wake113 (FULL PASS: 0 phase-1 rejections, MultiAssetNotConserved 316->0,
+  not-found/budget 0; only 281 #15 Error-term). db-clones/preprod-verify10f RETAINED for #15 diagnosis.
+- FINAL #10 fix on MAIN uncommitted (candidate-fix-10-FINAL-autodetect-multiasset.patch); commit on gauntlet pass.
 - fix-muscle w34va8uxf — COMPLETE (multi-asset tag0/1 fix; real-blob oracle PASS). FINAL patch
   candidate-fix-10-FINAL-autodetect-multiasset.patch + worktree wf_4f715407-1de-1.
 - import source db-preprod-sync/haskell-ledger/ INTACT. db-clones/preprod-verify10e kept for #15.
@@ -788,6 +795,14 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake113 2026-06-07: *** #10 FIRST CLEAN VERIFYING PASS *** verify10f re-soak full rejection-class scan: ZERO
+  phase-1 transaction rejections (was 986 across 5 classes -> ALL 0), script-not-found 0, budget 0,
+  MultiAssetNotConserved 316->0, auto-detect=Big sane (no safety-net trip). Only residual: 281 phase-2 Error-term
+  = #15 (separate). Synced past all failing slots. The complete import-completeness fix (refscript+datum+
+  endianness-autodetect+safety-net+multiasset-all-tags) WORKS end-to-end. SIGTERM'd verify10f (kept db for #15),
+  launched RE-GAUNTLET wmpyis3tx on the FINAL fix. #10 VERIFYING-RESOAK -> GAUNTLET-PENDING. next: poll -> on pass
+  COMMIT the FINAL patch via gh/HTTPS (lands #10) -> then #15 + #16 follow-ups. The byte-exact discipline drove
+  ~30 wakes through 4 fix iterations + 2 gauntlet refutations to a correct, version-independent fix.
 - wake112 2026-06-07: #10 VERIFYING-BUILDING -> VERIFYING-RESOAK. FINAL-fix build BUILD_EXIT=0. Cloned
   db-preprod-sync -> verify10f, ran FINAL binary (pid 78267): auto-detect=Big, sane distribution (low 3131782 vs
   mult256 62), utxo_count=4116338 skipped=0, multi-asset populated all tags. Node syncing. GC'd verify10e (4->75GB
