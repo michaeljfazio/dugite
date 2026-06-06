@@ -10,6 +10,9 @@
 ## DRep Pulser & Ratification
 - [drep-pulser-ratification.md](drep-pulser-ratification.md) — Complete pulser lifecycle: snapshot timing (end of EPOCH rule, post-transition state), pulse spreading (4k blocks, pulseSize=numAccounts/(4k)), RATIFY runs once at finishDRepPulser, results applied at NEXT epoch boundary
 
+## Epoch Nonce (TICKN/UPDN) Deep Dive
+- [epoch-nonce-tickn-deep-dive.md](epoch-nonce-tickn-deep-dive.md) — Complete eta0 formula, freeze window per era (3k/f for Shelley-Babbage, 4k/f for Conway+; BABBAGE IS 3k/f), prevHashNonce semantics, Byron→Shelley seeding, preprod epoch-by-epoch table, dugite correctness verdict
+
 ## Key Reference Files
 - Conway UTXO rules: `cardano-ledger/eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Utxo.hs`
 - Conway UTXOW rules: `...Rules/Utxow.hs`
@@ -183,6 +186,9 @@
 
 ## Epoch 0 RUPD ssFee Semantics (Boundary 0→1 / 1→2)
 - [epoch0-rupd-ssfee-semantics.md](epoch0-rupd-ssfee-semantics.md) — ssFee in startStep comes from SnapShots.ssFee (=0 at genesis), NOT utxosFees; SNAP sets it at boundary; dugite bug applies epoch-0 fees at wrong boundary (+87558 treasury excess)
+
+## PlutusV1 txInfoWdrl Encoding
+- [v1-txinfo-wdrl-encoding.md](v1-txinfo-wdrl-encoding.md) — V1=List[Constr0[cred,amt]] (NOT Map); V2=Map; pair-tuple encodes as Constr(0,[a,b]); credential indices: PubKey=0,Script=1,StakingHash=0; transWithdrawals source; common "unIData on B28" cause
 
 ## applyChainTick Mutations (Forge Path)
 - [apply-chain-tick-forge-mutations.md](apply-chain-tick-forge-mutations.md) — Exact fields mutated by TICK/NEWEPOCH visible to forge: intra-epoch (only nesRu+cgsFuturePParams solidification), epoch boundary (nesPd from OLD mark distr, curPParams via nextEpochPParams, only if ParameterChange/HardForkInitiation enacted); UTxO/treasury/rewards invisible to forge; ConwayTICKF as canonical minimal-mutation reference; tickedPP==untickedPP when no PP update enacted

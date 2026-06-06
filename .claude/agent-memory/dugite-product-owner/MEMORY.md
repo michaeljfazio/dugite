@@ -12,3 +12,4 @@
 - [capability_gaps.md](capability_gaps.md) — Known capability gaps and partial implementations
 - [dependency_status.md](dependency_status.md) — Current dependency versions and update status
 - [ledger_assessment_2026_04_16.md](ledger_assessment_2026_04_16.md) — Detailed ledger completeness assessment with per-area percentages, 2026-04-16
+- [project_state_2026_06_05.md](project_state_2026_06_05.md) — Post-PR-727 state: open reward bugs (ep213/ep57/ep292), fuzz CI, epoch validation coverage
