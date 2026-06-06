@@ -162,7 +162,34 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:DIAGNOSING (dissent-verification). *** wake152:
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:ROOT-CAUSED (dissent CONFIRMED). *** wake155:
+  DIAGNOSE wuoecuy7o dimension-1 (inline-datum-import-implication) RETURNED found=true with CONCRETE byte-level
+  evidence (the R1+R2 dissent is EMPIRICALLY CORRECT — the 297 residual is NOT cleanly #15):
+   CASE 1: failing tx 10a0dbda20742f52894b66af9cf8880271197a33df7be16f8a5f1039ac176e5d (slot 125009209 ep293)
+    spends UTxO d653e3692353fe3f86daf21f16e8027eaee5c835467e3139992e98dc0c8135bb#0 created slot 121384342 (<<
+    cutoff 124999169 => IMPORTED), addr 0x70 enterprise-script (hash 7afbde082796cfa6ede6bba8a6aadca8...), INLINE
+    datum tag=1 bytes d87a9fd8799fd8799fd8799f581c99...
+   CASE 2: failing tx 08c596becf99622f703e179be5dafaf936fed54679f39c98c1284c82dc0165fd (slot 125014562) spends
+    722326df219c768da65b549450d8a73c5b9f98e3d9292dfda089b3af2b26160a#0 created slot 124884686 (< cutoff => IMPORTED),
+    0x70 enterprise-script, INLINE datum tag=1 bytes d8799f01019f581c0ae2286929bc0908...
+   2/20 sampled (10%) 'Error term' txs spend imported inline-datum script UTxOs. (control dim a14571b1 still running,
+   irrelevant — one concrete imported case is dispositive/monotonic.)
+  ROOT CAUSE (precise): crates/dugite-uplc/src/redeemer_resolve.rs::resolve_spend_datum (~L620) returns
+  data.clone() for the inline-datum case and IGNORES the carried raw_cbor, then ScriptContext re-encodes via
+  plutus_data_to_data().to_cbor() CANONICALLY. On-chain inline datums are NON-canonical (Constr CBOR tag-102) and
+  do NOT round-trip -> datum-hash/ScriptContext bytes differ from chain -> script hits its Error branch -> 'Error
+  term'. (Same file ALREADY hardened the DatumHash path to hash ORIGINAL raw spans for this exact reason; the
+  inline-datum path was not given equivalent verbatim treatment.) SECONDARY (fold): tag-4/tag-5 import in node/mod.rs
+  SILENTLY degrades to None on decode err (no-silent-corruption violation); R3 json_number_to_word8 as_f64().fract()
+  accepts sub-ULP fractional version (gate on Number::as_u64/as_i64).
+  EXPANDED #10 SCOPE (3 fix sites across 3 crates -> SPLIT commits to honor <=2-crate rule):
+   (A) dugite-uplc: resolve_spend_datum must build the ScriptContext inline datum from VERBATIM raw_cbor (mirror the
+       DatumHash original-span path), NOT re-encode. THIS is the 297-residual fix. [1 crate]
+   (B) dugite-serialization + dugite-node: FINAL-DONE phase-1 import (codec-version/endianness/TxOut-completeness,
+       already 0 phase-1) + no-silent-None on tag-4/5 + R3 float-parse hardening. [2 crates]
+  Commit (A) and (B) as SEPARATE focused commits, each its own gauntlet. NEXT WAKE: launch FIX muscle for (A)
+  (inline-datum verbatim ScriptContext) in worktree; the (A) fix is the gating one for the phase-2 residual.
+  was: state:DIAGNOSING (dissent-verification). *** wake152:
   RE-GAUNTLET wetwroth8 RETURNED pass=false, REFUTED 3/3 (NOT a commit). DO NOT trust the prior numeric verdicts —
   verify the dissent (cardinal rule). The three refutations:
    (R1 haskell-semantics + R2 edge-epoch CONVERGE — the GATING dissent): the 297 phase-2 'Error term' residual is
@@ -995,6 +1022,14 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake155 2026-06-07: #10 DIAGNOSE wuoecuy7o COMPLETED found=true -> DIAGNOSING -> ROOT-CAUSED. The R1+R2 gauntlet
+  dissent is EMPIRICALLY CONFIRMED: 2/20 sampled 'Error term' txs (10a0dbda spends imported d653e369#0 created slot
+  121384342; 08c596be spends imported 722326df#0 created slot 124884686) spend pre-snapshot IMPORTED inline-datum
+  (tag=1) script (0x70) UTxOs. ROOT CAUSE = dugite-uplc resolve_spend_datum re-encodes inline datum CANONICALLY
+  (ignores raw_cbor) -> non-canonical on-chain Constr tag-102 datum doesn't round-trip -> ScriptContext datum-hash
+  mismatch -> 'Error term'. #10 NOT separable; absorbs the inline-datum verbatim-bytes fix. SPLIT into commit (A)
+  dugite-uplc verbatim-datum [gating 297-residual fix] + (B) dugite-serialization+dugite-node FINAL-DONE phase-1 +
+  no-silent-None + R3 float-parse. NEXT WAKE: launch FIX muscle for (A) in worktree.
 - wake154 2026-06-07: POLL #10 DIAGNOSE wuoecuy7o — still RUNNING, ACTIVE (recent agent writes; koios tx-input
   resolution is rate-limited REST, legitimately slow). No transition. Health: verify10j node (pid 63671, 17min)
   at slot 125105858 block 4793941, 0 phase-1; disk 28G. #10 stays DIAGNOSING. NEXT WAKE: act on diagnose verdict.
