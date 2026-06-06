@@ -624,6 +624,10 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake81 2026-06-07: POLL #10 fix muscle wagcpug42 — STILL RUNNING, healthy (5GB RAM, no nodes, 0 completed).
+  Implementing: extending decode_tag0/tag1 to decode_compact_value_exact so multi_asset is populated
+  consistently across all tags (thorough secondary fix alongside the primary mod.rs:68 endianness flip). Not
+  disturbed; no competing work. #10 stays FIXING; next: poll wagcpug42 -> re-import re-verify (291/41/11 -> ~0).
 - wake80 2026-06-07: POLL #10 fix muscle wagcpug42 — STILL RUNNING, healthy (5GB RAM, no nodes, 0 completed).
   Currently researching the canonical Haskell CompactValue multi-asset layout to correctly reconstruct
   multi-asset Values for the secondary fix (mod.rs:6435) — thorough (the primary endianness flip is the
