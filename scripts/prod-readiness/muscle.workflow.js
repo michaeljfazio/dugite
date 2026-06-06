@@ -18,6 +18,15 @@ export const meta = {
 const A = (typeof args === 'string' ? (() => { try { return JSON.parse(args) } catch (e) { return {} } })() : args) || {}
 const { item, mode, net, reference, dumpPath } = A
 
+// Per-task model strategy (deterministic regardless of the launching session's model):
+//   diagnose  -> Sonnet : bounded, parallel, schema-constrained Koios-vs-dump comparison;
+//               downstream Opus steps + the byte-exact replay gauntlet validate it.
+//   research / root-cause / fix / gauntlet -> Opus : deep ledger semantics, byte-exact
+//               Rust, and the adversarial autonomy gate demand the strongest reasoning
+//               (the #438 lesson: a wrong ledger fix that passes tests is the failure mode).
+const MODEL_DIAGNOSE = 'sonnet'
+const MODEL_REASON = 'opus'
+
 // ---- structured-output schemas ----
 const DIVERGENCE = {
   type: 'object',
@@ -84,7 +93,7 @@ if (mode === 'diagnose') {
       + `koios_pool_delegators_history, koios_pool_stake_snapshot, koios_epoch_info). `
       + `Report the EARLIEST epoch where they diverge, the exact entity (account/pool), the field, `
       + `and the lovelace delta (dugite - reference). If none diverge on this dimension, found=false.`,
-      { label: `diff:${dim.split(' ')[1] || dim.slice(0, 12)}`, phase: 'Diagnose', schema: DIVERGENCE },
+      { label: `diff:${dim.split(' ')[1] || dim.slice(0, 12)}`, phase: 'Diagnose', schema: DIVERGENCE, model: MODEL_DIAGNOSE },
     ).then((d) => d || { found: false, epoch: 0, entity: '', field: dim, delta_lovelace: 0, evidence: 'agent-skipped' })))
 
   const real = finds.filter(Boolean).filter((d) => d.found)
@@ -101,14 +110,14 @@ if (mode === 'analyze') {
     + `Then consult cardano-haskell-oracle for the canonical IntersectMBO/cardano-ledger `
     + `source for this calculation, then the ledger spec. `
     + `Return: the canonical Haskell calc (permalink + verbatim snippet) and the spec citation.`,
-    { label: 'research', phase: 'Research' },
+    { label: 'research', phase: 'Research', model: MODEL_REASON },
   )
   phase('RootCause')
   const rootcause = await agent(
     `Given this research:\n${research}\n\nRoot-cause "${item}". `
     + `Use the localized divergence already found (see engine-state.md; reference: ${reference}). `
     + `Be specific: the exact field, epoch, account/pool, and lovelace delta. Do NOT propose a fix yet.`,
-    { label: 'root-cause', phase: 'RootCause', schema: ROOTCAUSE },
+    { label: 'root-cause', phase: 'RootCause', schema: ROOTCAUSE, model: MODEL_REASON },
   )
   return { mode, research, rootcause }
 }
@@ -123,7 +132,7 @@ if (mode === 'fix') {
     + `Run: cargo fmt --all -- --check; cargo clippy --all-targets -- -D warnings; `
     + `cargo nextest run --workspace. Return files, diff summary, tier, the haskell quote, `
     + `and whether all checks are green. Remember: green tests are NOT proof of byte-exactness.`,
-    { label: 'fix', phase: 'Fix', isolation: 'worktree', schema: FIX },
+    { label: 'fix', phase: 'Fix', isolation: 'worktree', schema: FIX, model: MODEL_REASON },
   )
   return { mode, fix }
 }
@@ -141,7 +150,7 @@ if (mode === 'gauntlet') {
       + `and the fix quotes the canonical Haskell source. Try hard to find a case where `
       + `the fix is still wrong (an edge epoch, a compounding feedback, a rounding path, `
       + `a Haskell-semantics mismatch). Default refuted=true if you are uncertain.`,
-      { label: `refute:${lens}`, phase: 'Gauntlet', schema: VERDICT },
+      { label: `refute:${lens}`, phase: 'Gauntlet', schema: VERDICT, model: MODEL_REASON },
     ).then((v) => v || { refuted: true, reason: 'agent-skipped', lens })))
 
   const real = votes.filter(Boolean)
