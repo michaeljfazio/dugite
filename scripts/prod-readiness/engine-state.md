@@ -666,6 +666,10 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake87 2026-06-07: POLL #10 gauntlet wqwgen1p0 — RUNNING (3 parallel refuters active, 0 completed; 5GB RAM,
+  no nodes). Adversarially refuting the FULL fix (BE-key correctness across all callers, multi-asset rep edge
+  cases, #461 LE-context, re-save roundtrip). Not disturbed; no competing work. #10 stays GAUNTLET-PENDING; next:
+  poll -> pass (refute<2/3) -> COMMIT the FULL patch via gh/HTTPS; refuted -> address it.
 - wake86 2026-06-07: *** #10 VERIFYING = MAJOR chain-level SUCCESS *** full-fix re-soak (verify10c) dropped
   phase-2 divergences 549->277 with the KEY-RESOLUTION classes ELIMINATED ("not found" 11->0, "budget" 41->0,
   MissingScriptWitness 0; 4/5 target slots CLEAN). NO regression. The BE-key fix (the diagnosed root cause) made
