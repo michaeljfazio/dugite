@@ -125,6 +125,12 @@
    found for redeemer purpose". Tier A' (phase-2). state:VERIFYING-PENDING attempts:1  FIX COMPLETE (muscle
    we0nz74zr, hash-oracle PASSED byte-exact, checks_green, 2 crates; patch + worktree wf_41bd7059-365-1). See
    In-progress for the VERIFYING plan (SIGTERM soak -> build -> re-soak -> WARNs-gone -> gauntlet -> commit).
+16. [L][phase2][LATENT, from gauntlet wqwgen1p0] decode_imported_script_ref hard-codes Plutus language tag
+   0->V1,1->V2,2->V3,3->V4 as 'global', but the MemPack PlutusScript tag is ERA-RELATIVE (per-era packTagM).
+   Byte-exact for ALL CURRENT eras only because each era's language list is a strict PREFIX [V1,V2,V3,V4] (no
+   reorder/removal), so era-relative index == fromEnum(language) today. Patch comments self-contradict
+   ('era-relative' vs 'global'). NOT a current divergence. FIX: make the mapping era-aware (or assert the prefix
+   invariant + comment) when a future era reorders/removes a language. state:NEW attempts:0 (follow-up after #10 lands)
 15. [M][phase2][REAL-NEW wake86] Fast-start residual 277 "script returned Error term" — SEPARATE from #10's
    key/datum/refscript/multiasset (those are fixed: 549->277, not-found+budget zeroed). On the FULL-fix re-import
    re-soak (db-clones/preprod-verify10c retained), 277 DISTINCT txs each emit one "uplc fails but on-chain
@@ -147,7 +153,19 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:GAUNTLET-PENDING (FULL fix). *** VERIFYING
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:FIXING (endianness REFINEMENT). *** GAUNTLET
+  wqwgen1p0 verdict wake89: passed 2-1 (refuteCount=1) BUT the dissent is EMPIRICALLY CORRECT -> DID NOT COMMIT
+  (don't blindly trust majority) ***. The unconditional-BE TxIx fix is WRONG for legacy snapshots: TxIx
+  endianness is SNAPSHOT-VERSION-DEPENDENT. I VERIFIED byte-by-byte: new flat `tables` (>=11.0.1) index1=`00 01`=BE
+  (BigEndianTxIn byteSwap16); legacy nested `tables/tvar` (<=10.6.x) index1=`01 00`=LE (raw host MemPack). Both
+  share envelope 81bf5822 (can't branch on content) but resolve_inmemory_tables_path branches by FILE PATH (flat
+  file=new/BE; nested tvar=legacy/LE) — same oc-1.0.0.0/node-11.0.1 boundary flipped BOTH layout and endianness.
+  Unconditional BE would silently corrupt every TxIx>=1 from legacy/preview imports (01 00 -> 256) = mirror-image
+  regression the 2 pass-voters missed (they only tested new-format). FIX (muscle wauynb0ku): make endianness
+  CONDITIONAL on layout (flat->BE, nested-tvar->LE), threaded from the import call site through TvarIterator to
+  decode_mempack_txin; keep BOTH a LE pinned test (legacy fixture preview_tvar_head_64k.bin) AND a BE pinned test.
+  Main reset CLEAN (FULL unconditional-BE patch NOT committed; superseded). VERIFY: both fixtures' index-1 ->
+  txix==1 under their format; re-import re-soak keeps 549->277. was: state:GAUNTLET-PENDING (FULL fix). *** VERIFYING
   wake86: MAJOR chain-level SUCCESS (not a no-op this time) *** full-fix re-soak (verify10c) divergences
   549->277 with KEY-RESOLUTION classes ELIMINATED: "script not found" 11->0, "budget exhausted" 41->0,
   MissingScriptWitness 0; 4 of 5 original target slots now CLEAN. NO regression (counts only dropped). The
@@ -344,11 +362,12 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- gauntlet-muscle wqwgen1p0 (#10 FULL fix adversarial refutation, refuterN=3) — /workflows-visible. Poll next
-  wake: pass (refute<majority) -> COMMIT the FULL patch via gh/HTTPS; refuted -> address the refutation.
-- verify10c-resoak — STOPPED CLEAN wake86 (verdict: 549->277, not-found+budget zeroed). db-clones/preprod-verify10c
-  RETAINED for #15 (277 Error-term) residual diagnosis. RAM freed.
-- FULL #10 fix on MAIN uncommitted (candidate-fix-10-FULL-refscript-datum-endianness.patch); commit on gauntlet pass.
+- fix-muscle wauynb0ku (#10 endianness REFINEMENT: format-conditional LE/BE, Opus, worktree, Tier A') —
+  /workflows-visible. Poll next wake for FIX result (both-fixtures key-correctness oracle). On pass -> re-import re-verify.
+- gauntlet wqwgen1p0 — DONE (2-1 pass, but dissent EMPIRICALLY CORRECT: legacy=LE/new=BE). Drove the refinement.
+- db-clones/preprod-verify10c RETAINED for #15 (277 Error-term) diagnosis.
+- MAIN CLEAN. Patches retained: candidate-fix-10-COMPLETE-refscript-datum.patch (base, no endianness),
+  candidate-fix-10-FULL-...-endianness.patch (has the WRONG unconditional-BE — do NOT commit as-is).
 - fix-muscle wagcpug42 — COMPLETE (key-correctness oracles pass). FULL patch
   candidate-fix-10-FULL-refscript-datum-endianness.patch + worktree wf_843d9ff3-1d5-1.
 - import source: db-preprod-sync/haskell-ledger/ INTACT for the re-verify.
@@ -666,6 +685,15 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake89 2026-06-07 (notification-triggered): *** GAUNTLET CAUGHT A REAL REGRESSION (passed 2-1 but I overrode
+  the majority — verified the dissent) ***. wqwgen1p0: haskell-semantics + edge-epoch refuted=FALSE (found
+  upstream BigEndianTxIn confirming BE for NEW format); compounding-feedback refuted=TRUE and CORRECT: TxIx
+  endianness is snapshot-VERSION-dependent. I verified byte-by-byte: legacy tvar fixture index1=`01 00`=LE, new
+  tables index1=`00 01`=BE, identical envelopes, import branches by file path. Unconditional BE would mirror-image-
+  regress legacy/preview imports (01 00->256). DID NOT COMMIT. Reset main clean (FULL unconditional-BE patch NOT
+  committed). Launched refinement fix-muscle wauynb0ku (format-conditional LE/BE branched at the import call site,
+  BOTH LE+BE pinned tests). Filed latent #16 (era-relative plutus tag, byte-exact today). #10 GAUNTLET-PENDING ->
+  FIXING. LESSON: a 2-1 gauntlet pass with a concrete empirical dissent is NOT an auto-commit — verify the dissent.
 - wake88 2026-06-07: POLL #10 gauntlet wqwgen1p0 — 1/3 refuters DONE (edge-epoch: refuted=FALSE, DECISIVE
   validation). Found the canonical upstream source confirming the BE fix WORD-FOR-WORD: on-disk tables key is
   consensus-layer BigEndianTxIn, MemPack `packM (BigEndianTxIx (TxIx w)) = packM (byteSwap16 w)`
