@@ -93,6 +93,14 @@ pub fn eval_resolved_redeemer(
     // 2. Build the per-version ScriptContext as Data.
     let ctx_data = build_script_context(tx, resolved, r, slot_config)?;
 
+    if std::env::var("DUGITE_DUMP_CTX").is_ok() {
+        eprintln!(
+            "=== CTX tag={:?} idx={} lang={:?} ===",
+            r.tag, r.index, r.language
+        );
+        debug_dump_data(&ctx_data, 0);
+    }
+
     // 3. Pre-apply the args. V3 takes one (ctx); V1/V2 takes three for
     //    a Spend redeemer (datum, redeemer, ctx) and two for
     //    Mint/Cert/Reward redeemers (redeemer, ctx) — the latter have
@@ -345,6 +353,43 @@ fn decode_script_bytes_uncached(bytes: &[u8]) -> Result<Program, PhaseTwoError> 
     // Raw flat bytes (already unwrapped by the caller / serialization layer).
     Program::from_flat(bytes)
         .map_err(|e| PhaseTwoError::Internal(format!("eval_resolved_redeemer: script decode: {e}")))
+}
+
+fn debug_dump_data(d: &crate::data::Data, depth: usize) {
+    use crate::data::Data;
+    let pad = "  ".repeat(depth);
+    match d {
+        Data::Constr(tag, args) => {
+            eprintln!("{pad}Constr {tag} [{}]", args.len());
+            for a in args {
+                debug_dump_data(a, depth + 1);
+            }
+        }
+        Data::Map(kvs) => {
+            eprintln!("{pad}Map [{}]", kvs.len());
+            for (k, v) in kvs {
+                eprintln!("{pad} k:");
+                debug_dump_data(k, depth + 2);
+                eprintln!("{pad} v:");
+                debug_dump_data(v, depth + 2);
+            }
+        }
+        Data::List(xs) => {
+            eprintln!("{pad}List [{}]", xs.len());
+            for x in xs {
+                debug_dump_data(x, depth + 1);
+            }
+        }
+        Data::I(n) => eprintln!("{pad}I {n}"),
+        Data::B(b) => {
+            let h = hex::encode(b);
+            eprintln!(
+                "{pad}B(len={}) {}",
+                b.len(),
+                if h.len() > 24 { &h[..24] } else { &h }
+            );
+        }
+    }
 }
 
 /// Build the per-version `ScriptContext` as a `Data` value.
