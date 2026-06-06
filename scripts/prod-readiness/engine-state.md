@@ -87,7 +87,7 @@
 
 ## In-progress
 - item: #8 NEW (real, found by broad sweep): mainnet ep246 reserves +82,270,482 divergence (Allegra)
-- item: #9 snapshot backend mismatch (sync/perf, tractable). state:FIXING — fix muscle making mithril-import save in the configured utxo-backend so run fast-starts
+- item: #9 snapshot backend mismatch. state:VERIFYING — fix applied to main (Convertible arm: mem-snapshot-under-lsm loads+migrates instead of full-replay); building for operational verify
 - attempts: 1
 - ANALYZE RESULT (w6lsvu2p2, Opus): canonical Haskell active-stake =
   resolveActiveInstantStakeCredentials (Stake.hs @52ef3d5) — per registered+delegated
@@ -415,3 +415,11 @@
   genesis replay. Fix: persist+tag the snapshot in the CONFIGURED backend during mithril/haskell import so a
   mithril-import->run cycle fast-starts. Fired fix muscle. Verification = operational: after fix, run a
   mithril-imported db and confirm it loads the snapshot (no 'backend does not match' / no full replay).
+- wake53 2026-06-07: #9 fix done (wrpfacs13, Tier B, checks_green, canonically grounded vs ouroboros-consensus
+  LSM/InMemory backend guards + snapshot-converter). INSIGHT: the .bin payload is backend-AGNOSTIC (only inline
+  vs empty utxo_set); a DugiteMem snapshot under an LSM node is CONVERTIBLE — attach_utxo_store already migrates
+  inline UTxOs. Fix adds BackendCheckResult::Convertible (snapshot.rs) -> load_snapshot_with_backend_guard
+  accepts+migrates instead of reject->replay (node/mod.rs); self-healing (next save re-tags lsm). 2 files/2
+  crates, no ledger/byte-exact change. Applied to main (uncommitted), compiles clean, feature-build running.
+  NEXT: operational verify — run a fresh clone of db-preprod-sync with the fixed binary, confirm it loads the
+  mem snapshot (no 'backend does not match', NO full genesis replay) -> then COMMIT (first landed real fix).
