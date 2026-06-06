@@ -544,6 +544,92 @@ fn cred_data(c: &PrimCred) -> Data {
     credential_to_plutus(c).to_data()
 }
 
+/// Encode a primitive Credential as a V1/V2 Plutus `StakingCredential`
+/// (`StakingHash Credential` = `Constr 0 [Credential]`). The V1/V2 `DCert`
+/// type uses `StakingCredential` everywhere a credential appears, NOT the
+/// bare `Credential` (and NOT the Conway V3 `TxCert` shapes).
+fn staking_hash_data(c: &PrimCred) -> Data {
+    Data::Constr(0, vec![cred_data(c)])
+}
+
+/// Translate a ledger certificate into the **PlutusV1/V2** `DCert` Data,
+/// which is a completely different schema from the Conway V3 `TxCert` built
+/// by [`certificate_to_plutus`]. Byte-exact with cardano-ledger
+/// `Cardano.Ledger.Alonzo.Plutus.TxInfo::transTxCert` /
+/// `PlutusLedgerApi.V1.DCert` (`makeIsDataSchemaIndexed ''DCert`):
+///
+/// ```text
+/// DCertDelegRegKey   (StakingHash cred)        = Constr 0 [Constr 0 [Credential]]
+/// DCertDelegDeRegKey (StakingHash cred)        = Constr 1 [Constr 0 [Credential]]
+/// DCertDelegDelegate (StakingHash cred) poolId = Constr 2 [Constr 0 [Credential], B pool28]
+/// DCertPoolRegister  poolId vrfKeyHash         = Constr 3 [B pool28, B vrf32]
+/// DCertPoolRetire    poolId epoch              = Constr 4 [B pool28, I epoch]
+/// DCertGenesis                                 = Constr 5 []
+/// DCertMir                                     = Constr 6 []
+/// ```
+///
+/// `Credential` is `Constr 0 [B]` (PubKey) / `Constr 1 [B]` (Script); the
+/// delegatee pool key and pool ids are BARE `B` (PubKeyHash newtype).
+///
+/// Conway-only certs (deposit registration, DRep/committee, vote delegation)
+/// cannot legally co-exist with a V1/V2 script — cardano-ledger fails the
+/// translation (`transTxCertCommon` returns `Nothing`) — so they surface here
+/// as an internal error rather than a silently-wrong shape.
+pub fn certificate_to_plutus_v1v2(c: &PrimCert) -> Result<TxCert, PhaseTwoError> {
+    let conway_only = |name: &str| {
+        Err(PhaseTwoError::Internal(format!(
+            "certificate_to_plutus_v1v2: {name} is a Conway-only cert and cannot \
+             appear in a PlutusV1/V2 script context (ledger rejects the tx)"
+        )))
+    };
+    let data = match c {
+        PrimCert::StakeRegistration(cred) => Data::Constr(0, vec![staking_hash_data(cred)]),
+        PrimCert::StakeDeregistration(cred) => Data::Constr(1, vec![staking_hash_data(cred)]),
+        PrimCert::StakeDelegation {
+            credential,
+            pool_hash,
+        } => Data::Constr(
+            2,
+            vec![staking_hash_data(credential), Data::B(pool_hash.0.to_vec())],
+        ),
+        PrimCert::PoolRegistration(params) => Data::Constr(
+            3,
+            vec![
+                Data::B(params.operator.0.to_vec()),
+                Data::B(params.vrf_keyhash.0.to_vec()),
+            ],
+        ),
+        PrimCert::PoolRetirement { pool_hash, epoch } => Data::Constr(
+            4,
+            vec![Data::B(pool_hash.0.to_vec()), Data::I(BigInt::from(*epoch))],
+        ),
+        PrimCert::GenesisKeyDelegation { .. } => Data::Constr(5, vec![]),
+        PrimCert::MoveInstantaneousRewards { .. } => Data::Constr(6, vec![]),
+        // Conway-era certificate kinds — illegal alongside a V1/V2 script.
+        PrimCert::ConwayStakeRegistration { .. } => return conway_only("ConwayStakeRegistration"),
+        PrimCert::ConwayStakeDeregistration { .. } => {
+            return conway_only("ConwayStakeDeregistration")
+        }
+        PrimCert::RegStakeDeleg { .. } => return conway_only("RegStakeDeleg"),
+        PrimCert::VoteDelegation { .. } => return conway_only("VoteDelegation"),
+        PrimCert::StakeVoteDelegation { .. } => return conway_only("StakeVoteDelegation"),
+        PrimCert::RegStakeVoteDeleg { .. } => return conway_only("RegStakeVoteDeleg"),
+        PrimCert::VoteRegDeleg { .. } => return conway_only("VoteRegDeleg"),
+        PrimCert::RegDRep { .. } => return conway_only("RegDRep"),
+        PrimCert::UpdateDRep { .. } => return conway_only("UpdateDRep"),
+        PrimCert::UnregDRep { .. } => return conway_only("UnregDRep"),
+        PrimCert::CommitteeHotAuth { .. } => return conway_only("CommitteeHotAuth"),
+        PrimCert::CommitteeColdResign { .. } => return conway_only("CommitteeColdResign"),
+    };
+    Ok(TxCert(data))
+}
+
+/// V1/V2 batch translation — mirrors [`certificates_to_plutus`] but emits the
+/// `DCert` schema for `txInfoDCert :: [DCert]`.
+pub fn certificates_to_plutus_v1v2(certs: &[PrimCert]) -> Result<Vec<TxCert>, PhaseTwoError> {
+    certs.iter().map(certificate_to_plutus_v1v2).collect()
+}
+
 /// Encode `Option<u64>` as `Constr 1 []` (None) / `Constr 0 [I n]`
 /// (Some n). Matches Plutus' canonical Option encoding.
 fn option_int(v: Option<u64>) -> Data {
@@ -587,6 +673,80 @@ mod tests {
 
     fn script_cred(b: u8) -> PrimCred {
         PrimCred::Script(h28(b))
+    }
+
+    // V1/V2 DCert encoding ──────────────────────────────────────
+
+    #[test]
+    fn v1v2_dcert_stake_delegation_uses_dcert_schema_not_v3_txcert() {
+        // DCertDelegDelegate (StakingHash (ScriptCredential h)) poolKey =
+        //   Constr 2 [ Constr 0 [Constr 1 [B cred]], B pool ]
+        // (StakingHash-wrapped credential; BARE pool PubKeyHash) — NOT the
+        // Conway V3 `Constr 2 [Credential, Delegatee]` shape.
+        let cert = PrimCert::StakeDelegation {
+            credential: script_cred(0xaa),
+            pool_hash: h28(0xbb),
+        };
+        let d = certificate_to_plutus_v1v2(&cert).unwrap().0;
+        assert_eq!(
+            d,
+            Data::Constr(
+                2,
+                vec![
+                    Data::Constr(0, vec![Data::Constr(1, vec![Data::B(vec![0xaa; 28])])]),
+                    Data::B(vec![0xbb; 28]),
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn v1v2_dcert_stake_registration_wraps_in_staking_hash() {
+        // DCertDelegRegKey (StakingHash (PubKeyCredential h)) =
+        //   Constr 0 [ Constr 0 [Constr 0 [B cred]] ]
+        let cert = PrimCert::StakeRegistration(key_cred(0x11));
+        let d = certificate_to_plutus_v1v2(&cert).unwrap().0;
+        assert_eq!(
+            d,
+            Data::Constr(
+                0,
+                vec![Data::Constr(
+                    0,
+                    vec![Data::Constr(0, vec![Data::B(vec![0x11; 28])])]
+                )]
+            )
+        );
+    }
+
+    #[test]
+    fn v1v2_certifying_purpose_has_no_index_and_one_field() {
+        // V1/V2 `Certifying DCert` = Constr 3 [dcert] — exactly one field,
+        // NO integer cert index (that is a V3-only addition).
+        let cert = PrimCert::StakeDeregistration(script_cred(0x22));
+        let tx_cert = certificate_to_plutus_v1v2(&cert).unwrap();
+        let purpose = crate::script_context::ScriptPurpose::Certifying(0, tx_cert);
+        let d = purpose.to_data();
+        match d {
+            Data::Constr(3, fields) => {
+                assert_eq!(
+                    fields.len(),
+                    1,
+                    "V1/V2 Certifying must have exactly 1 field"
+                );
+                // The single field is the DCertDelegDeRegKey shape.
+                assert_eq!(
+                    fields[0],
+                    Data::Constr(
+                        1,
+                        vec![Data::Constr(
+                            0,
+                            vec![Data::Constr(1, vec![Data::B(vec![0x22; 28])])]
+                        )]
+                    )
+                );
+            }
+            other => panic!("expected Constr 3, got {other:?}"),
+        }
     }
 
     // Voter ─────────────────────────────────────────────────────
