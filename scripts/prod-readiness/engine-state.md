@@ -153,7 +153,18 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:FIXING (multi-asset reconstruction bug). ***
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-BUILDING (FINAL combined fix). ***
+  multi-asset muscle w34va8uxf COMPLETE wake111, checks_green, byte-exact real-blob oracle PASS, 2 crates ***.
+  ROOT CAUSE (empirical, real blob): MemPack TxOut tags 0/1 used the OPAQUE decode_compact_value (hardcodes
+  num_assets=0) -> 970K multi-asset UTxOs imported with EMPTY assets -> input_side:0 (tags 4/5 already used _exact,
+  hence synthetic unit passed but real tag-0/1 failed). FIX: route tag0+tag1 through decode_compact_value_exact
+  (parses VarLen numMA + rep per Mary Value.hs); tag1 DataHash offset from exact value extent. AFTER: tag0/1
+  num_assets=0 eliminated, 1,629,052 multi-asset UTxOs fold non-empty, ADA-only byte-identical, all 6750 tests
+  pass + new gated real-blob oracle (folded asset_list == Koios). COMBINED FINAL patch saved
+  candidate-fix-10-FINAL-autodetect-multiasset.patch (2905 lines: refscript+datum+endianness-autodetect+safety-net
+  +multiasset-all-tags, applies clean) + applied to MAIN + build pid 77765 (.jobs/verify-build-10f.log). NEXT WAKE:
+  BUILD_EXIT=0 -> fresh import re-soak -> MultiAssetNotConserved -> ~baseline AND endianness win kept (not-found 0,
+  budget 0) -> FULL rejection-class scan -> RE-GAUNTLET -> commit. was: state:FIXING (multi-asset reconstruction bug). ***
   VERIFYING wake106: endianness CORE verified BUT thorough check found a multi-asset REGRESSION *** robust-fix
   re-soak (verify10e): TxIx auto-detect=Big correct (script-not-found 0, budget 0, safety-net sane), BUT
   MultiAssetNotConserved jumped 32->316 (ALL input_side:0 = imported multi-asset UTxO carries ZERO of the asset).
@@ -428,8 +439,12 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- fix-muscle w34va8uxf (#10 multi-asset reconstruction bug: input_side:0 on imported multi-asset UTxOs, Opus,
-  worktree, Tier A') — /workflows-visible. Poll next wake for FIX (byte-exact multi_asset==Koios oracle).
+- verify-build-10f  pid 77765  log .jobs/verify-build-10f.log — release build of dugite-node with the FINAL #10
+  fix (endianness-autodetect+safety-net+datum+refscript+multiasset-all-tags) on MAIN. Poll BUILD_EXIT=0 -> re-verify.
+- fix-muscle w34va8uxf — COMPLETE (multi-asset tag0/1 fix; real-blob oracle PASS). FINAL patch
+  candidate-fix-10-FINAL-autodetect-multiasset.patch + worktree wf_4f715407-1de-1.
+- import source db-preprod-sync/haskell-ledger/ INTACT. db-clones/preprod-verify10e kept for #15.
+- Patch history: ...ROBUST(endianness-ok/multiasset-buggy) -> FINAL(multiasset also fixed, current candidate).
 - verify10e-resoak — STOPPED CLEAN wake106 (VERIFYING: endianness verified [script-not-found 0/budget 0], but
   MultiAssetNotConserved 32->316 = multi-asset reconstruction bug). db-clones/preprod-verify10e RETAINED for the
   multi-asset diagnosis + #15.
@@ -764,6 +779,14 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake111 2026-06-07 (notification-triggered): #10 MULTI-ASSET fix COMPLETE (muscle w34va8uxf, Tier A',
+  checks_green, real-blob oracle PASS). Root cause: tags 0/1 used opaque decode_compact_value (num_assets=0) ->
+  970K multi-asset UTxOs imported empty; fix routes tag0/1 through decode_compact_value_exact. After: 1.629M
+  multi-asset UTxOs fold non-empty, ADA-only byte-identical, real-blob folded asset_list == Koios. Assembled the
+  COMBINED FINAL patch (2905 lines, all #10 layers: refscript+datum+endianness-autodetect+safety-net+multiasset-
+  all-tags, 2 crates), applied to main, launched build pid 77765. Advanced #10 FIXING -> VERIFYING-BUILDING. next:
+  BUILD_EXIT=0 -> re-import re-soak -> FULL rejection-class scan (MultiAssetNotConserved->baseline + not-found/budget
+  still 0) -> re-gauntlet -> commit. Did NOT commit.
 - wake110 2026-06-07: POLL #10 multi-asset fix-muscle w34va8uxf — NEAR COMPLETE: byte-exact gated test (reconstructed
   multi_asset == Koios) PASSES against the real preprod blob; collecting final diff (txout.rs + tests.rs). Imminent
   completion. Not disturbed. #10 stays FIXING; next (notif/poll): read FIX -> re-import re-soak (MultiAssetNotConserved
