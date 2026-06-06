@@ -153,7 +153,17 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-RESOAK (ROBUST fix). Build DONE
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:FIXING (multi-asset reconstruction bug). ***
+  VERIFYING wake106: endianness CORE verified BUT thorough check found a multi-asset REGRESSION *** robust-fix
+  re-soak (verify10e): TxIx auto-detect=Big correct (script-not-found 0, budget 0, safety-net sane), BUT
+  MultiAssetNotConserved jumped 32->316 (ALL input_side:0 = imported multi-asset UTxO carries ZERO of the asset).
+  Cause: keys now resolve idx>=1 inputs (previously InputNotFound, 600 baseline), EXPOSING that the multi-asset
+  reconstruction stores empty/wrong assets despite the 10-NFT unit oracle passing (same decode-vs-real-data
+  pattern). So the reconstruction has a real gap. Launched diagnose+fix muscle w34va8uxf: locate the failing rep
+  layout via the real blob + Koios (sample tx 08e9548154... policy d8906ca5...), fix parse_multi_asset_rep and/or
+  the node value fold, byte-exact oracle = reconstructed multi_asset == Koios asset_list. Main reset clean
+  (ROBUST patch preserved as base). VERIFY: re-soak MultiAssetNotConserved back to ~baseline + endianness win
+  kept. was: state:VERIFYING-RESOAK (ROBUST fix). Build DONE
   (BUILD_EXIT=0). DROVE re-verify: cloned db-preprod-sync -> verify10e, ran ROBUST binary (pid 47327, port 4208).
   *** AUTO-DETECT WORKS ON REAL BLOB ***: log "Auto-detected MemPack TxIx endianness from snapshot data
   txix_endianness=Big" (correct for preprod new format), safety-net distribution SANE (txix_low=3131782 vs
@@ -418,10 +428,13 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- verify10e-resoak  pid 47327  log .jobs/verify10e-resoak.log  socket /tmp/engine-verify10e.sock port 4208
-  db-clones/preprod-verify10e — ROBUST-fix node, AUTO-DETECTED Big (safety-net sane: low 3131782 vs mult256 62),
-  syncing. NEXT WAKE VERDICT: grep failing slots -> must match 549->277. SIGTERM-only. DISK 84GB (GC verify10d soon).
-- verify-build-10e — DONE (BUILD_EXIT=0). ROBUST #10 fix on MAIN uncommitted (gated on re-verify+re-gauntlet).
+- fix-muscle w34va8uxf (#10 multi-asset reconstruction bug: input_side:0 on imported multi-asset UTxOs, Opus,
+  worktree, Tier A') — /workflows-visible. Poll next wake for FIX (byte-exact multi_asset==Koios oracle).
+- verify10e-resoak — STOPPED CLEAN wake106 (VERIFYING: endianness verified [script-not-found 0/budget 0], but
+  MultiAssetNotConserved 32->316 = multi-asset reconstruction bug). db-clones/preprod-verify10e RETAINED for the
+  multi-asset diagnosis + #15.
+- MAIN CLEAN. ROBUST patch (candidate-fix-10-ROBUST-autodetect-endianness.patch) = verified base + buggy multiasset.
+- Patch history: COMPLETE / FULL(uncond-BE) / CONDITIONAL(layout) / ROBUST(autodetect, endianness-correct/multiasset-buggy).
 - fix-muscle w1m4bxztw — COMPLETE (auto-detect, safety net, both-fixture oracles). patch
   candidate-fix-10-ROBUST-autodetect-endianness.patch + worktree wf_bdd8b73d-b58-1.
 - import source db-preprod-sync/haskell-ledger/ INTACT; legacy fixture committed. db-clones/preprod-verify10d kept for #15.
@@ -751,6 +764,15 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake106 2026-06-07: #10 VERIFYING — endianness CORE verified, multi-asset REGRESSION found (thorough check).
+  robust-fix re-soak: TxIx auto-detect=Big correct (script-not-found 0, budget 0, safety-net sane), but a full
+  rejection-class scan found MultiAssetNotConserved 32->316 (all input_side:0). The key fix RESOLVES idx>=1 inputs
+  (was 600 InputNotFound) which EXPOSED that the multi-asset reconstruction stores empty assets on real UTxOs
+  (10-NFT unit oracle passes, real data fails — same decode-vs-real pattern as the whole #10 saga). Did NOT
+  commit. SIGTERM'd verify10e (kept db), GC'd verify10d, reset main clean. Launched diagnose+fix muscle w34va8uxf
+  for the multi-asset reconstruction (real-blob + Koios byte-exact oracle). #10 VERIFYING-RESOAK -> FIXING.
+  LESSON: always scan ALL rejection classes in the verdict, not just the expected ones — a thorough grep caught a
+  regression a narrow check would have shipped.
 - wake105 2026-06-07: #10 VERIFYING-BUILDING -> VERIFYING-RESOAK. Robust-fix build BUILD_EXIT=0. Cloned
   db-preprod-sync -> verify10e, ran robust binary (pid 47327): AUTO-DETECT confirmed on real blob ("txix_endianness
   =Big") + safety-net distribution sane (low 3131782 vs mult256 62, no trip). utxo_count=4116338 skipped=0. Node
