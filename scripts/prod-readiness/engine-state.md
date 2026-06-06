@@ -41,7 +41,7 @@
 
 ## In-progress
 - item: #1 ep57 preprod stake-distribution -10 ADA
-- state: REPRODUCING-pinpoint (2nd fix also INERT for ep57 [Dijkstra path, pre-Babbage]; orchestrator running clamp-instrumented replay to find the exact offending tx)
+- state: REPRODUCING-pinpoint (clamp hypothesis REFUTED by measurement: 0 clamps/skips through ep60; now measuring per-cred stake_map value directly to learn if clean replay even reproduces -5 ADA)
 - attempts: 1
 - ANALYZE RESULT (w6lsvu2p2, Opus): canonical Haskell active-stake =
   resolveActiveInstantStakeCredentials (Stake.hs @52ef3d5) — per registered+delegated
@@ -84,9 +84,11 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- pinpoint-build  pid-file=.jobs/pinpoint-build.pid  (node build + epoch-state-debug + STAKE_CLAMP/SKIP
-  logging added to common.rs Phase-2 subtract, UNCOMMITTED diagnostic). NEXT: replay db-clones to ep57
-  with RUST_LOG=dugite_ledger::stake_clamp=warn, grep for creds 630472f7 / 7d3e2b31 to find offending tx.
+- pinpoint-build2  pid-file=.jobs/pinpoint-build2.pid  (node rebuild; added per-cred STAKE_TRACE log in
+  epoch.rs mark-snapshot for the 2 target creds, UNCOMMITTED diagnostic). NEXT: replay to ep58, read
+  STAKE_TRACE -> dugite's ep57 utxo_stake/reward_balance/total for 630472f7 & 7d3e2b31. If utxo_stake =
+  9957549164/9815680998 (Koios) -> clean replay is CORRECT -> bug is NOT in immutable replay (fork/original-sync
+  induced). If short -> clean replay reproduces -> keep hunting live path.
 
 ## VERIFY FINDING (CORRECTED after gauntlet — my wake9 analysis was WRONG)
 - The apply_utxo_diff fix is INERT for ep57. Gauntlet wm055td32 REFUTED 2/3 (haskell-semantics +
@@ -162,3 +164,10 @@
   KEY PROCESS INSIGHT: worktree muscles CANNOT run the replay harness, so they cannot pinpoint the exact
   ep57 tx; the ORCHESTRATOR must. Added STAKE_CLAMP/SKIP logging to common.rs Phase-2 (uncommitted),
   building node+epoch-state-debug; next wake replays to ep57 and greps the 2 creds to find the offender.
+- wake16 2026-06-06T13:44Z: ran clamp-instrumented replay -> ZERO STAKE_CLAMP/SKIP events (any cred) through
+  ep60. The Phase-2 subtract is perfectly balanced on the clean replay -> clamp/missing-ADD hypothesis
+  REFUTED BY MEASUREMENT. Critical gap exposed: the engine never directly measured the per-cred stake_map
+  value from its own replay (summary dump lacks it). Added per-cred STAKE_TRACE log in epoch.rs snapshot;
+  rebuilding; next wake reads the actual ep57 value -> settles whether a clean immutable replay even
+  reproduces the -5 ADA (mounting evidence — 0/931 diff, 0 clamps — suggests it may NOT, i.e. the bug is
+  fork/original-sync-induced like the apply_utxo_diff path after all).
