@@ -34,8 +34,14 @@
    fork/original-sync hypothesis).
 2. [H][ledger] #11 mainnet stake-dereg residual (4 no-withdrawal cases diverge).
    state:NEW attempts:0  (replayable from db-mainnet; verify its epoch first)
-3. [H][ledger] mainnet ep213 reward divergence (REWARD-DIVERGENCE-MAINNET-ep213.md).
-   state:NEW attempts:0
+3. [H][ledger] mainnet ep213 reward divergence (== #11; doc dated 2026-06-04, RECENT -> likely REAL,
+   not stale like ep57). 4 target creds: 53215c471b7ac752e3ddf8f2c4c1e6ed111857bfaa675d5e31ce8bce,
+   6184f6e7229530a2d1f9f746112406100e2696dd7439ff8c52750700,
+   af22f95915a19cd57adb14c558dcc4a175f60c6193dc23b8bd2d8beb,
+   d9812f8d30b5db4b03e5b76cfd242db9cd2763da4671ed062be808a0. PLAN: mainnet from-genesis replay (db-mainnet,
+   ep331; LONG - Byron+) with DUGITE_EPOCH_STATE_DUMP_CRED_FILTER=<4 creds> -> per-cred dump at ep213 ->
+   compare vs koios.sh mainnet account_reward_history. NOTE: verify the finding isn't stale FIRST (re-read
+   the doc's repro method; it bisected ep213 so may have a faster pre-ep213-snapshot path). state:NEW attempts:0
 4. [M][phase2] #22 CEK V1/V2 Babbage residual (budget/Error/unIData buckets).
    state:NEW attempts:0
 5. [L][phase2] #14 V3 TxInfo deferred fields (inert until mainnet ep507).
@@ -226,3 +232,9 @@
   ZERO WithdrawalAmountMismatch/panic/ValidationTagMismatch/chain_diverged. The preprod ledger frontier is
   solidly byte-exact, not just ep57. Replay finishing to ep293; next wake rotates to mainnet (#3 ep213 /
   #11) armed with the per-cred dump.
+- wake25 2026-06-06T14:33Z: SCHEDULE prep (lock-free; preprod replay at ep267 still holds heavy-op lock).
+  db-mainnet usable (ep331 + ledger snapshots; Koios mainnet tip ep635). Mainnet ep213 finding is RECENT
+  (2026-06-04) so unlike ep57 it's likely REAL -> warrants a mainnet replay. Extracted the 4 target creds
+  for the per-cred filter. Next wake: when preprod replay (->ep293) frees the lock, START the mainnet
+  investigation (either a from-genesis replay, or the doc's faster bisect path if it has one) OR pick
+  phase2 #22 (doable on the already-present db-preprod-sync Babbage Plutus) if mainnet replay is too long.
