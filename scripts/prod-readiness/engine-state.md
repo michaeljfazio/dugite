@@ -153,7 +153,20 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:FIXING (ROBUST endianness). *** RE-GAUNTLET
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-BUILDING (ROBUST fix). *** muscle
+  w1m4bxztw COMPLETE wake103, checks_green, version/layout-INDEPENDENT, 2 crates (8 files +2080/-239) ***. DROPPED
+  layout-conditional endianness entirely. REPLACED with: (1) documented snapshotTablesCodecVersion as upstream's
+  authoritative disambiguator (not exposed to dugite import inputs today -> fall through); (2) EMPIRICAL
+  AUTO-DETECT detect_txix_endianness — samples first 2000 keys via RawKeyWalker, decodes under BOTH endiannesses,
+  picks the sane index distribution (dense [1,255], sparse at nonzero mult-256); TvarIterator::new auto-detects;
+  (3) HARD SAFETY NET assert_txix_distribution_sane (low > mult256*8) accumulated during import, ERRORS LOUD on
+  mis-key (no silent corruption). Multi-asset reconstruction (parse_multi_asset_rep) ported. ORACLES: legacy
+  preview fixture auto-detects LE -> txix==1 (BE read TRIPS the net); synth BE blob auto-detects Big -> txix==1;
+  deliberate mis-key TRIPS the net; both-endianness pinned. ROBUST patch saved
+  candidate-fix-10-ROBUST-autodetect-endianness.patch (2724 lines, applies clean) + applied to MAIN + build pid
+  46612 (.jobs/verify-build-10e.log). Handles ALL combos (flat/nested x LE/BE) by reading data = gauntlet-proof
+  by construction. NEXT WAKE: BUILD_EXIT=0 -> fresh import from db-preprod-sync (auto-detects BE) -> re-soak ->
+  KEEP 549->277 -> RE-GAUNTLET -> commit. was: state:FIXING (ROBUST endianness). *** RE-GAUNTLET
   wj0pzgzaq REFUTED 2/3 — layout-proxy is WRONG (gauntlet's 2nd correct catch) ***. Upstream history (2 refuters,
   convergent commit cites): flat-`tables` layout (~oc 0.25.0.0 Apr-2025) and the BE TxIx flip (BigEndianTxIn
   byteSwap16, commit 9ac9388 Aug-2025) and the flat-tables MOVE (286ad7ec8 Oct-2025) landed in DIFFERENT
@@ -399,9 +412,12 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- fix-muscle w1m4bxztw (#10 ROBUST endianness: codec-version/empirical auto-detect + safety net, Opus, worktree,
-  Tier A') — /workflows-visible. Poll next wake for FIX (both-fixture oracles + mis-key safety-net test).
-- re-gauntlet wj0pzgzaq — DONE (REFUTED 2/3: layout!=endianness; intermediate flat-LE & nested-BE formats exist).
+- verify-build-10e  pid 46612  log .jobs/verify-build-10e.log — release build of dugite-node with the ROBUST #10
+  fix (auto-detect endianness + safety net + multiasset + refscript + datum) on MAIN. Poll BUILD_EXIT=0 -> re-verify.
+- fix-muscle w1m4bxztw — COMPLETE (auto-detect, safety net, both-fixture oracles). patch
+  candidate-fix-10-ROBUST-autodetect-endianness.patch + worktree wf_bdd8b73d-b58-1.
+- import source db-preprod-sync/haskell-ledger/ INTACT; legacy fixture committed. db-clones/preprod-verify10d kept for #15.
+- Patch history: COMPLETE(base) / FULL(uncond-BE WRONG) / CONDITIONAL(layout WRONG) / ROBUST(auto-detect, current).
 - verify10d-resoak — STOPPED CLEAN wake96 (VERIFYING PASS: not-found 0, budget 0, ~279 Error-term=#15).
   db-clones/preprod-verify10d RETAINED (conditional-fix import state) for #15 (277 Error-term) diagnosis.
 - verify10c GC'd. CONDITIONAL #10 fix on MAIN uncommitted (commit on re-gauntlet pass). 94GB disk free.
@@ -727,6 +743,13 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake103 2026-06-07 (notification-triggered): #10 ROBUST endianness fix COMPLETE (muscle w1m4bxztw, Tier A',
+  checks_green, 2 crates). Version/layout-INDEPENDENT: empirical auto-detect (detect_txix_endianness samples 2000
+  keys, picks sane index distribution) + hard safety net (assert_txix_distribution_sane errors loud on mis-key) +
+  multiasset+refscript+datum. Oracles: legacy fixture->LE/txix==1, synth BE->txix==1, mis-key trips net,
+  both-endianness pinned. Saved ROBUST patch (2724 lines, applies clean), applied to main, launched build pid
+  46612. Advanced #10 FIXING -> VERIFYING-BUILDING. next: BUILD_EXIT=0 -> fresh import re-soak (keep 549->277) ->
+  RE-GAUNTLET (should find no uncovered combo — auto-detect reads data) -> commit. Did NOT commit.
 - wake102 2026-06-07: POLL #10 robust fix-muscle w1m4bxztw — RUNNING, healthy (4GB RAM, no nodes, 0 completed).
   In build/clippy-fixup (observe_txix auto-detect helper; .is_multiple_of lint) -> approaching build+nextest. Not
   disturbed; no competing work. #10 stays FIXING; next: poll -> re-import re-verify -> re-gauntlet -> commit.
