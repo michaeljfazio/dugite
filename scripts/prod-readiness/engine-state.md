@@ -1032,6 +1032,9 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake158 2026-06-07: POLL #10 FIX muscle wst6ekcg6 — still RUNNING, ACTIVE (Opus fix agent aec3ca671 in analysis/
+  oracle+build phase). No transition. Health: verify10j node (pid 63671, 37min) slot 125107058 block 4793980, 0
+  phase-1; disk 28G. #10 stays FIXING. NEXT WAKE: on fix green -> VERIFYING-replay 297 residual.
 - wake157 2026-06-07: POLL #10 FIX muscle wst6ekcg6 — still RUNNING, ACTIVE (worktree build+fmt/clippy/nextest).
   No transition. Health: verify10j node (pid 63671, 32min) slot 125106750 block 4793973, 0 phase-1; disk 28G. #10
   stays FIXING. NEXT WAKE: on fix green -> VERIFYING-replay 297 residual.
