@@ -152,7 +152,15 @@
   txout.rs:503/583) into OutputDatum::Inline(PlutusData) instead of None; (3) [TODO] residual-11 ref-script
   sub-case. RE-VERIFY target: Error-term + budget-exhausted + "not found" ALL clear on a fresh fast-start re-soak
   (full-replay byte-exact is the oracle). #10 patch stays on MAIN (correct base, no regression). next: expanded
-  fix-muscle. was: state:VERIFYING-RESOAK — build DONE (BUILD_EXIT=0,
+  fix-muscle. *** wake68: expanded fix-muscle wnqthg8c8 LAUNCHED *** (Opus, worktree, Tier A'). Main reverted
+  CLEAN (refscript changes removed; patch candidate-fix-10-mempack-refscript.patch is the base + applies clean to
+  HEAD). Muscle instructed: STEP0 git-apply the refscript patch, THEN (A) decode MemPackTxOut.datum ->
+  OutputDatum::Inline(PlutusData) at mod.rs:6440 (reuse existing PlutusData decoder; BinaryData=ShortByteString
+  wrapping original CBOR), (B) cover the residual-11 refscript sub-case (script 7afbde08... etc — likely
+  multi-asset tag-5). Given TWO oracles: extended refscript hash-oracle + NEW datum byte-oracle (decoded datum ==
+  Koios inline_datum for an input of tx 578069c6). Verify target: fresh re-import re-soak clears 290 Error-term +
+  41 budget + 11 not-found (full-replay = byte-exact oracle). next: poll wnqthg8c8 -> on pass, fresh re-import
+  re-verify -> gauntlet -> commit complete fix. was: state:VERIFYING-RESOAK — build DONE (BUILD_EXIT=0,
   fixed binary target/release/dugite-node @01:37 w/ #10 patch on MAIN uncommitted). DROVE the fresh import with
   the FIXED binary: cloned db-preprod-sync (had haskell-ledger/ + immutable/, NO dugite snapshot = import state)
   -> db-clones/preprod-verify10, ran fixed binary (pid 46355, /tmp/engine-verify10.sock, port 4204). Log
@@ -230,11 +238,11 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- verify10-resoak — STOPPED CLEAN wake67 (SIGTERM; verdict captured: refscript resolution 379->11, but exposed
-  290 Error-term + 41 budget-exhausted eval-divergences from dropped inline datums @mod.rs:6440). RAM freed.
-  db-clones/preprod-verify10 retained (fixed-binary import w/ script_ref) for reference.
-- verify-build-10 — DONE (BUILD_EXIT=0). Fixed binary built. #10 refscript patch still on MAIN uncommitted
-  (correct base for the expanded inline-datum fix; commit gated on full re-verify + gauntlet).
+- fix-muscle wnqthg8c8 (#10 EXPANDED: inline-datum decode + residual-11 refscript, Opus, worktree, Tier A') —
+  /workflows-visible. Applies refscript patch first, then extends. Poll next wake for FIX result (datum oracle +
+  refscript hash-oracle). On pass -> fresh re-import re-verify (clears 290 Error-term + 41 budget + 11 not-found).
+- MAIN is CLEAN (refscript changes reverted; preserved as candidate-fix-10-mempack-refscript.patch, applies clean).
+- verify10-resoak — STOPPED CLEAN wake67. db-clones/preprod-verify10 retained for reference.
 - fix-muscle we0nz74zr — COMPLETE (hash-oracle PASSED). Patch candidate-fix-10-mempack-refscript.patch + worktree.
 - live-soak — STOPPED CLEAN wake65 (SIGTERM; ep293 snapshot saved; gate-2 VALIDATED banked).
 - replay-measure  pid-file=.jobs/replay-measure.pid  (clean HEAD from-genesis replay climbing past ep93
@@ -542,6 +550,14 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake68 2026-06-07: DRIVE #10 EXPANDED FIX. Reverted main's refscript changes CLEAN (patch preserved + applies
+  clean to HEAD), then launched expanded fix-muscle wnqthg8c8 (Opus, worktree, Tier A') to: git-apply the
+  refscript patch as the base, then (A) decode inline datums (MemPackTxOut.datum -> OutputDatum::Inline at
+  mod.rs:6440, reusing the existing PlutusData decoder) + (B) cover the residual-11 refscript sub-case
+  (7afbde08... etc, likely multi-asset tag-5). Gave it a NEW datum byte-oracle (decoded datum == Koios
+  inline_datum) on top of the refscript hash-oracle. Did NOT block on the muscle (long build+nextest). State
+  stays FIXING-EXPANDED. next: poll wnqthg8c8 -> fresh re-import re-verify (full-replay byte-exact oracle) ->
+  gauntlet -> commit the COMPLETE fix (refscripts+datums+residual) as one focused 2-crate unit.
 - wake67 2026-06-07: #10 VERIFYING VERDICT — fix CORRECT but INSUFFICIENT (the gate did its job: BLOCKS a
   premature commit). The fresh fixed-binary re-import re-soak cut "script not found" 379->11 (97%) and zeroed
   MissingScriptWitness; hash-oracle target txs now resolve; NO regression. But resolving scripts EXPOSED 290
