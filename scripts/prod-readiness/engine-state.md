@@ -153,7 +153,22 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:FIXING (authoritative endianness rework). ***
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-BUILDING (AUTHORITATIVE fix). ***
+  rework muscle wjnl2t2ib COMPLETE wake119, checks_green, addresses ALL 3 gauntlet refutations, 2 crates ***.
+  UPSTREAM PROOF (resolves wake115): Ouroboros.Consensus...Snapshots `data TablesCodecVersion=TablesCodecVersion1`
+  Haddock LITERALLY "Used in cardano-node 10.7. Previous versions have no codec version. [(txid, big-endian
+  txix)]"; enforceVersion: 1->ok, _->fail. So version field (introduced separately in 10.7, NOT at the BE-flip
+  commit) IS authoritative: tablesCodecVersion=1 -> BE; absent -> legacy host-LE; other -> ERROR. FIX:
+  TxIxEndianness::from_tables_codec_version (Some(1)=Big/None=Little/else Err) is the DECISION-maker; node import
+  reads haskell-ledger/<slot>/meta (ERROR if missing - "refuse to guess"), maps authoritatively, then
+  cross_validate_txix_endianness re-derives empirically as INDEPENDENT defense (errors only on CLEAR
+  contradiction); detect/is_sane demoted to cross-validation. 11 new unit tests (version maps, malformed->Err,
+  cross-val pass/contradiction/ambiguous-defers) + gated real-preprod oracle (meta=1->Big, UTxO 00000c0c#1->
+  txix==1 coin 1750000) + legacy LE fixture. serde_json dev->deps. AUTHORITATIVE patch saved
+  candidate-fix-10-AUTHORITATIVE-codecversion.patch (3282 lines) + applied to MAIN + build pid 23735
+  (.jobs/verify-build-10g.log). NEXT WAKE: BUILD_EXIT=0 -> re-import re-soak -> 0 phase-1 rejections (full
+  rejection-class scan) -> RE-GAUNTLET (now authoritative, error-on-ambiguity, independent cross-val) -> commit.
+  was: state:FIXING (authoritative endianness rework). ***
   GAUNTLET wmpyis3tx REFUTED (edge-epoch, decisive + correct) — gauntlet's 3rd catch, the most important ***.
   The FINAL fix's endianness uses an EMPIRICAL auto-detect HEURISTIC -> violates cardinal rule (byte-exact ONLY,
   NEVER heuristics); its 'safety net' re-runs the SAME is_sane() predicate (NOT independent, "first test twice");
@@ -463,11 +478,13 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- fix-muscle wjnl2t2ib (#10 authoritative-endianness rework: read tablesCodecVersion, error-on-ambiguity,
-  Opus, worktree, Tier A') — /workflows-visible. Poll next wake for FIX (version->endianness from upstream).
-- re-gauntlet wmpyis3tx — REFUTED (edge-epoch decisive; acted on it, did not wait for aggregate). Output file has
-  the full verdict.
-- db-clones/preprod-verify10f RETAINED for #15. FINAL patch (heuristic endianness) preserved but SUPERSEDED.
+- verify-build-10g  pid 23735  log .jobs/verify-build-10g.log — release build of dugite-node with the
+  AUTHORITATIVE #10 fix (codec-version endianness + error-on-ambiguity + independent cross-val) on MAIN.
+  Poll BUILD_EXIT=0 -> re-import re-verify.
+- fix-muscle wjnl2t2ib — COMPLETE (authoritative codec-version endianness; addresses all 3 gauntlet refutes).
+  patch candidate-fix-10-AUTHORITATIVE-codecversion.patch + worktree wf_fc714d5e-a00-1.
+- re-gauntlet wmpyis3tx — DONE 3/3 REFUTED (drove this rework). db-clones/preprod-verify10f kept for #15.
+- Patch history: ...FINAL(heuristic, 3/3 refuted) -> AUTHORITATIVE(codec-version, current candidate).
 - fix-muscle w34va8uxf — COMPLETE (multi-asset tag0/1 fix; real-blob oracle PASS). FINAL patch
   candidate-fix-10-FINAL-autodetect-multiasset.patch + worktree wf_4f715407-1de-1.
 - import source db-preprod-sync/haskell-ledger/ INTACT. db-clones/preprod-verify10e kept for #15.
@@ -806,6 +823,14 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake119 2026-06-07 (notification): #10 AUTHORITATIVE endianness fix COMPLETE (muscle wjnl2t2ib, Tier A',
+  checks_green). Resolved wake115: upstream Haddock proves TablesCodecVersion1 = "big-endian txix" (cardano-node
+  10.7+; absent=legacy LE; else ERROR) — version IS authoritative despite the BE-flip commit not bumping it
+  (version field added separately). Fix: from_tables_codec_version decides; node reads meta (ERROR if missing);
+  cross_validate is now INDEPENDENT (errors on contradiction); detect/is_sane demoted. Addresses all 3 unanimous
+  gauntlet refutations (heuristic->authoritative; same-predicate->independent; nonzero==0-default-Big->error).
+  Assembled AUTHORITATIVE patch (3282 lines, 2 crates), applied to main, build pid 23735. #10 FIXING ->
+  VERIFYING-BUILDING. next: BUILD_EXIT=0 -> re-soak (0 phase-1 rejections) -> re-gauntlet -> commit. Did NOT commit.
 - wake118 2026-06-07: POLL #10 rework muscle wjnl2t2ib — at FINAL gate (running nextest --workspace). Authoritative
   meta-derived endianness implemented + tests. Imminent completion. Not disturbed. #10 stays FIXING. next
   (notif/poll): read FIX -> re-import re-soak (0 phase-1 rejections, meta-derived endianness) -> re-gauntlet
