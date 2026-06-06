@@ -20,9 +20,10 @@
 ## Backlog  (ranked by impact; one advanced per wake)
 1. [H][ledger] ep57 preprod stake-distribution -10 ADA  (2 delegators each -5 ADA;
    root-caused to UTxO-set content / addr->cred attribution, NOT incremental upkeep;
-   feeds ep181 WithdrawalAmountMismatch). state:NEW attempts:0
+   feeds ep181 WithdrawalAmountMismatch). state:REPRODUCING attempts:1
+   blocked-on: acquiring db-preprod-sync (mithril) + epoch-state-debug binary
 2. [H][ledger] #11 mainnet stake-dereg residual (4 no-withdrawal cases diverge).
-   state:NEW attempts:0
+   state:NEW attempts:0  (replayable from db-mainnet; verify its epoch first)
 3. [H][ledger] mainnet ep213 reward divergence (REWARD-DIVERGENCE-MAINNET-ep213.md).
    state:NEW attempts:0
 4. [M][phase2] #22 CEK V1/V2 Babbage residual (budget/Error/unIData buckets).
@@ -31,19 +32,34 @@
    state:NEW attempts:0
 
 ## In-progress
-(none)
+- item: #1 ep57 preprod stake-distribution -10 ADA
+- state: REPRODUCING (precondition: build epoch-state-debug binary + acquire preprod db)
+- attempts: 1
+- next: when both jobs are `done`, wipe snapshot/utxo in db-preprod-sync, launch a
+  from-genesis replay with DUGITE_EPOCH_STATE_DUMP + DUGITE_REWARD_DBG, target ep57,
+  diff stake_distribution vs Koios pool_delegators_history for pool1n84mel6 ep57.
 
 ## Running jobs
-(none)
+- build-epoch-debug  pid=7191  log=scripts/prod-readiness/.jobs/build-epoch-debug.log
+  (cargo build --release -p dugite-node --features dugite-ledger/epoch-state-debug)
+- mithril-preprod    pid=7284  log=scripts/prod-readiness/.jobs/mithril-preprod.log
+  (mithril-import magic=1 -> db-preprod-sync; snapshot epoch=293 immutable=5786 ~3.3GB)
 
 ## DB clones on disk
-(none)
+(none yet — will clone db-preprod-sync after mithril import completes)
 
 ## Gauntlet ledger  (passed/refuted approaches — never silently retry a REFUTED)
 (none)
 
 ## Token spend  (rolling; UTC-dated lines)
-(none)
+- 2026-06-06T11:41Z wake1 ~ build+mithril launch (assess+drive)
 
 ## Last node state
-- sampled: never
+- sampled: 2026-06-06T11:40Z  node_pids="" rss_mb=0 free_disk_gb=205 free_ram_gb=5 jobs=0 halt=false
+
+## Wake log
+- wake1 2026-06-06T11:41Z: ASSESS found no db-preprod-sync (only db-mainnet + db-preprod-haskell
+  [cardano-node format]). SCHEDULE picked #1 (top impact); its precondition is a preprod dugite
+  db + the epoch-state-debug binary. DRIVE launched both as background jobs under the heavy-op
+  lock (build=CPU, mithril=IO — recorded concurrency: different resource classes, both blocking
+  prerequisites). RESCHEDULE ~1200s to let both finish.
