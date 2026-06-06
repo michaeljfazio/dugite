@@ -33,7 +33,7 @@
 
 ## In-progress
 - item: #1 ep57 preprod stake-distribution -10 ADA
-- state: VERIFYING (fixed binary built; fixed-binary from-genesis replay RUNNING; fix UNCOMMITTED)
+- state: GAUNTLET (replay-gate proven inapplicable; regression-test+parity evidence; gauntlet running; fix UNCOMMITTED)
 - attempts: 1
 - ANALYZE RESULT (w6lsvu2p2, Opus): canonical Haskell active-stake =
   resolveActiveInstantStakeCredentials (Stake.hs @52ef3d5) — per registered+delegated
@@ -76,11 +76,19 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- replay-preprod-ep57-FIXED  pid-file=.jobs/preprod-ep57-fixed.pid  (fixed-binary from-genesis
-  replay -> dumps at epoch-dumps-engine/preprod-ep57-fixed/; heavy-op lock held). Fix (2 files)
-  applied to MAIN working tree UNCOMMITTED, pending the verify gate. NEXT WAKE: poll done, then
-  diff epoch_000057.json fixed-vs-unfixed (epoch-dumps-engine/preprod-ep57 = unfixed baseline);
-  if identical -> clean replay can't exercise the fork path -> escalate to gauntlet + live re-sync.
+- gauntlet-muscle  workflow=wm055td32  (3 Opus refuters on the ep57 fix). Fix (2 files) applied to MAIN working
+  tree UNCOMMITTED, pending gauntlet pass.
+
+## VERIFY FINDING (decisive)
+- Fixed-vs-unfixed from-genesis ep57 dump diff = 0/931 fields -> a clean IMMUTABLE replay never
+  invokes the fork-rollback reconstruction path, so it neither reproduces the bug nor reflects the
+  fix. The "immutable replay reproduces Koios" gate is STRUCTURALLY INAPPLICABLE to this fork-path bug.
+- Clean-replay ep57 SET total_active_stake 254384027228099 == Koios epoch_info.active_stake BYTE-EXACT
+  -> clean replay is correct (no -10 ADA), confirming the bug is fork-rollback-only.
+- Therefore verification = regression test (deterministic fork-rollback reproduction, passes) +
+  parity-by-construction (reconstruction reuses the known-correct live stake_routing) + Haskell match
+  + adversarial gauntlet. End-to-end tripwire: a LIVE from-genesis re-sync must reach PAST ep181
+  (original WithdrawalAmountMismatch halt) without halting (queued, post-commit continuous check).
 
 ## DB clones on disk
 - db-clones/preprod-ep57         (unfixed-binary replay; baseline dump captured)
@@ -115,3 +123,6 @@
   lovelace x2 rules out reward balance -> structural UTxO instant-stake attribution (prior finding).
   ANALYZING->FIXING; launched fix muscle whq17wl1f (Opus, worktree). Fix gated on VERIFYING replay
   reproducing 26538160048802 + gauntlet before any commit.
+- wake9 2026-06-06T12:49Z: VERIFY decisive — fixed-vs-unfixed ep57 dump 0/931 diffs (fork-path bug,
+  immutable replay can't exercise it); clean-replay SET total 254384027228099 == Koios byte-exact.
+  Replay-gate ruled inapplicable; launched gauntlet wm055td32 with regression-test+parity evidence.
