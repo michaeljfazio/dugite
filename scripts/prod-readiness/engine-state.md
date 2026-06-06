@@ -153,7 +153,14 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-BUILDING (CONDITIONAL fix). *** muscle
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-RESOAK (CONDITIONAL fix). Build DONE
+  (BUILD_EXIT=0, 1m39s). DROVE re-verify: cloned db-preprod-sync -> verify10d, ran CONDITIONAL-fix binary
+  (pid 2797, port 4207). Import log CONFIRMS the conditional logic: "txix_endianness=Big" for the flat `tables`
+  new-format snapshot (legacy/LE path covered by green unit test test_legacy_fixture_first_entry_txix_le).
+  utxo_count=4116338 skipped=0. Node syncing 124999169 -> tip. NEXT WAKE VERDICT: grep verify10d-resoak.log —
+  must MATCH verify10c (549->277, not-found 0, budget 0, 4/5 target slots clean); if so the conditional fix is
+  chain-equivalent for the new format AND legacy is unit-proven -> RE-GAUNTLET -> commit. was:
+  state:VERIFYING-BUILDING (CONDITIONAL fix). *** muscle
   wauynb0ku COMPLETE wake94, checks_green, addresses the gauntlet's legacy regression, 2 crates ***. Replaced
   unconditional-BE with snapshot-version-CONDITIONAL endianness: `enum TxIxEndianness{Little,Big}`;
   decode_mempack_txin(data, endianness); TvarIterator::new_with_endianness; resolve_inmemory_tables_path returns
@@ -373,8 +380,11 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- verify-build-10d  pid 2336  log .jobs/verify-build-10d.log — release build of dugite-node with the CONDITIONAL
-  #10 fix on MAIN. Poll for BUILD_EXIT=0 -> fresh-import re-verify.
+- verify10d-resoak  pid 2797  log .jobs/verify10d-resoak.log  socket /tmp/engine-verify10d.sock port 4207
+  db-clones/preprod-verify10d — CONDITIONAL-fix node (txix_endianness=Big confirmed for new format), syncing.
+  NEXT WAKE VERDICT: grep failing slots -> must match 549->277 (not-found 0, budget 0). SIGTERM-only.
+  DISK NOTE: 94GB free, clones accumulating (verify10c+10d+mainnet-ep213) -> GC verify10c after #15 or next wake.
+- verify-build-10d — DONE (BUILD_EXIT=0). CONDITIONAL #10 fix on MAIN uncommitted (gated on re-verify+re-gauntlet).
 - fix-muscle wauynb0ku — COMPLETE (format-conditional, both pinned tests). patch
   candidate-fix-10-CONDITIONAL-endianness.patch + worktree wf_4e02da23-a01-1.
 - import source db-preprod-sync/haskell-ledger/ INTACT; legacy fixture committed (test_fixtures/preview_tvar_head_64k.bin).
@@ -697,6 +707,11 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake95 2026-06-07: #10 VERIFYING-BUILDING -> VERIFYING-RESOAK. Conditional-fix build BUILD_EXIT=0. Cloned
+  db-preprod-sync -> verify10d, ran conditional binary (pid 2797): import log confirms "txix_endianness=Big" for
+  the flat-tables new format (legacy/LE unit-proven). utxo_count=4116338 skipped=0. Node syncing. Deferred verdict
+  grep (one-step). next: grep verify10d-resoak.log -> must match 549->277 -> RE-GAUNTLET -> commit. 3GB RAM,
+  94GB disk (GC clones soon).
 - wake94 2026-06-07 (notification-triggered): #10 CONDITIONAL endianness fix COMPLETE (muscle wauynb0ku, Tier A',
   checks_green, 2 crates). enum TxIxEndianness{Little,Big} branched at resolve_inmemory_tables_path (flat tables->
   Big, nested tvar->Little); decode_mempack_txin + TvarIterator take endianness; BOTH pinned tests kept + legacy-
