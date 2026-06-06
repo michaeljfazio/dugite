@@ -15,11 +15,16 @@
 //! at its declared exUnits and returns `Err(BudgetExhausted)` if the CEK
 //! exceeds it, so a passing eval == "validated within declared budget".
 //!
-//! Currently these FAIL: dugite's CEK over-charges memory by <1% on real
-//! Babbage scripts (issue #730 — not a cost-parameter bug; parameters are
-//! byte-exact on-chain, verified; the divergence is in CEK step accounting).
-//! Marked `#[ignore]` until the #730 fix lands, at which point un-ignore so
-//! this guards the on-chain budget path in CI permanently.
+//! These were FAILING (#730): dugite over-charged real Babbage scripts by a
+//! fixed +542,489 cpu / +1,102 mem. Root cause was NOT a cost-parameter or
+//! CEK-accounting bug (both byte-exact) — it was the PlutusV1/V2
+//! `txInfoValidRange` upper-bound closure. cardano-ledger's Alonzo/Babbage
+//! `transValidityInterval` builds a ttl-only range with `PV1.to t =
+//! UpperBound (Finite t) True` (CLOSED), but dugite was emitting `False`
+//! (open), flipping one boundary comparison in every validity-range check and
+//! costing one extra `equalsInteger` + `ifThenElse` + ~11 CEK steps. Fixed in
+//! `script_context.rs::PosixTimeRange::to_data` (era-aware closure). tx0 now
+//! consumes EXACTLY its declared exUnits (cpu=512453022, mem=1734298).
 
 use dugite_uplc::phase_two::{eval_phase_two_raw, SlotConfig};
 use std::path::PathBuf;
@@ -91,7 +96,6 @@ fn eval_onchain_fixture(name: &str) -> Result<usize, String> {
 /// Every captured on-chain-valid Babbage tx must validate within its declared
 /// budget under dugite's on-chain cost-model CEK path.
 #[test]
-#[ignore = "#730: dugite CEK over-charges memory <1% on real Babbage scripts; un-ignore when fixed"]
 fn onchain_babbage_scripts_validate_within_declared_budget() {
     let fixtures = ["tx0.json", "tx1.json", "tx6.json"];
     let mut failures = Vec::new();

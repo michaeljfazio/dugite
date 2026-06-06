@@ -127,7 +127,7 @@ fn posix_time_range_always_valid_has_correct_structure() {
         lower: None,
         upper: None,
     };
-    let d = r.to_data();
+    let d = r.to_data(false);
 
     // Outer: Interval = Constr 0 [lower_bound, upper_bound]
     let Data::Constr(0, ref outer_fields) = d else {
@@ -187,7 +187,7 @@ fn posix_time_range_finite_bounds_have_correct_structure() {
         lower: Some(vs_ms),
         upper: Some(ttl_ms),
     };
-    let d = r.to_data();
+    let d = r.to_data(false);
 
     let Data::Constr(0, ref outer) = d else {
         panic!("Interval must be Constr 0");
@@ -232,7 +232,7 @@ fn posix_time_range_does_not_use_old_flat_encoding() {
         lower: Some(1_000_000i64),
         upper: Some(2_000_000i64),
     };
-    let d = r.to_data();
+    let d = r.to_data(false);
     let Data::Constr(0, ref outer) = d else {
         panic!("must be Constr 0");
     };
