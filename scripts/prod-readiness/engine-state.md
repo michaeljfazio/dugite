@@ -883,6 +883,19 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake132 2026-06-07: POLL #10 re-gauntlet w4007sv2k — 2/3 reported, BOTH refuted and AGREE (so not a wake122-
+  style contradiction). FINAL2's meta-absent tolerance is TOO LENIENT: (1) field-absent/null in a PRESENT meta
+  must be ERR (upstream FromJSON mandatory `.: tablesCodecVersion` -> MetadataInvalid -> hard error in converter
+  AND loader); my wake123 over-generalization (tolerate field-absent like file-absent) was wrong — wake122's
+  compounding-feedback was right. (2) DEEP: wake123's getMetadata analog returns Maybe CRC; its Nothing = skip-CRC
+  NOT decode-LE; the actual loader V2/InMemory.loadSnapshot decodes BigEndianTxIx UNCONDITIONALLY + hard-fails on
+  missing/invalid meta -> the "version decides endianness, absent=>LE" model may be a dugite invention. (3) backend
+  field not validated. EVERY refuter CONFIRMS the core modern-BE fix is correct (chain-verified 0 phase-1); all
+  disputes are edge metas the real import never hits. DECISION (wake122 lesson, esp. given the meta-absent
+  flip-flop): WAIT for the 3rd refuter -> full aggregate -> ONE remediation with a DEFINITIVE truth table
+  (file-absent/field-absent/null/version/backend => exact upstream behavior, LOADER analog). Likely STRICT:
+  version=1+backend=mem=>BE, else ERROR; decide meta-FILE-absent (legacy LE) deliberately, not by guess. #10 stays
+  GAUNTLET-PENDING. Did NOT commit, did NOT launch remediation yet.
 - wake131 2026-06-07: *** #10 FULL VERIFYING PASS (FINAL2) *** verify10h re-soak: 0 phase-1 transaction
   rejections (all classes), codec_version=Some(1)->Big, only 292 #15 Error-term. Synced past all failing slots.
   SIGTERM'd verify10h (kept db for #15). Launched RE-GAUNTLET w4007sv2k on FINAL2 (authoritative + meta-absent
