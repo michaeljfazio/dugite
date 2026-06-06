@@ -33,7 +33,7 @@
 
 ## In-progress
 - item: #1 ep57 preprod stake-distribution -10 ADA
-- state: FIXING (analyze DONE; root-cause disambiguated; fix muscle launched)
+- state: VERIFYING (fix DONE by whq17wl1f; building fixed binary; fix UNCOMMITTED)
 - attempts: 1
 - ANALYZE RESULT (w6lsvu2p2, Opus): canonical Haskell active-stake =
   resolveActiveInstantStakeCredentials (Stake.hs @52ef3d5) — per registered+delegated
@@ -46,8 +46,22 @@
   NOT the reward-balance term. Fix target = the UTxO->credential instant-stake routing
   (crates/dugite-ledger/src/eras/common.rs::apply_utxo_changes + stake_routing rebuild),
   matching the canonical per-credential UTxO aggregation. Tier A.
-- GATE: fix is NOT trusted until a VERIFYING replay reproduces ep57 active_stake
-  26538160048802 (koios.sh preprod) with the -10 ADA gone, then the gauntlet passes.
+- FIX RESULT (whq17wl1f, Opus, Tier A, checks_green): ROOT CAUSE = apply_utxo_diff in
+  crates/dugite-ledger/src/ledger_seq.rs (the state-RECONSTRUCTION path used by
+  rollback_via_seq after FORK rollbacks) mutated only the UTxO set, never
+  stake_distribution.stake_map/ptr_stake. The LIVE apply path (apply_utxo_changes) keeps
+  per-cred instant-stake incrementally; reconstruction did not -> fork rollback dropped the
+  per-cred stake while inverting UTxO -> exact 5-ADA add/subtract asymmetry. FIX: reconstruction
+  now reuses the SAME stake_routing as the live path (parity by construction); inserts ADD,
+  deletes SUBTRACT. Regression test apply_utxo_diff_replays_credential_stake_not_just_utxo_set.
+  Haskell: resolveActiveInstantStakeCredentials (Stake.hs) active=instant_stake<>balance, deposit NOT included.
+- VERIFICATION NUANCE: this is a FORK-ROLLBACK-path bug. A clean from-genesis IMMUTABLE replay
+  has no forks, so it may NOT reproduce the -10 ADA (dump also lacks per-pool active_stake).
+  PLAN: (1) fixed-binary from-genesis replay; diff ep57 dump vs the saved UNFIXED dump
+  (epoch-dumps-engine/preprod-ep57). If different -> compare to Koios. If identical -> clean
+  replay can't exercise the fork path; escalate to regression-test + gauntlet + a queued LIVE
+  re-sync (true end-to-end: network forks, match Koios ep48-181). (2) COMMIT ONLY after byte-exact
+  end-to-end confirms (honoring 'byte-exact or it isn't fixed'). Koios ref: ep57 active_stake 26538160048802.
 - reproduced: YES, byte-exact vs AUTHORITATIVE preprod.koios.rest (ep293, real chain):
   ep57 pool1n84mel6 active_stake: Koios 26538160048802 vs dugite 26538150048802 = -10 ADA.
   Localized (prior + confirmed): 2 delegators each -5 ADA, creds 630472f7bfeb8fde...b40d
@@ -62,8 +76,9 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- fix-muscle  workflow=whq17wl1f  (Fix phase, Opus, isolated worktree — implementing the
-  UTxO instant-stake attribution fix in dugite-ledger; runs fmt+clippy+nextest)
+- verify-build  pid-file=.jobs/verify-build.pid  (cargo build --release fixed binary +
+  epoch-state-debug; heavy-op lock held). Fix (2 files) applied to MAIN working tree
+  UNCOMMITTED, pending the verify gate.
 
 ## DB clones on disk
 - db-clones/preprod-ep57  (CoW clone of db-preprod-sync; snapshot/haskell-ledger wiped
