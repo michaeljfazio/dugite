@@ -971,6 +971,9 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake151 2026-06-07: POLL #10 RE-GAUNTLET wetwroth8 — still RUNNING (3 Opus refuters). No transition possible.
+  Health: verify10j node (pid 63671, 7min) at slot 125105256 block 4793919, still 0 phase-1 rejections; disk 28G
+  free (stable). #10 stays GAUNTLET-PENDING. NEXT WAKE: on gauntlet PASS -> COMMIT #10 via gh/HTTPS.
 - wake150 2026-06-07: #10 FULL-VERDICT PASS -> VERIFYING-RESOAK -> GAUNTLET-PENDING. verify10j synced 124999533
   ->125105013, 0 phase-1 rejections (all classes, == STRICT verify10i); 13 non-#15 ERRORs all benign (DNS/cost-
   model-fallback/chain_diverged=false); residual 297 = #15. Launched RE-GAUNTLET muscle wetwroth8 (wf_436d43b5-37f)
