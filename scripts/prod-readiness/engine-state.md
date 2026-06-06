@@ -153,7 +153,18 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:FIXING (endianness REFINEMENT). *** GAUNTLET
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-BUILDING (CONDITIONAL fix). *** muscle
+  wauynb0ku COMPLETE wake94, checks_green, addresses the gauntlet's legacy regression, 2 crates ***. Replaced
+  unconditional-BE with snapshot-version-CONDITIONAL endianness: `enum TxIxEndianness{Little,Big}`;
+  decode_mempack_txin(data, endianness); TvarIterator::new_with_endianness; resolve_inmemory_tables_path returns
+  (PathBuf, TxIxEndianness) = flat `tables`->Big (BigEndianTxIn byteSwap16), nested `tables/tvar`->Little (raw
+  MemPack Word16). Kept BOTH pinned tests (BE-new + LE-legacy) + test_legacy_fixture_first_entry_txix_le (legacy
+  fixture first entry -> txix==1 under LE, 256 under BE = mirror-regression guard). Multi-asset+refscript+datum
+  carried over. Both canonical Haskell sources quoted. CONDITIONAL patch saved
+  candidate-fix-10-CONDITIONAL-endianness.patch (2395 lines, applies clean) + applied to MAIN + build pid 2336
+  (.jobs/verify-build-10d.log). NEXT WAKE: BUILD_EXIT=0 -> fresh import from db-preprod-sync (NEW format=BE) ->
+  re-soak -> KEEP 549->277 (not-found+budget still 0) -> RE-GAUNTLET (must now clear the legacy-LE dissent) ->
+  commit. was: state:FIXING (endianness REFINEMENT). *** GAUNTLET
   wqwgen1p0 verdict wake89: passed 2-1 (refuteCount=1) BUT the dissent is EMPIRICALLY CORRECT -> DID NOT COMMIT
   (don't blindly trust majority) ***. The unconditional-BE TxIx fix is WRONG for legacy snapshots: TxIx
   endianness is SNAPSHOT-VERSION-DEPENDENT. I VERIFIED byte-by-byte: new flat `tables` (>=11.0.1) index1=`00 01`=BE
@@ -362,12 +373,13 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- fix-muscle wauynb0ku (#10 endianness REFINEMENT: format-conditional LE/BE, Opus, worktree, Tier A') —
-  /workflows-visible. Poll next wake for FIX result (both-fixtures key-correctness oracle). On pass -> re-import re-verify.
-- gauntlet wqwgen1p0 — DONE (2-1 pass, but dissent EMPIRICALLY CORRECT: legacy=LE/new=BE). Drove the refinement.
+- verify-build-10d  pid 2336  log .jobs/verify-build-10d.log — release build of dugite-node with the CONDITIONAL
+  #10 fix on MAIN. Poll for BUILD_EXIT=0 -> fresh-import re-verify.
+- fix-muscle wauynb0ku — COMPLETE (format-conditional, both pinned tests). patch
+  candidate-fix-10-CONDITIONAL-endianness.patch + worktree wf_4e02da23-a01-1.
+- import source db-preprod-sync/haskell-ledger/ INTACT; legacy fixture committed (test_fixtures/preview_tvar_head_64k.bin).
 - db-clones/preprod-verify10c RETAINED for #15 (277 Error-term) diagnosis.
-- MAIN CLEAN. Patches retained: candidate-fix-10-COMPLETE-refscript-datum.patch (base, no endianness),
-  candidate-fix-10-FULL-...-endianness.patch (has the WRONG unconditional-BE — do NOT commit as-is).
+- Patch history: COMPLETE (base, no endianness), FULL (WRONG unconditional-BE — do NOT commit), CONDITIONAL (correct).
 - fix-muscle wagcpug42 — COMPLETE (key-correctness oracles pass). FULL patch
   candidate-fix-10-FULL-refscript-datum-endianness.patch + worktree wf_843d9ff3-1d5-1.
 - import source: db-preprod-sync/haskell-ledger/ INTACT for the re-verify.
@@ -685,6 +697,14 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake94 2026-06-07 (notification-triggered): #10 CONDITIONAL endianness fix COMPLETE (muscle wauynb0ku, Tier A',
+  checks_green, 2 crates). enum TxIxEndianness{Little,Big} branched at resolve_inmemory_tables_path (flat tables->
+  Big, nested tvar->Little); decode_mempack_txin + TvarIterator take endianness; BOTH pinned tests kept + legacy-
+  fixture LE oracle (first entry->txix==1 under LE, 256 under BE). Multi-asset+refscript+datum carried over. Both
+  canonical Haskell sources quoted. Saved CONDITIONAL patch (2395 lines, applies clean), applied to main, launched
+  build pid 2336. Advanced #10 FIXING -> VERIFYING-BUILDING. next: BUILD_EXIT=0 -> fresh import re-soak (keep
+  549->277) -> RE-GAUNTLET (must clear the legacy dissent) -> commit. Did NOT commit (chain re-verify + re-gauntlet
+  pending).
 - wake93 2026-06-07: POLL #10 refinement muscle wauynb0ku — at FINAL gate (clippy clean; running nextest
   --workspace). Imminent completion. Not disturbed. Re-verify prep stands (db-preprod-sync import source intact +
   legacy fixture committed). #10 stays FIXING. next (notif/poll): read FIX -> fresh re-import re-soak (both formats:
