@@ -162,7 +162,16 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-BUILDING (FINAL-DONE). *** muscle
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-RESOAK (FINAL-DONE). *** wake149:
+  BUILD_EXIT=0 (FINAL-DONE binary built Jun7 07:14). DROVE re-import re-soak: GC'd verify10b (-2G CoW), CoW-cloned
+  db-preprod-sync -> db-clones/preprod-verify10j, launched FINAL-DONE node pid 63671 port 4211 sock
+  /tmp/engine-verify10j.sock. Import log byte-exact: "(strict: only version 1 => big-endian is accepted)
+  codec_version=1 txix_endianness=Big", 4116339 UTxOs loaded, snapshot saved ep293. 0 phase-1 rejections so far
+  (all classes). Node live-syncing forward 124999533 -> chain tip 125104880 (~105K slots; will process blocks
+  referencing imported snapshot UTxOs = real keying test). NEXT WAKE FULL-VERDICT: scan ALL rejection classes ->
+  must be 0 phase-1 (identical to STRICT verify10i, since real preprod meta=integer1=BE same path) -> RE-GAUNTLET
+  FINAL-DONE (should PASS: float-parse now Aeson-exact, claim accurate, CRC=#17) -> COMMIT #10 via gh/HTTPS (2
+  crates: dugite-serialization + dugite-node). was: state:VERIFYING-BUILDING (FINAL-DONE). *** muscle
   w3cxa15va COMPLETE wake147, checks_green, 2 crates ***. json_number_to_word8_codec_version mirrors Aeson
   toBoundedInteger@Word8 EXACTLY: 1.0/1e0/100e-2=>1=>Big (accepted like upstream); 1.5=>Err(non-integral);
   256/-1=>Err(out-of-Word8); 2.0=>Err(unknown version); "1"=>Err(string); then enforceVersion narrows to ==1.
@@ -951,6 +960,11 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake149 2026-06-07: #10 BUILD_EXIT=0 (FINAL-DONE binary, Jun7 07:14). DROVE VERIFYING-BUILDING -> VERIFYING-
+  RESOAK: GC'd verify10b (-2G), CoW-cloned db-preprod-sync -> verify10j, launched FINAL-DONE node pid 63671 (port
+  4211). Import byte-exact "(strict: only version 1 => big-endian) codec_version=1 txix_endianness=Big", 4116339
+  UTxOs, 0 phase-1 rejections so far. Node live-syncing 124999533 -> tip 125104880. NEXT WAKE FULL-VERDICT: scan
+  ALL rejection classes (must be 0, identical to STRICT) -> RE-GAUNTLET FINAL-DONE -> COMMIT #10 via gh/HTTPS.
 - wake148 2026-06-07: POLL #10 FINAL-DONE build verify-build-10j (pid 62684) — STILL RUNNING (final crate
   dugite-node compiling/linking). Not done; can't re-verify yet. No competing CPU during link. #10 stays
   VERIFYING-BUILDING; next: BUILD_EXIT=0 -> clone db-preprod-sync -> re-import re-soak (0 phase-1) -> re-gauntlet
