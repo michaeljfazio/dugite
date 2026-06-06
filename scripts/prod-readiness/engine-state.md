@@ -65,7 +65,7 @@
 
 ## In-progress
 - item: #8 NEW (real, found by broad sweep): mainnet ep246 reserves +82,270,482 divergence (Allegra)
-- state: REPRODUCING-pinpoint — DROP_TRACE replay running (db-mainnet, DUGITE_DROP_TRACE=1) capturing prefilter-dropped creds; climbing to ep246 to isolate the ep245-RUPD drop burst
+- state: ANALYZING (pivot) — prefilter RULED OUT by measurement (all ep245-window drops for the 4 pools are correctly-deregistered creds); +82M is NOT a prefilter drop
 - attempts: 1
 - ANALYZE RESULT (w6lsvu2p2, Opus): canonical Haskell active-stake =
   resolveActiveInstantStakeCredentials (Stake.hs @52ef3d5) — per registered+delegated
@@ -329,3 +329,13 @@
   cred(s) Koios PAYS (summing ~82.27M) are the bug = creds in Haskell accounts but missing from dugite
   reward_accounts at ep245 startStep. Then trace the registration-tracking gap (reg/dereg/re-reg or MIR order)
   -> byte-exact fix. Replay job: .jobs/replay-droptrace.{pid,log}.
+- wake39 2026-06-06T15:?? : PINPOINT via DROP_TRACE replay: the 3 creds dugite prefilter-drops at the ep245
+  RUPD for the 4 pools (36e9eb66/85545bae/cb303645) ALL deregistered at ep243/244 per Koios account_updates
+  (registered ep211-218, deregistered ep243-244, zero reward) -> CORRECTLY dropped, NOT the bug. So dugite's
+  reward_accounts is NOT missing a still-registered cred via the prefilter -> the +82.27M is NOT a prefilter
+  drop (rules out the muscle's missing-cred hypothesis too, by measurement). PIVOT candidates: (a) member_stake==0
+  skip rewards.rs:472 (member_stake from go.stake_distribution wrong -> member dropped); (b) leader/operator
+  reward (rewards.rs:427-437) under-paid; (c) the SNAP-before-MIR ordering (epoch.rs:333 vs 479) the muscle
+  flagged. NEXT: instrument the would-be-reward of EVERY dropped/zeroed member (Σ should ≈82.27M to confirm
+  the path) OR compare per-pool leader+member totals dugite-vs-Koios pool_history at ep244 to find the pool
+  whose total is short. All ep245-window drops saved /tmp/all_drops245.txt.
