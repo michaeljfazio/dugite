@@ -153,7 +153,18 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:GAUNTLET-PENDING (FINAL combined fix). *** FULL
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:FIXING (authoritative endianness rework). ***
+  GAUNTLET wmpyis3tx REFUTED (edge-epoch, decisive + correct) — gauntlet's 3rd catch, the most important ***.
+  The FINAL fix's endianness uses an EMPIRICAL auto-detect HEURISTIC -> violates cardinal rule (byte-exact ONLY,
+  NEVER heuristics); its 'safety net' re-runs the SAME is_sane() predicate (NOT independent, "first test twice");
+  and an AUTHORITATIVE signal exists+unused (tablesCodecVersion — which I MYSELF found at wake109 and recorded as
+  "cleaner than auto-detect" but didn't act on). Value/datum/refscript/multi-asset components confirmed SOUND by
+  the refuter; only the endianness DECISION mechanism is wrong. CONFIRMED tablesCodecVersion IS in dugite's
+  import dir (haskell-ledger/<slot>/meta = {"backend":"utxohd-mem","checksum":...,"tablesCodecVersion":1}; preprod
+  =1=BE). DID NOT COMMIT; main reset clean. Launched rework muscle wjnl2t2ib: read tablesCodecVersion
+  authoritatively (after VERIFYING from upstream that the version actually encodes the BE/LE flip), map
+  version->endianness, ERROR on missing/unknown (no guess), keep the distribution check ONLY as an independent
+  cross-validation. was: state:GAUNTLET-PENDING (FINAL combined fix). *** FULL
   VERIFYING PASS wake113 (first clean verdict) *** verify10f re-soak (synced 124999612->125096298, past all failing
   slots): ZERO phase-1 transaction rejections (was 986: 600 InputNotFound+174 MissingScriptWitness+163 InvalidMint
   +32 MultiAssetNotConserved+17 CollateralNotFound -> ALL 0); script-not-found 0, budget 0, MultiAssetNotConserved
@@ -452,11 +463,11 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- re-gauntlet wmpyis3tx (#10 FINAL fix adversarial refutation, refuterN=3) — /workflows-visible. Poll next wake:
-  pass -> COMMIT the FINAL patch via gh/HTTPS; refuted -> address.
-- verify10f-resoak — STOPPED CLEAN wake113 (FULL PASS: 0 phase-1 rejections, MultiAssetNotConserved 316->0,
-  not-found/budget 0; only 281 #15 Error-term). db-clones/preprod-verify10f RETAINED for #15 diagnosis.
-- FINAL #10 fix on MAIN uncommitted (candidate-fix-10-FINAL-autodetect-multiasset.patch); commit on gauntlet pass.
+- fix-muscle wjnl2t2ib (#10 authoritative-endianness rework: read tablesCodecVersion, error-on-ambiguity,
+  Opus, worktree, Tier A') — /workflows-visible. Poll next wake for FIX (version->endianness from upstream).
+- re-gauntlet wmpyis3tx — REFUTED (edge-epoch decisive; acted on it, did not wait for aggregate). Output file has
+  the full verdict.
+- db-clones/preprod-verify10f RETAINED for #15. FINAL patch (heuristic endianness) preserved but SUPERSEDED.
 - fix-muscle w34va8uxf — COMPLETE (multi-asset tag0/1 fix; real-blob oracle PASS). FINAL patch
   candidate-fix-10-FINAL-autodetect-multiasset.patch + worktree wf_4f715407-1de-1.
 - import source db-preprod-sync/haskell-ledger/ INTACT. db-clones/preprod-verify10e kept for #15.
@@ -795,6 +806,16 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake114 2026-06-07: *** GAUNTLET'S 3RD CORRECT CATCH (the most important) *** re-gauntlet wmpyis3tx edge-epoch
+  REFUTED the FINAL fix: TxIx endianness uses an empirical HEURISTIC (cardinal-rule violation), safety-net re-runs
+  the SAME is_sane predicate (not independent), and the authoritative tablesCodecVersion (which I found wake109
+  but didn't act on) is unused. Chain-verdict was clean (0 phase-1 rejections) BUT the heuristic is not
+  byte-exact-guaranteed for edge snapshots -> correctly refused. Value/datum/refscript/multi-asset SOUND. Acted
+  on the decisive refutation without waiting for aggregate (wake89 precedent). Confirmed tablesCodecVersion IS in
+  haskell-ledger/<slot>/meta (=1=BE for preprod). Reset main, launched rework muscle wjnl2t2ib (authoritative
+  version-based endianness, error-on-ambiguity, distribution check demoted to independent cross-validation).
+  #10 GAUNTLET-PENDING -> FIXING. LESSON: I should have used the authoritative signal at wake109 instead of
+  shipping a heuristic; the gauntlet enforced the cardinal rule I'd let slip.
 - wake113 2026-06-07: *** #10 FIRST CLEAN VERIFYING PASS *** verify10f re-soak full rejection-class scan: ZERO
   phase-1 transaction rejections (was 986 across 5 classes -> ALL 0), script-not-found 0, budget 0,
   MultiAssetNotConserved 316->0, auto-detect=Big sane (no safety-net trip). Only residual: 281 phase-2 Error-term
