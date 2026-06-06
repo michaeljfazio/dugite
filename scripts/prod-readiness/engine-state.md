@@ -65,7 +65,7 @@
 
 ## In-progress
 - item: #8 NEW (real, found by broad sweep): mainnet ep246 reserves +82,270,482 divergence (Allegra)
-- state: ANALYZING (pivot) — prefilter RULED OUT by measurement (all ep245-window drops for the 4 pools are correctly-deregistered creds); +82M is NOT a prefilter drop
+- state: ANALYZING (deep-dive) — deep-dive muscle wuc2kqb1z pinpointing under-paid member/path from per_credential dumps + Koios (last shot before park+broaden)
 - attempts: 1
 - ANALYZE RESULT (w6lsvu2p2, Opus): canonical Haskell active-stake =
   resolveActiveInstantStakeCredentials (Stake.hs @52ef3d5) — per registered+delegated
