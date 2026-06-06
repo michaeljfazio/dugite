@@ -867,6 +867,10 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake129 2026-06-07: POLL #10 FINAL2-fix build verify-build-10h (pid 71916) — STILL RUNNING (final crate
+  dugite-node compiling/linking). Not done; can't re-verify yet. No competing CPU during link. #10 stays
+  VERIFYING-BUILDING; next: BUILD_EXIT=0 -> clone db-preprod-sync -> re-import re-soak (0 phase-1, full
+  rejection-class scan) -> re-gauntlet -> commit.
 - wake128 2026-06-07 (notification): #10 META-ABSENT fix COMPLETE (muscle wx76r15y3, checks_green, 2 crates).
   meta read NotFound=>None=>Little (legacy LE), mirroring upstream getMetadata verbatim; resolve_snapshot_txix_
   endianness extracted + tested via the real importer path; added the missing end-to-end legacy-no-meta=>LE test
