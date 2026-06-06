@@ -550,6 +550,14 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake70 2026-06-07: POLL #10 muscle wnqthg8c8 — STILL RUNNING (active, 0 completed events, 4GB RAM free, no
+  nodes). Captured a MATERIAL finding from its live log for continuity: decoding inline datums revealed the OLD
+  tag-4 (datum-only) MemPack decode path was SILENTLY CORRUPTING datums — inline-datum-bearing outputs jumped
+  132,148 -> 778,015 once decoded correctly (so ~646K outputs had mishandled datums, not just the import-drop).
+  Muscle is validating decoded datums against real CBOR shapes (bstr, tag(121)/tag(122)/tag(1282) "output
+  reference" datum) and Koios tx_info. So #10's datum half is BIGGER than "inline datums dropped" — it includes
+  a tag-4 corruption bug; the muscle is fixing both. This raises #10's severity/value (correct phase-2 datums for
+  778K outputs on any fast-start node). No competing heavy work. #10 stays FIXING-EXPANDED; next: poll wnqthg8c8.
 - wake69 2026-06-07: POLL #10 muscle wnqthg8c8 — STILL RUNNING, healthy (actively building a real-blob
   diagnostic to locate the residual-11 refscript; no errors; 4GB RAM free). Not disturbed; no competing heavy
   work. Light lock-free support: Koios script_info confirms residual script 7afbde082796cfa6ed6ba87728c57f-
