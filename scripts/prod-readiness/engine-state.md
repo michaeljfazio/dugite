@@ -1032,6 +1032,9 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake157 2026-06-07: POLL #10 FIX muscle wst6ekcg6 — still RUNNING, ACTIVE (worktree build+fmt/clippy/nextest).
+  No transition. Health: verify10j node (pid 63671, 32min) slot 125106750 block 4793973, 0 phase-1; disk 28G. #10
+  stays FIXING. NEXT WAKE: on fix green -> VERIFYING-replay 297 residual.
 - wake156 2026-06-07: #10 ROOT-CAUSED -> FIXING. Launched FIX muscle wst6ekcg6 (wf_3ec4a181-f27, worktree) for
   commit (A) = dugite-uplc inline-datum verbatim-bytes ScriptContext fix (resolve_spend_datum:620 must use carried
   raw_cbor like the DatumHash:631-642 raw-span precedent; universal imported+live; +Constr-tag-102 regression test).
