@@ -107,6 +107,21 @@ bash scripts/prod-readiness/test/test-smoke-wake.sh
 for f in $(find scripts/prod-readiness -name '*.sh'); do shellcheck "$f"; done
 ```
 
+## Model strategy (per-task, in the muscle)
+
+The muscle pins a model per analytical task rather than running everything on one
+tier — set explicitly so behaviour is deterministic no matter which session model
+launches the engine:
+
+| Step | Model | Rationale |
+|---|---|---|
+| `diagnose` (×N parallel) | **Sonnet** | bounded, schema-constrained Koios-vs-dump comparison; validated downstream + by the replay gauntlet |
+| `analyze` (research + root-cause) | **Opus** | deep ledger semantics — wrong semantics poisons the fix |
+| `fix` | **Opus** | byte-exact Rust ledger code (the #438 lesson) |
+| `gauntlet` (refuters) | **Opus** | the adversarial autonomy gate must reason at full strength |
+
+Tune via `MODEL_DIAGNOSE` / `MODEL_REASON` at the top of `muscle.workflow.js`.
+
 ## Autonomy guarantees
 
 The only human touchpoint is the halt sentinel (a *stop*, never a *proceed*).
