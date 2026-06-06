@@ -65,7 +65,7 @@
 
 ## In-progress
 - item: #8 NEW (real, found by broad sweep): mainnet ep246 reserves +82,270,482 divergence (Allegra)
-- state: ANALYZING/localize — direction CONFIRMED via ep213 doc: member reward prefilter rewards.rs:461 (registered_at_startstep / frozen addrsRew set) drops ~82M of member rewards at ep246 that Haskell pays
+- state: REPRODUCING-pinpoint — prefilter LOCATION byte-exact (2nd muscle refuted a patch); bug = dugite reward_accounts MISSING cred(s) Haskell has at ep245 startStep; added DROP_TRACE, building to capture the dropped creds
 - attempts: 1
 - ANALYZE RESULT (w6lsvu2p2, Opus): canonical Haskell active-stake =
   resolveActiveInstantStakeCredentials (Stake.hs @52ef3d5) — per registered+delegated
@@ -138,6 +138,13 @@
 - db-clones/preprod-ep57-fixed   (fixed-binary replay, in progress)
 
 ## Gauntlet ledger  (passed/refuted approaches — never silently retry a REFUTED)
+- REFUTED 2026-06-06 (w20c0k2qr, fix muscle self-refuted, NO code change): "fix the member-reward prefilter
+  LOCATION (rewards.rs:461 / frozen addrsRew capture)". The prefilter is byte-exact correct: capture slot
+  172800=ceil(4k/f) matches; set=reward_accounts.keys()==Haskell accounts domain; owner-exclusion, member_stake
+  (utxo<>reward_balance), apply-time unregistered->treasury all match Haskell. The REAL bug: a credential is
+  in Haskell's accounts at ep245 startStep but MISSING from dugite's reward_accounts (registration-tracking
+  edge: reg/dereg/re-reg or MIR ordering). Treasury -55,269 = Haskell's frTotalUnregistered for it. DO NOT
+  re-patch the prefilter location.
 - REFUTED 2026-06-06 (whr4t971m, fix muscle self-refuted, NO code change): "ep246 reserves +82M is deltaR1
   too small from d-source". WRONG: RUPD at 245->246 uses prevPParams=ep244 d=0.26 (dugite correct);
   eta=1 (blocksMade>expectedBlocks) so deltaR1 identical for all candidate d; treasury -55K != 0.2*82M so
@@ -307,3 +314,11 @@
   de/re-registration edge. The 4 'creds' I filtered ARE the 4 top pools (af22f959/d9812f8d/53215c47/6184f6e7).
   Fired localize+fix muscle with strict pinpoint-first orders (find the exact dropped members via Koios
   account_reward_history before any fix).
+- wake37 2026-06-06T15:?? : 2nd muscle (w20c0k2qr) again refused to patch (no change), byte-exact-refuted the
+  prefilter-LOCATION hypothesis. Real bug: dugite's reward_accounts is MISSING a cred Haskell has at ep245
+  startStep (treasury -55,269 = frTotalUnregistered for it). Needs instrumented replay (orchestrator-only).
+  SIGTERMed the mainnet validation replay (job done: ep246 bisected, ep0-318 swept), added DROP_TRACE eprintln
+  to the prefilter (rewards.rs:461), building. Next: replay db-mainnet to ep246 with DUGITE_DROP_TRACE=1,
+  grep the dropped creds near ep245, cross-ref Koios to find the one(s) Koios pays -> trace why reward_accounts
+  misses it -> byte-exact fix. NOTE: dugite SNAP(epoch.rs:333) runs BEFORE apply_pending_mir(479) vs Haskell
+  applyRUpd->MIR->SNAP — flagged as a separate class to check.
