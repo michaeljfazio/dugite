@@ -33,18 +33,23 @@
 
 ## In-progress
 - item: #1 ep57 preprod stake-distribution -10 ADA
-- state: ANALYZING (diagnose muscle Workflow w2ci9weas running — localizing vs Koios)
+- state: ANALYZING (diagnose DONE + byte-exact CONFIRMED; ready for root-cause+fix)
 - attempts: 1
-- reproduced: YES. db-preprod-sync (mithril ep293) cloned -> preprod-ep57, from-genesis
-  replay produced epoch-state dumps ep0..ep62 at epoch-dumps-engine/preprod-ep57/.
-  ep56/57/58 present with stake_snapshot/pools/rewards. Replay SIGTERMed at ep63.
-- next: when diagnose Workflow returns the localized divergence, run analyze (research
-  Haskell source + spec) -> fix (worktree, Tier A) -> VERIFYING replay -> gauntlet.
+- reproduced: YES, byte-exact vs AUTHORITATIVE preprod.koios.rest (ep293, real chain):
+  ep57 pool1n84mel6 active_stake: Koios 26538160048802 vs dugite 26538150048802 = -10 ADA.
+  Localized (prior + confirmed): 2 delegators each -5 ADA, creds 630472f7bfeb8fde...b40d
+  and 7d3e2b319c66fe...64ca. Compounds -> +1 lovelace WithdrawalAmountMismatch at ep181.
+- root-cause hypothesis (from diagnose, Opus): UTxO-set add/spend asymmetry in
+  crates/dugite-ledger/src/eras/common.rs::apply_utxo_changes — some outputs are
+  spend-subtracted from a credential they were never fully add-credited to. NOT the
+  stake-snapshot rebuild. Tier A fix.
+- GROUND-TRUTH FIX: the Koios *MCP* serves the WRONG network (Preview ep1320 vs preprod
+  ep293) -> all ledger ground truth now goes through lib/koios.sh <net> <endpoint> REST.
+- next: analyze muscle (research canonical Haskell UTxO->stake-credit attribution + spec)
+  -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- diagnose-muscle  workflow=w2ci9weas  (Diagnose phase, 3 parallel agents vs Koios)
-  (build-epoch-debug + mithril-preprod completed in wake1/early-wake2; binary built,
-   db-preprod-sync ready at 17G ep293)
+(none — diagnose Workflow w2ci9weas complete; prereq build+mithril complete)
 
 ## DB clones on disk
 - db-clones/preprod-ep57  (CoW clone of db-preprod-sync; snapshot/haskell-ledger wiped
@@ -56,6 +61,7 @@
 ## Token spend  (rolling; UTC-dated lines)
 - 2026-06-06T11:41Z wake1 ~ build+mithril launch (assess+drive)
 - 2026-06-06T11:52Z wake2 ~ replay reproduce + 2 launch-replay fixes + diagnose Workflow
+- 2026-06-06T12:00Z wake3 ~ diagnose result + ground-truth fix (koios.sh) + byte-exact confirm
 
 ## Last node state
 - sampled: 2026-06-06T11:40Z  node_pids="" rss_mb=0 free_disk_gb=205 free_ram_gb=5 jobs=0 halt=false
