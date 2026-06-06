@@ -339,3 +339,10 @@
   flagged. NEXT: instrument the would-be-reward of EVERY dropped/zeroed member (Σ should ≈82.27M to confirm
   the path) OR compare per-pool leader+member totals dugite-vs-Koios pool_history at ep244 to find the pool
   whose total is short. All ep245-window drops saved /tmp/all_drops245.txt.
+- wake40 2026-06-06T15:?? : per-pool comparison is reward-TIMING-tangled (dugite per_pool_top20 ep246 d9812f8d
+  =2000768023438 vs Koios pool_history ep244 member=34060783216, ~60x off -> wrong epoch/semantic mapping).
+  Bug resists shallow localization (prefilter ruled out by measurement; 619 drops; timing tangled). Firing
+  ONE well-resourced deep-dive muscle with the per-cred dumps (epoch-dumps-engine/mainnet-droptrace/ has
+  per_credential WITH reward per cred) + all ruled-out findings. If it can't crack it -> PARK ep246 as a
+  thoroughly-characterized REAL open bug and BROADEN validation (later mainnet eras ep300+/Conway, phase2,
+  sync, perf) to maximize bug-discovery coverage (higher production-readiness value than one 82-ADA bug).
