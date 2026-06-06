@@ -18,6 +18,11 @@
 - perf:             at-tip CPU bounded (15 hot peers); sync ~300 blk/s Byron
 
 ## Backlog  (ranked by impact; one advanced per wake)
+0. [H][ledger][REAL-CURRENT] mainnet ep246 reserves +82,270,482 / treasury -55,269 divergence (Allegra,
+   PV3). FIRST divergence at ep246 (ep209-245 byte-exact); persists/amortizes ep246-250 (replay at ep262).
+   dugite took ~82.27M LESS from reserves at the ep245->246 reward transition. Found by broad Koios sweep
+   (NOT in the stale docs). state:ANALYZING. Likely: reward-pot/reserves-expansion (rho) / undistributed-
+   rewards-return / MIR calc at the Allegra boundary. Dumps in epoch-dumps-engine/mainnet-ep213/.
 1. [H][ledger] ep57 preprod stake-distribution -10 ADA. *** RESOLVED on clean HEAD (wake22-23): ***
    per-cred dump proves dugite ep57 = Koios 9957549164/9815680998 BYTE-EXACT; clean from-genesis replay
    crosses ep181 with NO WithdrawalAmountMismatch (verified to ep192+). Prior findings doc was STALE.
@@ -59,8 +64,8 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: (#3/#11 RESOLVED on HEAD — reserves byte-exact ep212-221; doc stale). Backlog is largely stale.
-- state: BROAD-VALIDATION pivot — sweep both nets vs Koios to find any REAL remaining divergence
+- item: #8 NEW (real, found by broad sweep): mainnet ep246 reserves +82,270,482 divergence (Allegra)
+- state: ANALYZING — analyze muscle diagnosing the reserves/reward-expansion calc vs Haskell
 - attempts: 1
 - ANALYZE RESULT (w6lsvu2p2, Opus): canonical Haskell active-stake =
   resolveActiveInstantStakeCredentials (Stake.hs @52ef3d5) — per registered+delegated
@@ -122,6 +127,7 @@
   non-Phase-5 output-creation path / an era-boundary path. The next ANALYZE/FIX targets THAT.
 
 ## Active job
+- analyze-muscle  workflow=w93yngoj8  (Opus, diagnosing ep246 reserves +82.27M via haskell-ledger-cross-validation)
 - replay-mainnet  pid-file=.jobs/replay-mainnet.pid  (mainnet from-genesis replay, db-mainnet clone,
   4-cred filter, DUGITE_EPOCH_STATE_DUMP=epoch-dumps-engine/mainnet-ep213). Climbing through Byron->ep214.
   CAUTION: free_ram=1GB at launch -> watch for OOM. When at ep213+: diff dugite reserves/treasury vs
@@ -260,3 +266,8 @@
   PIVOT: stop chasing stale per-finding items; do BROAD validation (sweep reserves/treasury/per-cred across
   many epochs both nets vs Koios) to find any REAL remaining divergence. Mainnet replay continues to validate
   more history. This is great production-readiness news: dugite is more correct than the docs suggested.
+- wake28 2026-06-06T14:47Z: BROAD SWEEP found a REAL current divergence: mainnet reserves byte-exact
+  ep209-245 then DIVERGES at ep246 (+82,270,482 reserves, -55,269 treasury), bisected (ep245 exact). This
+  is the first genuine non-stale bug the engine has found -> the broad-validation pivot works. ep246=Allegra
+  PV3. dugite under-removed ~82.27M from reserves at the 245->246 reward transition. Fired analyze muscle to
+  diagnose via haskell-ledger-cross-validation (reward-pot / reserves-expansion / undistributed-return / MIR).
