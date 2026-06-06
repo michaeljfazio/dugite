@@ -429,6 +429,13 @@ pub fn input_to_txininfo(
 pub fn sort_inputs(inputs: &[PrimTxIn]) -> Vec<PrimTxIn> {
     let mut sorted = inputs.to_vec();
     sorted.sort();
+    // cardano-ledger's `inputsTxBodyL` is a `Set TxIn`, so duplicate TxIns in
+    // the wire CBOR array collapse to one. Both the `Spending` redeemer pointer
+    // (`Set.elemAt idx`) and `txInfoInputs` index into that DEDUPED set — a tx
+    // whose wire inputs repeat a TxIn must present the smaller, deduped list to
+    // Plutus, or the redeemer index lands on the wrong input (observed on real
+    // preprod txs: "spent output's address is not script-locked").
+    sorted.dedup();
     sorted
 }
 
@@ -1404,6 +1411,34 @@ mod tests {
         assert_eq!(sorted[0].index, 0);
         assert_eq!(sorted[1].index, 2);
         assert_eq!(sorted[2].index, 5);
+    }
+
+    #[test]
+    fn sort_inputs_dedups_repeated_txin_like_a_set() {
+        // cardano-ledger `inputsTxBodyL :: Set TxIn` dedups repeated wire TxIns.
+        // The `Spending` redeemer pointer / `txInfoInputs` index into the
+        // deduped set, so a repeated TxIn must collapse to one entry.
+        let dup = PrimTxIn {
+            transaction_id: h32(0xcc),
+            index: 1,
+        };
+        let inputs = vec![
+            PrimTxIn {
+                transaction_id: h32(0xaa),
+                index: 0,
+            },
+            dup.clone(),
+            dup.clone(),
+            PrimTxIn {
+                transaction_id: h32(0xee),
+                index: 0,
+            },
+        ];
+        let sorted = sort_inputs(&inputs);
+        assert_eq!(sorted.len(), 3, "duplicate TxIn must collapse to one");
+        assert_eq!(sorted[0].transaction_id, h32(0xaa));
+        assert_eq!(sorted[1].transaction_id, h32(0xcc));
+        assert_eq!(sorted[2].transaction_id, h32(0xee));
     }
 
     #[test]
