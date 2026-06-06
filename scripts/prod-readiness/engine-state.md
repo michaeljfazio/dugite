@@ -84,11 +84,10 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- pinpoint-build2  pid-file=.jobs/pinpoint-build2.pid  (node rebuild; added per-cred STAKE_TRACE log in
-  epoch.rs mark-snapshot for the 2 target creds, UNCOMMITTED diagnostic). NEXT: replay to ep58, read
-  STAKE_TRACE -> dugite's ep57 utxo_stake/reward_balance/total for 630472f7 & 7d3e2b31. If utxo_stake =
-  9957549164/9815680998 (Koios) -> clean replay is CORRECT -> bug is NOT in immutable replay (fork/original-sync
-  induced). If short -> clean replay reproduces -> keep hunting live path.
+- pinpoint-build3  pid-file=.jobs/pinpoint-build3.pid  (rebuild; instrumentation switched to eprintln
+  [filter-proof, env-gated DUGITE_STAKE_TRACE=1] in epoch.rs per-cred + common.rs clamp/skip). NEXT:
+  replay with DUGITE_STAKE_TRACE=1, read STAKE_TRACE for 630472f7/7d3e2b31 ep57 -> if utxo_stake=
+  9957549164/9815680998 (Koios) clean replay CORRECT (bug not in immutable replay); if short, reproduces.
 
 ## VERIFY FINDING (CORRECTED after gauntlet — my wake9 analysis was WRONG)
 - The apply_utxo_diff fix is INERT for ep57. Gauntlet wm055td32 REFUTED 2/3 (haskell-semantics +
@@ -171,3 +170,8 @@
   rebuilding; next wake reads the actual ep57 value -> settles whether a clean immutable replay even
   reproduces the -5 ADA (mounting evidence — 0/931 diff, 0 clamps — suggests it may NOT, i.e. the bug is
   fork/original-sync-induced like the apply_utxo_diff path after all).
+- wake17 2026-06-06T13:52Z: per-cred tracing.warn produced ZERO output (INFO=308, WARN=0) — node logging
+  layers drop custom-target warns regardless of RUST_LOG. strings confirmed instrumentation IS in the
+  binary, so this is a LOG-FILTER artifact -> wake16 '0 clamps' is UNCONFIRMED (logs were suppressed,
+  not absent). Switched all instrumentation to eprintln (bypasses tracing, env-gated DUGITE_STAKE_TRACE);
+  rebuilding. Next wake: replay with the env set, finally read the per-cred ep57 value.
