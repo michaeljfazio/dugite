@@ -13,7 +13,7 @@
 - ledger.mainnet:   BYTE-EXACT vs Koios — reserves+treasury exact at ep212-221 (doc's +180.4B ep213 divergence GONE on HEAD); replay validating further
 - sync.preprod:     ep181 HALT GONE on HEAD (clean replay past ep192); the original blocker is resolved
 - sync.mainnet:     ~ep331 (last known good db-mainnet)
-- phase2.preprod:   open buckets: budget ~398, Error ~186, unIData ~44 (Babbage V1/V2)
+- phase2.preprod:   VALIDATING — replay reaching ep55+ with NO ValidationTagMismatch (is_valid byte-exact so far); ExBudget dumps capturing
 - phase2.mainnet:   inert until ep507 (V3)
 - perf:             at-tip CPU bounded (15 hot peers); sync ~300 blk/s Byron
 
@@ -77,7 +77,7 @@
 
 ## In-progress
 - item: #8 NEW (real, found by broad sweep): mainnet ep246 reserves +82,270,482 divergence (Allegra)
-- state: PARKED-WITH-ROOT-CAUSE — structural cause identified (two-map keying in member-reward fold); fix is a discrete careful task; BROADENING validation
+- (#0 ep246 PARKED-WITH-ROOT-CAUSE). NOW: phase-2 frontier (#22) — replay validating is_valid agreement + capturing ExBudget dumps
 - attempts: 1
 - ANALYZE RESULT (w6lsvu2p2, Opus): canonical Haskell active-stake =
   resolveActiveInstantStakeCredentials (Stake.hs @52ef3d5) — per registered+delegated
@@ -366,3 +366,10 @@
   mainnet eras ep300+/Babbage/Conway, phase2 #22 on db-preprod-sync, sync soak) to maximize byte-exact coverage
   and check whether the two-map keying manifests elsewhere. NET so far: preprod byte-exact all eras; mainnet
   byte-exact ep209-245 + ep247-318 (the one ep246 divergence root-caused).
+- wake44 2026-06-07: removed the ep246 DROP_TRACE diagnostic (cleanup, committed 4fd6ee4a2e; main clean).
+  BROADENED to the phase-2 readiness gate (#22, untouched so far): launched a preprod from-genesis replay
+  (Babbage/Conway Plutus-dense) with DUGITE_PHASE2_DUMP_DIR. PRIMARY signal = a clean replay with NO
+  ValidationTagMismatch proves dugite's phase-2 is_valid is byte-exact with on-chain (no Plutus eval
+  disagreement halts the chain). At ep55 so far, clean. The dumps capture finer ExBudget divergences (the
+  #22 residual class). Next wake: poll the replay to Conway tip; if no ValidationTagMismatch -> phase-2
+  is_valid byte-exact frontier locked; then bucket any ExBudget dumps via phase2_repro.
