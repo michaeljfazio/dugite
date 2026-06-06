@@ -162,7 +162,17 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:ROOT-CAUSED (dissent CONFIRMED). *** wake155:
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:FIXING (commit-A inline-datum verbatim). *** wake156:
+  DROVE ROOT-CAUSED -> FIXING. Launched FIX muscle wst6ekcg6 (run wf_3ec4a181-f27, worktree, Tier A') for commit (A)
+  = dugite-uplc inline-datum VERBATIM-BYTES ScriptContext fix. Pre-read confirmed exact site: redeemer_resolve.rs:620
+  `InlineDatum { data, .. } => Ok(data.clone())` DISCARDS the carried raw_cbor; the DatumHash branch L631-642 ALREADY
+  matches via tx.witness_set.raw_plutus_data_cbor element spans (plutus_data_element_spans) instead of re-encoding —
+  the inline-datum path must mirror that. InlineDatum.raw_cbor IS populated (importer sets Some(inline_cbor); live via
+  KeepRaw). Fix is UNIVERSAL (imported+live), scoped to dugite-uplc ONLY (<=1 crate), + non-canonical Constr-tag-102
+  InlineDatum regression test. NEXT WAKE: poll wst6ekcg6; on green -> apply to a clone, VERIFYING-replay the 297
+  'Error term' residual (expect CASE1/CASE2 gone + overall drop), then gauntlet, then commit (A). After (A) lands ->
+  commit (B) dugite-serialization+dugite-node (FINAL-DONE phase-1 + no-silent-None + R3 float-parse).
+  was: state:ROOT-CAUSED (dissent CONFIRMED). *** wake155:
   DIAGNOSE wuoecuy7o dimension-1 (inline-datum-import-implication) RETURNED found=true with CONCRETE byte-level
   evidence (the R1+R2 dissent is EMPIRICALLY CORRECT — the 297 residual is NOT cleanly #15):
    CASE 1: failing tx 10a0dbda20742f52894b66af9cf8880271197a33df7be16f8a5f1039ac176e5d (slot 125009209 ep293)
@@ -1022,6 +1032,10 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake156 2026-06-07: #10 ROOT-CAUSED -> FIXING. Launched FIX muscle wst6ekcg6 (wf_3ec4a181-f27, worktree) for
+  commit (A) = dugite-uplc inline-datum verbatim-bytes ScriptContext fix (resolve_spend_datum:620 must use carried
+  raw_cbor like the DatumHash:631-642 raw-span precedent; universal imported+live; +Constr-tag-102 regression test).
+  NEXT WAKE: poll; on green -> VERIFYING-replay 297 residual -> gauntlet -> commit (A), then commit (B).
 - wake155 2026-06-07: #10 DIAGNOSE wuoecuy7o COMPLETED found=true -> DIAGNOSING -> ROOT-CAUSED. The R1+R2 gauntlet
   dissent is EMPIRICALLY CONFIRMED: 2/20 sampled 'Error term' txs (10a0dbda spends imported d653e369#0 created slot
   121384342; 08c596be spends imported 722326df#0 created slot 124884686) spend pre-snapshot IMPORTED inline-datum
