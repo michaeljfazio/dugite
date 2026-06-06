@@ -13,7 +13,7 @@
 - ledger.mainnet:   BYTE-EXACT vs Koios — reserves+treasury exact at ep212-221 (doc's +180.4B ep213 divergence GONE on HEAD); replay validating further
 - sync.preprod:     ep181 HALT GONE on HEAD (clean replay past ep192); the original blocker is resolved
 - sync.mainnet:     ~ep331 (last known good db-mainnet)
-- phase2.preprod:   VALIDATING — replay reaching ep55+ with NO ValidationTagMismatch (is_valid byte-exact so far); ExBudget dumps capturing
+- phase2.preprod:   BYTE-EXACT (is_valid) — full preprod replay ep0-293 (V1/V2/V3, Alonzo->Babbage->Conway): 0 ValidationTagMismatch, 0 divergence dumps. #22 RESOLVED on HEAD (was 628 stale divergences)
 - phase2.mainnet:   inert until ep507 (V3)
 - perf:             at-tip CPU bounded (15 hot peers); sync ~300 blk/s Byron
 
@@ -61,8 +61,12 @@
    ep331; LONG - Byron+) with DUGITE_EPOCH_STATE_DUMP_CRED_FILTER=<4 creds> -> per-cred dump at ep213 ->
    compare vs koios.sh mainnet account_reward_history. NOTE: verify the finding isn't stale FIRST (re-read
    the doc's repro method; it bisected ep213 so may have a faster pre-ep213-snapshot path). state:NEW attempts:0
-4. [M][phase2] #22 CEK V1/V2 Babbage residual (budget/Error/unIData buckets).
-   state:NEW attempts:0
+4. [DONE-on-HEAD][phase2] #22 CEK V1/V2 Babbage residual: RESOLVED. Full preprod replay ep0-293 with
+   DUGITE_PHASE2_DUMP_DIR produced 0 phase-2 divergence dumps + 0 ValidationTagMismatch -> dugite's Plutus
+   is_valid is byte-exact for every on-chain script across all eras. The stale 628-divergence buckets
+   (398 budget/186 Error/44 unIData) are fixed on HEAD. (Caveat: this proves is_valid agreement, the
+   chain-critical property; per-redeemer ExBudget exact-match isn't separately instrumented but no is_valid
+   divergence means no script flipped validity.)
 5. [L][phase2] #14 V3 TxInfo deferred fields (inert until mainnet ep507).
    state:NEW attempts:0
 6. [H][ledger] FORK-ROBUSTNESS (elevated M->H, now vindicated): apply_utxo_diff reconstruction didn't
@@ -373,3 +377,10 @@
   disagreement halts the chain). At ep55 so far, clean. The dumps capture finer ExBudget divergences (the
   #22 residual class). Next wake: poll the replay to Conway tip; if no ValidationTagMismatch -> phase-2
   is_valid byte-exact frontier locked; then bucket any ExBudget dumps via phase2_repro.
+- wake46 2026-06-07: PHASE-2 FRONTIER LOCKED (preprod). Full from-genesis preprod replay (4,789,676 blocks,
+  ep0-293) with DUGITE_PHASE2_DUMP_DIR: ZERO ValidationTagMismatch, ZERO phase-2 divergence dumps. Confirmed
+  the dump fires ONLY on a phase-2 is_valid divergence (plutus.rs:260 maybe_dump_phase2_divergence), so 0
+  dumps = 0 divergences. dugite evaluates every on-chain Plutus V1/V2/V3 script (Alonzo/Babbage/Conway) to
+  the same validity verdict as the chain. #22 RESOLVED on HEAD (was 628 stale divergences). THIRD readiness
+  gate in strong shape: ledger (preprod all-era + mainnet ep209-318 minus root-caused ep246) ✓, phase-2 ✓.
+  Remaining: ep246 structural fix (parked, root-caused), sync/perf frontiers, mainnet-phase-2 V3 (inert til ep507).
