@@ -153,7 +153,13 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-BUILDING (ROBUST fix). *** muscle
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-RESOAK (ROBUST fix). Build DONE
+  (BUILD_EXIT=0). DROVE re-verify: cloned db-preprod-sync -> verify10e, ran ROBUST binary (pid 47327, port 4208).
+  *** AUTO-DETECT WORKS ON REAL BLOB ***: log "Auto-detected MemPack TxIx endianness from snapshot data
+  txix_endianness=Big" (correct for preprod new format), safety-net distribution SANE (txix_low=3131782 vs
+  txix_mult256=62 -> low>>mult256, net did NOT trip). utxo_count=4116338 skipped=0. Node syncing 124999169->tip.
+  NEXT WAKE VERDICT: grep verify10e-resoak.log -> must MATCH 549->277 (not-found 0, budget 0, 4/5 slots clean);
+  if so -> RE-GAUNTLET (version-independent, should clear) -> commit. was: state:VERIFYING-BUILDING (ROBUST fix). *** muscle
   w1m4bxztw COMPLETE wake103, checks_green, version/layout-INDEPENDENT, 2 crates (8 files +2080/-239) ***. DROPPED
   layout-conditional endianness entirely. REPLACED with: (1) documented snapshotTablesCodecVersion as upstream's
   authoritative disambiguator (not exposed to dugite import inputs today -> fall through); (2) EMPIRICAL
@@ -412,8 +418,10 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- verify-build-10e  pid 46612  log .jobs/verify-build-10e.log — release build of dugite-node with the ROBUST #10
-  fix (auto-detect endianness + safety net + multiasset + refscript + datum) on MAIN. Poll BUILD_EXIT=0 -> re-verify.
+- verify10e-resoak  pid 47327  log .jobs/verify10e-resoak.log  socket /tmp/engine-verify10e.sock port 4208
+  db-clones/preprod-verify10e — ROBUST-fix node, AUTO-DETECTED Big (safety-net sane: low 3131782 vs mult256 62),
+  syncing. NEXT WAKE VERDICT: grep failing slots -> must match 549->277. SIGTERM-only. DISK 84GB (GC verify10d soon).
+- verify-build-10e — DONE (BUILD_EXIT=0). ROBUST #10 fix on MAIN uncommitted (gated on re-verify+re-gauntlet).
 - fix-muscle w1m4bxztw — COMPLETE (auto-detect, safety net, both-fixture oracles). patch
   candidate-fix-10-ROBUST-autodetect-endianness.patch + worktree wf_bdd8b73d-b58-1.
 - import source db-preprod-sync/haskell-ledger/ INTACT; legacy fixture committed. db-clones/preprod-verify10d kept for #15.
@@ -743,6 +751,11 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake105 2026-06-07: #10 VERIFYING-BUILDING -> VERIFYING-RESOAK. Robust-fix build BUILD_EXIT=0. Cloned
+  db-preprod-sync -> verify10e, ran robust binary (pid 47327): AUTO-DETECT confirmed on real blob ("txix_endianness
+  =Big") + safety-net distribution sane (low 3131782 vs mult256 62, no trip). utxo_count=4116338 skipped=0. Node
+  syncing. Deferred verdict grep (one-step). next: grep verify10e-resoak.log -> must match 549->277 -> RE-GAUNTLET
+  -> commit. 3GB RAM, 84GB disk.
 - wake104 2026-06-07: POLL #10 robust-fix build verify-build-10e (pid 46612) — STILL RUNNING (final crate
   dugite-node compiling/linking). Not done; can't re-verify yet. No competing work during link. #10 stays
   VERIFYING-BUILDING; next: BUILD_EXIT=0 -> clone db-preprod-sync -> re-import re-soak (auto-detect BE, keep
