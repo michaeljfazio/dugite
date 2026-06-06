@@ -88,7 +88,7 @@
 
 ## In-progress
 - item: #8 NEW (real, found by broad sweep): mainnet ep246 reserves +82,270,482 divergence (Allegra)
-- (#9 FIXED + committed — first landed real fix). Selecting next item.
+- item: live soak (sync-gate, RAM now 5GB). state:SOAKING — live preprod node (fixed fast-start binary) syncing to tip then soaking; watch stall/wedge/chain_diverged
 - attempts: 1
 - ANALYZE RESULT (w6lsvu2p2, Opus): canonical Haskell active-stake =
   resolveActiveInstantStakeCredentials (Stake.hs @52ef3d5) — per registered+delegated
@@ -431,3 +431,7 @@
   mithril-imported nodes now fast-start instead of full-replaying. Remaining real work: #0 ep246 (hard
   structural, root-caused) + the RAM-clean live soak. ENGINE SCORECARD: ledger byte-exact (preprod all-era +
   mainnet ex-ep246), phase-2 byte-exact, sync replay-clean + #9 fixed; 2 real bugs found, 1 fixed, 1 root-caused.
+- wake55 2026-06-07: housekeeping + sync-soak retry. GC'd 4 old preprod db-clones (kept 2 newest). free_ram
+  recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
+  Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
+  ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
