@@ -153,7 +153,14 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-RESOAK (CONDITIONAL fix). Build DONE
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:GAUNTLET-PENDING (CONDITIONAL fix). *** VERIFYING
+  PASS wake96 *** conditional-fix re-soak (verify10d, new format=Big) MATCHES the unconditional run: not-found 0,
+  budget 0, MissingScriptWitness 0, ~279 Error-term (=#15 residual), 4/5 target slots clean. So conditional fix
+  is chain-equivalent for the NEW format (BE) AND fixes the legacy regression (LE, unit-proven via
+  test_legacy_fixture_first_entry_txix_le). Both formats correct. Launched RE-GAUNTLET wj0pzgzaq (refuterN=3) —
+  this time probing layout=>endianness mapping completeness/reliability + carry-over integrity. On PASS -> commit
+  the CONDITIONAL patch via gh/HTTPS. RESIDUAL ~277 Error-term = #15 (db-clones/preprod-verify10d kept for it).
+  was: state:VERIFYING-RESOAK (CONDITIONAL fix). Build DONE
   (BUILD_EXIT=0, 1m39s). DROVE re-verify: cloned db-preprod-sync -> verify10d, ran CONDITIONAL-fix binary
   (pid 2797, port 4207). Import log CONFIRMS the conditional logic: "txix_endianness=Big" for the flat `tables`
   new-format snapshot (legacy/LE path covered by green unit test test_legacy_fixture_first_entry_txix_le).
@@ -380,11 +387,11 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- verify10d-resoak  pid 2797  log .jobs/verify10d-resoak.log  socket /tmp/engine-verify10d.sock port 4207
-  db-clones/preprod-verify10d — CONDITIONAL-fix node (txix_endianness=Big confirmed for new format), syncing.
-  NEXT WAKE VERDICT: grep failing slots -> must match 549->277 (not-found 0, budget 0). SIGTERM-only.
-  DISK NOTE: 94GB free, clones accumulating (verify10c+10d+mainnet-ep213) -> GC verify10c after #15 or next wake.
-- verify-build-10d — DONE (BUILD_EXIT=0). CONDITIONAL #10 fix on MAIN uncommitted (gated on re-verify+re-gauntlet).
+- re-gauntlet wj0pzgzaq (#10 CONDITIONAL fix adversarial refutation, refuterN=3) — /workflows-visible. Poll next
+  wake: pass -> COMMIT the CONDITIONAL patch via gh/HTTPS; refuted -> address.
+- verify10d-resoak — STOPPED CLEAN wake96 (VERIFYING PASS: not-found 0, budget 0, ~279 Error-term=#15).
+  db-clones/preprod-verify10d RETAINED (conditional-fix import state) for #15 (277 Error-term) diagnosis.
+- verify10c GC'd. CONDITIONAL #10 fix on MAIN uncommitted (commit on re-gauntlet pass). 94GB disk free.
 - fix-muscle wauynb0ku — COMPLETE (format-conditional, both pinned tests). patch
   candidate-fix-10-CONDITIONAL-endianness.patch + worktree wf_4e02da23-a01-1.
 - import source db-preprod-sync/haskell-ledger/ INTACT; legacy fixture committed (test_fixtures/preview_tvar_head_64k.bin).
@@ -707,6 +714,12 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake96 2026-06-07: #10 VERIFYING PASS for the CONDITIONAL fix. verify10d re-soak (new format=Big) matches the
+  unconditional run: not-found 0, budget 0, MissingScriptWitness 0, ~279 Error-term (=#15), 4/5 target slots
+  clean -> conditional fix is chain-equivalent for new format AND fixes the legacy regression (LE unit-proven).
+  SIGTERM'd verify10d (kept its db for #15), GC'd verify10c. Launched RE-GAUNTLET wj0pzgzaq on the conditional
+  fix. #10 VERIFYING-RESOAK -> GAUNTLET-PENDING. next: poll -> on pass COMMIT the conditional patch (TxIxEndianness
+  + multiasset + refscript + datum, 2 crates) via gh/HTTPS -> then #16 follow-up + #15 diagnosis.
 - wake95 2026-06-07: #10 VERIFYING-BUILDING -> VERIFYING-RESOAK. Conditional-fix build BUILD_EXIT=0. Cloned
   db-preprod-sync -> verify10d, ran conditional binary (pid 2797): import log confirms "txix_endianness=Big" for
   the flat-tables new format (legacy/LE unit-proven). utxo_count=4116338 skipped=0. Node syncing. Deferred verdict
