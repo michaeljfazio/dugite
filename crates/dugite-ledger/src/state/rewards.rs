@@ -459,6 +459,10 @@ pub fn compute_reward_update(
                 // bypassed; routing of unregistered rewards happens at
                 // applyRUpd time (frTotalUnregistered → treasury).
                 if prev_protocol_version_major <= 6 && !registered_at_startstep(cred_hash) {
+                    // DIAGNOSTIC (ep246 investigation): which creds does the prefilter drop?
+                    if std::env::var("DUGITE_DROP_TRACE").is_ok() {
+                        eprintln!("DROP_PREFILTER cred={cred_hash} pool={pool_id}");
+                    }
                     continue;
                 }
 
