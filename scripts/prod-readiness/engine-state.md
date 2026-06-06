@@ -125,6 +125,15 @@
    found for redeemer purpose". Tier A' (phase-2). state:VERIFYING-PENDING attempts:1  FIX COMPLETE (muscle
    we0nz74zr, hash-oracle PASSED byte-exact, checks_green, 2 crates; patch + worktree wf_41bd7059-365-1). See
    In-progress for the VERIFYING plan (SIGTERM soak -> build -> re-soak -> WARNs-gone -> gauntlet -> commit).
+17. [H][security/integrity][REAL-NEW, from gauntlet w3upqlq0y compounding-feedback] Mithril/Haskell snapshot
+   IMPORT does NOT verify the snapshotChecksum/CRC. Upstream V2/InMemory.loadSnapshot computes
+   crcOfConcat(state-CRC, tables-CRC) and throws ReadSnapshotDataCorruption on mismatch; dugite's
+   import_haskell_ledger_snapshot reads the `checksum` meta field but NEVER verifies it. -> a snapshot with valid
+   meta (backend=utxohd-mem, tablesCodecVersion=1) but CORRUPTED/tampered/truncated state|tables bytes that
+   remain MemPack-decodable is SILENTLY ACCEPTED (upstream rejects it). Adversarial-deployment surface for the
+   mithril-fast-start path (a corrupt UTxO set -> wrong phase-2 ScriptContext at the live tip). SEPARATE from
+   #10's TxIx/datum/refscript/multiasset import-completeness scope. FIX: compute crcOfConcat(state, tables) ==
+   snapshotChecksum at import; ERROR on mismatch. state:NEW attempts:0
 16. [L][phase2][LATENT, from gauntlet wqwgen1p0] decode_imported_script_ref hard-codes Plutus language tag
    0->V1,1->V2,2->V3,3->V4 as 'global', but the MemPack PlutusScript tag is ERA-RELATIVE (per-era packTagM).
    Byte-exact for ALL CURRENT eras only because each era's language list is a strict PREFIX [V1,V2,V3,V4] (no
@@ -153,7 +162,17 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:GAUNTLET-PENDING (STRICT). *** FULL VERIFYING
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:FIXING (float-parse byte-exactness). *** re-
+  gauntlet w3upqlq0y = 2/3 refuted, but ALL 3 CONFIRM the endianness/backend/version decision is byte-exact for
+  real inputs — NO endianness refutation ***. Refutes: (a) haskell-semantics — parse_tables_codec_version
+  as_u64() REJECTS float-form 1.0/1e0/100e-2 that Aeson toBoundedInteger FLOORS to 1 and ACCEPTS -> over-strict
+  byte-exactness mismatch (unreachable from canonical snapshots, fail-closed, but cardinal-rule requires parity);
+  (b) compounding-feedback — overclaim "rejects everything upstream rejects" since dugite skips snapshotChecksum/
+  CRC verification (-> FILED as #17, separate integrity gap). RESOLUTION: small float-parse fix (accept integral
+  JSON Number ==1 like Aeson) + narrow the overclaim comments + fix the "dead code" wording (cross_validate is
+  live). Launched fix-muscle w3cxa15va (abs-path STRICT base). The real preprod import (integer 1) is unchanged ->
+  chain re-verify should stay 0 phase-1; re-gauntlet should PASS (parse now byte-exact, claim accurate, CRC filed
+  separately). was: state:GAUNTLET-PENDING (STRICT). *** FULL VERIFYING
   PASS wake142 *** verify10i re-soak (synced 124999612->125103157): 0 phase-1 transaction rejections (all
   classes), strict codec_version=1->Big, only 294 #15 Error-term. Launched RE-GAUNTLET w3upqlq0y on STRICT — key
   angle (over-strict guard): any case where upstream ACCEPTS but dugite now REJECTS (regression)? + backend tag
@@ -561,12 +580,12 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- re-gauntlet w3upqlq0y (#10 STRICT fix adversarial refutation, refuterN=3) — /workflows-visible. Poll next wake:
-  pass -> COMMIT the STRICT patch via gh/HTTPS; refuted -> address.
-- verify10i-resoak — STOPPED CLEAN wake142 (FULL PASS: 0 phase-1 rejections; only 294 #15 Error-term).
-  db-clones/preprod-verify10i RETAINED for #15 diagnosis.
-- STRICT #10 fix on MAIN uncommitted (candidate-fix-10-STRICT-codecversion.patch); commit on gauntlet pass.
-- DISK: 37GB free (GC'd mainnet-ep213; CoW-shared so modest). Watch.
+- fix-muscle w3cxa15va (#10 float-parse byte-exactness + claim narrowing; abs-path STRICT base; Opus, worktree,
+  Tier A') — /workflows-visible. Poll next wake for FIX.
+- re-gauntlet w3upqlq0y — DONE 2/3 refuted (endianness CONFIRMED byte-exact; refutes = float-parse over-strict +
+  CRC overclaim). STRICT patch = base for the float remediation.
+- verify10i-resoak — STOPPED. db-clones/preprod-verify10i RETAINED for #15.
+- DISK: 37GB free. Watch.
 - fix-muscle wh8n6ip92 — COMPLETE (strict meta; verified legacy-LE drop safe). patch
   candidate-fix-10-STRICT-codecversion.patch + worktree wf_e4a069c7-99f-1.
 - db-clones/preprod-verify10h RETAINED for #15.
@@ -922,6 +941,12 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake144 2026-06-07 (notification): re-gauntlet w3upqlq0y COMPLETE = 2/3 refuted but ALL 3 CONFIRM the
+  endianness decision is byte-exact (no endianness refutation — a milestone after 7 rounds). The 2 refutes are
+  narrow: (a) float-form Word8 parse over-strict (1.0/1e0 rejected vs Aeson-accepts) -> small byte-exact fix;
+  (b) overclaim re missing CRC -> FILED #17 (separate integrity gap) + narrow the comment. Filed #17. Reset main,
+  launched float-parse fix-muscle w3cxa15va. #10 GAUNTLET-PENDING -> FIXING. The endianness fix (the actual #10
+  bug) is DONE-correct; this is the last polish to make the meta PARSE byte-exact with Aeson + accurate claims.
 - wake143 2026-06-07: POLL #10 re-gauntlet w3upqlq0y — 2/3 reported, QUALITATIVELY DIFFERENT (no endianness
   refutation). compounding-feedback refuted=TRUE but CONFIRMS the endianness/backend/version truth table is
   byte-exact; it refutes only the OVERCLAIM "rejects everything upstream rejects" because dugite skips the
