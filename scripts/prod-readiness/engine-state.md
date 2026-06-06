@@ -33,8 +33,21 @@
 
 ## In-progress
 - item: #1 ep57 preprod stake-distribution -10 ADA
-- state: ANALYZING (diagnose DONE + byte-exact CONFIRMED; ready for root-cause+fix)
+- state: FIXING (analyze DONE; root-cause disambiguated; fix muscle launched)
 - attempts: 1
+- ANALYZE RESULT (w6lsvu2p2, Opus): canonical Haskell active-stake =
+  resolveActiveInstantStakeCredentials (Stake.hs @52ef3d5) — per registered+delegated
+  credential, active_stake = (UTxO instant stake) <> (reward-account balance); spec
+  stakeRelation = UTxO-stake ∪ rewards (Shelley epoch.tex stakeDistr). 3 merge branches.
+- ROOT-CAUSE DISAMBIGUATION (engine): analyze guessed the missing term is the reward
+  balance, but BOTH creds are short by EXACTLY 5,000,000 lovelace (630472f7 9952549164
+  vs 9957549164; 7d3e2b31 9810680998 vs 9815680998). A reward BALANCE is never round
+  5.000000 ADA -> this is a STRUCTURAL UTxO instant-stake attribution bug (prior finding),
+  NOT the reward-balance term. Fix target = the UTxO->credential instant-stake routing
+  (crates/dugite-ledger/src/eras/common.rs::apply_utxo_changes + stake_routing rebuild),
+  matching the canonical per-credential UTxO aggregation. Tier A.
+- GATE: fix is NOT trusted until a VERIFYING replay reproduces ep57 active_stake
+  26538160048802 (koios.sh preprod) with the -10 ADA gone, then the gauntlet passes.
 - reproduced: YES, byte-exact vs AUTHORITATIVE preprod.koios.rest (ep293, real chain):
   ep57 pool1n84mel6 active_stake: Koios 26538160048802 vs dugite 26538150048802 = -10 ADA.
   Localized (prior + confirmed): 2 delegators each -5 ADA, creds 630472f7bfeb8fde...b40d
@@ -49,7 +62,8 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-(none — diagnose Workflow w2ci9weas complete; prereq build+mithril complete)
+- fix-muscle  workflow=whq17wl1f  (Fix phase, Opus, isolated worktree — implementing the
+  UTxO instant-stake attribution fix in dugite-ledger; runs fmt+clippy+nextest)
 
 ## DB clones on disk
 - db-clones/preprod-ep57  (CoW clone of db-preprod-sync; snapshot/haskell-ledger wiped
@@ -62,6 +76,7 @@
 - 2026-06-06T11:41Z wake1 ~ build+mithril launch (assess+drive)
 - 2026-06-06T11:52Z wake2 ~ replay reproduce + 2 launch-replay fixes + diagnose Workflow
 - 2026-06-06T12:00Z wake3 ~ diagnose result + ground-truth fix (koios.sh) + byte-exact confirm
+- 2026-06-06T12:25Z wake6 ~ analyze result + root-cause disambiguation + fix muscle launched
 
 ## Last node state
 - sampled: 2026-06-06T11:40Z  node_pids="" rss_mb=0 free_disk_gb=205 free_ram_gb=5 jobs=0 halt=false
@@ -78,3 +93,8 @@
   ep56/57/58 captured. Fired diagnose muscle Workflow w2ci9weas (/workflows-visible) to localize
   the ep57 divergence vs Koios. Also committed observability change (diagnose mode routes all
   analytical work through the muscle for /workflows visibility).
+- wake6 2026-06-06T12:25Z: analyze w6lsvu2p2 returned canonical Haskell active-stake formula
+  (UTxO instant stake <> reward balance). Engine DISAMBIGUATED its root-cause: exact 5,000,000
+  lovelace x2 rules out reward balance -> structural UTxO instant-stake attribution (prior finding).
+  ANALYZING->FIXING; launched fix muscle whq17wl1f (Opus, worktree). Fix gated on VERIFYING replay
+  reproducing 26538160048802 + gauntlet before any commit.
