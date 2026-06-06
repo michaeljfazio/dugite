@@ -13,6 +13,14 @@
 > tiering gap (added Tier A′ for ScriptContext schema), (7) node-kill thrash +
 > heavy-op contention (anti-thrash policy + single heavy-op lock). Plus
 > Git/GitHub rules: all ops via `gh`, push over HTTPS, never SSH.
+>
+> **Autonomy hardening (2026-06-06):** added the *Autonomy invariants* section —
+> 12 enumerated stall points and their no-human-intervention mitigations. The #1
+> real-world risk is tool permission prompts (allowlist gaps: `cp -Rc`,
+> `caffeinate`, several Koios MCP tools); bootstrap pre-extends the allowlist and
+> the cron agent runs non-interactively. Also: no `AskUserQuestion`, no PR-merge
+> wait (auto-merge), Koios-first reference data (no local node), disk GC, stale
+> lock/worktree breakers, `caffeinate` wrap, idempotent crash recovery.
 
 ## Purpose
 
@@ -268,6 +276,60 @@ budget-aware:
   idles at the long cadence until the window rolls.
 - Workflow muscles scale their finder/refuter fan-out to remaining budget
   (`budget.remaining()` in the script), shrinking panels when tight.
+
+## Autonomy invariants — ZERO human intervention to proceed
+
+The engine must never block waiting on a human. The **only** intended human
+touchpoint is the halt sentinel — and that is a *stop*, not a *proceed*, so it
+can never stall progress. Every other potential stall point and its autonomous
+mitigation:
+
+1. **Tool permission prompts (the #1 real-world stall).** An allowlist gap
+   blocks the loop. Mitigations, both required:
+   - The engine's cron/loop agent runs under a **non-interactive permission
+     posture** (no prompt can block it).
+   - Bootstrap **pre-extends `.claude/settings.local.json`** to cover every
+     command the engine issues. Known gaps today: `cp` (the `cp -Rc` APFS clone
+     is core to every replay), `caffeinate`, `df`, `mv`, `mkdir`, `cat`,
+     `date:*`, and the Koios MCP tools the ledger gauntlet needs
+     (`koios_account_reward_history`, `koios_pool_history`,
+     `koios_pool_delegators_history`, `koios_pool_stake_snapshot`,
+     `koios_epoch_params`, `koios_tip`, …). The bootstrap step audits the
+     runbook's command set against the allowlist and adds the difference.
+2. **No interactive clarification.** The engine **never** calls
+   `AskUserQuestion` or otherwise asks the user a question. Ambiguity resolves
+   to a recorded default in `engine-state.md`, never a prompt.
+3. **No push/auth prompt.** HTTPS remote + `gh` keyring token (verified). If a
+   `gh` call ever fails auth, record the item `BLOCKED` and continue other work
+   — never prompt.
+4. **No PR-merge wait.** A human reviewer gate would stall the loop. Gauntlet-
+   green commits push directly to the long-lived engine branch; integration to
+   `main` (if used) goes via `gh pr merge --auto --squash` (auto-merges once CI
+   is green) — never waits for a human review.
+5. **Reference data without a local node.** Prefer **Koios (MCP)** for ground
+   truth — always available, no local Haskell node required. Use
+   `cardano-cli debug log-epoch-state` only when a reference node is *already*
+   running; never stand one up interactively. (Confirmed: no node running now.)
+6. **Disk exhaustion.** ASSESS samples free disk; the loop **GCs stale
+   db-clones/dumps autonomously** (keep last N per net), and refuses to start a
+   clone that won't fit rather than filling the disk — never waits for human
+   cleanup.
+7. **Stale heavy-op lock.** `.engine-heavyop.lock` carries holder PID + start
+   time; if the PID is dead or the lock exceeds its TTL, the next wake reclaims
+   it. A crashed wake can never permanently wedge the lock.
+8. **Stale git/worktree locks.** Wake start detects and clears abandoned
+   `.git/index.lock` and orphaned worktrees before any git op.
+9. **macOS App Nap freeze.** All long-running node/replay processes are wrapped
+   in `caffeinate -dimsu` (App Nap once froze a BP across a leader slot).
+10. **Crash mid-wake.** State is committed every wake and transitions are
+    idempotent, so the next wake reconstructs full working state from
+    `engine-state.md` and resumes — no human recovery.
+11. **Network/oracle/Koios flakiness.** Retry with backoff; on persistent
+    failure mark the *item* `BLOCKED` and switch to a different item — a single
+    flaky dependency never stalls the whole loop.
+12. **Time source for budget/cadence windows.** Workflow scripts cannot call
+    `Date.now()`; the loop turn reads wall-clock via Bash `date` and passes it
+    into any Workflow via `args`.
 
 ## Persistent artifacts the engine owns
 
