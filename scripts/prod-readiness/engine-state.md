@@ -18,11 +18,17 @@
 - perf:             at-tip CPU bounded (15 hot peers); sync ~300 blk/s Byron
 
 ## Backlog  (ranked by impact; one advanced per wake)
-1. [H][ledger] ep57 preprod stake-distribution -10 ADA (2 delegators each EXACTLY -5 ADA).
-   CORRECTED ROOT CAUSE (post-gauntlet): LIVE apply_utxo_changes attribution in eras/common.rs —
-   base-script address (addr_test1zpu3l06a...) / non-Phase-5 output-creation / era-boundary path.
-   NOT the reconstruction path (that fix was refuted as inert). Feeds ep181 WithdrawalAmountMismatch.
-   state:ANALYZING attempts:1 (1 refuted approach)
+1. [H][ledger] ep57 preprod stake-distribution -10 ADA (2 delegators 630472f7/7d3e2b31 each EXACTLY
+   -5 ADA). state:PARKED attempts:1 (1 refuted fix + 2 valid latent fixes banked #6/#7). UNRESOLVED.
+   CONFIRMED so far: NOT reconstruction path (inert), NOT Dijkstra (inert/pre-era), reward_balance IS
+   folded (epoch.rs:215). Measurement stalled: epoch.rs has MULTIPLE stake loops (live pool_stake ~205,
+   per-cred ~267, snapshot pool_stake recompute ~852, mark construct ~326) and ad-hoc eprintlns kept
+   hitting the wrong one. NEXT-ACTION (do NOT ad-hoc again): add per-credential stake_map values to the
+   COMMITTED epoch-state-debug dump (epoch_state_debug.rs) so a replay yields per-cred JSON reliably; OR
+   use the existing DUGITE_REWARD_DBG rewards.rs member-loop harness configured for these 2 creds. Then
+   measure dugite ep57 utxo_stake for both vs Koios 9957549164/9815680998 to settle whether a clean
+   immutable replay even reproduces the -5 ADA (0/931 diff suggests maybe NOT -> would re-open the
+   fork/original-sync hypothesis).
 2. [H][ledger] #11 mainnet stake-dereg residual (4 no-withdrawal cases diverge).
    state:NEW attempts:0  (replayable from db-mainnet; verify its epoch first)
 3. [H][ledger] mainnet ep213 reward divergence (REWARD-DIVERGENCE-MAINNET-ep213.md).
@@ -41,7 +47,7 @@
 
 ## In-progress
 - item: #1 ep57 preprod stake-distribution -10 ADA
-- state: REPRODUCING-pinpoint (clamp hypothesis REFUTED by measurement: 0 clamps/skips through ep60; now measuring per-cred stake_map value directly to learn if clean replay even reproduces -5 ADA)
+- state: PARKED (after 8 wakes of measurement plumbing; needs PROPER per-cred instrumentation, not ad-hoc eprintlns — see next-action). Rotating to other backlog items.
 - attempts: 1
 - ANALYZE RESULT (w6lsvu2p2, Opus): canonical Haskell active-stake =
   resolveActiveInstantStakeCredentials (Stake.hs @52ef3d5) — per registered+delegated
@@ -84,10 +90,7 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- pinpoint-build3  pid-file=.jobs/pinpoint-build3.pid  (rebuild; instrumentation switched to eprintln
-  [filter-proof, env-gated DUGITE_STAKE_TRACE=1] in epoch.rs per-cred + common.rs clamp/skip). NEXT:
-  replay with DUGITE_STAKE_TRACE=1, read STAKE_TRACE for 630472f7/7d3e2b31 ep57 -> if utxo_stake=
-  9957549164/9815680998 (Koios) clean replay CORRECT (bug not in immutable replay); if short, reproduces.
+(none — item #1 PARKED; ad-hoc instrumentation reverted from main)
 
 ## VERIFY FINDING (CORRECTED after gauntlet — my wake9 analysis was WRONG)
 - The apply_utxo_diff fix is INERT for ep57. Gauntlet wm055td32 REFUTED 2/3 (haskell-semantics +
@@ -175,3 +178,10 @@
   binary, so this is a LOG-FILTER artifact -> wake16 '0 clamps' is UNCONFIRMED (logs were suppressed,
   not absent). Switched all instrumentation to eprintln (bypasses tracing, env-gated DUGITE_STAKE_TRACE);
   rebuilding. Next wake: replay with the env set, finally read the per-cred ep57 value.
+- wake18 2026-06-06T13:58Z: eprintln instrumentation CONFIRMED in binary + env set, but ZERO output ->
+  I instrumented the WRONG stake loop (epoch.rs has several; dump pool value comes from the snapshot
+  delegation fold, not self.certs.delegations at ~205). After 8 wakes (11-18) of measurement plumbing
+  with no ledger-logic progress, PARKING #1 per engineering judgment (don't tunnel). Banked: 2 valid
+  latent fixes (#6/#7) + many refuted hypotheses. Reverted ad-hoc instrumentation; next wake ROTATES
+  to a fresh backlog item (#11 mainnet stake-dereg or #3 ep213). #1 resumes later with PROPER committed
+  per-cred dump instrumentation, not ad-hoc eprintlns.
