@@ -883,6 +883,11 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake134 2026-06-07: POLL #10 re-gauntlet — still 2/3, but 3rd refuter (compounding-feedback) is genuinely
+  busy: it's RUNNING the actual importer_ tests (cargo nextest -p dugite-node, 480s timeout) to EMPIRICALLY
+  verify the meta-absent behavior, not just reason. Worth waiting (the contested meta-file-absent case deserves
+  empirical grounding). Not disturbed; no competing work. #10 stays GAUNTLET-PENDING. next: aggregate -> strict
+  remediation.
 - wake133 2026-06-07: POLL #10 re-gauntlet w4007sv2k — still 2/3 (3rd refuter compounding-feedback a42d849 still
   actively running, deeper than the other two; not stuck). pass already=false (2 refuted+agree). Holding per
   wake132 to get the 3rd's take on the contested meta-FILE-absent case (it's the lens that first flagged
