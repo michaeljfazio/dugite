@@ -136,7 +136,20 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:FIXING (endianness). wake79: analyze muscle
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-BUILDING (FULL fix). *** fix-muscle
+  wagcpug42 COMPLETE wake84, checks_green, KEY-correctness oracles PASS, 2 crates (8 files +1453/-166) ***.
+  PRIMARY: mempack/mod.rs:68 from_le_bytes->from_be_bytes for the UTxO-HD ordered-store KEY's TxIx (#461
+  reconciled: generic MemPack Word16 IS host-LE, but the on-disk tables KEY is BE so lexicographic order ==
+  numeric TxIx order; repurposed pinned test ->_be_v11). SECONDARY: full multi-asset Value reconstruction
+  (parse_multi_asset_rep, byte-exact port of Mary CompactValue 5-region rep; node import folds triples into a
+  full Value instead of Value::lovelace). *** KEY-CORRECTNESS ORACLE (the anti-no-op proof) ***: new gated test
+  asserts 00000c0c...#1 decodes to txix==1 (NOT 256) with coin 1_750_000 + smooth idx distribution; all 3
+  real-blob oracles (txix-key, inline-datum bytes, refscript hashes) PASS vs the actual 885MB blob. FULL patch
+  saved scripts/prod-readiness/candidate-fix-10-FULL-refscript-datum-endianness.patch (1972 lines, applies clean)
+  + applied to MAIN + release build pid 55768 (.jobs/verify-build-10c.log). NEXT WAKE (chain-level proof): on
+  BUILD_EXIT=0, fresh import from db-preprod-sync -> re-soak -> the 291/41/11 phase-2 divergences MUST drop to ~0
+  (now keys are correct, the refscript+datum data finally resolves) -> gauntlet -> commit. Old notes below. was:
+  state:FIXING (endianness). wake79: analyze muscle
   wxuwzffyl FULLY COMPLETE (rootcause confidence 0.96: "TxIx decoded LE not BE at mempack mod.rs:68"). Launched
   FIX muscle wagcpug42 (Opus, worktree, Tier 1) to: STEP0 apply candidate-fix-10-COMPLETE-refscript-datum.patch
   (base), then (1) mod.rs:68 from_le_bytes->from_be_bytes with #461 RECONCILIATION (determine decoder scope:
@@ -307,9 +320,11 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- fix-muscle wagcpug42 (#10 endianness TxIx LE->BE + multi-asset drop, on refscript+datum base, Opus, worktree,
-  Tier 1) — /workflows-visible. Poll next wake for FIX result (key-correctness oracle). On pass -> re-import re-verify.
-- analyze-muscle wxuwzffyl — COMPLETE (rootcause confidence 0.96). Bug = mempack/mod.rs:68 TxIx LE vs BE.
+- verify-build-10c  pid 55768  log .jobs/verify-build-10c.log — release build of dugite-node with the FULL #10
+  fix (refscript+datum+endianness+multiasset) on MAIN. Poll for BUILD_EXIT=0 -> fresh-import re-verify.
+- fix-muscle wagcpug42 — COMPLETE (key-correctness oracles pass). FULL patch
+  candidate-fix-10-FULL-refscript-datum-endianness.patch + worktree wf_843d9ff3-1d5-1.
+- import source: db-preprod-sync/haskell-ledger/ INTACT for the re-verify.
 - verify10b-resoak — STOPPED CLEAN wake75 (SIGTERM; verdict: 549 divergences UNCHANGED by datum fix). RAM freed.
   db-clones/preprod-verify10b retains the COMPLETE-fix imported state for the analyze muscle.
 - COMPLETE #10 fix (refscript+datum) on MAIN uncommitted (correct oracle-proven base; commit gated on residual
@@ -624,6 +639,15 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake84 2026-06-07 (notification-triggered): #10 ENDIANNESS FIX COMPLETE (muscle wagcpug42, Tier A',
+  checks_green, 2 crates, +1453/-166). mod.rs:68 from_le_bytes->from_be_bytes (#461 reconciled: tables KEY is BE
+  for sort-order, distinct from host-LE MemPack Word16) + full multi-asset Value reconstruction (Mary
+  CompactValue rep port). KEY-CORRECTNESS ORACLE passes (00000c0c#1 -> txix==1 not 256, coin 1750000) — the
+  anti-no-op proof the last fix lacked; all 3 real-blob oracles green. Preserved FULL patch (1972 lines, applies
+  clean), reset main + applied it, launched build pid 55768. Advanced #10 FIXING -> VERIFYING-BUILDING. next:
+  BUILD_EXIT=0 -> fresh import from db-preprod-sync -> re-soak -> 291/41/11 MUST drop to ~0 -> gauntlet -> commit.
+  Did NOT commit (chain-level divergence-gone not yet confirmed; unit key-oracle is necessary but the re-soak is
+  the cardinal proof).
 - wake83 2026-06-07: POLL #10 fix muscle wagcpug42 — at FINAL gate (clippy clean; running nextest --workspace).
   Imminent completion. Not disturbed. Re-verify prep stands (db-preprod-sync import source intact, disk
   headroom). #10 stays FIXING. next (on completion notif/poll): read FIX -> fresh re-import re-soak -> 291/41/11
