@@ -161,10 +161,19 @@ Workflow({ scriptPath: "scripts/prod-readiness/muscle.workflow.js",
 
 ---
 
-## Phase 4 — RECORD  (rewrite + commit STATE)
+## Phase 4 — RECORD  (rewrite + commit STATE on material change)
 
+**Poll-wait wakes do NOT commit.** At 5-min cadence most wakes find the active
+item's Workflow/replay still in-flight and have nothing to advance — committing
+`engine-state.md` on every such wake would spam ~288 no-op commits/day. So:
+**only RECORD+commit when something MATERIAL changed** — a state-machine
+transition, a new finding/divergence, a fix, a gauntlet verdict, a new/cleared
+job, or a frontier move. For a pure poll-wait wake, do nothing here and go
+straight to Phase 5 (release the wake-lock and stop).
+
+On a material change:
 1. Rewrite `engine-state.md`: update the item's state/attempts, Frontiers,
-   Running jobs, DB clones on disk, Gauntlet ledger, In-progress.
+   Running jobs, DB clones on disk, Gauntlet ledger, In-progress, Wake log.
 2. Append a *Token spend* line: `printf -- '- %sZ %s\n' "$(date -u +%Y-%m-%dT%H:%M)" "<approx output tokens this wake>"`.
 3. Update *Last node state* with the health sample.
 4. Commit it (audit trail; recoverable if a later step crashes):
