@@ -136,8 +136,17 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (real, phase-2 mithril-fast-start ref-script gap) state:VERIFYING-PENDING — fix-muscle we0nz74zr
-  COMPLETE (Tier A', checks_green=true, EXACTLY 2 crates: dugite-serialization + dugite-node, 7 files/+732-56).
+- item: #10 (real, phase-2 mithril-fast-start ref-script gap) state:VERIFYING-BUILDING — soak SIGTERM'd clean
+  (ep293 snapshot saved, RAM freed); #10 patch APPLIED TO MAIN (uncommitted, working-tree only — commit gated on
+  gauntlet); release build launched bg pid 45661 log .jobs/verify-build-10.log. *** CRITICAL for next wake ***:
+  do NOT reuse db-clones/preprod-soak to verify — it was IMPORTED BY THE OLD BINARY so its on-disk UTxO store
+  already has script_ref=None baked in; loading it with the fixed binary does NOT re-import -> FALSE NEGATIVE.
+  VERIFYING must RE-EXERCISE THE IMPORT PATH with the fixed binary: fresh import from the raw Haskell tables
+  (db-preprod-haskell/db/ledger/<slot>/tables, the same blob the hash-oracle test read) -> confirm the imported
+  UTxO store now has script_ref populated for f08f73509b0d3b4a#0 (-> 744837b0a3...) -> run node -> ref-script
+  txs validate independently / WARNs gone. (The muscle's DUGITE_PREPROD_TABLES-gated unit test already proved
+  the decode at unit level; this end-to-end step confirms the mod.rs:6411 wiring into phase-2 resolution.)
+  was: fix-muscle we0nz74zr COMPLETE (Tier A', checks_green=true, EXACTLY 2 crates: dugite-serialization + dugite-node, 7 files/+732-56).
   *** HASH-ORACLE PASSED (chain-critical proof, not just green tests) ***: decoded the REAL on-disk preprod
   tables blob — input f08f73509b0d3b4a#0 -> Plutus(lang_tag2->global V3) -> blake2b_224(0x03||body) =
   744837b0a352566983276e1fb256e428d96eab87cc42972261e0c88b EXACT; e2766b4eb2b8d4da#0 -> d55eb689d8... EXACT.
@@ -203,10 +212,11 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- fix-muscle we0nz74zr — *** COMPLETE wake64 *** (hash-oracle PASSED, checks_green, Tier A', 2 crates). Fix in
-  worktree wf_41bd7059-365-1 + patch candidate-fix-10-mempack-refscript.patch. Next: VERIFYING re-soak.
-- live-soak pid 99162 (db-clones/preprod-soak) — at-tip soak, gate-2 VALIDATED (banked). .jobs/live-soak.{pid,log}.
-  SIGTERM-only. Slated for clean stop next wake to free RAM for the #10 verification build+re-soak.
+- verify-build-10  pid 45661  log .jobs/verify-build-10.log  — release build of dugite-node with #10 patch
+  applied to MAIN (uncommitted). Poll for "BUILD_EXIT=0" -> then VERIFYING re-import (see In-progress #10).
+- fix-muscle we0nz74zr — COMPLETE (hash-oracle PASSED). Fix preserved: candidate-fix-10-mempack-refscript.patch
+  + worktree wf_41bd7059-365-1. Patch now applied to main for the verification build.
+- live-soak — STOPPED CLEAN wake65 (SIGTERM; ep293 snapshot saved, 4118241 UTxOs; gate-2 VALIDATED banked).
 - replay-measure  pid-file=.jobs/replay-measure.pid  (clean HEAD from-genesis replay climbing past ep93
   toward ep181). TEST: does it hit the original WithdrawalAmountMismatch halt at ep181? If it CROSSES
   ep181 cleanly -> ep57/ep181 RESOLVED on HEAD (prior finding stale); sync.preprod frontier unblocks. If
@@ -512,6 +522,14 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake65 2026-06-07: START VERIFYING #10. SIGTERM'd the soak cleanly (4s; "Snapshot saved epoch=293, 4118241
+  UTxOs" + "Shutdown complete" — ImmutableDB flushed, no corruption); RAM freed. git-apply'd the #10 patch to
+  MAIN (applies clean; uncommitted working-tree only — commit still gated on gauntlet). Launched bg release
+  build pid 45661 (.jobs/verify-build-10.log; compiling downstream crates after dugite-serialization). Recorded
+  the CRITICAL verification nuance: must RE-IMPORT from the raw Haskell tables with the fixed binary (the old
+  soak db has script_ref=None baked in by the old-binary import -> reusing it = false negative). State
+  VERIFYING-PENDING -> VERIFYING-BUILDING. Next wake: poll build -> on BUILD_EXIT=0, fresh import + check
+  script_ref populated for f08f73509b0d3b4a#0 / ref-script WARNs gone -> gauntlet -> commit.
 - wake64 2026-06-07 (notification-triggered): #10 fix-muscle we0nz74zr COMPLETED. Tier A', checks_green, EXACTLY
   2 crates (dugite-serialization + dugite-node, 7 files +732/-56). *** HASH-ORACLE PASSED ***: decoded the real
   on-disk preprod tables blob and the CIP-tagged blake2b-224 of the decoded ScriptRef for f08f73509b0d3b4a#0 ==
