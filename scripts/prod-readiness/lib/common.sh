@@ -5,16 +5,16 @@
 # shellcheck disable=SC2034
 set -euo pipefail
 
-# --- canonical paths (repo-root relative) ---
-ENGINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-REPO_ROOT="$(cd "$ENGINE_DIR/../.." && pwd)"
-STATE_FILE="$ENGINE_DIR/engine-state.md"
-RUNBOOK="$ENGINE_DIR/engine-runbook.md"
-LOCK_FILE="$ENGINE_DIR/.engine-heavyop.lock"
-HALT_FILE="$ENGINE_DIR/.engine-halt"
-JOBS_DIR="$ENGINE_DIR/.jobs"          # per-background-job PID+log metadata
-CLONES_DIR="$REPO_ROOT/db-clones"     # APFS clones live here
-DUMPS_DIR="$REPO_ROOT/epoch-dumps-engine"
+# --- canonical paths (repo-root relative; each overridable via env for tests) ---
+ENGINE_DIR="${ENGINE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+REPO_ROOT="${REPO_ROOT:-$(cd "$ENGINE_DIR/../.." && pwd)}"
+STATE_FILE="${STATE_FILE:-$ENGINE_DIR/engine-state.md}"
+RUNBOOK="${RUNBOOK:-$ENGINE_DIR/engine-runbook.md}"
+LOCK_FILE="${LOCK_FILE:-$ENGINE_DIR/.engine-heavyop.lock}"
+HALT_FILE="${HALT_FILE:-$ENGINE_DIR/.engine-halt}"
+JOBS_DIR="${JOBS_DIR:-$ENGINE_DIR/.jobs}"          # per-background-job PID+log metadata
+CLONES_DIR="${CLONES_DIR:-$REPO_ROOT/db-clones}"   # APFS clones live here
+DUMPS_DIR="${DUMPS_DIR:-$REPO_ROOT/epoch-dumps-engine}"
 
 # --- tunables (overridable via env, defaults match the spec) ---
 HEAVYOP_TTL_SECS="${HEAVYOP_TTL_SECS:-21600}"   # 6h: a replay should finish inside this
