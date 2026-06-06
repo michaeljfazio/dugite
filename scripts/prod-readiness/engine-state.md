@@ -122,7 +122,9 @@
    the field, line 98); (2) dugite-node mod.rs:6411 — decode MemPackTxOut.script_ref raw bytes into a ScriptRef
    enum (CBOR script tag 0=Native/1=V1/2=V2/3=V3). VERIFY: re-run the mithril-fast-start soak; the failing slots
    125081911/125081937/125081958/125082000/125082081 must NO LONGER emit MissingScriptWitness / "script not
-   found for redeemer purpose". Tier A' (phase-2). state:ROOT-CAUSED attempts:0  next:FIX via fix-muscle
+   found for redeemer purpose". Tier A' (phase-2). state:VERIFYING-PENDING attempts:1  FIX COMPLETE (muscle
+   we0nz74zr, hash-oracle PASSED byte-exact, checks_green, 2 crates; patch + worktree wf_41bd7059-365-1). See
+   In-progress for the VERIFYING plan (SIGTERM soak -> build -> re-soak -> WARNs-gone -> gauntlet -> commit).
 6. [H][ledger] FORK-ROBUSTNESS (elevated M->H, now vindicated): apply_utxo_diff reconstruction didn't
    replay stake_map -> the FORK-INDUCED variant of the ep57 bug. Clean HEAD replay is correct, but a live
    sync hitting a rollback could still corrupt stake. The refuted gauntlet trusted a STALE doc; this IS a
@@ -134,12 +136,23 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (real, phase-2 mithril-fast-start ref-script gap) state:FIXING — fix-muscle we0nz74zr launched
-  (Opus, isolated worktree, Tier A'). Two-part fix: (1) decode_tag5 tail-parse -> script_ref:Some;
-  (2) mod.rs:6411 decode bytes -> ScriptRef. Given a BUILT-IN HASH ORACLE (decoded refscript for UTxO
-  f08f73509b0d3b4a#0 must hash to 744837b0a3...) so the agent self-verifies its MemPack Script decoding, not
-  guesses. next:poll muscle -> if checks_green + hash-oracle PASSES, VERIFYING (re-soak: failing slots must
-  stop WARNing) -> gauntlet -> commit. Do NOT commit on green tests alone (hash match is the proof).
+- item: #10 (real, phase-2 mithril-fast-start ref-script gap) state:VERIFYING-PENDING — fix-muscle we0nz74zr
+  COMPLETE (Tier A', checks_green=true, EXACTLY 2 crates: dugite-serialization + dugite-node, 7 files/+732-56).
+  *** HASH-ORACLE PASSED (chain-critical proof, not just green tests) ***: decoded the REAL on-disk preprod
+  tables blob — input f08f73509b0d3b4a#0 -> Plutus(lang_tag2->global V3) -> blake2b_224(0x03||body) =
+  744837b0a352566983276e1fb256e428d96eab87cc42972261e0c88b EXACT; e2766b4eb2b8d4da#0 -> d55eb689d8... EXACT.
+  Fix: decode_tag5 now parses the exact CompactValue (new decode_compact_value_exact in compact.rs) then the
+  MemPack Datum option + AlonzoScript blob -> script_ref:Some; mod.rs:6411 decode_imported_script_ref maps
+  ScriptRefKind->ScriptRef (Plutus tag 0/1/2/3 monotonic across eras; native via decode_native_script_cbor).
+  Quotes verbatim Haskell MemPack instances (BabbageTxOut/Datum/AlonzoScript/PlutusScript/CompactValue/
+  ShortByteString/Hash; key subtlety: Datum's DatumHash is BE PackedBytes32 stored verbatim, UNLIKE
+  DataHash32/Addr28Extra). PRESERVED: scripts/prod-readiness/candidate-fix-10-mempack-refscript.patch (923 lines)
+  + worktree .claude/worktrees/wf_41bd7059-365-1. NOT committed (gated on VERIFYING + gauntlet).
+  VERIFYING PLAN (next wake, heavy): RAM only 3GB free now -> (1) SIGTERM the current soak (gate-2 banked;
+  frees ~4.4GB) NEVER pkill -9; (2) build fixed binary from the worktree (or apply patch to a build clone);
+  (3) fresh mithril-fast-start re-soak on a clone; (4) CONFIRM the reference-script WARNs are GONE at slots
+  125081911/125081937/125081958/125082000/125082081 (and ref-script txs validate independently) -> then gauntlet
+  (refuterN=3, Aprime lenses) -> commit via gh/HTTPS on pass. Do NOT commit on green tests alone.
 - item: #0 ep246 reserves +82,270,482 (Allegra/PV3) state:PARKED-WITH-ROOT-CAUSE — structural member-reward fold
 - item: live soak (sync-gate) state:LIVE-SOAK VALIDATED — soak node tracks live preprod tip in LOCKSTEP
   (node block 4793042 slot 125082823 == koios live tip 4793042; extends within seconds of each new block,
@@ -190,9 +203,10 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- fix-muscle we0nz74zr (#10 phase-2 ref-script fix, Opus, worktree) — /workflows-visible. Poll next wake;
-  on completion read FIX result (files/tier/checks_green/hash-oracle). If hash-oracle PASSES -> VERIFYING re-soak.
-- live-soak pid 99162 (db-clones/preprod-soak) — at-tip soak, .jobs/live-soak.{pid,log}. SIGTERM-only to stop.
+- fix-muscle we0nz74zr — *** COMPLETE wake64 *** (hash-oracle PASSED, checks_green, Tier A', 2 crates). Fix in
+  worktree wf_41bd7059-365-1 + patch candidate-fix-10-mempack-refscript.patch. Next: VERIFYING re-soak.
+- live-soak pid 99162 (db-clones/preprod-soak) — at-tip soak, gate-2 VALIDATED (banked). .jobs/live-soak.{pid,log}.
+  SIGTERM-only. Slated for clean stop next wake to free RAM for the #10 verification build+re-soak.
 - replay-measure  pid-file=.jobs/replay-measure.pid  (clean HEAD from-genesis replay climbing past ep93
   toward ep181). TEST: does it hit the original WithdrawalAmountMismatch halt at ep181? If it CROSSES
   ep181 cleanly -> ep57/ep181 RESOLVED on HEAD (prior finding stale); sync.preprod frontier unblocks. If
@@ -498,6 +512,17 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake64 2026-06-07 (notification-triggered): #10 fix-muscle we0nz74zr COMPLETED. Tier A', checks_green, EXACTLY
+  2 crates (dugite-serialization + dugite-node, 7 files +732/-56). *** HASH-ORACLE PASSED ***: decoded the real
+  on-disk preprod tables blob and the CIP-tagged blake2b-224 of the decoded ScriptRef for f08f73509b0d3b4a#0 ==
+  744837b0a3... and e2766b4eb2b8d4da#0 == d55eb689d8... EXACTLY (chain-critical proof, not just green tests).
+  The fix parses the MemPack Datum-option + AlonzoScript tail in decode_tag5 (was opaque_tail/None) and decodes
+  ScriptRefKind->ScriptRef at mod.rs:6411; quotes verbatim Haskell MemPack instances. PRESERVED the fix as
+  candidate-fix-10-mempack-refscript.patch (923 lines) + worktree wf_41bd7059-365-1; NOT committed (gated on
+  VERIFYING+gauntlet). Advanced #10 ROOT-CAUSED -> VERIFYING-PENDING. Did NOT build now (only 3GB free RAM +
+  soak running -> would risk swap/wedge). Set the VERIFYING plan for next wake: SIGTERM soak (gate-2 banked) ->
+  build fixed binary -> fresh fast-start re-soak -> confirm ref-script WARNs GONE at the failing slots -> gauntlet
+  -> commit. RAM-safe deferral, fix durably preserved.
 - wake63 2026-06-07: #10 fix-muscle we0nz74zr STILL RUNNING (actively editing decode_tag5 in the worktree —
   iterating, likely refining after the hash-oracle check; not disturbed, no competing heavy work). Advanced
   gate (1) via a zero-cost HEAD spot-check: the soak log's "Building LedgerState from Haskell snapshot
