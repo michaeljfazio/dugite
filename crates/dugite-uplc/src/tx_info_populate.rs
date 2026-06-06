@@ -183,23 +183,40 @@ pub fn withdrawal_to_plutus(
     Ok((StakingCredential::Hash(cred), BigInt::from(w.amount.0)))
 }
 
+/// Byron-era slot length in milliseconds. cardano-ledger converts a slot to
+/// POSIXTime via the full multi-era `EpochInfo` (`slotToPOSIXTime` →
+/// `epochInfoSlotToUTCTime`), which is piecewise: each slot is resolved in the
+/// era whose `[boundSlot, eraEnd)` contains it, using THAT era's slot length.
+/// Byron's `eraSlotLength` is `genesisSlotLength` (Byron `ProtocolParameters.
+/// slotDuration`), which is 20_000 ms on every Cardano network that has a Byron
+/// era (mainnet + preprod); Byron-less networks (preview, Conway-genesis
+/// devnets) have `slot_zero_offset == 0`, so no slot ever falls below the pivot
+/// and this constant is unused there.
+const BYRON_SLOT_LENGTH_MS: i128 = 20_000;
+
 /// Convert a slot number to POSIX milliseconds using the supplied
-/// [`SlotConfig`].
+/// [`SlotConfig`], matching cardano-ledger's `slotToPOSIXTime` byte-exact
+/// (`libs/cardano-ledger-core/src/Cardano/Ledger/Plutus/TxInfo.hs`).
 ///
-/// Plutus' `TxInfo.valid_range` is expressed in POSIX milliseconds since
-/// the Unix epoch — the same convention `cardano-node` uses. The
-/// translation is:
+/// Plutus' `TxInfo.valid_range` is expressed in POSIX milliseconds since the
+/// Unix epoch. The conversion is PIECEWISE across eras, but for any Cardano
+/// network both the Byron line and the Shelley+ line meet exactly at the pivot
+/// `(slot_zero_offset, network_start)` — Shelley starts at the slot/time Byron
+/// ends — so a single signed expression covers both regimes:
 ///
 /// ```text
-/// posix_ms = (slot - slot_zero_offset) * slot_length_ms
-///                                     + network_start_unix_seconds * 1000
+/// posix_ms = network_start_unix_seconds * 1000
+///          + (slot - slot_zero_offset) * slot_length_for_era(slot)
 /// ```
 ///
-/// Returns an error if `slot < slot_zero_offset` (would produce a
-/// negative time) — that condition should never fire in practice
-/// (the ledger constructs the validity range from the tx's own
-/// `validity_interval_start` / `ttl`, both of which post-date the
-/// network start) but rejecting it explicitly keeps us panic-free.
+/// where `slot_length_for_era` is the Shelley slot length (`slot_length_ms`)
+/// at/after the pivot and the Byron slot length ([`BYRON_SLOT_LENGTH_MS`])
+/// before it. For a Byron slot `(slot - slot_zero_offset)` is negative, so the
+/// product walks backward from `network_start` at the Byron rate — exactly what
+/// the Haskell multi-era `EpochInfo` produces (e.g. preprod slot 1000 →
+/// `1655769600000 - 85400*20000 = 1654061600000`). The previous single-era form
+/// rejected `slot < slot_zero_offset`, which incorrectly failed every tx whose
+/// `validity_interval_start`/`ttl` references a pre-Shelley slot.
 pub fn slot_to_posix_ms(slot: u64, sc: &SlotConfig) -> Result<i64, PhaseTwoError> {
     // Mirror Haskell `Ouroboros.Consensus.HardFork.History.Qry.guardEnd`:
     // a slot `s` is past the horizon iff `s >= boundSlot eraEnd`. When
@@ -210,13 +227,16 @@ pub fn slot_to_posix_ms(slot: u64, sc: &SlotConfig) -> Result<i64, PhaseTwoError
             return Err(PhaseTwoError::TimeTranslationPastHorizon { slot, horizon });
         }
     }
-    let rel = slot.checked_sub(sc.slot_zero_offset).ok_or_else(|| {
-        PhaseTwoError::Internal(format!(
-            "slot {slot} < slot_zero_offset {}",
-            sc.slot_zero_offset
-        ))
-    })?;
-    let delta_ms = (rel as i128) * (sc.slot_length_ms as i128);
+    // Piecewise slot length: Byron rate below the Shelley pivot, Shelley rate
+    // at/after it. `slot_zero_offset` IS the Shelley start slot; everything
+    // before it is the Byron era (uniform 20s slots).
+    let slot_len_ms: i128 = if slot >= sc.slot_zero_offset {
+        sc.slot_length_ms as i128
+    } else {
+        BYRON_SLOT_LENGTH_MS
+    };
+    let rel = (slot as i128) - (sc.slot_zero_offset as i128);
+    let delta_ms = rel * slot_len_ms;
     let start_ms = (sc.network_start_unix_seconds as i128) * 1_000;
     let total = start_ms
         .checked_add(delta_ms)
@@ -857,15 +877,25 @@ mod tests {
     }
 
     #[test]
-    fn slot_to_posix_ms_rejects_slot_before_offset() {
+    fn slot_to_posix_ms_byron_slots_use_20s_pivot() {
+        // preprod: Shelley starts at absolute slot 86400 / unix 1655769600s;
+        // Byron (slots < 86400) runs at 20s. cardano-ledger's multi-era
+        // EpochInfo converts a Byron slot with Byron's 20s length — NOT the
+        // Shelley 1s — and the previous code wrongly rejected slot<offset.
         let sc = SlotConfig {
-            network_start_unix_seconds: 0,
-            slot_zero_offset: 1_000,
+            network_start_unix_seconds: 1_655_769_600,
+            slot_zero_offset: 86_400,
             slot_length_ms: 1_000,
             safe_zone_horizon_slot: None,
         };
-        let err = slot_to_posix_ms(500, &sc).unwrap_err();
-        assert!(matches!(err, PhaseTwoError::Internal(_)));
+        // Byron slot 1000 → byron_start(1654041600000) + 1000*20000.
+        assert_eq!(slot_to_posix_ms(1_000, &sc).unwrap(), 1_654_061_600_000);
+        // Byron slot 39329 → 1654041600000 + 39329*20000.
+        assert_eq!(slot_to_posix_ms(39_329, &sc).unwrap(), 1_654_828_180_000);
+        // The pivot slot maps to exactly network_start (both era-lines meet).
+        assert_eq!(slot_to_posix_ms(86_400, &sc).unwrap(), 1_655_769_600_000);
+        // Shelley slot 100000 → network_start + (100000-86400)*1000.
+        assert_eq!(slot_to_posix_ms(100_000, &sc).unwrap(), 1_655_783_200_000);
     }
 
     #[test]
