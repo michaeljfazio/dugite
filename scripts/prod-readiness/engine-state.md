@@ -855,6 +855,10 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake126 2026-06-07: POLL #10 meta-absent muscle wx76r15y3 — RUNNING, healthy (4GB RAM, no nodes, 0 completed).
+  Constructing the missing end-to-end test (meta-absent legacy snapshot must decode LE: from_tables_codec_version
+  (None)=>Little + cross-validation passes) — the exact gap the gauntlet flagged. Not disturbed; no competing
+  work. #10 stays FIXING; next: poll -> build+nextest -> re-verify (modern-BE + legacy-LE) -> re-gauntlet -> commit.
 - wake125 2026-06-07: POLL #10 re-launched muscle wx76r15y3 — RUNNING, healthy (4GB RAM, no nodes, 0 completed).
   CONFIRMED the abs-path fix worked: worktree now HAS the base machinery (from_tables_codec_version present) ->
   STEP 0 succeeded. Muscle verifying upstream SnapshotConversion.getMetadata meta-absent tolerance + doing the
