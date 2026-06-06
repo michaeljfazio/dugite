@@ -136,7 +136,23 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (real, phase-2 mithril-fast-start ref-script gap) state:VERIFYING-RESOAK — build DONE (BUILD_EXIT=0,
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:FIXING-EXPANDED. *** VERIFYING VERDICT wake67
+  (fix correct but INSUFFICIENT — gate correctly BLOCKS commit) ***: fresh fixed-binary re-import re-soak
+  (db-clones/preprod-verify10) measured vs the OLD soak: "script not found for redeemer purpose" 379 -> 11
+  (97% gone), MissingScriptWitness present -> 0, and the hash-oracle target txs (578069c6/0d325a6e/759eab17/
+  dadf042b/8b1a6a78) now RESOLVE. NO regression (those txs were already divergent as "not found"). BUT resolving
+  scripts EXPOSED a SIBLING import gap: 290 "script returned Error term" + 41 "budget exhausted" eval-divergences
+  (all "uplc fails but on-chain is_valid=true; trusting consensus" -> no wedge). DISCRIMINATOR (decisive, no
+  guess): full-replay is BYTE-EXACT for these same txs (phase2.preprod 0-divergence), so this is PURELY
+  import-incompleteness -> mod.rs:6440-6444 DROPS INLINE DATUMS on import (OutputDatum::None, "Skip for now")
+  -> resolved script + missing inline datum = wrong ScriptContext = Error term. Plus 11 RESIDUAL "not found"
+  for OTHER scripts (7afbde08.../23d3717e.../bb4e5521.../86820a34..., slots 125009-125046) — a tag-5 sub-case
+  the fix didn't cover (likely multi-asset tag-5 or another encoding). EXPANDED SCOPE (still 2 crates): (1) [DONE
+  on main] decode_tag5 ref-script; (2) [TODO] mod.rs:6440 decode MemPackTxOut.datum (NOW populated by the fix,
+  txout.rs:503/583) into OutputDatum::Inline(PlutusData) instead of None; (3) [TODO] residual-11 ref-script
+  sub-case. RE-VERIFY target: Error-term + budget-exhausted + "not found" ALL clear on a fresh fast-start re-soak
+  (full-replay byte-exact is the oracle). #10 patch stays on MAIN (correct base, no regression). next: expanded
+  fix-muscle. was: state:VERIFYING-RESOAK — build DONE (BUILD_EXIT=0,
   fixed binary target/release/dugite-node @01:37 w/ #10 patch on MAIN uncommitted). DROVE the fresh import with
   the FIXED binary: cloned db-preprod-sync (had haskell-ledger/ + immutable/, NO dugite snapshot = import state)
   -> db-clones/preprod-verify10, ran fixed binary (pid 46355, /tmp/engine-verify10.sock, port 4204). Log
@@ -214,11 +230,11 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- verify10-resoak  pid 46355  log .jobs/verify10-resoak.log  socket /tmp/engine-verify10.sock port 4204
-  db-clones/preprod-verify10 — FIXED-binary node that RE-IMPORTED (script_ref now decoded), syncing import-point
-  124999169 -> tip. NEXT WAKE: grep for ref-script WARNs at slots 125081911..125082081 (GONE=#10 verified).
-  SIGTERM-only to stop.
-- verify-build-10 — DONE (BUILD_EXIT=0). Fixed binary built. #10 patch still on MAIN uncommitted (gated on gauntlet).
+- verify10-resoak — STOPPED CLEAN wake67 (SIGTERM; verdict captured: refscript resolution 379->11, but exposed
+  290 Error-term + 41 budget-exhausted eval-divergences from dropped inline datums @mod.rs:6440). RAM freed.
+  db-clones/preprod-verify10 retained (fixed-binary import w/ script_ref) for reference.
+- verify-build-10 — DONE (BUILD_EXIT=0). Fixed binary built. #10 refscript patch still on MAIN uncommitted
+  (correct base for the expanded inline-datum fix; commit gated on full re-verify + gauntlet).
 - fix-muscle we0nz74zr — COMPLETE (hash-oracle PASSED). Patch candidate-fix-10-mempack-refscript.patch + worktree.
 - live-soak — STOPPED CLEAN wake65 (SIGTERM; ep293 snapshot saved; gate-2 VALIDATED banked).
 - replay-measure  pid-file=.jobs/replay-measure.pid  (clean HEAD from-genesis replay climbing past ep93
@@ -526,6 +542,17 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake67 2026-06-07: #10 VERIFYING VERDICT — fix CORRECT but INSUFFICIENT (the gate did its job: BLOCKS a
+  premature commit). The fresh fixed-binary re-import re-soak cut "script not found" 379->11 (97%) and zeroed
+  MissingScriptWitness; hash-oracle target txs now resolve; NO regression. But resolving scripts EXPOSED 290
+  "Error term" + 41 "budget exhausted" eval-divergences. Decisive discriminator (NOT a guess): full-replay is
+  byte-exact for these txs, so it's pure import-incompleteness -> mod.rs:6440 DROPS INLINE DATUMS ("Skip for
+  now") -> resolved-script + missing-datum = wrong ScriptContext = Error term. Plus 11 residual "not found"
+  (tag-5 sub-case uncovered). Confirmed the datum bytes ARE now available (txout.rs:503/583) so the fix is
+  feasible in the same 2 crates. Advanced #10 VERIFYING-RESOAK -> FIXING-EXPANDED ("fast-start phase-2 import
+  completeness" = refscripts[done] + inline-datums[todo] + residual-11[todo]). SIGTERM'd verify10 node (RAM
+  freed), kept #10 refscript patch on main as the base. Did NOT commit (divergence not gone). next: expanded
+  fix-muscle for the inline-datum decode + residual-11, then fresh re-import re-verify (full-replay = oracle).
 - wake66 2026-06-07: #10 VERIFYING-BUILDING -> VERIFYING-RESOAK. Build finished BUILD_EXIT=0 (fixed binary).
   DROVE the fresh import with the fixed binary: db-preprod-sync was already in import-state (haskell-ledger/ +
   immutable/, no dugite snapshot), so APFS-cloned it -> db-clones/preprod-verify10 and ran the fixed binary
