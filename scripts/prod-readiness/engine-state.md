@@ -727,6 +727,10 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake99 2026-06-07: POLL #10 robust fix-muscle w1m4bxztw — RUNNING, healthy (5GB RAM, no nodes, 0 completed).
+  Applied COMPLETE base; porting num_assets/parse_multi_asset_rep from CONDITIONAL + implementing robust
+  (codec-version/empirical-auto-detect) endianness + safety net. Not disturbed; no competing work. #10 stays
+  FIXING; next: poll -> build+nextest -> re-import re-verify (both fixtures + keep 549->277) -> re-gauntlet -> commit.
 - wake98 2026-06-07 (notification-triggered): *** RE-GAUNTLET REFUTED 2/3 — gauntlet's SECOND correct catch ***.
   wj0pzgzaq: 2 refuters (edge-epoch+compounding-feedback) proved layout!=endianness via upstream history (flat-
   tables and BE-flip in different oc releases months apart; intermediate flat-LE & nested-BE snapshots shipped).
