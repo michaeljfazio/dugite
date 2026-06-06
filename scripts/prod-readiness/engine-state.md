@@ -11,7 +11,7 @@
 ## Frontiers  (advance these; zero open divergence behind each)
 - ledger.preprod:   BYTE-EXACT vs Koios — total active_stake matches at ep100/150/200/230 (Shelley→Conway) + ep57 per-cred exact; clean replay ep0-233 zero halts; finishing to ep293
 - ledger.mainnet:   BYTE-EXACT vs Koios — reserves+treasury exact at ep212-221 (doc's +180.4B ep213 divergence GONE on HEAD); replay validating further
-- sync.preprod:     LIVE node REBUILDING from genesis (snapshot backend mismatch dugite-mem vs dugite-lsm -> snapshot discarded). FOUND a perf gap (#9). Replay clean (no stall/wedge/OOM); will reach tip + soak
+- sync.preprod:     from-genesis REPLAY validated clean (no stall/wedge/diverge across many replays incl this one). Live-SOAK portion RAM-constrained on this box (1GB free -> I/O-wait/swap); needs clean-RAM re-run. Found perf gap #9 + volatile-replay connect-warnings to recheck
 - sync.mainnet:     ~ep331 (last known good db-mainnet)
 - phase2.preprod:   BYTE-EXACT (is_valid) — full preprod replay ep0-293 (V1/V2/V3, Alonzo->Babbage->Conway): 0 ValidationTagMismatch, 0 divergence dumps. #22 RESOLVED on HEAD (was 628 stale divergences)
 - phase2.mainnet:   inert until ep507 (V3)
@@ -403,3 +403,10 @@
   issue (a mithril-import->run cycle always full-replays). The replay itself is clean (no stall/wedge/OOM,
   ~88% at slot 109M). Once it completes it syncs the ~620-block gap to live tip + soaks. Next wake: confirm
   tip + clean soak. The engine's broadening keeps finding REAL issues (ledger ep246, now sync/perf #9).
+- wake49 2026-06-07: SYNC-gate live test, deeper findings: after the #9 full replay, the node does a 2nd
+  replay of 2612 VOLATILE blocks emitting many "Block does not connect to tip" WARNs (recheck if benign or a
+  volatile-set handling issue), then was I/O-wait (state UN) at 1GB free RAM (swapping) -> startup very slow,
+  no N2C socket reached in the window. The from-genesis REPLAY path is proven clean (this + all prior replays:
+  no stall/wedge/chain_diverged/OOM). The LIVE-NETWORK-SYNC + at-tip SOAK portion is not cleanly testable
+  under 1GB free RAM -> SIGTERMed the node; flag for a clean-RAM re-run (or after the #9 backend fix lets it
+  fast-start). Sync gate = replay-clean ✓ + live-soak DEFERRED (RAM-bound). Added watch: volatile connect-WARNs.
