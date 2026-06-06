@@ -153,7 +153,17 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:FIXING (meta-absent tolerance). *** re-gauntlet
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-BUILDING (FINAL2 authoritative+meta-
+  absent). *** muscle wx76r15y3 COMPLETE wake128, checks_green, 2 crates ***. Fix (node/mod.rs): meta read
+  NotFound=>None=>Little (legacy LE), mirroring upstream getMetadata (MetadataFileDoesNotExist->Nothing->still
+  decode, quoted verbatim); other IO errors propagate; Some(1)=>Big, Some(other)=>Err, field-absent/null=>None,
+  malformed JSON=>Err; cross_validate+safety-net guard None=>LE. Extracted resolve_snapshot_txix_endianness
+  (testable via REAL importer path). Added the MISSING end-to-end tests: importer_accepts_legacy_snapshot_with_no
+  _meta_file_as_little_endian (+3: meta-without-field=>LE, codec=1=>Big, unknown=>Err) via build_tvar helper.
+  Combined FINAL2 patch saved candidate-fix-10-FINAL2-authoritative-metaabsent.patch (3542 lines, applies clean)
+  + applied to MAIN + build pid 71916 (.jobs/verify-build-10h.log). NEXT WAKE: BUILD_EXIT=0 -> re-import re-soak
+  (modern-BE preprod, 0 phase-1 rejections via FULL rejection-class scan) -> RE-GAUNTLET (meta-absent now
+  tolerated as LE per offline-importer analog; end-to-end test added) -> commit. was: state:FIXING (meta-absent tolerance). *** re-gauntlet
   w8t0ro3f6 = 3/3 refuted, but refuters DISAGREED -> waiting for the aggregate (wake122) was VINDICATED ***.
   Resolution (2-of-3 + correct upstream analog): dugite is TOO STRICT — hard-errors on meta-FILE-absent, which
   REGRESSES legitimate legacy LE snapshot imports. PROOF: dugite's mithril-import is the OFFLINE-conversion analog
@@ -505,10 +515,12 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- fix-muscle wx76r15y3 (#10 meta-absent tolerance, RE-LAUNCHED with absolute-path base patch; Opus, worktree,
-  Tier A') — /workflows-visible. Poll next wake for FIX. (w5vke699f was STOPPED — see infra note.)
-- re-gauntlet w8t0ro3f6 — DONE 3/3 refuted (refuters disagreed; resolution = tolerate meta-absent as LE).
-- db-clones/preprod-verify10g RETAINED for #15. AUTHORITATIVE patch = base (meta-absent too strict; superseded by remediation).
+- verify-build-10h  pid 71916  log .jobs/verify-build-10h.log — release build of dugite-node with the FINAL2 #10
+  fix (authoritative codec-version + meta-absent-tolerance) on MAIN. Poll BUILD_EXIT=0 -> re-import re-verify.
+- fix-muscle wx76r15y3 — COMPLETE (meta-absent=>LE tolerance + end-to-end tests). patch
+  candidate-fix-10-FINAL2-authoritative-metaabsent.patch + worktree wf_a2048ce6-581-1.
+- db-clones/preprod-verify10g RETAINED for #15.
+- Patch history: ...AUTHORITATIVE(meta-absent too strict, 3/3 refuted) -> FINAL2(meta-absent tolerated, current candidate).
 - *** INFRA NOTE (muscle worktree staleness) ***: isolation worktrees branch from a base commit that LAGS the
   engine-state/patch-file commits (crates/ identical to HEAD, but scripts/prod-readiness/*.patch FILES missing).
   => ALWAYS give muscles the base patch by ABSOLUTE path (/Users/michaelfazio/Source/dugite/scripts/prod-readiness/...),
@@ -855,6 +867,12 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake128 2026-06-07 (notification): #10 META-ABSENT fix COMPLETE (muscle wx76r15y3, checks_green, 2 crates).
+  meta read NotFound=>None=>Little (legacy LE), mirroring upstream getMetadata verbatim; resolve_snapshot_txix_
+  endianness extracted + tested via the real importer path; added the missing end-to-end legacy-no-meta=>LE test
+  (+3 more). Assembled COMBINED FINAL2 patch (3542 lines: authoritative codec-version + meta-absent tolerance,
+  2 crates), applied to main, build pid 71916. #10 FIXING -> VERIFYING-BUILDING. next: BUILD_EXIT=0 -> re-soak
+  (0 phase-1) -> re-gauntlet -> commit. Did NOT commit.
 - wake127 2026-06-07: POLL #10 meta-absent muscle wx76r15y3 — at FINAL gate (fmt+clippy clean; running nextest
   --workspace). Imminent completion. Not disturbed. #10 stays FIXING. next (notif/poll): read FIX -> re-import
   re-soak (modern-BE 0 phase-1) + legacy-LE path -> re-gauntlet -> commit.
