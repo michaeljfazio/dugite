@@ -153,7 +153,12 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-RESOAK (FINAL2). Build DONE
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:GAUNTLET-PENDING (FINAL2). *** FULL VERIFYING
+  PASS wake131 *** verify10h re-soak (synced 124999612->125100373): 0 phase-1 transaction rejections (all
+  classes), codec_version=Some(1)->Big, only 292 #15 Error-term residual. Launched RE-GAUNTLET w4007sv2k on
+  FINAL2 (= authoritative codec-version [addressed 3 prior refutes] + meta-absent tolerance [addressed the latest
+  refute] + new end-to-end tests). On PASS -> commit the FINAL2 patch via gh/HTTPS (lands #10). was:
+  state:VERIFYING-RESOAK (FINAL2). Build DONE
   (BUILD_EXIT=0). DROVE re-verify: cloned db-preprod-sync -> verify10h, ran FINAL2 binary (pid 72713, port 4211).
   Import: "codec_version=Some(1) txix_endianness=Big" (authoritative), distribution sane, utxo_count=4116338
   skipped=0. (meta-absent fix doesn't change the modern-BE preprod path; the legacy-LE meta-absent path is covered
@@ -522,10 +527,12 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- verify10h-resoak  pid 72713  log .jobs/verify10h-resoak.log  socket /tmp/engine-verify10h.sock port 4211
-  db-clones/preprod-verify10h — FINAL2-fix node (codec_version=Some(1)->Big), syncing. NEXT WAKE FULL-VERDICT:
-  scan ALL rejection classes (0 phase-1 expected). SIGTERM-only. Retain for #15.
-- verify-build-10h — DONE (BUILD_EXIT=0). FINAL2 #10 fix on MAIN uncommitted (gated on re-verify+re-gauntlet).
+- re-gauntlet w4007sv2k (#10 FINAL2 fix adversarial refutation, refuterN=3) — /workflows-visible. Poll next wake:
+  pass -> COMMIT the FINAL2 patch via gh/HTTPS; refuted -> address.
+- verify10h-resoak — STOPPED CLEAN wake131 (FULL PASS: 0 phase-1 rejections; only 292 #15 Error-term).
+  db-clones/preprod-verify10h RETAINED for #15 diagnosis.
+- FINAL2 #10 fix on MAIN uncommitted (candidate-fix-10-FINAL2-authoritative-metaabsent.patch); commit on gauntlet pass.
+- DISK: 51GB free (db-clones/mainnet-ep213 48G is the big one; GC if mainnet work not imminent).
 - fix-muscle wx76r15y3 — COMPLETE (meta-absent=>LE tolerance + end-to-end tests). patch
   candidate-fix-10-FINAL2-authoritative-metaabsent.patch + worktree wf_a2048ce6-581-1.
 - db-clones/preprod-verify10g RETAINED for #15.
@@ -876,6 +883,12 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake131 2026-06-07: *** #10 FULL VERIFYING PASS (FINAL2) *** verify10h re-soak: 0 phase-1 transaction
+  rejections (all classes), codec_version=Some(1)->Big, only 292 #15 Error-term. Synced past all failing slots.
+  SIGTERM'd verify10h (kept db for #15). Launched RE-GAUNTLET w4007sv2k on FINAL2 (authoritative + meta-absent
+  tolerance + end-to-end tests — all 4 prior refutations addressed). #10 VERIFYING-RESOAK -> GAUNTLET-PENDING.
+  next: poll -> on pass COMMIT the FINAL2 patch via gh/HTTPS (lands #10 after ~30 wakes / 4 fix iterations /
+  4 gauntlet rounds — every refute was a real bug avoided).
 - wake130 2026-06-07: #10 VERIFYING-BUILDING -> VERIFYING-RESOAK. FINAL2 build BUILD_EXIT=0. Cloned
   db-preprod-sync -> verify10h, ran FINAL2 binary (pid 72713): import "codec_version=Some(1)->Big" authoritative,
   sane distribution, utxo_count=4116338 skipped=0. Node syncing. GC'd verify10g (disk 53GB). Deferred
