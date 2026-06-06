@@ -10,7 +10,7 @@
 
 ## Frontiers  (advance these; zero open divergence behind each)
 - ledger.preprod:   BYTE-EXACT vs Koios — total active_stake matches at ep100/150/200/230 (Shelley→Conway) + ep57 per-cred exact; clean replay ep0-233 zero halts; finishing to ep293
-- ledger.mainnet:   ep209-212 byte-exact (per doc); FIRST divergence ep213 reserves +180.4B lovelace — REPRODUCING on HEAD now
+- ledger.mainnet:   BYTE-EXACT vs Koios — reserves+treasury exact at ep212-221 (doc's +180.4B ep213 divergence GONE on HEAD); replay validating further
 - sync.preprod:     ep181 HALT GONE on HEAD (clean replay past ep192); the original blocker is resolved
 - sync.mainnet:     ~ep331 (last known good db-mainnet)
 - phase2.preprod:   open buckets: budget ~398, Error ~186, unIData ~44 (Babbage V1/V2)
@@ -34,7 +34,9 @@
    fork/original-sync hypothesis).
 2. [H][ledger] #11 mainnet stake-dereg residual (4 no-withdrawal cases diverge).
    state:NEW attempts:0  (replayable from db-mainnet; verify its epoch first)
-3. [H][ledger] mainnet ep213 reward divergence (== #11; doc dated 2026-06-04, RECENT -> likely REAL,
+3. [DONE-on-HEAD][ledger] mainnet ep213 reserves divergence (== #11): RESOLVED. dugite reserves+treasury
+   BYTE-EXACT vs Koios at ep212-221 (the doc's +180.4B ep213 divergence is GONE; fix landed in last 2 days).
+   Stake-dereg reward attribution correct (reserves exact). OLD (stale) context: mainnet ep213 reward divergence (== #11; doc dated 2026-06-04, RECENT -> likely REAL,
    not stale like ep57). 4 target creds: 53215c471b7ac752e3ddf8f2c4c1e6ed111857bfaa675d5e31ce8bce,
    6184f6e7229530a2d1f9f746112406100e2696dd7439ff8c52750700,
    af22f95915a19cd57adb14c558dcc4a175f60c6193dc23b8bd2d8beb,
@@ -57,8 +59,8 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #3 mainnet ep213 reserves divergence (== #11; recent 2026-06-04 finding, REAL)
-- state: REPRODUCING — mainnet from-genesis replay running (db-mainnet clone) toward ep214 with 4-cred filter
+- item: (#3/#11 RESOLVED on HEAD — reserves byte-exact ep212-221; doc stale). Backlog is largely stale.
+- state: BROAD-VALIDATION pivot — sweep both nets vs Koios to find any REAL remaining divergence
 - attempts: 1
 - ANALYZE RESULT (w6lsvu2p2, Opus): canonical Haskell active-stake =
   resolveActiveInstantStakeCredentials (Stake.hs @52ef3d5) — per registered+delegated
@@ -250,3 +252,11 @@
   launched mainnet from-genesis replay with the 4 stake-dereg creds filtered + epoch-state-debug. Byron
   climbing. Next wake: poll to ep214, diff reserves/treasury vs Koios to reproduce the +180.4B, then
   diagnose with the haskell-ledger-cross-validation skill. WATCH RAM (1GB free at launch).
+- wake27 2026-06-06T14:42Z: *** mainnet ep213 RESOLVED on HEAD *** dugite reserves+treasury BYTE-EXACT vs
+  Koios at ep212/213/214/220/221 (diff=0). The doc's +180.4B ep213 reserves divergence is GONE (fix landed
+  2026-06-04..06). 4 stake-dereg creds absent from dump = deregistered; reserves-exact => their reward
+  attribution is correct. KEY STRATEGIC FINDING: BOTH ep57 (preprod) and ep213 (mainnet) backlog items
+  were STALE (already fixed on HEAD). The backlog is seeded from old findings docs describing fixed bugs.
+  PIVOT: stop chasing stale per-finding items; do BROAD validation (sweep reserves/treasury/per-cred across
+  many epochs both nets vs Koios) to find any REAL remaining divergence. Mainnet replay continues to validate
+  more history. This is great production-readiness news: dugite is more correct than the docs suggested.
