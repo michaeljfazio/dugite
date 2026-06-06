@@ -281,13 +281,27 @@ pub fn maybe_dump_phase2_divergence(item: &Phase2WorkItem) {
         "cost_models_cbor": item.cost_models_cbor.as_deref().map(&hex),
         "max_ex_cpu": item.max_ex.0,
         "max_ex_mem": item.max_ex.1,
+        // Major protocol version at eval time — selects the PlutusV1/V2
+        // BuiltinSemanticsVariant + cost-model variant. WITHOUT this an offline
+        // replay must guess the version and can misclassify the divergence
+        // (wrong variant -> spurious budget / builtin failures).
+        "protocol_major": item.protocol_major,
         // dugite SlotConfig -> dugite_uplc SlotConfig mapping (see apply.rs).
         "sc_network_start_unix_seconds": item.slot_config.zero_time / 1_000,
         "sc_slot_zero_offset": item.slot_config.zero_slot,
         "sc_slot_length_ms": item.slot_config.slot_length,
         "sc_safe_zone_horizon_slot": item.slot_config.safe_zone_horizon_slot,
     });
-    let path = format!("{dir}/phase2-divergence-tx{}.json", item.tx_idx);
+    // Key the filename on a content hash of the tx so distinct divergences
+    // across different blocks accumulate instead of overwriting each other
+    // (the per-block `tx_idx` repeats every block). Same tx -> same file.
+    let tx_key = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        item.tx_cbor.hash(&mut h);
+        format!("{:016x}", h.finish())
+    };
+    let path = format!("{dir}/phase2-divergence-tx{}-{tx_key}.json", item.tx_idx);
     match serde_json::to_vec_pretty(&doc) {
         Ok(bytes) => {
             if let Err(e) = std::fs::write(&path, bytes) {
