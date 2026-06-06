@@ -33,7 +33,7 @@
 
 ## In-progress
 - item: #1 ep57 preprod stake-distribution -10 ADA
-- state: VERIFYING (fix DONE by whq17wl1f; building fixed binary; fix UNCOMMITTED)
+- state: VERIFYING (fixed binary built; fixed-binary from-genesis replay RUNNING; fix UNCOMMITTED)
 - attempts: 1
 - ANALYZE RESULT (w6lsvu2p2, Opus): canonical Haskell active-stake =
   resolveActiveInstantStakeCredentials (Stake.hs @52ef3d5) — per registered+delegated
@@ -76,13 +76,15 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- verify-build  pid-file=.jobs/verify-build.pid  (cargo build --release fixed binary +
-  epoch-state-debug; heavy-op lock held). Fix (2 files) applied to MAIN working tree
-  UNCOMMITTED, pending the verify gate.
+- replay-preprod-ep57-FIXED  pid-file=.jobs/preprod-ep57-fixed.pid  (fixed-binary from-genesis
+  replay -> dumps at epoch-dumps-engine/preprod-ep57-fixed/; heavy-op lock held). Fix (2 files)
+  applied to MAIN working tree UNCOMMITTED, pending the verify gate. NEXT WAKE: poll done, then
+  diff epoch_000057.json fixed-vs-unfixed (epoch-dumps-engine/preprod-ep57 = unfixed baseline);
+  if identical -> clean replay can't exercise the fork path -> escalate to gauntlet + live re-sync.
 
 ## DB clones on disk
-- db-clones/preprod-ep57  (CoW clone of db-preprod-sync; snapshot/haskell-ledger wiped
-  for from-genesis replay; reusable for re-verification)
+- db-clones/preprod-ep57         (unfixed-binary replay; baseline dump captured)
+- db-clones/preprod-ep57-fixed   (fixed-binary replay, in progress)
 
 ## Gauntlet ledger  (passed/refuted approaches — never silently retry a REFUTED)
 (none)
