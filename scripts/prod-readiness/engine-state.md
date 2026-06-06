@@ -594,6 +594,11 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake76 2026-06-07: POLL #10 analyze muscle wxuwzffyl — STILL RUNNING, healthy (5GB RAM, no nodes, 0 completed
+  events). Interim trace findings worth noting: the snapshot ENCODE is faithful for datum/script_ref (post-Alonzo
+  output keys 2/3 emitted) so the snapshot roundtrip is NOT the loss point; muscle now inspecting the actual
+  phase-2 dumps' resolved output_cbor for tx 578069c6 to see if datum/script_ref are present at EVAL time (the
+  real decode-vs-runtime disconnect). Not disturbed; no competing heavy work. #10 stays DIAGNOSING; next: poll.
 - wake75 2026-06-07: #10 VERIFYING VERDICT = FAILED end-to-end (the gate did its job). Complete-fix re-soak
   (verify10b) shows IDENTICAL divergence counts to before the datum fix: 291 Error-term + 41 budget + 11
   not-found. So the byte-exact-PROVEN decode fix (datum+refscript) is a runtime NO-OP for these txs -> the
