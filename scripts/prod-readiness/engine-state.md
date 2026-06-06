@@ -136,7 +136,14 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-BUILDING (FULL fix). *** fix-muscle
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-RESOAK (FULL fix). Build DONE
+  (BUILD_EXIT=0, 1m39s). DROVE fresh import re-verify: cloned db-preprod-sync -> db-clones/preprod-verify10c, ran
+  FULL-fix binary (pid 56221, /tmp/engine-verify10c.sock, port 4206). Import clean (utxo_count=4116338 skipped=0)
+  with BE keys + datum + refscript + multi-asset. Node syncing 124999169 -> tip; re-processes the failing slots.
+  NEXT WAKE VERDICT (the culmination of the whole #10 arc): grep verify10c-resoak.log for 291 "Error term" + 41
+  "budget exhausted" + 11 "script not found" at slots 125081911..125082081 (and overall). DROP TO ~0 = #10
+  end-to-end VERIFIED (BE-key fix lets the refscript+datum data finally resolve) -> gauntlet -> commit FULL fix.
+  Any meaningful residual = not done. was: state:VERIFYING-BUILDING (FULL fix). *** fix-muscle
   wagcpug42 COMPLETE wake84, checks_green, KEY-correctness oracles PASS, 2 crates (8 files +1453/-166) ***.
   PRIMARY: mempack/mod.rs:68 from_le_bytes->from_be_bytes for the UTxO-HD ordered-store KEY's TxIx (#461
   reconciled: generic MemPack Word16 IS host-LE, but the on-disk tables KEY is BE so lexicographic order ==
@@ -320,8 +327,11 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- verify-build-10c  pid 55768  log .jobs/verify-build-10c.log — release build of dugite-node with the FULL #10
-  fix (refscript+datum+endianness+multiasset) on MAIN. Poll for BUILD_EXIT=0 -> fresh-import re-verify.
+- verify10c-resoak  pid 56221  log .jobs/verify10c-resoak.log  socket /tmp/engine-verify10c.sock port 4206
+  db-clones/preprod-verify10c — FULL-fix node (BE keys+datum+refscript+multiasset), RE-IMPORTED, syncing
+  124999169 -> tip. NEXT WAKE VERDICT: grep failing slots for 291 Error-term + 41 budget + 11 not-found (->~0 = #10 VERIFIED).
+  SIGTERM-only.
+- verify-build-10c — DONE (BUILD_EXIT=0). FULL #10 fix on MAIN uncommitted (gated on re-verify+gauntlet).
 - fix-muscle wagcpug42 — COMPLETE (key-correctness oracles pass). FULL patch
   candidate-fix-10-FULL-refscript-datum-endianness.patch + worktree wf_843d9ff3-1d5-1.
 - import source: db-preprod-sync/haskell-ledger/ INTACT for the re-verify.
@@ -639,6 +649,11 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake85 2026-06-07: #10 VERIFYING-BUILDING -> VERIFYING-RESOAK. Full-fix build BUILD_EXIT=0 (1m39s). Cloned
+  db-preprod-sync -> verify10c, ran FULL-fix binary (pid 56221): clean import (utxo_count=4116338 skipped=0) with
+  BE keys + datum + refscript + multi-asset. Node syncing to re-process the failing slots. Held one-step
+  discipline (wake66/74 precedent): recorded the re-soak launch, deferred the verdict grep to next wake. 3GB RAM
+  free. next wake: grep verify10c-resoak.log -> 291/41/11 must drop to ~0 -> #10 verified -> gauntlet -> commit.
 - wake84 2026-06-07 (notification-triggered): #10 ENDIANNESS FIX COMPLETE (muscle wagcpug42, Tier A',
   checks_green, 2 crates, +1453/-166). mod.rs:68 from_le_bytes->from_be_bytes (#461 reconciled: tables KEY is BE
   for sort-order, distinct from host-LE MemPack Word16) + full multi-asset Value reconstruction (Mary
