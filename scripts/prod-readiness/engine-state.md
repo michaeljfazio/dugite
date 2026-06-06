@@ -11,7 +11,7 @@
 ## Frontiers  (advance these; zero open divergence behind each)
 - ledger.preprod:   BYTE-EXACT vs Koios — total active_stake matches at ep100/150/200/230 (Shelley→Conway) + ep57 per-cred exact; clean replay ep0-233 zero halts; finishing to ep293
 - ledger.mainnet:   BYTE-EXACT vs Koios — reserves+treasury exact at ep212-221 (doc's +180.4B ep213 divergence GONE on HEAD); replay validating further
-- sync.preprod:     from-genesis REPLAY clean + #9 snapshot-backend fix LANDED + LIVE-SOAK reached tip healthy (wake57): clone db-clones/preprod-soak fast-started via #9 Convertible mem->lsm path (NO genesis replay, utxo_count=4116338), caught up to live tip (node block 4793022 hash-matched koios, 1 block/28s behind live 4793023), 0 panic/0 OOM/0 wedge, RSS 4.8GB, CPU 1.5% idle-at-tip. REMAINING: sustained-window confirm (next wake) + investigate #10 reference-script WARNs (below) which may be a regression in the #9 fast-start path
+- sync.preprod:     from-genesis REPLAY clean + #9 snapshot-backend fix LANDED + LIVE-SOAK reached tip healthy (wake57): clone db-clones/preprod-soak fast-started via #9 Convertible mem->lsm path (NO genesis replay, utxo_count=4116338), caught up to live tip (node block 4793022 hash-matched koios, 1 block/28s behind live 4793023), 0 panic/0 OOM/0 wedge, RSS 4.8GB, CPU 1.5% idle-at-tip. *** SUSTAINED-WINDOW CONFIRMED wake60 ***: node tracks live tip in lockstep ~18min (block 4793042 == koios live 4793042, extends within seconds of each new block), 0 anomalies => GATE (2) live-sync-to-tip VALIDATED on preprod. Residual is GATE (3) only: #10 ref-script independent validation on the fast-start path (in FIXING via muscle we0nz74zr; node trusts consensus meanwhile, no wedge)
 - sync.mainnet:     ~ep331 (last known good db-mainnet)
 - phase2.preprod:   BYTE-EXACT (is_valid) on FULL-REPLAY — full preprod replay ep0-293 (V1/V2/V3, Alonzo->Babbage->Conway): 0 ValidationTagMismatch, 0 divergence dumps. #22 RESOLVED on HEAD. OPEN GAP on MITHRIL-FAST-START path: #10 (mod.rs:6411 drops reference-script bytes on import -> ref-input scripts unresolved at tip; ledger-exactness unaffected). Frontier holds for replay; fast-start ref-scripts blocked on #10 fix.
 - phase2.mainnet:   inert until ep507 (V3)
@@ -134,8 +134,13 @@
   guesses. next:poll muscle -> if checks_green + hash-oracle PASSES, VERIFYING (re-soak: failing slots must
   stop WARNing) -> gauntlet -> commit. Do NOT commit on green tests alone (hash match is the proof).
 - item: #0 ep246 reserves +82,270,482 (Allegra/PV3) state:PARKED-WITH-ROOT-CAUSE — structural member-reward fold
-- item: live soak (sync-gate) state:AT-TIP CONFIRMED — soak node block 4793035 == koios live tip 4793035,
-  sustained ~17min, 0 panic/OOM/wedge, RSS 4.8GB, CPU 1.7% idle-at-tip. Sync-gate live-soak portion HOLDING.
+- item: live soak (sync-gate) state:LIVE-SOAK VALIDATED — soak node tracks live preprod tip in LOCKSTEP
+  (node block 4793042 slot 125082823 == koios live tip 4793042; extends within seconds of each new block,
+  4793037->4793042 over ~2min). Continuously at/near tip since 16:55 (~18min), 0 panic/OOM/wedge/chain_diverged,
+  RSS ~4.8GB, CPU 1.6% idle-at-tip. => readiness GATE (2) live-sync-to-tip VALIDATED on preprod (replay-clean +
+  fast-start + sustained at-tip lockstep). NUANCE: this is a MITHRIL-FAST-START node, so gate (3) phase-2
+  INDEPENDENT validation of ref-script txs is still gated on #10 (it trusts on-chain consensus meanwhile — no
+  wedge). Gates (2) and (3) are separate; (2) is now met.
 - attempts: 1
 - ANALYZE RESULT (w6lsvu2p2, Opus): canonical Haskell active-stake =
   resolveActiveInstantStakeCredentials (Stake.hs @52ef3d5) — per registered+delegated
@@ -486,6 +491,14 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake60 2026-06-07: POLL #10 muscle (we0nz74zr STILL RUNNING — agent jsonl live, journal shows started not
+  completed; mid two-part MemPack fix + nextest --workspace). Did NOT disturb it / did NOT launch competing
+  heavy work. Advanced the OTHER in-progress item instead: sync-gate live-soak -> VALIDATED. Soak node tracks
+  the live preprod tip in LOCKSTEP (block 4793042 slot 125082823 == koios live 4793042; extends within seconds
+  of each new block, 4793037->4793042 over ~2min), continuously at/near tip since 16:55 (~18min), 0
+  panic/OOM/wedge/chain_diverged. => readiness GATE (2) live-sync-to-tip VALIDATED on preprod. Recorded the
+  nuance that gate (3) phase-2 independent ref-script validation on the fast-start path remains blocked on #10
+  (node trusts consensus meanwhile; gates 2 and 3 are separate). #10 stays FIXING. Next wake: re-poll we0nz74zr.
 - wake59 2026-06-07: DRIVE #10 FIX. Soak still EXACTLY at tip (block 4793035 == koios live 4793035, ~17min,
   0 panic/OOM/wedge, 1.7% CPU) — sync-gate live-soak holding. Cheap pre-check already satisfied last wake
   (root-cause is definitive), so advanced #10 ROOT-CAUSED -> FIXING: launched fix-muscle we0nz74zr (Opus,
