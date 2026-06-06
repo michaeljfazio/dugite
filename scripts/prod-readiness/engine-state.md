@@ -69,7 +69,8 @@
    divergence means no script flipped validity.)
 5. [L][phase2] #14 V3 TxInfo deferred fields (inert until mainnet ep507).
    state:NEW attempts:0
-9. [M][sync/perf][REAL] Snapshot UTxO-backend mismatch: mithril-import/haskell-conversion saves the native
+9. [DONE] Snapshot UTxO-backend mismatch: FIXED + operationally verified + committed. (was:)
+   [M][sync/perf][REAL] Snapshot UTxO-backend mismatch: mithril-import/haskell-conversion saves the native
    ledger snapshot with backend `dugite-mem`, but `run` defaults to `dugite-lsm` -> "snapshot backend does not
    match configured backend" -> snapshot DISCARDED -> FULL genesis replay on every restart instead of
    fast-start. Real robustness/perf gap (not byte-exactness). Fix: save the snapshot in the configured backend
@@ -87,7 +88,7 @@
 
 ## In-progress
 - item: #8 NEW (real, found by broad sweep): mainnet ep246 reserves +82,270,482 divergence (Allegra)
-- item: #9 snapshot backend mismatch. state:VERIFYING — fix applied to main (Convertible arm: mem-snapshot-under-lsm loads+migrates instead of full-replay); building for operational verify
+- (#9 FIXED + committed — first landed real fix). Selecting next item.
 - attempts: 1
 - ANALYZE RESULT (w6lsvu2p2, Opus): canonical Haskell active-stake =
   resolveActiveInstantStakeCredentials (Stake.hs @52ef3d5) — per registered+delegated
@@ -423,3 +424,10 @@
   crates, no ledger/byte-exact change. Applied to main (uncommitted), compiles clean, feature-build running.
   NEXT: operational verify — run a fresh clone of db-preprod-sync with the fixed binary, confirm it loads the
   mem snapshot (no 'backend does not match', NO full genesis replay) -> then COMMIT (first landed real fix).
+- wake54 2026-06-07: *** #9 FIXED + OPERATIONALLY VERIFIED + COMMITTED (first landed real fix) ***. Ran the
+  fixed binary on a fresh db-preprod-sync clone: log shows "Loaded in-memory snapshot under the LSM backend ...
+  no from-genesis replay" (utxo_count=4116338), then live-synced 3319 Conway blocks. 0 panic/ERROR/backend-
+  mismatch/full-replay/volatile-WARN. fmt+clippy clean. Committed (2 files, Tier B, no byte-exact change).
+  mithril-imported nodes now fast-start instead of full-replaying. Remaining real work: #0 ep246 (hard
+  structural, root-caused) + the RAM-clean live soak. ENGINE SCORECARD: ledger byte-exact (preprod all-era +
+  mainnet ex-ep246), phase-2 byte-exact, sync replay-clean + #9 fixed; 2 real bugs found, 1 fixed, 1 root-caused.
