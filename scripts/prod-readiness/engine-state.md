@@ -153,7 +153,14 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-BUILDING (FINAL2 authoritative+meta-
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-RESOAK (FINAL2). Build DONE
+  (BUILD_EXIT=0). DROVE re-verify: cloned db-preprod-sync -> verify10h, ran FINAL2 binary (pid 72713, port 4211).
+  Import: "codec_version=Some(1) txix_endianness=Big" (authoritative), distribution sane, utxo_count=4116338
+  skipped=0. (meta-absent fix doesn't change the modern-BE preprod path; the legacy-LE meta-absent path is covered
+  by the new end-to-end unit tests since no meta-less legacy snapshot is on disk to soak.) Node syncing
+  124999169->tip. NEXT WAKE FULL-VERDICT: scan ALL rejection classes -> 0 phase-1 (MultiAssetNotConserved 0,
+  not-found 0, budget 0, no new class) -> RE-GAUNTLET -> commit. GC'd verify10g (disk 53GB). was:
+  state:VERIFYING-BUILDING (FINAL2 authoritative+meta-
   absent). *** muscle wx76r15y3 COMPLETE wake128, checks_green, 2 crates ***. Fix (node/mod.rs): meta read
   NotFound=>None=>Little (legacy LE), mirroring upstream getMetadata (MetadataFileDoesNotExist->Nothing->still
   decode, quoted verbatim); other IO errors propagate; Some(1)=>Big, Some(other)=>Err, field-absent/null=>None,
@@ -515,8 +522,10 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- verify-build-10h  pid 71916  log .jobs/verify-build-10h.log — release build of dugite-node with the FINAL2 #10
-  fix (authoritative codec-version + meta-absent-tolerance) on MAIN. Poll BUILD_EXIT=0 -> re-import re-verify.
+- verify10h-resoak  pid 72713  log .jobs/verify10h-resoak.log  socket /tmp/engine-verify10h.sock port 4211
+  db-clones/preprod-verify10h — FINAL2-fix node (codec_version=Some(1)->Big), syncing. NEXT WAKE FULL-VERDICT:
+  scan ALL rejection classes (0 phase-1 expected). SIGTERM-only. Retain for #15.
+- verify-build-10h — DONE (BUILD_EXIT=0). FINAL2 #10 fix on MAIN uncommitted (gated on re-verify+re-gauntlet).
 - fix-muscle wx76r15y3 — COMPLETE (meta-absent=>LE tolerance + end-to-end tests). patch
   candidate-fix-10-FINAL2-authoritative-metaabsent.patch + worktree wf_a2048ce6-581-1.
 - db-clones/preprod-verify10g RETAINED for #15.
@@ -867,6 +876,10 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake130 2026-06-07: #10 VERIFYING-BUILDING -> VERIFYING-RESOAK. FINAL2 build BUILD_EXIT=0. Cloned
+  db-preprod-sync -> verify10h, ran FINAL2 binary (pid 72713): import "codec_version=Some(1)->Big" authoritative,
+  sane distribution, utxo_count=4116338 skipped=0. Node syncing. GC'd verify10g (disk 53GB). Deferred
+  full-verdict grep (one-step). next: scan ALL rejection classes -> 0 phase-1 -> re-gauntlet -> commit.
 - wake129 2026-06-07: POLL #10 FINAL2-fix build verify-build-10h (pid 71916) — STILL RUNNING (final crate
   dugite-node compiling/linking). Not done; can't re-verify yet. No competing CPU during link. #10 stays
   VERIFYING-BUILDING; next: BUILD_EXIT=0 -> clone db-preprod-sync -> re-import re-soak (0 phase-1, full
