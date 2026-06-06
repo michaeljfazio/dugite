@@ -22,9 +22,14 @@ bin="$REPO_ROOT/target/release/dugite-node"
 
 # Force from-genesis replay: remove ALL ledger snapshots + the utxo-store INSIDE
 # the clone, leaving only immutable/ (genesis blocks) + volatile/ + mithril/.
-# A dugite/mithril db carries the ledger state as `ledger-snapshot.bin` (+ .meta.json)
-# and an LSM `utxo-store/`; if these survive, the node loads that epoch's state and
-# SKIPS the from-genesis replay (it would never produce early-epoch dumps).
+# A dugite/mithril db carries the ledger state in one of several forms; if ANY
+# survive, the node loads that epoch's state and SKIPS the from-genesis replay
+# (so it would never produce early-epoch dumps):
+#   - `haskell-ledger/`        : raw Haskell ledger import (mithril) -> converted on boot
+#   - `ledger-snapshot.bin`    : native snapshot (+ .meta.json)
+#   - `utxo-store/`            : LSM UTxO state
+# Leave only immutable/ (genesis blocks) + volatile/ + mithril/.
+rm -rf "$db/haskell-ledger" 2>/dev/null || true
 rm -f  "$db"/ledger-snapshot.bin "$db"/ledger-snapshot.bin.meta.json 2>/dev/null || true
 find "$db" -maxdepth 1 -iname '*snapshot*' -exec rm -rf {} + 2>/dev/null || true
 rm -rf "$db/utxo-store" 2>/dev/null || true
