@@ -162,7 +162,31 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:GAUNTLET-PENDING (FINAL-DONE). *** wake150:
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:DIAGNOSING (dissent-verification). *** wake152:
+  RE-GAUNTLET wetwroth8 RETURNED pass=false, REFUTED 3/3 (NOT a commit). DO NOT trust the prior numeric verdicts —
+  verify the dissent (cardinal rule). The three refutations:
+   (R1 haskell-semantics + R2 edge-epoch CONVERGE — the GATING dissent): the 297 phase-2 'Error term' residual is
+    attributed WHOLESALE to #15 WITHOUT per-error evidence. Concrete alt-cause squarely in #10's domain: imported
+    INLINE datums (MemPack tag-4) carry raw_cbor but phase-2 consumer dugite-uplc/src/redeemer_resolve.rs::
+    resolve_spend_datum (~L620) IGNORES raw_cbor and re-encodes CANONICALLY — on-chain datums are non-canonical
+    (Constr CBOR tag-102), don't round-trip -> datum-hash/ScriptContext mismatch -> 'Error term'. ALSO tag-4/tag-5
+    import in node/mod.rs SILENTLY degrades to None on decode err (warn-and-continue) = violates no-silent-corruption
+    cardinal rule -> wrong/empty ScriptContext -> 'Error term'. Same symptom as #15 -> attribution unproven.
+   (R3 compounding-feedback — REAL but NARROW, fold into #10 before re-gauntlet): json_number_to_word8_codec_version
+    uses serde_json as_f64().fract() (no arbitrary_precision) -> sub-ULP fractional versions (1.0000000000000001)
+    round to 1.0 and are ACCEPTED where Aeson arbitrary-precision Scientific.toBoundedInteger REJECTS any fractional.
+    Acceptance-side mismatch -> "mirror Aeson exactly" FALSIFIED for that input class. Unreachable from canonical
+    snapshots (real preprod meta = INTEGER 1, hits as_u64 fast path) but violates strict-parse contract. FIX: gate on
+    Number::as_u64/as_i64 integer typing (reject any non-integer-typed JSON number), NOT as_f64().fract().
+  DROVE: launched DIAGNOSE muscle wuoecuy7o (run wf_31db35f1-cbb) to verify the R1+R2 dissent via DECISIVE
+  discriminator: a spent input created at slot <= 124999169 came from the #10 IMPORT (MemPack tables); slot >
+  124999169 came from live block-CBOR decode (never imported). Diagnose resolves ~20 of the 305 'Error term'
+  tx_hashes' spent inputs via koios.sh preprod -> are ANY imported tag-4/tag-5 script UTxOs (import implicated) or
+  are ALL post-snapshot (residual genuinely #15)? NEXT WAKE: on diagnose verdict — IMPORT-IMPLICATED -> #10 absorbs
+  inline-datum verbatim-bytes (resolve_spend_datum must use raw_cbor) + no-silent-None fixes, re-fix+re-soak+re-
+  gauntlet; NOT-IMPLICATED -> #10 separable, fold R3 float-parse hardening, rebuild+re-soak+re-gauntlet, then commit.
+  Either way R3 hardening is REQUIRED before #10 commits. verify10j node (pid 63671) left soaking as evidence.
+  was: state:GAUNTLET-PENDING (FINAL-DONE). *** wake150:
   FULL-VERDICT PASS. verify10j soak (pid 63671) synced 124999533 -> 125105013 (~105K slots past snapshot tip,
   processed blocks referencing imported UTxOs): 0 phase-1 transaction rejections ALL classes (InputNotFound/
   MissingScriptWitness/InvalidMint/MultiAssetNotConserved/CollateralNotFound) — IDENTICAL to STRICT verify10i.
@@ -971,6 +995,13 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake152 2026-06-07: #10 RE-GAUNTLET wetwroth8 = pass=false REFUTED 3/3. GAUNTLET-PENDING -> DIAGNOSING. R1+R2
+  converge: 297 'Error term' residual attribution to #15 is UNPROVEN; viable #10 alt-cause = imported tag-4 inline
+  datum re-encoded canonically (resolve_spend_datum ignores raw_cbor) + tag-4/5 silent-None on decode err. R3:
+  json_number_to_word8 as_f64().fract() accepts sub-ULP fractional version Aeson rejects (narrow; fold before
+  commit). Launched DIAGNOSE muscle wuoecuy7o (wf_31db35f1-cbb): resolve 20 'Error term' tx_hashes' spent-input
+  slots via koios — imported(<=124999169) tag-4/5 => #10 implicated; all post-snapshot => #15 confirmed. NEXT WAKE:
+  act on diagnose verdict.
 - wake151 2026-06-07: POLL #10 RE-GAUNTLET wetwroth8 — still RUNNING (3 Opus refuters). No transition possible.
   Health: verify10j node (pid 63671, 7min) at slot 125105256 block 4793919, still 0 phase-1 rejections; disk 28G
   free (stable). #10 stays GAUNTLET-PENDING. NEXT WAKE: on gauntlet PASS -> COMMIT #10 via gh/HTTPS.
