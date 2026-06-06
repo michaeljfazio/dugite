@@ -11,7 +11,7 @@
 ## Frontiers  (advance these; zero open divergence behind each)
 - ledger.preprod:   BYTE-EXACT vs Koios — total active_stake matches at ep100/150/200/230 (Shelley→Conway) + ep57 per-cred exact; clean replay ep0-233 zero halts; finishing to ep293
 - ledger.mainnet:   BYTE-EXACT vs Koios — reserves+treasury exact at ep212-221 (doc's +180.4B ep213 divergence GONE on HEAD); replay validating further
-- sync.preprod:     ep181 HALT GONE on HEAD (clean replay past ep192); the original blocker is resolved
+- sync.preprod:     LIVE SYNC+SOAK running — node from ep293 snapshot syncing ~620 blocks to live tip (ep293 b4792907) then at-tip soak; watch stalls/wedges/chain_diverged
 - sync.mainnet:     ~ep331 (last known good db-mainnet)
 - phase2.preprod:   BYTE-EXACT (is_valid) — full preprod replay ep0-293 (V1/V2/V3, Alonzo->Babbage->Conway): 0 ValidationTagMismatch, 0 divergence dumps. #22 RESOLVED on HEAD (was 628 stale divergences)
 - phase2.mainnet:   inert until ep507 (V3)
@@ -384,3 +384,10 @@
   the same validity verdict as the chain. #22 RESOLVED on HEAD (was 628 stale divergences). THIRD readiness
   gate in strong shape: ledger (preprod all-era + mainnet ep209-318 minus root-caused ep246) ✓, phase-2 ✓.
   Remaining: ep246 structural fix (parked, root-caused), sync/perf frontiers, mainnet-phase-2 V3 (inert til ep507).
+- wake47 2026-06-07: BROADENED to the SYNC gate (4th frontier). Launched a LIVE preprod node (clone of
+  db-preprod-sync, fast-start from ep293 native snapshot, NOT wiped) connecting to preprod peers to sync
+  ~620 blocks to the live tip (ep293 b4792907) then SOAK at tip. Validates live-network sync + at-tip
+  stability (no stall/wedge/chain_diverged, ledger_tip==immutable_tip). job .jobs/sync-soak.{pid,log}.
+  CAUTION free_ram=1GB at launch (live node ~7GB) — watch for OOM. Next wakes: confirm it reaches tip and
+  soaks clean for a sustained window. This rounds out the 4th readiness gate (correctness gates ledger+phase2
+  already byte-exact).
