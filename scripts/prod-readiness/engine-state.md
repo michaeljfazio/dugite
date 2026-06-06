@@ -9,7 +9,7 @@
 - reference_node_socket: none        # Koios-first; set if a cn node is up
 
 ## Frontiers  (advance these; zero open divergence behind each)
-- ledger.preprod:   BYTE-EXACT vs Koios at ep100/150/200/230 (Shelley→Conway) + ep57 per-cred exact + ep292/293 total active_stake HEAD-verified on the LIVE soak node (go(293)==Koios as(292), set(293)==as(293)). The ep292 -100 ADA candidate (item 2b) was a STALE Jun-3 dump — RESOLVED on HEAD. clean replay ep0-233 zero halts. Frontier HOLDS through ep293 (aggregate active_stake to ADA precision; per-cred re-verified at ep57)
+- ledger.preprod:   BYTE-EXACT vs Koios at ep100/150/200/230 (Shelley→Conway) + ep57 per-cred exact + ep292/293 total active_stake HEAD-verified on the LIVE soak node (go(293)==Koios as(292), set(293)==as(293)) + ep293 reserves 13072484951876873 & treasury 1870588626354717 BOTH byte-exact (to the lovelace) vs Koios totals (wake63). So at ep293 the live HEAD node matches Koios on ALL three core accounting outputs (reserves+treasury+active_stake). NOTE: ep293 reserves/treasury are mithril-import-faithful + held; dugite's OWN reserves/treasury TRANSITION computation is covered separately by full-replay ep0-233. The ep292 -100 ADA candidate (2b) was a STALE dump — RESOLVED on HEAD. clean replay ep0-233 zero halts. Frontier HOLDS through ep293
 - ledger.mainnet:   BYTE-EXACT vs Koios — reserves+treasury exact at ep212-221 (doc's +180.4B ep213 divergence GONE on HEAD); replay validating further
 - sync.preprod:     from-genesis REPLAY clean + #9 snapshot-backend fix LANDED + LIVE-SOAK reached tip healthy (wake57): clone db-clones/preprod-soak fast-started via #9 Convertible mem->lsm path (NO genesis replay, utxo_count=4116338), caught up to live tip (node block 4793022 hash-matched koios, 1 block/28s behind live 4793023), 0 panic/0 OOM/0 wedge, RSS 4.8GB, CPU 1.5% idle-at-tip. *** SUSTAINED-WINDOW CONFIRMED wake60 ***: node tracks live tip in lockstep ~18min (block 4793042 == koios live 4793042, extends within seconds of each new block), 0 anomalies => GATE (2) live-sync-to-tip VALIDATED on preprod. Residual is GATE (3) only: #10 ref-script independent validation on the fast-start path (in FIXING via muscle we0nz74zr; node trusts consensus meanwhile, no wedge)
 - sync.mainnet:     ~ep331 (last known good db-mainnet)
@@ -498,6 +498,15 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake63 2026-06-07: #10 fix-muscle we0nz74zr STILL RUNNING (actively editing decode_tag5 in the worktree —
+  iterating, likely refining after the hash-oracle check; not disturbed, no competing heavy work). Advanced
+  gate (1) via a zero-cost HEAD spot-check: the soak log's "Building LedgerState from Haskell snapshot
+  epoch=293" line shows reserves=13072484951876873 treasury=1870588626354717, and Koios totals(293) gives the
+  SAME to the lovelace -> mithril-import reserves/treasury byte-exact + held. Combined with wake62's
+  dugite-recomputed active_stake match, the live HEAD node matches Koios on ALL 3 core accounting outputs at
+  ep293. Recorded honestly that reserves/treasury here are import-faithful (transition-computation is covered by
+  full-replay ep0-233). #10 stays FIXING. Idea banked: if the soak crosses ep293->294, that live-tests dugite's
+  OWN reserves/treasury transition on HEAD — watch for it.
 - wake62 2026-06-07: #10 fix-muscle we0nz74zr STILL RUNNING (now at its hash-oracle verification step —
   reading the real 885MB preprod tables blobs to validate its MemPack decoding; not disturbed). Advanced
   candidate 2b to RESOLVED-ON-HEAD via a LIGHT live-node query (no heavy work): dugite-cli query stake-snapshot
