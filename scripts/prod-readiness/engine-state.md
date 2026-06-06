@@ -855,6 +855,9 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake127 2026-06-07: POLL #10 meta-absent muscle wx76r15y3 — at FINAL gate (fmt+clippy clean; running nextest
+  --workspace). Imminent completion. Not disturbed. #10 stays FIXING. next (notif/poll): read FIX -> re-import
+  re-soak (modern-BE 0 phase-1) + legacy-LE path -> re-gauntlet -> commit.
 - wake126 2026-06-07: POLL #10 meta-absent muscle wx76r15y3 — RUNNING, healthy (4GB RAM, no nodes, 0 completed).
   Constructing the missing end-to-end test (meta-absent legacy snapshot must decode LE: from_tables_codec_version
   (None)=>Little + cross-validation passes) — the exact gap the gauntlet flagged. Not disturbed; no competing
