@@ -727,6 +727,9 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake102 2026-06-07: POLL #10 robust fix-muscle w1m4bxztw — RUNNING, healthy (4GB RAM, no nodes, 0 completed).
+  In build/clippy-fixup (observe_txix auto-detect helper; .is_multiple_of lint) -> approaching build+nextest. Not
+  disturbed; no competing work. #10 stays FIXING; next: poll -> re-import re-verify -> re-gauntlet -> commit.
 - wake101 2026-06-07: POLL #10 robust fix-muscle w1m4bxztw — RUNNING, healthy (5GB RAM, no nodes, 0 completed).
   Implemented EMPIRICAL AUTO-DETECT: TvarIterator::new auto-detects endianness from data (new_with_endianness for
   explicit tests); now adding gated key-correctness + safety-net tests. Version/layout-independent = gauntlet-proof
