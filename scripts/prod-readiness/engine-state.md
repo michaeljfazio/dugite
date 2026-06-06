@@ -743,6 +743,10 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake104 2026-06-07: POLL #10 robust-fix build verify-build-10e (pid 46612) — STILL RUNNING (final crate
+  dugite-node compiling/linking). Not done; can't re-verify yet. No competing work during link. #10 stays
+  VERIFYING-BUILDING; next: BUILD_EXIT=0 -> clone db-preprod-sync -> re-import re-soak (auto-detect BE, keep
+  549->277) -> re-gauntlet -> commit.
 - wake103 2026-06-07 (notification-triggered): #10 ROBUST endianness fix COMPLETE (muscle w1m4bxztw, Tier A',
   checks_green, 2 crates). Version/layout-INDEPENDENT: empirical auto-detect (detect_txix_endianness samples 2000
   keys, picks sane index distribution) + hard safety net (assert_txix_distribution_sane errors loud on mis-key) +
