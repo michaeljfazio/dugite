@@ -764,6 +764,10 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake110 2026-06-07: POLL #10 multi-asset fix-muscle w34va8uxf — NEAR COMPLETE: byte-exact gated test (reconstructed
+  multi_asset == Koios) PASSES against the real preprod blob; collecting final diff (txout.rs + tests.rs). Imminent
+  completion. Not disturbed. #10 stays FIXING; next (notif/poll): read FIX -> re-import re-soak (MultiAssetNotConserved
+  -> baseline + keep endianness win) -> re-gauntlet -> commit.
 - wake109 2026-06-07: POLL #10 multi-asset fix-muscle w34va8uxf — RUNNING, healthy (4GB RAM, no nodes). *** META
   DISCOVERY ***: db/ledger/<slot>/meta contains {"backend":"utxohd-mem","checksum":...,"tablesCodecVersion":1} —
   the AUTHORITATIVE endianness disambiguator (tablesCodecVersion, the gauntlet's prescribed signal) IS accessible
