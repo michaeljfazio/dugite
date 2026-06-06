@@ -806,6 +806,10 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake118 2026-06-07: POLL #10 rework muscle wjnl2t2ib — at FINAL gate (running nextest --workspace). Authoritative
+  meta-derived endianness implemented + tests. Imminent completion. Not disturbed. #10 stays FIXING. next
+  (notif/poll): read FIX -> re-import re-soak (0 phase-1 rejections, meta-derived endianness) -> re-gauntlet
+  (now authoritative, not heuristic) -> commit.
 - wake117 2026-06-07: POLL #10 rework muscle wjnl2t2ib — RUNNING, healthy (4GB RAM, no nodes, 0 completed).
   Implementing authoritative META-derived endianness (test_parse_tables_codec_version_real_preprod_meta added;
   updating the gated key-correctness oracle to derive endianness from the sibling meta file + cross-validate) ->
