@@ -90,7 +90,8 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-(none — item #1 PARKED; ad-hoc instrumentation reverted from main)
+- infra-muscle  workflow=whzzl2vls  (Opus, worktree) — adding per-credential stake to the epoch-state-debug
+  dump (env DUGITE_TRACE_CREDS). Shared diagnostic infra that unblocks #1/#3/#11 (all per-cred divergences).
 
 ## VERIFY FINDING (CORRECTED after gauntlet — my wake9 analysis was WRONG)
 - The apply_utxo_diff fix is INERT for ep57. Gauntlet wm055td32 REFUTED 2/3 (haskell-semantics +
@@ -185,3 +186,9 @@
   latent fixes (#6/#7) + many refuted hypotheses. Reverted ad-hoc instrumentation; next wake ROTATES
   to a fresh backlog item (#11 mainnet stake-dereg or #3 ep213). #1 resumes later with PROPER committed
   per-cred dump instrumentation, not ad-hoc eprintlns.
+- wake19 2026-06-06T14:00Z: SCHEDULE — instead of rotating into #11/#3 (same per-cred-divergence class
+  -> same measurement wall that stalled #1), chose the dependency-aware move: build SHARED per-cred dump
+  infra (reliable JSON, no log-filter/loop-guessing). Fired fix muscle whzzl2vls to add per-credential
+  stake (utxo_stake/reward_balance/total/pool) to the epoch-state-debug dump gated on DUGITE_TRACE_CREDS.
+  Once verified+committed, ALL ledger byte-exactness items become measurable from a replay's JSON. This
+  is the engine investing in tooling to unblock a whole frontier rather than tunneling.
