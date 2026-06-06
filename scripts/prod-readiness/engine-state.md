@@ -65,7 +65,7 @@
 
 ## In-progress
 - item: #8 NEW (real, found by broad sweep): mainnet ep246 reserves +82,270,482 divergence (Allegra)
-- state: ANALYZING — analyze muscle diagnosing the reserves/reward-expansion calc vs Haskell
+- state: FIXING — diagnosis in (deltaR1 too small); rho/tau RULED OUT (unchanged); d changed 0.24->0.22 at ep246; fix muscle pinpointing d-source/blocksMade/eta
 - attempts: 1
 - ANALYZE RESULT (w6lsvu2p2, Opus): canonical Haskell active-stake =
   resolveActiveInstantStakeCredentials (Stake.hs @52ef3d5) — per registered+delegated
@@ -277,3 +277,12 @@
   self-amortizes as the extra reserves generate slightly more expansion), NOT a per-epoch systematic drift,
   PLUS a second discrete event near ep271-275 (+~9M). Narrows diagnosis to a specific reward/MIR/pot event
   at the ep246 Allegra boundary. analyze muscle w93yngoj8 still running; mainnet replay at ep275.
+- wake30 2026-06-06T14:?? : analyze w93yngoj8 done — DIAGNOSIS: ep246 reserves+82.27M = deltaR1 too small in
+  the reward update (startStep: deltaR1=floor(min(1,eta)*rho*reserves); rho/tau/d ALL from prevPParams in
+  Haskell). Sign pattern (reserves high + treasury low) matches a small deltaR1 (rPot=ssFee+deltaR1 ->
+  deltaT1=floor(tau*rPot) also shrinks). Engine pinpointing: rewards.rs:177 pp=params sources rho/tau; d
+  uses separate prev_d (#629). RULED OUT rho/tau (mainnet ep245==ep246: rho 0.003, tau 0.2). CONFIRMED d
+  changed 0.24->0.22 at ep246. So bug is in deltaR1's d-dependent eta/expected_blocks OR blocksMade source
+  OR eta Rational arithmetic. Fired fix muscle to read the call site (which epoch's d/blocks passed),
+  compute Haskell-correct eta from Koios ep244 d + ep245 pool_blocks, pinpoint the exact wrong input, fix
+  (Tier A), and ADD RUPD-component dump (eta/expected_blocks/actual_blocks/deltaR1) for byte-exact verify.
