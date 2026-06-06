@@ -714,6 +714,10 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake97 2026-06-07: POLL #10 re-gauntlet wj0pzgzaq — RUNNING (3 refuters active, 0 completed; 5GB RAM, no
+  nodes). Adversarially probing the CONDITIONAL fix (layout=>endianness mapping completeness/reliability,
+  default-Big-on-legacy, carry-over integrity). Not disturbed; no competing work. #10 stays GAUNTLET-PENDING;
+  next: poll -> pass -> COMMIT the conditional patch via gh/HTTPS.
 - wake96 2026-06-07: #10 VERIFYING PASS for the CONDITIONAL fix. verify10d re-soak (new format=Big) matches the
   unconditional run: not-found 0, budget 0, MissingScriptWitness 0, ~279 Error-term (=#15), 4/5 target slots
   clean -> conditional fix is chain-equivalent for new format AND fixes the legacy regression (LE unit-proven).
