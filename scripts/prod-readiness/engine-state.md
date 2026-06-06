@@ -685,6 +685,10 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake91 2026-06-07: POLL #10 refinement muscle wauynb0ku — RUNNING, healthy (5GB RAM, no nodes, 0 completed).
+  Confirmed BOTH canonical sources (legacy/LE = generic MemPack Word16 host-native; new/BE = BigEndianTxIx
+  byteSwap16 — matches my wake89 byte-by-byte finding) and is editing mempack/mod.rs to implement the
+  format-conditional endianness. Not disturbed; no competing work. #10 stays FIXING; next: poll -> re-import re-verify.
 - wake90 2026-06-07: POLL #10 refinement muscle wauynb0ku — RUNNING, healthy (5GB RAM, no nodes, 0 completed).
   Applied the COMPLETE base (refscript+datum) in its worktree; now reworking the endianness as format-conditional
   (flat tables->BE, nested tvar->LE) + multi-asset delta. Not disturbed; no competing work. #10 stays FIXING;
