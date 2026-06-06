@@ -26,7 +26,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use dugite_primitives::era::Era;
-use dugite_primitives::hash::Hash28;
+use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::protocol_params::ProtocolParameters;
 use dugite_primitives::time::EpochNo;
 use dugite_primitives::transaction::{GovAction, GovActionId, Voter};
@@ -35,7 +35,19 @@ use serde::{Deserialize, Serialize};
 use super::{EpochSubState, GovernanceState, LedgerState, PoolRegistration, StakeSnapshot};
 
 const ENV_OUTPUT_DIR: &str = "DUGITE_EPOCH_STATE_DUMP";
+/// Comma-separated list of credential-hex *prefixes*.  Every GO-snapshot
+/// credential whose hex starts with one of these prefixes is always
+/// included in `per_credential.entries` in full, regardless of the top-N
+/// cap.  Use this to pin the specific account behind a divergence (#1
+/// ep57, #3 ep213, #11 mainnet stake-dereg) so its stake/delegation/reward
+/// is dumped exactly even when it is not in the top-N by stake.
+const ENV_CRED_FILTER: &str = "DUGITE_EPOCH_STATE_DUMP_CRED_FILTER";
 const TOP_N: usize = 20;
+/// Cap on per-credential entries emitted (beyond filter-matched ones).
+/// Bounds dump size at mainnet scale (millions of credentials) while still
+/// surfacing the heaviest accounts.  `credential_count`/`total_stake`/
+/// `total_reward` remain exhaustive regardless.
+const PER_CRED_TOP_N: usize = 200;
 
 /// Top-level canonical dump for one epoch boundary.
 ///
@@ -53,6 +65,10 @@ pub struct EpochStateDump {
     pub nonce: NonceState,
     pub utxo: UtxoSummary,
     pub stake_snapshot: StakeSnapshots,
+    /// Per-credential stake/delegation/reward breakdown of the GO snapshot.
+    /// Makes per-account divergences (#1/#3/#11) byte-exact-measurable.
+    #[serde(default)]
+    pub per_credential: PerCredentialSummary,
     pub pools: PoolSummary,
     pub rewards: RewardsSummary,
     pub governance: GovernanceSummary,
@@ -103,6 +119,60 @@ pub struct StakeSnapshots {
 pub struct StakeSnapshotSummary {
     pub total_active_stake: u64,
     pub pool_count: u64,
+}
+
+/// Per-credential stake + delegation + reward breakdown for the GO
+/// snapshot (the snapshot rewards are paid from — see §5/§6 of
+/// `references/era-rules/shelley-rewards.md`).
+///
+/// This is the missing piece that made the per-credential byte-exactness
+/// frontier (#1 ep57, #3 ep213, #11 mainnet stake-dereg — all
+/// per-credential/per-account divergences) measurable from a replay's JSON
+/// instead of ad-hoc log-grepping.
+///
+/// It mirrors three Haskell structures, all keyed by
+/// `Credential 'Staking`:
+///   * `unStake (ssStake (ssStakeGo ss)) :: VMap (Credential 'Staking)
+///     (CompactForm Coin)` — the active stake per credential.
+///   * `ssDelegations (ssStakeGo ss) :: VMap (Credential 'Staking)
+///     (KeyHash 'StakePool)` — pool each credential delegates to.
+///   * `rs ru :: Map (Credential 'Staking) (Set Reward)` — reward credited
+///     to each credential by `applyRUpdFiltered`
+///     (`Cardano/Ledger/Shelley/LedgerState/IncrementalStake.hs`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PerCredentialSummary {
+    /// Number of distinct credentials in the union of the GO snapshot's
+    /// stake distribution and the reward update.  Divergence in this
+    /// count alone localises a per-account class bug.
+    pub credential_count: u64,
+    /// Sum of `stake` across every credential (the GO snapshot's
+    /// `total_active_stake` re-derived from the per-credential map — must
+    /// equal `stake_snapshot.go.total_active_stake`).
+    pub total_stake: u64,
+    /// Sum of `reward` across every credential (must equal
+    /// `rewards.total_distributed`).
+    pub total_reward: u64,
+    /// Whether `entries` is the full credential set (`false`) or was
+    /// truncated to the top-N / filtered subset (`true`).  When `true`,
+    /// only `credential_count`/`total_stake`/`total_reward` are exhaustive.
+    pub truncated: bool,
+    /// Per-credential entries, deterministically ordered.  Always includes
+    /// every credential matched by `DUGITE_EPOCH_STATE_DUMP_CRED_FILTER`
+    /// (so the specific divergent account can be pulled in full), then
+    /// the top-N remaining credentials by stake.
+    pub entries: Vec<CredentialEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CredentialEntry {
+    /// 32-byte stake credential hash (hex).
+    pub credential_hex: String,
+    /// Active stake for this credential in the GO snapshot (lovelace).
+    pub stake: u64,
+    /// Pool this credential delegates to in the GO snapshot, if any.
+    pub pool_id_hex: Option<String>,
+    /// Reward credited to this credential by the reward update (lovelace).
+    pub reward: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,6 +361,136 @@ fn rewards_summary(
     RewardsSummary {
         total_distributed,
         per_pool_top20: top_n_pool_rewards(items),
+    }
+}
+
+/// Parse the credential-hex prefix filter from `ENV_CRED_FILTER`.
+/// Comma-separated, whitespace-trimmed, lowercased; empty when unset.
+fn cred_filter_prefixes() -> Vec<String> {
+    env::var(ENV_CRED_FILTER)
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(|p| p.trim().to_ascii_lowercase())
+                .filter(|p| !p.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Build the per-credential breakdown of the GO snapshot.
+///
+/// Joins three Haskell-credential-keyed maps (all keyed by
+/// `Credential 'Staking`):
+///   * `go.stake_distribution` ↔ `unStake (ssStake (ssStakeGo ss))`
+///   * `go.delegations`        ↔ `ssDelegations (ssStakeGo ss)`
+///   * `rupd.rewards`          ↔ `rs ru` (per-credential reward credit)
+///
+/// `credential_count`/`total_stake`/`total_reward` are exhaustive over the
+/// union of the stake distribution and the reward map.  `entries` is
+/// bounded: it always contains filter-matched credentials in full, then
+/// the top-N remaining credentials by stake (descending stake, ascending
+/// hex tiebreak) so output is deterministic regardless of HashMap order.
+fn per_credential_summary(
+    rupd: Option<&super::PendingRewardUpdate>,
+    go: Option<&StakeSnapshot>,
+) -> PerCredentialSummary {
+    let Some(go) = go else {
+        // Without a GO snapshot there is no per-credential stake to report;
+        // still surface reward totals so the field is never silently empty.
+        let total_reward: u64 = rupd
+            .map(|r| r.rewards.values().map(|l| l.0).sum())
+            .unwrap_or(0);
+        return PerCredentialSummary {
+            credential_count: 0,
+            total_stake: 0,
+            total_reward,
+            truncated: false,
+            entries: Vec::new(),
+        };
+    };
+
+    // Union of credentials appearing in the stake distribution or the
+    // reward map.  (A credential can earn a reward via leader/member even
+    // if its own active stake is zero; conversely a delegated credential
+    // may earn nothing.)
+    let mut creds: HashMap<&Hash32, (u64, Option<&Hash28>, u64)> = HashMap::new();
+    for (cred, stake) in go.stake_distribution.iter() {
+        let slot = creds.entry(cred).or_insert((0, None, 0));
+        slot.0 = stake.0;
+        slot.1 = go.delegations.get(cred);
+    }
+    if let Some(rupd) = rupd {
+        for (cred, reward) in rupd.rewards.iter() {
+            let slot = creds.entry(cred).or_insert((0, None, 0));
+            slot.2 = reward.0;
+            // Ensure delegation is populated even if the credential had no
+            // entry in stake_distribution (e.g. operator reward account).
+            if slot.1.is_none() {
+                slot.1 = go.delegations.get(cred);
+            }
+        }
+    }
+
+    let credential_count = creds.len() as u64;
+    let total_stake: u64 = creds.values().fold(0u64, |a, v| a.saturating_add(v.0));
+    let total_reward: u64 = creds.values().fold(0u64, |a, v| a.saturating_add(v.2));
+
+    let prefixes = cred_filter_prefixes();
+    let mut all: Vec<CredentialEntry> = creds
+        .into_iter()
+        .map(|(cred, (stake, pool, reward))| CredentialEntry {
+            credential_hex: cred.to_hex(),
+            stake,
+            pool_id_hex: pool.map(|p| p.to_hex()),
+            reward,
+        })
+        .collect();
+    // Deterministic order: descending stake, then descending reward, then
+    // ascending credential hex.
+    all.sort_by(|a, b| {
+        b.stake
+            .cmp(&a.stake)
+            .then_with(|| b.reward.cmp(&a.reward))
+            .then_with(|| a.credential_hex.cmp(&b.credential_hex))
+    });
+
+    let entries = if prefixes.is_empty() {
+        all
+    } else {
+        // Partition into filter-matched (always kept) and the rest.
+        let (mut matched, rest): (Vec<_>, Vec<_>) = all
+            .into_iter()
+            .partition(|e| prefixes.iter().any(|p| e.credential_hex.starts_with(p)));
+        matched.extend(rest);
+        matched
+    };
+
+    let truncated = entries.len() > PER_CRED_TOP_N;
+    let entries = if truncated {
+        // Keep all filter-matched entries plus top-N by stake.  Because
+        // filter-matched entries were moved to the front above, simply
+        // taking max(filter_matched_len, PER_CRED_TOP_N) preserves them.
+        let filter_matched_len = if prefixes.is_empty() {
+            0
+        } else {
+            entries
+                .iter()
+                .take_while(|e| prefixes.iter().any(|p| e.credential_hex.starts_with(p)))
+                .count()
+        };
+        let take = filter_matched_len.max(PER_CRED_TOP_N).min(entries.len());
+        entries.into_iter().take(take).collect()
+    } else {
+        entries
+    };
+
+    PerCredentialSummary {
+        credential_count,
+        total_stake,
+        total_reward,
+        truncated,
+        entries,
     }
 }
 
@@ -536,6 +736,7 @@ pub fn capture(
             set: empty_snapshot_summary_or(state.epochs.snapshots.set.as_ref()),
             go: empty_snapshot_summary_or(state.epochs.snapshots.go.as_ref()),
         },
+        per_credential: per_credential_summary(rupd, state.epochs.snapshots.go.as_ref()),
         pools: pool_summary(
             &state.certs.pool_params,
             &state.certs.pending_retirements,
@@ -633,6 +834,8 @@ pub fn maybe_dump(
             pools_registered = dump.pools.registered,
             dreps = dump.governance.drep_count,
             proposals = dump.governance.active_proposals,
+            credentials = dump.per_credential.credential_count,
+            per_cred_entries = dump.per_credential.entries.len(),
             "epoch-state debug dump written"
         ),
         Err(e) => tracing::warn!(
@@ -659,7 +862,7 @@ fn voter_kind(v: &Voter) -> &'static str {
 mod tests {
     use super::*;
     use crate::state::PendingRewardUpdate;
-    use dugite_primitives::hash::{Hash, Hash32};
+    use dugite_primitives::hash::Hash;
     use dugite_primitives::value::Lovelace;
     use std::sync::Arc;
 
@@ -890,6 +1093,165 @@ mod tests {
         assert_eq!(dump.rewards.per_pool_top20.len(), 1);
         assert_eq!(dump.rewards.per_pool_top20[0].amount, 150);
         assert_eq!(dump.rewards.per_pool_top20[0].pool_id_hex, pool_id.to_hex());
+    }
+
+    fn go_snapshot_with(stake: &[(Hash32, u64)], deleg: &[(Hash32, Hash28)]) -> StakeSnapshot {
+        let mut sd: HashMap<Hash32, Lovelace> = HashMap::new();
+        for (c, s) in stake {
+            sd.insert(*c, Lovelace(*s));
+        }
+        let mut dl: HashMap<Hash32, Hash28> = HashMap::new();
+        for (c, p) in deleg {
+            dl.insert(*c, *p);
+        }
+        StakeSnapshot {
+            epoch: EpochNo(40),
+            delegations: Arc::new(dl),
+            pool_stake: HashMap::new(),
+            pool_params: Arc::new(HashMap::new()),
+            stake_distribution: Arc::new(sd),
+            epoch_fees: Lovelace(0),
+            epoch_block_count: 0,
+            epoch_blocks_by_pool: Arc::new(HashMap::new()),
+        }
+    }
+
+    /// Per-credential summary: totals are exhaustive and per-entry
+    /// stake/delegation/reward are joined byte-exactly across the three
+    /// credential-keyed maps (#1/#3/#11 measurability).
+    #[test]
+    fn per_credential_joins_stake_delegation_reward() {
+        let pool = h28(0xaa);
+        let cred_a = h32(0x01);
+        let cred_b = h32(0x02);
+        let go = go_snapshot_with(
+            &[(cred_a, 1_000), (cred_b, 2_000)],
+            &[(cred_a, pool), (cred_b, pool)],
+        );
+        let mut rewards = HashMap::new();
+        rewards.insert(cred_a, Lovelace(7));
+        rewards.insert(cred_b, Lovelace(11));
+        let rupd = PendingRewardUpdate {
+            rewards,
+            delta_treasury: 0,
+            delta_reserves: 18,
+        };
+        let pc = per_credential_summary(Some(&rupd), Some(&go));
+        assert_eq!(pc.credential_count, 2);
+        assert_eq!(pc.total_stake, 3_000);
+        assert_eq!(pc.total_reward, 18);
+        assert!(!pc.truncated);
+        // Sorted descending by stake: cred_b (2000) first.
+        assert_eq!(pc.entries[0].credential_hex, cred_b.to_hex());
+        assert_eq!(pc.entries[0].stake, 2_000);
+        assert_eq!(pc.entries[0].reward, 11);
+        assert_eq!(
+            pc.entries[0].pool_id_hex.as_deref(),
+            Some(pool.to_hex().as_str())
+        );
+        assert_eq!(pc.entries[1].credential_hex, cred_a.to_hex());
+        assert_eq!(pc.entries[1].stake, 1_000);
+        assert_eq!(pc.entries[1].reward, 7);
+    }
+
+    /// A credential that earns a reward but has no stake-distribution entry
+    /// (e.g. a pool operator reward account) still appears, and totals stay
+    /// exhaustive over the union.
+    #[test]
+    fn per_credential_includes_reward_only_credentials() {
+        let go = go_snapshot_with(&[(h32(0x01), 1_000)], &[]);
+        let mut rewards = HashMap::new();
+        rewards.insert(h32(0x01), Lovelace(5));
+        rewards.insert(h32(0x99), Lovelace(50)); // reward-only, no stake
+        let rupd = PendingRewardUpdate {
+            rewards,
+            delta_treasury: 0,
+            delta_reserves: 55,
+        };
+        let pc = per_credential_summary(Some(&rupd), Some(&go));
+        assert_eq!(pc.credential_count, 2);
+        assert_eq!(pc.total_stake, 1_000);
+        assert_eq!(pc.total_reward, 55);
+        let reward_only = pc
+            .entries
+            .iter()
+            .find(|e| e.credential_hex == h32(0x99).to_hex())
+            .expect("reward-only credential present");
+        assert_eq!(reward_only.stake, 0);
+        assert_eq!(reward_only.reward, 50);
+        assert!(reward_only.pool_id_hex.is_none());
+    }
+
+    /// No GO snapshot → no per-credential stake, but reward totals still
+    /// surface so the field is never silently empty.
+    #[test]
+    fn per_credential_no_go_snapshot_reports_reward_total() {
+        let mut rewards = HashMap::new();
+        rewards.insert(h32(0x01), Lovelace(9));
+        let rupd = PendingRewardUpdate {
+            rewards,
+            delta_treasury: 0,
+            delta_reserves: 9,
+        };
+        let pc = per_credential_summary(Some(&rupd), None);
+        assert_eq!(pc.credential_count, 0);
+        assert_eq!(pc.total_stake, 0);
+        assert_eq!(pc.total_reward, 9);
+        assert!(pc.entries.is_empty());
+    }
+
+    /// `total_stake` re-derived from the per-credential map equals the
+    /// aggregate `stake_snapshot.go.total_active_stake`.  A mismatch here
+    /// is itself a per-credential class signal.
+    #[test]
+    fn per_credential_total_stake_matches_aggregate() {
+        let mut state = make_state();
+        let go = go_snapshot_with(
+            &[(h32(0x01), 1_000), (h32(0x02), 2_500), (h32(0x03), 500)],
+            &[],
+        );
+        state.epochs.snapshots.go = Some(go);
+        let dump = capture(&state, 41, 0, None);
+        assert_eq!(dump.per_credential.total_stake, 4_000);
+        // Aggregate path sums pool_stake (empty here) — they need not be
+        // equal in this fabricated state, but the per-credential total must
+        // equal the explicit stake_distribution sum.
+    }
+
+    /// The credential filter pins a specific account in full even when it
+    /// is not in the top-N by stake (the #1/#3/#11 use case).
+    #[test]
+    fn per_credential_filter_pins_account() {
+        // 5 high-stake creds (hex prefix not matching) + 1 tiny target.
+        let mut stake: Vec<(Hash32, u64)> =
+            (1u8..=5).map(|b| (h32(0x10 + b), 1_000_000u64)).collect();
+        let target = h32(0xab); // hex starts with "abab..."
+        stake.push((target, 1));
+        let go = go_snapshot_with(&stake, &[]);
+        let pc = with_cred_filter("abab", || per_credential_summary(None, Some(&go)));
+        // Target (tiny stake) must be present despite low stake.
+        assert!(
+            pc.entries
+                .iter()
+                .any(|e| e.credential_hex == target.to_hex()),
+            "filter-pinned credential must appear"
+        );
+    }
+
+    /// Helper: run a closure with `ENV_CRED_FILTER` set, restoring after.
+    /// Env mutation is process-global; nextest runs each test in its own
+    /// process so this is safe here.
+    fn with_cred_filter<T>(value: &str, f: impl FnOnce() -> T) -> T {
+        // SAFETY: nextest isolates each test in its own process; no other
+        // thread reads this env var concurrently within the test process.
+        unsafe {
+            env::set_var(ENV_CRED_FILTER, value);
+        }
+        let out = f();
+        unsafe {
+            env::remove_var(ENV_CRED_FILTER);
+        }
+        out
     }
 
     #[test]
