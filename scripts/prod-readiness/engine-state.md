@@ -162,7 +162,18 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-RESOAK (FINAL-DONE). *** wake149:
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:GAUNTLET-PENDING (FINAL-DONE). *** wake150:
+  FULL-VERDICT PASS. verify10j soak (pid 63671) synced 124999533 -> 125105013 (~105K slots past snapshot tip,
+  processed blocks referencing imported UTxOs): 0 phase-1 transaction rejections ALL classes (InputNotFound/
+  MissingScriptWitness/InvalidMint/MultiAssetNotConserved/CollateralNotFound) — IDENTICAL to STRICT verify10i.
+  The 13 non-#15 "ERROR" greps are benign substring hits (macOS DNS WARN, chain_diverged=false, PlutusV1 332-vs-166
+  cost-model fallback WARN — pre-existing, unrelated to import-keying). Only residual = 297 phase-2 'Error term'
+  = #15 (294->297 is +3 slots, separately filed). No halts/panics/apply-failures. Launched RE-GAUNTLET muscle
+  wetwroth8 (run wf_436d43b5-37f) on FINAL-DONE with rich item (codec-version Aeson-exact + endianness/backend +
+  TxOut completeness + CRC=#17 scoped). Should PASS (float-parse byte-exact resolves refutation-a; CRC filed
+  resolves refutation-b; endianness confirmed byte-exact by all 3 priors). NEXT WAKE: on gauntlet PASS -> COMMIT
+  #10 via gh/HTTPS (2 crates: dugite-serialization + dugite-node) using FINAL-DONE patch; on REFUTE -> verify the
+  dissent vs upstream before acting. was: state:VERIFYING-RESOAK (FINAL-DONE). *** wake149:
   BUILD_EXIT=0 (FINAL-DONE binary built Jun7 07:14). DROVE re-import re-soak: GC'd verify10b (-2G CoW), CoW-cloned
   db-preprod-sync -> db-clones/preprod-verify10j, launched FINAL-DONE node pid 63671 port 4211 sock
   /tmp/engine-verify10j.sock. Import log byte-exact: "(strict: only version 1 => big-endian is accepted)
@@ -960,6 +971,10 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake150 2026-06-07: #10 FULL-VERDICT PASS -> VERIFYING-RESOAK -> GAUNTLET-PENDING. verify10j synced 124999533
+  ->125105013, 0 phase-1 rejections (all classes, == STRICT verify10i); 13 non-#15 ERRORs all benign (DNS/cost-
+  model-fallback/chain_diverged=false); residual 297 = #15. Launched RE-GAUNTLET muscle wetwroth8 (wf_436d43b5-37f)
+  on FINAL-DONE. NEXT WAKE: on PASS -> COMMIT #10 via gh/HTTPS (dugite-serialization + dugite-node).
 - wake149 2026-06-07: #10 BUILD_EXIT=0 (FINAL-DONE binary, Jun7 07:14). DROVE VERIFYING-BUILDING -> VERIFYING-
   RESOAK: GC'd verify10b (-2G), CoW-cloned db-preprod-sync -> verify10j, launched FINAL-DONE node pid 63671 (port
   4211). Import byte-exact "(strict: only version 1 => big-endian) codec_version=1 txix_endianness=Big", 4116339
