@@ -136,7 +136,23 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-RESOAK (complete fix). Build DONE
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:DIAGNOSING (residual). *** VERIFYING VERDICT
+  wake75: FAILED end-to-end — the divergence is NOT gone *** The complete-fix re-soak (verify10b) shows IDENTICAL
+  counts to before the datum fix: 291 "script returned Error term" + 41 "budget exhausted" + 11 "script not
+  found" (was 290/41/11). So the datum+refscript DECODE fix (unit-oracles PROVEN byte-exact) did NOT change
+  runtime phase-2 behavior at all. The discipline caught what green tests would have hidden (had I committed on
+  oracle-green, I'd have shipped a no-op-at-runtime fix). FALSIFIED multi-asset hypothesis (tx 578069c6 has 3
+  ZERO-asset inputs). KEY PUZZLE: decode-oracle says 0/59,872 tag-5 lack script_ref, yet runtime STILL emits 11
+  "not found" -> a STATIC-DECODE vs RUNTIME-RESOLUTION disconnect. HYPOTHESIS (to verify, not assume): the
+  corrected import data (OutputDatum::InlineDatum + script_ref @mod.rs:6413-6445) is NOT reaching the phase-2
+  ScriptContext/input-resolution path for confirmed-block validation (candidates: bincode roundtrip drops
+  fields / ScriptContext reads datum from witness only / separate datum-table unfilled / resolution reads an
+  unpopulated structure). Launched ANALYZE muscle wxuwzffyl to TRACE import->store->phase-2-resolution and pin
+  the file:line where the data is lost. db-clones/preprod-verify10b retains the complete-fix imported state for
+  the muscle. #10 fixes (refscript+datum) stay on MAIN as the base (correct, oracle-proven, no regression).
+  NOTE (strategic, recorded): these divergences are NON-CHAIN-CRITICAL (node trusts on-chain consensus -> no
+  wedge/no chain-divergence; like any snapshot-bootstrapped node). next: poll wxuwzffyl root-cause. was:
+  state:VERIFYING-RESOAK (complete fix). Build DONE
   (BUILD_EXIT=0, 1m39s). DROVE fresh import re-verify: cloned db-preprod-sync -> db-clones/preprod-verify10b, ran
   COMPLETE-fix binary (pid 99008, /tmp/engine-verify10b.sock, port 4205). Import path ran WITH datum+refscript
   decode: "Loading UTxO set ...124999169/tables" -> "complete utxo_count=4116338 skipped=0" -> native snapshot
@@ -262,11 +278,12 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- verify10b-resoak  pid 99008  log .jobs/verify10b-resoak.log  socket /tmp/engine-verify10b.sock port 4205
-  db-clones/preprod-verify10b — COMPLETE-fix node, RE-IMPORTED (refscript+datum, snapshot 1487.5MB), syncing
-  124999169 -> tip. NEXT WAKE: grep failing slots for 290 Error-term + 41 budget + 11 not-found (ALL GONE=verified).
-  SIGTERM-only.
-- verify-build-10b — DONE (BUILD_EXIT=0, 1m39s). COMPLETE #10 fix on MAIN uncommitted (gated on re-verify+gauntlet).
+- analyze-muscle wxuwzffyl (#10 residual root-cause: why corrected import data doesn't reach runtime phase-2,
+  Opus, ROOTCAUSE schema) — /workflows-visible. Poll next wake for the file:line where datum/script_ref is lost.
+- verify10b-resoak — STOPPED CLEAN wake75 (SIGTERM; verdict: 549 divergences UNCHANGED by datum fix). RAM freed.
+  db-clones/preprod-verify10b retains the COMPLETE-fix imported state for the analyze muscle.
+- COMPLETE #10 fix (refscript+datum) on MAIN uncommitted (correct oracle-proven base; commit gated on residual
+  resolution + gauntlet). patch candidate-fix-10-COMPLETE-refscript-datum.patch.
 - fix-muscle wnqthg8c8 — COMPLETE (both oracles pass). COMPLETE patch candidate-fix-10-COMPLETE-refscript-datum.patch
   + worktree wf_17ccaf91-99f-1. (Base refscript-only patch candidate-fix-10-mempack-refscript.patch also retained.)
 - import source: db-preprod-sync/haskell-ledger/ INTACT (124995007+124999169) for the re-verify.
@@ -577,6 +594,15 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake75 2026-06-07: #10 VERIFYING VERDICT = FAILED end-to-end (the gate did its job). Complete-fix re-soak
+  (verify10b) shows IDENTICAL divergence counts to before the datum fix: 291 Error-term + 41 budget + 11
+  not-found. So the byte-exact-PROVEN decode fix (datum+refscript) is a runtime NO-OP for these txs -> the
+  corrected import data isn't reaching phase-2 eval. Falsified multi-asset (tx 578069c6 = 0-asset inputs).
+  Puzzle: decode-oracle says all tag-5 have script_ref yet runtime still 11 not-found = static-vs-runtime
+  disconnect. SIGTERM'd verify10b (RAM 5GB free). Launched ANALYZE muscle wxuwzffyl to trace import->store->
+  phase-2-resolution and pin where datum/script_ref is lost. #10 -> DIAGNOSING. Did NOT commit (divergence not
+  gone; refscript+datum fixes stay on main as oracle-proven base). Recorded that these divergences are
+  NON-chain-critical (trust-on-consensus). LESSON re-affirmed: oracle-green unit tests != runtime byte-exact.
 - wake74 2026-06-07: #10 VERIFYING-BUILDING -> VERIFYING-RESOAK. Complete-fix build finished BUILD_EXIT=0 (1m39s;
   wake73's "finished" was a PID artifact). Cloned db-preprod-sync -> verify10b, ran the complete-fix binary
   (pid 99008): import path executed WITH datum+refscript decode (snapshot 1487.5MB vs 1161.9MB refscript-only =
