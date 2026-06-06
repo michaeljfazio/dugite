@@ -10,7 +10,7 @@
 
 ## Frontiers  (advance these; zero open divergence behind each)
 - ledger.preprod:   BYTE-EXACT vs Koios — total active_stake matches at ep100/150/200/230 (Shelley→Conway) + ep57 per-cred exact; clean replay ep0-233 zero halts; finishing to ep293
-- ledger.mainnet:   epoch 212 (open: ep213 reward divergence)
+- ledger.mainnet:   ep209-212 byte-exact (per doc); FIRST divergence ep213 reserves +180.4B lovelace — REPRODUCING on HEAD now
 - sync.preprod:     ep181 HALT GONE on HEAD (clean replay past ep192); the original blocker is resolved
 - sync.mainnet:     ~ep331 (last known good db-mainnet)
 - phase2.preprod:   open buckets: budget ~398, Error ~186, unIData ~44 (Babbage V1/V2)
@@ -57,8 +57,8 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: (#1 RESOLVED — see below; selecting next item next wake)
-- state: IDLE/ROTATE — #1 resolved on HEAD; replay-measure finishing to ep293 to lock the frontier
+- item: #3 mainnet ep213 reserves divergence (== #11; recent 2026-06-04 finding, REAL)
+- state: REPRODUCING — mainnet from-genesis replay running (db-mainnet clone) toward ep214 with 4-cred filter
 - attempts: 1
 - ANALYZE RESULT (w6lsvu2p2, Opus): canonical Haskell active-stake =
   resolveActiveInstantStakeCredentials (Stake.hs @52ef3d5) — per registered+delegated
@@ -118,6 +118,12 @@
 - CORRECTED ROOT CAUSE: a LIVE-path apply_utxo_changes attribution bug (eras/common.rs). STAKE_CLAMP
   fired 6x in the live path; last-mile points at a BASE-SCRIPT address (addr_test1zpu3l06a...) / a
   non-Phase-5 output-creation path / an era-boundary path. The next ANALYZE/FIX targets THAT.
+
+## Active job
+- replay-mainnet  pid-file=.jobs/replay-mainnet.pid  (mainnet from-genesis replay, db-mainnet clone,
+  4-cred filter, DUGITE_EPOCH_STATE_DUMP=epoch-dumps-engine/mainnet-ep213). Climbing through Byron->ep214.
+  CAUTION: free_ram=1GB at launch -> watch for OOM. When at ep213+: diff dugite reserves/treasury vs
+  Koios totals (api.koios.rest) + per-cred reward vs account_reward_history. Confirm the +180.4B reserves.
 
 ## DB clones on disk
 - db-clones/preprod-ep57         (unfixed-binary replay; baseline dump captured)
@@ -238,3 +244,9 @@
   for the per-cred filter. Next wake: when preprod replay (->ep293) frees the lock, START the mainnet
   investigation (either a from-genesis replay, or the doc's faster bisect path if it has one) OR pick
   phase2 #22 (doable on the already-present db-preprod-sync Babbage Plutus) if mainnet replay is too long.
+- wake26 2026-06-06T14:39Z: ROTATE to mainnet #3/#11 (ep213 reserves divergence, recent+real). Doc method:
+  from-genesis REPLAY is fast (~min, not hours; replay!=full-validation-sync). SIGTERMed preprod replay
+  (frontier already established ep0-233 + spot-checks), cloned db-mainnet (CoW), wiped to immutable,
+  launched mainnet from-genesis replay with the 4 stake-dereg creds filtered + epoch-state-debug. Byron
+  climbing. Next wake: poll to ep214, diff reserves/treasury vs Koios to reproduce the +180.4B, then
+  diagnose with the haskell-ledger-cross-validation skill. WATCH RAM (1GB free at launch).
