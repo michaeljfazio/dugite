@@ -550,6 +550,11 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake72 2026-06-07: POLL #10 muscle wnqthg8c8 — at FINAL verification (clippy CLIPPY_EXIT=0; running
+  `cargo nextest run --workspace` now = last gate before it returns the FIX result). Imminent completion;
+  not disturbed, no competing work. Verify-prep from wake71 stands (db-preprod-sync import source intact, disk
+  headroom). #10 stays FIXING-EXPANDED. next (on completion notif or next poll): read FIX result -> fresh
+  import re-verify from db-preprod-sync (must clear 290 Error-term + 41 budget + 11 not-found) -> gauntlet -> commit.
 - wake71 2026-06-07: POLL #10 muscle wnqthg8c8 — STILL RUNNING, now in TEST/BUILD phase (nextest/cargo build,
   fixing its own datum-decode unit tests re BinaryData VarLen prefix) -> near completion. Not disturbed. Did
   non-contending VERIFY PREP to de-risk the upcoming re-verify: confirmed db-preprod-sync/haskell-ledger/
