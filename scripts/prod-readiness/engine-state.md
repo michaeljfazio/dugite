@@ -11,7 +11,7 @@
 ## Frontiers  (advance these; zero open divergence behind each)
 - ledger.preprod:   BYTE-EXACT vs Koios — total active_stake matches at ep100/150/200/230 (Shelley→Conway) + ep57 per-cred exact; clean replay ep0-233 zero halts; finishing to ep293
 - ledger.mainnet:   BYTE-EXACT vs Koios — reserves+treasury exact at ep212-221 (doc's +180.4B ep213 divergence GONE on HEAD); replay validating further
-- sync.preprod:     from-genesis REPLAY validated clean (no stall/wedge/diverge across many replays incl this one). Live-SOAK portion RAM-constrained on this box (1GB free -> I/O-wait/swap); needs clean-RAM re-run. Found perf gap #9 + volatile-replay connect-warnings to recheck
+- sync.preprod:     from-genesis REPLAY clean + #9 snapshot-backend fix LANDED + LIVE-SOAK reached tip healthy (wake57): clone db-clones/preprod-soak fast-started via #9 Convertible mem->lsm path (NO genesis replay, utxo_count=4116338), caught up to live tip (node block 4793022 hash-matched koios, 1 block/28s behind live 4793023), 0 panic/0 OOM/0 wedge, RSS 4.8GB, CPU 1.5% idle-at-tip. REMAINING: sustained-window confirm (next wake) + investigate #10 reference-script WARNs (below) which may be a regression in the #9 fast-start path
 - sync.mainnet:     ~ep331 (last known good db-mainnet)
 - phase2.preprod:   BYTE-EXACT (is_valid) — full preprod replay ep0-293 (V1/V2/V3, Alonzo->Babbage->Conway): 0 ValidationTagMismatch, 0 divergence dumps. #22 RESOLVED on HEAD (was 628 stale divergences)
 - phase2.mainnet:   inert until ep507 (V3)
@@ -76,6 +76,26 @@
    fast-start. Real robustness/perf gap (not byte-exactness). Fix: save the snapshot in the configured backend
    (or auto-run the snapshot converter, or make mithril-import honor --utxo-backend). Found via the sync-gate
    live-node test (wake48). state:NEW attempts:0
+10. [H][phase2/sync][REAL-NEW, wake57] Reference-script resolution fails at tip on the #9 fast-start clone.
+   During the live-soak (db-clones/preprod-soak, fast-started via #9 Convertible mem->lsm), EVERY tip tx that
+   spends a script-locked input or does a script-locked withdrawal via a REFERENCE script fails dugite's
+   independent validation: phase-1 `MissingScriptWitness`/`MissingWithdrawalScriptWitness` + phase-2
+   `script not found for redeemer purpose`. The node "trusts on-chain consensus" so it does NOT wedge, but
+   dugite would REJECT these txs standalone. Same script hashes recur across many independent txs
+   (ec80112317817fdf..., 744837b0a352566983276e1fb256e428d96eab87cc42972261e0c88b withdrawal,
+   85e3bfa6b315ad81..., d55eb689d83301fb...), i.e. these are reference scripts held in old UTxOs.
+   HYPOTHESIS: the #9 Convertible mem->lsm fast-start path (load_snapshot_with_backend_guard ->
+   attach_utxo_store inline-UTxO migration) does NOT preserve the reference-script bytes/index on converted
+   UTxO entries -> reference inputs resolve to a UTxO with no script -> resolution fails. Since phase2.preprod
+   was locked BYTE-EXACT on a FULL-REPLAY sync (0 divergence), these WARNs appearing ONLY on the fast-started
+   clone would be a REGRESSION IN THE #9 FIX (a real correctness gap I introduced), NOT a base phase-2 gap.
+   FALSIFIABLE EXPERIMENT (next wake, Tier A'/B): run a node that did a FULL from-genesis (or non-converted)
+   replay to the SAME preprod tip and check the SAME slots (125081911, 125081937, 125081958, 125082000,
+   125082081) for the identical WARNs. NOT present on full-replay => #9 reference-script gap (fix: rebuild the
+   reference-script resolution from converted UTxOs in the Convertible arm). Present on both => genuine
+   reference-script-from-UTxO resolution gap independent of snapshot. Cheaper pre-check: dump whether the
+   UTxO entry holding script 744837b0a3...  has its reference-script bytes after the mem->lsm conversion.
+   state:NEW attempts:0  (do NOT guess a fix — run the experiment first, this is exactly the #438-class trap)
 6. [H][ledger] FORK-ROBUSTNESS (elevated M->H, now vindicated): apply_utxo_diff reconstruction didn't
    replay stake_map -> the FORK-INDUCED variant of the ep57 bug. Clean HEAD replay is correct, but a live
    sync hitting a rollback could still corrupt stake. The refuted gauntlet trusted a STALE doc; this IS a
@@ -187,7 +207,8 @@
 - 2026-06-06T12:25Z wake6 ~ analyze result + root-cause disambiguation + fix muscle launched
 
 ## Last node state
-- sampled: 2026-06-06T11:40Z  node_pids="" rss_mb=0 free_disk_gb=205 free_ram_gb=5 jobs=0 halt=false
+- sampled: 2026-06-06T17:01Z  node_pids="99162 99165" rss_mb=4798 free_disk_gb=143 free_ram_gb=4 jobs=9 halt=false
+  AT-TIP: node block 4793022 slot 125082081 hash c8004a5b... == koios tip 4793022 (1 block/28s behind live 4793023); STAT SN, 1.5% CPU idle-at-tip; 0 panic/OOM/wedge
 
 ## Wake log
 - wake1 2026-06-06T11:41Z: ASSESS found no db-preprod-sync (only db-mainnet + db-preprod-haskell
@@ -435,3 +456,17 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake57 2026-06-07: *** LIVE-SOAK REACHED TIP HEALTHY (#9 fast-start validated end-to-end) ***. The soak node
+  (pid 99162, clone db-clones/preprod-soak) fast-started via the #9 Convertible mem->lsm path (NO genesis
+  replay, utxo_count=4116338, 8min elapsed) and caught up to the live preprod tip: node block 4793022 slot
+  125082081 hash c8004a5b... == koios tip 4793022, 1 block/28s behind live 4793023. STAT SN, 1.5% CPU
+  idle-at-tip, RSS 4.8GB. 0 panic/0 OOM/0 wedge/0 real-ERROR (the "chain_diverged" matches were benign
+  ChainSync-intersection status lines; rollbacks were normal initial peer intersections). Sync-gate live-soak
+  portion SUCCEEDING — needs only a sustained-window confirm (next wake). *** NEW REAL FINDING #10 ***: at tip,
+  EVERY reference-script-spending/withdrawing tx fails dugite's INDEPENDENT validation (phase-1
+  MissingScriptWitness + phase-2 'script not found for redeemer purpose'); node trusts on-chain so no wedge.
+  Same script hashes recur (744837b0a3... withdrawal, ec80112317..., 85e3bfa6b3...) => reference scripts in old
+  UTxOs. HYPOTHESIS: the #9 Convertible fast-start path doesn't preserve reference-script bytes/index on
+  converted UTxO entries — a REGRESSION in my own #9 fix (phase2.preprod was byte-exact on FULL replay). Logged
+  as backlog #10 with a falsifiable experiment (full-replay node to same tip — same WARNs?); did NOT guess a
+  fix (the #438-class trap). Next wake: (a) sustained at-tip confirm, (b) run experiment #10.
