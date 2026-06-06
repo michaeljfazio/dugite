@@ -153,7 +153,12 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-RESOAK (STRICT). Build DONE
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:GAUNTLET-PENDING (STRICT). *** FULL VERIFYING
+  PASS wake142 *** verify10i re-soak (synced 124999612->125103157): 0 phase-1 transaction rejections (all
+  classes), strict codec_version=1->Big, only 294 #15 Error-term. Launched RE-GAUNTLET w3upqlq0y on STRICT — key
+  angle (over-strict guard): any case where upstream ACCEPTS but dugite now REJECTS (regression)? + backend tag
+  exactness + re-verify modern-only claim. On PASS -> commit the STRICT patch via gh/HTTPS (lands #10). was:
+  state:VERIFYING-RESOAK (STRICT). Build DONE
   (BUILD_EXIT=0). DROVE re-verify: cloned db-preprod-sync -> verify10i, ran STRICT binary (pid 32304, port 4212).
   Import log: "(strict: only version 1 => big-endian is accepted) codec_version=1 txix_endianness=Big", sane
   distribution, utxo_count=4116338 skipped=0. Node syncing 124999169->tip. NEXT WAKE FULL-VERDICT: scan ALL
@@ -556,10 +561,12 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- verify10i-resoak  pid 32304  log .jobs/verify10i-resoak.log  socket /tmp/engine-verify10i.sock port 4212
-  db-clones/preprod-verify10i — STRICT-fix node (codec_version=1->Big, strict), syncing. NEXT WAKE FULL-VERDICT:
-  scan ALL rejection classes (0 phase-1 expected). SIGTERM-only. Retain for #15.
-- verify-build-10i — DONE (BUILD_EXIT=0). STRICT #10 fix on MAIN uncommitted (gated on re-verify+re-gauntlet).
+- re-gauntlet w3upqlq0y (#10 STRICT fix adversarial refutation, refuterN=3) — /workflows-visible. Poll next wake:
+  pass -> COMMIT the STRICT patch via gh/HTTPS; refuted -> address.
+- verify10i-resoak — STOPPED CLEAN wake142 (FULL PASS: 0 phase-1 rejections; only 294 #15 Error-term).
+  db-clones/preprod-verify10i RETAINED for #15 diagnosis.
+- STRICT #10 fix on MAIN uncommitted (candidate-fix-10-STRICT-codecversion.patch); commit on gauntlet pass.
+- DISK: 37GB free (GC'd mainnet-ep213; CoW-shared so modest). Watch.
 - fix-muscle wh8n6ip92 — COMPLETE (strict meta; verified legacy-LE drop safe). patch
   candidate-fix-10-STRICT-codecversion.patch + worktree wf_e4a069c7-99f-1.
 - db-clones/preprod-verify10h RETAINED for #15.
@@ -915,6 +922,12 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake142 2026-06-07: *** #10 FULL VERIFYING PASS (STRICT) *** verify10i re-soak: 0 phase-1 transaction
+  rejections (all classes), strict codec_version=1->Big, only 294 #15 Error-term. Synced past all failing slots.
+  SIGTERM'd verify10i (kept db for #15), GC'd mainnet-ep213 (re-clonable). Launched RE-GAUNTLET w3upqlq0y on the
+  STRICT terminal (key probe: over-strict regression — does dugite now reject anything upstream ACCEPTS?). #10
+  VERIFYING-RESOAK -> GAUNTLET-PENDING. next: poll -> on pass COMMIT the STRICT patch via gh/HTTPS (lands #10 at
+  last — 7 gauntlet rounds, each a real byte-exactness bug caught).
 - wake141 2026-06-07: #10 VERIFYING-BUILDING -> VERIFYING-RESOAK. STRICT build BUILD_EXIT=0. Cloned
   db-preprod-sync -> verify10i, ran STRICT binary (pid 32304): import "(strict: only version 1 => big-endian
   accepted) codec_version=1 txix_endianness=Big", sane distribution, utxo_count=4116338 skipped=0. Node syncing.
