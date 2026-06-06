@@ -136,7 +136,15 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-BUILDING (complete fix). *** muscle
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-RESOAK (complete fix). Build DONE
+  (BUILD_EXIT=0, 1m39s). DROVE fresh import re-verify: cloned db-preprod-sync -> db-clones/preprod-verify10b, ran
+  COMPLETE-fix binary (pid 99008, /tmp/engine-verify10b.sock, port 4205). Import path ran WITH datum+refscript
+  decode: "Loading UTxO set ...124999169/tables" -> "complete utxo_count=4116338 skipped=0" -> native snapshot
+  1487.5 MB (vs 1161.9 MB refscript-only = the 778K inline datums + refscripts now included). Node syncing from
+  124999169 toward tip; will RE-PROCESS the failing slots (>124999169). NEXT WAKE VERDICT: grep verify10b-resoak.log
+  for the 290 "script returned Error term" + 41 "budget exhausted" + 11 "script not found" at slots
+  125081911..125082081 (and broadly) — ALL GONE = #10 end-to-end VERIFIED -> gauntlet -> commit. ANY remaining
+  eval-divergence on these txs (that full-replay validates) = still a gap -> back to FIXING. was VERIFYING-BUILDING. *** muscle
   wnqthg8c8 COMPLETE wake73, BOTH byte-exact oracles PASS, checks_green, 2 crates (7 files +1060/-115) ***.
   KEY DISCOVERY: the real datum bug was tag-4 CORRUPTION, not just a drop — BinaryData era = bare
   ShortByteString (VarLen||cbor), and the old decoder neither stripped the VarLen prefix (stored 1e581c... vs
@@ -254,8 +262,11 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- verify-build-10b  pid 98554  log .jobs/verify-build-10b.log — release build of dugite-node with the COMPLETE
-  #10 fix (refscript+datum) applied to MAIN (uncommitted). Poll for BUILD_EXIT=0 -> fresh-import re-verify.
+- verify10b-resoak  pid 99008  log .jobs/verify10b-resoak.log  socket /tmp/engine-verify10b.sock port 4205
+  db-clones/preprod-verify10b — COMPLETE-fix node, RE-IMPORTED (refscript+datum, snapshot 1487.5MB), syncing
+  124999169 -> tip. NEXT WAKE: grep failing slots for 290 Error-term + 41 budget + 11 not-found (ALL GONE=verified).
+  SIGTERM-only.
+- verify-build-10b — DONE (BUILD_EXIT=0, 1m39s). COMPLETE #10 fix on MAIN uncommitted (gated on re-verify+gauntlet).
 - fix-muscle wnqthg8c8 — COMPLETE (both oracles pass). COMPLETE patch candidate-fix-10-COMPLETE-refscript-datum.patch
   + worktree wf_17ccaf91-99f-1. (Base refscript-only patch candidate-fix-10-mempack-refscript.patch also retained.)
 - import source: db-preprod-sync/haskell-ledger/ INTACT (124995007+124999169) for the re-verify.
@@ -566,6 +577,12 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake74 2026-06-07: #10 VERIFYING-BUILDING -> VERIFYING-RESOAK. Complete-fix build finished BUILD_EXIT=0 (1m39s;
+  wake73's "finished" was a PID artifact). Cloned db-preprod-sync -> verify10b, ran the complete-fix binary
+  (pid 99008): import path executed WITH datum+refscript decode (snapshot 1487.5MB vs 1161.9MB refscript-only =
+  778K inline datums + refscripts now populated, utxo_count=4116338 skipped=0). Node syncing 124999169 -> tip to
+  re-process the failing slots. Next wake greps verify10b-resoak.log: 290 Error-term + 41 budget + 11 not-found
+  must ALL be gone -> #10 verified -> gauntlet -> commit. 3GB RAM free; no competing heavy work.
 - wake73 2026-06-07 (notification-triggered): #10 EXPANDED FIX COMPLETE (muscle wnqthg8c8, Tier A', checks_green,
   2 crates). MAJOR: the datum bug was tag-4 CORRUPTION (BinaryData VarLen not stripped + multi-asset dropped),
   not just a drop -> 132,148 corrupt -> 778,015 correct inline-datum outputs. Fix = decode_binary_data +
