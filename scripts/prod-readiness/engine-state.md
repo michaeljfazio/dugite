@@ -685,6 +685,10 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake90 2026-06-07: POLL #10 refinement muscle wauynb0ku — RUNNING, healthy (5GB RAM, no nodes, 0 completed).
+  Applied the COMPLETE base (refscript+datum) in its worktree; now reworking the endianness as format-conditional
+  (flat tables->BE, nested tvar->LE) + multi-asset delta. Not disturbed; no competing work. #10 stays FIXING;
+  next: poll wauynb0ku -> re-import re-verify (both formats correct, keep 549->277) -> re-gauntlet -> commit.
 - wake89 2026-06-07 (notification-triggered): *** GAUNTLET CAUGHT A REAL REGRESSION (passed 2-1 but I overrode
   the majority — verified the dissent) ***. wqwgen1p0: haskell-semantics + edge-epoch refuted=FALSE (found
   upstream BigEndianTxIn confirming BE for NEW format); compounding-feedback refuted=TRUE and CORRECT: TxIx
