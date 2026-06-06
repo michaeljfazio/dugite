@@ -125,6 +125,17 @@
    found for redeemer purpose". Tier A' (phase-2). state:VERIFYING-PENDING attempts:1  FIX COMPLETE (muscle
    we0nz74zr, hash-oracle PASSED byte-exact, checks_green, 2 crates; patch + worktree wf_41bd7059-365-1). See
    In-progress for the VERIFYING plan (SIGTERM soak -> build -> re-soak -> WARNs-gone -> gauntlet -> commit).
+15. [M][phase2][REAL-NEW wake86] Fast-start residual 277 "script returned Error term" — SEPARATE from #10's
+   key/datum/refscript/multiasset (those are fixed: 549->277, not-found+budget zeroed). On the FULL-fix re-import
+   re-soak (db-clones/preprod-verify10c retained), 277 DISTINCT txs each emit one "uplc fails but on-chain
+   is_valid=true; trusting consensus" Error-term (e.g. 8b1a6a78 @slot125081937, ff9bc7d2, ff448523, fcee9506).
+   DISCRIMINATOR: full-replay (phase2.preprod) is BYTE-EXACT for these -> still PURELY import-incompleteness, a
+   field the import gets wrong that full-replay gets right. Already fixed+ruled-out: TxIx key, inline datum,
+   reference script, multi-asset value. LEADING SUSPECT (to verify, not assume): compact-ADDRESS decode for the
+   MemPack TxOut tags 2/3 Addr28Extra forms -> wrong txInfoInputs[].address in ScriptContext -> script returns
+   Error. Spread across 277 txs (broad field issue, not a few scripts) supports an address-class cause. NON-chain-
+   critical (trust-on-consensus, no wedge). NEXT: diagnose muscle comparing a failing tx's resolved-input
+   address (dugite import vs Koios) using db-clones/preprod-verify10c. state:NEW attempts:0
 6. [H][ledger] FORK-ROBUSTNESS (elevated M->H, now vindicated): apply_utxo_diff reconstruction didn't
    replay stake_map -> the FORK-INDUCED variant of the ep57 bug. Clean HEAD replay is correct, but a live
    sync hitting a rollback could still corrupt stake. The refuted gauntlet trusted a STALE doc; this IS a
@@ -136,7 +147,13 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-RESOAK (FULL fix). Build DONE
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:GAUNTLET-PENDING (FULL fix). *** VERIFYING
+  wake86: MAJOR chain-level SUCCESS (not a no-op this time) *** full-fix re-soak (verify10c) divergences
+  549->277 with KEY-RESOLUTION classes ELIMINATED: "script not found" 11->0, "budget exhausted" 41->0,
+  MissingScriptWitness 0; 4 of 5 original target slots now CLEAN. NO regression (counts only dropped). The
+  BE-key fix made the imported refscript/datum data finally RESOLVE at phase-2. Launched GAUNTLET wqwgen1p0
+  (refuterN=3) on the FULL fix; on PASS -> commit (FULL patch on main). RESIDUAL: 277 "script returned Error
+  term" persist (down only 14) = SEPARATE import cause, filed as #15. was: state:VERIFYING-RESOAK (FULL fix). Build DONE
   (BUILD_EXIT=0, 1m39s). DROVE fresh import re-verify: cloned db-preprod-sync -> db-clones/preprod-verify10c, ran
   FULL-fix binary (pid 56221, /tmp/engine-verify10c.sock, port 4206). Import clean (utxo_count=4116338 skipped=0)
   with BE keys + datum + refscript + multi-asset. Node syncing 124999169 -> tip; re-processes the failing slots.
@@ -327,11 +344,11 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- verify10c-resoak  pid 56221  log .jobs/verify10c-resoak.log  socket /tmp/engine-verify10c.sock port 4206
-  db-clones/preprod-verify10c — FULL-fix node (BE keys+datum+refscript+multiasset), RE-IMPORTED, syncing
-  124999169 -> tip. NEXT WAKE VERDICT: grep failing slots for 291 Error-term + 41 budget + 11 not-found (->~0 = #10 VERIFIED).
-  SIGTERM-only.
-- verify-build-10c — DONE (BUILD_EXIT=0). FULL #10 fix on MAIN uncommitted (gated on re-verify+gauntlet).
+- gauntlet-muscle wqwgen1p0 (#10 FULL fix adversarial refutation, refuterN=3) — /workflows-visible. Poll next
+  wake: pass (refute<majority) -> COMMIT the FULL patch via gh/HTTPS; refuted -> address the refutation.
+- verify10c-resoak — STOPPED CLEAN wake86 (verdict: 549->277, not-found+budget zeroed). db-clones/preprod-verify10c
+  RETAINED for #15 (277 Error-term) residual diagnosis. RAM freed.
+- FULL #10 fix on MAIN uncommitted (candidate-fix-10-FULL-refscript-datum-endianness.patch); commit on gauntlet pass.
 - fix-muscle wagcpug42 — COMPLETE (key-correctness oracles pass). FULL patch
   candidate-fix-10-FULL-refscript-datum-endianness.patch + worktree wf_843d9ff3-1d5-1.
 - import source: db-preprod-sync/haskell-ledger/ INTACT for the re-verify.
@@ -649,6 +666,16 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake86 2026-06-07: *** #10 VERIFYING = MAJOR chain-level SUCCESS *** full-fix re-soak (verify10c) dropped
+  phase-2 divergences 549->277 with the KEY-RESOLUTION classes ELIMINATED ("not found" 11->0, "budget" 41->0,
+  MissingScriptWitness 0; 4/5 target slots CLEAN). NO regression. The BE-key fix (the diagnosed root cause) made
+  the refscript+datum data finally resolve at runtime — this time NOT a no-op (contrast wake75). Launched GAUNTLET
+  wqwgen1p0 (refuterN=3) on the FULL fix toward commit. Filed the residual 277 "Error term" (277 distinct txs,
+  full-replay byte-exact so import-incompleteness; leading suspect compact-address decode tags 2/3) as new item
+  #15 (non-chain-critical). SIGTERM'd verify10c (kept its db for #15 diagnosis). #10 VERIFYING-RESOAK ->
+  GAUNTLET-PENDING. next: poll gauntlet -> on pass COMMIT the FULL patch (TxIx endianness + multiasset +
+  refscript + datum, 2 crates) via gh/HTTPS. ENGINE WORKED: byte-exact discipline forced the deep diagnosis that
+  found the real one-line endianness root cause two "correct" decode fixes had masked.
 - wake85 2026-06-07: #10 VERIFYING-BUILDING -> VERIFYING-RESOAK. Full-fix build BUILD_EXIT=0 (1m39s). Cloned
   db-preprod-sync -> verify10c, ran FULL-fix binary (pid 56221): clean import (utxo_count=4116338 skipped=0) with
   BE keys + datum + refscript + multi-asset. Node syncing to re-process the failing slots. Held one-step
