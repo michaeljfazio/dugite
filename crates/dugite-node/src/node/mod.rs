@@ -632,11 +632,19 @@ pub(crate) struct GsmActorParts {
 impl Node {
     /// Load a ledger snapshot and enforce the backend-tag guard before the
     /// node commits to it. Mirrors Haskell's `MetadataBackendMismatch`: a
-    /// snapshot written with a *different* UTxO backend is rejected (→ `Err`)
-    /// so the caller falls through to the from-chain rebuild rather than
-    /// loading an empty or structurally-incompatible UTxO set. A missing
-    /// sidecar (pre-meta snapshots, e.g. an existing `db-mainnet`) is handled
-    /// by backend inference and loads normally.
+    /// snapshot written with a *structurally-incompatible* UTxO backend is
+    /// rejected (→ `Err`) so the caller falls through to the from-chain rebuild
+    /// rather than loading an empty or wrong-shaped UTxO set. A missing sidecar
+    /// (pre-meta snapshots, e.g. an existing `db-mainnet`) is handled by backend
+    /// inference and loads normally.
+    ///
+    /// The one asymmetric exception is a `dugite-mem` snapshot loaded under the
+    /// `dugite-lsm` backend (the state produced by `mithril-import`, which
+    /// always writes a mem-tagged snapshot): the inline UTxOs are migrated into
+    /// the LSM store at attach time, so the snapshot is accepted and converted
+    /// inline rather than triggering a full from-genesis replay. This is the
+    /// dugite analogue of Haskell's offline `snapshot-converter`
+    /// (`Ouroboros.Consensus.Cardano.SnapshotConversion`, mem → LSM).
     fn load_snapshot_with_backend_guard(
         snapshot_path: &std::path::Path,
         database_path: &std::path::Path,
@@ -650,6 +658,24 @@ impl Node {
             configured,
         ) {
             dugite_ledger::BackendCheckResult::Ok => Ok(state),
+            // A `dugite-mem` snapshot loaded under a `dugite-lsm` node (the
+            // common case right after `mithril-import`, which always writes a
+            // mem-tagged snapshot). The inline `utxo_set` we just loaded is
+            // migrated into the LSM store by the `attach_utxo_store` drain that
+            // runs immediately after this — no from-genesis replay required.
+            dugite_ledger::BackendCheckResult::Convertible {
+                snapshot_backend,
+                configured_backend,
+            } => {
+                info!(
+                    snapshot_backend = snapshot_backend.as_tag(),
+                    configured_backend = configured_backend.as_tag(),
+                    utxo_count = state.utxo.utxo_set.len(),
+                    "Loaded in-memory snapshot under the LSM backend; its inline UTxOs will be \
+                     migrated into the on-disk store (no from-genesis replay)."
+                );
+                Ok(state)
+            }
             dugite_ledger::BackendCheckResult::Mismatch {
                 snapshot_backend,
                 configured_backend,
