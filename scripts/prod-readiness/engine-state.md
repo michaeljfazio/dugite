@@ -894,6 +894,10 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake137 2026-06-07: POLL #10 strict remediation muscle wh8n6ip92 — RUNNING, healthy (5GB RAM, no nodes, 0
+  completed). Implementing strict semantics: meta-FILE-absent=>ERROR, enforce backend=="utxohd-mem", version
+  parse->Big (only version=1), adding the backend parser. Exactly the specified strict fix. Not disturbed; no
+  competing work. #10 stays FIXING; next: poll -> build+nextest -> re-verify (modern-BE 0 phase-1) -> re-gauntlet -> commit.
 - wake136 2026-06-07: POLL #10 strict remediation muscle wh8n6ip92 — RUNNING, healthy (5GB RAM, no nodes, 0
   completed). Doing the verify-before-strict investigation: found the legacy-LE test (build_legacy_le_tvar) uses
   SYNTHETIC tvar blobs, not a real meta-less network snapshot (preview_tvar_head_64k.bin is doc-referenced).
