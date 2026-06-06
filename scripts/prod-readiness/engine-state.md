@@ -624,6 +624,10 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake83 2026-06-07: POLL #10 fix muscle wagcpug42 — at FINAL gate (clippy clean; running nextest --workspace).
+  Imminent completion. Not disturbed. Re-verify prep stands (db-preprod-sync import source intact, disk
+  headroom). #10 stays FIXING. next (on completion notif/poll): read FIX -> fresh re-import re-soak -> 291/41/11
+  must drop to ~0 (chain proof) -> gauntlet -> commit COMPLETE fix (refscript+datum+endianness+multiasset, 2 crates).
 - wake82 2026-06-07: POLL #10 fix muscle wagcpug42 — STILL RUNNING, healthy (4GB RAM, no nodes, building). In
   BUILD phase for the multi-asset reconstruction (PolicyId/AssetName imports added to mod.rs, compiling
   serialization+node); endianness flip + tag0/1 multi-asset done, build+nextest+gated-oracle still ahead. Not
