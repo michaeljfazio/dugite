@@ -18,10 +18,11 @@
 - perf:             at-tip CPU bounded (15 hot peers); sync ~300 blk/s Byron
 
 ## Backlog  (ranked by impact; one advanced per wake)
-1. [H][ledger] ep57 preprod stake-distribution -10 ADA  (2 delegators each -5 ADA;
-   root-caused to UTxO-set content / addr->cred attribution, NOT incremental upkeep;
-   feeds ep181 WithdrawalAmountMismatch). state:REPRODUCING attempts:1
-   blocked-on: acquiring db-preprod-sync (mithril) + epoch-state-debug binary
+1. [H][ledger] ep57 preprod stake-distribution -10 ADA (2 delegators each EXACTLY -5 ADA).
+   CORRECTED ROOT CAUSE (post-gauntlet): LIVE apply_utxo_changes attribution in eras/common.rs —
+   base-script address (addr_test1zpu3l06a...) / non-Phase-5 output-creation / era-boundary path.
+   NOT the reconstruction path (that fix was refuted as inert). Feeds ep181 WithdrawalAmountMismatch.
+   state:ANALYZING attempts:1 (1 refuted approach)
 2. [H][ledger] #11 mainnet stake-dereg residual (4 no-withdrawal cases diverge).
    state:NEW attempts:0  (replayable from db-mainnet; verify its epoch first)
 3. [H][ledger] mainnet ep213 reward divergence (REWARD-DIVERGENCE-MAINNET-ep213.md).
@@ -30,10 +31,13 @@
    state:NEW attempts:0
 5. [L][phase2] #14 V3 TxInfo deferred fields (inert until mainnet ep507).
    state:NEW attempts:0
+6. [M][ledger] LATENT fork-path bug: apply_utxo_diff reconstruction didn't replay stake_map (valid
+   fix preserved in scripts/prod-readiness/candidate-latent-fix-apply_utxo_diff.patch + worktree
+   wf_9be2125b-d01-1). Land separately AFTER its own verification (re-sync past ep181). state:NEW attempts:0
 
 ## In-progress
 - item: #1 ep57 preprod stake-distribution -10 ADA
-- state: GAUNTLET (replay-gate proven inapplicable; regression-test+parity evidence; gauntlet running; fix UNCOMMITTED)
+- state: ANALYZING (gauntlet REFUTED the apply_utxo_diff fix as INERT for ep57; re-aiming at the LIVE path)
 - attempts: 1
 - ANALYZE RESULT (w6lsvu2p2, Opus): canonical Haskell active-stake =
   resolveActiveInstantStakeCredentials (Stake.hs @52ef3d5) — per registered+delegated
@@ -76,26 +80,30 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- gauntlet-muscle  workflow=wm055td32  (3 Opus refuters on the ep57 fix). Fix (2 files) applied to MAIN working
-  tree UNCOMMITTED, pending gauntlet pass.
+(none — gauntlet wm055td32 returned REFUTED; inert fix reverted from main)
 
-## VERIFY FINDING (decisive)
-- Fixed-vs-unfixed from-genesis ep57 dump diff = 0/931 fields -> a clean IMMUTABLE replay never
-  invokes the fork-rollback reconstruction path, so it neither reproduces the bug nor reflects the
-  fix. The "immutable replay reproduces Koios" gate is STRUCTURALLY INAPPLICABLE to this fork-path bug.
-- Clean-replay ep57 SET total_active_stake 254384027228099 == Koios epoch_info.active_stake BYTE-EXACT
-  -> clean replay is correct (no -10 ADA), confirming the bug is fork-rollback-only.
-- Therefore verification = regression test (deterministic fork-rollback reproduction, passes) +
-  parity-by-construction (reconstruction reuses the known-correct live stake_routing) + Haskell match
-  + adversarial gauntlet. End-to-end tripwire: a LIVE from-genesis re-sync must reach PAST ep181
-  (original WithdrawalAmountMismatch halt) without halting (queued, post-commit continuous check).
+## VERIFY FINDING (CORRECTED after gauntlet — my wake9 analysis was WRONG)
+- The apply_utxo_diff fix is INERT for ep57. Gauntlet wm055td32 REFUTED 2/3 (haskell-semantics +
+  edge-epoch): the ep57 -10 ADA is reproduced on a CLEAN from-genesis LOCAL replay (no forks) per
+  REWARD-DIVERGENCE-FINDINGS.md, which applies every block via the LIVE path apply_utxo_changes and
+  NEVER invokes rollback_via_seq -> apply_utxo_diff. So the 0/931 fixed-vs-unfixed diff is the
+  SIGNATURE OF AN INERT FIX, not 'fork-path-only'.
+- My 'set==Koios -> clean replay correct' inference was a SNAPSHOT ERROR: the -10 ADA is in the GO
+  snapshot; I compared the SET total. The findings doc explicitly RULES OUT incremental/reconstruction
+  upkeep ("the -5 ADA is in UTxO set content or address->credential attribution, NOT incremental upkeep").
+- CORRECTED ROOT CAUSE: a LIVE-path apply_utxo_changes attribution bug (eras/common.rs). STAKE_CLAMP
+  fired 6x in the live path; last-mile points at a BASE-SCRIPT address (addr_test1zpu3l06a...) / a
+  non-Phase-5 output-creation path / an era-boundary path. The next ANALYZE/FIX targets THAT.
 
 ## DB clones on disk
 - db-clones/preprod-ep57         (unfixed-binary replay; baseline dump captured)
 - db-clones/preprod-ep57-fixed   (fixed-binary replay, in progress)
 
 ## Gauntlet ledger  (passed/refuted approaches — never silently retry a REFUTED)
-(none)
+- REFUTED 2026-06-06 (wm055td32, 2/3): "fix apply_utxo_diff reconstruction path to replay stake_map".
+  INERT for ep57 (the bug is in the LIVE apply_utxo_changes path; clean local replay reproduces it and
+  never reaches apply_utxo_diff). DO NOT re-propose this as the ep57 fix. The patch is itself a valid
+  LATENT fork-path fix -> tracked as backlog #6, needs its own verification (re-sync past ep181 first).
 
 ## Token spend  (rolling; UTC-dated lines)
 - 2026-06-06T11:41Z wake1 ~ build+mithril launch (assess+drive)
@@ -126,3 +134,8 @@
 - wake9 2026-06-06T12:49Z: VERIFY decisive — fixed-vs-unfixed ep57 dump 0/931 diffs (fork-path bug,
   immutable replay can't exercise it); clean-replay SET total 254384027228099 == Koios byte-exact.
   Replay-gate ruled inapplicable; launched gauntlet wm055td32 with regression-test+parity evidence.
+- wake10 2026-06-06T12:55Z: gauntlet wm055td32 REFUTED 2/3. CAUGHT MY OWN wake9 ERRORS: (a) 0/931
+  diff = inert fix, not fork-path-only; (b) set-vs-go snapshot mistake in 'clean replay correct'.
+  Real cause = live apply_utxo_changes base-script-address attribution (findings doc rules out
+  reconstruction). Reverted inert fix from main; preserved as latent-fix patch (backlog #6).
+  Item -> ANALYZING with corrected target. The gauntlet PREVENTED a #438-class wrong commit.
