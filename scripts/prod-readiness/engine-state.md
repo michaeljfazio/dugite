@@ -941,6 +941,9 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake146 2026-06-07: POLL #10 float-parse fix-muscle w3cxa15va — in VERIFY phase (clippy clean, running
+  codec_version targeted tests then full nextest). Near completion. Not disturbed. #10 stays FIXING. next
+  (notif/poll): read FIX -> re-import re-soak (real preprod integer 1, 0 phase-1) -> re-gauntlet -> commit.
 - wake145 2026-06-07: POLL #10 float-parse fix-muscle w3cxa15va — RUNNING, healthy (4GB RAM, no nodes, 0
   completed). Implementing the small float-parse byte-exactness (accept integral JSON Number==1 like Aeson
   toBoundedInteger) + narrowing the overclaim/dead-code comments. Not disturbed; no competing work. #10 stays
