@@ -550,7 +550,13 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
-- wake70 2026-06-07: POLL #10 muscle wnqthg8c8 — STILL RUNNING (active, 0 completed events, 4GB RAM free, no
+- wake71 2026-06-07: POLL #10 muscle wnqthg8c8 — STILL RUNNING, now in TEST/BUILD phase (nextest/cargo build,
+  fixing its own datum-decode unit tests re BinaryData VarLen prefix) -> near completion. Not disturbed. Did
+  non-contending VERIFY PREP to de-risk the upcoming re-verify: confirmed db-preprod-sync/haskell-ledger/
+  (124995007 + 124999169) is INTACT = reusable fresh-import source; GC'd 4 SUPERSEDED clones (preprod-soak
+  [gate-2 banked], preprod-verify10 [refscript-only verdict captured], preprod-9verify [#9 done], preprod-live
+  [old]) -> disk 125->132GB free (CoW-shared so modest). KEPT db-clones/mainnet-ep213 (#0/#3) + db-preprod-sync.
+  #10 stays FIXING-EXPANDED. next: poll wnqthg8c8 -> on FIX result, fresh import re-verify from db-preprod-sync. (active, 0 completed events, 4GB RAM free, no
   nodes). Captured a MATERIAL finding from its live log for continuity: decoding inline datums revealed the OLD
   tag-4 (datum-only) MemPack decode path was SILENTLY CORRUPTING datums — inline-datum-bearing outputs jumped
   132,148 -> 778,015 once decoded correctly (so ~646K outputs had mishandled datums, not just the import-drop).
