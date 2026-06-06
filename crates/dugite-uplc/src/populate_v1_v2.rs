@@ -15,7 +15,7 @@
 
 use crate::data::Data;
 use crate::phase_two::{PhaseTwoError, SlotConfig};
-use crate::populate_gov::certificates_to_plutus;
+use crate::populate_gov::certificates_to_plutus_v1v2;
 use crate::populate_v3::purpose_rank;
 use crate::redeemer_resolve::resolve_redeemers;
 use crate::script_context::{ScriptPurpose, TxCert, TxInfoV1, TxInfoV2};
@@ -60,7 +60,7 @@ pub fn populate_tx_info_v1(
         slot_config,
     )?;
     let signatories = required_signers_to_plutus_padded(&tx.body.required_signers);
-    let dcert: Vec<TxCert> = certificates_to_plutus(&tx.body.certificates)?;
+    let dcert: Vec<TxCert> = certificates_to_plutus_v1v2(&tx.body.certificates)?;
     let wdrl = withdrawals_to_plutus(&tx.body.withdrawals)?;
     let data = datums_to_plutus(
         &tx.witness_set.plutus_data,
@@ -110,7 +110,7 @@ pub fn populate_tx_info_v2(
         slot_config,
     )?;
     let signatories = required_signers_to_plutus_padded(&tx.body.required_signers);
-    let dcert: Vec<TxCert> = certificates_to_plutus(&tx.body.certificates)?;
+    let dcert: Vec<TxCert> = certificates_to_plutus_v1v2(&tx.body.certificates)?;
     let wdrl = withdrawals_to_plutus(&tx.body.withdrawals)?;
     let data = datums_to_plutus(
         &tx.witness_set.plutus_data,

@@ -681,9 +681,11 @@ impl ScriptPurpose {
             // → "unIData on non-I". (#22; PlutusLedgerApi.V{1,2}.Credential:
             // StakingHash=0/StakingPtr=1, PubKeyCredential=0/ScriptCredential=1.)
             ScriptPurpose::Rewarding(c) => data_constr(2, vec![data_constr(0, vec![c.to_data()])]),
-            ScriptPurpose::Certifying(i, c) => {
-                data_constr(3, vec![data_i((*i).into()), c.0.clone()])
-            }
+            // V1/V2 `Certifying DCert` takes EXACTLY ONE field (the DCert) —
+            // `Constr 3 [dcert]`. The integer cert-index is a V3-only addition
+            // (`to_data_v3`). `c.0` here must already be the V1/V2 `DCert`-schema
+            // Data (built via `certificate_to_plutus_v1v2`).
+            ScriptPurpose::Certifying(_i, c) => data_constr(3, vec![c.0.clone()]),
             ScriptPurpose::Voting(v) => data_constr(4, vec![v.to_data()]),
             ScriptPurpose::Proposing(i, p) => {
                 data_constr(5, vec![data_i((*i).into()), p.0.clone()])
@@ -723,6 +725,11 @@ impl ScriptPurpose {
             // StakingHash wrapper — V3 dropped StakingCredential), so override the
             // V1/V2 `to_data` arm which now adds the wrapper. Constr 2 [Credential].
             ScriptPurpose::Rewarding(c) => data_constr(2, vec![c.to_data()]),
+            // V3 `Certifying Integer TxCert` KEEPS the cert index (V1/V2 dropped
+            // it). `c.0` is the V3 `TxCert`-schema Data here. Constr 3 [I i, TxCert].
+            ScriptPurpose::Certifying(i, c) => {
+                data_constr(3, vec![data_i((*i).into()), c.0.clone()])
+            }
             // All other variants: same encoding in V1/V2/V3.
             other => other.to_data(),
         }

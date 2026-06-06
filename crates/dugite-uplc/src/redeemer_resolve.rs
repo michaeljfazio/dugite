@@ -221,14 +221,18 @@ fn resolve_cert(
         ))
     })?;
     let (script_bytes, language) = find_script_bytes(tx, resolved, &script_hash)?;
-    // V3-style cert purposes are `Certifying(idx, TxCert)`. The
-    // TxCert payload is the same opaque Data the populator emits;
-    // we re-derive it here so the per-redeemer ScriptContext carries
-    // the correct shape regardless of which language is in play.
-    let purpose = ScriptPurpose::Certifying(
-        idx as u64,
-        crate::populate_gov::certificate_to_plutus(cert)?,
-    );
+    // The `Certifying` purpose carries the cert as Data. The SCHEMA is
+    // version-specific: V1/V2 use the `DCert` shape (StakingHash-wrapped, no
+    // index in the purpose); V3 uses the Conway `TxCert` shape (index kept).
+    // `ScriptPurpose::to_data` / `to_data_v3` consume `c.0` accordingly, so the
+    // payload must be built with the matching encoder for `language`.
+    let tx_cert = match language {
+        ScriptLanguage::PlutusV1 | ScriptLanguage::PlutusV2 => {
+            crate::populate_gov::certificate_to_plutus_v1v2(cert)?
+        }
+        ScriptLanguage::PlutusV3 => crate::populate_gov::certificate_to_plutus(cert)?,
+    };
+    let purpose = ScriptPurpose::Certifying(idx as u64, tx_cert);
     Ok(ResolvedRedeemer {
         tag: r.tag.clone(),
         index: r.index,
