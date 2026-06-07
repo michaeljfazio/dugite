@@ -209,7 +209,31 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:DIAGNOSING (per-pool decomp + applyRUpd; ANALYTICAL CONTRADICTION to resolve).
+- item: #0 (mainnet ep246 reserves) state:FIXING (applyRUpd PARTITION; trap-aware fix muscle wyidhhb1o launched).
+  *** wake243: DIAGNOSE wz6pe606w COMPLETE — DEFINITIVE localization (conservation decomposition vs Koios `totals`).
+  The +82.27M is a conservation-preserving PARTITION error in applyRUpd, NOT a pot/deltaR1 magnitude error. THREE
+  deltas sum to EXACTLY 0 at ep246: reserves +82,270,482 (EXCESS via undistributed/deltaR2) ; treasury -55,269
+  (frTotalUnregistered SHORTFALL) ; reward-accounts -82,215,213 (SHORTFALL). Pot R=28,642,947,346,604 byte-exact
+  (deltaR1 35,803,096,246,665 + ssFee 587,936,590; deltaT1=7,160,736,836,651). ep245 baseline reserves
+  12,905,245,994,461,083 / treasury 284,352,137,586,764 == Koios (createRUpd INPUTS correct). MECHANISM: dugite
+  DROPS 82,270,482 of member/leader rewards at COMPUTE time (rewards.rs total_distributed under-counts ->
+  undistributed over-counts -> reserves) for credentials registered at createRUpd startStep[ep245] but deregistered/
+  ineligible by applyRUpd[ep246]; Haskell instead COMPUTES them into `rs` (go-snapshot domain) and PARTITIONS at
+  apply: still-registered -> reward-account (+82,215,213), deregistered-between -> frTotalUnregistered -> treasury
+  (+55,269). The dim-2 -5.027ppm per-member 'under-scaling' (8 prior rounds) is a MEASUREMENT ARTIFACT (per-pool
+  comp byte-exact given byte-exact globals+stake), exactly as dim-1's snapshot-lag was. *** CONVERGES with gauntlet
+  refutation w20c0k2qr: 'a cred in Haskell accounts at ep245 startStep is MISSING from dugite frozen set
+  (reg/dereg/re-reg or MIR ordering); prefilter LOGIC byte-exact correct, do NOT re-patch rewards.rs:461 location'.
+  DROVE (DIAGNOSING->ROOT-CAUSED->FIXING): launched trap-aware FIX muscle wyidhhb1o (run wf_42412e05-dbb, opus,
+  worktree, dugite-ledger only) with the full 3-delta decomposition + both REFUTED approaches (w20c0k2qr prefilter-
+  location, whr4t971m deltaR1/d) as DO-NOT-RETRY + empirical acceptance (reward-accts +82,215,213, treasury +55,269,
+  reserves end == 12,880,948,865,137,767, ep209-245 unregressed) + mandated EXACT Haskell quotes (createRUpd member
+  eligibility domain, applyRUpdFiltered regRU/unregRU/frTotalUnregistered, deltaR2->reserves) and a compute-vs-apply
+  determination. COMPUTE site rewards.rs:440-544 (registered_at_startstep + total_distributed/undistributed@528-544);
+  APPLY site epoch.rs:104-147. #438 GUARD: green tests are NOT proof; worktree CANNOT run mainnet replay -> orchestrator
+  MUST dump-verify ep246 reserves before any commit. NEXT WAKE: poll wyidhhb1o -> read diff+Haskell-quote -> apply to
+  HEAD + VERIFYING dump (regen ep245->246 transition, assert reserves==12880948865137767 + ep209-245 unregressed) ->
+  gauntlet -> commit ONLY on byte-exact pass.
   *** wake240: deltaR1/eta muscle w8q78zs1x VERIFIED byte-exact (no fix): expectedBlocks=floor((1-0)*(1/20)*86400)=
   4320 INTEGRAL (flooring moot), eta=3920/4320 exact, deltaR1=35,803,096,246,665 both ways identical; R=28,642,947,
   346,604. My eta-flooring hypothesis dead. *** ANALYTICAL CONTRADICTION (8 rounds): EVERY reward-formula INPUT now
@@ -1353,6 +1377,7 @@
 - 2026-06-06T11:52Z wake2 ~ replay reproduce + 2 launch-replay fixes + diagnose Workflow
 - 2026-06-06T12:00Z wake3 ~ diagnose result + ground-truth fix (koios.sh) + byte-exact confirm
 - 2026-06-06T12:25Z wake6 ~ analyze result + root-cause disambiguation + fix muscle launched
+- 2026-06-07T06:57Z wake243 ~ read definitive diagnose wz6pe606w (applyRUpd partition) + launched trap-aware fix muscle wyidhhb1o
 
 ## Last node state
 - sampled: 2026-06-06T17:01Z  node_pids="99162 99165" rss_mb=4798 free_disk_gb=143 free_ram_gb=4 jobs=9 halt=false
@@ -2586,3 +2611,14 @@
   converted UTxO entries — a REGRESSION in my own #9 fix (phase2.preprod was byte-exact on FULL replay). Logged
   as backlog #10 with a falsifiable experiment (full-replay node to same tip — same WARNs?); did NOT guess a
   fix (the #438-class trap). Next wake: (a) sustained at-tip confirm, (b) run experiment #10.
+- wake243 2026-06-07: #0 DIAGNOSING->ROOT-CAUSED->FIXING. Read DEFINITIVE diagnose wz6pe606w: ep246 +82.27M is
+  a conservation-preserving PARTITION error in applyRUpd (3 deltas sum to 0: reserves +82,270,482 / treasury
+  -55,269 / reward-accounts -82,215,213; pot R byte-exact). dugite DROPS member/leader rewards at compute time
+  (undistributed over-counts -> reserves) for creds registered at createRUpd[ep245] startStep but deregistered by
+  applyRUpd[ep246]; Haskell computes them into rs (go-snapshot domain) then partitions reg->reward-acct /
+  unreg->frTotalUnregistered->treasury. Converges with gauntlet refutation w20c0k2qr (cred in Haskell accounts
+  MISSING from dugite frozen set; prefilter LOGIC correct). Launched trap-aware FIX muscle wyidhhb1o (opus,
+  worktree, dugite-ledger only) with full decomposition + both REFUTED approaches as DO-NOT-RETRY + empirical
+  acceptance + mandated Haskell quotes. #438 GUARD recorded: green tests != byte-exact; orchestrator must
+  dump-verify ep246 reserves==12880948865137767 before commit. Reclaimed a stale wake-lock (prior wake wedged
+  >1320s TTL). next wake: poll wyidhhb1o -> apply diff to HEAD -> VERIFYING dump.
