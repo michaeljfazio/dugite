@@ -209,7 +209,7 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:REPLAY-RUNNING (instrumented from-genesis localization replay LAUNCHED wake256).
+- item: #0 (mainnet ep246 reserves) state:REPLAY-RUNNING (polled wake257 16:01 — pid 84509 alive at ep158 Byron, ~25 ep/min, 0 RUPD_DROP yet [expected pre-ep208 Shelley]; ep246 ETA <1h). (instrumented from-genesis localization replay LAUNCHED wake256).
   Build OK (release, 1m37s, no warnings). APFS CoW-cloned db-mainnet -> db-clones/mainnet-rupd-drop (instant, 0 extra
   disk; 46G immutable, blocks through ep331). Launched instrumented replay: job mainnet-rupd-drop pid 84509 (caffeinate),
   DUGITE_RUPD_DROP_TRACE=1 + DUGITE_EPOCH_STATE_DUMP=epoch-dumps-engine/mainnet-rupd-drop, --config config/mainnet/
