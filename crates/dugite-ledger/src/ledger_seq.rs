@@ -916,10 +916,65 @@ pub fn apply_delta_to_state(state: &mut LedgerState, delta: &LedgerDelta) {
 // ── UTxO ─────────────────────────────────────────────────────────────────────
 
 fn apply_utxo_diff(state: &mut LedgerState, diff: &UtxoDiff) {
+    use crate::state::{stake_routing, StakeRouting};
+    use dugite_primitives::value::Lovelace;
+
+    let ptr_stake_excluded = state.epochs.ptr_stake_excluded;
+
+    // The incremental UTxO-stake (Haskell `InstantStake`) must be replayed here,
+    // not just the UTxO set. `apply_delta_to_state` is the ONLY path that
+    // reconstructs the live `certs` after a fork rollback (`rollback_via_seq`
+    // assigns `self.certs = seq.tip_state().certs`) and during anchor advance.
+    // Without mirroring the live `apply_utxo_changes` add/subtract on
+    // `stake_distribution.stake_map` / `ptr_stake`, every per-credential UTxO
+    // stake change accumulated since the anchor is silently dropped on rollback,
+    // leaving a stake_map that no longer matches the (correctly inverted) UTxO
+    // set. That add/subtract asymmetry compounds into reward/pool-stake
+    // divergence (e.g. the exactly-5-ADA-per-credential preprod ep57 short on
+    // pool1n84mel6, which then cascades to the ep181 WithdrawalAmountMismatch).
+    //
+    // `inserts` are newly-created outputs (ADD stake, mirrors Phase 5 of
+    // `eras::common::apply_utxo_changes`); `deletes` are spent outputs (SUB
+    // stake, mirrors Phase 2). The routing (`stake_routing`) is byte-for-byte
+    // the same function the live path uses, so the keys are guaranteed
+    // identical — the fix is symmetric by construction.
+
+    // Inserts: new outputs add stake.
     for (input, output) in &diff.inserts {
+        let coin = output.value.coin.0;
+        match stake_routing(&output.address, ptr_stake_excluded) {
+            StakeRouting::Credential(cred_hash) => {
+                *state
+                    .certs
+                    .stake_distribution
+                    .stake_map
+                    .entry(cred_hash)
+                    .or_insert(Lovelace(0)) += Lovelace(coin);
+            }
+            StakeRouting::Pointer(ptr) => {
+                *state.epochs.ptr_stake.entry(ptr).or_insert(0) += coin;
+            }
+            StakeRouting::None => {}
+        }
         state.utxo.utxo_set.insert(input.clone(), output.clone());
     }
-    for (input, _output) in &diff.deletes {
+
+    // Deletes: spent outputs subtract stake.
+    for (input, output) in &diff.deletes {
+        let coin = output.value.coin.0;
+        match stake_routing(&output.address, ptr_stake_excluded) {
+            StakeRouting::Credential(cred_hash) => {
+                if let Some(stake) = state.certs.stake_distribution.stake_map.get_mut(&cred_hash) {
+                    stake.0 = stake.0.saturating_sub(coin);
+                }
+            }
+            StakeRouting::Pointer(ptr) => {
+                if let Some(entry) = state.epochs.ptr_stake.get_mut(&ptr) {
+                    *entry = entry.saturating_sub(coin);
+                }
+            }
+            StakeRouting::None => {}
+        }
         state.utxo.utxo_set.remove(input);
     }
 }
@@ -1426,6 +1481,89 @@ mod tests {
             5,
             "after rollback the governance must be the per-block snapshot (5), \
              NOT the stale anchor (0) — the #22/#481 fork-wipe bug"
+        );
+    }
+
+    /// Regression for the preprod ep57 `pool1n84mel6` stake short (#634 class):
+    /// `apply_delta_to_state` → `apply_utxo_diff` must replay the incremental
+    /// UTxO stake (Haskell `InstantStake`) onto `stake_distribution.stake_map`,
+    /// not just the UTxO set. Before the fix it only mutated the UTxO set, so a
+    /// reconstructed `tip_state()` (and therefore `rollback_via_seq`, which sets
+    /// `self.certs = seq.tip_state().certs`) dropped every per-credential stake
+    /// add accumulated since the anchor. A spend recorded as a `delete` would
+    /// then subtract from a credential that was never re-credited — the exact
+    /// add/subtract asymmetry that left two delegators short by exactly 5 ADA.
+    #[test]
+    fn apply_utxo_diff_replays_credential_stake_not_just_utxo_set() {
+        use dugite_primitives::address::{Address, BaseAddress};
+        use dugite_primitives::credentials::Credential;
+        use dugite_primitives::hash::Hash28;
+        use dugite_primitives::network::NetworkId;
+        use dugite_primitives::transaction::{TransactionInput, TransactionOutput};
+        use dugite_primitives::value::Value;
+
+        // A base address with a (key) stake credential — routes to stake_map.
+        let stake_cred = Credential::VerificationKey(Hash28::from_bytes([0x7d; 28]));
+        let cred_key = stake_cred.to_typed_hash32();
+        let addr = Address::Base(BaseAddress {
+            network: NetworkId::Testnet,
+            payment: Credential::VerificationKey(Hash28::from_bytes([0x11; 28])),
+            stake: stake_cred,
+        });
+        let mk_output = |lovelace: u64| TransactionOutput {
+            address: addr.clone(),
+            value: Value::lovelace(lovelace),
+            datum: dugite_primitives::transaction::OutputDatum::None,
+            script_ref: None,
+            is_legacy: false,
+            raw_cbor: None,
+        };
+        let mk_input = |b: u8| TransactionInput {
+            transaction_id: make_hash(b),
+            index: 0,
+        };
+
+        let mut state = make_anchor();
+
+        // Delta 1: create a 5-ADA output for the credential (an `insert`).
+        let mut d1 = make_delta(10, 10, 0);
+        d1.utxo_diff
+            .record_insert(mk_input(0xA0), mk_output(5_000_000));
+        apply_delta_to_state(&mut state, &d1);
+
+        assert_eq!(
+            state
+                .certs
+                .stake_distribution
+                .stake_map
+                .get(&cred_key)
+                .copied(),
+            Some(Lovelace(5_000_000)),
+            "apply_utxo_diff must ADD the new output's coin to the credential's \
+             stake_map — not silently drop it (the ep57 −5-ADA bug)"
+        );
+
+        // Delta 2: spend that output (a `delete`, carrying the original output).
+        let mut d2 = make_delta(20, 20, 0);
+        d2.utxo_diff
+            .record_delete(mk_input(0xA0), mk_output(5_000_000));
+        apply_delta_to_state(&mut state, &d2);
+
+        // Add/subtract is symmetric: stake returns to 0, never goes negative,
+        // and the UTxO set is empty.
+        assert_eq!(
+            state
+                .certs
+                .stake_distribution
+                .stake_map
+                .get(&cred_key)
+                .copied(),
+            Some(Lovelace(0)),
+            "apply_utxo_diff must SUBTRACT the spent output's coin symmetrically"
+        );
+        assert!(
+            state.utxo.utxo_set.lookup(&mk_input(0xA0)).is_none(),
+            "the spent UTxO must be removed from the set"
         );
     }
 
