@@ -209,7 +209,13 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #15 (phase-2 — V3 SpendingScriptInfo datum population, canonical) state:VERIFYING-RESOAK (minimal correct fix).
+- item: #15 (phase-2 — V3 SpendingScriptInfo datum population, canonical) state:GAUNTLET-PENDING (minimal correct fix).
+  *** wake219: REPLAY DECISIVE PASS — verify15min synced PAST window (tip 125125576), 0 'Error term' across the FULL
+  ep293 window (125001020-125105013, was 306), 0 phase-1, 27751ab9 fixed. The canonical V3-datum fix is byte-exact +
+  correct (no memo, no silent pass-where-Haskell-fails). SIGTERM'd verify15min; launched RE-GAUNTLET w4ou064y2 (run
+  wf_0d183edd-b51) on the minimal fix — the prior memo R1 is RESOLVED (memo reverted; serialiseData canonical).
+  #17/#19/#20 scoped out. NEXT WAKE: on PASS -> COMMIT #15 via gh/HTTPS (dugite-uplc, 1 crate); on REFUTE -> verify
+  the dissent (getBabbageSpendingDatum precedence / None-handling / datum-hash bytes).
   *** wake218: MINIMAL fix muscle wkba3hja9 green (2 files dugite-uplc: redeemer_resolve.rs resolve_spend_datum_v3
   [getBabbageSpendingDatum: inline <|> witness, None-tolerant] + eval_redeemer.rs purpose_to_script_info_v3 builds
   ScriptInfo::Spending{datum} via CANONICAL plutus_data_to_data; NO memo; data.rs/to_cbor/serialiseData UNTOUCHED =
@@ -1482,6 +1488,9 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
+- wake219 2026-06-07: #15 REPLAY DECISIVE PASS — 0 'Error term' across FULL ep293 window (was 306), 27751ab9 fixed,
+  0 phase-1 (tip 125125576). VERIFYING-RESOAK -> GAUNTLET-PENDING; SIGTERM'd verify15min, launched re-gauntlet
+  w4ou064y2 on the minimal canonical V3-datum fix (memo gone). NEXT WAKE: PASS -> commit #15 (dugite-uplc).
 - wake218 2026-06-07: #15 MINIMAL fix wkba3hja9 green -> built -> uplc nextest 435 -> REPLAY PREFIX PASS. verify15min:
   0 'Error term' by 125010507 (prior 41), 0 total so far, 27751ab9 fixed, 0 phase-1. Canonical V3-datum-population
   fix WORKS (no memo) — confirms 306 were V3 None-datum not byte-shape. FIXING -> VERIFYING-RESOAK. NEXT WAKE: confirm
