@@ -209,7 +209,25 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:PAID-SET-REBUILD (wake263 binary MISSED the epoch.rs edit; clean rebuild pid 26410).
+- item: #0 (mainnet ep246 reserves) state:PAID-SET-INSTRUMENT-RELOCATED (live path = shelley.rs; rebuild pending).
+  *** wake265: ROOT CAUSE of the missing dump = I instrumented a DEAD function. **MAJOR STRUCTURAL DISCOVERY**: there
+  are MANY process_epoch_transition — the LIVE applyRUpd for ep246 (Allegra) is `ShelleyRules::process_epoch_transition`
+  in **crates/dugite-ledger/src/eras/shelley.rs:258-440** (Allegra/Mary/Alonzo/Babbage all delegate to it via
+  babbage.rs:133/alonzo.rs:134; live sync calls it through state/apply.rs:292 -> eras/mod.rs era-dispatch). The
+  `state/epoch.rs:50 pub fn process_epoch_transition` I edited is **TEST-ONLY** (called only from tests.rs/governance.rs
+  /epoch.rs tests) -> no live caller -> release DCE removed it -> the env-var string never made it into the binary
+  (grep -a confirmed: DROP present, PAID absent). *** This means the WHOLE prior investigation's 'applyRUpd at
+  epoch.rs:119-148 partition' was analyzing the TEST path, NOT live. The LIVE applyRUpd is shelley.rs:291-325 (apply
+  PENDING rupd: reg->reward_acct line 304-308, unreg->treasury 309-315) + shelley.rs:430-441+ (compute via
+  compute_reward_update@383 then apply the NEW rupd). compute_reward_update (rewards.rs) IS shared/live (drop-trace
+  fired there). So the eventual #0 FIX lands in shelley.rs or compute_reward_update, NOT epoch.rs. *** DROVE: relocated
+  the paid-set instrumentation to shelley.rs:399 (right after rupd=compute_reward_update, new_epoch + rupd.rewards in
+  scope); REVERTED the dead epoch.rs edit. A from-scratch build (build3 pid 27010, after cargo clean -p dugite-ledger)
+  is running but may predate the shelley.rs edit. NEXT WAKE: wait for build3 -> strings-VERIFY
+  `grep -ac DUGITE_RUPD_PAID_EPOCH target/release/dugite-node` >=1 (do an incremental rebuild if 0) -> re-replay over
+  KEPT CoW clone db-clones/mainnet-rupd-drop with DUGITE_RUPD_PAID_EPOCH=246 -> rupd_paid_246.txt -> Koios diff.
+  LESSON: dugite has per-era trait-impl process_epoch_transition (eras/*.rs) + a separate test-only state/epoch.rs one;
+  ALWAYS instrument/fix the era impl for live behavior, and strings-verify the symbol. Instrumentation UNCOMMITTED.
   *** wake264: replay reached ep270 but rupd_paid_246.txt NEVER written. DIAGNOSED: env DUGITE_RUPD_PAID_EPOCH=246 WAS
   set on pid 98498, but `strings target/release/dugite-node` has NO 'DUGITE_RUPD_PAID_EPOCH'/'rupd_paid_' (while
   RUPD_DROP_TRACE IS present) => the wake263 build did NOT compile my epoch.rs paid edit into the binary (build/cache
@@ -2850,3 +2868,10 @@
   force-touched epoch.rs+rewards.rs, kicked off clean rebuild pid 26410. next wake: strings-VERIFY the symbol in the
   binary BEFORE re-replaying, then re-launch with DUGITE_RUPD_PAID_EPOCH=246. LESSON: strings-verify new symbols after
   a background build before depending on them.
+- wake265: MAJOR STRUCTURAL DISCOVERY — instrumented a DEAD fn. Live applyRUpd for ep246 (Allegra) is
+  ShelleyRules::process_epoch_transition (eras/shelley.rs:258-440), NOT state/epoch.rs:50 (TEST-ONLY, DCE'd ->
+  string absent from binary). The whole prior 'applyRUpd epoch.rs:119-148 partition' analysis was the TEST path; the
+  LIVE partition is shelley.rs:291-325 + 430-441, and the #0 FIX must land in shelley.rs / compute_reward_update.
+  Relocated paid-set instrumentation to shelley.rs:399, reverted epoch.rs. build3 (cargo clean rebuild) running; may
+  predate the shelley edit. next wake: strings-VERIFY DUGITE_RUPD_PAID_EPOCH in binary (incremental rebuild if 0) ->
+  re-replay. LESSON: dugite has per-era trait-impl process_epoch_transition; fix/instrument the era impl, strings-verify.
