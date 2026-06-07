@@ -221,7 +221,24 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #6 DONE (committed+pushed 8e41d0ae2a). NEXT WAKE: SCHEDULE picks the next item — see recommendation.
+- item: #17 (Mithril snapshot CRC not verified) state:ANALYZING attempts:0 — muscle w2ez2r1lk IN-FLIGHT; wake-lock HELD (TTL 22m). #6 DONE (8e41d0ae2a).
+  *** wake318 (ultracode): SCHEDULE→DRIVE. *** PIVOT #7→#17: ASSESS found #7's candidate-latent-fix-dijkstra-subutxo.patch
+  is in NORMAL diff (ed) format (`36c36`/`<`/`>`/`137a138,214`), NOT git-applyable (`git apply --check` → "No valid patches
+  in input"), AND it is a BROADER shared-helper refactor (introduces add_instant_stake/delete_instant_stake pub(crate) and
+  rewires the FORWARD apply_utxo_changes + collateral paths, not just dijkstra.rs::apply_sub_transactions@399). So #7 is
+  NOT the cheap sibling win assumed — its patch needs re-deriving as a proper refactor + re-validation against the post-#6
+  tree. #7 stays state:NEW, DEFERRED (M, inert — Dijkstra is a non-deployed future era; no urgency). Pivoted to the
+  highest-impact unblocked item #17 [H][security]. *** DRIVE: launched muscle analyze w2ez2r1lk (run wf_c2b08967-a20, 2 opus
+  Research→RootCause) to (1) locate the dugite snapshot-import site that reads the `checksum` meta but never verifies it
+  (dugite-node import_haskell_ledger_snapshot ~node/mod.rs:6411 + dugite-serialization mempack SnapshotMetadata; note
+  mithril.rs verify_block_checksum@147 is a DIFFERENT block-level CRC), (2) get the BYTE-EXACT crcOfConcat algorithm from
+  Haskell ouroboros-consensus V2/InMemory.loadSnapshot (CRC variant/polynomial + exact byte layout: crc32(state++tables)
+  vs combine(crc(state),crc(tables))), (3) design the fix (verify at import, ERROR=ReadSnapshotDataCorruption equiv, ≤2
+  crates), (4) design a NEGATIVE security test (valid snapshot imports; flipped-byte-but-decodable snapshot REJECTED; fails
+  pre-fix / passes post-fix; reference = Haskell reject behavior, NO Koios). NEXT (this wake, on auto-notify): RECORD the
+  root-cause + fix + verification design → #17 ANALYZING→ROOT-CAUSED, commit, RELEASE lock. Lock held across async is
+  intentional (overlapping cron skips on busy; 22m TTL prevents wedge). #7 patch-format note: re-derive from the post-#6
+  tree (don't trust the ed-format .patch).
   *** wake317-cont (ultracode): #6 VERIFYING→DONE. pass-post gauntlet ba20qc2ea GREEN: `cargo nextest -p dugite-ledger`
   1522/1522 passed (1521 + the new regression test), `clippy --all-targets -- -D warnings` clean, `fmt --check` clean.
   Combined with the empirically-confirmed FAIL-PRE (regression test FAILED on pre-patch: left=None vs Some(5000000)), the
