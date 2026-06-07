@@ -162,7 +162,17 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-BUILDING (commit-A). *** wake159:
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-RESOAK (commit-A). *** wake160:
+  BUILD_EXIT=0 (combined binary 08:06: FINAL-DONE + uplc inline_spend_datum fix). DROVE: SIGTERM'd verify10j evidence
+  node (clean "Shutdown complete"; its 297 count is in verify10j-resoak.log), GC'd verify10i (-CoW), CoW-cloned
+  db-preprod-sync -> db-clones/preprod-verify10A, launched combined binary pid 98474 port 4211. Import byte-exact
+  (codec_version=1 txix_endianness=Big), 0 phase-1 / 0 Error-term so far (still importing/replaying; has NOT reached
+  the ep293 divergence window slots 125001020+ yet). NEXT WAKE VERDICT (the arbiter, per fix-agent no-op caveat):
+  once verify10A syncs PAST slot ~125105013, COUNT 'Error term' over slots 125001020+: ~0 (CASE1 10a0dbda / CASE2
+  08c596be gone) => fix WORKS -> gauntlet -> commit (A); STILL ~297 => NO-OP confirmed -> revert redeemer_resolve.rs
+  from main + RE-DIAGNOSE toward UPLC serialiseData/CEK datum-bytes (on-chain Data carries memoised original bytes
+  via MemoBytes; dugite structural Data likely re-encodes when script hashes/serialises its datum arg).
+  was: state:VERIFYING-BUILDING (commit-A). *** wake159:
   FIX muscle wst6ekcg6 COMPLETED checks_green=true, tier A', 1 crate (dugite-uplc redeemer_resolve.rs only). Fix:
   InlineDatum arm now routes through new helper inline_spend_datum(data, raw_cbor, script_hash) that DECODES the
   preserved raw_cbor (validates span==original) to recover the structural datum anchored to verbatim bytes, mirroring
@@ -1054,6 +1064,10 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake160 2026-06-07: #10 BUILD_EXIT=0 -> VERIFYING-BUILDING -> VERIFYING-RESOAK. SIGTERM'd verify10j (clean),
+  GC'd verify10i, cloned verify10A, launched combined binary pid 98474. Import OK (codec_version=1 Big, 0 phase-1).
+  Still pre-window. NEXT WAKE VERDICT: count 'Error term' at slots 125001020+ -> ~0=works->gauntlet->commit(A);
+  ~297=no-op->revert+re-diagnose serialiseData/CEK. Disk 22G.
 - wake159 2026-06-07: #10 FIX muscle wst6ekcg6 COMPLETED (green, A', dugite-uplc inline_spend_datum verbatim) ->
   FIXING -> VERIFYING-BUILDING. *** FIX AGENT CAVEAT: V1/V2 txInfoData is witness-only + InlineDatum.data already
   read_plutus_data(raw_cbor) => fix LIKELY NO-OP; true mechanism may be UPLC serialiseData re-encode, not datum
