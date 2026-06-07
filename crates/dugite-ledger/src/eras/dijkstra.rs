@@ -219,7 +219,7 @@ impl EraRules for DijkstraRules {
         //    consumption is visible in the UTxO set by the time we get
         //    here, so the `contains(input)` check below catches it.
         if !tx.body.sub_transactions.is_empty() {
-            let sub_diff = apply_sub_transactions(tx, utxo);
+            let sub_diff = apply_sub_transactions(tx, utxo, certs, epochs);
             diff.merge(&sub_diff);
         }
 
@@ -396,9 +396,25 @@ impl EraRules for DijkstraRules {
 /// and folded into this helper one at a time. Until that work lands, a
 /// Dijkstra sub-tx that depends on (e.g.) certificate processing is a no-op
 /// at the cert layer; its UTxO effect is still applied correctly.
-fn apply_sub_transactions(tx: &Transaction, utxo: &mut UtxoSubState) -> UtxoDiff {
+fn apply_sub_transactions(
+    tx: &Transaction,
+    utxo: &mut UtxoSubState,
+    certs: &mut CertSubState,
+    epochs: &mut EpochSubState,
+) -> UtxoDiff {
+    use crate::state::{stake_routing, StakeRouting};
     use dugite_primitives::transaction::TransactionInput;
+    use dugite_primitives::value::Lovelace;
 
+    // #7: a Dijkstra sub-transaction's UTxO changes must replay the incremental
+    // instant-stake on `stake_map` / `ptr_stake` exactly like the top-level
+    // `eras::common::apply_utxo_changes` (Phase 2/5) and the reconstruction-path
+    // `ledger_seq::apply_utxo_diff` (#6). Without this the FORWARD path mutates
+    // `utxo_set` (below) but leaves `stake_map` stale after a sub-tx — the
+    // forward-path mirror of the #6 reconstruction bug. The routing
+    // (`stake_routing`, shared with the live path) keys identically by
+    // construction.
+    let ptr_stake_excluded = epochs.ptr_stake_excluded;
     let mut diff = UtxoDiff::new();
 
     for sub in &tx.body.sub_transactions {
@@ -434,6 +450,22 @@ fn apply_sub_transactions(tx: &Transaction, utxo: &mut UtxoSubState) -> UtxoDiff
         // applied immediately so a later sibling sub-tx can correctly see
         // (and fail on) double-spend attempts against the same parent.
         for (input, output) in &spent_outputs {
+            // SUB the spent output's instant-stake (mirrors apply_utxo_changes
+            // Phase 2 / apply_utxo_diff delete leg).
+            let coin = output.value.coin.0;
+            match stake_routing(&output.address, ptr_stake_excluded) {
+                StakeRouting::Credential(cred_hash) => {
+                    if let Some(stake) = certs.stake_distribution.stake_map.get_mut(&cred_hash) {
+                        stake.0 = stake.0.saturating_sub(coin);
+                    }
+                }
+                StakeRouting::Pointer(ptr) => {
+                    if let Some(entry) = epochs.ptr_stake.get_mut(&ptr) {
+                        *entry = entry.saturating_sub(coin);
+                    }
+                }
+                StakeRouting::None => {}
+            }
             utxo.utxo_set.remove(input);
             diff.record_delete(input.clone(), output.clone());
         }
@@ -446,6 +478,22 @@ fn apply_sub_transactions(tx: &Transaction, utxo: &mut UtxoSubState) -> UtxoDiff
                 transaction_id: sub.tx_id,
                 index: idx as u32,
             };
+            // ADD the new output's instant-stake (mirrors apply_utxo_changes
+            // Phase 5 / apply_utxo_diff insert leg).
+            let coin = output.value.coin.0;
+            match stake_routing(&output.address, ptr_stake_excluded) {
+                StakeRouting::Credential(cred_hash) => {
+                    *certs
+                        .stake_distribution
+                        .stake_map
+                        .entry(cred_hash)
+                        .or_insert(Lovelace(0)) += Lovelace(coin);
+                }
+                StakeRouting::Pointer(ptr) => {
+                    *epochs.ptr_stake.entry(ptr).or_insert(0) += coin;
+                }
+                StakeRouting::None => {}
+            }
             utxo.utxo_set.insert(new_input.clone(), output.clone());
             diff.record_insert(new_input, output.clone());
         }
@@ -1551,6 +1599,173 @@ mod tests {
             assert_eq!(diff.deletes[0].0, utxo_a_in);
             assert_eq!(diff.inserts.len(), 1, "exactly OA must be inserted");
             assert_eq!(diff.inserts[0].0, oa_in);
+        }
+
+        /// #7 — a Dijkstra sub-transaction's UTxO changes must replay the
+        /// incremental instant-stake on `stake_map` (the forward-path mirror of
+        /// the #6 `apply_utxo_diff` reconstruction fix). Pre-fix
+        /// `apply_sub_transactions` mutated only `utxo_set`, leaving `stake_map`
+        /// stale after a sub-tx that creates/spends a stake-credential output.
+        #[test]
+        fn sub_transactions_replay_instant_stake_forward_path() {
+            use super::super::*;
+            use crate::state::{stake_routing, StakeRouting};
+            use dugite_primitives::address::Address;
+            use dugite_primitives::era::Era;
+            use dugite_primitives::hash::{Hash28, Hash32};
+            use dugite_primitives::transaction::{
+                OutputDatum, SubTransaction, Transaction, TransactionBody, TransactionInput,
+                TransactionOutput, TransactionWitnessSet,
+            };
+            use dugite_primitives::value::{Lovelace, Value};
+            use std::collections::BTreeMap;
+
+            // A base address (type 0, testnet) carries a STAKE credential →
+            // `stake_routing` → `Credential`; an enterprise address (0x61) has
+            // none → `None` (which is why the existing apply test, using only
+            // enterprise addresses, never exercised the stake legs).
+            let base_addr = {
+                let mut b = vec![0x00u8];
+                b.extend_from_slice(Hash28::from_bytes([0x11; 28]).as_bytes());
+                b.extend_from_slice(Hash28::from_bytes([0x7d; 28]).as_bytes());
+                Address::from_bytes(&b).expect("base addr")
+            };
+            let enterprise_addr = {
+                let mut b = vec![0x61u8];
+                b.extend_from_slice(Hash28::from_bytes([0xEE; 28]).as_bytes());
+                Address::from_bytes(&b).expect("enterprise addr")
+            };
+            let mk_out = |addr: Address, coin: u64| TransactionOutput {
+                address: addr,
+                value: Value::lovelace(coin),
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: true,
+                raw_cbor: None,
+            };
+            let mk_in = |b: u8, idx: u32| TransactionInput {
+                transaction_id: Hash32::from_bytes([b; 32]),
+                index: idx,
+            };
+            let mk_parent = |subs: Vec<SubTransaction>| Transaction {
+                era: Era::Dijkstra,
+                hash: Hash32::from_bytes([0xDE; 32]),
+                body: TransactionBody {
+                    inputs: vec![],
+                    outputs: vec![],
+                    fee: Lovelace(0),
+                    ttl: None,
+                    certificates: vec![],
+                    withdrawals: BTreeMap::new(),
+                    auxiliary_data_hash: None,
+                    validity_interval_start: None,
+                    mint: BTreeMap::new(),
+                    script_data_hash: None,
+                    collateral: vec![],
+                    required_signers: vec![],
+                    network_id: None,
+                    collateral_return: None,
+                    total_collateral: None,
+                    reference_inputs: vec![],
+                    update: None,
+                    voting_procedures: BTreeMap::new(),
+                    proposal_procedures: vec![],
+                    treasury_value: None,
+                    donation: None,
+                    sub_transactions: subs,
+                    account_balance_intervals: vec![],
+                    direct_deposits: BTreeMap::new(),
+                    guards: Vec::new(),
+                },
+                witness_set: TransactionWitnessSet {
+                    vkey_witnesses: vec![],
+                    native_scripts: vec![],
+                    bootstrap_witnesses: vec![],
+                    plutus_v1_scripts: vec![],
+                    plutus_v2_scripts: vec![],
+                    plutus_v3_scripts: vec![],
+                    plutus_data: vec![],
+                    redeemers: vec![],
+                    raw_redeemers_cbor: None,
+                    raw_plutus_data_cbor: None,
+                    original_script_data_hash: None,
+                },
+                is_valid: true,
+                auxiliary_data: None,
+                raw_cbor: None,
+                raw_body_cbor: None,
+                raw_witness_cbor: None,
+            };
+
+            let mut utxo = super::make_utxo_sub();
+            let mut certs = super::make_cert_sub();
+            let mut epochs = super::make_epoch_sub();
+
+            // The stake_map key for the base credential, via the SAME routing the fix uses.
+            let cred_key = match stake_routing(&base_addr, epochs.ptr_stake_excluded) {
+                StakeRouting::Credential(h) => h,
+                _ => panic!("base address must route to a stake credential"),
+            };
+
+            // ── ADD leg ──────────────────────────────────────────────────────
+            // Seed an ENTERPRISE input (no stake) for the sub-tx to spend, so the
+            // ONLY stake effect is the ADD of the base output.
+            let ent_in = mk_in(0xA1, 0);
+            utxo.utxo_set
+                .insert(ent_in.clone(), mk_out(enterprise_addr.clone(), 10_000_000));
+            let sub_add = SubTransaction {
+                tx_id: Hash32::from_bytes([0xAA; 32]),
+                inputs: vec![ent_in],
+                outputs: vec![mk_out(base_addr.clone(), 4_000_000)],
+                ttl: None,
+                validity_interval_start: None,
+                reference_inputs: vec![],
+                auxiliary_data_hash: None,
+                raw_body_cbor: None,
+            };
+            apply_sub_transactions(
+                &mk_parent(vec![sub_add]),
+                &mut utxo,
+                &mut certs,
+                &mut epochs,
+            );
+            // PRE-FIX stake_map was empty here (apply_sub_transactions never touched
+            // it) → this FAILS pre-fix / PASSES post-fix.
+            assert_eq!(
+                certs.stake_distribution.stake_map.get(&cred_key).copied(),
+                Some(Lovelace(4_000_000)),
+                "forward-path sub-tx must ADD the base output's coin to stake_map (#7)"
+            );
+            assert_eq!(
+                certs.stake_distribution.stake_map.len(),
+                1,
+                "only the base credential should appear in stake_map (enterprise input has none)"
+            );
+
+            // ── SUB leg ──────────────────────────────────────────────────────
+            // A second sub-tx spends the base output created above (keyed under
+            // the first sub-tx's tx_id) → the spend SUBs the stake back to 0.
+            let sub_spend = SubTransaction {
+                tx_id: Hash32::from_bytes([0xBC; 32]),
+                inputs: vec![mk_in(0xAA, 0)],
+                outputs: vec![mk_out(enterprise_addr.clone(), 3_000_000)],
+                ttl: None,
+                validity_interval_start: None,
+                reference_inputs: vec![],
+                auxiliary_data_hash: None,
+                raw_body_cbor: None,
+            };
+            apply_sub_transactions(
+                &mk_parent(vec![sub_spend]),
+                &mut utxo,
+                &mut certs,
+                &mut epochs,
+            );
+            assert_eq!(
+                certs.stake_distribution.stake_map.get(&cred_key).copied(),
+                Some(Lovelace(0)),
+                "forward-path sub-tx must SUB the spent base output's coin from stake_map (#7)"
+            );
         }
 
         /// CIP-0167 — `isValid` flag removed at top level; collateral flow
