@@ -1277,6 +1277,8 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake182 2026-06-07: POLL #10 FIX muscle w3dsqneah — still RUNNING, ACTIVE (last activity 6s ago, between build
+  cycles). No transition. Disk 181G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process result.
 - wake181 2026-06-07: POLL #10 FIX muscle w3dsqneah (R1 dangerouslyBig + R2 full-consumption) — still RUNNING, ACTIVE
   (worktree present, bridge applied, build/test). No transition. Disk 181G, no nodes. #10 stays FIXING. NEXT WAKE:
   poll/process -> build -> re-import -> re-gauntlet -> commit.
