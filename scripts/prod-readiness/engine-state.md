@@ -209,7 +209,7 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:VERIFYING-REPLAY (fix build OK; verification re-replay launched wake278).
+- item: #0 (mainnet ep246 reserves) state:VERIFYING-REPLAY (polled wake279 — replay pid 93404 at Byron ep194, ep246 dump pending; reward-tests 100/100 PASS no-regression). verification re-replay launched wake278.
   Build OK (release 1m49s, recompiled dugite-ledger+node, binary 17:35 -> fix IS in binary). Launched verification
   re-replay job mainnet-fix-verify pid 93404 (from-genesis over CoW clone db-clones/mainnet-rupd-drop, FIX binary, NO
   instrumentation env, dumps -> epoch-dumps-engine/mainnet-fix-verify). Running. ~4min to ep246. (reward-tests pid
