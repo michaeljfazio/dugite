@@ -263,7 +263,21 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #25 DEBUNKED (muscle miscount: only 1 is_valid=false dump, not 370). #24 stays ROOT-CAUSED. NEXT WAKE: SCHEDULE #20 or pin #24.
+- item: #20c (backend dup-key first-wins) state:FIXING attempts:0 — fix+test applied + compiles; gauntlet bpf5r3skc IN-FLIGHT; lock HELD.
+  *** wake328 (ultracode): SCHEDULE #20 (snapshot-import adversarial-hardening — concrete/unit-testable, bank a clean win
+  after the long phase-2 thread; crc32 non-cryptographic so #17 doesn\'t subsume). #20 has 3 sub-items; DROVE sub-item (c)
+  HAND (byte-exact without a muscle — the #17 work already established aeson\'s first-wins default, verbatim haddock in the
+  file). FIX: enforce_snapshot_backend_is_utxohd_mem (mempack/mod.rs:1023) resolved `backend` via serde_json value.get
+  (LAST-wins on dup keys) while the sibling tablesCodecVersion/checksum use first_occurrence_value (aeson FIRST-wins) →
+  inconsistent dup-key resolution on the SAME SnapshotMetadata. Changed backend to first_occurrence_value too. + test
+  backend_enforce_is_aeson_first_wins_on_duplicate_key: critical case {"backend":"lsm","backend":"utxohd-mem"} must Err
+  (first-wins keeps "lsm"; pre-fix serde_json last-wins WRONGLY accepted the 2nd "utxohd-mem") — provably fails-pre/passes-
+  post. cargo test --no-run clean. Launched gauntlet bpf5r3skc (nextest -p dugite-serialization + clippy + fmt). *** ON
+  COMPLETION (this wake): if green → COMMIT focused 1-crate fix (mempack/mod.rs + tests.rs) + push → #20c DONE; #20
+  REMAINING = (a) decode_varlen overflow/non-minimal/terminal-mask hardening (~10 sites, compact.rs:50-69; needs byte-exact
+  Haskell unpack7BitVarLenLast confirmation → muscle), (b) definite-length map exact-count (premature-EOF) hardening. NEXT
+  WAKE after #20c: #20a (varlen, highest-impact, route a bounded muscle for the Haskell MemPack strictness) or #20b. Lock
+  held across async (TTL 22m). #24 stays ROOT-CAUSED (pin later w/ full UTxO context).
   *** wake327 (ultracode): SCHEDULE #25 (verify-reality before investing) → DRIVE = cheap empirical check → #25 DEBUNKED.
   The wogj8wp6h muscle claimed "370 dumps dugite-PASS-but-should-fail (wrong-accept)". RIGOROUS COUNT (python over all 769):
   EXACTLY 1 dump is is_valid=false (phase2-divergence-tx4-7a64fd02fc21d4ae.json), NOT 370. The muscle's "370" was WRONG —
