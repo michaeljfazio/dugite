@@ -155,7 +155,10 @@
    crc32_iso_hdlc(ascii_decimal(crc32(state)) ++ ascii_decimal(crc32(tables))) [NOT raw concat]; verified vs 2 real
    preprod fixtures. Fix = mempack/mod.rs parse_snapshot_checksum + snapshot_crc_of_concat helpers + node/mod.rs
    import compute+compare (Err on mismatch); 2 crates. Verify = negative security test (synthetic snapshot, flip byte →
-   reject). See In-progress for the full FIXING+VERIFY plan. state:ROOT-CAUSED attempts:0
+   reject). See In-progress for the full FIXING+VERIFY plan. *** DONE wake320 (committed+pushed 28bcd277e6): fix landed
+   (mempack parse_snapshot_checksum + snapshot_crc_of_concat + node import compute/compare/bail). Gauntlet GREEN: nextest
+   1146/1146 (serialization, incl. byte-exact-vs-real-fixture proof + corruption detection) + 955/955 (node) + clippy +
+   fmt. Closes the silent-accept-of-corrupt-snapshot surface. state:DONE attempts:0
 16. [L][phase2][LATENT, from gauntlet wqwgen1p0] decode_imported_script_ref hard-codes Plutus language tag
    0->V1,1->V2,2->V3,3->V4 as 'global', but the MemPack PlutusScript tag is ERA-RELATIVE (per-era packTagM).
    Byte-exact for ALL CURRENT eras only because each era's language list is a strict PREFIX [V1,V2,V3,V4] (no
@@ -225,7 +228,27 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #17 (Mithril snapshot CRC not verified) state:VERIFYING attempts:0 — gauntlet bc6j5y0qv IN-FLIGHT; wake-lock HELD (TTL 22m).
+- item: #17 DONE (committed+pushed 28bcd277e6). NEXT WAKE: SCHEDULE picks the next item — see recommendation.
+  *** wake320-cont (ultracode): #17 VERIFYING→DONE. Gauntlet bc6j5y0qv: nextest -p dugite-serialization 1146/1146 GREEN
+  (all 6 #17 tests pass incl. snapshot_crc_of_concat_matches_real_preprod_fixtures = THE byte-exact proof reproducing real
+  cardano-node checksums 2409556997/4213652121 from measured CRC inputs + single-byte-corruption detection + parse valid/
+  reject; NO regression of the Word8/tablesCodecVersion tests from the bounded-parser refactor); nextest -p dugite-node
+  955/955 GREEN; clippy --all-targets -D warnings clean. fmt initially FAILED on a trivial assert_ne! wrap in tests.rs →
+  cargo fmt auto-fixed (whitespace only) → fmt --check CLEAN. Since #17 is a security/code-invariant (reference = Haskell
+  reject-on-corruption + the byte-exact crcOfConcat vs REAL snapshots, no Koios), the real-fixture byte-exact test IS the
+  gauntlet → PASSED. COMMITTED focused 2-crate fix 28bcd277e6 (dugite-serialization mempack/mod.rs + tests.rs + Cargo.toml +
+  Cargo.lock + dugite-node node/mod.rs — common.rs #730 left uncommitted; verified staged set) + PUSHED prod-readiness-
+  engine→origin (8e41d0ae2a..28bcd277e6, HTTPS). #17 closes the silent-accept-of-corrupt-snapshot adversarial surface.
+  *** NEXT WAKE — SCHEDULE (one-step: don't drive this wake). #10 still BLOCKED (fast-start infra gone). Candidates:
+  (1) #20 [M][security/hardening] snapshot-import adversarial-hardening (varlen overflow/non-minimal reject, definite-map
+  entry-count truncation, backend dup-key first-wins) — DIRECT continuation of the #17 snapshot-import work, same area/momentum,
+  characterized by the #10 gauntlet refuters. (2) #15 [M->H][phase2] serialiseData canonical-re-encode (306 script-Error
+  divergences; ROOT-CAUSED-CONFIRMED, fix = Constant::Data carries original CBOR bytes / dugite-uplc; verification needs the
+  ep293 replay window — heavier, and was gated on #10 which is blocked). (3) #7 [M] Dijkstra SUBUTXO (re-derive the
+  normal-diff-format patch as a proper refactor). (4) #16 [L] decode_imported_script_ref era-relative tag. RECOMMEND #20
+  (continues the snapshot-hardening momentum, self-contained, unit-testable) OR #15 (M->H phase-2 correctness, but heavier
+  verify). Housekeeping: db-clones cruft (12× preprod-verify10*/15* @18G + mainnet-rupd-drop @47G) prunable;
+  /tmp/g17_*.log removable.
   *** wake320 (ultracode): #17 FIXING→VERIFYING (in-flight). Confirmed the uncommitted fix present (mempack/mod.rs helpers
   + node/mod.rs verify block). Launched the combined gauntlet bc6j5y0qv (background): cargo nextest -p dugite-serialization
   + cargo nextest -p dugite-node + clippy --all-targets -D warnings (both crates) + fmt --check → /tmp/g17_combined.log
@@ -2214,6 +2237,13 @@
 - db-clones/preprod-ep57-fixed   (fixed-binary replay, in progress)
 
 ## Gauntlet ledger  (passed/refuted approaches — never silently retry a REFUTED)
+- PASSED 2026-06-07 (wake320, #17): "verify snapshot CRC = crcOfConcat(crc(state), crc(tables)) at Haskell-ledger import;
+  bail on mismatch". Gauntlet for this security/code-invariant = the byte-exact crcOfConcat reproducing REAL cardano-node
+  snapshot checksums (no Koios). snapshot_crc_of_concat_matches_real_preprod_fixtures reproduces 2409556997 (fixture
+  124995007) + 4213652121 (124999169) from the measured per-file CRCs — proving the decimal-ASCII fold is byte-exact (the
+  naive crc32(state++tables) is WRONG). + single-byte-corruption detection + aeson-faithful parse (valid/reject) + NO
+  regression of Word8/tablesCodecVersion (bounded-parser refactor). nextest 1146/1146 (ser) + 955/955 (node) + clippy
+  -D warnings + fmt. Landed 28bcd277e6. crcOfConcat (Util/CRC.hs) + loadSnapshot (V2/InMemory.hs) Haskell-cross-checked.
 - PASSED 2026-06-07 (wake317, #6): "apply_utxo_diff must replay instant-stake (stake_map+ptr_stake) ADD/SUB
   symmetrically with the forward apply_utxo_changes path". Gauntlet for this CODE INVARIANT = a deterministic forward-vs-
   diff regression test (forward path is the byte-exact reference, proven vs Koios at ep57; NO fork replay/Koios needed).
@@ -2257,6 +2287,8 @@
 - 2026-06-07T14:xxZ wake316 ~ #6 FIXING (apply validated patch + compile-check)
 - 2026-06-07T14:xxZ wake317(+cont) ~ #6 VERIFYING→DONE (fail-pre empirical + pass-post 1522/1522+clippy+fmt) + commit/push 8e41d0ae2a
 - 2026-06-07T15:xxZ wake318(+cont) ~ SCHEDULE pivot #7→#17 + muscle analyze w2ez2r1lk (2 opus, byte-exact crcOfConcat vs real fixtures) → #17 ROOT-CAUSED
+- 2026-06-07T15:xxZ wake319 ~ #17 FIXING (hand-apply 2-crate CRC fix + 6 tests + bounded-parser refactor; both crates compile)
+- 2026-06-07T16:xxZ wake320(+cont) ~ #17 VERIFYING→DONE (gauntlet 1146/1146 ser + 955/955 node + clippy + fmt) + commit/push 28bcd277e6
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -3763,3 +3795,9 @@
   crc32_iso_hdlc(ascii_decimal(crc32(state)) ++ ascii_decimal(crc32(tables))) [empirically verified vs 2 real preprod
   fixtures; NOT raw concat]. Fix designed (mempack helpers + node import compare, 2 crates) + negative security test
   (synthetic snapshot, flip byte → reject). #17 ANALYZING→ROOT-CAUSED. NEXT WAKE: FIXING (hand-apply, fully specified).
+- wake319(+320) 2026-06-07: #17 ROOT-CAUSED→FIXING→VERIFYING→DONE. Hand-applied the fully-specified byte-exact fix (2 crates:
+  dugite-serialization parse_snapshot_checksum + snapshot_crc_of_concat [crcOfConcat decimal-ASCII fold] + Word8→bounded
+  parser refactor + 6 unit tests; dugite-node import compute/compare/bail). Gauntlet GREEN: nextest 1146/1146 (ser, incl.
+  byte-exact-vs-real-fixture proof + corruption detection) + 955/955 (node) + clippy + fmt (auto-fixed one assert wrap).
+  Committed+pushed focused fix 28bcd277e6. Closes the silent-accept-of-corrupt-snapshot adversarial surface (#17). NEXT:
+  SCHEDULE #20 (snapshot hardening, continues momentum) or #15 (serialiseData, M->H phase-2).
