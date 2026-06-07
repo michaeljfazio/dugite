@@ -228,7 +228,24 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #15 (serialiseData) state:VERIFYING-PENDING attempts:1 — muscle REFUTED the premise; patch saved+applies-clean. NEXT WAKE: apply+nextest+Koios-verify.
+- item: #15 (serialiseData) state:VERIFYING attempts:1 — Koios CONFIRMED real datum_hash (indefinite arrays); gauntlet b16jy1j76 IN-FLIGHT; lock HELD (TTL 22m).
+  *** wake322 (ultracode): #15 VERIFYING-PENDING→VERIFYING (independent verification of the muscle's refutation). Applied
+  candidate-fix-15-serialisedata-tests.patch to main (data.rs + denotations.rs, additive tests+docs). *** KOIOS INDEPENDENT
+  CONFIRMATION (koios.sh preprod datum_info): bbd352028feffe9a80a2822b46b9858bc1cf883cff383e1191b47d27ed708eb0 IS a REAL
+  on-chain preprod datum_hash (creation_tx d653e3692353fe3f86daf21f16e8027eaee5c835467e3139992e98dc0c8135bb), and its
+  on-chain CBOR `bytes` START d87a9fd8799fd8799fd8799f… = tag122(d87a) + INDEFINITE array (9f) — EXACTLY the muscle's claim
+  (on-chain datum uses indefinite-length arrays; dugite encode_list also emits indefinite → byte-exact). So the gold test
+  references a GENUINE on-chain hash, NOT fabricated. Chain of proof: gold test asserts blake2b256(serialiseData(test
+  datum bytes))==bbd352…; Koios confirms bbd352… is the real on-chain datum_hash; blake2b is collision-resistant → the
+  test's bytes ARE the on-chain bytes → if the gold test PASSES on main, dugite serialiseData is byte-exact for this real
+  datum. *** Launched gauntlet b16jy1j76 (background): cargo nextest -p dugite-uplc (999-conformance + 6 new #15 tests incl.
+  serialise_data_gold_preprod_datum_hash_matches_onchain) + clippy --all-targets -D warnings + fmt --check →
+  /tmp/g15_combined.log. *** ON COMPLETION (this wake, auto-notify): if nextest GREEN (gold test passes on MAIN + NO
+  conformance regression) + clippy + fmt → muscle refutation INDEPENDENTLY CONFIRMED → COMMIT the additive tests+docs
+  (1 crate dugite-uplc, locks in byte-exact correctness + the definite_input_is_reencoded_to_indefinite_not_memoised guard
+  against the wrong memo-fix) + push, advance #15 → DONE (stale-premise/no-op, byte-exact-confirmed) + add a REFUTED
+  gauntlet-ledger entry for the memo-fix approach. If gold test FAILS on main → muscle erred; re-open #15 with a fresh HEAD
+  ep293 capture. Lock held across async (overlapping cron skips; 22m TTL).
   *** wake321-cont (ultracode): muscle fix wf4hgn0hk COMPLETED and *** OVERTURNED THE #15 PREMISE *** (Tier A', checks_green,
   1 agent, byte-level proof — did NOT implement the prescribed memo-fix because it is WRONG and would INTRODUCE divergence).
   FINDING: Haskell serialiseData = `BSL.toStrict . serialise` = a STRUCTURAL CANONICAL RE-ENCODE, NOT a memoised verbatim
