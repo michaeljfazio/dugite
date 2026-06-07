@@ -209,7 +209,18 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:PAID-SET-REPLAY-RUNNING (build OK 1m41s; re-replay launched wake263).
+- item: #0 (mainnet ep246 reserves) state:PAID-SET-REBUILD (wake263 binary MISSED the epoch.rs edit; clean rebuild pid 26410).
+  *** wake264: replay reached ep270 but rupd_paid_246.txt NEVER written. DIAGNOSED: env DUGITE_RUPD_PAID_EPOCH=246 WAS
+  set on pid 98498, but `strings target/release/dugite-node` has NO 'DUGITE_RUPD_PAID_EPOCH'/'rupd_paid_' (while
+  RUPD_DROP_TRACE IS present) => the wake263 build did NOT compile my epoch.rs paid edit into the binary (build/cache
+  race: epoch.rs mtime 16:22 vs binary 16:24; the release build's dugite-ledger compile apparently predated the edit
+  write). Source IS correct (epoch.rs:109/116). FIX: SIGTERM'd the wrong-binary replay 98498, force-touched epoch.rs+
+  rewards.rs, kicked off CLEAN rebuild pid 26410 -> /tmp/dugite-rupd-paid-build2.log. NEXT WAKE: VERIFY
+  `strings target/release/dugite-node | grep -c DUGITE_RUPD_PAID_EPOCH` >=1 BEFORE re-replaying (don't repeat the
+  miss); then re-launch replay over the KEPT CoW clone db-clones/mainnet-rupd-drop with DUGITE_RUPD_PAID_EPOCH=246 ->
+  rupd_paid_246.txt -> diff vs Koios earned_epoch-245 for missing payees/amount deltas summing to 82,215,213.
+  LESSON: after a background build, ALWAYS strings-verify the new symbol is in the binary before launching the run
+  that depends on it (mtime/"Finished" is NOT proof the edit got compiled). Instrumentation UNCOMMITTED; CoW clone KEPT.
   Re-launched replay job mainnet-rupd-paid pid 98498 over the KEPT CoW clone db-clones/mainnet-rupd-drop (immutable
   46G intact) with DUGITE_RUPD_PAID_EPOCH=246 + DUGITE_RUPD_DROP_TRACE=1 + DUGITE_EPOCH_STATE_DUMP=...mainnet-rupd-drop,
   --socket /tmp/engine-rupd-paid.sock --port 3001 (no node running). Progressing (ep51, fast). Writes
@@ -2834,3 +2845,8 @@
   DUGITE_RUPD_PAID_EPOCH=246 -> writes epoch-dumps-engine/rupd_paid_246.txt (full paid set) at ep246 (~4min).
   Progressing ep51. next wake: poll for rupd_paid_246.txt -> diff dugite paid set vs Koios earned_epoch-245 to find
   missing payees / amount deltas summing to 82,215,213 (start: paid_count vs dump credentials=154,236).
+- wake264: paid-set replay produced NO rupd_paid_246.txt. Diagnosed: wake263 binary lacked the epoch.rs paid edit
+  (strings shows no DUGITE_RUPD_PAID_EPOCH though source is correct; build/cache race). SIGTERM'd replay 98498,
+  force-touched epoch.rs+rewards.rs, kicked off clean rebuild pid 26410. next wake: strings-VERIFY the symbol in the
+  binary BEFORE re-replaying, then re-launch with DUGITE_RUPD_PAID_EPOCH=246. LESSON: strings-verify new symbols after
+  a background build before depending on them.
