@@ -209,7 +209,25 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:ISOLATING-BUGGY-SUBSET (drop set captured; Koios isolation diagnose w79i1iplr launched).
+- item: #0 (mainnet ep246 reserves) state:ISOLATING-BUGGY-SUBSET (mechanical Koios isolation done; epoch-alignment + final subset PENDING analytical).
+  *** wake259: KILLED diagnose w79i1iplr (it ran the DEFAULT generic dims — args.dimensions did NOT reach the muscle;
+  the custom-dimensions mechanism is BROKEN when launching via Workflow scriptPath+args, AVOID it / fold task into
+  `item`). Did the Koios isolation MECHANICALLY (data-join; tool scripts/dev/isolate_buggy_drops.py): bech32-encoded
+  all 809 dropped creds (28-byte stake hash + header 0xe1) -> batched account_reward_history (Koios body limit 5120
+  bytes -> 70 addrs/batch). RESULTS (saved epoch-dumps-engine/mainnet-rupd-drop/ep246_isolation.json, per-cred
+  would_be/stake/koios-reward-epochs): of 809 dropped — 671 have NO Koios history at all (would_be 10.3B; legit drops,
+  never/long-deregistered), 138 have history (2.18B). 45 still-active (max_earned_epoch>=246, wb 968M) but MOST have
+  NO 245/246 reward row (lumpy earners Haskell also dropped at this distribution). 7 creds have an earned_epoch=246
+  row: would_be SUM=78,725,982 (vs target 82,215,213 — CLOSE, ~3.5M short); 6 have a 247 row (97M); 0 have a 245 row.
+  UNRESOLVED (analytical, for muscle): (a) EPOCH ALIGNMENT — Koios earned_epoch 244 -> spendable 246; the ep245->246
+  transition makes rewards spendable AT 246, so the matching Koios earned_epoch is ambiguous (244 by spendable-lag, OR
+  the per-cred would_be aligns to 246?); (b) AMOUNT MISMATCH — e.g. cred stake1u9sar42 dugite would_be=278,131,055 vs
+  Koios earned_epoch244 amount=245,574,542 (NOT equal) -> either misalignment or dugite computes would_be on different
+  stake; (c) which exact subset sums to 82,215,213 + the reg-tracking mechanism. NEXT WAKE: route the alignment+subset+
+  mechanism analysis through the muscle (mode analyze, fold the task+data-file path into `item` since custom dims are
+  broken) using ep246_isolation.json + era-rules reward-timeline reference. Lead: the 7 has-246 creds (78.7M) are the
+  prime buggy candidates; resolve the ~3.5M gap (script-hash creds header 0xf1 not tried? dereg-dust 55,269?).
+  CoW clone db-clones/mainnet-rupd-drop KEPT for verification re-replay; instrumentation UNCOMMITTED.
   *** wake258: instrumented replay REACHED ep246 in ~4 MIN (07:56->08:00; FAR faster than feared). Captured the
   ep245->246 boundary drop set: 809 MEMBER creds dropped (0 leaders), total_would_be=12,509,563,183. BUT ep245
   baseline was byte-exact (10.7B dropped @ ep244->245), so Haskell drops ~all of these too — they are mostly
@@ -2748,3 +2766,10 @@
   (CoW clone kept for verification re-replay). Launched opus Koios isolation diagnose w79i1iplr: batched
   account_reward_history over the 809 -> the earned_epoch=245-paid ones are buggy (sum≈82,215,213) -> reg-anomaly
   via account_update_history. next wake: read w79i1iplr -> targeted fix -> re-replay verify.
+- wake259: killed w79i1iplr (default-dims; custom-dimensions arg BROKEN via Workflow -> fold task into `item`).
+  Mechanical Koios isolation (scripts/dev/isolate_buggy_drops.py): bech32 all 809 dropped creds -> batched (70/batch,
+  Koios 5120B limit) account_reward_history. 671/809 have NO koios history (legit drops, 10.3B wb); 138 have history.
+  7 creds have an earned_epoch=246 row, wb sum=78,725,982 (target 82,215,213, ~3.5M short) — prime buggy candidates.
+  0 have a 245 row. Saved ep246_isolation.json. UNRESOLVED (analytical): epoch alignment (Koios earned_epoch vs
+  dugite boundary), amount mismatch (would_be 278M vs koios 245M for a cred), final subset + mechanism. next wake:
+  muscle analyze (task in `item`, data=ep246_isolation.json) to resolve alignment+subset+reg-mechanism -> fix.
