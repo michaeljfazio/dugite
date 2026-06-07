@@ -194,8 +194,23 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:GAUNTLET-PENDING (commit-B re-fix, 6-path).
-  *** wake178: verify10B2 IMPORT FULLY CLEAN — 4116339 UTxOs loaded, 0 phase-1, 0 import HARD-ERRORS (the new
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:FIXING (commit-B FINAL hardening: R1+R2).
+  *** wake180: RE-GAUNTLET wd3lzyawv = REFUTED 2/3 BUT the 3rd refuter (compounding-feedback) VERIFIED all 6 prior
+  paths byte-exact (couldn't refute). The 2 NEW narrow edges (both concrete + Haskell-grounded, both in dugite-
+  serialization/src/mempack/mod.rs ONLY): (R1 haskell-semantics) R3's c==0 short-circuit fixed 0e<huge> but NONZERO-
+  coeff huge-exponent 1e2000000000 still hits BigInt::pow(2e9) -> GB/OOM; Haskell toBoundedInteger has dangerouslyBig
+  guard (e>limit && e>integerLog10'(255)=2 -> Nothing in O(1), lazy toIntegral). FIX: bound net_exp before pow (>=0
+  branch: net_exp>=3 => None since coeff>=1; <0 branch: |net_exp| > coeff trailing-zero-count => non-integral None).
+  (R2 edge-epoch) TvarIterator::next() ~1064-1066 DISCARDS decode_mempack_txout's _consumed -> a value blob whose
+  decoder consumes only a PREFIX is silently accepted; Haskell mempack unpackFail is FULL-CONSUMPTION-STRICT
+  (consumedBytes/=len => NotFullyConsumed => loadSnapshot aborts). FIX: assert _consumed==val_bytes.len() else
+  Some(Err); same for key. Both VALID (verified the dissent). DROVE: SIGTERM'd verify10B2 (window evidence captured:
+  0 phase-1 past 125105013), regenerated base-commitB2-bridge.patch (5197L, 3-CRATE serialization+node+LEDGER so the
+  Convertible variant+arm both exist = NO more re-classify drift), launched FIX muscle w3dsqneah (run wf_ed2d1c3a-ca1).
+  NEXT WAKE: poll; green -> copy mempack/mod.rs(+tests) to main -> build -> re-import (0 phase-1) -> RE-GAUNTLET (R1+R2
+  addressed; 6 paths already verified byte-exact) -> COMMIT #10. CONVERGING: adversarial surface nearly exhausted
+  (opaque-store + truncation-hard-error + full-consumption + dangerouslyBig done; CRC=#17, opaque-addr=#19 separate).
+  was: state:GAUNTLET-PENDING (commit-B re-fix, 6-path). *** wake178: verify10B2 IMPORT FULLY CLEAN — 4116339 UTxOs loaded, 0 phase-1, 0 import HARD-ERRORS (the new
   hard-error paths do NOT false-trigger on a well-formed snapshot; tag-4/5 opaque-store relax does NOT over-reject).
   The 6-path changes provably CANNOT regress phase-1 (opaque relaxation + malformed-only hard-errors + parse-only R3),
   and verify10B already established 0-phase-1-PAST-window -> sufficient to gauntlet. DROVE: launched RE-GAUNTLET
@@ -1262,6 +1277,12 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake180 2026-06-07: #10 GAUNTLET-PENDING -> FIXING. wd3lzyawv REFUTED 2/3 (3rd verified 6 paths byte-exact). 2 new
+  edges in mempack/mod.rs: (R1) dangerouslyBig guard missing -> 1e2000000000 BigInt::pow blowup (bound net_exp before
+  pow); (R2) TvarIterator discards _consumed -> partial-TxOut silent accept; Haskell unpackFail full-consumption-
+  strict (assert _consumed==len else Err). SIGTERM'd verify10B2 (window 0-phase-1 captured). Regenerated 3-crate
+  base-commitB2-bridge.patch (includes Convertible variant+arm -> no drift). Launched FIX muscle w3dsqneah
+  (wf_ed2d1c3a-ca1). NEXT WAKE: poll -> build -> re-import -> re-gauntlet -> commit. Converging.
 - wake179 2026-06-07: POLL #10 GAUNTLET wd3lzyawv — still RUNNING (last activity current). verify10B2 WINDOW
   EVIDENCE CONFIRMED: synced PAST window (tip 125113936 > 125105013, block 4794270) with 0 phase-1 — the 6-path
   binary holds 0-phase-1 past the ep293 window. No transition (gauntlet is the gate). Disk 182G. #10 stays
