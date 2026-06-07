@@ -266,7 +266,20 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #20c DONE (committed+pushed b43f4fa80d). #20 remaining: (a) varlen, (b) definite-map. NEXT WAKE: SCHEDULE #20a or #20b.
+- item: #20a (decode_varlen overflow hardening) state:DIAGNOSING attempts:0 — muscle wi8udn7a7 (BOUNDED) IN-FLIGHT; lock HELD (TTL 22m).
+  *** wake329 (ultracode): SCHEDULE #20a (highest-impact #20 sub-item, ~10 decode sites). PREP: read decode_varlen
+  (compact.rs:50-67) — loops ≤10 bytes, `acc=(acc<<7)|(byte&0x7f)`, terminates on `byte&0x80==0`, errors only on >10-bytes/
+  empty. GAP: NO overflow check — 10 bytes carry 70 bits but u64=64, so the 10th byte\'s `acc<<7` silently DROPS high bits
+  → a >2^64 varlen decodes to a truncated u64 Ok where Haskell mempack unpack7BitVarLenLast fails. Possibly also non-minimal
+  (overlong) acceptance. *** DRIVE: launched muscle analyze wi8udn7a7 (run wf_a05f5a56-699, 2 opus) with a TIGHT ANTI-DEATH
+  brief: PURE SOURCE-READING (WebFetch lehins/mempack Data.MemPack) — NO build/run/instrument/measure (the trap that hung
+  prior muscles), time-boxed. Tasks: quote unpack7BitVarLen/Last verbatim; state EXACTLY (1) the overflow guard (which
+  terminal-byte bits / byte-count fail for Word64), (2) whether non-minimal is rejected (or NOT — if mempack accepts it, do
+  NOT add a stricter check), (3) the exact dugite decode_varlen fix + fail-pre/pass-post tests (10-byte overflow → Err;
+  u64::MAX boundary → still Ok). *** NOTE: analyze-mode edits the MAIN tree if the agent writes code (the #23 lesson) — on
+  completion CHECK git status + salvage any fix. NEXT WAKE (on auto-notify): RECORD the byte-exact semantics + fix → #20a
+  DIAGNOSING→ROOT-CAUSED (or FIXING if the agent applied a clean fix). Lock held across async (TTL 22m). If hang >20min/
+  0-byte-output → reclaim+salvage (check agent transcript mtime, not just output size — the wogj8wp6h 44min lesson).
   *** wake328-cont (ultracode): #20c FIXING→VERIFYING→DONE. Gauntlet bpf5r3skc GREEN: nextest -p dugite-serialization
   1147/1147 (was 1146, +1 = the new backend_enforce_is_aeson_first_wins_on_duplicate_key test, PASSES — the critical case
   {"backend":"lsm","backend":"utxohd-mem"} now Errs where pre-fix serde_json last-wins wrongly accepted the 2nd); clippy
