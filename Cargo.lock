@@ -1818,6 +1818,7 @@ version = "1.7.0"
 dependencies = [
  "bincode 1.3.3",
  "bytes",
+ "crc32fast",
  "criterion",
  "dugite-primitives",
  "hex",

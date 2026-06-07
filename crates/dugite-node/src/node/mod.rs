@@ -6494,6 +6494,43 @@ impl Node {
             "Decoding Haskell ExtLedgerState"
         );
 
+        // ── Verify snapshot integrity (CRC) BEFORE trusting any of the bytes ──
+        //
+        // Upstream ouroboros-consensus V2/InMemory.loadSnapshot computes
+        // `crcOfConcat(crc(state), crc(tables))` and throws `ReadSnapshotDataCorruption`
+        // on mismatch with the `checksum` recorded in the sibling `meta` file. dugite
+        // previously read `checksum` (for the codec-version path) but NEVER verified it,
+        // so a tampered/truncated-yet-MemPack-decodable snapshot was silently accepted
+        // (#17). The stored checksum is `crc32` over the DECIMAL-ASCII concatenation of
+        // the two file CRCs (NOT `crc32(state ++ tables)`); `snapshot_crc_of_concat`
+        // mirrors it byte-exactly (verified vs real preprod fixtures). When there is no
+        // tables file the checksum folds to the state-only CRC (Haskell `maybe crc1`).
+        let meta_path = snapshot_dir.join("meta");
+        let meta_bytes = std::fs::read(&meta_path)
+            .with_context(|| format!("reading snapshot meta at {}", meta_path.display()))?;
+        let expected_checksum =
+            dugite_serialization::mempack::parse_snapshot_checksum(&meta_bytes)?;
+        let tables_crc = resolve_inmemory_tables_path(snapshot_dir)
+            .map(|p| -> anyhow::Result<u32> {
+                let blob = std::fs::read(&p)
+                    .with_context(|| format!("reading tables file at {} for CRC", p.display()))?;
+                Ok(crc32fast::hash(&blob))
+            })
+            .transpose()?;
+        let computed_checksum = dugite_serialization::mempack::snapshot_crc_of_concat(
+            crc32fast::hash(&state_data),
+            tables_crc,
+        );
+        if computed_checksum != expected_checksum {
+            anyhow::bail!(
+                "snapshot checksum mismatch (upstream ReadSnapshotDataCorruption): computed \
+                 crcOfConcat {computed_checksum} != meta checksum {expected_checksum} at {} — the \
+                 state/tables bytes are corrupt or tampered; refusing to import",
+                snapshot_dir.display()
+            );
+        }
+        info!(checksum = expected_checksum, "Snapshot CRC verified");
+
         let hs = dugite_serialization::haskell_snapshot::decode_state_file(&state_data)
             .context("Failed to decode Haskell ExtLedgerState")?;
 

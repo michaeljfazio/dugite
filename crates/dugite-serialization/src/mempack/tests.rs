@@ -999,3 +999,111 @@ fn test_tvar_empty_indefinite_map_without_break_hard_errors() {
         other => panic!("empty unterminated indefinite map must yield Some(Err), got {other:?}"),
     }
 }
+
+// ── #17: snapshot-level CRC (crcOfConcat) verification ──────────────────────
+
+use super::{parse_snapshot_checksum, snapshot_crc_of_concat};
+
+#[test]
+fn snapshot_crc_of_concat_matches_real_preprod_fixtures() {
+    // Byte-exact vs TWO REAL preprod cardano-node snapshots (db-preprod-sync/haskell-
+    // ledger). The stored `checksum` is crc32(ascii_decimal(crc32(state)) ++
+    // ascii_decimal(crc32(tables))), NOT crc32(state ++ tables). The per-file CRC
+    // inputs were measured on disk (#17 analyze w2ez2r1lk) and the meta `checksum`
+    // values are taken verbatim from each snapshot's `meta` file.
+    assert_eq!(
+        snapshot_crc_of_concat(2003040462, Some(4175236221)),
+        2409556997,
+        "fixture 124995007"
+    );
+    assert_eq!(
+        snapshot_crc_of_concat(226322584, Some(1678180760)),
+        4213652121,
+        "fixture 124999169"
+    );
+}
+
+#[test]
+fn snapshot_crc_of_concat_is_decimal_ascii_fold_not_raw_concat() {
+    let (a, b) = (2003040462u32, 4175236221u32);
+    // The fold is over the DECIMAL-ASCII rendering of each CRC, concatenated.
+    assert_eq!(
+        snapshot_crc_of_concat(a, Some(b)),
+        crc32fast::hash(b"20030404624175236221"),
+    );
+    // It is NOT a CRC over the raw little-endian CRC bytes (the naive interpretation).
+    let mut raw = Vec::new();
+    raw.extend_from_slice(&a.to_le_bytes());
+    raw.extend_from_slice(&b.to_le_bytes());
+    assert_ne!(snapshot_crc_of_concat(a, Some(b)), crc32fast::hash(&raw));
+}
+
+#[test]
+fn snapshot_crc_of_concat_tables_absent_folds_to_state() {
+    // Haskell `maybe crc1 (crcOfConcat crc1) crc2`: no tables file ⇒ state-only crc1.
+    assert_eq!(snapshot_crc_of_concat(123_456_789, None), 123_456_789);
+}
+
+#[test]
+fn snapshot_crc_detects_single_byte_corruption() {
+    // Negative-security property: flipping ONE byte of the state blob changes
+    // crc32(state), hence the computed crcOfConcat, hence the import-time
+    // `computed != expected` check fires and the corrupt snapshot is rejected.
+    let state = b"the quick brown fox state blob";
+    let tables = b"tables blob bytes";
+    let good = snapshot_crc_of_concat(crc32fast::hash(state), Some(crc32fast::hash(tables)));
+    let mut corrupt = state.to_vec();
+    corrupt[0] ^= 0x01;
+    let bad = snapshot_crc_of_concat(crc32fast::hash(&corrupt), Some(crc32fast::hash(tables)));
+    assert_ne!(
+        good, bad,
+        "a corrupted state blob must produce a different checksum"
+    );
+    // And corrupting the tables blob is likewise caught.
+    let mut corrupt_t = tables.to_vec();
+    corrupt_t[0] ^= 0x01;
+    let bad_t = snapshot_crc_of_concat(crc32fast::hash(state), Some(crc32fast::hash(&corrupt_t)));
+    assert_ne!(
+        good, bad_t,
+        "a corrupted tables blob must produce a different checksum"
+    );
+}
+
+#[test]
+fn parse_snapshot_checksum_valid() {
+    let meta = br#"{"backend":"utxohd-mem","checksum":2409556997,"tablesCodecVersion":1}"#;
+    assert_eq!(parse_snapshot_checksum(meta).unwrap(), 2_409_556_997);
+    // Full Word32 range boundary.
+    assert_eq!(
+        parse_snapshot_checksum(br#"{"checksum":4294967295}"#).unwrap(),
+        u32::MAX
+    );
+    // aeson first-wins on a duplicate top-level key.
+    assert_eq!(
+        parse_snapshot_checksum(br#"{"checksum":7,"checksum":9}"#).unwrap(),
+        7
+    );
+    // aeson accepts float-syntax integral forms (Scientific.toBoundedInteger): 100e-2 == 1.
+    assert_eq!(
+        parse_snapshot_checksum(br#"{"checksum":100e-2}"#).unwrap(),
+        1
+    );
+}
+
+#[test]
+fn parse_snapshot_checksum_rejects_invalid() {
+    // absent (mandatory `fmap CRC (o .: "checksum")` fails)
+    assert!(parse_snapshot_checksum(br#"{"backend":"utxohd-mem"}"#).is_err());
+    // null
+    assert!(parse_snapshot_checksum(br#"{"checksum":null}"#).is_err());
+    // JSON string, not a Number
+    assert!(parse_snapshot_checksum(br#"{"checksum":"123"}"#).is_err());
+    // out of Word32 range (u32::MAX + 1)
+    assert!(parse_snapshot_checksum(br#"{"checksum":4294967296}"#).is_err());
+    // negative
+    assert!(parse_snapshot_checksum(br#"{"checksum":-1}"#).is_err());
+    // non-integral
+    assert!(parse_snapshot_checksum(br#"{"checksum":1.5}"#).is_err());
+    // not a JSON object
+    assert!(parse_snapshot_checksum(br#"[1,2,3]"#).is_err());
+}
