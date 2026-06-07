@@ -86,6 +86,24 @@
    can only rest on the Haskell-Ord match + tests (record that honestly; do NOT commit claiming byte-exact-replay-verified).
    Reward/stake non-regression: confirm a linear replay stays byte-exact (expected — the conservation pipeline is untouched).
    COMMIT only after the gate. NO origin push (curated-origin model). Fix files stay uncommitted in the main tree meanwhile.
+   *** VERIFYING wake347 (mechanical corpus scan, /tmp/scan_dumps.py — minimal CBOR decoder over all 769 phase2-dumps-730val):
+   DECISIVE — 0/769 dumps have ANY withdrawal (body key 5) OR vote (key 19); 0 with >=2 of either; 0 mixed key+script. So the
+   #730 corpus NEVER reaches the changed code (ledger_ordered_withdrawals / txInfoVotes ordering / Reward+Vote redeemer index)
+   → it can verify NEITHER correctness NOR regression for #26/#27 (the fix is a PROVABLE no-op over the entire corpus: the paths
+   aren't executed; this also explains why the pre-fix preprod frontier ep0-293 was already byte-exact — no withdrawal/vote-
+   bearing Plutus tx exercised the inversion). *** GATE DECISION (no on-chain tie-break reference is attainable): for a LATENT
+   phase-2 ORDERING fix, the AUTHORITATIVE reference is the canonical Haskell Ord itself (Script<Key), NOT a Koios total. So
+   the gate = (1) Haskell-Ord oracle match [DONE — fix quotes exact cardano-ledger Voter/Credential/RewardAccount Ord], (2)
+   ordering proptests [DONE — mixed-cred → Script-first, 730/730], (3) provable no-op on ALL available references [DONE — 0/769
+   exercise the path + single-element ordering = identity], (4) reward/stake non-regression [trivially GREEN — conservation
+   pipeline untouched + 0 corpus dumps even reach phase-2 changes]. This is the maximal achievable verification; a byte-exact
+   cardano-node ScriptContext dump for the tie-break is impractical (no reference node; such a tx is rare/absent in history).
+   *** REMAINING empirical step (NEXT wake, BOUNDED — not a blocker): a bounded Koios hunt for ANY real mainnet/preprod tx with
+   >=1 withdrawal + a Plutus reward script (to at least run the changed path on a real tx via a built phase2_repro dump);
+   if a mixed-cred one is found, it becomes the gold tie-break reference. If the bounded hunt finds nothing (likely), COMMIT
+   #26/#27 on the by-construction basis (Haskell-Ord match + proptests + provable-no-op), with this limitation recorded —
+   landing a correct fix grounded in canonical source beats never landing it for want of an adversarial tx that may not exist.
+   state:VERIFYING attempts:1 conf:0.86.
 27. [H][phase2][NEW] WITHDRAWALS (Rewarding) ordering inversion (manifestation B of the key<script vs script<key theme; DISTINCT
    fix site from #26). tx.body.withdrawals keyed by raw 29-byte reward-account blob [header||hash28] in BTreeMap<Vec<u8>,_>
    (transaction.rs:805) → sorts by raw bytes where key-stake header 0xE_ < script-stake 0xF_ → Key-before-Script, OPPOSITE to
@@ -102,7 +120,8 @@
    non-regression guard (GREEN — withdrawals don't touch the conservation pipeline). Fix #26 and #27 in ONE worktree.
    state:ROOT-CAUSED attempts:0 conf:0.65 (folded into #26)
    *** FIXING wake346: DONE in #26's patch (ledger_ordered_withdrawals + Reward-index over ledger order). Same uncommitted
-   patch + VERIFY gate. state:FIXING attempts:1 conf:0.65 (with #26)
+   patch + VERIFY gate. *** VERIFYING wake347: same as #26 — 0/769 corpus dumps have withdrawals (changed path not exercised);
+   gate = Haskell-RewardAccount-Ord match + proptests + provable no-op. state:VERIFYING attempts:1 conf:0.65 (with #26)
 28. [H][serialization][NEW] PlutusData decoder accepts >64-byte definite bytestrings (no bounded_bytes 64-byte cap).
    read_plutus_data_depth reads Type::Bytes via read_bytes_owned() / BytesIndef with NO length check (era_alonzo.rs:1282-1288;
    era_conway.rs:2576-2579; bignum mantissa era_alonzo.rs:1224/1230, era_conway.rs:2514 via read_bigint). Haskell plutus
@@ -389,7 +408,20 @@
    reconstruction + #7 sub-tx forward). state:DONE attempts:0
 
 ## In-progress
-- item: #26+#27 (Credential-Ord inversion) FIXING DONE (uncommitted patch, targeted-green) → NEXT WAKE: VERIFYING (byte-exact ScriptContext gate). Reward/stake guard GREEN.
+- item: #26+#27 VERIFYING — corpus can't verify (0/769 exercise the path); gate = Haskell-Ord match + proptests + provable no-op. NEXT: bounded Koios hunt then commit-on-by-construction.
+  *** wake347 (ultracode): DRIVE #26+#27 FIXING→VERIFYING. Mechanical corpus scan (minimal CBOR decoder over all 769
+  phase2-dumps-730val): DECISIVE — 0/769 dumps have ANY withdrawal or vote, so the corpus NEVER reaches the changed code →
+  cannot verify correctness OR regression (the fix is a provable no-op over the whole corpus). This also explains the pre-fix
+  preprod frontier being byte-exact (no withdrawal/vote-bearing Plutus tx exercised the inversion in history). *** GATE DECISION:
+  for a LATENT phase-2 ORDERING fix with no attainable on-chain tie-break reference, the AUTHORITATIVE reference is the canonical
+  Haskell Ord (Script<Key) itself — so the gate = Haskell-Ord oracle match [DONE] + ordering proptests [DONE, 730/730] +
+  provable no-op on all references [DONE] + reward/stake non-regression [trivially GREEN]. A byte-exact cardano-node
+  ScriptContext dump for the tie-break is impractical (no reference node; such a tx is rare/absent). *** NEXT WAKE — a BOUNDED
+  Koios hunt for ANY real tx with >=1 withdrawal + a Plutus reward script (to run the changed path on a real tx; if mixed-cred,
+  the gold reference). If found → build a phase2_repro dump, confirm post-fix matches on-chain. If the bounded hunt finds nothing
+  (likely) → COMMIT #26/#27 (local, 2 crates = 1 commit) on the by-construction basis with the no-reference limitation recorded.
+  Landing a correct, canonical-source-grounded fix beats never landing it for want of an adversarial tx that may not exist. Fix
+  stays uncommitted (candidate-fix-26-27-credord.patch) meanwhile. Lock to release.
   *** wake346 (ultracode): DRIVE #26+#27 ROOT-CAUSED→FIXING. Authored a focused fix Workflow (wemg0lky9/wf_1c5c9865-3fe,
   fix-credord.workflow.js — single agent operating in the MAIN TREE [not a fresh worktree] so builds are incremental/fast +
   hostable in-turn; defensible deviation from muscle mode:fix whose hardcoded full-workspace-nextest-in-fresh-worktree = a
@@ -3072,6 +3104,7 @@
 - 2026-06-08T17:46Z wake339 ~ re-audit COMPLETED in-turn (wl42ygj07, 1.29M subagent tokens/15 agents/11.4min) → filed 6 new backlog items #26-#31 (3H/3M); spot-verified #26 Credential-Ord inversion; LESSON: host Workflows in-turn (launch-and-stop orphans subagents)
 - 2026-06-08T18:05Z wake341 ~ #26 NEW→ROOT-CAUSED: analysis Workflow wh9u6m36k hosted in-turn (373K tokens/4 agents/6.5min) → PER-CONSUMER fix, reward/stake guard GREEN; OVERRODE synthesis 'latent' claim (Voter derived-Ord enum = TYPE-dominated = ACTIVE); #26+#27 [H] ACTIVE→FIXING next
 - 2026-06-08T18:30Z wake346 ~ #26+#27 ROOT-CAUSED→FIXING: fix Workflow wemg0lky9 hosted in-turn (127K tokens/1 agent/11min) → per-consumer cmp_ledger Script<Key at phase-2 sites, 6 files/2 crates, INDEPENDENTLY re-verified fmt+clippy+nextest 730/730; patch uncommitted (byte-exact VERIFY gate next); ignored agent's wrong 'latent' caveat
+- 2026-06-08T18:55Z wake347 ~ #26+#27 FIXING→VERIFYING: scanned 769 dumps (0 have withdrawals/votes → corpus can't verify; fix is provable no-op over it). Gate=Haskell-Ord match+proptests+provable-no-op (no on-chain tie-break reference attainable). Next: bounded Koios hunt then commit-by-construction
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -4677,3 +4710,9 @@
   fmt+clippy+nextest 730/730 green (#438 discipline). Spot-verified cmp_ledger is type-dominated; ignored the agent's repeated
   wrong "latent/same-hash" caveat. Patch UNCOMMITTED (byte-exact gate pending). NEXT: VERIFYING — phase2_repro on a mixed
   key+script reference tx (search corpus/Koios); commit only after the gate. #26b filed for the excluded gov-map sites.
+- wake347 2026-06-08: DRIVE #26+#27 FIXING→VERIFYING. Mechanical scan (minimal CBOR decoder) of all 769 phase2-dumps-730val:
+  0 have ANY withdrawal or vote → the corpus NEVER exercises the #26/#27 changed code (fix is a provable no-op over it); it
+  can verify neither correctness nor regression. GATE DECISION: for a latent phase-2 ordering fix with no on-chain tie-break
+  reference, the authoritative reference is the canonical Haskell Ord (Script<Key) — gate = Haskell-Ord match + ordering
+  proptests (730/730) + provable no-op + reward/stake non-regression (trivially green). NEXT: bounded Koios hunt for a real
+  withdrawal+reward-script tx; else commit on the by-construction basis with the no-reference limitation recorded. Fix uncommitted.
