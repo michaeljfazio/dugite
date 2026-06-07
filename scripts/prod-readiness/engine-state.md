@@ -209,7 +209,23 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:SNAPBD-REPLAY-RUNNING (live shelley.rs breakdown VERIFIED strings=2; replay pid 94744 launched wake294).
+- item: #0 (mainnet ep246 reserves) state:ROOT-CAUSING-COMPONENT (POINTER RULED OUT; per-cred bucket-confirm building).
+  *** wake295 (ultracode): SNAP_BREAKDOWN for the ep244-equiv snapshot (built epoch=243, pst=21,956,097,174,685,676):
+  deleg_utxo=21,748,802,274,556,340 ; reward_bal=207,294,900,129,336 ; ptr_resolved=0 ; ptr_excluded=1,000,000 ;
+  ptr_stake_total=1,000,000 ; n_deleg=150,785. **POINTER RULED OUT** (total pointer stake = 1 ADA; the w7ghihrir
+  leading hypothesis was WRONG). The 109,573,937,991 deficit is in deleg_utxo (=Σ stake_map) OR delegated reward_bal.
+  Koios totals.reward (ep244=252,049,566,508,032 = ALL reward accts) doesn't isolate vs dugite's delegated-only 207T.
+  *** STRONG #1/#11 CONNECTION: deleg_utxo = Σ stake_map; the standing in-progress hypothesis is apply_utxo_changes
+  add/spend asymmetry (common.rs) under-counting stake_map -> #0's total_active_stake deficit is LIKELY the SAME bug as
+  #1 (ep57 stake-distribution) + #11. Reward-timing less likely (shelley.rs order = applyRUpd[291] THEN SNAP[533],
+  matching Haskell). DROVE: instrumented per-cred dump for ONE short pool (env DUGITE_SNAP_PERCRED, pool
+  263498e010c7a49bbfd7c4e1aab29809fca7ed993f9e14192a75871e -> 'SNAP_PERCRED snap_epoch= cred= utxo= reward='). cargo
+  check CLEAN (5.29s). Build -> /tmp/dugite-percred-build.log. SIGTERM'd snapbd replay 94744. NEXT WAKE: strings-verify
+  -> replay w/ DUGITE_SNAP_PERCRED=1 -> grep 'SNAP_PERCRED snap_epoch=243' -> dugite per-cred (utxo,reward) for that
+  pool's delegators -> diff vs Koios pool_delegators_history(263498e0..,_epoch_no=244) per-delegator amount -> the
+  short delegator(s): if utxo short => stake_map/apply_utxo_changes bug (=#1); if reward short => reward_accounts bug.
+  Then localize that bucket -> fix in eras/shelley.rs (snapshot) OR common.rs apply_utxo_changes (stake_map). Instrumentation
+  UNCOMMITTED. CoW clone KEPT.
   Build OK (1m35s, binary 18:51), SNAP_BREAKDOWN strings=2 VERIFIED. Launched snap-breakdown replay job mainnet-snapbd
   pid 94744 (DUGITE_SNAP_BREAKDOWN=1) over CoW clone db-clones/mainnet-rupd-drop. ~4min. SNAP_BREAKDOWN lines ->
   scripts/prod-readiness/.jobs/mainnet-snapbd.log. NEXT WAKE: grep 'SNAP_BREAKDOWN .*pst=21956097174685676' (the
@@ -3199,3 +3215,9 @@
   job mainnet-snapbd pid 94744 (DUGITE_SNAP_BREAKDOWN=1) over CoW clone. next wake: grep SNAP_BREAKDOWN
   pst=21956097174685676 -> if ptr_excluded~=109.6B => pointer bucket (fix shelley.rs:552-566); else deleg_utxo/reward
   bucket -> per-cred diagnostic. fix in eras/shelley.rs:533-566 (live).
+- wake295 (ultracode): SNAP_BREAKDOWN ep244-equiv snapshot: deleg_utxo=21,748,802,274,556,340 reward_bal=
+  207,294,900,129,336 ptr_stake_total=1,000,000 (1 ADA) -> POINTER RULED OUT (w7ghihrir leading hypothesis WRONG).
+  109.6B deficit is in deleg_utxo(=Σstake_map) or delegated reward_bal. STRONG #1/#11 connection: deleg_utxo=stake_map,
+  standing hypothesis = apply_utxo_changes asymmetry -> #0 likely SAME bug as #1 ep57. Instrumented per-cred dump for
+  one short pool (DUGITE_SNAP_PERCRED, 263498e0..), building. SIGTERM'd snapbd replay. next wake: replay -> grep
+  SNAP_PERCRED snap_epoch=243 -> diff vs Koios pool_delegators ep244 -> utxo-short(=stake_map/#1) vs reward-short bucket.
