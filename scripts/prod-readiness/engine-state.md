@@ -209,7 +209,22 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:FIXING (uniform ~5ppm member-reward under-dist; PRECISION hypothesis).
+- item: #0 (mainnet ep246 reserves) state:FIXING (uniform ~5ppm; deltaR1/eta — last untested GLOBAL term).
+  *** wake238b: PRECISION muscle w5xpn4ju0 FALSIFIED the f64 hypothesis (no fix): production reward path in
+  compute_reward_update is ALREADY exact-Rational (Rat/BigInt, single final floor); all 8 f64 refs are #[cfg(test)]-
+  only; a byte-equal precision test proved no f64 loss. ELIMINATED (7 rounds): apply_utxo_changes, rebuild/load/
+  pointer, per-cred stake, epoch_fees/ssFee, member/pool reward formula precision, member-fold logic, expansion. The
+  uniform pool-independent -5.027ppm => a GLOBAL multiplicative factor; the ONLY un-verified global input to reward_pot
+  is deltaR1 (the reserves draw, NOT ssFee which was verified). SUSPECT: rewards.rs:200-221 deltaR1=floor(min(1,eta)*
+  rho*reserves), eta=actual_blocks/expected_blocks, expected_blocks=(1-d)*asc*slots then FLOORED (floor_u64 @211,
+  max(1) @219). HYPOTHESIS: eta off by ~5ppm via expected_blocks rounding (dugite FLOORS to int; if Haskell keeps it
+  exact-Rational in eta=blocksMade%expectedBlocks, the fractional part/~21000 is ppm-scale). Comment @190 hints a prior
+  partial fix here. DROVE: copied precision regression test to main (rewards.rs tests-only); launched VERIFY-THEN-FIX
+  muscle w8q78zs1x (run wf_062013cd-b61, opus, rewards.rs:200-221 deltaR1/eta) — verify dugite deltaR1 vs Haskell-exact
+  (Koios ep244 blk_count + d + asc + slots + reserves), confirm the +5.027ppm == +82,215,213 deficit BEFORE fixing;
+  else report 'deltaR1 byte-exact, 5ppm in maxPool/appPerf/sigma-cap' + STOP. NEXT WAKE: poll -> deltaR1/eta confirmed
+  +fixed -> verify 15 Koios rewards ppm->0 + ep246 reserves==12880948865137767. (Last untested global term; high
+  prior given expected_blocks flooring.)
   *** wake236: VERIFY-THEN-FIX muscle w0oegi6uf REJECTED the epoch_fees hypothesis (source+arithmetic, NO fix): ssFee
   is a single SnapShots field, reward_pot=ssFee<>deltaR1, dugite reads ep244 fees=587,936,590 entering ep246 = Haskell
   byte-exact; AND a reward_pot error CANNOT yield both -55,269 treasury and -82.2M members (treasury_cut=tau*reward_pot
@@ -1585,6 +1600,11 @@
 - wake235 2026-06-07: POLL #0 VERIFY-THEN-FIX muscle w0oegi6uf — still RUNNING (cargo pid 10828, build/test; 33
   epoch_fees/ss_fee refs in rewards.rs = working the fee area; last activity ~2min). No transition. Disk 157G. #0
   stays FIXING. NEXT WAKE: poll/process result.
+- wake238b 2026-06-07: #0 PRECISION w5xpn4ju0 FALSIFIED f64 (production path exact-Rational; 8 f64 refs all test-only;
+  byte-equal precision test). 7 rounds eliminated everything except deltaR1 (the un-verified reward_pot reserves-draw;
+  ssFee was verified, deltaR1 was NOT). SUSPECT rewards.rs:200-221 eta/expected_blocks FLOORING (~5ppm). Copied
+  precision test to main; launched VERIFY-THEN-FIX w8q78zs1x (deltaR1/eta vs Haskell-exact). NEXT WAKE: confirm+fix ->
+  verify reserves==12880948865137767.
 - wake237 2026-06-07: POLL #0 PRECISION muscle w5xpn4ju0 — still RUNNING, ACTIVE (last activity 18s). CORROBORATING:
   rewards.rs HEAD has 8 f64 refs (float arithmetic in the reward calc -> consistent with the f64-vs-exact-Rational
   ~5ppm hypothesis). No transition. Disk 166G, no nodes. #0 stays FIXING. NEXT WAKE: poll/process.

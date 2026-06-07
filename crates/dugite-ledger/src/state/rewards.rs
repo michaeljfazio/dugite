@@ -1162,6 +1162,90 @@ mod tests {
         );
     }
 
+    /// PRECISION TEST (mainnet ep246 ~5 ppm member under-distribution, #0).
+    ///
+    /// Hypothesis under test: the uniform, pool-independent ~-5.027 ppm
+    /// under-scaling of every member reward is caused by f64 (floating-point)
+    /// arithmetic in the member-reward pipeline, where Haskell uses EXACT
+    /// `Rational`. If true, the dugite `Rat` path should be measurably LOW
+    /// (~5 ppm) versus an independent exact-Rational reference.
+    ///
+    /// This test computes one large member reward at mainnet scale BOTH ways:
+    ///   (a) the dugite production path — the EXACT `Rat` (BigInt) chain used
+    ///       verbatim in `compute_reward_update` (rewards.rs:476-487):
+    ///         floor( (poolR - cost) * (1 - m) * member_stake / pool_stake )
+    ///   (b) an independent exact-Rational reference built from raw integers:
+    ///         floor( (poolR - cost) * (margin_den - margin_num) * member_stake
+    ///                / (margin_den * pool_stake) )
+    ///       collapsed into a single BigInt numerator / single BigInt
+    ///       denominator with ONE final integer floor — the canonical
+    ///       `rationalToCoinViaFloor` of
+    ///       `Cardano.Ledger.Shelley.Rewards.calcStakePoolMemberReward`:
+    ///         rationalToCoinViaFloor $ fromIntegral (f - cost) * (1 - m) * t / sigma
+    ///       with t = c/totalStake, sigma = poolStake/totalStake (totalStake
+    ///       cancels, leaving c/poolStake).
+    ///
+    /// RESULT: the two paths are BYTE-EQUAL for every scale tested. There is
+    /// NO f64 in the production member-reward path (`compute_reward_update`
+    /// uses `Rat` = BigInt rationals with a single `floor_u64` at the end),
+    /// so the precision hypothesis is FALSIFIED — a ~5 ppm uniform deficit
+    /// cannot originate in this arithmetic. The divergence lives in a SHARED
+    /// INPUT (most likely `poolR`/`max_pool` shape, `appPerf`, or `reward_pot`),
+    /// not in the float-vs-Rational distinction. See the module-level finding.
+    #[test]
+    fn test_member_reward_exact_rational_no_f64_precision_loss() {
+        use num_bigint::BigInt;
+
+        // Mainnet-scale inputs in the band of the reported member reward
+        // (koios=40_901_323_467 for stake1uxrx2qr8...). Exact values are not
+        // needed: the point is to prove the two exact paths AGREE at scale,
+        // i.e. no float rounding is hiding inside the dugite `Rat` chain.
+        let cases: &[(u64, u64, u64, i128, i128)] = &[
+            // (pool_reward(=poolR), cost, member_stake, margin_num, margin_den)
+            (5_000_000_000_000, 340_000_000, 9_000_000_000_000, 3, 100),
+            (2_728_459_704, 340_000_000, 1_597_168_222_937, 1, 20),
+            (123_456_789_012, 17_000_000, 998_877_665_544, 7, 1000),
+            (999_999_999_999, 0, 1_000_000_000_001, 0, 1),
+        ];
+        // A representative pool_active_stake (denominator). Chosen large so the
+        // ratio member_stake/pool_stake exercises a non-trivial fraction.
+        let pool_active_stake: u64 = 12_345_678_901_234;
+
+        for &(pool_reward, cost, member_stake, margin_num, margin_den) in cases {
+            let remainder = pool_reward.saturating_sub(cost);
+
+            // (a) dugite production path (copied verbatim from rewards.rs:480-486).
+            let one_minus_margin = Rat::from_i128(margin_den - margin_num, margin_den);
+            let member_frac = Rat::from_i128(member_stake as i128, pool_active_stake as i128);
+            let dugite = Rat::from_i128(remainder as i128, 1)
+                .mul(&one_minus_margin)
+                .mul(&member_frac)
+                .floor_u64();
+
+            // (b) independent exact-Rational reference: single BigInt fraction,
+            //     one integer floor. This is `rationalToCoinViaFloor` of
+            //     (f-cost)*(1-m)*c/poolStake with NO intermediate rounding.
+            let num = BigInt::from(remainder)
+                * BigInt::from(margin_den - margin_num)
+                * BigInt::from(member_stake);
+            let den = BigInt::from(margin_den) * BigInt::from(pool_active_stake);
+            let reference = {
+                let q = &num / &den; // BigInt floor for non-negative operands
+                u64::try_from(q).unwrap()
+            };
+
+            assert_eq!(
+                dugite, reference,
+                "dugite Rat member-reward path diverged from exact-Rational \
+                 reference for (poolR={pool_reward}, cost={cost}, \
+                 member_stake={member_stake}, margin={margin_num}/{margin_den}): \
+                 dugite={dugite}, reference={reference}. A non-zero delta here \
+                 would prove float precision loss; equality FALSIFIES the \
+                 ~5 ppm precision hypothesis."
+            );
+        }
+    }
+
     #[test]
     fn test_koios_operator_member_split() {
         let total_reward = 2_728_459_704u64;
