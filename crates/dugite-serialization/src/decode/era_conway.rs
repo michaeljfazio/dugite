@@ -205,7 +205,15 @@ fn decode_conway_block_mode(
     let aux_map = decode_aux_data_map(&mut r)?;
 
     // -------------------------------------------------------------------------
-    // 5. invalid_txs — set of tx indices that failed phase-1
+    // 5. invalid_txs — list of tx indices that failed phase-1.
+    //
+    // Despite the field name, this is a plain CDDL LIST, not a set:
+    // conway.cddl declares `invalid_transactions : [* transaction_index]`.
+    // Conway reuses `AlonzoBlockBody` (Alonzo BlockBody/Internal.hs), which
+    // decodes `isValIdxs :: [Int]` via plain `decodeList` and applies ONLY a
+    // range-check (`unless (all inRange isValIdxs) $ fail …`) — there is NO
+    // no-duplicate enforcement at any protocol version. Use lenient `read_set`
+    // so duplicate indices (e.g. `[0, 0]`) decode the same as Haskell.
     // -------------------------------------------------------------------------
     let invalid_tx_indices: Vec<u64> = r.read_set(|r| r.read_uint())?;
     let invalid_set: std::collections::HashSet<usize> =
@@ -528,7 +536,7 @@ fn decode_conway_tx_body(
         match key {
             0 => {
                 // inputs: set<transaction_input>  (tag 258 in Conway)
-                inputs = r.read_set(read_tx_input)?;
+                inputs = r.read_set_strict(read_tx_input)?;
             }
             1 => {
                 // outputs: [* transaction_output]
@@ -542,7 +550,7 @@ fn decode_conway_tx_body(
             }
             4 => {
                 // certificates: set<certificate>
-                certificates = r.read_set(|r| read_conway_certificate(r))?;
+                certificates = r.read_set_strict(|r| read_conway_certificate(r))?;
             }
             5 => {
                 // withdrawals: { reward_account => coin }
@@ -566,7 +574,7 @@ fn decode_conway_tx_body(
             }
             13 => {
                 // collateral inputs: set<transaction_input>
-                collateral = r.read_set(read_tx_input)?;
+                collateral = r.read_set_strict(read_tx_input)?;
             }
             14 => {
                 // Conway:  required_signers : set<addr_keyhash>
@@ -581,7 +589,7 @@ fn decode_conway_tx_body(
                 // the key-hash subset for Conway-shaped callers; the full
                 // credential list is surfaced through `guards` for Dijkstra+
                 // witness validation. Issue #475 Phase 3.5.
-                let parsed: Vec<Credential> = r.read_set(|r| {
+                let parsed: Vec<Credential> = r.read_set_strict(|r| {
                     let ty = r.peek_major()?;
                     match ty {
                         Type::Array | Type::ArrayIndef => read_stake_credential(r),
@@ -619,15 +627,20 @@ fn decode_conway_tx_body(
             }
             18 => {
                 // reference_inputs: set<transaction_input>
-                reference_inputs = r.read_set(read_tx_input)?;
+                reference_inputs = r.read_set_strict(read_tx_input)?;
             }
             19 => {
                 // voting_procedures: { voter => { gov_action_id => voting_procedure } }
                 voting_procedures = read_voting_procedures(r)?;
             }
             20 => {
-                // proposal_procedures: set<proposal_procedure>
-                proposal_procedures = r.read_set(|r| read_proposal_procedure(r))?;
+                // proposal_procedures: OSet<proposal_procedure>
+                //
+                // Conway encodes this as an *ordered* set. The no-duplicate
+                // count-check applies to any set/oset, and `read_set_strict`
+                // preserves wire order (it only rejects duplicates, never
+                // reorders), so the OSet ordering is unchanged.
+                proposal_procedures = r.read_set_strict(|r| read_proposal_procedure(r))?;
             }
             21 => {
                 // current_treasury_value
@@ -820,7 +833,7 @@ fn decode_sub_tx_body(
         match key {
             0 => {
                 // spend inputs: set<transaction_input>  (tag 258 in Dijkstra)
-                sub.inputs = r.read_set(read_tx_input)?;
+                sub.inputs = r.read_set_strict(read_tx_input)?;
             }
             1 => {
                 // outputs
@@ -836,7 +849,7 @@ fn decode_sub_tx_body(
                 sub.validity_interval_start = Some(SlotNo(r.read_uint()?));
             }
             18 => {
-                sub.reference_inputs = r.read_set(read_tx_input)?;
+                sub.reference_inputs = r.read_set_strict(read_tx_input)?;
             }
             // Other Dijkstra SubTx keys (4 certs, 5 withdrawals, 9 mint,
             // 11 script_integrity_hash, 14 guards, 15 network_id, 19/20
@@ -1548,7 +1561,7 @@ fn read_pool_params(r: &mut Reader<'_>) -> Result<PoolParams, SerializationError
     let cost = read_lovelace(r)?;
     let margin = r.read_rational()?;
     let reward_account = r.read_bytes_owned()?;
-    let pool_owners: Vec<Hash28> = r.read_set(|r| read_hash28_cert(r))?;
+    let pool_owners: Vec<Hash28> = r.read_set_strict(|r| read_hash28_cert(r))?;
     // relays: definite OR indefinite-length array — see #673 / era_shelley.rs.
     //
     // Issue #670: decode relays into `Relay` values (not skip) so the
@@ -1847,7 +1860,7 @@ fn read_gov_action(r: &mut Reader<'_>) -> Result<GovAction, SerializationError> 
             // UpdateCommittee
             let prev_action_id = read_optional_gov_action_id(r)?;
             // members_to_remove: set<credential>
-            let remove_list: Vec<Credential> = r.read_set(|r| read_stake_credential(r))?;
+            let remove_list: Vec<Credential> = r.read_set_strict(|r| read_stake_credential(r))?;
             // members_to_add: { credential => epoch }
             let add_pairs = r.read_map(|r| read_stake_credential(r), |r| r.read_uint())?;
             let members_to_add: BTreeMap<Credential, u64> = add_pairs.into_iter().collect();
@@ -2175,7 +2188,17 @@ fn decode_conway_witness_set(
         let key = r.read_uint()?;
         match key {
             0 => {
-                // vkey_witnesses: nonempty_set<vkeywitness> — tag(258) in Conway
+                // vkey_witnesses: nonempty_set<vkeywitness> — tag(258) in Conway.
+                //
+                // Conway reuses the Alonzo TxWits decoder (Conway/TxWits.hs:
+                // `type TxWits ConwayEra = AlonzoTxWits ConwayEra`). In
+                // Alonzo/TxWits.hs the no-duplicate enforcement for vkey
+                // witnesses (`addrWitsSetDecoder`) is gated at `natVersion @12`:
+                // `ifDecoderVersionAtLeast (natVersion @12)
+                //    nonEmptyNoDuplicatesDecoder nonEmptyDecoder`. At PV9-11
+                // Haskell silently dedups (`nonEmptyDecoder` = `Set.fromList`)
+                // and ACCEPTS a duplicate. Use lenient `read_set` so a dup-vkey
+                // tx that Haskell accepts at live-mainnet PV11 does not hard-fail.
                 vkey_witnesses = r.read_set(|r| {
                     let arr_len = r.read_array_header()?;
                     if !matches!(arr_len, Some(2)) {
@@ -2189,11 +2212,21 @@ fn decode_conway_witness_set(
                 })?;
             }
             1 => {
-                // native_scripts: nonempty_set<native_script> — tag(258) in Conway
+                // native_scripts: nonempty_set<native_script> — tag(258) in Conway.
+                //
+                // Alonzo/TxWits.hs `nativeScriptsDecoder` gates no-duplicate
+                // enforcement at `natVersion @12` (`noDuplicateNativeScriptsDecoder`);
+                // at PV9-11 it uses `decodeNonEmptyList` + `Map.fromList`, which
+                // silently dedups and ACCEPTS a duplicate. Use lenient `read_set`.
                 native_scripts = r.read_set(|r| read_native_script(r))?;
             }
             2 => {
-                // bootstrap_witnesses: nonempty_set<bootstrap_witness> — tag(258) in Conway
+                // bootstrap_witnesses: nonempty_set<bootstrap_witness> — tag(258) in Conway.
+                //
+                // Bootstrap witnesses share `addrWitsSetDecoder` with vkey
+                // witnesses (Alonzo/TxWits.hs), so the no-duplicate rule is also
+                // gated at `natVersion @12`. At PV9-11 Haskell silently dedups
+                // and ACCEPTS a duplicate. Use lenient `read_set`.
                 bootstrap_witnesses = r.read_set(|r| {
                     let arr_len = r.read_array_header()?;
                     if !matches!(arr_len, Some(4)) {
@@ -2215,12 +2248,17 @@ fn decode_conway_witness_set(
             }
             3 => {
                 // plutus_v1_scripts: nonempty_set<plutus_v1_script> — tag(258) in Conway
-                plutus_v1_scripts = r.read_set(|r| r.read_bytes_owned())?;
+                plutus_v1_scripts = r.read_set_strict(|r| r.read_bytes_owned())?;
             }
             4 => {
-                // plutus_data: nonempty_set<plutus_data> — may be tag(258) on mainnet
+                // plutus_data: nonempty_set<plutus_data> — may be tag(258) on mainnet.
                 // Conway CDDL allows both plain-array and tag-258 set encoding.
-                // read_set() strips the optional tag-258 prefix before reading items.
+                //
+                // `TxDatsRaw` DecCBOR (Alonzo/TxWits.hs) gates its no-duplicate
+                // enforcement (`noDuplicatesDatsDecoder`) at `natVersion @12`;
+                // at PV9-11 it uses `decodeNonEmptyList` + `Map.fromElems hashData`,
+                // which silently dedups by hash and ACCEPTS a duplicate datum.
+                // Use lenient `read_set` (still strips the optional tag-258 prefix).
                 let pd_start = r.position();
                 plutus_data = r.read_set(|r| read_plutus_data(r))?;
                 raw_plutus_data_cbor = Some(r.slice_from(pd_start).to_vec());
@@ -2233,11 +2271,11 @@ fn decode_conway_witness_set(
             }
             6 => {
                 // plutus_v2_scripts: nonempty_set<plutus_v2_script> — tag(258) in Conway
-                plutus_v2_scripts = r.read_set(|r| r.read_bytes_owned())?;
+                plutus_v2_scripts = r.read_set_strict(|r| r.read_bytes_owned())?;
             }
             7 => {
                 // plutus_v3_scripts: nonempty_set<plutus_v3_script> — tag(258) in Conway
-                plutus_v3_scripts = r.read_set(|r| r.read_bytes_owned())?;
+                plutus_v3_scripts = r.read_set_strict(|r| r.read_bytes_owned())?;
             }
             _ => {
                 // Haskell cardano-ledger decodes the witness set via SparseKeyed
@@ -3294,6 +3332,274 @@ mod tests {
             matches!(result, Err(SerializationError::CborDecode(_))),
             "unknown witness-set key must be rejected, got {result:?}"
         );
+    }
+
+    // ── Conway PV9+ Set duplicate rejection (backlog #31-C) ────────────────────
+
+    /// Build a Conway transaction_input `[hash32, index]`.
+    fn conway_input(hash_byte: u8, index: u64) -> Vec<u8> {
+        cbor_arr(&[&cbor_bytes(&[hash_byte; 32]), &cbor_uint(index)])
+    }
+
+    #[test]
+    fn conway_body_duplicate_input_rejected() {
+        // map(1) { 0: tag(258) [in, in] } — the SAME input twice.
+        // At PV9+ `inputs` is a Set and a duplicate must hard-fail the decode.
+        let input = conway_input(0xaa, 0);
+        let mut set = tag_258();
+        set.extend(vec![0x82]); // array(2)
+        set.extend(&input);
+        set.extend(&input);
+
+        let mut data = vec![0xa1]; // map(1)
+        data.extend(cbor_uint(0)); // key 0 = inputs
+        data.extend(&set);
+
+        let mut r = Reader::new(&data);
+        let result = decode_conway_tx_body(&mut r, Era::Conway);
+        assert!(
+            matches!(result, Err(SerializationError::CborDecode(_))),
+            "duplicate input in Conway set must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn conway_body_unique_inputs_accepted() {
+        // map(1) { 0: tag(258) [inA, inB] } — distinct inputs decode Ok and
+        // preserve wire order.
+        let mut set = tag_258();
+        set.extend(vec![0x82]); // array(2)
+        set.extend(&conway_input(0xaa, 0));
+        set.extend(&conway_input(0xbb, 1));
+
+        let mut data = vec![0xa1]; // map(1)
+        data.extend(cbor_uint(0));
+        data.extend(&set);
+
+        let mut r = Reader::new(&data);
+        let body = decode_conway_tx_body(&mut r, Era::Conway).expect("unique inputs decode");
+        assert_eq!(body.inputs.len(), 2);
+        assert_eq!(body.inputs[0].index, 0);
+        assert_eq!(body.inputs[1].index, 1);
+    }
+
+    #[test]
+    fn conway_body_duplicate_certificate_rejected() {
+        // map(1) { 4: tag(258) [cert, cert] } — the SAME stake-reg cert twice.
+        // certificates is a Set in Conway; a duplicate must hard-fail.
+        let cert = {
+            // [7, [0, keyhash(28)], deposit] = Conway stake registration
+            let mut c = vec![0x83];
+            c.extend(cbor_uint(7));
+            let mut cred = vec![0x82];
+            cred.extend(cbor_uint(0));
+            cred.extend(cbor_bytes(&[0x11; 28]));
+            c.extend(&cred);
+            c.extend(cbor_uint(2_000_000));
+            c
+        };
+        let mut set = tag_258();
+        set.extend(vec![0x82]); // array(2)
+        set.extend(&cert);
+        set.extend(&cert);
+
+        let mut data = vec![0xa1]; // map(1)
+        data.extend(cbor_uint(4)); // key 4 = certificates
+        data.extend(&set);
+
+        let mut r = Reader::new(&data);
+        let result = decode_conway_tx_body(&mut r, Era::Conway);
+        assert!(
+            matches!(result, Err(SerializationError::CborDecode(_))),
+            "duplicate certificate in Conway set must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn conway_body_duplicate_required_signer_rejected() {
+        // map(1) { 14: tag(258) [h28, h28] } — the SAME required signer twice.
+        // required_signers (key 14) is a Set in Conway; duplicate must fail.
+        let signer = cbor_bytes(&[0x33; 28]);
+        let mut set = tag_258();
+        set.extend(vec![0x82]); // array(2)
+        set.extend(&signer);
+        set.extend(&signer);
+
+        let mut data = vec![0xa1]; // map(1)
+        data.extend(cbor_uint(14)); // key 14 = required_signers
+        data.extend(&set);
+
+        let mut r = Reader::new(&data);
+        let result = decode_conway_tx_body(&mut r, Era::Conway);
+        assert!(
+            matches!(result, Err(SerializationError::CborDecode(_))),
+            "duplicate required_signer in Conway set must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn conway_witness_set_duplicate_vkey_accepted_lenient() {
+        // map(1) { 0: tag(258) [vkw, vkw] } — the SAME vkeywitness twice.
+        //
+        // Conway reuses the Alonzo TxWits decoder; `addrWitsSetDecoder`
+        // (Alonzo/TxWits.hs) gates no-duplicate enforcement at `natVersion @12`.
+        // At PV9-11 Haskell silently dedups (`nonEmptyDecoder` = `Set.fromList`)
+        // and ACCEPTS the tx. Live mainnet is PV11, so this MUST decode Ok — a
+        // hard-fail here would split the chain. dugite retains both physical
+        // elements (len == 2) rather than deduping; the decode succeeds either
+        // way, which is the consensus-relevant property.
+        let vkw = cbor_arr(&[&cbor_bytes(&[0x44; 32]), &cbor_bytes(&[0x55; 64])]);
+        let mut set = tag_258();
+        set.extend(vec![0x82]); // array(2)
+        set.extend(&vkw);
+        set.extend(&vkw);
+
+        let mut data = vec![0xa1]; // map(1)
+        data.extend(cbor_uint(0)); // key 0 = vkey_witnesses
+        data.extend(&set);
+
+        let mut r = Reader::new(&data);
+        let ws = decode_conway_witness_set(&mut r)
+            .expect("duplicate vkey witness must decode Ok at PV9-11 (Haskell accepts)");
+        assert_eq!(
+            ws.vkey_witnesses.len(),
+            2,
+            "lenient read_set retains both physical vkey witnesses"
+        );
+    }
+
+    #[test]
+    fn conway_witness_set_duplicate_native_script_accepted_lenient() {
+        // map(1) { 1: tag(258) [ns, ns] } — the SAME native script twice.
+        //
+        // `nativeScriptsDecoder` (Alonzo/TxWits.hs) gates no-duplicate
+        // enforcement at `natVersion @12`; at PV9-11 it uses `decodeNonEmptyList`
+        // + `Map.fromList` which silently dedups and ACCEPTS. Must decode Ok.
+        // native_script [0, keyhash(28)] = ScriptPubkey.
+        let ns = cbor_arr(&[&cbor_uint(0), &cbor_bytes(&[0x88; 28])]);
+        let mut set = tag_258();
+        set.extend(vec![0x82]); // array(2)
+        set.extend(&ns);
+        set.extend(&ns);
+
+        let mut data = vec![0xa1]; // map(1)
+        data.extend(cbor_uint(1)); // key 1 = native_scripts
+        data.extend(&set);
+
+        let mut r = Reader::new(&data);
+        let ws = decode_conway_witness_set(&mut r)
+            .expect("duplicate native script must decode Ok at PV9-11 (Haskell accepts)");
+        assert_eq!(
+            ws.native_scripts.len(),
+            2,
+            "lenient read_set retains both physical native scripts"
+        );
+    }
+
+    #[test]
+    fn conway_witness_set_duplicate_bootstrap_accepted_lenient() {
+        // map(1) { 2: tag(258) [bw, bw] } — the SAME bootstrap witness twice.
+        //
+        // Bootstrap witnesses share `addrWitsSetDecoder` with vkey witnesses, so
+        // the no-duplicate rule is also gated at `natVersion @12`. At PV9-11
+        // Haskell silently dedups and ACCEPTS. Must decode Ok.
+        // bootstrap_witness = [vkey(32), sig(64), chain_code(32), attrs(bytes)].
+        let bw = cbor_arr(&[
+            &cbor_bytes(&[0x44; 32]),
+            &cbor_bytes(&[0x55; 64]),
+            &cbor_bytes(&[0x66; 32]),
+            &cbor_bytes(&[0x77; 8]),
+        ]);
+        let mut set = tag_258();
+        set.extend(vec![0x82]); // array(2)
+        set.extend(&bw);
+        set.extend(&bw);
+
+        let mut data = vec![0xa1]; // map(1)
+        data.extend(cbor_uint(2)); // key 2 = bootstrap_witnesses
+        data.extend(&set);
+
+        let mut r = Reader::new(&data);
+        let ws = decode_conway_witness_set(&mut r)
+            .expect("duplicate bootstrap witness must decode Ok at PV9-11 (Haskell accepts)");
+        assert_eq!(
+            ws.bootstrap_witnesses.len(),
+            2,
+            "lenient read_set retains both physical bootstrap witnesses"
+        );
+    }
+
+    #[test]
+    fn conway_witness_set_duplicate_plutus_data_accepted_lenient() {
+        // map(1) { 4: tag(258) [pd, pd] } — the SAME plutus datum twice.
+        //
+        // `TxDatsRaw` DecCBOR (Alonzo/TxWits.hs) gates `noDuplicatesDatsDecoder`
+        // at `natVersion @12`; at PV9-11 it uses `decodeNonEmptyList` +
+        // `Map.fromElems hashData` which silently dedups by hash and ACCEPTS.
+        // Must decode Ok. plutus_data = a small int constant here.
+        let pd = cbor_uint(42);
+        let mut set = tag_258();
+        set.extend(vec![0x82]); // array(2)
+        set.extend(&pd);
+        set.extend(&pd);
+
+        let mut data = vec![0xa1]; // map(1)
+        data.extend(cbor_uint(4)); // key 4 = plutus_data
+        data.extend(&set);
+
+        let mut r = Reader::new(&data);
+        let ws = decode_conway_witness_set(&mut r)
+            .expect("duplicate plutus datum must decode Ok at PV9-11 (Haskell accepts)");
+        assert_eq!(
+            ws.plutus_data.len(),
+            2,
+            "lenient read_set retains both physical plutus data"
+        );
+    }
+
+    #[test]
+    fn conway_block_invalid_tx_indices_duplicate_accepted_lenient() {
+        // The block `invalid_transactions` field is a plain CDDL list
+        // (`invalid_transactions : [* transaction_index]`), decoded by the
+        // reused `AlonzoBlockBody` via plain `decodeList` + a range-check ONLY —
+        // there is NO no-duplicate enforcement at any protocol version. So
+        // duplicate indices `[0, 0]` must decode Ok (the same expression the
+        // block decoder uses: `r.read_set(|r| r.read_uint())`).
+        //
+        // We exercise the exact decode expression directly rather than building
+        // a full Conway header, which is not constructible by hand in a unit
+        // test.
+        let data = cbor_arr(&[&cbor_uint(0), &cbor_uint(0)]); // [0, 0]
+        let mut r = Reader::new(&data);
+        let indices: Vec<u64> = r
+            .read_set(|r| r.read_uint())
+            .expect("duplicate invalid-tx indices must decode Ok (plain list, no no-dup)");
+        assert_eq!(
+            indices,
+            vec![0, 0],
+            "lenient read_set retains both duplicate indices"
+        );
+    }
+
+    #[test]
+    fn conway_witness_set_unique_vkeys_accepted() {
+        // Two distinct vkeywitnesses decode Ok and preserve wire order.
+        let vkw_a = cbor_arr(&[&cbor_bytes(&[0x44; 32]), &cbor_bytes(&[0x55; 64])]);
+        let vkw_b = cbor_arr(&[&cbor_bytes(&[0x66; 32]), &cbor_bytes(&[0x77; 64])]);
+        let mut set = tag_258();
+        set.extend(vec![0x82]); // array(2)
+        set.extend(&vkw_a);
+        set.extend(&vkw_b);
+
+        let mut data = vec![0xa1]; // map(1)
+        data.extend(cbor_uint(0));
+        data.extend(&set);
+
+        let mut r = Reader::new(&data);
+        let ws = decode_conway_witness_set(&mut r).expect("unique vkeys decode");
+        assert_eq!(ws.vkey_witnesses.len(), 2);
+        assert_eq!(ws.vkey_witnesses[0].vkey, vec![0x44; 32]);
+        assert_eq!(ws.vkey_witnesses[1].vkey, vec![0x66; 32]);
     }
 
     // ── treasury_value + donation ─────────────────────────────────────────────

@@ -225,6 +225,92 @@ impl<'b> Reader<'b> {
         self.read_array(item)
     }
 
+    /// Read a CBOR set, optionally prefixed with tag 258, **rejecting duplicate
+    /// elements** (Conway PV9+ semantics).
+    ///
+    /// This is the strict counterpart to [`read_set`]. Use it only at Conway-era
+    /// (and later) decoder sites, which are statically protocol-version 9 or
+    /// above. Pre-Conway eras must keep using the lenient [`read_set`].
+    ///
+    /// # Upstream parity
+    ///
+    /// `cardano-ledger-binary`'s `decodeSet` is protocol-version gated: at PV9+
+    /// it routes through `decodeSetEnforceNoDuplicates` →
+    /// `decodeListLikeEnforceNoDuplicates`, which decodes every physical array
+    /// element, inserts them into a `Set` (Ord-dedup), then does
+    /// `when (len /= count) $ fail` — where `count` is the number of physical
+    /// elements decoded and `len` is the size of the deduplicated `Set`. Any
+    /// duplicate makes `len < count` and hard-fails the whole decode. Pre-PV9 is
+    /// lenient (`Set.fromList` silently drops duplicates). Ordering is never
+    /// enforced (the tag-258 prefix is optional and elements are not required to
+    /// be sorted), so this method preserves wire order and only rejects dups.
+    ///
+    /// # Duplicate detection
+    ///
+    /// Duplicates are detected by the **raw CBOR byte span** of each decoded
+    /// element (captured via `position`/`slice_from`), tracked in a
+    /// `HashSet<Vec<u8>>`. For canonical on-chain CBOR this coincides exactly
+    /// with Haskell's value-`Ord` dedup, because each value has a single
+    /// canonical encoding. Residual edge: two *non-canonical* encodings of the
+    /// same value with *different* bytes would pass raw-byte dedup here but be
+    /// rejected by Haskell's value-`Ord` dedup — a theoretical adversarial case
+    /// that does not arise for canonically-encoded chain data.
+    pub fn read_set_strict<T, F>(&mut self, mut item: F) -> Result<Vec<T>, SerializationError>
+    where
+        F: FnMut(&mut Reader<'b>) -> Result<T, SerializationError>,
+    {
+        // Strip the optional tag-258 header exactly as `read_set` does.
+        let pos = self.inner.position();
+        let remaining = &self.origin[pos..];
+        if remaining.starts_with(&TAG_258_HEADER) {
+            self.inner.set_position(pos + 3);
+        }
+
+        // Decode the array body, counting physical elements and tracking the
+        // raw byte span of each so that any duplicate is a hard error.
+        let len = self.read_array_header()?;
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        match len {
+            Some(n) => {
+                let mut out = Vec::with_capacity(self.safe_alloc_capacity(n));
+                for _ in 0..n {
+                    let start = self.inner.position();
+                    let value = item(self)?;
+                    let raw = self.slice_from(start).to_vec();
+                    if !seen.insert(raw) {
+                        return Err(SerializationError::CborDecode(
+                            "set: duplicate element".to_string(),
+                        ));
+                    }
+                    out.push(value);
+                }
+                Ok(out)
+            }
+            None => {
+                // Indefinite-length: read until the break byte.
+                let mut out = Vec::new();
+                loop {
+                    let ty = self.peek_major()?;
+                    if ty == Type::Break {
+                        let pos = self.inner.position();
+                        self.inner.set_position(pos + 1);
+                        break;
+                    }
+                    let start = self.inner.position();
+                    let value = item(self)?;
+                    let raw = self.slice_from(start).to_vec();
+                    if !seen.insert(raw) {
+                        return Err(SerializationError::CborDecode(
+                            "set: duplicate element".to_string(),
+                        ));
+                    }
+                    out.push(value);
+                }
+                Ok(out)
+            }
+        }
+    }
+
     /// Read a definite- or indefinite-length CBOR array, decoding each item.
     ///
     /// For indefinite-length arrays the reader stops at the CBOR break byte (0xff).
@@ -1273,6 +1359,107 @@ mod tests {
         let total = data.len();
         let mut r = Reader::new(&data);
         r.read_set(|rr| rr.read_uint()).unwrap();
+        assert_eq!(r.position(), total);
+    }
+
+    // -----------------------------------------------------------------------
+    // read_set_strict — Conway PV9+ duplicate rejection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn read_set_strict_rejects_duplicate_untagged() {
+        // Plain array [1, 1] — duplicate element must hard-fail at PV9+.
+        let mut data = cbor_array_hdr(2);
+        data.extend(cbor_uint(1));
+        data.extend(cbor_uint(1));
+        let mut r = Reader::new(&data);
+        let res = r.read_set_strict(|rr| rr.read_uint());
+        assert!(res.is_err(), "duplicate in untagged set must be rejected");
+    }
+
+    #[test]
+    fn read_set_strict_rejects_duplicate_tagged() {
+        // tag(258) [1, 1] — duplicate element must hard-fail at PV9+.
+        let mut data = TAG_258_HEADER.to_vec();
+        data.extend(cbor_array_hdr(2));
+        data.extend(cbor_uint(1));
+        data.extend(cbor_uint(1));
+        let mut r = Reader::new(&data);
+        let res = r.read_set_strict(|rr| rr.read_uint());
+        assert!(res.is_err(), "duplicate in tag-258 set must be rejected");
+    }
+
+    #[test]
+    fn read_set_strict_accepts_unique() {
+        // tag(258) [1, 2, 3] — all distinct, decodes Ok, preserves wire order.
+        let mut data = TAG_258_HEADER.to_vec();
+        data.extend(cbor_array_hdr(3));
+        data.extend(cbor_uint(1));
+        data.extend(cbor_uint(2));
+        data.extend(cbor_uint(3));
+        let mut r = Reader::new(&data);
+        let set = r.read_set_strict(|rr| rr.read_uint()).unwrap();
+        assert_eq!(set, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn read_set_strict_accepts_unique_untagged() {
+        // Plain array [3, 1, 2] — distinct, order preserved (never reordered).
+        let mut data = cbor_array_hdr(3);
+        data.extend(cbor_uint(3));
+        data.extend(cbor_uint(1));
+        data.extend(cbor_uint(2));
+        let mut r = Reader::new(&data);
+        let set = r.read_set_strict(|rr| rr.read_uint()).unwrap();
+        assert_eq!(set, vec![3, 1, 2]);
+    }
+
+    #[test]
+    fn read_set_strict_empty() {
+        // tag(258) [] — empty set decodes Ok.
+        let mut data = TAG_258_HEADER.to_vec();
+        data.extend(cbor_array_hdr(0));
+        let mut r = Reader::new(&data);
+        let set: Vec<u64> = r.read_set_strict(|rr| rr.read_uint()).unwrap();
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn read_set_strict_position_after_tagged() {
+        // After a successful strict read, position must be past all bytes.
+        let mut data = TAG_258_HEADER.to_vec();
+        data.extend(cbor_array_hdr(2));
+        data.extend(cbor_uint(10));
+        data.extend(cbor_uint(20));
+        let total = data.len();
+        let mut r = Reader::new(&data);
+        r.read_set_strict(|rr| rr.read_uint()).unwrap();
+        assert_eq!(r.position(), total);
+    }
+
+    #[test]
+    fn read_set_strict_indefinite_rejects_duplicate() {
+        // Indefinite array [_ 5, 5] — duplicate must hard-fail.
+        let mut data = vec![0x9f]; // indefinite array open
+        data.extend(cbor_uint(5));
+        data.extend(cbor_uint(5));
+        data.push(CBOR_BREAK);
+        let mut r = Reader::new(&data);
+        let res = r.read_set_strict(|rr| rr.read_uint());
+        assert!(res.is_err(), "duplicate in indefinite set must be rejected");
+    }
+
+    #[test]
+    fn read_set_strict_indefinite_accepts_unique() {
+        // Indefinite array [_ 5, 6] — distinct, decodes Ok, break consumed.
+        let mut data = vec![0x9f]; // indefinite array open
+        data.extend(cbor_uint(5));
+        data.extend(cbor_uint(6));
+        data.push(CBOR_BREAK);
+        let total = data.len();
+        let mut r = Reader::new(&data);
+        let set = r.read_set_strict(|rr| rr.read_uint()).unwrap();
+        assert_eq!(set, vec![5, 6]);
         assert_eq!(r.position(), total);
     }
 
