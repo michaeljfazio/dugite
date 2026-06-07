@@ -209,7 +209,20 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:FIXING (reward_pot epoch_fees ~5ppm; root cause RE-LOCATED via data).
+- item: #0 (mainnet ep246 reserves) state:FIXING (uniform ~5ppm member-reward under-dist; PRECISION hypothesis).
+  *** wake236: VERIFY-THEN-FIX muscle w0oegi6uf REJECTED the epoch_fees hypothesis (source+arithmetic, NO fix): ssFee
+  is a single SnapShots field, reward_pot=ssFee<>deltaR1, dugite reads ep244 fees=587,936,590 entering ep246 = Haskell
+  byte-exact; AND a reward_pot error CANNOT yield both -55,269 treasury and -82.2M members (treasury_cut=tau*reward_pot
+  would move ~20M not 55K — DECOUPLED). So the -82.2M is a UNIFORM member-DISTRIBUTION under-scaling (-5.027 ppm,
+  pool-independent) that splits: reserves+82.27M (deltaR2) + treasury-55,269 (unregistered slice) — same effect
+  partitioned. ELIMINATED so far: apply_utxo_changes, rebuild/load/pointer, per-cred stake, epoch_fees, expansion,
+  member-fold logic. NARROWED to a GLOBAL multiplicative factor in the POOL/MEMBER reward FORMULA -> likely FLOAT(f64)
+  vs Haskell EXACT-Rational precision loss flooring low for every member (maxPool'/calcPoolReward/calcStakePoolMember
+  Reward + floor_u64 @rewards.rs:488). DROVE: launched PRECISION-localization muscle w5xpn4ju0 (run wf_f3ecfde1-c4c,
+  opus, rewards.rs reward arithmetic) with precision-test-FIRST: compute a known member reward f64-path vs exact-
+  Rational(BigInt) ref, assert f64 ~5ppm LOW; if already exact-Rational -> report '5ppm elsewhere (a0/k/appPerf)' +
+  STOP. NEXT WAKE: poll -> f64-loss confirmed+converted-to-Rational -> dump/reward-loop verify 15 Koios rewards ppm->0
+  + ep246 reserves==12880948865137767. (5 localization rounds; converging on the exact site.)
   *** wake233: DIAGNOSE wbqhzeczq COMPLETE — ROOT CAUSE RE-LOCATED (data-driven, HIGH confidence) to reward_pot
   epoch_fees, NOT apply_utxo_changes/stake. Dim-1's '-7.1M per-cred whale' was a SNAPSHOT-LAG ARTIFACT (dump ep245
   stake == Koios with one-epoch lag, byte-exact). Dim-2 (the correcting, rigorous result): every member reward is
@@ -1572,6 +1585,11 @@
 - wake235 2026-06-07: POLL #0 VERIFY-THEN-FIX muscle w0oegi6uf — still RUNNING (cargo pid 10828, build/test; 33
   epoch_fees/ss_fee refs in rewards.rs = working the fee area; last activity ~2min). No transition. Disk 157G. #0
   stays FIXING. NEXT WAKE: poll/process result.
+- wake236 2026-06-07: #0 w0oegi6uf REJECTED epoch_fees (dugite ssFee byte-exact; treasury/member DECOUPLED rules out
+  reward_pot). Narrowed: uniform pool-independent -5.027ppm member-DISTRIBUTION under-scaling (splits reserves+82.27M
+  deltaR2 + treasury-55,269 unregistered) -> GLOBAL factor in pool/member reward FORMULA -> likely f64-vs-exact-Rational
+  precision (maxPool'/calcStakePoolMemberReward/floor_u64). Launched PRECISION muscle w5xpn4ju0 (precision-test-first).
+  NEXT WAKE: poll -> f64-loss confirmed+Rational-fix -> verify. 5 localization rounds; converging.
 - wake234 2026-06-07: POLL #0 VERIFY-THEN-FIX muscle w0oegi6uf (reward_pot epoch_fees) — still RUNNING, ACTIVE
   (worktree present, rewards.rs; Koios fee tracing + ppm arithmetic + code). No transition. Disk 166G, no nodes. #0
   stays FIXING. NEXT WAKE: poll/process — fee discrepancy confirmed+fixed OR 'not localizable to fees' report.
