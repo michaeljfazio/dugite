@@ -209,7 +209,16 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:FIXING (polled wake301 — mirfix build linking dugite-node, recompiled dugite-ledger; re-replay next wake). DEFINITIVE root cause = MIR-before-SNAP ordering; fix applied (uncommitted).
+- item: #0 (mainnet ep246 reserves) state:MIRFIX-VERIFYING (build OK; verification re-replay pid 41385 launched wake302).
+  Build OK (release 1m38s, binary 19:24, recompiled dugite-ledger). Launched MIR-fix verification re-replay job
+  mainnet-mirfix-verify pid 41385 (from-genesis over CoW clone db-clones/mainnet-rupd-drop, NO instrumentation env,
+  dumps -> epoch-dumps-engine/mainnet-mirfix-verify). ~4min to ep246. NEXT WAKE: read mainnet-mirfix-verify/
+  epoch_000246.json -> ASSERT scalars.reserves == 12,880,948,865,137,767 (Koios) AND treasury == 292,077,855,298,344
+  AND ep213/245 still byte-exact (no regression from moving MIR before SNAP). If byte-exact -> gauntlet (muscle,
+  adversarial) -> revert ALL instrumentation (rewards.rs globals+poolstake+drop-trace, shelley.rs breakdown+percred+
+  paid-set, epoch.rs already reverted) -> commit CLEAN MIR-ordering fix (shelley.rs only, 1 crate) + push. If NOT exact
+  -> investigate (maybe also reserve-MIR or another boundary). #438: byte-exact ep246 + unregressed ep209-245 is the
+  ONLY acceptance. ALSO: re-validate ledger.mainnet+preprod frontiers (this likely fixes a broad MIR-boundary class).
   *** wake300 (ultracode): analyze muscle w3jqnacgp = **DEFINITIVE ROOT CAUSE (Koios-exact + Haskell-quoted): a MIR
   call-site ORDERING bug.** dd1971's -2,483,312,791 deficit splits 100% REWARD, 0% UTXO: Koios reward balance @ ep243
   = Σ(rewards spendable<=243)=124,461,009,403 minus Σ(withdrawals<=243)=89,153,454,360 = 35,307,555,043; dugite
@@ -3280,3 +3289,7 @@
   apply_pending_mir to after applyRUpd/before SNAP in shelley.rs; fixed L725 comment. cargo check CLEAN, building. FIX
   UNCOMMITTED until re-replay byte-exact + gauntlet. next wake: re-replay -> ep246 reserves==12880948865137767 +
   ep209-245 unregressed -> gauntlet -> revert instrumentation -> commit. LIKELY fixes a BROAD MIR-boundary class.
+- wake302 (ultracode): mirfix build OK (release 1m38s, binary 19:24, recompiled dugite-ledger). Launched MIR-fix
+  verification re-replay job mainnet-mirfix-verify pid 41385 (from-genesis CoW clone, no instrumentation, dumps->
+  mainnet-mirfix-verify). next wake: epoch_000246.json reserves==12880948865137767 + treasury==292077855298344 +
+  ep213/245 unregressed -> gauntlet -> revert instrumentation -> commit clean MIR-ordering fix.
