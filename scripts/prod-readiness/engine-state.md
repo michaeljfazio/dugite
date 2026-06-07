@@ -209,7 +209,7 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:PAID-SET-REPLAY2-RUNNING (live shelley.rs instrumentation VERIFIED in binary).
+- item: #0 (mainnet ep246 reserves) state:PAID-SET-REPLAY2-RUNNING (polled wake267 16:50 — replay pid 27902 at ep238, RUPD_DROP_TRACE FIRING (52, instrumentation live), ~8 ep from ep246; rupd_paid_246.txt imminent). GOTCHA: epoch-dumps-engine/mainnet-rupd-drop/ holds STALE dumps to ep270 from a prior run — gauge THIS run's progress from its OWN job log slot=, not the dump dir. User note wake267: 'live node only up to 223' — consistent (this replay was ~ep223-238 during the user's check); Koios REST covers ALL epochs + this from-genesis replay reaches ep246 itself, so a live reference node capped at 223 does NOT block the ep246 diff.
   *** wake266 (ultracode): deterministic foreground rebuild (touch shelley.rs + cargo build, 1m41s) -> strings-VERIFY
   PASSED: grep -ac DUGITE_RUPD_PAID_EPOCH = 1, rupd_paid_ = 1 (binary 16:46). The shelley.rs LIVE-path paid-set
   instrumentation IS now compiled in. Re-launched replay job mainnet-rupd-paid2 pid 27902 over KEPT CoW clone
