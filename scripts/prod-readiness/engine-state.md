@@ -162,7 +162,28 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-RESOAK (commit-A). *** wake160:
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:DIAGNOSING (mechanism REFUTED by replay; re-open).
+  *** wake161 VERDICT: the inline-datum fix is a NO-OP — REPLAY ARBITRATES. verify10A (FINAL-DONE + uplc
+  inline_spend_datum) synced PAST the window (tip 125108218 > 125105013) and shows 306 'Error term' = SAME as
+  verify10j's 297 (FINAL-DONE alone; +9 is just more blocks). The R1+R2 refuter mechanism (imported inline-datum
+  re-encode in resolve_spend_datum) is EMPIRICALLY WRONG. The fix agent's caveat was correct (V1/V2 txInfoData is
+  witness-only; InlineDatum.data already == read_plutus_data(raw_cbor) so resolution was never re-encoding). DROVE:
+  SIGTERM'd verify10A, REVERTED redeemer_resolve.rs from main (no-op, kept main clean; FINAL-DONE serialization+node
+  intact). LESSON: the wuoecuy7o diagnose's '2/20 spend imported inline-datum UTxOs' was CORRELATION not causation
+  (10% of script UTxOs at ep293 are imported inline-datum regardless) — replay is the only arbiter, as the cardinal
+  rule says.
+  *** RE-OPEN: the 306 phase-2 'Error term' (uplc says script-fail, on-chain is_valid=true) are NOT datum-resolution.
+  NEXT-WAKE re-diagnosis must be OPEN (do NOT assume import). DECISIVE BRANCH to settle: are these IMPORT-specific or
+  GENERAL-UPLC? Launch a DIAGNOSE/ANALYZE muscle to ROOT-CAUSE ONE representative failing tx (CASE1 10a0dbda20742f52
+  894b66af9cf8880271197a33df7be16f8a5f1039ac176e5d, slot 125009209): pull tx CBOR + spent script + datum + redeemer
+  via koios.sh preprod, run dugite UPLC CEK with tracing, find the EXACT divergence (candidates: serialiseData builtin
+  re-encoding non-canonical datum canonically [fix-agent hypothesis: on-chain Data carries memoised MemoBytes; dugite
+  structural Data re-encodes when script serialises/hashes it]; a wrong/missing ScriptContext field; cost-model/budget;
+  a specific builtin). IMPLICATIONS: if GENERAL-UPLC (not import) -> #10 phase-1 import (FINAL-DONE, 0 rejections) IS
+  DONE+separable -> gauntlet+commit FINAL-DONE (dugite-serialization+dugite-node, the (B) commit) as the WHOLE of #10,
+  and the 306 become a NEW phase-2-UPLC item; if IMPORT-specific -> #10 must fix it. DO NOT let the phase-2 mystery
+  keep blocking the byte-exact phase-1 import fix.
+  was: state:VERIFYING-RESOAK (commit-A). *** wake160:
   BUILD_EXIT=0 (combined binary 08:06: FINAL-DONE + uplc inline_spend_datum fix). DROVE: SIGTERM'd verify10j evidence
   node (clean "Shutdown complete"; its 297 count is in verify10j-resoak.log), GC'd verify10i (-CoW), CoW-cloned
   db-preprod-sync -> db-clones/preprod-verify10A, launched combined binary pid 98474 port 4211. Import byte-exact
@@ -1064,6 +1085,11 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake161 2026-06-07: #10 VERDICT = NO-OP. verify10A (FINAL-DONE+inline-fix) synced past window -> 306 'Error term'
+  == verify10j's 297 (unchanged). Inline-datum re-encode mechanism REFUTED BY REPLAY. SIGTERM'd verify10A, REVERTED
+  redeemer_resolve.rs (kept main clean, FINAL-DONE intact). VERIFYING-RESOAK -> DIAGNOSING (re-open, OPEN mind).
+  NEXT WAKE: launch diagnose muscle to root-cause ONE failing tx (10a0dbda, slot 125009209) via koios+CEK trace ->
+  settle IMPORT-specific vs GENERAL-UPLC. If general -> commit FINAL-DONE as #10(B) + file 306 as new phase-2 item.
 - wake160 2026-06-07: #10 BUILD_EXIT=0 -> VERIFYING-BUILDING -> VERIFYING-RESOAK. SIGTERM'd verify10j (clean),
   GC'd verify10i, cloned verify10A, launched combined binary pid 98474. Import OK (codec_version=1 Big, 0 phase-1).
   Still pre-window. NEXT WAKE VERDICT: count 'Error term' at slots 125001020+ -> ~0=works->gauntlet->commit(A);
