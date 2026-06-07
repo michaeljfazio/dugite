@@ -1215,6 +1215,9 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake170 2026-06-07: POLL #10 ANALYZE wezt2hemc (Haskell per-path disposition) — still RUNNING, ACTIVE (oracle
+  research on loadSnapshot/MemPack/BinaryData). No transition. No nodes; disk 184G. #10 stays DIAGNOSING. NEXT WAKE:
+  on analyze result -> fix (R3 keep; tag-4/5 opaque-no-redecode; harden TvarIterator/address/multi-asset).
 - wake169 2026-06-07: #10 RE-GAUNTLET wdvf5l5le = REFUTED 3/3 (substantive). R3 float-parse + TxIx/backend CONFIRMED
   byte-exact by all 3. VALID: (a) my no-silent-None tag-4/5 OVER-REJECTS vs Haskell opaque BinaryData (re-decodes +
   hard-errors where Haskell stores opaque) — INTRODUCED bug; (b) pre-existing silent paths TvarIterator mid-map
