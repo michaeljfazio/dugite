@@ -253,7 +253,23 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #23 (V1 txInfoData dedup) DONE (committed+pushed 9c53405384). V2 inline-datum residual filed as #24. NEXT WAKE: SCHEDULE.
+- item: #24 (PlutusV2 phase-2 residual) state:DIAGNOSING attempts:0 — muscle w90vykjte (BOUNDED) IN-FLIGHT; lock HELD (TTL 22m). #23-V1 DONE.
+  *** wake326 (ultracode): SCHEDULE #24 (continues phase-2 momentum, byte-exact-checkable via the same dumps). PREP (direct,
+  to bound the muscle + avoid the #23 muscle-death): the 194 still-diverging tx0 dumps = 88 "budget exhausted" (V2 MEM
+  over-cost) + 106 other-error (a DIFFERENT non-budget class). The V2 budget sample tx0-018686176a5c5117 is pv8, 11 utxos,
+  with NO witness plutus_data → dugite\'s txInfoData (built only from witness datums, where #23 fixed) is EMPTY here, so the
+  V2 over-cost is a DIFFERENT ScriptContext component (NOT txInfoData; the muscle\'s earlier "inline-datum→txInfoData"
+  hypothesis is suspect since that would UNDER-cost). dugite builds txInfoData via datums_to_plutus (tx_info_populate.rs:529)
+  from witness TxDats only. *** DRIVE: launched muscle analyze w90vykjte (run wf_937b64b0-b9f, 2 opus) with a TIGHTLY-BOUNDED
+  ANTI-DEATH brief: (a) EXPLICITLY forbade CEK instrumentation / measuring full consumed mem (the intractable path that
+  killed #23\'s muscle wogj8wp6h); (b) scoped to a STRUCTURAL code+spec comparison — find the ScriptContext/TxInfo component
+  dugite builds with a LARGER Data repr than Haskell Babbage transTxInfo (per-input/output-scaling: a Value shape, an
+  OutputDatum Constr, a reference-script Maybe, an address staking Maybe), reading era-rules/babbage.md first; (c) classify
+  the 106 other-error (run phase2_repro on 5, report the error class); (d) TIME-BOX, report top candidate even if uncertain.
+  *** NOTE: analyze-mode muscles edit the MAIN tree (no isolation — the #23 lesson) → on completion CHECK git status for any
+  fix/scratch the agent left + salvage. NEXT WAKE (on auto-notify): RECORD root-cause + residual classification → #24
+  DIAGNOSING→ROOT-CAUSED; salvage any applied fix. Lock held across async (overlapping cron skips; 22m TTL). If the muscle
+  hangs again (>20min, 0-byte output) → reclaim, salvage from transcript+tree, and consider diagnosing directly.
   *** wake325-cont (ultracode): #23 V1-part FIXING→VERIFYING→DONE. The salvaged txInfoData-dedup fix is VERIFIED: re-running
   the 363 tx0 #730 dumps at HEAD+fix → 363/363 diverge DROPS to 194 (169 now reproduce on-chain is_valid BYTE-EXACT — the
   cardinal-rule standard: divergence gone on re-run, not just tests-green); nextest -p dugite-uplc 441/441 (conformance +
