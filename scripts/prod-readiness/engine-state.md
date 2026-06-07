@@ -209,7 +209,24 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:COMMIT-PENDING (GAUNTLET PASSED; clean fix re-applied + fmt/clippy clean; nextest bv1lbm3iy running).
+- item: #21 (re-validate ledger frontiers post-MIR-fix) state:NEW — #0 IS DONE+PUSHED. Pick next wake.
+  *** wake306 (ultracode): **#0 DONE — COMMITTED + PUSHED (8c868271c9 -> prod-readiness-engine via HTTPS).** nextest
+  bv1lbm3iy GREEN (1521/1521, 0 fail). Fix = MIR-before-SNAP in eras/shelley.rs (the clean 1-file move; common.rs +218
+  pre-existing add/spend tests left uncommitted). #0 (mainnet ep246 reserves +82,270,482 / treasury -55,269), chased
+  ~63 wakes, RESOLVED: the apply_pending_mir call ran after the mark snapshot was built, excluding a boundary's
+  treasury/reserve-MIR credit from go.pool_stake -> total_active_stake (sigmaA denom) -> uniform ~4.99 ppm reward
+  under-scaling. Verified byte-exact (re-replay ep246 reserves==12,880,948,865,137,767 + treasury==292,077,855,298,344,
+  ep209-245 unregressed) + gauntlet-passed + 1521 tests. *** BROAD IMPACT: this bug fired at EVERY pre-Conway epoch
+  boundary with a pending treasury/reserve MIR -> LIKELY also resolves #2/#11 (mainnet stake-dereg/reserves residual)
+  and the reward/treasury #438-class divergences; #1 (ep57 preprod stake-distribution -10 ADA) may be SEPARATE (it was
+  a utxo-class hypothesis, but the standing prompt is now stale — recheck against the fix). NEXT WAKE: SCHEDULE #21 —
+  full from-genesis MAINNET re-replay with the FIX binary (rebuild clean first, NO instrumentation) -> diff ALL epochs
+  vs Koios totals to (a) confirm broad MIR-boundary class closed, (b) re-surface #20b (ep235 +318.2T reserve-MIR
+  transient — likely the SAME apply_pending_mir/MIR-source(reserves) path), (c) recheck #2/#3/#11. Then preprod
+  re-validate for #1. HOUSEKEEPING: instrumentation dump dirs (mainnet-globals/poolstake/percred/snapbd/mirfix-verify/
+  fix-verify) + CoW clone db-clones/mainnet-rupd-drop can be pruned to free disk. Filed #20c (epoch.rs test-path MIR
+  cleanup). Open items: #20b (ep235 reserve-MIR transient,H), #11/#2 (recheck), #16/#17/#19/#20 (snapshot adversarial),
+  #20c (cleanup), #1 (ep57 recheck).
   *** wake305 (ultracode): **GAUNTLET wodons7bq PASSED (pass=true, refuteCount=1/3).** Refuter1(haskell-semantics)+
   Refuter2(edge-epoch) NOT refuted: ordering matches Haskell applyRUpd->MIR->EPOCH(SNAP) exactly; Refuter2
   INDEPENDENTLY re-derived mainnet Koios via direct api.koios.rest -> ep246 reserves/treasury diff 0, reserve-MIR
@@ -3345,3 +3362,10 @@
   common.rs +218 = pre-existing add/spend regression tests (leave uncommitted). nextest bv1lbm3iy running. next wake:
   GREEN -> git add shelley.rs -> commit+push -> #0 DONE -> re-validate frontiers + reopen #2/#3/#11. Filed #20c
   (test-only epoch.rs MIR ordering cleanup).
+- wake306 (ultracode): *** #0 DONE — COMMITTED + PUSHED 8c868271c9 (prod-readiness-engine, HTTPS). *** nextest GREEN
+  1521/1521. Fix = MIR-before-SNAP (eras/shelley.rs, 1 file). #0 mainnet ep246 reserves +82,270,482 RESOLVED byte-exact
+  (~63-wake investigation: total_active_stake 4.99ppm-low because apply_pending_mir ran AFTER the snapshot, excluding
+  boundary treasury/reserve-MIR credits). BROAD: fires at every pre-Conway MIR boundary -> likely closes #2/#11 +
+  reward/treasury class. next wake: #21 full-mainnet re-replay w/ fix binary (NO instrumentation) -> diff all epochs vs
+  Koios (confirm broad fix + re-surface #20b ep235 reserve-MIR transient + recheck #2/#3/#11); then preprod for #1.
+  Prune instrumentation dump dirs + CoW clone to free disk. Filed #20c.
