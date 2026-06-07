@@ -209,9 +209,16 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves +82,270,482 / treasury -55,269) state:PARKED-WITH-ROOT-CAUSE -> NOW ACTIVE (see
-  backlog #0: member-reward fold must use a single resolved active-stake VMap like resolveActiveInstantStakeCredentials;
-  Tier A ledger). NEXT WAKE: launch ANALYZE or FIX muscle for #0 (deep ledger; pass diagnoseModel:'opus' if diagnosing).
+- item: #0 (mainnet ep246 reserves +82,270,482 / treasury -55,269) state:ANALYZING (re-verify before 4th fix attempt).
+  *** wake222: #15 done -> activated #0 (highest-impact: mainnet reserves byte-exactness). PARKED attempts:3, so per
+  the staleness lesson (#481/#438: don't trust a stale root-cause; HEAD-verify first) launched ANALYZE muscle
+  wuqv1kgo9 (run wf_e3e8f3af-92f, opus/ledger) to RE-VERIFY the member-reward-fold root cause (rewards.rs:445-490 two-
+  map vs Haskell single resolved-active-stake VMap resolveActiveInstantStakeCredentials) against Haskell source +
+  epoch-dumps-engine/mainnet-ep213/ + Koios (reserves==12880948865137767 @ep246), characterize WHY the 2 maps
+  disagree for the divergent cred, hypothesize why the 3 prior fixes failed, and produce a discrete fix + verification
+  harness plan (full mainnet replay vs DUGITE_REWARD_DBG dump-loop). NEXT WAKE: read verdict -> if root cause confirmed
+  + harness available -> FIX (Tier A, careful); if harness needs a mainnet db at ep246, assess availability first.
+  NOTE: #0 verification is HEAVY (mainnet replay to ep246) — different from the preprod fast-start harness.
   *** ===== #15 DONE — COMMITTED 117c41e5f5 + PUSHED (prod-readiness-engine, HTTPS) wake221. =====
   GAUNTLET w4ou064y2 PASSED clean (pass=true, refuteCount=0; all 3 refuters source-verified byte-exact: getBabbage
   SpendingDatum precedence, CIP-0069 None-handling, datum-hash verbatim-vs-canonical separation, serialiseData stays
@@ -1500,6 +1507,10 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
+- wake222 2026-06-07: #15 done -> #0 ACTIVE (mainnet ep246 reserves). PARKED attempts:3 -> per staleness lesson,
+  launched ANALYZE muscle wuqv1kgo9 (opus) to RE-VERIFY the member-reward-fold root cause vs Haskell resolveActive
+  InstantStakeCredentials + characterize the 2-map disagreement + why 3 prior fixes failed + fix/harness plan. NEXT
+  WAKE: read verdict -> fix (careful Tier A) or assess mainnet-ep246 harness availability first. #0 verification HEAVY.
 - wake221 2026-06-07: ***** #15 DONE — COMMITTED 117c41e5f5 + PUSHED *****. Re-gauntlet w4ou064y2 PASSED clean (0/3
   refuted; all source-verified byte-exact vs getBabbageSpendingDatum/toPlutusV3Args). CI gate green (fmt+clippy+uplc
   435). Committed 2 files/1 crate (dugite-uplc). #15 closes phase-2 serialiseData: 306 ep293 'Error term' -> 0 (V3
