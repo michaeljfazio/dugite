@@ -1458,6 +1458,9 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
+- wake214 2026-06-07: POLL #15 ANALYZE wpkh7n7c9 (serialiseData canonical-vs-verbatim + encode_data delta) — still
+  RUNNING (research stage, last activity 9s). No transition. Disk 169G, no nodes. #15 stays DIAGNOSING. NEXT WAKE:
+  on verdict -> likely revert memo + fix encode_data.
 - wake213 2026-06-07: #15 GAUNTLET w4a16gr1r REFUTED 3/3 (PROFOUND). R1: serialiseData builtin = PlutusCore-CANONICAL
   encodeData (getPlutusData strips MemoBytes), NOT verbatim -> the memo is likely the WRONG approach; real bug =
   dugite encode_data != PlutusCore encodeData (270 vs 276). Replay passed for the wrong reason (ep293 datums already
