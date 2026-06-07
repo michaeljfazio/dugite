@@ -1092,7 +1092,14 @@ fn decode_shelley_witness_set(
                 })?;
             }
             _ => {
-                r.skip()?;
+                // Haskell cardano-ledger decodes the witness set via SparseKeyed
+                // with field-picker `txWitnessField n = invalidField n`, so an
+                // unknown map key hard-fails the decode (invalidField -> Invalid n
+                // -> invalidKey -> cborError). Not version-gated — reject in every
+                // era. Mirror that strictness here instead of silently skipping.
+                return Err(SerializationError::CborDecode(format!(
+                    "witness set: unknown key {key}"
+                )));
             }
         }
     }
@@ -2439,13 +2446,18 @@ mod tests {
     }
 
     #[test]
-    fn shelley_witness_set_unknown_key_skipped() {
-        // ws = {99: 0} — unknown key, value uint(0). Decoder must skip and return empty ws.
+    fn shelley_witness_set_unknown_key_rejected() {
+        // ws = {99: 0} — unknown key, value uint(0). Haskell cardano-ledger
+        // SparseKeyed (txWitnessField n = invalidField n) hard-fails an unknown
+        // witness-set map key, so dugite must reject the block decode too.
         let mut ws = vec![0xa1];
         ws.extend(cbor_uint(99));
         ws.extend(cbor_uint(0));
-        let block = decode_shelley_block(&shelley_block_with_witness_set(&ws)).unwrap();
-        assert!(block.transactions[0].witness_set.vkey_witnesses.is_empty());
+        let result = decode_shelley_block(&shelley_block_with_witness_set(&ws));
+        assert!(
+            result.is_err(),
+            "unknown witness-set key must be rejected, got {result:?}"
+        );
     }
 
     #[test]

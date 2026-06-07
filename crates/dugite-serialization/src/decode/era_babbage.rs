@@ -908,7 +908,14 @@ fn decode_babbage_witness_set(
                 plutus_v2_scripts = r.read_array(|r| r.read_bytes_owned())?;
             }
             _ => {
-                r.skip()?;
+                // Haskell cardano-ledger decodes the witness set via SparseKeyed
+                // with field-picker `txWitnessField n = invalidField n`, so an
+                // unknown map key hard-fails the decode (invalidField -> Invalid n
+                // -> invalidKey -> cborError). Not version-gated — reject in every
+                // era. Mirror that strictness here instead of silently skipping.
+                return Err(SerializationError::CborDecode(format!(
+                    "witness set: unknown key {key}"
+                )));
             }
         }
     }
@@ -1578,13 +1585,18 @@ mod tests {
     }
 
     #[test]
-    fn babbage_witness_set_unknown_key_skipped() {
+    fn babbage_witness_set_unknown_key_rejected() {
+        // Haskell cardano-ledger SparseKeyed (txWitnessField n = invalidField n)
+        // hard-fails an unknown witness-set map key. dugite must reject too.
         let mut ws = vec![0xa1];
         ws.extend(cbor_uint(99));
         ws.extend(cbor_uint(0));
         let mut r = Reader::new(&ws);
-        let result = decode_babbage_witness_set(&mut r).unwrap();
-        assert!(result.vkey_witnesses.is_empty());
+        let result = decode_babbage_witness_set(&mut r);
+        assert!(
+            matches!(result, Err(SerializationError::CborDecode(_))),
+            "unknown witness-set key must be rejected, got {result:?}"
+        );
     }
 
     // ── Babbage standalone tx ─────────────────────────────────────────────
