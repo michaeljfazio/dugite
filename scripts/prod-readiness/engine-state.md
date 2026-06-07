@@ -209,7 +209,24 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:DIAGNOSING (round-3 data-comparison; 2 code rounds RULED OUT).
+- item: #0 (mainnet ep246 reserves) state:FIXING (reward_pot epoch_fees ~5ppm; root cause RE-LOCATED via data).
+  *** wake233: DIAGNOSE wbqhzeczq COMPLETE — ROOT CAUSE RE-LOCATED (data-driven, HIGH confidence) to reward_pot
+  epoch_fees, NOT apply_utxo_changes/stake. Dim-1's '-7.1M per-cred whale' was a SNAPSHOT-LAG ARTIFACT (dump ep245
+  stake == Koios with one-epoch lag, byte-exact). Dim-2 (the correcting, rigorous result): every member reward is
+  uniformly under-scaled by -5.027 ppm (15 creds across DIFFERENT pools, stdev 0.0051 ppm, e.g. stake1uxrx2qr8...
+  dugite=40901117728 koios=40901323467 d=-205739). Pool-INDEPENDENT constant -> NOT sigma/stake (both byte-exact:
+  go.totalActiveStake=21,956,097,174,685,676, totalStake, appPerf all byte-exact) -> localizes to reward_pot (rewards.
+  rs:244 = expansion+epoch_fees-treasury_cut). expansion correct (ep245 reserves byte-exact) -> the ~5ppm is in the
+  EPOCH_FEES/ss_fee term (rewards.rs:184). Haskell uses the GO-snapshot ssFee (TWO-EPOCH LAG), not live fees.
+  *** CRITICAL LESSON: analyze-1 (wuqv1kgo9) WRONGLY 'ruled out' rewards.rs/reward_pot and pointed at apply_utxo_changes
+  -> rounds 1-2 chased red herrings (usefully proved apply_utxo_changes/rebuild correct + added regression tests, but
+  not the bug). The DATA-comparison (dim-2 cross-check) found the real cause AND corrected dim-1's lag artifact. Don't
+  trust 'ruled out' without data. *** The 3 prior #0 fixes failed in the member-fold (445-490); the REAL site is the
+  reward_pot epoch_fees scalar (184) — a DIFFERENT site. DROVE: launched VERIFY-THEN-FIX muscle w0oegi6uf (run
+  wf_656d4f7e-345, opus, rewards.rs reward_pot/epoch_fees only) with discipline: trace dugite's epoch_fees source vs
+  Koios epoch_info fees @244/245/246, confirm swapping to the GO-snapshot ssFee gives +5.027ppm == +82,215,213 deficit
+  (+ tau-cut == treasury -55,269), ONLY then fix; if not localizable to fees -> report (maybe a reward_pot precision
+  issue) + STOP. NEXT WAKE: poll -> verified+fixed -> dump/reward-loop verify ep246 reserves==12880948865137767.
   *** wake231: ROUND-2 muscle wr9tddl4q RESULT = rebuild/genesis-load/pointer ALSO correct (2 invariant tests PASS:
   rebuild_stake_distribution == incremental per-cred across base/script/pointer/Byron + aliasing hashes; genesis-load-
   then-spend == rebuild). Static: state::stake_routing == common::stake_routing == Credential::to_typed_hash32; rebuild
@@ -1552,6 +1569,12 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
+- wake233 2026-06-07: #0 DIAGNOSE wbqhzeczq COMPLETE -> ROOT CAUSE RE-LOCATED (data-driven) to reward_pot EPOCH_FEES
+  ~5ppm (rewards.rs:184), NOT apply_utxo_changes/stake. Dim-2: uniform pool-independent -5.027 ppm under-scaling of
+  every member reward (stake byte-exact). Haskell uses GO-snapshot ssFee (2-epoch lag). analyze-1 wrongly ruled out
+  rewards.rs -> rounds 1-2 chased red herrings. Launched VERIFY-THEN-FIX w0oegi6uf (epoch_fees source vs Koios; confirm
+  ppm arithmetic before fixing). NEXT WAKE: poll -> verify+fix -> dump-verify ep246 reserves. LESSON: don't trust
+  'ruled out' without data; the data-comparison diagnose found it.
 - wake232 2026-06-07: POLL #0 ROUND-3 DATA-comparison diagnose wbqhzeczq — still RUNNING (0/2 dims, active; Koios
   per-account active-stake resolution + hex->bech32 is rate-limited). No transition. Disk 166G, no nodes. #0 stays
   DIAGNOSING. NEXT WAKE: on found dugite!=Koios credential -> trace class -> fix.
