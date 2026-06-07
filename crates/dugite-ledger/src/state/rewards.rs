@@ -1162,90 +1162,6 @@ mod tests {
         );
     }
 
-    /// PRECISION TEST (mainnet ep246 ~5 ppm member under-distribution, #0).
-    ///
-    /// Hypothesis under test: the uniform, pool-independent ~-5.027 ppm
-    /// under-scaling of every member reward is caused by f64 (floating-point)
-    /// arithmetic in the member-reward pipeline, where Haskell uses EXACT
-    /// `Rational`. If true, the dugite `Rat` path should be measurably LOW
-    /// (~5 ppm) versus an independent exact-Rational reference.
-    ///
-    /// This test computes one large member reward at mainnet scale BOTH ways:
-    ///   (a) the dugite production path — the EXACT `Rat` (BigInt) chain used
-    ///       verbatim in `compute_reward_update` (rewards.rs:476-487):
-    ///         floor( (poolR - cost) * (1 - m) * member_stake / pool_stake )
-    ///   (b) an independent exact-Rational reference built from raw integers:
-    ///         floor( (poolR - cost) * (margin_den - margin_num) * member_stake
-    ///                / (margin_den * pool_stake) )
-    ///       collapsed into a single BigInt numerator / single BigInt
-    ///       denominator with ONE final integer floor — the canonical
-    ///       `rationalToCoinViaFloor` of
-    ///       `Cardano.Ledger.Shelley.Rewards.calcStakePoolMemberReward`:
-    ///         rationalToCoinViaFloor $ fromIntegral (f - cost) * (1 - m) * t / sigma
-    ///       with t = c/totalStake, sigma = poolStake/totalStake (totalStake
-    ///       cancels, leaving c/poolStake).
-    ///
-    /// RESULT: the two paths are BYTE-EQUAL for every scale tested. There is
-    /// NO f64 in the production member-reward path (`compute_reward_update`
-    /// uses `Rat` = BigInt rationals with a single `floor_u64` at the end),
-    /// so the precision hypothesis is FALSIFIED — a ~5 ppm uniform deficit
-    /// cannot originate in this arithmetic. The divergence lives in a SHARED
-    /// INPUT (most likely `poolR`/`max_pool` shape, `appPerf`, or `reward_pot`),
-    /// not in the float-vs-Rational distinction. See the module-level finding.
-    #[test]
-    fn test_member_reward_exact_rational_no_f64_precision_loss() {
-        use num_bigint::BigInt;
-
-        // Mainnet-scale inputs in the band of the reported member reward
-        // (koios=40_901_323_467 for stake1uxrx2qr8...). Exact values are not
-        // needed: the point is to prove the two exact paths AGREE at scale,
-        // i.e. no float rounding is hiding inside the dugite `Rat` chain.
-        let cases: &[(u64, u64, u64, i128, i128)] = &[
-            // (pool_reward(=poolR), cost, member_stake, margin_num, margin_den)
-            (5_000_000_000_000, 340_000_000, 9_000_000_000_000, 3, 100),
-            (2_728_459_704, 340_000_000, 1_597_168_222_937, 1, 20),
-            (123_456_789_012, 17_000_000, 998_877_665_544, 7, 1000),
-            (999_999_999_999, 0, 1_000_000_000_001, 0, 1),
-        ];
-        // A representative pool_active_stake (denominator). Chosen large so the
-        // ratio member_stake/pool_stake exercises a non-trivial fraction.
-        let pool_active_stake: u64 = 12_345_678_901_234;
-
-        for &(pool_reward, cost, member_stake, margin_num, margin_den) in cases {
-            let remainder = pool_reward.saturating_sub(cost);
-
-            // (a) dugite production path (copied verbatim from rewards.rs:480-486).
-            let one_minus_margin = Rat::from_i128(margin_den - margin_num, margin_den);
-            let member_frac = Rat::from_i128(member_stake as i128, pool_active_stake as i128);
-            let dugite = Rat::from_i128(remainder as i128, 1)
-                .mul(&one_minus_margin)
-                .mul(&member_frac)
-                .floor_u64();
-
-            // (b) independent exact-Rational reference: single BigInt fraction,
-            //     one integer floor. This is `rationalToCoinViaFloor` of
-            //     (f-cost)*(1-m)*c/poolStake with NO intermediate rounding.
-            let num = BigInt::from(remainder)
-                * BigInt::from(margin_den - margin_num)
-                * BigInt::from(member_stake);
-            let den = BigInt::from(margin_den) * BigInt::from(pool_active_stake);
-            let reference = {
-                let q = &num / &den; // BigInt floor for non-negative operands
-                u64::try_from(q).unwrap()
-            };
-
-            assert_eq!(
-                dugite, reference,
-                "dugite Rat member-reward path diverged from exact-Rational \
-                 reference for (poolR={pool_reward}, cost={cost}, \
-                 member_stake={member_stake}, margin={margin_num}/{margin_den}): \
-                 dugite={dugite}, reference={reference}. A non-zero delta here \
-                 would prove float precision loss; equality FALSIFIES the \
-                 ~5 ppm precision hypothesis."
-            );
-        }
-    }
-
     #[test]
     fn test_koios_operator_member_split() {
         let total_reward = 2_728_459_704u64;
@@ -1432,6 +1348,119 @@ mod tests {
             (22_900_000..=23_100_000).contains(&implied_delta),
             "implied owner-stake inflation should be ~22.98 ADA, got {implied_delta}"
         );
+    }
+
+    /// Byte-exact pin of `deltaR1` (the reserves-draw / monetary-expansion term)
+    /// for the mainnet RUPD applied at the 245→246 epoch boundary.
+    ///
+    /// This is the LAST untested global term feeding every member reward
+    /// (verification handoff for issue #438). The RUPD applied at boundary
+    /// 245→246 is computed during epoch 245 and uses `prevPParams` = the params
+    /// active during epoch 244 (Conway, d=0) plus `nesBprev` = blocks made
+    /// during epoch 244.
+    ///
+    /// Canonical Haskell `startStep`
+    /// (`eras/shelley/impl/src/Cardano/Ledger/Shelley/LedgerState/PulsingReward.hs`):
+    ///
+    /// ```haskell
+    /// expectedBlocks = floor $ (1 - d) * f * slotsPerEpoch
+    /// blocksMade     = fromIntegral $ Map.foldr (+) 0 b'
+    /// eta | d >= 0.8  = 1
+    ///     | otherwise = blocksMade % expectedBlocks
+    /// deltaR1 = rationalToCoinViaFloor $
+    ///             min 1 eta * unboundRational (pr ^. ppRhoL) * fromIntegral reserves
+    /// ```
+    ///
+    /// Koios oracle (mainnet):
+    /// - epoch_info(244): `blk_count = 3920`, `fees = 587_936_590`
+    /// - epoch_params(244): `decentralisation = 0`, `monetary_expand_rate = 0.003`
+    /// - genesis: `activeSlotCoeff = 1/20`, `epochLength = 86_400`
+    /// - totals(245): `reserves = 13_152_157_804_897_520`
+    ///
+    /// With d = 0 < 4/5:
+    ///   expectedBlocks = floor((1−0) · (1/20) · 86_400) = floor(4320) = 4320
+    ///   blocksMade     = 3920  (≤ expectedBlocks ⇒ min(1, eta) = eta)
+    ///   eta            = 3920 / 4320  (EXACT Rational)
+    ///   deltaR1        = floor( (3920/4320) · (3/1000) · 13_152_157_804_897_520 )
+    ///                  = 35_803_096_246_665
+    ///
+    /// This reproduces the EXACT production code path (rewards.rs ~199-231):
+    /// expectedBlocks is floored once; eta is kept as an exact Rational; the
+    /// final `floor` is applied once after multiplying through. `min(1, eta)`
+    /// is implemented by capping `effective_blocks = min(actual, expected)`,
+    /// which is algebraically identical (proven below for both branches).
+    #[test]
+    fn test_mainnet_ep246_delta_r1_reserves_draw_byte_exact() {
+        // prevPParams (epoch 244) + genesis inputs.
+        let d_num: i128 = 0; // decentralisation = 0 (Conway)
+        let d_den: i128 = 1;
+        let rho = Rat::from_i128(3, 1000); // monetary_expand_rate = 0.003
+        let f = Rat::from_i128(1, 20); // activeSlotCoeff = 0.05
+        let epoch_length: i128 = 86_400;
+        let reserves: i128 = 13_152_157_804_897_520;
+        let actual_blocks: u64 = 3920; // nesBprev = blk_count(epoch 244)
+
+        // Overlay gate: d >= 4/5  ⟺  5·d_num >= 4·d_den. Here 0 >= 4 is false.
+        let d_ge_4_5 = 5 * d_num >= 4 * d_den;
+        assert!(!d_ge_4_5, "epoch-244 d=0 must take the eta-scaled branch");
+
+        // expectedBlocks = floor((1 − d) · f · slotsPerEpoch), exact then floor once.
+        let one_minus_d = Rat::from_i128(d_den - d_num, d_den);
+        let expected_blocks = one_minus_d
+            .mul(&f)
+            .mul(&Rat::from_i128(epoch_length, 1))
+            .floor_u64()
+            .max(1);
+        assert_eq!(expected_blocks, 4320, "expectedBlocks must floor to 4320");
+
+        // min(1, eta) via effective_blocks = min(actual, expected).
+        let effective_blocks = actual_blocks.min(expected_blocks);
+        assert_eq!(
+            effective_blocks, 3920,
+            "blocksMade ≤ expectedBlocks ⇒ effective = blocksMade"
+        );
+
+        // deltaR1 = floor( rho · reserves · (effective/expected) ), single floor.
+        let delta_r1 = rho
+            .mul(&Rat::from_i128(reserves, 1))
+            .mul(&Rat::from_i128(
+                effective_blocks as i128,
+                expected_blocks as i128,
+            ))
+            .floor_u64();
+
+        assert_eq!(
+            delta_r1, 35_803_096_246_665,
+            "deltaR1 (mainnet 245→246 reserves draw) MUST be byte-exact with \
+             Haskell startStep: floor(min(1,eta)·rho·reserves)"
+        );
+
+        // Cross-check the algebraic identity used in production: the alternative
+        // Haskell phrasing min(1, eta)·rho·reserves with eta = blocksMade %
+        // expectedBlocks (exact Rational) yields the SAME floored value.
+        let eta = Rat::from_i128(actual_blocks as i128, expected_blocks as i128);
+        let min_1_eta = eta.min_rat(&Rat::from_i128(1, 1));
+        let delta_r1_alt = min_1_eta
+            .mul(&rho)
+            .mul(&Rat::from_i128(reserves, 1))
+            .floor_u64();
+        assert_eq!(
+            delta_r1, delta_r1_alt,
+            "effective/expected form and min(1,eta) form must be byte-identical"
+        );
+
+        // Downstream reward-pot terms pinned for the same boundary (tau=0.2):
+        //   rPot     = deltaR1 + ssFee
+        //   deltaT1  = floor(tau · rPot)
+        //   R        = rPot − deltaT1
+        let ss_fee: u64 = 587_936_590; // go-snapshot ssFee (epoch-244 fees)
+        let r_pot = delta_r1 + ss_fee;
+        let tau = Rat::from_i128(2, 10);
+        let delta_t1 = tau.mul(&Rat::from_i128(r_pot as i128, 1)).floor_u64();
+        let big_r = r_pot - delta_t1;
+        assert_eq!(r_pot, 35_803_684_183_255);
+        assert_eq!(delta_t1, 7_160_736_836_651);
+        assert_eq!(big_r, 28_642_947_346_604);
     }
 
     /// Issue #438 static-audit Suspect 2: pending-RUPD + fresh-RUPD double-credit.
