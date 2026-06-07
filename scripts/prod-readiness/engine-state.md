@@ -228,7 +228,26 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #17 DONE (committed+pushed 28bcd277e6). NEXT WAKE: SCHEDULE picks the next item — see recommendation.
+- item: #15 (serialiseData canonical re-encode) state:FIXING attempts:0 — muscle fix wf4hgn0hk (worktree) IN-FLIGHT; wake-lock HELD (TTL 22m). #17 DONE (28bcd277e6).
+  *** wake321 (ultracode): SCHEDULE→DRIVE. SCHEDULE: picked #15 [M->H][phase2] over #20 — #20's value DROPPED now that #17
+  (snapshot CRC) landed (a tampered snapshot exploiting the lenient varlen/map decoders now fails the CRC check first; #20
+  itself says "mostly backstopped by #17 + Mithril signature"). #15 is the highest-impact UNBLOCKED item: a REAL phase-2
+  conformance bug (serialiseData returns canonical re-encode, not the memoised original CBOR bytes → scripts that hash
+  serialiseData(non-canonical datum) return wrong results → 306 "script returned Error term" divergences). ROOT-CAUSED-
+  CONFIRMED (byte-level proof wake165: tx 27751ab9 datum 276B indefinite-arrays → on-chain datum_hash bbd352...; dugite
+  re-encodes to 270B canonical → wrong hash). KEY: verifiable via a BYTE-EXACT UNIT TEST (real datum → serialiseData →
+  blake2b == on-chain datum_hash, like #17's real-fixture approach) — NO heavy ep293 replay strictly needed → both high-
+  impact AND tractable. *** DRIVE: #15 ROOT-CAUSED→FIXING. Launched muscle fix wf4hgn0hk (run wf_fd1b09da-e5c, opus,
+  isolation:worktree) to make Data (data.rs:65) carry memoised original CBOR bytes from from_cbor (data.rs:96/decode_data
+  :316), serialiseData (denotations.rs:597-602) return the memo when present + to_cbor fallback for machine-constructed
+  Data; CRITICAL invariants briefed (memo must NOT affect Data Eq/Ord/Hash — conformance + equalsData depend on structural
+  equality; memo only for verbatim CBOR-decoded Data; no regression of serialise_data_round_trips/999-conformance/flat).
+  Briefed it to ADD the byte-exact regression test + run fmt/clippy/nextest -p dugite-uplc. *** NEXT WAKE (on auto-notify):
+  the muscle works in an EPHEMERAL worktree (kept since changed) — extract its diff (git worktree list / the run\'s worktree)
+  into a patch OR apply to main, then VERIFYING: nextest -p dugite-uplc (conformance + the new byte-exact serialiseData
+  test) + clippy + fmt. Since #15 verifies via the real on-chain datum_hash (byte-exact reference, no Koios numeric), the
+  byte-exact test + conformance-no-regression IS the gauntlet. On green → focused 1-crate commit (dugite-uplc) + push,
+  #15 FIXING→VERIFYING→DONE. (Optional stronger: ep293 replay 306→0.) Lock held across async (overlapping cron skips; 22m TTL).
   *** wake320-cont (ultracode): #17 VERIFYING→DONE. Gauntlet bc6j5y0qv: nextest -p dugite-serialization 1146/1146 GREEN
   (all 6 #17 tests pass incl. snapshot_crc_of_concat_matches_real_preprod_fixtures = THE byte-exact proof reproducing real
   cardano-node checksums 2409556997/4213652121 from measured CRC inputs + single-byte-corruption detection + parse valid/
