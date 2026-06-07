@@ -179,8 +179,29 @@
    — the canonical Haskell ENCODER always chunks >64-byte bytestrings, so NO honest mainnet/testnet block triggers it; fires only
    on a crafted block/tx (won't show on normal sync). Genuinely real, default-to-reject posture, close it. Caveat: source from
    plutus+ledger master HEAD (rule stable since Alonzo); didn't exhaustively trace every Conway redeemer-map site (same Data
-   decoder, high conf). state:ROOT-CAUSED attempts:0 conf:0.95. NEXT: FIXING (read_bounded_plutus_bytes scoped to leaves) +
-   defensive tests; gauntlet over-strictness lens (non-Plutus byte readers UNAFFECTED) before commit.
+   decoder, high conf).
+   *** FIXING DONE wake358 (fix Workflow w2e3vri2u hosted in-turn, 109K tokens; patch IN MAIN TREE UNCOMMITTED, backup
+   candidate-fix-28-plutusdata-bytes.patch 649 lines). 1 crate dugite-serialization, 3 files: reader.rs (ADDITIVE-ONLY, 0
+   removals: +read_bounded_plutus_bytes [definite >64 Err; indef ANY chunk >64 Err, total UNBOUNDED; 0-len ok] +
+   read_bounded_plutus_bigint [PlutusData-only bignum, mantissa via the bounded reader]; generic read_bytes_owned/read_indef_
+   bytes/read_bigint byte-for-byte UNCHANGED); era_alonzo.rs read_plutus_data_depth Bytes/BytesIndef + bignum mantissa →
+   bounded; era_conway.rs Bytes|BytesIndef + bignum → bounded. Babbage COVERED transitively (reuses Alonzo read_plutus_data,
+   era_babbage.rs:55/752/896/954 — no own copy). 23 defensive tests (unit + length-lattice proptests: def 64 ok/65 err, indef
+   chunk 64 ok/65 err, two-64-chunks=128 total OK, 0-len ok, bignum mantissa; + OVER-STRICTNESS guards: 200B non-Plutus blob
+   via generic readers still OK + prop_generic_bytes_unbounded). *** INDEPENDENTLY RE-VERIFIED (#438): 0 reader.rs deletions
+   (generic readers untouched), PlutusData arms route through bounded helpers in both eras, Babbage reuse confirmed, fmt=0
+   clippy=0 nextest 1175/1175 PASS incl. all the bound+over-strictness tests. *** ENCODER-ASYMMETRY caveat → FILED #28b:
+   dugite encode_plutus_data emits a SINGLE definite bstr even for >64B leaves (no chunking like Haskell encodeBoundedBytes), so
+   a dugite-encoded >64B leaf now fails re-decode — byte-exact vs the WIRE (Haskell never emits one) but self-inconsistent; a
+   dugite-forged block carrying a >64B datum would be self-rejected. state:FIXING attempts:1 conf:0.92. NEXT: GAUNTLET (refutation
+   panel: Haskell-decodeBoundedBytes-exact-match, over-strictness/completeness, encoder-consistency #28b) → commit on pass.
+28b. [M][serialization][NEW wake358] PlutusData ENCODER must chunk >64-byte leaf bytestrings into <=64-byte indefinite chunks
+   to match Haskell encodeBoundedBytes (plutus Data.hs) AND dugite's OWN new #28 decode bound. Currently encode_plutus_data →
+   encode_bytes (cbor.rs:~170) emits one definite bstr for any size → a dugite round-trip of a >64B PlutusData::Bytes now fails
+   re-decode (self-inconsistent), and a dugite-forged tx/datum with a >64B leaf would be rejected by Haskell peers AND by
+   dugite's own decoder. how_to_confirm: encode a PlutusData::Bytes of 100 bytes via dugite encoder → must produce the chunked
+   indefinite form (0x5f <=64-chunks 0xff), re-decodable by both dugite (post-#28) and Haskell deserialise @Data; byte-exact vs
+   a Haskell-encoded 100-byte Data leaf. state:NEW attempts:0 conf:0.9
 29. [M][ledger/governance][NEW] TreasuryWithdrawals double-subtract in a multi-withdrawal epoch. state/governance.rs: enact
    (line 2288 enact_gov_action_impl) physically decrements epochs.treasury when a TreasuryWithdrawals action enacts, AND
    ratify_proposals_impl independently accumulates disbursed withdrawals and subtracts them again from the remaining-treasury
@@ -460,7 +481,7 @@
    reconstruction + #7 sub-tx forward). state:DONE attempts:0
 
 ## In-progress
-- item: #28 [H] PlutusData >64-byte leaf bytestring ROOT-CAUSED (conf 0.95, Haskell 64-byte-leaf limit confirmed). NEXT: FIXING (read_bounded_plutus_bytes, leaves-only).
+- item: #28 [H] PlutusData >64-byte leaf cap FIXING DONE (uncommitted, 1175/1175 + over-strictness guards) → state:GAUNTLET. Filed #28b (encoder must chunk). NEXT: gauntlet → commit.
   *** wake354 (ultracode): SCHEDULE #28, DRIVE NEW→ROOT-CAUSED. HEAD-verified the dugite gap myself (era_alonzo.rs:1282-1288
   Type::Bytes/BytesIndef no length check), then diagnose Workflow wq6fv0lvv (hosted in-turn, conf 0.95) SOURCE-CONFIRMED the
   Haskell rule: plutus Data.hs decodeBoundedBytes caps every PlutusData LEAF bytestring at 64 bytes and `fail`s above (definite
@@ -3225,6 +3246,7 @@
 - 2026-06-08T19:45Z wake352 ~ #26/#27 surgical rework (w9jx0lhjm, in-turn): source-confirmed V1/V2=Plutus Key<Script vs V3=ledger Script<Key; withdrawals_to_plutus→derived Ord, ledger_ordered_withdrawals unchanged for V3+index; INDEPENDENTLY re-verified fmt+clippy+nextest 732/732. →GAUNTLET (re-run next). NO commit
 - 2026-06-08T20:10Z wake353 ~ #26/#27 re-gauntlet wpydujp5u PASSED 0/3 (substantive) on corrected code; engine-verified resolve_reward=ledger order + 732/732 + workspace check; COMMITTED 4fe61ad011 (2 crates). #26+#27 DONE. Next #28
 - 2026-06-08T20:35Z wake354 ~ #28 NEW→ROOT-CAUSED: diagnose wq6fv0lvv (in-turn, conf 0.95) source-confirmed plutus 64-byte PlutusData leaf limit (decodeBoundedBytes); real latent/adversarial acceptance asymmetry. Fix=read_bounded_plutus_bytes scoped to leaves only. Next FIXING
+- 2026-06-08T21:05Z wake358 ~ #28 ROOT-CAUSED→FIXING: fix Workflow w2e3vri2u (in-turn) bounded PlutusData leaf bytes at 64 (read_bounded_plutus_bytes/_bigint, additive, generic readers untouched, Babbage via Alonzo reuse); 23 defensive tests; INDEPENDENTLY verified 1175/1175 + over-strictness guards. Filed #28b (encoder must chunk). Uncommitted; gauntlet next
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -4859,3 +4881,10 @@
   acceptance asymmetry (latent/adversarial partition+DoS surface; canonical encoders always chunk so no honest block triggers).
   FIX (next): read_bounded_plutus_bytes scoped to PlutusData leaves ONLY (not generic read_bytes_owned — over-strictness guard),
   per-chunk<=64 not total, + length-lattice proptest + fuzz. state:ROOT-CAUSED. NEXT: FIXING.
+- wake355-357 2026-06-08 (busy stops): cron fires STOPPED on `busy` while wake358 hosted the #28 fix in-turn. Correct.
+- wake358 2026-06-08: DRIVE #28 ROOT-CAUSED→FIXING (fix Workflow w2e3vri2u, in-turn). Added read_bounded_plutus_bytes +
+  read_bounded_plutus_bigint (additive, 0 reader.rs removals — generic readers untouched); bounded the PlutusData Bytes/
+  BytesIndef + bignum-mantissa arms in era_alonzo + era_conway (Babbage covered via Alonzo reuse). 23 defensive tests
+  (length-lattice + over-strictness guards). INDEPENDENTLY re-verified: 0 generic-reader deletions, arms bounded both eras,
+  fmt+clippy+nextest 1175/1175. Filed #28b (encoder must chunk >64B leaves to match Haskell encodeBoundedBytes + the new decode
+  bound). FIXING done, uncommitted. NEXT: GAUNTLET (Haskell-exact-match + over-strictness + encoder-consistency) → commit on pass.
