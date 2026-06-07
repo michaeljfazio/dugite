@@ -209,8 +209,26 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves +82,270,482 / treasury -55,269) state:ANALYZING (re-verify before 4th fix attempt).
-  *** wake222: #15 done -> activated #0 (highest-impact: mainnet reserves byte-exactness). PARKED attempts:3, so per
+- item: #0 (mainnet ep246 reserves) state:FIXING (localize-then-fix; ROOT CAUSE RE-LOCATED to apply_utxo_changes).
+  *** wake225: ANALYZE wuqv1kgo9 COMPLETE — MAJOR ROOT-CAUSE REVISION (confidence HIGH on class+arithmetic, MEDIUM on
+  exact cred). The documented 'member-reward fold two-map' cause is REFUTED: dugite Sigma stake_distribution ==
+  go.total_active_stake == Koios 21,956,097,174,685,676 BYTE-EXACT @ep245; both maps already bundle utxo+reward_balance
+  (epoch.rs:209-215,:271-277); the fold (rewards.rs:445-490) is byte-exact FOR ITS INPUTS. REAL CAUSE: a PER-CRED
+  stake-VALUE error that nets to ZERO at aggregate, from an ADD/SPEND ASYMMETRY in crates/dugite-ledger/src/eras/
+  common.rs::apply_utxo_changes (spend saturating_sub 202-208/334-340 debits a different cred/amount than the add
+  Phase-5 credits @263) -> corrupted per-member t & sigma -> systematic FLOOR under-distribution across ~150k members
+  -> +82,270,482 reserves / -55,269 treasury (reward-acct credit deficit -82,215,213, ties out: -(82,270,482-55,269)).
+  Conservation: dRES+dTRE+dRewardAccts+dFees=0. *** STRATEGIC: UNIFIES #0 + #2/#11 + ep57-residual #6 — ALL the same
+  apply_utxo_changes asymmetry (REWARD-DIVERGENCE-FINDINGS/MAINNET-ep213/POST-HOLD-PLAN). The 3 prior #0 fixes FAILED
+  because they targeted rewards.rs/prefilter (the symptom), the #438 trap. *** Note: the wake-prompt's standing
+  'root-cause hypothesis = apply_utxo_changes add/spend asymmetry in common.rs' was CORRECT all along (not stale).
+  DROVE: launched LOCALIZE-THEN-FIX muscle wxbflru4x (run wf_625883f0-635, opus, dugite-ledger only) with DISCIPLINE:
+  write a SYMMETRIC-ROUTING INVARIANT unit test FIRST (add output under cred X -> spend -> stake_map net-zero on X,
+  no other cred moves; cover pointer/script-staking/collateral/multi-asset/cross-tx); only fix if the test concretely
+  FAILS; if it passes (no code asymmetry), STOP + report 'needs instrumented replay' (NO speculative fix). HARNESS:
+  HEAD dumps epoch-dumps-engine/mainnet-droptrace exist; final byte-exact gate = dump-verify ep246 reserves==
+  12880948865137767 + ep209-245 unregressed (+ ideally preprod ep57). NEXT WAKE: poll -> if invariant fails+fixed ->
+  build -> dump-verify; if no asymmetry -> instrumented DUGITE_REWARD_DBG replay to localize. #15 done -> activated #0 (highest-impact: mainnet reserves byte-exactness). PARKED attempts:3, so per
   the staleness lesson (#481/#438: don't trust a stale root-cause; HEAD-verify first) launched ANALYZE muscle
   wuqv1kgo9 (run wf_e3e8f3af-92f, opus/ledger) to RE-VERIFY the member-reward-fold root cause (rewards.rs:445-490 two-
   map vs Haskell single resolved-active-stake VMap resolveActiveInstantStakeCredentials) against Haskell source +
@@ -1507,6 +1525,12 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
+- wake225 2026-06-07: #0 ANALYZE wuqv1kgo9 COMPLETE -> ROOT-CAUSE REVISED -> FIXING. Member-reward fold REFUTED
+  (aggregate byte-exact); REAL cause = apply_utxo_changes ADD/SPEND ASYMMETRY (common.rs spend 202-208/334-340 vs add
+  263) corrupting per-cred stake (net-zero aggregate) -> floored under-distribution -> +82.27M reserves. UNIFIES #0/
+  #2/#11/#6; 3 prior fixes failed on wrong site (rewards.rs symptom). Launched LOCALIZE-THEN-FIX muscle wxbflru4x
+  (invariant-test-FIRST, no speculative fix). NEXT WAKE: poll -> invariant fails+fixed -> dump-verify ep246; else
+  instrumented replay. The standing wake-prompt's apply_utxo_changes hypothesis was right all along.
 - wake224 2026-06-07: POLL #0 ANALYZE wuqv1kgo9 — RESEARCH STAGE DONE (root-cause stage running). CONFIRMED divergence
   STILL REAL on HEAD (re-verify worthwhile): HEAD dumps epoch-dumps-engine/mainnet-droptrace/ show ep245 reserves=
   12905245994461083==Koios (0 diff), ep246 dugite=12880948947408249 vs Koios=12880948865137767 = +82,270,482 dRES /
