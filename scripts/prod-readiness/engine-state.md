@@ -395,7 +395,7 @@
    PASSES (test_conway/alonzo/babbage/mary/shelley_block + test_decode_block_dijkstra_native_dispatch — honest blocks decode
    unchanged); new tests conway_rejects_dijkstra_only_keys + dijkstra_accepts_23_25_26 + conway_rejects_key6 +
    dijkstra_unknown_key99_rejected all PASS; lenient cost_models_unknown_keys_ignored + pparam_update_unknown_key_skipped UNTOUCHED
-   + pass; fmt=0 clippy=0 nextest 1179/1179. #31-B state:GAUNTLET attempts:1 conf:0.9. *** NEXT WAKE — GAUNTLET #31-B (era-aware
+   + pass; fmt=0 clippy=0 nextest 1179/1179. #31-B state:B-DONE attempts:1 conf:0.95 COMMITTED 777e0b9844 wake412 (gauntlet wmics7ixo PASSED 0/3 gold-standard: again caught the v12+ WebFetch hallucination via raw-source; real blocks decode). #31-C/D/E remain. *** NEXT WAKE — GAUNTLET #31-B (era-aware
    Haskell-key-set match per era + over-rejection lens: every valid Conway/Dijkstra key still accepted, real blocks decode; the
    key-6-reject correctness; v12+ gate) → commit. #31-C/D/E remain. *** NEXT WAKE — GAUNTLET #31-A (Haskell-reject match + over-strictness lens:
    confirm only witness-set rejects, body/CostModels/PParamUpdate lenient preserved) → commit. Then #31-B/C/D as separate steps.
@@ -658,7 +658,15 @@
    reconstruction + #7 sub-tx forward). state:DONE attempts:0
 
 ## In-progress
-- item: #31-B FIXING DONE (era-aware tx-body reject; over-rejection guard verified — real blocks decode; 1179/1179) → state:GAUNTLET. NEXT: gauntlet #31-B → commit.
+- item: #31-B DONE (committed 777e0b9844) — era-aware tx-body reject, gauntlet PASSED 0/3 gold-standard. NEXT: #31-C (Conway PV9+ set-dedup = the folded #30 fix-B).
+  *** wake412 (ultracode): ran the #31-B gauntlet (wmics7ixo, 3 lenses) → PASSED 0/3, gold-standard: lens1 re-confirmed raw
+  cardano-ledger (cd8b7fab) + AGAIN caught the WebFetch v12+ hallucination ("_ -> Nothing silently ignored") via raw-source read;
+  exact Conway {0-5,7-9,11,13-22} + Dijkstra {+23,25,26} (key 24 SubTx-only); lens2 over-rejection — real blocks 110/110 decode,
+  era threaded everywhere; lens3 commit-safe (key 6 no honest impact, Dijkstra-unreleased can't fire today). COMMITTED 777e0b9844
+  (dugite-serialization, local). #31-B CLOSED. *** #31 REMAINING: #31-C Conway PV9+ Set duplicate-reject (= the folded #30 fix-B;
+  read_set has no dedup/count-check → all tag-258 Set fields accept dups at PV9+; fix = read_set_strict PV-threaded count-check),
+  #31-D dup-MAP-key reject (for_each_map_entry), #31-E pre-Conway body unknown-key reject (Shelley+). NEXT WAKE: SCHEDULE #31-C →
+  DIAGNOSE (read_set sites + PV-threading + the exact decodeSetEnforceNoDuplicates count-check).
   *** wake408 (ultracode): DRIVE #31-B ROOT-CAUSED→FIXING (fix Workflow wumudjsu8, in-turn). Threaded `era` into
   decode_conway_tx_body (all callers incl. the KeepRaw closure + dijkstra=Era::Dijkstra), guarded 23/25/26 with `if era==Dijkstra`,
   DELETED the key-6 skip, era-aware reject default. OVER-REJECTION GUARD INDEPENDENTLY VERIFIED: Conway accepts {0-5,7-9,11,13..22},
@@ -3381,6 +3389,14 @@
 - db-clones/preprod-ep57-fixed   (fixed-binary replay, in progress)
 
 ## Gauntlet ledger  (passed/refuted approaches — never silently retry a REFUTED)
+- PASSED 2026-06-09 (wake412, #31-B era-aware tx-body reject, gauntlet wmics7ixo): 0/3 refute, gold-standard. (1) per-era key-set
+  match: re-confirmed against RAW cardano-ledger cd8b7fab — AGAIN caught the WebFetch hallucinating "_ -> Nothing silently
+  ignored" + refuted it by reading Decoder.hs:1213-1257 in full (no version branch). Conway = EXACTLY {0,1,2,3,4,5,7,8,9,11,
+  13..22}; Dijkstra adds {23,25,26} (key 24 SubTx-only → top-level rejected); key 6 absent both → rejected. (2) over-rejection:
+  accept-arms = exactly Conway set; 23/25/26 fall through to reject for Conway; era threaded correctly at every caller (block.rs
+  Conway→Era::Conway, Dijkstra→Era::Dijkstra, no cross-era leak); real-blocks 110/110 decode unchanged. (3) commit-safety: key 6
+  no honest impact (no encoder emits it); Dijkstra-unreleased risk cannot fire today; strict #539-class gap closure. COMMITTED
+  777e0b9844 (1 crate dugite-serialization).
 - PASSED 2026-06-09 (wake400, #31-A witness-set reject, gauntlet w9xgaid4w): 0/3 refute, GOLD-STANDARD rigorous. (1) Haskell-reject
   -all-eras: INDEPENDENTLY re-pinned cardano-ledger cd8b7fab + read RAW source, caught the WebFetch paraphrase HALLUCINATING that
   v12+ is lenient — refuted it: v12+ decodeSparseKeyed decoderByKey `_ -> Nothing` → Decoder.hs:1244 `Nothing -> failMsg "Unknown
@@ -3593,6 +3609,7 @@
 - 2026-06-09T03:30Z wake400 ~ #31-A gauntlet w9xgaid4w PASSED 0/3 GOLD-STANDARD (raw-source recheck caught a WebFetch hallucination + cleared the v12+ version-gate trap; Dijkstra byte-exact). COMMITTED fe101965a0. #31-A DONE. Next #31-B (tx-body, era-aware)
 - 2026-06-09T04:00Z wake404 ~ #31-B NEW→ROOT-CAUSED: diagnose w075p3s3n (in-turn, conf 0.95, permalink-pinned) pinned exact Conway {0-5,7-9,11,13-22} vs Dijkstra +{23,25,26} body-key sets; era-aware fix (thread era, guard 23/25/26, DELETE key-6 skip — corrects #31-A hint). Filed #31-E. Next FIXING #31-B
 - 2026-06-09T04:30Z wake408 ~ #31-B ROOT-CAUSED→FIXING: fix Workflow wumudjsu8 (in-turn) era-aware tx-body reject (thread era, guard 23/25/26, delete key-6 skip); OVER-REJECTION GUARD verified (Conway/Dijkstra key sets, real blocks decode); 1179/1179. Uncommitted; gauntlet next
+- 2026-06-09T05:00Z wake412 ~ #31-B gauntlet wmics7ixo PASSED 0/3 gold-standard (raw-source recheck AGAIN caught the v12+ WebFetch hallucination; exact Conway/Dijkstra key sets; real blocks decode; over-rejection guard clean). COMMITTED 777e0b9844. #31-B DONE. Next #31-C
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -5302,3 +5319,7 @@
   into decode_conway_tx_body (all callers), guarded 23/25/26 with if era==Dijkstra, DELETED key-6 skip, era-aware reject default.
   OVER-REJECTION GUARD independently verified: Conway {0-5,7-9,11,13..22} + Dijkstra {23,25,26}; real-blocks suite passes (honest
   blocks unchanged); lenient CostModels/PParamUpdate untouched; 1179/1179. Uncommitted; gauntlet next. state:GAUNTLET.
+- wake412 2026-06-09: ran the #31-B gauntlet (wmics7ixo, 3 lenses, in-turn) → PASSED 0/3 gold-standard. lens1 re-confirmed raw
+  cardano-ledger source + AGAIN caught the WebFetch v12+ version-gate hallucination (read Decoder.hs in full); exact Conway/
+  Dijkstra key sets verified; lens2 over-rejection (real blocks 110/110 decode, era threaded everywhere); lens3 commit-safe.
+  COMMITTED 777e0b9844 (dugite-serialization, 1 crate). #31-B DONE. NEXT: #31-C (Conway PV9+ set-dedup).
