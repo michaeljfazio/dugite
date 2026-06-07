@@ -209,7 +209,7 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:ROOT-CAUSING (polled wake274 17:23 — analyze muscle wx7gexg1o ACTIVE, 242KB, reading shelley-rewards ref + Koios, localizing the ~4.92ppm site). DEFINITIVE: uniform ~4.92ppm reward under-scaling.
+- item: #0 (mainnet ep246 reserves) state:ROOT-CAUSING (polled wake275 17:28 — analyze muscle wx7gexg1o: research DONE, root-cause agent ACTIVE; localizing the ~4.92ppm site). DEFINITIVE: uniform ~4.92ppm reward under-scaling.
   *** wake273 (ultracode): RECONCILIATION VERDICT (workflow w8ufsxjg3, 7/8 agents, n=1400 creds, extracted from agent
   transcripts since synthesize hung): **AMOUNT-DELTAS, NOT missing payees.** ALL 1400 dugite-paid creds RESOLVED in
   Koios earned_epoch-244 (0 missing, 0 unresolved), 0 exact matches — EVERY cred a nonzero delta; 984 under / 416 over
