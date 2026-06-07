@@ -1297,6 +1297,8 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake186 2026-06-07: POLL #10 RE-GAUNTLET wvfzy4jta (4th round) — still RUNNING (1/3 refuters done, active). No
+  transition. Disk 179G, no nodes. #10 stays GAUNTLET-PENDING. NEXT WAKE: on PASS -> commit #10.
 - wake185 2026-06-07: #10 VERIFYING-RESOAK -> GAUNTLET-PENDING. verify10B3 window confirmed (tip 125115283, 0 phase-1,
   0 NotFullyConsumed). SIGTERM'd it; launched RE-GAUNTLET wvfzy4jta (wf_d0e85509-f55) on complete final state (6-path
   + R1 dangerouslyBig + R2 full-consumption). 4th round; prior 3 rounds all addressed. NEXT WAKE: PASS -> commit #10.
