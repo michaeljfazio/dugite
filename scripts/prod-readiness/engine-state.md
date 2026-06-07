@@ -45,13 +45,12 @@
    offline) → +4230 is a FLOOR; pin needs full UTxO context via Koios. Refs: tx 512d46dc… ep60 script 8e60a204…, on-chain
    mem=329275/steps=118172478. NEXT: pin the exact over-cost line (full UTxO context + CEK-work compare). state:ROOT-CAUSED
    attempts:0
-25. [H?][phase2][NEW wake326, from wogj8wp6h corpus sweep] dugite WRONGLY ACCEPTS invalid scripts — 370 of 769
-   phase2-dumps-730val dumps are on-chain is_valid=FALSE (scripts SUPPOSED to fail, collateral-consuming) but dugite=Ok
-   (scripts PASS). dugite under-validates → would accept a tx cardano-node rejected (a real correctness gap for a block
-   producer; arguably HIGHER severity than the #24 over-cost since accepting-invalid > rejecting-valid). Re-runnable via
-   examples/phase2_repro (classify the is_valid=false dumps where dugite says Ok). NEXT: DIAGNOSE — pick a few, find why
-   dugite's script PASSES where cardano-node's FAILS (budget under-charge? a builtin that should error but doesn't? phase-2
-   validation gap?). state:NEW attempts:0
+25. [L][phase2][DEBUNKED wake327] "dugite wrongly accepts invalid scripts" — the wogj8wp6h muscle's "370 dumps is_valid=
+   FALSE but dugite=Ok" claim is WRONG. RIGOROUS COUNT (python over all 769 phase2-dumps-730val): EXACTLY 1 dump is
+   is_valid=false (tx4-7a64fd02fc21d4ae), not 370. The "370" was almost certainly the muscle's raised-budget OVER-COST
+   dumps (is_valid=true, Err-at-declared/Ok-at-raised) mislabeled "should-fail" = the #24 class. The 1 real is_valid=false
+   dump (pv8, dugite=Ok on 3 redeemers) is an isolated minor case (budget under-cost vs logic vs incomplete-dump artifact —
+   undetermined); characterize-later if ever. NOT a systemic class. state:DEBUNKED-CLOSED attempts:1
 0. [H][ledger][REAL-CURRENT, ROOT-CAUSED] mainnet ep246 reserves +82,270,482 / treasury -55,269. STRUCTURAL
    ROOT CAUSE (deep-dive wuc2kqb1z): the member-reward fold (rewards.rs:445-490) iterates go.delegations +
    separate go.stake_distribution.get(cred) lookup, whereas Haskell folds a SINGLE resolved active-stake VMap
@@ -264,7 +263,22 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #24 (V2 inline-datum-spend over-cost) state:ROOT-CAUSED attempts:0 (conf 0.83, exact line pending). NEXT WAKE: pin the line or FIXING.
+- item: #25 DEBUNKED (muscle miscount: only 1 is_valid=false dump, not 370). #24 stays ROOT-CAUSED. NEXT WAKE: SCHEDULE #20 or pin #24.
+  *** wake327 (ultracode): SCHEDULE #25 (verify-reality before investing) → DRIVE = cheap empirical check → #25 DEBUNKED.
+  The wogj8wp6h muscle claimed "370 dumps dugite-PASS-but-should-fail (wrong-accept)". RIGOROUS COUNT (python over all 769):
+  EXACTLY 1 dump is is_valid=false (phase2-divergence-tx4-7a64fd02fc21d4ae.json), NOT 370. The muscle's "370" was WRONG —
+  almost certainly the raised-budget OVER-COST dumps (is_valid=true, dugite-Err-at-declared / dugite-Ok-at-raised) that it
+  mislabeled "should-fail" = the SAME #24 class, not a wrong-accept class. Classic #438 save: caught a muscle's unverified
+  number with a 1-command empirical check before wasting a diagnose muscle on a non-issue. *** The 1 real is_valid=false
+  dump (tx4-7a64fd02, pv8, dugite=Ok on 3 redeemers where on-chain failed) is an ISOLATED minor case (budget under-cost vs
+  logic divergence vs incomplete-dump artifact — undetermined) → filed as L, not a 370-class. #25 (as filed) CLOSED. *** NET
+  phase-2-dump state: the #730 corpus is largely MINED — #23 V1-dedup FIXED (742 resolved), #24 V2 inline-spend over-cost
+  (184 dumps) ROOT-CAUSED but exact line PENDING + limited by INCOMPLETE dumps (missing ref-input UTxOs → offline measure is
+  a floor), #25 debunked. *** NEXT WAKE — SCHEDULE: (A) #20 [M] snapshot-import adversarial-hardening (concrete, unit-
+  testable, completable — bank a clean win; crc32 non-cryptographic so #17 doesn't fully subsume); (B) pin #24 (needs FULL
+  UTxO context — resolve the dominant script 8e60a204's tx 512d46dc missing ref-inputs via Koios, re-measure dugite-consumed
+  vs on-chain) — harder, the dump-incompleteness limits offline work; (C) #7 re-derive Dijkstra patch. RECOMMEND #20 (clean
+  completable win after the long phase-2 thread) OR #24-pin (higher-impact but harder). Lock to release.
   *** wake326-cont (ultracode): TWIST — the wake324 #23 muscle wogj8wp6h did NOT die; it ran 44min and COMPLETED with an
   AUTHORITATIVE #24 diagnosis (Koios byte-exact + aiken cross-check) that SUPERSEDES the brief I gave w90vykjte. So my
   wake325 "salvage of a dead muscle" was premature but CORRECT (the dedup fix it confirms = my committed 9c53405384; muscle:
@@ -2554,6 +2568,7 @@
 - 2026-06-07T18:xxZ wake324 ~ #23 REPRODUCED→DIAGNOSING (MEM-only over-cost sharpened) + launched muscle wogj8wp6h (later DIED)
 - 2026-06-07T22:xxZ wake325(+cont) ~ SALVAGED dead muscle's txInfoData-dedup fix, VERIFIED (tx0 363→194, nextest 441/441) + commit/push 9c53405384; filed #24 (V2 residual)
 - 2026-06-07T23:xxZ wake326(+cont) ~ wogj8wp6h completed (44min, not dead) → #24 ROOT-CAUSED (inline-datum-spend over-cost, NOT txInfoData); stopped redundant w90vykjte; filed #25 (370 wrong-accept)
+- 2026-06-08T00:xxZ wake327 ~ #25 DEBUNKED (only 1 is_valid=false dump, not 370 — muscle miscount); #438 save via 1-command verify
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -4088,3 +4103,7 @@
   traversal (+4230mem/+1531582cpu, both dims), NOT txInfoData (refuted via cardano-ledger). Exact line pending. Filed #25
   (NEW class: 370 dumps dugite WRONGLY ACCEPTS invalid scripts — on-chain is_valid=false but dugite=Ok). Lesson: don't
   declare a muscle dead from a 0-byte output alone — it may be a very long (44min) run; check the agent transcript mtime.
+- wake327 2026-06-07: SCHEDULE+DRIVE #25 → DEBUNKED. Verified the muscle's "370 wrong-accept" claim with a 1-command python
+  count: EXACTLY 1 is_valid=false dump in 769 (not 370). The 370 was the muscle's raised-budget over-cost dumps mislabeled
+  (= the #24 class). #25 closed (L; 1 isolated minor case). #438 save: cheap empirical check before investing a muscle.
+  Phase-2-dump corpus now largely mined (#23 fixed, #24 root-caused/exact-line-pending, #25 debunked). Next: SCHEDULE #20 or pin #24.
