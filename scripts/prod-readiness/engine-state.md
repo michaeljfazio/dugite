@@ -208,7 +208,29 @@
    cap (remaining_treasury :2733, accumulator :2760-2765) → the 2nd+ withdrawal in the same epoch is wrongly blocked. Hask:
    Conway.Rules.Ratify withdrawalCanWithdraw (sum withdrawals <= ensTreasury, ONE cap check) + Conway.Rules.Enact
    enactmentTransition. Tier A. how_to_confirm: treasury=1000M, two 400M TreasuryWithdrawals (distinct registered accts), both
-   with passing DRep+CC votes; process_epoch_transition → both must enact (treasury 200M), dugite likely blocks the 2nd. state:NEW attempts:0 conf:0.78
+   with passing DRep+CC votes; process_epoch_transition → both must enact (treasury 200M), dugite likely blocks the 2nd.
+   *** ROOT-CAUSED wake360 (HEAD-verified by engine + diagnose Workflow wd3dqbaqm conf 0.96, hosted in-turn). is_real_gap=TRUE,
+   source-confirmed. HASKELL MODEL (Conway Ratify.hs:292-360 + Enact.hs:97-103, cross-checked conway.md): SINGLE running-treasury
+   subtraction, NO separate accumulator. withdrawalCanWithdraw checks `fold wdrls <= ensTreasury` against the CURRENT ensTreasury;
+   enactmentTransition decrements `ensTreasury <-> wdrlsAmount` per-enact + unions ensWithdrawals; ratifyTransition threads st'
+   so the next iteration's cap check sees the already-decremented ensTreasury (which IS the running cap basis). DUGITE BUG: the
+   PHYSICAL decrement at governance.rs:2288 (epochs.treasury.0 -= disbursed) is the CORRECT single subtraction (mirrors
+   ensTreasury<->wdrlsAmount); the ACCUMULATOR (remaining_treasury = treasury - enacted_withdrawals_total at :2733, += at
+   :2761-2765) is a REDUNDANT 2nd subtraction → w1 subtracted twice → 2nd+ withdrawal wrongly blocked when w1+w2<=treasury but
+   w2>treasury-2*w1. FIX (primary, source-confirmed): (1) :2733 cap-check against the LIVE epochs.treasury.0 directly (enact
+   already decremented it); (2) DELETE the accumulator: decl `let mut enacted_withdrawals_total` @:2702 + the increment block
+   @:2761-2765; (3) KEEP :2288 as-is (do NOT switch to constant-treasury-minus-accumulator — that would require removing the
+   physical decrement which is fused with the payout/reconciliation). SIDE-EFFECTS: payout leg intact (2266-2288 credits
+   registered reward accts, drops unregistered = Haskell applyEnactedWithdrawals); single-withdrawal epochs IDENTICAL (accumulator
+   was 0); byte-exact reserves/treasury validated to mainnet ep247/preprod ep293 NO regression (those had <=1 ratified withdrawal
+   /epoch; the ADA-moving enact leg unchanged). *** SECONDARY RESIDUAL flagged (NOT this fix's scope — consider in FIXING or file
+   #29b): dugite's cap basis decrements by `disbursed` (registered only) vs Haskell's transient ensTreasury by the FULL fold wdrls;
+   differs ONLY when UNREGISTERED withdrawal targets exist (post-bootstrap Conway rejects those via tag-17
+   TreasuryWithdrawalReturnAccountsDoNotExist, so edge-case: pre-bootstrap early-Conway / deregister-between-propose-and-enact;
+   matching Haskell exactly would need separate transient-ensTreasury vs real-casTreasury tracking). how_to_confirm: unit test
+   treasury=1000M, two 400M TreasuryWithdrawals (distinct registered accts) both ratified → BOTH enact, treasury=200M (pre-fix
+   blocks the 2nd). Tier A. state:ROOT-CAUSED attempts:0 conf:0.96. NEXT: FIXING (remove accumulator) + the unit test; gauntlet
+   (lenses: Haskell-single-subtraction-match, single-withdrawal-no-regression, the disbursed-vs-full-sum residual) before commit.
 30. [M][phase2][NEW] txInfoSignatories preserves on-wire order instead of Set.toList sorted+deduped.
    required_signers_to_plutus_padded (tx_info_populate.rs:481-485) maps Vec<Hash32> in wire order, no sort/dedup; wire Vec
    preserved (era decoders read_set only strips tag-258, no sort/dedup). Haskell txInfoSignatories = Set.toList
@@ -481,7 +503,15 @@
    reconstruction + #7 sub-tx forward). state:DONE attempts:0
 
 ## In-progress
-- item: #28 DONE (committed 9b21f6f0d5) — PlutusData 64-byte leaf cap, gauntlet PASSED 0/3. NEXT: #29 [M] TreasuryWithdrawals double-subtract (or paired #28b encoder).
+- item: #29 [M] TreasuryWithdrawals double-subtract ROOT-CAUSED (conf 0.96, Haskell single-decremented-ensTreasury model confirmed). NEXT: FIXING (remove the accumulator).
+  *** wake360 (ultracode): SCHEDULE #29, DRIVE NEW→ROOT-CAUSED. HEAD-verified the double-subtract myself (governance.rs:2288
+  enact decrements treasury AND :2733 cap-check ALSO subtracts the :2762 accumulator → w1 counted twice), then diagnose Workflow
+  wd3dqbaqm (in-turn, conf 0.96) SOURCE-CONFIRMED the Haskell model (Conway Ratify.hs withdrawalCanWithdraw against the per-enact-
+  decremented ensTreasury, NO accumulator; Enact.hs ensTreasury<->wdrlsAmount). The PHYSICAL :2288 decrement is correct; the
+  ACCUMULATOR is the redundant subtraction. FIX (next): cap-check against live epochs.treasury.0 + delete the accumulator
+  (:2702 decl + :2761-2765); keep :2288. No regression (single-withdrawal identical; validated eras had <=1 withdrawal/epoch).
+  Secondary residual flagged (disbursed vs full-sum cap basis for unregistered targets — edge, post-bootstrap tag-17 rejects).
+  NEXT WAKE: SCHEDULE #29 FIXING.
   *** wake359 (ultracode): ran the #28 gauntlet (w67vflrob, 3 lenses, in-turn) → PASSED 0/3, each lens substantive (read code +
   verbatim Haskell + traced forge/mempool/snapshot). Confirmed: decode bound matches plutus decodeBoundedBytes byte-for-byte;
   no over-strictness (generic readers untouched, non-Plutus >64B carriers decode); COMPLETE across all eras (Alonzo/Babbage-
@@ -3266,6 +3296,7 @@
 - 2026-06-08T20:35Z wake354 ~ #28 NEW→ROOT-CAUSED: diagnose wq6fv0lvv (in-turn, conf 0.95) source-confirmed plutus 64-byte PlutusData leaf limit (decodeBoundedBytes); real latent/adversarial acceptance asymmetry. Fix=read_bounded_plutus_bytes scoped to leaves only. Next FIXING
 - 2026-06-08T21:05Z wake358 ~ #28 ROOT-CAUSED→FIXING: fix Workflow w2e3vri2u (in-turn) bounded PlutusData leaf bytes at 64 (read_bounded_plutus_bytes/_bigint, additive, generic readers untouched, Babbage via Alonzo reuse); 23 defensive tests; INDEPENDENTLY verified 1175/1175 + over-strictness guards. Filed #28b (encoder must chunk). Uncommitted; gauntlet next
 - 2026-06-08T21:35Z wake359 ~ #28 gauntlet w67vflrob PASSED 0/3 (substantive: exact decodeBoundedBytes match + over-strictness/completeness incl Dijkstra-reuse + commit-safety); COMMITTED 9b21f6f0d5 (1 crate). #28 DONE. Next #29
+- 2026-06-08T22:05Z wake360 ~ #29 NEW→ROOT-CAUSED: HEAD-verified double-subtract + diagnose wd3dqbaqm (in-turn, conf 0.96) source-confirmed Conway single-decremented-ensTreasury (no accumulator). Fix=cap-check vs live treasury + delete accumulator, keep :2288. Next FIXING
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -4911,3 +4942,9 @@
   decodeBoundedBytes match, over-strictness/completeness incl. engine-verified Dijkstra reuse, commit-safety via forge/mempool/
   snapshot trace). Spot-verified no era_dijkstra read_plutus_data. COMMITTED 9b21f6f0d5 (dugite-serialization, 1 crate, local).
   #28 DONE. NEXT: #29 [M] TreasuryWithdrawals double-subtract.
+- wake360 2026-06-08: SCHEDULE #29, DRIVE NEW→ROOT-CAUSED. HEAD-verified the TreasuryWithdrawals double-subtract (governance.rs
+  :2288 enact decrements treasury + :2733 cap-check ALSO subtracts the :2762 accumulator), then diagnose Workflow wd3dqbaqm
+  (in-turn, conf 0.96) source-confirmed Conway Ratify.hs/Enact.hs single-decremented-ensTreasury model (no accumulator). FIX:
+  cap-check vs live epochs.treasury.0 + delete the accumulator (decl + increment); keep the physical :2288 decrement. No
+  regression (single-withdrawal identical; validated eras <=1 withdrawal/epoch). Secondary residual flagged (disbursed vs
+  full-sum cap basis, unregistered-target edge). state:ROOT-CAUSED. NEXT: FIXING.
