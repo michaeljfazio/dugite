@@ -1585,6 +1585,9 @@
 - wake235 2026-06-07: POLL #0 VERIFY-THEN-FIX muscle w0oegi6uf — still RUNNING (cargo pid 10828, build/test; 33
   epoch_fees/ss_fee refs in rewards.rs = working the fee area; last activity ~2min). No transition. Disk 157G. #0
   stays FIXING. NEXT WAKE: poll/process result.
+- wake237 2026-06-07: POLL #0 PRECISION muscle w5xpn4ju0 — still RUNNING, ACTIVE (last activity 18s). CORROBORATING:
+  rewards.rs HEAD has 8 f64 refs (float arithmetic in the reward calc -> consistent with the f64-vs-exact-Rational
+  ~5ppm hypothesis). No transition. Disk 166G, no nodes. #0 stays FIXING. NEXT WAKE: poll/process.
 - wake236 2026-06-07: #0 w0oegi6uf REJECTED epoch_fees (dugite ssFee byte-exact; treasury/member DECOUPLED rules out
   reward_pot). Narrowed: uniform pool-independent -5.027ppm member-DISTRIBUTION under-scaling (splits reserves+82.27M
   deltaR2 + treasury-55,269 unregistered) -> GLOBAL factor in pool/member reward FORMULA -> likely f64-vs-exact-Rational
