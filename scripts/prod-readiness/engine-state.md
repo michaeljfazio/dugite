@@ -194,8 +194,21 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:FIXING (round-5 FINAL: R1-complete-F1 + R3-indef-trunc).
-  *** wake194: 5th GAUNTLET ww5a6h0zx = REFUTED 2/3; the edge-epoch refuter COULD NOT refute & exhaustively CONFIRMED
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-RESOAK (round-5 FINAL: R1+R3).
+  *** wake197: FINAL fix muscle wiujlmyn2 green (tier A, 1 crate dugite-serialization mempack/mod.rs+tests). R1
+  COMPLETE: new top_level_number_literal() structure-scoped walk (skip_json_value/parse_json_string_at, top-level
+  object only = aeson KM.lookup) drives the codec-version VALUE; removed the dead extract_raw_number_literal flat
+  scan -> gate and value now AGREE (nested tablesCodecVersion ignored, matching aeson .: top-level-only). R3: tvar_
+  body_offset returns TvarBody{offset,indefinite}; TvarIterator carries map_indefinite+saw_break; indefinite-map EOF-
+  without-0xff => Some(Err) (Haskell ReadSnapshotFailed; RFC8949 indefinite requires break). +11 regression tests.
+  DROVE: copied 2 files to main (2-crate footprint, node/ledger 0 R1/R3 markers), BUILD_EXIT=0 (no drift), dugite-
+  serialization NEXTEST GREEN 1140 passed/6 skip, GC'd worktree, cloned verify10B5 pid 12350. Import BYTE-IDENTICAL:
+  codec_version=1 Big (R1 structural extraction reads canonical flat meta), utxo_count=4116338 + txix_low=3131782
+  txix_mult256=62, 0 phase-1, 0 NotFullyConsumed, 0 truncation-err (R3 no false-trigger; real blob ends 0xff). Node
+  syncing window. NEXT WAKE: confirm 0-phase-1 past window -> 6th RE-GAUNTLET (R1+R3 addressed). Per HARD POLICY
+  (wake194): on PASS -> COMMIT #10; on adversarial-only REFUTE -> COMMIT core anyway + open 'snapshot-import
+  adversarial-hardening' tracking item (NO 7th cycle). This is the LAST hardening cycle.
+  was: state:FIXING (round-5 FINAL: R1-complete-F1 + R3-indef-trunc). *** wake194: 5th GAUNTLET ww5a6h0zx = REFUTED 2/3; the edge-epoch refuter COULD NOT refute & exhaustively CONFIRMED
   the entire import byte-exact (addresses, multi-asset, tags 2/3, F2, container/truncation all match Haskell). verify
   10B4 WINDOW CONFIRMED (tip 125117568, 0 phase-1). The 2 refutations (both adversarial-only, no real-snapshot risk):
    (R1 haskell-semantics) F1 is INCOMPLETE: gate uses structural first_occurrence_value (top-level only, aeson) but
@@ -1362,6 +1375,10 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
+- wake197 2026-06-07: #10 FIXING -> VERIFYING-BUILDING -> VERIFYING-RESOAK. FINAL fix wiujlmyn2 green (R1 top_level_
+  number_literal structural value [aeson .: top-level only]; R3 indefinite-map EOF-no-break => Err). Copied to main,
+  BUILD_EXIT=0, serialization nextest GREEN 1140, verify10B5 byte-identical (4116338, codec=1 Big, 0 phase-1, 0
+  NotFullyConsumed, 0 truncation-err). NEXT WAKE: window -> 6th re-gauntlet -> COMMIT (hard policy: last cycle).
 - wake195 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 (R1 complete-F1 + R3 indef-trunc) — still RUNNING, ACTIVE
   (worktree present, bridge applied). No transition. Disk 177G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process
   -> build -> re-import -> 6th re-gauntlet -> COMMIT (per hard policy).
