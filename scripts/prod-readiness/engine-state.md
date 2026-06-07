@@ -209,7 +209,24 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:POOLSTAKE-DIFFING (polled wake290 18:38 — diff workflow w7ghihrir 7/8 agents done, 8th + synthesize finishing). per-pool data captured (1531 pools).
+- item: #0 (mainnet ep246 reserves) state:ROOT-CAUSING-COMPONENT (per-delegator stake component missing; breakdown instrumentation building).
+  *** wake291 (ultracode): per-pool diff workflow w7ghihrir COMPLETE — Σ(dugite-koios) over 1489 resolved pools =
+  EXACTLY -109,573,937,991 (perfect reconciliation to the deficit). 445/1489 pools (29.9%) short, **100%
+  one-directional (dugite always UNDER, never over)** -> a MISSING ADDEND (per-delegator stake component dropped for a
+  SUBSET of delegators), >=1 ADA each, loosely size-correlated (spread, not concentrated). The fold epoch.rs:199-217
+  is structurally correct (utxo_stake+reward_balance); the leak is in what populates stake_map. THREE candidate
+  buckets (synthesize verdict): (1) delegators in Koios but ABSENT from dugite's delegations map (registration timing),
+  (2) **pointer-addressed UTxO dropped via stake_routing/exclude_ptrs (mod.rs:2224, apply.rs:161, epoch.rs:194) —
+  LEADING hypothesis** (size-correlated, always-neg, >=1 ADA signature fits pointer-delegated UTxO), (3) reward-balance
+  miss (reward_accounts.get().unwrap_or(0) line 214). DROVE: instrumented the SNAP component breakdown in epoch.rs
+  (env DUGITE_SNAP_BREAKDOWN -> 'SNAP_BREAKDOWN epoch= pst=<pool_stake_total> deleg_utxo= reward_bal= ptr_resolved=
+  ptr_excluded= ptr_stake_total= n_deleg='). cargo check CLEAN (5.35s). Build -> /tmp/dugite-snapbreakdown-build.log.
+  NEXT WAKE: strings-verify -> replay w/ DUGITE_SNAP_BREAKDOWN=1 -> grep 'SNAP_BREAKDOWN ...pst=21956097174685676'
+  (the ep244-equiv snapshot) -> if ptr_excluded ~=109.6B OR ptr_stake_total large -> POINTER bucket confirmed (fix the
+  pointer-exclusion timing/resolution); if pointer ~0 -> deficit is in deleg_utxo (stake_map incomplete) or reward_bal
+  -> per-cred diagnostic for one short pool (263498e0.. diff -2.7B) vs Koios pool_delegators ep244. Instrumentation
+  UNCOMMITTED. CoW clone db-clones/mainnet-rupd-drop KEPT. Saved diff: ep246_dugite_poolstake.txt + the 445 short pools
+  in the w7ghihrir output.
   *** wake288 (ultracode): poolstake replay captured dugite per-pool go-stake @ep246 -> extracted+deduped to
   epoch-dumps-engine/mainnet-poolstake/ep246_dugite_poolstake.txt (1531 pools, sum==21,956,097,174,685,676 validated).
   SIGTERM'd replay 60311 (CoW clone db-clones/mainnet-rupd-drop KEPT). Launched per-pool diff WORKFLOW w7ghihrir (run
@@ -3143,3 +3160,10 @@
   ep246_dugite_poolstake.txt. SIGTERM'd replay. Launched per-pool diff workflow w7ghihrir (8 agents: hex->bech32 pool
   -> Koios pool_history ep244 active_stake -> diff). next wake: read verdict -> short pool(s) + concentrated-vs-spread
   + missing component -> inspect delegators -> fix in epoch.rs snapshot construction.
+- wake291 (ultracode): per-pool diff w7ghihrir = Σ(dugite-koios)=EXACTLY -109,573,937,991; 445/1489 pools short, 100%
+  one-directional (always under) -> a MISSING per-delegator stake ADDEND, >=1 ADA each, spread. Fold epoch.rs:199-217
+  structurally correct; leak in stake_map population. 3 buckets: (1) delegator absent from delegations, (2) POINTER
+  UTxO dropped (stake_routing/exclude_ptrs) LEADING, (3) reward_balance miss. Instrumented SNAP component breakdown
+  (env DUGITE_SNAP_BREAKDOWN: deleg_utxo/reward_bal/ptr_resolved/ptr_excluded/ptr_stake_total). cargo check CLEAN,
+  building. next wake: replay -> grep SNAP_BREAKDOWN pst=21956097174685676 -> ptr_excluded~=109.6B => pointer bucket;
+  else per-cred diagnostic. fix in epoch.rs/stake_routing.
