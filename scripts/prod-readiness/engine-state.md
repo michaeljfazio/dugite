@@ -352,6 +352,17 @@
    NEXT: FIXING — tackle the parts as SEPARATE focused steps (each its own gauntlet, distinct scoping risk): #31-A witness-set
    reject FIRST (cleanest, all-era, not version-gated), then #31-B body-reject (era-aware Dijkstra whitelist), #31-C PV9+ set-
    dedup (read_set_strict PV-threading), #31-D dup-map-key. Single crate dugite-serialization throughout.
+   *** #31-A FIXING DONE wake396 (fix Workflow wvcniku8l, in-turn; patch candidate-fix-31a-witsset-reject.patch). PERMALINK-PINNED
+   Haskell (cardano-ledger commit cd8b7fab): Alonzo TxWits txWitnessField n=invalidField n → Coders.hs invalidField → invalidKey
+   → Plain.hs cborError = hard-fail unknown wits key, all eras, NOT version-gated. Rejected the witness-set default arm at 4 sites:
+   era_shelley.rs:1094 (keys 0..2), era_alonzo.rs:1019 (keys 0..5; covers Allegra+Mary via reuse), era_babbage.rs:910 (0..6),
+   era_conway.rs:2232 (0..7) — `return Err(CborDecode("witness set: unknown key {key}"))`. Flipped 3 skip-tests →
+   *_unknown_key_rejected (alonzo/babbage/shelley) + new conway_witness_set_unknown_key_rejected. *** OVER-STRICTNESS GUARD
+   INDEPENDENTLY VERIFIED (#438): git diff = EXACTLY 4 r.skip() removed (all witness-set arms) + 4 rejects; tx-body skips
+   (era_conway:667/671 = #31-B) UNTOUCHED (absent from diff); CostModels (cost_models_unknown_keys_ignored) + PParamUpdate
+   (pparam_update_unknown_key_skipped) tests STILL PASS (genuinely lenient, NOT flipped); fmt=0 clippy=0 nextest 1176/1176.
+   state:GAUNTLET attempts:1 conf:0.9 (part A). *** NEXT WAKE — GAUNTLET #31-A (Haskell-reject match + over-strictness lens:
+   confirm only witness-set rejects, body/CostModels/PParamUpdate lenient preserved) → commit. Then #31-B/C/D as separate steps.
 23. [M][phase2][REPRODUCED-AT-HEAD wake323] Babbage V2-Spend BUDGET over-cost (the #730 "fixed-delta structural-context"
    residual). 363/363 tx0 dumps in phase2-dumps-730val/ (769 total across tx-indices) STILL diverge at HEAD via
    examples/phase2_repro: is_valid(on-chain)=true but dugite=Err, ~257 "budget exhausted" near-edge (mem_remaining 291/371,
@@ -611,7 +622,13 @@
    reconstruction + #7 sub-tx forward). state:DONE attempts:0
 
 ## In-progress
-- item: #31 [M] witness/body CBOR-strictness ROOT-CAUSED (conf 0.9 upgraded — REAL, 4 parts A/B/C/D). NEXT: FIXING #31-A (witness-set unknown-key reject, cleanest).
+- item: #31-A FIXING DONE (reject unknown witness-set keys, 4 sites all eras; over-strictness verified; 1176/1176) → state:GAUNTLET. NEXT: gauntlet #31-A → commit; then #31-B/C/D.
+  *** wake396 (ultracode): DRIVE #31 ROOT-CAUSED→FIXING #31-A (fix Workflow wvcniku8l, in-turn). PERMALINK-PINNED the Haskell
+  source (cardano-ledger cd8b7fab: txWitnessField n=invalidField n → cborError, all eras). Rejected the witness-set default arm
+  at 4 sites (shelley:1094/alonzo:1019/babbage:910/conway:2232; Allegra+Mary via Alonzo reuse) + flipped 3 skip-tests + added a
+  Conway reject test. OVER-STRICTNESS GUARD INDEPENDENTLY VERIFIED: exactly 4 witness-set skips→rejects, tx-body (#31-B) +
+  CostModels + PParamUpdate UNTOUCHED (their lenient tests still pass), 1176/1176. NEXT WAKE: GAUNTLET #31-A → commit. #31-B
+  (body, era-aware Dijkstra), #31-C (PV9+ set-dedup =#30 fix-B), #31-D (dup-map-key) remain as separate steps.
   *** wake392 (ultracode): SCHEDULE #31, DRIVE NEW→ROOT-CAUSED. HEAD-verified the Conway witness-set `_ => r.skip()`, then
   diagnose Workflow w2g366xg2 (in-turn) SOURCE-CONFIRMED (conf upgraded 0.55→0.9, NOT a #25 false candidate): Haskell SparseKeyed
   txWitnessField/bodyFields = invalidField n → cborError → HARD-FAILS unknown keys (all eras, not version-gated); + Conway PV9+
@@ -3506,6 +3523,7 @@
 - 2026-06-09T01:30Z wake384 ~ #30 ROOT-CAUSED→FIXING (A): sort+dedup in required_signers_to_plutus_padded (matches dugite's existing Set.toList convention; V1/V2/V3 in one helper) + canonicalisation test; INDEPENDENTLY verified 448/448. Uncommitted; gauntlet next
 - 2026-06-09T02:00Z wake388 ~ #30 gauntlet wgvyqtxj0 PASSED 0/3 (substantive, permalink-reconfirmed + PackedBytes-endianness check): sort+dedup==Set.toList for V1/V2/V3, sole live producer. COMMITTED 42bf522984. #30 DONE. Next #31
 - 2026-06-09T02:30Z wake392 ~ #31 NEW→ROOT-CAUSED: diagnose w2g366xg2 (in-turn, conf 0.55→0.9, REAL) — Haskell SparseKeyed hard-fails unknown wits/body keys (invalidField→cborError, all eras) + Conway PV9+ set dup-reject. 4 parts A/B/C(=#30 fix-B)/D, adversarial/latent #539-class. Next FIXING #31-A (witness-set reject)
+- 2026-06-09T03:00Z wake396 ~ #31 ROOT-CAUSED→FIXING #31-A: fix Workflow wvcniku8l (in-turn) rejected unknown witness-set keys at 4 sites (all eras, permalink-pinned Haskell); OVER-STRICTNESS GUARD verified (only witness-set; body/CostModels/PParamUpdate untouched); 1176/1176. Uncommitted; gauntlet next
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -5197,3 +5215,8 @@
   → cborError, all eras) + Conway PV9+ set dup-reject. REAL consensus gap (adversarial/latent, #539 class). 4 parts: A witness-set
   reject, B body-reject (era-aware Dijkstra), C PV9+ set-dedup (=#30 fix-B), D dup-map-key. Excludes lenient CostModels/PParamUpdate.
   state:ROOT-CAUSED. NEXT: FIXING #31-A (witness-set reject, cleanest).
+- wake396 2026-06-09: DRIVE #31 ROOT-CAUSED→FIXING #31-A (fix Workflow wvcniku8l, in-turn). Permalink-pinned Haskell (cardano-
+  ledger cd8b7fab: txWitnessField=invalidField→cborError, all eras), rejected unknown witness-set keys at 4 sites (shelley/
+  alonzo/babbage/conway; Allegra+Mary via reuse) + flipped 3 skip-tests + 1 new Conway test. OVER-STRICTNESS GUARD independently
+  verified: exactly 4 witness-set skips→rejects, tx-body/CostModels/PParamUpdate untouched (lenient tests still pass), 1176/1176.
+  Uncommitted; gauntlet next. state:GAUNTLET (part A). #31-B/C/D remain.
