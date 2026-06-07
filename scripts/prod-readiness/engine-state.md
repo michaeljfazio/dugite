@@ -209,9 +209,16 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #15 (phase-2 serialiseData verbatim-bytes) state:ROOT-CAUSED-CONFIRMED — NOW ACTIVE (see backlog #15 for the
-  byte-level root cause + fix: CEK Constant::Data must carry original CBOR like Haskell MemoBytes; serialiseData
-  returns memo). NEXT WAKE: launch FIX muscle for #15 in dugite-uplc.
+- item: #15 (phase-2 serialiseData verbatim-bytes) state:FIXING. *** wake201: ASSESSED — CEK Data enum (data.rs:65
+  Constr/Map/List/I/B) is PURELY STRUCTURAL (no memo); serialiseData (denotations.rs:601) always to_cbor()-canonical.
+  dugite-uplc is CLEAN + UNDRIFTED from base ca50afd9ef (no bridge needed); plutus_data_to_data (tx_info_populate.rs:
+  302) already has raw_cbor plumbing (~L388/531). #15 = dugite-uplc ONLY, 1 crate. Launched FIX muscle w1xi3j2nf (run
+  wf_75ef4164-1c0): add OPTIONAL original-CBOR memo to Data (Hash/Eq/PartialEq MUST IGNORE it — structural equality
+  unchanged); populate from on-chain CBOR (plutus_data_to_data threads raw_cbor for datum/redeemer/txInfoData +
+  Data::from_cbor); serialiseData returns memo-or-to_cbor; machine-built Data (constrData etc.) NO memo = canonical
+  (matches Haskell MemoBytes/builtinSerialiseData/hashAnnotated). Regression test: CASE-1 276-byte non-canonical datum
+  -> serialiseData returns verbatim (blake2b==bbd35202..) not canonical 270. NEXT WAKE: poll -> build -> replay ep293
+  window (slots 125001020+) -> 306 'Error term' must drop to ~0 -> gauntlet -> commit.
   *** ===== #10 DONE — COMMITTED 125ce7ef18 + PUSHED (prod-readiness-engine, HTTPS) wake200. =====
   6th GAUNTLET w7i0t8l28 REFUTED 3/3 but ALL THREE adversarial-only (malformed-snapshot decoder strictness, NOT
   byte-exactness on real data): R1 decode_varlen no overflow/non-minimal rejection; R2 DEFINITE-map truncation
@@ -1411,6 +1418,10 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
+- wake201 2026-06-07: #15 ROOT-CAUSED-CONFIRMED -> FIXING (first item after #10). Assessed: Data enum purely
+  structural, dugite-uplc clean+undrifted (no bridge), 1 crate. Launched FIX muscle w1xi3j2nf (wf_75ef4164-1c0):
+  optional CBOR memo on Data (Hash/Eq ignore it), threaded from on-chain bytes, serialiseData returns memo. NEXT
+  WAKE: poll -> build -> replay ep293 window -> 306 Error-term -> ~0 -> gauntlet -> commit.
 - wake200 2026-06-07: ***** #10 DONE — COMMITTED 125ce7ef18 + PUSHED *****. 6th gauntlet w7i0t8l28 REFUTED 3/3 but
   ALL adversarial-only (varlen overflow, definite-map truncation, backend dup-key last-wins). HARD POLICY invoked:
   core byte-exact (6 replays, round-5 exhaustive confirm), Mithril-signed => malformed out-of-band, surface unbounded.
