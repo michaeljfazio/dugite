@@ -209,7 +209,17 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:FIXING (polled wake277 — build pid 92379 still compiling, reward-tests pid 92380 running; re-replay next wake once built). ROOT-CAUSED + fix applied (rewards.rs:283 filter removed, uncommitted).
+- item: #0 (mainnet ep246 reserves) state:VERIFYING-REPLAY (fix build OK; verification re-replay launched wake278).
+  Build OK (release 1m49s, recompiled dugite-ledger+node, binary 17:35 -> fix IS in binary). Launched verification
+  re-replay job mainnet-fix-verify pid 93404 (from-genesis over CoW clone db-clones/mainnet-rupd-drop, FIX binary, NO
+  instrumentation env, dumps -> epoch-dumps-engine/mainnet-fix-verify). Running. ~4min to ep246. (reward-tests pid
+  92380 still running at launch — slow proptest; capture result next wake, not the proof.) NEXT WAKE: read
+  epoch-dumps-engine/mainnet-fix-verify/epoch_000246.json -> ASSERT scalars.reserves == 12,880,948,865,137,767 (Koios
+  exact) AND treasury == 292,077,855,298,344 AND ep209-245 reserves/treasury STILL byte-exact vs Koios (no regression
+  from removing the filter). If byte-exact -> gauntlet (muscle, adversarial) -> revert instrumentation (rewards.rs
+  drop-trace + shelley.rs paid-set) -> commit CLEAN fix (rewards.rs only, ≤2 crates) + push. If NOT exact -> the filter
+  removal is incomplete/wrong (re-examine: orphan-pool stake source, or a 2nd factor) — do NOT commit. #438: byte-exact
+  reserves at ep246 + unregressed ep209-245 is the ONLY acceptance.
   *** wake276 (ultracode): analyze muscle wx7gexg1o ROOT-CAUSED with HIGH confidence + full Haskell quotes. **THE BUG:
   crates/dugite-ledger/src/state/rewards.rs:283-287 computes total_active_stake with a SPURIOUS pool-params filter**
   `.filter(|(pool_id,_)| go.pool_params.contains_key(pool_id))`. total_active_stake is the apparent-performance
@@ -2989,3 +2999,7 @@
   total_active_stake=Σ all go.pool_stake). cargo check CLEAN. Build pid 92379 + reward-tests pid 92380. Fix UNCOMMITTED
   until re-replay byte-exact + gauntlet. CAVEAT: prove exact 82,215,213 by replay not assumption. next wake: build->
   re-replay ep246 reserves==12880948865137767 + ep209-245 unregressed -> gauntlet -> commit.
+- wake278 (ultracode): fix build OK (release 1m49s, recompiled dugite-ledger+node, binary 17:35). Launched verification
+  re-replay job mainnet-fix-verify pid 93404 (from-genesis CoW clone, FIX binary, clean/no-instrumentation, dumps->
+  mainnet-fix-verify). next wake: epoch_000246.json reserves==12880948865137767 + treasury==292077855298344 + ep209-245
+  unregressed -> gauntlet -> revert instrumentation -> commit clean rewards.rs fix. reward-tests pid 92380 still running.
