@@ -22,6 +22,36 @@ impl Credential {
         matches!(self, Credential::Script(_))
     }
 
+    /// Order two credentials in **ledger** order: `Script` BEFORE
+    /// `VerificationKey`, tie-broken by the 28-byte hash ascending.
+    ///
+    /// This is the ordering the Haskell ledger `Credential` derives —
+    /// `ScriptHashObj` is the first data constructor and `KeyHashObj` the
+    /// second, so the derived `Ord` is `ScriptHashObj < KeyHashObj`
+    /// (i.e. **Script < Key**). It is the OPPOSITE of this enum's *derived*
+    /// `Ord` (`VerificationKey(0) < Script(1)` ⇒ Key < Script), which models
+    /// the Plutus `Credential` Data-tag order and the canonical CBOR key-byte
+    /// order.
+    ///
+    /// Use this comparator at every site where the *ledger* `Credential`
+    /// ordering is observable — the phase-2 `ScriptContext` / `TxInfo`
+    /// construction and the `redeemerPointerInverse` (`Set.elemAt`) index
+    /// space (e.g. `txInfoWdrl`, `txInfoVotes`, `TreasuryWithdrawals` /
+    /// `UpdateCommittee` maps). The derived `Ord` (Key < Script) MUST stay
+    /// unchanged for its Plutus/CBOR roles.
+    pub fn cmp_ledger(&self, other: &Self) -> core::cmp::Ordering {
+        // Script sorts before VerificationKey: rank Script = 0, Key = 1.
+        fn rank(c: &Credential) -> u8 {
+            match c {
+                Credential::Script(_) => 0,
+                Credential::VerificationKey(_) => 1,
+            }
+        }
+        rank(self)
+            .cmp(&rank(other))
+            .then_with(|| self.to_hash().as_bytes().cmp(other.to_hash().as_bytes()))
+    }
+
     /// Convert to a 32-byte hash that preserves the credential TYPE.
     ///
     /// The 28-byte hash is zero-padded to 32 bytes, with byte 28 set to
@@ -141,10 +171,58 @@ mod tests {
 
     #[test]
     fn test_credential_ord_key_before_script() {
-        // Derived Ord: enum variant order (VerificationKey=0 < Script=1)
+        // Derived Ord: enum variant order (VerificationKey=0 < Script=1) ⇒
+        // Key < Script. This is the *Plutus* `Credential` Data-tag order and
+        // the canonical CBOR key-byte order — it is the OPPOSITE of the
+        // *ledger* `Credential` Ord (`ScriptHashObj < KeyHashObj` ⇒
+        // Script < Key). Where ledger semantics are observable (phase-2
+        // ScriptContext / TxInfo / redeemerPointerInverse index space) use
+        // `Credential::cmp_ledger`, which orders Script before Key. Do NOT
+        // reuse this derived Ord for those sites.
         let key = Credential::VerificationKey(key_hash());
         let script = Credential::Script(script_hash());
         assert!(key < script);
+    }
+
+    // ========== Credential::cmp_ledger (ledger Script < Key) ==========
+
+    #[test]
+    fn test_cmp_ledger_script_before_key_distinct_hashes() {
+        // key_hash()=0x01.., script_hash()=0x02.. — different hashes. Ledger
+        // order puts the Script credential FIRST regardless of hash bytes.
+        let key = Credential::VerificationKey(key_hash());
+        let script = Credential::Script(script_hash());
+        assert_eq!(script.cmp_ledger(&key), core::cmp::Ordering::Less);
+        assert_eq!(key.cmp_ledger(&script), core::cmp::Ordering::Greater);
+        // And the derived enum Ord disagrees (Key < Script) — confirming the
+        // two orderings are genuinely opposite on the type tie-break.
+        assert!(key < script);
+    }
+
+    #[test]
+    fn test_cmp_ledger_script_before_key_same_hash() {
+        // Adversarial same-28-byte-hash collision: the script credential must
+        // still sort before the key credential under the ledger comparator.
+        let same = Hash::from_bytes([0xaa; 28]);
+        let key = Credential::VerificationKey(same);
+        let script = Credential::Script(same);
+        assert_eq!(script.cmp_ledger(&key), core::cmp::Ordering::Less);
+        assert_eq!(key.cmp_ledger(&script), core::cmp::Ordering::Greater);
+        // Reflexive: identical credentials compare Equal.
+        assert_eq!(key.cmp_ledger(&key), core::cmp::Ordering::Equal);
+        assert_eq!(script.cmp_ledger(&script), core::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn test_cmp_ledger_same_type_orders_by_hash() {
+        // Within the same credential type the 28-byte hash breaks the tie,
+        // ascending.
+        let lo = Credential::Script(Hash::from_bytes([0x01; 28]));
+        let hi = Credential::Script(Hash::from_bytes([0x02; 28]));
+        assert_eq!(lo.cmp_ledger(&hi), core::cmp::Ordering::Less);
+        let lo_k = Credential::VerificationKey(Hash::from_bytes([0x01; 28]));
+        let hi_k = Credential::VerificationKey(Hash::from_bytes([0x02; 28]));
+        assert_eq!(lo_k.cmp_ledger(&hi_k), core::cmp::Ordering::Less);
     }
 
     // ========== StakeReference ==========

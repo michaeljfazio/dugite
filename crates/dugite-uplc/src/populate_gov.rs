@@ -114,13 +114,27 @@ pub fn gov_action_id_to_plutus(g: &PrimGovActionId) -> PlGovActionId {
 
 /// Translate the tx body's `voting_procedures` map into the
 /// `Vec<(Voter, Vec<(GovActionId, Vote)>)>` shape that V3 TxInfo
-/// exposes. Inner BTreeMap order is preserved (lex by `GovActionId`
-/// = `(tx_id, idx)` lex order), matching canonical CBOR.
+/// exposes (`txInfoVotes`).
+///
+/// The OUTER `Voter` order must be the ledger `Map Voter` order, NOT the
+/// dugite `BTreeMap<Voter,_>` iteration order. dugite's derived `Voter`
+/// `Ord` tie-breaks CC/DRep inner credentials Key < Script, whereas the
+/// Haskell ledger `Voter`/`Credential` derives Script < Key. We therefore
+/// re-order the entries by [`PrimVoter::cmp_ledger`] (Script < Key inner)
+/// to match `Map.toList` over the ledger `VotingProcedures` map. The inner
+/// `GovActionId` order is preserved (lex by `(tx_id, idx)`), matching the
+/// ledger `Map GovActionId` order and canonical CBOR.
 pub fn voting_procedures_to_plutus(
     vp: &BTreeMap<PrimVoter, BTreeMap<PrimGovActionId, PrimVotingProcedure>>,
 ) -> Vec<(PlVoter, Vec<(PlGovActionId, PlVote)>)> {
-    let mut out: Vec<(PlVoter, Vec<(PlGovActionId, PlVote)>)> = Vec::with_capacity(vp.len());
-    for (voter, votes) in vp {
+    // Collect the voter entries and sort by the LEDGER Voter order
+    // (Script < Key inner credential), rather than relying on dugite's
+    // derived `BTreeMap<Voter,_>` iteration (Key < Script inner).
+    let mut entries: Vec<(&PrimVoter, &BTreeMap<PrimGovActionId, PrimVotingProcedure>)> =
+        vp.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp_ledger(b.0));
+    let mut out: Vec<(PlVoter, Vec<(PlGovActionId, PlVote)>)> = Vec::with_capacity(entries.len());
+    for (voter, votes) in entries {
         let pl_voter = voter_to_plutus(voter);
         let mut pl_votes: Vec<(PlGovActionId, PlVote)> = Vec::with_capacity(votes.len());
         for (gid, vp_inner) in votes {
@@ -1224,6 +1238,61 @@ mod tests {
                 vec![Data::I(BigInt::from(2u64)), Data::I(BigInt::from(3u64))]
             ),
             "Rational must be Constr 0 [I num, I den]"
+        );
+    }
+
+    // txInfoVotes ordering ──────────────────────────────────────
+
+    /// `txInfoVotes` (`Map Voter …`) must list voters in the LEDGER `Map Voter`
+    /// order. For two same-variant (DRep) voters, the ledger orders
+    /// Script < Key, whereas dugite's derived `Voter`/`Credential` Ord orders
+    /// Key < Script. `voting_procedures_to_plutus` re-sorts to ledger order, so
+    /// the SCRIPT DRep must appear FIRST even though the input `BTreeMap` lists
+    /// the key DRep first.
+    #[test]
+    fn voting_procedures_to_plutus_orders_script_voter_before_key_voter() {
+        use crate::script_context::Voter as PlVoter;
+        use dugite_primitives::transaction::{Vote as PrimVote, Voter as PrimVoter};
+
+        let mk_inner = |b: u8| {
+            let mut inner: BTreeMap<GovActionId, PrimVotingProcedure> = BTreeMap::new();
+            inner.insert(
+                GovActionId {
+                    transaction_id: h32(b),
+                    action_index: 0,
+                },
+                PrimVotingProcedure {
+                    vote: PrimVote::Yes,
+                    anchor: None,
+                },
+            );
+            inner
+        };
+
+        let mut vp: BTreeMap<PrimVoter, BTreeMap<GovActionId, PrimVotingProcedure>> =
+            BTreeMap::new();
+        // Key DRep (derived order would place this first).
+        vp.insert(PrimVoter::DRep(key_cred(0x01)), mk_inner(1));
+        // Script DRep (ledger order places this first).
+        vp.insert(PrimVoter::DRep(script_cred(0x99)), mk_inner(2));
+
+        // Sanity: the input BTreeMap iterates the KEY voter first (derived Ord).
+        assert!(matches!(
+            vp.keys().next().unwrap(),
+            PrimVoter::DRep(PrimCred::VerificationKey(_))
+        ));
+
+        let out = voting_procedures_to_plutus(&vp);
+        assert_eq!(out.len(), 2);
+        assert!(
+            matches!(out[0].0, PlVoter::DrepVoter(PlCredential::Script(h)) if h == [0x99u8; 28]),
+            "txInfoVotes[0] must be the SCRIPT DRep (ledger Script<Key); got {:?}",
+            out[0].0
+        );
+        assert!(
+            matches!(out[1].0, PlVoter::DrepVoter(PlCredential::PubKey(h)) if h == [0x01u8; 28]),
+            "txInfoVotes[1] must be the KEY DRep; got {:?}",
+            out[1].0
         );
     }
 }

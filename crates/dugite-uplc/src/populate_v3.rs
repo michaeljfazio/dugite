@@ -51,7 +51,6 @@ use crate::tx_info_populate::{
     plutus_data_to_data, required_signers_to_plutus_padded, sort_inputs, tx_hash_to_array,
     valid_range_to_posix,
 };
-use dugite_primitives::address::Address as PrimAddress;
 use dugite_primitives::transaction::{
     RedeemerTag, Transaction as PrimTransaction, TransactionInput as PrimTxIn,
     TransactionOutput as PrimTxOut,
@@ -102,22 +101,14 @@ pub fn populate_tx_info_v3(
     // Translate withdrawals into the V3 wdrl map (field 6 of txInfoV3).
     // V3 key type is `Credential` DIRECTLY — NOT wrapped in StakingHash as V1/V2 did.
     // `tx.body.withdrawals` is a BTreeMap<Vec<u8>, Lovelace> keyed by 29-byte
-    // reward-account blobs in lex order (canonical CBOR map order). Iteration
-    // over BTreeMap is in key order, so the resulting Vec preserves that order.
+    // reward-account blobs in raw-blob lex order (header high-nibble 0xE=key
+    // before 0xF=script ⇒ Key < Script). The ledger `Map RewardAccount Coin`
+    // orders by `(Network, Credential Script<Key, hash)` ⇒ Script < Key, so we
+    // re-order via `ledger_ordered_withdrawals` to match `Map.toList` byte-exact.
     let wdrl = {
-        let mut out: Vec<(Credential, BigInt)> = Vec::with_capacity(tx.body.withdrawals.len());
-        for (reward_account, amount) in &tx.body.withdrawals {
-            let addr = PrimAddress::from_bytes(reward_account).map_err(|e| {
-                PhaseTwoError::Internal(format!("populate_tx_info_v3: wdrl reward_account: {e}"))
-            })?;
-            let stake = match addr {
-                PrimAddress::Reward(r) => r.stake,
-                other => {
-                    return Err(PhaseTwoError::Internal(format!(
-                        "populate_tx_info_v3: wdrl expected Reward address, got {other:?}"
-                    )));
-                }
-            };
+        let ordered = crate::tx_info_populate::ledger_ordered_withdrawals(&tx.body.withdrawals)?;
+        let mut out: Vec<(Credential, BigInt)> = Vec::with_capacity(ordered.len());
+        for (stake, amount) in ordered {
             out.push((credential_to_plutus(&stake), BigInt::from(amount.0)));
         }
         out

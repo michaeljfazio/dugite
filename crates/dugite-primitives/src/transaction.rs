@@ -505,6 +505,55 @@ pub enum Voter {
     StakePool(Hash32),
 }
 
+impl Voter {
+    /// Order two voters in **ledger** order, matching the Haskell ledger
+    /// `Voter` derived `Ord`:
+    ///
+    /// ```haskell
+    /// data Voter
+    ///   = CommitteeVoter !(Credential 'HotCommitteeRole)
+    ///   | DRepVoter      !(Credential 'DRepRole)
+    ///   | StakePoolVoter !(KeyHash 'StakePool)
+    ///   deriving (... Ord ...)
+    /// ```
+    ///
+    /// The variant order is the SAME as this enum's derived order
+    /// (`CommitteeVoter < DRepVoter < StakePoolVoter`), so the discriminant
+    /// rank is unchanged. The difference is the *inner* tie-break: the ledger
+    /// `Credential` orders **Script < Key** (see [`Credential::cmp_ledger`]),
+    /// whereas this enum's derived `Ord` orders Key < Script. Use this
+    /// comparator wherever the ledger `Set Voter` / `Map Voter` `elemAt`
+    /// order is observable (the phase-2 `txInfoVotes` map and the
+    /// `ConwayVoting` `redeemerPointerInverse` index space). `StakePool`
+    /// voters are key-only (no credential type), so they tie-break by the raw
+    /// `Hash32` bytes — identical to the derived order.
+    ///
+    /// Note the wire CBOR tags interleave the credential type
+    /// (CommitteeVoter+Key = 0, CommitteeVoter+Script = 1, …), so the CBOR
+    /// tag order is NOT this ledger `Set`/`Map` order — the redeemer index
+    /// space follows this `Ord`, not the wire tags.
+    pub fn cmp_ledger(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        fn rank(v: &Voter) -> u8 {
+            match v {
+                Voter::ConstitutionalCommittee(_) => 0,
+                Voter::DRep(_) => 1,
+                Voter::StakePool(_) => 2,
+            }
+        }
+        match rank(self).cmp(&rank(other)) {
+            Ordering::Equal => match (self, other) {
+                (Voter::ConstitutionalCommittee(a), Voter::ConstitutionalCommittee(b))
+                | (Voter::DRep(a), Voter::DRep(b)) => a.cmp_ledger(b),
+                (Voter::StakePool(a), Voter::StakePool(b)) => a.cmp(b),
+                // Unreachable: equal rank ⇒ same variant.
+                _ => Ordering::Equal,
+            },
+            other_ordering => other_ordering,
+        }
+    }
+}
+
 /// Vote
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Vote {

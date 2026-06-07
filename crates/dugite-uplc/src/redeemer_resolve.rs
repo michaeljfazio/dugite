@@ -28,7 +28,7 @@ use crate::tx_info_populate::{script_ref_hash, sort_inputs};
 use dugite_primitives::credentials::Credential as PrimCred;
 use dugite_primitives::transaction::{
     PlutusData as PrimPlutusData, Redeemer, RedeemerTag, ScriptRef as PrimScriptRef, Transaction,
-    TransactionInput as PrimTxIn, TransactionOutput as PrimTxOut,
+    TransactionInput as PrimTxIn, TransactionOutput as PrimTxOut, Voter as PrimVoter,
 };
 
 /// Plutus language version a script targets.
@@ -252,25 +252,21 @@ fn resolve_reward(
     resolved: &[(PrimTxIn, PrimTxOut, Vec<u8>)],
 ) -> Result<ResolvedRedeemer, PhaseTwoError> {
     let idx = r.index as usize;
-    // Withdrawals map iterates in BTreeMap order (lex by reward_account bytes).
-    let (reward_account, _) = tx.body.withdrawals.iter().nth(idx).ok_or_else(|| {
+    // The Reward redeemer index addresses the LEDGER `Map RewardAccount Coin`
+    // `Set.elemAt`/`redeemerPointerInverse` order, NOT the dugite blob
+    // `BTreeMap` order. The ledger `RewardAccount` Ord is
+    // `(Network, Credential Script<Key, hash)`; the blob `BTreeMap` orders by
+    // the raw `[header||hash]` bytes, whose header high-nibble puts key
+    // (`0xE_`) before script (`0xF_`) ⇒ Key < Script — INVERTED from the
+    // ledger. Within a tx all reward accounts share one network, so we order
+    // by the stake credential's ledger order (Script < Key, then hash).
+    let ordered = crate::tx_info_populate::ledger_ordered_withdrawals(&tx.body.withdrawals)?;
+    let (stake_cred, _) = ordered.into_iter().nth(idx).ok_or_else(|| {
         PhaseTwoError::Internal(format!(
             "reward redeemer references withdrawals[{idx}] but tx has {n}",
             n = tx.body.withdrawals.len()
         ))
     })?;
-    // Parse the 29-byte reward-address blob and unwrap to the stake credential.
-    let addr = dugite_primitives::address::Address::from_bytes(reward_account).map_err(|e| {
-        PhaseTwoError::Internal(format!("reward redeemer #{idx}: reward_account: {e}"))
-    })?;
-    let stake_cred = match addr {
-        dugite_primitives::address::Address::Reward(r) => r.stake,
-        other => {
-            return Err(PhaseTwoError::Internal(format!(
-                "reward redeemer #{idx}: expected Reward address, got {other:?}"
-            )));
-        }
-    };
     let script_hash = match stake_cred {
         PrimCred::Script(h) => h.0,
         PrimCred::VerificationKey(_) => {
@@ -312,10 +308,16 @@ fn resolve_vote(
 ) -> Result<ResolvedRedeemer, PhaseTwoError> {
     let idx = r.index as usize;
     // `voting_procedures` is `BTreeMap<Voter, BTreeMap<GovActionId, VotingProcedure>>`.
-    // `Voter` derives `Ord` by constructor order: ConstitutionalCommittee < DRep < StakePool
-    // (matching the CBOR wire tags 0/2/4). Iteration in `Map.toList` order is the canonical
-    // index space for `ConwayVoting` redeemers.
-    let (voter, _) = tx.body.voting_procedures.iter().nth(idx).ok_or_else(|| {
+    // The `ConwayVoting` redeemer index addresses the LEDGER `Map Voter`
+    // `Set.elemAt`/`redeemerPointerInverse` order, NOT the dugite
+    // `BTreeMap<Voter,_>` iteration order. The variant order
+    // (ConstitutionalCommittee < DRep < StakePool) matches, but dugite's
+    // derived `Voter` `Ord` tie-breaks CC/DRep inner credentials Key < Script,
+    // whereas the ledger `Voter`/`Credential` derives Script < Key. Re-order
+    // by `Voter::cmp_ledger` to match the ledger index space.
+    let mut voters: Vec<&PrimVoter> = tx.body.voting_procedures.keys().collect();
+    voters.sort_by(|a, b| a.cmp_ledger(b));
+    let voter = *voters.get(idx).ok_or_else(|| {
         PhaseTwoError::Internal(format!(
             "vote redeemer references voting_procedures[{idx}] but tx has {n}",
             n = tx.body.voting_procedures.len()
@@ -1408,5 +1410,138 @@ mod tests {
         let err = resolve_redeemers(&tx, &[]).unwrap_err();
         // InfoAction has no policy_hash → Internal
         assert!(matches!(err, PhaseTwoError::Internal(_)));
+    }
+
+    // ────────────────────────────────────────────────────────────
+    // ledger-order (Script < Key) redeemer index space
+    // ────────────────────────────────────────────────────────────
+
+    /// Encode a 29-byte reward-account blob `[header || hash28]`. Header high
+    /// nibble `0xE`=key / `0xF`=script, low nibble = network id.
+    fn reward_blob(is_script: bool, net: u8, hash: [u8; 28]) -> Vec<u8> {
+        let header = if is_script { 0xf0 } else { 0xe0 } | (net & 0x0f);
+        let mut v = Vec::with_capacity(29);
+        v.push(header);
+        v.extend_from_slice(&hash);
+        v
+    }
+
+    /// The `Rewarding` redeemer index addresses the LEDGER
+    /// `Map RewardAccount Coin` `Set.elemAt` order (Script < Key stake
+    /// credential), NOT the raw reward-account blob order (Key < Script). A
+    /// `Reward` redeemer with index 0 must therefore resolve to the SCRIPT
+    /// account even though the blob `BTreeMap` lists the key account first.
+    #[test]
+    fn reward_redeemer_index_uses_ledger_script_before_key_order() {
+        let script_bytes = vec![0xca, 0xfe, 0xba, 0xbe];
+        let script_hash = plutus_v3_script_with_hash(&script_bytes);
+
+        // Key account: header 0xE0 (key). Script account: header 0xF0 (script).
+        // In raw-blob order 0xE0.. < 0xF0.. ⇒ the key account is blob-index 0.
+        let key_blob = reward_blob(false, 0, [0x11u8; 28]);
+        let script_blob = reward_blob(true, 0, script_hash);
+
+        let mut body = minimal_body();
+        body.withdrawals.insert(key_blob.clone(), Lovelace(7));
+        body.withdrawals.insert(script_blob.clone(), Lovelace(9));
+
+        // Sanity: blob order really does put the key account first.
+        assert_eq!(body.withdrawals.keys().next().unwrap(), &key_blob);
+
+        let mut ws = empty_witness();
+        ws.plutus_v3_scripts = vec![script_bytes];
+        ws.redeemers = vec![Redeemer {
+            tag: RedeemerTag::Reward,
+            index: 0, // ledger order → the SCRIPT account
+            data: PrimPlutusData::Integer(num_bigint::BigInt::from(0)),
+            ex_units: ExUnits { mem: 1, steps: 1 },
+        }];
+        let tx = build_tx(body, ws);
+        let r = resolve_redeemers(&tx, &[]).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(
+            r[0].script_hash, script_hash,
+            "Reward index 0 must resolve to the script account (ledger Script<Key)"
+        );
+        assert!(matches!(
+            r[0].purpose,
+            ScriptPurpose::Rewarding(crate::script_context::Credential::Script(h)) if h == script_hash
+        ));
+
+        // Cross-check: under the OLD raw-blob order, index 0 would be the key
+        // account, which cannot dispatch a Plutus script — confirming the fix
+        // is load-bearing (the resolution would have been a hard error / wrong
+        // account before the ledger re-order).
+        let key_first =
+            crate::tx_info_populate::ledger_ordered_withdrawals(&tx.body.withdrawals).unwrap();
+        assert!(
+            matches!(key_first[0].0, PrimCred::Script(_)),
+            "ledger order must put the script account at index 0"
+        );
+    }
+
+    /// The `ConwayVoting` redeemer index addresses the LEDGER `Map Voter`
+    /// `Set.elemAt` order. For two same-variant (DRep) voters, the ledger
+    /// orders Script < Key, whereas dugite's derived `Voter`/`Credential` Ord
+    /// orders Key < Script. With a key DRep whose hash would place it FIRST
+    /// under the derived order, a `Vote` redeemer with index 0 must still
+    /// resolve to the SCRIPT DRep under the ledger order — and the key voter
+    /// (which cannot run Plutus) must NOT be selected.
+    #[test]
+    fn vote_redeemer_index_uses_ledger_script_before_key_order() {
+        use dugite_primitives::transaction::{GovActionId, Vote, Voter, VotingProcedure};
+        let script_bytes = vec![0xbe, 0xef];
+        let script_hash = plutus_v3_script_with_hash(&script_bytes);
+
+        let mk_inner = |b: u8| {
+            let mut inner = std::collections::BTreeMap::new();
+            inner.insert(
+                GovActionId {
+                    transaction_id: h32(b),
+                    action_index: 0,
+                },
+                VotingProcedure {
+                    vote: Vote::Yes,
+                    anchor: None,
+                },
+            );
+            inner
+        };
+
+        let mut body = minimal_body();
+        // Key DRep with a LOW hash — under the derived Ord (Key < Script) this
+        // would be index 0; under the ledger Ord (Script < Key) it is index 1.
+        body.voting_procedures.insert(
+            Voter::DRep(PrimCred::VerificationKey(h28(0x01))),
+            mk_inner(1),
+        );
+        // Script DRep — index 0 under the ledger Ord.
+        body.voting_procedures.insert(
+            Voter::DRep(PrimCred::Script(Hash::<28>(script_hash))),
+            mk_inner(2),
+        );
+
+        // Sanity: dugite's derived BTreeMap order lists the KEY voter first.
+        assert!(matches!(
+            body.voting_procedures.keys().next().unwrap(),
+            Voter::DRep(PrimCred::VerificationKey(_))
+        ));
+
+        let mut ws = empty_witness();
+        ws.plutus_v3_scripts = vec![script_bytes];
+        ws.redeemers = vec![Redeemer {
+            tag: RedeemerTag::Vote,
+            index: 0, // ledger order → the SCRIPT DRep
+            data: PrimPlutusData::Integer(num_bigint::BigInt::from(0)),
+            ex_units: ExUnits { mem: 1, steps: 1 },
+        }];
+        let tx = build_tx(body, ws);
+        let r = resolve_redeemers(&tx, &[]).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(
+            r[0].script_hash, script_hash,
+            "Vote index 0 must resolve to the script DRep (ledger Script<Key)"
+        );
+        assert!(matches!(r[0].purpose, ScriptPurpose::Voting(_)));
     }
 }
