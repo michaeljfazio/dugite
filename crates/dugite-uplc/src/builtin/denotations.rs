@@ -2250,6 +2250,89 @@ mod tests {
         }
     }
 
+    /// `serialiseData` is, in Haskell, the *structural canonical re-encode*
+    /// `BSL.toStrict . serialise` (NOT a memoised verbatim copy of the
+    /// on-chain bytes). A non-empty Constr's args array is therefore
+    /// rendered with cborg's indefinite-length list framing
+    /// (`0x9f … 0xff`), and an empty one with the definite `0x80`.
+    ///
+    /// This test runs the real `SerialiseData` builtin on a *machine-
+    /// constructed* `Data` (no memo could exist) and asserts the
+    /// indefinite framing — guarding against a regression to definite
+    /// arrays (the original suspected #15 bug) AND against a "return the
+    /// verbatim input bytes" memo implementation.
+    #[test]
+    fn serialise_data_uses_indefinite_arrays_for_nonempty_constr() {
+        // Constr 1 [ Constr 0 [ B 0xab, I 7 ] ]
+        let d = data_val(Data::Constr(
+            1,
+            vec![Data::Constr(
+                0,
+                vec![Data::B(vec![0xab]), Data::I(BigInt::from(7))],
+            )],
+        ));
+        let v = run(BuiltinId::SerialiseData, vec![d]).unwrap();
+        let Value::Const(Constant::ByteString(bytes)) = v else {
+            panic!("expected ByteString");
+        };
+        assert_eq!(hex::encode(&bytes), "d87a9fd8799f41ab07ffff");
+    }
+
+    /// Gold byte-exact regression for divergence #15 (preprod PlutusV3
+    /// script 7afbde08, tx 27751ab9): the script computes
+    /// `blake2b256(serialiseData datum) == datum_hash`. The real on-chain
+    /// datum (276 bytes, 8 indefinite-length arrays, prefix
+    /// `d87a9fd8799f…`) hashes to the on-chain datum_hash
+    /// `bbd352028feffe9a80a2822b46b9858bc1cf883cff383e1191b47d27ed708eb0`.
+    ///
+    /// We feed the *structurally-decoded* datum into the real
+    /// `SerialiseData` builtin and assert `blake2b256` of the result equals
+    /// that datum_hash. This proves dugite's `serialiseData` is byte-exact
+    /// with cardano-node for the exact failing tx — without any memoisation
+    /// of original bytes.
+    ///
+    /// Datum bytes sourced from Koios preprod `/datum_info`
+    /// (datum_hash bbd352…, creation tx d653e369…).
+    #[test]
+    fn serialise_data_gold_preprod_datum_hash_matches_onchain() {
+        use crate::data::Data;
+        const GOLD_DATUM_HEX: &str = "d87a9fd8799fd8799fd8799f581c9929c128c357ff9b7bdd79ee69d3540e87da001777f15a4c914928dcffd87a80ff1a017d78401a004c4b401a0243d5801b0000019e5bf806edd8799fd8799f581c43d7590ef124ba849222553b19fb84d056a7306dbcfec925002896f3ffd87a80ff58205afe303b6b0feae7632926b07e73921978d8fa7f02ca358a8676de1d3381b89c582097450e7fc42aa1f45e9f0abda20d32024bc40c3351a390ec409a42951657b2c858201dec2a9a7014a1fa0ae3b3fb7d8b483e5f40c427627d8b1c73f3fec282904d62581c57a437cbed5709a2214d40bdf44eb08d1b88e97967798d83ec774fb6581c535e4be12d936e564b44b33618f2ae55090b1ac0f3be37ef8beb60e7ffff";
+        const ON_CHAIN_DATUM_HASH: &str =
+            "bbd352028feffe9a80a2822b46b9858bc1cf883cff383e1191b47d27ed708eb0";
+
+        let datum_bytes = hex::decode(GOLD_DATUM_HEX).unwrap();
+        // Decode structurally (mirrors how a datum reaches the script as a
+        // `Constant::Data` value) — discards any "original bytes" channel.
+        let d = Data::from_cbor(&datum_bytes).unwrap();
+
+        // Run the actual builtin.
+        let v = run(
+            BuiltinId::SerialiseData,
+            vec![Value::Const(Constant::Data(d))],
+        )
+        .unwrap();
+        let Value::Const(Constant::ByteString(serialised)) = v else {
+            panic!("expected ByteString");
+        };
+
+        // serialiseData must reproduce the on-chain bytes exactly …
+        assert_eq!(
+            hex::encode(&serialised),
+            GOLD_DATUM_HEX,
+            "serialiseData(datum) must equal the on-chain datum bytes"
+        );
+        // … hence blake2b256 must equal the on-chain datum_hash.
+        let digest = {
+            use blake2::Digest;
+            blake2::Blake2b::<blake2::digest::consts::U32>::digest(&serialised).to_vec()
+        };
+        assert_eq!(
+            hex::encode(digest),
+            ON_CHAIN_DATUM_HASH,
+            "blake2b256(serialiseData datum) must equal the on-chain datum_hash"
+        );
+    }
+
     // ── Ed25519 ─────────────────────────────────────────────────────
 
     #[test]

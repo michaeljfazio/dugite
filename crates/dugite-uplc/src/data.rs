@@ -14,8 +14,13 @@
 //!    array `[i_as_u64, ds_as_array]`.
 //!  - `Map es` → definite-length CBOR map (Haskell encoder always uses
 //!    definite-length maps for Data).
-//!  - `List ds` → definite-length CBOR array if `len ≤ 64`, otherwise
-//!    indefinite-length. The decoder accepts either form.
+//!  - `List ds` (and the args array of any `Constr i ds`) → encoded via
+//!    the `cborg` `Serialise [a]` rule: an **empty** list is the
+//!    definite-length `0x80` (`encodeListLen 0`); a **non-empty** list
+//!    is the **indefinite**-length form `0x9f <items> 0xff`
+//!    (`encodeListLenIndef … encodeBreak`). The decoder accepts either
+//!    form. See `encode_list` for the byte-exact reproduction and the
+//!    Haskell source quote.
 //!  - `I i` → CBOR major-0/major-1 for `|i| < 2^64`; otherwise CBOR
 //!    tag 2 (positive bignum) or tag 3 (negative bignum) wrapping a
 //!    byte string ≤ 64 bytes.
@@ -164,18 +169,41 @@ fn encode_args<W: minicbor::encode::Write>(
     encode_list(e, args)
 }
 
-/// Encode a list of `Data` using the `Serialise [a]` rule from `cborg`:
+/// Encode a list of `Data` using the `Serialise [a]` rule from `cborg`.
+///
+/// This is the byte-exact behaviour required by the Plutus `serialiseData`
+/// builtin, whose Haskell denotation is a *structural canonical re-encode*
+/// (NOT a memoised verbatim copy of the on-chain bytes):
 ///
 /// ```text
-/// encodeList [] = encodeListLen 0
-/// encodeList xs = encodeListLenIndef <> foldr (\x r -> encode x <> r) encodeBreak xs
+/// -- plutus-core/.../PlutusCore/Default/Builtins.hs
+/// toBuiltinMeaning _semvar SerialiseData =
+///     let serialiseDataDenotation :: Data -> BS.ByteString
+///         serialiseDataDenotation = BSL.toStrict . serialise
+///      in makeBuiltinMeaning serialiseDataDenotation
+///           (runCostingFunOneArgument . paramSerialiseData)
 /// ```
 ///
-/// i.e. an empty list is `0x80` (definite length zero); a non-empty
-/// list is `0x9f <items> 0xff` (indefinite length). This empty / non-
-/// empty asymmetry is what cborg's `Codec.Serialise.Class.encodeList`
-/// produces, and reproducing it byte-for-byte is required for wire
-/// compatibility with cardano-node's PlutusData hashes.
+/// `serialise` is `Codec.Serialise.serialise` over the `Serialise Data`
+/// instance (`encode = encodeData`). `encodeData` emits `List ds -> encode ds`
+/// and `Constr i ds -> encodeTag … <> encode ds`, where `encode ds` reuses
+/// the `cborg` `Serialise [a]` instance:
+///
+/// ```text
+/// -- serialise: Codec/Serialise/Class.hs   (defaultEncodeList)
+/// defaultEncodeList []     = encodeListLen 0
+/// defaultEncodeList (x:xs) = encodeListLenIndef
+///                          <> foldr (\v r -> encode v <> r) encodeBreak (x:xs)
+/// ```
+///
+/// i.e. an empty list is `0x80` (definite length zero); a non-empty list
+/// is `0x9f <items> 0xff` (indefinite length). Because `serialise` ALWAYS
+/// re-encodes structurally, a non-canonical on-chain `Data` (e.g. a
+/// definite-length non-empty Constr-args array) is re-encoded into this
+/// indefinite form — the original verbatim bytes are NOT preserved. We
+/// therefore must reproduce this empty/non-empty asymmetry byte-for-byte
+/// (rather than memoise the input bytes) to keep
+/// `blake2b256(serialiseData d)` equal to cardano-node's.
 fn encode_list<W: minicbor::encode::Write>(
     e: &mut Encoder<W>,
     items: &[Data],
@@ -592,6 +620,90 @@ mod tests {
         // First byte must be 0x5f (indefinite-length byte string).
         assert_eq!(bytes[0], 0x5f, "expected indefinite-length byte string");
         assert_eq!(rt(&d), d);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // `serialiseData` byte-exactness vs Haskell `encodeData` / cborg.
+    //
+    // Haskell `serialiseData` is `BSL.toStrict . serialise` — a
+    // *structural canonical re-encode*. The `Serialise [a]` instance
+    // (`defaultEncodeList`) renders an empty list as the definite `0x80`
+    // and any non-empty list as the indefinite `0x9f … 0xff`. These
+    // tests pin that asymmetry and, crucially, prove that a non-canonical
+    // (definite-length, non-empty) input is RE-ENCODED to indefinite —
+    // i.e. `to_cbor()` is NOT a memoised verbatim copy of the input.
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn empty_constr_args_are_definite_0x80() {
+        // Constr 0 [] → tag 121 (0xd879) + empty list (0x80).
+        let d = Data::Constr(0, vec![]);
+        assert_eq!(hex::encode(d.to_cbor().unwrap()), "d87980");
+        // Bare empty List → 0x80.
+        assert_eq!(hex::encode(Data::List(vec![]).to_cbor().unwrap()), "80");
+    }
+
+    #[test]
+    fn nonempty_constr_args_are_indefinite_0x9f_0xff() {
+        // Constr 1 [ Constr 0 [ B 0xab, I 7 ] ]
+        //   → d87a 9f ( d879 9f 41ab 07 ff ) ff
+        // This is the on-chain shape `d87a9fd8799f…` of the failing-tx
+        // datum: the args arrays are INDEFINITE-length.
+        let d = Data::Constr(
+            1,
+            vec![Data::Constr(
+                0,
+                vec![Data::B(vec![0xab]), Data::I(BigInt::from(7))],
+            )],
+        );
+        assert_eq!(hex::encode(d.to_cbor().unwrap()), "d87a9fd8799f41ab07ffff");
+        // Bare non-empty List uses the same indefinite framing.
+        let l = Data::List(vec![Data::I(BigInt::from(1)), Data::I(BigInt::from(2))]);
+        assert_eq!(hex::encode(l.to_cbor().unwrap()), "9f0102ff");
+    }
+
+    #[test]
+    fn definite_input_is_reencoded_to_indefinite_not_memoised() {
+        // Feed a DEFINITE-length non-empty Constr (`d87a81…`) — a
+        // perfectly valid, decodable, but non-canonical encoding. Haskell
+        // `serialise` re-encodes it to the indefinite form; so must we.
+        // If `serialiseData` instead returned the *verbatim* input bytes
+        // (a "memoise the original" implementation), this assertion would
+        // fail and the resulting hash would diverge from cardano-node.
+        let definite_input = hex::decode("d87a81d8798241ab07").unwrap();
+        let d = Data::from_cbor(&definite_input).unwrap();
+        let reenc = d.to_cbor().unwrap();
+        assert_eq!(
+            hex::encode(&reenc),
+            "d87a9fd8799f41ab07ffff",
+            "definite-length input must be re-encoded as indefinite"
+        );
+        assert_ne!(
+            definite_input, reenc,
+            "to_cbor() must NOT echo the verbatim (non-canonical) input"
+        );
+    }
+
+    #[test]
+    fn gold_failing_tx_datum_round_trips_byte_exact() {
+        // Real on-chain PlutusV3 datum from preprod tx
+        // d653e36923…(creation) — its blake2b256 is the on-chain
+        // datum_hash bbd352028feffe9a80a2822b46b9858bc1cf883cff383e1191b47d27ed708eb0.
+        // Source: Koios preprod /datum_info. 276 bytes, 8 indefinite-length
+        // CBOR arrays (`d87a9fd8799f…`). Decoding then re-encoding with
+        // `to_cbor()` must reproduce the bytes EXACTLY, which is what makes
+        // `serialiseData(datum)` hash to the on-chain datum_hash and lets
+        // PlutusV3 7afbde08's `blake2b256(serialiseData datum) == datum_hash`
+        // check pass.
+        const GOLD_DATUM_HEX: &str = "d87a9fd8799fd8799fd8799f581c9929c128c357ff9b7bdd79ee69d3540e87da001777f15a4c914928dcffd87a80ff1a017d78401a004c4b401a0243d5801b0000019e5bf806edd8799fd8799f581c43d7590ef124ba849222553b19fb84d056a7306dbcfec925002896f3ffd87a80ff58205afe303b6b0feae7632926b07e73921978d8fa7f02ca358a8676de1d3381b89c582097450e7fc42aa1f45e9f0abda20d32024bc40c3351a390ec409a42951657b2c858201dec2a9a7014a1fa0ae3b3fb7d8b483e5f40c427627d8b1c73f3fec282904d62581c57a437cbed5709a2214d40bdf44eb08d1b88e97967798d83ec774fb6581c535e4be12d936e564b44b33618f2ae55090b1ac0f3be37ef8beb60e7ffff";
+        let datum = hex::decode(GOLD_DATUM_HEX).unwrap();
+        assert_eq!(datum.len(), 276);
+        let d = Data::from_cbor(&datum).unwrap();
+        let reenc = d.to_cbor().unwrap();
+        assert_eq!(
+            reenc, datum,
+            "serialiseData(datum) must reproduce the verbatim-equivalent 276-byte canonical form"
+        );
     }
 
     #[test]
