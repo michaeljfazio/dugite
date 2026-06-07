@@ -263,11 +263,19 @@
    cap_treasury decrement → the edge test FAILED (B wrongly enacted at 600M = the over-disbursement); restored → passes; the
    all-registered test passed under BOTH (isolating exactly the divergence). *** INDEPENDENTLY RE-VERIFIED (#438): cap_treasury
    decrement = FULL fold not disbursed, :2288 absent from the diff (untouched), fmt=0 clippy=0 nextest 1525/1525 incl. both
-   treasury tests. state:GAUNTLET attempts:2 conf:0.90. *** NEXT WAKE — RE-RUN the #29 gauntlet (gauntlet-29, same 3 lenses incl.
+   treasury tests. state:DONE attempts:2 conf:0.95 COMMITTED f816efc9b1 wake376 (gauntlet w7yhosc8m PASSED 0/3 substantive; cap_treasury==ensTreasury byte-exact). superseded *** NEXT WAKE — RE-RUN the #29 gauntlet (gauntlet-29, same 3 lenses incl.
    the disbursed-vs-full-sum lens which should now PASS) on the reworked code → commit on pass. *** NEXT WAKE — GAUNTLET (lenses: Haskell-single-subtraction exact match,
    single-withdrawal + validated-era no-regression, the disbursed-vs-full-sum cap-basis residual for unregistered targets) →
    commit on pass. Test-construction gotcha recorded: reward_account_to_hash keys on the 28-byte CREDENTIAL bytes[1..29], NOT
    byte[0] (network/script header) — vary byte[1] to make distinct accounts.
+29-order. [L][ledger/governance][NEW wake376] Within-pass gov-action ORDER: dugite ratifies/considers same-priority proposals
+   (TreasuryWithdrawals priority 5) in GovActionId/ImblOrdMap byte order, whereas Haskell uses OMap SUBMISSION order. When
+   multiple same-priority actions only PARTIALLY fit (e.g. competing TreasuryWithdrawals exceeding the treasury together), this
+   can change WHICH proposal is blocked/enacted (not the cap VALUE). PRE-EXISTING (the old #29 accumulator used the same loop
+   order; surfaced by the #29 gauntlet w7yhosc8m as a non-refuting residual), orthogonal to #29. how_to_confirm: two competing
+   same-priority gov actions submitted in an order that differs from their GovActionId sort, where only the first-submitted fits
+   → Haskell enacts the first-submitted, dugite enacts the GovActionId-smaller; diff vs cardano-node ratify order. Hask: Conway
+   GovActionState OMap submission order + actionPriority. state:NEW attempts:0 conf:0.7
 30. [M][phase2][NEW] txInfoSignatories preserves on-wire order instead of Set.toList sorted+deduped.
    required_signers_to_plutus_padded (tx_info_populate.rs:481-485) maps Vec<Hash32> in wire order, no sort/dedup; wire Vec
    preserved (era decoders read_set only strips tag-258, no sort/dedup). Haskell txInfoSignatories = Set.toList
@@ -540,7 +548,15 @@
    reconstruction + #7 sub-tx forward). state:DONE attempts:0
 
 ## In-progress
-- item: #29 byte-exact REWORK DONE (transient cap_treasury full-fold-decremented; over-disbursement edge fixed; 1525/1525) → state:GAUNTLET. NEXT: re-gauntlet → commit.
+- item: #29 DONE (committed f816efc9b1) — byte-exact TreasuryWithdrawals cap basis (cap_treasury==ensTreasury), gauntlet PASSED 0/3. NEXT: #30 [M] txInfoSignatories sort.
+  *** wake376 (ultracode): re-ran the #29 gauntlet (w7yhosc8m, 3 lenses) on the reworked code → PASSED 0/3, each lens
+  substantive + cross-checked conway.md. cap_treasury (full-fold) == Haskell ensTreasury for ALL cases incl. unregistered;
+  epochs.treasury.0 (disbursed) == casTreasury, :2288 untouched, no leak (engine-verified); ep247 pre-Conway so validated range
+  unaffected. COMMITTED f816efc9b1 (dugite-ledger, local). #29 CLOSED (the full lifecycle: diagnose→fix-v1→gauntlet-REFUTED→
+  byte-exact-rework→gauntlet-PASS — the adversarial panel caught v1's over-disbursement edge). *** REMAINING backlog: #30 [M]
+  txInfoSignatories sort (phase-2, next), #31 [M] witness-set silent-skip, #28b [M] encoder must chunk >64B PlutusData leaves,
+  #29-order [L] gov-action within-pass ordering (NEW, pre-existing), #26b (excluded gov-map ordering), #24 (deferred). NEXT
+  WAKE: SCHEDULE #30 → DIAGNOSE.
   *** wake372 (ultracode): DRIVE the #29 byte-exact rework (rework Workflow wpn0y1m1z, in-turn ~16min). Introduced transient
   cap_treasury (init=epochs.treasury.0; decremented by the FULL fold per enact, :2791) for the cap check; kept epochs.treasury.0
   disbursed-decremented (:2288 untouched). This mirrors Haskell ensTreasury (cap) vs casTreasury (real). Added an unregistered-
@@ -3197,6 +3213,14 @@
 - db-clones/preprod-ep57-fixed   (fixed-binary replay, in progress)
 
 ## Gauntlet ledger  (passed/refuted approaches — never silently retry a REFUTED)
+- PASSED 2026-06-09 (wake376, #29 cap_treasury REWORK, gauntlet w7yhosc8m): 0/3 refute, each lens SUBSTANTIVE (read code +
+  cross-checked conway.md). (1) cap_treasury == Haskell ensTreasury byte-for-byte: init at pass-start, FULL-fold decrement for
+  registered AND unregistered, threaded (mut outside loop), compared as withdrawalCanWithdraw, decrements only for Treasury-
+  Withdrawals. (2) casTreasury/no-regression: epochs.treasury.0 :2288 disbursed-decrement UNCHANGED (absent from diff),
+  cap_treasury pass-local with NO write-back (engine-verified 3 refs, no leak), mainnet ep247 is PRE-CONWAY (no withdrawals →
+  can't regress). (3) completeness: saturating floor safe, per-call scoping, cross-checked conway.md:172/210/216/222/435. Both
+  treasury tests + 220/220 governance pass. COMMITTED f816efc9b1 (1 crate dugite-ledger). NON-refuting residual surfaced → filed
+  as the within-pass gov-action ORDER item below (pre-existing, orthogonal).
 - REFUTED 2026-06-08 (wake368, #29 fix v1, gauntlet wq63ah2hg): the accumulator-removal fix is byte-exact for the ALL-REGISTERED
   case (the common bug) but NOT for the unregistered-target edge. Vote 1/3 (nominal "pass") but lens1 REFUTED + lens3 corroborated
   the SAME residual → REJECT (#26/#27 lesson: read substance, not vote count). ROOT: dugite conflates Haskell's transient cap-basis
@@ -3374,6 +3398,7 @@
 - 2026-06-08T22:45Z wake364 ~ #29 ROOT-CAUSED→FIXING: fix Workflow wggdmnnln (in-turn) removed the cap-check accumulator double-subtract (cap vs live treasury, kept :2288); reproducing test EMPIRICALLY fails pre-fix; INDEPENDENTLY verified 1524/1524. Uncommitted; gauntlet next
 - 2026-06-08T23:15Z wake368 ~ #29 gauntlet wq63ah2hg: 1/3 refute but DECISIVE (lens1+lens3) — v1 over-disburses in the unregistered-target edge (cap basis uses disbursed not full fold). REJECT; →FIXING attempts:2 (byte-exact rework: transient cap_treasury full-fold-decremented). NO commit
 - 2026-06-09T00:00Z wake372 ~ #29 byte-exact rework (wpn0y1m1z, in-turn): transient cap_treasury full-fold-decremented for the cap check, :2288 untouched; edge test EMPIRICALLY fails under v1; INDEPENDENTLY verified 1525/1525. Resolves wake368 refutation. Re-gauntlet next
+- 2026-06-09T00:30Z wake376 ~ #29 re-gauntlet w7yhosc8m PASSED 0/3 (substantive, cross-checked conway.md): cap_treasury==ensTreasury byte-exact, casTreasury untouched, no leak, ep247 pre-Conway. COMMITTED f816efc9b1. #29 DONE. Filed #29-order [L]. Next #30
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -5042,3 +5067,7 @@
   untouched = casTreasury / reserves-treasury byte-exactness preserved). Added an unregistered-target edge test the agent
   EMPIRICALLY proved fails under v1 (over-disbursement). INDEPENDENTLY re-verified full-fold decrement + :2288 untouched +
   1525/1525. Resolves the wake368 refutation. state:GAUNTLET. NEXT: re-gauntlet → commit.
+- wake376 2026-06-09: re-ran the #29 gauntlet (w7yhosc8m, 3 lenses, in-turn) on the cap_treasury rework → PASSED 0/3, each
+  lens substantive + cross-checked conway.md. cap_treasury==ensTreasury byte-exact (full fold, all cases); epochs.treasury.0==
+  casTreasury (:2288 untouched, no leak); ep247 pre-Conway. COMMITTED f816efc9b1 (dugite-ledger, 1 crate). #29 DONE (full
+  lifecycle diagnose→fix-v1→REFUTED→rework→PASS). Filed #29-order [L] (within-pass gov-action ordering, pre-existing). NEXT: #30.
