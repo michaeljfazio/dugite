@@ -209,7 +209,18 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:INSTRUMENTING-REPLAY (drop-set instrumentation, replay launch pending). polled wake255 15:43 — build pid 83303 compiling final crate dugite-node (release), no errors; next wake verify build done -> launch instrumented from-genesis replay (DUGITE_RUPD_DROP_TRACE=1).
+- item: #0 (mainnet ep246 reserves) state:REPLAY-RUNNING (instrumented from-genesis localization replay LAUNCHED wake256).
+  Build OK (release, 1m37s, no warnings). APFS CoW-cloned db-mainnet -> db-clones/mainnet-rupd-drop (instant, 0 extra
+  disk; 46G immutable, blocks through ep331). Launched instrumented replay: job mainnet-rupd-drop pid 84509 (caffeinate),
+  DUGITE_RUPD_DROP_TRACE=1 + DUGITE_EPOCH_STATE_DUMP=epoch-dumps-engine/mainnet-rupd-drop, --config config/mainnet/
+  config.json --socket-path /tmp/engine-rupd-drop.sock --port 3001 (no other node running, no port conflict). Log:
+  scripts/prod-readiness/.jobs/mainnet-rupd-drop.log (stderr -> same log; RUPD_DROP lines land there). FAST: Byron
+  replaying at ~128,001 blk/s -> ep246 likely <1h (NOT the feared 5-8h). NEXT WAKE(S): poll until past ep246, then
+  `grep RUPD_DROP scripts/prod-readiness/.jobs/mainnet-rupd-drop.log` — the RUPD_DROP_TRACE summary with
+  total_would_be ≈ 82,270,482 at the ep245->246 boundary + the RUPD_DROP per-cred lines = the EXACT dropped creds
+  (hash, would_be, stake, leader). Characterize them (recently reg/dereg? in reward_accounts now?) -> targeted fix in
+  apply.rs frozen-set construction / reward_accounts tracking. STOP node with SIGTERM only (never pkill -9 — corrupts
+  ImmutableDB). Instrumentation UNCOMMITTED on main (revert after pin). MAY rotate to other backlog items between polls.
   *** wake254: focused pin wz6ku12dk = found=false, RULED OUT the candidate pool + the single-whale hypothesis.
   KEY CORRECTION: the dump's per_pool_top20.amount is NOT reward data (top pool showed 2.0T vs Koios actual 36.8B) —
   candidate pool e7b605b72af was a red-herring from that misread field. Named whales (registered ep208/230, stable,
@@ -2709,3 +2720,10 @@
   rewards.rs (member rewards.rs:461 + leader drop sites + post-loop eprintln summary); cargo check -p dugite-ledger
   CLEAN; instrumentation UNCOMMITTED on purpose. Kicked off release build pid 83303. next wake: verify build ->
   launch from-genesis instrumented replay -> grep RUPD_DROP cluster==82,270,482 -> exact dropped creds -> fix.
+- wake256 2026-06-07: #0 INSTRUMENTING-REPLAY->REPLAY-RUNNING. Build OK (release 1m37s). Found last-night's mainnet
+  clone (db-clones/mainnet-ep213) was deleted; APFS CoW-cloned db-mainnet -> db-clones/mainnet-rupd-drop (instant,
+  0 disk). Launched instrumented from-genesis replay job mainnet-rupd-drop pid 84509 (DUGITE_RUPD_DROP_TRACE=1,
+  dumps->mainnet-rupd-drop, --config mainnet, socket /tmp/engine-rupd-drop.sock port 3001; no port conflict). Byron
+  flying at ~128K blk/s -> ep246 likely <1h. next wake: poll; once past ep246, grep RUPD_DROP (summary total_would_be
+  ≈82,270,482) for the exact dropped creds -> characterize -> targeted fix. SIGTERM-only to stop. Instrumentation
+  uncommitted.
