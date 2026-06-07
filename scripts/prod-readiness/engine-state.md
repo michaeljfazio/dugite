@@ -209,7 +209,27 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:DIAGNOSING-DATA (FOCUSED credential pin on pool e7b605b72af; diagnose wz6ku12dk ACTIVE, polled wake253 15:38 — agent still enumerating delegators' reward+update history (137KB, steady growth)).
+- item: #0 (mainnet ep246 reserves) state:INSTRUMENTING-REPLAY (Koios pin EXHAUSTED; drop-set instrumentation written + release build running).
+  *** wake254: focused pin wz6ku12dk = found=false, RULED OUT the candidate pool + the single-whale hypothesis.
+  KEY CORRECTION: the dump's per_pool_top20.amount is NOT reward data (top pool showed 2.0T vs Koios actual 36.8B) —
+  candidate pool e7b605b72af was a red-herring from that misread field. Named whales (registered ep208/230, stable,
+  no dereg/re-reg/MIR) earn 116M/111M/106M spendable_epoch 247 (not the 246 boundary). NO single ~82,215,213 reward
+  exists — the +82,270,482 is an AGGREGATE spread across MANY credentials NETWORK-WIDE. Koios confirms WHERE
+  (ep245->246 boundary, byte-exact) but cannot pin WHICH (dugite's full 154,236-cred reward map is truncated top-200;
+  drop spread thin). Koios-only localization DEFINITIVELY EXHAUSTED. Code-read of the frozen-set construction
+  (apply.rs:319-331: freeze certs.reward_accounts.keys() at first block past epoch_first_slot+4k/f=172800, before its
+  certs) shows NO obvious systematic bug (matches the fix muscle's byte-exact read). DECISION (defensible default,
+  #438+don't-tunnel-aware): go to instrumentation+from-genesis-replay — the only definitive pin. DROVE: wrote env-gated
+  drop-set instrumentation in rewards.rs (DUGITE_RUPD_DROP_TRACE: at the pv<=6 member prefilter rewards.rs:461 + leader
+  drop, accumulate every cred dropped because ∉fvAddrsRew with its would-be reward+stake; eprintln summary
+  RUPD_DROP_TRACE/RUPD_DROP after the pool loop). Observability-only, ledger output unchanged, cargo check -p
+  dugite-ledger CLEAN (34s, no warnings). INSTRUMENTATION IS UNCOMMITTED ON MAIN ON PURPOSE (needed for the replay
+  binary; revert after the cred is pinned — mirrors the wake16-18 measurement pattern). Kicked off release build pid
+  83303 -> /tmp/dugite-rupd-drop-build.log (cargo build --release -p dugite-node --features
+  dugite-ledger/epoch-state-debug). NEXT WAKE: verify build OK -> launch from-genesis mainnet instrumented replay in
+  background (DUGITE_RUPD_DROP_TRACE=1, stderr->log) to ep246 -> grep RUPD_DROP cluster summing to 82,270,482 at the
+  ep245 boundary = the exact dropped creds -> characterize (in reward_accounts now? recently reg/dereg?) -> the precise
+  fix. Replay is ~5-8h Byron+; poll across wakes; MAY rotate to other backlog items while it runs (don't monopolize).
   *** wake251: data-diagnose waum3utic COMPLETE — CONFIRMED localization, pin BLOCKED by top-200 truncation, candidate
   pool identified. Boundary deltas (dugite-koios) via koios.sh totals: ep245 0/0 (baseline byte-exact), ep246
   +82,270,482/-55,269, ep247 +82,078,374/-5,880 — divergence FIRST at ep245->246 (RUPD apply of ep245 rewards),
@@ -2681,3 +2701,11 @@
   ~130B-lovelace delegators, right range for ~82M reward). Launched FOCUSED Koios-only opus diagnose wz6ku12dk to
   pin the whale + its reg/dereg/re-reg/MIR anomaly (cheap; avoids a 5-8h instrumented localization replay). next
   wake: read wz6ku12dk -> targeted fix on the frozen-set construction, OR fall back to instrumentation+replay.
+- wake254 2026-06-07: focused pin wz6ku12dk found=false -> RULED OUT candidate pool (per_pool_top20 is NOT reward
+  data: 2.0T vs Koios 36.8B) + single-whale hypothesis. The +82,270,482 is an AGGREGATE across MANY creds
+  network-wide; Koios confirms WHERE (ep245->246 byte-exact) not WHICH (dump per_cred truncated top-200) ->
+  Koios pin EXHAUSTED. Code-read of apply.rs:319-331 frozen-set construction: no obvious systematic bug. DECISION:
+  instrumentation+replay (only definitive pin). Wrote env-gated DUGITE_RUPD_DROP_TRACE drop-set instrumentation in
+  rewards.rs (member rewards.rs:461 + leader drop sites + post-loop eprintln summary); cargo check -p dugite-ledger
+  CLEAN; instrumentation UNCOMMITTED on purpose. Kicked off release build pid 83303. next wake: verify build ->
+  launch from-genesis instrumented replay -> grep RUPD_DROP cluster==82,270,482 -> exact dropped creds -> fix.
