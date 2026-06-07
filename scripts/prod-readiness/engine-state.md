@@ -209,7 +209,16 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:ROOT-CAUSING-COMPONENT (breakdown relocated to LIVE shelley.rs; rebuild for replay).
+- item: #0 (mainnet ep246 reserves) state:SNAPBD-REPLAY-RUNNING (live shelley.rs breakdown VERIFIED strings=2; replay pid 94744 launched wake294).
+  Build OK (1m35s, binary 18:51), SNAP_BREAKDOWN strings=2 VERIFIED. Launched snap-breakdown replay job mainnet-snapbd
+  pid 94744 (DUGITE_SNAP_BREAKDOWN=1) over CoW clone db-clones/mainnet-rupd-drop. ~4min. SNAP_BREAKDOWN lines ->
+  scripts/prod-readiness/.jobs/mainnet-snapbd.log. NEXT WAKE: grep 'SNAP_BREAKDOWN .*pst=21956097174685676' (the
+  ep244-equiv snapshot the RUPD@ep246 uses) -> read deleg_utxo/reward_bal/ptr_resolved/ptr_excluded/ptr_stake_total.
+  DECISION: if ptr_excluded ~= 109,573,937,991 (or ptr_stake_total large & ptr_resolved short) => POINTER bucket
+  confirmed -> fix the shelley.rs:552-566 pointer resolution (Haskell sisPtrStake includes these at Allegra). If
+  ptr_* all ~0 => deficit is in deleg_utxo (stake_map incomplete) or reward_bal -> per-cred diagnostic on a short pool
+  (263498e0.. -2.7B) vs Koios pool_delegators ep244. FIX lands in eras/shelley.rs:533-566 (LIVE), NOT epoch.rs.
+  SIGTERM-only to stop.
   *** wake293 (ultracode): WAKE265 TRAP REPEATED — snapbreakdown build had SNAP_BREAKDOWN strings=0 (DCE'd): I'd
   instrumented the SNAP construction in the TEST-ONLY state/epoch.rs:199-254 (inside the dead state/epoch.rs:50
   process_epoch_transition). The LIVE go.pool_stake construction is **crates/dugite-ledger/src/eras/shelley.rs:533-617**
@@ -3186,3 +3195,7 @@
   +ptr_resolved/excluded tracking), reverted epoch.rs. cargo check CLEAN, building. next wake: strings-VERIFY then
   replay -> grep SNAP_BREAKDOWN pst=21956097174685676 -> pointer vs deleg_utxo vs reward bucket. LESSON (3rd time):
   verify the LIVE era-impl path before instrumenting/fixing; state/epoch.rs is test-only DCE'd; strings-verify.
+- wake294 (ultracode): live shelley.rs SNAP_BREAKDOWN build OK (strings=2 VERIFIED). Launched snap-breakdown replay
+  job mainnet-snapbd pid 94744 (DUGITE_SNAP_BREAKDOWN=1) over CoW clone. next wake: grep SNAP_BREAKDOWN
+  pst=21956097174685676 -> if ptr_excluded~=109.6B => pointer bucket (fix shelley.rs:552-566); else deleg_utxo/reward
+  bucket -> per-cred diagnostic. fix in eras/shelley.rs:533-566 (live).
