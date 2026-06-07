@@ -1233,6 +1233,9 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake173 2026-06-07: POLL #10 RE-FIX muscle wcp4vycpw — still RUNNING, ACTIVE (worktree present, bridge applied,
+  6-path edits + build/test). No transition. Disk 184G, no nodes. #10 stays FIXING. NEXT WAKE: poll -> on green copy
+  to main -> verify-build -> re-import -> re-gauntlet -> commit.
 - wake172 2026-06-07: #10 DIAGNOSING -> FIXING. ANALYZE wezt2hemc gave source-grounded 6-path disposition (leaf=
   OPAQUE-STORE, container-truncation=HARD-ERROR): tag-4/5 opaque (revert my over-reject), TvarIterator/address/multi-
   asset HARD-ERROR (pre-existing silent paths), R3 c==0 short-circuit. Regenerated base-commitB-bridge.patch (4152L,
