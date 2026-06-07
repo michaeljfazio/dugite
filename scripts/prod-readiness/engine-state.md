@@ -10,7 +10,10 @@
 
 ## Frontiers  (advance these; zero open divergence behind each)
 - ledger.preprod:   BYTE-EXACT vs Koios at ep100/150/200/230 (Shelley→Conway) + ep57 per-cred exact + ep292/293 total active_stake HEAD-verified on the LIVE soak node (go(293)==Koios as(292), set(293)==as(293)) + ep293 reserves 13072484951876873 & treasury 1870588626354717 BOTH byte-exact (to the lovelace) vs Koios totals (wake63). So at ep293 the live HEAD node matches Koios on ALL three core accounting outputs (reserves+treasury+active_stake). NOTE: ep293 reserves/treasury are mithril-import-faithful + held; dugite's OWN reserves/treasury TRANSITION computation is covered separately by full-replay ep0-233. The ep292 -100 ADA candidate (2b) was a STALE dump — RESOLVED on HEAD. clean replay ep0-233 zero halts. Frontier HOLDS through ep293
-- ledger.mainnet:   BYTE-EXACT vs Koios — reserves+treasury exact at ep212-221 (doc's +180.4B ep213 divergence GONE on HEAD); replay validating further
+- ledger.mainnet:   BYTE-EXACT vs Koios ep209-247 (reserves+treasury) AFTER the MIR-before-SNAP fix 8c868271c9 (wake307
+  re-validation of fix-applied dumps). EXCEPTIONS: ep208 (Byron->Shelley HFC dump artifact, not a bug) + ep235 (#20b
+  +318.2T reserve-MIR transient, self-corrects by ep245, pre-existing/separate). The MIR fix closed the broad reward/
+  treasury #438-class (~40 epochs) — was: "exact at ep212-221; doc's +180.4B ep213 divergence GONE"
 - sync.preprod:     from-genesis REPLAY clean + #9 snapshot-backend fix LANDED + LIVE-SOAK reached tip healthy (wake57): clone db-clones/preprod-soak fast-started via #9 Convertible mem->lsm path (NO genesis replay, utxo_count=4116338), caught up to live tip (node block 4793022 hash-matched koios, 1 block/28s behind live 4793023), 0 panic/0 OOM/0 wedge, RSS 4.8GB, CPU 1.5% idle-at-tip. *** SUSTAINED-WINDOW CONFIRMED wake60 ***: node tracks live tip in lockstep ~18min (block 4793042 == koios live 4793042, extends within seconds of each new block), 0 anomalies => GATE (2) live-sync-to-tip VALIDATED on preprod. Residual is GATE (3) only: #10 ref-script independent validation on the fast-start path (in FIXING via muscle we0nz74zr; node trusts consensus meanwhile, no wedge)
 - sync.mainnet:     ~ep331 (last known good db-mainnet)
 - phase2.preprod:   BYTE-EXACT (is_valid) on FULL-REPLAY — full preprod replay ep0-293 (V1/V2/V3, Alonzo->Babbage->Conway): 0 ValidationTagMismatch, 0 divergence dumps. #22 RESOLVED on HEAD. OPEN GAP on MITHRIL-FAST-START path: #10 (mod.rs:6411 drops reference-script bytes on import -> ref-input scripts unresolved at tip; ledger-exactness unaffected). Frontier holds for replay; fast-start ref-scripts blocked on #10 fix.
@@ -209,7 +212,24 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #21 (re-validate ledger frontiers post-MIR-fix) state:NEW — #0 IS DONE+PUSHED. Pick next wake.
+- item: #20b (mainnet ep235 reserve-MIR transient) state:NEW — #21 re-validation DONE (MIR-fix closed a broad class).
+  *** wake307 (ultracode): #21 LEDGER.MAINNET FRONTIER RE-VALIDATED post-MIR-fix (from the fix-applied
+  mainnet-mirfix-verify dumps ep0-254, instrumentation was env-off=no-op). Diffed EVERY ep208-247 reserves+treasury vs
+  Koios totals: **ep209-247 ALL BYTE-EXACT EXCEPT ep235.** Only 2 lines diverge: ep208 (Byron->Shelley era-transition
+  dump artifact — reserves recomputed at the HFC boundary; ep209+ exact, not a real bug) and ep235 (#20b: reserves
+  +318,200,635,000,000, treasury exact, the pre-existing reserve-MIR transient that self-corrects by ep245). *** SO
+  THE MIR-BEFORE-SNAP FIX CLOSED THE BROAD reward/treasury #438-CLASS across ~40 epochs — not just ep246. #2/#3/#11
+  (mainnet reserves/stake-dereg residuals, all in the now-byte-exact ep209-247 range) are VERY LIKELY resolved by the
+  fix -> recheck+close. NEXT WAKE: SCHEDULE #20b — ep235 reserves jump UP ~296T at ep234->235 then self-corrects by
+  ep245; treasury byte-exact throughout. Likely a RESERVE-source MIR (reserves->treasury or reserves->stake, ~318M
+  ADA) that dugite applies at the wrong boundary OR with a sign/pot error in the same apply_pending_mir /
+  MIR-source(reserves) path just touched. DIAGNOSE: koios reserve_withdrawals + the MIR cert at ep234/235 (which
+  earned_epoch, which source-pot, amount 318,200,635,000,000?); dugite's pending_mir_reserves handling +
+  apply_pending_mir reserves debit/credit + the boundary it fires. Then fix + re-replay-verify ep235 reserves byte-exact
+  + ep209-247 unregressed + gauntlet. HOUSEKEEPING (do opportunistically): prune epoch-dumps-engine/mainnet-{globals,
+  poolstake,percred,snapbd,fix-verify} + db-clones/mainnet-rupd-drop (free ~46G+) — but KEEP mainnet-mirfix-verify
+  (the fix-baseline dumps) + mainnet-droptrace (pre-fix reference) until #20b closes.
+  *** #0 RESOLVED (8c868271c9): MIR-before-SNAP. Broad class closed. ***
   *** wake306 (ultracode): **#0 DONE — COMMITTED + PUSHED (8c868271c9 -> prod-readiness-engine via HTTPS).** nextest
   bv1lbm3iy GREEN (1521/1521, 0 fail). Fix = MIR-before-SNAP in eras/shelley.rs (the clean 1-file move; common.rs +218
   pre-existing add/spend tests left uncommitted). #0 (mainnet ep246 reserves +82,270,482 / treasury -55,269), chased
@@ -3369,3 +3389,9 @@
   reward/treasury class. next wake: #21 full-mainnet re-replay w/ fix binary (NO instrumentation) -> diff all epochs vs
   Koios (confirm broad fix + re-surface #20b ep235 reserve-MIR transient + recheck #2/#3/#11); then preprod for #1.
   Prune instrumentation dump dirs + CoW clone to free disk. Filed #20c.
+- wake307 (ultracode): #21 ledger.mainnet RE-VALIDATED post-MIR-fix: diffed ALL ep208-247 (mainnet-mirfix-verify
+  dumps) vs Koios totals -> ep209-247 BYTE-EXACT reserves+treasury EXCEPT ep235 (#20b reserve-MIR transient) and ep208
+  (era-transition artifact). MIR-before-SNAP fix closed the broad reward/treasury class (~40 epochs); #2/#3/#11 likely
+  resolved (recheck+close). next wake: #20b ep235 reserve-MIR (+318.2T, treasury exact, self-corrects by ep245) —
+  diagnose koios reserve_withdrawals + the MIR cert at ep234/235 + dugite pending_mir_reserves/apply_pending_mir
+  reserves path. Housekeeping: prune old instrumentation dump dirs + CoW clone (keep mirfix-verify + droptrace).
