@@ -273,7 +273,19 @@
    invariant, NO replay (Dijkstra undeployed — inert/masked). state:ROOT-CAUSED attempts:0
 
 ## In-progress
-- item: #7 (Dijkstra SUBUTXO forward-path stake asymmetry) state:ROOT-CAUSED attempts:0 — direct analysis. NEXT WAKE: FIXING.
+- item: #7 (Dijkstra SUBUTXO stake replay) state:FIXING attempts:0 — fix applied + compiles (UNCOMMITTED). NEXT WAKE: VERIFYING.
+  *** wake332 (ultracode): #7 ROOT-CAUSED→FIXING (hand-impl mirroring #6/apply_utxo_changes — the normal-diff candidate
+  patch isn't git-applyable). Changes (dijkstra.rs, 1 crate): (1) apply_sub_transactions signature now takes
+  `certs: &mut CertSubState, epochs: &mut EpochSubState`; (2) SUB the spent output's instant-stake on each remove
+  (stake_routing → stake_map.get_mut.saturating_sub / ptr_stake), ADD on each insert (stake_map.entry.or_insert += /
+  ptr_stake +=), reusing the shared pub(crate) stake_routing/StakeRouting from state/mod.rs + ptr_stake_excluded —
+  byte-identical to the #6 apply_utxo_diff legs; (3) caller @222 passes certs/epochs. `cargo check -p dugite-ledger`
+  Finished clean (only call site is @222; no test callers). Fix UNCOMMITTED. *** NEXT WAKE (VERIFYING): write the
+  forward-path stake-replay test in dijkstra.rs #[cfg(test)] (reuse make_utxo_sub/make_cert_sub/make_epoch_sub +
+  sub_transactions_round_trip_and_apply @1306): a sub-tx creating a BASE-stake-credential output of K lovelace, apply via
+  apply_valid_tx, assert stake_map[cred] += K; sibling sub-tx spends it → assert back to baseline (#6 invariant). fail-pre/
+  pass-post (pre-fix: stake_map unchanged) + nextest -p dugite-ledger green + clippy + fmt. On green → focused 1-crate commit
+  + push → #7 DONE. NO replay (Dijkstra undeployed; code-invariant). After #7: open = #24-pin (deferred/heavy), #16 (L). Lock to release.
   *** wake331 (ultracode): SCHEDULE #7 over #24-pin/#16. RATIONALE: #24-pin is muscle-resistant (the 44-min wogj8wp6h
   couldn\'t pin the exact line, conf 0.83) + the cheap offline-dump paths are EXHAUSTED (reduced dumps miss ref-input UTxOs
   → measurement is a floor; pinning needs CEK-step instrumentation [the death-trap] OR a heavy full-UTxO-context replay /
