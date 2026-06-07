@@ -1383,6 +1383,11 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
+- wake199 2026-06-07: POLL #10 6th GAUNTLET w7i0t8l28 — still RUNNING (0/3 votes). verify10B5 WINDOW CONFIRMED:
+  synced PAST window (tip 125119080 > 125105013, block 4794493), 0 phase-1 — R1+R3 binary holds 0-phase-1 past the
+  ep293 window (full replay evidence in hand for commit). No transition (gauntlet is the gate). Disk 175G. #10 stays
+  GAUNTLET-PENDING. NEXT WAKE per HARD POLICY: PASS -> commit #10; adversarial-only REFUTE -> commit core + hardening
+  item.
 - wake198 2026-06-07: #10 VERIFYING-RESOAK -> GAUNTLET-PENDING. verify10B5 byte-identical (0 phase-1 so far, mid-
   window). Launched 6th RE-GAUNTLET w7i0t8l28 (wf_3579ddd3-3c2), #15/#17/#19 scoped out, parallel to window sync.
   NEXT WAKE per HARD POLICY: PASS -> COMMIT #10; adversarial-only REFUTE -> COMMIT core + hardening tracking item.
