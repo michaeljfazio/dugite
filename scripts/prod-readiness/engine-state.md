@@ -37,7 +37,33 @@
    reward/stake byte-exactness (preprod ep293 / mainnet ep247) is VALIDATED with that; flipping Credential Ord globally could
    REGRESS those. Per-site Haskell cross-check required (where ledger uses Credential Ord vs typed-hash bytes). how_to_confirm:
    Conway tx, 2 same-role DRep voters (one key-hash, one script-hash) + a Vote redeemer indexing the script voter; dump dugite
-   TxInfo.votes + resolved ScriptPurpose vs cardano-node ScriptContext. state:NEW attempts:0 conf:0.78
+   TxInfo.votes + resolved ScriptPurpose vs cardano-node ScriptContext.
+   *** ROOT-CAUSED wake341 (analysis Workflow wh9u6m36k/wf_49156cb2-71b, conf 0.86 → scripts/prod-readiness/.audit/credential-
+   ord-analysis.md). DECISIONS: (1) FIX LEVEL = PER-CONSUMER — do NOT flip the shared dugite_primitives::Credential derived Ord
+   (Key<Script is CORRECT for its two natural roles: Plutus Data tag order PubKey<Script + canonical CBOR key-byte order
+   [0,h]<[1,h]); a global flip would mis-order the LIVE BTreeMap<Credential,u64> UpdateCommittee members_to_add CBOR re-encode
+   (encode/governance.rs:182-186) + any future BTreeMap<Credential/Voter> consumer. Instead add a ledger-ordered comparator
+   cmp_ledger (Script<Key) and apply it at each phase-2/gov-CBOR construction site. (2) REWARD/STAKE GUARD = GREEN (no
+   regression): every credential is erased to a type-tagged Hash32 via to_typed_hash32() at ingest (state/mod.rs:2187, byte-28
+   tag 0x00 key/0x01 script); all conservation maps are HashMap/ImblHashMap<Hash32,_> (rewards mod.rs:169, stake_map :468,
+   delegations :526, vote_delegations :282), NEVER BTreeMap<Credential>; all totals are commutative integer folds; the one pv<=2
+   sort is keyed (is_member,pool_id) not Credential. So a per-consumer ordering change CANNOT touch the Koios-validated
+   reserves/treasury/rewards/stake. *** MY CORRECTION (verify-subagent-claims save) of the analysis's OVERSTATED TL;DR: the
+   synthesis claimed #26/#27 are "latent/adversarial — observable only under a same-28-byte-hash collision (infeasible), no live
+   divergence today". That is WRONG for the phase-2 sites. SPOT-VERIFIED transaction.rs:501-506: Voter is an ENUM
+   {CC(Credential)|DRep(Credential)|StakePool(Hash32)} with DERIVED Ord → compares the discriminant FIRST, then inner Credential
+   (also discriminant-first Key<Script). So ALL key-creds sort before ALL script-creds REGARDLESS of the 28-byte hash (TYPE
+   dominates, not hash). Likewise withdrawals BTreeMap<[header||hash28]> is HEADER-byte (0xE_ key < 0xF_ script) dominated.
+   => the inversion is an ACTIVE byte-exact divergence for ANY single tx carrying >=2 mixed key+script entries (a tx withdrawing
+   from one key-stake + one script-stake reward acct, with a Reward redeemer, is a realistic Plutus scenario; >=2 mixed-type
+   voters in one tx is legal). It went UNDETECTED only because the epoch-totals replays don't check per-script ScriptContext
+   bytes. So #26/#27 stay [H] ACTIVE (not latent). The "hash dominates" reasoning is correct ONLY for the to_typed_hash32-keyed
+   ledger HashMaps (which are unordered + don't affect totals anyway). state:ROOT-CAUSED attempts:0 conf:0.86. NEXT: FIXING —
+   muscle mode:fix (worktree): add Credential::cmp_ledger + Voter ledger comparator; apply Script<Key at populate_gov.rs:119/243
+   + members_to_add, populate_v3.rs:107-124, tx_info_populate.rs:569-583, redeemer_resolve.rs:318/256; sort txInfoSignatories by
+   raw keyhash (that one is the MISSING-SORT #30, not an inversion); gov CBOR encode/governance.rs:182-186 only if matching
+   ledger Map.toList. GATE (Tier A'): phase-2 ScriptContext dump-diff with a synthesized mixed key+script tx (NOT tests-green) +
+   reward/stake non-regression replay must stay byte-exact.
 27. [H][phase2][NEW] WITHDRAWALS (Rewarding) ordering inversion (manifestation B of the key<script vs script<key theme; DISTINCT
    fix site from #26). tx.body.withdrawals keyed by raw 29-byte reward-account blob [header||hash28] in BTreeMap<Vec<u8>,_>
    (transaction.rs:805) → sorts by raw bytes where key-stake header 0xE_ < script-stake 0xF_ → Key-before-Script, OPPOSITE to
@@ -45,7 +71,14 @@
    (redeemer_resolve.rs:256) resolves the Reward redeemer to the WRONG credential; txInfoWdrl order also reversed
    (populate_v3.rs:107-124 V3, tx_info_populate.rs:569-583 V1/V2). Hask: Address.RewardAccount Ord, Credential Ord (Script<Key),
    Alonzo Plutus rewarding pointer. how_to_confirm: tx with 2 withdrawals (one 0xE1 key-stake, one 0xF1 script-stake) + Reward
-   redeemer pointing at the script account; compare dugite TxInfo.wdrl + resolved purpose vs cardano-node. state:NEW attempts:0 conf:0.65
+   redeemer pointing at the script account; compare dugite TxInfo.wdrl + resolved purpose vs cardano-node.
+   *** ROOT-CAUSED wake341 (same analysis as #26: scripts/prod-readiness/.audit/credential-ord-analysis.md). #27 is the
+   withdrawals/RewardAccount manifestation of the Credential-Ord inversion — TYPE/header-byte dominated (0xE_ key < 0xF_
+   script vs Haskell RewardAccount Ord Script<Key), ACTIVE for any tx with >=1 key-stake + >=1 script-stake withdrawal (NOT
+   latent). FOLDED INTO #26's per-consumer FIX (its plan already covers redeemer_resolve.rs:256, populate_v3.rs:107-124,
+   tx_info_populate.rs:569-583 + the withdrawals blob ordering). Same Tier-A' ScriptContext dump-diff gate + reward/stake
+   non-regression guard (GREEN — withdrawals don't touch the conservation pipeline). Fix #26 and #27 in ONE worktree.
+   state:ROOT-CAUSED attempts:0 conf:0.65 (folded into #26)
 28. [H][serialization][NEW] PlutusData decoder accepts >64-byte definite bytestrings (no bounded_bytes 64-byte cap).
    read_plutus_data_depth reads Type::Bytes via read_bytes_owned() / BytesIndef with NO length check (era_alonzo.rs:1282-1288;
    era_conway.rs:2576-2579; bignum mantissa era_alonzo.rs:1224/1230, era_conway.rs:2514 via read_bigint). Haskell plutus
@@ -332,7 +365,24 @@
    reconstruction + #7 sub-tx forward). state:DONE attempts:0
 
 ## In-progress
-- item: RE-AUDIT DONE → 6 NEW backlog items #26-#31 filed (3×[H], 3×[M]). NEXT WAKE: SCHEDULE #26 (Credential Ord inversion) — highest impact + spot-verified.
+- item: #26 (Credential-Ord inversion) ROOT-CAUSED → NEXT WAKE: FIXING (muscle mode:fix, worktree) — per-consumer cmp_ledger across phase-2 sites; fix #26+#27 together. Reward/stake guard GREEN.
+  *** wake341 (ultracode): SCHEDULE #26, DRIVE NEW→ROOT-CAUSED via a focused analysis Workflow (wh9u6m36k/wf_49156cb2-71b —
+  custom analyze workflow, defensible deviation since muscle analyze-mode is ledger-divergence-shaped/epoch+delta_lovelace and
+  #26 is a code-ordering usage-map question; HOSTED IN-TURN per the wake337 lesson → completed clean, 373K tokens/4 agents/
+  6.5min, synthesis wrote scripts/prod-readiness/.audit/credential-ord-analysis.md). OUTCOME (conf 0.86): FIX = PER-CONSUMER
+  (add Credential::cmp_ledger Script<Key + a Voter ledger comparator; apply at the phase-2/gov-CBOR sites; do NOT flip the
+  shared enum derive — Key<Script is correct for Plutus-Data-tag + canonical-CBOR-key order, and a global flip would mis-order
+  the live UpdateCommittee members_to_add CBOR + future BTreeMap<Credential> consumers). REWARD/STAKE GUARD = GREEN (credential
+  erased to typed-Hash32 at ingest; conservation maps are HashMap<Hash32>; totals are commutative folds — a Credential-ord
+  change cannot touch Koios-validated reserves/treasury/rewards/stake). *** I OVERRODE the analysis's TL;DR severity claim
+  (verify-subagent-claims save): it said #26/#27 are "latent/adversarial, no live divergence (needs same-28-byte-hash
+  collision)" — WRONG; I spot-verified Voter is a derived-Ord enum so the TYPE discriminant dominates (all key-creds < all
+  script-creds regardless of hash), making it an ACTIVE divergence for any tx with >=2 mixed key+script entries; undetected only
+  because epoch-totals replays don't check ScriptContext bytes. #26/#27 stay [H] ACTIVE. *** NEXT WAKE — FIXING: launch muscle
+  mode:fix (worktree) implementing the per-consumer cmp_ledger across #26+#27 sites (one worktree), tier Aprime. GATE before
+  any commit: a phase-2 ScriptContext dump-diff on a SYNTHESIZED tx carrying both a key-stake and a script-stake entry (votes
+  AND withdrawals) showing byte-exact TxInfo + correct redeemer-index resolution vs cardano-node, PLUS the reward/stake
+  non-regression replay staying byte-exact (tests-green is NOT the gate). Local commit only (curated-origin model). Lock to release.
   *** wake339 (ultracode): the re-audit COMPLETED and 6/6 findings are filed. Path was bumpy — RECORD THE LESSON: a
   backgrounded Workflow DIES when the launching wake's TURN ENDS (wake337 launched whk03t6kd, then stopped → the 6 finders were
   KILLED ~2min in, mid-investigation, journal 6 started/0 completed, no findings). FIX APPLIED: re-launched fresh (wl42ygj07 /
@@ -2766,6 +2816,8 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
+- #26 analysis — DONE wake341. Workflow wh9u6m36k/wf_49156cb2-71b (analyze-credord.workflow.js) hosted in-turn → COMPLETE,
+  artifact scripts/prod-readiness/.audit/credential-ord-analysis.md (per-consumer fix; reward/stake guard GREEN). No running jobs.
 - re-audit — DONE wake339. Run 1 whk03t6kd/wf_b85f1761-d60 KILLED at wake337 turn-end (launch-and-stop orphans subagents). Run 2
   wl42ygj07/wf_5c21573e-92f COMPLETED in-turn (6 confirmed findings → #26-#31; findings file scripts/prod-readiness/.audit/
   reaudit-findings.md). No running jobs now.
@@ -2975,6 +3027,7 @@
 - 2026-06-08T16:xxZ wake335-336 ~ RE-ASSESS: full workspace CI gate b7kr6pyuw RESOLVED green (sole fail=dugite-monitor probe timing-flake, passes isolated; all 4 session crates verified clean) — milestone baseline solid; flagged push-divergence
 - 2026-06-08T17:27Z wake337 ~ push-model CORRECTED (origin/main human-curated; engine commits local-only, no origin push) + launched adversarial re-audit Workflow whk03t6kd (6 finders→refute-verify→findings file)
 - 2026-06-08T17:46Z wake339 ~ re-audit COMPLETED in-turn (wl42ygj07, 1.29M subagent tokens/15 agents/11.4min) → filed 6 new backlog items #26-#31 (3H/3M); spot-verified #26 Credential-Ord inversion; LESSON: host Workflows in-turn (launch-and-stop orphans subagents)
+- 2026-06-08T18:05Z wake341 ~ #26 NEW→ROOT-CAUSED: analysis Workflow wh9u6m36k hosted in-turn (373K tokens/4 agents/6.5min) → PER-CONSUMER fix, reward/stake guard GREEN; OVERRODE synthesis 'latent' claim (Voter derived-Ord enum = TYPE-dominated = ACTIVE); #26+#27 [H] ACTIVE→FIXING next
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -4566,3 +4619,10 @@
   completion then landed (agreeing). Filed 6 new backlog items #26-#31 (3 H / 3 M), spot-verified the #26 Credential-Ord-
   inversion core fact (credentials.rs Key<Script enum vs Haskell Script<Key). LESSON recorded: never launch-and-stop a
   Workflow — host in-turn. NEXT: SCHEDULE #26 → analyze the Credential-Ord usage map before fixing. No origin push (local model).
+- wake340 2026-06-08 (×N): cron fires STOPPED on `busy` — wake341 was hosting the #26 analysis workflow in-turn. Correct.
+- wake341 2026-06-08: SCHEDULE #26, DRIVE NEW→ROOT-CAUSED. Custom analysis Workflow (wh9u6m36k) hosted IN-TURN (wake337 lesson)
+  mapped the Credential-Ord usage sites Haskell-vs-dugite → .audit/credential-ord-analysis.md. Verdict: PER-CONSUMER fix (add
+  cmp_ledger Script<Key; don't flip the shared enum derive), reward/stake guard GREEN (credential erased to Hash32 at ingest;
+  conservation maps are HashMap<Hash32>, folds order-independent). OVERRODE the analysis's "latent/adversarial" severity claim
+  (spot-verified Voter derived-Ord enum → TYPE dominates → ACTIVE divergence for any >=2 mixed key+script entries). #26+#27 →
+  ROOT-CAUSED [H] ACTIVE. NEXT: FIXING (muscle mode:fix, worktree) gated by phase-2 ScriptContext dump-diff + reward/stake non-regression.
