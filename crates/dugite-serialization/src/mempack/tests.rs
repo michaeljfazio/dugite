@@ -45,7 +45,7 @@ fn test_decode_mempack_txin() {
     // TxIx = 1 (bytes 01 00 in LE)
     let key = hex::decode("00000c339a7d28e08060a69e3d9adf16846382f59a4d321f8b9580ffdb597c0b0100")
         .unwrap();
-    let txin = decode_mempack_txin(&key).unwrap();
+    let txin = decode_mempack_txin(&key, TxIxEndianness::Little).unwrap();
     assert_eq!(txin.txix, 1);
     assert_eq!(
         txin.txid.to_hex(),
@@ -56,16 +56,16 @@ fn test_decode_mempack_txin() {
 #[test]
 fn test_decode_mempack_txin_wrong_length() {
     let short = vec![0u8; 33];
-    assert!(decode_mempack_txin(&short).is_err());
+    assert!(decode_mempack_txin(&short, TxIxEndianness::Little).is_err());
     let long = vec![0u8; 35];
-    assert!(decode_mempack_txin(&long).is_err());
+    assert!(decode_mempack_txin(&long, TxIxEndianness::Little).is_err());
 }
 
 #[test]
 fn test_decode_mempack_txin_txix_zero() {
     let key = vec![0u8; 34];
     // TxIx = 0x0000 LE = 0
-    let txin = decode_mempack_txin(&key).unwrap();
+    let txin = decode_mempack_txin(&key, TxIxEndianness::Little).unwrap();
     assert_eq!(txin.txix, 0);
 }
 
@@ -75,7 +75,7 @@ fn test_decode_mempack_txin_txix_large() {
     // TxIx = 0xFF 0x00 LE = 255
     key[32] = 0xFF;
     key[33] = 0x00;
-    let txin = decode_mempack_txin(&key).unwrap();
+    let txin = decode_mempack_txin(&key, TxIxEndianness::Little).unwrap();
     assert_eq!(txin.txix, 255);
 }
 
@@ -97,7 +97,7 @@ fn test_mempack_txix_endianness_pinned_le_v11() {
     let mut key = [0u8; 34];
     key[32] = 0x02;
     key[33] = 0x01;
-    let txin = decode_mempack_txin(&key).unwrap();
+    let txin = decode_mempack_txin(&key, TxIxEndianness::Little).unwrap();
     assert_eq!(
         txin.txix, 258,
         "TxIx must decode as little-endian Word16 to match Haskell MemPack"
@@ -109,7 +109,7 @@ fn test_mempack_txix_endianness_pinned_le_v11() {
         let le = ix.to_le_bytes();
         k[32] = le[0];
         k[33] = le[1];
-        let decoded = decode_mempack_txin(&k).unwrap();
+        let decoded = decode_mempack_txin(&k, TxIxEndianness::Little).unwrap();
         assert_eq!(decoded.txix, ix, "LE round-trip failed at ix={ix}");
     }
 
@@ -352,6 +352,9 @@ fn test_decode_mempack_txout_tag4_ada_only() {
     val.extend_from_slice(&[0x70; 29]); // 29-byte enterprise script address
     val.push(0); // value tag = 0 (ADA-only)
     val.extend_from_slice(&[0xee, 0xdd, 0x01]); // coin = 1_814_145 (MSB-first)
+                                                // Tag-4 datum is a `BinaryData` = `VarLen(len) ‖ raw_cbor`. The 4 CBOR datum
+                                                // bytes must be length-prefixed (VarLen(4) = 0x04).
+    val.push(0x04);
     val.extend_from_slice(&[0xd8, 0x79, 0x9f, 0xff]); // 4 bytes of CBOR datum
 
     let (txout, consumed) = decode_mempack_txout(&val).unwrap();
@@ -426,7 +429,28 @@ fn test_tvar_iterator_fixture() {
                 }
                 count += 1;
             }
-            Err(e) => panic!("iteration error at entry {count}: {e}"),
+            Err(e) => {
+                // The 64KB fixture is a CLIPPED prefix of a real tvar blob, so its
+                // FINAL entry is cut short mid-value. The (now strict, #10
+                // full-consumption) iterator HARD-ERRORS on that truncated tail
+                // rather than silently skipping it — exactly as Haskell
+                // `loadSnapshot` aborts on a partial-EOF/CBOR-Fail. For a real
+                // (complete) snapshot this would be a genuine failure; for this
+                // deliberately-clipped fixture it is the expected end boundary.
+                // Accept it ONLY when it is the truncation error AND we have
+                // already decoded the bulk of the fixture.
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains("truncated") || msg.contains("partial"),
+                    "unexpected non-truncation error at entry {count}: {e}"
+                );
+                assert!(
+                    count >= 350,
+                    "truncation error must only occur at the clipped tail (entry \
+                     {count}), not mid-fixture: {e}"
+                );
+                break;
+            }
         }
     }
 
@@ -584,17 +608,24 @@ fn test_decode_mempack_txout_tag4_no_value_data() {
 
 #[test]
 fn test_decode_mempack_txout_tag4_multi_asset() {
-    // tag(4) + addr(29 bytes) + value_tag=1 (multi-asset) + coin + opaque tail
+    // Tag-4 (`TxOutCompactDH`): full-consumption layout
+    //   [4][addr][value(tag=1 multi-asset)][BinaryData datum].
+    // value(tag1) = tag, VarLen(coin), VarLen(numMA), VarLen(rep_len), rep_bytes.
+    // BinaryData  = VarLen(len) ‖ raw_cbor.
     let mut val = vec![4, 29];
     val.extend_from_slice(&[0x70u8; 29]);
     val.push(1); // value tag = 1 (multi-asset)
     val.push(0x00); // VarLen coin = 0
-    val.extend_from_slice(&[0xAA, 0xBB, 0xCC]); // some opaque trailing bytes
+    val.push(0x00); // VarLen numMA = 0
+    val.push(0x00); // VarLen rep_len = 0 (empty rep)
+                    // BinaryData datum: VarLen(2) ‖ [0xAA, 0xBB].
+    val.push(0x02);
+    val.extend_from_slice(&[0xAA, 0xBB]);
     let (txout, consumed) = decode_mempack_txout(&val).unwrap();
     assert_eq!(consumed, val.len());
     assert_eq!(txout.tag, 4);
     assert!(txout.multi_asset.is_some());
-    assert!(txout.datum.is_none());
+    assert_eq!(txout.datum.as_deref(), Some(&[0xAA, 0xBB][..]));
 }
 
 #[test]
@@ -611,29 +642,46 @@ fn test_decode_mempack_txout_tag5_no_value_data() {
 }
 
 #[test]
-fn test_decode_mempack_txout_tag5_ada_only_with_opaque_tail() {
+fn test_decode_mempack_txout_tag5_ada_only_datum_and_script() {
+    // Tag-5 (`TxOutCompactRefScript`): full-consumption layout
+    //   [5][addr][value(tag=0 ADA-only)][Datum option][Script].
+    // Datum option 0 = NoDatum. Script: AlonzoScript tag 0 = NativeScript whose
+    // MemoBytes body is `VarLen(len) ‖ raw_cbor` — here VarLen(0) = empty.
     let mut val = vec![5, 29];
     val.extend_from_slice(&[0x70u8; 29]);
     val.push(0); // ADA-only value tag
     val.push(0x00); // VarLen coin = 0
-    val.extend_from_slice(&[0xDE, 0xAD]); // opaque datum + script bytes
+    val.push(0x00); // Datum option = 0 (NoDatum)
+    val.push(0x00); // AlonzoScript tag 0 (NativeScript)
+    val.push(0x00); // MemoBytes VarLen(len) = 0 (empty native script body)
     let (txout, consumed) = decode_mempack_txout(&val).unwrap();
     assert_eq!(consumed, val.len());
     assert_eq!(txout.tag, 5);
-    assert_eq!(txout.opaque_tail.as_deref(), Some(&[0xDE, 0xAD][..]));
+    assert!(txout.datum.is_none());
+    assert!(txout.datum_hash.is_none());
+    // Reference-script blob = the AlonzoScript bytes [tag=0, VarLen=0].
+    assert_eq!(txout.script_ref.as_deref(), Some(&[0x00, 0x00][..]));
+    assert!(txout.opaque_tail.is_none());
 }
 
 #[test]
 fn test_decode_mempack_txout_tag5_multi_asset() {
+    // Tag-5 multi-asset full-consumption layout:
+    //   [5][addr][value(tag=1)][Datum option=0][Script tag0 VarLen0].
     let mut val = vec![5, 29];
     val.extend_from_slice(&[0x70u8; 29]);
     val.push(1); // multi-asset value tag
-    val.push(0x00); // VarLen coin
-    val.extend_from_slice(&[0xCA, 0xFE]);
+    val.push(0x00); // VarLen coin = 0
+    val.push(0x00); // VarLen numMA = 0
+    val.push(0x00); // VarLen rep_len = 0 (empty rep)
+    val.push(0x00); // Datum option = 0 (NoDatum)
+    val.push(0x00); // AlonzoScript tag 0 (NativeScript)
+    val.push(0x00); // MemoBytes VarLen(len) = 0 (empty)
     let (txout, consumed) = decode_mempack_txout(&val).unwrap();
     assert_eq!(consumed, val.len());
     assert_eq!(txout.tag, 5);
     assert!(txout.multi_asset.is_some());
+    assert_eq!(txout.script_ref.as_deref(), Some(&[0x00, 0x00][..]));
 }
 
 // ── TvarIterator: definite-length map handling ────────────────────────────────
@@ -672,7 +720,7 @@ fn test_tvar_iterator_truncated_before_map_header() {
 
 #[test]
 fn test_decode_mempack_txin_short_length_returns_invalid_length_error() {
-    let err = decode_mempack_txin(&[0u8; 10]).unwrap_err();
+    let err = decode_mempack_txin(&[0u8; 10], TxIxEndianness::Little).unwrap_err();
     match err {
         SerializationError::InvalidLength { expected, got } => {
             assert_eq!(expected, 34);
@@ -684,3 +732,270 @@ fn test_decode_mempack_txin_short_length_returns_invalid_length_error() {
 
 // Re-import for the SerializationError type used above.
 use crate::error::SerializationError;
+
+// ── F1: aeson FIRST-wins duplicate-key resolution for tablesCodecVersion ──────
+//
+// `loadSnapshotMetadata` reads the meta with `Aeson.eitherDecode` (the default
+// `json` parser), whose haddock states it "keeps only the first occurrence of
+// each key, using Data.Aeson.KeyMap.fromList". serde_json keeps the LAST
+// occurrence, so a duplicate-key meta would diverge from Haskell. These tests
+// pin the byte-exact FIRST-wins classification AND literal value.
+
+use super::{parse_tables_codec_version, TxIxEndianness};
+
+#[test]
+fn test_tables_codec_version_duplicate_first_number_last_string_imports() {
+    // first occurrence is Number 1, a later duplicate is String "x".
+    // aeson default `json` => FIRST wins => Number 1 => Ok(1) => Big (imports).
+    let meta =
+        br#"{"backend":"utxohd-mem","checksum":0,"tablesCodecVersion":1,"tablesCodecVersion":"x"}"#;
+    let v = parse_tables_codec_version(meta).expect("first-wins Number 1 must parse as Ok(1)");
+    assert_eq!(v, 1);
+    assert_eq!(
+        TxIxEndianness::from_tables_codec_version(Some(v)).unwrap(),
+        TxIxEndianness::Big
+    );
+}
+
+#[test]
+fn test_tables_codec_version_duplicate_first_string_last_number_rejects() {
+    // first occurrence is String "x", a later duplicate is Number 1.
+    // aeson default `json` => FIRST wins => String => typeMismatch "Number" => Err.
+    let meta =
+        br#"{"backend":"utxohd-mem","checksum":0,"tablesCodecVersion":"x","tablesCodecVersion":1}"#;
+    assert!(
+        parse_tables_codec_version(meta).is_err(),
+        "first-wins String must be rejected even when a later duplicate is Number 1"
+    );
+}
+
+#[test]
+fn test_tables_codec_version_no_duplicate_number_one_unchanged() {
+    // Common (non-duplicate) case stays byte-identical: Number 1 => Ok(1).
+    let meta = br#"{"backend":"utxohd-mem","checksum":2409556997,"tablesCodecVersion":1}"#;
+    assert_eq!(parse_tables_codec_version(meta).unwrap(), 1);
+}
+
+#[test]
+fn test_tables_codec_version_no_duplicate_string_rejected() {
+    // Common (non-duplicate) String value stays a hard error.
+    let meta = br#"{"backend":"utxohd-mem","checksum":0,"tablesCodecVersion":"1"}"#;
+    assert!(parse_tables_codec_version(meta).is_err());
+}
+
+#[test]
+fn test_tables_codec_version_duplicate_first_null_last_number_rejects() {
+    // first occurrence is null => MetadataInvalid (mandatory `.:` fails) => Err,
+    // even though a later duplicate is a valid Number.
+    let meta = br#"{"tablesCodecVersion":null,"tablesCodecVersion":1}"#;
+    assert!(parse_tables_codec_version(meta).is_err());
+}
+
+#[test]
+fn test_tables_codec_version_duplicate_first_number_two_last_one_uses_first() {
+    // first=2 (unknown version), last=1 (accepted). FIRST wins => 2 => parses Ok(2)
+    // here (range/integral check passes) but `from_tables_codec_version` rejects 2.
+    let meta = br#"{"tablesCodecVersion":2,"tablesCodecVersion":1}"#;
+    let v = parse_tables_codec_version(meta).expect("Number 2 is a valid Word8");
+    assert_eq!(v, 2);
+    assert!(TxIxEndianness::from_tables_codec_version(Some(v)).is_err());
+}
+
+// ── R1 (#10 round-5): codec-version VALUE is structure-scoped to the TOP-LEVEL ──
+//
+// Aeson `o .: "tablesCodecVersion"` does a TOP-LEVEL `KeyMap.lookup` ONLY; it never
+// matches an identically-named key nested inside a sibling's object/array value. The
+// previous `extract_raw_number_literal` was a FLAT byte scan that matched the key
+// ANYWHERE, so the gate (top-level, first-wins) and the value (flat scan) could
+// DISAGREE — making dugite stricter than aeson and rejecting a snapshot aeson loads.
+// These tests pin that the value now comes from the SAME top-level resolution as the
+// gate: a nested `tablesCodecVersion` is invisible.
+
+#[test]
+fn test_tables_codec_version_nested_in_object_value_ignored_top_level_wins() {
+    // A SIBLING field's object value contains `"tablesCodecVersion":99`; the real
+    // top-level field is 1. aeson reads the TOP-LEVEL 1 and imports (BigEndian). The
+    // old flat scan would have returned 99 => from_tables_codec_version(99) => hard
+    // error. Top-level MUST win => Ok(1) => Big.
+    let meta =
+        br#"{"backend":"utxohd-mem","extra":{"tablesCodecVersion":99},"checksum":0,"tablesCodecVersion":1}"#;
+    let v = parse_tables_codec_version(meta)
+        .expect("nested tablesCodecVersion:99 must be ignored; top-level 1 wins => Ok(1)");
+    assert_eq!(v, 1);
+    assert_eq!(
+        TxIxEndianness::from_tables_codec_version(Some(v)).unwrap(),
+        TxIxEndianness::Big
+    );
+}
+
+#[test]
+fn test_tables_codec_version_nested_in_array_value_ignored_top_level_wins() {
+    // A sibling ARRAY value contains an object with `"tablesCodecVersion":7`; the real
+    // top-level field is 1. Top-level MUST win => Ok(1).
+    let meta =
+        br#"{"history":[{"tablesCodecVersion":7}],"tablesCodecVersion":1,"backend":"utxohd-mem"}"#;
+    let v = parse_tables_codec_version(meta)
+        .expect("tablesCodecVersion nested in an array value must be ignored; top-level 1 wins");
+    assert_eq!(v, 1);
+}
+
+#[test]
+fn test_tables_codec_version_nested_before_top_level_does_not_shadow() {
+    // The nested occurrence appears BEFORE the top-level one in source order; the flat
+    // scan would have hit the nested `:99` first. The structure-scoped walk skips the
+    // whole nested object and reads only the top-level 1.
+    let meta =
+        br#"{"extra":{"a":{"tablesCodecVersion":99},"b":"tablesCodecVersion"},"tablesCodecVersion":1}"#;
+    let v =
+        parse_tables_codec_version(meta).expect("structure-scoped: top-level 1 wins over nested");
+    assert_eq!(v, 1);
+}
+
+#[test]
+fn test_tables_codec_version_top_level_float_syntax_still_accepted() {
+    // The structure-scoped literal extraction must preserve the EXACT top-level token,
+    // so the float-syntax integral form `1.0` still normalises to 1 and imports.
+    let meta = br#"{"backend":"utxohd-mem","tablesCodecVersion":1.0}"#;
+    assert_eq!(parse_tables_codec_version(meta).unwrap(), 1);
+}
+
+#[test]
+fn test_tables_codec_version_top_level_nonintegral_still_rejected() {
+    // And a non-integral top-level literal is still rejected on the exact token, even
+    // if a nested integral 1 exists.
+    let meta = br#"{"extra":{"tablesCodecVersion":1},"tablesCodecVersion":1.0000000000000001}"#;
+    assert!(
+        parse_tables_codec_version(meta).is_err(),
+        "top-level sub-ULP non-integral must be rejected on its exact literal"
+    );
+}
+
+// ── R3 (#10 round-5): indefinite map truncated at an entry boundary HARD-ERRORS ──
+//
+// The tables blob is `array(1) [ map(indefinite) { … } ]` (0xbf … 0xff). An
+// indefinite-length CBOR map MUST be terminated by a 0xff break byte (RFC 8949
+// §3.2.1). A blob TRUNCATED exactly at an entry boundary — a complete (key,value)
+// pair but NO trailing 0xff — used to hit `remaining.is_empty()` and silently return
+// None, importing the truncated PREFIX as a complete UTxO set. Haskell `loadSnapshot`
+// (`readIncremental … valuesMKDecoder`) surfaces partial-EOF as
+// `InitFailureRead.ReadSnapshotFailed` and ABORTS. These tests pin the abort.
+
+/// A real, fully-consuming MemPack tag-0 TxOut value (34 bytes), cross-checked against
+/// Koios: tx 00002435…#2, 1_814_145 lovelace. Reused as the value of every fixture
+/// entry below so each (key,value) pair is a COMPLETE, decodable map entry.
+const SAMPLE_TXOUT_VALUE_HEX: &str =
+    "001d60986cdecfc4f555a8605d621505a4a82c25c574f59fd0b79e2acdaf0200eedd01";
+
+/// Build a CBOR `bytes(len)` major-2 item from `payload`. `len` is small here
+/// (34 for both key and value), so the header is `0x58 <len-byte>`.
+fn cbor_bytes(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + payload.len());
+    assert!(payload.len() <= u8::MAX as usize);
+    out.push(0x58); // major 2 (byte string), additional-info 24 (one length byte)
+    out.push(payload.len() as u8);
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Build one complete tvar map entry: a 34-byte TxIn key (32-byte TxId ‖ 2-byte TxIx)
+/// and the sample TxOut value, each as a CBOR byte string.
+fn tvar_entry(txix: u16) -> Vec<u8> {
+    let mut key = vec![0xaau8; 32]; // arbitrary TxId
+    key.extend_from_slice(&txix.to_be_bytes()); // BigEndian TxIx (codec v1)
+    let val = hex::decode(SAMPLE_TXOUT_VALUE_HEX).unwrap();
+    let mut entry = cbor_bytes(&key);
+    entry.extend_from_slice(&cbor_bytes(&val));
+    entry
+}
+
+/// `array(1) [ map(indefinite) { entries… } ` — WITHOUT the trailing 0xff break.
+fn tvar_indefinite_no_break(n_entries: u16) -> Vec<u8> {
+    let mut blob = vec![0x81u8, 0xbf]; // array(1), map(indefinite, 0xbf)
+    for ix in 0..n_entries {
+        blob.extend_from_slice(&tvar_entry(ix));
+    }
+    blob // NOTE: no 0xff — truncated at an entry boundary
+}
+
+#[test]
+fn test_tvar_indefinite_map_truncated_at_entry_boundary_hard_errors() {
+    // 0xbf + N complete entries + EOF (no 0xff). The (N+1)th `next()` must yield
+    // Some(Err) (partial-EOF), NOT None — never a silent partial import.
+    let blob = tvar_indefinite_no_break(3);
+    let mut iter = TvarIterator::new_with_endianness(&blob, TxIxEndianness::Big).unwrap();
+    // 3 entries decode cleanly.
+    for i in 0..3 {
+        let item = iter
+            .next()
+            .unwrap_or_else(|| panic!("entry {i} should be Some"));
+        assert!(item.is_ok(), "entry {i} should decode: {item:?}");
+    }
+    // The 4th `next()` hits EOF at an entry boundary on an UNTERMINATED indefinite map.
+    let end = iter.next();
+    match end {
+        Some(Err(e)) => {
+            let msg = format!("{e}");
+            assert!(
+                msg.contains("TRUNCATED") || msg.contains("break") || msg.contains("partial-EOF"),
+                "expected an indefinite-map-missing-break truncation error, got: {e}"
+            );
+        }
+        other => {
+            panic!("indefinite map truncated at entry boundary must yield Some(Err), got {other:?}")
+        }
+    }
+}
+
+#[test]
+fn test_tvar_indefinite_map_with_break_completes_clean() {
+    // The SAME entries, properly 0xff-terminated, complete clean (all Ok, then None).
+    let mut blob = tvar_indefinite_no_break(3);
+    blob.push(0xff); // proper indefinite-map break
+    let mut iter = TvarIterator::new_with_endianness(&blob, TxIxEndianness::Big).unwrap();
+    for i in 0..3 {
+        let item = iter
+            .next()
+            .unwrap_or_else(|| panic!("entry {i} should be Some"));
+        assert!(item.is_ok(), "entry {i} should decode: {item:?}");
+    }
+    assert!(
+        iter.next().is_none(),
+        "a 0xff-terminated indefinite map must end cleanly with None"
+    );
+}
+
+#[test]
+fn test_tvar_definite_map_completes_clean_at_count() {
+    // A DEFINITE-length map (0xa1 = map of 1 entry) carries NO break byte and
+    // legitimately ends at exhaustion of its declared entries: clean None, never an
+    // R3 truncation error.
+    let mut blob = vec![0x81u8, 0xa1]; // array(1), map(1 entry, definite)
+    blob.extend_from_slice(&tvar_entry(0));
+    let mut iter = TvarIterator::new_with_endianness(&blob, TxIxEndianness::Big).unwrap();
+    let first = iter.next().expect("first entry present");
+    assert!(first.is_ok(), "definite-map entry should decode: {first:?}");
+    assert!(
+        iter.next().is_none(),
+        "a definite-length map must end cleanly with None at its declared count"
+    );
+}
+
+#[test]
+fn test_tvar_empty_indefinite_map_with_break_is_clean() {
+    // 0xbf 0xff — an empty but PROPERLY TERMINATED indefinite map is clean (None),
+    // distinct from a truncated one.
+    let blob = [0x81u8, 0xbf, 0xff];
+    let mut iter = TvarIterator::new_with_endianness(&blob, TxIxEndianness::Big).unwrap();
+    assert!(iter.next().is_none());
+}
+
+#[test]
+fn test_tvar_empty_indefinite_map_without_break_hard_errors() {
+    // 0xbf then EOF (no entries, no break) — still a truncated indefinite map => Err.
+    let blob = [0x81u8, 0xbf];
+    let mut iter = TvarIterator::new_with_endianness(&blob, TxIxEndianness::Big).unwrap();
+    match iter.next() {
+        Some(Err(_)) => {}
+        other => panic!("empty unterminated indefinite map must yield Some(Err), got {other:?}"),
+    }
+}

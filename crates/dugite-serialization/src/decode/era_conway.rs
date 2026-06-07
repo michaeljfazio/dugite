@@ -2347,39 +2347,103 @@ fn read_redeemer_tag(r: &mut Reader<'_>) -> Result<RedeemerTag, SerializationErr
 // Native script decoder
 // ============================================================================
 
+/// Decode a native (timelock) script from its raw CBOR encoding.
+///
+/// The input is the bare native-script CBOR array (NOT tag-24-wrapped). This is
+/// the body stored by a MemPack `AlonzoScript`'s `NativeScript` (timelock)
+/// variant, whose MemoBytes hold exactly this CBOR. Exposed so the Mithril /
+/// Haskell-import UTxO loader can reconstruct a typed `ScriptRef::NativeScript`
+/// from a MemPack reference-script blob and hash it via the ledger's
+/// `compute_script_ref_hash`.
+pub fn decode_native_script_cbor(cbor: &[u8]) -> Result<NativeScript, SerializationError> {
+    let mut r = Reader::new(cbor);
+    read_native_script(&mut r)
+}
+
+/// Decode an inline-datum `PlutusData` from its bare CBOR encoding.
+///
+/// The input is the raw CBOR-encoded Plutus `Data` (NOT tag-24-wrapped). This is
+/// exactly the body carried by a MemPack `Datum era` inline (`Datum binaryData`)
+/// variant: `BinaryData` is a newtype over `ShortByteString` holding the
+/// *original on-chain CBOR* of the datum, so the bytes are identical to the
+/// `inner_bytes` extracted from a tag-24 datum_option during normal block decode
+/// (see [`read_datum_option`]).
+///
+/// Exposed so the Mithril / Haskell-import UTxO loader can reconstruct a typed
+/// `OutputDatum::InlineDatum` from a MemPack TxOut (tags 4/5). Dropping the datum
+/// (importing `OutputDatum::None`) builds a *wrong* `ScriptContext` for any
+/// resolved script that spends the output, producing spurious "script returned
+/// Error term" phase-2 failures at the live tip.
+pub fn decode_plutus_data_cbor(cbor: &[u8]) -> Result<PlutusData, SerializationError> {
+    let mut r = Reader::new(cbor);
+    read_plutus_data(&mut r)
+}
+
 fn read_native_script(r: &mut Reader<'_>) -> Result<NativeScript, SerializationError> {
+    // OUTER ARRAY: accept BOTH definite- AND indefinite-length encodings.
+    //
+    // cardano-ledger's Timelock decoder reads this outer "sum" array via
+    // `Summands "TimelockRaw" decRaw` => `decodeRecordSum` => `decodeListLike`
+    // => `decodeListLikeT`, which decodes the length with `decodeListLenOrIndef`
+    // and TOLERATES the indefinite case (consuming the trailing break byte):
+    //
+    // ```haskell
+    // -- Cardano.Ledger.Allegra.Scripts
+    // instance Era era => DecCBOR (Annotator (TimelockRaw era)) where
+    //   decCBOR = decode (Summands "TimelockRaw" decRaw)
+    //
+    // -- Cardano.Ledger.Binary.Decoding.Decoder
+    // decodeRecordSum name decoder =
+    //   snd <$> decodeListLike name (decodeWord >>= decoder) $ \(size, _) n ->
+    //     matchSize ("Sum " <> name) size n
+    //
+    // decodeListLikeT name decoder actOnLength = do
+    //   lenOrIndef <- lift decodeListLenOrIndef
+    //   result <- decoder
+    //   case lenOrIndef of
+    //     Just n  -> actOnLength result n
+    //     Nothing -> lift $ do
+    //       isBreak <- decodeBreakOr
+    //       unless isBreak $ cborError $ DecoderErrorCustom name "Excess terms in array"
+    //   pure result
+    // ```
+    //
+    // So an indefinite-length outer array is VALID upstream. Our previous
+    // `read_array_header` + `is_none => Err` HARD-REJECTED it, over-rejecting
+    // potentially-real on-chain native scripts (ledger leniency means some may be
+    // indefinite-encoded) and aborting an entire snapshot import on the first such
+    // tag-5 reference script. Every NESTED list below already accepts indefinite
+    // arrays transparently via `read_array`; we now mirror that AND the upstream
+    // `decodeListLenOrIndef` tolerance for the outer array too (same bug class as
+    // commit 4b42125fbb, "accept indefinite-length CBOR map/array in Conway
+    // redeemers decode"). #10 round-4 F2.
     let arr_len = r.read_array_header()?;
-    if arr_len.is_none() {
-        return Err(SerializationError::CborDecode(
-            "native_script: expected definite-length array".into(),
-        ));
-    }
     let disc = r.read_uint()?;
-    match disc {
+    let script = match disc {
         0 => {
             let h28 = read_hash28_cert(r)?;
-            Ok(NativeScript::ScriptPubkey(h28.to_hash32_padded()))
+            NativeScript::ScriptPubkey(h28.to_hash32_padded())
         }
         1 => {
             let scripts = r.read_array(read_native_script)?;
-            Ok(NativeScript::ScriptAll(scripts))
+            NativeScript::ScriptAll(scripts)
         }
         2 => {
             let scripts = r.read_array(read_native_script)?;
-            Ok(NativeScript::ScriptAny(scripts))
+            NativeScript::ScriptAny(scripts)
         }
         3 => {
             let n = r.read_uint()? as u32;
             let scripts = r.read_array(read_native_script)?;
-            Ok(NativeScript::ScriptNOfK(n, scripts))
+            NativeScript::ScriptNOfK(n, scripts)
         }
         4 => {
             let slot = r.read_uint()?;
-            Ok(NativeScript::InvalidBefore(SlotNo(slot)))
+            NativeScript::InvalidBefore(SlotNo(slot))
         }
         5 => {
             let slot = r.read_uint()?;
-            Ok(NativeScript::InvalidHereafter(SlotNo(slot)))
+            NativeScript::InvalidHereafter(SlotNo(slot))
         }
         6 => {
             // Dijkstra (PV12+) only: `DijkstraRequireGuard credential`
@@ -2389,12 +2453,21 @@ fn read_native_script(r: &mut Reader<'_>) -> Result<NativeScript, SerializationE
             // where `credential = [type, hash28]` (0 = key, 1 = script).
             // Issue #475 Phase 3.5.
             let cred = read_stake_credential(r)?;
-            Ok(NativeScript::RequireGuard(cred))
+            NativeScript::RequireGuard(cred)
         }
-        other => Err(SerializationError::CborDecode(format!(
-            "native_script: unknown type {other}"
-        ))),
+        other => {
+            return Err(SerializationError::CborDecode(format!(
+                "native_script: unknown type {other}"
+            )))
+        }
+    };
+    // Indefinite-length outer array: consume the trailing CBOR break byte
+    // (0xff), exactly as upstream `decodeListLikeT` does for the `Nothing`
+    // (indefinite) case. For a definite-length array nothing further is needed.
+    if arr_len.is_none() {
+        r.expect_break()?;
     }
+    Ok(script)
 }
 
 // ============================================================================
@@ -4115,5 +4188,100 @@ mod tests {
         assert_eq!(rs2[0].tag, RedeemerTag::Spend);
         assert_eq!(rs2[0].index, 0);
         assert_eq!(rs2[0], rs[0]);
+    }
+
+    // ── F2: indefinite-length OUTER array in native (timelock) script ─────────
+    //
+    // cardano-ledger's Timelock decoder (`Summands "TimelockRaw" decRaw` =>
+    // `decodeRecordSum` => `decodeListLike` => `decodeListLikeT`) reads the outer
+    // sum array with `decodeListLenOrIndef` and TOLERATES the indefinite case
+    // (consuming the trailing break via `decodeBreakOr`). dugite previously
+    // HARD-REJECTED an indefinite outer array, over-rejecting potentially-real
+    // on-chain native scripts and aborting an entire snapshot import. These tests
+    // pin the relaxation and confirm the indefinite encoding decodes IDENTICALLY
+    // to its definite-encoded equivalent.
+
+    /// `[5, 1234]` = InvalidHereafter(1234), DEFINITE outer array.
+    fn native_invalid_hereafter_definite() -> Vec<u8> {
+        let mut v = vec![0x82, 0x05]; // array(2), uint 5
+        v.extend(cbor_uint(1234));
+        v
+    }
+
+    /// `[_ 5, 1234, break]` = InvalidHereafter(1234), INDEFINITE outer array.
+    fn native_invalid_hereafter_indefinite() -> Vec<u8> {
+        let mut v = vec![0x9f, 0x05]; // array(*) indefinite, uint 5
+        v.extend(cbor_uint(1234));
+        v.push(0xff); // break
+        v
+    }
+
+    #[test]
+    fn native_script_indefinite_outer_array_decodes_like_definite() {
+        let def = native_invalid_hereafter_definite();
+        let indef = native_invalid_hereafter_indefinite();
+
+        let parsed_def =
+            decode_native_script_cbor(&def).expect("definite-length native script must decode");
+        let parsed_indef = decode_native_script_cbor(&indef)
+            .expect("indefinite-length native script must decode (F2: ledger leniency)");
+
+        assert_eq!(parsed_def, NativeScript::InvalidHereafter(SlotNo(1234)));
+        // Byte-different encoding, identical decoded value.
+        assert_eq!(parsed_def, parsed_indef);
+    }
+
+    #[test]
+    fn native_script_indefinite_outer_array_missing_break_errors() {
+        // Indefinite header but the body is NOT closed with a break byte: upstream
+        // `decodeListLikeT` raises "Excess terms in array". We must error, not
+        // silently accept a half-open array.
+        let mut bad = vec![0x9f, 0x05]; // array(*) indefinite, uint 5
+        bad.extend(cbor_uint(1234));
+        // (no 0xff break, and a stray trailing byte that is not a break)
+        bad.push(0x00);
+        assert!(
+            decode_native_script_cbor(&bad).is_err(),
+            "indefinite outer array without a closing break must be rejected"
+        );
+    }
+
+    #[test]
+    fn native_script_nested_indefinite_outer_array_decodes() {
+        // ScriptAll with a child whose OUTER array is indefinite-encoded:
+        //   [1, [ [_ 5, 1234, break] ]]
+        // Exercises the relaxation through the recursive `read_array` path.
+        let mut v = vec![0x82, 0x01]; // array(2), uint 1 (ScriptAll)
+        v.push(0x81); // array(1) children
+        v.extend(native_invalid_hereafter_indefinite());
+        let parsed =
+            decode_native_script_cbor(&v).expect("nested indefinite native script must decode");
+        assert_eq!(
+            parsed,
+            NativeScript::ScriptAll(vec![NativeScript::InvalidHereafter(SlotNo(1234))])
+        );
+    }
+
+    #[test]
+    fn script_ref_native_script_indefinite_outer_array_imports() {
+        // A `#6.24`-wrapped reference script (script_type 0 = native) whose native
+        // timelock outer array is INDEFINITE-encoded must IMPORT rather than abort
+        // the decode — the snapshot-import failure mode this fix closes.
+        use dugite_primitives::transaction::ScriptRef;
+
+        let ns = native_invalid_hereafter_indefinite();
+        let mut inner = vec![0x82, 0x00]; // [0, native_script]
+        inner.extend(&ns);
+        let outer = embed_cbor_tag24(&inner);
+
+        let mut r = Reader::new(&outer);
+        let parsed = read_script_ref(&mut r)
+            .expect("indefinite native script_ref must decode (F2 import path)");
+        match parsed {
+            ScriptRef::NativeScript(NativeScript::InvalidHereafter(SlotNo(s))) => {
+                assert_eq!(s, 1234)
+            }
+            other => panic!("expected NativeScript(InvalidHereafter), got {other:?}"),
+        }
     }
 }

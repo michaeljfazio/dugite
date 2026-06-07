@@ -71,7 +71,7 @@
 //!   `writeWord64BE`/`writeWord32BE`)
 
 use crate::error::SerializationError;
-use crate::mempack::compact::{decode_compact_addr, decode_compact_value, decode_varlen};
+use crate::mempack::compact::{decode_compact_addr, decode_compact_value_exact, decode_varlen};
 
 /// A decoded MemPack TxOut.
 ///
@@ -90,11 +90,22 @@ pub struct MemPackTxOut {
     pub coin: u64,
     /// Raw multi-asset bytes (when CompactValue tag = 1).
     pub multi_asset: Option<Vec<u8>>,
+    /// Number of distinct `(policy, asset)` pairs in `multi_asset` (the
+    /// `CompactValue` `numMA` header). `0` when ADA-only or when the multi-asset
+    /// blob came from the opaque (tags 0–3) path. Needed to split the `rep`
+    /// ShortByteString into `(PolicyID, AssetName, Quantity)` triples via
+    /// [`crate::mempack::compact::parse_multi_asset_rep`].
+    pub num_assets: u64,
     /// 32-byte datum hash (tags 1, 3).
     pub datum_hash: Option<[u8; 32]>,
     /// Inline datum bytes (tags 4, 5).
     pub datum: Option<Vec<u8>>,
-    /// Reference script bytes (tag 5).
+    /// Reference script as a MemPack-encoded `AlonzoScript` blob (tag 5).
+    ///
+    /// The bytes are the raw MemPack serialization of the Haskell `Script era`:
+    /// a 1-byte `AlonzoScript` tag (`0` = native/timelock, `1` = Plutus) followed
+    /// by the script body. See [`decode_mempack_script`] for the exact layout and
+    /// [`ScriptRefKind`] for a fully-classified decode.
     pub script_ref: Option<Vec<u8>>,
     /// Opaque remaining bytes for variants we cannot fully split yet (tag 5
     /// multi-asset payloads, etc.). For tags 0–3 this is always `None`.
@@ -137,8 +148,17 @@ fn decode_tag0(data: &[u8]) -> Result<(MemPackTxOut, usize), SerializationError>
     let (address, addr_consumed) = decode_compact_addr(&data[off..])?;
     off += addr_consumed;
 
-    // CompactValue: tag(0/1) + VarLen(coin) [+ multi-asset].
-    let val = decode_compact_value(&data[off..], Some(data.len() - off))?;
+    // CompactValue: tag(0/1) + VarLen(coin) [+ VarLen(numMA) + rep].
+    //
+    // Parse it EXACTLY (not the opaque "everything to the end" path): the
+    // multi-asset `rep` ShortByteString carries its own `VarLen` length, and the
+    // `numMA` header is required to split it into (PolicyID, AssetName, Quantity)
+    // triples. The opaque path left `num_assets = 0`, so the node-side fold
+    // (`parse_multi_asset_rep(rep, 0)`) returned an empty asset map and silently
+    // dropped every native token on import — the #10 MultiAssetNotConserved /
+    // input_side:0 bug. Verified empirically: 898,515 tag-0 multi-asset preprod
+    // UTxOs were all decoded with num_assets=0 before this change.
+    let val = decode_compact_value_exact(&data[off..])?;
     off += val.consumed;
 
     Ok((
@@ -147,6 +167,7 @@ fn decode_tag0(data: &[u8]) -> Result<(MemPackTxOut, usize), SerializationError>
             address,
             coin: val.coin,
             multi_asset: val.multi_asset_raw,
+            num_assets: val.num_assets,
             datum_hash: None,
             datum: None,
             script_ref: None,
@@ -172,19 +193,29 @@ fn decode_tag1(data: &[u8]) -> Result<(MemPackTxOut, usize), SerializationError>
     let (address, addr_consumed) = decode_compact_addr(&data[off..])?;
     off += addr_consumed;
 
-    // The datum hash occupies the last 32 bytes.  Everything between addr and
-    // the hash is the CompactValue.
-    let value_end = data.len() - 32;
-    if off > value_end {
-        return Err(SerializationError::CborDecode(
-            "mempack_txout tag 1: not enough bytes for value + datum hash".into(),
-        ));
+    // CompactValue, parsed EXACTLY so we land precisely on the 32-byte DataHash
+    // that follows (`TxOutCompactDH' cAddr cValue dataHash`). The previous decoder
+    // located the hash as "the last 32 bytes" and treated everything in between as
+    // an OPAQUE multi-asset blob with num_assets=0 — so the node-side fold dropped
+    // all native tokens (the #10 MultiAssetNotConserved bug; 71,940 tag-1
+    // multi-asset preprod UTxOs were affected). The exact parse recovers the
+    // numMA header and rep length so the triples can be reconstructed, and the
+    // DataHash offset is now derived from the value extent rather than assumed.
+    let val = decode_compact_value_exact(&data[off..])?;
+    off += val.consumed;
+
+    let datum_end = off.checked_add(32).ok_or_else(|| {
+        SerializationError::CborDecode("mempack_txout tag 1: datum hash offset overflow".into())
+    })?;
+    if datum_end > data.len() {
+        return Err(SerializationError::CborDecode(format!(
+            "mempack_txout tag 1: need {datum_end} bytes for value + datum hash, have {}",
+            data.len()
+        )));
     }
-
-    let val = decode_compact_value(&data[off..], Some(value_end - off))?;
-
     let mut datum_hash_bytes = [0u8; 32];
-    datum_hash_bytes.copy_from_slice(&data[value_end..value_end + 32]);
+    datum_hash_bytes.copy_from_slice(&data[off..datum_end]);
+    off = datum_end;
 
     Ok((
         MemPackTxOut {
@@ -192,12 +223,13 @@ fn decode_tag1(data: &[u8]) -> Result<(MemPackTxOut, usize), SerializationError>
             address,
             coin: val.coin,
             multi_asset: val.multi_asset_raw,
+            num_assets: val.num_assets,
             datum_hash: Some(datum_hash_bytes),
             datum: None,
             script_ref: None,
             opaque_tail: None,
         },
-        data.len(),
+        off,
     ))
 }
 
@@ -329,6 +361,7 @@ fn decode_tag2(data: &[u8]) -> Result<(MemPackTxOut, usize), SerializationError>
             address: decoded.address,
             coin: decoded.coin,
             multi_asset: None,
+            num_assets: 0,
             datum_hash: None,
             datum: None,
             script_ref: None,
@@ -367,6 +400,7 @@ fn decode_tag3(data: &[u8]) -> Result<(MemPackTxOut, usize), SerializationError>
             address: decoded.address,
             coin: decoded.coin,
             multi_asset: None,
+            num_assets: 0,
             datum_hash: Some(datum_hash),
             datum: None,
             script_ref: None,
@@ -378,73 +412,105 @@ fn decode_tag3(data: &[u8]) -> Result<(MemPackTxOut, usize), SerializationError>
 
 /// Tag 4: `TxOutCompactDatum` — CompactAddr + CompactValue + inline datum.
 ///
-/// The datum occupies all remaining bytes after CompactAddr + CompactValue.
-/// There is no explicit length prefix for the datum.
+/// Matches the byte-exact MemPack layout from cardano-ledger
+/// (`eras/babbage/impl/src/Cardano/Ledger/Babbage/TxOut.hs`):
+///
+/// ```haskell
+/// TxOutCompactDatum cAddr cValue datum ->
+///   packTagM 4 >> packM cAddr >> packM cValue >> packM datum
+/// ```
+///
+/// Unlike tag 5's `Datum era` *option*, the tag-4 `datum` field is a
+/// `BinaryData era` **directly** (an inline datum is always present), i.e. a
+/// newtype over `ShortByteString` whose MemPack form is
+/// `VarLen(len) ‖ raw_cbor_datum`. The `VarLen` length prefix MUST be stripped
+/// so `datum` carries the bare on-chain Plutus `Data` CBOR — the same bytes a
+/// tag-24 inline datum yields during normal block decode. (The previous decoder
+/// stored the length-prefixed bytes for ADA-only and dropped the datum entirely
+/// for multi-asset; both produced a wrong inline datum on import — gap A of #10.)
+///
+/// Both the ADA-only and multi-asset CompactValue cases are parsed exactly (via
+/// [`decode_compact_value_exact`]) so the `BinaryData` datum tail is recovered
+/// from the correct offset.
 fn decode_tag4(data: &[u8]) -> Result<(MemPackTxOut, usize), SerializationError> {
     let mut off = 1;
 
     let (address, addr_consumed) = decode_compact_addr(&data[off..])?;
     off += addr_consumed;
 
-    // For ADA-only (value tag 0): coin VarLen, then datum is the rest.
-    // For multi-asset (value tag 1): coin VarLen + multi-asset, then datum.
-    // Since multi-asset has no self-delimiting length in this context, for
-    // multi-asset we store value + datum together as opaque remaining bytes.
     if off >= data.len() {
         return Err(SerializationError::CborDecode(
             "mempack_txout tag 4: no value data".into(),
         ));
     }
 
-    let value_tag = data[off];
-    if value_tag == 0 {
-        // ADA-only: parse coin, rest is datum.
-        let val = decode_compact_value(&data[off..], None)?;
-        off += val.consumed;
-        let datum = if off < data.len() {
-            Some(data[off..].to_vec())
-        } else {
-            None
-        };
-        Ok((
-            MemPackTxOut {
-                tag: 4,
-                address,
-                coin: val.coin,
-                multi_asset: None,
-                datum_hash: None,
-                datum,
-                script_ref: None,
-                opaque_tail: None,
-            },
-            data.len(),
-        ))
-    } else {
-        // Multi-asset: the boundary between multi-asset and datum is ambiguous
-        // without fully parsing the multi-asset structure.  Store all remaining
-        // bytes as opaque tail; coin is extracted from the VarLen.
-        let val = decode_compact_value(&data[off..], Some(data.len() - off))?;
-        Ok((
-            MemPackTxOut {
-                tag: 4,
-                address,
-                coin: val.coin,
-                multi_asset: val.multi_asset_raw,
-                datum_hash: None,
-                datum: None, // Datum is interleaved in multi_asset/opaque_tail.
-                script_ref: None,
-                opaque_tail: None,
-            },
-            data.len(),
-        ))
+    // CompactValue (ADA-only or multi-asset), parsed exactly so we land on the
+    // BinaryData length prefix.
+    let val = decode_compact_value_exact(&data[off..])?;
+    off += val.consumed;
+
+    // BinaryData : ShortByteString = VarLen(len) ‖ raw_cbor.
+    let (datum, datum_consumed) = decode_binary_data(&data[off..])?;
+    off += datum_consumed;
+
+    Ok((
+        MemPackTxOut {
+            tag: 4,
+            address,
+            coin: val.coin,
+            multi_asset: val.multi_asset_raw,
+            num_assets: val.num_assets,
+            datum_hash: None,
+            datum: Some(datum),
+            script_ref: None,
+            opaque_tail: None,
+        },
+        off,
+    ))
+}
+
+/// Decode a MemPack `BinaryData era` field: a newtype over `ShortByteString`
+/// serialized as `VarLen(len) ‖ raw_bytes`. Returns the bare bytes (the original
+/// on-chain Plutus `Data` CBOR) and the total bytes consumed (prefix + body).
+///
+/// `deriving newtype MemPack` on `BinaryData` (see
+/// `libs/cardano-ledger-core/src/Cardano/Ledger/Plutus/Data.hs`) means it
+/// inherits the `MemPack ShortByteString` instance.
+fn decode_binary_data(data: &[u8]) -> Result<(Vec<u8>, usize), SerializationError> {
+    let (len, len_bytes) = decode_varlen(data)?;
+    let len = len as usize;
+    let start = len_bytes;
+    let end = start.checked_add(len).ok_or_else(|| {
+        SerializationError::CborDecode("mempack_txout: BinaryData length overflow".into())
+    })?;
+    if end > data.len() {
+        return Err(SerializationError::CborDecode(format!(
+            "mempack_txout: BinaryData needs {end} bytes, have {}",
+            data.len()
+        )));
     }
+    Ok((data[start..end].to_vec(), end))
 }
 
 /// Tag 5: `TxOutCompactRefScript` — CompactAddr + CompactValue + Datum + Script.
 ///
-/// Similar to tag 4 but with an additional reference script after the datum.
-/// Without fully parsing each sub-field boundary, we store the address and coin,
-/// and put the remaining bytes into opaque_tail.
+/// Matches the byte-exact MemPack layout from cardano-ledger
+/// (`eras/babbage/impl/src/Cardano/Ledger/Babbage/TxOut.hs`):
+///
+/// ```haskell
+/// TxOutCompactRefScript cAddr cValue datum script ->
+///   packTagM 5 >> packM cAddr >> packM cValue >> packM datum >> packM script
+/// ```
+///
+/// where:
+/// * `datum :: Datum era`  — option, see [`decode_datum_option`]:
+///   `packTagM 0` (NoDatum) / `packTagM 1 >> packM dataHash` (DatumHash) /
+///   `packTagM 2 >> packM binaryData` (inline Datum).
+/// * `script :: Script era` — `AlonzoScript`, see [`decode_mempack_script`].
+///
+/// Both the ADA-only and multi-asset CompactValue cases are now parsed exactly
+/// (via [`decode_compact_value_exact`]) so the Datum + Script tail is recovered
+/// rather than dumped into `opaque_tail`.
 fn decode_tag5(data: &[u8]) -> Result<(MemPackTxOut, usize), SerializationError> {
     let mut off = 1;
 
@@ -457,45 +523,240 @@ fn decode_tag5(data: &[u8]) -> Result<(MemPackTxOut, usize), SerializationError>
         ));
     }
 
-    let value_tag = data[off];
-    if value_tag == 0 {
-        // ADA-only value.
-        let val = decode_compact_value(&data[off..], None)?;
-        off += val.consumed;
-        // Everything remaining is datum + script (opaque).
-        let opaque = if off < data.len() {
-            Some(data[off..].to_vec())
-        } else {
-            None
-        };
-        Ok((
-            MemPackTxOut {
-                tag: 5,
-                address,
-                coin: val.coin,
-                multi_asset: None,
-                datum_hash: None,
+    // CompactValue (ADA-only or multi-asset) — exact length so we land on the
+    // Datum option byte.
+    let val = decode_compact_value_exact(&data[off..])?;
+    off += val.consumed;
+
+    // Datum option.
+    let datum_opt = decode_datum_option(&data[off..])?;
+    off += datum_opt.consumed;
+
+    // Reference script (raw MemPack AlonzoScript blob). We validate that it
+    // decodes to a known shape but store the raw bytes for the caller to
+    // reconstruct a typed ScriptRef.
+    let (script_blob, script_consumed) = decode_mempack_script(&data[off..])?;
+    off += script_consumed;
+
+    Ok((
+        MemPackTxOut {
+            tag: 5,
+            address,
+            coin: val.coin,
+            multi_asset: val.multi_asset_raw,
+            num_assets: val.num_assets,
+            datum_hash: datum_opt.datum_hash,
+            datum: datum_opt.datum,
+            script_ref: Some(script_blob),
+            opaque_tail: None,
+        },
+        off,
+    ))
+}
+
+/// A decoded MemPack `Datum era` option.
+struct DatumOption {
+    /// 32-byte datum hash (the `DatumHash` branch).
+    datum_hash: Option<[u8; 32]>,
+    /// Inline datum CBOR bytes (the `Datum`/`BinaryData` branch).
+    datum: Option<Vec<u8>>,
+    /// Bytes consumed by the option.
+    consumed: usize,
+}
+
+/// Decode a MemPack `Datum era` option.
+///
+/// Matches `instance Era era => MemPack (Datum era)` from cardano-ledger
+/// (`libs/cardano-ledger-core/src/Cardano/Ledger/Plutus/Data.hs`):
+///
+/// ```haskell
+/// packM = \case
+///   NoDatum            -> packTagM 0
+///   DatumHash dataHash -> packTagM 1 >> packM dataHash
+///   Datum binaryData   -> packTagM 2 >> packM binaryData
+/// ```
+///
+/// * `DataHash` is `Hash Blake2b_256 ... = PackedBytes32`, packed via
+///   `writeWord64BE` (`Cardano.Crypto.PackedBytes.Internal`). That byteswaps to
+///   produce **big-endian on-disk bytes directly**, so the 32 stored bytes ARE
+///   the datum hash, contiguous and untransformed. (This differs from the
+///   `DataHash32`/`Addr28Extra` ledger types used by tags 2/3, which pack four
+///   plain native-endian `Word64`s and therefore require the LE→BE slot
+///   recovery in [`decode_tag3`]/[`decode_addr28_payload`].)
+/// * `BinaryData` is a newtype over `ShortByteString`, so it is serialized as
+///   `VarLen(len) ‖ raw_cbor_datum_bytes`.
+fn decode_datum_option(data: &[u8]) -> Result<DatumOption, SerializationError> {
+    if data.is_empty() {
+        return Err(SerializationError::CborDecode(
+            "mempack_txout tag 5: truncated Datum option".into(),
+        ));
+    }
+    match data[0] {
+        0 => Ok(DatumOption {
+            datum_hash: None,
+            datum: None,
+            consumed: 1,
+        }),
+        1 => {
+            if data.len() < 1 + 32 {
+                return Err(SerializationError::CborDecode(
+                    "mempack_txout tag 5: truncated DatumHash".into(),
+                ));
+            }
+            let mut dh = [0u8; 32];
+            dh.copy_from_slice(&data[1..1 + 32]);
+            Ok(DatumOption {
+                datum_hash: Some(dh),
                 datum: None,
-                script_ref: None,
-                opaque_tail: opaque,
-            },
-            data.len(),
-        ))
-    } else {
-        // Multi-asset: store coin + opaque remaining.
-        let val = decode_compact_value(&data[off..], Some(data.len() - off))?;
-        Ok((
-            MemPackTxOut {
-                tag: 5,
-                address,
-                coin: val.coin,
-                multi_asset: val.multi_asset_raw,
+                consumed: 1 + 32,
+            })
+        }
+        2 => {
+            // BinaryData : ShortByteString = VarLen(len) ‖ bytes.
+            let (len, len_bytes) = decode_varlen(&data[1..])?;
+            let len = len as usize;
+            let start = 1 + len_bytes;
+            let end = start.checked_add(len).ok_or_else(|| {
+                SerializationError::CborDecode("mempack_txout tag 5: datum length overflow".into())
+            })?;
+            if end > data.len() {
+                return Err(SerializationError::CborDecode(
+                    "mempack_txout tag 5: truncated inline Datum".into(),
+                ));
+            }
+            Ok(DatumOption {
                 datum_hash: None,
-                datum: None,
-                script_ref: None,
-                opaque_tail: None,
-            },
-            data.len(),
-        ))
+                datum: Some(data[start..end].to_vec()),
+                consumed: end,
+            })
+        }
+        other => Err(SerializationError::CborDecode(format!(
+            "mempack_txout tag 5: unknown Datum option tag {other}"
+        ))),
+    }
+}
+
+/// Decode a MemPack `Script era` (= `AlonzoScript`) blob, returning the raw
+/// blob bytes (tag + body) and the number of bytes consumed.
+///
+/// Matches `instance ... => MemPack (AlonzoScript era)` from cardano-ledger
+/// (`eras/alonzo/impl/src/Cardano/Ledger/Alonzo/Scripts.hs`):
+///
+/// ```haskell
+/// packM = \case
+///   NativeScript script -> packTagM 0 >> packM script
+///   PlutusScript script -> packTagM 1 >> packM script
+/// ```
+///
+/// * NativeScript (`Timelock`) is a `MemoBytes`, packed via `packMemoBytesM` as
+///   its memoized CBOR `ShortByteString` = `VarLen(len) ‖ raw_cbor`.
+/// * PlutusScript is era-relative (`PlutusScript era`): a further `packTagM`
+///   selects the language (Babbage: 0=V1, 1=V2; Conway: 0=V1, 1=V2, 2=V3) and
+///   the body is the `Plutus l` newtype over `ShortByteString` =
+///   `VarLen(len) ‖ flat_program`.
+///
+/// We do not interpret the language tag here (it is era-relative); we only need
+/// the total byte length to delimit the blob. The full blob (outer tag onward)
+/// is returned so the caller can reconstruct a typed `ScriptRef`.
+fn decode_mempack_script(data: &[u8]) -> Result<(Vec<u8>, usize), SerializationError> {
+    if data.is_empty() {
+        return Err(SerializationError::CborDecode(
+            "mempack_txout tag 5: truncated Script".into(),
+        ));
+    }
+    let outer_tag = data[0];
+    let body_off = match outer_tag {
+        0 => 1, // NativeScript: body is the MemoBytes ShortByteString.
+        1 => {
+            // PlutusScript: one era-relative language tag byte, then ShortByteString.
+            if data.len() < 2 {
+                return Err(SerializationError::CborDecode(
+                    "mempack_txout tag 5: truncated PlutusScript language tag".into(),
+                ));
+            }
+            2
+        }
+        other => {
+            return Err(SerializationError::CborDecode(format!(
+                "mempack_txout tag 5: unknown AlonzoScript tag {other}"
+            )));
+        }
+    };
+
+    // ShortByteString body: VarLen(len) ‖ bytes.
+    let (len, len_bytes) = decode_varlen(&data[body_off..])?;
+    let len = len as usize;
+    let body_start = body_off + len_bytes;
+    let total = body_start.checked_add(len).ok_or_else(|| {
+        SerializationError::CborDecode("mempack_txout tag 5: script length overflow".into())
+    })?;
+    if total > data.len() {
+        return Err(SerializationError::CborDecode(format!(
+            "mempack_txout tag 5: script needs {total} bytes, have {}",
+            data.len()
+        )));
+    }
+    Ok((data[..total].to_vec(), total))
+}
+
+/// Classified view of a MemPack `AlonzoScript` reference-script blob.
+///
+/// Produced by [`parse_script_ref_kind`]. The language tag carried by Plutus
+/// scripts is **era-relative** (Babbage: 0=V1, 1=V2; Conway: 0=V1, 1=V2, 2=V3),
+/// so the caller must map it to a global script language using the snapshot era.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScriptRefKind {
+    /// Native (timelock) script — body is the raw CBOR of the native script.
+    Native(Vec<u8>),
+    /// Plutus script — `(era_relative_language_tag, flat_program_bytes)`.
+    Plutus { lang_tag: u8, body: Vec<u8> },
+}
+
+/// Classify a raw MemPack `AlonzoScript` blob (as stored in
+/// [`MemPackTxOut::script_ref`]) into a [`ScriptRefKind`].
+///
+/// See [`decode_mempack_script`] for the byte layout this re-parses.
+pub fn parse_script_ref_kind(blob: &[u8]) -> Result<ScriptRefKind, SerializationError> {
+    if blob.is_empty() {
+        return Err(SerializationError::CborDecode(
+            "script_ref blob: empty".into(),
+        ));
+    }
+    match blob[0] {
+        0 => {
+            // Native: VarLen(len) ‖ cbor.
+            let (len, len_bytes) = decode_varlen(&blob[1..])?;
+            let start = 1 + len_bytes;
+            let end = start + len as usize;
+            if end > blob.len() {
+                return Err(SerializationError::CborDecode(
+                    "script_ref blob: truncated native body".into(),
+                ));
+            }
+            Ok(ScriptRefKind::Native(blob[start..end].to_vec()))
+        }
+        1 => {
+            if blob.len() < 2 {
+                return Err(SerializationError::CborDecode(
+                    "script_ref blob: truncated plutus language tag".into(),
+                ));
+            }
+            let lang_tag = blob[1];
+            let (len, len_bytes) = decode_varlen(&blob[2..])?;
+            let start = 2 + len_bytes;
+            let end = start + len as usize;
+            if end > blob.len() {
+                return Err(SerializationError::CborDecode(
+                    "script_ref blob: truncated plutus body".into(),
+                ));
+            }
+            Ok(ScriptRefKind::Plutus {
+                lang_tag,
+                body: blob[start..end].to_vec(),
+            })
+        }
+        other => Err(SerializationError::CborDecode(format!(
+            "script_ref blob: unknown AlonzoScript tag {other}"
+        ))),
     }
 }

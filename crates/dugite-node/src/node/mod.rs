@@ -166,6 +166,127 @@ pub(crate) fn resolve_inmemory_tables_path(snap: &std::path::Path) -> Option<Pat
     None
 }
 
+/// Authoritatively resolve the on-disk MemPack `TxIx` byte order for a Haskell
+/// snapshot directory, reading the disambiguator from the sibling `meta` file's
+/// `tablesCodecVersion`.
+///
+/// This is the exact logic the InMemory snapshot importer runs; it is factored
+/// out so it can be exercised end-to-end by the importer tests (rather than
+/// re-implementing the policy or testing `from_tables_codec_version` in
+/// isolation). `tvar_data` is the raw MemPack tables blob, used only by the
+/// independent cross-validation safety net.
+///
+/// STRICT META SEMANTICS (#10). The backend/version/endianness DECISION below is
+/// byte-exact with upstream `loadSnapshot`'s metadata handling. SCOPE NOTE: this
+/// import path does NOT verify snapshot CRC/checksum integrity
+/// (`crcOfConcat == snapshotChecksum`); that is tracked separately as #17.
+///
+/// The two-file `state`+`meta` snapshot format carries the disambiguators we
+/// REQUIRE: a `backend` (`UTxOHDMemSnapshot`) and a `tablesCodecVersion`. The
+/// node loader `Ouroboros.Consensus.Storage.LedgerDB.V2.InMemory.loadSnapshot`
+/// reads the metadata and:
+///
+/// 1. enforces the backend BEFORE decoding tables —
+///    ```haskell
+///    when (snapshotBackend /= UTxOHDMemSnapshot) $
+///      throwE $ MetadataBackendMismatch snapshotBackend
+///    ```
+/// 2. then decodes the tables via the `BigEndianTxIx` MemPack instance
+///    UNCONDITIONALLY — it never branches on the codec version for endianness;
+/// 3. a meta that fails to parse (including the mandatory
+///    `o .: "tablesCodecVersion"` — absent or null) is a `ReadMetadataError`;
+/// 4. a MISSING meta file is also a `ReadMetadataError`. (`getMetadata`'s
+///    `MetadataFileDoesNotExist -> Nothing` in the offline converter is the
+///    CRC-SKIP path, NOT a decode-LE branch — endianness is never selected from
+///    a missing/absent version.)
+///
+/// We therefore REJECT everything upstream's METADATA DECODE rejects (default to
+/// rejection / byte-exact only; CRC/checksum integrity is out of scope here — #17):
+///
+/// * meta FILE absent ⇒ ERROR (no silent legacy little-endian fallback);
+/// * meta present, `backend != "utxohd-mem"` (absent/other) ⇒ ERROR
+///   (`MetadataBackendMismatch`);
+/// * meta present, `tablesCodecVersion` absent/null ⇒ ERROR (`MetadataInvalid`);
+/// * meta present, `tablesCodecVersion == 1` ⇒ big-endian `TxIx` (the only
+///   accepted outcome; chain-verified against the modern preprod snapshot);
+/// * meta present, any other version / malformed ⇒ ERROR (`enforceVersion`).
+///
+/// `Big` is the ONLY byte order this function can ever return. The
+/// cross-validator is a LIVE defense-in-depth veto (called below on `tvar_data`):
+/// it re-derives the byte order from the actual UTxO index distribution and
+/// REJECTS the import if the data clearly contradicts the version-derived choice.
+/// The purely empirical `detect_txix_endianness` is reserved for test/fixture
+/// snapshots that ship no `meta` file.
+pub(crate) fn resolve_snapshot_txix_endianness(
+    snapshot_dir: &std::path::Path,
+    tvar_data: &[u8],
+) -> anyhow::Result<dugite_serialization::mempack::TxIxEndianness> {
+    use anyhow::Context;
+
+    let meta_path = snapshot_dir.join("meta");
+    let meta_bytes = match std::fs::read(&meta_path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!(
+                "snapshot has no meta file at {} (upstream V2/InMemory loadSnapshot would \
+                 fail with ReadMetadataError); refusing to import a snapshot without a valid \
+                 tables codec version — endianness is never selected from a missing meta \
+                 (no silent little-endian fallback)",
+                meta_path.display()
+            );
+        }
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "reading snapshot meta file at {} (it exists but could not be read — \
+                     refusing to guess the TxIx codec version)",
+                    meta_path.display()
+                )
+            });
+        }
+    };
+
+    // Enforce backend == "utxohd-mem" (UTxOHDMemSnapshot) BEFORE anything else,
+    // mirroring V2/InMemory loadSnapshot's MetadataBackendMismatch guard. The
+    // separate `check_snapshot_backend_match` / `load_snapshot_with_backend_guard`
+    // path guards the dugite ledger-snapshot LOAD, not this MemPack IMPORT path.
+    dugite_serialization::mempack::enforce_snapshot_backend_is_utxohd_mem(&meta_bytes)
+        .with_context(|| format!("validating snapshot backend from {}", meta_path.display()))?;
+
+    let codec_version = dugite_serialization::mempack::parse_tables_codec_version(&meta_bytes)
+        .with_context(|| format!("parsing tablesCodecVersion from {}", meta_path.display()))?;
+
+    let endianness = dugite_serialization::mempack::TxIxEndianness::from_tables_codec_version(
+        Some(codec_version),
+    )
+    .with_context(|| {
+        format!(
+            "mapping tablesCodecVersion={codec_version} (from {}) to a TxIx byte order",
+            meta_path.display()
+        )
+    })?;
+    info!(
+        codec_version,
+        txix_endianness = ?endianness,
+        "Authoritatively determined MemPack TxIx endianness from snapshot meta \
+         tablesCodecVersion (strict: only version 1 => big-endian is accepted)"
+    );
+
+    // INDEPENDENT cross-validation (defense in depth): re-derive the byte order
+    // empirically from the data and ERROR if it CLEARLY contradicts the
+    // version-derived choice (always big-endian under strict semantics). The
+    // version decides; the heuristic only vetoes a definite disagreement.
+    dugite_serialization::mempack::cross_validate_txix_endianness(tvar_data, endianness)
+        .with_context(|| {
+            format!(
+                "snapshot meta at {} disagrees with the UTxO index distribution",
+                meta_path.display()
+            )
+        })?;
+
+    Ok(endianness)
+}
+
 fn bind_n2n_listener(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
 
@@ -246,6 +367,103 @@ pub(crate) fn apply_peer_metrics(
     metrics
         .n2n_connections_active
         .store(active_connection_count as u64, Relaxed);
+}
+
+/// Convert a MemPack-classified reference script ([`ScriptRefKind`]) into a
+/// typed [`ScriptRef`](dugite_primitives::transaction::ScriptRef).
+///
+/// Used by the Haskell/Mithril UTxO importer to reconstruct reference scripts
+/// from a tag-5 (`TxOutCompactRefScript`) MemPack TxOut. The Plutus language tag
+/// is era-relative in MemPack, but its mapping is monotonic across every Cardano
+/// era (Babbage/Conway/Dijkstra `PlutusScript` MemPack instances all agree:
+/// 0→V1, 1→V2, 2→V3, 3→V4), so this mapping is byte-exact regardless of the
+/// snapshot era.
+///
+/// OPAQUE-STORE vs HARD-ERROR is split per the Haskell MemPack instances:
+///
+/// * Plutus body — `Plutus l` derives `MemPack` through
+///   `newtype PlutusBinary { unPlutusBinary :: ShortByteString }
+///    deriving newtype (… MemPack)` (cardano-ledger
+///   `Cardano.Ledger.Plutus.Language`). So `unpackM` stores the flat program
+///   bytes OPAQUELY and never re-validates them at snapshot load. We mirror that:
+///   the body is carried verbatim into `ScriptRef::PlutusV{1,2,3,4}` with no
+///   structural decode — a structurally-odd-but-framed body does NOT error.
+///
+/// * Native (timelock) body — `newtype Timelock era = MkTimelock (MemoBytes …)`
+///   with `unpackM = MkTimelock <$> unpackMemoBytesM (eraProtVerLow @era)`
+///   (cardano-ledger `Cardano.Ledger.Allegra.Scripts`). Unlike `PlutusBinary`,
+///   `unpackMemoBytesM` STRUCTURALLY decodes the script tree, so a malformed
+///   timelock CBOR is a genuine MemPack `unpackM` failure → HARD ERROR. We mirror
+///   that by decoding the native CBOR and erroring on failure.
+///
+/// The out-of-range Plutus language tag is a frame-level error (mirrors
+/// `unknownTagM`); truncation is caught earlier by `parse_script_ref_kind`. In
+/// every error case we refuse the import rather than silently drop a `ScriptRef`
+/// (which would make a Mithril-fast-started node fail to resolve a reference
+/// script at the live tip — spurious phase-2 failures).
+fn decode_imported_script_ref(
+    kind: dugite_serialization::mempack::txout::ScriptRefKind,
+) -> anyhow::Result<dugite_primitives::transaction::ScriptRef> {
+    use dugite_primitives::transaction::ScriptRef;
+    use dugite_serialization::mempack::txout::ScriptRefKind;
+    match kind {
+        ScriptRefKind::Native(cbor) => {
+            let ns = dugite_serialization::decode_native_script_cbor(&cbor).map_err(|e| {
+                anyhow::anyhow!(e).context(
+                    "import: malformed native reference-script (tag-5) CBOR; refusing to import \
+                     a silently-dropped script_ref",
+                )
+            })?;
+            Ok(ScriptRef::NativeScript(ns))
+        }
+        ScriptRefKind::Plutus { lang_tag, body } => match lang_tag {
+            0 => Ok(ScriptRef::PlutusV1(body)),
+            1 => Ok(ScriptRef::PlutusV2(body)),
+            2 => Ok(ScriptRef::PlutusV3(body)),
+            3 => Ok(ScriptRef::PlutusV4(body)),
+            other => Err(anyhow::anyhow!(
+                "import: unknown Plutus language tag {other} in tag-5 MemPack reference script; \
+                 refusing to import a silently-dropped script_ref"
+            )),
+        },
+    }
+}
+
+/// OPAQUE-STORE a MemPack-imported inline datum (`BinaryData`) into an
+/// [`OutputDatum::InlineDatum`].
+///
+/// Matches Haskell `BinaryData`, defined as
+///
+/// ```haskell
+/// newtype BinaryData era = BinaryData ShortByteString
+///   deriving newtype (..., MemPack)
+/// ```
+///
+/// (cardano-ledger `Cardano.Ledger.Plutus.Data`). Because the `MemPack` instance
+/// is *derived through* `ShortByteString`, `unpackM` at snapshot load stores the
+/// bytes OPAQUELY and never re-decodes the Plutus `Data` structure — structural
+/// validation lives only in `makeBinaryData`, the on-chain `DecCBOR` path, which
+/// `loadSnapshot` does NOT invoke. So a tag-4 blob that is framed (its MemPack
+/// VarLen wrapper already stripped by the TxOut decoder) but structurally odd
+/// must NOT hard-error the import (that would OVER-REJECT vs Haskell).
+///
+/// We best-effort decode `inline_cbor` to populate the structural `data` field
+/// for downstream ledger/Plutus use; on a decode error we KEEP the verbatim bytes
+/// (`PlutusData::Bytes` fallback) and never drop the datum. `raw_cbor` always
+/// carries the exact bytes for byte-exact re-encoding. This function is
+/// total — it never returns `OutputDatum::None` for a present inline datum.
+fn import_inline_datum(inline_cbor: &[u8]) -> dugite_primitives::transaction::OutputDatum {
+    use dugite_primitives::transaction::{OutputDatum, PlutusData};
+    match dugite_serialization::decode_plutus_data_cbor(inline_cbor) {
+        Ok(data) => OutputDatum::InlineDatum {
+            data,
+            raw_cbor: Some(inline_cbor.to_vec()),
+        },
+        Err(_e) => OutputDatum::InlineDatum {
+            data: PlutusData::Bytes(inline_cbor.to_vec()),
+            raw_cbor: Some(inline_cbor.to_vec()),
+        },
+    }
 }
 
 /// Flatten a `LedgerState` into the primitive [`GovernanceSnapshot`] consumed
@@ -632,19 +850,11 @@ pub(crate) struct GsmActorParts {
 impl Node {
     /// Load a ledger snapshot and enforce the backend-tag guard before the
     /// node commits to it. Mirrors Haskell's `MetadataBackendMismatch`: a
-    /// snapshot written with a *structurally-incompatible* UTxO backend is
-    /// rejected (→ `Err`) so the caller falls through to the from-chain rebuild
-    /// rather than loading an empty or wrong-shaped UTxO set. A missing sidecar
-    /// (pre-meta snapshots, e.g. an existing `db-mainnet`) is handled by backend
-    /// inference and loads normally.
-    ///
-    /// The one asymmetric exception is a `dugite-mem` snapshot loaded under the
-    /// `dugite-lsm` backend (the state produced by `mithril-import`, which
-    /// always writes a mem-tagged snapshot): the inline UTxOs are migrated into
-    /// the LSM store at attach time, so the snapshot is accepted and converted
-    /// inline rather than triggering a full from-genesis replay. This is the
-    /// dugite analogue of Haskell's offline `snapshot-converter`
-    /// (`Ouroboros.Consensus.Cardano.SnapshotConversion`, mem → LSM).
+    /// snapshot written with a *different* UTxO backend is rejected (→ `Err`)
+    /// so the caller falls through to the from-chain rebuild rather than
+    /// loading an empty or structurally-incompatible UTxO set. A missing
+    /// sidecar (pre-meta snapshots, e.g. an existing `db-mainnet`) is handled
+    /// by backend inference and loads normally.
     fn load_snapshot_with_backend_guard(
         snapshot_path: &std::path::Path,
         database_path: &std::path::Path,
@@ -6270,9 +6480,9 @@ impl Node {
     ) -> anyhow::Result<()> {
         use anyhow::Context;
         use dugite_primitives::address::Address;
-        use dugite_primitives::hash::Hash32;
+        use dugite_primitives::hash::{Hash32, PolicyId};
         use dugite_primitives::transaction::{OutputDatum, TransactionInput, TransactionOutput};
-        use dugite_primitives::value::Value;
+        use dugite_primitives::value::{AssetName, Value};
 
         // ── Decode the state file ────────────────────────────────────────
         let state_path = snapshot_dir.join("state");
@@ -6358,13 +6568,49 @@ impl Node {
                 "Loading UTxO set from MemPack tables blob"
             );
 
-            let iter = dugite_serialization::mempack::TvarIterator::new(&tvar_data)
-                .context("Failed to create tvar iterator")?;
+            // AUTHORITATIVE TxIx endianness: the on-disk byte order is NOT a
+            // function of the filesystem layout, nor of the blob bytes (a flat-LE
+            // blob is byte-identical to a flat-BE blob). Upstream records the
+            // disambiguator — the snapshot codec version
+            // (`snapshotTablesCodecVersion`) — in the sibling `meta` JSON file:
+            //   {"backend":…,"checksum":…,"tablesCodecVersion":1}
+            // The upstream type maps version → byte order EXACTLY
+            // (Ouroboros.Consensus.Storage.LedgerDB.Snapshots):
+            //   TablesCodecVersion1  -- "[ {_ (txid, big-endian txix) => txout} ]"
+            // STRICT (#10, re-gauntlet w4007sv2k): version 1 => Big is the ONLY
+            // accepted outcome. A missing meta file, a missing/null
+            // tablesCodecVersion, a wrong `backend`, or any other version is a
+            // HARD ERROR (matching V2/InMemory loadSnapshot's ReadMetadataError /
+            // MetadataInvalid / MetadataBackendMismatch). There is no silent
+            // little-endian fallback. The index-distribution heuristic below is an
+            // INDEPENDENT cross-validation only (it may veto a clear contradiction
+            // but never decides). See `dugite_serialization::mempack` module docs
+            // and #461/#10.
+            // Authoritatively resolve the on-disk MemPack `TxIx` byte order from
+            // the sibling `meta` file's `backend` + `tablesCodecVersion`. See
+            // `resolve_snapshot_txix_endianness` for the full upstream rationale.
+            let endianness = resolve_snapshot_txix_endianness(snapshot_dir, &tvar_data)?;
+
+            let iter = dugite_serialization::mempack::TvarIterator::new_with_endianness(
+                &tvar_data, endianness,
+            )
+            .context("Failed to create tvar iterator with the version-derived TxIx endianness")?;
 
             let mut utxo_count = 0u64;
-            let mut skipped = 0u64;
+            // NO-SILENT-SKIP: every malformed UTxO entry (empty/un-parseable
+            // address, un-parseable multi-asset rep, >32-byte asset name) is now
+            // a HARD ERROR that aborts the whole import — mirroring Haskell
+            // `loadSnapshot`, which throws `ReadSnapshotFailed` on any decode
+            // failure rather than importing a partial UTxO set. There is no
+            // "skipped" count by construction.
+            // HARD SAFETY NET: accumulate the decoded TxIx distribution and refuse
+            // the import if it looks mis-keyed (no silent corruption — the cardinal
+            // rule). This guards the version-derived decision regardless of how it
+            // was reached. `endianness` is the version-derived choice from above.
+            let mut txix_dist = dugite_serialization::mempack::TxIxDistribution::default();
             for result in iter {
                 let (txin, txout) = result.context("Failed to decode tvar entry")?;
+                txix_dist.observe_txix(txin.txix);
 
                 // Convert MemPackTxIn → TransactionInput
                 let input = TransactionInput {
@@ -6377,38 +6623,150 @@ impl Node {
                 // All tags (including 2/3 Addr28Extra compact forms) now
                 // produce a fully decoded address and coin value via
                 // dugite-serialization. A zero coin is legal for multi-asset
-                // entries; only truly malformed entries (empty address) are
-                // skipped.
+                // entries.
+                //
+                // HARD-ERROR (no-silent-skip): an empty / un-parseable address
+                // is a malformed CONTAINER entry, not a benign leaf. Haskell
+                // `loadSnapshot` aborts the whole import on any decode failure
+                // (`InitFailureRead . ReadSnapshotFailed`, InMemory.hs) — never a
+                // partial UTxO set. Silently dropping a UTxO entry here would
+                // build a wrong ledger state at the live tip ("input not found").
+                //
+                // NOTE: the larger opaque-`CompactAddr`-store refactor (keep the
+                // raw addr bytes verbatim like Haskell's MemPack `CompactAddr`
+                // newtype rather than round-tripping through `Address`) is OUT OF
+                // SCOPE here and tracked separately; this change only flips the
+                // existing silent-skip to the immediate hard-error.
                 if txout.address.is_empty() {
-                    skipped += 1;
-                    continue;
+                    return Err(anyhow::anyhow!(
+                        "import: empty address in imported TxOut for input {input:?}; \
+                         refusing a silent UTxO drop (Haskell loadSnapshot aborts on a \
+                         malformed entry)"
+                    ));
                 }
 
-                let address = match Address::from_bytes(&txout.address) {
-                    Ok(addr) => addr,
-                    Err(_) => {
-                        skipped += 1;
-                        continue;
+                let address = Address::from_bytes(&txout.address).map_err(|e| {
+                    anyhow::anyhow!(e).context(format!(
+                        "import: un-parseable address in imported TxOut for input {input:?}; \
+                         refusing a silent UTxO drop (Haskell loadSnapshot aborts on a \
+                         malformed entry)"
+                    ))
+                })?;
+                // Reconstruct the FULL value (lovelace + multi-asset). The
+                // MemPack decoder hands back the opaque `CompactValue` rep
+                // ShortByteString plus its `numMA` count; parse it into
+                // (PolicyId, AssetName, qty) triples so imported UTxO values are
+                // complete. A bare `Value::lovelace` would silently drop every
+                // native token, building wrong `txInfoInputs` values in the
+                // phase-2 ScriptContext (the #10 secondary gap).
+                let mut value = Value::lovelace(txout.coin);
+                if let Some(ref rep) = txout.multi_asset {
+                    match dugite_serialization::mempack::compact::parse_multi_asset_rep(
+                        rep,
+                        txout.num_assets as usize,
+                    ) {
+                        Ok(triples) => {
+                            for (pid, name, qty) in triples {
+                                let policy = PolicyId::from_bytes(pid);
+                                // HARD-ERROR (no-silent-skip): a name > 32 bytes
+                                // is impossible in a well-formed `CompactValue`
+                                // (Haskell `Mary.Value` MemPack), so it means the
+                                // snapshot entry is corrupt. Dropping the token
+                                // would silently corrupt the UTxO value; abort
+                                // the import instead (Haskell `loadSnapshot`
+                                // aborts on a malformed entry — InMemory.hs).
+                                let asset_name = AssetName::new(name).map_err(|e| {
+                                    anyhow::anyhow!(e).context(format!(
+                                        "import: corrupt multi-asset name (>32 bytes) in \
+                                         imported TxOut for input {input:?}; refusing a silent \
+                                         token drop (value corruption)"
+                                    ))
+                                })?;
+                                *value
+                                    .multi_asset
+                                    .entry(policy)
+                                    .or_default()
+                                    .entry(asset_name)
+                                    .or_default() += qty;
+                            }
+                        }
+                        Err(e) => {
+                            // HARD-ERROR (no-silent-skip): a `CompactValue` rep
+                            // that does not parse is a malformed snapshot entry.
+                            // Importing an ADA-only value would SILENTLY DROP every
+                            // native token (value corruption), building wrong
+                            // `txInfoInputs` values in the phase-2 ScriptContext.
+                            // Haskell `loadSnapshot` aborts the whole import on a
+                            // CBOR/MemPack decode failure (InMemory.hs) — mirror it.
+                            return Err(anyhow::anyhow!(e).context(format!(
+                                "import: failed to parse imported multi-asset rep for input \
+                                 {input:?}; refusing to import an ADA-only value that would \
+                                 silently drop native tokens (value corruption)"
+                            )));
+                        }
                     }
-                };
-                let value = Value::lovelace(txout.coin);
+                }
 
                 let datum = if let Some(ref hash_bytes) = txout.datum_hash {
                     OutputDatum::DatumHash(Hash32::from_bytes(*hash_bytes))
+                } else if let Some(ref inline_cbor) = txout.datum {
+                    // Inline datum (MemPack `Datum binaryData`): `BinaryData` is a
+                    // newtype over `ShortByteString` carrying the ORIGINAL on-chain
+                    // CBOR of the Plutus `Data`. The tag-5/tag-4 decoder already
+                    // stripped the MemPack VarLen length wrapper, so `inline_cbor`
+                    // is the bare datum CBOR — decode it with the SAME decoder used
+                    // for tag-24 inline datums during normal block decode and keep
+                    // the verbatim bytes for byte-exact re-encoding.
+                    //
+                    // OPAQUE-STORE (matches Haskell `BinaryData` MemPack newtype):
+                    // best-effort decode but never hard-error / never drop the
+                    // datum. See `import_inline_datum` for the full Haskell
+                    // grounding (`Cardano.Ledger.Plutus.Data`).
+                    import_inline_datum(inline_cbor)
                 } else {
-                    // Inline datums require PlutusData parsing from raw MemPack
-                    // bytes. Skip for now — the datum will be restored during gap
-                    // replay from the canonical CBOR block. For UTxO set membership
-                    // and stake distribution, the datum is not needed.
                     OutputDatum::None
                 };
 
-                // Script references from MemPack are raw bytes; skip for now as
-                // they require CBOR decoding to determine the script type. The
-                // output will still be valid for UTxO set membership and stake
-                // distribution; reference scripts are only needed for Phase-2
-                // evaluation which occurs during block validation (gap replay).
-                let script_ref: Option<dugite_primitives::transaction::ScriptRef> = None;
+                // Reference scripts: the MemPack `AlonzoScript` blob recovered by
+                // the tag-5 (`TxOutCompactRefScript`) decoder. Classify it into a
+                // typed `ScriptRef` so a Mithril-fast-started node can resolve
+                // reference scripts at the live tip (without this, every imported
+                // UTxO dropped its script bytes — see #10/#495 follow-up).
+                //
+                // The Plutus language tag is era-relative in MemPack but the
+                // mapping is monotonic across all eras (Babbage/Conway/Dijkstra:
+                // 0→V1, 1→V2, 2→V3, 3→V4 — see `PlutusScript` MemPack instances in
+                // cardano-ledger), so the same mapping is byte-exact regardless of
+                // the snapshot era.
+                //
+                // OPAQUE-STORE vs HARD-ERROR (#10 commit-B re-fix, path 2): the
+                // Plutus body is `PlutusBinary` (a `newtype … ShortByteString
+                // deriving newtype (… MemPack)`), so it is stored OPAQUELY with no
+                // structural re-decode — a structurally-odd-but-framed Plutus body
+                // does NOT error. Only frame-level problems HARD-ERROR: a truncated
+                // frame or unknown AlonzoScript tag (`parse_script_ref_kind`), an
+                // out-of-range Plutus language tag, or a malformed native (timelock)
+                // body — the native body IS structurally decoded because Haskell's
+                // `Timelock` MemPack `unpackM` calls `unpackMemoBytesM` (structural),
+                // unlike `PlutusBinary`. See `decode_imported_script_ref`. In every
+                // error case we refuse the import rather than silently drop the
+                // script_ref.
+                let script_ref: Option<dugite_primitives::transaction::ScriptRef> =
+                    match txout.script_ref.as_deref() {
+                        Some(blob) => {
+                            let kind =
+                                dugite_serialization::mempack::txout::parse_script_ref_kind(blob)
+                                    .map_err(|e| {
+                                    anyhow::anyhow!(e).context(format!(
+                                        "import: failed to classify MemPack reference-script \
+                                             (tag-5) blob for input {input:?}; refusing to import \
+                                             a silently-dropped script_ref"
+                                    ))
+                                })?;
+                            Some(decode_imported_script_ref(kind)?)
+                        }
+                        None => None,
+                    };
 
                 let output = TransactionOutput {
                     address,
@@ -6427,7 +6785,26 @@ impl Node {
                 }
             }
 
-            info!(utxo_count, skipped, "UTxO loading from tvar file complete");
+            // HARD SAFETY NET: refuse the import if the decoded TxIx distribution
+            // is mis-keyed (e.g. wrong endianness mapped real 1..255 onto multiples
+            // of 256). Erroring here is strictly better than silently storing a
+            // corrupt UTxO set that would cause spurious "input not found" /
+            // wrong-value failures at the live tip.
+            dugite_serialization::mempack::assert_txix_distribution_sane(&txix_dist, endianness)
+                .with_context(|| {
+                    format!(
+                        "imported UTxO set from {} has a mis-keyed TxIx distribution \
+                         (endianness {endianness:?}); refusing to proceed",
+                        tvar_path.display()
+                    )
+                })?;
+
+            info!(
+                utxo_count,
+                txix_low = txix_dist.low,
+                txix_mult256 = txix_dist.mult256,
+                "UTxO loading from tvar file complete"
+            );
         } else {
             warn!(
                 snapshot_dir = %snapshot_dir.display(),
@@ -7897,9 +8274,149 @@ mod tests {
     use dugite_primitives::hash::Hash32;
     use dugite_primitives::time::{BlockNo, SlotNo};
 
+    use dugite_primitives::transaction::ScriptRef;
+    use dugite_serialization::mempack::txout::ScriptRefKind;
+
+    #[test]
+    fn decode_imported_script_ref_maps_plutus_language_tags_to_global_versions() {
+        // The MemPack Plutus language tag is era-relative but monotonic across
+        // all eras (0→V1, 1→V2, 2→V3, 3→V4). decode_imported_script_ref must map
+        // it to the global ScriptRef variant so compute_script_ref_hash produces
+        // the correct CIP prefix (0x01/0x02/0x03/0x04).
+        let body = vec![0xAB, 0xCD, 0xEF];
+        assert_eq!(
+            super::decode_imported_script_ref(ScriptRefKind::Plutus {
+                lang_tag: 0,
+                body: body.clone()
+            })
+            .unwrap(),
+            ScriptRef::PlutusV1(body.clone())
+        );
+        assert_eq!(
+            super::decode_imported_script_ref(ScriptRefKind::Plutus {
+                lang_tag: 1,
+                body: body.clone()
+            })
+            .unwrap(),
+            ScriptRef::PlutusV2(body.clone())
+        );
+        assert_eq!(
+            super::decode_imported_script_ref(ScriptRefKind::Plutus {
+                lang_tag: 2,
+                body: body.clone()
+            })
+            .unwrap(),
+            ScriptRef::PlutusV3(body.clone())
+        );
+        assert_eq!(
+            super::decode_imported_script_ref(ScriptRefKind::Plutus {
+                lang_tag: 3,
+                body: body.clone()
+            })
+            .unwrap(),
+            ScriptRef::PlutusV4(body.clone())
+        );
+        // NO-SILENT-NONE (#10(B)): unknown language tag → HARD ERROR, never a
+        // silently-dropped script_ref.
+        assert!(
+            super::decode_imported_script_ref(ScriptRefKind::Plutus { lang_tag: 9, body }).is_err(),
+            "unknown Plutus language tag must hard-error, not silently drop"
+        );
+    }
+
+    #[test]
+    fn decode_imported_script_ref_decodes_native_timelock_cbor() {
+        // Native (timelock) script-ref body is the raw native-script CBOR:
+        // array(2) [0, bytes(28)] — a ScriptPubkey.
+        let mut cbor = vec![0x82, 0x00, 0x58, 28];
+        cbor.extend_from_slice(&[0x42u8; 28]);
+        let sr = super::decode_imported_script_ref(ScriptRefKind::Native(cbor))
+            .expect("native script must decode");
+        assert!(matches!(sr, ScriptRef::NativeScript(_)));
+    }
+
+    #[test]
+    fn decode_imported_script_ref_malformed_native_blob_hard_errors() {
+        // NO-SILENT-NONE (#10(B)): a malformed tag-5 native-script CBOR blob must
+        // HARD-ERROR the import path, not silently degrade to `None` (which would
+        // corrupt the imported UTxO set by dropping the reference script and cause
+        // spurious phase-2 failures at the live tip). dugite-node is
+        // adversarial-deployment software: reject over silent skip.
+        // `0x9f` is an indefinite-array opener with no body/terminator → invalid.
+        let malformed = vec![0x9f, 0x00];
+        assert!(
+            super::decode_imported_script_ref(ScriptRefKind::Native(malformed)).is_err(),
+            "malformed native reference-script CBOR must hard-error, not silently drop"
+        );
+    }
+
+    #[test]
+    fn imported_inline_datum_malformed_but_framed_is_opaque_not_error() {
+        // #10 commit-B RE-FIX (path 1): a tag-4 inline datum is a Haskell
+        // `BinaryData`, a `newtype … ShortByteString deriving newtype (… MemPack)`
+        // (cardano-ledger `Cardano.Ledger.Plutus.Data`). Its `unpackM` at snapshot
+        // load stores the bytes OPAQUELY and never re-decodes the Plutus `Data`
+        // structure (validation lives only in `makeBinaryData`, the on-chain
+        // DecCBOR path, which `loadSnapshot` does NOT invoke). So a malformed-but-
+        // framed blob must import OPAQUE — NOT hard-error (the previous no-silent-
+        // None behaviour OVER-REJECTED vs Haskell) and NOT `OutputDatum::None`.
+        use dugite_primitives::transaction::{OutputDatum, PlutusData};
+
+        // `0x9f` (indefinite array, no terminator) is not valid Plutus Data CBOR.
+        let malformed = [0x9f_u8, 0x00];
+        // Sanity: the structural decoder genuinely rejects it (so the fallback arm
+        // is the one exercised).
+        assert!(
+            dugite_serialization::decode_plutus_data_cbor(&malformed).is_err(),
+            "the malformed blob must fail structural decode (otherwise this test is vacuous)"
+        );
+
+        match super::import_inline_datum(&malformed) {
+            OutputDatum::InlineDatum { data, raw_cbor } => {
+                // OPAQUE fallback: raw bytes preserved verbatim in both fields.
+                assert_eq!(
+                    raw_cbor.as_deref(),
+                    Some(&malformed[..]),
+                    "raw_cbor must carry the verbatim datum bytes for byte-exact re-encoding"
+                );
+                assert_eq!(
+                    data,
+                    PlutusData::Bytes(malformed.to_vec()),
+                    "structural decode failure must fall back to opaque PlutusData::Bytes, \
+                     never OutputDatum::None"
+                );
+            }
+            other => panic!("malformed-but-framed datum must import as InlineDatum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn imported_inline_datum_well_formed_decodes_structurally() {
+        // A well-formed Plutus Data CBOR (integer 0 = 0x00) must populate the
+        // structural `data` field (here `PlutusData::Integer(0)`) while still
+        // preserving the verbatim raw bytes for byte-exact re-encoding.
+        use dugite_primitives::transaction::{OutputDatum, PlutusData};
+        let cbor = [0x00_u8]; // Plutus Data: integer 0.
+        match super::import_inline_datum(&cbor) {
+            OutputDatum::InlineDatum { data, raw_cbor } => {
+                assert_eq!(raw_cbor.as_deref(), Some(&cbor[..]));
+                assert_eq!(
+                    data,
+                    PlutusData::Integer(num_bigint::BigInt::from(0)),
+                    "well-formed datum must decode structurally to Integer(0), not the opaque \
+                     Bytes fallback"
+                );
+            }
+            other => panic!("expected InlineDatum, got {other:?}"),
+        }
+    }
+
     use super::serve::ChainDBBlockProvider;
     use super::sync::validate_genesis_blocks;
-    use super::{next_forged_block_number, resolve_inmemory_tables_path, ForgeMode, Point};
+    use super::{
+        next_forged_block_number, resolve_inmemory_tables_path, resolve_snapshot_txix_endianness,
+        ForgeMode, Point,
+    };
     use crate::config::NodeConfig;
 
     // ─── next_forged_block_number regression tests ───────────────────────────
@@ -8812,6 +9329,220 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join("tables")).expect("mkdir tables");
         assert!(resolve_inmemory_tables_path(tmp.path()).is_none());
+    }
+
+    /// Build a real `tvar` MemPack tables blob from the given `TxIx` values,
+    /// keyed with the supplied `endianness`. Each entry is a CBOR `bytes(34)`
+    /// key (`32-byte txid || 2-byte txix`) mapped to a CBOR `bytes(N)` value
+    /// holding a genuine tag-0 ADA-only `MemPackTxOut` (a real preview UTxO,
+    /// 1_814_145 lovelace) so the full `TvarIterator` decode path round-trips.
+    /// The map is `array(1)[ {indef} … 0xff ]`, exactly the on-disk shape.
+    fn build_tvar(
+        txixs: &[u16],
+        endianness: dugite_serialization::mempack::TxIxEndianness,
+    ) -> Vec<u8> {
+        // Real tag-0 entry from preview tvar (see mempack tests):
+        //   value = 1_814_145 lovelace, enterprise testnet address.
+        let txout =
+            hex::decode("001d60986cdecfc4f555a8605d621505a4a82c25c574f59fd0b79e2acdaf0200eedd01")
+                .expect("valid tag-0 txout hex");
+
+        let mut blob = vec![0x81u8, 0xbf]; // array(1) [ indefinite-map(
+        for (i, &ix) in txixs.iter().enumerate() {
+            // CBOR bytes(34) key: 0x58 0x22 || 32-byte txid || 2-byte txix.
+            blob.push(0x58);
+            blob.push(0x22);
+            let mut txid = [0u8; 32];
+            txid[0] = i as u8; // distinct keys
+            blob.extend_from_slice(&txid);
+            let ix_bytes = match endianness {
+                dugite_serialization::mempack::TxIxEndianness::Little => ix.to_le_bytes(),
+                dugite_serialization::mempack::TxIxEndianness::Big => ix.to_be_bytes(),
+            };
+            blob.extend_from_slice(&ix_bytes);
+            // CBOR bytes(N) value: 0x58 LEN || real tag-0 MemPackTxOut.
+            blob.push(0x58);
+            blob.push(txout.len() as u8);
+            blob.extend_from_slice(&txout);
+        }
+        blob.push(0xff); // break (end of map)
+        blob
+    }
+
+    /// STRICT #10 (re-gauntlet w4007sv2k): a snapshot directory with NO `meta`
+    /// file must be REJECTED — `resolve_snapshot_txix_endianness` returns `Err`
+    /// rather than silently decoding legacy little-endian.
+    ///
+    /// This drives the REAL importer endianness-resolution path
+    /// (`resolve_snapshot_txix_endianness`, the function the importer calls).
+    /// The upstream node loader (`V2/InMemory.hs loadSnapshot`) fails a
+    /// missing-meta snapshot with `ReadMetadataError`. `getMetadata`'s
+    /// `MetadataFileDoesNotExist -> Nothing` (offline converter) is the CRC-skip
+    /// path, NOT a decode-LE branch — endianness is never selected from a
+    /// missing meta. We default to rejection (byte-exact only): no silent LE.
+    #[test]
+    fn importer_meta_file_absent_is_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let snap = tmp.path();
+
+        let tvar = build_tvar(
+            &[1, 2, 3, 7, 42],
+            dugite_serialization::mempack::TxIxEndianness::Big,
+        );
+        std::fs::write(snap.join("tables"), &tvar).expect("write tables blob");
+
+        // No `meta` file is written.
+        assert!(
+            !snap.join("meta").exists(),
+            "test precondition: snapshot has no meta file"
+        );
+
+        let resolved = resolve_inmemory_tables_path(snap).expect("flat tables path must resolve");
+        let data = std::fs::read(&resolved).unwrap();
+
+        assert!(
+            resolve_snapshot_txix_endianness(snap, &data).is_err(),
+            "a snapshot with no meta file must be REJECTED (ReadMetadataError upstream); \
+             endianness is never selected from a missing meta — no silent little-endian"
+        );
+    }
+
+    /// STRICT #10: a present meta that parses but LACKS `tablesCodecVersion`
+    /// must be REJECTED (`MetadataInvalid` upstream — the mandatory
+    /// `o .: "tablesCodecVersion"` is an Aeson `Left`). No silent little-endian.
+    #[test]
+    fn importer_meta_without_codec_version_field_is_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let snap = tmp.path();
+        let tvar = build_tvar(
+            &[1, 5, 9],
+            dugite_serialization::mempack::TxIxEndianness::Big,
+        );
+        std::fs::write(snap.join("tables"), &tvar).expect("write tables blob");
+        // meta exists, parses, has the right backend, but no tablesCodecVersion field.
+        std::fs::write(
+            snap.join("meta"),
+            br#"{"backend":"utxohd-mem","checksum":2409556997}"#,
+        )
+        .expect("write fieldless meta");
+
+        let data = std::fs::read(snap.join("tables")).unwrap();
+        assert!(
+            resolve_snapshot_txix_endianness(snap, &data).is_err(),
+            "meta present but missing tablesCodecVersion must be REJECTED (MetadataInvalid)"
+        );
+    }
+
+    /// STRICT #10: a present meta whose `tablesCodecVersion` is `null` must be
+    /// REJECTED — same `MetadataInvalid` outcome as field-absent.
+    #[test]
+    fn importer_meta_null_codec_version_is_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let snap = tmp.path();
+        let tvar = build_tvar(
+            &[1, 5, 9],
+            dugite_serialization::mempack::TxIxEndianness::Big,
+        );
+        std::fs::write(snap.join("tables"), &tvar).expect("write tables blob");
+        std::fs::write(
+            snap.join("meta"),
+            br#"{"backend":"utxohd-mem","tablesCodecVersion":null}"#,
+        )
+        .expect("write null-version meta");
+
+        let data = std::fs::read(snap.join("tables")).unwrap();
+        assert!(
+            resolve_snapshot_txix_endianness(snap, &data).is_err(),
+            "meta with null tablesCodecVersion must be REJECTED (MetadataInvalid)"
+        );
+    }
+
+    /// STRICT #10: a present meta whose `backend` is not `utxohd-mem`
+    /// (UTxOHDMemSnapshot) must be REJECTED — V2/InMemory loadSnapshot guards
+    /// `when (snapshotBackend /= UTxOHDMemSnapshot) $ throwE MetadataBackendMismatch`.
+    #[test]
+    fn importer_meta_wrong_backend_is_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let snap = tmp.path();
+        // BE blob + valid version 1, but the WRONG backend tag.
+        let blob = build_tvar(
+            &[1, 2, 3],
+            dugite_serialization::mempack::TxIxEndianness::Big,
+        );
+        std::fs::write(snap.join("tables"), &blob).expect("write tables");
+        std::fs::write(
+            snap.join("meta"),
+            br#"{"backend":"utxohd-lmdb","checksum":1,"tablesCodecVersion":1}"#,
+        )
+        .expect("write wrong-backend meta");
+
+        let data = std::fs::read(snap.join("tables")).unwrap();
+        assert!(
+            resolve_snapshot_txix_endianness(snap, &data).is_err(),
+            "meta with backend != utxohd-mem must be REJECTED (MetadataBackendMismatch)"
+        );
+
+        // A meta with NO backend field at all is also rejected.
+        std::fs::write(
+            snap.join("meta"),
+            br#"{"checksum":1,"tablesCodecVersion":1}"#,
+        )
+        .expect("write backend-less meta");
+        let data = std::fs::read(snap.join("tables")).unwrap();
+        assert!(
+            resolve_snapshot_txix_endianness(snap, &data).is_err(),
+            "meta with no backend field must be REJECTED (MetadataBackendMismatch)"
+        );
+    }
+
+    /// STRICT #10 (kept): `tablesCodecVersion: 1` + `backend: utxohd-mem`
+    /// => big-endian, the modern format. The chain-verified accepted path.
+    #[test]
+    fn importer_meta_codec_version_1_selects_big_endian() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let snap = tmp.path();
+        // BE-keyed blob: write indices big-endian so the data agrees with BE.
+        let blob = build_tvar(
+            &[1, 2, 3],
+            dugite_serialization::mempack::TxIxEndianness::Big,
+        );
+        std::fs::write(snap.join("tables"), &blob).expect("write tables");
+        std::fs::write(
+            snap.join("meta"),
+            br#"{"backend":"utxohd-mem","checksum":1,"tablesCodecVersion":1}"#,
+        )
+        .expect("write meta v1");
+
+        let data = std::fs::read(snap.join("tables")).unwrap();
+        let endianness =
+            resolve_snapshot_txix_endianness(snap, &data).expect("meta v1 => big-endian");
+        assert_eq!(
+            endianness,
+            dugite_serialization::mempack::TxIxEndianness::Big
+        );
+    }
+
+    /// STRICT #10 (kept): a meta with an unknown codec version is a hard error
+    /// (mirrors upstream `enforceVersion` rejecting everything but `1`).
+    #[test]
+    fn importer_meta_unknown_version_is_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let snap = tmp.path();
+        let tvar = build_tvar(
+            &[1, 2, 3],
+            dugite_serialization::mempack::TxIxEndianness::Big,
+        );
+        std::fs::write(snap.join("tables"), &tvar).expect("write tables");
+        std::fs::write(
+            snap.join("meta"),
+            br#"{"backend":"utxohd-mem","tablesCodecVersion":2}"#,
+        )
+        .expect("write meta v2");
+        let data = std::fs::read(snap.join("tables")).unwrap();
+        assert!(
+            resolve_snapshot_txix_endianness(snap, &data).is_err(),
+            "unknown tablesCodecVersion must be rejected (not silently guessed)"
+        );
     }
 
     // ─── apply_peer_metrics gauge update (GitHub #437 regression) ────────────
