@@ -1,44 +1,71 @@
 diff --git a/crates/dugite-ledger/src/state/governance.rs b/crates/dugite-ledger/src/state/governance.rs
-index 322705b419..cc8faa0197 100644
+index 322705b419..b362008bf0 100644
 --- a/crates/dugite-ledger/src/state/governance.rs
 +++ b/crates/dugite-ledger/src/state/governance.rs
-@@ -2699,7 +2699,6 @@ pub(crate) fn ratify_proposals_impl(
+@@ -2699,7 +2699,20 @@ pub(crate) fn ratify_proposals_impl(
  
      let mut ratified = Vec::new();
      let mut delayed = false;
 -    let mut enacted_withdrawals_total: u64 = 0;
++
++    // Transient treasury cap-basis for the ratification pass. This mirrors
++    // Haskell Conway `Enact.hs`/`Ratify.hs` `ensTreasury`: the cap basis is
++    // threaded across the pass and decremented by the FULL declared `fold wdrls`
++    // for every enacted `TreasuryWithdrawals` (regardless of whether the target
++    // reward accounts are registered). Unregistered targets are filtered only
++    // LATER at the epoch boundary (`applyEnactedWithdrawals`) against the REAL
++    // `casTreasury` (`epochs.treasury.0`). Keeping these two quantities separate
++    // is required for byte-exactness: `epochs.treasury.0` continues to be
++    // decremented by `disbursed` (registered-target total only) inside
++    // `enact_gov_action_impl`, while `cap_treasury` is used solely for the
++    // `withdrawalCanWithdraw` cap check below. For the all-registered case
++    // `disbursed == fold wdrls`, so the two stay equal and behavior is identical.
++    let mut cap_treasury = epochs.treasury.0;
  
      for (action_id, action, expires) in &candidates {
          if *expires < epoch {
-@@ -2730,7 +2729,14 @@ pub(crate) fn ratify_proposals_impl(
+@@ -2730,7 +2743,17 @@ pub(crate) fn ratify_proposals_impl(
          }
  
          if let Some(state) = snap_proposals.get(action_id) {
 -            let remaining_treasury = epochs.treasury.0.saturating_sub(enacted_withdrawals_total);
-+            // Cap basis is the LIVE, per-enact-decremented treasury — mirroring
-+            // Haskell Conway `Ratify.hs` `withdrawalCanWithdraw`, which checks
-+            // `fold(wdrls) <= ensTreasury` against the threaded `ensTreasury`
-+            // that `enact_gov_action_impl` (the payout leg) already decremented
-+            // for any earlier withdrawal enacted in this same pass. There is NO
-+            // separate accumulator (an accumulator double-subtracts prior
-+            // withdrawals, since the treasury was already decremented).
-+            let remaining_treasury = epochs.treasury.0;
++            // Cap basis is the transient `cap_treasury` — mirroring Haskell
++            // Conway `Ratify.hs` `withdrawalCanWithdraw`, which checks
++            // `fold(wdrls) <= ensTreasury` against the threaded `ensTreasury`.
++            // `ensTreasury` is decremented by the FULL declared `fold wdrls` of
++            // every earlier enacted withdrawal in this pass (NOT by the
++            // registered-target-only `disbursed`), so we must NOT use
++            // `epochs.treasury.0` here: that field is the real `casTreasury`,
++            // decremented only by `disbursed`, and using it would under-subtract
++            // the cap basis whenever a prior withdrawal targeted an unregistered
++            // account — wrongly admitting a later withdrawal Haskell blocks.
++            let remaining_treasury = cap_treasury;
              let met = check_ratification_impl(
                  action_id,
                  state,
-@@ -2758,11 +2764,6 @@ pub(crate) fn ratify_proposals_impl(
+@@ -2758,10 +2781,18 @@ pub(crate) fn ratify_proposals_impl(
                      "Governance proposal RATIFIED"
                  );
                  enact_gov_action_impl(action, epochs, certs, gov);
--                if let GovAction::TreasuryWithdrawals { withdrawals, .. } = action {
++                // Thread the transient cap-basis: decrement `cap_treasury` by the
++                // FULL declared `fold wdrls` (NOT `disbursed`), mirroring Haskell
++                // `Enact.hs` `ensTreasury <- ensTreasury - fold wdrls`. The real
++                // `epochs.treasury.0` (= `casTreasury`) was already decremented by
++                // `disbursed` inside `enact_gov_action_impl`; this cap-basis decrement
++                // is independent and feeds only the cap check for later proposals.
+                 if let GovAction::TreasuryWithdrawals { withdrawals, .. } = action {
 -                    enacted_withdrawals_total += withdrawals
 -                        .values()
 -                        .fold(0u64, |acc, a| acc.saturating_add(a.0));
--                }
++                    cap_treasury = cap_treasury.saturating_sub(
++                        withdrawals
++                            .values()
++                            .fold(0u64, |acc, a| acc.saturating_add(a.0)),
++                    );
+                 }
                  // Match Haskell `RatifyState.rsEnactState.ensCommittee`
                  // threading: when an `UpdateCommittee` or `NoConfidence`
-                 // proposal enacts, refresh the local committee maps from
-@@ -5292,6 +5293,102 @@ mod tests {
+@@ -5292,6 +5323,250 @@ mod tests {
          );
      }
  
@@ -135,6 +162,154 @@ index 322705b419..cc8faa0197 100644
 +            state.gov.governance.proposals.len(),
 +            0,
 +            "Both withdrawal proposals must be ratified and removed"
++        );
++    }
++
++    #[test]
++    fn test_treasury_withdrawal_unregistered_target_still_consumes_cap_basis() {
++        // Backlog #29 byte-exact rework (gauntlet wq63ah2hg REFUTED fix v1).
++        //
++        // Haskell Conway `Enact.hs` decrements the transient cap-basis
++        // `ensTreasury` by the FULL declared `fold wdrls` for every enacted
++        // `TreasuryWithdrawals`, regardless of whether the target reward
++        // accounts are registered. Unregistered targets are filtered only LATER
++        // at the epoch boundary (`applyEnactedWithdrawals`) against the REAL
++        // `casTreasury`. dugite separates these: `cap_treasury` (the cap basis)
++        // drops by the full fold, while `epochs.treasury.0` (the real treasury)
++        // drops only by `disbursed` (registered-target total).
++        //
++        // Fix v1 cap-checked against `epochs.treasury.0`, which only decrements
++        // by `disbursed`. So a withdrawal to an UNREGISTERED account (disbursed
++        // = 0) left `epochs.treasury.0` unchanged, and v1 would WRONGLY admit a
++        // later withdrawal that Haskell BLOCKS.
++        //
++        // Scenario in ONE ratification pass: treasury = 1000M.
++        //   A = 600M to an UNREGISTERED reward account  → enact disburses 0,
++        //       epochs.treasury.0 stays 1000M, but cap_treasury drops by the FULL
++        //       600M → 400M.
++        //   B = 600M to a REGISTERED reward account      → cap check 600M > 400M
++        //       → B is BLOCKED (NOT enacted, target credited 0, B NOT removed).
++        //
++        // Both proposals are otherwise ratifiable (unanimous DRep + CC Yes).
++        let mut state = gov_test_state(10, 0);
++        state.epochs.treasury = Lovelace(1_000_000_000); // 1000M
++
++        // Proposal-deposit return address — registered so refunds land cleanly.
++        let return_addr = vec![0u8; 29];
++        let return_key = LedgerState::reward_account_to_hash(&return_addr);
++        state.certs.reward_accounts.insert(return_key, Lovelace(0));
++
++        // A's target: an UNREGISTERED reward account (absent from
++        // certs.reward_accounts). enact disburses 0 to it.
++        let mut wd_addr_unreg = vec![0u8; 29];
++        wd_addr_unreg[1] = 1;
++        let wd_key_unreg = LedgerState::reward_account_to_hash(&wd_addr_unreg);
++        // Deliberately do NOT register wd_addr_unreg.
++
++        // B's target: a REGISTERED reward account.
++        let mut wd_addr_reg = vec![0u8; 29];
++        wd_addr_reg[1] = 2;
++        let wd_key_reg = LedgerState::reward_account_to_hash(&wd_addr_reg);
++        state.certs.reward_accounts.insert(wd_key_reg, Lovelace(0));
++
++        // Proposal A (tx byte 50): 600M to the UNREGISTERED account.
++        {
++            let mut withdrawals = BTreeMap::new();
++            withdrawals.insert(wd_addr_unreg.clone(), Lovelace(600_000_000));
++            let tx_hash = Hash32::from_bytes([50u8; 32]);
++            state.process_proposal(
++                &tx_hash,
++                0,
++                &ProposalProcedure {
++                    deposit: Lovelace(100_000_000_000),
++                    return_addr: return_addr.clone(),
++                    gov_action: GovAction::TreasuryWithdrawals {
++                        withdrawals,
++                        policy_hash: None,
++                    },
++                    anchor: make_anchor(),
++                },
++            );
++            let action_id = make_action_id(50, 0);
++            for i in 0..10 {
++                drep_vote(&mut state, i, &action_id, Vote::Yes);
++            }
++            cc_vote_yes(&mut state, &action_id);
++        }
++
++        // Proposal B (tx byte 51): 600M to the REGISTERED account.
++        {
++            let mut withdrawals = BTreeMap::new();
++            withdrawals.insert(wd_addr_reg.clone(), Lovelace(600_000_000));
++            let tx_hash = Hash32::from_bytes([51u8; 32]);
++            state.process_proposal(
++                &tx_hash,
++                0,
++                &ProposalProcedure {
++                    deposit: Lovelace(100_000_000_000),
++                    return_addr: return_addr.clone(),
++                    gov_action: GovAction::TreasuryWithdrawals {
++                        withdrawals,
++                        policy_hash: None,
++                    },
++                    anchor: make_anchor(),
++                },
++            );
++            let action_id = make_action_id(51, 0);
++            for i in 0..10 {
++                drep_vote(&mut state, i, &action_id, Vote::Yes);
++            }
++            cc_vote_yes(&mut state, &action_id);
++        }
++
++        assert_eq!(state.gov.governance.proposals.len(), 2);
++        state.process_epoch_transition(EpochNo(1));
++
++        // A enacted: target is UNREGISTERED so it is credited 0 (silently
++        // dropped) and epochs.treasury.0 is NOT decremented by A. But the
++        // cap-basis WAS decremented by the full 600M → 400M.
++        assert_eq!(
++            state.certs.reward_accounts.get(&wd_key_unreg).copied(),
++            None,
++            "A's unregistered target must remain unregistered (credited 0)"
++        );
++
++        // B BLOCKED: 600M > cap_treasury (400M). B is NOT enacted — its
++        // registered target is credited 0 and B is NOT removed. This is the
++        // exact case fix v1 got wrong (it cap-checked against epochs.treasury.0,
++        // still 1000M after A, so it WRONGLY admitted B → treasury
++        // over-disbursement).
++        assert_eq!(
++            state.certs.reward_accounts.get(&wd_key_reg).copied(),
++            Some(Lovelace(0)),
++            "B's registered target must be credited 0 (B blocked by the cap basis)"
++        );
++
++        // Real treasury: A disbursed 0 (unregistered), B blocked → unchanged at
++        // 1000M. (epochs.treasury.0 == casTreasury, decremented only by
++        // `disbursed`.)
++        assert_eq!(
++            state.epochs.treasury.0, 1_000_000_000,
++            "Treasury must stay at 1000M: A disbursed 0 (unregistered), B blocked"
++        );
++
++        // B's proposal must remain active (not ratified, not removed); A is
++        // consumed (enacted + removed).
++        assert!(
++            state
++                .gov
++                .governance
++                .proposals
++                .contains_key(&make_action_id(51, 0)),
++            "B must remain an active proposal (cap check blocked it)"
++        );
++        assert!(
++            !state
++                .gov
++                .governance
++                .proposals
++                .contains_key(&make_action_id(50, 0)),
++            "A must be consumed (enacted + removed)"
 +        );
 +    }
 +
