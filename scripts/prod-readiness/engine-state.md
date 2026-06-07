@@ -29,7 +29,18 @@
    trust-on-consensus (no wedge/ledger impact; #22 ledger-byte-exact stands) but a real standalone-validation gap (block
    producer / trustless validator). REAL (committed phase2_onchain_budget fixtures pass → harness sound). NEXT: DIAGNOSE
    via muscle — one recurring script's dugite-consumed vs on-chain-consumed exUnits (Koios script_redeemers) → the delta +
-   the inflated cost component (structural-context hypothesis). state:REPRODUCED attempts:0
+   the inflated cost component (structural-context hypothesis). *** DONE (V1 part) wake325 (9c53405384): ROOT CAUSE = dugite
+   txInfoData (witness datums) not deduped by hash; Haskell TxDats=Map DataHash collapses dup datums → dugite's Vec kept
+   them → scripts iterating txInfoData over-cost MEM (the fixed-delta = the dup datum's mem). FIX tx_info_populate.rs
+   sort+dedup_by_key. VERIFIED: tx0 dumps 363→194 diverge (169 byte-exact), nextest 441/441 no-regression. state:DONE-V1
+   attempts:1. REMAINING = V2 inline-datum residual (194 tx0) → #24.
+24. [M][phase2][NEW wake325, split from #23] PlutusV2 inline-datum txInfoData over-cost — the 194 tx0 dumps NOT resolved by
+   the #23 V1 witness-datum dedup. V2 cases have NO witness plutus_data; the datums are INLINE in outputs (and possibly
+   reference-inputs). Babbage getBabbageSupplementalDataHashes: inline datums in outputs/ref-inputs ALSO feed txInfoData —
+   dugite likely includes/orders/dedups them differently from cardano-node → same MEM over-cost class. Still masked by
+   trust-on-consensus. Re-runnable byte-exact via examples/phase2_repro on /tmp/g23_still_diverge.txt (194). Also: 3 V1
+   cases now UNDER-consume post-dedup (-8794/-33798/-25224) — spot-check (dedup-too-much vs distinct). NEXT: DIAGNOSE the V2
+   inline-datum txInfoData construction vs Haskell. state:NEW attempts:0
 0. [H][ledger][REAL-CURRENT, ROOT-CAUSED] mainnet ep246 reserves +82,270,482 / treasury -55,269. STRUCTURAL
    ROOT CAUSE (deep-dive wuc2kqb1z): the member-reward fold (rewards.rs:445-490) iterates go.delegations +
    separate go.stake_distribution.get(cred) lookup, whereas Haskell folds a SINGLE resolved active-stake VMap
@@ -242,7 +253,24 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #23 phase-2 MEM over-cost state:FIXING attempts:1 — ROOT-CAUSED + candidate fix applied (UNVERIFIED); VERIFYING gauntlet launched.
+- item: #23 (V1 txInfoData dedup) DONE (committed+pushed 9c53405384). V2 inline-datum residual filed as #24. NEXT WAKE: SCHEDULE.
+  *** wake325-cont (ultracode): #23 V1-part FIXING→VERIFYING→DONE. The salvaged txInfoData-dedup fix is VERIFIED: re-running
+  the 363 tx0 #730 dumps at HEAD+fix → 363/363 diverge DROPS to 194 (169 now reproduce on-chain is_valid BYTE-EXACT — the
+  cardinal-rule standard: divergence gone on re-run, not just tests-green); nextest -p dugite-uplc 441/441 (conformance +
+  on-chain budget fixtures, NO regression); clippy -D warnings + fmt clean. COMMITTED focused 1-crate fix 9c53405384
+  (tx_info_populate.rs::datums_to_plutus sort+dedup_by_key, byte-exact per Haskell TxDats=Map DataHash) + PUSHED
+  (82cf25bfef..9c53405384, HTTPS). This salvaged a DEAD muscle's correct work + independently verified it (per #438-SAVE —
+  did NOT trust the unverified 742 claim; empirically confirmed 169/363 tx0 + no regression). (Muscle claimed ~742 across
+  the full 769 incl. tx1+ indices; I verified the tx0 subset = 169, consistent.) *** REMAINING (filed as #24): the 194
+  still-diverging tx0 dumps are the PlutusV2-only "structural-context" residual — inline datums (outputs/reference-inputs)
+  contributing to txInfoData via getBabbageSupplementalDataHashes (V2 cases have NO witness plutus_data, so the
+  witness-datum dedup doesn't touch them); list at /tmp/g23_still_diverge.txt. Plus 3 V1 cases now UNDER-consume
+  (-8794/-33798/-25224 — possibly dedup-removed-too-much or distinct; worth a spot-check). *** NEXT WAKE — SCHEDULE: (1)
+  #24 V2 inline-datum txInfoData (the direct continuation; same area, diagnose via muscle: do V2 inline/reference-input
+  datums belong in txInfoData per Babbage getBabbageSupplementalDataHashes, and does dugite include/order/dedup them right);
+  (2) re-run the FULL 769 (all tx-indices) to get the complete resolved count; (3) #20 snapshot hardening; (4) #7 Dijkstra.
+  RECOMMEND #24 (continues the phase-2 momentum, byte-exact-checkable via the same dumps). Housekeeping: /tmp/g23_*.log +
+  the dead muscle worktree-less transcript prunable.
   *** wake325 (ultracode): SALVAGE. The wake324 diagnose muscle wogj8wp6h DIED/HUNG (ran ~24min, 0-byte output, no
   completion notify, lock TTL-expired age1605s → reclaimed). BUT its research agent (analyze mode = NO worktree isolation,
   so it worked in the MAIN tree) found the ROOT CAUSE + applied a fix before hanging. SALVAGED from its transcript +
@@ -2398,6 +2426,13 @@
 - db-clones/preprod-ep57-fixed   (fixed-binary replay, in progress)
 
 ## Gauntlet ledger  (passed/refuted approaches — never silently retry a REFUTED)
+- PASSED 2026-06-07 (wake325, #23 V1): "dedup txInfoData witness datums by hash (Haskell TxDats=Map DataHash)". Gauntlet =
+  re-running the captured #730 phase-2 dumps at HEAD+fix reproduces on-chain is_valid with the divergence GONE: tx0 363→194
+  (169 byte-exact, ~47%); nextest -p dugite-uplc 441/441 (conformance + on-chain budget fixtures, no regression); clippy
+  -D warnings + fmt. Root cause: dugite stored witness datums as a Vec WITH duplicates; a script iterating txInfoData
+  processed the extra Data → MEM over-cost exhausting the redeemer budget cardano-node fit within. Fix tx_info_populate.rs
+  sort+dedup_by_key (byte-exact per transTxWitsDatums = Map.toList unTxDats). Landed 9c53405384. SALVAGED from a dead muscle
+  (wogj8wp6h) + independently verified (NOT trusting the unverified 742 claim). V2 inline-datum residual → #24.
 - REFUTED 2026-06-07 (wake322, #15, fix-muscle wf4hgn0hk SELF-REFUTED + independently confirmed): "make Data memoise its
   verbatim on-chain CBOR bytes and have serialiseData return them unchanged (MemoBytes-style)". WRONG — Haskell
   serialiseData = BSL.toStrict . serialise is a STRUCTURAL canonical re-encode (non-empty Constr/List args = INDEFINITE
@@ -2463,6 +2498,8 @@
 - 2026-06-07T17:xxZ wake321(+cont) ~ SCHEDULE #15 + muscle fix wf4hgn0hk (OVERTURNED premise) → VERIFYING-PENDING + patch saved
 - 2026-06-07T17:xxZ wake322(+cont) ~ #15 VERIFYING→DONE/REFUTED (Koios + gold test on main 441/441) + commit/push 82cf25bfef
 - 2026-06-07T18:xxZ wake323 ~ SCHEDULE+DRIVE #23: re-ran 363 #730 phase-2 dumps at HEAD (phase2_repro) → 363/363 still diverge (budget over-cost), filed #23 REPRODUCED
+- 2026-06-07T18:xxZ wake324 ~ #23 REPRODUCED→DIAGNOSING (MEM-only over-cost sharpened) + launched muscle wogj8wp6h (later DIED)
+- 2026-06-07T22:xxZ wake325(+cont) ~ SALVAGED dead muscle's txInfoData-dedup fix, VERIFIED (tx0 363→194, nextest 441/441) + commit/push 9c53405384; filed #24 (V2 residual)
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -3985,3 +4022,9 @@
   examples/phase2_repro (cheap, no replay — dumps are self-contained chain inputs). 363/363 STILL diverge: ~257 budget-
   exhausted near-edge (few recurring V2 scripts = the #730 fixed-delta residual), ~106 other-error. CONFIRMED real
   (committed budget fixtures pass → harness sound). Filed #23 (REPRODUCED). NEXT WAKE: DIAGNOSE the fixed-delta over-cost.
+- wake324(+325) 2026-06-07: #23 DIAGNOSE muscle wogj8wp6h DIED (24min, no output, lock TTL-reclaimed) but its analyze-mode
+  agent (no worktree → main tree) found+applied the fix before hanging. SALVAGED: root cause = txInfoData witness datums not
+  deduped by hash (Haskell TxDats=Map DataHash) → dup datum inflates txInfoData → MEM over-cost. Independently VERIFIED (per
+  #438-SAVE, not trusting the unverified 742 claim): tx0 dumps 363→194 diverge (169 byte-exact), nextest 441/441 no-regression.
+  Committed+pushed focused fix 9c53405384 (tx_info_populate.rs +8). V2 inline-datum residual (194) filed as #24. Lesson:
+  analyze-mode muscles edit the MAIN tree (no isolation) — recoverable from working tree even if the workflow dies.
