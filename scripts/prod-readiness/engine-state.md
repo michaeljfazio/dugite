@@ -172,10 +172,12 @@
    first-wins machinery -> opposite dup-key resolution for two fields of the SAME SnapshotMetadata; aeson is first-wins
    for all. FIX class: make every snapshot-leaf decoder hard-fail exactly where Haskell strict MemPack/CBOR does
    (varlen mask+overflow+too-many-bytes; definite-map entry-count; backend first-wins). Mostly backstopped in practice
-   by #17 (whole-file CRC) + Mithril signature, hence M not H. *** PROGRESS: sub-item (c) backend dup-key first-wins DONE
-   wake328 (b43f4fa80d, nextest 1147/1147). REMAINING: (a) decode_varlen overflow/non-minimal/terminal-mask (~10 sites,
-   compact.rs:50-69, HIGHEST-impact — needs Haskell unpack7BitVarLenLast confirmation via bounded muscle); (b) definite-
-   length-map exact-count (premature-EOF). state:PARTIAL (c done; a/b remain) attempts:0
+   by #17 (whole-file CRC) + Mithril signature, hence M not H. *** PROGRESS: (c) backend dup-key first-wins DONE wake328
+   (b43f4fa80d); (a) decode_varlen Word64 overflow guard DONE wake329 (49a2c0ce1d — byte-exact mempack
+   unpack7BitVarLenLast(0b1111_1110), rejects >2^64 10-byte forms, keeps non-minimal; nextest 1150/1150). REMAINING: only
+   (b) DEFINITE-length tables-map exact-count — truncated M<N declared entries silently imports the prefix (TvarBody/
+   TvarIterator track indefinite+saw_break but NOT entries_remaining); Haskell decodeMapLen demands exactly N →
+   DecoderErrorPrematureEOF. state:PARTIAL (a+c done; only b remains) attempts:0
 17. [H][security/integrity][REAL-NEW, from gauntlet w3upqlq0y compounding-feedback] Mithril/Haskell snapshot
    IMPORT does NOT verify the snapshotChecksum/CRC. Upstream V2/InMemory.loadSnapshot computes
    crcOfConcat(state-CRC, tables-CRC) and throws ReadSnapshotDataCorruption on mismatch; dugite's
@@ -266,7 +268,19 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #20a (decode_varlen overflow hardening) state:FIXING attempts:0 — byte-exact fix applied + compiles; gauntlet bxk1ycwus IN-FLIGHT; lock HELD.
+- item: #20a DONE (committed+pushed 49a2c0ce1d). #20 remaining: only (b) definite-map. NEXT WAKE: SCHEDULE #20b.
+  *** wake329-cont2 (ultracode): #20a FIXING→VERIFYING→DONE. Gauntlet bxk1ycwus: nextest -p dugite-serialization 1150/1150
+  (was 1147, +3 #20a tests ALL PASS: varlen_overflow_10byte_msbyte_rejected [fail-pre/pass-post — pre-fix returned a
+  TRUNCATED Ok], varlen_max_u64_still_ok [boundary], varlen_non_minimal_submaximal_still_accepted [over-strictness guard];
+  + the pre-existing compact::unit_tests::test_decode_varlen_max_u64 still passes = no regression); clippy -D warnings clean;
+  fmt initially DIRTY (multi-line if) → cargo fmt auto-fixed → clean. COMMITTED focused 1-crate fix 49a2c0ce1d (compact.rs
+  decode_varlen overflow guard + const + tests.rs) + PUSHED (b43f4fa80d..49a2c0ce1d). Byte-exact per mempack
+  unpack7BitVarLenLast(0b1111_1110). *** #20 now: (a) DONE, (c) DONE; only (b) DEFINITE-length-map exact-count (premature-
+  EOF) remains. *** NEXT WAKE — SCHEDULE #20b: definite-length tables map truncated to M<N declared entries silently
+  imports the prefix (TvarBody/TvarIterator track indefinite+saw_break but NOT entries_remaining); Haskell decodeMapLen
+  demands exactly N → DecoderErrorPrematureEOF. Likely hand-doable (read TvarIterator, add an exact-count/premature-EOF
+  check for the definite arm) OR a short bounded muscle for the cborg decodeMapLen semantics. After #20b → #20 fully DONE.
+  Other open: #24 (V2 inline-spend over-cost, ROOT-CAUSED, pin later w/ full UTxO ctx), #7 (Dijkstra re-derive). Lock to release.
   *** wake329-cont (ultracode): muscle wi8udn7a7 COMPLETED CLEANLY (164s, 8 tool uses — the tight anti-death source-reading
   brief WORKED: no hang, no tree edits [git verified clean]). DELIVERED byte-exact mempack semantics: *** OVERFLOW: mempack
   DOES reject — `unless (firstByte .&. mask == 0b_1000_0000) Fail` where firstByte = the most-significant byte (first byte
@@ -2553,6 +2567,14 @@
 - db-clones/preprod-ep57-fixed   (fixed-binary replay, in progress)
 
 ## Gauntlet ledger  (passed/refuted approaches — never silently retry a REFUTED)
+- PASSED 2026-06-08 (wake329, #20a): "reject Word64 VarLen overflow in decode_varlen, byte-exact with mempack
+  unpack7BitVarLenLast". Gauntlet = 3 new tests (varlen_overflow_10byte_msbyte_rejected fail-pre/pass-post — pre-fix
+  returned a TRUNCATED Ok; varlen_max_u64_still_ok + varlen_non_minimal_submaximal_still_accepted guard against over-
+  strictness) + nextest 1150/1150 (incl. the pre-existing u64::MAX test = no regression) + clippy -D warnings + fmt.
+  Byte-exact: guard `firstByte & 0b1111_1110 == 0b1000_0000` on the 10-byte path (Haskell verbatim in muscle wi8udn7a7).
+  CRITICAL not-too-strict: mempack accepts non-minimal sub-maximal encodings → did NOT add a minimality check. Landed
+  49a2c0ce1d. NOTE: the bounded anti-death source-reading muscle brief WORKED (164s clean, no hang) — the model for
+  Haskell-source lookups.
 - PASSED 2026-06-08 (wake328, #20c): "resolve snapshot meta `backend` via aeson first-wins (first_occurrence_value), not
   serde_json last-wins". Gauntlet = the new regression test backend_enforce_is_aeson_first_wins_on_duplicate_key (critical
   case {"backend":"lsm","backend":"utxohd-mem"} must Err — pre-fix last-wins wrongly accepted the 2nd "utxohd-mem") +
@@ -2636,6 +2658,7 @@
 - 2026-06-07T23:xxZ wake326(+cont) ~ wogj8wp6h completed (44min, not dead) → #24 ROOT-CAUSED (inline-datum-spend over-cost, NOT txInfoData); stopped redundant w90vykjte; filed #25 (370 wrong-accept)
 - 2026-06-08T00:xxZ wake327 ~ #25 DEBUNKED (only 1 is_valid=false dump, not 370 — muscle miscount); #438 save via 1-command verify
 - 2026-06-08T01:xxZ wake328(+cont) ~ #20c backend dup-key first-wins FIXING→DONE (nextest 1147/1147) + commit/push b43f4fa80d
+- 2026-06-08T02:xxZ wake329(+cont) ~ #20a decode_varlen overflow guard (muscle wi8udn7a7 byte-exact) FIXING→DONE (nextest 1150/1150) + commit/push 49a2c0ce1d
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -4177,3 +4200,7 @@
 - wake328(+cont) 2026-06-08: SCHEDULE #20 hardening; DROVE sub-item (c) backend dup-key first-wins (hand-fix, byte-exact via
   the #17-established aeson first-wins) → FIXING→VERIFYING→DONE. Gauntlet GREEN (nextest 1147/1147 incl. the new first-wins
   test, clippy, fmt). Committed+pushed b43f4fa80d. #20 (a)varlen + (b)definite-map remain. Next: #20a (bounded muscle).
+- wake329(+cont) 2026-06-08: SCHEDULE #20a; bounded source-reading muscle wi8udn7a7 (164s CLEAN — anti-death brief worked)
+  gave byte-exact mempack varlen overflow semantics (firstByte&0xFE==0x80, non-minimal NOT rejected). Hand-applied the
+  overflow guard + 3 tests → FIXING→VERIFYING→DONE (nextest 1150/1150). Committed+pushed 49a2c0ce1d. #20 now a+c done, only
+  (b) definite-map left. Lesson: tight pure-source-reading muscle briefs (no instrument/measure, time-boxed) complete fast+clean.
