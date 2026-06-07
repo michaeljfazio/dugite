@@ -194,7 +194,30 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:GAUNTLET-PENDING (commit-B). *** wake168:
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:DIAGNOSING (gauntlet REFUTED 3/3; verify dissents).
+  *** wake169: RE-GAUNTLET wdvf5l5le = pass=false REFUTED 3/3 — substantive, NOT a commit. ALL 3 CONFIRM byte-exact:
+  R3 scientific_literal_as_word8 (Aeson toBoundedInteger@Word8 — 1.0/1e0/100e-2=>1, sub-ULP/1.5 reject, range reject)
+  + TxIx endianness/backend STRICT mapping. VALID REFUTATIONS:
+   (CRUX, R2-a — INTRODUCED by my no-silent-None): mod.rs:6648-6660 now re-decodes EVERY tag-4/tag-5 inline datum via
+    decode_plutus_data_cbor and HARD-ERRORS the whole import on decode failure. But Haskell stores inline datums as
+    OPAQUE BinaryData (newtype MemPack over ShortByteString), NEVER re-decoding at load (lazy on script-consume). So a
+    legal-on-chain datum dugite's read_plutus_data rejects would BRICK a snapshot Haskell accepts = OVER-REJECTION
+    (inverse of byte-exact). #15 proves dugite Data layer is non-verbatim (276->270) = exactly this over-reject class.
+    -> my hardening is WRONG here; byte-exact = store verbatim opaque, best-effort structural decode, keep bytes on err.
+   (R1 / R2-b / R3 — PRE-EXISTING in FINAL-DONE, no-silent-corruption gaps; Haskell MemPack hard-fails on all):
+    TvarIterator::next() mempack/mod.rs:977-1006 swallows a mid-map CBOR decode_bytes Err as clean end-of-map ->
+    SILENT PARTIAL UTxO import (assert_txix_distribution_sane blind to it, skipped not incremented); address-failure
+    mod.rs:6571-6582 -> skip+continue (drops UTxO); parse_multi_asset_rep failure mod.rs:6616-6623 -> warn + ADA-only
+    (drops native tokens = the MultiAssetNotConserved class). minor: R3 lacks Haskell c==0 short-circuit (0e<huge> ->
+    BigInt::pow blowup).
+  NOTE: #10's CORE phase-1 byte-exactness on WELL-FORMED snapshots is DONE+verified (0 phase-1 x4 replays); these are
+  MALFORMED-input / over-reject robustness. DROVE: launched ANALYZE muscle wezt2hemc (run wf_66f42008-83b) to VERIFY
+  vs Haskell (does loadSnapshot re-decode tag-4 datum / tag-5 script or store opaque? does MemPack unpack hard-fail on
+  truncated map / malformed addr / malformed value?) + per-path byte-exact disposition (HARD-ERROR vs OPAQUE-STORE vs
+  short-circuit) + pre-existing-vs-introduced + fold-vs-separate-item. NEXT WAKE: on analyze result -> FIX (keep R3;
+  revise tag-4/5 to opaque-no-redecode; harden TvarIterator/address/multi-asset to hard-error per Haskell; +c==0
+  short-circuit) -> rebuild -> re-import (still 0 phase-1) -> re-gauntlet -> commit.
+  was: state:GAUNTLET-PENDING (commit-B). *** wake168:
   VERIFYING-RESOAK VERDICT = PASS. verify10B synced PAST window (tip 125110959 > 125105013): 0 phase-1 (all classes),
   0 import hard-errors (no-silent-None non-regressing), 308 Error-term (= #15 general-UPLC, unchanged by hardening as
   expected). DROVE: SIGTERM'd verify10B (evidence captured), launched RE-GAUNTLET muscle wdvf5l5le (run wf_83b4db4e-
@@ -1192,6 +1215,12 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake169 2026-06-07: #10 RE-GAUNTLET wdvf5l5le = REFUTED 3/3 (substantive). R3 float-parse + TxIx/backend CONFIRMED
+  byte-exact by all 3. VALID: (a) my no-silent-None tag-4/5 OVER-REJECTS vs Haskell opaque BinaryData (re-decodes +
+  hard-errors where Haskell stores opaque) — INTRODUCED bug; (b) pre-existing silent paths TvarIterator mid-map
+  truncation / address-skip / multi-asset-ADA-degrade (Haskell MemPack hard-fails). GAUNTLET-PENDING -> DIAGNOSING.
+  Launched ANALYZE muscle wezt2hemc (wf_66f42008-83b) to verify Haskell per-path disposition. NEXT WAKE: fix (R3 keep;
+  tag-4/5 opaque-no-redecode; harden the 3 silent paths) -> re-gauntlet -> commit.
 - wake168 2026-06-07: #10 VERIFYING-RESOAK PASS -> GAUNTLET-PENDING. verify10B past window: 0 phase-1, 0 import
   hard-errors, 308 Error-term (=#15). SIGTERM'd verify10B; launched RE-GAUNTLET wdvf5l5le (wf_83b4db4e-836) on
   FINAL-DONE+R3+no-silent-None (prior 3/3 resolved: R1+R2=general-UPLC #15 byte-level; R3 fixed; CRC=#17). NEXT WAKE:
