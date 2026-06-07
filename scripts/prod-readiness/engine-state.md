@@ -1262,6 +1262,10 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake179 2026-06-07: POLL #10 GAUNTLET wd3lzyawv — still RUNNING (last activity current). verify10B2 WINDOW
+  EVIDENCE CONFIRMED: synced PAST window (tip 125113936 > 125105013, block 4794270) with 0 phase-1 — the 6-path
+  binary holds 0-phase-1 past the ep293 window. No transition (gauntlet is the gate). Disk 182G. #10 stays
+  GAUNTLET-PENDING. NEXT WAKE: on gauntlet PASS -> COMMIT #10 (window evidence already in hand).
 - wake178 2026-06-07: #10 VERIFYING-RESOAK -> GAUNTLET-PENDING. verify10B2 import fully clean (4116339 UTxOs, 0
   phase-1, 0 hard-errors — new hard-error paths don't false-trigger, opaque relax doesn't over-reject). Launched
   RE-GAUNTLET wd3lzyawv (wf_487f86db-d79) on 6-path disposition, parallel to verify10B2 window sync. All prior
