@@ -21,6 +21,15 @@
 - perf:             at-tip CPU bounded (15 hot peers); sync ~300 blk/s Byron
 
 ## Backlog  (ranked by impact; one advanced per wake)
+23. [M][phase2][REPRODUCED-AT-HEAD wake323] Babbage V2-Spend BUDGET over-cost (the #730 "fixed-delta structural-context"
+   residual). 363/363 tx0 dumps in phase2-dumps-730val/ (769 total across tx-indices) STILL diverge at HEAD via
+   examples/phase2_repro: is_valid(on-chain)=true but dugite=Err, ~257 "budget exhausted" near-edge (mem_remaining 291/371,
+   identical recurring budgets → a FEW distinct V2 scripts), ~106 other-error (unclassified, NOT serialiseData). dugite's
+   CEK/ScriptContext over-costs a small FIXED DELTA vs cardano-node → exhausts budget on near-edge scripts. Masked by
+   trust-on-consensus (no wedge/ledger impact; #22 ledger-byte-exact stands) but a real standalone-validation gap (block
+   producer / trustless validator). REAL (committed phase2_onchain_budget fixtures pass → harness sound). NEXT: DIAGNOSE
+   via muscle — one recurring script's dugite-consumed vs on-chain-consumed exUnits (Koios script_redeemers) → the delta +
+   the inflated cost component (structural-context hypothesis). state:REPRODUCED attempts:0
 0. [H][ledger][REAL-CURRENT, ROOT-CAUSED] mainnet ep246 reserves +82,270,482 / treasury -55,269. STRUCTURAL
    ROOT CAUSE (deep-dive wuc2kqb1z): the member-reward fold (rewards.rs:445-490) iterates go.delegations +
    separate go.stake_distribution.get(cred) lookup, whereas Haskell folds a SINGLE resolved active-stake VMap
@@ -233,7 +242,31 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #15 DONE/REFUTED (committed+pushed 82cf25bfef). NEXT WAKE: SCHEDULE picks the next item — see recommendation.
+- item: #23 phase-2 Babbage BUDGET over-cost (the #730 "2 V2-Spend fixed-delta" residual) state:REPRODUCED attempts:0 — re-confirmed at HEAD. NEXT WAKE: DIAGNOSE.
+  *** wake323 (ultracode): SCHEDULE→DRIVE. SCHEDULE: instead of a heavy from-genesis ep293 replay, ASSESS found
+  phase2-dumps-730val/ has 769 SELF-CONTAINED phase-2 divergence dumps (tx_cbor + resolved utxo_pairs + cost_models_cbor +
+  budget + protocol_major + slot config) — re-runnable at HEAD via crates/dugite-uplc/examples/phase2_repro.rs (no replay).
+  Since the dumps hold IMMUTABLE chain inputs, re-running exercises HEAD's phase-2 logic. DRIVE (re-capture/REPRODUCE):
+  built phase2_repro (release) + re-ran the 363 tx0 dumps (of 769 total; other tx-indices tx1=190/tx2=91/tx3=40/… not yet
+  swept). RESULT: 363/363 STILL DIVERGE at HEAD — ALL is_valid(on-chain)=true but dugite=Err (dugite wrongly REJECTS valid
+  Babbage txs standalone; masked by trust-on-consensus = no wedge). Of the 363: ~257 "budget exhausted" with TINY
+  mem_remaining (291/371) and IDENTICAL recurring budgets (cpu_remaining=2798701/mem_remaining=291 repeats across many
+  files) → a FEW distinct V2-Spend scripts over-costing by a small FIXED DELTA, recurring across many txs = exactly the
+  #730 "2 V2-Spend budget validators remain (fixed-delta structural-context class)" residual; ~106 other-error (NOT
+  serialiseData — consistent with #15 refutation; unclassified, separate). *** CONFIRMED REAL (not a harness artifact):
+  the committed phase2_onchain_budget.rs fixtures (tx0/tx1/tx6.json) PASS at HEAD (#15 gauntlet nextest 441/441 incl. them)
+  → eval_phase_two_raw + cost-model application is SOUND; the 363 are real script-specific over-costs. The dump's max_ex is
+  the tx's declared per-redeemer exUnits; on-chain the script ran WITHIN it (is_valid=true), dugite consumes ~99.998% then
+  tips over → dugite's CEK/ScriptContext costs a small fixed delta MORE than cardano-node for these scripts. *** NOTE: #22
+  (backlog #4 "CEK V1/V2 Babbage RESOLVED via full ep0-293 replay byte-exact") was LEDGER byte-exactness; this is PHASE-2
+  STANDALONE validation (node trusts consensus on is_valid=true so it never re-evaluates these → no ledger impact, but a
+  real correctness gap for a block-producer/trustless validator). *** NEXT WAKE (DIAGNOSE, muscle): pick ONE recurring
+  budget-exhausted script (e.g. tx0-009d19e7… cpu_remaining=2798701/mem=291, V2, pv8, 4 utxos); get its on-chain CONSUMED
+  exUnits from Koios (script_redeemers / tx_info for the tx) and compare to dugite's consumed (from phase2_repro on
+  success-path with a raised budget) → the DELTA + which cost component (per the #730 "structural-context" hypothesis:
+  likely the ScriptContext Data size/shape inflating per-element builtin costs, or a specific builtin's V2 cost). Tool note:
+  phase2_repro takes a single dump; `target/release/examples/phase2_repro <dump.json>`. Persisting-divergence list at
+  /tmp/p2_divergences.txt (363). Lock healthy (~338s).
   *** wake322-cont (ultracode): #15 VERIFYING→DONE — muscle refutation INDEPENDENTLY CONFIRMED (premise was STALE; dugite
   serialiseData is ALREADY byte-exact). Gauntlet b16jy1j76 on MAIN: nextest -p dugite-uplc 441/441 GREEN — the GOLD test
   serialise_data_gold_preprod_datum_hash_matches_onchain PASSES (blake2b256(serialiseData(real 276-byte datum)) == on-chain
@@ -2392,6 +2425,7 @@
 - 2026-06-07T16:xxZ wake320(+cont) ~ #17 VERIFYING→DONE (gauntlet 1146/1146 ser + 955/955 node + clippy + fmt) + commit/push 28bcd277e6
 - 2026-06-07T17:xxZ wake321(+cont) ~ SCHEDULE #15 + muscle fix wf4hgn0hk (OVERTURNED premise) → VERIFYING-PENDING + patch saved
 - 2026-06-07T17:xxZ wake322(+cont) ~ #15 VERIFYING→DONE/REFUTED (Koios + gold test on main 441/441) + commit/push 82cf25bfef
+- 2026-06-07T18:xxZ wake323 ~ SCHEDULE+DRIVE #23: re-ran 363 #730 phase-2 dumps at HEAD (phase2_repro) → 363/363 still diverge (budget over-cost), filed #23 REPRODUCED
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -3910,3 +3944,7 @@
   datum))==bbd352… PASSES on MAIN (nextest 441/441) + clippy + fmt. Committed+pushed additive tests+docs 82cf25bfef
   (locks in byte-exactness + a guard vs the wrong memo-fix). Confirmed adversarial SAVE — prevented a divergence-introducing
   fix. 306 phase-2 divergences NOT in serialiseData; need fresh HEAD ep293 capture. NEXT: 306 re-capture or #20 hardening.
+- wake323 2026-06-07: SCHEDULE+DRIVE — phase-2 Babbage budget re-validation. Re-ran 363 tx0 #730 dumps at HEAD via
+  examples/phase2_repro (cheap, no replay — dumps are self-contained chain inputs). 363/363 STILL diverge: ~257 budget-
+  exhausted near-edge (few recurring V2 scripts = the #730 fixed-delta residual), ~106 other-error. CONFIRMED real
+  (committed budget fixtures pass → harness sound). Filed #23 (REPRODUCED). NEXT WAKE: DIAGNOSE the fixed-delta over-cost.
