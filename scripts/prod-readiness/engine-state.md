@@ -361,7 +361,7 @@
    INDEPENDENTLY VERIFIED (#438): git diff = EXACTLY 4 r.skip() removed (all witness-set arms) + 4 rejects; tx-body skips
    (era_conway:667/671 = #31-B) UNTOUCHED (absent from diff); CostModels (cost_models_unknown_keys_ignored) + PParamUpdate
    (pparam_update_unknown_key_skipped) tests STILL PASS (genuinely lenient, NOT flipped); fmt=0 clippy=0 nextest 1176/1176.
-   state:GAUNTLET attempts:1 conf:0.9 (part A). *** NEXT WAKE — GAUNTLET #31-A (Haskell-reject match + over-strictness lens:
+   state:A-DONE attempts:1 conf:0.95 COMMITTED fe101965a0 wake400 (gauntlet w9xgaid4w PASSED 0/3 GOLD-STANDARD: caught+cleared the v12+ version-gate trap + a WebFetch hallucination). #31-B/C/D remain. *** NEXT WAKE — GAUNTLET #31-A (Haskell-reject match + over-strictness lens:
    confirm only witness-set rejects, body/CostModels/PParamUpdate lenient preserved) → commit. Then #31-B/C/D as separate steps.
 23. [M][phase2][REPRODUCED-AT-HEAD wake323] Babbage V2-Spend BUDGET over-cost (the #730 "fixed-delta structural-context"
    residual). 363/363 tx0 dumps in phase2-dumps-730val/ (769 total across tx-indices) STILL diverge at HEAD via
@@ -622,7 +622,16 @@
    reconstruction + #7 sub-tx forward). state:DONE attempts:0
 
 ## In-progress
-- item: #31-A FIXING DONE (reject unknown witness-set keys, 4 sites all eras; over-strictness verified; 1176/1176) → state:GAUNTLET. NEXT: gauntlet #31-A → commit; then #31-B/C/D.
+- item: #31-A DONE (committed fe101965a0) — witness-set unknown-key reject, gauntlet PASSED 0/3 gold-standard. NEXT: #31-B (tx-body unknown-key reject, era-aware Dijkstra whitelist).
+  *** wake400 (ultracode): ran the #31-A gauntlet (w9xgaid4w, 3 lenses) → PASSED 0/3, GOLD-STANDARD: lens1 INDEPENDENTLY read
+  the RAW cardano-ledger source (cd8b7fab), CAUGHT the WebFetch paraphrase hallucinating that the v12+ witness decoder is lenient,
+  and traced decodeSparseKeyed `_ -> Nothing` → failMsg = HARD FAIL (the #30-class version-gate trap, checked+cleared); lens2
+  verified Err propagation + over-strictness scope; lens3 verified Dijkstra reuse byte-exactness (no PlutusV4 witness key).
+  COMMITTED fe101965a0 (dugite-serialization, local). #31-A CLOSED. *** #31 REMAINING SUB-PARTS: #31-B tx-body unknown-key reject
+  (ERA-AWARE: Conway decoder doubles as Dijkstra — whitelist active-era body keys, do NOT blindly reject >22; era_conway:669-672
+  + pre-Conway bodies; flip shelley_body_unknown_key_skipped, keep test_dijkstra_unknown_tx_body_key_skipped lenient for future
+  keys), #31-C Conway PV9+ set-dedup (=#30 fix-B; read_set_strict PV-thread), #31-D dup-map-key. NEXT WAKE: SCHEDULE #31-B → FIX
+  (era-aware — diagnose the exact Conway+Dijkstra known-body-key set first).
   *** wake396 (ultracode): DRIVE #31 ROOT-CAUSED→FIXING #31-A (fix Workflow wvcniku8l, in-turn). PERMALINK-PINNED the Haskell
   source (cardano-ledger cd8b7fab: txWitnessField n=invalidField n → cborError, all eras). Rejected the witness-set default arm
   at 4 sites (shelley:1094/alonzo:1019/babbage:910/conway:2232; Allegra+Mary via Alonzo reuse) + flipped 3 skip-tests + added a
@@ -3324,6 +3333,15 @@
 - db-clones/preprod-ep57-fixed   (fixed-binary replay, in progress)
 
 ## Gauntlet ledger  (passed/refuted approaches — never silently retry a REFUTED)
+- PASSED 2026-06-09 (wake400, #31-A witness-set reject, gauntlet w9xgaid4w): 0/3 refute, GOLD-STANDARD rigorous. (1) Haskell-reject
+  -all-eras: INDEPENDENTLY re-pinned cardano-ledger cd8b7fab + read RAW source, caught the WebFetch paraphrase HALLUCINATING that
+  v12+ is lenient — refuted it: v12+ decodeSparseKeyed decoderByKey `_ -> Nothing` → Decoder.hs:1244 `Nothing -> failMsg "Unknown
+  field key"` = HARD FAIL (the #30-class version-gate trap, checked + cleared); pre-v12 txWitnessField=invalidField→cborError;
+  Shelley witField→invalidKey, NO version gate. All eras hard-fail. (2) over-strictness: exactly 4 witness-set arms; tx-body +
+  CostModels + PParamUpdate preserved; Err PROPAGATES out of for_each_map_entry (reader.rs:323, not swallowed); Allegra/Mary reuse
+  Alonzo (keys 0..5) but only emit 0..2 = subset, no valid key rejected. (3) completeness: all 4 ws decoders covered; Dijkstra
+  reuses Conway (tops at key 7=PlutusV3, NO PlutusV4 witness key) → rejecting key>=8 byte-exact; tests genuinely flipped. COMMITTED
+  fe101965a0 (1 crate dugite-serialization).
 - PASSED 2026-06-09 (wake388, #30 txInfoSignatories sort+dedup, gauntlet wgvyqtxj0): 0/3 refute, each lens SUBSTANTIVE +
   PERMALINK-RECONFIRMED against current cardano-ledger master. (1) Set.toList exact match: Alonzo TxInfo.hs:311-312
   transTxBodyReqSignerHashes = transKeyHash <$> Set.toList(reqSignerHashes), reused for V1/V2/V3 (Conway L424/466/511); +
@@ -3524,6 +3542,7 @@
 - 2026-06-09T02:00Z wake388 ~ #30 gauntlet wgvyqtxj0 PASSED 0/3 (substantive, permalink-reconfirmed + PackedBytes-endianness check): sort+dedup==Set.toList for V1/V2/V3, sole live producer. COMMITTED 42bf522984. #30 DONE. Next #31
 - 2026-06-09T02:30Z wake392 ~ #31 NEW→ROOT-CAUSED: diagnose w2g366xg2 (in-turn, conf 0.55→0.9, REAL) — Haskell SparseKeyed hard-fails unknown wits/body keys (invalidField→cborError, all eras) + Conway PV9+ set dup-reject. 4 parts A/B/C(=#30 fix-B)/D, adversarial/latent #539-class. Next FIXING #31-A (witness-set reject)
 - 2026-06-09T03:00Z wake396 ~ #31 ROOT-CAUSED→FIXING #31-A: fix Workflow wvcniku8l (in-turn) rejected unknown witness-set keys at 4 sites (all eras, permalink-pinned Haskell); OVER-STRICTNESS GUARD verified (only witness-set; body/CostModels/PParamUpdate untouched); 1176/1176. Uncommitted; gauntlet next
+- 2026-06-09T03:30Z wake400 ~ #31-A gauntlet w9xgaid4w PASSED 0/3 GOLD-STANDARD (raw-source recheck caught a WebFetch hallucination + cleared the v12+ version-gate trap; Dijkstra byte-exact). COMMITTED fe101965a0. #31-A DONE. Next #31-B (tx-body, era-aware)
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -5220,3 +5239,7 @@
   alonzo/babbage/conway; Allegra+Mary via reuse) + flipped 3 skip-tests + 1 new Conway test. OVER-STRICTNESS GUARD independently
   verified: exactly 4 witness-set skips→rejects, tx-body/CostModels/PParamUpdate untouched (lenient tests still pass), 1176/1176.
   Uncommitted; gauntlet next. state:GAUNTLET (part A). #31-B/C/D remain.
+- wake400 2026-06-09: ran the #31-A gauntlet (w9xgaid4w, 3 lenses, in-turn) → PASSED 0/3 GOLD-STANDARD. lens1 independently read
+  raw cardano-ledger source, CAUGHT a WebFetch hallucination (claimed v12+ lenient) + cleared the #30-class version-gate trap
+  (decodeSparseKeyed `_ -> Nothing` = hard fail); lens2 Err-propagation + over-strictness; lens3 Dijkstra byte-exactness.
+  COMMITTED fe101965a0 (dugite-serialization, 1 crate). #31-A DONE. NEXT: #31-B (tx-body reject, era-aware Dijkstra whitelist).
