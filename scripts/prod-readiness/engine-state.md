@@ -209,7 +209,27 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:GLOBALS-REPLAY-RUNNING (build OK + strings-verified; replay pid 32932 launched wake283).
+- item: #0 (mainnet ep246 reserves) state:ROOT-CAUSED-VALUE (total_active_stake 109,573,937,991-lovelace deficit; find the missing stake).
+  *** wake284 (ultracode): **BREAKTHROUGH — the ~5 ppm is total_active_stake being 109,573,937,991 lovelace (4.991 ppm)
+  TOO LOW.** ep246 RUPD_GLOBALS (saved epoch-dumps-engine/mainnet-globals/ep246_globals.txt): reserves=
+  12,905,245,994,461,083 ; epoch_fees=13,516,792,921 (==Koios ep244 fees ✓) ; d=13/50=0.26 (==Koios ep244 ✓) ;
+  total_stake=32,094,754,005,538,917 (==45e15-reserves ✓) ; expansion(deltaR1)=38,597,052,350,175 ; reward_pot=
+  30,888,455,314,477 ; **total_active_stake=21,956,097,174,685,676 vs Koios ep244 active_stake 21,956,206,748,623,667
+  -> dugite LOW by 109,573,937,991 = 4.991 ppm.** total_active_stake is the sigmaA denominator (appPerf=beta*
+  total_active_stake/poolStake), so 4.99 ppm-low -> every poolR 4.99 ppm low -> ~82M under-distributed -> reserves
+  +82,270,482 (4.99 ppm x total_distributed). All OTHER globals byte-exact -> NOT deltaR1/R/total_stake/fees/d. ***
+  CORRECTION to wake281: that 'total_active_stake byte-exact' compared the DUMP's go.total_active_stake field (22.08T =
+  Koios ep245) which is NOT the value the RUPD uses (21.95T = Koios ep244, 5 ppm low). The globals instrumentation
+  exposed the real RUPD value the dump hid -> ALWAYS instrument the value at the USE site, not a nearby dump field. ***
+  The 109.6B (~109,574 ADA) is MISSING from dugite's go.pool_stake sum (the RUPD active-stake snapshot). The orphan-pool
+  filter is a NO-OP (removing it didn't change ep246) so it's NOT the filter — some credential stake is under-counted
+  in go.pool_stake. SAME CLASS as #1 (ep57 stake-distribution -10 ADA) + #11 (stake-dereg) — stake-snapshot accuracy.
+  DROVE: SIGTERM'd globals replay 32932 (data captured; CoW clone db-clones/mainnet-rupd-drop KEPT). NEXT WAKE: find
+  the MISSING 109,573,937,991 lovelace in go.pool_stake — instrument per-pool go.pool_stake dump at ep246 + compare to
+  Koios pool_stake_snapshot per pool (ep244) to find which pool(s)/cred-class is short; candidates: pointer-addr stake
+  (sisPtrStake) excluded, reward_balance under-counted for some creds, or a dereg/reg snapshot-timing edge. The FIX
+  lands wherever go.pool_stake is built (epoch.rs:199-217 SNAP fold / the mark-snapshot construction). Instrumentation
+  (globals+drop-trace rewards.rs, paid-set shelley.rs) UNCOMMITTED; baseline filter restored.
   Build OK (release 1m39s, binary 18:00), strings RUPD_GLOBALS=2 VERIFIED in binary. Launched globals replay job
   mainnet-globals pid 32932 (DUGITE_RUPD_GLOBALS=1, dumps->mainnet-globals) over CoW clone db-clones/mainnet-rupd-drop.
   ~4min to ep246. RUPD_GLOBALS eprintln per boundary -> scripts/prod-readiness/.jobs/mainnet-globals.log. NEXT WAKE:
@@ -3072,3 +3092,11 @@
   mainnet-globals pid 32932 (DUGITE_RUPD_GLOBALS=1) over CoW clone. next wake: grep 'RUPD_GLOBALS reserves=
   12905245994461083' -> compare deltaR1(expansion)/reward_pot/total_stake/total_active_stake to Koios-exact (rho=3/1000,
   reserves=12905245994461083, d=0.26, tau=0.2, max_supply=45e15) -> global ~5ppm low = bug; if all exact -> per-pool maxPool.
+- wake284 (ultracode): BREAKTHROUGH — ep246 RUPD_GLOBALS shows total_active_stake=21,956,097,174,685,676 vs Koios
+  ep244 active_stake 21,956,206,748,623,667 -> LOW by 109,573,937,991 = 4.991 ppm = THE reward under-scaling. All other
+  globals byte-exact (deltaR1/reward_pot/total_stake/fees/d). total_active_stake is the sigmaA denominator -> 5ppm-low
+  -> every reward 5ppm low -> +82M reserves. wake281 'byte-exact' was the DUMP's go field (ep245), NOT the RUPD value
+  (ep244, 5ppm low) -> instrument at the USE site. Orphan filter is a no-op (not it); 109.6B is missing from
+  go.pool_stake (active-stake snapshot). Same class as #1/#11 stake-distribution. SIGTERM'd replay. next wake: per-pool
+  go.pool_stake vs Koios pool_stake_snapshot to find the missing-stake pool/cred-class (pointer stake? reward_balance?
+  dereg-timing?). Fix lands at go.pool_stake construction (epoch.rs SNAP fold).
