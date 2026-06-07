@@ -306,6 +306,18 @@
    (line numbers may drift) — permalink-pin / oracle-reconfirm transTxBodyReqSignerHashes + decodeSetEnforceNoDuplicates before
    landing. state:ROOT-CAUSED attempts:0 conf:0.9. NEXT: FIXING (A) sort+dedup + proptest; gauntlet (Haskell-Set.toList match +
    over-canonicalization check: confirm sorting matches the other already-sorted fields' convention) → commit. (B) tracked sep.
+   *** FIXING (A) DONE wake384 (engine direct edit — trivial 2-line mechanical fix matching the EXISTING dugite convention; the
+   analytical reasoning is workflow-visible via the diagnose + the next gauntlet; patch backup candidate-fix-30-signatories.patch).
+   required_signers_to_plutus_padded (tx_info_populate.rs) now does `out.sort(); out.dedup();` on the Vec<PubKeyHash=[u8;28]>
+   (derived lexicographic Ord == Haskell Ord(KeyHash)) → reproduces Set.toList for V1/V2/V3 in the one shared helper; added a
+   canonicalisation test (wire order [3,1,2,1] → [1,2,3]; canonical/empty/single unchanged). SCOPE: the Hash28 variant
+   required_signers_to_plutus (:288) is TEST-ONLY (sole caller is the test at :1260) — NOT on the live txInfoSignatories path
+   (populate_v1_v2.rs:62/112 + populate_v3.rs:91 all use _padded), left untouched. *** INDEPENDENTLY VERIFIED: fmt=0 clippy=0
+   nextest 448/448 incl. the new test + the real onchain_babbage budget test (no regression — honest signers are canonical so
+   the sort is a no-op). state:GAUNTLET attempts:1 conf:0.9. *** NEXT WAKE — GAUNTLET (lenses: Set.toList exact match incl.
+   permalink-reconfirm transTxBodyReqSignerHashes per the diagnose caveat; over-canonicalization [does Haskell sort for ALL
+   eras — diagnose says yes, shared Alonzo helper]; completeness [any other live signatories path; is (A) sufficient for
+   txInfoSignatories CONTENT or does (B) decode-strictness matter for commit]) → commit on pass.
 31. [M][serialization][NEW] Witness-set decoders silently skip unknown map keys (the #537/#539 silent-skip class, new site).
    Alonzo/Babbage/Conway tx-witness-set map decoders fall through `_ => { r.skip()? }` for keys outside 0..7 (era_alonzo.rs:
    1019-1021, era_babbage.rs:~910-912, era_conway.rs:2232-2234), silently discarding. Haskell decodes via SparseKeyed
@@ -572,7 +584,14 @@
    reconstruction + #7 sub-tx forward). state:DONE attempts:0
 
 ## In-progress
-- item: #30 [M] txInfoSignatories wire-order ROOT-CAUSED (conf 0.9, Haskell Set.toList sort+dedup confirmed; dugite's lone uncanonicalized Set field). NEXT: FIXING (A) sort+dedup.
+- item: #30 FIXING (A) DONE (sort+dedup in required_signers_to_plutus_padded; 448/448) → state:GAUNTLET. NEXT: gauntlet → commit.
+  *** wake384 (ultracode): DRIVE #30 ROOT-CAUSED→FIXING (A). Applied the trivial sort+dedup directly (matches dugite's existing
+  Set.toList convention for inputs/withdrawals/datums/voters — required_signers was the lone wire-order field). PubKeyHash=[u8;28]
+  derived Ord == Haskell Ord(KeyHash) → reproduces Set.toList for V1/V2/V3 in one helper. Added a canonicalisation test
+  ([3,1,2,1]→[1,2,3] + canonical/empty/single). Scoped to the live _padded builder (the Hash28 variant :288 is test-only).
+  INDEPENDENTLY verified fmt+clippy+nextest 448/448 incl. the new test + the real onchain_babbage budget test. Uncommitted; patch
+  backed up. NEXT WAKE: GAUNTLET (Set.toList match + over-canonicalization + completeness; permalink-reconfirm per the diagnose
+  caveat) → commit. (B) Conway dup-reject-at-decode tracked with #31.
   *** wake380 (ultracode): SCHEDULE #30, DRIVE NEW→ROOT-CAUSED. HEAD-verified required_signers_to_plutus_padded does no
   sort/dedup, then diagnose Workflow w9r1peyto (in-turn, conf 0.9) SOURCE-CONFIRMED: Haskell txInfoSignatories =
   Set.toList(reqSignerHashesTxBody) = ascending+deduped (V1/V2/V3, shared Alonzo helper); decode is version-gated (Alonzo/
@@ -3432,6 +3451,7 @@
 - 2026-06-09T00:00Z wake372 ~ #29 byte-exact rework (wpn0y1m1z, in-turn): transient cap_treasury full-fold-decremented for the cap check, :2288 untouched; edge test EMPIRICALLY fails under v1; INDEPENDENTLY verified 1525/1525. Resolves wake368 refutation. Re-gauntlet next
 - 2026-06-09T00:30Z wake376 ~ #29 re-gauntlet w7yhosc8m PASSED 0/3 (substantive, cross-checked conway.md): cap_treasury==ensTreasury byte-exact, casTreasury untouched, no leak, ep247 pre-Conway. COMMITTED f816efc9b1. #29 DONE. Filed #29-order [L]. Next #30
 - 2026-06-09T01:00Z wake380 ~ #30 NEW→ROOT-CAUSED: diagnose w9r1peyto (in-turn, conf 0.9) source-confirmed Haskell txInfoSignatories=Set.toList sort+dedup (V1/V2/V3) + Conway PV9+ dup-reject-at-decode. dugite's lone uncanonicalized Set field. Fix=sort+dedup in builder; (B) dup-reject→#31. Next FIXING
+- 2026-06-09T01:30Z wake384 ~ #30 ROOT-CAUSED→FIXING (A): sort+dedup in required_signers_to_plutus_padded (matches dugite's existing Set.toList convention; V1/V2/V3 in one helper) + canonicalisation test; INDEPENDENTLY verified 448/448. Uncommitted; gauntlet next
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -5110,3 +5130,7 @@
   already canonicalizes its other Set-like TxInfo fields — required_signers is the lone wire-order one. FIX (A): out.sort()+
   out.dedup() in required_signers_to_plutus_padded; FIX (B) Conway dup-reject-at-decode → fold into #31. state:ROOT-CAUSED.
   NEXT: FIXING (A).
+- wake384 2026-06-09: DRIVE #30 ROOT-CAUSED→FIXING (A). Applied sort+dedup in required_signers_to_plutus_padded directly (trivial
+  2-line fix matching dugite's existing Set.toList convention; PubKeyHash derived Ord == Haskell Ord(KeyHash); fixes V1/V2/V3 in
+  one helper). Added a canonicalisation test. Scoped to the live _padded builder (Hash28 variant :288 is test-only). INDEPENDENTLY
+  verified fmt+clippy+nextest 448/448 incl. the new test + real onchain_babbage budget. Uncommitted; gauntlet next. state:GAUNTLET.
