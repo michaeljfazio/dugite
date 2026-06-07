@@ -209,7 +209,7 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:FIXING (applyRUpd PARTITION; trap-aware fix muscle wyidhhb1o ACTIVE, polled wake244 15:05 — agent investigating reward path, established ep246=Allegra PV3, worktree base ca50afd9ef [stale — bridge diff to HEAD on apply]).
+- item: #0 (mainnet ep246 reserves) state:FIXING (applyRUpd PARTITION; trap-aware fix muscle wyidhhb1o ACTIVE, polled wake245 15:08 — code WRITTEN + nextest GREEN (1513 passed); finalizing fmt/clippy + structured output. ep246=Allegra PV3. worktree base ca50afd9ef [stale — bridge diff to HEAD on apply]. REMINDER: green tests != byte-exact; orchestrator MUST dump-verify ep246 reserves before commit).
   *** wake243: DIAGNOSE wz6pe606w COMPLETE — DEFINITIVE localization (conservation decomposition vs Koios `totals`).
   The +82.27M is a conservation-preserving PARTITION error in applyRUpd, NOT a pot/deltaR1 magnitude error. THREE
   deltas sum to EXACTLY 0 at ep246: reserves +82,270,482 (EXCESS via undistributed/deltaR2) ; treasury -55,269
