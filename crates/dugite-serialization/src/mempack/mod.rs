@@ -370,6 +370,86 @@ pub fn parse_tables_codec_version(meta_json: &[u8]) -> Result<u64, Serialization
     }
 }
 
+/// Parse the mandatory `checksum` field (Haskell `SnapshotMetadata.snapshotChecksum ::
+/// CRC`, a `Word32`) from the snapshot `meta` JSON, with the SAME aeson-faithful
+/// first-occurrence / top-level / `Scientific.toBoundedInteger` semantics as
+/// [`parse_tables_codec_version`]. Upstream `FromJSON SnapshotMetadata` reads it via
+/// `fmap CRC (o .: "checksum")`, so an absent/null field, a non-`Number`, a non-integral
+/// number, or one outside the `Word32` range `[0, 4294967295]` is a HARD ERROR
+/// (`MetadataInvalid`) — there is no `Ok(None)`.
+///
+/// The returned value is the EXPECTED snapshot checksum, compared against the locally
+/// computed [`snapshot_crc_of_concat`] at import; a mismatch is upstream's
+/// `ReadSnapshotDataCorruption`.
+pub fn parse_snapshot_checksum(meta_json: &[u8]) -> Result<u32, SerializationError> {
+    let value: serde_json::Value = serde_json::from_slice(meta_json).map_err(|e| {
+        SerializationError::CborDecode(format!("snapshot meta is not valid JSON: {e}"))
+    })?;
+    if !value.is_object() {
+        return Err(SerializationError::CborDecode(
+            "snapshot meta is not a JSON object (aeson `withObject \"SnapshotMetadata\"` \
+             fails); refusing to import"
+                .to_string(),
+        ));
+    }
+    // First-occurrence value of `checksum`, aeson `KM.fromList` semantics (mirrors
+    // `parse_tables_codec_version`: gate via `first_occurrence_value`, literal via
+    // `top_level_number_literal`, so the gate and the value can never disagree).
+    let first = first_occurrence_value(meta_json, "checksum")?;
+    match first {
+        None | Some(serde_json::Value::Null) => Err(SerializationError::CborDecode(
+            "snapshot meta has no checksum field (MetadataInvalid upstream: the mandatory \
+             `fmap CRC (o .: \"checksum\")` fails on an absent/null field); refusing to import"
+                .to_string(),
+        )),
+        Some(v) if !v.is_number() => Err(SerializationError::CborDecode(format!(
+            "snapshot meta checksum is not a JSON Number (Aeson `withScientific'` yields \
+             `typeMismatch \"Number\"` for {v}); refusing to import"
+        ))),
+        Some(_) => {
+            let literal = top_level_number_literal(meta_json, "checksum")?.ok_or_else(|| {
+                SerializationError::CborDecode(
+                    "snapshot meta checksum is a JSON Number but its raw literal could not be \
+                     located as a top-level object value; refusing to import"
+                        .to_string(),
+                )
+            })?;
+            scientific_literal_as_bounded(&literal, u32::MAX as u64)
+                .map(|n| n as u32)
+                .ok_or_else(|| {
+                    SerializationError::CborDecode(format!(
+                        "snapshot meta checksum literal `{literal}` is not an integral value in \
+                         Word32 range [0, 4294967295] (Aeson Scientific.toBoundedInteger @Word32 \
+                         would fail); refusing to import"
+                    ))
+                })
+        }
+    }
+}
+
+/// Compute the snapshot-level checksum exactly as upstream ouroboros-consensus
+/// `crcOfConcat` (LedgerDB V2 InMemory). The stored `snapshotChecksum` is NOT
+/// `crc32(state ++ tables)` — it is `crc32` over the DECIMAL-ASCII concatenation of the
+/// two separate file CRCs, folding to the state-only CRC when there is no tables file:
+///
+/// ```haskell
+/// -- Ouroboros.Consensus.Util.CRC
+/// crcOfConcat crc1 crc2 =
+///   computeCRC $ BS.toStrict $ BS.toLazyByteString
+///     $ (BS.word32Dec $ getCRC crc1) <> (BS.word32Dec $ getCRC crc2)
+/// -- write side: snapshotChecksum = maybe crc1 (crcOfConcat crc1) crc2
+/// ```
+///
+/// `computeCRC = Digest.crc32` = zlib CRC-32/ISO-HDLC, byte-identical to `crc32fast`.
+/// `state_crc` / `tables_crc` are each `crc32fast::hash` over the WHOLE raw file blob.
+/// Empirically verified byte-exact against real preprod snapshots (#17).
+pub fn snapshot_crc_of_concat(state_crc: u32, tables_crc: Option<u32>) -> u32 {
+    match tables_crc {
+        Some(t) => crc32fast::hash(format!("{state_crc}{t}").as_bytes()),
+        None => state_crc,
+    }
+}
+
 /// Resolve the FIRST occurrence of the top-level object key `key` in `meta_json`,
 /// matching aeson's default `json` parser (`value = jsonWith (pure . KM.fromList)`),
 /// whose haddock states it "keeps only the first occurrence of each key".
@@ -723,6 +803,32 @@ fn scientific_literal_to_word8_codec_version(literal: &str) -> Result<u64, Seria
 /// in range — all with integer arithmetic, so `1.0000000000000001` (which has 16
 /// fractional digits) is correctly seen as NON-integral and rejected.
 fn scientific_literal_as_word8(literal: &str) -> Option<u64> {
+    scientific_literal_as_bounded(literal, u8::MAX as u64)
+}
+
+/// Number of decimal digits in `n` (so `10^digits > n >= 10^(digits-1)`); used as the
+/// `dangerouslyBig` net-exponent threshold. `decimal_digit_count(255) == 3`,
+/// `decimal_digit_count(u32::MAX) == 10`.
+fn decimal_digit_count(n: u64) -> i64 {
+    let mut digits = 1i64;
+    let mut v = n;
+    while v >= 10 {
+        v /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+/// Pure, `f64`-free evaluation of `Scientific.toBoundedInteger` over a JSON number
+/// literal, bounded to `[0, max]`. Returns `Some(n)` iff the literal denotes an integer
+/// in `[0, max]`, exactly matching Aeson's `FromJSON` for the corresponding bounded
+/// integer type (`Word8` => `max = 255`, `Word32` => `max = u32::MAX`); `None` otherwise.
+fn scientific_literal_as_bounded(literal: &str, max: u64) -> Option<u64> {
+    // 10^danger_threshold > max, so any `net_exp >= danger_threshold` guarantees
+    // `coeff * 10^net_exp >= 10^net_exp > max` (coeff >= 1 after the zero short-circuit)
+    // and is rejected WITHOUT materialising the pow — the byte-exact `dangerouslyBig`
+    // short-circuit, generalised from the original Word8 `net_exp >= 3` (255 has 3 digits).
+    let danger_threshold = decimal_digit_count(max);
     let s = literal.trim();
     let (negative, rest) = match s.strip_prefix('-') {
         Some(r) => (true, r),
@@ -830,10 +936,10 @@ fn scientific_literal_as_word8(literal: &str) -> Option<u64> {
         // regardless of the exact coefficient: reject WITHOUT computing the pow.
         // This is the byte-exact `dangerouslyBig` short-circuit for Word8 — e.g.
         // `1e9` and `1e2000000000` return `None` in O(1) with no allocation.
-        if net_exp >= 3 {
+        if net_exp >= danger_threshold {
             return None;
         }
-        // net_exp in {0, 1, 2}: 10^net_exp <= 100, bounded.
+        // net_exp in [0, danger_threshold): 10^net_exp <= max, bounded.
         let pow = num_bigint::BigInt::from(10u8).pow(net_exp as u32);
         coeff * pow
     } else {
@@ -855,12 +961,12 @@ fn scientific_literal_as_word8(literal: &str) -> Option<u64> {
         q
     };
     let value = if negative { -value } else { value };
-    // Word8 range check [0, 255].
+    // Range check [0, max].
     if value.is_negative() {
         return None;
     }
     let n = value.to_u64()?;
-    if n <= u8::MAX as u64 {
+    if n <= max {
         Some(n)
     } else {
         None
