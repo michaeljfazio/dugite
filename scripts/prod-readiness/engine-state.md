@@ -266,7 +266,23 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #20a (decode_varlen overflow hardening) state:DIAGNOSING attempts:0 — muscle wi8udn7a7 (BOUNDED) IN-FLIGHT; lock HELD (TTL 22m).
+- item: #20a (decode_varlen overflow hardening) state:FIXING attempts:0 — byte-exact fix applied + compiles; gauntlet bxk1ycwus IN-FLIGHT; lock HELD.
+  *** wake329-cont (ultracode): muscle wi8udn7a7 COMPLETED CLEANLY (164s, 8 tool uses — the tight anti-death source-reading
+  brief WORKED: no hang, no tree edits [git verified clean]). DELIVERED byte-exact mempack semantics: *** OVERFLOW: mempack
+  DOES reject — `unless (firstByte .&. mask == 0b_1000_0000) Fail` where firstByte = the most-significant byte (first byte
+  with continuation bit set) and mask=0b_1111_1110 for Word64. On the 10-byte form, the MS byte's payload bits land at
+  result bits 63..69; only bit 0 (→bit63) fits, bits 1..6 (→bits 64..69) overflow → mask requires bit7=1 + bits6..1=0.
+  u64::MAX (MS byte 0x81) passes; larger fails. Guard fires ONLY on the 10-byte path (shorter forms can't overflow u64).
+  *** NON-MINIMAL: mempack does NOT reject overlong/leading-zero sub-maximal encodings → MUST NOT add a minimality check
+  (would be STRICTER than Haskell → could refuse a valid snapshot). *** FIX APPLIED (hand, byte-exact): compact.rs
+  decode_varlen + const VARLEN_W64_MS_MASK=0b_1111_1110 — latch first_cont_byte (= mempack firstByte), on the terminal byte
+  if i+1==10 && (first_cont_byte & 0xFE)!=0x80 → Err. + 3 tests in mempack/tests.rs: varlen_max_u64_still_ok (boundary,
+  guards over-strictness), varlen_overflow_10byte_msbyte_rejected (MS 0x83/0xff → Err; fail-pre/pass-post — pre-fix returned
+  TRUNCATED Ok), varlen_non_minimal_submaximal_still_accepted (0x80 0x00 → Ok, guards over-strictness). cargo test --no-run
+  clean. Launched gauntlet bxk1ycwus (nextest -p dugite-serialization + clippy + fmt). *** ON COMPLETION (this wake): if
+  green → COMMIT focused 1-crate fix (compact.rs + tests.rs) + push → #20a DONE; #20 then has only (b) definite-map left.
+  Lock held across async (TTL 22m). Haskell ref: lehins/mempack Data.MemPack unpack7BitVarLen/Last (verbatim in muscle
+  output wi8udn7a7).
   *** wake329 (ultracode): SCHEDULE #20a (highest-impact #20 sub-item, ~10 decode sites). PREP: read decode_varlen
   (compact.rs:50-67) — loops ≤10 bytes, `acc=(acc<<7)|(byte&0x7f)`, terminates on `byte&0x80==0`, errors only on >10-bytes/
   empty. GAP: NO overflow check — 10 bytes carry 70 bits but u64=64, so the 10th byte\'s `acc<<7` silently DROPS high bits
