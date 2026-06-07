@@ -1318,6 +1318,9 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake188 2026-06-07: POLL #10 FIX muscle wb28q1upc (F1 dup-key + F2 native-indef-array) — still RUNNING, ACTIVE
+  (worktree present, bridge applied, build/test). No transition. Disk 179G, no nodes. #10 stays FIXING. NEXT WAKE:
+  poll/process -> build -> re-import -> re-gauntlet.
 - wake187 2026-06-07: #10 4th-gauntlet wvfzy4jta REFUTED 3/3 (new edges) -> FIXING. F1 dup-key (aeson first-wins vs
   serde_json last-wins in parse_tables_codec_version, compile-verified, adversarial); F2 read_native_script rejects
   indefinite outer array but Haskell/nested accept it -> aborts real fast-start (HIGH); F3 CompactAddr-not-verbatim
