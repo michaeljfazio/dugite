@@ -194,8 +194,16 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-RESOAK (round-5 FINAL: R1+R3).
-  *** wake197: FINAL fix muscle wiujlmyn2 green (tier A, 1 crate dugite-serialization mempack/mod.rs+tests). R1
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:GAUNTLET-PENDING (6th round, R1+R3 final).
+  *** wake198: verify10B5 byte-identical import (0 phase-1, 0 NotFullyConsumed, 0 truncation-err); node mid-window
+  (tip 125004549, still syncing toward 125105013 — wakes quick). R1+R3 can't regress phase-1 (parse-only + malformed-
+  only) so launched 6th RE-GAUNTLET w7i0t8l28 (run wf_3579ddd3-3c2, refuterN=3) IN PARALLEL with the window sync.
+  Gauntlet item scopes #15/#17/#19 OUT + requires the refutation be reachable from a real/malformed snapshot.
+  NEXT WAKE per HARD POLICY: on PASS -> COMMIT #10 via gh/HTTPS (2 crates) -> formally file #17/#19 + activate #15;
+  on adversarial-only REFUTE -> COMMIT #10 core anyway + open 'snapshot-import adversarial-hardening' tracking item
+  (NO 7th cycle — core exhaustively confirmed byte-exact round-5 + stable across 6 replays). Also confirm verify10B5
+  0-phase-1 PAST window before commit (currently mid-window, 0 so far).
+  was: state:VERIFYING-RESOAK (round-5 FINAL: R1+R3). *** wake197: FINAL fix muscle wiujlmyn2 green (tier A, 1 crate dugite-serialization mempack/mod.rs+tests). R1
   COMPLETE: new top_level_number_literal() structure-scoped walk (skip_json_value/parse_json_string_at, top-level
   object only = aeson KM.lookup) drives the codec-version VALUE; removed the dead extract_raw_number_literal flat
   scan -> gate and value now AGREE (nested tablesCodecVersion ignored, matching aeson .: top-level-only). R3: tvar_
@@ -1375,6 +1383,9 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
+- wake198 2026-06-07: #10 VERIFYING-RESOAK -> GAUNTLET-PENDING. verify10B5 byte-identical (0 phase-1 so far, mid-
+  window). Launched 6th RE-GAUNTLET w7i0t8l28 (wf_3579ddd3-3c2), #15/#17/#19 scoped out, parallel to window sync.
+  NEXT WAKE per HARD POLICY: PASS -> COMMIT #10; adversarial-only REFUTE -> COMMIT core + hardening tracking item.
 - wake197 2026-06-07: #10 FIXING -> VERIFYING-BUILDING -> VERIFYING-RESOAK. FINAL fix wiujlmyn2 green (R1 top_level_
   number_literal structural value [aeson .: top-level only]; R3 indefinite-map EOF-no-break => Err). Copied to main,
   BUILD_EXIT=0, serialization nextest GREEN 1140, verify10B5 byte-identical (4116338, codec=1 Big, 0 phase-1, 0
