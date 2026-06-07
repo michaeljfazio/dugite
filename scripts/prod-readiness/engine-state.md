@@ -212,7 +212,24 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #20c DONE (committed c974d12169). NEXT WAKE: SCHEDULE picks the next item — see recommendation below.
+- item: #6 (fork-robustness apply_utxo_diff) state:ANALYZING attempts:0 — muscle w2x5j3223 IN-FLIGHT; wake-lock HELD (TTL 22m). #20c DONE (c974d12169).
+  *** wake315 (ultracode): SCHEDULE→DRIVE. ASSESS ruled the in-flight #10 (VERIFYING-PENDING) effectively BLOCKED: its
+  fast-start repro db (db-clones/preprod-soak) AND worktree wf_41bd7059-365-1 are GONE, and launch-replay.sh forces a
+  FROM-GENESIS replay which structurally CANNOT reproduce #10's mithril-fast-start script_ref=None bug (genesis replay
+  rebuilds all script_refs from blocks). The fix survives as candidate-fix-10-COMPLETE-refscript-datum.patch; #10 needs
+  a reconstructed fast-start LIVE-soak (heavy, multi-wake) — deferred, not abandoned. Per the runbook "advance in-flight
+  if NOT BLOCKED," moved to the highest-impact UNBLOCKED item: #6 [H][ledger] fork-robustness (apply_utxo_diff doesn't
+  replay stake_map/ptr_stake on rollback → fork-induced stake corruption; clean LINEAR replay is byte-exact so it's
+  rollback-only). #6 has a candidate patch (candidate-latent-fix-apply_utxo_diff.patch, 8598B) but was blocked on HOW to
+  verify ("via a fork-exercising scenario" — undefined). DRIVE: launched the muscle analyze (Workflow w2x5j3223, run
+  wf_7f54c195-d52, 2 opus agents Research→RootCause) to (1) confirm the stake_map/ptr_stake omission on the add+spend
+  legs vs Haskell incremental instant-stake semantics, (2) validate the candidate patch restores full symmetry, (3)
+  DESIGN a deterministic verification — prefer a Rust property test asserting apply_utxo_diff == apply_utxo_changes on
+  stake_map+ptr_stake for the same logical UTxO set (no heavy fork replay; the forward path IS the reference), else a
+  precise fork-exercising replay recipe. NEXT (this wake, on muscle completion via auto-notify): RECORD the root-cause +
+  verification design → advance #6 ANALYZING→ROOT-CAUSED, commit engine-state, RELEASE the wake-lock. Lock held across
+  the async muscle is intentional (overlapping cron wakes skip on busy; 22m TTL prevents any wedge). Disk 189GB free;
+  no node running. db-clones cruft (12× preprod-verify10*/15* @18G, mainnet-rupd-drop @47G) prunable opportunistically.
   *** wake314 (ultracode): #20c FIXING→VERIFYING→DONE (one step: ran the tier-appropriate gauntlet + committed on pass).
   For a TEST-ONLY code-consistency item there is NO replay/Koios reference, so per the runbook the test suite IS the
   gauntlet ("commit + push only if the gauntlet passes"). Ran it on the uncommitted epoch.rs reorder: `cargo nextest run
