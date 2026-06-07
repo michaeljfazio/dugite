@@ -1525,6 +1525,10 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
+- wake226 2026-06-07: POLL #0 LOCALIZE-THEN-FIX muscle wxbflru4x (apply_utxo_changes invariant-test-first) — still
+  RUNNING, ACTIVE (worktree present, common.rs; deep ledger code analysis + symmetric-routing invariant test). No
+  transition. Disk 166G, no nodes. #0 stays FIXING. NEXT WAKE: poll/process — invariant fails+fixed OR 'no asymmetry'
+  report.
 - wake225 2026-06-07: #0 ANALYZE wuqv1kgo9 COMPLETE -> ROOT-CAUSE REVISED -> FIXING. Member-reward fold REFUTED
   (aggregate byte-exact); REAL cause = apply_utxo_changes ADD/SPEND ASYMMETRY (common.rs spend 202-208/334-340 vs add
   263) corrupting per-cred stake (net-zero aggregate) -> floored under-distribution -> +82.27M reserves. UNIFIES #0/
