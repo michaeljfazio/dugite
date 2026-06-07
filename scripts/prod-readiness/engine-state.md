@@ -1442,6 +1442,9 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
+- wake212 2026-06-07: POLL #15 GAUNTLET w4a16gr1r — still RUNNING (0/3 votes, active). No transition. Disk 169G, no
+  nodes. #15 stays GAUNTLET-PENDING (byte-exact gate already passed: 306->0 full window). NEXT WAKE: on PASS -> commit
+  #15 (dugite-uplc, 1 crate).
 - wake211 2026-06-07: #15 V3-extension fix w19kofqwx -> built -> REPLAY DECISIVE PASS. verify15v3: 0 'Error term'
   across FULL ep293 window (was 306), 27751ab9 fixed, 0 phase-1, uplc nextest 439 green. The serialiseData verbatim-
   bytes fix WORKS (V3 SpendingScriptInfo datum memoised per getBabbageSpendingDatum). VERIFYING-RESOAK -> GAUNTLET-
