@@ -209,7 +209,16 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:ROOT-CAUSING (polled wake282 — globals build pid 32254 compiling final crate dugite-node; replay next wake). data-driven re-localize via DUGITE_RUPD_GLOBALS.
+- item: #0 (mainnet ep246 reserves) state:GLOBALS-REPLAY-RUNNING (build OK + strings-verified; replay pid 32932 launched wake283).
+  Build OK (release 1m39s, binary 18:00), strings RUPD_GLOBALS=2 VERIFIED in binary. Launched globals replay job
+  mainnet-globals pid 32932 (DUGITE_RUPD_GLOBALS=1, dumps->mainnet-globals) over CoW clone db-clones/mainnet-rupd-drop.
+  ~4min to ep246. RUPD_GLOBALS eprintln per boundary -> scripts/prod-readiness/.jobs/mainnet-globals.log. NEXT WAKE:
+  `grep 'RUPD_GLOBALS reserves=12905245994461083' .jobs/mainnet-globals.log` = the ep246 boundary -> read expansion
+  (deltaR1), reward_pot, total_rewards_available, treasury_cut, total_stake, total_active_stake, actual_blocks, d.
+  Compare to Koios-EXACT: deltaR1 should = floor(eta*rho*reserves) with eta=poolBlocks/floor((1-d)*asc*432000),
+  rho=3/1000, reserves=12,905,245,994,461,083, d=0.26 (or 0.28 — check which dugite uses); reward_pot=floor((deltaR1+
+  fees)*(1-tau)). total_stake should=max_supply(45e15)-reserves. The global ~5 ppm low = the bug; if ALL globals
+  byte-exact -> the ~5 ppm is per-pool (maxPool/poolReward) -> instrument per-pool. SIGTERM-only to stop.
   *** wake281 (ultracode): cheap data-driven narrowing (NO replay). (1) dump go.total_active_stake =
   22,086,904,770,458,818 == Koios ep245 active_stake BYTE-EXACT -> the sigmaA denominator is correct -> total_active_stake
   RULED OUT (consistent w/ the filter being a no-op). (2) Per user guidance (don't assume), Koios mainnet epoch_params:
@@ -3059,3 +3068,7 @@
   DUGITE_RUPD_GLOBALS: reserves/epoch_fees/actual_blocks/expansion(deltaR1)/reward_pot/total_stake/total_active_stake/d).
   build pid 32254. next wake: strings-verify -> replay -> grep RUPD_GLOBALS reserves=12905245994461083 -> compare
   deltaR1/reward_pot/total_stake to Koios-exact; if globals exact -> per-pool maxPool. Instrumentation uncommitted.
+- wake283 (ultracode): globals build OK (release 1m39s, strings RUPD_GLOBALS=2 VERIFIED). Launched globals replay job
+  mainnet-globals pid 32932 (DUGITE_RUPD_GLOBALS=1) over CoW clone. next wake: grep 'RUPD_GLOBALS reserves=
+  12905245994461083' -> compare deltaR1(expansion)/reward_pot/total_stake/total_active_stake to Koios-exact (rho=3/1000,
+  reserves=12905245994461083, d=0.26, tau=0.2, max_supply=45e15) -> global ~5ppm low = bug; if all exact -> per-pool maxPool.
