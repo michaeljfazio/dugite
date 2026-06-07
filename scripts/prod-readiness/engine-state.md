@@ -180,8 +180,13 @@
    ONLY for machine-constructed Data. Thread original bytes through: plutus-data CBOR decode -> Constant::Data ->
    builtin SerialiseData. VERIFY: replay ep293 window (slots 125001020+), confirm 306 -> ~0; then gauntlet. Haskell
    ref: Cardano.Ledger.Plutus.Data BinaryData/hashBinaryData (hashAnnotated over memoised SBS) + Plutus
-   builtinSerialiseData returning the original bytes. state:ROOT-CAUSED-CONFIRMED attempts:0 (ACTIVATE after #10
-   phase-1 lands). --- wake163 re-frame (now fully confirmed): ---
+   builtinSerialiseData returning the original bytes. *** DONE/REFUTED wake322 (82cf25bfef): the memo-bytes premise is
+   STALE/WRONG — Haskell serialiseData IS a structural canonical re-encode (non-empty Constr/List args = indefinite
+   0x9f..0xff via cborg defaultEncodeList) and dugite ALREADY matches byte-for-byte. PROVEN: gold test blake2b256(
+   serialiseData(real 276B preprod datum)) == on-chain datum_hash bbd352… on MAIN (nextest 441/441) + Koios-confirmed the
+   hash is real on-chain (indefinite bytes d87a9f…). serialiseData was NEVER the cause of the 306 divergences (stale wake165
+   capture). Added byte-exact regression tests (incl. a guard vs the wrong memo-fix). state:DONE attempts:1 (REFUTED)
+   --- wake163 re-frame (NOW REFUTED — see DONE above): ---
    *** wake163 RE-DIAGNOSIS OVERTURNS the
    old framing below: classification muscle wpeec891q found a FULLY-INDEPENDENT PURELY-POST-SNAPSHOT failing tx
    27751ab9 (slot 125001020, PlutusV3 5b2bfe89; only input 3d7bb051 @slot124999282 > cutoff 124999169 = NEVER
@@ -228,7 +233,30 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #15 (serialiseData) state:VERIFYING attempts:1 — Koios CONFIRMED real datum_hash (indefinite arrays); gauntlet b16jy1j76 IN-FLIGHT; lock HELD (TTL 22m).
+- item: #15 DONE/REFUTED (committed+pushed 82cf25bfef). NEXT WAKE: SCHEDULE picks the next item — see recommendation.
+  *** wake322-cont (ultracode): #15 VERIFYING→DONE — muscle refutation INDEPENDENTLY CONFIRMED (premise was STALE; dugite
+  serialiseData is ALREADY byte-exact). Gauntlet b16jy1j76 on MAIN: nextest -p dugite-uplc 441/441 GREEN — the GOLD test
+  serialise_data_gold_preprod_datum_hash_matches_onchain PASSES (blake2b256(serialiseData(real 276-byte datum)) == on-chain
+  datum_hash bbd352…, ON MAIN) + definite_input_is_reencoded_to_indefinite_not_memoised (the guard that FAILS if anyone
+  implements the wrong verbatim-memo fix) + the other 4 #15 tests; NO conformance regression. clippy -D warnings + fmt
+  clean. Combined with the wake322 KOIOS confirmation (bbd352… IS a real on-chain preprod datum_hash with indefinite-array
+  bytes d87a9f…) and blake2b collision-resistance → dugite's serialiseData reproduces the real on-chain datum_hash
+  byte-exactly → #15's 306-divergence premise is REFUTED (stale capture; serialiseData was never the cause; the memo-fix
+  would have INTRODUCED divergence). COMMITTED additive tests+docs 82cf25bfef (dugite-uplc data.rs + denotations.rs ONLY —
+  common.rs #730 left uncommitted) + PUSHED (28bcd277e6..82cf25bfef, HTTPS). This is a confirmed ADVERSARIAL SAVE (the
+  engine's "independently verify refutations" discipline prevented a wrong fix + locked in correctness).
+  *** OPEN QUESTION (follow-up, NOT this item): the original 306 phase-2 "script returned Error term" divergences — are
+  they still present at HEAD, and if so what is the REAL cause (NOT serialiseData)? They need a FRESH HEAD ep293 capture
+  (per memory: regenerate dumps with HEAD before chasing residuals; the wake165 capture was stale). They may already be
+  resolved by other landed fixes. *** NEXT WAKE — SCHEDULE (one-step). #10 still BLOCKED. Candidates: (1) RE-CAPTURE the
+  306 phase-2 divergences at HEAD (clone db-preprod-sync, replay ep293 window slots 125001020+ with DUGITE_PHASE2_DUMP_DIR,
+  count "script returned Error term") — if 0 → close the whole 306-class; if >0 → diagnose the REAL cause. Heavy out-of-band
+  replay but potentially closes a real phase-2 conformance question. (2) #20 [M] snapshot-import adversarial-hardening
+  (defense-in-depth; crc32 is non-cryptographic so a CRC-preserving tamper could still exploit lenient decoders — #17
+  backstops but doesn't fully subsume). (3) #7 [M] re-derive the Dijkstra SUBUTXO patch (normal-diff format) as a proper
+  refactor. (4) #16 [L]. RECOMMEND (1) the 306 re-capture (settles whether a real phase-2 gap remains now that serialiseData
+  is ruled out — highest information value) OR #20 (concrete, completable). Housekeeping: prune db-clones cruft; /tmp/g15_*.log
+  + the muscle worktree wf_fd1b09da-e5c-1 removable.
   *** wake322 (ultracode): #15 VERIFYING-PENDING→VERIFYING (independent verification of the muscle's refutation). Applied
   candidate-fix-15-serialisedata-tests.patch to main (data.rs + denotations.rs, additive tests+docs). *** KOIOS INDEPENDENT
   CONFIRMATION (koios.sh preprod datum_info): bbd352028feffe9a80a2822b46b9858bc1cf883cff383e1191b47d27ed708eb0 IS a REAL
@@ -2300,6 +2328,16 @@
 - db-clones/preprod-ep57-fixed   (fixed-binary replay, in progress)
 
 ## Gauntlet ledger  (passed/refuted approaches — never silently retry a REFUTED)
+- REFUTED 2026-06-07 (wake322, #15, fix-muscle wf4hgn0hk SELF-REFUTED + independently confirmed): "make Data memoise its
+  verbatim on-chain CBOR bytes and have serialiseData return them unchanged (MemoBytes-style)". WRONG — Haskell
+  serialiseData = BSL.toStrict . serialise is a STRUCTURAL canonical re-encode (non-empty Constr/List args = INDEFINITE
+  0x9f..0xff via cborg defaultEncodeList; empty = definite 0x80); a verbatim memo would DIVERGE on any definite-length
+  input. dugite's encode_data/encode_list ALREADY matches byte-for-byte. PROVEN byte-exact: blake2b256(serialiseData(real
+  276B preprod datum)) == on-chain datum_hash bbd352028feffe9a… on MAIN (nextest 441/441) + Koios-confirmed real on-chain
+  hash (indefinite bytes d87a9f…). The wake165 "270-byte canonical definite re-encode" claim was a STALE pre-encode_list-
+  indef capture. DO NOT implement verbatim-memo serialiseData. The 306 phase-2 divergences are NOT in serialiseData —
+  re-capture at HEAD to find the real cause (if any remain). Locked in by 6 regression tests (82cf25bfef) incl. a guard
+  (definite_input_is_reencoded_to_indefinite_not_memoised) that FAILS if the memo-fix is ever attempted.
 - PASSED 2026-06-07 (wake320, #17): "verify snapshot CRC = crcOfConcat(crc(state), crc(tables)) at Haskell-ledger import;
   bail on mismatch". Gauntlet for this security/code-invariant = the byte-exact crcOfConcat reproducing REAL cardano-node
   snapshot checksums (no Koios). snapshot_crc_of_concat_matches_real_preprod_fixtures reproduces 2409556997 (fixture
@@ -2352,6 +2390,8 @@
 - 2026-06-07T15:xxZ wake318(+cont) ~ SCHEDULE pivot #7→#17 + muscle analyze w2ez2r1lk (2 opus, byte-exact crcOfConcat vs real fixtures) → #17 ROOT-CAUSED
 - 2026-06-07T15:xxZ wake319 ~ #17 FIXING (hand-apply 2-crate CRC fix + 6 tests + bounded-parser refactor; both crates compile)
 - 2026-06-07T16:xxZ wake320(+cont) ~ #17 VERIFYING→DONE (gauntlet 1146/1146 ser + 955/955 node + clippy + fmt) + commit/push 28bcd277e6
+- 2026-06-07T17:xxZ wake321(+cont) ~ SCHEDULE #15 + muscle fix wf4hgn0hk (OVERTURNED premise) → VERIFYING-PENDING + patch saved
+- 2026-06-07T17:xxZ wake322(+cont) ~ #15 VERIFYING→DONE/REFUTED (Koios + gold test on main 441/441) + commit/push 82cf25bfef
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -3864,3 +3904,9 @@
   byte-exact-vs-real-fixture proof + corruption detection) + 955/955 (node) + clippy + fmt (auto-fixed one assert wrap).
   Committed+pushed focused fix 28bcd277e6. Closes the silent-accept-of-corrupt-snapshot adversarial surface (#17). NEXT:
   SCHEDULE #20 (snapshot hardening, continues momentum) or #15 (serialiseData, M->H phase-2).
+- wake321(+322) 2026-06-07: #15 ROOT-CAUSED→FIXING→VERIFYING→DONE/REFUTED. Muscle fix wf4hgn0hk OVERTURNED the premise
+  (serialiseData IS structural canonical re-encode; dugite already byte-exact). Independently confirmed: Koios verified
+  bbd352… is a real on-chain preprod datum_hash (indefinite bytes d87a9f…); gold test blake2b(serialiseData(real 276B
+  datum))==bbd352… PASSES on MAIN (nextest 441/441) + clippy + fmt. Committed+pushed additive tests+docs 82cf25bfef
+  (locks in byte-exactness + a guard vs the wrong memo-fix). Confirmed adversarial SAVE — prevented a divergence-introducing
+  fix. 306 phase-2 divergences NOT in serialiseData; need fresh HEAD ep293 capture. NEXT: 306 re-capture or #20 hardening.
