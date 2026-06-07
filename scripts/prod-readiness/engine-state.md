@@ -209,7 +209,16 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:RECONCILING (polled wake271 17:08 — workflow w8ufsxjg3 ~5/9 agents done, remaining reconcile agents + synthesize finishing (heavy Koios load, 160-182KB); paid set CAPTURED + aligned wake268).
+- item: #0 (mainnet ep246 reserves) state:RECONCILING (polled wake272; ERA/PATH VERIFIED per user guidance).
+  *** wake272: USER GUIDANCE — verify era-specific code path, don't assume from prior knowledge; check node's reported
+  era or Koios. DONE: (1) node's OWN dump epoch_000246.json reports era=ALLEGRA protocol_version=3.0 (NOT assumed).
+  (2) ACTUAL code dispatch eras/mod.rs:191: `Era::Shelley | Era::Allegra | Era::Mary => Self::Shelley(ShelleyRules)`
+  -> the era enum maps Allegra to ShelleyRules; process_epoch_transition dispatch (eras/mod.rs:271-291) routes
+  Self::Shelley(r) -> r.process_epoch_transition = crates/dugite-ledger/src/eras/shelley.rs:258. So the LIVE applyRUpd
+  for ep246 IS shelley.rs (VERIFIED end-to-end: node-era=allegra -> code-dispatch -> shelley.rs), confirming the
+  wake265 relocation + where the #0 fix must land. LESSON (recorded): verify era via the node's reported era (dump
+  'era' field) AND the actual eras/mod.rs dispatch — never assume the era/path from HF-boundary prior knowledge.
+  Reconcile workflow w8ufsxjg3 still running (poll); read its verdict next wake. paid set CAPTURED + aligned wake268.
   *** wake268 (ultracode): CAPTURED dugite's full computed reward set epoch-dumps-engine/rupd_paid_246.txt
   (header: epoch=246 paid_count=141596 delta_reserves=24,297,047,052,834 delta_treasury=7,722,113,828,619; then
   <cred_hex> <amount> x141596). KEY RESOLUTION — this is the shelley.rs step-2 rupd COMPUTED+applied at ep246, and it
@@ -2918,3 +2927,8 @@
   MISSING PAYEES (but top creds are 0xf1 script accts). SIGTERM'd replay (CoW clone kept). Launched reconciliation
   workflow w8ufsxjg3 (8 agents, both header bytes + aggregation, vs koios earned_epoch-244 -> amount-deltas vs
   missing-payees). next wake: read verdict -> enumerate omitted creds (per-pool) -> fix in shelley.rs/compute_reward_update.
+- wake272: USER GUIDANCE — verify era-specific code path, don't assume. VERIFIED ep246: node dump era=ALLEGRA PV3.0;
+  code dispatch eras/mod.rs:191 maps Era::Shelley|Allegra|Mary -> Self::Shelley(ShelleyRules) -> shelley.rs:258. So
+  the live applyRUpd for ep246 IS shelley.rs (verified end-to-end, not assumed). LESSON: check the node's reported
+  'era' field + the actual eras/mod.rs dispatch; never infer era/path from HF-boundary prior knowledge. Reconcile
+  workflow w8ufsxjg3 still running.
