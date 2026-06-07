@@ -1538,6 +1538,9 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
+- wake228 2026-06-07: POLL #0 ROUND-2 muscle wr9tddl4q (rebuild==incremental invariant) — still RUNNING, ACTIVE
+  (worktree present, state/mod.rs; deep ledger code analysis + invariant test). No transition. Disk 166G, no nodes.
+  #0 stays DIAGNOSING. NEXT WAKE: poll/process — invariant fails+fixed OR escalate to instrumented mainnet replay.
 - wake227 2026-06-07: #0 ROUND-1 wxbflru4x: apply_utxo_changes SYMMETRIC (5 invariant tests PASS, no fix; tests kept
   on main). Narrowed to rebuild_stake_distribution / genesis-load / pointer-address (NOT dereg-prune — certs.rs:206
   keeps the entry). Launched ROUND-2 wr9tddl4q (rebuild==incremental per-cred invariant, dugite-ledger state/* only).
