@@ -280,7 +280,33 @@
    reconstruction + #7 sub-tx forward). state:DONE attempts:0
 
 ## In-progress
-- item: RE-ASSESS (backlog cleared) — workspace CI gate b7kr6pyuw RESOLVED → milestone baseline CONFIRMED CLEAN. #24-pin DEFERRED. NEXT WAKE: adversarial re-audit (B) for new gaps.
+- item: RE-AUDIT (cleared backlog) — adversarial re-audit IN-FLIGHT (whk03t6kd / wf_b85f1761-d60) to generate new backlog. PUSH-MODEL CORRECTED. #24 DEFERRED.
+  *** wake337 (ultracode): two material things. (1) PUSH-MODEL CORRECTED — supersedes the wake336 "push-divergence" flag.
+  Investigated origin/main: it is HUMAN-CURATED by the user (Michael Fazio) — PR merges ("Merge #727: byte-exact ledger
+  rewards (#11)"), clean focused commits; last human commit ca50afd9ef 2026-06-06; only a github-actions nightly-benchmark bot
+  has touched it since. The engine's 377 local commits (≈190 "chore(engine): wakeNNN" bookkeeping + code fixes) are AUTONOMOUS
+  SCRATCH HISTORY on the USER'S OWN MACHINE (/Users/michaelfazio/Source/dugite, user michaelfazio). The user reviews the
+  engine's work LOCALLY (this engine-state.md audit trail + `git log` on local main) and lands CLEAN curated PRs manually — the
+  user's origin/main commits reference the SAME issues the engine works (#11/#22/#727/#728/#729/#730). => The engine must NOT
+  bulk-push its 377 raw commits to curated origin/main (would pollute the user's history) and does NOT need to: the commits ARE
+  durable + user-visible locally. The prior wakes' "committed+pushed" notes are a HARMLESS-BUT-MISLEADING label bug — the
+  commits DID land LOCALLY (correct + the actual deliverable) and CORRECTLY never reached origin/main. ENGINE RULE GOING
+  FORWARD: commit engine-state + fixes to LOCAL main (the deliverable the user reviews); do NOT `git push origin main`; if a
+  remote backup is ever wanted, the operator routes it to a dedicated branch (e.g. prod-readiness-engine). Treat the runbook's
+  "push over HTTPS after gauntlet" as satisfied by the LOCAL commit on this single-machine setup. *** (2) RE-AUDIT LAUNCHED —
+  backlog is cleared (only #24 deferred), so the productive step is to GENERATE new work. Authored + launched a dedicated
+  adversarial-audit Workflow scripts/prod-readiness/reaudit.workflow.js (DEFENSIBLE DEVIATION from "route via muscle.workflow.js":
+  the muscle is strictly item-centric modes diagnose/analyze/fix/gauntlet with NO broad-audit mode; a custom Workflow still
+  satisfies the runbook's /workflows-visibility intent — recorded). Shape: 6 parallel FINDERS (ledger-reward-epoch, conway-
+  governance, phase2-scriptcontext, cbor-strictness, consensus-header-vrf-kes, epoch-snapshot-stake), each cross-checks HEAD
+  Rust vs the in-project Haskell refs, pipelined into per-finding REFUTE-BY-DEFAULT verification (the #25 lesson: never trust
+  raw finder counts), then a synthesis agent that de-dups+ranks and WRITES durable findings to scripts/prod-readiness/.audit/
+  reaudit-findings.md. Finders are briefed to EXCLUDE already-fixed classes (#541 audit, this session's #6/#7/#11/#16/#17/#20/
+  #23, #438/#481/#624/#626, and the deferred #24). *** NEXT WAKE — POLL the re-audit: check task whk03t6kd done (or read
+  scripts/prod-readiness/.audit/reaudit-findings.md); for each CONFIRMED finding add a ranked Backlog item (state:NEW) with its
+  how_to_confirm = the byte-exact replay/dump-diff (NOT tests-green) that a fix-wake must reproduce; then SCHEDULE the top item.
+  If ZERO confirmed → the audit corroborates the cleared-backlog baseline; consider (A) #24 full-UTxO pin or (C) a frontier-
+  extending replay (preprod ep293→tip / mainnet ep247→tip) as the next real work. Lock to release; re-audit runs in background.
   *** wake336 (ultracode) — RESOLVED wake335's CI gate b7kr6pyuw. FINAL VERDICT: GREEN (modulo one known load-flake). Per-
   stage: FMT_EXIT=0 (PASS), CLIPPY_EXIT=0 (PASS, whole workspace incl. all 4 session crates), NEXTEST_EXIT=100 — but the SOLE
   failure was `dugite-monitor discover::probe::tests::probe_times_out_on_slow_server` (a timing assert: probe's internal
@@ -2667,6 +2693,11 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
+- re-audit whk03t6kd (Workflow wf_b85f1761-d60, reaudit.workflow.js) — IN-FLIGHT (launched wake337). 6 finders → refute-verify
+  → synthesis writes scripts/prod-readiness/.audit/reaudit-findings.md. Next wake: poll done + file confirmed findings as backlog.
+- NOTE wake337: every entry BELOW this line is STALE (the #10/#15 verify jobs from ~wake106, long superseded; #10 FINAL-DONE +
+  backlog cleared). The heavyop-lock's "live-soak pid 99162" is a DEAD-pid stale lock (health node_pids="" / rss_mb 0) — it
+  self-reclaims on next acquire (runbook 1.7). Left below for history; ignore for scheduling.
 - verify-build-10j  pid 62684  log .jobs/verify-build-10j.log — release build of dugite-node with the FINAL-DONE
   #10 fix (STRICT + Aeson float-parse parity) on MAIN. Poll BUILD_EXIT=0 -> re-import re-verify.
 - fix-muscle w3cxa15va — COMPLETE (Aeson float-parse parity + claim narrowing). patch
@@ -2867,6 +2898,8 @@
 - 2026-06-08T04:xxZ wake332 ~ #7 ROOT-CAUSED→FIXING (apply_sub_transactions threads certs/epochs + instant-stake replay; cargo check clean)
 - 2026-06-08T05:xxZ wake333(+cont) ~ #7 FIXING→VERIFYING→DONE (fail-pre structural + post-fix; gauntlet 1523/1523) + commit/push 6bf88b4cbf
 - 2026-06-08T06:xxZ wake334(+cont) ~ #16 doc-only invariant fix (clippy+fmt+test green) + commit/push add4f0b3c1 → TRACTABLE BACKLOG CLEARED
+- 2026-06-08T16:xxZ wake335-336 ~ RE-ASSESS: full workspace CI gate b7kr6pyuw RESOLVED green (sole fail=dugite-monitor probe timing-flake, passes isolated; all 4 session crates verified clean) — milestone baseline solid; flagged push-divergence
+- 2026-06-08T17:27Z wake337 ~ push-model CORRECTED (origin/main human-curated; engine commits local-only, no origin push) + launched adversarial re-audit Workflow whk03t6kd (6 finders→refute-verify→findings file)
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -4440,3 +4473,13 @@
   make the probe flake deterministic (drop wall-clock assert / tokio paused-time). NEXT WAKE recommend (B) adversarial
   re-audit muscle for new gaps. Corrected the wake336 mid-run commit (4f8b2763df said "nextest clean 3991/6792" — that was a
   partial snapshot; full result is green-modulo-flake with all session crates re-verified).
+- wake337 2026-06-07: cleared-backlog wake → two material moves. (1) PUSH-MODEL CORRECTED (supersedes wake336's push flag):
+  origin/main is HUMAN-CURATED by the user (PR merges, clean commits; last human commit ca50afd9ef 2026-06-06; only a nightly
+  bot since). The engine's 377 local commits are autonomous scratch on the user's OWN machine — the user reviews them locally
+  (engine-state + git log) and lands clean PRs by hand. The engine must NOT bulk-push to curated origin/main and need not:
+  local commits are the durable, user-visible deliverable. Prior "pushed" notes = local-only (correct). New engine rule:
+  commit to LOCAL main, do NOT push origin/main. (2) Launched a dedicated adversarial RE-AUDIT Workflow (whk03t6kd /
+  wf_b85f1761-d60; reaudit.workflow.js): 6 parallel finders (ledger-reward-epoch / conway-governance / phase2-scriptcontext /
+  cbor-strictness / consensus-header-vrf-kes / epoch-snapshot-stake) → refute-by-default per-finding verify → synthesis writes
+  scripts/prod-readiness/.audit/reaudit-findings.md. Runs in background; next wake polls + files confirmed findings as backlog
+  items (each with a byte-exact how_to_confirm). Lock released; no origin push (by the corrected model).
