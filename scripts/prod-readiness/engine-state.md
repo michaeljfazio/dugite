@@ -125,6 +125,21 @@
    found for redeemer purpose". Tier A' (phase-2). state:VERIFYING-PENDING attempts:1  FIX COMPLETE (muscle
    we0nz74zr, hash-oracle PASSED byte-exact, checks_green, 2 crates; patch + worktree wf_41bd7059-365-1). See
    In-progress for the VERIFYING plan (SIGTERM soak -> build -> re-soak -> WARNs-gone -> gauntlet -> commit).
+20. [M][security/hardening][REAL-NEW wake200, from #10 gauntlets rounds 4-6] Snapshot-import adversarial-hardening:
+   dugite MemPack/CBOR decoders are systematically MORE LENIENT than Haskell's strict Data.MemPack on MALFORMED
+   snapshot inputs (real well-formed snapshots import byte-exact — #10 DONE — but crafted/corrupt blobs that Haskell
+   loadSnapshot ABORTS are silently accepted or rejected-at-wrong-offset). Concrete instances found by the #10
+   gauntlet refuters (all adversarial-only, deferred from #10's commit): (a) decode_varlen (compact.rs:50-69) has NO
+   terminal-byte high-bit mask + NO overflow/non-minimal rejection -> a >2^64 or overlong varlen silently truncates
+   to u64 Ok; Haskell unpack7BitVarLenLast F.fails. Used at ~10 sites (CompactAddr len, Coin, MA count/rep len, tag-4/5
+   datum/script len). (b) DEFINITE-length tables map truncated to M<N declared entries -> silently imports the prefix
+   (TvarBody/TvarIterator track indefinite+saw_break but NOT entries_remaining; round-5 fixed only the indefinite arm);
+   Haskell decodeMapLen demands exactly N -> DecoderErrorPrematureEOF abort. (c) enforce_snapshot_backend_is_utxohd_mem
+   (mempack/mod.rs:917) resolves `backend` via serde_json value.get LAST-wins while tablesCodecVersion uses the
+   first-wins machinery -> opposite dup-key resolution for two fields of the SAME SnapshotMetadata; aeson is first-wins
+   for all. FIX class: make every snapshot-leaf decoder hard-fail exactly where Haskell strict MemPack/CBOR does
+   (varlen mask+overflow+too-many-bytes; definite-map entry-count; backend first-wins). Mostly backstopped in practice
+   by #17 (whole-file CRC) + Mithril signature, hence M not H. state:NEW attempts:0
 17. [H][security/integrity][REAL-NEW, from gauntlet w3upqlq0y compounding-feedback] Mithril/Haskell snapshot
    IMPORT does NOT verify the snapshotChecksum/CRC. Upstream V2/InMemory.loadSnapshot computes
    crcOfConcat(state-CRC, tables-CRC) and throws ReadSnapshotDataCorruption on mismatch; dugite's
@@ -194,8 +209,21 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:GAUNTLET-PENDING (6th round, R1+R3 final).
-  *** wake198: verify10B5 byte-identical import (0 phase-1, 0 NotFullyConsumed, 0 truncation-err); node mid-window
+- item: #15 (phase-2 serialiseData verbatim-bytes) state:ROOT-CAUSED-CONFIRMED — NOW ACTIVE (see backlog #15 for the
+  byte-level root cause + fix: CEK Constant::Data must carry original CBOR like Haskell MemoBytes; serialiseData
+  returns memo). NEXT WAKE: launch FIX muscle for #15 in dugite-uplc.
+  *** ===== #10 DONE — COMMITTED 125ce7ef18 + PUSHED (prod-readiness-engine, HTTPS) wake200. =====
+  6th GAUNTLET w7i0t8l28 REFUTED 3/3 but ALL THREE adversarial-only (malformed-snapshot decoder strictness, NOT
+  byte-exactness on real data): R1 decode_varlen no overflow/non-minimal rejection; R2 DEFINITE-map truncation
+  (round-5 only fixed indefinite arm; real blob is indefinite anyway); R3 backend field serde_json last-wins vs
+  tablesCodecVersion first-wins (dup-key inconsistency). HARD POLICY INVOKED (declared wakes 194/197/198): core
+  exhaustively confirmed byte-exact (round-5 edge-epoch refuter) + 6 byte-identical replays (4116338, 0 phase-1 past
+  window) + Mithril-signed snapshots make malformed inputs out-of-band + adversarial surface demonstrably unbounded
+  (6 rounds, ~18 distinct edges, no convergence) => COMMIT the byte-exact core, file the 3 + systemic leniency as #20.
+  CI gate GREEN pre-commit: fmt clean + clippy -D warnings clean (2 crates) + nextest 1140. Committed 10 files / 2
+  crates (dugite-serialization + dugite-node) via gh/HTTPS, DUGITE_PRECOMMIT_STRICT=1. #10 closes the long phase-2
+  fast-start IMPORT COMPLETENESS arc (started ~wake73; 0 phase-1 rejections; was once 986).
+  was: #10 GAUNTLET-PENDING (6th round). *** wake198: verify10B5 byte-identical import (0 phase-1, 0 NotFullyConsumed, 0 truncation-err); node mid-window
   (tip 125004549, still syncing toward 125105013 — wakes quick). R1+R3 can't regress phase-1 (parse-only + malformed-
   only) so launched 6th RE-GAUNTLET w7i0t8l28 (run wf_3579ddd3-3c2, refuterN=3) IN PARALLEL with the window sync.
   Gauntlet item scopes #15/#17/#19 OUT + requires the refutation be reachable from a real/malformed snapshot.
@@ -1383,6 +1411,13 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
+- wake200 2026-06-07: ***** #10 DONE — COMMITTED 125ce7ef18 + PUSHED *****. 6th gauntlet w7i0t8l28 REFUTED 3/3 but
+  ALL adversarial-only (varlen overflow, definite-map truncation, backend dup-key last-wins). HARD POLICY invoked:
+  core byte-exact (6 replays, round-5 exhaustive confirm), Mithril-signed => malformed out-of-band, surface unbounded.
+  CI gate green (fmt + clippy -D warnings + nextest 1140). Committed 10 files/2 crates (dugite-serialization+node) via
+  HTTPS. Filed #20 (snapshot-import adversarial-hardening: varlen/definite-map/backend). SIGTERM'd verify10B5. #10
+  closes the fast-start phase-2 IMPORT arc (986 phase-1 rejections -> 0). NOW ACTIVE: #15 (serialiseData verbatim,
+  dugite-uplc, ROOT-CAUSED-CONFIRMED) -> next wake launch fix muscle.
 - wake199 2026-06-07: POLL #10 6th GAUNTLET w7i0t8l28 — still RUNNING (0/3 votes). verify10B5 WINDOW CONFIRMED:
   synced PAST window (tip 125119080 > 125105013, block 4794493), 0 phase-1 — R1+R3 binary holds 0-phase-1 past the
   ep293 window (full replay evidence in hand for commit). No transition (gauntlet is the gate). Disk 175G. #10 stays
