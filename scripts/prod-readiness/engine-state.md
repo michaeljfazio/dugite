@@ -209,7 +209,26 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:ROOT-CAUSING (FIX REFUTED by re-replay #438-save; re-localize the ~4.92ppm).
+- item: #0 (mainnet ep246 reserves) state:ROOT-CAUSING (globals instrumentation building pid 32254; data-driven re-localize).
+  *** wake281 (ultracode): cheap data-driven narrowing (NO replay). (1) dump go.total_active_stake =
+  22,086,904,770,458,818 == Koios ep245 active_stake BYTE-EXACT -> the sigmaA denominator is correct -> total_active_stake
+  RULED OUT (consistent w/ the filter being a no-op). (2) Per user guidance (don't assume), Koios mainnet epoch_params:
+  ep243 d=0.28, ep244 d=0.26 (NOT 0); rho=0.003, tau=0.2, a0=0.3, optimal_pool_count=500. *** wake240's 'deltaR1
+  byte-exact' verification used WRONG params (d=0 AND slots=86400 = PREVIEW/preprod; mainnet slots=432000) -> deltaR1/
+  eta was NEVER actually verified for mainnet and is a LIVE suspect. (The analyze muscle also mislabeled ep244 'Babbage'
+  — it is Allegra; era-assumption error, the exact trap.) (3) At d=0.26: expectedBlocks=floor((1-0.26)*(1/20)*432000)=
+  15984 (integer); pool blocks ~15903 -> eta~0.995 (NOT capped to 1). Koios blk_count ep244=21491 (total incl overlay).
+  ANALYSIS: deltaR1=floor(eta*rho*reserves) is a single floor of exact inputs -> SHOULD be exact; R=expansion+epoch_fees
+  -treasury_cut all single floors; total_stake=max_supply-reserves exact. I keep ruling globals out analytically ->
+  need DATA. DROVE: instrumented the reward GLOBALS in rewards.rs (env DUGITE_RUPD_GLOBALS -> eprintln per boundary:
+  reserves, epoch_fees, actual_blocks, expansion(=deltaR1), total_rewards_available, treasury_cut, reward_pot,
+  total_stake, total_active_stake, d). cargo check CLEAN (5.3s). Build pid 32254 -> /tmp/dugite-globals-build.log.
+  NEXT WAKE: strings-verify -> replay over CoW clone w/ DUGITE_RUPD_GLOBALS=1 -> grep 'RUPD_GLOBALS reserves=
+  12905245994461083' (the ep246 boundary) -> compare expansion(deltaR1)/reward_pot/total_stake to Koios-derived EXACT
+  (reserves 12,905,245,994,461,083, d, blocks, rho/tau) -> the global that is ~5 ppm low is the bug; if all globals
+  exact -> the ~5 ppm is per-pool (maxPool/poolReward formula) -> instrument per-pool next. Instrumentation UNCOMMITTED
+  (globals + drop-trace in rewards.rs, paid-set in shelley.rs; all env-gated). NEXT-WAKE NOTE: total_active_stake filter
+  is reverted to baseline (the latent non-Haskell filter stays for now; ep246 unaffected).
   *** wake280 (ultracode): **FIX REFUTED — re-replay #438 SAVE.** Fix-verify dump ep246 is BYTE-IDENTICAL to original:
   reserves 12,880,948,947,408,249 (still +82,270,482 vs Koios 12,880,948,865,137,767), treasury 292,077,855,243,075
   (still -55,269). ep213+ep245 byte-exact vs Koios (no regression). So removing the total_active_stake pool-params
@@ -3033,3 +3052,10 @@
   DATA-DRIVEN re-localize — instrument per-pool R/maxP/appPerf/poolR at ep246, re-replay, compare per-pool to Koios
   pool_history to find the uniform ~5ppm-low intermediate. LESSON: a fix must be proven to MOVE the divergence via
   re-replay (green tests + Haskell-quote insufficient); conservation rule-outs invalid when reserves IS the divergence.
+- wake281 (ultracode): cheap narrowing (no replay). dump go.total_active_stake == Koios ep245 active_stake BYTE-EXACT
+  -> sigmaA denom correct, total_active_stake RULED OUT. Koios mainnet d: ep243=0.28 ep244=0.26 (NOT 0) -> wake240's
+  deltaR1 verify used PREVIEW params (d=0, slots=86400) not mainnet (slots=432000) -> deltaR1/eta UNVERIFIED, live
+  suspect. analyze muscle also mislabeled ep244 'Babbage' (it's Allegra). Instrumented reward globals (env
+  DUGITE_RUPD_GLOBALS: reserves/epoch_fees/actual_blocks/expansion(deltaR1)/reward_pot/total_stake/total_active_stake/d).
+  build pid 32254. next wake: strings-verify -> replay -> grep RUPD_GLOBALS reserves=12905245994461083 -> compare
+  deltaR1/reward_pot/total_stake to Koios-exact; if globals exact -> per-pool maxPool. Instrumentation uncommitted.
