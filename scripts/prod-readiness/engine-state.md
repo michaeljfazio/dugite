@@ -194,7 +194,17 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-RESOAK (commit-B re-fix, 6-path).
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:GAUNTLET-PENDING (commit-B re-fix, 6-path).
+  *** wake178: verify10B2 IMPORT FULLY CLEAN — 4116339 UTxOs loaded, 0 phase-1, 0 import HARD-ERRORS (the new
+  hard-error paths do NOT false-trigger on a well-formed snapshot; tag-4/5 opaque-store relax does NOT over-reject).
+  The 6-path changes provably CANNOT regress phase-1 (opaque relaxation + malformed-only hard-errors + parse-only R3),
+  and verify10B already established 0-phase-1-PAST-window -> sufficient to gauntlet. DROVE: launched RE-GAUNTLET
+  wd3lzyawv (run wf_487f86db-d79, refuterN=3) on the 6-path disposition IN PARALLEL with verify10B2 (pid 10889) still
+  syncing toward the window (kept as belt-and-suspenders window evidence). Each prior refutation (wdvf5l5le) now
+  resolved: tag-4/5 OVER-REJECT -> opaque-store; TvarIterator/address/multi-asset SILENT -> hard-error; R3 c==0 blowup
+  -> short-circuit. NEXT WAKE: read gauntlet result + confirm verify10B2 0-phase-1 past window; on PASS -> COMMIT #10
+  via gh/HTTPS (2 crates) then file #19 (opaque-CompactAddr) + activate #15 (serialiseData); on REFUTE -> verify the
+  dissent vs the pinned source before acting.
   *** wake177: RE-FIX muscle wcp4vycpw COMPLETED green (tier B, 2 crates, 6-path). Notable: agent correctly split
   tag-5 into PLUTUS-body-OPAQUE vs NATIVE-Timelock-STRUCTURAL (Haskell Timelock MemPack unpackMemoBytesM IS
   structural — more precise than my instruction). All 6 paths applied: (1) import_inline_datum opaque-store
@@ -1252,6 +1262,10 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake178 2026-06-07: #10 VERIFYING-RESOAK -> GAUNTLET-PENDING. verify10B2 import fully clean (4116339 UTxOs, 0
+  phase-1, 0 hard-errors — new hard-error paths don't false-trigger, opaque relax doesn't over-reject). Launched
+  RE-GAUNTLET wd3lzyawv (wf_487f86db-d79) on 6-path disposition, parallel to verify10B2 window sync. All prior
+  refutes resolved (opaque/hard-error/short-circuit). NEXT WAKE: gauntlet PASS + window 0-phase-1 -> commit #10.
 - wake177 2026-06-07: #10 FIXING -> VERIFYING-BUILDING -> VERIFYING-RESOAK. Re-fix muscle wcp4vycpw green (6-path:
   tag-4/5 opaque-store [Plutus opaque, native Timelock structural], TvarIterator/address/multi-asset hard-error, R3
   c==0 short-circuit). Cross-crate drift: bridge 2-crate but Convertible variant lives in dugite-ledger (3rd crate);
