@@ -111,6 +111,28 @@ impl<'b> Reader<'b> {
             .map_err(|e| SerializationError::CborDecode(format!("peek_major: {e}")))
     }
 
+    /// Consume exactly one CBOR break byte (`0xff`) at the current position.
+    ///
+    /// Errors if the current value is not a break. This mirrors the upstream
+    /// cardano-ledger `decodeBreakOr`/`unless isBreak $ cborError ... "Excess
+    /// terms in array"` check that closes an indefinite-length list once its
+    /// fixed body has been decoded (`decodeListLikeT`). Used to consume the
+    /// trailing break of an indefinite-length structural array whose entries are
+    /// read by position rather than via [`read_array`].
+    pub fn expect_break(&mut self) -> Result<(), SerializationError> {
+        match self.peek_major()? {
+            Type::Break => {
+                let pos = self.inner.position();
+                self.inner.set_position(pos + 1);
+                Ok(())
+            }
+            other => Err(SerializationError::CborDecode(format!(
+                "expected CBOR break (0xff) to close indefinite-length array, found {other:?} \
+                 (upstream `decodeListLikeT`: \"Excess terms in array\")"
+            ))),
+        }
+    }
+
     /// Skip over exactly one CBOR value at the current position.
     ///
     /// Delegates to `crate::haskell_snapshot::cbor_utils::skip_cbor_value` which has

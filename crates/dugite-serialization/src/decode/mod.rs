@@ -70,6 +70,16 @@ use dugite_primitives::transaction::{Transaction, TransactionInput, TransactionO
 /// Conway keys 0-33 and Dijkstra keys 34-37 are all handled.
 pub use era_conway::ppu_from_cbor;
 
+/// Decode a native (timelock) script from its bare CBOR array encoding.
+/// Re-exported so the Mithril / Haskell-import UTxO loader can reconstruct a
+/// typed `ScriptRef::NativeScript` from a MemPack reference-script blob.
+pub use era_conway::decode_native_script_cbor;
+
+/// Decode an inline-datum `PlutusData` from its bare CBOR encoding.
+/// Re-exported so the Mithril / Haskell-import UTxO loader can reconstruct a
+/// typed `OutputDatum::InlineDatum` from a MemPack TxOut (tags 4/5).
+pub use era_conway::decode_plutus_data_cbor;
+
 /// Recover per-element original CBOR byte spans from a preserved `plutus_data`
 /// witness array, so datum hashes can be computed over the original bytes
 /// (matching Haskell `MemoBytes`) rather than a non-reproducible re-encoding.
