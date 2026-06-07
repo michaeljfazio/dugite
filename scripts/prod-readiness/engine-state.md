@@ -277,7 +277,23 @@
    reconstruction + #7 sub-tx forward). state:DONE attempts:0
 
 ## In-progress
-- item: #7 DONE (committed+pushed 6bf88b4cbf). NEXT WAKE: SCHEDULE #16 (last L) or re-assess (backlog nearly cleared).
+- item: #16 (decode_imported_script_ref invariant) state:VERIFYING attempts:0 — doc fix applied; verify btax9e09l IN-FLIGHT; lock HELD.
+  *** wake334 (ultracode): SCHEDULE #16 (last backlog item). ASSESS: #16 is LARGELY ALREADY ADEQUATE — the doc comment at
+  node/mod.rs:376 already accurately states the era-relative-but-monotonic-prefix invariant, and the test
+  decode_imported_script_ref_maps_plutus_language_tags_to_global_versions (8318) already pins 0→V1..3→V4 AND tag-9→Err
+  (out-of-range). No `Language` enum exists to anchor a static const-assertion, and the mapping is a hard-coded match. The
+  alleged "self-contradicting comment" is no longer present (current comment is accurate). So #16's only actionable gap is
+  making the strict-prefix DEPENDENCY + future-era caveat EXPLICIT (the "+ comment / assert the invariant" deliverable).
+  *** FIX (doc-comment-only, ZERO logic change, 1 crate dugite-node): enhanced the decode_imported_script_ref doc to state
+  (1) every era's language list is a strict PREFIX of [V1,V2,V3,V4] so era-relative index == global fromEnum today; (2)
+  adding a NEW language (tag ≥4) is SAFE (hits the out-of-range hard-error, not a mis-map); (3) INVARIANT(#16): the static
+  mapping is correct ONLY while strict-prefix holds — a future era REORDERING/REMOVING a language MUST make this era-aware
+  (thread snapshot era + per-era language list); names the pinning test. *** Launched verify btax9e09l (clippy -p dugite-node
+  -D warnings [doc lints + compile] + fmt --check + the decode_imported_script_ref test; nextest-full skipped — doc-only, no
+  logic change). *** ON COMPLETION (this wake): if green → COMMIT focused 1-crate doc fix (node/mod.rs) + push → #16 DONE →
+  ENTIRE BACKLOG CLEARED (only #24-pin remains, DEFERRED — muscle-resistant/heavy/masked). NEXT WAKE after #16: the engine
+  has cleared all tractable items; re-assess for NEW gaps (e.g. a fresh full-UTxO #24 capture if prioritized) or steady-state
+  monitoring. Lock held across async (TTL 22m).
   *** wake333-cont (ultracode): #7 VERIFYING→DONE. Gauntlet be81pp91a: nextest -p dugite-ledger 1523/1523 (new
   sub_transactions_replay_instant_stake_forward_path PASS + existing sub_transactions_round_trip_and_apply unchanged = no
   regression); clippy -D warnings clean; fmt auto-fixed → clean. COMMITTED focused 1-crate fix 6bf88b4cbf (dijkstra.rs only;
