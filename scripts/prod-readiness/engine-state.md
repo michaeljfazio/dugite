@@ -151,7 +151,11 @@
    remain MemPack-decodable is SILENTLY ACCEPTED (upstream rejects it). Adversarial-deployment surface for the
    mithril-fast-start path (a corrupt UTxO set -> wrong phase-2 ScriptContext at the live tip). SEPARATE from
    #10's TxIx/datum/refscript/multiasset import-completeness scope. FIX: compute crcOfConcat(state, tables) ==
-   snapshotChecksum at import; ERROR on mismatch. state:NEW attempts:0
+   snapshotChecksum at import; ERROR on mismatch. *** ANALYZED wake318 (w2ez2r1lk, conf 0.98): byte-exact crcOfConcat =
+   crc32_iso_hdlc(ascii_decimal(crc32(state)) ++ ascii_decimal(crc32(tables))) [NOT raw concat]; verified vs 2 real
+   preprod fixtures. Fix = mempack/mod.rs parse_snapshot_checksum + snapshot_crc_of_concat helpers + node/mod.rs
+   import compute+compare (Err on mismatch); 2 crates. Verify = negative security test (synthetic snapshot, flip byte →
+   reject). See In-progress for the full FIXING+VERIFY plan. state:ROOT-CAUSED attempts:0
 16. [L][phase2][LATENT, from gauntlet wqwgen1p0] decode_imported_script_ref hard-codes Plutus language tag
    0->V1,1->V2,2->V3,3->V4 as 'global', but the MemPack PlutusScript tag is ERA-RELATIVE (per-era packTagM).
    Byte-exact for ALL CURRENT eras only because each era's language list is a strict PREFIX [V1,V2,V3,V4] (no
@@ -221,7 +225,39 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #17 (Mithril snapshot CRC not verified) state:ANALYZING attempts:0 — muscle w2ez2r1lk IN-FLIGHT; wake-lock HELD (TTL 22m). #6 DONE (8e41d0ae2a).
+- item: #17 (Mithril snapshot CRC not verified) state:ROOT-CAUSED attempts:0 — analyze DONE (conf 0.98, byte-exact empirically verified). NEXT WAKE: FIXING.
+  *** wake318-cont (ultracode): muscle analyze w2ez2r1lk COMPLETED → #17 ANALYZING→ROOT-CAUSED (conf 0.98). *** ROOT CAUSE:
+  dugite reads the snapshot `checksum` meta but NEVER computes/compares a CRC → a snapshot with valid meta (backend=
+  utxohd-mem, tablesCodecVersion=1) but a tampered/truncated-yet-MemPack-decodable state|tables byte is SILENTLY ACCEPTED.
+  Sites: dugite-serialization/src/mempack/mod.rs::parse_tables_codec_version (L258) + ::enforce_snapshot_backend_is_utxohd_mem
+  (L917) parse the full meta but extract only tablesCodecVersion/backend (no parse_snapshot_checksum helper exists);
+  dugite-node/src/node/mod.rs::import_haskell_ledger_snapshot (fn L6471) reads state_data (L6489, <snap>/state) + tvar_data
+  (L6563, <snap>/tables via resolve_inmemory_tables_path) + meta via resolve_snapshot_txix_endianness (fn L220, meta L227)
+  → checksum discarded, zero CRC compare. Both module docs already NAME the #17 gap. *** BYTE-EXACT crcOfConcat (the
+  critical detail — NOT crc32(state++tables)): snapshotChecksum = crc32_iso_hdlc( ascii_decimal(crc32(state)) ++
+  ascii_decimal(crc32(tables)) ); tables-absent folds to state-only crc1 (Haskell `maybe crc1 (crcOfConcat crc1) crc2`).
+  crcOfConcat crc1 crc2 = computeCRC(word32Dec crc1 <> word32Dec crc2) [ouroboros-consensus Util/CRC.hs L20-26];
+  loadSnapshot V2/InMemory.hs L255-274 throws ReadSnapshotDataCorruption on mismatch; CRC = zlib CRC-32/ISO-HDLC (poly
+  0xEDB88320) = Rust crc32fast. EMPIRICALLY VERIFIED byte-exact vs 2 real preprod fixtures (db-preprod-sync/haskell-ledger):
+  124995007 → crc32("20030404624175236221")=2409556997 == meta ✓; 124999169 → 4213652121 == meta ✓ (naive concat WRONG).
+  *** FIX (≤2 crates: dugite-serialization + dugite-node): (A) mempack/mod.rs add `parse_snapshot_checksum(meta)->Result<u32>`
+  (reuse first_occurrence_value/top_level_number_literal aeson logic; reject absent/null/non-Word32) + `snapshot_crc_of_concat
+  (state_crc:u32, tables_crc:Option<u32>)->u32` { Some(t)=>crc32fast::hash(format!("{state_crc}{t}").as_bytes()), None=>
+  state_crc }; add `crc32fast={workspace=true}` to dugite-serialization/Cargo.toml. (B) node/mod.rs import_haskell_ledger_
+  snapshot: state_crc=crc32fast::hash(&state_data); tables_crc=tvar_data.as_ref().map(crc32fast::hash) (Option — capture
+  tvar_data as Option<Vec<u8>>); computed=snapshot_crc_of_concat(...); expected=parse_snapshot_checksum(&meta_bytes)? (return
+  meta bytes from resolve_snapshot_txix_endianness or re-read <snap>/meta); if computed!=expected → return Err (anyhow,
+  naming ReadSnapshotDataCorruption + both CRCs). Optional typed SerializationError::SnapshotChecksumMismatch. Reuse
+  crc32fast::hash, NOT mithril.rs verify_block_checksum (that's the #[cfg(test)] block-level CRC, different composition).
+  *** VERIFY (negative security test, NO Koios — reference = Haskell reject-on-corruption): synthetic minimal snapshot dir
+  (tempfile::tempdir): write state=S, tables=T, meta {"backend":"utxohd-mem","checksum":<c>,"tablesCodecVersion":1} with
+  c=snapshot_crc_of_concat(crc32(S),Some(crc32(T))). Assert: (a) valid → verifier Ok; (b) flip 1 byte in S (then in T) →
+  CRC-mismatch Err. FAILS pre-fix (no verifier → corrupt accepted → assert is_err fails), PASSES post-fix. Optional: real
+  fixtures 124995007/124999169 as ignored positive cross-check. *** NEXT WAKE (FIXING): implement (A)+(B) + the negative
+  test (hand-applied — fix is fully specified + byte-exact-validated; like #6/#20c, no muscle fix-mode needed). Then
+  VERIFYING: fail-pre (corrupt-snapshot accepted on pre-fix) /pass-post + nextest (-p dugite-serialization AND -p
+  dugite-node) + clippy + fmt. Code-invariant/security gauntlet = the fail-pre/pass-post test + the real-fixture byte-exact
+  cross-check (no replay/Koios). On green → focused commit (2 crates) + push.
   *** wake318 (ultracode): SCHEDULE→DRIVE. *** PIVOT #7→#17: ASSESS found #7's candidate-latent-fix-dijkstra-subutxo.patch
   is in NORMAL diff (ed) format (`36c36`/`<`/`>`/`137a138,214`), NOT git-applyable (`git apply --check` → "No valid patches
   in input"), AND it is a BROADER shared-helper refactor (introduces add_instant_stake/delete_instant_stake pub(crate) and
@@ -2182,6 +2218,7 @@
 - 2026-06-07T13:xxZ wake315(+cont) ~ SCHEDULE #6 (#10 ruled BLOCKED) + muscle analyze w2x5j3223 (2 opus, root-cause+patch-validate+verify-design) → #6 ROOT-CAUSED
 - 2026-06-07T14:xxZ wake316 ~ #6 FIXING (apply validated patch + compile-check)
 - 2026-06-07T14:xxZ wake317(+cont) ~ #6 VERIFYING→DONE (fail-pre empirical + pass-post 1522/1522+clippy+fmt) + commit/push 8e41d0ae2a
+- 2026-06-07T15:xxZ wake318(+cont) ~ SCHEDULE pivot #7→#17 + muscle analyze w2ez2r1lk (2 opus, byte-exact crcOfConcat vs real fixtures) → #17 ROOT-CAUSED
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -3682,3 +3719,9 @@
   test FAILED left=None vs Some(5000000)), restored, pass-post gauntlet ba20qc2ea GREEN (nextest 1522/1522 + clippy + fmt).
   Code-invariant gauntlet PASSED (forward path = byte-exact reference, no Koios). Committed+pushed focused fix 8e41d0ae2a
   (ledger_seq.rs + state/mod.rs). #6 closes fork-induced stake corruption. NEXT: SCHEDULE #7 (sibling) or #17 (H Mithril CRC).
+- wake318(+cont) 2026-06-07: SCHEDULE pivot #7→#17 (#7 patch is normal-diff format + broader refactor → deferred);
+  DRIVE #17 NEW→ANALYZING via muscle analyze w2ez2r1lk (2 opus). On completion (auto-notify, lock held TTL 22m) recorded
+  conf 0.98 ROOT-CAUSED: dugite reads snapshot `checksum` meta but never verifies CRC; byte-exact crcOfConcat =
+  crc32_iso_hdlc(ascii_decimal(crc32(state)) ++ ascii_decimal(crc32(tables))) [empirically verified vs 2 real preprod
+  fixtures; NOT raw concat]. Fix designed (mempack helpers + node import compare, 2 crates) + negative security test
+  (synthetic snapshot, flip byte → reject). #17 ANALYZING→ROOT-CAUSED. NEXT WAKE: FIXING (hand-apply, fully specified).
