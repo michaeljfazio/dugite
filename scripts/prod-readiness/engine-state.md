@@ -1569,6 +1569,9 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
+- wake235 2026-06-07: POLL #0 VERIFY-THEN-FIX muscle w0oegi6uf — still RUNNING (cargo pid 10828, build/test; 33
+  epoch_fees/ss_fee refs in rewards.rs = working the fee area; last activity ~2min). No transition. Disk 157G. #0
+  stays FIXING. NEXT WAKE: poll/process result.
 - wake234 2026-06-07: POLL #0 VERIFY-THEN-FIX muscle w0oegi6uf (reward_pot epoch_fees) — still RUNNING, ACTIVE
   (worktree present, rewards.rs; Koios fee tracing + ppm arithmetic + code). No transition. Disk 166G, no nodes. #0
   stays FIXING. NEXT WAKE: poll/process — fee discrepancy confirmed+fixed OR 'not localizable to fees' report.
