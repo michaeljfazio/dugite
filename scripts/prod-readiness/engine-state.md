@@ -209,7 +209,28 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:PAID-SET-REPLAY2-RUNNING (polled wake267 16:50 — replay pid 27902 at ep238, RUPD_DROP_TRACE FIRING (52, instrumentation live), ~8 ep from ep246; rupd_paid_246.txt imminent). GOTCHA: epoch-dumps-engine/mainnet-rupd-drop/ holds STALE dumps to ep270 from a prior run — gauge THIS run's progress from its OWN job log slot=, not the dump dir. User note wake267: 'live node only up to 223' — consistent (this replay was ~ep223-238 during the user's check); Koios REST covers ALL epochs + this from-genesis replay reaches ep246 itself, so a live reference node capped at 223 does NOT block the ep246 diff.
+- item: #0 (mainnet ep246 reserves) state:RECONCILING (paid set CAPTURED + aligned; reconciliation workflow w8ufsxjg3 launched).
+  *** wake268 (ultracode): CAPTURED dugite's full computed reward set epoch-dumps-engine/rupd_paid_246.txt
+  (header: epoch=246 paid_count=141596 delta_reserves=24,297,047,052,834 delta_treasury=7,722,113,828,619; then
+  <cred_hex> <amount> x141596). KEY RESOLUTION — this is the shelley.rs step-2 rupd COMPUTED+applied at ep246, and it
+  aligns to Koios **earned_epoch 244** (GO snapshot = 2-epoch lag): cred 1284f2a8 dugite 2,039,549,748 ≈ koios-244
+  2,039,560,652; b54995c6 dugite 380,694,643 ≈ koios-244 380,694,917; 085e408d dugite 23,362,296,230 ≈ koios-244
+  23,362,414,177. dugite per-cred amounts MATCH Koios when AGGREGATED (a reward account collecting leader rewards from
+  N pools = N Koios rows summed = 1 dugite entry; e.g. the '1.9T' cred 34413a06 is a ~34-pool operator acct, status
+  registered, total_balance 277B — its 1.9T = SUM of its koios-244 entries, CORRECT). So the earlier '294/300 differ'
+  + '1.9T anomaly' were MY errors (wrong epoch 245 + no aggregation + only 0xe1). sum_paid=16,588,450,017,136 vs dump
+  total_distributed 16,727,254,272,281 (these are DIFFERENT rupds — the dump per_cred reward aligned to earned_epoch
+  245 @wake260, a separate boundary's credited reward). The +82,215,213 shortfall is in rupd_paid_246 vs Koios
+  earned_epoch-244 — a small per-cred sample showed amounts ~exact (under_sum 246, over_sum 2611, rounding) => likely
+  MISSING PAYEES not amount-deltas, BUT many top creds are SCRIPT reward accts (0xf1) the 0xe1-only scan didn't
+  resolve. DROVE: SIGTERM'd replay 27902 (paid file captured; CoW clone db-clones/mainnet-rupd-drop KEPT). Launched
+  bespoke reconciliation WORKFLOW w8ufsxjg3 (run wf_a230465c-9ae, 8 sonnet agents stratified-sampling dugite's 141596
+  creds, BOTH 0xe1+0xf1 + per-cred aggregation, vs Koios earned_epoch-244 -> classify AMOUNT-DELTAS vs MISSING-PAYEES
+  + quantify + opus synthesis). NEXT WAKE: read w8ufsxjg3 verdict. If MISSING PAYEES (expected): enumerate Koios
+  earned_epoch-244 recipients (per-pool) absent from dugite's set -> the omitted cred-class -> the FIX in shelley.rs/
+  compute_reward_update (go-snapshot delegation domain / reward eligibility). If amount-deltas: scale + find the formula
+  site. Instrumentation UNCOMMITTED. NOTE: the divergence-causing rupd is the one APPLIED at ep246 (= rupd_paid_246,
+  earned_epoch 244, delta_reserves 24.3T); fix lands in the LIVE shelley.rs path.
   *** wake266 (ultracode): deterministic foreground rebuild (touch shelley.rs + cargo build, 1m41s) -> strings-VERIFY
   PASSED: grep -ac DUGITE_RUPD_PAID_EPOCH = 1, rupd_paid_ = 1 (binary 16:46). The shelley.rs LIVE-path paid-set
   instrumentation IS now compiled in. Re-launched replay job mainnet-rupd-paid2 pid 27902 over KEPT CoW clone
@@ -2890,3 +2911,10 @@
   (DUGITE_RUPD_PAID_EPOCH=1 in binary). Re-launched replay job mainnet-rupd-paid2 pid 27902 over kept CoW clone with
   DUGITE_RUPD_PAID_EPOCH=246 -> writes rupd_paid_246.txt at ep246 (~4min). Running ep31. next wake: poll for the file
   -> diff dugite paid set vs Koios earned_epoch-245 (missing payees / amount deltas summing to 82,215,213).
+- wake268 (ultracode): CAPTURED rupd_paid_246.txt (141,596 paid creds, untruncated). RESOLVED: it = Koios
+  earned_epoch 244 (GO 2-epoch lag); dugite amounts MATCH Koios when AGGREGATED per reward-account (multi-pool
+  operators get N koios rows = 1 dugite entry; '1.9T' cred = 34-pool op acct, correct). Earlier '294/300 differ' +
+  '1.9T anomaly' were my errors (wrong epoch + no aggregation + 0xe1-only). Small sample: amounts ~exact => likely
+  MISSING PAYEES (but top creds are 0xf1 script accts). SIGTERM'd replay (CoW clone kept). Launched reconciliation
+  workflow w8ufsxjg3 (8 agents, both header bytes + aggregation, vs koios earned_epoch-244 -> amount-deltas vs
+  missing-payees). next wake: read verdict -> enumerate omitted creds (per-pool) -> fix in shelley.rs/compute_reward_update.
