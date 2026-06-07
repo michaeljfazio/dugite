@@ -1488,6 +1488,9 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
+- wake220 2026-06-07: POLL #15 RE-GAUNTLET w4ou064y2 (minimal canonical V3-datum fix) — still RUNNING (0/3 votes,
+  active). No transition. Disk 166G, no nodes. #15 stays GAUNTLET-PENDING (replay already PASSED 306->0 full window).
+  NEXT WAKE: on PASS -> commit #15 (dugite-uplc, 1 crate).
 - wake219 2026-06-07: #15 REPLAY DECISIVE PASS — 0 'Error term' across FULL ep293 window (was 306), 27751ab9 fixed,
   0 phase-1 (tip 125125576). VERIFYING-RESOAK -> GAUNTLET-PENDING; SIGTERM'd verify15min, launched re-gauntlet
   w4ou064y2 on the minimal canonical V3-datum fix (memo gone). NEXT WAKE: PASS -> commit #15 (dugite-uplc).
