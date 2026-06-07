@@ -209,7 +209,7 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:ROOT-CAUSING-COMPONENT (per-delegator stake component missing; breakdown instrumentation building).
+- item: #0 (mainnet ep246 reserves) state:ROOT-CAUSING-COMPONENT (polled wake292 — snapbreakdown build linking dugite-node; replay next wake). per-delegator stake component missing (pointer leading).
   *** wake291 (ultracode): per-pool diff workflow w7ghihrir COMPLETE — Σ(dugite-koios) over 1489 resolved pools =
   EXACTLY -109,573,937,991 (perfect reconciliation to the deficit). 445/1489 pools (29.9%) short, **100%
   one-directional (dugite always UNDER, never over)** -> a MISSING ADDEND (per-delegator stake component dropped for a
