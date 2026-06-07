@@ -270,10 +270,27 @@
    #6/apply_utxo_changes — the normal-diff candidate-latent-fix-dijkstra-subutxo.patch is NOT git-applyable): thread
    certs/epochs into apply_sub_transactions, replay instant-stake (SUB on spend, ADD on insert via shared stake_routing),
    update caller @222. VERIFY = forward-vs-diff equivalence test (#6 invariant) + nextest -p dugite-ledger; 1 crate, code-
-   invariant, NO replay (Dijkstra undeployed — inert/masked). state:ROOT-CAUSED attempts:0
+   invariant, NO replay (Dijkstra undeployed — inert/masked). *** DONE wake333 (6bf88b4cbf): fix landed (apply_sub_
+   transactions threads certs/epochs + replays instant-stake SUB/ADD via shared stake_routing); test sub_transactions_
+   replay_instant_stake_forward_path (base-cred output ADD + spend SUB), fail-pre PROVEN (HEAD has 0 stake_map writes) +
+   post-fix PASS, nextest 1523/1523 no-regression. Completes the instant-stake-replay symmetry (forward top-level + #6
+   reconstruction + #7 sub-tx forward). state:DONE attempts:0
 
 ## In-progress
-- item: #7 (Dijkstra SUBUTXO stake replay) state:VERIFYING attempts:0 — test added, fail-pre proven + post-fix PASS; gauntlet be81pp91a IN-FLIGHT; lock HELD.
+- item: #7 DONE (committed+pushed 6bf88b4cbf). NEXT WAKE: SCHEDULE #16 (last L) or re-assess (backlog nearly cleared).
+  *** wake333-cont (ultracode): #7 VERIFYING→DONE. Gauntlet be81pp91a: nextest -p dugite-ledger 1523/1523 (new
+  sub_transactions_replay_instant_stake_forward_path PASS + existing sub_transactions_round_trip_and_apply unchanged = no
+  regression); clippy -D warnings clean; fmt auto-fixed → clean. COMMITTED focused 1-crate fix 6bf88b4cbf (dijkstra.rs only;
+  common.rs #730 left uncommitted) + PUSHED (d8e616d553..6bf88b4cbf). Fail-pre was PROVEN structurally (HEAD apply_sub_
+  transactions has 0 stake_map writes) + post-fix PASS. *** The instant-stake-replay symmetry is now COMPLETE across all
+  paths: forward top-level (apply_utxo_changes, always correct), reconstruction (apply_utxo_diff, #6), forward sub-tx
+  (apply_sub_transactions, #7). *** NEXT WAKE — SCHEDULE: the high/med-value backlog is CLEARED. Remaining: #16 [L] decode_
+  imported_script_ref hard-codes Plutus language tag 0..3 as 'global' but the MemPack PlutusScript tag is ERA-RELATIVE
+  (per-era packTagM); byte-exact for ALL current eras (each era's language list is a strict prefix [V1,V2,V3,V4]); NOT a
+  current divergence — small fix = assert the prefix invariant + fix the self-contradicting 'era-relative'/'global' comment
+  (catches a future era reordering/removing a language). #24-pin DEFERRED (muscle-resistant, needs CEK instrumentation /
+  full-UTxO replay; masked by trust-on-consensus). RECOMMEND #16 (last clean small win) — then the backlog is effectively
+  exhausted; consider a regression-validation replay (confirm #6/#23/#20/#7 hold byte-exact) as the next major step. Lock to release.
   *** wake333 (ultracode): #7 FIXING→VERIFYING. Wrote sub_transactions_replay_instant_stake_forward_path test (dijkstra.rs
   #[cfg(test)], calls apply_sub_transactions directly via the nested test mod — simpler than the full apply_valid_tx shell;
   reuses super::make_utxo_sub/make_cert_sub/make_epoch_sub). Uses a BASE address (type-0, [0x00]+pay+stake) which routes to
@@ -2648,6 +2665,13 @@
 - db-clones/preprod-ep57-fixed   (fixed-binary replay, in progress)
 
 ## Gauntlet ledger  (passed/refuted approaches — never silently retry a REFUTED)
+- PASSED 2026-06-08 (wake333, #7): "replay instant-stake in Dijkstra apply_sub_transactions forward path (mirror of #6)".
+  Gauntlet for this code-invariant = a forward-path stake-replay test (sub-tx creates a BASE-credential output → assert
+  stake_map[cred]+=K; sibling sub-tx spends it → assert ==0) using a base address (the existing sub-tx test used only
+  enterprise addrs → StakeRouting::None → never exercised the legs). FAIL-PRE PROVEN structurally (git show HEAD
+  apply_sub_transactions = 0 stake_map writes → cannot pass) + POST-FIX PASS; nextest 1523/1523 (existing sub-tx round-trip
+  unchanged) + clippy + fmt. Stake-replay byte-identical to the proven #6 apply_utxo_diff legs (shared stake_routing).
+  Landed 6bf88b4cbf. Completes instant-stake-replay symmetry across forward/reconstruction/sub-tx paths.
 - PASSED 2026-06-08 (wake330, #20b): "require exactly N entries in a definite-length tables map (cborg decodeMapLen
   premature-EOF)". Gauntlet = 2 new tests (definite_map_truncated_below_declared_count_hard_errors fail-pre/pass-post —
   pre-fix returned a silent None prefix-import; definite_map_exact_count_completes_clean over-strictness guard) + nextest
@@ -2748,6 +2772,9 @@
 - 2026-06-08T01:xxZ wake328(+cont) ~ #20c backend dup-key first-wins FIXING→DONE (nextest 1147/1147) + commit/push b43f4fa80d
 - 2026-06-08T02:xxZ wake329(+cont) ~ #20a decode_varlen overflow guard (muscle wi8udn7a7 byte-exact) FIXING→DONE (nextest 1150/1150) + commit/push 49a2c0ce1d
 - 2026-06-08T03:xxZ wake330(+cont) ~ #20b definite-map exact-count (hand-fix, cborg decodeMapLen) FIXING→DONE (nextest 1152/1152) + commit/push d8e616d553 → #20 FULLY DONE
+- 2026-06-08T04:xxZ wake331 ~ SCHEDULE #7 + DRIVE NEW→ROOT-CAUSED (forward-path mirror of #6; #24-pin deferred)
+- 2026-06-08T04:xxZ wake332 ~ #7 ROOT-CAUSED→FIXING (apply_sub_transactions threads certs/epochs + instant-stake replay; cargo check clean)
+- 2026-06-08T05:xxZ wake333(+cont) ~ #7 FIXING→VERIFYING→DONE (fail-pre structural + post-fix; gauntlet 1523/1523) + commit/push 6bf88b4cbf
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -4300,3 +4327,7 @@
   NEW→ROOT-CAUSED via direct analysis (the established #6 sibling): apply_sub_transactions (dijkstra.rs:399) misses
   forward-path stake_map/ptr_stake updates for Dijkstra sub-txs — the mirror of #6's reconstruction-path fix. Fix plan +
   forward-vs-diff verification recorded. NEXT WAKE: FIXING (thread certs/epochs + instant-stake replay; 1 crate, no replay).
+- wake333(+cont) 2026-06-08: #7 ROOT-CAUSED→FIXING→VERIFYING→DONE. Wrote forward-path stake-replay test (base addr,
+  ADD+SUB legs); fail-pre PROVEN structurally (HEAD has 0 stake_map writes) + post-fix PASS; gauntlet 1523/1523 +clippy+fmt.
+  Committed+pushed 6bf88b4cbf. Instant-stake-replay symmetry COMPLETE (forward/reconstruction/sub-tx). Backlog nearly
+  cleared — remaining #16 (L) + #24-pin (deferred/heavy). Next: #16 or a regression-validation replay.
