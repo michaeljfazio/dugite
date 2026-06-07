@@ -209,7 +209,20 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #15 (phase-2 serialiseData verbatim-bytes) state:FIXING. *** wake201: ASSESSED — CEK Data enum (data.rs:65
+- item: #15 (phase-2 serialiseData verbatim-bytes) state:FIXING (V3-extension; first fix was a NO-OP). *** wake208:
+  FIX muscle w1xi3j2nf green (Data-memo architecture: DataKind+Data{kind,original}, Eq/Hash IGNORE memo, to_cbor
+  returns memo, V1/V2 datum_raw + witness datums_to_plutus memoised; 438 uplc tests green). DROVE: copied 10 files
+  to main (dugite-uplc only), BUILD_EXIT=0, uplc nextest GREEN 438, verify15 replay. *** REPLAY VERDICT = NO-OP:
+  41 'Error term' by slot 125010507 == pre-#15 binary's 41, SAME tx_hashes incl 27751ab9. ROOT CAUSE (confirmed by
+  code): the memo was threaded into the V1/V2 datum ARGUMENT only (eval_redeemer.rs:130); the PlutusV3 branch (:156)
+  ignores datum_raw and populate_v3.rs has ZERO spending-datum memo. The 306 failing scripts are V3 (7afbde08) which
+  read their datum from the V3 ScriptContext SpendingScriptInfo (SpendingScript txOutRef (Just datum)), NOT the
+  memoised txInfoData. The Data-memo architecture + V1/V2 path are CORRECT and KEPT on main. DROVE: regenerated
+  base-15-uplc-bridge.patch (2140L, includes the #15 work), launched FIX muscle w19kofqwx (run wf_819302a0-b89) to
+  thread datum_raw into the V3 SpendingScriptInfo datum (plutus_data_to_data_memoised). NEXT WAKE: poll -> build ->
+  re-replay ep293 -> 306 Error-term MUST drop to ~0 (the byte-exact gate; tests-green is NOT proof) -> gauntlet ->
+  commit. LESSON (again): replay is the only arbiter — a green V1/V2-memo fix was a V3 no-op.
+  *** wake201: ASSESSED — CEK Data enum (data.rs:65
   Constr/Map/List/I/B) is PURELY STRUCTURAL (no memo); serialiseData (denotations.rs:601) always to_cbor()-canonical.
   dugite-uplc is CLEAN + UNDRIFTED from base ca50afd9ef (no bridge needed); plutus_data_to_data (tx_info_populate.rs:
   302) already has raw_cbor plumbing (~L388/531). #15 = dugite-uplc ONLY, 1 crate. Launched FIX muscle w1xi3j2nf (run
@@ -1418,6 +1431,11 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
+- wake208 2026-06-07: #15 fix w1xi3j2nf green (Data-memo, 438 uplc tests) BUT REPLAY VERDICT = NO-OP (41 Error-term
+  == pre-#15, same txs incl 27751ab9). Root cause: memo threaded V1/V2 datum-arg only; PlutusV3 spending datum
+  (SpendingScriptInfo) NOT memoised (eval_redeemer:156 + populate_v3 zero threading) — failing scripts are V3.
+  Architecture kept; regenerated base-15-uplc-bridge.patch, launched V3-extension fix w19kofqwx (wf_819302a0-b89).
+  NEXT WAKE: poll -> build -> re-replay (306 Error-term -> ~0) -> gauntlet -> commit. Replay caught the no-op again.
 - wake207 2026-06-07: POLL #15 FIX muscle w1xi3j2nf — still RUNNING (~45min; tool-calls 437->495, iterating on
   conformance-test assertions from the memo change [serialiseData round-trip], last activity 2s, not wedged). No
   transition. Disk 165G. #15 stays FIXING. NEXT WAKE: poll/process result.
