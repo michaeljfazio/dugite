@@ -1472,6 +1472,9 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
+- wake217 2026-06-07: POLL #15 MINIMAL fix muscle wkba3hja9 (V3 datum population, canonical, no memo) — still
+  RUNNING, ACTIVE (worktree present, build/test). No transition. Disk 161G, no nodes. #15 stays FIXING. NEXT WAKE:
+  poll/process -> build -> re-replay (306->0).
 - wake216 2026-06-07: #15 ANALYZE wpkh7n7c9 COMPLETE -> DIAGNOSING -> ROOT-CAUSED -> FIXING. Verdict: memo WRONG
   (serialiseData=canonical encodeData, dugite encoder already matches; ep293 datum IS canonical; memo = silent pass-
   where-Haskell-fails on non-canonical). REAL cause: V3 SpendingScriptInfo datum was None. Reverted main dugite-uplc
