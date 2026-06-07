@@ -209,7 +209,27 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:DIAGNOSING-DATA (frozen fvAddrsRew MISSING-credential hunt; data-diagnose waum3utic ACTIVE, polled wake250 15:28 — dim a9bde done (185KB), dim a348 still enumerating Koios accounts (284KB, steady growth, not wedged); barrier awaits a348).
+- item: #0 (mainnet ep246 reserves) state:DIAGNOSING-DATA (FOCUSED credential pin on pool e7b605b72af; diagnose wz6ku12dk launched).
+  *** wake251: data-diagnose waum3utic COMPLETE — CONFIRMED localization, pin BLOCKED by top-200 truncation, candidate
+  pool identified. Boundary deltas (dugite-koios) via koios.sh totals: ep245 0/0 (baseline byte-exact), ep246
+  +82,270,482/-55,269, ep247 +82,078,374/-5,880 — divergence FIRST at ep245->246 (RUPD apply of ep245 rewards),
+  carries forward. Split exact: 82,270,482-55,269=82,215,213 (still-registered reward-accts dugite dropped) + 55,269
+  (deregistered-by-apply -> Haskell frTotalUnregistered/treasury, dugite leaves in reserves) => >=2 missing creds in
+  the frozen fvAddrsRew (self.epochs.rupd_addrs_rew). TRUNCATION BLOCK: per_credential top-200-by-stake; the 5 highest
+  zero-reward creds checked vs Koios all legit-zero (NOT the bug); pool-level dodge buried (<0.2% of top pool ~50B
+  member total, affected pool not ejected from top20). dim-B flagged dominant-contributor pool
+  pool1u7mqtde27swkarngjsn5mmw3sy20zavlafgqkmg8qv2n2nwga0l (e7b605b72af41d6e8e6894274dedd18114f1759fea500b6d07031535).
+  VALIDATED LEAD (mechanical koios pool_delegators_history ep245): that pool has ~130B-lovelace delegators
+  (135,035,513,821 / 129,477,460,534 / 123,822,236,562) — at ~0.06%/epoch yield earns ~82M, matching the target. So
+  the whale IS plausibly in this pool. DROVE: launched FOCUSED single-dim opus diagnose wz6ku12dk (run wf_8dd4f86a-f47,
+  Koios-only, NO replay): enumerate the pool's ep245 delegators >=10B stake -> account_reward_history to find the
+  ~82,215,213 whale -> account_update_history/account_updates to pin the reg/dereg/re-reg/MIR anomaly between the
+  ep244->245 boundary and the startStep slot that makes dugite reward_accounts omit a cred Haskell accountsMap keeps.
+  RATIONALE: pins the MECHANISM cheaply (minutes) to drive a targeted fix, avoiding a 5-8h instrumented from-genesis
+  localization replay (the final fix-verification replay is unavoidable regardless). NEXT WAKE: read wz6ku12dk -> exact
+  cred + mechanism -> targeted FIX (fix frozen-set construction in apply.rs to include that cred-class) OR, if Koios
+  can't confirm, fall back to instrumentation (dump rupd_addrs_rew set-diff) + replay. Fix verified ONLY by re-replay
+  dump ep246 reserves==12880948865137767 + ep209-245 unregressed + gauntlet.
   *** wake246: FIX muscle wyidhhb1o RETURNED **NO-CODE-CHANGE (deliberate, #438-disciplined)** + a DECISIVE refinement.
   Determination: COMPUTE-side. The +82,270,482 split (+82,215,213 reward-accts / +55,269 frTotalUnregistered treasury)
   is EXACTLY Haskell's apply-time filterAllRewards' partition acting on rewards that WERE computed into `rs` — so the
@@ -2655,3 +2675,9 @@
   DATA-population gap not a logic gap, unpinnable in the worktree (no replay). Found full ep0-247 dumps from last
   night's replay (per_credential truncated top-200). Launched opus data-diagnose waum3utic (pool-level + cred-class
   vs Koios) to identify the missing cred + reg/dereg/re-reg/MIR class. next wake: read waum3utic -> targeted fix.
+- wake251 2026-06-07: data-diagnose waum3utic COMPLETE -> confirmed ep245->246 boundary (+82,270,482/-55,269,
+  >=2 missing fvAddrsRew creds: 82,215,213 still-reg + 55,269 dereg-dust) but pin BLOCKED by top-200 truncation;
+  candidate pool e7b605b72af flagged. Mechanically validated the lead (koios pool_delegators_history: pool has
+  ~130B-lovelace delegators, right range for ~82M reward). Launched FOCUSED Koios-only opus diagnose wz6ku12dk to
+  pin the whale + its reg/dereg/re-reg/MIR anomaly (cheap; avoids a 5-8h instrumented localization replay). next
+  wake: read wz6ku12dk -> targeted fix on the frozen-set construction, OR fall back to instrumentation+replay.
