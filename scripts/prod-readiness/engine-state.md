@@ -212,7 +212,25 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #20c (epoch.rs test-MIR cleanup) state:FIXING attempts:0 — edit applied + compiles clean (UNCOMMITTED). NEXT WAKE: VERIFYING.
+- item: #20c DONE (committed c974d12169). NEXT WAKE: SCHEDULE picks the next item — see recommendation below.
+  *** wake314 (ultracode): #20c FIXING→VERIFYING→DONE (one step: ran the tier-appropriate gauntlet + committed on pass).
+  For a TEST-ONLY code-consistency item there is NO replay/Koios reference, so per the runbook the test suite IS the
+  gauntlet ("commit + push only if the gauntlet passes"). Ran it on the uncommitted epoch.rs reorder: `cargo nextest run
+  -p dugite-ledger` = 1521/1521 PASS (6 skipped), ZERO churn (exactly as the inertness proof predicted); `cargo clippy
+  -p dugite-ledger --all-targets -- -D warnings` = Finished clean; `cargo fmt -p dugite-ledger -- --check` = clean.
+  COMMITTED the focused 1-crate fix c974d12169 (crates/dugite-ledger/src/state/epoch.rs ONLY — common.rs #730 regression
+  tests left uncommitted; verified the staged set = epoch.rs only). This CLOSES the #0 MIR-before-SNAP thread ENTIRELY,
+  including the test-only mirror drift (epoch.rs now matches the live shelley.rs 8c868271c9 NEWEPOCH ordering). PUSH:
+  prod-readiness-engine → origin (carries c974d12169 + the accumulated wake308–314 engine-state RECORD commits).
+  *** NEXT WAKE — SCHEDULE the next item (one-step discipline: don't drive it this wake). Per the runbook "continue
+  in-flight work first," candidates ranked: (1) #19 [phase2, Tier A'] state:VERIFYING-PENDING — fix COMPLETE (worktree
+  wf_41bd7059-365-1, hash-oracle byte-exact, 2 crates), needs the mithril-fast-start re-soak to confirm the script-not-
+  found WARNs are gone at slots 125081911/937/958/126082000/081 → launch the VERIFYING soak (heavy-op lock, out-of-band).
+  (2) #6 [H][ledger] fork-robustness apply_utxo_diff — vindicated (gauntlet ledger wake22: clean replay byte-exact ⇒ bug
+  is fork-induced; "the ep181-halt replay test decides"); candidate patch + worktree wf_9be2125b-d01-1 ready. (3) #17
+  [H][security] Mithril snapshot CRC not verified (clean NEW fix: crcOfConcat(state,tables)==snapshotChecksum at import).
+  RECOMMEND #19 (most-advanced in-flight; just needs its verification soak) OR #6 (H + decisive ep181-halt test). Both
+  are heavy-op-lock replays — next wake: heavyop-lock acquire, CoW-clone, launch, poll across wakes.
   *** wake313 (ultracode): #20c FIXING (one step ROOT-CAUSED→FIXING). Applied the locked reorder to
   state/epoch.rs::process_epoch_transition (the TEST-ONLY 1-arg path): (A) inserted
   `super::certificates::apply_pending_mir(&mut self.certs, &mut self.epochs)` AFTER Step 1 applyRUpd / BEFORE Step 2b
@@ -1999,6 +2017,12 @@
 - db-clones/preprod-ep57-fixed   (fixed-binary replay, in progress)
 
 ## Gauntlet ledger  (passed/refuted approaches — never silently retry a REFUTED)
+- PASSED 2026-06-07 (wake314, #20c): "MIR-before-SNAP reorder in state/epoch.rs::process_epoch_transition (test-only
+  path)". Gauntlet = the dugite-ledger test suite (NO replay/Koios reference — test-only DCE'd path). nextest
+  1521/1521 PASS + clippy --all-targets -D warnings clean + fmt clean. Reorder proven behaviorally INERT (wake312:
+  MIR-exercising tests drain apply_pending_mir directly + are disjoint from process_epoch_transition callers; gov tests
+  set no MIR certs) → zero test churn, confirming the no-op. Committed c974d12169. Closes the #0 MIR-thread test-mirror
+  drift; epoch.rs now matches the live shelley.rs 8c868271c9 NEWEPOCH ordering.
 - REFUTED 2026-06-06 (w20c0k2qr, fix muscle self-refuted, NO code change): "fix the member-reward prefilter
   LOCATION (rewards.rs:461 / frozen addrsRew capture)". The prefilter is byte-exact correct: capture slot
   172800=ceil(4k/f) matches; set=reward_accounts.keys()==Haskell accounts domain; owner-exclusion, member_stake
@@ -2025,8 +2049,11 @@
 - 2026-06-06T12:00Z wake3 ~ diagnose result + ground-truth fix (koios.sh) + byte-exact confirm
 - 2026-06-06T12:25Z wake6 ~ analyze result + root-cause disambiguation + fix muscle launched
 - 2026-06-07T06:57Z wake243 ~ read definitive diagnose wz6pe606w (applyRUpd partition) + launched trap-aware fix muscle wyidhhb1o
+- 2026-06-07T12:35Z wake314 ~ #20c VERIFYING gauntlet (nextest 1521/1521 + clippy + fmt) + focused commit c974d12169 + DONE/RECORD
 
 ## Last node state
+- sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
+  item needing no node; last preprod replay was SIGTERM'd wake311. Last real AT-TIP sample retained below.
 - sampled: 2026-06-06T17:01Z  node_pids="99162 99165" rss_mb=4798 free_disk_gb=143 free_ram_gb=4 jobs=9 halt=false
   AT-TIP: node block 4793022 slot 125082081 hash c8004a5b... == koios tip 4793022 (1 block/28s behind live 4793023); STAT SN, 1.5% CPU idle-at-tip; 0 panic/OOM/wedge
 
@@ -3506,3 +3533,8 @@
   hypothesis RULED OUT, matches wake22-23). MIR-FIX CROSS-NETWORK CONFIRMED (preprod ep0-130 byte-exact, didn't
   regress). OVERALL: mainnet ep209-247 + preprod ep5-130 byte-exact on the MIR-fixed binary; #0/#1/#2/#3/#11 RESOLVED.
   next wake: pick #20c (test-MIR cleanup, quick) OR #16/#17/#19/#20 (snapshot adversarial-hardening, real defensive).
+- wake314 2026-06-07T12:35Z: #20c FIXING→VERIFYING→DONE. Ran the test-only item's gauntlet (nextest -p dugite-ledger
+  1521/1521 PASS, clippy -D warnings clean, fmt clean) on the uncommitted MIR-before-SNAP reorder; zero churn confirmed
+  the proven inertness. Committed focused 1-crate fix c974d12169 (state/epoch.rs only). Closes the #0 MIR-thread
+  test-mirror drift (epoch.rs now matches live shelley.rs 8c868271c9). No node running (code/test-only item). NEXT WAKE:
+  SCHEDULE next item — recommend #19 (phase2 VERIFYING re-soak, fix complete) or #6 (H fork-robustness, ep181-halt test).
