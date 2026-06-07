@@ -133,7 +133,7 @@ pub mod txout;
 mod tests;
 
 use crate::error::SerializationError;
-use crate::haskell_snapshot::cbor_utils::{decode_array_len, decode_bytes};
+use crate::haskell_snapshot::cbor_utils::{decode_array_len, decode_bytes, decode_map_len};
 use dugite_primitives::hash::Hash;
 
 /// On-disk byte order of the 2-byte `TxIx` trailer in a MemPack TxIn key.
@@ -1340,6 +1340,11 @@ struct TvarBody {
     /// `true` when the map header was the indefinite-length form (`0xbf`); a missing
     /// `0xff` break is then a truncation. `false` for a definite-length map.
     indefinite: bool,
+    /// Declared entry count for a DEFINITE-length map (`Some(N)`); `None` for an
+    /// indefinite map. cborg `decodeMapLen` requires EXACTLY `N` entries for a
+    /// definite map — reaching EOF before `N` is `DecoderErrorPrematureEOF`
+    /// (#20 hardening, sub-item b).
+    count: Option<usize>,
 }
 
 /// Parse the `array(1)` + `map` headers and return the byte offset of the first
@@ -1361,44 +1366,22 @@ fn tvar_body_offset(data: &[u8]) -> Result<TvarBody, SerializationError> {
     }
     off += n;
 
-    // Expect indefinite-length map (0xbf) or definite-length map.
+    // Expect indefinite-length map (0xbf) or definite-length map. `decode_map_len`
+    // returns the declared entry count (`Some(N)` for a definite map, `None` for the
+    // indefinite `0xbf` form) and the header byte size, with bounds-checked uint
+    // length decoding. For a definite map, cborg `decodeMapLen` demands EXACTLY `N`
+    // entries — reaching EOF before `N` is `DecoderErrorPrematureEOF` (#20 sub-item b).
     if off >= data.len() {
         return Err(SerializationError::CborDecode(
             "tvar: truncated before map header".into(),
         ));
     }
-    let major = data[off] >> 5;
-    if major != 5 {
-        return Err(SerializationError::CborDecode(format!(
-            "tvar: expected map (major 5), got major {major}"
-        )));
-    }
-    let info = data[off] & 0x1f;
-    let indefinite;
-    if info == 31 {
-        // Indefinite map (0xbf): MUST be 0xff-terminated.
-        indefinite = true;
-        off += 1;
-    } else {
-        // Definite-length map: skip the header (we iterate until done). No break byte.
-        indefinite = false;
-        let hdr_size = match info {
-            0..=23 => 1,
-            24 => 2,
-            25 => 3,
-            26 => 5,
-            27 => 9,
-            _ => {
-                return Err(SerializationError::CborDecode(
-                    "tvar: invalid map length encoding".into(),
-                ))
-            }
-        };
-        off += hdr_size;
-    }
+    let (count, hdr_size) = decode_map_len(&data[off..])?;
+    off += hdr_size;
     Ok(TvarBody {
         offset: off,
-        indefinite,
+        indefinite: count.is_none(),
+        count,
     })
 }
 
@@ -1434,6 +1417,12 @@ pub struct TvarIterator<'a> {
     /// EOF-at-boundary branch can distinguish a clean (break-terminated) end from a
     /// truncated prefix.
     saw_break: bool,
+    /// For a DEFINITE-length map, the number of declared entries NOT yet yielded
+    /// (`Some(N)` initially, counted down to 0). `None` for an indefinite map. When
+    /// this reaches `Some(0)` the map is complete; if the stream reaches EOF while it
+    /// is still `Some(n > 0)`, the blob is a TRUNCATED prefix — cborg `decodeMapLen`
+    /// premature-EOF (#10/#20 hardening, sub-item b).
+    entries_remaining: Option<usize>,
 }
 
 impl<'a> TvarIterator<'a> {
@@ -1456,7 +1445,11 @@ impl<'a> TvarIterator<'a> {
         data: &'a [u8],
         endianness: TxIxEndianness,
     ) -> Result<Self, SerializationError> {
-        let TvarBody { offset, indefinite } = tvar_body_offset(data)?;
+        let TvarBody {
+            offset,
+            indefinite,
+            count,
+        } = tvar_body_offset(data)?;
         Ok(TvarIterator {
             data,
             offset,
@@ -1464,6 +1457,7 @@ impl<'a> TvarIterator<'a> {
             endianness,
             map_indefinite: indefinite,
             saw_break: false,
+            entries_remaining: count,
         })
     }
 
@@ -1483,6 +1477,14 @@ impl<'a> Iterator for TvarIterator<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.finished {
+            return None;
+        }
+
+        // #20b: a DEFINITE-length map ends EXACTLY at its declared entry count
+        // (cborg `decodeMapLen` reads exactly N pairs). Once all N have been
+        // yielded, the map is complete — stop, regardless of any trailing bytes.
+        if self.entries_remaining == Some(0) {
+            self.finished = true;
             return None;
         }
 
@@ -1515,8 +1517,27 @@ impl<'a> Iterator for TvarIterator<'a> {
                         .into(),
                 )));
             }
-            // A definite-length map (or an indefinite map already break-terminated) ends
-            // cleanly at exhaustion.
+            // #20b — a DEFINITE-length map that declared N entries but reached EOF
+            // with entries still owed is a TRUNCATED prefix. cborg `decodeMapLen`
+            // requires EXACTLY N (key,value) pairs; running out before N yields
+            // `DecoderErrorPrematureEOF`, which `loadSnapshot`'s `readIncremental …
+            // valuesMKDecoder` surfaces as `InitFailureRead . ReadSnapshotFailed`
+            // (InMemory.hs) and ABORTS the whole import. Returning `None` here would
+            // silently import the M < N prefix as a complete UTxO set (the
+            // key-distribution sanity check passes on a prefix). HARD-ERROR instead.
+            if let Some(rem) = self.entries_remaining {
+                if rem > 0 {
+                    return Some(Err(SerializationError::CborDecode(format!(
+                        "tvar: definite-length tables map declared {rem} more entr{} but \
+                         reached EOF — TRUNCATED snapshot prefix. Haskell decodeMapLen \
+                         demands exactly N entries (DecoderErrorPrematureEOF); refusing a \
+                         silent partial UTxO-set import",
+                        if rem == 1 { "y" } else { "ies" }
+                    ))));
+                }
+            }
+            // A definite-length map exhausted exactly at its declared count (or an
+            // indefinite map already break-terminated) ends cleanly.
             return None;
         }
         if remaining[0] == 0xff {
@@ -1628,6 +1649,10 @@ impl<'a> Iterator for TvarIterator<'a> {
                         consumed,
                         val_bytes.len()
                     ))));
+                }
+                // #20b: one declared definite-map entry consumed.
+                if let Some(rem) = &mut self.entries_remaining {
+                    *rem = rem.saturating_sub(1);
                 }
                 Some(Ok((txin, txout)))
             }
