@@ -1220,14 +1220,17 @@ fn read_plutus_data_depth(
                     // Positive bignum: tag was already consumed, just read bytes.
                     // CBOR §3.4.3 + Cardano `bounded_bytes`: the mantissa may
                     // be encoded as indefinite-length chunks. Use the
-                    // chunked-aware reader (#673).
-                    let bytes = r.read_bytes_owned()?;
+                    // chunked-aware reader (#673). The mantissa is a PlutusData
+                    // ByteString leaf, so enforce the 64-byte-per-chunk bound
+                    // (Note [The 64-byte limit], #28).
+                    let bytes = r.read_bounded_plutus_bytes()?;
                     let val = BigInt::from_bytes_be(num_bigint::Sign::Plus, &bytes);
                     Ok(PlutusData::Integer(val))
                 }
                 3 => {
                     // Negative bignum: tag was already consumed, just read bytes.
-                    let bytes = r.read_bytes_owned()?;
+                    // Mantissa is a PlutusData ByteString leaf — bounded (#28).
+                    let bytes = r.read_bounded_plutus_bytes()?;
                     let n = BigInt::from_bytes_be(num_bigint::Sign::Plus, &bytes);
                     Ok(PlutusData::Integer(-BigInt::from(1) - n))
                 }
@@ -1279,12 +1282,11 @@ fn read_plutus_data_depth(
             let v = r.read_int()?;
             Ok(PlutusData::Integer(BigInt::from(v)))
         }
-        Type::Bytes => {
-            let bytes = r.read_bytes_owned()?;
-            Ok(PlutusData::Bytes(bytes))
-        }
-        Type::BytesIndef => {
-            let bytes = r.read_indef_bytes()?;
+        Type::Bytes | Type::BytesIndef => {
+            // PlutusData ByteString leaf: enforce the plutus 64-byte-per-chunk
+            // bound (Note [The 64-byte limit]). Definite > 64 => Err; each
+            // indefinite chunk must be <= 64 (total unbounded). See #28.
+            let bytes = r.read_bounded_plutus_bytes()?;
             Ok(PlutusData::Bytes(bytes))
         }
         other => Err(SerializationError::CborDecode(format!(
@@ -2297,5 +2299,122 @@ mod tests {
         let mut r = Reader::new(&data);
         let ns = read_native_script_from_cbor(&mut r).unwrap();
         assert!(matches!(ns, NativeScript::ScriptPubkey(_)));
+    }
+
+    // ── Alonzo PlutusData 64-byte ByteString-leaf bound (#28) ─────────────────
+    //
+    // The Alonzo PlutusData decoder is a SEPARATE code path from the Conway one
+    // (with inline tag-2/tag-3 bignum arms), so it needs its own coverage of
+    // Note [The 64-byte limit] / decodeBoundedBytes(IndefLen).
+
+    /// Definite-length CBOR byte string header + payload (Alonzo test helper).
+    fn def_bytes(payload: &[u8]) -> Vec<u8> {
+        let n = payload.len();
+        let mut v = if n <= 23 {
+            vec![0x40 | n as u8]
+        } else if n <= 0xff {
+            vec![0x58, n as u8]
+        } else {
+            let b = (n as u16).to_be_bytes();
+            vec![0x59, b[0], b[1]]
+        };
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// Indefinite-length CBOR byte string (`0x5f <chunks> 0xff`).
+    fn indef_bytes(chunks: &[&[u8]]) -> Vec<u8> {
+        let mut v = vec![0x5fu8];
+        for c in chunks {
+            v.extend_from_slice(&def_bytes(c));
+        }
+        v.push(0xff);
+        v
+    }
+
+    fn decode_alonzo_pd(cbor: &[u8]) -> Result<PlutusData, SerializationError> {
+        let mut r = Reader::new(cbor);
+        read_plutus_data(&mut r)
+    }
+
+    #[test]
+    fn alonzo_plutus_bytes_definite_64_ok_65_err() {
+        let ok = vec![0xABu8; 64];
+        assert_eq!(
+            decode_alonzo_pd(&def_bytes(&ok)).expect("64 ok"),
+            PlutusData::Bytes(ok)
+        );
+        let bad = vec![0xABu8; 65];
+        let err = decode_alonzo_pd(&def_bytes(&bad)).expect_err("65 must reject");
+        assert!(matches!(&err, SerializationError::CborDecode(m) if m.contains("64 bytes")));
+    }
+
+    #[test]
+    fn alonzo_plutus_bytes_indef_chunk_64_ok_65_err() {
+        let ok = vec![0x11u8; 64];
+        assert_eq!(
+            decode_alonzo_pd(&indef_bytes(&[&ok])).expect("64 chunk ok"),
+            PlutusData::Bytes(ok)
+        );
+        let bad = vec![0x11u8; 65];
+        let err = decode_alonzo_pd(&indef_bytes(&[&bad])).expect_err("65 chunk must reject");
+        assert!(matches!(&err, SerializationError::CborDecode(m) if m.contains("64 bytes")));
+    }
+
+    #[test]
+    fn alonzo_plutus_bytes_indef_two_64_chunks_total_128_ok() {
+        let a = vec![0x22u8; 64];
+        let b = vec![0x33u8; 64];
+        let pd = decode_alonzo_pd(&indef_bytes(&[&a, &b])).expect("128 total ok");
+        let mut expected = a.clone();
+        expected.extend_from_slice(&b);
+        assert_eq!(pd, PlutusData::Bytes(expected));
+    }
+
+    #[test]
+    fn alonzo_plutus_bytes_indef_zero_length_chunk_ok() {
+        let empty: &[u8] = &[];
+        let b = vec![0x44u8; 8];
+        let pd = decode_alonzo_pd(&indef_bytes(&[empty, &b])).expect("0-length chunk ok");
+        assert_eq!(pd, PlutusData::Bytes(b));
+    }
+
+    #[test]
+    fn alonzo_plutus_bignum_mantissa_64_ok_65_err() {
+        // tag(2) positive bignum mantissa: 0xc2 then bytes.
+        let ok = vec![0x01u8; 64];
+        let mut cbor_ok = vec![0xc2u8];
+        cbor_ok.extend_from_slice(&def_bytes(&ok));
+        assert!(matches!(
+            decode_alonzo_pd(&cbor_ok).expect("64 mantissa ok"),
+            PlutusData::Integer(_)
+        ));
+
+        let bad = vec![0x01u8; 65];
+        let mut cbor_bad = vec![0xc2u8];
+        cbor_bad.extend_from_slice(&def_bytes(&bad));
+        let err = decode_alonzo_pd(&cbor_bad).expect_err("65 mantissa must reject");
+        assert!(matches!(&err, SerializationError::CborDecode(m) if m.contains("64 bytes")));
+
+        // tag(3) negative bignum: 65-byte indef chunk mantissa must also reject.
+        let mut cbor_neg = vec![0xc3u8];
+        cbor_neg.extend_from_slice(&indef_bytes(&[&bad]));
+        let err3 = decode_alonzo_pd(&cbor_neg).expect_err("tag3 65 indef chunk must reject");
+        assert!(matches!(&err3, SerializationError::CborDecode(m) if m.contains("64 bytes")));
+    }
+
+    /// OVER-STRICTNESS GUARD (Alonzo): a >64-byte non-PlutusData bytestring
+    /// (e.g. an Alonzo PlutusV1 script blob) still decodes via the generic
+    /// owned reader. The bound is PlutusData-leaf only.
+    #[test]
+    fn alonzo_over_strictness_guard_non_plutus_blob_over_64_ok() {
+        let blob = vec![0x7Eu8; 128];
+        let cbor = def_bytes(&blob);
+        let mut r = Reader::new(&cbor);
+        assert_eq!(
+            r.read_bytes_owned()
+                .expect(">64 non-plutus blob must decode"),
+            blob
+        );
     }
 }

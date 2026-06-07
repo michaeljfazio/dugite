@@ -2510,8 +2510,13 @@ fn read_plutus_data_depth(
             let tag_val = r.probe_tag()?;
             match tag_val {
                 2 | 3 => {
-                    // bignum — delegate to read_bigint which consumes the tag
-                    let big = r.read_bigint()?;
+                    // bignum: the mantissa is a PlutusData ByteString leaf, so
+                    // it must obey the plutus 64-byte-per-chunk bound (Note
+                    // [The 64-byte limit], #28). Route through the bounded
+                    // PlutusData bigint reader rather than the generic
+                    // `read_bigint` (which uses the unbounded `read_bytes_owned`
+                    // and is shared with non-PlutusData decode paths).
+                    let big = r.read_bounded_plutus_bigint()?;
                     Ok(PlutusData::Integer(big))
                 }
                 121..=127 => {
@@ -2574,7 +2579,10 @@ fn read_plutus_data_depth(
             Ok(PlutusData::Integer(big))
         }
         Type::Bytes | Type::BytesIndef => {
-            let bytes = r.read_bytes_owned()?;
+            // PlutusData ByteString leaf: enforce the plutus 64-byte-per-chunk
+            // bound (Note [The 64-byte limit]). Definite > 64 => Err; each
+            // indefinite chunk must be <= 64 (total unbounded). See #28.
+            let bytes = r.read_bounded_plutus_bytes()?;
             Ok(PlutusData::Bytes(bytes))
         }
         other => Err(SerializationError::CborDecode(format!(
@@ -4282,6 +4290,296 @@ mod tests {
                 assert_eq!(s, 1234)
             }
             other => panic!("expected NativeScript(InvalidHereafter), got {other:?}"),
+        }
+    }
+
+    // ── PlutusData 64-byte ByteString-leaf bound (#28, Note [The 64-byte limit]) ──
+    //
+    // Mirrors Haskell `plutus` PlutusCore.Data.decodeData
+    // `decodeBoundedBytes` / `decodeBoundedBytesIndefLen`:
+    //   * definite-length leaf  > 64 bytes  => Err
+    //   * indefinite form: EACH single chunk must be <= 64 bytes (any chunk
+    //     > 64 => Err); the concatenated TOTAL may exceed 64 (unbounded).
+    //   * a 0-length chunk is allowed.
+    //   * the tag-2 / tag-3 bignum mantissa is also a leaf — bounded the same way.
+    //
+    // The same rule must NOT touch generic (non-PlutusData) bytestrings.
+
+    /// Encode a definite-length CBOR byte string header + payload.
+    fn def_bytes(payload: &[u8]) -> Vec<u8> {
+        let n = payload.len();
+        let mut v = if n <= 23 {
+            vec![0x40 | n as u8]
+        } else if n <= 0xff {
+            vec![0x58, n as u8]
+        } else {
+            let b = (n as u16).to_be_bytes();
+            vec![0x59, b[0], b[1]]
+        };
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// Encode an indefinite-length CBOR byte string (`0x5f <chunks> 0xff`),
+    /// each chunk being a definite-length byte string.
+    fn indef_bytes(chunks: &[&[u8]]) -> Vec<u8> {
+        let mut v = vec![0x5fu8];
+        for c in chunks {
+            v.extend_from_slice(&def_bytes(c));
+        }
+        v.push(0xff);
+        v
+    }
+
+    /// Wrap a (definite or indefinite) byte-string encoding in a `tag(2)`
+    /// positive-bignum header.
+    fn tag2(mantissa: Vec<u8>) -> Vec<u8> {
+        let mut v = vec![0xc2u8]; // tag(2)
+        v.extend_from_slice(&mantissa);
+        v
+    }
+
+    /// Wrap a (definite or indefinite) byte-string encoding in a `tag(3)`
+    /// negative-bignum header.
+    fn tag3(mantissa: Vec<u8>) -> Vec<u8> {
+        let mut v = vec![0xc3u8]; // tag(3)
+        v.extend_from_slice(&mantissa);
+        v
+    }
+
+    fn decode_pd(cbor: &[u8]) -> Result<PlutusData, SerializationError> {
+        let mut r = Reader::new(cbor);
+        read_plutus_data(&mut r)
+    }
+
+    #[test]
+    fn plutus_bytes_definite_64_ok() {
+        let payload = vec![0xABu8; 64];
+        let pd = decode_pd(&def_bytes(&payload)).expect("64-byte definite leaf must decode");
+        assert_eq!(pd, PlutusData::Bytes(payload));
+    }
+
+    #[test]
+    fn plutus_bytes_definite_65_err() {
+        let payload = vec![0xABu8; 65];
+        let err = decode_pd(&def_bytes(&payload)).expect_err("65-byte definite leaf must reject");
+        assert!(
+            matches!(&err, SerializationError::CborDecode(m) if m.contains("64 bytes")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn plutus_bytes_indef_single_chunk_64_ok() {
+        let chunk = vec![0x11u8; 64];
+        let pd = decode_pd(&indef_bytes(&[&chunk])).expect("64-byte indef chunk must decode");
+        assert_eq!(pd, PlutusData::Bytes(chunk));
+    }
+
+    #[test]
+    fn plutus_bytes_indef_single_chunk_65_err() {
+        let chunk = vec![0x11u8; 65];
+        let err = decode_pd(&indef_bytes(&[&chunk])).expect_err("65-byte indef chunk must reject");
+        assert!(
+            matches!(&err, SerializationError::CborDecode(m) if m.contains("64 bytes")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn plutus_bytes_indef_two_64_chunks_total_128_ok() {
+        // Two <=64 chunks: concatenated total (128) MAY exceed 64 — unbounded.
+        let a = vec![0x22u8; 64];
+        let b = vec![0x33u8; 64];
+        let pd =
+            decode_pd(&indef_bytes(&[&a, &b])).expect("two 64-byte chunks (total 128) must decode");
+        let mut expected = a.clone();
+        expected.extend_from_slice(&b);
+        assert_eq!(pd, PlutusData::Bytes(expected));
+    }
+
+    #[test]
+    fn plutus_bytes_indef_zero_length_chunk_ok() {
+        // A 0-length chunk is permitted (alongside a non-empty one).
+        let a: &[u8] = &[];
+        let b = vec![0x44u8; 10];
+        let pd = decode_pd(&indef_bytes(&[a, &b])).expect("0-length chunk must decode");
+        assert_eq!(pd, PlutusData::Bytes(b));
+    }
+
+    #[test]
+    fn plutus_bytes_indef_second_chunk_65_err() {
+        // First chunk fine; the SECOND chunk (65) must trip the per-chunk bound.
+        let a = vec![0x55u8; 64];
+        let b = vec![0x66u8; 65];
+        let err = decode_pd(&indef_bytes(&[&a, &b]))
+            .expect_err("a >64 chunk anywhere in the stream must reject");
+        assert!(
+            matches!(&err, SerializationError::CborDecode(m) if m.contains("64 bytes")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn plutus_bignum_mantissa_definite_64_ok() {
+        let mantissa = vec![0x01u8; 64];
+        // tag(2): positive bignum with a 64-byte mantissa.
+        let pd = decode_pd(&tag2(def_bytes(&mantissa)))
+            .expect("64-byte bignum mantissa (tag2 definite) must decode");
+        assert!(matches!(pd, PlutusData::Integer(_)));
+        // tag(3): negative bignum, same mantissa bound.
+        let pd3 = decode_pd(&tag3(def_bytes(&mantissa)))
+            .expect("64-byte bignum mantissa (tag3 definite) must decode");
+        assert!(matches!(pd3, PlutusData::Integer(_)));
+    }
+
+    #[test]
+    fn plutus_bignum_mantissa_definite_65_err() {
+        let mantissa = vec![0x01u8; 65];
+        let err = decode_pd(&tag2(def_bytes(&mantissa)))
+            .expect_err("65-byte bignum mantissa (tag2 definite) must reject");
+        assert!(
+            matches!(&err, SerializationError::CborDecode(m) if m.contains("64 bytes")),
+            "unexpected error: {err:?}"
+        );
+        let err3 = decode_pd(&tag3(def_bytes(&mantissa)))
+            .expect_err("65-byte bignum mantissa (tag3 definite) must reject");
+        assert!(
+            matches!(&err3, SerializationError::CborDecode(m) if m.contains("64 bytes")),
+            "unexpected error: {err3:?}"
+        );
+    }
+
+    #[test]
+    fn plutus_bignum_mantissa_indef_chunk_65_err() {
+        let chunk = vec![0x01u8; 65];
+        let err = decode_pd(&tag2(indef_bytes(&[&chunk])))
+            .expect_err("65-byte bignum mantissa (tag2 indef chunk) must reject");
+        assert!(
+            matches!(&err, SerializationError::CborDecode(m) if m.contains("64 bytes")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn plutus_bignum_mantissa_indef_two_64_chunks_ok() {
+        // tag(2) mantissa as two 64-byte chunks: per-chunk bound respected,
+        // total (128) unbounded.
+        let a = vec![0x01u8; 64];
+        let b = vec![0x02u8; 64];
+        let pd = decode_pd(&tag2(indef_bytes(&[&a, &b])))
+            .expect("two 64-byte mantissa chunks must decode");
+        assert!(matches!(pd, PlutusData::Integer(_)));
+    }
+
+    /// OVER-STRICTNESS GUARD: a >64-byte NON-PlutusData bytestring (here a
+    /// Plutus script blob in a Conway witness set) is STILL accepted. The
+    /// 64-byte rule applies ONLY to PlutusData leaves, never to generic
+    /// `read_bytes_owned` / `read_indef_bytes` callers (vkeys, scripts,
+    /// addresses, asset names, metadata, ...).
+    #[test]
+    fn over_strictness_guard_non_plutus_script_blob_over_64_ok() {
+        // A 200-byte definite bytestring read via the generic owned reader.
+        let blob = vec![0x7Eu8; 200];
+        let cbor = def_bytes(&blob);
+        let mut r = Reader::new(&cbor);
+        let read = r
+            .read_bytes_owned()
+            .expect(">64-byte non-PlutusData bytestring must still decode");
+        assert_eq!(read, blob);
+
+        // And via the generic indefinite reader: two 200-byte chunks (each
+        // individually >64) must concatenate fine — the bound does not apply.
+        let big = vec![0x7Du8; 200];
+        let indef = indef_bytes(&[&big, &big]);
+        let mut r2 = Reader::new(&indef);
+        let read2 = r2
+            .read_indef_bytes()
+            .expect(">64-byte non-PlutusData indef chunks must still decode");
+        assert_eq!(read2.len(), 400);
+    }
+
+    proptest::proptest! {
+        /// Length-lattice property: for a single definite-length PlutusData
+        /// byte-string leaf, decode succeeds iff len <= 64.
+        #[test]
+        fn prop_plutus_definite_leaf_bound(len in 0usize..=160) {
+            let payload = vec![0x5Au8; len];
+            let res = decode_pd(&def_bytes(&payload));
+            if len <= 64 {
+                proptest::prop_assert!(res.is_ok(), "len {} <= 64 must decode", len);
+                proptest::prop_assert_eq!(res.unwrap(), PlutusData::Bytes(payload));
+            } else {
+                proptest::prop_assert!(res.is_err(), "len {} > 64 must reject", len);
+            }
+        }
+
+        /// Length-lattice property: a single indefinite chunk is bounded the
+        /// same way as a definite leaf (per-chunk <= 64).
+        #[test]
+        fn prop_plutus_indef_single_chunk_bound(len in 0usize..=160) {
+            let chunk = vec![0x6Bu8; len];
+            let res = decode_pd(&indef_bytes(&[&chunk]));
+            if len <= 64 {
+                proptest::prop_assert!(res.is_ok(), "chunk len {} <= 64 must decode", len);
+            } else {
+                proptest::prop_assert!(res.is_err(), "chunk len {} > 64 must reject", len);
+            }
+        }
+
+        /// Length-lattice property: TWO chunks each <= 64 always decode (total
+        /// unbounded); if EITHER chunk > 64 the whole leaf rejects.
+        #[test]
+        fn prop_plutus_indef_two_chunk_per_chunk_bound(
+            a in 0usize..=160,
+            b in 0usize..=160,
+        ) {
+            let ca = vec![0x01u8; a];
+            let cb = vec![0x02u8; b];
+            let res = decode_pd(&indef_bytes(&[&ca, &cb]));
+            if a <= 64 && b <= 64 {
+                proptest::prop_assert!(
+                    res.is_ok(),
+                    "both chunks <=64 (a={}, b={}, total={}) must decode",
+                    a, b, a + b
+                );
+            } else {
+                proptest::prop_assert!(
+                    res.is_err(),
+                    "a chunk >64 (a={}, b={}) must reject",
+                    a, b
+                );
+            }
+        }
+
+        /// Length-lattice property: the tag-2 bignum mantissa leaf obeys the
+        /// same definite-length bound.
+        #[test]
+        fn prop_plutus_bignum_mantissa_bound(len in 1usize..=160) {
+            let mantissa = vec![0x01u8; len];
+            let res = decode_pd(&tag2(def_bytes(&mantissa)));
+            if len <= 64 {
+                proptest::prop_assert!(res.is_ok(), "mantissa len {} <= 64 must decode", len);
+            } else {
+                proptest::prop_assert!(res.is_err(), "mantissa len {} > 64 must reject", len);
+            }
+        }
+
+        /// OVER-STRICTNESS GUARD (property form): a generic non-PlutusData
+        /// bytestring of ANY length (incl. > 64) read via `read_bytes_owned`
+        /// always decodes — the 64-byte rule must not leak into generic readers.
+        #[test]
+        fn prop_generic_bytes_unbounded(len in 0usize..=300) {
+            let blob = vec![0x9Cu8; len];
+            let cbor = def_bytes(&blob);
+            let mut r = Reader::new(&cbor);
+            let read = r.read_bytes_owned();
+            proptest::prop_assert!(
+                read.is_ok(),
+                "generic non-PlutusData bytestring len {} must always decode",
+                len
+            );
+            proptest::prop_assert_eq!(read.unwrap(), blob);
         }
     }
 }
