@@ -125,7 +125,7 @@
    Flipped the now-wrong V1/V2 script-first test; added contrast tests (V1/V2 key-first vs V3 script-first; reward index over
    ledger script-first). *** INDEPENDENTLY RE-VERIFIED (#438): diff sorts by derived Ord not cmp_ledger; fmt=0 clippy=0
    nextest 732/732 PASS incl. the 3 contrast tests. Patch backup refreshed (candidate-fix-26-27-credord.patch, 764 lines).
-   state:GAUNTLET attempts:2 conf:0.85. *** NEXT WAKE — RE-RUN the gauntlet (gauntlet-credord.workflow.js, all 3 lenses) on the
+   state:DONE attempts:2 conf:0.92. COMMITTED 4fe61ad011 wake353 (gauntlet wpydujp5u PASSED 0/3 substantive; V1/V2 Plutus Key<Script + V3/index/votes ledger Script<Key). *** NEXT WAKE — RE-RUN the gauntlet (gauntlet-credord.workflow.js, all 3 lenses) on the
    CORRECTED code; if it passes (the Haskell-Ord lens should now pass: V1/V2 Key<Script + V3 Script<Key + index ledger), COMMIT
    #26+#27 (local, 2 crates = 1 commit). NO origin push. Fix stays uncommitted until the gauntlet passes.
 27. [H][phase2][NEW] WITHDRAWALS (Rewarding) ordering inversion (manifestation B of the key<script vs script<key theme; DISTINCT
@@ -148,7 +148,9 @@
    gate = Haskell-RewardAccount-Ord match + proptests + provable no-op.
    *** GAUNTLET REFUTED wake348 (with #26): the V1/V2 txInfoWdrl part of this fix is WRONG (must be Plutus Key<Script, not
    ledger Script<Key). V3 txInfoWdrl + Reward redeemer-index are correct. Surgical correction with #26 next FIXING.
-   state:FIXING attempts:2 conf:0.65 (with #26)
+   *** REWORK DONE wake352 + GAUNTLET PASSED wake353 (with #26): V1/V2 txInfoWdrl now Plutus Key<Script (derived Ord); V3 +
+   Reward redeemer-index stay ledger Script<Key. Re-gauntlet wpydujp5u 0/3 substantive. COMMITTED 4fe61ad011.
+   state:DONE attempts:2 conf:0.92 (with #26, committed 4fe61ad011)
 28. [H][serialization][NEW] PlutusData decoder accepts >64-byte definite bytestrings (no bounded_bytes 64-byte cap).
    read_plutus_data_depth reads Type::Bytes via read_bytes_owned() / BytesIndef with NO length check (era_alonzo.rs:1282-1288;
    era_conway.rs:2576-2579; bignum mantissa era_alonzo.rs:1224/1230, era_conway.rs:2514 via read_bigint). Haskell plutus
@@ -435,7 +437,16 @@
    reconstruction + #7 sub-tx forward). state:DONE attempts:0
 
 ## In-progress
-- item: #26+#27 FIXING-REWORK DONE (V1/V2→Plutus Key<Script; V3+index stay ledger Script<Key) → state:GAUNTLET. NEXT: re-run the gauntlet; commit on pass.
+- item: #26+#27 DONE (committed 4fe61ad011) — ledger-ordered ScriptContext creds, gauntlet PASSED 0/3. NEXT: #28 [H] PlutusData >64-byte bytestring cap.
+  *** wake353 (ultracode): re-ran the Tier-A' gauntlet (wpydujp5u, 3 lenses) on the CORRECTED code → PASSED 0/3, each lens
+  SUBSTANTIVE (code-read + tests, not a vote count — the wake348 1/3 "pass" had hidden a real bug, so substance matters).
+  Confirmed: V1/V2 txInfoWdrl = Plutus Key<Script (derived Ord); V3 + Reward/Vote redeemer index + txInfoVotes = ledger
+  Script<Key; V1/V2 redeemer index correctly stays ledger order (field-vs-index opposite, per cardano-ledger). Engine-verified
+  independently: resolve_reward uses ledger_ordered_withdrawals; fmt+clippy+nextest 732/732 + cargo check --workspace clean.
+  COMMITTED 4fe61ad011 (dugite-primitives + dugite-uplc, local; no origin push). #26+#27 CLOSED. *** REMAINING re-audit backlog:
+  #28 [H] PlutusData decoder accepts >64-byte definite bytestrings (no bounded_bytes cap) — next, highest impact; then #29 [M]
+  TreasuryWithdrawals double-subtract, #30 [M] txInfoSignatories sort, #31 [M] witness-set silent-skip, #26b (excluded gov-map
+  ordering: TreasuryWithdrawals/UpdateCommittee maps + gov-CBOR), #24 (deferred). NEXT WAKE: SCHEDULE #28 → DIAGNOSE/FIX.
   *** wake352 (ultracode): DRIVE the surgical FIXING rework (rework Workflow w9jx0lhjm, hosted in-turn). The agent SOURCE-
   CONFIRMED (hard gate, quoted canonical cardano-ledger + plutus) that V1/V2 txInfoWdrl = Plutus Key<Script (Alonzo
   transWithdrawals → fresh Plutus Map → Map.toList by PubKeyCredential<ScriptCredential) and V3 = ledger Script<Key (Conway
@@ -3035,6 +3046,16 @@
 - db-clones/preprod-ep57-fixed   (fixed-binary replay, in progress)
 
 ## Gauntlet ledger  (passed/refuted approaches — never silently retry a REFUTED)
+- PASSED 2026-06-08 (wake353, #26/#27 REWORKED fix, gauntlet wpydujp5u): the per-consumer ledger-order fix WITH the V1/V2
+  correction. 0/3 refute, each lens SUBSTANTIVE (read code + ran tests, not just a vote): (1) V1/V2 txInfoWdrl = Plutus
+  Key<Script via withdrawals_to_plutus derived-Ord sort (no cmp_ledger in populate_v1_v2.rs), derived PrimCred Ord == Plutus
+  StakingCredential Ord for all cases; (2) V3 txInfoWdrl + Reward/Vote redeemer index + txInfoVotes use ledger Script<Key
+  (cmp_ledger / ledger_ordered_withdrawals / Voter::cmp_ledger), and the V1/V2 redeemer INDEX correctly stays ledger order
+  (field-vs-index deliberately opposite, matching cardano-ledger redeemerPointer over the ledger Map); (3) no common-case
+  regression — V1/V2 byte-identical to pre-fix blob order (0xE-key<0xF-script=Key<Script=derived Ord), real onchain_babbage_
+  scripts_validate + phase2_script_context_regression goldens pass. ENGINE-VERIFIED independently: resolve_reward uses
+  ledger_ordered_withdrawals (0 withdrawals_to_plutus calls); fmt+clippy+nextest 732/732 + cargo check --workspace clean.
+  COMMITTED 4fe61ad011 (2 crates: dugite-primitives + dugite-uplc).
 - REFUTED 2026-06-08 (wake348, #26/#27 fix, gauntlet wuweobtlm): the per-consumer cmp_ledger fix WRONGLY applies ledger
   Script<Key to the V1/V2 txInfoWdrl FIELD. Vote count was 1/3 refute (nominal "pass") but the single refutation is DECISIVE +
   source-backed, so this is a REJECT (don't trust the vote count — #25/#438 discipline). Canonical Haskell: V1/V2
@@ -3171,6 +3192,7 @@
 - 2026-06-08T18:55Z wake347 ~ #26+#27 FIXING→VERIFYING: scanned 769 dumps (0 have withdrawals/votes → corpus can't verify; fix is provable no-op over it). Gate=Haskell-Ord match+proptests+provable-no-op (no on-chain tie-break reference attainable). Next: bounded Koios hunt then commit-by-construction
 - 2026-06-08T19:20Z wake348 ~ #26/#27 GAUNTLET wuweobtlm (3 lenses, in-turn): 1/3 refute but DECISIVE — fix wrongly forces ledger Script<Key on V1/V2 txInfoWdrl (Haskell=Plutus Key<Script; V3+redeemer-indices+votes correct). REJECT; recorded REFUTED; →FIXING attempts:2 (surgical V1/V2 revert next). NO commit
 - 2026-06-08T19:45Z wake352 ~ #26/#27 surgical rework (w9jx0lhjm, in-turn): source-confirmed V1/V2=Plutus Key<Script vs V3=ledger Script<Key; withdrawals_to_plutus→derived Ord, ledger_ordered_withdrawals unchanged for V3+index; INDEPENDENTLY re-verified fmt+clippy+nextest 732/732. →GAUNTLET (re-run next). NO commit
+- 2026-06-08T20:10Z wake353 ~ #26/#27 re-gauntlet wpydujp5u PASSED 0/3 (substantive) on corrected code; engine-verified resolve_reward=ledger order + 732/732 + workspace check; COMMITTED 4fe61ad011 (2 crates). #26+#27 DONE. Next #28
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -4794,3 +4816,8 @@
   withdrawals_to_plutus (V1/V2) sort by the derived PrimCred Ord (Key<Script); kept ledger_ordered_withdrawals (Script<Key) for
   V3 + the Reward redeemer index. 1 file + flipped the wrong test + 2 contrast tests. INDEPENDENTLY re-verified: diff correct,
   fmt+clippy+nextest 732/732 green. Resolves the wake348 gauntlet refutation. NEXT: re-run the gauntlet; commit on pass. NO commit.
+- wake353 2026-06-08: re-ran the #26/#27 Tier-A' gauntlet (wpydujp5u, 3 lenses, in-turn) on the REWORKED code → PASSED 0/3,
+  each lens substantive (the wake348 1/3 "pass" hid a real bug, so substance is what counts). V1/V2 txInfoWdrl=Plutus Key<Script,
+  V3+redeemer-index+votes=ledger Script<Key, V1/V2 index correctly stays ledger. Engine-verified: resolve_reward uses
+  ledger_ordered_withdrawals, fmt+clippy+nextest 732/732 + workspace check clean. COMMITTED 4fe61ad011 (2 crates, local).
+  #26+#27 DONE. NEXT: #28 [H] PlutusData >64-byte bytestring cap.
