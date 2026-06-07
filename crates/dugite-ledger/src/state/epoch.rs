@@ -159,6 +159,18 @@ impl LedgerState {
             }
         }
 
+        // MIR rule — Haskell NEWEPOCH applies MIR BEFORE the EPOCH rule (whose
+        // first sub-rule is SNAP).  `Cardano.Ledger.Shelley.Rules.NewEpoch`:
+        //   es''  <- trans @(EraRule "MIR")   es'    -- MIR first
+        //   es''' <- trans @(EraRule "EPOCH") es''   -- then EPOCH (SNAP→POOLREAP→UPEC)
+        // The MIR credit MUST land in reward_accounts/reserves/treasury and be
+        // visible to the mark snapshot built by SNAP below — otherwise this
+        // boundary's MIR is excluded from go.pool_stake (the sigmaA denominator)
+        // and every reward under-scales.  Mirrors the live shelley.rs fix
+        // 8c868271c9.  Pre-Conway only — Conway produces no MIR certs so the
+        // pending maps are empty and this is a no-op.  See issue #631.
+        super::certificates::apply_pending_mir(&mut self.certs, &mut self.epochs);
+
         // Step 2b: SNAP — rotate snapshots, capture fees, update bprev.
         //
         // In Haskell NEWEPOCH ordering:
@@ -470,13 +482,11 @@ impl LedgerState {
             .pending_retirements
             .retain(|_, epoch| *epoch > new_epoch);
 
-        // MIR rule (Haskell EPOCH ordering: SNAP → POOLREAP → MIR → NEWPP).
-        // Drain the pending `dsIRewards` map and pot-transfer accumulators
-        // into reward_accounts + reserves/treasury per
-        // `Cardano.Ledger.Shelley.Rules.Mir.applyMIR`.  Pre-Conway only —
-        // Conway never produces MIR certs so the pending maps stay empty
-        // and this is a no-op.  See issue #631.
-        super::certificates::apply_pending_mir(&mut self.certs, &mut self.epochs);
+        // (MIR rule moved EARLIER — applied after applyRUpd / before Step 2b SNAP,
+        // matching Haskell NEWEPOCH ordering applyRUpd → MIR → EPOCH(SNAP→POOLREAP
+        // →UPEC).  See the apply_pending_mir call above and the live shelley.rs
+        // fix 8c868271c9; the old SNAP→POOLREAP→MIR placement here excluded a
+        // boundary's MIR credit from the mark snapshot.)
 
         // Capture prevPParams BEFORE PPUP updates curPP, matching Haskell's
         // NEWPP rule: prevPParams = old curPParams (before this boundary's PPUP).
