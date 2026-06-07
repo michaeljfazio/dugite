@@ -157,7 +157,30 @@
    PlutusCore.Data.decodeData uses decodeBoundedBytes / chunked indef; CDDL plutus_data bounded_bytes = bytes .size (0..64).
    dugite ADMITS a tx Haskell REJECTS at deserialization → phase-1 acceptance asymmetry + datum/redeemer-hash divergence
    (adversarial-input). how_to_confirm: PlutusData=Bytes of 65 bytes as a single definite bstr (0x58 0x41 ..) → dugite Ok vs
-   Haskell Codec.Serialise deserialise @Data error; also a 100-byte chunk must round-trip to the 64+rest chunked form. state:NEW attempts:0 conf:0.6
+   Haskell Codec.Serialise deserialise @Data error; also a 100-byte chunk must round-trip to the 64+rest chunked form.
+   *** ROOT-CAUSED wake354 (diagnose Workflow wq6fv0lvv, conf 0.95, hosted in-turn). is_real_gap=TRUE. HASKELL RULE (source:
+   plutus plutus-core/src/PlutusCore/Data.hs decodeData, Note [The 64-byte limit]): every PlutusData LEAF bytestring is capped
+   at 64 bytes at DECODE. decodeData dispatches TypeBytes->decodeBoundedBytes (`unless (BS.length b<=64) $ fail "ByteString
+   exceeds 64 bytes"`), TypeBytesIndef->decodeBoundedBytesIndef (decodeBoundedBytes PER CHUNK → each chunk <=64, but the
+   concatenated TOTAL may exceed 64 across multiple <=64 chunks — ALLOWED; 0-len chunk allowed), and bignum tag-2/3 mantissa via
+   decodeBoundedBigInteger→decodeBoundedBytes (same cap). Consensus-wired: cardano-ledger Cardano.Ledger.Plutus.Data DecCBOR
+   (PlutusData era)=fromPlainDecoder Cborg.decode (=plutus decodeData) for witness datums; BinaryData inline datums via
+   makeBinaryData→decodeFull'; redeemers via the same Data instance — ALL fail at CBOR decode BEFORE any ledger rule. DUGITE GAP:
+   NO 64-byte leaf bound — era_alonzo.rs:1283 (Type::Bytes read_bytes_owned), :1287 (BytesIndef read_indef_bytes, chunk loop
+   reader.rs:446-449 no per-chunk check), :1224/:1230 (bignum mantissa); era_conway.rs:2576-2578 (Bytes|BytesIndef), :2514
+   (bignum via read_bigint reader.rs:520/524). FIX PLAN: add read_bounded_plutus_bytes (mirrors decodeBoundedBytes/
+   decodeBoundedBytesIndefLen): definite >64 → Err; indef ANY single chunk >64 → Err (do NOT bound the total); bignum mantissa
+   same. *** SCOPE GUARD (critical, avoids over-strictness REGRESSION): apply ONLY to the PlutusData decode arms, NOT the generic
+   reader.rs read_bytes_owned/read_indef_bytes (which serve vkeys/KES/VRF/scripts/addresses/asset-names — NOT subject to the
+   plutus 64-byte rule). Tests: unit + length-lattice proptest + fuzz (def 64 ok/65 reject; indef chunk 64 ok/65 reject; two
+   64-chunks=128 total ACCEPT; bignum mantissa 65 reject) per the #538/#539 defensive pattern. CONSENSUS IMPACT: real ACCEPTANCE
+   asymmetry (hash unchanged — over raw bytes — but Haskell rejects at CBOR decode before any ledger rule, so a crafted >64-leaf
+   datum makes dugite admit-to-mempool + ADOPT a block Haskell drops = partition/DoS surface). SEVERITY: LATENT/adversarial only
+   — the canonical Haskell ENCODER always chunks >64-byte bytestrings, so NO honest mainnet/testnet block triggers it; fires only
+   on a crafted block/tx (won't show on normal sync). Genuinely real, default-to-reject posture, close it. Caveat: source from
+   plutus+ledger master HEAD (rule stable since Alonzo); didn't exhaustively trace every Conway redeemer-map site (same Data
+   decoder, high conf). state:ROOT-CAUSED attempts:0 conf:0.95. NEXT: FIXING (read_bounded_plutus_bytes scoped to leaves) +
+   defensive tests; gauntlet over-strictness lens (non-Plutus byte readers UNAFFECTED) before commit.
 29. [M][ledger/governance][NEW] TreasuryWithdrawals double-subtract in a multi-withdrawal epoch. state/governance.rs: enact
    (line 2288 enact_gov_action_impl) physically decrements epochs.treasury when a TreasuryWithdrawals action enacts, AND
    ratify_proposals_impl independently accumulates disbursed withdrawals and subtracts them again from the remaining-treasury
@@ -437,7 +460,15 @@
    reconstruction + #7 sub-tx forward). state:DONE attempts:0
 
 ## In-progress
-- item: #26+#27 DONE (committed 4fe61ad011) — ledger-ordered ScriptContext creds, gauntlet PASSED 0/3. NEXT: #28 [H] PlutusData >64-byte bytestring cap.
+- item: #28 [H] PlutusData >64-byte leaf bytestring ROOT-CAUSED (conf 0.95, Haskell 64-byte-leaf limit confirmed). NEXT: FIXING (read_bounded_plutus_bytes, leaves-only).
+  *** wake354 (ultracode): SCHEDULE #28, DRIVE NEW→ROOT-CAUSED. HEAD-verified the dugite gap myself (era_alonzo.rs:1282-1288
+  Type::Bytes/BytesIndef no length check), then diagnose Workflow wq6fv0lvv (hosted in-turn, conf 0.95) SOURCE-CONFIRMED the
+  Haskell rule: plutus Data.hs decodeBoundedBytes caps every PlutusData LEAF bytestring at 64 bytes and `fail`s above (definite
+  >64, each indef chunk >64, bignum tag-2/3 mantissa >64), enforced at CBOR decode before any ledger rule. is_real_gap=TRUE — a
+  crafted >64-leaf datum is ACCEPTED by dugite but REJECTED by Haskell = partition/DoS surface (LATENT/adversarial — canonical
+  encoders always chunk, so no honest block triggers it). FIX (next): read_bounded_plutus_bytes scoped to the PlutusData decode
+  arms ONLY (NOT generic read_bytes_owned — over-strictness would break vkeys/scripts/addresses); per-chunk <=64 for indef but
+  total may exceed; + length-lattice proptest + fuzz. GAUNTLET must include an over-strictness lens. NEXT WAKE: SCHEDULE #28 FIXING.
   *** wake353 (ultracode): re-ran the Tier-A' gauntlet (wpydujp5u, 3 lenses) on the CORRECTED code → PASSED 0/3, each lens
   SUBSTANTIVE (code-read + tests, not a vote count — the wake348 1/3 "pass" had hidden a real bug, so substance matters).
   Confirmed: V1/V2 txInfoWdrl = Plutus Key<Script (derived Ord); V3 + Reward/Vote redeemer index + txInfoVotes = ledger
@@ -3193,6 +3224,7 @@
 - 2026-06-08T19:20Z wake348 ~ #26/#27 GAUNTLET wuweobtlm (3 lenses, in-turn): 1/3 refute but DECISIVE — fix wrongly forces ledger Script<Key on V1/V2 txInfoWdrl (Haskell=Plutus Key<Script; V3+redeemer-indices+votes correct). REJECT; recorded REFUTED; →FIXING attempts:2 (surgical V1/V2 revert next). NO commit
 - 2026-06-08T19:45Z wake352 ~ #26/#27 surgical rework (w9jx0lhjm, in-turn): source-confirmed V1/V2=Plutus Key<Script vs V3=ledger Script<Key; withdrawals_to_plutus→derived Ord, ledger_ordered_withdrawals unchanged for V3+index; INDEPENDENTLY re-verified fmt+clippy+nextest 732/732. →GAUNTLET (re-run next). NO commit
 - 2026-06-08T20:10Z wake353 ~ #26/#27 re-gauntlet wpydujp5u PASSED 0/3 (substantive) on corrected code; engine-verified resolve_reward=ledger order + 732/732 + workspace check; COMMITTED 4fe61ad011 (2 crates). #26+#27 DONE. Next #28
+- 2026-06-08T20:35Z wake354 ~ #28 NEW→ROOT-CAUSED: diagnose wq6fv0lvv (in-turn, conf 0.95) source-confirmed plutus 64-byte PlutusData leaf limit (decodeBoundedBytes); real latent/adversarial acceptance asymmetry. Fix=read_bounded_plutus_bytes scoped to leaves only. Next FIXING
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -4821,3 +4853,9 @@
   V3+redeemer-index+votes=ledger Script<Key, V1/V2 index correctly stays ledger. Engine-verified: resolve_reward uses
   ledger_ordered_withdrawals, fmt+clippy+nextest 732/732 + workspace check clean. COMMITTED 4fe61ad011 (2 crates, local).
   #26+#27 DONE. NEXT: #28 [H] PlutusData >64-byte bytestring cap.
+- wake354 2026-06-08: SCHEDULE #28, DRIVE NEW→ROOT-CAUSED. HEAD-verified dugite has no 64-byte PlutusData leaf cap, then
+  diagnose Workflow wq6fv0lvv (in-turn, conf 0.95) source-confirmed plutus decodeBoundedBytes (Note [The 64-byte limit]) rejects
+  any PlutusData leaf bytestring >64 (definite, per indef-chunk, bignum mantissa) at CBOR decode before any ledger rule. Real
+  acceptance asymmetry (latent/adversarial partition+DoS surface; canonical encoders always chunk so no honest block triggers).
+  FIX (next): read_bounded_plutus_bytes scoped to PlutusData leaves ONLY (not generic read_bytes_owned — over-strictness guard),
+  per-chunk<=64 not total, + length-lattice proptest + fuzz. state:ROOT-CAUSED. NEXT: FIXING.
