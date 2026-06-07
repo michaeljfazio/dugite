@@ -194,8 +194,18 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-RESOAK (round-4: F1 dup-key + F2 indef-array).
-  *** wake191: FIX muscle wb28q1upc green (1 crate dugite-serialization: mempack/mod.rs F1 first_occurrence_value
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:GAUNTLET-PENDING (5th round, F1+F2 final).
+  *** wake192: verify10B4 import byte-identical (0 phase-1, 0 NotFullyConsumed; node still early at etime ~1min,
+  syncing toward window — wakes came in quick succession). F1 (dup-key, absent in real meta) + F2 (native-decode
+  relaxation) provably can't regress phase-1, so launched 5th RE-GAUNTLET ww5a6h0zx (run wf_bcedc476-060, refuterN=3)
+  in PARALLEL with verify10B4 window sync. Gauntlet item EXPLICITLY scopes #15/#17/#19 OUT (refute only on in-scope
+  serialization+node import defects NOT those 3). NEXT WAKE per wake187 POLICY: on PASS -> COMMIT #10 via gh/HTTPS
+  (2 crates) -> formally file #17/#19, activate #15; on REFUTE -> if the new edge is a REAL-snapshot byte-exactness
+  defect, fix it; if ADVERSARIAL-ONLY (like F1/duplicate-key class) AND no real-snapshot risk, COMMIT #10 core anyway
+  + fold the edge into a 'snapshot-import adversarial-hardening' tracking item (F2 was the last real-snapshot risk;
+  4 rounds done; the byte-exact core is stable across 5 replays — infinite adversarial-edge-chasing is non-productive).
+  Also confirm verify10B4 0-phase-1 past window before commit.
+  was: state:VERIFYING-RESOAK (round-4: F1 dup-key + F2 indef-array). *** wake191: FIX muscle wb28q1upc green (1 crate dugite-serialization: mempack/mod.rs F1 first_occurrence_value
   MapAccess [aeson KM.fromList first-wins] + era_conway.rs/reader.rs F2 read_native_script accept indefinite outer
   array via new Reader::expect_break [cardano-ledger decodeListLikeT/decodeListLenOrIndef]; +tests; also repaired
   bridge-orphaned tests [TxIxEndianness arg, full-consumption contract]). DROVE: copied 4 files to main (2-crate
@@ -1332,6 +1342,9 @@
   not wedged). No transition. Disk 178G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process result.
 - wake189 2026-06-07: POLL #10 FIX muscle wb28q1upc — still RUNNING, ACTIVE (last activity 5s, build/test). No
   transition. Disk 179G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process result.
+- wake192 2026-06-07: #10 VERIFYING-RESOAK -> GAUNTLET-PENDING. verify10B4 byte-identical (0 phase-1, 0
+  NotFullyConsumed). Launched 5th RE-GAUNTLET ww5a6h0zx (wf_bcedc476-060), #15/#17/#19 scoped OUT, parallel to window
+  sync. NEXT WAKE policy: PASS -> commit #10; REFUTE adversarial-only -> commit core + hardening tracking item.
 - wake191 2026-06-07: #10 FIXING -> VERIFYING-BUILDING -> VERIFYING-RESOAK. F1+F2 muscle wb28q1upc green (1 crate;
   F1 aeson first-wins dup-key, F2 read_native_script accept indefinite outer array). Copied to main, BUILD_EXIT=0,
   serialization nextest GREEN (1130 passed), verify10B4 import byte-identical (4116338, codec=1 Big, 0 phase-1, 0
