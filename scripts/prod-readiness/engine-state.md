@@ -209,7 +209,28 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:MIRFIX-VERIFYING (build OK; verification re-replay pid 41385 launched wake302).
+- item: #0 (mainnet ep246 reserves) state:GAUNTLET-PENDING (FIX VERIFIED BYTE-EXACT; gauntlet wodons7bq launched).
+  *** wake303 (ultracode): **MIR-FIX VERIFIED BYTE-EXACT (#438 acceptance MET).** mainnet-mirfix-verify re-replay:
+  ep246 reserves=12,880,948,865,137,767 (diff 0 vs Koios!) + treasury=292,077,855,298,344 (diff 0!) ; ep245 reserves/
+  treasury == Koios (baseline unregressed) ; ep213 == Koios ; ep247 carried-forward +82M GONE. Broad spot-check
+  byte-exact: ep210/220/228/242 all == Koios reserves+treasury. *** ep235 has a PRE-EXISTING +318,200,635,000,000
+  reserves transient (treasury byte-exact) — but it is IDENTICAL pre-fix (mainnet-fix-verify) AND post-fix
+  (mainnet-mirfix-verify) = NOT a regression from this fix; it self-corrects to byte-exact by ep245. Jump at ep234
+  (12,835,708,801,543,869) -> ep235 (13,131,756,222,125,201). Likely a RESERVE-MIR (~318M ADA mainnet reserve MIR)
+  applied at the wrong boundary / a reserve-pot-transfer dugite mistimes. FILED as new backlog item #0b (below).
+  DROVE: SIGTERM'd verify replay 41385; launched adversarial gauntlet wodons7bq (3 opus refuters: MIR double-apply/skip,
+  reserve-MIR vs treasury-MIR, POOLREAP-after-MIR interaction, fee-drain ordering, two-errors-cancel). NEXT WAKE: read
+  gauntlet -> if PASS (refuteCount<2): revert ALL instrumentation (rewards.rs globals+poolstake+drop-trace, shelley.rs
+  breakdown+percred+paid-set; epoch.rs already clean) -> commit CLEAN MIR-ordering fix (shelley.rs ONLY, 1 crate) +
+  PUSH via gh/HTTPS -> #0 DONE. If REFUTED with an empirically-correct dissent: investigate. The fix LIKELY also closes
+  the broad #438-class reward/treasury divergences at every MIR boundary -> re-validate ledger frontiers after commit.
+20b. [H][ledger][REAL-NEW wake303] mainnet ep235 reserves +318,200,635,000,000 TRANSIENT divergence (treasury exact).
+   Reserves JUMP UP ~296T at ep234->235 (dugite 13,131,756,222,125,201 vs Koios 12,813,555,587,125,201), self-corrects
+   to byte-exact by ep245. PRE-EXISTING (identical pre/post the #0 MIR-fix). Likely a RESERVE-source MIR (reserves->
+   treasury or reserves->stake, ~318M ADA — a known early-mainnet reserve MIR) that dugite applies to the wrong
+   boundary OR adds-to instead of subtracts-from reserves. Independent of #0 (which is a TREASURY-MIR snapshot-timing
+   bug). Check koios reserve_withdrawals + the MIR cert at ep234/235; the fix is likely in the same apply_pending_mir /
+   MIR-source(reserves) path. state:NEW attempts:0
   Build OK (release 1m38s, binary 19:24, recompiled dugite-ledger). Launched MIR-fix verification re-replay job
   mainnet-mirfix-verify pid 41385 (from-genesis over CoW clone db-clones/mainnet-rupd-drop, NO instrumentation env,
   dumps -> epoch-dumps-engine/mainnet-mirfix-verify). ~4min to ep246. NEXT WAKE: read mainnet-mirfix-verify/
@@ -3293,3 +3314,8 @@
   verification re-replay job mainnet-mirfix-verify pid 41385 (from-genesis CoW clone, no instrumentation, dumps->
   mainnet-mirfix-verify). next wake: epoch_000246.json reserves==12880948865137767 + treasury==292077855298344 +
   ep213/245 unregressed -> gauntlet -> revert instrumentation -> commit clean MIR-ordering fix.
+- wake303 (ultracode): MIR-FIX VERIFIED BYTE-EXACT (#438 met). ep246 reserves=12880948865137767 (diff 0) + treasury=
+  292077855298344 (diff 0); ep245/213 unregressed; ep210/220/228/242 byte-exact. ep235 +318.2T reserves transient is
+  PRE-EXISTING (identical pre/post fix, corrects by ep245) -> filed as #20b (likely reserve-MIR mistimed). SIGTERM'd
+  verify replay; launched adversarial gauntlet wodons7bq (3 refuters). next wake: gauntlet PASS -> revert instrumentation
+  -> commit+push clean MIR-ordering fix (shelley.rs) -> #0 DONE; likely closes broad MIR-boundary divergence class.
