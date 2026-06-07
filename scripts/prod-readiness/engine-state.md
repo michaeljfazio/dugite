@@ -209,7 +209,7 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:ROOT-CAUSING (globals instrumentation building pid 32254; data-driven re-localize).
+- item: #0 (mainnet ep246 reserves) state:ROOT-CAUSING (polled wake282 — globals build pid 32254 compiling final crate dugite-node; replay next wake). data-driven re-localize via DUGITE_RUPD_GLOBALS.
   *** wake281 (ultracode): cheap data-driven narrowing (NO replay). (1) dump go.total_active_stake =
   22,086,904,770,458,818 == Koios ep245 active_stake BYTE-EXACT -> the sigmaA denominator is correct -> total_active_stake
   RULED OUT (consistent w/ the filter being a no-op). (2) Per user guidance (don't assume), Koios mainnet epoch_params:
