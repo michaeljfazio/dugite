@@ -1130,3 +1130,36 @@ fn backend_enforce_is_aeson_first_wins_on_duplicate_key() {
     // not a JSON object → Err (aeson withObject).
     assert!(enforce_backend(br#"["utxohd-mem"]"#).is_err());
 }
+
+// ── #20 hardening (a): decode_varlen Word64 overflow guard (mempack-exact) ───
+
+#[test]
+fn varlen_max_u64_still_ok_after_overflow_guard() {
+    // u64::MAX must STILL decode Ok. MS byte 0x81 = 1000_0001: continuation +
+    // only bit 0 (the 2^63 bit). 0x81 & 0xFE == 0x80 → passes the guard.
+    let bytes = [0x81, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f];
+    assert_eq!(decode_varlen(&bytes).unwrap(), (u64::MAX, 10));
+}
+
+#[test]
+fn varlen_overflow_10byte_msbyte_rejected() {
+    // 10-byte form whose MS byte has an overflow payload bit set → value > u64::MAX.
+    // MS byte 0x83 = 1000_0011: bit 1 set. 0x83 & 0xFE == 0x82 != 0x80 → Err.
+    // Haskell unpack7BitVarLenLast(0b1111_1110) fails here; dugite previously
+    // returned a TRUNCATED Ok (high bits silently dropped by `acc << 7`).
+    let bytes = [0x83, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f];
+    assert!(
+        decode_varlen(&bytes).is_err(),
+        "10-byte VarLen with overflow MS byte must Err (matches mempack)"
+    );
+    // All-high MS byte 0xff (0xff & 0xfe == 0xfe != 0x80) → also rejected.
+    let all_high = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f];
+    assert!(decode_varlen(&all_high).is_err());
+}
+
+#[test]
+fn varlen_non_minimal_submaximal_still_accepted() {
+    // mempack does NOT reject non-minimal sub-maximal encodings; we must match
+    // (a stricter check could refuse a valid snapshot). 0x80 0x00 = 0 in 2 bytes.
+    assert_eq!(decode_varlen(&[0x80, 0x00]).unwrap(), (0, 2));
+}

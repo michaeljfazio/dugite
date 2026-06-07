@@ -43,20 +43,55 @@ use crate::error::SerializationError;
 /// covers the full u64 range (`ceil(64/7) = 10`).
 const MAX_VARLEN_BYTES: usize = 10;
 
+/// Mask for the most-significant byte of a maximal (10-byte) Word64 VarLen.
+/// Matches `unpack7BitVarLenLast 0b_1111_1110` in `Data.MemPack`: bit 7 is the
+/// continuation marker (must be set on the MS byte of a 10-byte form), bits 6..1
+/// must be zero (they would overflow Word64), bit 0 is unconstrained (it is the
+/// single bit, value 2^63, that legitimately fits).
+const VARLEN_W64_MS_MASK: u8 = 0b_1111_1110;
+
 /// Decode a MemPack VarLen-encoded unsigned integer (MSB-first base-128).
 ///
-/// Returns `(value, bytes_consumed)`. Errors if the encoding is truncated or
-/// exceeds 10 bytes without a terminating byte.
+/// Byte-exact with `mempack`'s `instance MemPack (VarLen Word64)`
+/// (lehins/mempack `Data.MemPack`, `unpack7BitVarLen` / `unpack7BitVarLenLast`):
+/// - errors on empty input,
+/// - errors on a continuation byte at position 10 ("Too many bytes."),
+/// - errors when a 10-byte form's most-significant byte has any of bits 6..1
+///   set (the value would exceed `u64::MAX`; the Haskell `firstByte .&. mask ==
+///   0b_1000_0000` overflow guard — #20 hardening, sub-item a),
+/// - does NOT reject non-minimal (leading-zero) sub-maximal encodings — mempack
+///   accepts them, so rejecting would be STRICTER than Haskell and could refuse
+///   a valid on-disk snapshot.
+///
+/// Returns `(value, bytes_consumed)`.
 pub fn decode_varlen(data: &[u8]) -> Result<(u64, usize), SerializationError> {
     if data.is_empty() {
         return Err(SerializationError::CborDecode("varlen: empty input".into()));
     }
 
+    // `first_cont_byte` latches the most-significant byte: the first byte read
+    // whose continuation bit (0x80) is set. Mirrors mempack's `firstByte`
+    // (0 until the first continuation byte, then fixed).
+    let mut first_cont_byte: u8 = 0;
     let mut acc: u64 = 0;
     for (i, &byte) in data.iter().take(MAX_VARLEN_BYTES).enumerate() {
+        if byte & 0x80 != 0 && first_cont_byte == 0 {
+            first_cont_byte = byte;
+        }
         // Shift existing bits up by 7 and OR in the lower 7 bits of this byte.
         acc = (acc << 7) | ((byte & 0x7f) as u64);
         if byte & 0x80 == 0 {
+            // Terminal byte. On the maximal 10-byte form, validate the
+            // most-significant byte's high bits (the Word64 overflow guard).
+            // For shorter forms the accumulator cannot overflow a u64, so
+            // mempack performs no check and neither do we.
+            if i + 1 == MAX_VARLEN_BYTES && (first_cont_byte & VARLEN_W64_MS_MASK) != 0b_1000_0000 {
+                return Err(SerializationError::CborDecode(format!(
+                    "varlen: overflow — unexpected high bits set in the most-significant \
+                     byte of a 10-byte Word64 VarLen: 0x{first_cont_byte:02x} \
+                     (mempack unpack7BitVarLenLast rejects)"
+                )));
+            }
             return Ok((acc, i + 1));
         }
     }
