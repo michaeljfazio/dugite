@@ -268,6 +268,12 @@
    single-withdrawal + validated-era no-regression, the disbursed-vs-full-sum cap-basis residual for unregistered targets) →
    commit on pass. Test-construction gotcha recorded: reward_account_to_hash keys on the 28-byte CREDENTIAL bytes[1..29], NOT
    byte[0] (network/script header) — vary byte[1] to make distinct accounts.
+31-E. [M][serialization][NEW wake404] Pre-Conway tx-BODY decoders silent-skip unknown keys (sibling of #31-B, out of its
+   Conway/Dijkstra scope). Shelley/Allegra/Mary/Alonzo/Babbage body decoders have `_ => r.skip()` for unknown keys; Haskell's
+   per-era bodyFields (SparseKeyed/invalidField → cborError) HARD-FAILS unknown body keys in those eras too. Flip
+   shelley_body_unknown_key_skipped (era_shelley:2247) + pin each era's exact known-body-key set. Same #539-class adversarial/
+   latent consensus gap. how_to_confirm: pre-Conway body with an unknown key → dugite Ok vs cardano-ledger decCBOR error.
+   state:NEW attempts:0 conf:0.85
 29-order. [L][ledger/governance][NEW wake376] Within-pass gov-action ORDER: dugite ratifies/considers same-priority proposals
    (TreasuryWithdrawals priority 5) in GovActionId/ImblOrdMap byte order, whereas Haskell uses OMap SUBMISSION order. When
    multiple same-priority actions only PARTIALLY fit (e.g. competing TreasuryWithdrawals exceeding the treasury together), this
@@ -361,7 +367,25 @@
    INDEPENDENTLY VERIFIED (#438): git diff = EXACTLY 4 r.skip() removed (all witness-set arms) + 4 rejects; tx-body skips
    (era_conway:667/671 = #31-B) UNTOUCHED (absent from diff); CostModels (cost_models_unknown_keys_ignored) + PParamUpdate
    (pparam_update_unknown_key_skipped) tests STILL PASS (genuinely lenient, NOT flipped); fmt=0 clippy=0 nextest 1176/1176.
-   state:A-DONE attempts:1 conf:0.95 COMMITTED fe101965a0 wake400 (gauntlet w9xgaid4w PASSED 0/3 GOLD-STANDARD: caught+cleared the v12+ version-gate trap + a WebFetch hallucination). #31-B/C/D remain. *** NEXT WAKE — GAUNTLET #31-A (Haskell-reject match + over-strictness lens:
+   state:A-DONE attempts:1 conf:0.95 COMMITTED fe101965a0 wake400 (gauntlet w9xgaid4w PASSED 0/3 GOLD-STANDARD: caught+cleared the v12+ version-gate trap + a WebFetch hallucination).
+   *** #31-B ROOT-CAUSED wake404 (diagnose Workflow w075p3s3n, conf 0.95, PERMALINK-PINNED cd8b7fab — re-verified the v12+ gate
+   by reading Decoder.hs:1198-1257 in full, NO version branch, Nothing→failMsg always fails). ERA-AWARE tx-body reject (dugite's
+   ONE decode_conway_tx_body serves BOTH Conway+Dijkstra). EXACT KNOWN-KEY SETS: CONWAY = {0,1,2,3,4,5,7,8,9,11,13,14,15,16,17,
+   18,19,20,21,22} (gaps 6,10,12,>=23 REJECTED — incl. key 6 pre-Conway `update` which Conway HARD-FAILS, does NOT skip);
+   DIJKSTRA = Conway ∪ {23=sub_transactions,25=direct_deposits,26=account_balance_intervals} (key 14 repurposed reqSigners→guards
+   same number; key 24 is SubTx-level only; rejects 6,10,12,99). Each era rejects the OTHER's unique keys (Conway invalidField 23
+   rejects a Dijkstra key; Dijkstra _ ->Nothing rejects 6/10/12). Haskell src: Conway TxBody.hs:189-265, Dijkstra TxBody.hs:330-
+   455, Decoder.hs:1198-1257 (all permalinked). *** FIX PLAN (delicate): (1) add `era: Era` param to decode_conway_tx_body
+   (era available at all call sites — block decoder line 177, standalone 2793, dijkstra-standalone 2891=Era::Dijkstra; no
+   blocker); (2) GUARD the 23/25/26 arms with `if era == Era::Dijkstra =>` so Conway falls through to reject them; (3) DELETE the
+   `6 => r.skip()` arm (key 6 rejected by both eras — *** CORRECTS the #31-A hint + the imprecise conway.md ref which said
+   "absent/ignored"; raw Haskell REJECTS it ***); (4) replace the default `_ => skip` with an era-aware reject
+   `return Err(CborDecode("{era:?} tx body: unknown/invalid key {key}"))`. (5) FLIP test_dijkstra_unknown_tx_body_key_skipped
+   (era_conway:3440, key99 → rejected, call with Era::Dijkstra); add Conway-rejects-23/25/26 + Dijkstra-accepts-23/25/26 +
+   Conway-rejects-key6 tests. CAVEAT: Dijkstra unreleased (TxBody could change pre-PV12); Conway is mainnet-stable, higher-stakes.
+   SIBLING (out of #31-B scope) → filed #31-E: pre-Conway BODY unknown-key reject (Shelley/Allegra/Mary/Alonzo/Babbage bodies,
+   same SparseKeyed/invalidField; flip shelley_body_unknown_key_skipped era_shelley:2247 + the per-era body sets). #31-B state:
+   ROOT-CAUSED attempts:0 conf:0.95. NEXT: FIXING #31-B. #31-C/D/E remain. *** NEXT WAKE — GAUNTLET #31-A (Haskell-reject match + over-strictness lens:
    confirm only witness-set rejects, body/CostModels/PParamUpdate lenient preserved) → commit. Then #31-B/C/D as separate steps.
 23. [M][phase2][REPRODUCED-AT-HEAD wake323] Babbage V2-Spend BUDGET over-cost (the #730 "fixed-delta structural-context"
    residual). 363/363 tx0 dumps in phase2-dumps-730val/ (769 total across tx-indices) STILL diverge at HEAD via
@@ -622,7 +646,13 @@
    reconstruction + #7 sub-tx forward). state:DONE attempts:0
 
 ## In-progress
-- item: #31-A DONE (committed fe101965a0) — witness-set unknown-key reject, gauntlet PASSED 0/3 gold-standard. NEXT: #31-B (tx-body unknown-key reject, era-aware Dijkstra whitelist).
+- item: #31-B tx-body unknown-key reject ROOT-CAUSED (conf 0.95, exact Conway/Dijkstra key sets pinned). NEXT: FIXING #31-B (era-aware, match-guards, delete key-6 skip).
+  *** wake404 (ultracode): SCHEDULE #31-B, DRIVE NEW→ROOT-CAUSED. diagnose Workflow w075p3s3n (in-turn, conf 0.95, permalink-
+  pinned cd8b7fab; re-verified the v12+ version-gate by reading Decoder.hs in full). EXACT key sets: Conway {0-5,7-9,11,13-22},
+  Dijkstra adds {23,25,26}; gaps 6/10/12/99 rejected by both. Fix: thread `era` into decode_conway_tx_body, guard 23/25/26 with
+  `if era==Dijkstra`, DELETE the `6 => skip` (key 6 hard-rejected — CORRECTS the #31-A hint + an imprecise conway.md note),
+  era-aware reject default arm. Flip test_dijkstra_unknown_tx_body_key_skipped (key99→reject). Filed #31-E (pre-Conway body
+  reject, Shelley+). NEXT WAKE: SCHEDULE #31-B FIXING. #31-C (Conway set-dedup=#30 fix-B), #31-D (dup-map-key), #31-E remain.
   *** wake400 (ultracode): ran the #31-A gauntlet (w9xgaid4w, 3 lenses) → PASSED 0/3, GOLD-STANDARD: lens1 INDEPENDENTLY read
   the RAW cardano-ledger source (cd8b7fab), CAUGHT the WebFetch paraphrase hallucinating that the v12+ witness decoder is lenient,
   and traced decodeSparseKeyed `_ -> Nothing` → failMsg = HARD FAIL (the #30-class version-gate trap, checked+cleared); lens2
@@ -3543,6 +3573,7 @@
 - 2026-06-09T02:30Z wake392 ~ #31 NEW→ROOT-CAUSED: diagnose w2g366xg2 (in-turn, conf 0.55→0.9, REAL) — Haskell SparseKeyed hard-fails unknown wits/body keys (invalidField→cborError, all eras) + Conway PV9+ set dup-reject. 4 parts A/B/C(=#30 fix-B)/D, adversarial/latent #539-class. Next FIXING #31-A (witness-set reject)
 - 2026-06-09T03:00Z wake396 ~ #31 ROOT-CAUSED→FIXING #31-A: fix Workflow wvcniku8l (in-turn) rejected unknown witness-set keys at 4 sites (all eras, permalink-pinned Haskell); OVER-STRICTNESS GUARD verified (only witness-set; body/CostModels/PParamUpdate untouched); 1176/1176. Uncommitted; gauntlet next
 - 2026-06-09T03:30Z wake400 ~ #31-A gauntlet w9xgaid4w PASSED 0/3 GOLD-STANDARD (raw-source recheck caught a WebFetch hallucination + cleared the v12+ version-gate trap; Dijkstra byte-exact). COMMITTED fe101965a0. #31-A DONE. Next #31-B (tx-body, era-aware)
+- 2026-06-09T04:00Z wake404 ~ #31-B NEW→ROOT-CAUSED: diagnose w075p3s3n (in-turn, conf 0.95, permalink-pinned) pinned exact Conway {0-5,7-9,11,13-22} vs Dijkstra +{23,25,26} body-key sets; era-aware fix (thread era, guard 23/25/26, DELETE key-6 skip — corrects #31-A hint). Filed #31-E. Next FIXING #31-B
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -5243,3 +5274,8 @@
   raw cardano-ledger source, CAUGHT a WebFetch hallucination (claimed v12+ lenient) + cleared the #30-class version-gate trap
   (decodeSparseKeyed `_ -> Nothing` = hard fail); lens2 Err-propagation + over-strictness; lens3 Dijkstra byte-exactness.
   COMMITTED fe101965a0 (dugite-serialization, 1 crate). #31-A DONE. NEXT: #31-B (tx-body reject, era-aware Dijkstra whitelist).
+- wake404 2026-06-09: SCHEDULE #31-B, DRIVE NEW→ROOT-CAUSED. diagnose Workflow w075p3s3n (in-turn, conf 0.95, permalink-pinned
+  cd8b7fab + re-read Decoder.hs for the v12+ gate) pinned the EXACT Conway {0-5,7-9,11,13-22} vs Dijkstra (+23/25/26) known-body-
+  key sets. Fix = thread era into decode_conway_tx_body, guard 23/25/26 with if era==Dijkstra, DELETE the `6 => skip` (key 6 is
+  hard-REJECTED — corrects the #31-A hint + an imprecise conway.md note), era-aware reject default. Flip the dijkstra key99 test.
+  Filed #31-E (pre-Conway body reject). state:ROOT-CAUSED. NEXT: FIXING #31-B.
