@@ -1418,6 +1418,9 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
+- wake207 2026-06-07: POLL #15 FIX muscle w1xi3j2nf — still RUNNING (~45min; tool-calls 437->495, iterating on
+  conformance-test assertions from the memo change [serialiseData round-trip], last activity 2s, not wedged). No
+  transition. Disk 165G. #15 stays FIXING. NEXT WAKE: poll/process result.
 - wake206 2026-06-07: POLL #15 FIX muscle w1xi3j2nf — still RUNNING (~40min; 437 agent tool-calls = heavy iteration
   on Data refactor + 999 UPLC conformance tests; last activity 6s, not wedged). No transition. Disk 173G. #15 stays
   FIXING. NEXT WAKE: poll/process result. (Legitimately long — Data enum change ripples through CEK + conformance.)
