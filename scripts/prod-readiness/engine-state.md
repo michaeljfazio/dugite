@@ -209,7 +209,7 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:PAID-SET-INSTRUMENTED (build running; re-replay next wake).
+- item: #0 (mainnet ep246 reserves) state:PAID-SET-INSTRUMENTED (polled wake262 — build pid 97876 still compiling dugite-node release, binary not yet refreshed; re-replay next wake once built).
   *** wake261: added the FULL-PAID-MAP instrumentation. At epoch.rs:104 (after rupd computed, applyRUpd site), env-gated
   DUGITE_RUPD_PAID_EPOCH=<N> -> one-shot dump of dugite's ENTIRE computed reward map (rupd.rewards = paid set,
   post-prefilter) to epoch-dumps-engine/rupd_paid_<N>.txt (header: paid_count, delta_reserves, delta_treasury; then
