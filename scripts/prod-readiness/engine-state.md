@@ -1418,6 +1418,9 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
+- wake202 2026-06-07: POLL #15 FIX muscle w1xi3j2nf (Data verbatim-memo) — still RUNNING, ACTIVE (worktree present,
+  dugite-uplc; Data-memo refactor touches data.rs+denotations.rs+tx_info_populate.rs+Hash/Eq impls+tests). No
+  transition. Disk 174G, no nodes. #15 stays FIXING. NEXT WAKE: poll/process -> build -> replay ep293 window.
 - wake201 2026-06-07: #15 ROOT-CAUSED-CONFIRMED -> FIXING (first item after #10). Assessed: Data enum purely
   structural, dugite-uplc clean+undrifted (no bridge), 1 crate. Launched FIX muscle w1xi3j2nf (wf_75ef4164-1c0):
   optional CBOR memo on Data (Hash/Eq ignore it), threaded from on-chain bytes, serialiseData returns memo. NEXT
