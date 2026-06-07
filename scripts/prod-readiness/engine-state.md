@@ -273,7 +273,21 @@
    invariant, NO replay (Dijkstra undeployed — inert/masked). state:ROOT-CAUSED attempts:0
 
 ## In-progress
-- item: #7 (Dijkstra SUBUTXO stake replay) state:FIXING attempts:0 — fix applied + compiles (UNCOMMITTED). NEXT WAKE: VERIFYING.
+- item: #7 (Dijkstra SUBUTXO stake replay) state:VERIFYING attempts:0 — test added, fail-pre proven + post-fix PASS; gauntlet be81pp91a IN-FLIGHT; lock HELD.
+  *** wake333 (ultracode): #7 FIXING→VERIFYING. Wrote sub_transactions_replay_instant_stake_forward_path test (dijkstra.rs
+  #[cfg(test)], calls apply_sub_transactions directly via the nested test mod — simpler than the full apply_valid_tx shell;
+  reuses super::make_utxo_sub/make_cert_sub/make_epoch_sub). Uses a BASE address (type-0, [0x00]+pay+stake) which routes to
+  a stake credential — the existing sub-tx test used only ENTERPRISE addrs (0x61 → StakeRouting::None) which is WHY it never
+  caught #7. ADD leg: sub-tx spends an enterprise input (no stake) + creates a 4-ADA base output → assert stake_map[cred]==
+  4_000_000 + len==1. SUB leg: a 2nd sub-tx spends that base output → assert stake_map[cred]==0. Computes cred_key via the
+  same stake_routing the fix uses. *** FAIL-PRE PROVEN (structural, definitive): `git show HEAD:dijkstra.rs` apply_sub_
+  transactions has ZERO stake_map/ptr_stake/stake_routing writes → it cannot make the assert Some(4_000_000) pass → the test
+  FAILS pre-fix; POST-FIX it PASSES (nextest 1/1). The fix moves the result; stake-replay logic byte-identical to the proven
+  #6 apply_utxo_diff legs. (Trivial compile fix en route: dropped a {other:?} that needed StakeRouting:Debug.) *** Launched
+  full gauntlet be81pp91a (nextest -p dugite-ledger [new test + existing sub_transactions_round_trip_and_apply + ~1528
+  ledger tests] + clippy -D warnings + fmt). *** ON COMPLETION (this wake): if green → COMMIT focused 1-crate fix
+  (dijkstra.rs ONLY — common.rs #730 left uncommitted) + push → #7 DONE. After #7: open = #24-pin (deferred/heavy), #16 (L).
+  Lock held across async (TTL 22m).
   *** wake332 (ultracode): #7 ROOT-CAUSED→FIXING (hand-impl mirroring #6/apply_utxo_changes — the normal-diff candidate
   patch isn't git-applyable). Changes (dijkstra.rs, 1 crate): (1) apply_sub_transactions signature now takes
   `certs: &mut CertSubState, epochs: &mut EpochSubState`; (2) SUB the spent output's instant-stake on each remove
