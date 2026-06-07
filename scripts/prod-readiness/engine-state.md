@@ -209,7 +209,7 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:RECONCILING (polled wake270 17:03 — workflow w8ufsxjg3 all 8 agents still ACTIVE in Reconcile phase (67-104KB, Koios batches + 0xf1 retries, none done yet); paid set CAPTURED + aligned wake268).
+- item: #0 (mainnet ep246 reserves) state:RECONCILING (polled wake271 17:08 — workflow w8ufsxjg3 ~5/9 agents done, remaining reconcile agents + synthesize finishing (heavy Koios load, 160-182KB); paid set CAPTURED + aligned wake268).
   *** wake268 (ultracode): CAPTURED dugite's full computed reward set epoch-dumps-engine/rupd_paid_246.txt
   (header: epoch=246 paid_count=141596 delta_reserves=24,297,047,052,834 delta_treasury=7,722,113,828,619; then
   <cred_hex> <amount> x141596). KEY RESOLUTION — this is the shelley.rs step-2 rupd COMPUTED+applied at ep246, and it
