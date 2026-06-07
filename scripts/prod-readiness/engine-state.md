@@ -209,7 +209,7 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:PER-DELEGATOR-LOCALIZED (polled wake298 19:13 — analyze muscle w3jqnacgp ACTIVE, splitting dd1971 utxo-vs-reward bucket + localizing). concentrated in whale dd1971 (-2.48B).
+- item: #0 (mainnet ep246 reserves) state:PER-DELEGATOR-LOCALIZED (polled wake299 19:18 — analyze muscle w3jqnacgp research DONE, root-cause agent ACTIVE on bucket-split + code localization). concentrated in whale dd1971 (-2.48B).
   *** wake297 (ultracode): per-delegator diff for pool 263498e0 RECONCILES EXACTLY: Σ(dugite-koios) over 351 matched
   delegators = -2,715,004,435 = the pool's deficit. CONCENTRATED: delegator dd1971af42dabd013cc774fa1190c6f2c7a892765611264d039366c9
   (stake1u8w3jud0gtdt6qfuca605yvscmev02yjwetpzfjdqwfkdjgfmh4py) alone = **-2,483,312,791 (91% of the pool deficit)**.
