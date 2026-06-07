@@ -209,7 +209,32 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:FIXING (applyRUpd PARTITION; trap-aware fix muscle wyidhhb1o ACTIVE, polled wake245 15:08 — code WRITTEN + nextest GREEN (1513 passed); finalizing fmt/clippy + structured output. ep246=Allegra PV3. worktree base ca50afd9ef [stale — bridge diff to HEAD on apply]. REMINDER: green tests != byte-exact; orchestrator MUST dump-verify ep246 reserves before commit).
+- item: #0 (mainnet ep246 reserves) state:DIAGNOSING-DATA (frozen fvAddrsRew MISSING-credential hunt; data-diagnose waum3utic launched).
+  *** wake246: FIX muscle wyidhhb1o RETURNED **NO-CODE-CHANGE (deliberate, #438-disciplined)** + a DECISIVE refinement.
+  Determination: COMPUTE-side. The +82,270,482 split (+82,215,213 reward-accts / +55,269 frTotalUnregistered treasury)
+  is EXACTLY Haskell's apply-time filterAllRewards' partition acting on rewards that WERE computed into `rs` — so the
+  rewards must be COMPUTED first; dugite drops them at compute (member prefilter rewards.rs:461 / leader rewards.rs:509,
+  ACTIVE at pv=3<=6) -> inflate undistributed (rewards.rs:544,576) -> reserves; the apply split (epoch.rs:126-145) never
+  runs. THE DEFECT: dugite's frozen fvAddrsRew set (apply.rs:319-331, from certs.reward_accounts.keys() at ep245
+  startStep) is MISSING credential(s) that Haskell's Map.keysSet(accounts^.accountsMapL) holds. Muscle independently
+  re-confirmed BYTE-EXACT: prefilter LOGIC, startStep capture timing (first block past epoch_first_slot+4k/f, before its
+  certs == Haskell TICK), reward_accounts membership domain (StakeReg inserts/StakeDereg removes == accountsMapL), MIR
+  Map.intersection, POOLREAP refund gate. So it is a DATA-POPULATION gap (a registered cred absent from dugite
+  reward_accounts via a reg/dereg/re-reg or MIR-ordering edge), NOT a logic gap — and it CANNOT be pinned or byte-exact-
+  verified inside the fix worktree (no mainnet replay there). Banked Haskell quotes: startStep FreeVars fvAddrsRew =
+  Map.keysSet(accounts^.accountsMapL); rewardOnePoolMember prefilter = hardforkBabbageForgoRewardPrefilter pv ||
+  hk∈addrsRew (pv>6 bypasses; ep246 PV3 does NOT); filterAllRewards' partitions rs by CURRENT registration ->
+  frRegistered(reward accts)/frTotalUnregistered(treasury); completeStep deltaR2 = oldr <-> sumRewards rs'' -> reserves.
+  HARNESS: full from-genesis dumps ep0-247 exist (epoch-dumps-engine/mainnet-droptrace/, gen 2026-06-06 23:35-37);
+  ep246 has rewards.total_distributed=16,727,254,272,281 + per_pool_top20 + per_credential(154,236 creds, TRUNCATED
+  top-200) + scalars. DROVE (FIXING->DIAGNOSING-DATA): launched opus data-diagnose waum3utic (run wf_8fc7312d-924):
+  dim-A pool-level (dugite per_pool_top20 @ep246 vs Koios pool_history member+leader @ep245 -> the ~82M-under pool ->
+  its dropped member/leader cred), dim-B cred-class (Koios account_reward_history earned_epoch=245 vs dump per_cred ->
+  the missing cred + reg/dereg/re-reg/MIR class; flag if below top-200 truncation -> recommend full-fvAddrsRew
+  instrumentation). NEXT WAKE: read waum3utic -> the specific missing cred + reg-class -> targeted FIX (make dugite
+  reward_accounts/fvAddrsRew include that cred-class) -> VERIFYING re-replay dump ep246 reserves==12880948865137767 +
+  ep209-245 unregressed -> gauntlet -> commit on byte-exact pass. (Toolchain green on unmodified tree: fmt/clippy clean,
+  1513/1513 ledger tests — NOT byte-exactness evidence.)
   *** wake243: DIAGNOSE wz6pe606w COMPLETE — DEFINITIVE localization (conservation decomposition vs Koios `totals`).
   The +82.27M is a conservation-preserving PARTITION error in applyRUpd, NOT a pot/deltaR1 magnitude error. THREE
   deltas sum to EXACTLY 0 at ep246: reserves +82,270,482 (EXCESS via undistributed/deltaR2) ; treasury -55,269
@@ -2622,3 +2647,11 @@
   acceptance + mandated Haskell quotes. #438 GUARD recorded: green tests != byte-exact; orchestrator must
   dump-verify ep246 reserves==12880948865137767 before commit. Reclaimed a stale wake-lock (prior wake wedged
   >1320s TTL). next wake: poll wyidhhb1o -> apply diff to HEAD -> VERIFYING dump.
+- wake246 2026-06-07: FIXING->DIAGNOSING-DATA. Fix muscle wyidhhb1o returned NO-CODE-CHANGE (deliberate, #438-
+  disciplined) + decisive refinement: COMPUTE-side; dugite's frozen fvAddrsRew set (apply.rs:319-331, from
+  certs.reward_accounts.keys() at ep245 startStep) is MISSING credential(s) Haskell's accountsMapL keys holds,
+  so member/leader prefilter (rewards.rs:461/509, active at PV3) drops 82,270,482 -> undistributed -> reserves;
+  apply split never runs. Prefilter logic + capture timing + MIR/POOLREAP all re-confirmed byte-exact == it is a
+  DATA-population gap not a logic gap, unpinnable in the worktree (no replay). Found full ep0-247 dumps from last
+  night's replay (per_credential truncated top-200). Launched opus data-diagnose waum3utic (pool-level + cred-class
+  vs Koios) to identify the missing cred + reg/dereg/re-reg/MIR class. next wake: read waum3utic -> targeted fix.
