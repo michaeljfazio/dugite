@@ -242,7 +242,23 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #23 phase-2 Babbage BUDGET over-cost (the #730 "2 V2-Spend fixed-delta" residual) state:REPRODUCED attempts:0 — re-confirmed at HEAD. NEXT WAKE: DIAGNOSE.
+- item: #23 phase-2 Babbage MEM over-cost state:DIAGNOSING attempts:0 — muscle wogj8wp6h IN-FLIGHT; lock HELD (TTL 22m).
+  *** wake324 (ultracode): #23 REPRODUCED→DIAGNOSING. *** SHARPENED THE FINDING via mechanical prep (phase2_repro on the
+  recurring sample tx0-009d19e79902f946, V2/pv8/4utxos): dugite errors "budget exhausted: cpu_remaining=2798701,
+  mem_remaining=291" — and this is IDENTICAL when the dump's max_ex_cpu/mem are raised to 1e16/1e10 → the per-redeemer
+  budget comes from the TX's DECLARED redeemer exUnits (inside tx_cbor), NOT the max_ex arg (which is only the per-tx cap).
+  KEY: cpu_remaining=2798701 = HEADROOM (cpu cost is byte-exact fine) but mem_remaining=291 = EXHAUSTED → this is a MEM-ONLY
+  over-cost. Many dumps share the IDENTICAL cpu_remaining=2798701/mem_remaining=291 → a FEW distinct recurring V2 scripts
+  (the #730 "fixed-delta" signature). So: dugite's CEK consumes MORE MEM than cardano-node for these V2 scripts, exhausting
+  the declared mem budget that cardano-node fit within. *** DRIVE: launched muscle analyze wogj8wp6h (run wf_a2cfba6d-f8e,
+  2 opus) to (1) measure dugite full consumed mem (budget from tx_cbor redeemer exUnits — needs an override/instrument to
+  see past the abort), (2) get on-chain consumed mem via koios.sh preprod script_redeemers (compute tx hash = blake2b256 of
+  tx body), (3) compute the mem DELTA + check it's a constant fixed amount across 2-3 recurring scripts, (4) root-cause the
+  inflated MEM component vs Haskell PlutusCore ExMemoryUsage — the structural-context hypothesis (dugite ScriptContext Data
+  mem-larger when unConstrData'd/iterated, OR a Constant::Data/Integer/ByteString ExMemoryUsage rule off vs Haskell;
+  conformance passes so it's an under-covered rule). Output = exact file:line + byte-exact Haskell rule + fix shape. *** NEXT
+  WAKE (on auto-notify): RECORD the root-cause → #23 DIAGNOSING→ROOT-CAUSED; then FIXING. Lock held across async (overlapping
+  cron skips; 22m TTL).
   *** wake323 (ultracode): SCHEDULE→DRIVE. SCHEDULE: instead of a heavy from-genesis ep293 replay, ASSESS found
   phase2-dumps-730val/ has 769 SELF-CONTAINED phase-2 divergence dumps (tx_cbor + resolved utxo_pairs + cost_models_cbor +
   budget + protocol_major + slot config) — re-runnable at HEAD via crates/dugite-uplc/examples/phase2_repro.rs (no replay).
