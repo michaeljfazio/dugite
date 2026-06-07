@@ -1614,6 +1614,9 @@
 - wake235 2026-06-07: POLL #0 VERIFY-THEN-FIX muscle w0oegi6uf — still RUNNING (cargo pid 10828, build/test; 33
   epoch_fees/ss_fee refs in rewards.rs = working the fee area; last activity ~2min). No transition. Disk 157G. #0
   stays FIXING. NEXT WAKE: poll/process result.
+- wake241 2026-06-07: POLL #0 per-pool-decomp+applyRUpd DIAGNOSE wz6pe606w — still RUNNING (0/2 dims, active; Koios
+  pool_history resolution). No transition. Disk 166G, no nodes. #0 stays DIAGNOSING. NEXT WAKE: read verdict
+  (compute-intermediate -5ppm OR applyRUpd partition) -> targeted fix.
 - wake240 2026-06-07: #0 deltaR1/eta VERIFIED byte-exact (expectedBlocks=4320 integral; no fix). ANALYTICAL
   CONTRADICTION: 8 rounds prove every reward-formula input byte-exact yet reserves +82.27M -> either a per-pool
   intermediate is off OR the -5ppm is an artifact + the +82M is in applyRUpd (undistributed/unregistered partition).
