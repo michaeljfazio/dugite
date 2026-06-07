@@ -211,14 +211,31 @@
    Conway drops ptr=ptr_stake_excluded). *** Patch candidate-latent-fix-apply_utxo_diff.patch VALIDATED (git apply --check
    passes, full symmetry, 2 non-blocking residuals) + adds an in-module regression test. VERIFY = deterministic forward-vs-
    diff equivalence test (apply_utxo_diff ≡ apply_utxo_changes on stake_map+ptr_stake; no fork replay, no Koios — forward
-   path is the byte-exact reference). See In-progress for the FIXING+VERIFY plan. state:ROOT-CAUSED attempts:0
+   path is the byte-exact reference). See In-progress for the FIXING+VERIFY plan. *** DONE wake317 (committed+pushed
+   8e41d0ae2a): fix landed (apply_utxo_diff replays instant-stake ADD/SUB via shared stake_routing); fail-pre CONFIRMED
+   (regression test FAILS pre-patch left=None vs Some(5000000)) + pass-post GREEN (nextest 1522/1522 + clippy + fmt). The
+   code-invariant gauntlet PASSED. state:DONE attempts:0
 7. [M][ledger] LATENT Dijkstra SUBUTXO bug: apply_sub_transactions mutated utxo_set but NOT stake_map/
    ptr_stake (asymmetry). Valid fix + add_instant_stake/delete_instant_stake helper refactor preserved in
    scripts/prod-readiness/candidate-latent-fix-dijkstra-subutxo.patch + worktree wf_dcc190ba-a5c-1. Inert
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #6 (fork-robustness apply_utxo_diff) state:VERIFYING attempts:0 — fail-pre CONFIRMED; patched gauntlet ba20qc2ea IN-FLIGHT; wake-lock HELD (TTL 22m).
+- item: #6 DONE (committed+pushed 8e41d0ae2a). NEXT WAKE: SCHEDULE picks the next item — see recommendation.
+  *** wake317-cont (ultracode): #6 VERIFYING→DONE. pass-post gauntlet ba20qc2ea GREEN: `cargo nextest -p dugite-ledger`
+  1522/1522 passed (1521 + the new regression test), `clippy --all-targets -- -D warnings` clean, `fmt --check` clean.
+  Combined with the empirically-confirmed FAIL-PRE (regression test FAILED on pre-patch: left=None vs Some(5000000)), the
+  #6 code-invariant gauntlet PASSED (forward path is the byte-exact reference, no Koios — the fail-pre/pass-post test IS the
+  gauntlet). COMMITTED the focused fix 8e41d0ae2a (ledger_seq.rs + state/mod.rs ONLY — verified staged set; common.rs #730
+  left uncommitted) + PUSHED prod-readiness-engine→origin (a70a140165..8e41d0ae2a, HTTPS). #6 closes the fork-induced
+  stake-corruption gap: a live sync hitting a rollback no longer drops instant-stake (the ep57 −5-ADA-on-fork variant).
+  *** NEXT WAKE — SCHEDULE (one-step: don't drive this wake). #10 still BLOCKED (fast-start repro infra gone). Candidates:
+  (1) #7 [M][ledger] Dijkstra SUBUTXO — the EXACT SIBLING of #6 (apply_sub_transactions mutates utxo_set but NOT stake_map/
+  ptr_stake); candidate-latent-fix-dijkstra-subutxo.patch ready; SAME verification pattern just proven (forward-vs-diff
+  equivalence test). Inert today (Dijkstra is a future era) but a quick, low-risk sibling landing while the pattern is hot.
+  (2) #17 [H][security] Mithril snapshot CRC not verified (clean NEW fix). (3) #16/#20 snapshot hardening. RECOMMEND #7
+  (quick sibling, candidate patch ready, same proven verification) OR #17 (H). Housekeeping: db-clones cruft (12×
+  preprod-verify10*/15* @18G + mainnet-rupd-drop @47G) prunable; /tmp/ledger_seq.patched.bak + /tmp/g_*.log removable.
   *** wake317 (ultracode): #6 FIXING→VERIFYING (in-flight). *** FAIL-PRE CONFIRMED EMPIRICALLY (the #438-lesson rigor): temp-
   reverted ledger_seq.rs apply_utxo_diff to its pre-patch utxo-set-only body (keeping the test; patched file backed up at
   /tmp/ledger_seq.patched.bak), ran the regression test (b9a0d9t7t) → FAILED exactly as designed: left=None vs
@@ -2106,6 +2123,12 @@
 - db-clones/preprod-ep57-fixed   (fixed-binary replay, in progress)
 
 ## Gauntlet ledger  (passed/refuted approaches — never silently retry a REFUTED)
+- PASSED 2026-06-07 (wake317, #6): "apply_utxo_diff must replay instant-stake (stake_map+ptr_stake) ADD/SUB
+  symmetrically with the forward apply_utxo_changes path". Gauntlet for this CODE INVARIANT = a deterministic forward-vs-
+  diff regression test (forward path is the byte-exact reference, proven vs Koios at ep57; NO fork replay/Koios needed).
+  FAIL-PRE empirically confirmed (temp-reverted apply_utxo_diff → test FAILED: left=None vs Some(Lovelace(5000000))) +
+  PASS-POST green (nextest 1522/1522 + clippy -D warnings + fmt). candidate-latent-fix-apply_utxo_diff.patch landed as
+  8e41d0ae2a. Haskell ShelleyInstantStake add/delete cross-checked. RESOLVES the fork-induced ep57 −5-ADA stake short.
 - PASSED 2026-06-07 (wake314, #20c): "MIR-before-SNAP reorder in state/epoch.rs::process_epoch_transition (test-only
   path)". Gauntlet = the dugite-ledger test suite (NO replay/Koios reference — test-only DCE'd path). nextest
   1521/1521 PASS + clippy --all-targets -D warnings clean + fmt clean. Reorder proven behaviorally INERT (wake312:
@@ -2140,6 +2163,8 @@
 - 2026-06-07T06:57Z wake243 ~ read definitive diagnose wz6pe606w (applyRUpd partition) + launched trap-aware fix muscle wyidhhb1o
 - 2026-06-07T12:35Z wake314 ~ #20c VERIFYING gauntlet (nextest 1521/1521 + clippy + fmt) + focused commit c974d12169 + DONE/RECORD
 - 2026-06-07T13:xxZ wake315(+cont) ~ SCHEDULE #6 (#10 ruled BLOCKED) + muscle analyze w2x5j3223 (2 opus, root-cause+patch-validate+verify-design) → #6 ROOT-CAUSED
+- 2026-06-07T14:xxZ wake316 ~ #6 FIXING (apply validated patch + compile-check)
+- 2026-06-07T14:xxZ wake317(+cont) ~ #6 VERIFYING→DONE (fail-pre empirical + pass-post 1522/1522+clippy+fmt) + commit/push 8e41d0ae2a
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -3635,3 +3660,8 @@
   location corrected), omits instant-stake ADD/SPEND on stake_map+ptr_stake; candidate patch VALIDATED (applies clean,
   full symmetry); deterministic forward-vs-diff equivalence test designed (no fork replay). #6 ANALYZING→ROOT-CAUSED.
   NEXT WAKE: FIXING (apply patch + add cross-path equivalence test → run → nextest/clippy/fmt → commit; ≤2 crates).
+- wake317(+317-cont) 2026-06-07: #6 FIXING→VERIFYING→DONE. Applied validated patch (apply_utxo_diff replays instant-stake
+  via shared stake_routing). VERIFYING rigor: fail-pre CONFIRMED empirically (temp-reverted apply_utxo_diff → regression
+  test FAILED left=None vs Some(5000000)), restored, pass-post gauntlet ba20qc2ea GREEN (nextest 1522/1522 + clippy + fmt).
+  Code-invariant gauntlet PASSED (forward path = byte-exact reference, no Koios). Committed+pushed focused fix 8e41d0ae2a
+  (ledger_seq.rs + state/mod.rs). #6 closes fork-induced stake corruption. NEXT: SCHEDULE #7 (sibling) or #17 (H Mithril CRC).
