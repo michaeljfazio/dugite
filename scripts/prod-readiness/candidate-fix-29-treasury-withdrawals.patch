@@ -1,0 +1,143 @@
+diff --git a/crates/dugite-ledger/src/state/governance.rs b/crates/dugite-ledger/src/state/governance.rs
+index 322705b419..cc8faa0197 100644
+--- a/crates/dugite-ledger/src/state/governance.rs
++++ b/crates/dugite-ledger/src/state/governance.rs
+@@ -2699,7 +2699,6 @@ pub(crate) fn ratify_proposals_impl(
+ 
+     let mut ratified = Vec::new();
+     let mut delayed = false;
+-    let mut enacted_withdrawals_total: u64 = 0;
+ 
+     for (action_id, action, expires) in &candidates {
+         if *expires < epoch {
+@@ -2730,7 +2729,14 @@ pub(crate) fn ratify_proposals_impl(
+         }
+ 
+         if let Some(state) = snap_proposals.get(action_id) {
+-            let remaining_treasury = epochs.treasury.0.saturating_sub(enacted_withdrawals_total);
++            // Cap basis is the LIVE, per-enact-decremented treasury — mirroring
++            // Haskell Conway `Ratify.hs` `withdrawalCanWithdraw`, which checks
++            // `fold(wdrls) <= ensTreasury` against the threaded `ensTreasury`
++            // that `enact_gov_action_impl` (the payout leg) already decremented
++            // for any earlier withdrawal enacted in this same pass. There is NO
++            // separate accumulator (an accumulator double-subtracts prior
++            // withdrawals, since the treasury was already decremented).
++            let remaining_treasury = epochs.treasury.0;
+             let met = check_ratification_impl(
+                 action_id,
+                 state,
+@@ -2758,11 +2764,6 @@ pub(crate) fn ratify_proposals_impl(
+                     "Governance proposal RATIFIED"
+                 );
+                 enact_gov_action_impl(action, epochs, certs, gov);
+-                if let GovAction::TreasuryWithdrawals { withdrawals, .. } = action {
+-                    enacted_withdrawals_total += withdrawals
+-                        .values()
+-                        .fold(0u64, |acc, a| acc.saturating_add(a.0));
+-                }
+                 // Match Haskell `RatifyState.rsEnactState.ensCommittee`
+                 // threading: when an `UpdateCommittee` or `NoConfidence`
+                 // proposal enacts, refresh the local committee maps from
+@@ -5292,6 +5293,102 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn test_two_treasury_withdrawals_both_enact_in_one_pass() {
++        // Backlog #29 regression: the cap basis for each TreasuryWithdrawals must
++        // be the LIVE, per-enact-decremented treasury — mirroring Haskell Conway
++        // `Ratify.hs` `withdrawalCanWithdraw` (fold(wdrls) <= ensTreasury) against
++        // the threaded `ensTreasury` that the enact (payout) leg already
++        // decremented. The old code ALSO maintained a separate
++        // `enacted_withdrawals_total` accumulator and computed the cap basis as
++        // `treasury - accumulator`, so the second withdrawal saw `treasury - 2*w1`
++        // (a double subtraction of the first withdrawal) and was wrongly blocked
++        // even when the aggregate fit within the treasury.
++        //
++        // Scenario: treasury = 1000M, two 400M withdrawals to DISTINCT registered
++        // reward accounts. Aggregate 800M <= 1000M → BOTH must enact, leaving the
++        // treasury at exactly 200M.
++        let mut state = gov_test_state(10, 0);
++        state.epochs.treasury = Lovelace(1_000_000_000); // 1000M
++
++        // Withdrawal target accounts (distinct from each other and from the
++        // proposal return address, so the disbursements and the deposit refunds
++        // do not co-mingle on the same reward account). All must be registered;
++        // per Haskell `applyEnactedWithdrawals` withdrawals to unregistered
++        // accounts are silently dropped.
++        //
++        // NOTE: `reward_account_to_hash` keys on bytes [1..29] (the 28-byte
++        // credential) and uses byte [0] only as the header. To get DISTINCT
++        // reward-account keys we must vary the CREDENTIAL bytes, not byte [0].
++        let return_addr = vec![0u8; 29]; // gets the two deposit refunds
++        let mut wd_addr_1 = vec![0u8; 29];
++        wd_addr_1[1] = 1;
++        let mut wd_addr_2 = vec![0u8; 29];
++        wd_addr_2[1] = 2;
++        for addr in [&return_addr, &wd_addr_1, &wd_addr_2] {
++            let key = LedgerState::reward_account_to_hash(addr);
++            state.certs.reward_accounts.insert(key, Lovelace(0));
++        }
++        let wd_key_1 = LedgerState::reward_account_to_hash(&wd_addr_1);
++        let wd_key_2 = LedgerState::reward_account_to_hash(&wd_addr_2);
++
++        // Two withdrawal proposals: 400M each to wd_addr_1 / wd_addr_2.
++        for (proposal_idx, wd_addr) in [&wd_addr_1, &wd_addr_2].iter().enumerate() {
++            let mut withdrawals = BTreeMap::new();
++            withdrawals.insert((*wd_addr).clone(), Lovelace(400_000_000));
++
++            let tx_byte = 50 + proposal_idx as u8;
++            let tx_hash = Hash32::from_bytes([tx_byte; 32]);
++            state.process_proposal(
++                &tx_hash,
++                0,
++                &ProposalProcedure {
++                    deposit: Lovelace(100_000_000_000),
++                    return_addr: return_addr.clone(),
++                    gov_action: GovAction::TreasuryWithdrawals {
++                        withdrawals,
++                        policy_hash: None,
++                    },
++                    anchor: make_anchor(),
++                },
++            );
++            let action_id = make_action_id(tx_byte, 0);
++            for i in 0..10 {
++                drep_vote(&mut state, i, &action_id, Vote::Yes);
++            }
++            cc_vote_yes(&mut state, &action_id);
++        }
++
++        assert_eq!(state.gov.governance.proposals.len(), 2);
++        state.process_epoch_transition(EpochNo(1));
++
++        // BOTH withdrawals must enact: each target credited exactly 400M.
++        assert_eq!(
++            state.certs.reward_accounts.get(&wd_key_1).copied(),
++            Some(Lovelace(400_000_000)),
++            "First withdrawal target must be credited 400M"
++        );
++        assert_eq!(
++            state.certs.reward_accounts.get(&wd_key_2).copied(),
++            Some(Lovelace(400_000_000)),
++            "Second withdrawal target must be credited 400M (NOT blocked by a \
++             double-subtracted cap basis)"
++        );
++
++        // Treasury: 1000M - 400M - 400M = 200M.
++        assert_eq!(
++            state.epochs.treasury.0, 200_000_000,
++            "Treasury must end at 200M after both 400M withdrawals enact"
++        );
++
++        // Both proposals consumed (ratified + removed).
++        assert_eq!(
++            state.gov.governance.proposals.len(),
++            0,
++            "Both withdrawal proposals must be ratified and removed"
++        );
++    }
++
+     #[test]
+     fn test_prev_action_id_expired_proposal_blocks_child() {
+         // Gap 4 regression: Proposal A submitted → B references A via
