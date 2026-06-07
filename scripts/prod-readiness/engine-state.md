@@ -194,8 +194,25 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:GAUNTLET-PENDING (5th round, F1+F2 final).
-  *** wake192: verify10B4 import byte-identical (0 phase-1, 0 NotFullyConsumed; node still early at etime ~1min,
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:FIXING (round-5 FINAL: R1-complete-F1 + R3-indef-trunc).
+  *** wake194: 5th GAUNTLET ww5a6h0zx = REFUTED 2/3; the edge-epoch refuter COULD NOT refute & exhaustively CONFIRMED
+  the entire import byte-exact (addresses, multi-asset, tags 2/3, F2, container/truncation all match Haskell). verify
+  10B4 WINDOW CONFIRMED (tip 125117568, 0 phase-1). The 2 refutations (both adversarial-only, no real-snapshot risk):
+   (R1 haskell-semantics) F1 is INCOMPLETE: gate uses structural first_occurrence_value (top-level only, aeson) but
+    VALUE still from extract_raw_number_literal FLAT byte-scan (matches key in NESTED objects too). meta {"extra":
+    {"tablesCodecVersion":99},"tablesCodecVersion":1} => aeson=1 imports, dugite gate=1 but scan="99" => hard-error.
+    A SELF-INCONSISTENT half-done fix in #10's OWN code -> MUST complete (won't ship inconsistent). FIX: drive value
+    from the same structural first-occurrence as the gate.
+   (R3 truncation) indefinite map 0xbf...0xff truncated at an ENTRY BOUNDARY (no 0xff) -> TvarIterator remaining.
+    is_empty()=>None silently imports the prefix as complete. Haskell aborts (ReadSnapshotFailed). Backstopped by
+    #17 CRC but in the truncation class #10 claims. FIX: carry map-kind; indefinite-EOF-without-break => Some(Err).
+  DROVE: SIGTERM'd verify10B4 (window captured), regenerated base-commitB4-bridge.patch (3-crate), launched FINAL fix
+  muscle wiujlmyn2 (run wf_26976ced-f49) for R1+R3 (mempack/mod.rs only). *** HARD POLICY (decided): this is the LAST
+  adversarial-hardening cycle. R1 is completing a half-done fix; R3 is small. After this -> COMMIT #10. If a 6th
+  gauntlet finds yet more ADVERSARIAL-ONLY edges (no real-snapshot risk), they go to a 'snapshot-import adversarial-
+  hardening' tracking item, NOT another cycle — the byte-exact core is confirmed stable across 6 replays + an
+  exhaustive edge-epoch refuter pass. NEXT WAKE: poll -> build -> re-import -> 6th re-gauntlet -> COMMIT.
+  was: state:GAUNTLET-PENDING (5th round, F1+F2 final). *** wake192: verify10B4 import byte-identical (0 phase-1, 0 NotFullyConsumed; node still early at etime ~1min,
   syncing toward window — wakes came in quick succession). F1 (dup-key, absent in real meta) + F2 (native-decode
   relaxation) provably can't regress phase-1, so launched 5th RE-GAUNTLET ww5a6h0zx (run wf_bcedc476-060, refuterN=3)
   in PARALLEL with verify10B4 window sync. Gauntlet item EXPLICITLY scopes #15/#17/#19 OUT (refute only on in-scope
@@ -1342,6 +1359,12 @@
   not wedged). No transition. Disk 178G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process result.
 - wake189 2026-06-07: POLL #10 FIX muscle wb28q1upc — still RUNNING, ACTIVE (last activity 5s, build/test). No
   transition. Disk 179G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process result.
+- wake194 2026-06-07: #10 5th GAUNTLET ww5a6h0zx REFUTED 2/3 (edge-epoch refuter CONFIRMED core byte-exact) ->
+  FIXING. R1 = F1 incomplete (value still flat-scans nested keys; complete it structurally); R3 = truncated
+  indefinite map silent-end (hard-error on indef-EOF-no-break). Both adversarial-only, mempack/mod.rs. SIGTERM'd
+  verify10B4 (window 0-phase-1 captured). Launched FINAL fix muscle wiujlmyn2. HARD POLICY: last adversarial cycle;
+  after this -> COMMIT #10 (further adversarial-only edges -> hardening tracking item, not more cycles). NEXT WAKE:
+  poll -> build -> re-import -> 6th re-gauntlet -> commit.
 - wake193 2026-06-07: POLL #10 5th GAUNTLET ww5a6h0zx — still RUNNING (0/3 votes). verify10B4 WINDOW CONFIRMED:
   synced PAST window (tip 125117568 > 125105013, block 4794428), 0 phase-1 — F1+F2 binary holds 0-phase-1 past the
   ep293 window (window evidence in hand for commit). No transition (gauntlet is the gate). Disk 177G. #10 stays
