@@ -2204,7 +2204,7 @@ fn credential_to_hash(credential: &Credential) -> Hash32 {
 /// in `sisPtrStake` and defers their resolution to SNAP time.  Base/Reward addresses
 /// go directly into `sisCredentialStake` (our `stake_map`).  In Conway,
 /// `ConwayInstantStake` omits pointer stake entirely.
-enum StakeRouting {
+pub(crate) enum StakeRouting {
     /// Credential hash — route coins to `stake_distribution.stake_map`.
     Credential(Hash32),
     /// Pointer key — route coins to `ptr_stake` (deferred resolution at SNAP time).
@@ -2221,7 +2221,7 @@ enum StakeRouting {
 ///
 /// When `exclude_ptrs` is true (Conway era), pointer addresses return
 /// `StakeRouting::None` — they are silently excluded as in `ConwayInstantStake`.
-fn stake_routing(
+pub(crate) fn stake_routing(
     address: &dugite_primitives::address::Address,
     exclude_ptrs: bool,
 ) -> StakeRouting {
