@@ -457,6 +457,88 @@ impl<'b> Reader<'b> {
         Ok(out)
     }
 
+    /// Maximum length of a single `PlutusData` `ByteString` *leaf chunk*, in bytes.
+    ///
+    /// Mirrors the Haskell `plutus` `PlutusCore.Data.decodeData` "Note [The
+    /// 64-byte limit]": `decodeBoundedBytes` / `decodeBoundedBytesIndefLen`
+    /// reject any single CBOR byte-string chunk longer than 64 bytes. For the
+    /// indefinite-length chunked form, the bound applies *per chunk* — the
+    /// concatenated total may exceed 64 bytes across multiple `<= 64`-byte
+    /// chunks. A zero-length chunk is permitted.
+    pub(crate) const PLUTUS_DATA_BYTES_LEAF_MAX: usize = 64;
+
+    /// Read a `PlutusData` `ByteString` *leaf* (definite or indefinite-length),
+    /// enforcing the plutus 64-byte-per-chunk bound and returning an owned
+    /// `Vec<u8>`.
+    ///
+    /// This is the bounded counterpart of [`Reader::read_bytes_owned`] /
+    /// [`Reader::read_indef_bytes`], to be used **only** at `PlutusData` leaf
+    /// sites (the `Bytes`/`BytesIndef` arms and the tag-2/tag-3 bignum
+    /// mantissa). It matches Haskell `plutus`
+    /// `PlutusCore.Data.decodeBoundedBytes` / `decodeBoundedBytesIndefLen`:
+    ///
+    /// - A single **definite**-length byte string longer than 64 bytes is
+    ///   rejected.
+    /// - For the **indefinite**-length chunked form, *each individual chunk*
+    ///   must be `<= 64` bytes (any single chunk `> 64` is rejected); the
+    ///   concatenated total is **not** bounded. A zero-length chunk is allowed.
+    ///
+    /// The generic readers ([`Reader::read_bytes_owned`],
+    /// [`Reader::read_indef_bytes`]) deliberately stay unbounded — they serve
+    /// non-`PlutusData` callers (Ed25519 vkeys, KES/VRF, native + Plutus script
+    /// blobs which routinely exceed 64 bytes, addresses, asset names, metadata)
+    /// that are *not* subject to the plutus 64-byte rule.
+    pub(crate) fn read_bounded_plutus_bytes(&mut self) -> Result<Vec<u8>, SerializationError> {
+        match self.peek_major()? {
+            Type::BytesIndef => {
+                // Consume the 0x5f header byte.
+                let pos = self.inner.position();
+                self.inner.set_position(pos + 1);
+
+                let mut out = Vec::new();
+                loop {
+                    let ty = self.peek_major()?;
+                    match ty {
+                        Type::Break => {
+                            // Consume the break byte (0xff).
+                            let pos = self.inner.position();
+                            self.inner.set_position(pos + 1);
+                            break;
+                        }
+                        Type::Bytes => {
+                            let chunk = self.read_bytes()?;
+                            if chunk.len() > Self::PLUTUS_DATA_BYTES_LEAF_MAX {
+                                return Err(SerializationError::CborDecode(format!(
+                                    "PlutusData ByteString leaf exceeds 64 bytes \
+                                     (indefinite-length chunk of {} bytes)",
+                                    chunk.len()
+                                )));
+                            }
+                            out.extend_from_slice(chunk);
+                        }
+                        other => {
+                            return Err(SerializationError::CborDecode(format!(
+                                "read_bounded_plutus_bytes: expected Bytes or Break, got {other}"
+                            )));
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            _ => {
+                let bytes = self.read_bytes()?;
+                if bytes.len() > Self::PLUTUS_DATA_BYTES_LEAF_MAX {
+                    return Err(SerializationError::CborDecode(format!(
+                        "PlutusData ByteString leaf exceeds 64 bytes \
+                         (definite-length string of {} bytes)",
+                        bytes.len()
+                    )));
+                }
+                Ok(bytes.to_vec())
+            }
+        }
+    }
+
     /// Read a CBOR unsigned integer (major type 0).
     pub fn read_uint(&mut self) -> Result<u64, SerializationError> {
         self.inner
@@ -547,6 +629,63 @@ impl<'b> Reader<'b> {
             }
             other => Err(SerializationError::CborDecode(format!(
                 "read_bigint: expected integer or bignum tag, got {other} at position {pos}"
+            ))),
+        }
+    }
+
+    /// Read a `PlutusData` integer (small int **or** tag-2/tag-3 bignum),
+    /// enforcing the plutus 64-byte-per-chunk bound on the bignum *mantissa*.
+    ///
+    /// This is the `PlutusData`-only counterpart of [`Reader::read_bigint`].
+    /// The bignum mantissa is a `PlutusData` `ByteString` leaf, so it must obey
+    /// Note [The 64-byte limit] just like the `Bytes`/`BytesIndef` leaf arms:
+    /// a definite mantissa `> 64` bytes is rejected, and each indefinite
+    /// mantissa chunk must be `<= 64` bytes (total unbounded).
+    ///
+    /// `read_bigint` itself is left unbounded so its (current and future)
+    /// non-`PlutusData` callers are not over-restricted; only the `PlutusData`
+    /// decode arms route bignums through this bounded helper.
+    pub(crate) fn read_bounded_plutus_bigint(&mut self) -> Result<BigInt, SerializationError> {
+        let pos = self.inner.position();
+        let ty = self.peek_major()?;
+        match ty {
+            Type::Tag => {
+                let tag_val = self
+                    .inner
+                    .tag()
+                    .map_err(|e| SerializationError::CborDecode(format!("bigint tag: {e}")))?;
+                match tag_val.as_u64() {
+                    TAG_BIGNUM_POS => {
+                        let bytes = self.read_bounded_plutus_bytes()?;
+                        Ok(BigInt::from_bytes_be(num_bigint::Sign::Plus, &bytes))
+                    }
+                    TAG_BIGNUM_NEG => {
+                        let bytes = self.read_bounded_plutus_bytes()?;
+                        // value = -1 - n  where n = BigInt::from_bytes_be(+, bytes)
+                        let magnitude = BigInt::from_bytes_be(num_bigint::Sign::Plus, &bytes);
+                        Ok(-BigInt::from(1) - magnitude)
+                    }
+                    other => Err(SerializationError::CborDecode(format!(
+                        "read_bounded_plutus_bigint: unexpected tag {other} at position {pos}"
+                    ))),
+                }
+            }
+            Type::U8 | Type::U16 | Type::U32 | Type::U64 => {
+                let v = self
+                    .inner
+                    .u64()
+                    .map_err(|e| SerializationError::CborDecode(format!("bigint/uint: {e}")))?;
+                Ok(BigInt::from(v))
+            }
+            Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::Int => {
+                let v: minicbor::data::Int = self
+                    .inner
+                    .int()
+                    .map_err(|e| SerializationError::CborDecode(format!("bigint/int: {e}")))?;
+                Ok(BigInt::from(i128::from(v)))
+            }
+            other => Err(SerializationError::CborDecode(format!(
+                "read_bounded_plutus_bigint: expected integer or bignum tag, got {other} at position {pos}"
             ))),
         }
     }
