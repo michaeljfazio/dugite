@@ -194,7 +194,24 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:FIXING (commit-B hardening: R3 + no-silent-None).
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-BUILDING (commit-B). *** wake166: FIX
+  muscle wjuuqz22k COMPLETED green (tier A, 3 files / 2 crates). R3: replaced as_f64().fract() with f64-FREE
+  scientific_literal_as_word8() (raw Number::as_str() literal + num_bigint, Aeson toBoundedInteger@Word8 exact:
+  1.0/1e0/100e-2=>1 accept, 1.0000000000000001/1.5 reject, 256/-1 reject, "1" reject) — chose raw-literal over
+  enabling global arbitrary_precision (avoids serde_json feature-unification across 61 crates). no-silent-None: tag-4
+  inline-datum + tag-5 decode_imported_script_ref (now Result) HARD-ERROR on malformed blob (no-silent-corruption);
+  +regression tests. Quotes Aeson parseBoundedIntegralFromScientific + Scientific.toBoundedInteger.
+  DROVE: copied the 3 files into main (FINAL-DONE base) -> 2-crate footprint. *** HIT worktree-staleness DRIFT: build
+  failed E0004 non-exhaustive BackendCheckResult (missing Convertible arm) — muscle worktrees branch from STALE base
+  ca50afd9ef; commit a417bd2c6f (#9, dugite-mem-under-LSM Convertible) landed AFTER that base and was NOT in the
+  worktree's node/mod.rs (base patch only carried FINAL-DONE diff, not intervening commits). Verified via git log
+  ca50afd9ef..HEAD: ONLY a417bd2c6f touched node/mod.rs, mempack ZERO drift. FIX: re-inserted HEAD's Convertible arm
+  (info! + Ok(state)) into node/mod.rs. Rebuild pid 47755 (.jobs/verify-build-10B.log). Also GC'd 161GB of 15 stale
+  muscle worktrees (each ~10G target/) -> disk 8.6G->186G (RECURRING: GC worktrees after every fix muscle).
+  NEXT WAKE: BUILD_EXIT=0 -> clone db-preprod-sync -> verify10B re-import (confirm STILL 0 phase-1, R3/no-silent-None
+  don't regress the integer-1 happy path) -> RE-GAUNTLET FINAL-DONE (prior 3/3 resolved: 297=general-UPLC #15; R3
+  fixed) -> COMMIT #10 via gh/HTTPS (dugite-serialization + dugite-node). Then activate #15 serialiseData.
+  was: state:FIXING (commit-B hardening: R3 + no-silent-None).
   *** wake164: DROVE ROOT-CAUSED -> FIXING. Generated FINAL-DONE base patch from main's uncommitted tree (3856 lines,
   2 crates) -> scripts/prod-readiness/base-FINAL-DONE-main.patch (ABS path; FINAL-DONE is uncommitted on main =
   invisible to fresh worktrees, so the muscle MUST git-apply it first). Launched FIX muscle wjuuqz22k (run
@@ -1157,6 +1174,11 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake166 2026-06-07: #10 FIXING -> VERIFYING-BUILDING. Fix muscle wjuuqz22k green (R3 f64-free Aeson-exact float-
+  parse via raw-literal+bigint; no-silent-None tag-4/5 hard-error; 2 crates). Copied to main; build FAILED on
+  worktree-staleness drift (missing BackendCheckResult::Convertible arm from #9 a417bd2c6f, landed after stale base
+  ca50afd9ef) -> re-inserted arm, rebuild pid 47755. GC'd 161GB / 15 stale muscle worktrees (8.6G->186G free).
+  NEXT WAKE: BUILD_EXIT=0 -> verify10B re-import (0 phase-1) -> re-gauntlet -> commit #10.
 - wake165 2026-06-07: RECORD #15 ROOT-CAUSED-CONFIRMED (byte-level proof from wpeec891q mechanism dim, while #10 fix
   muscle wjuuqz22k runs). Script 7afbde08 (PlutusV3) computes blake2b(serialiseData(datum)); on-chain datum = 276
   bytes w/ indefinite arrays, blake2b = bbd35202.. = datum_hash exactly; dugite to_cbor() canonicalises -> 270 bytes,
