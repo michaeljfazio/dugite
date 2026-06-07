@@ -19,12 +19,20 @@ const A = (typeof args === 'string' ? (() => { try { return JSON.parse(args) } c
 const { item, mode, net, reference, dumpPath } = A
 
 // Per-task model strategy (deterministic regardless of the launching session's model):
-//   diagnose  -> Sonnet : bounded, parallel, schema-constrained Koios-vs-dump comparison;
-//               downstream Opus steps + the byte-exact replay gauntlet validate it.
-//   research / root-cause / fix / gauntlet -> Opus : deep ledger semantics, byte-exact
-//               Rust, and the adversarial autonomy gate demand the strongest reasoning
-//               (the #438 lesson: a wrong ledger fix that passes tests is the failure mode).
-const MODEL_DIAGNOSE = 'sonnet'
+//   diagnose  -> Sonnet by DEFAULT : bounded, parallel, schema-constrained Koios-vs-dump
+//               NUMERIC ledger comparison (reserves/treasury/stake vs Koios — the mode's
+//               native use, e.g. #0/#11). Downstream Opus steps + the byte-exact replay
+//               gauntlet validate it.
+//               OVERRIDE to Opus via args.diagnoseModel:'opus' when the diagnose is
+//               MECHANISM-HUNTING rather than numeric — deep root-causing where a wrong
+//               conclusion burns a whole fix+gauntlet cycle (e.g. serialiseData byte-level
+//               proof, input-provenance, UPLC/CBOR disassembly). Pick per task.
+//   research / root-cause / fix / gauntlet -> Opus (ALWAYS) : deep ledger semantics,
+//               byte-exact Rust, and the adversarial autonomy gate demand the strongest
+//               reasoning (the #438 lesson: a wrong ledger fix that passes tests is the
+//               failure mode). These are never weakened.
+const VALID_MODELS = ['opus', 'sonnet', 'haiku']
+const MODEL_DIAGNOSE = (VALID_MODELS.includes(A.diagnoseModel) ? A.diagnoseModel : 'sonnet')
 const MODEL_REASON = 'opus'
 
 // ---- structured-output schemas ----
