@@ -175,9 +175,10 @@
    by #17 (whole-file CRC) + Mithril signature, hence M not H. *** PROGRESS: (c) backend dup-key first-wins DONE wake328
    (b43f4fa80d); (a) decode_varlen Word64 overflow guard DONE wake329 (49a2c0ce1d — byte-exact mempack
    unpack7BitVarLenLast(0b1111_1110), rejects >2^64 10-byte forms, keeps non-minimal; nextest 1150/1150). REMAINING: only
-   (b) DEFINITE-length tables-map exact-count — truncated M<N declared entries silently imports the prefix (TvarBody/
-   TvarIterator track indefinite+saw_break but NOT entries_remaining); Haskell decodeMapLen demands exactly N →
-   DecoderErrorPrematureEOF. state:PARTIAL (a+c done; only b remains) attempts:0
+   (b) DEFINITE-length tables-map exact-count — DONE wake330 (d8e616d553 — TvarIterator now captures the declared count via
+   decode_map_len + tracks entries_remaining → premature-EOF Err on a definite map truncated to M<N; nextest 1152/1152).
+   *** ALL THREE SUB-ITEMS DONE: (a) varlen 49a2c0ce1d, (b) definite-map d8e616d553, (c) backend b43f4fa80d. state:DONE
+   (a+b+c) attempts:0
 17. [H][security/integrity][REAL-NEW, from gauntlet w3upqlq0y compounding-feedback] Mithril/Haskell snapshot
    IMPORT does NOT verify the snapshotChecksum/CRC. Upstream V2/InMemory.loadSnapshot computes
    crcOfConcat(state-CRC, tables-CRC) and throws ReadSnapshotDataCorruption on mismatch; dugite's
@@ -268,7 +269,20 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #20b (definite-map exact-count) state:FIXING attempts:0 — hand-fix applied + compiles; gauntlet b6ll2gq8c IN-FLIGHT; lock HELD.
+- item: #20 FULLY DONE (a+b+c; #20b committed+pushed d8e616d553). NEXT WAKE: SCHEDULE #24-pin / #7 / #16.
+  *** wake330-cont (ultracode): #20b FIXING→VERIFYING→DONE → #20 COMPLETE. Gauntlet b6ll2gq8c: nextest -p
+  dugite-serialization 1152/1152 (was 1150, +2 #20b tests: definite_map_truncated_below_declared_count_hard_errors [fail-
+  pre/pass-post], definite_map_exact_count_completes_clean; the EXISTING test_tvar_definite_map_completes_clean_at_count +
+  test_tvar_indefinite_map_truncated_at_entry_boundary still PASS = no regression of either map arm); clippy -D warnings
+  clean; fmt auto-fixed → clean. COMMITTED focused 1-crate fix d8e616d553 (mempack/mod.rs TvarIterator entries_remaining +
+  decode_map_len count capture + tests.rs) + PUSHED (49a2c0ce1d..d8e616d553). *** #20 SNAPSHOT-IMPORT ADVERSARIAL-HARDENING
+  COMPLETE: (a) varlen Word64 overflow guard [49a2c0ce1d], (b) definite-map exact-count premature-EOF [d8e616d553], (c)
+  backend dup-key aeson first-wins [b43f4fa80d]. All snapshot-leaf MemPack/CBOR decoders now hard-fail exactly where Haskell
+  strict MemPack/cborg/aeson does. *** NEXT WAKE — SCHEDULE: open items = #24 (V2 inline-datum-spend ExUnit over-cost,
+  ROOT-CAUSED conf 0.83 — pin the exact line, needs FULL UTxO context: resolve the dominant script 8e60a204 tx 512d46dc
+  missing ref-inputs via Koios then re-measure dugite-consumed vs on-chain; harder), #7 [M] Dijkstra SUBUTXO (re-derive the
+  normal-diff patch as a proper refactor; inert/future-era), #16 [L] decode_imported_script_ref era-relative tag. RECOMMEND
+  #24-pin (highest-impact real phase-2 conformance) OR #7 (concrete). Lock to release.
   *** wake330 (ultracode): SCHEDULE #20b (last #20 sub-item — after this #20 fully DONE). HAND-FIXED byte-exact (no muscle:
   the Haskell ref is already established — cborg decodeMapLen exact-N / DecoderErrorPrematureEOF, cited in the existing
   indefinite-arm code + the #20 entry). GAP: tvar_body_offset read the definite-map header size but DISCARDED the declared
@@ -2583,6 +2597,13 @@
 - db-clones/preprod-ep57-fixed   (fixed-binary replay, in progress)
 
 ## Gauntlet ledger  (passed/refuted approaches — never silently retry a REFUTED)
+- PASSED 2026-06-08 (wake330, #20b): "require exactly N entries in a definite-length tables map (cborg decodeMapLen
+  premature-EOF)". Gauntlet = 2 new tests (definite_map_truncated_below_declared_count_hard_errors fail-pre/pass-post —
+  pre-fix returned a silent None prefix-import; definite_map_exact_count_completes_clean over-strictness guard) + nextest
+  1152/1152 (existing tvar definite + indefinite tests still pass = no regression of either map arm) + clippy + fmt.
+  Byte-exact: TvarIterator tracks entries_remaining (via cbor_utils::decode_map_len), stops at exactly N, errors on EOF
+  with entries owed (loadSnapshot ReadSnapshotFailed). Landed d8e616d553. *** #20 snapshot-import adversarial-hardening
+  COMPLETE (a varlen + b definite-map + c backend all landed; every snapshot-leaf decoder now hard-fails where Haskell does).
 - PASSED 2026-06-08 (wake329, #20a): "reject Word64 VarLen overflow in decode_varlen, byte-exact with mempack
   unpack7BitVarLenLast". Gauntlet = 3 new tests (varlen_overflow_10byte_msbyte_rejected fail-pre/pass-post — pre-fix
   returned a TRUNCATED Ok; varlen_max_u64_still_ok + varlen_non_minimal_submaximal_still_accepted guard against over-
@@ -2675,6 +2696,7 @@
 - 2026-06-08T00:xxZ wake327 ~ #25 DEBUNKED (only 1 is_valid=false dump, not 370 — muscle miscount); #438 save via 1-command verify
 - 2026-06-08T01:xxZ wake328(+cont) ~ #20c backend dup-key first-wins FIXING→DONE (nextest 1147/1147) + commit/push b43f4fa80d
 - 2026-06-08T02:xxZ wake329(+cont) ~ #20a decode_varlen overflow guard (muscle wi8udn7a7 byte-exact) FIXING→DONE (nextest 1150/1150) + commit/push 49a2c0ce1d
+- 2026-06-08T03:xxZ wake330(+cont) ~ #20b definite-map exact-count (hand-fix, cborg decodeMapLen) FIXING→DONE (nextest 1152/1152) + commit/push d8e616d553 → #20 FULLY DONE
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -4220,3 +4242,6 @@
   gave byte-exact mempack varlen overflow semantics (firstByte&0xFE==0x80, non-minimal NOT rejected). Hand-applied the
   overflow guard + 3 tests → FIXING→VERIFYING→DONE (nextest 1150/1150). Committed+pushed 49a2c0ce1d. #20 now a+c done, only
   (b) definite-map left. Lesson: tight pure-source-reading muscle briefs (no instrument/measure, time-boxed) complete fast+clean.
+- wake330(+cont) 2026-06-08: SCHEDULE+DRIVE #20b (definite-map exact-count) hand-fix (cborg decodeMapLen, byte-exact) →
+  FIXING→VERIFYING→DONE (nextest 1152/1152, existing tvar tests unchanged). Committed+pushed d8e616d553. *** #20
+  SNAPSHOT-IMPORT ADVERSARIAL-HARDENING COMPLETE (a varlen + b definite-map + c backend). Next: SCHEDULE #24-pin or #7.
