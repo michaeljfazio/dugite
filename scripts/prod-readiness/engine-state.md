@@ -209,7 +209,29 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:ROOT-CAUSING (polled wake275 17:28 — analyze muscle wx7gexg1o: research DONE, root-cause agent ACTIVE; localizing the ~4.92ppm site). DEFINITIVE: uniform ~4.92ppm reward under-scaling.
+- item: #0 (mainnet ep246 reserves) state:FIXING (ROOT-CAUSED + fix applied; build pid 92379 for verification re-replay).
+  *** wake276 (ultracode): analyze muscle wx7gexg1o ROOT-CAUSED with HIGH confidence + full Haskell quotes. **THE BUG:
+  crates/dugite-ledger/src/state/rewards.rs:283-287 computes total_active_stake with a SPURIOUS pool-params filter**
+  `.filter(|(pool_id,_)| go.pool_params.contains_key(pool_id))`. total_active_stake is the apparent-performance
+  denominator (line ~423: sigmaA=poolTotalStake/totalActiveStake; appPerf=beta/sigmaA; poolR=floor(appPerf*maxP)) —
+  the SINGLE global, pool-independent, conservation-invisible quantity scaling every member/leader reward. Haskell
+  `ssTotalActiveStake = sumAllActiveStake ssActiveStake` (SnapShots.hs mkSnapShot) sums ALL registered+delegated
+  credential stake with NO pool-params filter; Rewards.hs sigmaA=poolTotalStake/totalActiveStake. dugite's filter
+  DROPS the stake of creds delegated to a pool present in pool_stake but retired-from pool_params at this boundary ->
+  smaller denominator -> larger sigmaA -> smaller appPerf -> EVERY reward low by the same factor = the uniform ~4.92
+  ppm under. INVISIBLE to reserves/treasury conservation (total_active_stake appears ONLY in perf, not pot/deltaR1/
+  deltaT1) -> why wake240 'deltaR1 byte-exact' was correct-but-irrelevant + every conservation thread missed it. Ruled
+  out (agent, Haskell-backed): reward_pot/deltaR1/reserves (would be glaring reserves divergence), eta/expectedBlocks
+  (integer, can't be 5ppm), generic flooring (sub-lovelace), circulation/sigma denom. CAVEAT (agent): my absolute
+  total_distributed figure may be ~3x off -> the EXACT 82,215,213 must be PROVEN by re-replay, not assumed (#438).
+  DROVE: applied the Tier-A fix DIRECTLY (precise Haskell-quoted one-liner: removed the filter so total_active_stake =
+  Σ all go.pool_stake = sumAllActiveStake; pool_stake built epoch.rs:199-217 over ALL delegations incl orphan pools;
+  no-op at boundaries w/o retired-pool orphans -> ep209-245 stay unregressed). cargo check -p dugite-ledger CLEAN
+  (13.9s). Kicked off release build pid 92379 + ledger reward-tests pid 92380. FIX IS UNCOMMITTED (rewards.rs working
+  tree) — commit ONLY after re-replay byte-exact + gauntlet (cardinal rule). Instrumentation also still uncommitted
+  (env-gated off, doesn't affect ledger). NEXT WAKE: verify build + reward-tests -> re-replay over CoW clone
+  db-clones/mainnet-rupd-drop -> assert ep246 reserves==12,880,948,865,137,767 AND ep209-245 unregressed (NOT just
+  reduced) -> gauntlet (muscle) -> revert instrumentation -> commit clean fix.
   *** wake273 (ultracode): RECONCILIATION VERDICT (workflow w8ufsxjg3, 7/8 agents, n=1400 creds, extracted from agent
   transcripts since synthesize hung): **AMOUNT-DELTAS, NOT missing payees.** ALL 1400 dugite-paid creds RESOLVED in
   Koios earned_epoch-244 (0 missing, 0 unresolved), 0 exact matches — EVERY cred a nonzero delta; 984 under / 416 over
@@ -2960,3 +2982,10 @@
   launched analyze muscle wx7gexg1o to localize the ~4.92ppm site in shelley.rs:383 compute_reward_update/rewards.rs
   (re-check deltaR1/eta/reserves/sigma). next wake: read verdict -> fix -> re-replay verify. LESSON: a uniform-ppm
   signal across many entities is a GLOBAL FORMULA FACTOR, never dismiss as artifact; per-cred replay+Koios is the arbiter.
+- wake276 (ultracode): analyze muscle wx7gexg1o ROOT-CAUSED the ~4.92ppm: rewards.rs:283-287 total_active_stake has a
+  SPURIOUS .filter(pool_params.contains_key) -> drops orphan-pool (retired-this-boundary) delegator stake from the
+  apparent-performance denominator (sigmaA), under-scaling every reward uniformly; invisible to reserves/treasury
+  conservation. Haskell ssTotalActiveStake=sumAllActiveStake (no filter). Applied Tier-A fix DIRECTLY (removed filter;
+  total_active_stake=Σ all go.pool_stake). cargo check CLEAN. Build pid 92379 + reward-tests pid 92380. Fix UNCOMMITTED
+  until re-replay byte-exact + gauntlet. CAVEAT: prove exact 82,215,213 by replay not assumption. next wake: build->
+  re-replay ep246 reserves==12880948865137767 + ep209-245 unregressed -> gauntlet -> commit.
