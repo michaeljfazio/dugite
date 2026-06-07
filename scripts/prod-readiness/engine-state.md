@@ -1458,9 +1458,19 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
-- wake214 2026-06-07: POLL #15 ANALYZE wpkh7n7c9 (serialiseData canonical-vs-verbatim + encode_data delta) — still
-  RUNNING (research stage, last activity 9s). No transition. Disk 169G, no nodes. #15 stays DIAGNOSING. NEXT WAKE:
-  on verdict -> likely revert memo + fix encode_data.
+- wake215 2026-06-07: POLL #15 ANALYZE wpkh7n7c9 — RESEARCH STAGE DONE w/ DEFINITIVE VERDICT (root-cause stage still
+  running): MEMO IS WRONG, R1 CONFIRMED. Q1: serialiseData = BSL.toStrict.serialise = encodeData (CANONICAL);
+  getPlutusData STRIPS MemoBytes before the CEK (datum AND redeemer = bytes-less PLC.Data) -> serialiseData is
+  canonical, never verbatim; the datum-memoised-redeemer-not asymmetry is the tell the memo theory is wrong. Q2:
+  dugite encode_data ALREADY byte-matches PlutusCore encodeData (harness-proven: tag-102->compact-122, empty-list
+  definite/non-empty indefinite, etc.) -> encoder needs NO fix. KEY RECONCILIATION: the 306->0 came from the
+  V3-EXTENSION *POPULATING* the V3 SpendingScriptInfo datum (was None pre-fix -> script got no datum -> serialiseData
+  failed), NOT from the memo; canonical works equally. CORRECT FIX: KEEP the V3 spending-datum population
+  (resolve_spend_datum_optional + eval_redeemer ScriptInfo::Spending{datum}) but build it CANONICAL (plutus_data_to_
+  data, NOT memoised), and REVERT the entire Data-memo architecture (DataKind-split memo, to_cbor-returns-memo, all
+  the with_original/datum_raw threading). #15 memo still on main uncommitted. No transition (analyze not complete).
+  NEXT WAKE: read root-cause stage's precise keep-vs-revert plan -> FIX (revert memo + keep V3 datum population
+  canonical) -> re-replay (still 306->0 AND correct for non-canonical) -> re-gauntlet -> commit.
 - wake213 2026-06-07: #15 GAUNTLET w4a16gr1r REFUTED 3/3 (PROFOUND). R1: serialiseData builtin = PlutusCore-CANONICAL
   encodeData (getPlutusData strips MemoBytes), NOT verbatim -> the memo is likely the WRONG approach; real bug =
   dugite encode_data != PlutusCore encodeData (270 vs 276). Replay passed for the wrong reason (ep293 datums already
