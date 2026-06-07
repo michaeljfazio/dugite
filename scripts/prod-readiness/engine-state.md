@@ -201,18 +201,59 @@
    Error. Spread across 277 txs (broad field issue, not a few scripts) supports an address-class cause. NON-chain-
    critical (trust-on-consensus, no wedge). NEXT: diagnose muscle comparing a failing tx's resolved-input
    address (dugite import vs Koios) using db-clones/preprod-verify10c. state:NEW attempts:0
-6. [H][ledger] FORK-ROBUSTNESS (elevated M->H, now vindicated): apply_utxo_diff reconstruction didn't
-   replay stake_map -> the FORK-INDUCED variant of the ep57 bug. Clean HEAD replay is correct, but a live
-   sync hitting a rollback could still corrupt stake. The refuted gauntlet trusted a STALE doc; this IS a
-   real fix. Patch: scripts/prod-readiness/candidate-latent-fix-apply_utxo_diff.patch + worktree
-   wf_9be2125b-d01-1. Verify via a fork-exercising scenario, then land. state:NEW attempts:0
+6. [H][ledger] FORK-ROBUSTNESS (elevated M->H, vindicated): apply_utxo_diff reconstruction omits the
+   instant-stake replay -> the FORK-INDUCED variant of the ep57 bug. Clean LINEAR HEAD replay is byte-exact, but a
+   live sync hitting a rollback corrupts stake_map/ptr_stake. *** LOCATION CORRECTED (analyze w2x5j3223): the bug is
+   crates/dugite-ledger/src/ledger_seq.rs:918 apply_utxo_diff (NOT common.rs); common.rs:161 apply_utxo_changes is the
+   forward reference. Diff path mutates only utxo_set, omits ADD (stake_map/ptr_stake +=) + SPEND (-=). Latent: LedgerDelta
+   has no stake_map/ptr_stake snapshot; rollback_via_seq reassigns certs/epochs from the buggy reconstruction. Haskell:
+   ShelleyInstantStake add/delete on every TxOut incl. rollback (sisCredentialStake≙stake_map, sisPtrStake≙ptr_stake;
+   Conway drops ptr=ptr_stake_excluded). *** Patch candidate-latent-fix-apply_utxo_diff.patch VALIDATED (git apply --check
+   passes, full symmetry, 2 non-blocking residuals) + adds an in-module regression test. VERIFY = deterministic forward-vs-
+   diff equivalence test (apply_utxo_diff ≡ apply_utxo_changes on stake_map+ptr_stake; no fork replay, no Koios — forward
+   path is the byte-exact reference). See In-progress for the FIXING+VERIFY plan. state:ROOT-CAUSED attempts:0
 7. [M][ledger] LATENT Dijkstra SUBUTXO bug: apply_sub_transactions mutated utxo_set but NOT stake_map/
    ptr_stake (asymmetry). Valid fix + add_instant_stake/delete_instant_stake helper refactor preserved in
    scripts/prod-readiness/candidate-latent-fix-dijkstra-subutxo.patch + worktree wf_dcc190ba-a5c-1. Inert
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #6 (fork-robustness apply_utxo_diff) state:ANALYZING attempts:0 — muscle w2x5j3223 IN-FLIGHT; wake-lock HELD (TTL 22m). #20c DONE (c974d12169).
+- item: #6 (fork-robustness apply_utxo_diff) state:ROOT-CAUSED attempts:0 — analyze DONE (conf 0.95). NEXT WAKE: FIXING.
+  *** wake315-cont (ultracode): muscle analyze w2x5j3223 COMPLETED → #6 ANALYZING→ROOT-CAUSED. *** LOCATION CORRECTION
+  (the standing prompt + prior records were WRONG): the buggy code is NOT in common.rs — it is
+  crates/dugite-ledger/src/ledger_seq.rs:918 `fn apply_utxo_diff`. common.rs:161 `apply_utxo_changes` is the FORWARD
+  REFERENCE (correct). *** ROOT CAUSE CONFIRMED: pre-patch apply_utxo_diff mutates ONLY state.utxo.utxo_set and omits
+  the 4 instant-stake mutations the forward path makes — ADD leg (common.rs:257-272): stake_map[cred]+=coin,
+  ptr_stake[ptr]+=coin; SPEND leg (common.rs:198-213): stake_map[cred]-=coin, ptr_stake[ptr]-=coin (the spent output is
+  discarded as `_output`). Collateral path records into the SAME UtxoDiff so its stake deltas drop on replay too. LATENT
+  because LedgerDelta (ledger_seq.rs:83-172) snapshots reward_accounts/delegations/deposits/pool_params/gov but has NO
+  snapshot for stake_distribution.stake_map or epochs.ptr_stake (the only two state pieces maintained PURELY via the
+  UTxO diff). On rollback, rollback_via_seq (state/mod.rs:1951) inverts the UTxO set correctly (1964-1972) but reassigns
+  self.certs/self.epochs from the buggy reconstruction (1979/1982) → post-rollback UTxO and stake_map/ptr_stake DIVERGE.
+  Witness: preprod ep57 pool1n84mel6's 2 delegators short 5 ADA each on the fork path; linear ref == Koios active
+  9957549164 / set 9815680998. *** HASKELL: cardano-ledger ShelleyInstantStake (sisCredentialStake≙stake_map,
+  sisPtrStake≙ptr_stake); add/deleteShelleyInstantStake apply +/- over EVERY added/removed TxOut incl. rollback
+  reconstruction; Conway ConwayInstantStake drops StakeRefPtr (= dugite ptr_stake_excluded). Permalink cd8b7fab8365
+  Stake.hs:116-144; in-project ref shelley-rewards.md §2.3. *** PATCH VALIDATED:
+  candidate-latent-fix-apply_utxo_diff.patch (8598B) `git apply --check` PASSES, restores FULL symmetry — promotes
+  state/mod.rs::stake_routing+StakeRouting to pub(crate) and reuses them (byte-identical to common.rs::stake_routing),
+  add leg mirrors add_instant_stake, spend leg mirrors delete_instant_stake; all axes covered (pointer coins, multi-
+  asset-only=coin0, collateral, dedup, data-availability via UtxoDiff.deletes=Vec<(In,Out)>). 2 NON-BLOCKING residual
+  asymmetries: (a) zero-entry retention (saturating_sub leaves Lovelace(0) vs Haskell removes key — identical on BOTH
+  dugite paths, harmless), (b) saturating_sub underflow masking (can't fire post-patch). Patch also adds an in-module
+  ledger_seq.rs regression test apply_utxo_diff_replays_credential_stake_not_just_utxo_set (fails on main, passes patched).
+  *** VERIFICATION DESIGN (deliverable 3, the prior blocker): DETERMINISTIC forward-vs-diff equivalence test — NO fork
+  replay, NO Koios. Reference IS the forward path (proven byte-exact vs Koios at ep57), so tests-green≠byte-exact is
+  satisfied (assertion = apply_utxo_diff ≡ apply_utxo_changes on stake_map+ptr_stake). Shape: 3 outputs (out_base→
+  stake_map, out_ptr ptr_stake_excluded=false→ptr_stake, out_multiasset value=coin0+bundle→contributes 0); Path A forward
+  (apply_utxo_changes add then spend), Path B replay the SAME returned diffs through apply_utxo_diff; assert stake_map_A==
+  stake_map_B && ptr_stake_A==ptr_stake_B (after ADD-only and ADD+SPEND) + utxo equal + round-trip→0. Proptest variant
+  (random insert-N/spend-M over {base_a,base_b,ptr_x,ptr_y,enterprise,multiasset_base} + a Conway ptr_stake_excluded=true
+  case) is strongest. *** NEXT WAKE (FIXING): apply candidate-latent-fix-apply_utxo_diff.patch (it adds the in-module
+  test) + ADD the cross-path equivalence test in common.rs #[cfg(test)] (expose apply_utxo_diff pub(crate)); then
+  VERIFYING = run the new tests (must FAIL pre-patch / PASS post-patch) + full nextest -p dugite-ledger + clippy + fmt.
+  Since #6 is a CODE INVARIANT (forward path is the reference, no Koios), the equivalence test IS the gauntlet → on green,
+  focused commit (≤2 crates: dugite-ledger; patch touches ledger_seq.rs + state/mod.rs pub(crate) + common.rs test).
   *** wake315 (ultracode): SCHEDULE→DRIVE. ASSESS ruled the in-flight #10 (VERIFYING-PENDING) effectively BLOCKED: its
   fast-start repro db (db-clones/preprod-soak) AND worktree wf_41bd7059-365-1 are GONE, and launch-replay.sh forces a
   FROM-GENESIS replay which structurally CANNOT reproduce #10's mithril-fast-start script_ref=None bug (genesis replay
@@ -2067,6 +2108,7 @@
 - 2026-06-06T12:25Z wake6 ~ analyze result + root-cause disambiguation + fix muscle launched
 - 2026-06-07T06:57Z wake243 ~ read definitive diagnose wz6pe606w (applyRUpd partition) + launched trap-aware fix muscle wyidhhb1o
 - 2026-06-07T12:35Z wake314 ~ #20c VERIFYING gauntlet (nextest 1521/1521 + clippy + fmt) + focused commit c974d12169 + DONE/RECORD
+- 2026-06-07T13:xxZ wake315(+cont) ~ SCHEDULE #6 (#10 ruled BLOCKED) + muscle analyze w2x5j3223 (2 opus, root-cause+patch-validate+verify-design) → #6 ROOT-CAUSED
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -3555,3 +3597,10 @@
   the proven inertness. Committed focused 1-crate fix c974d12169 (state/epoch.rs only). Closes the #0 MIR-thread
   test-mirror drift (epoch.rs now matches live shelley.rs 8c868271c9). No node running (code/test-only item). NEXT WAKE:
   SCHEDULE next item — recommend #19 (phase2 VERIFYING re-soak, fix complete) or #6 (H fork-robustness, ep181-halt test).
+- wake315(+cont) 2026-06-07: SCHEDULE→DRIVE→RECORD on #6. ASSESS ruled in-flight #10 BLOCKED (fast-start repro
+  db+worktree gone; launch-replay forces genesis → can't reproduce the fast-start script_ref bug). Picked #6 (H,
+  highest-impact unblocked). Launched muscle analyze w2x5j3223 (2 opus); on completion (auto-notify, lock held across
+  async, TTL 22m) recorded: ROOT CAUSE CONFIRMED conf 0.95 — bug is ledger_seq.rs:918 apply_utxo_diff (NOT common.rs;
+  location corrected), omits instant-stake ADD/SPEND on stake_map+ptr_stake; candidate patch VALIDATED (applies clean,
+  full symmetry); deterministic forward-vs-diff equivalence test designed (no fork replay). #6 ANALYZING→ROOT-CAUSED.
+  NEXT WAKE: FIXING (apply patch + add cross-path equivalence test → run → nextest/clippy/fmt → commit; ≤2 crates).
