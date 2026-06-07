@@ -228,7 +228,34 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #15 (serialiseData canonical re-encode) state:FIXING attempts:0 — muscle fix wf4hgn0hk (worktree) IN-FLIGHT; wake-lock HELD (TTL 22m). #17 DONE (28bcd277e6).
+- item: #15 (serialiseData) state:VERIFYING-PENDING attempts:1 — muscle REFUTED the premise; patch saved+applies-clean. NEXT WAKE: apply+nextest+Koios-verify.
+  *** wake321-cont (ultracode): muscle fix wf4hgn0hk COMPLETED and *** OVERTURNED THE #15 PREMISE *** (Tier A', checks_green,
+  1 agent, byte-level proof — did NOT implement the prescribed memo-fix because it is WRONG and would INTRODUCE divergence).
+  FINDING: Haskell serialiseData = `BSL.toStrict . serialise` = a STRUCTURAL CANONICAL RE-ENCODE, NOT a memoised verbatim
+  copy. The Serialise Data instance renders non-empty Constr/List args via cborg defaultEncodeList as INDEFINITE 0x9f..0xff
+  (empty → definite 0x80). dugite's encode_data/encode_list (data.rs:179, shipped since the FIRST uplc commit) ALREADY does
+  exactly this. EMPIRICAL: (1) machine Constr 1 [Constr 0 [B 0xab, I 7]] → dugite to_cbor = d87a9fd8799f41ab07ffff
+  (indefinite, matches on-chain d87a9fd8799f… prefix); (2) a DEFINITE input d87a81d8798241ab07 is RE-ENCODED to indefinite
+  (a memo would DIVERGE here); (3) GOLD: the real 276-byte preprod datum (Koios /datum_info) → Data::from_cbor → to_cbor
+  reproduces all 276 bytes EXACTLY → blake2b256(serialiseData(datum)) == on-chain datum_hash
+  bbd352028feffe9a80a2822b46b9858bc1cf883cff383e1191b47d27ed708eb0 → the script's hash-check PASSES in dugite TODAY. The
+  wake165 '270-byte canonical definite re-encode' claim does NOT reproduce at HEAD (STALE capture, pre-encode_list-indef;
+  per memory: regenerate dumps with HEAD before chasing residuals). So #15 IS A NO-OP-ON-HEAD / STALE-PREMISE — the 306
+  divergences are NOT in serialiseData. Muscle's changes are ADDITIVE ONLY (no production logic): 6 byte-exact regression
+  tests + corrected stale docs — data.rs (empty_constr_args_are_definite_0x80, nonempty_constr_args_are_indefinite_0x9f_0xff,
+  definite_input_is_reencoded_to_indefinite_not_memoised [FAILS if anyone implements the wrong memo-fix], gold_failing_tx_
+  datum_round_trips_byte_exact 276B) + denotations.rs (serialise_data_uses_indefinite_arrays_for_nonempty_constr,
+  serialise_data_gold_preprod_datum_hash_matches_onchain). diffstat data.rs +132/-10, denotations.rs +83/-0. Saved to
+  scripts/prod-readiness/candidate-fix-15-serialisedata-tests.patch (255 lines, base ca50afd9ef IS on engine branch, `git
+  apply --check` PASSES). Worktree wf_fd1b09da-e5c-1 persists; full muscle output in task wf4hgn0hk.output. *** DISCIPLINE:
+  this is a REFUTING muscle (low-risk, additive tests+docs only) but per the engine rule I will INDEPENDENTLY VERIFY before
+  recording DONE. NEXT WAKE (VERIFYING): (1) git apply the patch to main; (2) cargo nextest run -p dugite-uplc — the GOLD
+  test serialise_data_gold_preprod_datum_hash_matches_onchain (blake2b==bbd352…) + the conformance suite MUST pass on MAIN
+  (not just the worktree); (3) INDEPENDENTLY confirm the datum_hash via koios.sh preprod (datum_info / the tx 27751ab9
+  datum) so the gold test isn't testing a fabricated hash; (4) clippy + fmt. If green → commit the additive tests+docs
+  (locks in correctness + guards the wrong-fix regression; 1 crate dugite-uplc) + push → #15 RESOLVED (stale-premise,
+  byte-exact-confirmed). Record a REFUTED entry in the gauntlet ledger for the memo-fix approach. If the gold test does NOT
+  pass on main or Koios contradicts → the muscle erred; re-open with a fresh HEAD ep293 capture.
   *** wake321 (ultracode): SCHEDULE→DRIVE. SCHEDULE: picked #15 [M->H][phase2] over #20 — #20's value DROPPED now that #17
   (snapshot CRC) landed (a tampered snapshot exploiting the lenient varlen/map decoders now fails the CRC check first; #20
   itself says "mostly backstopped by #17 + Mithril signature"). #15 is the highest-impact UNBLOCKED item: a REAL phase-2
