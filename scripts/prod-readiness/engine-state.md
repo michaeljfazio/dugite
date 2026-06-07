@@ -209,7 +209,28 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:VERIFYING-REPLAY (polled wake279 — replay pid 93404 at Byron ep194, ep246 dump pending; reward-tests 100/100 PASS no-regression). verification re-replay launched wake278.
+- item: #0 (mainnet ep246 reserves) state:ROOT-CAUSING (FIX REFUTED by re-replay #438-save; re-localize the ~4.92ppm).
+  *** wake280 (ultracode): **FIX REFUTED — re-replay #438 SAVE.** Fix-verify dump ep246 is BYTE-IDENTICAL to original:
+  reserves 12,880,948,947,408,249 (still +82,270,482 vs Koios 12,880,948,865,137,767), treasury 292,077,855,243,075
+  (still -55,269). ep213+ep245 byte-exact vs Koios (no regression). So removing the total_active_stake pool-params
+  filter (rewards.rs:283) changed ep246 NOTHING => there are NO orphan pools at ep246 => the filter is a NO-OP there =>
+  NOT the cause. The analyze muscle wx7gexg1o's root cause is WRONG for ep246. CRITICAL: its conservation-based
+  rule-out of reward_pot/deltaR1 was UNSOUND — it assumed reserves are byte-exact, but ep246 reserves DO diverge
+  (+82,270,482), and that +82M IS the under-distributed rewards flowing to reserves (under-distribute 82,215,213 ->
+  undistributed up -> reserves up, with the 55,269 treasury split). So reward_pot/maxPool/poolR are NOT actually ruled
+  out. The ~4.92 ppm uniform per-cred under is STILL REAL (reconciliation, ground truth) — it's a GLOBAL factor in the
+  poolR=floor(appPerf*maxP) chain (R/maxPool/precision), just NOT total_active_stake. DROVE: REVERTED the fix (restored
+  the filter; clean baseline); SIGTERM'd verify-replay 93404. LATENT NOTE: the total_active_stake filter IS non-Haskell
+  (muscle quoted ssTotalActiveStake=sumAllActiveStake, no filter) -> a real latent bug for orphan-pool boundaries, but
+  no-op at ep246; revisit/verify at a boundary WITH a retired pool before ever committing it. NEXT WAKE: DATA-DRIVEN
+  re-localization (don't trust conservation rule-outs): instrument compute_reward_update (rewards.rs) to dump per-pool
+  intermediates at ep246 (R reward_pot, maxP, appPerf, poolR, sigma, total_active_stake, blocksMade) -> re-replay ->
+  compare per-pool poolR + member_rewards to Koios pool_history(ep244) per pool -> the intermediate that is uniformly
+  ~5 ppm low across ALL pools is the bug (likely R/maxPool global term or a Rat precision/floor point). reward-tests
+  100/100 pass (no unit regression from the no-op fix). LESSON: (1) a fix MUST be proven to MOVE the divergence by
+  re-replay — green tests + plausible Haskell-quote are NOT enough (the muscle's quote was right but the site doesn't
+  trigger at ep246); (2) conservation-based rule-outs are invalid for conservation-invisible factors AND when the
+  conserved quantity (reserves) is itself the divergence.
   Build OK (release 1m49s, recompiled dugite-ledger+node, binary 17:35 -> fix IS in binary). Launched verification
   re-replay job mainnet-fix-verify pid 93404 (from-genesis over CoW clone db-clones/mainnet-rupd-drop, FIX binary, NO
   instrumentation env, dumps -> epoch-dumps-engine/mainnet-fix-verify). Running. ~4min to ep246. (reward-tests pid
@@ -3003,3 +3024,12 @@
   re-replay job mainnet-fix-verify pid 93404 (from-genesis CoW clone, FIX binary, clean/no-instrumentation, dumps->
   mainnet-fix-verify). next wake: epoch_000246.json reserves==12880948865137767 + treasury==292077855298344 + ep209-245
   unregressed -> gauntlet -> revert instrumentation -> commit clean rewards.rs fix. reward-tests pid 92380 still running.
+- wake280 (ultracode): FIX REFUTED by re-replay (#438 SAVE). Fix-verify ep246 BYTE-IDENTICAL to original (reserves
+  still +82,270,482, treasury still -55,269); ep213/245 byte-exact. => total_active_stake filter is a NO-OP at ep246
+  (no orphan pools) => NOT the cause; analyze muscle root cause WRONG for ep246. Its conservation rule-out of
+  reward_pot was unsound (reserves DO diverge here = the under-distributed rewards). ~4.92ppm uniform under STILL real;
+  it's a global factor in poolR=floor(appPerf*maxP) (R/maxPool/precision), not total_active_stake. Reverted fix,
+  SIGTERM'd verify-replay. Latent: the filter is non-Haskell (revisit at an orphan-pool boundary). next wake:
+  DATA-DRIVEN re-localize — instrument per-pool R/maxP/appPerf/poolR at ep246, re-replay, compare per-pool to Koios
+  pool_history to find the uniform ~5ppm-low intermediate. LESSON: a fix must be proven to MOVE the divergence via
+  re-replay (green tests + Haskell-quote insufficient); conservation rule-outs invalid when reserves IS the divergence.
