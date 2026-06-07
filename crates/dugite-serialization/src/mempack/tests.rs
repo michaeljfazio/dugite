@@ -1107,3 +1107,26 @@ fn parse_snapshot_checksum_rejects_invalid() {
     // not a JSON object
     assert!(parse_snapshot_checksum(br#"[1,2,3]"#).is_err());
 }
+
+// ── #20 hardening (c): backend dup-key must be aeson FIRST-wins ──────────────
+
+use super::enforce_snapshot_backend_is_utxohd_mem as enforce_backend;
+
+#[test]
+fn backend_enforce_is_aeson_first_wins_on_duplicate_key() {
+    // Single valid backend → Ok (unchanged behavior).
+    assert!(enforce_backend(br#"{"backend":"utxohd-mem","tablesCodecVersion":1}"#).is_ok());
+    // Duplicate `backend`: aeson keeps the FIRST occurrence.
+    //  first valid  → Ok.
+    assert!(enforce_backend(br#"{"backend":"utxohd-mem","backend":"lsm"}"#).is_ok());
+    //  first invalid → Err. THIS is the fix: serde_json `Value::get` (last-wins) would
+    //  have WRONGLY accepted the second "utxohd-mem"; aeson first-wins keeps "lsm" → reject.
+    assert!(enforce_backend(br#"{"backend":"lsm","backend":"utxohd-mem"}"#).is_err());
+    // absent / null / non-string / wrong-string → Err (unchanged).
+    assert!(enforce_backend(br#"{"tablesCodecVersion":1}"#).is_err());
+    assert!(enforce_backend(br#"{"backend":null}"#).is_err());
+    assert!(enforce_backend(br#"{"backend":123}"#).is_err());
+    assert!(enforce_backend(br#"{"backend":"lsm"}"#).is_err());
+    // not a JSON object → Err (aeson withObject).
+    assert!(enforce_backend(br#"["utxohd-mem"]"#).is_err());
+}

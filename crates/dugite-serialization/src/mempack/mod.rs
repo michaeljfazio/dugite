@@ -1021,10 +1021,18 @@ pub const UTXO_HD_MEM_BACKEND_TAG: &str = "utxohd-mem";
 ///
 /// Returns `Ok(())` only for `backend == "utxohd-mem"`.
 pub fn enforce_snapshot_backend_is_utxohd_mem(meta_json: &[u8]) -> Result<(), SerializationError> {
-    let value: serde_json::Value = serde_json::from_slice(meta_json).map_err(|e| {
-        SerializationError::CborDecode(format!("snapshot meta is not valid JSON: {e}"))
-    })?;
-    match value.get("backend").and_then(|b| b.as_str()) {
+    // AESON-FAITHFUL FIRST-WINS (#20 hardening, sub-item c): aeson's default `json`
+    // parser keeps the FIRST occurrence of a duplicate object key (`KM.fromList`);
+    // serde_json's `Value::get` keeps the LAST (its `Map::insert` overwrites). Resolving
+    // `backend` via serde_json would DISAGREE with aeson on a duplicate `backend` key —
+    // and disagree with how dugite resolves the sibling `tablesCodecVersion` / `checksum`
+    // fields of the SAME `SnapshotMetadata` (both first-wins via `first_occurrence_value`).
+    // A crafted meta with two `backend` keys (`utxohd-mem` first, a rejected value second,
+    // or vice-versa) would resolve OPPOSITELY in dugite vs cardano-node. Use the same
+    // first-occurrence machinery so all three fields share aeson's dup-key semantics.
+    // `first_occurrence_value` also enforces the blob is a JSON object (aeson `withObject`).
+    let backend = first_occurrence_value(meta_json, "backend")?;
+    match backend.as_ref().and_then(|b| b.as_str()) {
         Some(UTXO_HD_MEM_BACKEND_TAG) => Ok(()),
         other => Err(SerializationError::CborDecode(format!(
             "snapshot meta backend={other:?} is not `{UTXO_HD_MEM_BACKEND_TAG}` \
