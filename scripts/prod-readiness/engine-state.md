@@ -172,7 +172,10 @@
    first-wins machinery -> opposite dup-key resolution for two fields of the SAME SnapshotMetadata; aeson is first-wins
    for all. FIX class: make every snapshot-leaf decoder hard-fail exactly where Haskell strict MemPack/CBOR does
    (varlen mask+overflow+too-many-bytes; definite-map entry-count; backend first-wins). Mostly backstopped in practice
-   by #17 (whole-file CRC) + Mithril signature, hence M not H. state:NEW attempts:0
+   by #17 (whole-file CRC) + Mithril signature, hence M not H. *** PROGRESS: sub-item (c) backend dup-key first-wins DONE
+   wake328 (b43f4fa80d, nextest 1147/1147). REMAINING: (a) decode_varlen overflow/non-minimal/terminal-mask (~10 sites,
+   compact.rs:50-69, HIGHEST-impact — needs Haskell unpack7BitVarLenLast confirmation via bounded muscle); (b) definite-
+   length-map exact-count (premature-EOF). state:PARTIAL (c done; a/b remain) attempts:0
 17. [H][security/integrity][REAL-NEW, from gauntlet w3upqlq0y compounding-feedback] Mithril/Haskell snapshot
    IMPORT does NOT verify the snapshotChecksum/CRC. Upstream V2/InMemory.loadSnapshot computes
    crcOfConcat(state-CRC, tables-CRC) and throws ReadSnapshotDataCorruption on mismatch; dugite's
@@ -263,7 +266,21 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #20c (backend dup-key first-wins) state:FIXING attempts:0 — fix+test applied + compiles; gauntlet bpf5r3skc IN-FLIGHT; lock HELD.
+- item: #20c DONE (committed+pushed b43f4fa80d). #20 remaining: (a) varlen, (b) definite-map. NEXT WAKE: SCHEDULE #20a or #20b.
+  *** wake328-cont (ultracode): #20c FIXING→VERIFYING→DONE. Gauntlet bpf5r3skc GREEN: nextest -p dugite-serialization
+  1147/1147 (was 1146, +1 = the new backend_enforce_is_aeson_first_wins_on_duplicate_key test, PASSES — the critical case
+  {"backend":"lsm","backend":"utxohd-mem"} now Errs where pre-fix serde_json last-wins wrongly accepted the 2nd); clippy
+  -D warnings + fmt clean; NO regression. COMMITTED focused 1-crate fix b43f4fa80d (mempack/mod.rs backend→first_occurrence_
+  value + tests.rs) + PUSHED (9c53405384..b43f4fa80d). All three SnapshotMetadata fields now share aeson first-wins dup-key
+  semantics. *** #20 REMAINING (2 sub-items, dugite-serialization): (a) decode_varlen (compact.rs:50-69) — NO terminal-byte
+  high-bit mask + NO overflow/non-minimal rejection → a >2^64 or overlong varlen silently truncates to u64 Ok; Haskell
+  unpack7BitVarLenLast F.fails. Used ~10 sites (CompactAddr len, Coin, MA count/rep len, tag-4/5 datum/script len). HIGHEST-
+  IMPACT of the 3. Needs byte-exact Haskell MemPack confirmation (unpack7BitVarLenLast strictness: terminal-byte mask,
+  overflow, minimal-form) → BOUNDED muscle. (b) DEFINITE-length tables map truncated to M<N declared → silently imports the
+  prefix; Haskell decodeMapLen demands exactly N → DecoderErrorPrematureEOF. *** NEXT WAKE — SCHEDULE: #20a (varlen,
+  highest-impact — route a BOUNDED muscle for the Haskell MemPack/cborg strictness, anti-death-scoped given recent muscle
+  issues) OR #20b (definite-map, maybe hand-doable). RECOMMEND #20a. #24 stays ROOT-CAUSED (pin later). Housekeeping:
+  /tmp/g20_*.log removable.
   *** wake328 (ultracode): SCHEDULE #20 (snapshot-import adversarial-hardening — concrete/unit-testable, bank a clean win
   after the long phase-2 thread; crc32 non-cryptographic so #17 doesn\'t subsume). #20 has 3 sub-items; DROVE sub-item (c)
   HAND (byte-exact without a muscle — the #17 work already established aeson\'s first-wins default, verbatim haddock in the
@@ -2507,6 +2524,12 @@
 - db-clones/preprod-ep57-fixed   (fixed-binary replay, in progress)
 
 ## Gauntlet ledger  (passed/refuted approaches — never silently retry a REFUTED)
+- PASSED 2026-06-08 (wake328, #20c): "resolve snapshot meta `backend` via aeson first-wins (first_occurrence_value), not
+  serde_json last-wins". Gauntlet = the new regression test backend_enforce_is_aeson_first_wins_on_duplicate_key (critical
+  case {"backend":"lsm","backend":"utxohd-mem"} must Err — pre-fix last-wins wrongly accepted the 2nd "utxohd-mem") +
+  nextest 1147/1147 + clippy -D warnings + fmt, no regression. Byte-exact per aeson default `json` (KM.fromList first-wins,
+  verbatim haddock in mempack/mod.rs), consistent with tablesCodecVersion/checksum. Landed b43f4fa80d. #20 (a)varlen +
+  (b)definite-map remain.
 - PASSED 2026-06-07 (wake325, #23 V1): "dedup txInfoData witness datums by hash (Haskell TxDats=Map DataHash)". Gauntlet =
   re-running the captured #730 phase-2 dumps at HEAD+fix reproduces on-chain is_valid with the divergence GONE: tx0 363→194
   (169 byte-exact, ~47%); nextest -p dugite-uplc 441/441 (conformance + on-chain budget fixtures, no regression); clippy
@@ -2583,6 +2606,7 @@
 - 2026-06-07T22:xxZ wake325(+cont) ~ SALVAGED dead muscle's txInfoData-dedup fix, VERIFIED (tx0 363→194, nextest 441/441) + commit/push 9c53405384; filed #24 (V2 residual)
 - 2026-06-07T23:xxZ wake326(+cont) ~ wogj8wp6h completed (44min, not dead) → #24 ROOT-CAUSED (inline-datum-spend over-cost, NOT txInfoData); stopped redundant w90vykjte; filed #25 (370 wrong-accept)
 - 2026-06-08T00:xxZ wake327 ~ #25 DEBUNKED (only 1 is_valid=false dump, not 370 — muscle miscount); #438 save via 1-command verify
+- 2026-06-08T01:xxZ wake328(+cont) ~ #20c backend dup-key first-wins FIXING→DONE (nextest 1147/1147) + commit/push b43f4fa80d
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -4121,3 +4145,6 @@
   count: EXACTLY 1 is_valid=false dump in 769 (not 370). The 370 was the muscle's raised-budget over-cost dumps mislabeled
   (= the #24 class). #25 closed (L; 1 isolated minor case). #438 save: cheap empirical check before investing a muscle.
   Phase-2-dump corpus now largely mined (#23 fixed, #24 root-caused/exact-line-pending, #25 debunked). Next: SCHEDULE #20 or pin #24.
+- wake328(+cont) 2026-06-08: SCHEDULE #20 hardening; DROVE sub-item (c) backend dup-key first-wins (hand-fix, byte-exact via
+  the #17-established aeson first-wins) → FIXING→VERIFYING→DONE. Gauntlet GREEN (nextest 1147/1147 incl. the new first-wins
+  test, clippy, fmt). Committed+pushed b43f4fa80d. #20 (a)varlen + (b)definite-map remain. Next: #20a (bounded muscle).
