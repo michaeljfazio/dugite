@@ -162,7 +162,29 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:FIXING (commit-A inline-datum verbatim). *** wake156:
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-BUILDING (commit-A). *** wake159:
+  FIX muscle wst6ekcg6 COMPLETED checks_green=true, tier A', 1 crate (dugite-uplc redeemer_resolve.rs only). Fix:
+  InlineDatum arm now routes through new helper inline_spend_datum(data, raw_cbor, script_hash) that DECODES the
+  preserved raw_cbor (validates span==original) to recover the structural datum anchored to verbatim bytes, mirroring
+  Haskell binaryDataToData/getBabbageSpendingDatum + the DatumHash raw-span branch. +regression test.
+  *** CRITICAL CAVEAT from the fix agent (DO NOT TRUST GREEN — replay is the arbiter): the agent's OWN Haskell
+  research shows (a) V1/V2 txInfoData is WITNESS-ONLY (PV1.txInfoData = Alonzo.transTxWitsDatums (tx^.witsTxL)) — the
+  spent output's inline datum does NOT enter the context datum map; it is passed as the script's DATUM ARGUMENT; and
+  (b) in this main tree InlineDatum.data is ALREADY read_plutus_data(raw_cbor) at every construction site, so
+  inline_spend_datum recovers the SAME structural value => the fix is LIKELY A NO-OP for well-formed inputs and may
+  NOT remove the 297 'Error term'. Also: the wuoecuy7o diagnosis referenced decode_plutus_data_cbor which does NOT
+  exist in this checkout. HYPOTHESIS for the TRUE mechanism if replay shows no change: the divergence is NOT datum-
+  resolution but the UPLC serialiseData builtin (or other ScriptContext field) re-encoding the datum CANONICALLY when
+  the script itself hashes/serialises its datum arg — on-chain Data carries memoised original bytes (MemoBytes) so
+  serialiseData returns verbatim; dugite's structural Data likely re-encodes. That would be a dugite-uplc CEK/builtin
+  bug, deeper than resolve_spend_datum.
+  DROVE: copied worktree redeemer_resolve.rs into MAIN (which carries FINAL-DONE uncommitted: mempack codec-version +
+  node import-endianness present) -> combined binary; started release build pid 97939 (.jobs/verify-build-10A.log).
+  NEXT WAKE: BUILD_EXIT=0 -> clone db-preprod-sync -> verify10A re-soak -> COUNT 'Error term' divergences over the
+  SAME ep293 slot window (125001020+): if ~0 (CASE1 10a0dbda / CASE2 08c596be gone) the fix WORKS -> gauntlet ->
+  commit (A); if STILL ~297 the fix is a NO-OP -> REVERT redeemer_resolve.rs from main, RE-DIAGNOSE toward
+  serialiseData/CEK (the refuter mechanism was plausible but the Haskell research refutes it).
+  was: state:FIXING (commit-A inline-datum verbatim). *** wake156:
   DROVE ROOT-CAUSED -> FIXING. Launched FIX muscle wst6ekcg6 (run wf_3ec4a181-f27, worktree, Tier A') for commit (A)
   = dugite-uplc inline-datum VERBATIM-BYTES ScriptContext fix. Pre-read confirmed exact site: redeemer_resolve.rs:620
   `InlineDatum { data, .. } => Ok(data.clone())` DISCARDS the carried raw_cbor; the DatumHash branch L631-642 ALREADY
@@ -1032,6 +1054,12 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake159 2026-06-07: #10 FIX muscle wst6ekcg6 COMPLETED (green, A', dugite-uplc inline_spend_datum verbatim) ->
+  FIXING -> VERIFYING-BUILDING. *** FIX AGENT CAVEAT: V1/V2 txInfoData is witness-only + InlineDatum.data already
+  read_plutus_data(raw_cbor) => fix LIKELY NO-OP; true mechanism may be UPLC serialiseData re-encode, not datum
+  resolution. *** Copied fix into main (has FINAL-DONE), build pid 97939 (.jobs/verify-build-10A.log). NEXT WAKE:
+  BUILD_EXIT=0 -> verify10A re-soak -> COUNT 'Error term' at ep293 slots 125001020+: ~0=fix works->gauntlet->commit;
+  ~297=NO-OP -> revert + re-diagnose toward serialiseData/CEK. Health: node pid63671 slot125107354 0 phase-1; disk 20G.
 - wake158 2026-06-07: POLL #10 FIX muscle wst6ekcg6 — still RUNNING, ACTIVE (Opus fix agent aec3ca671 in analysis/
   oracle+build phase). No transition. Health: verify10j node (pid 63671, 37min) slot 125107058 block 4793980, 0
   phase-1; disk 28G. #10 stays FIXING. NEXT WAKE: on fix green -> VERIFYING-replay 297 residual.
