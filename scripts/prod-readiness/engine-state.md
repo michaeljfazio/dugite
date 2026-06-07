@@ -209,7 +209,7 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:INSTRUMENTING-REPLAY (Koios pin EXHAUSTED; drop-set instrumentation written + release build running).
+- item: #0 (mainnet ep246 reserves) state:INSTRUMENTING-REPLAY (drop-set instrumentation, replay launch pending). polled wake255 15:43 — build pid 83303 compiling final crate dugite-node (release), no errors; next wake verify build done -> launch instrumented from-genesis replay (DUGITE_RUPD_DROP_TRACE=1).
   *** wake254: focused pin wz6ku12dk = found=false, RULED OUT the candidate pool + the single-whale hypothesis.
   KEY CORRECTION: the dump's per_pool_top20.amount is NOT reward data (top pool showed 2.0T vs Koios actual 36.8B) —
   candidate pool e7b605b72af was a red-herring from that misread field. Named whales (registered ep208/230, stable,
