@@ -218,7 +218,19 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #6 (fork-robustness apply_utxo_diff) state:FIXING attempts:0 — patch applied + compiles (UNCOMMITTED). NEXT WAKE: VERIFYING.
+- item: #6 (fork-robustness apply_utxo_diff) state:VERIFYING attempts:0 — fail-pre CONFIRMED; patched gauntlet ba20qc2ea IN-FLIGHT; wake-lock HELD (TTL 22m).
+  *** wake317 (ultracode): #6 FIXING→VERIFYING (in-flight). *** FAIL-PRE CONFIRMED EMPIRICALLY (the #438-lesson rigor): temp-
+  reverted ledger_seq.rs apply_utxo_diff to its pre-patch utxo-set-only body (keeping the test; patched file backed up at
+  /tmp/ledger_seq.patched.bak), ran the regression test (b9a0d9t7t) → FAILED exactly as designed: left=None vs
+  right=Some(Lovelace(5000000)) "apply_utxo_diff must ADD the new output's coin to stake_map". Proves the test genuinely
+  catches the bug (not a tautology). RESTORED the patched fix from backup (verified: TEMP-marker count 0, fix+test markers
+  present). Working tree now = patched (ledger_seq.rs + state/mod.rs uncommitted; common.rs M = pre-existing #730). Launched
+  the pass-post gauntlet ba20qc2ea (background): cargo nextest -p dugite-ledger + clippy --all-targets -D warnings + fmt
+  --check → /tmp/g_combined.log. *** ON COMPLETION (this wake, auto-notify): if nextest GREEN (regression test passes,
+  no regression) + clippy clean + fmt clean → since #6 is a CODE INVARIANT (forward path is the byte-exact reference, no
+  Koios; the fail-pre/pass-post regression test IS the gauntlet), COMMIT the focused fix (crates/dugite-ledger/src/
+  ledger_seq.rs + state/mod.rs ONLY — do NOT stage common.rs) + push, advance #6 VERIFYING→DONE, release lock. If any
+  RED → record the failure, keep uncommitted, stay VERIFYING.
   *** wake316 (ultracode): #6 ROOT-CAUSED→FIXING (one step). Applied the VALIDATED candidate-latent-fix-apply_utxo_diff.patch
   (mechanical — analyze w2x5j3223 already did the analytical fix-validation; like #20c, applying a fully-validated patch is
   not analytical work). The patch (1) rewrites ledger_seq.rs:918 apply_utxo_diff to mirror the forward path: inserts ADD
