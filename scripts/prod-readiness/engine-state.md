@@ -209,7 +209,22 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:REPLAY-RUNNING (polled wake257 16:01 — pid 84509 alive at ep158 Byron, ~25 ep/min, 0 RUPD_DROP yet [expected pre-ep208 Shelley]; ep246 ETA <1h). (instrumented from-genesis localization replay LAUNCHED wake256).
+- item: #0 (mainnet ep246 reserves) state:ISOLATING-BUGGY-SUBSET (drop set captured; Koios isolation diagnose w79i1iplr launched).
+  *** wake258: instrumented replay REACHED ep246 in ~4 MIN (07:56->08:00; FAR faster than feared). Captured the
+  ep245->246 boundary drop set: 809 MEMBER creds dropped (0 leaders), total_would_be=12,509,563,183. BUT ep245
+  baseline was byte-exact (10.7B dropped @ ep244->245), so Haskell drops ~all of these too — they are mostly
+  LEGITIMATE deregistered creds. The BUG is only the 82,270,482 subset Haskell PAYS but dugite drops. Magnitude
+  alone won't isolate it (top drop=1.17B; 82M spread among the rest). Saved the 809-cred set ->
+  epoch-dumps-engine/mainnet-rupd-drop/ep246_drops.txt (each: cred=<28-byte stake hash padded to 32 w/ trailing
+  00000000> would_be stake leader=false). SIGTERM'd the replay pid 84509 (graceful; ep246 data captured; CoW clone
+  db-clones/mainnet-rupd-drop KEPT for the verification re-replay). DROVE (REPLAY-RUNNING->ISOLATING): launched opus
+  Koios isolation diagnose w79i1iplr (run wf_72e4b424-a5e): strip padding -> bech32 stake addrs -> BATCHED
+  account_reward_history (_stake_addresses array) -> the creds with an earned_epoch=245 reward row are the BUGGY
+  drops (Haskell paid them); confirm sum ≈82,215,213; then account_update_history -> the reg/dereg/re-reg/MIR anomaly
+  straddling the ep245 startStep (mainnet ep245 first_slot=20908800, startStep=+172800=21081600). NEXT WAKE: read
+  w79i1iplr -> exact buggy creds + mechanism -> targeted fix in apply.rs frozen-set capture (or reward_accounts
+  tracking) -> rebuild -> re-replay over the SAME CoW clone -> assert ep246 reserves==12880948865137767 + ep209-245
+  unregressed -> gauntlet -> commit. Instrumentation still UNCOMMITTED.
   Build OK (release, 1m37s, no warnings). APFS CoW-cloned db-mainnet -> db-clones/mainnet-rupd-drop (instant, 0 extra
   disk; 46G immutable, blocks through ep331). Launched instrumented replay: job mainnet-rupd-drop pid 84509 (caffeinate),
   DUGITE_RUPD_DROP_TRACE=1 + DUGITE_EPOCH_STATE_DUMP=epoch-dumps-engine/mainnet-rupd-drop, --config config/mainnet/
@@ -2727,3 +2742,9 @@
   flying at ~128K blk/s -> ep246 likely <1h. next wake: poll; once past ep246, grep RUPD_DROP (summary total_would_be
   ≈82,270,482) for the exact dropped creds -> characterize -> targeted fix. SIGTERM-only to stop. Instrumentation
   uncommitted.
+- wake258 2026-06-07: instrumented replay hit ep246 in ~4min (Byron 128K blk/s). ep245->246 boundary drop set =
+  809 MEMBER creds, total_would_be 12,509,563,183 — but Haskell drops ~all (ep245 byte-exact); BUG is only the
+  82,270,482 subset Haskell pays. Saved -> epoch-dumps-engine/mainnet-rupd-drop/ep246_drops.txt; SIGTERM'd replay
+  (CoW clone kept for verification re-replay). Launched opus Koios isolation diagnose w79i1iplr: batched
+  account_reward_history over the 809 -> the earned_epoch=245-paid ones are buggy (sum≈82,215,213) -> reg-anomaly
+  via account_update_history. next wake: read w79i1iplr -> targeted fix -> re-replay verify.
