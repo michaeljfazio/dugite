@@ -194,7 +194,25 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:DIAGNOSING (gauntlet REFUTED 3/3; verify dissents).
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:FIXING (commit-B RE-FIX, 6-path disposition).
+  *** wake172: ANALYZE wezt2hemc COMPLETE — authoritative per-path disposition (pinned cardano-ledger cd8b7fab +
+  ouroboros-consensus 640b7fea). GOVERNING PRINCIPLE: snapshot UTxO leaves are MemPack newtype-over-ShortByteString
+  (BinaryData/PlutusBinary/CompactAddr/multi-asset rep) = ZERO structural validation at load (that lives in on-chain
+  DecCBOR, NOT invoked); load-time protections = MemPack underrun hard-fail (truncation/unknown-tag) + whole-file CRC.
+  => leaf-structural = OPAQUE-STORE; container-truncation = HARD-ERROR. 6-PATH FIX:
+   (1) tag-4 datum mod.rs:6648-6660 OPAQUE-STORE (best-effort decode, keep raw bytes on Err, NO error) [my no-silent-
+       None OVER-REJECTED — BinaryData opaque]; (2) tag-5 refscript ~6679-6694 OPAQUE-STORE body (unknown-language-tag
+       MAY hard-error) [over-rejected]; (3) TvarIterator mempack/mod.rs:977-1006 HARD-ERROR on mid-map decode_bytes Err
+       / val_start>=len [pre-existing silent-truncate]; (4) address ~6571-6582 HARD-ERROR (opaque-CompactAddr refactor
+       = SEPARATE item) [pre-existing silent-skip]; (5) multi-asset ~6616-6623 + AssetName>32 ~6599-6607 HARD-ERROR
+       [pre-existing silent token-drop]; (6) R3 add coeff.is_zero()=>Some(0) short-circuit [my R3, 0e<huge> blowup].
+  R3 core is byte-exact-confirmed by all refuters (KEEP). DROVE: regenerated base-commitB-bridge.patch (4152 lines,
+  ca50afd9ef->main current = FINAL-DONE+R3+no-silent-None+Convertible arm, avoids the wake166 drift recurrence) +
+  launched FIX muscle wcp4vycpw (run wf_b1d55d93-e4a, worktree, applies bridge by abs-path first). NEXT WAKE: poll;
+  green -> copy files to main -> verify-build -> re-import (0 phase-1) -> re-gauntlet (all 3 prior refutes now
+  addressed: tag-4/5 opaque=byte-exact, 3 silent paths hard-error=byte-exact, R3 short-circuit) -> COMMIT #10.
+  FILE SEPARATELY: #19 opaque-CompactAddr-store adversarial-hardening (path-4 option-a).
+  was: state:DIAGNOSING (gauntlet REFUTED 3/3; verify dissents).
   *** wake169: RE-GAUNTLET wdvf5l5le = pass=false REFUTED 3/3 — substantive, NOT a commit. ALL 3 CONFIRM byte-exact:
   R3 scientific_literal_as_word8 (Aeson toBoundedInteger@Word8 — 1.0/1e0/100e-2=>1, sub-ULP/1.5 reject, range reject)
   + TxIx endianness/backend STRICT mapping. VALID REFUTATIONS:
@@ -1215,6 +1233,11 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake172 2026-06-07: #10 DIAGNOSING -> FIXING. ANALYZE wezt2hemc gave source-grounded 6-path disposition (leaf=
+  OPAQUE-STORE, container-truncation=HARD-ERROR): tag-4/5 opaque (revert my over-reject), TvarIterator/address/multi-
+  asset HARD-ERROR (pre-existing silent paths), R3 c==0 short-circuit. Regenerated base-commitB-bridge.patch (4152L,
+  ca50afd9ef->main, includes Convertible) + launched FIX muscle wcp4vycpw (wf_b1d55d93-e4a). NEXT WAKE: poll -> build
+  -> re-import -> re-gauntlet -> commit. File #19 opaque-CompactAddr separately.
 - wake171 2026-06-07: POLL #10 ANALYZE wezt2hemc — research stage DONE (1 result), root-cause agent running (final
   stage, last activity current). No transition. Disk 184G, no nodes. #10 stays DIAGNOSING. NEXT WAKE: on result ->
   fix (R3 keep; tag-4/5 opaque-no-redecode; harden the 3 silent paths).
