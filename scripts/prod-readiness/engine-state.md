@@ -241,7 +241,18 @@
    the test FAILS pre-fix: reintroduced the accumulator → 2nd target credited 0 (cap basis 600-400=200 < 400 → rejected),
    restored fix → passes (the gold "test reproduces the divergence" rigor). *** INDEPENDENTLY RE-VERIFIED (#438): accumulator
    gone (only in test comment), cap-check uses live treasury, :2288 unchanged, fmt=0 clippy=0 nextest 1524/1524 incl. both
-   treasury tests. state:GAUNTLET attempts:1 conf:0.93. *** NEXT WAKE — GAUNTLET (lenses: Haskell-single-subtraction exact match,
+   treasury tests. state:GAUNTLET attempts:1 conf:0.93.
+   *** GAUNTLET REFUTED → back to FIXING wake368 (gauntlet wq63ah2hg, 1/3 but DECISIVE + corroborated — see Gauntlet ledger).
+   The v1 fix (cap-check vs live epochs.treasury.0, accumulator deleted) is byte-exact for ALL-REGISTERED targets but for the
+   unregistered-target edge it under-subtracts the cap basis (:2288 uses `disbursed` not the full fold) → ALLOWS a 2nd same-pass
+   withdrawal Haskell BLOCKS = treasury OVER-DISBURSEMENT. BYTE-EXACT REWORK (next FIXING): introduce a transient cap_treasury
+   (init = epochs.treasury.0 at pass start; on each enacted TreasuryWithdrawals decrement by the FULL fold(withdrawals), NOT
+   disbursed) and cap-check remaining_treasury against cap_treasury; KEEP the v1 accumulator-deletion + :2739 change as the base
+   but redirect the cap basis to cap_treasury; KEEP :2288 decrementing epochs.treasury.0 by `disbursed` (real money / reserves-
+   treasury byte-exactness validated to ep247/ep293 stays untouched). Matches Haskell ensTreasury <-> fold wdrls (cap) vs
+   applyEnactedWithdrawals (real, registered-only). Add a test: registered-then-deregistered target + a 2nd registered withdrawal
+   in one pass → 2nd BLOCKED (Haskell-correct), proving the over-disbursement is gone. Re-run the gauntlet. state:FIXING attempts:2
+   conf:0.80. *** NEXT WAKE — GAUNTLET (lenses: Haskell-single-subtraction exact match,
    single-withdrawal + validated-era no-regression, the disbursed-vs-full-sum cap-basis residual for unregistered targets) →
    commit on pass. Test-construction gotcha recorded: reward_account_to_hash keys on the 28-byte CREDENTIAL bytes[1..29], NOT
    byte[0] (network/script header) — vary byte[1] to make distinct accounts.
@@ -517,7 +528,17 @@
    reconstruction + #7 sub-tx forward). state:DONE attempts:0
 
 ## In-progress
-- item: #29 TreasuryWithdrawals double-subtract FIXING DONE (uncommitted, 1524/1524, test empirically fails pre-fix) → state:GAUNTLET. NEXT: gauntlet → commit.
+- item: #29 GAUNTLET REFUTED → FIXING (attempts:2). v1 fixes the all-registered double-subtract but over-disburses in the unregistered-target edge; byte-exact rework = transient cap_treasury (full-fold-decremented). NO commit.
+  *** wake368 (ultracode): ran the #29 gauntlet (wq63ah2hg, 3 lenses, in-turn). Vote 1/3 refute = nominal "pass" BUT lens1
+  REFUTED + lens3 corroborated the SAME residual → REJECT (#26/#27 lesson). v1 (cap-check vs live epochs.treasury.0) is
+  byte-exact for ALL-REGISTERED targets, but the :2288 decrement uses `disbursed` (registered-only) which also serves as the
+  threaded cap basis; Haskell decrements the transient ensTreasury by the FULL fold(wdrls). So for a target registered-at-propose
+  then DEREGISTERED-before-enact + >=2 withdrawals/pass, dugite under-subtracts → ALLOWS a 2nd withdrawal Haskell BLOCKS = treasury
+  OVER-DISBURSEMENT (new unsafe failure mode). Lens2 (no common/validated-era regression) confirmed the v1 fix is otherwise good.
+  BYTE-EXACT REWORK (next): transient cap_treasury decremented by the FULL fold per enact for the cap check; keep epochs.treasury.0
+  decremented by disbursed for the real money; + a registered-then-deregistered test. Recorded REFUTED verbatim. NEXT WAKE: FIXING
+  rework (oracle-confirm wdrlsAmount=fold wdrls if needed; cap_treasury) → re-gauntlet → commit. Lock to release. Fix v1 stays
+  in-tree as the rework base.
   *** wake364 (ultracode): DRIVE #29 ROOT-CAUSED→FIXING (fix Workflow wggdmnnln, in-turn ~20min). 3 minimal edits in
   governance.rs: cap-check vs live epochs.treasury.0 (:2739), deleted the accumulator (decl :2702 + increment :2761-2765);
   kept the physical :2288 decrement + payout. Added test_two_treasury_withdrawals_both_enact_in_one_pass — the agent
@@ -3157,6 +3178,19 @@
 - db-clones/preprod-ep57-fixed   (fixed-binary replay, in progress)
 
 ## Gauntlet ledger  (passed/refuted approaches — never silently retry a REFUTED)
+- REFUTED 2026-06-08 (wake368, #29 fix v1, gauntlet wq63ah2hg): the accumulator-removal fix is byte-exact for the ALL-REGISTERED
+  case (the common bug) but NOT for the unregistered-target edge. Vote 1/3 (nominal "pass") but lens1 REFUTED + lens3 corroborated
+  the SAME residual → REJECT (#26/#27 lesson: read substance, not vote count). ROOT: dugite conflates Haskell's transient cap-basis
+  ensTreasury and the real casTreasury into ONE epochs.treasury.0. The unchanged :2288 decrement uses `disbursed` (registered-only)
+  and that value doubles as the threaded cap basis; Haskell Enact.hs decrements ensTreasury by the FULL `fold wdrls` (regardless of
+  registration), filtering unregistered only later at the boundary (applyEnactedWithdrawals / conway.md:210,216). REACHABLE edge:
+  target registered at proposal (passes tag-17) then DEREGISTERED before the enact epoch boundary + >=2 withdrawals in one pass →
+  dugite under-subtracts (treasury - disbursed > treasury - full) → ALLOWS a 2nd withdrawal Haskell BLOCKS = treasury OVER-
+  DISBURSEMENT (a NEW unsafe failure mode; the deleted accumulator tracked the full amount so old code was conservative-blocking
+  there). Lens2 (no common-case/validated-era regression) + the all-registered fix are CORRECT and KEPT. BYTE-EXACT FIX (rework):
+  add a transient cap_treasury (= epochs.treasury.0 at pass start, decremented by the FULL fold of each enacted withdrawal) and
+  cap-check against it; keep epochs.treasury.0 decremented by `disbursed` at :2288 for the real money. This subsumes the would-be
+  #29b. Do NOT commit fix v1.
 - PASSED 2026-06-08 (wake359, #28 PlutusData 64-byte leaf cap, gauntlet w67vflrob): 0/3 refute, each lens SUBSTANTIVE.
   (1) exact-match — read the diff vs verbatim plutus decodeBoundedBytes/decodeBoundedBytesIndefLen/decodeBoundedBigInteger:
   inclusive 64 boundary, per-chunk indef with UNBOUNDED total, 0-len ok, bignum tag-2+3 mantissa bounded both eras, small-ints
@@ -3319,6 +3353,7 @@
 - 2026-06-08T21:35Z wake359 ~ #28 gauntlet w67vflrob PASSED 0/3 (substantive: exact decodeBoundedBytes match + over-strictness/completeness incl Dijkstra-reuse + commit-safety); COMMITTED 9b21f6f0d5 (1 crate). #28 DONE. Next #29
 - 2026-06-08T22:05Z wake360 ~ #29 NEW→ROOT-CAUSED: HEAD-verified double-subtract + diagnose wd3dqbaqm (in-turn, conf 0.96) source-confirmed Conway single-decremented-ensTreasury (no accumulator). Fix=cap-check vs live treasury + delete accumulator, keep :2288. Next FIXING
 - 2026-06-08T22:45Z wake364 ~ #29 ROOT-CAUSED→FIXING: fix Workflow wggdmnnln (in-turn) removed the cap-check accumulator double-subtract (cap vs live treasury, kept :2288); reproducing test EMPIRICALLY fails pre-fix; INDEPENDENTLY verified 1524/1524. Uncommitted; gauntlet next
+- 2026-06-08T23:15Z wake368 ~ #29 gauntlet wq63ah2hg: 1/3 refute but DECISIVE (lens1+lens3) — v1 over-disburses in the unregistered-target edge (cap basis uses disbursed not full fold). REJECT; →FIXING attempts:2 (byte-exact rework: transient cap_treasury full-fold-decremented). NO commit
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -4975,3 +5010,9 @@
   accumulator double-subtract (cap-check vs live epochs.treasury.0; deleted decl+increment; kept the physical :2288 decrement).
   Added a reproducing test the agent EMPIRICALLY confirmed fails pre-fix. INDEPENDENTLY re-verified fmt+clippy+nextest 1524/1524.
   Uncommitted; gauntlet next. state:GAUNTLET.
+- wake368 2026-06-08: ran the #29 gauntlet (wq63ah2hg, 3 lenses, in-turn). 1/3 refute = nominal "pass" but lens1 REFUTED +
+  lens3 corroborated: the v1 fix is byte-exact for all-registered targets but the :2288 `disbursed` decrement (registered-only)
+  doubles as the threaded cap basis, whereas Haskell decrements the transient ensTreasury by the FULL fold(wdrls). Edge
+  (registered-then-deregistered target + >=2 withdrawals/pass) → dugite over-disburses the treasury (allows a withdrawal Haskell
+  blocks). REJECT (#26/#27 lesson). Recorded REFUTED; #29 → FIXING attempts:2. Byte-exact rework = transient cap_treasury
+  (full-fold-decremented) for the cap check, keep epochs.treasury.0 disbursed-decremented for real money. NO commit.
