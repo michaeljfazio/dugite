@@ -194,7 +194,16 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-RESOAK (commit-B). *** wake167:
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:GAUNTLET-PENDING (commit-B). *** wake168:
+  VERIFYING-RESOAK VERDICT = PASS. verify10B synced PAST window (tip 125110959 > 125105013): 0 phase-1 (all classes),
+  0 import hard-errors (no-silent-None non-regressing), 308 Error-term (= #15 general-UPLC, unchanged by hardening as
+  expected). DROVE: SIGTERM'd verify10B (evidence captured), launched RE-GAUNTLET muscle wdvf5l5le (run wf_83b4db4e-
+  836, refuterN=3) on FINAL-DONE+R3+no-silent-None. The prior 3/3 refute (wetwroth8) is now fully ADDRESSED: R1+R2
+  297-attribution PROVEN general-UPLC #15 (byte-level: independent post-snapshot tx + serialiseData 276->270 datum
+  mismatch); R3 float-parse FIXED byte-exact (f64-free + Aeson toBoundedInteger); CRC=#17 scoped. NEXT WAKE: on
+  gauntlet PASS -> COMMIT #10 via gh/HTTPS (dugite-serialization + dugite-node, 2 crates) then ACTIVATE #15; on any
+  REFUTE -> verify the dissent vs upstream before acting (do NOT blindly trust the count).
+  was: state:VERIFYING-RESOAK (commit-B). *** wake167:
   BUILD_EXIT=0 (combined hardening binary; Convertible-drift fixed). DROVE: CoW-cloned db-preprod-sync ->
   db-clones/preprod-verify10B, launched pid 48115 port 4211. R3/no-silent-None NON-REGRESSING confirmed: import
   logged "codec_version=1 txix_endianness=Big" (R3 f64-free scientific_literal_as_word8 parses the REAL integer-1
@@ -1183,6 +1192,10 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake168 2026-06-07: #10 VERIFYING-RESOAK PASS -> GAUNTLET-PENDING. verify10B past window: 0 phase-1, 0 import
+  hard-errors, 308 Error-term (=#15). SIGTERM'd verify10B; launched RE-GAUNTLET wdvf5l5le (wf_83b4db4e-836) on
+  FINAL-DONE+R3+no-silent-None (prior 3/3 resolved: R1+R2=general-UPLC #15 byte-level; R3 fixed; CRC=#17). NEXT WAKE:
+  PASS -> commit #10 (2 crates) + activate #15.
 - wake167 2026-06-07: #10 BUILD_EXIT=0 -> VERIFYING-BUILDING -> VERIFYING-RESOAK. Cloned verify10B, launched
   combined hardening binary pid 48115. R3/no-silent-None NON-REGRESSING: codec_version=1 Big (real integer-1 meta),
   0 phase-1, 0 import hard-errors. NEXT WAKE: confirm full 0 phase-1 past window -> RE-GAUNTLET -> commit #10.
