@@ -209,7 +209,7 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:FIXING (ROOT-CAUSED + fix applied; build pid 92379 for verification re-replay).
+- item: #0 (mainnet ep246 reserves) state:FIXING (polled wake277 — build pid 92379 still compiling, reward-tests pid 92380 running; re-replay next wake once built). ROOT-CAUSED + fix applied (rewards.rs:283 filter removed, uncommitted).
   *** wake276 (ultracode): analyze muscle wx7gexg1o ROOT-CAUSED with HIGH confidence + full Haskell quotes. **THE BUG:
   crates/dugite-ledger/src/state/rewards.rs:283-287 computes total_active_stake with a SPURIOUS pool-params filter**
   `.filter(|(pool_id,_)| go.pool_params.contains_key(pool_id))`. total_active_stake is the apparent-performance
