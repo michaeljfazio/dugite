@@ -1507,6 +1507,11 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
+- wake223 2026-06-07: POLL #0 ANALYZE wuqv1kgo9 — still RUNNING (research stage, last activity 3s). HARNESS NOTE:
+  NO db-mainnet present (only epoch-dumps-engine/mainnet-ep213 dumps) -> #0 byte-exact verification CANNOT use a live
+  mainnet replay without a heavy re-sync; must use the DUGITE_REWARD_DBG dump-loop harness on the ep245 'go' snapshot
+  (if dumped) OR re-acquire db-mainnet. No transition. Disk 166G, no nodes. #0 stays ANALYZING. NEXT WAKE: read
+  verdict + its harness recommendation.
 - wake222 2026-06-07: #15 done -> #0 ACTIVE (mainnet ep246 reserves). PARKED attempts:3 -> per staleness lesson,
   launched ANALYZE muscle wuqv1kgo9 (opus) to RE-VERIFY the member-reward-fold root cause vs Haskell resolveActive
   InstantStakeCredentials + characterize the 2-map disagreement + why 3 prior fixes failed + fix/harness plan. NEXT
