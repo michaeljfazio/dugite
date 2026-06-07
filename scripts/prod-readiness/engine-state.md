@@ -209,7 +209,7 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:ROOT-CAUSED-VALUE (per-pool poolstake instrumentation building; find the 109.6B-short pools).
+- item: #0 (mainnet ep246 reserves) state:ROOT-CAUSED-VALUE (polled wake286 — poolstake build linking dugite-node, not yet refreshed; replay next wake). find the 109.6B-short pools.
   *** wake285 (ultracode): confirmed ptr_stake IS populated (common.rs:268/362 += coin) -> pointer stake is NOT
   entirely missing; the 109,573,937,991 deficit is a subtler stake-snapshot under-count (same class as #1 ep57
   stake-distribution + #11 dereg). go.pool_stake construction = epoch.rs:199-254 (delegation utxo_stake + reward_balance
