@@ -209,7 +209,18 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:PAID-SET-INSTRUMENT-RELOCATED (live path = shelley.rs; rebuild pending).
+- item: #0 (mainnet ep246 reserves) state:PAID-SET-REPLAY2-RUNNING (live shelley.rs instrumentation VERIFIED in binary).
+  *** wake266 (ultracode): deterministic foreground rebuild (touch shelley.rs + cargo build, 1m41s) -> strings-VERIFY
+  PASSED: grep -ac DUGITE_RUPD_PAID_EPOCH = 1, rupd_paid_ = 1 (binary 16:46). The shelley.rs LIVE-path paid-set
+  instrumentation IS now compiled in. Re-launched replay job mainnet-rupd-paid2 pid 27902 over KEPT CoW clone
+  db-clones/mainnet-rupd-drop with DUGITE_RUPD_PAID_EPOCH=246 (+DROP_TRACE, +EPOCH_STATE_DUMP), socket
+  /tmp/engine-rupd-paid2.sock port 3001. Running (ep31). Writes epoch-dumps-engine/rupd_paid_246.txt at ep246 (~4min).
+  NEXT WAKE: poll for rupd_paid_246.txt -> THE DIFF (ground truth for the redirect): (a) header paid_count vs Koios
+  ep245 recipient count + vs dump credentials=154,236; (b) bug = Koios-paid-at-earned_epoch-245 creds NOT in
+  {dugite paid ∪ 809 dropped} = MISSING PAYEES, and/or per-cred amount deltas, summing to 82,215,213. Koios side:
+  the dump per_credential top-200 reward field == Koios earned_epoch 245 (alignment pinned wake260). To enumerate
+  Koios ep245 recipients efficiently, route through the muscle (mode diagnose with task folded into `item`, NOT custom
+  dims which are broken) OR per-pool. SIGTERM-only to stop. Instrumentation UNCOMMITTED; CoW clone KEPT.
   *** wake265: ROOT CAUSE of the missing dump = I instrumented a DEAD function. **MAJOR STRUCTURAL DISCOVERY**: there
   are MANY process_epoch_transition — the LIVE applyRUpd for ep246 (Allegra) is `ShelleyRules::process_epoch_transition`
   in **crates/dugite-ledger/src/eras/shelley.rs:258-440** (Allegra/Mary/Alonzo/Babbage all delegate to it via
@@ -2875,3 +2886,7 @@
   Relocated paid-set instrumentation to shelley.rs:399, reverted epoch.rs. build3 (cargo clean rebuild) running; may
   predate the shelley edit. next wake: strings-VERIFY DUGITE_RUPD_PAID_EPOCH in binary (incremental rebuild if 0) ->
   re-replay. LESSON: dugite has per-era trait-impl process_epoch_transition; fix/instrument the era impl, strings-verify.
+- wake266 (ultracode): deterministic foreground rebuild (touch shelley.rs + cargo build 1m41s); strings-VERIFY PASSED
+  (DUGITE_RUPD_PAID_EPOCH=1 in binary). Re-launched replay job mainnet-rupd-paid2 pid 27902 over kept CoW clone with
+  DUGITE_RUPD_PAID_EPOCH=246 -> writes rupd_paid_246.txt at ep246 (~4min). Running ep31. next wake: poll for the file
+  -> diff dugite paid set vs Koios earned_epoch-245 (missing payees / amount deltas summing to 82,215,213).
