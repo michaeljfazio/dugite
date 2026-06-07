@@ -242,7 +242,28 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #23 phase-2 Babbage MEM over-cost state:DIAGNOSING attempts:0 — muscle wogj8wp6h IN-FLIGHT; lock HELD (TTL 22m).
+- item: #23 phase-2 MEM over-cost state:FIXING attempts:1 — ROOT-CAUSED + candidate fix applied (UNVERIFIED); VERIFYING gauntlet launched.
+  *** wake325 (ultracode): SALVAGE. The wake324 diagnose muscle wogj8wp6h DIED/HUNG (ran ~24min, 0-byte output, no
+  completion notify, lock TTL-expired age1605s → reclaimed). BUT its research agent (analyze mode = NO worktree isolation,
+  so it worked in the MAIN tree) found the ROOT CAUSE + applied a fix before hanging. SALVAGED from its transcript +
+  working tree. *** ROOT CAUSE (byte-exact, Haskell-quoted): the DOMINANT recurring class is actually PlutusV1 (NOT V2 as
+  the #730 title assumed) — dugite's txInfoData (witness datums) was NOT deduped by hash. cardano-ledger
+  `TxDats = Map DataHash (Data era)` collapses duplicate witness datums (same datum supplied >once, e.g. an input AND an
+  output reference the same datum hash) to ONE entry; dugite stored them as a Vec WITH duplicates → a script iterating
+  txInfoData processes the extra Data entry → MEM over-cost (the "fixed-delta" = the duplicate datum's mem cost; exactly
+  the #730 "structural-context" hypothesis, now CONFIRMED). FIX (dugite-uplc tx_info_populate.rs::datums_to_plutus, +8
+  lines): after the existing sort_by_key(hash), add dedup_by_key(hash) → matches `Map.toList (unTxDats)`. Haskell ref:
+  transTxWitsDatums = transDataPair <$> Map.toList (txWits ^. datsTxWitsL . unTxDatsL); newtype TxDats era = Map DataHash
+  (Data era). Saved to scripts/prod-readiness/candidate-fix-23-txinfodata-dedup.patch. *** MUSCLE CLAIM (UNVERIFIED — it
+  died before running the suite): fix resolves 742 PlutusV1 dumps byte-exact; 3 V1 cases now UNDER-consume (-8794/-33798/
+  -25224, dedup-removed-too-much? or distinct); the PlutusV2 residuals (over=4230/14568…) are a SEPARATE V2-specific bug
+  (inline datums in outputs/reference-inputs contributing to txInfoData via getBabbageSupplementalDataHashes — NOT the
+  witness-datum dedup; V2 cases have NO witness plutus_data). *** DISCIPLINE: per #438-SAVE I do NOT trust the unverified
+  742 claim — VERIFYING this wake: rebuilt phase2_repro + re-run the 363 tx0 dumps (count now-passing) + nextest -p
+  dugite-uplc + clippy + fmt → gauntlet. On green AND a large divergence-reduction → commit the focused 1-crate fix + push,
+  #23 (V1 part) FIXED; file the V2 residual + the 3 under-consume cases as follow-ups. If the dump-count does NOT drop or
+  nextest regresses → the salvaged fix is wrong; re-diagnose. Lock held across async (TTL 22m). Note: this verify is the
+  byte-exact gauntlet (re-run reproduces the on-chain is_valid with the divergence gone — the cardinal-rule standard).
   *** wake324 (ultracode): #23 REPRODUCED→DIAGNOSING. *** SHARPENED THE FINDING via mechanical prep (phase2_repro on the
   recurring sample tx0-009d19e79902f946, V2/pv8/4utxos): dugite errors "budget exhausted: cpu_remaining=2798701,
   mem_remaining=291" — and this is IDENTICAL when the dump's max_ex_cpu/mem are raised to 1e16/1e10 → the per-redeemer
