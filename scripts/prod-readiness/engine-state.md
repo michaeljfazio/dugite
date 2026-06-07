@@ -64,6 +64,28 @@
    raw keyhash (that one is the MISSING-SORT #30, not an inversion); gov CBOR encode/governance.rs:182-186 only if matching
    ledger Map.toList. GATE (Tier A'): phase-2 ScriptContext dump-diff with a synthesized mixed key+script tx (NOT tests-green) +
    reward/stake non-regression replay must stay byte-exact.
+   *** FIXING wake346 (fix Workflow wemg0lky9/wf_1c5c9865-3fe hosted in-turn; patch IN MAIN TREE UNCOMMITTED, backed up
+   scripts/prod-readiness/candidate-fix-26-27-credord.patch 647 lines). 6 files (2 crates): dugite-primitives credentials.rs
+   (+Credential::cmp_ledger ranks Script=0<Key=1 then hash; derived Ord UNCHANGED; augmented the derived-Ord test comment) +
+   transaction.rs (+Voter::cmp_ledger: same variant rank CC<DRep<SPO [matches Haskell CommitteeVoter<DRepVoter<StakePoolVoter],
+   inner cred via Credential::cmp_ledger); dugite-uplc populate_gov.rs (txInfoVotes sorted by Voter::cmp_ledger),
+   tx_info_populate.rs (+ledger_ordered_withdrawals: parse blob→stake cred, sort by cmp_ledger; V1/V2 txInfoWdrl routed through
+   it), populate_v3.rs (V3 txInfoWdrl via same), redeemer_resolve.rs (Reward+Vote indices resolve over the ledger-ordered
+   sequence, not blob/derived-BTreeMap nth). +ordering/redeemer-index tests. *** INDEPENDENTLY RE-VERIFIED (not trusting the
+   agent): fmt=0, clippy -p dugite-primitives -p dugite-uplc --all-targets -D warnings=0, nextest 730/730 pass. *** SPOT-VERIFIED
+   the impl is TYPE-DOMINATED (cmp_ledger rank(Script)=0<rank(Key)=1 regardless of hash) — so the fix correctly handles ANY
+   mixed key+script collection. NOTE: the fix AGENT again repeated the WRONG "latent/same-28-byte-hash-only" caveat in its prose
+   — IGNORE it (same error overridden wake341); the CODE is type-dominated/correct. *** SCOPE EXCLUDED (deliberate, → follow-up
+   #26b): TreasuryWithdrawals + UpdateCommittee members_to_add map ordering in populate_gov.rs + the consensus-CBOR re-encode
+   encode/governance.rs:182-186 were NOT changed (separate sites/crate); txInfoSignatories=#30 (missing-sort), untouched.
+   state:FIXING attempts:1 conf:0.86. *** NEXT: VERIFYING — the byte-exact gate. Tier-A' #1 (Haskell-Ord oracle match) + #4
+   (ordering unit/proptests) are DONE; still need #2/#3 (ScriptContext field-diff / phase2_repro byte-exact) on a tx carrying
+   >=2 mixed key+script entries. PLAN: search phase2-dumps-730val/ (+ Koios preprod/mainnet) for a multi-withdrawal or
+   multi-voter tx with BOTH a key-stake and a script-stake entry; if found, phase2_repro pre-fix must DIVERGE (reproduce the
+   bug) and post-fix must MATCH on-chain is_valid/ExUnits. If NO such reference tx exists in the corpus/chain, byte-exactness
+   can only rest on the Haskell-Ord match + tests (record that honestly; do NOT commit claiming byte-exact-replay-verified).
+   Reward/stake non-regression: confirm a linear replay stays byte-exact (expected — the conservation pipeline is untouched).
+   COMMIT only after the gate. NO origin push (curated-origin model). Fix files stay uncommitted in the main tree meanwhile.
 27. [H][phase2][NEW] WITHDRAWALS (Rewarding) ordering inversion (manifestation B of the key<script vs script<key theme; DISTINCT
    fix site from #26). tx.body.withdrawals keyed by raw 29-byte reward-account blob [header||hash28] in BTreeMap<Vec<u8>,_>
    (transaction.rs:805) → sorts by raw bytes where key-stake header 0xE_ < script-stake 0xF_ → Key-before-Script, OPPOSITE to
@@ -79,6 +101,8 @@
    tx_info_populate.rs:569-583 + the withdrawals blob ordering). Same Tier-A' ScriptContext dump-diff gate + reward/stake
    non-regression guard (GREEN — withdrawals don't touch the conservation pipeline). Fix #26 and #27 in ONE worktree.
    state:ROOT-CAUSED attempts:0 conf:0.65 (folded into #26)
+   *** FIXING wake346: DONE in #26's patch (ledger_ordered_withdrawals + Reward-index over ledger order). Same uncommitted
+   patch + VERIFY gate. state:FIXING attempts:1 conf:0.65 (with #26)
 28. [H][serialization][NEW] PlutusData decoder accepts >64-byte definite bytestrings (no bounded_bytes 64-byte cap).
    read_plutus_data_depth reads Type::Bytes via read_bytes_owned() / BytesIndef with NO length check (era_alonzo.rs:1282-1288;
    era_conway.rs:2576-2579; bignum mantissa era_alonzo.rs:1224/1230, era_conway.rs:2514 via read_bigint). Haskell plutus
@@ -365,7 +389,23 @@
    reconstruction + #7 sub-tx forward). state:DONE attempts:0
 
 ## In-progress
-- item: #26 (Credential-Ord inversion) ROOT-CAUSED → NEXT WAKE: FIXING (muscle mode:fix, worktree) — per-consumer cmp_ledger across phase-2 sites; fix #26+#27 together. Reward/stake guard GREEN.
+- item: #26+#27 (Credential-Ord inversion) FIXING DONE (uncommitted patch, targeted-green) → NEXT WAKE: VERIFYING (byte-exact ScriptContext gate). Reward/stake guard GREEN.
+  *** wake346 (ultracode): DRIVE #26+#27 ROOT-CAUSED→FIXING. Authored a focused fix Workflow (wemg0lky9/wf_1c5c9865-3fe,
+  fix-credord.workflow.js — single agent operating in the MAIN TREE [not a fresh worktree] so builds are incremental/fast +
+  hostable in-turn; defensible deviation from muscle mode:fix whose hardcoded full-workspace-nextest-in-fresh-worktree = a
+  20-30min rebuild, impractical to host in-turn). HOSTED IN-TURN (wake337 lesson). RESULT: per-consumer cmp_ledger (Script<Key)
+  added + applied at the phase-2 sites; derived Credential/Voter Ord (Key<Script, Plutus/CBOR roles) UNCHANGED; conservation
+  pipeline untouched. 6 files / 2 crates (dugite-primitives + dugite-uplc), +466/-51, patch backed up candidate-fix-26-27-
+  credord.patch. *** INDEPENDENTLY RE-RAN the gate (not trusting the agent's claim, #438 discipline): fmt=0, clippy --all-targets
+  -D warnings=0, nextest 730/730 PASS. *** SPOT-VERIFIED cmp_ledger is TYPE-DOMINATED (rank Script<Key regardless of hash) — the
+  agent AGAIN mis-stated the impact as "latent/same-hash-only" in its prose caveat; IGNORED (the code is correct, #26/#27 stay
+  ACTIVE [H]). Scope EXCLUDED → follow-up #26b: TreasuryWithdrawals/UpdateCommittee map ordering in populate_gov.rs + gov-CBOR
+  encode/governance.rs; #30 txInfoSignatories untouched. *** NEXT WAKE — VERIFYING (the byte-exact gate, NOT tests-green): Tier-A'
+  #1 (Haskell-Ord oracle match) + #4 (ordering proptests) are DONE; need #2/#3 — find a tx in phase2-dumps-730val/ (or via Koios
+  preprod/mainnet) carrying >=2 mixed key+script entries (multi-withdrawal w/ one key-stake + one script-stake, or multi-voter),
+  run phase2_repro: pre-fix must DIVERGE (reproduce the bug), post-fix must MATCH on-chain. If NO such reference tx exists, record
+  honestly that byte-exactness rests on the Haskell-Ord match + tests (do NOT commit claiming replay-verified). Also confirm a
+  linear replay stays reward/stake byte-exact (expected). COMMIT (local, 2 crates = 1 commit) only after the gate passes. Lock to release.
   *** wake341 (ultracode): SCHEDULE #26, DRIVE NEW→ROOT-CAUSED via a focused analysis Workflow (wh9u6m36k/wf_49156cb2-71b —
   custom analyze workflow, defensible deviation since muscle analyze-mode is ledger-divergence-shaped/epoch+delta_lovelace and
   #26 is a code-ordering usage-map question; HOSTED IN-TURN per the wake337 lesson → completed clean, 373K tokens/4 agents/
@@ -2816,6 +2856,9 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
+- #26+#27 FIX — DONE wake346 (FIXING). Workflow wemg0lky9/wf_1c5c9865-3fe (fix-credord.workflow.js, main-tree single agent)
+  hosted in-turn → patch IN MAIN TREE UNCOMMITTED (6 files, candidate-fix-26-27-credord.patch). Targeted fmt+clippy+nextest
+  730/730 independently re-verified. NEXT = VERIFYING (byte-exact). No running jobs now.
 - #26 analysis — DONE wake341. Workflow wh9u6m36k/wf_49156cb2-71b (analyze-credord.workflow.js) hosted in-turn → COMPLETE,
   artifact scripts/prod-readiness/.audit/credential-ord-analysis.md (per-consumer fix; reward/stake guard GREEN). No running jobs.
 - re-audit — DONE wake339. Run 1 whk03t6kd/wf_b85f1761-d60 KILLED at wake337 turn-end (launch-and-stop orphans subagents). Run 2
@@ -3028,6 +3071,7 @@
 - 2026-06-08T17:27Z wake337 ~ push-model CORRECTED (origin/main human-curated; engine commits local-only, no origin push) + launched adversarial re-audit Workflow whk03t6kd (6 finders→refute-verify→findings file)
 - 2026-06-08T17:46Z wake339 ~ re-audit COMPLETED in-turn (wl42ygj07, 1.29M subagent tokens/15 agents/11.4min) → filed 6 new backlog items #26-#31 (3H/3M); spot-verified #26 Credential-Ord inversion; LESSON: host Workflows in-turn (launch-and-stop orphans subagents)
 - 2026-06-08T18:05Z wake341 ~ #26 NEW→ROOT-CAUSED: analysis Workflow wh9u6m36k hosted in-turn (373K tokens/4 agents/6.5min) → PER-CONSUMER fix, reward/stake guard GREEN; OVERRODE synthesis 'latent' claim (Voter derived-Ord enum = TYPE-dominated = ACTIVE); #26+#27 [H] ACTIVE→FIXING next
+- 2026-06-08T18:30Z wake346 ~ #26+#27 ROOT-CAUSED→FIXING: fix Workflow wemg0lky9 hosted in-turn (127K tokens/1 agent/11min) → per-consumer cmp_ledger Script<Key at phase-2 sites, 6 files/2 crates, INDEPENDENTLY re-verified fmt+clippy+nextest 730/730; patch uncommitted (byte-exact VERIFY gate next); ignored agent's wrong 'latent' caveat
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -4626,3 +4670,10 @@
   conservation maps are HashMap<Hash32>, folds order-independent). OVERRODE the analysis's "latent/adversarial" severity claim
   (spot-verified Voter derived-Ord enum → TYPE dominates → ACTIVE divergence for any >=2 mixed key+script entries). #26+#27 →
   ROOT-CAUSED [H] ACTIVE. NEXT: FIXING (muscle mode:fix, worktree) gated by phase-2 ScriptContext dump-diff + reward/stake non-regression.
+- wake342-345 2026-06-08 (busy stops): cron fires STOPPED on `busy` while wake346 hosted the #26/#27 fix workflow in-turn (~11min build/test). Correct.
+- wake346 2026-06-08: DRIVE #26+#27 ROOT-CAUSED→FIXING. Focused fix Workflow (wemg0lky9) hosted in-turn (main-tree single agent
+  for fast incremental builds) implemented per-consumer cmp_ledger (Script<Key) at the phase-2 votes/withdrawals/redeemer-index
+  sites; derived Ord + conservation pipeline untouched. 6 files/2 crates, +466/-51, patch backed up. INDEPENDENTLY re-verified
+  fmt+clippy+nextest 730/730 green (#438 discipline). Spot-verified cmp_ledger is type-dominated; ignored the agent's repeated
+  wrong "latent/same-hash" caveat. Patch UNCOMMITTED (byte-exact gate pending). NEXT: VERIFYING — phase2_repro on a mixed
+  key+script reference tx (search corpus/Koios); commit only after the gate. #26b filed for the excluded gov-map sites.
