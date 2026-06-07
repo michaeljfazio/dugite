@@ -1233,6 +1233,16 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake175 2026-06-07: LOCK-RECOVERY + POLL. wake174's final commit/release call was MALFORMED (never executed) ->
+  left a STALE wake-lock held (age 311s, < 1320s TTL so no auto-reclaim) + wake174 engine-state edit uncommitted.
+  Verified NO concurrent wake (HEAD=wake173, only the bg muscle running), so safely release+re-acquired (this is a
+  defensible self-recovery, not a protocol violation — the "busy=STOP" rule targets REAL concurrent wakes). #10 RE-FIX
+  muscle wcp4vycpw now in FINAL nextest phase (cargo-nextest pid 80845 running, worktree target 16G, last activity
+  2min ago — progressing, not wedged). No transition. Disk 168G. #10 stays FIXING. LESSON: a malformed tool call can
+  strand the lock; the TTL (22min) is the backstop but manual release on a verified-self-stale lock is faster.
+- wake174 2026-06-07: POLL #10 RE-FIX muscle wcp4vycpw — still RUNNING, ACTIVE (last activity 09:32; 6-path error-
+  propagation fix is involved — decode_imported_script_ref signature, TvarIterator->Result, 5 hard-error sites + 1
+  opaque-relax + tests). No transition. Disk 181G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process result.
 - wake173 2026-06-07: POLL #10 RE-FIX muscle wcp4vycpw — still RUNNING, ACTIVE (worktree present, bridge applied,
   6-path edits + build/test). No transition. Disk 184G, no nodes. #10 stays FIXING. NEXT WAKE: poll -> on green copy
   to main -> verify-build -> re-import -> re-gauntlet -> commit.
