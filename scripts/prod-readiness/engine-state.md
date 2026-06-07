@@ -209,7 +209,20 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:ROOT-CAUSING-COMPONENT (polled wake292 — snapbreakdown build linking dugite-node; replay next wake). per-delegator stake component missing (pointer leading).
+- item: #0 (mainnet ep246 reserves) state:ROOT-CAUSING-COMPONENT (breakdown relocated to LIVE shelley.rs; rebuild for replay).
+  *** wake293 (ultracode): WAKE265 TRAP REPEATED — snapbreakdown build had SNAP_BREAKDOWN strings=0 (DCE'd): I'd
+  instrumented the SNAP construction in the TEST-ONLY state/epoch.rs:199-254 (inside the dead state/epoch.rs:50
+  process_epoch_transition). The LIVE go.pool_stake construction is **crates/dugite-ledger/src/eras/shelley.rs:533-617**
+  (ShelleyRules::process_epoch_transition -> builds pool_stake[536-550] + pointer resolution[552-566] -> snapshots.mark
+  [614]). *** This ALSO corrects the w7ghihrir synthesize verdict: the #0 FIX lands in shelley.rs:533-566, NOT
+  epoch.rs:199-217 (which is the test mirror). DROVE: relocated the SNAP_BREAKDOWN instrumentation to shelley.rs:533-566
+  (live; with snap_ptr_resolved/snap_ptr_excluded tracking added to the pointer block), REVERTED the dead epoch.rs
+  instrumentation. cargo check CLEAN (4.95s). Build -> /tmp/dugite-snapbreakdown2-build.log. NEXT WAKE: strings-VERIFY
+  'grep -ac SNAP_BREAKDOWN' >=1 BEFORE replaying -> replay w/ DUGITE_SNAP_BREAKDOWN=1 -> grep
+  'SNAP_BREAKDOWN ...pst=21956097174685676' -> ptr_excluded~=109.6B OR ptr_stake_total large => POINTER bucket; else
+  deficit in deleg_utxo/reward_bal -> per-cred diagnostic. LESSON (3rd time): ALWAYS verify the LIVE era-impl path
+  (eras/shelley.rs for Allegra) BEFORE instrumenting/fixing — state/epoch.rs is TEST-ONLY (DCE'd); strings-verify the
+  symbol. Instrumentation UNCOMMITTED. CoW clone KEPT.
   *** wake291 (ultracode): per-pool diff workflow w7ghihrir COMPLETE — Σ(dugite-koios) over 1489 resolved pools =
   EXACTLY -109,573,937,991 (perfect reconciliation to the deficit). 445/1489 pools (29.9%) short, **100%
   one-directional (dugite always UNDER, never over)** -> a MISSING ADDEND (per-delegator stake component dropped for a
@@ -3167,3 +3180,9 @@
   (env DUGITE_SNAP_BREAKDOWN: deleg_utxo/reward_bal/ptr_resolved/ptr_excluded/ptr_stake_total). cargo check CLEAN,
   building. next wake: replay -> grep SNAP_BREAKDOWN pst=21956097174685676 -> ptr_excluded~=109.6B => pointer bucket;
   else per-cred diagnostic. fix in epoch.rs/stake_routing.
+- wake293 (ultracode): WAKE265 TRAP REPEATED — SNAP_BREAKDOWN strings=0 (DCE'd); I instrumented the TEST-ONLY
+  state/epoch.rs SNAP construction. LIVE go.pool_stake = eras/shelley.rs:533-617 (ShelleyRules). Corrects the
+  w7ghihrir verdict: #0 FIX lands in shelley.rs:533-566 NOT epoch.rs. Relocated SNAP_BREAKDOWN to shelley.rs (live,
+  +ptr_resolved/excluded tracking), reverted epoch.rs. cargo check CLEAN, building. next wake: strings-VERIFY then
+  replay -> grep SNAP_BREAKDOWN pst=21956097174685676 -> pointer vs deleg_utxo vs reward bucket. LESSON (3rd time):
+  verify the LIVE era-impl path before instrumenting/fixing; state/epoch.rs is test-only DCE'd; strings-verify.
