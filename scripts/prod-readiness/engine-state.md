@@ -209,7 +209,27 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:GAUNTLET-PENDING (polled wake304 19:38 — gauntlet wodons7bq 3 refuters ACTIVE, deep Haskell/Koios analysis, none done). FIX VERIFIED BYTE-EXACT.
+- item: #0 (mainnet ep246 reserves) state:COMMIT-PENDING (GAUNTLET PASSED; clean fix re-applied + fmt/clippy clean; nextest bv1lbm3iy running).
+  *** wake305 (ultracode): **GAUNTLET wodons7bq PASSED (pass=true, refuteCount=1/3).** Refuter1(haskell-semantics)+
+  Refuter2(edge-epoch) NOT refuted: ordering matches Haskell applyRUpd->MIR->EPOCH(SNAP) exactly; Refuter2
+  INDEPENDENTLY re-derived mainnet Koios via direct api.koios.rest -> ep246 reserves/treasury diff 0, reserve-MIR
+  symmetric, POOLREAP-after-SNAP + fee-drain ordering correct, 57/57 MIR tests pass. Refuter3 refuted ONLY due to a
+  Koios-ACCESS failure (couldn't reach mainnet Koios, defaulted refuted-under-uncertainty) — it explicitly states the
+  fix is 'logically and Haskell-faithful CORRECT'; a FALSE-NEGATIVE, NOT a fix flaw (verified the dissent per
+  discipline: empirically wrong, Refuter2+my wake303 both confirmed exact Koios match) -> does NOT override.
+  LATENT (all 3 noted, non-live): test-only state/epoch.rs:473-479 still has old MIR-after-SNAP ordering -> FILED as
+  #20c (reconcile/delete to avoid test drift; DCE'd, harmless for live). DROVE: reverted ALL instrumentation
+  (git checkout shelley.rs+rewards.rs+epoch.rs -> HEAD; 0 instrumentation symbols); RE-APPLIED the CLEAN MIR fix to
+  shelley.rs ONLY (move apply_pending_mir after applyRUpd/fee-drain, before SNAP; +Haskell-quoted comment). fmt OK,
+  clippy CLEAN (23s). git diff: shelley.rs = exactly the MIR move (+15/-5); common.rs +218 = PRE-EXISTING uncommitted
+  add/spend regression tests (NOT mine, leave uncommitted). Launched full nextest bv1lbm3iy (background). NEXT WAKE:
+  read bv1lbm3iy -> if GREEN: git add ONLY shelley.rs -> commit 'fix(ledger): apply MIR before SNAP...' -> PUSH via
+  gh/HTTPS -> **#0 DONE** -> re-validate ledger.mainnet+preprod frontiers (likely closes broad MIR-boundary class) +
+  reopen #2/#3/#11 to recheck against the fix. If RED: investigate the failing test (the fix may need a test update or
+  there is an edge).
+- 20c. [L][ledger][cleanup] test-only state/epoch.rs:473-479 LedgerState::process_epoch_transition still applies MIR
+   AFTER SNAP/POOLREAP (stale comment 'SNAP->POOLREAP->MIR->NEWPP'); DCE'd / test-only (live path is shelley.rs), so
+   harmless for mainnet, but should be reconciled to the fixed ordering or deleted to prevent test drift. state:NEW
   *** wake303 (ultracode): **MIR-FIX VERIFIED BYTE-EXACT (#438 acceptance MET).** mainnet-mirfix-verify re-replay:
   ep246 reserves=12,880,948,865,137,767 (diff 0 vs Koios!) + treasury=292,077,855,298,344 (diff 0!) ; ep245 reserves/
   treasury == Koios (baseline unregressed) ; ep213 == Koios ; ep247 carried-forward +82M GONE. Broad spot-check
@@ -3319,3 +3339,9 @@
   PRE-EXISTING (identical pre/post fix, corrects by ep245) -> filed as #20b (likely reserve-MIR mistimed). SIGTERM'd
   verify replay; launched adversarial gauntlet wodons7bq (3 refuters). next wake: gauntlet PASS -> revert instrumentation
   -> commit+push clean MIR-ordering fix (shelley.rs) -> #0 DONE; likely closes broad MIR-boundary divergence class.
+- wake305 (ultracode): GAUNTLET wodons7bq PASSED (refuteCount=1/3; the 1 refutation is a Koios-ACCESS false-negative,
+  explicitly says fix CORRECT; Refuter2 re-derived exact mainnet Koios match). Reverted ALL instrumentation (git
+  checkout -> HEAD), re-applied CLEAN MIR fix to shelley.rs ONLY (apply_pending_mir before SNAP). fmt OK, clippy CLEAN.
+  common.rs +218 = pre-existing add/spend regression tests (leave uncommitted). nextest bv1lbm3iy running. next wake:
+  GREEN -> git add shelley.rs -> commit+push -> #0 DONE -> re-validate frontiers + reopen #2/#3/#11. Filed #20c
+  (test-only epoch.rs MIR ordering cleanup).
