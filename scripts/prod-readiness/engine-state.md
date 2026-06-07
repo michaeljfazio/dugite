@@ -280,7 +280,26 @@
    reconstruction + #7 sub-tx forward). state:DONE attempts:0
 
 ## In-progress
-- item: RE-ASSESS (backlog cleared) — workspace CI gate b7kr6pyuw IN-FLIGHT (milestone validation); lock HELD. #24-pin DEFERRED.
+- item: RE-ASSESS (backlog cleared) — workspace CI gate b7kr6pyuw IN-FLIGHT (milestone validation); lock RELEASED, gate runs in background. #24-pin DEFERRED.
+  *** wake336 (ultracode): POLL wake335's CI gate. The gate was reclaimed-stale (exceeded the 22m wake-lock TTL because the
+  workspace nextest run is slow under host load — load avg 2.92, ~3.7GB free, NOT a hang). STATUS at poll: FMT_EXIT=0 (PASS),
+  nextest progressing 3991/6792 with ZERO FAIL/ERROR/panic lines, clippy not yet started. The earlier "list-phase hang"
+  (cross_validate_data / phase2_onchain_budget / phase2_script_context_regression sitting at 0 CPU) was load-throttled
+  process startup, NOT a deadlock — those list pids cleared and the log jumped 1.4KB→414KB. Gate is HEALTHY, just slow; it
+  will run PAST this wake too (cargo-nextest PID 67965 alive). DECISION: rather than hold the lock and force the next ~4 cron
+  fires into busy-stop churn (the wake325-pattern of 244/544/844/1145s busy stops then a stale-reclaim), RELEASE the lock now
+  and hand the poll to the next wake. *** NEXT WAKE — do NOT launch any new work until the gate is resolved: FIRST
+  `tail -8 /tmp/ci_combined.log` for `NEXTEST_EXIT=` + `CLIPPY_EXIT=` + `=== CI GATE DONE ===`, and `pgrep -fl cargo-nextest||
+  cargo-clippy||rustc`. (a) If DONE + all three EXIT=0 → milestone baseline CONFIRMED CLEAN; record it, THEN launch the fresh
+  adversarial re-audit (muscle) OR #24 full-UTxO capture. (b) If DONE + a RED: triage — a nextest FAIL in
+  dugite-ledger::eras::common (the +218 PRE-EXISTING uncommitted #730 regression tests, NOT a session deliverable) = a
+  pre-existing #730 condition, note+isolate (re-run gate skipping common.rs to prove session work clean); any OTHER crate FAIL
+  or a clippy RED = a SESSION-introduced cross-crate regression = new P0, fix immediately. (c) If STILL RUNNING → just
+  re-poll, release, STOP (do NOT relaunch a duplicate gate; PID 67965 owns /tmp/ci_*.log). Reconciliation note recorded this
+  wake: backlog #0 body text is STALE (reads PARKED attempts:3) — the ledger.mainnet frontier supersedes it (ep209-247
+  byte-exact AFTER MIR-before-SNAP fix 8c868271c9; ep246 not an exception → #0's ep246 +82.27M reserves IS resolved). Backlog
+  genuinely cleared except #24 (DEFERRED). Lock to release.
+  *** wake335 (ultracode): RE-ASSESS wake (no backlog item — entire tractable backlog cleared wake334); historical note —
   *** wake335 (ultracode): RE-ASSESS wake (no backlog item — entire tractable backlog cleared wake334). Before generating
   new work via an audit, validating the milestone: this session landed ~13 fixes across 4 crates (dugite-ledger,
   dugite-serialization, dugite-node, dugite-uplc), each verified PER-CRATE — but the per-crate gauntlets don't guarantee no
@@ -4389,3 +4408,12 @@
   invariant + future-era caveat explicit (already adequate comment+test; no Language enum for a static assert).
   clippy+fmt+test green → committed+pushed add4f0b3c1. *** ENTIRE TRACTABLE BACKLOG CLEARED *** — only #24-pin remains
   (deferred/heavy/masked). Next: re-assess for new gaps (recommend a fresh adversarial re-audit) or #24 full-context capture.
+- wake335 2026-06-07: RE-ASSESS (cleared backlog) — launched full workspace CI gate b7kr6pyuw (fmt+nextest+clippy) to
+  validate the session's ~13 cross-crate fixes end-to-end (per-crate gauntlets don't catch cross-crate regressions; CLAUDE.md
+  "CI green" gate). Gate ran past the 22m wake-lock TTL → lock reclaimed-stale → handed to wake336.
+- wake336 2026-06-07: POLL the b7kr6pyuw gate. FMT_EXIT=0; nextest 3991/6792 with ZERO failures; clippy pending. The earlier
+  apparent "list-phase hang" was host-load-throttled process startup (load 2.92, ~3.7GB free), NOT a deadlock — confirmed by
+  the list pids clearing + the log jumping 1.4KB→414KB. Gate HEALTHY but slow; will run past this wake. Released the lock
+  (avoid busy-stop churn) and recorded a precise next-wake poll protocol (read /tmp/ci_combined.log for NEXTEST_EXIT+
+  CLIPPY_EXIT+"CI GATE DONE"; do NOT relaunch a duplicate gate; PID 67965 owns the logs). Reconciliation: backlog #0 body is
+  STALE (PARKED) — ledger.mainnet frontier supersedes (ep246 byte-exact post-MIR-fix 8c868271c9); backlog cleared except #24.
