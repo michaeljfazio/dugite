@@ -209,7 +209,16 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:POOLSTAKE-REPLAY-RUNNING (build OK + strings-verified; replay pid 60311 launched wake287).
+- item: #0 (mainnet ep246 reserves) state:POOLSTAKE-DIFFING (per-pool data captured; Koios diff workflow w7ghihrir launched).
+  *** wake288 (ultracode): poolstake replay captured dugite per-pool go-stake @ep246 -> extracted+deduped to
+  epoch-dumps-engine/mainnet-poolstake/ep246_dugite_poolstake.txt (1531 pools, sum==21,956,097,174,685,676 validated).
+  SIGTERM'd replay 60311 (CoW clone db-clones/mainnet-rupd-drop KEPT). Launched per-pool diff WORKFLOW w7ghihrir (run
+  wf_5eec72b3-0de, 8 sonnet agents): each pool hex->bech32(hrp=pool, bare 28-byte hash)-> Koios pool_history
+  _epoch_no=244 active_stake -> diff dugite-koios; synthesize Σ(diff) (target -109,573,937,991), concentrated-vs-spread,
+  missing component. NEXT WAKE: read w7ghihrir -> the short pool(s) + whether the deficit is concentrated (specific
+  delegator/cred) or spread (systematic component: pointer stake / reward_balance / stake_map). Then inspect those
+  pools' delegators (Koios pool_delegators_history ep244) to find the missing-stake cred-class -> the FIX in
+  epoch.rs:199-302 go.pool_stake/snapshot_stake construction. Instrumentation UNCOMMITTED.
   Build OK (release 1m35s, binary 18:18), strings POOLSTAKE=2 VERIFIED. Launched poolstake replay job mainnet-poolstake
   pid 60311 (DUGITE_RUPD_POOLSTAKE=1 + DUGITE_RUPD_GLOBALS=1) over CoW clone db-clones/mainnet-rupd-drop. ~4min to ep246.
   Per-pool POOLSTAKE lines -> scripts/prod-readiness/.jobs/mainnet-poolstake.log. NEXT WAKE: grep
@@ -3130,3 +3139,7 @@
   mainnet-poolstake pid 60311 (DUGITE_RUPD_POOLSTAKE=1) over CoW clone. next wake: grep POOLSTAKE
   tas=21956097174685676 -> dugite per-pool go-stake (1570 pools) -> diff vs Koios pool_stake_snapshot (workflow-
   parallelized) -> short pool(s) summing to ~109,573,937,991 -> cred-class -> fix in epoch.rs snapshot construction.
+- wake288 (ultracode): captured dugite per-pool go-stake @ep246 (1531 pools, sum validated 21,956,097,174,685,676) ->
+  ep246_dugite_poolstake.txt. SIGTERM'd replay. Launched per-pool diff workflow w7ghihrir (8 agents: hex->bech32 pool
+  -> Koios pool_history ep244 active_stake -> diff). next wake: read verdict -> short pool(s) + concentrated-vs-spread
+  + missing component -> inspect delegators -> fix in epoch.rs snapshot construction.
