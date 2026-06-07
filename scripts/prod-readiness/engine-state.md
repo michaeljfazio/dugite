@@ -1418,6 +1418,9 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
+- wake205 2026-06-07: POLL #15 FIX muscle w1xi3j2nf — still RUNNING (~35min; memo IS added to data.rs [38 refs],
+  in build/test iteration, last activity 5s, not wedged). No transition. Disk 173G, no nodes. #15 stays FIXING.
+  NEXT WAKE: poll/process result.
 - wake204 2026-06-07: POLL #15 FIX muscle w1xi3j2nf — still RUNNING, ACTIVE (~30min; Data-memo refactor + heavy
   UPLC conformance nextest; last activity 5s, not wedged). No transition. Disk 173G, no nodes. #15 stays FIXING.
   NEXT WAKE: poll/process result.
