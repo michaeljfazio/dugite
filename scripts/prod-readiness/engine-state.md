@@ -194,8 +194,29 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:GAUNTLET-PENDING (commit-B FINAL, 6-path+R1+R2).
-  *** wake185: verify10B3 WINDOW CONFIRMED — synced PAST window (tip 125115283 > 125105013, block 4794330), 0 phase-1,
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:FIXING (round-4 hardening: F1 dup-key + F2 indef-array).
+  *** wake187: 4th RE-GAUNTLET wvfzy4jta = REFUTED 3/3 (3 NEW deeper edges; verified the dissents):
+   (F1 haskell-semantics, COMPILE-VERIFIED) duplicate-JSON-key: aeson default json keeps FIRST occurrence, serde_json
+    keeps LAST. parse_tables_codec_version type-gate uses serde_json value.get() (LAST) while extract_raw_number_literal
+    is FIRST -> they DISAGREE; meta {..,"tablesCodecVersion":1,"tablesCodecVersion":"x"} => Haskell imports (1), dugite
+    hard-errors (String). Adversarial-only but clear aeson mismatch in #10's R3 code. -> FIX in #10 (cheap, mod.rs).
+   (F2 edge-epoch, HIGH=real-snapshot risk) read_native_script HARD-REJECTS indefinite-length OUTER array (arr_len.
+    is_none()=>Err) while NESTED levels accept indefinite via read_array; cardano-ledger Timelock DecCBOR accepts both
+    (decodeListLenOrIndef). A tag-5 native ref-script with indefinite outer array imports in Haskell but ABORTS the
+    whole 4.1M fast-start in dugite. Same class as commit 4b42125fbb. -> FIX in #10 (era_conway.rs read_native_script).
+   (F3 compounding-feedback) CompactAddr stored parsed-not-verbatim -> pointer-address non-minimal base-128 varlen
+    re-encodes divergently. This IS the #19 carve-out; larger (dugite-primitives Address + all TxOut consumers),
+    real-snapshot impact ~nil (pointer addrs vanishingly rare, canonical round-trips lossless). -> STAYS #19 (re-framed
+    honestly: a real-but-rare lossy round-trip, not just a refactor preference).
+  DROVE: regenerated base-commitB3-bridge.patch (3-crate), launched FIX muscle wb28q1upc (run wf_351f2eb6-b40) for
+  F1+F2 (dugite-serialization ONLY: mempack/mod.rs first-wins gate + era_conway.rs read_native_script accept-indef).
+  NOTE: 4 gauntlet rounds, each finds deeper adversarial CBOR edges; the byte-exact CORE (well-formed snapshot, 0
+  phase-1, 4116338 byte-identical) is DONE. POLICY for round-5: if it finds ONLY new ADVERSARIAL-only edges (no real-
+  snapshot risk like F2), COMMIT #10's byte-exact core + open a 'snapshot-import adversarial-hardening' tracking item
+  (F1/dup-key class, #17 CRC, #19 CompactAddr) — infinite adversarial-edge-chasing is non-productive; the cardinal
+  rule's intent (byte-exact on REAL chain data) is satisfied. NEXT WAKE: poll wb28q1upc -> build -> re-import -> re-
+  gauntlet -> commit-or-policy-call.
+  was: state:GAUNTLET-PENDING (commit-B FINAL, 6-path+R1+R2). *** wake185: verify10B3 WINDOW CONFIRMED — synced PAST window (tip 125115283 > 125105013, block 4794330), 0 phase-1,
   0 NotFullyConsumed (R2 doesn't false-trigger on well-formed TxOuts). DROVE: SIGTERM'd verify10B3 (evidence captured),
   launched RE-GAUNTLET wvfzy4jta (run wf_d0e85509-f55, refuterN=3) on the COMPLETE final state (6-path + R1 dangerous-
   Big + R2 full-consumption). This is the 4th gauntlet round; prior 3 rounds' refutations ALL addressed (wetwroth8:
@@ -1297,6 +1318,12 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake187 2026-06-07: #10 4th-gauntlet wvfzy4jta REFUTED 3/3 (new edges) -> FIXING. F1 dup-key (aeson first-wins vs
+  serde_json last-wins in parse_tables_codec_version, compile-verified, adversarial); F2 read_native_script rejects
+  indefinite outer array but Haskell/nested accept it -> aborts real fast-start (HIGH); F3 CompactAddr-not-verbatim
+  pointer non-minimal varlen -> #19 (rare/large). Launched FIX muscle wb28q1upc (F1+F2, dugite-serialization only).
+  POLICY: if round-5 finds only adversarial-only edges (no real-snapshot risk), commit #10 core + open adversarial-
+  hardening tracking item. NEXT WAKE: poll -> build -> re-import -> re-gauntlet -> commit.
 - wake186 2026-06-07: POLL #10 RE-GAUNTLET wvfzy4jta (4th round) — still RUNNING (1/3 refuters done, active). No
   transition. Disk 179G, no nodes. #10 stays GAUNTLET-PENDING. NEXT WAKE: on PASS -> commit #10.
 - wake185 2026-06-07: #10 VERIFYING-RESOAK -> GAUNTLET-PENDING. verify10B3 window confirmed (tip 125115283, 0 phase-1,
