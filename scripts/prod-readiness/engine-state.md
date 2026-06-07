@@ -209,7 +209,20 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:FIXING (localize-then-fix; ROOT CAUSE RE-LOCATED to apply_utxo_changes).
+- item: #0 (mainnet ep246 reserves) state:DIAGNOSING (localization round 2; apply_utxo_changes RULED OUT).
+  *** wake227: ROUND-1 muscle wxbflru4x RESULT = apply_utxo_changes is SYMMETRIC/CORRECT (5 create-then-spend net-zero
+  invariant tests PASS: base-key/script-payment/script-stake/multi-asset/collateral — add Phase-5/sub Phase-2/
+  collateral all route via identical stake_routing+credential_to_hash). Followed discipline: NO speculative fix; kept
+  the 5 tests (copied to main as regression coverage + negative result). Narrowed candidates to OUTSIDE the hot path:
+  (A) rebuild_stake_distribution full re-sum (state/mod.rs + certificates.rs:209) using a different cred extraction/
+  value/pointer handling than incremental; (B) genesis/initial UTxO-set load (state/mod.rs:1072,1782); (C) POINTER-
+  address stake inclusion consistency (snapshot_format.rs:154). Note: certificates.rs:206 does NOT prune stake_map on
+  dereg (so pruning is NOT the bug). DROVE: launched ROUND-2 localize-then-fix muscle wr9tddl4q (run wf_5cf86f13-2e8,
+  opus, dugite-ledger only, NOT common.rs/rewards.rs/epoch.rs) with invariant-test-FIRST: rebuild_stake_distribution
+  (full re-sum) MUST == incremental apply_utxo_changes stake_map per-credential for all address classes (base/
+  enterprise/POINTER/Byron); if a test FAILS that IS the localization+fix; if all pass -> STOP, escalate to
+  instrumented mainnet replay. NEXT WAKE: poll -> invariant fails+fixed -> build -> dump-verify ep246; else round-3
+  or instrumented DUGITE_REWARD_DBG mainnet replay (HEAVY) to localize the exact credential.
   *** wake225: ANALYZE wuqv1kgo9 COMPLETE — MAJOR ROOT-CAUSE REVISION (confidence HIGH on class+arithmetic, MEDIUM on
   exact cred). The documented 'member-reward fold two-map' cause is REFUTED: dugite Sigma stake_distribution ==
   go.total_active_stake == Koios 21,956,097,174,685,676 BYTE-EXACT @ep245; both maps already bundle utxo+reward_balance
@@ -1525,6 +1538,10 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
+- wake227 2026-06-07: #0 ROUND-1 wxbflru4x: apply_utxo_changes SYMMETRIC (5 invariant tests PASS, no fix; tests kept
+  on main). Narrowed to rebuild_stake_distribution / genesis-load / pointer-address (NOT dereg-prune — certs.rs:206
+  keeps the entry). Launched ROUND-2 wr9tddl4q (rebuild==incremental per-cred invariant, dugite-ledger state/* only).
+  NEXT WAKE: poll -> fix-or-escalate-to-instrumented-mainnet-replay. apply_utxo_changes hot path is correct.
 - wake226 2026-06-07: POLL #0 LOCALIZE-THEN-FIX muscle wxbflru4x (apply_utxo_changes invariant-test-first) — still
   RUNNING, ACTIVE (worktree present, common.rs; deep ledger code analysis + symmetric-routing invariant test). No
   transition. Disk 166G, no nodes. #0 stays FIXING. NEXT WAKE: poll/process — invariant fails+fixed OR 'no asymmetry'
