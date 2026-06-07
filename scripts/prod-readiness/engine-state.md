@@ -209,7 +209,7 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:DIAGNOSING-DATA (frozen fvAddrsRew MISSING-credential hunt; data-diagnose waum3utic ACTIVE, polled wake248 15:18 — both agents still querying Koios (heavy: pool_history + account_reward_history + pool_delegators_history per pool/account)).
+- item: #0 (mainnet ep246 reserves) state:DIAGNOSING-DATA (frozen fvAddrsRew MISSING-credential hunt; data-diagnose waum3utic ACTIVE, polled wake249 15:23 — dim a9bde done (185KB), dim a348 still enumerating Koios; workflow barrier awaits both).
   *** wake246: FIX muscle wyidhhb1o RETURNED **NO-CODE-CHANGE (deliberate, #438-disciplined)** + a DECISIVE refinement.
   Determination: COMPUTE-side. The +82,270,482 split (+82,215,213 reward-accts / +55,269 frTotalUnregistered treasury)
   is EXACTLY Haskell's apply-time filterAllRewards' partition acting on rewards that WERE computed into `rs` — so the
