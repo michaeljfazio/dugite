@@ -209,7 +209,7 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:POOLSTAKE-DIFFING (polled wake289 18:33 — diff workflow w7ghihrir 8 agents active, ~190 Koios pool_history calls each, none done). per-pool data captured (1531 pools).
+- item: #0 (mainnet ep246 reserves) state:POOLSTAKE-DIFFING (polled wake290 18:38 — diff workflow w7ghihrir 7/8 agents done, 8th + synthesize finishing). per-pool data captured (1531 pools).
   *** wake288 (ultracode): poolstake replay captured dugite per-pool go-stake @ep246 -> extracted+deduped to
   epoch-dumps-engine/mainnet-poolstake/ep246_dugite_poolstake.txt (1531 pools, sum==21,956,097,174,685,676 validated).
   SIGTERM'd replay 60311 (CoW clone db-clones/mainnet-rupd-drop KEPT). Launched per-pool diff WORKFLOW w7ghihrir (run
