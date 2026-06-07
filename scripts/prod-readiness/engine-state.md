@@ -231,6 +231,20 @@
    treasury=1000M, two 400M TreasuryWithdrawals (distinct registered accts) both ratified → BOTH enact, treasury=200M (pre-fix
    blocks the 2nd). Tier A. state:ROOT-CAUSED attempts:0 conf:0.96. NEXT: FIXING (remove accumulator) + the unit test; gauntlet
    (lenses: Haskell-single-subtraction-match, single-withdrawal-no-regression, the disbursed-vs-full-sum residual) before commit.
+   *** FIXING DONE wake364 (fix Workflow wggdmnnln hosted in-turn ~20min, patch UNCOMMITTED, backup candidate-fix-29-treasury-
+   withdrawals.patch 143 lines, 1 crate dugite-ledger / 1 file governance.rs). 3 minimal edits: (1) :2739 cap basis →
+   `let remaining_treasury = epochs.treasury.0;` (live per-enact-decremented treasury); (2) DELETED accumulator decl :2702;
+   (3) DELETED increment block :2761-2765. Physical :2288 decrement + reward-account payout UNTOUCHED. Added
+   test_two_treasury_withdrawals_both_enact_in_one_pass (treasury=1000M, two 400M to distinct REGISTERED accts, all-10 DReps
+   Yes + CC Yes → process_epoch_transition → BOTH credited 400M, treasury=200M, both ratified+removed); the cap-preservation
+   test test_treasury_aggregate_withdrawal_cap (600M treasury, 2nd over-cap blocked) still passes. *** AGENT EMPIRICALLY proved
+   the test FAILS pre-fix: reintroduced the accumulator → 2nd target credited 0 (cap basis 600-400=200 < 400 → rejected),
+   restored fix → passes (the gold "test reproduces the divergence" rigor). *** INDEPENDENTLY RE-VERIFIED (#438): accumulator
+   gone (only in test comment), cap-check uses live treasury, :2288 unchanged, fmt=0 clippy=0 nextest 1524/1524 incl. both
+   treasury tests. state:GAUNTLET attempts:1 conf:0.93. *** NEXT WAKE — GAUNTLET (lenses: Haskell-single-subtraction exact match,
+   single-withdrawal + validated-era no-regression, the disbursed-vs-full-sum cap-basis residual for unregistered targets) →
+   commit on pass. Test-construction gotcha recorded: reward_account_to_hash keys on the 28-byte CREDENTIAL bytes[1..29], NOT
+   byte[0] (network/script header) — vary byte[1] to make distinct accounts.
 30. [M][phase2][NEW] txInfoSignatories preserves on-wire order instead of Set.toList sorted+deduped.
    required_signers_to_plutus_padded (tx_info_populate.rs:481-485) maps Vec<Hash32> in wire order, no sort/dedup; wire Vec
    preserved (era decoders read_set only strips tag-258, no sort/dedup). Haskell txInfoSignatories = Set.toList
@@ -503,7 +517,14 @@
    reconstruction + #7 sub-tx forward). state:DONE attempts:0
 
 ## In-progress
-- item: #29 [M] TreasuryWithdrawals double-subtract ROOT-CAUSED (conf 0.96, Haskell single-decremented-ensTreasury model confirmed). NEXT: FIXING (remove the accumulator).
+- item: #29 TreasuryWithdrawals double-subtract FIXING DONE (uncommitted, 1524/1524, test empirically fails pre-fix) → state:GAUNTLET. NEXT: gauntlet → commit.
+  *** wake364 (ultracode): DRIVE #29 ROOT-CAUSED→FIXING (fix Workflow wggdmnnln, in-turn ~20min). 3 minimal edits in
+  governance.rs: cap-check vs live epochs.treasury.0 (:2739), deleted the accumulator (decl :2702 + increment :2761-2765);
+  kept the physical :2288 decrement + payout. Added test_two_treasury_withdrawals_both_enact_in_one_pass — the agent
+  EMPIRICALLY proved it FAILS pre-fix (reintroduced the accumulator → 2nd withdrawal credited 0) then passes post-fix. INDEPEND-
+  ENTLY re-verified: accumulator gone, cap-check live, :2288 untouched, fmt+clippy+nextest 1524/1524 incl. both treasury tests.
+  Patch backed up; uncommitted. NEXT WAKE: GAUNTLET (Haskell-single-subtraction match + no-regression + disbursed-vs-full-sum
+  residual) → commit on pass. Lock to release.
   *** wake360 (ultracode): SCHEDULE #29, DRIVE NEW→ROOT-CAUSED. HEAD-verified the double-subtract myself (governance.rs:2288
   enact decrements treasury AND :2733 cap-check ALSO subtracts the :2762 accumulator → w1 counted twice), then diagnose Workflow
   wd3dqbaqm (in-turn, conf 0.96) SOURCE-CONFIRMED the Haskell model (Conway Ratify.hs withdrawalCanWithdraw against the per-enact-
@@ -3297,6 +3318,7 @@
 - 2026-06-08T21:05Z wake358 ~ #28 ROOT-CAUSED→FIXING: fix Workflow w2e3vri2u (in-turn) bounded PlutusData leaf bytes at 64 (read_bounded_plutus_bytes/_bigint, additive, generic readers untouched, Babbage via Alonzo reuse); 23 defensive tests; INDEPENDENTLY verified 1175/1175 + over-strictness guards. Filed #28b (encoder must chunk). Uncommitted; gauntlet next
 - 2026-06-08T21:35Z wake359 ~ #28 gauntlet w67vflrob PASSED 0/3 (substantive: exact decodeBoundedBytes match + over-strictness/completeness incl Dijkstra-reuse + commit-safety); COMMITTED 9b21f6f0d5 (1 crate). #28 DONE. Next #29
 - 2026-06-08T22:05Z wake360 ~ #29 NEW→ROOT-CAUSED: HEAD-verified double-subtract + diagnose wd3dqbaqm (in-turn, conf 0.96) source-confirmed Conway single-decremented-ensTreasury (no accumulator). Fix=cap-check vs live treasury + delete accumulator, keep :2288. Next FIXING
+- 2026-06-08T22:45Z wake364 ~ #29 ROOT-CAUSED→FIXING: fix Workflow wggdmnnln (in-turn) removed the cap-check accumulator double-subtract (cap vs live treasury, kept :2288); reproducing test EMPIRICALLY fails pre-fix; INDEPENDENTLY verified 1524/1524. Uncommitted; gauntlet next
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -4948,3 +4970,8 @@
   cap-check vs live epochs.treasury.0 + delete the accumulator (decl + increment); keep the physical :2288 decrement. No
   regression (single-withdrawal identical; validated eras <=1 withdrawal/epoch). Secondary residual flagged (disbursed vs
   full-sum cap basis, unregistered-target edge). state:ROOT-CAUSED. NEXT: FIXING.
+- wake361-363 2026-06-08 (busy stops): cron fires STOPPED on `busy` while wake364 hosted the #29 fix in-turn (~20min ledger build). Correct.
+- wake364 2026-06-08: DRIVE #29 ROOT-CAUSED→FIXING (fix Workflow wggdmnnln, in-turn). Removed the TreasuryWithdrawals cap-check
+  accumulator double-subtract (cap-check vs live epochs.treasury.0; deleted decl+increment; kept the physical :2288 decrement).
+  Added a reproducing test the agent EMPIRICALLY confirmed fails pre-fix. INDEPENDENTLY re-verified fmt+clippy+nextest 1524/1524.
+  Uncommitted; gauntlet next. state:GAUNTLET.
