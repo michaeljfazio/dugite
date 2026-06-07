@@ -209,7 +209,19 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:HYPOTHESIS-FALSIFIED-REDIRECT (member-drop root cause is WRONG; re-instrument full paid-set next).
+- item: #0 (mainnet ep246 reserves) state:PAID-SET-INSTRUMENTED (build running; re-replay next wake).
+  *** wake261: added the FULL-PAID-MAP instrumentation. At epoch.rs:104 (after rupd computed, applyRUpd site), env-gated
+  DUGITE_RUPD_PAID_EPOCH=<N> -> one-shot dump of dugite's ENTIRE computed reward map (rupd.rewards = paid set,
+  post-prefilter) to epoch-dumps-engine/rupd_paid_<N>.txt (header: paid_count, delta_reserves, delta_treasury; then
+  `<cred_hex> <amount>` per paid cred). Chose epoch.rs over rewards.rs because the epoch is in scope there (one-shot,
+  no per-boundary flood). cargo check -p dugite-ledger CLEAN (7s). Kicked off release build pid 97876 ->
+  /tmp/dugite-rupd-paid-build.log. NEXT WAKE: verify build -> re-launch replay over the KEPT CoW clone
+  db-clones/mainnet-rupd-drop with DUGITE_RUPD_PAID_EPOCH=246 (+ keep DUGITE_RUPD_DROP_TRACE=1) -> ~4min to ep246 ->
+  read rupd_paid_246.txt = dugite's full paid set. THEN the diff: dugite paid set ∪ dropped(809) = dugite's CONSIDERED
+  set; the bug = Koios earned_epoch-245 recipients NOT in dugite's considered set (missing payees) and/or per-cred
+  amount deltas, summing to 82,215,213. Efficient Koios enumeration TBD (per-pool delegators, or sample — decide once
+  the paid set is in hand; the paid_count vs dump credentials=154,236 will itself hint if creds are missing). Both
+  instrumentations UNCOMMITTED on main (observability; revert after pin). CoW clone KEPT.
   *** wake260: **MEMBER-DROP HYPOTHESIS FALSIFIED BY REPLAY+KOIOS DATA.** (1) Pinned epoch alignment DECISIVELY: dugite
   ep246 dump per-cred reward == Koios earned_epoch 245 (3/3 high-stake PAID creds match within rounding:
   40,899,604,958≈590 / 56,824,039,680≈168 / 42,618,357,963≈688). So the ep245->246 distribution = Koios earned_epoch
@@ -2803,3 +2815,8 @@
   full RUPD_PAID set + re-replay -> diff vs Koios earned_epoch 245 to find the missing/under-paid creds. LESSON:
   conservation decomposition localizes the symptom-pots, NOT the mechanism; replay+Koios data beat 8 wakes of
   plausible frozen-set reasoning.
+- wake261: added FULL-PAID-MAP instrumentation at epoch.rs applyRUpd site (env DUGITE_RUPD_PAID_EPOCH=N -> one-shot
+  dump rupd.rewards paid set -> epoch-dumps-engine/rupd_paid_N.txt). cargo check ledger CLEAN. Kicked off release
+  build pid 97876. next wake: verify build -> re-replay over kept CoW clone with DUGITE_RUPD_PAID_EPOCH=246 -> read
+  dugite's full paid set -> diff vs Koios earned_epoch245 to find missing payees summing to 82,215,213. Instrumentation
+  uncommitted.
