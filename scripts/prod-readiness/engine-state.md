@@ -280,7 +280,21 @@
    reconstruction + #7 sub-tx forward). state:DONE attempts:0
 
 ## In-progress
-- item: #16 DONE (committed+pushed add4f0b3c1). *** ENTIRE TRACTABLE BACKLOG CLEARED *** (only #24-pin DEFERRED). NEXT WAKE: re-assess.
+- item: RE-ASSESS (backlog cleared) — workspace CI gate b7kr6pyuw IN-FLIGHT (milestone validation); lock HELD. #24-pin DEFERRED.
+  *** wake335 (ultracode): RE-ASSESS wake (no backlog item — entire tractable backlog cleared wake334). Before generating
+  new work via an audit, validating the milestone: this session landed ~13 fixes across 4 crates (dugite-ledger,
+  dugite-serialization, dugite-node, dugite-uplc), each verified PER-CRATE — but the per-crate gauntlets don't guarantee no
+  CROSS-CRATE regression, and the CLAUDE.md hard requirement is "CI green". DRIVE: launched the full workspace CI gate
+  b7kr6pyuw (cargo fmt --all --check + nextest --workspace + clippy --all-targets -D warnings) → /tmp/ci_combined.log.
+  NOTE: the working tree carries the PRE-EXISTING uncommitted #730 common.rs regression tests (+218, not from this session
+  + not part of any landed item) — the gate runs WITH them; if THEY fail it's a pre-existing #730 condition, not a session
+  regression. *** ON COMPLETION (this wake): if all GREEN → milestone confirmed solid (record clean baseline), then NEXT
+  WAKE launch a fresh adversarial re-audit (muscle, like the #541/wake200 7-subagent audit) to surface NEW gaps — the
+  highest-leverage move for a cleared backlog. If any RED → triage: a SESSION-introduced cross-crate regression = a new P0
+  item to fix immediately; a pre-existing #730/common.rs failure = note + isolate (run the gate excluding common.rs to
+  confirm session work is clean). *** Open: ONLY #24-pin (DEFERRED — muscle-resistant, needs CEK instrumentation / full-UTxO
+  capture; masked). Lock held across async (TTL 22m). Recommend after this validation: (B) adversarial re-audit OR (A) #24
+  full-UTxO Koios capture.
   *** wake334-cont (ultracode): #16 VERIFYING→DONE. Verify btax9e09l GREEN: clippy -p dugite-node -D warnings clean (doc
   lints + compile), fmt clean, the 3 decode_imported_script_ref tests pass (incl. the mapping-pinning test). COMMITTED
   focused 1-crate doc fix add4f0b3c1 (node/mod.rs — made the strict-prefix dependency + future-era reorder/remove caveat
