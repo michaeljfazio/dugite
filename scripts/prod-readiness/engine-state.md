@@ -200,7 +200,10 @@
    Byte-exact for ALL CURRENT eras only because each era's language list is a strict PREFIX [V1,V2,V3,V4] (no
    reorder/removal), so era-relative index == fromEnum(language) today. Patch comments self-contradict
    ('era-relative' vs 'global'). NOT a current divergence. FIX: make the mapping era-aware (or assert the prefix
-   invariant + comment) when a future era reorders/removes a language. state:NEW attempts:0 (follow-up after #10 lands)
+   invariant + comment) when a future era reorders/removes a language. *** DONE wake334 (add4f0b3c1): ASSESS found the
+   comment already accurate + the mapping test (8318) already pins 0→V1..3→V4 AND tag-out-of-range→Err; no Language enum
+   exists for a static const-assert. Took the "+comment / assert-the-invariant" path: enhanced the doc to make the strict-
+   prefix DEPENDENCY + future-era REORDER/REMOVE caveat explicit (0 logic change; clippy+fmt+test green). state:DONE attempts:0
 15. [M->H][phase2][ROOT-CAUSED-CONFIRMED wake165 — byte-level proof] 306 "script returned Error term" phase-2
    divergences = dugite serialiseData CANONICAL RE-ENCODE bug (general-UPLC). *** wake165 DEFINITIVE PROOF (wpeec891q
    mechanism dim): failing tx 27751ab9 spends a script (7afbde08, PlutusV3, 4751 bytes) that calls serialiseData 11x
@@ -277,7 +280,23 @@
    reconstruction + #7 sub-tx forward). state:DONE attempts:0
 
 ## In-progress
-- item: #16 (decode_imported_script_ref invariant) state:VERIFYING attempts:0 — doc fix applied; verify btax9e09l IN-FLIGHT; lock HELD.
+- item: #16 DONE (committed+pushed add4f0b3c1). *** ENTIRE TRACTABLE BACKLOG CLEARED *** (only #24-pin DEFERRED). NEXT WAKE: re-assess.
+  *** wake334-cont (ultracode): #16 VERIFYING→DONE. Verify btax9e09l GREEN: clippy -p dugite-node -D warnings clean (doc
+  lints + compile), fmt clean, the 3 decode_imported_script_ref tests pass (incl. the mapping-pinning test). COMMITTED
+  focused 1-crate doc fix add4f0b3c1 (node/mod.rs — made the strict-prefix dependency + future-era reorder/remove caveat
+  explicit; 0 logic change) + PUSHED (6bf88b4cbf..add4f0b3c1). *** MILESTONE: the engine has cleared EVERY tractable backlog
+  item. Done this session: #0/#1/#2/#3/#6/#11/#20c (ledger reward/fork correctness, mainnet ep209-247 + preprod byte-exact),
+  #17 (snapshot CRC), #20 a+b+c (snapshot-import adversarial-hardening), #23 (txInfoData V1 dedup, 742 phase-2 dumps fixed),
+  #7 (Dijkstra sub-tx instant-stake), #16 (script-ref invariant); REFUTED #15 (serialiseData already byte-exact) + DEBUNKED
+  #25 (muscle miscount). *** REMAINING: ONLY #24 (V2 inline-datum-spend ExUnit over-cost, ROOT-CAUSED conf 0.83) — DEFERRED:
+  muscle-resistant (44-min muscle couldn't pin), needs CEK-step instrumentation or a heavy full-UTxO-context capture; masked
+  by trust-on-consensus (no wedge/ledger impact; only a trustless-validator/block-producer standalone-validation gap). *** NEXT
+  WAKE — re-assess for NEW gaps (no current backlog item to advance): options (A) tackle #24-pin with a full-UTxO Koios capture
+  (the only remaining real conformance item, but heavy); (B) a security/conformance RE-AUDIT to surface new gaps (like the
+  wake200/#541 audits); (C) steady-state — a from-genesis or fast-start sync health check / soak to confirm no live
+  regressions from this session's changes (note: #6/#7/#20/#23 are off the linear-replay forward path, so a linear replay
+  mostly re-confirms unchanged state). RECOMMEND (B) a fresh adversarial re-audit (highest chance of surfacing real new work)
+  OR (A) #24 full-context capture. Lock to release.
   *** wake334 (ultracode): SCHEDULE #16 (last backlog item). ASSESS: #16 is LARGELY ALREADY ADEQUATE — the doc comment at
   node/mod.rs:376 already accurately states the era-relative-but-monotonic-prefix invariant, and the test
   decode_imported_script_ref_maps_plutus_language_tags_to_global_versions (8318) already pins 0→V1..3→V4 AND tag-9→Err
@@ -2681,6 +2700,10 @@
 - db-clones/preprod-ep57-fixed   (fixed-binary replay, in progress)
 
 ## Gauntlet ledger  (passed/refuted approaches — never silently retry a REFUTED)
+- PASSED 2026-06-08 (wake334, #16): "make the decode_imported_script_ref Plutus language-tag prefix invariant explicit".
+  Doc-comment-only (0 logic change): clippy -p dugite-node -D warnings (doc lints + compile) clean + fmt + the 3
+  decode_imported_script_ref tests (mapping 0→V1..3→V4 + out-of-range tag-9→Err) pass. Landed add4f0b3c1. Last tractable
+  backlog item — backlog now CLEARED (only #24-pin deferred).
 - PASSED 2026-06-08 (wake333, #7): "replay instant-stake in Dijkstra apply_sub_transactions forward path (mirror of #6)".
   Gauntlet for this code-invariant = a forward-path stake-replay test (sub-tx creates a BASE-credential output → assert
   stake_map[cred]+=K; sibling sub-tx spends it → assert ==0) using a base address (the existing sub-tx test used only
@@ -2791,6 +2814,7 @@
 - 2026-06-08T04:xxZ wake331 ~ SCHEDULE #7 + DRIVE NEW→ROOT-CAUSED (forward-path mirror of #6; #24-pin deferred)
 - 2026-06-08T04:xxZ wake332 ~ #7 ROOT-CAUSED→FIXING (apply_sub_transactions threads certs/epochs + instant-stake replay; cargo check clean)
 - 2026-06-08T05:xxZ wake333(+cont) ~ #7 FIXING→VERIFYING→DONE (fail-pre structural + post-fix; gauntlet 1523/1523) + commit/push 6bf88b4cbf
+- 2026-06-08T06:xxZ wake334(+cont) ~ #16 doc-only invariant fix (clippy+fmt+test green) + commit/push add4f0b3c1 → TRACTABLE BACKLOG CLEARED
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -4347,3 +4371,7 @@
   ADD+SUB legs); fail-pre PROVEN structurally (HEAD has 0 stake_map writes) + post-fix PASS; gauntlet 1523/1523 +clippy+fmt.
   Committed+pushed 6bf88b4cbf. Instant-stake-replay symmetry COMPLETE (forward/reconstruction/sub-tx). Backlog nearly
   cleared — remaining #16 (L) + #24-pin (deferred/heavy). Next: #16 or a regression-validation replay.
+- wake334(+cont) 2026-06-08: SCHEDULE+DRIVE #16 (last item) — doc-only fix making the script-ref language-tag prefix
+  invariant + future-era caveat explicit (already adequate comment+test; no Language enum for a static assert).
+  clippy+fmt+test green → committed+pushed add4f0b3c1. *** ENTIRE TRACTABLE BACKLOG CLEARED *** — only #24-pin remains
+  (deferred/heavy/masked). Next: re-assess for new gaps (recommend a fresh adversarial re-audit) or #24 full-context capture.
