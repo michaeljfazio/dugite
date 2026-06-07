@@ -194,8 +194,17 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-RESOAK (commit-B FINAL, R1+R2).
-  *** wake184: FIX muscle w3dsqneah COMPLETED green (tier B, 1 crate dugite-serialization mempack/mod.rs+tests; node/
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:GAUNTLET-PENDING (commit-B FINAL, 6-path+R1+R2).
+  *** wake185: verify10B3 WINDOW CONFIRMED — synced PAST window (tip 125115283 > 125105013, block 4794330), 0 phase-1,
+  0 NotFullyConsumed (R2 doesn't false-trigger on well-formed TxOuts). DROVE: SIGTERM'd verify10B3 (evidence captured),
+  launched RE-GAUNTLET wvfzy4jta (run wf_d0e85509-f55, refuterN=3) on the COMPLETE final state (6-path + R1 dangerous-
+  Big + R2 full-consumption). This is the 4th gauntlet round; prior 3 rounds' refutations ALL addressed (wetwroth8:
+  R3/CRC#17; wdvf5l5le: opaque/hard-error/c==0; wd3lzyawv: dangerouslyBig/full-consumption + 6 paths verified byte-
+  exact by compounding-feedback). Out-of-scope (separate items, NOT defects): CRC=#17, opaque-CompactAddr=#19;
+  phase-2 Error-term=#15. NEXT WAKE: on gauntlet PASS -> COMMIT #10 via gh/HTTPS (dugite-serialization+dugite-node)
+  -> file #19 + activate #15; on REFUTE -> verify the dissent vs pinned source (4th round should be near-clean —
+  adversarial surface exhausted: opaque-store + truncation/leftover/dangerouslyBig hard-error all done).
+  was: state:VERIFYING-RESOAK (commit-B FINAL, R1+R2). *** wake184: FIX muscle w3dsqneah COMPLETED green (tier B, 1 crate dugite-serialization mempack/mod.rs+tests; node/
   ledger UNTOUCHED confirmed). R1 dangerouslyBig: O(1) bounds before pow (net_exp>=3=>None [coeff>=1, 10^3>255];
   net_exp<0 => trailing_zero_digits() scan, no 10^|e| materialised); huge-exp tests <0.02s. R2 full-consumption:
   TvarIterator asserts consumed==val_bytes.len() else Some(Err)+finished (Data.MemPack unpackFail); key side already
@@ -1288,6 +1297,9 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake185 2026-06-07: #10 VERIFYING-RESOAK -> GAUNTLET-PENDING. verify10B3 window confirmed (tip 125115283, 0 phase-1,
+  0 NotFullyConsumed). SIGTERM'd it; launched RE-GAUNTLET wvfzy4jta (wf_d0e85509-f55) on complete final state (6-path
+  + R1 dangerouslyBig + R2 full-consumption). 4th round; prior 3 rounds all addressed. NEXT WAKE: PASS -> commit #10.
 - wake184 2026-06-07: #10 FIXING -> VERIFYING-BUILDING -> VERIFYING-RESOAK. R1+R2 muscle w3dsqneah green (1 crate,
   dangerouslyBig O(1) bound + full-consumption assert). Copied to main, BUILD_EXIT=0 (no drift — 3-crate bridge),
   verify10B3 import BYTE-IDENTICAL (utxo_count=4116338 same txix dist; the '4116339' was misremembered), codec=1 Big,
