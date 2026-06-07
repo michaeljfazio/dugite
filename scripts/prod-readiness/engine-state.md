@@ -1600,6 +1600,9 @@
 - wake235 2026-06-07: POLL #0 VERIFY-THEN-FIX muscle w0oegi6uf — still RUNNING (cargo pid 10828, build/test; 33
   epoch_fees/ss_fee refs in rewards.rs = working the fee area; last activity ~2min). No transition. Disk 157G. #0
   stays FIXING. NEXT WAKE: poll/process result.
+- wake239 2026-06-07: POLL #0 deltaR1/eta VERIFY-THEN-FIX muscle w8q78zs1x — still RUNNING, ACTIVE (worktree present,
+  working eta/expected_blocks in rewards.rs, last activity 2s). No transition. Disk 166G, no nodes. #0 stays FIXING.
+  NEXT WAKE: poll/process — deltaR1/eta confirmed+fixed OR 'byte-exact, 5ppm in maxPool/appPerf' report.
 - wake238b 2026-06-07: #0 PRECISION w5xpn4ju0 FALSIFIED f64 (production path exact-Rational; 8 f64 refs all test-only;
   byte-equal precision test). 7 rounds eliminated everything except deltaR1 (the un-verified reward_pot reserves-draw;
   ssFee was verified, deltaR1 was NOT). SUSPECT rewards.rs:200-221 eta/expected_blocks FLOORING (~5ppm). Copied
