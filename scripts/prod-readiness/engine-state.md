@@ -209,7 +209,27 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:RECONCILING (polled wake272; ERA/PATH VERIFIED per user guidance).
+- item: #0 (mainnet ep246 reserves) state:ROOT-CAUSING (DEFINITIVE: uniform ~4.92ppm reward under-scaling; analyze muscle wx7gexg1o).
+  *** wake273 (ultracode): RECONCILIATION VERDICT (workflow w8ufsxjg3, 7/8 agents, n=1400 creds, extracted from agent
+  transcripts since synthesize hung): **AMOUNT-DELTAS, NOT missing payees.** ALL 1400 dugite-paid creds RESOLVED in
+  Koios earned_epoch-244 (0 missing, 0 unresolved), 0 exact matches — EVERY cred a nonzero delta; 984 under / 416 over
+  (over=floor noise); dominant signal = systematic ~5.0 ppm (modal) UNDER per cred (top operator creds ~5e-6 under).
+  *** MAGNITUDE PROOF: 82,215,213 / total_distributed 16,727,254,272,281 = 4.915e-6 = ~4.92 ppm. So the +82,215,213
+  shortfall IS a UNIFORM ~4.92 ppm MULTIPLICATIVE UNDER-SCALING of every member/leader reward — a GLOBAL,
+  pool-independent factor. *** THIS CONFIRMS the wake233 dim-2 finding (-5.027 ppm uniform per-member) that the wz6pe606w
+  diagnose WRONGLY dismissed as a 'measurement artifact' (wake240+) -> the ENTIRE frozen-fvAddrsRew / applyRUpd-partition
+  thread (wakes 233-272) chased the WRONG mechanism; member-drops were proven all-legitimate (wake260) and there are NO
+  missing payees (this reconciliation). The bug is a ~4.92 ppm global factor in the reward formula. DROVE: killed the
+  hung workflow w8ufsxjg3 (synthesize never started; barrier satisfied, extracted the 8 RECON_SCHEMA outputs directly);
+  RECONCILING->ROOT-CAUSING; launched analyze muscle wx7gexg1o (opus, mode analyze) to localize the EXACT ~4.92 ppm site
+  in the VERIFIED live path (shelley.rs:383 compute_reward_update / rewards.rs). Candidates: reward_pot R / deltaR1 /
+  reserves-in-expansion (RE-CHECK wake240's 'deltaR1 byte-exact' — it may have used d=0 but mainnet ep244 d!=0), eta=
+  blocksMade/expectedBlocks flooring, totalActiveStake/sigma denominator, or a uniform precision/floor loss. Refuted
+  (do-not-revisit): prefilter drops, frozen-fvAddrsRew missing-cred, state/epoch.rs partition (dead test path). NEXT
+  WAKE: read wx7gexg1o -> the exact field/line + Haskell quote -> Tier-A fix in shelley.rs/compute_reward_update ->
+  re-replay (CoW clone db-clones/mainnet-rupd-drop) verify ep246 reserves==12880948865137767 + ep209-245 unregressed ->
+  gauntlet -> commit. LESSON: a 'uniform ppm' signal across many entities is a GLOBAL FORMULA FACTOR, not an artifact —
+  do NOT dismiss it; per-cred replay+Koios data is the arbiter (conservation decomposition can't see a uniform scalar).
   *** wake272: USER GUIDANCE — verify era-specific code path, don't assume from prior knowledge; check node's reported
   era or Koios. DONE: (1) node's OWN dump epoch_000246.json reports era=ALLEGRA protocol_version=3.0 (NOT assumed).
   (2) ACTUAL code dispatch eras/mod.rs:191: `Era::Shelley | Era::Allegra | Era::Mary => Self::Shelley(ShelleyRules)`
@@ -2932,3 +2952,11 @@
   the live applyRUpd for ep246 IS shelley.rs (verified end-to-end, not assumed). LESSON: check the node's reported
   'era' field + the actual eras/mod.rs dispatch; never infer era/path from HF-boundary prior knowledge. Reconcile
   workflow w8ufsxjg3 still running.
+- wake273 (ultracode): RECONCILIATION VERDICT = AMOUNT-DELTAS not missing-payees. n=1400 creds all resolved in Koios
+  earned_epoch-244, 0 missing, 0 exact, systematic ~5.0ppm UNDER per cred. MAGNITUDE: 82,215,213/16,727,254,272,281
+  = 4.92ppm => the bug is a UNIFORM ~4.92ppm multiplicative under-scaling of every member/leader reward (global,
+  pool-independent). CONFIRMS wake233 dim-2 (-5.027ppm) wrongly dismissed as artifact; the whole frozen-fvAddrsRew
+  thread was the wrong mechanism. Killed hung workflow w8ufsxjg3 (extracted outputs directly). RECONCILING->ROOT-CAUSING;
+  launched analyze muscle wx7gexg1o to localize the ~4.92ppm site in shelley.rs:383 compute_reward_update/rewards.rs
+  (re-check deltaR1/eta/reserves/sigma). next wake: read verdict -> fix -> re-replay verify. LESSON: a uniform-ppm
+  signal across many entities is a GLOBAL FORMULA FACTOR, never dismiss as artifact; per-cred replay+Koios is the arbiter.
