@@ -209,7 +209,7 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:DIAGNOSING-DATA (FOCUSED credential pin on pool e7b605b72af; diagnose wz6ku12dk ACTIVE, polled wake252 15:34 — agent enumerating delegators' account_reward_history/account_update_history).
+- item: #0 (mainnet ep246 reserves) state:DIAGNOSING-DATA (FOCUSED credential pin on pool e7b605b72af; diagnose wz6ku12dk ACTIVE, polled wake253 15:38 — agent still enumerating delegators' reward+update history (137KB, steady growth)).
   *** wake251: data-diagnose waum3utic COMPLETE — CONFIRMED localization, pin BLOCKED by top-200 truncation, candidate
   pool identified. Boundary deltas (dugite-koios) via koios.sh totals: ep245 0/0 (baseline byte-exact), ep246
   +82,270,482/-55,269, ep247 +82,078,374/-5,880 — divergence FIRST at ep245->246 (RUPD apply of ep245 rewards),
