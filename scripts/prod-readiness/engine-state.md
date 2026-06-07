@@ -212,7 +212,21 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #1 (ep57 preprod stake-distribution) state:PREPROD-RECHECK-RUNNING (clean fixed binary verified; replay pid 69653 launched wake310).
+- item: #20c (epoch.rs test-MIR cleanup) state:NEW — #1 CLOSED (preprod byte-exact + MIR-fix cross-network confirmed).
+  *** wake311 (ultracode): #1 DONE/CLOSED. Preprod recheck with the CLEAN FIXED binary: dugite vs Koios PREPROD totals
+  BYTE-EXACT at ep5/20/40/57/80/100/130 (reserves+treasury). ep57 byte-exact confirms the stake-distribution is correct
+  (a -10 ADA stake error would cascade into reserves/rewards — none) -> the original #1 '-10 ADA' was STALE (matches
+  wake22-23 per-cred byte-exact finding) and the apply_utxo_changes hypothesis is RULED OUT. *** MIR-FIX CROSS-NETWORK
+  CONFIRMED: preprod (Babbage genesis -> ShelleyRules via babbage.rs delegation -> the MIR fix applies) is byte-exact
+  ep0-130 with the fixed binary -> the fix did NOT regress preprod. SIGTERM'd preprod replay 69653 (CoW clone
+  db-clones/preprod-mirfix-recheck kept). *** OVERALL LEDGER STATE: mainnet ep209-247 byte-exact + preprod ep5-130
+  byte-exact (reserves+treasury) on the MIR-fixed binary. #0/#1/#2/#3/#11 all RESOLVED. *** NEXT WAKE: pick highest-
+  value remaining: (A) #20c epoch.rs test-only MIR-after-SNAP cleanup (quick, gauntlet-flagged consistency) [DEFAULT];
+  (B) #6 apply_utxo_diff fork-reconstruction (latent fork-robustness); (C) #16/#17/#19/#20 snapshot adversarial-
+  hardening (varlen overflow, CRC, CompactAddr, definite-map truncation/backend dup-key) — real defensive gaps from
+  the #10 mithril-import work; (D) #20b ep235 dump-cosmetic characterization (L). Recommend C (real defensive
+  hardening) or A (quick win) next. Housekeeping: db-clones/preprod-mirfix-recheck + mainnet-rupd-drop CoW clones
+  prunable later.
   Clean build OK (release 1m36s, binary 20:05, strings=0 instrumentation symbols = the committed fix only). CoW-cloned
   db-preprod-sync -> db-clones/preprod-mirfix-recheck (15G immutable). Launched from-genesis preprod replay job
   preprod-mirfix pid 69653 (fixed binary, --config config/preprod/config.json, socket /tmp/engine-preprod-mirfix.sock
@@ -3447,3 +3461,8 @@
   db-clones/preprod-mirfix-recheck. Launched from-genesis preprod replay job preprod-mirfix pid 69653 (fixed binary,
   preprod config, dumps->preprod-mirfix). next wake: compare ep57 + ep0-100 sweep vs Koios PREPROD -> byte-exact =>
   #1 CLOSED + MIR-fix cross-network confirmed; else separate utxo/stake bug.
+- wake311 (ultracode): #1 CLOSED. Preprod recheck (clean fixed binary) BYTE-EXACT vs Koios PREPROD at
+  ep5/20/40/57/80/100/130 (reserves+treasury). ep57 byte-exact => original -10 ADA was STALE (apply_utxo_changes
+  hypothesis RULED OUT, matches wake22-23). MIR-FIX CROSS-NETWORK CONFIRMED (preprod ep0-130 byte-exact, didn't
+  regress). OVERALL: mainnet ep209-247 + preprod ep5-130 byte-exact on the MIR-fixed binary; #0/#1/#2/#3/#11 RESOLVED.
+  next wake: pick #20c (test-MIR cleanup, quick) OR #16/#17/#19/#20 (snapshot adversarial-hardening, real defensive).
