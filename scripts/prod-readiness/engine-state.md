@@ -194,8 +194,18 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:FIXING (round-4 hardening: F1 dup-key + F2 indef-array).
-  *** wake187: 4th RE-GAUNTLET wvfzy4jta = REFUTED 3/3 (3 NEW deeper edges; verified the dissents):
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-RESOAK (round-4: F1 dup-key + F2 indef-array).
+  *** wake191: FIX muscle wb28q1upc green (1 crate dugite-serialization: mempack/mod.rs F1 first_occurrence_value
+  MapAccess [aeson KM.fromList first-wins] + era_conway.rs/reader.rs F2 read_native_script accept indefinite outer
+  array via new Reader::expect_break [cardano-ledger decodeListLikeT/decodeListLenOrIndef]; +tests; also repaired
+  bridge-orphaned tests [TxIxEndianness arg, full-consumption contract]). DROVE: copied 4 files to main (2-crate
+  footprint, node/ledger 0 F1/F2 markers), BUILD_EXIT=0 (no drift), dugite-serialization NEXTEST GREEN 1130 passed/6
+  skip (the wake184 build-only test-consistency now CONFIRMED on main), GC'd worktree, cloned verify10B4 pid 78827.
+  Import BYTE-IDENTICAL: codec_version=1 Big (F1 no-dup common case unchanged), utxo_count=4116338 + txix_low=3131782
+  txix_mult256=62, 0 phase-1, 0 NotFullyConsumed. Node syncing window. NEXT WAKE: confirm 0-phase-1 past window ->
+  5th RE-GAUNTLET (F1+F2 addressed; F3->#19). Per wake187 POLICY: if 5th round finds ONLY adversarial-only edges (no
+  real-snapshot risk), COMMIT #10 core + open adversarial-hardening tracking item; F2 was the last real-snapshot risk.
+  was: state:FIXING (round-4 hardening: F1 dup-key + F2 indef-array). *** wake187: 4th RE-GAUNTLET wvfzy4jta = REFUTED 3/3 (3 NEW deeper edges; verified the dissents):
    (F1 haskell-semantics, COMPILE-VERIFIED) duplicate-JSON-key: aeson default json keeps FIRST occurrence, serde_json
     keeps LAST. parse_tables_codec_version type-gate uses serde_json value.get() (LAST) while extract_raw_number_literal
     is FIRST -> they DISAGREE; meta {..,"tablesCodecVersion":1,"tablesCodecVersion":"x"} => Haskell imports (1), dugite
@@ -1322,6 +1332,10 @@
   not wedged). No transition. Disk 178G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process result.
 - wake189 2026-06-07: POLL #10 FIX muscle wb28q1upc — still RUNNING, ACTIVE (last activity 5s, build/test). No
   transition. Disk 179G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process result.
+- wake191 2026-06-07: #10 FIXING -> VERIFYING-BUILDING -> VERIFYING-RESOAK. F1+F2 muscle wb28q1upc green (1 crate;
+  F1 aeson first-wins dup-key, F2 read_native_script accept indefinite outer array). Copied to main, BUILD_EXIT=0,
+  serialization nextest GREEN (1130 passed), verify10B4 import byte-identical (4116338, codec=1 Big, 0 phase-1, 0
+  NotFullyConsumed). NEXT WAKE: window -> 5th re-gauntlet -> commit-or-policy-call (F2 was last real-snapshot risk).
 - wake188 2026-06-07: POLL #10 FIX muscle wb28q1upc (F1 dup-key + F2 native-indef-array) — still RUNNING, ACTIVE
   (worktree present, bridge applied, build/test). No transition. Disk 179G, no nodes. #10 stays FIXING. NEXT WAKE:
   poll/process -> build -> re-import -> re-gauntlet.
