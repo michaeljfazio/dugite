@@ -268,7 +268,23 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #20a DONE (committed+pushed 49a2c0ce1d). #20 remaining: only (b) definite-map. NEXT WAKE: SCHEDULE #20b.
+- item: #20b (definite-map exact-count) state:FIXING attempts:0 — hand-fix applied + compiles; gauntlet b6ll2gq8c IN-FLIGHT; lock HELD.
+  *** wake330 (ultracode): SCHEDULE #20b (last #20 sub-item — after this #20 fully DONE). HAND-FIXED byte-exact (no muscle:
+  the Haskell ref is already established — cborg decodeMapLen exact-N / DecoderErrorPrematureEOF, cited in the existing
+  indefinite-arm code + the #20 entry). GAP: tvar_body_offset read the definite-map header size but DISCARDED the declared
+  count N ("iterate until done"); TvarIterator had no entries_remaining → a definite map declared N but truncated to M<N
+  returned None at exhaustion, silently importing the M-entry prefix (the distribution sanity-check passes on a prefix).
+  FIX (mempack/mod.rs): (1) reuse the existing cbor_utils::decode_map_len (Some(N)/None + bounds-checked uint) in
+  tvar_body_offset, capture count into TvarBody.count; (2) TvarIterator.entries_remaining: Option<usize> = count; (3) next():
+  top-check entries_remaining==Some(0)→None (stop exactly at N, cborg reads exactly N pairs), empty-branch with
+  entries_remaining=Some(n>0)→Err (premature-EOF), decrement on each successful yield. The other tvar_body_offset caller
+  (RawKeyWalker @1280) uses only .offset → unaffected. + 2 tests: definite_map_truncated_below_declared_count_hard_errors
+  (map(3)+1 entry → Err; fail-pre/pass-post — pre-fix returned silent None), definite_map_exact_count_completes_clean
+  (map(2)+2 entries → clean None, over-strictness guard). cargo test --no-run clean. Launched gauntlet b6ll2gq8c (nextest
+  + clippy + fmt; must keep the EXISTING tvar definite/indefinite tests green). *** ON COMPLETION (this wake): if green →
+  COMMIT focused 1-crate fix (mempack/mod.rs + tests.rs) + push → #20b DONE → #20 FULLY DONE (a+b+c all landed). Lock held
+  across async (TTL 22m). After #20: open items = #24 (V2 inline-spend over-cost ROOT-CAUSED, pin w/ full UTxO ctx), #7
+  (Dijkstra re-derive), #16 (L).
   *** wake329-cont2 (ultracode): #20a FIXING→VERIFYING→DONE. Gauntlet bxk1ycwus: nextest -p dugite-serialization 1150/1150
   (was 1147, +3 #20a tests ALL PASS: varlen_overflow_10byte_msbyte_rejected [fail-pre/pass-post — pre-fix returned a
   TRUNCATED Ok], varlen_max_u64_still_ok [boundary], varlen_non_minimal_submaximal_still_accepted [over-strictness guard];
