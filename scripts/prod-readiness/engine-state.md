@@ -194,7 +194,26 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:FIXING (commit-B RE-FIX, 6-path disposition).
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-RESOAK (commit-B re-fix, 6-path).
+  *** wake177: RE-FIX muscle wcp4vycpw COMPLETED green (tier B, 2 crates, 6-path). Notable: agent correctly split
+  tag-5 into PLUTUS-body-OPAQUE vs NATIVE-Timelock-STRUCTURAL (Haskell Timelock MemPack unpackMemoBytesM IS
+  structural — more precise than my instruction). All 6 paths applied: (1) import_inline_datum opaque-store
+  (PlutusData::Bytes fallback, never error/None); (2) tag-5 Plutus opaque, native structural-hard-error retained;
+  (3) TvarIterator Some(Err(CborDecode)) on mid-map trunc; (4) address hard-error; (5) multi-asset + AssetName>32
+  hard-error; (6) R3 coeff.is_zero()=>Some(0). +dead-code removal (skipped counter) +tests.
+  *** CROSS-CRATE DRIFT (handled): the bridge was 2-crate but BackendCheckResult::Convertible spans 3 crates (the
+  VARIANT lives in dugite-ledger, added by a417bd2c6f AFTER base ca50afd9ef). Worktree's dugite-ledger lacked the
+  variant, so the agent re-classified mem-under-LSM as a guarded Mismatch{DugiteMem,DugiteLsm} arm — but main's
+  dugite-ledger RETURNS Convertible (never that Mismatch), so on main that arm is dead + match non-exhaustive. FIX:
+  on copy-to-main, surgically restored HEAD's Convertible arm (Ok+Convertible+Mismatch). LESSON: bridge patches must
+  span ALL crates a feature touches, OR reconcile cross-crate enum drift at copy-time.
+  DROVE: copied 3 files to main (2-crate footprint), restored Convertible arm, BUILD_EXIT=0 (pid 10553, .jobs/verify-
+  build-10B2.log), GC'd 16G worktree, cloned db-clones/preprod-verify10B2, launched re-fixed binary pid 10889. Import
+  byte-exact: codec_version=1 Big, 0 phase-1, 0 import HARD-ERRORS (well-formed snapshot doesn't trip the new hard-
+  error paths; opaque-datum relax = no false reject). Import in progress. NEXT WAKE: confirm full import + 0 phase-1
+  past window -> RE-GAUNTLET (all 3 prior refutes now addressed: tag-4/5 opaque=byte-exact, 3 silent paths hard-error
+  =byte-exact, R3 short-circuit) -> COMMIT #10 via gh/HTTPS. File #19 opaque-CompactAddr separately.
+  was: state:FIXING (commit-B RE-FIX, 6-path disposition).
   *** wake172: ANALYZE wezt2hemc COMPLETE — authoritative per-path disposition (pinned cardano-ledger cd8b7fab +
   ouroboros-consensus 640b7fea). GOVERNING PRINCIPLE: snapshot UTxO leaves are MemPack newtype-over-ShortByteString
   (BinaryData/PlutusBinary/CompactAddr/multi-asset rep) = ZERO structural validation at load (that lives in on-chain
@@ -1233,6 +1252,12 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake177 2026-06-07: #10 FIXING -> VERIFYING-BUILDING -> VERIFYING-RESOAK. Re-fix muscle wcp4vycpw green (6-path:
+  tag-4/5 opaque-store [Plutus opaque, native Timelock structural], TvarIterator/address/multi-asset hard-error, R3
+  c==0 short-circuit). Cross-crate drift: bridge 2-crate but Convertible variant lives in dugite-ledger (3rd crate);
+  agent re-classified via Mismatch guard, dead on main -> restored HEAD Convertible arm at copy-time. BUILD_EXIT=0,
+  GC'd 16G worktree, launched verify10B2 pid 10889: codec_version=1 Big, 0 phase-1, 0 import hard-errors. NEXT WAKE:
+  confirm past window -> re-gauntlet -> commit. (LESSON: bridge must span all crates a feature touches.)
 - wake176 2026-06-07: POLL #10 RE-FIX muscle wcp4vycpw — nextest FINISHED (no cargo procs), agent writing final FIX
   result (last activity 30s ago). Nearly complete. No transition. Disk 168G. #10 stays FIXING. NEXT WAKE: process
   result -> copy to main -> verify-build -> re-import -> re-gauntlet -> commit.
