@@ -209,7 +209,17 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:PAID-SET-INSTRUMENTED (polled wake262 — build pid 97876 still compiling dugite-node release, binary not yet refreshed; re-replay next wake once built).
+- item: #0 (mainnet ep246 reserves) state:PAID-SET-REPLAY-RUNNING (build OK 1m41s; re-replay launched wake263).
+  Re-launched replay job mainnet-rupd-paid pid 98498 over the KEPT CoW clone db-clones/mainnet-rupd-drop (immutable
+  46G intact) with DUGITE_RUPD_PAID_EPOCH=246 + DUGITE_RUPD_DROP_TRACE=1 + DUGITE_EPOCH_STATE_DUMP=...mainnet-rupd-drop,
+  --socket /tmp/engine-rupd-paid.sock --port 3001 (no node running). Progressing (ep51, fast). Writes
+  epoch-dumps-engine/rupd_paid_246.txt (dugite's FULL paid reward map) when it crosses ep246 (~4min). NEXT WAKE: poll
+  until rupd_paid_246.txt exists -> diff dugite paid set vs Koios earned_epoch-245. Concretely: (a) compare header
+  paid_count to dump credentials=154,236 (missing-payee count hint); (b) the bug = Koios-paid-at-ep245 creds NOT in
+  {dugite paid ∪ 809 dropped}, summing to 82,215,213. Efficient Koios side: enumerate per-pool (pool_delegators_history
+  + account_reward_history) OR — cheaper — since dugite PAID amounts match Koios for sampled creds, look for creds in
+  dugite's paid set with a DIFFERENT amount vs Koios (amount-delta bug) AND creds entirely absent (missing-payee bug);
+  start by checking whether paid_count < Koios recipient count. SIGTERM-only to stop. Instrumentation UNCOMMITTED.
   *** wake261: added the FULL-PAID-MAP instrumentation. At epoch.rs:104 (after rupd computed, applyRUpd site), env-gated
   DUGITE_RUPD_PAID_EPOCH=<N> -> one-shot dump of dugite's ENTIRE computed reward map (rupd.rewards = paid set,
   post-prefilter) to epoch-dumps-engine/rupd_paid_<N>.txt (header: paid_count, delta_reserves, delta_treasury; then
@@ -2820,3 +2830,7 @@
   build pid 97876. next wake: verify build -> re-replay over kept CoW clone with DUGITE_RUPD_PAID_EPOCH=246 -> read
   dugite's full paid set -> diff vs Koios earned_epoch245 to find missing payees summing to 82,215,213. Instrumentation
   uncommitted.
+- wake263: build OK (release 1m41s). Re-launched replay job mainnet-rupd-paid pid 98498 over kept CoW clone with
+  DUGITE_RUPD_PAID_EPOCH=246 -> writes epoch-dumps-engine/rupd_paid_246.txt (full paid set) at ep246 (~4min).
+  Progressing ep51. next wake: poll for rupd_paid_246.txt -> diff dugite paid set vs Koios earned_epoch-245 to find
+  missing payees / amount deltas summing to 82,215,213 (start: paid_count vs dump credentials=154,236).
