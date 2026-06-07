@@ -193,7 +193,7 @@
    clippy=0 nextest 1175/1175 PASS incl. all the bound+over-strictness tests. *** ENCODER-ASYMMETRY caveat → FILED #28b:
    dugite encode_plutus_data emits a SINGLE definite bstr even for >64B leaves (no chunking like Haskell encodeBoundedBytes), so
    a dugite-encoded >64B leaf now fails re-decode — byte-exact vs the WIRE (Haskell never emits one) but self-inconsistent; a
-   dugite-forged block carrying a >64B datum would be self-rejected. state:FIXING attempts:1 conf:0.92. NEXT: GAUNTLET (refutation
+   dugite-forged block carrying a >64B datum would be self-rejected. state:DONE attempts:1 conf:0.95 COMMITTED 9b21f6f0d5 wake359 (gauntlet w67vflrob PASSED 0/3 substantive; Dijkstra completeness engine-verified). superseded NEXT (refutation
    panel: Haskell-decodeBoundedBytes-exact-match, over-strictness/completeness, encoder-consistency #28b) → commit on pass.
 28b. [M][serialization][NEW wake358] PlutusData ENCODER must chunk >64-byte leaf bytestrings into <=64-byte indefinite chunks
    to match Haskell encodeBoundedBytes (plutus Data.hs) AND dugite's OWN new #28 decode bound. Currently encode_plutus_data →
@@ -481,7 +481,15 @@
    reconstruction + #7 sub-tx forward). state:DONE attempts:0
 
 ## In-progress
-- item: #28 [H] PlutusData >64-byte leaf cap FIXING DONE (uncommitted, 1175/1175 + over-strictness guards) → state:GAUNTLET. Filed #28b (encoder must chunk). NEXT: gauntlet → commit.
+- item: #28 DONE (committed 9b21f6f0d5) — PlutusData 64-byte leaf cap, gauntlet PASSED 0/3. NEXT: #29 [M] TreasuryWithdrawals double-subtract (or paired #28b encoder).
+  *** wake359 (ultracode): ran the #28 gauntlet (w67vflrob, 3 lenses, in-turn) → PASSED 0/3, each lens substantive (read code +
+  verbatim Haskell + traced forge/mempool/snapshot). Confirmed: decode bound matches plutus decodeBoundedBytes byte-for-byte;
+  no over-strictness (generic readers untouched, non-Plutus >64B carriers decode); COMPLETE across all eras (Alonzo/Babbage-
+  reuse/Conway/Dijkstra-reuse — I engine-verified no separate era_dijkstra read_plutus_data); commit-safe alone (#28b encoder
+  gap inert — all read_plutus_data sites inbound, forge re-emits raw bytes). COMMITTED 9b21f6f0d5 (dugite-serialization, local).
+  #28 CLOSED. *** REMAINING re-audit backlog: #29 [M] TreasuryWithdrawals double-subtract (ledger/governance Tier-A — next,
+  highest direct impact), #30 [M] txInfoSignatories sort, #31 [M] witness-set silent-skip, #28b [M] encoder must chunk >64B
+  PlutusData leaves (paired with #28), #26b (excluded gov-map ordering), #24 (deferred). NEXT WAKE: SCHEDULE #29 → DIAGNOSE.
   *** wake354 (ultracode): SCHEDULE #28, DRIVE NEW→ROOT-CAUSED. HEAD-verified the dugite gap myself (era_alonzo.rs:1282-1288
   Type::Bytes/BytesIndef no length check), then diagnose Workflow wq6fv0lvv (hosted in-turn, conf 0.95) SOURCE-CONFIRMED the
   Haskell rule: plutus Data.hs decodeBoundedBytes caps every PlutusData LEAF bytestring at 64 bytes and `fail`s above (definite
@@ -3098,6 +3106,16 @@
 - db-clones/preprod-ep57-fixed   (fixed-binary replay, in progress)
 
 ## Gauntlet ledger  (passed/refuted approaches — never silently retry a REFUTED)
+- PASSED 2026-06-08 (wake359, #28 PlutusData 64-byte leaf cap, gauntlet w67vflrob): 0/3 refute, each lens SUBSTANTIVE.
+  (1) exact-match — read the diff vs verbatim plutus decodeBoundedBytes/decodeBoundedBytesIndefLen/decodeBoundedBigInteger:
+  inclusive 64 boundary, per-chunk indef with UNBOUNDED total, 0-len ok, bignum tag-2+3 mantissa bounded both eras, small-ints
+  unbounded, canonical-form fidelity; 1460 tests incl. real-block fixtures. (2) over-strictness/completeness — generic readers
+  untouched (non-Plutus >64B vkeys/scripts/metadata still decode); exactly 2 read_plutus_data impls (Alonzo+Conway), Babbage
+  reuses Alonzo, DIJKSTRA reuses Conway (decode_dijkstra_block→decode_conway_block_mode — ENGINE-VERIFIED, no era_dijkstra.rs);
+  all carriers (witness/inline datums, both redeemer forms, nested) bounded. (3) commit-safety — committing the decode bound
+  ALONE breaks no honest path (forge re-emits raw_body_cbor verbatim, mempool preserves CBOR, snapshot opaque; all
+  read_plutus_data sites inbound); #28b encoder gap real but INERT for commit safety. COMMITTED 9b21f6f0d5 (1 crate
+  dugite-serialization).
 - PASSED 2026-06-08 (wake353, #26/#27 REWORKED fix, gauntlet wpydujp5u): the per-consumer ledger-order fix WITH the V1/V2
   correction. 0/3 refute, each lens SUBSTANTIVE (read code + ran tests, not just a vote): (1) V1/V2 txInfoWdrl = Plutus
   Key<Script via withdrawals_to_plutus derived-Ord sort (no cmp_ledger in populate_v1_v2.rs), derived PrimCred Ord == Plutus
@@ -3247,6 +3265,7 @@
 - 2026-06-08T20:10Z wake353 ~ #26/#27 re-gauntlet wpydujp5u PASSED 0/3 (substantive) on corrected code; engine-verified resolve_reward=ledger order + 732/732 + workspace check; COMMITTED 4fe61ad011 (2 crates). #26+#27 DONE. Next #28
 - 2026-06-08T20:35Z wake354 ~ #28 NEW→ROOT-CAUSED: diagnose wq6fv0lvv (in-turn, conf 0.95) source-confirmed plutus 64-byte PlutusData leaf limit (decodeBoundedBytes); real latent/adversarial acceptance asymmetry. Fix=read_bounded_plutus_bytes scoped to leaves only. Next FIXING
 - 2026-06-08T21:05Z wake358 ~ #28 ROOT-CAUSED→FIXING: fix Workflow w2e3vri2u (in-turn) bounded PlutusData leaf bytes at 64 (read_bounded_plutus_bytes/_bigint, additive, generic readers untouched, Babbage via Alonzo reuse); 23 defensive tests; INDEPENDENTLY verified 1175/1175 + over-strictness guards. Filed #28b (encoder must chunk). Uncommitted; gauntlet next
+- 2026-06-08T21:35Z wake359 ~ #28 gauntlet w67vflrob PASSED 0/3 (substantive: exact decodeBoundedBytes match + over-strictness/completeness incl Dijkstra-reuse + commit-safety); COMMITTED 9b21f6f0d5 (1 crate). #28 DONE. Next #29
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -4888,3 +4907,7 @@
   (length-lattice + over-strictness guards). INDEPENDENTLY re-verified: 0 generic-reader deletions, arms bounded both eras,
   fmt+clippy+nextest 1175/1175. Filed #28b (encoder must chunk >64B leaves to match Haskell encodeBoundedBytes + the new decode
   bound). FIXING done, uncommitted. NEXT: GAUNTLET (Haskell-exact-match + over-strictness + encoder-consistency) → commit on pass.
+- wake359 2026-06-08: ran the #28 gauntlet (w67vflrob, 3 lenses, in-turn) → PASSED 0/3, each lens substantive (exact
+  decodeBoundedBytes match, over-strictness/completeness incl. engine-verified Dijkstra reuse, commit-safety via forge/mempool/
+  snapshot trace). Spot-verified no era_dijkstra read_plutus_data. COMMITTED 9b21f6f0d5 (dugite-serialization, 1 crate, local).
+  #28 DONE. NEXT: #29 [M] TreasuryWithdrawals double-subtract.
