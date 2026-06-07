@@ -1163,3 +1163,49 @@ fn varlen_non_minimal_submaximal_still_accepted() {
     // (a stricter check could refuse a valid snapshot). 0x80 0x00 = 0 in 2 bytes.
     assert_eq!(decode_varlen(&[0x80, 0x00]).unwrap(), (0, 2));
 }
+
+// ── #20 hardening (b): definite-length tables map must have EXACTLY N entries ─
+
+#[test]
+fn definite_map_truncated_below_declared_count_hard_errors() {
+    // array(1) + map(3 entries, definite 0xa3) but only 1 complete entry present.
+    // cborg decodeMapLen demands exactly 3 (key,value) pairs; reaching EOF after 1
+    // is a premature-EOF / TRUNCATED prefix → Some(Err), never a silent None (#20b).
+    // PRE-FIX: the iterator had no declared-count tracking and returned None at
+    // exhaustion, silently importing the 1-entry prefix as a complete UTxO set.
+    let mut blob = vec![0x81u8, 0xa3]; // array(1), map(3, definite)
+    blob.extend_from_slice(&tvar_entry(0)); // only 1 of the 3 declared entries
+    let mut iter = TvarIterator::new_with_endianness(&blob, TxIxEndianness::Big).unwrap();
+    let first = iter.next().expect("first declared entry present");
+    assert!(first.is_ok(), "entry 0 should decode: {first:?}");
+    match iter.next() {
+        Some(Err(e)) => {
+            let msg = format!("{e}");
+            assert!(
+                msg.contains("TRUNCATED")
+                    || msg.contains("PrematureEOF")
+                    || msg.contains("declared"),
+                "expected a definite-map premature-EOF error, got: {e}"
+            );
+        }
+        other => {
+            panic!("definite map declared 3 but truncated to 1 must yield Some(Err), got {other:?}")
+        }
+    }
+}
+
+#[test]
+fn definite_map_exact_count_completes_clean() {
+    // array(1) + map(2) with EXACTLY 2 entries → both Ok then clean None. Guards
+    // against an over-strict rejection of a complete definite-length map.
+    let mut blob = vec![0x81u8, 0xa2]; // array(1), map(2, definite)
+    blob.extend_from_slice(&tvar_entry(0));
+    blob.extend_from_slice(&tvar_entry(1));
+    let mut iter = TvarIterator::new_with_endianness(&blob, TxIxEndianness::Big).unwrap();
+    assert!(iter.next().expect("entry 0").is_ok());
+    assert!(iter.next().expect("entry 1").is_ok());
+    assert!(
+        iter.next().is_none(),
+        "an exact-count definite map ends cleanly with None"
+    );
+}
