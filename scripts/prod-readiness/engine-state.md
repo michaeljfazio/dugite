@@ -212,7 +212,23 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #20c (epoch.rs test-MIR cleanup) state:ROOT-CAUSED attempts:0 — fix shape locked, proven inert. NEXT WAKE: FIXING.
+- item: #20c (epoch.rs test-MIR cleanup) state:FIXING attempts:0 — edit applied + compiles clean (UNCOMMITTED). NEXT WAKE: VERIFYING.
+  *** wake313 (ultracode): #20c FIXING (one step ROOT-CAUSED→FIXING). Applied the locked reorder to
+  state/epoch.rs::process_epoch_transition (the TEST-ONLY 1-arg path): (A) inserted
+  `super::certificates::apply_pending_mir(&mut self.certs, &mut self.epochs)` AFTER Step 1 applyRUpd / BEFORE Step 2b
+  SNAP (L162), with a Haskell NEWEPOCH-quote comment block (es'' <- trans MIR es' BEFORE trans EPOCH; SNAP is EPOCH's
+  first sub-rule) mirroring the live shelley.rs fix 8c868271c9; (B) removed the old apply_pending_mir call + its stale
+  "SNAP→POOLREAP→MIR→NEWPP" comment at L473-479, replaced with a pointer comment. Diff: epoch.rs ONLY, +17/-7 (net +10
+  = longer comment). `cargo check -p dugite-ledger` = Finished clean (13s, no errors). Fix is the MECHANICAL application
+  of last wake's LOCKED + risk-proven-inert shape (the analytical diagnosis/inertness-proof was wake312; no muscle fix-
+  mode needed for a fully-specified 2-line reorder). Edit left UNCOMMITTED in the working tree (alongside the pre-existing
+  uncommitted common.rs #730 regression tests) per the "commit ONLY after the verification gauntlet passes" rule.
+  *** NEXT WAKE (VERIFYING): `cargo nextest run -p dugite-ledger` must stay GREEN (1521/1521 — proven inert, expect zero
+  churn) + `cargo clippy --all-targets -- -D warnings` + `cargo fmt --all -- --check`. NO replay/Koios gauntlet (test-only
+  path, no chain reference; the live MIR ordering it now matches is already #0-gauntlet-validated). On green → COMMIT-
+  PENDING: focused 1-crate commit of crates/dugite-ledger/src/state/epoch.rs ONLY (stage explicit filename; do NOT sweep
+  common.rs), then push (this carries the accumulated wake308-313 engine-state RECORD commits). Closes the #0 MIR-before-
+  SNAP thread tail.
   *** wake312 (ultracode): #20c DIAGNOSED → ROOT-CAUSED (one step NEW→ROOT-CAUSED; code-consistency item, NO Koios/muscle
   gauntlet — test-only code, no chain reference). FINDINGS: (1) state/apply.rs:292 is the LIVE 7-arg era-rules dispatch
   `epoch_rules.process_epoch_transition(next_epoch, &epoch_ctx, &mut self.utxo, certs, gov, epochs, consensus)` →
