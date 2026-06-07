@@ -209,7 +209,29 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:ISOLATING-BUGGY-SUBSET (mechanical Koios isolation done; epoch-alignment + final subset PENDING analytical).
+- item: #0 (mainnet ep246 reserves) state:HYPOTHESIS-FALSIFIED-REDIRECT (member-drop root cause is WRONG; re-instrument full paid-set next).
+  *** wake260: **MEMBER-DROP HYPOTHESIS FALSIFIED BY REPLAY+KOIOS DATA.** (1) Pinned epoch alignment DECISIVELY: dugite
+  ep246 dump per-cred reward == Koios earned_epoch 245 (3/3 high-stake PAID creds match within rounding:
+  40,899,604,958≈590 / 56,824,039,680≈168 / 42,618,357,963≈688). So the ep245->246 distribution = Koios earned_epoch
+  245. (2) Checked ALL 809 dropped creds for an earned_epoch=245 Koios reward — as keyhash (0xe1) AND script (0xf1):
+  **0 matches both ways.** 671/809 have NO koios history at all (never-registered, legit), 138 have history but NONE
+  at ep245. => Haskell ALSO pays none of the 809 at ep245 => EVERY member drop is LEGITIMATE. The fix muscle's
+  'COMPUTE-side member/leader prefilter drop (rewards.rs:461/509)' root cause is FALSE. (3) Also: dugite PAID amounts
+  match Koios within rounding (+275..+512, dugite slightly HIGHER) for top creds — so the -82,215,213 reward-accounts
+  shortfall is NOT wrong amounts on paid creds either. CONCLUSION: dugite UNDER-distributes 82,215,213 from a DIFFERENT
+  source — most likely creds Haskell PAYS at ep245 that dugite never even computes (absent from go.delegations/
+  delegators_by_pool -> never entered the member loop -> never logged as 'dropped'), OR a leader-reward gap, OR
+  per-cred amount deltas on lower-stake creds. The 8-round 'frozen fvAddrsRew missing-cred' thread + the fix muscle +
+  the gauntlet refutations were all chasing the WRONG mechanism (they reasoned from the conservation decomposition,
+  not replay data). NEXT WAKE: enhance the instrumentation to ALSO dump dugite's FULL paid reward_map (RUPD_PAID
+  cred=<hash> amt=<lovelace> for every credited cred) + the go.delegations considered-count at the ep245->246
+  boundary; re-replay (~4min over the KEPT CoW clone db-clones/mainnet-rupd-drop); then the bug = {creds Koios pays at
+  earned_epoch 245} MINUS {dugite RUPD_PAID set} (missing payees) and/or per-cred amount deltas, summing to 82,215,213.
+  To get Koios's ep245 recipient set efficiently: pull it per-pool via pool_delegators + account_reward_history, OR
+  diff dugite's full paid set against the ep246 dump's per_credential (but that's truncated) — decide next wake.
+  Artifacts: ep246_drops.txt + ep246_isolation.json + scripts/dev/isolate_buggy_drops.py. Instrumentation UNCOMMITTED;
+  CoW clone KEPT. *** LESSON: a conservation decomposition localizes the SYMPTOM (which pots move) but NOT the
+  mechanism; only replay+Koios data falsified 8 wakes of plausible-but-wrong 'frozen-set' reasoning. ***
   *** wake259: KILLED diagnose w79i1iplr (it ran the DEFAULT generic dims — args.dimensions did NOT reach the muscle;
   the custom-dimensions mechanism is BROKEN when launching via Workflow scriptPath+args, AVOID it / fold task into
   `item`). Did the Koios isolation MECHANICALLY (data-join; tool scripts/dev/isolate_buggy_drops.py): bech32-encoded
@@ -2773,3 +2795,11 @@
   0 have a 245 row. Saved ep246_isolation.json. UNRESOLVED (analytical): epoch alignment (Koios earned_epoch vs
   dugite boundary), amount mismatch (would_be 278M vs koios 245M for a cred), final subset + mechanism. next wake:
   muscle analyze (task in `item`, data=ep246_isolation.json) to resolve alignment+subset+reg-mechanism -> fix.
+- wake260: MEMBER-DROP HYPOTHESIS FALSIFIED. Pinned alignment: dugite ep246 reward == Koios earned_epoch 245 (3/3
+  paid creds match). All 809 dropped creds: 0 have an earned_epoch=245 Koios reward (tried 0xe1 AND 0xf1) -> Haskell
+  drops them too -> every drop LEGITIMATE. Paid amounts match Koios within rounding. So the -82,215,213 is NOT from
+  member/leader prefilter drops (fix muscle root cause WRONG) — it is under-distribution from a DIFFERENT source
+  (missing payees absent from go.delegations, or leader gap, or lower-stake amount deltas). next wake: instrument
+  full RUPD_PAID set + re-replay -> diff vs Koios earned_epoch 245 to find the missing/under-paid creds. LESSON:
+  conservation decomposition localizes the symptom-pots, NOT the mechanism; replay+Koios data beat 8 wakes of
+  plausible frozen-set reasoning.
