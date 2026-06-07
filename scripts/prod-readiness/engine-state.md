@@ -304,6 +304,20 @@
   7-subagent audit across N2N/N2C/CBOR/consensus/ledger/mempool) to surface NEW gaps — highest leverage for a cleared
   backlog. Alternatives: (A) #24 V2 inline-datum-spend pin via full-UTxO Koios capture (heavy/muscle-resistant), or (C) a
   fast-start/from-genesis sync health soak to confirm no live regression. Lock to release.
+  *** wake336 PUSH-DIVERGENCE FLAG (NEW, important — surfaced, NOT yet acted on): `git push origin main` REJECTED non-fast-
+  forward. Investigation: origin/main = `ca50afd9ef` + ONE bot commit `9b0775cbae Update nightly benchmark results
+  (2026-06-07)`; merge-base(HEAD,origin/main) = ca50afd9ef; **HEAD is 377 commits ahead of origin/main**. The nightly bot built
+  directly on ca50afd9ef ⇒ the ENTIRE engine history (every wake commit + EVERY code fix — 9c53405384 txInfoData dedup,
+  6bf88b4cbf Dijkstra, 28bcd277e6/49a2c0ce1d/d8e616d553/b43f4fa80d snapshot-hardening, add4f0b3c1 script-ref doc, etc.) was
+  NEVER actually pushed to origin/main. The prior wakes' "committed+pushed" notes are WRONG — the pushes silently failed the
+  same non-ff way each time. This is a PRE-EXISTING engine git-flow bug (push never verified-landed), surfaced now. NOT acted
+  on this wake: did NOT rebase+push 377 commits (heavy, outward-facing, and origin/main being pinned for an unknown reason
+  could be intentional — confirm before a bulk push; no user to ask in autonomous mode). The local HEAD durably holds all
+  work + this engine-state record (cross-wake memory reads the working tree, so the engine keeps functioning regardless). ***
+  NEXT WAKE / OPERATOR ACTION ITEM (do deliberately, not rushed): verify origin/main is meant to receive engine commits, then
+  `git pull --rebase origin main` (only the benign nightly to replay over; expect ZERO conflict — it touches only benchmark
+  results) and `git push origin main` to land the 377 verified commits. If origin/main is intentionally pinned, instead route
+  engine pushes to a dedicated branch. Until resolved, treat ALL "pushed" claims in this file as LOCAL-ONLY.
   *** wake335 (ultracode): RE-ASSESS wake (no backlog item — entire tractable backlog cleared wake334); historical note —
   *** wake335 (ultracode): RE-ASSESS wake (no backlog item — entire tractable backlog cleared wake334). Before generating
   new work via an audit, validating the milestone: this session landed ~13 fixes across 4 crates (dugite-ledger,
