@@ -21,6 +21,58 @@
 - perf:             at-tip CPU bounded (15 hot peers); sync ~300 blk/s Byron
 
 ## Backlog  (ranked by impact; one advanced per wake)
+# === wake339: NEW items #26-#31 from the adversarial re-audit (wf_5c21573e-92f, 6/6 refute-verified at HEAD). Full detail +
+#     byte-exact how_to_confirm in scripts/prod-readiness/.audit/reaudit-findings.md. These are CANDIDATES — each needs its
+#     Tier-A/A' gauntlet (byte-exact replay / ScriptContext dump-diff vs cardano-node) before any fix; tests-green is NOT proof. ===
+26. [H][phase2/primitives][NEW] CREDENTIAL Ord INVERSION (SYSTEMIC root, manifestation A = Voter/votes ordering). dugite
+   crates/dugite-primitives/src/credentials.rs:5-11 `Credential` = `VerificationKey(0) | Script(1)` with DERIVED Ord =>
+   Key < Script. Haskell Cardano.Ledger.Credential.Credential = `ScriptHashObj | KeyHashObj` => Script < Key (INVERTED).
+   *** SPOT-VERIFIED the core fact at HEAD this wake (read credentials.rs — derive(...,Ord) on Key-first enum). *** Manifestation:
+   Voter derives Ord (transaction.rs:501-506) → same-role voters sort Key-before-Script → (a) reversed txInfoVotes map
+   (script_context.rs:849-865 / populate_gov.rs:119-132) AND (b) Vote redeemer index resolve_vote nth(idx)
+   (redeemer_resolve.rs:318) picks the WRONG voter → wrong ScriptPurpose::Voting + wrong dispatched script = a CONSENSUS-affecting
+   phase-2 divergence (NOT caught by epoch-totals replays — they don't check per-script ScriptContext bytes). Hask refs:
+   Conway Procedures.Voter Ord, ConwayPlutusPurpose ConwayVoting via Map.toList, Conway.TxInfo.transVotingProcedures.
+   *** CAUTION: the fix is NOT a blind enum-flip — dugite's to_typed_hash32 uses key=0x00/script=0x01 (key<script) and the
+   reward/stake byte-exactness (preprod ep293 / mainnet ep247) is VALIDATED with that; flipping Credential Ord globally could
+   REGRESS those. Per-site Haskell cross-check required (where ledger uses Credential Ord vs typed-hash bytes). how_to_confirm:
+   Conway tx, 2 same-role DRep voters (one key-hash, one script-hash) + a Vote redeemer indexing the script voter; dump dugite
+   TxInfo.votes + resolved ScriptPurpose vs cardano-node ScriptContext. state:NEW attempts:0 conf:0.78
+27. [H][phase2][NEW] WITHDRAWALS (Rewarding) ordering inversion (manifestation B of the key<script vs script<key theme; DISTINCT
+   fix site from #26). tx.body.withdrawals keyed by raw 29-byte reward-account blob [header||hash28] in BTreeMap<Vec<u8>,_>
+   (transaction.rs:805) → sorts by raw bytes where key-stake header 0xE_ < script-stake 0xF_ → Key-before-Script, OPPOSITE to
+   Haskell Map RewardAccount Ord (Network then Credential, Script<Key). resolve_reward withdrawals.iter().nth(idx)
+   (redeemer_resolve.rs:256) resolves the Reward redeemer to the WRONG credential; txInfoWdrl order also reversed
+   (populate_v3.rs:107-124 V3, tx_info_populate.rs:569-583 V1/V2). Hask: Address.RewardAccount Ord, Credential Ord (Script<Key),
+   Alonzo Plutus rewarding pointer. how_to_confirm: tx with 2 withdrawals (one 0xE1 key-stake, one 0xF1 script-stake) + Reward
+   redeemer pointing at the script account; compare dugite TxInfo.wdrl + resolved purpose vs cardano-node. state:NEW attempts:0 conf:0.65
+28. [H][serialization][NEW] PlutusData decoder accepts >64-byte definite bytestrings (no bounded_bytes 64-byte cap).
+   read_plutus_data_depth reads Type::Bytes via read_bytes_owned() / BytesIndef with NO length check (era_alonzo.rs:1282-1288;
+   era_conway.rs:2576-2579; bignum mantissa era_alonzo.rs:1224/1230, era_conway.rs:2514 via read_bigint). Haskell plutus
+   PlutusCore.Data.decodeData uses decodeBoundedBytes / chunked indef; CDDL plutus_data bounded_bytes = bytes .size (0..64).
+   dugite ADMITS a tx Haskell REJECTS at deserialization → phase-1 acceptance asymmetry + datum/redeemer-hash divergence
+   (adversarial-input). how_to_confirm: PlutusData=Bytes of 65 bytes as a single definite bstr (0x58 0x41 ..) → dugite Ok vs
+   Haskell Codec.Serialise deserialise @Data error; also a 100-byte chunk must round-trip to the 64+rest chunked form. state:NEW attempts:0 conf:0.6
+29. [M][ledger/governance][NEW] TreasuryWithdrawals double-subtract in a multi-withdrawal epoch. state/governance.rs: enact
+   (line 2288 enact_gov_action_impl) physically decrements epochs.treasury when a TreasuryWithdrawals action enacts, AND
+   ratify_proposals_impl independently accumulates disbursed withdrawals and subtracts them again from the remaining-treasury
+   cap (remaining_treasury :2733, accumulator :2760-2765) → the 2nd+ withdrawal in the same epoch is wrongly blocked. Hask:
+   Conway.Rules.Ratify withdrawalCanWithdraw (sum withdrawals <= ensTreasury, ONE cap check) + Conway.Rules.Enact
+   enactmentTransition. Tier A. how_to_confirm: treasury=1000M, two 400M TreasuryWithdrawals (distinct registered accts), both
+   with passing DRep+CC votes; process_epoch_transition → both must enact (treasury 200M), dugite likely blocks the 2nd. state:NEW attempts:0 conf:0.78
+30. [M][phase2][NEW] txInfoSignatories preserves on-wire order instead of Set.toList sorted+deduped.
+   required_signers_to_plutus_padded (tx_info_populate.rs:481-485) maps Vec<Hash32> in wire order, no sort/dedup; wire Vec
+   preserved (era decoders read_set only strips tag-258, no sort/dedup). Haskell txInfoSignatories = Set.toList
+   (reqSignerHashesTxBodyL :: Set) → ascending+deduped. Out-of-order or duplicate required_signers → different ScriptContext +
+   different ExUnit cost. Used by all populate_tx_info_v{1,2,3}. how_to_confirm: tx with required_signers out of ascending byte
+   order (or a dup) → dump TxInfo.signatories vs cardano-node. state:NEW attempts:0 conf:0.6
+31. [M][serialization][NEW] Witness-set decoders silently skip unknown map keys (the #537/#539 silent-skip class, new site).
+   Alonzo/Babbage/Conway tx-witness-set map decoders fall through `_ => { r.skip()? }` for keys outside 0..7 (era_alonzo.rs:
+   1019-1021, era_babbage.rs:~910-912, era_conway.rs:2232-2234), silently discarding. Haskell decodes via SparseKeyed
+   ("TxWits", decodeKeyedSparse) which HARD-FAILS on an unknown key. dugite admits txs Haskell rejects (adversarial-input;
+   dugite-node is hostile-environment software, default-to-reject). NOTE there are explicit tests asserting the skip — those
+   must be updated to expect rejection. how_to_confirm: Conway witness-set map with extra key=8 appended → dugite decode Ok
+   (field skipped) vs cardano-ledger decCBOR @(TxWits) error. state:NEW attempts:0 conf:0.55
 23. [M][phase2][REPRODUCED-AT-HEAD wake323] Babbage V2-Spend BUDGET over-cost (the #730 "fixed-delta structural-context"
    residual). 363/363 tx0 dumps in phase2-dumps-730val/ (769 total across tx-indices) STILL diverge at HEAD via
    examples/phase2_repro: is_valid(on-chain)=true but dugite=Err, ~257 "budget exhausted" near-edge (mem_remaining 291/371,
@@ -280,7 +332,28 @@
    reconstruction + #7 sub-tx forward). state:DONE attempts:0
 
 ## In-progress
-- item: RE-AUDIT (cleared backlog) — adversarial re-audit IN-FLIGHT (whk03t6kd / wf_b85f1761-d60) to generate new backlog. PUSH-MODEL CORRECTED. #24 DEFERRED.
+- item: RE-AUDIT DONE → 6 NEW backlog items #26-#31 filed (3×[H], 3×[M]). NEXT WAKE: SCHEDULE #26 (Credential Ord inversion) — highest impact + spot-verified.
+  *** wake339 (ultracode): the re-audit COMPLETED and 6/6 findings are filed. Path was bumpy — RECORD THE LESSON: a
+  backgrounded Workflow DIES when the launching wake's TURN ENDS (wake337 launched whk03t6kd, then stopped → the 6 finders were
+  KILLED ~2min in, mid-investigation, journal 6 started/0 completed, no findings). FIX APPLIED: re-launched fresh (wl42ygj07 /
+  wf_5c21573e-92f) and HOSTED IT IN-TURN via a Bash-background poll (by85orn8c) that keeps the session alive across the
+  workflow's ~11min run. The poll exited at ~9min with 14/15 agents done + synthesis (15th) stalled mid-Write (turn-gap again);
+  I RECOVERED the 6 confirmed findings directly from the synthesis agent's in-context payload JSON and wrote the findings file
+  myself — THEN the workflow's own completion notification landed (it had finished: confirmed_count=6, file written, 1.29M
+  subagent tokens / 15 agents / 377 tool-uses / 11.4min). Both routes agree. *** ENGINE RULE (NEW, important): never
+  launch-and-stop a Workflow — host it in-turn to completion (Bash-background poll until the durable output file exists), or its
+  subagents get orphaned + killed at turn-end. *** FINDINGS (all refute-verified at HEAD; full detail + byte-exact how_to_confirm
+  in scripts/prod-readiness/.audit/reaudit-findings.md): #26 [H] Credential Ord INVERSION (dugite Key<Script vs Haskell
+  Script<Key — SPOT-VERIFIED the enum this wake) → Voter/votes mis-order + wrong Vote-redeemer dispatch (SYSTEMIC root; #27 is
+  the withdrawals manifestation; CAUTION: not a blind enum-flip, to_typed_hash32 key=0x00/script=0x01 underpins the VALIDATED
+  reward/stake byte-exactness — per-site Haskell cross-check required); #27 [H] Withdrawals(Rewarding) raw-blob key-before-script
+  vs Haskell script<key; #28 [H] PlutusData decoder accepts >64-byte definite bstr (no bounded_bytes cap); #29 [M]
+  TreasuryWithdrawals double-subtract in multi-withdrawal epoch; #30 [M] txInfoSignatories wire-order vs Set.toList sorted;
+  #31 [M] witness-set decoders silent-skip unknown keys (#537/#539 class, new site). *** NEXT WAKE — SCHEDULE #26 and DRIVE
+  NEW→ANALYZING via the muscle (mode:analyze) to get the canonical Haskell Credential-Ord usage map (which ledger/ScriptContext
+  sites sort by Credential Ord vs by typed-hash bytes) BEFORE any fix — this decides whether the fix is at the Credential level
+  or per-consumer, and guards the validated reward/stake byte-exactness. Lock to release (this wake hosted the audit in-turn so
+  the lock was held the whole ~11min — within TTL was tight; OK).
   *** wake337 (ultracode): two material things. (1) PUSH-MODEL CORRECTED — supersedes the wake336 "push-divergence" flag.
   Investigated origin/main: it is HUMAN-CURATED by the user (Michael Fazio) — PR merges ("Merge #727: byte-exact ledger
   rewards (#11)"), clean focused commits; last human commit ca50afd9ef 2026-06-06; only a github-actions nightly-benchmark bot
@@ -2693,8 +2766,9 @@
   -> fix (worktree, Tier A) -> VERIFYING replay (reuse db-clones/preprod-ep57) -> gauntlet.
 
 ## Running jobs
-- re-audit whk03t6kd (Workflow wf_b85f1761-d60, reaudit.workflow.js) — IN-FLIGHT (launched wake337). 6 finders → refute-verify
-  → synthesis writes scripts/prod-readiness/.audit/reaudit-findings.md. Next wake: poll done + file confirmed findings as backlog.
+- re-audit — DONE wake339. Run 1 whk03t6kd/wf_b85f1761-d60 KILLED at wake337 turn-end (launch-and-stop orphans subagents). Run 2
+  wl42ygj07/wf_5c21573e-92f COMPLETED in-turn (6 confirmed findings → #26-#31; findings file scripts/prod-readiness/.audit/
+  reaudit-findings.md). No running jobs now.
 - NOTE wake337: every entry BELOW this line is STALE (the #10/#15 verify jobs from ~wake106, long superseded; #10 FINAL-DONE +
   backlog cleared). The heavyop-lock's "live-soak pid 99162" is a DEAD-pid stale lock (health node_pids="" / rss_mb 0) — it
   self-reclaims on next acquire (runbook 1.7). Left below for history; ignore for scheduling.
@@ -2900,6 +2974,7 @@
 - 2026-06-08T06:xxZ wake334(+cont) ~ #16 doc-only invariant fix (clippy+fmt+test green) + commit/push add4f0b3c1 → TRACTABLE BACKLOG CLEARED
 - 2026-06-08T16:xxZ wake335-336 ~ RE-ASSESS: full workspace CI gate b7kr6pyuw RESOLVED green (sole fail=dugite-monitor probe timing-flake, passes isolated; all 4 session crates verified clean) — milestone baseline solid; flagged push-divergence
 - 2026-06-08T17:27Z wake337 ~ push-model CORRECTED (origin/main human-curated; engine commits local-only, no origin push) + launched adversarial re-audit Workflow whk03t6kd (6 finders→refute-verify→findings file)
+- 2026-06-08T17:46Z wake339 ~ re-audit COMPLETED in-turn (wl42ygj07, 1.29M subagent tokens/15 agents/11.4min) → filed 6 new backlog items #26-#31 (3H/3M); spot-verified #26 Credential-Ord inversion; LESSON: host Workflows in-turn (launch-and-stop orphans subagents)
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -4483,3 +4558,11 @@
   cbor-strictness / consensus-header-vrf-kes / epoch-snapshot-stake) → refute-by-default per-finding verify → synthesis writes
   scripts/prod-readiness/.audit/reaudit-findings.md. Runs in background; next wake polls + files confirmed findings as backlog
   items (each with a byte-exact how_to_confirm). Lock released; no origin push (by the corrected model).
+- wake338 2026-06-08 (×2): both cron fires STOPPED on `busy` (age 492s/574s) — wake339 was hosting the re-audit in-turn. Correct.
+- wake339 2026-06-08: re-audit RECOVERY + completion. wake337's launch-and-stop had KILLED the first run (whk03t6kd) at turn-end
+  (6 finders mid-flight, 0 completed). Re-launched fresh (wl42ygj07) and HOSTED IN-TURN via a Bash-background poll → it ran the
+  full pipeline (6 find → refute-verify → synthesis, 1.29M tokens/15 agents/11.4min). Synthesis stalled mid-Write at the
+  poll's turn-gap; recovered the 6 confirmed findings from its in-context payload + wrote the file; the workflow's own
+  completion then landed (agreeing). Filed 6 new backlog items #26-#31 (3 H / 3 M), spot-verified the #26 Credential-Ord-
+  inversion core fact (credentials.rs Key<Script enum vs Haskell Script<Key). LESSON recorded: never launch-and-stop a
+  Workflow — host in-turn. NEXT: SCHEDULE #26 → analyze the Credential-Ord usage map before fixing. No origin push (local model).
