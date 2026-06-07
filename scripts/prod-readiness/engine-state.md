@@ -395,7 +395,28 @@
    PASSES (test_conway/alonzo/babbage/mary/shelley_block + test_decode_block_dijkstra_native_dispatch — honest blocks decode
    unchanged); new tests conway_rejects_dijkstra_only_keys + dijkstra_accepts_23_25_26 + conway_rejects_key6 +
    dijkstra_unknown_key99_rejected all PASS; lenient cost_models_unknown_keys_ignored + pparam_update_unknown_key_skipped UNTOUCHED
-   + pass; fmt=0 clippy=0 nextest 1179/1179. #31-B state:B-DONE attempts:1 conf:0.95 COMMITTED 777e0b9844 wake412 (gauntlet wmics7ixo PASSED 0/3 gold-standard: again caught the v12+ WebFetch hallucination via raw-source; real blocks decode). #31-C/D/E remain. *** NEXT WAKE — GAUNTLET #31-B (era-aware
+   + pass; fmt=0 clippy=0 nextest 1179/1179. #31-B state:B-DONE attempts:1 conf:0.95 COMMITTED 777e0b9844 wake412 (gauntlet wmics7ixo PASSED 0/3 gold-standard: again caught the v12+ WebFetch hallucination via raw-source; real blocks decode).
+   *** #31-C ROOT-CAUSED wake416 (diagnose Workflow wjxy38j1r, conf 0.92; Haskell re-confirmed via TWO independent raw-source
+   fetches — the hallucination guard). HASKELL: PV9+ decodeSet → decodeSetEnforceNoDuplicates → decodeListLikeEnforceNoDuplicates
+   `when (len /= count) $ fail` (count=physical items decoded, len=Set.size of the Ord-dedup'd result → any dup makes len<count →
+   HARD-FAIL the whole CBOR object). PV-gated at EXACTLY natVersion @9; pre-PV9 (Alonzo PV5-6 / Babbage PV7-8) LENIENT (Set.fromList
+   silent dedup, accepts dups). Ordering NEVER enforced (Set not OSet; allowTag 258 optional). Applies to ALL tag-258 Set +
+   nonempty_set fields. DUGITE GAP: read_set (reader.rs:213-226) strips tag-258 + read_array, NO dedup/count-check → all tag-258
+   sets accept dups at PV9+. *** ARCHITECTURE (the key insight): the Reader carries NO protocol_major/era, and NONE IS NEEDED —
+   dugite's Conway decoders (decode_conway_tx_body :448, decode_conway_witness_set :2160) are PRIVATE fns reachable ONLY from
+   Conway/Dijkstra entry points (grep-verified zero pre-Conway callers; both are statically PV9+). FIX = add a read_set_strict
+   variant (count-check) called by the ~19 CONWAY sites; leave pre-Conway/span/test sites on the plain lenient read_set → STATIC
+   dispatch, no runtime PV, ZERO over-strictness risk for Alonzo/Babbage. STRICT TARGETS (~19): body inputs:531/certs:545/
+   collateral:569/required_signers:584/reference_inputs:622/proposal_procedures:630; Dijkstra sub-tx 823/839; witness vkey:2179/
+   native:2193/bootstrap:2197/plutus_v1:2218/plutus_data:2225/plutus_v2:2236/plutus_v3:2240; block invalid_transactions:210;
+   Conway pool_owners:1551; members_to_remove:1850. LENIENT (DO NOT change): era_shelley:798 + era_alonzo:817 pool_owners,
+   era_alonzo:1187 plutus_data_element_spans (span-reconstruction), test-only :3058/3072. *** FIX-TIME VERIFY (2 flagged
+   subtleties): (i) DEDUP KEY — raw-element-byte dedup is simplest + coincides with Haskell value-Ord dedup for CANONICAL CBOR,
+   but is more LENIENT for a non-canonical-encoding-of-the-same-value dup (theoretical adversarial edge; value-Ord would be
+   byte-exact but needs Eq/Hash on T). Decide raw-byte (simple) vs value-Ord at fix; note the residual. (ii) proposal_procedures
+   (:630) — VERIFY it is a Set (read_set, dedup) vs an OSet (ordered, separate decoder) in Conway CDDL before making it strict.
+   (iii) PERMALINK — resolve cardano-ledger master SHA + pin Decoder.hs line range at fix (URL targets mutable master).
+   #31-C state:ROOT-CAUSED attempts:0 conf:0.92. NEXT: FIXING #31-C (read_set_strict + ~19 sites, static dispatch). #31-D/E remain. *** NEXT WAKE — GAUNTLET #31-B (era-aware
    Haskell-key-set match per era + over-rejection lens: every valid Conway/Dijkstra key still accepted, real blocks decode; the
    key-6-reject correctness; v12+ gate) → commit. #31-C/D/E remain. *** NEXT WAKE — GAUNTLET #31-A (Haskell-reject match + over-strictness lens:
    confirm only witness-set rejects, body/CostModels/PParamUpdate lenient preserved) → commit. Then #31-B/C/D as separate steps.
@@ -658,7 +679,14 @@
    reconstruction + #7 sub-tx forward). state:DONE attempts:0
 
 ## In-progress
-- item: #31-B DONE (committed 777e0b9844) — era-aware tx-body reject, gauntlet PASSED 0/3 gold-standard. NEXT: #31-C (Conway PV9+ set-dedup = the folded #30 fix-B).
+- item: #31-C Conway PV9+ set-dedup ROOT-CAUSED (conf 0.92; read_set_strict via static dispatch — no PV-threading needed). NEXT: FIXING #31-C.
+  *** wake416 (ultracode): SCHEDULE #31-C, DRIVE NEW→ROOT-CAUSED. diagnose Workflow wjxy38j1r (in-turn, conf 0.92; Haskell
+  re-confirmed via 2 independent RAW-source fetches). PV9+ decodeSetEnforceNoDuplicates `when len/=count fail` (Ord-dedup count-
+  check); pre-PV9 lenient; all tag-258 sets. KEY ARCHITECTURE: Reader carries no PV but none needed — Conway decoders are private,
+  statically PV9+, zero pre-Conway callers (grep-verified). FIX = read_set_strict variant for the ~19 Conway sites; pre-Conway/
+  span/test stay plain lenient → static dispatch, zero over-strictness risk. FIX-TIME VERIFY: dedup-key (raw-byte vs value-Ord
+  for non-canonical edge), proposal_procedures Set-vs-OSet, permalink-pin master SHA. NEXT WAKE: SCHEDULE #31-C FIXING. #31-D
+  (dup-map-key), #31-E (pre-Conway body) remain.
   *** wake412 (ultracode): ran the #31-B gauntlet (wmics7ixo, 3 lenses) → PASSED 0/3, gold-standard: lens1 re-confirmed raw
   cardano-ledger (cd8b7fab) + AGAIN caught the WebFetch v12+ hallucination ("_ -> Nothing silently ignored") via raw-source read;
   exact Conway {0-5,7-9,11,13-22} + Dijkstra {+23,25,26} (key 24 SubTx-only); lens2 over-rejection — real blocks 110/110 decode,
@@ -3610,6 +3638,7 @@
 - 2026-06-09T04:00Z wake404 ~ #31-B NEW→ROOT-CAUSED: diagnose w075p3s3n (in-turn, conf 0.95, permalink-pinned) pinned exact Conway {0-5,7-9,11,13-22} vs Dijkstra +{23,25,26} body-key sets; era-aware fix (thread era, guard 23/25/26, DELETE key-6 skip — corrects #31-A hint). Filed #31-E. Next FIXING #31-B
 - 2026-06-09T04:30Z wake408 ~ #31-B ROOT-CAUSED→FIXING: fix Workflow wumudjsu8 (in-turn) era-aware tx-body reject (thread era, guard 23/25/26, delete key-6 skip); OVER-REJECTION GUARD verified (Conway/Dijkstra key sets, real blocks decode); 1179/1179. Uncommitted; gauntlet next
 - 2026-06-09T05:00Z wake412 ~ #31-B gauntlet wmics7ixo PASSED 0/3 gold-standard (raw-source recheck AGAIN caught the v12+ WebFetch hallucination; exact Conway/Dijkstra key sets; real blocks decode; over-rejection guard clean). COMMITTED 777e0b9844. #31-B DONE. Next #31-C
+- 2026-06-09T05:30Z wake416 ~ #31-C NEW→ROOT-CAUSED: diagnose wjxy38j1r (in-turn, conf 0.92, 2 raw-source fetches) — PV9+ decodeSetEnforceNoDuplicates count-check; fix=read_set_strict for ~19 Conway sites via static dispatch (Conway decoders statically PV9+, no pre-Conway callers → zero over-strictness). Flagged dedup-key + proposal_procedures Set/OSet. Next FIXING #31-C
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -5323,3 +5352,8 @@
   cardano-ledger source + AGAIN caught the WebFetch v12+ version-gate hallucination (read Decoder.hs in full); exact Conway/
   Dijkstra key sets verified; lens2 over-rejection (real blocks 110/110 decode, era threaded everywhere); lens3 commit-safe.
   COMMITTED 777e0b9844 (dugite-serialization, 1 crate). #31-B DONE. NEXT: #31-C (Conway PV9+ set-dedup).
+- wake416 2026-06-09: SCHEDULE #31-C, DRIVE NEW→ROOT-CAUSED. diagnose Workflow wjxy38j1r (in-turn, conf 0.92, Haskell re-confirmed
+  via 2 raw-source fetches). PV9+ decodeSetEnforceNoDuplicates count-check (any dup → hard fail); pre-PV9 lenient. KEY: Conway
+  decoders are statically PV9+ (no pre-Conway callers) → fix = read_set_strict for the ~19 Conway sites via static dispatch, no
+  PV-threading, zero over-strictness risk. Flagged: dedup-key (raw-byte vs value-Ord), proposal_procedures Set/OSet, permalink-pin.
+  state:ROOT-CAUSED. NEXT: FIXING #31-C.
