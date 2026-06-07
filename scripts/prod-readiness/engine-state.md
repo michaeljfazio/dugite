@@ -209,7 +209,23 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #15 (phase-2 serialiseData verbatim-bytes) state:GAUNTLET-PENDING. *** wake211 BYTE-EXACT GATE PASSED:
+- item: #15 (phase-2 serialiseData verbatim-bytes) state:DIAGNOSING (gauntlet REFUTED 3/3 — PROFOUND, may REVERSE
+  the whole memo approach). *** wake213: GAUNTLET w4a16gr1r REFUTED 3/3. R1 (haskell-semantics, DEEP): the
+  serialiseData BUILTIN is NOT verbatim-MemoBytes — transDatum/transRedeemer call getPlutusData (STRIPS MemoBytes) ->
+  PlutusCore.Data.Data (no bytes) -> Serialise `encode=encodeData` ALWAYS CANONICAL. So serialiseData = PlutusCore-
+  canonical encodeData, NEVER verbatim. The 306->0 replay passed ONLY because ep293 datums are ALREADY PlutusCore-
+  canonical (verbatim==canonical); the REAL bug is dugite encode_data (data.rs) not byte-matching PlutusCore
+  encodeData (270 vs on-chain 276). MY ANALYSIS CONFIRMS THE LOGIC: a NON-canonical datum spent by a blake2b(serialise
+  Data(datum))==datum_hash script is is_valid=FALSE on-chain (canonical != non-canonical -> hash mismatch -> fail),
+  but dugite-with-memo returns verbatim -> hash matches -> WRONGLY is_valid=TRUE = a silent pass-where-Haskell-fails.
+  R2/R3: redeemers not memoised (asymmetric) — MOOT if serialiseData is canonical (then the fix is encoder, no memo).
+  *** This means the #15 memo fix is likely the WRONG approach (passes replay for the wrong reason). DO NOT COMMIT.
+  Launched ANALYZE muscle wpkh7n7c9 (run wf_959aaeab-33f, opus) to SETTLE authoritatively vs PlutusCore source: Q1
+  serialiseData canonical-vs-verbatim, Q2 exact encodeData rules, Q3 is ep293 datum PlutusCore-canonical + where is
+  dugite's 270-vs-276 encode_data delta, Q4 verdict (memo-correct vs revert-memo+fix-encoder). #15 memo KEPT on main
+  (uncommitted) pending verdict. NEXT WAKE: on analyze verdict — if encoder-fix: REVERT memo, fix data.rs encode_data
+  to byte-match PlutusCore encodeData, re-replay (306->0 correctly + non-canonical class correct), re-gauntlet.
+  *** wake211 BYTE-EXACT GATE PASSED:
   V3-extension fix w19kofqwx (eval_redeemer.rs + redeemer_resolve.rs: resolve_spend_datum_optional resolves V3
   spending datum per getBabbageSpendingDatum [inline <|> witness, None if datum-less]; eval_redeemer builds V3
   SpendingScriptInfo datum via plutus_data_to_data_memoised = VERBATIM). DROVE: copied 2 files to main (dugite-uplc
@@ -1442,6 +1458,12 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
+- wake213 2026-06-07: #15 GAUNTLET w4a16gr1r REFUTED 3/3 (PROFOUND). R1: serialiseData builtin = PlutusCore-CANONICAL
+  encodeData (getPlutusData strips MemoBytes), NOT verbatim -> the memo is likely the WRONG approach; real bug =
+  dugite encode_data != PlutusCore encodeData (270 vs 276). Replay passed for the wrong reason (ep293 datums already
+  canonical). Memo makes dugite WRONGLY pass non-canonical-datum failed-script txs (silent pass-where-Haskell-fails).
+  GAUNTLET-PENDING -> DIAGNOSING; launched ANALYZE wpkh7n7c9 (opus) to settle vs PlutusCore source. DO NOT commit.
+  NEXT WAKE: verdict -> likely revert memo + fix encode_data. (Gauntlet caught a fix that passed replay for wrong reason.)
 - wake212 2026-06-07: POLL #15 GAUNTLET w4a16gr1r — still RUNNING (0/3 votes, active). No transition. Disk 169G, no
   nodes. #15 stays GAUNTLET-PENDING (byte-exact gate already passed: 306->0 full window). NEXT WAKE: on PASS -> commit
   #15 (dugite-uplc, 1 crate).
