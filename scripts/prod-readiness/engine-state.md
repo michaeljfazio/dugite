@@ -314,7 +314,7 @@
    required_signers_to_plutus (:288) is TEST-ONLY (sole caller is the test at :1260) — NOT on the live txInfoSignatories path
    (populate_v1_v2.rs:62/112 + populate_v3.rs:91 all use _padded), left untouched. *** INDEPENDENTLY VERIFIED: fmt=0 clippy=0
    nextest 448/448 incl. the new test + the real onchain_babbage budget test (no regression — honest signers are canonical so
-   the sort is a no-op). state:GAUNTLET attempts:1 conf:0.9. *** NEXT WAKE — GAUNTLET (lenses: Set.toList exact match incl.
+   the sort is a no-op). state:DONE attempts:1 conf:0.95 COMMITTED 42bf522984 wake388 (gauntlet wgvyqtxj0 PASSED 0/3 substantive + permalink-reconfirmed + PackedBytes-endianness check). superseded *** NEXT WAKE — GAUNTLET (lenses: Set.toList exact match incl.
    permalink-reconfirm transTxBodyReqSignerHashes per the diagnose caveat; over-canonicalization [does Haskell sort for ALL
    eras — diagnose says yes, shared Alonzo helper]; completeness [any other live signatories path; is (A) sufficient for
    txInfoSignatories CONTENT or does (B) decode-strictness matter for commit]) → commit on pass.
@@ -584,7 +584,14 @@
    reconstruction + #7 sub-tx forward). state:DONE attempts:0
 
 ## In-progress
-- item: #30 FIXING (A) DONE (sort+dedup in required_signers_to_plutus_padded; 448/448) → state:GAUNTLET. NEXT: gauntlet → commit.
+- item: #30 DONE (committed 42bf522984) — txInfoSignatories sort+dedup = Set.toList, gauntlet PASSED 0/3. NEXT: #31 [M] witness-set silent-skip (+ #30 fix-B Conway set dup-reject).
+  *** wake388 (ultracode): ran the #30 gauntlet (wgvyqtxj0, 3 lenses) → PASSED 0/3, each lens substantive + permalink-reconfirmed
+  the Haskell source (Alonzo transTxBodyReqSignerHashes Set.toList, V1/V2/V3) — including a deep PackedBytes big-endian Ord
+  check confirming [u8;28]-derived-Ord == byte-lexicographic (a subtle little-endian-would-break-it case, ruled out). _padded is
+  the sole live producer; (A) byte-exact, honest txs unchanged. COMMITTED 42bf522984 (dugite-uplc, local). #30 CLOSED. ***
+  REMAINING backlog: #31 [M] witness-set decoders silent-skip unknown keys (+ FOLD IN #30 fix-B: Conway PV9+ reject-duplicates-
+  at-decode for tag-258 Set fields — same Conway-set-strictness cluster), #28b [M] encoder must chunk >64B leaves, #29-order [L],
+  #26b (gov-map ordering), #24 (deferred). NEXT WAKE: SCHEDULE #31 → DIAGNOSE.
   *** wake384 (ultracode): DRIVE #30 ROOT-CAUSED→FIXING (A). Applied the trivial sort+dedup directly (matches dugite's existing
   Set.toList convention for inputs/withdrawals/datums/voters — required_signers was the lone wire-order field). PubKeyHash=[u8;28]
   derived Ord == Haskell Ord(KeyHash) → reproduces Set.toList for V1/V2/V3 in one helper. Added a canonicalisation test
@@ -3264,6 +3271,15 @@
 - db-clones/preprod-ep57-fixed   (fixed-binary replay, in progress)
 
 ## Gauntlet ledger  (passed/refuted approaches — never silently retry a REFUTED)
+- PASSED 2026-06-09 (wake388, #30 txInfoSignatories sort+dedup, gauntlet wgvyqtxj0): 0/3 refute, each lens SUBSTANTIVE +
+  PERMALINK-RECONFIRMED against current cardano-ledger master. (1) Set.toList exact match: Alonzo TxInfo.hs:311-312
+  transTxBodyReqSignerHashes = transKeyHash <$> Set.toList(reqSignerHashes), reused for V1/V2/V3 (Conway L424/466/511); +
+  a DEEP check that Ord(PackedBytes 28) compares words MSW-first with BIG-ENDIAN packing → word-compare == byte-lexicographic
+  over the 28 bytes (little-endian would have broken the [u8;28]-derived-Ord equivalence; it doesn't); sort() before dedup().
+  (2) over-canonicalization: Haskell genuinely sorts+dedups for ALL eras (reqSignerHashes is a Set every era, no list/wire-order
+  path); edit scope +40/-1 clean. (3) completeness/commit-safety: required_signers_to_plutus_padded is the SOLE live producer
+  (skeleton builders + Hash28 variant are test-only); (A) byte-exact content, honest txs unchanged; (B) Conway dup-reject
+  orthogonal (#31). COMMITTED 42bf522984 (1 crate dugite-uplc).
 - PASSED 2026-06-09 (wake376, #29 cap_treasury REWORK, gauntlet w7yhosc8m): 0/3 refute, each lens SUBSTANTIVE (read code +
   cross-checked conway.md). (1) cap_treasury == Haskell ensTreasury byte-for-byte: init at pass-start, FULL-fold decrement for
   registered AND unregistered, threaded (mut outside loop), compared as withdrawalCanWithdraw, decrements only for Treasury-
@@ -3452,6 +3468,7 @@
 - 2026-06-09T00:30Z wake376 ~ #29 re-gauntlet w7yhosc8m PASSED 0/3 (substantive, cross-checked conway.md): cap_treasury==ensTreasury byte-exact, casTreasury untouched, no leak, ep247 pre-Conway. COMMITTED f816efc9b1. #29 DONE. Filed #29-order [L]. Next #30
 - 2026-06-09T01:00Z wake380 ~ #30 NEW→ROOT-CAUSED: diagnose w9r1peyto (in-turn, conf 0.9) source-confirmed Haskell txInfoSignatories=Set.toList sort+dedup (V1/V2/V3) + Conway PV9+ dup-reject-at-decode. dugite's lone uncanonicalized Set field. Fix=sort+dedup in builder; (B) dup-reject→#31. Next FIXING
 - 2026-06-09T01:30Z wake384 ~ #30 ROOT-CAUSED→FIXING (A): sort+dedup in required_signers_to_plutus_padded (matches dugite's existing Set.toList convention; V1/V2/V3 in one helper) + canonicalisation test; INDEPENDENTLY verified 448/448. Uncommitted; gauntlet next
+- 2026-06-09T02:00Z wake388 ~ #30 gauntlet wgvyqtxj0 PASSED 0/3 (substantive, permalink-reconfirmed + PackedBytes-endianness check): sort+dedup==Set.toList for V1/V2/V3, sole live producer. COMMITTED 42bf522984. #30 DONE. Next #31
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -5134,3 +5151,7 @@
   2-line fix matching dugite's existing Set.toList convention; PubKeyHash derived Ord == Haskell Ord(KeyHash); fixes V1/V2/V3 in
   one helper). Added a canonicalisation test. Scoped to the live _padded builder (Hash28 variant :288 is test-only). INDEPENDENTLY
   verified fmt+clippy+nextest 448/448 incl. the new test + real onchain_babbage budget. Uncommitted; gauntlet next. state:GAUNTLET.
+- wake388 2026-06-09: ran the #30 gauntlet (wgvyqtxj0, 3 lenses, in-turn) → PASSED 0/3, substantive + permalink-reconfirmed
+  (Alonzo transTxBodyReqSignerHashes Set.toList V1/V2/V3 + a deep PackedBytes big-endian Ord-equivalence check). _padded is the
+  sole live signatories producer; (A) byte-exact, honest txs unchanged. COMMITTED 42bf522984 (dugite-uplc, 1 crate). #30 DONE.
+  NEXT: #31 (fold in #30 fix-B Conway set dup-reject).
