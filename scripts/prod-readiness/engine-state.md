@@ -225,7 +225,33 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #17 (Mithril snapshot CRC not verified) state:ROOT-CAUSED attempts:0 — analyze DONE (conf 0.98, byte-exact empirically verified). NEXT WAKE: FIXING.
+- item: #17 (Mithril snapshot CRC not verified) state:FIXING attempts:0 — fix implemented + both crates compile (UNCOMMITTED). NEXT WAKE: VERIFYING.
+  *** wake319 (ultracode): #17 ROOT-CAUSED→FIXING (one step). Hand-applied the fully-specified, byte-exact-validated fix
+  (analyze w2ez2r1lk did the analytical work; like #6/#20c, implementing a fully-specified fix is mechanical). 2 CRATES:
+  *** dugite-serialization/src/mempack/mod.rs: (a) generalized the proven aeson Word8 scientific parser to a bound-param
+  `scientific_literal_as_bounded(literal, max)` + thin `scientific_literal_as_word8` wrapper + `decimal_digit_count`
+  helper (Word8 behavior PROVEN preserved: danger_threshold for 255 = 3 digits = the original `net_exp >= 3`); (b) added
+  `parse_snapshot_checksum(meta)->Result<u32>` (aeson-faithful first-occurrence + top-level-literal + toBoundedInteger
+  @Word32, rejects absent/null/non-number/non-integral/OOB); (c) added `snapshot_crc_of_concat(state_crc, tables_crc:
+  Option<u32>)->u32` = crc32fast::hash(format!("{state}{tables}")) with None→state-only (the byte-exact crcOfConcat
+  decimal-ASCII fold). + added crc32fast={workspace=true} to dugite-serialization/Cargo.toml. + 6 unit tests in
+  mempack/tests.rs (byte-exact vs the 2 REAL preprod fixtures 2003040462/4175236221→2409556997 & 226322584/1678180760→
+  4213652121; decimal-ASCII-not-raw-concat; tables-absent→state; single-byte-corruption detection on state AND tables;
+  parse valid incl Word32-max/first-wins-dup/float-syntax 100e-2==1; parse rejects absent/null/string/OOB/negative/1.5/
+  non-object). *** dugite-node/src/node/mod.rs import_haskell_ledger_snapshot: added a CRC-verify block right after the
+  state blob is read (before decode) — reads <snap>/meta, parse_snapshot_checksum, computes crcOfConcat over
+  crc32fast::hash(state_data) + Option(crc32fast::hash(tables blob via resolve_inmemory_tables_path)), anyhow::bail!
+  (ReadSnapshotDataCorruption) on mismatch. (Localized own tables read for CRC — left the working UTxO-load block
+  untouched; one-time import double-read of tables ~1s, acceptable + low-risk.) *** BUILD: cargo test --no-run -p
+  dugite-serialization OK (all test exes built); cargo check -p dugite-node Finished clean (3m05s). Files: mempack/mod.rs
+  + mempack/tests.rs + dugite-serialization/Cargo.toml + node/mod.rs (2 crates; common.rs M = pre-existing #730,
+  untouched). Fix UNCOMMITTED. *** NEXT WAKE (VERIFYING): cargo nextest run -p dugite-serialization (the byte-exact-vs-
+  real-fixture test snapshot_crc_of_concat_matches_real_preprod_fixtures is THE proof; + corruption-detection + parse
+  tests) + cargo nextest run -p dugite-node + clippy --all-targets -D warnings (BOTH crates) + fmt --check. Confirm the
+  refactor didn't regress the existing Word8/tablesCodecVersion tests. Since #17 is a security/code-invariant (reference =
+  Haskell reject behavior + the byte-exact crcOfConcat vs real snapshots, no Koios), the real-fixture byte-exact test +
+  corruption-detection IS the gauntlet. On green → focused 2-crate commit + push. (Optional later: a full import-path
+  integration test driving a synthetic minimal snapshot dir to assert end-to-end rejection — not required to land #17.)
   *** wake318-cont (ultracode): muscle analyze w2ez2r1lk COMPLETED → #17 ANALYZING→ROOT-CAUSED (conf 0.98). *** ROOT CAUSE:
   dugite reads the snapshot `checksum` meta but NEVER computes/compares a CRC → a snapshot with valid meta (backend=
   utxohd-mem, tablesCodecVersion=1) but a tampered/truncated-yet-MemPack-decodable state|tables byte is SILENTLY ACCEPTED.
