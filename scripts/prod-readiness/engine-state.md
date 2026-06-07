@@ -385,7 +385,19 @@
    Conway-rejects-key6 tests. CAVEAT: Dijkstra unreleased (TxBody could change pre-PV12); Conway is mainnet-stable, higher-stakes.
    SIBLING (out of #31-B scope) → filed #31-E: pre-Conway BODY unknown-key reject (Shelley/Allegra/Mary/Alonzo/Babbage bodies,
    same SparseKeyed/invalidField; flip shelley_body_unknown_key_skipped era_shelley:2247 + the per-era body sets). #31-B state:
-   ROOT-CAUSED attempts:0 conf:0.95. NEXT: FIXING #31-B. #31-C/D/E remain. *** NEXT WAKE — GAUNTLET #31-A (Haskell-reject match + over-strictness lens:
+   ROOT-CAUSED attempts:0 conf:0.95.
+   *** #31-B FIXING DONE wake408 (fix Workflow wumudjsu8, in-turn; patch candidate-fix-31b-body-reject.patch; 1 file era_conway.rs).
+   Added `era: Era` to decode_conway_tx_body, threaded from all callers (block decoder :177 closure `|r| ..(r,era)`, conway
+   standalone :2803, dijkstra standalone :2901=Era::Dijkstra, test callers). Guarded 23/25/26 arms with `if era==Era::Dijkstra`
+   (Conway falls through to reject). DELETED the `6 => skip` arm. Era-aware reject default `Err(CborDecode("{era:?} tx body:
+   unknown/invalid key {key}"))`. *** OVER-REJECTION GUARD INDEPENDENTLY VERIFIED (#438, the #1 risk = consensus break): Conway
+   accepts EXACTLY {0,1,2,3,4,5,7,8,9,11,13..22} (all unconditional arms), Dijkstra adds {23,25,26} (guarded); real-blocks suite
+   PASSES (test_conway/alonzo/babbage/mary/shelley_block + test_decode_block_dijkstra_native_dispatch — honest blocks decode
+   unchanged); new tests conway_rejects_dijkstra_only_keys + dijkstra_accepts_23_25_26 + conway_rejects_key6 +
+   dijkstra_unknown_key99_rejected all PASS; lenient cost_models_unknown_keys_ignored + pparam_update_unknown_key_skipped UNTOUCHED
+   + pass; fmt=0 clippy=0 nextest 1179/1179. #31-B state:GAUNTLET attempts:1 conf:0.9. *** NEXT WAKE — GAUNTLET #31-B (era-aware
+   Haskell-key-set match per era + over-rejection lens: every valid Conway/Dijkstra key still accepted, real blocks decode; the
+   key-6-reject correctness; v12+ gate) → commit. #31-C/D/E remain. *** NEXT WAKE — GAUNTLET #31-A (Haskell-reject match + over-strictness lens:
    confirm only witness-set rejects, body/CostModels/PParamUpdate lenient preserved) → commit. Then #31-B/C/D as separate steps.
 23. [M][phase2][REPRODUCED-AT-HEAD wake323] Babbage V2-Spend BUDGET over-cost (the #730 "fixed-delta structural-context"
    residual). 363/363 tx0 dumps in phase2-dumps-730val/ (769 total across tx-indices) STILL diverge at HEAD via
@@ -646,7 +658,13 @@
    reconstruction + #7 sub-tx forward). state:DONE attempts:0
 
 ## In-progress
-- item: #31-B tx-body unknown-key reject ROOT-CAUSED (conf 0.95, exact Conway/Dijkstra key sets pinned). NEXT: FIXING #31-B (era-aware, match-guards, delete key-6 skip).
+- item: #31-B FIXING DONE (era-aware tx-body reject; over-rejection guard verified — real blocks decode; 1179/1179) → state:GAUNTLET. NEXT: gauntlet #31-B → commit.
+  *** wake408 (ultracode): DRIVE #31-B ROOT-CAUSED→FIXING (fix Workflow wumudjsu8, in-turn). Threaded `era` into
+  decode_conway_tx_body (all callers incl. the KeepRaw closure + dijkstra=Era::Dijkstra), guarded 23/25/26 with `if era==Dijkstra`,
+  DELETED the key-6 skip, era-aware reject default. OVER-REJECTION GUARD INDEPENDENTLY VERIFIED: Conway accepts {0-5,7-9,11,13..22},
+  Dijkstra +{23,25,26}; real-blocks suite passes (honest blocks decode unchanged incl. Dijkstra native dispatch); 4 new/flipped
+  tests pass; lenient CostModels/PParamUpdate untouched; 1179/1179. NEXT WAKE: GAUNTLET #31-B → commit. #31-C (Conway set-dedup
+  =#30 fix-B), #31-D (dup-map-key), #31-E (pre-Conway body) remain.
   *** wake404 (ultracode): SCHEDULE #31-B, DRIVE NEW→ROOT-CAUSED. diagnose Workflow w075p3s3n (in-turn, conf 0.95, permalink-
   pinned cd8b7fab; re-verified the v12+ version-gate by reading Decoder.hs in full). EXACT key sets: Conway {0-5,7-9,11,13-22},
   Dijkstra adds {23,25,26}; gaps 6/10/12/99 rejected by both. Fix: thread `era` into decode_conway_tx_body, guard 23/25/26 with
@@ -3574,6 +3592,7 @@
 - 2026-06-09T03:00Z wake396 ~ #31 ROOT-CAUSED→FIXING #31-A: fix Workflow wvcniku8l (in-turn) rejected unknown witness-set keys at 4 sites (all eras, permalink-pinned Haskell); OVER-STRICTNESS GUARD verified (only witness-set; body/CostModels/PParamUpdate untouched); 1176/1176. Uncommitted; gauntlet next
 - 2026-06-09T03:30Z wake400 ~ #31-A gauntlet w9xgaid4w PASSED 0/3 GOLD-STANDARD (raw-source recheck caught a WebFetch hallucination + cleared the v12+ version-gate trap; Dijkstra byte-exact). COMMITTED fe101965a0. #31-A DONE. Next #31-B (tx-body, era-aware)
 - 2026-06-09T04:00Z wake404 ~ #31-B NEW→ROOT-CAUSED: diagnose w075p3s3n (in-turn, conf 0.95, permalink-pinned) pinned exact Conway {0-5,7-9,11,13-22} vs Dijkstra +{23,25,26} body-key sets; era-aware fix (thread era, guard 23/25/26, DELETE key-6 skip — corrects #31-A hint). Filed #31-E. Next FIXING #31-B
+- 2026-06-09T04:30Z wake408 ~ #31-B ROOT-CAUSED→FIXING: fix Workflow wumudjsu8 (in-turn) era-aware tx-body reject (thread era, guard 23/25/26, delete key-6 skip); OVER-REJECTION GUARD verified (Conway/Dijkstra key sets, real blocks decode); 1179/1179. Uncommitted; gauntlet next
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -5279,3 +5298,7 @@
   key sets. Fix = thread era into decode_conway_tx_body, guard 23/25/26 with if era==Dijkstra, DELETE the `6 => skip` (key 6 is
   hard-REJECTED — corrects the #31-A hint + an imprecise conway.md note), era-aware reject default. Flip the dijkstra key99 test.
   Filed #31-E (pre-Conway body reject). state:ROOT-CAUSED. NEXT: FIXING #31-B.
+- wake408 2026-06-09: DRIVE #31-B ROOT-CAUSED→FIXING (fix Workflow wumudjsu8, in-turn). Era-aware tx-body reject: threaded `era`
+  into decode_conway_tx_body (all callers), guarded 23/25/26 with if era==Dijkstra, DELETED key-6 skip, era-aware reject default.
+  OVER-REJECTION GUARD independently verified: Conway {0-5,7-9,11,13..22} + Dijkstra {23,25,26}; real-blocks suite passes (honest
+  blocks unchanged); lenient CostModels/PParamUpdate untouched; 1179/1179. Uncommitted; gauntlet next. state:GAUNTLET.
