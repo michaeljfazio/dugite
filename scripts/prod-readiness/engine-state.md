@@ -183,6 +183,19 @@
   DONE+separable -> gauntlet+commit FINAL-DONE (dugite-serialization+dugite-node, the (B) commit) as the WHOLE of #10,
   and the 306 become a NEW phase-2-UPLC item; if IMPORT-specific -> #10 must fix it. DO NOT let the phase-2 mystery
   keep blocking the byte-exact phase-1 import fix.
+  *** wake162: code-confirmed PRIME SUSPECT + launched re-diagnose muscle wpeec891q (run wf_1bcfce4f-50b). FOUND:
+  dugite serialiseData builtin (crates/dugite-uplc/src/builtin/denotations.rs:597-604) does d.to_cbor() = CANONICAL
+  re-encode; Haskell serialiseData returns the MEMOISED ORIGINAL bytes (MemoBytes/BinaryData). So any script calling
+  serialiseData on a non-canonical Data (Constr tag-102 etc; CASE-1 datum starts d87a9f) and hashing/comparing the
+  result diverges -> logical 'Error term'. serialiseData is essentially the ONLY Data-BYTES divergence vector (all
+  other Data builtins are structural) — which is WHY the inline-datum resolution fix was a no-op (value was fine; the
+  bug is the SCRIPT serialising it). NOT import-specific. Muscle wpeec891q confirms vs the real failing tx 10a0dbda
+  (does the script invoke builtin tag 51? is the datum non-canonical?) + classifies import-vs-general (sample 15 of
+  306: how many spend ONLY post-snapshot inputs => GENERAL-UPLC). NEXT WAKE on verdict: GENERAL-UPLC (expected) ->
+  (i) #10 phase-1 FINAL-DONE is DONE+separable -> gauntlet+commit (dugite-serialization+dugite-node); (ii) file the
+  306 as NEW phase-2-UPLC item 'serialiseData verbatim-bytes' (dugite Data must carry original CBOR like Haskell
+  MemoBytes; serialiseData returns memo when present, canonical only for machine-built Data). IMPORT-specific ->
+  #10 absorbs.
   was: state:VERIFYING-RESOAK (commit-A). *** wake160:
   BUILD_EXIT=0 (combined binary 08:06: FINAL-DONE + uplc inline_spend_datum fix). DROVE: SIGTERM'd verify10j evidence
   node (clean "Shutdown complete"; its 297 count is in verify10j-resoak.log), GC'd verify10i (-CoW), CoW-cloned
@@ -1085,6 +1098,12 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake162 2026-06-07: #10 re-diagnose. CODE-CONFIRMED prime suspect: serialiseData builtin denotations.rs:601
+  d.to_cbor() = canonical re-encode (Haskell returns memoised ORIGINAL bytes) -> non-canonical Data serialised by a
+  script diverges -> 'Error term'. Explains the inline-fix no-op (only Data-BYTES vector). Launched re-diagnose
+  muscle wpeec891q (wf_1bcfce4f-50b): confirm vs tx 10a0dbda (builtin tag 51 present? datum non-canonical?) +
+  import-vs-general classification (15/306 spend only post-snapshot?). NEXT WAKE: GENERAL -> commit FINAL-DONE as #10
+  + file 306 as new serialiseData-verbatim item; IMPORT-specific -> #10 absorbs.
 - wake161 2026-06-07: #10 VERDICT = NO-OP. verify10A (FINAL-DONE+inline-fix) synced past window -> 306 'Error term'
   == verify10j's 297 (unchanged). Inline-datum re-encode mechanism REFUTED BY REPLAY. SIGTERM'd verify10A, REVERTED
   redeemer_resolve.rs (kept main clean, FINAL-DONE intact). VERIFYING-RESOAK -> DIAGNOSING (re-open, OPEN mind).
