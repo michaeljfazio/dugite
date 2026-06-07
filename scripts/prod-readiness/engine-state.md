@@ -212,7 +212,15 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #1 (ep57 preprod stake-distribution) state:RECHECK-BUILDING (clean fixed binary building pid 69201; preprod cross-network re-validate).
+- item: #1 (ep57 preprod stake-distribution) state:PREPROD-RECHECK-RUNNING (clean fixed binary verified; replay pid 69653 launched wake310).
+  Clean build OK (release 1m36s, binary 20:05, strings=0 instrumentation symbols = the committed fix only). CoW-cloned
+  db-preprod-sync -> db-clones/preprod-mirfix-recheck (15G immutable). Launched from-genesis preprod replay job
+  preprod-mirfix pid 69653 (fixed binary, --config config/preprod/config.json, socket /tmp/engine-preprod-mirfix.sock
+  port 3002, dumps -> epoch-dumps-engine/preprod-mirfix). NEXT WAKE: once past ep57+ -> compare preprod-mirfix dumps
+  ep57 (stake-distribution per-cred + reserves/treasury) AND a broad ep0-100 sweep to Koios PREPROD
+  (bash scripts/prod-readiness/lib/koios.sh preprod totals/pool_history/account_reward_history). If byte-exact -> #1
+  CLOSED + MIR-fix cross-network confirmed (preprod=Babbage->ShelleyRules, fix applies). If a real divergence persists
+  after the MIR fix -> separate utxo/stake bug (re-open with the apply_utxo_changes hypothesis). SIGTERM-only to stop.
   *** wake309 (ultracode): SCHEDULE #1 preprod recheck with the FIXED binary (cross-network confirmation of the MIR
   fix; #1 was already DONE-on-clean-replay wake22-23 byte-exact, so this confirms + the apply_utxo_changes hypothesis
   is suspect). DROVE: kicked off CLEAN rebuild pid 69201 (committed fix source, no instrumentation) ->
@@ -3435,3 +3443,7 @@
   immutable), db-clones/preprod-verify15. Pruned stale dump dirs. next wake: strings-verify clean -> CoW-clone
   db-preprod-sync -> from-genesis preprod replay to ep57+ -> compare ep57 stake + reserves/treasury to Koios preprod
   -> byte-exact => #1 CLOSED + cross-network confirmed; else separate utxo bug.
+- wake310 (ultracode): clean fixed binary OK (strings=0 instrumentation symbols). CoW-cloned db-preprod-sync ->
+  db-clones/preprod-mirfix-recheck. Launched from-genesis preprod replay job preprod-mirfix pid 69653 (fixed binary,
+  preprod config, dumps->preprod-mirfix). next wake: compare ep57 + ep0-100 sweep vs Koios PREPROD -> byte-exact =>
+  #1 CLOSED + MIR-fix cross-network confirmed; else separate utxo/stake bug.
