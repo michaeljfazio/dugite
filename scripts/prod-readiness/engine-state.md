@@ -209,7 +209,18 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #15 (phase-2 serialiseData verbatim-bytes) state:FIXING (V3-extension; first fix was a NO-OP). *** wake208:
+- item: #15 (phase-2 serialiseData verbatim-bytes) state:GAUNTLET-PENDING. *** wake211 BYTE-EXACT GATE PASSED:
+  V3-extension fix w19kofqwx (eval_redeemer.rs + redeemer_resolve.rs: resolve_spend_datum_optional resolves V3
+  spending datum per getBabbageSpendingDatum [inline <|> witness, None if datum-less]; eval_redeemer builds V3
+  SpendingScriptInfo datum via plutus_data_to_data_memoised = VERBATIM). DROVE: copied 2 files to main (dugite-uplc
+  only), BUILD_EXIT=0, uplc nextest GREEN 439 (438 + new V3 verbatim regression; conformance/eval green => machine-
+  built Data still canonical), verify15v3 replay. *** REPLAY VERDICT = DECISIVE PASS: 0 'Error term' across the FULL
+  ep293 window (slots 125001020-125105013, +18K beyond) — DOWN FROM 306; CASE-1 27751ab9 (V3 7afbde08) now passes;
+  0 phase-1. The serialiseData canonical-re-encode divergence is GONE. Launched #15 GAUNTLET w4a16gr1r (run
+  wf_c496a1ad-30a, opus refuters). NEXT WAKE: on PASS -> COMMIT #15 via gh/HTTPS (dugite-uplc, 1 crate); on REFUTE ->
+  verify the dissent (memo-leaks-into-Eq / machine-built-wrongly-memoised / tx-Data-misses-memo). After #15:
+  phase2.preprod fast-start now byte-exact on serialiseData; next backlog = #0 (mainnet ep246) / #16 / #17 / #19 / #20.
+  *** wake208:
   FIX muscle w1xi3j2nf green (Data-memo architecture: DataKind+Data{kind,original}, Eq/Hash IGNORE memo, to_cbor
   returns memo, V1/V2 datum_raw + witness datums_to_plutus memoised; 438 uplc tests green). DROVE: copied 10 files
   to main (dugite-uplc only), BUILD_EXIT=0, uplc nextest GREEN 438, verify15 replay. *** REPLAY VERDICT = NO-OP:
@@ -1431,6 +1442,11 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
+- wake211 2026-06-07: #15 V3-extension fix w19kofqwx -> built -> REPLAY DECISIVE PASS. verify15v3: 0 'Error term'
+  across FULL ep293 window (was 306), 27751ab9 fixed, 0 phase-1, uplc nextest 439 green. The serialiseData verbatim-
+  bytes fix WORKS (V3 SpendingScriptInfo datum memoised per getBabbageSpendingDatum). VERIFYING-RESOAK -> GAUNTLET-
+  PENDING; launched gauntlet w4a16gr1r. NEXT WAKE: PASS -> commit #15 (dugite-uplc). [Also: wake-mid, made muscle
+  diagnose model overridable via args.diagnoseModel per user request — committed separately.]
 - wake210 2026-06-07: LOCK-RECOVERY (wake209 final commit/release call malformed -> stale lock age302s + wake209
   edit uncommitted; HEAD=wake208, no concurrent wake -> released+reacquired). POLL #15 V3-extension w19kofqwx — still
   RUNNING (cargo pid 67721, last activity ~90s). No transition. Disk 163G. #15 stays FIXING. NEXT WAKE: poll/process
