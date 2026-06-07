@@ -209,7 +209,27 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:PER-DELEGATOR-LOCALIZED (polled wake299 19:18 — analyze muscle w3jqnacgp research DONE, root-cause agent ACTIVE on bucket-split + code localization). concentrated in whale dd1971 (-2.48B).
+- item: #0 (mainnet ep246 reserves) state:FIXING (DEFINITIVE root cause = MIR-before-SNAP ordering; fix applied, building).
+  *** wake300 (ultracode): analyze muscle w3jqnacgp = **DEFINITIVE ROOT CAUSE (Koios-exact + Haskell-quoted): a MIR
+  call-site ORDERING bug.** dd1971's -2,483,312,791 deficit splits 100% REWARD, 0% UTXO: Koios reward balance @ ep243
+  = Σ(rewards spendable<=243)=124,461,009,403 minus Σ(withdrawals<=243)=89,153,454,360 = 35,307,555,043; dugite
+  reward_balance=32,824,242,252; gap=2,483,312,791 = EXACTLY one type=treasury MIR (earned_epoch=242 spendable=243).
+  dugite utxo BYTE-EXACT -> **#1/#11 (apply_utxo_changes/stake_map) REJECTED** for this whale. THE BUG: dugite ran
+  `apply_pending_mir(certs, epochs)` at shelley.rs:729 — AFTER the mark/go snapshots were built (shelley.rs:533-662) —
+  but Haskell NEWEPOCH order is applyRUpd -> MIR -> EPOCH(SNAP->POOLREAP->UPEC) (NewEpoch.hs: es''<-MIR(es') BEFORE
+  EPOCH; SNAP is EPOCH's first sub-rule). So a boundary's treasury-MIR credit was EXCLUDED from go.pool_stake/
+  total_active_stake -> uniform ~4.99 ppm reward under-scaling. ONE-DIRECTIONAL (MIR only ADDS) + SPREAD (ep242 MIR was
+  a broad distribution, 445 pools) + WHALE-concentrated (scales w/ stake) — all explained. Conway path MIR-gated-off
+  (PV>=9 early-return common.rs:568) so only the pre-Conway shelley/babbage live path (Babbage/Alonzo delegate to
+  ShelleyRules) needs it. DROVE: APPLIED THE FIX — moved apply_pending_mir from shelley.rs:729 (after snapshot) to
+  AFTER applyRUpd / BEFORE SNAP (after the #670 epoch_fees drain, before the snapshot rotation+mark build); corrected
+  the wrong L725 comment. cargo check -p dugite-ledger CLEAN (5.47s). Build -> /tmp/dugite-mirfix-build.log. FIX
+  UNCOMMITTED (shelley.rs) until re-replay byte-exact + gauntlet (#438). NEXT WAKE: verify build (binary mtime +
+  recompiled dugite-ledger) -> re-replay over CoW clone db-clones/mainnet-rupd-drop (instrumentation env OFF = no-op) ->
+  ASSERT ep246 reserves==12,880,948,865,137,767 + treasury==292,077,855,298,344 + ep209-245 unregressed -> gauntlet ->
+  revert ALL instrumentation (globals/poolstake/percred/breakdown/drop-trace rewards.rs+shelley.rs+epoch.rs, paid-set
+  shelley.rs) -> commit CLEAN MIR-ordering fix (shelley.rs only). LIKELY ALSO FIXES a BROAD class: any epoch boundary
+  with a pending treasury/reserve-MIR before the snapshot (revalidate ledger.mainnet+preprod frontiers after).
   *** wake297 (ultracode): per-delegator diff for pool 263498e0 RECONCILES EXACTLY: Σ(dugite-koios) over 351 matched
   delegators = -2,715,004,435 = the pool's deficit. CONCENTRATED: delegator dd1971af42dabd013cc774fa1190c6f2c7a892765611264d039366c9
   (stake1u8w3jud0gtdt6qfuca605yvscmev02yjwetpzfjdqwfkdjgfmh4py) alone = **-2,483,312,791 (91% of the pool deficit)**.
@@ -3252,3 +3272,11 @@
   (utxo=stake_map/#1 vs reward) needs the exact Koios reward-balance reconciliation. SIGTERM'd percred replay. Launched
   analyze muscle w3jqnacgp to split the bucket + localize the dugite code defect + Haskell-quoted fix. next wake: read
   verdict -> Tier-A fix (live path) -> re-replay verify -> gauntlet.
+- wake300 (ultracode): DEFINITIVE ROOT CAUSE (w3jqnacgp, Koios-exact+Haskell-quoted): MIR-before-SNAP ORDERING bug.
+  dd1971 -2,483,312,791 = 100% REWARD (= one ep242 treasury-MIR), 0% UTXO -> #1/#11 apply_utxo_changes REJECTED.
+  dugite ran apply_pending_mir at shelley.rs:729 AFTER the mark snapshot; Haskell NEWEPOCH = applyRUpd->MIR->EPOCH(SNAP)
+  -> MIR before SNAP. So boundary treasury-MIR credits excluded from go.pool_stake/total_active_stake -> uniform
+  ~4.99ppm reward under-scaling (one-directional+spread+whale-concentrated, all explained). APPLIED FIX: moved
+  apply_pending_mir to after applyRUpd/before SNAP in shelley.rs; fixed L725 comment. cargo check CLEAN, building. FIX
+  UNCOMMITTED until re-replay byte-exact + gauntlet. next wake: re-replay -> ep246 reserves==12880948865137767 +
+  ep209-245 unregressed -> gauntlet -> revert instrumentation -> commit. LIKELY fixes a BROAD MIR-boundary class.
