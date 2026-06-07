@@ -225,7 +225,19 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #17 (Mithril snapshot CRC not verified) state:FIXING attempts:0 — fix implemented + both crates compile (UNCOMMITTED). NEXT WAKE: VERIFYING.
+- item: #17 (Mithril snapshot CRC not verified) state:VERIFYING attempts:0 — gauntlet bc6j5y0qv IN-FLIGHT; wake-lock HELD (TTL 22m).
+  *** wake320 (ultracode): #17 FIXING→VERIFYING (in-flight). Confirmed the uncommitted fix present (mempack/mod.rs helpers
+  + node/mod.rs verify block). Launched the combined gauntlet bc6j5y0qv (background): cargo nextest -p dugite-serialization
+  + cargo nextest -p dugite-node + clippy --all-targets -D warnings (both crates) + fmt --check → /tmp/g17_combined.log
+  (per-step logs /tmp/g17_{ser,node,clippy,fmt}.log). *** ON COMPLETION (this wake, auto-notify): if SER nextest GREEN
+  (esp. snapshot_crc_of_concat_matches_real_preprod_fixtures = THE byte-exact proof vs real cardano-node checksums
+  2409556997/4213652121 + corruption-detection + parse tests + NO regression of the Word8/tablesCodecVersion tests from
+  the bounded-parser refactor) + NODE nextest GREEN + clippy clean + fmt clean → since #17 is a security/code-invariant
+  (reference = Haskell reject behavior + byte-exact crcOfConcat vs REAL snapshots, no Koios) the real-fixture byte-exact
+  test IS the gauntlet → COMMIT the focused 2-crate fix (dugite-serialization mempack/mod.rs + mempack/tests.rs + Cargo.toml,
+  dugite-node node/mod.rs — do NOT stage common.rs) + push, advance #17 VERIFYING→DONE, release lock. If any RED → record
+  the failure, keep uncommitted, stay VERIFYING. Lock held across async is intentional (overlapping cron skips on busy; 22m
+  TTL prevents wedge).
   *** wake319 (ultracode): #17 ROOT-CAUSED→FIXING (one step). Hand-applied the fully-specified, byte-exact-validated fix
   (analyze w2ez2r1lk did the analytical work; like #6/#20c, implementing a fully-specified fix is mechanical). 2 CRATES:
   *** dugite-serialization/src/mempack/mod.rs: (a) generalized the proven aeson Word8 scientific parser to a bound-param
