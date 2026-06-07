@@ -1359,6 +1359,9 @@
   not wedged). No transition. Disk 178G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process result.
 - wake189 2026-06-07: POLL #10 FIX muscle wb28q1upc — still RUNNING, ACTIVE (last activity 5s, build/test). No
   transition. Disk 179G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process result.
+- wake195 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 (R1 complete-F1 + R3 indef-trunc) — still RUNNING, ACTIVE
+  (worktree present, bridge applied). No transition. Disk 177G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process
+  -> build -> re-import -> 6th re-gauntlet -> COMMIT (per hard policy).
 - wake194 2026-06-07: #10 5th GAUNTLET ww5a6h0zx REFUTED 2/3 (edge-epoch refuter CONFIRMED core byte-exact) ->
   FIXING. R1 = F1 incomplete (value still flat-scans nested keys; complete it structurally); R3 = truncated
   indefinite map silent-end (hard-error on indef-EOF-no-break). Both adversarial-only, mempack/mod.rs. SIGTERM'd
