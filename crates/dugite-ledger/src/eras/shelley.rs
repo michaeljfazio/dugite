@@ -477,6 +477,20 @@ impl EraRules for ShelleyRules {
         let ss_fee_drained = epochs.snapshots.ss_fee;
         utxo.epoch_fees = Lovelace(utxo.epoch_fees.0.saturating_sub(ss_fee_drained.0));
 
+        // MIR rule — Haskell NEWEPOCH ordering: applyRUpd → MIR → EPOCH(SNAP → POOLREAP
+        // → UPEC).  `Cardano.Ledger.Shelley.Rules.NewEpoch.newEpochTransition` runs
+        // `es'' <- trans @(EraRule "MIR") es'` BEFORE `trans @(EraRule "EPOCH")`, and
+        // SNAP is EPOCH's first sub-rule — so MIR's treasury/reserves → reward-account
+        // credits MUST be applied BEFORE the mark snapshot is taken below.  Previously
+        // this ran at the END of the boundary (after the mark snapshot was built), so a
+        // treasury/reserve MIR credited at the boundary was excluded from go.pool_stake /
+        // total_active_stake (the apparent-performance sigmaA denominator) → uniform
+        // ~4.99 ppm reward under-scaling (e.g. mainnet ep246 reserves +82,270,482 /
+        // treasury -55,269, traced to dd1971's ep242 treasury-MIR of 2,483,312,791).
+        // `Cardano.Ledger.Shelley.Rules.Mir.applyMIR`: irwd = iRTreasury ∩ accountsMap;
+        // casTreasury -= totT; accounts += irwd.  See issues #631, #0.
+        crate::state::certificates::apply_pending_mir(certs, epochs);
+
         // Step 3: SNAP — rotate snapshots, capture fees, update bprev.
         //
         // Per Haskell SNAP rule: `ssFee = utxosFees` of the **post-applyRUpd**
@@ -656,11 +670,10 @@ impl EraRules for ShelleyRules {
             .pending_retirements
             .retain(|_, epoch| *epoch > new_epoch);
 
-        // MIR rule (Haskell EPOCH ordering: SNAP → POOLREAP → MIR → NEWPP).
-        // Drain pending `dsIRewards` map + pot-transfer accumulators into
-        // reward_accounts + reserves/treasury per
-        // `Cardano.Ledger.Shelley.Rules.Mir.applyMIR`.  See issue #631.
-        crate::state::certificates::apply_pending_mir(certs, epochs);
+        // (MIR rule moved EARLIER — see `apply_pending_mir` after applyRUpd, before SNAP.
+        //  Haskell applies MIR in NEWEPOCH before EPOCH/SNAP so the mark snapshot reflects
+        //  the MIR'd reward balances; running it here, after SNAP+POOLREAP, excluded a
+        //  boundary's MIR credit from total_active_stake.  See issue #0.)
 
         // Capture prevPParams BEFORE PPUP updates.
         //
