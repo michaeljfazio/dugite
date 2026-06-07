@@ -664,6 +664,80 @@ fn resolve_spend_datum(
     }
 }
 
+/// Resolve the V3 spending datum for a spent output, returning `None`
+/// when the output carries no datum (a **valid** state for a V3
+/// spending script — unlike V1/V2 where a missing datum is a hard
+/// `MissingDatum` error).
+///
+/// Mirrors `Cardano.Ledger.Babbage.UTxO.getBabbageSpendingDatum`:
+///
+/// ```haskell
+/// getBabbageSpendingDatum (UTxO utxo) tx sp = do
+///   AsItem txIn <- toSpendingPurpose sp
+///   txOut <- Map.lookup txIn utxo
+///   let txOutDataFromWits = do
+///         dataHash <- strictMaybeToMaybe (txOut ^. dataHashTxOutL)
+///         Map.lookup dataHash (tx ^. witsTxL . datsTxWitsL . unTxDatsL)
+///   strictMaybeToMaybe (txOut ^. dataTxOutL) <|> txOutDataFromWits
+/// ```
+///
+/// I.e. **inline datum first** (`dataTxOutL`), then the datum-hash
+/// witness-set fallback (`dataHashTxOutL` then `Map.lookup`), then
+/// `Nothing`. The Conway `toPlutusV3Args` lifts the result via
+/// `transDatum = PV2.Datum . dataToBuiltinData . getPlutusData`, which
+/// is the **canonical structural** `Data` (the ledger `MemoBytes` are
+/// stripped by `getPlutusData` before the CEK ever sees the value) —
+/// so the caller translates with `plutus_data_to_data`, NOT verbatim
+/// wire bytes.
+pub fn resolve_spend_datum_v3(
+    tx: &Transaction,
+    spent_output: &PrimTxOut,
+) -> Result<Option<PrimPlutusData>, PhaseTwoError> {
+    use dugite_primitives::hash::blake2b_256;
+    use dugite_primitives::transaction::OutputDatum as PrimOutputDatum;
+    match &spent_output.datum {
+        // Inline datum: `strictMaybeToMaybe (txOut ^. dataTxOutL)`.
+        PrimOutputDatum::InlineDatum { data, .. } => Ok(Some(data.clone())),
+        // Datum hash: `dataHash <- …; Map.lookup dataHash (… datsTxWitsL)`.
+        // The hash is over the witness datum's ORIGINAL CBOR bytes
+        // (`hashData`/`hashAnnotated` over the ledger MemoBytes), so match
+        // against the preserved per-element raw spans first; fall back to a
+        // canonical re-encode only when no raw bytes exist.
+        PrimOutputDatum::DatumHash(h) => {
+            let spans = tx
+                .witness_set
+                .raw_plutus_data_cbor
+                .as_deref()
+                .and_then(dugite_serialization::plutus_data_element_spans)
+                .filter(|s| s.len() == tx.witness_set.plutus_data.len());
+            if let Some(spans) = spans {
+                for (i, raw) in spans.iter().enumerate() {
+                    if blake2b_256(raw).0 == h.0 {
+                        return Ok(Some(tx.witness_set.plutus_data[i].clone()));
+                    }
+                }
+            } else {
+                for d in &tx.witness_set.plutus_data {
+                    let translated = crate::tx_info_populate::plutus_data_to_data(d);
+                    let cbor = translated.to_cbor().map_err(|e| {
+                        PhaseTwoError::Internal(format!("resolve_spend_datum_v3: to_cbor: {e}"))
+                    })?;
+                    if blake2b_256(&cbor).0 == h.0 {
+                        return Ok(Some(d.clone()));
+                    }
+                }
+            }
+            // Datum hash present but no matching witness datum. `Map.lookup`
+            // returns `Nothing`; the `<|>` then also fails the inline branch
+            // (already absent), so the whole expression is `Nothing`.
+            Ok(None)
+        }
+        // No datum at all: both branches of the `<|>` are `Nothing`. For V3
+        // this is a VALID `Nothing`, not a hard error.
+        PrimOutputDatum::None => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -828,6 +902,67 @@ mod tests {
         assert!(
             resolve_spend_datum(&tx2, &out, &[0xAA; 28]).is_err(),
             "re-encode fallback must not match a non-canonically-encoded datum hash"
+        );
+    }
+
+    /// V3 spending datum resolution (`getBabbageSpendingDatum`):
+    ///
+    /// 1. An **inline datum** on the spent output resolves to `Some(Data)`,
+    ///    and the `Data` translation is the **canonical structural** form —
+    ///    `serialiseData` over it equals `encode_data` (NOT the verbatim
+    ///    non-canonical wire bytes). This is the #15 root-cause fix: a V3
+    ///    spending script that `serialiseData`s its own datum must see the
+    ///    datum, not `None` (which previously produced an Error term).
+    /// 2. A spent output with **no datum** resolves to `None` (a VALID state
+    ///    for V3 — not a hard `MissingDatum` like V1/V2).
+    #[test]
+    fn resolve_spend_datum_v3_inline_is_canonical_not_verbatim() {
+        use dugite_primitives::transaction::{OutputDatum as PrimOutputDatum, PlutusData as PD};
+        use num_bigint::BigInt;
+
+        // A datum whose verbatim encoding differs from the canonical
+        // re-encode: the general `Constr` tag-102 form (`d866`) for a small
+        // index, which `encode_data` writes back as the compact tag-121 form.
+        let verbatim = hexd("d8668200820102"); // Constr 0 [I 1, I 2] via tag 102
+        let datum = PD::Constr(
+            0,
+            vec![PD::Integer(BigInt::from(1)), PD::Integer(BigInt::from(2))],
+        );
+
+        let mut out = enterprise_script_output([0xBB; 28], 2_000_000);
+        out.datum = PrimOutputDatum::InlineDatum {
+            data: datum.clone(),
+            raw_cbor: Some(verbatim.clone()),
+        };
+        let tx = build_tx(minimal_body(), empty_witness());
+
+        // (1) Inline datum → Some(datum).
+        let resolved = resolve_spend_datum_v3(&tx, &out).expect("inline datum resolves");
+        assert_eq!(
+            resolved,
+            Some(datum.clone()),
+            "inline datum must resolve to Some, not None"
+        );
+
+        // serialiseData over the resolved datum == CANONICAL encode_data,
+        // and NOT the verbatim (tag-102) wire bytes.
+        let canonical = crate::tx_info_populate::plutus_data_to_data(&datum)
+            .to_cbor()
+            .expect("canonical encode");
+        assert_ne!(canonical, verbatim, "test vector must be non-canonical");
+        // The canonical form uses the compact constructor tag (0xd879 = tag 121).
+        assert_eq!(
+            &canonical[..2],
+            &[0xd8, 0x79],
+            "canonical Constr 0 uses tag 121"
+        );
+
+        // (2) No datum → None (valid for V3, not an error).
+        let bare = enterprise_script_output([0xBB; 28], 1);
+        assert_eq!(
+            resolve_spend_datum_v3(&tx, &bare).expect("no-datum is not an error for V3"),
+            None,
+            "V3 spending with no datum resolves to None, not MissingDatum"
         );
     }
 

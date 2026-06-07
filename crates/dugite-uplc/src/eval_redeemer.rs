@@ -34,8 +34,7 @@ use crate::populate_v3::populate_tx_info_v3;
 use crate::program::Program;
 use crate::redeemer_resolve::{ResolvedRedeemer, ScriptLanguage};
 use crate::script_context::{
-    Credential as PlCred, ScriptContextV1, ScriptContextV2, ScriptContextV3, ScriptInfo,
-    ScriptPurpose, TxOutRef,
+    ScriptContextV1, ScriptContextV2, ScriptContextV3, ScriptInfo, ScriptPurpose, TxOutRef,
 };
 use crate::term::{Constant, Term};
 use crate::tx_info_populate::plutus_data_to_data;
@@ -419,8 +418,8 @@ fn build_script_context(
         ScriptLanguage::PlutusV3 => {
             let tx_info = populate_tx_info_v3(tx, resolved, slot_config)?;
             // V3 builds a `ScriptInfo` from the purpose + (for spend)
-            // the resolved datum.
-            let script_info = purpose_to_script_info_v3(r);
+            // the resolved inline/witness datum.
+            let script_info = purpose_to_script_info_v3(r, tx, resolved)?;
             let redeemer_data = plutus_data_to_data(&r.redeemer_data);
             let ctx = ScriptContextV3 {
                 tx_info,
@@ -435,23 +434,52 @@ fn build_script_context(
 /// Lift a [`ScriptPurpose`] into a V3 [`ScriptInfo`]. The two enums
 /// share constructors for Minting / Rewarding / Certifying / Voting
 /// / Proposing — Spending differs (V3 inlines the datum reference).
-fn purpose_to_script_info_v3(r: &ResolvedRedeemer) -> ScriptInfo {
-    match &r.purpose {
+///
+/// For `Spending`, the inline `Option<Datum>` is resolved per
+/// `Cardano.Ledger.Conway.TxInfo.toPlutusV3Args` /
+/// `scriptPurposeToScriptInfo`:
+///
+/// ```haskell
+/// PV3.Spending txIn ->
+///   PV3.SpendingScript txIn maybeSpendingData
+///   where
+///     maybeSpendingData = transDatum <$> getBabbageSpendingDatum utxo tx sp
+///     transDatum = PV2.Datum . dataToBuiltinData . getPlutusData
+/// ```
+///
+/// `getPlutusData` strips the ledger `MemoBytes`, so the resulting
+/// `Data` is the **canonical structural** translation
+/// (`plutus_data_to_data`) — never the verbatim wire bytes.
+fn purpose_to_script_info_v3(
+    r: &ResolvedRedeemer,
+    tx: &Transaction,
+    resolved: &[(PrimTxIn, PrimTxOut, Vec<u8>)],
+) -> Result<ScriptInfo, PhaseTwoError> {
+    Ok(match &r.purpose {
         ScriptPurpose::Minting(h) => ScriptInfo::Minting(*h),
         ScriptPurpose::Spending(out_ref) => {
-            // V3 inline-datum lookup: cardano-node passes
-            // `Option<Datum>` here. Without an explicit datum on the
-            // ResolvedRedeemer (V3 doesn't fill it), we fall back to
-            // `None` — which matches V3 spending validators that
-            // don't actually consume a datum (e.g., a "burn"-only
-            // script). Validators that DO need a datum will pull it
-            // from the inputs/refInputs in the ctx.
+            // Resolve the spent output and run `getBabbageSpendingDatum`
+            // (inline datum first, then datum-hash witness lookup, else
+            // `Nothing`). `Nothing` is a VALID state for V3 — only the
+            // V1/V2 path treats a missing spending datum as a hard error.
+            let datum = resolved
+                .iter()
+                .find(|(i, _, _)| {
+                    i.transaction_id.0 == out_ref.tx_id && i.index as u64 == out_ref.idx
+                })
+                .and_then(|(_, spent_out, _)| {
+                    crate::redeemer_resolve::resolve_spend_datum_v3(tx, spent_out).transpose()
+                })
+                .transpose()?
+                // `transDatum = PV2.Datum . dataToBuiltinData . getPlutusData`
+                // — canonical structural Data, MemoBytes stripped.
+                .map(|d| plutus_data_to_data(&d));
             ScriptInfo::Spending {
                 out_ref: TxOutRef {
                     tx_id: out_ref.tx_id,
                     idx: out_ref.idx,
                 },
-                datum: None,
+                datum,
             }
         }
         ScriptPurpose::Rewarding(c) => ScriptInfo::Rewarding(c.clone()),
@@ -461,14 +489,7 @@ fn purpose_to_script_info_v3(r: &ResolvedRedeemer) -> ScriptInfo {
         // Dijkstra `DijkstraGuarding(ScriptHash)` — Sum 6.
         // Issue #475 Phase 3.5.
         ScriptPurpose::Guarding(h) => ScriptInfo::Guarding(*h),
-    }
-}
-
-// `PlCred` brought in for symmetry with future Spending-datum lookup
-// (not used yet — placeholder for V3 inline-datum binding).
-#[allow(dead_code)]
-fn _unused_placeholder(c: PlCred) -> PlCred {
-    c
+    })
 }
 
 // The `UplcError` import keeps the script-eval-failure path's
