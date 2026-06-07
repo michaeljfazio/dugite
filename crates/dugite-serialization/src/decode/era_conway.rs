@@ -2230,7 +2230,14 @@ fn decode_conway_witness_set(
                 plutus_v3_scripts = r.read_set(|r| r.read_bytes_owned())?;
             }
             _ => {
-                r.skip()?;
+                // Haskell cardano-ledger decodes the witness set via SparseKeyed
+                // with field-picker `txWitnessField n = invalidField n`, so an
+                // unknown map key hard-fails the decode (invalidField -> Invalid n
+                // -> invalidKey -> cborError). Not version-gated — reject in every
+                // era. Mirror that strictness here instead of silently skipping.
+                return Err(SerializationError::CborDecode(format!(
+                    "witness set: unknown key {key}"
+                )));
             }
         }
         Ok(())
@@ -3251,6 +3258,32 @@ mod tests {
         let ws = decode_conway_witness_set(&mut r).unwrap();
         assert_eq!(ws.plutus_v3_scripts.len(), 1);
         assert_eq!(ws.plutus_v3_scripts[0], vec![0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    #[test]
+    fn conway_witness_set_unknown_key_rejected() {
+        // A valid Conway witness set ({7: [[script]]}) with an unknown key 8
+        // appended (one past the highest known Conway witness key). Haskell
+        // cardano-ledger SparseKeyed (txWitnessField n = invalidField n)
+        // hard-fails the unknown key; dugite must reject the decode too.
+        let script_bytes = cbor_bytes(&[0xde, 0xad, 0xbe, 0xef]);
+        let scripts_arr = {
+            let mut v = vec![0x81]; // array(1)
+            v.extend(&script_bytes);
+            v
+        };
+        let mut data = vec![0xa2]; // map(2)
+        data.extend(cbor_uint(7)); // key 7 = plutus_v3_scripts (valid)
+        data.extend(&scripts_arr);
+        data.extend(cbor_uint(8)); // key 8 = unknown
+        data.extend(cbor_uint(0));
+
+        let mut r = Reader::new(&data);
+        let result = decode_conway_witness_set(&mut r);
+        assert!(
+            matches!(result, Err(SerializationError::CborDecode(_))),
+            "unknown witness-set key must be rejected, got {result:?}"
+        );
     }
 
     // ── treasury_value + donation ─────────────────────────────────────────────
