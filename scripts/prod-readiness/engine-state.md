@@ -194,7 +194,16 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-BUILDING (commit-B). *** wake166: FIX
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-RESOAK (commit-B). *** wake167:
+  BUILD_EXIT=0 (combined hardening binary; Convertible-drift fixed). DROVE: CoW-cloned db-preprod-sync ->
+  db-clones/preprod-verify10B, launched pid 48115 port 4211. R3/no-silent-None NON-REGRESSING confirmed: import
+  logged "codec_version=1 txix_endianness=Big" (R3 f64-free scientific_literal_as_word8 parses the REAL integer-1
+  meta correctly), 0 phase-1, 0 import hard-errors (no-silent-None did NOT falsely reject any real tag-4/5 blob ->
+  all real datums/refscripts decode fine). Node still importing/early-replay. NEXT WAKE: once synced past window
+  (slot 125105013) confirm full 0 phase-1 -> LAUNCH RE-GAUNTLET FINAL-DONE (prior 3/3 NOW resolved: R1+R2 297-attrib
+  PROVEN general-UPLC #15 [byte-level proof wake165]; R3 fixed byte-exact; CRC still #17) -> on PASS COMMIT #10 via
+  gh/HTTPS (dugite-serialization + dugite-node, 2 crates). Then ACTIVATE #15 serialiseData.
+  was: state:VERIFYING-BUILDING (commit-B). *** wake166: FIX
   muscle wjuuqz22k COMPLETED green (tier A, 3 files / 2 crates). R3: replaced as_f64().fract() with f64-FREE
   scientific_literal_as_word8() (raw Number::as_str() literal + num_bigint, Aeson toBoundedInteger@Word8 exact:
   1.0/1e0/100e-2=>1 accept, 1.0000000000000001/1.5 reject, 256/-1 reject, "1" reject) — chose raw-literal over
@@ -1174,6 +1183,9 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake167 2026-06-07: #10 BUILD_EXIT=0 -> VERIFYING-BUILDING -> VERIFYING-RESOAK. Cloned verify10B, launched
+  combined hardening binary pid 48115. R3/no-silent-None NON-REGRESSING: codec_version=1 Big (real integer-1 meta),
+  0 phase-1, 0 import hard-errors. NEXT WAKE: confirm full 0 phase-1 past window -> RE-GAUNTLET -> commit #10.
 - wake166 2026-06-07: #10 FIXING -> VERIFYING-BUILDING. Fix muscle wjuuqz22k green (R3 f64-free Aeson-exact float-
   parse via raw-literal+bigint; no-silent-None tag-4/5 hard-error; 2 crates). Copied to main; build FAILED on
   worktree-staleness drift (missing BackendCheckResult::Convertible arm from #9 a417bd2c6f, landed after stale base
