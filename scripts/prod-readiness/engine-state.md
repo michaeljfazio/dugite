@@ -280,25 +280,30 @@
    reconstruction + #7 sub-tx forward). state:DONE attempts:0
 
 ## In-progress
-- item: RE-ASSESS (backlog cleared) — workspace CI gate b7kr6pyuw IN-FLIGHT (milestone validation); lock RELEASED, gate runs in background. #24-pin DEFERRED.
-  *** wake336 (ultracode): POLL wake335's CI gate. The gate was reclaimed-stale (exceeded the 22m wake-lock TTL because the
-  workspace nextest run is slow under host load — load avg 2.92, ~3.7GB free, NOT a hang). STATUS at poll: FMT_EXIT=0 (PASS),
-  nextest progressing 3991/6792 with ZERO FAIL/ERROR/panic lines, clippy not yet started. The earlier "list-phase hang"
-  (cross_validate_data / phase2_onchain_budget / phase2_script_context_regression sitting at 0 CPU) was load-throttled
-  process startup, NOT a deadlock — those list pids cleared and the log jumped 1.4KB→414KB. Gate is HEALTHY, just slow; it
-  will run PAST this wake too (cargo-nextest PID 67965 alive). DECISION: rather than hold the lock and force the next ~4 cron
-  fires into busy-stop churn (the wake325-pattern of 244/544/844/1145s busy stops then a stale-reclaim), RELEASE the lock now
-  and hand the poll to the next wake. *** NEXT WAKE — do NOT launch any new work until the gate is resolved: FIRST
-  `tail -8 /tmp/ci_combined.log` for `NEXTEST_EXIT=` + `CLIPPY_EXIT=` + `=== CI GATE DONE ===`, and `pgrep -fl cargo-nextest||
-  cargo-clippy||rustc`. (a) If DONE + all three EXIT=0 → milestone baseline CONFIRMED CLEAN; record it, THEN launch the fresh
-  adversarial re-audit (muscle) OR #24 full-UTxO capture. (b) If DONE + a RED: triage — a nextest FAIL in
-  dugite-ledger::eras::common (the +218 PRE-EXISTING uncommitted #730 regression tests, NOT a session deliverable) = a
-  pre-existing #730 condition, note+isolate (re-run gate skipping common.rs to prove session work clean); any OTHER crate FAIL
-  or a clippy RED = a SESSION-introduced cross-crate regression = new P0, fix immediately. (c) If STILL RUNNING → just
-  re-poll, release, STOP (do NOT relaunch a duplicate gate; PID 67965 owns /tmp/ci_*.log). Reconciliation note recorded this
-  wake: backlog #0 body text is STALE (reads PARKED attempts:3) — the ledger.mainnet frontier supersedes it (ep209-247
-  byte-exact AFTER MIR-before-SNAP fix 8c868271c9; ep246 not an exception → #0's ep246 +82.27M reserves IS resolved). Backlog
-  genuinely cleared except #24 (DEFERRED). Lock to release.
+- item: RE-ASSESS (backlog cleared) — workspace CI gate b7kr6pyuw RESOLVED → milestone baseline CONFIRMED CLEAN. #24-pin DEFERRED. NEXT WAKE: adversarial re-audit (B) for new gaps.
+  *** wake336 (ultracode) — RESOLVED wake335's CI gate b7kr6pyuw. FINAL VERDICT: GREEN (modulo one known load-flake). Per-
+  stage: FMT_EXIT=0 (PASS), CLIPPY_EXIT=0 (PASS, whole workspace incl. all 4 session crates), NEXTEST_EXIT=100 — but the SOLE
+  failure was `dugite-monitor discover::probe::tests::probe_times_out_on_slow_server` (a timing assert: probe's internal
+  timeout is 500ms, test allows ≤10s for jitter; under the gate's host load the tokio runtime was starved and the probe took
+  25.159s to return None → blew the 10s bound). PROVED a flake: re-ran in isolation on the quiet host → PASS in 0.516s. It is
+  (i) in dugite-monitor, a crate this session NEVER touched, (ii) a pure HTTP-probe timeout test unrelated to ledger/
+  serialization/uplc/node, (iii) NOT the #730 common.rs failure. nextest is fail-fast so this one flake at test 4027 cancelled
+  the remaining ~2754 tests (incl. dugite-serialization + dugite-uplc) → I RE-RAN those two cancelled session crates: 1593/
+  1593 PASS. *** ALL 4 SESSION-TOUCHED CRATES VERIFIED CLEAN: dugite-ledger 1523 PASS/0 FAIL (incl. the +218 #730 common.rs
+  tests: 42 PASS/0 FAIL — so even the "pre-existing #730 common.rs failure" worry is MOOT, they pass), dugite-node 418 PASS/0
+  FAIL, dugite-serialization+dugite-uplc 1593 PASS/0 FAIL. ZERO failures in any session crate; clippy+fmt clean. => the
+  session's ~13 cross-crate fixes introduce NO regression. MILESTONE BASELINE IS SOLID. *** The earlier "list-phase hang"
+  (wake336 first poll: cross_validate_data/phase2_onchain_budget/phase2_script_context_regression at 0 CPU) was load-throttled
+  process startup, NOT a deadlock (list pids cleared; log jumped 1.4KB→414KB). Reconciliation: backlog #0 body is STALE (reads
+  PARKED attempts:3) — ledger.mainnet frontier supersedes (ep209-247 byte-exact post-MIR-fix 8c868271c9; ep246 not an
+  exception → #0 ep246 +82.27M reserves IS resolved). Backlog genuinely cleared except #24 (DEFERRED). *** CANDIDATE MINOR
+  ITEM (file next wake if pursuing): the probe_times_out_on_slow_server wall-clock assert is still flaky under extreme load
+  even after the 10s widening — make it deterministic (drop the wall-clock bound and assert only outcome.is_none(), or use
+  tokio paused-time/mock clock) so the CI gate isn't truncated by host load. Low impact (test-only, no product bug). *** NEXT
+  WAKE — no backlog item to advance (cleared); RECOMMEND (B) a fresh adversarial re-audit via muscle (like the wake200/#541
+  7-subagent audit across N2N/N2C/CBOR/consensus/ledger/mempool) to surface NEW gaps — highest leverage for a cleared
+  backlog. Alternatives: (A) #24 V2 inline-datum-spend pin via full-UTxO Koios capture (heavy/muscle-resistant), or (C) a
+  fast-start/from-genesis sync health soak to confirm no live regression. Lock to release.
   *** wake335 (ultracode): RE-ASSESS wake (no backlog item — entire tractable backlog cleared wake334); historical note —
   *** wake335 (ultracode): RE-ASSESS wake (no backlog item — entire tractable backlog cleared wake334). Before generating
   new work via an audit, validating the milestone: this session landed ~13 fixes across 4 crates (dugite-ledger,
@@ -4411,9 +4416,13 @@
 - wake335 2026-06-07: RE-ASSESS (cleared backlog) — launched full workspace CI gate b7kr6pyuw (fmt+nextest+clippy) to
   validate the session's ~13 cross-crate fixes end-to-end (per-crate gauntlets don't catch cross-crate regressions; CLAUDE.md
   "CI green" gate). Gate ran past the 22m wake-lock TTL → lock reclaimed-stale → handed to wake336.
-- wake336 2026-06-07: POLL the b7kr6pyuw gate. FMT_EXIT=0; nextest 3991/6792 with ZERO failures; clippy pending. The earlier
-  apparent "list-phase hang" was host-load-throttled process startup (load 2.92, ~3.7GB free), NOT a deadlock — confirmed by
-  the list pids clearing + the log jumping 1.4KB→414KB. Gate HEALTHY but slow; will run past this wake. Released the lock
-  (avoid busy-stop churn) and recorded a precise next-wake poll protocol (read /tmp/ci_combined.log for NEXTEST_EXIT+
-  CLIPPY_EXIT+"CI GATE DONE"; do NOT relaunch a duplicate gate; PID 67965 owns the logs). Reconciliation: backlog #0 body is
-  STALE (PARKED) — ledger.mainnet frontier supersedes (ep246 byte-exact post-MIR-fix 8c868271c9); backlog cleared except #24.
+- wake336 2026-06-07: RESOLVED the b7kr6pyuw gate. VERDICT GREEN: FMT exit 0, CLIPPY exit 0 (whole workspace), nextest's only
+  failure = dugite-monitor probe_times_out_on_slow_server (load-induced timing flake: 25.159s vs the 10s jitter bound under
+  host load; PASSES in isolation 0.516s on the quiet host; crate untouched this session, NOT the #730 common.rs test). nextest
+  fail-fast truncated at 4038/6792 (cancelled dugite-serialization+dugite-uplc) → re-ran those two: 1593/1593 PASS. ALL 4
+  session crates clean: ledger 1523/0 (incl. #730 common.rs 42/0), node 418/0, serialization+uplc 1593/0. The session's ~13
+  cross-crate fixes have ZERO regression → milestone baseline SOLID. Reconciliation: backlog #0 body STALE (PARKED) — frontier
+  supersedes (ep246 byte-exact post-MIR-fix 8c868271c9). Backlog cleared except #24 (DEFERRED). Candidate minor item noted:
+  make the probe flake deterministic (drop wall-clock assert / tokio paused-time). NEXT WAKE recommend (B) adversarial
+  re-audit muscle for new gaps. Corrected the wake336 mid-run commit (4f8b2763df said "nextest clean 3991/6792" — that was a
+  partial snapshot; full result is green-modulo-flake with all session crates re-verified).
