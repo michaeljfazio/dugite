@@ -374,10 +374,21 @@ pub(crate) fn apply_peer_metrics(
 ///
 /// Used by the Haskell/Mithril UTxO importer to reconstruct reference scripts
 /// from a tag-5 (`TxOutCompactRefScript`) MemPack TxOut. The Plutus language tag
-/// is era-relative in MemPack, but its mapping is monotonic across every Cardano
-/// era (Babbage/Conway/Dijkstra `PlutusScript` MemPack instances all agree:
-/// 0→V1, 1→V2, 2→V3, 3→V4), so this mapping is byte-exact regardless of the
-/// snapshot era.
+/// is era-relative in MemPack (per-era `packTagM`), but every Cardano era's
+/// supported-language list is a strict PREFIX of `[V1, V2, V3, V4]` — no era has
+/// ever reordered or removed a language — so the era-relative index equals the
+/// global `fromEnum(language)` and the static map below (0→V1, 1→V2, 2→V3, 3→V4)
+/// is byte-exact for EVERY snapshot era (Babbage/Conway/Dijkstra agree). Adding a
+/// NEW language in a future era is safe here: its tag (≥ 4) hits the out-of-range
+/// hard-error arm rather than mis-mapping.
+///
+/// INVARIANT (#16): this static tag→version mapping is correct ONLY while that
+/// strict-prefix property holds. If a future era ever REORDERS or REMOVES a Plutus
+/// language, the era-relative tag would no longer equal the global version, and
+/// this MUST become era-aware (thread the snapshot's era + its per-era language
+/// list) — the unit test
+/// `decode_imported_script_ref_maps_plutus_language_tags_to_global_versions` pins
+/// both the current mapping and the out-of-range rejection.
 ///
 /// OPAQUE-STORE vs HARD-ERROR is split per the Haskell MemPack instances:
 ///
