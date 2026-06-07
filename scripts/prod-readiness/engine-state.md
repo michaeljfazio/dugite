@@ -34,13 +34,24 @@
    them → scripts iterating txInfoData over-cost MEM (the fixed-delta = the dup datum's mem). FIX tx_info_populate.rs
    sort+dedup_by_key. VERIFIED: tx0 dumps 363→194 diverge (169 byte-exact), nextest 441/441 no-regression. state:DONE-V1
    attempts:1. REMAINING = V2 inline-datum residual (194 tx0) → #24.
-24. [M][phase2][NEW wake325, split from #23] PlutusV2 inline-datum txInfoData over-cost — the 194 tx0 dumps NOT resolved by
-   the #23 V1 witness-datum dedup. V2 cases have NO witness plutus_data; the datums are INLINE in outputs (and possibly
-   reference-inputs). Babbage getBabbageSupplementalDataHashes: inline datums in outputs/ref-inputs ALSO feed txInfoData —
-   dugite likely includes/orders/dedups them differently from cardano-node → same MEM over-cost class. Still masked by
-   trust-on-consensus. Re-runnable byte-exact via examples/phase2_repro on /tmp/g23_still_diverge.txt (194). Also: 3 V1
-   cases now UNDER-consume post-dedup (-8794/-33798/-25224) — spot-check (dedup-too-much vs distinct). NEXT: DIAGNOSE the V2
-   inline-datum txInfoData construction vs Haskell. state:NEW attempts:0
+24. [M][phase2][ROOT-CAUSED wake326 (wogj8wp6h, conf 0.83)] PlutusV2 inline-datum-SPEND ExUnit over-cost (184 budget-
+   exhausted dumps at HEAD). *** CORRECTED: NOT txInfoData (the inline-datum→txInfoData hypothesis is REFUTED — cardano-ledger
+   Babbage/TxInfo.hs PV2 txInfoData = witness-only transTxWitsDatums; dugite already matches; adding inline datums = a
+   REGRESSION). Genuine cause: a FIXED +4230 mem / +1531582 cpu (BOTH dims) per-script over-cost correlated EXACTLY with a
+   SPEND of an input carrying an INLINE datum (decisive isolation tx 64ba355e: only the inline-datum-spend redeemer over-
+   costs, Mint byte-exact). Spend script's traversal cost of the inline-datum structure; NOT the Data tree (1:1). Localized
+   to populate_v1_v2.rs:115-118 / redeemer_resolve.rs:619-620 resolve_spend_datum / eval_redeemer.rs:122 / tx_info_populate.rs
+   :302 — exact line PENDING (conf 0.83). Caveat: reduced dumps omit 2 ref-input UTxOs (txInfoReferenceInputs=List[0]
+   offline) → +4230 is a FLOOR; pin needs full UTxO context via Koios. Refs: tx 512d46dc… ep60 script 8e60a204…, on-chain
+   mem=329275/steps=118172478. NEXT: pin the exact over-cost line (full UTxO context + CEK-work compare). state:ROOT-CAUSED
+   attempts:0
+25. [H?][phase2][NEW wake326, from wogj8wp6h corpus sweep] dugite WRONGLY ACCEPTS invalid scripts — 370 of 769
+   phase2-dumps-730val dumps are on-chain is_valid=FALSE (scripts SUPPOSED to fail, collateral-consuming) but dugite=Ok
+   (scripts PASS). dugite under-validates → would accept a tx cardano-node rejected (a real correctness gap for a block
+   producer; arguably HIGHER severity than the #24 over-cost since accepting-invalid > rejecting-valid). Re-runnable via
+   examples/phase2_repro (classify the is_valid=false dumps where dugite says Ok). NEXT: DIAGNOSE — pick a few, find why
+   dugite's script PASSES where cardano-node's FAILS (budget under-charge? a builtin that should error but doesn't? phase-2
+   validation gap?). state:NEW attempts:0
 0. [H][ledger][REAL-CURRENT, ROOT-CAUSED] mainnet ep246 reserves +82,270,482 / treasury -55,269. STRUCTURAL
    ROOT CAUSE (deep-dive wuc2kqb1z): the member-reward fold (rewards.rs:445-490) iterates go.delegations +
    separate go.stake_distribution.get(cred) lookup, whereas Haskell folds a SINGLE resolved active-stake VMap
@@ -253,7 +264,33 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #24 (PlutusV2 phase-2 residual) state:DIAGNOSING attempts:0 — muscle w90vykjte (BOUNDED) IN-FLIGHT; lock HELD (TTL 22m). #23-V1 DONE.
+- item: #24 (V2 inline-datum-spend over-cost) state:ROOT-CAUSED attempts:0 (conf 0.83, exact line pending). NEXT WAKE: pin the line or FIXING.
+  *** wake326-cont (ultracode): TWIST — the wake324 #23 muscle wogj8wp6h did NOT die; it ran 44min and COMPLETED with an
+  AUTHORITATIVE #24 diagnosis (Koios byte-exact + aiken cross-check) that SUPERSEDES the brief I gave w90vykjte. So my
+  wake325 "salvage of a dead muscle" was premature but CORRECT (the dedup fix it confirms = my committed 9c53405384; muscle:
+  "PlutusV1 144 divergent → 742 byte-exact, all V1 resolved"). I STOPPED the now-redundant w90vykjte (TaskStop) — it was a
+  concurrent analyze-mode muscle editing the MAIN tree (pollution risk); verified tree clean (only pre-existing common.rs,
+  #23 fix intact). *** #24 ROOT CAUSE (wogj8wp6h, conf 0.83): the V2 over-cost is NOT txInfoData — the handoff hypothesis
+  "inline datums → txInfoData via getBabbageSupplementalDataHashes" is REFUTED by cardano-ledger master
+  Babbage/TxInfo.hs: PV2 txInfoData = `unsafeFromList (Alonzo.transTxWitsDatums (tx^.witsTxL))` = WITNESS-ONLY (identical to
+  Alonzo); dugite already matches (V2 sample has 0 witness datums → dugite txInfoData=Map[0], correct). Adding inline datums
+  would be a REGRESSION. *** The genuine cause: a FIXED per-script over-cost of +4230 mem / +1531582 cpu (BOTH dims, not
+  mem-only — my earlier narrowing was wrong) correlated EXACTLY with a SPEND whose spent output carries an INLINE datum.
+  DECISIVE ISOLATION (tx 64ba355e): same TxInfo for 2 redeemers, only the inline-datum-spend redeemer over-costs (Mint idx0
+  byte-exact) → it's the spend script's TRAVERSAL cost of the inline-datum structure, NOT a shared over-sized list. Delta
+  multiplies ~6-10x when the validator folds the structure repeatedly. NOT the Data tree (plutus_data_to_data is 1:1; datum
+  identical to on-chain). Localized to dugite's inline-datum-spend ScriptContext/eval path: populate_v1_v2.rs:115-118
+  (witness-only, CORRECT), redeemer_resolve.rs:619-620 resolve_spend_datum (inline-first, matches getBabbageSpendingDatum),
+  eval_redeemer.rs:122 (applies datum arg), tx_info_populate.rs:302 plutus_data_to_data (1:1). EXACT divergent line NOT
+  pinned (conf 0.83). CAVEAT: the reduced dumps omit 2 ref-input UTxOs → txInfoReferenceInputs rendered List[0] offline →
+  measured +4230 is a FLOOR; full context needs the missing ref-input UTxOs (Koios). Refs: tx 512d46dc… (ep60, script
+  8e60a204…), Koios on-chain unit_mem=329275/steps=118172478. *** SEPARATE NEW CLASS (file as #25): wogj8wp6h corpus sweep
+  of all 769 at HEAD found 184 budget-exhausted (the #24 V2 over-cost) BUT ALSO 370 "dugite-PASS-but-should-fail" (on-chain
+  is_valid=false but dugite=Ok — dugite WRONGLY ACCEPTS scripts that cardano-node FAILED; a distinct, arguably-higher-
+  severity under-validation class). *** NEXT WAKE: (A) PIN #24's exact inline-datum-spend over-cost line — needs FULL UTxO
+  context (resolve the 2 missing ref inputs via Koios) + compare dugite's CEK work on the inline-datum spend term vs aiken/
+  on-chain; OR (B) tackle #25 (370 wrong-accept — higher severity: dugite accepting invalid scripts). RECOMMEND #25 (safety:
+  accepting invalid > rejecting valid) OR pin #24. Lock to release.
   *** wake326 (ultracode): SCHEDULE #24 (continues phase-2 momentum, byte-exact-checkable via the same dumps). PREP (direct,
   to bound the muscle + avoid the #23 muscle-death): the 194 still-diverging tx0 dumps = 88 "budget exhausted" (V2 MEM
   over-cost) + 106 other-error (a DIFFERENT non-budget class). The V2 budget sample tx0-018686176a5c5117 is pv8, 11 utxos,
@@ -2516,6 +2553,7 @@
 - 2026-06-07T18:xxZ wake323 ~ SCHEDULE+DRIVE #23: re-ran 363 #730 phase-2 dumps at HEAD (phase2_repro) → 363/363 still diverge (budget over-cost), filed #23 REPRODUCED
 - 2026-06-07T18:xxZ wake324 ~ #23 REPRODUCED→DIAGNOSING (MEM-only over-cost sharpened) + launched muscle wogj8wp6h (later DIED)
 - 2026-06-07T22:xxZ wake325(+cont) ~ SALVAGED dead muscle's txInfoData-dedup fix, VERIFIED (tx0 363→194, nextest 441/441) + commit/push 9c53405384; filed #24 (V2 residual)
+- 2026-06-07T23:xxZ wake326(+cont) ~ wogj8wp6h completed (44min, not dead) → #24 ROOT-CAUSED (inline-datum-spend over-cost, NOT txInfoData); stopped redundant w90vykjte; filed #25 (370 wrong-accept)
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -4044,3 +4082,9 @@
   #438-SAVE, not trusting the unverified 742 claim): tx0 dumps 363→194 diverge (169 byte-exact), nextest 441/441 no-regression.
   Committed+pushed focused fix 9c53405384 (tx_info_populate.rs +8). V2 inline-datum residual (194) filed as #24. Lesson:
   analyze-mode muscles edit the MAIN tree (no isolation) — recoverable from working tree even if the workflow dies.
+- wake326(+cont) 2026-06-07: SCHEDULE #24 + launched bounded muscle w90vykjte. TWIST: the wake324 muscle wogj8wp6h did NOT
+  die — ran 44min, COMPLETED with the authoritative #24 diagnosis (so wake325's "salvage" was premature-but-correct).
+  STOPPED redundant w90vykjte (TaskStop; tree verified clean). #24 ROOT-CAUSED (conf 0.83): V2 over-cost is inline-datum-SPEND
+  traversal (+4230mem/+1531582cpu, both dims), NOT txInfoData (refuted via cardano-ledger). Exact line pending. Filed #25
+  (NEW class: 370 dumps dugite WRONGLY ACCEPTS invalid scripts — on-chain is_valid=false but dugite=Ok). Lesson: don't
+  declare a muscle dead from a 0-byte output alone — it may be a very long (44min) run; check the agent transcript mtime.
