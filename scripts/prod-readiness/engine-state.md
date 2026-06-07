@@ -209,8 +209,18 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #15 (phase-2 — RE-FRAMED: V3 SpendingScriptInfo datum population, serialiseData was already correct)
-  state:FIXING (minimal correct fix; memo REVERTED). *** wake216: ANALYZE wpkh7n7c9 COMPLETE — definitive verdict
+- item: #15 (phase-2 — V3 SpendingScriptInfo datum population, canonical) state:VERIFYING-RESOAK (minimal correct fix).
+  *** wake218: MINIMAL fix muscle wkba3hja9 green (2 files dugite-uplc: redeemer_resolve.rs resolve_spend_datum_v3
+  [getBabbageSpendingDatum: inline <|> witness, None-tolerant] + eval_redeemer.rs purpose_to_script_info_v3 builds
+  ScriptInfo::Spending{datum} via CANONICAL plutus_data_to_data; NO memo; data.rs/to_cbor/serialiseData UNTOUCHED =
+  canonical; ledger datum-hash path untouched). DROVE: copied 2 files to main (clean HEAD + fix; data.rs 0 memo
+  confirmed), BUILD_EXIT=0, uplc nextest GREEN 435 (conformance preserved, serialiseData canonical), cloned
+  verify15min pid 17352. *** REPLAY VERDICT (prefix) = PASS: 0 'Error term' by slot 125010507 (prior 41), 0 total so
+  far (tip 125019223), 27751ab9 fixed, 0 phase-1. The CORRECT fix (canonical, no silent pass-where-Haskell-fails)
+  eliminates the 306 just like the memo did — confirming the 306 were the V3 None-datum, not byte-shape. Node syncing
+  full window. NEXT WAKE: confirm 306->0 PAST window (slot>125105013) -> RE-GAUNTLET (memo conceptual error GONE;
+  serialiseData canonical; V3 datum canonical) -> on PASS commit #15 (dugite-uplc, 1 crate).
+  was: state:FIXING (minimal correct fix; memo REVERTED). *** wake216: ANALYZE wpkh7n7c9 COMPLETE — definitive verdict
   (the gauntlet was RIGHT to refute the memo). serialiseData = canonical encodeData (getPlutusData strips MemoBytes
   before CEK); dugite encode_data ALREADY byte-matches PlutusCore (Q2 harness-proven); ep293 datum IS canonical so
   the wake165 '270 vs 276' was a MISDIAGNOSIS; the memo causes silent PASS-where-Haskell-FAILS for non-canonical
@@ -1472,6 +1482,10 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
+- wake218 2026-06-07: #15 MINIMAL fix wkba3hja9 green -> built -> uplc nextest 435 -> REPLAY PREFIX PASS. verify15min:
+  0 'Error term' by 125010507 (prior 41), 0 total so far, 27751ab9 fixed, 0 phase-1. Canonical V3-datum-population
+  fix WORKS (no memo) — confirms 306 were V3 None-datum not byte-shape. FIXING -> VERIFYING-RESOAK. NEXT WAKE: confirm
+  past window -> re-gauntlet (should PASS now) -> commit #15.
 - wake217 2026-06-07: POLL #15 MINIMAL fix muscle wkba3hja9 (V3 datum population, canonical, no memo) — still
   RUNNING, ACTIVE (worktree present, build/test). No transition. Disk 161G, no nodes. #15 stays FIXING. NEXT WAKE:
   poll/process -> build -> re-replay (306->0).
