@@ -178,7 +178,20 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:ROOT-CAUSED (phase-1 SEPARABLE; 306 are #15 not #10).
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:FIXING (commit-B hardening: R3 + no-silent-None).
+  *** wake164: DROVE ROOT-CAUSED -> FIXING. Generated FINAL-DONE base patch from main's uncommitted tree (3856 lines,
+  2 crates) -> scripts/prod-readiness/base-FINAL-DONE-main.patch (ABS path; FINAL-DONE is uncommitted on main =
+  invisible to fresh worktrees, so the muscle MUST git-apply it first). Launched FIX muscle wjuuqz22k (run
+  wf_52ea6a96-0ac, worktree): (R3) make json_number_to_word8_codec_version BYTE-EXACT with Aeson toBoundedInteger@
+  Word8 — current as_f64().fract() (serde_json no arbitrary_precision) accepts sub-ULP fractional 1.0000000000000001
+  Aeson rejects; fix = enable arbitrary_precision + read raw Number::as_str() token, integral+range test on the exact
+  literal; (no-silent-None) tag-4/tag-5 import decode failures must HARD-ERROR not silently None (no-silent-corruption
+  rule). Scope dugite-serialization + dugite-node. NEXT WAKE: poll; on green -> copy changed files into main,
+  verify-build, re-import-replay (confirm STILL 0 phase-1), then RE-GAUNTLET FINAL-DONE (prior 3/3 refute resolved:
+  R1+R2 297-attribution PROVEN general-UPLC #15; R3 fixed), then COMMIT #10 via gh/HTTPS (2 crates).
+  *** (#15 mechanism dim of wpeec891q still running — read whenever it completes; it finalizes #15 serialiseData, not
+  #10.) ***
+  was: state:ROOT-CAUSED (phase-1 SEPARABLE; 306 are #15 not #10).
   *** wake163 VERDICT = GENERAL-UPLC (the 306 'Error term' are NOT import-caused). Re-diagnose muscle wpeec891q
   classification dim COMPLETE found=true: of 15 sampled failing txs, 6/15 (40%) are PURELY post-snapshot, and
   CASE 27751ab9 (slot 125001020, PlutusV3 script 5b2bfe89) is FULLY INDEPENDENT — its only spending input 3d7bb051
@@ -1128,6 +1141,11 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake164 2026-06-07: #10 ROOT-CAUSED -> FIXING (commit-B hardening). Generated base-FINAL-DONE-main.patch (3856
+  lines, 2 crates) from main's uncommitted tree; launched FIX muscle wjuuqz22k (wf_52ea6a96-0ac, worktree, applies
+  base patch by abs path first) for R3 byte-exact float-parse (arbitrary_precision + raw token, Aeson toBoundedInteger)
+  + no-silent-None tag-4/5 import. NEXT WAKE: poll; green -> verify-build -> re-import (still 0 phase-1) -> re-gauntlet
+  -> commit #10. (#15 wpeec891q mechanism dim still running.)
 - wake163 2026-06-07: #10 DIAGNOSING -> ROOT-CAUSED. wpeec891q classification dim COMPLETE = GENERAL-UPLC: 6/15
   failing txs purely-post-snapshot, CASE 27751ab9 fully INDEPENDENT (input 3d7bb051 @124999282 never imported) yet
   fails -> import is NOT necessary -> the 306 belong to #15 (re-framed: serialiseData general-UPLC, NOT compact-
