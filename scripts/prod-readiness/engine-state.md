@@ -212,7 +212,19 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #1 (ep57 preprod stake-distribution) state:RECHECK-NEEDED — #20b DOWNGRADED (dump artifact); #2/#3/#11 RESOLVED by MIR fix.
+- item: #1 (ep57 preprod stake-distribution) state:RECHECK-BUILDING (clean fixed binary building pid 69201; preprod cross-network re-validate).
+  *** wake309 (ultracode): SCHEDULE #1 preprod recheck with the FIXED binary (cross-network confirmation of the MIR
+  fix; #1 was already DONE-on-clean-replay wake22-23 byte-exact, so this confirms + the apply_utxo_changes hypothesis
+  is suspect). DROVE: kicked off CLEAN rebuild pid 69201 (committed fix source, no instrumentation) ->
+  /tmp/dugite-clean-fix-build.log. Preprod dbs with from-genesis immutable blocks: db-preprod-sync (15G immutable),
+  db-clones/preprod-verify15 (16G). Pruned stale mainnet instrumentation dump dirs (globals/poolstake/percred/snapbd/
+  fix-verify, ~47M). NEXT WAKE: build done + strings-verify clean (no DUGITE_RUPD/SNAP symbols) -> APFS CoW-clone
+  db-preprod-sync -> from-genesis preprod replay with DUGITE_EPOCH_STATE_DUMP to ep57+ -> compare ep57 per-cred
+  stake-distribution + reserves/treasury to Koios PREPROD (koios.sh preprod) across ep0-100. If byte-exact (incl any
+  preprod treasury/reserve-MIR boundaries now fixed) -> #1 CLOSED + MIR-fix cross-network confirmed. If a real
+  divergence remains -> THEN it is a separate utxo/stake-distribution bug (the original #1 hypothesis). NOTE: preprod
+  genesis is Babbage (uses ShelleyRules via babbage.rs delegation -> the MIR fix applies). KEPT mainnet CoW clone
+  db-clones/mainnet-rupd-drop (CoW, ~0 physical) + mainnet-mirfix-verify + mainnet-droptrace dumps.
   *** wake308 (ultracode): #20b DIAGNOSED = SINGLE-EPOCH DUMP-CAPTURE ARTIFACT, not a chain bug. dugite reserves
   byte-exact at ep233/234/236/240/245/246; +318,200,635,000,000 appears ONLY at the ep235 dump (treasury byte-exact
   throughout). Since ep236 reserves are byte-exact, the +318.2T is NOT in the ledger state used for the ep235->236
@@ -3418,3 +3430,8 @@
   UNAFFECTED. DOWNGRADED #20b to L. #2/#3/#11 RESOLVED by the MIR fix (their epochs in the now-byte-exact ep209-247
   range) -> CLOSE. next wake: #1 ep57 preprod RECHECK with the FIXED binary (the apply_utxo_changes hypothesis is
   suspect — #0 was MIR not utxo; re-validate preprod ledger first). Housekeeping: prune old dump dirs + CoW clone.
+- wake309 (ultracode): SCHEDULE #1 preprod recheck w/ fixed binary (cross-network MIR-fix confirm; #1 already
+  byte-exact wake22-23). Kicked off clean rebuild pid 69201 (no instrumentation). Preprod dbs: db-preprod-sync (15G
+  immutable), db-clones/preprod-verify15. Pruned stale dump dirs. next wake: strings-verify clean -> CoW-clone
+  db-preprod-sync -> from-genesis preprod replay to ep57+ -> compare ep57 stake + reserves/treasury to Koios preprod
+  -> byte-exact => #1 CLOSED + cross-network confirmed; else separate utxo bug.
