@@ -212,7 +212,31 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #20c (epoch.rs test-MIR cleanup) state:NEW — #1 CLOSED (preprod byte-exact + MIR-fix cross-network confirmed).
+- item: #20c (epoch.rs test-MIR cleanup) state:ROOT-CAUSED attempts:0 — fix shape locked, proven inert. NEXT WAKE: FIXING.
+  *** wake312 (ultracode): #20c DIAGNOSED → ROOT-CAUSED (one step NEW→ROOT-CAUSED; code-consistency item, NO Koios/muscle
+  gauntlet — test-only code, no chain reference). FINDINGS: (1) state/apply.rs:292 is the LIVE 7-arg era-rules dispatch
+  `epoch_rules.process_epoch_transition(next_epoch, &epoch_ctx, &mut self.utxo, certs, gov, epochs, consensus)` →
+  confirms state/epoch.rs::process_epoch_transition(&mut self, new_epoch) (1-arg) is TRULY test-only (DCE'd in release;
+  callers only in tests.rs/governance.rs/epoch.rs#[cfg(test)]). (2) The MIR call at epoch.rs:479
+  (super::certificates::apply_pending_mir, placed AFTER SNAP-rotation L172 + mark-snapshot-build + POOLREAP L470) is
+  ALWAYS A NO-OP across the WHOLE test suite: the MIR-exercising tests (test_mir_stake_credential_distribution @4132,
+  test_mir_pot_transfer @4157, the apply_pending_mir-panic tests @4935-5059) call apply_pending_mir DIRECTLY (immediate
+  std::mem::take drain) and NEVER call the 1-arg process_epoch_transition; the tests that DO call it
+  (test_pre_conway_pp_update_* @4221+, all ~40 governance.rs tests, ~120 tests.rs tests) set NO MIR certs (governance.rs
+  grep for MoveInstantaneousRewards/pending_mir = ZERO). The two sets are DISJOINT → pending_mir is empty whenever the
+  1-arg path's MIR call fires. (3) The comment at epoch.rs:473-477 is STALE/WRONG: it reads "MIR rule (Haskell EPOCH
+  ordering: SNAP → POOLREAP → MIR → NEWPP)" = the PRE-#0-fix ordering. Correct Haskell NEWEPOCH ordering (validated
+  byte-exact on mainnet ep209-247 by the live shelley.rs fix 8c868271c9) is applyRUpd → MIR → EPOCH(SNAP→POOLREAP→UPEC):
+  MIR BEFORE SNAP. *** FIX SHAPE (LOCKED, next wake): in state/epoch.rs::process_epoch_transition move the
+  apply_pending_mir call from L479 (after SNAP+POOLREAP) to AFTER Step 1 applyRUpd (~L160) / BEFORE Step 2b SNAP (L162),
+  mirroring the live shelley.rs MIR-before-SNAP placement; replace the L473-477 comment with the correct NEWEPOCH order +
+  a one-line Haskell-quote ref. PROVEN BEHAVIORALLY INERT (all tests no-op the MIR call) → zero test churn expected.
+  *** VERIFY PLAN (FIXING+VERIFYING wakes): cargo nextest run -p dugite-ledger must stay GREEN (currently 1521/1521) +
+  clippy --all-targets -D warnings + fmt --check; review the diff confirms reorder = no-op (no MIR-bearing test path).
+  COMMIT: 1 crate (dugite-ledger), focused, after tests green (no replay — test-only path has no Koios reference, so the
+  byte-exactness gauntlet is N/A; the live MIR ordering it now matches is already gauntlet-validated by #0). This closes
+  the #0 MIR-before-SNAP thread tail (eliminates the test-only mirror's drift trap: a future MIR-exercising test through
+  this path would otherwise silently get the wrong pre-fix ordering).
   *** wake311 (ultracode): #1 DONE/CLOSED. Preprod recheck with the CLEAN FIXED binary: dugite vs Koios PREPROD totals
   BYTE-EXACT at ep5/20/40/57/80/100/130 (reserves+treasury). ep57 byte-exact confirms the stake-distribution is correct
   (a -10 ADA stake error would cascade into reserves/rewards — none) -> the original #1 '-10 ADA' was STALE (matches
