@@ -209,7 +209,19 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:ROOT-CAUSED-VALUE (total_active_stake 109,573,937,991-lovelace deficit; find the missing stake).
+- item: #0 (mainnet ep246 reserves) state:ROOT-CAUSED-VALUE (per-pool poolstake instrumentation building; find the 109.6B-short pools).
+  *** wake285 (ultracode): confirmed ptr_stake IS populated (common.rs:268/362 += coin) -> pointer stake is NOT
+  entirely missing; the 109,573,937,991 deficit is a subtler stake-snapshot under-count (same class as #1 ep57
+  stake-distribution + #11 dereg). go.pool_stake construction = epoch.rs:199-254 (delegation utxo_stake + reward_balance
+  per epoch.rs:215, + resolved pointer stake 226-254); snapshot_stake mirror 261-302. DROVE: instrumented per-pool dump
+  in rewards.rs (env DUGITE_RUPD_POOLSTAKE -> eprintln 'POOLSTAKE tas=<total_active_stake> pool=<hex> stake=<lovelace>'
+  for EVERY go.pool_stake entry, tagged by total_active_stake so the ep246 lines = tas=21956097174685676). cargo check
+  CLEAN (5.65s). Build launched -> /tmp/dugite-poolstake-build.log. NEXT WAKE: strings-verify -> replay over CoW clone
+  w/ DUGITE_RUPD_POOLSTAKE=1 -> grep 'POOLSTAKE tas=21956097174685676' = dugite per-pool go-stake at ep246 -> diff each
+  pool vs Koios pool_stake_snapshot (the GO column, ep246 query) per pool [parallelize via workflow, 1570 pools] -> the
+  short pool(s) summing to 109,573,937,991 -> their cred-class -> the FIX in epoch.rs go.pool_stake/snapshot_stake
+  construction (utxo_stake/reward_balance/pointer). Instrumentation UNCOMMITTED (globals+poolstake+drop-trace rewards.rs,
+  paid-set shelley.rs). CoW clone db-clones/mainnet-rupd-drop KEPT.
   *** wake284 (ultracode): **BREAKTHROUGH — the ~5 ppm is total_active_stake being 109,573,937,991 lovelace (4.991 ppm)
   TOO LOW.** ep246 RUPD_GLOBALS (saved epoch-dumps-engine/mainnet-globals/ep246_globals.txt): reserves=
   12,905,245,994,461,083 ; epoch_fees=13,516,792,921 (==Koios ep244 fees ✓) ; d=13/50=0.26 (==Koios ep244 ✓) ;
@@ -3100,3 +3112,9 @@
   go.pool_stake (active-stake snapshot). Same class as #1/#11 stake-distribution. SIGTERM'd replay. next wake: per-pool
   go.pool_stake vs Koios pool_stake_snapshot to find the missing-stake pool/cred-class (pointer stake? reward_balance?
   dereg-timing?). Fix lands at go.pool_stake construction (epoch.rs SNAP fold).
+- wake285 (ultracode): ptr_stake IS populated (not all-missing); the 109.6B deficit is a subtler stake-snapshot
+  under-count (#1/#11 class). go.pool_stake built epoch.rs:199-254 (deleg utxo+reward_balance + pointer). Instrumented
+  per-pool dump (env DUGITE_RUPD_POOLSTAKE -> POOLSTAKE tas=<total_active_stake> pool=<hex> stake=<lovelace>). cargo
+  check CLEAN, building. next wake: replay -> grep POOLSTAKE tas=21956097174685676 -> diff each pool vs Koios
+  pool_stake_snapshot (workflow, 1570 pools) -> short pool(s) summing to 109,573,937,991 -> cred-class -> fix in
+  epoch.rs snapshot construction.
