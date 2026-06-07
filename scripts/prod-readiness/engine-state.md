@@ -209,8 +209,22 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #15 (phase-2 serialiseData verbatim-bytes) state:DIAGNOSING (gauntlet REFUTED 3/3 — PROFOUND, may REVERSE
-  the whole memo approach). *** wake213: GAUNTLET w4a16gr1r REFUTED 3/3. R1 (haskell-semantics, DEEP): the
+- item: #15 (phase-2 — RE-FRAMED: V3 SpendingScriptInfo datum population, serialiseData was already correct)
+  state:FIXING (minimal correct fix; memo REVERTED). *** wake216: ANALYZE wpkh7n7c9 COMPLETE — definitive verdict
+  (the gauntlet was RIGHT to refute the memo). serialiseData = canonical encodeData (getPlutusData strips MemoBytes
+  before CEK); dugite encode_data ALREADY byte-matches PlutusCore (Q2 harness-proven); ep293 datum IS canonical so
+  the wake165 '270 vs 276' was a MISDIAGNOSIS; the memo causes silent PASS-where-Haskell-FAILS for non-canonical
+  datums (Q4 airtight: non-canonical datum spent by blake2b(serialiseData)==datum_hash script is is_valid=false
+  on-chain [canonical!=wire] but dugite-memo returns verbatim->matches->wrongly is_valid=true). REAL ROOT CAUSE: the
+  306 were because the PlutusV3 SpendingScriptInfo spending DATUM was built as None (V3 branch left datum=None) ->
+  script got no datum -> Error term. V1/V2 already correct. DROVE: REVERTED main's dugite-uplc to clean HEAD (no memo,
+  structural Data); launched MINIMAL FIX muscle wkba3hja9 (run wf_96017a98-ead, NO bridge — worktree==clean HEAD) to
+  add ONLY the V3 SpendingScriptInfo datum population (getBabbageSpendingDatum: inline <|> witness, None-tolerant)
+  built CANONICAL (plutus_data_to_data, NO memo), serialiseData untouched/canonical. NEXT WAKE: poll -> build ->
+  re-replay (306->0, now CORRECT for non-canonical too) -> re-gauntlet -> commit. LESSON: the original #15 'verbatim
+  memo' passed its replay for the WRONG reason (ep293 canonical + V3-datum-population masked it); the gauntlet's
+  haskell-semantics refuter caught the conceptual error. serialiseData is canonical, NOT verbatim.
+  *** wake213: GAUNTLET w4a16gr1r REFUTED 3/3. R1 (haskell-semantics, DEEP): the
   serialiseData BUILTIN is NOT verbatim-MemoBytes — transDatum/transRedeemer call getPlutusData (STRIPS MemoBytes) ->
   PlutusCore.Data.Data (no bytes) -> Serialise `encode=encodeData` ALWAYS CANONICAL. So serialiseData = PlutusCore-
   canonical encodeData, NEVER verbatim. The 306->0 replay passed ONLY because ep293 datums are ALREADY PlutusCore-
@@ -1458,6 +1472,11 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
+- wake216 2026-06-07: #15 ANALYZE wpkh7n7c9 COMPLETE -> DIAGNOSING -> ROOT-CAUSED -> FIXING. Verdict: memo WRONG
+  (serialiseData=canonical encodeData, dugite encoder already matches; ep293 datum IS canonical; memo = silent pass-
+  where-Haskell-fails on non-canonical). REAL cause: V3 SpendingScriptInfo datum was None. Reverted main dugite-uplc
+  to clean HEAD; launched MINIMAL fix wkba3hja9 (V3 datum population, CANONICAL, no memo; no bridge). NEXT WAKE: poll
+  -> build -> re-replay (306->0) -> re-gauntlet -> commit. Gauntlet caught a fix that passed replay for wrong reason.
 - wake215 2026-06-07: POLL #15 ANALYZE wpkh7n7c9 — RESEARCH STAGE DONE w/ DEFINITIVE VERDICT (root-cause stage still
   running): MEMO IS WRONG, R1 CONFIRMED. Q1: serialiseData = BSL.toStrict.serialise = encodeData (CANONICAL);
   getPlutusData STRIPS MemoBytes before the CEK (datum AND redeemer = bytes-less PLC.Data) -> serialiseData is
