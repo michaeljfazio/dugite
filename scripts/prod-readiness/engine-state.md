@@ -194,8 +194,19 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:FIXING (commit-B FINAL hardening: R1+R2).
-  *** wake180: RE-GAUNTLET wd3lzyawv = REFUTED 2/3 BUT the 3rd refuter (compounding-feedback) VERIFIED all 6 prior
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:VERIFYING-RESOAK (commit-B FINAL, R1+R2).
+  *** wake184: FIX muscle w3dsqneah COMPLETED green (tier B, 1 crate dugite-serialization mempack/mod.rs+tests; node/
+  ledger UNTOUCHED confirmed). R1 dangerouslyBig: O(1) bounds before pow (net_exp>=3=>None [coeff>=1, 10^3>255];
+  net_exp<0 => trailing_zero_digits() scan, no 10^|e| materialised); huge-exp tests <0.02s. R2 full-consumption:
+  TvarIterator asserts consumed==val_bytes.len() else Some(Err)+finished (Data.MemPack unpackFail); key side already
+  strict (txin==34B). DROVE: copied 2 files to main (2-crate footprint, node/ledger 0 R1/R2 markers), BUILD_EXIT=0
+  (NO drift this time — the 3-crate bridge worked), GC'd worktree, cloned verify10B3 pid 41461. Import BYTE-IDENTICAL
+  to verify10B2: utxo_count=4116338 + txix_low=3131782 txix_mult256=62 IDENTICAL (R2 dropped nothing — the prior
+  '4116339' was a misrecollection; 4116338 is consistent across ALL runs). R1 happy-path codec_version=1 Big, 0
+  phase-1, 0 NotFullyConsumed (well-formed TxOuts fully consume). Node syncing window as evidence. NEXT WAKE: confirm
+  0-phase-1 past window -> RE-GAUNTLET (R1+R2 addressed; 6 paths byte-exact-verified; compounding-feedback already
+  passed) -> on PASS COMMIT #10 via gh/HTTPS (2 crates) + file #19 (opaque-addr) + activate #15 (serialiseData).
+  was: state:FIXING (commit-B FINAL hardening: R1+R2). *** wake180: RE-GAUNTLET wd3lzyawv = REFUTED 2/3 BUT the 3rd refuter (compounding-feedback) VERIFIED all 6 prior
   paths byte-exact (couldn't refute). The 2 NEW narrow edges (both concrete + Haskell-grounded, both in dugite-
   serialization/src/mempack/mod.rs ONLY): (R1 haskell-semantics) R3's c==0 short-circuit fixed 0e<huge> but NONZERO-
   coeff huge-exponent 1e2000000000 still hits BigInt::pow(2e9) -> GB/OOM; Haskell toBoundedInteger has dangerouslyBig
@@ -1277,6 +1288,10 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake184 2026-06-07: #10 FIXING -> VERIFYING-BUILDING -> VERIFYING-RESOAK. R1+R2 muscle w3dsqneah green (1 crate,
+  dangerouslyBig O(1) bound + full-consumption assert). Copied to main, BUILD_EXIT=0 (no drift — 3-crate bridge),
+  verify10B3 import BYTE-IDENTICAL (utxo_count=4116338 same txix dist; the '4116339' was misremembered), codec=1 Big,
+  0 phase-1, 0 NotFullyConsumed. NEXT WAKE: window 0-phase-1 -> re-gauntlet -> commit.
 - wake183 2026-06-07: POLL #10 FIX muscle w3dsqneah — still RUNNING (cargo-nextest pid 29079 in test phase, not
   wedged). No transition. Disk 173G, no soak nodes. #10 stays FIXING. NEXT WAKE: poll/process result.
 - wake182 2026-06-07: POLL #10 FIX muscle w3dsqneah — still RUNNING, ACTIVE (last activity 6s ago, between build
