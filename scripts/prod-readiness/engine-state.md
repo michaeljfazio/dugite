@@ -209,7 +209,7 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:GAUNTLET-PENDING (FIX VERIFIED BYTE-EXACT; gauntlet wodons7bq launched).
+- item: #0 (mainnet ep246 reserves) state:GAUNTLET-PENDING (polled wake304 19:38 — gauntlet wodons7bq 3 refuters ACTIVE, deep Haskell/Koios analysis, none done). FIX VERIFIED BYTE-EXACT.
   *** wake303 (ultracode): **MIR-FIX VERIFIED BYTE-EXACT (#438 acceptance MET).** mainnet-mirfix-verify re-replay:
   ep246 reserves=12,880,948,865,137,767 (diff 0 vs Koios!) + treasury=292,077,855,298,344 (diff 0!) ; ep245 reserves/
   treasury == Koios (baseline unregressed) ; ep213 == Koios ; ep247 carried-forward +82M GONE. Broad spot-check
