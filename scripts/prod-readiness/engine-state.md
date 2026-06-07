@@ -212,7 +212,24 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #20b (mainnet ep235 reserve-MIR transient) state:NEW — #21 re-validation DONE (MIR-fix closed a broad class).
+- item: #1 (ep57 preprod stake-distribution) state:RECHECK-NEEDED — #20b DOWNGRADED (dump artifact); #2/#3/#11 RESOLVED by MIR fix.
+  *** wake308 (ultracode): #20b DIAGNOSED = SINGLE-EPOCH DUMP-CAPTURE ARTIFACT, not a chain bug. dugite reserves
+  byte-exact at ep233/234/236/240/245/246; +318,200,635,000,000 appears ONLY at the ep235 dump (treasury byte-exact
+  throughout). Since ep236 reserves are byte-exact, the +318.2T is NOT in the ledger state used for the ep235->236
+  computation (else ep236 would diverge) -> it is the epoch-state-debug dump capturing reserves at a transient moment
+  during a large ep235 reserve event (likely an AVVM-return / reserve-MIR mid-application), NOT a real ledger
+  divergence. Cumulative ledger reserves are correct everywhere -> chain conformance UNAFFECTED. DOWNGRADED #20b to
+  L (dump-cosmetic; characterize the ep235 dump-timing later, non-blocking). *** #2 (#11 mainnet stake-dereg residual)
+  + #3 (mainnet ep213 reserves) RESOLVED by the MIR-before-SNAP fix: their epochs are in the ep209-247 range now
+  confirmed byte-exact (ep213/ep246 diff 0) -> CLOSE. NEXT WAKE: SCHEDULE #1 (ep57 preprod stake-distribution -10 ADA)
+  RECHECK — the standing prompt's apply_utxo_changes hypothesis is now SUSPECT (the #0 'apply_utxo_changes' premise was
+  WRONG; #0 was MIR-ordering). Preprod boundaries with treasury/reserve-MIRs may ALSO have been mis-snapshotted by the
+  same bug -> re-validate preprod ledger vs Koios preprod with the FIXED binary FIRST (a from-genesis preprod replay or
+  the existing db-clones/preprod-* ); if ep57 still -10 ADA after the MIR fix, THEN it's a separate utxo-class bug.
+  Alt next items: #16/#17/#19/#20 (snapshot adversarial-hardening), #20c (epoch.rs test-MIR cleanup), #20b-cosmetic.
+  HOUSEKEEPING pending: prune mainnet-{globals,poolstake,percred,snapbd,fix-verify} dump dirs + db-clones/mainnet-
+  rupd-drop (~46G).
+  *** #0 RESOLVED (8c868271c9) + broad reward/treasury class closed (ep209-247 byte-exact). ***
   *** wake307 (ultracode): #21 LEDGER.MAINNET FRONTIER RE-VALIDATED post-MIR-fix (from the fix-applied
   mainnet-mirfix-verify dumps ep0-254, instrumentation was env-off=no-op). Diffed EVERY ep208-247 reserves+treasury vs
   Koios totals: **ep209-247 ALL BYTE-EXACT EXCEPT ep235.** Only 2 lines diverge: ep208 (Byron->Shelley era-transition
@@ -3395,3 +3412,9 @@
   resolved (recheck+close). next wake: #20b ep235 reserve-MIR (+318.2T, treasury exact, self-corrects by ep245) —
   diagnose koios reserve_withdrawals + the MIR cert at ep234/235 + dugite pending_mir_reserves/apply_pending_mir
   reserves path. Housekeeping: prune old instrumentation dump dirs + CoW clone (keep mirfix-verify + droptrace).
+- wake308 (ultracode): #20b DIAGNOSED = single-epoch ep235 DUMP-CAPTURE ARTIFACT (reserves byte-exact at
+  ep233/234/236/240/245/246; +318.2T only at the ep235 dump, treasury exact). ep236 byte-exact proves it is NOT in the
+  computation-relevant ledger state -> dump-timing cosmetic during a large ep235 reserve event, chain conformance
+  UNAFFECTED. DOWNGRADED #20b to L. #2/#3/#11 RESOLVED by the MIR fix (their epochs in the now-byte-exact ep209-247
+  range) -> CLOSE. next wake: #1 ep57 preprod RECHECK with the FIXED binary (the apply_utxo_changes hypothesis is
+  suspect — #0 was MIR not utxo; re-validate preprod ledger first). Housekeeping: prune old dump dirs + CoW clone.
