@@ -281,7 +281,31 @@
    preserved (era decoders read_set only strips tag-258, no sort/dedup). Haskell txInfoSignatories = Set.toList
    (reqSignerHashesTxBodyL :: Set) → ascending+deduped. Out-of-order or duplicate required_signers → different ScriptContext +
    different ExUnit cost. Used by all populate_tx_info_v{1,2,3}. how_to_confirm: tx with required_signers out of ascending byte
-   order (or a dup) → dump TxInfo.signatories vs cardano-node. state:NEW attempts:0 conf:0.6
+   order (or a dup) → dump TxInfo.signatories vs cardano-node.
+   *** ROOT-CAUSED wake380 (HEAD-verified by engine + diagnose Workflow w9r1peyto conf 0.9, in-turn). is_real_gap=TRUE. HASKELL
+   (V1/V2/V3 identical, shared Alonzo helper): txInfoSignatories = transKeyHash <$> Set.toList(reqSignerHashesTxBodyG) =
+   ASCENDING 28-byte byte order + DEDUPED (Ord KeyHash = lexicographic 28 bytes; transKeyHash = pure 28-byte copy). Reused
+   verbatim by Babbage (V1+V2) + Conway (V3) — no V3-specific path. DECODE STRICTNESS (version-gated decodeSet): Alonzo PV5-6 /
+   Babbage PV7-8 LENIENT (Set.fromList re-sorts+dedups any array, accepts out-of-order AND duplicates); Conway PV9+
+   decodeSetEnforceNoDuplicates REJECTS DUPLICATES at decode (`when len/=count fail`) but accepts out-of-order-distinct
+   (re-sorts via Set.fromList(reverse)); ordering NEVER enforced at PV>=2. DUGITE GAP: body key 14 decoded into
+   Vec<Hash<32>> in WIRE order (read_set strips tag-258 only, no dedup/no dup-reject); required_signers_to_plutus_padded
+   (tx_info_populate.rs:481-485) maps wire order with NO sort/dedup → V1/V2/V3. *** STRONG CORROBORATION: dugite ALREADY
+   canonicalizes its OTHER Set-like TxInfo fields to Set.toList — sort_inputs+dedup (tx_info_populate.rs:429), withdrawals
+   sort_by cmp_ledger (598), datums sort_by_key hash (553), voters sort_by cmp_ledger (redeemer_resolve.rs:319). required_signers
+   is the ONE Set field still in wire order — the missing one. FIX (A) PRIMARY (this item): in required_signers_to_plutus_padded
+   after .collect() into Vec<PubKeyHash=[u8;28]>, add `out.sort(); out.dedup();` (sort on the 28-byte form; PubKeyHash derived
+   lexicographic Ord == Haskell Ord(KeyHash) → reproduces Set.toList EXACTLY for V1/V2/V3 in one helper) + a shuffled-with-dups
+   proptest asserting ascending-unique. FIX (B) BROADER → fold into #31 / file #31-set-strictness: Conway PV9+ reject-duplicates
+   at DECODE for ALL tag-258 Set fields (key14 required_signers + inputs/collateral/certs/reference_inputs/vkey_witnesses) —
+   a CBOR-strictness gap (#28/#31 class): dugite accepts a dup-bearing Conway tx Haskell rejects at decode (admission asymmetry;
+   (A) masks the txInfoSignatories content but not the acceptance). Do NOT enforce ascending order (Haskell never does at PV>=2);
+   do NOT dup-reject Alonzo/Babbage (lenient there — (A) dedup matches). OBSERVABILITY: mostly adversarial/non-canonical (honest
+   cardano-cli txs already emit sorted+unique required_signers → honest sync unaffected), but a live divergence for any Plutus
+   script reading txInfoSignatories on a hand-crafted out-of-order/dup tx. FIX-TIME CAVEAT: Haskell quotes via WebFetch master
+   (line numbers may drift) — permalink-pin / oracle-reconfirm transTxBodyReqSignerHashes + decodeSetEnforceNoDuplicates before
+   landing. state:ROOT-CAUSED attempts:0 conf:0.9. NEXT: FIXING (A) sort+dedup + proptest; gauntlet (Haskell-Set.toList match +
+   over-canonicalization check: confirm sorting matches the other already-sorted fields' convention) → commit. (B) tracked sep.
 31. [M][serialization][NEW] Witness-set decoders silently skip unknown map keys (the #537/#539 silent-skip class, new site).
    Alonzo/Babbage/Conway tx-witness-set map decoders fall through `_ => { r.skip()? }` for keys outside 0..7 (era_alonzo.rs:
    1019-1021, era_babbage.rs:~910-912, era_conway.rs:2232-2234), silently discarding. Haskell decodes via SparseKeyed
@@ -548,7 +572,15 @@
    reconstruction + #7 sub-tx forward). state:DONE attempts:0
 
 ## In-progress
-- item: #29 DONE (committed f816efc9b1) — byte-exact TreasuryWithdrawals cap basis (cap_treasury==ensTreasury), gauntlet PASSED 0/3. NEXT: #30 [M] txInfoSignatories sort.
+- item: #30 [M] txInfoSignatories wire-order ROOT-CAUSED (conf 0.9, Haskell Set.toList sort+dedup confirmed; dugite's lone uncanonicalized Set field). NEXT: FIXING (A) sort+dedup.
+  *** wake380 (ultracode): SCHEDULE #30, DRIVE NEW→ROOT-CAUSED. HEAD-verified required_signers_to_plutus_padded does no
+  sort/dedup, then diagnose Workflow w9r1peyto (in-turn, conf 0.9) SOURCE-CONFIRMED: Haskell txInfoSignatories =
+  Set.toList(reqSignerHashesTxBody) = ascending+deduped (V1/V2/V3, shared Alonzo helper); decode is version-gated (Alonzo/
+  Babbage lenient re-sort+dedup; Conway PV9+ rejects DUPLICATES at decode). Strong corroboration: dugite ALREADY sorts its other
+  Set-like TxInfo fields (inputs/withdrawals/datums/voters) — required_signers is the lone wire-order exception. FIX (A) primary:
+  out.sort()+out.dedup() in required_signers_to_plutus_padded (28-byte form = Haskell Ord(KeyHash)) → fixes V1/V2/V3. FIX (B)
+  broader (Conway PV9+ dup-reject-at-decode for all tag-258 Set fields) → fold into #31. Observability adversarial/non-canonical
+  (honest cardano-cli txs canonical). NEXT WAKE: SCHEDULE #30 FIXING (A) + proptest.
   *** wake376 (ultracode): re-ran the #29 gauntlet (w7yhosc8m, 3 lenses) on the reworked code → PASSED 0/3, each lens
   substantive + cross-checked conway.md. cap_treasury (full-fold) == Haskell ensTreasury for ALL cases incl. unregistered;
   epochs.treasury.0 (disbursed) == casTreasury, :2288 untouched, no leak (engine-verified); ep247 pre-Conway so validated range
@@ -3399,6 +3431,7 @@
 - 2026-06-08T23:15Z wake368 ~ #29 gauntlet wq63ah2hg: 1/3 refute but DECISIVE (lens1+lens3) — v1 over-disburses in the unregistered-target edge (cap basis uses disbursed not full fold). REJECT; →FIXING attempts:2 (byte-exact rework: transient cap_treasury full-fold-decremented). NO commit
 - 2026-06-09T00:00Z wake372 ~ #29 byte-exact rework (wpn0y1m1z, in-turn): transient cap_treasury full-fold-decremented for the cap check, :2288 untouched; edge test EMPIRICALLY fails under v1; INDEPENDENTLY verified 1525/1525. Resolves wake368 refutation. Re-gauntlet next
 - 2026-06-09T00:30Z wake376 ~ #29 re-gauntlet w7yhosc8m PASSED 0/3 (substantive, cross-checked conway.md): cap_treasury==ensTreasury byte-exact, casTreasury untouched, no leak, ep247 pre-Conway. COMMITTED f816efc9b1. #29 DONE. Filed #29-order [L]. Next #30
+- 2026-06-09T01:00Z wake380 ~ #30 NEW→ROOT-CAUSED: diagnose w9r1peyto (in-turn, conf 0.9) source-confirmed Haskell txInfoSignatories=Set.toList sort+dedup (V1/V2/V3) + Conway PV9+ dup-reject-at-decode. dugite's lone uncanonicalized Set field. Fix=sort+dedup in builder; (B) dup-reject→#31. Next FIXING
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -5071,3 +5104,9 @@
   lens substantive + cross-checked conway.md. cap_treasury==ensTreasury byte-exact (full fold, all cases); epochs.treasury.0==
   casTreasury (:2288 untouched, no leak); ep247 pre-Conway. COMMITTED f816efc9b1 (dugite-ledger, 1 crate). #29 DONE (full
   lifecycle diagnose→fix-v1→REFUTED→rework→PASS). Filed #29-order [L] (within-pass gov-action ordering, pre-existing). NEXT: #30.
+- wake380 2026-06-09: SCHEDULE #30, DRIVE NEW→ROOT-CAUSED. HEAD-verified required_signers_to_plutus_padded has no sort/dedup,
+  then diagnose Workflow w9r1peyto (in-turn, conf 0.9) source-confirmed Haskell txInfoSignatories = Set.toList (ascending+
+  deduped, V1/V2/V3) + the version-gated decodeSet strictness (Conway PV9+ rejects duplicates at decode). Corroborated: dugite
+  already canonicalizes its other Set-like TxInfo fields — required_signers is the lone wire-order one. FIX (A): out.sort()+
+  out.dedup() in required_signers_to_plutus_padded; FIX (B) Conway dup-reject-at-decode → fold into #31. state:ROOT-CAUSED.
+  NEXT: FIXING (A).
