@@ -140,7 +140,23 @@
    reorder/removal), so era-relative index == fromEnum(language) today. Patch comments self-contradict
    ('era-relative' vs 'global'). NOT a current divergence. FIX: make the mapping era-aware (or assert the prefix
    invariant + comment) when a future era reorders/removes a language. state:NEW attempts:0 (follow-up after #10 lands)
-15. [M][phase2][REAL-NEW wake86] Fast-start residual 277 "script returned Error term" — SEPARATE from #10's
+15. [M][phase2][REAL — RE-FRAMED wake163: GENERAL-UPLC, NOT import-incompleteness] 306 (was 277) "script returned
+   Error term" phase-2 divergences (uplc says fail, on-chain is_valid=true). *** wake163 RE-DIAGNOSIS OVERTURNS the
+   old framing below: classification muscle wpeec891q found a FULLY-INDEPENDENT PURELY-POST-SNAPSHOT failing tx
+   27751ab9 (slot 125001020, PlutusV3 5b2bfe89; only input 3d7bb051 @slot124999282 > cutoff 124999169 = NEVER
+   imported) — so these are NOT import-incompleteness and the old 'full-replay byte-exact / compact-address' suspect
+   is REFUTED (the full-replay-byte-exact claim was UNVERIFIED at ep293). CODE-CONFIRMED ROOT CAUSE: dugite
+   serialiseData builtin crates/dugite-uplc/src/builtin/denotations.rs:597-604 does d.to_cbor() = CANONICAL re-encode,
+   but Haskell serialiseData returns the MEMOISED ORIGINAL bytes (MemoBytes/BinaryData). A script that serialiseDatas
+   a non-canonical Data (Constr tag-102 / indefinite arrays / non-minimal ints) and hashes/compares the result
+   diverges -> logical Error term. serialiseData is the ONLY Data-BYTES divergence vector (all other Data builtins
+   structural) — consistent with the wake161 inline-datum-resolution fix being a NO-OP. FIX (Tier A', dugite-uplc):
+   dugite's Data must carry the original CBOR bytes (like Haskell MemoBytes) so serialiseData returns the memo when
+   present, canonical re-encode only for machine-constructed Data; thread original bytes from CBOR decode of
+   datums/redeemers/Data through the CEK Constant::Data. VERIFY by replaying the ep293 window (slots 125001020+) and
+   confirming 306 -> ~0. mechanism dim of wpeec891q still confirming (does 27751ab9's script invoke builtin tag 51?).
+   state:ROOT-CAUSED attempts:0 (becomes active AFTER #10 phase-1 lands). --- OLD (wake86, now refuted) framing: ---
+   Fast-start residual 277 "script returned Error term" — SEPARATE from #10's
    key/datum/refscript/multiasset (those are fixed: 549->277, not-found+budget zeroed). On the FULL-fix re-import
    re-soak (db-clones/preprod-verify10c retained), 277 DISTINCT txs each emit one "uplc fails but on-chain
    is_valid=true; trusting consensus" Error-term (e.g. 8b1a6a78 @slot125081937, ff9bc7d2, ff448523, fcee9506).
@@ -162,7 +178,21 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:DIAGNOSING (mechanism REFUTED by replay; re-open).
+- item: #10 (now "fast-start phase-2 IMPORT COMPLETENESS") state:ROOT-CAUSED (phase-1 SEPARABLE; 306 are #15 not #10).
+  *** wake163 VERDICT = GENERAL-UPLC (the 306 'Error term' are NOT import-caused). Re-diagnose muscle wpeec891q
+  classification dim COMPLETE found=true: of 15 sampled failing txs, 6/15 (40%) are PURELY post-snapshot, and
+  CASE 27751ab9 (slot 125001020, PlutusV3 script 5b2bfe89) is FULLY INDEPENDENT — its only spending input 3d7bb051
+  was created at slot 124999282 (113 slots ABOVE the snapshot cutoff 124999169 => live block-decoded, NEVER imported)
+  yet it STILL fails. One independent never-imported failing tx is DISPOSITIVE: import is NOT necessary for the bug.
+  IMPLICATION: #10's phase-1 import work (FINAL-DONE: 0 phase-1 rejections, byte-exact codec-version/endianness/TxOut-
+  completeness) is DONE and SEPARABLE; the 306 phase-2 'Error term' belong to #15 (general phase-2 UPLC), NOT #10.
+  The serialiseData mechanism dim of wpeec891q is STILL RUNNING (will confirm vs 10a0dbda/27751ab9). REMAINING #10
+  WORK before commit: (i) fold R3 float-parse hardening (json_number_to_word8 gate on Number::as_u64/as_i64, reject
+  sub-ULP fractional that Aeson rejects) + the no-silent-None on tag-4/5 import; (ii) RE-GAUNTLET FINAL-DONE — the
+  prior 3/3 refute is now RESOLVED (R1+R2 297-attribution: PROVEN to be #15/general-UPLC not #10; R3: fixed); (iii)
+  commit (dugite-serialization + dugite-node, <=2 crates) via gh/HTTPS. NEXT WAKE: read wpeec891q mechanism result
+  (finalize #15 root cause = serialiseData), then DRIVE #10 step (i) launch a small fix muscle for R3+no-silent-None.
+  was: state:DIAGNOSING (mechanism REFUTED by replay; re-open).
   *** wake161 VERDICT: the inline-datum fix is a NO-OP — REPLAY ARBITRATES. verify10A (FINAL-DONE + uplc
   inline_spend_datum) synced PAST the window (tip 125108218 > 125105013) and shows 306 'Error term' = SAME as
   verify10j's 297 (FINAL-DONE alone; +9 is just more blocks). The R1+R2 refuter mechanism (imported inline-datum
@@ -1098,6 +1128,12 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake163 2026-06-07: #10 DIAGNOSING -> ROOT-CAUSED. wpeec891q classification dim COMPLETE = GENERAL-UPLC: 6/15
+  failing txs purely-post-snapshot, CASE 27751ab9 fully INDEPENDENT (input 3d7bb051 @124999282 never imported) yet
+  fails -> import is NOT necessary -> the 306 belong to #15 (re-framed: serialiseData general-UPLC, NOT compact-
+  address/import). #10 phase-1 (FINAL-DONE, 0 phase-1) is DONE+SEPARABLE. REMAINING #10: fold R3 float-parse +
+  no-silent-None -> re-gauntlet (prior 3/3 refute now resolved) -> commit (2 crates). wpeec891q mechanism dim still
+  running. NEXT WAKE: read mechanism result, launch #10 R3+no-silent-None fix muscle.
 - wake162 2026-06-07: #10 re-diagnose. CODE-CONFIRMED prime suspect: serialiseData builtin denotations.rs:601
   d.to_cbor() = canonical re-encode (Haskell returns memoised ORIGINAL bytes) -> non-canonical Data serialised by a
   script diverges -> 'Error term'. Explains the inline-fix no-op (only Data-BYTES vector). Launched re-diagnose
