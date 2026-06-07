@@ -1215,6 +1215,9 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake171 2026-06-07: POLL #10 ANALYZE wezt2hemc — research stage DONE (1 result), root-cause agent running (final
+  stage, last activity current). No transition. Disk 184G, no nodes. #10 stays DIAGNOSING. NEXT WAKE: on result ->
+  fix (R3 keep; tag-4/5 opaque-no-redecode; harden the 3 silent paths).
 - wake170 2026-06-07: POLL #10 ANALYZE wezt2hemc (Haskell per-path disposition) — still RUNNING, ACTIVE (oracle
   research on loadSnapshot/MemPack/BinaryData). No transition. No nodes; disk 184G. #10 stays DIAGNOSING. NEXT WAKE:
   on analyze result -> fix (R3 keep; tag-4/5 opaque-no-redecode; harden TvarIterator/address/multi-asset).
