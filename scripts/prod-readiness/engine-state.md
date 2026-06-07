@@ -104,6 +104,16 @@
    #26/#27 on the by-construction basis (Haskell-Ord match + proptests + provable-no-op), with this limitation recorded —
    landing a correct fix grounded in canonical source beats never landing it for want of an adversarial tx that may not exist.
    state:VERIFYING attempts:1 conf:0.86.
+   *** GAUNTLET REFUTED → back to FIXING wake348 (gauntlet wuweobtlm, 1/3 refute but DECISIVE — see Gauntlet ledger). The fix
+   WRONGLY applies ledger Script<Key to the V1/V2 txInfoWdrl FIELD: canonical Haskell builds V1/V2 txInfoWdrl in PLUTUS order
+   Key<Script (Alonzo/Plutus/TxInfo.hs transWithdrawals folds into a fresh Plutus Data.Map then Map.toList by PubKeyCredential<
+   ScriptCredential), and dugite's PRE-FIX blob order already MATCHED that — the fix BROKE V1/V2. V3 txInfoWdrl + V3 txInfoVotes
+   + the Reward/Vote redeemer-pointer INDEX (ledger Set.elemAt, Script<Key, version-independent) are CORRECT. SURGICAL FIX
+   (next FIXING): revert withdrawals_to_plutus (V1/V2, populate_v1_v2.rs:64,114) to PLUTUS Key<Script = dugite's DERIVED
+   Credential Ord = the pre-fix order; keep ledger_ordered_withdrawals (Script<Key) for populate_v3.rs + the redeemer-index
+   resolvers ONLY. PREREQ before changing code: oracle-confirm the V1/V2-vs-V3 txInfoWdrl ordering (cardano-haskell-oracle,
+   Alonzo/Babbage vs Conway TxInfo.hs). The current uncommitted patch keeps the V1/V2 bug — fix files stay in-tree for rework.
+   state:FIXING attempts:2 conf:0.80.
 27. [H][phase2][NEW] WITHDRAWALS (Rewarding) ordering inversion (manifestation B of the key<script vs script<key theme; DISTINCT
    fix site from #26). tx.body.withdrawals keyed by raw 29-byte reward-account blob [header||hash28] in BTreeMap<Vec<u8>,_>
    (transaction.rs:805) → sorts by raw bytes where key-stake header 0xE_ < script-stake 0xF_ → Key-before-Script, OPPOSITE to
@@ -121,7 +131,10 @@
    state:ROOT-CAUSED attempts:0 conf:0.65 (folded into #26)
    *** FIXING wake346: DONE in #26's patch (ledger_ordered_withdrawals + Reward-index over ledger order). Same uncommitted
    patch + VERIFY gate. *** VERIFYING wake347: same as #26 — 0/769 corpus dumps have withdrawals (changed path not exercised);
-   gate = Haskell-RewardAccount-Ord match + proptests + provable no-op. state:VERIFYING attempts:1 conf:0.65 (with #26)
+   gate = Haskell-RewardAccount-Ord match + proptests + provable no-op.
+   *** GAUNTLET REFUTED wake348 (with #26): the V1/V2 txInfoWdrl part of this fix is WRONG (must be Plutus Key<Script, not
+   ledger Script<Key). V3 txInfoWdrl + Reward redeemer-index are correct. Surgical correction with #26 next FIXING.
+   state:FIXING attempts:2 conf:0.65 (with #26)
 28. [H][serialization][NEW] PlutusData decoder accepts >64-byte definite bytestrings (no bounded_bytes 64-byte cap).
    read_plutus_data_depth reads Type::Bytes via read_bytes_owned() / BytesIndef with NO length check (era_alonzo.rs:1282-1288;
    era_conway.rs:2576-2579; bignum mantissa era_alonzo.rs:1224/1230, era_conway.rs:2514 via read_bigint). Haskell plutus
@@ -408,7 +421,21 @@
    reconstruction + #7 sub-tx forward). state:DONE attempts:0
 
 ## In-progress
-- item: #26+#27 VERIFYING — corpus can't verify (0/769 exercise the path); gate = Haskell-Ord match + proptests + provable no-op. NEXT: bounded Koios hunt then commit-on-by-construction.
+- item: #26+#27 GAUNTLET REFUTED → FIXING (attempts:2). V1/V2 txInfoWdrl must be Plutus Key<Script, not ledger Script<Key (the fix broke V1/V2). Surgical correction next.
+  *** wake348 (ultracode): ran the Tier-A' refutation gauntlet (wuweobtlm, 3 lenses, hosted in-turn). Vote 1/3 refute = nominal
+  "pass" BUT the single refutation is DECISIVE + Haskell-source-backed → REJECT (#25/#438: don't trust the vote count). FINDING:
+  the fix WRONGLY applies ledger Script<Key to the V1/V2 txInfoWdrl FIELD. Canonical Haskell builds V1/V2 txInfoWdrl in PLUTUS
+  order Key<Script (Alonzo/Plutus/TxInfo.hs transWithdrawals → fresh Plutus Data.Map → Map.toList by PubKeyCredential<Script-
+  Credential); only V3 (Conway transMap) preserves ledger Script<Key. dugite's PRE-FIX blob order already matched V1/V2 (Key<
+  Script) — the fix BROKE it. The V3 txInfoWdrl, V3 txInfoVotes, and the Reward/Vote redeemer-pointer INDEX (ledger Set.elemAt,
+  version-independent Script<Key) are CORRECT and stay. Earlier this wake I'd also established the DECISIVE by-construction
+  finding (old vs new per-entry transform is byte-identical; only ordering changes; no-op except mixed-cred multi-entry) — that
+  remains true, but it ASSUMED Script<Key is the right order for all sites, which is wrong for V1/V2. Recorded REFUTED verbatim
+  in the Gauntlet ledger. *** NEXT WAKE — FIXING (surgical, oracle-confirm first): (1) cardano-haskell-oracle confirm V1/V2-vs-V3
+  txInfoWdrl ordering; (2) make withdrawals_to_plutus (V1/V2, populate_v1_v2.rs:64,114) sort by dugite's DERIVED Credential Ord
+  (Key<Script = Plutus = pre-fix order), keep ledger_ordered_withdrawals (Script<Key) for populate_v3.rs + redeemer_resolve.rs
+  ONLY; (3) add a V1/V2-Key<Script vs V3-Script<Key contrast test; (4) re-run the gauntlet. Fix files stay in-tree (carry the
+  V1/V2 bug) for the rework. NO commit. Lock to release.
   *** wake347 (ultracode): DRIVE #26+#27 FIXING→VERIFYING. Mechanical corpus scan (minimal CBOR decoder over all 769
   phase2-dumps-730val): DECISIVE — 0/769 dumps have ANY withdrawal or vote, so the corpus NEVER reaches the changed code →
   cannot verify correctness OR regression (the fix is a provable no-op over the whole corpus). This also explains the pre-fix
@@ -2984,6 +3011,19 @@
 - db-clones/preprod-ep57-fixed   (fixed-binary replay, in progress)
 
 ## Gauntlet ledger  (passed/refuted approaches — never silently retry a REFUTED)
+- REFUTED 2026-06-08 (wake348, #26/#27 fix, gauntlet wuweobtlm): the per-consumer cmp_ledger fix WRONGLY applies ledger
+  Script<Key to the V1/V2 txInfoWdrl FIELD. Vote count was 1/3 refute (nominal "pass") but the single refutation is DECISIVE +
+  source-backed, so this is a REJECT (don't trust the vote count — #25/#438 discipline). Canonical Haskell: V1/V2
+  (cardano-ledger Alonzo/Plutus/TxInfo.hs transWithdrawals) FOLDS withdrawals into a FRESH Plutus Data.Map StakingCredential
+  Integer then Map.toList → sorted by the PLUTUS Credential Ord (PubKeyCredential<ScriptCredential = KEY<SCRIPT); Babbage reuses
+  it for both V1+V2. ONLY V3 (Conway/TxInfo.hs transMap over the ledger Map RewardAccount, unsafeFromList no re-sort) preserves
+  ledger Script<Key. dugite's PRE-FIX V1/V2 used blob-BTreeMap order = header 0xE(key)<0xF(script) = Key<Script = MATCHED
+  Haskell V1/V2; the fix routed withdrawals_to_plutus (populate_v1_v2.rs:64,114) through ledger_ordered_withdrawals (Script<Key)
+  and BROKE it. CORRECT parts (NOT refuted, keep): V3 txInfoWdrl (populate_v3.rs), V3 txInfoVotes, and the Reward/Vote
+  redeemer-pointer INDEX (redeemer_resolve.rs:256/318 — index space = ledger Set.elemAt = Script<Key, version-independent).
+  SURGICAL CORRECTION (next FIXING, oracle-confirm V1/V2 first): make withdrawals_to_plutus (V1/V2) sort by the PLUTUS credential
+  Ord (Key<Script) = dugite's DERIVED Credential Ord = the pre-fix blob order; leave ledger_ordered_withdrawals (Script<Key) for
+  V3 + the redeemer-index resolvers ONLY. Lens "per-entry byte-identity" + "completeness/consistency" did NOT refute.
 - PASSED 2026-06-08 (wake334, #16): "make the decode_imported_script_ref Plutus language-tag prefix invariant explicit".
   Doc-comment-only (0 logic change): clippy -p dugite-node -D warnings (doc lints + compile) clean + fmt + the 3
   decode_imported_script_ref tests (mapping 0→V1..3→V4 + out-of-range tag-9→Err) pass. Landed add4f0b3c1. Last tractable
@@ -3105,6 +3145,7 @@
 - 2026-06-08T18:05Z wake341 ~ #26 NEW→ROOT-CAUSED: analysis Workflow wh9u6m36k hosted in-turn (373K tokens/4 agents/6.5min) → PER-CONSUMER fix, reward/stake guard GREEN; OVERRODE synthesis 'latent' claim (Voter derived-Ord enum = TYPE-dominated = ACTIVE); #26+#27 [H] ACTIVE→FIXING next
 - 2026-06-08T18:30Z wake346 ~ #26+#27 ROOT-CAUSED→FIXING: fix Workflow wemg0lky9 hosted in-turn (127K tokens/1 agent/11min) → per-consumer cmp_ledger Script<Key at phase-2 sites, 6 files/2 crates, INDEPENDENTLY re-verified fmt+clippy+nextest 730/730; patch uncommitted (byte-exact VERIFY gate next); ignored agent's wrong 'latent' caveat
 - 2026-06-08T18:55Z wake347 ~ #26+#27 FIXING→VERIFYING: scanned 769 dumps (0 have withdrawals/votes → corpus can't verify; fix is provable no-op over it). Gate=Haskell-Ord match+proptests+provable-no-op (no on-chain tie-break reference attainable). Next: bounded Koios hunt then commit-by-construction
+- 2026-06-08T19:20Z wake348 ~ #26/#27 GAUNTLET wuweobtlm (3 lenses, in-turn): 1/3 refute but DECISIVE — fix wrongly forces ledger Script<Key on V1/V2 txInfoWdrl (Haskell=Plutus Key<Script; V3+redeemer-indices+votes correct). REJECT; recorded REFUTED; →FIXING attempts:2 (surgical V1/V2 revert next). NO commit
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -4716,3 +4757,9 @@
   reference, the authoritative reference is the canonical Haskell Ord (Script<Key) — gate = Haskell-Ord match + ordering
   proptests (730/730) + provable no-op + reward/stake non-regression (trivially green). NEXT: bounded Koios hunt for a real
   withdrawal+reward-script tx; else commit on the by-construction basis with the no-reference limitation recorded. Fix uncommitted.
+- wake348 2026-06-08: ran the #26/#27 Tier-A' refutation gauntlet (wuweobtlm, hosted in-turn). 1/3 refute = nominal "pass" but
+  the single refutation is DECISIVE: the fix WRONGLY applies ledger Script<Key to the V1/V2 txInfoWdrl FIELD — canonical Haskell
+  builds V1/V2 txInfoWdrl in PLUTUS order Key<Script (Alonzo transWithdrawals → Plutus Map.toList), only V3 preserves ledger
+  Script<Key; dugite's PRE-FIX blob order already matched V1/V2. V3 + redeemer-indices + votes are correct. REJECT (don't trust
+  the vote count, #25/#438). Recorded REFUTED in the Gauntlet ledger; #26/#27 → FIXING attempts:2. NEXT: surgical correction
+  (oracle-confirm V1/V2 order, revert withdrawals_to_plutus to Key<Script, keep Script<Key for V3+indices, re-gauntlet). NO commit.
