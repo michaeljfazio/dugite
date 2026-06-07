@@ -15,6 +15,7 @@ export const meta = {
 // only if needed). Refute-by-default verify kills plausible-but-wrong findings.
 
 const REFS = '.claude/skills/haskell-ledger-cross-validation/references/era-rules'
+const EFFICIENCY = `Be efficient and time-boxed: read the specific files named + targeted greps; do NOT exhaustively read whole crates or chase unbounded web research. Aim to return your StructuredOutput with <=6 high-signal candidates within a focused investigation. A precise file:line + concrete Haskell divergence beats volume.`
 const EXCLUDE = `Do NOT report anything already fixed/known: the #541 security audit (silent-skip BootstrapWitness/vkey/nonce_vrf/kes — issues #541-#550, mostly fixed), this session's fixes (#6 apply_utxo_diff instant-stake, #7 Dijkstra sub-tx instant-stake, #11 Shelley->Allegra RUPD, #16 script-ref language-tag doc, #17 snapshot crcOfConcat, #20a varlen overflow / #20b definite-map exact-count / #20c backend dup-key first-wins, #23 txInfoData V1 dedup), the #438/#481/#624/#626 reward fixes, and the DEFERRED #24 (PlutusV2 inline-datum-spend ExUnit over-cost). Confirm the current HEAD code before claiming a gap — if HEAD already handles it, do NOT report it.`
 
 const FINDING_SCHEMA = {
@@ -83,7 +84,7 @@ const DIMENSIONS = [
 phase('Find')
 const results = await pipeline(
   DIMENSIONS,
-  (d) => agent(d.prompt + '\n\n' + EXCLUDE, { label: `find:${d.key}`, phase: 'Find', schema: FINDING_SCHEMA }),
+  (d) => agent(d.prompt + '\n\n' + EFFICIENCY + '\n\n' + EXCLUDE, { label: `find:${d.key}`, phase: 'Find', schema: FINDING_SCHEMA }),
   (res, d) => {
     const cands = (res && res.findings ? res.findings : []).filter((f) => f.confidence >= 0.45 && f.severity !== 'L')
     if (!cands.length) return { key: d.key, verified: [] }
