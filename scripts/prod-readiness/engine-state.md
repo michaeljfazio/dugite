@@ -209,7 +209,14 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:ROOT-CAUSING-COMPONENT (POINTER RULED OUT; per-cred bucket-confirm building).
+- item: #0 (mainnet ep246 reserves) state:PERCRED-REPLAY-RUNNING (build OK + strings-verified; replay pid 18640 launched wake296).
+  Build OK (1m38s, binary 19:02), SNAP_PERCRED strings=2 VERIFIED. Launched per-cred replay job mainnet-percred pid
+  18640 (DUGITE_SNAP_PERCRED=1) over CoW clone db-clones/mainnet-rupd-drop -> dumps per-cred (utxo,reward) for pool
+  263498e0.. delegators. ~4min. SNAP_PERCRED lines -> scripts/prod-readiness/.jobs/mainnet-percred.log. NEXT WAKE: grep
+  'SNAP_PERCRED snap_epoch=243' -> dugite per-cred (utxo,reward) for that pool -> diff vs Koios
+  pool_delegators_history(_pool_bech32=263498e0.. bech32, _epoch_no=244) per-delegator amount -> the delegator(s) where
+  dugite < Koios: if the gap is in utxo => stake_map/apply_utxo_changes bug (=#1); if reward => reward_accounts.
+  pool 263498e0 deficit is -2.7B; expect a handful of short delegators summing to it. SIGTERM-only to stop.
   *** wake295 (ultracode): SNAP_BREAKDOWN for the ep244-equiv snapshot (built epoch=243, pst=21,956,097,174,685,676):
   deleg_utxo=21,748,802,274,556,340 ; reward_bal=207,294,900,129,336 ; ptr_resolved=0 ; ptr_excluded=1,000,000 ;
   ptr_stake_total=1,000,000 ; n_deleg=150,785. **POINTER RULED OUT** (total pointer stake = 1 ADA; the w7ghihrir
@@ -3221,3 +3228,7 @@
   standing hypothesis = apply_utxo_changes asymmetry -> #0 likely SAME bug as #1 ep57. Instrumented per-cred dump for
   one short pool (DUGITE_SNAP_PERCRED, 263498e0..), building. SIGTERM'd snapbd replay. next wake: replay -> grep
   SNAP_PERCRED snap_epoch=243 -> diff vs Koios pool_delegators ep244 -> utxo-short(=stake_map/#1) vs reward-short bucket.
+- wake296 (ultracode): per-cred build OK (strings SNAP_PERCRED=2 verified). Launched per-cred replay job
+  mainnet-percred pid 18640 (DUGITE_SNAP_PERCRED=1, pool 263498e0..) over CoW clone. next wake: grep SNAP_PERCRED
+  snap_epoch=243 -> diff vs Koios pool_delegators_history ep244 -> short delegator(s): utxo-gap=#1 stake_map bug,
+  reward-gap=reward_accounts bug.
