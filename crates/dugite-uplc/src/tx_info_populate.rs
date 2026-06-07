@@ -478,10 +478,24 @@ fn padded_signer_to_pubkeyhash(h: &dugite_primitives::hash::Hash<32>) -> PubKeyH
 /// Translate the full `required_signers` field (`Vec<Hash<32>>` —
 /// each entry is a 28-byte addr_keyhash padded to 32 bytes) into the
 /// Plutus `signatories` list (`Vec<PubKeyHash>`).
+///
+/// Haskell builds `txInfoSignatories` (identically for PlutusV1/V2/V3) as
+/// `transKeyHash <$> Set.toList (txBody ^. reqSignerHashesTxBodyG)`, i.e. the
+/// `Set (KeyHash 'Witness)` rendered in ascending `Ord` order with duplicates
+/// removed. `Ord (KeyHash h)` compares the underlying 28-byte hash bytes
+/// lexicographically, which is exactly the derived `Ord` of `PubKeyHash`
+/// (`[u8; 28]`). So we sort + dedup the 28-byte form to reproduce `Set.toList`
+/// byte-for-byte — the same canonicalisation dugite already applies to its
+/// other Set-like `TxInfo` fields (inputs, withdrawals, datums, voters); the
+/// on-wire `required_signers` is decoded as a `Vec` in wire order (no dedup),
+/// so this is where the set semantics must be restored.
 pub fn required_signers_to_plutus_padded(
     signers: &[dugite_primitives::hash::Hash<32>],
 ) -> Vec<PubKeyHash> {
-    signers.iter().map(padded_signer_to_pubkeyhash).collect()
+    let mut out: Vec<PubKeyHash> = signers.iter().map(padded_signer_to_pubkeyhash).collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Translate the resolved-UTxO triples that
@@ -1245,6 +1259,31 @@ mod tests {
         let signers = vec![h28(1), h28(2), h28(3)];
         let pl = required_signers_to_plutus(&signers);
         assert_eq!(pl, vec![[1u8; 28], [2u8; 28], [3u8; 28]]);
+    }
+
+    #[test]
+    fn required_signers_to_plutus_padded_sorts_and_dedups_like_set_tolist() {
+        // Wire order is non-canonical: out of ascending order AND with a
+        // duplicate. Haskell `txInfoSignatories = Set.toList (Set KeyHash)`
+        // yields ascending 28-byte order with duplicates removed, so the
+        // padded builder must reproduce that regardless of wire order.
+        let signers = vec![h32(3), h32(1), h32(2), h32(1)];
+        let pl = required_signers_to_plutus_padded(&signers);
+        assert_eq!(pl, vec![[1u8; 28], [2u8; 28], [3u8; 28]]);
+
+        // Already-canonical input is unchanged (honest cardano-cli txs).
+        let canonical = vec![h32(1), h32(2), h32(3)];
+        assert_eq!(
+            required_signers_to_plutus_padded(&canonical),
+            vec![[1u8; 28], [2u8; 28], [3u8; 28]]
+        );
+
+        // Empty / single are trivially canonical.
+        assert!(required_signers_to_plutus_padded(&[]).is_empty());
+        assert_eq!(
+            required_signers_to_plutus_padded(&[h32(7)]),
+            vec![[7u8; 28]]
+        );
     }
 
     // ────────────────────────────────────────────────────────────
