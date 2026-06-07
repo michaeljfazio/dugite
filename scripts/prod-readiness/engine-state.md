@@ -1569,6 +1569,9 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
+- wake234 2026-06-07: POLL #0 VERIFY-THEN-FIX muscle w0oegi6uf (reward_pot epoch_fees) — still RUNNING, ACTIVE
+  (worktree present, rewards.rs; Koios fee tracing + ppm arithmetic + code). No transition. Disk 166G, no nodes. #0
+  stays FIXING. NEXT WAKE: poll/process — fee discrepancy confirmed+fixed OR 'not localizable to fees' report.
 - wake233 2026-06-07: #0 DIAGNOSE wbqhzeczq COMPLETE -> ROOT CAUSE RE-LOCATED (data-driven) to reward_pot EPOCH_FEES
   ~5ppm (rewards.rs:184), NOT apply_utxo_changes/stake. Dim-2: uniform pool-independent -5.027 ppm under-scaling of
   every member reward (stake byte-exact). Haskell uses GO-snapshot ssFee (2-epoch lag). analyze-1 wrongly ruled out
