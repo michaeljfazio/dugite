@@ -324,7 +324,34 @@
    ("TxWits", decodeKeyedSparse) which HARD-FAILS on an unknown key. dugite admits txs Haskell rejects (adversarial-input;
    dugite-node is hostile-environment software, default-to-reject). NOTE there are explicit tests asserting the skip — those
    must be updated to expect rejection. how_to_confirm: Conway witness-set map with extra key=8 appended → dugite decode Ok
-   (field skipped) vs cardano-ledger decCBOR @(TxWits) error. state:NEW attempts:0 conf:0.55
+   (field skipped) vs cardano-ledger decCBOR @(TxWits) error.
+   *** ROOT-CAUSED wake392 (HEAD-verified + diagnose Workflow w2g366xg2, conf UPGRADED 0.55→0.9 — NOT a false candidate).
+   is_real_gap=TRUE, CONSENSUS divergence (block-level, but ADVERSARIAL/LATENT — no honest block carries these; same class as
+   #539). Bigger than the original finding — FOUR parts, all source-confirmed (cardano-ledger-binary Coders.hs decodeSparse →
+   applyField → invalidField n → invalidKey → cborError; field pickers txWitnessField n=invalidField n / bodyFields n=invalidField
+   n; decodeSet PV-gated → decodeSetEnforceNoDuplicates `when len/=count fail`):
+   (A) WITNESS-SET unknown map key REJECT — Haskell hard-fails on key 8+, NOT version-gated (Alonzo/Babbage/Conway share the
+       AlonzoTxWits decoder; Shelley-style same). dugite `_ => r.skip()` at era_alonzo.rs:1019-1021, era_babbage:910-912,
+       era_conway:2232-2234 (+ Shelley witness decoder). Cleanest part.
+   (B) TX-BODY unknown map key REJECT — same Haskell mechanism (bodyFields n=invalidField n). dugite `_ => r.skip()` at
+       era_conway.rs:669-672 (decode_conway_tx_body) + pre-Conway bodies. *** CAUTION: dugite's Conway body decoder DOUBLES as
+       Dijkstra — the reject must be ERA-AWARE (reject only keys outside the ACTIVE era's known set; Conway 0..8,11,13..22;
+       Dijkstra adds 23/25/26 + key-14 guards; keep key-6 handling). Do NOT blindly reject >22.
+   (C) CONWAY PV9+ SET DUPLICATE REJECT (= folded #30 fix-B) — decodeSetEnforceNoDuplicates counts items vs dedup'd Set size,
+       hard-fails on dup; pre-PV9 lenient; ordering NEVER enforced. dugite read_set (reader.rs:213-226) has no dedup/count-check
+       → all tag-258 Set fields accept dups at PV9+ (wits 0/1/2/3/6/7; body inputs0/certs4/collateral13/required_signers14/
+       reference_inputs18). Fix = PV-thread a read_set_strict (protocol_major>=9 → count-check) for the Conway sites.
+   (D) DUPLICATE MAP-KEY reject (secondary, same class) — Haskell applyField rejects duplicate map keys (duplicateKey);
+       dugite for_each_map_entry doesn't check. Lower priority.
+   *** DO NOT FLIP (Haskell genuinely LENIENT — confirmed): cost_models_unknown_keys (CostModels retains unknown lang keys in
+   costModelsUnknown), pparam_update_unknown_key (PParamUpdate). EXISTING skip-tests to FLIP to expect-error: babbage_witness_set_
+   unknown_key_skipped (era_babbage:1581), alonzo_witness_set_unknown_key_skipped (era_alonzo:2188), shelley_witness_set_unknown_
+   key_skipped (era_shelley:2442), shelley_body_unknown_key_skipped (era_shelley:2240); test_dijkstra_unknown_tx_body_key_skipped
+   (era_conway:3407, key99) — keep lenient ONLY for genuinely-future Dijkstra keys. FIX-TIME: permalink-pin txWitnessField/
+   bodyFields/decodeSetEnforceNoDuplicates (WebFetch summaries, not line-pinned). state:ROOT-CAUSED attempts:0 conf:0.9.
+   NEXT: FIXING — tackle the parts as SEPARATE focused steps (each its own gauntlet, distinct scoping risk): #31-A witness-set
+   reject FIRST (cleanest, all-era, not version-gated), then #31-B body-reject (era-aware Dijkstra whitelist), #31-C PV9+ set-
+   dedup (read_set_strict PV-threading), #31-D dup-map-key. Single crate dugite-serialization throughout.
 23. [M][phase2][REPRODUCED-AT-HEAD wake323] Babbage V2-Spend BUDGET over-cost (the #730 "fixed-delta structural-context"
    residual). 363/363 tx0 dumps in phase2-dumps-730val/ (769 total across tx-indices) STILL diverge at HEAD via
    examples/phase2_repro: is_valid(on-chain)=true but dugite=Err, ~257 "budget exhausted" near-edge (mem_remaining 291/371,
@@ -584,7 +611,16 @@
    reconstruction + #7 sub-tx forward). state:DONE attempts:0
 
 ## In-progress
-- item: #30 DONE (committed 42bf522984) — txInfoSignatories sort+dedup = Set.toList, gauntlet PASSED 0/3. NEXT: #31 [M] witness-set silent-skip (+ #30 fix-B Conway set dup-reject).
+- item: #31 [M] witness/body CBOR-strictness ROOT-CAUSED (conf 0.9 upgraded — REAL, 4 parts A/B/C/D). NEXT: FIXING #31-A (witness-set unknown-key reject, cleanest).
+  *** wake392 (ultracode): SCHEDULE #31, DRIVE NEW→ROOT-CAUSED. HEAD-verified the Conway witness-set `_ => r.skip()`, then
+  diagnose Workflow w2g366xg2 (in-turn) SOURCE-CONFIRMED (conf upgraded 0.55→0.9, NOT a #25 false candidate): Haskell SparseKeyed
+  txWitnessField/bodyFields = invalidField n → cborError → HARD-FAILS unknown keys (all eras, not version-gated); + Conway PV9+
+  decodeSetEnforceNoDuplicates rejects set dups. CONSENSUS divergence (block-level) but adversarial/latent (#539 class). 4 parts:
+  (A) witness-set unknown-key reject [cleanest, all eras], (B) tx-body unknown-key reject [ERA-AWARE: Conway decoder doubles as
+  Dijkstra — whitelist active-era keys], (C) Conway PV9+ set-dedup [= folded #30 fix-B; read_set_strict PV-thread], (D) dup-map-key
+  reject [secondary]. Correctly EXCLUDES the genuinely-lenient CostModels/PParamUpdate. NEXT WAKE: SCHEDULE #31-A FIXING (reject
+  unknown witness-set keys at era_alonzo:1019/babbage:910/conway:2232 + Shelley; flip the *_witness_set_unknown_key_skipped tests).
+  Permalink-pin the Haskell field pickers before landing.
   *** wake388 (ultracode): ran the #30 gauntlet (wgvyqtxj0, 3 lenses) → PASSED 0/3, each lens substantive + permalink-reconfirmed
   the Haskell source (Alonzo transTxBodyReqSignerHashes Set.toList, V1/V2/V3) — including a deep PackedBytes big-endian Ord
   check confirming [u8;28]-derived-Ord == byte-lexicographic (a subtle little-endian-would-break-it case, ruled out). _padded is
@@ -3469,6 +3505,7 @@
 - 2026-06-09T01:00Z wake380 ~ #30 NEW→ROOT-CAUSED: diagnose w9r1peyto (in-turn, conf 0.9) source-confirmed Haskell txInfoSignatories=Set.toList sort+dedup (V1/V2/V3) + Conway PV9+ dup-reject-at-decode. dugite's lone uncanonicalized Set field. Fix=sort+dedup in builder; (B) dup-reject→#31. Next FIXING
 - 2026-06-09T01:30Z wake384 ~ #30 ROOT-CAUSED→FIXING (A): sort+dedup in required_signers_to_plutus_padded (matches dugite's existing Set.toList convention; V1/V2/V3 in one helper) + canonicalisation test; INDEPENDENTLY verified 448/448. Uncommitted; gauntlet next
 - 2026-06-09T02:00Z wake388 ~ #30 gauntlet wgvyqtxj0 PASSED 0/3 (substantive, permalink-reconfirmed + PackedBytes-endianness check): sort+dedup==Set.toList for V1/V2/V3, sole live producer. COMMITTED 42bf522984. #30 DONE. Next #31
+- 2026-06-09T02:30Z wake392 ~ #31 NEW→ROOT-CAUSED: diagnose w2g366xg2 (in-turn, conf 0.55→0.9, REAL) — Haskell SparseKeyed hard-fails unknown wits/body keys (invalidField→cborError, all eras) + Conway PV9+ set dup-reject. 4 parts A/B/C(=#30 fix-B)/D, adversarial/latent #539-class. Next FIXING #31-A (witness-set reject)
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -5155,3 +5192,8 @@
   (Alonzo transTxBodyReqSignerHashes Set.toList V1/V2/V3 + a deep PackedBytes big-endian Ord-equivalence check). _padded is the
   sole live signatories producer; (A) byte-exact, honest txs unchanged. COMMITTED 42bf522984 (dugite-uplc, 1 crate). #30 DONE.
   NEXT: #31 (fold in #30 fix-B Conway set dup-reject).
+- wake392 2026-06-09: SCHEDULE #31, DRIVE NEW→ROOT-CAUSED. HEAD-verified Conway witness-set `_ => r.skip()`, diagnose Workflow
+  w2g366xg2 (in-turn, conf upgraded 0.55→0.9) source-confirmed Haskell SparseKeyed hard-fails unknown wits/body keys (invalidField
+  → cborError, all eras) + Conway PV9+ set dup-reject. REAL consensus gap (adversarial/latent, #539 class). 4 parts: A witness-set
+  reject, B body-reject (era-aware Dijkstra), C PV9+ set-dedup (=#30 fix-B), D dup-map-key. Excludes lenient CostModels/PParamUpdate.
+  state:ROOT-CAUSED. NEXT: FIXING #31-A (witness-set reject, cleanest).
