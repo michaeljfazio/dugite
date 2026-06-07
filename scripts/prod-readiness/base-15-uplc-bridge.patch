@@ -1,0 +1,2140 @@
+diff --git a/crates/dugite-uplc/src/builtin/cost.rs b/crates/dugite-uplc/src/builtin/cost.rs
+index da8813e0ee..66e6c4bef5 100644
+--- a/crates/dugite-uplc/src/builtin/cost.rs
++++ b/crates/dugite-uplc/src/builtin/cost.rs
+@@ -30,7 +30,7 @@
+ //! `builtinCostModelE.json`. Variants not present in the JSON are
+ //! omitted; all evaluators are `const fn`-compatible.
+ 
+-use crate::data::Data;
++use crate::data::{Data, DataKind};
+ use crate::machine::value::Value;
+ use crate::machine::ExBudget;
+ use crate::term::{BuiltinId, Constant};
+@@ -179,24 +179,24 @@ pub fn data_node_count(d: &Data) -> i64 {
+     let mut stack = vec![d];
+     while let Some(node) = stack.pop() {
+         total = total.saturating_add(1);
+-        match node {
+-            Data::Constr(_, fields) => {
++        match &node.kind {
++            DataKind::Constr(_, fields) => {
+                 for f in fields {
+                     stack.push(f);
+                 }
+             }
+-            Data::Map(entries) => {
++            DataKind::Map(entries) => {
+                 for (k, v) in entries {
+                     stack.push(k);
+                     stack.push(v);
+                 }
+             }
+-            Data::List(elems) => {
++            DataKind::List(elems) => {
+                 for e in elems {
+                     stack.push(e);
+                 }
+             }
+-            Data::I(_) | Data::B(_) => {}
++            DataKind::I(_) | DataKind::B(_) => {}
+         }
+     }
+     total
+@@ -215,27 +215,27 @@ fn size_of_data(d: &Data) -> i64 {
+     let mut stack = vec![d];
+     while let Some(node) = stack.pop() {
+         total = total.saturating_add(4);
+-        match node {
+-            Data::Constr(_, fields) => {
++        match &node.kind {
++            DataKind::Constr(_, fields) => {
+                 for f in fields {
+                     stack.push(f);
+                 }
+             }
+-            Data::Map(entries) => {
++            DataKind::Map(entries) => {
+                 for (k, v) in entries {
+                     stack.push(k);
+                     stack.push(v);
+                 }
+             }
+-            Data::List(elems) => {
++            DataKind::List(elems) => {
+                 for e in elems {
+                     stack.push(e);
+                 }
+             }
+-            Data::I(n) => {
++            DataKind::I(n) => {
+                 total = total.saturating_add(memory_usage_integer(n));
+             }
+-            Data::B(b) => {
++            DataKind::B(b) => {
+                 total = total.saturating_add(size_of_bytestring(b));
+             }
+         }
+diff --git a/crates/dugite-uplc/src/builtin/denotations.rs b/crates/dugite-uplc/src/builtin/denotations.rs
+index 7d1663299d..9b55d7d757 100644
+--- a/crates/dugite-uplc/src/builtin/denotations.rs
++++ b/crates/dugite-uplc/src/builtin/denotations.rs
+@@ -422,12 +422,12 @@ pub fn denote(
+             let list_case = it.next().ok_or_else(|| builtin_arity_mismatch(id))?;
+             let i_case = it.next().ok_or_else(|| builtin_arity_mismatch(id))?;
+             let b_case = it.next().ok_or_else(|| builtin_arity_mismatch(id))?;
+-            Ok(match d {
+-                crate::data::Data::Constr(_, _) => constr_case,
+-                crate::data::Data::Map(_) => map_case,
+-                crate::data::Data::List(_) => list_case,
+-                crate::data::Data::I(_) => i_case,
+-                crate::data::Data::B(_) => b_case,
++            Ok(match d.kind() {
++                crate::data::DataKind::Constr(_, _) => constr_case,
++                crate::data::DataKind::Map(_) => map_case,
++                crate::data::DataKind::List(_) => list_case,
++                crate::data::DataKind::I(_) => i_case,
++                crate::data::DataKind::B(_) => b_case,
+             })
+         }
+         ConstrData => {
+@@ -507,8 +507,8 @@ pub fn denote(
+         UnConstrData => {
+             // Data -> Pair Integer (ProtoList Data)
+             let d = unwrap_data(take_one(args, id)?, id)?;
+-            match d {
+-                crate::data::Data::Constr(tag, fields) => {
++            match d.kind {
++                crate::data::DataKind::Constr(tag, fields) => {
+                     let elements: Vec<Constant> = fields.into_iter().map(Constant::Data).collect();
+                     Ok(Value::Const(Constant::ProtoPair {
+                         a_type: crate::term::TypeTag::Integer,
+@@ -525,8 +525,8 @@ pub fn denote(
+         }
+         UnMapData => {
+             let d = unwrap_data(take_one(args, id)?, id)?;
+-            match d {
+-                crate::data::Data::Map(entries) => {
++            match d.kind {
++                crate::data::DataKind::Map(entries) => {
+                     let elements: Vec<Constant> = entries
+                         .into_iter()
+                         .map(|(k, v)| Constant::ProtoPair {
+@@ -549,8 +549,8 @@ pub fn denote(
+         }
+         UnListData => {
+             let d = unwrap_data(take_one(args, id)?, id)?;
+-            match d {
+-                crate::data::Data::List(items) => Ok(Value::Const(Constant::ProtoList {
++            match d.kind {
++                crate::data::DataKind::List(items) => Ok(Value::Const(Constant::ProtoList {
+                     elem_type: crate::term::TypeTag::Data,
+                     elements: items.into_iter().map(Constant::Data).collect(),
+                 })),
+@@ -559,8 +559,8 @@ pub fn denote(
+         }
+         UnIData => {
+             let d = unwrap_data(take_one(args, id)?, id)?;
+-            match d {
+-                crate::data::Data::I(i) => Ok(Value::Const(Constant::Integer(i))),
++            match d.kind {
++                crate::data::DataKind::I(i) => Ok(Value::Const(Constant::Integer(i))),
+                 other => {
+                     if std::env::var("DUGITE_DUMP_CTX").is_ok() {
+                         eprintln!("!!! unIData on non-I: {other:?}");
+@@ -571,8 +571,8 @@ pub fn denote(
+         }
+         UnBData => {
+             let d = unwrap_data(take_one(args, id)?, id)?;
+-            match d {
+-                crate::data::Data::B(b) => Ok(Value::Const(Constant::ByteString(b))),
++            match d.kind {
++                crate::data::DataKind::B(b) => Ok(Value::Const(Constant::ByteString(b))),
+                 _ => Err(builtin_failure(id, "unBData on non-B Data")),
+             }
+         }
+@@ -595,7 +595,15 @@ pub fn denote(
+             }))
+         }
+         SerialiseData => {
+-            // Data -> ByteString (CBOR encoding)
++            // Data -> ByteString.
++            //
++            // Haskell: `serialiseDataDenotation = BSL.toStrict . serialise`.
++            // For tx-originating Data (datums / redeemers / txInfoData),
++            // cardano-ledger delivers a `MemoBytes`-backed `Data` whose
++            // `serialise` yields the VERBATIM original bytes the value
++            // decoded from — never a re-encode. `Data::to_cbor` honours that
++            // memo when present (and re-encodes canonically for machine-built
++            // Data, matching `serialise` on a freshly-constructed value).
+             let d = unwrap_data(take_one(args, id)?, id)?;
+             let bytes = d
+                 .to_cbor()
+@@ -1257,9 +1265,9 @@ pub fn denote(
+             // All of these are failure conditions — unValueData does NOT merge
+             // duplicates or normalise zeros.
+             let d = unwrap_data(take_one(args, id)?, id)?;
+-            use crate::data::Data;
+-            let outer_pairs = match d {
+-                Data::Map(pairs) => pairs,
++            use crate::data::DataKind;
++            let outer_pairs = match d.kind {
++                DataKind::Map(pairs) => pairs,
+                 _ => return Err(builtin_failure(id, "unValueData: expected outer Map")),
+             };
+             const MAX_KEY: usize = 32;
+@@ -1267,8 +1275,8 @@ pub fn denote(
+             let mut result: ValueMap = BTreeMap::new();
+             let mut prev_policy: Option<Vec<u8>> = None;
+             for (k, v) in outer_pairs {
+-                let policy = match k {
+-                    Data::B(b) => b,
++                let policy = match k.kind {
++                    DataKind::B(b) => b,
+                     _ => return Err(builtin_failure(id, "unValueData: policy key must be B")),
+                 };
+                 if policy.len() > MAX_KEY {
+@@ -1288,8 +1296,8 @@ pub fn denote(
+                 }
+                 prev_policy = Some(policy.clone());
+ 
+-                let inner_pairs = match v {
+-                    Data::Map(pairs) => pairs,
++                let inner_pairs = match v.kind {
++                    DataKind::Map(pairs) => pairs,
+                     _ => {
+                         return Err(builtin_failure(id, "unValueData: expected inner Map"));
+                     }
+@@ -1301,8 +1309,8 @@ pub fn denote(
+                 let inner_map = result.entry(policy).or_default();
+                 let mut prev_token: Option<Vec<u8>> = None;
+                 for (tk, tv) in inner_pairs {
+-                    let token = match tk {
+-                        Data::B(b) => b,
++                    let token = match tk.kind {
++                        DataKind::B(b) => b,
+                         _ => return Err(builtin_failure(id, "unValueData: token key must be B")),
+                     };
+                     if token.len() > MAX_KEY {
+@@ -1322,8 +1330,8 @@ pub fn denote(
+                     }
+                     prev_token = Some(token.clone());
+ 
+-                    let amount_bi = match tv {
+-                        Data::I(i) => i,
++                    let amount_bi = match tv.kind {
++                        DataKind::I(i) => i,
+                         _ => {
+                             return Err(builtin_failure(id, "unValueData: token amount must be I"))
+                         }
+diff --git a/crates/dugite-uplc/src/data.rs b/crates/dugite-uplc/src/data.rs
+index c1db2c5777..081ba19eb2 100644
+--- a/crates/dugite-uplc/src/data.rs
++++ b/crates/dugite-uplc/src/data.rs
+@@ -44,6 +44,7 @@ use crate::UplcError;
+ use minicbor::data::{Tag, Type};
+ use minicbor::{Decoder, Encoder};
+ use num_bigint::{BigInt, Sign};
++use std::rc::Rc;
+ 
+ /// Maximum nesting depth accepted by the [`Data`] CBOR decoder. The
+ /// real on-chain limit is much lower than this; the cap is purely a
+@@ -54,7 +55,7 @@ pub const DATA_MAX_DEPTH: usize = 256;
+ /// chunk, per the Haskell `decodeBoundedBytes` invariant.
+ const DATA_CHUNK_LIMIT: usize = 64;
+ 
+-/// Recursive PlutusData value. Maps 1:1 onto the Haskell
++/// Structural variant of a [`Data`] value. Maps 1:1 onto the Haskell
+ /// `Plutus.V1.Data` definition.
+ ///
+ /// `Constr` and `Map` payloads are `Vec` rather than `BTreeMap` because
+@@ -62,7 +63,7 @@ const DATA_CHUNK_LIMIT: usize = 64;
+ /// would change the body hash for txs that gossip in non-sorted form,
+ /// breaking byte-exact round-trip.
+ #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+-pub enum Data {
++pub enum DataKind {
+     /// `Constr` — tagged sum: `Constr tag args`.
+     Constr(u64, Vec<Data>),
+     /// `Map` — list of key-value pairs. Insertion order preserved;
+@@ -76,9 +77,135 @@ pub enum Data {
+     B(Vec<u8>),
+ }
+ 
++/// Recursive PlutusData value with an optional **memoised original-CBOR
++/// span**.
++///
++/// # Why the memo
++///
++/// On-chain `Data` (datums, redeemers, the `txInfoData` map) is delivered
++/// to the ledger as `Cardano.Ledger.Plutus.Data.Data`, a newtype over
++/// `MemoBytes (PlutusData era)`:
++///
++/// ```haskell
++/// newtype Data era = MkData (MemoBytes (PlutusData era))
++///   deriving (Eq, Generic)
++///   deriving newtype (SafeToHash, ToCBOR, NFData, DecCBOR)
++/// ```
++///
++/// `MemoBytes` carries the **verbatim original `ShortByteString`** the
++/// value decoded from. The Plutus `serialiseData` builtin and the ledger
++/// `hashData = hashAnnotated = getMemoSafeHash` both operate over those
++/// memoised bytes — they **never re-encode**. On-chain datums are
++/// routinely *non-canonical* (`Constr` tag-102 form for small indices,
++/// indefinite-length arrays `0x9f..0xff`, non-minimal ints), so a
++/// canonical structural re-encode produces *different* bytes than the
++/// chain, and any script that hashes/compares its own `serialiseData`
++/// output against an on-chain datum hash silently fails ("script returned
++/// Error term").
++///
++/// Machine-**constructed** `Data` (built by the `constrData` / `mapData`
++/// / `listData` / `iData` / `bData` builtins, or by the ledger when it
++/// assembles the `ScriptContext`) has **no** memo — Haskell computes its
++/// bytes lazily/canonically via `Codec.Serialise.serialise`. Sub-fields
++/// extracted by `unConstrData` / `unListData` / … are likewise plain
++/// (memo-less) — the memo lives only on the *whole* tx-originating value,
++/// exactly mirroring `MemoBytes`' whole-value memoisation.
++///
++/// # Equality / hashing ignore the memo
++///
++/// [`PartialEq`], [`Eq`] and [`Hash`] are implemented **by hand** and
++/// compare/hash **only** [`Data::kind`]. The memo is purely an output
++/// channel for `serialiseData` (and datum-hashing); two `Data` values
++/// that are structurally equal must remain `==` and hash identically
++/// regardless of their original bytes, so the CEK machine's structural
++/// `equalsData`, env dedup, and constant-folding are unaffected.
++#[derive(Debug, Clone)]
++pub struct Data {
++    /// Structural payload.
++    pub kind: DataKind,
++    /// Verbatim original CBOR of this value, when it originates from
++    /// tx wire bytes. `None` for machine-/ledger-constructed values.
++    ///
++    /// A *thin* `Rc<Vec<u8>>` (one pointer word) rather than a fat
++    /// `Rc<[u8]>` (two words): `Data` is built recursively in a
++    /// depth-bounded decoder, so every extra word in `size_of::<Data>()`
++    /// multiplies across [`DATA_MAX_DEPTH`] stack frames. Keeping the
++    /// memo to a single word preserves the decoder's stack headroom.
++    original: Option<Rc<Vec<u8>>>,
++}
++
+ impl Data {
+-    /// Encode the `Data` value to its canonical-on-chain CBOR bytes.
++    /// `Constr tag args` (no memo — machine-built / canonical).
++    #[allow(non_snake_case)]
++    pub fn Constr(tag: u64, args: Vec<Data>) -> Data {
++        Data::from_kind(DataKind::Constr(tag, args))
++    }
++
++    /// `Map entries` (no memo — machine-built / canonical).
++    #[allow(non_snake_case)]
++    pub fn Map(entries: Vec<(Data, Data)>) -> Data {
++        Data::from_kind(DataKind::Map(entries))
++    }
++
++    /// `List items` (no memo — machine-built / canonical).
++    #[allow(non_snake_case)]
++    pub fn List(items: Vec<Data>) -> Data {
++        Data::from_kind(DataKind::List(items))
++    }
++
++    /// `I n` (no memo — machine-built / canonical).
++    #[allow(non_snake_case)]
++    pub fn I(n: BigInt) -> Data {
++        Data::from_kind(DataKind::I(n))
++    }
++
++    /// `B bytes` (no memo — machine-built / canonical).
++    #[allow(non_snake_case)]
++    pub fn B(bytes: Vec<u8>) -> Data {
++        Data::from_kind(DataKind::B(bytes))
++    }
++
++    /// Build a memo-less `Data` from a structural [`DataKind`].
++    pub fn from_kind(kind: DataKind) -> Data {
++        Data {
++            kind,
++            original: None,
++        }
++    }
++
++    /// Attach a verbatim original-CBOR memo, mirroring the
++    /// `MemoBytes`-backed `Cardano.Ledger.Plutus.Data.Data` that
++    /// carries the bytes the value decoded from. The memo is consumed
++    /// *only* by [`Data::to_cbor`] / datum-hashing; it never affects
++    /// structural equality.
++    pub fn with_original(mut self, original: Rc<Vec<u8>>) -> Data {
++        self.original = Some(original);
++        self
++    }
++
++    /// The structural payload of this value (memo-independent).
++    pub fn kind(&self) -> &DataKind {
++        &self.kind
++    }
++
++    /// The memoised original CBOR bytes, if this value carries a memo.
++    pub fn original(&self) -> Option<&[u8]> {
++        self.original.as_deref().map(Vec::as_slice)
++    }
++
++    /// Serialise the `Data` value to CBOR.
++    ///
++    /// If this value carries a memoised original-CBOR span (i.e. it
++    /// originated from tx wire bytes), the **verbatim** bytes are
++    /// returned — matching Haskell `serialiseData` / `hashData`, which
++    /// operate over the `MemoBytes` original. Otherwise the value is
++    /// (re-)encoded with the canonical-on-chain encoder, matching how
++    /// Haskell `Codec.Serialise.serialise` encodes a freshly-built
++    /// `Data`.
+     pub fn to_cbor(&self) -> Result<Vec<u8>, UplcError> {
++        if let Some(original) = &self.original {
++            return Ok((**original).clone());
++        }
+         let mut out = Vec::new();
+         let mut e = Encoder::new(&mut out);
+         encode_data(&mut e, self).map_err(|err| UplcError::Encode(err.to_string()))?;
+@@ -87,6 +214,11 @@ impl Data {
+ 
+     /// Decode a `Data` value from CBOR bytes.
+     ///
++    /// The returned top-level value carries the input `bytes` as its
++    /// memoised original (so a subsequent [`Data::to_cbor`] is the
++    /// identity on the wire bytes), mirroring `decodeBinaryData`
++    /// producing a `MemoBytes`-backed `Data`.
++    ///
+     /// Defensive invariants:
+     ///
+     ///  - Recursion depth is capped at [`DATA_MAX_DEPTH`].
+@@ -102,7 +234,26 @@ impl Data {
+                 bytes.len() - d.position()
+             )));
+         }
+-        Ok(data)
++        Ok(data.with_original(Rc::new(bytes.to_vec())))
++    }
++}
++
++impl PartialEq for Data {
++    /// Structural equality only — the memo is ignored, mirroring the
++    /// derived `Eq (Data era)` in cardano-ledger (the `MemoBytes`
++    /// `Eq` compares the structural value, not the raw span).
++    fn eq(&self, other: &Self) -> bool {
++        self.kind == other.kind
++    }
++}
++
++impl Eq for Data {}
++
++impl std::hash::Hash for Data {
++    /// Hash the structural payload only — the memo must not perturb
++    /// CEK env dedup / constant interning.
++    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
++        self.kind.hash(state);
+     }
+ }
+ 
+@@ -114,9 +265,12 @@ fn encode_data<W: minicbor::encode::Write>(
+     e: &mut Encoder<W>,
+     data: &Data,
+ ) -> Result<(), minicbor::encode::Error<W::Error>> {
+-    match data {
+-        Data::Constr(tag, args) => encode_constr(e, *tag, args),
+-        Data::Map(entries) => {
++    // The structural canonical encoder deliberately ignores any memo on
++    // *sub*-nodes: it is only ever reached for memo-less (machine-built)
++    // values. The memo short-circuit lives in `Data::to_cbor`.
++    match &data.kind {
++        DataKind::Constr(tag, args) => encode_constr(e, *tag, args),
++        DataKind::Map(entries) => {
+             // Haskell's encoder always uses definite-length CBOR maps
+             // for Data. The decoder accepts indefinite, but byte-exact
+             // round-trip requires definite on the encode path.
+@@ -127,9 +281,9 @@ fn encode_data<W: minicbor::encode::Write>(
+             }
+             Ok(())
+         }
+-        Data::List(items) => encode_list(e, items),
+-        Data::I(n) => encode_integer(e, n),
+-        Data::B(bs) => encode_bytes(e, bs),
++        DataKind::List(items) => encode_list(e, items),
++        DataKind::I(n) => encode_integer(e, n),
++        DataKind::B(bs) => encode_bytes(e, bs),
+     }
+ }
+ 
+@@ -319,6 +473,14 @@ fn decode_data(d: &mut Decoder<'_>, depth: usize) -> Result<Data, UplcError> {
+             "Data nesting depth exceeds limit ({DATA_MAX_DEPTH})"
+         )));
+     }
++    // `Data` now carries a memo word, so a `DATA_MAX_DEPTH`-deep value
++    // builds larger stack frames than before. Mirror the flat-term
++    // decoder and transparently extend the OS stack when it runs low,
++    // so a deep-but-valid datum (within the depth cap) cannot overflow.
++    stacker::maybe_grow(64 * 1024, 1024 * 1024, || decode_data_inner(d, depth))
++}
++
++fn decode_data_inner(d: &mut Decoder<'_>, depth: usize) -> Result<Data, UplcError> {
+     let ty = d
+         .datatype()
+         .map_err(|e| UplcError::CborDecode(format!("datatype: {e}")))?;
+@@ -666,7 +828,7 @@ mod tests {
+             (Data::B(vec![0x01]), Data::I(BigInt::from(20))),
+         ]);
+         let decoded = rt(&d);
+-        if let Data::Map(es) = decoded {
++        if let DataKind::Map(es) = decoded.kind {
+             assert_eq!(es.len(), 2);
+         } else {
+             panic!("expected Map");
+@@ -718,4 +880,132 @@ mod tests {
+         let err = Data::from_cbor(&[]).expect_err("must reject empty");
+         assert!(matches!(err, UplcError::CborDecode(_)), "got {err:?}");
+     }
++
++    // ── serialiseData VERBATIM-BYTES memo (#15) ──────────────────────────
++
++    /// A `Data` decoded from **non-canonical** on-chain CBOR must
++    /// `serialise` back to the *verbatim* original bytes — never a
++    /// canonical re-encode. This mirrors the `MemoBytes`-backed ledger
++    /// `Data`, whose `serialiseData` / `hashData` operate over the
++    /// memoised original `ShortByteString`.
++    ///
++    /// The fixture is the CASE-1 shape from preprod ep293 failing tx
++    /// `27751ab9` (PlutusV3 script `7afbde08` calls `serialiseData` on
++    /// its datum): a `Constr` encoded in the **general tag-102 form**
++    /// (`d8 66 82 01 …`) wrapping **indefinite-length** field arrays
++    /// (`0x9f … 0xff`) — both of which a canonical structural encoder
++    /// (compact tag-121, definite arrays) cannot reproduce.
++    #[test]
++    fn serialise_data_returns_verbatim_noncanonical_bytes_not_reencode() {
++        use dugite_primitives::hash::blake2b_256;
++        // Non-canonical encoding:
++        //   tag 102 (general Constr form) [ uint 1, INDEF-array [ B"abc" ] ]
++        //   d8 66            -- tag(102)
++        //   82               -- array(2)   [tag_index, fields]
++        //   01               -- uint 1     (constructor index)
++        //   9f 43 61 62 63 ff-- indef-array [ bytes(3) "abc" ]
++        let noncanonical: Vec<u8> =
++            vec![0xd8, 0x66, 0x82, 0x01, 0x9f, 0x43, 0x61, 0x62, 0x63, 0xff];
++
++        // Decode → structural value is `Constr 1 [B "abc"]`.
++        let decoded = Data::from_cbor(&noncanonical).expect("decode non-canonical");
++        assert_eq!(
++            decoded.kind,
++            DataKind::Constr(1, vec![Data::B(b"abc".to_vec())]),
++            "structural decode must be Constr 1 [B abc]"
++        );
++
++        // serialiseData (via to_cbor) MUST return the verbatim bytes.
++        let serialised = decoded.to_cbor().expect("serialise");
++        assert_eq!(
++            serialised, noncanonical,
++            "serialiseData must return the verbatim non-canonical on-wire bytes"
++        );
++
++        // And the canonical structural re-encode is *different* (compact
++        // tag-121 `d87a`, definite-length field array) — proving the memo
++        // is doing real work.
++        let canonical = Data::from_kind(decoded.kind.clone())
++            .to_cbor()
++            .expect("canonical encode");
++        assert_ne!(
++            canonical, noncanonical,
++            "canonical re-encode must differ from the non-canonical original"
++        );
++        // Constr 1 [B abc] canonical = d87a 9f 43 616263 ff  (tag 122, indef list)
++        // i.e. the tag byte differs (0x66→0x7a region) — confirm the hashes split.
++        assert_ne!(
++            blake2b_256(&serialised).0,
++            blake2b_256(&canonical).0,
++            "verbatim vs canonical hashes must differ (the on-chain failure)"
++        );
++    }
++
++    /// Machine-**constructed** `Data` (the analogue of the `constrData` /
++    /// `bData` builtins) carries **no** memo, so `serialiseData` emits the
++    /// canonical encoding — matching Haskell `Codec.Serialise.serialise`
++    /// on a freshly-built `Data`.
++    #[test]
++    fn serialise_data_machine_built_is_canonical() {
++        let built = Data::Constr(1, vec![Data::B(b"abc".to_vec())]);
++        assert!(built.original().is_none(), "machine-built carries no memo");
++        let out = built.to_cbor().expect("encode");
++        // Canonical Constr 1: compact tag 122 = 0xd8 0x7a, then the
++        // (non-empty) indefinite field array.
++        assert_eq!(&out[..2], &[0xd8, 0x7a], "must use compact tag-121+ form");
++        assert_eq!(
++            out,
++            vec![0xd8, 0x7a, 0x9f, 0x43, 0x61, 0x62, 0x63, 0xff],
++            "machine-built Constr 1 [B abc] must be canonical"
++        );
++    }
++
++    /// The memo must be **invisible** to structural equality / hashing:
++    /// two structurally-equal `Data` values (one memoised, one not) must
++    /// be `==` and hash identically, so the CEK machine's `equalsData`,
++    /// env dedup and constant interning are unaffected.
++    #[test]
++    fn memo_is_ignored_by_eq_and_hash() {
++        use std::collections::hash_map::DefaultHasher;
++        use std::hash::{Hash, Hasher};
++
++        let memoised = Data::from_cbor(&[0xd8, 0x66, 0x82, 0x01, 0x80]).expect("decode");
++        let plain = Data::Constr(1, vec![]);
++        assert_eq!(memoised, plain, "memo must not affect equality");
++
++        let mut h1 = DefaultHasher::new();
++        let mut h2 = DefaultHasher::new();
++        memoised.hash(&mut h1);
++        plain.hash(&mut h2);
++        assert_eq!(h1.finish(), h2.finish(), "memo must not affect hashing");
++
++        // But their serialised forms differ (verbatim vs canonical).
++        assert_ne!(
++            memoised.to_cbor().unwrap(),
++            plain.to_cbor().unwrap(),
++            "verbatim memo vs canonical re-encode must serialise differently"
++        );
++    }
++
++    /// Sub-fields extracted from a memoised `Data` are themselves
++    /// memo-less (canonical) — matching `unConstrData` returning plain
++    /// `PV1.Data` fields. Only the *whole* tx-originating value carries
++    /// the `MemoBytes` original.
++    #[test]
++    fn extracted_subfields_are_memoless() {
++        // Constr 0 [ Constr 1 [] ] with the OUTER in non-canonical tag-102
++        // and the inner in compact form.
++        //   d8 66 82 00 9f  d87a80  ff
++        let bytes = vec![0xd8, 0x66, 0x82, 0x00, 0x9f, 0xd8, 0x7a, 0x80, 0xff];
++        let decoded = Data::from_cbor(&bytes).expect("decode");
++        assert!(decoded.original().is_some(), "top-level carries the memo");
++        let DataKind::Constr(0, fields) = &decoded.kind else {
++            panic!("expected Constr 0");
++        };
++        assert_eq!(fields.len(), 1);
++        assert!(
++            fields[0].original().is_none(),
++            "extracted sub-field must be memo-less (canonical), per MemoBytes whole-value memo"
++        );
++    }
+ }
+diff --git a/crates/dugite-uplc/src/eval_redeemer.rs b/crates/dugite-uplc/src/eval_redeemer.rs
+index cd9a61f19d..49f2dde185 100644
+--- a/crates/dugite-uplc/src/eval_redeemer.rs
++++ b/crates/dugite-uplc/src/eval_redeemer.rs
+@@ -120,7 +120,15 @@ pub fn eval_resolved_redeemer(
+                                 .to_string(),
+                         )
+                     })?;
+-                    let datum_term = data_const_term(plutus_data_to_data(datum));
++                    // Attach the preserved on-wire datum CBOR as the memo so a
++                    // `serialiseData`/datum-hash over the datum argument returns
++                    // the verbatim (frequently non-canonical) on-chain bytes,
++                    // matching the `MemoBytes`-backed ledger `Data`.
++                    let datum_term =
++                        data_const_term(crate::tx_info_populate::plutus_data_to_data_memoised(
++                            datum,
++                            r.datum_raw.as_deref(),
++                        ));
+                     // script(datum)(redeemer)(ctx)
+                     Term::App(
+                         Rc::new(Term::App(
+@@ -356,16 +364,16 @@ fn decode_script_bytes_uncached(bytes: &[u8]) -> Result<Program, PhaseTwoError>
+ }
+ 
+ fn debug_dump_data(d: &crate::data::Data, depth: usize) {
+-    use crate::data::Data;
++    use crate::data::DataKind;
+     let pad = "  ".repeat(depth);
+-    match d {
+-        Data::Constr(tag, args) => {
++    match &d.kind() {
++        DataKind::Constr(tag, args) => {
+             eprintln!("{pad}Constr {tag} [{}]", args.len());
+             for a in args {
+                 debug_dump_data(a, depth + 1);
+             }
+         }
+-        Data::Map(kvs) => {
++        DataKind::Map(kvs) => {
+             eprintln!("{pad}Map [{}]", kvs.len());
+             for (k, v) in kvs {
+                 eprintln!("{pad} k:");
+@@ -374,14 +382,14 @@ fn debug_dump_data(d: &crate::data::Data, depth: usize) {
+                 debug_dump_data(v, depth + 2);
+             }
+         }
+-        Data::List(xs) => {
++        DataKind::List(xs) => {
+             eprintln!("{pad}List [{}]", xs.len());
+             for x in xs {
+                 debug_dump_data(x, depth + 1);
+             }
+         }
+-        Data::I(n) => eprintln!("{pad}I {n}"),
+-        Data::B(b) => {
++        DataKind::I(n) => eprintln!("{pad}I {n}"),
++        DataKind::B(b) => {
+             let h = hex::encode(b);
+             eprintln!(
+                 "{pad}B(len={}) {}",
+diff --git a/crates/dugite-uplc/src/populate_gov.rs b/crates/dugite-uplc/src/populate_gov.rs
+index 471ce0f172..a023bddf7b 100644
+--- a/crates/dugite-uplc/src/populate_gov.rs
++++ b/crates/dugite-uplc/src/populate_gov.rs
+@@ -654,6 +654,7 @@ pub fn certificates_to_plutus(certs: &[PrimCert]) -> Result<Vec<TxCert>, PhaseTw
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use crate::data::DataKind;
+     use crate::script_context::Credential as PlCredential;
+     use dugite_primitives::hash::Hash;
+     use dugite_primitives::transaction::{Anchor, GovActionId};
+@@ -726,8 +727,8 @@ mod tests {
+         let tx_cert = certificate_to_plutus_v1v2(&cert).unwrap();
+         let purpose = crate::script_context::ScriptPurpose::Certifying(0, tx_cert);
+         let d = purpose.to_data();
+-        match d {
+-            Data::Constr(3, fields) => {
++        match d.kind {
++            DataKind::Constr(3, fields) => {
+                 assert_eq!(
+                     fields.len(),
+                     1,
+@@ -868,7 +869,7 @@ mod tests {
+             anchor: anchor(),
+         };
+         let pl = proposal_to_plutus(&p).unwrap();
+-        let Data::Constr(0, fields) = pl.0 else {
++        let DataKind::Constr(0, fields) = &pl.0.kind else {
+             panic!("expected Constr 0 wrapper");
+         };
+         assert_eq!(fields.len(), 3);
+@@ -876,7 +877,7 @@ mod tests {
+         assert_eq!(fields[0], Data::I(BigInt::from(100_000)));
+         // return_addr (Plutus Credential::PubKey([0x42; 28]) → Constr 0 [B ...])
+         assert!(
+-            matches!(&fields[1], Data::Constr(0, inner) if inner == &vec![Data::B(vec![0x42; 28])])
++            matches!(&fields[1].kind, DataKind::Constr(0, inner) if inner == &vec![Data::B(vec![0x42; 28])])
+         );
+         // gov_action: InfoAction = Constr 6 []
+         // Haskell: makeIsDataSchemaIndexed ''GovernanceAction [('InfoAction, 6)]
+@@ -903,7 +904,11 @@ mod tests {
+     #[test]
+     fn cert_stake_registration_uses_constr_0_with_none_deposit() {
+         let c = PrimCert::StakeRegistration(key_cred(1));
+-        let TxCert(Data::Constr(tag, fields)) = certificate_to_plutus(&c).unwrap() else {
++        let TxCert(Data {
++            kind: DataKind::Constr(tag, fields),
++            ..
++        }) = certificate_to_plutus(&c).unwrap()
++        else {
+             panic!("expected Constr");
+         };
+         assert_eq!(tag, 0);
+@@ -917,7 +922,11 @@ mod tests {
+             credential: key_cred(1),
+             deposit: Lovelace(2_000_000),
+         };
+-        let TxCert(Data::Constr(tag, fields)) = certificate_to_plutus(&c).unwrap() else {
++        let TxCert(Data {
++            kind: DataKind::Constr(tag, fields),
++            ..
++        }) = certificate_to_plutus(&c).unwrap()
++        else {
+             panic!("expected Constr");
+         };
+         assert_eq!(tag, 0);
+@@ -945,7 +954,11 @@ mod tests {
+             pool_metadata: None,
+         };
+         let c = PrimCert::PoolRegistration(params);
+-        let TxCert(Data::Constr(tag, fields)) = certificate_to_plutus(&c).unwrap() else {
++        let TxCert(Data {
++            kind: DataKind::Constr(tag, fields),
++            ..
++        }) = certificate_to_plutus(&c).unwrap()
++        else {
+             panic!("expected Constr");
+         };
+         assert_eq!(tag, 7);
+@@ -959,7 +972,11 @@ mod tests {
+             pool_hash: h28(0xcc),
+             epoch: 500,
+         };
+-        let TxCert(Data::Constr(tag, fields)) = certificate_to_plutus(&c).unwrap() else {
++        let TxCert(Data {
++            kind: DataKind::Constr(tag, fields),
++            ..
++        }) = certificate_to_plutus(&c).unwrap()
++        else {
+             panic!("expected Constr");
+         };
+         assert_eq!(tag, 8);
+@@ -972,7 +989,11 @@ mod tests {
+             cold_credential: key_cred(1),
+             hot_credential: script_cred(2),
+         };
+-        let TxCert(Data::Constr(tag, _)) = certificate_to_plutus(&c).unwrap() else {
++        let TxCert(Data {
++            kind: DataKind::Constr(tag, _),
++            ..
++        }) = certificate_to_plutus(&c).unwrap()
++        else {
+             panic!("expected Constr");
+         };
+         assert_eq!(tag, 9);
+@@ -1058,22 +1079,22 @@ mod tests {
+         })
+         .unwrap();
+         // outer: Constr 3 [Maybe]
+-        let Data::Constr(3, ref fields) = d else {
++        let DataKind::Constr(3, ref fields) = d.kind else {
+             panic!("NoConfidence must be Constr 3; got {d:?}");
+         };
+         assert_eq!(fields.len(), 1);
+         // Maybe = Just → Constr 0 [gaid_data]
+-        let Data::Constr(0, ref just_fields) = fields[0] else {
++        let DataKind::Constr(0, ref just_fields) = fields[0].kind else {
+             panic!("Just must be Constr 0; got {:?}", fields[0]);
+         };
+         assert_eq!(just_fields.len(), 1);
+         // GovernanceActionId = Constr 0 [B txid32, I 3]
+-        let Data::Constr(0, ref gaid_fields) = just_fields[0] else {
++        let DataKind::Constr(0, ref gaid_fields) = just_fields[0].kind else {
+             panic!("GovActionId must be Constr 0; got {:?}", just_fields[0]);
+         };
+         assert_eq!(gaid_fields.len(), 2);
+         assert!(
+-            matches!(&gaid_fields[0], Data::B(b) if b.len() == 32 && b.iter().all(|&x| x == 0xab)),
++            matches!(&gaid_fields[0].kind, DataKind::B(b) if b.len() == 32 && b.iter().all(|&x| x == 0xab)),
+             "txid must be bare B(32); got {:?}",
+             gaid_fields[0]
+         );
+@@ -1091,7 +1112,7 @@ mod tests {
+             protocol_version: (10, 0),
+         })
+         .unwrap();
+-        let Data::Constr(1, ref fields) = d else {
++        let DataKind::Constr(1, ref fields) = d.kind else {
+             panic!("HardForkInitiation must be Constr 1; got {d:?}");
+         };
+         assert_eq!(fields.len(), 2);
+@@ -1124,7 +1145,7 @@ mod tests {
+             },
+         })
+         .unwrap();
+-        let Data::Constr(5, ref fields) = d else {
++        let DataKind::Constr(5, ref fields) = d.kind else {
+             panic!("NewConstitution must be Constr 5; got {d:?}");
+         };
+         assert_eq!(fields.len(), 2);
+@@ -1151,17 +1172,17 @@ mod tests {
+             policy_hash: None,
+         })
+         .unwrap();
+-        let Data::Constr(2, ref fields) = d else {
++        let DataKind::Constr(2, ref fields) = d.kind else {
+             panic!("TreasuryWithdrawals must be Constr 2; got {d:?}");
+         };
+         assert_eq!(fields.len(), 2);
+         // Map: [(Credential::PubKey([0x77;28]), I 500_000)]
+-        let Data::Map(ref entries) = fields[0] else {
++        let DataKind::Map(ref entries) = fields[0].kind else {
+             panic!("field[0] must be Map; got {:?}", fields[0]);
+         };
+         assert_eq!(entries.len(), 1);
+         assert!(
+-            matches!(&entries[0].0, Data::Constr(0, inner) if inner.len() == 1),
++            matches!(&entries[0].0.kind, DataKind::Constr(0, inner) if inner.len() == 1),
+             "map key must be PubKeyCredential (Constr 0 [B28]); got {:?}",
+             entries[0].0
+         );
+@@ -1190,27 +1211,27 @@ mod tests {
+             },
+         })
+         .unwrap();
+-        let Data::Constr(4, ref fields) = d else {
++        let DataKind::Constr(4, ref fields) = d.kind else {
+             panic!("UpdateCommittee must be Constr 4; got {d:?}");
+         };
+         assert_eq!(fields.len(), 4);
+         // fields[1]: [ColdCredential] — 1 item (key_cred 0xaa) = Constr 0 [B28]
+-        let Data::List(ref remove_list) = fields[1] else {
++        let DataKind::List(ref remove_list) = fields[1].kind else {
+             panic!("field[1] must be List; got {:?}", fields[1]);
+         };
+         assert_eq!(remove_list.len(), 1);
+         assert!(
+-            matches!(&remove_list[0], Data::Constr(0, _)),
++            matches!(&remove_list[0].kind, DataKind::Constr(0, _)),
+             "ColdCommitteeCredential must be PubKeyCredential (Constr 0); got {:?}",
+             remove_list[0]
+         );
+         // fields[2]: Map — 1 entry: script_cred 0xbb → epoch 500
+-        let Data::Map(ref add_map) = fields[2] else {
++        let DataKind::Map(ref add_map) = fields[2].kind else {
+             panic!("field[2] must be Map; got {:?}", fields[2]);
+         };
+         assert_eq!(add_map.len(), 1);
+         assert!(
+-            matches!(&add_map[0].0, Data::Constr(1, _)),
++            matches!(&add_map[0].0.kind, DataKind::Constr(1, _)),
+             "ScriptCredential must be Constr 1; got {:?}",
+             add_map[0].0
+         );
+diff --git a/crates/dugite-uplc/src/populate_v3.rs b/crates/dugite-uplc/src/populate_v3.rs
+index f57552c197..06afda527d 100644
+--- a/crates/dugite-uplc/src/populate_v3.rs
++++ b/crates/dugite-uplc/src/populate_v3.rs
+@@ -210,6 +210,7 @@ pub(crate) fn purpose_rank(tag: &RedeemerTag) -> u8 {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use crate::data::DataKind;
+     use crate::script_context::{Credential as PlCredential, OutputDatum as PlOutputDatum};
+     use dugite_primitives::address::{Address as PrimAddress, EnterpriseAddress};
+     use dugite_primitives::credentials::Credential as PrimCred;
+@@ -502,7 +503,7 @@ mod tests {
+         assert_eq!(info.certs.len(), 1);
+         // TxCertUnRegStaking = Constr 1 [cred, Maybe Lovelace]
+         let crate::script_context::TxCert(ref d) = info.certs[0];
+-        let crate::data::Data::Constr(tag, ref fields) = d else {
++        let crate::data::DataKind::Constr(tag, ref fields) = &d.kind else {
+             panic!("cert must be Constr; got {d:?}");
+         };
+         assert_eq!(
+@@ -512,7 +513,7 @@ mod tests {
+         assert_eq!(fields.len(), 2, "must have credential + Maybe");
+         // credential = PubKeyCredential([0xcc;28]) = Constr 0 [B28]
+         assert!(
+-            matches!(&fields[0], crate::data::Data::Constr(0, inner) if inner.len() == 1),
++            matches!(&fields[0].kind, crate::data::DataKind::Constr(0, inner) if inner.len() == 1),
+             "credential must be Constr 0 [B28]; got {:?}",
+             fields[0]
+         );
+@@ -769,23 +770,23 @@ mod tests {
+         // Haskell: PlutusLedgerApi.V3.Contexts — TxId newtype deriving ToData from
+         //   BuiltinByteString → bare B(32) in the TxOutRef payload.
+         let spend_data = info.redeemers[0].0.to_data_v3();
+-        let Data::Constr(1, ref spend_fields) = spend_data else {
++        let DataKind::Constr(1, ref spend_fields) = spend_data.kind else {
+             panic!("Spending ScriptPurpose must be Constr 1; got {spend_data:?}");
+         };
+         // TxOutRef = Constr 0 [B32 (bare), I idx]  — V3 bare-txid form
+-        let Data::Constr(0, ref txoutref_fields) = spend_fields[0] else {
++        let DataKind::Constr(0, ref txoutref_fields) = spend_fields[0].kind else {
+             panic!("TxOutRef must be Constr 0; got {:?}", spend_fields[0]);
+         };
+         assert_eq!(txoutref_fields.len(), 2);
+         // V3: txid must be BARE B(32), NOT Constr 0 [B(32)]
+         assert!(
+-            matches!(&txoutref_fields[0], Data::B(b) if b.len() == 32),
++            matches!(&txoutref_fields[0].kind, DataKind::B(b) if b.len() == 32),
+             "V3 Spending TxOutRef txid must be bare B(32); got {:?}",
+             txoutref_fields[0]
+         );
+         // Must NOT be the double-wrapped V1/V2 Constr 0 [B32] form
+         assert!(
+-            !matches!(&txoutref_fields[0], Data::Constr(0, _)),
++            !matches!(&txoutref_fields[0].kind, DataKind::Constr(0, _)),
+             "V3 TxOutRef txid must NOT be Constr-wrapped (that is V1/V2 form)"
+         );
+     }
+@@ -838,20 +839,20 @@ mod tests {
+         // makeIsDataSchemaIndexed ''ScriptPurpose [('Voting, 4)]
+         // Use to_data_v3() to reflect actual serialization path (same for Voting).
+         let purpose_data = info.redeemers[0].0.to_data_v3();
+-        let Data::Constr(4, ref voter_fields) = purpose_data else {
++        let DataKind::Constr(4, ref voter_fields) = purpose_data.kind else {
+             panic!("Voting ScriptPurpose must be Constr 4; got {purpose_data:?}");
+         };
+         assert_eq!(voter_fields.len(), 1);
+         // Voter::DRepVoter(DRepCredential(Script(...))) = Constr 1 [Constr 1 [B28]]
+         // DRepCredential is newtype deriving ToData from Credential → bare Credential
+         // ScriptCredential = Constr 1 [B28]
+-        let Data::Constr(1, ref drep_fields) = voter_fields[0] else {
++        let DataKind::Constr(1, ref drep_fields) = voter_fields[0].kind else {
+             panic!("DRepVoter must be Constr 1; got {:?}", voter_fields[0]);
+         };
+         assert_eq!(drep_fields.len(), 1);
+         // DRepCredential passes through to Credential (Constr 1 for Script)
+         assert!(
+-            matches!(&drep_fields[0], Data::Constr(1, inner) if inner.len() == 1),
++            matches!(&drep_fields[0].kind, DataKind::Constr(1, inner) if inner.len() == 1),
+             "DRepCredential(ScriptCredential) must be Constr 1 [B28]; got {:?}",
+             drep_fields[0]
+         );
+diff --git a/crates/dugite-uplc/src/redeemer_resolve.rs b/crates/dugite-uplc/src/redeemer_resolve.rs
+index bbdd5826b2..1d698fe19c 100644
+--- a/crates/dugite-uplc/src/redeemer_resolve.rs
++++ b/crates/dugite-uplc/src/redeemer_resolve.rs
+@@ -62,6 +62,13 @@ pub struct ResolvedRedeemer {
+     /// stays `None` for them; the per-redeemer ScriptContext builder
+     /// (UPLC-9 part 4b) handles V3 inline-datum lookup separately.
+     pub datum: Option<PrimPlutusData>,
++    /// Verbatim on-wire CBOR of `datum`, when preserved (inline-datum
++    /// `raw_cbor` or the matched witness-datum span). Threaded as the
++    /// top-level memo on the datum `Data` so a V1/V2 script that
++    /// `serialiseData`s its datum argument gets the *original*
++    /// (frequently non-canonical) bytes, matching the `MemoBytes`-backed
++    /// ledger `Data`. `None` for V3 / locally-constructed datums.
++    pub datum_raw: Option<Vec<u8>>,
+     /// The redeemer's declared `ExUnits` budget. Per-redeemer
+     /// budget enforcement happens at eval time.
+     pub redeemer_data: PrimPlutusData,
+@@ -146,11 +153,12 @@ fn resolve_spend(
+     })?;
+     let (script_bytes, language) = find_script_bytes(tx, resolved, &script_hash)?;
+     // Datum lookup for V1/V2 only.
+-    let datum = match language {
++    let (datum, datum_raw) = match language {
+         ScriptLanguage::PlutusV1 | ScriptLanguage::PlutusV2 => {
+-            Some(resolve_spend_datum(tx, resolved_out, &script_hash)?)
++            let (d, raw) = resolve_spend_datum(tx, resolved_out, &script_hash)?;
++            (Some(d), raw)
+         }
+-        ScriptLanguage::PlutusV3 => None,
++        ScriptLanguage::PlutusV3 => (None, None),
+     };
+     let purpose = ScriptPurpose::Spending(crate::script_context::TxOutRef {
+         tx_id: input.transaction_id.0,
+@@ -164,6 +172,7 @@ fn resolve_spend(
+         language,
+         purpose,
+         datum,
++        datum_raw,
+         redeemer_data: r.data.clone(),
+         declared_ex_units: (r.ex_units.mem, r.ex_units.steps),
+     })
+@@ -198,6 +207,7 @@ fn resolve_mint(
+         language,
+         purpose: ScriptPurpose::Minting(policy_id),
+         datum: None,
++        datum_raw: None,
+         redeemer_data: r.data.clone(),
+         declared_ex_units: (r.ex_units.mem, r.ex_units.steps),
+     })
+@@ -241,6 +251,7 @@ fn resolve_cert(
+         language,
+         purpose,
+         datum: None,
++        datum_raw: None,
+         redeemer_data: r.data.clone(),
+         declared_ex_units: (r.ex_units.mem, r.ex_units.steps),
+     })
+@@ -289,6 +300,7 @@ fn resolve_reward(
+         language,
+         purpose,
+         datum: None,
++        datum_raw: None,
+         redeemer_data: r.data.clone(),
+         declared_ex_units: (r.ex_units.mem, r.ex_units.steps),
+     })
+@@ -338,6 +350,7 @@ fn resolve_vote(
+         language,
+         purpose,
+         datum: None,
++        datum_raw: None,
+         redeemer_data: r.data.clone(),
+         declared_ex_units: (r.ex_units.mem, r.ex_units.steps),
+     })
+@@ -387,6 +400,7 @@ fn resolve_propose(
+         language,
+         purpose,
+         datum: None,
++        datum_raw: None,
+         redeemer_data: r.data.clone(),
+         declared_ex_units: (r.ex_units.mem, r.ex_units.steps),
+     })
+@@ -430,6 +444,7 @@ fn resolve_guarding(
+         language,
+         purpose: ScriptPurpose::Guarding(script_hash),
+         datum: None,
++        datum_raw: None,
+         redeemer_data: r.data.clone(),
+         declared_ex_units: (r.ex_units.mem, r.ex_units.steps),
+     })
+@@ -613,11 +628,11 @@ fn resolve_spend_datum(
+     tx: &Transaction,
+     spent_output: &PrimTxOut,
+     script_hash: &[u8; 28],
+-) -> Result<PrimPlutusData, PhaseTwoError> {
++) -> Result<(PrimPlutusData, Option<Vec<u8>>), PhaseTwoError> {
+     use dugite_primitives::hash::blake2b_256;
+     use dugite_primitives::transaction::OutputDatum as PrimOutputDatum;
+     match &spent_output.datum {
+-        PrimOutputDatum::InlineDatum { data, .. } => Ok(data.clone()),
++        PrimOutputDatum::InlineDatum { data, raw_cbor } => Ok((data.clone(), raw_cbor.clone())),
+         PrimOutputDatum::DatumHash(h) => {
+             // A datum hash is `blake2b_256` over the witness datum's ORIGINAL
+             // CBOR bytes (Haskell hashes the memoised raw bytes). Many on-chain
+@@ -637,7 +652,10 @@ fn resolve_spend_datum(
+             if let Some(spans) = spans {
+                 for (i, raw) in spans.iter().enumerate() {
+                     if blake2b_256(raw).0 == h.0 {
+-                        return Ok(tx.witness_set.plutus_data[i].clone());
++                        // Carry the matched witness-datum span as the memo
++                        // source so a V1/V2 `serialiseData` over the datum
++                        // arg returns the verbatim on-wire bytes.
++                        return Ok((tx.witness_set.plutus_data[i].clone(), Some(raw.clone())));
+                     }
+                 }
+             } else {
+@@ -647,7 +665,7 @@ fn resolve_spend_datum(
+                         PhaseTwoError::Internal(format!("resolve_spend_datum: to_cbor: {e}"))
+                     })?;
+                     if blake2b_256(&cbor).0 == h.0 {
+-                        return Ok(d.clone());
++                        return Ok((d.clone(), None));
+                     }
+                 }
+             }
+@@ -816,9 +834,16 @@ mod tests {
+         raw_array.extend_from_slice(&original);
+         ws.raw_plutus_data_cbor = Some(raw_array);
+         let tx = build_tx(minimal_body(), ws);
+-        let resolved =
++        let (resolved, resolved_raw) =
+             resolve_spend_datum(&tx, &out, &[0xAA; 28]).expect("datum must resolve via raw spans");
+         assert_eq!(resolved, datum);
++        // The matched witness-datum span (verbatim, non-canonical) must be
++        // carried back so it can be memoised onto the datum argument.
++        assert_eq!(
++            resolved_raw.as_deref(),
++            Some(original.as_slice()),
++            "resolve_spend_datum must return the verbatim original datum bytes"
++        );
+ 
+         // Without raw bytes → the canonical re-encode (tag-121) cannot match.
+         let mut ws2 = empty_witness();
+diff --git a/crates/dugite-uplc/src/script_context.rs b/crates/dugite-uplc/src/script_context.rs
+index 6ea4693548..e383612f6f 100644
+--- a/crates/dugite-uplc/src/script_context.rs
++++ b/crates/dugite-uplc/src/script_context.rs
+@@ -1028,6 +1028,7 @@ impl ScriptContextV2 {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use crate::data::DataKind;
+ 
+     fn pk(b: u8) -> Credential {
+         Credential::PubKey([b; 28])
+@@ -1038,14 +1039,14 @@ mod tests {
+     /// UpperBound]` where each bound is `Constr 0 [Extended, Bool]` and a
+     /// `Bool` is `Constr 0 []` (False) / `Constr 1 []` (True).
+     fn closures(d: &Data) -> (u64, u64) {
+-        let Data::Constr(0, bounds) = d else {
++        let DataKind::Constr(0, bounds) = &d.kind else {
+             panic!("interval is not Constr 0")
+         };
+         let tag = |b: &Data| -> u64 {
+-            let Data::Constr(0, parts) = b else {
++            let DataKind::Constr(0, parts) = &b.kind else {
+                 panic!("bound is not Constr 0")
+             };
+-            let Data::Constr(t, _) = &parts[1] else {
++            let DataKind::Constr(t, _) = &parts[1].kind else {
+                 panic!("closure is not a Constr")
+             };
+             *t
+@@ -1101,38 +1102,38 @@ mod tests {
+         };
+         // V1/V2: ada entry present and first.
+         let m = v.to_mint_data_v1v2();
+-        let Data::Map(entries) = m else {
++        let DataKind::Map(entries) = m.kind else {
+             panic!("expected Map");
+         };
+         assert_eq!(entries.len(), 2, "ada + 1 native policy");
+         // entry[0] = (b"", Map[(b"", I 0)])
+-        assert!(matches!(&entries[0].0, Data::B(b) if b.is_empty()));
+-        let Data::Map(ada_tokens) = &entries[0].1 else {
++        assert!(matches!(&entries[0].0.kind, DataKind::B(b) if b.is_empty()));
++        let DataKind::Map(ada_tokens) = &entries[0].1.kind else {
+             panic!("ada inner must be a Map");
+         };
+         assert_eq!(ada_tokens.len(), 1);
+-        assert!(matches!(&ada_tokens[0].0, Data::B(b) if b.is_empty()));
+-        assert!(matches!(&ada_tokens[0].1, Data::I(n) if *n == BigInt::from(0)));
++        assert!(matches!(&ada_tokens[0].0.kind, DataKind::B(b) if b.is_empty()));
++        assert!(matches!(&ada_tokens[0].1.kind, DataKind::I(n) if *n == BigInt::from(0)));
+         // entry[1] = the native policy (28-byte key).
+-        assert!(matches!(&entries[1].0, Data::B(b) if b.len() == 28));
++        assert!(matches!(&entries[1].0.kind, DataKind::B(b) if b.len() == 28));
+ 
+         // V3 (to_data): NO ada entry — just the native policy.
+         let v3 = v.to_data();
+-        let Data::Map(v3_entries) = v3 else {
++        let DataKind::Map(v3_entries) = v3.kind else {
+             panic!("expected Map");
+         };
+         assert_eq!(v3_entries.len(), 1, "V3 MintValue omits ada");
+-        assert!(matches!(&v3_entries[0].0, Data::B(b) if b.len() == 28));
++        assert!(matches!(&v3_entries[0].0.kind, DataKind::B(b) if b.len() == 28));
+     }
+ 
+     #[test]
+     fn credential_pubkey_encodes_as_constr_0() {
+         let c = pk(0xaa);
+         let d = c.to_data();
+-        if let Data::Constr(tag, fields) = d {
++        if let DataKind::Constr(tag, fields) = d.kind {
+             assert_eq!(tag, 0);
+             assert_eq!(fields.len(), 1);
+-            assert!(matches!(&fields[0], Data::B(b) if b.len() == 28));
++            assert!(matches!(&fields[0].kind, DataKind::B(b) if b.len() == 28));
+         } else {
+             panic!("expected Constr");
+         }
+@@ -1142,7 +1143,7 @@ mod tests {
+     fn credential_script_encodes_as_constr_1() {
+         let c = Credential::Script([0xbb; 28]);
+         let d = c.to_data();
+-        assert!(matches!(d, Data::Constr(1, _)));
++        assert!(matches!(d.kind, DataKind::Constr(1, _)));
+     }
+ 
+     #[test]
+@@ -1152,7 +1153,7 @@ mod tests {
+             staking: None,
+         };
+         let d = a.to_data();
+-        if let Data::Constr(0, fields) = d {
++        if let DataKind::Constr(0, fields) = d.kind {
+             assert_eq!(fields.len(), 2);
+         } else {
+             panic!("expected Constr 0");
+@@ -1168,7 +1169,7 @@ mod tests {
+             idx: 3,
+         };
+         let d = r.to_data();
+-        let Data::Constr(0, ref fields) = d else {
++        let DataKind::Constr(0, ref fields) = d.kind else {
+             panic!("TxOutRef must be Constr 0; got {d:?}");
+         };
+         assert_eq!(
+@@ -1177,18 +1178,18 @@ mod tests {
+             "TxOutRef must have 2 fields (TxId, Integer)"
+         );
+         // fields[0] must be TxId = Constr 0 [B bytes32]
+-        let Data::Constr(0, ref id_fields) = fields[0] else {
++        let DataKind::Constr(0, ref id_fields) = fields[0].kind else {
+             panic!("TxId must be Constr 0; got {:?}", fields[0]);
+         };
+         assert_eq!(id_fields.len(), 1, "TxId has 1 inner field (the raw bytes)");
+         assert!(
+-            matches!(&id_fields[0], Data::B(b) if b.len() == 32 && b.iter().all(|&x| x == 7)),
++            matches!(&id_fields[0].kind, DataKind::B(b) if b.len() == 32 && b.iter().all(|&x| x == 7)),
+             "TxId inner bytes must be the 32 hash bytes; got {:?}",
+             id_fields[0]
+         );
+         // fields[1] must be the index
+         assert!(
+-            matches!(&fields[1], Data::I(i) if i == &BigInt::from(3)),
++            matches!(&fields[1].kind, DataKind::I(i) if i == &BigInt::from(3)),
+             "TxOutRef idx field must be I(3); got {:?}",
+             fields[1]
+         );
+@@ -1364,7 +1365,7 @@ mod tests {
+         };
+ 
+         let d = info.to_data();
+-        let Data::Constr(tag, ref fields) = d else {
++        let DataKind::Constr(tag, ref fields) = d.kind else {
+             panic!("TxInfoV3::to_data must be Constr; got {d:?}");
+         };
+         assert_eq!(tag, 0, "outer tag must be 0");
+@@ -1377,19 +1378,19 @@ mod tests {
+ 
+         // Field 0: inputs — List[TxInInfo]
+         assert!(
+-            matches!(&fields[0], Data::List(v) if v.len() == 1),
++            matches!(&fields[0].kind, DataKind::List(v) if v.len() == 1),
+             "field[0] (inputs) must be List of 1; got {:?}",
+             fields[0]
+         );
+         // Field 1: reference_inputs — List[] (empty)
+         assert!(
+-            matches!(&fields[1], Data::List(v) if v.is_empty()),
++            matches!(&fields[1].kind, DataKind::List(v) if v.is_empty()),
+             "field[1] (reference_inputs) must be empty List; got {:?}",
+             fields[1]
+         );
+         // Field 2: outputs — List[] (empty)
+         assert!(
+-            matches!(&fields[2], Data::List(v) if v.is_empty()),
++            matches!(&fields[2].kind, DataKind::List(v) if v.is_empty()),
+             "field[2] (outputs) must be empty List; got {:?}",
+             fields[2]
+         );
+@@ -1407,7 +1408,7 @@ mod tests {
+         // Field 5: certs — List[TxCert]
+         // Expected: List[Constr 1 [Constr 0 [B28], Constr 1 []]]
+         assert!(
+-            matches!(&fields[5], Data::List(v) if v.len() == 1),
++            matches!(&fields[5].kind, DataKind::List(v) if v.len() == 1),
+             "field[5] (certs) must be List of 1; got {:?}",
+             fields[5]
+         );
+@@ -1453,18 +1454,18 @@ mod tests {
+         );
+         // Also confirm it is NOT the Constr-wrapped form
+         assert!(
+-            !matches!(&fields[11], Data::Constr(0, _)),
++            !matches!(&fields[11].kind, DataKind::Constr(0, _)),
+             "field[11] (txid) must NOT be Constr 0 [...]; V3 uses bare bytes"
+         );
+         // Field 12: votes — Map (empty)
+         assert!(
+-            matches!(&fields[12], Data::Map(v) if v.is_empty()),
++            matches!(&fields[12].kind, DataKind::Map(v) if v.is_empty()),
+             "field[12] (votes) must be empty Map; got {:?}",
+             fields[12]
+         );
+         // Field 13: proposal_procedures — List (empty)
+         assert!(
+-            matches!(&fields[13], Data::List(v) if v.is_empty()),
++            matches!(&fields[13].kind, DataKind::List(v) if v.is_empty()),
+             "field[13] (proposal_procedures) must be empty List; got {:?}",
+             fields[13]
+         );
+@@ -1493,23 +1494,23 @@ mod tests {
+         // Pubkey credential
+         info.wdrl = vec![(Credential::PubKey([0xaa; 28]), BigInt::from(100u64))];
+         let d = info.to_data();
+-        let Data::Constr(0, ref fields) = d else {
++        let DataKind::Constr(0, ref fields) = d.kind else {
+             panic!("expected Constr 0")
+         };
+ 
+         // Field 6 is wdrl
+-        let Data::Map(ref entries) = fields[6] else {
++        let DataKind::Map(ref entries) = fields[6].kind else {
+             panic!("wdrl (field[6]) must be Map; got {:?}", fields[6]);
+         };
+         assert_eq!(entries.len(), 1, "must have one wdrl entry");
+         let (key, _val) = &entries[0];
+ 
+         // Key must be Credential directly: Constr 0 [B28] for PubKey
+-        match key {
+-            Data::Constr(0, inner) => {
++        match &key.kind {
++            DataKind::Constr(0, inner) => {
+                 assert_eq!(inner.len(), 1, "PubKeyCredential has 1 field");
+                 assert!(
+-                    matches!(&inner[0], Data::B(b) if b.len() == 28),
++                    matches!(&inner[0].kind, DataKind::B(b) if b.len() == 28),
+                     "PubKeyCredential field must be B(28); got {:?}",
+                     inner[0]
+                 );
+@@ -1522,8 +1523,12 @@ mod tests {
+ 
+         // Explicitly check it is NOT double-wrapped (StakingHash form would be
+         // Constr 0 [Constr 0/1 [...]])
+-        if let Data::Constr(0, ref outer_fields) = key {
+-            if let Some(Data::Constr(_, _)) = outer_fields.first() {
++        if let DataKind::Constr(0, ref outer_fields) = key.kind {
++            if let Some(Data {
++                kind: DataKind::Constr(_, _),
++                ..
++            }) = outer_fields.first()
++            {
+                 panic!(
+                     "wdrl key is double-wrapped as StakingHash; V3 must use bare Credential. \
+                      Got: {key:?}"
+@@ -1535,15 +1540,15 @@ mod tests {
+         let mut info2 = empty_tx_info_v3();
+         info2.wdrl = vec![(Credential::Script([0xbb; 28]), BigInt::from(200u64))];
+         let d2 = info2.to_data();
+-        let Data::Constr(0, ref fields2) = d2 else {
++        let DataKind::Constr(0, ref fields2) = d2.kind else {
+             panic!()
+         };
+-        let Data::Map(ref entries2) = fields2[6] else {
++        let DataKind::Map(ref entries2) = fields2[6].kind else {
+             panic!()
+         };
+         // Script credential = Constr 1 [B28]
+         assert!(
+-            matches!(&entries2[0].0, Data::Constr(1, inner) if inner.len() == 1),
++            matches!(&entries2[0].0.kind, DataKind::Constr(1, inner) if inner.len() == 1),
+             "ScriptCredential must be Constr 1; got {:?}",
+             entries2[0].0
+         );
+@@ -1564,12 +1569,12 @@ mod tests {
+         let mut info = empty_tx_info_v3();
+         info.certs = vec![TxCert(cert_data.clone())];
+         let d = info.to_data();
+-        let Data::Constr(0, ref fields) = d else {
++        let DataKind::Constr(0, ref fields) = d.kind else {
+             panic!()
+         };
+ 
+         // Field 5 is certs
+-        let Data::List(ref cert_list) = fields[5] else {
++        let DataKind::List(ref cert_list) = fields[5].kind else {
+             panic!("certs (field[5]) must be List; got {:?}", fields[5]);
+         };
+         assert_eq!(cert_list.len(), 1);
+@@ -1579,14 +1584,14 @@ mod tests {
+             "TxCertUnRegStaking must be Constr 1 [Credential, Maybe Lovelace]"
+         );
+         // Outer tag is 1
+-        let Data::Constr(tag, ref cert_fields) = cert_list[0] else {
++        let DataKind::Constr(tag, ref cert_fields) = cert_list[0].kind else {
+             panic!()
+         };
+         assert_eq!(tag, 1u64, "TxCertUnRegStaking must use Constr tag 1");
+         assert_eq!(cert_fields.len(), 2, "must have exactly 2 fields");
+         // credential is Constr 0 [B28]
+         assert!(
+-            matches!(&cert_fields[0], Data::Constr(0, inner) if inner.len() == 1),
++            matches!(&cert_fields[0].kind, DataKind::Constr(0, inner) if inner.len() == 1),
+             "cert credential must be Constr 0 [B28]; got {:?}",
+             cert_fields[0]
+         );
+@@ -1612,13 +1617,13 @@ mod tests {
+         let mut info = empty_tx_info_v3();
+         info.txid = [0xde; 32];
+         let d = info.to_data();
+-        let Data::Constr(0, ref fields) = d else {
++        let DataKind::Constr(0, ref fields) = d.kind else {
+             panic!()
+         };
+ 
+         // Field 11 is txid
+-        match &fields[11] {
+-            Data::B(b) => {
++        match &fields[11].kind {
++            DataKind::B(b) => {
+                 assert_eq!(b.len(), 32, "txid must be 32 bytes");
+                 assert!(b.iter().all(|&x| x == 0xde), "txid bytes must match");
+             }
+@@ -1688,7 +1693,7 @@ mod tests {
+         println!("TxInfoV3 CBOR hex:\n{hex}");
+ 
+         // Structural sanity: 16 fields
+-        let Data::Constr(0, ref fields) = d else {
++        let DataKind::Constr(0, ref fields) = d.kind else {
+             panic!()
+         };
+         assert_eq!(fields.len(), 16, "eyeball test: must still have 16 fields");
+@@ -1720,9 +1725,12 @@ mod tests {
+ 
+     #[test]
+     fn vote_constructors_have_expected_tags() {
+-        assert!(matches!(Vote::No.to_data(), Data::Constr(0, _)));
+-        assert!(matches!(Vote::Yes.to_data(), Data::Constr(1, _)));
+-        assert!(matches!(Vote::Abstain.to_data(), Data::Constr(2, _)));
++        assert!(matches!(Vote::No.to_data().kind, DataKind::Constr(0, _)));
++        assert!(matches!(Vote::Yes.to_data().kind, DataKind::Constr(1, _)));
++        assert!(matches!(
++            Vote::Abstain.to_data().kind,
++            DataKind::Constr(2, _)
++        ));
+     }
+ 
+     #[test]
+@@ -1814,8 +1822,8 @@ mod tests {
+             },
+             purpose: p,
+         };
+-        assert!(matches!(v1.to_data(), Data::Constr(0, _)));
+-        assert!(matches!(v2.to_data(), Data::Constr(0, _)));
++        assert!(matches!(v1.to_data().kind, DataKind::Constr(0, _)));
++        assert!(matches!(v2.to_data().kind, DataKind::Constr(0, _)));
+     }
+ 
+     #[test]
+@@ -1827,11 +1835,11 @@ mod tests {
+             },
+             datum: Some(Data::I(BigInt::from(42))),
+         };
+-        if let Data::Constr(1, fields) = si.to_data() {
++        if let DataKind::Constr(1, fields) = si.to_data().kind {
+             assert_eq!(fields.len(), 2);
+             // datum slot: Constr 0 [Data::I(42)]
+-            if let Data::Constr(0, inner) = &fields[1] {
+-                assert!(matches!(&inner[0], Data::I(i) if i == &BigInt::from(42)));
++            if let DataKind::Constr(0, inner) = &fields[1].kind {
++                assert!(matches!(&inner[0].kind, DataKind::I(i) if i == &BigInt::from(42)));
+             } else {
+                 panic!("expected Just-wrapped datum");
+             }
+diff --git a/crates/dugite-uplc/src/tx_info_populate.rs b/crates/dugite-uplc/src/tx_info_populate.rs
+index df9c9a13ec..ee7a024fc0 100644
+--- a/crates/dugite-uplc/src/tx_info_populate.rs
++++ b/crates/dugite-uplc/src/tx_info_populate.rs
+@@ -316,19 +316,43 @@ pub fn plutus_data_to_data(p: &PrimPlutusData) -> Data {
+     }
+ }
+ 
++/// Translate a primitive [`PrimPlutusData`] and attach the verbatim
++/// `raw_cbor` of the *whole* value as a memo, when available.
++///
++/// This is the entry point for **tx-originating** `Data` (datums,
++/// redeemers, inline datums, `txInfoData` entries): the memo makes a
++/// subsequent `serialiseData` / datum-hash return the *original* on-wire
++/// bytes rather than a canonical re-encode, mirroring the
++/// `MemoBytes`-backed `Cardano.Ledger.Plutus.Data.Data`. The memo lives
++/// only on the top-level node — sub-fields extracted by `unConstrData` /
++/// `unListData` / … are plain (canonical), matching whole-value
++/// `MemoBytes` memoisation.
++///
++/// `None` raw bytes (locally-constructed data, or a decoder that did not
++/// preserve the span) falls back to a memo-less value.
++pub fn plutus_data_to_data_memoised(p: &PrimPlutusData, raw_cbor: Option<&[u8]>) -> Data {
++    let data = plutus_data_to_data(p);
++    match raw_cbor {
++        Some(bytes) => data.with_original(std::rc::Rc::new(bytes.to_vec())),
++        None => data,
++    }
++}
++
+ /// Translate a primitive [`PrimOutputDatum`] into the Plutus
+ /// [`script_context::OutputDatum`] shape.
+ ///
+-/// `DatumHash(h)` is byte-copied. `InlineDatum { data, .. }` recursively
+-/// translates `data` via [`plutus_data_to_data`]; the `raw_cbor` side
+-/// channel is dropped at this layer — Plutus validators only observe
+-/// the structural `Data` value, not its on-the-wire byte form.
++/// `DatumHash(h)` is byte-copied. `InlineDatum { data, raw_cbor }`
++/// recursively translates `data` via [`plutus_data_to_data`] and attaches
++/// the preserved on-wire `raw_cbor` as the top-level memo (so a script
++/// that inlines this datum and `serialiseData`s it gets the *verbatim*
++/// on-chain bytes — frequently non-canonical — exactly as Haskell's
++/// `MemoBytes`-backed datum would).
+ pub fn output_datum_to_plutus(d: &PrimOutputDatum) -> PlOutputDatum {
+     match d {
+         PrimOutputDatum::None => PlOutputDatum::None,
+         PrimOutputDatum::DatumHash(h) => PlOutputDatum::Hash(h.0),
+-        PrimOutputDatum::InlineDatum { data, .. } => {
+-            PlOutputDatum::Inline(plutus_data_to_data(data))
++        PrimOutputDatum::InlineDatum { data, raw_cbor } => {
++            PlOutputDatum::Inline(plutus_data_to_data_memoised(data, raw_cbor.as_deref()))
+         }
+     }
+ }
+@@ -535,10 +559,21 @@ pub fn datums_to_plutus(
+         .filter(|spans| spans.len() == plutus_data.len());
+     let mut out: Vec<([u8; 32], Data)> = Vec::with_capacity(plutus_data.len());
+     for (i, d) in plutus_data.iter().enumerate() {
+-        let translated = plutus_data_to_data(d);
+-        let h = match &spans {
+-            Some(spans) => dugite_primitives::hash::blake2b_256(&spans[i]).0,
+-            None => datum_hash(&translated)?,
++        // When the per-element original span is available, attach it as the
++        // top-level memo so a script that resolves this datum from
++        // `txInfoData` and `serialiseData`s it gets the verbatim on-wire
++        // bytes (matching the `MemoBytes`-backed ledger `Data`). The hash
++        // is likewise computed over the original span, never a re-encode.
++        let (translated, h) = match &spans {
++            Some(spans) => (
++                plutus_data_to_data(d).with_original(std::rc::Rc::new(spans[i].clone())),
++                dugite_primitives::hash::blake2b_256(&spans[i]).0,
++            ),
++            None => {
++                let translated = plutus_data_to_data(d);
++                let h = datum_hash(&translated)?;
++                (translated, h)
++            }
+         };
+         out.push((h, translated));
+     }
+@@ -577,6 +612,7 @@ pub fn withdrawals_to_plutus(
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use crate::data::DataKind;
+     use dugite_primitives::address::{
+         BaseAddress, EnterpriseAddress, PointerAddress, RewardAddress,
+     };
+@@ -1077,8 +1113,8 @@ mod tests {
+             ),
+         ]);
+         let d = plutus_data_to_data(&p);
+-        match d {
+-            Data::Map(entries) => {
++        match d.kind {
++            DataKind::Map(entries) => {
+                 assert_eq!(entries.len(), 2);
+                 assert_eq!(entries[0].0, Data::I(BigInt::from(2))); // input order preserved
+                 assert_eq!(entries[1].0, Data::I(BigInt::from(1)));
+diff --git a/crates/dugite-uplc/tests/phase2_script_context_regression.rs b/crates/dugite-uplc/tests/phase2_script_context_regression.rs
+index 315c9854c9..15621bff8b 100644
+--- a/crates/dugite-uplc/tests/phase2_script_context_regression.rs
++++ b/crates/dugite-uplc/tests/phase2_script_context_regression.rs
+@@ -55,7 +55,7 @@
+ //!   depth limit was raised to 4096 and `stacker::maybe_grow` added to
+ //!   the recursive decoder to prevent stack overflow on deep but valid scripts.
+ 
+-use dugite_uplc::data::Data;
++use dugite_uplc::data::{Data, DataKind};
+ use dugite_uplc::script_context::Address;
+ use dugite_uplc::script_context::{
+     Credential, GovActionId, OutputDatum, PlutusValue, PosixTimeRange, ScriptContextV1,
+@@ -81,7 +81,7 @@ fn ada_value_policy_key_is_empty_bytestring() {
+     };
+     let d = v.to_data();
+     // Must be a Map.
+-    let Data::Map(entries) = &d else {
++    let DataKind::Map(entries) = &d.kind else {
+         panic!("PlutusValue.to_data() must be Data::Map, got {d:?}");
+     };
+     assert_eq!(entries.len(), 1, "expected exactly one policy entry");
+@@ -102,7 +102,7 @@ fn ada_value_policy_key_is_not_28_zero_bytes() {
+         policies: vec![([0u8; 28], vec![(Vec::new(), BigInt::from(1u64))])],
+     };
+     let d = v.to_data();
+-    let Data::Map(entries) = &d else {
++    let DataKind::Map(entries) = &d.kind else {
+         panic!("expected Map");
+     };
+     let (key, _) = &entries[0];
+@@ -130,13 +130,13 @@ fn posix_time_range_always_valid_has_correct_structure() {
+     let d = r.to_data(false);
+ 
+     // Outer: Interval = Constr 0 [lower_bound, upper_bound]
+-    let Data::Constr(0, ref outer_fields) = d else {
++    let DataKind::Constr(0, ref outer_fields) = d.kind else {
+         panic!("Interval must be Constr 0; got {d:?}");
+     };
+     assert_eq!(outer_fields.len(), 2, "Interval has 2 fields (lb, ub)");
+ 
+     // Lower bound: LowerBound NegInf True = Constr 0 [Constr 0 [], Constr 1 []]
+-    let Data::Constr(0, ref lb_fields) = outer_fields[0] else {
++    let DataKind::Constr(0, ref lb_fields) = outer_fields[0].kind else {
+         panic!("LowerBound must be Constr 0; got {:?}", outer_fields[0]);
+     };
+     assert_eq!(
+@@ -156,7 +156,7 @@ fn posix_time_range_always_valid_has_correct_structure() {
+     );
+ 
+     // Upper bound: UpperBound PosInf True = Constr 0 [Constr 2 [], Constr 1 []]
+-    let Data::Constr(0, ref ub_fields) = outer_fields[1] else {
++    let DataKind::Constr(0, ref ub_fields) = outer_fields[1].kind else {
+         panic!("UpperBound must be Constr 0; got {:?}", outer_fields[1]);
+     };
+     assert_eq!(
+@@ -189,12 +189,12 @@ fn posix_time_range_finite_bounds_have_correct_structure() {
+     };
+     let d = r.to_data(false);
+ 
+-    let Data::Constr(0, ref outer) = d else {
++    let DataKind::Constr(0, ref outer) = d.kind else {
+         panic!("Interval must be Constr 0");
+     };
+ 
+     // Lower: LowerBound (Finite vs_ms) True
+-    let Data::Constr(0, ref lb) = outer[0] else {
++    let DataKind::Constr(0, ref lb) = outer[0].kind else {
+         panic!("LowerBound must be Constr 0");
+     };
+     assert_eq!(
+@@ -209,7 +209,7 @@ fn posix_time_range_finite_bounds_have_correct_structure() {
+     );
+ 
+     // Upper: UpperBound (Finite ttl_ms) False
+-    let Data::Constr(0, ref ub) = outer[1] else {
++    let DataKind::Constr(0, ref ub) = outer[1].kind else {
+         panic!("UpperBound must be Constr 0");
+     };
+     assert_eq!(
+@@ -233,18 +233,18 @@ fn posix_time_range_does_not_use_old_flat_encoding() {
+         upper: Some(2_000_000i64),
+     };
+     let d = r.to_data(false);
+-    let Data::Constr(0, ref outer) = d else {
++    let DataKind::Constr(0, ref outer) = d.kind else {
+         panic!("must be Constr 0");
+     };
+     // Old encoding: bound(Some(t)) = Constr 1 [I(t), Constr 1 []]
+     // New encoding: LowerBound = Constr 0 [Constr 1 [I(t)], Bool]
+     // Check that neither field is Constr 1 at the top level (that was the old bug).
+     assert!(
+-        !matches!(outer[0], Data::Constr(1, _)),
++        !matches!(outer[0].kind, DataKind::Constr(1, _)),
+         "lower bound must NOT be Constr 1 (old buggy encoding)"
+     );
+     assert!(
+-        !matches!(outer[1], Data::Constr(1, _)),
++        !matches!(outer[1].kind, DataKind::Constr(1, _)),
+         "upper bound must NOT be Constr 1 (old buggy encoding)"
+     );
+ }
+@@ -453,13 +453,13 @@ fn txinfo_v3_fee_is_bare_integer_not_value_map() {
+     let mut info = minimal_txinfo_v3();
+     info.fee = BigInt::from(lovelace);
+     let d = info.to_data();
+-    let Data::Constr(0, ref fields) = d else {
++    let DataKind::Constr(0, ref fields) = d.kind else {
+         panic!("TxInfoV3 must be Constr 0");
+     };
+     // V3 TxInfo to_data field order: [inputs, refInputs, outputs, fee, ...] —
+     // fee is field index 3.
+-    match &fields[3] {
+-        Data::I(n) => assert_eq!(
++    match &fields[3].kind {
++        DataKind::I(n) => assert_eq!(
+             *n,
+             BigInt::from(lovelace),
+             "V3 fee must be the bare lovelace integer"
+@@ -492,27 +492,27 @@ fn txinfo_v1_wdrl_is_data_list_of_constr_pairs() {
+     let d = info.to_data();
+ 
+     // V1 TxInfo: Constr 0 [inputs, outputs, fee, mint, dcert, wdrl, ...]
+-    let Data::Constr(0, ref fields) = d else {
++    let DataKind::Constr(0, ref fields) = d.kind else {
+         panic!("TxInfoV1 must be Constr 0");
+     };
+     // wdrl is field index 5
+     let wdrl_field = &fields[5];
+     // V1 wdrl must be a List (not a Map).
+     assert!(
+-        matches!(wdrl_field, Data::List(_)),
++        matches!(wdrl_field.kind, DataKind::List(_)),
+         "txInfoWdrl (V1 field 5) must be Data::List, got {wdrl_field:?}"
+     );
+     assert!(
+-        !matches!(wdrl_field, Data::Map(_)),
++        !matches!(wdrl_field.kind, DataKind::Map(_)),
+         "txInfoWdrl (V1) must NOT be Data::Map"
+     );
+     // Each element must be Constr 0 [cred, Integer].
+-    let Data::List(ref items) = wdrl_field else {
++    let DataKind::List(ref items) = wdrl_field.kind else {
+         unreachable!()
+     };
+     assert_eq!(items.len(), 1, "expected 1 withdrawal entry");
+     assert!(
+-        matches!(&items[0], Data::Constr(0, inner) if inner.len() == 2),
++        matches!(&items[0].kind, DataKind::Constr(0, inner) if inner.len() == 2),
+         "V1 wdrl entry must be Constr 0 [cred, amt]; got {:?}",
+         items[0]
+     );
+@@ -527,7 +527,7 @@ fn txinfo_v2_wdrl_is_data_map() {
+     info.wdrl = vec![(sc, amt)];
+     let d = info.to_data();
+ 
+-    let Data::Constr(0, ref fields) = d else {
++    let DataKind::Constr(0, ref fields) = d.kind else {
+         panic!("TxInfoV2 must be Constr 0");
+     };
+     // V2 field order: inputs=0, reference_inputs=1, outputs=2, fee=3, mint=4,
+@@ -535,11 +535,11 @@ fn txinfo_v2_wdrl_is_data_map() {
+     //                 data=10, txid=11
+     let wdrl_field = &fields[6];
+     assert!(
+-        matches!(wdrl_field, Data::Map(_)),
++        matches!(wdrl_field.kind, DataKind::Map(_)),
+         "txInfoWdrl (V2 field 6) must be Data::Map, got {wdrl_field:?}"
+     );
+     assert!(
+-        !matches!(wdrl_field, Data::List(_)),
++        !matches!(wdrl_field.kind, DataKind::List(_)),
+         "txInfoWdrl (V2) must NOT be Data::List"
+     );
+ }
+@@ -549,7 +549,7 @@ fn txinfo_v2_wdrl_is_data_map() {
+ fn txinfo_v1_empty_wdrl_is_empty_list() {
+     let info = minimal_txinfo_v1();
+     let d = info.to_data();
+-    let Data::Constr(0, ref fields) = d else {
++    let DataKind::Constr(0, ref fields) = d.kind else {
+         panic!("expected Constr 0");
+     };
+     assert_eq!(
+@@ -565,7 +565,7 @@ fn txinfo_v1_empty_wdrl_is_empty_list() {
+ fn txinfo_v2_empty_wdrl_is_empty_map() {
+     let info = minimal_txinfo_v2();
+     let d = info.to_data();
+-    let Data::Constr(0, ref fields) = d else {
++    let DataKind::Constr(0, ref fields) = d.kind else {
+         panic!("expected Constr 0");
+     };
+     assert_eq!(
+@@ -639,12 +639,12 @@ fn txoutref_txid_is_constr_wrapped() {
+     };
+     let d = r.to_data();
+     // Outer: Constr 0 [TxId, Integer]
+-    let Data::Constr(0, ref outer) = d else {
++    let DataKind::Constr(0, ref outer) = d.kind else {
+         panic!("TxOutRef must be Constr 0; got {d:?}");
+     };
+     assert_eq!(outer.len(), 2, "TxOutRef has 2 fields");
+     // Inner TxId: must be Constr 0 [B bytes32], NOT bare B bytes32.
+-    let Data::Constr(0, ref id_fields) = outer[0] else {
++    let DataKind::Constr(0, ref id_fields) = outer[0].kind else {
+         panic!(
+             "TxId must be Constr 0 [B bytes32]; got {:?} — this is Bug E (TxId not wrapped)",
+             outer[0]
+@@ -652,13 +652,13 @@ fn txoutref_txid_is_constr_wrapped() {
+     };
+     assert_eq!(id_fields.len(), 1);
+     assert!(
+-        matches!(&id_fields[0], Data::B(b) if b.len() == 32),
++        matches!(&id_fields[0].kind, DataKind::B(b) if b.len() == 32),
+         "TxId inner field must be B bytes32; got {:?}",
+         id_fields[0]
+     );
+     // Index
+     assert!(
+-        matches!(&outer[1], Data::I(i) if i == &BigInt::from(7u64)),
++        matches!(&outer[1].kind, DataKind::I(i) if i == &BigInt::from(7u64)),
+         "TxOutRef idx must be I(7); got {:?}",
+         outer[1]
+     );
+@@ -672,11 +672,11 @@ fn txoutref_txid_is_not_bare_bytes() {
+         tx_id: [0x11; 32],
+         idx: 0,
+     };
+-    let Data::Constr(0, ref outer) = r.to_data() else {
++    let DataKind::Constr(0, ref outer) = r.to_data().kind else {
+         panic!("expected Constr 0");
+     };
+     assert!(
+-        !matches!(&outer[0], Data::B(_)),
++        !matches!(&outer[0].kind, DataKind::B(_)),
+         "TxId field must NOT be bare bytes (Bug E regression); got {:?}",
+         outer[0]
+     );
+@@ -697,16 +697,16 @@ fn txoutref_v3_txid_is_bare_bytes() {
+         tx_id: [0xcd; 32],
+         idx: 3,
+     };
+-    let Data::Constr(0, ref outer) = r.to_data_v3() else {
++    let DataKind::Constr(0, ref outer) = r.to_data_v3().kind else {
+         panic!("V3 TxOutRef must be Constr 0");
+     };
+     assert_eq!(outer.len(), 2);
+     assert!(
+-        matches!(&outer[0], Data::B(b) if b.len() == 32),
++        matches!(&outer[0].kind, DataKind::B(b) if b.len() == 32),
+         "V3 TxOutRef txid must be BARE B(32); got {:?}",
+         outer[0]
+     );
+-    assert!(matches!(&outer[1], Data::I(i) if i == &BigInt::from(3u64)));
++    assert!(matches!(&outer[1].kind, DataKind::I(i) if i == &BigInt::from(3u64)));
+ }
+ 
+ /// The V3 `TxInfo.inputs` path (`TxInInfo::to_data_v3`) must embed the bare-txid
+@@ -732,22 +732,22 @@ fn v3_txininfo_embeds_bare_txid_outref() {
+         }];
+         i
+     };
+-    let Data::Constr(0, ref fields) = info.to_data() else {
++    let DataKind::Constr(0, ref fields) = info.to_data().kind else {
+         panic!("TxInfoV3 must be Constr 0");
+     };
+     // field[0] = inputs : List[TxInInfo]
+-    let Data::List(ref inputs) = fields[0] else {
++    let DataKind::List(ref inputs) = fields[0].kind else {
+         panic!("inputs must be a List");
+     };
+-    let Data::Constr(0, ref txininfo) = inputs[0] else {
++    let DataKind::Constr(0, ref txininfo) = inputs[0].kind else {
+         panic!("TxInInfo must be Constr 0");
+     };
+     // txininfo[0] = TxOutRef = Constr 0 [B32 BARE, I idx]
+-    let Data::Constr(0, ref outref) = txininfo[0] else {
++    let DataKind::Constr(0, ref outref) = txininfo[0].kind else {
+         panic!("TxOutRef must be Constr 0");
+     };
+     assert!(
+-        matches!(&outref[0], Data::B(b) if b.len() == 32),
++        matches!(&outref[0].kind, DataKind::B(b) if b.len() == 32),
+         "V3 TxInInfo's TxOutRef txid must be BARE B(32), not Constr-wrapped; got {:?}",
+         outref[0]
+     );
+@@ -760,16 +760,16 @@ fn gov_action_id_v3_txid_is_bare_bytes() {
+         tx_id: [0x09; 32],
+         idx: 1,
+     };
+-    let Data::Constr(0, ref outer) = g.to_data() else {
++    let DataKind::Constr(0, ref outer) = g.to_data().kind else {
+         panic!("GovActionId must be Constr 0");
+     };
+     assert_eq!(outer.len(), 2);
+     assert!(
+-        matches!(&outer[0], Data::B(b) if b.len() == 32),
++        matches!(&outer[0].kind, DataKind::B(b) if b.len() == 32),
+         "V3 GovActionId txid must be BARE B(32); got {:?}",
+         outer[0]
+     );
+-    assert!(matches!(&outer[1], Data::I(i) if i == &BigInt::from(1u64)));
++    assert!(matches!(&outer[1].kind, DataKind::I(i) if i == &BigInt::from(1u64)));
+ }
+ 
+ // ─────────────────────────────────────────────────────────────────────────────
+@@ -788,23 +788,23 @@ fn txinfo_v1_fee_is_ada_value_map() {
+     let d = info.to_data();
+ 
+     // V1 TxInfo: Constr 0 [inputs, outputs, fee, ...]  — fee is field 2
+-    let Data::Constr(0, ref fields) = d else {
++    let DataKind::Constr(0, ref fields) = d.kind else {
+         panic!("TxInfoV1 must be Constr 0");
+     };
+     let fee_field = &fields[2];
+ 
+     // fee must be a Map (not I)
+     assert!(
+-        matches!(fee_field, Data::Map(_)),
++        matches!(fee_field.kind, DataKind::Map(_)),
+         "txInfoFee (V1 field 2) must be Data::Map (ADA-only Value), got {fee_field:?}"
+     );
+     assert!(
+-        !matches!(fee_field, Data::I(_)),
++        !matches!(fee_field.kind, DataKind::I(_)),
+         "txInfoFee must NOT be bare Integer (Bug F regression)"
+     );
+ 
+     // Verify the map structure: Map[(b"", Map[(b"", I lovelace)])]
+-    let Data::Map(ref outer_entries) = fee_field else {
++    let DataKind::Map(ref outer_entries) = fee_field.kind else {
+         unreachable!()
+     };
+     assert_eq!(outer_entries.len(), 1, "ADA-only Value has 1 policy");
+@@ -814,7 +814,7 @@ fn txinfo_v1_fee_is_ada_value_map() {
+         &Data::B(Vec::new()),
+         "ADA policy key must be b\"\" (empty bytes)"
+     );
+-    let Data::Map(ref token_entries) = inner_map else {
++    let DataKind::Map(ref token_entries) = inner_map.kind else {
+         panic!("inner value must be Map; got {inner_map:?}");
+     };
+     assert_eq!(token_entries.len(), 1, "ADA-only token map has 1 entry");
+@@ -837,13 +837,13 @@ fn txinfo_v2_fee_is_ada_value_map() {
+     let mut info = minimal_txinfo_v2();
+     info.fee = BigInt::from(5_000_000u64);
+     let d = info.to_data();
+-    let Data::Constr(0, ref fields) = d else {
++    let DataKind::Constr(0, ref fields) = d.kind else {
+         panic!("TxInfoV2 must be Constr 0");
+     };
+     // V2: inputs=0, ref_inputs=1, outputs=2, fee=3
+     let fee_field = &fields[3];
+     assert!(
+-        matches!(fee_field, Data::Map(_)),
++        matches!(fee_field.kind, DataKind::Map(_)),
+         "txInfoFee (V2 field 3) must be Data::Map (ADA-only Value), got {fee_field:?}"
+     );
+ }
+@@ -865,23 +865,23 @@ fn txinfo_v1_data_is_list_of_constr_pairs() {
+ 
+     // V1 TxInfo: Constr 0 [inputs, outputs, fee, mint, dcert, wdrl, validRange, sigs, data, id]
+     // data is field index 8
+-    let Data::Constr(0, ref fields) = d else {
++    let DataKind::Constr(0, ref fields) = d.kind else {
+         panic!("TxInfoV1 must be Constr 0");
+     };
+     let data_field = &fields[8];
+     assert!(
+-        matches!(data_field, Data::List(_)),
++        matches!(data_field.kind, DataKind::List(_)),
+         "txInfoData (V1 field 8) must be Data::List; got {data_field:?}"
+     );
+     assert!(
+-        !matches!(data_field, Data::Map(_)),
++        !matches!(data_field.kind, DataKind::Map(_)),
+         "txInfoData (V1) must NOT be Data::Map (Bug G regression)"
+     );
+-    let Data::List(ref items) = data_field else {
++    let DataKind::List(ref items) = data_field.kind else {
+         unreachable!()
+     };
+     assert_eq!(items.len(), 1, "expected 1 datum entry");
+-    let Data::Constr(0, ref pair) = items[0] else {
++    let DataKind::Constr(0, ref pair) = items[0].kind else {
+         panic!(
+             "V1 data entry must be Constr 0 [B32, datum]; got {:?}",
+             items[0]
+@@ -889,7 +889,7 @@ fn txinfo_v1_data_is_list_of_constr_pairs() {
+     };
+     assert_eq!(pair.len(), 2);
+     assert!(
+-        matches!(&pair[0], Data::B(b) if b.len() == 32),
++        matches!(&pair[0].kind, DataKind::B(b) if b.len() == 32),
+         "datum hash must be B32; got {:?}",
+         pair[0]
+     );
+@@ -906,12 +906,12 @@ fn txinfo_v2_data_is_map() {
+     let d = info.to_data();
+ 
+     // V2: field 10 is data
+-    let Data::Constr(0, ref fields) = d else {
++    let DataKind::Constr(0, ref fields) = d.kind else {
+         panic!("TxInfoV2 must be Constr 0");
+     };
+     let data_field = &fields[10];
+     assert!(
+-        matches!(data_field, Data::Map(_)),
++        matches!(data_field.kind, DataKind::Map(_)),
+         "txInfoData (V2 field 10) must be Data::Map; got {data_field:?}"
+     );
+ }
+@@ -928,16 +928,16 @@ fn txinfo_v1_txid_is_constr_wrapped() {
+     let d = info.to_data();
+ 
+     // V1 TxInfo field 9 is txid
+-    let Data::Constr(0, ref fields) = d else {
++    let DataKind::Constr(0, ref fields) = d.kind else {
+         panic!("TxInfoV1 must be Constr 0");
+     };
+     let id_field = &fields[9];
+-    let Data::Constr(0, ref inner) = id_field else {
++    let DataKind::Constr(0, ref inner) = id_field.kind else {
+         panic!("txInfoId (V1 field 9) must be TxId = Constr 0 [B32]; got {id_field:?}");
+     };
+     assert_eq!(inner.len(), 1);
+     assert!(
+-        matches!(&inner[0], Data::B(b) if b.len() == 32),
++        matches!(&inner[0].kind, DataKind::B(b) if b.len() == 32),
+         "txInfoId inner bytes must be B32; got {:?}",
+         inner[0]
+     );
+@@ -948,11 +948,11 @@ fn txinfo_v1_txid_is_constr_wrapped() {
+ fn txinfo_v1_txid_is_not_bare_bytes() {
+     let info = minimal_txinfo_v1();
+     let d = info.to_data();
+-    let Data::Constr(0, ref fields) = d else {
++    let DataKind::Constr(0, ref fields) = d.kind else {
+         panic!("expected Constr 0")
+     };
+     assert!(
+-        !matches!(&fields[9], Data::B(_)),
++        !matches!(&fields[9].kind, DataKind::B(_)),
+         "txInfoId (V1 field 9) must NOT be bare bytes; got {:?}",
+         fields[9]
+     );
+@@ -980,7 +980,7 @@ fn minimal_txout_v1(datum: OutputDatum) -> TxOut {
+ fn txout_v1_has_three_fields() {
+     let out = minimal_txout_v1(OutputDatum::None);
+     let d = out.to_data_v1();
+-    let Data::Constr(0, ref fields) = d else {
++    let DataKind::Constr(0, ref fields) = d.kind else {
+         panic!("TxOut (V1) must be Constr 0; got {d:?}");
+     };
+     assert_eq!(
+@@ -996,7 +996,7 @@ fn txout_v1_has_three_fields() {
+ fn txout_v2_has_four_fields() {
+     let out = minimal_txout_v1(OutputDatum::None);
+     let d = out.to_data();
+-    let Data::Constr(0, ref fields) = d else {
++    let DataKind::Constr(0, ref fields) = d.kind else {
+         panic!("TxOut (V2) must be Constr 0; got {d:?}");
+     };
+     assert_eq!(
+@@ -1013,17 +1013,17 @@ fn txout_v1_datum_hash_is_just_b32() {
+     let hash = [0x77; 32];
+     let out = minimal_txout_v1(OutputDatum::Hash(hash));
+     let d = out.to_data_v1();
+-    let Data::Constr(0, ref fields) = d else {
++    let DataKind::Constr(0, ref fields) = d.kind else {
+         panic!("expected Constr 0")
+     };
+-    let Data::Constr(0, ref maybe_inner) = fields[2] else {
++    let DataKind::Constr(0, ref maybe_inner) = fields[2].kind else {
+         panic!(
+             "V1 DatumHash must be Just = Constr 0 [B32]; got {:?}",
+             fields[2]
+         );
+     };
+     assert!(
+-        matches!(&maybe_inner[0], Data::B(b) if b.len() == 32),
++        matches!(&maybe_inner[0].kind, DataKind::B(b) if b.len() == 32),
+         "DatumHash inner must be B32"
+     );
+ }
+@@ -1033,7 +1033,7 @@ fn txout_v1_datum_hash_is_just_b32() {
+ fn txout_v1_no_datum_is_nothing() {
+     let out = minimal_txout_v1(OutputDatum::None);
+     let d = out.to_data_v1();
+-    let Data::Constr(0, ref fields) = d else {
++    let DataKind::Constr(0, ref fields) = d.kind else {
+         panic!("expected Constr 0")
+     };
+     assert_eq!(
+@@ -1064,27 +1064,27 @@ fn script_context_v1_spend_purpose_has_wrapped_txid() {
+     };
+     let d = ctx.to_data();
+     // ctx = Constr 0 [TxInfo, ScriptPurpose]
+-    let Data::Constr(0, ref ctx_fields) = d else {
++    let DataKind::Constr(0, ref ctx_fields) = d.kind else {
+         panic!("ScriptContext must be Constr 0");
+     };
+     // ScriptPurpose::Spending = Constr 1 [TxOutRef]
+-    let Data::Constr(1, ref purpose_fields) = ctx_fields[1] else {
++    let DataKind::Constr(1, ref purpose_fields) = ctx_fields[1].kind else {
+         panic!("Spending purpose must be Constr 1; got {:?}", ctx_fields[1]);
+     };
+     assert_eq!(purpose_fields.len(), 1);
+     // TxOutRef = Constr 0 [TxId, Integer]
+-    let Data::Constr(0, ref outref_fields) = purpose_fields[0] else {
++    let DataKind::Constr(0, ref outref_fields) = purpose_fields[0].kind else {
+         panic!("TxOutRef must be Constr 0; got {:?}", purpose_fields[0]);
+     };
+     // TxId = Constr 0 [B bytes32]
+-    let Data::Constr(0, ref txid_fields) = outref_fields[0] else {
++    let DataKind::Constr(0, ref txid_fields) = outref_fields[0].kind else {
+         panic!(
+             "TxId in Spending purpose must be Constr 0 [B32]; got {:?}",
+             outref_fields[0]
+         );
+     };
+     assert!(
+-        matches!(&txid_fields[0], Data::B(b) if b.len() == 32),
++        matches!(&txid_fields[0].kind, DataKind::B(b) if b.len() == 32),
+         "TxId inner field must be B32"
+     );
+ }
+@@ -1101,7 +1101,7 @@ fn v1v2_rewarding_purpose_wraps_credential_in_staking_hash() {
+     let p = ScriptPurpose::Rewarding(Credential::Script([0xab; 28]));
+     let d = p.to_data();
+     // Constr 2 [ Constr 0 [ Constr 1 [B28] ] ]
+-    let Data::Constr(2, outer) = &d else {
++    let DataKind::Constr(2, outer) = &d.kind else {
+         panic!("Rewarding must be Constr 2, got {d:?}");
+     };
+     assert_eq!(
+@@ -1109,17 +1109,17 @@ fn v1v2_rewarding_purpose_wraps_credential_in_staking_hash() {
+         1,
+         "Rewarding has one field (StakingCredential)"
+     );
+-    let Data::Constr(0, sh) = &outer[0] else {
++    let DataKind::Constr(0, sh) = &outer[0].kind else {
+         panic!(
+             "V1/V2 Rewarding field must be StakingHash = Constr 0, got {:?}",
+             outer[0]
+         );
+     };
+     assert_eq!(sh.len(), 1, "StakingHash wraps one Credential");
+-    let Data::Constr(1, cred) = &sh[0] else {
++    let DataKind::Constr(1, cred) = &sh[0].kind else {
+         panic!("inner must be ScriptCredential = Constr 1, got {:?}", sh[0]);
+     };
+-    assert!(matches!(&cred[0], Data::B(b) if b.len() == 28));
++    assert!(matches!(&cred[0].kind, DataKind::B(b) if b.len() == 28));
+ }
+ 
+ #[test]
+@@ -1127,14 +1127,14 @@ fn v3_rewarding_purpose_uses_bare_credential() {
+     let p = ScriptPurpose::Rewarding(Credential::Script([0xab; 28]));
+     let d = p.to_data_v3();
+     // V3: Constr 2 [ Constr 1 [B28] ]  (Credential directly, NO StakingHash)
+-    let Data::Constr(2, outer) = &d else {
++    let DataKind::Constr(2, outer) = &d.kind else {
+         panic!("Rewarding must be Constr 2, got {d:?}");
+     };
+-    let Data::Constr(1, cred) = &outer[0] else {
++    let DataKind::Constr(1, cred) = &outer[0].kind else {
+         panic!(
+             "V3 Rewarding field must be the bare Credential = Constr 1, got {:?}",
+             outer[0]
+         );
+     };
+-    assert!(matches!(&cred[0], Data::B(b) if b.len() == 28));
++    assert!(matches!(&cred[0].kind, DataKind::B(b) if b.len() == 28));
+ }
