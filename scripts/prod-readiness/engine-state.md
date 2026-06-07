@@ -1552,6 +1552,9 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
+- wake232 2026-06-07: POLL #0 ROUND-3 DATA-comparison diagnose wbqhzeczq — still RUNNING (0/2 dims, active; Koios
+  per-account active-stake resolution + hex->bech32 is rate-limited). No transition. Disk 166G, no nodes. #0 stays
+  DIAGNOSING. NEXT WAKE: on found dugite!=Koios credential -> trace class -> fix.
 - wake231 2026-06-07: #0 ROUND-2 wr9tddl4q: rebuild/genesis-load/pointer ALSO correct (2 invariant tests PASS, no
   fix; kept on main). Both code rounds prove dugite INTERNALLY consistent -> can't catch a dugite-vs-Haskell per-cred
   attribution difference. Launched ROUND-3 DIAGNOSE wbqhzeczq (opus, data-comparison: dugite ep245 per-cred stake dump
