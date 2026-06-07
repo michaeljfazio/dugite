@@ -209,7 +209,7 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:FIXING (DEFINITIVE root cause = MIR-before-SNAP ordering; fix applied, building).
+- item: #0 (mainnet ep246 reserves) state:FIXING (polled wake301 — mirfix build linking dugite-node, recompiled dugite-ledger; re-replay next wake). DEFINITIVE root cause = MIR-before-SNAP ordering; fix applied (uncommitted).
   *** wake300 (ultracode): analyze muscle w3jqnacgp = **DEFINITIVE ROOT CAUSE (Koios-exact + Haskell-quoted): a MIR
   call-site ORDERING bug.** dd1971's -2,483,312,791 deficit splits 100% REWARD, 0% UTXO: Koios reward balance @ ep243
   = Σ(rewards spendable<=243)=124,461,009,403 minus Σ(withdrawals<=243)=89,153,454,360 = 35,307,555,043; dugite
