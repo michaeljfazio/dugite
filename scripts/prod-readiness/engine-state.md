@@ -209,7 +209,21 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:PERCRED-REPLAY-RUNNING (build OK + strings-verified; replay pid 18640 launched wake296).
+- item: #0 (mainnet ep246 reserves) state:PER-DELEGATOR-LOCALIZED (concentrated in whale delegators; bucket-split+fix via muscle w3jqnacgp).
+  *** wake297 (ultracode): per-delegator diff for pool 263498e0 RECONCILES EXACTLY: Σ(dugite-koios) over 351 matched
+  delegators = -2,715,004,435 = the pool's deficit. CONCENTRATED: delegator dd1971af42dabd013cc774fa1190c6f2c7a892765611264d039366c9
+  (stake1u8w3jud0gtdt6qfuca605yvscmev02yjwetpzfjdqwfkdjgfmh4py) alone = **-2,483,312,791 (91% of the pool deficit)**.
+  dugite: utxo=3,436,495,701,117 reward=32,824,242,252 total=3,469,319,943,369 ; Koios pool_delegators total=
+  3,471,803,256,160 ; diff=-2,483,312,791. So the 109.6B network deficit is a sum of per-WHALE-delegator stake
+  under-counts (specific missing amounts, NOT a uniform fraction: dd1971 -715ppm of its stake vs others ~215ppm).
+  Koios combines utxo+reward so the bucket isn't trivially split (Koios Σ rewards spendable_epoch<=243 for dd1971 =
+  124,461,009,403; balance = that minus withdrawals<=243 which Koios doesn't expose per-epoch). The component is either
+  stake_map utxo (=> #1 apply_utxo_changes bug) or reward_accounts balance. DROVE: SIGTERM'd percred replay 18640;
+  saved /tmp/dugite_percred_263498e0.txt; launching analyze muscle (next: route the exact reward-balance reconciliation
+  + code localization + Haskell-quoted fix through it). NEXT WAKE: read muscle verdict -> bucket (utxo vs reward) +
+  exact dugite code bug (shelley.rs:533-566 snapshot fold / common.rs apply_utxo_changes stake_map / reward credit-
+  withdraw) -> Tier-A fix -> re-replay verify ep246 reserves==12880948865137767 + ep209-245 unregressed -> gauntlet.
+  Instrumentation UNCOMMITTED. CoW clone KEPT.
   Build OK (1m38s, binary 19:02), SNAP_PERCRED strings=2 VERIFIED. Launched per-cred replay job mainnet-percred pid
   18640 (DUGITE_SNAP_PERCRED=1) over CoW clone db-clones/mainnet-rupd-drop -> dumps per-cred (utxo,reward) for pool
   263498e0.. delegators. ~4min. SNAP_PERCRED lines -> scripts/prod-readiness/.jobs/mainnet-percred.log. NEXT WAKE: grep
@@ -3232,3 +3246,9 @@
   mainnet-percred pid 18640 (DUGITE_SNAP_PERCRED=1, pool 263498e0..) over CoW clone. next wake: grep SNAP_PERCRED
   snap_epoch=243 -> diff vs Koios pool_delegators_history ep244 -> short delegator(s): utxo-gap=#1 stake_map bug,
   reward-gap=reward_accounts bug.
+- wake297 (ultracode): per-delegator diff for pool 263498e0 RECONCILES EXACTLY (Σ=-2,715,004,435); CONCENTRATED in
+  whale dd1971 = -2,483,312,791 (91%). dugite dd1971: utxo=3,436,495,701,117 reward=32,824,242,252; Koios total=
+  3,471,803,256,160; diff -2,483,312,791. So 109.6B = sum of per-whale stake under-counts (specific amounts). Bucket
+  (utxo=stake_map/#1 vs reward) needs the exact Koios reward-balance reconciliation. SIGTERM'd percred replay. Launched
+  analyze muscle w3jqnacgp to split the bucket + localize the dugite code defect + Haskell-quoted fix. next wake: read
+  verdict -> Tier-A fix (live path) -> re-replay verify -> gauntlet.
