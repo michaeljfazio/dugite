@@ -1431,6 +1431,13 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
+- wake210 2026-06-07: LOCK-RECOVERY (wake209 final commit/release call malformed -> stale lock age302s + wake209
+  edit uncommitted; HEAD=wake208, no concurrent wake -> released+reacquired). POLL #15 V3-extension w19kofqwx — still
+  RUNNING (cargo pid 67721, last activity ~90s). No transition. Disk 163G. #15 stays FIXING. NEXT WAKE: poll/process
+  -> build -> re-replay ep293 (306 Error-term -> ~0).
+- wake209 2026-06-07: POLL #15 V3-extension fix muscle w19kofqwx — still RUNNING, ACTIVE (worktree present, bridge
+  applied, build/test). No transition. Disk 171G, no nodes. #15 stays FIXING. NEXT WAKE: poll/process -> build ->
+  re-replay ep293 (306 Error-term -> ~0).
 - wake208 2026-06-07: #15 fix w1xi3j2nf green (Data-memo, 438 uplc tests) BUT REPLAY VERDICT = NO-OP (41 Error-term
   == pre-#15, same txs incl 27751ab9). Root cause: memo threaded V1/V2 datum-arg only; PlutusV3 spending datum
   (SpendingScriptInfo) NOT memoised (eval_redeemer:156 + populate_v3 zero threading) — failing scripts are V3.
