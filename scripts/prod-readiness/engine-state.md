@@ -140,8 +140,24 @@
    reorder/removal), so era-relative index == fromEnum(language) today. Patch comments self-contradict
    ('era-relative' vs 'global'). NOT a current divergence. FIX: make the mapping era-aware (or assert the prefix
    invariant + comment) when a future era reorders/removes a language. state:NEW attempts:0 (follow-up after #10 lands)
-15. [M][phase2][REAL — RE-FRAMED wake163: GENERAL-UPLC, NOT import-incompleteness] 306 (was 277) "script returned
-   Error term" phase-2 divergences (uplc says fail, on-chain is_valid=true). *** wake163 RE-DIAGNOSIS OVERTURNS the
+15. [M->H][phase2][ROOT-CAUSED-CONFIRMED wake165 — byte-level proof] 306 "script returned Error term" phase-2
+   divergences = dugite serialiseData CANONICAL RE-ENCODE bug (general-UPLC). *** wake165 DEFINITIVE PROOF (wpeec891q
+   mechanism dim): failing tx 27751ab9 spends a script (7afbde08, PlutusV3, 4751 bytes) that calls serialiseData 11x
+   and checks blake2b(serialiseData(datum)) against the stored datum_hash. The on-chain datum d87a9fd8799f... is 276
+   bytes using 8x INDEFINITE-length CBOR arrays (0x9f..0xff); blake2b256(those 276 verbatim bytes) = bbd352028feffe9a
+   80a2822b46b9858bc1cf883cff383e1191b47d27ed708eb0 = the on-chain datum_hash EXACTLY. dugite denotations.rs:601
+   d.to_cbor() RE-ENCODES to 270 bytes canonical DEFINITE-length -> blake2b256 = feec1506b516a2ca... != datum_hash ->
+   the script's own hash-check fails -> 'Error term'. 12/13 unique failing-script credentials call serialiseData (the
+   2 that don't always co-appear with an SD script). This is the SAME set in verify10A & verify10j (post-snapshot live
+   blocks), import-independent. FIX (Tier A', dugite-uplc ONLY): the CEK Constant::Data must carry the ORIGINAL CBOR
+   bytes verbatim (Haskell MemoBytes/BinaryData equivalent) when the Data originated from CBOR decode (datums,
+   redeemers, txInfo Data); serialiseData returns those memoised bytes unchanged, falling back to canonical to_cbor()
+   ONLY for machine-constructed Data. Thread original bytes through: plutus-data CBOR decode -> Constant::Data ->
+   builtin SerialiseData. VERIFY: replay ep293 window (slots 125001020+), confirm 306 -> ~0; then gauntlet. Haskell
+   ref: Cardano.Ledger.Plutus.Data BinaryData/hashBinaryData (hashAnnotated over memoised SBS) + Plutus
+   builtinSerialiseData returning the original bytes. state:ROOT-CAUSED-CONFIRMED attempts:0 (ACTIVATE after #10
+   phase-1 lands). --- wake163 re-frame (now fully confirmed): ---
+   *** wake163 RE-DIAGNOSIS OVERTURNS the
    old framing below: classification muscle wpeec891q found a FULLY-INDEPENDENT PURELY-POST-SNAPSHOT failing tx
    27751ab9 (slot 125001020, PlutusV3 5b2bfe89; only input 3d7bb051 @slot124999282 > cutoff 124999169 = NEVER
    imported) — so these are NOT import-incompleteness and the old 'full-replay byte-exact / compact-address' suspect
@@ -1141,6 +1157,12 @@
   recovered to 5GB (verify node exited). Launched a LIVE preprod soak with the #9-FIXED binary (fast-starts via
   Convertible snapshot load). Monitoring: reach tip + sustained at-tip soak (no stall/wedge/chain_diverged,
   ledger_tip==immutable_tip) -> would lock the sync gate's live-soak portion. job .jobs/live-soak.{pid,log}.
+- wake165 2026-06-07: RECORD #15 ROOT-CAUSED-CONFIRMED (byte-level proof from wpeec891q mechanism dim, while #10 fix
+  muscle wjuuqz22k runs). Script 7afbde08 (PlutusV3) computes blake2b(serialiseData(datum)); on-chain datum = 276
+  bytes w/ indefinite arrays, blake2b = bbd35202.. = datum_hash exactly; dugite to_cbor() canonicalises -> 270 bytes,
+  blake2b = feec1506.. != hash -> Error term. 12/13 failing scripts call serialiseData. FIX (dugite-uplc): Constant::
+  Data must carry verbatim original CBOR (MemoBytes); serialiseData returns it. #15 -> ROOT-CAUSED-CONFIRMED, activates
+  after #10 lands. (#10 unchanged this wake — its fix muscle still running.)
 - wake164 2026-06-07: #10 ROOT-CAUSED -> FIXING (commit-B hardening). Generated base-FINAL-DONE-main.patch (3856
   lines, 2 crates) from main's uncommitted tree; launched FIX muscle wjuuqz22k (wf_52ea6a96-0ac, worktree, applies
   base patch by abs path first) for R3 byte-exact float-parse (arbitrary_precision + raw token, Aeson toBoundedInteger)
