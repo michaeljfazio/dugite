@@ -209,8 +209,20 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #15 (phase-2 — V3 SpendingScriptInfo datum population, canonical) state:GAUNTLET-PENDING (minimal correct fix).
-  *** wake219: REPLAY DECISIVE PASS — verify15min synced PAST window (tip 125125576), 0 'Error term' across the FULL
+- item: #0 (mainnet ep246 reserves +82,270,482 / treasury -55,269) state:PARKED-WITH-ROOT-CAUSE -> NOW ACTIVE (see
+  backlog #0: member-reward fold must use a single resolved active-stake VMap like resolveActiveInstantStakeCredentials;
+  Tier A ledger). NEXT WAKE: launch ANALYZE or FIX muscle for #0 (deep ledger; pass diagnoseModel:'opus' if diagnosing).
+  *** ===== #15 DONE — COMMITTED 117c41e5f5 + PUSHED (prod-readiness-engine, HTTPS) wake221. =====
+  GAUNTLET w4ou064y2 PASSED clean (pass=true, refuteCount=0; all 3 refuters source-verified byte-exact: getBabbage
+  SpendingDatum precedence, CIP-0069 None-handling, datum-hash verbatim-vs-canonical separation, serialiseData stays
+  canonical, no non-Spending regression, memo's silent-pass-where-Haskell-fails GONE). CI gate green (fmt + clippy
+  -D warnings + uplc nextest 435). Committed 2 files / 1 crate (dugite-uplc) via gh/HTTPS. #15 closes the phase-2
+  serialiseData arc: the 306 ep293 'Error term' (V3 SpendingScriptInfo datum was None) -> 0, byte-exact + Haskell-
+  correct (canonical, no memo). *** THE #15 ARC IS THE GAUNTLET'S BEST CASE: a verbatim-memo 'fix' PASSED its replay
+  (306->0) but the haskell-semantics refuter caught it as conceptually wrong (serialiseData=canonical not verbatim;
+  memo = silent pass-where-Haskell-fails on non-canonical); analyze confirmed via PlutusCore source; the minimal
+  correct fix (V3 datum population, canonical) then passed cleanly. Replay-passing is necessary NOT sufficient. ***
+  was: #15 GAUNTLET-PENDING. *** wake219: REPLAY DECISIVE PASS — verify15min synced PAST window (tip 125125576), 0 'Error term' across the FULL
   ep293 window (125001020-125105013, was 306), 0 phase-1, 27751ab9 fixed. The canonical V3-datum fix is byte-exact +
   correct (no memo, no silent pass-where-Haskell-fails). SIGTERM'd verify15min; launched RE-GAUNTLET w4ou064y2 (run
   wf_0d183edd-b51) on the minimal fix — the prior memo R1 is RESOLVED (memo reverted; serialiseData canonical).
@@ -1488,6 +1500,12 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
+- wake221 2026-06-07: ***** #15 DONE — COMMITTED 117c41e5f5 + PUSHED *****. Re-gauntlet w4ou064y2 PASSED clean (0/3
+  refuted; all source-verified byte-exact vs getBabbageSpendingDatum/toPlutusV3Args). CI gate green (fmt+clippy+uplc
+  435). Committed 2 files/1 crate (dugite-uplc). #15 closes phase-2 serialiseData: 306 ep293 'Error term' -> 0 (V3
+  SpendingScriptInfo datum was None; fixed canonical, NO memo). Arc lesson: the gauntlet caught a replay-passing memo
+  fix as conceptually wrong; minimal canonical fix passed clean. NOW ACTIVE: #0 (mainnet ep246 reserves, parked->
+  active) -> next wake launch ledger muscle.
 - wake220 2026-06-07: POLL #15 RE-GAUNTLET w4ou064y2 (minimal canonical V3-datum fix) — still RUNNING (0/3 votes,
   active). No transition. Disk 166G, no nodes. #15 stays GAUNTLET-PENDING (replay already PASSED 306->0 full window).
   NEXT WAKE: on PASS -> commit #15 (dugite-uplc, 1 crate).
