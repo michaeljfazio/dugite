@@ -114,6 +114,20 @@
    resolvers ONLY. PREREQ before changing code: oracle-confirm the V1/V2-vs-V3 txInfoWdrl ordering (cardano-haskell-oracle,
    Alonzo/Babbage vs Conway TxInfo.hs). The current uncommitted patch keeps the V1/V2 bug — fix files stay in-tree for rework.
    state:FIXING attempts:2 conf:0.80.
+   *** FIXING REWORK DONE wake352 (rework Workflow w9jx0lhjm hosted in-turn, 92K tokens). SOURCE-CONFIRMED (the hard gate, agent
+   quoted canonical source): V1 Alonzo.Plutus.TxInfo transWithdrawals folds into a FRESH Plutus Map keyed by PV1.StakingCredential
+   then Map.toList → Plutus Credential Ord (makeIsDataSchemaIndexed PubKeyCredential=0 < ScriptCredential=1 ⇒ KEY<SCRIPT); V2
+   Babbage PV2.txInfoWdrl = unsafeFromList of the same Plutus-ordered list; V3 Conway transTxBodyWithdrawals = transMap over the
+   LEDGER Map RewardAccount (Credential ScriptHashObj<KeyHashObj ⇒ SCRIPT<KEY), unsafeFromList no re-sort; Reward redeemer index
+   = ledger Set.elemAt (Script<Key, version-independent). SURGICAL CHANGE (1 file, tx_info_populate.rs): withdrawals_to_plutus
+   (V1/V2) now parses each blob→stake cred and sorts by the DERIVED PrimCred Ord `a.0.cmp(&b.0)` (Key<Script = Plutus); ledger_
+   ordered_withdrawals (cmp_ledger, Script<Key) UNCHANGED, still feeds populate_v3.rs (V3) + redeemer_resolve.rs (Reward index).
+   Flipped the now-wrong V1/V2 script-first test; added contrast tests (V1/V2 key-first vs V3 script-first; reward index over
+   ledger script-first). *** INDEPENDENTLY RE-VERIFIED (#438): diff sorts by derived Ord not cmp_ledger; fmt=0 clippy=0
+   nextest 732/732 PASS incl. the 3 contrast tests. Patch backup refreshed (candidate-fix-26-27-credord.patch, 764 lines).
+   state:GAUNTLET attempts:2 conf:0.85. *** NEXT WAKE — RE-RUN the gauntlet (gauntlet-credord.workflow.js, all 3 lenses) on the
+   CORRECTED code; if it passes (the Haskell-Ord lens should now pass: V1/V2 Key<Script + V3 Script<Key + index ledger), COMMIT
+   #26+#27 (local, 2 crates = 1 commit). NO origin push. Fix stays uncommitted until the gauntlet passes.
 27. [H][phase2][NEW] WITHDRAWALS (Rewarding) ordering inversion (manifestation B of the key<script vs script<key theme; DISTINCT
    fix site from #26). tx.body.withdrawals keyed by raw 29-byte reward-account blob [header||hash28] in BTreeMap<Vec<u8>,_>
    (transaction.rs:805) → sorts by raw bytes where key-stake header 0xE_ < script-stake 0xF_ → Key-before-Script, OPPOSITE to
@@ -421,7 +435,17 @@
    reconstruction + #7 sub-tx forward). state:DONE attempts:0
 
 ## In-progress
-- item: #26+#27 GAUNTLET REFUTED → FIXING (attempts:2). V1/V2 txInfoWdrl must be Plutus Key<Script, not ledger Script<Key (the fix broke V1/V2). Surgical correction next.
+- item: #26+#27 FIXING-REWORK DONE (V1/V2→Plutus Key<Script; V3+index stay ledger Script<Key) → state:GAUNTLET. NEXT: re-run the gauntlet; commit on pass.
+  *** wake352 (ultracode): DRIVE the surgical FIXING rework (rework Workflow w9jx0lhjm, hosted in-turn). The agent SOURCE-
+  CONFIRMED (hard gate, quoted canonical cardano-ledger + plutus) that V1/V2 txInfoWdrl = Plutus Key<Script (Alonzo
+  transWithdrawals → fresh Plutus Map → Map.toList by PubKeyCredential<ScriptCredential) and V3 = ledger Script<Key (Conway
+  transMap preserves ledger Map order); Reward redeemer index = ledger order (version-independent). SURGICAL: withdrawals_to_plutus
+  (V1/V2) now sorts by the DERIVED PrimCred Ord (Key<Script); ledger_ordered_withdrawals (Script<Key) UNCHANGED for V3 +
+  redeemer index. 1 file (tx_info_populate.rs) + flipped the now-wrong test + 2 contrast tests. *** I INDEPENDENTLY RE-VERIFIED
+  (#438): the diff sorts by `a.0.cmp(&b.0)` (derived Ord) not cmp_ledger; fmt=0, clippy=0, nextest 732/732 PASS incl. the 3
+  contrast tests. Patch backup refreshed (764 lines). This resolves the wake348 gauntlet refutation precisely. *** NEXT WAKE —
+  re-run the refutation gauntlet (gauntlet-credord.workflow.js) on the CORRECTED code; on pass → COMMIT #26+#27 (local, 2 crates
+  = 1 commit, the Voter/V3/votes/redeemer-index + the corrected V1/V2 wdrl). NO origin push (curated-origin model). Lock to release.
   *** wake348 (ultracode): ran the Tier-A' refutation gauntlet (wuweobtlm, 3 lenses, hosted in-turn). Vote 1/3 refute = nominal
   "pass" BUT the single refutation is DECISIVE + Haskell-source-backed → REJECT (#25/#438: don't trust the vote count). FINDING:
   the fix WRONGLY applies ledger Script<Key to the V1/V2 txInfoWdrl FIELD. Canonical Haskell builds V1/V2 txInfoWdrl in PLUTUS
@@ -3146,6 +3170,7 @@
 - 2026-06-08T18:30Z wake346 ~ #26+#27 ROOT-CAUSED→FIXING: fix Workflow wemg0lky9 hosted in-turn (127K tokens/1 agent/11min) → per-consumer cmp_ledger Script<Key at phase-2 sites, 6 files/2 crates, INDEPENDENTLY re-verified fmt+clippy+nextest 730/730; patch uncommitted (byte-exact VERIFY gate next); ignored agent's wrong 'latent' caveat
 - 2026-06-08T18:55Z wake347 ~ #26+#27 FIXING→VERIFYING: scanned 769 dumps (0 have withdrawals/votes → corpus can't verify; fix is provable no-op over it). Gate=Haskell-Ord match+proptests+provable-no-op (no on-chain tie-break reference attainable). Next: bounded Koios hunt then commit-by-construction
 - 2026-06-08T19:20Z wake348 ~ #26/#27 GAUNTLET wuweobtlm (3 lenses, in-turn): 1/3 refute but DECISIVE — fix wrongly forces ledger Script<Key on V1/V2 txInfoWdrl (Haskell=Plutus Key<Script; V3+redeemer-indices+votes correct). REJECT; recorded REFUTED; →FIXING attempts:2 (surgical V1/V2 revert next). NO commit
+- 2026-06-08T19:45Z wake352 ~ #26/#27 surgical rework (w9jx0lhjm, in-turn): source-confirmed V1/V2=Plutus Key<Script vs V3=ledger Script<Key; withdrawals_to_plutus→derived Ord, ledger_ordered_withdrawals unchanged for V3+index; INDEPENDENTLY re-verified fmt+clippy+nextest 732/732. →GAUNTLET (re-run next). NO commit
 
 ## Last node state
 - sampled: 2026-06-07T12:35Z (wake314)  no dugite-node running (pgrep dugite-node = empty) — #20c is a code/test-only
@@ -4763,3 +4788,9 @@
   Script<Key; dugite's PRE-FIX blob order already matched V1/V2. V3 + redeemer-indices + votes are correct. REJECT (don't trust
   the vote count, #25/#438). Recorded REFUTED in the Gauntlet ledger; #26/#27 → FIXING attempts:2. NEXT: surgical correction
   (oracle-confirm V1/V2 order, revert withdrawals_to_plutus to Key<Script, keep Script<Key for V3+indices, re-gauntlet). NO commit.
+- wake349-351 2026-06-08 (busy stops): cron fires STOPPED on `busy` while wake352 hosted the #26/#27 rework in-turn. Correct.
+- wake352 2026-06-08: surgical FIXING rework of #26/#27 (rework Workflow w9jx0lhjm, in-turn). Source-confirmed V1/V2 txInfoWdrl =
+  Plutus Key<Script (Alonzo transWithdrawals → fresh Plutus Map → Map.toList) vs V3 = ledger Script<Key (Conway transMap). Made
+  withdrawals_to_plutus (V1/V2) sort by the derived PrimCred Ord (Key<Script); kept ledger_ordered_withdrawals (Script<Key) for
+  V3 + the Reward redeemer index. 1 file + flipped the wrong test + 2 contrast tests. INDEPENDENTLY re-verified: diff correct,
+  fmt+clippy+nextest 732/732 green. Resolves the wake348 gauntlet refutation. NEXT: re-run the gauntlet; commit on pass. NO commit.
