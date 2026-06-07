@@ -209,7 +209,21 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:DIAGNOSING (localization round 2; apply_utxo_changes RULED OUT).
+- item: #0 (mainnet ep246 reserves) state:DIAGNOSING (round-3 data-comparison; 2 code rounds RULED OUT).
+  *** wake231: ROUND-2 muscle wr9tddl4q RESULT = rebuild/genesis-load/pointer ALSO correct (2 invariant tests PASS:
+  rebuild_stake_distribution == incremental per-cred across base/script/pointer/Byron + aliasing hashes; genesis-load-
+  then-spend == rebuild). Static: state::stake_routing == common::stake_routing == Credential::to_typed_hash32; rebuild
+  gated OFF during from-genesis replay. NO fix (discipline held; 2 tests kept on main as coverage). *** KEY: both code
+  rounds prove dugite is INTERNALLY consistent (incremental==rebuild, add/spend symmetric) — which CANNOT catch a
+  dugite-vs-HASKELL credential-attribution difference that's internally consistent but per-cred wrong vs chain. Code-
+  internal invariants are exhausted; need a dugite-vs-Koios DATA comparison. DROVE: launched ROUND-3 DIAGNOSE muscle
+  wbqhzeczq (run wf_aae4b738-242, opus via diagnoseModel:'opus') comparing dugite top-30-50 per-cred active stake
+  (epoch-dumps-engine/mainnet-droptrace/epoch_000245.json) to Koios per-account active stake @ep245 (+ reward-side
+  cross-check vs account_reward_history @ep246) to find the credential(s) where dugite stake != Koios and infer the
+  class. NEXT WAKE: on found credential -> trace its address/stake class -> the dugite-vs-Haskell extraction/value bug
+  -> FIX; if top-50 all match (error spread thin) -> need a FULL per-cred dump (re-dump w/ higher top-N) or instrumented
+  replay. HARNESS REALITY: no db-mainnet (from-genesis mainnet replay infeasible quickly); rely on existing dumps +
+  Koios for localization.
   *** wake227: ROUND-1 muscle wxbflru4x RESULT = apply_utxo_changes is SYMMETRIC/CORRECT (5 create-then-spend net-zero
   invariant tests PASS: base-key/script-payment/script-stake/multi-asset/collateral — add Phase-5/sub Phase-2/
   collateral all route via identical stake_routing+credential_to_hash). Followed discipline: NO speculative fix; kept
@@ -1538,6 +1552,11 @@
 - wake196 2026-06-07: POLL #10 FINAL fix muscle wiujlmyn2 — still RUNNING (build/test, last activity 2min, not
   wedged). No transition. Disk 168G, no nodes. #10 stays FIXING. NEXT WAKE: poll/process -> build -> re-import ->
   6th re-gauntlet -> COMMIT.
+- wake231 2026-06-07: #0 ROUND-2 wr9tddl4q: rebuild/genesis-load/pointer ALSO correct (2 invariant tests PASS, no
+  fix; kept on main). Both code rounds prove dugite INTERNALLY consistent -> can't catch a dugite-vs-Haskell per-cred
+  attribution difference. Launched ROUND-3 DIAGNOSE wbqhzeczq (opus, data-comparison: dugite ep245 per-cred stake dump
+  vs Koios) to find the credential where dugite!=Koios. NEXT WAKE: found cred -> trace class -> fix; else full-dump/
+  replay. No db-mainnet so from-genesis mainnet replay infeasible; using dumps+Koios.
 - wake230 2026-06-07: LOCK-RECOVERY (wake229 final commit/release malformed -> stale lock age315s + wake229 edit
   uncommitted; HEAD=wake228, no concurrent wake -> released+reacquired). POLL #0 ROUND-2 wr9tddl4q — still RUNNING
   (cargo pid 68010, last activity now; ~8min, rebuild==incremental invariant + full nextest). No transition. Disk
