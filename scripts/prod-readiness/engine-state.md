@@ -218,7 +218,26 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #6 (fork-robustness apply_utxo_diff) state:ROOT-CAUSED attempts:0 — analyze DONE (conf 0.95). NEXT WAKE: FIXING.
+- item: #6 (fork-robustness apply_utxo_diff) state:FIXING attempts:0 — patch applied + compiles (UNCOMMITTED). NEXT WAKE: VERIFYING.
+  *** wake316 (ultracode): #6 ROOT-CAUSED→FIXING (one step). Applied the VALIDATED candidate-latent-fix-apply_utxo_diff.patch
+  (mechanical — analyze w2x5j3223 already did the analytical fix-validation; like #20c, applying a fully-validated patch is
+  not analytical work). The patch (1) rewrites ledger_seq.rs:918 apply_utxo_diff to mirror the forward path: inserts ADD
+  (stake_map[cred]+=coin / ptr_stake[ptr]+=coin via the SHARED stake_routing+StakeRouting), deletes SUB (saturating_sub on
+  both), reusing the byte-identical routing so keys match the forward path by construction; (2) promotes
+  state/mod.rs::stake_routing + StakeRouting to pub(crate); (3) ADDS a deterministic regression test in ledger_seq.rs
+  `apply_utxo_diff_replays_credential_stake_not_just_utxo_set` (creates a 5-ADA base-cred output via record_insert →
+  apply_delta_to_state → asserts stake_map[cred]==5_000_000; then record_delete the same output → asserts stake_map[cred]==0
+  + UTxO removed). Files: ledger_seq.rs + state/mod.rs (1 crate dugite-ledger; common.rs's M is the SEPARATE pre-existing
+  #730 change, untouched by this patch). `git apply` clean; `cargo test --no-run -p dugite-ledger` compiled all test
+  executables (fix + regression test build OK). Fix left UNCOMMITTED (commit only after the gauntlet passes).
+  *** NEXT WAKE (VERIFYING): (1) RIGOR — confirm the regression test FAILS on main (pre-patch): git stash the 2 fix files,
+  run `cargo nextest -p dugite-ledger -E 'test(apply_utxo_diff_replays_credential_stake)'` → must FAIL (proves it catches
+  the bug), then unstash; (2) run the test patched → must PASS; (3) full `cargo nextest run -p dugite-ledger` (expect
+  green, no regression) + `cargo clippy --all-targets -- -D warnings` + `cargo fmt --all -- --check`. Since #6 is a CODE
+  INVARIANT (forward path is the byte-exact reference, no Koios), the fail-pre/pass-post regression test IS the gauntlet
+  → on green, focused commit of ledger_seq.rs + state/mod.rs (stage explicit filenames; do NOT sweep common.rs) + push.
+  OPTIONAL later enhancement: the stronger cross-path proptest (apply_utxo_diff ≡ apply_utxo_changes over a random
+  insert/spend sequence incl. pointer + multi-asset-only + enterprise + Conway ptr_stake_excluded) — not required to land #6.
   *** wake315-cont (ultracode): muscle analyze w2x5j3223 COMPLETED → #6 ANALYZING→ROOT-CAUSED. *** LOCATION CORRECTION
   (the standing prompt + prior records were WRONG): the buggy code is NOT in common.rs — it is
   crates/dugite-ledger/src/ledger_seq.rs:918 `fn apply_utxo_diff`. common.rs:161 `apply_utxo_changes` is the FORWARD
