@@ -263,13 +263,38 @@
    8e41d0ae2a): fix landed (apply_utxo_diff replays instant-stake ADD/SUB via shared stake_routing); fail-pre CONFIRMED
    (regression test FAILS pre-patch left=None vs Some(5000000)) + pass-post GREEN (nextest 1522/1522 + clippy + fmt). The
    code-invariant gauntlet PASSED. state:DONE attempts:0
-7. [M][ledger] LATENT Dijkstra SUBUTXO bug: apply_sub_transactions mutated utxo_set but NOT stake_map/
-   ptr_stake (asymmetry). Valid fix + add_instant_stake/delete_instant_stake helper refactor preserved in
-   scripts/prod-readiness/candidate-latent-fix-dijkstra-subutxo.patch + worktree wf_dcc190ba-a5c-1. Inert
-   for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
+7. [M][ledger][ROOT-CAUSED wake331] LATENT Dijkstra SUBUTXO forward-path stake asymmetry: dijkstra.rs:399
+   apply_sub_transactions(tx, utxo: &mut UtxoSubState) mutates utxo_set in-place but NOT stake_map/ptr_stake (no certs/
+   epochs access); caller @222 merges its diff into the returned UtxoDiff. So the FORWARD path misses sub-tx instant-stake
+   updates — the MIRROR of #6 (which fixed the RECONSTRUCTION path apply_utxo_diff). FIX (next wake, hand-impl mirroring
+   #6/apply_utxo_changes — the normal-diff candidate-latent-fix-dijkstra-subutxo.patch is NOT git-applyable): thread
+   certs/epochs into apply_sub_transactions, replay instant-stake (SUB on spend, ADD on insert via shared stake_routing),
+   update caller @222. VERIFY = forward-vs-diff equivalence test (#6 invariant) + nextest -p dugite-ledger; 1 crate, code-
+   invariant, NO replay (Dijkstra undeployed — inert/masked). state:ROOT-CAUSED attempts:0
 
 ## In-progress
-- item: #20 FULLY DONE (a+b+c; #20b committed+pushed d8e616d553). NEXT WAKE: SCHEDULE #24-pin / #7 / #16.
+- item: #7 (Dijkstra SUBUTXO forward-path stake asymmetry) state:ROOT-CAUSED attempts:0 — direct analysis. NEXT WAKE: FIXING.
+  *** wake331 (ultracode): SCHEDULE #7 over #24-pin/#16. RATIONALE: #24-pin is muscle-resistant (the 44-min wogj8wp6h
+  couldn\'t pin the exact line, conf 0.83) + the cheap offline-dump paths are EXHAUSTED (reduced dumps miss ref-input UTxOs
+  → measurement is a floor; pinning needs CEK-step instrumentation [the death-trap] OR a heavy full-UTxO-context replay /
+  tedious Koios→CBOR re-encoding) → DEFERRED (record below). #16 is L (no current divergence). #7 is M, concrete, byte-
+  exact-testable via the proven #6 forward-vs-diff pattern, closes a known latent bug. *** #7 ROOT CAUSE (direct code
+  analysis, the established #6/#23 instant-stake-symmetry class — no new muscle): dijkstra.rs:399 apply_sub_transactions(tx,
+  utxo: &mut UtxoSubState) mutates utxo.utxo_set in-place (remove spent @437, insert new @449) + records a UtxoDiff, but
+  does NOT update stake_map (in certs) / ptr_stake (in epochs) — it has no certs/epochs access. Caller @222-223:
+  `let sub_diff = apply_sub_transactions(tx, utxo); diff.merge(&sub_diff);` merges into the returned diff. So the FORWARD
+  path misses the sub-tx instant-stake updates (the RECONSTRUCTION path apply_utxo_diff now replays them via #6) → #7 is the
+  FORWARD-PATH MIRROR of #6 for Dijkstra sub-transactions. *** FIX PLAN (next wake, hand-impl mirroring #6/apply_utxo_changes
+  — NOT the normal-diff candidate patch which isn\'t git-applyable): (1) change apply_sub_transactions signature to also take
+  `certs: &mut CertSubState, epochs: &mut EpochSubState`; (2) on each spend (remove) SUB the spent output\'s stake
+  (stake_routing → stake_map saturating_sub / ptr_stake), on each insert ADD (stake_map += / ptr_stake +=), mirroring
+  apply_utxo_changes Phase 2/5 + the #6 apply_utxo_diff impl (reuse the shared pub(crate) stake_routing/StakeRouting from
+  state/mod.rs); (3) update the caller @222 to pass certs/epochs (apply_valid_tx already has them in scope — verify).
+  VERIFY = forward-vs-diff equivalence test (apply_sub_transactions\' stake updates == apply_utxo_diff of the merged sub_diff,
+  the #6 invariant) + nextest -p dugite-ledger; 1 crate, code-invariant, NO replay (Dijkstra undeployed — inert, masked).
+  *** #24-pin DEFERRED: needs CEK-step instrumentation or a full-UTxO-context capture (heavy); offline-dump approach
+  exhausted. The over-cost (+4230 mem/+1531582 cpu fixed per inline-datum-spend script) is real but masked by trust-on-
+  consensus (no wedge). Revisit if a trustless-validator / block-producer use case is prioritized. Lock to release.
   *** wake330-cont (ultracode): #20b FIXING→VERIFYING→DONE → #20 COMPLETE. Gauntlet b6ll2gq8c: nextest -p
   dugite-serialization 1152/1152 (was 1150, +2 #20b tests: definite_map_truncated_below_declared_count_hard_errors [fail-
   pre/pass-post], definite_map_exact_count_completes_clean; the EXISTING test_tvar_definite_map_completes_clean_at_count +
@@ -4245,3 +4270,7 @@
 - wake330(+cont) 2026-06-08: SCHEDULE+DRIVE #20b (definite-map exact-count) hand-fix (cborg decodeMapLen, byte-exact) →
   FIXING→VERIFYING→DONE (nextest 1152/1152, existing tvar tests unchanged). Committed+pushed d8e616d553. *** #20
   SNAPSHOT-IMPORT ADVERSARIAL-HARDENING COMPLETE (a varlen + b definite-map + c backend). Next: SCHEDULE #24-pin or #7.
+- wake331 2026-06-08: SCHEDULE #7 (#24-pin deferred — muscle-resistant + offline-dump paths exhausted; #16 is L). DRIVE
+  NEW→ROOT-CAUSED via direct analysis (the established #6 sibling): apply_sub_transactions (dijkstra.rs:399) misses
+  forward-path stake_map/ptr_stake updates for Dijkstra sub-txs — the mirror of #6's reconstruction-path fix. Fix plan +
+  forward-vs-diff verification recorded. NEXT WAKE: FIXING (thread certs/epochs + instant-stake replay; 1 crate, no replay).
