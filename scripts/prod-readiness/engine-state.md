@@ -209,7 +209,21 @@
    for ep57 (Dijkstra is post-Conway). Land separately after its own verification. state:NEW attempts:0
 
 ## In-progress
-- item: #0 (mainnet ep246 reserves) state:FIXING (uniform ~5ppm; deltaR1/eta — last untested GLOBAL term).
+- item: #0 (mainnet ep246 reserves) state:DIAGNOSING (per-pool decomp + applyRUpd; ANALYTICAL CONTRADICTION to resolve).
+  *** wake240: deltaR1/eta muscle w8q78zs1x VERIFIED byte-exact (no fix): expectedBlocks=floor((1-0)*(1/20)*86400)=
+  4320 INTEGRAL (flooring moot), eta=3920/4320 exact, deltaR1=35,803,096,246,665 both ways identical; R=28,642,947,
+  346,604. My eta-flooring hypothesis dead. *** ANALYTICAL CONTRADICTION (8 rounds): EVERY reward-formula INPUT now
+  byte-exact (stake, ssFee, deltaR1/R, a0=3/10, k=500, totalActiveStake=21,956,097,174,685,676, totalBlocks=3920,
+  exact-Rational formula) -> member rewards SHOULD be byte-exact, YET reserves diverge +82.27M. So EITHER a per-pool
+  intermediate is subtly off OR dim-2's -5.027ppm-per-member is a MEASUREMENT ARTIFACT (like dim-1's snapshot-lag) and
+  the +82M is in applyRUpd (APPLICATION: undistributed/deltaR2 to reserves + frTotalUnregistered to treasury + creds
+  DEREGISTERED between createRUpd[ep245] and applyRUpd[ep246]). Note: the 3 prior #0 attempts + the #438 trap touched
+  the undistributed/frTotalUnregistered partition. DROVE: copied deltaR1 regression test to main; launched per-pool-
+  decomp+applyRUpd DIAGNOSE wz6pe606w (run wf_c02e61b8-9c2, opus): dim-A decompose 3 pools' poolR/maxP/appPerf/member-
+  rewards vs Koios pool_history @ep244 (which intermediate is -5ppm, OR byte-exact=artifact); dim-B check if the +82M
+  localizes to applyRUpd deltaR2/undistributed/unregistered partition. NEXT WAKE: read verdict -> the DEFINITIVE
+  localization (per-pool compute intermediate OR applyRUpd partition) -> targeted FIX. 8 rounds eliminated everything
+  global+stake; this resolves compute-vs-apply.
   *** wake238b: PRECISION muscle w5xpn4ju0 FALSIFIED the f64 hypothesis (no fix): production reward path in
   compute_reward_update is ALREADY exact-Rational (Rat/BigInt, single final floor); all 8 f64 refs are #[cfg(test)]-
   only; a byte-equal precision test proved no f64 loss. ELIMINATED (7 rounds): apply_utxo_changes, rebuild/load/
@@ -1600,6 +1614,11 @@
 - wake235 2026-06-07: POLL #0 VERIFY-THEN-FIX muscle w0oegi6uf — still RUNNING (cargo pid 10828, build/test; 33
   epoch_fees/ss_fee refs in rewards.rs = working the fee area; last activity ~2min). No transition. Disk 157G. #0
   stays FIXING. NEXT WAKE: poll/process result.
+- wake240 2026-06-07: #0 deltaR1/eta VERIFIED byte-exact (expectedBlocks=4320 integral; no fix). ANALYTICAL
+  CONTRADICTION: 8 rounds prove every reward-formula input byte-exact yet reserves +82.27M -> either a per-pool
+  intermediate is off OR the -5ppm is an artifact + the +82M is in applyRUpd (undistributed/unregistered partition).
+  Copied deltaR1 test to main; launched per-pool-decomp+applyRUpd DIAGNOSE wz6pe606w (dugite poolR/appPerf vs Koios
+  pool_history + applyRUpd partition). NEXT WAKE: definitive verdict -> targeted fix.
 - wake239 2026-06-07: POLL #0 deltaR1/eta VERIFY-THEN-FIX muscle w8q78zs1x — still RUNNING, ACTIVE (worktree present,
   working eta/expected_blocks in rewards.rs, last activity 2s). No transition. Disk 166G, no nodes. #0 stays FIXING.
   NEXT WAKE: poll/process — deltaR1/eta confirmed+fixed OR 'byte-exact, 5ppm in maxPool/appPerf' report.
