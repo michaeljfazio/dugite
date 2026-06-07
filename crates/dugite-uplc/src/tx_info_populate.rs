@@ -562,22 +562,92 @@ pub fn datums_to_plutus(
     Ok(out)
 }
 
+/// Order a tx's `withdrawals` map in **ledger** `Map RewardAccount Coin`
+/// order and project each entry to its stake [`PrimCred`] + amount.
+///
+/// The dugite `withdrawals` field is a `BTreeMap<Vec<u8>, Lovelace>` keyed by
+/// the 29-byte reward-account blob (`[header || hash28]`). `BTreeMap`
+/// iteration is in raw-blob lex order, whose header high-nibble puts key
+/// accounts (`0xE_`) before script accounts (`0xF_`) ⇒ **Key < Script** —
+/// the OPPOSITE of the ledger `RewardAccount` Ord
+/// (`(Network, Credential Script<Key, hash)`). Every Plutus `txInfoWdrl`
+/// map and the `Rewarding` `redeemerPointerInverse` index space follow the
+/// ledger order, so we re-sort here by the stake credential's
+/// [`PrimCred::cmp_ledger`] (Script < Key, then 28-byte hash). All reward
+/// accounts in a single tx share one network, so the `Network` component of
+/// the ledger `RewardAccount` Ord is constant and need not enter the key.
+pub fn ledger_ordered_withdrawals(
+    wdrl: &BTreeMap<Vec<u8>, dugite_primitives::value::Lovelace>,
+) -> Result<Vec<(PrimCred, dugite_primitives::value::Lovelace)>, PhaseTwoError> {
+    let mut out: Vec<(PrimCred, dugite_primitives::value::Lovelace)> =
+        Vec::with_capacity(wdrl.len());
+    for (reward_account, amount) in wdrl {
+        let addr = PrimAddress::from_bytes(reward_account).map_err(|e| {
+            PhaseTwoError::Internal(format!("ledger_ordered_withdrawals: reward_account: {e}"))
+        })?;
+        let stake = match addr {
+            PrimAddress::Reward(r) => r.stake,
+            other => {
+                return Err(PhaseTwoError::Internal(format!(
+                    "ledger_ordered_withdrawals: expected Reward address, got {other:?}"
+                )));
+            }
+        };
+        out.push((stake, *amount));
+    }
+    out.sort_by(|a, b| a.0.cmp_ledger(&b.0));
+    Ok(out)
+}
+
 /// Translate the V1/V2 `withdrawals` map into the
 /// `Vec<(StakingCredential, BigInt)>` shape Plutus TxInfo exposes.
-/// Iteration order matches the BTreeMap iteration order (lex by
-/// reward_account bytes), which is the canonical wire order.
+///
+/// Iteration order matches the **PLUTUS** `Credential` Ord (`Key < Script`,
+/// then 28-byte hash) — NOT the ledger `Map RewardAccount Coin` order
+/// (Script < Key). This is byte-exact with cardano-ledger's V1/V2 builder:
+/// `Cardano.Ledger.Alonzo.Plutus.TxInfo.transWithdrawals` folds the ledger
+/// withdrawals into a FRESH `Map StakingCredential Integer` keyed by the
+/// Plutus `StakingCredential`, then `transTxBodyWithdrawals` calls
+/// `Map.toList` on it — RE-sorting by the Plutus `Credential` derived Ord
+/// (`PubKeyCredential | ScriptCredential` ⇒ Key < Script). Babbage's
+/// `TxInfo.hs` sets BOTH `PV1.txInfoWdrl` and `PV2.txInfoWdrl` from
+/// `Alonzo.transTxBodyWithdrawals txBody` (V2 only wraps it with
+/// `unsafeFromList`, which does NOT re-sort the already-Plutus-ordered list).
+///
+/// dugite's *derived* [`PrimCred`] Ord (`VerificationKey(0) < Script(1)`,
+/// then hash) equals the Plutus `Credential` Ord exactly, so we sort each
+/// `(stake_credential, amount)` pair by `a.0.cmp(&b.0)` — NOT `cmp_ledger`.
+/// All reward accounts in a single tx share one network, so the network
+/// component of any address-level order is constant and need not enter the
+/// key. (Cf. [`ledger_ordered_withdrawals`], which is Script < Key and is
+/// the correct order for the V3 `txInfoWdrl` builder and the `Rewarding`
+/// `redeemerPointerInverse` index space.)
 pub fn withdrawals_to_plutus(
     wdrl: &BTreeMap<Vec<u8>, dugite_primitives::value::Lovelace>,
 ) -> Result<Vec<(StakingCredential, BigInt)>, PhaseTwoError> {
-    let mut out = Vec::with_capacity(wdrl.len());
+    let mut pairs: Vec<(PrimCred, dugite_primitives::value::Lovelace)> =
+        Vec::with_capacity(wdrl.len());
     for (reward_account, amount) in wdrl {
-        // Reuse withdrawal_to_plutus by reconstructing a Withdrawal here so we
-        // share the exact reward-address parsing/validation path.
-        let w = PrimWithdrawal {
-            reward_account: reward_account.clone(),
-            amount: *amount,
+        let addr = PrimAddress::from_bytes(reward_account).map_err(|e| {
+            PhaseTwoError::Internal(format!("withdrawals_to_plutus: reward_account: {e}"))
+        })?;
+        let stake = match addr {
+            PrimAddress::Reward(r) => r.stake,
+            other => {
+                return Err(PhaseTwoError::Internal(format!(
+                    "withdrawals_to_plutus: expected Reward address, got {other:?}"
+                )));
+            }
         };
-        out.push(withdrawal_to_plutus(&w)?);
+        pairs.push((stake, *amount));
+    }
+    // Plutus `Credential` Ord (Key < Script, then 28-byte hash) — equals the
+    // DERIVED `PrimCred` Ord, NOT `cmp_ledger`.
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out = Vec::with_capacity(pairs.len());
+    for (stake, amount) in pairs {
+        let cred = credential_to_plutus(&stake);
+        out.push((StakingCredential::Hash(cred), BigInt::from(amount.0)));
     }
     Ok(out)
 }
@@ -859,6 +929,148 @@ mod tests {
         };
         let err = withdrawal_to_plutus(&w).unwrap_err();
         assert!(matches!(err, PhaseTwoError::Internal(_)));
+    }
+
+    /// The LEDGER withdrawal helper [`ledger_ordered_withdrawals`] — which
+    /// feeds the V3 `txInfoWdrl` builder AND the `Rewarding` redeemer index
+    /// space — must list the SCRIPT-stake reward account BEFORE the KEY-stake
+    /// account, matching the ledger `Map RewardAccount Coin` Ord
+    /// (`(Network, Credential Script<Key, hash)`). The raw 29-byte
+    /// reward-account blob order does the OPPOSITE (header high-nibble
+    /// `0xE_`=key < `0xF_`=script ⇒ Key < Script), so this test pins that the
+    /// `BTreeMap`-blob order is re-sorted to ledger order. (The V1/V2
+    /// `withdrawals_to_plutus` builder does the REVERSE — Plutus Key < Script
+    /// — see `withdrawals_to_plutus_v1v2_puts_key_before_script_contrast_v3`.)
+    ///
+    /// The key account is given a LOWER 28-byte hash than the script account so
+    /// that BOTH the header nibble AND the hash bytes would place the key
+    /// account first under blob order — only the ledger Script<Key rule flips
+    /// it. This exercises the genuine inversion, not just a hash tie-break.
+    #[test]
+    fn ledger_ordered_withdrawals_puts_script_before_key() {
+        let same_net = true;
+        let key_blob = encode_reward_addr_blob(same_net, false, [0x01u8; 28]);
+        let script_blob = encode_reward_addr_blob(same_net, true, [0x02u8; 28]);
+
+        let mut wdrl: BTreeMap<Vec<u8>, Lovelace> = BTreeMap::new();
+        wdrl.insert(key_blob.clone(), Lovelace(10));
+        wdrl.insert(script_blob.clone(), Lovelace(20));
+
+        // Sanity: BTreeMap blob order is Key (0xE1..) BEFORE Script (0xF1..).
+        let blob_first = wdrl.keys().next().unwrap();
+        assert_eq!(blob_first, &key_blob, "blob order must be Key < Script");
+
+        // Ledger order flips it: Script credential first.
+        let ordered = ledger_ordered_withdrawals(&wdrl).unwrap();
+        assert!(
+            matches!(ordered[0].0, PrimCred::Script(h) if h.0 == [0x02u8; 28]),
+            "ledger order must put the SCRIPT account first, got {:?}",
+            ordered[0].0
+        );
+        assert!(
+            matches!(ordered[1].0, PrimCred::VerificationKey(h) if h.0 == [0x01u8; 28]),
+            "ledger order must put the KEY account second, got {:?}",
+            ordered[1].0
+        );
+        assert_eq!(ordered[0].1, Lovelace(20));
+        assert_eq!(ordered[1].1, Lovelace(10));
+    }
+
+    /// Contrast test: the SAME mixed key+script withdrawal set yields
+    /// **KEY-first** via [`withdrawals_to_plutus`] (the V1/V2 `txInfoWdrl`
+    /// builder — Plutus `Credential` Ord, Key < Script) but **SCRIPT-first**
+    /// via [`ledger_ordered_withdrawals`] (the V3 `txInfoWdrl` builder + the
+    /// `Rewarding` redeemer-pointer index — ledger `Credential` Ord,
+    /// Script < Key). These two orders are GENUINELY OPPOSITE.
+    ///
+    /// Source: V1/V2 `Alonzo.transWithdrawals` folds into a fresh
+    /// `Map StakingCredential Integer` and `Map.toList`s it (re-sorts by the
+    /// Plutus Credential Ord = Key < Script); Babbage reuses it for both V1
+    /// and V2. V3 `Conway.transTxBodyWithdrawals` preserves the ledger
+    /// `Map RewardAccount Coin` order (Script < Key) via `unsafeFromList`.
+    ///
+    /// The key account is given a LOWER 28-byte hash than the script account
+    /// so that the hash byte-order alone would place the key account first —
+    /// only the credential-TYPE rule decides the flip, exercising the genuine
+    /// inversion rather than a hash tie-break.
+    #[test]
+    fn withdrawals_to_plutus_v1v2_puts_key_before_script_contrast_v3() {
+        let same_net = true;
+        let key_blob = encode_reward_addr_blob(same_net, false, [0x01u8; 28]);
+        let script_blob = encode_reward_addr_blob(same_net, true, [0x02u8; 28]);
+
+        let mut wdrl: BTreeMap<Vec<u8>, Lovelace> = BTreeMap::new();
+        wdrl.insert(key_blob, Lovelace(10));
+        wdrl.insert(script_blob, Lovelace(20));
+
+        // V1/V2 builder: Plutus Credential Ord (Key < Script) ⇒ KEY first.
+        let pl = withdrawals_to_plutus(&wdrl).unwrap();
+        assert!(
+            matches!(
+                pl[0].0,
+                StakingCredential::Hash(PlCredential::PubKey(h)) if h == [0x01u8; 28]
+            ),
+            "V1/V2 txInfoWdrl[0] must be the KEY account (Plutus Key < Script), got {:?}",
+            pl[0].0
+        );
+        assert_eq!(pl[0].1, BigInt::from(10));
+        assert!(
+            matches!(
+                pl[1].0,
+                StakingCredential::Hash(PlCredential::Script(h)) if h == [0x02u8; 28]
+            ),
+            "V1/V2 txInfoWdrl[1] must be the SCRIPT account, got {:?}",
+            pl[1].0
+        );
+        assert_eq!(pl[1].1, BigInt::from(20));
+
+        // V3 builder / ledger order: Script < Key ⇒ SCRIPT first — OPPOSITE.
+        let ordered = ledger_ordered_withdrawals(&wdrl).unwrap();
+        assert!(
+            matches!(ordered[0].0, PrimCred::Script(h) if h.0 == [0x02u8; 28]),
+            "V3/ledger order must put the SCRIPT account first, got {:?}",
+            ordered[0].0
+        );
+        assert!(
+            matches!(ordered[1].0, PrimCred::VerificationKey(h) if h.0 == [0x01u8; 28]),
+            "V3/ledger order must put the KEY account second, got {:?}",
+            ordered[1].0
+        );
+
+        // And the two builders genuinely disagree on entry 0's credential type.
+        let v1v2_first_is_key = matches!(pl[0].0, StakingCredential::Hash(PlCredential::PubKey(_)));
+        let v3_first_is_script = matches!(ordered[0].0, PrimCred::Script(_));
+        assert!(
+            v1v2_first_is_key && v3_first_is_script,
+            "V1/V2 (Key-first) and V3 (Script-first) withdrawal orders must be opposite"
+        );
+    }
+
+    /// The `Rewarding` redeemer-pointer index resolves over the SCRIPT-first
+    /// LEDGER order (`ledger_ordered_withdrawals`), independent of Plutus
+    /// language version — matching `redeemerPointerInverse` / `Set.elemAt`.
+    /// For the mixed set above, ledger index 0 is the SCRIPT account.
+    #[test]
+    fn reward_redeemer_index_resolves_over_ledger_script_first_order() {
+        let same_net = true;
+        let key_blob = encode_reward_addr_blob(same_net, false, [0x01u8; 28]);
+        let script_blob = encode_reward_addr_blob(same_net, true, [0x02u8; 28]);
+
+        let mut wdrl: BTreeMap<Vec<u8>, Lovelace> = BTreeMap::new();
+        wdrl.insert(key_blob, Lovelace(10));
+        wdrl.insert(script_blob, Lovelace(20));
+
+        let ordered = ledger_ordered_withdrawals(&wdrl).unwrap();
+        // Reward redeemer ptr `idx` indexes this ledger-ordered list: idx 0 is
+        // the SCRIPT account, idx 1 the KEY account.
+        assert!(
+            matches!(ordered[0].0, PrimCred::Script(h) if h.0 == [0x02u8; 28]),
+            "Rewarding redeemer index 0 must resolve to the SCRIPT account"
+        );
+        assert!(
+            matches!(ordered[1].0, PrimCred::VerificationKey(h) if h.0 == [0x01u8; 28]),
+            "Rewarding redeemer index 1 must resolve to the KEY account"
+        );
     }
 
     // ────────────────────────────────────────────────────────────
