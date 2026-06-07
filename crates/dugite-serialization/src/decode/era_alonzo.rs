@@ -1637,6 +1637,35 @@ mod tests {
         assert_eq!(spans, vec![hex("182a"), hex("43aabbcc")]);
     }
 
+    /// Pre-Conway leniency guard (backlog #31-C over-strictness inverse).
+    ///
+    /// Alonzo/Babbage are protocol-version < 9, so their `set` fields must stay
+    /// LENIENT: `cardano-ledger-binary`'s `decodeSet` only enforces
+    /// no-duplicates at PV9+; pre-PV9 it silently dedups via `Set.fromList`.
+    /// `read_pool_params` here decodes `pool_owners` via the lenient
+    /// [`Reader::read_set`], which must accept a duplicate `addr_keyhash`
+    /// without error. This pins that leniency so the Conway-only switch to
+    /// `read_set_strict` cannot accidentally tighten pre-Conway decoders.
+    #[test]
+    fn alonzo_pool_owners_set_accepts_duplicate_lenient() {
+        // tag(258) [h28, h28] — the SAME 28-byte key twice.
+        let key = [0x11u8; 28];
+        let mut data = vec![0xd9, 0x01, 0x02]; // tag 258
+        data.extend(vec![0x82]); // array(2)
+        data.extend(cbor_bytes(&key));
+        data.extend(cbor_bytes(&key));
+
+        let mut r = Reader::new(&data);
+        // This is exactly the call Alonzo `read_pool_params` makes for
+        // `pool_owners`. It must NOT reject the duplicate at PV < 9.
+        let owners: Vec<Hash28> = r
+            .read_set(read_hash28_cert)
+            .expect("pre-Conway set must accept duplicate elements (lenient)");
+        // The lenient reader keeps both physical elements (no dedup, no fail).
+        assert_eq!(owners.len(), 2);
+        assert_eq!(owners[0], owners[1]);
+    }
+
     // -----------------------------------------------------------------------
     // CBOR encoding helpers
     // -----------------------------------------------------------------------
