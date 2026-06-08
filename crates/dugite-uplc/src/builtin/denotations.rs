@@ -928,6 +928,19 @@ pub fn denote(
             let indices_val = it.next().ok_or_else(|| builtin_arity_mismatch(id))?;
             let value = unwrap_bool(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
             let (_, idx_elems) = unwrap_proto_list(indices_val, id)?;
+            // CIP-122/CIP-123 `ensurable` gate: variants D/E cap the input
+            // bytestring at maximumInputLength = 4096 bytes (Bitwise.hs:82,
+            // Builtins.hs:2199). A/B/C (incl. V3 at plominPV) impose no cap.
+            // Fires on input length BEFORE the per-index checks, matching the
+            // Haskell guard order (over-length fails even with empty/in-range
+            // indices).
+            const WRITE_BITS_MAX_INPUT_LENGTH: usize = 4096;
+            if variant.bitwise_max_input_enforced() && bs.len() > WRITE_BITS_MAX_INPUT_LENGTH {
+                return Err(builtin_failure(
+                    id,
+                    "writeBits: input too long (maximum is 4096 bytes)",
+                ));
+            }
             let len_bits = bs.len().saturating_mul(8);
             let mut out = bs;
             for c in idx_elems {
@@ -2677,6 +2690,138 @@ mod tests {
             assert_eq!(lenient, strict, "lenient != strict for in-range byte {i}");
             assert_eq!(lenient, bs(&[i as u8, b'z']));
         }
+    }
+
+    // ── writeBits: maximumInputLength cap (backlog #33) ─────────────────────
+    //
+    // Plutus `writeBits` caps the INPUT bytestring at maximumInputLength = 4096
+    // bytes (Bitwise.hs:81-83). The guard `BS.length b > 4096 ->
+    // builtinResultFailure` (Builtins.hs:2191-2221) fires on the INPUT length
+    // BEFORE the per-index out-of-bounds checks, and is gated by `ensurable`
+    // (true for D/E only). A/B/C impose NO cap.
+
+    /// Build a `ProtoList Integer` of indices for the `writeBits` indices arg.
+    fn idx_list(indices: &[i64]) -> Value {
+        Value::Const(Constant::ProtoList {
+            elem_type: crate::term::TypeTag::Integer,
+            elements: indices
+                .iter()
+                .map(|&i| Constant::Integer(BigInt::from(i)))
+                .collect(),
+        })
+    }
+
+    #[test]
+    fn write_bits_over_length_rejected_under_de() {
+        // 4097-byte input, empty indices, value=true: variants D and E enforce
+        // the 4096-byte cap → BuiltinFailure.
+        let over = bs(&vec![0u8; 4097]);
+        for v in [SemanticsVariant::D, SemanticsVariant::E] {
+            assert!(
+                matches!(
+                    run_variant(
+                        BuiltinId::WriteBits,
+                        vec![over.clone(), idx_list(&[]), b(true)],
+                        v,
+                    ),
+                    Err(UplcError::BuiltinFailure { .. })
+                ),
+                "expected over-length writeBits to fail under {v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_bits_over_length_accepted_under_c() {
+        // Variant C (V3 < plominPV) imposes NO cap → over-length is fine.
+        let over = bs(&vec![0u8; 4097]);
+        assert!(matches!(
+            run_variant(
+                BuiltinId::WriteBits,
+                vec![over, idx_list(&[]), b(true)],
+                SemanticsVariant::C,
+            ),
+            Ok(Value::Const(Constant::ByteString(_)))
+        ));
+    }
+
+    #[test]
+    fn write_bits_boundary_4096() {
+        // The cap is `>` not `>=`: exactly 4096 bytes is accepted under E, 4097
+        // is rejected.
+        let at = bs(&vec![0u8; 4096]);
+        assert!(matches!(
+            run_variant(
+                BuiltinId::WriteBits,
+                vec![at, idx_list(&[]), b(true)],
+                SemanticsVariant::E,
+            ),
+            Ok(Value::Const(Constant::ByteString(_)))
+        ));
+        let over = bs(&vec![0u8; 4097]);
+        assert!(matches!(
+            run_variant(
+                BuiltinId::WriteBits,
+                vec![over, idx_list(&[]), b(true)],
+                SemanticsVariant::E,
+            ),
+            Err(UplcError::BuiltinFailure { .. })
+        ));
+    }
+
+    #[test]
+    fn write_bits_normal_identical_c_e() {
+        // A normal 32-byte input with a valid index produces byte-identical
+        // output under C (no cap) and E (cap, but input is well under it).
+        let input = bs(&[0u8; 32]);
+        let under_c = run_variant(
+            BuiltinId::WriteBits,
+            vec![input.clone(), idx_list(&[5]), b(true)],
+            SemanticsVariant::C,
+        )
+        .unwrap();
+        let under_e = run_variant(
+            BuiltinId::WriteBits,
+            vec![input, idx_list(&[5]), b(true)],
+            SemanticsVariant::E,
+        )
+        .unwrap();
+        assert_eq!(under_c, under_e);
+        // bit 5 set in the LAST byte (CIP-122 ordering): byte 31 = 0b0010_0000.
+        let mut expect = vec![0u8; 32];
+        expect[31] = 0b0010_0000;
+        assert_eq!(under_e, bs(&expect));
+    }
+
+    #[test]
+    fn write_bits_length_guard_precedes_index() {
+        // Over-length input with an IN-RANGE index under E still fails on the
+        // length cap (which precedes the per-index check) — NOT on the index.
+        let over = bs(&vec![0u8; 4097]);
+        // index 0 is in range (4097*8 bits available).
+        assert!(matches!(
+            run_variant(
+                BuiltinId::WriteBits,
+                vec![over, idx_list(&[0]), b(true)],
+                SemanticsVariant::E,
+            ),
+            Err(UplcError::BuiltinFailure { .. })
+        ));
+    }
+
+    #[test]
+    fn write_bits_empty_indices_over_length_under_e() {
+        // Empty indices + over-length input under E → the length guard fires
+        // even though there are no indices to check.
+        let over = bs(&vec![0u8; 4097]);
+        assert!(matches!(
+            run_variant(
+                BuiltinId::WriteBits,
+                vec![over, idx_list(&[]), b(true)],
+                SemanticsVariant::E,
+            ),
+            Err(UplcError::BuiltinFailure { .. })
+        ));
     }
 
     #[test]

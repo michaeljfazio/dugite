@@ -122,6 +122,13 @@ impl SemanticsVariant {
     pub fn cons_byte_string_strict(self) -> bool {
         matches!(self, SemanticsVariant::C | SemanticsVariant::E)
     }
+
+    /// Whether the bitwise builtins enforce the `maximumInputLength` (4096-byte
+    /// input) cap on `writeBits`. Mirrors Plutus `ensurable` (Builtins.hs): true
+    /// for D and E.
+    pub fn bitwise_max_input_enforced(self) -> bool {
+        matches!(self, SemanticsVariant::D | SemanticsVariant::E)
+    }
 }
 
 #[cfg(test)]
@@ -185,6 +192,17 @@ mod tests {
         assert!(!SemanticsVariant::D.cons_byte_string_strict());
         assert!(SemanticsVariant::C.cons_byte_string_strict());
         assert!(SemanticsVariant::E.cons_byte_string_strict());
+    }
+
+    #[test]
+    fn bitwise_max_input_enforced_only_for_d_and_e() {
+        // `writeBits` enforces the 4096-byte maximumInputLength cap only under
+        // variants D and E (Plutus `ensurable`). A/B/C impose no cap.
+        assert!(!SemanticsVariant::A.bitwise_max_input_enforced());
+        assert!(!SemanticsVariant::B.bitwise_max_input_enforced());
+        assert!(!SemanticsVariant::C.bitwise_max_input_enforced());
+        assert!(SemanticsVariant::D.bitwise_max_input_enforced());
+        assert!(SemanticsVariant::E.bitwise_max_input_enforced());
     }
 
     #[test]
