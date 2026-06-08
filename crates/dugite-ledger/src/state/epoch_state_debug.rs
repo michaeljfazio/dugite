@@ -624,17 +624,29 @@ fn synth_committee_hash(members: &[CcMember], num: u64, den: u64) -> String {
 
 /// Compute a UTxO summary from a `LedgerState`.
 ///
-/// `count` and `total_lovelace` delegate to `UtxoSet`.  `asset_count` is
-/// best-effort: it walks the live UTxO set summing distinct (policy,
-/// asset) pairs.  For an LSM-backed store this is O(N) and may be slow at
-/// mainnet scale; the dump runs at epoch boundaries (once per ~5 days
-/// mainnet) so the cost is amortised, but we still gate it behind a
-/// dedicated env var to make it skippable when only nonce/governance
-/// fields are needed.
+/// `count` is the O(1) maintained entry count.  `total_lovelace` and
+/// `asset_count` both require a full O(N) scan of the live UTxO set; for an
+/// LSM-backed store at mainnet scale (tens of millions of entries) these run
+/// inline on the apply thread at every epoch boundary and can stall the
+/// replay for seconds-to-minutes — long enough to masquerade as a wedge.
+///
+/// Two env gates make the scans skippable (`SKIP_UTXO` implies `SKIP_ASSETS`):
+///
+/// - `DUGITE_EPOCH_STATE_DUMP_SKIP_UTXO` skips BOTH scans (reporting only the
+///   O(1) `count`). Use during a full mainnet replay where the pot scalars
+///   (reserves/treasury/fees/deposits, all O(1)) are the cross-validation
+///   target and the UTxO total is not needed every boundary.
+/// - `DUGITE_EPOCH_STATE_DUMP_SKIP_ASSETS` skips only the per-asset scan,
+///   keeping the `total_lovelace` value-conservation figure.
 fn utxo_summary(state: &LedgerState) -> UtxoSummary {
     let count = state.utxo.utxo_set.len() as u64;
-    let total_lovelace = state.utxo.utxo_set.total_lovelace().0;
-    let skip_assets = env::var("DUGITE_EPOCH_STATE_DUMP_SKIP_ASSETS").is_ok();
+    let skip_utxo = env::var("DUGITE_EPOCH_STATE_DUMP_SKIP_UTXO").is_ok();
+    let skip_assets = skip_utxo || env::var("DUGITE_EPOCH_STATE_DUMP_SKIP_ASSETS").is_ok();
+    let total_lovelace = if skip_utxo {
+        0
+    } else {
+        state.utxo.utxo_set.total_lovelace().0
+    };
     let asset_count = if skip_assets {
         0
     } else {
