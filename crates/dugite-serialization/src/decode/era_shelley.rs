@@ -418,8 +418,10 @@ fn read_vrf_cert(r: &mut Reader<'_>) -> Result<(Vec<u8>, Vec<u8>), Serialization
 
 /// Decode a Shelley transaction body from a map.
 ///
-/// The Shelley tx body is a CBOR map with keys 0..7. Unknown keys are silently
-/// ignored (forward-compatibility behaviour matching Haskell).
+/// The Shelley tx body is a CBOR map with keys 0..7. Unknown/out-of-era keys
+/// are HARD-REJECTED, matching Haskell cardano-ledger's per-era SparseKeyed
+/// `bodyFields` catch-all (`invalidField n -> invalidKey -> cborError`). The
+/// reject is un-gated (no `ifDecoderVersionAtLeast`). See #31-E.
 fn decode_shelley_tx_body(r: &mut Reader<'_>) -> Result<TransactionBody, SerializationError> {
     let mut inputs: Vec<TransactionInput> = Vec::new();
     let mut outputs: Vec<TransactionOutput> = Vec::new();
@@ -495,8 +497,12 @@ fn decode_shelley_tx_body(r: &mut Reader<'_>) -> Result<TransactionBody, Seriali
                 auxiliary_data_hash = Some(read_hash32(r)?);
             }
             _ => {
-                // Unknown key — skip value (forward compatibility)
-                r.skip()?;
+                // Unknown/out-of-era tx-body key — HARD REJECT, per upstream
+                // Shelley SparseKeyed bodyFields catch-all (invalidField n ->
+                // cborError). Shelley knows ONLY keys 0..7. See #31-E.
+                return Err(SerializationError::CborDecode(format!(
+                    "Shelley tx body: unknown/invalid key {key}"
+                )));
             }
         }
     }
@@ -2244,13 +2250,57 @@ mod tests {
     }
 
     #[test]
-    fn shelley_body_unknown_key_skipped() {
-        // Unknown key 42 — must be skipped without error.
+    fn shelley_body_unknown_key_rejected() {
+        // Unknown key 42 — must be HARD-REJECTED. Haskell cardano-ledger's
+        // Shelley SparseKeyed bodyFields catch-all (invalidField n -> cborError)
+        // fails on any out-of-domain tx-body key. See #31-E.
         let mut extra = Vec::new();
         extra.extend(cbor_uint(42));
         extra.extend(cbor_uint(0));
+        let result = decode_shelley_block(&shelley_block_with_tx_body(&extra, 1));
+        assert!(
+            result.is_err(),
+            "unknown Shelley tx-body key must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn shelley_body_key_8_rejected() {
+        // Key 8 (validity_interval_start) is Allegra+ — Shelley must reject it.
+        let mut extra = Vec::new();
+        extra.extend(cbor_uint(8));
+        extra.extend(cbor_uint(0));
+        let result = decode_shelley_block(&shelley_block_with_tx_body(&extra, 1));
+        assert!(
+            result.is_err(),
+            "Shelley tx-body key 8 must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn shelley_body_key_9_rejected() {
+        // Key 9 (mint) is Mary+ — Shelley must reject it.
+        let mut extra = Vec::new();
+        extra.extend(cbor_uint(9));
+        extra.extend(cbor_uint(0));
+        let result = decode_shelley_block(&shelley_block_with_tx_body(&extra, 1));
+        assert!(
+            result.is_err(),
+            "Shelley tx-body key 9 must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn shelley_body_key_7_accepted() {
+        // Key 7 (auxiliary_data_hash) is the highest valid Shelley key.
+        let mut extra = Vec::new();
+        extra.extend(cbor_uint(7));
+        extra.extend(cbor_bytes(&[0x42; 32]));
         let block = decode_shelley_block(&shelley_block_with_tx_body(&extra, 1)).unwrap();
-        assert_eq!(block.transactions[0].body.fee.0, 1_000_000);
+        assert_eq!(
+            block.transactions[0].body.auxiliary_data_hash.unwrap(),
+            Hash32::from_bytes([0x42; 32])
+        );
     }
 
     // ── pool_params + pool_metadata + relays ────────────────────────────────
