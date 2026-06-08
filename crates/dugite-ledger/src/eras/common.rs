@@ -574,16 +574,31 @@ pub(crate) fn apply_shelley_cert(
                         MIRSource::Reserves => &mut certs.pending_mir_reserves,
                         MIRSource::Treasury => &mut certs.pending_mir_treasury,
                     };
+                    // Haskell `Cardano.Ledger.Shelley.Rules.Deleg.hs` `applyMIRCert`:
+                    //   pvMajor <= 4 (Shelley/Allegra/Mary): `Map.union credCoinMap' ir`
+                    //     — left-biased, so a later cert for the same credential OVERWRITES.
+                    //     This is "last-wins": process certs in order; the last one wins.
+                    //   pvMajor >  4 (Alonzo+): `Map.unionWith (<>) credCoinMap' ir`
+                    //     — additive: amounts for the same credential are summed.
+                    // Guard: `hardforkAlonzoAllowMIRTransfer pv = pvMajor pv > natVersion @4`
+                    let pv = epochs.protocol_params.protocol_version_major;
+                    let additive = pv > 4;
                     let mut total: i128 = 0;
                     for (cred, amount) in creds {
                         let key = credential_to_hash(cred);
-                        *pending.entry(key).or_insert(0i128) += *amount as i128;
+                        if additive {
+                            *pending.entry(key).or_insert(0i128) += *amount as i128;
+                        } else {
+                            // Last-wins: overwrite any previous entry for this credential.
+                            pending.insert(key, *amount as i128);
+                        }
                         total += *amount as i128;
                         debug!(
-                            "MIR: queuing {} lovelace from {:?} to {}",
+                            "MIR: queuing {} lovelace from {:?} to {} ({})",
                             amount,
                             source,
-                            key.to_hex()
+                            key.to_hex(),
+                            if additive { "additive" } else { "last-wins" }
                         );
                     }
                     debug!(
