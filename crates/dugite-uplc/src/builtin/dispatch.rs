@@ -11,6 +11,7 @@
 
 use crate::builtin::arity::arity_of;
 use crate::builtin::denotations::denote;
+use crate::builtin::semantics::SemanticsVariant;
 use crate::machine::cost::BudgetTracker;
 use crate::machine::value::Value;
 use crate::term::BuiltinId;
@@ -40,12 +41,17 @@ pub enum ForceOutcome {
 ///
 /// `trace_log` is threaded through to the denotation for the `Trace`
 /// builtin to append its string argument.
+///
+/// `variant` is the script's [`SemanticsVariant`], forwarded to the
+/// denotation for the builtins whose result depends on it (currently
+/// `consByteString`).
 pub fn force_builtin(
     id: BuiltinId,
     forces: u8,
     args: Vec<Value>,
     tracker: Option<&mut BudgetTracker>,
     trace_log: Option<&mut Vec<String>>,
+    variant: SemanticsVariant,
 ) -> Result<ForceOutcome, UplcError> {
     let (required_forces, required_arity) = arity_of(id);
     if forces < required_forces {
@@ -62,7 +68,7 @@ pub fn force_builtin(
                 let cost = t.builtin_costs.charge_for_args(id, &[]);
                 t.charge(cost)?;
             }
-            let result = denote(id, vec![], trace_log)?;
+            let result = denote(id, vec![], trace_log, variant)?;
             return Ok(ForceOutcome::Done(result));
         }
         Ok(ForceOutcome::Pending(v))
@@ -80,6 +86,10 @@ pub fn force_builtin(
 ///
 /// `trace_log` is threaded through to the denotation for the `Trace`
 /// builtin to append its string argument.
+///
+/// `variant` is the script's [`SemanticsVariant`], forwarded to the
+/// denotation for the builtins whose result depends on it (currently
+/// `consByteString`).
 pub fn apply_builtin(
     id: BuiltinId,
     forces: u8,
@@ -87,6 +97,7 @@ pub fn apply_builtin(
     arg: Value,
     tracker: Option<&mut BudgetTracker>,
     trace_log: Option<&mut Vec<String>>,
+    variant: SemanticsVariant,
 ) -> Result<Value, UplcError> {
     let (required_forces, required_arity) = arity_of(id);
     if forces < required_forces {
@@ -126,7 +137,7 @@ pub fn apply_builtin(
         let cost = t.builtin_costs.charge_for_args(id, &args);
         t.charge(cost)?;
     }
-    denote(id, args, trace_log)
+    denote(id, args, trace_log, variant)
 }
 
 /// Return a `'static str` identifier for the builtin (alias for the
@@ -149,7 +160,16 @@ mod tests {
     #[test]
     fn force_zero_force_builtin_returns_excess_on_first_force() {
         // AddInteger needs 0 forces. The first force is already excess.
-        match force_builtin(BuiltinId::AddInteger, 0, vec![], None, None).unwrap() {
+        match force_builtin(
+            BuiltinId::AddInteger,
+            0,
+            vec![],
+            None,
+            None,
+            SemanticsVariant::LATEST,
+        )
+        .unwrap()
+        {
             ForceOutcome::Excess => {}
             other => panic!("expected Excess, got {other:?}"),
         }
@@ -158,7 +178,16 @@ mod tests {
     #[test]
     fn force_one_force_builtin_becomes_pending_then_excess() {
         // IfThenElse needs 1 force.
-        let v1 = match force_builtin(BuiltinId::IfThenElse, 0, vec![], None, None).unwrap() {
+        let v1 = match force_builtin(
+            BuiltinId::IfThenElse,
+            0,
+            vec![],
+            None,
+            None,
+            SemanticsVariant::LATEST,
+        )
+        .unwrap()
+        {
             ForceOutcome::Pending(v) => v,
             other => panic!("expected Pending, got {other:?}"),
         };
@@ -170,7 +199,16 @@ mod tests {
             _ => panic!("expected Value::Builtin"),
         }
         // Forcing again is excess.
-        match force_builtin(BuiltinId::IfThenElse, 1, vec![], None, None).unwrap() {
+        match force_builtin(
+            BuiltinId::IfThenElse,
+            1,
+            vec![],
+            None,
+            None,
+            SemanticsVariant::LATEST,
+        )
+        .unwrap()
+        {
             ForceOutcome::Excess => {}
             other => panic!("expected Excess, got {other:?}"),
         }
@@ -180,15 +218,32 @@ mod tests {
     fn applying_before_forces_satisfied_errors() {
         // IfThenElse needs 1 force; applying an arg first is a
         // builtin-type error.
-        let err =
-            apply_builtin(BuiltinId::IfThenElse, 0, vec![], int_val(1), None, None).unwrap_err();
+        let err = apply_builtin(
+            BuiltinId::IfThenElse,
+            0,
+            vec![],
+            int_val(1),
+            None,
+            None,
+            SemanticsVariant::LATEST,
+        )
+        .unwrap_err();
         assert!(matches!(err, UplcError::BuiltinTypeError { .. }));
     }
 
     #[test]
     fn apply_under_arity_returns_partial() {
         // AddInteger arity (0, 2) — applying just one arg is still partial.
-        let v = apply_builtin(BuiltinId::AddInteger, 0, vec![], int_val(1), None, None).unwrap();
+        let v = apply_builtin(
+            BuiltinId::AddInteger,
+            0,
+            vec![],
+            int_val(1),
+            None,
+            None,
+            SemanticsVariant::LATEST,
+        )
+        .unwrap();
         match v {
             Value::Builtin { id, args, .. } => {
                 assert_eq!(id, BuiltinId::AddInteger);

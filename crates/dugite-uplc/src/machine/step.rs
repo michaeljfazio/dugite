@@ -1,5 +1,6 @@
 //! CEK step driver — minimal subset of UPLC-3.
 
+use crate::builtin::semantics::SemanticsVariant;
 use crate::machine::context::{Frame, Kont};
 use crate::machine::env::Env;
 use crate::machine::value::{rc_into_term, Value};
@@ -21,7 +22,9 @@ pub fn evaluate(term: Term) -> Result<Value, UplcError> {
         kont: Kont::new(),
     };
     loop {
-        state = step(state, None, None)?;
+        // No `(language, pv)` context here (budget-free harness / unit
+        // tests), so default to the STRICT / latest semantics variant.
+        state = step(state, None, None, SemanticsVariant::LATEST)?;
         if let State::Done(v) = state {
             return Ok(v);
         }
@@ -41,10 +44,17 @@ pub fn evaluate(term: Term) -> Result<Value, UplcError> {
 /// mirrors the Haskell CEK `emit` mechanism. Pass `None` to discard
 /// trace output (e.g. when running the conformance suite without log
 /// capture).
+///
+/// `variant` is the script's [`SemanticsVariant`] — computed once by the
+/// caller from `(language, major_pv)` and forwarded to the builtin
+/// denotations that change their result across protocol versions
+/// (`consByteString`). Callers with no `(language, pv)` context (the UPLC
+/// conformance harness, standalone tools) pass [`SemanticsVariant::LATEST`].
 pub fn evaluate_with_budget(
     term: Term,
     tracker: &mut crate::machine::cost::BudgetTracker,
     mut trace_log: Option<&mut Vec<String>>,
+    variant: SemanticsVariant,
 ) -> Result<Value, UplcError> {
     let mut state = State::Compute {
         term,
@@ -55,7 +65,12 @@ pub fn evaluate_with_budget(
         if let State::Compute { ref term, .. } = state {
             tracker.compute_step(term)?;
         }
-        state = step(state, Some(&mut *tracker), trace_log.as_deref_mut())?;
+        state = step(
+            state,
+            Some(&mut *tracker),
+            trace_log.as_deref_mut(),
+            variant,
+        )?;
         if let State::Done(v) = state {
             tracker.flush()?;
             return Ok(v);
@@ -67,10 +82,11 @@ fn step(
     state: State,
     tracker: Option<&mut crate::machine::cost::BudgetTracker>,
     trace_log: Option<&mut Vec<String>>,
+    variant: SemanticsVariant,
 ) -> Result<State, UplcError> {
     match state {
         State::Compute { term, env, kont } => compute(term, env, kont),
-        State::Return { value, kont } => return_compute(value, kont, tracker, trace_log),
+        State::Return { value, kont } => return_compute(value, kont, tracker, trace_log, variant),
         State::Done(_) => Err(UplcError::Internal("step called on Done state".into())),
     }
 }
@@ -217,6 +233,7 @@ fn return_compute(
     mut kont: Kont,
     tracker: Option<&mut crate::machine::cost::BudgetTracker>,
     trace_log: Option<&mut Vec<String>>,
+    variant: SemanticsVariant,
 ) -> Result<State, UplcError> {
     let frame = match kont.pop() {
         None => return Ok(State::Done(value)),
@@ -236,9 +253,11 @@ fn return_compute(
                 kont,
             })
         }
-        Frame::AwaitArg { function, .. } => apply(function, value, kont, tracker, trace_log),
-        Frame::Force => force_value(value, kont, tracker, trace_log),
-        Frame::ApplyValue { argument } => apply(value, argument, kont, tracker, trace_log),
+        Frame::AwaitArg { function, .. } => {
+            apply(function, value, kont, tracker, trace_log, variant)
+        }
+        Frame::Force => force_value(value, kont, tracker, trace_log, variant),
+        Frame::ApplyValue { argument } => apply(value, argument, kont, tracker, trace_log, variant),
         Frame::Constr {
             tag,
             mut pending,
@@ -404,6 +423,7 @@ fn apply(
     kont: Kont,
     tracker: Option<&mut crate::machine::cost::BudgetTracker>,
     trace_log: Option<&mut Vec<String>>,
+    variant: SemanticsVariant,
 ) -> Result<State, UplcError> {
     match function {
         Value::Lambda { body, env } => Ok(State::Compute {
@@ -420,7 +440,7 @@ fn apply(
         }),
         Value::Builtin { id, forces, args } => {
             let v = crate::builtin::dispatch::apply_builtin(
-                id, forces, args, argument, tracker, trace_log,
+                id, forces, args, argument, tracker, trace_log, variant,
             )?;
             Ok(State::Return { value: v, kont })
         }
@@ -438,6 +458,7 @@ fn force_value(
     kont: Kont,
     tracker: Option<&mut crate::machine::cost::BudgetTracker>,
     trace_log: Option<&mut Vec<String>>,
+    variant: SemanticsVariant,
 ) -> Result<State, UplcError> {
     match value {
         Value::Delay { body, env } => Ok(State::Compute {
@@ -447,7 +468,7 @@ fn force_value(
         }),
         Value::Builtin { id, forces, args } => {
             use crate::builtin::dispatch::{force_builtin, ForceOutcome};
-            match force_builtin(id, forces, args, tracker, trace_log)? {
+            match force_builtin(id, forces, args, tracker, trace_log, variant)? {
                 ForceOutcome::Pending(v) | ForceOutcome::Done(v) => {
                     Ok(State::Return { value: v, kont })
                 }

@@ -31,6 +31,7 @@
 // the dead-code warning unconditionally for this test binary.
 #![allow(dead_code)]
 
+use dugite_uplc::builtin::semantics::SemanticsVariant;
 use dugite_uplc::machine::cost::BudgetTracker;
 use dugite_uplc::machine::env::Env;
 use dugite_uplc::machine::step::evaluate_with_budget;
@@ -92,7 +93,16 @@ fn run_conformance_test(
     let mut tracker = BudgetTracker::new_counting();
     // Conformance tests don't exercise trace output — pass `None` to
     // discard any `trace` builtin emissions (mirrors `evaluateCekNoEmit`).
-    let eval = evaluate_with_budget(input_prog.term.clone(), &mut tracker, None);
+    //
+    // The corpus is generated against the latest (PlutusV3 / van Rossem)
+    // semantics, so use the STRICT / latest `SemanticsVariant` — its
+    // `consByteString` vectors expect the V3 range-checking behaviour.
+    let eval = evaluate_with_budget(
+        input_prog.term.clone(),
+        &mut tracker,
+        None,
+        SemanticsVariant::LATEST,
+    );
 
     let value = match eval {
         Ok(v) => v,

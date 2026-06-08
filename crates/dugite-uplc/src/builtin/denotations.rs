@@ -10,6 +10,7 @@
 //! external crypto crates needed). Subsequent commits add bytestring,
 //! string, list, pair, data, and crypto suites.
 
+use crate::builtin::semantics::SemanticsVariant;
 use crate::machine::value::Value;
 use crate::term::{BuiltinId, Constant};
 use crate::UplcError;
@@ -28,10 +29,19 @@ type ValueMap = BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, i128>>;
 /// (string) argument here before returning the second. This mirrors
 /// the Haskell CEK `emit` mechanism (`traceDenotation text a = a <$
 /// emit text`, see `PlutusCore.Default.Builtins`).
+///
+/// `variant` is the script's [`SemanticsVariant`], which selects between
+/// alternative result-level denotations for the small set of builtins whose
+/// observable result changed across protocol versions. Today the only such
+/// builtin is `consByteString` (lenient `fromIntegral` for V1/V2 vs strict
+/// `Word8` for V3); every other denotation is variant-insensitive at the
+/// result level (their per-variant difference, if any, is cost-only and is
+/// handled in [`crate::cost_apply`]).
 pub fn denote(
     id: BuiltinId,
     args: Vec<Value>,
     trace_log: Option<&mut Vec<String>>,
+    variant: SemanticsVariant,
 ) -> Result<Value, UplcError> {
     use BuiltinId::*;
     match id {
@@ -142,18 +152,47 @@ pub fn denote(
             Ok(Value::Const(Constant::ByteString(out)))
         }
         ConsByteString => {
-            // First arg is an Integer in 0..=255; second is a ByteString.
-            // Haskell: `consByteString : i -> bs -> (i `mod` 256) `BS.cons` bs`
-            // The Plutus V2+ semantics CHANGE: range-check (0..=255)
-            // and reject out-of-range. We follow V2 semantics by
-            // default (which is mainnet).
+            // `consByteString : Integer -> ByteString -> ByteString`.
+            //
+            // Two denotations, selected by the script's `SemanticsVariant`
+            // (`variant.cons_byte_string_strict()`):
+            //
+            //   * LENIENT (variants A/B/D = PlutusV1 & PlutusV2 at EVERY
+            //     protocol version): the meaning is `BS.cons . fromIntegral`
+            //     where `fromIntegral :: Integer -> Word8` is modular /
+            //     Euclidean — the integer is reduced mod 256 to a byte and
+            //     NEVER errors (256 → 0x00, 257 → 0x01, -1 → 0xFF,
+            //     -256 → 0x00).
+            //   * STRICT (variants C/E = PlutusV3): the argument is a `Word8`,
+            //     so an integer outside `0..=255` is a `BuiltinFailure`.
+            //
+            // Net rule: STRICT iff the script language is PlutusV3.
+            //
+            // Source: IntersectMBO/plutus `Builtins.hs`
+            // `consByteStringMeaning_V1` / `consByteStringMeaning_V2`
+            // (`BS.cons . fromIntegral`, lenient) vs the V3 `Word8`-typed
+            // meaning (strict). Commit d3c8d752:
+            // https://github.com/IntersectMBO/plutus/blob/d3c8d752/plutus-core/plutus-core/src/PlutusCore/Default/Builtins.hs
             let mut it = args.into_iter();
             let i = unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
             let bs = unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
-            // Range check (V2+).
-            let i_u8 = bigint_to_u8(&i, id, "cons byte must be 0..=255")?;
+            let byte = if variant.cons_byte_string_strict() {
+                // STRICT (V3): range-check, error on <0 or >255.
+                bigint_to_u8(&i, id, "cons byte must be 0..=255")?
+            } else {
+                // LENIENT (V1/V2): `fromIntegral :: Integer -> Word8`, i.e.
+                // reduce mod 256 to a byte. Use EUCLIDEAN remainder (not
+                // num-bigint `%`, whose sign follows the dividend, e.g.
+                // `-1 % 256 == -1`). `rem_euclid` is guaranteed in 0..=255,
+                // so `to_u8` cannot be `None`; map the impossible `None` to a
+                // typed error rather than panicking (no-panic invariant).
+                use num_traits::{Euclid, ToPrimitive};
+                let m = i.rem_euclid(&BigInt::from(256u16));
+                m.to_u8()
+                    .ok_or_else(|| builtin_failure(id, "cons byte mod 256 out of range"))?
+            };
             let mut out = Vec::with_capacity(1 + bs.len());
-            out.push(i_u8);
+            out.push(byte);
             out.extend_from_slice(&bs);
             Ok(Value::Const(Constant::ByteString(out)))
         }
@@ -1760,7 +1799,19 @@ mod tests {
     }
 
     fn run(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
-        denote(id, args, None)
+        // Default to the STRICT / latest variant (matches existing behaviour
+        // for every variant-insensitive builtin).
+        denote(id, args, None, SemanticsVariant::LATEST)
+    }
+
+    /// Run a denotation under an explicit [`SemanticsVariant`] — for the
+    /// `consByteString` lenient/strict tests.
+    fn run_variant(
+        id: BuiltinId,
+        args: Vec<Value>,
+        variant: SemanticsVariant,
+    ) -> Result<Value, UplcError> {
+        denote(id, args, None, variant)
     }
 
     fn run_with_log(
@@ -1768,7 +1819,7 @@ mod tests {
         args: Vec<Value>,
         log: &mut Vec<String>,
     ) -> Result<Value, UplcError> {
-        denote(id, args, Some(log))
+        denote(id, args, Some(log), SemanticsVariant::LATEST)
     }
 
     // ── Integer arithmetic ─────────────────────────────────────────
@@ -2512,6 +2563,8 @@ mod tests {
 
     #[test]
     fn cons_byte_string_out_of_range_fails() {
+        // `run` uses the STRICT / latest variant (V3 semantics): out-of-range
+        // integers are a BuiltinFailure.
         assert!(matches!(
             run(BuiltinId::ConsByteString, vec![int(256), bs(b"")]),
             Err(UplcError::BuiltinFailure { .. })
@@ -2520,6 +2573,110 @@ mod tests {
             run(BuiltinId::ConsByteString, vec![int(-1), bs(b"")]),
             Err(UplcError::BuiltinFailure { .. })
         ));
+    }
+
+    // ── consByteString: per-SemanticsVariant denotation (backlog #32) ──────
+    //
+    // LENIENT (V1/V2 variants A/B/D): `BS.cons . fromIntegral` — reduce the
+    // integer mod 256 (Euclidean) to a byte; NEVER errors.
+    // STRICT (V3 variants C/E): `Word8` arg — error outside 0..=255.
+
+    #[test]
+    fn cons_byte_string_lenient_wraps_modulo_256() {
+        use SemanticsVariant::A;
+        // 256 → 0x00
+        assert_eq!(
+            run_variant(BuiltinId::ConsByteString, vec![int(256), bs(b"")], A).unwrap(),
+            bs(&[0x00])
+        );
+        // 257, "x" → [0x01, 0x78]
+        assert_eq!(
+            run_variant(BuiltinId::ConsByteString, vec![int(257), bs(b"x")], A).unwrap(),
+            bs(&[0x01, 0x78])
+        );
+        // 511 → 0xFF
+        assert_eq!(
+            run_variant(BuiltinId::ConsByteString, vec![int(511), bs(b"")], A).unwrap(),
+            bs(&[0xFF])
+        );
+        // 0, "ab" → [0x00, 0x61, 0x62] (in-range value, byte-identical to strict)
+        assert_eq!(
+            run_variant(BuiltinId::ConsByteString, vec![int(0), bs(b"ab")], A).unwrap(),
+            bs(&[0x00, 0x61, 0x62])
+        );
+    }
+
+    #[test]
+    fn cons_byte_string_lenient_handles_negatives_via_rem_euclid() {
+        // The sign guard: num-bigint `%` would give -1 % 256 == -1 (WRONG);
+        // `rem_euclid` gives 255 → 0xFF.
+        for variant in [
+            SemanticsVariant::A,
+            SemanticsVariant::B,
+            SemanticsVariant::D,
+        ] {
+            assert_eq!(
+                run_variant(BuiltinId::ConsByteString, vec![int(-1), bs(b"")], variant).unwrap(),
+                bs(&[0xFF]),
+                "{variant:?}: -1 must wrap to 0xFF",
+            );
+            // -256 → 0x00
+            assert_eq!(
+                run_variant(BuiltinId::ConsByteString, vec![int(-256), bs(b"")], variant).unwrap(),
+                bs(&[0x00]),
+                "{variant:?}: -256 must wrap to 0x00",
+            );
+        }
+    }
+
+    #[test]
+    fn cons_byte_string_strict_v3_rejects_out_of_range() {
+        for variant in [SemanticsVariant::C, SemanticsVariant::E] {
+            assert!(
+                matches!(
+                    run_variant(BuiltinId::ConsByteString, vec![int(256), bs(b"")], variant),
+                    Err(UplcError::BuiltinFailure { .. })
+                ),
+                "{variant:?}: 256 must error under strict semantics",
+            );
+            assert!(
+                matches!(
+                    run_variant(BuiltinId::ConsByteString, vec![int(-1), bs(b"")], variant),
+                    Err(UplcError::BuiltinFailure { .. })
+                ),
+                "{variant:?}: -1 must error under strict semantics",
+            );
+            // In-range value still succeeds.
+            assert_eq!(
+                run_variant(BuiltinId::ConsByteString, vec![int(255), bs(b"")], variant).unwrap(),
+                bs(&[0xFF]),
+                "{variant:?}: 255 must succeed → 0xFF",
+            );
+        }
+    }
+
+    #[test]
+    fn cons_byte_string_lenient_equals_strict_for_in_range_bytes() {
+        // Regression guard: for EVERY in-range integer (0..=255) the lenient
+        // and strict paths produce byte-identical output. This is what keeps
+        // the 999-vector conformance suite and the in-range #730 dumps
+        // unchanged.
+        for i in 0u16..=255 {
+            let lenient = run_variant(
+                BuiltinId::ConsByteString,
+                vec![int(i as i64), bs(b"z")],
+                SemanticsVariant::A,
+            )
+            .unwrap();
+            let strict = run_variant(
+                BuiltinId::ConsByteString,
+                vec![int(i as i64), bs(b"z")],
+                SemanticsVariant::E,
+            )
+            .unwrap();
+            assert_eq!(lenient, strict, "lenient != strict for in-range byte {i}");
+            assert_eq!(lenient, bs(&[i as u8, b'z']));
+        }
     }
 
     #[test]
