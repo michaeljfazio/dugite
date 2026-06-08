@@ -258,26 +258,26 @@ pub fn gov_action_to_data(action: &PrimGovAction) -> Result<Data, PhaseTwoError>
             withdrawals,
             policy_hash,
         } => {
-            let mut entries: Vec<(Data, Data)> = Vec::with_capacity(withdrawals.len());
-            for (reward_addr_bytes, amount) in withdrawals {
-                let addr = dugite_primitives::address::Address::from_bytes(reward_addr_bytes)
-                    .map_err(|e| {
-                        PhaseTwoError::Internal(format!(
-                            "gov_action_to_data: TreasuryWithdrawals reward_addr: {e}"
-                        ))
-                    })?;
-                let stake_cred = match addr {
-                    dugite_primitives::address::Address::Reward(r) => {
-                        credential_to_plutus(&r.stake)
-                    }
-                    other => {
-                        return Err(PhaseTwoError::Internal(format!(
-                            "gov_action_to_data: TreasuryWithdrawals expected Reward address, got {other:?}"
-                        )));
-                    }
-                };
-                entries.push((stake_cred.to_data(), Data::I(BigInt::from(amount.0))));
-            }
+            // The Plutus V3 `Map Credential Lovelace` must follow the LEDGER
+            // `Map RewardAccount Coin` order (`Credential` Script < Key), NOT
+            // the raw 29-byte reward-account blob order (which `BTreeMap`
+            // iteration gives — header high-nibble `0xE_`=key < `0xF_`=script
+            // ⇒ Key < Script). Haskell `Conway.TxInfo.transGovAction`:
+            // `transMap = PV3.unsafeFromList . map f . Map.toList` preserves
+            // the ledger `Map`'s `Credential Ord` (ScriptHashObj < KeyHashObj).
+            // Reuse the gauntlet-proven `ledger_ordered_withdrawals` helper
+            // (issue #26, same `&BTreeMap<Vec<u8>, Lovelace>` input) — it
+            // re-sorts the blob order to ledger order via `cmp_ledger`.
+            let ordered = crate::tx_info_populate::ledger_ordered_withdrawals(withdrawals)?;
+            let entries: Vec<(Data, Data)> = ordered
+                .into_iter()
+                .map(|(stake, amount)| {
+                    (
+                        credential_to_plutus(&stake).to_data(),
+                        Data::I(BigInt::from(amount.0)),
+                    )
+                })
+                .collect();
             Data::Constr(
                 2,
                 vec![Data::Map(entries), maybe_script_hash(policy_hash.as_ref())],
@@ -296,14 +296,31 @@ pub fn gov_action_to_data(action: &PrimGovAction) -> Result<Data, PhaseTwoError>
             members_to_add,
             threshold,
         } => {
-            // [ColdCredential] — list of credentials to remove
-            let remove_list: Vec<Data> = members_to_remove
-                .iter()
+            // [ColdCredential] — list of credentials to remove.
+            // Haskell `Conway.TxInfo.transGovAction` builds this from
+            // `Set.toList membersToRemove`, which is in ledger `Credential`
+            // Ord (Script < Key) and deduped. dugite stores it as a `Vec` in
+            // wire order, so re-sort by `cmp_ledger` (Script < Key) and dedup
+            // (Set parity — a no-op for valid txs) before building the list.
+            let mut remove_sorted: Vec<&PrimCred> = members_to_remove.iter().collect();
+            remove_sorted.sort_by(|a, b| a.cmp_ledger(b));
+            remove_sorted.dedup();
+            let remove_list: Vec<Data> = remove_sorted
+                .into_iter()
                 .map(|c| credential_to_plutus(c).to_data())
                 .collect();
-            // Map ColdCredential Epoch — credentials to add with their term expiry epoch
-            let add_map: Vec<(Data, Data)> = members_to_add
-                .iter()
+            // Map ColdCredential Epoch — credentials to add with their term
+            // expiry epoch. Same ledger-order requirement: the Plutus map must
+            // follow the ledger `Map Credential EpochNo` order (Script < Key),
+            // NOT dugite's derived `BTreeMap<Credential, _>` iteration order
+            // (Key < Script). `Conway.TxInfo.transGovAction` uses
+            // `transMap = PV3.unsafeFromList . map f . Map.toList`, preserving
+            // the ledger `Map`'s `Credential Ord`. Collect + re-sort by
+            // `cmp_ledger` before mapping.
+            let mut add_sorted: Vec<(&PrimCred, &u64)> = members_to_add.iter().collect();
+            add_sorted.sort_by(|a, b| a.0.cmp_ledger(b.0));
+            let add_map: Vec<(Data, Data)> = add_sorted
+                .into_iter()
                 .map(|(c, epoch)| {
                     (
                         credential_to_plutus(c).to_data(),
@@ -1238,6 +1255,255 @@ mod tests {
                 vec![Data::I(BigInt::from(2u64)), Data::I(BigInt::from(3u64))]
             ),
             "Rational must be Constr 0 [I num, I den]"
+        );
+    }
+
+    // GovernanceAction ledger-order (Script < Key) ─────────────────────
+    //
+    // The 3 V3 GovernanceAction map/list fields (TreasuryWithdrawals map,
+    // UpdateCommittee members_to_add map, members_to_remove list) are built
+    // in LEDGER `Credential` Ord (Script < Key) in Haskell
+    // (`Conway.TxInfo.transGovAction`: `transMap = unsafeFromList . map f .
+    // Map.toList` preserves the ledger Map's Credential Ord ScriptHashObj <
+    // KeyHashObj; `members_to_remove = Set.toList`, Script < Key, deduped).
+    // dugite's derived `Credential`/`BTreeMap` order is the OPPOSITE
+    // (Key < Script), so each field is re-sorted by `cmp_ledger`. These are
+    // V3-only, so use the LEDGER comparator (NOT the V1/V2 Plutus Key < Script).
+
+    /// Build a reward-account blob: header high-nibble `0xE_` (key-stake) /
+    /// `0xF_` (script-stake), low-nibble = network (mainnet = 1), then a
+    /// 28-byte credential hash. Mirrors
+    /// `tx_info_populate::tests::encode_reward_addr_blob`.
+    fn reward_addr_blob_typed(is_script: bool, hash: [u8; 28]) -> Vec<u8> {
+        let header = if is_script { 0xf1u8 } else { 0xe1u8 };
+        let mut v = Vec::with_capacity(29);
+        v.push(header);
+        v.extend_from_slice(&hash);
+        v
+    }
+
+    #[test]
+    fn gov_action_treasury_withdrawals_orders_script_before_key() {
+        // Two reward blobs: a key-stake (0xE1..) and a script-stake (0xF1..).
+        // The key hash is LOWER (0x01 < 0x02) so blob order AND hash order
+        // both place the key entry first — only the ledger Script < Key rule
+        // flips it. `BTreeMap` iterates the key blob first; the Plutus
+        // `Map Credential Lovelace` must list the SCRIPT credential first.
+        use dugite_primitives::transaction::GovAction;
+        use dugite_primitives::value::Lovelace;
+        let key_blob = reward_addr_blob_typed(false, [0x01u8; 28]);
+        let script_blob = reward_addr_blob_typed(true, [0x02u8; 28]);
+        let mut withdrawals = std::collections::BTreeMap::new();
+        withdrawals.insert(key_blob.clone(), Lovelace(10));
+        withdrawals.insert(script_blob, Lovelace(20));
+
+        // Sanity: BTreeMap blob order iterates the KEY entry first.
+        assert_eq!(
+            withdrawals.keys().next().unwrap(),
+            &key_blob,
+            "blob order must be Key < Script"
+        );
+
+        let d = gov_action_to_data(&GovAction::TreasuryWithdrawals {
+            withdrawals,
+            policy_hash: None,
+        })
+        .unwrap();
+        let Data::Constr(2, ref fields) = d else {
+            panic!("TreasuryWithdrawals must be Constr 2; got {d:?}");
+        };
+        let Data::Map(ref entries) = fields[0] else {
+            panic!("field[0] must be Map; got {:?}", fields[0]);
+        };
+        assert_eq!(entries.len(), 2);
+        // entries[0] = Script credential (Constr 1 [B28]) + amount 20.
+        assert_eq!(
+            entries[0].0,
+            Data::Constr(1, vec![Data::B(vec![0x02u8; 28])]),
+            "entries[0] must be the SCRIPT credential (ledger Script < Key); got {:?}",
+            entries[0].0
+        );
+        assert_eq!(entries[0].1, Data::I(BigInt::from(20u64)));
+        // entries[1] = Key credential (Constr 0 [B28]) + amount 10.
+        assert_eq!(
+            entries[1].0,
+            Data::Constr(0, vec![Data::B(vec![0x01u8; 28])]),
+            "entries[1] must be the KEY credential; got {:?}",
+            entries[1].0
+        );
+        assert_eq!(entries[1].1, Data::I(BigInt::from(10u64)));
+    }
+
+    #[test]
+    fn gov_action_treasury_withdrawals_single_entry_identity() {
+        // Single entry — no over-sort regression; the sole credential stays put.
+        use dugite_primitives::transaction::GovAction;
+        use dugite_primitives::value::Lovelace;
+        let mut withdrawals = std::collections::BTreeMap::new();
+        withdrawals.insert(reward_addr_blob_typed(true, [0x55u8; 28]), Lovelace(7));
+        let d = gov_action_to_data(&GovAction::TreasuryWithdrawals {
+            withdrawals,
+            policy_hash: None,
+        })
+        .unwrap();
+        let Data::Constr(2, ref fields) = d else {
+            panic!("TreasuryWithdrawals must be Constr 2; got {d:?}");
+        };
+        let Data::Map(ref entries) = fields[0] else {
+            panic!("field[0] must be Map; got {:?}", fields[0]);
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].0,
+            Data::Constr(1, vec![Data::B(vec![0x55u8; 28])])
+        );
+        assert_eq!(entries[0].1, Data::I(BigInt::from(7u64)));
+    }
+
+    #[test]
+    fn gov_action_update_committee_add_orders_script_before_key() {
+        // members_to_add {key 0x01, script 0x02}: dugite's derived
+        // `BTreeMap<Credential, _>` iterates Key < Script; the Plutus
+        // `Map ColdCredential Epoch` must list the SCRIPT credential first.
+        use dugite_primitives::transaction::{GovAction, Rational};
+        let mut members_to_add = std::collections::BTreeMap::new();
+        members_to_add.insert(key_cred(0x01), 100u64);
+        members_to_add.insert(script_cred(0x02), 200u64);
+
+        // Sanity: BTreeMap iterates the KEY credential first (derived Key < Script).
+        assert!(matches!(
+            members_to_add.keys().next().unwrap(),
+            PrimCred::VerificationKey(_)
+        ));
+
+        let d = gov_action_to_data(&GovAction::UpdateCommittee {
+            prev_action_id: None,
+            members_to_remove: vec![],
+            members_to_add,
+            threshold: Rational {
+                numerator: 1,
+                denominator: 2,
+            },
+        })
+        .unwrap();
+        let Data::Constr(4, ref fields) = d else {
+            panic!("UpdateCommittee must be Constr 4; got {d:?}");
+        };
+        let Data::Map(ref add_map) = fields[2] else {
+            panic!("field[2] must be Map; got {:?}", fields[2]);
+        };
+        assert_eq!(add_map.len(), 2);
+        // add[0] = Script credential (Constr 1) + epoch 200.
+        assert_eq!(
+            add_map[0].0,
+            Data::Constr(1, vec![Data::B(vec![0x02u8; 28])]),
+            "add[0] must be the SCRIPT credential (ledger Script < Key); got {:?}",
+            add_map[0].0
+        );
+        assert_eq!(add_map[0].1, Data::I(BigInt::from(200u64)));
+        // add[1] = Key credential (Constr 0) + epoch 100.
+        assert_eq!(
+            add_map[1].0,
+            Data::Constr(0, vec![Data::B(vec![0x01u8; 28])]),
+            "add[1] must be the KEY credential; got {:?}",
+            add_map[1].0
+        );
+        assert_eq!(add_map[1].1, Data::I(BigInt::from(100u64)));
+    }
+
+    #[test]
+    fn gov_action_update_committee_add_single_entry_identity() {
+        // Single add entry — no over-sort regression.
+        use dugite_primitives::transaction::{GovAction, Rational};
+        let mut members_to_add = std::collections::BTreeMap::new();
+        members_to_add.insert(script_cred(0x66), 300u64);
+        let d = gov_action_to_data(&GovAction::UpdateCommittee {
+            prev_action_id: None,
+            members_to_remove: vec![],
+            members_to_add,
+            threshold: Rational {
+                numerator: 1,
+                denominator: 2,
+            },
+        })
+        .unwrap();
+        let Data::Constr(4, ref fields) = d else {
+            panic!("UpdateCommittee must be Constr 4; got {d:?}");
+        };
+        let Data::Map(ref add_map) = fields[2] else {
+            panic!("field[2] must be Map; got {:?}", fields[2]);
+        };
+        assert_eq!(add_map.len(), 1);
+        assert_eq!(
+            add_map[0].0,
+            Data::Constr(1, vec![Data::B(vec![0x66u8; 28])])
+        );
+        assert_eq!(add_map[0].1, Data::I(BigInt::from(300u64)));
+    }
+
+    #[test]
+    fn gov_action_update_committee_remove_orders_script_before_key() {
+        // members_to_remove vec![key, script] in KEY-first input order; the
+        // Plutus `[ColdCredential]` list must be re-sorted to ledger order
+        // (Script < Key) ⇒ [Script (Constr 1), Key (Constr 0)].
+        use dugite_primitives::transaction::{GovAction, Rational};
+        let d = gov_action_to_data(&GovAction::UpdateCommittee {
+            prev_action_id: None,
+            members_to_remove: vec![key_cred(0x01), script_cred(0x02)],
+            members_to_add: std::collections::BTreeMap::new(),
+            threshold: Rational {
+                numerator: 1,
+                denominator: 2,
+            },
+        })
+        .unwrap();
+        let Data::Constr(4, ref fields) = d else {
+            panic!("UpdateCommittee must be Constr 4; got {d:?}");
+        };
+        let Data::List(ref remove_list) = fields[1] else {
+            panic!("field[1] must be List; got {:?}", fields[1]);
+        };
+        assert_eq!(remove_list.len(), 2);
+        // remove[0] = Script credential (Constr 1).
+        assert_eq!(
+            remove_list[0],
+            Data::Constr(1, vec![Data::B(vec![0x02u8; 28])]),
+            "remove[0] must be the SCRIPT credential (ledger Script < Key); got {:?}",
+            remove_list[0]
+        );
+        // remove[1] = Key credential (Constr 0).
+        assert_eq!(
+            remove_list[1],
+            Data::Constr(0, vec![Data::B(vec![0x01u8; 28])]),
+            "remove[1] must be the KEY credential; got {:?}",
+            remove_list[1]
+        );
+    }
+
+    #[test]
+    fn gov_action_update_committee_remove_single_entry_identity() {
+        // Single remove entry — no over-sort regression.
+        use dugite_primitives::transaction::{GovAction, Rational};
+        let d = gov_action_to_data(&GovAction::UpdateCommittee {
+            prev_action_id: None,
+            members_to_remove: vec![key_cred(0x77)],
+            members_to_add: std::collections::BTreeMap::new(),
+            threshold: Rational {
+                numerator: 1,
+                denominator: 2,
+            },
+        })
+        .unwrap();
+        let Data::Constr(4, ref fields) = d else {
+            panic!("UpdateCommittee must be Constr 4; got {d:?}");
+        };
+        let Data::List(ref remove_list) = fields[1] else {
+            panic!("field[1] must be List; got {:?}", fields[1]);
+        };
+        assert_eq!(remove_list.len(), 1);
+        assert_eq!(
+            remove_list[0],
+            Data::Constr(0, vec![Data::B(vec![0x77u8; 28])])
         );
     }
 
