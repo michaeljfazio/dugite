@@ -136,7 +136,11 @@ pub fn encode_plutus_int(value: &num_bigint::BigInt) -> Vec<u8> {
         (2u64, bytes)
     };
     let mut buf = encode_tag(tag);
-    buf.extend(encode_bytes(&mag));
+    // The bignum magnitude is a `PlutusData` `ByteString` leaf (Haskell
+    // `encodeInteger` outside [-1-maxWord64 .. maxWord64] -> tag 2/3 +
+    // `encodeBs (integerToBytesBE magnitude)`), so it obeys the same 64-byte
+    // chunking bound as the `Bytes` leaf arm. See #28b.
+    buf.extend(encode_bounded_plutus_bytes(&mag));
     buf
 }
 
@@ -243,6 +247,42 @@ pub fn encode_map_header(len: usize) -> Vec<u8> {
     buf
 }
 
+/// Encode a `PlutusData` `ByteString` *leaf* (the `Bytes` arm and the tag-2 /
+/// tag-3 bignum mantissa) with the plutus 64-byte-per-chunk bound.
+///
+/// Mirrors Haskell `plutus` `PlutusCore.Data.encodeData` `encodeBs` (and the
+/// inverse of dugite's own [`Reader::read_bounded_plutus_bytes`], #28):
+///
+/// - `len <= 64` -> a single **definite**-length byte string
+///   (`CBOR.encodeBytes`). The empty leaf encodes as `0x40`.
+/// - `len > 64`  -> an **indefinite**-length byte string `0x5f` ... `0xff`
+///   whose payload is `to64ByteChunks` of the input: a *greedy* split into
+///   64-byte definite chunks (`data.chunks(64)`), each emitted as its own
+///   definite byte string. A 128-byte leaf becomes exactly two 64-byte
+///   chunks (the final 64 is **not** re-split); a 100-byte leaf becomes a
+///   64-byte chunk followed by a 36-byte chunk.
+///
+/// The bound constant is shared with the decoder
+/// ([`Reader::PLUTUS_DATA_BYTES_LEAF_MAX`]) so the encode and decode bounds can
+/// never drift. This is **only** applied at `PlutusData` leaf sites — the
+/// generic [`encode_bytes`] deliberately stays a single definite byte string
+/// for any size, because it serves ~40 non-plutus call sites (addresses,
+/// 28/32-byte hashes, native + Plutus script blobs that routinely exceed 64
+/// bytes, metadata, pool relay IPs, reward/return addresses) where chunking
+/// would corrupt the field and break block-body / tx hashes.
+fn encode_bounded_plutus_bytes(data: &[u8]) -> Vec<u8> {
+    const PLUTUS_LEAF_MAX: usize = crate::decode::reader::Reader::PLUTUS_DATA_BYTES_LEAF_MAX;
+    if data.len() <= PLUTUS_LEAF_MAX {
+        return encode_bytes(data);
+    }
+    let mut buf = vec![0x5f];
+    for chunk in data.chunks(PLUTUS_LEAF_MAX) {
+        buf.extend(encode_bytes(chunk));
+    }
+    buf.push(0xff);
+    buf
+}
+
 /// Encode PlutusData to CBOR
 pub fn encode_plutus_data(data: &PlutusData) -> Vec<u8> {
     match data {
@@ -293,7 +333,7 @@ pub fn encode_plutus_data(data: &PlutusData) -> Vec<u8> {
             buf
         }
         PlutusData::Integer(n) => encode_plutus_int(n),
-        PlutusData::Bytes(b) => encode_bytes(b),
+        PlutusData::Bytes(b) => encode_bounded_plutus_bytes(b),
     }
 }
 
@@ -584,5 +624,232 @@ mod tests {
         assert_eq!(encoded[4], 0x01);
         assert_eq!(encoded[5], 0x00);
         assert_eq!(encoded[6], 0x80); // empty fields array
+    }
+
+    // ── #28b: PlutusData ENCODER must chunk >64-byte leaf bytestrings ──
+    //
+    // Mirrors Haskell `plutus` PlutusCore.Data.encodeData `encodeBs`:
+    //   * len <= 64 -> single definite bstr (CBOR.encodeBytes)
+    //   * len  > 64 -> indefinite bstr 0x5f ... 0xff, payload = to64ByteChunks
+    //     (greedy 64-byte definite chunks, final chunk 1..=64, a 128 -> two 64).
+    // The same rule covers the tag-2/tag-3 bignum mantissa.
+    // The generic encode_bytes must STAY a single definite bstr for any size.
+
+    use crate::decode::era_alonzo::read_plutus_data as read_plutus_data_alonzo;
+    use crate::decode::era_conway::read_plutus_data as read_plutus_data_conway;
+    use crate::decode::reader::Reader;
+    use num_bigint::BigInt;
+
+    const PLUTUS_LEAF_MAX: usize = Reader::PLUTUS_DATA_BYTES_LEAF_MAX;
+
+    /// (a) chunk-shape: a 100-byte leaf -> 0x5f, 0x58 0x40 <64>, 0x58 0x24 <36>, 0xff.
+    #[test]
+    fn plutus_bytes_100b_leaf_chunks_64_then_36() {
+        let payload = vec![0xABu8; 100];
+        let encoded = encode_plutus_data(&PlutusData::Bytes(payload));
+
+        // 0x5f indefinite-length byte-string header.
+        assert_eq!(encoded[0], 0x5f);
+        // First chunk: definite bstr, 1-byte length 0x40 (=64), 64 payload bytes.
+        assert_eq!(encoded[1], 0x58);
+        assert_eq!(encoded[2], 0x40);
+        assert_eq!(&encoded[3..67], &[0xABu8; 64][..]);
+        // Second chunk: definite bstr, 1-byte length 0x24 (=36), 36 payload bytes.
+        assert_eq!(encoded[67], 0x58);
+        assert_eq!(encoded[68], 0x24);
+        assert_eq!(&encoded[69..105], &[0xABu8; 36][..]);
+        // 0xff break.
+        assert_eq!(encoded[105], 0xff);
+        assert_eq!(encoded.len(), 106);
+    }
+
+    /// (b) length-lattice: <=64 single definite (no 0x5f); >64 indefinite with
+    /// every interior chunk == 64 and final chunk == len-64*floor(...) (64 when
+    /// len%64==0).
+    #[test]
+    fn plutus_bytes_length_lattice_chunk_shape() {
+        for &len in &[0usize, 1, 63, 64, 65, 100, 128, 200] {
+            let payload = vec![0x5Au8; len];
+            let encoded = encode_plutus_data(&PlutusData::Bytes(payload.clone()));
+
+            if len <= PLUTUS_LEAF_MAX {
+                // Single definite byte string — NO indefinite marker / break.
+                assert_ne!(encoded[0], 0x5f, "len {len} must NOT be indefinite");
+                assert_eq!(
+                    encoded,
+                    encode_bytes(&payload),
+                    "len {len} must be a single definite bstr"
+                );
+            } else {
+                // Indefinite: 0x5f ... 0xff.
+                assert_eq!(encoded[0], 0x5f, "len {len} must be indefinite");
+                assert_eq!(
+                    *encoded.last().unwrap(),
+                    0xff,
+                    "len {len} must end in break"
+                );
+
+                // Walk the interior chunks: every chunk except the last must be
+                // exactly 64 bytes; the final chunk = len % 64 (or 64).
+                let n_chunks = len.div_ceil(PLUTUS_LEAF_MAX);
+                let expected_last = if len % PLUTUS_LEAF_MAX == 0 {
+                    PLUTUS_LEAF_MAX
+                } else {
+                    len % PLUTUS_LEAF_MAX
+                };
+                let mut chunk_lens = Vec::new();
+                let mut i = 1usize; // skip 0x5f
+                while encoded[i] != 0xff {
+                    // Each chunk is a definite bstr; lengths here are <=64 so
+                    // either 0x40|len (len<24) or 0x58 <len>.
+                    let clen = match encoded[i] {
+                        b if (0x40..0x58).contains(&b) => {
+                            let l = (b & 0x1f) as usize;
+                            i += 1 + l;
+                            l
+                        }
+                        0x58 => {
+                            let l = encoded[i + 1] as usize;
+                            i += 2 + l;
+                            l
+                        }
+                        other => panic!("len {len}: unexpected chunk header {other:#04x}"),
+                    };
+                    chunk_lens.push(clen);
+                }
+                assert_eq!(chunk_lens.len(), n_chunks, "len {len} chunk count");
+                for (idx, &cl) in chunk_lens.iter().enumerate() {
+                    if idx + 1 < n_chunks {
+                        assert_eq!(cl, PLUTUS_LEAF_MAX, "len {len} interior chunk {idx}");
+                    } else {
+                        assert_eq!(cl, expected_last, "len {len} final chunk");
+                    }
+                }
+                // 128 specifically -> exactly two 64-byte chunks.
+                if len == 128 {
+                    assert_eq!(chunk_lens, vec![64, 64]);
+                }
+            }
+        }
+    }
+
+    /// (c) ROUND-TRIP closure — the self-inconsistency fix. For >64 leaves the
+    /// OLD single-definite encoding FAILED dugite's own #28 decode bound; the
+    /// chunked encoding now decodes via read_bounded_plutus_bytes AND the full
+    /// read_plutus_data (Conway + Alonzo).
+    #[test]
+    fn plutus_bytes_roundtrip_via_bounded_decoder() {
+        for &len in &[0usize, 1, 63, 64, 65, 100, 128, 200] {
+            // Distinct byte pattern so a corrupted round-trip is caught.
+            let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let encoded = encode_plutus_data(&PlutusData::Bytes(payload.clone()));
+
+            // Low-level bounded leaf reader.
+            let mut r = Reader::new(&encoded);
+            let decoded = r
+                .read_bounded_plutus_bytes()
+                .unwrap_or_else(|e| panic!("len {len}: read_bounded_plutus_bytes failed: {e}"));
+            assert_eq!(decoded, payload, "len {len}: bounded leaf round-trip");
+
+            // Full PlutusData decoders (Conway + Alonzo).
+            let mut rc = Reader::new(&encoded);
+            assert_eq!(
+                read_plutus_data_conway(&mut rc).unwrap(),
+                PlutusData::Bytes(payload.clone()),
+                "len {len}: Conway read_plutus_data round-trip"
+            );
+            let mut ra = Reader::new(&encoded);
+            assert_eq!(
+                read_plutus_data_alonzo(&mut ra).unwrap(),
+                PlutusData::Bytes(payload.clone()),
+                "len {len}: Alonzo read_plutus_data round-trip"
+            );
+        }
+    }
+
+    /// (c-bignum) symmetric case: a BigInt whose big-endian magnitude exceeds
+    /// 64 bytes (tag-2 path) must round-trip encode_plutus_int ->
+    /// read_bounded_plutus_bigint, AND through the full PlutusData decoders.
+    #[test]
+    fn plutus_bignum_magnitude_over_64_bytes_roundtrips() {
+        // 2^520 has a 66-byte big-endian magnitude -> tag 2 + chunked mantissa.
+        let big_pos = BigInt::from(2u8).pow(520);
+        let enc_pos = encode_plutus_int(&big_pos);
+        // tag 2 (positive bignum) header, then chunked indefinite mantissa.
+        assert_eq!(enc_pos[0], 0xc2, "positive bignum tag");
+        assert_eq!(enc_pos[1], 0x5f, "mantissa must be chunked (indefinite)");
+
+        let mut r = Reader::new(&enc_pos);
+        assert_eq!(
+            r.read_bounded_plutus_bigint().unwrap(),
+            big_pos,
+            "positive bignum magnitude>64 round-trip"
+        );
+        // Full PlutusData decode (Integer leaf).
+        let mut rc = Reader::new(&enc_pos);
+        assert_eq!(
+            read_plutus_data_conway(&mut rc).unwrap(),
+            PlutusData::Integer(big_pos.clone())
+        );
+
+        // Negative bignum (tag 3): value = -1 - magnitude.
+        let big_neg = -BigInt::from(2u8).pow(600);
+        let enc_neg = encode_plutus_int(&big_neg);
+        assert_eq!(enc_neg[0], 0xc3, "negative bignum tag");
+        assert_eq!(enc_neg[1], 0x5f, "mantissa must be chunked (indefinite)");
+        let mut rn = Reader::new(&enc_neg);
+        assert_eq!(
+            rn.read_bounded_plutus_bigint().unwrap(),
+            big_neg,
+            "negative bignum magnitude>64 round-trip"
+        );
+    }
+
+    /// (d) generic-encoder guard: encode_bytes (non-plutus) STAYS a single
+    /// definite byte string for >64 bytes — NO indefinite marker. Chunking it
+    /// would corrupt addresses / hashes / script blobs and break body hashes.
+    #[test]
+    fn generic_encode_bytes_stays_single_definite() {
+        let encoded = encode_bytes(&[0u8; 100]);
+        assert_eq!(
+            encoded[0], 0x58,
+            "100-byte generic bstr: 1-byte length form"
+        );
+        assert_eq!(encoded[1], 0x64, "length 100 == 0x64");
+        assert_eq!(encoded.len(), 102);
+        assert!(
+            !encoded.contains(&0x5f),
+            "generic encode_bytes must never chunk"
+        );
+
+        // And a deliberately large (>64) blob — e.g. a Plutus script blob class.
+        let big = encode_bytes(&[0xCDu8; 300]);
+        assert_eq!(big[0], 0x59, "300-byte generic bstr: 2-byte length form");
+        assert_eq!(u16::from_be_bytes([big[1], big[2]]), 300);
+    }
+
+    proptest::proptest! {
+        /// (b/c property) length-lattice over arbitrary sizes 0..=512: the
+        /// encoding always round-trips through the bounded decoder, <=64 stays a
+        /// single definite bstr, and >64 is a chunked indefinite bstr whose
+        /// interior chunks are all exactly 64.
+        #[test]
+        fn prop_plutus_bytes_chunk_shape_and_roundtrip(len in 0usize..=512) {
+            let payload: Vec<u8> = (0..len).map(|i| (i % 256) as u8).collect();
+            let encoded = encode_plutus_data(&PlutusData::Bytes(payload.clone()));
+
+            // Round-trip via the bounded leaf reader.
+            let mut r = Reader::new(&encoded);
+            let decoded = r.read_bounded_plutus_bytes().unwrap();
+            proptest::prop_assert_eq!(&decoded, &payload);
+
+            if len <= PLUTUS_LEAF_MAX {
+                proptest::prop_assert_ne!(encoded[0], 0x5f);
+                proptest::prop_assert_eq!(&encoded, &encode_bytes(&payload));
+            } else {
+                proptest::prop_assert_eq!(encoded[0], 0x5f);
+                proptest::prop_assert_eq!(*encoded.last().unwrap(), 0xff);
+            }
+        }
     }
 }

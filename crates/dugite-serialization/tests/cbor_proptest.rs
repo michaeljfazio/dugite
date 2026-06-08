@@ -471,14 +471,29 @@ proptest! {
 
     // -----------------------------------------------------------------------
     // PlutusData::Bytes CBOR round-trip
+    //
+    // Decode via the canonical, bound-aware `decode_plutus_data_cbor` rather
+    // than the naive local `decode_cbor_bytes` (single-definite-only) helper:
+    // since #28b, a `PlutusData::Bytes` leaf > 64 bytes is encoded as the
+    // Haskell `plutus` indefinite-length 64-byte-chunked form (`0x5f ... 0xff`),
+    // which the naive helper cannot parse. This round-trip proves the chunked
+    // ENCODER is self-consistent with dugite's own bounded DECODER (#28).
     // -----------------------------------------------------------------------
     #[test]
     fn prop_plutus_data_bytes_roundtrip(bytes in prop::collection::vec(any::<u8>(), 0..=128)) {
+        use dugite_serialization::decode::decode_plutus_data_cbor;
         let data = PlutusData::Bytes(bytes.clone());
         let encoded = encode_plutus_data(&data);
-        let (decoded, consumed) = decode_cbor_bytes(&encoded).unwrap();
-        prop_assert_eq!(decoded, bytes);
-        prop_assert_eq!(consumed, encoded.len());
+        // <=64 stays a single definite bstr; >64 becomes the chunked indefinite
+        // form. Either way the canonical decoder reconstructs the exact bytes.
+        if bytes.len() > 64 {
+            prop_assert_eq!(encoded[0], 0x5f, "leaf >64 must be chunked (indefinite)");
+            prop_assert_eq!(*encoded.last().unwrap(), 0xff);
+        } else {
+            prop_assert_ne!(encoded[0], 0x5f, "leaf <=64 must stay single definite");
+        }
+        let decoded = decode_plutus_data_cbor(&encoded).unwrap();
+        prop_assert_eq!(decoded, PlutusData::Bytes(bytes));
     }
 
     // -----------------------------------------------------------------------
