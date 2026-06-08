@@ -163,8 +163,15 @@ pub fn eval_resolved_redeemer(
         Some(applied) => BudgetTracker::with_applied(initial_budget, applied),
         None => BudgetTracker::new(initial_budget),
     };
-    let value = evaluate_with_budget(applied_term, &mut tracker, Some(&mut trace_log)).map_err(
-        |error| {
+    // Select the Plutus `BuiltinSemanticsVariant` ONCE from the script's
+    // language + the block's major protocol version. This governs the small
+    // set of builtins whose RESULT changed across protocol versions — today
+    // only `consByteString` (lenient `fromIntegral`/mod-256 for PlutusV1/V2 at
+    // every PV; strict `Word8` range-check for PlutusV3). See
+    // [`SemanticsVariant::for_script`].
+    let variant = crate::builtin::semantics::SemanticsVariant::for_script(r.language, major_pv);
+    let value = evaluate_with_budget(applied_term, &mut tracker, Some(&mut trace_log), variant)
+        .map_err(|error| {
             // If any trace strings were emitted before the error, surface
             // them in the richer `ScriptEvaluationFailedWithLogs` variant
             // so callers can render "Trace logs: [...]" before the error
@@ -179,8 +186,7 @@ pub fn eval_resolved_redeemer(
                     logs: trace_log.clone(),
                 }
             }
-        },
-    )?;
+        })?;
 
     // 5. Classify the CEK result.
     //
