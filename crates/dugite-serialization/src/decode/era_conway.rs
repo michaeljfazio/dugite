@@ -1047,8 +1047,7 @@ fn read_map_tx_output(r: &mut Reader<'_>) -> Result<TransactionOutput, Serializa
     let mut datum = OutputDatum::None;
     let mut script_ref = None;
 
-    r.for_each_map_entry(|r| {
-        let key = r.read_uint()?;
+    r.for_each_field_entry(|r, key| {
         match key {
             0 => {
                 address_bytes = Some(r.read_bytes_owned()?);
@@ -2184,8 +2183,7 @@ fn decode_conway_witness_set(
     let mut raw_redeemers_cbor: Option<Vec<u8>> = None;
     let mut raw_plutus_data_cbor: Option<Vec<u8>> = None;
 
-    r.for_each_map_entry(|r| {
-        let key = r.read_uint()?;
+    r.for_each_field_entry(|r, key| {
         match key {
             0 => {
                 // vkey_witnesses: nonempty_set<vkeywitness> — tag(258) in Conway.
@@ -3332,6 +3330,71 @@ mod tests {
             matches!(result, Err(SerializationError::CborDecode(_))),
             "unknown witness-set key must be rejected, got {result:?}"
         );
+    }
+
+    // ── SparseKeyed duplicate field-key rejection (backlog #31-D) ──────────────
+
+    #[test]
+    fn conway_witness_set_duplicate_field_key_rejected() {
+        // map(2) { 0: [], 0: [] } — field key 0 (vkey_witnesses) twice.
+        // Haskell decodeSparseKeyed tracks Set Word seen keys and hard-fails
+        // the second occurrence (un-gated at every PV).
+        let empty_set = vec![0x80]; // array(0)
+        let mut data = vec![0xa2]; // map(2)
+        data.extend(cbor_uint(0));
+        data.extend(&empty_set);
+        data.extend(cbor_uint(0));
+        data.extend(&empty_set);
+
+        let mut r = Reader::new(&data);
+        let result = decode_conway_witness_set(&mut r);
+        assert!(
+            matches!(result, Err(SerializationError::CborDecode(_))),
+            "duplicate witness-set field key must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn map_tx_output_duplicate_field_key_rejected() {
+        // map(3) { 0: addr, 1: 5, 1: 7 } — field key 1 (value) twice.
+        let addr = {
+            let mut a = vec![0x60u8]; // enterprise, mainnet
+            a.extend([0x11u8; 28]);
+            a
+        };
+        let mut data = vec![0xa3]; // map(3)
+        data.extend(cbor_uint(0));
+        data.extend(cbor_bytes(&addr));
+        data.extend(cbor_uint(1));
+        data.extend(cbor_uint(5));
+        data.extend(cbor_uint(1));
+        data.extend(cbor_uint(7));
+
+        let mut r = Reader::new(&data);
+        let result = read_map_tx_output(&mut r);
+        assert!(
+            matches!(result, Err(SerializationError::CborDecode(_))),
+            "duplicate map-TxOut field key must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn map_tx_output_unique_field_keys_ok() {
+        // map(2) { 0: addr, 1: 5 } — sanity that the strict path still decodes.
+        let addr = {
+            let mut a = vec![0x60u8];
+            a.extend([0x11u8; 28]);
+            a
+        };
+        let mut data = vec![0xa2]; // map(2)
+        data.extend(cbor_uint(0));
+        data.extend(cbor_bytes(&addr));
+        data.extend(cbor_uint(1));
+        data.extend(cbor_uint(5));
+
+        let mut r = Reader::new(&data);
+        let out = read_map_tx_output(&mut r).expect("unique map-TxOut keys decode");
+        assert_eq!(out.value.coin.0, 5);
     }
 
     // ── Conway PV9+ Set duplicate rejection (backlog #31-C) ────────────────────

@@ -421,6 +421,64 @@ impl<'b> Reader<'b> {
         Ok(())
     }
 
+    /// Iterate the entries of a SparseKeyed *field map* (definite or indefinite),
+    /// reading the uint field key for each entry and **rejecting a duplicate
+    /// field key**.
+    ///
+    /// Unlike [`for_each_map_entry`](Self::for_each_map_entry) (last-wins,
+    /// lenient), this mirrors Haskell cardano-ledger's `decodeSparseKeyed` /
+    /// `applyField`, which tracks the set of seen field keys (`Set Word`) and
+    /// hard-fails on the first repeat (`if Set.member key seen then
+    /// duplicateKey`). That duplicate-field-key rejection is **un-gated** (no
+    /// `ifDecoderVersionAtLeast`), so it applies at every protocol version,
+    /// including pre-Conway and live PV11.
+    ///
+    /// The key passed to `entry` is the decoded uint; the helper has already
+    /// consumed it, so the closure consumes only the value. Wire order is
+    /// preserved and the first duplicate aborts the decode.
+    ///
+    /// Only the *field* maps of SparseKeyed structures (tx body, witness set,
+    /// map-form TxOut, aux-data tag-259 inner map) get this strictness. The
+    /// canonical last-wins-lenient maps (transaction metadata label maps,
+    /// `Metadatum::Map`, the block aux-data IntMap) must keep using
+    /// [`for_each_map_entry`](Self::for_each_map_entry).
+    pub fn for_each_field_entry<F>(&mut self, mut entry: F) -> Result<(), SerializationError>
+    where
+        F: FnMut(&mut Reader<'b>, u64) -> Result<(), SerializationError>,
+    {
+        let mut seen = std::collections::HashSet::<u64>::new();
+        let len = self.read_map_header()?;
+        match len {
+            Some(n) => {
+                for _ in 0..n {
+                    let key = self.read_uint()?;
+                    if !seen.insert(key) {
+                        return Err(SerializationError::CborDecode(format!(
+                            "duplicate field key {key}"
+                        )));
+                    }
+                    entry(self, key)?;
+                }
+            }
+            None => loop {
+                let ty = self.peek_major()?;
+                if ty == Type::Break {
+                    let pos = self.inner.position();
+                    self.inner.set_position(pos + 1);
+                    break;
+                }
+                let key = self.read_uint()?;
+                if !seen.insert(key) {
+                    return Err(SerializationError::CborDecode(format!(
+                        "duplicate field key {key}"
+                    )));
+                }
+                entry(self, key)?;
+            },
+        }
+        Ok(())
+    }
+
     /// Read a definite- or indefinite-length CBOR map, decoding each key-value pair.
     ///
     /// Entries are returned in the order they appear in the input; no deduplication
@@ -1620,5 +1678,120 @@ mod tests {
         assert!(p1 < p2);
         assert!(p2 < p3);
         assert_eq!(p3, data.len());
+    }
+
+    // -----------------------------------------------------------------------
+    // for_each_field_entry — SparseKeyed dup-field-key reject (#31-D)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn for_each_field_entry_unique_keys_ok_wire_order() {
+        // { 0 => 10, 2 => 12, 1 => 11 } — non-sorted to assert wire order.
+        let mut data = cbor_map_hdr(3);
+        data.extend(cbor_uint(0));
+        data.extend(cbor_uint(10));
+        data.extend(cbor_uint(2));
+        data.extend(cbor_uint(12));
+        data.extend(cbor_uint(1));
+        data.extend(cbor_uint(11));
+        let mut r = Reader::new(&data);
+        let mut seen = Vec::new();
+        r.for_each_field_entry(|r, key| {
+            let v = r.read_uint()?;
+            seen.push((key, v));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, vec![(0, 10), (2, 12), (1, 11)]);
+    }
+
+    #[test]
+    fn for_each_field_entry_empty_ok() {
+        let data = cbor_map_hdr(0);
+        let mut r = Reader::new(&data);
+        let mut count = 0;
+        r.for_each_field_entry(|_r, _key| {
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn for_each_field_entry_duplicate_key_err() {
+        // { 0 => 10, 1 => 11, 1 => 12 } — second key 1 must abort.
+        let mut data = cbor_map_hdr(3);
+        data.extend(cbor_uint(0));
+        data.extend(cbor_uint(10));
+        data.extend(cbor_uint(1));
+        data.extend(cbor_uint(11));
+        data.extend(cbor_uint(1));
+        data.extend(cbor_uint(12));
+        let mut r = Reader::new(&data);
+        let res = r.for_each_field_entry(|r, _key| {
+            r.read_uint()?;
+            Ok(())
+        });
+        assert!(matches!(res, Err(SerializationError::CborDecode(_))));
+    }
+
+    #[test]
+    fn for_each_field_entry_indefinite_unique_ok() {
+        // 0xbf { 0 => 10, 1 => 11 } 0xff
+        let mut data = vec![0xbf];
+        data.extend(cbor_uint(0));
+        data.extend(cbor_uint(10));
+        data.extend(cbor_uint(1));
+        data.extend(cbor_uint(11));
+        data.push(0xff);
+        let mut r = Reader::new(&data);
+        let mut keys = Vec::new();
+        r.for_each_field_entry(|r, key| {
+            r.read_uint()?;
+            keys.push(key);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(keys, vec![0, 1]);
+    }
+
+    #[test]
+    fn for_each_field_entry_indefinite_duplicate_key_err() {
+        // 0xbf { 0 => 10, 0 => 11 } 0xff — dup key 0 must abort.
+        let mut data = vec![0xbf];
+        data.extend(cbor_uint(0));
+        data.extend(cbor_uint(10));
+        data.extend(cbor_uint(0));
+        data.extend(cbor_uint(11));
+        data.push(0xff);
+        let mut r = Reader::new(&data);
+        let res = r.for_each_field_entry(|r, _key| {
+            r.read_uint()?;
+            Ok(())
+        });
+        assert!(matches!(res, Err(SerializationError::CborDecode(_))));
+    }
+
+    #[test]
+    fn for_each_map_entry_duplicate_key_still_ok_lenient() {
+        // Guard: for_each_map_entry stays LENIENT (last-wins). The same dup
+        // payload that for_each_field_entry rejects must NOT error here, so
+        // the canonical lenient maps (metadata, Metadatum::Map, aux IntMap)
+        // keep accepting Haskell-accepted duplicates.
+        let mut data = cbor_map_hdr(2);
+        data.extend(cbor_uint(7));
+        data.extend(cbor_uint(10));
+        data.extend(cbor_uint(7));
+        data.extend(cbor_uint(11));
+        let mut r = Reader::new(&data);
+        let mut last = 0;
+        r.for_each_map_entry(|r| {
+            let _k = r.read_uint()?;
+            last = r.read_uint()?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(last, 11);
     }
 }

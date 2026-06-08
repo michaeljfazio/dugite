@@ -1385,8 +1385,7 @@ pub(crate) fn decode_alonzo_auxiliary_data(
             // Now we have a map — handle BOTH definite and indefinite
             // length (sibling of #673 — cn 11.0.1 emits indef-length on
             // preview for some Babbage blocks).
-            aux_r.for_each_map_entry(|r| {
-                let k = r.read_uint()?;
+            aux_r.for_each_field_entry(|r, k| {
                 match k {
                     0 => {
                         metadata = decode_metadata_map(r)?;
@@ -1664,6 +1663,67 @@ mod tests {
         // The lenient reader keeps both physical elements (no dedup, no fail).
         assert_eq!(owners.len(), 2);
         assert_eq!(owners[0], owners[1]);
+    }
+
+    // ── SparseKeyed duplicate field-key rejection (backlog #31-D) ──────────────
+
+    /// tag(259) aux-data field map rejects a duplicate field key.
+    ///
+    /// `decodeSparseKeyed` tracks the seen field keys (`Set Word`) and
+    /// hard-fails the second occurrence; this rejection is un-gated.
+    #[test]
+    fn alonzo_tag259_aux_duplicate_field_key_rejected() {
+        // tag(259) { 0: {}, 0: {} } — field key 0 (metadata) twice.
+        let mut data = vec![0xd9, 0x01, 0x03]; // tag 259
+        data.extend(vec![0xa2]); // map(2)
+        data.extend(cbor_uint(0));
+        data.extend(cbor_map0()); // empty metadata map
+        data.extend(cbor_uint(0));
+        data.extend(cbor_map0());
+
+        let mut r = Reader::new(&data);
+        let result = decode_alonzo_auxiliary_data(&mut r);
+        assert!(
+            matches!(result, Err(SerializationError::CborDecode(_))),
+            "duplicate tag-259 aux field key must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn alonzo_tag259_aux_unique_field_keys_ok() {
+        // tag(259) { 0: { 5 => 7 } } — sanity the strict path still decodes.
+        let mut metadata_map = vec![0xa1]; // map(1)
+        metadata_map.extend(cbor_uint(5));
+        metadata_map.extend(cbor_uint(7));
+
+        let mut data = vec![0xd9, 0x01, 0x03]; // tag 259
+        data.extend(vec![0xa1]); // map(1)
+        data.extend(cbor_uint(0));
+        data.extend(&metadata_map);
+
+        let mut r = Reader::new(&data);
+        let aux = decode_alonzo_auxiliary_data(&mut r).expect("unique aux field keys decode");
+        assert_eq!(aux.metadata.len(), 1);
+    }
+
+    /// Metadata LABEL maps stay LENIENT (last-wins) — metadata is the canonical
+    /// lenient class. A duplicate label key must NOT error here, mirroring the
+    /// Haskell `Map.fromList`/last-wins behaviour. This pins that the #31-D
+    /// switch to strict touched ONLY the SparseKeyed field maps.
+    #[test]
+    fn alonzo_metadata_label_map_accepts_duplicate_lenient() {
+        // map(2) { 5 => 7, 5 => 9 } — the SAME label twice.
+        let mut data = vec![0xa2]; // map(2)
+        data.extend(cbor_uint(5));
+        data.extend(cbor_uint(7));
+        data.extend(cbor_uint(5));
+        data.extend(cbor_uint(9));
+
+        let mut r = Reader::new(&data);
+        let md = decode_metadata_map(&mut r)
+            .expect("metadata label map must accept duplicate label (lenient last-wins)");
+        // Last-wins: BTreeMap keeps the final value, no fail.
+        assert_eq!(md.get(&5), Some(&TransactionMetadatum::Int(9i128)));
     }
 
     // -----------------------------------------------------------------------
