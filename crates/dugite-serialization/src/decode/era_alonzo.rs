@@ -500,27 +500,33 @@ pub(crate) fn decode_alonzo_tx_body(
                 // mint (Mary+): { policy_id => { asset_name => int } }
                 mint = read_mint_map(r)?;
             }
-            11 => {
-                // script_data_hash (Alonzo+)
+            11 if matches!(era, Era::Alonzo) => {
+                // script_data_hash (Alonzo-only; Allegra/Mary reject)
                 script_data_hash = Some(read_hash32(r)?);
             }
-            13 => {
-                // collateral (Alonzo+)
+            13 if matches!(era, Era::Alonzo) => {
+                // collateral (Alonzo-only; Allegra/Mary reject)
                 collateral = r.read_array(read_tx_input)?;
             }
-            14 => {
-                // required_signers (Alonzo+): [* addr_keyhash(28)] → padded to Hash32
+            14 if matches!(era, Era::Alonzo) => {
+                // required_signers (Alonzo-only): [* addr_keyhash(28)] → padded to Hash32
                 required_signers = r.read_array(|r| {
                     let h28 = read_hash28(r)?;
                     Ok(h28.to_hash32_padded())
                 })?;
             }
-            15 => {
-                // network_id (Alonzo+)
+            15 if matches!(era, Era::Alonzo) => {
+                // network_id (Alonzo-only; Allegra/Mary reject)
                 network_id = Some(read_network_id(r)?);
             }
             _ => {
-                r.skip()?;
+                // Unknown/out-of-era tx-body key — HARD REJECT, per upstream
+                // per-era SparseKeyed bodyFields catch-all (invalidField n ->
+                // cborError). Allegra/Mary know 0..9; Alonzo adds 11,13,14,15
+                // (NOT 10,12). See #31-E.
+                return Err(SerializationError::CborDecode(format!(
+                    "{era:?} tx body: unknown/invalid key {key}"
+                )));
             }
         }
     }
@@ -1949,6 +1955,130 @@ mod tests {
             raw_sdh.value.script_data_hash,
             Some(Hash32::from_bytes(sdh))
         );
+    }
+
+    // ── #31-E: per-era unknown/out-of-era tx-body key rejection ─────────────
+    // decode_alonzo_tx_body is SHARED across Allegra/Mary/Alonzo (era threaded).
+    // Allegra/Mary know {0..9}; Alonzo adds {11,13,14,15} (NOT 10,12,16+).
+
+    /// Helper: minimal map(2) tx body {0:[], <key>:0} for unknown-key probes.
+    fn alonzo_body_with_extra_key(key: u64) -> Vec<u8> {
+        let mut tb = vec![0xa2]; // map(2)
+        tb.extend(cbor_uint(0));
+        tb.push(0x80); // inputs []
+        tb.extend(cbor_uint(key));
+        tb.extend(cbor_uint(0)); // arbitrary value
+        tb
+    }
+
+    #[test]
+    fn allegra_body_key_11_rejected() {
+        // Key 11 (script_data_hash) is Alonzo-only — Allegra must reject it.
+        let tb = alonzo_body_with_extra_key(11);
+        let result = KeepRaw::parse_with(&mut Reader::new(&tb), |r| {
+            decode_alonzo_tx_body(r, Era::Allegra)
+        });
+        assert!(
+            result.is_err(),
+            "Allegra tx-body key 11 must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn allegra_body_key_13_rejected() {
+        // Key 13 (collateral) is Alonzo-only — Allegra must reject it.
+        let tb = alonzo_body_with_extra_key(13);
+        let result = KeepRaw::parse_with(&mut Reader::new(&tb), |r| {
+            decode_alonzo_tx_body(r, Era::Allegra)
+        });
+        assert!(
+            result.is_err(),
+            "Allegra tx-body key 13 must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn mary_body_key_11_rejected() {
+        // Key 11 (script_data_hash) is Alonzo-only — Mary must reject it.
+        let tb = alonzo_body_with_extra_key(11);
+        let result = KeepRaw::parse_with(&mut Reader::new(&tb), |r| {
+            decode_alonzo_tx_body(r, Era::Mary)
+        });
+        assert!(
+            result.is_err(),
+            "Mary tx-body key 11 must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn alonzo_body_key_10_rejected() {
+        // Key 10 is NOT in the Alonzo bodyFields domain — must be rejected.
+        let tb = alonzo_body_with_extra_key(10);
+        let result = KeepRaw::parse_with(&mut Reader::new(&tb), |r| {
+            decode_alonzo_tx_body(r, Era::Alonzo)
+        });
+        assert!(
+            result.is_err(),
+            "Alonzo tx-body key 10 must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn alonzo_body_key_12_rejected() {
+        // Key 12 is NOT in the Alonzo bodyFields domain — must be rejected.
+        let tb = alonzo_body_with_extra_key(12);
+        let result = KeepRaw::parse_with(&mut Reader::new(&tb), |r| {
+            decode_alonzo_tx_body(r, Era::Alonzo)
+        });
+        assert!(
+            result.is_err(),
+            "Alonzo tx-body key 12 must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn alonzo_body_key_16_rejected() {
+        // Key 16 (collateral_return) is Babbage+ — Alonzo must reject it.
+        let tb = alonzo_body_with_extra_key(16);
+        let result = KeepRaw::parse_with(&mut Reader::new(&tb), |r| {
+            decode_alonzo_tx_body(r, Era::Alonzo)
+        });
+        assert!(
+            result.is_err(),
+            "Alonzo tx-body key 16 must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn alonzo_body_key_15_accepted() {
+        // Key 15 (network_id) is the highest valid Alonzo key.
+        let mut tb = vec![0xa2]; // map(2)
+        tb.extend(cbor_uint(0));
+        tb.push(0x80); // inputs []
+        tb.extend(cbor_uint(15));
+        tb.extend(cbor_uint(1)); // network_id = mainnet
+        let raw = KeepRaw::parse_with(&mut Reader::new(&tb), |r| {
+            decode_alonzo_tx_body(r, Era::Alonzo)
+        })
+        .unwrap();
+        assert_eq!(raw.value.network_id, Some(1));
+    }
+
+    #[test]
+    fn alonzo_rejects_babbage_keys_16_17_18() {
+        // Cross-era discriminator: keys 16/17/18 (Babbage collateral_return /
+        // total_collateral / reference_inputs) MUST be rejected by Alonzo even
+        // though Babbage accepts them. See babbage_accepts_keys_16_17_18.
+        for key in [16u64, 17, 18] {
+            let tb = alonzo_body_with_extra_key(key);
+            let result = KeepRaw::parse_with(&mut Reader::new(&tb), |r| {
+                decode_alonzo_tx_body(r, Era::Alonzo)
+            });
+            assert!(
+                result.is_err(),
+                "Alonzo tx-body key {key} must be rejected, got {result:?}"
+            );
+        }
     }
 
     #[test]

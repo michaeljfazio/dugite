@@ -5,8 +5,9 @@
 //! to Shelley/Allegra (4 elements, no `invalid_transactions` field).
 //!
 //! This module delegates to the Alonzo family decoder with `has_invalid_txs = false`
-//! and `era = Era::Mary`. All tx body keys 0–9 are decoded; keys 11+ are
-//! silently skipped for forward compatibility.
+//! and `era = Era::Mary`. Mary knows tx body keys 0–9; any out-of-era key
+//! (e.g. Alonzo's 11/13/14/15, or 10+) is HARD-REJECTED, mirroring Haskell
+//! cardano-ledger's per-era SparseKeyed `bodyFields` catch-all. See #31-E.
 
 use crate::decode::era_alonzo::{decode_alonzo_family_block, DecodeMode};
 use crate::error::SerializationError;

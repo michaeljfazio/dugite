@@ -499,7 +499,13 @@ fn decode_babbage_tx_body(r: &mut Reader<'_>) -> Result<TransactionBody, Seriali
                 reference_inputs = r.read_array(read_tx_input)?;
             }
             _ => {
-                r.skip()?;
+                // Unknown/out-of-era tx-body key — HARD REJECT, per upstream
+                // Babbage SparseKeyed bodyFields catch-all (invalidField n ->
+                // cborError). Babbage knows {0..9,11,13..18}; keys 10,12 are
+                // NOT valid and are rejected here. See #31-E.
+                return Err(SerializationError::CborDecode(format!(
+                    "Babbage tx body: unknown/invalid key {key}"
+                )));
             }
         }
     }
@@ -1307,6 +1313,113 @@ mod tests {
             raw.value.reference_inputs[0].transaction_id.as_bytes(),
             &tx_id
         );
+    }
+
+    // ── #31-E: Babbage unknown/out-of-era tx-body key rejection ─────────────
+    // Babbage knows {0..9,11,13..18}; keys 10,12 and 19+ are NOT valid.
+
+    /// Helper: minimal map(2) tx body {0:[], <key>:0} for unknown-key probes.
+    fn babbage_body_with_extra_key(key: u64) -> Vec<u8> {
+        let mut tb = vec![0xa2]; // map(2)
+        tb.extend(cbor_uint(0));
+        tb.push(0x80); // inputs []
+        tb.extend(cbor_uint(key));
+        tb.extend(cbor_uint(0)); // arbitrary value
+        tb
+    }
+
+    #[test]
+    fn babbage_body_key_10_rejected() {
+        // Key 10 is NOT in the Babbage bodyFields domain — must be rejected.
+        let tb = babbage_body_with_extra_key(10);
+        let result = KeepRaw::parse_with(&mut Reader::new(&tb), |r| decode_babbage_tx_body(r));
+        assert!(
+            result.is_err(),
+            "Babbage tx-body key 10 must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn babbage_body_key_12_rejected() {
+        // Key 12 is NOT in the Babbage bodyFields domain — must be rejected.
+        let tb = babbage_body_with_extra_key(12);
+        let result = KeepRaw::parse_with(&mut Reader::new(&tb), |r| decode_babbage_tx_body(r));
+        assert!(
+            result.is_err(),
+            "Babbage tx-body key 12 must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn babbage_body_key_19_rejected() {
+        // Key 19 is above the Babbage bodyFields domain — must be rejected.
+        let tb = babbage_body_with_extra_key(19);
+        let result = KeepRaw::parse_with(&mut Reader::new(&tb), |r| decode_babbage_tx_body(r));
+        assert!(
+            result.is_err(),
+            "Babbage tx-body key 19 must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn babbage_body_key_18_accepted() {
+        // Key 18 (reference_inputs) is the highest valid Babbage key.
+        let tx_id = [0xbb; 32];
+        let mut inp_cbor = vec![0x82]; // array(2)
+        inp_cbor.extend(cbor_bytes(&tx_id));
+        inp_cbor.extend(cbor_uint(0));
+        let mut ref_arr = vec![0x81]; // array(1)
+        ref_arr.extend(&inp_cbor);
+
+        let mut tb = vec![0xa2]; // map(2)
+        tb.extend(cbor_uint(0));
+        tb.push(0x80); // inputs []
+        tb.extend(cbor_uint(18));
+        tb.extend(&ref_arr);
+
+        let raw =
+            KeepRaw::parse_with(&mut Reader::new(&tb), |r| decode_babbage_tx_body(r)).unwrap();
+        assert_eq!(raw.value.reference_inputs.len(), 1);
+    }
+
+    #[test]
+    fn babbage_accepts_keys_16_17_18() {
+        // Cross-era discriminator: Babbage ACCEPTS keys 16/17/18 while Alonzo
+        // rejects them (see era_alonzo::alonzo_rejects_babbage_keys_16_17_18).
+        // 16: collateral_return (post-Alonzo map output {0:addr,1:coin}).
+        let addr: Vec<u8> = {
+            let mut v = vec![0x60]; // enterprise testnet header
+            v.extend_from_slice(&[0u8; 28]);
+            v
+        };
+        let mut cret = vec![0xa2]; // map(2)
+        cret.extend(cbor_uint(0));
+        cret.extend(cbor_bytes(&addr));
+        cret.extend(cbor_uint(1));
+        cret.extend(cbor_uint(1_000_000));
+
+        // 18: reference_inputs [* tx_input]
+        let mut inp = vec![0x82];
+        inp.extend(cbor_bytes(&[0xbb; 32]));
+        inp.extend(cbor_uint(0));
+        let mut ref_arr = vec![0x81];
+        ref_arr.extend(&inp);
+
+        let mut tb = vec![0xa4]; // map(4): inputs + 16 + 17 + 18
+        tb.extend(cbor_uint(0));
+        tb.push(0x80); // inputs []
+        tb.extend(cbor_uint(16));
+        tb.extend(&cret);
+        tb.extend(cbor_uint(17));
+        tb.extend(cbor_uint(2_000_000)); // total_collateral
+        tb.extend(cbor_uint(18));
+        tb.extend(&ref_arr);
+
+        let raw =
+            KeepRaw::parse_with(&mut Reader::new(&tb), |r| decode_babbage_tx_body(r)).unwrap();
+        assert!(raw.value.collateral_return.is_some());
+        assert_eq!(raw.value.total_collateral, Some(Lovelace(2_000_000)));
+        assert_eq!(raw.value.reference_inputs.len(), 1);
     }
 
     #[test]
