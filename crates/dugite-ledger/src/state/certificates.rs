@@ -617,19 +617,33 @@ impl LedgerState {
                 // MIR sub-rule of EPOCH.  See issue #631.
                 match target {
                     MIRTarget::StakeCredentials(creds) => {
+                        // Haskell `Cardano.Ledger.Shelley.Rules.Deleg.hs` `applyMIRCert`:
+                        //   pvMajor <= 4 (Shelley/Allegra/Mary): `Map.union credCoinMap' ir`
+                        //     — left-biased → later cert for same credential OVERWRITES (last-wins).
+                        //   pvMajor >  4 (Alonzo+): `Map.unionWith (<>) credCoinMap' ir`
+                        //     — additive: amounts for the same credential are summed.
+                        // Guard: `hardforkAlonzoAllowMIRTransfer pv = pvMajor pv > natVersion @4`
+                        let pv = self.epochs.protocol_params.protocol_version_major;
+                        let additive = pv > 4;
                         let pending = match source {
                             MIRSource::Reserves => &mut self.certs.pending_mir_reserves,
                             MIRSource::Treasury => &mut self.certs.pending_mir_treasury,
                         };
                         for (cred, amount) in creds {
                             let key = credential_to_hash(cred);
-                            let entry = pending.entry(key).or_insert(0i128);
-                            *entry += *amount as i128;
+                            if additive {
+                                let entry = pending.entry(key).or_insert(0i128);
+                                *entry += *amount as i128;
+                            } else {
+                                // Last-wins: overwrite any previous entry for this credential.
+                                pending.insert(key, *amount as i128);
+                            }
                             debug!(
-                                "MIR: pending {} lovelace from {:?} to {}",
+                                "MIR: pending {} lovelace from {:?} to {} ({})",
                                 amount,
                                 source,
-                                key.to_hex()
+                                key.to_hex(),
+                                if additive { "additive" } else { "last-wins" }
                             );
                         }
                     }
@@ -1806,6 +1820,144 @@ mod tests {
         assert!(
             result.is_err(),
             "apply_pending_mir must panic on a delta that exceeds the source pot"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 29a — MIR last-wins semantics for pre-Alonzo (pvMajor <= 4)
+    // -----------------------------------------------------------------------
+
+    /// Two MIR reserve certs for the same credential, pre-Alonzo (PV=4).
+    /// Per Haskell `applyMIRCert` (`Map.union` left-biased, processed in cert order):
+    /// the LAST cert's amount must win — earlier amounts are overwritten, NOT summed.
+    ///
+    /// cert 1: 500_000_000 lovelace (processed first → overwritten)
+    /// cert 2: 200_000_000 lovelace (processed second → wins)
+    /// expected reward credit = 200_000_000, NOT 700_000_000
+    #[test]
+    fn mir_last_wins_pre_alonzo() {
+        use dugite_primitives::transaction::{MIRSource, MIRTarget};
+
+        let mut state = make_state();
+        // Downgrade to Mary / protocol version 4 (pre-Alonzo).
+        state.epochs.protocol_params.protocol_version_major = 4;
+        let initial_reserves: u64 = 1_000_000_000_000;
+        state.epochs.reserves.0 = initial_reserves;
+
+        let cred = test_credential();
+        let key = credential_to_hash(&cred);
+        state.process_certificate(&Certificate::StakeRegistration(cred.clone()));
+
+        // First cert: 500_000_000 — must be overwritten by the second.
+        state.process_certificate(&Certificate::MoveInstantaneousRewards {
+            source: MIRSource::Reserves,
+            target: MIRTarget::StakeCredentials(vec![(cred.clone(), 500_000_000i64)]),
+        });
+        // Second cert: 200_000_000 — this one must win.
+        state.process_certificate(&Certificate::MoveInstantaneousRewards {
+            source: MIRSource::Reserves,
+            target: MIRTarget::StakeCredentials(vec![(cred, 200_000_000i64)]),
+        });
+        super::apply_pending_mir(&mut state.certs, &mut state.epochs);
+
+        let balance = state
+            .certs
+            .reward_accounts
+            .get(&key)
+            .copied()
+            .unwrap_or(Lovelace(0));
+        assert_eq!(
+            balance.0, 200_000_000,
+            "pre-Alonzo last-wins: reward must equal the LAST cert amount (200_000_000), not the sum (700_000_000)"
+        );
+        assert_eq!(
+            state.epochs.reserves.0,
+            initial_reserves - 200_000_000,
+            "pre-Alonzo last-wins: reserves must be debited by the LAST cert amount only"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 29b — MIR additive semantics for Alonzo+ (pvMajor >= 5)
+    // -----------------------------------------------------------------------
+
+    /// Two MIR reserve certs for the same credential, Alonzo+ (PV=6).
+    /// Per Haskell `applyMIRCert` (`Map.unionWith (<>)` additive):
+    /// both cert amounts are summed → 700_000_000.
+    #[test]
+    fn mir_additive_alonzo_plus() {
+        use dugite_primitives::transaction::{MIRSource, MIRTarget};
+
+        let mut state = make_state();
+        // Set to Alonzo+ protocol version 6.
+        state.epochs.protocol_params.protocol_version_major = 6;
+        let initial_reserves: u64 = 1_000_000_000_000;
+        state.epochs.reserves.0 = initial_reserves;
+
+        let cred = test_credential();
+        let key = credential_to_hash(&cred);
+        state.process_certificate(&Certificate::StakeRegistration(cred.clone()));
+
+        // First cert: 500_000_000.
+        state.process_certificate(&Certificate::MoveInstantaneousRewards {
+            source: MIRSource::Reserves,
+            target: MIRTarget::StakeCredentials(vec![(cred.clone(), 500_000_000i64)]),
+        });
+        // Second cert: 200_000_000.  Together they must sum to 700_000_000.
+        state.process_certificate(&Certificate::MoveInstantaneousRewards {
+            source: MIRSource::Reserves,
+            target: MIRTarget::StakeCredentials(vec![(cred, 200_000_000i64)]),
+        });
+        super::apply_pending_mir(&mut state.certs, &mut state.epochs);
+
+        let balance = state
+            .certs
+            .reward_accounts
+            .get(&key)
+            .copied()
+            .unwrap_or(Lovelace(0));
+        assert_eq!(
+            balance.0, 700_000_000,
+            "Alonzo+ additive: reward must equal the SUM of both cert amounts (700_000_000)"
+        );
+        assert_eq!(
+            state.epochs.reserves.0,
+            initial_reserves - 700_000_000,
+            "Alonzo+ additive: reserves must be debited by the full sum"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 29c — MIR to an unregistered credential is silently dropped
+    // -----------------------------------------------------------------------
+
+    /// A MIR cert for an UNregistered credential must not debit reserves and
+    /// must not panic.  `apply_pending_mir` only credits registered reward accounts.
+    #[test]
+    fn mir_unregistered_credential_dropped() {
+        use dugite_primitives::transaction::{MIRSource, MIRTarget};
+
+        let mut state = make_state();
+        // Use PV=4 (pre-Alonzo) — exercises last-wins path; same behaviour at any PV.
+        state.epochs.protocol_params.protocol_version_major = 4;
+        let initial_reserves: u64 = 1_000_000_000_000;
+        state.epochs.reserves.0 = initial_reserves;
+
+        // Intentionally do NOT register the credential.
+        let cred = test_credential();
+
+        state.process_certificate(&Certificate::MoveInstantaneousRewards {
+            source: MIRSource::Reserves,
+            target: MIRTarget::StakeCredentials(vec![(cred, 500_000_000i64)]),
+        });
+        // Must not panic.
+        super::apply_pending_mir(&mut state.certs, &mut state.epochs);
+
+        // Reserves must be unchanged — unregistered credential is filtered out
+        // by apply_pending_mir's registered-only loop.
+        assert_eq!(
+            state.epochs.reserves.0, initial_reserves,
+            "Reserves must not be debited when the MIR target is an unregistered credential"
         );
     }
 
