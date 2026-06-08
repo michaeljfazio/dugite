@@ -712,7 +712,19 @@ pub fn capture(
             minor: cur_pp.protocol_version_minor,
         },
         scalars: Scalars {
-            reserves: state.epochs.reserves.0,
+            // At the Shelley->Allegra boundary, `on_era_transition` has already
+            // credited the unredeemed-AVVM refund to `reserves` AND stashed the
+            // amount in `pending_avvm_return` (consumed later by the reward calc).
+            // Haskell's `cardano-cli debug log-epoch-state` / Koios report the
+            // PRE-AVVM reserves for the closing epoch (the refund lands at the
+            // start of the next epoch = the Allegra HF). Subtract the pending
+            // refund so the dumped scalar matches Haskell byte-exact. This is a
+            // no-op at every other boundary (`pending_avvm_return == 0`).
+            reserves: state
+                .epochs
+                .reserves
+                .0
+                .saturating_sub(state.epochs.pending_avvm_return),
             treasury: state.epochs.treasury.0,
             // #615f: the dump now fires PRE-boundary (see apply.rs), so
             // `state.utxo.epoch_fees` is the live accumulator for the
