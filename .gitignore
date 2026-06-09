@@ -59,3 +59,6 @@ reward-dumps-issue-481/
 reports/devnet-validate/report.json
 reports/devnet-validate/report.md
 testnet/local-devnet/evidence/
+.opencode
+*.pid
+epoch-dumps-*

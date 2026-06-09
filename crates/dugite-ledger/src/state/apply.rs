@@ -1363,9 +1363,30 @@ impl LedgerState {
         self.era = block.era;
 
         // Record this block's UTxO diff for rollback support.
-        self.utxo
-            .diff_seq
-            .push(block.slot(), *block.hash(), block_diff);
+        //
+        // Use `push_bounded` with `security_param` (k) as the cap, exactly as
+        // the Byron path does (line ~446 above).  The plain unbounded `push` was
+        // the root cause of the ~42 GB from-genesis replay OOM: across 6.8 M
+        // Shelley+ blocks the DiffSeq VecDeque grew without bound — ~4 KB per
+        // block × 6.8 M ≈ 27 GB in the seq alone, on top of the LSM UTxO store.
+        // Immutable blocks cannot be rolled back, so retaining more than k diffs
+        // is waste; a k-bounded window is exactly what Haskell's `DiffSeq`
+        // semantics require (see ouroboros-consensus `LedgerDB.V2`).
+        //
+        // Byte-exact safety: `push_bounded` only controls how many diffs are
+        // *retained* after the push; the state mutation itself (UTxO inserts /
+        // deletes, nonces, certs, etc.) already happened above and is unaffected.
+        // Rollback via `DiffSeq` only works within the k-window anyway, and the
+        // `LedgerSeq` layer (which also operates over k deltas) is the primary
+        // rollback mechanism.  Evicting the oldest diff merely stops us from
+        // being able to undo more than k blocks via the fast UTxO-diff path —
+        // which matches the Haskell invariant.
+        self.utxo.diff_seq.push_bounded(
+            block.slot(),
+            *block.hash(),
+            block_diff,
+            self.security_param as usize,
+        );
 
         trace!(
             slot = block.slot().0,
