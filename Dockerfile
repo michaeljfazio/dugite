@@ -2,7 +2,7 @@
 FROM rust:1.95-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libclang-dev clang pkg-config && \
+    libclang-dev clang pkg-config protoc && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
