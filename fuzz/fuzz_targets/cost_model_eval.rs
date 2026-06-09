@@ -87,6 +87,9 @@ impl UtxoLookup for EmptyUtxoSet {
 // Mainnet slot config used for time-conversion inside script contexts.
 const MAINNET_SLOT_CONFIG: (u64, u64, u32) = (1_596_059_091_000, 4_492_800, 1_000);
 
+// Conway protocol major version — selects V3 script semantics in the evaluator.
+const CONWAY_PROTOCOL_MAJOR: u32 = 10;
+
 // ---------------------------------------------------------------------------
 // Panic guards
 //
@@ -171,6 +174,7 @@ fuzz_target!(|data: &[u8]| {
                     None, // no cost model; CEK budget applied via FUZZ_BUDGET below
                     FUZZ_BUDGET,
                     &slot_config,
+                    CONWAY_PROTOCOL_MAJOR,
                 )
             }));
             // Only try the first era that successfully decodes.
