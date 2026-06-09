@@ -47,6 +47,15 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install protoc
+        run: |
+          if [[ "${{ matrix.os }}" == *"ubuntu"* ]]; then
+            sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          elif [[ "${{ matrix.os }}" == *"macos"* ]]; then
+            brew install protobuf
+          fi
+
+
       - name: Cache cargo
         uses: actions/cache@v5
         with:
