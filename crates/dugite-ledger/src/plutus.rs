@@ -31,6 +31,26 @@ pub enum PlutusError {
     CollectError(String),
 }
 
+impl PlutusError {
+    /// Whether this error is a phase-2 **collection/context** error
+    /// (Haskell `UtxosFailure (CollectErrors …)`) rather than a genuine
+    /// script-evaluation failure.
+    ///
+    /// Collection errors reject the transaction — and any block containing
+    /// it — regardless of the `is_valid` tag; only [`Self::EvalFailed`]
+    /// legitimises `is_valid = false` (#733/#734).  Missing-CBOR
+    /// infrastructure errors are collect-class: they must never be mistaken
+    /// for "scripts genuinely fail".
+    pub fn is_collect_error(&self) -> bool {
+        match self {
+            PlutusError::CollectError(_)
+            | PlutusError::MissingTxCbor
+            | PlutusError::MissingOutputCbor(_) => true,
+            PlutusError::EvalFailed(_) => false,
+        }
+    }
+}
+
 /// Recover a printable message from a `catch_unwind` panic payload. The payload
 /// is a `Box<dyn Any + Send>` whose concrete type is `&'static str` for `panic!`
 /// with a string literal, `String` for `panic!` with a formatted message, or

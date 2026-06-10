@@ -414,6 +414,27 @@ pub(crate) fn decode_phase_two_inputs(
         let input = dugite_serialization::decode_transaction_input(input_cbor)
             .map_err(|e| PhaseTwoError::UtxoDecode(format!("utxo #{idx} input: {e}")))?;
         let output = dugite_serialization::decode_transaction_output(output_era_id, output_cbor)
+            .or_else(|first_err| {
+                // Resolved UTxOs were validated when they entered the chain.
+                // A Conway-spending tx may consume an output CREATED
+                // pre-Conway whose raw bytes contain zero-quantity
+                // multiasset entries; Haskell decoded that output at
+                // creation time with prune semantics (decoder version < 9)
+                // and never re-decodes, so its in-memory Value carries no
+                // zeros.  Mirror that by retrying with the Babbage decoder
+                // (prune semantics, accepts both legacy and post-Alonzo
+                // output shapes) before failing — a spurious UtxoDecode
+                // here must never become a block-fatal CollectError
+                // (#730/#733).  Strictness for NEWLY CREATED outputs is
+                // enforced when the creating tx itself is decoded, not
+                // here.
+                if output_era_id >= 6 {
+                    dugite_serialization::decode_transaction_output(5, output_cbor)
+                        .map_err(|_| first_err)
+                } else {
+                    Err(first_err)
+                }
+            })
             .map_err(|e| PhaseTwoError::UtxoDecode(format!("utxo #{idx} output: {e}")))?;
         decoded_utxos.push((input, output, output_cbor.clone()));
     }
