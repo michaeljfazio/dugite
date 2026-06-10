@@ -2013,7 +2013,8 @@ mod tests {
             assert!(!app.tip_state().is_problem());
         }
 
-        // Row 4: sync < 99.90%, block_number NOT advancing => Stuck (red)
+        // Row 4: sync < 99.90%, block_number NOT advancing for the full
+        // no-advance window => Stuck (red)
         {
             let mut app = App::new();
             app.node_status = NodeStatus::Online;
@@ -2029,10 +2030,13 @@ mod tests {
                 ("dugite_tip_age_seconds", 57_610.0),
                 ("dugite_block_number", 1000.0),
             ]));
+            // Quiet polls alone are not enough — Stuck requires the full
+            // no-advance window (STUCK_AFTER) to elapse first.
+            app.set_stuck_after(std::time::Duration::ZERO);
             assert_eq!(
                 app.tip_state(),
                 TipState::Stuck,
-                "sync<99.9%, block not advancing => Stuck"
+                "sync<99.9%, block not advancing for the window => Stuck"
             );
             assert!(app.tip_state().is_problem());
         }
@@ -2066,7 +2070,7 @@ mod tests {
             ("dugite_tip_age_seconds", 50_000.0),
             ("dugite_block_number", 1.0),
         ]));
-        // Should be CatchingUp (block_number_advancing defaults to true).
+        // Should be CatchingUp (no-advance timer unset => reads as advancing).
         assert_eq!(
             app.tip_state(),
             TipState::CatchingUp,

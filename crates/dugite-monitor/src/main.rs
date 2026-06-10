@@ -1,7 +1,7 @@
 //! dugite-monitor — Terminal UI dashboard for the Dugite Cardano node.
 //!
 //! Polls the Dugite Prometheus endpoint (default http://localhost:12798/metrics)
-//! every 2 seconds and renders a real-time 5-panel dashboard:
+//! every second and renders a real-time 5-panel dashboard:
 //!
 //! - **Node**:         Role, network, version, era, uptime
 //! - **Chain**:        Epoch progress bar, block/slot/tip metrics, density, forks, tx counts
