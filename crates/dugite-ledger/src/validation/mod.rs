@@ -691,6 +691,18 @@ pub enum ValidationError {
     /// tag-mismatched txs.
     #[error("is_valid tag mismatch: declared={declared}, evaluated={evaluated}")]
     IsValidTagMismatch { declared: bool, evaluated: bool },
+    /// Phase-2 **collection/context** error — the script context could not be
+    /// built or its inputs collected: UTxO/cost-model decode failure, missing
+    /// script or datum, or validity-interval time translation past the
+    /// safe-zone horizon (`TimeTranslationPastHorizon`).
+    ///
+    /// Mirrors Haskell `UtxosFailure (CollectErrors …)` (Babbage/Conway),
+    /// raised by `collectTwoPhaseScriptInputs` BEFORE script evaluation and
+    /// rejecting the transaction **regardless** of the `is_valid` tag.
+    /// Unlike `ScriptFailed`, this never legitimises `is_valid = false`
+    /// (#733/#734).
+    #[error("phase-2 collection error (UtxosFailure CollectErrors): {0}")]
+    Phase2CollectError(String),
     #[error("Script-locked input at index {index} has no matching Spend redeemer")]
     MissingSpendRedeemer { index: u32 },
     /// A script-locked withdrawal or Plutus minting policy has no matching
@@ -1911,6 +1923,59 @@ pub enum VotingPeriod {
 /// The `utxo_set` parameter accepts anything that implements [`UtxoLookup`],
 /// including the standard on-chain `&UtxoSet` and the composite
 /// `CompositeUtxoView` used by the mempool validator for chained tx support.
+/// Decide the phase-2 admission outcome from the `is_valid` tag and the
+/// evaluator result, mirroring the Haskell UTXOS rule exactly (#733/#734):
+///
+/// * **Collection/context errors** (`CollectErrors`: decode failures, missing
+///   script/datum, past-horizon time translation, missing CBOR
+///   infrastructure) reject the tx for BOTH tag polarities — Haskell raises
+///   `UtxosFailure (CollectErrors …)` before any script is evaluated.
+/// * `is_valid = true` + script failure → `ScriptFailed`
+///   (Haskell `ValidationTagMismatch … FailedUnexpectedly`).
+/// * `is_valid = false` + all scripts pass → `IsValidTagMismatch`
+///   (Haskell `ValidationTagMismatch … PassedUnexpectedly`, the #522 class).
+/// * `is_valid = false` + genuine script failure → admitted (the legitimate
+///   collateral-consuming path).
+pub(crate) fn phase2_admission_error(
+    is_valid: bool,
+    eval_result: &Result<(), crate::plutus::PlutusError>,
+) -> Option<ValidationError> {
+    use crate::plutus::PlutusError;
+    match eval_result {
+        // Collection/context errors reject regardless of the tag.  The
+        // match is exhaustive on purpose: a new PlutusError variant must
+        // make a deliberate classification choice here.
+        Err(
+            e @ (PlutusError::CollectError(_)
+            | PlutusError::MissingTxCbor
+            | PlutusError::MissingOutputCbor(_)),
+        ) => Some(ValidationError::Phase2CollectError(e.to_string())),
+        Err(e @ PlutusError::EvalFailed(_)) => {
+            if is_valid {
+                // Tx claims scripts pass — they failed.
+                Some(ValidationError::ScriptFailed(e.to_string()))
+            } else {
+                // Both the tag and the evaluator agree the scripts fail —
+                // the legitimate is_valid=false path (collateral consumed
+                // at block apply).
+                None
+            }
+        }
+        Ok(()) => {
+            if is_valid {
+                None
+            } else {
+                // Tx claims scripts fail but they pass — the #522 "DoS
+                // class" attack vector (`TagMismatch PassedUnexpectedly`).
+                Some(ValidationError::IsValidTagMismatch {
+                    declared: false,
+                    evaluated: true,
+                })
+            }
+        }
+    }
+}
+
 pub fn validate_transaction(
     tx: &Transaction,
     utxo_set: &dyn UtxoLookup,
@@ -3627,31 +3692,14 @@ pub fn validate_transaction_with_pools(
                             sc,
                             params.protocol_version_major as u32,
                         );
-                        if tx.is_valid {
-                            // Tx claims scripts pass — reject if they actually fail.
-                            if let Err(e) = eval_result {
-                                errors.push(ValidationError::ScriptFailed(e.to_string()));
-                            }
-                        } else {
-                            // Tx claims scripts fail (is_valid=false) — reject if they
-                            // actually pass.  This is the "DoS-class" attack vector:
-                            // an attacker marks is_valid=false on a tx whose Plutus
-                            // script evaluates to True.  Cardano mempool (`applyTx`)
-                            // catches this with `ValidationTagMismatch`; we mirror
-                            // that check here so BPs never admit such txs.
-                            // Haskell rule: `Cardano.Ledger.Conway.Rules.Utxos`
-                            // predicate `ConwayUtxos`:
-                            //   IsValid True vs eval False → `TagMismatch False`
-                            //   IsValid False vs eval True → `TagMismatch True`
-                            if eval_result.is_ok() {
-                                errors.push(ValidationError::IsValidTagMismatch {
-                                    declared: false,
-                                    evaluated: true,
-                                });
-                            }
-                            // If eval also fails (both agree scripts fail), the
-                            // is_valid=false path is legitimate — collateral is
-                            // consumed at block apply time. No error here.
+                        // Decide the admission outcome from the (is_valid,
+                        // eval_result) matrix per the Haskell UTXOS rule —
+                        // collection errors reject for BOTH polarities,
+                        // only a genuine script failure legitimises
+                        // is_valid=false (#733/#734).  See
+                        // `phase2_admission_error` for the full matrix.
+                        if let Some(e) = phase2_admission_error(tx.is_valid, &eval_result) {
+                            errors.push(e);
                         }
                     }
                 }

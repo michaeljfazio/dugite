@@ -647,6 +647,11 @@ pub(crate) fn convert_validation_error(
         VE::IsValidTagMismatch { declared, evaluated } => {
             TxValidationError::IsValidTagMismatch { declared, evaluated }
         }
+        // Phase-2 collection/context errors (Haskell `UtxosFailure
+        // (CollectErrors …)` — e.g. TimeTranslationPastHorizon, strict UTxO
+        // decode) ride the ScriptFailed wire variant so the N2C reject
+        // reason carries the full message without a wire-format change.
+        VE::Phase2CollectError(reason) => TxValidationError::ScriptFailed { reason },
         VE::MissingSpendRedeemer { index } => TxValidationError::MissingSpendRedeemer { index },
         VE::RedeemerIndexOutOfRange { tag, index, max } => {
             TxValidationError::RedeemerIndexOutOfRange { tag, index, max: max as u32 }
