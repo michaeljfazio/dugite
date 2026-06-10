@@ -172,7 +172,25 @@ impl BlockFetchServer {
         // block_in_place / blocking_read pattern from exhausting the tokio
         // async worker thread pool when the Haskell relay is syncing rapidly
         // with pipelined batch requests.
-        let blocks = block_provider.get_blocks_in_range(from_slot, to_slot, MAX_BLOCKS_PER_BATCH);
+        let mut blocks =
+            block_provider.get_blocks_in_range(from_slot, to_slot, MAX_BLOCKS_PER_BATCH);
+
+        // Haskell BlockFetch ranges are inclusive by POINT, not by slot.  A
+        // Byron EBB shares its absolute slot with the first main block of
+        // the epoch, so the slot range may over-collect a same-slot sibling
+        // on either edge: trim leading blocks at `from_slot` that precede
+        // the requested `from` hash, and trailing blocks at `to_slot` that
+        // follow the requested `to` hash.
+        if let Point::Specific(s, h) = from {
+            while blocks.first().is_some_and(|(bs, bh, _)| bs == s && bh != h) {
+                blocks.remove(0);
+            }
+        }
+        if let Point::Specific(s, h) = to {
+            while blocks.last().is_some_and(|(bs, bh, _)| bs == s && bh != h) {
+                blocks.pop();
+            }
+        }
 
         if blocks.is_empty() {
             let no_blocks = encode_message(&BlockFetchMessage::MsgNoBlocks);
@@ -333,6 +351,143 @@ mod tests {
                 .find(|(s, _, _)| *s > after_slot)
                 .cloned()
         }
+
+        fn get_next_block_after_point(
+            &self,
+            slot: u64,
+            hash: &[u8; 32],
+        ) -> Option<(u64, [u8; 32], Vec<u8>)> {
+            if let Some(pos) = self
+                .blocks
+                .iter()
+                .position(|(s, h, _)| *s == slot && h == hash)
+            {
+                return self.blocks.get(pos + 1).cloned();
+            }
+            self.get_next_block_after_slot(slot)
+        }
+    }
+
+    /// Drive one MsgRequestRange against `provider` and collect the served
+    /// block bodies (empty when the server answers MsgNoBlocks).
+    async fn collect_range(provider: MockBlockProvider, from: Point, to: Point) -> Vec<Vec<u8>> {
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let handle =
+            tokio::spawn(async move { BlockFetchServer::run(&mut channel, &provider).await });
+
+        let req = encode_message(&BlockFetchMessage::MsgRequestRange { from, to });
+        ingress_tx.send(Bytes::from(req)).await.unwrap();
+
+        let mut blocks = Vec::new();
+        let (_, _, first) = egress_rx.recv().await.unwrap();
+        match decode_message(&first).unwrap() {
+            BlockFetchMessage::MsgNoBlocks => {}
+            BlockFetchMessage::MsgStartBatch => loop {
+                let (_, _, msg) = egress_rx.recv().await.unwrap();
+                match decode_message(&msg).unwrap() {
+                    BlockFetchMessage::MsgBlock(body) => blocks.push(body),
+                    BlockFetchMessage::MsgBatchDone => break,
+                    other => panic!("unexpected message in batch: {other:?}"),
+                }
+            },
+            other => panic!("unexpected first response: {other:?}"),
+        }
+
+        let done = encode_message(&BlockFetchMessage::MsgClientDone);
+        ingress_tx.send(Bytes::from(done)).await.unwrap();
+        handle.await.unwrap().unwrap();
+        blocks
+    }
+
+    /// Byron boundary pair: the EBB and the first main block of the epoch
+    /// share an absolute slot.  A range spanning the boundary must serve
+    /// BOTH blocks in chain order — slot-cursor iteration drops the second.
+    #[tokio::test]
+    async fn range_includes_both_same_slot_blocks() {
+        let pred = make_storage_block(7, &[0x10]);
+        let ebb = make_storage_block(7, &[0x20]);
+        let main = make_storage_block(7, &[0x30]);
+        let next = make_storage_block(7, &[0x40]);
+        let provider = MockBlockProvider {
+            blocks: vec![
+                (99, [0x01; 32], pred.clone()),
+                (100, [0x02; 32], ebb.clone()),
+                (100, [0x03; 32], main.clone()),
+                (101, [0x04; 32], next.clone()),
+            ],
+        };
+
+        let served = collect_range(
+            provider,
+            Point::Specific(99, [0x01; 32]),
+            Point::Specific(101, [0x04; 32]),
+        )
+        .await;
+
+        assert_eq!(
+            served,
+            vec![pred, ebb, main, next],
+            "range spanning a Byron boundary must include both same-slot blocks"
+        );
+    }
+
+    /// The `from` point is a specific block (slot + hash): when the range
+    /// starts at the main block of a same-slot EBB/main pair, the EBB must
+    /// NOT be served — Haskell ranges are inclusive by point, not by slot.
+    #[tokio::test]
+    async fn range_start_at_main_excludes_same_slot_ebb() {
+        let ebb = make_storage_block(7, &[0x20]);
+        let main = make_storage_block(7, &[0x30]);
+        let next = make_storage_block(7, &[0x40]);
+        let provider = MockBlockProvider {
+            blocks: vec![
+                (100, [0x02; 32], ebb),
+                (100, [0x03; 32], main.clone()),
+                (101, [0x04; 32], next.clone()),
+            ],
+        };
+
+        let served = collect_range(
+            provider,
+            Point::Specific(100, [0x03; 32]),
+            Point::Specific(101, [0x04; 32]),
+        )
+        .await;
+
+        assert_eq!(
+            served,
+            vec![main, next],
+            "range starting at the main block must not include the same-slot EBB"
+        );
+    }
+
+    /// The `to` point is a specific block: when the range ends at the EBB of
+    /// a same-slot pair, the main block at the same slot must NOT be served.
+    #[tokio::test]
+    async fn range_end_at_ebb_excludes_same_slot_main() {
+        let pred = make_storage_block(7, &[0x10]);
+        let ebb = make_storage_block(7, &[0x20]);
+        let main = make_storage_block(7, &[0x30]);
+        let provider = MockBlockProvider {
+            blocks: vec![
+                (99, [0x01; 32], pred.clone()),
+                (100, [0x02; 32], ebb.clone()),
+                (100, [0x03; 32], main),
+            ],
+        };
+
+        let served = collect_range(
+            provider,
+            Point::Specific(99, [0x01; 32]),
+            Point::Specific(100, [0x02; 32]),
+        )
+        .await;
+
+        assert_eq!(
+            served,
+            vec![pred, ebb],
+            "range ending at the EBB must not include the same-slot main block"
+        );
     }
 
     fn make_test_channel() -> (
