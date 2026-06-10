@@ -1,11 +1,18 @@
 # Cardano Haskell Oracle - Agent Memory
 
+## LoP / HistoricityCheck / Idling (ChainSync Client, Genesis)
+- [lop-historicity-chainsync.md](lop-historicity-chainsync.md) — Complete LoP bucket (capacity=100K, rate=500tok/s, Syncing-only), token grant condition (blockNo>kBestBlockNo), pause on MsgAwaitReply / resume on RollForward|RollBackward, EmptyBucket exception, HistoricityCheck (cutoff=37h = 3*2160*20+3600s, PreSyncing+Syncing only, HistoricityError), csIdling GSM CaughtUp gate, GDD lb vs ub idle semantics
+
+## LoE Chain Selection (Genesis Mode)
+- [loe-chain-selection.md](loe-chain-selection.md) — Complete LoE reference: LoE type, trimToLoE exact algorithm, GDD governor, sharedCandidatePrefix, setGetLoEFragment GSM-gating, copyToImmutableDB NOT gated, initial selection k-limit, Praos bypass, config keys
+
 ## ExtLedgerState Snapshot Format
 - [ext-ledger-state-snapshot-format.md](ext-ledger-state-snapshot-format.md) — Complete CBOR encoding of state file: snapshot wrapper array(2)[1,...], ExtLedgerState array(2), HeaderState array(2)[withOrigin,telescope], PraosState 8-field array, ShelleyLedgerState 4-field array, Nonce encoding, telescope lengths
 - [ledger-state-11-0-1-format-changes.md](ledger-state-11-0-1-format-changes.md) — Breaking format changes 10.6.2→11.0.1: spsAccountId array(2)[tag,hash28] (was bytes(29)), Peras field in ShelleyLedgerState array(4), psFutureStakePoolParams values changed type
 
 ## GDD — Genesis Density Disconnector
 - [gdd-genesis-density-disconnector.md](gdd-genesis-density-disconnector.md) — Complete GDD algorithm: genesis window=3k/f slots, integer density bounds (lower/upper), 4 disconnection guards, 1s rate limit, LoE enforcement in ChainSel (+k blocks), GSM state gating (only runs in Syncing)
+- [gdd-governor-deep-dive.md](gdd-governor-deep-dive.md) — EXHAUSTIVE: gddWatcher internals, Watcher fingerprint, sharedCandidatePrefix, all 4 densityDisconnect guards verbatim, GenesisWindow source (3k/f via computeStabilityWindow), DensityTooLow throwTo kill, LoE trimToLoE +k, CSJ jumper fragment visibility, GSM gating, startup wiring, all defaults
 
 ## DRep Pulser & Ratification
 - [drep-pulser-ratification.md](drep-pulser-ratification.md) — Complete pulser lifecycle: snapshot timing (end of EPOCH rule, post-transition state), pulse spreading (4k blocks, pulseSize=numAccounts/(4k)), RATIFY runs once at finishDRepPulser, results applied at NEXT epoch boundary
