@@ -118,8 +118,24 @@ impl LedgerState {
         // between VolatileDB.selected_chain and the ledger state — including
         // forged blocks being effectively orphaned from our own view (see
         // issue #439). The bypass is retained ONLY for `ApplyOnly` mode
-        // (used during startup chunk-file replay, where serialization
-        // roundtrip differences are the only legitimate cause of mismatch).
+        // (used during startup chunk-file replay, where the block source is
+        // our own trusted ImmutableDB).
+        //
+        // The one legitimate cause of a Byron prev_hash mismatch during replay
+        // is a MISSING EPOCH BOUNDARY BLOCK (EBB). On Byron, every epoch starts
+        // with a content-free EBB whose absolute slot is `epoch * epochLength`.
+        // When a regular block is also produced in the very first slot of that
+        // epoch (relative slot 0), the EBB and that regular block share the same
+        // absolute slot. dugite's ImmutableDB is keyed by slot, so on that
+        // collision only the regular block is retained and the EBB is dropped
+        // (mainnet Byron: 3 such boundaries — epochs 112, 135, 145). The first
+        // regular block of the epoch then declares `prev_hash = <EBB hash>`,
+        // which cannot match the last block of the previous epoch that the
+        // ledger holds. EBBs carry NO transactions and NO ledger state, so the
+        // dropped block does not affect UTxO/reserves/etc., and applying the
+        // canonical successor by sequence number is correct. (The decoder's
+        // Byron header hash is byte-exact — `decode_byron_main_block` hashes the
+        // captured raw header bytes, matching Haskell `headerHashAnnotated`.)
         // `ValidateAll` mode (used for every live block and every forged
         // block) must reject mismatches unconditionally.
         if self.tip.point != Point::Origin {
@@ -134,13 +150,17 @@ impl LedgerState {
                             tracing::info!(
                                 block_no = block.block_number().0,
                                 tip_block = self.tip.block_number.0,
+                                slot = block.slot().0,
                                 tip_hash = %tip_hash.to_hex(),
                                 got_prev = %block.prev_hash().to_hex(),
                                 era = ?block.era,
                                 "ApplyOnly (Byron): accepting block by sequence number despite \
-                                 hash mismatch — byron::BlockHead `OriginalHash` re-encodes \
-                                 instead of using raw bytes; Shelley+ uses raw bytes and cannot \
-                                 exhibit this mismatch. Tracked upstream in the in-house decoder."
+                                 prev_hash mismatch — the epoch-boundary block (EBB) for this \
+                                 epoch shares its absolute slot with this relative-slot-0 block \
+                                 and was dropped by the slot-keyed ImmutableDB, so this block's \
+                                 prev_hash points at the missing EBB. EBBs carry no ledger state, \
+                                 so applying the canonical successor is correct (issue: drop-EBB \
+                                 on rel-slot-0 collision)."
                             );
                         }
                         _ => {

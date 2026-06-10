@@ -1573,6 +1573,42 @@ impl Node {
         ) {
             let utxo_path = args.database_path.join("utxo-store");
             let utxo_cfg = &args.storage_config.utxo;
+
+            // ── From-genesis store-consistency guard ───────────────────────────
+            //
+            // When the ledger is at Origin (slot 0) we are about to seed genesis
+            // and replay the whole chain from block 0. The on-disk LSM UTxO store
+            // MUST start empty for that replay to reconstruct the correct UTxO
+            // set. If a previous sync left a populated `utxo-store/` on disk while
+            // the ledger snapshot was lost/reset (so we fell back to a chain-from-
+            // genesis replay via `init_fresh_ledger`), opening it as-is would let
+            // `attach_utxo_store` migrate the genesis UTxOs ON TOP of the stale
+            // tip set, and the replay then piles the Byron UTxOs on top of that.
+            // At the Byron→Shelley boundary `sumCoinUTxO` then ~doubles (genesis
+            // supply + stale tip supply), the reserves recompute
+            // (`maxLovelaceSupply - sumCoinUTxO`) goes negative → 0, and the first
+            // MIR reserves-debit underflows and panics. Wipe the stale store so
+            // the replay rebuilds the UTxO set from scratch. (A truly fresh node
+            // has no `utxo-store/` yet, so this is a no-op there.)
+            if ledger.tip.point == Point::Origin && utxo_path.exists() {
+                warn!(
+                    path = %utxo_path.display(),
+                    "Ledger is at origin (from-genesis replay) but a UTxO store exists on disk — \
+                     wiping it so the replay rebuilds the UTxO set from an empty store. A stale \
+                     store would otherwise inflate sumCoinUTxO at the Byron→Shelley boundary and \
+                     drive the reserves recompute to 0 (MIR debit underflow panic)."
+                );
+                if let Err(e) = std::fs::remove_dir_all(&utxo_path) {
+                    // Non-fatal: if the wipe fails the recompute tripwire in
+                    // `recompute_shelley_initial_reserves` still aborts loudly with
+                    // an actionable message rather than corrupting the ledger.
+                    warn!(
+                        path = %utxo_path.display(),
+                        "Failed to wipe stale UTxO store before from-genesis replay: {e}"
+                    );
+                }
+            }
+
             match dugite_ledger::utxo_store::UtxoStore::open_with_config(
                 &utxo_path,
                 utxo_cfg.memtable_size_mb,
