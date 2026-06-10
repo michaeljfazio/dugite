@@ -63,3 +63,4 @@ testnet/local-devnet/evidence/
 *.pid
 epoch-dumps-*
 .claude/scheduled_tasks.lock
+target-replay/
