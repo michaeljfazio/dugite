@@ -5,7 +5,7 @@
   "ByronGenesisHash": "83de1d7302569ad56cf9139a41e2e11346d4cb4a31c00142557b6ab3fa550761",
   "CheckpointsFile": "checkpoints.json",
   "CheckpointsFileHash": "bb5056ff1ced9d68dd99720695789664f6bf6f0cb02a4010df09b813e225ac51",
-  "ConsensusMode": "GenesisMode",
+  "ConsensusMode": "Genesis",
   "ConwayGenesisFile": "conway-genesis.json",
   "ConwayGenesisHash": "9cc5084f02e27210eacba47af0872e3dba8946ad9460b6072d793e1d2f3987ef",
   "ExperimentalHardForksEnabled": false,
