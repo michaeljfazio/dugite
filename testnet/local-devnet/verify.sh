@@ -147,10 +147,31 @@ p2_per_bp_attribution() {
             validator_only=1
         fi
     else
-        # Process already gone (post-soak verify) — fall back to the run
-        # script source which is the canonical recipe for this devnet.
-        if ! grep -q -- '--shelley-kes-key' "$SCRIPT_DIR/run.sh" 2>/dev/null; then
+        # Process already gone (post-soak verify, e.g. after stop.sh). The
+        # node's own startup log is authoritative: cardano-node emits
+        # `BlockForgingUpdate {enabled: DisabledBlockForging}` when launched
+        # without forging credentials. Prefer that over grepping run.sh —
+        # run.sh passes --shelley-kes-key to the DUGITE bp (pool1), so a
+        # whole-file grep matches that flag and falsely concludes cardano-bp
+        # forges, turning the intentional validator-only topology into a
+        # spurious p2 FAIL.
+        local cbp_log="$LD_LOGS/cardano-bp.log"
+        if [ -f "$cbp_log" ] && grep -q 'DisabledBlockForging' "$cbp_log" 2>/dev/null; then
             validator_only=1
+        elif [ -f "$cbp_log" ] && grep -q 'EnabledBlockForging' "$cbp_log" 2>/dev/null; then
+            validator_only=0
+        else
+            # No log signal — scope the run.sh check to the cardano-bp
+            # launch block (between the cardano-bp marker and the next
+            # node launch) rather than the whole script.
+            local cbp_block
+            cbp_block=$(awk '/cardano-bp ----/{c=1} c&&/dugite-bp ----/{c=0} c' \
+                "$SCRIPT_DIR/run.sh" 2>/dev/null)
+            if [ -n "$cbp_block" ]; then
+                echo "$cbp_block" | grep -q -- '--shelley-kes-key' || validator_only=1
+            elif ! grep -q -- '--shelley-kes-key' "$SCRIPT_DIR/run.sh" 2>/dev/null; then
+                validator_only=1
+            fi
         fi
     fi
 
