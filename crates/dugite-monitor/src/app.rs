@@ -34,20 +34,35 @@ pub enum NodeStatus {
     Offline,
 }
 
+/// How long `dugite_block_number` may stand still before the monitor calls
+/// the node Stuck (tip pill) / Stalled (header pill) during sync.
+///
+/// Block processing during heavy-era sync is legitimately bursty: a single
+/// Plutus-dense block can take > 1 s of apply time, and epoch boundaries
+/// (mark/set/go snapshots + reward calculation) pause the apply loop for
+/// 10–60 s.  Live mainnet measurement (2026-06-10) showed ~20 % of 1 s poll
+/// windows with zero advance during perfectly healthy sync, so a per-poll
+/// check flapped the UI red ~12×/min.  90 s rides out every legitimate
+/// pause with margin while still flagging genuine wedges well ahead of the
+/// 10-minute ecosystem alerting norm (IOG: `rate(blockNum[1m]) == 0` held
+/// 10 m) and the DugiteTipStale Prometheus rule (120 s sustained 5 m).
+pub const STUCK_AFTER: Duration = Duration::from_secs(90);
+
 /// Tip-age display state derived from the combination of sync progress,
-/// tip age, and whether the block number is advancing between polls.
+/// tip age, and whether the block number has advanced within the
+/// [`STUCK_AFTER`] window.
 ///
 /// This 4-state enum resolves the ambiguity where a freshly-imported
 /// Mithril snapshot starts with a legitimately large tip age that is
 /// *expected* (the node is catching up) versus the same large tip age
 /// when the node is at-tip but stuck (a real problem).
 ///
-/// | sync_progress | tip_age   | block advancing | State       |
-/// |---------------|-----------|-----------------|-------------|
-/// | ≥ 99.90 %     | < 120 s   | —               | AtTip       |
-/// | ≥ 99.90 %     | ≥ 120 s   | —               | Stale       |
-/// | < 99.90 %     | any       | yes             | CatchingUp  |
-/// | < 99.90 %     | any       | no              | Stuck       |
+/// | sync_progress | tip_age   | block advanced in last 90 s | State       |
+/// |---------------|-----------|-----------------------------|-------------|
+/// | ≥ 99.90 %     | < 120 s   | —                           | AtTip       |
+/// | ≥ 99.90 %     | ≥ 120 s   | —                           | Stale       |
+/// | < 99.90 %     | any       | yes                         | CatchingUp  |
+/// | < 99.90 %     | any       | no                          | Stuck       |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TipState {
     /// Node is at the chain tip and tip age is fresh (< 120 s). Green.
@@ -55,11 +70,13 @@ pub enum TipState {
     /// Node is at the chain tip but tip age is stale (≥ 120 s).
     /// This is a real problem — the node may be disconnected. Red.
     Stale,
-    /// Node is below 99.9 % sync and the block number is advancing
-    /// between polls. This is the expected catch-up state. Yellow.
+    /// Node is below 99.9 % sync and the block number has advanced within
+    /// the [`STUCK_AFTER`] window. This is the expected catch-up state —
+    /// including quiet windows from slow-applying blocks and epoch
+    /// boundaries. Yellow.
     CatchingUp,
     /// Node is below 99.9 % sync and the block number has **not**
-    /// advanced since the last poll. Possible stall. Red.
+    /// advanced for at least [`STUCK_AFTER`]. Probable stall. Red.
     Stuck,
 }
 
@@ -98,11 +115,13 @@ pub enum SyncState {
     /// Node is receiving and applying blocks from the network but has not yet
     /// reached the tip of the chain.
     Syncing,
-    /// Node appears stuck: tip age is high and progress is below 99.9%.
+    /// Node appears stuck: tip age is high (> 300 s), progress is below
+    /// 99.9 %, and the block number has not advanced for the full
+    /// [`STUCK_AFTER`] no-advance window.
     ///
-    /// The tip-age threshold is 300 seconds (5 minutes).  A node that is
-    /// simply slow may briefly appear stalled; the label self-corrects as
-    /// soon as new blocks arrive.
+    /// The sustained-window requirement keeps legitimately bursty sync
+    /// (slow-applying Plutus blocks, epoch-boundary pauses) from flapping
+    /// the label; it self-corrects on the next applied block.
     Stalled,
     /// Node has reached the chain tip (sync progress ≥ 99.9%).
     Synced,
@@ -453,11 +472,17 @@ pub struct App {
     /// Last `dugite_block_number` value seen, used to detect block advancement
     /// between successive polls (for the tip-state 4-state matrix).
     prev_block_number: u64,
-    /// Whether `dugite_block_number` advanced in the most recent poll.
+    /// Wall-clock moment `dugite_block_number` was last seen to move forward
+    /// (seeded by the first non-zero observation).
     ///
-    /// Initialised to `true` so the first sample does not incorrectly report
-    /// "Stuck" before any data has been received.
-    pub block_number_advancing: bool,
+    /// `None` until the first non-zero block number has been received, which
+    /// reads as "advancing" so the monitor never reports Stuck before it has
+    /// data.  Stuck/Stalled trigger only once this is older than
+    /// `stuck_after` — see [`App::block_number_advancing`].
+    last_block_advance: Option<Instant>,
+    /// No-advance window before Stuck/Stalled ([`STUCK_AFTER`]; overridable
+    /// in tests so they don't have to sleep through the real window).
+    stuck_after: Duration,
     /// Ring-buffer of CPU utilisation samples (one per poll).
     ///
     /// Each entry is the CPU percentage scaled by 10 (e.g. 475 means 47.5 %).
@@ -500,7 +525,8 @@ impl App {
             block_rate_history: VecDeque::with_capacity(BLOCK_HISTORY_LEN),
             prev_blocks_applied: 0,
             prev_block_number: 0,
-            block_number_advancing: true,
+            last_block_advance: None,
+            stuck_after: STUCK_AFTER,
             cpu_pct_history: VecDeque::with_capacity(CPU_HISTORY_LEN),
             theme_idx: monokai_idx,
             should_quit: false,
@@ -538,6 +564,15 @@ impl App {
         }
 
         // Successful poll: clear offline state.
+        //
+        // Coming back online after an outage grants a fresh no-advance
+        // window: the timer kept running while the node was unreachable, and
+        // a restarting node legitimately applies nothing while it reloads
+        // its ledger snapshot — judging it by the pre-outage timer would
+        // flash Stuck the moment it reconnects.
+        if self.node_status == NodeStatus::Offline && self.last_block_advance.is_some() {
+            self.last_block_advance = Some(Instant::now());
+        }
         self.node_status = NodeStatus::Online;
         self.offline_since = None;
         self.last_error = None;
@@ -595,12 +630,21 @@ impl App {
 
         // Track block_number advancement for the tip-state 4-state matrix.
         //
-        // We only update `block_number_advancing` once we have seen at least
-        // one non-zero block_number, so the very first successful poll does not
-        // falsely report "Stuck".
+        // `last_block_advance` records the wall-clock moment the block number
+        // last moved forward; Stuck/Stalled trigger only once it is older
+        // than `stuck_after` (see `block_number_advancing()`).  A single
+        // quiet poll window — one Plutus-heavy block taking > 1 s to apply,
+        // an epoch-boundary pause, a fetch-range turnaround — must not flap
+        // the UI red.  The first non-zero observation seeds the timer so a
+        // freshly started monitor reads CatchingUp, not Stuck.  A rollback
+        // (block_number decreasing) leaves the timer running: transient fork
+        // switches re-advance well within the window, while sustained
+        // rollback without forward progress IS a problem.
         let block_number = snapshot.get_u64("dugite_block_number");
-        if self.prev_block_number > 0 {
-            self.block_number_advancing = block_number > self.prev_block_number;
+        if block_number > 0
+            && (block_number > self.prev_block_number || self.last_block_advance.is_none())
+        {
+            self.last_block_advance = Some(Instant::now());
         }
         if block_number > 0 {
             self.prev_block_number = block_number;
@@ -777,12 +821,13 @@ impl App {
     /// 3. **Replaying** — `blocks_applied_total == 0` AND progress > 0 AND
     ///    `tip_age > 300`.  The node is reading blocks back from its local
     ///    ImmutableDB chunk files; no peer blocks have been applied yet.
-    /// 4. **Stalled** — `tip_age > 300` AND the block number is NOT advancing
-    ///    (and we did not match Replaying above, meaning some peer blocks have
-    ///    been applied in the past).  `tip_age` alone is NOT a stall signal:
-    ///    during a from-genesis / deep catch-up the tip is legitimately hours-
-    ///    to-years old while blocks stream in at full speed, so we additionally
-    ///    require that no progress is being made.
+    /// 4. **Stalled** — `tip_age > 300` AND the block number has not advanced
+    ///    within the [`STUCK_AFTER`] window (and we did not match Replaying
+    ///    above, meaning some peer blocks have been applied in the past).
+    ///    `tip_age` alone is NOT a stall signal: during a from-genesis / deep
+    ///    catch-up the tip is legitimately hours-to-years old while blocks
+    ///    stream in at full speed, so we additionally require that no
+    ///    progress has been made for a sustained window.
     /// 5. **Syncing** — catch-all: progress is advancing normally.
     pub fn sync_status(&self) -> SyncState {
         if self.node_status == NodeStatus::Offline {
@@ -802,29 +847,40 @@ impl App {
             // No peer blocks have been applied yet, but sync progress is
             // advancing — the node is replaying its local ImmutableDB.
             SyncState::Replaying
-        } else if tip_age > 300 && pct < 99.0 && !self.block_number_advancing {
-            // Old tip AND no forward progress between polls — a genuine stall.
-            // A node bulk-syncing from genesis has a huge tip_age but IS
-            // advancing, so it must read as Syncing, not Stalled (matches the
-            // CatchingUp vs Stuck split in `tip_state`).
+        } else if tip_age > 300 && pct < 99.0 && !self.block_number_advancing() {
+            // Old tip AND no forward progress for the full no-advance window
+            // — a genuine stall.  A node bulk-syncing from genesis has a huge
+            // tip_age but IS advancing, so it must read as Syncing, not
+            // Stalled (matches the CatchingUp vs Stuck split in `tip_state`).
             SyncState::Stalled
         } else {
             SyncState::Syncing
         }
     }
 
+    /// Whether the node's block number has advanced within the no-advance
+    /// window (`stuck_after`, normally [`STUCK_AFTER`]).
+    ///
+    /// `None` (no non-zero block number observed yet) reads as advancing so
+    /// the monitor never reports Stuck before it has data — mirroring the
+    /// first-poll guard of the old per-poll boolean.
+    pub fn block_number_advancing(&self) -> bool {
+        self.last_block_advance
+            .is_none_or(|t| t.elapsed() < self.stuck_after)
+    }
+
     /// Determine the tip display state using the 4-state matrix.
     ///
     /// Composes `sync_progress_percent`, `tip_age_seconds`, and whether the
-    /// block number has advanced since the last poll to produce an unambiguous
-    /// display state for the tip-age pill:
+    /// block number has advanced within the [`STUCK_AFTER`] window to produce
+    /// an unambiguous display state for the tip-age pill:
     ///
-    /// | sync_progress | tip_age   | block advancing | State       |
-    /// |---------------|-----------|-----------------|-------------|
-    /// | ≥ 99.90 %     | < 120 s   | —               | AtTip       |
-    /// | ≥ 99.90 %     | ≥ 120 s   | —               | Stale       |
-    /// | < 99.90 %     | any       | yes             | CatchingUp  |
-    /// | < 99.90 %     | any       | no              | Stuck       |
+    /// | sync_progress | tip_age   | block advanced in last 90 s | State       |
+    /// |---------------|-----------|-----------------------------|-------------|
+    /// | ≥ 99.90 %     | < 120 s   | —                           | AtTip       |
+    /// | ≥ 99.90 %     | ≥ 120 s   | —                           | Stale       |
+    /// | < 99.90 %     | any       | yes                         | CatchingUp  |
+    /// | < 99.90 %     | any       | no                          | Stuck       |
     ///
     /// This resolves the ambiguity where a freshly-imported Mithril snapshot
     /// legitimately starts with a large `tip_age` while catching up, but that
@@ -842,12 +898,26 @@ impl App {
             }
         } else {
             // Node is still catching up.
-            if self.block_number_advancing {
+            if self.block_number_advancing() {
                 TipState::CatchingUp
             } else {
                 TipState::Stuck
             }
         }
+    }
+
+    /// Test-only: override the no-advance window so tests can cross it
+    /// without sleeping (e.g. `Duration::ZERO` makes any already-seen
+    /// block number read as not-advancing on the next check).
+    #[cfg(test)]
+    pub(crate) fn set_stuck_after(&mut self, window: Duration) {
+        self.stuck_after = window;
+    }
+
+    /// Test-only: mark the block number as having advanced right now.
+    #[cfg(test)]
+    pub(crate) fn note_block_advance(&mut self) {
+        self.last_block_advance = Some(Instant::now());
     }
 
     /// Sync progress as a percentage (0.0–100.0).
@@ -1119,8 +1189,9 @@ mod tests {
         assert!(!app.sync_status().is_replaying());
 
         // Stalled (blocks applied in the past, tip is old, AND no forward
-        // progress between polls).
-        app.block_number_advancing = false;
+        // progress for the full no-advance window).
+        app.note_block_advance();
+        app.set_stuck_after(std::time::Duration::ZERO);
         app.metrics = make_snapshot(vec![
             ("dugite_sync_progress_percent", 5000.0),
             ("dugite_tip_age_seconds", 600.0),
@@ -1134,7 +1205,8 @@ mod tests {
         // Bulk sync from genesis: tip is legitimately ancient (years old) and
         // progress is ~1 %, but the block number IS advancing — must read as
         // Syncing, NOT Stalled.  Regression for the "Stalled 1.00%" mislabel.
-        app.block_number_advancing = true;
+        app.set_stuck_after(STUCK_AFTER);
+        app.note_block_advance();
         app.metrics = make_snapshot(vec![
             ("dugite_sync_progress_percent", 100.0),  // 1.00 %
             ("dugite_tip_age_seconds", 63_000_000.0), // ~2 years
@@ -1147,8 +1219,9 @@ mod tests {
         );
         assert!(!app.sync_status().is_stalled());
 
-        // Same ancient tip but NO forward progress → a genuine stall.
-        app.block_number_advancing = false;
+        // Same ancient tip but NO forward progress for the full window →
+        // a genuine stall.
+        app.set_stuck_after(std::time::Duration::ZERO);
         assert_eq!(
             app.sync_status(),
             SyncState::Stalled,
@@ -1191,9 +1264,10 @@ mod tests {
         );
 
         // Once blocks have been applied (replay finished, now syncing from peers)
-        // but tip age is still high AND the block number is not advancing —
-        // that is Stalled, not Replaying.
-        app.block_number_advancing = false;
+        // but tip age is still high AND the block number has not advanced for
+        // the full no-advance window — that is Stalled, not Replaying.
+        app.note_block_advance();
+        app.set_stuck_after(std::time::Duration::ZERO);
         app.metrics = make_snapshot(vec![
             ("dugite_sync_progress_percent", 9000.0),
             ("dugite_tip_age_seconds", 600.0),
@@ -1602,6 +1676,34 @@ mod tests {
         assert_eq!(app.tip_state().label(), "Catching up");
     }
 
+    /// A single quiet poll window (block number unchanged between two
+    /// 1-second polls) must NOT flip the tip pill to Stuck.  During
+    /// heavy-era mainnet sync 20 % of 1 s windows are legitimately quiet
+    /// (one Plutus-dense block can take > 1 s to apply), which made the
+    /// per-poll rule flap CatchingUp↔Stuck 12×/min (measured 2026-06-10).
+    #[test]
+    fn test_tip_state_not_stuck_on_single_quiet_poll() {
+        let mut app = App::new();
+        app.node_status = NodeStatus::Online;
+        app.update_metrics(make_snapshot(vec![
+            ("dugite_sync_progress_percent", 5000.0),
+            ("dugite_tip_age_seconds", 57_600.0),
+            ("dugite_block_number", 1000.0),
+        ]));
+        // Second poll: block_number did NOT advance — still within the
+        // no-advance grace window, so this is CatchingUp, not Stuck.
+        app.update_metrics(make_snapshot(vec![
+            ("dugite_sync_progress_percent", 5000.0),
+            ("dugite_tip_age_seconds", 57_620.0),
+            ("dugite_block_number", 1000.0),
+        ]));
+        assert_eq!(
+            app.tip_state(),
+            TipState::CatchingUp,
+            "a single quiet poll window must not report Stuck"
+        );
+    }
+
     #[test]
     fn test_tip_state_stuck_block_not_advancing() {
         let mut app = App::new();
@@ -1612,20 +1714,92 @@ mod tests {
             ("dugite_tip_age_seconds", 57_600.0),
             ("dugite_block_number", 1000.0),
         ]));
-        // Second poll: block_number did NOT advance (same value).
+        // Second poll: block_number did NOT advance (same value).  Quiet
+        // polls do not reset the no-advance timer, but within the window
+        // the state is still CatchingUp.
         app.update_metrics(make_snapshot(vec![
             ("dugite_sync_progress_percent", 5000.0),
             ("dugite_tip_age_seconds", 57_620.0),
             ("dugite_block_number", 1000.0),
         ]));
+        assert_eq!(app.tip_state(), TipState::CatchingUp);
+        // Once the no-advance window has fully elapsed → Stuck.
+        app.set_stuck_after(std::time::Duration::ZERO);
         assert_eq!(app.tip_state(), TipState::Stuck);
-        assert!(app.tip_state().is_problem());
         assert!(app.tip_state().is_problem());
         assert_eq!(app.tip_state().label(), "Stuck");
     }
 
-    /// First poll must not falsely report Stuck (block_number_advancing
-    /// defaults to true so no comparison can be made yet).
+    /// An Offline → Online transition grants a fresh no-advance window: the
+    /// timer kept running during the outage, and a restarting node applies
+    /// nothing while reloading its ledger snapshot, so it must not flash
+    /// Stuck the moment it reconnects.
+    #[test]
+    fn test_tip_state_offline_online_grants_fresh_window() {
+        let mut app = App::new();
+        app.node_status = NodeStatus::Online;
+        app.update_metrics(make_snapshot(vec![
+            ("dugite_sync_progress_percent", 5000.0),
+            ("dugite_tip_age_seconds", 57_600.0),
+            ("dugite_block_number", 1000.0),
+        ]));
+        let seeded = app.last_block_advance.expect("timer seeded by first poll");
+
+        // Node goes offline: the timer is left untouched (frozen).
+        app.update_metrics(make_disconnected_snapshot("connection refused"));
+        assert_eq!(app.last_block_advance, Some(seeded));
+
+        // Node comes back online with the SAME block number: the timer is
+        // refreshed (grace window) and the state stays CatchingUp.  The
+        // tiny sleep guarantees the refreshed Instant is strictly later.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        app.update_metrics(make_snapshot(vec![
+            ("dugite_sync_progress_percent", 5000.0),
+            ("dugite_tip_age_seconds", 57_700.0),
+            ("dugite_block_number", 1000.0),
+        ]));
+        assert!(app.last_block_advance.expect("timer still set") > seeded);
+        assert_eq!(app.tip_state(), TipState::CatchingUp);
+    }
+
+    /// A rollback (block number decreasing, e.g. a fork switch) does not
+    /// reset the no-advance timer, but re-advancing afterwards — even to a
+    /// value below the old high-water mark — does.
+    #[test]
+    fn test_tip_state_rollback_then_advance_resets_window() {
+        let mut app = App::new();
+        app.node_status = NodeStatus::Online;
+        app.update_metrics(make_snapshot(vec![
+            ("dugite_sync_progress_percent", 5000.0),
+            ("dugite_tip_age_seconds", 57_600.0),
+            ("dugite_block_number", 1000.0),
+        ]));
+        let seeded = app.last_block_advance.expect("timer seeded by first poll");
+
+        // Rollback: block_number decreases — timer NOT refreshed.
+        app.update_metrics(make_snapshot(vec![
+            ("dugite_sync_progress_percent", 5000.0),
+            ("dugite_tip_age_seconds", 57_620.0),
+            ("dugite_block_number", 900.0),
+        ]));
+        assert_eq!(app.last_block_advance, Some(seeded));
+
+        // Forward progress from the rolled-back tip (still below the old
+        // high-water mark of 1000) counts as an advance.  The tiny sleep
+        // guarantees the refreshed Instant is strictly later.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        app.update_metrics(make_snapshot(vec![
+            ("dugite_sync_progress_percent", 5000.0),
+            ("dugite_tip_age_seconds", 57_640.0),
+            ("dugite_block_number", 950.0),
+        ]));
+        assert!(app.last_block_advance.expect("timer still set") > seeded);
+        assert_eq!(app.tip_state(), TipState::CatchingUp);
+    }
+
+    /// First poll must not falsely report Stuck (the no-advance timer is
+    /// unset until the first non-zero block number, which reads as
+    /// advancing).
     #[test]
     fn test_tip_state_first_poll_not_stuck() {
         let mut app = App::new();
