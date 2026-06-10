@@ -808,8 +808,9 @@ mod tests {
             epoch_size: 86400,
             slot_length_ms: 1000,
             safe_zone: 129600,
+            genesis_window: 25_920,
         };
-        let mut eh = EraHistory::from_genesis(params.clone(), params, 0, 4320);
+        let mut eh = EraHistory::from_genesis(params.clone(), params, 0);
 
         let snapshot_era = Era::Dijkstra;
         for (era, epoch) in era_transitions_for_magic(2) {
@@ -838,8 +839,9 @@ mod tests {
             epoch_size: 86400,
             slot_length_ms: 1000,
             safe_zone: 129600,
+            genesis_window: 25_920,
         };
-        let mut eh = EraHistory::from_genesis(params.clone(), params, 0, 4320);
+        let mut eh = EraHistory::from_genesis(params.clone(), params, 0);
 
         let snapshot_era = Era::Conway;
         for (era, epoch) in era_transitions_for_magic(2) {
