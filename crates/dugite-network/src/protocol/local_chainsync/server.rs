@@ -165,8 +165,13 @@ impl LocalChainSyncServer {
             }
         }
 
+        // Advance by POINT, not by slot: a Byron EBB shares its absolute
+        // slot with the first main block of the epoch, and a slot-only
+        // advance from the EBB would skip that main block.  For the origin
+        // cursor (all-zero hash, not a stored block) the point lookup falls
+        // back to the slot-based behavior.
         if let Some((slot, hash, block_cbor)) =
-            block_provider.get_next_block_after_slot(self.cursor_slot)
+            block_provider.get_next_block_after_point(self.cursor_slot, &self.cursor_hash)
         {
             let tip = block_provider.get_tip();
 
@@ -198,8 +203,8 @@ impl LocalChainSyncServer {
                             self.send_rollback(channel, block_provider, &rb).await
                         } else {
                             // Cursor behind rollback — serve next block from new fork.
-                            if let Some((slot, hash, block_cbor)) =
-                                block_provider.get_next_block_after_slot(self.cursor_slot)
+                            if let Some((slot, hash, block_cbor)) = block_provider
+                                .get_next_block_after_point(self.cursor_slot, &self.cursor_hash)
                             {
                                 let tip = block_provider.get_tip();
                                 let response = encode_message(&ChainSyncMessage::MsgRollForward {
@@ -245,8 +250,8 @@ impl LocalChainSyncServer {
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         // Try to catch up from current position.
-                        if let Some((slot, hash, block_cbor)) =
-                            block_provider.get_next_block_after_slot(self.cursor_slot)
+                        if let Some((slot, hash, block_cbor)) = block_provider
+                            .get_next_block_after_point(self.cursor_slot, &self.cursor_hash)
                         {
                             let tip = block_provider.get_tip();
                             let response = encode_message(&ChainSyncMessage::MsgRollForward {

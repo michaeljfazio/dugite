@@ -53,6 +53,28 @@ pub trait BlockProvider: Send + Sync + 'static {
     /// Uses strict `>` comparison: only returns blocks with `slot > after_slot`.
     fn get_next_block_after_slot(&self, after_slot: u64) -> Option<(u64, [u8; 32], Vec<u8>)>;
 
+    /// Get the chain-order successor of the block identified by `(slot, hash)`.
+    ///
+    /// A Byron Epoch Boundary Block (EBB) shares its absolute slot with the
+    /// first main block of the epoch, so a slot-only cursor cannot step from
+    /// the EBB to the same-slot main block — it would serve the peer a chain
+    /// with a hole in it.  Cursor-driven servers (ChainSync, LocalChainSync)
+    /// and range iteration MUST advance by point, mirroring cardano-node,
+    /// whose followers and iterators are keyed by `Point` with same-slot
+    /// EBB/main pairs disambiguated by header hash.
+    ///
+    /// Default implementation: fall back to the slot-based lookup, which is
+    /// correct for chains without same-slot blocks (Shelley+).  Providers
+    /// backed by real chain storage SHOULD override this.
+    fn get_next_block_after_point(
+        &self,
+        slot: u64,
+        hash: &[u8; 32],
+    ) -> Option<(u64, [u8; 32], Vec<u8>)> {
+        let _ = hash;
+        self.get_next_block_after_slot(slot)
+    }
+
     /// Return `true` iff `hash` is on the current canonical chain (the
     /// volatile `selected_chain` window OR the immutable layer).  A fork
     /// block stored alongside the chain returns `false`.
@@ -108,27 +130,27 @@ pub trait BlockProvider: Send + Sync + 'static {
     /// of this method.
     ///
     /// The default implementation delegates to [`get_block_at_or_after_slot`] and
-    /// [`get_next_block_after_slot`] in a loop.  Concrete implementations backed
+    /// [`get_next_block_after_point`] in a loop.  Concrete implementations backed
     /// by a real storage layer MUST override this with a single lock acquisition.
+    ///
+    /// Iteration is point-cursor driven so that a Byron EBB and the same-slot
+    /// first main block of the epoch are BOTH returned, in chain order.
     fn get_blocks_in_range(
         &self,
         from_slot: u64,
         to_slot: u64,
         limit: usize,
     ) -> Vec<(u64, [u8; 32], Vec<u8>)> {
-        let mut blocks = Vec::new();
-        let mut current_slot = from_slot;
-        let mut first = true;
-        while current_slot <= to_slot && blocks.len() < limit {
-            let next = if first {
-                first = false;
-                self.get_block_at_or_after_slot(current_slot)
-            } else {
-                self.get_next_block_after_slot(current_slot)
+        let mut blocks: Vec<(u64, [u8; 32], Vec<u8>)> = Vec::new();
+        let mut cursor: Option<(u64, [u8; 32])> = None;
+        while blocks.len() < limit {
+            let next = match cursor {
+                None => self.get_block_at_or_after_slot(from_slot),
+                Some((slot, hash)) => self.get_next_block_after_point(slot, &hash),
             };
             match next {
                 Some((slot, hash, cbor)) if slot <= to_slot => {
-                    current_slot = slot;
+                    cursor = Some((slot, hash));
                     blocks.push((slot, hash, cbor));
                 }
                 _ => break,

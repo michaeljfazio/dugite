@@ -579,11 +579,16 @@ impl ChainSyncServer {
         // When cursor_at_origin is true, use the inclusive `>=` lookup so that
         // a block at slot 0 is not skipped.  The strict `>` lookup would miss
         // it since cursor_slot is 0.
+        //
+        // Otherwise advance by POINT, not by slot: a Byron EBB shares its
+        // absolute slot with the first main block of the epoch, and a
+        // slot-only advance from the EBB would skip that main block,
+        // serving the peer a chain with a hole in it.
         let lookup_start = std::time::Instant::now();
         let next_block = if self.cursor_at_origin {
             block_provider.get_block_at_or_after_slot(0)
         } else {
-            block_provider.get_next_block_after_slot(self.cursor_slot)
+            block_provider.get_next_block_after_point(self.cursor_slot, &self.cursor_hash)
         };
         let lookup_elapsed = lookup_start.elapsed();
         if lookup_elapsed.as_millis() > 50 {
@@ -814,6 +819,21 @@ mod tests {
                 .iter()
                 .find(|(s, _, _)| *s > after_slot)
                 .cloned()
+        }
+
+        fn get_next_block_after_point(
+            &self,
+            slot: u64,
+            hash: &[u8; 32],
+        ) -> Option<(u64, [u8; 32], Vec<u8>)> {
+            if let Some(pos) = self
+                .blocks
+                .iter()
+                .position(|(s, h, _)| *s == slot && h == hash)
+            {
+                return self.blocks.get(pos + 1).cloned();
+            }
+            self.get_next_block_after_slot(slot)
         }
     }
 
@@ -1049,6 +1069,71 @@ mod tests {
         }
 
         // Send MsgDone
+        let done = encode_message(&ChainSyncMessage::MsgDone);
+        ingress_tx.send(Bytes::from(done)).await.unwrap();
+        handle.await.unwrap().unwrap();
+    }
+
+    /// A Byron EBB shares its absolute slot with the first main block of the
+    /// epoch (mainnet: 171 of 176 Byron boundaries).  The follower cursor is
+    /// a point (slot + hash), so the server must serve the EBB and then the
+    /// same-slot main block — a slot-only cursor advance skips the main
+    /// block and serves the peer a chain with a hole in it.
+    #[tokio::test]
+    async fn serves_same_slot_ebb_pair_in_chain_order() {
+        let hdr_pred = vec![0x10, 0x11];
+        let hdr_ebb = vec![0x20, 0x21];
+        let hdr_main = vec![0x30, 0x31];
+        let hdr_next = vec![0x40, 0x41];
+
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let provider = MockBlockProvider {
+            blocks: vec![
+                (99, [0x01; 32], make_hfc_block(7, &hdr_pred)),
+                (100, [0x02; 32], make_hfc_block(7, &hdr_ebb)),
+                (100, [0x03; 32], make_hfc_block(7, &hdr_main)),
+                (101, [0x04; 32], make_hfc_block(7, &hdr_next)),
+            ],
+        };
+        let (ann_tx, _) = broadcast::channel(16);
+        let (rb_tx, _) = broadcast::channel(16);
+
+        let mut server = ChainSyncServer::new();
+        let handle = tokio::spawn(async move {
+            server
+                .run(
+                    &mut channel,
+                    &provider,
+                    ann_tx.subscribe(),
+                    rb_tx.subscribe(),
+                )
+                .await
+        });
+
+        // Intersect at the predecessor of the boundary pair.
+        let find = encode_message(&ChainSyncMessage::MsgFindIntersect(vec![Point::Specific(
+            99, [0x01; 32],
+        )]));
+        ingress_tx.send(Bytes::from(find)).await.unwrap();
+        let _ = egress_rx.recv().await.unwrap(); // MsgIntersectFound
+
+        // Serve order must be: EBB@100, main@100, next@101.
+        for (name, hdr) in [("ebb", &hdr_ebb), ("main", &hdr_main), ("next", &hdr_next)] {
+            let req = encode_message(&ChainSyncMessage::MsgRequestNext);
+            ingress_tx.send(Bytes::from(req)).await.unwrap();
+            let (_, _, resp) = egress_rx.recv().await.unwrap();
+            let msg = decode_message(&resp).unwrap();
+            let ChainSyncMessage::MsgRollForward { header, .. } = msg else {
+                panic!("expected MsgRollForward for {name}, got {msg:?}");
+            };
+            let expected = expected_hfc_header(7, &cbor_encode_bytes(hdr));
+            assert_eq!(
+                header, expected,
+                "wrong block served at step {name}: same-slot EBB/main pair \
+                 must be served in chain order"
+            );
+        }
+
         let done = encode_message(&ChainSyncMessage::MsgDone);
         ingress_tx.send(Bytes::from(done)).await.unwrap();
         handle.await.unwrap().unwrap();
