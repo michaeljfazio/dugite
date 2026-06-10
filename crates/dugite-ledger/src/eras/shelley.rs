@@ -842,7 +842,9 @@ impl EraRules for ShelleyRules {
 
         // DIAGNOSTIC (#15 epoch-nonce debug): log the TICKN inputs + result so we
         // can cross-validate the epoch nonce against the live mainnet value.
-        tracing::info!(
+        // debug-level: fires every epoch boundary during from-genesis replay,
+        // which floods the default INFO log.
+        tracing::debug!(
             epoch = new_epoch.0,
             candidate = %candidate.to_hex(),
             prev_hash_nonce = %prev_hash_nonce.to_hex(),
