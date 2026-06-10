@@ -6159,10 +6159,17 @@ impl Node {
 
         let t_after_mempool = if timing { Some(Instant::now()) } else { None };
 
-        // 3. N2C snapshot refresh, rate-limited at 1 Hz (matches the existing
-        //    apply_fetched_block predicate at mod.rs:3854 pre-refactor).
+        // 3. N2C snapshot refresh, rate-limited by `query_state_refresh_interval`:
+        //    1 Hz at tip, 30 s during catch-up.  The rebuild is ~1.4 s at
+        //    mainnet scale and runs synchronously on the apply task, so the
+        //    catch-up cadence directly bounds bulk-sync throughput.  Same
+        //    at-tip signal as the WAL/snapshot/LedgerSeq catch-up modes
+        //    (updated per applied block in `apply_fetched_block`).
+        let at_tip = self
+            .volatile_wal_sync_at_tip
+            .load(std::sync::atomic::Ordering::Relaxed);
         let query_state_ran =
-            if self.last_query_state_update.elapsed() >= std::time::Duration::from_secs(1) {
+            if self.last_query_state_update.elapsed() >= query_state_refresh_interval(at_tip) {
                 self.update_query_state().await;
                 self.last_query_state_update = std::time::Instant::now();
                 true
@@ -7205,6 +7212,26 @@ pub(crate) fn next_forged_block_number(
         dugite_primitives::time::BlockNo(0)
     } else {
         dugite_primitives::time::BlockNo(current_block_number.0 + 1)
+    }
+}
+
+/// Minimum interval between N2C `LocalStateQuery` snapshot rebuilds.
+///
+/// The rebuild (`Node::update_query_state`) walks every delegation, pool,
+/// and DRep in the ledger state — ~1.4 s at mainnet epoch-334 scale — and
+/// runs synchronously on the apply task with the ledger read lock held.
+///
+/// At tip that cost is amortised over ~20 s block arrivals, so a 1 Hz
+/// limit keeps client-visible state fresh at negligible cost.  During
+/// catch-up the apply loop IS the sync throughput bottleneck: an
+/// unconditional 1 Hz cadence stalled it for ~60 % of wall time on
+/// mainnet (a metronomic ~1.4 s pause every ~2.5 s, measured 2026-06-10),
+/// so the cadence drops to the 30 s documented on `update_query_state`.
+pub(crate) fn query_state_refresh_interval(at_tip: bool) -> std::time::Duration {
+    if at_tip {
+        std::time::Duration::from_secs(1)
+    } else {
+        std::time::Duration::from_secs(30)
     }
 }
 
@@ -8859,6 +8886,25 @@ mod tests {
             *guard
         });
         assert_eq!(value, 42);
+    }
+
+    /// N2C query-snapshot refresh cadence: 1 Hz at tip (effectively per
+    /// block, since at-tip blocks arrive every ~20 s), 30 s during catch-up.
+    /// The rebuild walks every delegation/pool/DRep in the ledger (~1.4 s at
+    /// mainnet epoch-334 scale) and runs synchronously on the apply task, so
+    /// the previous unconditional 1 Hz cadence stalled the apply loop for
+    /// ~60 % of wall time during mainnet bulk sync (metronomic 1.4 s gap
+    /// every 2.5 s, measured 2026-06-10).
+    #[test]
+    fn query_state_refresh_interval_drops_to_30s_during_catch_up() {
+        assert_eq!(
+            super::query_state_refresh_interval(true),
+            std::time::Duration::from_secs(1)
+        );
+        assert_eq!(
+            super::query_state_refresh_interval(false),
+            std::time::Duration::from_secs(30)
+        );
     }
 
     // ─── Forge-loop gate tests (Haskell-aligned) ─────────────────────────────
