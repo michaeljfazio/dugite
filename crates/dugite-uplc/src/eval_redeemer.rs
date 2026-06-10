@@ -260,9 +260,12 @@ pub fn eval_resolved_redeemer(
     if matches!(r.language, ScriptLanguage::PlutusV3)
         && !matches!(&result_term, Term::Const(Constant::Unit))
     {
-        return Err(PhaseTwoError::Internal(format!(
-            "V3 script returned non-Unit value: {result_term:?}"
-        )));
+        // A V3 script that evaluates to a non-Unit value is a SCRIPT
+        // failure (the script ran to completion with the wrong result),
+        // not a context error — it legitimises is_valid=false (#734).
+        return Err(PhaseTwoError::ScriptEvaluationFailed(
+            crate::UplcError::NonUnitReturn,
+        ));
     }
 
     Ok(RedeemerEvalOutcome {
@@ -392,14 +395,14 @@ fn decode_script_bytes_uncached(bytes: &[u8]) -> Result<Program, PhaseTwoError> 
 
     if looks_like_cbor_bytes {
         // Bytes are CBOR-wrapped — decode once and propagate any error.
-        return Program::from_cbor(bytes).map_err(|e| {
-            PhaseTwoError::Internal(format!("eval_resolved_redeemer: script decode: {e}"))
-        });
+        // Undecodable SCRIPT bytes are a script-evaluation failure in
+        // Haskell (PlutusFailure on deserialisation), not a collection
+        // error — they legitimise is_valid=false (#734).
+        return Program::from_cbor(bytes).map_err(PhaseTwoError::ScriptEvaluationFailed);
     }
 
     // Raw flat bytes (already unwrapped by the caller / serialization layer).
-    Program::from_flat(bytes)
-        .map_err(|e| PhaseTwoError::Internal(format!("eval_resolved_redeemer: script decode: {e}")))
+    Program::from_flat(bytes).map_err(PhaseTwoError::ScriptEvaluationFailed)
 }
 
 fn debug_dump_data(d: &crate::data::Data, depth: usize) {
@@ -574,9 +577,12 @@ mod tests {
 
     #[test]
     fn decode_script_bytes_rejects_garbage() {
-        // Pure garbage — neither CBOR-wrapped nor valid flat.
+        // Pure garbage — neither CBOR-wrapped nor valid flat.  Undecodable
+        // SCRIPT bytes are a script-evaluation failure (Haskell
+        // PlutusFailure), not a collection error (#734).
         let err = decode_script_bytes(&[0xfe, 0xfe, 0xfe]).unwrap_err();
-        assert!(matches!(err, PhaseTwoError::Internal(_)));
+        assert!(matches!(err, PhaseTwoError::ScriptEvaluationFailed(_)));
+        assert!(err.is_script_evaluation_failure());
     }
 
     /// Build a minimal `ResolvedRedeemer` that points at the smallest

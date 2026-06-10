@@ -174,6 +174,41 @@ pub enum PhaseTwoError {
     TimeTranslationPastHorizon { slot: u64, horizon: u64 },
 }
 
+impl PhaseTwoError {
+    /// Whether this error is a genuine **script-evaluation failure** —
+    /// the CEK machine ran the script and the script failed.
+    ///
+    /// Mirrors the Haskell phase-2 partition (issues #733/#734):
+    ///
+    /// * `evalScripts` → `Fails`/`ValidationFailure` — the only outcome
+    ///   that legitimises a tx declared `is_valid = false` (its collateral
+    ///   is consumed at apply).  This includes undecodable script bytes,
+    ///   which Haskell also treats as a script failure.
+    /// * Everything else corresponds to `collectTwoPhaseScriptInputs` →
+    ///   `CollectErrors` (`NoRedeemer`/`NoWitness`/`NoCostModel`/
+    ///   `BadTranslation`): deterministic context/collection errors that
+    ///   reject the transaction — and any block containing it —
+    ///   **regardless** of the `is_valid` tag
+    ///   (`UtxosFailure (CollectErrors …)` in Babbage/Conway).
+    ///
+    /// The match is exhaustive on purpose: a new variant must make a
+    /// deliberate classification choice here or the crate fails to build.
+    pub fn is_script_evaluation_failure(&self) -> bool {
+        match self {
+            PhaseTwoError::ScriptEvaluationFailed(_)
+            | PhaseTwoError::ScriptEvaluationFailedWithLogs { .. } => true,
+            PhaseTwoError::NotImplemented
+            | PhaseTwoError::TxDecode(_)
+            | PhaseTwoError::UtxoDecode(_)
+            | PhaseTwoError::CostModelDecode(_)
+            | PhaseTwoError::MissingScript(_)
+            | PhaseTwoError::MissingDatum { .. }
+            | PhaseTwoError::Internal(_)
+            | PhaseTwoError::TimeTranslationPastHorizon { .. } => false,
+        }
+    }
+}
+
 /// The redeemer trait callers implement to observe each redeemer
 /// during evaluation (used by aiken-uplc to surface debug info).
 /// We provide a no-op implementation by default so callers without
@@ -325,16 +360,17 @@ pub fn eval_phase_two_raw<O: RedeemerObserver>(
                 );
             }
         } else if outcome.consumed.cpu > declared_cpu || outcome.consumed.mem > declared_mem {
-            return Err(PhaseTwoError::Internal(format!(
-                "redeemer {tag:?}@{idx} consumed (cpu={}, mem={}) exceeds declared \
-                 (cpu={}, mem={})",
-                outcome.consumed.cpu,
-                outcome.consumed.mem,
-                declared_cpu,
-                declared_mem,
-                tag = resolved_r.tag,
-                idx = resolved_r.index,
-            )));
+            // Running past the declared budget is a SCRIPT failure
+            // (Haskell `CekOutOfExError` under `evaluateScriptRestricting`),
+            // not a context error — it legitimises is_valid=false (#734).
+            // Production-unreachable: the restricting cap above already
+            // bounds the run at the declared budget; kept defensively.
+            return Err(PhaseTwoError::ScriptEvaluationFailed(
+                crate::UplcError::BudgetExhausted {
+                    cpu_remaining: declared_cpu.saturating_sub(outcome.consumed.cpu),
+                    mem_remaining: declared_mem.saturating_sub(outcome.consumed.mem),
+                },
+            ));
         }
 
         results.push(RedeemerResult {
@@ -741,6 +777,45 @@ mod tests {
             tx.era = non_plutus_era;
             assert_eq!(era_id_for_outputs(&tx), 6, "era={non_plutus_era:?}");
         }
+    }
+
+    /// Haskell partitions phase-2 outcomes into script-evaluation failures
+    /// (`evalScripts` → `Fails`, which legitimise `is_valid=false`) and
+    /// collection/context errors (`collectTwoPhaseScriptInputs` →
+    /// `CollectErrors`: `NoRedeemer`/`NoWitness`/`NoCostModel`/
+    /// `BadTranslation`, which reject the tx/block REGARDLESS of the
+    /// `is_valid` tag).  `is_script_evaluation_failure` must encode that
+    /// partition exactly (issues #733/#734).
+    #[test]
+    fn phase_two_error_classification_matches_haskell_partition() {
+        use crate::UplcError;
+        // Script-evaluation failures (Haskell `Fails`/ValidationFailure).
+        assert!(
+            PhaseTwoError::ScriptEvaluationFailed(UplcError::ScriptError)
+                .is_script_evaluation_failure()
+        );
+        assert!(PhaseTwoError::ScriptEvaluationFailedWithLogs {
+            error: UplcError::BudgetExhausted {
+                cpu_remaining: -1,
+                mem_remaining: 0,
+            },
+            logs: vec!["trace".into()],
+        }
+        .is_script_evaluation_failure());
+        // Collection/context errors (Haskell `CollectErrors`) — must NOT
+        // legitimise is_valid=false.
+        assert!(!PhaseTwoError::TxDecode("bad".into()).is_script_evaluation_failure());
+        assert!(!PhaseTwoError::UtxoDecode("zeros".into()).is_script_evaluation_failure());
+        assert!(!PhaseTwoError::CostModelDecode("bad".into()).is_script_evaluation_failure());
+        assert!(!PhaseTwoError::MissingScript("h".into()).is_script_evaluation_failure());
+        assert!(!PhaseTwoError::MissingDatum { hash: "h".into() }.is_script_evaluation_failure());
+        assert!(!PhaseTwoError::TimeTranslationPastHorizon {
+            slot: 728,
+            horizon: 400
+        }
+        .is_script_evaluation_failure());
+        assert!(!PhaseTwoError::Internal("ctx".into()).is_script_evaluation_failure());
+        assert!(!PhaseTwoError::NotImplemented.is_script_evaluation_failure());
     }
 
     // ─────────────────────────────────────────────────────────────
