@@ -1,8 +1,12 @@
 # ---- Build stage ----
 FROM rust:1.95-bookworm AS builder
 
+# protobuf-compiler provides the protoc binary; libprotobuf-dev provides the
+# well-known type .proto files (google/protobuf/*.proto) under /usr/include,
+# which dugite-rpc's tonic-build codegen imports (e.g. field_mask.proto). The
+# clean Debian base does not ship these like GitHub's Ubuntu runners do.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libclang-dev clang pkg-config protobuf-compiler && \
+    libclang-dev clang pkg-config protobuf-compiler libprotobuf-dev && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
