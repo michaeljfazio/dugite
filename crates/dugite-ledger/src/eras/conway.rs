@@ -881,6 +881,10 @@ impl EraRules for ConwayRules {
 
         // === Step 9: Prune expired committee members ===
         expire_committee_members(new_epoch, gov);
+        // Haskell `updateCommitteeState` (Epoch.hs): prune hot-key auths +
+        // resignations to the post-enactment committee membership (wipes all
+        // on an enacted NoConfidence).
+        crate::state::governance::prune_committee_state(gov);
 
         // DRep activity marking (mark inactive DReps)
         update_drep_activity(new_epoch, epochs, gov);
@@ -1718,13 +1722,23 @@ fn process_governance_votes_and_proposals(
     let governance = Arc::make_mut(&mut gov.governance);
 
     // Process votes.
+    //
+    // Last-vote-wins per voter: Haskell GOV stores votes in per-action maps
+    // keyed by voter (`gasCommitteeVotes` / `gasDRepVotes` /
+    // `gasStakePoolVotes` are `Map voter Vote`, updated via `Map.insert`), so
+    // a re-vote OVERWRITES the previous one. Appending a duplicate entry
+    // would double-count the voter's stake at ratification.
     for (voter, action_votes) in &tx.body.voting_procedures {
         for (action_id, vote_proc) in action_votes {
-            governance
+            let entry = governance
                 .votes_by_action
                 .entry(action_id.clone())
-                .or_default()
-                .push((voter.clone(), vote_proc.clone()));
+                .or_default();
+            if let Some(existing) = entry.iter_mut().find(|(v, _)| v == voter) {
+                existing.1 = vote_proc.clone();
+            } else {
+                entry.push((voter.clone(), vote_proc.clone()));
+            }
         }
     }
 
