@@ -642,6 +642,7 @@ mod tests {
             epoch_size: 432_000,
             slot_length_ms: 1_000,
             safe_zone: 2 * 2160,
+            genesis_window: 129_600,
         }
     }
 
@@ -659,8 +660,9 @@ mod tests {
             epoch_size,
             slot_length_ms: 1_000,
             safe_zone: 4_320,
+            genesis_window: 4_320,
         };
-        EraHistory::from_genesis(p.clone(), p, 0, 4_320)
+        EraHistory::from_genesis(p.clone(), p, 0)
     }
 
     /// Build a two-era history that mirrors mainnet Byron (epoch_size=21600,
@@ -671,13 +673,15 @@ mod tests {
             epoch_size: 21_600,
             slot_length_ms: 20_000,
             safe_zone: 4_320,
+            genesis_window: 4_320,
         };
         let shelley = EraParams {
             epoch_size: 432_000,
             slot_length_ms: 1_000,
             safe_zone: 129_600,
+            genesis_window: 129_600,
         };
-        EraHistory::from_genesis(byron, shelley, 208, 4_320)
+        EraHistory::from_genesis(byron, shelley, 208)
     }
 
     /// Build a three-era history: two eras of 1000-slot epochs, third open.
@@ -687,8 +691,9 @@ mod tests {
             epoch_size: 1_000,
             slot_length_ms: 1_000,
             safe_zone: 200,
+            genesis_window: 200,
         };
-        let mut eh = EraHistory::from_genesis(p.clone(), p.clone(), 0, 200);
+        let mut eh = EraHistory::from_genesis(p.clone(), p.clone(), 0);
         // Byron→Shelley instant, then Shelley closes at epoch 5 (slot 5000),
         // opening Allegra.
         eh.record_era_transition(Era::Allegra, 5);

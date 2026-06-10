@@ -433,6 +433,7 @@ impl CsjOrchestrator {
             epoch_size: 432_000,
             slot_length_ms: 1_000,
             safe_zone: genesis_window,
+            genesis_window,
         };
         let instruction = JumpInstruction {
             point: jump_point,
@@ -795,6 +796,7 @@ impl CsjOrchestrator {
                 epoch_size: 432_000,
                 slot_length_ms: 1_000,
                 safe_zone: 60,
+                genesis_window: 60,
             },
         };
         self.peers
@@ -1007,6 +1009,7 @@ mod tests {
                 epoch_size: 432_000,
                 slot_length_ms: 1_000,
                 safe_zone: 60,
+                genesis_window: 60,
             },
         };
         orch.peers

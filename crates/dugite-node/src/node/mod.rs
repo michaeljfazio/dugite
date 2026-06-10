@@ -1832,7 +1832,6 @@ impl Node {
 
             let k = consensus.security_param;
             let active_slots_coeff = consensus.active_slot_coeff;
-            let genesis_window = k * 2;
 
             let byron_params = EraParams {
                 epoch_size: if byron_epoch_length > 0 {
@@ -1843,6 +1842,8 @@ impl Node {
                 },
                 slot_length_ms: byron_slot_duration_ms,
                 safe_zone: k * 2,
+                // Haskell `byronEraParams`: eraGenesisWin = GenesisWindow (2 * k).
+                genesis_window: k * 2,
             };
 
             let shelley_epoch_length = shelley_genesis
@@ -1853,22 +1854,23 @@ impl Node {
                 .as_ref()
                 .map(|g| g.slot_length * 1000)
                 .unwrap_or(1000);
-            let shelley_safe_zone = (3.0 * k as f64 / active_slots_coeff).floor() as u64;
+            // Haskell `shelleyEraParams`: both the safe zone and the genesis
+            // window are the stability window `ceil(3k/f)`
+            // (`computeStabilityWindow`). All real networks yield exact
+            // integers so ceil == floor there, but ceiling is the formula.
+            let stability_window = dugite_consensus::stability_window_slots(k, active_slots_coeff);
 
             let shelley_params = EraParams {
                 epoch_size: shelley_epoch_length,
                 slot_length_ms: shelley_slot_length_ms,
-                safe_zone: shelley_safe_zone,
+                safe_zone: stability_window,
+                genesis_window: stability_window,
             };
 
             let shelley_transition_epoch = epoch::shelley_transition_epoch_for_magic(network_magic);
 
-            let mut eh = EraHistory::from_genesis(
-                byron_params,
-                shelley_params,
-                shelley_transition_epoch,
-                genesis_window,
-            );
+            let mut eh =
+                EraHistory::from_genesis(byron_params, shelley_params, shelley_transition_epoch);
 
             // If we loaded a ledger snapshot, reconstruct past era transitions
             // so the era history covers all eras up to the current ledger era.

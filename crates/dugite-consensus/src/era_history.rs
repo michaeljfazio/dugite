@@ -49,8 +49,21 @@ pub struct EraParams {
     /// Milliseconds per slot.
     pub slot_length_ms: u64,
     /// Number of slots past the era end bound where predictions are still valid.
-    /// Byron uses `2 * k`, Shelley+ uses `floor(3 * k / active_slots_coeff)`.
+    /// Byron uses `2 * k`, Shelley+ uses `ceil(3 * k / active_slots_coeff)`
+    /// (Haskell `computeStabilityWindow`).
     pub safe_zone: u64,
+    /// Genesis window `sgen` for the Ouroboros Genesis density comparison
+    /// (Haskell `EraParams.eraGenesisWin`).
+    ///
+    /// Byron: `2 * k` (`byronEraParams`). Shelley-based eras:
+    /// `ceil(3 * k / active_slots_coeff)` — the stability window
+    /// (`shelleyEraParams` / `computeStabilityWindow`).
+    ///
+    /// Defaulted on deserialization so pre-existing serialized forms
+    /// without the field still decode (value 0 = "unknown"; callers that
+    /// need a real window must rebuild from genesis).
+    #[serde(default)]
+    pub genesis_window: u64,
 }
 
 /// A bound marking where an era starts or ends.
@@ -89,8 +102,6 @@ pub struct EraSummaryEntry {
     pub end: Option<Bound>,
     /// Era-specific parameters.
     pub params: EraParams,
-    /// Genesis window = 2 * k (security parameter). Used in N2C export.
-    pub genesis_window: u64,
 }
 
 impl EraSummaryEntry {
@@ -172,11 +183,12 @@ impl EraHistory {
     /// Construct a new era history from Byron and Shelley genesis parameters.
     ///
     /// - `byron_params`: Byron-era parameters (epoch_size = 10*k for mainnet,
-    ///   slot_length_ms = 20000 for mainnet / 1000 for testnets).
-    /// - `shelley_params`: Shelley-era parameters from genesis.
+    ///   slot_length_ms = 20000 for mainnet / 1000 for testnets). Its
+    ///   `genesis_window` must be `2 * k` (Haskell `byronEraParams`).
+    /// - `shelley_params`: Shelley-era parameters from genesis. Its
+    ///   `genesis_window` must be `ceil(3k/f)` (Haskell `shelleyEraParams`).
     /// - `shelley_transition_epoch`: The epoch at which the Byron→Shelley hard fork
     ///   occurred. For testnets with instant transitions, this is 0.
-    /// - `genesis_window`: 2 * k (security parameter), used in N2C export.
     ///
     /// Creates a Byron entry (closed at `shelley_transition_epoch`) followed by an
     /// open Shelley entry. For networks with `shelley_transition_epoch == 0`, Byron
@@ -185,7 +197,6 @@ impl EraHistory {
         byron_params: EraParams,
         shelley_params: EraParams,
         shelley_transition_epoch: u64,
-        genesis_window: u64,
     ) -> Self {
         let byron_start = Bound::origin();
 
@@ -213,14 +224,12 @@ impl EraHistory {
                     start: byron_start,
                     end: Some(byron_end),
                     params: byron_params,
-                    genesis_window,
                 },
                 EraSummaryEntry {
                     era: Era::Shelley,
                     start: shelley_start,
                     end: None, // open era
                     params: shelley_params,
-                    genesis_window,
                 },
             ],
         }
@@ -247,15 +256,16 @@ impl EraHistory {
         // Close the current era.
         current.end = Some(end_bound.clone());
 
-        // The new era starts where the old one ended and inherits the same params.
-        let genesis_window = current.genesis_window;
+        // The new era starts where the old one ended and inherits the same params
+        // (all Shelley-based eras share epoch_size, slot_length, safe_zone and
+        // genesis_window — Haskell builds every post-Shelley era from the same
+        // `shelleyEraParams`).
         let new_params = current.params.clone();
         self.entries.push(EraSummaryEntry {
             era: new_era,
             start: end_bound,
             end: None,
             params: new_params,
-            genesis_window,
         });
     }
 
@@ -444,6 +454,18 @@ impl EraHistory {
         Some(horizon)
     }
 
+    /// Genesis window `sgen` applicable at `slot`.
+    ///
+    /// Mirrors Haskell's `slotToGenesisWindow` HardFork-history query used by
+    /// the GDD governor (`Ouroboros.Consensus.Genesis.Governor.evaluateGDD`):
+    /// the window is looked up for the era containing the slot. Returns
+    /// `Err(PastHorizonError)` when the slot is beyond the known era history —
+    /// the GDD must SKIP its evaluation for that cycle in that case.
+    pub fn genesis_window_for_slot(&self, slot: SlotNo) -> Result<u64, PastHorizonError> {
+        self.find_era_for_slot(slot.0)
+            .map(|entry| entry.params.genesis_window)
+    }
+
     // -----------------------------------------------------------------------
     // N2C export
     // -----------------------------------------------------------------------
@@ -468,7 +490,7 @@ impl EraHistory {
                 epoch_size: entry.params.epoch_size,
                 slot_length_ms: entry.params.slot_length_ms,
                 safe_zone: entry.params.safe_zone,
-                genesis_window: entry.genesis_window,
+                genesis_window: entry.params.genesis_window,
             })
             .collect()
     }
@@ -593,13 +615,13 @@ mod tests {
     const MAINNET_K: u64 = 2160;
     const MAINNET_ACTIVE_SLOTS_COEFF: f64 = 0.05;
     const MAINNET_SHELLEY_TRANSITION_EPOCH: u64 = 208;
-    const MAINNET_GENESIS_WINDOW: u64 = MAINNET_K * 2; // 4320
 
     fn mainnet_byron_params() -> EraParams {
         EraParams {
             epoch_size: MAINNET_BYRON_EPOCH_SIZE,
             slot_length_ms: MAINNET_BYRON_SLOT_MS,
             safe_zone: MAINNET_K * 2,
+            genesis_window: MAINNET_K * 2, // byronEraParams: 2k
         }
     }
 
@@ -608,6 +630,7 @@ mod tests {
             epoch_size: MAINNET_SHELLEY_EPOCH_SIZE,
             slot_length_ms: MAINNET_SHELLEY_SLOT_MS,
             safe_zone: (3.0 * MAINNET_K as f64 / MAINNET_ACTIVE_SLOTS_COEFF).floor() as u64,
+            genesis_window: 129_600, // shelleyEraParams: ceil(3k/f)
         }
     }
 
@@ -616,13 +639,13 @@ mod tests {
     const PREVIEW_SHELLEY_SLOT_MS: u64 = 1000;
     const PREVIEW_K: u64 = 432;
     const PREVIEW_ACTIVE_SLOTS_COEFF: f64 = 0.05;
-    const PREVIEW_GENESIS_WINDOW: u64 = PREVIEW_K * 2; // 864
 
     fn preview_byron_params() -> EraParams {
         EraParams {
             epoch_size: 4320,
             slot_length_ms: 1000,
             safe_zone: PREVIEW_K * 2,
+            genesis_window: PREVIEW_K * 2, // byronEraParams: 2k
         }
     }
 
@@ -631,6 +654,7 @@ mod tests {
             epoch_size: PREVIEW_SHELLEY_EPOCH_SIZE,
             slot_length_ms: PREVIEW_SHELLEY_SLOT_MS,
             safe_zone: (3.0 * PREVIEW_K as f64 / PREVIEW_ACTIVE_SLOTS_COEFF).floor() as u64,
+            genesis_window: 25_920, // shelleyEraParams: ceil(3*432/0.05)
         }
     }
 
@@ -640,7 +664,6 @@ mod tests {
             mainnet_byron_params(),
             mainnet_shelley_params(),
             MAINNET_SHELLEY_TRANSITION_EPOCH,
-            MAINNET_GENESIS_WINDOW,
         );
 
         assert_eq!(eh.len(), 2);
@@ -668,14 +691,32 @@ mod tests {
     }
 
     #[test]
+    fn test_genesis_window_for_slot_per_era() {
+        // GDD `slotToGenesisWindow` analogue: Byron slots → 2k, Shelley+ slots
+        // → ceil(3k/f); past-horizon slots are an error (GDD must skip).
+        let eh = EraHistory::from_genesis(
+            mainnet_byron_params(),
+            mainnet_shelley_params(),
+            MAINNET_SHELLEY_TRANSITION_EPOCH,
+        );
+        // Byron era slot
+        assert_eq!(eh.genesis_window_for_slot(SlotNo(0)).unwrap(), 4320);
+        assert_eq!(eh.genesis_window_for_slot(SlotNo(4_492_799)).unwrap(), 4320);
+        // First Shelley slot and beyond (open era)
+        assert_eq!(
+            eh.genesis_window_for_slot(SlotNo(4_492_800)).unwrap(),
+            129_600
+        );
+        assert_eq!(
+            eh.genesis_window_for_slot(SlotNo(100_000_000)).unwrap(),
+            129_600
+        );
+    }
+
+    #[test]
     fn test_from_genesis_preview() {
         // Preview: shelley_transition_epoch = 0 (instant Byron→Shelley)
-        let eh = EraHistory::from_genesis(
-            preview_byron_params(),
-            preview_shelley_params(),
-            0,
-            PREVIEW_GENESIS_WINDOW,
-        );
+        let eh = EraHistory::from_genesis(preview_byron_params(), preview_shelley_params(), 0);
 
         assert_eq!(eh.len(), 2);
         assert_eq!(eh.current_era(), Era::Shelley);
@@ -694,12 +735,7 @@ mod tests {
     #[test]
     fn test_record_era_transitions() {
         // Start with preview-like history (instant Byron)
-        let mut eh = EraHistory::from_genesis(
-            preview_byron_params(),
-            preview_shelley_params(),
-            0,
-            PREVIEW_GENESIS_WINDOW,
-        );
+        let mut eh = EraHistory::from_genesis(preview_byron_params(), preview_shelley_params(), 0);
 
         // Record: Shelley→Allegra at epoch 0 (instant), Allegra→Mary at epoch 0,
         // Mary→Alonzo at epoch 0, Alonzo→Babbage at epoch 3, Babbage→Conway at epoch 646
@@ -750,7 +786,6 @@ mod tests {
             mainnet_byron_params(),
             mainnet_shelley_params(),
             MAINNET_SHELLEY_TRANSITION_EPOCH,
-            MAINNET_GENESIS_WINDOW,
         );
 
         let system_start = dugite_primitives::time::mainnet_system_start();
@@ -771,7 +806,6 @@ mod tests {
             mainnet_byron_params(),
             mainnet_shelley_params(),
             MAINNET_SHELLEY_TRANSITION_EPOCH,
-            MAINNET_GENESIS_WINDOW,
         );
 
         let system_start = dugite_primitives::time::mainnet_system_start();
@@ -808,7 +842,6 @@ mod tests {
             mainnet_byron_params(),
             mainnet_shelley_params(),
             MAINNET_SHELLEY_TRANSITION_EPOCH,
-            MAINNET_GENESIS_WINDOW,
         );
         let system_start = dugite_primitives::time::mainnet_system_start();
 
@@ -833,7 +866,6 @@ mod tests {
             mainnet_byron_params(),
             mainnet_shelley_params(),
             MAINNET_SHELLEY_TRANSITION_EPOCH,
-            MAINNET_GENESIS_WINDOW,
         );
 
         // Slot 0 = epoch 0, offset 0 (Byron)
@@ -874,7 +906,6 @@ mod tests {
             mainnet_byron_params(),
             mainnet_shelley_params(),
             MAINNET_SHELLEY_TRANSITION_EPOCH,
-            MAINNET_GENESIS_WINDOW,
         );
 
         // Byron epoch 0 → slot 0
@@ -910,13 +941,15 @@ mod tests {
             epoch_size: 100,
             slot_length_ms: 1000,
             safe_zone: 200,
+            genesis_window: 100,
         };
         let shelley_params = EraParams {
             epoch_size: 100,
             slot_length_ms: 1000,
             safe_zone: 200,
+            genesis_window: 100,
         };
-        let mut eh = EraHistory::from_genesis(byron_params, shelley_params, 10, 100);
+        let mut eh = EraHistory::from_genesis(byron_params, shelley_params, 10);
         // Close Shelley at epoch 20 and open Allegra
         eh.record_era_transition(Era::Allegra, 20);
 
@@ -942,7 +975,6 @@ mod tests {
             mainnet_byron_params(),
             mainnet_shelley_params(),
             MAINNET_SHELLEY_TRANSITION_EPOCH,
-            MAINNET_GENESIS_WINDOW,
         );
 
         // Mainnet era transitions (from build_era_summaries hardcoded values):
@@ -962,6 +994,12 @@ mod tests {
         assert_eq!(byron.slot_length_ms, 20000);
         assert_eq!(byron.safe_zone, 4320); // 2 * 2160
         assert_eq!(byron.genesis_window, 4320);
+
+        // Per-era genesis window (Haskell eraGenesisWin): Byron = 2k, Shelley+
+        // = ceil(3k/f) — the N2C era-summaries export must carry the per-era
+        // value, NOT a uniform 2k.
+        let shelley_export = &exports[1];
+        assert_eq!(shelley_export.genesis_window, 129_600);
 
         let byron_end = byron.end.as_ref().unwrap();
         assert_eq!(byron_end.slot, 4_492_800);
@@ -1001,7 +1039,6 @@ mod tests {
             preview_byron_params(),
             preview_shelley_params(),
             0, // instant Byron
-            PREVIEW_GENESIS_WINDOW,
         );
 
         eh.record_era_transition(Era::Allegra, 0);
@@ -1038,12 +1075,7 @@ mod tests {
     #[test]
     fn test_preview_era_summaries() {
         // Build full preview history matching current hardcoded values
-        let mut eh = EraHistory::from_genesis(
-            preview_byron_params(),
-            preview_shelley_params(),
-            0,
-            PREVIEW_GENESIS_WINDOW,
-        );
+        let mut eh = EraHistory::from_genesis(preview_byron_params(), preview_shelley_params(), 0);
 
         // Preview: Byron/Shelley/Allegra/Mary at epoch 0 (instant)
         // Alonzo 0→3, Babbage 3→646, Conway 646+
@@ -1091,7 +1123,6 @@ mod tests {
             mainnet_byron_params(),
             mainnet_shelley_params(),
             MAINNET_SHELLEY_TRANSITION_EPOCH,
-            MAINNET_GENESIS_WINDOW,
         );
 
         let json = serde_json::to_string(&eh).unwrap();
@@ -1113,14 +1144,16 @@ mod tests {
             epoch_size: 500,
             slot_length_ms: 2000, // 2s slots
             safe_zone: 100,
+            genesis_window: 100,
         };
         let shelley_params = EraParams {
             epoch_size: 1000,
             slot_length_ms: 500, // 0.5s slots
             safe_zone: 200,
+            genesis_window: 100,
         };
 
-        let eh = EraHistory::from_genesis(byron_params, shelley_params, 5, 100);
+        let eh = EraHistory::from_genesis(byron_params, shelley_params, 5);
         let system_start = dugite_primitives::time::mainnet_system_start();
 
         // Byron: 5 epochs * 500 slots = 2500 slots at 2s each = 5000s
@@ -1154,8 +1187,9 @@ mod tests {
             epoch_size: 400,
             slot_length_ms: 1000,
             safe_zone: 360,
+            genesis_window: 120,
         };
-        EraHistory::from_genesis(p.clone(), p, 0, 120)
+        EraHistory::from_genesis(p.clone(), p, 0)
     }
 
     #[test]
@@ -1213,8 +1247,9 @@ mod tests {
             epoch_size: 400,
             slot_length_ms: 1000,
             safe_zone: 0,
+            genesis_window: 120,
         };
-        let eh = EraHistory::from_genesis(p.clone(), p, 0, 120);
+        let eh = EraHistory::from_genesis(p.clone(), p, 0);
         assert_eq!(eh.safe_zone_horizon_slot(SlotNo(100)), None);
     }
 
@@ -1230,8 +1265,9 @@ mod tests {
             epoch_size: 432000,
             slot_length_ms: 1000,
             safe_zone: 129600,
+            genesis_window: 129600,
         };
-        let eh = EraHistory::from_genesis(p.clone(), p, 0, 4320);
+        let eh = EraHistory::from_genesis(p.clone(), p, 0);
         // anchor=1, +129600 = 129601. r=129601, q=0, q+1=1. horizon = 432000.
         assert_eq!(eh.safe_zone_horizon_slot(SlotNo(0)), Some(432000));
     }
