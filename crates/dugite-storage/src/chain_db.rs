@@ -44,6 +44,27 @@ pub enum ChainDBError {
 /// passed to [`ChainDB::open_with_config`].
 pub const DEFAULT_SECURITY_PARAM_K: usize = 2160;
 
+/// `true` iff the stored block CBOR is a Byron Epoch Boundary Block.
+///
+/// Every stored block is the multi-era envelope `array(2) [era_tag, inner]`;
+/// era_tag 0 = ByronEbb (see `dugite-serialization` `EraTag::from_u64`), so
+/// an EBB always starts with the bytes `0x82 0x00`.  cardano-node records the
+/// same fact out-of-band via the primary-index relative slot (rel slot 0 of
+/// an EBB-capable chunk = EBB, `Ouroboros.Consensus.Storage.ImmutableDB.
+/// Chunks.Layout.relativeSlotIsEBB`); dugite's variable-length chunks derive
+/// it from the envelope tag instead — same information, byte-exact blocks.
+///
+/// Note: unlike cardano-node's `BlockOrEBB` secondary-index convention
+/// (EpochNo for EBBs), the flush path stores the EBB's ABSOLUTE slot in the
+/// secondary-index slot field.  Dugite chunks span many epochs, the slot
+/// field drives binary search (`ChunkMeta.first_slot`/`last_slot`), and the
+/// pre-existing EBB entries already use absolute slots — keeping it absolute
+/// preserves the monotonic non-decreasing slot invariant.
+#[inline]
+pub(crate) fn is_byron_ebb_envelope(cbor: &[u8]) -> bool {
+    cbor.len() >= 2 && cbor[0] == 0x82 && cbor[1] == 0x00
+}
+
 // ---------------------------------------------------------------------------
 // ChainDB
 // ---------------------------------------------------------------------------
@@ -629,6 +650,58 @@ impl ChainDB {
         }
     }
 
+    /// Get the chain-order successor of the block identified by `(slot, hash)`.
+    ///
+    /// Point-aware counterpart of [`get_next_block_after_slot`]: a Byron EBB
+    /// shares its absolute slot with the first main block of the epoch, so a
+    /// slot-only cursor cannot step from the EBB to the same-slot main block.
+    /// Mirrors cardano-node, whose ChainSync followers and BlockFetch ranges
+    /// are keyed by `Point` (slot + hash), with same-slot EBB/main pairs
+    /// disambiguated by header hash.
+    ///
+    /// Resolution order:
+    /// 1. cursor on the volatile selected chain → its selected-chain
+    ///    successor (`None` = cursor is the tip);
+    /// 2. cursor in the immutable chain → next entry in chunk order; when
+    ///    the cursor is the immutable tip, the oldest volatile
+    ///    selected-chain block at-or-after `slot` (the seam);
+    /// 3. unknown cursor (fork block / stale hash) → the pre-existing
+    ///    slot-based merge.
+    pub fn get_next_block_after_point(
+        &self,
+        slot: SlotNo,
+        hash: &BlockHeaderHash,
+    ) -> Result<Option<(SlotNo, BlockHeaderHash, Vec<u8>)>, ChainDBError> {
+        if self.volatile.get_block(hash).is_some() {
+            if self.volatile.is_on_selected_chain(hash) {
+                return Ok(self
+                    .volatile
+                    .get_next_block_after_point(hash)
+                    .map(|(s, h, cbor)| (SlotNo(s), h, cbor.to_vec())));
+            }
+            // Fork-block cursor — fall back to the slot-based merge.
+            return self.get_next_block_after_slot(slot);
+        }
+
+        if self.immutable.has_block(hash) {
+            if let Some((s, h, cbor)) = self.immutable.get_next_block_after_point(slot.0, hash) {
+                return Ok(Some((SlotNo(s), h, cbor)));
+            }
+            // Cursor is the immutable tip — the successor (if any) is the
+            // oldest volatile selected-chain block at-or-after `slot`.  A
+            // same-slot sibling that PRECEDES the cursor cannot appear here:
+            // the EBB is flushed before its same-slot main block, so by the
+            // time the cursor is in immutable, no earlier same-slot block
+            // remains in the volatile window.
+            return Ok(self
+                .volatile
+                .get_block_at_or_after_slot(slot.0)
+                .map(|(s, h, cbor)| (SlotNo(s), h, cbor.to_vec())));
+        }
+
+        self.get_next_block_after_slot(slot)
+    }
+
     /// Get the first block at or after a given slot (inclusive `>=`).
     ///
     /// Checks both ImmutableDB and VolatileDB, returning the block with the
@@ -845,7 +918,12 @@ impl ChainDB {
         // `selected_chain_entries` returns (hash, slot, block_no, prev_hash).
         let mut to_finalize: Vec<(u64, Hash32, u64, Vec<u8>)> = Vec::new(); // (slot, hash, block_no, cbor)
         for (hash, slot, block_no, _prev_hash) in self.volatile.selected_chain_entries() {
-            if block_no < start_block_no {
+            // `block_no + 1 < start` (not `block_no < start`): a Byron EBB
+            // shares its block_no with the predecessor main block, so an
+            // entry at exactly `last_flushed_block_no` may be an unflushed
+            // EBB.  The `has_block` check below skips the already-flushed
+            // predecessor itself.  See `selected_chain_entries_bounded`.
+            if block_no + 1 < start_block_no {
                 // Already flushed in a prior call — skip cheaply.
                 continue;
             }
@@ -870,8 +948,13 @@ impl ChainDB {
 
         // Append canonical-chain blocks to ImmutableDB in oldest-first order.
         for (slot, hash, block_no, cbor) in &to_finalize {
-            self.immutable
-                .append_block(*slot, *block_no, hash, cbor, false)?;
+            self.immutable.append_block(
+                *slot,
+                *block_no,
+                hash,
+                cbor,
+                is_byron_ebb_envelope(cbor),
+            )?;
         }
 
         // Update immutable tip and last-flushed tracking.
@@ -962,8 +1045,13 @@ impl ChainDB {
         let count = to_finalize.len() as u64;
 
         for (slot, hash, block_no, cbor) in &to_finalize {
-            self.immutable
-                .append_block(*slot, *block_no, hash, cbor, false)?;
+            self.immutable.append_block(
+                *slot,
+                *block_no,
+                hash,
+                cbor,
+                is_byron_ebb_envelope(cbor),
+            )?;
         }
 
         if let Some((slot, hash, block_no, _)) = to_finalize.last() {
@@ -1397,6 +1485,231 @@ mod tests {
         // Volatile should retain exactly k blocks
         assert_eq!(db.volatile.len(), custom_k);
     }
+
+    /// A Byron EBB shares its `block_no` with the predecessor main block
+    /// (EBBs do not increment the chain difficulty).  When a flush batch ends
+    /// exactly at the predecessor, the next batch starts at
+    /// `last_flushed_block_no + 1` and must NOT skip the EBB whose block_no
+    /// equals `last_flushed_block_no`.  This is the exact mechanism that
+    /// dropped the mainnet EBBs for epochs 112/135/145 (1-in-50 chance per
+    /// boundary with FLUSH_BATCH_SIZE=50).
+    #[test]
+    fn test_flush_batch_boundary_does_not_drop_same_block_no_ebb() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db =
+            ChainDB::open_with_config(dir.path(), &crate::config::ImmutableConfig::default(), 2)
+                .unwrap();
+
+        // Chain: main blocks 1..=5 (block_no == slot), then the EBB at the
+        // epoch boundary sharing block_no 5 with its predecessor and slot 6
+        // with its successor, then main blocks 6..=11.
+        for i in 1..=5u64 {
+            db.add_block(
+                make_hash(i as u8),
+                SlotNo(i),
+                BlockNo(i),
+                make_hash(i as u8 - 1),
+                format!("block{i}").into_bytes(),
+            )
+            .unwrap();
+        }
+        let ebb_hash = make_hash(0x66);
+        // Realistic EBB envelope prefix: [0, ebb] = 0x82 0x00 ...
+        db.add_block(
+            ebb_hash,
+            SlotNo(6),
+            BlockNo(5),
+            make_hash(5),
+            vec![0x82, 0x00, 0x83],
+        )
+        .unwrap();
+        db.add_block(
+            make_hash(6),
+            SlotNo(6),
+            BlockNo(6),
+            ebb_hash,
+            b"block6".to_vec(),
+        )
+        .unwrap();
+        for i in 7..=11u64 {
+            db.add_block(
+                make_hash(i as u8),
+                SlotNo(i),
+                BlockNo(i),
+                make_hash(i as u8 - 1),
+                format!("block{i}").into_bytes(),
+            )
+            .unwrap();
+        }
+
+        // First batch of 5 collects exactly block_no 1..=5 (hashes 1..5) and
+        // ends at the EBB's predecessor: last_flushed_block_no becomes 5.
+        let flushed = db.flush_to_immutable_batch(5).unwrap();
+        assert_eq!(flushed, 5);
+        assert!(db.immutable.has_block(&make_hash(5)));
+
+        // Second batch starts at block_no 6 — the EBB (block_no 5) must
+        // still be flushed, in chain order (before the slot-6 main block).
+        let flushed = db.flush_to_immutable_batch(5).unwrap();
+        assert!(flushed >= 2, "second flush batch flushed {flushed} blocks");
+        assert!(
+            db.immutable.has_block(&ebb_hash),
+            "EBB sharing block_no with flushed predecessor was dropped by flush"
+        );
+        assert!(db.immutable.has_block(&make_hash(6)));
+    }
+
+    /// The genesis EBB has block_no 0 (chain difficulty 0) while
+    /// `last_flushed_block_no` starts at 0 on a fresh DB, so the
+    /// `block_no < start_block_no` walk skipped it deterministically —
+    /// mainnet chunk 00000 starts at the first main block with the genesis
+    /// EBB missing.
+    #[test]
+    fn test_flush_includes_genesis_ebb_at_block_no_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db =
+            ChainDB::open_with_config(dir.path(), &crate::config::ImmutableConfig::default(), 2)
+                .unwrap();
+
+        // Genesis EBB: block_no 0 at slot 0, then main blocks 1..=8
+        // (the first main block shares slot 0 with the EBB on mainnet).
+        let ebb_hash = make_hash(0xEE);
+        db.add_block(
+            ebb_hash,
+            SlotNo(0),
+            BlockNo(0),
+            make_hash(0xAA),
+            vec![0x82, 0x00, 0x83],
+        )
+        .unwrap();
+        db.add_block(
+            make_hash(1),
+            SlotNo(0),
+            BlockNo(1),
+            ebb_hash,
+            b"block1".to_vec(),
+        )
+        .unwrap();
+        for i in 2..=8u64 {
+            db.add_block(
+                make_hash(i as u8),
+                SlotNo(i - 1),
+                BlockNo(i),
+                make_hash(i as u8 - 1),
+                format!("block{i}").into_bytes(),
+            )
+            .unwrap();
+        }
+
+        let flushed = db.flush_to_immutable().unwrap();
+        assert!(flushed >= 2, "flush flushed {flushed} blocks");
+        assert!(
+            db.immutable.has_block(&ebb_hash),
+            "genesis EBB at block_no 0 was dropped by flush"
+        );
+        assert!(db.immutable.has_block(&make_hash(1)));
+        // Chain order: the EBB must be the first block in the immutable
+        // chunk — at-or-after slot 0 returns it before the slot-0 main block.
+        // (`get_block_at_or_after_slot` reads the on-disk secondary index,
+        // so persist the active chunk first.)
+        db.persist().unwrap();
+        let (slot, hash, _) = db
+            .immutable
+            .get_block_at_or_after_slot(0)
+            .expect("immutable must contain the genesis EBB");
+        assert_eq!(slot, 0);
+        assert_eq!(
+            hash, ebb_hash,
+            "genesis EBB must precede the slot-0 main block"
+        );
+    }
+
+    /// Point-aware successor lookup across the volatile/immutable seam:
+    /// when the immutable tip is an EBB, its same-slot main-block successor
+    /// still lives in the VolatileDB and must be returned.
+    #[test]
+    fn test_get_next_block_after_point_across_immutable_volatile_seam() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db =
+            ChainDB::open_with_config(dir.path(), &crate::config::ImmutableConfig::default(), 2)
+                .unwrap();
+
+        for i in 1..=5u64 {
+            db.add_block(
+                make_hash(i as u8),
+                SlotNo(i),
+                BlockNo(i),
+                make_hash(i as u8 - 1),
+                format!("block{i}").into_bytes(),
+            )
+            .unwrap();
+        }
+        let ebb_hash = make_hash(0x66);
+        db.add_block(
+            ebb_hash,
+            SlotNo(6),
+            BlockNo(5),
+            make_hash(5),
+            vec![0x82, 0x00, 0x83],
+        )
+        .unwrap();
+        db.add_block(
+            make_hash(6),
+            SlotNo(6),
+            BlockNo(6),
+            ebb_hash,
+            b"block6".to_vec(),
+        )
+        .unwrap();
+        for i in 7..=11u64 {
+            db.add_block(
+                make_hash(i as u8),
+                SlotNo(i),
+                BlockNo(i),
+                make_hash(i as u8 - 1),
+                format!("block{i}").into_bytes(),
+            )
+            .unwrap();
+        }
+
+        // Flush 1..=5, then exactly the EBB, leaving the slot-6 main block
+        // in the VolatileDB: the immutable tip is now the EBB at slot 6.
+        assert_eq!(db.flush_to_immutable_batch(5).unwrap(), 5);
+        assert_eq!(db.flush_to_immutable_batch(1).unwrap(), 1);
+        assert!(db.immutable.has_block(&ebb_hash));
+        assert!(!db.immutable.has_block(&make_hash(6)));
+        db.persist().unwrap();
+
+        // Immutable-interior step: pred -> EBB (same chunk, on disk).
+        let (s, hash, _) = db
+            .get_next_block_after_point(SlotNo(5), &make_hash(5))
+            .unwrap()
+            .expect("EBB after block 5");
+        assert_eq!((s, hash), (SlotNo(6), ebb_hash));
+
+        // Seam step: EBB (immutable tip) -> same-slot main block (volatile).
+        let (s, hash, cbor) = db
+            .get_next_block_after_point(SlotNo(6), &ebb_hash)
+            .unwrap()
+            .expect("same-slot main block after EBB across the seam");
+        assert_eq!((s, hash), (SlotNo(6), make_hash(6)));
+        assert_eq!(cbor, b"block6");
+
+        // Volatile-interior step: main block -> next volatile block.
+        let (s, hash, _) = db
+            .get_next_block_after_point(SlotNo(6), &make_hash(6))
+            .unwrap()
+            .expect("block 7 after slot-6 main block");
+        assert_eq!((s, hash), (SlotNo(7), make_hash(7)));
+
+        // Unknown cursor falls back to the slot-based merge.
+        let (s, _, _) = db
+            .get_next_block_after_point(SlotNo(6), &make_hash(0x99))
+            .unwrap()
+            .expect("slot-based fallback");
+        assert_eq!(s, SlotNo(7));
+    }
+
     #[test]
     fn test_flush_all_to_immutable() {
         let dir = tempfile::tempdir().unwrap();

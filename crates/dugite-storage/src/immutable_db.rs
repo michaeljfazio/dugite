@@ -871,6 +871,98 @@ impl ImmutableDB {
         None
     }
 
+    /// Get the chain-order successor of the block identified by `(slot, hash)`.
+    ///
+    /// A Byron Epoch Boundary Block (EBB) shares its absolute slot with the
+    /// first main block of the epoch, so a slot-only cursor
+    /// ([`get_next_block_after_slot`]) cannot step from the EBB to the
+    /// same-slot main block — it would skip it.  This point-aware lookup
+    /// locates the entry for `(slot, hash)` in the secondary index and
+    /// returns the NEXT entry in chain order (same chunk, or the first entry
+    /// of a following chunk), mirroring cardano-node's by-point iterators
+    /// (`Ouroboros.Consensus.Storage.ImmutableDB.Impl.getSlotInfo`
+    /// disambiguates same-slot EBB/main pairs by header hash).
+    ///
+    /// When `(slot, hash)` is not found (fork block, volatile-only cursor,
+    /// or stale hash), falls back to the strict `slot >` lookup, which is
+    /// the pre-existing behavior.
+    pub fn get_next_block_after_point(
+        &self,
+        slot: u64,
+        hash: &Hash32,
+    ) -> Option<(u64, Hash32, Vec<u8>)> {
+        // Chunks are chain-ordered with non-decreasing slots; the cursor
+        // entry lives in the first chunk whose last_slot >= slot.
+        let start_idx = self.chunks.partition_point(|c| c.last_slot < slot);
+
+        // True once the cursor entry has been located — the next valid
+        // entry (possibly in a later chunk) is the result.
+        let mut serve_next = false;
+
+        for chunk_meta in &self.chunks[start_idx..] {
+            let secondary_path = self
+                .dir
+                .join(format!("{:05}.secondary", chunk_meta.chunk_num));
+            let secondary_data = match fs::read(&secondary_path) {
+                Ok(data) => data,
+                Err(_) => continue,
+            };
+
+            let chunk_path = self.dir.join(format!("{:05}.chunk", chunk_meta.chunk_num));
+            let chunk_len = match chunk_path.metadata() {
+                Ok(m) => m.len(),
+                Err(_) => continue,
+            };
+
+            let mut pos = 0;
+            while pos + SECONDARY_ENTRY_SIZE <= secondary_data.len() {
+                let data = &secondary_data[pos..];
+                let (Some(block_offset), Some(entry_slot)) =
+                    (read_be_u64(&data[0..8]), read_be_u64(&data[48..56]))
+                else {
+                    pos += SECONDARY_ENTRY_SIZE;
+                    continue;
+                };
+
+                if serve_next {
+                    let next_pos = pos + SECONDARY_ENTRY_SIZE;
+                    let block_end = if next_pos + SECONDARY_ENTRY_SIZE <= secondary_data.len() {
+                        read_be_u64(&secondary_data[next_pos..next_pos + 8]).unwrap_or(chunk_len)
+                    } else {
+                        chunk_len
+                    };
+                    let loc = BlockLocation {
+                        chunk_num: chunk_meta.chunk_num,
+                        block_offset,
+                        block_end,
+                    };
+                    let mut header_hash = [0u8; 32];
+                    header_hash.copy_from_slice(&data[16..48]);
+                    if let Some(cbor) = self.read_block_at(&loc) {
+                        return Some((entry_slot, Hash32::from_bytes(header_hash), cbor));
+                    }
+                    // Unreadable block — keep scanning (matches the slot
+                    // cursor's skip-on-read-failure behavior).
+                } else if entry_slot == slot && data[16..48] == *hash.as_bytes() {
+                    serve_next = true;
+                } else if entry_slot > slot {
+                    // Scanned past the cursor slot without finding the hash —
+                    // the cursor block is not in the immutable chain.
+                    return self.get_next_block_after_slot(slot);
+                }
+
+                pos += SECONDARY_ENTRY_SIZE;
+            }
+        }
+
+        if serve_next {
+            // Cursor is the immutable tip — no successor here.
+            return None;
+        }
+        // Cursor slot beyond every chunk, or hash never seen.
+        self.get_next_block_after_slot(slot)
+    }
+
     /// Get the first block at or after a given slot (inclusive `>=` comparison).
     ///
     /// Unlike [`get_next_block_after_slot`] which uses strict `>`, this method
@@ -1581,6 +1673,97 @@ mod tests {
         let db = ImmutableDB::open(dir.path()).unwrap();
         assert_eq!(db.total_blocks(), 0);
         assert_eq!(db.tip_slot(), 0);
+    }
+
+    /// A Byron EBB and the first main block of the epoch share an absolute
+    /// slot (mainnet: 171 of 176 Byron boundaries).  A slot-only cursor
+    /// (`get_next_block_after_slot`) cannot step from the EBB to the
+    /// same-slot main block — the point-aware lookup must.
+    #[test]
+    fn test_get_next_block_after_point_steps_through_same_slot_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let pred = [1u8; 32];
+        let ebb = [2u8; 32];
+        let main = [3u8; 32];
+        let next = [4u8; 32];
+        create_test_chunk(
+            dir.path(),
+            0,
+            &[
+                (b"pred", pred, 99),
+                (b"ebb_", ebb, 100),
+                (b"main", main, 100),
+                (b"next", next, 101),
+            ],
+        );
+        let db = ImmutableDB::open(dir.path()).unwrap();
+
+        // pred -> EBB (first block at slot 100, chain order)
+        let (s, h, cbor) = db
+            .get_next_block_after_point(99, &Hash32::from_bytes(pred))
+            .expect("EBB after pred");
+        assert_eq!((s, h), (100, Hash32::from_bytes(ebb)));
+        assert_eq!(cbor, b"ebb_");
+
+        // EBB -> same-slot main block (the case slot-only cursors skip)
+        let (s, h, cbor) = db
+            .get_next_block_after_point(100, &Hash32::from_bytes(ebb))
+            .expect("main block after EBB at the same slot");
+        assert_eq!((s, h), (100, Hash32::from_bytes(main)));
+        assert_eq!(cbor, b"main");
+
+        // main -> next slot
+        let (s, h, _) = db
+            .get_next_block_after_point(100, &Hash32::from_bytes(main))
+            .expect("block after slot-100 main");
+        assert_eq!((s, h), (101, Hash32::from_bytes(next)));
+
+        // tip -> none
+        assert!(db
+            .get_next_block_after_point(101, &Hash32::from_bytes(next))
+            .is_none());
+    }
+
+    /// When the cursor hash is not stored at the given slot (e.g. a fork or
+    /// volatile-only block), fall back to the strict `slot >` lookup.
+    #[test]
+    fn test_get_next_block_after_point_falls_back_for_unknown_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_chunk(
+            dir.path(),
+            0,
+            &[
+                (b"ebb_", [2u8; 32], 100),
+                (b"main", [3u8; 32], 100),
+                (b"next", [4u8; 32], 101),
+            ],
+        );
+        let db = ImmutableDB::open(dir.path()).unwrap();
+
+        let (s, h, _) = db
+            .get_next_block_after_point(100, &Hash32::from_bytes([0x99; 32]))
+            .expect("fallback to strict-after lookup");
+        assert_eq!((s, h), (101, Hash32::from_bytes([4u8; 32])));
+    }
+
+    /// The chain-order successor of a chunk's last block is the next chunk's
+    /// first block.
+    #[test]
+    fn test_get_next_block_after_point_crosses_chunk_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_chunk(
+            dir.path(),
+            0,
+            &[(b"a", [1u8; 32], 10), (b"b", [2u8; 32], 20)],
+        );
+        create_test_chunk(dir.path(), 1, &[(b"c", [3u8; 32], 30)]);
+        let db = ImmutableDB::open(dir.path()).unwrap();
+
+        let (s, h, cbor) = db
+            .get_next_block_after_point(20, &Hash32::from_bytes([2u8; 32]))
+            .expect("first block of next chunk");
+        assert_eq!((s, h), (30, Hash32::from_bytes([3u8; 32])));
+        assert_eq!(cbor, b"c");
     }
 
     #[test]
