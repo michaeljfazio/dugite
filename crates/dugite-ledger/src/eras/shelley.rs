@@ -94,10 +94,41 @@ fn recompute_shelley_initial_reserves(
     max_lovelace_supply: u64,
 ) {
     let mut utxo_sum: u64 = 0;
+    // DIAG (issue: reserves=0 / 2x UTxO inflation): break the scanned sum down by
+    // address class so we can tell genesis double-seed / stale-LSM from a genuine
+    // ledger non-conservation. Redeem (AVVM) entries should equal the *unredeemed*
+    // remainder of the ICO; non-redeem entries the circulating supply.
+    let mut redeem_sum: u64 = 0;
+    let mut redeem_count: u64 = 0;
+    let mut scan_count: u64 = 0;
     utxo.utxo_set.scan_all(|_input, output| {
         // Shelley-era outputs are ADA-only; coin == full value.
         utxo_sum = utxo_sum.saturating_add(output.value.coin.0);
+        scan_count += 1;
+        if matches!(&output.address, Address::Byron(b) if b.is_redeem()) {
+            redeem_sum = redeem_sum.saturating_add(output.value.coin.0);
+            redeem_count += 1;
+        }
     });
+    // Invariant tripwire: the live UTxO can never sum to MORE than the maximum
+    // lovelace supply — `sumCoinUTxO ≤ maxLovelaceSupply` always holds on a
+    // correct chain (Haskell computes `reserves = maxLovelaceSupply <-> sumCoinUTxO`
+    // over `Coin = Integer`, which would silently go negative; dugite stores
+    // reserves as `u64`). If `utxo_sum > max_lovelace_supply` the UTxO set is
+    // corrupt — almost always because a from-genesis ledger replay ran on top of
+    // a stale on-disk UTxO store that was never cleared (the genesis + Byron UTxOs
+    // were summed ON TOP of a previously-synced tip set). Silently clamping
+    // reserves to 0 here produces a permanently wrong ledger and surfaces later as
+    // a cryptic "MIR reserves debit underflows" panic three lines of context away.
+    // Fail loud at the root instead, naming the cause and the remedy.
+    assert!(
+        utxo_sum <= max_lovelace_supply,
+        "Byron->Shelley reserves init: sumCoinUTxO(liveByronUTxO)={utxo_sum} exceeds \
+         maxLovelaceSupply={max_lovelace_supply} (redeem_sum={redeem_sum} redeem_count={redeem_count} \
+         scan_count={scan_count}). The UTxO set is corrupt — a from-genesis replay almost certainly \
+         ran on top of a stale on-disk UTxO store. Wipe `<database-path>/utxo-store` (or the whole \
+         database) and restart so the replay rebuilds the UTxO set from an empty store.",
+    );
     let new_reserves = max_lovelace_supply.saturating_sub(utxo_sum);
     let old_reserves = epochs.reserves.0;
     epochs.reserves = Lovelace(new_reserves);
@@ -106,6 +137,12 @@ fn recompute_shelley_initial_reserves(
         old_reserves,
         new_reserves,
         delta_lovelace = new_reserves as i128 - old_reserves as i128,
+        redeem_sum,
+        redeem_count,
+        nonredeem_sum = utxo_sum.saturating_sub(redeem_sum),
+        nonredeem_count = scan_count.saturating_sub(redeem_count),
+        scan_count,
+        len_count = utxo.utxo_set.len() as u64,
         "Byron->Shelley: reserves = maxLovelaceSupply - sumCoinUTxO(liveByronUTxO)"
     );
 }
@@ -2062,6 +2099,56 @@ mod tests {
             transaction_id: Hash32::from_bytes([tx_id; 32]),
             index,
         }
+    }
+
+    /// Byron→Shelley reserves init recomputes `reserves = maxLovelaceSupply −
+    /// sumCoinUTxO(liveByronUTxO)`, overwriting whatever reserves held before.
+    #[test]
+    fn recompute_initial_reserves_subtracts_full_utxo_sum() {
+        let max = 45_000_000_000_000_000u64;
+        let mut utxo = make_utxo_sub(vec![
+            (
+                make_redeem_input(0x01, 0),
+                make_byron_output(2, 31_000_000_000_000_000),
+            ),
+            (
+                make_redeem_input(0x02, 0),
+                make_byron_output(0, 112_484_745_000_000),
+            ),
+        ]);
+        let mut epochs = make_epoch_sub();
+        epochs.reserves = Lovelace(7); // arbitrary stale value — must be overwritten
+        recompute_shelley_initial_reserves(&mut utxo, &mut epochs, max);
+        assert_eq!(
+            epochs.reserves.0,
+            max - 31_112_484_745_000_000,
+            "reserves must be maxLovelaceSupply minus the summed live Byron UTxO"
+        );
+    }
+
+    /// Defense-in-depth tripwire: a live Byron UTxO sum that EXCEEDS
+    /// maxLovelaceSupply is impossible on a correct chain and signals a corrupt
+    /// UTxO set (e.g. a from-genesis replay layered on a stale on-disk store).
+    /// The recompute must abort loudly rather than clamp reserves to 0 — the
+    /// latter silently corrupts the ledger and later surfaces as a cryptic MIR
+    /// reserves-debit underflow.
+    #[test]
+    #[should_panic(expected = "exceeds maxLovelaceSupply")]
+    fn recompute_initial_reserves_tripwire_on_inflated_utxo() {
+        let max = 45_000_000_000_000_000u64;
+        // Two 40M-ADA-equivalent entries sum to ~62.98B-style inflation > max.
+        let mut utxo = make_utxo_sub(vec![
+            (
+                make_redeem_input(0x01, 0),
+                make_byron_output(0, 40_000_000_000_000_000),
+            ),
+            (
+                make_redeem_input(0x02, 0),
+                make_byron_output(0, 40_000_000_000_000_000),
+            ),
+        ]);
+        let mut epochs = make_epoch_sub();
+        recompute_shelley_initial_reserves(&mut utxo, &mut epochs, max);
     }
 
     /// Shelley → Allegra transition purges AVVM (redeem) UTxOs from the UTxO
