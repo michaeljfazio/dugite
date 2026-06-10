@@ -87,6 +87,7 @@ pub fn eval_resolved_redeemer(
     // bytes wrapper) or unwrapped flat depending on which decoder
     // succeeds first.
     let program = decode_script_bytes(&r.script_bytes)?;
+    let version = program.version;
     let term = program.term;
 
     // 2. Build the per-version ScriptContext as Data.
@@ -98,6 +99,28 @@ pub fn eval_resolved_redeemer(
             r.tag, r.index, r.language
         );
         debug_dump_data(&ctx_data, 0);
+    }
+
+    // Debug aid: alongside the applied-program flat dump (below), write each
+    // script argument as CBOR so it can be byte-diffed against the canonical
+    // args produced by cardano-ledger's `collectPlutusScriptsWithContext`.
+    if let Ok(dir) = std::env::var("DUGITE_DUMP_APPLIED_DIR") {
+        let write_arg = |name: &str, data: &crate::data::Data| {
+            let path = format!("{dir}/args-{:?}-{}-{name}.cbor", r.tag, r.index);
+            match data.to_cbor() {
+                Ok(bytes) => {
+                    if let Err(e) = std::fs::write(&path, bytes) {
+                        eprintln!("DUGITE_DUMP_APPLIED_DIR: write {path} failed: {e}");
+                    }
+                }
+                Err(e) => eprintln!("DUGITE_DUMP_APPLIED_DIR: {name} to_cbor failed: {e}"),
+            }
+        };
+        if let Some(datum) = r.datum.as_ref() {
+            write_arg("datum", &plutus_data_to_data(datum));
+        }
+        write_arg("redeemer", &plutus_data_to_data(&r.redeemer_data));
+        write_arg("ctx", &ctx_data);
     }
 
     // 3. Pre-apply the args. V3 takes one (ctx); V1/V2 takes three for
@@ -149,6 +172,25 @@ pub fn eval_resolved_redeemer(
             Term::App(Rc::new(term), Rc::new(ctx_term))
         }
     };
+
+    // Debug aid (like DUGITE_DUMP_CTX above): dump the fully-applied
+    // program as flat so it can be replayed through an external reference
+    // CEK (Haskell `uplc evaluate`, `aiken uplc eval`) when root-causing a
+    // budget/trace divergence offline.
+    if let Ok(dir) = std::env::var("DUGITE_DUMP_APPLIED_DIR") {
+        let prog = crate::program::Program {
+            version,
+            term: applied_term.clone(),
+        };
+        let path = format!("{dir}/applied-{:?}-{}.flat", r.tag, r.index);
+        match prog.to_flat() {
+            Ok(bytes) => match std::fs::write(&path, bytes) {
+                Ok(()) => eprintln!("DUGITE_DUMP_APPLIED_DIR: wrote {path}"),
+                Err(e) => eprintln!("DUGITE_DUMP_APPLIED_DIR: write {path} failed: {e}"),
+            },
+            Err(e) => eprintln!("DUGITE_DUMP_APPLIED_DIR: flat-encode failed: {e}"),
+        }
+    }
 
     // 4. Run the CEK machine with budget tracking and trace capture.
     //

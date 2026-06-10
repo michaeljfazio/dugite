@@ -286,6 +286,16 @@ pub fn eval_phase_two_raw<O: RedeemerObserver>(
                 .unwrap_or(i64::MAX)
                 .min(initial_ex_budget.mem),
         };
+        // Debug aid (offline repro only — see DUGITE_DUMP_APPLIED_DIR): lift
+        // the per-redeemer restricting cap to the tx-level budget so a
+        // divergence repro can measure the FULL consumption a script would
+        // need, instead of halting at the declared exUnits. Never set on a
+        // running node.
+        let redeemer_budget = if std::env::var("DUGITE_PHASE2_UNCAPPED").is_ok() {
+            initial_ex_budget
+        } else {
+            redeemer_budget
+        };
 
         let outcome = crate::eval_redeemer::eval_resolved_redeemer(
             &decoded.tx,
@@ -300,7 +310,21 @@ pub fn eval_phase_two_raw<O: RedeemerObserver>(
         // The restricting cap above already guarantees `consumed <= declared`
         // on success; this post-hoc check is retained as defense-in-depth and
         // to surface a precise error if a future change loosens the cap.
-        if outcome.consumed.cpu > declared_cpu || outcome.consumed.mem > declared_mem {
+        // Under DUGITE_PHASE2_UNCAPPED (offline repro only) report the
+        // overage to stderr but keep evaluating the remaining redeemers so a
+        // repro can compare EVERY redeemer's full consumption vs declared.
+        if std::env::var("DUGITE_PHASE2_UNCAPPED").is_ok() {
+            if outcome.consumed.cpu > declared_cpu || outcome.consumed.mem > declared_mem {
+                eprintln!(
+                    "DUGITE_PHASE2_UNCAPPED: redeemer {tag:?}@{idx} consumed \
+                     (cpu={}, mem={}) EXCEEDS declared (cpu={declared_cpu}, mem={declared_mem})",
+                    outcome.consumed.cpu,
+                    outcome.consumed.mem,
+                    tag = resolved_r.tag,
+                    idx = resolved_r.index,
+                );
+            }
+        } else if outcome.consumed.cpu > declared_cpu || outcome.consumed.mem > declared_mem {
             return Err(PhaseTwoError::Internal(format!(
                 "redeemer {tag:?}@{idx} consumed (cpu={}, mem={}) exceeds declared \
                  (cpu={}, mem={})",
