@@ -641,14 +641,17 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         key: "ConsensusMode",
         section: "Network",
         param_type: ParamType::Enum {
-            values: &["PraosMode", "GenesisMode"],
+            // cardano-node canonical spellings; legacy "PraosMode" /
+            // "GenesisMode" remain accepted on input as serde aliases.
+            values: &["Praos", "Genesis"],
         },
-        default: "PraosMode",
-        description: "Consensus protocol mode. PraosMode is the standard operating mode. \
-                      GenesisMode enables Ouroboros Genesis for trustless bulk sync from \
+        default: "Praos",
+        description: "Consensus protocol mode. Praos is the standard operating mode. \
+                      Genesis enables Ouroboros Genesis for trustless bulk sync from \
                       potentially dishonest peers.",
-        tuning_hint: "Use PraosMode unless you specifically need Genesis sync guarantees. \
-                      GenesisMode requires additional SyncTargetNumberOf* configuration.",
+        tuning_hint: "Use Praos unless you specifically need Genesis sync guarantees. \
+                      Genesis mode reads LowLevelGenesisOptions and the \
+                      SyncTargetNumberOf* fields.",
         reloadability: Reloadability::Restart,
     },
     ParamDef {
@@ -1392,7 +1395,7 @@ pub fn network_defaults(network: Network) -> serde_json::Map<String, serde_json:
     map.insert("TargetNumberOfKnownBigLedgerPeers".into(), json!(15));
 
     // Consensus mode.
-    map.insert("ConsensusMode".into(), json!("PraosMode"));
+    map.insert("ConsensusMode".into(), json!("Praos"));
 
     // Genesis sync targets (cardano-node defaults).
     map.insert("SyncTargetNumberOfActivePeers".into(), json!(5));

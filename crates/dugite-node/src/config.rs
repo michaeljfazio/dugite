@@ -14,9 +14,17 @@ use std::path::Path;
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConsensusMode {
     /// Standard Ouroboros Praos operation.
+    ///
+    /// JSON: `"Praos"` — the cardano-node 11.0.1 canonical spelling
+    /// (`Cardano.Node.Types` accepts exactly `"Genesis"` / `"Praos"`).
+    /// `"PraosMode"` is accepted as a legacy dugite alias.
     #[default]
+    #[serde(rename = "Praos", alias = "PraosMode")]
     PraosMode,
     /// Ouroboros Genesis for trustless bulk sync from untrusted peers.
+    ///
+    /// JSON: `"Genesis"` (canonical), `"GenesisMode"` (legacy alias).
+    #[serde(rename = "Genesis", alias = "GenesisMode")]
     GenesisMode,
 }
 
@@ -28,6 +36,98 @@ impl ConsensusMode {
             ConsensusMode::PraosMode => "praos",
             ConsensusMode::GenesisMode => "genesis",
         }
+    }
+}
+
+/// Low-level Ouroboros Genesis tuning knobs.
+///
+/// Mirrors cardano-node's `LowLevelGenesisOptions` config object, parsed into
+/// `GenesisConfigFlags` (ouroboros-consensus `Ouroboros.Consensus.Node.Genesis`).
+/// Field names and defaults are byte-for-byte those of cardano-node 11.0.1
+/// (`Cardano.Node.Orphans` `FromJSON GenesisConfigFlags`):
+///
+/// ```json
+/// { "EnableCSJ": true, "EnableLoEAndGDD": true, "EnableLoP": true,
+///   "BlockFetchGracePeriod": 10, "BucketCapacity": 100000,
+///   "BucketRate": 500, "CSJJumpSize": 4320, "GDDRateLimit": 1.0 }
+/// ```
+///
+/// Only consulted when `ConsensusMode` is `Genesis` (Praos mode is
+/// `disableGenesisConfig`: every subsystem off).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LowLevelGenesisOptions {
+    /// Enable ChainSync Jumping (`gcfEnableCSJ`, default true).
+    #[serde(rename = "EnableCSJ", default = "default_true")]
+    pub enable_csj: bool,
+    /// Enable the Limit on Eagerness + Genesis Density Disconnection
+    /// (`gcfEnableLoEAndGDD`, default true).
+    #[serde(rename = "EnableLoEAndGDD", default = "default_true")]
+    pub enable_loe_and_gdd: bool,
+    /// Enable the Limit on Patience leaky bucket (`gcfEnableLoP`, default true).
+    #[serde(rename = "EnableLoP", default = "default_true")]
+    pub enable_lop: bool,
+    /// BlockFetch bulk-sync grace period in seconds before rotating a
+    /// starving peer (`gcfBlockFetchGracePeriod`; upstream default 10 s).
+    #[serde(rename = "BlockFetchGracePeriod", default)]
+    pub block_fetch_grace_period_secs: Option<f64>,
+    /// LoP bucket capacity in tokens (`gcfBucketCapacity`; default 100 000).
+    #[serde(rename = "BucketCapacity", default)]
+    pub bucket_capacity: Option<u64>,
+    /// LoP bucket leak rate in tokens/second (`gcfBucketRate`; default 500).
+    #[serde(rename = "BucketRate", default)]
+    pub bucket_rate: Option<u64>,
+    /// CSJ jump size in slots (`gcfCSJJumpSize`; default 2*2160 = 4320, the
+    /// Byron forecast range).
+    #[serde(rename = "CSJJumpSize", default)]
+    pub csj_jump_size: Option<u64>,
+    /// Minimum seconds between GDD evaluations (`gcfGDDRateLimit`; default 1.0).
+    #[serde(rename = "GDDRateLimit", default)]
+    pub gdd_rate_limit_secs: Option<f64>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for LowLevelGenesisOptions {
+    fn default() -> Self {
+        LowLevelGenesisOptions {
+            enable_csj: true,
+            enable_loe_and_gdd: true,
+            enable_lop: true,
+            block_fetch_grace_period_secs: None,
+            bucket_capacity: None,
+            bucket_rate: None,
+            csj_jump_size: None,
+            gdd_rate_limit_secs: None,
+        }
+    }
+}
+
+impl LowLevelGenesisOptions {
+    /// `gbfcGracePeriod` with the `mkGenesisConfig` default applied (10 s).
+    pub fn effective_block_fetch_grace_period_secs(&self) -> f64 {
+        self.block_fetch_grace_period_secs.unwrap_or(10.0)
+    }
+
+    /// `csbcCapacity` with the upstream default applied (100 000 tokens).
+    pub fn effective_bucket_capacity(&self) -> u64 {
+        self.bucket_capacity.unwrap_or(100_000)
+    }
+
+    /// `csbcRate` with the upstream default applied (500 tokens/s).
+    pub fn effective_bucket_rate(&self) -> u64 {
+        self.bucket_rate.unwrap_or(500)
+    }
+
+    /// `csjcJumpSize` with the upstream default applied (4320 slots).
+    pub fn effective_csj_jump_size(&self) -> u64 {
+        self.csj_jump_size.unwrap_or(2 * 2160)
+    }
+
+    /// `lgpGDDRateLimit` with the upstream default applied (1.0 s).
+    pub fn effective_gdd_rate_limit_secs(&self) -> f64 {
+        self.gdd_rate_limit_secs.unwrap_or(1.0)
     }
 }
 
@@ -393,9 +493,15 @@ pub struct NodeConfig {
     #[serde(default)]
     pub experimental_hard_forks_enabled: bool,
 
-    /// Consensus protocol mode (PraosMode or GenesisMode).
+    /// Consensus protocol mode (`"Praos"` or `"Genesis"`).
     #[serde(default)]
     pub consensus_mode: ConsensusMode,
+
+    /// Low-level Ouroboros Genesis tuning (cardano-node
+    /// `LowLevelGenesisOptions`). Only consulted in Genesis mode; absent ⇒
+    /// upstream defaults (`defaultGenesisConfigFlags`).
+    #[serde(default)]
+    pub low_level_genesis_options: Option<LowLevelGenesisOptions>,
 
     // ── Genesis mode sync targets ──────────────────────────────────────
     /// Active peers during Genesis bulk sync (default: 5, matching cardano-node).
@@ -997,6 +1103,7 @@ impl Default for NodeConfig {
             error_demotion_threshold: default_error_demotion_threshold(),
             experimental_hard_forks_enabled: false,
             consensus_mode: ConsensusMode::default(),
+            low_level_genesis_options: None,
             sync_target_number_of_active_peers: 5,
             sync_target_number_of_established_peers: 10,
             sync_target_number_of_known_peers: 150,
@@ -1434,6 +1541,79 @@ mod tests {
         let json = r#"{"ConsensusMode": "GenesisMode"}"#;
         let config: NodeConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.consensus_mode, ConsensusMode::GenesisMode);
+    }
+
+    #[test]
+    fn test_consensus_mode_cardano_node_canonical_values() {
+        // cardano-node 11.0.1 `NodeConsensusMode` accepts EXACTLY "Genesis" /
+        // "Praos" (Cardano.Node.Types). A cardano-node config file must work
+        // verbatim with dugite.
+        let config: NodeConfig = serde_json::from_str(r#"{"ConsensusMode": "Genesis"}"#).unwrap();
+        assert_eq!(config.consensus_mode, ConsensusMode::GenesisMode);
+        let config: NodeConfig = serde_json::from_str(r#"{"ConsensusMode": "Praos"}"#).unwrap();
+        assert_eq!(config.consensus_mode, ConsensusMode::PraosMode);
+        // Legacy dugite spellings remain accepted as aliases.
+        let config: NodeConfig = serde_json::from_str(r#"{"ConsensusMode": "PraosMode"}"#).unwrap();
+        assert_eq!(config.consensus_mode, ConsensusMode::PraosMode);
+    }
+
+    #[test]
+    fn test_consensus_mode_serializes_to_cardano_node_value() {
+        // Round-trip emits the cardano-node canonical strings.
+        assert_eq!(
+            serde_json::to_string(&ConsensusMode::GenesisMode).unwrap(),
+            r#""Genesis""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ConsensusMode::PraosMode).unwrap(),
+            r#""Praos""#
+        );
+    }
+
+    // ── LowLevelGenesisOptions (cardano-node GenesisConfigFlags) ────────────
+
+    #[test]
+    fn test_low_level_genesis_options_absent_yields_defaults() {
+        // cardano-node `defaultGenesisConfigFlags`: all subsystems enabled,
+        // every tunable at its upstream default.
+        let config: NodeConfig = serde_json::from_str("{}").unwrap();
+        let opts = config.low_level_genesis_options.unwrap_or_default();
+        assert!(opts.enable_csj);
+        assert!(opts.enable_loe_and_gdd);
+        assert!(opts.enable_lop);
+        assert_eq!(opts.effective_block_fetch_grace_period_secs(), 10.0);
+        assert_eq!(opts.effective_bucket_capacity(), 100_000);
+        assert_eq!(opts.effective_bucket_rate(), 500);
+        assert_eq!(opts.effective_csj_jump_size(), 4320);
+        assert_eq!(opts.effective_gdd_rate_limit_secs(), 1.0);
+    }
+
+    #[test]
+    fn test_low_level_genesis_options_cardano_node_field_names() {
+        // Field names from cardano-node 11.0.1 Cardano.Node.Orphans
+        // (FromJSON GenesisConfigFlags): EnableCSJ, EnableLoEAndGDD, EnableLoP,
+        // BlockFetchGracePeriod, BucketCapacity, BucketRate, CSJJumpSize,
+        // GDDRateLimit — all optional.
+        let json = r#"{
+            "ConsensusMode": "Genesis",
+            "LowLevelGenesisOptions": {
+                "EnableCSJ": false,
+                "EnableLoP": true,
+                "BlockFetchGracePeriod": 22.5,
+                "BucketCapacity": 50000,
+                "CSJJumpSize": 1000
+            }
+        }"#;
+        let config: NodeConfig = serde_json::from_str(json).unwrap();
+        let opts = config.low_level_genesis_options.unwrap();
+        assert!(!opts.enable_csj);
+        assert!(opts.enable_loe_and_gdd); // absent → default true
+        assert!(opts.enable_lop);
+        assert_eq!(opts.effective_block_fetch_grace_period_secs(), 22.5);
+        assert_eq!(opts.effective_bucket_capacity(), 50_000);
+        assert_eq!(opts.effective_bucket_rate(), 500); // absent → default
+        assert_eq!(opts.effective_csj_jump_size(), 1000);
+        assert_eq!(opts.effective_gdd_rate_limit_secs(), 1.0); // absent → default
     }
 
     // ── ConsensusMode CLI/JSON resolution (#535) ─────────────────────────────
