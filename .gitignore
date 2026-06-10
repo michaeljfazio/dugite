@@ -62,3 +62,4 @@ testnet/local-devnet/evidence/
 .opencode
 *.pid
 epoch-dumps-*
+.claude/scheduled_tasks.lock
