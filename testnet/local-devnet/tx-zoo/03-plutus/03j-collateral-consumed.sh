@@ -47,7 +47,10 @@ ADDR=$(cat "$ZOO_PAY_ADDR_FILE")
 # Collateral sub-balance:
 #   COLLAT_AMT - total_collateral = RETURN_AMT
 TIP=$(zoo_tip_slot)
-TTL=$((TIP + 600))
+# Keep the validity upper bound inside the time-translation horizon —
+# tip+600 trips TimeTranslationPastHorizon on the Haskell BP for some
+# tip positions (issue #733), which rejects the tx for the wrong reason.
+TTL=$((TIP + 100))
 RAW="$ZOO_BUILT/$NAME.raw"
 SIGNED="$ZOO_BUILT/$NAME.signed"
 PPARAMS=$(zoo_pparams_file)

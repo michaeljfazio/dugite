@@ -35,7 +35,12 @@ echo '{"int": 0}' > "$REDEEMER"
 ADDR=$(cat "$ZOO_PAY_ADDR_FILE")
 
 TIP=$(zoo_tip_slot)
-TTL=$((TIP + 600))
+# Keep the validity upper bound inside the time-translation horizon
+# (devnet safe zone is 240 slots; horizon distance ranges ~241-640 slots
+# depending on epoch position).  tip+600 made this test trip
+# TimeTranslationPastHorizon on the Haskell BP for some tip positions
+# (issue #733) instead of exercising the tag-mismatch path.
+TTL=$((TIP + 100))
 RAW="$ZOO_BUILT/$NAME.raw"
 SIGNED="$ZOO_BUILT/$NAME.signed"
 PPARAMS=$(zoo_pparams_file)
@@ -69,15 +74,17 @@ cardano-cli conway transaction sign \
 
 # The submission MUST be rejected by dugite (IsValidTagMismatch at admission).
 # zoo_submit returns non-zero when the node rejects the tx.
-if zoo_submit "$SIGNED" 2>/dev/null; then
+if TXID=$(zoo_submit "$SIGNED" 2>/dev/null); then
     # If submission somehow succeeded, the tx must not be included.
-    TXID=$(zoo_tx_id "$SIGNED")
     if zoo_wait_inclusion "$TXID" 30 2>/dev/null; then
         zoo_record "$NAME" FAIL "$TXID" "tag-mismatch tx was included — #522 regression"
         exit 1
     else
-        # Submitted but not included — partial success, log it.
-        zoo_record "$NAME" PASS "" "rejected-post-submission (not included)"
+        # Admission must reject the tag-mismatch tx (IsValidTagMismatch);
+        # accepting it into the mempool at all is the #522/#734 bug even
+        # if it never reaches a block.
+        zoo_record "$NAME" FAIL "$TXID" "admitted at submission — must reject IsValidTagMismatch (#734)"
+        exit 1
     fi
 else
     # Rejected at submission — this is the expected #522 fix behaviour.
