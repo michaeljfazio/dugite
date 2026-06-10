@@ -652,7 +652,15 @@ fn read_multiasset_map_u64(
             })?;
             assets.insert(asset_name, qty);
         }
-        result.insert(policy, assets);
+        // Haskell `decodeMultiAsset` for decoder version < 9 (Mary/Allegra era
+        // CBOR) prunes zero-quantity assets and drops policies whose asset map
+        // becomes (or arrives) empty — `pruneZeroMultiAsset`/`filterMultiAsset`
+        // (Mary/Value.hs). See era_alonzo::read_multiasset_map_u64 for the
+        // quoted Haskell (#730).
+        assets.retain(|_, qty| *qty != 0);
+        if !assets.is_empty() {
+            result.insert(policy, assets);
+        }
     }
     Ok(result)
 }

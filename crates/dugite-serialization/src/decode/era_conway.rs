@@ -1117,6 +1117,19 @@ fn read_value(r: &mut Reader<'_>) -> Result<Value, SerializationError> {
 fn read_multiasset_map_u64(
     r: &mut Reader<'_>,
 ) -> Result<BTreeMap<Hash28, BTreeMap<AssetName, u64>>, SerializationError> {
+    // Haskell `decodeMultiAsset` (Mary/Value.hs) for decoder version >= 9
+    // (`decodeConway`) REJECTS what pre-Conway eras pruned:
+    //
+    // ```haskell
+    // decodeConway = MultiAsset <$> decodeMap decCBOR (decodeNonEmptyMap decodeNonZeroAmount)
+    // decodeNonZeroAmount = do
+    //   amount <- decodeAmount
+    //   amount <$ when (amount == 0) (fail "MultiAsset cannot contain zeros")
+    // decodeNonEmptyMap valueDecoder = do
+    //   m <- decodeMap decCBOR valueDecoder
+    //   m <$ when (Map.null m) (fail "Empty Assets are not allowed")
+    // ```
+    //
     // Use read_map to handle both definite- and indefinite-length outer map.
     let policy_pairs = r.read_map(
         |r| {
@@ -1137,8 +1150,21 @@ fn read_multiasset_map_u64(
                         SerializationError::CborDecode("multiasset: asset name too long".into())
                     })
                 },
-                |r| r.read_uint(),
+                |r| {
+                    let amount = r.read_uint()?;
+                    if amount == 0 {
+                        return Err(SerializationError::CborDecode(
+                            "multiasset: MultiAsset cannot contain zeros".into(),
+                        ));
+                    }
+                    Ok(amount)
+                },
             )?;
+            if asset_pairs.is_empty() {
+                return Err(SerializationError::CborDecode(
+                    "multiasset: Empty Assets are not allowed".into(),
+                ));
+            }
             Ok(asset_pairs.into_iter().collect::<BTreeMap<_, _>>())
         },
     )?;
@@ -1161,6 +1187,10 @@ fn read_mint_map(
         },
         |r| {
             // Inner asset map — also use read_map to handle indefinite lengths.
+            // Same Conway (decoder version >= 9) strictness as
+            // `read_multiasset_map_u64` above: Haskell's `decodeMultiAsset` is
+            // shared by the mint field (with a signed amount decoder), so zero
+            // quantities and empty asset maps are decode FAILURES.
             let asset_pairs = r.read_map(
                 |r| {
                     let name_bytes = r.read_bytes_owned()?;
@@ -1168,8 +1198,21 @@ fn read_mint_map(
                         SerializationError::CborDecode("mint: asset name too long".into())
                     })
                 },
-                |r| Ok(r.read_int()? as i64),
+                |r| {
+                    let amount = r.read_int()? as i64;
+                    if amount == 0 {
+                        return Err(SerializationError::CborDecode(
+                            "mint: MultiAsset cannot contain zeros".into(),
+                        ));
+                    }
+                    Ok(amount)
+                },
             )?;
+            if asset_pairs.is_empty() {
+                return Err(SerializationError::CborDecode(
+                    "mint: Empty Assets are not allowed".into(),
+                ));
+            }
             Ok(asset_pairs.into_iter().collect::<BTreeMap<_, _>>())
         },
     )?;
@@ -2997,6 +3040,54 @@ pub(crate) fn decode_conway_tx_output_standalone(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #730: Haskell `decodeMultiAsset` at decoder version >= 9
+    /// (`decodeConway`) REJECTS zero-quantity assets:
+    /// `fail "MultiAsset cannot contain zeros"`.
+    #[test]
+    fn conway_value_zero_quantity_asset_rejected() {
+        // [10, {policy(0x11) -> {"" -> 0}}]
+        let mut bytes = vec![0x82, 0x0a, 0xa1, 0x58, 0x1c];
+        bytes.extend([0x11; 28]);
+        bytes.extend([0xa1, 0x40, 0x00]);
+        let mut r = Reader::new(&bytes);
+        let err = read_value(&mut r).expect_err("Conway must reject zero amounts");
+        assert!(
+            err.to_string().contains("cannot contain zeros"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Haskell `decodeNonEmptyMap`: `fail "Empty Assets are not allowed"`.
+    #[test]
+    fn conway_value_empty_asset_map_rejected() {
+        // [10, {policy(0x11) -> {}}]
+        let mut bytes = vec![0x82, 0x0a, 0xa1, 0x58, 0x1c];
+        bytes.extend([0x11; 28]);
+        bytes.push(0xa0);
+        let mut r = Reader::new(&bytes);
+        let err = read_value(&mut r).expect_err("Conway must reject empty asset maps");
+        assert!(
+            err.to_string().contains("Empty Assets"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Conway mint shares the same strictness: zero quantities are a decode
+    /// failure.
+    #[test]
+    fn conway_mint_zero_quantity_rejected() {
+        // {policy(0x11) -> {"" -> 0}}
+        let mut bytes = vec![0xa1, 0x58, 0x1c];
+        bytes.extend([0x11; 28]);
+        bytes.extend([0xa1, 0x40, 0x00]);
+        let mut r = Reader::new(&bytes);
+        let err = read_mint_map(&mut r).expect_err("Conway must reject zero mint amounts");
+        assert!(
+            err.to_string().contains("cannot contain zeros"),
+            "unexpected error: {err}"
+        );
+    }
 
     // ── CBOR helpers ──────────────────────────────────────────────────────────
 
