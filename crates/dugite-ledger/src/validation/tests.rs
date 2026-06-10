@@ -15609,6 +15609,79 @@ mod tests {
         );
     }
 
+    /// Phase-2 admission matrix (#733/#734) — must mirror the Haskell UTXOS
+    /// semantics exactly:
+    ///
+    /// | is_valid | phase-2 outcome             | Haskell                            | result                  |
+    /// |----------|-----------------------------|------------------------------------|-------------------------|
+    /// | true     | Ok                          | scripts pass                       | admit                   |
+    /// | true     | script-eval failure         | TagMismatch FailedUnexpectedly     | ScriptFailed            |
+    /// | true     | collection/context error    | UtxosFailure CollectErrors         | Phase2CollectError      |
+    /// | false    | Ok                          | TagMismatch PassedUnexpectedly     | IsValidTagMismatch      |
+    /// | false    | script-eval failure         | legit collateral path              | admit                   |
+    /// | false    | collection/context error    | UtxosFailure CollectErrors         | Phase2CollectError      |
+    ///
+    /// The (false, collect-error) row is THE #734 fix: a collection error
+    /// (e.g. TimeTranslationPastHorizon, strict UTxO decode) must never be
+    /// mistaken for "scripts genuinely fail" and admit the tx.
+    #[test]
+    fn phase2_admission_matrix_matches_haskell() {
+        use crate::plutus::PlutusError;
+        use crate::validation::phase2_admission_error;
+
+        // (true, Ok) → admit
+        assert!(phase2_admission_error(true, &Ok(())).is_none());
+
+        // (true, script-eval failure) → ScriptFailed
+        let r = Err(PlutusError::EvalFailed("error term".into()));
+        assert!(matches!(
+            phase2_admission_error(true, &r),
+            Some(ValidationError::ScriptFailed(_))
+        ));
+
+        // (true, collect error) → Phase2CollectError
+        let r = Err(PlutusError::CollectError("past horizon".into()));
+        assert!(matches!(
+            phase2_admission_error(true, &r),
+            Some(ValidationError::Phase2CollectError(_))
+        ));
+
+        // (false, Ok) → IsValidTagMismatch (the #522 protection)
+        assert!(matches!(
+            phase2_admission_error(false, &Ok(())),
+            Some(ValidationError::IsValidTagMismatch {
+                declared: false,
+                evaluated: true
+            })
+        ));
+
+        // (false, script-eval failure) → admit (collateral consumed at apply)
+        let r = Err(PlutusError::EvalFailed("error term".into()));
+        assert!(phase2_admission_error(false, &r).is_none());
+
+        // (false, collect error) → Phase2CollectError — THE #734 fix.
+        let r = Err(PlutusError::CollectError(
+            "time translation past horizon: slot=728 horizon=400".into(),
+        ));
+        assert!(matches!(
+            phase2_admission_error(false, &r),
+            Some(ValidationError::Phase2CollectError(_))
+        ));
+
+        // Missing-CBOR infrastructure errors are collect-class for BOTH
+        // polarities — they must never legitimise is_valid=false.
+        let r = Err(PlutusError::MissingTxCbor);
+        assert!(matches!(
+            phase2_admission_error(false, &r),
+            Some(ValidationError::Phase2CollectError(_))
+        ));
+        let r = Err(PlutusError::MissingOutputCbor("0#0".into()));
+        assert!(matches!(
+            phase2_admission_error(true, &r),
+            Some(ValidationError::Phase2CollectError(_))
+        ));
+    }
+
     /// `IsValidTagMismatch` is a proper `ValidationError` variant and can be
     /// constructed and matched as expected.  This guards the variant definition
     /// against refactoring that accidentally removes it or changes its fields.

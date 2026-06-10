@@ -17,6 +17,18 @@ pub enum PlutusError {
     MissingOutputCbor(String),
     #[error("Plutus evaluation failed: {0}")]
     EvalFailed(String),
+    /// Phase-2 **collection/context** error — the script context could not
+    /// be built or its inputs collected (UTxO/cost-model decode, missing
+    /// script or datum, validity-interval time translation past the
+    /// safe-zone horizon, internal translation errors).
+    ///
+    /// Mirrors Haskell `UtxosFailure (CollectErrors …)` (Babbage/Conway):
+    /// raised by `collectTwoPhaseScriptInputs` BEFORE script evaluation and
+    /// rejects the transaction — and any block containing it —
+    /// **regardless** of the `is_valid` tag.  Unlike [`Self::EvalFailed`],
+    /// this never legitimises `is_valid = false` (#733/#734).
+    #[error("Phase-2 collection error (UtxosFailure CollectErrors): {0}")]
+    CollectError(String),
 }
 
 /// Recover a printable message from a `catch_unwind` panic payload. The payload
@@ -438,7 +450,10 @@ fn run_single_phase2_eval(
         Ok(r) => r,
         Err(payload) => {
             let msg = panic_payload_to_string(&payload);
-            return Err(PlutusError::EvalFailed(format!(
+            // Reject-by-default: a panic on adversarial input is not a
+            // legitimate script failure, so it must never legitimise
+            // is_valid=false (#734).
+            return Err(PlutusError::CollectError(format!(
                 "dugite-uplc panic on malformed script: {msg}"
             )));
         }
@@ -469,7 +484,16 @@ fn run_single_phase2_eval(
                 }
                 _ => format!("eval_phase_two_raw error: {e}"),
             };
-            Err(PlutusError::EvalFailed(error_msg))
+            // Partition per the Haskell phase-2 semantics: genuine script
+            // evaluation failures (`evalScripts` → Fails) keep EvalFailed;
+            // collection/context errors (`CollectErrors`: decode, missing
+            // script/datum, past-horizon time translation) become
+            // CollectError and reject regardless of is_valid (#733/#734).
+            if e.is_script_evaluation_failure() {
+                Err(PlutusError::EvalFailed(error_msg))
+            } else {
+                Err(PlutusError::CollectError(error_msg))
+            }
         }
     }
 }
@@ -671,12 +695,16 @@ pub fn evaluate_plutus_scripts_with_reports(
     let results = match eval_outcome {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
-            return Err(PlutusError::EvalFailed(format!(
-                "eval_phase_two_raw error: {e}"
-            )));
+            // Same partition as `run_single_phase2_eval` (#733/#734).
+            let msg = format!("eval_phase_two_raw error: {e}");
+            return Err(if e.is_script_evaluation_failure() {
+                PlutusError::EvalFailed(msg)
+            } else {
+                PlutusError::CollectError(msg)
+            });
         }
         Err(payload) => {
-            return Err(PlutusError::EvalFailed(format!(
+            return Err(PlutusError::CollectError(format!(
                 "dugite-uplc panic on malformed script: {}",
                 panic_payload_to_string(&payload)
             )));
@@ -1150,6 +1178,41 @@ mod tests {
         ex_units_steps: u64,
         ex_units_mem: u64,
     ) -> Vec<u8> {
+        build_conway_tx_cbor_inner(
+            tx_input_hash,
+            script_cbor,
+            ex_units_steps,
+            ex_units_mem,
+            None,
+        )
+    }
+
+    /// Like `build_conway_tx_cbor` but with a TTL (body key 3) so the
+    /// script context requires validity-interval time translation —
+    /// used by the horizon/CollectError partition tests (#733/#734).
+    fn build_conway_tx_cbor_with_ttl(
+        tx_input_hash: &[u8; 32],
+        script_cbor: &[u8],
+        ex_units_steps: u64,
+        ex_units_mem: u64,
+        ttl: u64,
+    ) -> Vec<u8> {
+        build_conway_tx_cbor_inner(
+            tx_input_hash,
+            script_cbor,
+            ex_units_steps,
+            ex_units_mem,
+            Some(ttl),
+        )
+    }
+
+    fn build_conway_tx_cbor_inner(
+        tx_input_hash: &[u8; 32],
+        script_cbor: &[u8],
+        ex_units_steps: u64,
+        ex_units_mem: u64,
+        ttl: Option<u64>,
+    ) -> Vec<u8> {
         // ----------------------------------------------------------------
         // Re-use the same minicbor encoder as the rest of the Plutus module.
         // All writes to Vec<u8> are infallible.
@@ -1163,9 +1226,10 @@ mod tests {
         enc.array(4).expect("infallible");
 
         // ----------------------------------------------------------------
-        // [0] Transaction body — map(3): inputs, outputs, fee
+        // [0] Transaction body — map(3): inputs, outputs, fee (+ ttl key 3)
         // ----------------------------------------------------------------
-        enc.map(3).expect("infallible");
+        enc.map(if ttl.is_some() { 4 } else { 3 })
+            .expect("infallible");
 
         // key 0: inputs — a definite array containing one TransactionInput
         // TransactionInput CBOR: array(2) [bytes(32), uint(0)]
@@ -1199,6 +1263,12 @@ mod tests {
         // key 2: fee — 1 ADA (not validated in phase-2 mode)
         enc.u8(2).expect("infallible");
         enc.u32(1_000_000).expect("infallible");
+
+        // key 3: ttl (validity-interval upper bound), when requested
+        if let Some(t) = ttl {
+            enc.u8(3).expect("infallible");
+            enc.u64(t).expect("infallible");
+        }
 
         // ----------------------------------------------------------------
         // [1] Witness set — map(2): plutus_v2_scripts (key 6), redeemers (key 5)
@@ -1382,6 +1452,69 @@ mod tests {
             matches!(result, Err(PlutusError::EvalFailed(_))),
             "Always-fails script should produce EvalFailed: {:?}",
             result
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 2b: CollectError partition (#733/#734)
+    //
+    // An ALWAYS-SUCCEEDS script whose tx carries a TTL past the safe-zone
+    // horizon must fail with `PlutusError::CollectError` (the Haskell
+    // `UtxosFailure (CollectErrors (BadTranslation (TimeTranslationPastHorizon)))`
+    // class) — NOT `EvalFailed`.  Conflating the two is what let an
+    // `is_valid=false` tx with passing scripts into the mempool (#734) and
+    // a Haskell-invalid block onto the dugite chain (#733).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_past_horizon_ttl_is_collect_error_not_eval_failed() {
+        let script_cbor =
+            build_script_cbor("(program 1.0.0 (lam _ (lam _ (lam _ (con unit ())))))");
+        let script_hash = script_hash_v2(&script_cbor);
+        let tx_input_hash = [0x07u8; 32];
+
+        // TTL far past any horizon we set below.
+        let tx_cbor =
+            build_conway_tx_cbor_with_ttl(&tx_input_hash, &script_cbor, 14_000_000, 2_000_000, 728);
+        let (utxo_set, input) = build_script_utxo_set(&tx_input_hash, &script_hash);
+
+        let mut tx = Transaction::empty_with_hash(Hash32::ZERO);
+        tx.raw_cbor = Some(tx_cbor);
+        tx.body.inputs = vec![input];
+        tx.witness_set.plutus_v2_scripts = vec![script_cbor.clone()];
+
+        // Devnet-shaped horizon: tip=128, safe zone 240, epoch 400 →
+        // horizon slot 400 (exclusive).  TTL 728 ≥ 400 → past horizon.
+        let mut slot_config = SlotConfig::preview();
+        slot_config.safe_zone_horizon_slot = Some(400);
+        let result = evaluate_plutus_scripts(
+            &tx,
+            &utxo_set,
+            None,
+            (14_000_000, 2_000_000),
+            &slot_config,
+            9,
+        );
+        assert!(
+            matches!(result, Err(PlutusError::CollectError(_))),
+            "past-horizon TTL must be CollectError, got: {result:?}"
+        );
+
+        // Same tx with the horizon left unbounded (legacy behavior) must
+        // evaluate fine — proving the TTL itself is well-formed and the
+        // CollectError above came from the horizon guard.
+        slot_config.safe_zone_horizon_slot = None;
+        let result = evaluate_plutus_scripts(
+            &tx,
+            &utxo_set,
+            None,
+            (14_000_000, 2_000_000),
+            &slot_config,
+            9,
+        );
+        assert!(
+            result.is_ok(),
+            "same tx within horizon must pass: {:?}",
+            result.err()
         );
     }
 
