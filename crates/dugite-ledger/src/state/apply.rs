@@ -122,22 +122,30 @@ impl LedgerState {
         // our own trusted ImmutableDB).
         //
         // The one legitimate cause of a Byron prev_hash mismatch during replay
-        // is a MISSING EPOCH BOUNDARY BLOCK (EBB). On Byron, every epoch starts
-        // with a content-free EBB whose absolute slot is `epoch * epochLength`.
-        // When a regular block is also produced in the very first slot of that
-        // epoch (relative slot 0), the EBB and that regular block share the same
-        // absolute slot. dugite's ImmutableDB is keyed by slot, so on that
-        // collision only the regular block is retained and the EBB is dropped
-        // (mainnet Byron: 3 such boundaries — epochs 112, 135, 145). The first
-        // regular block of the epoch then declares `prev_hash = <EBB hash>`,
-        // which cannot match the last block of the previous epoch that the
-        // ledger holds. EBBs carry NO transactions and NO ledger state, so the
-        // dropped block does not affect UTxO/reserves/etc., and applying the
-        // canonical successor by sequence number is correct. (The decoder's
-        // Byron header hash is byte-exact — `decode_byron_main_block` hashes the
-        // captured raw header bytes, matching Haskell `headerHashAnnotated`.)
-        // `ValidateAll` mode (used for every live block and every forged
-        // block) must reject mismatches unconditionally.
+        // is a MISSING EPOCH BOUNDARY BLOCK (EBB) in an ImmutableDB built by a
+        // pre-fix dugite. On Byron, every pre-OBFT epoch starts with a
+        // content-free EBB that shares its `block_no` with the predecessor
+        // main block (EBBs do not increment the chain difficulty). The old
+        // VolatileDB→ImmutableDB flush walked entries by
+        // `block_no >= last_flushed + 1`, so an EBB was silently dropped
+        // whenever a flush batch ended exactly at its predecessor (mainnet
+        // Byron: epochs 112/135/145 at 1-in-FLUSH_BATCH_SIZE odds, plus the
+        // genesis EBB at block_no 0 deterministically). The first block of
+        // the next epoch then declares `prev_hash = <EBB hash>`, which cannot
+        // match the last block the ledger holds. EBBs carry NO transactions
+        // and NO ledger state, so the dropped block does not affect
+        // UTxO/reserves/etc., and applying the canonical successor by
+        // sequence number is correct. (The decoder's Byron header hash is
+        // byte-exact — `decode_byron_main_block` hashes the captured raw
+        // header bytes, matching Haskell `headerHashAnnotated`.)
+        //
+        // The flush no longer drops EBBs (`ChainDB::flush_to_immutable*` +
+        // `VolatileDB::selected_chain_entries_bounded` admit same-block_no
+        // EBBs), so a fresh sync/re-import stores the full Byron chain and
+        // this fallback never fires. It is RETAINED as the safety net for
+        // ImmutableDBs built before the fix, which still lack those EBBs
+        // until re-imported. `ValidateAll` mode (used for every live block
+        // and every forged block) must reject mismatches unconditionally.
         if self.tip.point != Point::Origin {
             if let Some(tip_hash) = self.tip.point.hash() {
                 if block.prev_hash() != tip_hash {
@@ -155,12 +163,13 @@ impl LedgerState {
                                 got_prev = %block.prev_hash().to_hex(),
                                 era = ?block.era,
                                 "ApplyOnly (Byron): accepting block by sequence number despite \
-                                 prev_hash mismatch — the epoch-boundary block (EBB) for this \
-                                 epoch shares its absolute slot with this relative-slot-0 block \
-                                 and was dropped by the slot-keyed ImmutableDB, so this block's \
-                                 prev_hash points at the missing EBB. EBBs carry no ledger state, \
-                                 so applying the canonical successor is correct (issue: drop-EBB \
-                                 on rel-slot-0 collision)."
+                                 prev_hash mismatch — this block's prev_hash points at an \
+                                 epoch-boundary block (EBB) that a pre-fix flush dropped from \
+                                 the ImmutableDB (EBBs share their block_no with the \
+                                 predecessor and were skipped at flush batch boundaries). \
+                                 EBBs carry no ledger state, so applying the canonical \
+                                 successor is correct. Re-import (mithril-import or \
+                                 from-genesis re-sync) to restore the missing EBBs."
                             );
                         }
                         _ => {
