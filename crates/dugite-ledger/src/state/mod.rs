@@ -450,6 +450,45 @@ impl GovernanceState {
     pub fn active_drep_count(&self) -> usize {
         self.dreps.values().filter(|d| d.active).count()
     }
+
+    /// Cold credentials eligible to authorize a committee hot key: the
+    /// CURRENT committee members plus every cold credential named in
+    /// `members_to_add` of any LIVE (not yet enacted/expired)
+    /// `UpdateCommittee` proposal.
+    ///
+    /// Mirrors the Haskell GOVCERT rule (Conway/Rules/GovCert.hs,
+    /// `checkAndOverwriteCommitteeMemberState`):
+    ///
+    /// ```haskell
+    /// let isCurrentMember =
+    ///       strictMaybe False (Map.member coldCred . committeeMembers) cgceCurrentCommittee
+    ///     committeeUpdateContainsColdCred GovActionState {gasProposalProcedure} =
+    ///       case pProcGovAction gasProposalProcedure of
+    ///         UpdateCommittee _ _ newMembers _ -> Map.member coldCred newMembers
+    ///         _ -> False
+    ///     isPotentialFutureMember =
+    ///       any committeeUpdateContainsColdCred cgceCommitteeProposals
+    /// isCurrentMember || isPotentialFutureMember
+    ///   ?! (injectFailure . ConwayCommitteeIsUnknown) coldCred
+    /// ```
+    ///
+    /// A `CommitteeHotAuth` is therefore valid not only for current members
+    /// but also for incoming members of a pending committee-update proposal
+    /// (they may pre-authorize their hot key before enactment).
+    pub fn committee_auth_eligible_members(&self) -> std::collections::HashSet<Hash32> {
+        let mut eligible: std::collections::HashSet<Hash32> =
+            self.committee_expiration.keys().copied().collect();
+        for proposal in self.proposals.values() {
+            if let dugite_primitives::transaction::GovAction::UpdateCommittee {
+                members_to_add,
+                ..
+            } = &proposal.procedure.gov_action
+            {
+                eligible.extend(members_to_add.keys().map(credential_to_hash));
+            }
+        }
+        eligible
+    }
 }
 
 /// State of a governance proposal

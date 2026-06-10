@@ -810,14 +810,11 @@ impl Node {
                     .values()
                     .copied()
                     .collect();
+            // Current members ∪ `members_to_add` of live UpdateCommittee
+            // proposals — Haskell GOVCERT accepts a CommitteeHotAuth from a
+            // potential FUTURE member too (`isPotentialFutureMember`).
             let committee_members: std::collections::HashSet<dugite_primitives::hash::Hash32> =
-                ledger
-                    .gov
-                    .governance
-                    .committee_expiration
-                    .keys()
-                    .copied()
-                    .collect();
+                ledger.gov.governance.committee_auth_eligible_members();
             let committee_resigned: std::collections::HashSet<dugite_primitives::hash::Hash32> =
                 ledger
                     .gov

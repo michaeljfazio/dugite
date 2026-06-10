@@ -1573,6 +1573,60 @@ pub(crate) fn expire_committee_members(new_epoch: EpochNo, gov: &mut GovSubState
     }
 }
 
+/// Prune committee hot-key authorizations and resignations to the
+/// POST-enactment committee membership at the epoch boundary.
+///
+/// Mirrors Haskell `updateCommitteeState` (Conway/Rules/Epoch.hs), which runs
+/// unconditionally every epoch boundary AFTER enactment:
+///
+/// ```haskell
+/// updateCommitteeState :: StrictMaybe (Committee era) -> CommitteeState era -> CommitteeState era
+/// updateCommitteeState committee (CommitteeState creds) =
+///   CommitteeState $ Map.intersection creds members
+///   where
+///     members = foldMap' committeeMembers committee
+/// ```
+///
+/// `vsCommitteeState` (dugite: `committee_hot_keys` + `committee_resigned`)
+/// keeps ONLY entries whose cold credential is in the new committee — entries
+/// for members removed by an enacted `UpdateCommittee` (explicitly or
+/// implicitly) are discarded, and a `NoConfidence` (empty committee) wipes
+/// everything. `script_committee_hot_credentials` (hot-credential TYPE
+/// tracking, keyed by HOT hash) is kept in sync with the retained hot keys.
+pub(crate) fn prune_committee_state(gov: &mut GovSubState) {
+    let members: std::collections::HashSet<Hash32> = gov
+        .governance
+        .committee_expiration
+        .keys()
+        .copied()
+        .collect();
+    let gov_state = Arc::make_mut(&mut gov.governance);
+
+    let stale_hot: Vec<Hash32> = gov_state
+        .committee_hot_keys
+        .iter()
+        .filter(|(cold, _)| !members.contains(*cold))
+        .map(|(_, hot)| *hot)
+        .collect();
+    if !stale_hot.is_empty() {
+        gov_state
+            .committee_hot_keys
+            .retain(|cold, _| members.contains(cold));
+        // A hot credential's script-type marker is dropped only when no
+        // RETAINED member still authorizes that same hot credential.
+        let live_hot: std::collections::HashSet<Hash32> =
+            gov_state.committee_hot_keys.values().copied().collect();
+        for hot in stale_hot {
+            if !live_hot.contains(&hot) {
+                gov_state.script_committee_hot_credentials.remove(&hot);
+            }
+        }
+    }
+    gov_state
+        .committee_resigned
+        .retain(|cold, _| members.contains(cold));
+}
+
 /// Capture the DRep distribution snapshot and ratification snapshot for the
 /// NEXT epoch boundary.
 ///
@@ -2309,22 +2363,28 @@ pub(crate) fn enact_gov_action_impl(
             threshold,
             ..
         } => {
+            // Haskell ENACT (`updatedCommittee`, Conway/Rules/Enact.hs) only
+            // rewrites the committee MEMBERSHIP:
+            //
+            // ```haskell
+            // newCommitteeMembers =
+            //   Map.union membersToAdd (currentMembers `Map.withoutKeys` membersToRemove)
+            // ```
+            //
+            // (left-biased union: a credential both removed and re-added stays,
+            // with the NEW term). Hot-key authorizations and resignations
+            // (`vsCommitteeState`) are NOT touched here — they are pruned to the
+            // post-enactment membership at the epoch boundary by
+            // `updateCommitteeState` (see `prune_committee_state`), so a member
+            // removed-and-re-added in one action keeps both its hot-key auth and
+            // any standing resignation.
             for cred in members_to_remove {
                 let key = credential_to_hash(cred);
-                Arc::make_mut(&mut gov.governance)
-                    .committee_hot_keys
-                    .remove(&key);
                 Arc::make_mut(&mut gov.governance)
                     .committee_expiration
                     .remove(&key);
                 Arc::make_mut(&mut gov.governance)
-                    .committee_resigned
-                    .remove(&key);
-                Arc::make_mut(&mut gov.governance)
                     .script_committee_credentials
-                    .remove(&key);
-                Arc::make_mut(&mut gov.governance)
-                    .script_committee_hot_credentials
                     .remove(&key);
             }
             for (cred, expiration_epoch) in members_to_add {
@@ -6246,6 +6306,153 @@ mod tests {
                 numerator: 2,
                 denominator: 3,
             })
+        );
+    }
+
+    /// #731: Haskell GOVCERT accepts a `CommitteeHotAuth` for a cold
+    /// credential that is named in `members_to_add` of any LIVE
+    /// `UpdateCommittee` proposal (`isPotentialFutureMember`), not just for
+    /// current committee members.
+    #[test]
+    fn test_committee_auth_eligible_includes_pending_update_committee_adds() {
+        let mut state = gov_test_state(0, 0);
+        let current_cold =
+            credential_to_hash(&Credential::VerificationKey(Hash28::from_bytes([10u8; 28])));
+        let future_cred = Credential::VerificationKey(Hash28::from_bytes([77u8; 28]));
+        let future_cold = credential_to_hash(&future_cred);
+        let unrelated_cold =
+            credential_to_hash(&Credential::VerificationKey(Hash28::from_bytes([78u8; 28])));
+
+        // Before any proposal: only the current member is eligible.
+        let eligible = state.gov.governance.committee_auth_eligible_members();
+        assert!(eligible.contains(&current_cold));
+        assert!(!eligible.contains(&future_cold));
+
+        // A live UpdateCommittee proposal naming `future_cred` makes it a
+        // potential future member.
+        let mut members = BTreeMap::new();
+        members.insert(future_cred, 500u64);
+        let action_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0xAA; 32]),
+            action_index: 0,
+        };
+        Arc::make_mut(&mut state.gov.governance).proposals.insert(
+            action_id,
+            ProposalState {
+                procedure: ProposalProcedure {
+                    deposit: Lovelace(100_000_000_000),
+                    return_addr: vec![0; 29],
+                    gov_action: GovAction::UpdateCommittee {
+                        prev_action_id: None,
+                        members_to_remove: vec![],
+                        members_to_add: members,
+                        threshold: Rational {
+                            numerator: 2,
+                            denominator: 3,
+                        },
+                    },
+                    anchor: make_anchor(),
+                },
+                proposed_epoch: EpochNo(0),
+                expires_epoch: EpochNo(10),
+                yes_votes: 0,
+                no_votes: 0,
+                abstain_votes: 0,
+            },
+        );
+
+        let eligible = state.gov.governance.committee_auth_eligible_members();
+        assert!(eligible.contains(&current_cold));
+        assert!(
+            eligible.contains(&future_cold),
+            "members_to_add of a live UpdateCommittee proposal must be auth-eligible"
+        );
+        assert!(!eligible.contains(&unrelated_cold));
+    }
+
+    /// #731: Haskell `updateCommitteeState` (Conway/Rules/Epoch.hs) prunes
+    /// hot-key authorizations AND resignations to the post-enactment
+    /// committee membership via `Map.intersection` — including members
+    /// removed IMPLICITLY (present in neither `members_to_remove` nor
+    /// `members_to_add`)… of which explicit removal is just a special case.
+    /// A member removed and re-added in the SAME action keeps its hot-key
+    /// authorization and any standing resignation.
+    #[test]
+    fn test_prune_committee_state_intersects_with_membership() {
+        let mut state = gov_test_state(0, 0);
+        let gov_state = Arc::make_mut(&mut state.gov.governance);
+
+        let cold_a = Hash32::from_bytes([1u8; 32]);
+        let cold_b = Hash32::from_bytes([2u8; 32]);
+        let cold_c = Hash32::from_bytes([3u8; 32]);
+        let hot_a = Hash32::from_bytes([11u8; 32]);
+        let hot_b = Hash32::from_bytes([12u8; 32]);
+
+        // Committee after enactment: A and C only (B implicitly removed).
+        gov_state.committee_expiration.insert(cold_a, EpochNo(900));
+        gov_state.committee_expiration.insert(cold_c, EpochNo(900));
+        // committeeState before the prune: hot auths for A and B, B has a
+        // script-typed hot credential, C has a standing resignation.
+        gov_state.committee_hot_keys.insert(cold_a, hot_a);
+        gov_state.committee_hot_keys.insert(cold_b, hot_b);
+        gov_state.script_committee_hot_credentials.insert(hot_b);
+        gov_state.committee_resigned.insert(cold_b, None);
+        gov_state.committee_resigned.insert(cold_c, None);
+
+        prune_committee_state(&mut state.gov);
+
+        let g = &state.gov.governance;
+        // A: still a member — hot auth retained.
+        assert_eq!(g.committee_hot_keys.get(&cold_a), Some(&hot_a));
+        // B: not in the new committee — hot auth, script-type marker, and
+        // resignation all pruned.
+        assert!(!g.committee_hot_keys.contains_key(&cold_b));
+        assert!(!g.script_committee_hot_credentials.contains(&hot_b));
+        assert!(!g.committee_resigned.contains_key(&cold_b));
+        // C: still a member — its resignation is KEPT (resignations are
+        // permanent while the member remains in the committee).
+        assert!(g.committee_resigned.contains_key(&cold_c));
+    }
+
+    /// #731: a member removed and re-added by the SAME UpdateCommittee action
+    /// stays in the committee (Haskell `Map.union membersToAdd (current
+    /// \\ removed)` is left-biased) and KEEPS its hot-key authorization and
+    /// resignation through the boundary prune (ENACT does not touch
+    /// `vsCommitteeState`).
+    #[test]
+    fn test_update_committee_remove_and_readd_keeps_committee_state() {
+        let mut state = gov_test_state(0, 0);
+        let cred = Credential::VerificationKey(Hash28::from_bytes([10u8; 28]));
+        let cold_key = credential_to_hash(&cred);
+        // gov_test_state seeded `cred` as a member with a hot-key auth.
+        assert!(state
+            .gov
+            .governance
+            .committee_hot_keys
+            .contains_key(&cold_key));
+
+        let mut members = BTreeMap::new();
+        members.insert(cred.clone(), 777u64);
+        state.enact_gov_action(&GovAction::UpdateCommittee {
+            prev_action_id: None,
+            members_to_remove: vec![cred],
+            members_to_add: members,
+            threshold: Rational {
+                numerator: 2,
+                denominator: 3,
+            },
+        });
+        prune_committee_state(&mut state.gov);
+
+        let g = &state.gov.governance;
+        assert_eq!(
+            g.committee_expiration.get(&cold_key),
+            Some(&EpochNo(777)),
+            "re-added member keeps membership with the NEW term (add wins)"
+        );
+        assert!(
+            g.committee_hot_keys.contains_key(&cold_key),
+            "hot-key auth survives a remove-and-re-add in one action"
         );
     }
 

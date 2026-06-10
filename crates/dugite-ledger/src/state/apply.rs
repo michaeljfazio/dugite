@@ -679,13 +679,11 @@ impl LedgerState {
                 .values()
                 .map(|reg| (reg.vrf_keyhash, reg.pool_id))
                 .collect();
-            let committee_members: HashSet<dugite_primitives::hash::Hash32> = self
-                .gov
-                .governance
-                .committee_expiration
-                .keys()
-                .copied()
-                .collect();
+            // Current members ∪ `members_to_add` of live UpdateCommittee
+            // proposals — Haskell GOVCERT accepts a CommitteeHotAuth from a
+            // potential FUTURE member too (`isPotentialFutureMember`).
+            let committee_members: HashSet<dugite_primitives::hash::Hash32> =
+                self.gov.governance.committee_auth_eligible_members();
             let committee_resigned: HashSet<dugite_primitives::hash::Hash32> = self
                 .gov
                 .governance
@@ -873,26 +871,31 @@ impl LedgerState {
 
                     // Conway LEDGERS: unelected committee member check.
                     //
+                    // Per Haskell GOVCERT (`checkAndOverwriteCommitteeMemberState`)
+                    // the cold credential must be a CURRENT committee member OR a
+                    // potential FUTURE member (named in `members_to_add` of a live
+                    // UpdateCommittee proposal) — `isCurrentMember ||
+                    // isPotentialFutureMember`.
+                    //
                     // Aggregate one WARN per tx, not one per cert: a single
-                    // CommitteeHotAuth tx can carry 30+ certs, and dugite does not
-                    // yet enact the network's UpdateCommittee gov actions, so its
-                    // committee stays at the genesis set and EVERY elected member's
-                    // hot-key auth fails this lookup. Per-cert logging produced a
-                    // 186K-line / 1GB+ log over a single Conway sync (#22 follow-up).
+                    // CommitteeHotAuth tx can carry 30+ certs; per-cert logging
+                    // produced a 186K-line / 1GB+ log over a single Conway sync
+                    // (#22 follow-up).
                     if self.epochs.protocol_params.protocol_version_major >= 9 {
                         let mut unelected: Vec<String> = Vec::new();
+                        let mut eligible: Option<
+                            std::collections::HashSet<dugite_primitives::hash::Hash32>,
+                        > = None;
                         for cert in &tx.body.certificates {
                             if let Certificate::CommitteeHotAuth {
                                 cold_credential, ..
                             } = cert
                             {
                                 let cold_key = credential_to_hash(cold_credential);
-                                if !self
-                                    .gov
-                                    .governance
-                                    .committee_expiration
-                                    .contains_key(&cold_key)
-                                {
+                                let eligible = eligible.get_or_insert_with(|| {
+                                    self.gov.governance.committee_auth_eligible_members()
+                                });
+                                if !eligible.contains(&cold_key) {
                                     unelected.push(cold_key.to_hex());
                                 }
                             }
@@ -903,9 +906,10 @@ impl LedgerState {
                                 slot = block.slot().0,
                                 count = unelected.len(),
                                 first_cold_key = %unelected[0],
-                                "CommitteeHotAuth for non-current CC member(s) on confirmed \
-                                 block — dugite has not enacted the network's UpdateCommittee, \
-                                 so its committee is stale; trusting on-chain consensus"
+                                "CommitteeHotAuth for cold credential(s) neither in the \
+                                 current committee nor in any live UpdateCommittee \
+                                 proposal — committee state may be stale; trusting \
+                                 on-chain consensus"
                             );
                         }
                     }
