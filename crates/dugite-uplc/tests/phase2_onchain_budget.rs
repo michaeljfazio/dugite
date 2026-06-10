@@ -40,6 +40,10 @@ fn hexd(s: &str) -> Vec<u8> {
 /// cost-model path. Returns `Ok(redeemer_count)` when every script validates
 /// within its declared exUnits, `Err(message)` otherwise.
 fn eval_onchain_fixture(name: &str) -> Result<usize, String> {
+    eval_onchain_fixture_expecting(name, true)
+}
+
+fn eval_onchain_fixture_expecting(name: &str, expect_valid: bool) -> Result<usize, String> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/phase2_onchain")
         .join(name);
@@ -49,8 +53,8 @@ fn eval_onchain_fixture(name: &str) -> Result<usize, String> {
 
     assert_eq!(
         doc["is_valid"].as_bool(),
-        Some(true),
-        "{name}: fixture must be an on-chain is_valid=true tx"
+        Some(expect_valid),
+        "{name}: fixture must be an on-chain is_valid={expect_valid} tx"
     );
 
     let tx_cbor = hexd(doc["tx_cbor"].as_str().unwrap());
@@ -97,7 +101,19 @@ fn eval_onchain_fixture(name: &str) -> Result<usize, String> {
 /// budget under dugite's on-chain cost-model CEK path.
 #[test]
 fn onchain_babbage_scripts_validate_within_declared_budget() {
-    let fixtures = ["tx0.json", "tx1.json", "tx6.json"];
+    let fixtures = [
+        "tx0.json",
+        "tx1.json",
+        "tx6.json",
+        // Zero-quantity multiasset entries in TxOut values: Haskell's
+        // decoder prunes them pre-Conway (`pruneZeroMultiAsset`), so the
+        // Plutus ScriptContext never contains them. Keeping the zero entry
+        // made the spend validator walk one extra Value node — a fixed
+        // +15,423,657 cpu / +26,364 mem over-charge that pushed these
+        // on-chain-valid txs over their declared exUnits (#730).
+        "zero_asset_tx0.json",
+        "zero_asset_tx1.json",
+    ];
     let mut failures = Vec::new();
     for f in fixtures {
         match eval_onchain_fixture(f) {
@@ -109,5 +125,20 @@ fn onchain_babbage_scripts_validate_within_declared_budget() {
         failures.is_empty(),
         "on-chain-valid scripts must pass phase-2 within their declared budget (#730):\n{}",
         failures.join("\n")
+    );
+}
+
+/// The reverse polarity: a captured on-chain `is_valid = FALSE` Babbage tx
+/// (the network's Haskell nodes evaluated its scripts and they FAILED) must
+/// also fail dugite's phase-2. Before the zero-quantity pruning fix dugite
+/// PASSED all three of this tx's redeemers (a wrong-accept): its un-pruned
+/// ScriptContext value maps steered the validators down a cheaper, succeeding
+/// path (#730).
+#[test]
+fn onchain_invalid_babbage_tx_fails_phase_two() {
+    let result = eval_onchain_fixture_expecting("zero_asset_invalid_tx4.json", false);
+    assert!(
+        result.is_err(),
+        "on-chain is_valid=false tx must fail dugite phase-2, got {result:?}"
     );
 }
