@@ -674,9 +674,28 @@ fn read_multiasset_map_u64(
             Ok(assets)
         },
     )?;
+    // Haskell `decodeMultiAsset` (Mary/Value.hs) for decoder version < 9
+    // (Alonzo/Babbage era CBOR) uses `decodeWithPrunning`:
+    //
+    // ```haskell
+    // decodeWithPrunning =
+    //   pruneZeroMultiAsset . MultiAsset <$> decodeMap decCBOR (decodeMap decCBOR decodeAmount)
+    // pruneZeroMultiAsset = filterMultiAsset (\_ _ -> (/= 0))
+    // ```
+    //
+    // Zero-quantity assets are ACCEPTED on the wire and pruned, and a policy
+    // whose asset map becomes (or arrives) empty is dropped entirely
+    // (`filterMultiAsset` guards `not (null newAssetMap)`). The pruned value
+    // is what the ledger stores and what Plutus ScriptContexts see — keeping
+    // zeros made every script walking such a Value over-cost vs cardano-node
+    // (#730). Conway (v9+) instead REJECTS zeros — see
+    // era_conway::read_multiasset_map_u64.
     let mut result = BTreeMap::new();
-    for (k, v) in entries {
-        result.insert(k, v);
+    for (k, mut v) in entries {
+        v.retain(|_, amount| *amount != 0);
+        if !v.is_empty() {
+            result.insert(k, v);
+        }
     }
     Ok(result)
 }
@@ -715,9 +734,16 @@ fn read_mint_map(
             Ok(assets)
         },
     )?;
+    // Same pre-v9 `decodeWithPrunning` semantics as `read_multiasset_map_u64`
+    // above: the mint field shares Haskell's `decodeMultiAsset` (with a signed
+    // amount decoder), so zero quantities are pruned and emptied policies
+    // dropped.
     let mut result = BTreeMap::new();
-    for (k, v) in entries {
-        result.insert(k, v);
+    for (k, mut v) in entries {
+        v.retain(|_, amount| *amount != 0);
+        if !v.is_empty() {
+            result.insert(k, v);
+        }
     }
     Ok(result)
 }
@@ -1601,6 +1627,75 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
             .collect()
+    }
+
+    /// CBOR for `[coin, {policy(28×fill) -> {"" -> amount}}]`.
+    fn value_one_asset_cbor(coin: u8, fill: u8, amount: u8) -> Vec<u8> {
+        let mut v = vec![0x82, coin, 0xa1, 0x58, 0x1c];
+        v.extend([fill; 28]);
+        v.extend([0xa1, 0x40, amount]);
+        v
+    }
+
+    /// #730: Haskell `decodeMultiAsset` at decoder version < 9 PRUNES
+    /// zero-quantity assets (`pruneZeroMultiAsset`) and drops policies whose
+    /// asset map becomes empty. A value whose only asset is zero collapses to
+    /// an ada-only Value (the ledger / Plutus ScriptContext never see the
+    /// zero entry).
+    #[test]
+    fn pre_conway_value_zero_quantity_asset_pruned() {
+        let bytes = value_one_asset_cbor(0x0a, 0x11, 0x00);
+        let mut r = Reader::new(&bytes);
+        let v = read_value(&mut r).expect("zero amount accepted pre-Conway");
+        assert_eq!(v.coin.0, 10);
+        assert!(
+            v.multi_asset.is_empty(),
+            "zero-quantity asset must be pruned: {:?}",
+            v.multi_asset
+        );
+    }
+
+    /// Mixed case: only the zero entry is pruned; non-zero assets survive.
+    #[test]
+    fn pre_conway_value_partial_zero_prune() {
+        // [10, {policy(0x11) -> {"" -> 0}, policy(0x22) -> {"" -> 5}}]
+        let mut bytes = vec![0x82, 0x0a, 0xa2, 0x58, 0x1c];
+        bytes.extend([0x11; 28]);
+        bytes.extend([0xa1, 0x40, 0x00, 0x58, 0x1c]);
+        bytes.extend([0x22; 28]);
+        bytes.extend([0xa1, 0x40, 0x05]);
+        let mut r = Reader::new(&bytes);
+        let v = read_value(&mut r).expect("decode");
+        assert_eq!(v.multi_asset.len(), 1);
+        let (policy, assets) = v.multi_asset.iter().next().unwrap();
+        assert_eq!(policy.as_bytes(), &[0x22; 28]);
+        assert_eq!(assets.values().copied().collect::<Vec<u64>>(), vec![5]);
+    }
+
+    /// A wire-empty inner asset map is dropped pre-Conway (`filterMultiAsset`
+    /// guards `not (null newAssetMap)` over the as-decoded map).
+    #[test]
+    fn pre_conway_value_empty_asset_map_dropped() {
+        // [10, {policy(0x11) -> {}}]
+        let mut bytes = vec![0x82, 0x0a, 0xa1, 0x58, 0x1c];
+        bytes.extend([0x11; 28]);
+        bytes.push(0xa0);
+        let mut r = Reader::new(&bytes);
+        let v = read_value(&mut r).expect("decode");
+        assert!(v.multi_asset.is_empty());
+    }
+
+    /// The mint field shares Haskell's `decodeMultiAsset`: zero quantities are
+    /// pruned pre-Conway.
+    #[test]
+    fn pre_conway_mint_zero_quantity_pruned() {
+        // {policy(0x11) -> {"" -> 0}}
+        let mut bytes = vec![0xa1, 0x58, 0x1c];
+        bytes.extend([0x11; 28]);
+        bytes.extend([0xa1, 0x40, 0x00]);
+        let mut r = Reader::new(&bytes);
+        let mint = read_mint_map(&mut r).expect("decode");
+        assert!(mint.is_empty(), "zero mint quantity must be pruned");
     }
 
     /// `plutus_data_element_spans` must return each datum's *original* bytes
