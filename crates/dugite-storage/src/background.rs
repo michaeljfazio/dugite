@@ -191,9 +191,12 @@ impl CopyToImmutable {
         // Append the block to ImmutableDB.
         // `put_blocks_batch` writes directly to ImmutableDB (the Mithril bypass
         // path) — which is exactly what we want here: a single already-verified
-        // block being moved from volatile to immutable storage.
+        // block being moved from volatile to immutable storage.  The slot stays
+        // ABSOLUTE for Byron EBBs (dugite-format chunks keep monotonic slots);
+        // only the is_ebb metadata flag is derived from the stored envelope.
+        let is_ebb = crate::chain_db::is_byron_ebb_envelope(&cbor);
         chain_db
-            .put_blocks_batch(&[(oldest_slot, &oldest_hash, oldest_block_no, &cbor, false)])
+            .put_blocks_batch(&[(oldest_slot, &oldest_hash, oldest_block_no, &cbor, is_ebb)])
             .map_err(|e| {
                 format!("CopyToImmutable: ImmutableDB append failed for block {oldest_hash}: {e}")
             })?;

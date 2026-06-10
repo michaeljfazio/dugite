@@ -888,6 +888,23 @@ impl VolatileDB {
         None
     }
 
+    /// Get the selected-chain successor of the block with the given hash.
+    ///
+    /// Point-aware counterpart of [`get_next_block_after_slot`]: a Byron EBB
+    /// shares its absolute slot with the first main block of the epoch, so a
+    /// slot cursor cannot step between them — the chain-order successor can.
+    /// Returns `None` when the cursor is the selected-chain tip, is a fork
+    /// block off the selected chain, or is unknown.
+    ///
+    /// O(n) in the selected-chain length, like
+    /// [`is_on_selected_chain`](Self::is_on_selected_chain).
+    pub fn get_next_block_after_point(&self, hash: &Hash32) -> Option<(u64, Hash32, &[u8])> {
+        let pos = self.selected_chain.iter().position(|h| h == hash)?;
+        let next_hash = self.selected_chain.get(pos + 1)?;
+        let blk = self.blocks.get(next_hash)?;
+        Some((blk.slot, *next_hash, &blk.cbor))
+    }
+
     /// Get the first block at or after a given slot (inclusive `>=`).
     ///
     /// Unlike [`get_next_block_after_slot`] which uses strict `>`, this method
@@ -1375,7 +1392,16 @@ impl VolatileDB {
             let Some(blk) = self.blocks.get(hash) else {
                 continue;
             };
-            if blk.block_no < start_block_no {
+            // EBB invariant: a Byron Epoch Boundary Block shares its block_no
+            // with the predecessor main block (EBBs do not increment the
+            // chain difficulty).  `start_block_no` is `last_flushed + 1`, so a
+            // strict `block_no < start_block_no` skip drops an EBB whenever a
+            // flush batch ended exactly at its predecessor (mainnet epochs
+            // 112/135/145 + the genesis EBB at block_no 0).  Let entries at
+            // exactly `last_flushed` through — the caller's
+            // `immutable.has_block` check skips the already-flushed
+            // predecessor, while the unflushed EBB is collected.
+            if blk.block_no + 1 < start_block_no {
                 continue;
             }
             if blk.block_no > finalize_up_to {
@@ -1843,6 +1869,47 @@ mod tests {
 
     fn h(byte: u8) -> Hash32 {
         Hash32::from_bytes([byte; 32])
+    }
+
+    /// A Byron EBB and the first main block of an epoch share an absolute
+    /// slot; the selected-chain successor lookup must step from the EBB to
+    /// the same-slot main block, which the slot-keyed
+    /// `get_next_block_after_slot` cannot express.
+    #[test]
+    fn get_next_block_after_point_steps_through_same_slot_pair() {
+        let mut db = VolatileDB::new();
+        // pred(slot 99, block 5) <- ebb(slot 100, block 5) <- main(slot 100, block 6)
+        db.add_block(h(1), 99, 5, h(0), b"pred".to_vec());
+        db.add_block(h(2), 100, 5, h(1), b"ebb_".to_vec());
+        db.add_block(h(3), 100, 6, h(2), b"main".to_vec());
+
+        let (s, hash, cbor) = db
+            .get_next_block_after_point(&h(1))
+            .expect("ebb after pred");
+        assert_eq!((s, hash), (100, h(2)));
+        assert_eq!(cbor, b"ebb_");
+
+        let (s, hash, cbor) = db
+            .get_next_block_after_point(&h(2))
+            .expect("same-slot main after ebb");
+        assert_eq!((s, hash), (100, h(3)));
+        assert_eq!(cbor, b"main");
+
+        // Tip has no successor; unknown cursor has no successor.
+        assert!(db.get_next_block_after_point(&h(3)).is_none());
+        assert!(db.get_next_block_after_point(&h(99)).is_none());
+    }
+
+    /// A fork block stored off the selected chain has no selected-chain
+    /// successor.
+    #[test]
+    fn get_next_block_after_point_ignores_fork_cursor() {
+        let mut db = VolatileDB::new();
+        db.add_block(h(1), 10, 1, h(0), b"a".to_vec());
+        db.add_block(h(2), 20, 2, h(1), b"b".to_vec());
+        // Fork block at the same height, not extending the tip.
+        db.add_block(h(9), 20, 2, h(1), b"fork".to_vec());
+        assert!(db.get_next_block_after_point(&h(9)).is_none());
     }
 
     /// The incrementally-maintained `leaves` set must always equal the
