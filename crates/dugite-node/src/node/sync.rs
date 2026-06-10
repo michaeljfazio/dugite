@@ -344,11 +344,23 @@ impl Node {
                 let mut current_slot = ledger_slot;
                 let mut replayed = 0u64;
                 let mut ls = self.ledger_state.write().await;
+                // Point cursor: a Byron EBB shares its slot with the first
+                // main block of the epoch, so the walk must step by
+                // (slot, hash) — a slot-only step would skip the main block
+                // right after applying the EBB.  An Origin/unknown hash
+                // falls back to the slot-based lookup inside ChainDB.
+                let mut current_hash = ls
+                    .tip
+                    .point
+                    .hash()
+                    .copied()
+                    .unwrap_or(dugite_primitives::hash::Hash32::ZERO);
                 while current_slot < rollback_slot {
-                    match db
-                        .get_next_block_after_slot(dugite_primitives::time::SlotNo(current_slot))
-                    {
-                        Ok(Some((next_slot, _hash, cbor))) => {
+                    match db.get_next_block_after_point(
+                        dugite_primitives::time::SlotNo(current_slot),
+                        &current_hash,
+                    ) {
+                        Ok(Some((next_slot, next_hash, cbor))) => {
                             if next_slot.0 > rollback_slot {
                                 break;
                             }
@@ -368,6 +380,7 @@ impl Node {
                                     }
                                     replayed += 1;
                                     current_slot = next_slot.0;
+                                    current_hash = next_hash;
                                 }
                                 Err(e) => {
                                     warn!(
@@ -566,11 +579,20 @@ impl Node {
                         let db = self.chain_db.read().await;
                         let mut current_slot = replay_from;
                         let mut replayed = 0u64;
+                        // Point cursor (slot, hash): steps through same-slot
+                        // Byron EBB/main pairs that a slot-only walk skips.
+                        let mut current_hash = ls
+                            .tip
+                            .point
+                            .hash()
+                            .copied()
+                            .unwrap_or(dugite_primitives::hash::Hash32::ZERO);
                         while current_slot < rollback_slot {
-                            match db.get_next_block_after_slot(dugite_primitives::time::SlotNo(
-                                current_slot,
-                            )) {
-                                Ok(Some((next_slot, _hash, cbor))) => {
+                            match db.get_next_block_after_point(
+                                dugite_primitives::time::SlotNo(current_slot),
+                                &current_hash,
+                            ) {
+                                Ok(Some((next_slot, next_hash, cbor))) => {
                                     if next_slot.0 > rollback_slot {
                                         break;
                                     }
@@ -587,6 +609,7 @@ impl Node {
                                             }
                                             replayed += 1;
                                             current_slot = next_slot.0;
+                                            current_hash = next_hash;
                                         }
                                         Err(e) => {
                                             warn!("Failed to decode block during replay: {e}");
@@ -1385,18 +1408,24 @@ impl Node {
                         ledger_slot, first_new.slot().0,
                     );
                     let mut bridge_slot = ledger_slot;
+                    // Point cursor: steps through same-slot Byron EBB/main
+                    // pairs that a slot-only walk would skip.  Unknown/origin
+                    // hashes fall back to the slot lookup inside ChainDB.
+                    let mut bridge_hash =
+                        ledger_tip_hash.unwrap_or(dugite_primitives::hash::Hash32::ZERO);
                     let target_slot = first_new.slot().0;
                     let mut bridged = 0u64;
                     let mut bridge_failed = false;
                     loop {
                         let block_data = {
                             let db = self.chain_db.read().await;
-                            db.get_next_block_after_slot(dugite_primitives::time::SlotNo(
-                                bridge_slot,
-                            ))
+                            db.get_next_block_after_point(
+                                dugite_primitives::time::SlotNo(bridge_slot),
+                                &bridge_hash,
+                            )
                         };
                         match block_data {
-                            Ok(Some((next_slot, _hash, cbor))) => {
+                            Ok(Some((next_slot, next_hash, cbor))) => {
                                 if next_slot.0 >= target_slot {
                                     break; // Reached the incoming batch
                                 }
@@ -1417,6 +1446,7 @@ impl Node {
                                                 "Gap bridge: skipping non-connecting block (likely fork contamination)"
                                             );
                                             bridge_slot = next_slot.0;
+                                            bridge_hash = next_hash;
                                             continue; // Skip, try next block
                                         }
                                         if let Err(e) = ls.apply_block(&block, BlockValidationMode::ApplyOnly) {
@@ -1430,10 +1460,12 @@ impl Node {
                                         }
                                         bridged += 1;
                                         bridge_slot = next_slot.0;
+                                        bridge_hash = next_hash;
                                     }
                                     Err(e) => {
                                         warn!(slot = next_slot.0, error = %e, "Gap bridge decode failed");
                                         bridge_slot = next_slot.0;
+                                        bridge_hash = next_hash;
                                     }
                                 }
                             }
@@ -2671,9 +2703,15 @@ impl Node {
                 // At genesis — always canonical, no check needed.
                 false
             } else {
+                // Point lookup: when the ledger tip is a Byron EBB, the next
+                // canonical block is the same-slot main block — a slot-only
+                // probe would skip it and compare against the WRONG successor,
+                // mis-diagnosing a fork.
                 let db = self.chain_db.read().await;
-                let next_block =
-                    db.get_next_block_after_slot(dugite_primitives::time::SlotNo(ledger_tip_slot));
+                let next_block = db.get_next_block_after_point(
+                    dugite_primitives::time::SlotNo(ledger_tip_slot),
+                    &ledger_tip_hash.unwrap_or(dugite_primitives::hash::Hash32::ZERO),
+                );
                 drop(db);
 
                 match (next_block, ledger_tip_hash) {
@@ -2858,6 +2896,17 @@ impl Node {
         }
 
         let mut current_slot = start_slot;
+        // Point cursor: steps through same-slot Byron EBB/main pairs that a
+        // slot-only walk skips.  Origin/unknown hashes fall back to the
+        // slot-based lookup inside ChainDB.
+        let mut current_hash = {
+            let ls = self.ledger_state.read().await;
+            ls.tip
+                .point
+                .hash()
+                .copied()
+                .unwrap_or(dugite_primitives::hash::Hash32::ZERO)
+        };
         loop {
             // Check shutdown every 1000 blocks
             if replayed.is_multiple_of(1000) && replayed > 0 && *shutdown_rx.borrow() {
@@ -2878,11 +2927,14 @@ impl Node {
 
             let block_data = {
                 let db = self.chain_db.read().await;
-                db.get_next_block_after_slot(dugite_primitives::time::SlotNo(current_slot))
+                db.get_next_block_after_point(
+                    dugite_primitives::time::SlotNo(current_slot),
+                    &current_hash,
+                )
             };
 
             match block_data {
-                Ok(Some((next_slot, _hash, cbor))) => {
+                Ok(Some((next_slot, next_hash, cbor))) => {
                     // Stop once we have replayed up to and including the target slot.
                     if next_slot.0 > end_slot {
                         break;
@@ -2902,6 +2954,7 @@ impl Node {
                             }
                             replayed += 1;
                             current_slot = next_slot.0;
+                            current_hash = next_hash;
 
                             if last_log.elapsed().as_secs() >= 5 {
                                 let elapsed = start.elapsed().as_secs_f64();
@@ -2941,8 +2994,10 @@ impl Node {
                                 slot = next_slot.0,
                                 "Failed to decode block during replay: {e}"
                             );
-                            // Advance past the undecodable slot to avoid an infinite loop.
+                            // Advance past the undecodable block to avoid an
+                            // infinite loop.
                             current_slot = next_slot.0;
+                            current_hash = next_hash;
                         }
                     }
                 }
@@ -3994,9 +4049,15 @@ pub async fn chainsync_client_task(
     let mut chain_diverged = false;
     if chain_slot >= ledger_slot && ledger_tip != Point::Origin {
         let db = chain_db.read().await;
-        if let Ok(Some((_next_slot, _hash, cbor))) =
-            db.get_next_block_after_slot(dugite_primitives::time::SlotNo(ledger_slot))
-        {
+        // Point lookup: when the ledger tip is a Byron EBB, the next block is
+        // the same-slot main block — a slot-only probe would skip it and
+        // falsely flag divergence.
+        if let Ok(Some((_next_slot, _hash, cbor))) = db.get_next_block_after_point(
+            dugite_primitives::time::SlotNo(ledger_slot),
+            ledger_tip
+                .hash()
+                .unwrap_or(&dugite_primitives::hash::Hash32::ZERO),
+        ) {
             if let Ok(block) = dugite_serialization::decode_block_minimal_with_byron_epoch_length(
                 &cbor,
                 byron_epoch_length,

@@ -74,6 +74,26 @@ impl BlockProvider for ChainDBBlockProvider {
         })
     }
 
+    fn get_next_block_after_point(
+        &self,
+        slot: u64,
+        hash: &[u8; 32],
+    ) -> Option<(u64, [u8; 32], Vec<u8>)> {
+        let block_hash = dugite_primitives::hash::Hash32::from_bytes(*hash);
+        tokio::task::block_in_place(|| {
+            let db = self.chain_db.blocking_read();
+            match db.get_next_block_after_point(dugite_primitives::time::SlotNo(slot), &block_hash)
+            {
+                Ok(Some((s, h, cbor))) => {
+                    let mut hash_arr = [0u8; 32];
+                    hash_arr.copy_from_slice(h.as_bytes());
+                    Some((s.0, hash_arr, cbor))
+                }
+                _ => None,
+            }
+        })
+    }
+
     fn is_on_chain(&self, hash: &[u8; 32]) -> bool {
         let block_hash = dugite_primitives::hash::Hash32::from_bytes(*hash);
         tokio::task::block_in_place(|| {
@@ -146,30 +166,31 @@ impl BlockProvider for ChainDBBlockProvider {
 
         tokio::task::block_in_place(|| {
             let mut blocks = Vec::new();
-            let mut current_slot = from_slot;
-            let mut first = true;
+            // Point cursor (slot, hash) of the last collected block.  A Byron
+            // EBB shares its absolute slot with the first main block of the
+            // epoch, so iteration must step by point — a slot cursor would
+            // skip the same-slot main block after collecting the EBB.
+            let mut cursor: Option<(u64, dugite_primitives::hash::Hash32)> = None;
 
-            while current_slot <= to_slot && blocks.len() < limit {
+            while blocks.len() < limit {
                 // Acquire the read lock for a chunk of blocks.
                 let db = self.chain_db.blocking_read();
                 let chunk_limit = BATCH_CHUNK_SIZE.min(limit - blocks.len());
 
                 for _ in 0..chunk_limit {
-                    if current_slot > to_slot {
-                        break;
-                    }
-                    let slot_no = dugite_primitives::time::SlotNo(current_slot);
-                    let result = if first {
-                        first = false;
-                        db.get_block_at_or_after_slot(slot_no)
-                    } else {
-                        db.get_next_block_after_slot(slot_no)
+                    let result = match cursor {
+                        None => db
+                            .get_block_at_or_after_slot(dugite_primitives::time::SlotNo(from_slot)),
+                        Some((slot, hash)) => db.get_next_block_after_point(
+                            dugite_primitives::time::SlotNo(slot),
+                            &hash,
+                        ),
                     };
                     match result {
                         Ok(Some((s, hash, cbor))) if s.0 <= to_slot => {
                             let mut hash_arr = [0u8; 32];
                             hash_arr.copy_from_slice(hash.as_bytes());
-                            current_slot = s.0;
+                            cursor = Some((s.0, hash));
                             blocks.push((s.0, hash_arr, cbor));
                         }
                         _ => return blocks, // No more blocks — done
