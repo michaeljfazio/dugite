@@ -644,6 +644,10 @@ pub struct ConnectionLifecycleManager {
     /// Historicity cutoff seconds; `None` = praos (noCheck).
     historicity_cutoff_secs: Option<u64>,
 
+    /// ChainSync Jumping coordinator; `None` = disabled (praos / EnableCSJ
+    /// false → noJumping).
+    csj: Option<Arc<crate::csj::CsjRegistry>>,
+
     /// Shared block provider for server protocols (ChainSync server, BlockFetch server).
     block_provider: Arc<ChainDBBlockProvider>,
 
@@ -779,6 +783,7 @@ impl ConnectionLifecycleManager {
         gsm_snapshot_rx: tokio::sync::watch::Receiver<crate::gsm::GsmSnapshot>,
         lop_params: Option<(u64, u64)>,
         historicity_cutoff_secs: Option<u64>,
+        csj: Option<Arc<crate::csj::CsjRegistry>>,
         block_provider: Arc<ChainDBBlockProvider>,
         rollback_announcement_tx: broadcast::Sender<RollbackAnnouncement>,
         peer_manager_for_servers: Arc<RwLock<NodePeerManager>>,
@@ -816,6 +821,7 @@ impl ConnectionLifecycleManager {
             gsm_snapshot_rx,
             lop_params,
             historicity_cutoff_secs,
+            csj,
             block_provider,
             rollback_announcement_tx,
             peer_manager_for_servers,
@@ -1710,6 +1716,7 @@ impl ConnectionLifecycleManager {
         let gsm_snapshot_rx = self.gsm_snapshot_rx.clone();
         let lop_params = self.lop_params;
         let historicity_cutoff_secs = self.historicity_cutoff_secs;
+        let csj = self.csj.clone();
         let peer_intersection_established = self.peer_intersection_established.clone();
         let peer_failure_tx = self.peer_failure_tx.clone();
         let peer_manager = self.peer_manager_for_servers.clone();
@@ -1753,6 +1760,7 @@ impl ConnectionLifecycleManager {
                         gsm_snapshot_rx,
                         lop_params,
                         historicity_cutoff_secs,
+                        csj,
                     ) => r
                 };
                 // Report any non-cancel failure to the peer manager so the
@@ -1795,6 +1803,8 @@ impl ConnectionLifecycleManager {
         let peer_failure_tx = self.peer_failure_tx.clone();
         // Operator-tunable upper clamp on the adaptive fetch-range size.
         let max_range = self.blockfetch_max_range;
+        // CSJ dynamo rotation on starvation (Haskell demoteChainSyncJumpingDynamo).
+        let csj = self.csj.clone();
 
         Box::new(move |mut channel, cancel| {
             Box::pin(async move {
@@ -2269,6 +2279,14 @@ impl ConnectionLifecycleManager {
                                             timeout_secs = FETCH_RANGE_TIMEOUT.as_secs(),
                                             "BlockFetch range timed out, releasing fetcher",
                                         );
+                                        // CSJ: a peer starving BlockFetch is
+                                        // rotated out of the dynamo role so a
+                                        // different peer drives the jumps
+                                        // (Haskell: ChainSel-starvation past the
+                                        // grace period → demoteChainSyncJumpingDynamo).
+                                        if let Some(ref csj) = csj {
+                                            csj.rotate_dynamo(&addr);
+                                        }
                                         // Per-peer chain tracking (issue #702): record timeout
                                         // as a failure towards the Aberrant threshold.
                                         {
@@ -3053,6 +3071,7 @@ impl ConnectionLifecycleManager {
             .1,
             None,
             None,
+            None,
             block_provider,
             rollback_announcement_tx,
             peer_manager_for_servers,
@@ -3126,6 +3145,7 @@ impl ConnectionLifecycleManager {
                 loe_slot: None,
             })
             .1,
+            None,
             None,
             None,
             block_provider,

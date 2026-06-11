@@ -595,6 +595,19 @@ pub struct NodeMetrics {
     /// (0 = Praos, 1 = Ouroboros Genesis).  Set once at startup so dugite-monitor
     /// can show whether the node is running with Genesis (LoE/GDD) protection.
     pub consensus_mode_genesis: AtomicU64,
+    /// Genesis State Machine state: 0=PreSyncing, 1=Syncing, 2=CaughtUp.
+    /// `dugite_gsm_state`.
+    pub gsm_state: AtomicU64,
+    /// LoE tip slot published to chain selection. `dugite_loe_tip_slot`.
+    pub loe_tip_slot: AtomicU64,
+    /// Cumulative GDD density disconnects. `dugite_gdd_disconnects_total`.
+    pub gdd_disconnects_total: AtomicU64,
+    /// CSJ role counts. `dugite_csj_dynamos` / `_objectors` / `_jumpers` /
+    /// `_disengaged`.
+    pub csj_dynamos: AtomicU64,
+    pub csj_objectors: AtomicU64,
+    pub csj_jumpers: AtomicU64,
+    pub csj_disengaged: AtomicU64,
     /// Slot duration in milliseconds from the active Shelley genesis. Exposed
     /// as `dugite_slot_length_ms`. With this and `epoch_length_slots` clients
     /// can derive total epoch wall-clock time and remaining time precisely.
@@ -844,6 +857,13 @@ impl NodeMetrics {
             epoch_length_slots: AtomicU64::new(0),
             slot_in_epoch: AtomicU64::new(0),
             consensus_mode_genesis: AtomicU64::new(0),
+            gsm_state: AtomicU64::new(0),
+            loe_tip_slot: AtomicU64::new(0),
+            gdd_disconnects_total: AtomicU64::new(0),
+            csj_dynamos: AtomicU64::new(0),
+            csj_objectors: AtomicU64::new(0),
+            csj_jumpers: AtomicU64::new(0),
+            csj_disengaged: AtomicU64::new(0),
             slot_length_ms: AtomicU64::new(0),
             active_slots_coeff_x1000: AtomicU64::new(0),
             liveness_threshold_secs: AtomicU64::new(600),
@@ -1322,6 +1342,31 @@ impl NodeMetrics {
 
     /// Record the active consensus mode (`dugite_consensus_mode`: 0 = Praos,
     /// 1 = Genesis).  Call once at startup.
+    /// Record the GSM state (0/1/2), the LoE tip slot, and the CSJ role
+    /// counts in one call (driven by the GSM/CSJ subsystems).
+    pub fn set_genesis_state(
+        &self,
+        gsm_state: u64,
+        loe_tip_slot: u64,
+        csj_roles: (usize, usize, usize, usize),
+    ) {
+        self.gsm_state.store(gsm_state, Ordering::Relaxed);
+        self.loe_tip_slot.store(loe_tip_slot, Ordering::Relaxed);
+        self.csj_dynamos
+            .store(csj_roles.0 as u64, Ordering::Relaxed);
+        self.csj_objectors
+            .store(csj_roles.1 as u64, Ordering::Relaxed);
+        self.csj_jumpers
+            .store(csj_roles.2 as u64, Ordering::Relaxed);
+        self.csj_disengaged
+            .store(csj_roles.3 as u64, Ordering::Relaxed);
+    }
+
+    /// Increment the GDD disconnect counter.
+    pub fn record_gdd_disconnect(&self) {
+        self.gdd_disconnects_total.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn set_consensus_mode_genesis(&self, genesis: bool) {
         self.consensus_mode_genesis
             .store(genesis as u64, Ordering::Relaxed);
@@ -1908,6 +1953,41 @@ impl NodeMetrics {
                 "dugite_consensus_mode",
                 "Active consensus mode: 0=Praos, 1=Ouroboros Genesis",
                 &self.consensus_mode_genesis,
+            ),
+            (
+                "dugite_gsm_state",
+                "Genesis State Machine state: 0=PreSyncing, 1=Syncing, 2=CaughtUp",
+                &self.gsm_state,
+            ),
+            (
+                "dugite_loe_tip_slot",
+                "Limit on Eagerness tip slot published to chain selection",
+                &self.loe_tip_slot,
+            ),
+            (
+                "dugite_gdd_disconnects_total",
+                "Cumulative Genesis Density Disconnector peer disconnects",
+                &self.gdd_disconnects_total,
+            ),
+            (
+                "dugite_csj_dynamos",
+                "ChainSync Jumping peers in the dynamo role",
+                &self.csj_dynamos,
+            ),
+            (
+                "dugite_csj_objectors",
+                "ChainSync Jumping peers in the objector role",
+                &self.csj_objectors,
+            ),
+            (
+                "dugite_csj_jumpers",
+                "ChainSync Jumping peers in a jumper role",
+                &self.csj_jumpers,
+            ),
+            (
+                "dugite_csj_disengaged",
+                "ChainSync Jumping peers disengaged (running normal ChainSync)",
+                &self.csj_disengaged,
             ),
             (
                 "dugite_slot_length_ms",

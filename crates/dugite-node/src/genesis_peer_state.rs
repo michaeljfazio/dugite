@@ -285,6 +285,14 @@ impl PeerChainState {
         self.fragment.lock().expect("peer fragment lock").clone()
     }
 
+    /// Replace the candidate fragment wholesale and update `csLatestSlot`
+    /// (Haskell `updateChainSyncState`: a jumper that accepts a jump takes
+    /// the dynamo's fragment so the GDD sees it).
+    pub fn replace_fragment(&self, fragment: CandidateFragment) {
+        *self.latest_slot.lock().expect("latest_slot lock") = Some(fragment.head_slot());
+        *self.fragment.lock().expect("peer fragment lock") = fragment;
+    }
+
     /// Drop fragment entries at or below the immutable tip and re-anchor.
     ///
     /// Mirrors how Haskell candidate fragments are always compared after

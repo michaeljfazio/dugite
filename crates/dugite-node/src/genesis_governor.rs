@@ -13,7 +13,7 @@ use crate::genesis_peer_state::{CandidateFragment, FragAnchor, FragEntry, WithOr
 use dugite_consensus::loe::LoePoint;
 
 /// `succWithOrigin`: `Origin → 0`, `At s → s + 1`.
-fn succ_with_origin(w: WithOrigin) -> u64 {
+pub(crate) fn succ_with_origin(w: WithOrigin) -> u64 {
     match w {
         WithOrigin::Origin => 0,
         WithOrigin::At(s) => s.saturating_add(1),
