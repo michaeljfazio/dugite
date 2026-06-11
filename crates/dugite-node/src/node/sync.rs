@@ -4039,16 +4039,22 @@ async fn run_csj_jumper_loop(
     cancel: &CancellationToken,
 ) -> Result<JumperExit> {
     use crate::csj::CsjInstruction;
-    // Set when a JumpToGoodPoint promotion handshake is accepted — the
-    // server cursor has moved to the (potentially far-ahead) good point and
-    // the caller must re-intersect at the frontier before streaming (#735).
-    let mut promoted = false;
+    // Set when ANY accepted MsgFindIntersect moved the server cursor away
+    // from the original intersection — a regular jump OR a JumpToGoodPoint
+    // promotion handshake. A peer whose cursor jumped MUST re-intersect at
+    // the frontier before streaming (#735): a backfilled dynamo (promoted
+    // with `starting: None` after the old dynamo died) reaches RunNormally
+    // directly, so keying this on the good-point handshake alone left it
+    // streaming from its far-ahead jump point — the contiguity guard then
+    // (correctly) declined every range and the sync stalled (observed live
+    // on the mainnet CSJ soak, 2026-06-11 11:29).
+    let mut cursor_jumped = false;
     loop {
         match csj.next_instruction(&peer_addr) {
             CsjInstruction::RunNormally | CsjInstruction::Restart => {
                 // Became dynamo/objector (or a disengaged peer that now runs
                 // normal ChainSync). Fall through to the streaming pipeline.
-                return Ok(if promoted {
+                return Ok(if cursor_jumped {
                     JumperExit::StreamReintersect
                 } else {
                     JumperExit::Stream
@@ -4116,16 +4122,14 @@ async fn run_csj_jumper_loop(
                     }
                 };
                 let _ = byron_epoch_length; // jumps carry no Byron headers
+                if accepted && ji.tip_point().is_some() {
+                    // The server cursor moved to the accepted jump point —
+                    // whatever role this peer later assumes, it must
+                    // re-intersect at the frontier before streaming (#735).
+                    cursor_jumped = true;
+                }
                 let replace = if is_good_point {
-                    let r = csj.process_good_point_result(&peer_addr, accepted);
-                    if accepted {
-                        // Promotion handshake succeeded — the server cursor
-                        // now sits at the good point. The caller must
-                        // re-intersect at the frontier before streaming so
-                        // BlockFetch only ever sees contiguous ranges (#735).
-                        promoted = true;
-                    }
-                    r
+                    csj.process_good_point_result(&peer_addr, accepted)
                 } else {
                     csj.process_jump_result(&peer_addr, ji.clone(), accepted)
                 };
