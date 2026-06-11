@@ -1355,12 +1355,23 @@ pub(super) fn run_phase1_rules(
     // Rule 9: Reference inputs must exist and not overlap with regular inputs
     //
     // Disjointness (`inputs ∩ reference_inputs = ∅`) is enforced at phase-1
-    // only for PV < 11. At PV >= 11, Haskell `cardano-ledger` PR #5011
-    // (commit 44de8edcc1005ec0fe3442898b59ee57060ff72c) RELAXED this rule:
-    // V1/V2/native txs are accepted with overlap, and the equivalent check
-    // moves into PlutusV3 `TxInfo` translation as
-    // `ConwayContextError::ReferenceInputsNotDisjointFromInputs` (tag 15),
-    // surfaced as a phase-2 `BadTranslation`. See dugite issue #470.
+    // ONLY in the window 8 < PV < 11, exactly mirroring Haskell
+    // `disjointRefInputs` (Babbage Rules/Utxo.hs, post-#5011):
+    //
+    //   when ( pvMajor > eraProtVerHigh @BabbageEra   -- (= 8)
+    //            && pvMajor < natVersion @11 )
+    //        (failureOnNonEmpty common BabbageNonDisjointRefInputs)
+    //
+    // - PV7/PV8 (Babbage itself): NO disjointness rule. Mainnet carries such
+    //   txs (17 observed live at ep387, 2026-06-12) — enforcing here caused
+    //   false phase-1 divergences on confirmed blocks.
+    // - PV9/PV10 (Conway pre-Van-Rossem): rejected at phase-1
+    //   (`BabbageNonDisjointRefInputs`).
+    // - PV >= 11: Haskell PR #5011 (commit 44de8edc) RELAXED the rule:
+    //   V1/V2/native accepted; the equivalent check moves into PlutusV3
+    //   `TxInfo` translation as
+    //   `ConwayContextError::ReferenceInputsNotDisjointFromInputs` (tag 15),
+    //   surfaced as a phase-2 `BadTranslation`. See dugite issue #470.
     //
     // The `ReferenceInputNotFound` check is stable across all PVs.
     // ------------------------------------------------------------------
@@ -1373,7 +1384,7 @@ pub(super) fn run_phase1_rules(
                     ref_input.to_string(),
                 ));
             }
-            if pv_major < 11 && input_set.contains(ref_input) {
+            if pv_major > 8 && pv_major < 11 && input_set.contains(ref_input) {
                 errors.push(ValidationError::ReferenceInputOverlapsInput(
                     ref_input.to_string(),
                 ));
@@ -2147,6 +2158,50 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, ValidationError::ReferenceInputOverlapsInput(_))),
             "PV 10: expected ReferenceInputOverlapsInput, got {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 14-pre — Babbage PV7/PV8: overlap must be ACCEPTED.
+    //
+    // Haskell `disjointRefInputs` (Babbage Rules/Utxo.hs, post-#5011) fires
+    // only when `pvMajor > eraProtVerHigh @BabbageEra (= 8) && pvMajor < 11`,
+    // i.e. PV9/PV10 only. Within Babbage itself (PV7/PV8) the rule does NOT
+    // exist — mainnet ep387 carries such txs (17 observed live on 2026-06-12
+    // as false ReferenceInputOverlapsInput divergences on confirmed blocks
+    // before this lower bound was added).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_ref_inputs_overlap_accepted_at_babbage_pv7_pv8() {
+        for pv in [7u64, 8] {
+            let (utxo_set, mut tx, input) = make_valid_tx();
+            tx.body.reference_inputs.push(input.clone());
+            let mut params = ProtocolParameters::mainnet_defaults();
+            params.protocol_version_major = pv;
+            let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+            assert!(
+                result.is_ok(),
+                "PV {pv} (Babbage) tx with input/refInput overlap must be accepted \
+                 (Haskell disjointRefInputs fires only for 8 < pv < 11), got: {:?}",
+                result.err()
+            );
+        }
+    }
+
+    /// PV9 (lower edge of the Conway enforcement window) must still reject —
+    /// the rule window is exactly 8 < pv < 11.
+    #[test]
+    fn test_ref_inputs_overlap_rejected_at_pv9() {
+        let (utxo_set, mut tx, input) = make_valid_tx();
+        tx.body.reference_inputs.push(input.clone());
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9;
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::ReferenceInputOverlapsInput(_))),
+            "PV 9: expected ReferenceInputOverlapsInput, got {errors:?}"
         );
     }
 
