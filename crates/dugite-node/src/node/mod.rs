@@ -2133,7 +2133,6 @@ impl Node {
         );
         let gsm_config = crate::gsm::GsmConfig {
             min_active_blp: genesis_params.min_big_ledger_peers,
-            genesis_window_slots: genesis_params.sgen_slots,
             gdd_rate_limit_ms: (genesis_params.options.effective_gdd_rate_limit_secs() * 1000.0)
                 .max(1.0) as u64,
             security_param_k: genesis_params.security_param_k,
@@ -4180,6 +4179,24 @@ impl Node {
             let gsm_actor_shutdown = shutdown_rx.clone();
             let gsm_chain_db = self.chain_db.clone();
             let gsm_era_history = self.era_history.clone();
+            // Live tip age at spawn time — the durationUntilTooOld input for
+            // the startup marker-staleness check (Haskell
+            // initializationGsmState).
+            let gsm_initial_tip_age = {
+                let tip_slot_time_ms = self
+                    .metrics
+                    .tip_slot_time_ms
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if tip_slot_time_ms == 0 {
+                    None // tip slot time unknown — trust the marker
+                } else {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    Some(now_ms.saturating_sub(tip_slot_time_ms) / 1000)
+                }
+            };
             tokio::spawn(async move {
                 let mut shutdown = gsm_actor_shutdown;
                 tokio::select! {
@@ -4190,6 +4207,7 @@ impl Node {
                         gsm_chain_db,
                         gsm_era_history,
                         parts.loe_out,
+                        gsm_initial_tip_age,
                         parts.event_rx,
                         parts.snapshot_tx,
                         parts.action_tx,
@@ -4208,11 +4226,18 @@ impl Node {
             //    (audit gdd-03/gsm-05).
             gdd_action_rx = Some(parts.action_rx);
 
-            // 3. Spawn SyncStatus emitter — every 10 seconds, gathers sync
-            //    metrics and sends a SyncStatus event to the GSM actor.
+            // 3. Spawn SyncStatus emitter — every 10 seconds, gathers the
+            //    GSM transition inputs and sends a SyncStatus event:
+            //    - HAA: ACTIVE (hot) big-ledger peer count;
+            //    - the selection tip block number (candidate-vs-selection);
+            //    - the LIVE tip age (now − tip slot wallclock), computed
+            //      here each tick rather than read from a scrape-refreshed
+            //      gauge (audit gsm-11: a stalled chain must still regress
+            //      CaughtUp → PreSyncing without a Prometheus scraper).
             let status_event_tx = self.gsm_event_tx.clone();
             let status_pm = peer_manager.clone();
             let status_metrics = self.metrics.clone();
+            let status_chain_db = self.chain_db.clone();
             let status_shutdown = shutdown_rx.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(10));
@@ -4228,21 +4253,27 @@ impl Node {
                         let pm = status_pm.read().await;
                         pm.active_big_ledger_peer_count()
                     };
-                    let tip_age_secs = status_metrics
-                        .tip_age_secs
+                    let selection_block_no = {
+                        let db = status_chain_db.read().await;
+                        db.get_tip_info().map(|(_, _, bn)| bn.0).unwrap_or(0)
+                    };
+                    let tip_slot_time_ms = status_metrics
+                        .tip_slot_time_ms
                         .load(std::sync::atomic::Ordering::Relaxed);
-                    let chainsync_idle = status_metrics
-                        .chainsync_idle_secs
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    let all_idle = chainsync_idle > 30;
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let tip_age_secs = if tip_slot_time_ms == 0 {
+                        u64::MAX // no block applied yet — maximally stale
+                    } else {
+                        now_ms.saturating_sub(tip_slot_time_ms) / 1000
+                    };
 
                     let event = crate::gsm::GsmEvent::SyncStatus {
                         active_blp_count: active_blp,
-                        all_chainsync_idle: all_idle,
+                        selection_block_no,
                         tip_age_secs,
-                        immutable_tip_slot: status_metrics
-                            .slot_number
-                            .load(std::sync::atomic::Ordering::Relaxed),
                     };
                     if let Err(e) = status_event_tx.try_send(event) {
                         debug!("GSM SyncStatus event dropped: {e}");
@@ -4349,6 +4380,7 @@ impl Node {
         // (Haskell triggerChainSelectionAsync / ChainSelReprocessLoEBlocks).
         let mut loe_watch_rx = self.gsm_snapshot_rx.clone();
         let mut last_seen_loe_slot = loe_watch_rx.borrow().loe_slot;
+        let mut last_seen_gsm_state = loe_watch_rx.borrow().state;
 
         info!("Main run loop entered");
         loop {
@@ -4730,6 +4762,43 @@ impl Node {
                 // ── LoE advance → reprocess deferred blocks ─────────────
                 Ok(()) = loe_watch_rx.changed(), if genesis_enabled => {
                     let snap = *loe_watch_rx.borrow_and_update();
+                    // Genesis sync-vs-deadline peer-selection targets
+                    // (Haskell getPeerSelectionTargets: GenesisMode+TooOld →
+                    // syncTargets, else deadlineTargets — audit gsm-09/16).
+                    if snap.state != last_seen_gsm_state {
+                        last_seen_gsm_state = snap.state;
+                        let syncing = snap.state != crate::gsm::GenesisSyncState::CaughtUp;
+                        let cfg = &self.config;
+                        let targets = if syncing {
+                            dugite_network::peer::governor::PeerTargets {
+                                target_warm: cfg.sync_target_number_of_established_peers,
+                                target_hot: cfg.sync_target_number_of_active_peers,
+                                max_cold: cfg.sync_target_number_of_known_peers,
+                                target_warm_big_ledger:
+                                    cfg.sync_target_number_of_established_big_ledger_peers,
+                                target_hot_big_ledger:
+                                    cfg.sync_target_number_of_active_big_ledger_peers,
+                            }
+                        } else {
+                            dugite_network::peer::governor::PeerTargets {
+                                target_warm: cfg.target_number_of_established_peers,
+                                target_hot: cfg.target_number_of_active_peers,
+                                max_cold: cfg.target_number_of_known_peers,
+                                target_warm_big_ledger:
+                                    cfg.target_number_of_established_big_ledger_peers,
+                                target_hot_big_ledger:
+                                    cfg.target_number_of_active_big_ledger_peers,
+                            }
+                        };
+                        info!(
+                            state = %snap.state,
+                            syncing,
+                            target_hot = targets.target_hot,
+                            target_hot_blp = targets.target_hot_big_ledger,
+                            "GSM state change — switching peer-selection targets"
+                        );
+                        governor.update_targets(targets);
+                    }
                     if snap.loe_slot != last_seen_loe_slot {
                         last_seen_loe_slot = snap.loe_slot;
                         let handle = self.chain_sel_handle.clone();

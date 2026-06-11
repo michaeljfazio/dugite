@@ -854,12 +854,16 @@ impl NodePeerManager {
         self.conn_states.values().map(|s| s.to_counters()).sum()
     }
     pub fn active_big_ledger_peer_count(&self) -> usize {
+        // Haskell HAA: `activeNumBigLedgerPeers >= minNumberOfBigLedgerPeers`
+        // counts ACTIVE (hot) big-ledger connections only — a warm BLP is
+        // established but not serving ChainSync and gives no availability
+        // guarantee (audit gsm-07/blockfetch-08).
         self.big_ledger_peers
             .iter()
             .filter(|addr| {
                 self.inner
                     .get_peer(addr)
-                    .is_some_and(|p| p.state != PeerState::Cold)
+                    .is_some_and(|p| p.state == PeerState::Hot)
             })
             .count()
     }
