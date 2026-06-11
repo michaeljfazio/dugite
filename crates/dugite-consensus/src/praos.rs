@@ -1628,6 +1628,13 @@ impl OuroborosPraos {
 
     /// Replace the opcert counters map wholesale.
     /// Used by the node layer to seed counters from a loaded LedgerState snapshot.
+    /// Install the lightweight checkpoint map (block_number → header hash).
+    /// Mirrors cardano-node's `CheckpointsMap` loaded from `CheckpointsFile`;
+    /// applied in `validate_header` for every header, both consensus modes.
+    pub fn set_checkpoints(&mut self, checkpoints: HashMap<u64, Hash32>) {
+        self.checkpoints = checkpoints;
+    }
+
     pub fn set_opcert_counters(&mut self, counters: HashMap<Hash28, u64>) {
         debug!(
             count = counters.len(),

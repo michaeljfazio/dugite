@@ -1836,6 +1836,7 @@ dependencies = [
 name = "dugite-storage"
 version = "2.0.1"
 dependencies = [
+ "arc-swap",
  "bytes",
  "crc32fast",
  "criterion",

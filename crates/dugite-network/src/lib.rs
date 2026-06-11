@@ -538,9 +538,7 @@ pub trait ConnectionMetrics: Send + Sync + 'static {
 // Key types re-exported at crate root for ergonomic imports.
 
 pub use protocol::blockfetch::client::BlockFetchClient;
-pub use protocol::blockfetch::decision::{
-    BlockFetchDecision, GenesisFetchCoordinator, GenesisFetchMode, CSJ_REPROCESS_LOE_DELAY_SECS,
-};
+pub use protocol::blockfetch::decision::BlockFetchDecision;
 pub use protocol::chainsync::client::{ChainSyncEvent, PipelinedChainSyncClient};
 pub use protocol::chainsync::jumping::{
     bisect_midpoint, EraParams as CsjEraParams, JumpInstruction, JumpState, JumperState,

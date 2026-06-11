@@ -706,7 +706,7 @@ impl GenesisDensityComparator {
 
     /// Compare two chains using a CSJ bisection dissent snapshot.
     ///
-    /// This variant is used when the CsjOrchestrator has completed bisection
+    /// This variant is used when CSJ bisection has completed
     /// and has exact block counts for both the objector and dynamo chains within
     /// the genesis window above the fork point.  Because the CSJ dissection
     /// process already localises the fork point precisely, we skip the

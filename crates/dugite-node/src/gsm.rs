@@ -98,7 +98,7 @@ impl std::fmt::Display for GenesisSyncState {
 ///
 /// Mirrors Haskell's `CsjOutcome` used in `csjGsmHandler`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // constructed in csj_orchestrator (lib target), invisible to bin dead-code pass
+#[allow(dead_code)] // diagnostics-only CSJ-objection events; objectors are also caught by the all-idling CaughtUp check
 pub enum CsjObjectionOutcome {
     /// GDD comparison resolved in the dynamo's favour — adopt the dynamo chain.
     DynamoWins,
@@ -107,10 +107,10 @@ pub enum CsjObjectionOutcome {
 }
 
 /// Event sent to the GSM actor from producers (ChainSync, BlockFetch, networking).
-// The CSJ Phase C variants (JumpAgreed / ObjectionRaised / ObjectionResolved) are
-// constructed exclusively in `csj_orchestrator` (lib target).  The binary-target
-// dead-code pass cannot see across the lib/bin split so it reports those variants
-// as unused; the allow suppresses the false positive.
+// CSJ diagnostics events (JumpAgreed / ObjectionRaised / ObjectionResolved).
+// The GSM CaughtUp predicate already blocks on objectors via the all-peers-
+// idling check (an objector is streaming, not idling), so these events are a
+// diagnostics-grade gate; they have no live producer at present.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum GsmEvent {
@@ -151,7 +151,7 @@ pub enum GsmEvent {
     /// A jumper peer agreed to the proposed jump point and has found the
     /// intersection on its own chain (CSJ `IntersectFound`).
     ///
-    /// Emitted by `CsjOrchestrator` when a peer transitions
+    /// (Diagnostics.) Indicates a jumper transitioned
     /// `LookingForIntersection → FoundIntersection`.  Informational only —
     /// the GSM records it for diagnostics and future LoP extension points.
     JumpAgreed {
@@ -177,7 +177,7 @@ pub enum GsmEvent {
 
     /// An earlier objection has been resolved by the GDD density comparison.
     ///
-    /// Emitted by `CsjOrchestrator` when `BisectionComplete` is processed.
+    /// (Diagnostics.) Indicates an objection was resolved by the GDD.
     /// Once all outstanding objections are resolved, the LoP gate is lifted
     /// and `CaughtUp` transitions become possible again.
     ObjectionResolved {
