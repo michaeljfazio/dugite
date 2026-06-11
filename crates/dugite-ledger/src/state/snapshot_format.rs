@@ -196,6 +196,25 @@ pub struct LedgerStateSnapshot {
     pub stake_key_deposits: HashMap<Hash32, u64>,
     /// Per-pool deposit paid at pool registration time (lovelace).
     pub pool_deposits: HashMap<Hash28, u64>,
+    /// #736: the pv≤6 RUPD startStep capture — the registered
+    /// reward-account credential set frozen when the epoch's slot crossed
+    /// `epoch_first_slot + 4k/f` (Haskell RUPD pulser `fvAddrsRew`).
+    /// MUST be persisted: it is historical state that cannot be
+    /// reconstructed from the restored tip. Before v22 this was dropped on
+    /// load and lazily re-captured at the restored tip's slot, so any
+    /// mid-epoch restart past the 4k/f mark in an Alonzo-or-earlier epoch
+    /// computed the next boundary's rewards with a LATE credential set:
+    /// rewards of window-deregistered accounts were never computed (left
+    /// in reserves instead of routed to treasury → constant treasury
+    /// shortfall) and window-re-registered old credentials were paid from
+    /// the GO snapshot (stale reward balances). Observed live as the
+    /// ~2998 ADA replay-seam offset at mainnet boundary 337→338.
+    pub rupd_addrs_rew: Option<std::collections::HashSet<Hash32>>,
+    /// #736 (same class): AVVM return amount pending at the next epoch
+    /// boundary (Shelley→Allegra transition). Set once at the era
+    /// transition and consumed at the following boundary; a mid-epoch
+    /// restart inside that window must not lose it.
+    pub pending_avvm_return: u64,
 }
 
 // ── From conversions for snapshot roundtrip ─────────────────────────
@@ -299,6 +318,10 @@ impl From<&super::LedgerState> for LedgerStateSnapshot {
             stability_window_3kf: s.stability_window_3kf,
             // Legacy field (always zero for new snapshots)
             stability_window: 0,
+            // #736: persist the pv≤6 RUPD startStep capture — historical
+            // state that a restart cannot re-derive.
+            rupd_addrs_rew: s.epochs.rupd_addrs_rew.as_deref().cloned(),
+            pending_avvm_return: s.epochs.pending_avvm_return,
         }
     }
 }
@@ -371,10 +394,14 @@ impl From<LedgerStateSnapshot> for super::LedgerState {
                 prev_protocol_params: s.prev_protocol_params,
                 prev_protocol_version_major: s.prev_protocol_version_major,
                 prev_d: s.prev_d,
-                // #11: transient startStep capture — not persisted; a mid-epoch
-                // snapshot resume re-captures (or falls back to boundary accounts).
-                rupd_addrs_rew: None,
-                pending_avvm_return: 0,
+                // #736: restored from the snapshot (v22+). The pre-v22
+                // behaviour — drop on load and lazily re-capture at the
+                // restored tip — used a LATE credential set whenever the
+                // restart happened past the epoch's 4k/f mark, producing
+                // the ~2998 ADA replay-seam treasury shortfall + stale
+                // reward balances at the next pv≤6 boundary.
+                rupd_addrs_rew: s.rupd_addrs_rew.map(Arc::new),
+                pending_avvm_return: s.pending_avvm_return,
             },
             tip: s.tip,
             era: s.era,
@@ -447,5 +474,42 @@ mod tests {
             restored.epochs.protocol_params.protocol_version_major,
             state.epochs.protocol_params.protocol_version_major
         );
+    }
+
+    #[test]
+    fn test_rupd_addrs_rew_survives_snapshot_roundtrip() {
+        // #736: the pv≤6 RUPD startStep capture is HISTORICAL state (the
+        // registered credential set as of the epoch's 4k/f slot). Dropping
+        // it on load and re-capturing at the restored tip used a LATE set,
+        // mis-routing the next boundary's rewards (~2998 ADA treasury
+        // shortfall at mainnet 337→338). It must survive save/load exactly.
+        let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        let frozen: std::collections::HashSet<Hash32> =
+            [Hash32::from_bytes([1u8; 32]), Hash32::from_bytes([2u8; 32])]
+                .into_iter()
+                .collect();
+        state.epochs.rupd_addrs_rew = Some(Arc::new(frozen.clone()));
+        state.epochs.pending_avvm_return = 318_200_000_000_000;
+
+        let snapshot = LedgerStateSnapshot::from(&state);
+        let bytes = bincode::serialize(&snapshot).expect("serialize");
+        let restored_snapshot: LedgerStateSnapshot =
+            bincode::deserialize(&bytes).expect("deserialize");
+        let restored = LedgerState::from(restored_snapshot);
+
+        assert_eq!(
+            restored.epochs.rupd_addrs_rew.as_deref(),
+            Some(&frozen),
+            "frozen RUPD credential set must survive the roundtrip byte-exact"
+        );
+        assert_eq!(restored.epochs.pending_avvm_return, 318_200_000_000_000);
+
+        // None must also roundtrip as None (boundary just crossed).
+        let state2 = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        let snap2 = LedgerStateSnapshot::from(&state2);
+        let bytes2 = bincode::serialize(&snap2).expect("serialize");
+        let restored2: LedgerStateSnapshot = bincode::deserialize(&bytes2).expect("deserialize");
+        let restored2 = LedgerState::from(restored2);
+        assert_eq!(restored2.epochs.rupd_addrs_rew, None);
     }
 }
