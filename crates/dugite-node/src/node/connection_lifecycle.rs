@@ -2066,7 +2066,15 @@ impl ConnectionLifecycleManager {
                                     // missing.
                                     let connects = fetched_hashes.contains(prev.as_bytes()) || {
                                         let cdb = chain_db.read().await;
-                                        cdb.has_block(&prev)
+                                        // From-origin bootstrap: an EMPTY
+                                        // ChainDB has no frontier to extend —
+                                        // the first block's prev_hash is the
+                                        // GENESIS HASH, which is never a
+                                        // stored block. The guard only arms
+                                        // once a frontier exists (caught live
+                                        // on the devnet: the relay wedged at
+                                        // origin, declining block 1 forever).
+                                        cdb.get_tip_info().is_none() || cdb.has_block(&prev)
                                     };
                                     if !connects {
                                         debug!(
