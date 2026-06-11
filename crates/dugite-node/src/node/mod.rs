@@ -5083,8 +5083,8 @@ impl Node {
             handle.abort();
         }
 
-        // Flush volatile blocks, persist ChainDB, and save ledger snapshot,
-        // with a timeout to prevent hanging on shutdown.
+        // Flush volatile blocks, persist ChainDB, and quiesce the snapshot
+        // worker, with a timeout to prevent hanging on shutdown.
         let shutdown_result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
             {
                 let mut db = self.chain_db.write().await;
@@ -5116,14 +5116,34 @@ impl Node {
                     ),
                 }
             }
-            self.save_ledger_snapshot().await;
         })
         .await;
+        if shutdown_result.is_err() {
+            error!("Graceful shutdown (flush/persist/quiesce) timed out after 30s, forcing exit");
+            std::process::exit(1);
+        }
 
-        match shutdown_result {
+        // Final shutdown snapshot under its OWN generous budget. A mainnet
+        // snapshot is ~1.4 GB and routinely takes 5-20 s — and >30 s under
+        // I/O contention. Sharing the 30 s flush/quiesce timeout above (which
+        // the worker quiesce alone can eat 20 s of) force-exited the process
+        // mid-write (observed live 2026-06-11T22:44Z: quiesce at +0 s, forced
+        // exit at +29 s with the save still running; recovery then fell back
+        // to an older periodic snapshot + chunk replay). The write itself is
+        // atomic (temp + rename), so a timeout here loses only restart speed,
+        // never integrity — but 120 s makes that practically unreachable.
+        let save_result = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            self.save_ledger_snapshot(),
+        )
+        .await;
+        match save_result {
             Ok(()) => info!("Shutdown complete"),
             Err(_) => {
-                error!("Graceful shutdown timed out after 30s, forcing exit");
+                error!(
+                    "Final shutdown snapshot timed out after 120s, forcing exit \
+                     (node will recover from the last periodic snapshot + chunk replay)"
+                );
                 std::process::exit(1);
             }
         }
