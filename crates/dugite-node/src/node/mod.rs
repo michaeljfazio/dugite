@@ -2514,7 +2514,6 @@ impl Node {
     /// constructing from current state. Used by call sites that no
     /// longer hold the write lock when they want to refresh the view
     /// (e.g. after `post_block_apply_updates` has run).
-    #[allow(dead_code)] // wired in by per-call-site migration follow-ups
     pub(crate) async fn publish_view_now(&self) {
         let ls = self.ledger_state.read().await;
         self.publish_ledger_view(&ls);
@@ -2712,6 +2711,21 @@ impl Node {
                 count,
                 "Reseeded consensus opcert counters from post-replay ledger state"
             );
+
+            // Issue #742: publish the post-replay ledger view + tip watch so
+            // per-peer CSJ tasks are not stuck parking on a stale tip=0 view.
+            //
+            // After a from-genesis replay the `ledger_view` ArcSwap and
+            // `ledger_tip_slot_tx` watch were seeded from the AT-LOAD ledger
+            // (tip=Origin/0) in `Node::new`. `replay_from_lsm` /
+            // `replay_from_chunk_files` apply millions of blocks without ever
+            // calling `publish_ledger_view`, so the view remains frozen at 0
+            // after replay. The first CSJ dynamo MsgRollForward (slot ~73M on
+            // mainnet) hit `forecast_park_or_disconnect` → max_for = 0+1+sw
+            // → OutsideForecastRange → parks on tip_rx.changed() → nobody
+            // ever calls send → deadlock (Haskell: tip watch is refreshed by
+            // the chain-apply loop, not just the live-block path).
+            self.publish_ledger_view(&ls);
         }
 
         // Enable strict verification (full crypto checks for new blocks).
