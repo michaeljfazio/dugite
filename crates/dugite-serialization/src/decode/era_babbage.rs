@@ -565,6 +565,18 @@ fn read_tx_input(r: &mut Reader<'_>) -> Result<TransactionInput, SerializationEr
     })
 }
 
+/// Read a Babbage mint map `{ policy_id => { asset_name => signed_int } }`.
+///
+/// Applies the same pre-Conway zero-pruning semantics as Alonzo's `read_mint_map`:
+///
+/// ```haskell
+/// -- Haskell: decodeWithPrunning (pre-v9) = pruneZeroMultiAsset . MultiAsset <$> ...
+/// -- pruneZeroMultiAsset = filterMultiAsset (\_ _ -> (/= 0))
+/// ```
+///
+/// Zero-quantity assets MUST be dropped (and any policy whose entire asset map
+/// becomes empty is dropped too).  Keeping zeros inflates `txInfoMint` in Plutus
+/// V2 script contexts, causing spurious budget exhaustion (#730/#745).
 fn read_babbage_mint_map(
     r: &mut Reader<'_>,
 ) -> Result<
@@ -600,9 +612,14 @@ fn read_babbage_mint_map(
             Ok(assets)
         },
     )?;
+    // Pre-v9 pruning: drop zero-quantity assets and empty policies.
+    // Mirrors era_alonzo::read_mint_map and Haskell `decodeWithPrunning`.
     let mut result = BTreeMap::new();
-    for (k, v) in entries {
-        result.insert(k, v);
+    for (k, mut v) in entries {
+        v.retain(|_, amount| *amount != 0);
+        if !v.is_empty() {
+            result.insert(k, v);
+        }
     }
     Ok(result)
 }
@@ -1871,6 +1888,87 @@ mod tests {
         let (_pol, assets) = result.iter().next().unwrap();
         let &qty = assets.values().next().unwrap();
         assert_eq!(qty, -10);
+    }
+
+    /// Fix #745 — Babbage mint decoder must prune zero-quantity assets.
+    ///
+    /// Haskell `decodeMultiAsset` (pre-v9) uses `decodeWithPrunning` =
+    /// `pruneZeroMultiAsset . MultiAsset <$> ...` which filters out entries
+    /// where `amount == 0`.  The Alonzo `read_mint_map` already does this
+    /// (`v.retain(|_, amount| *amount != 0); if !v.is_empty() { ... }`).
+    /// Babbage's `read_babbage_mint_map` was missing the same prune logic.
+    ///
+    /// Effect without fix: inflated txInfoMint → phase-2 budget exhaustion
+    /// (confirmed 2 mainnet occurrences).  Worst case: wrong redeemer index
+    /// mapping → CollectError → block fatal.
+    #[test]
+    fn babbage_mint_map_zero_quantity_pruned() {
+        // {policy(0x11) -> {"" -> 0}}
+        let mut mint = vec![0xa1u8];
+        mint.push(0x58);
+        mint.push(0x1c);
+        mint.extend([0x11u8; 28]); // policy
+        mint.push(0xa1); // inner map(1)
+        mint.push(0x40); // asset name ""
+        mint.push(0x00); // quantity = 0
+        let mut r = Reader::new(&mint);
+        let result = read_babbage_mint_map(&mut r).expect("decode");
+        assert!(
+            result.is_empty(),
+            "zero-quantity Babbage mint entry must be pruned, got {result:?}"
+        );
+    }
+
+    /// Fix #745 — partial prune: only the non-zero asset survives.
+    #[test]
+    fn babbage_mint_map_partial_zero_pruned() {
+        // {policy(0x11) -> {"A" -> 5, "B" -> 0}}
+        let mut mint = vec![0xa1u8];
+        mint.push(0x58);
+        mint.push(0x1c);
+        mint.extend([0x11u8; 28]); // policy
+        mint.push(0xa2); // inner map(2)
+        mint.push(0x41);
+        mint.push(b'A');   // asset name "A"
+        mint.push(0x05);   // quantity = 5
+        mint.push(0x41);
+        mint.push(b'B');   // asset name "B"
+        mint.push(0x00);   // quantity = 0  ← must be pruned
+        let mut r = Reader::new(&mint);
+        let result = read_babbage_mint_map(&mut r).expect("decode");
+        assert_eq!(result.len(), 1, "policy with mixed zero/nonzero assets survives");
+        let (_pol, assets) = result.iter().next().unwrap();
+        assert_eq!(assets.len(), 1, "only non-zero asset survives");
+        let &qty = assets.values().next().unwrap();
+        assert_eq!(qty, 5i64);
+    }
+
+    /// Fix #745 — entire policy dropped when all assets are zero.
+    #[test]
+    fn babbage_mint_map_all_zero_policy_dropped() {
+        // {policy1 -> {"A" -> 1}, policy2 -> {"X" -> 0}}
+        let mut mint = vec![0xa2u8]; // map(2)
+        // policy1 with nonzero asset
+        mint.push(0x58);
+        mint.push(0x1c);
+        mint.extend([0x11u8; 28]);
+        mint.push(0xa1); // inner map(1)
+        mint.push(0x41);
+        mint.push(b'A');
+        mint.push(0x01); // qty = 1
+        // policy2 with zero asset → should be dropped
+        mint.push(0x58);
+        mint.push(0x1c);
+        mint.extend([0x22u8; 28]);
+        mint.push(0xa1); // inner map(1)
+        mint.push(0x41);
+        mint.push(b'X');
+        mint.push(0x00); // qty = 0
+        let mut r = Reader::new(&mint);
+        let result = read_babbage_mint_map(&mut r).expect("decode");
+        assert_eq!(result.len(), 1, "policy with all-zero assets must be dropped");
+        let (pol, _) = result.iter().next().unwrap();
+        assert_eq!(pol.as_bytes(), &[0x11u8; 28]);
     }
 
     // ── post-Alonzo map output with script_ref ────────────────────────────
