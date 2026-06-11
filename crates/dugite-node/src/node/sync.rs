@@ -3618,9 +3618,7 @@ pub(crate) async fn forecast_park_or_disconnect(
                 // In non-genesis mode the hard timeout fires at 60s anyway,
                 // so the warn is primarily for the genesis bulk-sync park.
                 let total_parked = park_start.elapsed();
-                if total_parked >= PARK_WARN_INTERVAL
-                    && last_warn.elapsed() >= PARK_WARN_INTERVAL
-                {
+                if total_parked >= PARK_WARN_INTERVAL && last_warn.elapsed() >= PARK_WARN_INTERVAL {
                     warn!(
                         %peer_addr,
                         header_slot,
@@ -7713,7 +7711,9 @@ mod fix1_replay_publish_tests {
             )
         };
         state.randomness_stabilisation_window = sw;
-        Arc::new(arc_swap::ArcSwap::from_pointee(LedgerView::from_state(&state)))
+        Arc::new(arc_swap::ArcSwap::from_pointee(LedgerView::from_state(
+            &state,
+        )))
     }
 
     /// Regression test for #742: before the fix, after a from-genesis replay the
@@ -7759,15 +7759,9 @@ mod fix1_replay_publish_tests {
         });
 
         let start = std::time::Instant::now();
-        let result = forecast_park_or_disconnect(
-            &peer,
-            73_000_000,
-            &view,
-            &mut rx,
-            &cancel,
-            Some(&gsm_rx),
-        )
-        .await;
+        let result =
+            forecast_park_or_disconnect(&peer, 73_000_000, &view, &mut rx, &cancel, Some(&gsm_rx))
+                .await;
 
         assert!(
             result.is_ok(),
