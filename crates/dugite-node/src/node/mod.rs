@@ -2377,6 +2377,15 @@ impl Node {
         // (from main() which is `#[tokio::main]`), so `tokio::spawn` is safe.
         tokio::spawn(chain_sel_runner);
 
+        // Issue #747: extract bulk-sync snapshot rate limit from config BEFORE
+        // args.config is moved into the Node struct literal below.
+        let bulk_sync_snapshot_rate_limit_secs: f64 = args
+            .config
+            .low_level_genesis_options
+            .as_ref()
+            .map(|o| o.effective_snapshot_min_interval_bulk_sync_secs())
+            .unwrap_or(1800.0);
+
         Ok(Node {
             config: args.config,
             topology: args.topology,
@@ -2460,9 +2469,18 @@ impl Node {
             // Slot-based snapshot interval = k * 2 (#701, Haskell defInterval).
             // For mainnet/preprod k=2160 → 4320 slots ≈ 72 min.
             // For preview k=432 → 864 slots ≈ 14 min.
-            bg_snapshot_scheduler: SnapshotScheduler::with_slot_interval(
-                consensus_security_param.saturating_mul(2),
-            ),
+            bg_snapshot_scheduler: {
+                let mut sched = SnapshotScheduler::with_slot_interval(
+                    consensus_security_param.saturating_mul(2),
+                );
+                // Issue #747: apply bulk-sync rate limit from config so epoch-
+                // boundary snapshots during genesis catch-up don't fire more
+                // often than the configured interval (default 30 min).
+                sched.set_bulk_sync_rate_limit(std::time::Duration::from_secs_f64(
+                    bulk_sync_snapshot_rate_limit_secs,
+                ));
+                sched
+            },
             last_query_state_update: Instant::now(),
             last_volatile_wal_sync: Instant::now(),
             peer_intersection_established: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2514,7 +2532,6 @@ impl Node {
     /// constructing from current state. Used by call sites that no
     /// longer hold the write lock when they want to refresh the view
     /// (e.g. after `post_block_apply_updates` has run).
-    #[allow(dead_code)] // wired in by per-call-site migration follow-ups
     pub(crate) async fn publish_view_now(&self) {
         let ls = self.ledger_state.read().await;
         self.publish_ledger_view(&ls);
@@ -2712,6 +2729,21 @@ impl Node {
                 count,
                 "Reseeded consensus opcert counters from post-replay ledger state"
             );
+
+            // Issue #742: publish the post-replay ledger view + tip watch so
+            // per-peer CSJ tasks are not stuck parking on a stale tip=0 view.
+            //
+            // After a from-genesis replay the `ledger_view` ArcSwap and
+            // `ledger_tip_slot_tx` watch were seeded from the AT-LOAD ledger
+            // (tip=Origin/0) in `Node::new`. `replay_from_lsm` /
+            // `replay_from_chunk_files` apply millions of blocks without ever
+            // calling `publish_ledger_view`, so the view remains frozen at 0
+            // after replay. The first CSJ dynamo MsgRollForward (slot ~73M on
+            // mainnet) hit `forecast_park_or_disconnect` → max_for = 0+1+sw
+            // → OutsideForecastRange → parks on tip_rx.changed() → nobody
+            // ever calls send → deadlock (Haskell: tip watch is refreshed by
+            // the chain-apply loop, not just the live-block path).
+            self.publish_ledger_view(&ls);
         }
 
         // Enable strict verification (full crypto checks for new blocks).
@@ -4164,6 +4196,14 @@ impl Node {
             n2n_tx_validator,
             crate::node::connection_lifecycle::resolve_blockfetch_max_range(
                 self.config.blockfetch_max_range,
+            ),
+            // Issue #742 Fix 2: grace period for ChainSel-starvation dynamo rotation.
+            std::time::Duration::from_secs_f64(
+                self.config
+                    .low_level_genesis_options
+                    .as_ref()
+                    .map(|o| o.effective_block_fetch_grace_period_secs())
+                    .unwrap_or(10.0),
             ),
         );
         // Enable outbound source-port pairing only when this node is also
@@ -6244,6 +6284,14 @@ impl Node {
         self.metrics
             .blocks_applied
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Issue #742 Fix 2: update starvation-detection timestamp so the
+        // BlockFetch grace-period check (ChainSelStarvation) knows the
+        // apply loop is making progress.  Called here — after a block is
+        // confirmed applied — so the starvation clock resets on real
+        // progress, not just on block receipt.
+        if let Some(ref lc) = self.connection_lifecycle {
+            lc.mark_block_applied();
+        }
         // Tip-query staleness fix (2026-05-16): shared post-apply housekeeping
         // also used by try_forge_block_at.  Replaces the previous inline
         // metric/mempool/snapshot updates.

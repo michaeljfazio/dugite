@@ -74,10 +74,14 @@ const CHAINSYNC_INGRESS_LIMIT: usize = 512 * 1024;
 
 /// BlockFetch ingress queue limit — matches Haskell
 /// `blockFetchProtocolLimits = max(10 * 2 MiB, 100 * 90112) * 1.1` ≈ 22 MB.
-/// Bumped to 24 MB for headroom on era transitions where block bodies grow.
-/// dugite's previous default of 4 MB caused back-pressure stalls during
-/// bulk catch-up (issue #701).
-const BLOCKFETCH_INGRESS_LIMIT: usize = 24 * 1024 * 1024;
+/// Bumped to 32 MB (#747) to exceed the maximum pipelined in-flight budget
+/// (`BLOCKFETCH_PIPELINE_WINDOW × BLOCKFETCH_RANGE_BYTE_BUDGET` in
+/// `connection_lifecycle.rs` = 2 × 8 MB = 16 MB) with headroom.
+/// A compile-time assert in `connection_lifecycle.rs` verifies the invariant.
+///
+/// **MUST** stay in sync with `BLOCKFETCH_INGRESS_LIMIT_BF` in
+/// `connection_lifecycle.rs`; the const-assert there guards against drift.
+const BLOCKFETCH_INGRESS_LIMIT: usize = 32 * 1024 * 1024;
 
 /// TxSubmission ingress queue limit — matches Haskell
 /// `txSubmissionProtocolLimits = addSafetyMargin (100 * 65540)` ≈ 7.2 MB.
@@ -385,8 +389,21 @@ impl PeerConnection {
         let mux_resubscribe = mux.take_handle();
 
         // Spawn mux task — runs until bearer closes or error.
+        // Issue #747: log WARN on unexpected mux exit so ingress-overflow and
+        // other mux-level failures are not silently swallowed (they previously
+        // produced no log output — the protocol tasks simply saw closed channels
+        // and reported generic "send failed" errors, making root-cause analysis
+        // very difficult).
         let cancel = CancellationToken::new();
-        let mux_handle = tokio::spawn(async move { mux.run().await });
+        let mux_addr_for_log = addr;
+        let mux_handle = tokio::spawn(async move {
+            let result = mux.run().await;
+            match &result {
+                Ok(()) => debug!(%mux_addr_for_log, "mux exited cleanly"),
+                Err(e) => warn!(%mux_addr_for_log, error = %e, "mux exited with error (#747)"),
+            }
+            result
+        });
 
         // Run N2N handshake on the handshake channel.
         let our_data = N2NVersionData::new(network_magic, initiator_only, peer_sharing);
@@ -536,8 +553,17 @@ impl PeerConnection {
         let mux_resubscribe = mux.take_handle();
 
         // Spawn mux task.
+        // Issue #747: log WARN on unexpected mux exit (same as outbound path).
         let cancel = CancellationToken::new();
-        let mux_handle = tokio::spawn(async move { mux.run().await });
+        let mux_addr_for_log = addr;
+        let mux_handle = tokio::spawn(async move {
+            let result = mux.run().await;
+            match &result {
+                Ok(()) => debug!(%mux_addr_for_log, "mux exited cleanly"),
+                Err(e) => warn!(%mux_addr_for_log, error = %e, "mux exited with error (#747)"),
+            }
+            result
+        });
 
         // Run N2N handshake as server.
         let our_data = N2NVersionData::new(network_magic, initiator_only, peer_sharing);

@@ -96,6 +96,13 @@ pub const DEFAULT_SNAPSHOT_JITTER_MIN: Duration = Duration::from_secs(5 * 60);
 /// Matches Haskell's `tenMinutes = 10 * 60`.
 pub const DEFAULT_SNAPSHOT_JITTER_MAX: Duration = Duration::from_secs(10 * 60);
 
+/// Minimum wall-clock gap between epoch-boundary snapshots during bulk sync
+/// (catch-up mode, issue #747).  Default 30 minutes — 3× the at-tip rate
+/// limit — because bulk sync crosses many epoch boundaries per minute and
+/// per-epoch I/O at that rate would dominate the apply loop.  Configurable
+/// via `LowLevelGenesisOptions.SnapshotMinIntervalBulkSync`.
+pub const DEFAULT_SNAPSHOT_BULK_SYNC_RATE_LIMIT: Duration = Duration::from_secs(30 * 60);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // CopyToImmutable
 // ─────────────────────────────────────────────────────────────────────────────
@@ -405,6 +412,16 @@ pub struct SnapshotScheduler {
     /// Hard floor on wall-clock duration between consecutive snapshots
     /// (Haskell `defRateLimit = 10 min`).
     rate_limit: Duration,
+    /// Minimum wall-clock gap between epoch-boundary snapshots during bulk
+    /// sync (catch-up mode).  Defaults to 30 minutes — substantially longer
+    /// than the at-tip rate limit (10 min) — because during genesis bulk sync
+    /// we cross epoch boundaries rapidly (multiple per minute) and taking a
+    /// snapshot at each one wastes significant I/O (bincode walk + prune).
+    ///
+    /// Issue #747: configurable via `SnapshotMinIntervalBulkSync` in
+    /// `LowLevelGenesisOptions`.  Always snapshot on graceful shutdown
+    /// regardless of this limit.
+    bulk_sync_rate_limit: Duration,
     /// Lower bound of the post-trigger jitter window.
     jitter_min: Duration,
     /// Upper bound of the post-trigger jitter window.
@@ -454,6 +471,7 @@ impl SnapshotScheduler {
         Self {
             snapshot_slot_interval,
             rate_limit: DEFAULT_SNAPSHOT_RATE_LIMIT,
+            bulk_sync_rate_limit: DEFAULT_SNAPSHOT_BULK_SYNC_RATE_LIMIT,
             jitter_min: DEFAULT_SNAPSHOT_JITTER_MIN,
             jitter_max: DEFAULT_SNAPSHOT_JITTER_MAX,
             last_snapshot_slot: None,
@@ -467,8 +485,21 @@ impl SnapshotScheduler {
         }
     }
 
+    /// Override the bulk-sync snapshot rate limit.
+    ///
+    /// Callers can set a longer minimum interval for epoch-boundary snapshots
+    /// during catch-up (genesis bulk sync).  The default is 30 minutes
+    /// (`DEFAULT_SNAPSHOT_BULK_SYNC_RATE_LIMIT`).  Configurable via
+    /// `LowLevelGenesisOptions.SnapshotMinIntervalBulkSync`.
+    pub fn set_bulk_sync_rate_limit(&mut self, limit: Duration) {
+        self.bulk_sync_rate_limit = limit;
+    }
+
     /// Override the rate-limit / jitter window — primarily for tests that need
     /// deterministic firing without waiting 5+ minutes of real time.
+    ///
+    /// Also sets `bulk_sync_rate_limit = rate_limit` so that tests using
+    /// catch-up mode do not need a separate call.
     #[doc(hidden)]
     pub fn with_test_timing(
         mut self,
@@ -477,6 +508,9 @@ impl SnapshotScheduler {
         jitter_max: Duration,
     ) -> Self {
         self.rate_limit = rate_limit;
+        // Mirror into bulk_sync_rate_limit so test schedulers fire deterministically
+        // in both normal and catch-up mode without separate set_bulk_sync_rate_limit calls.
+        self.bulk_sync_rate_limit = rate_limit;
         self.jitter_min = jitter_min;
         self.jitter_max = jitter_max;
         self
@@ -590,9 +624,20 @@ impl SnapshotScheduler {
         // Rate limit must be satisfied before any slot or epoch trigger can
         // fire (matches Haskell `defRateLimit`).  Skip rate-limit on first
         // snapshot.
+        //
+        // Issue #747: during catch-up (genesis bulk sync), apply a LONGER
+        // rate limit (`bulk_sync_rate_limit`, default 30 min) so epoch-boundary
+        // snapshots do not fire at every epoch crossing — bulk sync may cross
+        // many epochs per minute, and taking a snapshot at each one wastes
+        // significant I/O (bincode walk + prune).
+        let effective_rate_limit = if self.catchup_mode {
+            self.bulk_sync_rate_limit
+        } else {
+            self.rate_limit
+        };
         let rate_limit_ok = self
             .last_snapshot_time
-            .map(|t| now.saturating_duration_since(t) >= self.rate_limit)
+            .map(|t| now.saturating_duration_since(t) >= effective_rate_limit)
             .unwrap_or(true);
 
         // 2. Epoch boundary.
@@ -1269,5 +1314,131 @@ mod tests {
         assert_eq!(DEFAULT_SECURITY_PARAM_K, 2160);
         let copier = CopyToImmutable::new(DEFAULT_SECURITY_PARAM_K);
         assert_eq!(copier.k, 2160);
+    }
+
+    // ─── Fix 4 (#747): bulk-sync snapshot rate-limit tests ───────────────────
+
+    /// During catch-up mode, an epoch boundary that occurs within the
+    /// bulk_sync_rate_limit window must be suppressed.
+    ///
+    /// Without Fix 4 the regular rate_limit (10 min) was used in catchup_mode,
+    /// allowing epoch-boundary snapshots as frequently as every 10 min even
+    /// during genesis bulk sync.  Fix 4 raises the floor to 30 min.
+    #[test]
+    fn bulk_sync_epoch_boundary_suppressed_within_rate_limit() {
+        let mut sched = SnapshotScheduler::with_slot_interval(864).with_test_timing(
+            Duration::from_secs(0),
+            Duration::from_secs(0),
+            Duration::from_secs(0),
+        );
+        sched.set_bulk_sync_rate_limit(Duration::from_secs(1800)); // 30 min
+        sched.set_catchup_mode(true);
+
+        let t0 = Instant::now();
+        // First snapshot fires immediately (no last_snapshot_time).
+        let fires = sched.maybe_snapshot_check_at(EpochNo(0), SlotNo(100), t0);
+        assert!(
+            fires,
+            "first snapshot must fire immediately even in catchup_mode"
+        );
+        sched.record_snapshot_taken_at(EpochNo(0), SlotNo(100), t0);
+
+        // Cross epoch boundary 11 minutes later — within the 30-min bulk limit.
+        let t1 = t0 + Duration::from_secs(11 * 60);
+        let fires2 = sched.maybe_snapshot_check_at(EpochNo(1), SlotNo(1000), t1);
+        assert!(
+            !fires2,
+            "epoch boundary at +11min must be suppressed by 30-min bulk_sync_rate_limit"
+        );
+    }
+
+    /// An epoch boundary that occurs after the bulk_sync_rate_limit has elapsed
+    /// MUST fire (otherwise we'd never snapshot during long bulk syncs).
+    #[test]
+    fn bulk_sync_epoch_boundary_fires_after_bulk_rate_limit() {
+        let mut sched = SnapshotScheduler::with_slot_interval(864).with_test_timing(
+            Duration::from_secs(0),
+            Duration::from_secs(0),
+            Duration::from_secs(0),
+        );
+        sched.set_bulk_sync_rate_limit(Duration::from_secs(1800));
+        sched.set_catchup_mode(true);
+
+        let t0 = Instant::now();
+        // First snapshot.
+        sched.maybe_snapshot_check_at(EpochNo(0), SlotNo(0), t0);
+        sched.record_snapshot_taken_at(EpochNo(0), SlotNo(0), t0);
+
+        // Cross epoch boundary 31 minutes later — beyond the 30-min limit.
+        let t1 = t0 + Duration::from_secs(31 * 60);
+        let fires = sched.maybe_snapshot_check_at(EpochNo(1), SlotNo(1000), t1);
+        assert!(
+            fires,
+            "epoch boundary at +31min must fire after 30-min bulk_sync_rate_limit expires"
+        );
+    }
+
+    /// In normal (at-tip) mode the regular rate_limit (10 min) must still apply,
+    /// not the bulk_sync_rate_limit.
+    #[test]
+    fn at_tip_mode_uses_normal_rate_limit_not_bulk() {
+        let mut sched = SnapshotScheduler::with_slot_interval(864).with_test_timing(
+            Duration::from_secs(0),
+            Duration::from_secs(0),
+            Duration::from_secs(0),
+        );
+        sched.set_bulk_sync_rate_limit(Duration::from_secs(1800)); // 30 min
+                                                                   // Explicitly not in catchup_mode.
+        sched.set_catchup_mode(false);
+
+        let t0 = Instant::now();
+        sched.maybe_snapshot_check_at(EpochNo(0), SlotNo(0), t0);
+        sched.record_snapshot_taken_at(EpochNo(0), SlotNo(0), t0);
+
+        // Cross epoch boundary 11 minutes later — within 30-min bulk limit
+        // but beyond the 10-min normal rate limit.
+        // NOTE: with_test_timing sets rate_limit=0, so we need to test the
+        // default rate_limit path explicitly by NOT using with_test_timing.
+        let mut sched2 = SnapshotScheduler::with_slot_interval(864);
+        sched2.set_bulk_sync_rate_limit(Duration::from_secs(1800));
+        sched2.set_catchup_mode(false);
+
+        let t0 = Instant::now();
+        // First snapshot fires.
+        sched2.maybe_snapshot_check_at(EpochNo(0), SlotNo(0), t0);
+        sched2.record_snapshot_taken_at(EpochNo(0), SlotNo(0), t0);
+
+        // Cross epoch boundary 11 minutes later — beyond the 10-min normal limit.
+        let t1 = t0 + Duration::from_secs(11 * 60);
+        let fires = sched2.maybe_snapshot_check_at(EpochNo(1), SlotNo(1000), t1);
+        assert!(
+            fires,
+            "at-tip epoch boundary at +11min must fire (10-min normal rate limit, not 30-min bulk)"
+        );
+    }
+
+    /// Shutdown requests must always fire regardless of bulk_sync_rate_limit.
+    #[test]
+    fn shutdown_fires_regardless_of_bulk_rate_limit() {
+        let mut sched = SnapshotScheduler::with_slot_interval(864).with_test_timing(
+            Duration::from_secs(0),
+            Duration::from_secs(0),
+            Duration::from_secs(0),
+        );
+        sched.set_bulk_sync_rate_limit(Duration::from_secs(1800));
+        sched.set_catchup_mode(true);
+
+        let t0 = Instant::now();
+        sched.maybe_snapshot_check_at(EpochNo(0), SlotNo(0), t0);
+        sched.record_snapshot_taken_at(EpochNo(0), SlotNo(0), t0);
+
+        // Fire shutdown just 1 second later — well within bulk limit.
+        sched.request_shutdown_snapshot();
+        let t1 = t0 + Duration::from_secs(1);
+        let fires = sched.maybe_snapshot_check_at(EpochNo(0), SlotNo(1), t1);
+        assert!(
+            fires,
+            "shutdown must always fire regardless of bulk_sync_rate_limit"
+        );
     }
 }
