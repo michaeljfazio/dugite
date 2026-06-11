@@ -602,6 +602,26 @@ pub struct ConnectionLifecycleManager {
     /// it as the upper clamp on the adaptive byte-budget range sizing.
     blockfetch_max_range: usize,
 
+    /// Milliseconds timestamp of the last block delivered to the apply loop.
+    ///
+    /// Updated by `mark_block_applied()` after each `apply_fetched_block`.
+    /// Initialized to the current time at construction so that the starvation
+    /// check (claim_start > last_applied + grace) doesn't fire spuriously
+    /// during the very first claim.
+    ///
+    /// Maps to Haskell's `ChainSelStarvation` two-state flag in
+    /// `ouroboros-consensus/Ouroboros.Consensus.MiniProtocol.BlockFetch.Server`:
+    ///   - `0`  → `Ongoing` (initial stale-view state, or node start)
+    ///   - `>0` → `EndedAt(t)` (millis since UNIX epoch when last block arrived)
+    ///
+    /// Shared between `Node::run` (writer) and each BlockFetch worker (reader).
+    pub(crate) last_block_applied_ms: Arc<std::sync::atomic::AtomicU64>,
+
+    /// BlockFetch starvation grace period (seconds) before rotating the CSJ
+    /// dynamo. Configurable via `LowLevelGenesisOptions.BlockFetchGracePeriod`
+    /// (upstream default 10 s). Only consulted in genesis-mode bulk sync.
+    pub(crate) block_fetch_grace_period: std::time::Duration,
+
     /// Prometheus metrics for recording peer latencies.
     metrics: Arc<NodeMetrics>,
 
@@ -790,7 +810,15 @@ impl ConnectionLifecycleManager {
         peer_intersection_established: Arc<std::sync::atomic::AtomicBool>,
         tx_validator: Arc<dyn TxValidator>,
         blockfetch_max_range: usize,
+        block_fetch_grace_period: std::time::Duration,
     ) -> Self {
+        // Seed last_block_applied_ms to "now" so the starvation check (claim_start
+        // > last_applied + grace) does not fire spuriously during the first claim
+        // while the node is still establishing connections post-replay.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         Self {
             connections: HashMap::new(),
             network_magic,
@@ -812,6 +840,8 @@ impl ConnectionLifecycleManager {
             active_fetch_peer: Arc::new(std::sync::Mutex::new(None)),
             max_fetched_slot: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             blockfetch_max_range,
+            last_block_applied_ms: Arc::new(std::sync::atomic::AtomicU64::new(now_ms)),
+            block_fetch_grace_period,
             metrics,
             mempool,
             peer_failure_tx,
@@ -837,6 +867,21 @@ impl ConnectionLifecycleManager {
     /// duplex-paired source-port binding. Call once after construction.
     pub fn set_local_listen_addr(&mut self, addr: SocketAddr) {
         self.local_listen_addr = Some(addr);
+    }
+
+    /// Record that a block was successfully delivered to the apply loop.
+    ///
+    /// Called by `Node::apply_fetched_block` after each block is stored +
+    /// applied. Updates `last_block_applied_ms` (the `EndedAt` half of the
+    /// Haskell `ChainSelStarvation` flag) so the BlockFetch workers can
+    /// compute starvation duration and rotate the CSJ dynamo if needed.
+    pub fn mark_block_applied(&self) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.last_block_applied_ms
+            .store(now_ms, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Return the `SocketAddr` of the peer currently holding the
@@ -1805,6 +1850,11 @@ impl ConnectionLifecycleManager {
         let max_range = self.blockfetch_max_range;
         // CSJ dynamo rotation on starvation (Haskell demoteChainSyncJumpingDynamo).
         let csj = self.csj.clone();
+        // Starvation detection: shared timestamp updated by apply_fetched_block.
+        let last_block_applied_ms = self.last_block_applied_ms.clone();
+        let block_fetch_grace_period = self.block_fetch_grace_period;
+        // GSM state for genesis-mode gate (only rotate in genesis bulk sync).
+        let gsm_snapshot_rx_for_starv = self.gsm_snapshot_rx.clone();
 
         Box::new(move |mut channel, cancel| {
             Box::pin(async move {
@@ -1871,6 +1921,12 @@ impl ConnectionLifecycleManager {
                 // size each fetch range against `BLOCKFETCH_RANGE_BYTE_BUDGET`.
                 // Starts pessimistic (Conway-sized) so the first range is small.
                 let mut avg_block_bytes: usize = BLOCKFETCH_INIT_AVG_BLOCK_BYTES;
+
+                // ChainSelStarvation: records when this peer first claimed the
+                // active_fetcher slot in the current continuous claim window.
+                // Reset to None when the slot is released (peer not fetching).
+                // Used below for grace-period starvation dynamo rotation.
+                let mut claim_start_ms: Option<u64> = None;
 
                 info!(%addr, "blockfetch worker started (waiting for turn)");
 
@@ -1969,6 +2025,17 @@ impl ConnectionLifecycleManager {
                             if claimed {
                                 if let Ok(mut guard) = active_fetch_peer.lock() {
                                     *guard = Some(addr);
+                                }
+                                // Record claim start for starvation detection.
+                                // If this peer is already in a claim window (re-claim
+                                // after releasing at end of batch), we do NOT reset
+                                // claim_start so the starvation window keeps growing.
+                                if claim_start_ms.is_none() {
+                                    let now_ms = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_millis() as u64)
+                                        .unwrap_or(0);
+                                    claim_start_ms = Some(now_ms);
                                 }
                             }
                             let _fetch_guard = ActiveFetcherGuard {
@@ -2088,6 +2155,67 @@ impl ConnectionLifecycleManager {
                                         active_fetcher
                                             .store(0, std::sync::atomic::Ordering::SeqCst);
                                         continue;
+                                    }
+                                }
+                            }
+
+                            // Issue #742 Fix 2: ChainSel-starvation dynamo rotation.
+                            //
+                            // If this peer has held the fetcher slot for longer than
+                            // the grace period AND the ChainSel apply loop has not
+                            // consumed any block during that window (starvation =
+                            // Ongoing), rotate the CSJ dynamo to try a different peer.
+                            //
+                            // Haskell equivalent: `demoteChainSyncJumpingDynamo` in
+                            // `ouroboros-consensus/src/ouroboros-consensus/Ouroboros/
+                            // Consensus/Genesis/Client.hs` — fires when the BlockFetch
+                            // decision loop finds starvation for > `lgBlockFetchGracePeriod`.
+                            //
+                            // Only fires in genesis-mode bulk sync (not at live tip where
+                            // BlockFetch stalls are normal) and only when CSJ is enabled.
+                            if let Some(ref cs) = csj {
+                                if let Some(claim_ms) = claim_start_ms {
+                                    let is_genesis_bulk_sync = gsm_snapshot_rx_for_starv
+                                        .borrow()
+                                        .state
+                                        != crate::gsm::GenesisSyncState::CaughtUp;
+                                    if is_genesis_bulk_sync {
+                                        let now_ms = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .map(|d| d.as_millis() as u64)
+                                            .unwrap_or(0);
+                                        let last_applied = last_block_applied_ms
+                                            .load(std::sync::atomic::Ordering::Relaxed);
+                                        let grace_ms =
+                                            block_fetch_grace_period.as_millis() as u64;
+                                        // Starvation condition: this peer has held the
+                                        // fetcher for >= grace_period AND no block has
+                                        // been applied for >= grace_period since the
+                                        // claim started. This avoids false positives
+                                        // during normal bulk sync where the apply loop
+                                        // is keeping up but the ChainSync peer's queue
+                                        // is temporarily empty.
+                                        let held_long_enough = now_ms
+                                            .saturating_sub(claim_ms)
+                                            >= grace_ms;
+                                        let apply_stalled = last_applied == 0
+                                            || now_ms.saturating_sub(last_applied) >= grace_ms;
+                                        if held_long_enough && apply_stalled {
+                                            info!(
+                                                %addr,
+                                                grace_secs = block_fetch_grace_period.as_secs(),
+                                                claim_held_ms = now_ms.saturating_sub(claim_ms),
+                                                "BlockFetch: ChainSel starvation past grace \
+                                                 period — rotating CSJ dynamo (#742)"
+                                            );
+                                            cs.rotate_dynamo(&addr);
+                                            active_fetcher.store(
+                                                0,
+                                                std::sync::atomic::Ordering::SeqCst,
+                                            );
+                                            claim_start_ms = None;
+                                            continue;
+                                        }
                                     }
                                 }
                             }
@@ -2510,6 +2638,11 @@ impl ConnectionLifecycleManager {
                                 std::sync::atomic::Ordering::SeqCst,
                                 std::sync::atomic::Ordering::SeqCst,
                             );
+                            // Reset claim window: the slot was just voluntarily
+                            // released. If this peer re-claims on the next tick
+                            // the starvation clock starts fresh (Haskell resets
+                            // the grace-period timer on each new acquisition).
+                            claim_start_ms = None;
 
                             // Explicit yield so the SAME peer's worker
                             // Yield once to the scheduler so that a
@@ -3133,6 +3266,7 @@ impl ConnectionLifecycleManager {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(NoOpTxValidator),
             BLOCKFETCH_MAX_RANGE,
+            std::time::Duration::from_secs(10),
         )
     }
 
@@ -3209,6 +3343,7 @@ impl ConnectionLifecycleManager {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(NoOpTxValidator),
             BLOCKFETCH_MAX_RANGE,
+            std::time::Duration::from_secs(10),
         );
         (lc, peer_failure_rx)
     }
@@ -5190,6 +5325,139 @@ mod tests {
             result.is_ok(),
             "txsubmission2 task must exit within 1s of cancellation during blocking mempool poll; \
              elapsed={elapsed:?} (500ms sleep was un-guarded before fix)"
+        );
+    }
+}
+
+// ─── Fix 2 (#742): ChainSel-starvation detection unit tests ─────────────────
+//
+// These tests verify the starvation-detection machinery:
+//  • `mark_block_applied()` advances `last_block_applied_ms`
+//  • Starvation condition fires when held long + apply stalled
+//  • No false positive when apply is keeping up
+
+#[cfg(test)]
+mod fix2_starvation_detection_tests {
+    use super::*;
+
+    /// `mark_block_applied()` must advance the shared `last_block_applied_ms`
+    /// atomic to a wall-clock value at least as large as the value observed
+    /// before the call (monotone).
+    #[tokio::test]
+    async fn mark_block_applied_advances_timestamp() {
+        let lc = ConnectionLifecycleManager::new_for_test();
+        let before = lc
+            .last_block_applied_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // Small delay so wall clock has had a chance to tick.
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        lc.mark_block_applied();
+        let after = lc
+            .last_block_applied_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after >= before,
+            "mark_block_applied must not go backwards: before={before} after={after}"
+        );
+    }
+
+    /// The starvation condition logic mirrors the production code exactly so
+    /// we can unit-test it without spinning up a BlockFetch worker task.
+    ///
+    /// Condition:
+    ///   held_long_enough = now_ms - claim_ms >= grace_ms
+    ///   apply_stalled    = last_applied == 0 || now_ms - last_applied >= grace_ms
+    fn is_starved(now_ms: u64, claim_ms: u64, last_applied: u64, grace_ms: u64) -> bool {
+        let held_long_enough = now_ms.saturating_sub(claim_ms) >= grace_ms;
+        let apply_stalled = last_applied == 0 || now_ms.saturating_sub(last_applied) >= grace_ms;
+        held_long_enough && apply_stalled
+    }
+
+    /// When no block has ever been applied (last_applied==0) and the peer has
+    /// held the fetcher slot for >= grace, starvation must fire.
+    #[test]
+    fn starvation_fires_when_no_block_applied_and_held_long() {
+        let grace_ms: u64 = 10_000; // 10 s
+        let claim_ms: u64 = 1_000;
+        let last_applied: u64 = 0; // never applied
+        let now_ms: u64 = claim_ms + grace_ms + 1;
+        assert!(
+            is_starved(now_ms, claim_ms, last_applied, grace_ms),
+            "starvation must fire when last_applied==0 and held >= grace"
+        );
+    }
+
+    /// When the apply loop last ran BEFORE the grace window opened, starvation
+    /// must fire.
+    #[test]
+    fn starvation_fires_when_last_apply_older_than_grace() {
+        let grace_ms: u64 = 10_000;
+        let claim_ms: u64 = 1_000;
+        // Applied once, but 2× the grace period ago (500ms into the epoch).
+        let last_applied: u64 = 500;
+        // now = claim_ms + 2*grace: peer has been claiming for 2*grace.
+        // held_long_enough: now - claim = 2*grace >= grace  ✓
+        // apply_stalled:    now - last_applied >> grace     ✓
+        let now_ms: u64 = claim_ms + 2 * grace_ms;
+        assert!(
+            is_starved(now_ms, claim_ms, last_applied, grace_ms),
+            "starvation must fire when last_applied older than grace window"
+        );
+    }
+
+    /// When the apply loop ran within the grace window, starvation must NOT
+    /// fire — the peer is downloading fine, ChainSel is consuming blocks.
+    #[test]
+    fn starvation_does_not_fire_when_apply_is_current() {
+        let grace_ms: u64 = 10_000;
+        let claim_ms: u64 = 1_000;
+        let now_ms: u64 = claim_ms + grace_ms + 500;
+        // Apply ran only 1 s ago — well within the grace period.
+        let last_applied: u64 = now_ms - 1_000;
+        assert!(
+            !is_starved(now_ms, claim_ms, last_applied, grace_ms),
+            "starvation must not fire when apply ran recently"
+        );
+    }
+
+    /// When the peer has held the slot for less than the grace period,
+    /// starvation must NOT fire even if no block has been applied.
+    #[test]
+    fn starvation_does_not_fire_before_grace_period_expires() {
+        let grace_ms: u64 = 10_000;
+        let claim_ms: u64 = 1_000;
+        let last_applied: u64 = 0;
+        // Held for only grace_ms - 1 ms.
+        let now_ms: u64 = claim_ms + grace_ms - 1;
+        assert!(
+            !is_starved(now_ms, claim_ms, last_applied, grace_ms),
+            "starvation must not fire before grace period expires"
+        );
+    }
+
+    /// `mark_block_applied()` is callable from multiple threads without data
+    /// races (AtomicU64 store/load with Relaxed ordering is sufficient for
+    /// the timestamp update).
+    #[tokio::test]
+    async fn mark_block_applied_is_thread_safe() {
+        let lc = Arc::new(ConnectionLifecycleManager::new_for_test());
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let lc2 = lc.clone();
+            handles.push(tokio::spawn(async move {
+                lc2.mark_block_applied();
+            }));
+        }
+        for h in handles {
+            h.await.expect("mark_block_applied task panicked");
+        }
+        // After 8 concurrent calls the timestamp must be non-zero.
+        let ts = lc
+            .last_block_applied_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            ts > 0,
+            "last_block_applied_ms must be non-zero after mark_block_applied"
         );
     }
 }

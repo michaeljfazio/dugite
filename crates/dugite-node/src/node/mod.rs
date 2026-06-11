@@ -4179,6 +4179,14 @@ impl Node {
             crate::node::connection_lifecycle::resolve_blockfetch_max_range(
                 self.config.blockfetch_max_range,
             ),
+            // Issue #742 Fix 2: grace period for ChainSel-starvation dynamo rotation.
+            std::time::Duration::from_secs_f64(
+                self.config
+                    .low_level_genesis_options
+                    .as_ref()
+                    .map(|o| o.effective_block_fetch_grace_period_secs())
+                    .unwrap_or(10.0),
+            ),
         );
         // Enable outbound source-port pairing only when this node is also
         // running as a responder (it has a listen socket to share). When
@@ -6258,6 +6266,14 @@ impl Node {
         self.metrics
             .blocks_applied
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Issue #742 Fix 2: update starvation-detection timestamp so the
+        // BlockFetch grace-period check (ChainSelStarvation) knows the
+        // apply loop is making progress.  Called here — after a block is
+        // confirmed applied — so the starvation clock resets on real
+        // progress, not just on block receipt.
+        if let Some(ref lc) = self.connection_lifecycle {
+            lc.mark_block_applied();
+        }
         // Tip-query staleness fix (2026-05-16): shared post-apply housekeeping
         // also used by try_forge_block_at.  Replaces the previous inline
         // metric/mempool/snapshot updates.
