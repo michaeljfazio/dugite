@@ -4647,7 +4647,9 @@ pub async fn chainsync_client_task(
     peer_intersection_established.store(true, std::sync::atomic::Ordering::Relaxed);
 
     // Initialize candidate chain state for this peer.
-    let intersection_slot = intersection
+    // (`mut`: a promoted CSJ peer re-intersects at the frontier below and
+    // refreshes this for the GSM registration, #735.)
+    let mut intersection_slot = intersection
         .as_ref()
         .map(|p| match p {
             CodecPoint::Specific(s, _) => *s,
@@ -4745,7 +4747,22 @@ pub async fn chainsync_client_task(
                     chains.remove(&peer_addr);
                     return Ok(());
                 };
-                intersection = Some(point);
+                // Refresh the pre-jump intersection bookkeeping so the GSM
+                // registration below and the candidate entry reflect the
+                // frontier anchor (peer_state.set_anchor was already
+                // updated inside reintersect_promoted_peer).
+                intersection_slot = match &point {
+                    CodecPoint::Specific(s, _) => *s,
+                    CodecPoint::Origin => 0,
+                };
+                let mut chains = candidate_chains.write().await;
+                if let Some(state) = chains.get_mut(&peer_addr) {
+                    state.tip_slot = intersection_slot;
+                    state.tip_hash = match &point {
+                        CodecPoint::Specific(_, h) => *h,
+                        CodecPoint::Origin => [0u8; 32],
+                    };
+                }
             }
             JumperExit::Stream => {}
         }
