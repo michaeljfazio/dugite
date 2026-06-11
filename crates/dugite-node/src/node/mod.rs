@@ -2377,6 +2377,15 @@ impl Node {
         // (from main() which is `#[tokio::main]`), so `tokio::spawn` is safe.
         tokio::spawn(chain_sel_runner);
 
+        // Issue #747: extract bulk-sync snapshot rate limit from config BEFORE
+        // args.config is moved into the Node struct literal below.
+        let bulk_sync_snapshot_rate_limit_secs: f64 = args
+            .config
+            .low_level_genesis_options
+            .as_ref()
+            .map(|o| o.effective_snapshot_min_interval_bulk_sync_secs())
+            .unwrap_or(1800.0);
+
         Ok(Node {
             config: args.config,
             topology: args.topology,
@@ -2460,9 +2469,18 @@ impl Node {
             // Slot-based snapshot interval = k * 2 (#701, Haskell defInterval).
             // For mainnet/preprod k=2160 → 4320 slots ≈ 72 min.
             // For preview k=432 → 864 slots ≈ 14 min.
-            bg_snapshot_scheduler: SnapshotScheduler::with_slot_interval(
-                consensus_security_param.saturating_mul(2),
-            ),
+            bg_snapshot_scheduler: {
+                let mut sched = SnapshotScheduler::with_slot_interval(
+                    consensus_security_param.saturating_mul(2),
+                );
+                // Issue #747: apply bulk-sync rate limit from config so epoch-
+                // boundary snapshots during genesis catch-up don't fire more
+                // often than the configured interval (default 30 min).
+                sched.set_bulk_sync_rate_limit(std::time::Duration::from_secs_f64(
+                    bulk_sync_snapshot_rate_limit_secs,
+                ));
+                sched
+            },
             last_query_state_update: Instant::now(),
             last_volatile_wal_sync: Instant::now(),
             peer_intersection_established: Arc::new(std::sync::atomic::AtomicBool::new(false)),
