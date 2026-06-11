@@ -83,6 +83,13 @@ pub struct LowLevelGenesisOptions {
     /// Minimum seconds between GDD evaluations (`gcfGDDRateLimit`; default 1.0).
     #[serde(rename = "GDDRateLimit", default)]
     pub gdd_rate_limit_secs: Option<f64>,
+    /// Minimum wall-clock seconds between epoch-boundary ledger snapshots
+    /// during genesis bulk sync (catch-up mode).  Defaults to 1800 s (30 min).
+    /// Raising this reduces snapshot I/O during fast bulk sync; lowering it
+    /// increases the rollback blast radius on unexpected shutdown.
+    /// See issue #747.  Dugite-specific — not a cardano-node config key.
+    #[serde(rename = "SnapshotMinIntervalBulkSync", default)]
+    pub snapshot_min_interval_bulk_sync_secs: Option<f64>,
 }
 
 fn default_true() -> bool {
@@ -100,6 +107,7 @@ impl Default for LowLevelGenesisOptions {
             bucket_rate: None,
             csj_jump_size: None,
             gdd_rate_limit_secs: None,
+            snapshot_min_interval_bulk_sync_secs: None,
         }
     }
 }
@@ -128,6 +136,12 @@ impl LowLevelGenesisOptions {
     /// `lgpGDDRateLimit` with the upstream default applied (1.0 s).
     pub fn effective_gdd_rate_limit_secs(&self) -> f64 {
         self.gdd_rate_limit_secs.unwrap_or(1.0)
+    }
+
+    /// Minimum seconds between epoch-boundary snapshots during bulk sync.
+    /// Default 1800 s (30 min).  Issue #747.
+    pub fn effective_snapshot_min_interval_bulk_sync_secs(&self) -> f64 {
+        self.snapshot_min_interval_bulk_sync_secs.unwrap_or(1800.0)
     }
 }
 
