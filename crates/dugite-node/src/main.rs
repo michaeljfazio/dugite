@@ -4,6 +4,7 @@ use dugite_node::config_reload;
 use dugite_node::forge;
 mod disk_monitor;
 mod genesis;
+mod genesis_governor;
 mod genesis_peer_state;
 mod gsm;
 mod logging;

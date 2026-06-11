@@ -6,6 +6,7 @@ pub mod chain_selection;
 pub mod epoch;
 pub mod era_history;
 pub mod forecast;
+pub mod loe;
 pub mod overlay;
 pub mod peras_wire;
 pub mod praos;
