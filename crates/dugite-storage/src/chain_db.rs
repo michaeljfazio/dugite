@@ -581,6 +581,19 @@ impl ChainDB {
     /// All other `BlockHeader` fields (keys, VRF output, KES sig, etc.) are
     /// zeroed.  Callers that need the full header should fetch it from
     /// VolatileDB via `get_block`.
+    /// The volatile selected-chain points (immutable tip exclusive →
+    /// selection tip inclusive) as `(slot, hash)`, oldest first. This is the
+    /// node's own already-adopted volatile window — the base of the Genesis
+    /// LoE fragment (the peers agreed up to the intersection, which is at or
+    /// above the selection tip, so the whole window is part of the LoE).
+    pub fn volatile_selected_points(&self) -> Vec<(u64, [u8; 32])> {
+        self.volatile
+            .selected_chain_entries()
+            .into_iter()
+            .map(|(hash, slot, _block_no, _prev)| (slot, *hash.as_bytes()))
+            .collect()
+    }
+
     pub fn get_volatile_chain_headers(&self) -> Vec<dugite_primitives::block::BlockHeader> {
         // Walk the selected chain from oldest to newest, building header stubs
         // from the VolatileBlock metadata (no CBOR decode needed).

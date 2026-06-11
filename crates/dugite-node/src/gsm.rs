@@ -748,14 +748,30 @@ pub async fn run_gsm_actor(
                 dirty = false;
 
                 // ── LoE per state (setGetLoEFragment) ────────────────────
-                let imm_tip: Option<(u64, [u8; 32])> = {
+                // The Genesis LoE is anchored at the immutable tip but INCLUDES
+                // the node's own volatile selected chain (immutable tip →
+                // selection tip) as its base: the peers intersect at/above the
+                // selection tip, so that whole window is agreed. The peers'
+                // candidate fragments are anchored at the intersection (the
+                // selection tip) and provide the forward extension.
+                #[allow(clippy::type_complexity)]
+                let (imm_tip, selection_tip, volatile_window): (
+                    Option<(u64, [u8; 32])>,
+                    Option<(u64, [u8; 32])>,
+                    Vec<(u64, [u8; 32])>,
+                ) = {
                     let db = chain_db.read().await;
-                    match db.get_immutable_tip_point() {
+                    let imm = match db.get_immutable_tip_point() {
                         None | Some(dugite_primitives::block::Point::Origin) => None,
                         Some(dugite_primitives::block::Point::Specific(slot, hash)) => {
                             Some((slot.0, *hash.as_bytes()))
                         }
-                    }
+                    };
+                    let sel = db
+                        .get_tip_info()
+                        .map(|(slot, hash, _bn)| (slot.0, *hash.as_bytes()));
+                    let win = db.volatile_selected_points();
+                    (imm, sel, win)
                 };
 
                 match gsm.state() {
@@ -773,10 +789,10 @@ pub async fn run_gsm_actor(
                         }));
                     }
                     GenesisSyncState::Syncing => {
-                        // Prune fragments behind the advancing immutable tip,
-                        // then snapshot.
+                        // Re-anchor peer fragments to the selection tip (the
+                        // intersection point) so they all align, then snapshot.
                         let peers = registry.all();
-                        if let Some((s, h)) = imm_tip {
+                        if let Some((s, h)) = selection_tip {
                             for (_, st) in &peers {
                                 let _ = st.reanchor_to_immutable_tip(s, &h);
                             }
@@ -791,13 +807,33 @@ pub async fn run_gsm_actor(
                             // "Losing all peers effectively disables the LoE
                             // constraint": LoE = current selection.
                             loe_out.store(std::sync::Arc::new(LoeState::SelectionTip { k }));
-                            gsm.set_loe_tip_slot(imm_tip.map(|(s, _)| s).unwrap_or(0));
+                            gsm.set_loe_tip_slot(selection_tip.map(|(s, _)| s).unwrap_or(0));
                         } else {
+                            // Shared FORWARD extension among peers, anchored at
+                            // the selection tip.
                             let sp = crate::genesis_governor::shared_candidate_prefix(
-                                imm_tip, &frags,
+                                selection_tip, &frags,
                             );
-                            let loe_tip =
-                                crate::genesis_governor::loe_tip_slot(imm_tip, &sp.prefix);
+                            // The LoE fragment = volatile window (immutable →
+                            // selection) ++ shared forward. The LoE tip is the
+                            // furthest peer agreement.
+                            let mut loe_entries: Vec<LoePoint> = volatile_window
+                                .iter()
+                                .map(|(slot, hash)| LoePoint {
+                                    slot: *slot,
+                                    hash: *hash,
+                                })
+                                .collect();
+                            loe_entries.extend(sp.prefix.iter().copied());
+                            let loe_tip = match loe_entries.last() {
+                                Some(p) => crate::genesis_peer_state::WithOrigin::At(p.slot),
+                                None => match imm_tip {
+                                    Some((s, _)) => {
+                                        crate::genesis_peer_state::WithOrigin::At(s)
+                                    }
+                                    None => crate::genesis_peer_state::WithOrigin::Origin,
+                                },
+                            };
 
                             // Per-era genesis window at (LoE tip + 1) —
                             // PastHorizon ⇒ skip this entire evaluation
@@ -824,7 +860,7 @@ pub async fn run_gsm_actor(
 
                             let new_loe = LoeState::Fragment {
                                 anchor: imm_tip.map(|(s, h)| LoePoint { slot: s, hash: h }),
-                                entries: sp.prefix.clone(),
+                                entries: loe_entries,
                                 k,
                             };
                             let new_tip = new_loe.fragment_tip();

@@ -38,6 +38,7 @@ pub struct SharedPrefix {
 }
 
 /// Slot of the LoE tip given the prefix (or the immutable-tip anchor).
+#[allow(dead_code)] // retained for tests + future objector LoE alignment
 pub fn loe_tip_slot(imm_tip: Option<(u64, [u8; 32])>, prefix: &[LoePoint]) -> WithOrigin {
     match prefix.last() {
         Some(p) => WithOrigin::At(p.slot),
