@@ -737,8 +737,12 @@ pub async fn blockfetch_worker(
                         from,
                         to,
                         |block_cbor| {
-                            // Decode the block from raw CBOR.
-                            match dugite_serialization::decode_block_minimal_with_byron_epoch_length(
+                            // Decode the block from raw CBOR. FULL decode —
+                            // fetched blocks feed the ValidateAll apply
+                            // pipeline whose phase-1/phase-2 oracle reads the
+                            // witness set (#738); the minimal decoder is only
+                            // safe for ApplyOnly replay.
+                            match dugite_serialization::decode_block_with_byron_epoch_length(
                                 &block_cbor,
                                 epoch_len,
                             ) {
