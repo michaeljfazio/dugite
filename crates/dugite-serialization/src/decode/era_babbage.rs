@@ -1929,14 +1929,18 @@ mod tests {
         mint.extend([0x11u8; 28]); // policy
         mint.push(0xa2); // inner map(2)
         mint.push(0x41);
-        mint.push(b'A');   // asset name "A"
-        mint.push(0x05);   // quantity = 5
+        mint.push(b'A'); // asset name "A"
+        mint.push(0x05); // quantity = 5
         mint.push(0x41);
-        mint.push(b'B');   // asset name "B"
-        mint.push(0x00);   // quantity = 0  ← must be pruned
+        mint.push(b'B'); // asset name "B"
+        mint.push(0x00); // quantity = 0  ← must be pruned
         let mut r = Reader::new(&mint);
         let result = read_babbage_mint_map(&mut r).expect("decode");
-        assert_eq!(result.len(), 1, "policy with mixed zero/nonzero assets survives");
+        assert_eq!(
+            result.len(),
+            1,
+            "policy with mixed zero/nonzero assets survives"
+        );
         let (_pol, assets) = result.iter().next().unwrap();
         assert_eq!(assets.len(), 1, "only non-zero asset survives");
         let &qty = assets.values().next().unwrap();
@@ -1948,7 +1952,7 @@ mod tests {
     fn babbage_mint_map_all_zero_policy_dropped() {
         // {policy1 -> {"A" -> 1}, policy2 -> {"X" -> 0}}
         let mut mint = vec![0xa2u8]; // map(2)
-        // policy1 with nonzero asset
+                                     // policy1 with nonzero asset
         mint.push(0x58);
         mint.push(0x1c);
         mint.extend([0x11u8; 28]);
@@ -1956,7 +1960,7 @@ mod tests {
         mint.push(0x41);
         mint.push(b'A');
         mint.push(0x01); // qty = 1
-        // policy2 with zero asset → should be dropped
+                         // policy2 with zero asset → should be dropped
         mint.push(0x58);
         mint.push(0x1c);
         mint.extend([0x22u8; 28]);
@@ -1966,7 +1970,11 @@ mod tests {
         mint.push(0x00); // qty = 0
         let mut r = Reader::new(&mint);
         let result = read_babbage_mint_map(&mut r).expect("decode");
-        assert_eq!(result.len(), 1, "policy with all-zero assets must be dropped");
+        assert_eq!(
+            result.len(),
+            1,
+            "policy with all-zero assets must be dropped"
+        );
         let (pol, _) = result.iter().next().unwrap();
         assert_eq!(pol.as_bytes(), &[0x11u8; 28]);
     }

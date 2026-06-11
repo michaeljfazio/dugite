@@ -2939,12 +2939,58 @@ pub fn validate_transaction_with_pools(
     // above). Both the pre-Conway `StakeRegistration` (tag 0) and the Conway
     // `ConwayStakeRegistration` (tag 7) variants are covered.
     //
-    // Reference: Haskell `StakeKeyRegisteredDELEG` in
-    // `cardano-ledger-shelley:Cardano.Ledger.Shelley.Rules.Deleg`.
+    // IMPORTANT — sequential / intra-tx overlay semantics:
+    // Haskell applies certificates left-to-right against the EVOLVING
+    // ledger state. A [dereg(C), reg(C)] sequence in the same transaction
+    // must be accepted because the dereg clears the key before the re-reg.
+    // Conversely, [reg(C), reg(C)] must be rejected even when C is not
+    // pre-registered, because the first cert registers it intra-tx and the
+    // second cert sees it as already registered.
+    //
+    // We track two overlay sets that shadow the `accounts` map:
+    //   `in_tx_deregistered` — credentials deregistered by a prior cert in
+    //     this tx; they are treated as absent from `accounts`.
+    //   `in_tx_registered`   — credentials registered by a prior cert in
+    //     this tx; they are treated as present even if absent from `accounts`.
+    //
+    // Reference: Haskell `StakeKeyRegisteredDELEG` /
+    // `ConwayDRepAlreadyRegistered` in
+    // `cardano-ledger-shelley:Cardano.Ledger.Shelley.Rules.Deleg` and
+    // `cardano-ledger-conway:Cardano.Ledger.Conway.Rules.Deleg`.
     // ------------------------------------------------------------------
     if let Some(accounts) = reward_accounts {
+        let mut in_tx_deregistered: std::collections::HashSet<dugite_primitives::hash::Hash32> =
+            std::collections::HashSet::new();
+        let mut in_tx_registered: std::collections::HashSet<dugite_primitives::hash::Hash32> =
+            std::collections::HashSet::new();
+
         for cert in &tx.body.certificates {
-            let opt_cred: Option<&dugite_primitives::credentials::Credential> = match cert {
+            // ----------------------------------------------------------
+            // Track deregistrations: clear from in_tx_registered, add to
+            // in_tx_deregistered. This makes the key "invisible" to
+            // subsequent registration certs in the same tx.
+            // ----------------------------------------------------------
+            let opt_dereg_cred: Option<&dugite_primitives::credentials::Credential> = match cert {
+                dugite_primitives::transaction::Certificate::StakeDeregistration(cred) => {
+                    Some(cred)
+                }
+                dugite_primitives::transaction::Certificate::ConwayStakeDeregistration {
+                    credential,
+                    ..
+                } => Some(credential),
+                _ => None,
+            };
+            if let Some(credential) = opt_dereg_cred {
+                let key = credential.to_typed_hash32();
+                in_tx_deregistered.insert(key);
+                in_tx_registered.remove(&key);
+                continue;
+            }
+
+            // ----------------------------------------------------------
+            // Check and track registrations.
+            // ----------------------------------------------------------
+            let opt_reg_cred: Option<&dugite_primitives::credentials::Credential> = match cert {
                 dugite_primitives::transaction::Certificate::StakeRegistration(cred) => Some(cred),
                 dugite_primitives::transaction::Certificate::ConwayStakeRegistration {
                     credential: cred,
@@ -2967,15 +3013,28 @@ pub fn validate_transaction_with_pools(
                 } => Some(cred),
                 _ => None,
             };
-            if let Some(credential) = opt_cred {
+            if let Some(credential) = opt_reg_cred {
                 // Mirror `state::credential_to_hash` — `to_typed_hash32` so the
                 // lookup key matches the kind-tagged storage form.
                 let key = credential.to_typed_hash32();
-                if accounts.contains_key(&key) {
+
+                // A credential is "currently registered" if:
+                //   (a) it is in the pre-tx accounts map AND was not deregistered
+                //       by a prior cert in this tx, OR
+                //   (b) it was registered by a prior cert in this tx.
+                let is_currently_registered = (accounts.contains_key(&key)
+                    && !in_tx_deregistered.contains(&key))
+                    || in_tx_registered.contains(&key);
+
+                if is_currently_registered {
                     errors.push(ValidationError::StakeKeyAlreadyRegistered {
                         credential_hash: key.to_hex(),
                     });
                 }
+
+                // Record that this cert registers the key for subsequent certs.
+                in_tx_registered.insert(key);
+                in_tx_deregistered.remove(&key);
             }
         }
     }

@@ -240,12 +240,14 @@ fn decode_conway_block_mode(
             // Reconstruct full wire-format tx CBOR for fee-size calculation.
             // Haskell toCBORForSizeComputation (Conway) = array(3)[body,wits,aux];
             // we build array(4) and fee_tx_size() subtracts the 1-byte is_valid.
-            let raw_cbor = Some(crate::decode::era_babbage::reconstruct_alonzo_plus_tx_raw_cbor(
-                &raw_body,
-                raw_witness.as_deref().unwrap_or(&[0xA0]),
-                is_valid,
-                auxiliary_data.as_ref(),
-            ));
+            let raw_cbor = Some(
+                crate::decode::era_babbage::reconstruct_alonzo_plus_tx_raw_cbor(
+                    &raw_body,
+                    raw_witness.as_deref().unwrap_or(&[0xA0]),
+                    is_valid,
+                    auxiliary_data.as_ref(),
+                ),
+            );
 
             Ok(Transaction {
                 hash: tx_hash,
@@ -5259,7 +5261,10 @@ mod tests {
             "block-decoded Conway tx must have raw_cbor populated for fee calculation"
         );
         let raw = tx.raw_cbor.as_ref().unwrap();
-        assert_eq!(raw[0], 0x84, "Conway tx raw_cbor must start with 0x84 (array-4)");
+        assert_eq!(
+            raw[0], 0x84,
+            "Conway tx raw_cbor must start with 0x84 (array-4)"
+        );
 
         let body_len = tx.raw_body_cbor.as_ref().map_or(0, |b| b.len());
         let witness_len = tx.raw_witness_cbor.as_ref().map_or(0, |b| b.len());
@@ -5267,7 +5272,9 @@ mod tests {
         assert_eq!(
             raw.len(),
             expected_len,
-            "raw_cbor.len()={} expected={}", raw.len(), expected_len
+            "raw_cbor.len()={} expected={}",
+            raw.len(),
+            expected_len
         );
     }
 }
