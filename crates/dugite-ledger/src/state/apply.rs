@@ -373,7 +373,7 @@ impl LedgerState {
             }
         }
 
-        // #11 startStep capture: the first time this (Shelley+, pv≤6) epoch's
+        // #11 startStep capture: the first time this (Shelley+) epoch's
         // block slot crosses `epoch_first_slot + randomness_stabilisation_window`
         // (4k/f), freeze the registered reward-account credential set — BEFORE
         // applying this block's certificates. Mirrors Haskell's RUPD pulser
@@ -382,8 +382,20 @@ impl LedgerState {
         // `compute_reward_update` uses this frozen set for the pv≤6 member +
         // leader reward prefilters instead of boundary-time accounts. pv≥7
         // bypasses the prefilter, so we skip the (potentially large) snapshot.
+        //
+        // PV GATE: the RUPD this freeze feeds is the one applied at the NEXT
+        // boundary, which Haskell computes under prevPParams — i.e. THIS
+        // epoch's previous-boundary params (`prev_protocol_version_major`),
+        // NOT the current curPParams. Gating on curPParams skipped the freeze
+        // during the Vasil epoch itself (ep365: cur=pv7, prev=pv6): Haskell's
+        // pulser still ran the pv6 prefilter with its mid-epoch frozen set,
+        // while dugite fell back to boundary-time accounts — accounts
+        // deregistered between the 4k/f mark and the boundary were never
+        // computed (left in reserves) where Haskell computes-then-routes them
+        // to treasury. Observed live at mainnet 365→366: treasury short
+        // 857600586 lovelace, reserves correspondingly high.
         if block.era != Era::Byron
-            && self.epochs.protocol_params.protocol_version_major <= 6
+            && self.epochs.prev_protocol_version_major <= 6
             && self.epochs.rupd_addrs_rew.is_none()
         {
             let startstep_slot = self
