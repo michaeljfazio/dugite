@@ -12,6 +12,7 @@ pub mod genesis_governor;
 pub mod genesis_params;
 pub mod genesis_peer_state;
 pub mod gsm;
+pub mod leaky_bucket;
 pub mod snapshot_convert;
 pub mod verify_snapshot;
 

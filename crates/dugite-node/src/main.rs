@@ -7,6 +7,7 @@ mod genesis;
 mod genesis_governor;
 mod genesis_peer_state;
 mod gsm;
+mod leaky_bucket;
 mod logging;
 mod metrics;
 mod mithril;

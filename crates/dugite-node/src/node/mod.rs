@@ -725,6 +725,14 @@ pub struct Node {
     /// chain selection (`LoeState::Disabled` in praos mode = identity).
     #[allow(dead_code)] // consumed by chain selection in the trimToLoE task (T5)
     pub(crate) loe_out: Arc<arc_swap::ArcSwap<dugite_consensus::loe::LoeState>>,
+
+    /// Limit on Patience (capacity, rate) handed to every ChainSync task;
+    /// `None` in praos mode or with `EnableLoP=false`.
+    pub(crate) lop_params: Option<(u64, u64)>,
+
+    /// Historicity cutoff handed to every ChainSync task; `None` in praos
+    /// mode (Haskell `gcHistoricityCutoff = Nothing`).
+    pub(crate) historicity_cutoff_secs: Option<u64>,
     /// GSM snapshot receiver — latest GSM state (watch channel, synchronous borrow).
     ///
     /// Consumers call `self.gsm_snapshot_rx.borrow()` to read the latest
@@ -2165,6 +2173,23 @@ impl Node {
             dugite_consensus::loe::LoeState::Disabled
         };
         let loe_out = Arc::new(arc_swap::ArcSwap::from_pointee(initial_loe));
+        // Limit on Patience config (Haskell mkGenesisConfig): enabled only in
+        // Genesis mode with EnableLoP (default true); praos =
+        // ChainSyncLoPBucketDisabled.
+        let lop_params = if genesis_enabled && genesis_params.options.enable_lop {
+            Some((
+                genesis_params.options.effective_bucket_capacity(),
+                genesis_params.options.effective_bucket_rate(),
+            ))
+        } else {
+            None
+        };
+        // Historicity cutoff (Haskell mkGenesisConfig): genesis mode only.
+        let historicity_cutoff_secs = if genesis_enabled {
+            Some(genesis_params.historicity_cutoff_secs)
+        } else {
+            None
+        };
         {
             let mut db = chain_db
                 .try_write()
@@ -2371,6 +2396,8 @@ impl Node {
             consensus_mode: args.consensus_mode,
             peer_registry,
             loe_out,
+            lop_params,
+            historicity_cutoff_secs,
             validate_all_blocks: args.validate_all_blocks,
             skip_eagerly_validated_header_crypto: args.skip_eagerly_validated_header_crypto,
             disk_space_rx: watch::channel(crate::disk_monitor::DiskSpaceLevel::Ok).1,
@@ -4078,6 +4105,9 @@ impl Node {
             keepalive_rtt_tx,
             self.gsm_event_tx.clone(),
             self.peer_registry.clone(),
+            self.gsm_snapshot_rx.clone(),
+            self.lop_params,
+            self.historicity_cutoff_secs,
             // Duplex server protocol fields
             Arc::new(serve::ChainDBBlockProvider {
                 chain_db: self.chain_db.clone(),
