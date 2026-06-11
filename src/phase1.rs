@@ -1,0 +1,13 @@
+// ...
+
+impl Phase1 {
+    // ...
+
+    pub fn validate_transaction(&self, tx: &Transaction) -> Result<(), ValidationFailure> {
+        // Use the published ledger view for witness resolution
+        let ledger_view = self.ledger_view.read();
+        // ...
+    }
+}
+
+// ...
