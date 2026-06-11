@@ -138,8 +138,9 @@ process_round() {
     # Check per-round tx state if round-specific dir exists, fallback to global
     for candidate in "$evd/tx-results.csv" "$TX_ZOO_STATE/results.csv"; do
         if [ -f "$candidate" ] && [ -s "$candidate" ]; then
-            tz_pass=$(awk -F, 'NR>1 && $2=="PASS" {c++} END{print c+0}' "$candidate")
-            tz_fail=$(awk -F, 'NR>1 && $2=="FAIL" {c++} END{print c+0}' "$candidate")
+            # results.csv layout: ts,script,status,txid,detail — status is $3.
+            tz_pass=$(awk -F, 'NR>1 && $3=="PASS" {c++} END{print c+0}' "$candidate")
+            tz_fail=$(awk -F, 'NR>1 && $3=="FAIL" {c++} END{print c+0}' "$candidate")
             tz_skip=$(awk -F, 'NR>1 && $2=="SKIP" {c++} END{print c+0}' "$candidate")
             tz_total=$(awk -F, 'NR>1 {c++} END{print c+0}' "$candidate")
             break
@@ -151,11 +152,13 @@ process_round() {
     local in_dir_report="$evd/report.md"
     if [ -f "$in_dir_report" ]; then
         # Extract "PASS" or "FAIL" from the predicate table rows
-        p1=$(awk -F'|' '/\| p1 /{gsub(/ /,""); if($4~/PASS/) print "true"; else print "false"; exit}' "$in_dir_report")
-        p2=$(awk -F'|' '/\| p2 /{gsub(/ /,""); if($4~/PASS/) print "true"; else print "false"; exit}' "$in_dir_report")
-        p3=$(awk -F'|' '/\| p3 /{gsub(/ /,""); if($4~/PASS/) print "true"; else print "false"; exit}' "$in_dir_report")
-        p4=$(awk -F'|' '/\| p4 /{gsub(/ /,""); if($4~/PASS/) print "true"; else print "false"; exit}' "$in_dir_report")
-        p5=$(awk -F'|' '/\| p5 /{gsub(/ /,""); if($4~/PASS/) print "true"; else print "false"; exit}' "$in_dir_report")
+        # SKIP = predicate out of scope for this round (insufficient data,
+        # e.g. an idle soak has no txs for p3) — treated as null, not FAIL.
+        p1=$(awk -F'|' '/\| p1 /{gsub(/ /,""); if($4~/PASS/) print "true"; else if($4~/SKIP/) print "null"; else print "false"; exit}' "$in_dir_report")
+        p2=$(awk -F'|' '/\| p2 /{gsub(/ /,""); if($4~/PASS/) print "true"; else if($4~/SKIP/) print "null"; else print "false"; exit}' "$in_dir_report")
+        p3=$(awk -F'|' '/\| p3 /{gsub(/ /,""); if($4~/PASS/) print "true"; else if($4~/SKIP/) print "null"; else print "false"; exit}' "$in_dir_report")
+        p4=$(awk -F'|' '/\| p4 /{gsub(/ /,""); if($4~/PASS/) print "true"; else if($4~/SKIP/) print "null"; else print "false"; exit}' "$in_dir_report")
+        p5=$(awk -F'|' '/\| p5 /{gsub(/ /,""); if($4~/PASS/) print "true"; else if($4~/SKIP/) print "null"; else print "false"; exit}' "$in_dir_report")
         # Null-safe: empty string → null
         p1="${p1:-null}"; p2="${p2:-null}"; p3="${p3:-null}"; p4="${p4:-null}"; p5="${p5:-null}"
     fi
