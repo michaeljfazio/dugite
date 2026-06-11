@@ -51,6 +51,7 @@ use crate::chain_db::ChainDB;
 ///
 /// Currently there is only one variant; future work may add `Shutdown`,
 /// `Flush`, or priority hint messages.
+#[allow(clippy::large_enum_variant)] // AddBlock dominates the queue; boxing would churn every producer for no win
 pub enum ChainSelMessage {
     /// Request to add a block to the chain.
     ///
@@ -73,6 +74,18 @@ pub enum ChainSelMessage {
         /// strict-greater block_no in that case.
         header: Option<dugite_primitives::block::BlockHeader>,
         /// Fulfillment channel for the processing result.
+        result_tx: oneshot::Sender<AddBlockResult>,
+    },
+
+    /// Re-run chain selection with no new block — Haskell
+    /// `ChainSelReprocessLoEBlocks`. Sent when the Limit on Eagerness
+    /// advances (or the GSM enters CaughtUp) so blocks whose adoption was
+    /// deferred by `trimToLoE` get re-evaluated even when no further block
+    /// arrives. Returns the selection outcome: `TriggeredFork` when a
+    /// deferred candidate is now adoptable, `StoredAsFork` when nothing
+    /// changed.
+    ReprocessLoE {
+        /// Fulfillment channel for the selection outcome.
         result_tx: oneshot::Sender<AddBlockResult>,
     },
 }
@@ -334,10 +347,222 @@ pub async fn add_block_runner(
                     trace!(hash = %hash.to_hex(), "add_block_runner: result receiver dropped");
                 }
             }
+            ChainSelMessage::ReprocessLoE { result_tx } => {
+                let invalid_snapshot: Option<std::collections::HashSet<Hash32>> = {
+                    let cache = invalid_cache.write().await;
+                    if cache.is_empty() {
+                        None
+                    } else {
+                        Some(cache.hash_set())
+                    }
+                };
+                let result = run_selection_pass(&chain_db, &invalid_snapshot, true)
+                    .await
+                    .unwrap_or(AddBlockResult::StoredAsFork);
+                if result_tx.send(result).is_err() {
+                    trace!("add_block_runner: ReprocessLoE receiver dropped");
+                }
+            }
         }
     }
 
     debug!("add_block_runner: channel closed, exiting");
+}
+
+/// One chain-selection evaluation over the current VolatileDB fork tips
+/// (Haskell `chainSelectionForBlock` / `ChainSelReprocessLoEBlocks`).
+///
+/// Applies `trimToLoE` to every candidate (identity when the LoE is
+/// disabled — the praos fast path), then the Praos preference order, the
+/// known-invalid-ancestry guard, and finally `switch_to_fork`.
+///
+/// Returns:
+/// - `Some(AddBlockResult::TriggeredFork{..})` — a candidate was adopted;
+/// - `Some(AddBlockResult::StoredAsFork)` — the preferred candidate was
+///   refused (contains a known-invalid block);
+/// - `None` — no preferred candidate (or the fork is currently unreachable);
+///   the caller falls through to its non-switch path.
+async fn run_selection_pass(
+    chain_db: &Arc<RwLock<ChainDB>>,
+    invalid_snapshot: &Option<std::collections::HashSet<Hash32>>,
+    prefer_praos: bool,
+) -> Option<AddBlockResult> {
+    let mut db = chain_db.write().await;
+
+    let current_tip_info = db.get_tip_info();
+    let current_tip_block_no: u64 = current_tip_info
+        .as_ref()
+        .map(|(_slot, _hash, bn)| bn.0)
+        .unwrap_or(0);
+
+    // For the Praos tiebreaker we need: (a) the current tip's BlockHeader,
+    // (b) each fork-tip's BlockHeader.  All come from the in-memory cache
+    // populated by `add_block_with_header`.
+    let current_tip_header = current_tip_info
+        .as_ref()
+        .and_then(|(_, h, _)| db.get_volatile_header(h).cloned());
+
+    // `trimToLoE` (Ouroboros Genesis): refresh the published LoE and
+    // trim every candidate. `Allowed` passes through; `TrimmedTo`
+    // candidates participate as their trimmed ancestor (Haskell adopts
+    // `candPrefix ++ takeOldest k candSuffix`); `Deferred` candidates
+    // are invisible to this pass and re-enter when the LoE advances.
+    // With the LoE disabled (praos) this is the identity.
+    db.refresh_loe_view();
+    let fork_tips: Vec<(Hash32, BlockNo, SlotNo)> = db
+        .get_all_fork_tips()
+        .into_iter()
+        .filter_map(|(h, bn, slot)| match db.loe_verdict(&h) {
+            crate::loe_trim::LoeVerdict::Allowed => Some((h, bn, slot)),
+            crate::loe_trim::LoeVerdict::TrimmedTo(t) => db
+                .get_volatile_block_meta(&t)
+                .map(|(t_slot, t_bn)| (t, t_bn, t_slot)),
+            crate::loe_trim::LoeVerdict::Deferred => None,
+        })
+        .collect();
+
+    // Helper: pick the best fork using the Praos comparator.  Returns the
+    // (hash, block_no, slot) of the preferred candidate, or None.
+    fn select_best_praos(
+        fork_tips: Vec<(Hash32, BlockNo, SlotNo)>,
+        current_header: &dugite_primitives::block::BlockHeader,
+        db: &ChainDB,
+    ) -> Option<(Hash32, BlockNo, SlotNo)> {
+        // Era for the slot-window decision: use the current tip's era,
+        // which always matches the candidate's era within a 5-slot
+        // tiebreaker window.
+        let era = current_header.protocol_version.era();
+        let slot_window: u64 = match era {
+            Era::Conway | Era::Dijkstra => 5, // RestrictedVRFTiebreaker 5
+            // Byron uses density not Praos; `prefer_chain_with_headers`
+            // short-circuits to `compare_density` and never consults
+            // `slot_window`. Value is irrelevant — keep `u64::MAX` for
+            // consistency with other unrestricted arms.
+            Era::Byron => u64::MAX,
+            _ => u64::MAX, // pre-Conway Praos: unrestricted
+        };
+
+        let mut sel = ChainSelection::new();
+        sel.set_tip(Tip {
+            point: Point::Specific(current_header.slot, current_header.header_hash),
+            block_number: current_header.block_number,
+        });
+
+        fork_tips
+            .into_iter()
+            .filter_map(|(h, bn, slot)| {
+                let cand_header = db.get_volatile_header(&h)?.clone();
+                let cand_tip = Tip {
+                    point: Point::Specific(cand_header.slot, cand_header.header_hash),
+                    block_number: cand_header.block_number,
+                };
+                let pref = sel.prefer_chain_with_headers(
+                    &cand_tip,
+                    current_header,
+                    &cand_header,
+                    era,
+                    slot_window,
+                );
+                if matches!(pref, ChainPreference::PreferCandidate) {
+                    Some((h, bn, slot))
+                } else {
+                    None
+                }
+            })
+            // Among preferred candidates, prefer highest block_no.
+            .max_by_key(|(_, bn, _)| bn.0)
+    }
+
+    // Legacy fallback for callers that did not pass a header (or where
+    // some required header is missing).  This preserves the strict-greater
+    // semantics used by the older chain_sel_queue tests.
+    fn select_best_legacy(
+        fork_tips: Vec<(Hash32, BlockNo, SlotNo)>,
+        current_tip_block_no: u64,
+    ) -> Option<(Hash32, BlockNo, SlotNo)> {
+        fork_tips
+            .into_iter()
+            .filter(|(_h, bn, _slot)| bn.0 > current_tip_block_no)
+            .max_by_key(|(_h, bn, _slot)| bn.0)
+    }
+
+    let best_fork = match (prefer_praos, current_tip_header.as_ref()) {
+        (true, Some(cur_h)) => {
+            // Praos path. `select_best_praos` consults the comparator for
+            // every fork-tip whose header is cached. Returning `None` here
+            // means either:
+            //   (a) no candidate's header is cached (legacy / Byron path),
+            //       in which case we must fall back to give those callers
+            //       some chance of triggering a fork switch; OR
+            //   (b) every cached candidate was explicitly rejected by
+            //       Praos (PreferCurrent or Equal).
+            //
+            // Case (b) is safe to fall through because `select_best_legacy`
+            // is strictly weaker than Praos for the cases they both decide:
+            // any candidate Praos rejected via the EQUAL-block_no
+            // tiebreaker has bn == current_tip_block_no, which `> filter`
+            // also rejects. A candidate with bn > current_tip would have
+            // been chosen by Praos's `compare_length` (PreferCandidate),
+            // so we never reach this fallback for that case.
+            select_best_praos(fork_tips.clone(), cur_h, &db)
+                .or_else(|| select_best_legacy(fork_tips, current_tip_block_no))
+        }
+        _ => select_best_legacy(fork_tips, current_tip_block_no),
+    };
+
+    if let Some((fork_hash, fork_bn, fork_slot)) = best_fork {
+        // Haskell `truncateRejectedBlocks`: never adopt a candidate whose
+        // chain contains a known-invalid block (e.g. one that failed ledger
+        // application during a prior fork replay). Without this, a peer
+        // extending such a fork would make us re-adopt it, re-fail the
+        // replay, and roll back — an endless loop. Gated on a non-empty
+        // invalid cache, so this is a no-op during normal sync.
+        if invalid_snapshot
+            .as_ref()
+            .is_some_and(|inv| db.candidate_contains_invalid(&fork_hash, inv))
+        {
+            warn!(
+                fork_hash = %fork_hash.to_hex(),
+                fork_block_no = fork_bn.0,
+                "chain_sel: candidate fork contains a known-invalid block — \
+                 refusing to adopt (StoreButDontChange)"
+            );
+            return Some(AddBlockResult::StoredAsFork);
+        }
+
+        info!(
+            fork_hash = %fork_hash.to_hex(),
+            fork_block_no = fork_bn.0,
+            fork_slot = fork_slot.0,
+            current_tip_block_no,
+            "chain_sel: switching to longer fork"
+        );
+
+        if let Some(plan) = db.switch_to_fork(&fork_hash) {
+            return Some(AddBlockResult::TriggeredFork {
+                intersection_hash: plan.intersection,
+                intersection_slot: SlotNo(plan.intersection_slot),
+                rollback: plan.rollback,
+                apply: plan.apply,
+            });
+        }
+        // `switch_to_fork` returned None: the intersection is not
+        // reachable within the VolatileDB window.  Per Haskell
+        // `isReachable = Nothing` (`Paths.hs`), this is the
+        // `StoreButDontChange` case — the block stays in VolatileDB but
+        // no chain selection occurs.  We fall through so the caller does
+        // NOT attempt a ledger rollback; the block will re-enter chain
+        // selection later if its ancestry becomes complete.
+        warn!(
+            fork_hash = %fork_hash.to_hex(),
+            fork_block_no = fork_bn.0,
+            fork_slot = fork_slot.0,
+            current_tip_block_no,
+            "chain_sel: fork unreachable — StoreButDontChange"
+        );
+    }
+
+    None
 }
 
 /// Core processing logic for a single `AddBlock` message.
@@ -420,188 +645,11 @@ async fn process_add_block(
 
     // --- Step 4: Chain selection (Haskell `chainSelectionForBlock`) ---------
     //
-    // Per Haskell `Ouroboros.Consensus.Protocol.Praos.Common::comparePraos`:
-    //
-    // - block_no strictly greater  → switch (longest-chain rule).
-    // - block_no equal             → run Praos tiebreaker:
-    //                                  same slot + same issuer → compare OCert
-    //                                  seq number; otherwise compare VRF output
-    //                                  bytes if within RestrictedVRFTiebreaker
-    //                                  window (Conway: 5 slots), else no switch.
-    // - block_no strictly less     → no switch.
-    //
-    // dugite-consensus implements this in `ChainSelection::prefer_chain_with_headers`.
-    // We call it when ALL relevant headers (new block, current tip, candidate)
-    // are present; otherwise fall back to the legacy strict-greater rule so
-    // tests using synthetic CBOR keep their existing semantics (Bug D, #497).
-    //
-    // Fork-selection runs unconditionally so out-of-order arrivals are
-    // recovered as soon as the missing ancestor lands and a `switch_to_fork`
-    // can succeed.  When the just-added block itself extended the chain
-    // (`extended_tip == true`), `TriggeredFork.intersection_slot` will be
-    // at or AHEAD of the ledger tip — `apply_fetched_block` /
-    // `handle_ledger_rollback` already implement the
-    // "rollback target ahead of ledger → walk forward through ChainDB"
-    // path (sync.rs:303-356) so the ledger catches up to the intersection
-    // before the new fork's apply list is replayed.
-    {
-        let mut db = chain_db.write().await;
-
-        let current_tip_info = db.get_tip_info();
-        let current_tip_block_no: u64 = current_tip_info
-            .as_ref()
-            .map(|(_slot, _hash, bn)| bn.0)
-            .unwrap_or(0);
-
-        // For the Praos tiebreaker we need: (a) the current tip's BlockHeader,
-        // (b) each fork-tip's BlockHeader.  All come from the in-memory cache
-        // populated by `add_block_with_header`.
-        let current_tip_header = current_tip_info
-            .as_ref()
-            .and_then(|(_, h, _)| db.get_volatile_header(h).cloned());
-
-        let fork_tips = db.get_all_fork_tips();
-
-        // Helper: pick the best fork using the Praos comparator.  Returns the
-        // (hash, block_no, slot) of the preferred candidate, or None.
-        fn select_best_praos(
-            fork_tips: Vec<(Hash32, BlockNo, SlotNo)>,
-            current_header: &dugite_primitives::block::BlockHeader,
-            db: &ChainDB,
-        ) -> Option<(Hash32, BlockNo, SlotNo)> {
-            // Era for the slot-window decision: use the current tip's era,
-            // which always matches the candidate's era within a 5-slot
-            // tiebreaker window.
-            let era = current_header.protocol_version.era();
-            let slot_window: u64 = match era {
-                Era::Conway | Era::Dijkstra => 5, // RestrictedVRFTiebreaker 5
-                // Byron uses density not Praos; `prefer_chain_with_headers`
-                // short-circuits to `compare_density` and never consults
-                // `slot_window`. Value is irrelevant — keep `u64::MAX` for
-                // consistency with other unrestricted arms.
-                Era::Byron => u64::MAX,
-                _ => u64::MAX, // pre-Conway Praos: unrestricted
-            };
-
-            let mut sel = ChainSelection::new();
-            sel.set_tip(Tip {
-                point: Point::Specific(current_header.slot, current_header.header_hash),
-                block_number: current_header.block_number,
-            });
-
-            fork_tips
-                .into_iter()
-                .filter_map(|(h, bn, slot)| {
-                    let cand_header = db.get_volatile_header(&h)?.clone();
-                    let cand_tip = Tip {
-                        point: Point::Specific(cand_header.slot, cand_header.header_hash),
-                        block_number: cand_header.block_number,
-                    };
-                    let pref = sel.prefer_chain_with_headers(
-                        &cand_tip,
-                        current_header,
-                        &cand_header,
-                        era,
-                        slot_window,
-                    );
-                    if matches!(pref, ChainPreference::PreferCandidate) {
-                        Some((h, bn, slot))
-                    } else {
-                        None
-                    }
-                })
-                // Among preferred candidates, prefer highest block_no.
-                .max_by_key(|(_, bn, _)| bn.0)
-        }
-
-        // Legacy fallback for callers that did not pass a header (or where
-        // some required header is missing).  This preserves the strict-greater
-        // semantics used by the older chain_sel_queue tests.
-        fn select_best_legacy(
-            fork_tips: Vec<(Hash32, BlockNo, SlotNo)>,
-            current_tip_block_no: u64,
-        ) -> Option<(Hash32, BlockNo, SlotNo)> {
-            fork_tips
-                .into_iter()
-                .filter(|(_h, bn, _slot)| bn.0 > current_tip_block_no)
-                .max_by_key(|(_h, bn, _slot)| bn.0)
-        }
-
-        let best_fork = match (header, current_tip_header.as_ref()) {
-            (Some(_new_h), Some(cur_h)) => {
-                // Praos path. `select_best_praos` consults the comparator for
-                // every fork-tip whose header is cached. Returning `None` here
-                // means either:
-                //   (a) no candidate's header is cached (legacy / Byron path),
-                //       in which case we must fall back to give those callers
-                //       some chance of triggering a fork switch; OR
-                //   (b) every cached candidate was explicitly rejected by
-                //       Praos (PreferCurrent or Equal).
-                //
-                // Case (b) is safe to fall through because `select_best_legacy`
-                // is strictly weaker than Praos for the cases they both decide:
-                // any candidate Praos rejected via the EQUAL-block_no
-                // tiebreaker has bn == current_tip_block_no, which `> filter`
-                // also rejects. A candidate with bn > current_tip would have
-                // been chosen by Praos's `compare_length` (PreferCandidate),
-                // so we never reach this fallback for that case.
-                select_best_praos(fork_tips, cur_h, &db)
-                    .or_else(|| select_best_legacy(db.get_all_fork_tips(), current_tip_block_no))
-            }
-            _ => select_best_legacy(fork_tips, current_tip_block_no),
-        };
-
-        if let Some((fork_hash, fork_bn, fork_slot)) = best_fork {
-            // Haskell `truncateRejectedBlocks`: never adopt a candidate whose
-            // chain contains a known-invalid block (e.g. one that failed ledger
-            // application during a prior fork replay). Without this, a peer
-            // extending such a fork would make us re-adopt it, re-fail the
-            // replay, and roll back — an endless loop. Gated on a non-empty
-            // invalid cache, so this is a no-op during normal sync.
-            if invalid_snapshot
-                .as_ref()
-                .is_some_and(|inv| db.candidate_contains_invalid(&fork_hash, inv))
-            {
-                warn!(
-                    fork_hash = %fork_hash.to_hex(),
-                    fork_block_no = fork_bn.0,
-                    "chain_sel: candidate fork contains a known-invalid block — \
-                     refusing to adopt (StoreButDontChange)"
-                );
-                return AddBlockResult::StoredAsFork;
-            }
-
-            info!(
-                fork_hash = %fork_hash.to_hex(),
-                fork_block_no = fork_bn.0,
-                fork_slot = fork_slot.0,
-                current_tip_block_no,
-                "chain_sel: switching to longer fork"
-            );
-
-            if let Some(plan) = db.switch_to_fork(&fork_hash) {
-                return AddBlockResult::TriggeredFork {
-                    intersection_hash: plan.intersection,
-                    intersection_slot: SlotNo(plan.intersection_slot),
-                    rollback: plan.rollback,
-                    apply: plan.apply,
-                };
-            }
-            // `switch_to_fork` returned None: the intersection is not
-            // reachable within the VolatileDB window.  Per Haskell
-            // `isReachable = Nothing` (`Paths.hs`), this is the
-            // `StoreButDontChange` case — the block stays in VolatileDB but
-            // no chain selection occurs.  We fall through so the caller does
-            // NOT attempt a ledger rollback; the block will re-enter chain
-            // selection later if its ancestry becomes complete.
-            warn!(
-                fork_hash = %fork_hash.to_hex(),
-                fork_block_no = fork_bn.0,
-                fork_slot = fork_slot.0,
-                current_tip_block_no,
-                "chain_sel: fork unreachable — StoreButDontChange"
-            );
-        }
+    // Factored into `run_selection_pass` so the LoE reprocess path
+    // (`ChainSelMessage::ReprocessLoE`) can re-run selection without a new
+    // block. See that function for the full Haskell-parity notes.
+    if let Some(result) = run_selection_pass(chain_db, &invalid_snapshot, header.is_some()).await {
+        return result;
     }
 
     // If the block extended our selected_chain, surface the new tip.
@@ -683,6 +731,22 @@ impl ChainSelHandle {
         let handle = ChainSelHandle { tx, invalid_cache };
 
         (handle, runner)
+    }
+
+    /// Re-run chain selection after the Limit on Eagerness advanced
+    /// (Haskell `ChainSelReprocessLoEBlocks` / `triggerChainSelectionAsync`).
+    ///
+    /// Returns the selection outcome — `Some(TriggeredFork{..})` when a
+    /// previously-deferred candidate is now adoptable (the caller must run
+    /// the fork-switch plan), `Some(StoredAsFork)` when nothing changed,
+    /// `None` when the runner has exited.
+    pub async fn reprocess_loe(&self) -> Option<AddBlockResult> {
+        let (result_tx, result_rx) = oneshot::channel();
+        self.tx
+            .send(ChainSelMessage::ReprocessLoE { result_tx })
+            .await
+            .ok()?;
+        result_rx.await.ok()
     }
 
     /// Submit a block for chain-selection processing.
@@ -2010,5 +2074,238 @@ mod tests {
                 "strictly greater block_no MUST trigger switch under both legacy and Praos rules, got: {other:?}"
             ),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // LoE (trimToLoE) behaviour — Ouroboros Genesis
+    // -----------------------------------------------------------------------
+
+    fn h(b: u8) -> Hash32 {
+        Hash32::from_bytes([b; 32])
+    }
+
+    /// Install an LoE on the ChainDB and return the publisher.
+    async fn install_loe(
+        chain_db: &Arc<RwLock<ChainDB>>,
+        initial: dugite_consensus::loe::LoeState,
+    ) -> Arc<arc_swap::ArcSwap<dugite_consensus::loe::LoeState>> {
+        let handle = Arc::new(arc_swap::ArcSwap::from_pointee(initial));
+        chain_db.write().await.set_loe_handle(handle.clone());
+        handle
+    }
+
+    fn loe_fragment(
+        anchor: Option<(u64, u8)>,
+        entries: &[(u64, u8)],
+        k: u64,
+    ) -> dugite_consensus::loe::LoeState {
+        use dugite_consensus::loe::{LoePoint, LoeState};
+        LoeState::Fragment {
+            anchor: anchor.map(|(slot, b)| LoePoint {
+                slot,
+                hash: [b; 32],
+            }),
+            entries: entries
+                .iter()
+                .map(|(slot, b)| LoePoint {
+                    slot: *slot,
+                    hash: [*b; 32],
+                })
+                .collect(),
+            k,
+        }
+    }
+
+    #[tokio::test]
+    async fn loe_disabled_is_identity_with_praos() {
+        // Publishing LoeState::Disabled must behave exactly like no handle.
+        let dir = tempfile::tempdir().unwrap();
+        let chain_db = make_chain_db(dir.path());
+        let _loe = install_loe(&chain_db, dugite_consensus::loe::LoeState::Disabled).await;
+        let (handle, runner) = ChainSelHandle::new(Arc::clone(&chain_db));
+        let _runner_task = tokio::spawn(runner);
+
+        for i in 1..=5u8 {
+            let prev = if i == 1 { Hash32::ZERO } else { h(i - 1) };
+            let r = handle
+                .submit_block(
+                    h(i),
+                    SlotNo(i as u64 * 10),
+                    BlockNo(i as u64),
+                    prev,
+                    vec![i],
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(r, AddBlockResult::AddedAsTip { .. }),
+                "Disabled LoE must not defer extensions (block {i}): {r:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn loe_defers_extension_beyond_k_then_adopts_on_advance() {
+        // LoE = empty fragment at Origin, k = 2: blocks 1,2 adopt; block 3
+        // is stored-not-adopted (deferred). When the LoE advances to cover
+        // block 1, ReprocessLoE adopts block 3 (depth from new tip = 2 ≤ k).
+        let dir = tempfile::tempdir().unwrap();
+        let chain_db = make_chain_db(dir.path());
+        let loe = install_loe(&chain_db, loe_fragment(None, &[], 2)).await;
+        let (handle, runner) = ChainSelHandle::new(Arc::clone(&chain_db));
+        let _runner_task = tokio::spawn(runner);
+
+        let r1 = handle
+            .submit_block(h(1), SlotNo(10), BlockNo(1), Hash32::ZERO, vec![1])
+            .await
+            .unwrap();
+        assert!(matches!(r1, AddBlockResult::AddedAsTip { .. }), "{r1:?}");
+        let r2 = handle
+            .submit_block(h(2), SlotNo(20), BlockNo(2), h(1), vec![2])
+            .await
+            .unwrap();
+        assert!(matches!(r2, AddBlockResult::AddedAsTip { .. }), "{r2:?}");
+
+        // Depth 3 past the LoE tip (Origin) → deferred.
+        let r3 = handle
+            .submit_block(h(3), SlotNo(30), BlockNo(3), h(2), vec![3])
+            .await
+            .unwrap();
+        assert_eq!(
+            r3,
+            AddBlockResult::StoredAsFork,
+            "extension beyond k past the LoE tip must be deferred"
+        );
+        // Selection unchanged.
+        assert_eq!(
+            chain_db.read().await.get_tip_info().map(|(_, h_, _)| h_),
+            Some(h(2))
+        );
+
+        // LoE advances: tip = block 1 → block 3 is now depth 2 ≤ k.
+        loe.store(Arc::new(loe_fragment(None, &[(10, 1)], 2)));
+        let r = handle.reprocess_loe().await.unwrap();
+        match r {
+            AddBlockResult::TriggeredFork { apply, .. } => {
+                assert_eq!(apply, vec![h(3)], "deferred block adopted on LoE advance");
+            }
+            other => panic!("expected TriggeredFork, got {other:?}"),
+        }
+        assert_eq!(
+            chain_db.read().await.get_tip_info().map(|(_, h_, _)| h_),
+            Some(h(3))
+        );
+    }
+
+    #[tokio::test]
+    async fn loe_rejects_fork_diverging_below_its_tip() {
+        // Selection a1,a2 with LoE fragment [a1,a2] (the peers' common
+        // prefix). A higher-block_no fork c2 child of a1 diverges from the
+        // fragment BELOW its tip → candPrefix case → never adopted while the
+        // LoE says peers agree on a2.
+        let dir = tempfile::tempdir().unwrap();
+        let chain_db = make_chain_db(dir.path());
+        let loe = install_loe(&chain_db, loe_fragment(None, &[(10, 1), (20, 2)], 10)).await;
+        let (handle, runner) = ChainSelHandle::new(Arc::clone(&chain_db));
+        let _runner_task = tokio::spawn(runner);
+
+        handle
+            .submit_block(h(1), SlotNo(10), BlockNo(1), Hash32::ZERO, vec![1])
+            .await
+            .unwrap();
+        handle
+            .submit_block(h(2), SlotNo(20), BlockNo(2), h(1), vec![2])
+            .await
+            .unwrap();
+
+        // Competing fork: c3 (block_no 3!) child of a1 — longer than the
+        // selection but diverging from the LoE fragment below its tip.
+        let r = handle
+            .submit_block(h(0xC3), SlotNo(25), BlockNo(3), h(1), vec![3])
+            .await
+            .unwrap();
+        assert_eq!(r, AddBlockResult::StoredAsFork, "divergent fork deferred");
+        assert_eq!(
+            chain_db.read().await.get_tip_info().map(|(_, h_, _)| h_),
+            Some(h(2)),
+            "selection must hold while the LoE covers the honest chain"
+        );
+
+        // The peers switch: the LoE fragment now ends at a1 (the fork point).
+        // The deferred fork (1 block past the new LoE tip) becomes adoptable.
+        loe.store(Arc::new(loe_fragment(None, &[(10, 1)], 10)));
+        let r = handle.reprocess_loe().await.unwrap();
+        match r {
+            AddBlockResult::TriggeredFork {
+                apply, rollback, ..
+            } => {
+                assert_eq!(apply, vec![h(0xC3)]);
+                assert_eq!(rollback, vec![h(2)], "a2 rolled back");
+            }
+            other => panic!("expected TriggeredFork, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn loe_trims_overlong_candidate_to_k_past_tip() {
+        // k = 2, LoE tip = block 1. A 5-block chain is stored; selection may
+        // only advance to block 3 (= LoE tip + k). After the LoE advances to
+        // block 3, the rest follows.
+        let dir = tempfile::tempdir().unwrap();
+        let chain_db = make_chain_db(dir.path());
+        let loe = install_loe(&chain_db, loe_fragment(None, &[(10, 1)], 2)).await;
+        let (handle, runner) = ChainSelHandle::new(Arc::clone(&chain_db));
+        let _runner_task = tokio::spawn(runner);
+
+        // b1..b2 extend within k of the tip; b3 hits depth 2 (allowed);
+        // b4, b5 deferred.
+        for i in 1..=5u8 {
+            let prev = if i == 1 { Hash32::ZERO } else { h(i - 1) };
+            let _ = handle
+                .submit_block(
+                    h(i),
+                    SlotNo(i as u64 * 10),
+                    BlockNo(i as u64),
+                    prev,
+                    vec![i],
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            chain_db.read().await.get_tip_info().map(|(_, h_, _)| h_),
+            Some(h(3)),
+            "selection holds at LoE tip + k"
+        );
+
+        // LoE advances to block 3 → the stored suffix (b4, b5) is adoptable:
+        // the candidate b5 is depth 2 ≤ k past the new tip.
+        loe.store(Arc::new(loe_fragment(
+            None,
+            &[(10, 1), (20, 2), (30, 3)],
+            2,
+        )));
+        let r = handle.reprocess_loe().await.unwrap();
+        match r {
+            AddBlockResult::TriggeredFork { apply, .. } => {
+                assert_eq!(apply, vec![h(4), h(5)]);
+            }
+            other => panic!("expected TriggeredFork, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn loe_reprocess_noop_when_nothing_deferred() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain_db = make_chain_db(dir.path());
+        let _loe = install_loe(&chain_db, loe_fragment(None, &[], 10)).await;
+        let (handle, runner) = ChainSelHandle::new(Arc::clone(&chain_db));
+        let _runner_task = tokio::spawn(runner);
+        handle
+            .submit_block(h(1), SlotNo(10), BlockNo(1), Hash32::ZERO, vec![1])
+            .await
+            .unwrap();
+        let r = handle.reprocess_loe().await.unwrap();
+        assert_eq!(r, AddBlockResult::StoredAsFork, "no-op reprocess");
     }
 }

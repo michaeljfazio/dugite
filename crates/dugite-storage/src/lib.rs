@@ -5,6 +5,7 @@ pub mod chain_sel_queue;
 pub(crate) mod chunk_reader;
 pub mod config;
 pub mod immutable_db;
+pub mod loe_trim;
 pub mod volatile_db;
 
 pub use chain_db::ChainDB;
