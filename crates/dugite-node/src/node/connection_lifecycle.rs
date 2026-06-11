@@ -2037,6 +2037,53 @@ impl ConnectionLifecycleManager {
                                 continue;
                             }
 
+                            // #735: Genesis gross-request invariant (Haskell
+                            // `selectThePeer` / `requestHeadInCandidate`):
+                            // only dispatch a range that contiguously extends
+                            // the known chain. After a CSJ jump a promoted
+                            // peer's pending headers may start far above the
+                            // frontier; fetching them would store unreachable
+                            // far-ahead blocks (`fork unreachable`) and strand
+                            // the single fetcher slot on a range chain-sel can
+                            // never adopt. Shelley+ headers carry prev_hash —
+                            // require the FIRST block of the range to connect
+                            // to a stored block. Byron headers (rejected by
+                            // the wrapped-header decoder) skip the check: the
+                            // CSJ promotion re-intersection in `sync.rs`
+                            // guarantees contiguity at the source for all
+                            // eras; this guard is defense-in-depth.
+                            if let Some(first) = headers_to_fetch.first() {
+                                if let Ok(hdr) =
+                                    dugite_serialization::decode_wrapped_block_header(
+                                        &first.header_cbor,
+                                    )
+                                {
+                                    let prev = hdr.prev_hash;
+                                    // Accept a parent this worker already
+                                    // fetched even if the apply pipeline has
+                                    // not stored it yet (channel lag) — the
+                                    // contiguous chain is in flight, not
+                                    // missing.
+                                    let connects = fetched_hashes.contains(prev.as_bytes()) || {
+                                        let cdb = chain_db.read().await;
+                                        cdb.has_block(&prev)
+                                    };
+                                    if !connects {
+                                        debug!(
+                                            %addr,
+                                            first_slot = first.slot,
+                                            prev = %prev.to_hex(),
+                                            "BlockFetch: declining far-ahead range — \
+                                             first block does not extend a stored block \
+                                             (gross-request invariant, #735)"
+                                        );
+                                        active_fetcher
+                                            .store(0, std::sync::atomic::Ordering::SeqCst);
+                                        continue;
+                                    }
+                                }
+                            }
+
                             info!(
                                 %addr,
                                 count = headers_to_fetch.len(),
