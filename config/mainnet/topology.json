@@ -29,5 +29,6 @@
       "advertise": false
     }
   ],
-  "useLedgerAfterSlot": 0
+  "useLedgerAfterSlot": 0,
+  "peerSnapshotFile": "peer-snapshot.json"
 }
