@@ -396,6 +396,71 @@ pub struct PendingHeader {
     pub hash: [u8; 32],
     /// Raw CBOR-encoded header bytes (for header validation before fetch).
     pub header_cbor: Vec<u8>,
+    /// Block body size DECLARED in the header (Shelley+ `block_body_size`).
+    ///
+    /// `None` for Byron headers (no size field) or undecodable headers.
+    /// Used for EXACT in-flight byte accounting when batching BlockFetch
+    /// ranges — Haskell's `blockFetchSize` analogue (#747: an average-based
+    /// estimate let nominal 8 MB ranges deliver 2×+ actual bytes and overrun
+    /// the mux ingress queue).
+    pub body_size: Option<u64>,
+}
+
+/// Estimated wire bytes a fetched block will occupy in the mux ingress
+/// queue: declared body size + the header itself + per-`MsgBlock` framing.
+/// Falls back to `avg_block_bytes` when the header does not declare a size
+/// (Byron).
+fn estimated_block_wire_bytes(h: &PendingHeader, avg_block_bytes: usize) -> usize {
+    match h.body_size {
+        Some(b) => (b as usize)
+            .saturating_add(h.header_cbor.len())
+            .saturating_add(16),
+        None => avg_block_bytes,
+    }
+}
+
+/// Chunk `headers` into consecutive index ranges `[start, end]` such that the
+/// ESTIMATED wire bytes per range stay within `BLOCKFETCH_RANGE_BYTE_BUDGET`
+/// (computed from header-declared body sizes — exact for Shelley+; average
+/// fallback for Byron), with at least one header and at most `max_range`
+/// headers per range.
+///
+/// This is the #747 ingress-invariant companion: with per-range actual bytes
+/// bounded by `budget + one max-size block`, the pipelined worst case is
+/// `BLOCKFETCH_PIPELINE_WINDOW × (budget + max_block)` ≈ 16.2 MB — safely
+/// inside the 32 MB mux ingress limit regardless of how slowly the apply
+/// side drains. The previous block-COUNT chunking (`budget / avg`) bounded
+/// only an estimate: a burst of blocks ~2× the running average delivered
+/// ~33.5 MB against the 32 MB limit and silently killed the connection
+/// (observed live, mainnet ep388, 2026-06-11T22:30Z).
+pub(crate) fn build_fetch_ranges(
+    headers: &[PendingHeader],
+    avg_block_bytes: usize,
+    max_range: usize,
+) -> Vec<(usize, usize)> {
+    let avg = avg_block_bytes.max(1);
+    let max_range = max_range.max(1);
+    let mut result = Vec::new();
+    let mut start = 0usize;
+    let mut bytes = 0usize;
+    for (i, h) in headers.iter().enumerate() {
+        let est = estimated_block_wire_bytes(h, avg);
+        let count = i - start;
+        // Close the current range BEFORE adding this header when either
+        // bound would be exceeded (but never produce an empty range).
+        if count > 0
+            && (bytes.saturating_add(est) > BLOCKFETCH_RANGE_BYTE_BUDGET || count >= max_range)
+        {
+            result.push((start, i - 1));
+            start = i;
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(est);
+    }
+    if start < headers.len() {
+        result.push((start, headers.len() - 1));
+    }
+    result
 }
 
 /// Select pending headers that still need to be fetched from a peer.
@@ -2292,36 +2357,33 @@ impl ConnectionLifecycleManager {
                             // Batch headers into ranges for efficient fetching.
                             // A single MsgRequestRange(from, to) fetches all blocks
                             // between two points, avoiding per-block round-trips.
-                            // Adaptive range size: byte budget / running average
-                            // block size, clamped to [MIN, MAX].  Large for tiny
-                            // Byron blocks (→ protocol cap), small for big Conway
-                            // blocks — bounding the per-range decode buffer.
-                            let range_size = (BLOCKFETCH_RANGE_BYTE_BUDGET
-                                / avg_block_bytes.max(1))
-                            .clamp(BLOCKFETCH_MIN_RANGE, max_range);
-                            let ranges: Vec<(CodecPoint, CodecPoint)> = {
-                                let mut result = Vec::new();
-                                let mut i = 0;
-                                while i < headers_to_fetch.len() {
-                                    let start = i;
-                                    // Batch up to `range_size` consecutive headers
-                                    // per range to amortise the per-range request
-                                    // round-trip across many blocks.
-                                    let end =
-                                        (i + range_size).min(headers_to_fetch.len()) - 1;
-                                    let from = CodecPoint::Specific(
-                                        headers_to_fetch[start].slot,
-                                        headers_to_fetch[start].hash,
-                                    );
-                                    let to = CodecPoint::Specific(
-                                        headers_to_fetch[end].slot,
-                                        headers_to_fetch[end].hash,
-                                    );
-                                    result.push((from, to));
-                                    i = end + 1;
-                                }
-                                result
-                            };
+                            // Ranges are chunked by EXACT header-declared body
+                            // sizes (Haskell `blockFetchSize` analogue) so each
+                            // range's actual wire bytes stay within the 8 MB
+                            // budget — the #747 ingress invariant holds against
+                            // real bytes, not an average estimate. Byron headers
+                            // (no declared size) fall back to the adaptive
+                            // average.
+                            let ranges: Vec<(CodecPoint, CodecPoint)> =
+                                build_fetch_ranges(
+                                    &headers_to_fetch,
+                                    avg_block_bytes,
+                                    max_range,
+                                )
+                                .into_iter()
+                                .map(|(start, end)| {
+                                    (
+                                        CodecPoint::Specific(
+                                            headers_to_fetch[start].slot,
+                                            headers_to_fetch[start].hash,
+                                        ),
+                                        CodecPoint::Specific(
+                                            headers_to_fetch[end].slot,
+                                            headers_to_fetch[end].hash,
+                                        ),
+                                    )
+                                })
+                                .collect();
 
                             debug!(%addr, ranges = ranges.len(), headers = headers_to_fetch.len(), "BlockFetch: fetching in batched ranges");
 
@@ -3485,6 +3547,7 @@ mod tests {
                 slot: 12345,
                 hash: [0xAB; 32],
                 header_cbor: vec![0x82, 0x01],
+                body_size: None,
             }],
             ..Default::default()
         };
@@ -3517,18 +3580,21 @@ mod tests {
                 slot: 99,
                 hash: [0x02; 32],
                 header_cbor: vec![],
+                body_size: None,
             },
             // Already in ChainDB — must be skipped.
             PendingHeader {
                 slot: 50,
                 hash: [0x01; 32],
                 header_cbor: vec![],
+                body_size: None,
             },
             // Above applied_slot — must be fetched.
             PendingHeader {
                 slot: 101,
                 hash: [0x03; 32],
                 header_cbor: vec![],
+                body_size: None,
             },
         ];
         let _ = applied_slot; // documents the scenario; not used in filter
@@ -3568,11 +3634,13 @@ mod tests {
                 slot: 10,
                 hash: [0xAA; 32],
                 header_cbor: vec![],
+                body_size: None,
             }, // in-flight
             PendingHeader {
                 slot: 11,
                 hash: [0xBB; 32],
                 header_cbor: vec![],
+                body_size: None,
             }, // new
         ];
 
@@ -3614,26 +3682,31 @@ mod tests {
                 slot: 10,
                 hash: h1,
                 header_cbor: vec![],
+                body_size: None,
             },
             PendingHeader {
                 slot: 11,
                 hash: h2,
                 header_cbor: vec![],
+                body_size: None,
             },
             PendingHeader {
                 slot: 12,
                 hash: h3,
                 header_cbor: vec![],
+                body_size: None,
             },
             PendingHeader {
                 slot: 13,
                 hash: h4,
                 header_cbor: vec![],
+                body_size: None,
             },
             PendingHeader {
                 slot: 14,
                 hash: h5,
                 header_cbor: vec![],
+                body_size: None,
             },
         ];
         let known: HashSet<[u8; 32]> = HashSet::new();
@@ -3687,16 +3760,19 @@ mod tests {
                 slot: 10,
                 hash: h1,
                 header_cbor: vec![],
+                body_size: None,
             },
             PendingHeader {
                 slot: 11,
                 hash: h2,
                 header_cbor: vec![],
+                body_size: None,
             },
             PendingHeader {
                 slot: 12,
                 hash: h3,
                 header_cbor: vec![],
+                body_size: None,
             },
         ];
         let known: HashSet<[u8; 32]> = HashSet::new();
@@ -3760,6 +3836,7 @@ mod tests {
             slot: 999,
             hash: [0xFF; 32],
             header_cbor: vec![0x83, 0x01, 0x02],
+            body_size: None,
         };
         assert_eq!(hdr.slot, 999);
         assert_eq!(hdr.header_cbor.len(), 3);
@@ -4233,11 +4310,13 @@ mod tests {
                 slot: 1,
                 hash: known_hash,
                 header_cbor: vec![],
+                body_size: None,
             },
             PendingHeader {
                 slot: 2,
                 hash: [0xCD; 32],
                 header_cbor: vec![],
+                body_size: None,
             },
         ];
         let out = select_headers_to_fetch(&pending, |h| h == &known_hash, &HashSet::new());
@@ -4258,6 +4337,7 @@ mod tests {
                 slot: 9999,
                 hash: [0x77; 32],
                 header_cbor: vec![0x01, 0x02],
+                body_size: None,
             }],
             ..Default::default()
         };
@@ -4984,6 +5064,7 @@ mod tests {
                     slot: 1,
                     hash: [0x01; 32],
                     header_cbor: vec![],
+                    body_size: None,
                 });
                 s
             });
@@ -5065,11 +5146,13 @@ mod tests {
                     slot: 1,
                     hash: [0x02; 32],
                     header_cbor: vec![],
+                    body_size: None,
                 });
                 s.pending_headers.push(PendingHeader {
                     slot: 2,
                     hash: [0x03; 32],
                     header_cbor: vec![],
+                    body_size: None,
                 });
                 s
             });
@@ -5566,6 +5649,114 @@ mod fix2_starvation_detection_tests {
 mod fix3_blockfetch_ingress_tests {
     use super::*;
 
+    fn hdr(slot: u64, body_size: Option<u64>) -> PendingHeader {
+        PendingHeader {
+            slot,
+            hash: [slot as u8; 32],
+            header_cbor: vec![0u8; 1_000],
+            body_size,
+        }
+    }
+
+    /// Ranges chunk by EXACT declared bytes: 90,112-byte blocks (mainnet max)
+    /// must yield ranges whose actual byte total stays within the 8 MB budget
+    /// — the failure mode that overran the 32 MB ingress live (33.5 MB from
+    /// 2 nominal 8 MB ranges, mainnet ep388 2026-06-11T22:30Z) cannot recur
+    /// for size-declaring headers.
+    #[test]
+    fn ranges_chunk_by_declared_bytes() {
+        let headers: Vec<_> = (0..1_000).map(|i| hdr(i, Some(90_112))).collect();
+        let ranges = build_fetch_ranges(&headers, 65_536, BLOCKFETCH_MAX_RANGE);
+        assert!(!ranges.is_empty());
+        let per_block = 90_112 + 1_000 + 16;
+        for &(start, end) in &ranges {
+            let bytes = (end - start + 1) * per_block;
+            assert!(
+                bytes <= BLOCKFETCH_RANGE_BYTE_BUDGET || start == end,
+                "range [{start},{end}] = {bytes} bytes exceeds the 8 MB budget"
+            );
+        }
+        // Coverage: consecutive, gapless, complete.
+        assert_eq!(ranges.first().unwrap().0, 0);
+        assert_eq!(ranges.last().unwrap().1, headers.len() - 1);
+        for w in ranges.windows(2) {
+            assert_eq!(w[0].1 + 1, w[1].0, "ranges must be consecutive");
+        }
+        // 8 MB / ~91 KB ≈ 92 blocks per range — NOT the old avg-based 128.
+        let first_len = ranges[0].1 - ranges[0].0 + 1;
+        assert!(
+            (80..=95).contains(&first_len),
+            "expected ~92 blocks per range for 90,112-byte blocks, got {first_len}"
+        );
+    }
+
+    /// Headers without a declared size (Byron) fall back to the adaptive
+    /// average estimate.
+    #[test]
+    fn ranges_fall_back_to_avg_for_undeclared() {
+        let headers: Vec<_> = (0..3_000).map(|i| hdr(i, None)).collect();
+        let ranges = build_fetch_ranges(&headers, 4_096, BLOCKFETCH_MAX_RANGE);
+        // 8 MB / 4 KB = 2048 estimated blocks per range, capped by max_range.
+        let first_len = ranges[0].1 - ranges[0].0 + 1;
+        assert_eq!(
+            first_len,
+            BLOCKFETCH_MAX_RANGE.min(BLOCKFETCH_RANGE_BYTE_BUDGET / 4_096),
+            "avg-based fallback sizing changed unexpectedly"
+        );
+    }
+
+    /// A single block whose declared size exceeds the whole budget gets its
+    /// own range (never an empty range, never a stall).
+    #[test]
+    fn oversized_block_gets_own_range() {
+        let headers = vec![
+            hdr(0, Some(1_000)),
+            hdr(1, Some(BLOCKFETCH_RANGE_BYTE_BUDGET as u64 * 2)),
+            hdr(2, Some(1_000)),
+        ];
+        let ranges = build_fetch_ranges(&headers, 65_536, BLOCKFETCH_MAX_RANGE);
+        assert_eq!(ranges, vec![(0, 0), (1, 1), (2, 2)]);
+    }
+
+    /// max_range caps the per-range block count even when bytes allow more.
+    #[test]
+    fn max_range_caps_block_count() {
+        let headers: Vec<_> = (0..100).map(|i| hdr(i, Some(100))).collect();
+        let ranges = build_fetch_ranges(&headers, 65_536, 10);
+        assert_eq!(ranges.len(), 10);
+        for &(start, end) in &ranges {
+            assert_eq!(end - start + 1, 10);
+        }
+    }
+
+    /// Empty input produces no ranges.
+    #[test]
+    fn empty_headers_no_ranges() {
+        assert!(build_fetch_ranges(&[], 65_536, BLOCKFETCH_MAX_RANGE).is_empty());
+    }
+
+    /// Mixed declared sizes: a burst of large blocks among small ones closes
+    /// ranges early so the byte bound holds for every range.
+    #[test]
+    fn mixed_sizes_hold_byte_bound() {
+        let mut headers = Vec::new();
+        for i in 0..500 {
+            let size = if i % 7 == 0 { 88_000 } else { 2_000 };
+            headers.push(hdr(i, Some(size)));
+        }
+        let ranges = build_fetch_ranges(&headers, 65_536, BLOCKFETCH_MAX_RANGE);
+        for &(start, end) in &ranges {
+            let bytes: usize = headers[start..=end]
+                .iter()
+                .map(|h| h.body_size.unwrap() as usize + 1_000 + 16)
+                .sum();
+            assert!(
+                bytes <= BLOCKFETCH_RANGE_BYTE_BUDGET || start == end,
+                "range [{start},{end}] = {bytes} bytes exceeds budget"
+            );
+        }
+    }
+
     /// The pipeline-window constant must be 2 after the #747 fix.
     /// Window 4 × 8 MB = 32 MB would overflow a 24 MB ingress limit.
     #[test]
@@ -5618,6 +5809,7 @@ mod fix3_blockfetch_ingress_tests {
                     slot: i as u64,
                     hash,
                     header_cbor: vec![],
+                    body_size: None,
                 }
             })
             .collect();
