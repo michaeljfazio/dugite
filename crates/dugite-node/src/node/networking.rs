@@ -895,15 +895,38 @@ impl NodePeerManager {
         if local_roots.is_empty() {
             return false;
         }
-        let hot = self.inner.peers_in_state(PeerState::Hot);
-        if hot.is_empty() {
-            // Haskell requires at least one ACTIVE (hot) peer.
+        // Haskell `outboundConnectionsState` assesses only OUTBOUND-initiated
+        // connections — peers that connect TO us (inbound) are not part of
+        // the honest-availability assessment of our own chain. Without this
+        // restriction an inbound peer (e.g. a downstream node) flaps the HAA.
+        let is_outbound = |a: &SocketAddr| {
+            matches!(
+                self.conn_states.get(a),
+                Some(
+                    ConnectionState::OutboundIdle(_)
+                        | ConnectionState::OutboundUni
+                        | ConnectionState::OutboundDup
+                        | ConnectionState::DuplexConn
+                )
+            )
+        };
+        // At least one ACTIVE (hot) outbound trusted local root.
+        let any_hot_root = self
+            .inner
+            .peers_in_state(PeerState::Hot)
+            .into_iter()
+            .any(|a| is_outbound(&a) && local_roots.contains(&a));
+        if !any_hot_root {
             return false;
         }
-        // Every ESTABLISHED (warm + hot) peer must be a trusted local root.
+        // Every OUTBOUND established (warm + hot) peer must be a trusted
+        // local root.
         let mut established = self.inner.peers_in_state(PeerState::Warm);
-        established.extend(hot);
-        established.iter().all(|a| local_roots.contains(a))
+        established.extend(self.inner.peers_in_state(PeerState::Hot));
+        established
+            .iter()
+            .filter(|a| is_outbound(a))
+            .all(|a| local_roots.contains(a))
     }
 
     /// Get connected peer addresses.
@@ -1044,12 +1067,40 @@ mod tests {
         });
         // Not established yet → HAA not satisfied (no BLPs, no hot peer).
         assert!(!pm.haa_satisfied(5));
-        // Warm only → still not satisfied (Haskell needs an ACTIVE peer).
-        pm.inner.promote_to_warm(&root);
+        // Warm outbound only → still not satisfied (Haskell needs an ACTIVE peer).
+        pm.peer_connected(&root, ConnectionDirection::Outbound);
         assert!(!pm.haa_satisfied(5));
-        // Hot trusted local root → HAA satisfied.
+        // Hot OUTBOUND trusted local root → HAA satisfied.
         pm.inner.promote_to_hot(&root);
         assert!(pm.haa_satisfied(5));
+    }
+
+    #[test]
+    fn test_haa_ignores_inbound_peers() {
+        // An INBOUND connection (a downstream node connecting to us) must not
+        // affect the HAA — Haskell's outboundConnectionsState assesses only
+        // outbound peers. Otherwise a relay's inbound downstream flaps the HAA.
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        let root: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+        let downstream: SocketAddr = "127.0.0.1:3003".parse().unwrap();
+        pm.add_local_root_group(LocalRootGroupInfo {
+            name: "upstream".into(),
+            addrs: vec![root],
+            hot_valency: 1,
+            warm_valency: 1,
+            diffusion_mode: None,
+            behind_firewall: false,
+            advertise: false,
+        });
+        pm.peer_connected(&root, ConnectionDirection::Outbound);
+        pm.inner.promote_to_hot(&root);
+        // A non-local-root INBOUND peer is established but must be ignored.
+        pm.peer_connected(&downstream, ConnectionDirection::Inbound);
+        pm.inner.promote_to_hot(&downstream);
+        assert!(
+            pm.haa_satisfied(5),
+            "inbound downstream must not break the HAA"
+        );
     }
 
     #[test]
@@ -1069,13 +1120,14 @@ mod tests {
             behind_firewall: false,
             advertise: false,
         });
-        pm.add_config_peer(public);
+        pm.peer_connected(&public, ConnectionDirection::Outbound);
         pm.inner.promote_to_hot(&public);
-        // Established set includes a non-local-root hot peer → not all trusted.
+        // OUTBOUND established set includes a non-local-root hot peer → not all
+        // trusted, and the hot peer is not a local root → not satisfied.
         assert!(!pm.haa_satisfied(5));
         // No local roots at all → never satisfied via that path.
         let mut pm2 = NodePeerManager::new(PeerManagerConfig::default());
-        pm2.add_config_peer(public);
+        pm2.peer_connected(&public, ConnectionDirection::Outbound);
         pm2.inner.promote_to_hot(&public);
         assert!(!pm2.haa_satisfied(5));
     }
