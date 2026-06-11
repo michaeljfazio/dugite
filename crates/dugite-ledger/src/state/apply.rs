@@ -44,6 +44,21 @@ use tracing::{debug, trace, warn};
 /// limit is rejected with [`LedgerError::BlockTxValidationFailed`].
 const MAX_REF_SCRIPT_SIZE_PER_TX: u64 = 200 * 1024; // 200 KiB
 
+/// Whether a phase-2 collection error (Haskell `UtxosFailure CollectErrors`)
+/// is BLOCK-FATAL at apply (#733). Default true — the Haskell-faithful
+/// behaviour for Babbage+ blocks. `DUGITE_PHASE2_APPLY_FATAL=0` reverts to
+/// warn-and-trust as an operational escape hatch (e.g. to keep syncing past
+/// a suspected false fatality while it is reported). Read once per process
+/// for determinism.
+fn phase2_collect_fatal_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("DUGITE_PHASE2_APPLY_FATAL")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true)
+    })
+}
+
 impl LedgerState {
     /// Build a read-only rule context for era rule dispatch.
     ///
@@ -99,6 +114,28 @@ impl LedgerState {
             hash = %block.header.header_hash.to_hex(),
             "Ledger: applying block"
         );
+
+        // #733: consume the one-shot apply-time phase-2 horizon set by the
+        // async caller at the PRE-block ledger tip (corrections 5/6 — a
+        // deterministic per-block snapshot, never a `try_read` inside
+        // apply). Taken unconditionally so a stale value can never leak
+        // into a later block. Alonzo gate (correction 2): Haskell's Alonzo
+        // UTXOS translates time via the linearly-extended EpochInfo and
+        // filters `BadTranslation` out of CollectErrors
+        // (`isNotBadTranslation`, Alonzo/Rules/Utxos.hs) — past-horizon is
+        // structurally non-fatal there, so the horizon only arms for
+        // Babbage+ blocks.
+        let phase2_horizon = self.phase2_apply_horizon.take();
+        let phase2_slot_config = {
+            let mut sc = self.slot_config;
+            sc.safe_zone_horizon_slot = if block.era >= Era::Babbage {
+                phase2_horizon
+            } else {
+                None
+            };
+            sc
+        };
+        let _ = &phase2_slot_config; // used by the ValidateAll tx loop below
 
         // ── Step 1: Verify block connects to current tip ──────────────────
         //
@@ -983,13 +1020,16 @@ impl LedgerState {
                         None
                     };
                     // ctx is consumed (and all per-tx Arc clones dropped) here:
+                    // `phase2_slot_config` carries the #733 apply horizon —
+                    // inert in parallel builds (phase-2 deferred), live for
+                    // the sequential fallback.
                     let result = crate::validation::validate_transaction_with_context(
                         tx,
                         &self.utxo.utxo_set,
                         &self.epochs.protocol_params,
                         block.slot().0,
                         tx_size,
-                        Some(&self.slot_config),
+                        Some(&phase2_slot_config),
                         ctx,
                     );
                     if let Some(start) = validate_start {
@@ -1032,6 +1072,37 @@ impl LedgerState {
                                      inserted by best-effort apply"
                                 );
                             } else {
+                                // #733 (sequential builds): a phase-2
+                                // collection error from the inline eval is
+                                // block-fatal in Babbage+ unless any input
+                                // failed to resolve (UTxO-gap carve-out).
+                                // Parallel builds surface this via the
+                                // Step 8d outcomes instead (phase-2 was
+                                // skipped here).
+                                let has_collect = errors
+                                    .iter()
+                                    .any(|e| matches!(e, ValidationError::Phase2CollectError(_)));
+                                let has_utxo_gap = errors.iter().any(|e| {
+                                    matches!(
+                                        e,
+                                        ValidationError::InputNotFound(_)
+                                            | ValidationError::CollateralNotFound(_)
+                                            | ValidationError::ReferenceInputNotFound(_)
+                                    )
+                                });
+                                if has_collect
+                                    && !has_utxo_gap
+                                    && block.era >= Era::Babbage
+                                    && phase2_collect_fatal_enabled()
+                                {
+                                    let err_str: Vec<String> =
+                                        errors.iter().map(|e| e.to_string()).collect();
+                                    return Err(LedgerError::Phase2CollectErrors {
+                                        slot: block.slot().0,
+                                        tx_hash: tx.hash.to_hex(),
+                                        error: err_str.join("; "),
+                                    });
+                                }
                                 let err_str: Vec<String> =
                                     errors.iter().map(|e| e.to_string()).collect();
                                 warn!(
@@ -1069,7 +1140,7 @@ impl LedgerState {
                             &self.utxo.utxo_set,
                             cost_models_cbor.clone(),
                             max_ex,
-                            self.slot_config,
+                            phase2_slot_config,
                             self.epochs.protocol_params.protocol_version_major as u32,
                         ));
                     }
@@ -1090,7 +1161,7 @@ impl LedgerState {
                             &self.utxo.utxo_set,
                             cost_models_cbor.clone(),
                             max_ex,
-                            self.slot_config,
+                            phase2_slot_config,
                             self.epochs.protocol_params.protocol_version_major as u32,
                         ));
                     }
@@ -1106,24 +1177,59 @@ impl LedgerState {
                             &self.utxo.utxo_set,
                             cost_models_cbor.as_deref(),
                             max_ex,
-                            &self.slot_config,
+                            &phase2_slot_config,
                             self.epochs.protocol_params.protocol_version_major as u32,
                         );
-                        if eval_result.is_ok() {
-                            // Phase-2 divergence on a confirmed block: the
-                            // on-chain is_valid=false flag is consensus truth
-                            // (see the parallel branch in Step 8d for the full
-                            // rationale). Trust it, log, and fall through to
-                            // Step 8b which applies the tx as invalid — keeping
-                            // the ledger state byte-exact — instead of halting
-                            // the sync.
-                            warn!(
-                                tx_hash = %tx.hash.to_hex(),
-                                slot = block.slot().0,
-                                "Plutus evaluation divergence: uplc says scripts PASS but block \
-                                 is_valid=false on-chain — trusting on-chain consensus (tx applied \
-                                 as invalid; dugite CEK over-permissive)"
-                            );
+                        match &eval_result {
+                            Ok(()) => {
+                                // Phase-2 divergence on a confirmed block: the
+                                // on-chain is_valid=false flag is consensus truth
+                                // (see the parallel branch in Step 8d for the full
+                                // rationale). Trust it, log, and fall through to
+                                // Step 8b which applies the tx as invalid — keeping
+                                // the ledger state byte-exact — instead of halting
+                                // the sync.
+                                warn!(
+                                    tx_hash = %tx.hash.to_hex(),
+                                    slot = block.slot().0,
+                                    "Plutus evaluation divergence: uplc says scripts PASS but block \
+                                     is_valid=false on-chain — trusting on-chain consensus (tx applied \
+                                     as invalid; dugite CEK over-permissive)"
+                                );
+                            }
+                            Err(e)
+                                if e.is_collect_error()
+                                    && block.era >= Era::Babbage
+                                    && phase2_collect_fatal_enabled() =>
+                            {
+                                // #733: CollectErrors reject the block
+                                // regardless of the is_valid tag — Haskell
+                                // never reaches script evaluation. UTxO-gap
+                                // carve-out: only fatal when every input
+                                // resolved.
+                                let attempted = tx.body.inputs.len()
+                                    + tx.body.reference_inputs.len()
+                                    + tx.body.collateral.len();
+                                let resolved = crate::plutus::resolve_phase2_utxo_pairs(
+                                    tx,
+                                    &self.utxo.utxo_set,
+                                )
+                                .len();
+                                if resolved == attempted {
+                                    return Err(LedgerError::Phase2CollectErrors {
+                                        slot: block.slot().0,
+                                        tx_hash: tx.hash.to_hex(),
+                                        error: e.to_string(),
+                                    });
+                                }
+                            }
+                            Err(_) => {
+                                // Genuine script failure (legitimate
+                                // is_valid=false path) or CEK panic
+                                // (warn-and-trust at apply, #733
+                                // correction 3) — collateral consumption
+                                // proceeds in Step 8b.
+                            }
                         }
                     }
                 }
@@ -1320,6 +1426,41 @@ impl LedgerState {
                         Some(t) => t,
                         None => continue,
                     };
+                    // #733: a phase-2 COLLECTION error is block-fatal in
+                    // Babbage+ regardless of the is_valid tag — Haskell
+                    // raises `UtxosFailure (CollectErrors …)` before any
+                    // script runs, so every honest node rejects this block.
+                    // Carve-outs: CEK panics (not a Haskell error class —
+                    // correction 3) and UTxO-gap work items (inputs
+                    // unresolved during best-effort partial replay —
+                    // correction 4) stay warn-and-trust. Alonzo blocks never
+                    // arm the time-translation horizon (correction 2) and
+                    // keep warn-only semantics for the remaining collect
+                    // classes (conservative: no false fatality).
+                    if let Err(e) = &outcome.result {
+                        if e.is_eval_panic() {
+                            warn!(
+                                tx_hash = %tx.hash.to_hex(),
+                                slot = block.slot().0,
+                                error = %e,
+                                "Phase-2 evaluator PANIC on confirmed block — trusting \
+                                 on-chain consensus (dugite CEK robustness gap; never \
+                                 block-fatal at apply)"
+                            );
+                            continue;
+                        }
+                        if e.is_collect_error()
+                            && block.era >= Era::Babbage
+                            && outcome.utxo_complete
+                            && phase2_collect_fatal_enabled()
+                        {
+                            return Err(LedgerError::Phase2CollectErrors {
+                                slot: block.slot().0,
+                                tx_hash: tx.hash.to_hex(),
+                                error: e.to_string(),
+                            });
+                        }
+                    }
                     if outcome.is_valid {
                         // is_valid=true: phase-2 failure is a ScriptFailed on a
                         // confirmed block — log a warning and trust on-chain consensus.

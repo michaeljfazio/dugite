@@ -48,12 +48,22 @@ pub fn stability_window_slots(k: u64, f: f64) -> u64 {
         // Degenerate: disable the gate (caller treats u64::MAX as "no limit").
         return u64::MAX;
     }
-    // ceil(3k/f) — Haskell `computeStabilityWindow` computes this over exact
-    // Rationals.  Our `f` is an f64 parsed from the genesis JSON, so the
-    // division can land an ulp ABOVE an exact integer result (e.g.
-    // 3*2160/0.05 = 129600 exactly in ℚ, but 0.05 is not representable in
-    // binary).  A naive `ceil` would then return 129601.  Snap to the nearest
-    // integer when within a float-noise epsilon before ceiling.
+    // Haskell `computeStabilityWindow` is `ceiling (3*k /. f)` over EXACT
+    // rationals — `f` originates as a decimal literal in the genesis JSON
+    // (e.g. 0.05).  Our callers carry it as the f64 serde parsed from that
+    // literal.  Recover the exact decimal via shortest-roundtrip formatting
+    // (for any human-written genesis decimal this IS the original literal),
+    // then compute `ceil(3k·den/num)` in pure u128 integer arithmetic —
+    // no float division, no epsilon (#733 correction 7).
+    if let Some((num, den)) = f64_to_decimal_rational(f) {
+        let prod = 3u128 * (k as u128) * den;
+        let ceiled = prod.div_ceil(num);
+        if let Ok(v) = u64::try_from(ceiled) {
+            return v;
+        }
+    }
+    // Fallback (non-decimal-representable f, e.g. synthetic test values):
+    // previous float path with nearest-integer snap.
     let exact = (3.0 * k as f64) / f;
     let nearest = exact.round();
     if (exact - nearest).abs() < 1e-6 {
@@ -61,6 +71,40 @@ pub fn stability_window_slots(k: u64, f: f64) -> u64 {
     } else {
         exact.ceil() as u64
     }
+}
+
+/// Recover the exact decimal rational `num/den` whose shortest-roundtrip
+/// decimal representation produced this f64 (e.g. `0.05` → `(5, 100)`).
+///
+/// Returns `None` for non-finite values, exponent-formatted extremes, or
+/// decimals longer than u128 arithmetic can hold.
+fn f64_to_decimal_rational(f: f64) -> Option<(u128, u128)> {
+    if !f.is_finite() || f <= 0.0 {
+        return None;
+    }
+    let s = format!("{f}");
+    if s.contains(['e', 'E']) {
+        return None;
+    }
+    let (int_part, frac_part) = match s.split_once('.') {
+        Some((i, fr)) => (i, fr),
+        None => (s.as_str(), ""),
+    };
+    if frac_part.len() > 30 {
+        return None;
+    }
+    let den = 10u128.checked_pow(frac_part.len() as u32)?;
+    let int_val: u128 = int_part.parse().ok()?;
+    let frac_val: u128 = if frac_part.is_empty() {
+        0
+    } else {
+        frac_part.parse().ok()?
+    };
+    let num = int_val.checked_mul(den)?.checked_add(frac_val)?;
+    if num == 0 {
+        return None;
+    }
+    Some((num, den))
 }
 
 #[cfg(test)]
@@ -115,5 +159,27 @@ mod tests {
     fn stability_window_slots_zero_f_returns_max() {
         // Degenerate: f=0 → u64::MAX (gate is disabled).
         assert_eq!(stability_window_slots(2160, 0.0), u64::MAX);
+    }
+
+    #[test]
+    fn stability_window_slots_exact_integer_math() {
+        // #733 correction 7: exact rational ceiling, mirroring Haskell
+        // computeStabilityWindow = ceiling (3k /. f) over ℚ.
+        // f=0.049 → 3·2160·1000/49 = 6_480_000/49 = 132244.897… → 132245.
+        assert_eq!(stability_window_slots(2160, 0.049), 132_245);
+        // f=0.07 → 3·1000·100/7 = 300_000/7 = 42857.14… → 42858.
+        assert_eq!(stability_window_slots(1000, 0.07), 42_858);
+        // Large k where f64 noise could flip a naive ceil: 3k/f exact.
+        assert_eq!(stability_window_slots(1_000_000_007, 0.05), 60_000_000_420);
+    }
+
+    #[test]
+    fn f64_to_decimal_rational_recovers_genesis_literals() {
+        assert_eq!(super::f64_to_decimal_rational(0.05), Some((5, 100)));
+        assert_eq!(super::f64_to_decimal_rational(0.1), Some((1, 10)));
+        assert_eq!(super::f64_to_decimal_rational(1.0), Some((1, 1)));
+        assert_eq!(super::f64_to_decimal_rational(0.2), Some((2, 10)));
+        assert_eq!(super::f64_to_decimal_rational(0.0), None);
+        assert_eq!(super::f64_to_decimal_rational(-0.05), None);
     }
 }

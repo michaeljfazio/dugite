@@ -420,6 +420,7 @@ impl From<LedgerStateSnapshot> for super::LedgerState {
             security_param: 0, // Set from genesis config at startup via set_epoch_length()
             conway_genesis_init: None, // Set from genesis config at startup
             max_lovelace_supply: super::MAX_LOVELACE_SUPPLY,
+            phase2_apply_horizon: None,
         }
     }
 }

@@ -652,6 +652,9 @@ pub(crate) fn convert_validation_error(
         // decode) ride the ScriptFailed wire variant so the N2C reject
         // reason carries the full message without a wire-format change.
         VE::Phase2CollectError(reason) => TxValidationError::ScriptFailed { reason },
+        // CEK panic: rejected at admission (reject-by-default), surfaced to
+        // the client as a script failure (#733 correction 3).
+        VE::Phase2EvalPanic(reason) => TxValidationError::ScriptFailed { reason },
         VE::MissingSpendRedeemer { index } => TxValidationError::MissingSpendRedeemer { index },
         VE::RedeemerIndexOutOfRange { tag, index, max } => {
             TxValidationError::RedeemerIndexOutOfRange { tag, index, max: max as u32 }
