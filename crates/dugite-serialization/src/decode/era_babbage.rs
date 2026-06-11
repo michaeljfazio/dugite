@@ -188,6 +188,17 @@ fn decode_babbage_block_mode(
             let raw_witness = raw_witnesses.get(i).cloned();
             let auxiliary_data = aux_map.get(&(i as u32)).cloned();
 
+            // Reconstruct full wire-format tx CBOR so that apply.rs can use
+            // raw_cbor.len() as the tx_size for fee-minimum validation.
+            // Haskell toCBORForSizeComputation (Alonzo+) = array(3)[body,wits,aux];
+            // we build array(4) and fee_tx_size() subtracts the 1-byte is_valid.
+            let raw_cbor = Some(reconstruct_alonzo_plus_tx_raw_cbor(
+                &raw_body,
+                raw_witness.as_deref().unwrap_or(&[0xA0]),
+                is_valid,
+                auxiliary_data.as_ref(),
+            ));
+
             Ok(Transaction {
                 hash: tx_hash,
                 era: Era::Babbage,
@@ -195,7 +206,7 @@ fn decode_babbage_block_mode(
                 witness_set,
                 is_valid,
                 auxiliary_data,
-                raw_cbor: None,
+                raw_cbor,
                 raw_body_cbor: Some(raw_body),
                 raw_witness_cbor: raw_witness,
             })
@@ -985,6 +996,43 @@ fn read_babbage_redeemer(r: &mut Reader<'_>) -> Result<Redeemer, SerializationEr
 // Standalone tx decoder (Babbage era)
 // ============================================================================
 
+/// Reconstruct the full wire-format CBOR for an Alonzo+ tx decoded from a block.
+///
+/// Alonzo/Babbage/Conway blocks store `[body, wits, is_valid, aux]` as SEPARATE
+/// arrays within the block envelope.  The block decoders do not materialise the
+/// full per-tx CBOR slice.  This function reassembles it so that
+/// `Transaction.raw_cbor` has a byte-length equal to the on-wire tx size, which
+/// `apply.rs` uses as `tx_size` for fee-minimum calculations.
+///
+/// Haskell: `toCBORForSizeComputation` (Alonzo+) = `array(3)[body, wits, aux]`
+/// (the 3-element encoding without `is_valid`).  The canonical wire form is
+/// `array(4)[body, wits, is_valid, aux]`.  `fee_tx_size()` in scripts.rs
+/// detects `0x84` and subtracts 1, yielding the Haskell-compatible fee size.
+///
+/// Reconstruction (byte-exact):
+/// ```text
+/// [0x84]  raw_body  raw_witness  (0xF5|0xF4)  (aux_raw | 0xF6)
+/// ```
+pub(crate) fn reconstruct_alonzo_plus_tx_raw_cbor(
+    raw_body: &[u8],
+    raw_witness: &[u8],
+    is_valid: bool,
+    auxiliary_data: Option<&dugite_primitives::transaction::AuxiliaryData>,
+) -> Vec<u8> {
+    let is_valid_byte: u8 = if is_valid { 0xF5 } else { 0xF4 };
+    let aux_bytes: &[u8] = match auxiliary_data {
+        Some(aux) => aux.raw_cbor.as_deref().unwrap_or(&[0xF6]),
+        None => &[0xF6],
+    };
+    let mut out = Vec::with_capacity(1 + raw_body.len() + raw_witness.len() + 1 + aux_bytes.len());
+    out.push(0x84); // array(4)
+    out.extend_from_slice(raw_body);
+    out.extend_from_slice(raw_witness);
+    out.push(is_valid_byte);
+    out.extend_from_slice(aux_bytes);
+    out
+}
+
 /// Decode a standalone Babbage-era transaction from raw CBOR bytes.
 ///
 /// The standalone tx format is `[body_map, witness_set_map, is_valid_bool, aux_data]`.
@@ -1513,6 +1561,48 @@ mod tests {
         let cbor = make_babbage_block(1);
         let block = decode_babbage_block_minimal(&cbor).unwrap();
         assert!(block.transactions[0].witness_set.vkey_witnesses.is_empty());
+    }
+
+    /// Fix #744 — block-decoded Babbage tx must have raw_cbor populated so
+    /// that compute_min_fee can use the correct wire size for the fee formula.
+    ///
+    /// Haskell: toCBORForSizeComputation (Alonzo+) = [body, wits, aux] — a
+    /// 3-element array, i.e., the wire-format 4-element array minus the 1-byte
+    /// is_valid bool.  We reconstruct raw_cbor as a 4-element array
+    /// [0x84, body, wits, is_valid_byte, aux|0xF6] so that fee_tx_size()
+    /// correctly subtracts 1 to get the Haskell fee-size.
+    #[test]
+    fn block_decoded_babbage_tx_has_raw_cbor() {
+        let cbor = make_babbage_block(1);
+        let block = decode_babbage_block(&cbor).unwrap();
+        let tx = &block.transactions[0];
+
+        // After Fix #744, raw_cbor must be Some.
+        assert!(
+            tx.raw_cbor.is_some(),
+            "block-decoded Babbage tx must have raw_cbor populated for fee calculation"
+        );
+
+        let raw = tx.raw_cbor.as_ref().unwrap();
+        // Must start with 0x84 (Alonzo+ 4-element array).
+        assert_eq!(
+            raw[0], 0x84,
+            "Babbage tx raw_cbor must start with 0x84 (array-4)"
+        );
+
+        // The reconstructed size must match raw_body + raw_witness + 1 (is_valid) +
+        // 1 (null aux) + 1 (array header) = raw_body.len() + raw_witness.len() + 3.
+        let body_len = tx.raw_body_cbor.as_ref().map_or(0, |b| b.len());
+        let witness_len = tx.raw_witness_cbor.as_ref().map_or(0, |b| b.len());
+        // 1 (array header) + body + witness + 1 (is_valid) + 1 (null aux)
+        let expected_len = 1 + body_len + witness_len + 1 + 1;
+        assert_eq!(
+            raw.len(),
+            expected_len,
+            "raw_cbor.len()={} expected={}  (body={body_len} witness={witness_len})",
+            raw.len(),
+            expected_len,
+        );
     }
 
     // ── datum_option + script_ref ─────────────────────────────────────────
