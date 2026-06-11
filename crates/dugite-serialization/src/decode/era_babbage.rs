@@ -188,6 +188,17 @@ fn decode_babbage_block_mode(
             let raw_witness = raw_witnesses.get(i).cloned();
             let auxiliary_data = aux_map.get(&(i as u32)).cloned();
 
+            // Reconstruct full wire-format tx CBOR so that apply.rs can use
+            // raw_cbor.len() as the tx_size for fee-minimum validation.
+            // Haskell toCBORForSizeComputation (Alonzo+) = array(3)[body,wits,aux];
+            // we build array(4) and fee_tx_size() subtracts the 1-byte is_valid.
+            let raw_cbor = Some(reconstruct_alonzo_plus_tx_raw_cbor(
+                &raw_body,
+                raw_witness.as_deref().unwrap_or(&[0xA0]),
+                is_valid,
+                auxiliary_data.as_ref(),
+            ));
+
             Ok(Transaction {
                 hash: tx_hash,
                 era: Era::Babbage,
@@ -195,7 +206,7 @@ fn decode_babbage_block_mode(
                 witness_set,
                 is_valid,
                 auxiliary_data,
-                raw_cbor: None,
+                raw_cbor,
                 raw_body_cbor: Some(raw_body),
                 raw_witness_cbor: raw_witness,
             })
@@ -554,6 +565,18 @@ fn read_tx_input(r: &mut Reader<'_>) -> Result<TransactionInput, SerializationEr
     })
 }
 
+/// Read a Babbage mint map `{ policy_id => { asset_name => signed_int } }`.
+///
+/// Applies the same pre-Conway zero-pruning semantics as Alonzo's `read_mint_map`:
+///
+/// ```haskell
+/// -- Haskell: decodeWithPrunning (pre-v9) = pruneZeroMultiAsset . MultiAsset <$> ...
+/// -- pruneZeroMultiAsset = filterMultiAsset (\_ _ -> (/= 0))
+/// ```
+///
+/// Zero-quantity assets MUST be dropped (and any policy whose entire asset map
+/// becomes empty is dropped too).  Keeping zeros inflates `txInfoMint` in Plutus
+/// V2 script contexts, causing spurious budget exhaustion (#730/#745).
 fn read_babbage_mint_map(
     r: &mut Reader<'_>,
 ) -> Result<
@@ -589,9 +612,14 @@ fn read_babbage_mint_map(
             Ok(assets)
         },
     )?;
+    // Pre-v9 pruning: drop zero-quantity assets and empty policies.
+    // Mirrors era_alonzo::read_mint_map and Haskell `decodeWithPrunning`.
     let mut result = BTreeMap::new();
-    for (k, v) in entries {
-        result.insert(k, v);
+    for (k, mut v) in entries {
+        v.retain(|_, amount| *amount != 0);
+        if !v.is_empty() {
+            result.insert(k, v);
+        }
     }
     Ok(result)
 }
@@ -984,6 +1012,43 @@ fn read_babbage_redeemer(r: &mut Reader<'_>) -> Result<Redeemer, SerializationEr
 // ============================================================================
 // Standalone tx decoder (Babbage era)
 // ============================================================================
+
+/// Reconstruct the full wire-format CBOR for an Alonzo+ tx decoded from a block.
+///
+/// Alonzo/Babbage/Conway blocks store `[body, wits, is_valid, aux]` as SEPARATE
+/// arrays within the block envelope.  The block decoders do not materialise the
+/// full per-tx CBOR slice.  This function reassembles it so that
+/// `Transaction.raw_cbor` has a byte-length equal to the on-wire tx size, which
+/// `apply.rs` uses as `tx_size` for fee-minimum calculations.
+///
+/// Haskell: `toCBORForSizeComputation` (Alonzo+) = `array(3)[body, wits, aux]`
+/// (the 3-element encoding without `is_valid`).  The canonical wire form is
+/// `array(4)[body, wits, is_valid, aux]`.  `fee_tx_size()` in scripts.rs
+/// detects `0x84` and subtracts 1, yielding the Haskell-compatible fee size.
+///
+/// Reconstruction (byte-exact):
+/// ```text
+/// [0x84]  raw_body  raw_witness  (0xF5|0xF4)  (aux_raw | 0xF6)
+/// ```
+pub(crate) fn reconstruct_alonzo_plus_tx_raw_cbor(
+    raw_body: &[u8],
+    raw_witness: &[u8],
+    is_valid: bool,
+    auxiliary_data: Option<&dugite_primitives::transaction::AuxiliaryData>,
+) -> Vec<u8> {
+    let is_valid_byte: u8 = if is_valid { 0xF5 } else { 0xF4 };
+    let aux_bytes: &[u8] = match auxiliary_data {
+        Some(aux) => aux.raw_cbor.as_deref().unwrap_or(&[0xF6]),
+        None => &[0xF6],
+    };
+    let mut out = Vec::with_capacity(1 + raw_body.len() + raw_witness.len() + 1 + aux_bytes.len());
+    out.push(0x84); // array(4)
+    out.extend_from_slice(raw_body);
+    out.extend_from_slice(raw_witness);
+    out.push(is_valid_byte);
+    out.extend_from_slice(aux_bytes);
+    out
+}
 
 /// Decode a standalone Babbage-era transaction from raw CBOR bytes.
 ///
@@ -1515,6 +1580,48 @@ mod tests {
         assert!(block.transactions[0].witness_set.vkey_witnesses.is_empty());
     }
 
+    /// Fix #744 — block-decoded Babbage tx must have raw_cbor populated so
+    /// that compute_min_fee can use the correct wire size for the fee formula.
+    ///
+    /// Haskell: toCBORForSizeComputation (Alonzo+) = [body, wits, aux] — a
+    /// 3-element array, i.e., the wire-format 4-element array minus the 1-byte
+    /// is_valid bool.  We reconstruct raw_cbor as a 4-element array
+    /// [0x84, body, wits, is_valid_byte, aux|0xF6] so that fee_tx_size()
+    /// correctly subtracts 1 to get the Haskell fee-size.
+    #[test]
+    fn block_decoded_babbage_tx_has_raw_cbor() {
+        let cbor = make_babbage_block(1);
+        let block = decode_babbage_block(&cbor).unwrap();
+        let tx = &block.transactions[0];
+
+        // After Fix #744, raw_cbor must be Some.
+        assert!(
+            tx.raw_cbor.is_some(),
+            "block-decoded Babbage tx must have raw_cbor populated for fee calculation"
+        );
+
+        let raw = tx.raw_cbor.as_ref().unwrap();
+        // Must start with 0x84 (Alonzo+ 4-element array).
+        assert_eq!(
+            raw[0], 0x84,
+            "Babbage tx raw_cbor must start with 0x84 (array-4)"
+        );
+
+        // The reconstructed size must match raw_body + raw_witness + 1 (is_valid) +
+        // 1 (null aux) + 1 (array header) = raw_body.len() + raw_witness.len() + 3.
+        let body_len = tx.raw_body_cbor.as_ref().map_or(0, |b| b.len());
+        let witness_len = tx.raw_witness_cbor.as_ref().map_or(0, |b| b.len());
+        // 1 (array header) + body + witness + 1 (is_valid) + 1 (null aux)
+        let expected_len = 1 + body_len + witness_len + 1 + 1;
+        assert_eq!(
+            raw.len(),
+            expected_len,
+            "raw_cbor.len()={} expected={}  (body={body_len} witness={witness_len})",
+            raw.len(),
+            expected_len,
+        );
+    }
+
     // ── datum_option + script_ref ─────────────────────────────────────────
 
     #[test]
@@ -1781,6 +1888,95 @@ mod tests {
         let (_pol, assets) = result.iter().next().unwrap();
         let &qty = assets.values().next().unwrap();
         assert_eq!(qty, -10);
+    }
+
+    /// Fix #745 — Babbage mint decoder must prune zero-quantity assets.
+    ///
+    /// Haskell `decodeMultiAsset` (pre-v9) uses `decodeWithPrunning` =
+    /// `pruneZeroMultiAsset . MultiAsset <$> ...` which filters out entries
+    /// where `amount == 0`.  The Alonzo `read_mint_map` already does this
+    /// (`v.retain(|_, amount| *amount != 0); if !v.is_empty() { ... }`).
+    /// Babbage's `read_babbage_mint_map` was missing the same prune logic.
+    ///
+    /// Effect without fix: inflated txInfoMint → phase-2 budget exhaustion
+    /// (confirmed 2 mainnet occurrences).  Worst case: wrong redeemer index
+    /// mapping → CollectError → block fatal.
+    #[test]
+    fn babbage_mint_map_zero_quantity_pruned() {
+        // {policy(0x11) -> {"" -> 0}}
+        let mut mint = vec![0xa1u8];
+        mint.push(0x58);
+        mint.push(0x1c);
+        mint.extend([0x11u8; 28]); // policy
+        mint.push(0xa1); // inner map(1)
+        mint.push(0x40); // asset name ""
+        mint.push(0x00); // quantity = 0
+        let mut r = Reader::new(&mint);
+        let result = read_babbage_mint_map(&mut r).expect("decode");
+        assert!(
+            result.is_empty(),
+            "zero-quantity Babbage mint entry must be pruned, got {result:?}"
+        );
+    }
+
+    /// Fix #745 — partial prune: only the non-zero asset survives.
+    #[test]
+    fn babbage_mint_map_partial_zero_pruned() {
+        // {policy(0x11) -> {"A" -> 5, "B" -> 0}}
+        let mut mint = vec![0xa1u8];
+        mint.push(0x58);
+        mint.push(0x1c);
+        mint.extend([0x11u8; 28]); // policy
+        mint.push(0xa2); // inner map(2)
+        mint.push(0x41);
+        mint.push(b'A'); // asset name "A"
+        mint.push(0x05); // quantity = 5
+        mint.push(0x41);
+        mint.push(b'B'); // asset name "B"
+        mint.push(0x00); // quantity = 0  ← must be pruned
+        let mut r = Reader::new(&mint);
+        let result = read_babbage_mint_map(&mut r).expect("decode");
+        assert_eq!(
+            result.len(),
+            1,
+            "policy with mixed zero/nonzero assets survives"
+        );
+        let (_pol, assets) = result.iter().next().unwrap();
+        assert_eq!(assets.len(), 1, "only non-zero asset survives");
+        let &qty = assets.values().next().unwrap();
+        assert_eq!(qty, 5i64);
+    }
+
+    /// Fix #745 — entire policy dropped when all assets are zero.
+    #[test]
+    fn babbage_mint_map_all_zero_policy_dropped() {
+        // {policy1 -> {"A" -> 1}, policy2 -> {"X" -> 0}}
+        let mut mint = vec![0xa2u8]; // map(2)
+                                     // policy1 with nonzero asset
+        mint.push(0x58);
+        mint.push(0x1c);
+        mint.extend([0x11u8; 28]);
+        mint.push(0xa1); // inner map(1)
+        mint.push(0x41);
+        mint.push(b'A');
+        mint.push(0x01); // qty = 1
+                         // policy2 with zero asset → should be dropped
+        mint.push(0x58);
+        mint.push(0x1c);
+        mint.extend([0x22u8; 28]);
+        mint.push(0xa1); // inner map(1)
+        mint.push(0x41);
+        mint.push(b'X');
+        mint.push(0x00); // qty = 0
+        let mut r = Reader::new(&mint);
+        let result = read_babbage_mint_map(&mut r).expect("decode");
+        assert_eq!(
+            result.len(),
+            1,
+            "policy with all-zero assets must be dropped"
+        );
+        let (pol, _) = result.iter().next().unwrap();
+        assert_eq!(pol.as_bytes(), &[0x11u8; 28]);
     }
 
     // ── post-Alonzo map output with script_ref ────────────────────────────

@@ -1179,21 +1179,37 @@ fn fee_tx_size(tx: &Transaction, tx_size: u64) -> u64 {
 ///
 /// The base fee uses [`fee_tx_size`] to match Haskell's `toCBORForSizeComputation`,
 /// which omits the `is_valid` boolean from the size for Alonzo+ transactions.
+///
+/// The ref-script fee is only added for Conway (PV >= 9) and later eras.
+/// Haskell: Babbage `getMinFeeTxUtxo` = `getShelleyMinFeeTxUtxo pp tx` (no
+/// ref-script-byte charge); the term first appears in Conway
+/// `getConwayMinFeeTxUtxo` (tierRefScriptFee).  Pre-Conway eras share
+/// Shelley's `getShelleyMinFeeTxUtxo` which has no such term.
+/// Reference: babbage.md §5 "Reference script fee (Babbage: NONE)";
+/// conway.md §12 "Tiered reference script fee".
 pub(super) fn compute_min_fee(
     tx: &Transaction,
     utxo_set: &dyn UtxoLookup,
     params: &ProtocolParameters,
     tx_size: u64,
 ) -> Lovelace {
-    // Pass both spending inputs and reference inputs so that scripts embedded in
-    // spending-input UTxOs are counted in the tiered fee — matching Haskell's
-    // `txNonDistinctRefScriptsSize` which uses `inputs txb <> referenceInputs txb`.
-    let rs_fee = ref_script_fee(
-        &tx.body.inputs,
-        &tx.body.reference_inputs,
-        utxo_set,
-        params.min_fee_ref_script_cost_per_byte,
-    );
+    // The tiered ref-script fee was introduced with Conway (PV9).  Pre-Conway
+    // eras (Shelley through Babbage) use `getShelleyMinFeeTxUtxo` which has
+    // no such term.  Mirror the Haskell era dispatch by gating on
+    // `protocol_version_major >= 9`.
+    let rs_fee = if params.protocol_version_major >= 9 {
+        // Pass both spending inputs and reference inputs so that scripts embedded in
+        // spending-input UTxOs are counted in the tiered fee — matching Haskell's
+        // `txNonDistinctRefScriptsSize` which uses `inputs txb <> referenceInputs txb`.
+        ref_script_fee(
+            &tx.body.inputs,
+            &tx.body.reference_inputs,
+            utxo_set,
+            params.min_fee_ref_script_cost_per_byte,
+        )
+    } else {
+        0
+    };
     let eu_fee = ex_unit_fee(tx, params);
     // Use the Haskell-compatible size (excludes is_valid for Alonzo+).
     let effective_size = fee_tx_size(tx, tx_size);
@@ -1672,5 +1688,119 @@ mod tests {
             errors.is_empty(),
             "Witness script matching a script-locked input must not be flagged as extraneous; got: {errors:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix #743 — ref-script fee must be PV>=9 only
+    // -----------------------------------------------------------------------
+
+    /// Babbage-era tx (PV=7) that spends a UTxO carrying a reference script
+    /// MUST NOT be charged a ref-script fee.  Before Fix #743 `compute_min_fee`
+    /// unconditionally called `ref_script_fee`, so this would return a non-zero
+    /// rs_fee even at PV<9.
+    ///
+    /// Haskell: Babbage `getMinFeeTxUtxo` = `getShelleyMinFeeTxUtxo pp tx` (no
+    /// ref-script-byte charge).  The term first appears in Conway
+    /// `getConwayMinFeeTxUtxo` (tierRefScriptFee, PV9+).
+    /// babbage.md §5 "Reference script fee (Babbage: NONE)".
+    #[test]
+    fn test_no_ref_script_fee_at_pv7() {
+        // A Plutus V2 script (5 bytes) attached to a UTxO.
+        let script_bytes = vec![0x01u8, 0x02, 0x03, 0x04, 0x05];
+        let spending_input = tx_input(0xAB);
+        let mut output = simple_output();
+        output.script_ref = Some(ScriptRef::PlutusV2(script_bytes));
+        let mut utxo_set = UtxoSet::new();
+        utxo_set.insert(spending_input.clone(), output);
+
+        let mut tx = Transaction::empty_with_hash(TransactionHash::from_bytes([0x11; 32]));
+        tx.body.inputs.push(spending_input);
+
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 7; // Babbage
+        params.min_fee_ref_script_cost_per_byte = 15;
+
+        let tx_size: u64 = 200;
+        let fee = compute_min_fee(&tx, &utxo_set, &params, tx_size);
+        // At PV7 there must be no ref-script fee component.
+        let expected_no_rs = Lovelace(params.min_fee(fee_tx_size(&tx, tx_size)).0);
+        assert_eq!(
+            fee, expected_no_rs,
+            "Babbage (PV7) must not charge ref-script fee: got {fee:?}, expected {expected_no_rs:?}"
+        );
+    }
+
+    /// Conway-era tx (PV=9) that spends a UTxO carrying a reference script
+    /// MUST be charged a ref-script fee via the tiered formula.
+    ///
+    /// Haskell: Conway `getConwayMinFeeTxUtxo pp tx refScriptsSize` adds
+    /// `tierRefScriptFee` (conway.md §12).
+    #[test]
+    fn test_ref_script_fee_at_pv9() {
+        // A Plutus V2 script (5 bytes) attached to a UTxO.
+        let script_bytes = vec![0x01u8, 0x02, 0x03, 0x04, 0x05];
+        let script_size = script_bytes.len() as u64;
+        let spending_input = tx_input(0xAB);
+        let mut output = simple_output();
+        output.script_ref = Some(ScriptRef::PlutusV2(script_bytes));
+        let mut utxo_set = UtxoSet::new();
+        utxo_set.insert(spending_input.clone(), output);
+
+        let mut tx = Transaction::empty_with_hash(TransactionHash::from_bytes([0x22; 32]));
+        tx.body.inputs.push(spending_input);
+
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // Conway
+        params.min_fee_ref_script_cost_per_byte = 15;
+
+        let tx_size: u64 = 200;
+        let fee = compute_min_fee(&tx, &utxo_set, &params, tx_size);
+
+        // At PV9 ref-script fee = tiered fee for 5 bytes at 15/byte = 5*15 = 75.
+        let expected_rs = calculate_ref_script_tiered_fee(15, script_size);
+        assert!(
+            expected_rs > 0,
+            "tiered fee for 5 bytes must be positive, got {expected_rs}"
+        );
+        let expected = Lovelace(params.min_fee(fee_tx_size(&tx, tx_size)).0 + expected_rs);
+        assert_eq!(
+            fee, expected,
+            "Conway (PV9) must charge ref-script fee: got {fee:?}, expected {expected:?}"
+        );
+    }
+
+    /// Boundary test: exactly one full 25,600-byte tier at PV=10.
+    /// Haskell tierRefScriptFee: n < sizeIncrement → Coin $ floor (acc + toRational n * curTierPrice)
+    /// For n=25,600 at base=15: fee = floor(0 + 25600 * 15) = 384,000.
+    #[test]
+    fn test_tiered_fee_boundary_one_tier_25600() {
+        let fee = calculate_ref_script_tiered_fee(15, 25_600);
+        assert_eq!(
+            fee, 384_000,
+            "25,600 bytes at 15/byte = 384,000 (single tier)"
+        );
+    }
+
+    /// Boundary test: two full tiers (51,200 bytes) at PV=10.
+    /// Tier 0: 25,600 * 15 = 384,000; Tier 1: 25,600 * 18 = 460,800; total = 844,800.
+    #[test]
+    fn test_tiered_fee_boundary_two_tiers_51200() {
+        let fee = calculate_ref_script_tiered_fee(15, 51_200);
+        assert_eq!(
+            fee, 844_800,
+            "51,200 bytes: tier0=384,000 + tier1=460,800 = 844,800"
+        );
+    }
+
+    /// Boundary test: partial tier 3 at 80,000 bytes.
+    /// Tier 0: 15/1,       25600 bytes → 384,000
+    /// Tier 1: 18/1,       25600 bytes → 460,800
+    /// Tier 2: 108/5,      25600 bytes → 2,764,800/5 = 552,960
+    /// Tier 3: 648/25,     3200 bytes  → 2,073,600/25 = 82,944
+    /// Total = 384,000 + 460,800 + 552,960 + 82,944 = 1,480,704.
+    #[test]
+    fn test_tiered_fee_boundary_80000() {
+        let fee = calculate_ref_script_tiered_fee(15, 80_000);
+        assert_eq!(fee, 1_480_704, "80,000 bytes tiered fee must be 1,480,704");
     }
 }
