@@ -675,8 +675,10 @@ impl LedgerState {
             mut block_active_proposals,
             block_committee_authorized_hot_keys,
             block_committee_authorized_elected_hot_keys,
-            // O(1) imbl structural clone — the pre-block snapshot for validation.
-            block_stake_key_deposits_snap,
+            // Retained for registry-builder signature compatibility; the
+            // per-tx ValidationContext now clones the LIVE deposits map
+            // (sequential LEDGERS semantics — see the reward-accounts note).
+            _block_stake_key_deposits_snap,
             block_constitution_script_hash,
         ): (
             std::sync::Arc<std::collections::HashSet<dugite_primitives::hash::Hash28>>,
@@ -812,9 +814,14 @@ impl LedgerState {
                 None,
             )
         };
-        // `reward_accounts` is `imbl::HashMap` — O(1) structural clone for the snapshot.
-        // Passed directly to ValidationContext as imbl type (no std::HashMap conversion needed).
-        let block_reward_accounts_snap = self.certs.reward_accounts.clone();
+        // NOTE: the per-tx ValidationContext below takes a FRESH O(1) imbl
+        // clone of `self.certs.reward_accounts` for every transaction —
+        // Haskell's LEDGERS rule applies txs SEQUENTIALLY, so tx N+1 must
+        // validate against the post-tx-N state. A per-BLOCK snapshot here
+        // false-positived `StakeKeyHasNonZeroBalance` on the common
+        // withdraw-then-deregister same-block chain (observed: 39 spurious
+        // divergence warnings during the mainnet ep345-351 sync while the
+        // pots stayed byte-exact and the accounts were correctly drained).
 
         if timing_enabled {
             t_registry_build = registry_start.elapsed();
@@ -998,10 +1005,14 @@ impl LedgerState {
                             &block_committee_resigned_keys,
                         ))
                         .with_treasury(self.epochs.treasury.0)
-                        // O(1) imbl clone — pre-block snapshot for validation.
-                        .with_reward_accounts_imbl(block_reward_accounts_snap.clone())
+                        // O(1) imbl clone of the LIVE map at THIS tx's apply
+                        // point — Haskell LEDGERS applies txs sequentially,
+                        // so a same-block withdraw→deregister chain must see
+                        // the post-withdrawal balance (a pre-block snapshot
+                        // false-positived StakeKeyHasNonZeroBalance here).
+                        .with_reward_accounts_imbl(self.certs.reward_accounts.clone())
                         .with_epoch(self.epoch.0)
-                        .with_stake_key_deposits_imbl(block_stake_key_deposits_snap.clone())
+                        .with_stake_key_deposits_imbl(self.certs.stake_key_deposits.clone())
                         .with_vote_delegations_arc(std::sync::Arc::clone(
                             &block_vote_delegation_keys,
                         ));
