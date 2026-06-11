@@ -7188,6 +7188,48 @@ mod additional_sync_tests {
         assert_eq!(unwrap_hfc_header(&buf), None);
     }
 
+    // ── extract_body_size_from_header ────────────────────────────────────────
+
+    /// REAL mainnet Babbage header (lifted from the block-33760 fixture),
+    /// wrapped in the N2N HFC envelope `[6, tag24(bytes(header))]` exactly as
+    /// ChainSync delivers it: the declared block body size MUST be extracted.
+    /// Guards the #747 exact byte-accounting path — if this returns None the
+    /// range builder silently degrades to the average-based estimate that
+    /// overran the mux ingress live.
+    #[test]
+    fn extract_body_size_from_real_babbage_wrapped_header() {
+        let wrapped_block = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../dugite-serialization/tests/fixtures/babbage_indef_tx_bodies_block33760.cbor"
+        ))
+        .expect("fixture");
+        // Fixture layout: [era_tag(6), block([header, ...])]
+        let mut dec = minicbor::Decoder::new(&wrapped_block);
+        dec.array().expect("outer");
+        assert_eq!(dec.u64().expect("era"), 6, "fixture must be Babbage");
+        dec.array().expect("block");
+        let start = dec.position();
+        dec.skip().expect("skip header");
+        let header_bytes = &wrapped_block[start..dec.position()];
+
+        // Re-wrap as the N2N ChainSync header envelope: [6, tag24(bytes(h))].
+        let mut buf = Vec::with_capacity(header_bytes.len() + 8);
+        {
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.array(2).unwrap();
+            enc.u64(6).unwrap();
+            enc.tag(minicbor::data::Tag::new(24)).unwrap();
+            enc.bytes(header_bytes).unwrap();
+        }
+
+        let size = extract_body_size_from_header(&buf);
+        assert!(
+            size.is_some_and(|s| s > 0),
+            "must extract a positive declared body size from a real wrapped \
+             Babbage header, got {size:?}"
+        );
+    }
+
     // ── extract_hash_from_header ──────────────────────────────────────────────
 
     /// Hash is deterministic: same input always produces the same 32 bytes.

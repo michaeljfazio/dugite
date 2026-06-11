@@ -489,6 +489,43 @@ where
         .collect()
 }
 
+/// Like [`select_headers_to_fetch`], but preserves CONTIGUITY information:
+/// returns runs of headers that were CONSECUTIVE in `pending` (the peer's
+/// in-order candidate stream). A new run starts wherever the filter skipped
+/// an element.
+///
+/// Why this matters (#747): a `MsgRequestRange(from, to)` makes the peer
+/// stream EVERY block between the two points on its chain — not just the
+/// headers we enumerated. Building one range across a filtered-out gap
+/// (e.g. blocks already delivered by an earlier short-batched claim) makes
+/// the peer re-send the gap blocks too: the range's actual wire bytes exceed
+/// the byte-accounted estimate (observed live as ~2× — 33.5 MB against the
+/// 32 MB mux ingress limit — and as systematic re-download waste). Ranges
+/// must therefore never span a gap.
+pub(crate) fn select_fetch_runs<F>(
+    pending: &[PendingHeader],
+    is_known_in_chain_db: F,
+    fetched_hashes: &std::collections::HashSet<[u8; 32]>,
+) -> Vec<Vec<PendingHeader>>
+where
+    F: Fn(&[u8; 32]) -> bool,
+{
+    let mut runs: Vec<Vec<PendingHeader>> = Vec::new();
+    let mut gap = true; // start of a fresh run
+    for h in pending {
+        if !is_known_in_chain_db(&h.hash) && !fetched_hashes.contains(&h.hash) {
+            if gap {
+                runs.push(Vec::new());
+                gap = false;
+            }
+            runs.last_mut().expect("run exists").push(h.clone());
+        } else {
+            gap = true;
+        }
+    }
+    runs
+}
+
 /// A block fetched by a BlockFetch task, ready for ledger application.
 ///
 /// Sent from per-peer BlockFetch tasks to the main run loop via an `mpsc`
@@ -2188,27 +2225,27 @@ impl ConnectionLifecycleManager {
                             // skipped afterwards by the per-worker `fetched_hashes`
                             // set; headers that have already been flushed to
                             // ImmutableDB are skipped by `has_block`.
-                            let headers_to_fetch = {
+                            let fetch_runs = {
                                 let chains = candidate_chains.read().await;
                                 let cdb = chain_db.read().await;
                                 use dugite_primitives::hash::Hash32;
                                 if let Some(state) = chains.get(&addr) {
-                                    let filtered = select_headers_to_fetch(
+                                    let runs = select_fetch_runs(
                                         &state.pending_headers,
                                         |h| cdb.has_block(&Hash32::from_bytes(*h)),
                                         &fetched_hashes,
                                     );
-                                    if filtered.is_empty() {
+                                    if runs.is_empty() {
                                         active_fetcher.store(0, std::sync::atomic::Ordering::SeqCst);
                                     }
-                                    filtered
+                                    runs
                                 } else {
                                     active_fetcher.store(0, std::sync::atomic::Ordering::SeqCst);
                                     continue;
                                 }
                             };
 
-                            if headers_to_fetch.is_empty() {
+                            if fetch_runs.is_empty() {
                                 continue;
                             }
 
@@ -2224,11 +2261,25 @@ impl ConnectionLifecycleManager {
                             // architecture.  Any remaining headers reappear on
                             // the next tick (fetched_hashes is not advanced for
                             // un-requested headers).
-                            let headers_to_fetch = if headers_to_fetch.len() > 2048 {
-                                headers_to_fetch.into_iter().take(2048).collect::<Vec<_>>()
-                            } else {
-                                headers_to_fetch
+                            let fetch_runs = {
+                                let mut budget = 2048usize;
+                                let mut capped: Vec<Vec<PendingHeader>> = Vec::new();
+                                for mut run in fetch_runs {
+                                    if budget == 0 {
+                                        break;
+                                    }
+                                    if run.len() > budget {
+                                        run.truncate(budget);
+                                    }
+                                    budget -= run.len();
+                                    capped.push(run);
+                                }
+                                capped
                             };
+                            // Flat view for the legacy single-list consumers
+                            // below (contiguity guard, logging, hash dedup).
+                            let headers_to_fetch: Vec<PendingHeader> =
+                                fetch_runs.iter().flatten().cloned().collect();
 
                             // #735: Genesis gross-request invariant (Haskell
                             // `selectThePeer` / `requestHeadInCandidate`):
@@ -2355,33 +2406,34 @@ impl ConnectionLifecycleManager {
                             );
 
                             // Batch headers into ranges for efficient fetching.
-                            // A single MsgRequestRange(from, to) fetches all blocks
-                            // between two points, avoiding per-block round-trips.
-                            // Ranges are chunked by EXACT header-declared body
-                            // sizes (Haskell `blockFetchSize` analogue) so each
-                            // range's actual wire bytes stay within the 8 MB
-                            // budget — the #747 ingress invariant holds against
-                            // real bytes, not an average estimate. Byron headers
-                            // (no declared size) fall back to the adaptive
-                            // average.
-                            let ranges: Vec<(CodecPoint, CodecPoint)> =
-                                build_fetch_ranges(
-                                    &headers_to_fetch,
-                                    avg_block_bytes,
-                                    max_range,
-                                )
-                                .into_iter()
-                                .map(|(start, end)| {
-                                    (
-                                        CodecPoint::Specific(
-                                            headers_to_fetch[start].slot,
-                                            headers_to_fetch[start].hash,
-                                        ),
-                                        CodecPoint::Specific(
-                                            headers_to_fetch[end].slot,
-                                            headers_to_fetch[end].hash,
-                                        ),
-                                    )
+                            // A single MsgRequestRange(from, to) fetches ALL
+                            // blocks between the two points on the peer's chain
+                            // — so ranges are built PER CONTIGUOUS RUN (never
+                            // spanning a filtered-out gap, which would make the
+                            // peer re-stream already-fetched gap blocks and
+                            // blow past the byte budget; observed live as
+                            // 33.5 MB from two nominally-8 MB ranges, #747).
+                            // Within a run, ranges are chunked by EXACT
+                            // header-declared body sizes (Haskell
+                            // `blockFetchSize` analogue); Byron headers fall
+                            // back to the adaptive average.
+                            let ranges: Vec<(CodecPoint, CodecPoint)> = fetch_runs
+                                .iter()
+                                .flat_map(|run| {
+                                    build_fetch_ranges(run, avg_block_bytes, max_range)
+                                        .into_iter()
+                                        .map(move |(start, end)| {
+                                            (
+                                                CodecPoint::Specific(
+                                                    run[start].slot,
+                                                    run[start].hash,
+                                                ),
+                                                CodecPoint::Specific(
+                                                    run[end].slot,
+                                                    run[end].hash,
+                                                ),
+                                            )
+                                        })
                                 })
                                 .collect();
 
@@ -5733,6 +5785,54 @@ mod fix3_blockfetch_ingress_tests {
     #[test]
     fn empty_headers_no_ranges() {
         assert!(build_fetch_ranges(&[], 65_536, BLOCKFETCH_MAX_RANGE).is_empty());
+    }
+
+    /// `select_fetch_runs` splits at every filtered-out element, so a range
+    /// can never span a gap (the peer would re-stream the gap blocks,
+    /// breaking the byte accounting — the residual #747 overrun).
+    #[test]
+    fn fetch_runs_split_at_gaps() {
+        // pending: 10 headers; 3, 4 and 7 already fetched.
+        let pending: Vec<_> = (0..10).map(|i| hdr(i, Some(10_000))).collect();
+        let mut fetched = std::collections::HashSet::new();
+        fetched.insert(pending[3].hash);
+        fetched.insert(pending[4].hash);
+        fetched.insert(pending[7].hash);
+        let runs = select_fetch_runs(&pending, |_| false, &fetched);
+        let run_slots: Vec<Vec<u64>> = runs
+            .iter()
+            .map(|r| r.iter().map(|h| h.slot).collect())
+            .collect();
+        assert_eq!(
+            run_slots,
+            vec![vec![0, 1, 2], vec![5, 6], vec![8, 9]],
+            "runs must break at every gap"
+        );
+    }
+
+    /// No gaps → exactly one run identical to the filtered list.
+    #[test]
+    fn fetch_runs_single_when_contiguous() {
+        let pending: Vec<_> = (0..5).map(|i| hdr(i, Some(10_000))).collect();
+        let runs = select_fetch_runs(&pending, |_| false, &std::collections::HashSet::new());
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].len(), 5);
+    }
+
+    /// chain-db-known blocks split runs exactly like fetched-hash gaps.
+    #[test]
+    fn fetch_runs_split_on_chain_db_known() {
+        let pending: Vec<_> = (0..6).map(|i| hdr(i, Some(10_000))).collect();
+        let runs = select_fetch_runs(
+            &pending,
+            |h| h[0] == 2, // slot-2 header hash starts with 2 → "known"
+            &std::collections::HashSet::new(),
+        );
+        let run_slots: Vec<Vec<u64>> = runs
+            .iter()
+            .map(|r| r.iter().map(|h| h.slot).collect())
+            .collect();
+        assert_eq!(run_slots, vec![vec![0, 1], vec![3, 4, 5]]);
     }
 
     /// Mixed declared sizes: a burst of large blocks among small ones closes
