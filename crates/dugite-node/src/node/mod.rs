@@ -8227,7 +8227,7 @@ impl Node {
                 // fall back to the direct ChainDB write path for correctness.
                 let chain_sel_verdict = if let Some(ref handle) = self.chain_sel_handle {
                     handle
-                        .submit_block_with_header(
+                        .submit_self_forged_block_with_header(
                             *block.hash(),
                             block.slot(),
                             block.block_number(),

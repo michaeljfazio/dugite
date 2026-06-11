@@ -280,6 +280,42 @@ impl ChainDB {
         Ok(extended)
     }
 
+    /// Add a block the LOCAL node forged, bypassing the Limit on Eagerness
+    /// (the node's own production extends its selection unconditionally).
+    pub fn add_self_forged_block(
+        &mut self,
+        hash: BlockHeaderHash,
+        slot: SlotNo,
+        block_no: BlockNo,
+        prev_hash: BlockHeaderHash,
+        cbor: Vec<u8>,
+    ) -> Result<bool, ChainDBError> {
+        if self.has_block(&hash) {
+            return Ok(false);
+        }
+        Ok(self
+            .volatile
+            .add_block_gated(hash, slot.0, block_no.0, prev_hash, cbor, true))
+    }
+
+    /// Header-carrying variant of [`add_self_forged_block`].
+    pub fn add_self_forged_block_with_header(
+        &mut self,
+        hash: BlockHeaderHash,
+        slot: SlotNo,
+        block_no: BlockNo,
+        prev_hash: BlockHeaderHash,
+        cbor: Vec<u8>,
+        header: dugite_primitives::block::BlockHeader,
+    ) -> Result<bool, ChainDBError> {
+        if self.has_block(&hash) {
+            return Ok(false);
+        }
+        Ok(self
+            .volatile
+            .add_block_with_header_gated(hash, slot.0, block_no.0, prev_hash, cbor, header, true))
+    }
+
     /// Install the LoE handle published by the Genesis governor.
     ///
     /// Absent handle (or a published `LoeState::Disabled`) keeps chain

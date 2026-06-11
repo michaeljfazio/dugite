@@ -73,6 +73,12 @@ pub enum ChainSelMessage {
         /// `None` for legacy callers and Byron blocks; comparator falls back to
         /// strict-greater block_no in that case.
         header: Option<dugite_primitives::block::BlockHeader>,
+        /// True when the LOCAL node forged this block. A self-forged block
+        /// extends the node's own selection unconditionally — the Limit on
+        /// Eagerness constrains trust in PEER chains, never the node's own
+        /// production (which an adversary cannot forge). Genesis-mode block
+        /// producers would otherwise have their own blocks deferred past k.
+        self_forged: bool,
         /// Fulfillment channel for the processing result.
         result_tx: oneshot::Sender<AddBlockResult>,
     },
@@ -319,6 +325,7 @@ pub async fn add_block_runner(
                 prev_hash,
                 cbor,
                 header,
+                self_forged,
                 result_tx,
             } => {
                 let result = process_add_block(
@@ -328,6 +335,7 @@ pub async fn add_block_runner(
                     prev_hash,
                     cbor,
                     header.as_ref(),
+                    self_forged,
                     &chain_db,
                     &invalid_cache,
                 )
@@ -576,6 +584,7 @@ async fn process_add_block(
     prev_hash: BlockHeaderHash,
     cbor: Vec<u8>,
     header: Option<&dugite_primitives::block::BlockHeader>,
+    self_forged: bool,
     chain_db: &Arc<RwLock<ChainDB>>,
     invalid_cache: &Arc<RwLock<InvalidBlockCache>>,
 ) -> AddBlockResult {
@@ -587,6 +596,41 @@ async fn process_add_block(
             trace!(hash = %hash.to_hex(), "chain_sel: block already known");
             return AddBlockResult::AlreadyKnown;
         }
+    }
+
+    // --- Self-forged fast path (LoE-exempt) --------------------------------
+    //
+    // The node's own forged block extends its selection unconditionally: the
+    // Limit on Eagerness restrains trust in PEER chains, not the node's own
+    // production. Bypassing the LoE here keeps a genesis-mode block producer
+    // from deferring its own blocks past k. Chain selection over competing
+    // forks is unnecessary — the forge built this block directly on the
+    // current tip.
+    if self_forged {
+        let mut db = chain_db.write().await;
+        let extended = match header {
+            Some(h) => db.add_self_forged_block_with_header(
+                hash.to_owned(),
+                slot,
+                block_no,
+                prev_hash,
+                cbor,
+                h.clone(),
+            ),
+            None => db.add_self_forged_block(hash.to_owned(), slot, block_no, prev_hash, cbor),
+        };
+        return match extended {
+            Ok(true) => match db.get_tip_info() {
+                Some((tip_slot, tip_hash, tip_block_no)) => AddBlockResult::AddedAsTip {
+                    tip_hash,
+                    tip_slot,
+                    tip_block_no,
+                },
+                None => AddBlockResult::StoredAsFork,
+            },
+            Ok(false) => AddBlockResult::StoredAsFork,
+            Err(e) => AddBlockResult::Invalid(format!("self-forged storage write failed: {e}")),
+        };
     }
 
     // --- Step 2: Invalid-block cache check ---------------------------------
@@ -779,6 +823,7 @@ impl ChainSelHandle {
                 prev_hash,
                 cbor,
                 header: None, // legacy path, no Praos tiebreak
+                self_forged: false,
                 result_tx,
             })
             .await
@@ -813,11 +858,40 @@ impl ChainSelHandle {
                 prev_hash,
                 cbor,
                 header: Some(header),
+                self_forged: false,
                 result_tx,
             })
             .await
             .ok()?;
 
+        result_rx.await.ok()
+    }
+
+    /// Submit a block the LOCAL node forged. LoE-exempt: it extends the
+    /// node's own selection unconditionally (see `AddBlock::self_forged`).
+    pub async fn submit_self_forged_block_with_header(
+        &self,
+        hash: BlockHeaderHash,
+        slot: SlotNo,
+        block_no: BlockNo,
+        prev_hash: BlockHeaderHash,
+        cbor: Vec<u8>,
+        header: dugite_primitives::block::BlockHeader,
+    ) -> Option<AddBlockResult> {
+        let (result_tx, result_rx) = oneshot::channel();
+        self.tx
+            .send(ChainSelMessage::AddBlock {
+                hash,
+                slot,
+                block_no,
+                prev_hash,
+                cbor,
+                header: Some(header),
+                self_forged: true,
+                result_tx,
+            })
+            .await
+            .ok()?;
         result_rx.await.ok()
     }
 }
@@ -2292,6 +2366,57 @@ mod tests {
             }
             other => panic!("expected TriggeredFork, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn self_forged_blocks_bypass_the_loe() {
+        // A genesis-mode block producer: LoE empty@Origin, k=2 — a SYNCED
+        // peer block beyond k defers, but the node's OWN forged blocks
+        // extend unconditionally (the LoE constrains peer chains, not the
+        // node's own production).
+        let dir = tempfile::tempdir().unwrap();
+        let chain_db = make_chain_db(dir.path());
+        let _loe = install_loe(&chain_db, loe_fragment(None, &[], 2)).await;
+        let (handle, runner) = ChainSelHandle::new(Arc::clone(&chain_db));
+        let _runner_task = tokio::spawn(runner);
+
+        // Forge 6 blocks (well past k=2) — every one must be adopted as tip.
+        for i in 1..=6u8 {
+            let prev = if i == 1 { Hash32::ZERO } else { h(i - 1) };
+            let r = handle
+                .submit_self_forged_block_with_header(
+                    h(i),
+                    SlotNo(i as u64 * 10),
+                    BlockNo(i as u64),
+                    prev,
+                    vec![i],
+                    praos_header(
+                        *h(i).as_bytes(),
+                        if i == 1 {
+                            [0u8; 32]
+                        } else {
+                            *h(i - 1).as_bytes()
+                        },
+                        i as u64 * 10,
+                        i as u64,
+                        vec![0xAA],
+                        i as u64,
+                        vec![i],
+                        10,
+                    ),
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(r, AddBlockResult::AddedAsTip { .. }),
+                "self-forged block {i} must extend the chain past the LoE: {r:?}"
+            );
+        }
+        assert_eq!(
+            chain_db.read().await.get_tip_info().map(|(_, _, bn)| bn.0),
+            Some(6),
+            "forger advanced to block 6 despite k=2 LoE"
+        );
     }
 
     #[tokio::test]
