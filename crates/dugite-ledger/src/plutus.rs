@@ -29,6 +29,14 @@ pub enum PlutusError {
     /// this never legitimises `is_valid = false` (#733/#734).
     #[error("Phase-2 collection error (UtxosFailure CollectErrors): {0}")]
     CollectError(String),
+    /// The dugite CEK **panicked** on this script (caught by
+    /// `catch_unwind`). NOT a Haskell error class — a Haskell-validated
+    /// chain CAN contain scripts that panic dugite's evaluator, so this
+    /// must never be block-fatal at apply (warn-and-trust); at ADMISSION it
+    /// rejects both `is_valid` polarities (reject-by-default on adversarial
+    /// input, #733 correction 3 / #734).
+    #[error("Phase-2 evaluator panic: {0}")]
+    EvalPanic(String),
 }
 
 impl PlutusError {
@@ -46,8 +54,16 @@ impl PlutusError {
             PlutusError::CollectError(_)
             | PlutusError::MissingTxCbor
             | PlutusError::MissingOutputCbor(_) => true,
-            PlutusError::EvalFailed(_) => false,
+            // A CEK panic is NOT a Haskell CollectError — it must be
+            // rejected at admission but stay warn-only at apply (#733
+            // correction 3).
+            PlutusError::EvalFailed(_) | PlutusError::EvalPanic(_) => false,
         }
+    }
+
+    /// Whether this error is a dugite CEK panic (see [`Self::EvalPanic`]).
+    pub fn is_eval_panic(&self) -> bool {
+        matches!(self, PlutusError::EvalPanic(_))
     }
 }
 
@@ -220,6 +236,11 @@ pub struct Phase2WorkItem {
     /// `BuiltinSemanticsVariant` (VariantA pre-Conway, VariantB at PV9+) for the
     /// per-builtin cost model — see `dugite_uplc::cost_apply`.
     pub protocol_major: u32,
+    /// Whether ALL of the transaction's inputs (regular + reference +
+    /// collateral) resolved against the UTxO set at capture time. `false`
+    /// means a best-effort partial-replay state (UTxO gap) — phase-2
+    /// errors from such items must NOT be block-fatal (#733 correction 4).
+    pub utxo_complete: bool,
 }
 
 /// Resolve a transaction's Plutus inputs into `(input_cbor, output_cbor)` pairs
@@ -277,6 +298,12 @@ pub fn capture_phase2_work_item(
         None => reassemble_phase_two_tx_cbor(tx),
     };
     let utxo_pairs = resolve_phase2_utxo_pairs(tx, utxo_set);
+    // #733 correction 4: record whether every input resolved. A shortfall
+    // means a UTxO gap (best-effort partial replay) — collection errors
+    // from such items must stay warn-only at apply.
+    let attempted =
+        tx.body.inputs.len() + tx.body.reference_inputs.len() + tx.body.collateral.len();
+    let utxo_complete = utxo_pairs.len() == attempted;
     Phase2WorkItem {
         tx_idx,
         is_valid: tx.is_valid,
@@ -286,6 +313,7 @@ pub fn capture_phase2_work_item(
         max_ex,
         slot_config,
         protocol_major,
+        utxo_complete,
     }
 }
 
@@ -355,6 +383,10 @@ pub struct Phase2Outcome {
     pub is_valid: bool,
     /// The evaluation result: `Ok(())` = all scripts pass, `Err(msg)` = failure.
     pub result: Result<(), PlutusError>,
+    /// Whether ALL inputs resolved at capture time (see
+    /// [`Phase2WorkItem::utxo_complete`]) — gates apply-time fatality
+    /// (#733 correction 4).
+    pub utxo_complete: bool,
 }
 
 /// Execute a batch of pre-resolved Phase-2 work items IN PARALLEL via rayon,
@@ -399,6 +431,7 @@ pub fn run_phase2_parallel(items: Vec<Phase2WorkItem>) -> Vec<Phase2Outcome> {
                 tx_idx: item.tx_idx,
                 is_valid: item.is_valid,
                 result,
+                utxo_complete: item.utxo_complete,
             }
         })
         .collect();
@@ -434,6 +467,7 @@ pub fn run_phase2_parallel(items: Vec<Phase2WorkItem>) -> Vec<Phase2Outcome> {
                 tx_idx: item.tx_idx,
                 is_valid: item.is_valid,
                 result,
+                utxo_complete: item.utxo_complete,
             }
         })
         .collect();
@@ -470,10 +504,13 @@ fn run_single_phase2_eval(
         Ok(r) => r,
         Err(payload) => {
             let msg = panic_payload_to_string(&payload);
-            // Reject-by-default: a panic on adversarial input is not a
-            // legitimate script failure, so it must never legitimise
-            // is_valid=false (#734).
-            return Err(PlutusError::CollectError(format!(
+            // Reject-by-default at ADMISSION: a panic on adversarial input
+            // is not a legitimate script failure, so it must never
+            // legitimise is_valid=false (#734). Distinct from CollectError
+            // so the APPLY path stays warn-and-trust — a Haskell-validated
+            // chain can contain scripts that panic dugite's CEK (#733
+            // correction 3).
+            return Err(PlutusError::EvalPanic(format!(
                 "dugite-uplc panic on malformed script: {msg}"
             )));
         }

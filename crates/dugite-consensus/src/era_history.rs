@@ -454,6 +454,50 @@ impl EraHistory {
         Some(horizon)
     }
 
+    /// Conservative **apply-time** phase-2 horizon (#733 correction 1).
+    ///
+    /// Haskell's apply-time horizon depends on whether the next era
+    /// transition is already known to the ledger (`reconstructSummary`,
+    /// `HardFork/Combinator/State/Infra.hs`):
+    ///
+    /// - `TransitionUnknown ledgerTip`: horizon = first epoch boundary at
+    ///   or after `tip + 1 + safeZone` — [`Self::safe_zone_horizon_slot`].
+    /// - `TransitionKnown E` (hard fork enacted for the next boundary,
+    ///   `E = tipEpoch + 1`): the current era ends exactly at `E`, and the
+    ///   NEXT era's safe zone applies **from its start**
+    ///   (`applySafeZone nextParams nextStart (boundSlot nextStart)`), so
+    ///   the horizon is the start of epoch `E + 1` — up to a full epoch
+    ///   beyond the unknown-case bound.
+    ///
+    /// dugite's `EraHistory` records transitions when they happen, not one
+    /// epoch ahead, so it cannot distinguish the two cases. For block
+    /// FATALITY the sound choice is the MAXIMUM of the possible horizons: a
+    /// slot past this bound is past every horizon Haskell could be using,
+    /// so rejecting the block can never be a false fatality at a hard-fork
+    /// window (mainnet ep 364–366, 506–508, and every future HF). Blocks in
+    /// the gap between the actual Haskell horizon and this bound are
+    /// warn-only (callers keep the trust-consensus path for them).
+    ///
+    /// For Shelley-based eras (`safe_zone < epoch_size`) this is simply the
+    /// start of `tipEpoch + 2`. Degenerate parameter sets fall back to the
+    /// unknown-case bound.
+    pub fn phase2_apply_horizon_slot(&self, ledger_tip: SlotNo) -> Option<u64> {
+        let unknown = self.safe_zone_horizon_slot(ledger_tip)?;
+        let entry = match self.find_era_for_slot(ledger_tip.0) {
+            Ok(e) => e,
+            Err(_) => self.entries.last()?,
+        };
+        let epoch_size = entry.params.epoch_size;
+        if epoch_size == 0 {
+            return Some(unknown);
+        }
+        let era_start_slot = entry.start.slot;
+        let tip_epoch_index = ledger_tip.0.saturating_sub(era_start_slot) / epoch_size;
+        let known = era_start_slot
+            .saturating_add(tip_epoch_index.saturating_add(2).saturating_mul(epoch_size));
+        Some(unknown.max(known))
+    }
+
     /// Genesis window `sgen` applicable at `slot`.
     ///
     /// Mirrors Haskell's `slotToGenesisWindow` HardFork-history query used by
@@ -1238,6 +1282,46 @@ mod tests {
         // epoch_size=400: 1200 (epoch 3 start).
         let eh = devnet_400_safe360();
         assert_eq!(eh.safe_zone_horizon_slot(SlotNo(740)), Some(1200));
+    }
+
+    #[test]
+    fn test_phase2_apply_horizon_is_start_of_tip_epoch_plus_two() {
+        // #733 correction 1: the conservative apply horizon must cover the
+        // TransitionKnown case (HF enacted at E = tipEpoch+1 → next era's
+        // safe zone from its start → horizon = start of E+1). For all
+        // Shelley-shaped eras (safe_zone < epoch_size) that is the start of
+        // tipEpoch + 2.
+        let eh = devnet_400_safe360();
+        // tip 265 in epoch 0: unknown-case = 800 (epoch 2 start);
+        // known-case = start of epoch 2 = 800. max = 800.
+        assert_eq!(eh.phase2_apply_horizon_slot(SlotNo(265)), Some(800));
+        // tip 39 in epoch 0: unknown-case = 400; known-case = 800. max=800
+        // — one full epoch beyond the unknown bound (the gap the issue
+        // documents).
+        assert_eq!(eh.phase2_apply_horizon_slot(SlotNo(39)), Some(800));
+        // tip 740 in epoch 1: unknown-case = 1200; known = start of epoch 3
+        // = 1200. max = 1200.
+        assert_eq!(eh.phase2_apply_horizon_slot(SlotNo(740)), Some(1200));
+        // Apply horizon is always >= the admission (unknown-case) horizon.
+        for tip in [0u64, 39, 265, 399, 400, 740, 1199] {
+            assert!(
+                eh.phase2_apply_horizon_slot(SlotNo(tip)).unwrap()
+                    >= eh.safe_zone_horizon_slot(SlotNo(tip)).unwrap(),
+                "apply horizon must dominate the admission horizon (tip={tip})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_phase2_apply_horizon_zero_safe_zone_unbounded() {
+        let p = EraParams {
+            epoch_size: 400,
+            slot_length_ms: 1000,
+            safe_zone: 0,
+            genesis_window: 120,
+        };
+        let eh = EraHistory::from_genesis(p.clone(), p, 0);
+        assert_eq!(eh.phase2_apply_horizon_slot(SlotNo(100)), None);
     }
 
     #[test]

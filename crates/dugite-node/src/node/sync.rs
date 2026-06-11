@@ -1596,6 +1596,22 @@ impl Node {
                     BlockValidationMode::ApplyOnly => self.metrics.inc_apply_mode_reapply(),
                     BlockValidationMode::ValidateAll => self.metrics.inc_apply_mode_validate_all(),
                 }
+                // #733: per-block apply-time phase-2 horizon snapshot,
+                // anchored at the PRE-block ledger tip (conservative —
+                // sound across HF windows). One-shot: consumed by this
+                // apply. Lock order ls→era_history matches the era
+                // transition propagation below.
+                ls.phase2_apply_horizon = if matches!(ledger_mode, BlockValidationMode::ValidateAll)
+                    && block.era >= dugite_primitives::era::Era::Babbage
+                {
+                    let pre_tip = ls.tip.point.slot().map(|s| s.0).unwrap_or(0);
+                    self.era_history
+                        .read()
+                        .await
+                        .phase2_apply_horizon_slot(dugite_primitives::time::SlotNo(pre_tip))
+                } else {
+                    None
+                };
                 // Issue #653 — relief-worker scheduling around the
                 // CPU-bound per-block apply inside the bulk batch loop.
                 let apply_result =

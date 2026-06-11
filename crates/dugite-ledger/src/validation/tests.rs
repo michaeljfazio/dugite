@@ -15680,6 +15680,27 @@ mod tests {
             phase2_admission_error(true, &r),
             Some(ValidationError::Phase2CollectError(_))
         ));
+
+        // (either polarity, CEK panic) → Phase2EvalPanic — rejected at
+        // admission (reject-by-default) but a DISTINCT class from
+        // CollectError so the APPLY path stays warn-and-trust for panics
+        // (#733 correction 3: a Haskell-validated chain can contain
+        // scripts that panic dugite's CEK).
+        let r = Err(PlutusError::EvalPanic("index out of bounds".into()));
+        assert!(matches!(
+            phase2_admission_error(true, &r),
+            Some(ValidationError::Phase2EvalPanic(_))
+        ));
+        assert!(matches!(
+            phase2_admission_error(false, &r),
+            Some(ValidationError::Phase2EvalPanic(_))
+        ));
+        // And the classification helpers the apply-side fatality keys on:
+        let panic_err = PlutusError::EvalPanic("boom".into());
+        assert!(!panic_err.is_collect_error(), "panic is NOT collect-class");
+        assert!(panic_err.is_eval_panic());
+        assert!(PlutusError::CollectError("x".into()).is_collect_error());
+        assert!(!PlutusError::CollectError("x".into()).is_eval_panic());
     }
 
     /// `IsValidTagMismatch` is a proper `ValidationError` variant and can be

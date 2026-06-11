@@ -155,6 +155,15 @@ pub struct LedgerState {
     /// reserves at genesis and (b) derive `total_stake = max_lovelace_supply − reserves`
     /// in the reward calculation.
     pub max_lovelace_supply: u64,
+    /// One-shot phase-2 time-translation horizon for the NEXT `apply_block`
+    /// call (#733 corrections 5/6): the conservative apply-time horizon
+    /// (`EraHistory::phase2_apply_horizon_slot`) computed by the async
+    /// caller at the PRE-block ledger tip, set under the same write lock as
+    /// the apply (deterministic — never resolved via `try_read` inside
+    /// apply). Consumed (`take()`) by `apply_block`. `None` ⇒ the
+    /// apply-time horizon check is skipped (warn-only) — never a false
+    /// fatality. Not persisted in snapshots (per-block transient).
+    pub phase2_apply_horizon: Option<u64>,
 }
 
 /// Pending reward update matching Haskell's RUPD structure.
@@ -720,6 +729,7 @@ impl LedgerState {
             security_param: 2160,
             conway_genesis_init: None,
             max_lovelace_supply: MAX_LOVELACE_SUPPLY,
+            phase2_apply_horizon: None,
         }
     }
 
@@ -1208,6 +1218,7 @@ impl LedgerState {
             security_param: 0,         // Will be set by set_epoch_length()
             conway_genesis_init: None, // Will be set by caller
             max_lovelace_supply: MAX_LOVELACE_SUPPLY,
+            phase2_apply_horizon: None,
         }
     }
 
@@ -1255,6 +1266,7 @@ impl LedgerState {
             security_param: self.security_param,
             conway_genesis_init: self.conway_genesis_init.clone(),
             max_lovelace_supply: self.max_lovelace_supply,
+            phase2_apply_horizon: None,
         }
     }
 
@@ -2317,6 +2329,19 @@ pub enum LedgerError {
     },
     #[error("Block body size mismatch: actual serialized size {actual} != header claimed size {claimed} (WrongBlockBodySizeBBODY)")]
     WrongBlockBodySize { actual: u64, claimed: u64 },
+    /// Phase-2 collection/context error on a block transaction — Haskell
+    /// `UtxosFailure (CollectErrors …)` (Babbage+), raised regardless of
+    /// the `is_valid` tag. Block-fatal at apply (#733): a block containing
+    /// such a tx is invalid on every honest Haskell node.
+    #[error(
+        "Phase-2 collection error at slot {slot} tx {tx_hash}: {error} \
+         (UtxosFailure CollectErrors — block invalid regardless of is_valid)"
+    )]
+    Phase2CollectErrors {
+        slot: u64,
+        tx_hash: String,
+        error: String,
+    },
 }
 
 #[cfg(test)]

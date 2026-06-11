@@ -5482,6 +5482,19 @@ impl Node {
                             // acquiring ledger_seq (same invariant as Fix A).
                             let fork_delta = {
                                 let mut ls = self.ledger_state.write().await;
+                                // #733: per-block apply horizon snapshot at
+                                // the pre-block ledger tip (one-shot).
+                                ls.phase2_apply_horizon =
+                                    if matches!(validation_mode, BlockValidationMode::ValidateAll)
+                                        && fork_block.era >= dugite_primitives::era::Era::Babbage
+                                    {
+                                        let pre_tip = ls.tip.point.slot().map(|s| s.0).unwrap_or(0);
+                                        self.era_history.read().await.phase2_apply_horizon_slot(
+                                            dugite_primitives::time::SlotNo(pre_tip),
+                                        )
+                                    } else {
+                                        None
+                                    };
                                 // Issue #653 — relief-worker scheduling.
                                 let apply_result = tokio::task::block_in_place(|| {
                                     ls.apply_block_with_delta(&fork_block, validation_mode)
@@ -6054,6 +6067,19 @@ impl Node {
         // starts), so there is no risk of double-pushing the same block.
         let delta = {
             let mut ls = self.ledger_state.write().await;
+            // #733: per-block apply horizon snapshot at the pre-block
+            // ledger tip (one-shot, conservative — sound across HF windows).
+            ls.phase2_apply_horizon = if matches!(validation_mode, BlockValidationMode::ValidateAll)
+                && block.era >= dugite_primitives::era::Era::Babbage
+            {
+                let pre_tip = ls.tip.point.slot().map(|s| s.0).unwrap_or(0);
+                self.era_history
+                    .read()
+                    .await
+                    .phase2_apply_horizon_slot(dugite_primitives::time::SlotNo(pre_tip))
+            } else {
+                None
+            };
             // Issue #653 — wrap the CPU-bound apply in `block_in_place`
             // so the multi-thread tokio runtime spawns relief workers
             // for the duration. Without this, every block apply pins
@@ -8485,6 +8511,22 @@ impl Node {
                                     // tracks forged-path fork replay blocks too.
                                     let forge_fork_delta = {
                                         let mut ls = self.ledger_state.write().await;
+                                        // #733: per-block apply horizon snapshot
+                                        // at the pre-block ledger tip (one-shot).
+                                        ls.phase2_apply_horizon = if matches!(
+                                            validation_mode,
+                                            BlockValidationMode::ValidateAll
+                                        ) && fork_block.era
+                                            >= dugite_primitives::era::Era::Babbage
+                                        {
+                                            let pre_tip =
+                                                ls.tip.point.slot().map(|s| s.0).unwrap_or(0);
+                                            self.era_history.read().await.phase2_apply_horizon_slot(
+                                                dugite_primitives::time::SlotNo(pre_tip),
+                                            )
+                                        } else {
+                                            None
+                                        };
                                         // Issue #653 — relief-worker scheduling.
                                         let apply_result = tokio::task::block_in_place(|| {
                                             ls.apply_block_with_delta(&fork_block, validation_mode)
@@ -8594,6 +8636,18 @@ impl Node {
                 // forged blocks too, enabling seq-based rollback on the next fork.
                 let forged_delta = {
                     let mut ls = self.ledger_state.write().await;
+                    // #733: per-block apply horizon snapshot at the pre-block
+                    // ledger tip (one-shot). Our own forged block must pass
+                    // the same horizon fatality every honest node applies.
+                    ls.phase2_apply_horizon = if block.era >= dugite_primitives::era::Era::Babbage {
+                        let pre_tip = ls.tip.point.slot().map(|s| s.0).unwrap_or(0);
+                        self.era_history
+                            .read()
+                            .await
+                            .phase2_apply_horizon_slot(dugite_primitives::time::SlotNo(pre_tip))
+                    } else {
+                        None
+                    };
                     // Issue #653 — relief-worker scheduling.
                     let apply_result = tokio::task::block_in_place(|| {
                         ls.apply_block_with_delta(&block, BlockValidationMode::ValidateAll)

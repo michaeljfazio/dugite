@@ -703,6 +703,13 @@ pub enum ValidationError {
     /// (#733/#734).
     #[error("phase-2 collection error (UtxosFailure CollectErrors): {0}")]
     Phase2CollectError(String),
+    /// The dugite CEK panicked (caught by `catch_unwind`). Rejects at
+    /// ADMISSION (reject-by-default on adversarial input) but is NOT a
+    /// Haskell CollectError: at block apply it must stay warn-and-trust —
+    /// a Haskell-validated chain can contain scripts that panic dugite's
+    /// evaluator (#733 correction 3).
+    #[error("phase-2 evaluator panic: {0}")]
+    Phase2EvalPanic(String),
     #[error("Script-locked input at index {index} has no matching Spend redeemer")]
     MissingSpendRedeemer { index: u32 },
     /// A script-locked withdrawal or Plutus minting policy has no matching
@@ -1950,6 +1957,12 @@ pub(crate) fn phase2_admission_error(
             | PlutusError::MissingTxCbor
             | PlutusError::MissingOutputCbor(_)),
         ) => Some(ValidationError::Phase2CollectError(e.to_string())),
+        // A dugite-CEK panic rejects at admission for BOTH polarities
+        // (reject-by-default on adversarial input) but is deliberately NOT
+        // a Haskell CollectError: at block apply it stays warn-and-trust —
+        // a Haskell-validated chain can contain scripts that panic dugite's
+        // evaluator (#733 correction 3).
+        Err(e @ PlutusError::EvalPanic(_)) => Some(ValidationError::Phase2EvalPanic(e.to_string())),
         Err(e @ PlutusError::EvalFailed(_)) => {
             if is_valid {
                 // Tx claims scripts pass — they failed.
