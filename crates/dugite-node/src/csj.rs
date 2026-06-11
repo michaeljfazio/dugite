@@ -358,15 +358,15 @@ impl CsjRegistry {
         let role = std::mem::replace(&mut peer.role, CsjRole::Disengaged { restarting: false });
         match role {
             CsjRole::Dynamo { .. } => {
-                peer.notify.notify_waiters();
+                peer.notify.notify_one();
                 Self::backfill_dynamo(&mut inner);
             }
             CsjRole::Objector { .. } => {
-                peer.notify.notify_waiters();
+                peer.notify.notify_one();
                 Self::elect_new_objector(&mut inner);
             }
             CsjRole::Jumper(_) => {
-                peer.notify.notify_waiters();
+                peer.notify.notify_one();
             }
             CsjRole::Disengaged { .. } => {
                 peer.role = role; // restore (already disengaged)
@@ -467,7 +467,7 @@ impl CsjRegistry {
             return true;
         }
         let role = std::mem::replace(&mut peer.role, CsjRole::Disengaged { restarting: true });
-        peer.notify.notify_waiters();
+        peer.notify.notify_one();
         match role {
             CsjRole::Dynamo { .. } => Self::backfill_dynamo(&mut inner),
             CsjRole::Objector { .. } => Self::elect_new_objector(&mut inner),
@@ -520,7 +520,7 @@ impl CsjRegistry {
                 last_good: None,
             });
             p.next_jump = None;
-            p.notify.notify_waiters();
+            p.notify.notify_one();
         }
         Self::backfill_dynamo(&mut inner);
     }
@@ -544,7 +544,7 @@ impl CsjRegistry {
         for peer in inner.peers.values_mut() {
             if matches!(peer.role, CsjRole::Jumper(JumperRole::Happy { .. })) {
                 peer.next_jump = Some(ji.clone());
-                peer.notify.notify_waiters();
+                peer.notify.notify_one();
             }
         }
     }
@@ -553,7 +553,7 @@ impl CsjRegistry {
         peer.role = CsjRole::Disengaged { restarting };
         peer.jump_info = None;
         peer.next_jump = None;
-        peer.notify.notify_waiters();
+        peer.notify.notify_one();
     }
 
     /// `backfillDynamo`: prefer a STARTED objector (its server cursor is
@@ -621,7 +621,7 @@ impl CsjRegistry {
                 last_jump_slot,
             };
             p.next_jump = None;
-            p.notify.notify_waiters();
+            p.notify.notify_one();
         }
         // Demote every other engaged peer to a fresh jumper, clearing all
         // FoundIntersection / LookingForIntersection state.
@@ -640,7 +640,7 @@ impl CsjRegistry {
                 last_good: None,
             });
             p.next_jump = dynamo_ji.clone();
-            p.notify.notify_waiters();
+            p.notify.notify_one();
         }
     }
 
@@ -700,7 +700,7 @@ impl CsjRegistry {
             bad: bad.clone(),
         });
         peer.next_jump = Some(JumpInfo { fragment: mid_frag });
-        peer.notify.notify_waiters();
+        peer.notify.notify_one();
     }
 
     /// `maybeElectNewObjector`: the objector seat goes to the
@@ -732,7 +732,7 @@ impl CsjRegistry {
                         {
                             p.role =
                                 CsjRole::Jumper(JumperRole::FoundIntersection { good, bad_point });
-                            p.notify.notify_waiters();
+                            p.notify.notify_one();
                         }
                     }
                     Self::promote_objector(inner, candidate);
@@ -772,7 +772,7 @@ impl CsjRegistry {
                     bad_point,
                 };
                 p.next_jump = None;
-                p.notify.notify_waiters();
+                p.notify.notify_one();
             }
         }
     }

@@ -4011,10 +4011,14 @@ async fn run_csj_jumper_loop(
                 return Ok(true);
             }
             CsjInstruction::Wait => {
+                // 1s timeout is a safety net: even if a jump notification is
+                // missed, the loop re-reads next_instruction and picks up a
+                // pending jump (next_jump is set losslessly by setJumps).
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return Ok(false),
                     _ = notify.notified() => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
                 }
             }
             instr @ (CsjInstruction::Jump(_) | CsjInstruction::JumpToGoodPoint(_)) => {
@@ -4196,6 +4200,28 @@ pub async fn chainsync_client_task(
     }
     let _registry_guard = RegistryGuard {
         registry: peer_registry.clone(),
+        addr: peer_addr,
+    };
+    // CSJ registration MUST be removed on EVERY exit path — including
+    // `?`-propagated protocol/IO errors (a dead dynamo's connection ends the
+    // task via `?`, not the happy `Ok(())` return). A leaked Dynamo
+    // registration is never backfilled, so every jumper parks forever and the
+    // whole sync wedges. Mirrors Haskell's `bracket`-guaranteed
+    // `unregisterClient` (→ `backfillDynamo`/`electNewObjector`). The Arc is
+    // installed below once `csj.register` has actually run.
+    struct CsjGuard {
+        csj: Option<Arc<crate::csj::CsjRegistry>>,
+        addr: SocketAddr,
+    }
+    impl Drop for CsjGuard {
+        fn drop(&mut self) {
+            if let Some(csj) = &self.csj {
+                csj.unregister(&self.addr);
+            }
+        }
+    }
+    let mut _csj_guard = CsjGuard {
+        csj: None,
         addr: peer_addr,
     };
     // ═══════════════════════════════════════════════════════════════════════
@@ -4534,6 +4560,8 @@ pub async fn chainsync_client_task(
         let gsm_caught_up =
             gsm_snapshot_rx.borrow().state == crate::gsm::GenesisSyncState::CaughtUp;
         let csj_notify = csj.register(peer_addr, gsm_caught_up, anchor_slot);
+        // Arm the unregister guard now that the peer is in the CSJ registry.
+        _csj_guard.csj = Some(csj.clone());
 
         // Jumper loop. Returns Ok(true) when the peer became a streaming role
         // (dynamo/objector → fall through to the pipeline), Ok(false) when the
@@ -4554,7 +4582,7 @@ pub async fn chainsync_client_task(
             // dugite keeps the per-peer task simple).
             let mut chains = candidate_chains.write().await;
             chains.remove(&peer_addr);
-            csj.unregister(&peer_addr);
+            // `_csj_guard` unregisters on this return (→ backfill/re-elect).
             return Ok(());
         }
     }
@@ -5546,9 +5574,8 @@ pub async fn chainsync_client_task(
         let mut chains = candidate_chains.write().await;
         chains.remove(&peer_addr);
     }
-    if let Some(ref csj) = csj {
-        csj.unregister(&peer_addr);
-    }
+    // CSJ unregister (→ backfill dynamo / re-elect objector) is handled by
+    // `_csj_guard` on drop, covering this happy return AND every `?` error.
 
     info!(
         %peer_addr,
