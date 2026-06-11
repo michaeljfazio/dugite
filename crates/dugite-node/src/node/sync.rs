@@ -3963,6 +3963,107 @@ pub(crate) fn should_refill_pipeline(
     !at_tip && outstanding <= low_mark && !*throttled
 }
 
+/// CSJ jumper protocol loop.
+///
+/// A jumper consumes `CsjInstruction`s from the registry: it offers
+/// `MsgFindIntersect` jumps (and never `MsgRequestNext`), bisects on
+/// rejection, and parks on its notify between jumps. Returns:
+/// - `Ok(true)` — the peer is now a streaming role (dynamo / objector);
+///   the caller falls through to the normal pipeline;
+/// - `Ok(false)` — the peer disengaged or was cancelled; the caller ends
+///   the task;
+/// - `Err` — a protocol violation; the caller disconnects.
+#[allow(clippy::too_many_arguments)]
+async fn run_csj_jumper_loop(
+    channel: &mut MuxChannel,
+    peer_addr: SocketAddr,
+    csj: &Arc<crate::csj::CsjRegistry>,
+    notify: &tokio::sync::Notify,
+    peer_state: &crate::genesis_peer_state::PeerChainState,
+    byron_epoch_length: u64,
+    cancel: &CancellationToken,
+) -> Result<bool> {
+    use crate::csj::CsjInstruction;
+    loop {
+        match csj.next_instruction(&peer_addr) {
+            CsjInstruction::RunNormally | CsjInstruction::Restart => {
+                // Became dynamo/objector (or a disengaged peer that now runs
+                // normal ChainSync). Fall through to the streaming pipeline.
+                return Ok(true);
+            }
+            CsjInstruction::Wait => {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Ok(false),
+                    _ = notify.notified() => {}
+                }
+            }
+            instr @ (CsjInstruction::Jump(_) | CsjInstruction::JumpToGoodPoint(_)) => {
+                let (ji, is_good_point) = match instr {
+                    CsjInstruction::Jump(ji) => (ji, false),
+                    CsjInstruction::JumpToGoodPoint(ji) => (ji, true),
+                    _ => unreachable!(),
+                };
+                // A jump to Origin always intersects — skip the wire.
+                let accepted = match ji.tip_point() {
+                    None => true,
+                    Some((slot, hash)) => {
+                        let probe = vec![CodecPoint::Specific(slot, hash)];
+                        let find = cs_encode(&ChainSyncMessage::MsgFindIntersect(probe));
+                        channel.send(find).await.map_err(|e| {
+                            anyhow::anyhow!("CSJ jump MsgFindIntersect send failed: {e}")
+                        })?;
+                        // Await exactly one intersect response (cancellable).
+                        let data = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => return Ok(false),
+                            r = channel.recv() => r.map_err(|e| {
+                                anyhow::anyhow!("CSJ jump recv failed: {e}")
+                            })?,
+                        };
+                        match cs_decode(&data)
+                            .map_err(|e| anyhow::anyhow!("CSJ jump decode failed: {e}"))?
+                        {
+                            ChainSyncMessage::MsgIntersectFound { point, .. } => {
+                                // Haskell: IntersectFound at any point OTHER
+                                // than the probed one is InvalidJumpResponse.
+                                let found = match from_codec_point(&point) {
+                                    Point::Specific(s, h) => s.0 == slot && *h.as_bytes() == hash,
+                                    Point::Origin => false,
+                                };
+                                if !found {
+                                    return Err(anyhow::anyhow!(
+                                        "CSJ: {peer_addr} InvalidJumpResponse \
+                                         (IntersectFound at unexpected point)"
+                                    ));
+                                }
+                                true
+                            }
+                            ChainSyncMessage::MsgIntersectNotFound { .. } => false,
+                            other => {
+                                return Err(anyhow::anyhow!(
+                                    "CSJ: {peer_addr} unexpected jump response: {other:?}"
+                                ));
+                            }
+                        }
+                    }
+                };
+                let _ = byron_epoch_length; // jumps carry no Byron headers
+                let replace = if is_good_point {
+                    csj.process_good_point_result(&peer_addr, accepted)
+                } else {
+                    csj.process_jump_result(&peer_addr, ji.clone(), accepted)
+                };
+                if replace {
+                    // updateChainSyncState: take the jump's fragment so the
+                    // GDD sees this jumper's (now dynamo-aligned) candidate.
+                    peer_state.replace_fragment(ji.fragment.clone());
+                }
+            }
+        }
+    }
+}
+
 /// Per-peer ChainSync client task.
 ///
 /// Runs on a single MuxChannel, receives headers, and updates shared
@@ -4053,6 +4154,9 @@ pub async fn chainsync_client_task(
     // Historicity cutoff in seconds — `None` in praos mode (Haskell
     // `gcHistoricityCutoff = Nothing` → `HistoricityCheck.noCheck`).
     historicity_cutoff_secs: Option<u64>,
+    // ChainSync Jumping coordinator — `None` in praos mode or when
+    // `EnableCSJ=false` (Haskell `noJumping`: every peer streams normally).
+    csj: Option<Arc<crate::csj::CsjRegistry>>,
 ) -> Result<()> {
     // Register this peer's shared chain state for the lifetime of the task.
     // The anchor starts at Origin (no intersection yet): csLatestSlot=None
@@ -4395,6 +4499,46 @@ pub async fn chainsync_client_task(
         }
         _ => crate::genesis_peer_state::FragAnchor::Origin,
     });
+
+    // ── ChainSync Jumping: register + run the jumper protocol ───────────────
+    //
+    // The dynamo and objector fall straight through to the normal pipeline
+    // below (their `next_instruction` is RunNormally); a jumper instead runs
+    // `MsgFindIntersect`-only jumps here and never streams headers, which is
+    // the whole point of CSJ. When CSJ is disabled every peer is RunNormally
+    // and this block is a no-op — the praos path is byte-identical.
+    if let Some(ref csj) = csj {
+        let anchor_slot = match &intersection {
+            Some(CodecPoint::Specific(slot, _)) => crate::genesis_peer_state::WithOrigin::At(*slot),
+            _ => crate::genesis_peer_state::WithOrigin::Origin,
+        };
+        let gsm_caught_up =
+            gsm_snapshot_rx.borrow().state == crate::gsm::GenesisSyncState::CaughtUp;
+        let csj_notify = csj.register(peer_addr, gsm_caught_up, anchor_slot);
+
+        // Jumper loop. Returns Ok(true) when the peer became a streaming role
+        // (dynamo/objector → fall through to the pipeline), Ok(false) when the
+        // peer disengaged or was cancelled (return), Err to disconnect.
+        let became_streamer = run_csj_jumper_loop(
+            &mut channel,
+            peer_addr,
+            csj,
+            &csj_notify,
+            &peer_state,
+            byron_epoch_length,
+            &cancel,
+        )
+        .await?;
+        if !became_streamer {
+            // Disengaged or cancelled — the task is done (a disengaged jumper
+            // that should run normal ChainSync re-enters via reconnection;
+            // dugite keeps the per-peer task simple).
+            let mut chains = candidate_chains.write().await;
+            chains.remove(&peer_addr);
+            csj.unregister(&peer_addr);
+            return Ok(());
+        }
+    }
 
     if let Err(e) = gsm_event_tx.try_send(crate::gsm::GsmEvent::PeerRegistered {
         addr: peer_addr,
@@ -4806,6 +4950,16 @@ pub async fn chainsync_client_task(
                             block_no: header_block_no,
                         });
 
+                        // CSJ (dynamo): keep this peer's jump-info snapshot
+                        // current, then drive jumps when the cadence boundary
+                        // is crossed (Haskell updateJumpInfo + onRollForward,
+                        // BEFORE validation). No-op for non-dynamo roles and
+                        // when CSJ is disabled.
+                        if let Some(ref csj) = csj {
+                            csj.update_jump_info(&peer_addr, peer_state.fragment_snapshot());
+                            csj.on_roll_forward(&peer_addr, (slot, hash));
+                        }
+
                         // LoP: any message resumes the leak; a header that
                         // STRICTLY advances kBestBlockNo earns one token
                         // (Haskell recvMsgRollForward: idlingStop >> lbResume,
@@ -4905,6 +5059,19 @@ pub async fn chainsync_client_task(
                         // LoP: rollbacks also resume the leak (Haskell
                         // recvMsgRollBackward: idlingStop >> lbResume).
                         lop_bucket.resume(std::time::Instant::now());
+
+                        // CSJ (dynamo/objector): rollback guards (Haskell
+                        // onRollBackward — disengage a dynamo that rewinds
+                        // behind its last jump, or an objector behind its
+                        // bad point).
+                        if let Some(ref csj) = csj {
+                            let rb = if matches!(point, CodecPoint::Origin) {
+                                crate::genesis_peer_state::WithOrigin::Origin
+                            } else {
+                                crate::genesis_peer_state::WithOrigin::At(rollback_slot)
+                            };
+                            csj.on_roll_backward(&peer_addr, rb);
+                        }
 
                         // Historicity: judge the OLDEST header this rollback
                         // rewinds (depth-0 rollbacks are never historical —
@@ -5263,6 +5430,13 @@ pub async fn chainsync_client_task(
                         peer_state.on_await_reply();
                         lop_bucket.pause(std::time::Instant::now());
 
+                        // CSJ: any peer claiming it has no more headers leaves
+                        // CSJ (Haskell onAwaitReply: disengage + backfill /
+                        // elect successor).
+                        if let Some(ref csj) = csj {
+                            csj.on_await_reply(&peer_addr);
+                        }
+
                         // Emit PeerIdling to the GSM actor so the GDD knows
                         // this peer has stopped sending blocks.
                         if let Err(e) = gsm_event_tx.try_send(crate::gsm::GsmEvent::PeerIdling {
@@ -5351,6 +5525,9 @@ pub async fn chainsync_client_task(
     {
         let mut chains = candidate_chains.write().await;
         chains.remove(&peer_addr);
+    }
+    if let Some(ref csj) = csj {
+        csj.unregister(&peer_addr);
     }
 
     info!(

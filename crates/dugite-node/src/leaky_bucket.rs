@@ -79,11 +79,6 @@ impl LopBucket {
         self.as_of = now;
     }
 
-    /// Whether the bucket is the active (Syncing) configuration.
-    pub fn is_active(&self) -> bool {
-        self.active
-    }
-
     /// Settle the lazily-computed level to `now`.
     fn settle(&mut self, now: Instant) {
         if self.active && !self.paused {

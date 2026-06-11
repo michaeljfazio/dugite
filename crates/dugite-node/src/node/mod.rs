@@ -733,6 +733,10 @@ pub struct Node {
     /// Historicity cutoff handed to every ChainSync task; `None` in praos
     /// mode (Haskell `gcHistoricityCutoff = Nothing`).
     pub(crate) historicity_cutoff_secs: Option<u64>,
+
+    /// ChainSync Jumping coordinator; `None` = disabled (praos / EnableCSJ
+    /// false → noJumping). Shared across all peers' ChainSync tasks.
+    pub(crate) csj: Option<Arc<crate::csj::CsjRegistry>>,
     /// GSM snapshot receiver — latest GSM state (watch channel, synchronous borrow).
     ///
     /// Consumers call `self.gsm_snapshot_rx.borrow()` to read the latest
@@ -2190,6 +2194,15 @@ impl Node {
         } else {
             None
         };
+        // ChainSync Jumping (Haskell mkGenesisConfig): genesis mode + EnableCSJ.
+        let csj = if genesis_enabled && genesis_params.options.enable_csj {
+            Some(crate::csj::CsjRegistry::new(
+                true,
+                genesis_params.options.effective_csj_jump_size(),
+            ))
+        } else {
+            None
+        };
         {
             let mut db = chain_db
                 .try_write()
@@ -2398,6 +2411,7 @@ impl Node {
             loe_out,
             lop_params,
             historicity_cutoff_secs,
+            csj,
             validate_all_blocks: args.validate_all_blocks,
             skip_eagerly_validated_header_crypto: args.skip_eagerly_validated_header_crypto,
             disk_space_rx: watch::channel(crate::disk_monitor::DiskSpaceLevel::Ok).1,
@@ -4108,6 +4122,7 @@ impl Node {
             self.gsm_snapshot_rx.clone(),
             self.lop_params,
             self.historicity_cutoff_secs,
+            self.csj.clone(),
             // Duplex server protocol fields
             Arc::new(serve::ChainDBBlockProvider {
                 chain_db: self.chain_db.clone(),
@@ -4268,6 +4283,8 @@ impl Node {
             let status_pm = peer_manager.clone();
             let status_metrics = self.metrics.clone();
             let status_chain_db = self.chain_db.clone();
+            let status_snapshot_rx = self.gsm_snapshot_rx.clone();
+            let status_csj = self.csj.clone();
             let status_shutdown = shutdown_rx.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(10));
@@ -4308,6 +4325,23 @@ impl Node {
                     if let Err(e) = status_event_tx.try_send(event) {
                         debug!("GSM SyncStatus event dropped: {e}");
                     }
+
+                    // Publish genesis observability (GSM state, LoE tip, CSJ roles).
+                    let snap = *status_snapshot_rx.borrow();
+                    let gsm_state_code = match snap.state {
+                        crate::gsm::GenesisSyncState::PreSyncing => 0,
+                        crate::gsm::GenesisSyncState::Syncing => 1,
+                        crate::gsm::GenesisSyncState::CaughtUp => 2,
+                    };
+                    let csj_roles = status_csj
+                        .as_ref()
+                        .map(|c| c.role_counts())
+                        .unwrap_or((0, 0, 0, 0));
+                    status_metrics.set_genesis_state(
+                        gsm_state_code,
+                        snap.loe_slot.unwrap_or(0),
+                        csj_roles,
+                    );
                 }
             });
         }
@@ -4778,6 +4812,7 @@ impl Node {
                     }
                 } => {
                     warn!(%addr, "GDD: density too low — disconnecting peer");
+                    self.metrics.record_gdd_disconnect();
                     let mut pm = peer_manager.write().await;
                     pm.peer_failed(&addr);
                     if let Some(ref mut lifecycle) = self.connection_lifecycle {
