@@ -3251,7 +3251,7 @@ fn unwrap_byron_n2n_header(header_cbor: &[u8]) -> Option<(u8, &[u8])> {
 ///    `header_body = [block_number, slot, ...]`.
 /// 2. **Byron HFC wrap** (sent by `cardano-node` for pre-Shelley blocks):
 ///    `[0, [[isEbb, size], tag24(bytes(byron_header))]]`.  EBB and main-block
-///    headers are decoded by [`decode_byron_header_slot`].
+///    headers are decoded by [`decode_byron_header_slot_difficulty`].
 /// 3. **Raw Shelley+ header** (already unwrapped) — kept for back-compat with
 ///    the legacy `chain_sync_loop` code path.
 ///
@@ -3259,13 +3259,31 @@ fn unwrap_byron_n2n_header(header_cbor: &[u8]) -> Option<(u8, &[u8])> {
 /// mainnet formula (`epoch * 21_600 + rel_slot`).
 ///
 /// Returns `None` if the header CBOR cannot be parsed.
+#[cfg(test)]
 fn extract_slot_from_wrapped_header(header_cbor: &[u8], byron_epoch_length: u64) -> Option<u64> {
+    extract_slot_block_no_from_wrapped_header(header_cbor, byron_epoch_length).map(|(s, _)| s)
+}
+
+/// Extract `(slot, block_no)` from a wrapped header.
+///
+/// Same decoding paths as `extract_slot_from_wrapped_header`, but also
+/// surfaces the block number for the Genesis candidate fragments
+/// (Haskell candidates are full headers; the GSM CaughtUp predicate and
+/// chain-preference comparison need `blockNo`):
+/// - Shelley+: `header_body = [block_number, slot, …]`.
+/// - Byron main: `consensus_data = [[epoch, rel_slot], issuer,
+///   [difficulty], sig]` — `difficulty` is the Byron chain length.
+/// - Byron EBB: `consensus_data = [epoch, [difficulty]]`.
+fn extract_slot_block_no_from_wrapped_header(
+    header_cbor: &[u8],
+    byron_epoch_length: u64,
+) -> Option<(u64, u64)> {
     use minicbor::Decoder;
 
     // 1. Byron HFC wrap — check first because its outer shape can collide
     //    with the raw-header fallback below.
     if let Some((is_ebb, byron_header_bytes)) = unwrap_byron_n2n_header(header_cbor) {
-        return decode_byron_header_slot(byron_header_bytes, is_ebb, byron_epoch_length);
+        return decode_byron_header_slot_difficulty(byron_header_bytes, is_ebb, byron_epoch_length);
     }
 
     // 2. Shelley+ HFC wrap: [era_tag(uint), tag24(bytes(inner_header))]
@@ -3273,9 +3291,9 @@ fn extract_slot_from_wrapped_header(header_cbor: &[u8], byron_epoch_length: u64)
         let mut inner = Decoder::new(inner_bytes);
         let _ = inner.array().ok()?;
         let _ = inner.array().ok()?;
-        let _block_number = inner.u64().ok()?;
+        let block_number = inner.u64().ok()?;
         let slot = inner.u64().ok()?;
-        return Some(slot);
+        return Some((slot, block_number));
     }
 
     // 3. Raw Shelley+ header (legacy path) — already unwrapped.
@@ -3284,9 +3302,9 @@ fn extract_slot_from_wrapped_header(header_cbor: &[u8], byron_epoch_length: u64)
     let mut dec = Decoder::new(header_cbor);
     if let Ok(Some(_outer_len)) = dec.array() {
         if let Ok(Some(_body_len)) = dec.array() {
-            let _block_number = dec.u64().ok()?;
+            let block_number = dec.u64().ok()?;
             let slot = dec.u64().ok()?;
-            return Some(slot);
+            return Some((slot, block_number));
         }
     }
 
@@ -3599,11 +3617,15 @@ pub(crate) async fn forecast_park_or_disconnect(
 ///
 /// `byron_epoch_length == 0` selects the mainnet formula
 /// (`epoch * 21_600 + rel_slot`, derived from `(epoch * 432_000) / 20`).
-fn decode_byron_header_slot(
+/// Byron header → `(absolute_slot, difficulty)`.
+///
+/// `difficulty` is Byron's chain-length counter (the block-number
+/// equivalent used for the Genesis candidate fragments).
+fn decode_byron_header_slot_difficulty(
     byron_header_cbor: &[u8],
     is_ebb: u8,
     byron_epoch_length: u64,
-) -> Option<u64> {
+) -> Option<(u64, u64)> {
     use minicbor::Decoder;
 
     let mut dec = Decoder::new(byron_header_cbor);
@@ -3616,14 +3638,18 @@ fn decode_byron_header_slot(
     dec.skip().ok()?; // body_proof
 
     // consensus_data
-    let (epoch, rel_slot) = match is_ebb {
+    let (epoch, rel_slot, difficulty) = match is_ebb {
         0 => {
             // EBB: consensus_data = [uint(epoch), array(1)[difficulty]]
             if dec.array().ok()? != Some(2) {
                 return None;
             }
             let epoch = dec.u64().ok()?;
-            (epoch, 0u64)
+            if dec.array().ok()? != Some(1) {
+                return None;
+            }
+            let difficulty = dec.u64().ok()?;
+            (epoch, 0u64, difficulty)
         }
         1 => {
             // Main: consensus_data =
@@ -3636,24 +3662,26 @@ fn decode_byron_header_slot(
             }
             let epoch = dec.u64().ok()?;
             let rel_slot = dec.u64().ok()?;
-            (epoch, rel_slot)
+            dec.skip().ok()?; // issuer
+            if dec.array().ok()? != Some(1) {
+                return None;
+            }
+            let difficulty = dec.u64().ok()?;
+            (epoch, rel_slot, difficulty)
         }
         _ => return None,
     };
 
-    if byron_epoch_length > 0 {
-        Some(
-            epoch
-                .checked_mul(byron_epoch_length)?
-                .checked_add(rel_slot)?,
-        )
+    let slot = if byron_epoch_length > 0 {
+        epoch
+            .checked_mul(byron_epoch_length)?
+            .checked_add(rel_slot)?
     } else {
-        Some(
-            epoch
-                .checked_mul(MAINNET_BYRON_SLOTS_PER_EPOCH)?
-                .checked_add(rel_slot)?,
-        )
-    }
+        epoch
+            .checked_mul(MAINNET_BYRON_SLOTS_PER_EPOCH)?
+            .checked_add(rel_slot)?
+    };
+    Some((slot, difficulty))
 }
 
 /// Convert a `dugite_primitives::block::Point` to a network `codec::Point`.
@@ -4011,7 +4039,33 @@ pub async fn chainsync_client_task(
     // Shared peer-manager handle — used by the rollback-below-immutable
     // guard (#699) to record divergence witnesses.
     peer_manager: Arc<RwLock<super::networking::NodePeerManager>>,
+    // Lossless per-peer Genesis chain state (candidate fragment, idling,
+    // csLatestSlot) — the Haskell `ChainSyncState` TVar analogue. Written
+    // synchronously at every protocol-message site; the GSM/GDD/LoE read it
+    // directly (GsmEvents remain wakeup hints only).
+    peer_registry: Arc<crate::genesis_peer_state::PeerStateRegistry>,
 ) -> Result<()> {
+    // Register this peer's shared chain state for the lifetime of the task.
+    // The anchor starts at Origin (no intersection yet): csLatestSlot=None
+    // keeps the peer out of GDD density comparisons (Gate 0) while
+    // idling=false blocks a spurious GSM CaughtUp — exactly Haskell's fresh
+    // `ChainSyncState`. Re-anchored after MsgIntersectFound below.
+    let peer_state =
+        peer_registry.register(peer_addr, crate::genesis_peer_state::FragAnchor::Origin);
+    // Deregister on EVERY exit path (incl. `?` errors): Drop guard.
+    struct RegistryGuard {
+        registry: Arc<crate::genesis_peer_state::PeerStateRegistry>,
+        addr: SocketAddr,
+    }
+    impl Drop for RegistryGuard {
+        fn drop(&mut self) {
+            self.registry.deregister(&self.addr);
+        }
+    }
+    let _registry_guard = RegistryGuard {
+        registry: peer_registry.clone(),
+        addr: peer_addr,
+    };
     // ═══════════════════════════════════════════════════════════════════════
     // Phase 1: Build known points for intersection
     // ═══════════════════════════════════════════════════════════════════════
@@ -4324,6 +4378,15 @@ pub async fn chainsync_client_task(
     // Emit PeerRegistered to the GSM actor after successful intersection.
     // The tip_slot here is 0 (we haven't received any headers yet); the
     // GSM will update it as PeerTipUpdated events arrive.
+    // Anchor the Genesis candidate fragment at the negotiated intersection
+    // (Haskell: the candidate fragment starts at the intersection point).
+    peer_state.set_anchor(match &intersection {
+        Some(CodecPoint::Specific(slot, hash)) => {
+            crate::genesis_peer_state::FragAnchor::Point(*slot, *hash)
+        }
+        _ => crate::genesis_peer_state::FragAnchor::Origin,
+    });
+
     if let Err(e) = gsm_event_tx.try_send(crate::gsm::GsmEvent::PeerRegistered {
         addr: peer_addr,
         intersection_slot,
@@ -4497,11 +4560,12 @@ pub async fn chainsync_client_task(
                         // peer to inject an arbitrary slot value into pipeline
                         // scheduling and epoch-boundary logic.  An undecodable header
                         // is a protocol violation → disconnect.
-                        let slot = match extract_slot_from_wrapped_header(
-                            &header,
-                            byron_epoch_length,
-                        ) {
-                            Some(s) => s,
+                        let (slot, header_block_no) =
+                            match extract_slot_block_no_from_wrapped_header(
+                                &header,
+                                byron_epoch_length,
+                            ) {
+                            Some(sb) => sb,
                             None => {
                                 return Err(anyhow::anyhow!(
                                     "ChainSync: {peer_addr} sent MsgRollForward with \
@@ -4662,6 +4726,15 @@ pub async fn chainsync_client_task(
                             entry.pending_headers.len()
                         };
 
+                        // Genesis candidate fragment: lossless synchronous write
+                        // (csLatestSlot first, idling cleared, header appended) —
+                        // the GSM events below are wakeup HINTS only.
+                        peer_state.on_roll_forward(crate::genesis_peer_state::FragEntry {
+                            slot,
+                            hash,
+                            block_no: header_block_no,
+                        });
+
                         // Emit GSM events: BlockReceived, PeerTipUpdated, PeerActive.
                         // All use try_send — if the channel is full, the event is
                         // dropped silently (the periodic SyncStatus ensures convergence).
@@ -4741,6 +4814,34 @@ pub async fn chainsync_client_task(
                             CodecPoint::Origin => 0,
                             CodecPoint::Specific(s, _) => *s,
                         };
+
+                        // Genesis candidate fragment: truncate to the rollback
+                        // point and clear idling (Haskell runs `idlingStop` in
+                        // the rollback arm too — finding lop-historicity-03).
+                        // A rollback target absent from our fragment (e.g. the
+                        // initial post-intersection rollback after the fragment
+                        // was re-anchored, or a rollback below a re-anchored
+                        // prefix) conservatively RESETS the fragment to that
+                        // anchor: the peer's candidate beyond it is unknown,
+                        // which under-credits density (safe direction). The
+                        // hard protocol guards (below-immutable, k-limit)
+                        // remain the disconnect authority below.
+                        {
+                            let (rb_slot, rb_hash) = match &point {
+                                CodecPoint::Origin => (0u64, [0u8; 32]),
+                                CodecPoint::Specific(s, h) => (*s, *h),
+                            };
+                            if !peer_state.on_roll_backward(rb_slot, &rb_hash) {
+                                peer_state.set_anchor(match &point {
+                                    CodecPoint::Origin => {
+                                        crate::genesis_peer_state::FragAnchor::Origin
+                                    }
+                                    CodecPoint::Specific(s, h) => {
+                                        crate::genesis_peer_state::FragAnchor::Point(*s, *h)
+                                    }
+                                });
+                            }
+                        }
                         let prim_point = from_codec_point(&point);
 
                         // ── k-block rollback limit (Haskell: terminateAfterDrain) ──
@@ -5020,6 +5121,10 @@ pub async fn chainsync_client_task(
                         // consume a request. The server will eventually respond
                         // with MsgRollForward or MsgRollBackward.
                         //
+                        // Genesis state: idlingStart (lossless; the GSM event
+                        // below is a wakeup hint only).
+                        peer_state.on_await_reply();
+
                         // Emit PeerIdling to the GSM actor so the GDD knows
                         // this peer has stopped sending blocks.
                         if let Err(e) = gsm_event_tx.try_send(crate::gsm::GsmEvent::PeerIdling {

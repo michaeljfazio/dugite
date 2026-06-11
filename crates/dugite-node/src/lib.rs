@@ -9,6 +9,7 @@ pub mod config_reload;
 pub mod csj_orchestrator;
 pub mod forge;
 pub mod genesis_params;
+pub mod genesis_peer_state;
 pub mod gsm;
 pub mod snapshot_convert;
 pub mod verify_snapshot;

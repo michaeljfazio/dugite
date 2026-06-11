@@ -628,6 +628,11 @@ pub struct ConnectionLifecycleManager {
     /// events to the GSM actor.
     gsm_event_tx: tokio::sync::mpsc::Sender<crate::gsm::GsmEvent>,
 
+    /// Lossless per-peer Genesis chain state (candidate fragments, idling,
+    /// csLatestSlot) — written synchronously by ChainSync tasks, read by the
+    /// GSM/GDD/LoE governor.
+    peer_registry: Arc<crate::genesis_peer_state::PeerStateRegistry>,
+
     /// Shared block provider for server protocols (ChainSync server, BlockFetch server).
     block_provider: Arc<ChainDBBlockProvider>,
 
@@ -759,6 +764,7 @@ impl ConnectionLifecycleManager {
         peer_failure_tx: mpsc::Sender<SocketAddr>,
         keepalive_rtt_tx: mpsc::Sender<(SocketAddr, f64)>,
         gsm_event_tx: tokio::sync::mpsc::Sender<crate::gsm::GsmEvent>,
+        peer_registry: Arc<crate::genesis_peer_state::PeerStateRegistry>,
         block_provider: Arc<ChainDBBlockProvider>,
         rollback_announcement_tx: broadcast::Sender<RollbackAnnouncement>,
         peer_manager_for_servers: Arc<RwLock<NodePeerManager>>,
@@ -792,6 +798,7 @@ impl ConnectionLifecycleManager {
             peer_failure_tx,
             keepalive_rtt_tx,
             gsm_event_tx,
+            peer_registry,
             block_provider,
             rollback_announcement_tx,
             peer_manager_for_servers,
@@ -1682,6 +1689,7 @@ impl ConnectionLifecycleManager {
         let active_slots_coeff = self.active_slots_coeff;
         let metrics = self.metrics.clone();
         let gsm_event_tx = self.gsm_event_tx.clone();
+        let peer_registry = self.peer_registry.clone();
         let peer_intersection_established = self.peer_intersection_established.clone();
         let peer_failure_tx = self.peer_failure_tx.clone();
         let peer_manager = self.peer_manager_for_servers.clone();
@@ -1721,6 +1729,7 @@ impl ConnectionLifecycleManager {
                         gsm_event_tx,
                         peer_intersection_established,
                         peer_manager,
+                        peer_registry,
                     ) => r
                 };
                 // Report any non-cancel failure to the peer manager so the
@@ -3013,6 +3022,7 @@ impl ConnectionLifecycleManager {
             peer_failure_tx,
             keepalive_rtt_tx,
             gsm_event_tx,
+            crate::genesis_peer_state::PeerStateRegistry::new(),
             block_provider,
             rollback_announcement_tx,
             peer_manager_for_servers,
@@ -3080,6 +3090,7 @@ impl ConnectionLifecycleManager {
             peer_failure_tx,
             keepalive_rtt_tx,
             gsm_event_tx,
+            crate::genesis_peer_state::PeerStateRegistry::new(),
             block_provider,
             rollback_announcement_tx,
             peer_manager_for_servers,
