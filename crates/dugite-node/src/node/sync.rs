@@ -4044,6 +4044,15 @@ pub async fn chainsync_client_task(
     // synchronously at every protocol-message site; the GSM/GDD/LoE read it
     // directly (GsmEvents remain wakeup hints only).
     peer_registry: Arc<crate::genesis_peer_state::PeerStateRegistry>,
+    // GSM state snapshot — gates the LoP bucket (active only while Syncing)
+    // and the historicity check (PreSyncing/Syncing only).
+    gsm_snapshot_rx: tokio::sync::watch::Receiver<crate::gsm::GsmSnapshot>,
+    // Limit on Patience (capacity, rate) — `None` in praos mode or when
+    // `EnableLoP=false` (Haskell ChainSyncLoPBucketDisabled).
+    lop_params: Option<(u64, u64)>,
+    // Historicity cutoff in seconds — `None` in praos mode (Haskell
+    // `gcHistoricityCutoff = Nothing` → `HistoricityCheck.noCheck`).
+    historicity_cutoff_secs: Option<u64>,
 ) -> Result<()> {
     // Register this peer's shared chain state for the lifetime of the task.
     // The anchor starts at Origin (no intersection yet): csLatestSlot=None
@@ -4449,8 +4458,57 @@ pub async fn chainsync_client_task(
         "ChainSync pipeline started",
     );
 
+    // Limit on Patience bucket (Haskell lopBucketConfig): active only while
+    // the GSM is Syncing; PreSyncing / CaughtUp / praos run the dummy.
+    let mut lop_bucket = crate::leaky_bucket::LopBucket::dummy(std::time::Instant::now());
+    let mut lop_was_active = false;
+
+    // Historicity check (Haskell HistoricityCheck.judgeMessageHistoricity):
+    // reject MsgRollBackward / MsgAwaitReply about headers older than the
+    // cutoff while PreSyncing/Syncing (CaughtUp and praos: noCheck).
+    // The slot→wallclock translation is the Shelley-anchored linear map;
+    // pre-Shelley slots saturate to the Shelley start, which still vastly
+    // exceeds the cutoff — exactly the verdict such ancient points deserve.
+    let judge_historicity =
+        |judged_slot: u64, view: &super::ledger_view::LedgerView, what: &str| -> Result<()> {
+            let Some(cutoff) = historicity_cutoff_secs else {
+                return Ok(());
+            };
+            let sc = &view.slot_config;
+            let slot_ms = sc
+                .zero_time
+                .saturating_add(judged_slot.saturating_sub(sc.zero_slot) * sc.slot_length as u64);
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let age_secs = now_ms.saturating_sub(slot_ms) / 1000;
+            if age_secs > cutoff {
+                return Err(anyhow::anyhow!(
+                    "ChainSync: {peer_addr} sent historical {what} \
+                 (judged slot {judged_slot}, age {age_secs}s > cutoff {cutoff}s) \
+                 — HistoricityError, disconnecting"
+                ));
+            }
+            Ok(())
+        };
+
     // Main loop: receive responses and update candidate_chains.
     loop {
+        // LoP reconfiguration on GSM state change (cschOnGsmStateChanged →
+        // updateLopBucketConfig — refills to capacity).
+        if let Some((capacity, rate)) = lop_params {
+            let syncing = gsm_snapshot_rx.borrow().state == crate::gsm::GenesisSyncState::Syncing;
+            if syncing != lop_was_active {
+                lop_was_active = syncing;
+                lop_bucket.reconfigure(std::time::Instant::now(), syncing, capacity, rate);
+                debug!(%peer_addr, active = syncing, "LoP bucket reconfigured");
+            }
+        }
+        // Empty deadline for the silent-peer case (Haskell's leak thread
+        // fires exactly when the bucket empties even if no message arrives).
+        let lop_deadline = lop_bucket.empty_deadline(std::time::Instant::now());
+
         // Check for cancellation before each recv.
         tokio::select! {
             biased;
@@ -4458,6 +4516,19 @@ pub async fn chainsync_client_task(
             _ = cancel.cancelled() => {
                 debug!(%peer_addr, "ChainSync task cancelled");
                 break;
+            }
+
+            // ── Limit on Patience exhausted ─────────────────────────────
+            _ = tokio::time::sleep_until(
+                tokio::time::Instant::from_std(
+                    lop_deadline.unwrap_or_else(|| std::time::Instant::now()
+                        + std::time::Duration::from_secs(3600)),
+                )
+            ), if lop_deadline.is_some() => {
+                return Err(anyhow::anyhow!(
+                    "ChainSync: {peer_addr} exhausted the Limit on Patience \
+                     (EmptyBucket) — disconnecting"
+                ));
             }
 
             // Periodic wakeup ONLY exists to break the deadlock when
@@ -4735,6 +4806,22 @@ pub async fn chainsync_client_task(
                             block_no: header_block_no,
                         });
 
+                        // LoP: any message resumes the leak; a header that
+                        // STRICTLY advances kBestBlockNo earns one token
+                        // (Haskell recvMsgRollForward: idlingStop >> lbResume,
+                        // then checkLoP).
+                        {
+                            let now = std::time::Instant::now();
+                            lop_bucket.resume(now);
+                            lop_bucket.on_header(now, header_block_no);
+                            if lop_bucket.is_empty(now) {
+                                return Err(anyhow::anyhow!(
+                                    "ChainSync: {peer_addr} exhausted the Limit on \
+                                     Patience (EmptyBucket) — disconnecting"
+                                ));
+                            }
+                        }
+
                         // Emit GSM events: BlockReceived, PeerTipUpdated, PeerActive.
                         // All use try_send — if the channel is full, the event is
                         // dropped silently (the periodic SyncStatus ensures convergence).
@@ -4814,6 +4901,31 @@ pub async fn chainsync_client_task(
                             CodecPoint::Origin => 0,
                             CodecPoint::Specific(s, _) => *s,
                         };
+
+                        // LoP: rollbacks also resume the leak (Haskell
+                        // recvMsgRollBackward: idlingStop >> lbResume).
+                        lop_bucket.resume(std::time::Instant::now());
+
+                        // Historicity: judge the OLDEST header this rollback
+                        // rewinds (depth-0 rollbacks are never historical —
+                        // Haskell judges the HeaderStateWithTime of the
+                        // oldest rewound header). Applies while
+                        // PreSyncing/Syncing only.
+                        if historicity_cutoff_secs.is_some()
+                            && gsm_snapshot_rx.borrow().state
+                                != crate::gsm::GenesisSyncState::CaughtUp
+                        {
+                            let frag = peer_state.fragment_snapshot();
+                            let oldest_rewound = frag
+                                .entries
+                                .iter()
+                                .find(|e| e.slot > rollback_slot)
+                                .map(|e| e.slot);
+                            if let Some(judged) = oldest_rewound {
+                                let view = ledger_view.load();
+                                judge_historicity(judged, &view, "MsgRollBackward")?;
+                            }
+                        }
 
                         // Genesis candidate fragment: truncate to the rollback
                         // point and clear idling (Haskell runs `idlingStop` in
@@ -5121,9 +5233,35 @@ pub async fn chainsync_client_task(
                         // consume a request. The server will eventually respond
                         // with MsgRollForward or MsgRollBackward.
                         //
+                        // Historicity: a peer claiming OUR candidate tip is
+                        // its chain tip (MsgAwaitReply) while that tip is
+                        // older than the cutoff is stalling us on a stale
+                        // chain (Haskell judges the candidate tip's
+                        // HeaderStateWithTime on HistoricalMsgAwaitReply).
+                        if historicity_cutoff_secs.is_some()
+                            && gsm_snapshot_rx.borrow().state
+                                != crate::gsm::GenesisSyncState::CaughtUp
+                        {
+                            let frag = peer_state.fragment_snapshot();
+                            let judged = match frag.head() {
+                                crate::genesis_peer_state::FragAnchor::Point(slot, _) => {
+                                    Some(slot)
+                                }
+                                crate::genesis_peer_state::FragAnchor::Origin => None,
+                            };
+                            if let Some(judged) = judged {
+                                let view = ledger_view.load();
+                                judge_historicity(judged, &view, "MsgAwaitReply")?;
+                            }
+                        }
+
                         // Genesis state: idlingStart (lossless; the GSM event
-                        // below is a wakeup hint only).
+                        // below is a wakeup hint only). The LoP bucket is
+                        // PAUSED while awaiting — an at-tip peer consumes no
+                        // patience (Haskell onMsgAwaitReply: idlingStart >>
+                        // lbPause).
                         peer_state.on_await_reply();
+                        lop_bucket.pause(std::time::Instant::now());
 
                         // Emit PeerIdling to the GSM actor so the GDD knows
                         // this peer has stopped sending blocks.

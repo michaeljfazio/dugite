@@ -633,6 +633,17 @@ pub struct ConnectionLifecycleManager {
     /// GSM/GDD/LoE governor.
     peer_registry: Arc<crate::genesis_peer_state::PeerStateRegistry>,
 
+    /// GSM state snapshot for per-peer protocol gating (LoP bucket activity,
+    /// historicity check).
+    gsm_snapshot_rx: tokio::sync::watch::Receiver<crate::gsm::GsmSnapshot>,
+
+    /// Limit on Patience (capacity, rate); `None` = disabled (praos or
+    /// `EnableLoP=false`).
+    lop_params: Option<(u64, u64)>,
+
+    /// Historicity cutoff seconds; `None` = praos (noCheck).
+    historicity_cutoff_secs: Option<u64>,
+
     /// Shared block provider for server protocols (ChainSync server, BlockFetch server).
     block_provider: Arc<ChainDBBlockProvider>,
 
@@ -765,6 +776,9 @@ impl ConnectionLifecycleManager {
         keepalive_rtt_tx: mpsc::Sender<(SocketAddr, f64)>,
         gsm_event_tx: tokio::sync::mpsc::Sender<crate::gsm::GsmEvent>,
         peer_registry: Arc<crate::genesis_peer_state::PeerStateRegistry>,
+        gsm_snapshot_rx: tokio::sync::watch::Receiver<crate::gsm::GsmSnapshot>,
+        lop_params: Option<(u64, u64)>,
+        historicity_cutoff_secs: Option<u64>,
         block_provider: Arc<ChainDBBlockProvider>,
         rollback_announcement_tx: broadcast::Sender<RollbackAnnouncement>,
         peer_manager_for_servers: Arc<RwLock<NodePeerManager>>,
@@ -799,6 +813,9 @@ impl ConnectionLifecycleManager {
             keepalive_rtt_tx,
             gsm_event_tx,
             peer_registry,
+            gsm_snapshot_rx,
+            lop_params,
+            historicity_cutoff_secs,
             block_provider,
             rollback_announcement_tx,
             peer_manager_for_servers,
@@ -1690,6 +1707,9 @@ impl ConnectionLifecycleManager {
         let metrics = self.metrics.clone();
         let gsm_event_tx = self.gsm_event_tx.clone();
         let peer_registry = self.peer_registry.clone();
+        let gsm_snapshot_rx = self.gsm_snapshot_rx.clone();
+        let lop_params = self.lop_params;
+        let historicity_cutoff_secs = self.historicity_cutoff_secs;
         let peer_intersection_established = self.peer_intersection_established.clone();
         let peer_failure_tx = self.peer_failure_tx.clone();
         let peer_manager = self.peer_manager_for_servers.clone();
@@ -1730,6 +1750,9 @@ impl ConnectionLifecycleManager {
                         peer_intersection_established,
                         peer_manager,
                         peer_registry,
+                        gsm_snapshot_rx,
+                        lop_params,
+                        historicity_cutoff_secs,
                     ) => r
                 };
                 // Report any non-cancel failure to the peer manager so the
@@ -3023,6 +3046,13 @@ impl ConnectionLifecycleManager {
             keepalive_rtt_tx,
             gsm_event_tx,
             crate::genesis_peer_state::PeerStateRegistry::new(),
+            tokio::sync::watch::channel(crate::gsm::GsmSnapshot {
+                state: crate::gsm::GenesisSyncState::CaughtUp,
+                loe_slot: None,
+            })
+            .1,
+            None,
+            None,
             block_provider,
             rollback_announcement_tx,
             peer_manager_for_servers,
@@ -3091,6 +3121,13 @@ impl ConnectionLifecycleManager {
             keepalive_rtt_tx,
             gsm_event_tx,
             crate::genesis_peer_state::PeerStateRegistry::new(),
+            tokio::sync::watch::channel(crate::gsm::GsmSnapshot {
+                state: crate::gsm::GenesisSyncState::CaughtUp,
+                loe_slot: None,
+            })
+            .1,
+            None,
+            None,
             block_provider,
             rollback_announcement_tx,
             peer_manager_for_servers,
