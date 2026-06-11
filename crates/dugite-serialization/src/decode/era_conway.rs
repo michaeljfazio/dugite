@@ -237,6 +237,18 @@ fn decode_conway_block_mode(
             let raw_witness = raw_witnesses.get(i).cloned();
             let auxiliary_data = aux_map.get(&(i as u32)).cloned();
 
+            // Reconstruct full wire-format tx CBOR for fee-size calculation.
+            // Haskell toCBORForSizeComputation (Conway) = array(3)[body,wits,aux];
+            // we build array(4) and fee_tx_size() subtracts the 1-byte is_valid.
+            let raw_cbor = Some(
+                crate::decode::era_babbage::reconstruct_alonzo_plus_tx_raw_cbor(
+                    &raw_body,
+                    raw_witness.as_deref().unwrap_or(&[0xA0]),
+                    is_valid,
+                    auxiliary_data.as_ref(),
+                ),
+            );
+
             Ok(Transaction {
                 hash: tx_hash,
                 era,
@@ -244,7 +256,7 @@ fn decode_conway_block_mode(
                 witness_set,
                 is_valid,
                 auxiliary_data,
-                raw_cbor: None,
+                raw_cbor,
                 raw_body_cbor: Some(raw_body),
                 raw_witness_cbor: raw_witness,
             })
@@ -5166,5 +5178,103 @@ mod tests {
             );
             proptest::prop_assert_eq!(read.unwrap(), blob);
         }
+    }
+
+    // ── Fix #744: block-decoded Conway tx must have raw_cbor populated ────────
+
+    /// Build a minimal Conway block inner CBOR (same 5-element structure as Babbage).
+    fn make_conway_block_inner(n_txs: usize) -> Vec<u8> {
+        // VRF result = [output(64), proof(80)]
+        let vrf_out = cbor_bytes(&[0u8; 64]);
+        let vrf_proof = cbor_bytes(&[0u8; 80]);
+        let vrf_result = cbor_arr(&[&vrf_out, &vrf_proof]);
+
+        // operational_cert = [hot_vkey(32), seq_num, kes_period, sigma(64)]
+        let op_cert = cbor_arr(&[
+            &cbor_bytes(&[0x10u8; 32]),
+            &cbor_uint(0),
+            &cbor_uint(0),
+            &cbor_bytes(&[0x11u8; 64]),
+        ]);
+        // protocol_version = [9, 0]  (Conway)
+        let proto_ver = cbor_arr(&[&cbor_uint(9), &cbor_uint(0)]);
+
+        // header_body = array(10)
+        let mut hb = vec![0x8au8]; // array(10)
+        hb.extend(cbor_uint(200)); // block_number
+        hb.extend(cbor_uint(88888888)); // slot
+        hb.extend(cbor_bytes(&[0xcc; 32])); // prev_hash
+        hb.extend(cbor_bytes(&[0x01; 32])); // issuer_vkey
+        hb.extend(cbor_bytes(&[0x02; 32])); // vrf_vkey
+        hb.extend(&vrf_result);
+        hb.extend(cbor_uint(0)); // body_size
+        hb.extend(cbor_bytes(&[0x00; 32])); // body_hash
+        hb.extend(&op_cert);
+        hb.extend(&proto_ver);
+
+        let kes_sig = cbor_bytes(&[0x05u8; 448]);
+        let mut header = vec![0x82u8]; // array(2)
+        header.extend(&hb);
+        header.extend(&kes_sig);
+
+        let mut tx_bodies_v = Vec::new();
+        let mut tx_witnesses_v = Vec::new();
+        if n_txs <= 23 {
+            tx_bodies_v.push(0x80 | n_txs as u8);
+            tx_witnesses_v.push(0x80 | n_txs as u8);
+        }
+        for _ in 0..n_txs {
+            // {0: [], 1: [], 2: 1000000}
+            let mut tb = vec![0xa3u8];
+            tb.extend(cbor_uint(0));
+            tb.push(0x80);
+            tb.extend(cbor_uint(1));
+            tb.push(0x80);
+            tb.extend(cbor_uint(2));
+            tb.extend(cbor_uint(1_000_000));
+            tx_bodies_v.extend(&tb);
+            tx_witnesses_v.push(0xa0u8); // empty witness set
+        }
+
+        let aux_data = vec![0xa0u8]; // {}
+        let invalid_txs = vec![0x80u8]; // []
+
+        let mut block = vec![0x85u8]; // array(5)
+        block.extend(&header);
+        block.extend(&tx_bodies_v);
+        block.extend(&tx_witnesses_v);
+        block.extend(&aux_data);
+        block.extend(&invalid_txs);
+        block
+    }
+
+    /// Fix #744 — block-decoded Conway tx must have raw_cbor populated so that
+    /// compute_min_fee can use the correct wire size for the fee formula.
+    #[test]
+    fn block_decoded_conway_tx_has_raw_cbor() {
+        let cbor = make_conway_block_inner(1);
+        let block = decode_conway_block(&cbor).unwrap();
+        let tx = &block.transactions[0];
+
+        assert!(
+            tx.raw_cbor.is_some(),
+            "block-decoded Conway tx must have raw_cbor populated for fee calculation"
+        );
+        let raw = tx.raw_cbor.as_ref().unwrap();
+        assert_eq!(
+            raw[0], 0x84,
+            "Conway tx raw_cbor must start with 0x84 (array-4)"
+        );
+
+        let body_len = tx.raw_body_cbor.as_ref().map_or(0, |b| b.len());
+        let witness_len = tx.raw_witness_cbor.as_ref().map_or(0, |b| b.len());
+        let expected_len = 1 + body_len + witness_len + 1 + 1;
+        assert_eq!(
+            raw.len(),
+            expected_len,
+            "raw_cbor.len()={} expected={}",
+            raw.len(),
+            expected_len
+        );
     }
 }
