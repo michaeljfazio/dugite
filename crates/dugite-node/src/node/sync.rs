@@ -3998,17 +3998,6 @@ pub(crate) fn should_refill_pipeline(
     !at_tip && outstanding <= low_mark && !*throttled
 }
 
-/// CSJ jumper protocol loop.
-///
-/// A jumper consumes `CsjInstruction`s from the registry: it offers
-/// `MsgFindIntersect` jumps (and never `MsgRequestNext`), bisects on
-/// rejection, and parks on its notify between jumps. Returns:
-/// - `Ok(true)` — the peer is now a streaming role (dynamo / objector);
-///   the caller falls through to the normal pipeline;
-/// - `Ok(false)` — the peer disengaged or was cancelled; the caller ends
-///   the task;
-/// - `Err` — a protocol violation; the caller disconnects.
-#[allow(clippy::too_many_arguments)]
 /// How a peer exits [`run_csj_jumper_loop`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JumperExit {
@@ -4033,6 +4022,13 @@ enum JumperExit {
     Done,
 }
 
+/// CSJ jumper protocol loop.
+///
+/// A jumper consumes `CsjInstruction`s from the registry: it offers
+/// `MsgFindIntersect` jumps (and never `MsgRequestNext`), bisects on
+/// rejection, and parks on its notify between jumps. Returns a
+/// [`JumperExit`] (`Err` = protocol violation; the caller disconnects).
+#[allow(clippy::too_many_arguments)]
 async fn run_csj_jumper_loop(
     channel: &mut MuxChannel,
     peer_addr: SocketAddr,
