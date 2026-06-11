@@ -8,6 +8,7 @@ pub mod config;
 pub mod config_reload;
 pub mod csj_orchestrator;
 pub mod forge;
+pub mod genesis_governor;
 pub mod genesis_params;
 pub mod genesis_peer_state;
 pub mod gsm;

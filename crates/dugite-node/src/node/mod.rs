@@ -720,6 +720,11 @@ pub struct Node {
     /// idling, csLatestSlot) — the Haskell per-peer `ChainSyncState` TVar
     /// analogue. Written by ChainSync tasks; read by the GSM/GDD/LoE.
     pub(crate) peer_registry: Arc<crate::genesis_peer_state::PeerStateRegistry>,
+
+    /// The Limit on Eagerness published by the GSM/GDD governor; consumed by
+    /// chain selection (`LoeState::Disabled` in praos mode = identity).
+    #[allow(dead_code)] // consumed by chain selection in the trimToLoE task (T5)
+    pub(crate) loe_out: Arc<arc_swap::ArcSwap<dugite_consensus::loe::LoeState>>,
     /// GSM snapshot receiver — latest GSM state (watch channel, synchronous borrow).
     ///
     /// Consumers call `self.gsm_snapshot_rx.borrow()` to read the latest
@@ -859,6 +864,10 @@ pub(crate) struct GsmActorParts {
     pub snapshot_tx: tokio::sync::watch::Sender<crate::gsm::GsmSnapshot>,
     pub action_tx: tokio::sync::mpsc::Sender<crate::gsm::GddAction>,
     pub action_rx: tokio::sync::mpsc::Receiver<crate::gsm::GddAction>,
+    /// Lossless per-peer chain state (shared with the ChainSync tasks).
+    pub registry: Arc<crate::genesis_peer_state::PeerStateRegistry>,
+    /// LoE publication target (shared with chain selection).
+    pub loe_out: Arc<arc_swap::ArcSwap<dugite_consensus::loe::LoeState>>,
 }
 
 // ─── Node impl: new() ────────────────────────────────────────────────────────
@@ -2096,10 +2105,56 @@ impl Node {
         // `loe_slot: None`, and all events sent to `gsm_event_tx` are no-ops
         // inside the actor.
         let genesis_enabled = args.consensus_mode == "genesis";
+        // Network-derived genesis parameters (audit gsm-07/gdd-04: the GSM
+        // previously ran mainnet-hardcoded k/sgen on every network).
+        let genesis_params = dugite_node::genesis_params::GenesisParams::from_network(
+            consensus.security_param,
+            consensus.active_slot_coeff,
+            shelley_genesis
+                .as_ref()
+                .map(|g| g.slot_length as f64)
+                .unwrap_or(1.0),
+            args.config.min_big_ledger_peers_for_trusted_state,
+            args.config
+                .low_level_genesis_options
+                .clone()
+                .unwrap_or_default(),
+        );
         let gsm_config = crate::gsm::GsmConfig {
+            min_active_blp: genesis_params.min_big_ledger_peers,
+            genesis_window_slots: genesis_params.sgen_slots,
+            gdd_rate_limit_ms: (genesis_params.options.effective_gdd_rate_limit_secs() * 1000.0)
+                .max(1.0) as u64,
+            security_param_k: genesis_params.security_param_k,
             marker_path: args.database_path.join("caught_up.marker"),
             ..Default::default()
         };
+        // The LoE handed to chain selection. Initial value mirrors Haskell's
+        // pre-setGetLoEFragment conservative default: in genesis mode an
+        // empty fragment anchored at the current immutable tip (≤ k blocks
+        // of selection freedom); in praos mode Disabled (identity).
+        let initial_loe = if genesis_enabled {
+            let db = chain_db
+                .try_read()
+                .expect("ChainDB lock available during startup");
+            let anchor = match db.get_immutable_tip_point() {
+                None | Some(dugite_primitives::block::Point::Origin) => None,
+                Some(dugite_primitives::block::Point::Specific(slot, hash)) => {
+                    Some(dugite_consensus::loe::LoePoint {
+                        slot: slot.0,
+                        hash: *hash.as_bytes(),
+                    })
+                }
+            };
+            dugite_consensus::loe::LoeState::Fragment {
+                anchor,
+                entries: Vec::new(),
+                k: genesis_params.security_param_k,
+            }
+        } else {
+            dugite_consensus::loe::LoeState::Disabled
+        };
+        let loe_out = Arc::new(arc_swap::ArcSwap::from_pointee(initial_loe));
         // G12: increased from 1024 to 4096 to absorb rapid peer churn events.
         let (gsm_event_tx, gsm_event_rx) = tokio::sync::mpsc::channel(GSM_EVENT_CHANNEL_CAP);
         let peer_registry = crate::genesis_peer_state::PeerStateRegistry::new();
@@ -2132,6 +2187,8 @@ impl Node {
             snapshot_tx: gsm_snapshot_tx,
             action_tx: gdd_action_tx,
             action_rx: gdd_action_rx,
+            registry: peer_registry.clone(),
+            loe_out: loe_out.clone(),
         });
 
         // Build and configure metrics before assembling the node struct so we
@@ -2282,6 +2339,7 @@ impl Node {
             live_epoch_transitions: 0,
             consensus_mode: args.consensus_mode,
             peer_registry,
+            loe_out,
             validate_all_blocks: args.validate_all_blocks,
             skip_eagerly_validated_header_crypto: args.skip_eagerly_validated_header_crypto,
             disk_space_rx: watch::channel(crate::disk_monitor::DiskSpaceLevel::Ok).1,
@@ -4086,12 +4144,18 @@ impl Node {
             // 1. Spawn the GSM actor — owns the GenesisStateMachine and
             //    processes GsmEvent messages, publishing GsmSnapshot via watch.
             let gsm_actor_shutdown = shutdown_rx.clone();
+            let gsm_chain_db = self.chain_db.clone();
+            let gsm_era_history = self.era_history.clone();
             tokio::spawn(async move {
                 let mut shutdown = gsm_actor_shutdown;
                 tokio::select! {
                     _ = crate::gsm::run_gsm_actor(
                         parts.config,
                         parts.enabled,
+                        parts.registry,
+                        gsm_chain_db,
+                        gsm_era_history,
+                        parts.loe_out,
                         parts.event_rx,
                         parts.snapshot_tx,
                         parts.action_tx,
