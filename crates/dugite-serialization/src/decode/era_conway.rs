@@ -1375,8 +1375,16 @@ fn read_conway_certificate(r: &mut Reader<'_>) -> Result<Certificate, Serializat
             Ok(Certificate::PoolRetirement { pool_hash, epoch })
         }
         5 => {
-            let genesis_hash = read_hash32(r)?;
-            let delegate_hash = read_hash32(r)?;
+            // GenesisKeyDelegation — Shelley CDDL:
+            //   (5, genesishash, genesis_delegate_hash, vrf_keyhash)
+            // genesishash / genesis_delegate_hash are 28-byte KEY hashes
+            // ($hash28); only vrf_keyhash is 32 bytes. Stored zero-padded in
+            // the Hash32 enum fields (the ledger consumer truncates back to
+            // 28 — see certificates.rs GenesisKeyDelegation). Reading them
+            // as Hash32 broke at the first real cert on mainnet (slot
+            // 66137371, the pre-Vasil genesis-delegate rotations).
+            let genesis_hash = read_hash28_cert(r)?.to_hash32_padded();
+            let delegate_hash = read_hash28_cert(r)?.to_hash32_padded();
             let vrf_keyhash = read_hash32(r)?;
             Ok(Certificate::GenesisKeyDelegation {
                 genesis_hash,
