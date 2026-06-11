@@ -2660,6 +2660,12 @@ impl Node {
         if let Err(e) = result {
             error!("Chunk-file replay task panicked: {e}");
         }
+
+        // Issue #742 defense-in-depth: publish the post-chunk-replay view so
+        // that per-peer forecast-park tasks see the updated tip immediately.
+        // Primary publish happens at the Node::run replay→live handover; this
+        // ensures coverage for future callers that skip that step.
+        self.publish_view_now().await;
     }
 
     /// Fallback replay: read blocks from ChainDB using slot-based iteration.
@@ -3082,6 +3088,14 @@ impl Node {
             if let Err(e) = ls.save_snapshot(&snapshot_path) {
                 error!("Failed to save ledger snapshot after replay: {e}");
             }
+
+            // Issue #742 defense-in-depth: publish the post-LSM-replay view
+            // so any caller of `replay_from_lsm` that doesn't separately
+            // call `publish_ledger_view` still gets a fresh view. The primary
+            // publish is at the `Node::run` replay→live handover in `mod.rs`,
+            // but having it here ensures correctness if this function is ever
+            // called from a future code path that doesn't do the handover step.
+            self.publish_ledger_view(&ls);
         }
     }
 }
@@ -3551,6 +3565,15 @@ pub(crate) async fn forecast_park_or_disconnect(
     // horizon and waits for the ledger rather than dropping the upstream peer.
     let mut last_progress = std::time::Instant::now();
     let mut wakes: u32 = 0;
+    // Issue #742: track total park duration so we can emit a rate-limited
+    // WARN when a peer has been parked for >60s. In genesis bulk-sync mode
+    // the park is expected (no timeout), but being silent at DEBUG only
+    // meant this failure mode was invisible at default log level.
+    let park_start = std::time::Instant::now();
+    let mut last_warn = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(120))
+        .unwrap_or(std::time::Instant::now());
+    const PARK_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
     loop {
         let view = ledger_view.load();
         let stability_window = if view.randomness_stabilisation_window > 0 {
@@ -3588,6 +3611,30 @@ pub(crate) async fn forecast_park_or_disconnect(
                         out.max_for.0,
                         FORECAST_PARK_TIMEOUT
                     ));
+                }
+                // Issue #742: emit a rate-limited WARN when a peer has been
+                // parked beyond the WARN interval (default 60s). This makes
+                // the stale-view deadlock visible at default log level.
+                // In non-genesis mode the hard timeout fires at 60s anyway,
+                // so the warn is primarily for the genesis bulk-sync park.
+                let total_parked = park_start.elapsed();
+                if total_parked >= PARK_WARN_INTERVAL
+                    && last_warn.elapsed() >= PARK_WARN_INTERVAL
+                {
+                    warn!(
+                        %peer_addr,
+                        header_slot,
+                        tip = ?out.at,
+                        max_for = out.max_for.0,
+                        parked_secs = total_parked.as_secs(),
+                        genesis_bulk_sync,
+                        "ChainSync: peer has been parked on forecast horizon for >{}s; \
+                         check that publish_ledger_view is firing after replay \
+                         (issue #742 — stale tip watch causes permanent park in \
+                         genesis bulk-sync mode)",
+                        PARK_WARN_INTERVAL.as_secs(),
+                    );
+                    last_warn = std::time::Instant::now();
                 }
                 debug!(
                     %peer_addr,
@@ -7642,6 +7689,129 @@ mod additional_sync_tests {
 // These tests verify the LedgerSeq invariant that Fix A + B enforce:
 // every applied block MUST contribute a delta so that rollback_via_seq
 // can always find the intersection point within k blocks.
+
+// ─── Fix 1: publish_ledger_view at replay→live handover (#742) ───────────────
+
+#[cfg(test)]
+mod fix1_replay_publish_tests {
+    use super::*;
+    use crate::gsm::{GenesisSyncState, GsmSnapshot};
+    use crate::node::ledger_view::LedgerView;
+    use dugite_ledger::LedgerState;
+    use dugite_primitives::protocol_params::ProtocolParameters;
+    use dugite_primitives::time::SlotNo;
+    use std::time::Duration;
+
+    fn make_view_swap_at(tip_slot: u64, sw: u64) -> Arc<arc_swap::ArcSwap<LedgerView>> {
+        let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        state.tip.point = if tip_slot == 0 {
+            dugite_primitives::block::Point::Origin
+        } else {
+            dugite_primitives::block::Point::Specific(
+                SlotNo(tip_slot),
+                dugite_primitives::hash::Hash32::ZERO,
+            )
+        };
+        state.randomness_stabilisation_window = sw;
+        Arc::new(arc_swap::ArcSwap::from_pointee(LedgerView::from_state(&state)))
+    }
+
+    /// Regression test for #742: before the fix, after a from-genesis replay the
+    /// tip watch was still at 0, causing `forecast_park_or_disconnect` to park
+    /// FOREVER in genesis-bulk-sync mode for any header slot > stability_window.
+    ///
+    /// This test seeds the watch at 0 (simulating post-replay stale state),
+    /// parks a header at slot 73_000_000 (typical first CSJ dynamo slot), then
+    /// simulates what `publish_ledger_view` does: advance the watch to 73_000_000
+    /// (now within horizon) and update the ArcSwap view. The function must wake
+    /// and return Ok within 500ms.
+    #[tokio::test]
+    async fn genesis_bulk_sync_park_wakes_when_tip_watch_advances() {
+        // tip=0 (stale post-replay state), sw=129600 (3k/f mainnet)
+        // max_for = 0 + 1 + 129600 = 129601 — slot 73M is outside.
+        let view = make_view_swap_at(0, 129_600);
+        // tip_rx starts at 0, simulating stale view that replay left behind.
+        let (tx, mut rx) = watch::channel(0u64);
+        let cancel = CancellationToken::new();
+        let peer: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+
+        // GSM snapshot saying we're in Genesis Syncing (bulk sync, not CaughtUp).
+        let (gsm_tx, gsm_rx) = watch::channel(GsmSnapshot {
+            state: GenesisSyncState::Syncing,
+            loe_slot: None,
+        });
+        let _ = gsm_tx; // keep alive
+
+        let view_for_writer = Arc::clone(&view);
+        // After 80ms: simulate what publish_ledger_view does — advance the watch
+        // to a slot that brings the header into range.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            // Publish a fresh view with tip=73_000_000 so max_for > 73_000_000.
+            let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+            state.tip.point = dugite_primitives::block::Point::Specific(
+                SlotNo(73_000_000),
+                dugite_primitives::hash::Hash32::ZERO,
+            );
+            state.randomness_stabilisation_window = 129_600;
+            view_for_writer.store(Arc::new(LedgerView::from_state(&state)));
+            let _ = tx.send(73_000_000u64);
+        });
+
+        let start = std::time::Instant::now();
+        let result = forecast_park_or_disconnect(
+            &peer,
+            73_000_000,
+            &view,
+            &mut rx,
+            &cancel,
+            Some(&gsm_rx),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "genesis bulk sync: park must wake on tip advance, got {:?}",
+            result
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(50) && elapsed < Duration::from_secs(2),
+            "expected ~80ms park, got {elapsed:?}"
+        );
+    }
+
+    /// Verify the tip watch channel semantics that Fix 1 relies on:
+    /// a watch::Sender::send advances the borrow value immediately.
+    #[test]
+    fn tip_watch_send_advances_borrow_immediately() {
+        let (tx, rx) = watch::channel(0u64);
+        assert_eq!(*rx.borrow(), 0);
+        tx.send(42).unwrap();
+        assert_eq!(*rx.borrow(), 42);
+        tx.send(73_000_000).unwrap();
+        assert_eq!(*rx.borrow(), 73_000_000);
+    }
+
+    /// Confirm that LedgerView::from_state correctly captures the tip slot,
+    /// so that the published view accurately reflects the post-replay ledger.
+    #[test]
+    fn ledger_view_captures_tip_slot_from_state() {
+        let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        state.tip.point = dugite_primitives::block::Point::Specific(
+            SlotNo(999_999),
+            dugite_primitives::hash::Hash32::ZERO,
+        );
+        state.randomness_stabilisation_window = 100;
+        let view = LedgerView::from_state(&state);
+        assert_eq!(
+            view.last_applied_slot,
+            Some(SlotNo(999_999)),
+            "view must reflect the post-replay ledger tip"
+        );
+    }
+}
+
 #[cfg(test)]
 mod bug_b_ledger_seq_regression {
     use dugite_ledger::ledger_seq::{LedgerDelta, LedgerSeq};
