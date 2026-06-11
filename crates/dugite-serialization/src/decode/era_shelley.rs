@@ -734,9 +734,16 @@ fn read_shelley_certificate(r: &mut Reader<'_>) -> Result<Certificate, Serializa
             Ok(Certificate::PoolRetirement { pool_hash, epoch })
         }
         5 => {
-            // GenesisKeyDelegation
-            let genesis_hash = read_hash32(r)?;
-            let delegate_hash = read_hash32(r)?;
+            // GenesisKeyDelegation — Shelley CDDL:
+            //   (5, genesishash, genesis_delegate_hash, vrf_keyhash)
+            // genesishash / genesis_delegate_hash are 28-byte KEY hashes
+            // ($hash28); only vrf_keyhash is 32 bytes. Stored zero-padded in
+            // the Hash32 enum fields (the ledger consumer truncates back to
+            // 28 — see certificates.rs GenesisKeyDelegation). Reading them
+            // as Hash32 broke at the first real cert on mainnet (slot
+            // 66137371, the pre-Vasil genesis-delegate rotations).
+            let genesis_hash = read_hash28_cert(r)?.to_hash32_padded();
+            let delegate_hash = read_hash28_cert(r)?.to_hash32_padded();
             let vrf_keyhash = read_hash32(r)?;
             Ok(Certificate::GenesisKeyDelegation {
                 genesis_hash,
@@ -2036,20 +2043,72 @@ mod tests {
 
     #[test]
     fn shelley_body_key_4_certificate_genesis_key_delegation() {
+        // CDDL: (5, genesishash: $hash28, genesis_delegate_hash: $hash28,
+        //        vrf_keyhash: $hash32). The previous fixture used 32-byte
+        //        key hashes, masking a decoder that read all three fields
+        //        as Hash32 and broke at the FIRST real cert on mainnet
+        //        (slot 66137371, pre-Vasil genesis-delegate rotations).
         let mut cert = vec![0x84]; // array(4)
         cert.extend(cbor_uint(5));
-        cert.extend(cbor_bytes(&[0x01; 32])); // genesis hash
-        cert.extend(cbor_bytes(&[0x02; 32])); // delegate hash
-        cert.extend(cbor_bytes(&[0x03; 32])); // vrf keyhash
+        cert.extend(cbor_bytes(&[0x01; 28])); // genesis KEY hash (28!)
+        cert.extend(cbor_bytes(&[0x02; 28])); // delegate KEY hash (28!)
+        cert.extend(cbor_bytes(&[0x03; 32])); // vrf keyhash (32)
         let mut extra = Vec::new();
         extra.extend(cbor_uint(4));
         extra.push(0x81);
         extra.extend(&cert);
         let block = decode_shelley_block(&shelley_block_with_tx_body(&extra, 1)).unwrap();
-        assert!(matches!(
-            block.transactions[0].body.certificates[0],
-            Certificate::GenesisKeyDelegation { .. }
-        ));
+        match &block.transactions[0].body.certificates[0] {
+            Certificate::GenesisKeyDelegation {
+                genesis_hash,
+                genesis_delegate_hash,
+                vrf_keyhash,
+            } => {
+                // 28-byte hashes are stored zero-PADDED in the Hash32 enum
+                // fields (the ledger truncates back to 28 on apply).
+                assert_eq!(&genesis_hash.as_bytes()[..28], &[0x01; 28]);
+                assert_eq!(&genesis_hash.as_bytes()[28..], &[0u8; 4]);
+                assert_eq!(&genesis_delegate_hash.as_bytes()[..28], &[0x02; 28]);
+                assert_eq!(vrf_keyhash.as_bytes(), &[0x03; 32]);
+            }
+            other => panic!("expected GenesisKeyDelegation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shelley_genesis_key_delegation_real_mainnet_cert() {
+        // The exact certificate from mainnet block 7492516 (slot 66137371)
+        // that broke the from-genesis sync at first contact — the genesis
+        // delegate key rotation ahead of the Vasil HF.
+        let genesis_hash =
+            hex::decode("2075a095b3c844a29c24317a94a643ab8e22d54a3a3a72a420260af6").unwrap();
+        let delegate_hash =
+            hex::decode("98599cbfede2ff9471797f7115ce2f745d83026936759fcf95092cc1").unwrap();
+        let vrf =
+            hex::decode("5549bba78a65e5160a8421b9ad7cf0db017dc8aa84e2f2cb957c490a2f699aca")
+                .unwrap();
+        let mut cert = vec![0x84];
+        cert.extend(cbor_uint(5));
+        cert.extend(cbor_bytes(&genesis_hash));
+        cert.extend(cbor_bytes(&delegate_hash));
+        cert.extend(cbor_bytes(&vrf));
+        let mut extra = Vec::new();
+        extra.extend(cbor_uint(4));
+        extra.push(0x81);
+        extra.extend(&cert);
+        let block = decode_shelley_block(&shelley_block_with_tx_body(&extra, 1)).unwrap();
+        match &block.transactions[0].body.certificates[0] {
+            Certificate::GenesisKeyDelegation {
+                genesis_hash: g,
+                genesis_delegate_hash: d,
+                vrf_keyhash: v,
+            } => {
+                assert_eq!(&g.as_bytes()[..28], genesis_hash.as_slice());
+                assert_eq!(&d.as_bytes()[..28], delegate_hash.as_slice());
+                assert_eq!(v.as_bytes(), vrf.as_slice());
+            }
+            other => panic!("expected GenesisKeyDelegation, got {other:?}"),
+        }
     }
 
     #[test]

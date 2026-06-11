@@ -277,8 +277,12 @@ pub fn encode_certificate(cert: &Certificate) -> Vec<u8> {
         } => {
             let mut buf = encode_array_header(4);
             buf.extend(encode_uint(5));
-            buf.extend(encode_hash32(genesis_hash));
-            buf.extend(encode_hash32(genesis_delegate_hash));
+            // CDDL: genesishash / genesis_delegate_hash are $hash28 — the
+            // enum stores them zero-PADDED in Hash32 (see the era decoders);
+            // re-encode the first 28 bytes so decode->encode round-trips the
+            // wire bytes exactly.
+            buf.extend(encode_bytes(&genesis_hash.as_bytes()[..28]));
+            buf.extend(encode_bytes(&genesis_delegate_hash.as_bytes()[..28]));
             buf.extend(encode_hash32(vrf_keyhash));
             buf
         }
