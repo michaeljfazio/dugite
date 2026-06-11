@@ -395,7 +395,10 @@ impl LedgerState {
     /// dugite is pre-1.0 and makes no snapshot back-compat guarantee:
     /// there is no migration shim and no `serde(default)` fallbacks on
     /// fields added after launch.
-    pub(crate) const SNAPSHOT_VERSION: u8 = 21;
+    /// v22 (#736): added `rupd_addrs_rew` (pv≤6 RUPD startStep capture)
+    /// and `pending_avvm_return` — both previously dropped on load,
+    /// breaking byte-exactness across mid-epoch restarts in pv≤6 epochs.
+    pub(crate) const SNAPSHOT_VERSION: u8 = 22;
 
     /// Save ledger state snapshot to disk using bincode serialization.
     ///

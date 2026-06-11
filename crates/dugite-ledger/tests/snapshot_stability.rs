@@ -56,13 +56,14 @@ fn snapshot_format_hash_stability() {
     // This hash was computed from the current LedgerStateSnapshot layout.
     // If this changes, existing snapshot files become unreadable.
     //
-    // Last update: SNAPSHOT_VERSION 20 → 21 (extraEntropy TICKN fix,
-    // 2026-05-30) — `ConsensusSubState` now carries an `extra_entropy: Hash32`
-    // field (Shelley `ppExtraEntropy`, ZERO = NeutralNonce) folded into the
-    // epoch nonce. bincode is positional so the format hash necessarily
-    // changes; pre-existing snapshots are quarantined on load and operators
+    // Last update: SNAPSHOT_VERSION 21 → 22 (#736, 2026-06-11) — the wire
+    // view now persists `rupd_addrs_rew` (pv≤6 RUPD startStep capture) and
+    // `pending_avvm_return`. Both were previously dropped on load, breaking
+    // byte-exactness across mid-epoch restarts in pv≤6 epochs (~2998 ADA
+    // treasury shortfall at the mainnet replay seam, boundary 337→338).
+    // Pre-existing snapshots are quarantined on load and operators
     // re-sync (no `serde(default)` migration shim — see SNAPSHOT_VERSION docs).
-    const EXPECTED_HASH: &str = "eb80510ad9a325575a2450380ead02eaf5a99273b29ba848be5346b01018275b";
+    const EXPECTED_HASH: &str = "90b5a01b00b54772b3f24f199c4ae728d1031bc7ff4d5ae1e708aad05c1297a9";
 
     if EXPECTED_HASH == "COMPUTE_ON_FIRST_RUN" {
         panic!(
