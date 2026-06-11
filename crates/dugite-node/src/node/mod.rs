@@ -4582,7 +4582,25 @@ impl Node {
                 // reaches ChainDB unconditionally; chain selection owns
                 // all routing decisions.
                 Some(fetched) = fetched_blocks_rx.recv() => {
+                    // Issue #742 Fix 2 — ChainSelStarvation edge recording
+                    // (Haskell ChainDB `getChainSelMessage`): the dequeue that
+                    // ends a starvation period stamps EndedAt(now) (CAS from
+                    // Ongoing); recorded at DEQUEUE time, before the apply,
+                    // exactly like Haskell.
+                    if let Some(ref lc) = self.connection_lifecycle {
+                        lc.chainsel_dequeued();
+                    }
                     self.apply_fetched_block(fetched).await;
+                    // After the apply, if the queue is empty we are about to
+                    // block waiting → starvation Ongoing. A FULL queue during
+                    // a long apply (epoch boundary, snapshot) keeps the old
+                    // EndedAt, so BlockFetch never mistakes apply latency for
+                    // peer starvation.
+                    if fetched_blocks_rx.is_empty() {
+                        if let Some(ref lc) = self.connection_lifecycle {
+                            lc.chainsel_queue_empty();
+                        }
+                    }
                 }
 
                 // ── ChainDB maintenance (periodic) ───────────────────────
@@ -6284,14 +6302,6 @@ impl Node {
         self.metrics
             .blocks_applied
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Issue #742 Fix 2: update starvation-detection timestamp so the
-        // BlockFetch grace-period check (ChainSelStarvation) knows the
-        // apply loop is making progress.  Called here — after a block is
-        // confirmed applied — so the starvation clock resets on real
-        // progress, not just on block receipt.
-        if let Some(ref lc) = self.connection_lifecycle {
-            lc.mark_block_applied();
-        }
         // Tip-query staleness fix (2026-05-16): shared post-apply housekeeping
         // also used by try_forge_block_at.  Replaces the previous inline
         // metric/mempool/snapshot updates.
