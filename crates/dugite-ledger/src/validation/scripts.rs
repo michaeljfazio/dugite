@@ -1803,4 +1803,120 @@ mod tests {
         let fee = calculate_ref_script_tiered_fee(15, 80_000);
         assert_eq!(fee, 1_480_704, "80,000 bytes tiered fee must be 1,480,704");
     }
+
+    // -----------------------------------------------------------------------
+    // Mainnet pin fixtures (#743/#744): three REAL Babbage transactions whose
+    // dugite-vs-Haskell minimum-fee arithmetic was verified to the lovelace
+    // against Koios mainnet ground truth during the 2026-06-12 FeeTooSmall
+    // divergence investigation. These pin the END-TO-END pipeline:
+    // standalone decode → raw_cbor → fee_tx_size (−1 is_valid) → 44·size +
+    // min_fee_b + single-ceiling ExUnits fee, with NO ref-script term at PV7.
+    //
+    //   tx 1a36a841… (ep367, Minswap swap): wire 862 B → fee-size 861,
+    //     eu = ceil(820,114·577/10⁴ + 270,993,264·721/10⁷) = 66,860
+    //     min = 44·861 + 155,381 + 66,860 = 260,125 (fee paid: 260,345)
+    //   tx 495d4ac7… : wire 864 B → fee-size 863, eu = 67,550 → min 260,903
+    //   tx 47dab938… (ep380, 2 redeemers): wire 1,022 B → fee-size 1,021,
+    //     eu = ceil over the SUMMED units (mem 3,452,498 / steps
+    //     1,074,904,790) = 276,710 → min 477,015 (fee paid: 485,947)
+    //
+    // Pre-#743 dugite reported minimums 260,656 / 261,346 / 642,331 for these
+    // very transactions (phantom Conway ref-script fee + missing size term),
+    // producing 59,574 false FeeTooSmall divergences on mainnet ep367-385.
+    // -----------------------------------------------------------------------
+
+    const MAINNET_TX_1A36A841: &str = include_str!("fixtures/tx-1a36a841.hex");
+    const MAINNET_TX_495D4AC7: &str = include_str!("fixtures/tx-495d4ac7.hex");
+    const MAINNET_TX_47DAB938: &str = include_str!("fixtures/tx-47dab938.hex");
+
+    fn hex_to_bytes(s: &str) -> Vec<u8> {
+        let s = s.trim();
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("valid hex"))
+            .collect()
+    }
+
+    /// Mainnet Babbage protocol parameters as of epoch 367-385 (the regime the
+    /// fixtures come from): a=44, b=155,381, prices mem 577/10⁴ steps 721/10⁷,
+    /// PV7, Conway ref-script price already present in the params struct (15)
+    /// — which must be IGNORED at PV<9.
+    fn mainnet_babbage_params() -> ProtocolParameters {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.min_fee_a = 44;
+        params.min_fee_b = 155_381;
+        params.protocol_version_major = 7;
+        params.min_fee_ref_script_cost_per_byte = 15;
+        params.execution_costs.mem_price.numerator = 577;
+        params.execution_costs.mem_price.denominator = 10_000;
+        params.execution_costs.step_price.numerator = 721;
+        params.execution_costs.step_price.denominator = 10_000_000;
+        params
+    }
+
+    fn pin_min_fee(hex: &str, expected_wire_len: usize, expected_min_fee: u64) {
+        let bytes = hex_to_bytes(hex);
+        assert_eq!(bytes.len(), expected_wire_len, "fixture wire length");
+        let tx =
+            dugite_serialization::decode::decode_transaction(5, &bytes).expect("decode Babbage tx");
+        assert_eq!(
+            tx.raw_cbor.as_ref().map(|c| c.len()),
+            Some(expected_wire_len),
+            "standalone decode must preserve full wire bytes"
+        );
+        let params = mainnet_babbage_params();
+        // Empty UTxO set: at PV7 the ref-script term must not apply, and the
+        // base+eu terms do not consult the UTxO set.
+        let utxo_set = UtxoSet::new();
+        let fee = compute_min_fee(&tx, &utxo_set, &params, bytes.len() as u64);
+        assert_eq!(
+            fee.0, expected_min_fee,
+            "Haskell-exact Babbage minimum fee for the pinned mainnet tx"
+        );
+    }
+
+    #[test]
+    fn pin_mainnet_babbage_min_fee_tx_1a36a841() {
+        pin_min_fee(MAINNET_TX_1A36A841, 862, 260_125);
+    }
+
+    #[test]
+    fn pin_mainnet_babbage_min_fee_tx_495d4ac7() {
+        pin_min_fee(MAINNET_TX_495D4AC7, 864, 260_903);
+    }
+
+    #[test]
+    fn pin_mainnet_babbage_min_fee_tx_47dab938() {
+        pin_min_fee(MAINNET_TX_47DAB938, 1_022, 477_015);
+    }
+
+    /// The same Minswap fixture evaluated at PV9 with its 2,561-byte PlutusV2
+    /// reference script resolvable in the UTxO set MUST charge the tiered
+    /// ref-script fee: 260,125 + 15·2,561 = 298,540 (single tier).  This pins
+    /// the PV gate from both sides with real mainnet data.
+    #[test]
+    fn pin_mainnet_min_fee_pv9_adds_ref_script_term() {
+        let bytes = hex_to_bytes(MAINNET_TX_1A36A841);
+        let tx =
+            dugite_serialization::decode::decode_transaction(5, &bytes).expect("decode Babbage tx");
+        let ref_input = tx
+            .body
+            .reference_inputs
+            .first()
+            .expect("fixture has a reference input")
+            .clone();
+        let mut output = simple_output();
+        output.script_ref = Some(ScriptRef::PlutusV2(vec![0u8; 2_561]));
+        let mut utxo_set = UtxoSet::new();
+        utxo_set.insert(ref_input, output);
+
+        let mut params = mainnet_babbage_params();
+        params.protocol_version_major = 9;
+        let fee = compute_min_fee(&tx, &utxo_set, &params, bytes.len() as u64);
+        assert_eq!(
+            fee.0,
+            260_125 + 38_415,
+            "PV9 must add tiered ref-script fee (2,561 B × 15 = 38,415)"
+        );
+    }
 }
