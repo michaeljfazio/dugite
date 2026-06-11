@@ -868,6 +868,44 @@ impl NodePeerManager {
             .count()
     }
 
+    /// The set of trusted local-root addresses (topology `localRoots`).
+    fn local_root_addrs(&self) -> std::collections::HashSet<SocketAddr> {
+        self.local_root_groups
+            .iter()
+            .flat_map(|g| g.addrs.iter().copied())
+            .collect()
+    }
+
+    /// Honest-Availability-Assumption satisfaction (Haskell
+    /// `outboundConnectionsState` → `TrustedStateWithExternalPeers`).
+    ///
+    /// Two independent ways to be trusted, matching the Haskell case split:
+    /// - **Local-roots trust** (`LocalRootsOnly`): there is at least one
+    ///   active (hot) peer AND every established (warm/hot) peer is a
+    ///   trusted local root. This is how a devnet — and a mainnet node early
+    ///   in boot before ledger big-ledger peers are established — satisfies
+    ///   the HAA.
+    /// - **Big-ledger trust** (Genesis mode, `DontUseBootstrapPeers`): at
+    ///   least `min_active_blp` ACTIVE big-ledger peers.
+    pub fn haa_satisfied(&self, min_active_blp: usize) -> bool {
+        if self.active_big_ledger_peer_count() >= min_active_blp {
+            return true;
+        }
+        let local_roots = self.local_root_addrs();
+        if local_roots.is_empty() {
+            return false;
+        }
+        let hot = self.inner.peers_in_state(PeerState::Hot);
+        if hot.is_empty() {
+            // Haskell requires at least one ACTIVE (hot) peer.
+            return false;
+        }
+        // Every ESTABLISHED (warm + hot) peer must be a trusted local root.
+        let mut established = self.inner.peers_in_state(PeerState::Warm);
+        established.extend(hot);
+        established.iter().all(|a| local_roots.contains(a))
+    }
+
     /// Get connected peer addresses.
     pub fn connected_peer_addrs(&self) -> Vec<SocketAddr> {
         self.conn_states.keys().copied().collect()
@@ -987,6 +1025,60 @@ impl std::fmt::Display for PeerManagerStats {
 mod tests {
     use super::*;
     use std::net::SocketAddr;
+
+    #[test]
+    fn test_haa_satisfied_via_trusted_local_roots() {
+        // Devnet / early-boot path: HAA holds when there is ≥1 hot peer and
+        // every established peer is a trusted local root, even with zero
+        // big-ledger peers (Haskell LocalRootsOnly → TrustedStateWithExternalPeers).
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        let root: SocketAddr = "127.0.0.1:3002".parse().unwrap();
+        pm.add_local_root_group(LocalRootGroupInfo {
+            name: "relays".into(),
+            addrs: vec![root],
+            hot_valency: 1,
+            warm_valency: 1,
+            diffusion_mode: None,
+            behind_firewall: false,
+            advertise: false,
+        });
+        // Not established yet → HAA not satisfied (no BLPs, no hot peer).
+        assert!(!pm.haa_satisfied(5));
+        // Warm only → still not satisfied (Haskell needs an ACTIVE peer).
+        pm.inner.promote_to_warm(&root);
+        assert!(!pm.haa_satisfied(5));
+        // Hot trusted local root → HAA satisfied.
+        pm.inner.promote_to_hot(&root);
+        assert!(pm.haa_satisfied(5));
+    }
+
+    #[test]
+    fn test_haa_not_satisfied_with_untrusted_hot_peer() {
+        // A hot peer that is NOT a local root (e.g. a public/ledger peer)
+        // does not satisfy the local-roots HAA path; only the big-ledger
+        // count can.
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        let root: SocketAddr = "127.0.0.1:3002".parse().unwrap();
+        let public: SocketAddr = "8.8.8.8:3001".parse().unwrap();
+        pm.add_local_root_group(LocalRootGroupInfo {
+            name: "relays".into(),
+            addrs: vec![root],
+            hot_valency: 1,
+            warm_valency: 1,
+            diffusion_mode: None,
+            behind_firewall: false,
+            advertise: false,
+        });
+        pm.add_config_peer(public);
+        pm.inner.promote_to_hot(&public);
+        // Established set includes a non-local-root hot peer → not all trusted.
+        assert!(!pm.haa_satisfied(5));
+        // No local roots at all → never satisfied via that path.
+        let mut pm2 = NodePeerManager::new(PeerManagerConfig::default());
+        pm2.add_config_peer(public);
+        pm2.inner.promote_to_hot(&public);
+        assert!(!pm2.haa_satisfied(5));
+    }
 
     #[test]
     fn test_effective_diffusion_mode_per_group() {
