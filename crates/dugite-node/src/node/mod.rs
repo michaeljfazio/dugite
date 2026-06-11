@@ -715,6 +715,11 @@ pub struct Node {
     /// the GSM actor processes events asynchronously and the periodic
     /// SyncStatus event ensures state convergence.
     pub(crate) gsm_event_tx: tokio::sync::mpsc::Sender<crate::gsm::GsmEvent>,
+
+    /// Lossless per-peer Genesis chain state registry (candidate fragments,
+    /// idling, csLatestSlot) — the Haskell per-peer `ChainSyncState` TVar
+    /// analogue. Written by ChainSync tasks; read by the GSM/GDD/LoE.
+    pub(crate) peer_registry: Arc<crate::genesis_peer_state::PeerStateRegistry>,
     /// GSM snapshot receiver — latest GSM state (watch channel, synchronous borrow).
     ///
     /// Consumers call `self.gsm_snapshot_rx.borrow()` to read the latest
@@ -2097,6 +2102,7 @@ impl Node {
         };
         // G12: increased from 1024 to 4096 to absorb rapid peer churn events.
         let (gsm_event_tx, gsm_event_rx) = tokio::sync::mpsc::channel(GSM_EVENT_CHANNEL_CAP);
+        let peer_registry = crate::genesis_peer_state::PeerStateRegistry::new();
         // Compute the initial snapshot so consumers have the right state
         // before the actor has even started.
         let initial_gsm_state = if genesis_enabled {
@@ -2275,6 +2281,7 @@ impl Node {
             genesis_validated: false,
             live_epoch_transitions: 0,
             consensus_mode: args.consensus_mode,
+            peer_registry,
             validate_all_blocks: args.validate_all_blocks,
             skip_eagerly_validated_header_crypto: args.skip_eagerly_validated_header_crypto,
             disk_space_rx: watch::channel(crate::disk_monitor::DiskSpaceLevel::Ok).1,
@@ -3981,6 +3988,7 @@ impl Node {
             peer_failure_tx,
             keepalive_rtt_tx,
             self.gsm_event_tx.clone(),
+            self.peer_registry.clone(),
             // Duplex server protocol fields
             Arc::new(serve::ChainDBBlockProvider {
                 chain_db: self.chain_db.clone(),
