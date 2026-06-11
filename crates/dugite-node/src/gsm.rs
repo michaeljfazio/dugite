@@ -132,10 +132,17 @@ pub enum GsmEvent {
     PeerActive { addr: SocketAddr },
     /// Periodic status update from the sync pipeline.
     SyncStatus {
+        /// Number of ACTIVE (hot) big-ledger peers — the HAA input
+        /// (Haskell `activeNumBigLedgerPeers`).
         active_blp_count: usize,
-        all_chainsync_idle: bool,
+        /// Block number of the current selection tip — the
+        /// candidate-vs-selection comparison baseline (Haskell
+        /// `getCurrentSelection` in `blockUntilCaughtUp`).
+        selection_block_no: u64,
+        /// LIVE age of the selection tip in seconds (now − slot wallclock):
+        /// the `durationUntilTooOld` input. Computed by the emitter each
+        /// tick — never a scrape-refreshed gauge (audit gsm-11).
         tip_age_secs: u64,
-        immutable_tip_slot: u64,
     },
 
     // ── CSJ Phase C events — constructed in csj_orchestrator (lib target) ───
@@ -215,12 +222,6 @@ pub struct GsmConfig {
     /// Maximum random jitter (seconds) added to the dwell time.
     /// Prevents multiple nodes from regressing simultaneously.
     pub anti_thundering_herd_max_secs: u64,
-    /// Genesis window size in slots (`sgen = 3k/f`).
-    ///
-    /// The GDD compares block density across peers within this window,
-    /// anchored at the intersection point. Defaults to 129_600 slots
-    /// (~36 hours at 1-second slot intervals, matching mainnet `k=2160, f=0.05`).
-    pub genesis_window_slots: u64,
     /// Minimum interval (milliseconds) between GDD evaluations.
     /// Rate-limits the pairwise comparison to avoid CPU spikes with many peers.
     pub gdd_rate_limit_ms: u64,
@@ -238,7 +239,6 @@ impl Default for GsmConfig {
             max_caught_up_age_secs: 1200,       // 20 minutes
             min_caught_up_dwell_secs: 1200,     // 20 minutes
             anti_thundering_herd_max_secs: 300, // up to 5 minutes jitter
-            genesis_window_slots: 129_600,      // 3 * 2160 / 0.05
             gdd_rate_limit_ms: 1000,            // 1 GDD tick per second
             security_param_k: 2160,             // mainnet default
             marker_path: PathBuf::from("caught_up.marker"),
@@ -280,16 +280,39 @@ pub struct GenesisStateMachine {
 impl GenesisStateMachine {
     /// Create a new GSM. If not enabled, it immediately enters CaughtUp
     /// and all constraints are disabled.
+    /// `initial_tip_age_secs`: live age of the selection tip at startup —
+    /// the `durationUntilTooOld` input for Haskell's
+    /// `initializationGsmState` marker-staleness table:
+    ///
+    /// | marker  | tip age                | initial state                |
+    /// |---------|------------------------|------------------------------|
+    /// | absent  | —                      | PreSyncing                   |
+    /// | present | `None` (no age limit)  | CaughtUp                     |
+    /// | present | young enough           | CaughtUp                     |
+    /// | present | already too old        | PreSyncing + marker DELETED  |
     pub fn new(
         config: GsmConfig,
         enabled: bool,
         registry: std::sync::Arc<crate::genesis_peer_state::PeerStateRegistry>,
+        initial_tip_age_secs: Option<u64>,
     ) -> Self {
         let initial_state = if enabled {
-            // Check for marker file — fast restart
             if config.marker_path.exists() {
-                info!("Genesis: caught_up marker found, starting in CaughtUp state");
-                GenesisSyncState::CaughtUp
+                let too_old = initial_tip_age_secs
+                    .map(|age| age > config.max_caught_up_age_secs)
+                    .unwrap_or(false);
+                if too_old {
+                    info!(
+                        age_secs = initial_tip_age_secs,
+                        "Genesis: caught_up marker is STALE (tip too old) — \
+                         removing marker, starting in PreSyncing"
+                    );
+                    let _ = std::fs::remove_file(&config.marker_path);
+                    GenesisSyncState::PreSyncing
+                } else {
+                    info!("Genesis: caught_up marker found, starting in CaughtUp state");
+                    GenesisSyncState::CaughtUp
+                }
             } else {
                 GenesisSyncState::PreSyncing
             }
@@ -355,16 +378,14 @@ impl GenesisStateMachine {
     /// Returns `Some(new_state)` if a transition occurred, `None` if unchanged.
     ///
     /// # Arguments
-    /// - `active_blp_count`: number of active big ledger peers
-    /// - `all_chainsync_idle`: whether all ChainSync clients are idle
-    /// - `tip_age_secs`: age of our chain tip in seconds
-    /// - `immutable_tip_slot`: current immutable tip slot (for within-window check)
+    /// - `active_blp_count`: number of ACTIVE (hot) big ledger peers (HAA)
+    /// - `selection_block_no`: block number of the current selection tip
+    /// - `tip_age_secs`: LIVE age of the selection tip in seconds
     pub fn evaluate(
         &mut self,
         active_blp_count: usize,
-        all_chainsync_idle: bool,
+        selection_block_no: u64,
         tip_age_secs: u64,
-        immutable_tip_slot: u64,
     ) -> Option<GenesisSyncState> {
         if !self.enabled {
             return None;
@@ -395,24 +416,18 @@ impl GenesisStateMachine {
                         min = self.config.min_active_blp,
                         "Genesis: HAA lost, regressing to PreSyncing"
                     );
-                } else if all_chainsync_idle
-                    && self.all_peers_idling()
-                    && tip_age_secs < self.config.max_caught_up_age_secs
-                    && self.all_peers_within_window(immutable_tip_slot)
-                    && self.csj_gate_satisfied()
-                {
-                    // Transition to CaughtUp when:
-                    // 1. All ChainSync clients are idle (both external heuristic
-                    //    AND per-peer MsgAwaitReply tracking)
-                    // 2. Our tip is fresh
-                    // 3. All peers' fragments are within the genesis window
-                    // 4. No unresolved CSJ objections
+                } else if self.caught_up_predicate(selection_block_no) {
+                    // Haskell `blockUntilCaughtUp`: at least one peer, every
+                    // peer idling (MsgAwaitReply), and no candidate better
+                    // than the selection. (Plus the dugite CSJ-diagnostics
+                    // gate, folded into the predicate.) On entry: write the
+                    // marker; the dwell below enforces minCaughtUpDuration.
                     self.state = GenesisSyncState::CaughtUp;
                     self.caught_up_since = Some(Instant::now());
                     self.write_marker();
                     info!(
-                        tip_age_secs,
-                        "Genesis: all peers idle and tip fresh, transitioning to CaughtUp"
+                        selection_block_no,
+                        "Genesis: all peers idle and no better candidate — CaughtUp"
                     );
                 }
             }
@@ -448,24 +463,44 @@ impl GenesisStateMachine {
         }
     }
 
-    /// Check whether all registered peers report idling (MsgAwaitReply).
-    /// Returns `true` if there are no peers or every peer's `idling` flag
-    /// is set (per-peer state from the lossless registry — Haskell
-    /// `all peerIsIdle states`).
-    fn all_peers_idling(&self) -> bool {
-        self.registry.all().iter().all(|(_, st)| st.is_idling())
-    }
-
-    /// Check whether all peers' fragment anchors are within the genesis
-    /// window relative to `immutable_tip_slot`.
-    fn all_peers_within_window(&self, immutable_tip_slot: u64) -> bool {
-        self.registry.all().iter().all(|(_, st)| {
-            let anchor_slot = match st.fragment_snapshot().anchor {
-                crate::genesis_peer_state::FragAnchor::Origin => 0,
-                crate::genesis_peer_state::FragAnchor::Point(s, _) => s,
-            };
-            immutable_tip_slot <= anchor_slot.saturating_add(self.config.genesis_window_slots)
-        })
+    /// The `Syncing → CaughtUp` entry predicate.
+    ///
+    /// Haskell `blockUntilCaughtUp` (GSM.hs), checked atomically:
+    ///
+    /// ```haskell
+    /// check $ not (Map.null states) && all peerIsIdle states
+    /// ...
+    /// let ok candidate =
+    ///       WhetherCandidateIsBetter False
+    ///         == candidateOverSelection selection candidate
+    /// check $ all ok candidates
+    /// ```
+    ///
+    /// The candidate-vs-selection comparison uses the candidate fragment
+    /// HEAD's block number against the selection tip's (the dominant,
+    /// longest-chain term of `preferAnchoredCandidate`). A candidate with
+    /// EQUAL block number that would win only on the VRF tiebreaker is
+    /// treated as not-better — the only effect is entering CaughtUp moments
+    /// before adopting that block, after which selection behaves
+    /// identically; no safety impact.
+    fn caught_up_predicate(&self, selection_block_no: u64) -> bool {
+        let peers = self.registry.all();
+        if peers.is_empty() {
+            // Haskell: `not (Map.null states)` — a node with no peers can
+            // NEVER declare itself caught up.
+            return false;
+        }
+        if !peers.iter().all(|(_, st)| st.is_idling()) {
+            return false;
+        }
+        let any_better = peers.iter().any(|(_, st)| {
+            let frag = st.fragment_snapshot();
+            frag.entries
+                .last()
+                .map(|e| e.block_no > selection_block_no)
+                .unwrap_or(false)
+        });
+        !any_better && self.csj_gate_satisfied()
     }
 
     // ── CSJ objection tracking (diagnostics gate) ───────────────────────────
@@ -604,6 +639,7 @@ pub async fn run_gsm_actor(
     chain_db: std::sync::Arc<tokio::sync::RwLock<dugite_storage::ChainDB>>,
     era_history: std::sync::Arc<tokio::sync::RwLock<dugite_consensus::EraHistory>>,
     loe_out: std::sync::Arc<arc_swap::ArcSwap<dugite_consensus::loe::LoeState>>,
+    initial_tip_age_secs: Option<u64>,
     mut event_rx: mpsc::Receiver<GsmEvent>,
     snapshot_tx: watch::Sender<GsmSnapshot>,
     action_tx: mpsc::Sender<GddAction>,
@@ -612,7 +648,7 @@ pub async fn run_gsm_actor(
 
     let gdd_interval_ms = config.gdd_rate_limit_ms;
     let k = config.security_param_k;
-    let mut gsm = GenesisStateMachine::new(config, enabled, registry.clone());
+    let mut gsm = GenesisStateMachine::new(config, enabled, registry.clone(), initial_tip_age_secs);
 
     // Publish initial snapshot.
     let initial_snapshot = GsmSnapshot {
@@ -657,11 +693,13 @@ pub async fn run_gsm_actor(
                     }
                     GsmEvent::SyncStatus {
                         active_blp_count,
-                        all_chainsync_idle,
+                        selection_block_no,
                         tip_age_secs,
-                        immutable_tip_slot,
                     } => {
-                        if gsm.evaluate(active_blp_count, all_chainsync_idle, tip_age_secs, immutable_tip_slot).is_some() {
+                        if gsm
+                            .evaluate(active_blp_count, selection_block_no, tip_age_secs)
+                            .is_some()
+                        {
                             state_changed = true;
                         }
                     }
@@ -1017,15 +1055,27 @@ mod tests {
             max_caught_up_age_secs: 600,
             min_caught_up_dwell_secs: 0, // no dwell for most tests
             anti_thundering_herd_max_secs: 0,
-            genesis_window_slots: 1_000,
             gdd_rate_limit_ms: 100,
             security_param_k: 2160,
             marker_path: PathBuf::from(marker_path),
         };
         let registry = PeerStateRegistry::new();
-        let mut gsm = GenesisStateMachine::new(config, enabled, registry.clone());
+        let mut gsm = GenesisStateMachine::new(config, enabled, registry.clone(), None);
         gsm.set_jitter(0); // deterministic
         (gsm, registry)
+    }
+
+    /// Register an idling peer whose fragment head is at `block_no` —
+    /// the minimum CaughtUp-eligible peer (Haskell: nonempty handle map,
+    /// all idling, candidate not better than selection).
+    fn add_idling_peer(reg: &Arc<PeerStateRegistry>, n: u8, block_no: u64) {
+        let st = reg.register(taddr(n), FragAnchor::Origin);
+        st.on_roll_forward(FragEntry {
+            slot: block_no * 10,
+            hash: h(n),
+            block_no,
+        });
+        st.on_await_reply();
     }
 
     // ── State transitions ────────────────────────────────────────────────
@@ -1035,76 +1085,95 @@ mod tests {
         let (mut gsm, _reg) = make_gsm(true, "/tmp/gsm_t1.marker");
         assert_eq!(gsm.state(), GenesisSyncState::PreSyncing);
         // Below HAA: stays.
-        assert!(gsm.evaluate(2, false, 9_999, 0).is_none());
+        assert!(gsm.evaluate(2, 0, 9_999).is_none());
         assert_eq!(gsm.state(), GenesisSyncState::PreSyncing);
         // HAA satisfied: Syncing.
-        assert_eq!(
-            gsm.evaluate(3, false, 9_999, 0),
-            Some(GenesisSyncState::Syncing)
-        );
+        assert_eq!(gsm.evaluate(3, 0, 9_999), Some(GenesisSyncState::Syncing));
     }
 
     #[test]
     fn test_state_haa_loss_regresses_to_presyncing() {
         let (mut gsm, _reg) = make_gsm(true, "/tmp/gsm_t2.marker");
-        gsm.evaluate(5, false, 9_999, 0);
+        gsm.evaluate(5, 0, 9_999);
         assert_eq!(gsm.state(), GenesisSyncState::Syncing);
         assert_eq!(
-            gsm.evaluate(1, false, 9_999, 0),
+            gsm.evaluate(1, 0, 9_999),
             Some(GenesisSyncState::PreSyncing)
         );
     }
 
     #[test]
     fn test_state_syncing_to_caught_up() {
-        let (mut gsm, _reg) = make_gsm(true, "/tmp/gsm_t3.marker");
-        gsm.evaluate(5, false, 9_999, 0);
-        // Not idle → stays Syncing.
-        assert!(gsm.evaluate(5, false, 10, 0).is_none());
-        // Idle + fresh tip → CaughtUp (empty registry: per-peer conjuncts
-        // vacuously true, matching the previous behavior until T6).
-        assert_eq!(
-            gsm.evaluate(5, true, 10, 0),
-            Some(GenesisSyncState::CaughtUp)
-        );
+        let (mut gsm, reg) = make_gsm(true, "/tmp/gsm_t3.marker");
+        gsm.evaluate(5, 0, 9_999);
+        // ZERO peers → never CaughtUp (Haskell `not (Map.null states)`).
+        assert!(gsm.evaluate(5, 100, 10).is_none());
+        // One idling peer whose candidate (bn 90) is not better than the
+        // selection (bn 100) → CaughtUp.
+        add_idling_peer(&reg, 1, 90);
+        assert_eq!(gsm.evaluate(5, 100, 10), Some(GenesisSyncState::CaughtUp));
         // Marker written.
         assert!(PathBuf::from("/tmp/gsm_t3.marker").exists());
         let _ = std::fs::remove_file("/tmp/gsm_t3.marker");
     }
 
     #[test]
+    fn test_better_candidate_blocks_caught_up() {
+        // Haskell stage 2: a candidate fragment head with a HIGHER block
+        // number than the selection blocks CaughtUp.
+        let (mut gsm, reg) = make_gsm(true, "/tmp/gsm_t3b.marker");
+        gsm.evaluate(5, 0, 9_999);
+        add_idling_peer(&reg, 1, 150); // candidate bn 150 > selection bn 100
+        assert!(
+            gsm.evaluate(5, 100, 10).is_none(),
+            "better candidate blocks"
+        );
+        // Selection catches up to bn 150 → no candidate better → CaughtUp.
+        assert_eq!(gsm.evaluate(5, 150, 10), Some(GenesisSyncState::CaughtUp));
+        let _ = std::fs::remove_file("/tmp/gsm_t3b.marker");
+    }
+
+    #[test]
     fn test_non_idling_peer_blocks_caught_up() {
         let (mut gsm, reg) = make_gsm(true, "/tmp/gsm_t4.marker");
-        gsm.evaluate(5, false, 9_999, 0);
-        // One peer, NOT idling → blocks CaughtUp even when the global
-        // heuristic says idle.
+        gsm.evaluate(5, 0, 9_999);
+        // One peer, NOT idling → blocks CaughtUp.
         let st = reg.register(taddr(1), FragAnchor::Origin);
-        assert!(gsm.evaluate(5, true, 10, 0).is_none());
-        // Peer goes idle → CaughtUp.
+        assert!(gsm.evaluate(5, 100, 10).is_none());
+        // Peer goes idle (candidate empty → not better) → CaughtUp.
         st.on_await_reply();
-        assert_eq!(
-            gsm.evaluate(5, true, 10, 0),
-            Some(GenesisSyncState::CaughtUp)
-        );
+        assert_eq!(gsm.evaluate(5, 100, 10), Some(GenesisSyncState::CaughtUp));
         let _ = std::fs::remove_file("/tmp/gsm_t4.marker");
     }
 
     #[test]
-    fn test_peer_outside_window_blocks_caught_up() {
-        let (mut gsm, reg) = make_gsm(true, "/tmp/gsm_t5.marker");
-        gsm.evaluate(5, false, 9_999, 0);
-        // Peer anchored at slot 0 with window 1000; immutable tip at 5000 is
-        // beyond anchor+window → blocks CaughtUp.
-        let st = reg.register(taddr(1), FragAnchor::Point(0, h(1)));
-        st.on_await_reply();
-        assert!(gsm.evaluate(5, true, 10, 5_000).is_none());
-        // Re-anchored near the tip → passes.
-        st.set_anchor(FragAnchor::Point(4_900, h(2)));
-        assert_eq!(
-            gsm.evaluate(5, true, 10, 5_000),
-            Some(GenesisSyncState::CaughtUp)
-        );
-        let _ = std::fs::remove_file("/tmp/gsm_t5.marker");
+    fn test_startup_marker_staleness() {
+        // Haskell initializationGsmState: marker + too-old tip → marker
+        // deleted, PreSyncing; marker + fresh tip → CaughtUp; marker +
+        // unknown age → CaughtUp.
+        let marker = "/tmp/gsm_t5.marker";
+        std::fs::write(marker, "caught_up").unwrap();
+        let config = GsmConfig {
+            max_caught_up_age_secs: 600,
+            marker_path: PathBuf::from(marker),
+            ..Default::default()
+        };
+        // Stale tip (age 601 > 600): PreSyncing + marker removed.
+        let gsm =
+            GenesisStateMachine::new(config.clone(), true, PeerStateRegistry::new(), Some(601));
+        assert_eq!(gsm.state(), GenesisSyncState::PreSyncing);
+        assert!(!PathBuf::from(marker).exists(), "stale marker deleted");
+
+        // Fresh tip: CaughtUp.
+        std::fs::write(marker, "caught_up").unwrap();
+        let gsm =
+            GenesisStateMachine::new(config.clone(), true, PeerStateRegistry::new(), Some(10));
+        assert_eq!(gsm.state(), GenesisSyncState::CaughtUp);
+
+        // Unknown age: trust the marker.
+        let gsm = GenesisStateMachine::new(config, true, PeerStateRegistry::new(), None);
+        assert_eq!(gsm.state(), GenesisSyncState::CaughtUp);
+        let _ = std::fs::remove_file(marker);
     }
 
     #[test]
@@ -1116,19 +1185,19 @@ mod tests {
             max_caught_up_age_secs: 600,
             min_caught_up_dwell_secs: 10_000, // long dwell
             anti_thundering_herd_max_secs: 0,
-            genesis_window_slots: 1_000,
             gdd_rate_limit_ms: 100,
             security_param_k: 2160,
             marker_path: PathBuf::from(marker),
         };
         let registry = PeerStateRegistry::new();
-        let mut gsm = GenesisStateMachine::new(config, true, registry);
+        add_idling_peer(&registry, 1, 50);
+        let mut gsm = GenesisStateMachine::new(config, true, registry, None);
         gsm.set_jitter(0);
-        gsm.evaluate(5, false, 9_999, 0);
-        gsm.evaluate(5, true, 10, 0);
+        gsm.evaluate(5, 100, 9_999);
+        gsm.evaluate(5, 100, 10);
         assert_eq!(gsm.state(), GenesisSyncState::CaughtUp);
         // Stale tip but dwell not elapsed → stays CaughtUp.
-        assert!(gsm.evaluate(5, false, 99_999, 0).is_none());
+        assert!(gsm.evaluate(5, 100, 99_999).is_none());
         assert_eq!(gsm.state(), GenesisSyncState::CaughtUp);
         let _ = std::fs::remove_file(marker);
     }
@@ -1136,13 +1205,14 @@ mod tests {
     #[test]
     fn test_caught_up_stale_tip_regresses_and_removes_marker() {
         let marker = "/tmp/gsm_t7.marker";
-        let (mut gsm, _reg) = make_gsm(true, marker);
-        gsm.evaluate(5, false, 9_999, 0);
-        gsm.evaluate(5, true, 10, 0);
+        let (mut gsm, reg) = make_gsm(true, marker);
+        add_idling_peer(&reg, 1, 50);
+        gsm.evaluate(5, 100, 9_999);
+        gsm.evaluate(5, 100, 10);
         assert_eq!(gsm.state(), GenesisSyncState::CaughtUp);
         assert!(PathBuf::from(marker).exists());
         assert_eq!(
-            gsm.evaluate(5, false, 601, 0),
+            gsm.evaluate(5, 100, 601),
             Some(GenesisSyncState::PreSyncing)
         );
         assert!(!PathBuf::from(marker).exists(), "marker removed on regress");
@@ -1156,7 +1226,7 @@ mod tests {
             marker_path: PathBuf::from(marker),
             ..Default::default()
         };
-        let gsm = GenesisStateMachine::new(config, true, PeerStateRegistry::new());
+        let gsm = GenesisStateMachine::new(config, true, PeerStateRegistry::new(), None);
         assert_eq!(gsm.state(), GenesisSyncState::CaughtUp);
         let _ = std::fs::remove_file(marker);
     }
@@ -1165,7 +1235,7 @@ mod tests {
     fn test_disabled_mode_is_inert() {
         let (mut gsm, _reg) = make_gsm(false, "/tmp/gsm_t9.marker");
         assert_eq!(gsm.state(), GenesisSyncState::CaughtUp);
-        assert!(gsm.evaluate(0, false, 99_999, 0).is_none());
+        assert!(gsm.evaluate(0, 0, 99_999).is_none());
         assert_eq!(gsm.compute_loe_slot(), None);
         // Marker never written in praos mode.
         assert!(!PathBuf::from("/tmp/gsm_t9.marker").exists());
@@ -1175,12 +1245,13 @@ mod tests {
 
     #[test]
     fn test_loe_slot_metric_per_state() {
-        let (mut gsm, _reg) = make_gsm(true, "/tmp/gsm_t10.marker");
+        let (mut gsm, reg) = make_gsm(true, "/tmp/gsm_t10.marker");
         assert_eq!(gsm.compute_loe_slot(), Some(0), "PreSyncing pins 0");
-        gsm.evaluate(5, false, 9_999, 0);
+        gsm.evaluate(5, 100, 9_999);
         gsm.set_loe_tip_slot(1234);
         assert_eq!(gsm.compute_loe_slot(), Some(1234), "Syncing reports tip");
-        gsm.evaluate(5, true, 10, 0);
+        add_idling_peer(&reg, 1, 50);
+        gsm.evaluate(5, 100, 10);
         assert_eq!(gsm.compute_loe_slot(), None, "CaughtUp unconstrained");
         let _ = std::fs::remove_file("/tmp/gsm_t10.marker");
     }
@@ -1194,14 +1265,16 @@ mod tests {
             max_caught_up_age_secs: 600,
             min_caught_up_dwell_secs: 0,
             anti_thundering_herd_max_secs: 0,
-            genesis_window_slots: 1_000,
             gdd_rate_limit_ms: 100,
             security_param_k: 2160,
             marker_path: PathBuf::from(marker),
         };
-        let mut gsm = GenesisStateMachine::new(config, true, PeerStateRegistry::new());
+        let registry = PeerStateRegistry::new();
+        // CaughtUp needs ≥1 idling, not-better peer.
+        add_idling_peer(&registry, 9, 50);
+        let mut gsm = GenesisStateMachine::new(config, true, registry, None);
         gsm.set_jitter(0);
-        gsm.evaluate(5, false, 0, 0);
+        gsm.evaluate(5, 100, 0);
         assert_eq!(gsm.state(), GenesisSyncState::Syncing);
         gsm
     }
@@ -1211,13 +1284,10 @@ mod tests {
         let mut gsm = make_syncing_gsm("/tmp/gsm_t11.marker");
         gsm.raise_objection(taddr(1));
         assert!(!gsm.csj_gate_satisfied());
-        assert!(gsm.evaluate(5, true, 10, 0).is_none(), "objection blocks");
+        assert!(gsm.evaluate(5, 100, 10).is_none(), "objection blocks");
         gsm.resolve_objection(&taddr(1), CsjObjectionOutcome::DynamoWins);
         assert!(gsm.csj_gate_satisfied());
-        assert_eq!(
-            gsm.evaluate(5, true, 10, 0),
-            Some(GenesisSyncState::CaughtUp)
-        );
+        assert_eq!(gsm.evaluate(5, 100, 10), Some(GenesisSyncState::CaughtUp));
         let _ = std::fs::remove_file("/tmp/gsm_t11.marker");
     }
 
@@ -1252,7 +1322,6 @@ mod tests {
             max_caught_up_age_secs: 600,
             min_caught_up_dwell_secs: 0,
             anti_thundering_herd_max_secs: 0,
-            genesis_window_slots: 1_000,
             gdd_rate_limit_ms: 20, // fast ticks for tests
             security_param_k: k,
             marker_path: marker,
@@ -1286,6 +1355,7 @@ mod tests {
             chain_db,
             era_history,
             loe.clone(),
+            None,
             event_rx,
             snapshot_tx,
             action_tx,
@@ -1304,9 +1374,8 @@ mod tests {
         h.event_tx
             .send(GsmEvent::SyncStatus {
                 active_blp_count: 5,
-                all_chainsync_idle: false,
+                selection_block_no: 0,
                 tip_age_secs: 9_999,
-                immutable_tip_slot: 0,
             })
             .await
             .unwrap();
@@ -1433,12 +1502,13 @@ mod tests {
     async fn test_actor_caught_up_disables_loe() {
         let h = spawn_actor(true, 1, 10);
         drive_to_syncing(&h).await;
+        // CaughtUp needs ≥1 idling, not-better peer in the registry.
+        add_idling_peer(&h.registry, 9, 50);
         h.event_tx
             .send(GsmEvent::SyncStatus {
                 active_blp_count: 5,
-                all_chainsync_idle: true,
+                selection_block_no: 1_000,
                 tip_age_secs: 10,
-                immutable_tip_slot: 0,
             })
             .await
             .unwrap();
@@ -1461,6 +1531,8 @@ mod tests {
     async fn test_csj_events_via_actor_channel() {
         let h = spawn_actor(true, 1, 10);
         drive_to_syncing(&h).await;
+        // CaughtUp needs ≥1 idling, not-better peer in the registry.
+        add_idling_peer(&h.registry, 9, 50);
         // Raise an objection, verify CaughtUp is blocked, resolve, verify
         // CaughtUp becomes reachable.
         h.event_tx
@@ -1474,9 +1546,8 @@ mod tests {
         h.event_tx
             .send(GsmEvent::SyncStatus {
                 active_blp_count: 5,
-                all_chainsync_idle: true,
+                selection_block_no: 1_000,
                 tip_age_secs: 10,
-                immutable_tip_slot: 0,
             })
             .await
             .unwrap();
@@ -1493,9 +1564,8 @@ mod tests {
         h.event_tx
             .send(GsmEvent::SyncStatus {
                 active_blp_count: 5,
-                all_chainsync_idle: true,
+                selection_block_no: 1_000,
                 tip_age_secs: 10,
-                immutable_tip_slot: 0,
             })
             .await
             .unwrap();
