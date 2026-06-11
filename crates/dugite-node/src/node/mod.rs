@@ -1861,6 +1861,29 @@ impl Node {
             consensus.set_opcert_counters(counters);
         }
 
+        // Lightweight checkpoints (cardano-node CheckpointsFile): loaded once
+        // at startup and enforced for every header in BOTH consensus modes
+        // (validateIfCheckpoint). Path resolves relative to the config file's
+        // directory. A parse error or file-hash mismatch is fatal.
+        if let Some(ref cp_file) = args.config.checkpoints_file {
+            let cp_dir = args
+                .config_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
+            let cp_path = cp_dir.join(cp_file);
+            let checkpoints = crate::checkpoints::load_checkpoints(
+                &cp_path,
+                args.config.checkpoints_file_hash.as_deref(),
+            )
+            .map_err(|e| anyhow::anyhow!("CheckpointsFile: {e}"))?;
+            info!(
+                path = %cp_path.display(),
+                count = checkpoints.len(),
+                "Loaded lightweight checkpoints"
+            );
+            consensus.set_checkpoints(checkpoints);
+        }
+
         // Build the HFC era history state machine from genesis parameters.
         // This replaces the hardcoded era lookup tables with a proper state machine
         // that tracks era boundaries and provides slot↔time conversions.

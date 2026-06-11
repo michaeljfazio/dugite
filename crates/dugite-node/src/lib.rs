@@ -1,3 +1,4 @@
+pub mod checkpoints;
 /// Public API surface of dugite-node, exposed for integration testing.
 ///
 /// The binary crate (main.rs) owns all module declarations and wires them
@@ -7,7 +8,6 @@
 pub mod config;
 pub mod config_reload;
 pub mod csj;
-pub mod csj_orchestrator;
 pub mod forge;
 pub mod genesis_governor;
 pub mod genesis_params;

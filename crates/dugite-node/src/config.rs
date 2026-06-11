@@ -503,6 +503,18 @@ pub struct NodeConfig {
     #[serde(default)]
     pub low_level_genesis_options: Option<LowLevelGenesisOptions>,
 
+    /// Path to a lightweight-checkpoints JSON file (cardano-node
+    /// `CheckpointsFile`): `{"checkpoints":[{"blockNo":N,"hash":hex},...]}`.
+    /// Resolved relative to the config file's directory. Checkpoints are
+    /// enforced for every header in both consensus modes.
+    #[serde(rename = "CheckpointsFile", default)]
+    pub checkpoints_file: Option<String>,
+
+    /// Optional Blake2b-256 hex of the checkpoints file bytes
+    /// (`CheckpointsFileHash`); a mismatch is a fatal startup error.
+    #[serde(rename = "CheckpointsFileHash", default)]
+    pub checkpoints_file_hash: Option<String>,
+
     // ── Genesis mode sync targets ──────────────────────────────────────
     /// Active peers during Genesis bulk sync (default: 5, matching cardano-node).
     #[serde(default = "default_sync_active_peers")]
@@ -1104,6 +1116,8 @@ impl Default for NodeConfig {
             experimental_hard_forks_enabled: false,
             consensus_mode: ConsensusMode::default(),
             low_level_genesis_options: None,
+            checkpoints_file: None,
+            checkpoints_file_hash: None,
             sync_target_number_of_active_peers: 5,
             sync_target_number_of_established_peers: 10,
             sync_target_number_of_known_peers: 150,

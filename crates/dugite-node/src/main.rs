@@ -2,6 +2,7 @@
 use dugite_node::config;
 use dugite_node::config_reload;
 use dugite_node::forge;
+mod checkpoints;
 mod csj;
 mod disk_monitor;
 mod genesis;
