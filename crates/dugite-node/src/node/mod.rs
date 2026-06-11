@@ -5389,10 +5389,26 @@ impl Node {
             };
             match cbor_opt {
                 Some(cbor) => {
-                    match dugite_serialization::decode_block_minimal_with_byron_epoch_length(
-                        &cbor,
-                        self.byron_epoch_length,
-                    ) {
+                    // #738: the ValidateAll phase-1/phase-2 oracle reads the
+                    // witness set, so fork blocks must go through the FULL
+                    // decoder. The minimal (witness-skipping) decoder is only
+                    // safe in ApplyOnly mode. Decoding fork batches minimally
+                    // made every tx in every LoE-reprocessed block fail
+                    // witness validation (542K MissingVKey/Script/Signer
+                    // divergences in a 19-minute window).
+                    let decode_result = if matches!(validation_mode, BlockValidationMode::ApplyOnly)
+                    {
+                        dugite_serialization::decode_block_minimal_with_byron_epoch_length(
+                            &cbor,
+                            self.byron_epoch_length,
+                        )
+                    } else {
+                        dugite_serialization::decode_block_with_byron_epoch_length(
+                            &cbor,
+                            self.byron_epoch_length,
+                        )
+                    };
+                    match decode_result {
                         Ok(fork_block) => {
                             let fork_slot = fork_block.slot();
                             let fork_block_no = fork_block.block_number();
@@ -8436,20 +8452,33 @@ impl Node {
                                         replay_failed = true;
                                         break;
                                     };
-                                    let fork_block = match dugite_serialization::decode_block_minimal_with_byron_epoch_length(
-                                    &cbor,
-                                    self.byron_epoch_length,
-                                ) {
-                                    Ok(b) => b,
-                                    Err(e) => {
-                                        warn!(
-                                            hash = %fork_hash.to_hex(),
-                                            "Forge fork replay: failed to decode block: {e}"
-                                        );
-                                        replay_failed = true;
-                                        break;
-                                    }
-                                };
+                                    // #738: ValidateAll reads the witness set —
+                                    // minimal decode is only safe for ApplyOnly.
+                                    let decode_result = if matches!(
+                                        validation_mode,
+                                        BlockValidationMode::ApplyOnly
+                                    ) {
+                                        dugite_serialization::decode_block_minimal_with_byron_epoch_length(
+                                            &cbor,
+                                            self.byron_epoch_length,
+                                        )
+                                    } else {
+                                        dugite_serialization::decode_block_with_byron_epoch_length(
+                                            &cbor,
+                                            self.byron_epoch_length,
+                                        )
+                                    };
+                                    let fork_block = match decode_result {
+                                        Ok(b) => b,
+                                        Err(e) => {
+                                            warn!(
+                                                hash = %fork_hash.to_hex(),
+                                                "Forge fork replay: failed to decode block: {e}"
+                                            );
+                                            replay_failed = true;
+                                            break;
+                                        }
+                                    };
                                     let fork_slot = fork_block.slot();
                                     let fork_block_no = fork_block.block_number();
                                     // Fix B (forge path): collect delta so LedgerSeq
