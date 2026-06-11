@@ -461,19 +461,28 @@ mod tests {
             .expect("timed out waiting for disk level update")
             .expect("watch channel closed unexpectedly");
 
-        // On any dev machine, the level should be Ok (plenty of space)
+        // This test verifies the WATCH-CHANNEL PLUMBING (a level gets
+        // published after the first check), not the host's actual disk
+        // fill — CI runners routinely sit above the warning threshold, so
+        // asserting `Ok` here was environment-flaky. The level/pause
+        // threshold logic is covered hermetically by
+        // `test_ingestion_pause_*` below via `evaluate_ingestion_pause`.
         let level = *disk_level_rx.borrow();
-        assert_eq!(
-            level,
-            DiskSpaceLevel::Ok,
-            "expected Ok disk level on dev machine, got {level:?}"
+        assert!(
+            matches!(
+                level,
+                DiskSpaceLevel::Ok | DiskSpaceLevel::Warning | DiskSpaceLevel::Critical
+            ),
+            "monitor must publish a concrete disk level, got {level:?}"
         );
 
-        // Ingestion should NOT be paused on a healthy dev machine
-        assert!(
-            !ingestion_paused.load(Ordering::Relaxed),
-            "ingestion_paused should be false when disk has plenty of space"
-        );
+        // Ingestion pause must be consistent with the published level.
+        if level == DiskSpaceLevel::Ok {
+            assert!(
+                !ingestion_paused.load(Ordering::Relaxed),
+                "ingestion_paused should be false when the level is Ok"
+            );
+        }
 
         // Shutdown the monitor
         shutdown_tx.send(true).ok();
