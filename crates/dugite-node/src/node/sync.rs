@@ -3993,6 +3993,30 @@ pub(crate) fn should_refill_pipeline(
 ///   the task;
 /// - `Err` — a protocol violation; the caller disconnects.
 #[allow(clippy::too_many_arguments)]
+/// How a peer exits [`run_csj_jumper_loop`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JumperExit {
+    /// Became a streaming role with its server cursor still at the normal
+    /// intersection — fall straight through to the pipeline.
+    Stream,
+    /// Was PROMOTED (dynamo/objector `JumpToGoodPoint` accepted): the server
+    /// cursor now sits at the far-ahead good point, so the caller MUST
+    /// re-intersect at the frontier before streaming (#735). Without this,
+    /// the promoted peer streams headers from the jump point, BlockFetch
+    /// downloads a far-ahead disjoint range, VolatileDB gets an unreachable
+    /// gap, and the single fetcher slot wedges (`fork unreachable`).
+    ///
+    /// Haskell avoids the gap because a jumper's candidate INHERITS the
+    /// dynamo's fragment from the immutable tip (`jTheirFragment`) and
+    /// BlockFetch serves bodies off that candidate; dugite's BlockFetch
+    /// needs streamed header CBOR, so the architectural equivalent is to
+    /// re-stream from the frontier — the gap headers died with the old
+    /// dynamo anyway.
+    StreamReintersect,
+    /// Disengaged or cancelled — the task is done.
+    Done,
+}
+
 async fn run_csj_jumper_loop(
     channel: &mut MuxChannel,
     peer_addr: SocketAddr,
@@ -4001,14 +4025,22 @@ async fn run_csj_jumper_loop(
     peer_state: &crate::genesis_peer_state::PeerChainState,
     byron_epoch_length: u64,
     cancel: &CancellationToken,
-) -> Result<bool> {
+) -> Result<JumperExit> {
     use crate::csj::CsjInstruction;
+    // Set when a JumpToGoodPoint promotion handshake is accepted — the
+    // server cursor has moved to the (potentially far-ahead) good point and
+    // the caller must re-intersect at the frontier before streaming (#735).
+    let mut promoted = false;
     loop {
         match csj.next_instruction(&peer_addr) {
             CsjInstruction::RunNormally | CsjInstruction::Restart => {
                 // Became dynamo/objector (or a disengaged peer that now runs
                 // normal ChainSync). Fall through to the streaming pipeline.
-                return Ok(true);
+                return Ok(if promoted {
+                    JumperExit::StreamReintersect
+                } else {
+                    JumperExit::Stream
+                });
             }
             CsjInstruction::Wait => {
                 // 1s timeout is a safety net: even if a jump notification is
@@ -4016,7 +4048,7 @@ async fn run_csj_jumper_loop(
                 // pending jump (next_jump is set losslessly by setJumps).
                 tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => return Ok(false),
+                    _ = cancel.cancelled() => return Ok(JumperExit::Done),
                     _ = notify.notified() => {}
                     _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
                 }
@@ -4039,7 +4071,7 @@ async fn run_csj_jumper_loop(
                         // Await exactly one intersect response (cancellable).
                         let data = tokio::select! {
                             biased;
-                            _ = cancel.cancelled() => return Ok(false),
+                            _ = cancel.cancelled() => return Ok(JumperExit::Done),
                             r = channel.recv() => r.map_err(|e| {
                                 anyhow::anyhow!("CSJ jump recv failed: {e}")
                             })?,
@@ -4073,7 +4105,15 @@ async fn run_csj_jumper_loop(
                 };
                 let _ = byron_epoch_length; // jumps carry no Byron headers
                 let replace = if is_good_point {
-                    csj.process_good_point_result(&peer_addr, accepted)
+                    let r = csj.process_good_point_result(&peer_addr, accepted);
+                    if accepted {
+                        // Promotion handshake succeeded — the server cursor
+                        // now sits at the good point. The caller must
+                        // re-intersect at the frontier before streaming so
+                        // BlockFetch only ever sees contiguous ranges (#735).
+                        promoted = true;
+                    }
+                    r
                 } else {
                     csj.process_jump_result(&peer_addr, ji.clone(), accepted)
                 };
@@ -4084,6 +4124,91 @@ async fn run_csj_jumper_loop(
                 }
             }
         }
+    }
+}
+
+/// Re-intersect a freshly-promoted CSJ dynamo/objector at the frontier
+/// (#735).
+///
+/// The promotion handshake (`JumpToGoodPoint`) left the peer's server
+/// cursor at its last accepted jump point — potentially hundreds of
+/// thousands of slots above our applied frontier. Streaming from there
+/// would hand BlockFetch a far-ahead disjoint range (the `fork
+/// unreachable` fetcher wedge). Re-anchor the session at the frontier so
+/// the promoted peer streams the gap headers itself — the dugite
+/// equivalent of Haskell's inherited `jTheirFragment` candidate (see
+/// [`JumperExit::StreamReintersect`]).
+///
+/// Known points: selected tip → recent volatile points → immutable tip.
+/// A promoted peer served (or agreed to) our chain's headers, so a
+/// `MsgIntersectNotFound` here means it rolled back off our chain —
+/// disconnect.
+async fn reintersect_promoted_peer(
+    channel: &mut MuxChannel,
+    peer_addr: SocketAddr,
+    chain_db: &Arc<RwLock<dugite_storage::ChainDB>>,
+    peer_state: &crate::genesis_peer_state::PeerChainState,
+    cancel: &CancellationToken,
+) -> Result<Option<CodecPoint>> {
+    let mut points: Vec<CodecPoint> = Vec::new();
+    {
+        let db = chain_db.read().await;
+        if let Some((slot, hash, _bn)) = db.get_tip_info() {
+            points.push(CodecPoint::Specific(slot.0, *hash.as_bytes()));
+        }
+        for p in db.get_chain_points(VOLATILE_POINTS_DEPTH) {
+            if let Point::Specific(slot, hash) = p {
+                let cp = CodecPoint::Specific(slot.0, *hash.as_bytes());
+                if !points.contains(&cp) {
+                    points.push(cp);
+                }
+            }
+        }
+        if let Some(Point::Specific(slot, hash)) = db.get_immutable_tip_point() {
+            let cp = CodecPoint::Specific(slot.0, *hash.as_bytes());
+            if !points.contains(&cp) {
+                points.push(cp);
+            }
+        }
+    }
+    if points.is_empty() {
+        points.push(CodecPoint::Origin);
+    }
+    points.truncate(MAX_KNOWN_POINTS);
+
+    let find = cs_encode(&ChainSyncMessage::MsgFindIntersect(points));
+    channel
+        .send(find)
+        .await
+        .map_err(|e| anyhow::anyhow!("CSJ reintersect MsgFindIntersect send failed: {e}"))?;
+    let data = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Ok(None),
+        r = channel.recv() => r.map_err(|e| {
+            anyhow::anyhow!("CSJ reintersect recv failed: {e}")
+        })?,
+    };
+    match cs_decode(&data).map_err(|e| anyhow::anyhow!("CSJ reintersect decode failed: {e}"))? {
+        ChainSyncMessage::MsgIntersectFound { point, .. } => {
+            info!(
+                %peer_addr,
+                point = ?point,
+                "CSJ: promoted peer re-intersected at frontier — streaming from there"
+            );
+            peer_state.set_anchor(match &point {
+                CodecPoint::Specific(slot, hash) => {
+                    crate::genesis_peer_state::FragAnchor::Point(*slot, *hash)
+                }
+                CodecPoint::Origin => crate::genesis_peer_state::FragAnchor::Origin,
+            });
+            Ok(Some(point))
+        }
+        ChainSyncMessage::MsgIntersectNotFound { .. } => Err(anyhow::anyhow!(
+            "CSJ: promoted peer {peer_addr} no longer intersects our chain — disconnecting"
+        )),
+        other => Err(anyhow::anyhow!(
+            "CSJ: {peer_addr} unexpected reintersect response: {other:?}"
+        )),
     }
 }
 
@@ -4563,10 +4688,10 @@ pub async fn chainsync_client_task(
         // Arm the unregister guard now that the peer is in the CSJ registry.
         _csj_guard.csj = Some(csj.clone());
 
-        // Jumper loop. Returns Ok(true) when the peer became a streaming role
-        // (dynamo/objector → fall through to the pipeline), Ok(false) when the
-        // peer disengaged or was cancelled (return), Err to disconnect.
-        let became_streamer = run_csj_jumper_loop(
+        // Jumper loop. Returns Stream/StreamReintersect when the peer became
+        // a streaming role (dynamo/objector → fall through to the pipeline),
+        // Done when the peer disengaged or was cancelled, Err to disconnect.
+        let jumper_exit = run_csj_jumper_loop(
             &mut channel,
             peer_addr,
             csj,
@@ -4576,14 +4701,37 @@ pub async fn chainsync_client_task(
             &cancel,
         )
         .await?;
-        if !became_streamer {
-            // Disengaged or cancelled — the task is done (a disengaged jumper
-            // that should run normal ChainSync re-enters via reconnection;
-            // dugite keeps the per-peer task simple).
-            let mut chains = candidate_chains.write().await;
-            chains.remove(&peer_addr);
-            // `_csj_guard` unregisters on this return (→ backfill/re-elect).
-            return Ok(());
+        match jumper_exit {
+            JumperExit::Done => {
+                // Disengaged or cancelled — the task is done (a disengaged
+                // jumper that should run normal ChainSync re-enters via
+                // reconnection; dugite keeps the per-peer task simple).
+                let mut chains = candidate_chains.write().await;
+                chains.remove(&peer_addr);
+                // `_csj_guard` unregisters on this return (→ backfill/re-elect).
+                return Ok(());
+            }
+            JumperExit::StreamReintersect => {
+                // Promoted dynamo/objector: re-anchor the session at the
+                // frontier so it streams the gap headers itself and
+                // BlockFetch only ever sees contiguous ranges (#735).
+                let found = reintersect_promoted_peer(
+                    &mut channel,
+                    peer_addr,
+                    &chain_db,
+                    &peer_state,
+                    &cancel,
+                )
+                .await?;
+                let Some(point) = found else {
+                    // Cancelled mid-handshake.
+                    let mut chains = candidate_chains.write().await;
+                    chains.remove(&peer_addr);
+                    return Ok(());
+                };
+                intersection = Some(point);
+            }
+            JumperExit::Stream => {}
         }
     }
 
