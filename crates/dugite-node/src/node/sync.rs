@@ -4696,6 +4696,20 @@ pub async fn chainsync_client_task(
                 debug!(%peer_addr, active = syncing, "LoP bucket reconfigured");
             }
         }
+        // Haskell parity (Client.hs `pauseBucket` around `checkTime`,
+        // lines 1880-1889): the bucket must not leak while WE are the
+        // bottleneck — "we should not leak tokens as our peer is not
+        // responsible for this waiting time". dugite's wire-level
+        // backpressure (`throttled`, see `should_refill_pipeline`) is
+        // exactly that state: we stopped sending MsgRequestNext, so the
+        // peer owes us nothing and must not be charged patience. Without
+        // this, every hot peer dies of EmptyBucket ~200 s into any bulk
+        // sync where BlockFetch (not the peer) is the rate limiter (#740:
+        // 237 LoP kills / 34 min → BLP churn → HAA flap → GSM flap).
+        // The at-tip pause/resume pair is managed by the MsgAwaitReply /
+        // MsgRollForward / MsgRollBackward handlers (Haskell sites
+        // onMsgAwaitReply / handleNext).
+        lop_bucket.reconcile_backpressure(std::time::Instant::now(), throttled, at_tip);
         // Empty deadline for the silent-peer case (Haskell's leak thread
         // fires exactly when the bucket empties even if no message arrives).
         let lop_deadline = lop_bucket.empty_deadline(std::time::Instant::now());
@@ -4856,7 +4870,14 @@ pub async fn chainsync_client_task(
                         // and Byron is at most ~1 day of mainnet — the missed
                         // fan-out is negligible during bulk sync.
                         if !is_byron_wrapped_header(&header) {
-                            forecast_park_or_disconnect(
+                            // Haskell parity (Client.hs `pauseBucket`, Site D):
+                            // pause the LoP bucket for the entire forecast-
+                            // horizon wait — the peer is not responsible for
+                            // our ledger lagging behind its header. The
+                            // loop-top reconcile re-pauses afterwards if the
+                            // wire-level throttle is engaged.
+                            lop_bucket.pause(std::time::Instant::now());
+                            let park_result = forecast_park_or_disconnect(
                                 &peer_addr,
                                 slot,
                                 &ledger_view,
@@ -4864,7 +4885,9 @@ pub async fn chainsync_client_task(
                                 &cancel,
                                 Some(&gsm_snapshot_rx),
                             )
-                            .await?;
+                            .await;
+                            lop_bucket.resume(std::time::Instant::now());
+                            park_result?;
                         }
 
                         // Issue #654 P1.b — eager per-peer header

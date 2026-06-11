@@ -124,6 +124,26 @@ impl LopBucket {
         }
     }
 
+    /// Reconcile the pause state with the client-side backpressure flags
+    /// (Haskell `pauseBucket` around `checkTime`, Client.hs lines
+    /// 1880-1889: "we should not leak tokens as our peer is not
+    /// responsible for this waiting time").
+    ///
+    /// - `throttled` (wire-level backpressure engaged — WE stopped sending
+    ///   `MsgRequestNext`): the peer owes us nothing → pause.
+    /// - not throttled and not awaiting (`at_tip`): the peer owes us a
+    ///   header → leak.
+    /// - not throttled but awaiting: leave the `MsgAwaitReply` pause in
+    ///   place (Haskell `onMsgAwaitReply`); the next
+    ///   `MsgRollForward`/`MsgRollBackward` resumes it.
+    pub fn reconcile_backpressure(&mut self, now: Instant, throttled: bool, awaiting: bool) {
+        if throttled {
+            self.pause(now);
+        } else if !awaiting {
+            self.resume(now);
+        }
+    }
+
     /// True when the active bucket has run dry (`onEmpty` fires —
     /// the peer must be disconnected with `EmptyBucket`).
     pub fn is_empty(&mut self, now: Instant) -> bool {
@@ -203,6 +223,56 @@ mod tests {
         b.on_header(now, 1);
         assert!(b.level <= 100_000.0);
         assert_eq!(b.level, 100_000.0);
+    }
+
+    #[test]
+    fn reconcile_throttle_pauses_and_release_resumes() {
+        // #740: a peer under wire-level backpressure must not be charged
+        // patience — 100k tokens @ 500/s would otherwise kill every hot
+        // peer ~200s into bulk sync (observed: 237 kills / 34 min).
+        let now = t0();
+        let mut b = active_bucket(now);
+        // Throttle engages 10 s in: 5_000 tokens drained, then frozen.
+        b.reconcile_backpressure(now + Duration::from_secs(10), true, false);
+        assert_eq!(
+            b.empty_deadline(now + Duration::from_secs(10)),
+            None,
+            "throttled bucket never empties on its own"
+        );
+        // 10 minutes throttled: still not empty (no leak while paused).
+        assert!(!b.is_empty(now + Duration::from_secs(610)));
+        // Throttle releases: leak resumes from 95_000 → empty after 190 s.
+        let released = now + Duration::from_secs(610);
+        b.reconcile_backpressure(released, false, false);
+        assert!(!b.is_empty(released + Duration::from_secs(189)));
+        assert!(b.is_empty(released + Duration::from_secs(191)));
+    }
+
+    #[test]
+    fn reconcile_preserves_await_pause_when_not_throttled() {
+        // An at-tip peer (MsgAwaitReply) is paused by the await handler;
+        // the loop-top reconcile must NOT resume it while still awaiting.
+        let now = t0();
+        let mut b = active_bucket(now);
+        b.pause(now); // MsgAwaitReply
+        b.reconcile_backpressure(now + Duration::from_secs(1), false, true);
+        assert_eq!(
+            b.empty_deadline(now + Duration::from_secs(1)),
+            None,
+            "await pause survives reconcile"
+        );
+        // Header arrives (awaiting clears): reconcile resumes the leak.
+        b.reconcile_backpressure(now + Duration::from_secs(2), false, false);
+        assert!(b.empty_deadline(now + Duration::from_secs(2)).is_some());
+    }
+
+    #[test]
+    fn reconcile_throttle_dominates_await() {
+        // Throttled AND awaiting: paused either way.
+        let now = t0();
+        let mut b = active_bucket(now);
+        b.reconcile_backpressure(now, true, true);
+        assert_eq!(b.empty_deadline(now), None);
     }
 
     #[test]

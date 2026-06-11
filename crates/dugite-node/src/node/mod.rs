@@ -4484,6 +4484,33 @@ impl Node {
         let mut last_seen_loe_slot = loe_watch_rx.borrow().loe_slot;
         let mut last_seen_gsm_state = loe_watch_rx.borrow().state;
 
+        // Which target set the governor is currently running (true = sync
+        // targets). Haskell `getPeerSelectionTargets` keys the switch on the
+        // LedgerStateJudgement — PreSyncing and Syncing BOTH map to TooOld —
+        // so the boundary is CaughtUp ↔ not-CaughtUp, never the
+        // PreSyncing ↔ Syncing flap (#740). Apply sync targets from boot
+        // when the GSM starts below CaughtUp rather than waiting for the
+        // first transition.
+        let mut sync_targets_applied = false;
+        if genesis_enabled && last_seen_gsm_state != crate::gsm::GenesisSyncState::CaughtUp {
+            let cfg = &self.config;
+            let targets = dugite_network::peer::governor::PeerTargets {
+                target_warm: cfg.sync_target_number_of_established_peers,
+                target_hot: cfg.sync_target_number_of_active_peers,
+                max_cold: cfg.sync_target_number_of_known_peers,
+                target_warm_big_ledger: cfg.sync_target_number_of_established_big_ledger_peers,
+                target_hot_big_ledger: cfg.sync_target_number_of_active_big_ledger_peers,
+            };
+            info!(
+                state = %last_seen_gsm_state,
+                target_hot = targets.target_hot,
+                target_hot_blp = targets.target_hot_big_ledger,
+                "Genesis boot below CaughtUp — applying sync peer-selection targets"
+            );
+            governor.update_targets(targets);
+            sync_targets_applied = true;
+        }
+
         info!("Main run loop entered");
         loop {
             tokio::select! {
@@ -4871,36 +4898,44 @@ impl Node {
                     if snap.state != last_seen_gsm_state {
                         last_seen_gsm_state = snap.state;
                         let syncing = snap.state != crate::gsm::GenesisSyncState::CaughtUp;
-                        let cfg = &self.config;
-                        let targets = if syncing {
-                            dugite_network::peer::governor::PeerTargets {
-                                target_warm: cfg.sync_target_number_of_established_peers,
-                                target_hot: cfg.sync_target_number_of_active_peers,
-                                max_cold: cfg.sync_target_number_of_known_peers,
-                                target_warm_big_ledger:
-                                    cfg.sync_target_number_of_established_big_ledger_peers,
-                                target_hot_big_ledger:
-                                    cfg.sync_target_number_of_active_big_ledger_peers,
-                            }
-                        } else {
-                            dugite_network::peer::governor::PeerTargets {
-                                target_warm: cfg.target_number_of_established_peers,
-                                target_hot: cfg.target_number_of_active_peers,
-                                max_cold: cfg.target_number_of_known_peers,
-                                target_warm_big_ledger:
-                                    cfg.target_number_of_established_big_ledger_peers,
-                                target_hot_big_ledger:
-                                    cfg.target_number_of_active_big_ledger_peers,
-                            }
-                        };
-                        info!(
-                            state = %snap.state,
-                            syncing,
-                            target_hot = targets.target_hot,
-                            target_hot_blp = targets.target_hot_big_ledger,
-                            "GSM state change — switching peer-selection targets"
-                        );
-                        governor.update_targets(targets);
+                        // Haskell parity: PreSyncing and Syncing both map to
+                        // LedgerStateJudgement TooOld — the peer-selection
+                        // governor only reacts to the TooOld ↔ YoungEnough
+                        // boundary, so a PreSyncing ↔ Syncing flap must not
+                        // re-apply targets (#740).
+                        if syncing != sync_targets_applied {
+                            sync_targets_applied = syncing;
+                            let cfg = &self.config;
+                            let targets = if syncing {
+                                dugite_network::peer::governor::PeerTargets {
+                                    target_warm: cfg.sync_target_number_of_established_peers,
+                                    target_hot: cfg.sync_target_number_of_active_peers,
+                                    max_cold: cfg.sync_target_number_of_known_peers,
+                                    target_warm_big_ledger:
+                                        cfg.sync_target_number_of_established_big_ledger_peers,
+                                    target_hot_big_ledger:
+                                        cfg.sync_target_number_of_active_big_ledger_peers,
+                                }
+                            } else {
+                                dugite_network::peer::governor::PeerTargets {
+                                    target_warm: cfg.target_number_of_established_peers,
+                                    target_hot: cfg.target_number_of_active_peers,
+                                    max_cold: cfg.target_number_of_known_peers,
+                                    target_warm_big_ledger:
+                                        cfg.target_number_of_established_big_ledger_peers,
+                                    target_hot_big_ledger:
+                                        cfg.target_number_of_active_big_ledger_peers,
+                                }
+                            };
+                            info!(
+                                state = %snap.state,
+                                syncing,
+                                target_hot = targets.target_hot,
+                                target_hot_blp = targets.target_hot_big_ledger,
+                                "GSM state change — switching peer-selection targets"
+                            );
+                            governor.update_targets(targets);
+                        }
                     }
                     if snap.loe_slot != last_seen_loe_slot {
                         last_seen_loe_slot = snap.loe_slot;
