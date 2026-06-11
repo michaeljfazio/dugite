@@ -730,6 +730,10 @@ pub struct Node {
     /// `None` in praos mode or with `EnableLoP=false`.
     pub(crate) lop_params: Option<(u64, u64)>,
 
+    /// Minimum active big-ledger peers for the GSM HAA (`min_active_blp`),
+    /// surfaced for the SyncStatus emitter's local-roots-aware HAA check.
+    pub(crate) gsm_min_active_blp: usize,
+
     /// Historicity cutoff handed to every ChainSync task; `None` in praos
     /// mode (Haskell `gcHistoricityCutoff = Nothing`).
     pub(crate) historicity_cutoff_secs: Option<u64>,
@@ -2435,6 +2439,7 @@ impl Node {
             lop_params,
             historicity_cutoff_secs,
             csj,
+            gsm_min_active_blp: genesis_params.min_big_ledger_peers,
             validate_all_blocks: args.validate_all_blocks,
             skip_eagerly_validated_header_crypto: args.skip_eagerly_validated_header_crypto,
             disk_space_rx: watch::channel(crate::disk_monitor::DiskSpaceLevel::Ok).1,
@@ -4308,6 +4313,7 @@ impl Node {
             let status_chain_db = self.chain_db.clone();
             let status_snapshot_rx = self.gsm_snapshot_rx.clone();
             let status_csj = self.csj.clone();
+            let status_min_blp = self.gsm_min_active_blp;
             let status_shutdown = shutdown_rx.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(10));
@@ -4321,7 +4327,16 @@ impl Node {
 
                     let active_blp = {
                         let pm = status_pm.read().await;
-                        pm.active_big_ledger_peer_count()
+                        // HAA satisfaction (Haskell outboundConnectionsState):
+                        // big-ledger-peer trust OR trusted-local-roots trust.
+                        // Report a synthetic count the GSM's `>= min` gate reads
+                        // (the real BLP count when below, min when HAA holds via
+                        // local roots).
+                        if pm.haa_satisfied(status_min_blp) {
+                            status_min_blp
+                        } else {
+                            pm.active_big_ledger_peer_count()
+                        }
                     };
                     let selection_block_no = {
                         let db = status_chain_db.read().await;
