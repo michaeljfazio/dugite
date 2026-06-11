@@ -4139,7 +4139,9 @@ impl Node {
             );
         }
 
-        // Spawn GSM actor task, GDD action consumer, and SyncStatus emitter.
+        // Spawn GSM actor task and SyncStatus emitter; route GDD actions to
+        // the main loop (full teardown needs `self.connection_lifecycle`).
+        let mut gdd_action_rx: Option<tokio::sync::mpsc::Receiver<crate::gsm::GddAction>> = None;
         if let Some(parts) = self.gsm_actor_parts.take() {
             // 1. Spawn the GSM actor — owns the GenesisStateMachine and
             //    processes GsmEvent messages, publishing GsmSnapshot via watch.
@@ -4166,33 +4168,13 @@ impl Node {
                 }
             });
 
-            // 2. Spawn GDD action consumer — reads disconnect commands from
-            //    the GSM actor and applies them via the peer manager.
-            let gdd_pm = peer_manager.clone();
-            let gdd_shutdown = shutdown_rx.clone();
-            let mut gdd_action_rx = parts.action_rx;
-            tokio::spawn(async move {
-                let mut shutdown = gdd_shutdown;
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = shutdown.changed() => { break; }
-                        action = gdd_action_rx.recv() => {
-                            match action {
-                                Some(crate::gsm::GddAction::DisconnectPeer(addr)) => {
-                                    info!(%addr, "GDD: disconnecting sparse-chain peer");
-                                    let mut pm = gdd_pm.write().await;
-                                    pm.peer_disconnected(&addr);
-                                }
-                                None => {
-                                    debug!("GDD action channel closed");
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            });
+            // 2. GDD disconnect commands are consumed by the MAIN run loop
+            //    (below) so the kill can run the full connection teardown via
+            //    the lifecycle manager — Haskell's `cschGDDKill = throwTo tid
+            //    DensityTooLow` terminates the ChainSync client and closes
+            //    the connection, it does not merely re-label the peer
+            //    (audit gdd-03/gsm-05).
+            gdd_action_rx = Some(parts.action_rx);
 
             // 3. Spawn SyncStatus emitter — every 10 seconds, gathers sync
             //    metrics and sends a SyncStatus event to the GSM actor.
@@ -4675,6 +4657,34 @@ impl Node {
                     let mut pm = peer_manager.write().await;
                     warn!(%failed_addr, "peer reported as failed by protocol task");
                     pm.peer_failed(&failed_addr);
+                    self.update_peer_metrics(&pm);
+                }
+
+                // ── GDD density disconnects (DensityTooLow) ─────────────
+                //
+                // Haskell kills the ChainSync client thread with the
+                // `DensityTooLow` exception, which tears the whole peer
+                // connection down and removes its handle. Equivalent here:
+                // record a failure (governor cooldown / forget-threshold
+                // accounting) and run the full lifecycle demotion — closes
+                // every connection to the peer, cancels its protocol tasks
+                // (the ChainSync task's drop guard deregisters it from the
+                // genesis peer registry) and drops its candidate state.
+                Some(crate::gsm::GddAction::DisconnectPeer(addr)) = async {
+                    match gdd_action_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    warn!(%addr, "GDD: density too low — disconnecting peer");
+                    let mut pm = peer_manager.write().await;
+                    pm.peer_failed(&addr);
+                    if let Some(ref mut lifecycle) = self.connection_lifecycle {
+                        if let Err(e) = lifecycle.demote_to_cold(addr, &mut pm).await {
+                            // Not connected any more — bookkeeping only.
+                            debug!(%addr, error = %e, "GDD disconnect: no live connection");
+                        }
+                    }
                     self.update_peer_metrics(&pm);
                 }
 
