@@ -31,7 +31,7 @@
   "MetricsPort": 12800,
   "ConsensusMode": "Genesis",
   "LowLevelGenesisOptions": {
-    "EnableCSJ": false,
+    "EnableCSJ": true,
     "EnableLoEAndGDD": true,
     "EnableLoP": true
   }
