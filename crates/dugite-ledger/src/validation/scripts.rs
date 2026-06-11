@@ -1775,7 +1775,10 @@ mod tests {
     #[test]
     fn test_tiered_fee_boundary_one_tier_25600() {
         let fee = calculate_ref_script_tiered_fee(15, 25_600);
-        assert_eq!(fee, 384_000, "25,600 bytes at 15/byte = 384,000 (single tier)");
+        assert_eq!(
+            fee, 384_000,
+            "25,600 bytes at 15/byte = 384,000 (single tier)"
+        );
     }
 
     /// Boundary test: two full tiers (51,200 bytes) at PV=10.
@@ -1783,7 +1786,10 @@ mod tests {
     #[test]
     fn test_tiered_fee_boundary_two_tiers_51200() {
         let fee = calculate_ref_script_tiered_fee(15, 51_200);
-        assert_eq!(fee, 844_800, "51,200 bytes: tier0=384,000 + tier1=460,800 = 844,800");
+        assert_eq!(
+            fee, 844_800,
+            "51,200 bytes: tier0=384,000 + tier1=460,800 = 844,800"
+        );
     }
 
     /// Boundary test: partial tier 3 at 80,000 bytes.

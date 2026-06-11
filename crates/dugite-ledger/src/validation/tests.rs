@@ -15742,4 +15742,313 @@ mod tests {
             }
         ));
     }
+
+    // ---------------------------------------------------------------------------
+    // Intra-tx DELEGS sequencing — Fix #746
+    //
+    // Haskell applies certificates left-to-right against evolving state.
+    // A [dereg(C), reg(C), delegate(C, pool)] sequence is valid when C is
+    // pre-registered: the dereg clears the key, the re-reg re-enters it, the
+    // delegation sees it as registered.
+    //
+    // References:
+    //   Shelley LEDGER rule: `certState & certDStateL.accountsL %~ drainAccounts`
+    //   Conway Certs.hs: sequential cert application with `processCertPreOncChain`
+    //   `DelegateeStakePoolNotRegisteredDELEG` / `StakeKeyRegisteredDELEG` /
+    //   `StakeKeyNotRegisteredDELEG` all evaluated against the evolving map.
+    // ---------------------------------------------------------------------------
+
+    /// Build a transaction with multiple certificates (no deposit adjustments —
+    /// caller is responsible for balancing the body value).
+    fn make_multi_cert_tx(utxo_set: &mut UtxoSet, certs: Vec<Certificate>) -> Transaction {
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0xCCu8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(10_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: false,
+                raw_cbor: None,
+            },
+        );
+        let mut tx = make_simple_tx(input, 9_800_000, 200_000);
+        tx.body.certificates = certs;
+        tx
+    }
+
+    #[test]
+    fn test_intra_tx_dereg_rereg_delegate_accepted() {
+        // Mainnet pattern: a pre-registered credential is deregistered, re-registered,
+        // then delegated in the SAME transaction.
+        // Sequence: [StakeDeregistration(C), StakeRegistration(C), StakeDelegation(C, pool)]
+        // Expected: no errors — the sequential semantics make C "unregistered" before
+        // the re-registration, and "registered" before the delegation.
+        //
+        // This is the exact pattern that was falsely rejected by the non-sequential
+        // "already registered" check in the pre-fix code path.
+        let cred_bytes = [0xA1u8; 28];
+        let cred = dugite_primitives::credentials::Credential::VerificationKey(Hash28::from_bytes(
+            cred_bytes,
+        ));
+        let pool_id = Hash28::from_bytes([0xA2u8; 28]);
+        let mut params = ProtocolParameters::mainnet_defaults();
+        // Zero deposits so value-conservation balances in the simple test body.
+        params.key_deposit = Lovelace(0);
+
+        let mut utxo_set = UtxoSet::new();
+        let tx = make_multi_cert_tx(
+            &mut utxo_set,
+            vec![
+                Certificate::StakeDeregistration(cred.clone()),
+                Certificate::StakeRegistration(cred.clone()),
+                Certificate::StakeDelegation {
+                    credential: cred.clone(),
+                    pool_hash: pool_id,
+                },
+            ],
+        );
+
+        // C is pre-registered with zero balance (withdraw drained or never accumulated).
+        let reward_accounts = make_reward_accounts(cred_bytes, 0);
+        // Pool is registered.
+        let mut registered_pools: std::collections::HashSet<Hash28> = HashSet::new();
+        registered_pools.insert(pool_id);
+
+        let result = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            Some(&registered_pools),
+            None,
+            Some(&reward_accounts),
+            None,
+            None, // registered_dreps
+            None, // registered_vrf_keys
+            None, // node_network
+            None, // committee_members
+            None, // committee_resigned
+            None, // stake_key_deposits
+            None, // constitution_script_hash
+            None, // vote_delegations
+        );
+
+        // Must NOT produce StakeKeyAlreadyRegistered (the bug) or
+        // StakeKeyNotRegisteredForDelegation. Witness errors are acceptable in
+        // a pure-logic test without real vkey witnesses.
+        let has_already_reg = matches!(&result, Err(errors) if errors.iter().any(|e| {
+            matches!(e, ValidationError::StakeKeyAlreadyRegistered { .. })
+        }));
+        let has_not_reg_for_deleg = matches!(&result, Err(errors) if errors.iter().any(|e| {
+            matches!(e, ValidationError::StakeKeyNotRegisteredForDelegation { .. })
+        }));
+        assert!(
+            !has_already_reg,
+            "Expected no StakeKeyAlreadyRegistered for [dereg, re-reg, delegate]; got: {result:?}"
+        );
+        assert!(
+            !has_not_reg_for_deleg,
+            "Expected no StakeKeyNotRegisteredForDelegation for [dereg, re-reg, delegate]; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_intra_tx_double_reg_rejected() {
+        // A transaction containing [reg(C), reg(C)] must be rejected with
+        // StakeKeyAlreadyRegistered on the second registration even when C is
+        // not pre-registered in the ledger state — the first cert registers it
+        // intra-tx and the second sees it as already registered.
+        let cred_bytes = [0xA3u8; 28];
+        let cred = dugite_primitives::credentials::Credential::VerificationKey(Hash28::from_bytes(
+            cred_bytes,
+        ));
+        let mut params = ProtocolParameters::mainnet_defaults();
+        // Zero deposits so value-conservation balances in the simple test body.
+        params.key_deposit = Lovelace(0);
+
+        let mut utxo_set = UtxoSet::new();
+        let tx = make_multi_cert_tx(
+            &mut utxo_set,
+            vec![
+                Certificate::StakeRegistration(cred.clone()),
+                Certificate::StakeRegistration(cred.clone()),
+            ],
+        );
+
+        // C is NOT pre-registered — empty reward_accounts.
+        let reward_accounts: imbl::HashMap<Hash32, dugite_primitives::value::Lovelace> =
+            imbl::HashMap::new();
+
+        let result = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            None,
+            None,
+            Some(&reward_accounts),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert!(
+            result.is_err(),
+            "Expected StakeKeyAlreadyRegistered for [reg, reg]; got Ok"
+        );
+        let errors = result.unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::StakeKeyAlreadyRegistered { .. })),
+            "Expected StakeKeyAlreadyRegistered for intra-tx double-reg; got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_intra_tx_reg_dereg_rereg_accepted() {
+        // A transaction with [reg(C), dereg(C), reg(C)] where C is NOT pre-registered:
+        // * reg(C)   → C becomes registered intra-tx
+        // * dereg(C) → C becomes unregistered intra-tx
+        // * reg(C)   → C becomes registered again — no duplicate error
+        // Expected: no StakeKeyAlreadyRegistered on the final cert.
+        let cred_bytes = [0xA4u8; 28];
+        let cred = dugite_primitives::credentials::Credential::VerificationKey(Hash28::from_bytes(
+            cred_bytes,
+        ));
+        let mut params = ProtocolParameters::mainnet_defaults();
+        // Zero deposits so value-conservation balances in the simple test body.
+        params.key_deposit = Lovelace(0);
+
+        let mut utxo_set = UtxoSet::new();
+        let tx = make_multi_cert_tx(
+            &mut utxo_set,
+            vec![
+                Certificate::StakeRegistration(cred.clone()),
+                Certificate::StakeDeregistration(cred.clone()),
+                Certificate::StakeRegistration(cred.clone()),
+            ],
+        );
+
+        // C is NOT pre-registered.
+        let reward_accounts: imbl::HashMap<Hash32, dugite_primitives::value::Lovelace> =
+            imbl::HashMap::new();
+
+        let result = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            None,
+            None,
+            Some(&reward_accounts),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let has_dup_err = matches!(&result, Err(errors) if errors.iter().any(|e| {
+            matches!(e, ValidationError::StakeKeyAlreadyRegistered { .. })
+        }));
+        assert!(
+            !has_dup_err,
+            "Expected no StakeKeyAlreadyRegistered for [reg, dereg, reg]; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_intra_tx_delegation_after_intra_tx_dereg_rereg_accepted() {
+        // Extended version: [dereg(C), reg(C), delegate(C, pool)] where C IS
+        // pre-registered. Checks that the delegation check (`new_stake_keys` overlay)
+        // also handles the case where C was deregistered-then-reregistered intra-tx.
+        let cred_bytes = [0xA5u8; 28];
+        let cred = dugite_primitives::credentials::Credential::VerificationKey(Hash28::from_bytes(
+            cred_bytes,
+        ));
+        let pool_id = Hash28::from_bytes([0xA6u8; 28]);
+        let mut params = ProtocolParameters::mainnet_defaults();
+        // Zero deposits so value-conservation balances in the simple test body.
+        params.key_deposit = Lovelace(0);
+
+        let mut utxo_set = UtxoSet::new();
+        let tx = make_multi_cert_tx(
+            &mut utxo_set,
+            vec![
+                Certificate::StakeDeregistration(cred.clone()),
+                Certificate::StakeRegistration(cred.clone()),
+                Certificate::StakeDelegation {
+                    credential: cred.clone(),
+                    pool_hash: pool_id,
+                },
+            ],
+        );
+
+        // C is pre-registered, zero balance.
+        let reward_accounts = make_reward_accounts(cred_bytes, 0);
+        let mut registered_pools: std::collections::HashSet<Hash28> = HashSet::new();
+        registered_pools.insert(pool_id);
+
+        let result = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            Some(&registered_pools),
+            None,
+            Some(&reward_accounts),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        // Must NOT produce StakeKeyAlreadyRegistered or
+        // StakeKeyNotRegisteredForDelegation. Witness errors are acceptable.
+        let has_already_reg = matches!(&result, Err(errors) if errors.iter().any(|e| {
+            matches!(e, ValidationError::StakeKeyAlreadyRegistered { .. })
+        }));
+        let has_not_reg_for_deleg = matches!(&result, Err(errors) if errors.iter().any(|e| {
+            matches!(e, ValidationError::StakeKeyNotRegisteredForDelegation { .. })
+        }));
+        assert!(
+            !has_already_reg,
+            "Expected no StakeKeyAlreadyRegistered for [dereg, re-reg, delegate] (pre-registered); got: {result:?}"
+        );
+        assert!(
+            !has_not_reg_for_deleg,
+            "Expected no StakeKeyNotRegisteredForDelegation for [dereg, re-reg, delegate] (pre-registered); got: {result:?}"
+        );
+    }
 }

@@ -274,20 +274,24 @@ pub(crate) fn decode_alonzo_family_block(
             // we build array(4) and fee_tx_size() subtracts the 1-byte is_valid.
             let raw_cbor = if has_invalid_txs {
                 // Alonzo+ era: include the is_valid byte.
-                Some(crate::decode::era_babbage::reconstruct_alonzo_plus_tx_raw_cbor(
-                    &raw_body,
-                    raw_witness.as_deref().unwrap_or(&[0xA0]),
-                    is_valid,
-                    auxiliary_data.as_ref(),
-                ))
+                Some(
+                    crate::decode::era_babbage::reconstruct_alonzo_plus_tx_raw_cbor(
+                        &raw_body,
+                        raw_witness.as_deref().unwrap_or(&[0xA0]),
+                        is_valid,
+                        auxiliary_data.as_ref(),
+                    ),
+                )
             } else {
                 // Pre-Alonzo era (Shelley/Allegra/Mary via this path when
                 // has_invalid_txs=false): no is_valid byte; wire = array(3).
-                Some(crate::decode::era_shelley::reconstruct_pre_alonzo_tx_raw_cbor(
-                    &raw_body,
-                    raw_witness.as_deref().unwrap_or(&[0xA0]),
-                    auxiliary_data.as_ref(),
-                ))
+                Some(
+                    crate::decode::era_shelley::reconstruct_pre_alonzo_tx_raw_cbor(
+                        &raw_body,
+                        raw_witness.as_deref().unwrap_or(&[0xA0]),
+                        auxiliary_data.as_ref(),
+                    ),
+                )
             };
 
             Ok(Transaction {
@@ -2787,7 +2791,10 @@ mod tests {
             "block-decoded Alonzo tx must have raw_cbor populated for fee calculation"
         );
         let raw = tx.raw_cbor.as_ref().unwrap();
-        assert_eq!(raw[0], 0x84, "Alonzo tx raw_cbor must start with 0x84 (array-4)");
+        assert_eq!(
+            raw[0], 0x84,
+            "Alonzo tx raw_cbor must start with 0x84 (array-4)"
+        );
 
         let body_len = tx.raw_body_cbor.as_ref().map_or(0, |b| b.len());
         let witness_len = tx.raw_witness_cbor.as_ref().map_or(0, |b| b.len());
@@ -2795,7 +2802,9 @@ mod tests {
         assert_eq!(
             raw.len(),
             expected_len,
-            "raw_cbor.len()={} expected={}", raw.len(), expected_len
+            "raw_cbor.len()={} expected={}",
+            raw.len(),
+            expected_len
         );
     }
 }
