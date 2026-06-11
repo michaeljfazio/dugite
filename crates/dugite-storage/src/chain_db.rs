@@ -85,6 +85,12 @@ pub struct ChainDB {
     /// Security parameter k — blocks deeper than k from the tip are flushed
     /// to immutable storage. Read from Byron genesis `protocolConsts.k`.
     security_param_k: usize,
+    /// The Limit on Eagerness published by the Genesis governor (None /
+    /// `LoeState::Disabled` ⇒ praos behaviour — selection unconstrained).
+    loe_handle: Option<std::sync::Arc<arc_swap::ArcSwap<dugite_consensus::loe::LoeState>>>,
+    /// Cached index over the currently-published LoE (invalidated by Arc
+    /// pointer identity when the governor republishes).
+    loe_view: Option<crate::loe_trim::LoeView>,
 }
 
 impl ChainDB {
@@ -191,6 +197,8 @@ impl ChainDB {
             immutable_tip,
             last_flushed_block_no,
             security_param_k: k,
+            loe_handle: None,
+            loe_view: None,
         })
     }
 
@@ -236,9 +244,11 @@ impl ChainDB {
             return Ok(false);
         }
 
-        let extended_tip = self
-            .volatile
-            .add_block(hash, slot.0, block_no.0, prev_hash, cbor);
+        self.refresh_loe_view();
+        let allow_extend = self.loe_allows_extension(&hash, &prev_hash);
+        let extended_tip =
+            self.volatile
+                .add_block_gated(hash, slot.0, block_no.0, prev_hash, cbor, allow_extend);
         Ok(extended_tip)
     }
 
@@ -256,10 +266,91 @@ impl ChainDB {
         if self.has_block(&hash) {
             return Ok(false);
         }
-        let extended = self
-            .volatile
-            .add_block_with_header(hash, slot.0, block_no.0, prev_hash, cbor, header);
+        self.refresh_loe_view();
+        let allow_extend = self.loe_allows_extension(&hash, &prev_hash);
+        let extended = self.volatile.add_block_with_header_gated(
+            hash,
+            slot.0,
+            block_no.0,
+            prev_hash,
+            cbor,
+            header,
+            allow_extend,
+        );
         Ok(extended)
+    }
+
+    /// Install the LoE handle published by the Genesis governor.
+    ///
+    /// Absent handle (or a published `LoeState::Disabled`) keeps chain
+    /// selection byte-identical to praos.
+    pub fn set_loe_handle(
+        &mut self,
+        handle: std::sync::Arc<arc_swap::ArcSwap<dugite_consensus::loe::LoeState>>,
+    ) {
+        self.loe_handle = Some(handle);
+        self.loe_view = None;
+    }
+
+    /// Refresh the cached LoE view if the governor republished.
+    pub fn refresh_loe_view(&mut self) {
+        let Some(handle) = &self.loe_handle else {
+            return;
+        };
+        let current = handle.load_full();
+        let ptr = std::sync::Arc::as_ptr(&current) as usize;
+        let stale = self
+            .loe_view
+            .as_ref()
+            .map(|v| v.source_ptr != ptr)
+            .unwrap_or(true);
+        if stale {
+            self.loe_view = Some(crate::loe_trim::LoeView::build(&current, ptr));
+        }
+    }
+
+    /// `trimToLoE` verdict for a candidate tip in the VolatileDB.
+    /// `Allowed` when no LoE is installed (praos).
+    pub fn loe_verdict(&self, candidate_tip: &BlockHeaderHash) -> crate::loe_trim::LoeVerdict {
+        match &self.loe_view {
+            Some(view) if !view.disabled => {
+                crate::loe_trim::loe_verdict_for_candidate(&self.volatile, candidate_tip, view)
+            }
+            _ => crate::loe_trim::LoeVerdict::Allowed,
+        }
+    }
+
+    /// Whether the LoE permits extending the selected chain with a block
+    /// whose parent is the current tip. `true` when no LoE installed.
+    fn loe_allows_extension(&self, hash: &BlockHeaderHash, prev: &BlockHeaderHash) -> bool {
+        match &self.loe_view {
+            Some(view) if !view.disabled => {
+                crate::loe_trim::loe_allows_extension(&self.volatile, hash, prev, view)
+            }
+            _ => true,
+        }
+    }
+
+    /// Cap the freshly-rebuilt selection at `max_depth` blocks past the
+    /// immutable tip — Haskell's initial-chain-selection k-limit when the
+    /// LoE is enabled (`maximalCandidates succsOf (Just k)`):
+    ///
+    /// > "Shutting down a syncing node and then restarting it should not
+    /// >  cause it to select the longest chain in the VolDB, since that
+    /// >  chain might be adversarial."
+    ///
+    /// Called by the node at startup in genesis mode, after the VolatileDB
+    /// WAL replay rebuilt `selected_chain`. Truncated blocks stay in the
+    /// VolatileDB and re-enter selection under the live LoE.
+    pub fn truncate_selection_to_depth(&mut self, max_depth: u64) -> usize {
+        self.volatile.truncate_selection_to_depth(max_depth)
+    }
+
+    /// Slot and block number of a VolatileDB block (LoE trim bookkeeping).
+    pub fn get_volatile_block_meta(&self, hash: &BlockHeaderHash) -> Option<(SlotNo, BlockNo)> {
+        self.volatile
+            .get_block(hash)
+            .map(|b| (SlotNo(b.slot), BlockNo(b.block_no)))
     }
 
     /// Look up a previously cached VolatileDB header.

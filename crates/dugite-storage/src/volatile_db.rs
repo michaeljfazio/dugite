@@ -639,12 +639,17 @@ impl VolatileDB {
         // and will be corrected over time as blocks are re-added via
         // normal sync after the first node startup post-upgrade.
         for entry in entries {
+            // WAL replay: extension gating does not apply here —
+            // `rebuild_selected_chain` below re-derives the selection, and
+            // the genesis-mode startup k-cap is applied by the node after
+            // open (Haskell `maximalCandidates` k-limit analogue).
             let _ = db.insert_block_internal(
                 entry.hash,
                 entry.slot,
                 entry.block_no,
                 entry.prev_hash,
                 entry.cbor,
+                true,
             );
         }
 
@@ -713,23 +718,16 @@ impl VolatileDB {
     /// Returns `true` iff the block extended `selected_chain` (i.e. it
     /// became the new selected-chain tip). Returns `false` when the block
     /// was stored as a fork block without advancing the selected chain.
-    pub fn add_block(
-        &mut self,
-        hash: Hash32,
-        slot: u64,
-        block_no: u64,
-        prev_hash: Hash32,
-        cbor: Vec<u8>,
-    ) -> bool {
-        // G4: proactively compact the WAL once it has accumulated more than
-        // WAL_COMPACTION_SLACK_BYTES of reclaimable garbage ABOVE the live-set
-        // floor (the WAL size recorded at the last compaction). This rewrites
-        // the WAL to contain only the current in-memory blocks, dropping
-        // finalized entries that survived after flush_to_immutable. Triggering
-        // on slack-above-floor (rather than an absolute cap the live set can
-        // itself exceed) bounds compaction to O(1) amortised — see the
-        // `WAL_COMPACTION_SLACK_BYTES` doc for the per-block-recompaction
-        // collapse this avoids. Routine maintenance — logged at `debug!`.
+    /// G4: proactively compact the WAL once it has accumulated more than
+    /// WAL_COMPACTION_SLACK_BYTES of reclaimable garbage ABOVE the live-set
+    /// floor (the WAL size recorded at the last compaction). This rewrites
+    /// the WAL to contain only the current in-memory blocks, dropping
+    /// finalized entries that survived after flush_to_immutable. Triggering
+    /// on slack-above-floor (rather than an absolute cap the live set can
+    /// itself exceed) bounds compaction to O(1) amortised — see the
+    /// `WAL_COMPACTION_SLACK_BYTES` doc for the per-block-recompaction
+    /// collapse this avoids. Routine maintenance — logged at `debug!`.
+    fn maybe_compact_wal(&mut self) {
         if let Some(ref wal) = self.wal {
             let threshold = self
                 .wal_size_floor
@@ -747,6 +745,17 @@ impl VolatileDB {
                 _ => {}
             }
         }
+    }
+
+    pub fn add_block(
+        &mut self,
+        hash: Hash32,
+        slot: u64,
+        block_no: u64,
+        prev_hash: Hash32,
+        cbor: Vec<u8>,
+    ) -> bool {
+        self.maybe_compact_wal();
 
         // Write to WAL first (if enabled) so that prev_hash is durable
         // before the in-memory state is updated.
@@ -756,7 +765,35 @@ impl VolatileDB {
             }
         }
 
-        self.insert_block_internal(hash, slot, block_no, prev_hash, cbor)
+        self.insert_block_internal(hash, slot, block_no, prev_hash, cbor, true)
+    }
+
+    /// [`add_block`] with an explicit selected-chain extension gate.
+    ///
+    /// `allow_extend = false` stores the block (durably, WAL included) but
+    /// does NOT advance `selected_chain` even when the block links to the
+    /// tip — the Limit on Eagerness defers adoption; the block re-enters
+    /// selection as a fork tip when the LoE moves.
+    pub fn add_block_gated(
+        &mut self,
+        hash: Hash32,
+        slot: u64,
+        block_no: u64,
+        prev_hash: Hash32,
+        cbor: Vec<u8>,
+        allow_extend: bool,
+    ) -> bool {
+        if allow_extend {
+            return self.add_block(hash, slot, block_no, prev_hash, cbor);
+        }
+        // Same WAL handling as add_block, extension suppressed.
+        self.maybe_compact_wal();
+        if let Some(ref mut wal) = self.wal {
+            if let Err(e) = wal.append(slot, block_no, &hash, &prev_hash, &cbor) {
+                warn!(error = %e, "WAL: failed to append entry");
+            }
+        }
+        self.insert_block_internal(hash, slot, block_no, prev_hash, cbor, false)
     }
 
     /// Variant of [`add_block`] that also caches the block's `BlockHeader`
@@ -782,6 +819,22 @@ impl VolatileDB {
         self.add_block(hash, slot, block_no, prev_hash, cbor)
     }
 
+    /// [`add_block_with_header`] with the LoE extension gate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_block_with_header_gated(
+        &mut self,
+        hash: Hash32,
+        slot: u64,
+        block_no: u64,
+        prev_hash: Hash32,
+        cbor: Vec<u8>,
+        header: dugite_primitives::block::BlockHeader,
+        allow_extend: bool,
+    ) -> bool {
+        self.headers.insert(hash, header);
+        self.add_block_gated(hash, slot, block_no, prev_hash, cbor, allow_extend)
+    }
+
     /// Look up a previously cached header (Bug D Praos tiebreaker).
     ///
     /// Returns `None` for any block stored via the legacy `add_block` path,
@@ -804,6 +857,7 @@ impl VolatileDB {
         block_no: u64,
         prev_hash: Hash32,
         cbor: Vec<u8>,
+        allow_extend: bool,
     ) -> bool {
         // Track successor relationship (all forks)
         self.successors.entry(prev_hash).or_default().insert(hash);
@@ -829,17 +883,43 @@ impl VolatileDB {
             self.leaves.insert(hash);
         }
 
-        // Extend selected chain if this block connects to it
-        let extends = match self.selected_chain.last() {
-            Some(tip_hash) => prev_hash == *tip_hash,
-            None => true,
-        };
+        // Extend selected chain if this block connects to it (and the
+        // Limit on Eagerness permits — `allow_extend=false` defers adoption
+        // while keeping the block stored; see `crate::loe_trim`).
+        let extends = allow_extend
+            && match self.selected_chain.last() {
+                Some(tip_hash) => prev_hash == *tip_hash,
+                None => true,
+            };
         if extends {
             self.selected_chain.push(hash);
             self.block_no_index.insert(block_no, hash);
             self.tip = Some((slot, hash, block_no));
         }
         extends
+    }
+
+    /// Truncate `selected_chain` to at most `max_depth` blocks (drop the
+    /// newest beyond it). The dropped blocks remain stored and re-enter
+    /// selection as fork tips. Returns how many were dropped.
+    pub fn truncate_selection_to_depth(&mut self, max_depth: u64) -> usize {
+        let len = self.selected_chain.len() as u64;
+        if len <= max_depth {
+            return 0;
+        }
+        let keep = max_depth as usize;
+        let dropped: Vec<Hash32> = self.selected_chain.split_off(keep);
+        for h in &dropped {
+            if let Some(b) = self.blocks.get(h) {
+                self.block_no_index.remove(&b.block_no);
+            }
+        }
+        // Refresh the tip from the new selection head.
+        self.tip = self
+            .selected_chain
+            .last()
+            .and_then(|h| self.blocks.get(h).map(|b| (b.slot, *h, b.block_no)));
+        dropped.len()
     }
 
     /// Get a block by hash.
@@ -3255,7 +3335,7 @@ mod tests {
         // Canonical chain: missing link h(99) at block_no=6 is NOT in the WAL.
         // The canonical continuation at block_no=7..11 has prev=h(99) as root.
         // This is the "disconnected island" that the network produced.
-        db.insert_block_internal(h(7), 600, 7, h(99), b"c7".to_vec()); // prev=h(99) NOT in WAL
+        db.insert_block_internal(h(7), 600, 7, h(99), b"c7".to_vec(), true); // prev=h(99) NOT in WAL
         db.add_block(h(8), 700, 8, h(7), b"c8".to_vec());
         db.add_block(h(9), 800, 9, h(8), b"c9".to_vec());
         db.add_block(h(10), 900, 10, h(9), b"c10".to_vec());
