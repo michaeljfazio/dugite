@@ -28,5 +28,11 @@
     "TraceMempool": true
   },
   "MinSeverity": "Info",
-  "MetricsPort": 12800
+  "MetricsPort": 12800,
+  "ConsensusMode": "Genesis",
+  "LowLevelGenesisOptions": {
+    "EnableCSJ": false,
+    "EnableLoEAndGDD": true,
+    "EnableLoP": true
+  }
 }

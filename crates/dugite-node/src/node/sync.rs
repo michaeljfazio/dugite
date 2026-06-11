@@ -3514,6 +3514,11 @@ pub(crate) async fn forecast_park_or_disconnect(
     ledger_view: &Arc<arc_swap::ArcSwap<super::ledger_view::LedgerView>>,
     tip_rx: &mut watch::Receiver<u64>,
     cancel: &CancellationToken,
+    // GSM snapshot — in genesis Syncing/PreSyncing (bulk sync) the node
+    // legitimately streams headers far ahead of the LoE-gated ledger; the
+    // forecast park must NOT disconnect (that churns peers and pins the LoE
+    // at the immutable tip, deadlocking the sync). Park and wait instead.
+    gsm_snapshot_rx: Option<&watch::Receiver<crate::gsm::GsmSnapshot>>,
 ) -> anyhow::Result<()> {
     use dugite_consensus::forecast::forecast_for;
     use dugite_primitives::time::SlotNo;
@@ -3555,8 +3560,10 @@ pub(crate) async fn forecast_park_or_disconnect(
         match forecast_for(tip_slot_no, stability_window, SlotNo(header_slot)) {
             Ok(()) => return Ok(()),
             Err(out) => {
+                let genesis_bulk_sync = gsm_snapshot_rx
+                    .is_some_and(|rx| rx.borrow().state != crate::gsm::GenesisSyncState::CaughtUp);
                 let elapsed = last_progress.elapsed();
-                if elapsed >= FORECAST_PARK_TIMEOUT {
+                if elapsed >= FORECAST_PARK_TIMEOUT && !genesis_bulk_sync {
                     return Err(anyhow::anyhow!(
                         "ChainSync: {peer_addr} header slot {} beyond forecast horizon \
                          (tip {:?}, max_for {}) — no ledger progress for {:?}; disconnecting",
@@ -3574,7 +3581,13 @@ pub(crate) async fn forecast_park_or_disconnect(
                     wakes,
                     "ChainSync: header beyond forecast horizon; parking on tip advance"
                 );
-                let remaining = FORECAST_PARK_TIMEOUT - elapsed;
+                // In genesis bulk sync, park indefinitely (re-check on a
+                // periodic tick as well as tip advance) — never disconnect.
+                let remaining = if genesis_bulk_sync {
+                    std::time::Duration::from_secs(5)
+                } else {
+                    FORECAST_PARK_TIMEOUT.saturating_sub(elapsed)
+                };
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return Ok(()),
@@ -3590,6 +3603,12 @@ pub(crate) async fn forecast_park_or_disconnect(
                         last_progress = std::time::Instant::now();
                     }
                     _ = tokio::time::sleep(remaining) => {
+                        if genesis_bulk_sync {
+                            // Re-loop: re-read the GSM state and the horizon
+                            // (the LoE/ledger may have advanced without a
+                            // tip_rx wake under throttling). No disconnect.
+                            continue;
+                        }
                         return Err(anyhow::anyhow!(
                             "ChainSync: {peer_addr} header slot {} beyond forecast horizon \
                              — no ledger progress for {:?}; disconnecting",
@@ -4815,6 +4834,7 @@ pub async fn chainsync_client_task(
                                 &ledger_view,
                                 &mut ledger_tip_rx,
                                 &cancel,
+                                Some(&gsm_snapshot_rx),
                             )
                             .await?;
                         }
@@ -5576,7 +5596,7 @@ mod forecast_park_tests {
         let peer: SocketAddr = "127.0.0.1:3001".parse().unwrap();
 
         let start = std::time::Instant::now();
-        forecast_park_or_disconnect(&peer, 1_050, &view, &mut rx, &cancel)
+        forecast_park_or_disconnect(&peer, 1_050, &view, &mut rx, &cancel, None)
             .await
             .expect("slot 1050 is within [1000, 1101)");
         // Should be near-instant, certainly <500ms.
@@ -5609,7 +5629,7 @@ mod forecast_park_tests {
         });
 
         let start = std::time::Instant::now();
-        forecast_park_or_disconnect(&peer, 1_500, &view, &mut rx, &cancel)
+        forecast_park_or_disconnect(&peer, 1_500, &view, &mut rx, &cancel, None)
             .await
             .expect("park should wake and succeed after tip advance");
         let elapsed = start.elapsed();
@@ -5635,7 +5655,7 @@ mod forecast_park_tests {
 
         // Header slot 2000 is way outside; only cancel can break us out
         // (other than the 60s timeout we don't want to wait for).
-        forecast_park_or_disconnect(&peer, 2_000, &view, &mut rx, &cancel)
+        forecast_park_or_disconnect(&peer, 2_000, &view, &mut rx, &cancel, None)
             .await
             .expect("cancel must short-circuit to Ok");
     }
