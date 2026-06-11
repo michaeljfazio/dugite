@@ -2084,9 +2084,8 @@ mod tests {
             hex::decode("2075a095b3c844a29c24317a94a643ab8e22d54a3a3a72a420260af6").unwrap();
         let delegate_hash =
             hex::decode("98599cbfede2ff9471797f7115ce2f745d83026936759fcf95092cc1").unwrap();
-        let vrf =
-            hex::decode("5549bba78a65e5160a8421b9ad7cf0db017dc8aa84e2f2cb957c490a2f699aca")
-                .unwrap();
+        let vrf = hex::decode("5549bba78a65e5160a8421b9ad7cf0db017dc8aa84e2f2cb957c490a2f699aca")
+            .unwrap();
         let mut cert = vec![0x84];
         cert.extend(cbor_uint(5));
         cert.extend(cbor_bytes(&genesis_hash));
