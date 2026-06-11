@@ -255,6 +255,14 @@ fn decode_shelley_block_mode(
             let raw_witness = raw_witnesses.get(i).cloned();
             let auxiliary_data = aux_map.get(&(i as u32)).cloned();
 
+            // Reconstruct full wire-format tx CBOR (pre-Alonzo: 3-element array).
+            // Haskell fee size = full wire size of [body, wits, aux] (no subtraction).
+            let raw_cbor = Some(reconstruct_pre_alonzo_tx_raw_cbor(
+                &raw_body,
+                raw_witness.as_deref().unwrap_or(&[0xA0]),
+                auxiliary_data.as_ref(),
+            ));
+
             Ok(Transaction {
                 hash: tx_hash,
                 era: Era::Shelley,
@@ -262,7 +270,7 @@ fn decode_shelley_block_mode(
                 witness_set,
                 is_valid: true,
                 auxiliary_data,
-                raw_cbor: None, // full tx CBOR not available without re-serialization
+                raw_cbor,
                 raw_body_cbor: Some(raw_body),
                 raw_witness_cbor: raw_witness,
             })
@@ -1314,6 +1322,39 @@ fn read_metadatum(r: &mut Reader<'_>) -> Result<TransactionMetadatum, Serializat
 // ============================================================================
 // Standalone tx decoder (Shelley era)
 // ============================================================================
+
+/// Reconstruct the full wire-format CBOR for a pre-Alonzo tx decoded from a block.
+///
+/// Pre-Alonzo blocks (Shelley/Allegra/Mary) embed transactions as separate
+/// `[body, wits, aux_data]` arrays without an `is_valid` flag.  The block
+/// decoders do not materialise the full per-tx CBOR slice.  This function
+/// reassembles it so that `Transaction.raw_cbor` has the correct byte-length.
+///
+/// Haskell fee size for Shelley/Allegra/Mary = full wire size of
+/// `[body, wits, aux_data]` (3-element, no subtraction).  `fee_tx_size()` in
+/// scripts.rs does not subtract for `0x83` (pre-Alonzo), so returning a
+/// 3-element array is byte-exact.
+///
+/// Reconstruction:
+/// ```text
+/// [0x83]  raw_body  raw_witness  (aux_raw | 0xF6)
+/// ```
+pub(crate) fn reconstruct_pre_alonzo_tx_raw_cbor(
+    raw_body: &[u8],
+    raw_witness: &[u8],
+    auxiliary_data: Option<&dugite_primitives::transaction::AuxiliaryData>,
+) -> Vec<u8> {
+    let aux_bytes: &[u8] = match auxiliary_data {
+        Some(aux) => aux.raw_cbor.as_deref().unwrap_or(&[0xF6]),
+        None => &[0xF6],
+    };
+    let mut out = Vec::with_capacity(1 + raw_body.len() + raw_witness.len() + aux_bytes.len());
+    out.push(0x83); // array(3)
+    out.extend_from_slice(raw_body);
+    out.extend_from_slice(raw_witness);
+    out.extend_from_slice(aux_bytes);
+    out
+}
 
 /// Decode a standalone Shelley-era transaction from raw CBOR bytes.
 ///
