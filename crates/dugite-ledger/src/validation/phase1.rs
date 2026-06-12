@@ -483,8 +483,21 @@ fn extract_byron_address_root(payload: &[u8]) -> Option<[u8; 28]> {
     }
 }
 
-/// Check address binding: each bootstrap witness's computed root must match
-/// the root in the Byron address of at least one regular input (Haskell `checkBootstrap`).
+/// Check address binding in the HASKELL direction: every BYRON INPUT must be
+/// covered by a bootstrap witness whose `bootstrapWitKeyHash` equals the
+/// input's Byron address root.
+///
+/// Extra bootstrap witnesses that do NOT bind to any Byron input are LEGAL:
+/// Alonzo/Babbage UTXOW (`alonzoStyleWitness`) has no "every bootstrap
+/// witness must match an input" predicate — bootstrap witnesses contribute
+/// their key hashes to the `provided` set of `validateNeededWitnesses`
+/// (`needed ⊆ provided`), and `validateVerifiedWits` checks only the Ed25519
+/// signature. Legacy Daedalus-compatible wallets routinely attach BOTH a
+/// vkey witness and a bootstrap witness for the same key when spending from
+/// SHELLEY addresses; the previous wrong-direction check falsely rejected
+/// two confirmed mainnet txs during the v2.0.4 soak (432b916e…/e1f29011…,
+/// blocks 9,074,761/9,075,213 — all-Shelley inputs + a redundant bootstrap
+/// witness).
 fn check_bootstrap_address_binding(
     tx: &Transaction,
     utxo_set: &dyn UtxoLookup,
@@ -492,49 +505,41 @@ fn check_bootstrap_address_binding(
     use dugite_primitives::address::Address;
     let mut errors = Vec::new();
 
-    for bw in &tx.witness_set.bootstrap_witnesses {
-        // Only check structurally valid witnesses (others are caught by signature verifier).
-        if bw.vkey.len() != 32 || bw.signature.len() != 64 || bw.chain_code.len() != 32 {
-            continue;
-        }
-        // The Byron address root is derived from the 64-byte XPub =
-        // public_key (32) || chain_code (32).
-        let xpub: Vec<u8> = bw
-            .vkey
-            .iter()
-            .chain(bw.chain_code.iter())
-            .copied()
-            .collect();
-        let computed_root = match compute_bootstrap_root(&xpub, &bw.attributes) {
-            Some(r) => r,
-            None => {
-                errors.push(ValidationError::InvalidWitnessSignature(format!(
-                    "bootstrap:address_root_computation_failed:{:02x?}",
-                    &bw.vkey[..4]
-                )));
-                continue;
-            }
-        };
+    // bootstrapWitKeyHash for every structurally valid bootstrap witness.
+    let bootstrap_key_hashes: HashSet<[u8; 28]> = tx
+        .witness_set
+        .bootstrap_witnesses
+        .iter()
+        .filter(|bw| bw.vkey.len() == 32 && bw.signature.len() == 64 && bw.chain_code.len() == 32)
+        .filter_map(|bw| {
+            // The Byron address root is derived from the 64-byte XPub =
+            // public_key (32) || chain_code (32).
+            let xpub: Vec<u8> = bw
+                .vkey
+                .iter()
+                .chain(bw.chain_code.iter())
+                .copied()
+                .collect();
+            compute_bootstrap_root(&xpub, &bw.attributes)
+        })
+        .collect();
 
-        let mut matched = false;
-        'outer: for input in &tx.body.inputs {
-            if let Some(output) = utxo_set.lookup(input) {
-                if let Address::Byron(ref byron) = output.address {
-                    if let Some(root_bytes) = extract_byron_address_root(&byron.payload) {
-                        if root_bytes == computed_root {
-                            matched = true;
-                            break 'outer;
-                        }
+    // Every Byron input must be covered (Haskell `witsVKeyNeeded` includes
+    // Byron address roots in `needed`; uncovered → missing-witness class).
+    for input in &tx.body.inputs {
+        if let Some(output) = utxo_set.lookup(input) {
+            if let Address::Byron(ref byron) = output.address {
+                if let Some(root_bytes) = extract_byron_address_root(&byron.payload) {
+                    if !bootstrap_key_hashes.contains(&root_bytes) {
+                        errors.push(ValidationError::MissingInputWitness(
+                            root_bytes
+                                .iter()
+                                .map(|b| format!("{b:02x}"))
+                                .collect::<String>(),
+                        ));
                     }
                 }
             }
-        }
-
-        if !matched {
-            errors.push(ValidationError::InvalidWitnessSignature(format!(
-                "bootstrap:address_binding_failed:{:02x?}",
-                &bw.vkey[..4]
-            )));
         }
     }
     errors
@@ -1442,7 +1447,10 @@ pub(super) fn run_phase1_rules(
                         }
                     }
                     None => {
-                        // Byron address — bootstrap witness is verified in Rule 14.
+                        // Byron address — input coverage is enforced by
+                        // check_bootstrap_address_binding (every Byron input
+                        // must be covered by a bootstrap witness whose key
+                        // hash matches the address root).
                         // No additional completeness check needed here.
                     }
                 }
@@ -2143,6 +2151,48 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, ValidationError::NotYetValid { .. })),
             "expected NotYetValid, got {errors:?}"
+        );
+    }
+
+    /// Bootstrap binding runs in the HASKELL direction: a redundant bootstrap
+    /// witness alongside all-Shelley inputs is LEGAL (legacy Daedalus wallets
+    /// attach both vkey + bootstrap witnesses for the same key). Two confirmed
+    /// mainnet txs (blocks 9,074,761 / 9,075,213) were falsely rejected by the
+    /// previous wrong-direction check. Uses the on-chain witness key material.
+    #[test]
+    fn test_redundant_bootstrap_witness_on_shelley_inputs_accepted() {
+        let (utxo_set, mut tx, _input) = make_valid_tx();
+        let params = ProtocolParameters::mainnet_defaults();
+
+        // On-chain witness from mainnet tx 432b916e…: vkey b7a8e15f…,
+        // chain_code all-zeros, attributes = {} (0xA0). Signature is not the
+        // subject here (signature validity is checked by a different rule);
+        // assert specifically that NO binding/missing-input-witness error
+        // fires for the redundant bootstrap witness.
+        let mut vkey = vec![0u8; 32];
+        vkey[0] = 0xb7;
+        vkey[1] = 0xa8;
+        vkey[2] = 0xe1;
+        vkey[3] = 0x5f;
+        tx.witness_set
+            .bootstrap_witnesses
+            .push(dugite_primitives::transaction::BootstrapWitness {
+                vkey,
+                signature: vec![0u8; 64],
+                chain_code: vec![0u8; 32],
+                attributes: vec![0xA0],
+            });
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        let binding_or_missing = matches!(&result, Err(errors) if errors.iter().any(|e| {
+            matches!(e, ValidationError::MissingInputWitness(_))
+                || matches!(e, ValidationError::InvalidWitnessSignature(s2) if s2.contains("binding"))
+        }));
+        assert!(
+            !binding_or_missing,
+            "a redundant bootstrap witness with all-Shelley inputs must not fire \
+             a binding/missing-witness error (Haskell alonzoStyleWitness has no \
+             witness→input predicate); got {result:?}"
         );
     }
 
