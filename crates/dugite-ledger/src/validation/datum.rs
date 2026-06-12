@@ -6,14 +6,24 @@
 //!
 //! ## Required datums (missing datum check)
 //!
-//! For every spending input whose UTxO carries a `DatumHash` (i.e. the hash
-//! form of datum attachment — not an inline datum) AND whose address is
-//! script-locked (payment credential is `Credential::Script`), the raw datum
-//! bytes that hash to that value MUST be present in
+//! For every spending input whose UTxO carries a `DatumHash` AND whose
+//! address is locked by a **Plutus** script (payment credential is
+//! `Credential::Script` AND the script resolves to Plutus V1/V2/V3/V4 in
+//! `ScriptsProvided`), the raw datum bytes MUST be present in
 //! `tx.witness_set.plutus_data`.
 //!
-//! Inputs that are NOT script-locked do not require a datum witness even if
-//! their UTxO carries a `DatumHash` — only scripts need to inspect the datum.
+//! Inputs locked by **native scripts** are explicitly exempt even when their
+//! UTxO carries a `DatumHash`.  Haskell's `getInputDataHashesTxBody`
+//! (`eras/alonzo/impl/src/Cardano/Ledger/Alonzo/UTxO.hs`) only sets the
+//! required flag when `isSpendingPlutusScript addr` is true —
+//! `lookupPlutusScript` returns `Nothing` for native scripts, and the
+//! `DatumHash` case falls through to `_ -> ans` (no change).  The Haskell
+//! source includes the comment: *"Though it is somewhat odd to allow native
+//! scripts to include a datum, the Alonzo era already set the precedent with
+//! datum hashes, and several dapp developers see this as a helpful feature."*
+//!
+//! Inputs that are NOT script-locked at all do not require a datum witness
+//! even if their UTxO carries a `DatumHash`.
 //! Inputs with `OutputDatum::InlineDatum` are also exempt: the datum is
 //! already embedded in the UTxO and does not need to be re-supplied.
 //!
@@ -172,11 +182,34 @@ pub(super) fn check_datum_witnesses(
             continue; // NoDatum inputs never contribute to required_datum_hashes
         }
 
-        // Only DatumHash outputs require a witness datum.
+        // Only Plutus-script-locked inputs require a datum witness when the
+        // UTxO carries a DatumHash.  Native-script-locked inputs are explicitly
+        // exempt — Haskell's `getInputDataHashesTxBody` only adds to the
+        // required set when `isSpendingPlutusScript addr` is true
+        // (`lookupPlutusScript` returns `Nothing` for native scripts).
+        //
+        // Reference: IntersectMBO/cardano-ledger,
+        // eras/alonzo/impl/src/Cardano/Ledger/Alonzo/UTxO.hs,
+        // `getInputDataHashesTxBody`, DatumHash branch:
+        //   DatumHash dataHash
+        //     | isSpendingPlutusScript addr -> (Set.insert dataHash hashSet, …)
+        //   -- "Though it is somewhat odd to allow native scripts to include a
+        //   --  datum, the Alonzo era already set the precedent with datum
+        //   --  hashes, and several dapp developers see this as a helpful
+        //   --  feature."
+        //   _ -> ans
+        //
         // InlineDatum outputs embed the datum in the UTxO itself — no witness
-        // needed.
+        // needed regardless of script type.
         if let OutputDatum::DatumHash(hash) = &utxo.datum {
-            required_datum_hashes.insert(*hash);
+            if let Some(Credential::Script(script_hash)) = utxo.address.payment_credential() {
+                let version = script_versions.get(script_hash).copied().unwrap_or(0);
+                // version == 0: native script or unknown → NOT required (exempt)
+                // version >= 1: PlutusV1/V2/V3/V4 → REQUIRED
+                if version > 0 {
+                    required_datum_hashes.insert(*hash);
+                }
+            }
         }
     }
 
@@ -196,6 +229,16 @@ pub(super) fn check_datum_witnesses(
 
     for output in &tx.body.outputs {
         if let OutputDatum::DatumHash(hash) = &output.datum {
+            allowed_supplemental_hashes.insert(*hash);
+        }
+    }
+
+    // Collateral return counts as an output too: Haskell's Babbage
+    // `getBabbageSupplementalDataHashes` iterates `allSizedOutputsTxBodyF`
+    // = regular outputs ++ collateral return
+    // (eras/babbage/impl/src/Cardano/Ledger/Babbage/UTxO.hs).
+    if let Some(collateral_return) = &tx.body.collateral_return {
+        if let OutputDatum::DatumHash(hash) = &collateral_return.datum {
             allowed_supplemental_hashes.insert(*hash);
         }
     }
@@ -363,6 +406,9 @@ mod tests {
             "5ff23baed51ec22e9342ace92e6dd9976be5ded109575f58a8a2419f064818d0"
         );
 
+        // `script_output_with_datum_hash` uses script hash [0xbb; 28] — mark it
+        // as PlutusV1 so the datum witness is required (and checked via raw spans).
+        let script_hash = Hash28::from_bytes([0xbbu8; 28]);
         let (utxo_set, input) = make_utxo(script_output_with_datum_hash(onchain_hash));
 
         // array(1) wrapping the datum — as stored in `raw_plutus_data_cbor`.
@@ -378,13 +424,13 @@ mod tests {
         );
         tx.witness_set.raw_plutus_data_cbor = Some(raw_array);
 
+        // PlutusV1 → datum witness is required; the raw-span path must reproduce
+        // the on-chain hash exactly.
+        let mut script_versions = std::collections::HashMap::new();
+        script_versions.insert(script_hash, 1u8);
+
         let mut errors: Vec<ValidationError> = vec![];
-        check_datum_witnesses(
-            &tx,
-            &utxo_set,
-            &std::collections::HashMap::new(),
-            &mut errors,
-        );
+        check_datum_witnesses(&tx, &utxo_set, &script_versions, &mut errors);
         assert!(
             errors.is_empty(),
             "datum hash must be computed over the original (tag-102) bytes; got: {errors:?}"
@@ -514,28 +560,29 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 1 — script-locked input with matching datum witness → no error
+    // Test 1 — script-locked Plutus input with matching datum witness → no error
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_script_input_datum_present() {
+        // Script hash used by `script_output_with_datum_hash`.
+        let script_hash = Hash28::from_bytes([0xbbu8; 28]);
         // Datum to witness
         let datum = int_datum(42);
         let hash = datum_hash_of(&datum);
 
-        // UTxO: script-locked, DatumHash in output
+        // UTxO: script-locked (Plutus V1), DatumHash in output
         let utxo_output = script_output_with_datum_hash(hash);
         let (utxo_set, input) = make_utxo(utxo_output);
 
         let tx = make_tx(vec![input], vec![], vec![], vec![datum]);
 
+        // script_versions: the locking script is PlutusV1 → datum witness required.
+        let mut script_versions = std::collections::HashMap::new();
+        script_versions.insert(script_hash, 1u8);
+
         let mut errors: Vec<ValidationError> = vec![];
-        check_datum_witnesses(
-            &tx,
-            &utxo_set,
-            &std::collections::HashMap::new(),
-            &mut errors,
-        );
+        check_datum_witnesses(&tx, &utxo_set, &script_versions, &mut errors);
 
         assert!(
             !errors
@@ -546,11 +593,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 2 — script-locked input with missing datum witness → error
+    // Test 2 — Plutus-script-locked input with missing datum witness → error
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_script_input_datum_missing() {
+        let script_hash = Hash28::from_bytes([0xbbu8; 28]);
         // Datum NOT supplied in witness
         let datum = int_datum(99);
         let hash = datum_hash_of(&datum);
@@ -561,13 +609,12 @@ mod tests {
         // witness plutus_data is empty — no datum supplied
         let tx = make_tx(vec![input], vec![], vec![], vec![]);
 
+        // script_versions: PlutusV1 → datum witness IS required.
+        let mut script_versions = std::collections::HashMap::new();
+        script_versions.insert(script_hash, 1u8);
+
         let mut errors: Vec<ValidationError> = vec![];
-        check_datum_witnesses(
-            &tx,
-            &utxo_set,
-            &std::collections::HashMap::new(),
-            &mut errors,
-        );
+        check_datum_witnesses(&tx, &utxo_set, &script_versions, &mut errors);
 
         assert!(
             errors
@@ -716,13 +763,15 @@ mod tests {
         // Both the spending input UTxO and the reference input UTxO carry the
         // same DatumHash.  The datum is NOT in the witness.
         //
-        // Because the spending input is script-locked, MissingDatumWitness must
-        // still fire — the reference input datum hash only makes the witness
-        // *allowed*, it does not satisfy the *required* set.
+        // Because the spending input is locked by a PLUTUS script,
+        // MissingDatumWitness must still fire — the reference input datum hash
+        // only makes the witness *allowed*, it does not satisfy the *required*
+        // set.
+        let script_hash = Hash28::from_bytes([0xbbu8; 28]);
         let datum = int_datum(77);
         let hash = datum_hash_of(&datum);
 
-        // Spending input: script-locked, DatumHash
+        // Spending input: Plutus-script-locked, DatumHash
         let spend_output = script_output_with_datum_hash(hash);
         let (mut utxo_set, spend_input) = make_utxo(spend_output);
 
@@ -754,13 +803,12 @@ mod tests {
             vec![], // datum NOT supplied
         );
 
+        // script_versions: PlutusV1 → datum witness IS required.
+        let mut script_versions = std::collections::HashMap::new();
+        script_versions.insert(script_hash, 1u8);
+
         let mut errors: Vec<ValidationError> = vec![];
-        check_datum_witnesses(
-            &tx,
-            &utxo_set,
-            &std::collections::HashMap::new(),
-            &mut errors,
-        );
+        check_datum_witnesses(&tx, &utxo_set, &script_versions, &mut errors);
 
         assert!(
             errors
@@ -776,13 +824,16 @@ mod tests {
 
     #[test]
     fn test_multiple_script_inputs_one_missing() {
+        // Script hash used by `script_output_with_datum_hash`.
+        let script_hash = Hash28::from_bytes([0xbbu8; 28]);
+
         let datum_a = int_datum(10);
         let hash_a = datum_hash_of(&datum_a);
 
         let datum_b = int_datum(20);
         let hash_b = datum_hash_of(&datum_b);
 
-        // Two distinct UTxOs, both script-locked, each with a different DatumHash
+        // Two distinct UTxOs, both Plutus-script-locked, each with a different DatumHash
         let output_a = script_output_with_datum_hash(hash_a);
         let output_b = script_output_with_datum_hash(hash_b);
 
@@ -801,13 +852,12 @@ mod tests {
         // Only datum_a is in the witness; datum_b is absent
         let tx = make_tx(vec![input_a, input_b], vec![], vec![], vec![datum_a]);
 
+        // script_versions: both inputs locked by the same PlutusV1 script hash.
+        let mut script_versions = std::collections::HashMap::new();
+        script_versions.insert(script_hash, 1u8);
+
         let mut errors: Vec<ValidationError> = vec![];
-        check_datum_witnesses(
-            &tx,
-            &utxo_set,
-            &std::collections::HashMap::new(),
-            &mut errors,
-        );
+        check_datum_witnesses(&tx, &utxo_set, &script_versions, &mut errors);
 
         let missing: Vec<_> = errors
             .iter()
@@ -919,6 +969,315 @@ mod tests {
                 ValidationError::UnspendableUTxONoDatumHash { .. }
             )),
             "expected no UnspendableUTxONoDatumHash for V3 input (CIP-0069 exempt), got: {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 11 — Native-script-locked input with DatumHash: NO witness required
+    //
+    // Regression test for mainnet false-positive divergence (epoch ~434, Babbage
+    // PV8).  Txs like `af4a50e599f6...` spend native-script-locked UTxOs that
+    // carry a `DatumHash` WITHOUT providing the datum preimage in the witness
+    // set — Haskell accepts them because `getInputDataHashesTxBody` in
+    // `eras/alonzo/impl/src/Cardano/Ledger/Alonzo/UTxO.hs` gates the required
+    // set on `isSpendingPlutusScript addr` (which returns `false` for native
+    // scripts).  dugite must NOT emit `MissingDatumWitness` for these inputs.
+    //
+    // Haskell source comment on the native-script DatumHash case:
+    //   "Though it is somewhat odd to allow native scripts to include a datum,
+    //    the Alonzo era already set the precedent with datum hashes, and several
+    //    dapp developers see this as a helpful feature."
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_native_script_datum_hash_no_witness_required() {
+        // Script hash for a native script (all_of or similar).
+        let script_hash = Hash28::from_bytes([0xaau8; 28]);
+
+        // UTxO at a native-script address that carries a DatumHash.
+        // The datum preimage is deliberately NOT in the witness set.
+        let datum = int_datum(42);
+        let datum_hash = datum_hash_of(&datum);
+
+        let utxo_output = TransactionOutput {
+            address: Address::Base(BaseAddress {
+                network: NetworkId::Testnet,
+                payment: Credential::Script(script_hash),
+                stake: Credential::VerificationKey(Hash28::from_bytes([0xbbu8; 28])),
+            }),
+            value: Value::lovelace(2_000_000),
+            datum: OutputDatum::DatumHash(datum_hash),
+            script_ref: None,
+            is_legacy: false,
+            raw_cbor: None,
+        };
+        let (utxo_set, input) = make_utxo(utxo_output);
+
+        // Witness set: the native script is present but NO plutus_data.
+        // script_versions map does NOT contain an entry for this hash (or maps
+        // to version 0), reflecting that native scripts are absent from
+        // `plutus_script_version_map`.
+        let tx = make_tx(vec![input], vec![], vec![], vec![]);
+
+        // Version map is empty — native script hash not in Plutus map.
+        let mut errors: Vec<ValidationError> = vec![];
+        check_datum_witnesses(
+            &tx,
+            &utxo_set,
+            &std::collections::HashMap::new(),
+            &mut errors,
+        );
+
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::MissingDatumWitness(_))),
+            "native-script-locked input with DatumHash must NOT require datum witness; got: {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 12 — Plutus V2 script-locked input with DatumHash: witness required
+    //
+    // Positive control: a Plutus V2 script-locked input with DatumHash and no
+    // witness datum MUST produce MissingDatumWitness.  This ensures the native-
+    // script exemption does not accidentally exempt Plutus scripts.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_plutus_v2_datum_hash_witness_required() {
+        let script_hash = Hash28::from_bytes([0xddu8; 28]);
+
+        let datum = int_datum(77);
+        let datum_hash = datum_hash_of(&datum);
+
+        let utxo_output = TransactionOutput {
+            address: Address::Base(BaseAddress {
+                network: NetworkId::Testnet,
+                payment: Credential::Script(script_hash),
+                stake: Credential::VerificationKey(Hash28::from_bytes([0xeeu8; 28])),
+            }),
+            value: Value::lovelace(2_000_000),
+            datum: OutputDatum::DatumHash(datum_hash),
+            script_ref: None,
+            is_legacy: false,
+            raw_cbor: None,
+        };
+        let (utxo_set, input) = make_utxo(utxo_output);
+
+        // Witness plutus_data is empty — datum preimage absent.
+        let tx = make_tx(vec![input], vec![], vec![], vec![]);
+
+        // script_versions: PlutusV2 script at this hash.
+        let mut script_versions = std::collections::HashMap::new();
+        script_versions.insert(script_hash, 2u8);
+
+        let mut errors: Vec<ValidationError> = vec![];
+        check_datum_witnesses(&tx, &utxo_set, &script_versions, &mut errors);
+
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::MissingDatumWitness(_))),
+            "PlutusV2-locked input with DatumHash and absent witness MUST produce MissingDatumWitness; got: {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Collateral return datum hash is an ALLOWED supplemental target:
+    // Haskell's Babbage `getBabbageSupplementalDataHashes` iterates
+    // `allSizedOutputsTxBodyF` = regular outputs ++ collateral return
+    // (eras/babbage/impl/src/Cardano/Ledger/Babbage/UTxO.hs). A witness
+    // datum matching ONLY the collateral-return's datum hash must NOT be
+    // flagged ExtraDatumWitness.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_collateral_return_datum_hash_supplemental() {
+        let datum = int_datum(77);
+        let hash = datum_hash_of(&datum);
+
+        let utxo_output = vkey_output_no_datum();
+        let (utxo_set, input) = make_utxo(utxo_output);
+
+        let collateral_return = TransactionOutput {
+            address: Address::Base(BaseAddress {
+                network: NetworkId::Testnet,
+                payment: Credential::VerificationKey(Hash28::from_bytes([0x33u8; 28])),
+                stake: Credential::VerificationKey(Hash28::from_bytes([0x44u8; 28])),
+            }),
+            value: Value::lovelace(5_000_000),
+            datum: OutputDatum::DatumHash(hash),
+            script_ref: None,
+            is_legacy: false,
+            raw_cbor: None,
+        };
+
+        let mut tx = make_tx(vec![input], vec![], vec![], vec![datum]);
+        tx.body.collateral_return = Some(collateral_return);
+
+        let mut errors: Vec<ValidationError> = vec![];
+        check_datum_witnesses(
+            &tx,
+            &utxo_set,
+            &std::collections::HashMap::new(),
+            &mut errors,
+        );
+
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::ExtraDatumWitness(_))),
+            "collateral-return datum hash must be an allowed supplemental target; got: {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The rejection side of the native-script exemption: a witness datum whose
+    // hash matches ONLY a native-script-locked input's DatumHash (not any
+    // output / collateral return / reference input) is NOT allowed. Haskell's
+    // `missingRequiredDatums` computes supplemental = txHashes − inputHashes;
+    // the native-script input contributes nothing to inputHashes, and
+    // `getSupplementalDataHashes` never includes spending-input UTxO hashes →
+    // NotAllowedSupplementalDatums. The #751-era fix must narrow REQUIRED
+    // without widening ALLOWED.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_native_script_supplied_datum_rejected_as_supplemental() {
+        let datum = int_datum(99);
+        let hash = datum_hash_of(&datum);
+
+        // Native-script-locked input (script absent from script_versions map)
+        // whose UTxO carries the datum hash.
+        let utxo_output = script_output_with_datum_hash(hash);
+        let (utxo_set, input) = make_utxo(utxo_output);
+
+        // The witness SUPPLIES the datum preimage anyway; no output declares it.
+        let tx = make_tx(vec![input], vec![], vec![], vec![datum]);
+
+        let mut errors: Vec<ValidationError> = vec![];
+        check_datum_witnesses(
+            &tx,
+            &utxo_set,
+            &std::collections::HashMap::new(), // native: not in Plutus map
+            &mut errors,
+        );
+
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::MissingDatumWitness(_))),
+            "native-script input must not REQUIRE a datum witness; got: {errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::ExtraDatumWitness(_))),
+            "unsolicited datum for a native-script input is NotAllowedSupplementalDatums \
+             in Haskell and must stay rejected; got: {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PIN — real mainnet tx af4a50e599f6cd83c3680c3255b91bedc7776e7de090bb37
+    // 0f0034ef023eb7e3 (slot 102,975,745, epoch ~434, Babbage PV8), one of
+    // the 8 confirmed on-chain txs the pre-fix code falsely rejected with
+    // MissingDatumWitness during the v2.0.5 mainnet sync.
+    //
+    // The tx spends:
+    //   • 0a7c723b…#4 — vkey-locked (payment cred 5c27059e…), no datum
+    //   • 62cfc1b2…#1 — NATIVE-script-locked enterprise address (script
+    //     hash 279b2518…), UTxO carries DatumHash 6cdd5320… whose preimage
+    //     is deliberately ABSENT from the witness set
+    // The witness set's only datum is the preimage of an OUTPUT's datum
+    // hash (supplemental — allowed). Haskell accepted this tx on-chain:
+    // `getInputDataHashesTxBody` requires datums only for Plutus-locked
+    // inputs (`isSpendingPlutusScript`), so the native-script input
+    // contributes nothing to the required set. The full datum check must
+    // produce ZERO datum-class errors.
+    // -----------------------------------------------------------------------
+
+    const MAINNET_TX_AF4A50E5: &str = include_str!("fixtures/tx-af4a50e5.hex");
+
+    #[test]
+    fn pin_mainnet_babbage_native_script_datum_hash_tx_af4a50e5() {
+        let s = MAINNET_TX_AF4A50E5.trim();
+        let bytes: Vec<u8> = (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("valid hex"))
+            .collect();
+        let tx = dugite_serialization::decode::decode_transaction(5, &bytes)
+            .expect("decode real Babbage tx");
+        assert_eq!(tx.body.inputs.len(), 2, "fixture spends exactly 2 inputs");
+
+        // Reconstruct the spent UTxOs from chain data (Koios tx_info):
+        let mut utxo_set = crate::utxo::UtxoSet::new();
+        for input in &tx.body.inputs {
+            let output = if input.index == 1 {
+                // 62cfc1b2…#1 — the native-script-locked UTxO with DatumHash.
+                TransactionOutput {
+                    address: Address::Enterprise(dugite_primitives::address::EnterpriseAddress {
+                        network: NetworkId::Mainnet,
+                        payment: Credential::Script(
+                            Hash28::from_hex(
+                                "279b2518634a7402405b8df3d52c19e26bee2792f770fc0bb536bc4b",
+                            )
+                            .unwrap(),
+                        ),
+                    }),
+                    value: Value::lovelace(1_198_180),
+                    datum: OutputDatum::DatumHash(
+                        Hash32::from_hex(
+                            "6cdd5320fb8f463541458270bfef9a6444f9c7f3fa06513607d90c7f0fa68808",
+                        )
+                        .unwrap(),
+                    ),
+                    script_ref: None,
+                    is_legacy: false,
+                    raw_cbor: None,
+                }
+            } else {
+                // 0a7c723b…#4 — vkey-locked, no datum.
+                TransactionOutput {
+                    address: Address::Base(BaseAddress {
+                        network: NetworkId::Mainnet,
+                        payment: Credential::VerificationKey(
+                            Hash28::from_hex(
+                                "5c27059e275c30b7307ba74d0823e049a6b642f1da9a1c9732a44f96",
+                            )
+                            .unwrap(),
+                        ),
+                        stake: Credential::VerificationKey(Hash28::from_bytes([0u8; 28])),
+                    }),
+                    value: Value::lovelace(8_754_014_993),
+                    datum: OutputDatum::None,
+                    script_ref: None,
+                    is_legacy: false,
+                    raw_cbor: None,
+                }
+            };
+            utxo_set.insert(input.clone(), output);
+        }
+
+        // The REAL production path for the Plutus map: the tx's witness set
+        // carries the native script, which must NOT enter the map.
+        let script_versions = crate::validation::plutus_script_version_map(&tx, &utxo_set);
+        assert!(
+            !script_versions.contains_key(
+                &Hash28::from_hex("279b2518634a7402405b8df3d52c19e26bee2792f770fc0bb536bc4b")
+                    .unwrap()
+            ),
+            "native script must not appear in the Plutus version map"
+        );
+
+        let mut errors: Vec<ValidationError> = vec![];
+        check_datum_witnesses(&tx, &utxo_set, &script_versions, &mut errors);
+
+        assert!(
+            errors.is_empty(),
+            "on-chain tx af4a50e5… must produce zero datum-class errors \
+             (pre-fix: false MissingDatumWitness for 6cdd5320…); got: {errors:?}"
         );
     }
 }
