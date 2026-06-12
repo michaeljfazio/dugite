@@ -1337,6 +1337,27 @@ pub enum ValidationError {
         /// Hex-encoded credential hash (zero-padded to 32 bytes).
         credential_hash: String,
     },
+    /// Haskell `StakeKeyNotRegisteredDELEG` (dereg polarity): a stake
+    /// DEREGISTRATION certificate names a credential that is not registered
+    /// at that point in the left-to-right cert walk (neither pre-tx nor by a
+    /// prior cert in the same tx).
+    ///
+    /// Both legacy `StakeDeregistration` (tag 1) and Conway
+    /// `ConwayStakeDeregistration` (tag 8) are covered. Without this check a
+    /// dugite BP could forge a Haskell-invalid block, and the apply path
+    /// would refund a key deposit that was never paid (deposits-pot drift).
+    ///
+    /// Reference: Haskell `StakeKeyNotRegisteredDELEG` in
+    /// `cardano-ledger-shelley:Cardano.Ledger.Shelley.Rules.Deleg`
+    /// (ShelleyUnRegCert / ConwayUnRegCert predicate). dugite #748.
+    #[error(
+        "Stake deregistration rejected: credential {credential_hash} is not registered \
+         (StakeKeyNotRegisteredDELEG)"
+    )]
+    StakeKeyNotRegisteredForDeregistration {
+        /// Hex-encoded credential hash (zero-padded to 32 bytes).
+        credential_hash: String,
+    },
     /// Haskell `DelegateeStakePoolNotRegisteredDELEG`: a stake delegation
     /// certificate names a pool ID that is not currently registered.
     ///
@@ -2982,6 +3003,20 @@ pub fn validate_transaction_with_pools(
             };
             if let Some(credential) = opt_dereg_cred {
                 let key = credential.to_typed_hash32();
+                // #748: a deregistration of a credential that is NOT
+                // registered at this point in the left-to-right walk is
+                // rejected by Haskell (`StakeKeyNotRegisteredDELEG`,
+                // ShelleyUnRegCert/ConwayUnRegCert). Without this, dugite's
+                // mempool admits the tx, a dugite BP forges a Haskell-invalid
+                // block, and the apply path refunds a deposit never paid.
+                let is_currently_registered = (accounts.contains_key(&key)
+                    && !in_tx_deregistered.contains(&key))
+                    || in_tx_registered.contains(&key);
+                if !is_currently_registered {
+                    errors.push(ValidationError::StakeKeyNotRegisteredForDeregistration {
+                        credential_hash: key.to_hex(),
+                    });
+                }
                 in_tx_deregistered.insert(key);
                 in_tx_registered.remove(&key);
                 continue;
@@ -3223,9 +3258,36 @@ pub fn validate_transaction_with_pools(
         // Track stake credentials registered within THIS tx via
         // StakeRegistration / ConwayStakeRegistration / Reg* combo certs,
         // so that a same-tx register-then-delegate sequence is accepted.
+        //
+        // Intra-tx DELEGS sequencing (#746 follow-up): a same-tx
+        // DEREGISTRATION must also make the credential invisible to LATER
+        // delegation certs — Haskell applies certs left-to-right against
+        // evolving state, so [dereg(C), delegate(C)] fires
+        // `StakeKeyNotRegisteredDELEG` even when C was registered pre-tx,
+        // and [reg(C), dereg(C), voteDeleg(C)] likewise. Track deregs in
+        // `dropped_stake_keys` and prune `new_stake_keys` symmetrically.
         let mut new_stake_keys: std::collections::HashSet<dugite_primitives::hash::Hash32> =
             std::collections::HashSet::new();
+        let mut dropped_stake_keys: std::collections::HashSet<dugite_primitives::hash::Hash32> =
+            std::collections::HashSet::new();
         for cert in &tx.body.certificates {
+            // Track deregistrations FIRST (left-to-right evolution): a dereg
+            // removes the credential from the evolving registered set.
+            let opt_dereg_cred: Option<&dugite_primitives::credentials::Credential> = match cert {
+                dugite_primitives::transaction::Certificate::StakeDeregistration(c) => Some(c),
+                dugite_primitives::transaction::Certificate::ConwayStakeDeregistration {
+                    credential: c,
+                    ..
+                } => Some(c),
+                _ => None,
+            };
+            if let Some(cred) = opt_dereg_cred {
+                let key = cred.to_typed_hash32();
+                dropped_stake_keys.insert(key);
+                new_stake_keys.remove(&key);
+                continue;
+            }
+
             // Collect credentials registered by pure or combo registration certs.
             let opt_reg_cred: Option<&dugite_primitives::credentials::Credential> = match cert {
                 dugite_primitives::transaction::Certificate::StakeRegistration(c) => Some(c),
@@ -3249,7 +3311,12 @@ pub fn validate_transaction_with_pools(
                 _ => None,
             };
             if let Some(cred) = opt_reg_cred {
-                new_stake_keys.insert(cred.to_typed_hash32());
+                let key = cred.to_typed_hash32();
+                new_stake_keys.insert(key);
+                // A re-registration after a same-tx dereg makes the
+                // credential visible again ([dereg, reg, delegate] is the
+                // legal mainnet pattern).
+                dropped_stake_keys.remove(&key);
                 // Don't `continue` here — we still need to check delegation
                 // certs later in the loop.
             }
@@ -3270,7 +3337,14 @@ pub fn validate_transaction_with_pools(
             };
             if let Some(credential) = opt_deleg_cred {
                 let key = credential.to_typed_hash32();
-                if !accounts.contains_key(&key) && !new_stake_keys.contains(&key) {
+                // Registered at THIS point in the left-to-right cert walk:
+                // pre-tx registered AND not since deregistered in this tx,
+                // OR registered earlier in this tx (and not re-dropped —
+                // `new_stake_keys` is pruned by the dereg arm above).
+                let is_registered = (accounts.contains_key(&key)
+                    && !dropped_stake_keys.contains(&key))
+                    || new_stake_keys.contains(&key);
+                if !is_registered {
                     errors.push(ValidationError::StakeKeyNotRegisteredForDelegation {
                         credential_hash: key.to_hex(),
                     });
