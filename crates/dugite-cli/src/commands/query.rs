@@ -2603,7 +2603,7 @@ impl QueryCmd {
                 let _ = output_json; // accepted as explicit JSON request
                 let rendered = if output_text {
                     format!(
-                        "Account State\n=============\nTreasury: {} ADA\nReserves: {} ADA\n",
+                        "Account State\n=============\nTreasury: {treasury} lovelace ({} ADA)\nReserves: {reserves} lovelace ({} ADA)\n",
                         treasury / 1_000_000,
                         reserves / 1_000_000,
                     )
