@@ -38,6 +38,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::node::block_fetch_logic::BlockFetchLogicTask;
 use crate::node::connection_lifecycle::{
     CandidateChainState, ConnectResult, ConnectionLifecycleManager, FetchedBlock, LifecycleError,
+    PeerFailureKind,
 };
 use crate::node::peer_connection::PeerConnection;
 
@@ -638,7 +639,7 @@ pub struct Node {
     fetched_blocks_rx: Option<mpsc::Receiver<FetchedBlock>>,
     /// Receiver for peer failure reports from protocol tasks (e.g. fetch timeout).
     /// The main run loop drains this to call `peer_failed()` for reputation scoring.
-    peer_failure_rx: Option<mpsc::Receiver<SocketAddr>>,
+    peer_failure_rx: Option<mpsc::Receiver<(SocketAddr, PeerFailureKind)>>,
     /// Receiver for KeepAlive RTT measurements from connected peers.
     /// The main run loop uses these to update PeerManager EWMA and RTT gauges.
     keepalive_rtt_rx: Option<mpsc::Receiver<(SocketAddr, f64)>>,
@@ -4088,7 +4089,7 @@ impl Node {
         // at 90 KB/block while still providing adequate pipeline depth.
         let (fetched_blocks_tx, fetched_blocks_rx) =
             mpsc::channel::<FetchedBlock>(FETCHED_BLOCKS_CHANNEL_CAP);
-        let (peer_failure_tx, peer_failure_rx) = mpsc::channel::<SocketAddr>(64);
+        let (peer_failure_tx, peer_failure_rx) = mpsc::channel::<(SocketAddr, PeerFailureKind)>(64);
         let (keepalive_rtt_tx, keepalive_rtt_rx) = mpsc::channel::<(SocketAddr, f64)>(256);
         let candidate_chains: Arc<RwLock<HashMap<SocketAddr, CandidateChainState>>> =
             Arc::new(RwLock::new(HashMap::new()));
@@ -4908,13 +4909,29 @@ impl Node {
 
                 // ── Peer failure reports from protocol tasks ────────────
                 //
-                // BlockFetch tasks report timed-out peers here so we can
-                // record the failure for reputation scoring and backoff
-                // without waiting for the mux to die naturally.
-                Some(failed_addr) = peer_failure_rx.recv() => {
+                // Protocol tasks report failed peers here so we can record
+                // the failure for reputation scoring and backoff without
+                // waiting for the mux to die naturally. `ProtocolFault`
+                // convictions (#751: mis-declared block sizes, undecodable
+                // blocks, agency violations — provable lies) additionally
+                // tear the connection down, mirroring Haskell where every
+                // BlockFetch conviction is a thrown exception that kills
+                // the bearer; without this the convicted peer keeps a hot
+                // connection whose dead BlockFetch worker silently discards
+                // the remaining flood (mux drops frames on a closed
+                // channel without closing TCP).
+                Some((failed_addr, failure_kind)) = peer_failure_rx.recv() => {
                     let mut pm = peer_manager.write().await;
-                    warn!(%failed_addr, "peer reported as failed by protocol task");
+                    warn!(%failed_addr, kind = ?failure_kind, "peer reported as failed by protocol task");
                     pm.peer_failed(&failed_addr);
+                    if failure_kind == PeerFailureKind::ProtocolFault {
+                        if let Some(ref mut lifecycle) = self.connection_lifecycle {
+                            if let Err(e) = lifecycle.demote_to_cold(failed_addr, &mut pm).await {
+                                // Not connected any more — bookkeeping only.
+                                debug!(%failed_addr, error = %e, "protocol-fault teardown: no live connection");
+                            }
+                        }
+                    }
                     self.update_peer_metrics(&pm);
                 }
 
