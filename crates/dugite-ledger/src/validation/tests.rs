@@ -16051,4 +16051,289 @@ mod tests {
             "Expected no StakeKeyNotRegisteredForDelegation for [dereg, re-reg, delegate] (pre-registered); got: {result:?}"
         );
     }
+
+    // ---------------------------------------------------------------------------
+    // Intra-tx DELEGS sequencing — #746 review follow-ups (2026-06-12)
+    //
+    // The delegation check and the deregistration check must BOTH see the
+    // evolving registered-set: a same-tx dereg hides the credential from
+    // later delegation certs, and a dereg of a credential that is not
+    // registered at that point fires `StakeKeyNotRegisteredDELEG` (#748).
+    // ---------------------------------------------------------------------------
+
+    /// [dereg(C), delegate(C, pool)] with C PRE-registered: Haskell applies
+    /// certs left-to-right, so the delegation sees C unregistered → rejected.
+    /// Pre-fix dugite accepted this (forge-invalid polarity).
+    #[test]
+    fn test_intra_tx_dereg_then_delegate_rejected() {
+        let cred_bytes = [0xB1u8; 28];
+        let cred = dugite_primitives::credentials::Credential::VerificationKey(Hash28::from_bytes(
+            cred_bytes,
+        ));
+        let pool_id = Hash28::from_bytes([0xB2u8; 28]);
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.key_deposit = Lovelace(0);
+
+        let mut utxo_set = UtxoSet::new();
+        let tx = make_multi_cert_tx(
+            &mut utxo_set,
+            vec![
+                Certificate::StakeDeregistration(cred.clone()),
+                Certificate::StakeDelegation {
+                    credential: cred.clone(),
+                    pool_hash: pool_id,
+                },
+            ],
+        );
+
+        let reward_accounts = make_reward_accounts(cred_bytes, 0);
+        let mut registered_pools: std::collections::HashSet<Hash28> = HashSet::new();
+        registered_pools.insert(pool_id);
+
+        let result = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            Some(&registered_pools),
+            None,
+            Some(&reward_accounts),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let rejected = matches!(&result, Err(errors) if errors.iter().any(|e| {
+            matches!(e, ValidationError::StakeKeyNotRegisteredForDelegation { .. })
+        }));
+        assert!(
+            rejected,
+            "[dereg(C), delegate(C)] must fire StakeKeyNotRegisteredForDelegation \
+             (Haskell left-to-right DELEGS); got: {result:?}"
+        );
+    }
+
+    /// [reg(C), dereg(C), delegate(C, pool)] with C NOT pre-registered: the
+    /// intra-tx registration is cancelled by the dereg before the delegation
+    /// → rejected. Pre-fix `new_stake_keys` was never pruned on dereg.
+    #[test]
+    fn test_intra_tx_reg_dereg_delegate_rejected() {
+        let cred_bytes = [0xB3u8; 28];
+        let cred = dugite_primitives::credentials::Credential::VerificationKey(Hash28::from_bytes(
+            cred_bytes,
+        ));
+        let pool_id = Hash28::from_bytes([0xB4u8; 28]);
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.key_deposit = Lovelace(0);
+
+        let mut utxo_set = UtxoSet::new();
+        let tx = make_multi_cert_tx(
+            &mut utxo_set,
+            vec![
+                Certificate::StakeRegistration(cred.clone()),
+                Certificate::StakeDeregistration(cred.clone()),
+                Certificate::StakeDelegation {
+                    credential: cred.clone(),
+                    pool_hash: pool_id,
+                },
+            ],
+        );
+
+        // C is NOT pre-registered.
+        let reward_accounts = make_reward_accounts([0xEEu8; 28], 0);
+        let mut registered_pools: std::collections::HashSet<Hash28> = HashSet::new();
+        registered_pools.insert(pool_id);
+
+        let result = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            Some(&registered_pools),
+            None,
+            Some(&reward_accounts),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let rejected = matches!(&result, Err(errors) if errors.iter().any(|e| {
+            matches!(e, ValidationError::StakeKeyNotRegisteredForDelegation { .. })
+        }));
+        assert!(
+            rejected,
+            "[reg(C), dereg(C), delegate(C)] must fire StakeKeyNotRegisteredForDelegation \
+             (the dereg prunes the intra-tx registration); got: {result:?}"
+        );
+    }
+
+    /// Deregistration of a credential that is not registered (pre-tx or
+    /// intra-tx) fires `StakeKeyNotRegisteredDELEG` (#748). Pre-fix dugite
+    /// accepted it: a dugite BP could forge a Haskell-invalid block and the
+    /// apply path refunded a deposit that was never paid.
+    #[test]
+    fn test_dereg_of_unregistered_rejected() {
+        let cred = dugite_primitives::credentials::Credential::VerificationKey(Hash28::from_bytes(
+            [0xB5u8; 28],
+        ));
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.key_deposit = Lovelace(0);
+
+        let mut utxo_set = UtxoSet::new();
+        let tx = make_multi_cert_tx(
+            &mut utxo_set,
+            vec![Certificate::StakeDeregistration(cred.clone())],
+        );
+
+        // Accounts map exists but does NOT contain C.
+        let reward_accounts = make_reward_accounts([0xEFu8; 28], 0);
+
+        let result = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            None,
+            None,
+            Some(&reward_accounts),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let rejected = matches!(&result, Err(errors) if errors.iter().any(|e| {
+            matches!(e, ValidationError::StakeKeyNotRegisteredForDeregistration { .. })
+        }));
+        assert!(
+            rejected,
+            "dereg of an unregistered credential must fire \
+             StakeKeyNotRegisteredForDeregistration; got: {result:?}"
+        );
+    }
+
+    /// [reg(C), dereg(C), dereg(C)]: the SECOND dereg sees C unregistered →
+    /// rejected; the first is fine (intra-tx registration).
+    #[test]
+    fn test_intra_tx_double_dereg_second_rejected() {
+        let cred = dugite_primitives::credentials::Credential::VerificationKey(Hash28::from_bytes(
+            [0xB6u8; 28],
+        ));
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.key_deposit = Lovelace(0);
+
+        let mut utxo_set = UtxoSet::new();
+        let tx = make_multi_cert_tx(
+            &mut utxo_set,
+            vec![
+                Certificate::StakeRegistration(cred.clone()),
+                Certificate::StakeDeregistration(cred.clone()),
+                Certificate::StakeDeregistration(cred.clone()),
+            ],
+        );
+
+        let reward_accounts = make_reward_accounts([0xEDu8; 28], 0);
+
+        let result = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            None,
+            None,
+            Some(&reward_accounts),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let rejected = matches!(&result, Err(errors) if errors.iter().any(|e| {
+            matches!(e, ValidationError::StakeKeyNotRegisteredForDeregistration { .. })
+        }));
+        assert!(
+            rejected,
+            "[reg, dereg, dereg] must reject the second dereg; got: {result:?}"
+        );
+    }
+
+    /// Sanity: [dereg(C)] with C pre-registered and zero balance must NOT
+    /// fire the new dereg-registered check (no regression on the normal
+    /// deregistration path).
+    #[test]
+    fn test_dereg_of_preregistered_accepted() {
+        let cred_bytes = [0xB7u8; 28];
+        let cred = dugite_primitives::credentials::Credential::VerificationKey(Hash28::from_bytes(
+            cred_bytes,
+        ));
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.key_deposit = Lovelace(0);
+
+        let mut utxo_set = UtxoSet::new();
+        let tx = make_multi_cert_tx(
+            &mut utxo_set,
+            vec![Certificate::StakeDeregistration(cred.clone())],
+        );
+
+        let reward_accounts = make_reward_accounts(cred_bytes, 0);
+
+        let result = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            None,
+            None,
+            Some(&reward_accounts),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let false_fire = matches!(&result, Err(errors) if errors.iter().any(|e| {
+            matches!(e, ValidationError::StakeKeyNotRegisteredForDeregistration { .. })
+        }));
+        assert!(
+            !false_fire,
+            "dereg of a pre-registered credential must not fire the #748 check; got: {result:?}"
+        );
+    }
 }

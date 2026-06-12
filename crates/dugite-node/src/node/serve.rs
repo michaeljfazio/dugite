@@ -782,6 +782,13 @@ pub(crate) fn convert_validation_error(
                 "Stake registration rejected: credential {credential_hash} is already registered"
             ),
         },
+        VE::StakeKeyNotRegisteredForDeregistration { credential_hash } => {
+            TxValidationError::ScriptFailed {
+                reason: format!(
+                    "Stake deregistration rejected: credential {credential_hash} is not registered"
+                ),
+            }
+        }
         VE::DelegateePoolNotRegistered { pool_id } => TxValidationError::ScriptFailed {
             reason: format!(
                 "Stake delegation rejected: target pool {pool_id} is not registered"
