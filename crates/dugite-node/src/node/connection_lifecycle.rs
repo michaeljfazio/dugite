@@ -130,26 +130,24 @@ const BLOCKFETCH_INIT_AVG_BLOCK_BYTES: usize = 65_536;
 ///
 /// **Ingress invariant (#747):** `BLOCKFETCH_PIPELINE_WINDOW *
 /// BLOCKFETCH_RANGE_BYTE_BUDGET` must not exceed
-/// `BLOCKFETCH_INGRESS_LIMIT_BF` (the mux-layer per-protocol ingress
-/// buffer limit in `peer_connection.rs`).  A violation means pipelined
-/// in-flight data can silently overflow the ingress queue, killing the mux
-/// with no error visible at the BlockFetch protocol level.
-/// Window 2 × 8 MB = 16 MB < 32 MB ingress limit — invariant holds.
+/// `peer_connection::BLOCKFETCH_INGRESS_LIMIT` (the mux-layer per-protocol
+/// ingress buffer limit).  A violation means pipelined in-flight data can
+/// silently overflow the ingress queue, killing the mux with no error
+/// visible at the BlockFetch protocol level.
+/// Window 2 × 8 MB = 16 MB ≤ 48 MB ingress limit — invariant holds with
+/// ~3× headroom for estimate slack.
 const BLOCKFETCH_PIPELINE_WINDOW: usize = 2;
 
-/// Mirror of `peer_connection::BLOCKFETCH_INGRESS_LIMIT`.  Must match; the
-/// compile-time assert below guards against drift.  When you bump the mux
-/// ingress limit in `peer_connection.rs`, update this constant too.
-const BLOCKFETCH_INGRESS_LIMIT_BF: usize = 32 * 1024 * 1024;
-
-// Issue #747: compile-time invariant.
+// Issue #747: compile-time invariant, referencing the REAL mux constant
+// directly (no hand-mirrored copy that could drift).
 // The total pipelined in-flight bytes (PIPELINE_WINDOW × RANGE_BYTE_BUDGET)
 // must not exceed the mux ingress queue limit, or in-flight data silently
 // overflows the buffer and kills the mux connection without a protocol-level
 // error.
 const _: () = assert!(
-    BLOCKFETCH_PIPELINE_WINDOW * BLOCKFETCH_RANGE_BYTE_BUDGET <= BLOCKFETCH_INGRESS_LIMIT_BF,
-    "pipelined in-flight budget exceeds mux ingress limit: reduce BLOCKFETCH_PIPELINE_WINDOW or increase BLOCKFETCH_INGRESS_LIMIT_BF"
+    BLOCKFETCH_PIPELINE_WINDOW * BLOCKFETCH_RANGE_BYTE_BUDGET
+        <= super::peer_connection::BLOCKFETCH_INGRESS_LIMIT,
+    "pipelined in-flight budget exceeds mux ingress limit: reduce BLOCKFETCH_PIPELINE_WINDOW or increase peer_connection::BLOCKFETCH_INGRESS_LIMIT"
 );
 
 use tokio::sync::{broadcast, mpsc, RwLock};
@@ -2073,6 +2071,15 @@ impl ConnectionLifecycleManager {
                 // Used below for grace-period starvation dynamo rotation.
                 let mut claim_start_ms: Option<u64> = None;
 
+                // #742 watchdog: first instant of a CONTINUOUS streak of
+                // unproductive claim ticks (slot claimed but nothing
+                // dispatchable — empty runs, or the #735 far-ahead decline).
+                // Cleared whenever a range is actually dispatched. Drives the
+                // conservative 3×grace dynamo rotation for wedge classes the
+                // Haskell starvation path cannot reach (it requires a current
+                // fetch peer with an outstanding request).
+                let mut unproductive_since_ms: Option<u64> = None;
+
                 info!(%addr, "blockfetch worker started (waiting for turn)");
 
                 // Per-peer worker poll cadence.
@@ -2241,11 +2248,68 @@ impl ConnectionLifecycleManager {
                                     runs
                                 } else {
                                     active_fetcher.store(0, std::sync::atomic::Ordering::SeqCst);
+                                    // Voluntary release: the claim epoch must
+                                    // not bleed into a later re-claim (the
+                                    // grace clock measures slot TENURE, not
+                                    // idle time).
+                                    claim_start_ms = None;
                                     continue;
                                 }
                             };
 
                             if fetch_runs.is_empty() {
+                                // #742 watchdog (unproductive claim): the slot
+                                // was claimed but there is NOTHING dispatchable
+                                // from this peer. Haskell's rotation cannot
+                                // fire here (no current fetch peer without a
+                                // fetch request — it relies on the LoP to kill
+                                // silent peers), but dugite pauses the LoP
+                                // while a peer parks on the forecast horizon,
+                                // so a dynamo that never feeds headers would
+                                // starve ChainSel forever. Rotate after a
+                                // conservative 3× grace of continuous
+                                // unproductive claims WITH ChainSel starved
+                                // (issue #742's watchdog ask; no-op unless
+                                // this peer is the dynamo).
+                                let now_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0);
+                                if unproductive_since_ms.is_none() {
+                                    unproductive_since_ms = Some(now_ms);
+                                }
+                                if let (Some(ref cs), Some(since)) = (&csj, unproductive_since_ms)
+                                {
+                                    let is_genesis_bulk_sync = gsm_snapshot_rx_for_starv
+                                        .borrow()
+                                        .state
+                                        != crate::gsm::GenesisSyncState::CaughtUp;
+                                    let starv = chainsel_starvation_ms
+                                        .load(std::sync::atomic::Ordering::Relaxed);
+                                    let last_starvation_ms =
+                                        if starv == 0 { now_ms } else { starv };
+                                    let watchdog_ms =
+                                        3 * block_fetch_grace_period.as_millis() as u64;
+                                    if is_genesis_bulk_sync
+                                        && now_ms.saturating_sub(since) >= watchdog_ms
+                                        && last_starvation_ms >= since.saturating_add(watchdog_ms)
+                                    {
+                                        if cs.rotate_dynamo(&addr) {
+                                            info!(
+                                                %addr,
+                                                unproductive_secs =
+                                                    now_ms.saturating_sub(since) / 1000,
+                                                "BlockFetch: dynamo unproductive past watchdog \
+                                                 with ChainSel starved — rotating (#742)"
+                                            );
+                                        }
+                                        unproductive_since_ms = None;
+                                    }
+                                }
+                                // Voluntary release happened above (store(0));
+                                // reset the claim epoch so tenure is measured
+                                // per continuous hold.
+                                claim_start_ms = None;
                                 continue;
                             }
 
@@ -2329,12 +2393,60 @@ impl ConnectionLifecycleManager {
                                              first block does not extend a stored block \
                                              (gross-request invariant, #735)"
                                         );
+                                        // #742 watchdog: a perpetual decline is the
+                                        // exact #735 far-ahead wedge — same treatment
+                                        // as the empty-runs case above: rotate the
+                                        // dynamo after 3× grace of continuous
+                                        // unproductive claims with ChainSel starved.
+                                        let now_ms = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .map(|d| d.as_millis() as u64)
+                                            .unwrap_or(0);
+                                        if unproductive_since_ms.is_none() {
+                                            unproductive_since_ms = Some(now_ms);
+                                        }
+                                        if let (Some(ref cs), Some(since)) =
+                                            (&csj, unproductive_since_ms)
+                                        {
+                                            let is_genesis_bulk_sync =
+                                                gsm_snapshot_rx_for_starv.borrow().state
+                                                    != crate::gsm::GenesisSyncState::CaughtUp;
+                                            let starv = chainsel_starvation_ms
+                                                .load(std::sync::atomic::Ordering::Relaxed);
+                                            let last_starvation_ms =
+                                                if starv == 0 { now_ms } else { starv };
+                                            let watchdog_ms = 3 * block_fetch_grace_period
+                                                .as_millis()
+                                                as u64;
+                                            if is_genesis_bulk_sync
+                                                && now_ms.saturating_sub(since) >= watchdog_ms
+                                                && last_starvation_ms
+                                                    >= since.saturating_add(watchdog_ms)
+                                            {
+                                                if cs.rotate_dynamo(&addr) {
+                                                    info!(
+                                                        %addr,
+                                                        unproductive_secs =
+                                                            now_ms.saturating_sub(since) / 1000,
+                                                        "BlockFetch: dynamo declined far-ahead \
+                                                         ranges past watchdog with ChainSel \
+                                                         starved — rotating (#742/#735)"
+                                                    );
+                                                }
+                                                unproductive_since_ms = None;
+                                            }
+                                        }
                                         active_fetcher
                                             .store(0, std::sync::atomic::Ordering::SeqCst);
+                                        claim_start_ms = None;
                                         continue;
                                     }
                                 }
                             }
+
+                            // A range IS being dispatched this tick — the
+                            // unproductive-claim watchdog resets.
+                            unproductive_since_ms = None;
 
                             // Issue #742 Fix 2: ChainSel-starvation dynamo rotation.
                             //
@@ -2417,12 +2529,27 @@ impl ConnectionLifecycleManager {
                             // header-declared body sizes (Haskell
                             // `blockFetchSize` analogue); Byron headers fall
                             // back to the adaptive average.
-                            let ranges: Vec<(CodecPoint, CodecPoint)> = fetch_runs
+                            // Each entry: (from, to, estimated_wire_bytes) — the
+                            // estimate travels with the range so the recv path
+                            // can compare it against ACTUAL delivered bytes
+                            // (#747 instrumentation: residual ingress overruns
+                            // mean actual > estimate somewhere; the WARN below
+                            // names the offending range).
+                            let ranges: Vec<(CodecPoint, CodecPoint, usize)> = fetch_runs
                                 .iter()
                                 .flat_map(|run| {
                                     build_fetch_ranges(run, avg_block_bytes, max_range)
                                         .into_iter()
                                         .map(move |(start, end)| {
+                                            let est: usize = run[start..=end]
+                                                .iter()
+                                                .map(|h| {
+                                                    estimated_block_wire_bytes(
+                                                        h,
+                                                        avg_block_bytes,
+                                                    )
+                                                })
+                                                .sum();
                                             (
                                                 CodecPoint::Specific(
                                                     run[start].slot,
@@ -2432,6 +2559,7 @@ impl ConnectionLifecycleManager {
                                                     run[end].slot,
                                                     run[end].hash,
                                                 ),
+                                                est,
                                             )
                                         })
                                 })
@@ -2457,7 +2585,7 @@ impl ConnectionLifecycleManager {
                             let mut next_req = 0usize;
                             let mut prime_failed = false;
                             while next_req < pipeline_window {
-                                let (from, to) = ranges[next_req].clone();
+                                let (from, to, _est) = ranges[next_req].clone();
                                 let send_req = BlockFetchClient::send_range_request(&mut channel, from, to);
                                 let result = tokio::select! {
                                     biased;
@@ -2611,6 +2739,24 @@ impl ConnectionLifecycleManager {
                                         if let Some(avg) = range_bytes.checked_div(count) {
                                             avg_block_bytes = avg.max(1);
                                         }
+                                        // #747 instrumentation: residual ingress
+                                        // overruns imply ACTUAL range bytes exceed
+                                        // the header-declared estimate somewhere.
+                                        // Surface any range whose delivery blows
+                                        // 1.5x the estimate (+256 KiB slack) so the
+                                        // offending slots/peer are identifiable.
+                                        let est = ranges[range_idx].2;
+                                        if range_bytes > est + est / 2 + 262_144 {
+                                            warn!(
+                                                %addr,
+                                                range_idx,
+                                                count,
+                                                actual_bytes = range_bytes,
+                                                estimated_bytes = est,
+                                                "BlockFetch: range delivered far more bytes \
+                                                 than the header-declared estimate (#747)"
+                                            );
+                                        }
                                         debug!(%addr, count, fetch_ms, avg_block_bytes, "BlockFetch: range complete");
                                     }
                                     Ok(Err(e)) => {
@@ -2665,7 +2811,7 @@ impl ConnectionLifecycleManager {
                                 // apply loop below. Keeps `pipeline_window` requests
                                 // outstanding at all times (until the tail).
                                 if next_req < ranges.len() {
-                                    let (from, to) = ranges[next_req].clone();
+                                    let (from, to, _est) = ranges[next_req].clone();
                                     let refill_req = BlockFetchClient::send_range_request(&mut channel, from, to);
                                     let refill_result = tokio::select! {
                                         biased;
@@ -5868,13 +6014,14 @@ mod fix3_blockfetch_ingress_tests {
         );
     }
 
-    /// The ingress-limit mirror constant must match the peer_connection.rs value.
+    /// The mux ingress limit must keep ~3x headroom over the in-flight budget
+    /// (estimate slack was observed live at up to ~2x, #747).
     #[test]
-    fn ingress_limit_bf_is_32mb() {
+    fn ingress_limit_is_48mb() {
         assert_eq!(
-            BLOCKFETCH_INGRESS_LIMIT_BF,
-            32 * 1024 * 1024,
-            "BLOCKFETCH_INGRESS_LIMIT_BF must be 32 MB after #747 fix"
+            super::super::peer_connection::BLOCKFETCH_INGRESS_LIMIT,
+            48 * 1024 * 1024,
+            "BLOCKFETCH_INGRESS_LIMIT must be 48 MB (#747)"
         );
     }
 
@@ -5885,10 +6032,10 @@ mod fix3_blockfetch_ingress_tests {
     fn pipeline_invariant_holds() {
         let in_flight = BLOCKFETCH_PIPELINE_WINDOW * BLOCKFETCH_RANGE_BYTE_BUDGET;
         assert!(
-            in_flight <= BLOCKFETCH_INGRESS_LIMIT_BF,
-            "pipelined in-flight bytes ({in_flight}) must not exceed ingress limit \
-             ({BLOCKFETCH_INGRESS_LIMIT_BF}): reduce BLOCKFETCH_PIPELINE_WINDOW or \
-             increase BLOCKFETCH_INGRESS_LIMIT_BF"
+            in_flight <= super::super::peer_connection::BLOCKFETCH_INGRESS_LIMIT,
+            "pipelined in-flight bytes ({in_flight}) must not exceed the mux ingress \
+             limit: reduce BLOCKFETCH_PIPELINE_WINDOW or increase \
+             peer_connection::BLOCKFETCH_INGRESS_LIMIT"
         );
     }
 
