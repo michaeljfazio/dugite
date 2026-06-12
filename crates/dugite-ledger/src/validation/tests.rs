@@ -1854,7 +1854,12 @@ mod tests {
         use dugite_primitives::address::EnterpriseAddress;
         use dugite_primitives::credentials::Credential;
 
-        let script_hash = Hash28::from_bytes([0xaa; 28]);
+        // The Plutus V2 script body used below is `vec![0x01]`.
+        // Its hash is blake2b_224_tagged(2, b"\x01") so the UTxO payment
+        // credential must use exactly this hash — otherwise `plutus_script_version_map`
+        // returns version=0 (native) and no MissingSpendRedeemer is emitted.
+        let plutus_script_bytes: Vec<u8> = vec![0x01];
+        let script_hash = dugite_primitives::hash::blake2b_224_tagged(2, &plutus_script_bytes);
         let input = TransactionInput {
             transaction_id: Hash32::from_bytes([3u8; 32]),
             index: 0,
@@ -4203,7 +4208,9 @@ mod tests {
     fn test_script_withdrawal_missing_reward_redeemer() {
         use super::super::collateral::check_script_redeemers;
 
-        let script_hash = Hash28::from_bytes([0xCC; 28]);
+        // Derive hash from actual Plutus V2 script so script_versions contains it.
+        let plutus_script = vec![0xABu8];
+        let script_hash = dugite_primitives::hash::blake2b_224_tagged(2, &plutus_script);
 
         // Reward address: header 0xF0 = script stake credential (no network bit),
         // followed by the 28-byte script hash.
@@ -4277,7 +4284,7 @@ mod tests {
                 native_scripts: vec![],
                 bootstrap_witnesses: vec![],
                 plutus_v1_scripts: vec![],
-                plutus_v2_scripts: vec![vec![0xAB]],
+                plutus_v2_scripts: vec![plutus_script],
                 plutus_v3_scripts: vec![],
                 plutus_data: vec![],
                 // No Reward redeemer — this is the bug we are testing.
@@ -4294,7 +4301,12 @@ mod tests {
         };
 
         let mut errors: Vec<ValidationError> = Vec::new();
-        check_script_redeemers(&tx, &utxo_set, &mut errors);
+        check_script_redeemers(
+            &tx,
+            &utxo_set,
+            &super::super::collateral::plutus_script_version_map(&tx, &utxo_set),
+            &mut errors,
+        );
 
         assert!(
             errors
@@ -4405,7 +4417,12 @@ mod tests {
         };
 
         let mut errors: Vec<ValidationError> = Vec::new();
-        check_script_redeemers(&tx, &utxo_set, &mut errors);
+        check_script_redeemers(
+            &tx,
+            &utxo_set,
+            &super::super::collateral::plutus_script_version_map(&tx, &utxo_set),
+            &mut errors,
+        );
 
         assert!(
             !errors.iter().any(
@@ -4515,7 +4532,12 @@ mod tests {
         };
 
         let mut errors: Vec<ValidationError> = Vec::new();
-        check_script_redeemers(&tx, &utxo_set, &mut errors);
+        check_script_redeemers(
+            &tx,
+            &utxo_set,
+            &super::super::collateral::plutus_script_version_map(&tx, &utxo_set),
+            &mut errors,
+        );
 
         assert!(
             errors.iter().any(
@@ -4627,7 +4649,12 @@ mod tests {
         };
 
         let mut errors: Vec<ValidationError> = Vec::new();
-        check_script_redeemers(&tx, &utxo_set, &mut errors);
+        check_script_redeemers(
+            &tx,
+            &utxo_set,
+            &super::super::collateral::plutus_script_version_map(&tx, &utxo_set),
+            &mut errors,
+        );
 
         assert!(
             !errors.iter().any(
@@ -4755,7 +4782,12 @@ mod tests {
         };
 
         let mut errors: Vec<ValidationError> = Vec::new();
-        check_script_redeemers(&tx, &utxo_set, &mut errors);
+        check_script_redeemers(
+            &tx,
+            &utxo_set,
+            &super::super::collateral::plutus_script_version_map(&tx, &utxo_set),
+            &mut errors,
+        );
 
         // The second policy (index 1) is missing a Mint redeemer.
         assert!(
@@ -4914,7 +4946,12 @@ mod tests {
         };
 
         let mut errors: Vec<ValidationError> = Vec::new();
-        check_script_redeemers(&tx, &utxo_set, &mut errors);
+        check_script_redeemers(
+            &tx,
+            &utxo_set,
+            &super::super::collateral::plutus_script_version_map(&tx, &utxo_set),
+            &mut errors,
+        );
 
         let redeemer_errors: Vec<_> = errors
             .iter()
@@ -5284,7 +5321,12 @@ mod tests {
         };
 
         let mut errors: Vec<ValidationError> = Vec::new();
-        check_script_redeemers(&tx, &utxo_set, &mut errors);
+        check_script_redeemers(
+            &tx,
+            &utxo_set,
+            &super::super::collateral::plutus_script_version_map(&tx, &utxo_set),
+            &mut errors,
+        );
 
         // The spending input is locked by a Plutus script whose body is provided
         // via a reference input.  A Spend redeemer is still required — the check
@@ -5422,7 +5464,12 @@ mod tests {
         };
 
         let mut errors: Vec<ValidationError> = Vec::new();
-        check_script_redeemers(&tx, &utxo_set, &mut errors);
+        check_script_redeemers(
+            &tx,
+            &utxo_set,
+            &super::super::collateral::plutus_script_version_map(&tx, &utxo_set),
+            &mut errors,
+        );
 
         let spend_errors: Vec<_> = errors
             .iter()
@@ -5458,7 +5505,9 @@ mod tests {
         use dugite_primitives::transaction::Certificate;
         use dugite_primitives::value::Lovelace;
 
-        let script_hash = Hash28::from_bytes([0xD0; 28]);
+        // Derive hash from actual Plutus V2 script so script_versions contains it.
+        let plutus_script = vec![0xAAu8];
+        let script_hash = dugite_primitives::hash::blake2b_224_tagged(2, &plutus_script);
 
         let mut utxo_set = UtxoSet::new();
         let input = TransactionInput {
@@ -5527,7 +5576,7 @@ mod tests {
                 native_scripts: vec![],
                 bootstrap_witnesses: vec![],
                 plutus_v1_scripts: vec![],
-                plutus_v2_scripts: vec![vec![0xAA]],
+                plutus_v2_scripts: vec![plutus_script],
                 plutus_v3_scripts: vec![],
                 plutus_data: vec![],
                 // No Cert redeemer — this is what we are testing.
@@ -5544,7 +5593,12 @@ mod tests {
         };
 
         let mut errors: Vec<ValidationError> = Vec::new();
-        check_script_redeemers(&tx, &utxo_set, &mut errors);
+        check_script_redeemers(
+            &tx,
+            &utxo_set,
+            &super::super::collateral::plutus_script_version_map(&tx, &utxo_set),
+            &mut errors,
+        );
 
         assert!(
             errors
@@ -5656,7 +5710,12 @@ mod tests {
         };
 
         let mut errors: Vec<ValidationError> = Vec::new();
-        check_script_redeemers(&tx, &utxo_set, &mut errors);
+        check_script_redeemers(
+            &tx,
+            &utxo_set,
+            &super::super::collateral::plutus_script_version_map(&tx, &utxo_set),
+            &mut errors,
+        );
 
         assert!(
             !errors.iter().any(
@@ -5675,7 +5734,9 @@ mod tests {
         use dugite_primitives::credentials::Credential;
         use dugite_primitives::transaction::Certificate;
 
-        let script_hash = Hash28::from_bytes([0xD2; 28]);
+        // Derive hash from actual Plutus V2 script so script_versions contains it.
+        let plutus_script = vec![0xBBu8];
+        let script_hash = dugite_primitives::hash::blake2b_224_tagged(2, &plutus_script);
 
         let mut utxo_set = UtxoSet::new();
         let input = TransactionInput {
@@ -5742,7 +5803,7 @@ mod tests {
                 native_scripts: vec![],
                 bootstrap_witnesses: vec![],
                 plutus_v1_scripts: vec![],
-                plutus_v2_scripts: vec![vec![0xBB]],
+                plutus_v2_scripts: vec![plutus_script],
                 plutus_v3_scripts: vec![],
                 plutus_data: vec![],
                 redeemers: vec![],
@@ -5758,7 +5819,12 @@ mod tests {
         };
 
         let mut errors: Vec<ValidationError> = Vec::new();
-        check_script_redeemers(&tx, &utxo_set, &mut errors);
+        check_script_redeemers(
+            &tx,
+            &utxo_set,
+            &super::super::collateral::plutus_script_version_map(&tx, &utxo_set),
+            &mut errors,
+        );
 
         assert!(
             errors
@@ -5861,7 +5927,12 @@ mod tests {
         };
 
         let mut errors: Vec<ValidationError> = Vec::new();
-        check_script_redeemers(&tx, &utxo_set, &mut errors);
+        check_script_redeemers(
+            &tx,
+            &utxo_set,
+            &super::super::collateral::plutus_script_version_map(&tx, &utxo_set),
+            &mut errors,
+        );
 
         assert!(
             !errors.iter().any(
@@ -5964,7 +6035,12 @@ mod tests {
         };
 
         let mut errors: Vec<ValidationError> = Vec::new();
-        check_script_redeemers(&tx, &utxo_set, &mut errors);
+        check_script_redeemers(
+            &tx,
+            &utxo_set,
+            &super::super::collateral::plutus_script_version_map(&tx, &utxo_set),
+            &mut errors,
+        );
 
         assert!(
             !errors.iter().any(
@@ -5988,8 +6064,11 @@ mod tests {
         use dugite_primitives::transaction::Certificate;
         use dugite_primitives::value::Lovelace;
 
-        let hash_a = Hash28::from_bytes([0xD5; 28]);
-        let hash_b = Hash28::from_bytes([0xD6; 28]);
+        // Derive hashes from actual Plutus scripts so script_versions contains both.
+        let script_a = vec![0xDDu8];
+        let script_b = vec![0xDEu8];
+        let hash_a = dugite_primitives::hash::blake2b_224_tagged(2, &script_a);
+        let hash_b = dugite_primitives::hash::blake2b_224_tagged(2, &script_b);
         let pool_hash = Hash28::from_bytes([0xD7; 28]);
 
         let mut utxo_set = UtxoSet::new();
@@ -6068,7 +6147,7 @@ mod tests {
                 native_scripts: vec![],
                 bootstrap_witnesses: vec![],
                 plutus_v1_scripts: vec![],
-                plutus_v2_scripts: vec![vec![0xDD]],
+                plutus_v2_scripts: vec![script_a, script_b],
                 plutus_v3_scripts: vec![],
                 plutus_data: vec![],
                 // Only cert index 1 has a redeemer.  Index 2 is missing.
@@ -6093,7 +6172,12 @@ mod tests {
         };
 
         let mut errors: Vec<ValidationError> = Vec::new();
-        check_script_redeemers(&tx, &utxo_set, &mut errors);
+        check_script_redeemers(
+            &tx,
+            &utxo_set,
+            &super::super::collateral::plutus_script_version_map(&tx, &utxo_set),
+            &mut errors,
+        );
 
         // Index 2 (StakeDelegation with Script) must fire.
         assert!(
@@ -6130,7 +6214,9 @@ mod tests {
         use dugite_primitives::transaction::Certificate;
         use dugite_primitives::value::Lovelace;
 
-        let drep_script_hash = Hash28::from_bytes([0xD8; 28]);
+        // Derive hash from actual Plutus V2 script so script_versions contains it.
+        let plutus_script = vec![0xEEu8];
+        let drep_script_hash = dugite_primitives::hash::blake2b_224_tagged(2, &plutus_script);
 
         let mut utxo_set = UtxoSet::new();
         let input = TransactionInput {
@@ -6202,7 +6288,7 @@ mod tests {
                 native_scripts: vec![],
                 bootstrap_witnesses: vec![],
                 plutus_v1_scripts: vec![],
-                plutus_v2_scripts: vec![vec![0xEE]],
+                plutus_v2_scripts: vec![plutus_script.clone()],
                 plutus_v3_scripts: vec![],
                 plutus_data: vec![],
                 redeemers: vec![],
@@ -6218,7 +6304,12 @@ mod tests {
         };
 
         let mut reg_errors: Vec<ValidationError> = Vec::new();
-        check_script_redeemers(&tx_reg, &utxo_set, &mut reg_errors);
+        check_script_redeemers(
+            &tx_reg,
+            &utxo_set,
+            &super::super::collateral::plutus_script_version_map(&tx_reg, &utxo_set),
+            &mut reg_errors,
+        );
 
         assert!(
             !reg_errors.iter().any(
@@ -6277,7 +6368,7 @@ mod tests {
                 native_scripts: vec![],
                 bootstrap_witnesses: vec![],
                 plutus_v1_scripts: vec![],
-                plutus_v2_scripts: vec![vec![0xEE]],
+                plutus_v2_scripts: vec![plutus_script],
                 plutus_v3_scripts: vec![],
                 plutus_data: vec![],
                 // No Cert redeemer — must trigger MissingRedeemer.
@@ -6294,7 +6385,12 @@ mod tests {
         };
 
         let mut unreg_errors: Vec<ValidationError> = Vec::new();
-        check_script_redeemers(&tx_unreg, &utxo_set, &mut unreg_errors);
+        check_script_redeemers(
+            &tx_unreg,
+            &utxo_set,
+            &super::super::collateral::plutus_script_version_map(&tx_unreg, &utxo_set),
+            &mut unreg_errors,
+        );
 
         assert!(
             unreg_errors
@@ -6312,7 +6408,9 @@ mod tests {
         use dugite_primitives::credentials::Credential;
         use dugite_primitives::transaction::Certificate;
 
-        let cold_script_hash = Hash28::from_bytes([0xD9; 28]);
+        // Derive hash from actual Plutus V2 script so script_versions contains it.
+        let plutus_script = vec![0xFFu8];
+        let cold_script_hash = dugite_primitives::hash::blake2b_224_tagged(2, &plutus_script);
 
         let mut utxo_set = UtxoSet::new();
         let input = TransactionInput {
@@ -6380,7 +6478,7 @@ mod tests {
                 native_scripts: vec![],
                 bootstrap_witnesses: vec![],
                 plutus_v1_scripts: vec![],
-                plutus_v2_scripts: vec![vec![0xFF]],
+                plutus_v2_scripts: vec![plutus_script],
                 plutus_v3_scripts: vec![],
                 plutus_data: vec![],
                 redeemers: vec![],
@@ -6396,7 +6494,12 @@ mod tests {
         };
 
         let mut errors: Vec<ValidationError> = Vec::new();
-        check_script_redeemers(&tx, &utxo_set, &mut errors);
+        check_script_redeemers(
+            &tx,
+            &utxo_set,
+            &super::super::collateral::plutus_script_version_map(&tx, &utxo_set),
+            &mut errors,
+        );
 
         assert!(
             errors
@@ -6418,7 +6521,9 @@ mod tests {
         use dugite_primitives::credentials::Credential;
         use dugite_primitives::transaction::{GovActionId, Vote, Voter, VotingProcedure};
 
-        let script_hash = Hash28::from_bytes([0xE0; 28]);
+        // Derive hash from actual Plutus V2 script so script_versions contains it.
+        let plutus_script = vec![0xE1u8];
+        let script_hash = dugite_primitives::hash::blake2b_224_tagged(2, &plutus_script);
 
         // Build a UTxO with a key-locked input (so Spend redeemer is not needed).
         let mut utxo_set = UtxoSet::new();
@@ -6501,8 +6606,8 @@ mod tests {
                 native_scripts: vec![],
                 bootstrap_witnesses: vec![],
                 plutus_v1_scripts: vec![],
-                // Include a V2 script so has_plutus_scripts() returns true.
-                plutus_v2_scripts: vec![vec![0xE1]],
+                // Include a V2 script — the DRep voter's script credential.
+                plutus_v2_scripts: vec![plutus_script],
                 plutus_v3_scripts: vec![],
                 plutus_data: vec![],
                 // No Vote redeemer — this is what we are testing.
@@ -6519,7 +6624,12 @@ mod tests {
         };
 
         let mut errors: Vec<ValidationError> = Vec::new();
-        check_script_redeemers(&tx, &utxo_set, &mut errors);
+        check_script_redeemers(
+            &tx,
+            &utxo_set,
+            &super::super::collateral::plutus_script_version_map(&tx, &utxo_set),
+            &mut errors,
+        );
 
         assert!(
             errors
@@ -6643,7 +6753,12 @@ mod tests {
         };
 
         let mut errors: Vec<ValidationError> = Vec::new();
-        check_script_redeemers(&tx, &utxo_set, &mut errors);
+        check_script_redeemers(
+            &tx,
+            &utxo_set,
+            &super::super::collateral::plutus_script_version_map(&tx, &utxo_set),
+            &mut errors,
+        );
 
         assert!(
             !errors.iter().any(
@@ -6661,7 +6776,9 @@ mod tests {
         use dugite_primitives::credentials::Credential;
         use dugite_primitives::transaction::{GovActionId, Vote, Voter, VotingProcedure};
 
-        let script_hash = Hash28::from_bytes([0xE3; 28]);
+        // Derive hash from actual Plutus V2 script so script_versions contains it.
+        let plutus_script = vec![0xE3u8];
+        let script_hash = dugite_primitives::hash::blake2b_224_tagged(2, &plutus_script);
 
         let mut utxo_set = UtxoSet::new();
         let input = TransactionInput {
@@ -6743,7 +6860,7 @@ mod tests {
                 native_scripts: vec![],
                 bootstrap_witnesses: vec![],
                 plutus_v1_scripts: vec![],
-                plutus_v2_scripts: vec![vec![0xE3]],
+                plutus_v2_scripts: vec![plutus_script],
                 plutus_v3_scripts: vec![],
                 plutus_data: vec![],
                 // Redeemer at index 1, but the script voter is at position 0.
@@ -6768,7 +6885,12 @@ mod tests {
         };
 
         let mut errors: Vec<ValidationError> = Vec::new();
-        check_script_redeemers(&tx, &utxo_set, &mut errors);
+        check_script_redeemers(
+            &tx,
+            &utxo_set,
+            &super::super::collateral::plutus_script_version_map(&tx, &utxo_set),
+            &mut errors,
+        );
 
         // The script voter at index 0 has no redeemer — expect MissingRedeemer.
         assert!(
@@ -6890,7 +7012,12 @@ mod tests {
         };
 
         let mut errors: Vec<ValidationError> = Vec::new();
-        check_script_redeemers(&tx, &utxo_set, &mut errors);
+        check_script_redeemers(
+            &tx,
+            &utxo_set,
+            &super::super::collateral::plutus_script_version_map(&tx, &utxo_set),
+            &mut errors,
+        );
 
         assert!(
             !errors.iter().any(
@@ -7004,7 +7131,12 @@ mod tests {
         };
 
         let mut errors: Vec<ValidationError> = Vec::new();
-        check_script_redeemers(&tx, &utxo_set, &mut errors);
+        check_script_redeemers(
+            &tx,
+            &utxo_set,
+            &super::super::collateral::plutus_script_version_map(&tx, &utxo_set),
+            &mut errors,
+        );
 
         assert!(
             !errors.iter().any(
@@ -7122,7 +7254,12 @@ mod tests {
         };
 
         let mut errors: Vec<ValidationError> = Vec::new();
-        check_script_redeemers(&tx, &utxo_set, &mut errors);
+        check_script_redeemers(
+            &tx,
+            &utxo_set,
+            &super::super::collateral::plutus_script_version_map(&tx, &utxo_set),
+            &mut errors,
+        );
 
         assert!(
             errors
@@ -7236,7 +7373,12 @@ mod tests {
         };
 
         let mut errors: Vec<ValidationError> = Vec::new();
-        check_script_redeemers(&tx, &utxo_set, &mut errors);
+        check_script_redeemers(
+            &tx,
+            &utxo_set,
+            &super::super::collateral::plutus_script_version_map(&tx, &utxo_set),
+            &mut errors,
+        );
 
         assert!(
             errors
@@ -7346,7 +7488,12 @@ mod tests {
         };
 
         let mut errors: Vec<ValidationError> = Vec::new();
-        check_script_redeemers(&tx, &utxo_set, &mut errors);
+        check_script_redeemers(
+            &tx,
+            &utxo_set,
+            &super::super::collateral::plutus_script_version_map(&tx, &utxo_set),
+            &mut errors,
+        );
 
         assert!(
             !errors
@@ -7454,7 +7601,12 @@ mod tests {
         };
 
         let mut errors: Vec<ValidationError> = Vec::new();
-        check_script_redeemers(&tx, &utxo_set, &mut errors);
+        check_script_redeemers(
+            &tx,
+            &utxo_set,
+            &super::super::collateral::plutus_script_version_map(&tx, &utxo_set),
+            &mut errors,
+        );
 
         assert!(
             !errors.iter().any(
@@ -7574,13 +7726,509 @@ mod tests {
         };
 
         let mut errors: Vec<ValidationError> = Vec::new();
-        check_script_redeemers(&tx, &utxo_set, &mut errors);
+        check_script_redeemers(
+            &tx,
+            &utxo_set,
+            &super::super::collateral::plutus_script_version_map(&tx, &utxo_set),
+            &mut errors,
+        );
 
         assert!(
             !errors.iter().any(
                 |e| matches!(e, ValidationError::MissingRedeemer { tag, .. } if tag == "Propose")
             ),
             "Propose redeemer present at index 0; must not produce MissingRedeemer: {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #758: Native-script-locked input must NOT require a Spend redeemer
+    //
+    // Haskell's `hasExactSetOfRedeemers` (eras/alonzo/impl/src/Cardano/Ledger/
+    // Alonzo/Rules/Utxow.hs) filters `scriptsNeeded` through `scriptsProvided`
+    // and only retains entries where `Map.lookup sh provided == Just (PlutusScript _)`.
+    // Native-script-locked spending inputs are in `scriptsNeeded` but their hash
+    // resolves to `NativeScript _` in `scriptsProvided`, so they are silently
+    // excluded from the redeemer requirement.
+    //
+    // The fixture tx is mainnet epoch 473 slot 119,065,392
+    // tx 9d4f2989696024c74bf79fab6a0d5d7c5b7ba75e28de969e41dde6cc482777b2:
+    //   - 3 spending inputs; sorted order:
+    //     - index 0: 207f1d2f...#0  locked by Plutus V2 script → Spend redeemer at 0
+    //     - index 1: 207f1d2f...#2  locked by native multisig (5-of-7) → NO redeemer required
+    //     - index 2: d0ada11b...#2  locked by VKey → no redeemer
+    //   - Witness set: 1 native script + Plutus V2 scripts (keys 3/4/6) + 1 Spend redeemer at 0
+    //   - Dugite's old check_script_redeemers emitted MissingSpendRedeemer{index:1} (false positive)
+    // -----------------------------------------------------------------------
+
+    /// A native-script-locked spending input must NOT produce `MissingSpendRedeemer`
+    /// even when the transaction also contains Plutus scripts (triggering the
+    /// collateral/redeemer path).
+    ///
+    /// This is a unit test that mirrors the structural bug without the full tx
+    /// decode path: we build a UTxO set with two script-locked inputs — one
+    /// Plutus V2 and one native (no entry in `plutus_script_version_map`) — and
+    /// confirm that only the Plutus one requires a Spend redeemer.
+    #[test]
+    fn test_native_script_input_no_spend_redeemer_required() {
+        use super::super::collateral::{check_script_redeemers, plutus_script_version_map};
+        use dugite_primitives::address::EnterpriseAddress;
+        use dugite_primitives::credentials::Credential;
+        use dugite_primitives::network::NetworkId;
+
+        // A fake Plutus V2 script in the witness set.
+        let plutus_script_bytes: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let plutus_hash = dugite_primitives::hash::blake2b_224_tagged(2, &plutus_script_bytes);
+
+        // A native script hash (NOT in any Plutus map entry).
+        let native_hash = Hash28::from_bytes([0xAB; 28]);
+
+        let mut utxo_set = UtxoSet::new();
+
+        // Sorted index 0: Plutus V2 locked — earlier TxId
+        let plutus_input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0x10; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            plutus_input.clone(),
+            TransactionOutput {
+                address: Address::Enterprise(EnterpriseAddress {
+                    network: NetworkId::Testnet,
+                    payment: Credential::Script(plutus_hash),
+                }),
+                value: Value::lovelace(5_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: false,
+                raw_cbor: None,
+            },
+        );
+
+        // Sorted index 1: native script locked — later TxId
+        let native_input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0x20; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            native_input.clone(),
+            TransactionOutput {
+                address: Address::Enterprise(EnterpriseAddress {
+                    network: NetworkId::Testnet,
+                    payment: Credential::Script(native_hash),
+                }),
+                value: Value::lovelace(3_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: false,
+                raw_cbor: None,
+            },
+        );
+
+        // Transaction: Spend redeemer at index 0 (for the Plutus input), but
+        // NO Spend redeemer at index 1 (native input does not need one).
+        let tx = Transaction {
+            era: dugite_primitives::era::Era::Babbage,
+            hash: Hash32::ZERO,
+            body: TransactionBody {
+                inputs: vec![native_input, plutus_input], // order doesn't matter — sorted internally
+                outputs: vec![],
+                fee: Lovelace(500_000),
+                ttl: None,
+                certificates: vec![],
+                withdrawals: BTreeMap::new(),
+                auxiliary_data_hash: None,
+                validity_interval_start: None,
+                mint: BTreeMap::new(),
+                script_data_hash: None,
+                collateral: vec![],
+                required_signers: vec![],
+                network_id: None,
+                collateral_return: None,
+                total_collateral: None,
+                reference_inputs: vec![],
+                update: None,
+                voting_procedures: BTreeMap::new(),
+                proposal_procedures: vec![],
+                treasury_value: None,
+                donation: None,
+                sub_transactions: vec![],
+                account_balance_intervals: vec![],
+                direct_deposits: BTreeMap::new(),
+                guards: Vec::new(),
+            },
+            witness_set: TransactionWitnessSet {
+                vkey_witnesses: vec![],
+                native_scripts: vec![NativeScript::ScriptAll(vec![])], // native script witness (placeholder)
+                bootstrap_witnesses: vec![],
+                plutus_v1_scripts: vec![],
+                plutus_v2_scripts: vec![plutus_script_bytes],
+                plutus_v3_scripts: vec![],
+                plutus_data: vec![],
+                redeemers: vec![Redeemer {
+                    tag: RedeemerTag::Spend,
+                    index: 0, // sorted index 0 = Plutus input
+                    data: PlutusData::Integer(num_bigint::BigInt::from(0i64)),
+                    ex_units: ExUnits {
+                        mem: 100,
+                        steps: 100,
+                    },
+                }],
+                raw_redeemers_cbor: None,
+                raw_plutus_data_cbor: None,
+                original_script_data_hash: None,
+            },
+            is_valid: true,
+            auxiliary_data: None,
+            raw_cbor: None,
+            raw_body_cbor: None,
+            raw_witness_cbor: None,
+        };
+
+        let versions = plutus_script_version_map(&tx, &utxo_set);
+        let mut errors: Vec<ValidationError> = Vec::new();
+        check_script_redeemers(&tx, &utxo_set, &versions, &mut errors);
+
+        // Must produce NO MissingSpendRedeemer at index 1 (native script).
+        let missing_at_1 = errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::MissingSpendRedeemer { index: 1 }));
+        assert!(
+            !missing_at_1,
+            "Native-script-locked input at sorted index 1 must NOT require a Spend redeemer, \
+             got: {errors:?}"
+        );
+
+        // Also must produce NO MissingSpendRedeemer at index 0 (Plutus input has
+        // the redeemer at index 0 — redeemer is present, so no error).
+        let missing_at_0 = errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::MissingSpendRedeemer { index: 0 }));
+        assert!(
+            !missing_at_0,
+            "Plutus-script-locked input at sorted index 0 has a Spend redeemer; must not error: \
+             {errors:?}"
+        );
+    }
+
+    /// Negative control: a Plutus-script-locked input WITHOUT a Spend redeemer
+    /// MUST still produce `MissingSpendRedeemer`.  The fix must not over-narrow.
+    #[test]
+    fn test_plutus_script_input_missing_spend_redeemer_still_errors() {
+        use super::super::collateral::{check_script_redeemers, plutus_script_version_map};
+        use dugite_primitives::address::EnterpriseAddress;
+        use dugite_primitives::credentials::Credential;
+        use dugite_primitives::network::NetworkId;
+
+        let plutus_script_bytes: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let plutus_hash = dugite_primitives::hash::blake2b_224_tagged(2, &plutus_script_bytes);
+
+        let mut utxo_set = UtxoSet::new();
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0x55; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            input.clone(),
+            TransactionOutput {
+                address: Address::Enterprise(EnterpriseAddress {
+                    network: NetworkId::Testnet,
+                    payment: Credential::Script(plutus_hash),
+                }),
+                value: Value::lovelace(5_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: false,
+                raw_cbor: None,
+            },
+        );
+
+        // Transaction with a Plutus V2 script but NO Spend redeemer.
+        let tx = Transaction {
+            era: dugite_primitives::era::Era::Babbage,
+            hash: Hash32::ZERO,
+            body: TransactionBody {
+                inputs: vec![input],
+                outputs: vec![],
+                fee: Lovelace(500_000),
+                ttl: None,
+                certificates: vec![],
+                withdrawals: BTreeMap::new(),
+                auxiliary_data_hash: None,
+                validity_interval_start: None,
+                mint: BTreeMap::new(),
+                script_data_hash: None,
+                collateral: vec![],
+                required_signers: vec![],
+                network_id: None,
+                collateral_return: None,
+                total_collateral: None,
+                reference_inputs: vec![],
+                update: None,
+                voting_procedures: BTreeMap::new(),
+                proposal_procedures: vec![],
+                treasury_value: None,
+                donation: None,
+                sub_transactions: vec![],
+                account_balance_intervals: vec![],
+                direct_deposits: BTreeMap::new(),
+                guards: Vec::new(),
+            },
+            witness_set: TransactionWitnessSet {
+                vkey_witnesses: vec![],
+                native_scripts: vec![],
+                bootstrap_witnesses: vec![],
+                plutus_v1_scripts: vec![],
+                plutus_v2_scripts: vec![plutus_script_bytes], // Plutus V2 script present
+                plutus_v3_scripts: vec![],
+                plutus_data: vec![],
+                redeemers: vec![], // NO Spend redeemer — this is the bug scenario
+                raw_redeemers_cbor: None,
+                raw_plutus_data_cbor: None,
+                original_script_data_hash: None,
+            },
+            is_valid: true,
+            auxiliary_data: None,
+            raw_cbor: None,
+            raw_body_cbor: None,
+            raw_witness_cbor: None,
+        };
+
+        let versions = plutus_script_version_map(&tx, &utxo_set);
+        let mut errors: Vec<ValidationError> = Vec::new();
+        check_script_redeemers(&tx, &utxo_set, &versions, &mut errors);
+
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::MissingSpendRedeemer { index: 0 })),
+            "Plutus-script-locked input without a Spend redeemer must produce \
+             MissingSpendRedeemer{{index:0}}, got: {errors:?}"
+        );
+    }
+
+    /// Regression test for issue #758: mainnet epoch 473 slot 119,065,392
+    /// tx 9d4f2989696024c74bf79fab6a0d5d7c5b7ba75e28de969e41dde6cc482777b2.
+    ///
+    /// This transaction has three spending inputs where sorted index 1 is locked
+    /// by a native multisig script (5-of-7).  The transaction has only one Spend
+    /// redeemer at index 0 (for the Plutus V2 input).  Dugite's old
+    /// `check_script_redeemers` incorrectly required a Spend redeemer for index 1
+    /// (the native-script-locked input), producing a false-positive
+    /// `MissingSpendRedeemer{index:1}` that caused the confirmed mainnet block to
+    /// fail Phase-1 validation.
+    ///
+    /// This test constructs a UTxO set that mirrors the on-chain state:
+    ///   sorted index 0: 207f1d2f...#0 → Plutus V2 (has Spend redeemer at 0)
+    ///   sorted index 1: 207f1d2f...#2 → native multisig 5-of-7 (no redeemer needed)
+    ///   sorted index 2: d0ada11b...#2 → VKey (never needs redeemer)
+    #[test]
+    fn test_issue_758_native_multisig_no_spend_redeemer_required() {
+        use super::super::collateral::{check_script_redeemers, plutus_script_version_map};
+        use dugite_primitives::address::EnterpriseAddress;
+        use dugite_primitives::credentials::Credential;
+        use dugite_primitives::network::NetworkId;
+
+        // ----------------------------------------------------------------
+        // The native multisig script from the witness set:
+        // allOf([5 of 7 keys]) = CBOR: 830305878200581c...
+        // Hash (blake2b_224 of 0x00 || native_script_cbor):
+        //   = 6d0cff12c3d9ef694fd3b17c324ead678fff388fddd6c37db30c5c4e
+        // This matches the payment credential of addr1w9kselcjc...
+        // (the UTxO at 207f1d2f...#2, confirmed on-chain at epoch 473).
+        // ----------------------------------------------------------------
+        let native_script_hash = Hash28::from_bytes([
+            0x6d, 0x0c, 0xff, 0x12, 0xc3, 0xd9, 0xef, 0x69, 0x4f, 0xd3, 0xb1, 0x7c, 0x32, 0x4e,
+            0xad, 0x67, 0x8f, 0xff, 0x38, 0x8f, 0xdd, 0xd6, 0xc3, 0x7d, 0xb3, 0x0c, 0x5c, 0x4e,
+        ]);
+
+        // The Plutus V2 script hash for the input at sorted index 0 is not
+        // easily derived without the full script bytes, so we use a synthetic
+        // Plutus V2 script whose hash we control.  What matters for this test
+        // is the presence/absence of a Spend redeemer, not the actual script body.
+        let plutus_v2_bytes: Vec<u8> = vec![0xCA, 0xFE, 0xBA, 0xBE];
+        let plutus_v2_hash = dugite_primitives::hash::blake2b_224_tagged(2, &plutus_v2_bytes);
+
+        let mut utxo_set = UtxoSet::new();
+
+        // Sorted index 0: 207f1d2f...#0 — Plutus V2 locked (has Spend redeemer at 0).
+        // TxId bytes: 207f1d2f3fac9e7d0438176fd898e2c30e7010bb2e4b352c080b71b3250f07ff
+        let plutus_txid = Hash32::from_bytes([
+            0x20, 0x7f, 0x1d, 0x2f, 0x3f, 0xac, 0x9e, 0x7d, 0x04, 0x38, 0x17, 0x6f, 0xd8, 0x98,
+            0xe2, 0xc3, 0x0e, 0x70, 0x10, 0xbb, 0x2e, 0x4b, 0x35, 0x2c, 0x08, 0x0b, 0x71, 0xb3,
+            0x25, 0x0f, 0x07, 0xff,
+        ]);
+        let plutus_input = TransactionInput {
+            transaction_id: plutus_txid,
+            index: 0,
+        };
+        utxo_set.insert(
+            plutus_input.clone(),
+            TransactionOutput {
+                address: Address::Enterprise(EnterpriseAddress {
+                    network: NetworkId::Mainnet,
+                    payment: Credential::Script(plutus_v2_hash),
+                }),
+                value: Value::lovelace(1_197_924),
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: false,
+                raw_cbor: None,
+            },
+        );
+
+        // Sorted index 1: 207f1d2f...#2 — native multisig locked (no redeemer).
+        // Same TxId as above, output index 2.
+        let native_input = TransactionInput {
+            transaction_id: plutus_txid,
+            index: 2,
+        };
+        utxo_set.insert(
+            native_input.clone(),
+            TransactionOutput {
+                address: Address::Enterprise(EnterpriseAddress {
+                    network: NetworkId::Mainnet,
+                    payment: Credential::Script(native_script_hash),
+                }),
+                value: Value::lovelace(1_181_068),
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: false,
+                raw_cbor: None,
+            },
+        );
+
+        // Sorted index 2: d0ada11b...#2 — VKey locked (never needs a redeemer).
+        // TxId: d0ada11b0870a2dfe7d5f3d9651548136172cc7001fd165de638581bdc71601c
+        let vkey_input = TransactionInput {
+            transaction_id: Hash32::from_bytes([
+                0xd0, 0xad, 0xa1, 0x1b, 0x08, 0x70, 0xa2, 0xdf, 0xe7, 0xd5, 0xf3, 0xd9, 0x65, 0x15,
+                0x48, 0x13, 0x61, 0x72, 0xcc, 0x70, 0x01, 0xfd, 0x16, 0x5d, 0xe6, 0x38, 0x58, 0x1b,
+                0xdc, 0x71, 0x60, 0x1c,
+            ]),
+            index: 2,
+        };
+        utxo_set.insert(
+            vkey_input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(15_618_531),
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: false,
+                raw_cbor: None,
+            },
+        );
+
+        // Transaction mirroring the on-chain structure:
+        //   - Spend redeemer at index 0 for the Plutus V2 input
+        //   - No Spend redeemer at index 1 (native multisig — correct on-chain)
+        let tx = Transaction {
+            era: dugite_primitives::era::Era::Babbage,
+            hash: Hash32::ZERO,
+            body: TransactionBody {
+                inputs: vec![vkey_input, plutus_input, native_input], // decoded order; sorted internally
+                outputs: vec![],
+                fee: Lovelace(542_713),
+                ttl: None,
+                certificates: vec![],
+                withdrawals: BTreeMap::new(),
+                auxiliary_data_hash: None,
+                validity_interval_start: None,
+                mint: BTreeMap::new(),
+                script_data_hash: None,
+                collateral: vec![],
+                required_signers: vec![],
+                network_id: None,
+                collateral_return: None,
+                total_collateral: None,
+                reference_inputs: vec![],
+                update: None,
+                voting_procedures: BTreeMap::new(),
+                proposal_procedures: vec![],
+                treasury_value: None,
+                donation: None,
+                sub_transactions: vec![],
+                account_balance_intervals: vec![],
+                direct_deposits: BTreeMap::new(),
+                guards: Vec::new(),
+            },
+            witness_set: TransactionWitnessSet {
+                vkey_witnesses: vec![],
+                // The native multisig script is in the witness set (but NOT Plutus)
+                native_scripts: vec![NativeScript::ScriptAll(vec![])], // placeholder — hash not checked here
+                bootstrap_witnesses: vec![],
+                plutus_v1_scripts: vec![],
+                plutus_v2_scripts: vec![plutus_v2_bytes],
+                plutus_v3_scripts: vec![],
+                plutus_data: vec![],
+                redeemers: vec![Redeemer {
+                    tag: RedeemerTag::Spend,
+                    index: 0, // sorted index 0 = Plutus V2 input
+                    data: PlutusData::Integer(num_bigint::BigInt::from(1i64)),
+                    ex_units: ExUnits {
+                        mem: 822_303,
+                        steps: 339_430_417,
+                    },
+                }],
+                raw_redeemers_cbor: None,
+                raw_plutus_data_cbor: None,
+                original_script_data_hash: None,
+            },
+            is_valid: true,
+            auxiliary_data: None,
+            raw_cbor: None,
+            raw_body_cbor: None,
+            raw_witness_cbor: None,
+        };
+
+        let versions = plutus_script_version_map(&tx, &utxo_set);
+
+        // The Plutus V2 hash should appear in versions with value 2.
+        assert_eq!(
+            versions.get(&plutus_v2_hash).copied(),
+            Some(2),
+            "Plutus V2 hash must be present in script_versions"
+        );
+        // The native script hash must NOT appear in versions.
+        assert!(
+            !versions.contains_key(&native_script_hash),
+            "Native script hash must NOT appear in script_versions"
+        );
+
+        let mut errors: Vec<ValidationError> = Vec::new();
+        check_script_redeemers(&tx, &utxo_set, &versions, &mut errors);
+
+        // Primary assertion: no false-positive MissingSpendRedeemer at index 1.
+        let false_positive = errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::MissingSpendRedeemer { index: 1 }));
+        assert!(
+            !false_positive,
+            "Issue #758 regression: native-script-locked input at sorted index 1 must NOT \
+             require a Spend redeemer; got: {errors:?}"
+        );
+
+        // Secondary: the Plutus input at index 0 has its redeemer — no error there.
+        let plutus_missing = errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::MissingSpendRedeemer { index: 0 }));
+        assert!(
+            !plutus_missing,
+            "Plutus-script-locked input at sorted index 0 has Spend redeemer; must not error: \
+             {errors:?}"
+        );
+
+        // Overall: no validation errors expected.
+        let spend_errors: Vec<_> = errors
+            .iter()
+            .filter(|e| matches!(e, ValidationError::MissingSpendRedeemer { .. }))
+            .collect();
+        assert!(
+            spend_errors.is_empty(),
+            "Expected no MissingSpendRedeemer errors for this tx, got: {spend_errors:?}"
         );
     }
 
