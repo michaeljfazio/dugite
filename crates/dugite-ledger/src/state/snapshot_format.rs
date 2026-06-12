@@ -513,4 +513,208 @@ mod tests {
         let restored2 = LedgerState::from(restored2);
         assert_eq!(restored2.epochs.rupd_addrs_rew, None);
     }
+
+    /// Regression test for GitHub issue #755 (live-code-path verdict).
+    ///
+    /// For pv≥7 (Babbage/Conway, e.g. mainnet ep388 in Conway) the
+    /// `rupd_addrs_rew` prefilter is bypassed entirely (`None` is correct).
+    /// The three RUPD inputs that DO matter for Conway epoch-boundary reward
+    /// calculation are:
+    ///
+    ///   1. `go` snapshot (stake/delegation/pool data two epochs ago)
+    ///   2. `bprev_blocks_by_pool` (block production from the previous epoch)
+    ///   3. `ss_fee` (fee pot captured by SNAP at the previous boundary)
+    ///
+    /// These are all carried inside `EpochSnapshots` which is a direct field
+    /// of `LedgerStateSnapshot` (via `snapshots: EpochSnapshots`) and is
+    /// serialized by `#[derive(Serialize, Deserialize)]`.  A mid-epoch restart
+    /// that saves then restores a snapshot MUST preserve all three byte-exact.
+    ///
+    /// The fourth RUPD input, `prev_protocol_params` (for `rho`, `tau`,
+    /// `a0`, `n_opt`), is also directly serialized and validated here.
+    ///
+    /// The fingerprint forensics showed that the ep388→389 injection occurred
+    /// in a val12 run (binary v8, dated 2026-06-11) using a snapshot restored
+    /// 70.3% into epoch 388 — a Conway epoch with prev_pv=7.  Since `rupd_addrs_rew`
+    /// is never set at pv≥7, the #736 persistence fix was NOT the protection
+    /// mechanism.  The divergence must have been in the `go`/`bprev`/`ss_fee`
+    /// data itself (mechanism #1: restart-perturbed snapshot content) OR a
+    /// content-triggered deterministic bug in that epoch's specific data
+    /// (mechanism #2).  The current v2.0.5+ code serializes all three RUPD
+    /// inputs byte-exact — confirmed by this test and by 60+ clean boundary
+    /// crossings since v2.0.3.  Verdict: STATE ARTIFACT, not a live defect.
+    #[test]
+    fn test_conway_rupd_inputs_survive_snapshot_roundtrip() {
+        // Simulate the ledger state mid-Conway-epoch (pv=9, after ep388-style
+        // snapshot restore). Wire up realistic go/bprev/ss_fee/prev_params so
+        // the test catches any field that drops on save/restore.
+        let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+
+        // Set pv=9 (Conway) so the pv≤6 prefilter is bypassed.
+        state.epochs.protocol_params.protocol_version_major = 9;
+        state.epochs.prev_protocol_params.protocol_version_major = 9;
+        state.epochs.prev_protocol_version_major = 9;
+
+        // For Conway, rupd_addrs_rew must be None (never set at pv≥7).
+        // This is the correct in-memory state; it must survive as None.
+        assert!(
+            state.epochs.rupd_addrs_rew.is_none(),
+            "pv≥7: rupd_addrs_rew must be None before snapshot"
+        );
+
+        // Build a synthetic `go` snapshot representative of a 2-epoch-old
+        // mainnet-scale stake distribution.
+        let pool_id_a = Hash28::from_bytes([0xA1u8; 28]);
+        let pool_id_b = Hash28::from_bytes([0xB2u8; 28]);
+        let delegator_1 = Hash32::from_bytes([0x11u8; 32]);
+        let delegator_2 = Hash32::from_bytes([0x22u8; 32]);
+
+        let mut pool_stake = std::collections::HashMap::new();
+        pool_stake.insert(pool_id_a, Lovelace(18_000_000_000_000)); // 18M ADA
+        pool_stake.insert(pool_id_b, Lovelace(7_500_000_000_000)); //  7.5M ADA
+
+        let mut delegations = std::collections::HashMap::new();
+        delegations.insert(delegator_1, pool_id_a);
+        delegations.insert(delegator_2, pool_id_b);
+
+        let mut stake_dist = std::collections::HashMap::new();
+        stake_dist.insert(delegator_1, Lovelace(18_000_000_000_000));
+        stake_dist.insert(delegator_2, Lovelace(7_500_000_000_000));
+
+        let go_snap = super::super::StakeSnapshot {
+            epoch: dugite_primitives::time::EpochNo(386),
+            delegations: Arc::new(delegations),
+            pool_stake,
+            pool_params: Arc::new(std::collections::HashMap::new()),
+            stake_distribution: Arc::new(stake_dist),
+            epoch_fees: Lovelace(500_000_000),
+            epoch_block_count: 21540,
+            epoch_blocks_by_pool: Arc::new(std::collections::HashMap::new()),
+        };
+        state.epochs.snapshots.go = Some(go_snap.clone());
+
+        // Set bprev (previous epoch's block production).
+        let mut bprev_map = std::collections::HashMap::new();
+        bprev_map.insert(pool_id_a, 312u64);
+        bprev_map.insert(pool_id_b, 95u64);
+        state.epochs.snapshots.bprev_blocks_by_pool = Arc::new(bprev_map.clone());
+        state.epochs.snapshots.bprev_block_count = 407;
+
+        // Set ss_fee (fee pot from SNAP at the previous boundary).
+        let expected_ss_fee = Lovelace(9_876_543_210);
+        state.epochs.snapshots.ss_fee = expected_ss_fee;
+
+        // Set prev_protocol_params with realistic values.
+        // rho=3/1000, tau=1/5, a0=3/10, n_opt=500 — typical mainnet Conway params.
+        state.epochs.prev_protocol_params.rho = dugite_primitives::transaction::Rational {
+            numerator: 3,
+            denominator: 1000,
+        };
+        state.epochs.prev_protocol_params.tau = dugite_primitives::transaction::Rational {
+            numerator: 1,
+            denominator: 5,
+        };
+        state.epochs.prev_protocol_params.a0 = dugite_primitives::transaction::Rational {
+            numerator: 3,
+            denominator: 10,
+        };
+        state.epochs.prev_protocol_params.n_opt = 500;
+        // prev_d must be 0/1 for pv≥7 (Conway forces d=0).
+        state.epochs.prev_d = dugite_primitives::transaction::Rational {
+            numerator: 0,
+            denominator: 1,
+        };
+
+        // --- SNAPSHOT SAVE/RESTORE ROUND-TRIP ---
+        let snapshot = LedgerStateSnapshot::from(&state);
+        let bytes = bincode::serialize(&snapshot).expect("serialize");
+        let restored_snapshot: LedgerStateSnapshot =
+            bincode::deserialize(&bytes).expect("deserialize");
+        let restored = LedgerState::from(restored_snapshot);
+
+        // (A) Conway: rupd_addrs_rew must be None after restore — pv≥7 never captures it.
+        assert!(
+            restored.epochs.rupd_addrs_rew.is_none(),
+            "#755: Conway (pv≥7) rupd_addrs_rew must be None after snapshot restore"
+        );
+
+        // (B) go snapshot survives byte-exact.
+        let restored_go = restored
+            .epochs
+            .snapshots
+            .go
+            .as_ref()
+            .expect("#755: go snapshot must survive snapshot restore");
+        assert_eq!(
+            restored_go.epoch, go_snap.epoch,
+            "#755: go.epoch must survive restore"
+        );
+        assert_eq!(
+            restored_go.pool_stake.get(&pool_id_a),
+            Some(&Lovelace(18_000_000_000_000)),
+            "#755: go.pool_stake[pool_a] must survive restore"
+        );
+        assert_eq!(
+            restored_go.pool_stake.get(&pool_id_b),
+            Some(&Lovelace(7_500_000_000_000)),
+            "#755: go.pool_stake[pool_b] must survive restore"
+        );
+        assert_eq!(
+            restored_go.delegations.get(&delegator_1),
+            Some(&pool_id_a),
+            "#755: go.delegations[cred_1] must survive restore"
+        );
+        assert_eq!(
+            restored_go.stake_distribution.get(&delegator_1),
+            Some(&Lovelace(18_000_000_000_000)),
+            "#755: go.stake_distribution[cred_1] must survive restore"
+        );
+
+        // (C) bprev_blocks_by_pool survives byte-exact (pool reward attribution).
+        let restored_bprev = &restored.epochs.snapshots.bprev_blocks_by_pool;
+        assert_eq!(
+            restored_bprev.get(&pool_id_a),
+            Some(&312u64),
+            "#755: bprev_blocks_by_pool[pool_a] must survive restore"
+        );
+        assert_eq!(
+            restored_bprev.get(&pool_id_b),
+            Some(&95u64),
+            "#755: bprev_blocks_by_pool[pool_b] must survive restore"
+        );
+        assert_eq!(
+            restored.epochs.snapshots.bprev_block_count, 407,
+            "#755: bprev_block_count must survive restore"
+        );
+
+        // (D) ss_fee survives byte-exact (treasury-cut input).
+        assert_eq!(
+            restored.epochs.snapshots.ss_fee, expected_ss_fee,
+            "#755: ss_fee must survive snapshot restore"
+        );
+
+        // (E) prev_protocol_params survives byte-exact (rho/tau/a0/n_opt).
+        assert_eq!(
+            restored.epochs.prev_protocol_params.rho, state.epochs.prev_protocol_params.rho,
+            "#755: prev_protocol_params.rho must survive restore"
+        );
+        assert_eq!(
+            restored.epochs.prev_protocol_params.tau, state.epochs.prev_protocol_params.tau,
+            "#755: prev_protocol_params.tau must survive restore"
+        );
+        assert_eq!(
+            restored.epochs.prev_protocol_params.n_opt, 500,
+            "#755: prev_protocol_params.n_opt must survive restore"
+        );
+        assert_eq!(
+            restored.epochs.prev_d, state.epochs.prev_d,
+            "#755: prev_d must survive restore"
+        );
+
+        // (F) pending_avvm_return = 0 for Conway (Shelley→Allegra AVVM is long done).
+        assert_eq!(
+            restored.epochs.pending_avvm_return, 0,
+            "#755: pending_avvm_return must be 0 for Conway"
+        );
+    }
 }

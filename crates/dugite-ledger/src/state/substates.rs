@@ -163,9 +163,11 @@ pub struct EpochSubState {
     /// `compute_reward_update` at the N→N+1 boundary, then cleared. `None` ⇒ not
     /// captured this epoch ⇒ fall back to boundary-time `reward_accounts`
     /// (matches Haskell's `RewardsTooLate` forced-startStep-at-boundary path).
-    /// Transient within an epoch; intentionally NOT serialized in snapshots — a
-    /// mid-epoch snapshot resume falls back to boundary accounts for one epoch.
-    /// pv≥7 never reads it (the prefilter is bypassed).
+    /// Serialized in snapshots (v22+, commit `40db083021`, issue #736) — a
+    /// mid-epoch restart past the 4k/f mark that drops this field falls back to
+    /// LATE boundary-time accounts, mis-routing treasury (observed at mainnet
+    /// 337→338: ~2998 ADA shortfall). pv≥7 never reads it (prefilter bypassed);
+    /// its snapshot value is always None for Conway epochs.
     pub rupd_addrs_rew: Option<Arc<HashSet<Hash32>>>,
 
     /// AVVM coin returned to reserves by `returnRedeemAddrsToReserves` at the
@@ -181,6 +183,7 @@ pub struct EpochSubState {
     /// (mainnet ep236: +318.2M ADA inflated reserves → deltaR1 over by ~954K ADA
     /// → -561K ADA reserves / +184K ADA treasury divergence). Set in
     /// `return_redeem_addrs_to_reserves`, consumed (and reset) by the first
-    /// `compute_reward_update` of the boundary. Transient; NOT serialized.
+    /// `compute_reward_update` of the boundary. Serialized in snapshots (v22+,
+    /// commit `40db083021`, issue #736); zero for all Conway epochs.
     pub pending_avvm_return: u64,
 }
