@@ -72,16 +72,18 @@ const DEFAULT_INGRESS_LIMIT: usize = 4 * 1024 * 1024; // 4 MB (handshake/keepali
 /// Bumped to 512 KB for round-number alignment + small headroom.
 const CHAINSYNC_INGRESS_LIMIT: usize = 512 * 1024;
 
-/// BlockFetch ingress queue limit — matches Haskell
+/// BlockFetch ingress queue limit — Haskell's analogue is
 /// `blockFetchProtocolLimits = max(10 * 2 MiB, 100 * 90112) * 1.1` ≈ 22 MB.
-/// Bumped to 32 MB (#747) to exceed the maximum pipelined in-flight budget
+/// Sized (#747) to exceed the maximum pipelined in-flight budget
 /// (`BLOCKFETCH_PIPELINE_WINDOW × BLOCKFETCH_RANGE_BYTE_BUDGET` in
-/// `connection_lifecycle.rs` = 2 × 8 MB = 16 MB) with headroom.
-/// A compile-time assert in `connection_lifecycle.rs` verifies the invariant.
-///
-/// **MUST** stay in sync with `BLOCKFETCH_INGRESS_LIMIT_BF` in
-/// `connection_lifecycle.rs`; the const-assert there guards against drift.
-const BLOCKFETCH_INGRESS_LIMIT: usize = 32 * 1024 * 1024;
+/// `connection_lifecycle.rs` = 2 × 8 MB = 16 MB) with ~3× headroom: live
+/// mainnet observation (2026-06-11) recorded transient queue peaks of
+/// ~33.5 MB under estimate slack, and instrumentation in
+/// `connection_lifecycle.rs` (actual-vs-estimated range bytes WARN) tracks
+/// the residual gap. A compile-time assert in `connection_lifecycle.rs`
+/// references THIS constant directly (pub(crate)) so the invariant cannot
+/// drift.
+pub(crate) const BLOCKFETCH_INGRESS_LIMIT: usize = 48 * 1024 * 1024;
 
 /// TxSubmission ingress queue limit — matches Haskell
 /// `txSubmissionProtocolLimits = addSafetyMargin (100 * 65540)` ≈ 7.2 MB.

@@ -485,16 +485,19 @@ impl CsjRegistry {
     /// fresh jumper, move it to the back of the order, promote the next
     /// non-disengaged peer. No-op unless the peer is the current dynamo or
     /// it is the only engaged peer.
-    pub fn rotate_dynamo(&self, addr: &SocketAddr) {
+    /// Returns `true` iff the named peer WAS the dynamo and a rotation
+    /// actually happened (used by callers to log accurately; the call is a
+    /// cheap no-op for non-dynamo peers, matching Haskell `rotateDynamo`).
+    pub fn rotate_dynamo(&self, addr: &SocketAddr) -> bool {
         if !self.enabled {
-            return;
+            return false;
         }
         let mut inner = self.inner.lock().expect("csj lock");
         let Some(peer) = inner.peers.get(addr) else {
-            return;
+            return false;
         };
         if !matches!(peer.role, CsjRole::Dynamo { .. }) {
-            return;
+            return false;
         }
         // Move to the back of the election order.
         inner.order.retain(|a| a != addr);
@@ -512,7 +515,7 @@ impl CsjRegistry {
             })
             .copied();
         let Some(_next) = successor else {
-            return; // only engaged peer — keep it as dynamo
+            return false; // only engaged peer — keep it as dynamo
         };
         if let Some(p) = inner.peers.get_mut(addr) {
             p.role = CsjRole::Jumper(JumperRole::Happy {
@@ -523,6 +526,7 @@ impl CsjRegistry {
             p.notify.notify_one();
         }
         Self::backfill_dynamo(&mut inner);
+        true
     }
 
     // ── internal: elections & helpers ───────────────────────────────────
