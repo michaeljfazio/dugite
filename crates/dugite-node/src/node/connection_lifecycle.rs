@@ -2385,7 +2385,7 @@ impl ConnectionLifecycleManager {
                             // eras; this guard is defense-in-depth.
                             if let Some(first) = headers_to_fetch.first() {
                                 if let Ok(hdr) =
-                                    dugite_serialization::decode_wrapped_block_header(
+                                    dugite_serialization::decode_wire_wrapped_block_header(
                                         &first.header_cbor,
                                     )
                                 {

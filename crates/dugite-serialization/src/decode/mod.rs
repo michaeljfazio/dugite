@@ -199,9 +199,18 @@ pub fn decode_wrapped_block_header(
         .bytes()
         .map_err(|e| SerializationError::CborDecode(format!("wrapped header inner bytes: {e}")))?;
 
-    // Dispatch by era tag. Mapping matches `decode_block`:
+    // Dispatch by era tag. Mapping matches `decode_block` (the STORAGE
+    // wrap, where Byron splits into EBB=0 / main=1):
     //   2 Shelley, 3 Allegra, 4 Mary, 5 Alonzo, 6 Babbage,
     //   7 Conway, 8 Dijkstra.
+    //
+    // ⚠ N2N WIRE headers use the 0-based HFC `NS` index (Byron COMBINED at
+    // 0): Shelley=1 … Babbage=5, Conway=6, Dijkstra=7 — see
+    // `storage_era_tag_to_hfc_index` in dugite-network. Wire-wrapped headers
+    // MUST go through [`decode_wire_wrapped_block_header`]; feeding them
+    // here mis-dispatches every era by one (live mainnet Babbage headers
+    // (wire 5) hit the Alonzo TPraos decoder and fail — caught 2026-06-12
+    // via the #747 range byte instrumentation).
     match era_tag {
         2 => era_shelley::decode_shelley_block_header(inner),
         3..=5 => era_alonzo::decode_alonzo_block_header(inner),
@@ -212,6 +221,79 @@ pub fn decode_wrapped_block_header(
         ))),
         n => Err(SerializationError::CborDecode(format!(
             "wrapped header: unknown era_tag {n}"
+        ))),
+    }
+}
+
+/// Decode an N2N WIRE-wrapped block header (`MsgRollForward` payload).
+///
+/// The wire wrap is `[hfc_index(uint), tag24(bytes(inner_header))]` where
+/// `hfc_index` is the 0-based hard-fork-combinator `NS` position with Byron
+/// COMBINED at index 0:
+///   0 Byron, 1 Shelley, 2 Allegra, 3 Mary, 4 Alonzo, 5 Babbage,
+///   6 Conway, 7 Dijkstra.
+///
+/// This differs by ONE from the STORAGE block wrap (Byron splits into
+/// EBB=0/main=1, pushing Shelley to 2 … Conway to 7) used by
+/// [`decode_wrapped_block_header`]. dugite's own ChainSync server performs
+/// the storage→wire conversion (`storage_era_tag_to_hfc_index`); this is the
+/// matching wire-side decoder. Byron wire headers (index 0) use a different
+/// envelope entirely and are rejected here.
+pub fn decode_wire_wrapped_block_header(
+    wrapped_cbor: &[u8],
+) -> Result<dugite_primitives::block::BlockHeader, SerializationError> {
+    use minicbor::Decoder;
+
+    let mut dec = Decoder::new(wrapped_cbor);
+    let arr_len = dec
+        .array()
+        .map_err(|e| SerializationError::CborDecode(format!("wire wrapped header outer: {e}")))?;
+    if arr_len != Some(2) {
+        return Err(SerializationError::CborDecode(format!(
+            "wire wrapped header: expected outer array(2), got {arr_len:?}"
+        )));
+    }
+    let dt = dec.datatype().map_err(|e| {
+        SerializationError::CborDecode(format!("wire wrapped header tag type: {e}"))
+    })?;
+    if !matches!(
+        dt,
+        minicbor::data::Type::U8
+            | minicbor::data::Type::U16
+            | minicbor::data::Type::U32
+            | minicbor::data::Type::U64
+    ) {
+        return Err(SerializationError::CborDecode(format!(
+            "wire wrapped header: era tag is not a uint (got {dt:?}) — \
+             Byron headers are not supported by this decoder"
+        )));
+    }
+    let hfc_index = dec
+        .u64()
+        .map_err(|e| SerializationError::CborDecode(format!("wire wrapped header era_tag: {e}")))?;
+    let tag = dec
+        .tag()
+        .map_err(|e| SerializationError::CborDecode(format!("wire wrapped header tag: {e}")))?;
+    if tag != minicbor::data::Tag::new(24) {
+        return Err(SerializationError::CborDecode(format!(
+            "wire wrapped header: expected tag(24), got {tag:?}"
+        )));
+    }
+    let inner = dec.bytes().map_err(|e| {
+        SerializationError::CborDecode(format!("wire wrapped header inner bytes: {e}"))
+    })?;
+
+    match hfc_index {
+        1 => era_shelley::decode_shelley_block_header(inner),
+        2..=4 => era_alonzo::decode_alonzo_block_header(inner),
+        5 => era_babbage::decode_babbage_block_header(inner),
+        6 | 7 => era_conway::decode_conway_block_header(inner),
+        0 => Err(SerializationError::CborDecode(
+            "wire wrapped header: Byron (hfc index 0) unsupported by decode_wire_wrapped_block_header"
+                .into(),
+        )),
+        n => Err(SerializationError::CborDecode(format!(
+            "wire wrapped header: unknown hfc index {n}"
         ))),
     }
 }
