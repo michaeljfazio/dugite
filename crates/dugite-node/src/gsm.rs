@@ -230,6 +230,25 @@ pub struct GsmConfig {
     pub security_param_k: u64,
     /// Path for the caught_up marker file.
     pub marker_path: PathBuf,
+    /// Stability window in seconds (`sgen × slot_length_secs`, i.e.
+    /// `ceil(3k/f) × slot_length_secs`).
+    ///
+    /// When the node starts without a `caught_up.marker` **and** the tip age
+    /// at startup is less than this threshold, it transitions directly to
+    /// **Syncing** instead of staying in PreSyncing.
+    ///
+    /// Rationale: a Mithril-bootstrapped node near the live tip has already
+    /// had its chain certified by the Mithril certificate chain; the HAA
+    /// (honest-availability-assumption) check that normally gates
+    /// PreSyncing → Syncing is therefore satisfied by construction, and
+    /// requiring additional big-ledger-peer connections before extending the
+    /// chain would cause a permanent k-block stall (issue #757).
+    ///
+    /// This is a Dugite extension — the Haskell node relies on a
+    /// `peerSnapshotFile` to seed BLPs instantly at startup and so never
+    /// encounters this scenario.  A value of `0` disables the optimisation
+    /// (keeps strict Haskell semantics: absent marker → PreSyncing always).
+    pub syncing_startup_threshold_secs: u64,
 }
 
 impl Default for GsmConfig {
@@ -242,6 +261,9 @@ impl Default for GsmConfig {
             gdd_rate_limit_ms: 1000,            // 1 GDD tick per second
             security_param_k: 2160,             // mainnet default
             marker_path: PathBuf::from("caught_up.marker"),
+            // Default: sgen for mainnet/preprod = ceil(3×2160/0.05) × 1s = 129 600 s ≈ 36 h.
+            // This is a safe upper bound; real value is set from the genesis file.
+            syncing_startup_threshold_secs: 129_600,
         }
     }
 }
@@ -282,14 +304,22 @@ impl GenesisStateMachine {
     /// and all constraints are disabled.
     /// `initial_tip_age_secs`: live age of the selection tip at startup —
     /// the `durationUntilTooOld` input for Haskell's
-    /// `initializationGsmState` marker-staleness table:
+    /// `initializationGsmState` marker-staleness table (extended for #757):
     ///
-    /// | marker  | tip age                | initial state                |
-    /// |---------|------------------------|------------------------------|
-    /// | absent  | —                      | PreSyncing                   |
-    /// | present | `None` (no age limit)  | CaughtUp                     |
-    /// | present | young enough           | CaughtUp                     |
-    /// | present | already too old        | PreSyncing + marker DELETED  |
+    /// | marker  | tip age                                  | initial state                |
+    /// |---------|------------------------------------------|------------------------------|
+    /// | absent  | `None` or ≥ `syncing_startup_threshold`  | PreSyncing                   |
+    /// | absent  | < `syncing_startup_threshold` (recent)   | Syncing  (Dugite ext. #757)  |
+    /// | present | `None` (no age limit)                    | CaughtUp                     |
+    /// | present | young enough                             | CaughtUp                     |
+    /// | present | already too old                          | PreSyncing + marker DELETED  |
+    ///
+    /// The "absent marker + recent tip → Syncing" row is a Dugite extension
+    /// that handles Mithril snapshot bootstrap near the live tip.  In Haskell
+    /// an absent marker always yields PreSyncing; Haskell avoids the
+    /// resulting k-block stall by requiring a `peerSnapshotFile` in the
+    /// topology so that big-ledger-peers are seeded instantly.  Dugite adds
+    /// this shortcut for deployments without a peer snapshot file.
     pub fn new(
         config: GsmConfig,
         enabled: bool,
@@ -314,7 +344,39 @@ impl GenesisStateMachine {
                     GenesisSyncState::CaughtUp
                 }
             } else {
-                GenesisSyncState::PreSyncing
+                // No marker file.
+                // Haskell: always PreSyncing (requires peerSnapshotFile to
+                // seed BLPs so the HAA gate fires quickly).
+                //
+                // Dugite extension (issue #757): when the selection tip is
+                // recent enough (age < syncing_startup_threshold_secs, i.e.
+                // within one stability window of the current time), the node
+                // was either just bootstrapped from a Mithril snapshot near
+                // the live tip, or restarted shortly after being caught up.
+                // In both cases the Mithril certificate chain (or the prior
+                // run's chain-state) has already proven chain validity, so
+                // the HAA is satisfied by construction.  Skip straight to
+                // Syncing so the LoE fragment is computed from live peer
+                // candidate prefixes rather than the restrictive
+                // immutable-tip anchor that caps selection at k blocks and
+                // permanently stalls the node when no peer-snapshot-file is
+                // configured and ledger-peer discovery hasn't fired yet.
+                let recent = matches!(
+                    initial_tip_age_secs,
+                    Some(age) if config.syncing_startup_threshold_secs > 0
+                        && age < config.syncing_startup_threshold_secs
+                );
+                if recent {
+                    info!(
+                        tip_age_secs = initial_tip_age_secs,
+                        threshold_secs = config.syncing_startup_threshold_secs,
+                        "Genesis: tip is recent (no marker) — starting in \
+                         Syncing (Mithril snapshot / fast-restart path, issue #757)"
+                    );
+                    GenesisSyncState::Syncing
+                } else {
+                    GenesisSyncState::PreSyncing
+                }
             }
         } else {
             GenesisSyncState::CaughtUp
@@ -407,14 +469,61 @@ impl GenesisStateMachine {
                 }
             }
             GenesisSyncState::Syncing => {
-                // HAA LOSS: if we drop below the minimum BLP count, regress.
-                if active_blp_count < self.config.min_active_blp {
+                // HAA LOSS: if we drop below the minimum BLP count, regress to
+                // PreSyncing — but ONLY when the tip is also stale.
+                //
+                // Haskell alignment: in `UseBootstrapPeers` mode the HAA
+                // (`outboundConnectionsState = TrustedStateWithExternalPeers`)
+                // is satisfied by ≥1 active BOOTSTRAP PEER, not by big-ledger
+                // peers.  Dugite does not yet track bootstrap peers in
+                // `haa_satisfied`, so `active_blp_count` always reads 0 in a
+                // topology with only bootstrap peers (preprod, preview with no
+                // peerSnapshotFile) — `haa_satisfied` returns the synthetic
+                // `min` only via the trusted-local-roots path, which is also
+                // empty when `localRoots = []`.
+                //
+                // When the node started in Syncing because its tip was recent
+                // (the Mithril-bootstrap path — `syncing_startup_threshold_secs`
+                // > 0 and tip age < threshold) it already passed the
+                // certified-chain check at startup.  GDD provides safety during
+                // the bounded gap to the live tip.  HAA-loss regression here
+                // would re-enter the k-block stall that issue #757 was opened to
+                // fix.
+                //
+                // Rule (mirrors Haskell `enterSyncing'` semantics for the
+                // UseBootstrapPeers case): regress to PreSyncing ONLY when BOTH
+                // conditions hold simultaneously:
+                //   (a) HAA is lost (BLP count < min), AND
+                //   (b) the tip is STALE (age ≥ syncing_startup_threshold_secs)
+                //
+                // When the tip is still recent (a) alone does NOT trigger
+                // regression.  Once the tip goes stale the node IS in the
+                // from-genesis-vulnerable regime and must re-establish the HAA.
+                // When `syncing_startup_threshold_secs = 0` the bypass is
+                // disabled and the original strict behaviour is preserved.
+                let haa_lost = active_blp_count < self.config.min_active_blp;
+                let tip_stale = self.config.syncing_startup_threshold_secs == 0
+                    || tip_age_secs >= self.config.syncing_startup_threshold_secs;
+
+                if haa_lost && tip_stale {
                     self.state = GenesisSyncState::PreSyncing;
                     self.remove_marker();
                     warn!(
                         active_blp = active_blp_count,
                         min = self.config.min_active_blp,
-                        "Genesis: HAA lost, regressing to PreSyncing"
+                        tip_age_secs,
+                        "Genesis: HAA lost (tip stale), regressing to PreSyncing"
+                    );
+                } else if haa_lost {
+                    // HAA temporarily lost but tip is still recent — suppress
+                    // regression; log at DEBUG so it is observable without noise.
+                    debug!(
+                        active_blp = active_blp_count,
+                        min = self.config.min_active_blp,
+                        tip_age_secs,
+                        threshold = self.config.syncing_startup_threshold_secs,
+                        "Genesis: HAA transiently lost but tip is recent — \
+                         staying in Syncing (UseBootstrapPeers path, issue #757)"
                     );
                 } else if self.caught_up_predicate(selection_block_no) {
                     // Haskell `blockUntilCaughtUp`: at least one peer, every
@@ -1094,6 +1203,7 @@ mod tests {
             gdd_rate_limit_ms: 100,
             security_param_k: 2160,
             marker_path: PathBuf::from(marker_path),
+            ..Default::default()
         };
         let registry = PeerStateRegistry::new();
         let mut gsm = GenesisStateMachine::new(config, enabled, registry.clone(), None);
@@ -1129,11 +1239,14 @@ mod tests {
 
     #[test]
     fn test_state_haa_loss_regresses_to_presyncing() {
+        // HAA loss must regress when the tip is STALE (≥ syncing_startup_threshold).
+        // `make_gsm` uses Default which sets syncing_startup_threshold_secs=129_600;
+        // a tip age of 200_000 s is well past the threshold.
         let (mut gsm, _reg) = make_gsm(true, "/tmp/gsm_t2.marker");
-        gsm.evaluate(5, 0, 9_999);
+        gsm.evaluate(5, 0, 200_000);
         assert_eq!(gsm.state(), GenesisSyncState::Syncing);
         assert_eq!(
-            gsm.evaluate(1, 0, 9_999),
+            gsm.evaluate(1, 0, 200_000),
             Some(GenesisSyncState::PreSyncing)
         );
     }
@@ -1224,6 +1337,7 @@ mod tests {
             gdd_rate_limit_ms: 100,
             security_param_k: 2160,
             marker_path: PathBuf::from(marker),
+            ..Default::default()
         };
         let registry = PeerStateRegistry::new();
         add_idling_peer(&registry, 1, 50);
@@ -1267,6 +1381,230 @@ mod tests {
         let _ = std::fs::remove_file(marker);
     }
 
+    // ── Issue #757: Mithril snapshot bootstrap startup state ─────────────
+
+    /// A node that has no marker file but whose tip is very recent (well within
+    /// the stability window) should start in **Syncing**, not PreSyncing.
+    ///
+    /// Root cause: PreSyncing LoE caps selection at k blocks past the snapshot
+    /// tip. For a Mithril snapshot (~2h old) BLPs never arrive fast enough to
+    /// satisfy the HAA before LoE fires, so the node stalls at exactly
+    /// k=snapshot_tip+2160 blocks.
+    ///
+    /// Fix: `syncing_startup_threshold_secs` (≈ sgen × slot_length = 129,600 s
+    /// on mainnet/preprod) allows the no-marker path to start in Syncing when
+    /// the tip age is < threshold.
+    #[test]
+    fn test_mithril_snapshot_bootstrap_starts_in_syncing() {
+        let marker = "/tmp/gsm_t757a.marker";
+        let _ = std::fs::remove_file(marker);
+        let config = GsmConfig {
+            marker_path: PathBuf::from(marker),
+            // Default threshold is 129_600s; tip age 7_200s (2 h) << threshold.
+            syncing_startup_threshold_secs: 129_600,
+            ..Default::default()
+        };
+        // Tip age 2 hours — typical for a fresh Mithril snapshot.
+        let gsm = GenesisStateMachine::new(config, true, PeerStateRegistry::new(), Some(7_200));
+        assert_eq!(
+            gsm.state(),
+            GenesisSyncState::Syncing,
+            "recent tip (7200s) with no marker should start in Syncing, not PreSyncing"
+        );
+    }
+
+    /// A node whose tip is STALE (age ≥ syncing_startup_threshold) should still
+    /// start in PreSyncing — it requires proper HAA bootstrap.
+    #[test]
+    fn test_stale_tip_no_marker_starts_in_presyncing() {
+        let marker = "/tmp/gsm_t757b.marker";
+        let _ = std::fs::remove_file(marker);
+        let config = GsmConfig {
+            marker_path: PathBuf::from(marker),
+            syncing_startup_threshold_secs: 129_600,
+            ..Default::default()
+        };
+        // Tip age > stability window — this is a genuine from-genesis sync.
+        let gsm = GenesisStateMachine::new(config, true, PeerStateRegistry::new(), Some(200_000));
+        assert_eq!(
+            gsm.state(),
+            GenesisSyncState::PreSyncing,
+            "stale tip (200000s > 129600s threshold) with no marker should be PreSyncing"
+        );
+    }
+
+    /// When `initial_tip_age_secs` is `None` (unknown, e.g. empty ChainDB),
+    /// the node must NOT start in Syncing — default to PreSyncing.
+    #[test]
+    fn test_unknown_tip_age_no_marker_starts_in_presyncing() {
+        let marker = "/tmp/gsm_t757c.marker";
+        let _ = std::fs::remove_file(marker);
+        let config = GsmConfig {
+            marker_path: PathBuf::from(marker),
+            syncing_startup_threshold_secs: 129_600,
+            ..Default::default()
+        };
+        let gsm = GenesisStateMachine::new(config, true, PeerStateRegistry::new(), None);
+        assert_eq!(
+            gsm.state(),
+            GenesisSyncState::PreSyncing,
+            "unknown tip age with no marker must be PreSyncing (cannot trust recent heuristic)"
+        );
+    }
+
+    /// Setting `syncing_startup_threshold_secs = 0` disables the optimisation
+    /// entirely — strict Haskell semantics; even a very recent tip starts PreSyncing.
+    #[test]
+    fn test_threshold_zero_disables_syncing_startup() {
+        let marker = "/tmp/gsm_t757d.marker";
+        let _ = std::fs::remove_file(marker);
+        let config = GsmConfig {
+            marker_path: PathBuf::from(marker),
+            syncing_startup_threshold_secs: 0, // disabled
+            ..Default::default()
+        };
+        let gsm = GenesisStateMachine::new(config, true, PeerStateRegistry::new(), Some(100));
+        assert_eq!(
+            gsm.state(),
+            GenesisSyncState::PreSyncing,
+            "threshold=0 must disable the Mithril-bootstrap optimisation"
+        );
+    }
+
+    /// Tip age exactly at the boundary (age == threshold) must be PreSyncing —
+    /// the condition is strict `<`, not `<=`.
+    #[test]
+    fn test_tip_age_at_threshold_boundary_is_presyncing() {
+        let marker = "/tmp/gsm_t757e.marker";
+        let _ = std::fs::remove_file(marker);
+        let config = GsmConfig {
+            marker_path: PathBuf::from(marker),
+            syncing_startup_threshold_secs: 129_600,
+            ..Default::default()
+        };
+        // Age exactly equal to threshold — should be PreSyncing (not recent).
+        let gsm = GenesisStateMachine::new(config, true, PeerStateRegistry::new(), Some(129_600));
+        assert_eq!(
+            gsm.state(),
+            GenesisSyncState::PreSyncing,
+            "tip age == threshold is NOT recent; boundary must be exclusive"
+        );
+    }
+
+    // ── Issue #757 corrected fix: evaluate() HAA-loss suppression ────────
+
+    /// LIVE-DISPROVEN v1 regression: a node that started in Syncing (recent tip,
+    /// no marker) must NOT regress to PreSyncing when HAA is transiently lost
+    /// while the tip is still recent.
+    ///
+    /// Scenario: Mithril-bootstrapped preprod node — 0 BLPs (only bootstrap
+    /// peers in topology), 0 local roots.  `active_blp_count` reported as 0 by
+    /// the SyncStatus emitter.  Before this fix `evaluate()` immediately
+    /// regressed to PreSyncing on the first tick after startup, re-entering the
+    /// k-block stall.
+    #[test]
+    fn test_recent_tip_syncing_haa_loss_suppressed() {
+        // Start in Syncing (recent tip path).
+        let marker = "/tmp/gsm_t757f.marker";
+        let _ = std::fs::remove_file(marker);
+        let config = GsmConfig {
+            min_active_blp: 5,
+            max_caught_up_age_secs: 600,
+            min_caught_up_dwell_secs: 0,
+            anti_thundering_herd_max_secs: 0,
+            gdd_rate_limit_ms: 100,
+            security_param_k: 2160,
+            marker_path: PathBuf::from(marker),
+            syncing_startup_threshold_secs: 129_600,
+        };
+        // Tip age 7 200 s — node started in Syncing via recent-tip path.
+        let mut gsm = GenesisStateMachine::new(config, true, PeerStateRegistry::new(), Some(7_200));
+        gsm.set_jitter(0);
+        assert_eq!(
+            gsm.state(),
+            GenesisSyncState::Syncing,
+            "should start Syncing"
+        );
+
+        // First evaluate: active_blp=0, tip still recent (7 300 s < 129 600 s).
+        // Must NOT regress.
+        assert!(
+            gsm.evaluate(0, 100, 7_300).is_none(),
+            "HAA lost but tip recent — must stay Syncing"
+        );
+        assert_eq!(gsm.state(), GenesisSyncState::Syncing);
+
+        // Repeated ticks with active_blp=0, tip still recent.
+        assert!(gsm.evaluate(0, 200, 10_000).is_none());
+        assert!(gsm.evaluate(0, 300, 50_000).is_none());
+        assert_eq!(gsm.state(), GenesisSyncState::Syncing);
+        let _ = std::fs::remove_file(marker);
+    }
+
+    /// Once the tip goes stale (age ≥ syncing_startup_threshold_secs) while
+    /// HAA is still unmet, the node MUST regress to PreSyncing — this is the
+    /// from-genesis cold-start scenario where real HAA protection is required.
+    #[test]
+    fn test_syncing_haa_loss_with_stale_tip_regresses() {
+        let marker = "/tmp/gsm_t757g.marker";
+        let _ = std::fs::remove_file(marker);
+        let config = GsmConfig {
+            min_active_blp: 5,
+            max_caught_up_age_secs: 600,
+            min_caught_up_dwell_secs: 0,
+            anti_thundering_herd_max_secs: 0,
+            gdd_rate_limit_ms: 100,
+            security_param_k: 2160,
+            marker_path: PathBuf::from(marker),
+            syncing_startup_threshold_secs: 129_600,
+        };
+        // Start in Syncing via recent-tip path.
+        let mut gsm = GenesisStateMachine::new(config, true, PeerStateRegistry::new(), Some(7_200));
+        gsm.set_jitter(0);
+        assert_eq!(gsm.state(), GenesisSyncState::Syncing);
+
+        // Tip goes stale AND HAA is lost → must regress.
+        let result = gsm.evaluate(0, 100, 130_000); // age > threshold
+        assert_eq!(
+            result,
+            Some(GenesisSyncState::PreSyncing),
+            "HAA lost AND tip stale must regress to PreSyncing"
+        );
+        assert_eq!(gsm.state(), GenesisSyncState::PreSyncing);
+        let _ = std::fs::remove_file(marker);
+    }
+
+    /// PRAOS mode: `evaluate()` must be a no-op regardless of active_blp or
+    /// tip age — enabled=false means genesis constraints are off entirely.
+    #[test]
+    fn test_praos_evaluate_noop_with_recent_tip() {
+        let marker = "/tmp/gsm_t757h.marker";
+        let _ = std::fs::remove_file(marker);
+        let config = GsmConfig {
+            min_active_blp: 5,
+            max_caught_up_age_secs: 600,
+            min_caught_up_dwell_secs: 0,
+            anti_thundering_herd_max_secs: 0,
+            gdd_rate_limit_ms: 100,
+            security_param_k: 2160,
+            marker_path: PathBuf::from(marker),
+            syncing_startup_threshold_secs: 129_600,
+        };
+        // Praos mode (enabled=false) — always starts CaughtUp, evaluate is inert.
+        let mut gsm = GenesisStateMachine::new(config, false, PeerStateRegistry::new(), Some(100));
+        assert_eq!(gsm.state(), GenesisSyncState::CaughtUp);
+        assert!(gsm.evaluate(0, 0, 100).is_none(), "praos: evaluate noop");
+        assert!(
+            gsm.evaluate(0, 0, 500_000).is_none(),
+            "praos: evaluate noop even with stale tip"
+        );
+        assert_eq!(gsm.state(), GenesisSyncState::CaughtUp);
+        assert!(
+            !PathBuf::from(marker).exists(),
+            "praos: marker never written"
+        );
+    }
+
     #[test]
     fn test_disabled_mode_is_inert() {
         let (mut gsm, _reg) = make_gsm(false, "/tmp/gsm_t9.marker");
@@ -1304,6 +1642,7 @@ mod tests {
             gdd_rate_limit_ms: 100,
             security_param_k: 2160,
             marker_path: PathBuf::from(marker),
+            ..Default::default()
         };
         let registry = PeerStateRegistry::new();
         // CaughtUp needs ≥1 idling, not-better peer.
@@ -1361,6 +1700,7 @@ mod tests {
             gdd_rate_limit_ms: 20, // fast ticks for tests
             security_param_k: k,
             marker_path: marker,
+            ..Default::default()
         };
         let registry = PeerStateRegistry::new();
         let chain_db = Arc::new(tokio::sync::RwLock::new(
