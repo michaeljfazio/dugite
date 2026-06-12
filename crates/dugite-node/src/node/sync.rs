@@ -3511,25 +3511,39 @@ pub(crate) fn eager_validate_header(
     // Look up the issuer pool in the SET snapshot — the active
     // distribution for the current epoch's leader election (Cardano
     // mark/set/go rule, #652 C2).
+    //
+    // INCOMPLETE-VIEW GUARD: eager validation is an OPTIMIZATION layer; its
+    // failure mode for missing data must be SKIP (fall back to the
+    // authoritative body apply), never reject. When the view has NO set
+    // snapshot — or an EMPTY one — (genesis epochs 0/1 before the first
+    // mark/set/go rotation, or a view that has not been populated yet),
+    // rejecting here partitions honest peers: the first devnet run after
+    // the wire-era-gate fix made eager validation actually execute for
+    // Conway headers rejected every block the BP forged from genesis
+    // ("block from unregistered pool", slot 4) and disconnected it.
+    // A POPULATED set that lacks the pool still rejects via
+    // issuer_info=None below — the #654 unknown-pool header hardening is
+    // preserved for every mid-chain case.
     let pool_id = dugite_primitives::hash::blake2b_224(&header.issuer_vkey);
-    let issuer_info = match ledger_view.snapshots.set.as_ref() {
-        Some(set_snap) => set_snap.pool_stake.get(&pool_id).map(|pool_stake| {
-            let total_active_stake: u64 = set_snap.pool_stake.values().map(|l| l.0).sum();
-            // Pool's registered VRF key hash — look up in the snapshot's
-            // pool_params (the active map at the set boundary).
-            let vrf_keyhash = set_snap
-                .pool_params
-                .get(&pool_id)
-                .map(|p| p.vrf_keyhash)
-                .unwrap_or(dugite_primitives::hash::Hash32::ZERO);
-            dugite_consensus::praos::BlockIssuerInfo {
-                vrf_keyhash,
-                pool_stake: pool_stake.0,
-                total_active_stake,
-            }
-        }),
-        None => None,
+    let set_snap = match ledger_view.snapshots.set.as_ref() {
+        Some(s) if !s.pool_stake.is_empty() => s,
+        _ => return Ok(false), // incomplete view — skip eager, body apply decides
     };
+    let issuer_info = set_snap.pool_stake.get(&pool_id).map(|pool_stake| {
+        let total_active_stake: u64 = set_snap.pool_stake.values().map(|l| l.0).sum();
+        // Pool's registered VRF key hash — look up in the snapshot's
+        // pool_params (the active map at the set boundary).
+        let vrf_keyhash = set_snap
+            .pool_params
+            .get(&pool_id)
+            .map(|p| p.vrf_keyhash)
+            .unwrap_or(dugite_primitives::hash::Hash32::ZERO);
+        dugite_consensus::praos::BlockIssuerInfo {
+            vrf_keyhash,
+            pool_stake: pool_stake.0,
+            total_active_stake,
+        }
+    });
 
     // Forecast horizon was already checked by `forecast_park_or_disconnect`
     // at this site; pass the same `last_applied_slot` so any further
@@ -7223,6 +7237,62 @@ mod additional_sync_tests {
         enc.tag(minicbor::data::Tag::new(6)).unwrap(); // wrong tag
         enc.bytes(b"foo").unwrap();
         assert_eq!(unwrap_hfc_header(&buf), None);
+    }
+
+    /// Eager validation with an INCOMPLETE view (no/empty set snapshot —
+    /// genesis epochs before the first mark/set/go rotation) must SKIP
+    /// (Ok(false)), never reject: rejecting partitioned the devnet relay
+    /// from its BP ("block from unregistered pool" at slot 4, 2026-06-12)
+    /// the moment the wire-era-gate fix made eager validation actually run
+    /// for Conway headers.
+    #[test]
+    fn eager_validate_skips_on_missing_set_snapshot() {
+        use std::collections::HashMap;
+        // Real Babbage header from the block-33760 fixture; the Praos header
+        // shape is identical across Babbage/Conway, so wrapping it with the
+        // WIRE Conway index (6) exercises the Conway eager path with a
+        // structurally valid header.
+        let wrapped_block = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../dugite-serialization/tests/fixtures/babbage_indef_tx_bodies_block33760.cbor"
+        ))
+        .expect("fixture");
+        let mut dec = minicbor::Decoder::new(&wrapped_block);
+        dec.array().expect("outer");
+        let _ = dec.u64().expect("era");
+        dec.array().expect("block");
+        let start = dec.position();
+        dec.skip().expect("skip header");
+        let header_bytes = &wrapped_block[start..dec.position()];
+        let mut buf = Vec::with_capacity(header_bytes.len() + 8);
+        {
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.array(2).unwrap();
+            enc.u64(6).unwrap(); // WIRE Conway index
+            enc.tag(minicbor::data::Tag::new(24)).unwrap();
+            enc.bytes(header_bytes).unwrap();
+        }
+
+        let consensus = dugite_consensus::praos::OuroborosPraos::new(11);
+        // Fresh ledger state → LedgerView with NO set snapshot.
+        let state = dugite_ledger::LedgerState::new(
+            dugite_primitives::protocol_params::ProtocolParameters::mainnet_defaults(),
+        );
+        let view = crate::node::ledger_view::LedgerView::from_state(&state);
+        assert!(
+            view.snapshots
+                .set
+                .as_ref()
+                .is_none_or(|s| s.pool_stake.is_empty()),
+            "test precondition: view must have no populated set snapshot"
+        );
+        let peer: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+        let mut counters = HashMap::new();
+        let result = eager_validate_header(&peer, &buf, 0, &consensus, &view, &mut counters);
+        assert!(
+            matches!(result, Ok(false)),
+            "incomplete view must SKIP eager validation, got {result:?}"
+        );
     }
 
     // ── extract_header_fetch_info ────────────────────────────────────────────
