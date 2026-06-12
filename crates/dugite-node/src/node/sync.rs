@@ -3560,6 +3560,32 @@ pub(crate) fn eager_validate_header(
     // Pass `header.slot` so the FutureBlock check trivially passes.
     let current_slot = header.slot;
 
+    // Seed the per-peer opcert-counter view from the GLOBAL (snapshot-derived)
+    // counters on the first encounter of each pool.
+    //
+    // `peer_counters` is a per-peer override map (#652 C1): so that headers
+    // from one peer's fork never mutate another peer's — or the global —
+    // counter state, `validate_header_full_with_counters` swaps this map in
+    // wholesale (`std::mem::take`) for the duration of the call. But the map
+    // starts EMPTY (`CandidateChainState::default`), so without seeding, the
+    // OCERT check inside falls back to counter 0 for any known pool and a
+    // pool whose snapshot counter is > 1 trips a false
+    // `CounterOverIncrementedOCERT` on its very first eager header —
+    // disconnecting every peer of a Mithril-bootstrapped node.
+    //
+    // A from-genesis node never hit this: it accumulates each pool's counter
+    // from 0 as it applies the chain, so the per-peer map is already warm by
+    // the time eager validation runs at the tip. Only a node that JUMPED to a
+    // mid-chain tip via a Mithril snapshot (where pools already carry
+    // arbitrary counters, e.g. mainnet/preprod max 463) is affected — the
+    // reported genesis-mode bootstrap failure.
+    //
+    // Seeding lazily per-pool (not a full upfront clone) keeps this O(1) per
+    // first-seen pool. An existing per-peer entry is never overwritten: a
+    // peer's own fork may legitimately have advanced the counter past the
+    // snapshot value, and that diverged view must win.
+    seed_peer_counter_from_global(peer_counters, consensus_seed.opcert_counters(), pool_id);
+
     consensus_seed.validate_header_full_with_counters(
         peer_counters,
         &header,
@@ -3571,6 +3597,28 @@ pub(crate) fn eager_validate_header(
         ledger_tip,
     )?;
     Ok(true)
+}
+
+/// Seed a single pool's entry in a per-peer opcert-counter view from the
+/// global (snapshot-derived) counter map, iff the per-peer map does not
+/// already track that pool.
+///
+/// This is the core of the Mithril genesis-bootstrap fix: the per-peer eager
+/// validation map (`CandidateChainState::eager_opcert_counters`) starts empty
+/// and is swapped wholesale into the validator, discarding the global
+/// snapshot counters. Seeding the pool on first encounter restores the
+/// snapshot's counter as the per-peer baseline; an already-present entry
+/// (the peer's own diverged fork value) is preserved.
+pub(crate) fn seed_peer_counter_from_global(
+    peer_counters: &mut HashMap<dugite_primitives::hash::Hash28, u64>,
+    global_counters: &HashMap<dugite_primitives::hash::Hash28, u64>,
+    pool_id: dugite_primitives::hash::Hash28,
+) {
+    if let std::collections::hash_map::Entry::Vacant(slot) = peer_counters.entry(pool_id) {
+        if let Some(&seeded) = global_counters.get(&pool_id) {
+            slot.insert(seeded);
+        }
+    }
 }
 
 /// Run the forecast check for an incoming header's slot against the
@@ -5894,6 +5942,100 @@ pub async fn chainsync_client_task(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod seed_peer_counter_tests {
+    use super::*;
+    use dugite_primitives::hash::Hash28;
+
+    fn pool(b: u8) -> Hash28 {
+        Hash28::from_bytes([b; 28])
+    }
+
+    /// The Mithril genesis-bootstrap fix: a per-peer counter map that does
+    /// NOT yet track a pool is seeded from the global (snapshot-derived)
+    /// counter, so the OCERT check sees the real baseline (e.g. 5) instead of
+    /// falling back to 0 and falsely rejecting the pool's first eager header.
+    #[test]
+    fn seeds_absent_pool_from_global() {
+        let mut peer: HashMap<Hash28, u64> = HashMap::new();
+        let mut global: HashMap<Hash28, u64> = HashMap::new();
+        global.insert(pool(0x85), 5); // TPREP-style snapshot counter
+        global.insert(pool(0x99), 463); // preprod max
+
+        seed_peer_counter_from_global(&mut peer, &global, pool(0x85));
+        assert_eq!(
+            peer.get(&pool(0x85)),
+            Some(&5),
+            "absent pool must seed from global"
+        );
+        // Only the requested pool is seeded (lazy, O(1) per first-seen pool).
+        assert_eq!(
+            peer.get(&pool(0x99)),
+            None,
+            "unrelated pool must not be seeded"
+        );
+    }
+
+    /// A per-peer entry that already exists (the peer's own fork advanced the
+    /// counter past the snapshot value) must NOT be overwritten by the global
+    /// seed — the diverged per-peer view wins.
+    #[test]
+    fn preserves_existing_peer_entry() {
+        let mut peer: HashMap<Hash28, u64> = HashMap::new();
+        peer.insert(pool(0x85), 7); // peer advanced past snapshot's 5
+        let mut global: HashMap<Hash28, u64> = HashMap::new();
+        global.insert(pool(0x85), 5);
+
+        seed_peer_counter_from_global(&mut peer, &global, pool(0x85));
+        assert_eq!(
+            peer.get(&pool(0x85)),
+            Some(&7),
+            "existing peer entry must be preserved"
+        );
+    }
+
+    /// A pool absent from BOTH maps stays absent — the validator's
+    /// known-issuer fallback (counter 0) then applies, which is correct for a
+    /// genuinely counter-0 pool on a from-genesis node.
+    #[test]
+    fn pool_absent_from_global_stays_absent() {
+        let mut peer: HashMap<Hash28, u64> = HashMap::new();
+        let global: HashMap<Hash28, u64> = HashMap::new();
+        seed_peer_counter_from_global(&mut peer, &global, pool(0x85));
+        assert!(peer.is_empty(), "no entry when global lacks the pool");
+    }
+
+    /// End-to-end of the regression: a peer map seeded from a snapshot global
+    /// then validated against the praos OCERT predicate accepts the pool's
+    /// snapshot counter, where the un-seeded (empty) map would reject it.
+    #[test]
+    fn seeded_counter_accepts_snapshot_value_unseeded_rejects() {
+        // Model the OCERT predicate the way validate_header checks it:
+        // m = counter-for-pool (or 0 if known issuer but absent); reject when
+        // n > m + 1 (CounterOverIncrementedOCERT).
+        let n = 5u64; // header's opcert counter (TPREP at snapshot)
+        let mut global: HashMap<Hash28, u64> = HashMap::new();
+        global.insert(pool(0x85), 5);
+
+        // Un-seeded (the bug): empty peer map → m falls back to 0 → 5 > 1 → reject.
+        let unseeded: HashMap<Hash28, u64> = HashMap::new();
+        let m_unseeded = unseeded.get(&pool(0x85)).copied().unwrap_or(0);
+        assert!(
+            n > m_unseeded + 1,
+            "un-seeded map reproduces the false rejection"
+        );
+
+        // Seeded (the fix): m = 5 → 5 > 6 is false → accept.
+        let mut seeded: HashMap<Hash28, u64> = HashMap::new();
+        seed_peer_counter_from_global(&mut seeded, &global, pool(0x85));
+        let m_seeded = seeded.get(&pool(0x85)).copied().unwrap_or(0);
+        assert!(
+            n <= m_seeded + 1,
+            "seeded map accepts the pool's snapshot counter"
+        );
+    }
 }
 
 #[cfg(test)]
