@@ -3198,7 +3198,7 @@ fn extract_hash_from_header(header_cbor: &[u8]) -> [u8; 32] {
 ///   hidden gap makes the peer deliver the gap blocks too, blowing the byte
 ///   budget (observed live: ranges delivering 1.7-2x their estimate).
 fn extract_header_fetch_info(header_cbor: &[u8]) -> (Option<u64>, Option<[u8; 32]>) {
-    match dugite_serialization::decode_wrapped_block_header(header_cbor) {
+    match dugite_serialization::decode_wire_wrapped_block_header(header_cbor) {
         Ok(h) => {
             let mut prev = [0u8; 32];
             prev.copy_from_slice(h.prev_hash.as_ref());
@@ -3485,18 +3485,25 @@ pub(crate) fn eager_validate_header(
     // Shelley/Allegra/Mary/Alonzo/Babbage headers require overlay schedule
     // context (BFT delegate slots when d > 0) which Phase 1 does not
     // construct from the LedgerView. Conway+ has d == 0, so no overlay.
+    //
+    // N2N WIRE headers carry the 0-based HFC index (Byron COMBINED at 0):
+    // … 5=Babbage, 6=Conway, 7=Dijkstra. The previous `< 7` gate was written
+    // against the STORAGE mapping (7=Conway) — on the wire that matched
+    // Dijkstra only, so eager validation silently never ran for Conway
+    // chains (caught 2026-06-12 alongside the #747 wire/storage mismatch).
+    const WIRE_HFC_CONWAY: u64 = 6;
     let era_tag = match extract_era_tag_from_wrapped_header(header_cbor) {
         Some(t) => t,
         None => return Ok(false), // malformed envelope — let body apply catch it
     };
-    if era_tag < 7 {
+    if era_tag < WIRE_HFC_CONWAY {
         return Ok(false);
     }
 
     // Decode the header. Anything that fails here is malformed CBOR — let
     // the caller treat that as a structural error (return Err so we
     // disconnect with a labelled reason).
-    let header = dugite_serialization::decode_wrapped_block_header(header_cbor).map_err(|e| {
+    let header = dugite_serialization::decode_wire_wrapped_block_header(header_cbor).map_err(|e| {
         tracing::warn!(%peer_addr, slot = header_slot, "ChainSync eager: header decode failed: {e}");
         dugite_consensus::ConsensusError::InvalidBlock(format!("eager header decode: {e}"))
     })?;
@@ -6026,7 +6033,10 @@ mod forecast_park_tests {
         let view = crate::node::ledger_view::LedgerView::from_state(&state);
         let peer: SocketAddr = "127.0.0.1:3001".parse().unwrap();
 
-        for tag in [2u64, 3, 4, 5, 6] {
+        // WIRE HFC indices (Byron combined at 0): 1=Shelley … 5=Babbage.
+        // 6 = Conway on the wire and must NOT skip (covered by the
+        // undecodable-header test below).
+        for tag in [1u64, 2, 3, 4, 5] {
             // Use a header CBOR that would NOT validate (empty inner) — we
             // assert the function returns Ok(false) BEFORE attempting any
             // decode, proving the era gate fires first.
@@ -6081,19 +6091,25 @@ mod forecast_park_tests {
         let view = crate::node::ledger_view::LedgerView::from_state(&state);
         let peer: SocketAddr = "127.0.0.1:3001".parse().unwrap();
 
-        // Build a Conway-tagged (era_tag=7) wrap whose inner bytes are
-        // not a valid Conway header — the decoder must return Err and
-        // eager_validate_header must propagate.
-        let mut buf = Vec::new();
-        let mut enc = Encoder::new(&mut buf);
-        enc.array(2).unwrap();
-        enc.u64(7).unwrap();
-        enc.tag(minicbor::data::Tag::new(24)).unwrap();
-        enc.bytes(b"garbage").unwrap();
+        // Build wraps for the WIRE Conway (6) and Dijkstra (7) indices whose
+        // inner bytes are not a valid header — the decoder must return Err
+        // and eager_validate_header must propagate (i.e. the era gate lets
+        // both through to the decode).
+        for tag in [6u64, 7] {
+            let mut buf = Vec::new();
+            let mut enc = Encoder::new(&mut buf);
+            enc.array(2).unwrap();
+            enc.u64(tag).unwrap();
+            enc.tag(minicbor::data::Tag::new(24)).unwrap();
+            enc.bytes(b"garbage").unwrap();
 
-        let mut counters = HashMap::new();
-        let result = eager_validate_header(&peer, &buf, 0, &consensus, &view, &mut counters);
-        assert!(result.is_err(), "undecodable Conway header must Err");
+            let mut counters = HashMap::new();
+            let result = eager_validate_header(&peer, &buf, 0, &consensus, &view, &mut counters);
+            assert!(
+                result.is_err(),
+                "undecodable wire-tag-{tag} header must Err (got {result:?})"
+            );
+        }
     }
 
     #[test]
@@ -7233,21 +7249,29 @@ mod additional_sync_tests {
         dec.skip().expect("skip header");
         let header_bytes = &wrapped_block[start..dec.position()];
 
-        // Re-wrap as the N2N ChainSync header envelope: [6, tag24(bytes(h))].
+        // Re-wrap as the N2N ChainSync WIRE envelope: [5, tag24(bytes(h))].
+        // The wire HFC index for Babbage is 5 (0-based, Byron combined) —
+        // NOT the storage tag 6 the fixture file carries. Using the storage
+        // tag here previously masked the wire/storage mis-dispatch that made
+        // extraction fail for every live mainnet header.
         let mut buf = Vec::with_capacity(header_bytes.len() + 8);
         {
             let mut enc = minicbor::Encoder::new(&mut buf);
             enc.array(2).unwrap();
-            enc.u64(6).unwrap();
+            enc.u64(5).unwrap();
             enc.tag(minicbor::data::Tag::new(24)).unwrap();
             enc.bytes(header_bytes).unwrap();
         }
 
         let (size, prev) = extract_header_fetch_info(&buf);
-        assert!(
-            size.is_some_and(|s| s > 0),
-            "must extract a positive declared body size from a real wrapped \
-             Babbage header, got {size:?}"
+        // Ground truth from manual CBOR analysis of the fixture: header_body
+        // index 6 (block_body_size) = 7,531 = EXACTLY the fixture's actual
+        // body bytes (8,386 total block − 855 header). An extraction that
+        // returns any other value silently breaks the #747 byte accounting.
+        assert_eq!(
+            size,
+            Some(7_531),
+            "declared body size must match the fixture's actual body bytes"
         );
         assert!(
             prev.is_some(),
