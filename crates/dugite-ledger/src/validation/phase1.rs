@@ -4,7 +4,7 @@
 //! execution. Each numbered rule corresponds to a distinct ledger invariant:
 //!
 //! - Rule 1  — at least one input
-//! - Rule 1b — no duplicate inputs
+//! - Rule 1b — no duplicate inputs (Conway+ PV≥9 only; Haskell silently dedups at PV<9)
 //! - Rule 1c — auxiliary data hash / auxiliary data consistency
 //! - Rule 1d — era gating (Conway-only certs/governance in pre-Conway eras)
 //! - Rule 2  — all inputs exist in the UTxO set
@@ -622,11 +622,31 @@ pub(super) fn run_phase1_rules(
 
     // ------------------------------------------------------------------
     // Rule 1b: No duplicate inputs
+    //
+    // Haskell semantic is protocol-version gated:
+    //
+    // PV < 9 (Alonzo/Babbage): `decodeSet` routes through the lenient path
+    //   (`Set.fromList`), which silently deduplicates.  No `BabbageUtxoPredFailure`
+    //   constructor for duplicate inputs exists, so Haskell accepts such txs.
+    //   Real mainnet Babbage blocks contain transactions with duplicate spend
+    //   inputs encoded in a plain CBOR array (e.g. tx 5ca83e21… at epoch 484,
+    //   slot 123728795, PV8) — Haskell silently dedups and accepts.
+    //
+    // PV >= 9 (Conway+): `decodeSetEnforceNoDuplicates` hard-fails at the
+    //   binary layer.  We mirror that by surfacing `DuplicateInput` at
+    //   Phase-1 time (the net effect is the same rejection).
+    //
+    // Reference: `cardano-ledger-binary` `decodeSet` / `decodeSetEnforceNoDuplicates`
+    //   (Cardano.Ledger.Binary.Decoding.Coders), and the absence of a
+    //   DuplicateInput constructor in `AlonzoUtxoPredFailure` / `BabbageUtxoPredFailure`.
     // ------------------------------------------------------------------
     {
         let mut seen = HashSet::new();
         for input in &body.inputs {
-            if !seen.insert(input) {
+            // PV < 9 (Alonzo/Babbage): Haskell `Set.fromList` silently dedups —
+            // no rejection.  PV >= 9 (Conway+): hard-fail mirrors
+            // `decodeSetEnforceNoDuplicates`.
+            if !seen.insert(input) && params.protocol_version_major >= 9 {
                 errors.push(ValidationError::DuplicateInput(input.to_string()));
             }
         }
@@ -2869,20 +2889,110 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 31 — Rule 1b: duplicate inputs rejected
+    // Test 31 — Rule 1b: duplicate inputs rejected at Conway PV9+
+    //
+    // Haskell `decodeSetEnforceNoDuplicates` (PV >= 9) hard-fails on duplicates.
+    // Dugite mirrors this at Phase-1 time.  `mainnet_defaults()` has PV9.
     // -----------------------------------------------------------------------
     #[test]
-    fn test_duplicate_inputs_rejected() {
+    fn test_duplicate_inputs_rejected_at_conway_pv9() {
         let (utxo_set, mut tx, input) = make_valid_tx();
         // Add the same input a second time.
         tx.body.inputs.push(input.clone());
-        let params = ProtocolParameters::mainnet_defaults();
+        let params = ProtocolParameters::mainnet_defaults(); // PV9
         let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err();
         assert!(
             errors
                 .iter()
                 .any(|e| matches!(e, ValidationError::DuplicateInput(_))),
-            "expected DuplicateInput, got {errors:?}"
+            "expected DuplicateInput at PV9, got {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 31b — Rule 1b: duplicate inputs silently accepted at Babbage PV8
+    //
+    // Haskell `decodeSet` at PV < 9 routes through `Set.fromList` which
+    // silently deduplicates.  `BabbageUtxoPredFailure` has no DuplicateInput
+    // constructor.  Real mainnet tx 5ca83e21… (epoch 484, slot 123728795,
+    // PV8) has body key 0 = array(3) with the same TxIn listed twice; it was
+    // accepted by cardano-node 8.x and is on-chain.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_duplicate_inputs_accepted_at_babbage_pv8() {
+        let (utxo_set, mut tx, input) = make_valid_tx();
+        // Add the same input a second time — simulating the PV8 wire encoding.
+        tx.body.inputs.push(input.clone());
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 8; // Babbage
+                                           // With a duplicate input and PV8, Phase-1 must NOT emit DuplicateInput.
+                                           // (Other errors may fire — the point is DuplicateInput is absent.)
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        let no_dup_error = match &result {
+            Ok(()) => true,
+            Err(errors) => !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::DuplicateInput(_))),
+        };
+        assert!(
+            no_dup_error,
+            "DuplicateInput must not fire at PV8 (Babbage), got {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 31c — Rule 1b: real mainnet Babbage tx 5ca83e21 with duplicate
+    //             spend input accepted (issue #759 regression pin)
+    //
+    // tx 5ca83e216eb4fce8e907ed3597bd290261136ae97fc4cd7fbd5eadf9bbedf09f
+    // mainnet epoch 484, slot 123728795, block 10294413 (PV8 = Babbage).
+    // Body key 0 = plain array(3): [ab2829f0…#1, ab2829f0…#1, 3bd13603…#0]
+    // The same TxIn `ab2829f03f…#1` appears twice.  Haskell accepted it
+    // (it is on-chain); dugite must not reject with DuplicateInput.
+    //
+    // Note: this test decodes the raw CBOR and checks that DuplicateInput is
+    // absent; it does NOT reconstruct a full UTxO environment, so Phase-1
+    // may emit BadInputs/ValueNotConserved.  The critical invariant is that
+    // DuplicateInput is NEVER in the error list when PV < 9.
+    // -----------------------------------------------------------------------
+    const TX_5CA83E21_HEX: &str = include_str!("fixtures/tx-5ca83e21.hex");
+
+    #[test]
+    fn test_mainnet_babbage_duplicate_input_5ca83e21_no_false_positive() {
+        let s = TX_5CA83E21_HEX.trim();
+        let bytes: Vec<u8> = (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("valid hex"))
+            .collect();
+        // Decode as era 5 (Babbage)
+        let tx = dugite_serialization::decode::decode_transaction(5, &bytes)
+            .expect("decode real mainnet Babbage tx 5ca83e21");
+
+        // Verify the wire-level duplicate is preserved by the decoder
+        assert_eq!(
+            tx.body.inputs.len(),
+            3,
+            "wire has array(3); decoder must preserve physical element count"
+        );
+        assert_eq!(
+            tx.body.inputs[0], tx.body.inputs[1],
+            "first two inputs must be identical (wire duplicate)"
+        );
+
+        // Validate against an empty UTxO (BadInputs expected, DuplicateInput forbidden)
+        let empty_utxo = UtxoSet::new();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 8; // PV8 = Babbage
+        let result = validate_transaction(&tx, &empty_utxo, &params, 123_728_795, 500, None);
+        let has_dup_error = match &result {
+            Ok(()) => false,
+            Err(errors) => errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::DuplicateInput(_))),
+        };
+        assert!(
+            !has_dup_error,
+            "DuplicateInput must not fire for PV8 Babbage tx 5ca83e21 (issue #759): {result:?}"
         );
     }
 
