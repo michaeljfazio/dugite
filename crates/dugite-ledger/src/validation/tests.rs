@@ -7705,13 +7705,12 @@ mod tests {
             raw_witness_cbor: None,
         };
 
+        // Script hash [0xAA; 28] is PlutusV1 → datum witness is required.
+        let mut script_versions = std::collections::HashMap::new();
+        script_versions.insert(Hash28::from_bytes([0xAAu8; 28]), 1u8);
+
         let mut errors = Vec::new();
-        check_datum_witnesses(
-            &tx,
-            &utxo_set,
-            &std::collections::HashMap::new(),
-            &mut errors,
-        );
+        check_datum_witnesses(&tx, &utxo_set, &script_versions, &mut errors);
         assert!(
             errors
                 .iter()
@@ -7797,13 +7796,12 @@ mod tests {
             raw_witness_cbor: None,
         };
 
+        // Script hash [0xBB; 28] is PlutusV1 → datum witness is required.
+        let mut script_versions = std::collections::HashMap::new();
+        script_versions.insert(Hash28::from_bytes([0xBBu8; 28]), 1u8);
+
         let mut errors = Vec::new();
-        check_datum_witnesses(
-            &tx,
-            &utxo_set,
-            &std::collections::HashMap::new(),
-            &mut errors,
-        );
+        check_datum_witnesses(&tx, &utxo_set, &script_versions, &mut errors);
         assert!(errors.is_empty(), "Expected no errors, got: {errors:?}");
     }
 
@@ -8178,13 +8176,14 @@ mod tests {
             raw_witness_cbor: None,
         };
 
+        // Both script hashes [0x11; 28] and [0x22; 28] are PlutusV1 → datum
+        // witnesses are required for both inputs.
+        let mut script_versions = std::collections::HashMap::new();
+        script_versions.insert(Hash28::from_bytes([0x11u8; 28]), 1u8);
+        script_versions.insert(Hash28::from_bytes([0x22u8; 28]), 1u8);
+
         let mut errors = Vec::new();
-        check_datum_witnesses(
-            &tx,
-            &utxo_set,
-            &std::collections::HashMap::new(),
-            &mut errors,
-        );
+        check_datum_witnesses(&tx, &utxo_set, &script_versions, &mut errors);
         assert!(
             errors.is_empty(),
             "Expected no errors when all needed datums present, got: {errors:?}"
