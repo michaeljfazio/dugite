@@ -172,13 +172,36 @@ impl ChainDB {
 
         // Open VolatileDB with WAL for crash recovery
         let volatile_dir = db_path.join("volatile");
-        let volatile = match VolatileDB::open(&volatile_dir) {
+        let mut volatile = match VolatileDB::open(&volatile_dir) {
             Ok(v) => v,
             Err(e) => {
                 warn!(error = %e, "Failed to open VolatileDB with WAL, falling back to in-memory");
                 VolatileDB::new()
             }
         };
+
+        // Crash-recovery validation (Haskell: VolatileDB open-time
+        // validation): drop any persisted volatile block not reachable from
+        // the immutable tip via prev-hash links. A crash mid-flush can leave
+        // a GAP in the volatile chain; without this prune the boot ledger
+        // replay fails on every block above the gap and the node enters live
+        // sync permanently wedged (ledger_tip << ChainDB tip while
+        // BlockFetch's has_block filter refuses to re-fetch the gap region —
+        // observed live 2026-06-12 after a SIGBUS crash). Pruned blocks are
+        // simply re-fetched from the network. Skipped when the ImmutableDB
+        // is empty (fresh node: the volatile chain is anchored at genesis,
+        // not at an immutable tip).
+        if let Some((_, anchor_hash, _)) = immutable_tip {
+            let pruned = volatile.prune_unreachable_from(&anchor_hash);
+            if pruned > 0 {
+                warn!(
+                    pruned,
+                    anchor = %anchor_hash.to_hex(),
+                    "VolatileDB: pruned blocks unreachable from the immutable tip \
+                     (crash-recovery validation); they will be re-fetched from peers"
+                );
+            }
+        }
 
         debug!(
             volatile_blocks = volatile.len(),
