@@ -2171,12 +2171,20 @@ impl Node {
                 .clone()
                 .unwrap_or_default(),
         );
+        // Stability window in seconds (sgen × slot_length_secs).  Used to
+        // decide whether a no-marker tip is "recent" enough to skip
+        // PreSyncing and start directly in Syncing (issue #757: Mithril
+        // snapshot bootstrap stalls k blocks short of live tip because
+        // PreSyncing LoE caps selection at k and BLPs never arrive in time).
+        let syncing_startup_threshold_secs =
+            (genesis_params.sgen_slots as f64 * genesis_params.slot_length_secs) as u64;
         let gsm_config = crate::gsm::GsmConfig {
             min_active_blp: genesis_params.min_big_ledger_peers,
             gdd_rate_limit_ms: (genesis_params.options.effective_gdd_rate_limit_secs() * 1000.0)
                 .max(1.0) as u64,
             security_param_k: genesis_params.security_param_k,
             marker_path: args.database_path.join("caught_up.marker"),
+            syncing_startup_threshold_secs,
             ..Default::default()
         };
         // The LoE handed to chain selection. Initial value mirrors Haskell's
@@ -2257,11 +2265,38 @@ impl Node {
         let peer_registry = crate::genesis_peer_state::PeerStateRegistry::new();
         // Compute the initial snapshot so consumers have the right state
         // before the actor has even started.
+        //
+        // For the no-marker Syncing path (issue #757): estimate the tip age
+        // from the tip slot and shelley genesis system_start, using the same
+        // threshold as the GSM actor so the initial snapshot is consistent.
         let initial_gsm_state = if genesis_enabled {
             if gsm_config.marker_path.exists() {
                 crate::gsm::GenesisSyncState::CaughtUp
             } else {
-                crate::gsm::GenesisSyncState::PreSyncing
+                // Estimate tip age: system_start + tip_slot × slot_length_ms.
+                let tip_age_secs: Option<u64> = shelley_genesis.as_ref().and_then(|sg| {
+                    chrono::DateTime::parse_from_rfc3339(&sg.system_start)
+                        .ok()
+                        .map(|t| {
+                            let tip_wallclock_ms = t.timestamp_millis().max(0) as u64
+                                + initial_tip_slot * sg.slot_length.saturating_mul(1000);
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+                            now_ms.saturating_sub(tip_wallclock_ms) / 1000
+                        })
+                });
+                let recent = matches!(
+                    tip_age_secs,
+                    Some(age) if gsm_config.syncing_startup_threshold_secs > 0
+                        && age < gsm_config.syncing_startup_threshold_secs
+                );
+                if recent {
+                    crate::gsm::GenesisSyncState::Syncing
+                } else {
+                    crate::gsm::GenesisSyncState::PreSyncing
+                }
             }
         } else {
             crate::gsm::GenesisSyncState::CaughtUp

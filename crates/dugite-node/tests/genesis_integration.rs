@@ -60,6 +60,7 @@ fn spawn_governor(
         security_param_k: 2,
         marker_path: std::env::temp_dir()
             .join(format!("gi-{}-{enabled}.marker", std::process::id())),
+        ..Default::default()
     };
     let _ = std::fs::remove_file(&config.marker_path);
     let (event_tx, event_rx) = mpsc::channel(256);
