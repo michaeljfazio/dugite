@@ -174,3 +174,105 @@ the run with a documented known-constant offset (T-drift grows ~534–586 ADA/ep
 *Method artifacts: Koios pulls in `/tmp/koios_totals_all.json`, `/tmp/koios_epochinfo_340_445.json`;
 model script inline in this session. Logs consulted: `logs/mainnet-val{,2-8,10-24}.log` (val9 = live,
 header/tail only). No node, DB, or crate sources were modified.*
+
+---
+
+## #755 live-code-path verdict
+
+**Date:** 2026-06-12 · **Verdict: (b) ALREADY CLOSED — STATE ARTIFACT, NOT A LIVE DEFECT**
+
+### Investigation scope
+
+Examined the following code paths in `crates/dugite-ledger/src/`:
+
+- `state/apply.rs` — `rupd_addrs_rew` capture gate (the `fvAddrsRew` startStep freeze)
+- `state/rewards.rs` — `compute_reward_update` (the RUPD formula, `registered_at_startstep` closure)
+- `state/epoch.rs` — `process_epoch_transition` (test-only path, confirms RUPD input wiring)
+- `eras/conway.rs` — `process_epoch_transition` (live path, lines 586–636)
+- `eras/shelley.rs` — `process_epoch_transition` (Shelley–Babbage live path)
+- `state/snapshot_format.rs` — `LedgerStateSnapshot` (bincode wire format, v22)
+- `state/substates.rs` — `EpochSubState` and `EpochSnapshots` struct definitions
+- `state/snapshot.rs` — `SNAPSHOT_VERSION = 22`, save/load entry points
+
+### Why ep388 is NOT a pv≤6 / #736-class bug
+
+At mainnet epoch 388 (Conway, `prev_protocol_version_major = 7`):
+
+1. **`rupd_addrs_rew` is never captured.** The freeze gate in `state/apply.rs` is:
+   ```rust
+   if block.era != Era::Byron
+       && self.epochs.prev_protocol_version_major <= 6  // pv7+ → gate fails
+       && self.epochs.rupd_addrs_rew.is_none()
+   ```
+   Conway epochs have `prev_pv = 7`; the gate never fires → field stays `None`.
+
+2. **The `#736` fix (`40db083021`, 2026-06-11 18:09 UTC) only matters for pv≤6.**
+   The commit added persistence of `rupd_addrs_rew` + `pending_avvm_return`. Both
+   are inert at pv≥7: `rupd_addrs_rew` is `None` and `pending_avvm_return` is 0.
+   Protection against a 337→338-class treasury shortfall is complete. No gap at ep388.
+
+3. **The `eed333984a` (#736-class) freeze-gate fix is also pv≤6 scoped.** It corrected
+   the gate from `cur_pv` to `prev_pv` to catch the pv6→pv7 transition epoch (mainnet
+   ep365: treasury short 857,600,586 lovelace). Irrelevant for Conway ep388.
+
+### What the live code serializes for Conway RUPD inputs
+
+`EpochSnapshots` (via `#[derive(Serialize, Deserialize)]`, embedded as `snapshots: EpochSnapshots`
+in `LedgerStateSnapshot`) carries all three Conway RUPD inputs byte-exact across save/restore:
+
+| RUPD input (Haskell name) | Dugite field | Persisted? |
+|---|---|---|
+| `ssStakeGo` (stake 2 epochs ago) | `epochs.snapshots.go` | Yes — inside `EpochSnapshots` |
+| `nesBprev` (blocks 1 epoch ago) | `epochs.snapshots.bprev_blocks_by_pool` | Yes — inside `EpochSnapshots` |
+| `ssFee` (fees from last SNAP) | `epochs.snapshots.ss_fee` | Yes — inside `EpochSnapshots` |
+| `prevPParams` (rho/tau/a0/n_opt) | `epochs.prev_protocol_params` | Yes — direct field in snapshot |
+
+`pending_avvm_return` = 0 and `rupd_addrs_rew` = `None` for all Conway epochs — confirmed
+to round-trip correctly (None→None, 0→0).
+
+### Closing commits
+
+| Commit | Fix | Relevance |
+|---|---|---|
+| `40db083021` (2026-06-11 18:09) | Persist `rupd_addrs_rew` + `pending_avvm_return` (#736) | Closed pv≤6 restart-during-RUPD path; inert at ep388 |
+| `eed333984a` (2026-06-12 00:18) | Fix freeze gate to use `prev_pv` not `cur_pv` (#736-class) | Closed pv6→pv7 transition epoch (mainnet ep365); inert at ep388 |
+
+Neither commit was in the val12 binary (v8 ≈ `f2a87d81e7`, compiled before 18:09 UTC Jun 11).
+But both are pv≤6-scoped — they would not have changed the ep388 reward calculation regardless.
+
+### Why the ep388 injection must be a state artifact
+
+The only live code changes that could produce a `+996,138 ADA total_allocated` overshoot with
+treasury byte-exact are:
+
+- **Corrupted `go.pool_stake` or `go.delegations`** — inflated pool stake raises `max_pool` and
+  thus `pool_reward` for every participating pool, while leaving the `treasury_cut` formula
+  (`tau × expansion`) untouched (treasury-exact).
+- **Corrupted `bprev_blocks_by_pool`** — incorrect block attribution raises `pool_reward` via
+  the performance term, again leaving `tau × expansion` intact.
+- **Corrupted `prev_protocol_params.rho` or `prev_protocol_params.tau`** — changes both reserves
+  drain AND treasury cut simultaneously; inconsistent with treasury exactness.
+
+Options 1 and 2 fit the fingerprint signature (reserves short, treasury exact). Both fields are
+inside `EpochSnapshots`, which has been serialized correctly since well before val12. The mutation
+must have occurred in-memory in the v8 binary during the 2-minute window between the snapshot
+restore and the ep388→389 boundary crossing, or in a snapshot already produced by an upstream
+session (val11 at v7 / `33923f8aa3`/`1c8afcd27d`). No code change after v8 and before v2.0.5
+touches these fields or their serialization.
+
+**v2.0.5+ has run 60+ clean boundaries (including 6 across mid-epoch restarts) with sub-ADA
+pots-drift model precision. The live code path is confirmed clean.**
+
+### Regression test added
+
+`crates/dugite-ledger/src/state/snapshot_format.rs::tests::test_conway_rupd_inputs_survive_snapshot_roundtrip`
+
+Verifies:
+- (A) `rupd_addrs_rew` stays `None` after Conway snapshot round-trip (pv≥7, prefilter bypassed)
+- (B) `go` snapshot — epoch, pool_stake, delegations, stake_distribution — survives byte-exact
+- (C) `bprev_blocks_by_pool` and `bprev_block_count` survive byte-exact
+- (D) `ss_fee` (treasury-cut input) survives byte-exact
+- (E) `prev_protocol_params` (rho/tau/a0/n_opt/prev_d) survive byte-exact
+- (F) `pending_avvm_return` = 0 for Conway (Shelley→Allegra AVVM is historical)
+
+Test passes: `1559/1559` in `cargo nextest run -p dugite-ledger`. Clippy clean.
