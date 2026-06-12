@@ -3710,15 +3710,27 @@ pub fn validate_transaction_with_pools(
         // Rule 11b: redeemer index bounds
         collateral::check_collateral(tx, utxo_set, params, &mut errors);
 
-        // Rule 11c: every script-locked input/withdrawal and every Plutus minting
-        // policy must have a matching redeemer (Spend / Reward / Mint respectively).
-        // Matches Haskell's `scriptsNeeded` check.
-        collateral::check_script_redeemers(tx, utxo_set, &mut errors);
+        // Rule 11c: every Plutus-script-locked input/withdrawal and every Plutus
+        // minting policy must have a matching redeemer (Spend/Reward/Mint).
+        // Native-script-locked inputs are exempt.  Matches Haskell's
+        // `hasExactSetOfRedeemers` / `neededPlutusSet` filter.
+        let script_versions_for_redeemers = collateral::plutus_script_version_map(tx, utxo_set);
+        collateral::check_script_redeemers(
+            tx,
+            utxo_set,
+            &script_versions_for_redeemers,
+            &mut errors,
+        );
 
         // Alonzo UTXOW: every redeemer in the witness set must map to a valid
         // script purpose. Redeemers with no matching purpose are rejected.
         // Matches Haskell's `hasExactSetOfRedeemers` / `ExtraRedeemers`.
-        collateral::check_extra_redeemers(tx, utxo_set, &mut errors);
+        collateral::check_extra_redeemers(
+            tx,
+            utxo_set,
+            &script_versions_for_redeemers,
+            &mut errors,
+        );
 
         // Rule 12: script data hash (mkScriptIntegrity) — covers redeemers,
         // datums, cost models, and language versions.

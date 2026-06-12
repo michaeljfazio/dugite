@@ -244,18 +244,30 @@ fn check_redeemer_indices(tx: &Transaction, errors: &mut Vec<ValidationError>) {
     }
 }
 
-/// Rule 11c: Every script-locked spending input, script-locked withdrawal, and
-/// Plutus minting policy must have a matching redeemer of the appropriate tag.
+/// Rule 11c: Every Plutus-script-locked spending input, script-locked withdrawal,
+/// and Plutus minting policy must have a matching redeemer of the appropriate tag.
 ///
-/// Matches Haskell's `scriptsNeeded` which requires:
-/// - A `Spend` redeemer at the sorted index for each script-locked input.
+/// Matches Haskell's `hasExactSetOfRedeemers` which requires:
+/// - A `Spend` redeemer at the sorted index for each **Plutus**-script-locked input.
+///   Native-script-locked inputs are exempt — Haskell's `hasExactSetOfRedeemers`
+///   filters `scriptsNeeded` through `scriptsProvided` and only keeps entries where
+///   `Map.lookup sh provided == Just (PlutusScript _)` before checking for a
+///   matching redeemer.  Native scripts (`NativeScript _`) are silently excluded.
+///   Reference: `eras/alonzo/impl/src/Cardano/Ledger/Alonzo/Rules/Utxow.hs`,
+///   `hasExactSetOfRedeemers`, `neededPlutusSet` filter.
 /// - A `Reward` redeemer at the sorted index for each script-locked withdrawal
 ///   (reward address whose stake credential is a script hash).
 /// - A `Mint` redeemer at the sorted index for each Plutus minting policy (a
 ///   policy ID that matches a script in the witness set or reference inputs).
+///
+/// `script_versions` maps each Plutus script hash (from witness set and reference
+/// inputs) to its language version (1=V1, 2=V2, 3=V3).  A hash absent from this
+/// map (version == 0) is a native script and does NOT require a Spend redeemer.
+/// Build it via [`plutus_script_version_map`].
 pub(crate) fn check_script_redeemers(
     tx: &Transaction,
     utxo_set: &dyn UtxoLookup,
+    script_versions: &HashMap<Hash28, u8>,
     errors: &mut Vec<ValidationError>,
 ) {
     let body = &tx.body;
@@ -281,29 +293,51 @@ pub(crate) fn check_script_redeemers(
 
     for (idx, input) in sorted_inputs.iter().enumerate() {
         if let Some(utxo) = utxo_set.lookup(input) {
-            let is_script_locked = match &utxo.address {
+            // Extract the script hash from the payment credential, if any.
+            // Inputs locked by a key credential never require a Spend redeemer.
+            let script_hash: Option<&Hash28> = match &utxo.address {
                 dugite_primitives::address::Address::Base(b) => {
-                    matches!(
-                        b.payment,
-                        dugite_primitives::credentials::Credential::Script(_)
-                    )
+                    if let dugite_primitives::credentials::Credential::Script(h) = &b.payment {
+                        Some(h)
+                    } else {
+                        None
+                    }
                 }
                 dugite_primitives::address::Address::Enterprise(e) => {
-                    matches!(
-                        e.payment,
-                        dugite_primitives::credentials::Credential::Script(_)
-                    )
+                    if let dugite_primitives::credentials::Credential::Script(h) = &e.payment {
+                        Some(h)
+                    } else {
+                        None
+                    }
                 }
                 dugite_primitives::address::Address::Pointer(p) => {
-                    matches!(
-                        p.payment,
-                        dugite_primitives::credentials::Credential::Script(_)
-                    )
+                    if let dugite_primitives::credentials::Credential::Script(h) = &p.payment {
+                        Some(h)
+                    } else {
+                        None
+                    }
                 }
-                _ => false,
+                _ => None,
             };
-            if is_script_locked && !spend_indices.contains(&(idx as u32)) {
-                errors.push(ValidationError::MissingSpendRedeemer { index: idx as u32 });
+            // A Spend redeemer is required only when the locking script is a
+            // PLUTUS script (version ≥ 1 in `script_versions`).  Native scripts
+            // (absent from the map → version 0) are authenticated by their script
+            // witness alone and never need a redeemer.
+            //
+            // Haskell: `hasExactSetOfRedeemers` computes
+            //   `neededPlutusSet = [(purpose, sh) | (purpose, sh) <- scriptsNeeded
+            //                                     , Map.lookup sh provided == Just (PlutusScript _)]`
+            // so native-script entries in `scriptsNeeded` are silently dropped
+            // from the redeemer requirement set.
+            //
+            // Reference: IntersectMBO/cardano-ledger,
+            // eras/alonzo/impl/src/Cardano/Ledger/Alonzo/Rules/Utxow.hs,
+            // `hasExactSetOfRedeemers`, `neededPlutusSet` filter.
+            if let Some(sh) = script_hash {
+                let version = script_versions.get(sh).copied().unwrap_or(0);
+                if version > 0 && !spend_indices.contains(&(idx as u32)) {
+                    errors.push(ValidationError::MissingSpendRedeemer { index: idx as u32 });
+                }
             }
         }
     }
@@ -316,7 +350,18 @@ pub(crate) fn check_script_redeemers(
     //
     // A reward address is script-locked when the header nibble is 0xF
     // (i.e., bit 4 of the header byte is set), indicating a script stake
-    // credential.
+    // credential.  A Reward redeemer is required ONLY when that script
+    // credential is a PLUTUS script (version ≥ 1 in `script_versions`).
+    // Native-script reward accounts never require a Reward redeemer.
+    //
+    // Haskell: `hasExactSetOfRedeemers` builds `redeemersNeeded` by filtering
+    // `getScriptsNeeded txb utxo` through `scriptsProvided` and keeping only
+    // entries where the resolved script is `PlutusScript _`.  Native-script
+    // withdrawals are present in `getScriptsNeeded` but dropped by the filter.
+    //
+    // Reference: IntersectMBO/cardano-ledger,
+    // eras/alonzo/impl/src/Cardano/Ledger/Alonzo/Rules/Utxow.hs,
+    // `hasExactSetOfRedeemers`, `neededPlutusSet` filter.
     let reward_indices: HashSet<u32> = tx
         .witness_set
         .redeemers
@@ -332,13 +377,21 @@ pub(crate) fn check_script_redeemers(
         let header = reward_addr[0];
         // Bit 4 of the header distinguishes script (1) from key (0) credentials.
         // 0xE0/0xE1 = key stake credential (no redeemer required)
-        // 0xF0/0xF1 = script stake credential (Reward redeemer required)
+        // 0xF0/0xF1 = script stake credential → check if it is a Plutus script.
         let is_script_credential = (header & 0x10) != 0;
-        if is_script_credential && !reward_indices.contains(&(idx as u32)) {
-            errors.push(ValidationError::MissingRedeemer {
-                tag: "Reward".to_string(),
-                index: idx as u32,
-            });
+        if !is_script_credential {
+            continue;
+        }
+        // Extract the 28-byte script hash from bytes 1..29.
+        if let Ok(hash_arr) = <[u8; 28]>::try_from(&reward_addr[1..29]) {
+            let sh = Hash28::from_bytes(hash_arr);
+            let version = script_versions.get(&sh).copied().unwrap_or(0);
+            if version > 0 && !reward_indices.contains(&(idx as u32)) {
+                errors.push(ValidationError::MissingRedeemer {
+                    tag: "Reward".to_string(),
+                    index: idx as u32,
+                });
+            }
         }
     }
 
@@ -442,9 +495,17 @@ pub(crate) fn check_script_redeemers(
             | Certificate::MoveInstantaneousRewards { .. } => None,
         };
 
-        // A redeemer is only required when the extracted credential is a script hash.
-        if let Some(Credential::Script(_)) = script_cred {
-            if !cert_indices.contains(&(idx as u32)) {
+        // A redeemer is only required when the extracted credential is a
+        // PLUTUS script (version ≥ 1 in `script_versions`).  Native-script
+        // credentials that appear in `conwayCertsNeeded` are dropped by the
+        // same Plutus filter in Haskell's `hasExactSetOfRedeemers`.
+        //
+        // Reference: IntersectMBO/cardano-ledger,
+        // eras/alonzo/impl/src/Cardano/Ledger/Alonzo/Rules/Utxow.hs,
+        // `hasExactSetOfRedeemers`, `neededPlutusSet` filter.
+        if let Some(Credential::Script(sh)) = script_cred {
+            let version = script_versions.get(sh).copied().unwrap_or(0);
+            if version > 0 && !cert_indices.contains(&(idx as u32)) {
                 errors.push(ValidationError::MissingRedeemer {
                     tag: "Cert".to_string(),
                     index: idx as u32,
@@ -481,19 +542,29 @@ pub(crate) fn check_script_redeemers(
         .collect();
 
     for (idx, voter) in body.voting_procedures.keys().enumerate() {
-        // Extract the script credential from voters that can carry one.
+        // Extract the script hash from voters that can carry a script credential.
         // `StakePool` voters are pool key hashes, never scripts.
-        let is_script_voter = match voter {
-            Voter::ConstitutionalCommittee(cred) | Voter::DRep(cred) => {
-                matches!(cred, Credential::Script(_))
-            }
-            Voter::StakePool(_) => false,
+        // A Vote redeemer is required ONLY when the voter's script is a PLUTUS
+        // script (version ≥ 1 in `script_versions`).  Native-script voters
+        // (absent from the map → version 0) are authenticated by including the
+        // script witness alone and never need a redeemer.
+        //
+        // Reference: IntersectMBO/cardano-ledger,
+        // eras/alonzo/impl/src/Cardano/Ledger/Alonzo/Rules/Utxow.hs,
+        // `hasExactSetOfRedeemers`, `neededPlutusSet` filter.
+        let script_hash: Option<&Hash28> = match voter {
+            Voter::ConstitutionalCommittee(Credential::Script(h))
+            | Voter::DRep(Credential::Script(h)) => Some(h),
+            _ => None,
         };
-        if is_script_voter && !vote_indices.contains(&(idx as u32)) {
-            errors.push(ValidationError::MissingRedeemer {
-                tag: "Vote".to_string(),
-                index: idx as u32,
-            });
+        if let Some(sh) = script_hash {
+            let version = script_versions.get(sh).copied().unwrap_or(0);
+            if version > 0 && !vote_indices.contains(&(idx as u32)) {
+                errors.push(ValidationError::MissingRedeemer {
+                    tag: "Vote".to_string(),
+                    index: idx as u32,
+                });
+            }
         }
     }
 
@@ -534,11 +605,23 @@ pub(crate) fn check_script_redeemers(
 
 /// Check for extra redeemers (Haskell `hasExactSetOfRedeemers`).
 ///
-/// Every redeemer in the witness set must correspond to a valid script
+/// Every redeemer in the witness set must correspond to a valid PLUTUS-script
 /// purpose. Redeemers with no matching purpose are reported as extra.
+///
+/// Haskell's `hasExactSetOfRedeemers` requires the supplied redeemer set to
+/// EXACTLY equal `redeemersNeeded`, where `redeemersNeeded` is built by
+/// filtering `getScriptsNeeded` through `scriptsProvided` and retaining only
+/// entries resolved to `PlutusScript _`.  This means a redeemer pointing at a
+/// NATIVE-script purpose (Spend/Reward/Cert/Vote) is reported as `ExtraRedeemers`
+/// even though the native script itself is valid.
+///
+/// `script_versions` maps each Plutus script hash available to this transaction
+/// (from witness set and reference inputs) to its version (1=V1, 2=V2, 3=V3).
+/// Build it via [`plutus_script_version_map`].
 pub(crate) fn check_extra_redeemers(
     tx: &Transaction,
     utxo_set: &dyn UtxoLookup,
+    script_versions: &HashMap<Hash28, u8>,
     errors: &mut Vec<ValidationError>,
 ) {
     let body = &tx.body;
@@ -546,7 +629,9 @@ pub(crate) fn check_extra_redeemers(
     // Build the set of valid (tag_byte, index) pairs.
     let mut valid_purposes: HashSet<(u8, u32)> = HashSet::new();
 
-    // Spend: script-locked inputs (sorted by TxIn)
+    // Spend: PLUTUS-script-locked inputs only (sorted by TxIn).
+    // A redeemer for a native-script-locked input is extra (not in
+    // `redeemersNeeded`), matching Haskell's `hasExactSetOfRedeemers`.
     let mut sorted_inputs: Vec<_> = body.inputs.iter().collect();
     sorted_inputs.sort_by(|a, b| {
         a.transaction_id
@@ -555,20 +640,35 @@ pub(crate) fn check_extra_redeemers(
     });
     for (idx, input) in sorted_inputs.iter().enumerate() {
         if let Some(utxo) = utxo_set.lookup(input) {
-            let is_script_locked = match &utxo.address {
+            let script_hash: Option<&Hash28> = match &utxo.address {
                 dugite_primitives::address::Address::Base(b) => {
-                    matches!(b.payment, Credential::Script(_))
+                    if let Credential::Script(h) = &b.payment {
+                        Some(h)
+                    } else {
+                        None
+                    }
                 }
                 dugite_primitives::address::Address::Enterprise(e) => {
-                    matches!(e.payment, Credential::Script(_))
+                    if let Credential::Script(h) = &e.payment {
+                        Some(h)
+                    } else {
+                        None
+                    }
                 }
                 dugite_primitives::address::Address::Pointer(p) => {
-                    matches!(p.payment, Credential::Script(_))
+                    if let Credential::Script(h) = &p.payment {
+                        Some(h)
+                    } else {
+                        None
+                    }
                 }
-                _ => false,
+                _ => None,
             };
-            if is_script_locked {
-                valid_purposes.insert((0, idx as u32));
+            // Only Plutus script hashes (version ≥ 1) count as valid Spend purposes.
+            if let Some(sh) = script_hash {
+                if script_versions.get(sh).copied().unwrap_or(0) > 0 {
+                    valid_purposes.insert((0, idx as u32));
+                }
             }
         }
     }
@@ -581,51 +681,94 @@ pub(crate) fn check_extra_redeemers(
         }
     }
 
-    // Cert: script-credential certificates
+    // Cert: PLUTUS-script-credential certificates only.
     // CBOR redeemer_tag = 2 (Cardano CDDL: 0=spend,1=mint,2=cert,3=reward).
+    // Native-script cert credentials are not in `redeemersNeeded`; a Cert
+    // redeemer for them is extra.
     for (idx, cert) in body.certificates.iter().enumerate() {
-        let script_cred: Option<&Credential> = match cert {
-            Certificate::StakeDeregistration(c) => Some(c),
-            Certificate::StakeDelegation { credential: c, .. } => Some(c),
-            Certificate::ConwayStakeDeregistration { credential: c, .. } => Some(c),
-            Certificate::VoteDelegation { credential: c, .. } => Some(c),
-            Certificate::StakeVoteDelegation { credential: c, .. } => Some(c),
-            Certificate::RegStakeDeleg { credential: c, .. } => Some(c),
-            Certificate::RegStakeVoteDeleg { credential: c, .. } => Some(c),
-            Certificate::VoteRegDeleg { credential: c, .. } => Some(c),
+        let script_hash: Option<&Hash28> = match cert {
+            Certificate::StakeDeregistration(Credential::Script(h)) => Some(h),
+            Certificate::StakeDelegation {
+                credential: Credential::Script(h),
+                ..
+            } => Some(h),
+            Certificate::ConwayStakeDeregistration {
+                credential: Credential::Script(h),
+                ..
+            } => Some(h),
+            Certificate::VoteDelegation {
+                credential: Credential::Script(h),
+                ..
+            } => Some(h),
+            Certificate::StakeVoteDelegation {
+                credential: Credential::Script(h),
+                ..
+            } => Some(h),
+            Certificate::RegStakeDeleg {
+                credential: Credential::Script(h),
+                ..
+            } => Some(h),
+            Certificate::RegStakeVoteDeleg {
+                credential: Credential::Script(h),
+                ..
+            } => Some(h),
+            Certificate::VoteRegDeleg {
+                credential: Credential::Script(h),
+                ..
+            } => Some(h),
             Certificate::CommitteeHotAuth {
-                cold_credential: c, ..
-            } => Some(c),
+                cold_credential: Credential::Script(h),
+                ..
+            } => Some(h),
             Certificate::CommitteeColdResign {
-                cold_credential: c, ..
-            } => Some(c),
-            Certificate::UnregDRep { credential: c, .. } => Some(c),
-            Certificate::UpdateDRep { credential: c, .. } => Some(c),
+                cold_credential: Credential::Script(h),
+                ..
+            } => Some(h),
+            Certificate::UnregDRep {
+                credential: Credential::Script(h),
+                ..
+            } => Some(h),
+            Certificate::UpdateDRep {
+                credential: Credential::Script(h),
+                ..
+            } => Some(h),
             _ => None,
         };
-        if let Some(Credential::Script(_)) = script_cred {
-            valid_purposes.insert((2, idx as u32));
+        if let Some(sh) = script_hash {
+            if script_versions.get(sh).copied().unwrap_or(0) > 0 {
+                valid_purposes.insert((2, idx as u32));
+            }
         }
     }
 
-    // Reward: script-locked withdrawals
+    // Reward: PLUTUS-script-locked withdrawals only.
     // CBOR redeemer_tag = 3 (Cardano CDDL: 0=spend,1=mint,2=cert,3=reward).
+    // Native-script reward accounts are not in `redeemersNeeded`; a Reward
+    // redeemer for them is extra.
     for (idx, reward_addr) in body.withdrawals.keys().enumerate() {
         if reward_addr.len() >= 29 && (reward_addr[0] & 0x10) != 0 {
-            valid_purposes.insert((3, idx as u32));
+            if let Ok(hash_arr) = <[u8; 28]>::try_from(&reward_addr[1..29]) {
+                let sh = Hash28::from_bytes(hash_arr);
+                if script_versions.get(&sh).copied().unwrap_or(0) > 0 {
+                    valid_purposes.insert((3, idx as u32));
+                }
+            }
         }
     }
 
-    // Vote: script-credential voters
+    // Vote: PLUTUS-script-credential voters only.
+    // Native-script voters are not in `redeemersNeeded`; a Vote redeemer for
+    // them is extra.
     for (idx, voter) in body.voting_procedures.keys().enumerate() {
-        let is_script_voter = match voter {
-            Voter::ConstitutionalCommittee(cred) | Voter::DRep(cred) => {
-                matches!(cred, Credential::Script(_))
-            }
-            Voter::StakePool(_) => false,
+        let script_hash: Option<&Hash28> = match voter {
+            Voter::ConstitutionalCommittee(Credential::Script(h))
+            | Voter::DRep(Credential::Script(h)) => Some(h),
+            _ => None,
         };
-        if is_script_voter {
-            valid_purposes.insert((4, idx as u32));
+        if let Some(sh) = script_hash {
+            if script_versions.get(sh).copied().unwrap_or(0) > 0 {
+                valid_purposes.insert((4, idx as u32));
+            }
         }
     }
 
@@ -986,9 +1129,9 @@ mod tests {
     use dugite_primitives::hash::{Hash28, Hash32};
     use dugite_primitives::protocol_params::ProtocolParameters;
     use dugite_primitives::transaction::{
-        ExUnits, GovActionId, OutputDatum, PlutusData, Redeemer, RedeemerTag, Transaction,
-        TransactionBody, TransactionInput, TransactionOutput, TransactionWitnessSet, Vote, Voter,
-        VotingProcedure,
+        Certificate, ExUnits, GovActionId, OutputDatum, PlutusData, Redeemer, RedeemerTag,
+        Transaction, TransactionBody, TransactionInput, TransactionOutput, TransactionWitnessSet,
+        Vote, Voter, VotingProcedure,
     };
     use dugite_primitives::value::{AssetName, Lovelace, Value};
 
@@ -1553,16 +1696,19 @@ mod tests {
     // Tests for check_extra_redeemers
     // -----------------------------------------------------------------------
 
-    /// A Spend redeemer at index 99 with no corresponding script-locked input
-    /// at that index must produce an `ExtraRedeemer` error.
+    /// A Spend redeemer at index 99 with no corresponding Plutus-script-locked
+    /// input at that index must produce an `ExtraRedeemer` error.
     #[test]
     fn test_extra_redeemer_spend_no_matching_input() {
         use dugite_primitives::address::EnterpriseAddress;
 
-        use super::check_extra_redeemers;
+        use super::{check_extra_redeemers, plutus_script_version_map};
 
-        // One script-locked input at sorted index 0.
-        let script_hash = Hash28::from_bytes([0xAB; 28]);
+        // One Plutus V2-script-locked input at sorted index 0.
+        // The script hash must be derived from an actual V2 script in the
+        // witness set so that `plutus_script_version_map` returns version > 0.
+        let plutus_v2_script = vec![0x55u8, 0xAB, 0xCD]; // synthetic script bytes
+        let script_hash = dugite_primitives::hash::blake2b_224_tagged(2, &plutus_v2_script);
         let inp = TransactionInput {
             transaction_id: Hash32::from_bytes([0x01; 32]),
             index: 0,
@@ -1583,7 +1729,7 @@ mod tests {
             },
         );
 
-        // Redeemer at index 99 — no script-locked input at that position.
+        // Redeemer at index 99 — no Plutus-script-locked input at that position.
         let tx = Transaction {
             hash: Hash32::ZERO,
             era: Era::Conway,
@@ -1619,7 +1765,7 @@ mod tests {
                 native_scripts: vec![],
                 bootstrap_witnesses: vec![],
                 plutus_v1_scripts: vec![],
-                plutus_v2_scripts: vec![],
+                plutus_v2_scripts: vec![plutus_v2_script],
                 plutus_v3_scripts: vec![],
                 plutus_data: vec![],
                 redeemers: vec![Redeemer {
@@ -1642,8 +1788,9 @@ mod tests {
             raw_witness_cbor: None,
         };
 
+        let sv = plutus_script_version_map(&tx, &utxo_set);
         let mut errors: Vec<ValidationError> = Vec::new();
-        check_extra_redeemers(&tx, &utxo_set, &mut errors);
+        check_extra_redeemers(&tx, &utxo_set, &sv, &mut errors);
 
         assert!(
             errors.iter().any(|e| matches!(
@@ -1654,16 +1801,17 @@ mod tests {
         );
     }
 
-    /// A Spend redeemer at the correct index 0 for a script-locked input must
-    /// NOT produce an `ExtraRedeemer` error.
+    /// A Spend redeemer at the correct index 0 for a Plutus-script-locked input
+    /// must NOT produce an `ExtraRedeemer` error.
     #[test]
     fn test_extra_redeemer_spend_valid_index_no_error() {
         use dugite_primitives::address::EnterpriseAddress;
 
-        use super::check_extra_redeemers;
+        use super::{check_extra_redeemers, plutus_script_version_map};
 
-        // Script-locked input — the only input, so it sorts to index 0.
-        let script_hash = Hash28::from_bytes([0xCD; 28]);
+        // Plutus V1-script-locked input — derive hash from the actual script bytes.
+        let plutus_v1_script = vec![0x77u8, 0xCD, 0xEF];
+        let script_hash = dugite_primitives::hash::blake2b_224_tagged(1, &plutus_v1_script);
         let inp = TransactionInput {
             transaction_id: Hash32::from_bytes([0x02; 32]),
             index: 0,
@@ -1684,7 +1832,7 @@ mod tests {
             },
         );
 
-        // Redeemer at index 0 — matches the single script-locked input.
+        // Redeemer at index 0 — matches the single Plutus-script-locked input.
         let tx = Transaction {
             hash: Hash32::ZERO,
             era: Era::Conway,
@@ -1719,7 +1867,7 @@ mod tests {
                 vkey_witnesses: vec![],
                 native_scripts: vec![],
                 bootstrap_witnesses: vec![],
-                plutus_v1_scripts: vec![],
+                plutus_v1_scripts: vec![plutus_v1_script],
                 plutus_v2_scripts: vec![],
                 plutus_v3_scripts: vec![],
                 plutus_data: vec![],
@@ -1743,8 +1891,9 @@ mod tests {
             raw_witness_cbor: None,
         };
 
+        let sv = plutus_script_version_map(&tx, &utxo_set);
         let mut errors: Vec<ValidationError> = Vec::new();
-        check_extra_redeemers(&tx, &utxo_set, &mut errors);
+        check_extra_redeemers(&tx, &utxo_set, &sv, &mut errors);
 
         let extra_errors: Vec<_> = errors
             .iter()
@@ -1835,6 +1984,534 @@ mod tests {
         assert!(
             script_locked_errors.is_empty(),
             "expected no ScriptLockedCollateral errors, got: {script_locked_errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for Reward/Cert/Vote native-script exemption (#758 review follow-up)
+    // -----------------------------------------------------------------------
+
+    // Helper: build a reward address with bit-4 of header set (script stake
+    // credential), embedding 28-byte `hash` at bytes 1..29.
+    fn script_reward_addr(hash: &Hash28) -> Vec<u8> {
+        // Header 0xF0 = script stake credential on mainnet (bit-4 = script).
+        let mut addr = vec![0xF0u8];
+        addr.extend_from_slice(hash.as_bytes());
+        addr
+    }
+
+    // Helper: build a minimal transaction with no inputs/outputs/collateral,
+    // just enough to call check_script_redeemers.
+    fn make_bare_tx(redeemers: Vec<Redeemer>) -> Transaction {
+        Transaction {
+            hash: Hash32::ZERO,
+            era: Era::Conway,
+            body: TransactionBody {
+                inputs: vec![],
+                outputs: vec![],
+                fee: Lovelace(0),
+                ttl: None,
+                certificates: vec![],
+                withdrawals: BTreeMap::new(),
+                auxiliary_data_hash: None,
+                validity_interval_start: None,
+                mint: BTreeMap::new(),
+                script_data_hash: None,
+                collateral: vec![],
+                required_signers: vec![],
+                network_id: None,
+                collateral_return: None,
+                total_collateral: None,
+                reference_inputs: vec![],
+                update: None,
+                voting_procedures: BTreeMap::new(),
+                proposal_procedures: vec![],
+                treasury_value: None,
+                donation: None,
+                sub_transactions: vec![],
+                account_balance_intervals: vec![],
+                direct_deposits: BTreeMap::new(),
+                guards: Vec::new(),
+            },
+            witness_set: TransactionWitnessSet {
+                vkey_witnesses: vec![],
+                native_scripts: vec![],
+                bootstrap_witnesses: vec![],
+                plutus_v1_scripts: vec![],
+                plutus_v2_scripts: vec![],
+                plutus_v3_scripts: vec![],
+                plutus_data: vec![],
+                redeemers,
+                raw_redeemers_cbor: None,
+                raw_plutus_data_cbor: None,
+                original_script_data_hash: None,
+            },
+            is_valid: true,
+            auxiliary_data: None,
+            raw_cbor: None,
+            raw_body_cbor: None,
+            raw_witness_cbor: None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // REWARD — native-script exemption
+    // -----------------------------------------------------------------------
+
+    /// A native-script reward account withdrawal must NOT require a Reward
+    /// redeemer.  The script hash is not in `script_versions`, so version == 0
+    /// and the missing-redeemer check must be skipped.
+    ///
+    /// Haskell: `hasExactSetOfRedeemers` → `neededPlutusSet` filters out
+    /// native-script withdrawals; `getScriptsNeeded` includes them in
+    /// `scriptsNeeded` but the Plutus filter drops them.
+    #[test]
+    fn test_reward_native_script_no_redeemer_required() {
+        use super::{check_script_redeemers, plutus_script_version_map};
+
+        // Native script hash — NOT in the Plutus version map.
+        let native_sh = Hash28::from_bytes([0x10; 28]);
+        let reward_addr = script_reward_addr(&native_sh);
+
+        let utxo = UtxoSet::new();
+        let mut tx = make_bare_tx(vec![]);
+        tx.body
+            .withdrawals
+            .insert(reward_addr, dugite_primitives::value::Lovelace(0));
+
+        // script_versions is empty: native_sh has no entry → version 0.
+        let sv = plutus_script_version_map(&tx, &utxo);
+        assert!(sv.is_empty());
+
+        let mut errors: Vec<ValidationError> = Vec::new();
+        check_script_redeemers(&tx, &utxo, &sv, &mut errors);
+
+        let reward_errors: Vec<_> = errors
+            .iter()
+            .filter(
+                |e| matches!(e, ValidationError::MissingRedeemer { tag, .. } if tag == "Reward"),
+            )
+            .collect();
+        assert!(
+            reward_errors.is_empty(),
+            "native-script reward account must NOT require Reward redeemer; got: {reward_errors:?}"
+        );
+    }
+
+    /// A Plutus-script reward account withdrawal WITHOUT a Reward redeemer
+    /// must still emit `MissingRedeemer{tag:"Reward",index:0}`.
+    #[test]
+    fn test_reward_plutus_script_missing_redeemer_errors() {
+        use super::{check_script_redeemers, plutus_script_version_map};
+
+        // Plutus V2 script — derive hash so it appears in script_versions.
+        let plutus_script = vec![0x20u8, 0x21, 0x22];
+        let plutus_sh = dugite_primitives::hash::blake2b_224_tagged(2, &plutus_script);
+        let reward_addr = script_reward_addr(&plutus_sh);
+
+        let utxo = UtxoSet::new();
+        let mut tx = make_bare_tx(vec![]);
+        tx.witness_set.plutus_v2_scripts = vec![plutus_script];
+        tx.body
+            .withdrawals
+            .insert(reward_addr, dugite_primitives::value::Lovelace(0));
+
+        let sv = plutus_script_version_map(&tx, &utxo);
+        assert_eq!(sv.get(&plutus_sh).copied(), Some(2));
+
+        // No Reward redeemer supplied.
+        let mut errors: Vec<ValidationError> = Vec::new();
+        check_script_redeemers(&tx, &utxo, &sv, &mut errors);
+
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::MissingRedeemer { tag, index: 0 } if tag == "Reward"
+            )),
+            "Plutus-script reward account without Reward redeemer must error; got: {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // CERT — native-script exemption
+    // -----------------------------------------------------------------------
+
+    /// A certificate with a native-script stake credential must NOT require a
+    /// Cert redeemer.
+    ///
+    /// Haskell: `conwayCertsNeeded` includes script-credential certs in
+    /// `scriptsNeeded`, but `hasExactSetOfRedeemers`'s `neededPlutusSet`
+    /// filter drops entries resolved to `NativeScript _`.
+    #[test]
+    fn test_cert_native_script_no_redeemer_required() {
+        use super::{check_script_redeemers, plutus_script_version_map};
+
+        // Native script credential — NOT in script_versions.
+        let native_sh = Hash28::from_bytes([0x30; 28]);
+
+        let utxo = UtxoSet::new();
+        let mut tx = make_bare_tx(vec![]);
+        // StakeDeregistration with native-script credential.
+        tx.body.certificates = vec![Certificate::StakeDeregistration(Credential::Script(
+            native_sh,
+        ))];
+
+        // script_versions empty → native_sh version == 0.
+        let sv = plutus_script_version_map(&tx, &utxo);
+
+        let mut errors: Vec<ValidationError> = Vec::new();
+        check_script_redeemers(&tx, &utxo, &sv, &mut errors);
+
+        let cert_errors: Vec<_> = errors
+            .iter()
+            .filter(|e| matches!(e, ValidationError::MissingRedeemer { tag, .. } if tag == "Cert"))
+            .collect();
+        assert!(
+            cert_errors.is_empty(),
+            "native-script cert credential must NOT require Cert redeemer; got: {cert_errors:?}"
+        );
+    }
+
+    /// A certificate with a Plutus-script credential WITHOUT a Cert redeemer
+    /// must emit `MissingRedeemer{tag:"Cert",index:0}`.
+    #[test]
+    fn test_cert_plutus_script_missing_redeemer_errors() {
+        use super::{check_script_redeemers, plutus_script_version_map};
+
+        let plutus_script = vec![0x30u8, 0x31, 0x32];
+        let plutus_sh = dugite_primitives::hash::blake2b_224_tagged(1, &plutus_script);
+
+        let utxo = UtxoSet::new();
+        let mut tx = make_bare_tx(vec![]);
+        tx.witness_set.plutus_v1_scripts = vec![plutus_script];
+        tx.body.certificates = vec![Certificate::StakeDeregistration(Credential::Script(
+            plutus_sh,
+        ))];
+
+        let sv = plutus_script_version_map(&tx, &utxo);
+        assert_eq!(sv.get(&plutus_sh).copied(), Some(1));
+
+        // No Cert redeemer supplied.
+        let mut errors: Vec<ValidationError> = Vec::new();
+        check_script_redeemers(&tx, &utxo, &sv, &mut errors);
+
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::MissingRedeemer { tag, index: 0 } if tag == "Cert"
+            )),
+            "Plutus-script cert credential without Cert redeemer must error; got: {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // VOTE — native-script exemption
+    // -----------------------------------------------------------------------
+
+    /// A DRep voter with a native-script credential must NOT require a Vote
+    /// redeemer.
+    ///
+    /// Haskell: `conwayVotesNeeded` includes script-credential voters, but
+    /// `hasExactSetOfRedeemers`'s Plutus filter drops native-script entries.
+    #[test]
+    fn test_vote_native_script_no_redeemer_required() {
+        use super::{check_script_redeemers, plutus_script_version_map};
+
+        // Native script credential for a DRep voter — NOT in script_versions.
+        let native_sh = Hash28::from_bytes([0x50; 28]);
+        let drep_voter = Voter::DRep(Credential::Script(native_sh));
+        let dummy_proc = VotingProcedure {
+            vote: Vote::Yes,
+            anchor: None,
+        };
+        let dummy_action = GovActionId {
+            transaction_id: Hash32::ZERO,
+            action_index: 0,
+        };
+
+        let utxo = UtxoSet::new();
+        let mut tx = make_bare_tx(vec![]);
+        tx.body
+            .voting_procedures
+            .entry(drep_voter)
+            .or_default()
+            .insert(dummy_action, dummy_proc);
+
+        let sv = plutus_script_version_map(&tx, &utxo);
+
+        let mut errors: Vec<ValidationError> = Vec::new();
+        check_script_redeemers(&tx, &utxo, &sv, &mut errors);
+
+        let vote_errors: Vec<_> = errors
+            .iter()
+            .filter(|e| matches!(e, ValidationError::MissingRedeemer { tag, .. } if tag == "Vote"))
+            .collect();
+        assert!(
+            vote_errors.is_empty(),
+            "native-script DRep voter must NOT require Vote redeemer; got: {vote_errors:?}"
+        );
+    }
+
+    /// A DRep voter with a Plutus-script credential WITHOUT a Vote redeemer
+    /// must emit `MissingRedeemer{tag:"Vote",index:0}`.
+    #[test]
+    fn test_vote_plutus_script_missing_redeemer_errors() {
+        use super::{check_script_redeemers, plutus_script_version_map};
+
+        let plutus_script = vec![0x50u8, 0x51, 0x52];
+        let plutus_sh = dugite_primitives::hash::blake2b_224_tagged(3, &plutus_script);
+        let drep_voter = Voter::DRep(Credential::Script(plutus_sh));
+        let dummy_proc = VotingProcedure {
+            vote: Vote::No,
+            anchor: None,
+        };
+        let dummy_action = GovActionId {
+            transaction_id: Hash32::ZERO,
+            action_index: 0,
+        };
+
+        let utxo = UtxoSet::new();
+        let mut tx = make_bare_tx(vec![]);
+        tx.witness_set.plutus_v3_scripts = vec![plutus_script];
+        tx.body
+            .voting_procedures
+            .entry(drep_voter)
+            .or_default()
+            .insert(dummy_action, dummy_proc);
+
+        let sv = plutus_script_version_map(&tx, &utxo);
+        assert_eq!(sv.get(&plutus_sh).copied(), Some(3));
+
+        // No Vote redeemer supplied.
+        let mut errors: Vec<ValidationError> = Vec::new();
+        check_script_redeemers(&tx, &utxo, &sv, &mut errors);
+
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::MissingRedeemer { tag, index: 0 } if tag == "Vote"
+            )),
+            "Plutus-script DRep voter without Vote redeemer must error; got: {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // check_extra_redeemers — native-script purposes must be ExtraRedeemers
+    // -----------------------------------------------------------------------
+
+    /// A Reward redeemer pointing at a native-script withdrawal must be flagged
+    /// as `ExtraRedeemer`, because native-script purposes are NOT in
+    /// `redeemersNeeded` (Haskell `hasExactSetOfRedeemers` exact-set check).
+    #[test]
+    fn test_extra_redeemer_native_script_reward_is_extra() {
+        use super::{check_extra_redeemers, plutus_script_version_map};
+
+        // Native script reward account — NOT in script_versions.
+        let native_sh = Hash28::from_bytes([0x60; 28]);
+        let reward_addr = script_reward_addr(&native_sh);
+
+        let utxo = UtxoSet::new();
+        let mut tx = make_bare_tx(vec![Redeemer {
+            tag: RedeemerTag::Reward,
+            index: 0,
+            data: PlutusData::Integer(num_bigint::BigInt::from(0i128)),
+            ex_units: ExUnits { mem: 1, steps: 1 },
+        }]);
+        tx.body
+            .withdrawals
+            .insert(reward_addr, dugite_primitives::value::Lovelace(0));
+
+        // script_versions empty → native_sh version 0 → index 0 NOT a valid purpose.
+        let sv = plutus_script_version_map(&tx, &utxo);
+
+        let mut errors: Vec<ValidationError> = Vec::new();
+        check_extra_redeemers(&tx, &utxo, &sv, &mut errors);
+
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::ExtraRedeemer { tag, index: 0 } if tag == "Reward"
+            )),
+            "Reward redeemer for native-script withdrawal must be ExtraRedeemer; got: {errors:?}"
+        );
+    }
+
+    /// A Cert redeemer pointing at a native-script-credential certificate must
+    /// be flagged as `ExtraRedeemer`.
+    #[test]
+    fn test_extra_redeemer_native_script_cert_is_extra() {
+        use super::{check_extra_redeemers, plutus_script_version_map};
+
+        let native_sh = Hash28::from_bytes([0x70; 28]);
+
+        let utxo = UtxoSet::new();
+        let mut tx = make_bare_tx(vec![Redeemer {
+            tag: RedeemerTag::Cert,
+            index: 0,
+            data: PlutusData::Integer(num_bigint::BigInt::from(0i128)),
+            ex_units: ExUnits { mem: 1, steps: 1 },
+        }]);
+        tx.body.certificates = vec![Certificate::StakeDeregistration(Credential::Script(
+            native_sh,
+        ))];
+
+        let sv = plutus_script_version_map(&tx, &utxo);
+
+        let mut errors: Vec<ValidationError> = Vec::new();
+        check_extra_redeemers(&tx, &utxo, &sv, &mut errors);
+
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::ExtraRedeemer { tag, index: 0 } if tag == "Cert"
+            )),
+            "Cert redeemer for native-script credential cert must be ExtraRedeemer; got: {errors:?}"
+        );
+    }
+
+    /// A Vote redeemer pointing at a native-script voter must be flagged as
+    /// `ExtraRedeemer`.
+    #[test]
+    fn test_extra_redeemer_native_script_vote_is_extra() {
+        use super::{check_extra_redeemers, plutus_script_version_map};
+
+        let native_sh = Hash28::from_bytes([0x80; 28]);
+        let drep_voter = Voter::DRep(Credential::Script(native_sh));
+        let dummy_proc = VotingProcedure {
+            vote: Vote::Abstain,
+            anchor: None,
+        };
+        let dummy_action = GovActionId {
+            transaction_id: Hash32::ZERO,
+            action_index: 1,
+        };
+
+        let utxo = UtxoSet::new();
+        let mut tx = make_bare_tx(vec![Redeemer {
+            tag: RedeemerTag::Vote,
+            index: 0,
+            data: PlutusData::Integer(num_bigint::BigInt::from(0i128)),
+            ex_units: ExUnits { mem: 1, steps: 1 },
+        }]);
+        tx.body
+            .voting_procedures
+            .entry(drep_voter)
+            .or_default()
+            .insert(dummy_action, dummy_proc);
+
+        let sv = plutus_script_version_map(&tx, &utxo);
+
+        let mut errors: Vec<ValidationError> = Vec::new();
+        check_extra_redeemers(&tx, &utxo, &sv, &mut errors);
+
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::ExtraRedeemer { tag, index: 0 } if tag == "Vote"
+            )),
+            "Vote redeemer for native-script voter must be ExtraRedeemer; got: {errors:?}"
+        );
+    }
+
+    /// A Spend redeemer pointing at a NATIVE-script-locked input must be flagged
+    /// as `ExtraRedeemer` (Finding 2 from the adversarial review of #758).
+    #[test]
+    fn test_extra_redeemer_native_script_spend_is_extra() {
+        use dugite_primitives::address::EnterpriseAddress;
+
+        use super::{check_extra_redeemers, plutus_script_version_map};
+
+        // Native-script-locked input — its hash is NOT in script_versions.
+        let native_sh = Hash28::from_bytes([0x90; 28]);
+        let inp = TransactionInput {
+            transaction_id: Hash32::from_bytes([0x10; 32]),
+            index: 0,
+        };
+        let mut utxo_set = UtxoSet::new();
+        utxo_set.insert(
+            inp.clone(),
+            TransactionOutput {
+                address: Address::Enterprise(EnterpriseAddress {
+                    payment: Credential::Script(native_sh),
+                    network: dugite_primitives::network::NetworkId::Mainnet,
+                }),
+                value: Value::lovelace(3_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: false,
+                raw_cbor: None,
+            },
+        );
+
+        // Spend redeemer at index 0 — native-script-locked input, so this is extra.
+        let tx = Transaction {
+            hash: Hash32::ZERO,
+            era: Era::Conway,
+            body: TransactionBody {
+                inputs: vec![inp],
+                outputs: vec![],
+                fee: Lovelace(0),
+                ttl: None,
+                certificates: vec![],
+                withdrawals: BTreeMap::new(),
+                auxiliary_data_hash: None,
+                validity_interval_start: None,
+                mint: BTreeMap::new(),
+                script_data_hash: None,
+                collateral: vec![],
+                required_signers: vec![],
+                network_id: None,
+                collateral_return: None,
+                total_collateral: None,
+                reference_inputs: vec![],
+                update: None,
+                voting_procedures: BTreeMap::new(),
+                proposal_procedures: vec![],
+                treasury_value: None,
+                donation: None,
+                sub_transactions: vec![],
+                account_balance_intervals: vec![],
+                direct_deposits: BTreeMap::new(),
+                guards: Vec::new(),
+            },
+            witness_set: TransactionWitnessSet {
+                vkey_witnesses: vec![],
+                native_scripts: vec![],
+                bootstrap_witnesses: vec![],
+                plutus_v1_scripts: vec![],
+                plutus_v2_scripts: vec![],
+                plutus_v3_scripts: vec![],
+                plutus_data: vec![],
+                redeemers: vec![Redeemer {
+                    tag: RedeemerTag::Spend,
+                    index: 0,
+                    data: PlutusData::Integer(num_bigint::BigInt::from(0i128)),
+                    ex_units: ExUnits { mem: 1, steps: 1 },
+                }],
+                raw_redeemers_cbor: None,
+                raw_plutus_data_cbor: None,
+                original_script_data_hash: None,
+            },
+            is_valid: true,
+            auxiliary_data: None,
+            raw_cbor: None,
+            raw_body_cbor: None,
+            raw_witness_cbor: None,
+        };
+
+        // script_versions empty → native_sh version 0 → index 0 NOT a valid Spend purpose.
+        let sv = plutus_script_version_map(&tx, &utxo_set);
+        assert!(sv.is_empty());
+
+        let mut errors: Vec<ValidationError> = Vec::new();
+        check_extra_redeemers(&tx, &utxo_set, &sv, &mut errors);
+
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::ExtraRedeemer { tag, index: 0 } if tag == "Spend"
+            )),
+            "Spend redeemer for native-script-locked input must be ExtraRedeemer; got: {errors:?}"
         );
     }
 }
