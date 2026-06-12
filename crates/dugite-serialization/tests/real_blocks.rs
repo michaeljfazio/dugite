@@ -202,3 +202,45 @@ fn test_non_dijkstra_blocks_dispatch_correctly() {
         );
     }
 }
+
+/// #753 — duplicate redeemer entries on the wire must collapse with
+/// Haskell's `Map.fromList` last-wins semantics.
+///
+/// Real mainnet tx 572a9da40e8209dcac0149760a97c9a61a7dc746ac493765a36afd1c6752d84c
+/// (block 8,826,011, slot 93,595,649): the wire redeemers array carries
+/// (Mint, 0) TWICE (identical units 2,307,431 mem / 958,659,782 steps).
+/// Keeping both double-counted the block-level ExUnits sum
+/// (20,173,234,420 vs the true 19,214,574,638 against the 20e9 limit) and
+/// HALTED mainnet sync on a confirmed block.
+#[test]
+fn dup_redeemer_mainnet_tx_collapses_last_wins() {
+    let hex = include_str!("fixtures/babbage_dup_redeemer_tx_572a9da4.hex");
+    let hex = hex.trim();
+    let bytes: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
+        .collect();
+    let tx = dugite_serialization::decode::decode_transaction(5, &bytes).expect("decode");
+    let rs = &tx.witness_set.redeemers;
+    assert_eq!(
+        rs.len(),
+        3,
+        "4 wire entries with one duplicate key must collapse to 3, got {}",
+        rs.len()
+    );
+    use dugite_primitives::transaction::RedeemerTag;
+    let mint: Vec<_> = rs
+        .iter()
+        .filter(|r| r.tag == RedeemerTag::Mint && r.index == 0)
+        .collect();
+    assert_eq!(mint.len(), 1, "(Mint, 0) must appear exactly once");
+    assert_eq!(mint[0].ex_units.steps, 958_659_782);
+    assert_eq!(mint[0].ex_units.mem, 2_307_431);
+    // Total ExUnits across the tx must count the duplicate once:
+    let total_steps: u64 = rs.iter().map(|r| r.ex_units.steps).sum();
+    assert_eq!(
+        total_steps,
+        37_781_653 + 19_470_901 + 958_659_782,
+        "tx totExUnits must match Haskell's deduplicated Map"
+    );
+}

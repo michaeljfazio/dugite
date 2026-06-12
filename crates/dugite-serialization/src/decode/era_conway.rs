@@ -2369,6 +2369,14 @@ fn decode_conway_witness_set(
 
 /// Read redeemers — supports both Conway map form and pre-Conway array form.
 fn read_redeemers(r: &mut Reader<'_>) -> Result<Vec<Redeemer>, SerializationError> {
+    read_redeemers_raw(r).map(crate::decode::helpers::dedup_redeemers_last_wins)
+}
+
+/// Wire-form reader without the Haskell `Map.fromList` dedup — every caller
+/// must go through [`read_redeemers`]. Duplicate (tag, index) entries occur
+/// on-chain (mainnet block 8,826,011, #753); Haskell collapses them
+/// (last-wins) in BOTH the map and array wire forms.
+fn read_redeemers_raw(r: &mut Reader<'_>) -> Result<Vec<Redeemer>, SerializationError> {
     let ty = r.peek_major()?;
     match ty {
         Type::Map | Type::MapIndef => {

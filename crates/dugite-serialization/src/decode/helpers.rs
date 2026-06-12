@@ -105,6 +105,49 @@ pub fn read_network_id(r: &mut Reader<'_>) -> Result<u8, SerializationError> {
 // Tests
 // =========================================================================
 
+/// Deduplicate decoded redeemers by `(tag, index)` with Haskell's exact
+/// collision semantics: **last occurrence wins** (`Map.fromList` — used by
+/// cardano-ledger for BOTH the pre-PV9 list wire form and the PV9+ map wire
+/// form of the redeemers field; duplicates are deliberately NOT a decode
+/// error, see `Cardano.Ledger.Alonzo.TxWits` `RedeemersRaw . Map.fromList`).
+///
+/// The kept (last) value is placed at the position where its key FIRST
+/// appeared, so the relative order of distinct keys is unchanged — for
+/// transactions without duplicates this is the identity.
+///
+/// Why this matters (#753): every downstream Haskell consumer (`totExUnits`
+/// for the BBODY `maxBlockExUnits` check and `minfee`,
+/// `collectTwoPhaseScriptInputs`/`evalScripts`) operates on the deduplicated
+/// Map. Keeping wire duplicates in a Vec double-counted a duplicated mint
+/// redeemer's ExUnits in mainnet block 8,826,011 (slot 93,595,649) — dugite
+/// computed 20,173,234,420 block steps vs the true 19,214,574,638 and
+/// HALTED on a confirmed block — and double-evaluated such scripts in
+/// phase-2 (spurious 'budget exhausted' divergences; tx 55519c6d… and the
+/// long-unexplained preprod #730 'fixed-delta' residual class).
+///
+/// The raw redeemers wire bytes are preserved separately by the witness
+/// decoders, so script-integrity hashing is unaffected.
+pub(crate) fn dedup_redeemers_last_wins(
+    redeemers: Vec<dugite_primitives::transaction::Redeemer>,
+) -> Vec<dugite_primitives::transaction::Redeemer> {
+    use std::collections::HashMap;
+    let mut pos: HashMap<(dugite_primitives::transaction::RedeemerTag, u32), usize> =
+        HashMap::with_capacity(redeemers.len());
+    let mut out: Vec<dugite_primitives::transaction::Redeemer> =
+        Vec::with_capacity(redeemers.len());
+    for rd in redeemers {
+        let key = (rd.tag.clone(), rd.index);
+        match pos.get(&key) {
+            Some(&i) => out[i] = rd, // last value wins, first position kept
+            None => {
+                pos.insert(key, out.len());
+                out.push(rd);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

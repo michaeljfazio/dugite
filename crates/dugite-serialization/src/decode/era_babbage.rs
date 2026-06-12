@@ -935,7 +935,10 @@ fn decode_babbage_witness_set(
                 let rd_start = r.position();
                 let items = r.read_array(|r| read_babbage_redeemer(r))?;
                 raw_redeemers = Some(r.slice_from(rd_start).to_vec());
-                redeemers = items;
+                // Haskell Map.fromList semantics: duplicate (tag, index)
+                // entries collapse, last wins (#753). Raw bytes above keep
+                // the duplicates for script-integrity hashing.
+                redeemers = crate::decode::helpers::dedup_redeemers_last_wins(items);
             }
             6 => {
                 // plutus_v2_scripts (Babbage+)
