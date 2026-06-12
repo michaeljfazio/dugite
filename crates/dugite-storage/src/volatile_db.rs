@@ -1054,6 +1054,49 @@ impl VolatileDB {
         }
     }
 
+    /// Remove every block NOT reachable from `anchor` via prev-hash links.
+    ///
+    /// Crash-recovery validation (Haskell: VolatileDB open-time validation +
+    /// chain selection from the immutable tip): a crash mid-flush can leave a
+    /// GAP in the persisted volatile chain — blocks above the gap can never
+    /// connect to the canonical chain, the boot ledger replay fails on every
+    /// one of them ("Block does not connect to tip"), and the node enters
+    /// live sync with `ledger_tip` far behind the ChainDB tip. BlockFetch
+    /// then refuses to re-fetch the gap region (`has_block` filter) — a
+    /// permanent wedge (observed live 2026-06-12 after a SIGBUS crash).
+    ///
+    /// Pruning the unreachable suffix at boot restores the invariant that the
+    /// ChainDB tip is always reachable from the immutable tip, so live sync
+    /// simply re-fetches the pruned region from the network.
+    ///
+    /// Returns the number of blocks removed.
+    pub fn prune_unreachable_from(&mut self, anchor: &Hash32) -> usize {
+        use std::collections::VecDeque;
+        let mut reachable: HashSet<Hash32> = HashSet::new();
+        let mut queue: VecDeque<Hash32> = VecDeque::new();
+        queue.push_back(*anchor);
+        while let Some(h) = queue.pop_front() {
+            if let Some(succs) = self.successors.get(&h) {
+                for s in succs {
+                    if reachable.insert(*s) {
+                        queue.push_back(*s);
+                    }
+                }
+            }
+        }
+        let unreachable: Vec<Hash32> = self
+            .blocks
+            .keys()
+            .filter(|h| !reachable.contains(*h))
+            .copied()
+            .collect();
+        let n = unreachable.len();
+        if n > 0 {
+            self.remove_blocks_by_hashes(&unreachable);
+        }
+        n
+    }
+
     /// Remove a specific set of blocks by hash.
     ///
     /// Only the named blocks are removed — blocks at the same slot but on
@@ -1949,6 +1992,55 @@ mod tests {
 
     fn h(byte: u8) -> Hash32 {
         Hash32::from_bytes([byte; 32])
+    }
+
+    /// Crash-recovery prune: blocks not reachable from the anchor via
+    /// prev-hash links are removed; the connectable chain and its forks
+    /// survive. This is the gap left by a crash mid-flush (2026-06-12 SIGBUS
+    /// incident): without the prune, boot replay loops "does not connect"
+    /// and the node wedges.
+    #[test]
+    fn prune_unreachable_removes_gap_suffix_keeps_connected() {
+        let mut db = VolatileDB::new();
+        let anchor = h(0xAA); // immutable tip (not in volatile)
+                              // Connected chain: anchor <- b1 <- b2, plus fork f1 off anchor.
+        db.add_block(h(1), 101, 11, anchor, b"b1".to_vec());
+        db.add_block(h(2), 102, 12, h(1), b"b2".to_vec());
+        db.add_block(h(9), 101, 11, anchor, b"f1".to_vec());
+        // Gap: o1's parent (h(5)) was lost in the crash; o2 builds on o1.
+        db.add_block(h(6), 110, 15, h(5), b"o1".to_vec());
+        db.add_block(h(7), 111, 16, h(6), b"o2".to_vec());
+
+        let pruned = db.prune_unreachable_from(&anchor);
+        assert_eq!(pruned, 2, "the two gap-suffix blocks must be pruned");
+        assert!(db.get_block(&h(1)).is_some());
+        assert!(db.get_block(&h(2)).is_some());
+        assert!(db.get_block(&h(9)).is_some(), "connected fork survives");
+        assert!(db.get_block(&h(6)).is_none());
+        assert!(db.get_block(&h(7)).is_none());
+    }
+
+    /// A fully connected volatile chain is untouched.
+    #[test]
+    fn prune_unreachable_noop_when_fully_connected() {
+        let mut db = VolatileDB::new();
+        let anchor = h(0xAA);
+        db.add_block(h(1), 101, 11, anchor, b"b1".to_vec());
+        db.add_block(h(2), 102, 12, h(1), b"b2".to_vec());
+        assert_eq!(db.prune_unreachable_from(&anchor), 0);
+        assert_eq!(db.len(), 2);
+    }
+
+    /// Everything unreachable (anchor unknown to the volatile set) → all
+    /// pruned. ChainDB only invokes the prune when an immutable tip exists,
+    /// so the fresh-node genesis case never reaches this path.
+    #[test]
+    fn prune_unreachable_clears_fully_disconnected_set() {
+        let mut db = VolatileDB::new();
+        db.add_block(h(6), 110, 15, h(5), b"o1".to_vec());
+        db.add_block(h(7), 111, 16, h(6), b"o2".to_vec());
+        assert_eq!(db.prune_unreachable_from(&h(0xAA)), 2);
+        assert_eq!(db.len(), 0);
     }
 
     /// A Byron EBB and the first main block of an epoch share an absolute
