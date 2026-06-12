@@ -845,6 +845,7 @@ mod tests {
             hash,
             header_cbor: vec![0x82, 0x01],
             body_size: None,
+            prev_hash: None,
         }
     }
 

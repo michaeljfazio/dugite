@@ -3187,10 +3187,25 @@ fn extract_hash_from_header(header_cbor: &[u8]) -> [u8; 32] {
 /// BlockFetch range builder. Used for exact in-flight byte accounting
 /// (#747), mirroring Haskell's `blockFetchSize` which schedules fetch
 /// ranges from header-declared sizes rather than estimates.
-fn extract_body_size_from_header(header_cbor: &[u8]) -> Option<u64> {
-    dugite_serialization::decode_wrapped_block_header(header_cbor)
-        .ok()
-        .map(|h| h.body_size)
+/// Extract `(declared body size, prev_hash)` from a wrapped ChainSync header
+/// in ONE decode (both feed BlockFetch range planning, #747):
+/// - `body_size` → exact per-range byte accounting;
+/// - `prev_hash` → chain-adjacency run splitting. `pending_headers` can be
+///   SPARSE relative to the peer's chain (headers whose block is already in
+///   the ChainDB are never pushed — common right after a CSJ dynamo rotation
+///   re-streams an overlapping segment), so consecutive pending entries are
+///   not necessarily consecutive blocks; a `MsgRequestRange` spanning such a
+///   hidden gap makes the peer deliver the gap blocks too, blowing the byte
+///   budget (observed live: ranges delivering 1.7-2x their estimate).
+fn extract_header_fetch_info(header_cbor: &[u8]) -> (Option<u64>, Option<[u8; 32]>) {
+    match dugite_serialization::decode_wrapped_block_header(header_cbor) {
+        Ok(h) => {
+            let mut prev = [0u8; 32];
+            prev.copy_from_slice(h.prev_hash.as_ref());
+            (Some(h.body_size), Some(prev))
+        }
+        Err(_) => (None, None),
+    }
 }
 
 /// Unwrap a Shelley+ HFC-wrapped header to get the inner header bytes.
@@ -5233,18 +5248,21 @@ pub async fn chainsync_client_task(
                                 let already_have =
                                     cdb.has_block(&dugite_primitives::hash::Hash32::from_bytes(hash));
                                 if !already_have {
-                                    // Header-declared body size for exact
-                                    // BlockFetch range byte-accounting (#747).
-                                    // None for Byron / undecodable headers
-                                    // (range builder falls back to the
-                                    // adaptive average).
-                                    let body_size =
-                                        extract_body_size_from_header(&header);
+                                    // Header-declared body size (exact range
+                                    // byte-accounting) + prev_hash (chain-
+                                    // adjacency run splitting), one decode.
+                                    // (None, None) for Byron / undecodable
+                                    // headers — range builder falls back to
+                                    // the adaptive average and filter-gap
+                                    // splitting only.
+                                    let (body_size, prev_hash) =
+                                        extract_header_fetch_info(&header);
                                     entry.pending_headers.push(PendingHeader {
                                         slot,
                                         hash,
                                         header_cbor: header,
                                         body_size,
+                                        prev_hash,
                                     });
                                 }
                                 entry.headers_since_prune =
@@ -6339,18 +6357,21 @@ mod chainsync_task_tests {
                 hash: fork_root,
                 header_cbor: vec![0xF6],
                 body_size: None,
+                prev_hash: None,
             },
             PendingHeader {
                 slot: 220,
                 hash: fork_child,
                 header_cbor: vec![0xF6],
                 body_size: None,
+                prev_hash: None,
             },
             PendingHeader {
                 slot: 150,
                 hash: h_b_arr,
                 header_cbor: vec![0xF6],
                 body_size: None,
+                prev_hash: None,
             },
         ];
 
@@ -7188,7 +7209,7 @@ mod additional_sync_tests {
         assert_eq!(unwrap_hfc_header(&buf), None);
     }
 
-    // ── extract_body_size_from_header ────────────────────────────────────────
+    // ── extract_header_fetch_info ────────────────────────────────────────────
 
     /// REAL mainnet Babbage header (lifted from the block-33760 fixture),
     /// wrapped in the N2N HFC envelope `[6, tag24(bytes(header))]` exactly as
@@ -7222,11 +7243,15 @@ mod additional_sync_tests {
             enc.bytes(header_bytes).unwrap();
         }
 
-        let size = extract_body_size_from_header(&buf);
+        let (size, prev) = extract_header_fetch_info(&buf);
         assert!(
             size.is_some_and(|s| s > 0),
             "must extract a positive declared body size from a real wrapped \
              Babbage header, got {size:?}"
+        );
+        assert!(
+            prev.is_some(),
+            "must extract prev_hash for chain-adjacency run splitting"
         );
     }
 
@@ -7347,12 +7372,14 @@ mod additional_sync_tests {
                 hash: [0x01; 32],
                 header_cbor: vec![],
                 body_size: None,
+                prev_hash: None,
             },
             PendingHeader {
                 slot: 20,
                 hash: [0x02; 32],
                 header_cbor: vec![],
                 body_size: None,
+                prev_hash: None,
             },
         ];
         let mut headers = headers;
@@ -7384,6 +7411,7 @@ mod additional_sync_tests {
                 hash: [0xAAu8; 32], // in ChainDB
                 header_cbor: vec![],
                 body_size: None,
+                prev_hash: None,
             },
             PendingHeader {
                 slot: 200,
@@ -7394,6 +7422,7 @@ mod additional_sync_tests {
                 }, // NOT in ChainDB
                 header_cbor: vec![],
                 body_size: None,
+                prev_hash: None,
             },
         ];
 
@@ -7432,12 +7461,14 @@ mod additional_sync_tests {
                 hash: arr1,
                 header_cbor: vec![],
                 body_size: None,
+                prev_hash: None,
             },
             PendingHeader {
                 slot: 2,
                 hash: arr2,
                 header_cbor: vec![],
                 body_size: None,
+                prev_hash: None,
             },
         ];
         prune_already_known_pending_headers(&mut pending, &chain_db);
@@ -7465,12 +7496,14 @@ mod additional_sync_tests {
                 hash: [0x01; 32],
                 header_cbor: vec![],
                 body_size: None,
+                prev_hash: None,
             },
             PendingHeader {
                 slot: 2,
                 hash: [0x02; 32],
                 header_cbor: vec![],
                 body_size: None,
+                prev_hash: None,
             },
         ];
         let out = select_headers_to_fetch(&pending, |_| false, &HashSet::new());
@@ -7488,12 +7521,14 @@ mod additional_sync_tests {
                 hash: [0x01; 32], // known
                 header_cbor: vec![],
                 body_size: None,
+                prev_hash: None,
             },
             PendingHeader {
                 slot: 2,
                 hash: [0x02; 32], // unknown
                 header_cbor: vec![],
                 body_size: None,
+                prev_hash: None,
             },
         ];
         let out = select_headers_to_fetch(&pending, |h| known.contains(h), &HashSet::new());
@@ -7512,12 +7547,14 @@ mod additional_sync_tests {
                 hash: [0xAA; 32], // in-flight
                 header_cbor: vec![],
                 body_size: None,
+                prev_hash: None,
             },
             PendingHeader {
                 slot: 11,
                 hash: [0xBB; 32], // available
                 header_cbor: vec![],
                 body_size: None,
+                prev_hash: None,
             },
         ];
         let out = select_headers_to_fetch(&pending, |_| false, &fetched);
@@ -7536,6 +7573,7 @@ mod additional_sync_tests {
             hash: [0xFE; 32],
             header_cbor: vec![],
             body_size: None,
+            prev_hash: None,
         }];
         let out = select_headers_to_fetch(&pending, |_| false, &HashSet::new());
         assert_eq!(
