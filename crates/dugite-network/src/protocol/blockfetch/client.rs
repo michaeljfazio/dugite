@@ -20,6 +20,17 @@ use super::{decode_message, encode_message, BlockFetchMessage};
 /// we approximate with a generous cap matching the server's `MAX_BLOCKS_PER_BATCH`.
 pub const MAX_BLOCKS_PER_FETCH: usize = 2_000;
 
+/// Per-`MsgBlock` payload byte cap, mirroring Haskell's `largeByteLimit`
+/// (`Ouroboros.Network.Protocol.Limits`): every message in the BFStreaming
+/// state is bounded to 2,500,000 bytes, connection-fatal on violation, in
+/// ALL eras (the largest real block — Byron's 2 MB cap — fits well under
+/// it; mainnet `maxBlockBodySize` has never exceeded 90,112). This is the
+/// only per-message bound for ranges the #751 declared-size abort cannot
+/// arm (Byron/average-estimated), and it convicts a size-flooding peer
+/// with attribution instead of letting a single giant frame ride toward
+/// the 48 MB mux ingress backstop.
+pub const MAX_MSG_BLOCK_BYTES: usize = 2_500_000;
+
 /// BlockFetch client for downloading block ranges.
 pub struct BlockFetchClient;
 
@@ -132,6 +143,19 @@ impl BlockFetchClient {
                             reason: format!(
                                 "peer sent more than {MAX_BLOCKS_PER_FETCH} MsgBlock messages \
                                  without MsgBatchDone"
+                            ),
+                        });
+                    }
+                    // Haskell `largeByteLimit` parity: no single MsgBlock may
+                    // exceed 2.5 MB in any era (see MAX_MSG_BLOCK_BYTES).
+                    if data.len() > MAX_MSG_BLOCK_BYTES {
+                        return Err(ProtocolError::BoundsExceeded {
+                            protocol: "BlockFetch",
+                            reason: format!(
+                                "peer sent a {}-byte MsgBlock exceeding the \
+                                 {MAX_MSG_BLOCK_BYTES}-byte protocol limit \
+                                 (largeByteLimit parity)",
+                                data.len()
                             ),
                         });
                     }
@@ -588,5 +612,159 @@ mod tests {
             ),
             "expected StateViolation"
         );
+    }
+
+    /// Haskell `largeByteLimit` parity: a single MsgBlock above
+    /// 2,500,000 bytes is a connection-fatal bounds violation — the only
+    /// per-message bound for ranges the #751 declared-size abort cannot arm
+    /// (Byron). A maximum-size honest block must still pass.
+    #[tokio::test]
+    async fn msg_block_byte_cap_enforced() {
+        use crate::protocol::blockfetch::encode_message as bf_enc;
+
+        // The default test channel's 1 MB reassembly limit sits below the
+        // 2.5 MB protocol cap under test — build channels with the real
+        // 48 MB-class headroom so the MsgBlock cap (not the mux limit) is
+        // what fires.
+        fn make_big_channel() -> (
+            MuxChannel,
+            mpsc::Receiver<(u16, crate::mux::Direction, Bytes)>,
+            mpsc::Sender<Bytes>,
+        ) {
+            let (egress_tx, egress_rx) = mpsc::channel(64);
+            let (ingress_tx, ingress_rx) = mpsc::channel(64);
+            let channel = MuxChannel::new(
+                3,
+                crate::mux::Direction::InitiatorDir,
+                egress_tx,
+                ingress_rx,
+                48 * 1024 * 1024,
+                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            );
+            (channel, egress_rx, ingress_tx)
+        }
+
+        // Oversized: 2,500,001 bytes → BoundsExceeded.
+        let (mut channel, mut egress_rx, ingress_tx) = make_big_channel();
+        let handle = tokio::spawn(async move {
+            BlockFetchClient::fetch_range(
+                &mut channel,
+                Point::Origin,
+                Point::Specific(1, [0x01; 32]),
+                |_| Ok(()),
+            )
+            .await
+        });
+        let _ = egress_rx.recv().await.unwrap(); // MsgRequestRange
+        ingress_tx
+            .send(Bytes::from(bf_enc(&BlockFetchMessage::MsgStartBatch)))
+            .await
+            .unwrap();
+        ingress_tx
+            .send(Bytes::from(bf_enc(&BlockFetchMessage::MsgBlock(vec![
+                0xAA;
+                MAX_MSG_BLOCK_BYTES + 1
+            ]))))
+            .await
+            .unwrap();
+        match handle.await.unwrap() {
+            Err(ProtocolError::BoundsExceeded { protocol, reason }) => {
+                assert_eq!(protocol, "BlockFetch");
+                assert!(
+                    reason.contains("largeByteLimit"),
+                    "cap violation must cite the Haskell limit: {reason}"
+                );
+            }
+            other => panic!("expected BoundsExceeded, got {other:?}"),
+        }
+
+        // Exactly at the cap: an honest maximum-size block passes.
+        let (mut channel, mut egress_rx, ingress_tx) = make_big_channel();
+        let handle = tokio::spawn(async move {
+            BlockFetchClient::fetch_range(
+                &mut channel,
+                Point::Origin,
+                Point::Specific(1, [0x01; 32]),
+                |_| Ok(()),
+            )
+            .await
+        });
+        let _ = egress_rx.recv().await.unwrap();
+        ingress_tx
+            .send(Bytes::from(bf_enc(&BlockFetchMessage::MsgStartBatch)))
+            .await
+            .unwrap();
+        ingress_tx
+            .send(Bytes::from(bf_enc(&BlockFetchMessage::MsgBlock(vec![
+                0xBB;
+                MAX_MSG_BLOCK_BYTES
+            ]))))
+            .await
+            .unwrap();
+        ingress_tx
+            .send(Bytes::from(bf_enc(&BlockFetchMessage::MsgBatchDone)))
+            .await
+            .unwrap();
+        assert_eq!(handle.await.unwrap().unwrap(), 1);
+    }
+
+    /// #751 plumbing: an `Err` returned by the per-block callback (e.g. the
+    /// receive-side per-range byte abort) must propagate out of `recv_batch`
+    /// IMMEDIATELY — mid-stream, without waiting for `MsgBatchDone` or
+    /// consuming the rest of the flood — and must surface the callback's
+    /// error verbatim so the peer fault is attributed.
+    #[tokio::test]
+    async fn callback_error_aborts_batch_mid_stream() {
+        use crate::protocol::blockfetch::encode_message as bf_enc;
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+
+        let handle = tokio::spawn(async move {
+            let mut seen = 0usize;
+            let result = BlockFetchClient::fetch_range(
+                &mut channel,
+                Point::Origin,
+                Point::Specific(1, [0x01; 32]),
+                |_| {
+                    seen += 1;
+                    if seen == 2 {
+                        Err(ProtocolError::BoundsExceeded {
+                            protocol: "BlockFetch",
+                            reason: "range byte abort (#751 test)".to_string(),
+                        })
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+            (result, seen)
+        });
+
+        let _ = egress_rx.recv().await.unwrap(); // MsgRequestRange
+
+        // Stream 4 blocks; the callback aborts on the 2nd. No MsgBatchDone.
+        ingress_tx
+            .send(Bytes::from(bf_enc(&BlockFetchMessage::MsgStartBatch)))
+            .await
+            .unwrap();
+        for _ in 0..4 {
+            ingress_tx
+                .send(Bytes::from(bf_enc(&BlockFetchMessage::MsgBlock(vec![
+                    0xAA;
+                    64
+                ]))))
+                .await
+                .unwrap();
+        }
+
+        let (result, seen) = handle.await.unwrap();
+        assert_eq!(seen, 2, "callback must not be invoked past the abort");
+        match result {
+            Err(ProtocolError::BoundsExceeded { protocol, reason }) => {
+                assert_eq!(protocol, "BlockFetch");
+                assert!(reason.contains("#751"), "abort reason must be surfaced");
+            }
+            other => panic!("expected BoundsExceeded, got {other:?}"),
+        }
     }
 }

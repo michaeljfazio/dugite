@@ -150,6 +150,30 @@ const _: () = assert!(
     "pipelined in-flight budget exceeds mux ingress limit: reduce BLOCKFETCH_PIPELINE_WINDOW or increase peer_connection::BLOCKFETCH_INGRESS_LIMIT"
 );
 
+/// Why a protocol task reported a peer to `peer_failure_tx` (#751).
+///
+/// `ProtocolFault` is a PROVABLE protocol violation (mis-declared block
+/// sizes, undecodable blocks, agency/state violations): Haskell parity is
+/// a thrown exception that tears the whole bearer down, so the handler
+/// additionally runs full lifecycle demotion (`demote_to_cold`). Without
+/// the teardown the convicted peer keeps a hot connection with a dead
+/// BlockFetch worker, and its in-flight flood survives as a silent
+/// bandwidth sink (the dropped mux channel discards frames without
+/// closing TCP).
+///
+/// `Slow` is a performance failure (fetch/keepalive timeout, send
+/// failure): reputation/backoff only. DEVIATION from Haskell (which kills
+/// the connection on timeouts too, then reconnects after governor
+/// backoff): dugite's single-active-fetcher architecture makes
+/// timeout-teardown churn-prone — tracked as a follow-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerFailureKind {
+    /// Provable protocol violation — reputation + connection teardown.
+    ProtocolFault,
+    /// Timeout / transport failure — reputation only.
+    Slow,
+}
+
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{debug, info, warn};
 
@@ -422,6 +446,123 @@ fn estimated_block_wire_bytes(h: &PendingHeader, avg_block_bytes: usize) -> usiz
             .saturating_add(h.header_cbor.len())
             .saturating_add(16),
         None => avg_block_bytes,
+    }
+}
+
+/// #751: hard multiple of a range's header-declared byte estimate beyond
+/// which the receive side aborts the range as a peer fault. Declared body
+/// sizes come from SIGNED headers, so an honest peer's actual delivery
+/// tracks the estimate almost exactly (the estimate already includes the
+/// header bytes and per-`MsgBlock` framing); 3× is unreachable without
+/// mis-declaring sizes.
+pub(crate) const RANGE_BYTE_ABORT_FACTOR: usize = 3;
+
+/// #751: absolute slack added on top of the factor so that tiny ranges
+/// (one small block) can never trip on per-block framing variance.
+pub(crate) const RANGE_BYTE_ABORT_SLACK: usize = 1 << 20; // 1 MiB
+
+/// #751: hard ceiling on any single range's abort limit, sized so that the
+/// worst case across the whole pipeline window still convicts BEFORE the
+/// mux ingress backstop kills the connection generically (which would lose
+/// the attribution this feature exists to provide). Honest deliveries sit
+/// at ≈1.0× a budget-bounded estimate (≤ `BLOCKFETCH_RANGE_BYTE_BUDGET` +
+/// one max-size block ≈ 8.1 MB), so a 20 MiB ceiling keeps ≥2.4× honest
+/// headroom. ASSUMPTION: `maxBlockBodySize` stays ≪ this ceiling (mainnet
+/// has never exceeded 90,112 bytes); revisit if protocol params ever allow
+/// multi-MB blocks.
+pub(crate) const RANGE_BYTE_ABORT_CEILING: usize = 20 * 1024 * 1024;
+
+// #751 attribution invariant: the abort must fire before the generic
+// ingress death even with every pipelined range simultaneously at its
+// ceiling. Mirrors the #747 compile-time invariant directly above it in
+// spirit: reference the REAL mux constant, no hand-mirrored copy.
+const _: () = assert!(
+    BLOCKFETCH_PIPELINE_WINDOW * RANGE_BYTE_ABORT_CEILING
+        <= super::peer_connection::BLOCKFETCH_INGRESS_LIMIT,
+    "#751 abort ceiling × pipeline window exceeds the mux ingress limit: \
+     attribution would be lost to the generic ingress backstop"
+);
+// Honest-headroom invariant: the ceiling must comfortably exceed the
+// largest possible honest range (byte budget + margin), or honest peers
+// could be convicted.
+const _: () = assert!(
+    RANGE_BYTE_ABORT_CEILING >= 2 * BLOCKFETCH_RANGE_BYTE_BUDGET,
+    "#751 abort ceiling too close to the range byte budget: honest \
+     full-budget ranges would risk conviction"
+);
+
+/// Receive-side hard byte limit for a range whose EVERY header declared its
+/// body size (#751). Ranges containing any undeclared (Byron) header are
+/// estimated from the adaptive average, which honest variance can exceed
+/// arbitrarily — those ranges are never armed; the 48 MB mux ingress
+/// backstop still bounds them. For declared ranges, exceeding this limit
+/// means the peer is lying about block sizes: the range is aborted as a
+/// `ProtocolError` so the overrun is attributed to the peer
+/// (reputation/backoff) instead of dying generically at the ingress limit.
+pub(crate) fn range_byte_abort_limit(estimated_bytes: usize) -> usize {
+    estimated_bytes
+        .saturating_mul(RANGE_BYTE_ABORT_FACTOR)
+        .saturating_add(RANGE_BYTE_ABORT_SLACK)
+        .min(RANGE_BYTE_ABORT_CEILING)
+}
+
+/// True when every header in the slice declares its body size, i.e. the
+/// range byte estimate is exact (Shelley+) rather than average-based
+/// (Byron) — the precondition for arming the #751 receive-side abort.
+pub(crate) fn range_all_declared(headers: &[PendingHeader]) -> bool {
+    headers.iter().all(|h| h.body_size.is_some())
+}
+
+/// Per-range receive-side byte accounting with the #751 hard abort (armed
+/// only for declared-size ranges). Extracted from the recv callback so the
+/// armed behavior — not just the threshold math — is unit-testable: feed it
+/// a stream of block sizes and it convicts exactly when an armed range
+/// crosses its limit.
+pub(crate) struct RangeByteAbort {
+    /// Hard byte limit; `None` when the range is not armed
+    /// (Byron/average-estimated — see `range_all_declared`).
+    limit: Option<usize>,
+    /// The declared-size estimate the limit derives from (conviction
+    /// message context).
+    estimated_bytes: usize,
+    /// Cumulative `MsgBlock` payload bytes delivered so far.
+    seen_bytes: usize,
+}
+
+impl RangeByteAbort {
+    pub(crate) fn new(all_declared: bool, estimated_bytes: usize) -> Self {
+        Self {
+            limit: all_declared.then(|| range_byte_abort_limit(estimated_bytes)),
+            estimated_bytes,
+            seen_bytes: 0,
+        }
+    }
+
+    /// Account one delivered block payload. `Err` = the peer provably
+    /// mis-declared block sizes (#751): abort the range as a peer fault.
+    pub(crate) fn on_block(
+        &mut self,
+        wire_len: usize,
+    ) -> Result<(), dugite_network::error::ProtocolError> {
+        self.seen_bytes = self.seen_bytes.saturating_add(wire_len);
+        if let Some(limit) = self.limit {
+            if self.seen_bytes > limit {
+                return Err(dugite_network::error::ProtocolError::BoundsExceeded {
+                    protocol: "BlockFetch",
+                    reason: format!(
+                        "range delivered {} bytes against a declared-size estimate \
+                         of {} bytes (abort limit {limit}): peer is mis-declaring \
+                         block body sizes (#751)",
+                        self.seen_bytes, self.estimated_bytes,
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn seen_bytes(&self) -> usize {
+        self.seen_bytes
     }
 }
 
@@ -783,7 +924,10 @@ pub struct ConnectionLifecycleManager {
     /// so the main run loop can call `peer_failed()` for reputation scoring and
     /// exponential backoff. This provides faster failure detection than waiting
     /// for the mux to die via `cleanup_dead_connections()`.
-    peer_failure_tx: mpsc::Sender<SocketAddr>,
+    /// Carries the failure kind: `ProtocolFault` convictions additionally
+    /// tear the connection down (#751 / Haskell parity), `Slow` is
+    /// reputation-only.
+    peer_failure_tx: mpsc::Sender<(SocketAddr, PeerFailureKind)>,
 
     /// Channel for KeepAlive tasks to report per-pong RTT measurements.
     ///
@@ -945,7 +1089,7 @@ impl ConnectionLifecycleManager {
         active_slots_coeff: f64,
         metrics: Arc<NodeMetrics>,
         mempool: Arc<Mempool>,
-        peer_failure_tx: mpsc::Sender<SocketAddr>,
+        peer_failure_tx: mpsc::Sender<(SocketAddr, PeerFailureKind)>,
         keepalive_rtt_tx: mpsc::Sender<(SocketAddr, f64)>,
         gsm_event_tx: tokio::sync::mpsc::Sender<crate::gsm::GsmEvent>,
         peer_registry: Arc<crate::genesis_peer_state::PeerStateRegistry>,
@@ -1731,7 +1875,7 @@ impl ConnectionLifecycleManager {
                             consecutive_failures,
                             "keepalive: peer unresponsive, reporting failure",
                         );
-                        let _ = peer_failure_tx.try_send(addr);
+                        let _ = peer_failure_tx.try_send((addr, PeerFailureKind::Slow));
                     }
                     Err(e) => debug!(%addr, "keepalive error: {e}"),
                 }
@@ -1981,7 +2125,10 @@ impl ConnectionLifecycleManager {
                 if let Err(e) = result {
                     warn!(%addr, error = %e, "chainsync task failed");
                     if !cancel.is_cancelled() {
-                        let _ = peer_failure_tx.try_send(addr);
+                        // Reported as `Slow` (reputation-only) even for decode
+                        // errors: upgrading ChainSync faults to teardown is a
+                        // behavior change beyond #751's BlockFetch scope.
+                        let _ = peer_failure_tx.try_send((addr, PeerFailureKind::Slow));
                     }
                 }
                 debug!(%addr, "chainsync task exiting");
@@ -2265,12 +2412,13 @@ impl ConnectionLifecycleManager {
                                         |h| cdb.has_block(&Hash32::from_bytes(*h)),
                                         &fetched_hashes,
                                     );
-                                    if runs.is_empty() {
-                                        active_fetcher.store(0, std::sync::atomic::Ordering::SeqCst);
-                                    }
+                                    // (Slot release happens via the guard's
+                                    // Drop at iteration end — a manual
+                                    // store(0) here would defeat the guard's
+                                    // CAS and leave the SocketAddr companion
+                                    // stale.)
                                     runs
                                 } else {
-                                    active_fetcher.store(0, std::sync::atomic::Ordering::SeqCst);
                                     // Voluntary release: the claim epoch must
                                     // not bleed into a later re-claim (the
                                     // grace clock measures slot TENURE, not
@@ -2552,13 +2700,17 @@ impl ConnectionLifecycleManager {
                             // header-declared body sizes (Haskell
                             // `blockFetchSize` analogue); Byron headers fall
                             // back to the adaptive average.
-                            // Each entry: (from, to, estimated_wire_bytes) — the
-                            // estimate travels with the range so the recv path
-                            // can compare it against ACTUAL delivered bytes
+                            // Each entry: (from, to, estimated_wire_bytes,
+                            // planned_count, all_declared) — the estimate
+                            // travels with the range so the recv path can
+                            // compare it against ACTUAL delivered bytes
                             // (#747 instrumentation: residual ingress overruns
                             // mean actual > estimate somewhere; the WARN below
-                            // names the offending range).
-                            let ranges: Vec<(CodecPoint, CodecPoint, usize, usize)> =
+                            // names the offending range). `all_declared` arms
+                            // the #751 receive-side hard abort: only ranges
+                            // whose every header DECLARED its body size carry
+                            // an exact estimate the peer can be held to.
+                            let ranges: Vec<(CodecPoint, CodecPoint, usize, usize, bool)> =
                                 fetch_runs
                                     .iter()
                                     .flat_map(|run| {
@@ -2585,6 +2737,7 @@ impl ConnectionLifecycleManager {
                                                     ),
                                                     est,
                                                     end - start + 1,
+                                                    range_all_declared(&run[start..=end]),
                                                 )
                                             })
                                     })
@@ -2610,7 +2763,7 @@ impl ConnectionLifecycleManager {
                             let mut next_req = 0usize;
                             let mut prime_failed = false;
                             while next_req < pipeline_window {
-                                let (from, to, _est, _planned) = ranges[next_req].clone();
+                                let (from, to, _est, _planned, _declared) = ranges[next_req].clone();
                                 let send_req = BlockFetchClient::send_range_request(&mut channel, from, to);
                                 let result = tokio::select! {
                                     biased;
@@ -2636,8 +2789,11 @@ impl ConnectionLifecycleManager {
                                         state.record_fetch_failed(addr);
                                     }
                                 }
-                                active_fetcher.store(0, std::sync::atomic::Ordering::SeqCst);
-                                let _ = peer_failure_tx.try_send(addr);
+                                // Slot release + companion clear via the
+                                // guard's Drop at `return` (a manual store(0)
+                                // would defeat its CAS and leave the
+                                // companion stale).
+                                let _ = peer_failure_tx.try_send((addr, PeerFailureKind::Slow));
                                 return;
                             }
 
@@ -2663,10 +2819,17 @@ impl ConnectionLifecycleManager {
                                 // sends outside the callback avoids the panic while
                                 // preserving ordering and backpressure.
                                 let mut decoded_blocks: Vec<FetchedBlock> = Vec::new();
-                                // Sum of raw CBOR sizes seen this range, used to
-                                // refresh `avg_block_bytes` for the next range's
-                                // byte-budget sizing.
-                                let mut range_bytes: usize = 0;
+                                // #751: per-range byte accounting + hard abort,
+                                // armed only when every header in the range
+                                // DECLARED its body size (exact estimate).
+                                // Byron/average-based ranges stay unarmed —
+                                // honest variance there is unbounded and the
+                                // 48 MB ingress backstop still applies. Also
+                                // feeds the `avg_block_bytes` refresh for the
+                                // next range's byte-budget sizing.
+                                let range_est = ranges[range_idx].2;
+                                let mut range_abort =
+                                    RangeByteAbort::new(ranges[range_idx].4, range_est);
 
                                 let fetch_start = std::time::Instant::now();
                                 // Wrap recv_batch in a cancel-aware select so
@@ -2681,7 +2844,18 @@ impl ConnectionLifecycleManager {
                                 let recv_batch_future = BlockFetchClient::recv_batch(
                                     &mut channel,
                                     |block_cbor| {
-                                        range_bytes += block_cbor.len();
+                                        // #751: abort the range as a PEER FAULT the
+                                        // moment actual delivery exceeds the hard
+                                        // limit — checked BEFORE decoding so a
+                                        // size-lying peer buys no CPU either. The
+                                        // resulting ProtocolError flows through the
+                                        // normal fetch-failure path
+                                        // (record_fetch_failed + peer_failure_tx
+                                        // with ProtocolFault → reputation AND
+                                        // connection teardown), attributing the
+                                        // overrun to the peer instead of dying
+                                        // generically at the mux ingress backstop.
+                                        range_abort.on_block(block_cbor.len())?;
                                         match dugite_serialization::decode_block_with_byron_epoch_length(
                                             &block_cbor, bel,
                                         ) {
@@ -2761,7 +2935,7 @@ impl ConnectionLifecycleManager {
                                         metrics_clone.record_block_fetch_latency(fetch_ms);
                                         // Refresh the average block size for the
                                         // next range's byte-budget sizing.
-                                        if let Some(avg) = range_bytes.checked_div(count) {
+                                        if let Some(avg) = range_abort.seen_bytes().checked_div(count) {
                                             avg_block_bytes = avg.max(1);
                                         }
                                         // #747 instrumentation: residual ingress
@@ -2770,8 +2944,8 @@ impl ConnectionLifecycleManager {
                                         // Surface any range whose delivery blows
                                         // 1.5x the estimate (+256 KiB slack) so the
                                         // offending slots/peer are identifiable.
-                                        let est = ranges[range_idx].2;
-                                        if range_bytes > est + est / 2 + 262_144 {
+                                        let est = range_est;
+                                        if range_abort.seen_bytes() > est + est / 2 + 262_144 {
                                             let from_slot = match &ranges[range_idx].0 {
                                                 CodecPoint::Specific(s, _) => *s,
                                                 CodecPoint::Origin => 0,
@@ -2781,7 +2955,7 @@ impl ConnectionLifecycleManager {
                                                 range_idx,
                                                 planned = ranges[range_idx].3,
                                                 delivered = count,
-                                                actual_bytes = range_bytes,
+                                                actual_bytes = range_abort.seen_bytes(),
                                                 estimated_bytes = est,
                                                 from_slot,
                                                 to_slot = range_to_slot,
@@ -2801,8 +2975,29 @@ impl ConnectionLifecycleManager {
                                                 state.record_fetch_failed(addr);
                                             }
                                         }
-                                        active_fetcher.store(0, std::sync::atomic::Ordering::SeqCst);
-                                        let _ = peer_failure_tx.try_send(addr);
+                                        // #751: provable protocol violations
+                                        // (mis-declared sizes, undecodable
+                                        // blocks, agency/state violations) get
+                                        // connection teardown on top of
+                                        // reputation — Haskell parity, where
+                                        // every BlockFetch conviction is a
+                                        // thrown exception that kills the
+                                        // bearer. Transport-level recv errors
+                                        // stay reputation-only.
+                                        use dugite_network::error::ProtocolError as PE;
+                                        let kind = match &e {
+                                            PE::CborDecode { .. }
+                                            | PE::BoundsExceeded { .. }
+                                            | PE::AgencyViolation { .. }
+                                            | PE::InvalidMessage { .. }
+                                            | PE::StateViolation { .. } => {
+                                                PeerFailureKind::ProtocolFault
+                                            }
+                                            _ => PeerFailureKind::Slow,
+                                        };
+                                        // Slot release + companion clear via
+                                        // the guard's Drop at `return`.
+                                        let _ = peer_failure_tx.try_send((addr, kind));
                                         return;
                                     }
                                     Err(_elapsed) => {
@@ -2831,8 +3026,9 @@ impl ConnectionLifecycleManager {
                                                 state.record_fetch_failed(addr);
                                             }
                                         }
-                                        active_fetcher.store(0, std::sync::atomic::Ordering::SeqCst);
-                                        let _ = peer_failure_tx.try_send(addr);
+                                        // Slot release + companion clear via
+                                        // the guard's Drop at `return`.
+                                        let _ = peer_failure_tx.try_send((addr, PeerFailureKind::Slow));
                                         return;
                                     }
                                 }
@@ -2843,7 +3039,7 @@ impl ConnectionLifecycleManager {
                                 // apply loop below. Keeps `pipeline_window` requests
                                 // outstanding at all times (until the tail).
                                 if next_req < ranges.len() {
-                                    let (from, to, _est, _planned) = ranges[next_req].clone();
+                                    let (from, to, _est, _planned, _declared) = ranges[next_req].clone();
                                     let refill_req = BlockFetchClient::send_range_request(&mut channel, from, to);
                                     let refill_result = tokio::select! {
                                         biased;
@@ -2863,9 +3059,9 @@ impl ConnectionLifecycleManager {
                                                     state.record_fetch_failed(addr);
                                                 }
                                             }
-                                            active_fetcher
-                                                .store(0, std::sync::atomic::Ordering::SeqCst);
-                                            let _ = peer_failure_tx.try_send(addr);
+                                            // Slot release + companion clear
+                                            // via the guard's Drop at `return`.
+                                            let _ = peer_failure_tx.try_send((addr, PeerFailureKind::Slow));
                                             return;
                                         }
                                     }
@@ -2910,9 +3106,9 @@ impl ConnectionLifecycleManager {
                                     };
                                     if let Err(e) = send_result {
                                         warn!(%addr, slot, "send to run loop failed (channel closed): {e}");
-                                        // Channel closed means the run loop exited.
-                                        // Release the active fetcher and stop.
-                                        active_fetcher.store(0, std::sync::atomic::Ordering::SeqCst);
+                                        // Channel closed means the run loop
+                                        // exited. Slot release + companion
+                                        // clear via the guard's Drop.
                                         return;
                                     }
                                 }
@@ -3626,7 +3822,8 @@ impl ConnectionLifecycleManager {
     /// Variant of [`new_for_test`] that returns the peer-failure receiver
     /// instead of dropping it, so tests can observe failures reported by
     /// protocol tasks (e.g. the chainsync auto-restart hook from #499).
-    pub(crate) fn new_for_test_with_failure_rx() -> (Self, mpsc::Receiver<SocketAddr>) {
+    pub(crate) fn new_for_test_with_failure_rx(
+    ) -> (Self, mpsc::Receiver<(SocketAddr, PeerFailureKind)>) {
         let (fetched_blocks_tx, _rx) = mpsc::channel(1);
         let (block_announcement_tx, _) = broadcast::channel(1);
         let (rollback_announcement_tx, _) = broadcast::channel(1);
@@ -4829,7 +5026,7 @@ mod tests {
                 .expect("peer_failure_rx timed out");
         assert_eq!(
             received,
-            Some(addr),
+            Some((addr, PeerFailureKind::Slow)),
             "chainsync task must report failure to peer manager when bearer closes"
         );
         // Drain the spawned task; it should already be finishing.
@@ -6198,6 +6395,252 @@ mod fix3_blockfetch_ingress_tests {
             next.len(),
             3000,
             "non-fetched headers must reappear on next tick"
+        );
+    }
+}
+
+// ─── #751: receive-side per-range byte abort ────────────────────────────────
+//
+// A peer that under-declares `block_body_size` (a SIGNED header field) can
+// pack far more actual bytes into a nominal range than budgeted. The mux
+// ingress backstop (48 MB) kills the connection generically; the #751 abort
+// attributes the overrun to the peer as a ProtocolError (reputation/backoff)
+// long before the backstop. Adversarial contract:
+//   • honest variance must NEVER trip the abort (declared sizes are exact,
+//     the WARN threshold at 1.5×+256 KiB fires strictly first)
+//   • Byron / average-estimated ranges are NEVER armed (no declared sizes
+//     to hold the peer to — honest variance there is unbounded)
+//   • a size-lying peer trips the abort well below the ingress backstop
+#[cfg(test)]
+mod range_byte_abort_751_tests {
+    use super::*;
+
+    fn hdr(slot: u64, body_size: Option<u64>) -> PendingHeader {
+        PendingHeader {
+            slot,
+            hash: [slot as u8; 32],
+            header_cbor: vec![0u8; 1_000],
+            body_size,
+            prev_hash: None,
+        }
+    }
+
+    /// Limit math: factor × estimate + slack in the un-clamped region,
+    /// ceiling-clamped above it, saturating (no overflow panic on
+    /// adversarially huge declared sizes).
+    #[test]
+    fn abort_limit_math_ceiling_and_saturation() {
+        assert_eq!(range_byte_abort_limit(0), RANGE_BYTE_ABORT_SLACK);
+        // Un-clamped region: 3×4 MiB + 1 MiB = 13 MiB < 20 MiB ceiling.
+        assert_eq!(
+            range_byte_abort_limit(4 << 20),
+            (4 << 20) * RANGE_BYTE_ABORT_FACTOR + RANGE_BYTE_ABORT_SLACK
+        );
+        // A full-budget range (8 MiB est → 25 MiB formula) clamps to the
+        // ceiling so attribution survives the pipeline-window worst case.
+        assert_eq!(range_byte_abort_limit(8 << 20), RANGE_BYTE_ABORT_CEILING);
+        // Saturation: must not panic; the ceiling caps everything.
+        assert_eq!(range_byte_abort_limit(usize::MAX), RANGE_BYTE_ABORT_CEILING);
+        assert_eq!(
+            range_byte_abort_limit(usize::MAX / 2),
+            RANGE_BYTE_ABORT_CEILING
+        );
+    }
+
+    // (The #751 attribution invariant — abort ceiling × pipeline window ≤
+    // mux ingress limit, with ≥2× honest headroom over the byte budget — is
+    // enforced by the compile-time `const _: () = assert!(…)` blocks next to
+    // `RANGE_BYTE_ABORT_CEILING`; no runtime test needed.)
+
+    /// Lattice sweep over CONSTRUCTIBLE range estimates (range building
+    /// bounds the estimate at `BLOCKFETCH_RANGE_BYTE_BUDGET` + one max-size
+    /// block; larger declared sizes cannot appear on a chain whose headers
+    /// pass validation): the #747 instrumentation WARN threshold
+    /// (est + est/2 + 256 KiB) is STRICTLY below the abort limit —
+    /// instrumentation always fires before attribution, and honest 1.5×
+    /// variance never aborts.
+    #[test]
+    fn warn_threshold_strictly_below_abort_limit() {
+        for est in [
+            0usize,
+            1,
+            100,
+            4_096,
+            65_536,
+            1 << 20,
+            8 << 20,
+            BLOCKFETCH_RANGE_BYTE_BUDGET + 90_112 + 1_016, // budget + max block
+        ] {
+            let warn_at = est.saturating_add(est / 2).saturating_add(262_144);
+            let abort_at = range_byte_abort_limit(est);
+            assert!(
+                warn_at < abort_at,
+                "WARN threshold {warn_at} must precede abort limit {abort_at} (est={est})"
+            );
+        }
+    }
+
+    /// Armed behavior (not just the math): an armed `RangeByteAbort` accepts
+    /// an honest stream byte-for-byte, then convicts EXACTLY when a lying
+    /// stream crosses the limit — with the #751 conviction surfaced as
+    /// `BoundsExceeded`.
+    #[test]
+    fn armed_range_convicts_exactly_at_limit() {
+        let est = 2_232_000usize; // 2000 blocks declared at 100 B + header
+        let limit = range_byte_abort_limit(est);
+        let mut abort = RangeByteAbort::new(true, est);
+
+        // Honest-sized prefix: fine.
+        assert!(abort.on_block(90_112).is_ok());
+        // Walk to just below the limit…
+        let mut delivered = 90_112usize;
+        while delivered + 90_112 <= limit {
+            assert!(abort.on_block(90_112).is_ok(), "below limit must pass");
+            delivered += 90_112;
+        }
+        // …the next block crosses it: conviction, as BoundsExceeded, citing #751.
+        let err = abort.on_block(90_112).unwrap_err();
+        match err {
+            dugite_network::error::ProtocolError::BoundsExceeded { protocol, reason } => {
+                assert_eq!(protocol, "BlockFetch");
+                assert!(
+                    reason.contains("#751"),
+                    "conviction must cite #751: {reason}"
+                );
+            }
+            other => panic!("expected BoundsExceeded, got {other:?}"),
+        }
+        assert_eq!(abort.seen_bytes(), delivered + 90_112);
+    }
+
+    /// Unarmed (Byron/average) ranges never convict regardless of overshoot
+    /// — 100 MB through a range estimated at nothing stays `Ok`.
+    #[test]
+    fn unarmed_range_never_convicts() {
+        let mut abort = RangeByteAbort::new(false, 4_096);
+        for _ in 0..100 {
+            assert!(abort.on_block(1 << 20).is_ok());
+        }
+        assert_eq!(abort.seen_bytes(), 100 << 20);
+    }
+
+    /// An armed range delivering exactly its estimate (the honest case)
+    /// never convicts, and the accounting matches.
+    #[test]
+    fn armed_honest_exact_delivery_passes() {
+        let headers: Vec<_> = (0..92).map(|i| hdr(i, Some(90_112))).collect();
+        let est: usize = headers
+            .iter()
+            .map(|h| estimated_block_wire_bytes(h, 65_536))
+            .sum();
+        let mut abort = RangeByteAbort::new(true, est);
+        for h in &headers {
+            // Actual wire bytes ≈ declared body + header CBOR + framing.
+            assert!(abort.on_block(90_112 + h.header_cbor.len() + 16).is_ok());
+        }
+        assert_eq!(abort.seen_bytes(), est);
+    }
+
+    /// Arming flag: only ranges whose EVERY header declares a body size are
+    /// armed. One Byron header (None) anywhere disarms the whole range.
+    #[test]
+    fn arming_requires_all_headers_declared() {
+        let declared: Vec<_> = (0..10).map(|i| hdr(i, Some(50_000))).collect();
+        assert!(range_all_declared(&declared));
+
+        let mut mixed = declared.clone();
+        mixed[5] = hdr(5, None);
+        assert!(!range_all_declared(&mixed));
+
+        let byron: Vec<_> = (0..10).map(|i| hdr(i, None)).collect();
+        assert!(!range_all_declared(&byron));
+    }
+
+    /// Honest delivery: actual block wire bytes track the declared estimate
+    /// (header + body + framing). Even with +25% per-block framing variance
+    /// — far beyond anything real — an honest range stays under the abort
+    /// limit. (Real variance is bytes per block: the estimate already counts
+    /// declared body + header CBOR + 16 bytes framing.)
+    #[test]
+    fn honest_variance_never_trips_abort() {
+        // A realistic budget-full range: ~92 mainnet-max blocks (90,112 B).
+        let headers: Vec<_> = (0..92).map(|i| hdr(i, Some(90_112))).collect();
+        let est: usize = headers
+            .iter()
+            .map(|h| estimated_block_wire_bytes(h, 65_536))
+            .sum();
+        let limit = range_byte_abort_limit(est);
+
+        // Actual = declared body + header + GENEROUS 25% overhead.
+        let actual: usize = headers
+            .iter()
+            .map(|h| (90_112 + h.header_cbor.len()) * 5 / 4)
+            .sum();
+        assert!(
+            actual < limit,
+            "honest +25% delivery ({actual}) must stay below the abort limit ({limit})"
+        );
+
+        // A single tiny block: slack alone must absorb any framing variance.
+        let tiny = hdr(0, Some(100));
+        let est_tiny = estimated_block_wire_bytes(&tiny, 65_536);
+        let limit_tiny = range_byte_abort_limit(est_tiny);
+        let actual_tiny = 100 + 1_000 + 512; // body + header + worst-case framing
+        assert!(
+            actual_tiny < limit_tiny,
+            "tiny honest block ({actual_tiny}) must stay below ({limit_tiny})"
+        );
+    }
+
+    /// Adversarial: a size-liar declares 100-byte bodies but streams real
+    /// ~90 KB blocks. The abort limit must sit far BELOW the 48 MB mux
+    /// ingress backstop so the overrun is attributed (ProtocolError → peer
+    /// fault) instead of dying generically — and the cumulative delivery
+    /// crosses the limit within a few real blocks.
+    #[test]
+    fn size_liar_trips_abort_before_ingress_backstop() {
+        const INGRESS_BACKSTOP: usize = 48 << 20;
+        // Liar's range: max_range-many 100-byte-declared headers — the
+        // worst case (largest estimate a liar can build while lying small).
+        let headers: Vec<_> = (0..2_000).map(|i| hdr(i, Some(100))).collect();
+        let est: usize = headers
+            .iter()
+            .map(|h| estimated_block_wire_bytes(h, 65_536))
+            .sum();
+        let limit = range_byte_abort_limit(est);
+        assert!(
+            limit < INGRESS_BACKSTOP / 4,
+            "abort limit ({limit}) must sit far below the ingress backstop"
+        );
+
+        // Stream real 90 KB blocks: cumulative bytes cross the limit at
+        // block ~⌈limit/90KB⌉ — i.e. the guard fires mid-stream, not after
+        // the full 2000-block flood (~180 MB).
+        let real_block = 90_112usize;
+        let blocks_to_trip = limit / real_block + 1;
+        assert!(
+            blocks_to_trip < 100,
+            "abort must fire within ~100 real blocks, computed {blocks_to_trip}"
+        );
+        let cumulative = blocks_to_trip * real_block;
+        assert!(cumulative > limit, "guard fires once cumulative > limit");
+        assert!(
+            cumulative < INGRESS_BACKSTOP,
+            "attribution happens before the generic ingress death"
+        );
+    }
+
+    /// Byron ranges (no declared sizes) are estimated from the adaptive
+    /// average — honest variance can exceed ANY multiple of it (e.g. average
+    /// trained on empty 600-byte blocks, then a burst of full 2 MB Byron
+    /// blocks). The abort must not be armed: `range_all_declared` is false,
+    /// so no limit applies regardless of overshoot.
+    #[test]
+    fn byron_average_ranges_never_armed() {
+        let headers: Vec<_> = (0..100).map(|i| hdr(i, None)).collect();
+        assert!(
+            !range_all_declared(&headers),
+            "Byron ranges must never arm the #751 abort"
         );
     }
 }
