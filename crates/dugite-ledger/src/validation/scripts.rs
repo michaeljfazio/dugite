@@ -1158,7 +1158,7 @@ pub(super) fn ex_unit_fee(tx: &Transaction, params: &ProtocolParameters) -> u64 
 /// Reference:
 /// - `Cardano.Ledger.Alonzo.Tx.toCBORForSizeComputation` (cardano-ledger)
 /// - Conway tiered reference script fee is based on script bytes, not tx size.
-fn fee_tx_size(tx: &Transaction, tx_size: u64) -> u64 {
+pub(super) fn fee_tx_size(tx: &Transaction, tx_size: u64) -> u64 {
     // The raw CBOR first byte tells us the CBOR major type and additional info.
     // 0x84 = major type 4 (array) with additional info 4 (length = 4 elements).
     // An Alonzo+ transaction is encoded as array(4); pre-Alonzo as array(3) = 0x83.
