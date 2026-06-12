@@ -402,6 +402,14 @@ pub struct PendingHeader {
     /// estimate let nominal 8 MB ranges deliver 2×+ actual bytes and overrun
     /// the mux ingress queue).
     pub body_size: Option<u64>,
+    /// `prev_hash` from the decoded header (Shelley+), used for
+    /// chain-adjacency run splitting: two consecutive `pending_headers`
+    /// entries are only fetchable in ONE `MsgRequestRange` when the second
+    /// block's parent IS the first block (`pending_headers` is sparse
+    /// relative to the peer's chain — already-stored blocks are never
+    /// pushed). `None` for Byron / undecodable headers (adjacency unknown —
+    /// only filter-gap splitting applies).
+    pub prev_hash: Option<[u8; 32]>,
 }
 
 /// Estimated wire bytes a fetched block will occupy in the mux ingress
@@ -512,7 +520,22 @@ where
     let mut gap = true; // start of a fresh run
     for h in pending {
         if !is_known_in_chain_db(&h.hash) && !fetched_hashes.contains(&h.hash) {
-            if gap {
+            // Chain-adjacency split: even without a filter gap, consecutive
+            // pending entries may not be consecutive blocks on the peer's
+            // chain (`pending_headers` is sparse — already-stored blocks are
+            // never pushed, e.g. the overlap re-streamed after a CSJ dynamo
+            // rotation). A range spanning such a hidden gap makes the peer
+            // deliver the gap blocks too, breaking the byte accounting
+            // (observed live: 1.7-2x estimate, #747). Split whenever the
+            // next header's declared parent is NOT the previous header in
+            // the run; unknown parents (Byron) keep filter-gap-only
+            // behaviour.
+            let adjacent = match (runs.last_mut().filter(|_| !gap), h.prev_hash) {
+                (Some(run), Some(prev)) => run.last().map(|p| p.hash == prev).unwrap_or(true),
+                (Some(_), None) => true, // unknown parent — don't split
+                (None, _) => true,       // fresh run anyway
+            };
+            if gap || !adjacent {
                 runs.push(Vec::new());
                 gap = false;
             }
@@ -2535,35 +2558,37 @@ impl ConnectionLifecycleManager {
                             // (#747 instrumentation: residual ingress overruns
                             // mean actual > estimate somewhere; the WARN below
                             // names the offending range).
-                            let ranges: Vec<(CodecPoint, CodecPoint, usize)> = fetch_runs
-                                .iter()
-                                .flat_map(|run| {
-                                    build_fetch_ranges(run, avg_block_bytes, max_range)
-                                        .into_iter()
-                                        .map(move |(start, end)| {
-                                            let est: usize = run[start..=end]
-                                                .iter()
-                                                .map(|h| {
-                                                    estimated_block_wire_bytes(
-                                                        h,
-                                                        avg_block_bytes,
-                                                    )
-                                                })
-                                                .sum();
-                                            (
-                                                CodecPoint::Specific(
-                                                    run[start].slot,
-                                                    run[start].hash,
-                                                ),
-                                                CodecPoint::Specific(
-                                                    run[end].slot,
-                                                    run[end].hash,
-                                                ),
-                                                est,
-                                            )
-                                        })
-                                })
-                                .collect();
+                            let ranges: Vec<(CodecPoint, CodecPoint, usize, usize)> =
+                                fetch_runs
+                                    .iter()
+                                    .flat_map(|run| {
+                                        build_fetch_ranges(run, avg_block_bytes, max_range)
+                                            .into_iter()
+                                            .map(move |(start, end)| {
+                                                let est: usize = run[start..=end]
+                                                    .iter()
+                                                    .map(|h| {
+                                                        estimated_block_wire_bytes(
+                                                            h,
+                                                            avg_block_bytes,
+                                                        )
+                                                    })
+                                                    .sum();
+                                                (
+                                                    CodecPoint::Specific(
+                                                        run[start].slot,
+                                                        run[start].hash,
+                                                    ),
+                                                    CodecPoint::Specific(
+                                                        run[end].slot,
+                                                        run[end].hash,
+                                                    ),
+                                                    est,
+                                                    end - start + 1,
+                                                )
+                                            })
+                                    })
+                                    .collect();
 
                             debug!(%addr, ranges = ranges.len(), headers = headers_to_fetch.len(), "BlockFetch: fetching in batched ranges");
 
@@ -2585,7 +2610,7 @@ impl ConnectionLifecycleManager {
                             let mut next_req = 0usize;
                             let mut prime_failed = false;
                             while next_req < pipeline_window {
-                                let (from, to, _est) = ranges[next_req].clone();
+                                let (from, to, _est, _planned) = ranges[next_req].clone();
                                 let send_req = BlockFetchClient::send_range_request(&mut channel, from, to);
                                 let result = tokio::select! {
                                     biased;
@@ -2747,12 +2772,19 @@ impl ConnectionLifecycleManager {
                                         // offending slots/peer are identifiable.
                                         let est = ranges[range_idx].2;
                                         if range_bytes > est + est / 2 + 262_144 {
+                                            let from_slot = match &ranges[range_idx].0 {
+                                                CodecPoint::Specific(s, _) => *s,
+                                                CodecPoint::Origin => 0,
+                                            };
                                             warn!(
                                                 %addr,
                                                 range_idx,
-                                                count,
+                                                planned = ranges[range_idx].3,
+                                                delivered = count,
                                                 actual_bytes = range_bytes,
                                                 estimated_bytes = est,
+                                                from_slot,
+                                                to_slot = range_to_slot,
                                                 "BlockFetch: range delivered far more bytes \
                                                  than the header-declared estimate (#747)"
                                             );
@@ -2811,7 +2843,7 @@ impl ConnectionLifecycleManager {
                                 // apply loop below. Keeps `pipeline_window` requests
                                 // outstanding at all times (until the tail).
                                 if next_req < ranges.len() {
-                                    let (from, to, _est) = ranges[next_req].clone();
+                                    let (from, to, _est, _planned) = ranges[next_req].clone();
                                     let refill_req = BlockFetchClient::send_range_request(&mut channel, from, to);
                                     let refill_result = tokio::select! {
                                         biased;
@@ -3746,6 +3778,7 @@ mod tests {
                 hash: [0xAB; 32],
                 header_cbor: vec![0x82, 0x01],
                 body_size: None,
+                prev_hash: None,
             }],
             ..Default::default()
         };
@@ -3779,6 +3812,7 @@ mod tests {
                 hash: [0x02; 32],
                 header_cbor: vec![],
                 body_size: None,
+                prev_hash: None,
             },
             // Already in ChainDB — must be skipped.
             PendingHeader {
@@ -3786,6 +3820,7 @@ mod tests {
                 hash: [0x01; 32],
                 header_cbor: vec![],
                 body_size: None,
+                prev_hash: None,
             },
             // Above applied_slot — must be fetched.
             PendingHeader {
@@ -3793,6 +3828,7 @@ mod tests {
                 hash: [0x03; 32],
                 header_cbor: vec![],
                 body_size: None,
+                prev_hash: None,
             },
         ];
         let _ = applied_slot; // documents the scenario; not used in filter
@@ -3833,12 +3869,14 @@ mod tests {
                 hash: [0xAA; 32],
                 header_cbor: vec![],
                 body_size: None,
+                prev_hash: None,
             }, // in-flight
             PendingHeader {
                 slot: 11,
                 hash: [0xBB; 32],
                 header_cbor: vec![],
                 body_size: None,
+                prev_hash: None,
             }, // new
         ];
 
@@ -3881,30 +3919,35 @@ mod tests {
                 hash: h1,
                 header_cbor: vec![],
                 body_size: None,
+                prev_hash: None,
             },
             PendingHeader {
                 slot: 11,
                 hash: h2,
                 header_cbor: vec![],
                 body_size: None,
+                prev_hash: None,
             },
             PendingHeader {
                 slot: 12,
                 hash: h3,
                 header_cbor: vec![],
                 body_size: None,
+                prev_hash: None,
             },
             PendingHeader {
                 slot: 13,
                 hash: h4,
                 header_cbor: vec![],
                 body_size: None,
+                prev_hash: None,
             },
             PendingHeader {
                 slot: 14,
                 hash: h5,
                 header_cbor: vec![],
                 body_size: None,
+                prev_hash: None,
             },
         ];
         let known: HashSet<[u8; 32]> = HashSet::new();
@@ -3959,18 +4002,21 @@ mod tests {
                 hash: h1,
                 header_cbor: vec![],
                 body_size: None,
+                prev_hash: None,
             },
             PendingHeader {
                 slot: 11,
                 hash: h2,
                 header_cbor: vec![],
                 body_size: None,
+                prev_hash: None,
             },
             PendingHeader {
                 slot: 12,
                 hash: h3,
                 header_cbor: vec![],
                 body_size: None,
+                prev_hash: None,
             },
         ];
         let known: HashSet<[u8; 32]> = HashSet::new();
@@ -4035,6 +4081,7 @@ mod tests {
             hash: [0xFF; 32],
             header_cbor: vec![0x83, 0x01, 0x02],
             body_size: None,
+            prev_hash: None,
         };
         assert_eq!(hdr.slot, 999);
         assert_eq!(hdr.header_cbor.len(), 3);
@@ -4509,12 +4556,14 @@ mod tests {
                 hash: known_hash,
                 header_cbor: vec![],
                 body_size: None,
+                prev_hash: None,
             },
             PendingHeader {
                 slot: 2,
                 hash: [0xCD; 32],
                 header_cbor: vec![],
                 body_size: None,
+                prev_hash: None,
             },
         ];
         let out = select_headers_to_fetch(&pending, |h| h == &known_hash, &HashSet::new());
@@ -4536,6 +4585,7 @@ mod tests {
                 hash: [0x77; 32],
                 header_cbor: vec![0x01, 0x02],
                 body_size: None,
+                prev_hash: None,
             }],
             ..Default::default()
         };
@@ -5263,6 +5313,7 @@ mod tests {
                     hash: [0x01; 32],
                     header_cbor: vec![],
                     body_size: None,
+                    prev_hash: None,
                 });
                 s
             });
@@ -5345,12 +5396,14 @@ mod tests {
                     hash: [0x02; 32],
                     header_cbor: vec![],
                     body_size: None,
+                    prev_hash: None,
                 });
                 s.pending_headers.push(PendingHeader {
                     slot: 2,
                     hash: [0x03; 32],
                     header_cbor: vec![],
                     body_size: None,
+                    prev_hash: None,
                 });
                 s
             });
@@ -5853,6 +5906,7 @@ mod fix3_blockfetch_ingress_tests {
             hash: [slot as u8; 32],
             header_cbor: vec![0u8; 1_000],
             body_size,
+            prev_hash: None,
         }
     }
 
@@ -5965,6 +6019,68 @@ mod fix3_blockfetch_ingress_tests {
         assert_eq!(runs[0].len(), 5);
     }
 
+    /// Chained helper: header i's prev_hash = header (i-1)'s hash.
+    fn chained(slots: &[u64]) -> Vec<PendingHeader> {
+        slots
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| PendingHeader {
+                slot: s,
+                hash: [s as u8; 32],
+                header_cbor: vec![0u8; 1_000],
+                body_size: Some(10_000),
+                prev_hash: if i == 0 {
+                    Some([0xFFu8; 32])
+                } else {
+                    Some([slots[i - 1] as u8; 32])
+                },
+            })
+            .collect()
+    }
+
+    /// `pending_headers` can be SPARSE relative to the peer's chain (blocks
+    /// already in ChainDB are never pushed). A prev-hash discontinuity inside
+    /// an otherwise filter-contiguous list must split the run — otherwise the
+    /// MsgRequestRange spans the hidden gap and the peer delivers the gap
+    /// blocks too (observed live as ranges delivering 1.7-2x their estimate).
+    #[test]
+    fn fetch_runs_split_on_prev_hash_discontinuity() {
+        let mut pending = chained(&[1, 2, 3]);
+        // headers 4,5 chain to a block NOT in the list (block 0xAA) — the
+        // hidden gap: blocks between 3 and 4 are already stored.
+        let mut tail = chained(&[40, 41]);
+        tail[0].prev_hash = Some([0xAAu8; 32]);
+        pending.append(&mut tail);
+        let runs = select_fetch_runs(&pending, |_| false, &std::collections::HashSet::new());
+        let run_slots: Vec<Vec<u64>> = runs
+            .iter()
+            .map(|r| r.iter().map(|h| h.slot).collect())
+            .collect();
+        assert_eq!(
+            run_slots,
+            vec![vec![1, 2, 3], vec![40, 41]],
+            "a prev-hash discontinuity must split the run"
+        );
+    }
+
+    /// Fully chained headers stay in one run.
+    #[test]
+    fn fetch_runs_keep_chained_headers_together() {
+        let pending = chained(&[1, 2, 3, 4, 5]);
+        let runs = select_fetch_runs(&pending, |_| false, &std::collections::HashSet::new());
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].len(), 5);
+    }
+
+    /// Unknown parents (Byron: prev_hash=None) never trigger adjacency
+    /// splits — filter-gap-only behaviour is preserved.
+    #[test]
+    fn fetch_runs_unknown_parent_no_adjacency_split() {
+        let pending: Vec<_> = (0..5).map(|i| hdr(i, Some(10_000))).collect();
+        let runs = select_fetch_runs(&pending, |_| false, &std::collections::HashSet::new());
+        assert_eq!(runs.len(), 1, "None prev_hash must not split runs");
+    }
+
     /// chain-db-known blocks split runs exactly like fetched-hash gaps.
     #[test]
     fn fetch_runs_split_on_chain_db_known() {
@@ -6057,6 +6173,7 @@ mod fix3_blockfetch_ingress_tests {
                     hash,
                     header_cbor: vec![],
                     body_size: None,
+                    prev_hash: None,
                 }
             })
             .collect();
