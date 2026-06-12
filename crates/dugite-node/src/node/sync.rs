@@ -3586,7 +3586,7 @@ pub(crate) fn eager_validate_header(
     // snapshot value, and that diverged view must win.
     seed_peer_counter_from_global(peer_counters, consensus_seed.opcert_counters(), pool_id);
 
-    consensus_seed.validate_header_full_with_counters(
+    let result = consensus_seed.validate_header_full_with_counters(
         peer_counters,
         &header,
         current_slot,
@@ -3595,8 +3595,51 @@ pub(crate) fn eager_validate_header(
         dugite_consensus::ValidationMode::Replay,
         ledger_pv,
         ledger_tip,
-    )?;
-    Ok(true)
+    );
+    if let Err(dugite_consensus::ConsensusError::OpcertCounterOverIncremented { got, last_seen }) =
+        &result
+    {
+        tracing::debug!(
+            %peer_addr, slot = header_slot, got, last_seen,
+            "eager: opcert over-increment deferred to authoritative body apply \
+             (per-peer counter is not authoritative for the upper bound)"
+        );
+    }
+    classify_eager_validation_result(result)
+}
+
+/// Map a `validate_header_full_with_counters` result to the eager-validation
+/// outcome, deferring the one check the eager layer cannot authoritatively
+/// enforce.
+///
+/// The opcert UPPER bound (`CounterOverIncrementedOCERT`, `n > m + 1`) is
+/// computed against `m` = the PER-PEER reconstructed counter, which only ever
+/// sees the opcert advances carried by headers THIS peer streamed. A pool may
+/// legitimately advance its counter by > 1 across blocks the peer never sent
+/// us (it re-issued its opcert several times off-window, or — on a
+/// Mithril-bootstrapped node — advanced past the snapshot tip while our
+/// per-peer baseline stayed frozen at the startup `consensus_seed` clone).
+/// Treating that as fatal in the eager layer false-rejects an honest peer
+/// (review of #756: a freshly-connected peer's first header for a
+/// post-snapshot-rotated pool was penalised even though the block is valid
+/// on-chain).
+///
+/// So an over-increment is mapped to `Ok(false)` (deliberate skip): the
+/// body-apply path (`validate_header_full` against the LIVE global counters,
+/// which advance on every applied block) IS authoritative and re-checks the
+/// upper bound, so deferring it here loses no safety — a genuine
+/// over-increment attack is still rejected at apply with the peer attributed
+/// there. EVERY OTHER check (VRF, KES, and crucially the opcert LOWER bound
+/// `CounterTooSmallOCERT` replay-regression guard, which a stale baseline can
+/// only make MORE conservative) stays fatal.
+fn classify_eager_validation_result(
+    result: Result<(), dugite_consensus::ConsensusError>,
+) -> Result<bool, dugite_consensus::ConsensusError> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(dugite_consensus::ConsensusError::OpcertCounterOverIncremented { .. }) => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// Seed a single pool's entry in a per-peer opcert-counter view from the
@@ -6005,6 +6048,44 @@ mod seed_peer_counter_tests {
         let global: HashMap<Hash28, u64> = HashMap::new();
         seed_peer_counter_from_global(&mut peer, &global, pool(0x85));
         assert!(peer.is_empty(), "no entry when global lacks the pool");
+    }
+
+    /// Eager-validation outcome mapping (review of #756): an opcert
+    /// over-increment is DEFERRED (Ok(false)/skip) because the per-peer
+    /// counter is not authoritative for the upper bound — the body-apply
+    /// path re-checks it. Every other error stays fatal; success → Ok(true).
+    #[test]
+    fn eager_defers_over_increment_keeps_other_faults_fatal() {
+        use dugite_consensus::ConsensusError;
+
+        // Success → validated.
+        assert!(classify_eager_validation_result(Ok(())).unwrap());
+
+        // Over-increment → deliberate skip, NOT a peer fault.
+        let over = Err(ConsensusError::OpcertCounterOverIncremented {
+            got: 5,
+            last_seen: 0,
+        });
+        assert!(
+            !classify_eager_validation_result(over).unwrap(),
+            "over-increment must be deferred to body apply, never penalise the peer here"
+        );
+
+        // The opcert LOWER bound (replay-regression guard) stays FATAL — a
+        // stale baseline can only make it more conservative, never permissive,
+        // so eager enforcement is safe.
+        let regress = Err(ConsensusError::OpcertSequenceRegression {
+            got: 2,
+            expected: 5,
+        });
+        assert!(
+            classify_eager_validation_result(regress).is_err(),
+            "CounterTooSmall/regression must remain a fatal eager fault"
+        );
+
+        // An unrelated crypto fault stays fatal.
+        let bad = Err(ConsensusError::InvalidBlock("kes".into()));
+        assert!(classify_eager_validation_result(bad).is_err());
     }
 
     /// End-to-end of the regression: a peer map seeded from a snapshot global
