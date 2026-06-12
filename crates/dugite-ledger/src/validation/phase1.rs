@@ -1311,11 +1311,21 @@ pub(super) fn run_phase1_rules(
 
     // ------------------------------------------------------------------
     // Rule 6: Transaction size limit
+    //
+    // Haskell `validateMaxTxSizeUTxO` compares `sizeTxF`, which for Alonzo+
+    // is `toCBORForSizeComputation` — the 3-element [body, wits, aux]
+    // encoding WITHOUT the is_valid flag, i.e. full wire size − 1 — the
+    // same measure as the fee size. Proven on-chain: mainnet slot
+    // 94,062,660 carries a confirmed 16,385-wire-byte tx against
+    // maxTxSize=16384 (wallets build to exactly the Haskell limit); using
+    // the raw wire size falsely rejected it by one byte. db-sync/Koios
+    // `tx_size` records the same wire−1 measure.
     // ------------------------------------------------------------------
-    if tx_size > params.max_tx_size {
+    let haskell_tx_size = super::scripts::fee_tx_size(tx, tx_size);
+    if haskell_tx_size > params.max_tx_size {
         errors.push(ValidationError::TxTooLarge {
             maximum: params.max_tx_size,
-            actual: tx_size,
+            actual: haskell_tx_size,
         });
     }
 
@@ -2133,6 +2143,42 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, ValidationError::NotYetValid { .. })),
             "expected NotYetValid, got {errors:?}"
+        );
+    }
+
+    /// Rule 6 must use the Haskell size (`toCBORForSizeComputation` =
+    /// wire − 1 for Alonzo+): a tx whose FULL wire size is max_tx_size + 1
+    /// is exactly at the Haskell limit and must be ACCEPTED (proven on-chain
+    /// at mainnet slot 94,062,660); one more byte must be rejected.
+    #[test]
+    fn test_max_tx_size_uses_haskell_size_for_alonzo_plus() {
+        let (utxo_set, mut tx, _input) = make_valid_tx();
+        let params = ProtocolParameters::mainnet_defaults();
+        let max = params.max_tx_size;
+
+        // Alonzo+ wire form: raw_cbor starting 0x84 → fee/size measure = wire − 1.
+        let mut wire = vec![0x84u8];
+        wire.resize((max + 1) as usize, 0);
+        tx.raw_cbor = Some(wire.clone());
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, max + 1, None);
+        let too_large = matches!(&result, Err(errors) if errors.iter().any(|e| {
+            matches!(e, ValidationError::TxTooLarge { .. })
+        }));
+        assert!(
+            !too_large,
+            "wire size max+1 (Haskell size == max) must NOT be TxTooLarge; got {result:?}"
+        );
+
+        let mut wire2 = vec![0x84u8];
+        wire2.resize((max + 2) as usize, 0);
+        tx.raw_cbor = Some(wire2);
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, max + 2, None);
+        let too_large = matches!(&result, Err(errors) if errors.iter().any(|e| {
+            matches!(e, ValidationError::TxTooLarge { .. })
+        }));
+        assert!(
+            too_large,
+            "wire size max+2 (Haskell size == max+1) must be TxTooLarge; got {result:?}"
         );
     }
 
