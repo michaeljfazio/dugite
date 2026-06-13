@@ -446,10 +446,13 @@ pub(crate) fn check_script_redeemers(
     //   - UnregDRep (credential must be Script)
     //   - UpdateDRep (credential must be Script)
     //
+    //   - ConwayStakeRegistration (deposit-bearing RegDepositTxCert — Conway)
+    //
     // Certificates that do NOT require a redeemer regardless of credential type:
-    //   - StakeRegistration, ConwayStakeRegistration, PoolRegistration,
-    //     PoolRetirement, RegDRep, GenesisKeyDelegation, MoveInstantaneousRewards
-    //     (either registrations or pool-operator-only actions)
+    //   - StakeRegistration (legacy no-deposit), PoolRegistration, PoolRetirement,
+    //     RegDRep (witness requirement under live re-verification — see below),
+    //     GenesisKeyDelegation, MoveInstantaneousRewards
+    //     (permissionless registration or pool-operator-only actions)
     let cert_indices: HashSet<u32> = tx
         .witness_set
         .redeemers
@@ -485,9 +488,17 @@ pub(crate) fn check_script_redeemers(
             Certificate::UnregDRep { credential: c, .. } => Some(c),
             // DRep update: credential must sign.
             Certificate::UpdateDRep { credential: c, .. } => Some(c),
-            // Registrations and pool operations do not require a redeemer.
+            // Conway stake registration WITH a deposit (RegDepositTxCert) requires a
+            // witness (Haskell getScriptWitnessConwayTxCert: `ConwayRegCert cred
+            // (SJust _) -> credScriptHash cred`). dugite's ConwayStakeRegistration is
+            // ALWAYS the deposit-bearing form (CBOR tag 7); the legacy no-deposit form
+            // is StakeRegistration (in the None arm below).
+            Certificate::ConwayStakeRegistration { credential: c, .. } => Some(c),
+            // Legacy no-deposit registration and pool operations do not require a
+            // redeemer. (RegDRep witness requirement: under live re-verification —
+            // the cardano-ledger-oracle says it needs one, an existing test says it
+            // does not; deferred to avoid a false-rejection halt until confirmed.)
             Certificate::StakeRegistration(_)
-            | Certificate::ConwayStakeRegistration { .. }
             | Certificate::PoolRegistration(_)
             | Certificate::PoolRetirement { .. }
             | Certificate::RegDRep { .. }
@@ -729,6 +740,15 @@ pub(crate) fn check_extra_redeemers(
                 ..
             } => Some(h),
             Certificate::UpdateDRep {
+                credential: Credential::Script(h),
+                ..
+            } => Some(h),
+            // Conway deposit-bearing registration (RegDepositTxCert) requires a
+            // script witness, so its Cert redeemer is NEEDED — not extra (Haskell
+            // getScriptWitnessConwayTxCert returns credScriptHash for `ConwayRegCert
+            // cred (SJust _)`). dugite's ConwayStakeRegistration is always the deposit
+            // form (tag 7); the legacy no-deposit StakeRegistration is permissionless.
+            Certificate::ConwayStakeRegistration {
                 credential: Credential::Script(h),
                 ..
             } => Some(h),
