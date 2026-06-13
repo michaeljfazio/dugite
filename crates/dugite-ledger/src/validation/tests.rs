@@ -5942,6 +5942,158 @@ mod tests {
         );
     }
 
+    /// A Conway `ConwayStakeRegistration` (deposit-bearing `RegDepositTxCert`,
+    /// CBOR tag 7) with a SCRIPT credential REQUIRES a Cert redeemer — unlike the
+    /// legacy no-deposit `StakeRegistration`, the deposit form carries a script
+    /// witness. Haskell `getScriptWitnessConwayTxCert`:
+    ///   `ConwayRegCert cred (SJust _) -> credScriptHash cred`.
+    ///
+    /// Without the matching Cert redeemer the tx must be rejected with
+    /// `MissingRedeemer { tag: "Cert", index: 0 }`; with one present (covered by
+    /// the converse check below) it must NOT appear as an `ExtraRedeemer`.
+    ///
+    /// Regression for the Conway ValidateAll `ExtraRedeemer(Cert)` divergence
+    /// observed on mainnet tx
+    /// fe8da9ad24251e3a5eba8efb6f7294e72a9820b5bd45c779365877f51a003118
+    /// (deposit-bearing registration of a script-credential stake key).
+    #[test]
+    fn test_cert_redeemer_conway_deposit_registration_script_requires_redeemer() {
+        use super::super::collateral::{check_extra_redeemers, check_script_redeemers};
+        use dugite_primitives::credentials::Credential;
+        use dugite_primitives::transaction::Certificate;
+        use dugite_primitives::value::Lovelace;
+
+        // Derive the credential hash from the actual Plutus V2 script so the
+        // version map recognises it as a Plutus (version > 0) credential.
+        let plutus_script = vec![0xC7u8];
+        let script_hash = dugite_primitives::hash::blake2b_224_tagged(2, &plutus_script);
+
+        let mut utxo_set = UtxoSet::new();
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0x84; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(5_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: false,
+                raw_cbor: None,
+            },
+        );
+
+        let make_tx = |redeemers: Vec<Redeemer>| Transaction {
+            era: dugite_primitives::era::Era::Conway,
+            hash: Hash32::ZERO,
+            body: TransactionBody {
+                inputs: vec![input.clone()],
+                outputs: vec![TransactionOutput {
+                    address: Address::Byron(ByronAddress {
+                        payload: vec![0u8; 32],
+                    }),
+                    value: Value::lovelace(4_800_000),
+                    datum: OutputDatum::None,
+                    script_ref: None,
+                    is_legacy: false,
+                    raw_cbor: None,
+                }],
+                fee: Lovelace(200_000),
+                ttl: None,
+                certificates: vec![Certificate::ConwayStakeRegistration {
+                    credential: Credential::Script(script_hash),
+                    deposit: Lovelace(2_000_000),
+                }],
+                withdrawals: BTreeMap::new(),
+                auxiliary_data_hash: None,
+                validity_interval_start: None,
+                mint: BTreeMap::new(),
+                script_data_hash: None,
+                collateral: vec![],
+                required_signers: vec![],
+                network_id: None,
+                collateral_return: None,
+                total_collateral: None,
+                reference_inputs: vec![],
+                update: None,
+                voting_procedures: BTreeMap::new(),
+                proposal_procedures: vec![],
+                treasury_value: None,
+                donation: None,
+                sub_transactions: vec![],
+                account_balance_intervals: vec![],
+                direct_deposits: ::std::collections::BTreeMap::new(),
+                guards: Vec::new(),
+            },
+            witness_set: TransactionWitnessSet {
+                vkey_witnesses: vec![],
+                native_scripts: vec![],
+                bootstrap_witnesses: vec![],
+                plutus_v1_scripts: vec![],
+                plutus_v2_scripts: vec![plutus_script.clone()],
+                plutus_v3_scripts: vec![],
+                plutus_data: vec![],
+                redeemers,
+                raw_redeemers_cbor: None,
+                raw_plutus_data_cbor: None,
+                original_script_data_hash: None,
+            },
+            is_valid: true,
+            auxiliary_data: None,
+            raw_cbor: None,
+            raw_body_cbor: None,
+            raw_witness_cbor: None,
+        };
+
+        // Case 1 — missing redeemer: must be rejected with MissingRedeemer.
+        let tx_missing = make_tx(vec![]);
+        let mut errors: Vec<ValidationError> = Vec::new();
+        check_script_redeemers(
+            &tx_missing,
+            &utxo_set,
+            &super::super::collateral::plutus_script_version_map(&tx_missing, &utxo_set),
+            &mut errors,
+        );
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::MissingRedeemer { tag, index: 0 } if tag == "Cert"
+            )),
+            "deposit-bearing ConwayStakeRegistration with Script credential must \
+             require a Cert redeemer, got: {errors:?}"
+        );
+
+        // Case 2 — redeemer present: must NOT be flagged as an ExtraRedeemer.
+        let tx_present = make_tx(vec![Redeemer {
+            tag: RedeemerTag::Cert,
+            index: 0,
+            data: PlutusData::Integer(num_bigint::BigInt::from(0i64)),
+            ex_units: ExUnits {
+                mem: 100,
+                steps: 100,
+            },
+        }]);
+        let mut extra_errors: Vec<ValidationError> = Vec::new();
+        check_extra_redeemers(
+            &tx_present,
+            &utxo_set,
+            &super::super::collateral::plutus_script_version_map(&tx_present, &utxo_set),
+            &mut extra_errors,
+        );
+        assert!(
+            !extra_errors.iter().any(|e| matches!(
+                e,
+                ValidationError::ExtraRedeemer { tag, .. } if tag == "Cert"
+            )),
+            "Cert redeemer matching a deposit-bearing ConwayStakeRegistration must \
+             not be reported as extra, got: {extra_errors:?}"
+        );
+    }
+
     /// A `StakeDeregistration` with a VerificationKey credential must NOT
     /// require a Cert redeemer — only Script credentials need redeemers.
     #[test]
