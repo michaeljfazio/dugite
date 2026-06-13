@@ -3,6 +3,20 @@
 ## Era Rules
 - [Dijkstra era rules dispatch (#462)](issue-462-dijkstra-era-rules.md) — Conway alias removed; DijkstraRules delegates to Conway plus identity translateEraDijkstra
 
+## Validation Rules
+- DO NOT skip V1/V2 Propose/Vote/Guarding redeemers in phase-2 (REFUTED 2026-06-13). A prior note claimed they must be silently skipped; the cardano-ledger-oracle proved Haskell REJECTS a V1/V2 script in a tx with Conway-only fields via `guardConwayFeaturesForPlutusV1V2` → `BadTranslation(ProposalProceduresFieldNotSupported)`. The on-chain is_valid=true txs (51f495aa, b2a591ac) actually use a V3 guardrails script; the divergence is a V3 ScriptContext data-shape bug (#761), not a V1/V2-skip issue. Skipping would FALSE-ACCEPT txs Haskell rejects.
+- [Conway DRep bootstrap phase delegatee check](conway-drep-bootstrap-phase-delegatee-check.md) — `DelegateeDRepNotRegisteredDELEG` SKIPPED at PV9 (bootstrap); only fires PV>=10; fix `mod.rs:3184` `>= 9` → `>= 10`; 26 mainnet PV9 divergences
+- [Datum witness native-script exemption](datum-native-script-false-positive.md) — `MissingDatumWitness` false positives on native-script-locked inputs with DatumHash; Haskell's `getInputDataHashesTxBody` guards on `isSpendingPlutusScript`; fix: `version > 0` guard in `DatumHash` branch of `check_datum_witnesses`
+- [Spend/Reward/Cert/Vote redeemer native-script exemption (#758)](issue-758-native-script-spend-redeemer.md) — All 4 purposes: native-script credentials silently excluded from `neededPlutusSet`; `check_extra_redeemers` also narrowed; `check_script_redeemers` + `check_extra_redeemers` both gate on `script_versions.get(sh) > 0`
+- [DuplicateInput false positive Babbage PV<9 (#759)](issue-759-babbage-duplicate-input.md) — Rule 1b must gate on `pv >= 9`; Haskell `Set.fromList` silently dedups at PV<9; no BabbageUtxoPredFailure constructor for duplicates; fixture tx-5ca83e21.hex pins regression
+- [VRF key uniqueness PV11 gate](vrf-key-uniqueness-pv11-gate.md) — `VRFKeyHashAlreadyRegistered` must gate at PV>=11 NOT PV>=9; Haskell `hardforkConwayDisallowDuplicatedVRFKeys = pvMajor > 10`; mod.rs:3468 `>= 9` → `>= 11`; epoch 523 mainnet divergence
+- [Conway cert script-witness / Cert-redeemer reqs](conway-cert-redeemer-witnessing.md) — getScriptWitnessConwayTxCert: ALL 3 DRep gov-certs (RegDRep/UnRegDRep/UpdateDRep) symmetric + deposit-bearing ConwayStakeRegistration (tag 7) need a Cert redeemer; omitting them → FALSE ExtraRedeemer rejection (a6639ae520, 01718b8b88)
+- [Conway PlutusV3 cost-model seeding](conway-plutus-v3-cost-model-seeding.md) — V3 cost model from conway-genesis.json must be seeded at the Babbage→Conway HF (on_era_transition) AND via a post-snapshot guard (pv>=9 && plutus_v3.is_none()); else ScriptDataHashMismatch + budget-exhausted on every V3 tx from ep507. shelley.rs wholesale cost-model replace is CORRECT (pre-Conway path) — do NOT merge it (00a1a3ac8b)
+
+## Genesis Mode
+- [GSM PreSyncing Mithril stall (#757)](gsm-presyncing-mithril-stall.md) — genesis PreSyncing LoE caps at k=2160; fix: `syncing_startup_threshold_secs` in GsmConfig (sgen×slot_length ≈ 36h); Mithril tip age < threshold → start Syncing
+- [#760-A genesis cold-restart watchdog wedge](issue-760-genesis-watchdog-rotation.md) — unproductive-claim watchdog (connection_lifecycle.rs:2464) fires after 30s on legitimately-parked dynamo in genesis bulk sync; fix: `!is_genesis_bulk_sync` guard flips the condition; ChainSel-starvation rotation at line 2661 is correct and stays
+
 ## Critical Invariants & Bug Patterns
 - [Mempool Mined-cascade fix (bbdcb67a1)](mempool-mined-cascade-fix.md) — Mined parent must NOT cascade children; outputs move to on-chain UTxO; early-return in remove_tx_inner for Mined reason; fixes 01h-tx-chain test
 - [GOV apply-path prev_action_id bypass (1f1367a82)](gov-apply-path-prev-action-id-bypass.md) — process_governance_votes_and_proposals bypassed InvalidPrevGovActionId; stale prev_id admitted silently; ratification fails forever; BOTH process_proposal AND process_governance_votes_and_proposals must be updated for any validation change
