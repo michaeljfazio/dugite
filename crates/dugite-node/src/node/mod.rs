@@ -6361,6 +6361,20 @@ impl Node {
                             ls.epochs.protocol_params.protocol_version_minor,
                         );
                         self.metrics.set_utxo_count(ls.utxo.utxo_set.len() as u64);
+                        // Keep the pots gauges live during catch-up too. These are
+                        // O(1) atomic stores (the heavy governance snapshot — dreps,
+                        // proposals, delegations — stays on the at-tip /
+                        // era-transition `publish_ledger_view` path above). Without
+                        // them `dugite_reserves_lovelace` / `dugite_treasury_lovelace`
+                        // froze at their startup values for the whole bulk sync,
+                        // making the pots appear stuck (cosmetic, but misleading for
+                        // boundary cross-checks).
+                        self.metrics
+                            .reserves_lovelace
+                            .store(ls.epochs.reserves.0, std::sync::atomic::Ordering::Relaxed);
+                        self.metrics
+                            .treasury_lovelace
+                            .store(ls.epochs.treasury.0, std::sync::atomic::Ordering::Relaxed);
                         let _ = self.ledger_tip_slot_tx.send(local_tip);
                     }
                     // Consume pending era transition and propagate to the HFC state machine.
