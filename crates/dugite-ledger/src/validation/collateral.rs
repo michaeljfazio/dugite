@@ -443,14 +443,19 @@ pub(crate) fn check_script_redeemers(
     //   - VoteRegDeleg (credential must be Script)
     //   - CommitteeHotAuth (cold_credential must be Script)
     //   - CommitteeColdResign (cold_credential must be Script)
+    //   - RegDRep (credential must be Script)
     //   - UnregDRep (credential must be Script)
     //   - UpdateDRep (credential must be Script)
     //
     //   - ConwayStakeRegistration (deposit-bearing RegDepositTxCert — Conway)
     //
+    // All three DRep gov-certs (RegDRep / UnregDRep / UpdateDRep) are treated
+    // identically by Haskell `getScriptWitnessConwayTxCert.govWitness`, each
+    // returning `credScriptHash cred`. cardano-ledger-conway-1.23.0.0,
+    // eras/conway/impl/src/Cardano/Ledger/Conway/TxCert.hs.
+    //
     // Certificates that do NOT require a redeemer regardless of credential type:
     //   - StakeRegistration (legacy no-deposit), PoolRegistration, PoolRetirement,
-    //     RegDRep (witness requirement under live re-verification — see below),
     //     GenesisKeyDelegation, MoveInstantaneousRewards
     //     (permissionless registration or pool-operator-only actions)
     let cert_indices: HashSet<u32> = tx
@@ -484,6 +489,11 @@ pub(crate) fn check_script_redeemers(
             Certificate::CommitteeColdResign {
                 cold_credential: c, ..
             } => Some(c),
+            // DRep registration: credential must sign. `getScriptWitnessConwayTxCert`
+            // returns `credScriptHash cred` for `ConwayRegDRep cred _ _` — identical
+            // to UnRegDRep/UpdateDRep (no asymmetry). When the credential is a Plutus
+            // script, the cert needs a Certifying redeemer.
+            Certificate::RegDRep { credential: c, .. } => Some(c),
             // DRep unregistration: credential must sign.
             Certificate::UnregDRep { credential: c, .. } => Some(c),
             // DRep update: credential must sign.
@@ -495,13 +505,10 @@ pub(crate) fn check_script_redeemers(
             // is StakeRegistration (in the None arm below).
             Certificate::ConwayStakeRegistration { credential: c, .. } => Some(c),
             // Legacy no-deposit registration and pool operations do not require a
-            // redeemer. (RegDRep witness requirement: under live re-verification —
-            // the cardano-ledger-oracle says it needs one, an existing test says it
-            // does not; deferred to avoid a false-rejection halt until confirmed.)
+            // redeemer (permissionless registration or pool-operator-only actions).
             Certificate::StakeRegistration(_)
             | Certificate::PoolRegistration(_)
             | Certificate::PoolRetirement { .. }
-            | Certificate::RegDRep { .. }
             | Certificate::GenesisKeyDelegation { .. }
             | Certificate::MoveInstantaneousRewards { .. } => None,
         };
@@ -733,6 +740,14 @@ pub(crate) fn check_extra_redeemers(
             } => Some(h),
             Certificate::CommitteeColdResign {
                 cold_credential: Credential::Script(h),
+                ..
+            } => Some(h),
+            // RegDRep with a script credential needs a Certifying redeemer, so its
+            // Cert redeemer is NEEDED — not extra. Haskell `govWitness` returns
+            // `credScriptHash cred` for `ConwayRegDRep cred _ _`, identical to
+            // UnRegDRep/UpdateDRep below.
+            Certificate::RegDRep {
+                credential: Credential::Script(h),
                 ..
             } => Some(h),
             Certificate::UnregDRep {
