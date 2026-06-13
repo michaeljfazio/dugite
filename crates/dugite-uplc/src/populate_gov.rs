@@ -636,10 +636,23 @@ pub fn certificate_to_plutus_v1v2(c: &PrimCert) -> Result<TxCert, PhaseTwoError>
         ),
         PrimCert::GenesisKeyDelegation { .. } => Data::Constr(5, vec![]),
         PrimCert::MoveInstantaneousRewards { .. } => Data::Constr(6, vec![]),
-        // Conway-era certificate kinds — illegal alongside a V1/V2 script.
-        PrimCert::ConwayStakeRegistration { .. } => return conway_only("ConwayStakeRegistration"),
-        PrimCert::ConwayStakeDeregistration { .. } => {
-            return conway_only("ConwayStakeDeregistration")
+        // Conway registration / deregistration (with an explicit deposit /
+        // refund) translate to the SAME legacy V1/V2 `DCert` as the no-deposit
+        // Shelley form — the deposit / refund is silently DROPPED (the
+        // PlutusV1/V2 `DCert` has no deposit field). Byte-exact with
+        // cardano-ledger `Conway/TxInfo::transTxCertV1V2`:
+        //   RegDepositTxCert  cred _deposit -> DCertDelegRegKey   (StakingHash cred)  [Constr 0]
+        //   UnRegDepositTxCert cred _refund -> DCertDelegDeRegKey (StakingHash cred)  [Constr 1]
+        // A V1/V2 script witnessing one of these is VALID on-chain — rejecting
+        // it halted the node at mainnet epoch 511 (slot 135634801, the first
+        // Conway stake-registration-with-deposit witnessed by a cert-purpose
+        // V1/V2 script). The remaining Conway-only certs below have NO legacy
+        // `DCert` form, so they correctly stay `CertificateNotSupported`.
+        PrimCert::ConwayStakeRegistration { credential, .. } => {
+            Data::Constr(0, vec![staking_hash_data(credential)])
+        }
+        PrimCert::ConwayStakeDeregistration { credential, .. } => {
+            Data::Constr(1, vec![staking_hash_data(credential)])
         }
         PrimCert::RegStakeDeleg { .. } => return conway_only("RegStakeDeleg"),
         PrimCert::VoteDelegation { .. } => return conway_only("VoteDelegation"),
@@ -746,6 +759,45 @@ mod tests {
                     vec![Data::Constr(0, vec![Data::B(vec![0x11; 28])])]
                 )]
             )
+        );
+    }
+
+    #[test]
+    fn v1v2_dcert_conway_registration_with_deposit_drops_deposit() {
+        // Conway RegDepositTxCert (registration WITH a deposit) translates to
+        // the SAME legacy V1/V2 DCertDelegRegKey [Constr 0] as the no-deposit
+        // Shelley form — the deposit is DROPPED. Byte-exact with cardano-ledger
+        // Conway/TxInfo::transTxCertV1V2. Pins the mainnet epoch-511 halt fix
+        // (tx 360b9a34…, stake_registration deposit=2_000_000 witnessed by a
+        // cert-purpose V1/V2 script).
+        let reg = PrimCert::ConwayStakeRegistration {
+            credential: key_cred(0x11),
+            deposit: Lovelace(2_000_000),
+        };
+        assert_eq!(
+            certificate_to_plutus_v1v2(&reg).unwrap().0,
+            Data::Constr(
+                0,
+                vec![Data::Constr(
+                    0,
+                    vec![Data::Constr(0, vec![Data::B(vec![0x11; 28])])]
+                )]
+            ),
+        );
+        // UnRegDepositTxCert → DCertDelegDeRegKey [Constr 1], refund dropped.
+        let dereg = PrimCert::ConwayStakeDeregistration {
+            credential: script_cred(0x22),
+            refund: Lovelace(2_000_000),
+        };
+        assert_eq!(
+            certificate_to_plutus_v1v2(&dereg).unwrap().0,
+            Data::Constr(
+                1,
+                vec![Data::Constr(
+                    0,
+                    vec![Data::Constr(1, vec![Data::B(vec![0x22; 28])])]
+                )]
+            ),
         );
     }
 
