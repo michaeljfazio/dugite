@@ -3638,6 +3638,19 @@ fn classify_eager_validation_result(
     match result {
         Ok(()) => Ok(true),
         Err(dugite_consensus::ConsensusError::OpcertCounterOverIncremented { .. }) => Ok(false),
+        // The eager forecast horizon is checked against the lock-free `LedgerView`,
+        // whose `last_applied_slot` can LAG the live ledger tip — `publish_ledger_view`
+        // is throttled during catch-up (#698) and freezes entirely if the apply loop
+        // stalls. `forecast_park_or_disconnect` has ALREADY gated this header against
+        // the FRESH tip watch (`tip_rx`) at the call site, so a stale view that cannot
+        // yet forecast the slot is a FALSE negative — defer to the authoritative body
+        // apply (which forecasts against the live ledger state), never disconnect.
+        // Without this, a throttled view freezing ~a stability window behind the
+        // applied tip eager-rejects every in-range header and disconnects all peers →
+        // permanent wedge (observed live at the mainnet Babbage→Conway boundary,
+        // 2026-06-13: view frozen at slot 133109521 rejected the first Conway block at
+        // 133660855 while the applied tip was 133660799, churning all 40 peers).
+        Err(dugite_consensus::ConsensusError::OutsideForecast(_)) => Ok(false),
         Err(e) => Err(e),
     }
 }
@@ -6086,6 +6099,23 @@ mod seed_peer_counter_tests {
         // An unrelated crypto fault stays fatal.
         let bad = Err(ConsensusError::InvalidBlock("kes".into()));
         assert!(classify_eager_validation_result(bad).is_err());
+
+        // OutsideForecast → deliberate skip, NOT a peer fault. The eager forecast
+        // uses the throttled lock-free view (which can freeze far behind the applied
+        // tip); the FRESH tip watch already gated the header in forecast_park, and
+        // body apply re-forecasts authoritatively. Treating it as fatal here churned
+        // all peers at the mainnet Babbage→Conway boundary (2026-06-13).
+        let stale = Err(ConsensusError::OutsideForecast(
+            dugite_consensus::OutsideForecastRange {
+                at: Some(dugite_primitives::time::SlotNo(133_109_521)),
+                max_for: dugite_primitives::time::SlotNo(133_239_122),
+                requested: dugite_primitives::time::SlotNo(133_660_855),
+            },
+        ));
+        assert!(
+            !classify_eager_validation_result(stale).unwrap(),
+            "stale-view OutsideForecast must be deferred to body apply, never disconnect"
+        );
     }
 
     /// End-to-end of the regression: a peer map seeded from a snapshot global
