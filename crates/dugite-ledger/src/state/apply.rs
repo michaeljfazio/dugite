@@ -573,12 +573,18 @@ impl LedgerState {
             rules.validate_block_body(block, &body_ctx, &self.utxo)?;
         }
 
-        // Pre-compute cost_models CBOR once per block
-        let cost_models_cbor = if mode == BlockValidationMode::ValidateAll {
-            self.epochs.protocol_params.cost_models.to_cbor()
-        } else {
-            None
-        };
+        // Pre-compute cost_models CBOR once per block.
+        //
+        // This must be computed in BOTH modes, not just ValidateAll: the parallel
+        // (and sequential-fallback) phase-2 *divergence checker* runs even in
+        // ApplyOnly mode (it logs "Plutus evaluation divergence … trusting on-chain
+        // consensus" without gating). If we hand it `None`, `resolve_applied_costs`
+        // silently falls back to the DEFAULT cost model, which over-counts budget by
+        // a fixed margin and produces a flood of spurious "budget exhausted" Plutus
+        // divergences on every PlutusV3 transaction — masking real divergences. The
+        // ValidateAll gating path was already correct; ApplyOnly's diagnostic was
+        // not. `to_cbor()` is a cheap once-per-block encode of the cost-model arrays.
+        let cost_models_cbor = self.epochs.protocol_params.cost_models.to_cbor();
 
         // Track processed tx hashes to skip duplicates within a block
         let mut processed_tx_hashes =
