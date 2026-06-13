@@ -162,6 +162,28 @@ impl CsjRegistry {
         self.enabled
     }
 
+    /// Head slot of a peer's current candidate (jump-info) fragment, if any.
+    ///
+    /// Used by the BlockFetch unproductive-dynamo watchdog (#760-A) to tell a
+    /// GENUINELY-SILENT dynamo (no headers ahead of our selected chain — the
+    /// #742 rotation target) from one that fed headers and is now legitimately
+    /// PARKED on the forecast horizon (its fragment leads our chain by ~a
+    /// stability window). Rotating the latter merely re-intersects a fresh
+    /// dynamo at the same frontier and re-parks it, producing the ~1 blk/min
+    /// cold-restart churn. Mirrors Haskell: a peer blocked at the forecast
+    /// horizon is not starving us — the ledger is catching up.
+    ///
+    /// `None` when the peer is unknown or has never delivered a header
+    /// (no `jump_info`, or its fragment is anchored at Origin).
+    pub fn fragment_head_slot(&self, addr: &SocketAddr) -> Option<u64> {
+        let inner = self.inner.lock().expect("csj lock");
+        let peer = inner.peers.get(addr)?;
+        match peer.jump_info.as_ref()?.fragment.head_slot() {
+            WithOrigin::At(s) => Some(s),
+            WithOrigin::Origin => None,
+        }
+    }
+
     /// `registerClient`: first peer (while not CaughtUp) becomes the
     /// dynamo; later peers become fresh jumpers pre-loaded with the
     /// dynamo's current jump info; peers connecting while CaughtUp are
@@ -1107,5 +1129,23 @@ mod tests {
             reg.next_instruction(&addr(2)),
             CsjInstruction::Restart
         ));
+    }
+
+    // #760-A: `fragment_head_slot` is the discriminator the BlockFetch
+    // unproductive-dynamo watchdog uses to tell a silent dynamo (rotate) from
+    // one parked on the forecast horizon (keep).
+    #[test]
+    fn fragment_head_slot_reports_fed_frontier_else_none() {
+        let reg = two_peer_registry();
+        // Dynamo p1 has not delivered a header yet → no jump_info → None.
+        assert_eq!(reg.fragment_head_slot(&addr(1)), None);
+        // Feed p1 a candidate fragment whose head is slot 5_000.
+        reg.update_jump_info(&addr(1), frag(FragAnchor::Origin, &[(100, 1), (5_000, 2)]));
+        assert_eq!(reg.fragment_head_slot(&addr(1)), Some(5_000));
+        // An unknown peer → None.
+        assert_eq!(reg.fragment_head_slot(&addr(99)), None);
+        // A jump_info whose fragment is empty (anchored at Origin) → None.
+        reg.update_jump_info(&addr(2), frag(FragAnchor::Origin, &[]));
+        assert_eq!(reg.fragment_head_slot(&addr(2)), None);
     }
 }

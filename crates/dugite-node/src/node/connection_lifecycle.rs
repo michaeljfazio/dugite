@@ -150,6 +150,44 @@ const _: () = assert!(
     "pipelined in-flight budget exceeds mux ingress limit: reduce BLOCKFETCH_PIPELINE_WINDOW or increase peer_connection::BLOCKFETCH_INGRESS_LIMIT"
 );
 
+/// Slots a dynamo's CSJ fragment must lead our selected chain by before the
+/// unproductive-dynamo watchdog (#742) treats it as legitimately PARKED on the
+/// forecast horizon and SKIPS rotation (#760-A). Chosen well below the smallest
+/// network forecast/stability window (preview `3k/f ≈ 25 920` slots) and well
+/// above streaming noise, so a parked dynamo (≈ a full stability window ahead)
+/// is never mistaken for a silent one, and a genuinely-silent dynamo (fragment
+/// at or near our tip) is always rotated.
+pub(crate) const GENESIS_PARKED_DYNAMO_MARGIN_SLOTS: u64 = 2_000;
+
+// Compile-time guard: the margin must stay below the smallest network
+// forecast/stability window (preview `3k/f = 3*432/0.05 = 25 920` slots) so a
+// dynamo parked on the horizon (≈ a full window ahead) is never mistaken for a
+// silent one on ANY network.
+const _: () = assert!(GENESIS_PARKED_DYNAMO_MARGIN_SLOTS < 25_920);
+
+/// Should an unproductive dynamo that has starved ChainSel past the watchdog
+/// window be ROTATED?
+///
+/// `#742` added this watchdog to rotate a dynamo that never feeds headers (the
+/// LoP cannot kill it because dugite pauses the LoP while a peer parks on the
+/// forecast horizon). But on a cold genesis restart a HEALTHY dynamo streams a
+/// full forecast window of headers, drains them, and then parks — and was being
+/// rotated too (`#760-A` ~1 blk/min churn). The discriminator: a dynamo whose
+/// CSJ fragment leads our selected chain by more than
+/// [`GENESIS_PARKED_DYNAMO_MARGIN_SLOTS`] has fed headers and is parked
+/// (don't rotate — the ledger is catching up); one at/near our tip, or with no
+/// fragment at all, is genuinely silent (rotate). Mirrors Haskell, where a peer
+/// blocked at the forecast horizon is not counted as starving us.
+pub(crate) fn should_rotate_unproductive_dynamo(
+    fragment_head_slot: Option<u64>,
+    chain_tip_slot: u64,
+) -> bool {
+    match fragment_head_slot {
+        Some(head) => head <= chain_tip_slot.saturating_add(GENESIS_PARKED_DYNAMO_MARGIN_SLOTS),
+        None => true,
+    }
+}
+
 /// Why a protocol task reported a peer to `peer_failure_tx` (#751).
 ///
 /// `ProtocolFault` is a PROVABLE protocol violation (mis-declared block
@@ -2465,13 +2503,36 @@ impl ConnectionLifecycleManager {
                                         && now_ms.saturating_sub(since) >= watchdog_ms
                                         && last_starvation_ms >= since.saturating_add(watchdog_ms)
                                     {
-                                        if cs.rotate_dynamo(&addr) {
+                                        // #760-A: only rotate a GENUINELY-SILENT
+                                        // dynamo. A dynamo that fed a forecast
+                                        // window of headers and is now PARKED on the
+                                        // horizon has its CSJ fragment far ahead of
+                                        // our selected chain; rotating it just
+                                        // re-intersects a fresh dynamo at the same
+                                        // frontier and re-parks it (~1 blk/min
+                                        // cold-restart churn). Mirror Haskell: a peer
+                                        // blocked at the forecast horizon is not
+                                        // starving us — the ledger is catching up.
+                                        // The #742 silent-dynamo case (fragment NOT
+                                        // ahead) is still rotated. The chain_db read
+                                        // is taken only here (≤ once per watchdog
+                                        // window), never on the hot per-tick path.
+                                        let chain_tip_slot = {
+                                            let cdb = chain_db.read().await;
+                                            cdb.get_tip().point.slot().map(|s| s.0).unwrap_or(0)
+                                        };
+                                        let rotate = should_rotate_unproductive_dynamo(
+                                            cs.fragment_head_slot(&addr),
+                                            chain_tip_slot,
+                                        );
+                                        if rotate && cs.rotate_dynamo(&addr) {
                                             info!(
                                                 %addr,
                                                 unproductive_secs =
                                                     now_ms.saturating_sub(since) / 1000,
-                                                "BlockFetch: dynamo unproductive past watchdog \
-                                                 with ChainSel starved — rotating (#742)"
+                                                "BlockFetch: silent dynamo unproductive past \
+                                                 watchdog with ChainSel starved (no headers \
+                                                 ahead) — rotating (#742/#760-A)"
                                             );
                                         }
                                         unproductive_since_ms = None;
@@ -6642,5 +6703,31 @@ mod range_byte_abort_751_tests {
             !range_all_declared(&headers),
             "Byron ranges must never arm the #751 abort"
         );
+    }
+
+    // #760-A: the unproductive-dynamo watchdog must rotate a GENUINELY-SILENT
+    // dynamo (preserving the #742 fix) but NOT a dynamo that fed a forecast
+    // window of headers and is now legitimately parked on the horizon.
+    #[test]
+    fn unproductive_watchdog_rotates_only_silent_dynamo() {
+        let tip = 1_000_000u64;
+        // No fragment at all → never fed headers → silent → rotate.
+        assert!(should_rotate_unproductive_dynamo(None, tip));
+        // Fragment exactly at our tip → silent → rotate.
+        assert!(should_rotate_unproductive_dynamo(Some(tip), tip));
+        // Fragment a few hundred slots ahead (within margin) → still silent.
+        assert!(should_rotate_unproductive_dynamo(Some(tip + 500), tip));
+        // Exactly at the margin boundary → still rotate (`<=`).
+        assert!(should_rotate_unproductive_dynamo(
+            Some(tip + GENESIS_PARKED_DYNAMO_MARGIN_SLOTS),
+            tip
+        ));
+        // Just past the margin → parked-with-headers → do NOT rotate.
+        assert!(!should_rotate_unproductive_dynamo(
+            Some(tip + GENESIS_PARKED_DYNAMO_MARGIN_SLOTS + 1),
+            tip
+        ));
+        // ~A full mainnet stability window ahead → clearly parked → keep it.
+        assert!(!should_rotate_unproductive_dynamo(Some(tip + 129_600), tip));
     }
 }
