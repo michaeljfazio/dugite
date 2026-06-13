@@ -1628,11 +1628,18 @@ impl Node {
         // `None`) would compute the wrong `script_data_hash` and default-cost-model
         // budgets for every PlutusV3 transaction. The Babbage→Conway
         // `on_era_transition` only fires when crossing the hard fork during replay;
-        // for a node resuming directly from a Conway snapshot it never runs, so seed
-        // V3 here from the Conway genesis upgrade params when we are already past the
-        // hard fork (pv >= 9) and the snapshot is missing it. This is a per-language
-        // insert — V1/V2 (and any governance-updated V3) are left untouched.
-        if ledger.epochs.protocol_params.protocol_version_major >= 9
+        // for a node resuming directly from a Conway snapshot it never runs.
+        //
+        // The genesis `ucppPlutusV3CostModel` is the INITIAL (PV9) V3 model. From
+        // the Plomin HF (PV10) the on-chain V3 model is expanded (251→297, and
+        // PV11→350) via governance ParameterChange enactment, NOT via the genesis
+        // upgrade params. So only seed the genesis model when we are at PV9 (where
+        // it is exactly authoritative). At PV>9 a `None` V3 means a governance-
+        // enactment gap (or an unsupported snapshot) — seeding the stale 251-entry
+        // genesis model there would be WRONG, so we warn loudly instead and let the
+        // governance replay path populate the correct expanded model.
+        let pv = ledger.epochs.protocol_params.protocol_version_major;
+        if pv >= 9
             && ledger
                 .epochs
                 .protocol_params
@@ -1640,19 +1647,34 @@ impl Node {
                 .plutus_v3
                 .is_none()
         {
-            if let Some(ref v3) = conway_v3_cost_model {
-                ledger.epochs.protocol_params.cost_models.plutus_v3 = Some(v3.clone());
-                warn!(
-                    entries = v3.len(),
-                    "Seeded missing PlutusV3 cost model into Conway ledger state from genesis \
-                     (snapshot predates V3 seeding); this prevents ScriptDataHashMismatch and \
-                     spurious budget-exhausted divergences on PlutusV3 transactions"
-                );
-            } else {
-                warn!(
-                    "Conway ledger state has no PlutusV3 cost model and no Conway genesis V3 \
-                     cost model is available to seed it — PlutusV3 transactions will diverge"
-                );
+            match (pv, &conway_v3_cost_model) {
+                (9, Some(v3)) => {
+                    ledger.epochs.protocol_params.cost_models.plutus_v3 = Some(v3.clone());
+                    warn!(
+                        entries = v3.len(),
+                        "Seeded missing PlutusV3 cost model into Conway ledger state from genesis \
+                         (PV9 snapshot predates V3 seeding); this prevents ScriptDataHashMismatch \
+                         and spurious budget-exhausted divergences on PlutusV3 transactions"
+                    );
+                }
+                (9, None) => {
+                    warn!(
+                        "Conway PV9 ledger state has no PlutusV3 cost model and no Conway genesis \
+                         V3 cost model is available to seed it — PlutusV3 transactions will diverge"
+                    );
+                }
+                _ => {
+                    // pv > 9 with no V3: do NOT inject the stale genesis model.
+                    warn!(
+                        pv,
+                        "Conway PV{pv} ledger state has no PlutusV3 cost model. The genesis \
+                         (PV9) model is NOT authoritative at this PV (Plomin/PV11 expand V3 via \
+                         governance), so it is NOT being seeded — the governance ParameterChange \
+                         enactment must populate the correct expanded model. PlutusV3 transactions \
+                         will diverge until then; this indicates a governance-enactment gap or an \
+                         unsupported snapshot."
+                    );
+                }
             }
         }
 
