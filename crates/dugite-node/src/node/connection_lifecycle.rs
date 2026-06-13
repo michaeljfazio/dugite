@@ -2521,18 +2521,34 @@ impl ConnectionLifecycleManager {
                                             let cdb = chain_db.read().await;
                                             cdb.get_tip().point.slot().map(|s| s.0).unwrap_or(0)
                                         };
+                                        let fragment_head = cs.fragment_head_slot(&addr);
                                         let rotate = should_rotate_unproductive_dynamo(
-                                            cs.fragment_head_slot(&addr),
+                                            fragment_head,
                                             chain_tip_slot,
                                         );
-                                        if rotate && cs.rotate_dynamo(&addr) {
-                                            info!(
+                                        if rotate {
+                                            if cs.rotate_dynamo(&addr) {
+                                                info!(
+                                                    %addr,
+                                                    unproductive_secs =
+                                                        now_ms.saturating_sub(since) / 1000,
+                                                    "BlockFetch: silent dynamo unproductive past \
+                                                     watchdog with ChainSel starved (no headers \
+                                                     ahead) — rotating (#742/#760-A)"
+                                                );
+                                            }
+                                        } else {
+                                            // Parked-with-headers dynamo: KEEP it (the ledger is
+                                            // catching up to the forecast horizon). Log so an
+                                            // operator can tell "watchdog fired and correctly held
+                                            // the parked dynamo" from "watchdog never fired".
+                                            debug!(
                                                 %addr,
-                                                unproductive_secs =
-                                                    now_ms.saturating_sub(since) / 1000,
-                                                "BlockFetch: silent dynamo unproductive past \
-                                                 watchdog with ChainSel starved (no headers \
-                                                 ahead) — rotating (#742/#760-A)"
+                                                ahead = fragment_head
+                                                    .unwrap_or(0)
+                                                    .saturating_sub(chain_tip_slot),
+                                                "BlockFetch: unproductive dynamo KEPT — parked on \
+                                                 forecast horizon, not silent (#760-A)"
                                             );
                                         }
                                         unproductive_since_ms = None;
