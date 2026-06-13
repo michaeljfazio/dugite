@@ -1192,6 +1192,34 @@ impl EraRules for ConwayRules {
             );
         }
 
+        // Step 1b (PParams upgrade): seed the PlutusV3 cost model.
+        //
+        // Haskell `upgradeConwayPParams` builds the Conway `cppCostModels` as
+        //   updateCostModels bppCostModels (mkCostModels {PlutusV3 -> ucppPlutusV3CostModel})
+        // i.e. a per-language INSERT of V3 over the Babbage {V1,V2} map — V1 and
+        // V2 are carried across unchanged; V3 comes from
+        // `cgUpgradePParams.ucppPlutusV3CostModel` in conway-genesis.json.
+        // (cardano-ledger eras/conway/impl/src/Cardano/Ledger/Conway/PParams.hs.)
+        //
+        // Without this, `cost_models.plutus_v3` stays `None` for the whole
+        // session: `encode_language_views(has_v3=true)` emits an empty map and
+        // every PlutusV3 tx gets a wrong `script_data_hash` (ScriptDataHashMismatch)
+        // plus default-cost-model budgets (spurious "budget exhausted"). The
+        // `is_none()` guard keeps a governance-updated V3 (e.g. the Plomin 297-entry
+        // expansion) from being overwritten on a re-entry, and leaves V1/V2 alone.
+        if let Some(genesis) = ctx.conway_genesis {
+            if let Some(ref v3) = genesis.plutus_v3_cost_model {
+                if epochs.protocol_params.cost_models.plutus_v3.is_none() {
+                    epochs.protocol_params.cost_models.plutus_v3 = Some(v3.clone());
+                    tracing::info!(
+                        entries = v3.len(),
+                        "Conway: seeded PlutusV3 cost model from genesis upgrade params \
+                         (per-language insert preserving V1/V2)"
+                    );
+                }
+            }
+        }
+
         // Step 3: VRF key hash -> pool ID map.
         // In Haskell this is built for the DRep pulser to identify which pool
         // produced a block. Dugite uses pool_id directly from block headers,
@@ -3245,6 +3273,93 @@ mod tests {
         assert_eq!(drep2.deposit.0, 1_000_000_000);
     }
 
+    /// Babbage→Conway must seed the PlutusV3 cost model from ConwayGenesis as a
+    /// per-language INSERT: V3 is set, V1/V2 carried from Babbage are untouched,
+    /// and an already-present V3 (e.g. a governance update) is NOT overwritten.
+    ///
+    /// Regression for the Conway ScriptDataHashMismatch + budget-exhausted
+    /// divergence cluster (mainnet epoch 507+, e.g. tx 31b6732d…): when V3 is
+    /// `None`, `encode_language_views` emits an empty map and every PlutusV3 tx
+    /// gets the wrong script_data_hash and default-cost-model budgets.
+    #[test]
+    fn test_on_era_transition_seeds_plutus_v3_cost_model() {
+        use crate::eras::ConwayGenesisInit;
+
+        let rules = ConwayRules::new();
+        let params = ProtocolParameters::mainnet_defaults();
+
+        // The first four mainnet V3 entries (conway-genesis.json plutusV3CostModel).
+        let v3_model = vec![100788i64, 420, 1, 1000];
+        let genesis = ConwayGenesisInit {
+            plutus_v3_cost_model: Some(v3_model.clone()),
+            ..Default::default()
+        };
+        let delegates = Box::leak(Box::new(HashMap::new()));
+        let ctx = RuleContext {
+            params: &params,
+            current_slot: 100,
+            current_epoch: EpochNo(507),
+            era: Era::Conway,
+            slot_config: None,
+            node_network: None,
+            genesis_delegates: delegates,
+            update_quorum: 5,
+            epoch_length: 432000,
+            shelley_transition_epoch: 0,
+            byron_epoch_length: 21600,
+            stability_window: 129600,
+            stability_window_3kf: 129600,
+            randomness_stabilisation_window: 129600,
+            tx_index: 0,
+            conway_genesis: Some(&genesis),
+            max_lovelace_supply: crate::state::MAX_LOVELACE_SUPPLY,
+        };
+
+        let run = |v3_pre: Option<Vec<i64>>| {
+            let mut utxo = make_utxo_sub(vec![]);
+            let mut certs = make_cert_sub();
+            let mut gov = make_gov_sub();
+            let mut consensus = make_consensus_sub();
+            let mut epochs = make_epoch_sub();
+            epochs.ptr_stake_excluded = false;
+            // Babbage carried V1/V2; V3 state varies per case.
+            epochs.protocol_params.cost_models.plutus_v1 = Some(vec![1, 2, 3]);
+            epochs.protocol_params.cost_models.plutus_v2 = Some(vec![4, 5, 6]);
+            epochs.protocol_params.cost_models.plutus_v3 = v3_pre;
+            rules
+                .on_era_transition(
+                    Era::Babbage,
+                    &ctx,
+                    &mut utxo,
+                    &mut certs,
+                    &mut gov,
+                    &mut consensus,
+                    &mut epochs,
+                )
+                .expect("era transition should succeed");
+            epochs.protocol_params.cost_models
+        };
+
+        // Case 1 — V3 absent: inserted from genesis, V1/V2 preserved.
+        let cm = run(None);
+        assert_eq!(
+            cm.plutus_v3,
+            Some(v3_model.clone()),
+            "V3 must be seeded from Conway genesis"
+        );
+        assert_eq!(cm.plutus_v1, Some(vec![1, 2, 3]), "V1 must be preserved");
+        assert_eq!(cm.plutus_v2, Some(vec![4, 5, 6]), "V2 must be preserved");
+
+        // Case 2 — V3 already present (e.g. governance-updated): NOT overwritten.
+        let existing = vec![9, 9, 9, 9, 9];
+        let cm = run(Some(existing.clone()));
+        assert_eq!(
+            cm.plutus_v3,
+            Some(existing),
+            "an already-present V3 cost model must not be clobbered by genesis"
+        );
+    }
+
     /// Verify committee members and threshold are set from ConwayGenesis.
     #[test]
     fn test_on_era_transition_seeds_committee() {
@@ -3454,6 +3569,7 @@ mod tests {
                 },
                 script_hash: None,
             }),
+            plutus_v3_cost_model: None,
         };
         let delegates = Box::leak(Box::new(HashMap::new()));
         let ctx = RuleContext {

@@ -1086,6 +1086,7 @@ impl Node {
         let mut conway_constitution: Option<dugite_primitives::transaction::Constitution> = None;
         let mut conway_initial_dreps: Vec<(dugite_primitives::hash::Hash28, u64)> = Vec::new();
         let mut conway_genesis_file_hash: Option<dugite_primitives::hash::Hash32> = None;
+        let mut conway_v3_cost_model: Option<Vec<i64>> = None;
         if let Some(ref genesis_path) = args.config.conway_genesis_file {
             let genesis_path = config_dir.join(genesis_path);
             match ConwayGenesis::load_with_hash(&genesis_path) {
@@ -1101,6 +1102,7 @@ impl Node {
                     conway_committee_members = genesis.committee_members();
                     conway_constitution = genesis.to_ledger_constitution();
                     conway_initial_dreps = genesis.initial_dreps_as_entries();
+                    conway_v3_cost_model = genesis.plutus_v3_cost_model.clone();
                     genesis.apply_to_protocol_params(&mut protocol_params);
                 }
                 Err(e) => {
@@ -1608,14 +1610,44 @@ impl Node {
         {
             let has_data = conway_committee_threshold.is_some()
                 || !conway_committee_members.is_empty()
-                || !conway_initial_dreps.is_empty();
+                || !conway_initial_dreps.is_empty()
+                || conway_v3_cost_model.is_some();
             if has_data {
                 ledger.conway_genesis_init = Some(dugite_ledger::eras::ConwayGenesisInit {
                     initial_dreps: conway_initial_dreps,
                     committee_members: conway_committee_members,
                     committee_threshold: conway_committee_threshold,
                     constitution: ledger.gov.governance.constitution.clone(),
+                    plutus_v3_cost_model: conway_v3_cost_model.clone(),
                 });
+            }
+        }
+
+        // Safety net: a Conway-era ledger snapshot taken before the V3 cost-model
+        // seeding fix (or any Conway snapshot whose `cost_models.plutus_v3` is
+        // `None`) would compute the wrong `script_data_hash` and default-cost-model
+        // budgets for every PlutusV3 transaction. The Babbage→Conway
+        // `on_era_transition` only fires when crossing the hard fork during replay;
+        // for a node resuming directly from a Conway snapshot it never runs, so seed
+        // V3 here from the Conway genesis upgrade params when we are already past the
+        // hard fork (pv >= 9) and the snapshot is missing it. This is a per-language
+        // insert — V1/V2 (and any governance-updated V3) are left untouched.
+        if ledger.epochs.protocol_params.protocol_version_major >= 9
+            && ledger.epochs.protocol_params.cost_models.plutus_v3.is_none()
+        {
+            if let Some(ref v3) = conway_v3_cost_model {
+                ledger.epochs.protocol_params.cost_models.plutus_v3 = Some(v3.clone());
+                warn!(
+                    entries = v3.len(),
+                    "Seeded missing PlutusV3 cost model into Conway ledger state from genesis \
+                     (snapshot predates V3 seeding); this prevents ScriptDataHashMismatch and \
+                     spurious budget-exhausted divergences on PlutusV3 transactions"
+                );
+            } else {
+                warn!(
+                    "Conway ledger state has no PlutusV3 cost model and no Conway genesis V3 \
+                     cost model is available to seed it — PlutusV3 transactions will diverge"
+                );
             }
         }
 

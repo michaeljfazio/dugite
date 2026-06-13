@@ -40,6 +40,12 @@ pub struct ConwayGenesisInit {
     pub committee_threshold: Option<(u64, u64)>,
     /// Initial constitution
     pub constitution: Option<dugite_primitives::transaction::Constitution>,
+    /// Initial PlutusV3 cost model from `conway-genesis.json`
+    /// (`cgUpgradePParams.ucppPlutusV3CostModel`). Seeded into
+    /// `protocol_params.cost_models.plutus_v3` at the Babbage→Conway hard fork,
+    /// mirroring Haskell `upgradeConwayPParams` (a per-language INSERT that
+    /// preserves the V1/V2 cost models carried over from Babbage).
+    pub plutus_v3_cost_model: Option<Vec<i64>>,
 }
 
 /// Read-only context available to all era rules.
