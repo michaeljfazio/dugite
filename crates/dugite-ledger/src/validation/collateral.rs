@@ -1069,11 +1069,26 @@ pub(crate) fn redeemer_script_version_map(
                 cold_credential: Credential::Script(h),
                 ..
             } => Some(*h),
+            // RegDRep and the deposit-bearing ConwayStakeRegistration with a
+            // script credential are part of the certifying scripts-needed set
+            // (getScriptWitnessConwayTxCert returns credScriptHash for both), so
+            // they must be enumerated here too — otherwise the PV11 V3
+            // reference-input disjointness check (mod.rs) misses a V3 cert script
+            // and falsely accepts. Mirrors check_script_redeemers /
+            // check_extra_redeemers.
+            Certificate::RegDRep {
+                credential: Credential::Script(h),
+                ..
+            } => Some(*h),
             Certificate::UnregDRep {
                 credential: Credential::Script(h),
                 ..
             } => Some(*h),
             Certificate::UpdateDRep {
+                credential: Credential::Script(h),
+                ..
+            } => Some(*h),
+            Certificate::ConwayStakeRegistration {
                 credential: Credential::Script(h),
                 ..
             } => Some(*h),
@@ -1300,6 +1315,47 @@ mod tests {
             steps: 10_000_000_000,
         };
         p
+    }
+
+    /// `redeemer_script_version_map` must enumerate the deposit-bearing
+    /// `ConwayStakeRegistration` and `RegDRep` certs (script credential) so the
+    /// PV11 V3 reference-input disjointness check sees their V3 script. Mirrors
+    /// the check_script_redeemers / check_extra_redeemers cert set. Regression
+    /// for adversarial-review finding V207-CERT-REDEEMER-01.
+    #[test]
+    fn test_version_map_includes_conway_stake_reg_and_regdrep_certs() {
+        use super::redeemer_script_version_map;
+        let h_reg = Hash28::from_bytes([0x51; 28]);
+        let h_drep = Hash28::from_bytes([0x52; 28]);
+        let mut tx = make_plutus_tx(200_000, vec![]);
+        tx.body.certificates = vec![
+            Certificate::ConwayStakeRegistration {
+                credential: Credential::Script(h_reg),
+                deposit: Lovelace(2_000_000),
+            },
+            Certificate::RegDRep {
+                credential: Credential::Script(h_drep),
+                deposit: Lovelace(500_000_000),
+                anchor: None,
+            },
+        ];
+        let mut version_map: std::collections::HashMap<Hash28, u8> =
+            std::collections::HashMap::new();
+        version_map.insert(h_reg, 3);
+        version_map.insert(h_drep, 3);
+        let utxo = UtxoSet::new();
+        let result = redeemer_script_version_map(&tx, &utxo, &version_map);
+        // Cert tag = 2; cert index 0 = ConwayStakeRegistration, 1 = RegDRep.
+        assert_eq!(
+            result.get(&(2u8, 0u32)),
+            Some(&3u8),
+            "deposit-bearing ConwayStakeRegistration(script) must map to its V3 version"
+        );
+        assert_eq!(
+            result.get(&(2u8, 1u32)),
+            Some(&3u8),
+            "RegDRep(script) must map to its V3 version"
+        );
     }
 
     // -----------------------------------------------------------------------
