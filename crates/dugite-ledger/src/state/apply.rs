@@ -573,18 +573,17 @@ impl LedgerState {
             rules.validate_block_body(block, &body_ctx, &self.utxo)?;
         }
 
-        // Pre-compute cost_models CBOR once per block.
-        //
-        // This must be computed in BOTH modes, not just ValidateAll: the parallel
-        // (and sequential-fallback) phase-2 *divergence checker* runs even in
-        // ApplyOnly mode (it logs "Plutus evaluation divergence … trusting on-chain
-        // consensus" without gating). If we hand it `None`, `resolve_applied_costs`
-        // silently falls back to the DEFAULT cost model, which over-counts budget by
-        // a fixed margin and produces a flood of spurious "budget exhausted" Plutus
-        // divergences on every PlutusV3 transaction — masking real divergences. The
-        // ValidateAll gating path was already correct; ApplyOnly's diagnostic was
-        // not. `to_cbor()` is a cheap once-per-block encode of the cost-model arrays.
-        let cost_models_cbor = self.epochs.protocol_params.cost_models.to_cbor();
+        // Pre-compute cost_models CBOR once per block, for the ValidateAll phase-2
+        // path only. All consumers (capture_phase2_work_item, the sequential
+        // evaluate_plutus_scripts, and the parallel divergence checker) live inside
+        // the `if mode == ValidateAll` block / are gated on ValidateAll — in
+        // ApplyOnly mode phase-2 is suppressed (SKIP_PHASE2_EVAL), so the value
+        // would be unused dead work on the bulk-sync hot path.
+        let cost_models_cbor = if mode == BlockValidationMode::ValidateAll {
+            self.epochs.protocol_params.cost_models.to_cbor()
+        } else {
+            None
+        };
 
         // Track processed tx hashes to skip duplicates within a block
         let mut processed_tx_hashes =
