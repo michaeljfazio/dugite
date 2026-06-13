@@ -3452,20 +3452,32 @@ pub fn validate_transaction_with_pools(
     // ------------------------------------------------------------------
     // VRF key deduplication (Haskell `VRFKeyHashAlreadyRegistered`, Conway+)
     //
-    // From Conway (protocol >= 9), a pool registration certificate whose VRF
-    // key hash is already registered to a DIFFERENT pool is rejected. A pool
+    // From protocol version 11 onward, a pool registration certificate whose
+    // VRF key hash is already registered to a DIFFERENT pool is rejected. A pool
     // re-registering its own parameters with the same VRF key is permitted (the
     // key already belongs to that pool, so the new registration is not a
     // collision).
     //
+    // The gate is PV >= 11, NOT >= 9: Haskell
+    //   hardforkConwayDisallowDuplicatedVRFKeys pv = pvMajor pv > natVersion @10
+    // (eras/shelley/impl/src/Cardano/Ledger/Shelley/Era.hs), consulted in the
+    // RegPool branch of Shelley.Rules.Pool. The check is INACTIVE at PV 9 and
+    // PV 10 — the whole Conway bootstrap + current mainnet — so two genuinely
+    // different pools (e.g. same operator) may legitimately share a VRF key
+    // until PV 11. Gating at >= 9 falsely rejected mainnet tx 054c270b… at
+    // epoch 523 (PV 9.0), which cardano-node accepts.
+    //
     // This check is only enforced when `registered_vrf_keys` is provided (block
     // validation mode). The map is keyed by VRF key hash (Hash32) and maps to
-    // the pool ID (Hash28) that currently holds that key.
+    // the pool ID (Hash28) that currently holds that key. (NOTE: at PV 11 the
+    // Haskell `psVRFKeyHashes` is a refcount map and a retiring pool keeps its
+    // key until POOLREAP — a refcount model will be needed then; mainnet is not
+    // yet at PV 11.)
     //
     // Reference: Haskell `VRFKeyHashAlreadyRegistered` in
-    // `cardano-ledger-conway:Cardano.Ledger.Conway.Rules.Pool`.
+    // `cardano-ledger:Cardano.Ledger.Shelley.Rules.Pool` (reused by Conway).
     // ------------------------------------------------------------------
-    if params.protocol_version_major >= 9 {
+    if params.protocol_version_major >= 11 {
         if let Some(vrf_keys) = registered_vrf_keys {
             for cert in &tx.body.certificates {
                 if let dugite_primitives::transaction::Certificate::PoolRegistration(pool_params) =

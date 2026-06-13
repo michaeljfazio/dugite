@@ -11410,15 +11410,16 @@ mod tests {
     }
 
     #[test]
-    fn test_vrf_key_already_registered_rejected_in_conway() {
+    fn test_vrf_key_already_registered_rejected_at_pv11() {
         // A new pool registration using a VRF key that belongs to a DIFFERENT
-        // registered pool must be rejected in Conway (proto >= 9).
+        // registered pool must be rejected only from PV 11 onward (Haskell
+        // hardforkConwayDisallowDuplicatedVRFKeys = pvMajor > 10).
         let pool_a = Hash28::from_bytes([0xA0u8; 28]);
         let pool_b = Hash28::from_bytes([0xB0u8; 28]);
         let shared_vrf = Hash32::from_bytes([0xCCu8; 32]);
 
         let mut params = ProtocolParameters::mainnet_defaults();
-        params.protocol_version_major = 9; // Conway
+        params.protocol_version_major = 11; // check active at PV >= 11
 
         let mut utxo_set = UtxoSet::new();
         let input = TransactionInput {
@@ -11481,7 +11482,7 @@ mod tests {
 
         assert!(
             result.is_err(),
-            "Expected VrfKeyHashAlreadyRegistered for duplicate VRF key in Conway; got Ok"
+            "Expected VrfKeyHashAlreadyRegistered for duplicate VRF key at PV11; got Ok"
         );
         let errors = result.unwrap_err();
         assert!(
@@ -11494,12 +11495,13 @@ mod tests {
 
     #[test]
     fn test_vrf_key_already_registered_same_pool_allowed() {
-        // A pool re-registering with its OWN VRF key must be accepted (no collision).
+        // A pool re-registering with its OWN VRF key must be accepted (no collision)
+        // even when the duplicate-VRF check is active (PV >= 11).
         let pool_a = Hash28::from_bytes([0xA0u8; 28]);
         let own_vrf = Hash32::from_bytes([0xCCu8; 32]);
 
         let mut params = ProtocolParameters::mainnet_defaults();
-        params.protocol_version_major = 9; // Conway
+        params.protocol_version_major = 11; // check active at PV >= 11
 
         let mut utxo_set = UtxoSet::new();
         let input = TransactionInput {
@@ -11569,8 +11571,9 @@ mod tests {
 
     #[test]
     fn test_vrf_key_dedup_skipped_pre_conway() {
-        // VRF key deduplication is only enforced in Conway (proto >= 9). In
-        // Babbage (proto = 8), duplicate VRF keys are allowed.
+        // VRF key deduplication is only enforced from PV 11 onward
+        // (hardforkConwayDisallowDuplicatedVRFKeys = pvMajor > 10). In Babbage
+        // (proto = 8) duplicate VRF keys are allowed.
         let pool_a = Hash28::from_bytes([0xA1u8; 28]);
         let pool_b = Hash28::from_bytes([0xB1u8; 28]);
         let shared_vrf = Hash32::from_bytes([0xDDu8; 32]);
@@ -11643,6 +11646,88 @@ mod tests {
         );
     }
 
+    /// Regression for the mainnet epoch-523 (PV 9.0) divergence: a NEW pool
+    /// registering with a VRF key already held by a DIFFERENT pool must be
+    /// ACCEPTED during the Conway bootstrap window (PV 9 and PV 10), because
+    /// `hardforkConwayDisallowDuplicatedVRFKeys = pvMajor > 10` is False there.
+    /// dugite previously gated at PV >= 9 and falsely rejected mainnet tx
+    /// 054c270b6fed2be05cec72077e5dea18c041eb33e9c632a8f9c750d70b1c02df.
+    #[test]
+    fn test_vrf_key_dedup_skipped_during_conway_bootstrap_pv9_pv10() {
+        for pv in [9u64, 10u64] {
+            let pool_a = Hash28::from_bytes([0xA3u8; 28]);
+            let pool_b = Hash28::from_bytes([0xB3u8; 28]);
+            let shared_vrf = Hash32::from_bytes([0xDFu8; 32]);
+
+            let mut params = ProtocolParameters::mainnet_defaults();
+            params.protocol_version_major = pv;
+
+            let mut utxo_set = UtxoSet::new();
+            let input = TransactionInput {
+                transaction_id: Hash32::from_bytes([0x05u8; 32]),
+                index: 0,
+            };
+            utxo_set.insert(
+                input.clone(),
+                TransactionOutput {
+                    address: Address::Byron(ByronAddress {
+                        payload: vec![0u8; 32],
+                    }),
+                    value: Value::lovelace(1_000_000_000),
+                    datum: OutputDatum::None,
+                    script_ref: None,
+                    is_legacy: false,
+                    raw_cbor: None,
+                },
+            );
+
+            let pool_deposit = params.pool_deposit.0;
+            let fee = 200_000u64;
+            let output = 1_000_000_000 - fee - pool_deposit;
+            let mut tx = make_simple_tx(input, output, fee);
+            tx.body
+                .certificates
+                .push(Certificate::PoolRegistration(make_pool_params_with_vrf(
+                    pool_b, shared_vrf,
+                )));
+
+            let mut registered_vrf_keys: std::collections::HashMap<Hash32, Hash28> =
+                std::collections::HashMap::new();
+            registered_vrf_keys.insert(shared_vrf, pool_a);
+            let registered_pools: std::collections::HashSet<Hash28> =
+                std::collections::HashSet::new();
+
+            let result = validate_transaction_with_pools(
+                &tx,
+                &utxo_set,
+                &params,
+                100,
+                300,
+                None,
+                Some(&registered_pools),
+                None,
+                None,
+                None,
+                None, // registered_dreps
+                Some(&registered_vrf_keys),
+                None, // node_network
+                None, // committee_members
+                None, // committee_resigned
+                None, // stake_key_deposits
+                None, // constitution_script_hash
+                None, // vote_delegations
+            );
+
+            let has_vrf_err = matches!(&result, Err(errors) if errors.iter().any(|e| {
+                matches!(e, ValidationError::VrfKeyHashAlreadyRegistered { .. })
+            }));
+            assert!(
+                !has_vrf_err,
+                "VRF key dedup must NOT fire during Conway bootstrap (PV {pv}); got: {result:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_vrf_key_dedup_no_map_skips_check() {
         // When registered_vrf_keys is None, the VRF dedup check must be skipped.
@@ -11652,7 +11737,7 @@ mod tests {
         let shared_vrf = Hash32::from_bytes([0xEEu8; 32]);
 
         let mut params = ProtocolParameters::mainnet_defaults();
-        params.protocol_version_major = 9; // Conway — but map is None
+        params.protocol_version_major = 11; // check active at PV >= 11 — but map is None
 
         let mut utxo_set = UtxoSet::new();
         let input = TransactionInput {
