@@ -134,6 +134,17 @@ const FETCHED_BLOCKS_CHANNEL_CAP: usize = 1024;
 /// dropping GSM events via try_send in the ChainSync task.
 const GSM_EVENT_CHANNEL_CAP: usize = 4096;
 
+/// #760: hard deadline (seconds) for the main run loop to BREAK after a
+/// shutdown signal, after which an independent watchdog force-exits the
+/// process. Bounds the SIGTERM-to-exit latency so a sync wedge (e.g. the
+/// genesis CSJ-far-ahead loop) can never leave the node un-stoppable: a
+/// wedged node once ignored SIGTERM for 1h42m, forcing a SIGKILL that risks
+/// ImmutableDB/LSM corruption. The watchdog only fires if the loop has NOT
+/// broken (i.e. never reached the already-bounded post-loop drain), so a
+/// healthy slow drain is never killed. Override via
+/// `DUGITE_SHUTDOWN_DEADLINE_SECS`. A SECOND signal forces immediate exit.
+const SHUTDOWN_LOOP_BREAK_DEADLINE_SECS: u64 = 90;
+
 /// Bind the N2N listener with `SO_REUSEADDR` + `SO_REUSEPORT` (Unix) so
 /// outbound connections from this node can share the listen port via
 /// [`dugite_network::TcpBearer::connect_from`]. Matches Haskell
@@ -2640,9 +2651,15 @@ impl Node {
         // Setup shutdown signal (SIGINT + SIGTERM) early so the node can be
         // gracefully stopped during replay (which can take 30+ minutes).
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        // #760: set true the instant the main run loop breaks, so the
+        // shutdown watchdog can tell "loop wedged, never broke" (force-exit)
+        // from "loop broke, draining cleanly" (the post-loop block has its own
+        // bounded 30s/120s timeouts — leave it alone).
+        let loop_broken = Arc::new(std::sync::atomic::AtomicBool::new(false));
         #[cfg(unix)]
         {
             let shutdown_tx_clone = shutdown_tx.clone();
+            let loop_broken_wd = loop_broken.clone();
             tokio::spawn(async move {
                 // Startup-time panic is acceptable — if we can't register signal
                 // handlers, the node cannot shut down gracefully.
@@ -2657,6 +2674,48 @@ impl Node {
                     }
                 }
                 shutdown_tx_clone.send(true).ok();
+
+                // #760: bounded shutdown watchdog, fully independent of the run
+                // loop (so a wedged run loop holding ledger/chain_db locks
+                // cannot starve it). Race the loop-break deadline against a
+                // SECOND signal:
+                //   - second SIGINT/SIGTERM  -> immediate forced exit (operator
+                //     escape hatch, matches cardano-node muscle memory),
+                //   - deadline elapses && the loop has NOT broken -> the run
+                //     loop is wedged (e.g. genesis CSJ-far-ahead, #760) and will
+                //     never reach the bounded post-loop drain, so force-exit
+                //     rather than leave an un-stoppable node that an operator
+                //     would have to SIGKILL (risking DB corruption).
+                // It deliberately does NOT touch ledger_state/chain_db: it relies
+                // on the last periodic atomic snapshot for recovery, so it is
+                // safe even when those locks are held by the wedge.
+                let deadline_secs = std::env::var("DUGITE_SHUTDOWN_DEADLINE_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(SHUTDOWN_LOOP_BREAK_DEADLINE_SECS);
+                tokio::select! {
+                    _ = signal::ctrl_c() => {
+                        error!("second shutdown signal (SIGINT) — forcing immediate exit");
+                        std::process::exit(130);
+                    }
+                    _ = sigterm.recv() => {
+                        error!("second shutdown signal (SIGTERM) — forcing immediate exit");
+                        std::process::exit(143);
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(deadline_secs)) => {
+                        if !loop_broken_wd.load(std::sync::atomic::Ordering::Acquire) {
+                            error!(
+                                deadline_secs,
+                                "run loop did not break within the shutdown deadline \
+                                 (sync wedge?) — forcing exit to avoid an un-stoppable \
+                                 node; recovery uses the last periodic snapshot (#760)"
+                            );
+                            std::process::exit(1);
+                        }
+                        // Loop broke in time; the post-loop drain owns the rest
+                        // (its own bounded 30s/120s force-exits). Watchdog done.
+                    }
+                }
             });
         }
         #[cfg(not(unix))]
@@ -4590,6 +4649,22 @@ impl Node {
         info!("Main run loop entered");
         loop {
             tokio::select! {
+                // #760: `biased;` + the shutdown arm FIRST so a shutdown signal
+                // breaks the loop on the very next iteration (after the current
+                // arm body returns), instead of being starved by tokio's random
+                // select fairness while a high-volume arm (e.g. fetched-block
+                // apply) stays perpetually ready. This bounds the COOPERATIVE
+                // SIGTERM-to-break latency to one arm-body; the independent
+                // watchdog (see the signal task) is the backstop for a truly
+                // wedged arm body.
+                biased;
+
+                // ── Shutdown ────────────────────────────────────────────
+                _ = shutdown_rx.changed() => {
+                    info!("Shutdown signal received");
+                    break;
+                }
+
                 // ── Process fetched blocks from BlockFetch workers ───────
                 //
                 // Every fetched block is unconditionally routed to
@@ -5094,14 +5169,14 @@ impl Node {
                 _ = forge_ticker.tick(), if has_block_producer => {
                     self.try_forge_block().await;
                 }
-
-                // ── Shutdown ────────────────────────────────────────────
-                _ = shutdown_rx.changed() => {
-                    info!("Shutdown signal received");
-                    break;
-                }
+                // (Shutdown arm moved to the top of the select — see `biased;` above, #760.)
             }
         }
+
+        // #760: the loop has broken — tell the shutdown watchdog so it does NOT
+        // force-exit while the bounded post-loop drain (below) runs its own
+        // 30s/120s timeouts. (Release pairs with the watchdog's Acquire load.)
+        loop_broken.store(true, std::sync::atomic::Ordering::Release);
 
         // Shut down all peer connections in parallel with a global timeout.
         // Each connection's shutdown() stops hot/warm protocols (up to 5s each)
