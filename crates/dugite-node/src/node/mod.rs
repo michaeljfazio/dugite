@@ -2624,6 +2624,22 @@ impl Node {
             if let Some(slot) = tip.point.slot() {
                 self.metrics.set_slot(slot.0);
                 self.metrics.set_block_number(tip.block_number.0);
+                // #742: seed the ledger-tip watch with the ChainDB tip so the
+                // forecast-horizon admission gate (forecast_park_or_disconnect)
+                // measures incoming headers against the node's EFFECTIVE tip,
+                // not the stale snapshot tip. The startup volatile replay
+                // (reapply mode) advances the ledger toward this tip but never
+                // fires `ledger_tip_slot_tx` (publish_ledger_view runs only on
+                // the live apply path). Without this seed, a restart with a
+                // large fetched-ahead volatile gap (e.g. blocks fetched past a
+                // block whose apply then halted) parks EVERY incoming header on
+                // "beyond forecast horizon" against the snapshot tip and wedges
+                // the whole sync (observed live: restart from an epoch-511
+                // snapshot whose ChainDB had fetched ~172k slots ahead). Only an
+                // admission gate — apply-time validation stays authoritative and
+                // the genesis LoE still caps adoption, so an optimistic seed
+                // during the brief local replay is safe.
+                let _ = self.ledger_tip_slot_tx.send(slot.0);
                 self.update_sync_progress(slot.0, &ls.slot_config).await;
                 // Era-aware tip-age computation (see Node::slot_to_wallclock_ms).
                 let slot_time_ms = self.slot_to_wallclock_ms(slot.0, &ls.slot_config).await;
