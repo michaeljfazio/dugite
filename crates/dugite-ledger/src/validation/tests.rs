@@ -10338,11 +10338,12 @@ mod tests {
     #[test]
     fn test_vote_deleg_to_unregistered_drep_rejected() {
         // VoteDelegation to an unregistered DRep must produce
-        // DelegateeDRepNotRegistered in Conway era.
+        // DelegateeDRepNotRegistered — but ONLY at PV >= 10. The PV9 Conway
+        // bootstrap phase skips the check (see the PV9-accept test below).
         let drep_cred_bytes = [0x40u8; 28];
         let stake_cred_bytes = [0x41u8; 28];
         let mut params = ProtocolParameters::mainnet_defaults();
-        params.protocol_version_major = 9; // Conway
+        params.protocol_version_major = 10; // PV10 — DRep-registered check active
 
         let drep_hash = Hash28::from_bytes(drep_cred_bytes).to_hash32_padded();
         // DRep target as a KeyHash DRep
@@ -10397,6 +10398,71 @@ mod tests {
                 .any(|e| matches!(e, ValidationError::DelegateeDRepNotRegistered { .. })),
             "Expected DelegateeDRepNotRegistered; got: {errors:?}"
         );
+    }
+
+    #[test]
+    fn test_vote_deleg_to_unregistered_drep_accepted_at_pv9_bootstrap() {
+        // During the PV9 Conway bootstrap phase the DRep-registered check is
+        // SKIPPED (hardforkConwayBootstrapPhase pvMajor==9). A VoteDelegation to
+        // a not-yet-registered DRep is ACCEPTED — the on-chain
+        // self-register-then-self-delegate pattern (VoteDelegation cert[0] +
+        // RegDRep cert[1]) that diverged 26× on mainnet at epoch 507+ before the
+        // >= 9 → >= 10 fix. Pins the bootstrap-phase relaxation.
+        let drep_cred_bytes = [0x40u8; 28];
+        let stake_cred_bytes = [0x41u8; 28];
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // PV9 — Conway bootstrap, check skipped
+
+        let drep_hash = Hash28::from_bytes(drep_cred_bytes).to_hash32_padded();
+        let drep = DRep::KeyHash(drep_hash);
+        let stake_cred = dugite_primitives::credentials::Credential::VerificationKey(
+            Hash28::from_bytes(stake_cred_bytes),
+        );
+
+        let mut utxo_set = UtxoSet::new();
+        let tx = make_vote_deleg_tx(
+            &mut utxo_set,
+            Certificate::VoteDelegation {
+                credential: stake_cred.clone(),
+                drep,
+            },
+        );
+
+        let registered_dreps: std::collections::HashSet<Hash32> = std::collections::HashSet::new();
+        let reward_accounts = make_reward_accounts_with_cred(stake_cred_bytes);
+
+        let result = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            None,
+            None,
+            Some(&reward_accounts),
+            None,
+            Some(&registered_dreps),
+            None, // registered_vrf_keys
+            None, // node_network
+            None, // committee_members
+            None, // committee_resigned
+            None, // stake_key_deposits
+            None, // constitution_script_hash
+            None, // vote_delegations
+        );
+
+        // At PV9 the bootstrap phase skips the check — there must be NO
+        // DelegateeDRepNotRegistered error (other unrelated errors, if any, are
+        // not this rule).
+        if let Err(errors) = &result {
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::DelegateeDRepNotRegistered { .. })),
+                "PV9 bootstrap must NOT emit DelegateeDRepNotRegistered; got: {errors:?}"
+            );
+        }
     }
 
     #[test]

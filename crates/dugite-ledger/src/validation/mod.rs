@@ -3155,7 +3155,7 @@ pub fn validate_transaction_with_pools(
     }
 
     // ------------------------------------------------------------------
-    // DelegateeDRepNotRegisteredDELEG (Conway DELEG rule, PV >= 9)
+    // DelegateeDRepNotRegisteredDELEG (Conway DELEG rule, PV >= 10)
     //
     // A vote-delegation certificate that points to a specific DRep
     // (KeyHash or ScriptHash) is rejected when that DRep credential is
@@ -3175,13 +3175,22 @@ pub fn validate_transaction_with_pools(
     // evaluated, so the checks below honour the same sequential semantics
     // (tracking a per-tx `new_dreps` delta set).
     //
-    // This check is only enforced in Conway (protocol >= 9) and when
-    // `registered_dreps` is provided.
+    // This check is SKIPPED during the PV9 Conway bootstrap phase and only
+    // enforced at protocol >= 10 (when `registered_dreps` is provided). Haskell
+    // `Cardano.Ledger.Conway.Rules.Deleg.checkDRepRegistered`:
+    //   unless (hardforkConwayBootstrapPhase pv) $
+    //     targetDRep `Map.member` dReps ?! DelegateeDRepNotRegisteredDELEG
+    // with `hardforkConwayBootstrapPhase pv = pvMajor pv == 9`. So during PV9 a
+    // vote-delegation to a not-yet-registered DRep — including the on-chain
+    // self-register-then-self-delegate pattern (VoteDelegation cert[0] +
+    // RegDRep cert[1] in one tx, which the left-to-right new_dreps tracking
+    // below would otherwise reject) — is ACCEPTED. Gating this at >= 9 wrongly
+    // rejected 26 such mainnet txs at PV9 (epoch 507+).
     //
     // Reference: Haskell `DelegateeDRepNotRegisteredDELEG` in
     // `cardano-ledger-conway:Cardano.Ledger.Conway.Rules.Deleg`.
     // ------------------------------------------------------------------
-    if params.protocol_version_major >= 9 {
+    if params.protocol_version_major >= 10 {
         if let Some(dreps) = registered_dreps {
             // Track DRep credentials registered within THIS tx (RegDRep cert
             // preceding a VoteDelegation in the same tx is valid).
