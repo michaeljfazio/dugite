@@ -693,6 +693,7 @@ async fn run_dump_snapshot(args: DumpSnapshotArgs) -> Result<()> {
     let mut conway_committee_members: Vec<([u8; 32], u64)> = Vec::new();
     let mut conway_constitution: Option<dugite_primitives::transaction::Constitution> = None;
     let mut conway_initial_dreps: Vec<(dugite_primitives::hash::Hash28, u64)> = Vec::new();
+    let mut conway_v3_cost_model: Option<Vec<i64>> = None;
     if let Some(ref genesis_path) = node_config.conway_genesis_file {
         let genesis_path = config_dir.join(genesis_path);
         if let Ok(genesis) = genesis::ConwayGenesis::load(&genesis_path) {
@@ -701,6 +702,7 @@ async fn run_dump_snapshot(args: DumpSnapshotArgs) -> Result<()> {
             conway_committee_members = genesis.committee_members();
             conway_constitution = genesis.to_ledger_constitution();
             conway_initial_dreps = genesis.initial_dreps_as_entries();
+            conway_v3_cost_model = genesis.plutus_v3_cost_model.clone();
             info!("Conway genesis loaded");
         }
     }
@@ -709,12 +711,14 @@ async fn run_dump_snapshot(args: DumpSnapshotArgs) -> Result<()> {
     let conway_genesis_init = if conway_committee_threshold.is_some()
         || !conway_committee_members.is_empty()
         || !conway_initial_dreps.is_empty()
+        || conway_v3_cost_model.is_some()
     {
         Some(dugite_ledger::eras::ConwayGenesisInit {
             initial_dreps: conway_initial_dreps.clone(),
             committee_members: conway_committee_members.clone(),
             committee_threshold: conway_committee_threshold,
             constitution: conway_constitution.clone(),
+            plutus_v3_cost_model: conway_v3_cost_model.clone(),
         })
     } else {
         None

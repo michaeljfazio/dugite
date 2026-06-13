@@ -978,6 +978,7 @@ mod tests {
                 },
                 script_hash: None,
             }),
+            plutus_v3_cost_model: None,
         };
         let ctx = make_ctx(&params, &delegates, Some(&genesis));
 
@@ -1100,6 +1101,7 @@ mod tests {
             committee_members: vec![],
             committee_threshold: None,
             constitution: None,
+            plutus_v3_cost_model: None,
         };
         let ctx = make_ctx(&params, &delegates, Some(&genesis));
         let mut utxo = make_utxo_sub();
