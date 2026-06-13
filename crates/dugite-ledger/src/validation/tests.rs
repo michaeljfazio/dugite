@@ -6356,11 +6356,15 @@ mod tests {
         );
     }
 
-    /// An `UnregDRep` certificate with a Script credential and no Cert redeemer
-    /// must be rejected.  `RegDRep` with the same credential must NOT require
-    /// a redeemer (DRep registration is one-sided, like stake registration).
+    /// Both `RegDRep` and `UnregDRep` with a Script credential and no Cert
+    /// redeemer must be rejected. Haskell `getScriptWitnessConwayTxCert.govWitness`
+    /// treats all three DRep gov-certs identically — `ConwayRegDRep cred _ _`,
+    /// `ConwayUnRegDRep cred _`, and `ConwayUpdateDRep cred _` each return
+    /// `credScriptHash cred` (cardano-ledger-conway-1.23.0.0,
+    /// eras/conway/impl/src/Cardano/Ledger/Conway/TxCert.hs), so a Plutus-script
+    /// credential on any of them needs a Certifying redeemer.
     #[test]
-    fn test_cert_redeemer_drep_unreg_requires_cert_reg_does_not() {
+    fn test_cert_redeemer_drep_reg_and_unreg_both_require() {
         use super::super::collateral::check_script_redeemers;
         use dugite_primitives::credentials::Credential;
         use dugite_primitives::transaction::Certificate;
@@ -6389,7 +6393,7 @@ mod tests {
             },
         );
 
-        // --- Part A: RegDRep with Script credential — no redeemer required ---
+        // --- Part A: RegDRep with Script credential — redeemer REQUIRED ---
 
         let tx_reg = Transaction {
             era: dugite_primitives::era::Era::Conway,
@@ -6408,7 +6412,7 @@ mod tests {
                 }],
                 fee: Lovelace(200_000),
                 ttl: None,
-                // DRep registration — no redeemer required.
+                // DRep registration with a script credential — redeemer required.
                 certificates: vec![Certificate::RegDRep {
                     credential: Credential::Script(drep_script_hash),
                     deposit: Lovelace(500_000_000),
@@ -6464,10 +6468,10 @@ mod tests {
         );
 
         assert!(
-            !reg_errors.iter().any(
-                |e| matches!(e, ValidationError::MissingRedeemer { tag, .. } if tag == "Cert")
-            ),
-            "RegDRep must not require a Cert redeemer, got: {reg_errors:?}"
+            reg_errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::MissingRedeemer { tag, index: 0 } if tag == "Cert")),
+            "Expected MissingRedeemer {{ tag: Cert, index: 0 }} for RegDRep with Script credential, got: {reg_errors:?}"
         );
 
         // --- Part B: UnregDRep with Script credential — redeemer required ---
