@@ -1633,7 +1633,12 @@ impl Node {
         // hard fork (pv >= 9) and the snapshot is missing it. This is a per-language
         // insert — V1/V2 (and any governance-updated V3) are left untouched.
         if ledger.epochs.protocol_params.protocol_version_major >= 9
-            && ledger.epochs.protocol_params.cost_models.plutus_v3.is_none()
+            && ledger
+                .epochs
+                .protocol_params
+                .cost_models
+                .plutus_v3
+                .is_none()
         {
             if let Some(ref v3) = conway_v3_cost_model {
                 ledger.epochs.protocol_params.cost_models.plutus_v3 = Some(v3.clone());
