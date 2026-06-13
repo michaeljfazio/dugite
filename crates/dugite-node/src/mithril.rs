@@ -915,7 +915,59 @@ async fn download_range(
     end: u64,
     progress: &std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<()> {
-    let range_header = format!("bytes={start}-{end}");
+    // A single transient mid-stream failure (connection reset, truncated body —
+    // surfaced by reqwest as "error decoding response body" / "error reading a
+    // body from connection") on ANY of the parallel ranges previously failed the
+    // entire multi-GB download with no recovery. Retry the range with an HTTP
+    // resume (`Range: bytes={next_offset}-{end}`) from the last byte we durably
+    // flushed, so a blip costs one range re-issue, not the whole snapshot. The
+    // imported snapshot is hash/certificate-verified downstream, so a bad resume
+    // cannot silently corrupt the DB.
+    const MAX_RANGE_RETRIES: u32 = 6;
+    let mut next_offset = start;
+    let mut attempt: u32 = 0;
+    loop {
+        match stream_range_once(client, url, path, &mut next_offset, end, progress).await {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < MAX_RANGE_RETRIES => {
+                attempt += 1;
+                tracing::warn!(
+                    range_start = start,
+                    range_end = end,
+                    resume_from = next_offset,
+                    attempt,
+                    error = %e,
+                    "Mithril range stream failed; retrying with HTTP resume"
+                );
+                // Capped linear backoff (0.5s, 1s, … up to ~3s).
+                let backoff_ms = std::cmp::min(500u64 * attempt as u64, 3000);
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "range {start}-{end} failed after {MAX_RANGE_RETRIES} retries \
+                         (resumed from {next_offset})"
+                    )
+                });
+            }
+        }
+    }
+}
+
+/// Stream one attempt of a byte range starting at `*next_offset`, advancing
+/// `*next_offset` only as batches are durably pwritten. On a mid-stream error
+/// the unflushed tail is dropped and `*next_offset` stays at the last flushed
+/// position, so the caller's retry re-requests exactly the missing bytes.
+async fn stream_range_once(
+    client: &reqwest::Client,
+    url: &str,
+    path: &Path,
+    next_offset: &mut u64,
+    end: u64,
+    progress: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> Result<()> {
+    let range_header = format!("bytes={}-{}", *next_offset, end);
     let response = client
         .get(url)
         .header(reqwest::header::RANGE, &range_header)
@@ -930,7 +982,6 @@ async fn download_range(
 
     // Accumulate up to FLUSH_BATCH_BYTES, then pwrite the whole batch.
     let mut buf: Vec<u8> = Vec::with_capacity(FLUSH_BATCH_BYTES);
-    let mut next_offset = start;
     let path_owned = path.to_owned();
 
     while let Some(chunk) = stream.next().await {
@@ -941,8 +992,8 @@ async fn download_range(
 
         if buf.len() >= FLUSH_BATCH_BYTES {
             let taken = std::mem::replace(&mut buf, Vec::with_capacity(FLUSH_BATCH_BYTES));
-            let off = next_offset;
-            next_offset += taken.len() as u64;
+            let off = *next_offset;
+            *next_offset += taken.len() as u64;
             let p = path_owned.clone();
             tokio::task::spawn_blocking(move || -> std::io::Result<()> {
                 pwrite_all(&p, &taken, off)
@@ -955,7 +1006,8 @@ async fn download_range(
 
     // Flush any remaining tail.
     if !buf.is_empty() {
-        let off = next_offset;
+        let off = *next_offset;
+        *next_offset += buf.len() as u64;
         let p = path_owned;
         tokio::task::spawn_blocking(move || -> std::io::Result<()> { pwrite_all(&p, &buf, off) })
             .await
@@ -4180,6 +4232,99 @@ mod tests {
                 w[1]
             );
         }
+    }
+
+    /// A range whose body is TRUNCATED mid-stream (server closes the connection
+    /// before Content-Length) must be retried and recovered, not fail the whole
+    /// download. Reproduces the `error decoding response body` / `error reading a
+    /// body from connection` failure that previously aborted multi-GB Mithril
+    /// imports on a single transient blip.
+    #[tokio::test]
+    async fn test_download_range_retries_on_truncated_body() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const SIZE: usize = 8 * 1024; // < FLUSH_BATCH_BYTES, so retry restarts from 0
+        let payload: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8).collect();
+        let payload = Arc::new(payload);
+        let req_count = Arc::new(AtomicUsize::new(0));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let payload_srv = Arc::clone(&payload);
+        let req_count_srv = Arc::clone(&req_count);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let payload_conn = Arc::clone(&payload_srv);
+                let req_count_conn = Arc::clone(&req_count_srv);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = std::str::from_utf8(&buf[..n]).unwrap_or("");
+                    if req.starts_with("HEAD ") {
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {SIZE}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                        let _ = stream.shutdown().await;
+                        return;
+                    }
+                    let range_str = req
+                        .lines()
+                        .find(|l| l.to_lowercase().starts_with("range:"))
+                        .and_then(|l| l.split_once(':').map(|x| x.1.trim().to_string()))
+                        .unwrap_or_else(|| "bytes=0-".to_string());
+                    let range_val = range_str.strip_prefix("bytes=").unwrap_or(&range_str);
+                    let mut parts = range_val.splitn(2, '-');
+                    let start: usize = parts.next().unwrap().parse().unwrap_or(0);
+                    let end: usize = parts.next().unwrap().parse().unwrap_or(SIZE - 1);
+                    let slice = &payload_conn[start..=end];
+
+                    // Advertise the full Content-Length, but on the FIRST request
+                    // write only half the body then close → truncated stream.
+                    let resp = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{SIZE}\r\nConnection: close\r\n\r\n",
+                        slice.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let attempt = req_count_conn.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        let _ = stream.write_all(&slice[..slice.len() / 2]).await;
+                    // truncate
+                    } else {
+                        let _ = stream.write_all(slice).await; // full body
+                    }
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("snapshot.tar.zst");
+
+        let _env_lock = env_lock().lock().await;
+        std::env::set_var("DUGITE_MITHRIL_DOWNLOAD_PARALLELISM", "1");
+        let result =
+            download_snapshot(&client, &format!("http://{addr}/snap"), &dest, SIZE as u64).await;
+        std::env::remove_var("DUGITE_MITHRIL_DOWNLOAD_PARALLELISM");
+        result.expect("download must recover from a truncated range via retry");
+
+        let got = std::fs::read(&dest).expect("output file must exist");
+        assert_eq!(
+            got, *payload,
+            "recovered output must match the original payload"
+        );
+        assert!(
+            req_count.load(Ordering::SeqCst) >= 2,
+            "expected at least one retry after the truncated first response, got {} request(s)",
+            req_count.load(Ordering::SeqCst)
+        );
     }
 
     /// When the server responds with `Accept-Ranges: none` (or omits the
