@@ -150,33 +150,53 @@ mod download_upstream_fixtures {
         fs::create_dir_all(target_dir)
             .with_context(|| format!("Cannot create {}", target_dir.display()))?;
 
-        let bytes = download_with_retry(url, token, 3)?;
-
-        let cursor = std::io::Cursor::new(bytes);
-        let gz = flate2::read::GzDecoder::new(cursor);
+        // Stream to a temp file (not an in-memory Vec) with HTTP-Range resume —
+        // some assets are hundreds of MB (ledger-rules ~875MB) and a whole-body
+        // `.bytes()` read aborts on any mid-stream blip with "error decoding
+        // response body". 5 attempts, resuming from the last byte written.
+        let tmp = download_to_temp_with_resume(url, token, 5)?;
+        let file = fs::File::open(&tmp).with_context(|| format!("open {}", tmp.display()))?;
+        let gz = flate2::read::GzDecoder::new(std::io::BufReader::new(file));
         let mut archive = tar::Archive::new(gz);
         archive.set_overwrite(true);
-        archive
+        let unpack = archive
             .unpack(target_dir)
-            .with_context(|| format!("Cannot extract to {}", target_dir.display()))?;
+            .with_context(|| format!("Cannot extract to {}", target_dir.display()));
+        let _ = fs::remove_file(&tmp);
+        unpack?;
 
         let count = count_files(target_dir);
         eprintln!("    extracted {count} files");
         Ok(())
     }
 
-    fn download_with_retry(url: &str, token: Option<&str>, max_retries: u32) -> Result<Vec<u8>> {
+    /// Download `url` to a temp file, retrying with an HTTP-Range resume from the
+    /// last durably-written byte on transient stream errors. Returns the temp
+    /// file path. Falls back to a fresh restart if the server ignores Range
+    /// (responds 200 instead of 206).
+    fn download_to_temp_with_resume(
+        url: &str,
+        token: Option<&str>,
+        max_retries: u32,
+    ) -> Result<PathBuf> {
+        use std::io::{Read, Write};
+
         let client = reqwest::blocking::Client::builder()
             .user_agent("dugite-xtask/1.0")
             .build()
             .context("Cannot build HTTP client")?;
 
-        let mut last_err = None;
+        let asset = url.rsplit('/').next().unwrap_or("fixture");
+        let tmp = std::env::temp_dir().join(format!("dugite-xtask-{asset}.download.tmp"));
+        let _ = fs::remove_file(&tmp);
+
+        let mut written: u64 = 0;
+        let mut last_err: Option<anyhow::Error> = None;
         for attempt in 0..=max_retries {
             if attempt > 0 {
-                let delay = Duration::from_secs(1u64 << (attempt - 1));
+                let delay = Duration::from_secs(1u64 << (attempt - 1).min(4));
                 eprintln!(
-                    "    retry {attempt}/{max_retries} after {}s…",
+                    "    retry {attempt}/{max_retries} (resume from {written} bytes) after {}s…",
                     delay.as_secs()
                 );
                 thread::sleep(delay);
@@ -185,21 +205,62 @@ mod download_upstream_fixtures {
             if let Some(tok) = token {
                 req = req.header("Authorization", format!("Bearer {tok}"));
             }
-            match req
-                .send()
-                .and_then(|r| r.error_for_status())
-                .and_then(|r| r.bytes())
-            {
-                Ok(bytes) => return Ok(bytes.to_vec()),
+            if written > 0 {
+                req = req.header(reqwest::header::RANGE, format!("bytes={written}-"));
+            }
+            let resp = match req.send().and_then(|r| r.error_for_status()) {
+                Ok(r) => r,
                 Err(e) => {
-                    eprintln!("    attempt {attempt} failed: {e}");
+                    eprintln!("    attempt {attempt} request failed: {e}");
+                    last_err = Some(e.into());
+                    continue;
+                }
+            };
+            // 206 = the server honoured Range → append; otherwise (200) it sent
+            // the whole body → restart the file from scratch.
+            let resuming = written > 0 && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+            let mut file = if resuming {
+                match fs::OpenOptions::new().append(true).open(&tmp) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        last_err = Some(e.into());
+                        written = 0;
+                        continue;
+                    }
+                }
+            } else {
+                written = 0;
+                fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?
+            };
+
+            let mut buf = vec![0u8; 1 << 20];
+            let stream_result: Result<()> = (|| {
+                let mut r = resp;
+                loop {
+                    let n = r.read(&mut buf).context("error reading response body")?;
+                    if n == 0 {
+                        break;
+                    }
+                    file.write_all(&buf[..n]).context("write to temp file")?;
+                    written += n as u64;
+                }
+                file.flush().context("flush temp file")?;
+                Ok(())
+            })();
+            match stream_result {
+                Ok(()) => return Ok(tmp),
+                Err(e) => {
+                    eprintln!("    attempt {attempt} stream failed at {written} bytes: {e}");
                     last_err = Some(e);
                 }
             }
         }
+        let _ = fs::remove_file(&tmp);
         bail!(
             "Download failed after {max_retries} retries: {}",
-            last_err.unwrap()
+            last_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown error".into())
         );
     }
 
