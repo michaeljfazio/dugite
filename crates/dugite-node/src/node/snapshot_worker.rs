@@ -63,6 +63,10 @@ pub struct SnapshotRequest {
     /// `.meta.json` sidecar so a backend-mismatched snapshot is rejected
     /// on load (mirrors Haskell's `SnapshotMetadata` backend tag).
     pub backend: dugite_ledger::SnapshotBackend,
+    /// ImmutableDB tip slot at enqueue time (#762). The prune floor guard
+    /// spares the newest snapshot at-or-below this slot so a restart always
+    /// retains a replayable recovery anchor. `0` disables the floor guard.
+    pub immutable_tip_slot: u64,
 }
 
 /// Construct the channel + spawn the worker task.
@@ -161,8 +165,10 @@ fn process_request(
     }
 
     // Prune retains `max_snapshots + 1` so the freshly-written one
-    // doesn't get nuked by its own prune pass.
-    prune_old_snapshots_in_dir(database_path, max_snapshots.saturating_add(1));
+    // doesn't get nuked by its own prune pass. #762: also spare the newest
+    // snapshot at-or-below the ImmutableDB tip (restart-recovery anchor).
+    let floor = (req.immutable_tip_slot > 0).then_some(req.immutable_tip_slot);
+    prune_old_snapshots_in_dir(database_path, max_snapshots.saturating_add(1), floor);
 
     info!(
         epoch = req.epoch,
@@ -236,6 +242,7 @@ mod tests {
             slot: 1234,
             utxo_count: 0,
             backend: dugite_ledger::SnapshotBackend::DugiteMem,
+            immutable_tip_slot: 0,
         })
         .await
         .unwrap();
@@ -285,6 +292,7 @@ mod tests {
             slot: 0,
             utxo_count: 0,
             backend: dugite_ledger::SnapshotBackend::DugiteMem,
+            immutable_tip_slot: 0,
         })
         .unwrap();
         assert!(
@@ -337,6 +345,7 @@ mod tests {
                 slot: epoch * 1000,
                 utxo_count: 0,
                 backend: dugite_ledger::SnapshotBackend::DugiteMem,
+                immutable_tip_slot: 0,
             })
             .await
             .unwrap();

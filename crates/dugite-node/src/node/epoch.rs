@@ -212,8 +212,22 @@ pub(crate) fn snapshot_backend_for_ledger(
 /// most recent. Free function so it is reachable from a `spawn_blocking`
 /// task without `&Node` (issue #649 — Phase B of the offloaded snapshot
 /// write).
-pub(crate) fn prune_old_snapshots_in_dir(database_path: &std::path::Path, keep: usize) {
-    let mut snapshots: Vec<(u64, PathBuf)> = Vec::new();
+pub(crate) fn prune_old_snapshots_in_dir(
+    database_path: &std::path::Path,
+    keep: usize,
+    // #762: the newest snapshot whose tip slot is `<=` this floor (the
+    // ImmutableDB tip / flush point) is PROTECTED from pruning, so a restart
+    // always retains at least one snapshot that can be replayed forward from
+    // ChainDB even when the VolatileDB is lost (e.g. a crash before the WAL
+    // fsync, or a flush that lagged far behind the live tip). Without this
+    // guard, a slow ValidateAll sync — where every snapshot is taken at the
+    // live (volatile) tip far above the immutable tip — leaves ALL snapshots
+    // stranded above the immutable tip; on restart they cannot be replayed and
+    // the node wedges. `None` disables the floor guard (used in unit tests).
+    immutable_tip_slot: Option<u64>,
+) {
+    // (epoch, slot, path); slot is 0 for the legacy "epochN.bin" name format.
+    let mut snapshots: Vec<(u64, u64, PathBuf)> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(database_path) {
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -221,18 +235,41 @@ pub(crate) fn prune_old_snapshots_in_dir(database_path: &std::path::Path, keep: 
             if let Some(rest) = name_str.strip_prefix("ledger-snapshot-epoch") {
                 if let Some(epoch_str) = rest.strip_suffix(".bin") {
                     // Handle both "5" (legacy) and "5-slot12345" (new) formats.
-                    let epoch_part = epoch_str.split("-slot").next().unwrap_or(epoch_str);
+                    let mut parts = epoch_str.splitn(2, "-slot");
+                    let epoch_part = parts.next().unwrap_or(epoch_str);
+                    let slot = parts
+                        .next()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(0);
                     if let Ok(epoch) = epoch_part.parse::<u64>() {
-                        snapshots.push((epoch, entry.path()));
+                        snapshots.push((epoch, slot, entry.path()));
                     }
                 }
             }
         }
     }
+
+    // #762: identify the newest snapshot at-or-below the immutable tip — the
+    // restart-recovery anchor — and spare it from pruning regardless of age.
+    let protected: Option<PathBuf> = immutable_tip_slot.and_then(|floor| {
+        snapshots
+            .iter()
+            .filter(|(_, slot, _)| *slot > 0 && *slot <= floor)
+            .max_by_key(|(_, slot, _)| *slot)
+            .map(|(_, _, p)| p.clone())
+    });
+
     if snapshots.len() > keep {
-        snapshots.sort_by_key(|(epoch, _)| *epoch);
+        snapshots.sort_by_key(|(epoch, _, _)| *epoch);
         let to_remove = snapshots.len() - keep;
-        for (epoch, path) in snapshots.into_iter().take(to_remove) {
+        for (epoch, _slot, path) in snapshots.into_iter().take(to_remove) {
+            if protected.as_ref() == Some(&path) {
+                debug!(
+                    epoch,
+                    "Sparing restart-recovery snapshot (<= immutable tip) from prune (#762)"
+                );
+                continue;
+            }
             if let Err(e) = std::fs::remove_file(&path) {
                 warn!(epoch, "Failed to remove old snapshot: {e}");
             } else {
@@ -356,6 +393,16 @@ impl Node {
 
         let database_path = self.database_path.clone();
         let max_snapshots = self.snapshot_policy.max_snapshots + 1;
+        // #762: the ImmutableDB tip is the flush point. The prune floor guard
+        // keeps the newest snapshot at-or-below it so a restart always has a
+        // replayable recovery anchor (see prune_old_snapshots_in_dir).
+        let immutable_tip_slot = self
+            .chain_db
+            .read()
+            .await
+            .get_immutable_tip_point()
+            .and_then(|p| p.slot())
+            .map(|s| s.0);
         let epoch_path = database_path.join(format!("ledger-snapshot-epoch{epoch}-slot{slot}.bin"));
         let latest_path = database_path.join("ledger-snapshot.bin");
 
@@ -378,7 +425,7 @@ impl Node {
                 // `latest.bin` is missing.
                 error!("Failed to hardlink latest ledger snapshot: {e}");
             }
-            prune_old_snapshots_in_dir(&database_path, max_snapshots);
+            prune_old_snapshots_in_dir(&database_path, max_snapshots, immutable_tip_slot);
             Ok(bytes)
         })
         .await;
@@ -431,6 +478,21 @@ impl Node {
             return SnapshotEnqueue::Skipped;
         }
 
+        // #762: capture the ImmutableDB tip (flush point) BEFORE the ledger
+        // write lock to avoid a lock-order inversion (chain_db is always
+        // acquired before ledger_state on the apply path). Threaded into the
+        // snapshot worker's prune floor guard so the newest snapshot at-or-
+        // below the immutable tip is never pruned — guaranteeing a restart-
+        // recoverable anchor even when the live (volatile) tip races far ahead.
+        let immutable_tip_slot = self
+            .chain_db
+            .read()
+            .await
+            .get_immutable_tip_point()
+            .and_then(|p| p.slot())
+            .map(|s| s.0)
+            .unwrap_or(0);
+
         // Phase A — under the ledger write lock. LSM flush (sub-second
         // on preview, ~1–2 s on mainnet under churn) + Arc::clone
         // view build (two big stake-credential HashMaps ≈ 350 ms on
@@ -453,6 +515,7 @@ impl Node {
                 slot: ls.tip.point.slot().map(|s| s.0).unwrap_or(0),
                 utxo_count: ls.utxo.utxo_set.len(),
                 backend: snapshot_backend_for_ledger(&ls),
+                immutable_tip_slot,
             }
             // ── LOCK RELEASED HERE ──
         };
@@ -990,7 +1053,7 @@ mod tests {
         std::fs::write(&other, b"junk").unwrap();
 
         // Keep 3 most recent — epochs 3, 4, 5 survive; 0, 1, 2 are deleted.
-        prune_old_snapshots_in_dir(dir, 3);
+        prune_old_snapshots_in_dir(dir, 3, None);
 
         assert!(!legacy.exists(), "legacy epoch 0 must be pruned");
         assert!(
@@ -1029,7 +1092,7 @@ mod tests {
             )
             .unwrap();
         }
-        prune_old_snapshots_in_dir(dir, 5);
+        prune_old_snapshots_in_dir(dir, 5, None);
         assert!(dir.join("ledger-snapshot-epoch1-slot100.bin").exists());
         assert!(dir.join("ledger-snapshot-epoch2-slot200.bin").exists());
     }
@@ -1039,7 +1102,70 @@ mod tests {
     fn test_prune_old_snapshots_in_dir_missing_dir_is_noop() {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("nope");
-        prune_old_snapshots_in_dir(&missing, 3); // must not panic
+        prune_old_snapshots_in_dir(&missing, 3, None); // must not panic
+    }
+
+    /// #762: the prune floor guard must SPARE the newest snapshot at-or-below
+    /// the immutable tip so a restart always retains a replayable recovery
+    /// anchor — even when every "recent" snapshot is stranded above the
+    /// immutable tip (the slow-ValidateAll / lagging-flush scenario).
+    #[test]
+    fn test_prune_floor_spares_recovery_anchor_below_immutable_tip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // ep1/slot100 and ep2/slot200 are at-or-below the immutable tip (250);
+        // ep3..ep5 are stranded above it (volatile region). With keep=2 the
+        // default prune would delete ep1,ep2,ep3 — leaving NO snapshot <= the
+        // immutable tip → unrecoverable on a volatile-loss restart.
+        for (epoch, slot) in [(1u64, 100u64), (2, 200), (3, 300), (4, 400), (5, 500)] {
+            std::fs::write(
+                dir.join(format!("ledger-snapshot-epoch{epoch}-slot{slot}.bin")),
+                b"x",
+            )
+            .unwrap();
+        }
+
+        // Keep 2 newest, floor = immutable tip 250.
+        prune_old_snapshots_in_dir(dir, 2, Some(250));
+
+        // The newest snapshot at-or-below 250 is ep2/slot200 — it MUST survive
+        // even though it is older than the keep window.
+        assert!(
+            dir.join("ledger-snapshot-epoch2-slot200.bin").exists(),
+            "ep2 (newest <= immutable tip) is the recovery anchor and must be spared"
+        );
+        // The keep window keeps the 2 newest by epoch (ep4, ep5).
+        assert!(dir.join("ledger-snapshot-epoch5-slot500.bin").exists());
+        assert!(dir.join("ledger-snapshot-epoch4-slot400.bin").exists());
+        // ep3 (above the floor, outside keep window) is pruned.
+        assert!(
+            !dir.join("ledger-snapshot-epoch3-slot300.bin").exists(),
+            "ep3 is above the immutable tip and outside the keep window → pruned"
+        );
+        // ep1 (below floor but older than the spared anchor) is pruned.
+        assert!(
+            !dir.join("ledger-snapshot-epoch1-slot100.bin").exists(),
+            "ep1 is superseded by the newer anchor ep2 → pruned"
+        );
+    }
+
+    /// #762: when the floor is `None` (guard disabled), behaviour is unchanged
+    /// — only the `keep` newest survive.
+    #[test]
+    fn test_prune_floor_none_keeps_only_newest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for (epoch, slot) in [(1u64, 100u64), (2, 200), (3, 300)] {
+            std::fs::write(
+                dir.join(format!("ledger-snapshot-epoch{epoch}-slot{slot}.bin")),
+                b"x",
+            )
+            .unwrap();
+        }
+        prune_old_snapshots_in_dir(dir, 1, None);
+        assert!(!dir.join("ledger-snapshot-epoch1-slot100.bin").exists());
+        assert!(!dir.join("ledger-snapshot-epoch2-slot200.bin").exists());
+        assert!(dir.join("ledger-snapshot-epoch3-slot300.bin").exists());
     }
 
     #[test]
