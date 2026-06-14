@@ -1051,6 +1051,56 @@ mod tests {
         assert_eq!(and.mem, 3);
     }
 
+    /// #764 Part B: confirm the budget-exhausted flood is the DEFAULT-cost
+    /// fallback, NOT a real-model over-count. When the V3 cost model is absent
+    /// (the from-genesis PPUP-wipe, pre-#764-Part-A), `resolve_applied_costs`
+    /// returns `None` and the CEK runs on `BuiltinCosts::DEFAULT`, which charges
+    /// MORE than the real on-chain V3 model for `equalsByteString` — the ~1453-cpu
+    /// overrun (signature cpu_remaining=14547). With the real model, `apply_v3`
+    /// is byte-exact, so once Part A guarantees V3 is always present the flood
+    /// disappears. This test pins both facts.
+    #[test]
+    fn v3_default_fallback_overcharges_equals_bytestring() {
+        let raw = include_str!("../tests/fixtures/mainnet_plutus_v3_costmodel.json");
+        let p: Vec<i64> = raw
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .split(',')
+            .map(|s| s.trim().parse::<i64>().expect("int"))
+            .collect();
+        let real = apply_v3(&p).unwrap();
+
+        // Real on-chain V3 equalsByteString = LinearOnDiagonal(const=24548,
+        // intercept=29498, slope=38) [fixture idx 64..=66]. For equal-length
+        // args (on-diagonal) the cost is intercept + slope*n.
+        let n = 58i64;
+        let real_cost = real
+            .builtins
+            .cost_for(BuiltinId::EqualsByteString, n, n, 0)
+            .cpu;
+        assert_eq!(
+            real_cost,
+            29498 + 38 * n,
+            "apply_v3 must map equalsByteString to the real on-chain coefficients \
+             (no real-model over-count)"
+        );
+
+        // DEFAULT equalsByteString = LinearOnDiagonal(const=30623, intercept=28755,
+        // slope=75) — strictly MORE than the real model for any n>0. This is the
+        // over-charge that produced the flood when V3 was absent.
+        let default_cost = BuiltinCosts::DEFAULT
+            .cost_for(BuiltinId::EqualsByteString, n, n, 0)
+            .cpu;
+        assert_eq!(default_cost, 28755 + 75 * n);
+        assert!(
+            default_cost > real_cost,
+            "DEFAULT over-charges vs the real V3 model (DEFAULT={default_cost}, \
+             real={real_cost}) — the source of the #764 budget-exhausted flood \
+             when V3 was wiped to None on a from-genesis sync"
+        );
+    }
+
     /// The actual mainnet Alonzo PlutusV1 cost model (the 166 values from
     /// `config/mainnet/alonzo-genesis.json`, sorted into canonical
     /// `ParamName` order exactly as the ledger seeds them). Asserts a
