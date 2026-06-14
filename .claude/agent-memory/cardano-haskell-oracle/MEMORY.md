@@ -199,3 +199,6 @@
 
 ## applyChainTick Mutations (Forge Path)
 - [apply-chain-tick-forge-mutations.md](apply-chain-tick-forge-mutations.md) — Exact fields mutated by TICK/NEWEPOCH visible to forge: intra-epoch (only nesRu+cgsFuturePParams solidification), epoch boundary (nesPd from OLD mark distr, curPParams via nextEpochPParams, only if ParameterChange/HardForkInitiation enacted); UTxO/treasury/rewards invisible to forge; ConwayTICKF as canonical minimal-mutation reference; tickedPP==untickedPP when no PP update enacted
+
+## Babbage→Conway HFC PPUP Order & updateCostModels
+- [babbage-conway-hf-ppup-order.md](babbage-conway-hf-ppup-order.md) — PPUP applied in Babbage EPOCH/UPEC BEFORE translateEra; FuturePParams type (NoPParamsUpdate/DefinitePParamsUpdate/PotentialPParamsUpdate); translateGovState translates ALL THREE pparams fields including futurePParams; updateCostModels: first arg=OLD(bppCostModels), second arg=NEW(V3 genesis), Map.union modValid oldValid (LEFT-biased=genesis-V3 wins, but no collision since Babbage can't have valid V3); Babbage PPUP V1/V2 survive; V3 always from ConwayGenesis

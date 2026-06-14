@@ -8,6 +8,9 @@
 - [ConwayGovState encoding](conway-gov-state-encoding-detailed.md) — array(7), nested types
 - [Conway Accounts/ConwayAccountState encoding](conway-accounts-encoding.md) — per-account array(4) with nullable delegations
 
+## V3 ScriptContext / Plutus Data Encoding
+- [ChangedParameters (PParamsUpdate) Plutus Data encoding](changed-parameters-plutus-data-encoding.md) — Data::Map keyed by ppuTag integers; all value shapes; Rational=List NOT Constr 0; CostModels/voting thresholds
+
 ## Governance / Epoch Boundary Corrections
 - [Conway proposal deposit epoch boundary — verified source facts](feedback_proposal_deposit_epoch_boundary.md) — returnProposalDeposits scope, expiry off-by-one, no silent drops, divergence diagnosis
 - [DRep expiry and vsNumDormantEpochs mechanics](drep-expiry-numDormantEpochs.md) — computeDRepExpiry formula, cumulative counter, delta-only correction, expiry check reCurrentEpoch > drepExpiry
