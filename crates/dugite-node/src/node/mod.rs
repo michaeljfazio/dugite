@@ -2916,6 +2916,41 @@ impl Node {
             self.publish_ledger_view(&ls);
         }
 
+        // #762: the post-replay `publish_ledger_view` above sends the LEDGER
+        // tip on `ledger_tip_slot_tx`. When the replay only PARTIALLY advanced
+        // the ledger toward the ChainDB tip — chunk files that do not connect
+        // to the loaded snapshot, or an LSM fork-rollback to an earlier
+        // canonical snapshot — that ledger tip is BELOW the ChainDB tip, and
+        // the publish REGRESSES the #742 startup seed (which set tip_rx to the
+        // ChainDB tip). The per-peer forecast-horizon admission gate
+        // (forecast_park_or_disconnect) then measures every incoming header
+        // against the regressed, lower tip and parks them all → permanent
+        // wedge in genesis bulk-sync mode (self-heals only on a SECOND restart,
+        // once replay re-saved a snapshot at the ChainDB tip so nothing is
+        // replayed). The forecast gate is admission-only — apply-time
+        // validation and the genesis LoE stay authoritative — so seeding it at
+        // the node's actual block coverage (the ChainDB tip) is safe and
+        // correct. Never let tip_rx regress below the ChainDB tip after replay.
+        {
+            let chaindb_tip_slot = self
+                .chain_db
+                .read()
+                .await
+                .get_tip()
+                .point
+                .slot()
+                .map(|s| s.0)
+                .unwrap_or(0);
+            if chaindb_tip_slot > *self.ledger_tip_slot_tx.borrow() {
+                let _ = self.ledger_tip_slot_tx.send(chaindb_tip_slot);
+                info!(
+                    chaindb_tip_slot,
+                    "Re-seeded ledger-tip watch to ChainDB tip after replay \
+                     (post-replay ledger tip lagged the ChainDB tip; #762)"
+                );
+            }
+        }
+
         // Enable strict verification (full crypto checks for new blocks).
         // After replay, we're at the chain tip from storage — enable strict
         // mode so live blocks are fully validated. The epoch nonce loaded from
@@ -4722,6 +4757,19 @@ impl Node {
         }
 
         info!("Main run loop entered");
+        // #762: count blocks applied since the last volatile→immutable flush so
+        // the flush is never starved. The main `select!` is `biased` with the
+        // fetched-block arm AHEAD of the `maintenance_ticker` arm; under a slow
+        // ValidateAll catch-up the fetched-block channel is perpetually ready,
+        // so the ticker NEVER fires and `run_background_maintenance` never runs
+        // — the VolatileDB grows without bound (observed: ~259k blocks / ~12
+        // epochs), stranding every ledger snapshot far above the immutable tip
+        // and making the node unrecoverable on restart. Forcing maintenance
+        // every MAINTENANCE_FORCE_BLOCKS blocks bounds the VolatileDB to the
+        // retention window + this interval, keeping the immutable flush within
+        // ~k of the live tip regardless of ticker starvation.
+        const MAINTENANCE_FORCE_BLOCKS: u64 = 256;
+        let mut blocks_since_maintenance: u64 = 0;
         loop {
             tokio::select! {
                 // #760: `biased;` + the shutdown arm FIRST so a shutdown signal
@@ -4787,6 +4835,16 @@ impl Node {
                             lc.chainsel_queue_empty();
                         }
                     }
+                    // #762: force the volatile→immutable flush periodically even
+                    // when the biased select starves the maintenance_ticker
+                    // during a sustained ValidateAll catch-up. Without this, the
+                    // VolatileDB grows unbounded and snapshots strand above the
+                    // immutable tip.
+                    blocks_since_maintenance += 1;
+                    if blocks_since_maintenance >= MAINTENANCE_FORCE_BLOCKS {
+                        blocks_since_maintenance = 0;
+                        self.run_background_maintenance().await;
+                    }
                 }
 
                 // ── ChainDB maintenance (periodic) ───────────────────────
@@ -4795,6 +4853,7 @@ impl Node {
                 // live sync.  See the `maintenance_ticker` declaration above
                 // for why this is the from-genesis apply-rate fix.
                 _ = maintenance_ticker.tick() => {
+                    blocks_since_maintenance = 0;
                     self.run_background_maintenance().await;
                 }
 
