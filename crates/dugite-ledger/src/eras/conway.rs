@@ -505,6 +505,43 @@ impl EraRules for ConwayRules {
                     merge_field!(protocol_version_minor);
                 }
                 super::shelley::apply_pp_update(&mut epochs.protocol_params, &merged);
+                // #764 Part A — re-seed PlutusV3 after a pre-Conway PPUP wipe.
+                //
+                // At the Babbage→Conway boundary `on_era_transition` (block-apply
+                // Step 2) seeds `cost_models.plutus_v3` from the Conway genesis,
+                // but `process_epoch_transition` (Step 3, here) then applies any
+                // pending PRE-CONWAY (Babbage) PPUP. A Babbage PPUP that carries
+                // `cost_models` (mainnet ep506 has two such quorum-meeting PPUPs,
+                // each `{PlutusV1, PlutusV2}` + protocol_major=9) makes
+                // `shelley::apply_pp_update` WHOLESALE-REPLACE the cost_models
+                // field (shelley.rs `params.cost_models = v.clone()`), wiping the
+                // just-seeded V3 → `plutus_v3 = None` for the whole Conway era →
+                // every PlutusV3 phase-2 eval falls back to the DEFAULT cost
+                // model (budget-exhausted false rejections).
+                //
+                // Haskell's order is PPUP-first, translateEra-second:
+                // `nextEpochPParams` applies the Babbage PPUP, THEN the hardfork's
+                // `translateEra @Conway` → `upgradeConwayPParams` →
+                // `updateCostModels` does `Map.union {V3_genesis} {V1_new,V2_new}`,
+                // so V3 SURVIVES. We mirror that final state by re-inserting V3
+                // here. We do NOT change `shelley::apply_pp_update` to per-language
+                // merge: the oracle confirmed pre-Conway generic `applyPPUpdates`
+                // REPLACES the whole cost_models field, so merging there would
+                // itself diverge for an all-pre-Conway sync.
+                if epochs.protocol_params.cost_models.plutus_v3.is_none() {
+                    if let Some(genesis) = ctx.conway_genesis {
+                        if let Some(ref v3) = genesis.plutus_v3_cost_model {
+                            epochs.protocol_params.cost_models.plutus_v3 = Some(v3.clone());
+                            debug!(
+                                entries = v3.len(),
+                                epoch = new_epoch.0,
+                                "Re-seeded PlutusV3 cost model after pre-Conway PPUP \
+                                 wholesale cost_models replace (Haskell translateEra \
+                                 per-language insert; #764)"
+                            );
+                        }
+                    }
+                }
                 debug!(
                     epoch = new_epoch.0,
                     proposers = distinct_proposers,
@@ -3358,6 +3395,108 @@ mod tests {
             Some(existing),
             "an already-present V3 cost model must not be clobbered by genesis"
         );
+    }
+
+    /// #764 Part A regression: a pending PRE-CONWAY (Babbage) PPUP carrying
+    /// `cost_models = {V1, V2}` (no V3) applied at the Babbage→Conway boundary
+    /// must NOT leave `plutus_v3 = None`. `on_era_transition` seeds V3 (Step 2);
+    /// `process_epoch_transition` then applies the PPUP (Step 3) which wholesale-
+    /// replaces `cost_models` and would wipe V3. The fix re-seeds V3 from genesis,
+    /// matching Haskell's PPUP-then-translateEra order (mainnet ep506 has two
+    /// quorum-meeting PPUPs carrying `{PlutusV1, PlutusV2}` + protocol_major=9).
+    #[test]
+    fn test_process_epoch_transition_ppup_does_not_wipe_v3() {
+        use crate::eras::ConwayGenesisInit;
+        use dugite_primitives::transaction::{CostModels, ProtocolParamUpdate};
+
+        let rules = ConwayRules::new();
+        let params = ProtocolParameters::mainnet_defaults();
+
+        let genesis_v3 = vec![100788i64, 420, 1, 1000];
+        let genesis = ConwayGenesisInit {
+            plutus_v3_cost_model: Some(genesis_v3.clone()),
+            ..Default::default()
+        };
+        let delegates = Box::leak(Box::new(HashMap::new()));
+        let ctx = RuleContext {
+            params: &params,
+            current_slot: 133_660_800,
+            current_epoch: EpochNo(506),
+            era: Era::Conway,
+            slot_config: None,
+            node_network: None,
+            genesis_delegates: delegates,
+            update_quorum: 5,
+            epoch_length: 432000,
+            shelley_transition_epoch: 208,
+            byron_epoch_length: 21600,
+            stability_window: 129600,
+            stability_window_3kf: 129600,
+            randomness_stabilisation_window: 129600,
+            tx_index: 0,
+            conway_genesis: Some(&genesis),
+            max_lovelace_supply: crate::state::MAX_LOVELACE_SUPPLY,
+        };
+
+        let mut utxo = make_utxo_sub(vec![]);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut consensus = make_consensus_sub();
+        let mut epochs = make_epoch_sub();
+        // Simulate the state AFTER on_era_transition seeded V3 (Step 2):
+        epochs.protocol_params.cost_models.plutus_v1 = Some(vec![1, 2, 3]);
+        epochs.protocol_params.cost_models.plutus_v2 = Some(vec![4, 5, 6]);
+        epochs.protocol_params.cost_models.plutus_v3 = Some(genesis_v3.clone());
+
+        // Pending Babbage PPUP for epoch 506 (lookup = new_epoch-1 = 506) with
+        // cost_models = {V1_new, V2_new} (no V3) + PV9 bump; 5 distinct proposers.
+        let ppup = ProtocolParamUpdate {
+            cost_models: Some(CostModels {
+                plutus_v1: Some(vec![10, 20, 30]),
+                plutus_v2: Some(vec![40, 50, 60]),
+                plutus_v3: None,
+                plutus_v4: None,
+            }),
+            protocol_version_major: Some(9),
+            ..Default::default()
+        };
+        let mut proposals = Vec::new();
+        for i in 0u8..5 {
+            let mut key = [0u8; 32];
+            key[0] = i;
+            proposals.push((Hash32::from_bytes(key), ppup.clone()));
+        }
+        epochs.pending_pp_updates.insert(EpochNo(506), proposals);
+
+        rules
+            .process_epoch_transition(
+                EpochNo(507),
+                &ctx,
+                &mut utxo,
+                &mut certs,
+                &mut gov,
+                &mut epochs,
+                &mut consensus,
+            )
+            .expect("epoch transition should succeed");
+
+        // V3 must survive — re-seeded from genesis after the PPUP wipe.
+        assert_eq!(
+            epochs.protocol_params.cost_models.plutus_v3,
+            Some(genesis_v3),
+            "PlutusV3 cost model must survive a Babbage PPUP that carries only V1/V2 (#764)"
+        );
+        // V1/V2 updated by the PPUP.
+        assert_eq!(
+            epochs.protocol_params.cost_models.plutus_v1,
+            Some(vec![10, 20, 30])
+        );
+        assert_eq!(
+            epochs.protocol_params.cost_models.plutus_v2,
+            Some(vec![40, 50, 60])
+        );
+        // PV bumped to 9 by the PPUP.
+        assert_eq!(epochs.protocol_params.protocol_version_major, 9);
     }
 
     /// Verify committee members and threshold are set from ConwayGenesis.
