@@ -64,9 +64,9 @@ use crate::script_context::{
 use crate::tx_info_populate::credential_to_plutus;
 use dugite_primitives::credentials::Credential as PrimCred;
 use dugite_primitives::transaction::{
-    Certificate as PrimCert, GovAction as PrimGovAction, GovActionId as PrimGovActionId,
-    ProposalProcedure as PrimProposal, Vote as PrimVote, Voter as PrimVoter,
-    VotingProcedure as PrimVotingProcedure,
+    Certificate as PrimCert, CostModels, GovAction as PrimGovAction,
+    GovActionId as PrimGovActionId, ProposalProcedure as PrimProposal, ProtocolParamUpdate,
+    Rational, Vote as PrimVote, Voter as PrimVoter, VotingProcedure as PrimVotingProcedure,
 };
 use num_bigint::BigInt;
 use std::collections::BTreeMap;
@@ -202,11 +202,9 @@ pub fn proposal_to_plutus(p: &PrimProposal) -> Result<PlProposalProcedure, Phase
 ///   (`makeIsDataSchemaIndexed ''ProtocolVersion [('ProtocolVersion, 0)]`)
 /// - `Constitution = Constr 0 [Maybe ScriptHash]`
 ///   (`makeIsDataSchemaIndexed ''Constitution [('Constitution, 0)]`)
-/// - `ChangedParameters` (ParameterChange body) — opaque `Data` blob; dugite emits
-///   `Constr 0 []` (an empty placeholder) since the actual ppUpdate serialisation
-///   as `Data` is not observable by any currently-deployed script beyond its presence.
-///   A script that inspects `ChangedParameters` would need the full PParams decoder
-///   which is out of scope for this task — see issue #475 follow-up.
+/// - `ChangedParameters` (ParameterChange body) — `Data::Map [(I ppuTag, value)]`
+///   built by `ppu_to_changed_parameters_data` (#761), keyed by the Conway
+///   `ppuTag` integer; the Conway guardrails scripts `unMapData` this field.
 /// - `ColdCommitteeCredential` — `newtype deriving ToData` from `V2.Credential` →
 ///   bare `Credential` data (`Constr 0 [B28]` / `Constr 1 [B28]`)
 /// - `Rational = Constr 0 [I numerator, I denominator]`
@@ -218,20 +216,20 @@ pub fn gov_action_to_data(action: &PrimGovAction) -> Result<Data, PhaseTwoError>
         // Constr 0 [Maybe GovActionId, ChangedParameters, Maybe ScriptHash]
         PrimGovAction::ParameterChange {
             prev_action_id,
-            protocol_param_update: _,
+            protocol_param_update,
             policy_hash,
         } => Data::Constr(
             0,
             vec![
                 maybe_gov_action_id(prev_action_id.as_ref()),
-                // ChangedParameters is an opaque BuiltinData blob in Plutus V3.
-                // We emit Constr 0 [] as a safe placeholder — no deployed script
-                // byte-exactly inspects the inner PParamsUpdate fields through
-                // GovernanceAction (validators that care about PP changes read
-                // them from txInfoCurrentTreasuryAmount / proposal deposits, not
-                // the ChangedParameters blob directly). Full encoding tracked in
-                // issue #475 follow-up.
-                Data::Constr(0, vec![]),
+                // ChangedParameters (#761): the Conway guardrails scripts that
+                // validate ParameterChange proposals `unMapData` this field and
+                // inspect the changed parameters by integer key, so it MUST be a
+                // Data::Map [(I ppuTag, value)] — NOT the old `Constr 0 []`
+                // placeholder (which failed with "unMapData on non-Map Data" on
+                // mainnet txs 51f495aa / b2a591ac, which propose a PlutusV3
+                // cost-model change).
+                ppu_to_changed_parameters_data(protocol_param_update),
                 maybe_script_hash(policy_hash.as_ref()),
             ],
         ),
@@ -368,6 +366,212 @@ pub fn gov_action_to_data(action: &PrimGovAction) -> Result<Data, PhaseTwoError>
         PrimGovAction::InfoAction => Data::Constr(6, vec![]),
     };
     Ok(d)
+}
+
+/// Conway `CostModels` → Plutus `Data::Map [(I lang, List [I cost..])]`,
+/// languages in ascending order (V1=0, V2=1, V3=2, V4=3). Mirrors Haskell
+/// `flattenCostModels` + `ToPlutusData (Map Word8 [Int64])`
+/// (`Cardano.Ledger.Plutus.ToPlutusData`). Cost values are signed (the V3
+/// model contains negative entries, e.g. -900) so each is `Data::I` of a
+/// signed `BigInt`.
+fn cost_models_to_data(cm: &CostModels) -> Data {
+    let mut entries: Vec<(Data, Data)> = Vec::new();
+    let mut push_lang = |lang: i64, costs: &Option<Vec<i64>>| {
+        if let Some(c) = costs {
+            entries.push((
+                Data::I(BigInt::from(lang)),
+                Data::List(c.iter().map(|x| Data::I(BigInt::from(*x))).collect()),
+            ));
+        }
+    };
+    push_lang(0, &cm.plutus_v1);
+    push_lang(1, &cm.plutus_v2);
+    push_lang(2, &cm.plutus_v3);
+    push_lang(3, &cm.plutus_v4);
+    Data::Map(entries)
+}
+
+/// Build the Plutus V3 `ChangedParameters` Data for a Conway `ParameterChange`
+/// action: a `Data::Map [(I ppuTag, value)]` containing ONLY the fields the
+/// update actually sets, keyed by the Haskell `ppuTag` integer (= the Conway
+/// PParamsUpdate CBOR sparse-map key), in ascending key order. (#761)
+///
+/// Haskell reference (cardano-ledger-core `Cardano.Ledger.Core.PParams`):
+/// ```haskell
+/// instance ConwayEraScript era => ToPlutusData (PParamsUpdate era) where
+///   toPlutusData ppu = P.Map $ mapMaybe ppToData (eraPParams @era)
+///     where ppToData PParam{ppUpdate} = do
+///             PParamUpdate{ppuTag, ppuLens} <- ppUpdate
+///             t <- strictMaybeToMaybe $ ppu ^. ppuLens
+///             pure (P.I (toInteger ppuTag), toPlutusData t)
+/// ```
+///
+/// Value encodings (`Cardano.Ledger.Plutus.ToPlutusData`):
+/// - Coin / Word / EpochInterval: `I n`
+/// - UnitInterval / NonNegativeInterval: `List [I num, I den]` (NOT `Constr`!)
+/// - ExUnits: `List [I mem, I steps]` (mem first)
+/// - Prices (ExUnitPrices): `List [memPrice, stepPrice]` (each a rational `List`)
+/// - CostModels: `Map [(I lang, List [I cost..])]` (V1=0, V2=1, V3=2)
+/// - PoolVotingThresholds: `List` of 5 rationals (fixed order)
+/// - DRepVotingThresholds: `List` of 10 rationals (fixed order)
+///
+/// `SNothing` (unset) fields are omitted. `protocolVersion`, `d`, and
+/// `extraEntropy` are NOT updatable Conway PParams and have no ppuTag.
+fn ppu_to_changed_parameters_data(ppu: &ProtocolParamUpdate) -> Data {
+    fn int(v: u64) -> Data {
+        Data::I(BigInt::from(v))
+    }
+    // UnitInterval / NonNegativeInterval → List [I num, I den] (hand-written
+    // `ToPlutusData Rational` in plutus-ledger-api — List, not Constr).
+    fn rat(r: &Rational) -> Data {
+        Data::List(vec![
+            Data::I(BigInt::from(r.numerator)),
+            Data::I(BigInt::from(r.denominator)),
+        ])
+    }
+    let mut e: Vec<(Data, Data)> = Vec::new();
+    // 0–11: classic Shelley parameters.
+    if let Some(v) = ppu.min_fee_a {
+        e.push((int(0), int(v)));
+    }
+    if let Some(v) = ppu.min_fee_b {
+        e.push((int(1), int(v)));
+    }
+    if let Some(v) = ppu.max_block_body_size {
+        e.push((int(2), int(v)));
+    }
+    if let Some(v) = ppu.max_tx_size {
+        e.push((int(3), int(v)));
+    }
+    if let Some(v) = ppu.max_block_header_size {
+        e.push((int(4), int(v)));
+    }
+    if let Some(v) = ppu.key_deposit {
+        e.push((int(5), int(v.0)));
+    }
+    if let Some(v) = ppu.pool_deposit {
+        e.push((int(6), int(v.0)));
+    }
+    if let Some(v) = ppu.e_max {
+        e.push((int(7), int(v)));
+    }
+    if let Some(v) = ppu.n_opt {
+        e.push((int(8), int(v)));
+    }
+    if let Some(ref v) = ppu.a0 {
+        e.push((int(9), rat(v)));
+    }
+    if let Some(ref v) = ppu.rho {
+        e.push((int(10), rat(v)));
+    }
+    if let Some(ref v) = ppu.tau {
+        e.push((int(11), rat(v)));
+    }
+    // 16–24: Alonzo/Babbage parameters (keys 12–15 do not exist in Conway).
+    if let Some(v) = ppu.min_pool_cost {
+        e.push((int(16), int(v.0)));
+    }
+    if let Some(v) = ppu.ada_per_utxo_byte {
+        e.push((int(17), int(v.0)));
+    }
+    if let Some(ref cm) = ppu.cost_models {
+        e.push((int(18), cost_models_to_data(cm)));
+    }
+    if let Some(ref p) = ppu.execution_costs {
+        e.push((
+            int(19),
+            Data::List(vec![rat(&p.mem_price), rat(&p.step_price)]),
+        ));
+    }
+    if let Some(ref u) = ppu.max_tx_ex_units {
+        e.push((int(20), Data::List(vec![int(u.mem), int(u.steps)])));
+    }
+    if let Some(ref u) = ppu.max_block_ex_units {
+        e.push((int(21), Data::List(vec![int(u.mem), int(u.steps)])));
+    }
+    if let Some(v) = ppu.max_val_size {
+        e.push((int(22), int(v)));
+    }
+    if let Some(v) = ppu.collateral_percentage {
+        e.push((int(23), int(v)));
+    }
+    if let Some(v) = ppu.max_collateral_inputs {
+        e.push((int(24), int(v)));
+    }
+    // 25: poolVotingThresholds — 5 rationals, set together (all-or-nothing).
+    // Order: motionNoConfidence, committeeNormal, committeeNoConfidence,
+    //        hardForkInitiation, ppSecurityGroup.
+    if let (Some(a), Some(b), Some(c), Some(d), Some(f)) = (
+        ppu.pvt_motion_no_confidence.as_ref(),
+        ppu.pvt_committee_normal.as_ref(),
+        ppu.pvt_committee_no_confidence.as_ref(),
+        ppu.pvt_hard_fork.as_ref(),
+        ppu.pvt_pp_security_group.as_ref(),
+    ) {
+        e.push((
+            int(25),
+            Data::List(vec![rat(a), rat(b), rat(c), rat(d), rat(f)]),
+        ));
+    }
+    // 26: dRepVotingThresholds — 10 rationals, set together. Order:
+    //   motionNoConfidence, committeeNormal, committeeNoConfidence,
+    //   updateToConstitution, hardForkInitiation, ppNetworkGroup,
+    //   ppEconomicGroup, ppTechnicalGroup, ppGovGroup, treasuryWithdrawal.
+    #[allow(clippy::type_complexity)]
+    let dvt: Option<[&Rational; 10]> = match (
+        ppu.dvt_no_confidence.as_ref(),
+        ppu.dvt_committee_normal.as_ref(),
+        ppu.dvt_committee_no_confidence.as_ref(),
+        ppu.dvt_constitution.as_ref(),
+        ppu.dvt_hard_fork.as_ref(),
+        ppu.dvt_pp_network_group.as_ref(),
+        ppu.dvt_pp_economic_group.as_ref(),
+        ppu.dvt_pp_technical_group.as_ref(),
+        ppu.dvt_pp_gov_group.as_ref(),
+        ppu.dvt_treasury_withdrawal.as_ref(),
+    ) {
+        (
+            Some(a),
+            Some(b),
+            Some(c),
+            Some(d),
+            Some(f),
+            Some(g),
+            Some(h),
+            Some(j),
+            Some(k),
+            Some(l),
+        ) => Some([a, b, c, d, f, g, h, j, k, l]),
+        _ => None,
+    };
+    if let Some(t) = dvt {
+        e.push((int(26), Data::List(t.iter().map(|r| rat(r)).collect())));
+    }
+    // 27–33: Conway governance parameters.
+    if let Some(v) = ppu.min_committee_size {
+        e.push((int(27), int(v)));
+    }
+    if let Some(v) = ppu.committee_term_limit {
+        e.push((int(28), int(v)));
+    }
+    if let Some(v) = ppu.gov_action_lifetime {
+        e.push((int(29), int(v)));
+    }
+    if let Some(v) = ppu.gov_action_deposit {
+        e.push((int(30), int(v.0)));
+    }
+    if let Some(v) = ppu.drep_deposit {
+        e.push((int(31), int(v.0)));
+    }
+    if let Some(v) = ppu.drep_activity {
+        e.push((int(32), int(v)));
+    }
+    if let Some(v) = ppu.min_fee_ref_script_cost_per_byte {
+        // NonNegativeInterval in Haskell (List [num, den]); dugite stores the
+        // integer value, so emit v/1 (mainnet on-chain value is integer).
+        e.push((int(33), Data::List(vec![int(v), int(1)])));
+    }
+    Data::Map(e)
 }
 
 /// Encode `Maybe GovernanceActionId` as Plutus Data.
@@ -1188,6 +1392,89 @@ mod tests {
                 vec![Data::I(BigInt::from(10u64)), Data::I(BigInt::from(0u64))]
             )
         );
+    }
+
+    #[test]
+    fn parameter_change_changed_parameters_is_cost_models_map() {
+        // #761: mainnet tx 51f495aa proposes a PlutusV3 cost-model
+        // ParameterChange. ChangedParameters MUST be
+        // Data::Map [(I 18, Map[(I 2, List[I cost..])])] — NOT the old
+        // `Constr 0 []` placeholder, which broke the guardrails script's
+        // `unMapData` ("unMapData on non-Map Data").
+        use dugite_primitives::transaction::{CostModels, GovAction, ProtocolParamUpdate};
+        let v3 = vec![100788i64, 420, 1, 1, -900]; // includes a negative cost
+        let ppu = ProtocolParamUpdate {
+            cost_models: Some(CostModels {
+                plutus_v1: None,
+                plutus_v2: None,
+                plutus_v3: Some(v3.clone()),
+                plutus_v4: None,
+            }),
+            ..Default::default()
+        };
+        let d = gov_action_to_data(&GovAction::ParameterChange {
+            prev_action_id: None,
+            protocol_param_update: Box::new(ppu),
+            policy_hash: None,
+        })
+        .unwrap();
+        let Data::Constr(0, ref fields) = d else {
+            panic!("ParameterChange must be Constr 0; got {d:?}");
+        };
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0], Data::Constr(1, vec![]), "Nothing prev_action_id");
+        let expected_v3 = Data::List(v3.iter().map(|x| Data::I(BigInt::from(*x))).collect());
+        let expected_cm = Data::Map(vec![(Data::I(BigInt::from(2u64)), expected_v3)]);
+        let expected_changed = Data::Map(vec![(Data::I(BigInt::from(18u64)), expected_cm)]);
+        assert_eq!(
+            fields[1], expected_changed,
+            "ChangedParameters must be a Data::Map keyed by ppuTag (18 = costModels, lang 2 = V3)"
+        );
+        assert_eq!(fields[2], Data::Constr(1, vec![]), "Nothing policy_hash");
+    }
+
+    #[test]
+    fn changed_parameters_int_rational_encoding_and_pputag_order() {
+        // #761: int fields → I n; rational fields (a0 = ppuTag 9) → List[I num, I den]
+        // (NOT Constr); entries sorted ascending by ppuTag.
+        use dugite_primitives::transaction::{GovAction, ProtocolParamUpdate, Rational};
+        use dugite_primitives::value::Lovelace;
+        let ppu = ProtocolParamUpdate {
+            min_fee_a: Some(44), // ppuTag 0
+            a0: Some(Rational {
+                numerator: 3,
+                denominator: 10,
+            }), // ppuTag 9
+            gov_action_deposit: Some(Lovelace(100_000_000_000)), // ppuTag 30
+            ..Default::default()
+        };
+        let d = gov_action_to_data(&GovAction::ParameterChange {
+            prev_action_id: None,
+            protocol_param_update: Box::new(ppu),
+            policy_hash: None,
+        })
+        .unwrap();
+        let Data::Constr(0, fields) = d else {
+            panic!("ParameterChange must be Constr 0");
+        };
+        let Data::Map(entries) = &fields[1] else {
+            panic!("ChangedParameters must be Map; got {:?}", fields[1]);
+        };
+        assert_eq!(entries.len(), 3, "only the 3 set fields appear");
+        // Ascending ppuTag order: 0, 9, 30.
+        assert_eq!(entries[0].0, Data::I(BigInt::from(0u64)));
+        assert_eq!(entries[0].1, Data::I(BigInt::from(44u64)));
+        assert_eq!(entries[1].0, Data::I(BigInt::from(9u64)));
+        assert_eq!(
+            entries[1].1,
+            Data::List(vec![
+                Data::I(BigInt::from(3u64)),
+                Data::I(BigInt::from(10u64))
+            ]),
+            "a0 rational must be List[num,den], not Constr"
+        );
+        assert_eq!(entries[2].0, Data::I(BigInt::from(30u64)));
+        assert_eq!(entries[2].1, Data::I(BigInt::from(100_000_000_000u64)));
     }
 
     #[test]
