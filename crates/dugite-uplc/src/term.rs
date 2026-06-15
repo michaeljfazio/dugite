@@ -307,16 +307,16 @@ pub enum BuiltinId {
     Bls12_381_G1_Neg = 55,
     Bls12_381_G1_ScalarMul = 56,
     Bls12_381_G1_Equal = 57,
-    Bls12_381_G1_HashToGroup = 58,
-    Bls12_381_G1_Compress = 59,
-    Bls12_381_G1_Uncompress = 60,
+    Bls12_381_G1_Compress = 58,
+    Bls12_381_G1_Uncompress = 59,
+    Bls12_381_G1_HashToGroup = 60,
     Bls12_381_G2_Add = 61,
     Bls12_381_G2_Neg = 62,
     Bls12_381_G2_ScalarMul = 63,
     Bls12_381_G2_Equal = 64,
-    Bls12_381_G2_HashToGroup = 65,
-    Bls12_381_G2_Compress = 66,
-    Bls12_381_G2_Uncompress = 67,
+    Bls12_381_G2_Compress = 65,
+    Bls12_381_G2_Uncompress = 66,
+    Bls12_381_G2_HashToGroup = 67,
     Bls12_381_MillerLoop = 68,
     Bls12_381_MulMlResult = 69,
     Bls12_381_FinalVerify = 70,
@@ -339,32 +339,34 @@ pub enum BuiltinId {
     Ripemd_160 = 86,
     ExpModInteger = 87,
     // ── PV1.1.0 additions ───────────────────────────────────────────────
-    /// `dropList : (Integer, list T) -> list T` (PV1.1.0).
+    // Wire IDs 88-100 per IntersectMBO/plutus DefaultFun ordering
+    // (explicit hand-written Flat instance in Builtins.hs, NOT toEnum order).
+    /// `dropList : (Integer, list T) -> list T` (PV1.1.0). Wire ID 88.
     DropList = 88,
-    /// `indexArray : (array T, Integer) -> T` (PV1.1.0).
-    IndexArray = 89,
-    /// `lengthOfArray : (array T) -> Integer` (PV1.1.0).
-    LengthOfArray = 90,
-    /// `listToArray : (list T) -> (array T)` (PV1.1.0).
-    ListToArray = 91,
-    /// `insertCoin : ByteString -> ByteString -> Integer -> Value -> Value` (PV1.1.0).
-    InsertCoin = 92,
-    /// `lookupCoin : ByteString -> ByteString -> Value -> Integer` (PV1.1.0).
-    LookupCoin = 93,
-    /// `scaleValue : Integer -> Value -> Value` (PV1.1.0).
-    ScaleValue = 94,
-    /// `unValueData : Data -> Value` (PV1.1.0).
-    UnValueData = 95,
-    /// `valueData : Value -> Data` (PV1.1.0).
-    ValueData = 96,
-    /// `valueContains : Value -> Value -> Bool` (PV1.1.0).
+    /// `lengthOfArray : (array T) -> Integer` (PV1.1.0). Wire ID 89.
+    LengthOfArray = 89,
+    /// `listToArray : (list T) -> (array T)` (PV1.1.0). Wire ID 90.
+    ListToArray = 90,
+    /// `indexArray : (array T, Integer) -> T` (PV1.1.0). Wire ID 91.
+    IndexArray = 91,
+    /// `bls12_381_G1_multiScalarMul : (list Integer) -> (list G1) -> G1` (PV1.1.0). Wire ID 92.
+    Bls12_381_G1_MultiScalarMul = 92,
+    /// `bls12_381_G2_multiScalarMul : (list Integer) -> (list G2) -> G2` (PV1.1.0). Wire ID 93.
+    Bls12_381_G2_MultiScalarMul = 93,
+    /// `insertCoin : ByteString -> ByteString -> Integer -> Value -> Value` (PV1.1.0). Wire ID 94.
+    InsertCoin = 94,
+    /// `lookupCoin : ByteString -> ByteString -> Value -> Integer` (PV1.1.0). Wire ID 95.
+    LookupCoin = 95,
+    /// `unionValue : Value -> Value -> Value` (PV1.1.0). Wire ID 96.
+    UnionValue = 96,
+    /// `valueContains : Value -> Value -> Bool` (PV1.1.0). Wire ID 97.
     ValueContains = 97,
-    /// `unionValue : Value -> Value -> Value` (PV1.1.0).
-    UnionValue = 98,
-    /// `bls12_381_G1_multiScalarMul : (list Integer) -> (list G1) -> G1` (PV1.1.0).
-    Bls12_381_G1_MultiScalarMul = 99,
-    /// `bls12_381_G2_multiScalarMul : (list Integer) -> (list G2) -> G2` (PV1.1.0).
-    Bls12_381_G2_MultiScalarMul = 100,
+    /// `valueData : Value -> Data` (PV1.1.0). Wire ID 98.
+    ValueData = 98,
+    /// `unValueData : Data -> Value` (PV1.1.0). Wire ID 99.
+    UnValueData = 99,
+    /// `scaleValue : Integer -> Value -> Value` (PV1.1.0). Wire ID 100.
+    ScaleValue = 100,
 }
 
 impl BuiltinId {
@@ -435,16 +437,16 @@ impl BuiltinId {
             55 => Ok(BuiltinId::Bls12_381_G1_Neg),
             56 => Ok(BuiltinId::Bls12_381_G1_ScalarMul),
             57 => Ok(BuiltinId::Bls12_381_G1_Equal),
-            58 => Ok(BuiltinId::Bls12_381_G1_HashToGroup),
-            59 => Ok(BuiltinId::Bls12_381_G1_Compress),
-            60 => Ok(BuiltinId::Bls12_381_G1_Uncompress),
+            58 => Ok(BuiltinId::Bls12_381_G1_Compress),
+            59 => Ok(BuiltinId::Bls12_381_G1_Uncompress),
+            60 => Ok(BuiltinId::Bls12_381_G1_HashToGroup),
             61 => Ok(BuiltinId::Bls12_381_G2_Add),
             62 => Ok(BuiltinId::Bls12_381_G2_Neg),
             63 => Ok(BuiltinId::Bls12_381_G2_ScalarMul),
             64 => Ok(BuiltinId::Bls12_381_G2_Equal),
-            65 => Ok(BuiltinId::Bls12_381_G2_HashToGroup),
-            66 => Ok(BuiltinId::Bls12_381_G2_Compress),
-            67 => Ok(BuiltinId::Bls12_381_G2_Uncompress),
+            65 => Ok(BuiltinId::Bls12_381_G2_Compress),
+            66 => Ok(BuiltinId::Bls12_381_G2_Uncompress),
+            67 => Ok(BuiltinId::Bls12_381_G2_HashToGroup),
             68 => Ok(BuiltinId::Bls12_381_MillerLoop),
             69 => Ok(BuiltinId::Bls12_381_MulMlResult),
             70 => Ok(BuiltinId::Bls12_381_FinalVerify),
@@ -466,18 +468,18 @@ impl BuiltinId {
             86 => Ok(BuiltinId::Ripemd_160),
             87 => Ok(BuiltinId::ExpModInteger),
             88 => Ok(BuiltinId::DropList),
-            89 => Ok(BuiltinId::IndexArray),
-            90 => Ok(BuiltinId::LengthOfArray),
-            91 => Ok(BuiltinId::ListToArray),
-            92 => Ok(BuiltinId::InsertCoin),
-            93 => Ok(BuiltinId::LookupCoin),
-            94 => Ok(BuiltinId::ScaleValue),
-            95 => Ok(BuiltinId::UnValueData),
-            96 => Ok(BuiltinId::ValueData),
+            89 => Ok(BuiltinId::LengthOfArray),
+            90 => Ok(BuiltinId::ListToArray),
+            91 => Ok(BuiltinId::IndexArray),
+            92 => Ok(BuiltinId::Bls12_381_G1_MultiScalarMul),
+            93 => Ok(BuiltinId::Bls12_381_G2_MultiScalarMul),
+            94 => Ok(BuiltinId::InsertCoin),
+            95 => Ok(BuiltinId::LookupCoin),
+            96 => Ok(BuiltinId::UnionValue),
             97 => Ok(BuiltinId::ValueContains),
-            98 => Ok(BuiltinId::UnionValue),
-            99 => Ok(BuiltinId::Bls12_381_G1_MultiScalarMul),
-            100 => Ok(BuiltinId::Bls12_381_G2_MultiScalarMul),
+            98 => Ok(BuiltinId::ValueData),
+            99 => Ok(BuiltinId::UnValueData),
+            100 => Ok(BuiltinId::ScaleValue),
             _ => Err(crate::UplcError::FlatDecode(format!(
                 "unknown builtin id {raw} (max recognised: 100)"
             ))),

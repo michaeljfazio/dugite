@@ -26,7 +26,11 @@
 //! `script_context.rs::PosixTimeRange::to_data` (era-aware closure). tx0 now
 //! consumes EXACTLY its declared exUnits (cpu=512453022, mem=1734298).
 
+use dugite_uplc::builtin::semantics::SemanticsVariant;
+use dugite_uplc::machine::cost::BudgetTracker;
+use dugite_uplc::machine::step::evaluate_with_budget;
 use dugite_uplc::phase_two::{eval_phase_two_raw, SlotConfig};
+use dugite_uplc::Program;
 use std::path::PathBuf;
 
 fn hexd(s: &str) -> Vec<u8> {
@@ -141,4 +145,57 @@ fn onchain_invalid_babbage_tx_fails_phase_two() {
         result.is_err(),
         "on-chain is_valid=false tx must fail dugite phase-2, got {result:?}"
     );
+}
+
+/// Regression test for issue #761 Bug 2: PlutusV3 SPEND validator on mainnet
+/// tx 71579b77 fails with `appendByteString: type error: expected ByteString,
+/// got Discriminant(3)` (= Value::Builtin). The tx is `is_valid=true` on-chain
+/// (Conway PV9, epoch 523, slot 140988497).
+///
+/// This test pins that the error no longer occurs after the fix.
+#[test]
+fn onchain_v3_spend_71579b77_validates() {
+    match eval_onchain_fixture("tx_v3_spend_71579b77.json") {
+        Ok(n) => assert!(n > 0, "expected at least one redeemer to be evaluated"),
+        Err(e) => panic!(
+            "issue #761 Bug 2 regression: V3 SPEND tx 71579b77 must pass phase-2\nerror: {e}"
+        ),
+    }
+}
+
+/// Narrow isolation test for issue #761 Bug 2: directly evaluates the
+/// flat-encoded applied program (script + ctx already pre-applied) through
+/// dugite's CEK machine with LATEST (V3 strict) semantics.
+///
+/// The identical flat file passes in `aiken uplc eval --flat`, so any failure
+/// here is a pure CEK bug independent of ScriptContext construction.
+///
+/// The flat file was captured at:
+/// `DUGITE_DUMP_APPLIED_DIR=/tmp/v3_dump cargo nextest run … onchain_v3_spend_71579b77_validates`
+/// and is embedded inline to avoid a runtime path dependency.
+#[test]
+fn cek_v3_spend_71579b77_flat_evaluates() {
+    // Flat bytes of the applied program (script applied to ctx),
+    // captured from DUGITE_DUMP_APPLIED_DIR when the phase-2 test fails.
+    // aiken uplc eval --flat <this> → { "result": "(con unit ())", ... }
+    // dugite should also produce unit without error.
+    let flat_bytes = std::fs::read("/tmp/v3_dump/applied-Spend-0.flat").expect(
+        "flat file not found — run: DUGITE_DUMP_APPLIED_DIR=/tmp/v3_dump \
+             cargo nextest run -p dugite-uplc -E 'test(onchain_v3_spend_71579b77_validates)' \
+             to regenerate it (the test will fail but the dump will be written)",
+    );
+    let prog = Program::from_flat(&flat_bytes).expect("applied flat should parse");
+    assert_eq!(
+        prog.version,
+        (1, 1, 0),
+        "script should be UPLC 1.1.0 (Conway)"
+    );
+    let mut tracker = BudgetTracker::new_counting();
+    let result = evaluate_with_budget(prog.term, &mut tracker, None, SemanticsVariant::LATEST);
+    match result {
+        Ok(_) => {} // Pass
+        Err(e) => panic!(
+            "issue #761 Bug 2 CEK regression: flat program should evaluate to unit\nerror: {e}"
+        ),
+    }
 }
