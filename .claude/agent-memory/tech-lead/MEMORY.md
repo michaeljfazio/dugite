@@ -1,5 +1,8 @@
 # Tech Lead Agent Memory
 
+## UPLC CEK Machine
+- [UPLC flat wire ID vs DEFAULT cost table misalignment (#761)](uplc-builtin-flat-id-mismatch.md) — BLS G1/G2 compress/uncompress/hashToGroup IDs 58-60/65-67 were 3-way rotated; UPLC 1.1.0 IDs 89-100 mis-ordered; `cost.rs` DEFAULT table must match enum discriminants or `refill_builtin` consumes wrong params + charges wrong costs; conformance tests DO NOT catch this (text-format, not flat)
+
 ## Era Rules
 - [Dijkstra era rules dispatch (#462)](issue-462-dijkstra-era-rules.md) — Conway alias removed; DijkstraRules delegates to Conway plus identity translateEraDijkstra
 
