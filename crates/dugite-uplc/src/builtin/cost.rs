@@ -1123,15 +1123,15 @@ const fn builtin_cost_table() -> [CostPair; 101] {
         },
         // 57 Bls12_381_G1_Equal — constant
         c(442008, 1),
-        // 58 Bls12_381_G1_HashToGroup — linear_in_x / constant
+        // 58 Bls12_381_G1_Compress — constant
+        c(2780678, 6),
+        // 59 Bls12_381_G1_Uncompress — constant
+        c(52948122, 18),
+        // 60 Bls12_381_G1_HashToGroup — linear_in_x / constant
         CostPair {
             cpu: LinearInX(lin1(52538055, 3756)),
             mem: Constant(18),
         },
-        // 59 Bls12_381_G1_Compress — constant
-        c(2780678, 6),
-        // 60 Bls12_381_G1_Uncompress — constant
-        c(52948122, 18),
         // 61 Bls12_381_G2_Add — constant
         c(1995836, 36),
         // 62 Bls12_381_G2_Neg — constant
@@ -1143,15 +1143,15 @@ const fn builtin_cost_table() -> [CostPair; 101] {
         },
         // 64 Bls12_381_G2_Equal — constant
         c(901022, 1),
-        // 65 Bls12_381_G2_HashToGroup — linear_in_x / constant
+        // 65 Bls12_381_G2_Compress — constant
+        c(3227919, 12),
+        // 66 Bls12_381_G2_Uncompress — constant
+        c(74698472, 36),
+        // 67 Bls12_381_G2_HashToGroup — linear_in_x / constant
         CostPair {
             cpu: LinearInX(lin1(166917843, 4307)),
             mem: Constant(36),
         },
-        // 66 Bls12_381_G2_Compress — constant
-        c(3227919, 12),
-        // 67 Bls12_381_G2_Uncompress — constant
-        c(74698472, 36),
         // 68 Bls12_381_MillerLoop — constant
         c(254006273, 72),
         // 69 Bls12_381_MulMlResult — constant
@@ -1262,22 +1262,32 @@ const fn builtin_cost_table() -> [CostPair; 101] {
             cpu: LinearInX(lin1(116711, 1957)),
             mem: Constant(4),
         },
-        // 89 IndexArray — constant_cost / constant_cost
-        CostPair {
-            cpu: Constant(232010),
-            mem: Constant(32),
-        },
-        // 90 LengthOfArray — constant_cost / constant_cost
+        // 89 LengthOfArray — constant_cost / constant_cost
         CostPair {
             cpu: Constant(231883),
             mem: Constant(10),
         },
-        // 91 ListToArray — linear_in_x / linear_in_x
+        // 90 ListToArray — linear_in_x / linear_in_x
         CostPair {
             cpu: LinearInX(lin1(1000, 24838)),
             mem: LinearInX(lin1(7, 1)),
         },
-        // 92 InsertCoin — linear_in_u (= 4th value-arg size); dugite's
+        // 91 IndexArray — constant_cost / constant_cost
+        CostPair {
+            cpu: Constant(232010),
+            mem: Constant(32),
+        },
+        // 92 Bls12_381_G1_MultiScalarMul — linear_in_x / constant_cost
+        CostPair {
+            cpu: LinearInX(lin1(321837444, 25087669)),
+            mem: Constant(18),
+        },
+        // 93 Bls12_381_G2_MultiScalarMul — linear_in_x / constant_cost
+        CostPair {
+            cpu: LinearInX(lin1(617887431, 67302824)),
+            mem: Constant(36),
+        },
+        // 94 InsertCoin — linear_in_u (= 4th value-arg size); dugite's
         //   `cost_for` only carries x/y/z, so we approximate as
         //   linear_in_z (3rd arg = Integer amount) — for the
         //   conformance corpus this matches because the Plutus
@@ -1287,29 +1297,20 @@ const fn builtin_cost_table() -> [CostPair; 101] {
             cpu: LinearInZ(lin1(356924, 18413)),
             mem: LinearInZ(lin1(45, 21)),
         },
-        // 93 LookupCoin — linear_in_z / constant_cost
+        // 95 LookupCoin — linear_in_z / constant_cost
         CostPair {
             cpu: LinearInZ(lin1(219951, 9444)),
             mem: Constant(1),
         },
-        // 94 ScaleValue — linear_in_y / linear_in_y
+        // 96 UnionValue — with_interaction_in_x_and_y / added_sizes
         CostPair {
-            cpu: LinearInY(lin1(1000, 277577)),
-            mem: LinearInY(lin1(12, 21)),
-        },
-        // 95 UnValueData — quadratic_in_x / linear_in_x
-        CostPair {
-            cpu: QuadraticInX(Quadratic1 {
-                c0: 1000,
-                c1: 95933,
-                c2: 1,
+            cpu: WithInteractionXY(InteractionXYP {
+                c00: 1000,
+                c01: 183150,
+                c10: 172116,
+                c11: 6,
             }),
-            mem: LinearInX(lin1(1, 11)),
-        },
-        // 96 ValueData — linear_in_x / linear_in_x
-        CostPair {
-            cpu: LinearInX(lin1(1000, 38159)),
-            mem: LinearInX(lin1(2, 22)),
+            mem: AddedSizes(lin1(24, 21)),
         },
         // 97 ValueContains — const_above_diagonal{linear_in_x_and_y} / constant_cost
         CostPair {
@@ -1321,25 +1322,24 @@ const fn builtin_cost_table() -> [CostPair; 101] {
             }),
             mem: Constant(1),
         },
-        // 98 UnionValue — with_interaction_in_x_and_y / added_sizes
+        // 98 ValueData — linear_in_x / linear_in_x
         CostPair {
-            cpu: WithInteractionXY(InteractionXYP {
-                c00: 1000,
-                c01: 183150,
-                c10: 172116,
-                c11: 6,
+            cpu: LinearInX(lin1(1000, 38159)),
+            mem: LinearInX(lin1(2, 22)),
+        },
+        // 99 UnValueData — quadratic_in_x / linear_in_x
+        CostPair {
+            cpu: QuadraticInX(Quadratic1 {
+                c0: 1000,
+                c1: 95933,
+                c2: 1,
             }),
-            mem: AddedSizes(lin1(24, 21)),
+            mem: LinearInX(lin1(1, 11)),
         },
-        // 99 Bls12_381_G1_MultiScalarMul — linear_in_x / constant_cost
+        // 100 ScaleValue — linear_in_y / linear_in_y
         CostPair {
-            cpu: LinearInX(lin1(321837444, 25087669)),
-            mem: Constant(18),
-        },
-        // 100 Bls12_381_G2_MultiScalarMul — linear_in_x / constant_cost
-        CostPair {
-            cpu: LinearInX(lin1(617887431, 67302824)),
-            mem: Constant(36),
+            cpu: LinearInY(lin1(1000, 277577)),
+            mem: LinearInY(lin1(12, 21)),
         },
     ]
 }

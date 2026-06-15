@@ -176,19 +176,35 @@ pub fn eval_resolved_redeemer(
     // Debug aid (like DUGITE_DUMP_CTX above): dump the fully-applied
     // program as flat so it can be replayed through an external reference
     // CEK (Haskell `uplc evaluate`, `aiken uplc eval`) when root-causing a
-    // budget/trace divergence offline.
-    if let Ok(dir) = std::env::var("DUGITE_DUMP_APPLIED_DIR") {
-        let prog = crate::program::Program {
-            version,
-            term: applied_term.clone(),
-        };
-        let path = format!("{dir}/applied-{:?}-{}.flat", r.tag, r.index);
-        match prog.to_flat() {
-            Ok(bytes) => match std::fs::write(&path, bytes) {
-                Ok(()) => eprintln!("DUGITE_DUMP_APPLIED_DIR: wrote {path}"),
-                Err(e) => eprintln!("DUGITE_DUMP_APPLIED_DIR: write {path} failed: {e}"),
-            },
-            Err(e) => eprintln!("DUGITE_DUMP_APPLIED_DIR: flat-encode failed: {e}"),
+    // budget/trace divergence offline. Two modes:
+    //  - `DUGITE_DUMP_APPLIED_DIR` alone: dump EVERY applied term (file name
+    //    `applied-{tag}-{idx}.flat`, OVERWRITES per tag/index) — for single-tx
+    //    offline repro.
+    //  - `+ DUGITE_DUMP_FAILED_ONLY`: dump ONLY the applied terms whose CEK
+    //    eval FAILS, each with a unique sequence number + a `.err` sidecar
+    //    (`failed-{tag}-{idx}-{seq}.flat`). Lets a multi-tx ValidateAll sync
+    //    capture exactly the diverging evals (e.g. #761 Bug 2 `appendByteString`)
+    //    without thousands of overwritten dumps.
+    static DUMP_FAIL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dump_dir = std::env::var("DUGITE_DUMP_APPLIED_DIR").ok();
+    let dump_failed_only = std::env::var_os("DUGITE_DUMP_FAILED_ONLY").is_some();
+    let mut applied_for_fail_dump: Option<Term> = None;
+    if let Some(ref dir) = dump_dir {
+        if dump_failed_only {
+            applied_for_fail_dump = Some(applied_term.clone());
+        } else {
+            let prog = crate::program::Program {
+                version,
+                term: applied_term.clone(),
+            };
+            let path = format!("{dir}/applied-{:?}-{}.flat", r.tag, r.index);
+            match prog.to_flat() {
+                Ok(bytes) => match std::fs::write(&path, bytes) {
+                    Ok(()) => eprintln!("DUGITE_DUMP_APPLIED_DIR: wrote {path}"),
+                    Err(e) => eprintln!("DUGITE_DUMP_APPLIED_DIR: write {path} failed: {e}"),
+                },
+                Err(e) => eprintln!("DUGITE_DUMP_APPLIED_DIR: flat-encode failed: {e}"),
+            }
         }
     }
 
@@ -212,23 +228,37 @@ pub fn eval_resolved_redeemer(
     // every PV; strict `Word8` range-check for PlutusV3). See
     // [`SemanticsVariant::for_script`].
     let variant = crate::builtin::semantics::SemanticsVariant::for_script(r.language, major_pv);
-    let value = evaluate_with_budget(applied_term, &mut tracker, Some(&mut trace_log), variant)
-        .map_err(|error| {
-            // If any trace strings were emitted before the error, surface
-            // them in the richer `ScriptEvaluationFailedWithLogs` variant
-            // so callers can render "Trace logs: [...]" before the error
-            // (matching Haskell `cardano-cli transaction submit` output).
-            // When no traces were emitted, use the simpler variant to keep
-            // the error message clean.
-            if trace_log.is_empty() {
-                PhaseTwoError::ScriptEvaluationFailed(error)
-            } else {
-                PhaseTwoError::ScriptEvaluationFailedWithLogs {
-                    error,
-                    logs: trace_log.clone(),
-                }
+    let eval_result =
+        evaluate_with_budget(applied_term, &mut tracker, Some(&mut trace_log), variant);
+    // #761 Bug 2 capture: on a FAILED eval, dump the applied term with a
+    // unique name + the error message (when DUGITE_DUMP_FAILED_ONLY is set).
+    if let Err(ref err) = eval_result {
+        if let (Some(dir), Some(term)) = (dump_dir.as_ref(), applied_for_fail_dump.take()) {
+            let seq = DUMP_FAIL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let base = format!("{dir}/failed-{:?}-{}-{seq:04}", r.tag, r.index);
+            if let Ok(bytes) = (crate::program::Program { version, term }).to_flat() {
+                let _ = std::fs::write(format!("{base}.flat"), bytes);
             }
-        })?;
+            let _ = std::fs::write(format!("{base}.err"), format!("{err}"));
+            eprintln!("DUGITE_DUMP_FAILED_ONLY: wrote {base}.flat (err: {err})");
+        }
+    }
+    let value = eval_result.map_err(|error| {
+        // If any trace strings were emitted before the error, surface
+        // them in the richer `ScriptEvaluationFailedWithLogs` variant
+        // so callers can render "Trace logs: [...]" before the error
+        // (matching Haskell `cardano-cli transaction submit` output).
+        // When no traces were emitted, use the simpler variant to keep
+        // the error message clean.
+        if trace_log.is_empty() {
+            PhaseTwoError::ScriptEvaluationFailed(error)
+        } else {
+            PhaseTwoError::ScriptEvaluationFailedWithLogs {
+                error,
+                logs: trace_log.clone(),
+            }
+        }
+    })?;
 
     // 5. Classify the CEK result.
     //
