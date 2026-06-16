@@ -395,6 +395,14 @@ pub struct NodeMetrics {
     /// investigated (#669); without it the warn-and-return handler is
     /// indistinguishable from a network silence.
     pub block_apply_failures: AtomicU64,
+    /// Cumulative number of fetched blocks that were stored in the ChainDB but
+    /// SKIPPED at ledger apply because they did not connect to the ledger tip
+    /// (`prev_hash != ledger.tip`).  Out-of-order pipelined blocks bump this
+    /// transiently during healthy catch-up; a sustained rise while the applied
+    /// tip is frozen AND the ledger tip is ahead of the ChainDB tip is the
+    /// fingerprint of the #768 stranded-snapshot wedge (the apply-stall watchdog
+    /// keys on it).
+    pub fetched_blocks_not_connecting: AtomicU64,
     pub peers_connected: AtomicU64,
     pub peers_outbound: AtomicU64,
     pub peers_inbound: AtomicU64,
@@ -765,6 +773,7 @@ impl NodeMetrics {
             transactions_validated: AtomicU64::new(0),
             transactions_rejected: AtomicU64::new(0),
             block_apply_failures: AtomicU64::new(0),
+            fetched_blocks_not_connecting: AtomicU64::new(0),
             peers_connected: AtomicU64::new(0),
             peers_outbound: AtomicU64::new(0),
             peers_inbound: AtomicU64::new(0),
@@ -1543,6 +1552,14 @@ impl NodeMetrics {
                  A rising value means the chain has stalled at the offending block; \
                  inspect logs for the structured ERROR with peer and tx context.",
                 &self.block_apply_failures,
+            ),
+            (
+                "dugite_fetched_blocks_not_connecting_total",
+                "Fetched blocks stored but skipped at apply because they did not \
+                 connect to the ledger tip (#768). A sustained rise while the applied \
+                 tip is frozen and the ledger tip is ahead of the ChainDB tip is the \
+                 stranded-snapshot wedge fingerprint.",
+                &self.fetched_blocks_not_connecting,
             ),
             (
                 "dugite_blocks_forged_total",

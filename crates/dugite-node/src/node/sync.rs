@@ -2393,7 +2393,23 @@ impl Node {
         let db_tip_slot = db_tip.point.slot().map(|s| s.0).unwrap_or(0);
 
         if db_tip_slot <= ledger_slot {
-            return; // Ledger is already caught up
+            // #768: ledger tip STRICTLY ahead of the ChainDB tip = the ledger
+            // snapshot is ahead of stored blocks (a Mithril import gap, or a
+            // pre-#762 stranded DB). Normal (gap fills as peers deliver) — but if
+            // it does NOT fill, the apply-stall watchdog (run loop) detects the
+            // wedge and exits with an actionable error. Surface the gap at
+            // startup so the condition is visible without waiting for the watchdog.
+            if ledger_slot > db_tip_slot {
+                warn!(
+                    ledger_slot,
+                    chaindb_tip_slot = db_tip_slot,
+                    gap_slots = ledger_slot - db_tip_slot,
+                    "Ledger tip is ahead of the ChainDB tip — sync will not advance \
+                     until peers backfill the gap. If this persists (no apply progress), \
+                     the database is stranded; re-import via `dugite-node mithril-import` (#768)."
+                );
+            }
+            return; // Ledger is already caught up (or ahead — see warning above)
         }
 
         let blocks_behind = db_tip.block_number.0.saturating_sub({
