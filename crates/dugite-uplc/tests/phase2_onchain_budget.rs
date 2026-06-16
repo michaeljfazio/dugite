@@ -175,15 +175,19 @@ fn onchain_v3_spend_71579b77_validates() {
 /// and is embedded inline to avoid a runtime path dependency.
 #[test]
 fn cek_v3_spend_71579b77_flat_evaluates() {
-    // Flat bytes of the applied program (script applied to ctx),
-    // captured from DUGITE_DUMP_APPLIED_DIR when the phase-2 test fails.
+    // Flat bytes of the applied program (script applied to ctx), captured from
+    // DUGITE_DUMP_APPLIED_DIR and committed as a hermetic fixture so this test
+    // runs in CI (no /tmp runtime dependency).
     // aiken uplc eval --flat <this> → { "result": "(con unit ())", ... }
     // dugite should also produce unit without error.
-    let flat_bytes = std::fs::read("/tmp/v3_dump/applied-Spend-0.flat").expect(
-        "flat file not found — run: DUGITE_DUMP_APPLIED_DIR=/tmp/v3_dump \
-             cargo nextest run -p dugite-uplc -E 'test(onchain_v3_spend_71579b77_validates)' \
-             to regenerate it (the test will fail but the dump will be written)",
-    );
+    // To regenerate: DUGITE_DUMP_APPLIED_DIR=/tmp/v3_dump cargo nextest run -p
+    //   dugite-uplc -E 'test(onchain_v3_spend_71579b77_validates)' then copy
+    //   /tmp/v3_dump/applied-Spend-0.flat over the fixture below.
+    let flat_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/phase2_onchain")
+        .join("applied-Spend-0.flat");
+    let flat_bytes = std::fs::read(&flat_path)
+        .unwrap_or_else(|e| panic!("read flat fixture {}: {e}", flat_path.display()));
     let prog = Program::from_flat(&flat_bytes).expect("applied flat should parse");
     assert_eq!(
         prog.version,
