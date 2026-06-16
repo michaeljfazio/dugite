@@ -654,6 +654,8 @@ impl Node {
             cost_models_v1: pp.cost_models.plutus_v1.clone(),
             cost_models_v2: pp.cost_models.plutus_v2.clone(),
             cost_models_v3: pp.cost_models.plutus_v3.clone(),
+            cost_models_v4: pp.cost_models.plutus_v4.clone(),
+            cost_models_unknown: pp.cost_models.unknown_cost_models.clone(),
             execution_costs_mem_num: pp.execution_costs.mem_price.numerator,
             execution_costs_mem_den: pp.execution_costs.mem_price.denominator,
             execution_costs_step_num: pp.execution_costs.step_price.numerator,

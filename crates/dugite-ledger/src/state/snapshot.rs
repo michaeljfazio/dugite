@@ -402,7 +402,12 @@ impl LedgerState {
     /// changed from `u64` to `Rational` (Conway `NonNegativeInterval`), so
     /// the bincode layout of every embedded `protocol_params` /
     /// `prev_protocol_params` grew by one `u64` (the denominator).
-    pub(crate) const SNAPSHOT_VERSION: u8 = 23;
+    /// v24 (#770): `CostModels` gained `unknown_cost_models:
+    /// BTreeMap<u8, Vec<i64>>` (unknown-language entries preserved per Haskell
+    /// `_costModelsUnknown`), which bincode serializes as a length-prefixed
+    /// sequence — changing the layout of every embedded `protocol_params` /
+    /// `prev_protocol_params`.
+    pub(crate) const SNAPSHOT_VERSION: u8 = 24;
 
     /// Save ledger state snapshot to disk using bincode serialization.
     ///

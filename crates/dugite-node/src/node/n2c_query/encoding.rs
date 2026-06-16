@@ -599,11 +599,15 @@ pub(crate) fn encode_protocol_params_cbor(
     // [14] coinsPerUTxOByte (utxoCostPerByte)
     enc.u64(pp.ada_per_utxo_byte).ok();
 
-    // [15] costModels (map: {0: [v1], 1: [v2], 2: [v3]})
+    // [15] costModels — Haskell `EncCBOR CostModels` = `encCBOR .
+    // flattenCostModels`, a CBOR map keyed by ascending Word8 language:
+    // {0: [v1], 1: [v2], 2: [v3], 3: [v4], <unknown keys ≥ 4>}.
     {
         let cm_count = pp.cost_models_v1.is_some() as u64
             + pp.cost_models_v2.is_some() as u64
-            + pp.cost_models_v3.is_some() as u64;
+            + pp.cost_models_v3.is_some() as u64
+            + pp.cost_models_v4.is_some() as u64
+            + pp.cost_models_unknown.len() as u64;
         enc.map(cm_count).ok();
         if let Some(ref v1) = pp.cost_models_v1 {
             enc.u32(0).ok();
@@ -623,6 +627,22 @@ pub(crate) fn encode_protocol_params_cbor(
             enc.u32(2).ok();
             enc.array(v3.len() as u64).ok();
             for cost in v3 {
+                enc.i64(*cost).ok();
+            }
+        }
+        // PlutusV4 (Dijkstra, key 3).
+        if let Some(ref v4) = pp.cost_models_v4 {
+            enc.u32(3).ok();
+            enc.array(v4.len() as u64).ok();
+            for cost in v4 {
+                enc.i64(*cost).ok();
+            }
+        }
+        // #770: unknown-language entries (keys ≥ 4) in ascending key order.
+        for (key, costs) in &pp.cost_models_unknown {
+            enc.u32(u32::from(*key)).ok();
+            enc.array(costs.len() as u64).ok();
+            for cost in costs {
                 enc.i64(*cost).ok();
             }
         }

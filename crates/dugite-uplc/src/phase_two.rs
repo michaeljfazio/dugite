@@ -672,6 +672,7 @@ mod tests {
             plutus_v3: Some(vec![6]),
             // V4 not exercised here — covered by cost_models.rs decode tests.
             plutus_v4: None,
+            ..Default::default()
         };
         let cm_cbor = prim.to_cbor().unwrap();
         let tx_cbor = minimal_conway_tx_cbor();

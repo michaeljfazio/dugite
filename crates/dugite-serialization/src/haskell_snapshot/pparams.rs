@@ -473,6 +473,8 @@ pub fn decode_cost_models(data: &[u8]) -> Result<(CostModels, usize), Serializat
     let mut plutus_v2: Option<Vec<i64>> = None;
     let mut plutus_v3: Option<Vec<i64>> = None;
     let mut plutus_v4: Option<Vec<i64>> = None;
+    let mut unknown_cost_models: std::collections::BTreeMap<u8, Vec<i64>> =
+        std::collections::BTreeMap::new();
 
     // Decode each key→value pair; stop when we've consumed `maybe_len` entries
     // (definite) or hit the break byte 0xff (indefinite).
@@ -510,9 +512,16 @@ pub fn decode_cost_models(data: &[u8]) -> Result<(CostModels, usize), Serializat
             2 => plutus_v3 = Some(costs),
             // Dijkstra cost-model slot 3 = PlutusV4 (issue #475 Phase 5).
             3 => plutus_v4 = Some(costs),
-            // Silently ignore unknown language versions so future Plutus
-            // versions don't break deserialization.
-            _ => {}
+            // #770: preserve unknown-language entries (Haskell
+            // `_costModelsUnknown`). A key > 255 is not a valid `Word8`.
+            other => {
+                let lang = u8::try_from(other).map_err(|_| {
+                    SerializationError::CborDecode(format!(
+                        "cost-model language key {other} exceeds Word8 (0..=255)"
+                    ))
+                })?;
+                unknown_cost_models.insert(lang, costs);
+            }
         }
 
         entries_decoded += 1;
@@ -524,6 +533,7 @@ pub fn decode_cost_models(data: &[u8]) -> Result<(CostModels, usize), Serializat
             plutus_v2,
             plutus_v3,
             plutus_v4,
+            unknown_cost_models,
         },
         off,
     ))
@@ -664,6 +674,24 @@ pub fn decode_min_fee_ref_script(
 mod cap_tests {
     //! #554 allocation-cap tests for the haskell_snapshot pparams decoder.
     use super::*;
+
+    /// #770: the Haskell-snapshot cost-model decoder preserves unknown-language
+    /// entries (keys ≥ 4) instead of dropping them.
+    #[test]
+    fn decode_cost_models_snapshot_preserves_unknown() {
+        // {0: [1,2,3], 4: [50,60]}
+        let bytes: Vec<u8> = vec![
+            0xa2, // map(2)
+            0x00, 0x83, 0x01, 0x02, 0x03, // 0 => [1,2,3]
+            0x04, 0x82, 0x18, 0x32, 0x18, 0x3c, // 4 => [50,60]
+        ];
+        let (cm, n) = decode_cost_models(&bytes).unwrap();
+        assert_eq!(n, bytes.len(), "consumes the whole map");
+        assert_eq!(cm.plutus_v1, Some(vec![1, 2, 3]));
+        assert!(cm.plutus_v2.is_none() && cm.plutus_v3.is_none() && cm.plutus_v4.is_none());
+        assert_eq!(cm.unknown_cost_models.get(&4), Some(&vec![50, 60]));
+        assert_eq!(cm.unknown_cost_models.len(), 1);
+    }
 
     #[test]
     fn cost_array_rejects_declared_u32_max() {

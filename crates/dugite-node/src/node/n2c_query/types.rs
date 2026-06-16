@@ -385,6 +385,12 @@ pub struct ProtocolParamsSnapshot {
     pub cost_models_v1: Option<Vec<i64>>,
     pub cost_models_v2: Option<Vec<i64>>,
     pub cost_models_v3: Option<Vec<i64>>,
+    /// PlutusV4 cost model (Dijkstra, map key 3).
+    pub cost_models_v4: Option<Vec<i64>>,
+    /// #770: unknown-language cost models (keys ≥ 4), preserved so the
+    /// `GetCurrentPParams` reply routes the full `flattenCostModels` map like
+    /// Haskell `EncCBOR CostModels`. Ascending Word8 key order via `BTreeMap`.
+    pub cost_models_unknown: std::collections::BTreeMap<u8, Vec<i64>>,
     pub execution_costs_mem_num: u64,
     pub execution_costs_mem_den: u64,
     pub execution_costs_step_num: u64,
@@ -464,6 +470,8 @@ impl Default for ProtocolParamsSnapshot {
             cost_models_v1: None,
             cost_models_v2: None,
             cost_models_v3: None,
+            cost_models_v4: None,
+            cost_models_unknown: std::collections::BTreeMap::new(),
             execution_costs_mem_num: 577,
             execution_costs_mem_den: 10000,
             execution_costs_step_num: 721,

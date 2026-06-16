@@ -388,6 +388,15 @@ fn cost_models_to_data(cm: &CostModels) -> Data {
     push_lang(1, &cm.plutus_v2);
     push_lang(2, &cm.plutus_v3);
     push_lang(3, &cm.plutus_v4);
+    // #770: unknown-language entries (keys ≥ 4) in ascending key order. Haskell
+    // `toPlutusData . flattenCostModels` includes them, so a guardrail script
+    // that reads the cost-models field of a ParameterChange sees them too.
+    for (key, costs) in &cm.unknown_cost_models {
+        entries.push((
+            Data::I(BigInt::from(i64::from(*key))),
+            Data::List(costs.iter().map(|x| Data::I(BigInt::from(*x))).collect()),
+        ));
+    }
     Data::Map(entries)
 }
 
@@ -907,6 +916,32 @@ mod tests {
     use dugite_primitives::transaction::{Anchor, GovActionId};
     use dugite_primitives::value::Lovelace;
 
+    /// #770: `cost_models_to_data` (the `ChangedParameters` guardrail `Data` a
+    /// governance script sees) must include unknown-language entries (keys ≥ 4)
+    /// after the typed langs, in ascending order — matching Haskell
+    /// `toPlutusData . flattenCostModels`.
+    #[test]
+    fn cost_models_to_data_includes_unknown_lang() {
+        let cm = CostModels {
+            plutus_v3: Some(vec![100]),
+            unknown_cost_models: [(4u8, vec![200i64])].into_iter().collect(),
+            ..Default::default()
+        };
+        let data = cost_models_to_data(&cm);
+        match data {
+            Data::Map(entries) => {
+                assert_eq!(entries.len(), 2, "V3 + one unknown lang");
+                // Entry 0: (I 2, List [I 100]) — PlutusV3.
+                assert_eq!(entries[0].0, Data::I(BigInt::from(2)));
+                assert_eq!(entries[0].1, Data::List(vec![Data::I(BigInt::from(100))]));
+                // Entry 1: (I 4, List [I 200]) — the unknown language.
+                assert_eq!(entries[1].0, Data::I(BigInt::from(4)));
+                assert_eq!(entries[1].1, Data::List(vec![Data::I(BigInt::from(200))]));
+            }
+            other => panic!("expected Data::Map, got {other:?}"),
+        }
+    }
+
     fn h28(b: u8) -> dugite_primitives::hash::Hash28 {
         Hash::<28>([b; 28])
     }
@@ -1409,6 +1444,7 @@ mod tests {
                 plutus_v2: None,
                 plutus_v3: Some(v3.clone()),
                 plutus_v4: None,
+                ..Default::default()
             }),
             ..Default::default()
         };

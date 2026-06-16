@@ -1574,6 +1574,7 @@ mod tests {
             plutus_v2: Some(vec![100; 5]),
             plutus_v3: None,
             plutus_v4: None,
+            ..Default::default()
         });
         let mut errors = Vec::new();
         check_pparam_update_well_formed(&params, &body, &mut errors);
@@ -1592,6 +1593,7 @@ mod tests {
             plutus_v2: None,
             plutus_v3: None,
             plutus_v4: None,
+            ..Default::default()
         });
         let mut errors = Vec::new();
         check_pparam_update_well_formed(&params, &body, &mut errors);
@@ -1612,6 +1614,7 @@ mod tests {
             plutus_v2: Some(vec![100; 100]),
             plutus_v3: None,
             plutus_v4: None,
+            ..Default::default()
         });
         let mut errors = Vec::new();
         check_pparam_update_well_formed(&params, &body, &mut errors);
@@ -1632,6 +1635,7 @@ mod tests {
             plutus_v2: None,
             plutus_v3: Some(vec![100; 250]),
             plutus_v4: None,
+            ..Default::default()
         });
         let mut errors = Vec::new();
         check_pparam_update_well_formed(&params, &body, &mut errors);
@@ -1652,6 +1656,7 @@ mod tests {
             plutus_v2: Some(vec![100; 175]),
             plutus_v3: Some(vec![100; 297]),
             plutus_v4: None,
+            ..Default::default()
         });
         let mut errors = Vec::new();
         check_pparam_update_well_formed(&params, &body, &mut errors);
