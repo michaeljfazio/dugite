@@ -10,9 +10,13 @@
 set -uo pipefail
 
 METRICS="http://127.0.0.1:12801/metrics"
-NODE_PID=88299
+# Match by command line, not a fixed PID, so the monitor survives a node
+# restart (e.g. #767 wedge recovery).
+NODE_PAT="release-prof/dugite-node.*db-mainnet-genesis"
 LOG=/private/tmp/dugite-mainnet-soak-20260615-154625.log
 REPORTS=/Users/michaelfazio/Source/dugite/reports
+WEDGE_STALL=5   # consecutive 60s ticks with no block advance before sampling
+                # (>=5min; tolerates long Alonzo/Babbage snapshot+flush pauses)
 
 era_for() { # epoch -> era name (mainnet)
   local e=$1
@@ -40,15 +44,19 @@ pots_status="unknown"
 pots_epoch="?"
 hb_count=0          # heartbeat once every 60 loops (~60 min)
 block_hr_start=-1   # block number at start of the heartbeat hour
+# Baseline the error scan at the current EOF so pre-existing/resolved errors
+# (e.g. an already-handled disk-space warning) are never re-reported.
+last_size=$(stat -f%z "$LOG" 2>/dev/null || echo 0)
 
 while true; do
   ep=$(metric dugite_epoch_number)
   blk=$(metric dugite_block_number)
 
   # ---- liveness / stop detection ----
+  node_pid=$(pgrep -f "$NODE_PAT" | head -1)
   if [ -z "$ep" ] || [ -z "$blk" ]; then
-    if ! kill -0 "$NODE_PID" 2>/dev/null; then
-      echo "SOAK STOPPED: node pid $NODE_PID gone; last seen ep${last_epoch} block${last_block}"
+    if [ -z "$node_pid" ]; then
+      echo "SOAK STOPPED: node ($NODE_PAT) gone; last seen ep${last_epoch} block${last_block}"
       exit 0
     fi
     # metrics briefly unreachable but process alive -> skip this tick quietly
@@ -60,16 +68,31 @@ while true; do
   # ---- wedge detection ----
   if [ "$blk" = "$last_block" ]; then
     stall=$((stall+1))
-    if [ "$stall" -ge 2 ]; then
+    if [ "$stall" -ge "$WEDGE_STALL" ]; then
       ts=$(date -u +%Y%m%dT%H%M%SZ)
       out="$REPORTS/767-wedge-sample-$ts.txt"
-      sample "$NODE_PID" 5 -mayDie -f "$out" >/dev/null 2>&1 &
-      echo "WEDGE #767 at ep${ep} block${blk} slot$(metric dugite_slot_number): block did not advance across 2x60s; sampling -> $out"
-      stall=0   # don't re-fire every tick; wait for next genuine 2-stall
+      [ -n "$node_pid" ] && sample "$node_pid" 5 -mayDie -f "$out" >/dev/null 2>&1 &
+      echo "WEDGE #767 at ep${ep} block${blk} slot$(metric dugite_slot_number): no block advance across ${WEDGE_STALL}x60s; sampling -> $out"
+      stall=0   # don't re-fire every tick; wait for next genuine stall run
     fi
   else
     stall=0
   fi
+
+  # ---- new-error scan (since-offset: only bytes appended since last tick, so
+  #      a resolved error never re-alerts; reports each new occurrence once) ----
+  cur_size=$(stat -f%z "$LOG" 2>/dev/null || echo "$last_size")
+  if [ "$cur_size" -gt "$last_size" ]; then
+    new_err=$(tail -c "+$((last_size + 1))" "$LOG" 2>/dev/null |
+      grep -acE "ERROR|panic|FATAL|diverg|reserves mismatch|treasury mismatch|unable to store")
+    if [ "${new_err:-0}" -gt 0 ]; then
+      first=$(tail -c "+$((last_size + 1))" "$LOG" 2>/dev/null |
+        grep -aE "ERROR|panic|FATAL|diverg" | head -1 | cut -c1-200)
+      echo "NEW ERRORS (${new_err}) at ep${ep}: ${first}"
+    fi
+  fi
+  # If the log was rotated/truncated (cur < last), re-baseline.
+  last_size=$cur_size
 
   # ---- era boundary ----
   era=$(era_for "$ep")
