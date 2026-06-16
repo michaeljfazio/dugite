@@ -123,10 +123,18 @@ const ROLLBACK_ANN_CHANNEL_CAP: usize = 256;
 /// pinned the worker on `fetched_blocks_tx.send().await` after every range
 /// completion, undoing the throughput win of the 10 ms cadence.
 ///
-/// At 90 KB per Shelley+ block the worst-case memory footprint is ~90 MB.
-/// In Byron-era bulk sync (≤ 1 KiB blocks) it's ~1 MB.  Both are within the
-/// runtime budget.
-const FETCHED_BLOCKS_CHANNEL_CAP: usize = 1024;
+/// Each `FetchedBlock` holds the raw CBOR plus the fully-decoded `Block`
+/// (transactions/witnesses/decoded Plutus data), so peak in-flight memory is a
+/// few × the raw size: ballpark up to ~0.5–1 GB worst-case Conway at 4096 slots,
+/// ~50 MB Alonzo avg, a few MB Byron — within the runtime budget on the soak
+/// host, but not a hard ceiling for memory-constrained deployments.
+///
+/// #767: raised 1024 → 4096 to widen the apply-lag tolerance window during bulk
+/// catch-up. The residual peer-cascade stall begins when sustained apply lag
+/// drains then refills this channel; a deeper buffer delays cascade onset
+/// (~85 s → ~340 s fill time), giving apply time to absorb spikes. Defense in
+/// depth alongside the chainsync lock-convoy fix.
+const FETCHED_BLOCKS_CHANNEL_CAP: usize = 4096;
 
 /// GSM event channel capacity (G12).
 ///
@@ -4289,10 +4297,20 @@ impl Node {
         // Governor actions are dispatched through the lifecycle manager,
         // which creates/tears down protocol tasks on the single per-peer
         // mux connection.
-        // G11: reduced from 1000 to 128 — caps in-flight memory to ~11 MB
-        // at 90 KB/block while still providing adequate pipeline depth.
+        // #767: capacity defaults to FETCHED_BLOCKS_CHANNEL_CAP (4096) — the
+        // deeper buffer widens the apply-lag tolerance window during bulk
+        // catch-up.  Overridable via `DUGITE_FETCHED_BLOCKS_CAP` (same pattern
+        // as `DUGITE_PIPELINE_DEPTH`) so memory-constrained deployments can
+        // lower it: each in-flight `FetchedBlock` holds a fully-decoded Conway
+        // block, so peak memory scales with this cap.  A value of 0 or an
+        // unparseable value falls back to the default.
+        let fetched_blocks_cap: usize = std::env::var("DUGITE_FETCHED_BLOCKS_CAP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(FETCHED_BLOCKS_CHANNEL_CAP);
         let (fetched_blocks_tx, fetched_blocks_rx) =
-            mpsc::channel::<FetchedBlock>(FETCHED_BLOCKS_CHANNEL_CAP);
+            mpsc::channel::<FetchedBlock>(fetched_blocks_cap);
         let (peer_failure_tx, peer_failure_rx) = mpsc::channel::<(SocketAddr, PeerFailureKind)>(64);
         let (keepalive_rtt_tx, keepalive_rtt_rx) = mpsc::channel::<(SocketAddr, f64)>(256);
         let candidate_chains: Arc<RwLock<HashMap<SocketAddr, CandidateChainState>>> =

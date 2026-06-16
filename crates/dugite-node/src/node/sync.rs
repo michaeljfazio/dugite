@@ -4118,6 +4118,12 @@ pub(crate) const DEEP_HISTORICAL_DEPTH: usize = 8;
 /// of block number ordering.  Chain selection fires per-block via
 /// `chainSelectionForBlock` once `preferCandidate` (block-number ordering)
 /// favours the new fork.
+// #767: the production callers (MsgRollForward + the refill ticker) now prune
+// OFF the candidate_chains write lock via an inline retain-by-hash (snapshot →
+// chain_db.read() alone → retain) to break the lock convoy, so this helper is
+// now exercised only by the prune-semantics tests. Kept (with its regression
+// tests) as the canonical statement of the prune rule.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn prune_already_known_pending_headers(
     headers: &mut Vec<PendingHeader>,
     chain_db: &dugite_storage::ChainDB,
@@ -5127,15 +5133,38 @@ pub async fn chainsync_client_task(
             // future at all while throttled is false, so a 50-hot-peer node
             // at-tip saves 500 wakeups/sec.
             _ = refill_ticker.tick(), if throttled => {
+                // #767 (residual): prune OFF the candidate_chains write lock — same
+                // convoy fix as the MsgRollForward path.  The previous code held
+                // `candidate_chains.write()` across `chain_db.read()` (via the prune),
+                // and this arm fires exactly when throttled (pending near the pause
+                // mark) i.e. under the storm.  Snapshot the hashes under a read lock,
+                // compute the already-stored set under `chain_db.read()` alone, then
+                // `retain` under a brief write lock.  The two locks are never held
+                // simultaneously (no convoy, no lock-order cycle); retain-by-hash is
+                // race-safe vs concurrent pushes.
+                let hashes: Vec<[u8; 32]> = {
+                    let chains = candidate_chains.read().await;
+                    match chains.get(&peer_addr) {
+                        Some(entry) => entry.pending_headers.iter().map(|h| h.hash).collect(),
+                        None => continue,
+                    }
+                };
+                let known: std::collections::HashSet<[u8; 32]> = {
+                    let cdb = chain_db.read().await;
+                    hashes
+                        .into_iter()
+                        .filter(|h| {
+                            cdb.has_block(&dugite_primitives::hash::Hash32::from_bytes(*h))
+                        })
+                        .collect()
+                };
                 let pending_count = {
                     let mut chains = candidate_chains.write().await;
                     match chains.get_mut(&peer_addr) {
                         Some(entry) => {
-                            let cdb = chain_db.read().await;
-                            prune_already_known_pending_headers(
-                                &mut entry.pending_headers,
-                                &cdb,
-                            );
+                            if !known.is_empty() {
+                                entry.pending_headers.retain(|h| !known.contains(&h.hash));
+                            }
                             entry.pending_headers.len()
                         }
                         None => continue,
@@ -5329,7 +5358,53 @@ pub async fn chainsync_client_task(
                         // The captured `pending_count` (post-prune) feeds
                         // `should_refill_pipeline` below — we MUST NOT silently
                         // drop unfetched headers here.  See `PENDING_HEADERS_PAUSE`.
-                        let pending_count = {
+                        // #767 (residual): do the chain_db read(s) WITHOUT holding
+                        // `candidate_chains.write()`.  The previous code nested
+                        // `chain_db.read()` INSIDE the `candidate_chains.write()`
+                        // critical section, so during a rollback storm (many peers
+                        // re-sending headers) the continuous write contention starved
+                        // the BlockFetch decision task's `candidate_chains.read()`
+                        // (connection_lifecycle.rs ~2444) — no fetch ranges were built,
+                        // the fetched-blocks channel drained, and the apply task
+                        // stalled on an empty channel (a self-sustaining stall).
+                        // `chain_db.read()` and `candidate_chains.write()` are now
+                        // NEVER held simultaneously, so (a) there is no convoy and
+                        // (b) this path cannot participate in any lock-order cycle
+                        // (it never holds one lock while awaiting another) — unlike a
+                        // naive reorder, which would invert the order vs the blockfetch
+                        // decision task (candidate_chains.read → chain_db.read).
+                        //
+                        // Hash-based filter (unchanged semantics): a header whose hash
+                        // is already in the ChainDB is skipped.  Slot-based filtering
+                        // is unsound after a peer rolls back below our applied tip and
+                        // switches to a competing fork (regression observed 2026-04-26)
+                        // — `theirFrag` retains every candidate-fragment header and
+                        // BlockFetch fetches everything not in `curChain`.
+                        let already_have = {
+                            let cdb = chain_db.read().await;
+                            cdb.has_block(&dugite_primitives::hash::Hash32::from_bytes(hash))
+                        };
+                        let new_pending = if !already_have {
+                            // Header-declared body size (exact range byte-accounting)
+                            // + prev_hash (chain-adjacency run splitting), one decode.
+                            // (None, None) for Byron / undecodable headers.
+                            let (body_size, prev_hash) = extract_header_fetch_info(&header);
+                            Some(PendingHeader {
+                                slot,
+                                hash,
+                                header_cbor: header,
+                                body_size,
+                                prev_hash,
+                            })
+                        } else {
+                            None
+                        };
+
+                        // Short write-lock: tip update + push + prune-due check.  O(1)
+                        // plus (only every PENDING_PRUNE_INTERVAL headers) a cheap clone
+                        // of the pending hashes for an OFF-LOCK prune.  No chain_db
+                        // access while the write lock is held.
+                        let (mut pending_count, prune_hashes) = {
                             let mut chains = candidate_chains.write().await;
                             let entry = chains.entry(peer_addr).or_insert_with(|| {
                                 CandidateChainState {
@@ -5344,64 +5419,51 @@ pub async fn chainsync_client_task(
                             entry.tip_hash = tip_hash;
                             entry.tip_block_number = tip_block_number;
                             metrics.update_peer_tip(tip_slot);
+                            if let Some(ph) = new_pending {
+                                entry.pending_headers.push(ph);
+                            }
+                            entry.headers_since_prune = entry.headers_since_prune.saturating_add(1);
+                            let prune = if entry.headers_since_prune >= PENDING_PRUNE_INTERVAL {
+                                entry.headers_since_prune = 0;
+                                Some(
+                                    entry
+                                        .pending_headers
+                                        .iter()
+                                        .map(|h| h.hash)
+                                        .collect::<Vec<[u8; 32]>>(),
+                                )
+                            } else {
+                                None
+                            };
+                            (entry.pending_headers.len(), prune)
+                        };
 
-                            // Queue this header for BlockFetch unless we already
-                            // have its block, and periodically drain headers that
-                            // BlockFetch has fetched+stored since the last prune.
-                            //
-                            // Hash-based filter: only headers whose hash is
-                            // already present in the ChainDB are skipped.  A
-                            // slot-based filter is unsound after a peer rolls back
-                            // below our applied tip and switches to a competing
-                            // fork — the new fork's earliest headers may carry
-                            // slots ≤ applied tip but DIFFERENT hashes; dropping
-                            // them breaks the parent chain BlockFetch needs to
-                            // walk back from the fork's tip (regression observed
-                            // 2026-04-26).  Matches Haskell: `theirFrag` retains
-                            // every header on the candidate fragment; BlockFetch
-                            // fetches everything not in `curChain`.
-                            //
-                            // Per-header we do a single O(1) `has_block` check on
-                            // the just-arrived header instead of re-scanning the
-                            // whole pending list (which sits near
-                            // PENDING_HEADERS_PAUSE during bulk sync) — that
-                            // per-header full scan was an O(N²)-per-batch hotspot.
-                            // A full prune runs only every PENDING_PRUNE_INTERVAL
-                            // headers; see `headers_since_prune`.
-                            {
+                        // Periodic prune OFF the candidate_chains lock: compute the
+                        // already-stored hashes under `chain_db.read()` alone, then
+                        // `retain` under a brief write lock.  retain-by-hash is
+                        // race-safe vs concurrent pushes — only hashes from the
+                        // snapshot are removed; any header pushed during the window is
+                        // simply kept (and re-evaluated on the next prune).
+                        if let Some(hashes) = prune_hashes {
+                            let known: std::collections::HashSet<[u8; 32]> = {
                                 let cdb = chain_db.read().await;
-                                let already_have =
-                                    cdb.has_block(&dugite_primitives::hash::Hash32::from_bytes(hash));
-                                if !already_have {
-                                    // Header-declared body size (exact range
-                                    // byte-accounting) + prev_hash (chain-
-                                    // adjacency run splitting), one decode.
-                                    // (None, None) for Byron / undecodable
-                                    // headers — range builder falls back to
-                                    // the adaptive average and filter-gap
-                                    // splitting only.
-                                    let (body_size, prev_hash) =
-                                        extract_header_fetch_info(&header);
-                                    entry.pending_headers.push(PendingHeader {
-                                        slot,
-                                        hash,
-                                        header_cbor: header,
-                                        body_size,
-                                        prev_hash,
-                                    });
-                                }
-                                entry.headers_since_prune =
-                                    entry.headers_since_prune.saturating_add(1);
-                                if entry.headers_since_prune >= PENDING_PRUNE_INTERVAL {
-                                    prune_already_known_pending_headers(
-                                        &mut entry.pending_headers,
-                                        &cdb,
-                                    );
-                                    entry.headers_since_prune = 0;
+                                hashes
+                                    .into_iter()
+                                    .filter(|h| {
+                                        cdb.has_block(&dugite_primitives::hash::Hash32::from_bytes(
+                                            *h,
+                                        ))
+                                    })
+                                    .collect()
+                            };
+                            if !known.is_empty() {
+                                let mut chains = candidate_chains.write().await;
+                                if let Some(entry) = chains.get_mut(&peer_addr) {
+                                    entry.pending_headers.retain(|h| !known.contains(&h.hash));
+                                    pending_count = entry.pending_headers.len();
                                 }
                             }
-                            entry.pending_headers.len()
-                        };
+                        }
 
                         // Genesis candidate fragment: lossless synchronous write
                         // (csLatestSlot first, idling cleared, header appended) —
@@ -7820,6 +7882,233 @@ mod additional_sync_tests {
         ];
         prune_already_known_pending_headers(&mut pending, &chain_db);
         assert!(pending.is_empty(), "all known headers must be removed");
+    }
+
+    // ── #767 residual: inline retain-by-hash prune (production path) ───────────
+    //
+    // The MsgRollForward + refill_ticker arms no longer call
+    // `prune_already_known_pending_headers` directly; they inline a
+    // "snapshot hashes → compute already-stored set under `chain_db.read()`
+    // alone → `retain(|h| !known.contains(&h.hash))`" idiom so the chain_db
+    // read never happens under `candidate_chains.write()` (the lock convoy that
+    // wedged #767).  These tests pin that inline idiom to the canonical
+    // (now test-only) helper so a future refactor cannot silently diverge them.
+
+    /// Replicates the exact inline production idiom: build the already-stored
+    /// `known` set from `chain_db.has_block`, then `retain` by hash.
+    fn retain_by_hash_inline(pending: &mut Vec<PendingHeader>, chain_db: &dugite_storage::ChainDB) {
+        let hashes: Vec<[u8; 32]> = pending.iter().map(|h| h.hash).collect();
+        let known: std::collections::HashSet<[u8; 32]> = hashes
+            .into_iter()
+            .filter(|h| chain_db.has_block(&Hash32::from_bytes(*h)))
+            .collect();
+        if !known.is_empty() {
+            pending.retain(|h| !known.contains(&h.hash));
+        }
+    }
+
+    /// The inline retain-by-hash idiom must be byte-for-byte equivalent to the
+    /// canonical `prune_already_known_pending_headers`, including the
+    /// 2026-04-26 fork regression rule: a competing-fork header at a slot
+    /// at/below the applied tip whose block is NOT in the ChainDB must be KEPT.
+    #[test]
+    fn retain_by_hash_equivalent_to_prune_known_pending_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut chain_db = dugite_storage::ChainDB::open(dir.path()).unwrap();
+
+        // Canonical chain: slots 1..=3 stored in the ChainDB.
+        let c1 = Hash32::from_bytes([0x11; 32]);
+        let c2 = Hash32::from_bytes([0x22; 32]);
+        let c3 = Hash32::from_bytes([0x33; 32]);
+        chain_db
+            .add_block(c1, SlotNo(1), BlockNo(1), Hash32::ZERO, b"c1".to_vec())
+            .unwrap();
+        chain_db
+            .add_block(c2, SlotNo(2), BlockNo(2), c1, b"c2".to_vec())
+            .unwrap();
+        chain_db
+            .add_block(c3, SlotNo(3), BlockNo(3), c2, b"c3".to_vec())
+            .unwrap();
+
+        let to_arr = |h: Hash32| {
+            let mut a = [0u8; 32];
+            a.copy_from_slice(h.as_ref());
+            a
+        };
+
+        // 5 pending headers:
+        //  - c2, c3: hashes IN the ChainDB              → must be DROPPED
+        //  - fork@slot2: slot at/below tip, NOT stored  → must be KEPT (regression)
+        //  - u4, u5: unknown hashes not stored          → must be KEPT
+        let fork = [0xF0u8; 32]; // competing-fork header at slot 2, not in ChainDB
+        let u4 = [0x44u8; 32];
+        let u5 = [0x55u8; 32];
+        let make = |slot: u64, hash: [u8; 32]| PendingHeader {
+            slot,
+            hash,
+            header_cbor: vec![],
+            body_size: None,
+            prev_hash: None,
+        };
+        let build = || {
+            vec![
+                make(2, to_arr(c2)),
+                make(2, fork),
+                make(3, to_arr(c3)),
+                make(4, u4),
+                make(5, u5),
+            ]
+        };
+
+        let mut via_helper = build();
+        prune_already_known_pending_headers(&mut via_helper, &chain_db);
+
+        let mut via_inline = build();
+        retain_by_hash_inline(&mut via_inline, &chain_db);
+
+        // PendingHeader has no PartialEq; compare the ordered hash sequence,
+        // which is what both prune paths preserve.
+        let helper_hashes: Vec<[u8; 32]> = via_helper.iter().map(|h| h.hash).collect();
+        let inline_hashes: Vec<[u8; 32]> = via_inline.iter().map(|h| h.hash).collect();
+        assert_eq!(
+            helper_hashes, inline_hashes,
+            "inline retain-by-hash must equal the canonical prune helper"
+        );
+        // And assert the expected concrete result: fork + u4 + u5 survive.
+        let surviving: std::collections::HashSet<[u8; 32]> =
+            via_inline.iter().map(|h| h.hash).collect();
+        assert_eq!(via_inline.len(), 3, "c2 and c3 must be pruned, 3 kept");
+        assert!(
+            surviving.contains(&fork),
+            "competing-fork header must be kept"
+        );
+        assert!(surviving.contains(&u4));
+        assert!(surviving.contains(&u5));
+        assert!(!surviving.contains(&to_arr(c2)));
+        assert!(!surviving.contains(&to_arr(c3)));
+    }
+
+    /// `pending_count` after the off-lock prune must reflect the post-prune
+    /// length (`entry.pending_headers.len()`), not the stale pre-prune count —
+    /// otherwise `should_refill_pipeline` would hold `throttled` past RESUME.
+    #[test]
+    fn pending_count_post_prune_accurate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut chain_db = dugite_storage::ChainDB::open(dir.path()).unwrap();
+
+        // PENDING_PRUNE_INTERVAL known headers + 1 unknown.
+        let n = PENDING_PRUNE_INTERVAL as usize;
+        let mut pending: Vec<PendingHeader> = Vec::with_capacity(n + 1);
+        let mut prev = Hash32::ZERO;
+        for i in 0..n {
+            let mut hb = [0u8; 32];
+            hb[0] = (i & 0xFF) as u8;
+            hb[1] = ((i >> 8) & 0xFF) as u8;
+            hb[31] = 0xAB; // disambiguate from the unknown header below
+            let h = Hash32::from_bytes(hb);
+            chain_db
+                .add_block(
+                    h,
+                    SlotNo(i as u64 + 1),
+                    BlockNo(i as u64 + 1),
+                    prev,
+                    vec![i as u8],
+                )
+                .unwrap();
+            prev = h;
+            pending.push(PendingHeader {
+                slot: i as u64 + 1,
+                hash: hb,
+                header_cbor: vec![],
+                body_size: None,
+                prev_hash: None,
+            });
+        }
+        // One unknown header (not in ChainDB).
+        pending.push(PendingHeader {
+            slot: n as u64 + 1,
+            hash: [0xEE; 32],
+            header_cbor: vec![],
+            body_size: None,
+            prev_hash: None,
+        });
+
+        retain_by_hash_inline(&mut pending, &chain_db);
+        let pending_count = pending.len();
+        assert_eq!(pending_count, 1, "only the unknown header should remain");
+        assert_eq!(pending[0].hash, [0xEE; 32]);
+    }
+
+    /// Race-safety: a header pushed concurrently (between the hash snapshot and
+    /// the retain) must NOT be dropped.  retain-by-hash removes only snapshot
+    /// hashes that are now stored, so a newly-pushed header is always kept.
+    #[test]
+    fn ticker_arm_prune_race_safe_newly_pushed_header_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut chain_db = dugite_storage::ChainDB::open(dir.path()).unwrap();
+
+        let h1 = [0x01u8; 32]; // will become stored (known)
+        let h2 = [0x02u8; 32]; // unknown, in the snapshot
+        let h3 = [0x03u8; 32]; // pushed AFTER the snapshot (the race)
+
+        // Snapshot taken when pending = [h1, h2].
+        let snapshot_hashes: Vec<[u8; 32]> = vec![h1, h2];
+
+        // Concurrently: h1 gets stored, and h3 is pushed.
+        chain_db
+            .add_block(
+                Hash32::from_bytes(h1),
+                SlotNo(1),
+                BlockNo(1),
+                Hash32::ZERO,
+                b"x".to_vec(),
+            )
+            .unwrap();
+        let mut pending = vec![
+            PendingHeader {
+                slot: 1,
+                hash: h1,
+                header_cbor: vec![],
+                body_size: None,
+                prev_hash: None,
+            },
+            PendingHeader {
+                slot: 2,
+                hash: h2,
+                header_cbor: vec![],
+                body_size: None,
+                prev_hash: None,
+            },
+            PendingHeader {
+                slot: 3,
+                hash: h3,
+                header_cbor: vec![],
+                body_size: None,
+                prev_hash: None,
+            },
+        ];
+
+        // `known` is computed only from the SNAPSHOT hashes (production idiom).
+        let known: std::collections::HashSet<[u8; 32]> = snapshot_hashes
+            .into_iter()
+            .filter(|h| chain_db.has_block(&Hash32::from_bytes(*h)))
+            .collect();
+        pending.retain(|h| !known.contains(&h.hash));
+
+        let surviving: std::collections::HashSet<[u8; 32]> =
+            pending.iter().map(|h| h.hash).collect();
+        assert!(
+            !surviving.contains(&h1),
+            "stored snapshot header h1 must be dropped"
+        );
+        assert!(
+            surviving.contains(&h2),
+            "unknown snapshot header h2 must be kept"
+        );
+        assert!(
+            surviving.contains(&h3),
+            "concurrently-pushed header h3 must NOT be dropped"
+        );
     }
 
     // ── select_headers_to_fetch ───────────────────────────────────────────────
