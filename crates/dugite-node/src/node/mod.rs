@@ -95,6 +95,38 @@ const HEARTBEAT_TICK: Duration = Duration::from_secs(2);
 /// Maximum acceptable heartbeat lateness before logging a WARN (G9).
 const HEARTBEAT_LATE_THRESHOLD: Duration = Duration::from_secs(10);
 
+/// Poll interval for the #768 apply-stall watchdog.
+const APPLY_STALL_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long the ledger tip may remain ahead of the ChainDB tip with zero
+/// forward progress (and fetched blocks arriving but not connecting) before the
+/// node is declared stranded (#768) and shuts down with an actionable error.
+/// Generous so a slowly-bridging Mithril gap is never false-flagged — in normal
+/// operation the ChainDB write precedes the ledger apply, so the ledger tip is
+/// NEVER ahead of the ChainDB tip; this state only arises from an
+/// ahead-of-storage snapshot.
+const APPLY_STALL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// #768 apply-stall predicate (pure, unit-tested). The node is stranded iff:
+/// (1) the ledger tip is STRICTLY ahead of the ChainDB tip — only possible from
+///     an ahead-of-storage snapshot, since in normal operation the ChainDB
+///     write precedes the ledger apply (so chaindb_tip >= ledger_tip);
+/// (2) fetched blocks are still arriving and being skipped as non-connecting
+///     (`work_arriving`) — distinguishes the wedge from a quiet at-tip node; and
+/// (3) there has been zero forward progress (neither tip advanced) for at least
+///     `timeout`.
+/// Any forward progress (a tip advancing, i.e. a Mithril gap bridging) resets
+/// the timer, so a healthy or slowly-progressing node never trips it.
+fn apply_stall_detected(
+    ledger_slot: u64,
+    chaindb_slot: u64,
+    work_arriving: bool,
+    stalled: Duration,
+    timeout: Duration,
+) -> bool {
+    ledger_slot > chaindb_slot && work_arriving && stalled >= timeout
+}
+
 // ── N2N broadcast channel capacities ──────────────────────────────────────
 
 /// Block-announcement broadcast channel capacity for N2N and N2C servers.
@@ -3364,6 +3396,99 @@ impl Node {
             });
         }
 
+        // #768: apply-stall watchdog. In all normal operation the ChainDB write
+        // precedes the ledger apply, so the ChainDB tip is >= the ledger tip.
+        // The ONLY way the ledger tip exceeds the ChainDB tip is an
+        // ahead-of-storage snapshot (a Mithril import gap, or a pre-#762
+        // stranded DB whose in-between blocks are missing). That state is normal
+        // *transiently* while peers backfill the gap, but if it PERSISTS with
+        // zero forward progress (neither tip advances) while fetched blocks keep
+        // arriving and being skipped as non-connecting, the gap is unbridgeable:
+        // the node would otherwise busy-loop the header-validation hot path
+        // forever (#768). Detect it and exit cleanly with an actionable error.
+        // This is byte-exact-safe (no ledger/consensus state is touched) and
+        // cannot false-fire on a healthy node (the gate `ledger > chaindb` never
+        // holds there) nor on a slowly-progressing one (any tip advance resets
+        // the timer).
+        {
+            let watchdog_chain_db = self.chain_db.clone();
+            let watchdog_ledger = self.ledger_state.clone();
+            let watchdog_metrics = self.metrics.clone();
+            let watchdog_shutdown_tx = shutdown_tx.clone();
+            let mut watchdog_shutdown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                use std::sync::atomic::Ordering;
+                let mut interval = tokio::time::interval(APPLY_STALL_CHECK_INTERVAL);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut last_progress = std::time::Instant::now();
+                let mut last_ledger_slot = 0u64;
+                let mut last_chaindb_slot = 0u64;
+                let mut last_skipped = 0u64;
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            let chaindb_slot = watchdog_chain_db
+                                .read()
+                                .await
+                                .get_tip()
+                                .point
+                                .slot()
+                                .map(|s| s.0)
+                                .unwrap_or(0);
+                            let ledger_slot = watchdog_ledger
+                                .read()
+                                .await
+                                .tip
+                                .point
+                                .slot()
+                                .map(|s| s.0)
+                                .unwrap_or(0);
+                            let skipped = watchdog_metrics
+                                .fetched_blocks_not_connecting
+                                .load(Ordering::Relaxed);
+
+                            // Any tip advance = forward progress; reset the timer.
+                            if ledger_slot > last_ledger_slot || chaindb_slot > last_chaindb_slot {
+                                last_progress = std::time::Instant::now();
+                            }
+                            last_ledger_slot = ledger_slot;
+                            last_chaindb_slot = chaindb_slot;
+
+                            let work_arriving = skipped > last_skipped;
+                            last_skipped = skipped;
+
+                            if apply_stall_detected(
+                                ledger_slot,
+                                chaindb_slot,
+                                work_arriving,
+                                last_progress.elapsed(),
+                                APPLY_STALL_TIMEOUT,
+                            ) {
+                                error!(
+                                    ledger_slot,
+                                    chaindb_tip_slot = chaindb_slot,
+                                    gap_slots = ledger_slot - chaindb_slot,
+                                    skipped_blocks = skipped,
+                                    stalled_for_s = last_progress.elapsed().as_secs(),
+                                    "APPLY STALL (#768): the ledger snapshot tip is ahead of \
+                                     the ChainDB tip and no block has applied while fetched \
+                                     blocks are being skipped as non-connecting. The database \
+                                     is stranded — the in-between blocks are missing and the \
+                                     gap cannot be bridged. Shutting down; re-import via \
+                                     `dugite-node mithril-import` and restart."
+                                );
+                                let _ = watchdog_shutdown_tx.send(true);
+                                break;
+                            }
+                        }
+                        _ = watchdog_shutdown.changed() => {
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+
         // Register topology peers in the peer manager with full metadata
         let detailed_peers = self.topology.detailed_peers();
         if detailed_peers.is_empty() {
@@ -6292,6 +6417,13 @@ impl Node {
         };
 
         if !connects_to_tip {
+            // Out-of-order during healthy pipelined sync (normal); a SUSTAINED
+            // rise while the applied tip is frozen and the ledger tip is ahead
+            // of the ChainDB tip is the #768 stranded-snapshot wedge — the
+            // apply-stall watchdog keys on this counter to detect it.
+            self.metrics
+                .fetched_blocks_not_connecting
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             debug!(
                 slot = block_slot.0,
                 block = block_number.0,
@@ -9220,6 +9352,7 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::sync::RwLock;
 
     use dugite_primitives::block::{
@@ -9228,6 +9361,33 @@ mod tests {
     use dugite_primitives::era::Era;
     use dugite_primitives::hash::Hash32;
     use dugite_primitives::time::{BlockNo, SlotNo};
+
+    /// #768 apply-stall predicate matrix.
+    #[test]
+    fn apply_stall_detected_matrix() {
+        use super::apply_stall_detected;
+        let timeout = Duration::from_secs(300);
+        let past = Duration::from_secs(301);
+        let within = Duration::from_secs(120);
+
+        // The wedge: ledger ahead of ChainDB, work arriving, stalled past timeout.
+        assert!(apply_stall_detected(534, 524, true, past, timeout));
+
+        // Healthy: ChainDB tip >= ledger tip (storage precedes apply) — never fires,
+        // even if "work_arriving" and long-stalled.
+        assert!(!apply_stall_detected(524, 524, true, past, timeout)); // at-tip idle
+        assert!(!apply_stall_detected(524, 534, true, past, timeout)); // chaindb ahead
+
+        // Ahead but still bridging (progress within the window) — must not fire.
+        assert!(!apply_stall_detected(534, 524, true, within, timeout));
+
+        // Ahead + stalled but NO fetched blocks arriving (quiet, e.g. no peers) —
+        // not the busy-loop wedge; do not exit.
+        assert!(!apply_stall_detected(534, 524, false, past, timeout));
+
+        // Exactly at the timeout boundary fires (>=).
+        assert!(apply_stall_detected(534, 524, true, timeout, timeout));
+    }
 
     use dugite_primitives::transaction::ScriptRef;
     use dugite_serialization::mempack::txout::ScriptRefKind;
