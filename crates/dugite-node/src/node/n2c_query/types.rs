@@ -398,7 +398,10 @@ pub struct ProtocolParamsSnapshot {
     pub max_collateral_inputs: u64,
     pub protocol_version_major: u64,
     pub protocol_version_minor: u64,
-    pub min_fee_ref_script_cost_per_byte: u64,
+    // Conway minFeeRefScriptCostPerByte is a NonNegativeInterval (rational),
+    // stored as num/den like a0/rho/tau above.
+    pub min_fee_ref_script_cost_per_byte_num: u64,
+    pub min_fee_ref_script_cost_per_byte_den: u64,
     // Conway governance
     pub drep_deposit: u64,
     pub drep_activity: u64,
@@ -474,7 +477,8 @@ impl Default for ProtocolParamsSnapshot {
             max_collateral_inputs: 3,
             protocol_version_major: 9,
             protocol_version_minor: 0,
-            min_fee_ref_script_cost_per_byte: 15,
+            min_fee_ref_script_cost_per_byte_num: 15,
+            min_fee_ref_script_cost_per_byte_den: 1,
             drep_deposit: 500_000_000,
             drep_activity: 20,
             gov_action_deposit: 100_000_000_000,

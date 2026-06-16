@@ -404,7 +404,10 @@ proptest! {
         let _: u64 = params.gov_action_lifetime;
         let _: u64 = params.committee_min_size;
         let _: u64 = params.committee_max_term_length;
-        let _: u64 = params.min_fee_ref_script_cost_per_byte;
+        // min_fee_ref_script_cost_per_byte is a NonNegativeInterval (rational
+        // num/den), not a uint — checkpoint both components as u64.
+        let _: u64 = params.min_fee_ref_script_cost_per_byte.numerator;
+        let _: u64 = params.min_fee_ref_script_cost_per_byte.denominator;
 
         // ── Protocol version is present and structurally valid ───────────────
         // In Conway, protocol_version is encoded at position 12 in the PParams
@@ -549,9 +552,9 @@ proptest! {
             original.max_collateral_inputs, updated.max_collateral_inputs
         );
         prop_assert_eq!(
-            updated.min_fee_ref_script_cost_per_byte,
-            original.min_fee_ref_script_cost_per_byte,
-            "min_fee_ref_script_cost_per_byte changed: {} -> {}",
+            &updated.min_fee_ref_script_cost_per_byte,
+            &original.min_fee_ref_script_cost_per_byte,
+            "min_fee_ref_script_cost_per_byte changed: {:?} -> {:?}",
             original.min_fee_ref_script_cost_per_byte,
             updated.min_fee_ref_script_cost_per_byte
         );

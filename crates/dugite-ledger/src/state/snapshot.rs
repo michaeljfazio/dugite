@@ -398,7 +398,11 @@ impl LedgerState {
     /// v22 (#736): added `rupd_addrs_rew` (pv≤6 RUPD startStep capture)
     /// and `pending_avvm_return` — both previously dropped on load,
     /// breaking byte-exactness across mid-epoch restarts in pv≤6 epochs.
-    pub(crate) const SNAPSHOT_VERSION: u8 = 22;
+    /// v23 (#766): `ProtocolParameters::min_fee_ref_script_cost_per_byte`
+    /// changed from `u64` to `Rational` (Conway `NonNegativeInterval`), so
+    /// the bincode layout of every embedded `protocol_params` /
+    /// `prev_protocol_params` grew by one `u64` (the denominator).
+    pub(crate) const SNAPSHOT_VERSION: u8 = 23;
 
     /// Save ledger state snapshot to disk using bincode serialization.
     ///

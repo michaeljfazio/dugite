@@ -729,7 +729,11 @@ pub(crate) fn encode_protocol_params_cbor(
     enc.u64(pp.drep_activity).ok();
 
     // [30] minFeeRefScriptCostPerByte (NonNegativeInterval, tagged rational)
-    encode_tagged_rational(enc, pp.min_fee_ref_script_cost_per_byte, 1);
+    encode_tagged_rational(
+        enc,
+        pp.min_fee_ref_script_cost_per_byte_num,
+        pp.min_fee_ref_script_cost_per_byte_den,
+    );
 }
 
 /// Helper to encode a tagged rational number: `tag(30)[numerator, denominator]`

@@ -959,7 +959,12 @@ impl ConwayGenesis {
         params.dvt_pp_gov_group = float_to_rational(dvt.pp_gov_group);
 
         if let Some(cost) = self.min_fee_ref_script_cost_per_byte {
-            params.min_fee_ref_script_cost_per_byte = cost;
+            // Conway genesis always specifies an integer (e.g. 15); store as the
+            // NonNegativeInterval cost/1.
+            params.min_fee_ref_script_cost_per_byte = dugite_primitives::transaction::Rational {
+                numerator: cost,
+                denominator: 1,
+            };
         }
 
         // PlutusV3 cost model from Conway genesis

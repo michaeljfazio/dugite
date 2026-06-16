@@ -659,7 +659,10 @@ fn make_protocol_params(pp: &crate::schema::UtxoProtocolParams) -> ProtocolParam
         max_val_size: pp.max_val_size,
         collateral_percentage: pp.collateral_percentage,
         max_collateral_inputs: pp.max_collateral_inputs,
-        min_fee_ref_script_cost_per_byte: pp.min_fee_ref_script_cost_per_byte,
+        min_fee_ref_script_cost_per_byte: dugite_primitives::transaction::Rational {
+            numerator: pp.min_fee_ref_script_cost_per_byte,
+            denominator: 1,
+        },
         drep_deposit: Lovelace(pp.drep_deposit),
         drep_activity: 20,
         gov_action_deposit: Lovelace(pp.gov_action_deposit),

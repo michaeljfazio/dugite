@@ -612,11 +612,14 @@ fn decode_cost_array(data: &[u8]) -> Result<(Vec<i64>, usize), SerializationErro
 ///
 /// Haskell encodes this as a rational (e.g. `tag(30) [15, 1]` for the value
 /// 15).  Some older snapshots or testing environments may encode it as a plain
-/// unsigned integer.  Both forms are accepted; the integer value of the
-/// numerator is returned (i.e. `floor(num / den)` with an error if den == 0).
+/// unsigned integer.  Both forms are accepted; the full `Rational` (num/den)
+/// is returned (an error if den == 0).  A bare uint `v` decodes to `v/1`.
 ///
-/// For the expected case of `15/1`, this returns `15`.
-pub fn decode_min_fee_ref_script(data: &[u8]) -> Result<(u64, usize), SerializationError> {
+/// For the expected case of `15/1`, this returns `Rational { 15, 1 }`.
+pub fn decode_min_fee_ref_script(
+    data: &[u8],
+) -> Result<(dugite_primitives::transaction::Rational, usize), SerializationError> {
+    use dugite_primitives::transaction::Rational;
     // Peek at the first byte(s) to decide encoding:
     // - 0xd8 0x1e → tag(30) followed by array(2) — rational
     // - 0x82       → bare array(2) — rational without tag
@@ -636,13 +639,24 @@ pub fn decode_min_fee_ref_script(data: &[u8]) -> Result<(u64, usize), Serializat
                 "minFeeRefScriptCostPerByte: rational denominator is zero".into(),
             ));
         }
-        // Truncating division is correct: Haskell always encodes 15/1 or
-        // similar whole-number rationals for this parameter.
-        Ok((num / den, n))
+        // Preserve the full rational; do not truncate the denominator.
+        Ok((
+            Rational {
+                numerator: num,
+                denominator: den,
+            },
+            n,
+        ))
     } else {
-        // Plain uint fallback
+        // Plain uint fallback -> v/1.
         let (v, n) = decode_uint(data)?;
-        Ok((v, n))
+        Ok((
+            Rational {
+                numerator: v,
+                denominator: 1,
+            },
+            n,
+        ))
     }
 }
 
@@ -666,6 +680,45 @@ mod cap_tests {
         let bytes: Vec<u8> = vec![0x9b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
         let err = decode_cost_array(&bytes).unwrap_err();
         assert!(format!("{err:?}").contains("exceeds"));
+    }
+
+    #[test]
+    fn min_fee_ref_script_preserves_full_rational() {
+        use dugite_primitives::transaction::Rational;
+        // #766: a fractional NonNegativeInterval must NOT be truncated.
+        // tag(30) [44, 3]  →  44/3  (must stay 44/3, not floor to 14).
+        let (r, n) = decode_min_fee_ref_script(&[0xd8, 0x1e, 0x82, 0x18, 0x2c, 0x03]).unwrap();
+        assert_eq!(
+            r,
+            Rational {
+                numerator: 44,
+                denominator: 3,
+            }
+        );
+        assert_eq!(n, 6);
+
+        // tag(30) [15, 1] → 15/1 (the mainnet value).
+        let (r, _) = decode_min_fee_ref_script(&[0xd8, 0x1e, 0x82, 0x0f, 0x01]).unwrap();
+        assert_eq!(
+            r,
+            Rational {
+                numerator: 15,
+                denominator: 1,
+            }
+        );
+
+        // Bare uint 15 → 15/1.
+        let (r, _) = decode_min_fee_ref_script(&[0x0f]).unwrap();
+        assert_eq!(
+            r,
+            Rational {
+                numerator: 15,
+                denominator: 1,
+            }
+        );
+
+        // Denominator zero is rejected.
+        assert!(decode_min_fee_ref_script(&[0xd8, 0x1e, 0x82, 0x0f, 0x00]).is_err());
     }
 
     #[test]

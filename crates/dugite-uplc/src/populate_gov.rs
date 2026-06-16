@@ -566,10 +566,10 @@ fn ppu_to_changed_parameters_data(ppu: &ProtocolParamUpdate) -> Data {
     if let Some(v) = ppu.drep_activity {
         e.push((int(32), int(v)));
     }
-    if let Some(v) = ppu.min_fee_ref_script_cost_per_byte {
-        // NonNegativeInterval in Haskell (List [num, den]); dugite stores the
-        // integer value, so emit v/1 (mainnet on-chain value is integer).
-        e.push((int(33), Data::List(vec![int(v), int(1)])));
+    if let Some(ref v) = ppu.min_fee_ref_script_cost_per_byte {
+        // NonNegativeInterval -> Haskell `ToPlutusData Rational` = List [I num, I den]
+        // (key 33). Emit the full rational, mirroring a0/rho/tau via `rat()`.
+        e.push((int(33), rat(v)));
     }
     Data::Map(e)
 }
@@ -1475,6 +1475,43 @@ mod tests {
         );
         assert_eq!(entries[2].0, Data::I(BigInt::from(30u64)));
         assert_eq!(entries[2].1, Data::I(BigInt::from(100_000_000_000u64)));
+    }
+
+    #[test]
+    fn changed_parameters_min_fee_ref_script_is_rational_list_at_tag_33() {
+        // #766: minFeeRefScriptCostPerByte (ppuTag 33) is a NonNegativeInterval,
+        // so ChangedParameters must emit List[I num, I den] (Haskell
+        // `ToPlutusData Rational`), NOT a bare integer or Constr.
+        use dugite_primitives::transaction::{GovAction, ProtocolParamUpdate, Rational};
+        let ppu = ProtocolParamUpdate {
+            min_fee_ref_script_cost_per_byte: Some(Rational {
+                numerator: 44,
+                denominator: 3,
+            }),
+            ..Default::default()
+        };
+        let d = gov_action_to_data(&GovAction::ParameterChange {
+            prev_action_id: None,
+            protocol_param_update: Box::new(ppu),
+            policy_hash: None,
+        })
+        .unwrap();
+        let Data::Constr(0, fields) = d else {
+            panic!("ParameterChange must be Constr 0");
+        };
+        let Data::Map(entries) = &fields[1] else {
+            panic!("ChangedParameters must be Map");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, Data::I(BigInt::from(33u64)), "ppuTag 33");
+        assert_eq!(
+            entries[0].1,
+            Data::List(vec![
+                Data::I(BigInt::from(44u64)),
+                Data::I(BigInt::from(3u64))
+            ]),
+            "min_fee_ref rational must be List[num,den] (full 44/3, not truncated)"
+        );
     }
 
     #[test]
