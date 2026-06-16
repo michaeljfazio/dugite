@@ -6735,7 +6735,14 @@ impl Node {
                 // no big-ledger peers exist) froze the immutable tip and let the
                 // VolatileDB grow without bound (observed 1.6M blocks → O(N) CPU
                 // storm → wedge ~epoch 208). Always flush k-deep.
-                let result = db.flush_to_immutable_batch_retain(retain_blocks, FLUSH_BATCH_SIZE);
+                // #767: the ImmutableDB batch flush is synchronous I/O held
+                // under `chain_db.write()`. Wrap in `block_in_place` (same
+                // rationale as the snapshot LSM flush and #653 apply) so the
+                // runtime keeps servicing network/timer tasks and the 5s
+                // peer-deactivate cascade is not triggered.
+                let result = tokio::task::block_in_place(|| {
+                    db.flush_to_immutable_batch_retain(retain_blocks, FLUSH_BATCH_SIZE)
+                });
                 match result {
                     Ok(n) => n,
                     Err(e) => {

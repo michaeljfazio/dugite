@@ -371,7 +371,15 @@ impl Node {
             // Flush UTxO store to disk FIRST (cardano-lsm has no WAL).
             // MUST stay under the lock: `LsmTree::save_snapshot` takes
             // `&mut self` and concurrent flush is not supported.
-            if let Err(e) = ls.save_utxo_snapshot() {
+            // #767: the LSM flush (memtable→SST + possible compaction) is a
+            // multi-second SYNCHRONOUS call held under `ledger_state.write()`.
+            // Without `block_in_place` it pins this tokio worker for the whole
+            // flush, so the runtime cannot fan out the network/timer tasks onto
+            // relief workers — the 5s peer-deactivate timeout then fires and
+            // mass-demotes/cancels every hot BlockFetch peer, stalling the apply
+            // pipeline (live-apply wedge). Mirror the #653 pattern at
+            // apply_block_with_delta.
+            if let Err(e) = tokio::task::block_in_place(|| ls.save_utxo_snapshot()) {
                 error!("Failed to save UTxO store snapshot: {e}");
             }
 
@@ -501,7 +509,15 @@ impl Node {
             let mut ls = self.ledger_state.write().await;
             ls.consensus.opcert_counters = self.consensus.opcert_counters().clone();
             ls.utxo.diff_seq.clear();
-            if let Err(e) = ls.save_utxo_snapshot() {
+            // #767: the LSM flush (memtable→SST + possible compaction) is a
+            // multi-second SYNCHRONOUS call held under `ledger_state.write()`.
+            // Without `block_in_place` it pins this tokio worker for the whole
+            // flush, so the runtime cannot fan out the network/timer tasks onto
+            // relief workers — the 5s peer-deactivate timeout then fires and
+            // mass-demotes/cancels every hot BlockFetch peer, stalling the apply
+            // pipeline (live-apply wedge). Mirror the #653 pattern at
+            // apply_block_with_delta.
+            if let Err(e) = tokio::task::block_in_place(|| ls.save_utxo_snapshot()) {
                 error!(error = %e, "LSM flush failed during snapshot");
                 self.metrics.inc_utxo_flush_failed();
                 // Proceed: in-memory utxo_set may be empty (LSM
