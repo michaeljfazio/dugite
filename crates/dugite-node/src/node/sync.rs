@@ -3399,8 +3399,55 @@ const MAINNET_BYRON_SLOTS_PER_EPOCH: u64 = 21_600;
 /// (#654 / #652 C4). When this elapses the peer is disconnected with
 /// `ForecastSuspensionTimeout`. 60s is a balance between giving the apply
 /// path time to catch up under realistic bulk-sync load and not hanging
-/// the receive loop indefinitely if our node is wedged.
+/// the receive loop indefinitely if our node is wedged. Used **at/near tip**,
+/// where a frozen ledger for 60s is genuinely suspicious.
 pub(crate) const FORECAST_PARK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Bulk-catch-up upper bound on the forecast park (see
+/// [`forecast_park_or_disconnect`]). When the node is far **behind the network
+/// tip** (more than a stability window), the ledger legitimately lags the
+/// header tip and transient apply stalls of a couple of minutes are expected
+/// (fetch is the bottleneck, especially on high-latency links). Disconnecting
+/// the chainsync peer in that window is actively harmful: the peer is innocent
+/// (our ledger is the laggard, mirroring cardano-node which parks at the
+/// horizon and never drops the upstream), and dropping it removes the very
+/// blockfetch candidate that would close the gap — empirically collapsing the
+/// whole peer set on a transient stall. We therefore use a much larger bound
+/// while behind, comfortably above observed self-recovering stalls (~3 min),
+/// so only a *genuine* multi-minute wedge trips it. Crucially this bound is
+/// still **finite**: the network-tip signal selects the timeout MAGNITUDE, it
+/// never suppresses the watchdog — a real wedge is always surfaced, so a stale
+/// or peer-inflated network tip can only lengthen detection, never produce an
+/// infinite silent park.
+pub(crate) const FORECAST_PARK_TIMEOUT_BULK: std::time::Duration =
+    std::time::Duration::from_secs(300);
+
+/// Select the forecast-park no-progress timeout.
+///
+/// `network_tip_slot` is the highest tip any peer has reported
+/// (`metrics.get_peer_tip()`, a monotonic max). When it leads our
+/// `local_tip_slot` by more than a (per-era) `stability_window`, the local
+/// ledger is legitimately behind the network — bulk catch-up — and a header
+/// beyond the forecast horizon is normal apply lag, so we wait patiently
+/// ([`FORECAST_PARK_TIMEOUT_BULK`]) rather than churning the peer. Otherwise we
+/// are at/near tip, where a frozen ledger is suspicious, so the tight
+/// [`FORECAST_PARK_TIMEOUT`] applies.
+///
+/// Crucially the result is ALWAYS finite: this signal selects the timeout
+/// MAGNITUDE only — it can never suppress the watchdog. A stale or
+/// peer-inflated `network_tip_slot` can therefore only lengthen detection
+/// (max 5 min), never produce an infinite silent park while apply is wedged.
+pub(crate) fn forecast_park_timeout(
+    network_tip_slot: u64,
+    local_tip_slot: u64,
+    stability_window: u64,
+) -> std::time::Duration {
+    if network_tip_slot.saturating_sub(local_tip_slot) > stability_window {
+        FORECAST_PARK_TIMEOUT_BULK
+    } else {
+        FORECAST_PARK_TIMEOUT
+    }
+}
 
 /// Cheap structural predicate: returns `true` if `header_cbor` is the
 /// Byron N2N HFC wrap (era tag 0 with the `ABoundaryOrRegular` payload
@@ -3719,6 +3766,15 @@ pub(crate) async fn forecast_park_or_disconnect(
     // forecast park must NOT disconnect (that churns peers and pins the LoE
     // at the immutable tip, deadlocking the sync). Park and wait instead.
     gsm_snapshot_rx: Option<&watch::Receiver<crate::gsm::GsmSnapshot>>,
+    // Highest tip slot reported by any peer (global monotonic max,
+    // `metrics.get_peer_tip()`). In **Praos** mode the GSM is always
+    // `CaughtUp`, so `gsm_snapshot_rx` never marks bulk sync — yet a Praos
+    // from-genesis resync IS bulk sync and legitimately lags the header tip by
+    // far more than a stability window. We compare this against our local tip
+    // to detect "behind the network" and pick the longer, patient timeout.
+    // Used to select the timeout MAGNITUDE only; it never suppresses the
+    // disconnect (see [`FORECAST_PARK_TIMEOUT_BULK`]).
+    network_tip_slot: u64,
 ) -> anyhow::Result<()> {
     use dugite_consensus::forecast::forecast_for;
     use dugite_primitives::time::SlotNo;
@@ -3771,15 +3827,32 @@ pub(crate) async fn forecast_park_or_disconnect(
             Err(out) => {
                 let genesis_bulk_sync = gsm_snapshot_rx
                     .is_some_and(|rx| rx.borrow().state != crate::gsm::GenesisSyncState::CaughtUp);
+                // Praos from-genesis resync is bulk sync too, but GSM is always
+                // `CaughtUp` so `genesis_bulk_sync` can't see it. Detect "behind
+                // the network" from the tip gap: if the highest peer-reported
+                // tip leads our local tip by more than a (per-era) stability
+                // window, our ledger is legitimately lagging the header tip and
+                // a header beyond the horizon is normal apply lag — be patient
+                // (`FORECAST_PARK_TIMEOUT_BULK`) rather than churning the peer.
+                // The signal only selects the timeout magnitude; both bounds are
+                // finite so a genuine wedge is always surfaced (a stale or
+                // peer-inflated `network_tip_slot` can only lengthen detection,
+                // never cause an infinite silent park).
+                let park_timeout =
+                    forecast_park_timeout(network_tip_slot, latest_tip_slot, stability_window);
+                let behind_network_tip = park_timeout == FORECAST_PARK_TIMEOUT_BULK;
                 let elapsed = last_progress.elapsed();
-                if elapsed >= FORECAST_PARK_TIMEOUT && !genesis_bulk_sync {
+                if elapsed >= park_timeout && !genesis_bulk_sync {
                     return Err(anyhow::anyhow!(
                         "ChainSync: {peer_addr} header slot {} beyond forecast horizon \
-                         (tip {:?}, max_for {}) — no ledger progress for {:?}; disconnecting",
+                         (tip {:?}, max_for {}) — no ledger progress for {:?} \
+                         (behind_network_tip={}, network_tip={}); disconnecting",
                         header_slot,
                         out.at,
                         out.max_for.0,
-                        FORECAST_PARK_TIMEOUT
+                        park_timeout,
+                        behind_network_tip,
+                        network_tip_slot
                     ));
                 }
                 // Issue #742: emit a rate-limited WARN when a peer has been
@@ -3796,6 +3869,9 @@ pub(crate) async fn forecast_park_or_disconnect(
                         max_for = out.max_for.0,
                         parked_secs = total_parked.as_secs(),
                         genesis_bulk_sync,
+                        behind_network_tip,
+                        network_tip_slot,
+                        park_timeout_secs = park_timeout.as_secs(),
                         "ChainSync: peer has been parked on forecast horizon for >{}s; \
                          check that publish_ledger_view is firing after replay \
                          (issue #742 — stale tip watch causes permanent park in \
@@ -3817,7 +3893,7 @@ pub(crate) async fn forecast_park_or_disconnect(
                 let remaining = if genesis_bulk_sync {
                     std::time::Duration::from_secs(5)
                 } else {
-                    FORECAST_PARK_TIMEOUT.saturating_sub(elapsed)
+                    park_timeout.saturating_sub(elapsed)
                 };
                 tokio::select! {
                     biased;
@@ -3842,9 +3918,12 @@ pub(crate) async fn forecast_park_or_disconnect(
                         }
                         return Err(anyhow::anyhow!(
                             "ChainSync: {peer_addr} header slot {} beyond forecast horizon \
-                             — no ledger progress for {:?}; disconnecting",
+                             — no ledger progress for {:?} \
+                             (behind_network_tip={}, network_tip={}); disconnecting",
                             header_slot,
-                            FORECAST_PARK_TIMEOUT
+                            park_timeout,
+                            behind_network_tip,
+                            network_tip_slot
                         ));
                     }
                 }
@@ -5309,6 +5388,11 @@ pub async fn chainsync_client_task(
                                 &mut ledger_tip_rx,
                                 &cancel,
                                 Some(&gsm_snapshot_rx),
+                                // #767/#sync-eval: highest peer-reported tip →
+                                // detect Praos bulk sync (behind the network) and
+                                // use the patient timeout, so a transient apply
+                                // stall does not churn the whole peer set.
+                                metrics.get_peer_tip(),
                             )
                             .await;
                             lop_bucket.resume(std::time::Instant::now());
@@ -6264,7 +6348,7 @@ mod forecast_park_tests {
         let peer: SocketAddr = "127.0.0.1:3001".parse().unwrap();
 
         let start = std::time::Instant::now();
-        forecast_park_or_disconnect(&peer, 1_050, &view, &mut rx, &cancel, None)
+        forecast_park_or_disconnect(&peer, 1_050, &view, &mut rx, &cancel, None, 0)
             .await
             .expect("slot 1050 is within [1000, 1101)");
         // Should be near-instant, certainly <500ms.
@@ -6297,7 +6381,7 @@ mod forecast_park_tests {
         });
 
         let start = std::time::Instant::now();
-        forecast_park_or_disconnect(&peer, 1_500, &view, &mut rx, &cancel, None)
+        forecast_park_or_disconnect(&peer, 1_500, &view, &mut rx, &cancel, None, 0)
             .await
             .expect("park should wake and succeed after tip advance");
         let elapsed = start.elapsed();
@@ -6323,9 +6407,124 @@ mod forecast_park_tests {
 
         // Header slot 2000 is way outside; only cancel can break us out
         // (other than the 60s timeout we don't want to wait for).
-        forecast_park_or_disconnect(&peer, 2_000, &view, &mut rx, &cancel, None)
+        forecast_park_or_disconnect(&peer, 2_000, &view, &mut rx, &cancel, None, 0)
             .await
             .expect("cancel must short-circuit to Ok");
+    }
+
+    /// #sync-eval Fix 1: the pure timeout-selection gate. Behind the network
+    /// tip by > a stability window ⇒ patient bulk bound; otherwise the tight
+    /// at-tip bound. The comparison is strict (`>`), and both bounds are finite.
+    #[test]
+    fn forecast_park_timeout_selects_bound_by_tip_gap() {
+        let sw = 100u64;
+        // At/near tip: gap 0, gap < sw, gap == sw (strict >) → tight bound.
+        assert_eq!(
+            forecast_park_timeout(1_000, 1_000, sw),
+            FORECAST_PARK_TIMEOUT
+        );
+        assert_eq!(
+            forecast_park_timeout(1_050, 1_000, sw),
+            FORECAST_PARK_TIMEOUT
+        );
+        assert_eq!(
+            forecast_park_timeout(1_100, 1_000, sw),
+            FORECAST_PARK_TIMEOUT,
+            "gap == stability_window is NOT behind (strict >)"
+        );
+        // Behind: gap sw+1 and far behind → patient bulk bound.
+        assert_eq!(
+            forecast_park_timeout(1_101, 1_000, sw),
+            FORECAST_PARK_TIMEOUT_BULK,
+            "gap == stability_window + 1 ⇒ behind"
+        );
+        assert_eq!(
+            forecast_park_timeout(50_000_000, 1_000, sw),
+            FORECAST_PARK_TIMEOUT_BULK
+        );
+        // Unknown / stale network tip (0) or local ahead → tight bound, never panics.
+        assert_eq!(forecast_park_timeout(0, 1_000, sw), FORECAST_PARK_TIMEOUT);
+        // Both bounds finite (no infinite park is representable).
+        assert!(
+            FORECAST_PARK_TIMEOUT_BULK.as_secs() > 0 && FORECAST_PARK_TIMEOUT_BULK.as_secs() < 3600
+        );
+    }
+
+    /// #sync-eval Fix 1: when we are far BEHIND the network tip (Praos
+    /// from-genesis bulk sync), a header beyond the forecast horizon must NOT
+    /// disconnect the peer at the tight 60s bound — that transient-stall churn
+    /// collapsed the whole peer set in the live preprod repro. It must stay
+    /// parked through `FORECAST_PARK_TIMEOUT` and only disconnect at the patient
+    /// `FORECAST_PARK_TIMEOUT_BULK` (so the watchdog is still BOUNDED — a real
+    /// wedge is surfaced, never an infinite silent park).
+    ///
+    /// On the pre-fix code this test FAILS: behind-tip used the same 60s bound,
+    /// so the task returns `Err` shortly after 60s and the "still parked at 61s"
+    /// assertion trips.
+    #[tokio::test(start_paused = true)]
+    async fn forecast_park_behind_network_tip_is_patient_then_bounded() {
+        // tip=1000, sw=100 → max_for=1101 → header 5000 is beyond the horizon.
+        let view = make_view_swap(1_000, 100);
+        // network tip leads our local tip (1000) by far more than sw=100 ⇒
+        // behind_network_tip = true ⇒ patient FORECAST_PARK_TIMEOUT_BULK.
+        let network_tip = 1_000 + 100 + 50_000;
+        let peer: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+        // tip_rx never advances (apply wedged): only the timeout can end the park.
+        let (_tx, rx) = watch::channel(1_000u64);
+        let cancel = CancellationToken::new();
+
+        let handle = tokio::spawn(async move {
+            let mut rx = rx;
+            forecast_park_or_disconnect(&peer, 5_000, &view, &mut rx, &cancel, None, network_tip)
+                .await
+        });
+        // Let the spawned task reach its internal sleep before advancing time.
+        tokio::task::yield_now().await;
+
+        // Past the at-tip 60s bound but well under the bulk 300s bound:
+        // must still be parked (the fix — old code would have disconnected).
+        tokio::time::advance(FORECAST_PARK_TIMEOUT + Duration::from_secs(5)).await;
+        assert!(
+            !handle.is_finished(),
+            "behind network tip: must stay parked past the 60s at-tip bound, not disconnect"
+        );
+
+        // Past the bulk bound: the watchdog MUST fire (bounded — no infinite
+        // silent park even though network_tip stayed far ahead the whole time).
+        tokio::time::advance(FORECAST_PARK_TIMEOUT_BULK).await;
+        let res = handle.await.expect("task joins");
+        assert!(
+            res.is_err(),
+            "behind network tip: a genuinely wedged ledger must still disconnect at the bulk bound"
+        );
+    }
+
+    /// #sync-eval Fix 1: when we are AT/near the network tip, a header beyond
+    /// the horizon with no local progress is genuinely suspicious and must
+    /// still disconnect at the tight 60s bound (behaviour preserved).
+    #[tokio::test(start_paused = true)]
+    async fn forecast_park_at_tip_disconnects_at_60s() {
+        let view = make_view_swap(1_000, 100);
+        // network tip within one stability window of local ⇒ behind=false ⇒ 60s.
+        let network_tip = 1_000 + 50;
+        let peer: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+        let (_tx, rx) = watch::channel(1_000u64);
+        let cancel = CancellationToken::new();
+
+        let handle = tokio::spawn(async move {
+            let mut rx = rx;
+            forecast_park_or_disconnect(&peer, 5_000, &view, &mut rx, &cancel, None, network_tip)
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        // Under 60s: still parked.
+        tokio::time::advance(FORECAST_PARK_TIMEOUT - Duration::from_secs(5)).await;
+        assert!(!handle.is_finished(), "at tip: parked until the 60s bound");
+        // Past 60s: disconnects (and crucially does NOT wait the full 300s).
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let res = handle.await.expect("task joins");
+        assert!(res.is_err(), "at tip + silent: disconnect at the 60s bound");
     }
 
     /// Issue #654 P1.b: `extract_era_tag_from_wrapped_header` reads the
@@ -8529,9 +8728,16 @@ mod fix1_replay_publish_tests {
         });
 
         let start = std::time::Instant::now();
-        let result =
-            forecast_park_or_disconnect(&peer, 73_000_000, &view, &mut rx, &cancel, Some(&gsm_rx))
-                .await;
+        let result = forecast_park_or_disconnect(
+            &peer,
+            73_000_000,
+            &view,
+            &mut rx,
+            &cancel,
+            Some(&gsm_rx),
+            73_000_000,
+        )
+        .await;
 
         assert!(
             result.is_ok(),
