@@ -9,14 +9,16 @@ use super::certificate::encode_rational;
 /// Key mapping follows the Conway era protocol_param_update CDDL:
 ///   0: min_fee_a, 1: min_fee_b, 2: max_block_body_size, 3: max_tx_size,
 ///   4: max_block_header_size, 5: key_deposit, 6: pool_deposit, 7: e_max,
-///   8: n_opt, 9: a0, 10: rho, 11: tau, 13: min_pool_cost,
-///   14: ada_per_utxo_byte, 15: cost_models, 16: execution_costs,
-///   17: max_tx_ex_units, 18: max_block_ex_units, 19: max_val_size,
-///   20: collateral_percentage, 21: max_collateral_inputs,
-///   22: pool_voting_thresholds(5), 23: drep_voting_thresholds(10),
-///   24: min_committee_size, 25: committee_term_limit, 26: gov_action_lifetime,
-///   27: gov_action_deposit, 28: drep_deposit, 29: drep_activity,
-///   30: min_fee_ref_script_cost_per_byte
+///   8: n_opt, 9: a0, 10: rho, 11: tau,
+///   (keys 12-15 are Babbage-only: decentralization, extra_entropy,
+///    protocol_version, min_utxo_value — not present in Conway PPU)
+///   16: min_pool_cost, 17: ada_per_utxo_byte, 18: cost_models,
+///   19: execution_costs, 20: max_tx_ex_units, 21: max_block_ex_units,
+///   22: max_val_size, 23: collateral_percentage, 24: max_collateral_inputs,
+///   25: pool_voting_thresholds(5), 26: drep_voting_thresholds(10),
+///   27: min_committee_size, 28: committee_term_limit, 29: gov_action_lifetime,
+///   30: gov_action_deposit, 31: drep_deposit, 32: drep_activity,
+///   33: min_fee_ref_script_cost_per_byte
 pub fn encode_protocol_param_update(ppu: &ProtocolParamUpdate) -> Vec<u8> {
     // Count non-None fields to determine map size
     let mut entries: Vec<(u64, Vec<u8>)> = Vec::new();
@@ -59,42 +61,42 @@ pub fn encode_protocol_param_update(ppu: &ProtocolParamUpdate) -> Vec<u8> {
     }
     // Key 12 is protocol_version — not in ProtocolParamUpdate (it's in HardForkInitiation)
     if let Some(ref v) = ppu.min_pool_cost {
-        entries.push((13, encode_uint(v.0)));
+        entries.push((16, encode_uint(v.0)));
     }
     if let Some(ref v) = ppu.ada_per_utxo_byte {
-        entries.push((14, encode_uint(v.0)));
+        entries.push((17, encode_uint(v.0)));
     }
     if let Some(ref v) = ppu.cost_models {
-        entries.push((15, encode_cost_models(v)));
+        entries.push((18, encode_cost_models(v)));
     }
     if let Some(ref v) = ppu.execution_costs {
         let mut buf = encode_array_header(2);
         buf.extend(encode_rational(&v.mem_price));
         buf.extend(encode_rational(&v.step_price));
-        entries.push((16, buf));
+        entries.push((19, buf));
     }
     if let Some(ref v) = ppu.max_tx_ex_units {
         let mut buf = encode_array_header(2);
         buf.extend(encode_uint(v.mem));
         buf.extend(encode_uint(v.steps));
-        entries.push((17, buf));
+        entries.push((20, buf));
     }
     if let Some(ref v) = ppu.max_block_ex_units {
         let mut buf = encode_array_header(2);
         buf.extend(encode_uint(v.mem));
         buf.extend(encode_uint(v.steps));
-        entries.push((18, buf));
+        entries.push((21, buf));
     }
     if let Some(v) = ppu.max_val_size {
-        entries.push((19, encode_uint(v)));
+        entries.push((22, encode_uint(v)));
     }
     if let Some(v) = ppu.collateral_percentage {
-        entries.push((20, encode_uint(v)));
+        entries.push((23, encode_uint(v)));
     }
     if let Some(v) = ppu.max_collateral_inputs {
-        entries.push((21, encode_uint(v)));
+        entries.push((24, encode_uint(v)));
     }
-    // Key 22: pool_voting_thresholds — 5-element array
+    // Key 25: pool_voting_thresholds — 5-element array
     if ppu.pvt_motion_no_confidence.is_some()
         || ppu.pvt_committee_normal.is_some()
         || ppu.pvt_committee_no_confidence.is_some()
@@ -119,9 +121,9 @@ pub fn encode_protocol_param_update(ppu: &ProtocolParamUpdate) -> Vec<u8> {
         buf.extend(encode_rational(
             ppu.pvt_pp_security_group.as_ref().unwrap_or(&zero),
         ));
-        entries.push((22, buf));
+        entries.push((25, buf));
     }
-    // Key 23: drep_voting_thresholds — 10-element array
+    // Key 26: drep_voting_thresholds — 10-element array
     if ppu.dvt_pp_network_group.is_some()
         || ppu.dvt_pp_economic_group.is_some()
         || ppu.dvt_pp_technical_group.is_some()
@@ -166,29 +168,29 @@ pub fn encode_protocol_param_update(ppu: &ProtocolParamUpdate) -> Vec<u8> {
         buf.extend(encode_rational(
             ppu.dvt_constitution.as_ref().unwrap_or(&zero),
         ));
-        entries.push((23, buf));
+        entries.push((26, buf));
     }
     if let Some(v) = ppu.min_committee_size {
-        entries.push((24, encode_uint(v)));
+        entries.push((27, encode_uint(v)));
     }
     if let Some(v) = ppu.committee_term_limit {
-        entries.push((25, encode_uint(v)));
+        entries.push((28, encode_uint(v)));
     }
     if let Some(v) = ppu.gov_action_lifetime {
-        entries.push((26, encode_uint(v)));
+        entries.push((29, encode_uint(v)));
     }
     if let Some(ref v) = ppu.gov_action_deposit {
-        entries.push((27, encode_uint(v.0)));
+        entries.push((30, encode_uint(v.0)));
     }
     if let Some(ref v) = ppu.drep_deposit {
-        entries.push((28, encode_uint(v.0)));
+        entries.push((31, encode_uint(v.0)));
     }
     if let Some(v) = ppu.drep_activity {
-        entries.push((29, encode_uint(v)));
+        entries.push((32, encode_uint(v)));
     }
     if let Some(ref v) = ppu.min_fee_ref_script_cost_per_byte {
         // NonNegativeInterval: encode the full rational as tag-30 [num, den].
-        entries.push((30, encode_rational(v)));
+        entries.push((33, encode_rational(v)));
     }
 
     let mut buf = encode_map_header(entries.len());
@@ -349,12 +351,12 @@ mod tests {
         assert_eq!(encoded[pos + 1], 0x1e, "tag(30) low byte for tau");
     }
 
-    // ── execution costs (key 16) ─────────────────────────────────────────────
+    // ── execution costs (key 19) ─────────────────────────────────────────────
 
-    /// execution_costs (key 16) must encode as array(2) of two rationals,
+    /// execution_costs (key 19) must encode as array(2) of two rationals,
     /// each wrapped in tag(30).
     #[test]
-    fn test_execution_costs_key_16() {
+    fn test_execution_costs_key_19() {
         let ppu = ProtocolParamUpdate {
             execution_costs: Some(ExUnitPrices {
                 mem_price: rat(577, 10_000),
@@ -366,8 +368,8 @@ mod tests {
 
         // map(1) = 0xa1
         assert_eq!(encoded[0], 0xa1, "should be map(1)");
-        // key 16 = 0x10
-        assert_eq!(encoded[1], 0x10, "key 16 (execution_costs)");
+        // key 19 = 0x13
+        assert_eq!(encoded[1], 0x13, "key 19 (execution_costs)");
         // value starts with array(2) = 0x82
         assert_eq!(encoded[2], 0x82, "array(2) for execution costs");
         // first element: rational mem_price — must start with tag(30)
@@ -375,12 +377,12 @@ mod tests {
         assert_eq!(encoded[4], 0x1e, "tag(30) low byte for mem_price");
     }
 
-    // ── ExUnits (key 17) ─────────────────────────────────────────────────────
+    // ── ExUnits (key 20) ─────────────────────────────────────────────────────
 
-    /// max_tx_ex_units (key 17) must encode as array(2) of two plain uints
+    /// max_tx_ex_units (key 20) must encode as array(2) of two plain uints
     /// (no tag 30 — ExUnits are not rationals).
     #[test]
-    fn test_ex_units_key_17_plain_uints() {
+    fn test_ex_units_key_20_plain_uints() {
         let ppu = ProtocolParamUpdate {
             max_tx_ex_units: Some(ExUnits {
                 mem: 14_000_000,
@@ -392,8 +394,8 @@ mod tests {
 
         // map(1) = 0xa1
         assert_eq!(encoded[0], 0xa1);
-        // key 17 = 0x11
-        assert_eq!(encoded[1], 0x11, "key 17 (max_tx_ex_units)");
+        // key 20 = 0x14
+        assert_eq!(encoded[1], 0x14, "key 20 (max_tx_ex_units)");
         // value: array(2) = 0x82
         assert_eq!(encoded[2], 0x82, "array(2) for ExUnits");
         // Next byte is a uint (NOT 0xd8 tag-30); mem = 14_000_000
@@ -401,11 +403,11 @@ mod tests {
         assert_eq!(encoded[3], 0x1a, "mem should be 4-byte uint (no tag 30)");
     }
 
-    // ── pool voting thresholds (key 22) ──────────────────────────────────────
+    // ── pool voting thresholds (key 25) ──────────────────────────────────────
 
-    /// pool_voting_thresholds (key 22) must encode as a 5-element array of rationals.
+    /// pool_voting_thresholds (key 25) must encode as a 5-element array of rationals.
     #[test]
-    fn test_pool_voting_thresholds_key_22() {
+    fn test_pool_voting_thresholds_key_25() {
         let r = rat(1, 2);
         let ppu = ProtocolParamUpdate {
             pvt_motion_no_confidence: Some(r.clone()),
@@ -419,20 +421,21 @@ mod tests {
 
         // map(1)
         assert_eq!(encoded[0], 0xa1);
-        // key 22 = 0x16
-        assert_eq!(encoded[1], 0x16, "key 22 (pool_voting_thresholds)");
+        // key 25 = 0x18 0x19 (two-byte encoding since 25 > 23)
+        assert_eq!(encoded[1], 0x18, "key 25 high byte");
+        assert_eq!(encoded[2], 0x19, "key 25 value (25 = 0x19)");
         // value: array(5) = 0x85
-        assert_eq!(encoded[2], 0x85, "array(5) for pool voting thresholds");
+        assert_eq!(encoded[3], 0x85, "array(5) for pool voting thresholds");
         // Each element starts with tag(30) = 0xd8 0x1e
-        assert_eq!(encoded[3], 0xd8, "first pvt element tag(30) high");
-        assert_eq!(encoded[4], 0x1e, "first pvt element tag(30) low");
+        assert_eq!(encoded[4], 0xd8, "first pvt element tag(30) high");
+        assert_eq!(encoded[5], 0x1e, "first pvt element tag(30) low");
     }
 
-    // ── DRep voting thresholds (key 23) ──────────────────────────────────────
+    // ── DRep voting thresholds (key 26) ──────────────────────────────────────
 
-    /// drep_voting_thresholds (key 23) must encode as a 10-element array of rationals.
+    /// drep_voting_thresholds (key 26) must encode as a 10-element array of rationals.
     #[test]
-    fn test_drep_voting_thresholds_key_23() {
+    fn test_drep_voting_thresholds_key_26() {
         let r = rat(2, 3);
         let ppu = ProtocolParamUpdate {
             dvt_no_confidence: Some(r.clone()),
@@ -451,31 +454,34 @@ mod tests {
 
         // map(1)
         assert_eq!(encoded[0], 0xa1);
-        // key 23 = 0x17
-        assert_eq!(encoded[1], 0x17, "key 23 (drep_voting_thresholds)");
+        // key 26 = 0x18 0x1a (two-byte encoding since 26 > 23)
+        assert_eq!(encoded[1], 0x18, "key 26 high byte");
+        assert_eq!(encoded[2], 0x1a, "key 26 value (26 = 0x1a)");
         // value: array(10) = 0x8a
-        assert_eq!(encoded[2], 0x8a, "array(10) for drep voting thresholds");
+        assert_eq!(encoded[3], 0x8a, "array(10) for drep voting thresholds");
         // First element: tag(30)
-        assert_eq!(encoded[3], 0xd8, "first dvt element tag(30) high");
-        assert_eq!(encoded[4], 0x1e, "first dvt element tag(30) low");
+        assert_eq!(encoded[4], 0xd8, "first dvt element tag(30) high");
+        assert_eq!(encoded[5], 0x1e, "first dvt element tag(30) low");
     }
 
-    // ── Conway governance fields (keys 24-30) ────────────────────────────────
+    // ── Conway governance fields (keys 27-33) ────────────────────────────────
 
-    /// Conway fields keys 24-30 must encode as simple uint values (or a rational for key 30).
+    /// Conway governance fields keys 27-33 must encode as simple uint values
+    /// (or a rational for key 33, min_fee_ref_script_cost_per_byte).
+    /// All of these keys are ≥ 24, so they use two-byte CBOR uint encoding.
     #[test]
     fn test_conway_governance_fields() {
         let ppu = ProtocolParamUpdate {
-            min_committee_size: Some(5),                         // key 24
-            committee_term_limit: Some(146),                     // key 25
-            gov_action_lifetime: Some(6),                        // key 26
-            gov_action_deposit: Some(Lovelace(100_000_000_000)), // key 27
-            drep_deposit: Some(Lovelace(500_000_000)),           // key 28
-            drep_activity: Some(20),                             // key 29
+            min_committee_size: Some(5),                         // key 27
+            committee_term_limit: Some(146),                     // key 28
+            gov_action_lifetime: Some(6),                        // key 29
+            gov_action_deposit: Some(Lovelace(100_000_000_000)), // key 30
+            drep_deposit: Some(Lovelace(500_000_000)),           // key 31
+            drep_activity: Some(20),                             // key 32
             min_fee_ref_script_cost_per_byte: Some(Rational {
                 numerator: 15,
                 denominator: 1,
-            }), // key 30 — encoded as rational 15/1
+            }), // key 33 — encoded as rational 15/1
             ..Default::default()
         };
         let encoded = encode_protocol_param_update(&ppu);
@@ -483,37 +489,37 @@ mod tests {
         // map(7) = 0xa7
         assert_eq!(encoded[0], 0xa7, "should be map(7) for 7 Conway fields");
 
-        // Walk through to confirm key ordering: 24, 25, 26, 27, 28, 29, 30
+        // Walk through to confirm key ordering: 27, 28, 29, 30, 31, 32, 33
         let mut pos = 1;
 
-        // key 24 = 0x18 0x18
-        assert_eq!(encoded[pos], 0x18, "key 24 prefix");
-        assert_eq!(encoded[pos + 1], 0x18, "key 24 value");
+        // key 27 = 0x18 0x1b  (min_committee_size)
+        assert_eq!(encoded[pos], 0x18, "key 27 high byte");
+        assert_eq!(encoded[pos + 1], 0x1b, "key 27 value (27 = 0x1b)");
         pos += 2;
         // value 5
         assert_eq!(encoded[pos], 0x05);
         pos += 1;
 
-        // key 25 = 0x18 0x19
-        assert_eq!(encoded[pos], 0x18, "key 25 prefix");
-        assert_eq!(encoded[pos + 1], 0x19, "key 25 value");
+        // key 28 = 0x18 0x1c  (committee_term_limit)
+        assert_eq!(encoded[pos], 0x18, "key 28 high byte");
+        assert_eq!(encoded[pos + 1], 0x1c, "key 28 value (28 = 0x1c)");
         pos += 2;
         // value 146 = 0x18 0x92
         assert_eq!(encoded[pos], 0x18);
         assert_eq!(encoded[pos + 1], 0x92); // 146 = 0x92
         pos += 2;
 
-        // key 26 = 0x18 0x1a
-        assert_eq!(encoded[pos], 0x18, "key 26 prefix");
-        assert_eq!(encoded[pos + 1], 0x1a, "key 26 value");
+        // key 29 = 0x18 0x1d  (gov_action_lifetime)
+        assert_eq!(encoded[pos], 0x18, "key 29 high byte");
+        assert_eq!(encoded[pos + 1], 0x1d, "key 29 value (29 = 0x1d)");
         pos += 2;
         // value 6
         assert_eq!(encoded[pos], 0x06);
         pos += 1;
 
-        // key 27 = 0x18 0x1b  (gov_action_deposit)
-        assert_eq!(encoded[pos], 0x18, "key 27 prefix");
-        assert_eq!(encoded[pos + 1], 0x1b, "key 27 value");
+        // key 30 = 0x18 0x1e  (gov_action_deposit)
+        assert_eq!(encoded[pos], 0x18, "key 30 high byte");
+        assert_eq!(encoded[pos + 1], 0x1e, "key 30 value (30 = 0x1e)");
         pos += 2;
         // 100_000_000_000 is a 5-byte uint (> 4294967296), encoded as 0x1b + 8 bytes
         assert_eq!(
@@ -522,41 +528,41 @@ mod tests {
         );
         pos += 9; // 1 prefix + 8 bytes
 
-        // key 28 = 0x18 0x1c  (drep_deposit)
-        assert_eq!(encoded[pos], 0x18, "key 28 prefix");
-        assert_eq!(encoded[pos + 1], 0x1c, "key 28 value");
+        // key 31 = 0x18 0x1f  (drep_deposit)
+        assert_eq!(encoded[pos], 0x18, "key 31 high byte");
+        assert_eq!(encoded[pos + 1], 0x1f, "key 31 value (31 = 0x1f)");
         pos += 2;
         // 500_000_000 = 0x1d_cd_65_00  → 4-byte uint: 0x1a
         assert_eq!(encoded[pos], 0x1a, "drep_deposit should be 4-byte uint");
         pos += 5; // 1 prefix + 4 bytes
 
-        // key 29 = 0x18 0x1d  (drep_activity)
-        assert_eq!(encoded[pos], 0x18, "key 29 prefix");
-        assert_eq!(encoded[pos + 1], 0x1d, "key 29 value");
+        // key 32 = 0x18 0x20  (drep_activity)
+        assert_eq!(encoded[pos], 0x18, "key 32 high byte");
+        assert_eq!(encoded[pos + 1], 0x20, "key 32 value (32 = 0x20)");
         pos += 2;
         // value 20 = 0x14
         assert_eq!(encoded[pos], 0x14);
         pos += 1;
 
-        // key 30 = 0x18 0x1e  (min_fee_ref_script_cost_per_byte)
-        assert_eq!(encoded[pos], 0x18, "key 30 prefix");
-        assert_eq!(encoded[pos + 1], 0x1e, "key 30 value");
+        // key 33 = 0x18 0x21  (min_fee_ref_script_cost_per_byte)
+        assert_eq!(encoded[pos], 0x18, "key 33 high byte");
+        assert_eq!(encoded[pos + 1], 0x21, "key 33 value (33 = 0x21)");
         pos += 2;
         // value: rational 15/1 → tag(30) = 0xd8 0x1e
-        assert_eq!(encoded[pos], 0xd8, "key 30 value must be rational (tag 30)");
+        assert_eq!(encoded[pos], 0xd8, "key 33 value must be rational (tag 30)");
         assert_eq!(encoded[pos + 1], 0x1e, "tag 30 low byte");
     }
 
     // ── integer keys are in ascending order ──────────────────────────────────
 
-    /// Setting keys 0, 9, 17, 24 in a single PPU and verifying monotone key order.
+    /// Setting keys 0, 9, 20, 27 in a single PPU and verifying monotone key order.
     #[test]
     fn test_keys_are_in_ascending_order() {
         let ppu = ProtocolParamUpdate {
             min_fee_a: Some(44),                                 // key 0
             a0: Some(rat(3, 10)),                                // key 9
-            max_tx_ex_units: Some(ExUnits { mem: 1, steps: 2 }), // key 17
-            min_committee_size: Some(3),                         // key 24
+            max_tx_ex_units: Some(ExUnits { mem: 1, steps: 2 }), // key 20
+            min_committee_size: Some(3),                         // key 27
             ..Default::default()
         };
         let encoded = encode_protocol_param_update(&ppu);
@@ -572,10 +578,9 @@ mod tests {
         // pos 1 = key 0x00, pos 2-3 = value (0x18 0x2c), pos 4 = key 9
         assert_eq!(encoded[4], 0x09, "second key should be 9");
 
-        // After rational (tag 30 = 0xd8 0x1e + array(2) + 0x03 + 0x0a = 6 bytes) key 17 appears
-        // pos 5..10 = rational bytes (6 bytes), pos 11 = key 17
-        // rational: 0xd8 0x1e 0x82 0x03 0x0a = 5 bytes
-        assert_eq!(encoded[10], 0x11, "third key should be 17 (0x11)");
+        // After rational (tag 30 = 0xd8 0x1e + array(2) + 0x03 + 0x0a = 5 bytes) key 20 appears
+        // pos 5..9 = rational bytes (5 bytes), pos 10 = key 20 (0x14, single byte since 20 ≤ 23)
+        assert_eq!(encoded[10], 0x14, "third key should be 20 (0x14)");
     }
 
     // ── cost models ──────────────────────────────────────────────────────────
@@ -706,11 +711,11 @@ mod tests {
         assert_eq!(encoded[7], 0x01, "1 should encode as 0x01");
     }
 
-    // ── cost models via protocol param update (key 15) ───────────────────────
+    // ── cost models via protocol param update (key 18) ───────────────────────
 
-    /// cost_models set on a PPU must produce key 15 in the map.
+    /// cost_models set on a PPU must produce key 18 in the map.
     #[test]
-    fn test_ppu_cost_models_key_15() {
+    fn test_ppu_cost_models_key_18() {
         let ppu = ProtocolParamUpdate {
             cost_models: Some(CostModels {
                 plutus_v1: Some(vec![42]),
@@ -722,10 +727,104 @@ mod tests {
 
         // map(1)
         assert_eq!(encoded[0], 0xa1);
-        // key 15 = 0x0f
-        assert_eq!(encoded[1], 0x0f, "cost_models key should be 15 (0x0f)");
+        // key 18 = 0x12
+        assert_eq!(encoded[1], 0x12, "cost_models key should be 18 (0x12)");
         // value: cost models starts with map(1) = 0xa1
         assert_eq!(encoded[2], 0xa1, "cost models inner map(1)");
+    }
+
+    // ── encode→decode round-trip (key correctness regression) ────────────────
+
+    /// Encode a PPU covering all key ranges (0-11, 16-17, 18, 19-21, 22-24,
+    /// 25-26, 27-33), decode it back via ppu_from_cbor, and assert field parity.
+    /// This pins that every CBOR key matches the Conway decoder's dispatch table.
+    #[test]
+    fn test_ppu_round_trip_all_key_ranges() {
+        use crate::decode::ppu_from_cbor;
+
+        let original = ProtocolParamUpdate {
+            // Keys 0-11 (always-correct range)
+            min_fee_a: Some(44),                        // key 0
+            min_pool_cost: Some(Lovelace(170_000_000)), // key 16
+            // Key 17: ada_per_utxo_byte
+            ada_per_utxo_byte: Some(Lovelace(4_310)), // key 17
+            // Key 18: cost_models
+            cost_models: Some(CostModels {
+                plutus_v1: None,
+                plutus_v2: Some(vec![100, 200]),
+                plutus_v3: None,
+                plutus_v4: None,
+            }), // key 18
+            // Key 22: max_val_size
+            max_val_size: Some(5_000), // key 22
+            // Key 30: gov_action_deposit
+            gov_action_deposit: Some(Lovelace(100_000_000_000)), // key 30
+            // Key 31: drep_deposit
+            drep_deposit: Some(Lovelace(500_000_000)), // key 31
+            // Key 32: drep_activity
+            drep_activity: Some(20), // key 32
+            // Key 33: min_fee_ref_script_cost_per_byte (rational)
+            min_fee_ref_script_cost_per_byte: Some(Rational {
+                numerator: 15,
+                denominator: 1,
+            }), // key 33
+            ..Default::default()
+        };
+
+        let encoded = encode_protocol_param_update(&original);
+        let decoded = ppu_from_cbor(&encoded).expect("round-trip decode must succeed");
+
+        assert_eq!(decoded.min_fee_a, original.min_fee_a, "min_fee_a (key 0)");
+        assert_eq!(
+            decoded.min_pool_cost.as_ref().map(|v| v.0),
+            original.min_pool_cost.as_ref().map(|v| v.0),
+            "min_pool_cost (key 16)"
+        );
+        assert_eq!(
+            decoded.ada_per_utxo_byte.as_ref().map(|v| v.0),
+            original.ada_per_utxo_byte.as_ref().map(|v| v.0),
+            "ada_per_utxo_byte (key 17)"
+        );
+        assert_eq!(
+            decoded
+                .cost_models
+                .as_ref()
+                .and_then(|cm| cm.plutus_v2.as_ref()),
+            original
+                .cost_models
+                .as_ref()
+                .and_then(|cm| cm.plutus_v2.as_ref()),
+            "cost_models.plutus_v2 (key 18)"
+        );
+        assert_eq!(
+            decoded.max_val_size, original.max_val_size,
+            "max_val_size (key 22)"
+        );
+        assert_eq!(
+            decoded.gov_action_deposit.as_ref().map(|v| v.0),
+            original.gov_action_deposit.as_ref().map(|v| v.0),
+            "gov_action_deposit (key 30)"
+        );
+        assert_eq!(
+            decoded.drep_deposit.as_ref().map(|v| v.0),
+            original.drep_deposit.as_ref().map(|v| v.0),
+            "drep_deposit (key 31)"
+        );
+        assert_eq!(
+            decoded.drep_activity, original.drep_activity,
+            "drep_activity (key 32)"
+        );
+        assert_eq!(
+            decoded
+                .min_fee_ref_script_cost_per_byte
+                .as_ref()
+                .map(|r| (r.numerator, r.denominator)),
+            original
+                .min_fee_ref_script_cost_per_byte
+                .as_ref()
+                .map(|r| (r.numerator, r.denominator)),
+            "min_fee_ref_script_cost_per_byte (key 33)"
+        );
     }
 
     // ── round-trip of a realistic PPU ────────────────────────────────────────
