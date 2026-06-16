@@ -13,7 +13,9 @@ METRICS="http://127.0.0.1:12801/metrics"
 # Match by command line, not a fixed PID, so the monitor survives a node
 # restart (e.g. #767 wedge recovery).
 NODE_PAT="release-prof/dugite-node.*db-mainnet-genesis"
-LOG=/private/tmp/dugite-mainnet-soak-20260615-154625.log
+# Read the active log path from the pointer file (updated on each relaunch) so
+# the monitor follows the node across restarts.
+LOG=$(cat /tmp/dugite-mainnet-soak-current.log 2>/dev/null || echo /private/tmp/dugite-mainnet-soak-20260615-154625.log)
 REPORTS=/Users/michaelfazio/Source/dugite/reports
 WEDGE_STALL=5   # consecutive 60s ticks with no block advance before sampling
                 # (>=5min; tolerates long Alonzo/Babbage snapshot+flush pauses)
