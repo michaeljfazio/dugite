@@ -2081,8 +2081,8 @@ fn test_encode_protocol_param_update_all_simple_numeric_keys() {
         pool_deposit: Some(Lovelace(500_000_000)),  // key 6
         e_max: Some(18),                            // key 7
         n_opt: Some(500),                           // key 8
-        min_pool_cost: Some(Lovelace(340_000_000)), // key 13
-        ada_per_utxo_byte: Some(Lovelace(4310)),    // key 14
+        min_pool_cost: Some(Lovelace(340_000_000)), // key 16
+        ada_per_utxo_byte: Some(Lovelace(4310)),    // key 17
         ..Default::default()
     };
 
@@ -2106,7 +2106,7 @@ fn test_encode_protocol_param_update_all_simple_numeric_keys() {
 
 #[test]
 fn test_encode_protocol_param_update_min_fee_ref_script_cost_per_byte() {
-    // Key 30: the min_fee_ref_script_cost_per_byte field (u64, encoded as tag(30) rational)
+    // Key 33: the min_fee_ref_script_cost_per_byte field (u64, encoded as tag(30) rational)
     let ppu = ProtocolParamUpdate {
         min_fee_ref_script_cost_per_byte: Some(dugite_primitives::transaction::Rational {
             numerator: 15,
@@ -2119,14 +2119,14 @@ fn test_encode_protocol_param_update_min_fee_ref_script_cost_per_byte() {
     let mut dec = minicbor::Decoder::new(&ppu_bytes);
     let map_len = dec.map().unwrap().unwrap();
     assert_eq!(map_len, 1);
-    assert_eq!(dec.u64().unwrap(), 30); // key 30
+    assert_eq!(dec.u64().unwrap(), 33); // key 33
     let tag = dec.tag().unwrap();
     assert_eq!(tag, minicbor::data::Tag::new(30)); // rational tag
 }
 
 #[test]
 fn test_encode_protocol_param_update_governance_group_keys() {
-    // Keys 22 (pool voting thresholds) and 23 (drep voting thresholds)
+    // Keys 25 (pool voting thresholds) and 26 (drep voting thresholds)
     // are emitted when any threshold in the group is set.
     let ppu = ProtocolParamUpdate {
         pvt_motion_no_confidence: Some(Rational {
@@ -2143,10 +2143,10 @@ fn test_encode_protocol_param_update_governance_group_keys() {
     let ppu_bytes = encode_ppu_via_body(ppu);
     let mut dec = minicbor::Decoder::new(&ppu_bytes);
     let map_len = dec.map().unwrap().unwrap();
-    assert_eq!(map_len, 2); // keys 22 and 23
-    assert_eq!(dec.u64().unwrap(), 22); // pool_voting_thresholds group
+    assert_eq!(map_len, 2); // keys 25 and 26
+    assert_eq!(dec.u64().unwrap(), 25); // pool_voting_thresholds group
     dec.skip().unwrap();
-    assert_eq!(dec.u64().unwrap(), 23); // drep_voting_thresholds group
+    assert_eq!(dec.u64().unwrap(), 26); // drep_voting_thresholds group
 }
 
 #[test]

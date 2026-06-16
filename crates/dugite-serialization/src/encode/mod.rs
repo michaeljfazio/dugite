@@ -678,7 +678,7 @@ mod tests {
 
         let mut dec = minicbor::Decoder::new(&encoded);
         let map_len = dec.map().unwrap().unwrap();
-        assert_eq!(map_len, 3); // pvt group (key 22), dvt group (key 23), drep_deposit (key 28)
+        assert_eq!(map_len, 3); // pvt group (key 25), dvt group (key 26), drep_deposit (key 31)
     }
 
     #[test]
@@ -705,7 +705,7 @@ mod tests {
 
         let mut dec = minicbor::Decoder::new(&encoded);
         let map_len = dec.map().unwrap().unwrap();
-        assert_eq!(map_len, 2); // keys 16 and 17
+        assert_eq!(map_len, 2); // keys 19 and 20
     }
 
     #[test]
@@ -724,10 +724,10 @@ mod tests {
 
         let mut dec = minicbor::Decoder::new(&encoded);
         let map_len = dec.map().unwrap().unwrap();
-        assert_eq!(map_len, 1); // key 15 only
+        assert_eq!(map_len, 1); // key 18 only
 
-        // Key 15
-        assert_eq!(dec.u64().unwrap(), 15);
+        // Key 18
+        assert_eq!(dec.u64().unwrap(), 18);
         // Cost models map: {1: [100, 200, 300]}
         let cm_map_len = dec.map().unwrap().unwrap();
         assert_eq!(cm_map_len, 1);
