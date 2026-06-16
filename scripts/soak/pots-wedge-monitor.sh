@@ -17,8 +17,11 @@ NODE_PAT="release-prof/dugite-node.*db-mainnet-genesis"
 # the monitor follows the node across restarts.
 LOG=$(cat /tmp/dugite-mainnet-soak-current.log 2>/dev/null || echo /private/tmp/dugite-mainnet-soak-20260615-154625.log)
 REPORTS=/Users/michaelfazio/Source/dugite/reports
-WEDGE_STALL=5   # consecutive 60s ticks with no block advance before sampling
-                # (>=5min; tolerates long Alonzo/Babbage snapshot+flush pauses)
+WEDGE_STALL=30  # consecutive 60s ticks with no block advance before sampling
+                # (>=30min). Raised from 5: the KNOWN #767 residual (peer-Slow-
+                # cascade) self-recovers within ~5-7min, so a 5min threshold spams
+                # samples; only a genuine >30min hard wedge (beyond the residual)
+                # should alert now.
 # Match ERROR/FATAL *log-level* lines (anchored on the tracing timestamp so we
 # don't match "ERROR" inside a message), plus panics and REAL divergence
 # signals. Deliberately NOT a bare "diverg" — that matches the benign
