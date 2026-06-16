@@ -664,6 +664,19 @@ pub struct CostModels {
     /// separate slot exists so a future ParameterChange action can
     /// independently re-tune V4 without touching V3. Issue #475 Phase 5.
     pub plutus_v4: Option<Vec<i64>>,
+    /// Unknown-language cost models (#770): any cost-model map entry whose
+    /// language key is not 0–3 (V1–V4). Haskell `CostModels` keeps these in
+    /// `_costModelsUnknown :: Map Word8 [Int64]` and `flattenCostModels` folds
+    /// the valid (typed) models on top of them, so they survive
+    /// `EncCBOR CostModels` (on-chain PPU / active-params CBOR) and
+    /// `ToPlutusData CostModels` (the `ChangedParameters` guardrail `Data` a
+    /// governance script sees). Keyed by raw `Word8` so iteration is ascending,
+    /// matching Haskell's `Map Word8` `toAscList` wire order; the decoders
+    /// guarantee keys here are always ≥ 4 (0–3 land in the typed fields), so
+    /// emitting the typed entries first then this map preserves the canonical
+    /// ascending-key order. Latent today (no key ≥ 4 is on-chain at PV11) —
+    /// carried for byte-exact completeness.
+    pub unknown_cost_models: std::collections::BTreeMap<u8, Vec<i64>>,
 }
 
 impl CostModels {
@@ -676,7 +689,8 @@ impl CostModels {
         let has_any = self.plutus_v1.is_some()
             || self.plutus_v2.is_some()
             || self.plutus_v3.is_some()
-            || self.plutus_v4.is_some();
+            || self.plutus_v4.is_some()
+            || !self.unknown_cost_models.is_empty();
         if !has_any {
             return None;
         }
@@ -695,7 +709,8 @@ impl CostModels {
         ]
         .iter()
         .filter(|m| m.is_some())
-        .count();
+        .count()
+            + self.unknown_cost_models.len();
         enc.map(count as u64).expect("infallible: Vec<u8> write");
 
         if let Some(v1) = &self.plutus_v1 {
@@ -727,6 +742,17 @@ impl CostModels {
             enc.array(v4.len() as u64)
                 .expect("infallible: Vec<u8> write");
             for cost in v4 {
+                enc.i64(*cost).expect("infallible: Vec<u8> write");
+            }
+        }
+        // #770: unknown-language entries (keys ≥ 4), in ascending key order
+        // (BTreeMap iteration). Mirrors Haskell `flattenCostModels` folding the
+        // typed models on top of `_costModelsUnknown`.
+        for (key, costs) in &self.unknown_cost_models {
+            enc.u32(u32::from(*key)).expect("infallible: Vec<u8> write");
+            enc.array(costs.len() as u64)
+                .expect("infallible: Vec<u8> write");
+            for cost in costs {
                 enc.i64(*cost).expect("infallible: Vec<u8> write");
             }
         }
@@ -1462,6 +1488,7 @@ mod tests {
             plutus_v2: Some(vec![20]),
             plutus_v3: Some(vec![30]),
             plutus_v4: Some(vec![40]),
+            ..Default::default()
         };
         let cbor = cm.to_cbor().expect("should produce CBOR");
         let mut dec = minicbor::Decoder::new(&cbor);
@@ -1511,6 +1538,7 @@ mod tests {
             plutus_v2: Some(vec![2]),
             plutus_v3: Some(vec![3]),
             plutus_v4: Some(vec![4]),
+            ..Default::default()
         };
         let cbor = cm.to_cbor().expect("4-version cost model");
         let mut dec = minicbor::Decoder::new(&cbor);
@@ -1522,6 +1550,44 @@ mod tests {
             assert_eq!(dec.array().unwrap().unwrap(), 1);
             assert_eq!(dec.i64().unwrap(), (expected_key as i64) + 1);
         }
+    }
+
+    /// #770: `to_cbor` includes unknown-language entries (keys ≥ 4) after the
+    /// typed keys, in ascending order, preserving signed values — mirroring
+    /// Haskell `flattenCostModels`.
+    #[test]
+    fn test_cost_models_to_cbor_includes_unknown() {
+        let cm = CostModels {
+            plutus_v1: Some(vec![1]),
+            unknown_cost_models: [(7u8, vec![999i64, -1])].into_iter().collect(),
+            ..Default::default()
+        };
+        let cbor = cm.to_cbor().expect("cost models with unknown entry encode");
+        let mut dec = minicbor::Decoder::new(&cbor);
+        assert_eq!(dec.map().unwrap().unwrap(), 2, "V1 + one unknown lang");
+        // key 0 (V1) first.
+        assert_eq!(dec.u32().unwrap(), 0);
+        assert_eq!(dec.array().unwrap().unwrap(), 1);
+        assert_eq!(dec.i64().unwrap(), 1);
+        // key 7 (unknown) next, with a negative value preserved.
+        assert_eq!(dec.u32().unwrap(), 7);
+        assert_eq!(dec.array().unwrap().unwrap(), 2);
+        assert_eq!(dec.i64().unwrap(), 999);
+        assert_eq!(dec.i64().unwrap(), -1);
+    }
+
+    /// #770: a CostModels carrying ONLY unknown entries still encodes (the
+    /// `has_any` guard must account for the unknown map).
+    #[test]
+    fn test_cost_models_to_cbor_unknown_only() {
+        let cm = CostModels {
+            unknown_cost_models: [(4u8, vec![5i64])].into_iter().collect(),
+            ..Default::default()
+        };
+        let cbor = cm.to_cbor().expect("unknown-only cost models still encode");
+        let mut dec = minicbor::Decoder::new(&cbor);
+        assert_eq!(dec.map().unwrap().unwrap(), 1);
+        assert_eq!(dec.u32().unwrap(), 4);
     }
 
     // ========== DRep::credential_hash32 ==========

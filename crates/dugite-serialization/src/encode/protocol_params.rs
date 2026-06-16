@@ -210,7 +210,8 @@ pub fn encode_cost_models(cm: &CostModels) -> Vec<u8> {
     let count = [&cm.plutus_v1, &cm.plutus_v2, &cm.plutus_v3, &cm.plutus_v4]
         .iter()
         .filter(|m| m.is_some())
-        .count();
+        .count()
+        + cm.unknown_cost_models.len();
     let mut buf = encode_map_header(count);
     if let Some(ref v1) = cm.plutus_v1 {
         buf.extend(encode_uint(0));
@@ -237,6 +238,15 @@ pub fn encode_cost_models(cm: &CostModels) -> Vec<u8> {
         buf.extend(encode_uint(3));
         buf.extend(encode_array_header(v4.len()));
         for cost in v4 {
+            buf.extend(encode_int(*cost as i128));
+        }
+    }
+    // #770: unknown-language entries (keys ≥ 4) in ascending key order, mirroring
+    // Haskell `flattenCostModels` (typed models folded on top of the unknown map).
+    for (key, costs) in &cm.unknown_cost_models {
+        buf.extend(encode_uint(u64::from(*key)));
+        buf.extend(encode_array_header(costs.len()));
+        for cost in costs {
             buf.extend(encode_int(*cost as i128));
         }
     }
@@ -622,6 +632,7 @@ mod tests {
             plutus_v2: Some(vec![2]),
             plutus_v3: Some(vec![3]),
             plutus_v4: None,
+            ..Default::default()
         };
         let encoded = encode_cost_models(&cm);
 
@@ -656,6 +667,7 @@ mod tests {
             plutus_v2: Some(vec![2]),
             plutus_v3: Some(vec![3]),
             plutus_v4: Some(vec![4]),
+            ..Default::default()
         };
         let encoded = encode_cost_models(&cm);
         // map(4) = 0xa4
@@ -680,6 +692,49 @@ mod tests {
         assert_eq!(encoded[0], 0xa1);
         assert_eq!(encoded[1], 0x03, "PlutusV4 cost-model key = 3 (Dijkstra)");
         assert_eq!(encoded[2], 0x83);
+    }
+
+    /// #770: unknown-language entries (keys ≥ 4) are encoded after the typed
+    /// keys in ascending key order, mirroring Haskell `flattenCostModels`.
+    #[test]
+    fn test_cost_models_preserves_unknown_entry() {
+        let cm = CostModels {
+            plutus_v2: Some(vec![10]),
+            unknown_cost_models: [(5u8, vec![99i64, -1])].into_iter().collect(),
+            ..Default::default()
+        };
+        let encoded = encode_cost_models(&cm);
+        // map(2): key 1 (V2) then key 5 (unknown), ascending.
+        assert_eq!(encoded[0], 0xa2, "map(2): one typed + one unknown");
+        assert_eq!(encoded[1], 0x01, "first key must be 1 (V2)");
+        // V2 value: array(1) [10] = 0x81 0x0a
+        assert_eq!(&encoded[2..5], &[0x81, 0x0a, 0x05]);
+        // ...then key 5 (unknown), array(2) [99, -1] = 0x82 0x18 0x63 0x20
+        assert_eq!(&encoded[5..], &[0x82, 0x18, 0x63, 0x20]);
+
+        // Round-trips through the canonical decoder, preserving the unknown.
+        let mut r = crate::decode::reader::Reader::new(&encoded);
+        let back = crate::decode::era_conway::read_cost_models(&mut r).unwrap();
+        assert_eq!(back.plutus_v2, Some(vec![10]));
+        assert_eq!(back.unknown_cost_models.get(&5), Some(&vec![99, -1]));
+    }
+
+    /// #770: the two hand-rolled flat-map emitters — `encode_cost_models`
+    /// (PPU/active-params) and `CostModels::to_cbor` (phase-2 evaluator feed) —
+    /// must stay byte-identical, including unknown entries, so they cannot drift.
+    #[test]
+    fn test_encode_cost_models_matches_to_cbor_with_unknown() {
+        let cm = CostModels {
+            plutus_v1: Some(vec![1, 2]),
+            plutus_v3: Some(vec![-300, 7]),
+            unknown_cost_models: [(4u8, vec![5i64]), (9u8, vec![6, 7])].into_iter().collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            encode_cost_models(&cm),
+            cm.to_cbor().expect("non-empty cost models encode"),
+            "encode_cost_models and CostModels::to_cbor must be byte-identical"
+        );
     }
 
     /// Cost models with negative values must use CBOR negative integer encoding.
@@ -754,6 +809,7 @@ mod tests {
                 plutus_v2: Some(vec![100, 200]),
                 plutus_v3: None,
                 plutus_v4: None,
+                ..Default::default()
             }), // key 18
             // Key 22: max_val_size
             max_val_size: Some(5_000), // key 22

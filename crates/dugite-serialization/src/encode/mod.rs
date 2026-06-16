@@ -512,6 +512,7 @@ mod tests {
             plutus_v2: None,
             plutus_v3: None,
             plutus_v4: None,
+            ..Default::default()
         };
         let encoded = encode_language_views(&cost_models, true, false, false);
         // map(1), key = bstr(0x00) = [0x41, 0x00]
@@ -534,6 +535,7 @@ mod tests {
             plutus_v2: None,
             plutus_v3: None,
             plutus_v4: None,
+            ..Default::default()
         };
         let encoded = encode_language_views(&cost_models, true, false, false);
         // The value should be a bstr containing [0x9F, <ints>, 0xFF]
@@ -564,6 +566,7 @@ mod tests {
             plutus_v2: Some(vec![10, 20]),
             plutus_v3: None,
             plutus_v4: None,
+            ..Default::default()
         };
         let encoded = encode_language_views(&cost_models, false, true, false);
         // map(1), key = uint(1) = [0x01]
@@ -582,6 +585,7 @@ mod tests {
             plutus_v2: Some(vec![2]),
             plutus_v3: None,
             plutus_v4: None,
+            ..Default::default()
         };
         let encoded = encode_language_views(&cost_models, true, true, false);
         assert_eq!(encoded[0], 0xA2); // map(2)
@@ -599,6 +603,7 @@ mod tests {
             plutus_v2: Some(vec![2]),
             plutus_v3: Some(vec![3]),
             plutus_v4: None,
+            ..Default::default()
         };
         let encoded = encode_language_views(&cost_models, true, true, true);
         assert_eq!(encoded[0], 0xA3); // map(3)
@@ -619,6 +624,7 @@ mod tests {
             plutus_v2: None,
             plutus_v3: None,
             plutus_v4: None,
+            ..Default::default()
         };
         let encoded = encode_language_views(&cost_models, false, false, false);
         assert_eq!(encoded, encode_map_header(0));
@@ -717,6 +723,7 @@ mod tests {
                 plutus_v2: Some(vec![100, 200, 300]),
                 plutus_v3: None,
                 plutus_v4: None,
+                ..Default::default()
             }),
             ..Default::default()
         };

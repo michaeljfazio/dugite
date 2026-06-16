@@ -2101,6 +2101,8 @@ pub(crate) fn read_cost_models(r: &mut Reader<'_>) -> Result<CostModels, Seriali
     let mut plutus_v2 = None;
     let mut plutus_v3 = None;
     let mut plutus_v4 = None;
+    let mut unknown_cost_models: std::collections::BTreeMap<u8, Vec<i64>> =
+        std::collections::BTreeMap::new();
     // Use read_map to handle both definite- and indefinite-length maps.
     let pairs = r.read_map(
         |r| r.read_uint(),
@@ -2113,7 +2115,18 @@ pub(crate) fn read_cost_models(r: &mut Reader<'_>) -> Result<CostModels, Seriali
             2 => plutus_v3 = Some(costs),
             // Dijkstra cost-model slot 3 = PlutusV4 (issue #475 Phase 5).
             3 => plutus_v4 = Some(costs),
-            _ => {}
+            // #770: preserve unknown-language entries (Haskell keeps these in
+            // `_costModelsUnknown :: Map Word8 [Int64]` and re-emits them via
+            // `flattenCostModels`). A key > 255 is not a valid `Word8` — Haskell
+            // decodes the language key as `Word8`, so such a key is malformed.
+            other => {
+                let lang = u8::try_from(other).map_err(|_| {
+                    SerializationError::CborDecode(format!(
+                        "cost-model language key {other} exceeds Word8 (0..=255)"
+                    ))
+                })?;
+                unknown_cost_models.insert(lang, costs);
+            }
         }
     }
     Ok(CostModels {
@@ -2121,6 +2134,7 @@ pub(crate) fn read_cost_models(r: &mut Reader<'_>) -> Result<CostModels, Seriali
         plutus_v2,
         plutus_v3,
         plutus_v4,
+        unknown_cost_models,
     })
 }
 
@@ -4278,16 +4292,45 @@ mod tests {
         assert_eq!(cm.plutus_v3.as_ref().unwrap(), &vec![75]);
     }
 
+    /// #770: unknown-language entries (keys ≥ 4) are PRESERVED, not dropped —
+    /// Haskell keeps them in `_costModelsUnknown` and re-emits via
+    /// `flattenCostModels`. Known typed fields decode alongside.
     #[test]
-    fn cost_models_unknown_keys_ignored() {
-        let mut data = vec![0xa1];
+    fn cost_models_unknown_keys_preserved() {
+        // {0: [1, 2], 99: [42, 43]}
+        let mut data = vec![0xa2];
+        data.extend(cbor_uint(0));
+        data.push(0x82); // array(2)
+        data.extend(cbor_uint(1));
+        data.extend(cbor_uint(2));
         data.extend(cbor_uint(99));
-        data.push(0x80);
+        data.push(0x82); // array(2)
+        data.extend(cbor_uint(42));
+        data.extend(cbor_uint(43));
         let mut r = Reader::new(&data);
         let cm = read_cost_models(&mut r).unwrap();
-        assert!(cm.plutus_v1.is_none());
+        assert_eq!(cm.plutus_v1.as_ref().unwrap(), &vec![1, 2]);
         assert!(cm.plutus_v2.is_none());
         assert!(cm.plutus_v3.is_none());
+        assert!(cm.plutus_v4.is_none());
+        assert_eq!(cm.unknown_cost_models.get(&99), Some(&vec![42, 43]));
+        assert_eq!(cm.unknown_cost_models.len(), 1);
+    }
+
+    /// #770: a language key > 255 is not a valid `Word8` (Haskell decodes the
+    /// key as `Word8`) → malformed, hard reject rather than silent truncation.
+    #[test]
+    fn cost_models_key_over_255_rejected() {
+        // {256: []}
+        let mut data = vec![0xa1];
+        data.extend(cbor_uint(256));
+        data.push(0x80); // array(0)
+        let mut r = Reader::new(&data);
+        let err = read_cost_models(&mut r).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds Word8"),
+            "expected Word8-overflow error, got: {err}"
+        );
     }
 
     #[test]

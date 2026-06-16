@@ -355,6 +355,7 @@ mod tests {
             plutus_v2: None,
             plutus_v3: Some(vec![100, 200, -300]),
             plutus_v4: Some(vec![7, 8, 9, 10]),
+            ..Default::default()
         };
         let cbor = prim.to_cbor().unwrap();
         let cm = decode_cost_models_cbor(&cbor).unwrap();

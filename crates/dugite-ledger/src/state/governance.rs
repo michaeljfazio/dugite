@@ -2495,6 +2495,19 @@ fn apply_protocol_param_update_impl(
         if let Some(ref v3) = v.plutus_v3 {
             params.cost_models.plutus_v3 = Some(v3.clone());
         }
+        if let Some(ref v4) = v.plutus_v4 {
+            params.cost_models.plutus_v4 = Some(v4.clone());
+        }
+        // #770: per-language merge of unknown-language entries (keys ≥ 4),
+        // mirroring Haskell Conway `updateCostModels` (`Map.union new old`,
+        // new wins; old keys absent from the update are retained). Typed and
+        // unknown keys never collide (decoders route 0–3 to the typed fields).
+        for (key, costs) in &v.unknown_cost_models {
+            params
+                .cost_models
+                .unknown_cost_models
+                .insert(*key, costs.clone());
+        }
     }
     if let Some(ref v) = update.execution_costs {
         params.execution_costs = v.clone();
@@ -3925,6 +3938,51 @@ mod tests {
     use dugite_primitives::value::Lovelace;
     use std::collections::BTreeMap;
     use std::sync::Arc;
+
+    /// #770 (the decisive path): the Conway gov-action ENACTMENT merge
+    /// (`apply_protocol_param_update_impl`) must merge V4 AND unknown-language
+    /// cost models per-language, mirroring Haskell `updateCostModels`
+    /// (`Map.union new old`) — preserving the prior V2 entry, layering V3/V4,
+    /// and carrying unknown keys ≥ 4. (Before #770 this path merged only
+    /// V1/V2/V3 and silently dropped V4 + unknown.)
+    #[test]
+    fn apply_ppu_enactment_merges_v4_and_unknown_cost_models() {
+        use dugite_primitives::transaction::CostModels;
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.cost_models.plutus_v2 = Some(vec![1]);
+        params.cost_models.plutus_v3 = None;
+        params.cost_models.plutus_v4 = None;
+        params.cost_models.unknown_cost_models.clear();
+
+        let update = ProtocolParamUpdate {
+            cost_models: Some(CostModels {
+                plutus_v3: Some(vec![2]),
+                plutus_v4: Some(vec![3]),
+                unknown_cost_models: [(5u8, vec![9i64])].into_iter().collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        apply_protocol_param_update_impl(&mut params, &update).unwrap();
+
+        assert_eq!(
+            params.cost_models.plutus_v2,
+            Some(vec![1]),
+            "prior V2 entry must be preserved (per-language merge)"
+        );
+        assert_eq!(params.cost_models.plutus_v3, Some(vec![2]), "V3 merged");
+        assert_eq!(
+            params.cost_models.plutus_v4,
+            Some(vec![3]),
+            "V4 merged (was dropped)"
+        );
+        assert_eq!(
+            params.cost_models.unknown_cost_models.get(&5),
+            Some(&vec![9]),
+            "unknown lang=5 merged (was dropped at enactment)"
+        );
+    }
 
     fn make_anchor() -> Anchor {
         Anchor {

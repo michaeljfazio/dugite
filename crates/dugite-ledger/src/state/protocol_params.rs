@@ -83,6 +83,18 @@ impl LedgerState {
             if let Some(ref v3) = v.plutus_v3 {
                 self.epochs.protocol_params.cost_models.plutus_v3 = Some(v3.clone());
             }
+            if let Some(ref v4) = v.plutus_v4 {
+                self.epochs.protocol_params.cost_models.plutus_v4 = Some(v4.clone());
+            }
+            // #770: per-language merge of unknown-language entries (keys ≥ 4),
+            // mirroring Haskell `updateCostModels` (`Map.union new old`).
+            for (key, costs) in &v.unknown_cost_models {
+                self.epochs
+                    .protocol_params
+                    .cost_models
+                    .unknown_cost_models
+                    .insert(*key, costs.clone());
+            }
         }
         if let Some(ref v) = update.execution_costs {
             self.epochs.protocol_params.execution_costs = v.clone();

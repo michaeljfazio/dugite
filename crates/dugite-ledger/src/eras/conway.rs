@@ -3456,6 +3456,7 @@ mod tests {
                 plutus_v2: Some(vec![40, 50, 60]),
                 plutus_v3: None,
                 plutus_v4: None,
+                ..Default::default()
             }),
             protocol_version_major: Some(9),
             ..Default::default()
