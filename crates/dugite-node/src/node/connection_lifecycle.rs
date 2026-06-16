@@ -136,6 +136,14 @@ const BLOCKFETCH_INIT_AVG_BLOCK_BYTES: usize = 65_536;
 /// visible at the BlockFetch protocol level.
 /// Window 2 × 8 MB = 16 MB ≤ 48 MB ingress limit — invariant holds with
 /// ~3× headroom for estimate slack.
+///
+/// #sync-eval: a bump to 4 to hide RTT on high-latency links was evaluated and
+/// REJECTED — it violates the SECOND ingress invariant below
+/// (`BLOCKFETCH_PIPELINE_WINDOW * RANGE_BYTE_ABORT_CEILING <= INGRESS_LIMIT`):
+/// at the 20 MB abort ceiling, 4 × 20 MB = 80 MB > 48 MB. Window is therefore
+/// capped at 2 (2 × 20 = 40 ≤ 48) without also enlarging the mux ingress buffer
+/// or lowering the abort ceiling — both separate, carefully-reviewed changes.
+/// Real RTT-hiding throughput work is concurrent multi-peer fetch (deferred).
 const BLOCKFETCH_PIPELINE_WINDOW: usize = 2;
 
 // Issue #747: compile-time invariant, referencing the REAL mux constant
@@ -200,10 +208,15 @@ pub(crate) fn should_rotate_unproductive_dynamo(
 /// closing TCP).
 ///
 /// `Slow` is a performance failure (fetch/keepalive timeout, send
-/// failure): reputation/backoff only. DEVIATION from Haskell (which kills
-/// the connection on timeouts too, then reconnects after governor
-/// backoff): dugite's single-active-fetcher architecture makes
-/// timeout-teardown churn-prone — tracked as a follow-up.
+/// failure): reputation/backoff PLUS connection teardown. Teardown was
+/// added (#sync-eval) after a `Slow` burst was found to collapse the peer
+/// set permanently: leaving the mux alive kept the peer in
+/// `lifecycle.connections`, so the governor's `has_connection` reconnect
+/// gate blocked re-promotion forever (the connection never died on its own
+/// because keepalive kept succeeding — the peer was fine, our ledger was the
+/// laggard). Tearing down lets the governor reconnect on the normal
+/// Cold→Warm schedule after the backoff `peer_failed()` applies. This now
+/// matches Haskell (which kills the bearer on timeouts and reconnects).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PeerFailureKind {
     /// Provable protocol violation — reputation + connection teardown.

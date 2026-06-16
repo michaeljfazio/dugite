@@ -5311,12 +5311,25 @@ impl Node {
                     let mut pm = peer_manager.write().await;
                     warn!(%failed_addr, kind = ?failure_kind, "peer reported as failed by protocol task");
                     pm.peer_failed(&failed_addr);
-                    if failure_kind == PeerFailureKind::ProtocolFault {
-                        if let Some(ref mut lifecycle) = self.connection_lifecycle {
-                            if let Err(e) = lifecycle.demote_to_cold(failed_addr, &mut pm).await {
-                                // Not connected any more — bookkeeping only.
-                                debug!(%failed_addr, error = %e, "protocol-fault teardown: no live connection");
-                            }
+                    // #sync-eval companion fix: tear the connection down for
+                    // BOTH failure kinds, not just `ProtocolFault`. A `Slow`
+                    // failure used to only hit reputation/backoff and leave the
+                    // mux alive; because the connection stayed in
+                    // `lifecycle.connections`, `has_connection(addr)` kept
+                    // returning true, so the governor's reconnect path
+                    // (`if lifecycle.has_connection(addr) … continue`) was
+                    // blocked FOREVER — even after backoff decayed. A burst of
+                    // `Slow` drops (e.g. a transient network blip) therefore
+                    // collapsed the peer set to 0 with no recovery (observed in
+                    // the preprod resync). Tearing down on `Slow` too removes
+                    // the peer from `lifecycle.connections` so the governor
+                    // re-promotes it on the normal Cold→Warm schedule after the
+                    // backoff `peer_failed()` already applied. `demote_to_cold`
+                    // is a safe no-op when there is no live connection.
+                    if let Some(ref mut lifecycle) = self.connection_lifecycle {
+                        if let Err(e) = lifecycle.demote_to_cold(failed_addr, &mut pm).await {
+                            // Not connected any more — bookkeeping only.
+                            debug!(%failed_addr, kind = ?failure_kind, error = %e, "peer-failure teardown: no live connection");
                         }
                     }
                     self.update_peer_metrics(&pm);
