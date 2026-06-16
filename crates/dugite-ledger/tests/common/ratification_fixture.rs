@@ -795,7 +795,10 @@ pub fn koios_protocol_param_update(v: &serde_json::Value) -> ProtocolParamUpdate
         ppu.max_collateral_inputs = Some(read_u64(x, "maxCollateralInputs"));
     }
     if let Some(x) = map.get("minFeeRefScriptCostPerByte") {
-        ppu.min_fee_ref_script_cost_per_byte = Some(read_u64(x, "minFeeRefScriptCostPerByte"));
+        ppu.min_fee_ref_script_cost_per_byte = Some(dugite_primitives::transaction::Rational {
+            numerator: read_u64(x, "minFeeRefScriptCostPerByte"),
+            denominator: 1,
+        });
     }
     if let Some(x) = map.get("drepDeposit") {
         ppu.drep_deposit = Some(Lovelace(read_u64(x, "drepDeposit")));

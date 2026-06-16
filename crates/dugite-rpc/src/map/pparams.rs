@@ -48,11 +48,11 @@ pub fn pparams_to_proto(p: &ProtocolParameters) -> pb::PParams {
             steps: p.max_block_ex_units.steps,
             memory: p.max_block_ex_units.mem,
         }),
-        // dugite stores ref-script-cost as a per-byte u64; the proto wants
-        // a RationalNumber. Express as `n/1`.
+        // minFeeRefScriptCostPerByte is a NonNegativeInterval; map the full
+        // rational into the proto RationalNumber.
         min_fee_script_ref_cost_per_byte: Some(pb::RationalNumber {
-            numerator: p.min_fee_ref_script_cost_per_byte as i32,
-            denominator: 1,
+            numerator: p.min_fee_ref_script_cost_per_byte.numerator as i32,
+            denominator: p.min_fee_ref_script_cost_per_byte.denominator as u32,
         }),
         pool_voting_thresholds: Some(pb::VotingThresholds {
             thresholds: vec![

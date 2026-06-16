@@ -186,14 +186,9 @@ pub fn encode_protocol_param_update(ppu: &ProtocolParamUpdate) -> Vec<u8> {
     if let Some(v) = ppu.drep_activity {
         entries.push((29, encode_uint(v)));
     }
-    if let Some(v) = ppu.min_fee_ref_script_cost_per_byte {
-        entries.push((
-            30,
-            encode_rational(&Rational {
-                numerator: v,
-                denominator: 1,
-            }),
-        ));
+    if let Some(ref v) = ppu.min_fee_ref_script_cost_per_byte {
+        // NonNegativeInterval: encode the full rational as tag-30 [num, den].
+        entries.push((30, encode_rational(v)));
     }
 
     let mut buf = encode_map_header(entries.len());
@@ -477,7 +472,10 @@ mod tests {
             gov_action_deposit: Some(Lovelace(100_000_000_000)), // key 27
             drep_deposit: Some(Lovelace(500_000_000)),           // key 28
             drep_activity: Some(20),                             // key 29
-            min_fee_ref_script_cost_per_byte: Some(15), // key 30 — encoded as rational 15/1
+            min_fee_ref_script_cost_per_byte: Some(Rational {
+                numerator: 15,
+                denominator: 1,
+            }), // key 30 — encoded as rational 15/1
             ..Default::default()
         };
         let encoded = encode_protocol_param_update(&ppu);

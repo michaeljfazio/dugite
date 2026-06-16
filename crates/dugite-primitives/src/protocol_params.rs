@@ -99,7 +99,11 @@ pub struct ProtocolParameters {
     pub max_val_size: u64,
     pub collateral_percentage: u64,
     pub max_collateral_inputs: u64,
-    pub min_fee_ref_script_cost_per_byte: u64,
+    /// Conway `minFeeRefScriptCostPerByte` — a `NonNegativeInterval` (rational),
+    /// not an integer.  Mainnet is `15/1`, but a governance ParameterChange may
+    /// set a fractional value, so it is stored as a full `Rational` to stay
+    /// byte-exact with cardano-ledger (`ppMinFeeRefScriptCostPerByte`).
+    pub min_fee_ref_script_cost_per_byte: Rational,
 
     // Conway governance
     pub drep_deposit: Lovelace,
@@ -299,7 +303,10 @@ impl ProtocolParameters {
             max_val_size: 5000,
             collateral_percentage: 150,
             max_collateral_inputs: 3,
-            min_fee_ref_script_cost_per_byte: 15,
+            min_fee_ref_script_cost_per_byte: Rational {
+                numerator: 15,
+                denominator: 1,
+            },
             drep_deposit: Lovelace(500_000_000),
             drep_activity: 20,
             gov_action_deposit: Lovelace(100_000_000_000),

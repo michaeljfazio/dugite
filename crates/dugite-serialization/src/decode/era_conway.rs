@@ -2057,10 +2057,11 @@ fn read_protocol_param_update(
             31 => ppu.drep_deposit = Some(read_lovelace(r)?),
             32 => ppu.drep_activity = Some(r.read_uint()?),
             33 => {
-                // min_fee_ref_script_cost_per_byte: rational, store as numerator/denominator
-                let rat = r.read_rational()?;
-                ppu.min_fee_ref_script_cost_per_byte =
-                    Some(rat.numerator.checked_div(rat.denominator).unwrap_or(15));
+                // min_fee_ref_script_cost_per_byte: NonNegativeInterval (rational).
+                // Preserve the full num/den — Haskell carries this rational through
+                // the tiered ref-script fee and the ChangedParameters Plutus Data,
+                // so truncating the denominator would diverge for a fractional value.
+                ppu.min_fee_ref_script_cost_per_byte = Some(r.read_rational()?);
             }
             // Dijkstra-era PParams (keys 34-37)
             // Haskell: `eras/dijkstra/impl/src/Cardano/Ledger/Dijkstra/PParams.hs`

@@ -593,7 +593,9 @@ pub struct ProtocolParamUpdate {
     pub max_val_size: Option<u64>,
     pub collateral_percentage: Option<u64>,
     pub max_collateral_inputs: Option<u64>,
-    pub min_fee_ref_script_cost_per_byte: Option<u64>,
+    /// Conway `minFeeRefScriptCostPerByte` — `StrictMaybe NonNegativeInterval`
+    /// (rational), CBOR map key 33 encoded as tag-30 `[num, den]`.
+    pub min_fee_ref_script_cost_per_byte: Option<Rational>,
     /// Decentralisation parameter (d). Deprecated since Babbage.
     pub d: Option<Rational>,
     /// Extra entropy (Shelley `ppExtraEntropy` / nonce, PParamUpdate key 13).

@@ -2108,7 +2108,10 @@ fn test_encode_protocol_param_update_all_simple_numeric_keys() {
 fn test_encode_protocol_param_update_min_fee_ref_script_cost_per_byte() {
     // Key 30: the min_fee_ref_script_cost_per_byte field (u64, encoded as tag(30) rational)
     let ppu = ProtocolParamUpdate {
-        min_fee_ref_script_cost_per_byte: Some(15), // stored as u64, wire-encoded as rational
+        min_fee_ref_script_cost_per_byte: Some(dugite_primitives::transaction::Rational {
+            numerator: 15,
+            denominator: 1,
+        }), // NonNegativeInterval, wire-encoded as tag-30 rational
         ..Default::default()
     };
 

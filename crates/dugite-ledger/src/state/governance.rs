@@ -2514,8 +2514,8 @@ fn apply_protocol_param_update_impl(
     if let Some(v) = update.max_collateral_inputs {
         params.max_collateral_inputs = v;
     }
-    if let Some(v) = update.min_fee_ref_script_cost_per_byte {
-        params.min_fee_ref_script_cost_per_byte = v;
+    if let Some(v) = &update.min_fee_ref_script_cost_per_byte {
+        params.min_fee_ref_script_cost_per_byte = v.clone();
     }
     if let Some(v) = update.drep_deposit {
         params.drep_deposit = v;

@@ -56,14 +56,13 @@ fn snapshot_format_hash_stability() {
     // This hash was computed from the current LedgerStateSnapshot layout.
     // If this changes, existing snapshot files become unreadable.
     //
-    // Last update: SNAPSHOT_VERSION 21 → 22 (#736, 2026-06-11) — the wire
-    // view now persists `rupd_addrs_rew` (pv≤6 RUPD startStep capture) and
-    // `pending_avvm_return`. Both were previously dropped on load, breaking
-    // byte-exactness across mid-epoch restarts in pv≤6 epochs (~2998 ADA
-    // treasury shortfall at the mainnet replay seam, boundary 337→338).
-    // Pre-existing snapshots are quarantined on load and operators
-    // re-sync (no `serde(default)` migration shim — see SNAPSHOT_VERSION docs).
-    const EXPECTED_HASH: &str = "90b5a01b00b54772b3f24f199c4ae728d1031bc7ff4d5ae1e708aad05c1297a9";
+    // Last update: SNAPSHOT_VERSION 22 → 23 (#766, 2026-06-15) —
+    // `ProtocolParameters::min_fee_ref_script_cost_per_byte` changed from
+    // `u64` to `Rational` (Conway `NonNegativeInterval`), growing the bincode
+    // layout of every embedded `protocol_params` / `prev_protocol_params` by
+    // one `u64` (the denominator). Pre-existing snapshots are quarantined on
+    // load and operators re-sync (no migration shim — see SNAPSHOT_VERSION docs).
+    const EXPECTED_HASH: &str = "3a3218208b4a41e9afd1585c431de3badb9d44a6110ead6df552d6f8f91892f4";
 
     if EXPECTED_HASH == "COMPUTE_ON_FIRST_RUN" {
         panic!(

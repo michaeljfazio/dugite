@@ -443,9 +443,13 @@ fn test_decode_pparams_preview_epoch_1259() {
     assert_eq!(pp.drep_activity, 31, "dRepActivity");
 
     // ── ref script fee ───────────────────────────────────────────────────────
-    // Haskell encodes as rational 15/1; we extract 15.
+    // Haskell encodes as rational 15/1; we preserve the full rational.
     assert_eq!(
-        pp.min_fee_ref_script_cost_per_byte, 15,
+        pp.min_fee_ref_script_cost_per_byte,
+        dugite_primitives::transaction::Rational {
+            numerator: 15,
+            denominator: 1,
+        },
         "minFeeRefScriptCostPerByte"
     );
 

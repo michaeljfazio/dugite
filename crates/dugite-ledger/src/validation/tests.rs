@@ -22,9 +22,9 @@ mod tests {
     use super::super::conway::{calculate_deposits_and_refunds, conway_only_certificate_name};
     use super::super::phase1::extract_reward_credential;
     use super::super::scripts::{
-        calculate_ref_script_tiered_fee, cbor_uint_size, check_script_data_hash, compute_min_fee,
-        compute_script_ref_hash, estimate_value_cbor_size, evaluate_native_script,
-        script_ref_byte_size, MAX_REF_SCRIPT_SIZE_TIER_CAP,
+        calculate_ref_script_tiered_fee, calculate_ref_script_tiered_fee_rational, cbor_uint_size,
+        check_script_data_hash, compute_min_fee, compute_script_ref_hash, estimate_value_cbor_size,
+        evaluate_native_script, script_ref_byte_size, MAX_REF_SCRIPT_SIZE_TIER_CAP,
     };
 
     use dugite_primitives::hash::Hash28;
@@ -3453,6 +3453,53 @@ mod tests {
         // At the tier cap, must not panic and must be a positive finite value.
         let fee_at_cap = calculate_ref_script_tiered_fee(1, MAX_REF_SCRIPT_SIZE_TIER_CAP);
         assert!(fee_at_cap > 0 && fee_at_cap < u64::MAX);
+    }
+
+    /// #766: minFeeRefScriptCostPerByte is a `NonNegativeInterval` (rational),
+    /// not an integer.  Haskell `tierRefScriptFee` carries the full rational
+    /// `baseFeePerByte` through an exact rational accumulator and applies a
+    /// single `floor` at the end.  These cases are hand-derived from that
+    /// formula and pin the rational variant byte-exact.
+    #[test]
+    fn test_ref_script_fee_rational_base_byte_exact() {
+        // den == 1 must reproduce the integer path *exactly* for every size.
+        for &size in &[0u64, 1, 1000, 25_600, 26_600, 51_200, 76_800, 204_800] {
+            assert_eq!(
+                calculate_ref_script_tiered_fee_rational(15, 1, size),
+                calculate_ref_script_tiered_fee(15, size),
+                "den=1 must equal integer path at size {size}"
+            );
+        }
+
+        // Single tier, exact: base 3/2, size 1000 → floor(1000 * 1.5) = 1500.
+        assert_eq!(calculate_ref_script_tiered_fee_rational(3, 2, 1000), 1500);
+
+        // Single tier, floor: base 1/3, size 1000 → floor(1000/3) = 333.
+        assert_eq!(calculate_ref_script_tiered_fee_rational(1, 3, 1000), 333);
+
+        // Two full tiers, exact: base 3/2, size 51200.
+        //   tier0 = 25600 * 1.5            = 38400
+        //   tier1 = 25600 * 1.5 * 6/5      = 46080
+        //   total = 84480  (= 844_800 / 10, matching the base-15 fixture)
+        assert_eq!(
+            calculate_ref_script_tiered_fee_rational(3, 2, 51_200),
+            84_480
+        );
+        assert_eq!(
+            calculate_ref_script_tiered_fee_rational(3, 2, 51_200),
+            calculate_ref_script_tiered_fee(15, 51_200) / 10
+        );
+
+        // Two tiers with a fractional accumulator AND a fractional base.
+        // base 1/7, size 30001 = tier0(25600) + tier1(4401):
+        //   numerator-only sum S = 25600 + floor-free(4401*6/5)
+        //     = 25600 + 26406/5 = 30881 + 1/5  (acc_whole=30881, frac=1/5)
+        //   fee = floor(S / 7) = floor(154406 / 35) = floor(4411.6…) = 4411
+        assert_eq!(calculate_ref_script_tiered_fee_rational(1, 7, 30_001), 4411);
+
+        // Degenerate guards: zero numerator or zero denominator → 0 fee.
+        assert_eq!(calculate_ref_script_tiered_fee_rational(0, 1, 100_000), 0);
+        assert_eq!(calculate_ref_script_tiered_fee_rational(15, 0, 100_000), 0);
     }
 
     // ===================================================================

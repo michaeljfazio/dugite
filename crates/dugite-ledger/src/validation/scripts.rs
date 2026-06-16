@@ -15,7 +15,7 @@ use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::protocol_params::ProtocolParameters;
 use dugite_primitives::time::SlotNo;
 use dugite_primitives::transaction::{
-    Certificate, GovAction, NativeScript, ScriptRef, Transaction, TransactionInput, Voter,
+    Certificate, GovAction, NativeScript, Rational, ScriptRef, Transaction, TransactionInput, Voter,
 };
 use dugite_primitives::value::Lovelace;
 use tracing::debug;
@@ -263,10 +263,9 @@ pub(crate) fn script_ref_byte_size(script_ref: &ScriptRef) -> u64 {
 /// Conway ledger tiered reference script fee calculation.
 ///
 /// Divides the total script size into 25 KiB tiers, applying a 1.2× multiplier
-/// per tier. The result is the ceiling of the exact rational sum — matching
-/// the Cardano Blueprint spec which states "you should take the ceiling as a
-/// last step" and Haskell's `tierRefScriptFee` which uses `Data.Ratio.Rational`
-/// and `ceiling`.
+/// per tier. The result is the **floor** of the exact rational sum — matching
+/// Haskell `tierRefScriptFee` (`Coin $ floor (acc + toRational n * curTierPrice)`,
+/// a single `floor` applied to the exact `Data.Ratio.Rational` accumulator).
 ///
 /// # Algorithm: scaled-integer accumulation
 ///
@@ -291,7 +290,10 @@ pub(crate) fn script_ref_byte_size(script_ref: &ScriptRef) -> u64 {
 /// 4. Accumulate: `acc_whole += whole`, `frac_scaled += scaled_rem`.
 ///    Drain any whole units from `frac_scaled` into `acc_whole` when
 ///    `frac_scaled >= denom`.
-/// 5. Single ceiling: `fee = acc_whole + (1 if frac_scaled > 0)`.
+/// 5. Single floor: `fee = acc_whole` (the sub-unit `frac_scaled/denom` is
+///    discarded). For a rational base `num/den` the final result is instead
+///    `floor((acc_whole·denom + frac_scaled) / (denom·den))` — see
+///    [`calculate_ref_script_tiered_fee_rational`].
 ///
 /// # Overflow proofs (within the 1 MiB cap)
 ///
@@ -310,7 +312,33 @@ pub(crate) fn script_ref_byte_size(script_ref: &ScriptRef) -> u64 {
 /// short-circuits immediately with `u64::MAX`. Such inputs are already rejected
 /// by the Conway block-body rule before fee calculation is invoked in
 /// production.
+// Integer-base convenience wrapper retained for the fee fixtures (which exercise
+// the byte-exact integer path); production callers use the rational variant.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn calculate_ref_script_tiered_fee(base_fee_per_byte: u64, total_size: u64) -> u64 {
+    // Integer base = the rational base_fee_per_byte/1.
+    calculate_ref_script_tiered_fee_rational(base_fee_per_byte, 1, total_size)
+}
+
+/// Conway tiered reference-script fee with a **rational** per-byte base price.
+///
+/// Mirrors cardano-ledger `tierRefScriptFee multiplier sizeIncrement baseFeePerByte
+/// size` where `baseFeePerByte = unboundRational ppMinFeeRefScriptCostPerByte` is a
+/// full `Rational` carried through an exact rational accumulator, with a **single
+/// `floor`** applied to the final sum (never per-tier).
+///
+/// Byte-exactness: the accumulator builds the exact sum
+/// `S = Σ_i chunk_i · base_num · (6/5)^i` (numerator-only, identical to the
+/// historical integer-base computation), giving `S = acc_whole + frac_scaled/denom`.
+/// The true fee for base `base_num/base_den` is then
+/// `floor(S / base_den) = floor((acc_whole·denom + frac_scaled) / (denom·base_den))`.
+/// For `base_den == 1` this reduces to `acc_whole` — bit-identical to the prior
+/// integer-only result, so every existing fixture is preserved exactly.
+pub(super) fn calculate_ref_script_tiered_fee_rational(
+    base_num: u64,
+    base_den: u64,
+    total_size: u64,
+) -> u64 {
     const TIER_SIZE: u64 = 25_600; // 25 KiB (= 25 * 1024)
 
     // Inputs beyond the Conway 1 MiB block-body limit are rejected before this
@@ -319,9 +347,12 @@ pub(super) fn calculate_ref_script_tiered_fee(base_fee_per_byte: u64, total_size
     if total_size > MAX_REF_SCRIPT_SIZE_TIER_CAP {
         return u64::MAX;
     }
-    if total_size == 0 || base_fee_per_byte == 0 {
+    // A zero base price (num == 0) or zero den (degenerate/never produced by the
+    // decoder, which rejects den == 0) yields no fee.
+    if total_size == 0 || base_num == 0 || base_den == 0 {
         return 0;
     }
+    let base_fee_per_byte = base_num;
 
     // Pre-count tiers: ceil(total_size / TIER_SIZE).
     let k = total_size.div_ceil(TIER_SIZE);
@@ -405,12 +436,31 @@ pub(super) fn calculate_ref_script_tiered_fee(base_fee_per_byte: u64, total_size
         price_den /= g;
     }
 
-    // Haskell's tierRefScriptFee uses floor (truncation), not ceiling.
-    // The accumulation in `acc_whole` already contains only the integer parts;
-    // `frac_scaled` holds the sub-unit remainder which is simply discarded.
-    let total = acc_whole;
+    // Haskell's tierRefScriptFee applies a single `floor` to the final sum.
+    // The accumulator holds the exact value S = acc_whole + frac_scaled/denom
+    // for the *numerator-only* base price.  The true fee for base price
+    // base_num/base_den is floor(S / base_den):
+    //   floor((acc_whole·denom + frac_scaled) / (denom·base_den)).
+    let total = if base_den == 1 {
+        // frac_scaled < denom, so floor(S) == acc_whole.  Bit-identical to the
+        // historical integer-base result; no extra arithmetic on the hot path.
+        acc_whole
+    } else {
+        let numer = match acc_whole
+            .checked_mul(denom)
+            .and_then(|x| x.checked_add(frac_scaled))
+        {
+            Some(v) => v,
+            None => return u64::MAX,
+        };
+        let den = match denom.checked_mul(base_den as u128) {
+            Some(v) => v,
+            None => return u64::MAX,
+        };
+        numer / den // exact floor division
+    };
     // Saturate to u64::MAX if the fee exceeds u64 range (only possible for
-    // unrealistically large base_fee_per_byte values).
+    // unrealistically large base prices).
     u64::try_from(total).unwrap_or(u64::MAX)
 }
 
@@ -1084,11 +1134,15 @@ pub(super) fn ref_script_fee(
     inputs: &[TransactionInput],
     reference_inputs: &[TransactionInput],
     utxo_set: &dyn UtxoLookup,
-    min_fee_ref_script_cost_per_byte: u64,
+    min_fee_ref_script_cost_per_byte: &Rational,
 ) -> u64 {
     let size = calculate_ref_script_size(inputs, reference_inputs, utxo_set);
     if size > 0 {
-        calculate_ref_script_tiered_fee(min_fee_ref_script_cost_per_byte, size)
+        calculate_ref_script_tiered_fee_rational(
+            min_fee_ref_script_cost_per_byte.numerator,
+            min_fee_ref_script_cost_per_byte.denominator,
+            size,
+        )
     } else {
         0
     }
@@ -1205,7 +1259,7 @@ pub(super) fn compute_min_fee(
             &tx.body.inputs,
             &tx.body.reference_inputs,
             utxo_set,
-            params.min_fee_ref_script_cost_per_byte,
+            &params.min_fee_ref_script_cost_per_byte,
         )
     } else {
         0
@@ -1718,7 +1772,10 @@ mod tests {
 
         let mut params = ProtocolParameters::mainnet_defaults();
         params.protocol_version_major = 7; // Babbage
-        params.min_fee_ref_script_cost_per_byte = 15;
+        params.min_fee_ref_script_cost_per_byte = Rational {
+            numerator: 15,
+            denominator: 1,
+        };
 
         let tx_size: u64 = 200;
         let fee = compute_min_fee(&tx, &utxo_set, &params, tx_size);
@@ -1751,7 +1808,10 @@ mod tests {
 
         let mut params = ProtocolParameters::mainnet_defaults();
         params.protocol_version_major = 9; // Conway
-        params.min_fee_ref_script_cost_per_byte = 15;
+        params.min_fee_ref_script_cost_per_byte = Rational {
+            numerator: 15,
+            denominator: 1,
+        };
 
         let tx_size: u64 = 200;
         let fee = compute_min_fee(&tx, &utxo_set, &params, tx_size);
@@ -1846,7 +1906,10 @@ mod tests {
         params.min_fee_a = 44;
         params.min_fee_b = 155_381;
         params.protocol_version_major = 7;
-        params.min_fee_ref_script_cost_per_byte = 15;
+        params.min_fee_ref_script_cost_per_byte = Rational {
+            numerator: 15,
+            denominator: 1,
+        };
         params.execution_costs.mem_price.numerator = 577;
         params.execution_costs.mem_price.denominator = 10_000;
         params.execution_costs.step_price.numerator = 721;
