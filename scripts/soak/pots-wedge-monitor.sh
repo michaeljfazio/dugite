@@ -17,6 +17,11 @@ LOG=/private/tmp/dugite-mainnet-soak-20260615-154625.log
 REPORTS=/Users/michaelfazio/Source/dugite/reports
 WEDGE_STALL=5   # consecutive 60s ticks with no block advance before sampling
                 # (>=5min; tolerates long Alonzo/Babbage snapshot+flush pauses)
+# Match ERROR/FATAL *log-level* lines (anchored on the tracing timestamp so we
+# don't match "ERROR" inside a message), plus panics and REAL divergence
+# signals. Deliberately NOT a bare "diverg" — that matches the benign
+# `chain_diverged=false` field present on every routine ChainSync INFO line.
+ERR_PAT='Z +ERROR |Z +FATAL |panicked|chain_diverged=true|reserves mismatch|treasury mismatch|unable to store'
 
 era_for() { # epoch -> era name (mainnet)
   local e=$1
@@ -83,11 +88,10 @@ while true; do
   #      a resolved error never re-alerts; reports each new occurrence once) ----
   cur_size=$(stat -f%z "$LOG" 2>/dev/null || echo "$last_size")
   if [ "$cur_size" -gt "$last_size" ]; then
-    new_err=$(tail -c "+$((last_size + 1))" "$LOG" 2>/dev/null |
-      grep -acE "ERROR|panic|FATAL|diverg|reserves mismatch|treasury mismatch|unable to store")
+    new_err=$(tail -c "+$((last_size + 1))" "$LOG" 2>/dev/null | grep -acE "$ERR_PAT")
     if [ "${new_err:-0}" -gt 0 ]; then
       first=$(tail -c "+$((last_size + 1))" "$LOG" 2>/dev/null |
-        grep -aE "ERROR|panic|FATAL|diverg" | head -1 | cut -c1-200)
+        grep -aE "$ERR_PAT" | head -1 | cut -c1-200)
       echo "NEW ERRORS (${new_err}) at ep${ep}: ${first}"
     fi
   fi
