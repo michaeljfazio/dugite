@@ -1129,8 +1129,13 @@ impl ChainDB {
         // Remove only the flushed canonical blocks from VolatileDB.
         // We do NOT remove by slot because fork blocks at the same slots must
         // survive until they are naturally garbage-collected.
+        //
+        // Deferred WAL reclamation (see `remove_flushed_blocks`): the flushed
+        // blocks are ancestors of the new immutable tip, so leaving their stale
+        // WAL entries to be reclaimed by slack-gated compaction is byte-safe —
+        // crash recovery prunes them via `prune_unreachable_from` at open time.
         let flushed_hashes: Vec<Hash32> = to_finalize.iter().map(|(_, h, _, _)| *h).collect();
-        self.volatile.remove_blocks_by_hashes(&flushed_hashes);
+        self.volatile.remove_flushed_blocks(&flushed_hashes);
 
         debug!(
             flushed = count,
@@ -1223,7 +1228,7 @@ impl ChainDB {
         }
 
         let flushed_hashes: Vec<Hash32> = to_finalize.iter().map(|(_, h, _, _)| *h).collect();
-        self.volatile.remove_blocks_by_hashes(&flushed_hashes);
+        self.volatile.remove_flushed_blocks(&flushed_hashes);
 
         debug!(
             flushed = count,

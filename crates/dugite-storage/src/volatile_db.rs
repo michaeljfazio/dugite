@@ -1107,7 +1107,68 @@ impl VolatileDB {
     ///
     /// After removal the WAL is rewritten (if enabled) with the surviving
     /// entries.
+    ///
+    /// Use this for removals where the removed blocks are NOT guaranteed to be
+    /// ancestors of the immutable tip (rollback, LoE trim, prune-unreachable):
+    /// crash recovery cannot reconstruct the post-removal set by pruning, so
+    /// the WAL must be made durable immediately.  For the hot volatile→immutable
+    /// flush path use [`remove_flushed_blocks`], which defers the rewrite.
     pub fn remove_blocks_by_hashes(&mut self, hashes: &[Hash32]) {
+        self.remove_blocks_in_memory(hashes);
+
+        // Rewrite WAL with remaining entries (upgrades legacy format)
+        if let Some(ref mut wal) = self.wal {
+            let remaining: Vec<(u64, u64, Hash32, Hash32, Vec<u8>)> = self
+                .blocks
+                .iter()
+                .map(|(h, b)| (b.slot, b.block_no, *h, b.prev_hash, b.cbor.clone()))
+                .collect();
+            if let Err(e) = wal.rewrite(&remaining) {
+                warn!(error = %e, "WAL: failed to rewrite after canonical flush");
+            }
+        }
+    }
+
+    /// Flush-path block removal that DEFERS WAL reclamation to slack-gated
+    /// compaction instead of rewriting the entire live set on every batch.
+    ///
+    /// The volatile→immutable flush calls this after every ~50-block batch.
+    /// The previous behaviour re-serialised + fsynced the *entire* retain
+    /// window (default 10 000 blocks, hundreds of MiB) under the ChainDB write
+    /// lock on every batch — an O(retain-window) tax that dominated the
+    /// main-thread profile during bulk sync (≈26 % of samples) and parked the
+    /// block-fetch/serve readers across the fsync.
+    ///
+    /// Because the flushed blocks are at or below the immutable tip, they are
+    /// **ancestors** of the anchor that `ChainDB::open` prunes from via
+    /// [`prune_unreachable_from`].  Leaving their stale entries in the WAL is
+    /// therefore byte-safe: a crash-recovery replay restores them, the
+    /// open-time `prune_unreachable_from(immutable_tip)` walks *forward* from
+    /// the anchor and drops every ancestor, reconstructing exactly the set the
+    /// immediate rewrite would have produced.  (It is also strictly *more*
+    /// durable: if the ImmutableDB chunk had not yet been fsynced at crash
+    /// time, the still-present WAL entries are recovered and re-flushed rather
+    /// than lost.)
+    ///
+    /// WAL growth is bounded by [`maybe_compact_wal`] — the same slack-gated,
+    /// amortised-O(1) compaction the append path already uses — so the hot
+    /// flush path becomes an O(batch) in-memory removal with no WAL I/O.
+    ///
+    /// This deferral is ONLY valid for ancestors-of-the-immutable-tip removals.
+    /// Rollback / fork-prune removals must use [`remove_blocks_by_hashes`].
+    pub fn remove_flushed_blocks(&mut self, hashes: &[Hash32]) {
+        self.remove_blocks_in_memory(hashes);
+        // Bound WAL growth without rewriting every batch: compact only once the
+        // accumulated garbage exceeds the slack window above the live-set floor.
+        self.maybe_compact_wal();
+    }
+
+    /// Remove a set of blocks from the in-memory indices only (no WAL I/O).
+    ///
+    /// Shared by [`remove_blocks_by_hashes`] (durable) and
+    /// [`remove_flushed_blocks`] (deferred); the two differ only in how they
+    /// persist the survivors to the WAL.
+    fn remove_blocks_in_memory(&mut self, hashes: &[Hash32]) {
         let hash_set: HashSet<&Hash32> = hashes.iter().collect();
 
         for hash in hashes {
@@ -1138,18 +1199,6 @@ impl VolatileDB {
 
         // Trim flushed blocks from the front of selected_chain
         self.selected_chain.retain(|h| !hash_set.contains(h));
-
-        // Rewrite WAL with remaining entries (upgrades legacy format)
-        if let Some(ref mut wal) = self.wal {
-            let remaining: Vec<(u64, u64, Hash32, Hash32, Vec<u8>)> = self
-                .blocks
-                .iter()
-                .map(|(h, b)| (b.slot, b.block_no, *h, b.prev_hash, b.cbor.clone()))
-                .collect();
-            if let Err(e) = wal.rewrite(&remaining) {
-                warn!(error = %e, "WAL: failed to rewrite after canonical flush");
-            }
-        }
     }
 
     /// Remove all blocks at or below a given slot.
@@ -3787,6 +3836,80 @@ mod tests {
             db2.has_block(&hash),
             "block must survive compact + close + reopen"
         );
+    }
+
+    /// Fix 1 (incremental WAL): the hot flush path (`remove_flushed_blocks`)
+    /// must NOT rewrite/shrink the WAL — the previous unconditional rewrite was
+    /// an O(retain-window) re-serialise+fsync on every batch. Deferral is
+    /// byte-safe because flushed blocks are ancestors of the immutable tip and
+    /// are reconstructed exactly by the open-time `prune_unreachable_from`
+    /// (mirrored here), recovering retained blocks with byte-identical CBOR.
+    #[test]
+    fn remove_flushed_blocks_defers_wal_and_recovers_byte_exact() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path();
+        let wal_path = path.join("volatile-wal.bin");
+
+        // Chain b1<-b2<-...<-b6, each with a distinct CBOR payload.
+        let mk = |i: u64| {
+            let mut hb = [0u8; 32];
+            hb[0..8].copy_from_slice(&i.to_be_bytes());
+            let mut pb = [0u8; 32];
+            if i > 1 {
+                pb[0..8].copy_from_slice(&(i - 1).to_be_bytes());
+            }
+            (Hash32::from_bytes(hb), i * 100, i, Hash32::from_bytes(pb))
+        };
+        let cbor = |i: u64| vec![i as u8; 8 + i as usize];
+
+        let mut db = VolatileDB::open(path).expect("open");
+        for i in 1..=6u64 {
+            let (h, slot, bn, prev) = mk(i);
+            db.add_block(h, slot, bn, prev, cbor(i));
+        }
+        let size_before = std::fs::metadata(&wal_path).unwrap().len();
+
+        // Flush b1..b3 via the deferred path. Anchor (immutable tip) = b3;
+        // retained volatile window = b4, b5, b6.
+        let flushed: Vec<Hash32> = (1..=3u64).map(|i| mk(i).0).collect();
+        db.remove_flushed_blocks(&flushed);
+
+        // In-memory state is correct immediately.
+        assert_eq!(db.len(), 3, "only b4,b5,b6 remain in memory");
+        for i in 1..=3u64 {
+            assert!(!db.has_block(&mk(i).0), "b{i} removed from memory");
+        }
+        for i in 4..=6u64 {
+            assert!(db.has_block(&mk(i).0), "b{i} retained in memory");
+        }
+
+        // DEFERRED: the WAL on disk was not rewritten/shrunk (the whole point —
+        // a regression to the old unconditional rewrite would shrink it here).
+        let size_after = std::fs::metadata(&wal_path).unwrap().len();
+        assert_eq!(
+            size_after, size_before,
+            "deferred flush must not rewrite the WAL on the hot path"
+        );
+
+        // Crash + recovery: reopen replays the (deferred) WAL — all six blocks
+        // come back — then prune unreachable-from-anchor exactly as
+        // ChainDB::open does. The flushed ancestors b1,b2,b3 must be pruned.
+        drop(db);
+        let mut db2 = VolatileDB::open(path).expect("reopen");
+        assert_eq!(db2.len(), 6, "replay restores the full deferred WAL");
+        let anchor = mk(3).0;
+        db2.prune_unreachable_from(&anchor);
+        assert_eq!(db2.len(), 3, "recovery prunes the flushed ancestor blocks");
+        for i in 1..=3u64 {
+            assert!(!db2.has_block(&mk(i).0), "b{i} pruned on recovery");
+        }
+        for i in 4..=6u64 {
+            assert_eq!(
+                db2.get_block_cbor(&mk(i).0).map(|c| c.to_vec()),
+                Some(cbor(i)),
+                "retained b{i} recovers byte-exact CBOR"
+            );
+        }
     }
 
     /// Regression for the 2026-05-29 sync collapse: when the live volatile set
