@@ -2241,6 +2241,11 @@ impl ConnectionLifecycleManager {
                     /// Companion SocketAddr companion cleared in tandem with the
                     /// u64 CAS flag so the governor always sees a consistent view.
                     peer_slot: std::sync::Arc<std::sync::Mutex<Option<SocketAddr>>>,
+                    /// Bumps `dugite_blockfetch_active_peers` +1 for the lifetime of
+                    /// the claim window so the gauge reflects live fetch concurrency
+                    /// (≈1 under the single-fetcher mutex; rises with multi-peer
+                    /// fetch). Decremented on any drop (release / cancel / unwind).
+                    metrics: std::sync::Arc<crate::metrics::NodeMetrics>,
                 }
                 impl Drop for ActiveFetcherGuard {
                     fn drop(&mut self) {
@@ -2258,6 +2263,7 @@ impl ConnectionLifecycleManager {
                                 *guard = None;
                             }
                         }
+                        self.metrics.dec_blockfetch_active_peers();
                     }
                 }
 
@@ -2411,10 +2417,12 @@ impl ConnectionLifecycleManager {
                                     claim_start_ms = Some(now_ms);
                                 }
                             }
+                            metrics_clone.inc_blockfetch_active_peers();
                             let _fetch_guard = ActiveFetcherGuard {
                                 fetcher: active_fetcher.clone(),
                                 id: my_id,
                                 peer_slot: active_fetch_peer.clone(),
+                                metrics: metrics_clone.clone(),
                             };
 
                             // Build the list of headers to fetch from this peer.
@@ -3022,7 +3030,11 @@ impl ConnectionLifecycleManager {
                                 match fetch_result {
                                     Ok(Ok(count)) => {
                                         let fetch_ms = fetch_start.elapsed().as_secs_f64() * 1000.0;
-                                        metrics_clone.record_block_fetch_latency(fetch_ms);
+                                        metrics_clone.record_block_fetch_range_latency(fetch_ms);
+                                        // Live block-download throughput: count the
+                                        // bytes this range delivered (rate = rx B/s).
+                                        metrics_clone
+                                            .inc_blockfetch_rx_bytes(range_abort.seen_bytes() as u64);
                                         // Refresh the average block size for the
                                         // next range's byte-budget sizing.
                                         if let Some(avg) = range_abort.seen_bytes().checked_div(count) {

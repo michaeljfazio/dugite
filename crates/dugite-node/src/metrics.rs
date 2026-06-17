@@ -540,8 +540,22 @@ pub struct NodeMetrics {
     protocol_errors: std::sync::Mutex<HashMap<String, u64>>,
     /// Peer handshake RTT histogram (milliseconds) — cumulative, for Prometheus.
     pub peer_handshake_rtt_ms: Histogram,
-    /// Block fetch latency histogram (milliseconds per block)
-    pub peer_block_fetch_ms: Histogram,
+    /// Block fetch latency histogram (milliseconds **per range request**, NOT
+    /// per block). One `MsgRequestRange` streams a whole batch (up to
+    /// `MAX_BLOCKS_PER_FETCH` blocks / an ~8 MiB byte-budget) on a single
+    /// round-trip, so this observes the per-range wall time. (Previously
+    /// mislabeled `dugite_peer_block_fetch_ms` "per block", which read ~450×
+    /// low on dashboards.)
+    pub peer_block_fetch_range_ms: Histogram,
+    /// Total bytes received over BlockFetch (counter). Sum of per-range
+    /// delivered bytes; divide by scrape interval for live rx bytes/sec. The
+    /// dominant bulk-sync traffic — use to see whether the link is saturated.
+    pub blockfetch_rx_bytes_total: AtomicU64,
+    /// Number of peers currently streaming blocks (gauge). Reads ~1 under the
+    /// single-`active_fetcher` design (`bfcMaxConcurrencyBulkSync=1`); rises to
+    /// the real fetch concurrency once multi-peer parallel fetch is active —
+    /// the headline signal for whether the single-fetcher gate is lifted.
+    pub blockfetch_active_peers: AtomicU64,
     /// Current average RTT across connected peers (milliseconds, gauge).
     /// Updated on each KeepAlive pong from the PeerManager's EWMA values.
     pub peer_rtt_avg_ms: AtomicU64,
@@ -843,7 +857,9 @@ impl NodeMetrics {
             n2c_txs_rejected: AtomicU64::new(0),
             protocol_errors: std::sync::Mutex::new(HashMap::new()),
             peer_handshake_rtt_ms: Histogram::new(),
-            peer_block_fetch_ms: Histogram::new(),
+            peer_block_fetch_range_ms: Histogram::new(),
+            blockfetch_rx_bytes_total: AtomicU64::new(0),
+            blockfetch_active_peers: AtomicU64::new(0),
             peer_rtt_avg_ms: AtomicU64::new(0),
             peer_rtt_min_ms: AtomicU64::new(0),
             peer_rtt_max_ms: AtomicU64::new(0),
@@ -982,9 +998,31 @@ impl NodeMetrics {
         self.peer_handshake_rtt_ms.observe(rtt_ms);
     }
 
-    /// Record a per-block fetch latency observation.
-    pub fn record_block_fetch_latency(&self, ms_per_block: f64) {
-        self.peer_block_fetch_ms.observe(ms_per_block);
+    /// Record a per-**range** fetch latency observation (wall time to stream
+    /// one `MsgRequestRange` batch).
+    pub fn record_block_fetch_range_latency(&self, ms_per_range: f64) {
+        self.peer_block_fetch_range_ms.observe(ms_per_range);
+    }
+
+    /// Add `n` to the cumulative BlockFetch received-bytes counter.
+    pub fn inc_blockfetch_rx_bytes(&self, n: u64) {
+        self.blockfetch_rx_bytes_total
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Mark a peer as having begun streaming blocks (gauge +1).
+    pub fn inc_blockfetch_active_peers(&self) {
+        self.blockfetch_active_peers.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Mark a peer as having stopped streaming blocks (gauge -1, saturating).
+    pub fn dec_blockfetch_active_peers(&self) {
+        // Saturating decrement: never wrap below zero if inc/dec ever skew.
+        let _ =
+            self.blockfetch_active_peers
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(1))
+                });
     }
 
     /// Update the current peer RTT gauges from PeerManager EWMA values.
@@ -1657,10 +1695,21 @@ impl NodeMetrics {
                 "LSM (UTxO store) flush failures observed during Phase A of snapshot save",
                 &self.utxo_flush_failed_total,
             ),
+            (
+                "dugite_blockfetch_rx_bytes_total",
+                "Total bytes received over BlockFetch (rate = live block-download bytes/sec)",
+                &self.blockfetch_rx_bytes_total,
+            ),
         ];
 
         // Gauges (can go up and down)
         let gauges: &[(&str, &str, &AtomicU64)] = &[
+            (
+                "dugite_blockfetch_active_peers",
+                "Peers currently streaming blocks (≈1 under single-fetcher; \
+                 real concurrency once multi-peer fetch is active)",
+                &self.blockfetch_active_peers,
+            ),
             (
                 "dugite_peers_connected",
                 "Number of connected peers",
@@ -2237,9 +2286,10 @@ impl NodeMetrics {
             "dugite_peer_handshake_rtt_ms",
             "Peer handshake round-trip time in milliseconds",
         ));
-        out.push_str(&self.peer_block_fetch_ms.to_prometheus(
-            "dugite_peer_block_fetch_ms",
-            "Per-block fetch latency in milliseconds",
+        out.push_str(&self.peer_block_fetch_range_ms.to_prometheus(
+            "dugite_peer_block_fetch_range_ms",
+            "Per-range BlockFetch latency in milliseconds (one range streams up \
+             to MAX_BLOCKS_PER_FETCH blocks on a single round-trip)",
         ));
 
         // Current peer RTT gauges (from KeepAlive EWMA, not cumulative histogram).
@@ -2997,11 +3047,11 @@ mod tests {
     fn test_prometheus_output_includes_histograms() {
         let metrics = NodeMetrics::new();
         metrics.record_handshake_rtt(50.0);
-        metrics.record_block_fetch_latency(25.0);
+        metrics.record_block_fetch_range_latency(25.0);
 
         let output = metrics.to_prometheus();
         assert!(output.contains("dugite_peer_handshake_rtt_ms_bucket"));
-        assert!(output.contains("dugite_peer_block_fetch_ms_bucket"));
+        assert!(output.contains("dugite_peer_block_fetch_range_ms_bucket"));
         assert!(output.contains("dugite_uptime_seconds"));
     }
 
@@ -3020,12 +3070,30 @@ mod tests {
     #[test]
     fn test_block_fetch_latency_records_to_histogram() {
         let metrics = NodeMetrics::new();
-        metrics.record_block_fetch_latency(25.0);
-        metrics.record_block_fetch_latency(300.0);
+        metrics.record_block_fetch_range_latency(25.0);
+        metrics.record_block_fetch_range_latency(300.0);
         let output = metrics.to_prometheus();
-        assert!(output.contains("dugite_peer_block_fetch_ms_count 2"));
-        assert!(output.contains("peer_block_fetch_ms_bucket{le=\"25\"} 1"));
-        assert!(output.contains("peer_block_fetch_ms_bucket{le=\"500\"} 2"));
+        assert!(output.contains("dugite_peer_block_fetch_range_ms_count 2"));
+        assert!(output.contains("peer_block_fetch_range_ms_bucket{le=\"25\"} 1"));
+        assert!(output.contains("peer_block_fetch_range_ms_bucket{le=\"500\"} 2"));
+    }
+
+    #[test]
+    fn test_blockfetch_rx_bytes_and_active_peers_exposed() {
+        let metrics = NodeMetrics::new();
+        metrics.inc_blockfetch_rx_bytes(4096);
+        metrics.inc_blockfetch_active_peers();
+        metrics.inc_blockfetch_active_peers();
+        metrics.dec_blockfetch_active_peers();
+        let output = metrics.to_prometheus();
+        assert!(output.contains("dugite_blockfetch_rx_bytes_total 4096"));
+        assert!(output.contains("dugite_blockfetch_active_peers 1"));
+        // Saturating decrement never wraps below zero.
+        metrics.dec_blockfetch_active_peers();
+        metrics.dec_blockfetch_active_peers();
+        assert!(metrics
+            .to_prometheus()
+            .contains("dugite_blockfetch_active_peers 0"));
     }
 
     #[test]
