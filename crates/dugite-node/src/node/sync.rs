@@ -4246,15 +4246,17 @@ pub(crate) fn classify_intersect_response(msg: &ChainSyncMessage) -> IntersectOu
 /// swap time and get routed onto this fresh channel by the ingress task. It is
 /// provably NOT a reply to our `MsgFindIntersect` — the caller never pipelines a
 /// request before intersection — so we discard it and re-read, up to
-/// `MAX_STALE_DISCARD`. Beyond that a genuinely broken peer fails fast and falls
+/// `max_stale_discard` (sized to the pipeline window: a demoted prior session
+/// can leave that many responses in flight). Beyond that a genuinely broken
+/// peer fails fast and falls
 /// back to the pre-existing teardown+reconnect. Mirrors Haskell, whose
 /// typed-protocols codec rejects a next-phase message in StIntersect as a
 /// wire-state violation.
 pub(crate) async fn read_intersect_reply(
     channel: &mut MuxChannel,
     peer_addr: SocketAddr,
+    max_stale_discard: u32,
 ) -> Result<Option<CodecPoint>, anyhow::Error> {
-    const MAX_STALE_DISCARD: u32 = 16;
     let mut discarded: u32 = 0;
     loop {
         let response = channel
@@ -4313,20 +4315,16 @@ pub(crate) async fn read_intersect_reply(
             other => match classify_intersect_response(&other) {
                 IntersectOutcome::StaleNextPhase => {
                     discarded += 1;
-                    if discarded > MAX_STALE_DISCARD {
+                    if discarded > max_stale_discard {
                         return Err(anyhow::anyhow!(
                             "ChainSync: {discarded} stale next-phase responses in StIntersect \
-                             from {peer_addr}; giving up (will reconnect)"
+                             from {peer_addr} (bound {max_stale_discard}); giving up (reconnect)"
                         ));
                     }
-                    // NB: do NOT Debug-format `other` here — MsgRollForward
-                    // carries the full header bytes and would flood the log.
-                    warn!(
-                        %peer_addr,
-                        discarded,
-                        "ChainSync: discarding stale next-phase response in StIntersect \
-                         (reused-mux residue)",
-                    );
+                    // Silently discard prior-session residue; the count is logged
+                    // ONCE on recovery (the Found/NotFound arms) to avoid
+                    // per-frame spam — a deeply-pipelined prior session can leave
+                    // up to ~DUGITE_PIPELINE_DEPTH (default 300) frames in flight.
                     // loop re-reads
                 }
                 _ => {
@@ -4930,7 +4928,15 @@ pub async fn chainsync_client_task(
         // INVARIANT: that tolerance is sound ONLY because we do NOT pipeline any
         // request before this read — do not add a pre-intersection
         // MsgRequestNext without revisiting `read_intersect_reply`.
-        read_intersect_reply(channel, peer_addr).await
+        // Bound the stale-residue discard by the pipeline window + margin: a
+        // demoted prior session can leave up to DUGITE_PIPELINE_DEPTH (default
+        // 300) RollForward responses in flight on a reused mux.
+        let max_stale_discard = std::env::var("DUGITE_PIPELINE_DEPTH")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(300)
+            .saturating_add(16);
+        read_intersect_reply(channel, peer_addr, max_stale_discard).await
     }
 
     // Attempt 1: use the known_points we built above.
@@ -6984,7 +6990,7 @@ mod chainsync_task_tests {
             tip_block_number: 10,
         });
         let mut ch = preload_chainsync_channel(vec![stale_roll_forward(), found]);
-        let res = read_intersect_reply(&mut ch, test_addr()).await;
+        let res = read_intersect_reply(&mut ch, test_addr(), 16).await;
         assert!(
             matches!(res, Ok(Some(_))),
             "stale RollForward must be discarded then IntersectFound returned, got {res:?}"
@@ -7002,7 +7008,7 @@ mod chainsync_task_tests {
         });
         let mut ch = preload_chainsync_channel(vec![found]);
         assert!(matches!(
-            read_intersect_reply(&mut ch, test_addr()).await,
+            read_intersect_reply(&mut ch, test_addr(), 16).await,
             Ok(Some(_))
         ));
 
@@ -7013,7 +7019,7 @@ mod chainsync_task_tests {
         });
         let mut ch = preload_chainsync_channel(vec![not_found]);
         assert!(matches!(
-            read_intersect_reply(&mut ch, test_addr()).await,
+            read_intersect_reply(&mut ch, test_addr(), 16).await,
             Ok(None)
         ));
     }
@@ -7036,18 +7042,18 @@ mod chainsync_task_tests {
         });
         let mut ch = preload_chainsync_channel(vec![rb, await_reply, nf]);
         assert!(matches!(
-            read_intersect_reply(&mut ch, test_addr()).await,
+            read_intersect_reply(&mut ch, test_addr(), 16).await,
             Ok(None)
         ));
     }
 
-    /// Beyond MAX_STALE_DISCARD (16) the reader fails fast (→ reconnect), not
-    /// an infinite spin on a genuinely broken peer.
+    /// Beyond `max_stale_discard` (16 here) the reader fails fast (→ reconnect),
+    /// not an infinite spin on a genuinely broken peer.
     #[tokio::test]
     async fn read_intersect_reply_exceeds_stale_bound_errors() {
         let frames: Vec<Vec<u8>> = (0..17).map(|_| stale_roll_forward()).collect();
         let mut ch = preload_chainsync_channel(frames);
-        let res = read_intersect_reply(&mut ch, test_addr()).await;
+        let res = read_intersect_reply(&mut ch, test_addr(), 16).await;
         let err = res.expect_err("17 stale frames must exceed the bound and error");
         assert!(
             format!("{err:?}").contains("giving up"),
@@ -7060,7 +7066,7 @@ mod chainsync_task_tests {
     #[tokio::test]
     async fn read_intersect_reply_genuine_violation_errors_immediately() {
         let mut ch = preload_chainsync_channel(vec![enc(&ChainSyncMessage::MsgDone)]);
-        let res = read_intersect_reply(&mut ch, test_addr()).await;
+        let res = read_intersect_reply(&mut ch, test_addr(), 16).await;
         let err = res.expect_err("MsgDone in StIntersect is a violation");
         assert!(
             format!("{err:?}").contains("unexpected response"),
