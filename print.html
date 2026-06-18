@@ -6806,13 +6806,13 @@ just test-conformance-mithril
 <li>Wiki <a href="https://github.com/michaeljfazio/dugite/wiki/Protocol-Compliance">Protocol Compliance</a> — feature-by-feature compatibility catalogue.</li>
 <li>Wiki <a href="https://github.com/michaeljfazio/dugite/wiki/Known-Issues">Known Issues</a> — open gaps and follow-ups.</li>
 </ul>
-<div style="break-before: page; page-break-before: always;"></div><h1 id="nightly-benchmark-results--2026-06-17"><a class="header" href="#nightly-benchmark-results--2026-06-17">Nightly Benchmark Results — 2026-06-17</a></h1>
-<p>Captured on <strong>2026-06-17</strong> from commit <a href="https://github.com/MichaelJFazio/dugite/commit/3adc379"><code>3adc379</code></a> on <code>main</code> (GitHub Actions <code>ubuntu-latest</code>).</p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="nightly-benchmark-results--2026-06-18"><a class="header" href="#nightly-benchmark-results--2026-06-18">Nightly Benchmark Results — 2026-06-18</a></h1>
+<p>Captured on <strong>2026-06-18</strong> from commit <a href="https://github.com/MichaelJFazio/dugite/commit/bfb5e5e"><code>bfb5e5e</code></a> on <code>main</code> (GitHub Actions <code>ubuntu-latest</code>).</p>
 <blockquote>
 <p><strong>Interactive reports</strong>, including per-benchmark detail pages and historical trend lines, are published at <a href="https://michaeljfazio.github.io/dugite/benchmarks/">https://michaeljfazio.github.io/dugite/benchmarks/</a>. Each section below also links directly to its interactive report.</p>
 </blockquote>
 <blockquote>
-<p>The collapsed <em>Raw measurements</em> blocks contain the filtered <code>cargo bench</code> output (cargo build chatter and ANSI escapes are stripped). Full unfiltered logs are uploaded as the <code>benchmark-results-104</code> workflow artifact.</p>
+<p>The collapsed <em>Raw measurements</em> blocks contain the filtered <code>cargo bench</code> output (cargo build chatter and ANSI escapes are stripped). Full unfiltered logs are uploaded as the <code>benchmark-results-105</code> workflow artifact.</p>
 </blockquote>
 <hr />
 <h2 id="storage-1"><a class="header" href="#storage-1">Storage</a></h2>
@@ -6821,480 +6821,502 @@ just test-conformance-mithril
 <pre><code>Gnuplot not found, using plotters backend
 Benchmarking chaindb/sequential_insert/10k_20kb
 Benchmarking chaindb/sequential_insert/10k_20kb: Warming up for 3.0000 s
-Benchmarking chaindb/sequential_insert/10k_20kb: Collecting 10 samples in estimated 5.1799 s (20 iterations)
+Benchmarking chaindb/sequential_insert/10k_20kb: Collecting 10 samples in estimated 5.7688 s (20 iterations)
 Benchmarking chaindb/sequential_insert/10k_20kb: Analyzing
 chaindb/sequential_insert/10k_20kb
-                        time:   [251.29 ms 258.58 ms 266.11 ms]
+                        time:   [268.65 ms 277.59 ms 287.03 ms]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
 
 Benchmarking chaindb/random_read/by_hash/10000blks
 Benchmarking chaindb/random_read/by_hash/10000blks: Warming up for 3.0000 s
-Benchmarking chaindb/random_read/by_hash/10000blks: Collecting 100 samples in estimated 6.5974 s (20k iterations)
+Benchmarking chaindb/random_read/by_hash/10000blks: Collecting 100 samples in estimated 5.6976 s (15k iterations)
 Benchmarking chaindb/random_read/by_hash/10000blks: Analyzing
 chaindb/random_read/by_hash/10000blks
-                        time:   [326.51 µs 326.77 µs 327.09 µs]
-Found 7 outliers among 100 measurements (7.00%)
-  4 (4.00%) high mild
-  3 (3.00%) high severe
+                        time:   [375.48 µs 376.68 µs 378.14 µs]
+Found 12 outliers among 100 measurements (12.00%)
+  6 (6.00%) high mild
+  6 (6.00%) high severe
 Benchmarking chaindb/random_read/by_hash/100000blks
 Benchmarking chaindb/random_read/by_hash/100000blks: Warming up for 3.0000 s
-Benchmarking chaindb/random_read/by_hash/100000blks: Collecting 100 samples in estimated 6.4193 s (20k iterations)
+Benchmarking chaindb/random_read/by_hash/100000blks: Collecting 100 samples in estimated 5.9928 s (15k iterations)
 Benchmarking chaindb/random_read/by_hash/100000blks: Analyzing
 chaindb/random_read/by_hash/100000blks
-                        time:   [316.44 µs 316.73 µs 317.12 µs]
-Found 10 outliers among 100 measurements (10.00%)
-  4 (4.00%) low mild
-  2 (2.00%) high mild
-  4 (4.00%) high severe
+                        time:   [395.24 µs 397.93 µs 401.36 µs]
+Found 4 outliers among 100 measurements (4.00%)
+  3 (3.00%) high mild
+  1 (1.00%) high severe
 
 Benchmarking chaindb/tip_query
 Benchmarking chaindb/tip_query: Warming up for 3.0000 s
-Benchmarking chaindb/tip_query: Collecting 100 samples in estimated 5.0000 s (16B iterations)
+Benchmarking chaindb/tip_query: Collecting 100 samples in estimated 5.0000 s (14B iterations)
 Benchmarking chaindb/tip_query: Analyzing
-chaindb/tip_query       time:   [311.42 ps 312.16 ps 313.24 ps]
-Found 13 outliers among 100 measurements (13.00%)
-  5 (5.00%) high mild
-  8 (8.00%) high severe
+chaindb/tip_query       time:   [351.70 ps 351.90 ps 352.13 ps]
+Found 12 outliers among 100 measurements (12.00%)
+  6 (6.00%) high mild
+  6 (6.00%) high severe
 
 Benchmarking chaindb/has_block
 Benchmarking chaindb/has_block: Warming up for 3.0000 s
-Benchmarking chaindb/has_block: Collecting 100 samples in estimated 5.1151 s (207k iterations)
+Benchmarking chaindb/has_block: Collecting 100 samples in estimated 5.0679 s (242k iterations)
 Benchmarking chaindb/has_block: Analyzing
-chaindb/has_block       time:   [22.136 µs 22.458 µs 22.793 µs]
+chaindb/has_block       time:   [20.986 µs 21.042 µs 21.101 µs]
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
 
 Benchmarking chaindb/slot_range_100
 Benchmarking chaindb/slot_range_100: Warming up for 3.0000 s
-Benchmarking chaindb/slot_range_100: Collecting 100 samples in estimated 5.0007 s (20M iterations)
+Benchmarking chaindb/slot_range_100: Collecting 100 samples in estimated 5.0010 s (19M iterations)
 Benchmarking chaindb/slot_range_100: Analyzing
-chaindb/slot_range_100  time:   [248.25 ns 248.60 ns 248.97 ns]
-Found 2 outliers among 100 measurements (2.00%)
-  2 (2.00%) high severe
+chaindb/slot_range_100  time:   [261.22 ns 261.49 ns 261.84 ns]
+Found 7 outliers among 100 measurements (7.00%)
+  4 (4.00%) high mild
+  3 (3.00%) high severe
 
 Benchmarking chaindb/flush_to_immutable/k_2160_blocks_20kb/2160
 Benchmarking chaindb/flush_to_immutable/k_2160_blocks_20kb/2160: Warming up for 3.0000 s
-Benchmarking chaindb/flush_to_immutable/k_2160_blocks_20kb/2160: Collecting 10 samples in estimated 5.7820 s (110 iterations)
+Benchmarking chaindb/flush_to_immutable/k_2160_blocks_20kb/2160: Collecting 10 samples in estimated 6.2609 s (110 iterations)
 Benchmarking chaindb/flush_to_immutable/k_2160_blocks_20kb/2160: Analyzing
 chaindb/flush_to_immutable/k_2160_blocks_20kb/2160
-                        time:   [6.7488 ms 6.8442 ms 6.9828 ms]
+                        time:   [7.3715 ms 7.4203 ms 7.4823 ms]
 
 Benchmarking chaindb/profile_comparison/insert_10k_20kb/in_memory
 Benchmarking chaindb/profile_comparison/insert_10k_20kb/in_memory: Warming up for 3.0000 s
-Benchmarking chaindb/profile_comparison/insert_10k_20kb/in_memory: Collecting 10 samples in estimated 7.3109 s (30 iterations)
+Benchmarking chaindb/profile_comparison/insert_10k_20kb/in_memory: Collecting 10 samples in estimated 5.1068 s (20 iterations)
 Benchmarking chaindb/profile_comparison/insert_10k_20kb/in_memory: Analyzing
 chaindb/profile_comparison/insert_10k_20kb/in_memory
-                        time:   [243.41 ms 244.44 ms 245.79 ms]
-Found 1 outliers among 10 measurements (10.00%)
-  1 (10.00%) high severe
+                        time:   [249.24 ms 253.77 ms 259.60 ms]
+Found 2 outliers among 10 measurements (20.00%)
+  2 (20.00%) high severe
 Benchmarking chaindb/profile_comparison/insert_10k_20kb/mmap
 Benchmarking chaindb/profile_comparison/insert_10k_20kb/mmap: Warming up for 3.0000 s
-Benchmarking chaindb/profile_comparison/insert_10k_20kb/mmap: Collecting 10 samples in estimated 7.3806 s (30 iterations)
+Benchmarking chaindb/profile_comparison/insert_10k_20kb/mmap: Collecting 10 samples in estimated 5.1291 s (20 iterations)
 Benchmarking chaindb/profile_comparison/insert_10k_20kb/mmap: Analyzing
 chaindb/profile_comparison/insert_10k_20kb/mmap
-                        time:   [244.45 ms 244.93 ms 245.43 ms]
+                        time:   [256.05 ms 258.53 ms 262.83 ms]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
 Benchmarking chaindb/profile_comparison/read_500/in_memory
 Benchmarking chaindb/profile_comparison/read_500/in_memory: Warming up for 3.0000 s
-Benchmarking chaindb/profile_comparison/read_500/in_memory: Collecting 10 samples in estimated 7.3033 s (30 iterations)
+Benchmarking chaindb/profile_comparison/read_500/in_memory: Collecting 10 samples in estimated 5.1302 s (20 iterations)
 Benchmarking chaindb/profile_comparison/read_500/in_memory: Analyzing
 chaindb/profile_comparison/read_500/in_memory
-                        time:   [33.284 ms 33.547 ms 33.812 ms]
+                        time:   [34.141 ms 34.206 ms 34.286 ms]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
 Benchmarking chaindb/profile_comparison/read_500/mmap
 Benchmarking chaindb/profile_comparison/read_500/mmap: Warming up for 3.0000 s
-Benchmarking chaindb/profile_comparison/read_500/mmap: Collecting 10 samples in estimated 7.3496 s (30 iterations)
+Benchmarking chaindb/profile_comparison/read_500/mmap: Collecting 10 samples in estimated 5.2293 s (20 iterations)
 Benchmarking chaindb/profile_comparison/read_500/mmap: Analyzing
 chaindb/profile_comparison/read_500/mmap
-                        time:   [34.052 ms 34.160 ms 34.275 ms]
+                        time:   [34.398 ms 34.562 ms 34.750 ms]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
 
 Benchmarking immutabledb/open/in_memory/10000
 Benchmarking immutabledb/open/in_memory/10000: Warming up for 3.0000 s
-
-Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 8.8s, or reduce sample count to 50.
-Benchmarking immutabledb/open/in_memory/10000: Collecting 100 samples in estimated 8.7949 s (100 iterations)
+Benchmarking immutabledb/open/in_memory/10000: Collecting 100 samples in estimated 6.5826 s (200 iterations)
 Benchmarking immutabledb/open/in_memory/10000: Analyzing
 immutabledb/open/in_memory/10000
-                        time:   [87.991 ms 88.157 ms 88.375 ms]
+                        time:   [32.904 ms 32.958 ms 33.017 ms]
 Found 5 outliers among 100 measurements (5.00%)
-  1 (1.00%) high mild
-  4 (4.00%) high severe
+  4 (4.00%) high mild
+  1 (1.00%) high severe
 Benchmarking immutabledb/open/mmap_cached/10000
 Benchmarking immutabledb/open/mmap_cached/10000: Warming up for 3.0000 s
-Benchmarking immutabledb/open/mmap_cached/10000: Collecting 100 samples in estimated 5.7159 s (30k iterations)
+Benchmarking immutabledb/open/mmap_cached/10000: Collecting 100 samples in estimated 5.1046 s (25k iterations)
 Benchmarking immutabledb/open/mmap_cached/10000: Analyzing
 immutabledb/open/mmap_cached/10000
-                        time:   [188.80 µs 189.00 µs 189.23 µs]
-Found 5 outliers among 100 measurements (5.00%)
+                        time:   [200.59 µs 200.94 µs 201.44 µs]
+Found 7 outliers among 100 measurements (7.00%)
+  2 (2.00%) low mild
   2 (2.00%) high mild
   3 (3.00%) high severe
 Benchmarking immutabledb/open/mmap_cold_rebuild/10000
 Benchmarking immutabledb/open/mmap_cold_rebuild/10000: Warming up for 3.0000 s
-Benchmarking immutabledb/open/mmap_cold_rebuild/10000: Collecting 100 samples in estimated 5.3460 s (1500 iterations)
+Benchmarking immutabledb/open/mmap_cold_rebuild/10000: Collecting 100 samples in estimated 5.0155 s (1700 iterations)
 Benchmarking immutabledb/open/mmap_cold_rebuild/10000: Analyzing
 immutabledb/open/mmap_cold_rebuild/10000
-                        time:   [3.3523 ms 3.5654 ms 3.9328 ms]
-Found 8 outliers among 100 measurements (8.00%)
-  5 (5.00%) high mild
-  3 (3.00%) high severe
+                        time:   [3.0012 ms 3.1561 ms 3.4346 ms]
+Found 11 outliers among 100 measurements (11.00%)
+  1 (1.00%) high mild
+  10 (10.00%) high severe
 Benchmarking immutabledb/open/in_memory/100000
 Benchmarking immutabledb/open/in_memory/100000: Warming up for 3.0000 s
 
-Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 112.0s, or reduce sample count to 10.
-Benchmarking immutabledb/open/in_memory/100000: Collecting 100 samples in estimated 112.00 s (100 iterations)
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 30.2s, or reduce sample count to 10.
+Benchmarking immutabledb/open/in_memory/100000: Collecting 100 samples in estimated 30.197 s (100 iterations)
 Benchmarking immutabledb/open/in_memory/100000: Analyzing
 immutabledb/open/in_memory/100000
-                        time:   [871.78 ms 872.36 ms 873.02 ms]
-Found 7 outliers among 100 measurements (7.00%)
-  5 (5.00%) high mild
-  2 (2.00%) high severe
+                        time:   [270.63 ms 271.90 ms 273.49 ms]
+Found 8 outliers among 100 measurements (8.00%)
+  4 (4.00%) high mild
+  4 (4.00%) high severe
 Benchmarking immutabledb/open/mmap_cached/100000
 Benchmarking immutabledb/open/mmap_cached/100000: Warming up for 3.0000 s
 
-Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 9.6s, enable flat sampling, or reduce sample count to 50.
-Benchmarking immutabledb/open/mmap_cached/100000: Collecting 100 samples in estimated 9.6057 s (5050 iterations)
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 9.9s, enable flat sampling, or reduce sample count to 50.
+Benchmarking immutabledb/open/mmap_cached/100000: Collecting 100 samples in estimated 9.8950 s (5050 iterations)
 Benchmarking immutabledb/open/mmap_cached/100000: Analyzing
 immutabledb/open/mmap_cached/100000
-                        time:   [1.8852 ms 1.8932 ms 1.9025 ms]
+                        time:   [2.0399 ms 2.0570 ms 2.0737 ms]
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) high mild
+  1 (1.00%) high severe
 Benchmarking immutabledb/open/mmap_cold_rebuild/100000
 Benchmarking immutabledb/open/mmap_cold_rebuild/100000: Warming up for 3.0000 s
-Benchmarking immutabledb/open/mmap_cold_rebuild/100000: Collecting 100 samples in estimated 5.4528 s (200 iterations)
+Benchmarking immutabledb/open/mmap_cold_rebuild/100000: Collecting 100 samples in estimated 5.8523 s (200 iterations)
 Benchmarking immutabledb/open/mmap_cold_rebuild/100000: Analyzing
 immutabledb/open/mmap_cold_rebuild/100000
-                        time:   [26.954 ms 27.239 ms 27.647 ms]
-Found 7 outliers among 100 measurements (7.00%)
-  4 (4.00%) high mild
-  3 (3.00%) high severe
+                        time:   [29.003 ms 29.140 ms 29.279 ms]
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
 
 Benchmarking immutabledb/lookup/in_memory/10000
 Benchmarking immutabledb/lookup/in_memory/10000: Warming up for 3.0000 s
-Benchmarking immutabledb/lookup/in_memory/10000: Collecting 100 samples in estimated 5.5213 s (500 iterations)
+Benchmarking immutabledb/lookup/in_memory/10000: Collecting 100 samples in estimated 5.1053 s (400 iterations)
 Benchmarking immutabledb/lookup/in_memory/10000: Analyzing
 immutabledb/lookup/in_memory/10000
-                        time:   [10.975 ms 11.013 ms 11.054 ms]
-Found 2 outliers among 100 measurements (2.00%)
-  1 (1.00%) high mild
-  1 (1.00%) high severe
+                        time:   [12.390 ms 12.454 ms 12.516 ms]
 Benchmarking immutabledb/lookup/mmap/10000
 Benchmarking immutabledb/lookup/mmap/10000: Warming up for 3.0000 s
-Benchmarking immutabledb/lookup/mmap/10000: Collecting 100 samples in estimated 5.4948 s (500 iterations)
+Benchmarking immutabledb/lookup/mmap/10000: Collecting 100 samples in estimated 5.0570 s (400 iterations)
 Benchmarking immutabledb/lookup/mmap/10000: Analyzing
 immutabledb/lookup/mmap/10000
-                        time:   [10.988 ms 11.022 ms 11.056 ms]
+                        time:   [12.483 ms 12.525 ms 12.565 ms]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) low mild
 
 Benchmarking immutabledb/has_block/in_memory
 Benchmarking immutabledb/has_block/in_memory: Warming up for 3.0000 s
-Benchmarking immutabledb/has_block/in_memory: Collecting 100 samples in estimated 5.1768 s (146k iterations)
+Benchmarking immutabledb/has_block/in_memory: Collecting 100 samples in estimated 5.0947 s (162k iterations)
 Benchmarking immutabledb/has_block/in_memory: Analyzing
 immutabledb/has_block/in_memory
-                        time:   [32.922 µs 33.357 µs 33.816 µs]
+                        time:   [31.783 µs 31.913 µs 32.039 µs]
 Benchmarking immutabledb/has_block/mmap
 Benchmarking immutabledb/has_block/mmap: Warming up for 3.0000 s
-Benchmarking immutabledb/has_block/mmap: Collecting 100 samples in estimated 5.1749 s (146k iterations)
+Benchmarking immutabledb/has_block/mmap: Collecting 100 samples in estimated 5.0768 s (162k iterations)
 Benchmarking immutabledb/has_block/mmap: Analyzing
 immutabledb/has_block/mmap
-                        time:   [33.018 µs 33.529 µs 34.095 µs]
-Found 1 outliers among 100 measurements (1.00%)
-  1 (1.00%) high severe
+                        time:   [31.789 µs 31.983 µs 32.233 µs]
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high severe
 
 Benchmarking immutabledb/append/1k_blocks_20kb/in_memory
 Benchmarking immutabledb/append/1k_blocks_20kb/in_memory: Warming up for 3.0000 s
-Benchmarking immutabledb/append/1k_blocks_20kb/in_memory: Collecting 100 samples in estimated 6.1163 s (400 iterations)
+Benchmarking immutabledb/append/1k_blocks_20kb/in_memory: Collecting 100 samples in estimated 6.4671 s (400 iterations)
 Benchmarking immutabledb/append/1k_blocks_20kb/in_memory: Analyzing
 immutabledb/append/1k_blocks_20kb/in_memory
-                        time:   [15.172 ms 15.217 ms 15.265 ms]
-Found 2 outliers among 100 measurements (2.00%)
+                        time:   [16.325 ms 16.449 ms 16.620 ms]
+Found 4 outliers among 100 measurements (4.00%)
   2 (2.00%) high mild
+  2 (2.00%) high severe
 Benchmarking immutabledb/append/1k_blocks_20kb/mmap
 Benchmarking immutabledb/append/1k_blocks_20kb/mmap: Warming up for 3.0000 s
-Benchmarking immutabledb/append/1k_blocks_20kb/mmap: Collecting 100 samples in estimated 6.2956 s (400 iterations)
+Benchmarking immutabledb/append/1k_blocks_20kb/mmap: Collecting 100 samples in estimated 5.1365 s (300 iterations)
 Benchmarking immutabledb/append/1k_blocks_20kb/mmap: Analyzing
 immutabledb/append/1k_blocks_20kb/mmap
-                        time:   [15.537 ms 15.564 ms 15.592 ms]
-Found 5 outliers among 100 measurements (5.00%)
-  5 (5.00%) high mild
+                        time:   [16.856 ms 16.961 ms 17.116 ms]
+Found 13 outliers among 100 measurements (13.00%)
+  4 (4.00%) low mild
+  7 (7.00%) high mild
+  2 (2.00%) high severe
 
 Benchmarking immutabledb/slot_range/range_100/in_memory
 Benchmarking immutabledb/slot_range/range_100/in_memory: Warming up for 3.0000 s
-Benchmarking immutabledb/slot_range/range_100/in_memory: Collecting 100 samples in estimated 6.3913 s (20k iterations)
+Benchmarking immutabledb/slot_range/range_100/in_memory: Collecting 100 samples in estimated 5.3561 s (15k iterations)
 Benchmarking immutabledb/slot_range/range_100/in_memory: Analyzing
 immutabledb/slot_range/range_100/in_memory
-                        time:   [315.81 µs 316.21 µs 316.63 µs]
-Found 17 outliers among 100 measurements (17.00%)
+                        time:   [354.88 µs 355.65 µs 356.56 µs]
+Found 12 outliers among 100 measurements (12.00%)
   7 (7.00%) low severe
-  5 (5.00%) low mild
-  4 (4.00%) high mild
+  3 (3.00%) low mild
+  1 (1.00%) high mild
   1 (1.00%) high severe
 Benchmarking immutabledb/slot_range/range_100/mmap
 Benchmarking immutabledb/slot_range/range_100/mmap: Warming up for 3.0000 s
-Benchmarking immutabledb/slot_range/range_100/mmap: Collecting 100 samples in estimated 6.4646 s (20k iterations)
+Benchmarking immutabledb/slot_range/range_100/mmap: Collecting 100 samples in estimated 5.4051 s (15k iterations)
 Benchmarking immutabledb/slot_range/range_100/mmap: Analyzing
 immutabledb/slot_range/range_100/mmap
-                        time:   [316.09 µs 316.64 µs 317.37 µs]
-Found 17 outliers among 100 measurements (17.00%)
-  6 (6.00%) low severe
-  6 (6.00%) low mild
-  2 (2.00%) high mild
-  3 (3.00%) high severe
+                        time:   [354.62 µs 355.08 µs 355.52 µs]
+Found 19 outliers among 100 measurements (19.00%)
+  10 (10.00%) low severe
+  5 (5.00%) low mild
+  3 (3.00%) high mild
+  1 (1.00%) high severe
 
 Benchmarking block_index/insert/in_memory/10000
 Benchmarking block_index/insert/in_memory/10000: Warming up for 3.0000 s
-Benchmarking block_index/insert/in_memory/10000: Collecting 100 samples in estimated 7.9491 s (10k iterations)
+Benchmarking block_index/insert/in_memory/10000: Collecting 100 samples in estimated 8.2188 s (10k iterations)
 Benchmarking block_index/insert/in_memory/10000: Analyzing
 block_index/insert/in_memory/10000
-                        time:   [793.41 µs 794.83 µs 796.26 µs]
-Found 1 outliers among 100 measurements (1.00%)
-  1 (1.00%) high severe
+                        time:   [771.40 µs 772.07 µs 772.91 µs]
+Found 7 outliers among 100 measurements (7.00%)
+  3 (3.00%) low mild
+  4 (4.00%) high severe
 Benchmarking block_index/insert/mmap/10000
 Benchmarking block_index/insert/mmap/10000: Warming up for 3.0000 s
-Benchmarking block_index/insert/mmap/10000: Collecting 100 samples in estimated 5.5285 s (900 iterations)
+Benchmarking block_index/insert/mmap/10000: Collecting 100 samples in estimated 5.5953 s (900 iterations)
 Benchmarking block_index/insert/mmap/10000: Analyzing
 block_index/insert/mmap/10000
-                        time:   [6.0212 ms 6.0799 ms 6.1554 ms]
-Found 8 outliers among 100 measurements (8.00%)
-  5 (5.00%) high mild
-  3 (3.00%) high severe
+                        time:   [6.2613 ms 6.3501 ms 6.4547 ms]
+Found 12 outliers among 100 measurements (12.00%)
+  12 (12.00%) high severe
 Benchmarking block_index/insert/in_memory/50000
 Benchmarking block_index/insert/in_memory/50000: Warming up for 3.0000 s
-Benchmarking block_index/insert/in_memory/50000: Collecting 100 samples in estimated 5.2702 s (1500 iterations)
+Benchmarking block_index/insert/in_memory/50000: Collecting 100 samples in estimated 5.1152 s (1400 iterations)
 Benchmarking block_index/insert/in_memory/50000: Analyzing
 block_index/insert/in_memory/50000
-                        time:   [3.5515 ms 3.5605 ms 3.5695 ms]
+                        time:   [3.4262 ms 3.4324 ms 3.4413 ms]
+Found 3 outliers among 100 measurements (3.00%)
+  1 (1.00%) high mild
+  2 (2.00%) high severe
 Benchmarking block_index/insert/mmap/50000
 Benchmarking block_index/insert/mmap/50000: Warming up for 3.0000 s
-Benchmarking block_index/insert/mmap/50000: Collecting 100 samples in estimated 7.8056 s (200 iterations)
+Benchmarking block_index/insert/mmap/50000: Collecting 100 samples in estimated 8.3353 s (200 iterations)
 Benchmarking block_index/insert/mmap/50000: Analyzing
 block_index/insert/mmap/50000
-                        time:   [38.899 ms 39.110 ms 39.422 ms]
-Found 10 outliers among 100 measurements (10.00%)
-  5 (5.00%) high mild
+                        time:   [41.477 ms 41.721 ms 42.029 ms]
+Found 8 outliers among 100 measurements (8.00%)
+  3 (3.00%) high mild
   5 (5.00%) high severe
 Benchmarking block_index/insert/in_memory/100000
 Benchmarking block_index/insert/in_memory/100000: Warming up for 3.0000 s
-Benchmarking block_index/insert/in_memory/100000: Collecting 100 samples in estimated 5.3849 s (700 iterations)
+Benchmarking block_index/insert/in_memory/100000: Collecting 100 samples in estimated 5.1678 s (600 iterations)
 Benchmarking block_index/insert/in_memory/100000: Analyzing
 block_index/insert/in_memory/100000
-                        time:   [7.7429 ms 7.8152 ms 7.8929 ms]
-Found 5 outliers among 100 measurements (5.00%)
+                        time:   [7.9070 ms 7.9805 ms 8.0591 ms]
+Found 3 outliers among 100 measurements (3.00%)
   3 (3.00%) high mild
-  2 (2.00%) high severe
 Benchmarking block_index/insert/mmap/100000
 Benchmarking block_index/insert/mmap/100000: Warming up for 3.0000 s
 
-Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 7.8s, or reduce sample count to 60.
-Benchmarking block_index/insert/mmap/100000: Collecting 100 samples in estimated 7.7702 s (100 iterations)
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 8.4s, or reduce sample count to 50.
+Benchmarking block_index/insert/mmap/100000: Collecting 100 samples in estimated 8.4003 s (100 iterations)
 Benchmarking block_index/insert/mmap/100000: Analyzing
 block_index/insert/mmap/100000
-                        time:   [76.746 ms 76.911 ms 77.087 ms]
-Found 6 outliers among 100 measurements (6.00%)
-  4 (4.00%) high mild
-  2 (2.00%) high severe
+                        time:   [82.935 ms 83.093 ms 83.258 ms]
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
 
 Benchmarking block_index/lookup/in_memory/10000
 Benchmarking block_index/lookup/in_memory/10000: Warming up for 3.0000 s
-Benchmarking block_index/lookup/in_memory/10000: Collecting 100 samples in estimated 5.0807 s (273k iterations)
+Benchmarking block_index/lookup/in_memory/10000: Collecting 100 samples in estimated 5.0558 s (298k iterations)
 Benchmarking block_index/lookup/in_memory/10000: Analyzing
 block_index/lookup/in_memory/10000
-                        time:   [18.420 µs 18.458 µs 18.509 µs]
-Found 16 outliers among 100 measurements (16.00%)
-  16 (16.00%) high severe
+                        time:   [17.037 µs 17.059 µs 17.081 µs]
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) high mild
+  1 (1.00%) high severe
 Benchmarking block_index/lookup/mmap/10000
 Benchmarking block_index/lookup/mmap/10000: Warming up for 3.0000 s
-Benchmarking block_index/lookup/mmap/10000: Collecting 100 samples in estimated 5.0566 s (167k iterations)
+Benchmarking block_index/lookup/mmap/10000: Collecting 100 samples in estimated 5.0192 s (187k iterations)
 Benchmarking block_index/lookup/mmap/10000: Analyzing
 block_index/lookup/mmap/10000
-                        time:   [29.368 µs 29.609 µs 29.836 µs]
-Found 1 outliers among 100 measurements (1.00%)
-  1 (1.00%) high mild
+                        time:   [27.020 µs 27.083 µs 27.188 µs]
+Found 9 outliers among 100 measurements (9.00%)
+  4 (4.00%) low mild
+  3 (3.00%) high mild
+  2 (2.00%) high severe
 Benchmarking block_index/lookup/in_memory/50000
 Benchmarking block_index/lookup/in_memory/50000: Warming up for 3.0000 s
-Benchmarking block_index/lookup/in_memory/50000: Collecting 100 samples in estimated 5.0232 s (247k iterations)
+Benchmarking block_index/lookup/in_memory/50000: Collecting 100 samples in estimated 5.0103 s (258k iterations)
 Benchmarking block_index/lookup/in_memory/50000: Analyzing
 block_index/lookup/in_memory/50000
-                        time:   [20.075 µs 20.180 µs 20.380 µs]
-Found 4 outliers among 100 measurements (4.00%)
+                        time:   [19.447 µs 19.478 µs 19.516 µs]
+Found 2 outliers among 100 measurements (2.00%)
   1 (1.00%) high mild
-  3 (3.00%) high severe
+  1 (1.00%) high severe
 Benchmarking block_index/lookup/mmap/50000
 Benchmarking block_index/lookup/mmap/50000: Warming up for 3.0000 s
-Benchmarking block_index/lookup/mmap/50000: Collecting 100 samples in estimated 5.0382 s (242k iterations)
+Benchmarking block_index/lookup/mmap/50000: Collecting 100 samples in estimated 5.0430 s (242k iterations)
 Benchmarking block_index/lookup/mmap/50000: Analyzing
 block_index/lookup/mmap/50000
-                        time:   [20.184 µs 20.319 µs 20.444 µs]
+                        time:   [20.918 µs 20.946 µs 20.972 µs]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
 Benchmarking block_index/lookup/in_memory/100000
 Benchmarking block_index/lookup/in_memory/100000: Warming up for 3.0000 s
-Benchmarking block_index/lookup/in_memory/100000: Collecting 100 samples in estimated 5.0260 s (242k iterations)
+Benchmarking block_index/lookup/in_memory/100000: Collecting 100 samples in estimated 5.0341 s (252k iterations)
 Benchmarking block_index/lookup/in_memory/100000: Analyzing
 block_index/lookup/in_memory/100000
-                        time:   [20.484 µs 20.510 µs 20.538 µs]
-Found 1 outliers among 100 measurements (1.00%)
-  1 (1.00%) high severe
+                        time:   [19.872 µs 19.896 µs 19.920 µs]
+Found 4 outliers among 100 measurements (4.00%)
+  4 (4.00%) high severe
 Benchmarking block_index/lookup/mmap/100000
 Benchmarking block_index/lookup/mmap/100000: Warming up for 3.0000 s
-Benchmarking block_index/lookup/mmap/100000: Collecting 100 samples in estimated 5.0068 s (247k iterations)
+Benchmarking block_index/lookup/mmap/100000: Collecting 100 samples in estimated 5.0407 s (247k iterations)
 Benchmarking block_index/lookup/mmap/100000: Analyzing
 block_index/lookup/mmap/100000
-                        time:   [19.695 µs 19.826 µs 19.947 µs]
+                        time:   [20.475 µs 20.517 µs 20.567 µs]
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) high mild
+  1 (1.00%) high severe
 
 Benchmarking block_index/contains_miss/in_memory
 Benchmarking block_index/contains_miss/in_memory: Warming up for 3.0000 s
-Benchmarking block_index/contains_miss/in_memory: Collecting 100 samples in estimated 5.0449 s (399k iterations)
+Benchmarking block_index/contains_miss/in_memory: Collecting 100 samples in estimated 5.0150 s (419k iterations)
 Benchmarking block_index/contains_miss/in_memory: Analyzing
 block_index/contains_miss/in_memory
-                        time:   [12.511 µs 12.530 µs 12.555 µs]
-Found 7 outliers among 100 measurements (7.00%)
+                        time:   [11.972 µs 11.979 µs 11.986 µs]
+Found 3 outliers among 100 measurements (3.00%)
   1 (1.00%) high mild
-  6 (6.00%) high severe
+  2 (2.00%) high severe
 Benchmarking block_index/contains_miss/mmap
 Benchmarking block_index/contains_miss/mmap: Warming up for 3.0000 s
-Benchmarking block_index/contains_miss/mmap: Collecting 100 samples in estimated 5.1516 s (131k iterations)
+Benchmarking block_index/contains_miss/mmap: Collecting 100 samples in estimated 5.1550 s (126k iterations)
 Benchmarking block_index/contains_miss/mmap: Analyzing
 block_index/contains_miss/mmap
-                        time:   [41.331 µs 41.970 µs 42.582 µs]
+                        time:   [40.102 µs 40.224 µs 40.353 µs]
 
 Benchmarking scaling/block_index_insert/in_memory/10000
 Benchmarking scaling/block_index_insert/in_memory/10000: Warming up for 3.0000 s
-Benchmarking scaling/block_index_insert/in_memory/10000: Collecting 10 samples in estimated 5.0367 s (6380 iterations)
+Benchmarking scaling/block_index_insert/in_memory/10000: Collecting 10 samples in estimated 5.0344 s (6600 iterations)
 Benchmarking scaling/block_index_insert/in_memory/10000: Analyzing
 scaling/block_index_insert/in_memory/10000
-                        time:   [790.99 µs 792.30 µs 794.61 µs]
+                        time:   [763.80 µs 768.69 µs 775.11 µs]
+Found 2 outliers among 10 measurements (20.00%)
+  2 (20.00%) high severe
 Benchmarking scaling/block_index_insert/mmap/10000
 Benchmarking scaling/block_index_insert/mmap/10000: Warming up for 3.0000 s
-Benchmarking scaling/block_index_insert/mmap/10000: Collecting 10 samples in estimated 5.2646 s (825 iterations)
+Benchmarking scaling/block_index_insert/mmap/10000: Collecting 10 samples in estimated 5.0753 s (825 iterations)
 Benchmarking scaling/block_index_insert/mmap/10000: Analyzing
 scaling/block_index_insert/mmap/10000
-                        time:   [6.0454 ms 6.1100 ms 6.2038 ms]
+                        time:   [6.1878 ms 6.3045 ms 6.4554 ms]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
 Benchmarking scaling/block_index_insert/in_memory/50000
 Benchmarking scaling/block_index_insert/in_memory/50000: Warming up for 3.0000 s
-Benchmarking scaling/block_index_insert/in_memory/50000: Collecting 10 samples in estimated 5.1581 s (1430 iterations)
+Benchmarking scaling/block_index_insert/in_memory/50000: Collecting 10 samples in estimated 5.0521 s (1485 iterations)
 Benchmarking scaling/block_index_insert/in_memory/50000: Analyzing
 scaling/block_index_insert/in_memory/50000
-                        time:   [3.6049 ms 3.6106 ms 3.6225 ms]
+                        time:   [3.3601 ms 3.3684 ms 3.3783 ms]
 Found 2 outliers among 10 measurements (20.00%)
-  1 (10.00%) low severe
   1 (10.00%) high mild
+  1 (10.00%) high severe
 Benchmarking scaling/block_index_insert/mmap/50000
 Benchmarking scaling/block_index_insert/mmap/50000: Warming up for 3.0000 s
-Benchmarking scaling/block_index_insert/mmap/50000: Collecting 10 samples in estimated 6.4362 s (165 iterations)
+Benchmarking scaling/block_index_insert/mmap/50000: Collecting 10 samples in estimated 6.8290 s (165 iterations)
 Benchmarking scaling/block_index_insert/mmap/50000: Analyzing
 scaling/block_index_insert/mmap/50000
-                        time:   [38.756 ms 38.840 ms 38.990 ms]
+                        time:   [41.425 ms 41.948 ms 42.712 ms]
 Found 1 outliers among 10 measurements (10.00%)
   1 (10.00%) high severe
 Benchmarking scaling/block_index_insert/in_memory/100000
 Benchmarking scaling/block_index_insert/in_memory/100000: Warming up for 3.0000 s
-Benchmarking scaling/block_index_insert/in_memory/100000: Collecting 10 samples in estimated 5.1129 s (660 iterations)
+Benchmarking scaling/block_index_insert/in_memory/100000: Collecting 10 samples in estimated 5.2823 s (770 iterations)
 Benchmarking scaling/block_index_insert/in_memory/100000: Analyzing
 scaling/block_index_insert/in_memory/100000
-                        time:   [7.7694 ms 7.8272 ms 7.8831 ms]
+                        time:   [6.8361 ms 6.8988 ms 6.9501 ms]
 Found 1 outliers among 10 measurements (10.00%)
   1 (10.00%) high mild
 Benchmarking scaling/block_index_insert/mmap/100000
 Benchmarking scaling/block_index_insert/mmap/100000: Warming up for 3.0000 s
-Benchmarking scaling/block_index_insert/mmap/100000: Collecting 10 samples in estimated 8.4176 s (110 iterations)
+Benchmarking scaling/block_index_insert/mmap/100000: Collecting 10 samples in estimated 9.0312 s (110 iterations)
 Benchmarking scaling/block_index_insert/mmap/100000: Analyzing
 scaling/block_index_insert/mmap/100000
-                        time:   [76.656 ms 77.045 ms 77.402 ms]
+                        time:   [82.298 ms 82.480 ms 82.777 ms]
 
 Benchmarking scaling/block_index_lookup/in_memory/10000
 Benchmarking scaling/block_index_lookup/in_memory/10000: Warming up for 3.0000 s
-Benchmarking scaling/block_index_lookup/in_memory/10000: Collecting 10 samples in estimated 5.0007 s (273k iterations)
+Benchmarking scaling/block_index_lookup/in_memory/10000: Collecting 10 samples in estimated 5.0004 s (291k iterations)
 Benchmarking scaling/block_index_lookup/in_memory/10000: Analyzing
 scaling/block_index_lookup/in_memory/10000
-                        time:   [18.614 µs 18.625 µs 18.642 µs]
-Found 2 outliers among 10 measurements (20.00%)
-  1 (10.00%) low severe
-  1 (10.00%) high mild
+                        time:   [16.989 µs 17.111 µs 17.347 µs]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
 Benchmarking scaling/block_index_lookup/mmap/10000
 Benchmarking scaling/block_index_lookup/mmap/10000: Warming up for 3.0000 s
-Benchmarking scaling/block_index_lookup/mmap/10000: Collecting 10 samples in estimated 5.0016 s (173k iterations)
+Benchmarking scaling/block_index_lookup/mmap/10000: Collecting 10 samples in estimated 5.0008 s (185k iterations)
 Benchmarking scaling/block_index_lookup/mmap/10000: Analyzing
 scaling/block_index_lookup/mmap/10000
-                        time:   [30.340 µs 30.375 µs 30.405 µs]
+                        time:   [26.824 µs 26.971 µs 27.179 µs]
 Found 1 outliers among 10 measurements (10.00%)
-  1 (10.00%) low severe
+  1 (10.00%) high severe
 Benchmarking scaling/block_index_lookup/in_memory/50000
 Benchmarking scaling/block_index_lookup/in_memory/50000: Warming up for 3.0000 s
-Benchmarking scaling/block_index_lookup/in_memory/50000: Collecting 10 samples in estimated 5.0004 s (251k iterations)
+Benchmarking scaling/block_index_lookup/in_memory/50000: Collecting 10 samples in estimated 5.0009 s (278k iterations)
 Benchmarking scaling/block_index_lookup/in_memory/50000: Analyzing
 scaling/block_index_lookup/in_memory/50000
-                        time:   [20.254 µs 20.262 µs 20.269 µs]
+                        time:   [17.642 µs 17.664 µs 17.707 µs]
 Found 2 outliers among 10 measurements (20.00%)
-  1 (10.00%) low severe
-  1 (10.00%) high mild
+  2 (20.00%) high severe
 Benchmarking scaling/block_index_lookup/mmap/50000
 Benchmarking scaling/block_index_lookup/mmap/50000: Warming up for 3.0000 s
-Benchmarking scaling/block_index_lookup/mmap/50000: Collecting 10 samples in estimated 5.0002 s (247k iterations)
+Benchmarking scaling/block_index_lookup/mmap/50000: Collecting 10 samples in estimated 5.0005 s (240k iterations)
 Benchmarking scaling/block_index_lookup/mmap/50000: Analyzing
 scaling/block_index_lookup/mmap/50000
-                        time:   [20.757 µs 20.764 µs 20.768 µs]
-Found 2 outliers among 10 measurements (20.00%)
-  1 (10.00%) low severe
-  1 (10.00%) high severe
+                        time:   [20.813 µs 20.855 µs 20.881 µs]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) low mild
 Benchmarking scaling/block_index_lookup/in_memory/100000
 Benchmarking scaling/block_index_lookup/in_memory/100000: Warming up for 3.0000 s
-Benchmarking scaling/block_index_lookup/in_memory/100000: Collecting 10 samples in estimated 5.0002 s (244k iterations)
+Benchmarking scaling/block_index_lookup/in_memory/100000: Collecting 10 samples in estimated 5.0001 s (279k iterations)
 Benchmarking scaling/block_index_lookup/in_memory/100000: Analyzing
 scaling/block_index_lookup/in_memory/100000
-                        time:   [20.817 µs 20.822 µs 20.824 µs]
+                        time:   [17.727 µs 17.731 µs 17.735 µs]
 Found 1 outliers among 10 measurements (10.00%)
-  1 (10.00%) low severe
+  1 (10.00%) high severe
 Benchmarking scaling/block_index_lookup/mmap/100000
 Benchmarking scaling/block_index_lookup/mmap/100000: Warming up for 3.0000 s
-Benchmarking scaling/block_index_lookup/mmap/100000: Collecting 10 samples in estimated 5.0000 s (252k iterations)
+Benchmarking scaling/block_index_lookup/mmap/100000: Collecting 10 samples in estimated 5.0002 s (245k iterations)
 Benchmarking scaling/block_index_lookup/mmap/100000: Analyzing
 scaling/block_index_lookup/mmap/100000
-                        time:   [20.266 µs 20.414 µs 20.653 µs]
-Found 2 outliers among 10 measurements (20.00%)
-  1 (10.00%) low severe
-  1 (10.00%) high severe
+                        time:   [20.381 µs 20.439 µs 20.515 µs]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
 
 Benchmarking scaling/immutabledb_open/in_memory/10000
 Benchmarking scaling/immutabledb_open/in_memory/10000: Warming up for 3.0000 s
-
-Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 5.1s or enable flat sampling.
-Benchmarking scaling/immutabledb_open/in_memory/10000: Collecting 10 samples in estimated 5.1348 s (55 iterations)
+Benchmarking scaling/immutabledb_open/in_memory/10000: Collecting 10 samples in estimated 5.5728 s (165 iterations)
 Benchmarking scaling/immutabledb_open/in_memory/10000: Analyzing
 scaling/immutabledb_open/in_memory/10000
-                        time:   [93.119 ms 93.341 ms 93.569 ms]
+                        time:   [33.696 ms 34.294 ms 35.333 ms]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
 Benchmarking scaling/immutabledb_open/mmap_cached/10000
 Benchmarking scaling/immutabledb_open/mmap_cached/10000: Warming up for 3.0000 s
-Benchmarking scaling/immutabledb_open/mmap_cached/10000: Collecting 10 samples in estimated 5.0023 s (27k iterations)
+Benchmarking scaling/immutabledb_open/mmap_cached/10000: Collecting 10 samples in estimated 5.0089 s (24k iterations)
 Benchmarking scaling/immutabledb_open/mmap_cached/10000: Analyzing
 scaling/immutabledb_open/mmap_cached/10000
-                        time:   [186.75 µs 186.87 µs 187.06 µs]
-Found 2 outliers among 10 measurements (20.00%)
-  2 (20.00%) high mild
+                        time:   [200.93 µs 201.52 µs 202.24 µs]
 Benchmarking scaling/immutabledb_open/in_memory/50000
 Benchmarking scaling/immutabledb_open/in_memory/50000: Warming up for 3.0000 s
-Benchmarking scaling/immutabledb_open/in_memory/50000: Collecting 10 samples in estimated 8.8858 s (20 iterations)
+
+Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 7.9s or enable flat sampling.
+Benchmarking scaling/immutabledb_open/in_memory/50000: Collecting 10 samples in estimated 7.9394 s (55 iterations)
 Benchmarking scaling/immutabledb_open/in_memory/50000: Analyzing
 scaling/immutabledb_open/in_memory/50000
-                        time:   [442.48 ms 442.88 ms 443.27 ms]
+                        time:   [143.66 ms 143.91 ms 144.15 ms]
 Benchmarking scaling/immutabledb_open/mmap_cached/50000
 Benchmarking scaling/immutabledb_open/mmap_cached/50000: Warming up for 3.0000 s
-Benchmarking scaling/immutabledb_open/mmap_cached/50000: Collecting 10 samples in estimated 5.0317 s (6160 iterations)
+Benchmarking scaling/immutabledb_open/mmap_cached/50000: Collecting 10 samples in estimated 5.0342 s (5830 iterations)
 Benchmarking scaling/immutabledb_open/mmap_cached/50000: Analyzing
 scaling/immutabledb_open/mmap_cached/50000
-                        time:   [812.95 µs 816.70 µs 819.01 µs]
+                        time:   [854.58 µs 858.57 µs 861.07 µs]
 Benchmarking scaling/immutabledb_open/in_memory/100000
 Benchmarking scaling/immutabledb_open/in_memory/100000: Warming up for 3.0000 s
-
-Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 10.8s.
-Benchmarking scaling/immutabledb_open/in_memory/100000: Collecting 10 samples in estimated 10.760 s (10 iterations)
+Benchmarking scaling/immutabledb_open/in_memory/100000: Collecting 10 samples in estimated 6.1372 s (20 iterations)
 Benchmarking scaling/immutabledb_open/in_memory/100000: Analyzing
 scaling/immutabledb_open/in_memory/100000
-                        time:   [869.88 ms 870.82 ms 871.91 ms]
+                        time:   [274.42 ms 274.72 ms 275.04 ms]
 Benchmarking scaling/immutabledb_open/mmap_cached/100000
 Benchmarking scaling/immutabledb_open/mmap_cached/100000: Warming up for 3.0000 s
-Benchmarking scaling/immutabledb_open/mmap_cached/100000: Collecting 10 samples in estimated 5.0230 s (2640 iterations)
+Benchmarking scaling/immutabledb_open/mmap_cached/100000: Collecting 10 samples in estimated 5.0477 s (2585 iterations)
 Benchmarking scaling/immutabledb_open/mmap_cached/100000: Analyzing
 scaling/immutabledb_open/mmap_cached/100000
-                        time:   [1.8940 ms 1.8980 ms 1.9014 ms]
+                        time:   [1.9248 ms 1.9529 ms 1.9666 ms]
+Found 2 outliers among 10 measurements (20.00%)
+  2 (20.00%) low mild
 
 Benchmarking scaling/chaindb_insert/default_20kb/10000
 Benchmarking scaling/chaindb_insert/default_20kb/10000: Warming up for 3.0000 s
-Benchmarking scaling/chaindb_insert/default_20kb/10000: Collecting 10 samples in estimated 7.2702 s (30 iterations)
+Benchmarking scaling/chaindb_insert/default_20kb/10000: Collecting 10 samples in estimated 5.1367 s (20 iterations)
 Benchmarking scaling/chaindb_insert/default_20kb/10000: Analyzing
 scaling/chaindb_insert/default_20kb/10000
-                        time:   [242.72 ms 244.05 ms 246.01 ms]
+                        time:   [253.42 ms 254.10 ms 254.89 ms]
 Found 1 outliers among 10 measurements (10.00%)
-  1 (10.00%) high severe
+  1 (10.00%) high mild
 
 
 </code></pre>
@@ -7306,44 +7328,46 @@ Found 1 outliers among 10 measurements (10.00%)
 Benchmarking utxo_store/insert/default/1000000
 Benchmarking utxo_store/insert/default/1000000: Warming up for 3.0000 s
 
-Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 25.9s.
-Benchmarking utxo_store/insert/default/1000000: Collecting 10 samples in estimated 25.877 s (10 iterations)
+Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 26.4s.
+Benchmarking utxo_store/insert/default/1000000: Collecting 10 samples in estimated 26.387 s (10 iterations)
 Benchmarking utxo_store/insert/default/1000000: Analyzing
 utxo_store/insert/default/1000000
-                        time:   [2.4973 s 2.5231 s 2.5486 s]
+                        time:   [2.5778 s 2.5966 s 2.6198 s]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
 
 Benchmarking utxo_store/lookup/hit/1000000
 Benchmarking utxo_store/lookup/hit/1000000: Warming up for 3.0000 s
-Benchmarking utxo_store/lookup/hit/1000000: Collecting 100 samples in estimated 5.1312 s (15k iterations)
+Benchmarking utxo_store/lookup/hit/1000000: Collecting 100 samples in estimated 5.7965 s (10k iterations)
 Benchmarking utxo_store/lookup/hit/1000000: Analyzing
 utxo_store/lookup/hit/1000000
-                        time:   [328.07 µs 329.57 µs 331.07 µs]
+                        time:   [577.26 µs 579.10 µs 581.06 µs]
 Found 1 outliers among 100 measurements (1.00%)
   1 (1.00%) high severe
 Benchmarking utxo_store/lookup/miss/1000000
 Benchmarking utxo_store/lookup/miss/1000000: Warming up for 3.0000 s
-Benchmarking utxo_store/lookup/miss/1000000: Collecting 100 samples in estimated 5.8192 s (35k iterations)
+Benchmarking utxo_store/lookup/miss/1000000: Collecting 100 samples in estimated 5.2523 s (15k iterations)
 Benchmarking utxo_store/lookup/miss/1000000: Analyzing
 utxo_store/lookup/miss/1000000
-                        time:   [164.10 µs 164.21 µs 164.34 µs]
-Found 9 outliers among 100 measurements (9.00%)
-  7 (7.00%) high mild
-  2 (2.00%) high severe
+                        time:   [345.00 µs 345.78 µs 346.64 µs]
+Found 5 outliers among 100 measurements (5.00%)
+  2 (2.00%) high mild
+  3 (3.00%) high severe
 
 Benchmarking utxo_store/contains/hit
 Benchmarking utxo_store/contains/hit: Warming up for 3.0000 s
-Benchmarking utxo_store/contains/hit: Collecting 100 samples in estimated 6.2149 s (25k iterations)
+Benchmarking utxo_store/contains/hit: Collecting 100 samples in estimated 7.0270 s (15k iterations)
 Benchmarking utxo_store/contains/hit: Analyzing
-utxo_store/contains/hit time:   [245.94 µs 246.49 µs 247.18 µs]
+utxo_store/contains/hit time:   [460.10 µs 461.62 µs 463.63 µs]
 Found 10 outliers among 100 measurements (10.00%)
-  2 (2.00%) high mild
-  8 (8.00%) high severe
+  3 (3.00%) high mild
+  7 (7.00%) high severe
 Benchmarking utxo_store/contains/miss
 Benchmarking utxo_store/contains/miss: Warming up for 3.0000 s
-Benchmarking utxo_store/contains/miss: Collecting 100 samples in estimated 5.0967 s (30k iterations)
+Benchmarking utxo_store/contains/miss: Collecting 100 samples in estimated 5.1505 s (15k iterations)
 Benchmarking utxo_store/contains/miss: Analyzing
 utxo_store/contains/miss
-                        time:   [167.19 µs 167.52 µs 167.85 µs]
+                        time:   [336.87 µs 337.46 µs 338.05 µs]
 Found 4 outliers among 100 measurements (4.00%)
   2 (2.00%) high mild
   2 (2.00%) high severe
@@ -7351,325 +7375,320 @@ Found 4 outliers among 100 measurements (4.00%)
 Benchmarking utxo_store/remove/sequential/1000000
 Benchmarking utxo_store/remove/sequential/1000000: Warming up for 3.0000 s
 
-Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 45.0s.
-Benchmarking utxo_store/remove/sequential/1000000: Collecting 10 samples in estimated 44.998 s (10 iterations)
+Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 50.4s.
+Benchmarking utxo_store/remove/sequential/1000000: Collecting 10 samples in estimated 50.406 s (10 iterations)
 Benchmarking utxo_store/remove/sequential/1000000: Analyzing
 utxo_store/remove/sequential/1000000
-                        time:   [2.3753 s 2.3859 s 2.3971 s]
+                        time:   [2.6635 s 2.6721 s 2.6812 s]
 
 Benchmarking utxo_store/apply_tx/block_50tx_3in_2out
 Benchmarking utxo_store/apply_tx/block_50tx_3in_2out: Warming up for 3.0000 s
 
-Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 24.7s.
-Benchmarking utxo_store/apply_tx/block_50tx_3in_2out: Collecting 10 samples in estimated 24.693 s (10 iterations)
+Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 26.3s.
+Benchmarking utxo_store/apply_tx/block_50tx_3in_2out: Collecting 10 samples in estimated 26.251 s (10 iterations)
 Benchmarking utxo_store/apply_tx/block_50tx_3in_2out: Analyzing
 utxo_store/apply_tx/block_50tx_3in_2out
-                        time:   [334.81 ms 343.29 ms 352.87 ms]
-Found 1 outliers among 10 measurements (10.00%)
-  1 (10.00%) high mild
+                        time:   [298.53 ms 305.00 ms 310.79 ms]
 Benchmarking utxo_store/apply_tx/block_300tx_2in_2out
 Benchmarking utxo_store/apply_tx/block_300tx_2in_2out: Warming up for 3.0000 s
 
-Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 24.5s.
-Benchmarking utxo_store/apply_tx/block_300tx_2in_2out: Collecting 10 samples in estimated 24.474 s (10 iterations)
+Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 25.7s.
+Benchmarking utxo_store/apply_tx/block_300tx_2in_2out: Collecting 10 samples in estimated 25.671 s (10 iterations)
 Benchmarking utxo_store/apply_tx/block_300tx_2in_2out: Analyzing
 utxo_store/apply_tx/block_300tx_2in_2out
-                        time:   [325.15 ms 332.36 ms 343.39 ms]
-Found 1 outliers among 10 measurements (10.00%)
-  1 (10.00%) high severe
+                        time:   [284.33 ms 289.51 ms 295.38 ms]
 
 Benchmarking utxo_store/multi_asset/insert_mixed_30pct/1000000
 Benchmarking utxo_store/multi_asset/insert_mixed_30pct/1000000: Warming up for 3.0000 s
 
-Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 31.1s.
-Benchmarking utxo_store/multi_asset/insert_mixed_30pct/1000000: Collecting 10 samples in estimated 31.130 s (10 iterations)
+Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 33.4s.
+Benchmarking utxo_store/multi_asset/insert_mixed_30pct/1000000: Collecting 10 samples in estimated 33.448 s (10 iterations)
 Benchmarking utxo_store/multi_asset/insert_mixed_30pct/1000000: Analyzing
 utxo_store/multi_asset/insert_mixed_30pct/1000000
-                        time:   [2.9455 s 2.9579 s 2.9690 s]
+                        time:   [3.3392 s 3.3479 s 3.3558 s]
 Benchmarking utxo_store/multi_asset/lookup_mixed_30pct/1000000
 Benchmarking utxo_store/multi_asset/lookup_mixed_30pct/1000000: Warming up for 3.0000 s
 
-Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 30.1s.
-Benchmarking utxo_store/multi_asset/lookup_mixed_30pct/1000000: Collecting 10 samples in estimated 30.108 s (10 iterations)
+Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 33.9s.
+Benchmarking utxo_store/multi_asset/lookup_mixed_30pct/1000000: Collecting 10 samples in estimated 33.924 s (10 iterations)
 Benchmarking utxo_store/multi_asset/lookup_mixed_30pct/1000000: Analyzing
 utxo_store/multi_asset/lookup_mixed_30pct/1000000
-                        time:   [105.34 ms 112.57 ms 120.07 ms]
+                        time:   [120.45 ms 127.14 ms 133.83 ms]
 
 Benchmarking utxo_store/total_lovelace/scan/1000000
 Benchmarking utxo_store/total_lovelace/scan/1000000: Warming up for 3.0000 s
 
-Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 21.9s, or reduce sample count to 20.
-Benchmarking utxo_store/total_lovelace/scan/1000000: Collecting 100 samples in estimated 21.920 s (100 iterations)
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 28.7s, or reduce sample count to 10.
+Benchmarking utxo_store/total_lovelace/scan/1000000: Collecting 100 samples in estimated 28.711 s (100 iterations)
 Benchmarking utxo_store/total_lovelace/scan/1000000: Analyzing
 utxo_store/total_lovelace/scan/1000000
-                        time:   [222.81 ms 223.96 ms 225.13 ms]
+                        time:   [278.55 ms 280.27 ms 282.00 ms]
 
 Benchmarking utxo_store/rebuild_address_index/rebuild/1000000
 Benchmarking utxo_store/rebuild_address_index/rebuild/1000000: Warming up for 3.0000 s
 
-Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 31.9s.
-Benchmarking utxo_store/rebuild_address_index/rebuild/1000000: Collecting 10 samples in estimated 31.858 s (10 iterations)
+Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 34.4s.
+Benchmarking utxo_store/rebuild_address_index/rebuild/1000000: Collecting 10 samples in estimated 34.435 s (10 iterations)
 Benchmarking utxo_store/rebuild_address_index/rebuild/1000000: Analyzing
 utxo_store/rebuild_address_index/rebuild/1000000
-                        time:   [422.05 ms 427.11 ms 431.90 ms]
+                        time:   [474.00 ms 480.82 ms 488.93 ms]
 
 Benchmarking utxo_store/insert_configs/low_8gb/1000000
 Benchmarking utxo_store/insert_configs/low_8gb/1000000: Warming up for 3.0000 s
 
-Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 24.1s.
-Benchmarking utxo_store/insert_configs/low_8gb/1000000: Collecting 10 samples in estimated 24.058 s (10 iterations)
+Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 25.1s.
+Benchmarking utxo_store/insert_configs/low_8gb/1000000: Collecting 10 samples in estimated 25.135 s (10 iterations)
 Benchmarking utxo_store/insert_configs/low_8gb/1000000: Analyzing
 utxo_store/insert_configs/low_8gb/1000000
-                        time:   [2.3737 s 2.3906 s 2.4086 s]
+                        time:   [2.5119 s 2.5176 s 2.5238 s]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
 Benchmarking utxo_store/insert_configs/mid_16gb/1000000
 Benchmarking utxo_store/insert_configs/mid_16gb/1000000: Warming up for 3.0000 s
 
-Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 24.0s.
-Benchmarking utxo_store/insert_configs/mid_16gb/1000000: Collecting 10 samples in estimated 23.993 s (10 iterations)
+Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 25.2s.
+Benchmarking utxo_store/insert_configs/mid_16gb/1000000: Collecting 10 samples in estimated 25.178 s (10 iterations)
 Benchmarking utxo_store/insert_configs/mid_16gb/1000000: Analyzing
 utxo_store/insert_configs/mid_16gb/1000000
-                        time:   [2.3921 s 2.4040 s 2.4159 s]
+                        time:   [2.5090 s 2.5177 s 2.5275 s]
 Benchmarking utxo_store/insert_configs/high_32gb/1000000
 Benchmarking utxo_store/insert_configs/high_32gb/1000000: Warming up for 3.0000 s
 
-Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 23.8s.
-Benchmarking utxo_store/insert_configs/high_32gb/1000000: Collecting 10 samples in estimated 23.770 s (10 iterations)
+Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 25.3s.
+Benchmarking utxo_store/insert_configs/high_32gb/1000000: Collecting 10 samples in estimated 25.268 s (10 iterations)
 Benchmarking utxo_store/insert_configs/high_32gb/1000000: Analyzing
 utxo_store/insert_configs/high_32gb/1000000
-                        time:   [2.3785 s 2.3859 s 2.3937 s]
+                        time:   [2.5333 s 2.5408 s 2.5492 s]
 Benchmarking utxo_store/insert_configs/high_bloom_16gb/1000000
 Benchmarking utxo_store/insert_configs/high_bloom_16gb/1000000: Warming up for 3.0000 s
 
-Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 23.8s.
-Benchmarking utxo_store/insert_configs/high_bloom_16gb/1000000: Collecting 10 samples in estimated 23.773 s (10 iterations)
+Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 25.1s.
+Benchmarking utxo_store/insert_configs/high_bloom_16gb/1000000: Collecting 10 samples in estimated 25.113 s (10 iterations)
 Benchmarking utxo_store/insert_configs/high_bloom_16gb/1000000: Analyzing
 utxo_store/insert_configs/high_bloom_16gb/1000000
-                        time:   [2.3544 s 2.3720 s 2.3867 s]
+                        time:   [2.5161 s 2.5292 s 2.5418 s]
 Benchmarking utxo_store/insert_configs/legacy_small/1000000
 Benchmarking utxo_store/insert_configs/legacy_small/1000000: Warming up for 3.0000 s
 
-Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 24.0s.
-Benchmarking utxo_store/insert_configs/legacy_small/1000000: Collecting 10 samples in estimated 24.001 s (10 iterations)
+Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 25.1s.
+Benchmarking utxo_store/insert_configs/legacy_small/1000000: Collecting 10 samples in estimated 25.088 s (10 iterations)
 Benchmarking utxo_store/insert_configs/legacy_small/1000000: Analyzing
 utxo_store/insert_configs/legacy_small/1000000
-                        time:   [2.3742 s 2.3838 s 2.3941 s]
+                        time:   [2.5122 s 2.5198 s 2.5274 s]
 
 Benchmarking utxo_store/lookup_configs/low_8gb/1000000
 Benchmarking utxo_store/lookup_configs/low_8gb/1000000: Warming up for 3.0000 s
-Benchmarking utxo_store/lookup_configs/low_8gb/1000000: Collecting 100 samples in estimated 5.3318 s (20k iterations)
+Benchmarking utxo_store/lookup_configs/low_8gb/1000000: Collecting 100 samples in estimated 6.7396 s (15k iterations)
 Benchmarking utxo_store/lookup_configs/low_8gb/1000000: Analyzing
 utxo_store/lookup_configs/low_8gb/1000000
-                        time:   [267.14 µs 269.06 µs 271.04 µs]
-Found 5 outliers among 100 measurements (5.00%)
-  2 (2.00%) high mild
-  3 (3.00%) high severe
+                        time:   [434.07 µs 436.10 µs 438.40 µs]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
 Benchmarking utxo_store/lookup_configs/mid_16gb/1000000
 Benchmarking utxo_store/lookup_configs/mid_16gb/1000000: Warming up for 3.0000 s
-Benchmarking utxo_store/lookup_configs/mid_16gb/1000000: Collecting 100 samples in estimated 5.3325 s (20k iterations)
+Benchmarking utxo_store/lookup_configs/mid_16gb/1000000: Collecting 100 samples in estimated 6.7682 s (15k iterations)
 Benchmarking utxo_store/lookup_configs/mid_16gb/1000000: Analyzing
 utxo_store/lookup_configs/mid_16gb/1000000
-                        time:   [267.64 µs 269.59 µs 271.73 µs]
-Found 6 outliers among 100 measurements (6.00%)
-  4 (4.00%) high mild
-  2 (2.00%) high severe
-Benchmarking utxo_store/lookup_configs/high_32gb/1000000
-Benchmarking utxo_store/lookup_configs/high_32gb/1000000: Warming up for 3.0000 s
-Benchmarking utxo_store/lookup_configs/high_32gb/1000000: Collecting 100 samples in estimated 5.3900 s (20k iterations)
-Benchmarking utxo_store/lookup_configs/high_32gb/1000000: Analyzing
-utxo_store/lookup_configs/high_32gb/1000000
-                        time:   [268.42 µs 270.62 µs 273.05 µs]
+                        time:   [434.96 µs 436.79 µs 438.76 µs]
 Found 2 outliers among 100 measurements (2.00%)
   1 (1.00%) high mild
   1 (1.00%) high severe
+Benchmarking utxo_store/lookup_configs/high_32gb/1000000
+Benchmarking utxo_store/lookup_configs/high_32gb/1000000: Warming up for 3.0000 s
+Benchmarking utxo_store/lookup_configs/high_32gb/1000000: Collecting 100 samples in estimated 6.8235 s (15k iterations)
+Benchmarking utxo_store/lookup_configs/high_32gb/1000000: Analyzing
+utxo_store/lookup_configs/high_32gb/1000000
+                        time:   [438.48 µs 440.42 µs 442.49 µs]
 Benchmarking utxo_store/lookup_configs/high_bloom_16gb/1000000
 Benchmarking utxo_store/lookup_configs/high_bloom_16gb/1000000: Warming up for 3.0000 s
-Benchmarking utxo_store/lookup_configs/high_bloom_16gb/1000000: Collecting 100 samples in estimated 5.3468 s (20k iterations)
+Benchmarking utxo_store/lookup_configs/high_bloom_16gb/1000000: Collecting 100 samples in estimated 6.7606 s (15k iterations)
 Benchmarking utxo_store/lookup_configs/high_bloom_16gb/1000000: Analyzing
 utxo_store/lookup_configs/high_bloom_16gb/1000000
-                        time:   [269.37 µs 271.57 µs 274.07 µs]
-Found 6 outliers among 100 measurements (6.00%)
-  2 (2.00%) high mild
-  4 (4.00%) high severe
+                        time:   [436.04 µs 437.81 µs 439.69 µs]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high severe
 Benchmarking utxo_store/lookup_configs/legacy_small/1000000
 Benchmarking utxo_store/lookup_configs/legacy_small/1000000: Warming up for 3.0000 s
-Benchmarking utxo_store/lookup_configs/legacy_small/1000000: Collecting 100 samples in estimated 5.3221 s (20k iterations)
+Benchmarking utxo_store/lookup_configs/legacy_small/1000000: Collecting 100 samples in estimated 6.7729 s (15k iterations)
 Benchmarking utxo_store/lookup_configs/legacy_small/1000000: Analyzing
 utxo_store/lookup_configs/legacy_small/1000000
-                        time:   [267.57 µs 269.36 µs 271.12 µs]
+                        time:   [436.96 µs 438.75 µs 440.66 µs]
 Found 1 outliers among 100 measurements (1.00%)
-  1 (1.00%) high mild
+  1 (1.00%) high severe
 
 Benchmarking utxo_scaling/insert/default/100000
 Benchmarking utxo_scaling/insert/default/100000: Warming up for 3.0000 s
-Benchmarking utxo_scaling/insert/default/100000: Collecting 10 samples in estimated 5.5314 s (30 iterations)
+Benchmarking utxo_scaling/insert/default/100000: Collecting 10 samples in estimated 6.2540 s (30 iterations)
 Benchmarking utxo_scaling/insert/default/100000: Analyzing
 utxo_scaling/insert/default/100000
-                        time:   [183.53 ms 185.82 ms 188.36 ms]
+                        time:   [207.66 ms 209.14 ms 210.55 ms]
 Found 1 outliers among 10 measurements (10.00%)
-  1 (10.00%) high mild
+  1 (10.00%) low mild
 Benchmarking utxo_scaling/insert/default/500000
 Benchmarking utxo_scaling/insert/default/500000: Warming up for 3.0000 s
 
-Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 10.7s.
-Benchmarking utxo_scaling/insert/default/500000: Collecting 10 samples in estimated 10.673 s (10 iterations)
+Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 11.9s.
+Benchmarking utxo_scaling/insert/default/500000: Collecting 10 samples in estimated 11.903 s (10 iterations)
 Benchmarking utxo_scaling/insert/default/500000: Analyzing
 utxo_scaling/insert/default/500000
-                        time:   [1.0783 s 1.0874 s 1.0964 s]
+                        time:   [1.1663 s 1.1718 s 1.1770 s]
 Benchmarking utxo_scaling/insert/default/1000000
 Benchmarking utxo_scaling/insert/default/1000000: Warming up for 3.0000 s
 
-Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 24.2s.
-Benchmarking utxo_scaling/insert/default/1000000: Collecting 10 samples in estimated 24.196 s (10 iterations)
+Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 25.3s.
+Benchmarking utxo_scaling/insert/default/1000000: Collecting 10 samples in estimated 25.345 s (10 iterations)
 Benchmarking utxo_scaling/insert/default/1000000: Analyzing
 utxo_scaling/insert/default/1000000
-                        time:   [2.3955 s 2.4139 s 2.4374 s]
-Found 1 outliers among 10 measurements (10.00%)
-  1 (10.00%) high mild
+                        time:   [2.5160 s 2.5234 s 2.5314 s]
 
 Benchmarking utxo_scaling/lookup/hit/100000
 Benchmarking utxo_scaling/lookup/hit/100000: Warming up for 3.0000 s
-Benchmarking utxo_scaling/lookup/hit/100000: Collecting 10 samples in estimated 5.0014 s (23k iterations)
+Benchmarking utxo_scaling/lookup/hit/100000: Collecting 10 samples in estimated 5.0002 s (14k iterations)
 Benchmarking utxo_scaling/lookup/hit/100000: Analyzing
 utxo_scaling/lookup/hit/100000
-                        time:   [210.23 µs 210.62 µs 211.27 µs]
-Found 2 outliers among 10 measurements (20.00%)
-  1 (10.00%) high mild
-  1 (10.00%) high severe
+                        time:   [371.61 µs 372.11 µs 372.55 µs]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) low severe
 Benchmarking utxo_scaling/lookup/hit/500000
 Benchmarking utxo_scaling/lookup/hit/500000: Warming up for 3.0000 s
-Benchmarking utxo_scaling/lookup/hit/500000: Collecting 10 samples in estimated 5.0119 s (19k iterations)
+Benchmarking utxo_scaling/lookup/hit/500000: Collecting 10 samples in estimated 5.0161 s (12k iterations)
 Benchmarking utxo_scaling/lookup/hit/500000: Analyzing
 utxo_scaling/lookup/hit/500000
-                        time:   [249.25 µs 250.22 µs 251.70 µs]
+                        time:   [420.60 µs 421.41 µs 422.27 µs]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
 Benchmarking utxo_scaling/lookup/hit/1000000
 Benchmarking utxo_scaling/lookup/hit/1000000: Warming up for 3.0000 s
-Benchmarking utxo_scaling/lookup/hit/1000000: Collecting 10 samples in estimated 5.0084 s (19k iterations)
+Benchmarking utxo_scaling/lookup/hit/1000000: Collecting 10 samples in estimated 5.0111 s (11k iterations)
 Benchmarking utxo_scaling/lookup/hit/1000000: Analyzing
 utxo_scaling/lookup/hit/1000000
-                        time:   [254.81 µs 256.32 µs 259.02 µs]
-Found 1 outliers among 10 measurements (10.00%)
+                        time:   [450.82 µs 453.06 µs 458.20 µs]
+Found 2 outliers among 10 measurements (20.00%)
+  1 (10.00%) low severe
   1 (10.00%) high severe
 
 Benchmarking utxo_scaling/apply_tx/block_50tx_3in_2out/100000
 Benchmarking utxo_scaling/apply_tx/block_50tx_3in_2out/100000: Warming up for 3.0000 s
-Benchmarking utxo_scaling/apply_tx/block_50tx_3in_2out/100000: Collecting 10 samples in estimated 5.5805 s (30 iterations)
+Benchmarking utxo_scaling/apply_tx/block_50tx_3in_2out/100000: Collecting 10 samples in estimated 6.3611 s (30 iterations)
 Benchmarking utxo_scaling/apply_tx/block_50tx_3in_2out/100000: Analyzing
 utxo_scaling/apply_tx/block_50tx_3in_2out/100000
-                        time:   [18.427 ms 20.686 ms 22.923 ms]
+                        time:   [16.873 ms 17.402 ms 18.066 ms]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
 Benchmarking utxo_scaling/apply_tx/block_50tx_3in_2out/500000
 Benchmarking utxo_scaling/apply_tx/block_50tx_3in_2out/500000: Warming up for 3.0000 s
 
-Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 11.3s.
-Benchmarking utxo_scaling/apply_tx/block_50tx_3in_2out/500000: Collecting 10 samples in estimated 11.272 s (10 iterations)
+Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 12.0s.
+Benchmarking utxo_scaling/apply_tx/block_50tx_3in_2out/500000: Collecting 10 samples in estimated 11.958 s (10 iterations)
 Benchmarking utxo_scaling/apply_tx/block_50tx_3in_2out/500000: Analyzing
 utxo_scaling/apply_tx/block_50tx_3in_2out/500000
-                        time:   [128.56 ms 144.96 ms 158.97 ms]
-Found 3 outliers among 10 measurements (30.00%)
-  2 (20.00%) low severe
-  1 (10.00%) high mild
+                        time:   [125.49 ms 127.43 ms 129.47 ms]
 Benchmarking utxo_scaling/apply_tx/block_50tx_3in_2out/1000000
 Benchmarking utxo_scaling/apply_tx/block_50tx_3in_2out/1000000: Warming up for 3.0000 s
 
-Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 24.0s.
-Benchmarking utxo_scaling/apply_tx/block_50tx_3in_2out/1000000: Collecting 10 samples in estimated 24.023 s (10 iterations)
+Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 25.4s.
+Benchmarking utxo_scaling/apply_tx/block_50tx_3in_2out/1000000: Collecting 10 samples in estimated 25.392 s (10 iterations)
 Benchmarking utxo_scaling/apply_tx/block_50tx_3in_2out/1000000: Analyzing
 utxo_scaling/apply_tx/block_50tx_3in_2out/1000000
-                        time:   [322.06 ms 323.87 ms 325.67 ms]
+                        time:   [257.60 ms 261.36 ms 265.03 ms]
 
 Benchmarking utxo_scaling/total_lovelace/scan/100000
 Benchmarking utxo_scaling/total_lovelace/scan/100000: Warming up for 3.0000 s
-Benchmarking utxo_scaling/total_lovelace/scan/100000: Collecting 10 samples in estimated 6.1306 s (275 iterations)
+Benchmarking utxo_scaling/total_lovelace/scan/100000: Collecting 10 samples in estimated 6.0934 s (220 iterations)
 Benchmarking utxo_scaling/total_lovelace/scan/100000: Analyzing
 utxo_scaling/total_lovelace/scan/100000
-                        time:   [22.215 ms 22.353 ms 22.493 ms]
-Found 1 outliers among 10 measurements (10.00%)
-  1 (10.00%) high mild
+                        time:   [27.768 ms 28.378 ms 29.031 ms]
 Benchmarking utxo_scaling/total_lovelace/scan/500000
 Benchmarking utxo_scaling/total_lovelace/scan/500000: Warming up for 3.0000 s
 
-Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 5.9s or enable flat sampling.
-Benchmarking utxo_scaling/total_lovelace/scan/500000: Collecting 10 samples in estimated 5.8963 s (55 iterations)
+Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 8.3s or enable flat sampling.
+Benchmarking utxo_scaling/total_lovelace/scan/500000: Collecting 10 samples in estimated 8.3382 s (55 iterations)
 Benchmarking utxo_scaling/total_lovelace/scan/500000: Analyzing
 utxo_scaling/total_lovelace/scan/500000
-                        time:   [106.80 ms 106.96 ms 107.23 ms]
+                        time:   [148.77 ms 149.08 ms 149.39 ms]
 Found 1 outliers among 10 measurements (10.00%)
-  1 (10.00%) high severe
+  1 (10.00%) low severe
 Benchmarking utxo_scaling/total_lovelace/scan/1000000
 Benchmarking utxo_scaling/total_lovelace/scan/1000000: Warming up for 3.0000 s
-Benchmarking utxo_scaling/total_lovelace/scan/1000000: Collecting 10 samples in estimated 6.7748 s (30 iterations)
+Benchmarking utxo_scaling/total_lovelace/scan/1000000: Collecting 10 samples in estimated 5.7078 s (20 iterations)
 Benchmarking utxo_scaling/total_lovelace/scan/1000000: Analyzing
 utxo_scaling/total_lovelace/scan/1000000
-                        time:   [225.99 ms 227.68 ms 229.84 ms]
-Found 2 outliers among 10 measurements (20.00%)
-  2 (20.00%) high severe
+                        time:   [288.70 ms 291.84 ms 293.77 ms]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) low severe
 
 Benchmarking utxo_large_scale/insert/default/5000000
 Benchmarking utxo_large_scale/insert/default/5000000: Warming up for 3.0000 s
 
-Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 146.7s.
-Benchmarking utxo_large_scale/insert/default/5000000: Collecting 10 samples in estimated 146.70 s (10 iterations)
+Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 156.1s.
+Benchmarking utxo_large_scale/insert/default/5000000: Collecting 10 samples in estimated 156.10 s (10 iterations)
 Benchmarking utxo_large_scale/insert/default/5000000: Analyzing
 utxo_large_scale/insert/default/5000000
-                        time:   [14.714 s 14.788 s 14.864 s]
+                        time:   [15.481 s 15.506 s 15.530 s]
 Benchmarking utxo_large_scale/insert/default/10000000
 Benchmarking utxo_large_scale/insert/default/10000000: Warming up for 3.0000 s
 
-Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 321.6s.
-Benchmarking utxo_large_scale/insert/default/10000000: Collecting 10 samples in estimated 321.60 s (10 iterations)
+Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 341.3s.
+Benchmarking utxo_large_scale/insert/default/10000000: Collecting 10 samples in estimated 341.33 s (10 iterations)
 Benchmarking utxo_large_scale/insert/default/10000000: Analyzing
 utxo_large_scale/insert/default/10000000
-                        time:   [30.535 s 30.582 s 30.630 s]
+                        time:   [32.699 s 33.033 s 33.386 s]
 
 Benchmarking utxo_large_scale/lookup/hit/5000000
 Benchmarking utxo_large_scale/lookup/hit/5000000: Warming up for 3.0000 s
-Benchmarking utxo_large_scale/lookup/hit/5000000: Collecting 10 samples in estimated 5.0575 s (4785 iterations)
+Benchmarking utxo_large_scale/lookup/hit/5000000: Collecting 10 samples in estimated 5.0335 s (3905 iterations)
 Benchmarking utxo_large_scale/lookup/hit/5000000: Analyzing
 utxo_large_scale/lookup/hit/5000000
-                        time:   [1.0444 ms 1.0499 ms 1.0567 ms]
+                        time:   [1.2943 ms 1.2968 ms 1.2997 ms]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) low mild
 Benchmarking utxo_large_scale/lookup/hit/10000000
 Benchmarking utxo_large_scale/lookup/hit/10000000: Warming up for 3.0000 s
-Benchmarking utxo_large_scale/lookup/hit/10000000: Collecting 10 samples in estimated 5.0272 s (3740 iterations)
+Benchmarking utxo_large_scale/lookup/hit/10000000: Collecting 10 samples in estimated 5.0455 s (3190 iterations)
 Benchmarking utxo_large_scale/lookup/hit/10000000: Analyzing
 utxo_large_scale/lookup/hit/10000000
-                        time:   [1.3265 ms 1.3367 ms 1.3437 ms]
+                        time:   [1.5718 ms 1.5790 ms 1.5901 ms]
+Found 2 outliers among 10 measurements (20.00%)
+  1 (10.00%) high mild
+  1 (10.00%) high severe
 
 Benchmarking utxo_large_scale/total_lovelace/scan/5000000
 Benchmarking utxo_large_scale/total_lovelace/scan/5000000: Warming up for 3.0000 s
 
-Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 12.5s.
-Benchmarking utxo_large_scale/total_lovelace/scan/5000000: Collecting 10 samples in estimated 12.464 s (10 iterations)
+Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 16.5s.
+Benchmarking utxo_large_scale/total_lovelace/scan/5000000: Collecting 10 samples in estimated 16.486 s (10 iterations)
 Benchmarking utxo_large_scale/total_lovelace/scan/5000000: Analyzing
 utxo_large_scale/total_lovelace/scan/5000000
-                        time:   [1.2370 s 1.2417 s 1.2491 s]
+                        time:   [1.6343 s 1.6481 s 1.6583 s]
 Found 1 outliers among 10 measurements (10.00%)
-  1 (10.00%) high severe
+  1 (10.00%) low mild
 Benchmarking utxo_large_scale/total_lovelace/scan/10000000
 Benchmarking utxo_large_scale/total_lovelace/scan/10000000: Warming up for 3.0000 s
 
-Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 24.7s.
-Benchmarking utxo_large_scale/total_lovelace/scan/10000000: Collecting 10 samples in estimated 24.731 s (10 iterations)
+Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 32.5s.
+Benchmarking utxo_large_scale/total_lovelace/scan/10000000: Collecting 10 samples in estimated 32.499 s (10 iterations)
 Benchmarking utxo_large_scale/total_lovelace/scan/10000000: Analyzing
 utxo_large_scale/total_lovelace/scan/10000000
-                        time:   [2.4749 s 2.4872 s 2.5006 s]
+                        time:   [3.1859 s 3.2036 s 3.2156 s]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) low severe
 
 Benchmarking ledger/apply_block/apply_only_shelley_50tx
 Benchmarking ledger/apply_block/apply_only_shelley_50tx: Warming up for 3.0000 s
-Benchmarking ledger/apply_block/apply_only_shelley_50tx: Collecting 20 samples in estimated 5.0471 s (16k iterations)
+Benchmarking ledger/apply_block/apply_only_shelley_50tx: Collecting 20 samples in estimated 5.0312 s (13k iterations)
 Benchmarking ledger/apply_block/apply_only_shelley_50tx: Analyzing
 ledger/apply_block/apply_only_shelley_50tx
-                        time:   [304.06 µs 305.35 µs 307.07 µs]
-Found 7 outliers among 20 measurements (35.00%)
-  4 (20.00%) low severe
+                        time:   [377.03 µs 378.02 µs 380.21 µs]
+Found 2 outliers among 20 measurements (10.00%)
   1 (5.00%) high mild
-  2 (10.00%) high severe
+  1 (5.00%) high severe
 Benchmarking ledger/apply_block/validate_all_shelley_50tx
 Benchmarking ledger/apply_block/validate_all_shelley_50tx: Warming up for 3.0000 s
-Benchmarking ledger/apply_block/validate_all_shelley_50tx: Collecting 20 samples in estimated 5.0321 s (14k iterations)
+Benchmarking ledger/apply_block/validate_all_shelley_50tx: Collecting 20 samples in estimated 5.0806 s (12k iterations)
 Benchmarking ledger/apply_block/validate_all_shelley_50tx: Analyzing
 ledger/apply_block/validate_all_shelley_50tx
-                        time:   [346.09 µs 346.80 µs 347.73 µs]
-Found 5 outliers among 20 measurements (25.00%)
-  3 (15.00%) low severe
+                        time:   [427.51 µs 427.86 µs 428.37 µs]
+Found 2 outliers among 20 measurements (10.00%)
   2 (10.00%) high severe
 
 
@@ -7681,227 +7700,231 @@ Found 5 outliers among 20 measurements (25.00%)
 <pre><code>Gnuplot not found, using plotters backend
 Benchmarking network/handshake_encode/n2n_version_data
 Benchmarking network/handshake_encode/n2n_version_data: Warming up for 3.0000 s
-Benchmarking network/handshake_encode/n2n_version_data: Collecting 100 samples in estimated 5.0001 s (162M iterations)
+Benchmarking network/handshake_encode/n2n_version_data: Collecting 100 samples in estimated 5.0001 s (116M iterations)
 Benchmarking network/handshake_encode/n2n_version_data: Analyzing
 network/handshake_encode/n2n_version_data
-                        time:   [29.964 ns 30.287 ns 30.680 ns]
-Found 4 outliers among 100 measurements (4.00%)
-  4 (4.00%) high mild
+                        time:   [43.238 ns 43.265 ns 43.292 ns]
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high severe
 Benchmarking network/handshake_encode/n2c_version_data
 Benchmarking network/handshake_encode/n2c_version_data: Warming up for 3.0000 s
-Benchmarking network/handshake_encode/n2c_version_data: Collecting 100 samples in estimated 5.0001 s (229M iterations)
+Benchmarking network/handshake_encode/n2c_version_data: Collecting 100 samples in estimated 5.0001 s (208M iterations)
 Benchmarking network/handshake_encode/n2c_version_data: Analyzing
 network/handshake_encode/n2c_version_data
-                        time:   [22.023 ns 22.196 ns 22.402 ns]
+                        time:   [23.531 ns 23.607 ns 23.694 ns]
+Found 16 outliers among 100 measurements (16.00%)
+  15 (15.00%) high mild
+  1 (1.00%) high severe
 
 Benchmarking network/chainsync/roll_forward/encode/256
 Benchmarking network/chainsync/roll_forward/encode/256: Warming up for 3.0000 s
-Benchmarking network/chainsync/roll_forward/encode/256: Collecting 100 samples in estimated 5.0002 s (37M iterations)
+Benchmarking network/chainsync/roll_forward/encode/256: Collecting 100 samples in estimated 5.0001 s (36M iterations)
 Benchmarking network/chainsync/roll_forward/encode/256: Analyzing
 network/chainsync/roll_forward/encode/256
-                        time:   [137.56 ns 139.12 ns 140.60 ns]
-                        thrpt:  [2.0601 GiB/s 2.0819 GiB/s 2.1056 GiB/s]
-Found 18 outliers among 100 measurements (18.00%)
-  9 (9.00%) high mild
-  9 (9.00%) high severe
+                        time:   [131.95 ns 133.07 ns 134.49 ns]
+                        thrpt:  [2.1536 GiB/s 2.1766 GiB/s 2.1951 GiB/s]
+Found 7 outliers among 100 measurements (7.00%)
+  4 (4.00%) high mild
+  3 (3.00%) high severe
 Benchmarking network/chainsync/roll_forward/decode/256
 Benchmarking network/chainsync/roll_forward/decode/256: Warming up for 3.0000 s
-Benchmarking network/chainsync/roll_forward/decode/256: Collecting 100 samples in estimated 5.0004 s (63M iterations)
+Benchmarking network/chainsync/roll_forward/decode/256: Collecting 100 samples in estimated 5.0002 s (52M iterations)
 Benchmarking network/chainsync/roll_forward/decode/256: Analyzing
 network/chainsync/roll_forward/decode/256
-                        time:   [79.153 ns 79.202 ns 79.250 ns]
-                        thrpt:  [3.6548 GiB/s 3.6570 GiB/s 3.6593 GiB/s]
-Found 3 outliers among 100 measurements (3.00%)
-  1 (1.00%) low mild
-  2 (2.00%) high severe
+                        time:   [95.357 ns 95.495 ns 95.638 ns]
+                        thrpt:  [3.0285 GiB/s 3.0330 GiB/s 3.0375 GiB/s]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high severe
 Benchmarking network/chainsync/roll_forward/encode/1024
 Benchmarking network/chainsync/roll_forward/encode/1024: Warming up for 3.0000 s
-Benchmarking network/chainsync/roll_forward/encode/1024: Collecting 100 samples in estimated 5.0000 s (38M iterations)
+Benchmarking network/chainsync/roll_forward/encode/1024: Collecting 100 samples in estimated 5.0000 s (32M iterations)
 Benchmarking network/chainsync/roll_forward/encode/1024: Analyzing
 network/chainsync/roll_forward/encode/1024
-                        time:   [129.51 ns 129.55 ns 129.60 ns]
-                        thrpt:  [7.7539 GiB/s 7.7567 GiB/s 7.7595 GiB/s]
-Found 9 outliers among 100 measurements (9.00%)
-  3 (3.00%) low mild
-  2 (2.00%) high mild
-  4 (4.00%) high severe
+                        time:   [155.97 ns 156.09 ns 156.22 ns]
+                        thrpt:  [6.4324 GiB/s 6.4380 GiB/s 6.4429 GiB/s]
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high severe
 Benchmarking network/chainsync/roll_forward/decode/1024
 Benchmarking network/chainsync/roll_forward/decode/1024: Warming up for 3.0000 s
-Benchmarking network/chainsync/roll_forward/decode/1024: Collecting 100 samples in estimated 5.0000 s (60M iterations)
+Benchmarking network/chainsync/roll_forward/decode/1024: Collecting 100 samples in estimated 5.0002 s (48M iterations)
 Benchmarking network/chainsync/roll_forward/decode/1024: Analyzing
 network/chainsync/roll_forward/decode/1024
-                        time:   [84.042 ns 84.159 ns 84.263 ns]
-                        thrpt:  [11.926 GiB/s 11.940 GiB/s 11.957 GiB/s]
+                        time:   [103.10 ns 103.24 ns 103.39 ns]
+                        thrpt:  [9.7195 GiB/s 9.7337 GiB/s 9.7468 GiB/s]
 Found 1 outliers among 100 measurements (1.00%)
   1 (1.00%) high severe
 Benchmarking network/chainsync/roll_forward/encode/4096
 Benchmarking network/chainsync/roll_forward/encode/4096: Warming up for 3.0000 s
-Benchmarking network/chainsync/roll_forward/encode/4096: Collecting 100 samples in estimated 5.0000 s (24M iterations)
+Benchmarking network/chainsync/roll_forward/encode/4096: Collecting 100 samples in estimated 5.0004 s (26M iterations)
 Benchmarking network/chainsync/roll_forward/encode/4096: Analyzing
 network/chainsync/roll_forward/encode/4096
-                        time:   [206.07 ns 206.22 ns 206.41 ns]
-                        thrpt:  [18.730 GiB/s 18.747 GiB/s 18.760 GiB/s]
-Found 6 outliers among 100 measurements (6.00%)
+                        time:   [191.73 ns 191.91 ns 192.10 ns]
+                        thrpt:  [20.124 GiB/s 20.145 GiB/s 20.163 GiB/s]
+Found 4 outliers among 100 measurements (4.00%)
+  1 (1.00%) low mild
   1 (1.00%) high mild
-  5 (5.00%) high severe
+  2 (2.00%) high severe
 Benchmarking network/chainsync/roll_forward/decode/4096
 Benchmarking network/chainsync/roll_forward/decode/4096: Warming up for 3.0000 s
-Benchmarking network/chainsync/roll_forward/decode/4096: Collecting 100 samples in estimated 5.0002 s (36M iterations)
+Benchmarking network/chainsync/roll_forward/decode/4096: Collecting 100 samples in estimated 5.0004 s (26M iterations)
 Benchmarking network/chainsync/roll_forward/decode/4096: Analyzing
 network/chainsync/roll_forward/decode/4096
-                        time:   [137.71 ns 137.80 ns 137.91 ns]
-                        thrpt:  [28.032 GiB/s 28.054 GiB/s 28.073 GiB/s]
-Found 4 outliers among 100 measurements (4.00%)
-  1 (1.00%) high mild
-  3 (3.00%) high severe
+                        time:   [191.71 ns 192.02 ns 192.35 ns]
+                        thrpt:  [20.099 GiB/s 20.133 GiB/s 20.166 GiB/s]
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high severe
 
 Benchmarking network/chainsync/roll_backward/encode
 Benchmarking network/chainsync/roll_backward/encode: Warming up for 3.0000 s
-Benchmarking network/chainsync/roll_backward/encode: Collecting 100 samples in estimated 5.0003 s (29M iterations)
+Benchmarking network/chainsync/roll_backward/encode: Collecting 100 samples in estimated 5.0003 s (30M iterations)
 Benchmarking network/chainsync/roll_backward/encode: Analyzing
 network/chainsync/roll_backward/encode
-                        time:   [175.17 ns 175.31 ns 175.45 ns]
-                        thrpt:  [478.33 MiB/s 478.70 MiB/s 479.08 MiB/s]
-Found 3 outliers among 100 measurements (3.00%)
-  2 (2.00%) high mild
-  1 (1.00%) high severe
+                        time:   [163.51 ns 163.67 ns 163.84 ns]
+                        thrpt:  [512.22 MiB/s 512.76 MiB/s 513.25 MiB/s]
+Found 7 outliers among 100 measurements (7.00%)
+  3 (3.00%) high mild
+  4 (4.00%) high severe
 Benchmarking network/chainsync/roll_backward/decode
 Benchmarking network/chainsync/roll_backward/decode: Warming up for 3.0000 s
-Benchmarking network/chainsync/roll_backward/decode: Collecting 100 samples in estimated 5.0003 s (99M iterations)
+Benchmarking network/chainsync/roll_backward/decode: Collecting 100 samples in estimated 5.0000 s (70M iterations)
 Benchmarking network/chainsync/roll_backward/decode: Analyzing
 network/chainsync/roll_backward/decode
-                        time:   [49.709 ns 50.000 ns 50.323 ns]
-                        thrpt:  [1.6286 GiB/s 1.6391 GiB/s 1.6487 GiB/s]
+                        time:   [70.638 ns 70.902 ns 71.269 ns]
+                        thrpt:  [1.1500 GiB/s 1.1559 GiB/s 1.1602 GiB/s]
 Found 1 outliers among 100 measurements (1.00%)
-  1 (1.00%) high mild
+  1 (1.00%) high severe
 
 Benchmarking network/blockfetch/msg_block/encode/2048
 Benchmarking network/blockfetch/msg_block/encode/2048: Warming up for 3.0000 s
-Benchmarking network/blockfetch/msg_block/encode/2048: Collecting 100 samples in estimated 5.0002 s (53M iterations)
+Benchmarking network/blockfetch/msg_block/encode/2048: Collecting 100 samples in estimated 5.0001 s (45M iterations)
 Benchmarking network/blockfetch/msg_block/encode/2048: Analyzing
 network/blockfetch/msg_block/encode/2048
-                        time:   [94.935 ns 95.005 ns 95.082 ns]
-                        thrpt:  [20.109 GiB/s 20.125 GiB/s 20.140 GiB/s]
-Found 6 outliers among 100 measurements (6.00%)
-  3 (3.00%) high mild
-  3 (3.00%) high severe
+                        time:   [109.61 ns 109.77 ns 109.93 ns]
+                        thrpt:  [17.393 GiB/s 17.418 GiB/s 17.443 GiB/s]
+Found 9 outliers among 100 measurements (9.00%)
+  2 (2.00%) low mild
+  5 (5.00%) high mild
+  2 (2.00%) high severe
 Benchmarking network/blockfetch/msg_block/decode/2048
 Benchmarking network/blockfetch/msg_block/decode/2048: Warming up for 3.0000 s
-Benchmarking network/blockfetch/msg_block/decode/2048: Collecting 100 samples in estimated 5.0003 s (60M iterations)
+Benchmarking network/blockfetch/msg_block/decode/2048: Collecting 100 samples in estimated 5.0000 s (56M iterations)
 Benchmarking network/blockfetch/msg_block/decode/2048: Analyzing
 network/blockfetch/msg_block/decode/2048
-                        time:   [82.490 ns 82.620 ns 82.740 ns]
-                        thrpt:  [23.109 GiB/s 23.142 GiB/s 23.179 GiB/s]
-Found 1 outliers among 100 measurements (1.00%)
-  1 (1.00%) high severe
+                        time:   [89.766 ns 89.835 ns 89.948 ns]
+                        thrpt:  [21.257 GiB/s 21.283 GiB/s 21.300 GiB/s]
+Found 7 outliers among 100 measurements (7.00%)
+  5 (5.00%) high mild
+  2 (2.00%) high severe
 Benchmarking network/blockfetch/msg_block/encode/20480
 Benchmarking network/blockfetch/msg_block/encode/20480: Warming up for 3.0000 s
-Benchmarking network/blockfetch/msg_block/encode/20480: Collecting 100 samples in estimated 5.0005 s (26M iterations)
+Benchmarking network/blockfetch/msg_block/encode/20480: Collecting 100 samples in estimated 5.0017 s (9.8M iterations)
 Benchmarking network/blockfetch/msg_block/encode/20480: Analyzing
 network/blockfetch/msg_block/encode/20480
-                        time:   [193.65 ns 193.85 ns 194.08 ns]
-                        thrpt:  [98.299 GiB/s 98.415 GiB/s 98.519 GiB/s]
-Found 2 outliers among 100 measurements (2.00%)
-  1 (1.00%) high mild
+                        time:   [511.40 ns 511.63 ns 511.84 ns]
+                        thrpt:  [37.273 GiB/s 37.289 GiB/s 37.305 GiB/s]
+Found 4 outliers among 100 measurements (4.00%)
+  3 (3.00%) high mild
   1 (1.00%) high severe
 Benchmarking network/blockfetch/msg_block/decode/20480
 Benchmarking network/blockfetch/msg_block/decode/20480: Warming up for 3.0000 s
-Benchmarking network/blockfetch/msg_block/decode/20480: Collecting 100 samples in estimated 5.0000 s (19M iterations)
+Benchmarking network/blockfetch/msg_block/decode/20480: Collecting 100 samples in estimated 5.0321 s (732k iterations)
 Benchmarking network/blockfetch/msg_block/decode/20480: Analyzing
 network/blockfetch/msg_block/decode/20480
-                        time:   [258.50 ns 258.78 ns 259.04 ns]
-                        thrpt:  [73.649 GiB/s 73.723 GiB/s 73.802 GiB/s]
-Found 1 outliers among 100 measurements (1.00%)
-  1 (1.00%) high severe
+                        time:   [6.8645 µs 6.8665 µs 6.8688 µs]
+                        thrpt:  [2.7775 GiB/s 2.7784 GiB/s 2.7792 GiB/s]
+Found 12 outliers among 100 measurements (12.00%)
+  4 (4.00%) high mild
+  8 (8.00%) high severe
 Benchmarking network/blockfetch/msg_block/encode/90000
 Benchmarking network/blockfetch/msg_block/encode/90000: Warming up for 3.0000 s
-Benchmarking network/blockfetch/msg_block/encode/90000: Collecting 100 samples in estimated 5.0013 s (2.4M iterations)
+Benchmarking network/blockfetch/msg_block/encode/90000: Collecting 100 samples in estimated 5.0019 s (2.4M iterations)
 Benchmarking network/blockfetch/msg_block/encode/90000: Analyzing
 network/blockfetch/msg_block/encode/90000
-                        time:   [2.0557 µs 2.0564 µs 2.0570 µs]
-                        thrpt:  [40.750 GiB/s 40.764 GiB/s 40.778 GiB/s]
-Found 1 outliers among 100 measurements (1.00%)
-  1 (1.00%) high severe
+                        time:   [2.0566 µs 2.0580 µs 2.0596 µs]
+                        thrpt:  [40.699 GiB/s 40.731 GiB/s 40.759 GiB/s]
+Found 3 outliers among 100 measurements (3.00%)
+  1 (1.00%) high mild
+  2 (2.00%) high severe
 Benchmarking network/blockfetch/msg_block/decode/90000
 Benchmarking network/blockfetch/msg_block/decode/90000: Warming up for 3.0000 s
-Benchmarking network/blockfetch/msg_block/decode/90000: Collecting 100 samples in estimated 5.0040 s (2.5M iterations)
+Benchmarking network/blockfetch/msg_block/decode/90000: Collecting 100 samples in estimated 5.0091 s (2.5M iterations)
 Benchmarking network/blockfetch/msg_block/decode/90000: Analyzing
 network/blockfetch/msg_block/decode/90000
-                        time:   [2.0380 µs 2.0385 µs 2.0389 µs]
-                        thrpt:  [41.112 GiB/s 41.122 GiB/s 41.131 GiB/s]
-Found 4 outliers among 100 measurements (4.00%)
+                        time:   [2.0351 µs 2.0364 µs 2.0378 µs]
+                        thrpt:  [41.136 GiB/s 41.164 GiB/s 41.190 GiB/s]
+Found 3 outliers among 100 measurements (3.00%)
   2 (2.00%) high mild
-  2 (2.00%) high severe
+  1 (1.00%) high severe
 
 Benchmarking network/blockfetch/request_range/encode
 Benchmarking network/blockfetch/request_range/encode: Warming up for 3.0000 s
-Benchmarking network/blockfetch/request_range/encode: Collecting 100 samples in estimated 5.0005 s (44M iterations)
+Benchmarking network/blockfetch/request_range/encode: Collecting 100 samples in estimated 5.0003 s (48M iterations)
 Benchmarking network/blockfetch/request_range/encode: Analyzing
 network/blockfetch/request_range/encode
-                        time:   [115.11 ns 115.25 ns 115.39 ns]
-Found 17 outliers among 100 measurements (17.00%)
-  14 (14.00%) low mild
-  3 (3.00%) high severe
+                        time:   [103.82 ns 103.87 ns 103.93 ns]
+Found 12 outliers among 100 measurements (12.00%)
+  1 (1.00%) low mild
+  6 (6.00%) high mild
+  5 (5.00%) high severe
 Benchmarking network/blockfetch/request_range/decode
 Benchmarking network/blockfetch/request_range/decode: Warming up for 3.0000 s
-Benchmarking network/blockfetch/request_range/decode: Collecting 100 samples in estimated 5.0001 s (112M iterations)
+Benchmarking network/blockfetch/request_range/decode: Collecting 100 samples in estimated 5.0003 s (71M iterations)
 Benchmarking network/blockfetch/request_range/decode: Analyzing
 network/blockfetch/request_range/decode
-                        time:   [44.930 ns 45.015 ns 45.095 ns]
-Found 1 outliers among 100 measurements (1.00%)
+                        time:   [69.421 ns 69.802 ns 70.195 ns]
+Found 3 outliers among 100 measurements (3.00%)
+  2 (2.00%) high mild
   1 (1.00%) high severe
 
 Benchmarking network/n2c_query_encode/pparams/hfc_success
 Benchmarking network/n2c_query_encode/pparams/hfc_success: Warming up for 3.0000 s
-Benchmarking network/n2c_query_encode/pparams/hfc_success: Collecting 100 samples in estimated 5.0001 s (80M iterations)
+Benchmarking network/n2c_query_encode/pparams/hfc_success: Collecting 100 samples in estimated 5.0001 s (97M iterations)
 Benchmarking network/n2c_query_encode/pparams/hfc_success: Analyzing
 network/n2c_query_encode/pparams/hfc_success
-                        time:   [62.759 ns 62.791 ns 62.827 ns]
-                        thrpt:  [1.3489 GiB/s 1.3497 GiB/s 1.3504 GiB/s]
-Found 4 outliers among 100 measurements (4.00%)
-  2 (2.00%) high mild
-  2 (2.00%) high severe
+                        time:   [50.298 ns 50.362 ns 50.441 ns]
+                        thrpt:  [1.6802 GiB/s 1.6828 GiB/s 1.6850 GiB/s]
+Found 9 outliers among 100 measurements (9.00%)
+  1 (1.00%) high mild
+  8 (8.00%) high severe
 Benchmarking network/n2c_query_encode/pparams/tag24
 Benchmarking network/n2c_query_encode/pparams/tag24: Warming up for 3.0000 s
-Benchmarking network/n2c_query_encode/pparams/tag24: Collecting 100 samples in estimated 5.0002 s (78M iterations)
+Benchmarking network/n2c_query_encode/pparams/tag24: Collecting 100 samples in estimated 5.0000 s (93M iterations)
 Benchmarking network/n2c_query_encode/pparams/tag24: Analyzing
 network/n2c_query_encode/pparams/tag24
-                        time:   [65.725 ns 66.456 ns 67.143 ns]
-                        thrpt:  [1.2622 GiB/s 1.2753 GiB/s 1.2895 GiB/s]
-Found 20 outliers among 100 measurements (20.00%)
-  20 (20.00%) high severe
+                        time:   [53.771 ns 53.809 ns 53.857 ns]
+                        thrpt:  [1.5736 GiB/s 1.5750 GiB/s 1.5761 GiB/s]
+Found 10 outliers among 100 measurements (10.00%)
+  5 (5.00%) high mild
+  5 (5.00%) high severe
 Benchmarking network/n2c_query_encode/govstate/hfc_success
 Benchmarking network/n2c_query_encode/govstate/hfc_success: Warming up for 3.0000 s
-Benchmarking network/n2c_query_encode/govstate/hfc_success: Collecting 100 samples in estimated 5.0003 s (62M iterations)
+Benchmarking network/n2c_query_encode/govstate/hfc_success: Collecting 100 samples in estimated 5.0000 s (64M iterations)
 Benchmarking network/n2c_query_encode/govstate/hfc_success: Analyzing
 network/n2c_query_encode/govstate/hfc_success
-                        time:   [80.447 ns 80.517 ns 80.611 ns]
-                        thrpt:  [9.0346 GiB/s 9.0452 GiB/s 9.0531 GiB/s]
-Found 5 outliers among 100 measurements (5.00%)
-  1 (1.00%) low mild
-  1 (1.00%) high mild
-  3 (3.00%) high severe
+                        time:   [77.588 ns 77.621 ns 77.657 ns]
+                        thrpt:  [9.3784 GiB/s 9.3827 GiB/s 9.3867 GiB/s]
+Found 6 outliers among 100 measurements (6.00%)
+  4 (4.00%) high mild
+  2 (2.00%) high severe
 Benchmarking network/n2c_query_encode/govstate/tag24
 Benchmarking network/n2c_query_encode/govstate/tag24: Warming up for 3.0000 s
-Benchmarking network/n2c_query_encode/govstate/tag24: Collecting 100 samples in estimated 5.0001 s (61M iterations)
+Benchmarking network/n2c_query_encode/govstate/tag24: Collecting 100 samples in estimated 5.0003 s (55M iterations)
 Benchmarking network/n2c_query_encode/govstate/tag24: Analyzing
 network/n2c_query_encode/govstate/tag24
-                        time:   [81.986 ns 82.073 ns 82.192 ns]
-                        thrpt:  [8.8609 GiB/s 8.8738 GiB/s 8.8832 GiB/s]
-Found 8 outliers among 100 measurements (8.00%)
-  1 (1.00%) low mild
-  3 (3.00%) high mild
-  4 (4.00%) high severe
+                        time:   [90.060 ns 90.113 ns 90.170 ns]
+                        thrpt:  [8.0769 GiB/s 8.0820 GiB/s 8.0868 GiB/s]
+Found 3 outliers among 100 measurements (3.00%)
+  1 (1.00%) high mild
+  2 (2.00%) high severe
 Benchmarking network/n2c_query_encode/era_mismatch
 Benchmarking network/n2c_query_encode/era_mismatch: Warming up for 3.0000 s
-Benchmarking network/n2c_query_encode/era_mismatch: Collecting 100 samples in estimated 5.0001 s (220M iterations)
+Benchmarking network/n2c_query_encode/era_mismatch: Collecting 100 samples in estimated 5.0001 s (211M iterations)
 Benchmarking network/n2c_query_encode/era_mismatch: Analyzing
 network/n2c_query_encode/era_mismatch
-                        time:   [22.436 ns 22.466 ns 22.502 ns]
-                        thrpt:  [32.365 GiB/s 32.418 GiB/s 32.461 GiB/s]
-Found 18 outliers among 100 measurements (18.00%)
-  3 (3.00%) high mild
-  15 (15.00%) high severe
+                        time:   [24.017 ns 24.102 ns 24.183 ns]
+                        thrpt:  [30.116 GiB/s 30.217 GiB/s 30.324 GiB/s]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
 
 
 </code></pre>
@@ -7912,78 +7935,81 @@ Found 18 outliers among 100 measurements (18.00%)
 <pre><code>Gnuplot not found, using plotters backend
 Benchmarking consensus/vrf_leader_check/single/sigma=0.0000247
 Benchmarking consensus/vrf_leader_check/single/sigma=0.0000247: Warming up for 3.0000 s
-Benchmarking consensus/vrf_leader_check/single/sigma=0.0000247: Collecting 100 samples in estimated 5.1563 s (131k iterations)
+Benchmarking consensus/vrf_leader_check/single/sigma=0.0000247: Collecting 100 samples in estimated 5.1236 s (126k iterations)
 Benchmarking consensus/vrf_leader_check/single/sigma=0.0000247: Analyzing
 consensus/vrf_leader_check/single/sigma=0.0000247
-                        time:   [39.678 µs 39.771 µs 39.859 µs]
-Found 29 outliers among 100 measurements (29.00%)
-  12 (12.00%) low mild
-  15 (15.00%) high mild
-  2 (2.00%) high severe
+                        time:   [40.478 µs 40.490 µs 40.503 µs]
+Found 4 outliers among 100 measurements (4.00%)
+  1 (1.00%) high mild
+  3 (3.00%) high severe
 Benchmarking consensus/vrf_leader_check/single/sigma=0.001
 Benchmarking consensus/vrf_leader_check/single/sigma=0.001: Warming up for 3.0000 s
-Benchmarking consensus/vrf_leader_check/single/sigma=0.001: Collecting 100 samples in estimated 5.1621 s (131k iterations)
+Benchmarking consensus/vrf_leader_check/single/sigma=0.001: Collecting 100 samples in estimated 5.1333 s (126k iterations)
 Benchmarking consensus/vrf_leader_check/single/sigma=0.001: Analyzing
 consensus/vrf_leader_check/single/sigma=0.001
-                        time:   [40.000 µs 40.093 µs 40.181 µs]
-Found 33 outliers among 100 measurements (33.00%)
-  15 (15.00%) low mild
-  13 (13.00%) high mild
-  5 (5.00%) high severe
+                        time:   [40.547 µs 40.580 µs 40.629 µs]
+Found 5 outliers among 100 measurements (5.00%)
+  2 (2.00%) high mild
+  3 (3.00%) high severe
 Benchmarking consensus/vrf_leader_check/single/sigma=0.01
 Benchmarking consensus/vrf_leader_check/single/sigma=0.01: Warming up for 3.0000 s
-Benchmarking consensus/vrf_leader_check/single/sigma=0.01: Collecting 100 samples in estimated 5.1592 s (131k iterations)
+Benchmarking consensus/vrf_leader_check/single/sigma=0.01: Collecting 100 samples in estimated 5.1299 s (126k iterations)
 Benchmarking consensus/vrf_leader_check/single/sigma=0.01: Analyzing
 consensus/vrf_leader_check/single/sigma=0.01
-                        time:   [40.056 µs 40.241 µs 40.469 µs]
-Found 16 outliers among 100 measurements (16.00%)
-  6 (6.00%) high mild
-  10 (10.00%) high severe
+                        time:   [40.954 µs 41.204 µs 41.501 µs]
+Found 10 outliers among 100 measurements (10.00%)
+  5 (5.00%) high mild
+  5 (5.00%) high severe
 Benchmarking consensus/vrf_leader_check/batch/21600
 Benchmarking consensus/vrf_leader_check/batch/21600: Warming up for 3.0000 s
 
-Warning: Unable to complete 20 samples in 5.0s. You may wish to increase target time to 16.9s, or reduce sample count to 10.
-Benchmarking consensus/vrf_leader_check/batch/21600: Collecting 20 samples in estimated 16.925 s (20 iterations)
+Warning: Unable to complete 20 samples in 5.0s. You may wish to increase target time to 17.6s, or reduce sample count to 10.
+Benchmarking consensus/vrf_leader_check/batch/21600: Collecting 20 samples in estimated 17.595 s (20 iterations)
 Benchmarking consensus/vrf_leader_check/batch/21600: Analyzing
 consensus/vrf_leader_check/batch/21600
-                        time:   [845.12 ms 845.40 ms 845.69 ms]
-                        thrpt:  [25.541 Kelem/s 25.550 Kelem/s 25.558 Kelem/s]
+                        time:   [878.12 ms 878.76 ms 879.29 ms]
+                        thrpt:  [24.565 Kelem/s 24.580 Kelem/s 24.598 Kelem/s]
+Found 3 outliers among 20 measurements (15.00%)
+  3 (15.00%) low severe
 
 Benchmarking consensus/validate_header/replay_mode
 Benchmarking consensus/validate_header/replay_mode: Warming up for 3.0000 s
-Benchmarking consensus/validate_header/replay_mode: Collecting 100 samples in estimated 5.0001 s (446M iterations)
+Benchmarking consensus/validate_header/replay_mode: Collecting 100 samples in estimated 5.0000 s (444M iterations)
 Benchmarking consensus/validate_header/replay_mode: Analyzing
 consensus/validate_header/replay_mode
-                        time:   [11.207 ns 11.212 ns 11.216 ns]
-Found 5 outliers among 100 measurements (5.00%)
-  1 (1.00%) high mild
+                        time:   [11.262 ns 11.266 ns 11.271 ns]
+Found 8 outliers among 100 measurements (8.00%)
+  4 (4.00%) high mild
   4 (4.00%) high severe
 
 Benchmarking consensus/chain_selection/longer_fork_100
 Benchmarking consensus/chain_selection/longer_fork_100: Warming up for 3.0000 s
-Benchmarking consensus/chain_selection/longer_fork_100: Collecting 100 samples in estimated 5.0000 s (3.2B iterations)
+Benchmarking consensus/chain_selection/longer_fork_100: Collecting 100 samples in estimated 5.0000 s (2.8B iterations)
 Benchmarking consensus/chain_selection/longer_fork_100: Analyzing
 consensus/chain_selection/longer_fork_100
-                        time:   [1.5585 ns 1.5619 ns 1.5663 ns]
-Found 13 outliers among 100 measurements (13.00%)
+                        time:   [1.7577 ns 1.7597 ns 1.7633 ns]
+Found 9 outliers among 100 measurements (9.00%)
   2 (2.00%) high mild
-  11 (11.00%) high severe
+  7 (7.00%) high severe
 Benchmarking consensus/chain_selection/equal_length_tiebreak
 Benchmarking consensus/chain_selection/equal_length_tiebreak: Warming up for 3.0000 s
-Benchmarking consensus/chain_selection/equal_length_tiebreak: Collecting 100 samples in estimated 5.0015 s (15M iterations)
+Benchmarking consensus/chain_selection/equal_length_tiebreak: Collecting 100 samples in estimated 5.0015 s (14M iterations)
 Benchmarking consensus/chain_selection/equal_length_tiebreak: Analyzing
 consensus/chain_selection/equal_length_tiebreak
-                        time:   [327.90 ns 328.30 ns 328.75 ns]
-Found 1 outliers among 100 measurements (1.00%)
-  1 (1.00%) high mild
+                        time:   [344.00 ns 344.20 ns 344.41 ns]
+Found 4 outliers among 100 measurements (4.00%)
+  2 (2.00%) high mild
+  2 (2.00%) high severe
 Benchmarking consensus/chain_selection/prefer_simple
 Benchmarking consensus/chain_selection/prefer_simple: Warming up for 3.0000 s
-Benchmarking consensus/chain_selection/prefer_simple: Collecting 100 samples in estimated 5.0000 s (2.0B iterations)
+Benchmarking consensus/chain_selection/prefer_simple: Collecting 100 samples in estimated 5.0000 s (1.9B iterations)
 Benchmarking consensus/chain_selection/prefer_simple: Analyzing
 consensus/chain_selection/prefer_simple
-                        time:   [2.4398 ns 2.4421 ns 2.4443 ns]
-Found 1 outliers among 100 measurements (1.00%)
-  1 (1.00%) low mild
+                        time:   [2.6774 ns 2.6798 ns 2.6820 ns]
+Found 5 outliers among 100 measurements (5.00%)
+  1 (1.00%) low severe
+  3 (3.00%) low mild
+  1 (1.00%) high mild
 
 
 </code></pre>
@@ -7994,73 +8020,76 @@ Found 1 outliers among 100 measurements (1.00%)
 <pre><code>Gnuplot not found, using plotters backend
 Benchmarking lsm/insert/random_keys/10000
 Benchmarking lsm/insert/random_keys/10000: Warming up for 3.0000 s
-Benchmarking lsm/insert/random_keys/10000: Collecting 10 samples in estimated 5.0727 s (1925 iterations)
+Benchmarking lsm/insert/random_keys/10000: Collecting 10 samples in estimated 5.1112 s (1485 iterations)
 Benchmarking lsm/insert/random_keys/10000: Analyzing
 lsm/insert/random_keys/10000
-                        time:   [2.5262 ms 2.5301 ms 2.5334 ms]
-                        thrpt:  [3.9473 Melem/s 3.9524 Melem/s 3.9585 Melem/s]
+                        time:   [3.2935 ms 3.3016 ms 3.3193 ms]
+                        thrpt:  [3.0127 Melem/s 3.0288 Melem/s 3.0363 Melem/s]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
 
 Benchmarking lsm/point_lookup/hit_random/10000
 Benchmarking lsm/point_lookup/hit_random/10000: Warming up for 3.0000 s
-Benchmarking lsm/point_lookup/hit_random/10000: Collecting 100 samples in estimated 6.4543 s (20k iterations)
+Benchmarking lsm/point_lookup/hit_random/10000: Collecting 100 samples in estimated 6.4268 s (15k iterations)
 Benchmarking lsm/point_lookup/hit_random/10000: Analyzing
 lsm/point_lookup/hit_random/10000
-                        time:   [320.25 µs 320.60 µs 321.03 µs]
-                        thrpt:  [3.1149 Melem/s 3.1192 Melem/s 3.1225 Melem/s]
-Found 15 outliers among 100 measurements (15.00%)
-  6 (6.00%) low mild
-  5 (5.00%) high mild
-  4 (4.00%) high severe
+                        time:   [422.23 µs 422.64 µs 423.13 µs]
+                        thrpt:  [2.3633 Melem/s 2.3661 Melem/s 2.3684 Melem/s]
+Found 5 outliers among 100 measurements (5.00%)
+  2 (2.00%) high mild
+  3 (3.00%) high severe
 Benchmarking lsm/point_lookup/miss_random/10000
 Benchmarking lsm/point_lookup/miss_random/10000: Warming up for 3.0000 s
-Benchmarking lsm/point_lookup/miss_random/10000: Collecting 100 samples in estimated 5.1053 s (71k iterations)
+Benchmarking lsm/point_lookup/miss_random/10000: Collecting 100 samples in estimated 5.0270 s (50k iterations)
 Benchmarking lsm/point_lookup/miss_random/10000: Analyzing
 lsm/point_lookup/miss_random/10000
-                        time:   [72.000 µs 72.129 µs 72.289 µs]
-                        thrpt:  [13.833 Melem/s 13.864 Melem/s 13.889 Melem/s]
-Found 4 outliers among 100 measurements (4.00%)
+                        time:   [99.363 µs 100.38 µs 101.55 µs]
+                        thrpt:  [9.8473 Melem/s 9.9622 Melem/s 10.064 Melem/s]
+Found 7 outliers among 100 measurements (7.00%)
   2 (2.00%) high mild
-  2 (2.00%) high severe
+  5 (5.00%) high severe
 
 Benchmarking lsm/range_scan/window_100_of_10k/10000
 Benchmarking lsm/range_scan/window_100_of_10k/10000: Warming up for 3.0000 s
-Benchmarking lsm/range_scan/window_100_of_10k/10000: Collecting 20 samples in estimated 5.0048 s (106k iterations)
+Benchmarking lsm/range_scan/window_100_of_10k/10000: Collecting 20 samples in estimated 5.0073 s (87k iterations)
 Benchmarking lsm/range_scan/window_100_of_10k/10000: Analyzing
 lsm/range_scan/window_100_of_10k/10000
-                        time:   [46.597 µs 46.647 µs 46.710 µs]
-                        thrpt:  [2.1409 Melem/s 2.1438 Melem/s 2.1460 Melem/s]
-Found 2 outliers among 20 measurements (10.00%)
-  2 (10.00%) high severe
+                        time:   [58.419 µs 58.460 µs 58.503 µs]
+                        thrpt:  [1.7093 Melem/s 1.7106 Melem/s 1.7118 Melem/s]
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) low severe
 Benchmarking lsm/range_scan/full_scan/10000
 Benchmarking lsm/range_scan/full_scan/10000: Warming up for 3.0000 s
-Benchmarking lsm/range_scan/full_scan/10000: Collecting 20 samples in estimated 5.1730 s (3990 iterations)
+Benchmarking lsm/range_scan/full_scan/10000: Collecting 20 samples in estimated 5.2535 s (3360 iterations)
 Benchmarking lsm/range_scan/full_scan/10000: Analyzing
 lsm/range_scan/full_scan/10000
-                        time:   [1.2877 ms 1.2910 ms 1.2954 ms]
-                        thrpt:  [7.7198 Melem/s 7.7460 Melem/s 7.7655 Melem/s]
-Found 3 outliers among 20 measurements (15.00%)
-  3 (15.00%) low severe
+                        time:   [1.6278 ms 1.6363 ms 1.6434 ms]
+                        thrpt:  [6.0848 Melem/s 6.1113 Melem/s 6.1434 Melem/s]
+Found 4 outliers among 20 measurements (20.00%)
+  1 (5.00%) low severe
+  1 (5.00%) high mild
+  2 (10.00%) high severe
 
 Benchmarking lsm/apply_batch/inserts_10k_deletes_2.5k/10000
 Benchmarking lsm/apply_batch/inserts_10k_deletes_2.5k/10000: Warming up for 3.0000 s
-Benchmarking lsm/apply_batch/inserts_10k_deletes_2.5k/10000: Collecting 10 samples in estimated 5.2470 s (550 iterations)
+Benchmarking lsm/apply_batch/inserts_10k_deletes_2.5k/10000: Collecting 10 samples in estimated 5.4312 s (440 iterations)
 Benchmarking lsm/apply_batch/inserts_10k_deletes_2.5k/10000: Analyzing
 lsm/apply_batch/inserts_10k_deletes_2.5k/10000
-                        time:   [4.2050 ms 4.2130 ms 4.2202 ms]
-                        thrpt:  [2.3695 Melem/s 2.3736 Melem/s 2.3781 Melem/s]
+                        time:   [5.5417 ms 5.5915 ms 5.6840 ms]
+                        thrpt:  [1.7593 Melem/s 1.7884 Melem/s 1.8045 Melem/s]
 
 Benchmarking lsm/snapshot/save_10k
 Benchmarking lsm/snapshot/save_10k: Warming up for 3.0000 s
-Benchmarking lsm/snapshot/save_10k: Collecting 10 samples in estimated 5.0382 s (880 iterations)
+Benchmarking lsm/snapshot/save_10k: Collecting 10 samples in estimated 5.1835 s (770 iterations)
 Benchmarking lsm/snapshot/save_10k: Analyzing
-lsm/snapshot/save_10k   time:   [414.87 µs 419.19 µs 426.25 µs]
-Found 2 outliers among 10 measurements (20.00%)
-  2 (20.00%) high severe
+lsm/snapshot/save_10k   time:   [505.25 µs 508.74 µs 511.71 µs]
 Benchmarking lsm/snapshot/load_10k
 Benchmarking lsm/snapshot/load_10k: Warming up for 3.0000 s
-Benchmarking lsm/snapshot/load_10k: Collecting 10 samples in estimated 5.1913 s (770 iterations)
+Benchmarking lsm/snapshot/load_10k: Collecting 10 samples in estimated 5.2903 s (660 iterations)
 Benchmarking lsm/snapshot/load_10k: Analyzing
-lsm/snapshot/load_10k   time:   [1.3005 ms 1.3022 ms 1.3039 ms]
+lsm/snapshot/load_10k   time:   [1.5873 ms 1.5997 ms 1.6125 ms]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
 
 
 </code></pre>
@@ -8071,119 +8100,122 @@ lsm/snapshot/load_10k   time:   [1.3005 ms 1.3022 ms 1.3039 ms]
 <pre><code>Gnuplot not found, using plotters backend
 Benchmarking mempool/add/txs/1000
 Benchmarking mempool/add/txs/1000: Warming up for 3.0000 s
-Benchmarking mempool/add/txs/1000: Collecting 100 samples in estimated 7.7798 s (10k iterations)
+Benchmarking mempool/add/txs/1000: Collecting 100 samples in estimated 7.9388 s (10k iterations)
 Benchmarking mempool/add/txs/1000: Analyzing
-mempool/add/txs/1000    time:   [742.60 µs 743.61 µs 744.65 µs]
-Found 2 outliers among 100 measurements (2.00%)
+mempool/add/txs/1000    time:   [748.21 µs 750.34 µs 753.24 µs]
+Found 7 outliers among 100 measurements (7.00%)
   1 (1.00%) high mild
-  1 (1.00%) high severe
+  6 (6.00%) high severe
 Benchmarking mempool/add/txs/5000
 Benchmarking mempool/add/txs/5000: Warming up for 3.0000 s
-Benchmarking mempool/add/txs/5000: Collecting 100 samples in estimated 5.1851 s (800 iterations)
+Benchmarking mempool/add/txs/5000: Collecting 100 samples in estimated 5.3644 s (1100 iterations)
 Benchmarking mempool/add/txs/5000: Analyzing
-mempool/add/txs/5000    time:   [6.0681 ms 6.3111 ms 6.5584 ms]
+mempool/add/txs/5000    time:   [4.2443 ms 4.3009 ms 4.3619 ms]
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
 Benchmarking mempool/add/txs/10000
 Benchmarking mempool/add/txs/10000: Warming up for 3.0000 s
-Benchmarking mempool/add/txs/10000: Collecting 100 samples in estimated 5.2017 s (400 iterations)
+Benchmarking mempool/add/txs/10000: Collecting 100 samples in estimated 5.7306 s (300 iterations)
 Benchmarking mempool/add/txs/10000: Analyzing
-mempool/add/txs/10000   time:   [14.730 ms 15.497 ms 16.278 ms]
+mempool/add/txs/10000   time:   [16.675 ms 17.312 ms 17.931 ms]
 
 Benchmarking mempool/remove/txs/1000
 Benchmarking mempool/remove/txs/1000: Warming up for 3.0000 s
 
 Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 5.8s, enable flat sampling, or reduce sample count to 60.
-Benchmarking mempool/remove/txs/1000: Collecting 100 samples in estimated 5.8006 s (5050 iterations)
+Benchmarking mempool/remove/txs/1000: Collecting 100 samples in estimated 5.8422 s (5050 iterations)
 Benchmarking mempool/remove/txs/1000: Analyzing
-mempool/remove/txs/1000 time:   [479.08 µs 480.31 µs 481.49 µs]
-Found 2 outliers among 100 measurements (2.00%)
-  1 (1.00%) high mild
-  1 (1.00%) high severe
+mempool/remove/txs/1000 time:   [483.24 µs 484.57 µs 485.84 µs]
 Benchmarking mempool/remove/txs/5000
 Benchmarking mempool/remove/txs/5000: Warming up for 3.0000 s
-Benchmarking mempool/remove/txs/5000: Collecting 100 samples in estimated 5.0133 s (800 iterations)
+Benchmarking mempool/remove/txs/5000: Collecting 100 samples in estimated 5.5894 s (900 iterations)
 Benchmarking mempool/remove/txs/5000: Analyzing
-mempool/remove/txs/5000 time:   [2.6094 ms 2.6180 ms 2.6275 ms]
-Found 5 outliers among 100 measurements (5.00%)
-  3 (3.00%) high mild
-  2 (2.00%) high severe
+mempool/remove/txs/5000 time:   [2.7065 ms 2.7248 ms 2.7444 ms]
+Found 14 outliers among 100 measurements (14.00%)
+  9 (9.00%) high mild
+  5 (5.00%) high severe
 Benchmarking mempool/remove/txs/10000
 Benchmarking mempool/remove/txs/10000: Warming up for 3.0000 s
-Benchmarking mempool/remove/txs/10000: Collecting 100 samples in estimated 5.5375 s (400 iterations)
+Benchmarking mempool/remove/txs/10000: Collecting 100 samples in estimated 5.8628 s (400 iterations)
 Benchmarking mempool/remove/txs/10000: Analyzing
 mempool/remove/txs/10000
-                        time:   [5.9136 ms 5.9522 ms 5.9924 ms]
-Found 3 outliers among 100 measurements (3.00%)
-  3 (3.00%) high mild
+                        time:   [6.3424 ms 6.3648 ms 6.3879 ms]
+Found 6 outliers among 100 measurements (6.00%)
+  6 (6.00%) high mild
 
 Benchmarking mempool/get_sorted/by_fee_density/1000
 Benchmarking mempool/get_sorted/by_fee_density/1000: Warming up for 3.0000 s
-Benchmarking mempool/get_sorted/by_fee_density/1000: Collecting 100 samples in estimated 5.1116 s (71k iterations)
+Benchmarking mempool/get_sorted/by_fee_density/1000: Collecting 100 samples in estimated 5.0333 s (71k iterations)
 Benchmarking mempool/get_sorted/by_fee_density/1000: Analyzing
 mempool/get_sorted/by_fee_density/1000
-                        time:   [70.536 µs 70.656 µs 70.768 µs]
+                        time:   [72.316 µs 72.622 µs 72.915 µs]
 Found 1 outliers among 100 measurements (1.00%)
   1 (1.00%) high severe
 Benchmarking mempool/get_sorted/by_fee_density/5000
 Benchmarking mempool/get_sorted/by_fee_density/5000: Warming up for 3.0000 s
-Benchmarking mempool/get_sorted/by_fee_density/5000: Collecting 100 samples in estimated 5.1213 s (66k iterations)
+Benchmarking mempool/get_sorted/by_fee_density/5000: Collecting 100 samples in estimated 5.1592 s (66k iterations)
 Benchmarking mempool/get_sorted/by_fee_density/5000: Analyzing
 mempool/get_sorted/by_fee_density/5000
-                        time:   [78.132 µs 78.278 µs 78.421 µs]
-Found 5 outliers among 100 measurements (5.00%)
-  5 (5.00%) high severe
+                        time:   [79.434 µs 79.752 µs 80.053 µs]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
 Benchmarking mempool/get_sorted/by_fee_density/10000
 Benchmarking mempool/get_sorted/by_fee_density/10000: Warming up for 3.0000 s
-Benchmarking mempool/get_sorted/by_fee_density/10000: Collecting 100 samples in estimated 5.2071 s (66k iterations)
+Benchmarking mempool/get_sorted/by_fee_density/10000: Collecting 100 samples in estimated 5.0565 s (61k iterations)
 Benchmarking mempool/get_sorted/by_fee_density/10000: Analyzing
 mempool/get_sorted/by_fee_density/10000
-                        time:   [79.484 µs 79.634 µs 79.790 µs]
-Found 2 outliers among 100 measurements (2.00%)
-  1 (1.00%) high mild
+                        time:   [84.529 µs 84.866 µs 85.184 µs]
+Found 1 outliers among 100 measurements (1.00%)
   1 (1.00%) high severe
 
 Benchmarking mempool/drain_readd/txs/1000
 Benchmarking mempool/drain_readd/txs/1000: Warming up for 3.0000 s
 
-Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 7.1s, enable flat sampling, or reduce sample count to 50.
-Benchmarking mempool/drain_readd/txs/1000: Collecting 100 samples in estimated 7.0822 s (5050 iterations)
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 7.2s, enable flat sampling, or reduce sample count to 50.
+Benchmarking mempool/drain_readd/txs/1000: Collecting 100 samples in estimated 7.2312 s (5050 iterations)
 Benchmarking mempool/drain_readd/txs/1000: Analyzing
 mempool/drain_readd/txs/1000
-                        time:   [742.55 µs 744.36 µs 746.36 µs]
-Found 2 outliers among 100 measurements (2.00%)
-  2 (2.00%) high mild
+                        time:   [746.33 µs 748.49 µs 750.76 µs]
+Found 7 outliers among 100 measurements (7.00%)
+  6 (6.00%) high mild
+  1 (1.00%) high severe
 Benchmarking mempool/drain_readd/txs/5000
 Benchmarking mempool/drain_readd/txs/5000: Warming up for 3.0000 s
-Benchmarking mempool/drain_readd/txs/5000: Collecting 100 samples in estimated 5.6066 s (700 iterations)
+Benchmarking mempool/drain_readd/txs/5000: Collecting 100 samples in estimated 5.6525 s (700 iterations)
 Benchmarking mempool/drain_readd/txs/5000: Analyzing
 mempool/drain_readd/txs/5000
-                        time:   [4.2680 ms 4.3133 ms 4.3594 ms]
+                        time:   [4.1907 ms 4.2292 ms 4.2730 ms]
+Found 9 outliers among 100 measurements (9.00%)
+  2 (2.00%) high mild
+  7 (7.00%) high severe
 Benchmarking mempool/drain_readd/txs/10000
 Benchmarking mempool/drain_readd/txs/10000: Warming up for 3.0000 s
-Benchmarking mempool/drain_readd/txs/10000: Collecting 100 samples in estimated 5.7132 s (200 iterations)
+Benchmarking mempool/drain_readd/txs/10000: Collecting 100 samples in estimated 5.9693 s (200 iterations)
 Benchmarking mempool/drain_readd/txs/10000: Analyzing
 mempool/drain_readd/txs/10000
-                        time:   [13.248 ms 13.378 ms 13.502 ms]
-Found 1 outliers among 100 measurements (1.00%)
-  1 (1.00%) low severe
+                        time:   [14.012 ms 14.117 ms 14.223 ms]
+Found 5 outliers among 100 measurements (5.00%)
+  2 (2.00%) low mild
+  3 (3.00%) high mild
 
 Benchmarking mempool/batch_remove/50_from/5000
 Benchmarking mempool/batch_remove/50_from/5000: Warming up for 3.0000 s
-Benchmarking mempool/batch_remove/50_from/5000: Collecting 100 samples in estimated 5.0071 s (3.5M iterations)
+Benchmarking mempool/batch_remove/50_from/5000: Collecting 100 samples in estimated 5.0044 s (3.4M iterations)
 Benchmarking mempool/batch_remove/50_from/5000: Analyzing
 mempool/batch_remove/50_from/5000
-                        time:   [1.4289 µs 1.4302 µs 1.4316 µs]
-Found 3 outliers among 100 measurements (3.00%)
-  1 (1.00%) high mild
-  2 (2.00%) high severe
+                        time:   [1.4959 µs 1.4969 µs 1.4979 µs]
+Found 6 outliers among 100 measurements (6.00%)
+  2 (2.00%) high mild
+  4 (4.00%) high severe
 Benchmarking mempool/batch_remove/50_from/10000
 Benchmarking mempool/batch_remove/50_from/10000: Warming up for 3.0000 s
-Benchmarking mempool/batch_remove/50_from/10000: Collecting 100 samples in estimated 5.0071 s (3.4M iterations)
+Benchmarking mempool/batch_remove/50_from/10000: Collecting 100 samples in estimated 5.0060 s (3.4M iterations)
 Benchmarking mempool/batch_remove/50_from/10000: Analyzing
 mempool/batch_remove/50_from/10000
-                        time:   [1.5107 µs 1.5121 µs 1.5134 µs]
-Found 3 outliers among 100 measurements (3.00%)
-  2 (2.00%) high mild
-  1 (1.00%) high severe
+                        time:   [1.4620 µs 1.4637 µs 1.4658 µs]
+Found 10 outliers among 100 measurements (10.00%)
+  5 (5.00%) high mild
+  5 (5.00%) high severe
 
 
 </code></pre>
@@ -8194,112 +8226,122 @@ Found 3 outliers among 100 measurements (3.00%)
 <pre><code>Gnuplot not found, using plotters backend
 Benchmarking ed25519_verify/single
 Benchmarking ed25519_verify/single: Warming up for 3.0000 s
-Benchmarking ed25519_verify/single: Collecting 100 samples in estimated 5.1737 s (126k iterations)
+Benchmarking ed25519_verify/single: Collecting 100 samples in estimated 5.0611 s (136k iterations)
 Benchmarking ed25519_verify/single: Analyzing
-ed25519_verify/single   time:   [39.733 µs 40.053 µs 40.314 µs]
-Found 24 outliers among 100 measurements (24.00%)
-  24 (24.00%) low mild
+ed25519_verify/single   time:   [37.097 µs 37.116 µs 37.137 µs]
+Found 8 outliers among 100 measurements (8.00%)
+  2 (2.00%) low mild
+  3 (3.00%) high mild
+  3 (3.00%) high severe
 
 Benchmarking ed25519_batch_verify/sequential/1
 Benchmarking ed25519_batch_verify/sequential/1: Warming up for 3.0000 s
-Benchmarking ed25519_batch_verify/sequential/1: Collecting 100 samples in estimated 5.1436 s (126k iterations)
+Benchmarking ed25519_batch_verify/sequential/1: Collecting 100 samples in estimated 5.0677 s (136k iterations)
 Benchmarking ed25519_batch_verify/sequential/1: Analyzing
 ed25519_batch_verify/sequential/1
-                        time:   [43.191 µs 43.417 µs 43.675 µs]
+                        time:   [37.228 µs 37.257 µs 37.289 µs]
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) high mild
+  1 (1.00%) high severe
 Benchmarking ed25519_batch_verify/sequential/10
 Benchmarking ed25519_batch_verify/sequential/10: Warming up for 3.0000 s
-Benchmarking ed25519_batch_verify/sequential/10: Collecting 100 samples in estimated 6.1609 s (15k iterations)
+Benchmarking ed25519_batch_verify/sequential/10: Collecting 100 samples in estimated 5.6316 s (15k iterations)
 Benchmarking ed25519_batch_verify/sequential/10: Analyzing
 ed25519_batch_verify/sequential/10
-                        time:   [432.00 µs 434.66 µs 437.75 µs]
-Found 1 outliers among 100 measurements (1.00%)
-  1 (1.00%) high mild
+                        time:   [372.96 µs 374.58 µs 376.54 µs]
+Found 7 outliers among 100 measurements (7.00%)
+  2 (2.00%) high mild
+  5 (5.00%) high severe
 Benchmarking ed25519_batch_verify/sequential/50
 Benchmarking ed25519_batch_verify/sequential/50: Warming up for 3.0000 s
-Benchmarking ed25519_batch_verify/sequential/50: Collecting 100 samples in estimated 5.1262 s (2500 iterations)
+
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 9.4s, enable flat sampling, or reduce sample count to 50.
+Benchmarking ed25519_batch_verify/sequential/50: Collecting 100 samples in estimated 9.3787 s (5050 iterations)
 Benchmarking ed25519_batch_verify/sequential/50: Analyzing
 ed25519_batch_verify/sequential/50
-                        time:   [2.1591 ms 2.1728 ms 2.1870 ms]
+                        time:   [1.8613 ms 1.8625 ms 1.8639 ms]
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) high mild
+  1 (1.00%) high severe
 Benchmarking ed25519_batch_verify/sequential/100
 Benchmarking ed25519_batch_verify/sequential/100: Warming up for 3.0000 s
-Benchmarking ed25519_batch_verify/sequential/100: Collecting 100 samples in estimated 5.3024 s (1300 iterations)
+Benchmarking ed25519_batch_verify/sequential/100: Collecting 100 samples in estimated 5.1978 s (1400 iterations)
 Benchmarking ed25519_batch_verify/sequential/100: Analyzing
 ed25519_batch_verify/sequential/100
-                        time:   [4.3107 ms 4.3365 ms 4.3629 ms]
+                        time:   [3.7322 ms 3.7360 ms 3.7399 ms]
 Benchmarking ed25519_batch_verify/sequential/200
 Benchmarking ed25519_batch_verify/sequential/200: Warming up for 3.0000 s
-Benchmarking ed25519_batch_verify/sequential/200: Collecting 100 samples in estimated 5.8270 s (700 iterations)
+Benchmarking ed25519_batch_verify/sequential/200: Collecting 100 samples in estimated 5.2992 s (700 iterations)
 Benchmarking ed25519_batch_verify/sequential/200: Analyzing
 ed25519_batch_verify/sequential/200
-                        time:   [8.7538 ms 8.8045 ms 8.8561 ms]
+                        time:   [7.6134 ms 7.6209 ms 7.6285 ms]
 Benchmarking ed25519_batch_verify/sequential/500
 Benchmarking ed25519_batch_verify/sequential/500: Warming up for 3.0000 s
-Benchmarking ed25519_batch_verify/sequential/500: Collecting 100 samples in estimated 6.3019 s (300 iterations)
+Benchmarking ed25519_batch_verify/sequential/500: Collecting 100 samples in estimated 5.7388 s (300 iterations)
 Benchmarking ed25519_batch_verify/sequential/500: Analyzing
 ed25519_batch_verify/sequential/500
-                        time:   [22.086 ms 22.211 ms 22.338 ms]
+                        time:   [19.228 ms 19.246 ms 19.264 ms]
 
 Benchmarking keyhash_from_vkey/single
 Benchmarking keyhash_from_vkey/single: Warming up for 3.0000 s
-Benchmarking keyhash_from_vkey/single: Collecting 100 samples in estimated 5.0002 s (26M iterations)
+Benchmarking keyhash_from_vkey/single: Collecting 100 samples in estimated 5.0001 s (29M iterations)
 Benchmarking keyhash_from_vkey/single: Analyzing
 keyhash_from_vkey/single
-                        time:   [189.96 ns 190.51 ns 191.21 ns]
-Found 8 outliers among 100 measurements (8.00%)
-  5 (5.00%) high mild
+                        time:   [172.58 ns 176.50 ns 180.99 ns]
+Found 4 outliers among 100 measurements (4.00%)
+  1 (1.00%) high mild
   3 (3.00%) high severe
 Benchmarking keyhash_from_vkey/batch/10
 Benchmarking keyhash_from_vkey/batch/10: Warming up for 3.0000 s
-Benchmarking keyhash_from_vkey/batch/10: Collecting 100 samples in estimated 5.0075 s (2.8M iterations)
+Benchmarking keyhash_from_vkey/batch/10: Collecting 100 samples in estimated 5.0083 s (3.0M iterations)
 Benchmarking keyhash_from_vkey/batch/10: Analyzing
 keyhash_from_vkey/batch/10
-                        time:   [1.7995 µs 1.8006 µs 1.8018 µs]
-Found 3 outliers among 100 measurements (3.00%)
-  1 (1.00%) high mild
-  2 (2.00%) high severe
-Benchmarking keyhash_from_vkey/batch/50
-Benchmarking keyhash_from_vkey/batch/50: Warming up for 3.0000 s
-Benchmarking keyhash_from_vkey/batch/50: Collecting 100 samples in estimated 5.0426 s (561k iterations)
-Benchmarking keyhash_from_vkey/batch/50: Analyzing
-keyhash_from_vkey/batch/50
-                        time:   [8.9936 µs 8.9982 µs 9.0027 µs]
+                        time:   [1.6384 µs 1.6393 µs 1.6403 µs]
 Found 1 outliers among 100 measurements (1.00%)
   1 (1.00%) high severe
+Benchmarking keyhash_from_vkey/batch/50
+Benchmarking keyhash_from_vkey/batch/50: Warming up for 3.0000 s
+Benchmarking keyhash_from_vkey/batch/50: Collecting 100 samples in estimated 5.0115 s (611k iterations)
+Benchmarking keyhash_from_vkey/batch/50: Analyzing
+keyhash_from_vkey/batch/50
+                        time:   [8.1934 µs 8.1994 µs 8.2056 µs]
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
 Benchmarking keyhash_from_vkey/batch/100
 Benchmarking keyhash_from_vkey/batch/100: Warming up for 3.0000 s
-Benchmarking keyhash_from_vkey/batch/100: Collecting 100 samples in estimated 5.0782 s (283k iterations)
+Benchmarking keyhash_from_vkey/batch/100: Collecting 100 samples in estimated 5.0630 s (308k iterations)
 Benchmarking keyhash_from_vkey/batch/100: Analyzing
 keyhash_from_vkey/batch/100
-                        time:   [17.983 µs 17.991 µs 17.998 µs]
-Found 3 outliers among 100 measurements (3.00%)
-  2 (2.00%) high mild
-  1 (1.00%) high severe
+                        time:   [16.395 µs 16.404 µs 16.413 µs]
+Found 4 outliers among 100 measurements (4.00%)
+  1 (1.00%) low mild
+  3 (3.00%) high mild
 Benchmarking keyhash_from_vkey/batch/200
 Benchmarking keyhash_from_vkey/batch/200: Warming up for 3.0000 s
-Benchmarking keyhash_from_vkey/batch/200: Collecting 100 samples in estimated 5.1532 s (146k iterations)
+Benchmarking keyhash_from_vkey/batch/200: Collecting 100 samples in estimated 5.1418 s (157k iterations)
 Benchmarking keyhash_from_vkey/batch/200: Analyzing
 keyhash_from_vkey/batch/200
-                        time:   [32.764 µs 32.782 µs 32.801 µs]
-Found 4 outliers among 100 measurements (4.00%)
-  2 (2.00%) high mild
+                        time:   [32.775 µs 32.791 µs 32.808 µs]
+Found 2 outliers among 100 measurements (2.00%)
   2 (2.00%) high severe
 Benchmarking keyhash_from_vkey/batch/500
 Benchmarking keyhash_from_vkey/batch/500: Warming up for 3.0000 s
-Benchmarking keyhash_from_vkey/batch/500: Collecting 100 samples in estimated 5.3679 s (66k iterations)
+Benchmarking keyhash_from_vkey/batch/500: Collecting 100 samples in estimated 5.3847 s (66k iterations)
 Benchmarking keyhash_from_vkey/batch/500: Analyzing
 keyhash_from_vkey/batch/500
-                        time:   [81.888 µs 81.943 µs 82.003 µs]
-Found 4 outliers among 100 measurements (4.00%)
-  2 (2.00%) high mild
-  2 (2.00%) high severe
+                        time:   [81.907 µs 81.973 µs 82.068 µs]
+Found 9 outliers among 100 measurements (9.00%)
+  1 (1.00%) high mild
+  8 (8.00%) high severe
 
 Benchmarking vrf_verify/single_proof
 Benchmarking vrf_verify/single_proof: Warming up for 3.0000 s
-Benchmarking vrf_verify/single_proof: Collecting 100 samples in estimated 5.1569 s (30k iterations)
+Benchmarking vrf_verify/single_proof: Collecting 100 samples in estimated 5.1530 s (30k iterations)
 Benchmarking vrf_verify/single_proof: Analyzing
-vrf_verify/single_proof time:   [170.13 µs 170.20 µs 170.29 µs]
-Found 5 outliers among 100 measurements (5.00%)
-  5 (5.00%) high severe
+vrf_verify/single_proof time:   [170.05 µs 170.10 µs 170.15 µs]
+Found 9 outliers among 100 measurements (9.00%)
+  6 (6.00%) high mild
+  3 (3.00%) high severe
 
 
 </code></pre>
@@ -8310,155 +8352,170 @@ Found 5 outliers among 100 measurements (5.00%)
 <pre><code>Gnuplot not found, using plotters backend
 Benchmarking blake2b_256/hash/32B_txhash
 Benchmarking blake2b_256/hash/32B_txhash: Warming up for 3.0000 s
-Benchmarking blake2b_256/hash/32B_txhash: Collecting 100 samples in estimated 5.0007 s (31M iterations)
+Benchmarking blake2b_256/hash/32B_txhash: Collecting 100 samples in estimated 5.0001 s (31M iterations)
 Benchmarking blake2b_256/hash/32B_txhash: Analyzing
 blake2b_256/hash/32B_txhash
-                        time:   [157.68 ns 157.98 ns 158.34 ns]
-Found 2 outliers among 100 measurements (2.00%)
-  2 (2.00%) high severe
+                        time:   [157.98 ns 158.41 ns 158.91 ns]
+Found 26 outliers among 100 measurements (26.00%)
+  3 (3.00%) low mild
+  20 (20.00%) high mild
+  3 (3.00%) high severe
 Benchmarking blake2b_256/hash/64B_vkey
 Benchmarking blake2b_256/hash/64B_vkey: Warming up for 3.0000 s
-Benchmarking blake2b_256/hash/64B_vkey: Collecting 100 samples in estimated 5.0006 s (31M iterations)
+Benchmarking blake2b_256/hash/64B_vkey: Collecting 100 samples in estimated 5.0004 s (31M iterations)
 Benchmarking blake2b_256/hash/64B_vkey: Analyzing
 blake2b_256/hash/64B_vkey
-                        time:   [157.97 ns 158.36 ns 158.75 ns]
-Found 19 outliers among 100 measurements (19.00%)
-  16 (16.00%) low mild
-  2 (2.00%) high mild
+                        time:   [157.38 ns 157.99 ns 158.71 ns]
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) high mild
   1 (1.00%) high severe
 Benchmarking blake2b_256/hash/256B_small_tx
 Benchmarking blake2b_256/hash/256B_small_tx: Warming up for 3.0000 s
-Benchmarking blake2b_256/hash/256B_small_tx: Collecting 100 samples in estimated 5.0009 s (18M iterations)
+Benchmarking blake2b_256/hash/256B_small_tx: Collecting 100 samples in estimated 5.0001 s (18M iterations)
 Benchmarking blake2b_256/hash/256B_small_tx: Analyzing
 blake2b_256/hash/256B_small_tx
-                        time:   [279.07 ns 279.60 ns 280.20 ns]
+                        time:   [278.97 ns 279.38 ns 279.84 ns]
+Found 22 outliers among 100 measurements (22.00%)
+  5 (5.00%) low mild
+  10 (10.00%) high mild
+  7 (7.00%) high severe
 Benchmarking blake2b_256/hash/500B_avg_tx
 Benchmarking blake2b_256/hash/500B_avg_tx: Warming up for 3.0000 s
-Benchmarking blake2b_256/hash/500B_avg_tx: Collecting 100 samples in estimated 5.0006 s (9.2M iterations)
+Benchmarking blake2b_256/hash/500B_avg_tx: Collecting 100 samples in estimated 5.0024 s (9.2M iterations)
 Benchmarking blake2b_256/hash/500B_avg_tx: Analyzing
 blake2b_256/hash/500B_avg_tx
-                        time:   [537.31 ns 537.77 ns 538.36 ns]
-Found 3 outliers among 100 measurements (3.00%)
-  1 (1.00%) high mild
-  2 (2.00%) high severe
+                        time:   [536.56 ns 537.29 ns 538.20 ns]
+Found 5 outliers among 100 measurements (5.00%)
+  2 (2.00%) high mild
+  3 (3.00%) high severe
 Benchmarking blake2b_256/hash/1KB_tx_body
 Benchmarking blake2b_256/hash/1KB_tx_body: Warming up for 3.0000 s
-Benchmarking blake2b_256/hash/1KB_tx_body: Collecting 100 samples in estimated 5.0032 s (4.8M iterations)
+Benchmarking blake2b_256/hash/1KB_tx_body: Collecting 100 samples in estimated 5.0044 s (4.8M iterations)
 Benchmarking blake2b_256/hash/1KB_tx_body: Analyzing
 blake2b_256/hash/1KB_tx_body
-                        time:   [1.0472 µs 1.0476 µs 1.0481 µs]
-Found 1 outliers among 100 measurements (1.00%)
-  1 (1.00%) high severe
+                        time:   [1.0473 µs 1.0477 µs 1.0480 µs]
+Found 9 outliers among 100 measurements (9.00%)
+  9 (9.00%) high severe
 Benchmarking blake2b_256/hash/4KB_large_tx
 Benchmarking blake2b_256/hash/4KB_large_tx: Warming up for 3.0000 s
-Benchmarking blake2b_256/hash/4KB_large_tx: Collecting 100 samples in estimated 5.0194 s (1.2M iterations)
+Benchmarking blake2b_256/hash/4KB_large_tx: Collecting 100 samples in estimated 5.0080 s (1.2M iterations)
 Benchmarking blake2b_256/hash/4KB_large_tx: Analyzing
 blake2b_256/hash/4KB_large_tx
-                        time:   [4.1180 µs 4.1187 µs 4.1195 µs]
-Found 2 outliers among 100 measurements (2.00%)
-  1 (1.00%) high mild
-  1 (1.00%) high severe
+                        time:   [4.1195 µs 4.1295 µs 4.1454 µs]
+Found 14 outliers among 100 measurements (14.00%)
+  6 (6.00%) high mild
+  8 (8.00%) high severe
 Benchmarking blake2b_256/hash/16KB_block_header
 Benchmarking blake2b_256/hash/16KB_block_header: Warming up for 3.0000 s
-Benchmarking blake2b_256/hash/16KB_block_header: Collecting 100 samples in estimated 5.0589 s (308k iterations)
+Benchmarking blake2b_256/hash/16KB_block_header: Collecting 100 samples in estimated 5.0616 s (308k iterations)
 Benchmarking blake2b_256/hash/16KB_block_header: Analyzing
 blake2b_256/hash/16KB_block_header
-                        time:   [16.411 µs 16.413 µs 16.415 µs]
-Found 12 outliers among 100 measurements (12.00%)
-  5 (5.00%) high mild
-  7 (7.00%) high severe
+                        time:   [16.449 µs 16.521 µs 16.602 µs]
+Found 15 outliers among 100 measurements (15.00%)
+  2 (2.00%) high mild
+  13 (13.00%) high severe
 Benchmarking blake2b_256/hash/20KB_avg_block
 Benchmarking blake2b_256/hash/20KB_avg_block: Warming up for 3.0000 s
-Benchmarking blake2b_256/hash/20KB_avg_block: Collecting 100 samples in estimated 5.0781 s (247k iterations)
+Benchmarking blake2b_256/hash/20KB_avg_block: Collecting 100 samples in estimated 5.0790 s (247k iterations)
 Benchmarking blake2b_256/hash/20KB_avg_block: Analyzing
 blake2b_256/hash/20KB_avg_block
-                        time:   [20.510 µs 20.515 µs 20.522 µs]
+                        time:   [20.503 µs 20.506 µs 20.509 µs]
 Found 8 outliers among 100 measurements (8.00%)
-  2 (2.00%) low mild
-  1 (1.00%) high mild
-  5 (5.00%) high severe
+  4 (4.00%) high mild
+  4 (4.00%) high severe
 Benchmarking blake2b_256/hash/90KB_max_block
 Benchmarking blake2b_256/hash/90KB_max_block: Warming up for 3.0000 s
-Benchmarking blake2b_256/hash/90KB_max_block: Collecting 100 samples in estimated 5.1243 s (56k iterations)
+Benchmarking blake2b_256/hash/90KB_max_block: Collecting 100 samples in estimated 5.1373 s (56k iterations)
 Benchmarking blake2b_256/hash/90KB_max_block: Analyzing
 blake2b_256/hash/90KB_max_block
-                        time:   [92.267 µs 92.468 µs 92.748 µs]
-Found 14 outliers among 100 measurements (14.00%)
-  3 (3.00%) high mild
-  11 (11.00%) high severe
+                        time:   [92.241 µs 92.266 µs 92.305 µs]
+Found 9 outliers among 100 measurements (9.00%)
+  1 (1.00%) low mild
+  1 (1.00%) high mild
+  7 (7.00%) high severe
 
 Benchmarking blake2b_224/hash/32B_vkey_to_keyhash
 Benchmarking blake2b_224/hash/32B_vkey_to_keyhash: Warming up for 3.0000 s
-Benchmarking blake2b_224/hash/32B_vkey_to_keyhash: Collecting 100 samples in estimated 5.0004 s (29M iterations)
+Benchmarking blake2b_224/hash/32B_vkey_to_keyhash: Collecting 100 samples in estimated 5.0002 s (30M iterations)
 Benchmarking blake2b_224/hash/32B_vkey_to_keyhash: Analyzing
 blake2b_224/hash/32B_vkey_to_keyhash
-                        time:   [165.62 ns 166.06 ns 166.56 ns]
-Found 1 outliers among 100 measurements (1.00%)
-  1 (1.00%) high mild
+                        time:   [166.69 ns 167.07 ns 167.49 ns]
+Found 4 outliers among 100 measurements (4.00%)
+  3 (3.00%) high mild
+  1 (1.00%) high severe
 Benchmarking blake2b_224/hash/64B_script_bytes
 Benchmarking blake2b_224/hash/64B_script_bytes: Warming up for 3.0000 s
-Benchmarking blake2b_224/hash/64B_script_bytes: Collecting 100 samples in estimated 5.0008 s (30M iterations)
+Benchmarking blake2b_224/hash/64B_script_bytes: Collecting 100 samples in estimated 5.0007 s (30M iterations)
 Benchmarking blake2b_224/hash/64B_script_bytes: Analyzing
 blake2b_224/hash/64B_script_bytes
-                        time:   [165.55 ns 165.75 ns 165.96 ns]
-Found 2 outliers among 100 measurements (2.00%)
-  1 (1.00%) high mild
-  1 (1.00%) high severe
+                        time:   [165.53 ns 165.75 ns 165.95 ns]
 Benchmarking blake2b_224/hash/256B_address_payload
 Benchmarking blake2b_224/hash/256B_address_payload: Warming up for 3.0000 s
-Benchmarking blake2b_224/hash/256B_address_payload: Collecting 100 samples in estimated 5.0007 s (17M iterations)
+Benchmarking blake2b_224/hash/256B_address_payload: Collecting 100 samples in estimated 5.0009 s (18M iterations)
 Benchmarking blake2b_224/hash/256B_address_payload: Analyzing
 blake2b_224/hash/256B_address_payload
-                        time:   [285.58 ns 285.92 ns 286.32 ns]
+                        time:   [285.34 ns 285.65 ns 285.94 ns]
 
 Benchmarking blake2b_batch/224_keyhashes/10
 Benchmarking blake2b_batch/224_keyhashes/10: Warming up for 3.0000 s
-Benchmarking blake2b_batch/224_keyhashes/10: Collecting 100 samples in estimated 5.0049 s (3.1M iterations)
+Benchmarking blake2b_batch/224_keyhashes/10: Collecting 100 samples in estimated 5.0007 s (3.2M iterations)
 Benchmarking blake2b_batch/224_keyhashes/10: Analyzing
 blake2b_batch/224_keyhashes/10
-                        time:   [1.5709 µs 1.5739 µs 1.5775 µs]
+                        time:   [1.5648 µs 1.5664 µs 1.5679 µs]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high severe
 Benchmarking blake2b_batch/224_keyhashes/50
 Benchmarking blake2b_batch/224_keyhashes/50: Warming up for 3.0000 s
-Benchmarking blake2b_batch/224_keyhashes/50: Collecting 100 samples in estimated 5.0039 s (626k iterations)
+Benchmarking blake2b_batch/224_keyhashes/50: Collecting 100 samples in estimated 5.0108 s (641k iterations)
 Benchmarking blake2b_batch/224_keyhashes/50: Analyzing
 blake2b_batch/224_keyhashes/50
-                        time:   [7.8506 µs 7.8644 µs 7.8806 µs]
+                        time:   [7.8323 µs 7.8388 µs 7.8452 µs]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
 Benchmarking blake2b_batch/224_keyhashes/100
 Benchmarking blake2b_batch/224_keyhashes/100: Warming up for 3.0000 s
-Benchmarking blake2b_batch/224_keyhashes/100: Collecting 100 samples in estimated 5.0153 s (313k iterations)
+Benchmarking blake2b_batch/224_keyhashes/100: Collecting 100 samples in estimated 5.0526 s (323k iterations)
 Benchmarking blake2b_batch/224_keyhashes/100: Analyzing
 blake2b_batch/224_keyhashes/100
-                        time:   [15.755 µs 15.782 µs 15.814 µs]
-Found 1 outliers among 100 measurements (1.00%)
+                        time:   [15.711 µs 15.752 µs 15.809 µs]
+Found 3 outliers among 100 measurements (3.00%)
   1 (1.00%) high mild
+  2 (2.00%) high severe
 Benchmarking blake2b_batch/224_keyhashes/500
 Benchmarking blake2b_batch/224_keyhashes/500: Warming up for 3.0000 s
-Benchmarking blake2b_batch/224_keyhashes/500: Collecting 100 samples in estimated 5.2532 s (66k iterations)
+Benchmarking blake2b_batch/224_keyhashes/500: Collecting 100 samples in estimated 5.1334 s (66k iterations)
 Benchmarking blake2b_batch/224_keyhashes/500: Analyzing
 blake2b_batch/224_keyhashes/500
-                        time:   [78.664 µs 78.801 µs 78.957 µs]
+                        time:   [78.471 µs 78.534 µs 78.595 µs]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high severe
 Benchmarking blake2b_batch/256_txbodies_500B/50
 Benchmarking blake2b_batch/256_txbodies_500B/50: Warming up for 3.0000 s
-Benchmarking blake2b_batch/256_txbodies_500B/50: Collecting 100 samples in estimated 5.0455 s (187k iterations)
+Benchmarking blake2b_batch/256_txbodies_500B/50: Collecting 100 samples in estimated 5.1120 s (192k iterations)
 Benchmarking blake2b_batch/256_txbodies_500B/50: Analyzing
 blake2b_batch/256_txbodies_500B/50
-                        time:   [26.752 µs 26.773 µs 26.797 µs]
-Found 1 outliers among 100 measurements (1.00%)
+                        time:   [26.651 µs 26.670 µs 26.692 µs]
+Found 4 outliers among 100 measurements (4.00%)
   1 (1.00%) high mild
+  3 (3.00%) high severe
 Benchmarking blake2b_batch/256_txbodies_500B/100
 Benchmarking blake2b_batch/256_txbodies_500B/100: Warming up for 3.0000 s
-Benchmarking blake2b_batch/256_txbodies_500B/100: Collecting 100 samples in estimated 5.1810 s (96k iterations)
+Benchmarking blake2b_batch/256_txbodies_500B/100: Collecting 100 samples in estimated 5.1029 s (96k iterations)
 Benchmarking blake2b_batch/256_txbodies_500B/100: Analyzing
 blake2b_batch/256_txbodies_500B/100
-                        time:   [53.516 µs 53.555 µs 53.600 µs]
+                        time:   [53.306 µs 53.333 µs 53.359 µs]
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) high mild
+  1 (1.00%) high severe
 Benchmarking blake2b_batch/256_txbodies_500B/300
 Benchmarking blake2b_batch/256_txbodies_500B/300: Warming up for 3.0000 s
-Benchmarking blake2b_batch/256_txbodies_500B/300: Collecting 100 samples in estimated 5.7416 s (35k iterations)
+Benchmarking blake2b_batch/256_txbodies_500B/300: Collecting 100 samples in estimated 5.6418 s (35k iterations)
 Benchmarking blake2b_batch/256_txbodies_500B/300: Analyzing
 blake2b_batch/256_txbodies_500B/300
-                        time:   [160.64 µs 160.75 µs 160.89 µs]
-Found 2 outliers among 100 measurements (2.00%)
+                        time:   [160.11 µs 160.26 µs 160.43 µs]
+Found 6 outliers among 100 measurements (6.00%)
   2 (2.00%) high mild
+  4 (4.00%) high severe
 
 
 </code></pre>
@@ -8469,49 +8526,53 @@ Found 2 outliers among 100 measurements (2.00%)
 <pre><code>Gnuplot not found, using plotters backend
 Benchmarking serialization/encode_transaction/conway_2in_2out_2wit
 Benchmarking serialization/encode_transaction/conway_2in_2out_2wit: Warming up for 3.0000 s
-Benchmarking serialization/encode_transaction/conway_2in_2out_2wit: Collecting 100 samples in estimated 5.0092 s (2.7M iterations)
+Benchmarking serialization/encode_transaction/conway_2in_2out_2wit: Collecting 100 samples in estimated 5.0002 s (2.7M iterations)
 Benchmarking serialization/encode_transaction/conway_2in_2out_2wit: Analyzing
 serialization/encode_transaction/conway_2in_2out_2wit
-                        time:   [1.8534 µs 1.8646 µs 1.8851 µs]
-Found 4 outliers among 100 measurements (4.00%)
-  2 (2.00%) high mild
-  2 (2.00%) high severe
+                        time:   [2.0839 µs 2.1019 µs 2.1174 µs]
+Found 15 outliers among 100 measurements (15.00%)
+  4 (4.00%) low severe
+  6 (6.00%) low mild
+  4 (4.00%) high mild
+  1 (1.00%) high severe
 Benchmarking serialization/encode_transaction/body_only_2in_2out
 Benchmarking serialization/encode_transaction/body_only_2in_2out: Warming up for 3.0000 s
-Benchmarking serialization/encode_transaction/body_only_2in_2out: Collecting 100 samples in estimated 5.0029 s (4.0M iterations)
+Benchmarking serialization/encode_transaction/body_only_2in_2out: Collecting 100 samples in estimated 5.0029 s (3.9M iterations)
 Benchmarking serialization/encode_transaction/body_only_2in_2out: Analyzing
 serialization/encode_transaction/body_only_2in_2out
-                        time:   [1.2522 µs 1.2534 µs 1.2545 µs]
-Found 2 outliers among 100 measurements (2.00%)
-  2 (2.00%) high severe
+                        time:   [1.2670 µs 1.2680 µs 1.2692 µs]
+Found 6 outliers among 100 measurements (6.00%)
+  1 (1.00%) high mild
+  5 (5.00%) high severe
 
 Benchmarking serialization/encode_block_header/with_vrf_output
 Benchmarking serialization/encode_block_header/with_vrf_output: Warming up for 3.0000 s
-Benchmarking serialization/encode_block_header/with_vrf_output: Collecting 100 samples in estimated 5.0012 s (4.3M iterations)
+Benchmarking serialization/encode_block_header/with_vrf_output: Collecting 100 samples in estimated 5.0054 s (4.7M iterations)
 Benchmarking serialization/encode_block_header/with_vrf_output: Analyzing
 serialization/encode_block_header/with_vrf_output
-                        time:   [1.1788 µs 1.1980 µs 1.2216 µs]
-Found 22 outliers among 100 measurements (22.00%)
-  1 (1.00%) low mild
-  1 (1.00%) high mild
-  20 (20.00%) high severe
+                        time:   [1.0747 µs 1.0874 µs 1.1028 µs]
+Found 17 outliers among 100 measurements (17.00%)
+  17 (17.00%) high severe
 
 Benchmarking serialization/encode_value/ada_only
 Benchmarking serialization/encode_value/ada_only: Warming up for 3.0000 s
-Benchmarking serialization/encode_value/ada_only: Collecting 100 samples in estimated 5.0001 s (226M iterations)
+Benchmarking serialization/encode_value/ada_only: Collecting 100 samples in estimated 5.0000 s (216M iterations)
 Benchmarking serialization/encode_value/ada_only: Analyzing
 serialization/encode_value/ada_only
-                        time:   [22.991 ns 23.377 ns 23.800 ns]
-Found 17 outliers among 100 measurements (17.00%)
-  1 (1.00%) high mild
-  16 (16.00%) high severe
+                        time:   [23.092 ns 23.202 ns 23.397 ns]
+Found 9 outliers among 100 measurements (9.00%)
+  1 (1.00%) low severe
+  3 (3.00%) low mild
+  3 (3.00%) high mild
+  2 (2.00%) high severe
 Benchmarking serialization/encode_value/multi_asset_3policy_5asset
 Benchmarking serialization/encode_value/multi_asset_3policy_5asset: Warming up for 3.0000 s
-Benchmarking serialization/encode_value/multi_asset_3policy_5asset: Collecting 100 samples in estimated 5.0005 s (6.8M iterations)
+Benchmarking serialization/encode_value/multi_asset_3policy_5asset: Collecting 100 samples in estimated 5.0005 s (6.6M iterations)
 Benchmarking serialization/encode_value/multi_asset_3policy_5asset: Analyzing
 serialization/encode_value/multi_asset_3policy_5asset
-                        time:   [730.45 ns 732.26 ns 735.92 ns]
-Found 6 outliers among 100 measurements (6.00%)
+                        time:   [760.39 ns 761.60 ns 763.73 ns]
+Found 7 outliers among 100 measurements (7.00%)
+  1 (1.00%) low mild
   3 (3.00%) high mild
   3 (3.00%) high severe
 
