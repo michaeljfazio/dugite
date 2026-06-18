@@ -223,6 +223,49 @@ pub(crate) enum PeerFailureKind {
     ProtocolFault,
     /// Timeout / transport failure — reputation only.
     Slow,
+    /// Peer cannot offer a usable chain: its ChainSync intersection resolves
+    /// only at genesis while our local selection is beyond `k` blocks (the peer
+    /// is far behind our immutable tip, or on a disjoint chain). This is the
+    /// dugite equivalent of Haskell's `ChainSyncClientResult::ForkTooDeep` — an
+    /// EXPECTED, routine outcome on public networks (stale / wrong-chain
+    /// registered relays), NOT a fault. Handled identically to `Slow`
+    /// (reputation + teardown + governor re-promote after backoff) but logged
+    /// at INFO, mirroring cardano-node's `Notice` severity for
+    /// `TraceTermination ForkTooDeep`, so it does not drown real warnings.
+    Unsuitable,
+}
+
+/// Marker error returned by `chainsync_client_task` when the peer's ChainSync
+/// intersection resolves only at genesis while our local selection is beyond
+/// `k` blocks. Downstream code downcasts to this to classify the failure as
+/// [`PeerFailureKind::Unsuitable`] (logged at INFO) instead of a generic fault.
+/// See [`classify_chainsync_failure`]. Equivalent to Haskell `ForkTooDeep`.
+#[derive(Debug, Clone)]
+pub(crate) struct PeerUnsuitable {
+    pub(crate) reason: String,
+}
+
+impl std::fmt::Display for PeerUnsuitable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.reason)
+    }
+}
+
+impl std::error::Error for PeerUnsuitable {}
+
+/// Classify a `chainsync_client_task` failure into a [`PeerFailureKind`].
+///
+/// A [`PeerUnsuitable`] marker (ChainSync intersection only at genesis — the
+/// Haskell `ForkTooDeep` equivalent) is an expected, routine peer-quality
+/// outcome and maps to [`PeerFailureKind::Unsuitable`] (logged at INFO).
+/// Everything else (bearer close, decode error, timeout, etc.) maps to
+/// [`PeerFailureKind::Slow`].
+pub(crate) fn classify_chainsync_failure(err: &anyhow::Error) -> PeerFailureKind {
+    if err.downcast_ref::<PeerUnsuitable>().is_some() {
+        PeerFailureKind::Unsuitable
+    } else {
+        PeerFailureKind::Slow
+    }
 }
 
 use tokio::sync::{broadcast, mpsc, RwLock};
@@ -2174,12 +2217,23 @@ impl ConnectionLifecycleManager {
                 // intersection) leaves the TCP connection up but no headers
                 // arriving (#499).  Matches keepalive/blockfetch pattern.
                 if let Err(e) = result {
-                    warn!(%addr, error = %e, "chainsync task failed");
+                    let kind = classify_chainsync_failure(&e);
+                    // `Unsuitable` (ChainSync intersection only at genesis — the
+                    // Haskell `ForkTooDeep` equivalent) is an EXPECTED outcome on
+                    // public networks (stale / wrong-chain relays), so log it at
+                    // INFO (≈ cardano-node `Notice`). Genuine faults stay WARN so
+                    // they are not drowned out.
+                    if kind == PeerFailureKind::Unsuitable {
+                        info!(%addr, error = %e, "chainsync ended: peer unsuitable (intersection only at genesis / ForkTooDeep) — demoting for backoff");
+                    } else {
+                        warn!(%addr, error = %e, "chainsync task failed");
+                    }
                     if !cancel.is_cancelled() {
-                        // Reported as `Slow` (reputation-only) even for decode
-                        // errors: upgrading ChainSync faults to teardown is a
-                        // behavior change beyond #751's BlockFetch scope.
-                        let _ = peer_failure_tx.try_send((addr, PeerFailureKind::Slow));
+                        // Both kinds hit reputation + teardown in the peer-failure
+                        // handler; they differ only in log severity / reputation
+                        // weight. (Reported as `Slow`/`Unsuitable`, not teardown-
+                        // upgraded, for decode errors — that stays #751's scope.)
+                        let _ = peer_failure_tx.try_send((addr, kind));
                     }
                 }
                 debug!(%addr, "chainsync task exiting");
@@ -5154,6 +5208,35 @@ mod tests {
             Err(mpsc::error::TryRecvError::Empty) => { /* expected */ }
             other => panic!("expected no peer_failure when cancelled, got {:?}", other),
         }
+    }
+
+    /// A `PeerUnsuitable` marker (ChainSync intersection only at genesis — the
+    /// Haskell `ForkTooDeep` equivalent) is an EXPECTED, routine peer-quality
+    /// outcome on public networks, not a fault. It must classify as
+    /// `Unsuitable` so it is logged at INFO (≈ cardano-node `Notice`) rather
+    /// than spamming WARN.
+    #[test]
+    fn classify_chainsync_failure_maps_peer_unsuitable_to_unsuitable() {
+        let err = anyhow::Error::new(PeerUnsuitable {
+            reason: "intersection only at genesis (block_no=4394795 > k=432)".to_string(),
+        });
+        assert_eq!(
+            classify_chainsync_failure(&err),
+            PeerFailureKind::Unsuitable,
+            "a PeerUnsuitable (ForkTooDeep) marker must classify as Unsuitable, not a fault"
+        );
+    }
+
+    /// Any other chainsync failure (bearer close, decode error, timeout) is a
+    /// genuine transport/protocol problem and must stay `Slow` (WARN).
+    #[test]
+    fn classify_chainsync_failure_maps_generic_error_to_slow() {
+        let err = anyhow::anyhow!("bearer read error: timeout");
+        assert_eq!(
+            classify_chainsync_failure(&err),
+            PeerFailureKind::Slow,
+            "a generic transport/decode error must classify as Slow"
+        );
     }
 
     // ── PeerFetchStatus / CandidateChainState status tracking ────────────────
