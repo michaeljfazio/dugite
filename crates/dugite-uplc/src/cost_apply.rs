@@ -181,23 +181,6 @@ fn refill_builtin(
     Ok(())
 }
 
-/// V1 integer-division cpu: `const_above_diagonal` over `multiplied_sizes`,
-/// flat sub-order `constant`, `model-arguments-intercept`,
-/// `model-arguments-slope`. mem: `subtracted_sizes`.
-fn v1_division(cur: &mut Cursor<'_>) -> CostPair {
-    let cpu = CostingFun::ConstAboveDiagonalMul(ConstAboveDiagMulP {
-        constant: cur.next(),
-        intercept: cur.next(),
-        slope: cur.next(),
-    });
-    let mem = CostingFun::SubtractedSizes(SubtractedSizesP {
-        intercept: cur.next(),
-        minimum: cur.next(),
-        slope: cur.next(),
-    });
-    CostPair { cpu, mem }
-}
-
 /// Protocol-version-dependent `BuiltinSemanticsVariant` for PlutusV1/V2.
 ///
 /// Per IntersectMBO/plutus `PlutusLedgerApi.Common.ProtocolVersions`
@@ -208,11 +191,85 @@ fn v1_division(cur: &mut Cursor<'_>) -> CostPair {
 /// flat-array PARAM COUNT is identical across the variants (175 for V2); only
 /// the cost-function SHAPE of two builtins changes — `multiplyInteger` cpu
 /// (`added_sizes` → `multiplied_sizes`) and `verifyEd25519Signature` cpu
-/// (`linear_in_z` → `linear_in_y`). (PV11/van Rossem introduces VariantD with
-/// further text-builtin changes — a future follow-up.)
+/// (`linear_in_z` → `linear_in_y`).
 #[inline]
 fn is_variant_b(major_pv: u32) -> bool {
     major_pv >= 9
+}
+
+/// `DefaultFunSemanticsVariantD` gate for PlutusV1/V2 — the van Rossem hard fork
+/// (`PV11`). Per IntersectMBO/plutus `PlutusLedgerApi.Common.ProtocolVersions`,
+/// PlutusV1 and PlutusV2 move VariantB → VariantD at PV11 (V3 moves C → E).
+///
+/// Beyond the VariantB changes, VariantD changes the cost-function SHAPE of two
+/// integer-division builtins (`builtinCostModelD.json` vs `…B.json`):
+/// `modInteger`/`remainderInteger` MEMORY goes `subtracted_sizes` →
+/// `linear_in_y2` (= `intercept + slope*size_y`, the `minimum` dropped), and
+/// `modInteger`/`divideInteger` CPU goes `const_above_diagonal` →
+/// `above_and_below_diagonal` (always runs the `multiplied_sizes` sub-model over
+/// `(max,min)`, the diagonal `constant` dropped). `quotientInteger` is
+/// unchanged, as are `divideInteger` mem and `remainderInteger` cpu. The flat
+/// param count/order is identical across variants — only the interpretation of
+/// the same coefficients changes.
+#[inline]
+fn is_variant_d(major_pv: u32) -> bool {
+    major_pv >= 11
+}
+
+/// Integer-division (`divideInteger` / `modInteger` / `quotientInteger` /
+/// `remainderInteger`) cost pair, variant-aware. Consumes 6 flat params in
+/// canonical order in EVERY branch — cpu `[constant, intercept, slope]` then mem
+/// `[intercept, minimum, slope]` — so the param cursor stays aligned; only the
+/// cost-function SHAPE differs by semantics variant (see [`is_variant_d`]).
+///
+/// `cpu_variant_d` (set for `modInteger`/`divideInteger` at PV≥11): cpu becomes
+/// `above_and_below_diagonal` over `multiplied_sizes`, which equals
+/// [`CostingFun::MultipliedSizes`] because `max*min == x*y` (the diagonal
+/// `constant` is dropped); otherwise `const_above_diagonal`
+/// ([`CostingFun::ConstAboveDiagonalMul`]).
+///
+/// `mem_variant_d` (set for `modInteger`/`remainderInteger` at PV≥11): mem
+/// becomes `linear_in_y2` = `intercept + slope*size_y` ([`CostingFun::LinearInY`],
+/// the `minimum` dropped); otherwise `subtracted_sizes`
+/// ([`CostingFun::SubtractedSizes`]).
+///
+/// Source: IntersectMBO/plutus `builtinCostModel{B,D}.json` +
+/// `PlutusCore.Evaluation.Machine.CostingFun.Core` (`runTwoArgumentModel`,
+/// `ModelTwoArgumentsLinearInY2` discards the minimum;
+/// `ModelTwoArgumentsAboveAndBelowDiagonal` drops the constant).
+fn divmod_cost(cur: &mut Cursor<'_>, cpu_variant_d: bool, mem_variant_d: bool) -> CostPair {
+    // cpu params: [constant, intercept, slope] (const_above_diagonal / multiplied_sizes).
+    let cpu_constant = cur.next();
+    let cpu_lin = cur.linear(); // intercept, slope
+    let cpu = if cpu_variant_d {
+        // above_and_below_diagonal(multiplied_sizes) ≡ multiplied_sizes, since
+        // max*min == x*y; the diagonal `constant` is dropped at VariantD.
+        CostingFun::MultipliedSizes(cpu_lin)
+    } else {
+        CostingFun::ConstAboveDiagonalMul(ConstAboveDiagMulP {
+            constant: cpu_constant,
+            intercept: cpu_lin.intercept,
+            slope: cpu_lin.slope,
+        })
+    };
+    // mem params: [intercept, minimum, slope] (subtracted_sizes / linear_in_y2).
+    let mem_intercept = cur.next();
+    let mem_minimum = cur.next();
+    let mem_slope = cur.next();
+    let mem = if mem_variant_d {
+        // linear_in_y2 == intercept + slope*size_y; the `minimum` is dropped.
+        CostingFun::LinearInY(Linear1 {
+            intercept: mem_intercept,
+            slope: mem_slope,
+        })
+    } else {
+        CostingFun::SubtractedSizes(SubtractedSizesP {
+            intercept: mem_intercept,
+            minimum: mem_minimum,
+            slope: mem_slope,
+        })
+    };
+    CostPair { cpu, mem }
 }
 
 /// `multiplyInteger` cost pair for the given semantics variant. Consumes 4
@@ -249,6 +306,7 @@ fn verify_ed25519(cur: &mut Cursor<'_>, variant_b: bool) -> CostPair {
 /// `ParamName` order) to a fresh [`AppliedCosts`].
 pub fn apply_v1(p: &[i64], major_pv: u32) -> Result<AppliedCosts, CostModelApplyError> {
     let variant_b = is_variant_b(major_pv);
+    let variant_d = is_variant_d(major_pv);
     if p.len() != V1_PARAM_COUNT {
         return Err(CostModelApplyError::WrongLength {
             expected: V1_PARAM_COUNT,
@@ -285,7 +343,7 @@ pub fn apply_v1(p: &[i64], major_pv: u32) -> Result<AppliedCosts, CostModelApply
     refill_builtin(&mut b, ConsByteString, cur)?;
     refill_builtin(&mut b, ConstrData, cur)?;
     refill_builtin(&mut b, DecodeUtf8, cur)?;
-    b.set_cost_pair(DivideInteger, v1_division(cur));
+    b.set_cost_pair(DivideInteger, divmod_cost(cur, variant_d, false));
     refill_builtin(&mut b, EncodeUtf8, cur)?;
     refill_builtin(&mut b, EqualsByteString, cur)?;
     refill_builtin(&mut b, EqualsData, cur)?;
@@ -307,14 +365,14 @@ pub fn apply_v1(p: &[i64], major_pv: u32) -> Result<AppliedCosts, CostModelApply
     refill_builtin(&mut b, MkNilData, cur)?;
     refill_builtin(&mut b, MkNilPairData, cur)?;
     refill_builtin(&mut b, MkPairData, cur)?;
-    b.set_cost_pair(ModInteger, v1_division(cur));
+    b.set_cost_pair(ModInteger, divmod_cost(cur, variant_d, variant_d));
     // multiplyInteger — VariantA cpu `added_sizes`; VariantB (PV9+)
     // `multiplied_sizes`.
     let mul = multiply_integer(cur, variant_b);
     b.set_cost_pair(MultiplyInteger, mul);
     refill_builtin(&mut b, NullList, cur)?;
-    b.set_cost_pair(QuotientInteger, v1_division(cur));
-    b.set_cost_pair(RemainderInteger, v1_division(cur));
+    b.set_cost_pair(QuotientInteger, divmod_cost(cur, false, false));
+    b.set_cost_pair(RemainderInteger, divmod_cost(cur, false, variant_d));
     refill_builtin(&mut b, Sha2_256, cur)?;
     refill_builtin(&mut b, Sha3_256, cur)?;
     refill_builtin(&mut b, SliceByteString, cur)?;
@@ -371,6 +429,7 @@ pub fn apply_v1(p: &[i64], major_pv: u32) -> Result<AppliedCosts, CostModelApply
 /// no-op for any V2 script that does not call a Plomin-era builtin.
 pub fn apply_v2(p: &[i64], major_pv: u32) -> Result<AppliedCosts, CostModelApplyError> {
     let variant_b = is_variant_b(major_pv);
+    let variant_d = is_variant_d(major_pv);
     if p.len() < V2_PARAM_COUNT {
         return Err(CostModelApplyError::WrongLength {
             expected: V2_PARAM_COUNT,
@@ -407,7 +466,7 @@ pub fn apply_v2(p: &[i64], major_pv: u32) -> Result<AppliedCosts, CostModelApply
     refill_builtin(&mut b, ConsByteString, cur)?;
     refill_builtin(&mut b, ConstrData, cur)?;
     refill_builtin(&mut b, DecodeUtf8, cur)?;
-    b.set_cost_pair(DivideInteger, v1_division(cur));
+    b.set_cost_pair(DivideInteger, divmod_cost(cur, variant_d, false));
     refill_builtin(&mut b, EncodeUtf8, cur)?;
     refill_builtin(&mut b, EqualsByteString, cur)?;
     refill_builtin(&mut b, EqualsData, cur)?;
@@ -429,15 +488,16 @@ pub fn apply_v2(p: &[i64], major_pv: u32) -> Result<AppliedCosts, CostModelApply
     refill_builtin(&mut b, MkNilData, cur)?;
     refill_builtin(&mut b, MkNilPairData, cur)?;
     refill_builtin(&mut b, MkPairData, cur)?;
-    b.set_cost_pair(ModInteger, v1_division(cur));
+    b.set_cost_pair(ModInteger, divmod_cost(cur, variant_d, variant_d));
     // multiplyInteger — VariantA cpu `added_sizes`; VariantB (PV9+)
-    // `multiplied_sizes`. (Division shapes are unchanged A↔B — only the
-    // coefficients differ — so they stay on `v1_division`.)
+    // `multiplied_sizes`. (The integer-division builtins are handled by the
+    // variant-aware `divmod_cost`, which switches their cost shapes at
+    // VariantD/PV11.)
     let mul = multiply_integer(cur, variant_b);
     b.set_cost_pair(MultiplyInteger, mul);
     refill_builtin(&mut b, NullList, cur)?;
-    b.set_cost_pair(QuotientInteger, v1_division(cur));
-    b.set_cost_pair(RemainderInteger, v1_division(cur));
+    b.set_cost_pair(QuotientInteger, divmod_cost(cur, false, false));
+    b.set_cost_pair(RemainderInteger, divmod_cost(cur, false, variant_d));
     // serialiseData — new in V2, alphabetically before sha2_256.
     refill_builtin(&mut b, SerialiseData, cur)?;
     refill_builtin(&mut b, Sha2_256, cur)?;
@@ -775,6 +835,48 @@ pub fn apply_v3(p: &[i64]) -> Result<AppliedCosts, CostModelApplyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `divmod_cost` must select the correct cost-function SHAPE per semantics
+    /// variant while consuming the SAME 6 params (cursor alignment), reading the
+    /// coefficients into the right fields. VariantD (PV≥11) switches
+    /// modInteger/divideInteger cpu → multiplied_sizes and
+    /// modInteger/remainderInteger mem → linear_in_y2; VariantB keeps
+    /// const_above_diagonal / subtracted_sizes. (PV11 byte-correctness fix.)
+    #[test]
+    fn divmod_cost_variant_boundary_shapes() {
+        // cpu [constant, intercept, slope], mem [intercept, minimum, slope]
+        // (modInteger D-model coefficients).
+        let p = [85848_i64, 228465, 122, 0, 1, 1];
+
+        // VariantD modInteger: cpu AND mem switch.
+        let mut cur = Cursor { p: &p, i: 0 };
+        let d = divmod_cost(&mut cur, true, true);
+        assert_eq!(cur.i, 6, "divmod_cost must consume exactly 6 params");
+        match d.cpu {
+            CostingFun::MultipliedSizes(l) => assert_eq!((l.intercept, l.slope), (228465, 122)),
+            other => panic!("VariantD cpu must be MultipliedSizes, got {other:?}"),
+        }
+        match d.mem {
+            CostingFun::LinearInY(l) => assert_eq!((l.intercept, l.slope), (0, 1)),
+            other => panic!("VariantD mem must be LinearInY (linear_in_y2), got {other:?}"),
+        }
+
+        // VariantB: cpu const_above_diagonal(mul), mem subtracted_sizes.
+        let mut cur = Cursor { p: &p, i: 0 };
+        let b = divmod_cost(&mut cur, false, false);
+        match b.cpu {
+            CostingFun::ConstAboveDiagonalMul(c) => {
+                assert_eq!((c.constant, c.intercept, c.slope), (85848, 228465, 122))
+            }
+            other => panic!("VariantB cpu must be ConstAboveDiagonalMul, got {other:?}"),
+        }
+        match b.mem {
+            CostingFun::SubtractedSizes(s) => {
+                assert_eq!((s.intercept, s.minimum, s.slope), (0, 1, 1))
+            }
+            other => panic!("VariantB mem must be SubtractedSizes, got {other:?}"),
+        }
+    }
 
     #[test]
     fn wrong_length_is_rejected() {
