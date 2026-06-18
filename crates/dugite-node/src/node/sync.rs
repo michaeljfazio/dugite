@@ -4903,18 +4903,39 @@ pub async fn chainsync_client_task(
             db.get_tip_info().map(|(_, _, bn)| bn.0).unwrap_or(0)
         };
         if local_block_no > security_param {
-            warn!(
+            // EXPECTED on public networks: the peer shares no history with us
+            // above genesis (it is far behind our immutable tip or on a disjoint
+            // chain), so ChainSync cannot make progress and we end it. This is
+            // the dugite equivalent of Haskell's
+            // `ChainSyncClientResult::ForkTooDeep`, which cardano-node traces at
+            // `Notice` (not `Warning`) — see Consensus tracer + ExitPolicy
+            // (RepromoteDelay 120). We log at INFO and return a `PeerUnsuitable`
+            // marker so `classify_chainsync_failure` maps this to
+            // `PeerFailureKind::Unsuitable` (quiet) instead of a generic fault.
+            //
+            // NOTE — deliberate divergence from Haskell: we tear the whole
+            // connection down here (Bug-A / Bug-E: chain selection cannot operate
+            // across an Origin anchor, and the inbound supervisor cannot re-spawn
+            // a gracefully-ended ChainSync). Haskell ends only the ChainSync
+            // mini-protocol and keeps the mux alive for the other protocols. For
+            // a peer this far behind, block-fetch from it is useless anyway, so
+            // the teardown is harmless; the governor re-promotes after backoff.
+            info!(
                 %peer_addr,
                 local_ledger_tip = %ledger_tip,
                 local_block_no,
                 security_param,
-                "ChainSync intersection at Origin with non-Origin local chain \
-                 beyond k blocks — disconnecting to retry after peer catches up"
+                "ChainSync intersection only at genesis (peer far behind our \
+                 immutable tip / disjoint chain) — ending ChainSync, demoting \
+                 for backoff (Haskell ForkTooDeep equivalent)"
             );
-            return Err(anyhow::anyhow!(
-                "Peer {peer_addr} intersection at Origin with non-Origin local \
-                 ledger tip (block_no={local_block_no} > k={security_param}); \
-                 disconnecting to retry after peer catches up"
+            return Err(anyhow::Error::new(
+                super::connection_lifecycle::PeerUnsuitable {
+                    reason: format!(
+                        "peer {peer_addr} ChainSync intersection only at genesis \
+                         (block_no={local_block_no} > k={security_param})"
+                    ),
+                },
             ));
         }
         info!(

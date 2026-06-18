@@ -5309,7 +5309,16 @@ impl Node {
                 // channel without closing TCP).
                 Some((failed_addr, failure_kind)) = peer_failure_rx.recv() => {
                     let mut pm = peer_manager.write().await;
-                    warn!(%failed_addr, kind = ?failure_kind, "peer reported as failed by protocol task");
+                    // `Unsuitable` (ChainSync intersection only at genesis — the
+                    // Haskell `ForkTooDeep` equivalent) is routine on public
+                    // networks, so log at INFO (≈ cardano-node `Notice`). Real
+                    // faults (Slow / ProtocolFault) stay WARN. Demotion + backoff
+                    // below are identical for every kind.
+                    if failure_kind == PeerFailureKind::Unsuitable {
+                        info!(%failed_addr, kind = ?failure_kind, "peer reported unsuitable by protocol task (intersection only at genesis) — demoting for backoff");
+                    } else {
+                        warn!(%failed_addr, kind = ?failure_kind, "peer reported as failed by protocol task");
+                    }
                     pm.peer_failed(&failed_addr);
                     // #sync-eval companion fix: tear the connection down for
                     // BOTH failure kinds, not just `ProtocolFault`. A `Slow`
