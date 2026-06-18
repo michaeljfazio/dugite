@@ -4194,6 +4194,151 @@ pub(crate) const VOLATILE_POINTS_DEPTH: usize = 10;
 /// chunks (passed to `ChainDB::get_immutable_historical_points`).
 pub(crate) const DEEP_HISTORICAL_DEPTH: usize = 8;
 
+/// Classification of a server response received while the ChainSync client is
+/// in `StIntersect` — i.e. immediately after sending `MsgFindIntersect`, before
+/// any streaming `MsgRequestNext`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IntersectOutcome {
+    /// Legitimate StIntersect reply: an intersection point was found.
+    Found,
+    /// Legitimate StIntersect reply: no intersection within our offered points.
+    NotFound,
+    /// A server *next-phase* response (`MsgRollForward` / `MsgRollBackward` /
+    /// `MsgAwaitReply`) seen while in StIntersect. On a reused (resubscribed)
+    /// mux this is prior-session residue: the previous ChainSync run pipelined
+    /// `MsgRequestNext` and the server's reply was still in-flight in the kernel
+    /// socket buffer when the peer was demoted+re-promoted without TCP teardown;
+    /// the ingress task then routes it onto this fresh channel. It is provably
+    /// NOT a reply to our `MsgFindIntersect` — the client never pipelines a
+    /// request before intersection (see `try_find_intersect`) — so it is safe to
+    /// discard and re-read. (Haskell typed-protocols treats a next-phase message
+    /// in StIntersect as a wire-state violation and tears the run down; we
+    /// recover in place for this known stale-only case instead.)
+    StaleNextPhase,
+    /// Any other message — client-agency `MsgRequestNext` / `MsgFindIntersect` /
+    /// `MsgDone`, or anything unexpected: a genuine protocol violation.
+    Invalid,
+}
+
+/// Classify a message received while in `StIntersect`. Pure and *total* over
+/// every `ChainSyncMessage` variant (no wildcard arm, so adding a protocol
+/// message forces an update here). See [`IntersectOutcome`] / `try_find_intersect`.
+pub(crate) fn classify_intersect_response(msg: &ChainSyncMessage) -> IntersectOutcome {
+    match msg {
+        ChainSyncMessage::MsgIntersectFound { .. } => IntersectOutcome::Found,
+        ChainSyncMessage::MsgIntersectNotFound { .. } => IntersectOutcome::NotFound,
+        ChainSyncMessage::MsgRollForward { .. }
+        | ChainSyncMessage::MsgRollBackward { .. }
+        | ChainSyncMessage::MsgAwaitReply => IntersectOutcome::StaleNextPhase,
+        ChainSyncMessage::MsgRequestNext
+        | ChainSyncMessage::MsgFindIntersect(_)
+        | ChainSyncMessage::MsgDone => IntersectOutcome::Invalid,
+    }
+}
+
+/// Read the reply to a `MsgFindIntersect` we just sent (the server is in
+/// `StIntersect`), tolerating a bounded number of STALE next-phase responses.
+///
+/// Only `MsgIntersectFound` / `MsgIntersectNotFound` are legitimate here. On a
+/// mux that was resubscribed after a warm demote+re-promote (no TCP teardown), a
+/// next-phase response (`MsgRollForward` / `MsgRollBackward` / `MsgAwaitReply`)
+/// from the PRIOR session can still be in-flight in the kernel socket buffer at
+/// swap time and get routed onto this fresh channel by the ingress task. It is
+/// provably NOT a reply to our `MsgFindIntersect` — the caller never pipelines a
+/// request before intersection — so we discard it and re-read, up to
+/// `MAX_STALE_DISCARD`. Beyond that a genuinely broken peer fails fast and falls
+/// back to the pre-existing teardown+reconnect. Mirrors Haskell, whose
+/// typed-protocols codec rejects a next-phase message in StIntersect as a
+/// wire-state violation.
+pub(crate) async fn read_intersect_reply(
+    channel: &mut MuxChannel,
+    peer_addr: SocketAddr,
+) -> Result<Option<CodecPoint>, anyhow::Error> {
+    const MAX_STALE_DISCARD: u32 = 16;
+    let mut discarded: u32 = 0;
+    loop {
+        let response = channel
+            .recv()
+            .await
+            .map_err(|e| anyhow::anyhow!("ChainSync intersection response recv failed: {e}"))?;
+        let intersect_msg = cs_decode(&response)
+            .map_err(|e| anyhow::anyhow!("ChainSync intersection decode failed: {e}"))?;
+
+        match intersect_msg {
+            ChainSyncMessage::MsgIntersectFound {
+                point,
+                tip_slot,
+                tip_block_number,
+                ..
+            } => {
+                let prim_point = from_codec_point(&point);
+                if discarded > 0 {
+                    warn!(
+                        %peer_addr,
+                        discarded,
+                        "ChainSync intersection found after discarding stale next-phase \
+                         residue (reused-mux)",
+                    );
+                }
+                info!(
+                    %peer_addr,
+                    point = %prim_point,
+                    tip_slot,
+                    tip_block_number,
+                    "ChainSync intersection found",
+                );
+                return Ok(Some(point));
+            }
+            ChainSyncMessage::MsgIntersectNotFound {
+                tip_slot,
+                tip_block_number,
+                ..
+            } => {
+                if discarded > 0 {
+                    warn!(
+                        %peer_addr,
+                        discarded,
+                        "ChainSync no-intersection after discarding stale next-phase \
+                         residue (reused-mux)",
+                    );
+                }
+                info!(
+                    %peer_addr,
+                    tip_slot,
+                    tip_block_number,
+                    "ChainSync MsgIntersectNotFound",
+                );
+                return Ok(None);
+            }
+            other => match classify_intersect_response(&other) {
+                IntersectOutcome::StaleNextPhase => {
+                    discarded += 1;
+                    if discarded > MAX_STALE_DISCARD {
+                        return Err(anyhow::anyhow!(
+                            "ChainSync: {discarded} stale next-phase responses in StIntersect \
+                             from {peer_addr}; giving up (will reconnect)"
+                        ));
+                    }
+                    // NB: do NOT Debug-format `other` here — MsgRollForward
+                    // carries the full header bytes and would flood the log.
+                    warn!(
+                        %peer_addr,
+                        discarded,
+                        "ChainSync: discarding stale next-phase response in StIntersect \
+                         (reused-mux residue)",
+                    );
+                    // loop re-reads
+                }
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "ChainSync unexpected response to MsgFindIntersect: {other:?}"
+                    ))
+                }
+            },
+        }
+    }
+}
+
 /// Drop pending headers whose block is already stored in the local ChainDB.
 ///
 /// Use **hash equality** rather than slot comparison: after a peer issues
@@ -4778,47 +4923,14 @@ pub async fn chainsync_client_task(
             .await
             .map_err(|e| anyhow::anyhow!("ChainSync MsgFindIntersect send failed: {e}"))?;
 
-        let response = channel
-            .recv()
-            .await
-            .map_err(|e| anyhow::anyhow!("ChainSync intersection response recv failed: {e}"))?;
-        let intersect_msg = cs_decode(&response)
-            .map_err(|e| anyhow::anyhow!("ChainSync intersection decode failed: {e}"))?;
-
-        match intersect_msg {
-            ChainSyncMessage::MsgIntersectFound {
-                point,
-                tip_slot,
-                tip_block_number,
-                ..
-            } => {
-                let prim_point = from_codec_point(&point);
-                info!(
-                    %peer_addr,
-                    point = %prim_point,
-                    tip_slot,
-                    tip_block_number,
-                    "ChainSync intersection found",
-                );
-                Ok(Some(point))
-            }
-            ChainSyncMessage::MsgIntersectNotFound {
-                tip_slot,
-                tip_block_number,
-                ..
-            } => {
-                info!(
-                    %peer_addr,
-                    tip_slot,
-                    tip_block_number,
-                    "ChainSync MsgIntersectNotFound",
-                );
-                Ok(None)
-            }
-            other => Err(anyhow::anyhow!(
-                "ChainSync unexpected response to MsgFindIntersect: {other:?}"
-            )),
-        }
+        // After MsgFindIntersect the server is in StIntersect; read the reply,
+        // tolerating bounded stale next-phase residue from a reused mux (see
+        // `read_intersect_reply` / `classify_intersect_response`).
+        //
+        // INVARIANT: that tolerance is sound ONLY because we do NOT pipeline any
+        // request before this read — do not add a pre-intersection
+        // MsgRequestNext without revisiting `read_intersect_reply`.
+        read_intersect_reply(channel, peer_addr).await
     }
 
     // Attempt 1: use the known_points we built above.
@@ -6755,6 +6867,206 @@ mod forecast_park_tests {
 #[cfg(test)]
 mod chainsync_task_tests {
     use super::*;
+
+    /// `classify_intersect_response` must map every `ChainSyncMessage` variant
+    /// correctly: only `MsgIntersectFound`/`NotFound` are legitimate replies in
+    /// StIntersect; the three server next-phase responses are stale residue to
+    /// discard; everything else is a protocol violation. (Drives the stale-
+    /// RollForward-on-reused-mux fix.)
+    #[test]
+    fn classify_intersect_response_covers_all_variants() {
+        let found = ChainSyncMessage::MsgIntersectFound {
+            point: CodecPoint::Origin,
+            tip_slot: 1,
+            tip_hash: [0u8; 32],
+            tip_block_number: 1,
+        };
+        let not_found = ChainSyncMessage::MsgIntersectNotFound {
+            tip_slot: 1,
+            tip_hash: [0u8; 32],
+            tip_block_number: 1,
+        };
+        let roll_fwd = ChainSyncMessage::MsgRollForward {
+            header: vec![],
+            tip_slot: 1,
+            tip_hash: [0u8; 32],
+            tip_block_number: 1,
+        };
+        let roll_back = ChainSyncMessage::MsgRollBackward {
+            point: CodecPoint::Origin,
+            tip_slot: 1,
+            tip_hash: [0u8; 32],
+            tip_block_number: 1,
+        };
+        assert_eq!(classify_intersect_response(&found), IntersectOutcome::Found);
+        assert_eq!(
+            classify_intersect_response(&not_found),
+            IntersectOutcome::NotFound
+        );
+        // The three stale next-phase responses (reused-mux residue):
+        assert_eq!(
+            classify_intersect_response(&roll_fwd),
+            IntersectOutcome::StaleNextPhase
+        );
+        assert_eq!(
+            classify_intersect_response(&roll_back),
+            IntersectOutcome::StaleNextPhase
+        );
+        assert_eq!(
+            classify_intersect_response(&ChainSyncMessage::MsgAwaitReply),
+            IntersectOutcome::StaleNextPhase
+        );
+        // Client-agency / terminal messages are genuine violations here:
+        assert_eq!(
+            classify_intersect_response(&ChainSyncMessage::MsgRequestNext),
+            IntersectOutcome::Invalid
+        );
+        assert_eq!(
+            classify_intersect_response(&ChainSyncMessage::MsgFindIntersect(vec![])),
+            IntersectOutcome::Invalid
+        );
+        assert_eq!(
+            classify_intersect_response(&ChainSyncMessage::MsgDone),
+            IntersectOutcome::Invalid
+        );
+    }
+
+    /// Build a `MuxChannel` whose ingress is preloaded with the given complete
+    /// CBOR frames (each a `cs_encode`d `ChainSyncMessage`), then closed. Lets
+    /// `read_intersect_reply` be driven without a live mux/egress.
+    fn preload_chainsync_channel(frames: Vec<Vec<u8>>) -> dugite_network::MuxChannel {
+        use dugite_network::{Direction, MuxChannel};
+        type Bytes = tokio_util::bytes::Bytes;
+        let (egress_tx, _egress_rx) = tokio::sync::mpsc::channel::<(u16, Direction, Bytes)>(8);
+        let (ingress_tx, ingress_rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+        for f in frames {
+            ingress_tx
+                .try_send(Bytes::from(f))
+                .expect("preload ingress");
+        }
+        drop(ingress_tx); // close after preloading; recv yields buffered frames first
+        MuxChannel::new(
+            2,
+            Direction::InitiatorDir,
+            egress_tx,
+            ingress_rx,
+            65_536,
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        )
+    }
+
+    fn test_addr() -> std::net::SocketAddr {
+        "127.0.0.1:3001".parse().unwrap()
+    }
+
+    fn enc(msg: &ChainSyncMessage) -> Vec<u8> {
+        cs_encode(msg)
+    }
+
+    fn stale_roll_forward() -> Vec<u8> {
+        enc(&ChainSyncMessage::MsgRollForward {
+            header: vec![0x80], // any valid CBOR value; content irrelevant (discarded)
+            tip_slot: 9,
+            tip_hash: [1u8; 32],
+            tip_block_number: 9,
+        })
+    }
+
+    /// THE BUG REPRO: a stale `MsgRollForward` (prior-session residue on a
+    /// reused mux) is discarded, then the real `MsgIntersectFound` is returned.
+    /// Pre-fix this hit the `unexpected response` error and tore the peer down.
+    #[tokio::test]
+    async fn read_intersect_reply_discards_one_stale_rollforward_then_found() {
+        let found = enc(&ChainSyncMessage::MsgIntersectFound {
+            point: CodecPoint::Origin,
+            tip_slot: 10,
+            tip_hash: [2u8; 32],
+            tip_block_number: 10,
+        });
+        let mut ch = preload_chainsync_channel(vec![stale_roll_forward(), found]);
+        let res = read_intersect_reply(&mut ch, test_addr()).await;
+        assert!(
+            matches!(res, Ok(Some(_))),
+            "stale RollForward must be discarded then IntersectFound returned, got {res:?}"
+        );
+    }
+
+    /// A clean connection (only the intersect reply) is byte-identical behavior.
+    #[tokio::test]
+    async fn read_intersect_reply_clean_found_and_not_found() {
+        let found = enc(&ChainSyncMessage::MsgIntersectFound {
+            point: CodecPoint::Origin,
+            tip_slot: 5,
+            tip_hash: [0u8; 32],
+            tip_block_number: 5,
+        });
+        let mut ch = preload_chainsync_channel(vec![found]);
+        assert!(matches!(
+            read_intersect_reply(&mut ch, test_addr()).await,
+            Ok(Some(_))
+        ));
+
+        let not_found = enc(&ChainSyncMessage::MsgIntersectNotFound {
+            tip_slot: 5,
+            tip_hash: [0u8; 32],
+            tip_block_number: 5,
+        });
+        let mut ch = preload_chainsync_channel(vec![not_found]);
+        assert!(matches!(
+            read_intersect_reply(&mut ch, test_addr()).await,
+            Ok(None)
+        ));
+    }
+
+    /// Multiple stale next-phase variants (RollBackward + AwaitReply) discarded
+    /// before the real NotFound.
+    #[tokio::test]
+    async fn read_intersect_reply_discards_rollback_and_awaitreply_then_not_found() {
+        let rb = enc(&ChainSyncMessage::MsgRollBackward {
+            point: CodecPoint::Origin,
+            tip_slot: 1,
+            tip_hash: [0u8; 32],
+            tip_block_number: 1,
+        });
+        let await_reply = enc(&ChainSyncMessage::MsgAwaitReply);
+        let nf = enc(&ChainSyncMessage::MsgIntersectNotFound {
+            tip_slot: 2,
+            tip_hash: [0u8; 32],
+            tip_block_number: 2,
+        });
+        let mut ch = preload_chainsync_channel(vec![rb, await_reply, nf]);
+        assert!(matches!(
+            read_intersect_reply(&mut ch, test_addr()).await,
+            Ok(None)
+        ));
+    }
+
+    /// Beyond MAX_STALE_DISCARD (16) the reader fails fast (→ reconnect), not
+    /// an infinite spin on a genuinely broken peer.
+    #[tokio::test]
+    async fn read_intersect_reply_exceeds_stale_bound_errors() {
+        let frames: Vec<Vec<u8>> = (0..17).map(|_| stale_roll_forward()).collect();
+        let mut ch = preload_chainsync_channel(frames);
+        let res = read_intersect_reply(&mut ch, test_addr()).await;
+        let err = res.expect_err("17 stale frames must exceed the bound and error");
+        assert!(
+            format!("{err:?}").contains("giving up"),
+            "expected a give-up error, got: {err:?}"
+        );
+    }
+
+    /// A genuine protocol violation (client-agency/terminal message in
+    /// StIntersect) errors immediately, NOT tolerated.
+    #[tokio::test]
+    async fn read_intersect_reply_genuine_violation_errors_immediately() {
+        let mut ch = preload_chainsync_channel(vec![enc(&ChainSyncMessage::MsgDone)]);
+        let res = read_intersect_reply(&mut ch, test_addr()).await;
+        let err = res.expect_err("MsgDone in StIntersect is a violation");
+        assert!(
+            format!("{err:?}").contains("unexpected response"),
+            "expected the unexpected-response error, got: {err:?}"
+        );
+    }
 
     /// Verify extract_hash_from_header produces a 32-byte array.
     #[test]
