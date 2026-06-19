@@ -6998,16 +6998,24 @@ impl Node {
                 .slot_to_wallclock_ms(block_slot.0, &view.slot_config)
                 .await;
             self.metrics.set_tip_slot_time_ms(slot_time_ms);
-            let (live_epoch, pv_major, pv_minor) = {
+            let (live_epoch, pv_major, pv_minor, treasury, reserves) = {
                 let ls = self.ledger_state.read().await;
                 (
                     ls.epoch.0,
                     ls.epochs.protocol_params.protocol_version_major,
                     ls.epochs.protocol_params.protocol_version_minor,
+                    ls.epochs.treasury.0,
+                    ls.epochs.reserves.0,
                 )
             };
             self.metrics.set_epoch(live_epoch);
             self.metrics.set_protocol_version(pv_major, pv_minor);
+            // Keep the pots gauges as live as the epoch gauge.  This per-block
+            // path runs at tip too (unlike the catch-up-only inline store in
+            // `apply_fetched_block`), so the reserves→treasury transfer applied
+            // at an epoch boundary is reflected immediately even when the node
+            // did not forge the boundary block.  Cheap (two atomic stores).
+            self.metrics.set_pots(treasury, reserves);
         }
         // Authoritative era from the applied block's HFC era tag — NOT from the
         // ledger protocol-version major (which is Shelley-shaped and reads 2
