@@ -1725,6 +1725,7 @@ dependencies = [
  "dugite-rpc",
  "dugite-serialization",
  "dugite-storage",
+ "dugite-uplc",
  "ed25519-dalek",
  "fs2",
  "futures",

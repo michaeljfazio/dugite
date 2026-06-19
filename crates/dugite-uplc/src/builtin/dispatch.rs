@@ -135,6 +135,7 @@ pub fn apply_builtin(
     // invoke the denotation.
     if let Some(t) = tracker {
         let cost = t.builtin_costs.charge_for_args(id, &args);
+        record_builtin_charge(id, cost);
         t.charge(cost)?;
     }
     denote(id, args, trace_log, variant)
@@ -145,6 +146,53 @@ pub fn apply_builtin(
 /// constructors don't carry the full `BuiltinId` import everywhere.
 fn builtin_name_static(id: BuiltinId) -> &'static str {
     id.name()
+}
+
+// ─── Diagnostic per-builtin charge trace (DUGITE_UPLC_BUILTIN_TRACE) ──────────
+//
+// When the env var is set, every per-builtin charge is accumulated by builtin
+// name on the evaluating thread. `take_builtin_trace` drains the aggregates so
+// an offline tool (e.g. `replay_phase2`) can localize a phase-2 mem/cpu
+// accounting divergence to a specific builtin. Zero overhead when disabled
+// (one cached atomic load per call).
+thread_local! {
+    static BUILTIN_TRACE: std::cell::RefCell<std::collections::HashMap<&'static str, (i64, i64, u64)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn builtin_trace_enabled() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("DUGITE_UPLC_BUILTIN_TRACE").is_ok())
+}
+
+#[inline]
+fn record_builtin_charge(id: BuiltinId, cost: crate::machine::cost::ExBudget) {
+    if !builtin_trace_enabled() {
+        return;
+    }
+    BUILTIN_TRACE.with(|m| {
+        let mut m = m.borrow_mut();
+        let e = m.entry(id.name()).or_insert((0, 0, 0));
+        e.0 = e.0.saturating_add(cost.cpu);
+        e.1 = e.1.saturating_add(cost.mem);
+        e.2 += 1;
+    });
+}
+
+/// Drain the per-builtin charge aggregates `(name, total_cpu, total_mem,
+/// invocations)` accumulated on this thread when `DUGITE_UPLC_BUILTIN_TRACE`
+/// is set, sorted by total mem descending. Diagnostic only.
+pub fn take_builtin_trace() -> Vec<(&'static str, i64, i64, u64)> {
+    BUILTIN_TRACE.with(|m| {
+        let mut v: Vec<(&'static str, i64, i64, u64)> = m
+            .borrow()
+            .iter()
+            .map(|(k, (c, mm, n))| (*k, *c, *mm, *n))
+            .collect();
+        m.borrow_mut().clear();
+        v.sort_by_key(|b| std::cmp::Reverse(b.2));
+        v
+    })
 }
 
 #[cfg(test)]
