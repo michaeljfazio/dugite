@@ -569,6 +569,26 @@ fn governance_snapshot_from_ledger(ls: &LedgerState) -> GovernanceSnapshot {
     }
 }
 
+/// Refresh the *heavier* per-block gauges — the full governance snapshot
+/// (DReps, proposals, committee, pparams, and pots) plus `utxo_count` — from
+/// live ledger state.
+///
+/// This is deliberately distinct from the O(1) pots refresh ([`crate::metrics::NodeMetrics::set_pots`])
+/// that runs on the universal per-block path (`post_block_apply_updates`):
+/// [`governance_snapshot_from_ledger`] walks the governance maps, so this is
+/// reserved for the at-tip / era-transition branch of `apply_fetched_block`
+/// (and the forge path), where blocks are seconds apart. It must NOT run per
+/// block on the bulk-sync hot path — that is the whole point of the at-tip
+/// gate; doing so would reintroduce the per-block governance walk the catch-up
+/// branch deliberately skips. Without this call, `drep_count`, `proposal_count`,
+/// the committee gauges, the pparam gauges, and `utxo_count` froze at tip on
+/// every epoch boundary the node did not forge itself — the same staleness
+/// class the pots gauge had.
+pub(crate) fn refresh_heavy_at_tip_gauges(metrics: &crate::metrics::NodeMetrics, ls: &LedgerState) {
+    metrics.set_governance_snapshot(&governance_snapshot_from_ledger(ls));
+    metrics.set_utxo_count(ls.utxo.utxo_set.len() as u64);
+}
+
 // ─── NodeArgs ────────────────────────────────────────────────────────────────
 
 pub struct NodeArgs {
@@ -6640,6 +6660,17 @@ impl Node {
                     let is_era_transition = ls.pending_era_transition.is_some();
                     if at_tip || is_era_transition {
                         self.publish_ledger_view(&ls);
+                        // Refresh the heavy governance gauges + utxo_count
+                        // per-block AT TIP / era-boundary. `publish_ledger_view`
+                        // alone touches no Prometheus atomics, so without this
+                        // the DRep / proposal / committee / pparam / utxo_count
+                        // gauges froze at tip on every epoch boundary the node
+                        // did not forge itself (same staleness class as pots).
+                        // Gated on at_tip || is_era_transition so the governance
+                        // map walk never runs per-block on the bulk-sync hot
+                        // path (the catch-up `else` branch keeps the O(1)
+                        // atomics only).
+                        refresh_heavy_at_tip_gauges(&self.metrics, &ls);
                     } else {
                         // We're catching up — skip the heavy LedgerView Arc
                         // materialization (the whole point of the gate) but
@@ -10765,6 +10796,53 @@ mod tests {
         assert_eq!(metrics.peers_inbound.load(Relaxed), 0);
         assert_eq!(metrics.conn_inbound.load(Relaxed), 0);
         assert_eq!(metrics.n2n_connections_active.load(Relaxed), 0);
+    }
+
+    /// Regression: the heavy governance gauges (DReps, proposals, committee,
+    /// pparams) and `utxo_count` must be refreshed per-block AT TIP, not only
+    /// during bulk sync (5 s gate) / on forge / at startup. Before this fix the
+    /// at-tip received-block path (`apply_fetched_block` at_tip branch) called
+    /// only `publish_ledger_view` (which touches no atomics), so these gauges
+    /// froze at the last value once the node reached tip — the same staleness
+    /// class as the pots gauge. `refresh_heavy_at_tip_gauges` is the seam the
+    /// at-tip / era-transition branch uses; this asserts it overwrites stale
+    /// gauge values from live ledger state.
+    #[test]
+    fn refresh_heavy_at_tip_gauges_refreshes_governance_and_utxo() {
+        use crate::metrics::NodeMetrics;
+        use crate::node::refresh_heavy_at_tip_gauges;
+        use dugite_ledger::LedgerState;
+        use dugite_primitives::protocol_params::ProtocolParameters;
+        use dugite_primitives::value::Lovelace;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let metrics = NodeMetrics::default();
+        let mut ls = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        ls.epochs.treasury = Lovelace(111);
+        ls.epochs.reserves = Lovelace(222);
+
+        // Stale gauge values from a prior refresh; the at-tip refresh must
+        // overwrite them from live ledger state, not leave them frozen.
+        metrics.set_utxo_count(9999);
+        metrics.set_pots(1, 2);
+
+        refresh_heavy_at_tip_gauges(&metrics, &ls);
+
+        assert_eq!(
+            metrics.utxo_count.load(Relaxed),
+            ls.utxo.utxo_set.len() as u64,
+            "utxo_count must be refreshed from live ledger at tip (was stale 9999)"
+        );
+        assert_eq!(
+            metrics.treasury_lovelace.load(Relaxed),
+            111,
+            "treasury gauge must reflect live ledger pots at tip"
+        );
+        assert_eq!(
+            metrics.reserves_lovelace.load(Relaxed),
+            222,
+            "reserves gauge must reflect live ledger pots at tip"
+        );
     }
 
     // ─── Forge peer-connectivity gate tests (Bug C) ──────────────────────────
