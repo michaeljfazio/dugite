@@ -115,6 +115,64 @@ impl MachineCosts {
 /// check in blocks of [`SLIPPAGE`] steps. We mirror the same constant.
 pub const SLIPPAGE: u64 = 200;
 
+// ─── Diagnostic per-CEK-step-type charge trace (DUGITE_UPLC_BUILTIN_TRACE) ────
+//
+// When the env var is set, each `compute_step` charge is accumulated by term
+// (step) kind on the evaluating thread. Drained via `take_step_trace` by an
+// offline tool to localize a phase-2 step-accounting divergence. Zero overhead
+// when disabled.
+thread_local! {
+    static STEP_TRACE: std::cell::RefCell<std::collections::HashMap<&'static str, (i64, i64, u64)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn step_trace_enabled() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("DUGITE_UPLC_BUILTIN_TRACE").is_ok())
+}
+
+#[inline]
+fn record_step_charge(term: &Term, cost: ExBudget) {
+    if !step_trace_enabled() {
+        return;
+    }
+    let kind = match term {
+        Term::Var(_) => "step:var",
+        Term::Const(_) => "step:const",
+        Term::Lam(_) => "step:lam",
+        Term::Delay(_) => "step:delay",
+        Term::Force(_) => "step:force",
+        Term::App(_, _) => "step:apply",
+        Term::Builtin(_) => "step:builtin",
+        Term::Constr { .. } => "step:constr",
+        Term::Case { .. } => "step:case",
+        Term::Error => "step:error",
+    };
+    STEP_TRACE.with(|m| {
+        let mut m = m.borrow_mut();
+        let e = m.entry(kind).or_insert((0, 0, 0));
+        e.0 = e.0.saturating_add(cost.cpu);
+        e.1 = e.1.saturating_add(cost.mem);
+        e.2 += 1;
+    });
+}
+
+/// Drain per-CEK-step-type charge aggregates `(kind, total_cpu, total_mem,
+/// count)` accumulated on this thread when `DUGITE_UPLC_BUILTIN_TRACE` is set,
+/// sorted by total mem descending. Diagnostic only.
+pub fn take_step_trace() -> Vec<(&'static str, i64, i64, u64)> {
+    STEP_TRACE.with(|m| {
+        let mut v: Vec<(&'static str, i64, i64, u64)> = m
+            .borrow()
+            .iter()
+            .map(|(k, (c, mm, n))| (*k, *c, *mm, *n))
+            .collect();
+        m.borrow_mut().clear();
+        v.sort_by_key(|b| std::cmp::Reverse(b.2));
+        v
+    })
+}
+
 /// State for a budget-tracking CEK run.
 #[derive(Debug, Clone)]
 pub struct BudgetTracker {
@@ -219,6 +277,7 @@ impl BudgetTracker {
     /// steps; exhaustion is returned at the flush boundary.
     pub fn compute_step(&mut self, term: &Term) -> Result<(), UplcError> {
         let cost = self.costs.cost_for(term);
+        record_step_charge(term, cost);
         self.pending.cpu = self.pending.cpu.saturating_add(cost.cpu);
         self.pending.mem = self.pending.mem.saturating_add(cost.mem);
         self.pending_count = self.pending_count.saturating_add(1);

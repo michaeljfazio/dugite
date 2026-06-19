@@ -27,6 +27,7 @@ dugite-serialization = { workspace = true }
 dugite-network = { workspace = true }
 dugite-consensus = { workspace = true }
 dugite-ledger = { workspace = true }
+dugite-uplc = { workspace = true }
 dugite-mempool = { workspace = true }
 dugite-storage = { workspace = true }
 dugite-rpc = { workspace = true }
