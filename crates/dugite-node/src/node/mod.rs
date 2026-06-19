@@ -5688,7 +5688,7 @@ impl Node {
     async fn validate_peer_header_full(
         &mut self,
         block: &dugite_primitives::block::Block,
-    ) -> Result<(), String> {
+    ) -> Result<(), dugite_consensus::ConsensusError> {
         // Byron has no Praos header crypto — validated on the ledger path.
         if !block.era.is_shelley_based() {
             return Ok(());
@@ -5789,7 +5789,9 @@ impl Node {
             ls.forecast_max_block_body_size_for_epoch(block_epoch),
             ls.epochs.protocol_params.max_block_header_size,
         ) {
-            return Err(format!("envelope check: {e}"));
+            return Err(dugite_consensus::ConsensusError::InvalidBlock(format!(
+                "envelope check: {e}"
+            )));
         }
 
         let current_slot_for_check = wall_clock_slot
@@ -5813,7 +5815,7 @@ impl Node {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
-            Err(e) => Err(e.to_string()),
+            Err(e) => Err(e),
         }
     }
 
@@ -5979,6 +5981,37 @@ impl Node {
                             // is in range. No `ls` lock is held here, so the read-lock
                             // acquired by `validate_peer_header_full` is safe.
                             if let Err(reason) = self.validate_peer_header_full(&fork_block).await {
+                                // FutureBlock during fork replay: transient — do NOT
+                                // blacklist.  The fork is simply abandoned for now; the
+                                // peer may reconnect and re-offer the fork once the slot
+                                // has passed.  All other errors are permanent crypto
+                                // failures and go through abandon_failed_fork normally.
+                                if matches!(
+                                    reason,
+                                    dugite_consensus::ConsensusError::FutureBlock { .. }
+                                ) {
+                                    warn!(
+                                        slot = fork_slot.0,
+                                        block = fork_block_no.0,
+                                        "Fork replay: future-slot block beyond clock skew — \
+                                         dropping fork WITHOUT blacklisting (transient)"
+                                    );
+                                    self.metrics
+                                        .header_validation_failures_total
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    // Roll back chain + ledger without touching invalid_cache.
+                                    {
+                                        let mut db = self.chain_db.write().await;
+                                        if let Err(e) = db.rollback_to_point(&rollback_point) {
+                                            error!(
+                                                error = %e,
+                                                "future-block fork rollback: volatile rollback failed"
+                                            );
+                                        }
+                                    }
+                                    let _ = self.handle_ledger_rollback(&rollback_point).await;
+                                    break;
+                                }
                                 warn!(
                                     slot = fork_slot.0,
                                     block = fork_block_no.0,
@@ -6490,6 +6523,62 @@ impl Node {
         // Haskell, where the header is checked against the predecessor's
         // forecast as the chain is extended.
         if let Err(reason) = self.validate_peer_header_full(&block).await {
+            // ── FutureBlock is a TRANSIENT condition, not a permanent failure ──
+            //
+            // Haskell cardano-node handles blocks from the future entirely in
+            // the ChainSync client layer
+            // (`Ouroboros.Consensus.MiniProtocol.ChainSync.Client.InFutureCheck`):
+            //
+            //   • Within the 2-second `defaultClockSkew` window: the client
+            //     sleeps (`threadDelay`) until the slot onset and then proceeds
+            //     normally.
+            //   • Beyond the skew window: the client throws
+            //     `InFutureHeaderExceedsClockSkew` and disconnects the peer.
+            //
+            // In NEITHER case does the block enter `cdbInvalid` (the invalid-
+            // blocks set).  `addInvalidBlock` / `ExtValidationError` only cover
+            // real ledger/crypto failures, not timing conditions.
+            //
+            // Dugite historically called `abandon_failed_fork` here for ALL
+            // validation errors, which inserted the block into `invalid_cache`
+            // permanently.  For a FutureBlock this caused a wedge: the peer
+            // reconnected and re-offered the (now valid) block, which was
+            // immediately rejected from the cache — stalling the chain forever.
+            //
+            // Fix: if the error is FutureBlock, roll back the chain to the
+            // parent (so we are not stuck with an unapplied tip) but do NOT
+            // insert into invalid_cache.  The peer will reconnect and re-offer
+            // once the slot has passed.
+            if matches!(reason, dugite_consensus::ConsensusError::FutureBlock { .. }) {
+                warn!(
+                    peer = %fetched.peer,
+                    slot = block_slot.0,
+                    block = block_number.0,
+                    hash = %block_hash.to_hex(),
+                    "Praos: block from future slot (beyond clock skew) — \
+                     rolling back without blacklisting (transient, peer will retry)"
+                );
+                self.metrics
+                    .header_validation_failures_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Roll back chain + ledger but do NOT insert into invalid_cache.
+                let parent_point = {
+                    let ls = self.ledger_state.read().await;
+                    ls.tip.point.clone()
+                };
+                {
+                    let mut db = self.chain_db.write().await;
+                    if let Err(e) = db.rollback_to_point(&parent_point) {
+                        error!(
+                            error = %e,
+                            "future-block rollback: volatile rollback to parent failed"
+                        );
+                    }
+                }
+                let _ = self.handle_ledger_rollback(&parent_point).await;
+                return;
+            }
+
             warn!(
                 peer = %fetched.peer,
                 slot = block_slot.0,

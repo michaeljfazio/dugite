@@ -14,6 +14,21 @@ pub const KES_PERIOD_SLOTS: u64 = 129600;
 /// Maximum number of KES evolutions (mainnet: 62)
 pub const MAX_KES_EVOLUTIONS: u64 = 62;
 
+/// Maximum permissible clock skew for headers from the future (in slots).
+///
+/// Mirrors Haskell ouroboros-consensus
+/// `Ouroboros.Consensus.MiniProtocol.ChainSync.Client.InFutureCheck.defaultClockSkew`
+/// which is 2 seconds (`clockSkewInSeconds 2`).  All live Cardano eras use a
+/// 1-second slot length, so 2 seconds maps directly to 2 slots.
+///
+/// A header whose slot is at most `current_slot + CLOCK_SKEW_SLOTS` is
+/// accepted after a brief sleep until slot onset (or immediately if it has
+/// already passed).  A header further in the future causes the peer to be
+/// disconnected — but the block is NEVER added to the permanent invalid cache,
+/// because its time-invalidity is transient: the peer may reconnect and
+/// re-offer it once the clock has advanced.
+pub const CLOCK_SKEW_SLOTS: u64 = 2;
+
 #[derive(Error, Debug)]
 pub enum ConsensusError {
     #[error("Invalid block: {0}")]
@@ -474,12 +489,21 @@ impl OuroborosPraos {
             }
         }
 
-        // Block must not be from the future
-        if header.slot > current_slot {
+        // Block must not be from the future beyond the permissible clock skew.
+        //
+        // Haskell `defaultClockSkew` = 2 seconds (NominalDiffTime).  All live
+        // Cardano eras use 1 s/slot, so 2 s == 2 slots.  A block whose slot is
+        // within the skew window is allowed through (the caller is responsible
+        // for sleeping until the slot onset if necessary); a block beyond the
+        // skew window causes a `FutureBlock` error, which the caller should
+        // treat as a transient/deferred condition — NOT a permanent
+        // invalidation.
+        if header.slot.0 > current_slot.0.saturating_add(CLOCK_SKEW_SLOTS) {
             warn!(
                 block_slot = header.slot.0,
                 current_slot = current_slot.0,
-                "Praos: rejecting future block"
+                skew_slots = CLOCK_SKEW_SLOTS,
+                "Praos: rejecting future block (beyond clock skew)"
             );
             return Err(ConsensusError::FutureBlock {
                 current: current_slot.0,
@@ -613,8 +637,9 @@ impl OuroborosPraos {
         ledger_pv_major: Option<u64>,
         ledger_tip_slot: Option<SlotNo>,
     ) -> Result<(), ConsensusError> {
-        // 1. Structural checks (always fatal)
-        if header.slot > current_slot {
+        // 1. Structural checks (always fatal for actual crypto failures, but
+        // FutureBlock is transient — see CLOCK_SKEW_SLOTS documentation).
+        if header.slot.0 > current_slot.0.saturating_add(CLOCK_SKEW_SLOTS) {
             return Err(ConsensusError::FutureBlock {
                 current: current_slot.0,
                 block: header.slot.0,
@@ -5481,6 +5506,50 @@ mod tests {
         assert!(
             !matches!(result, Err(ConsensusError::FutureBlock { .. })),
             "Block at current_slot should not be rejected as FutureBlock, got {result:?}"
+        );
+    }
+
+    /// Clock-skew tolerance: a block 1 slot ahead of the wall clock is within
+    /// the 2-slot skew window and must NOT be rejected as FutureBlock.
+    /// Matches Haskell `defaultClockSkew = clockSkewInSeconds 2` (2 s = 2 slots
+    /// at 1 s/slot).
+    #[test]
+    fn clock_skew_one_slot_ahead_allowed() {
+        let praos = OuroborosPraos::new(11);
+        let header = make_valid_header(101); // block at slot 101
+        let current_slot = SlotNo(100); // wall clock at slot 100
+        let result = praos.validate_header(&header, current_slot, ValidationMode::Replay, None);
+        assert!(
+            !matches!(result, Err(ConsensusError::FutureBlock { .. })),
+            "Block 1 slot ahead is within clock skew and must not be FutureBlock, got {result:?}"
+        );
+    }
+
+    /// Clock-skew tolerance: a block exactly at the skew boundary (current + 2)
+    /// must NOT be rejected.
+    #[test]
+    fn clock_skew_at_boundary_allowed() {
+        let praos = OuroborosPraos::new(11);
+        let header = make_valid_header(102); // block at current + CLOCK_SKEW_SLOTS
+        let current_slot = SlotNo(100);
+        let result = praos.validate_header(&header, current_slot, ValidationMode::Replay, None);
+        assert!(
+            !matches!(result, Err(ConsensusError::FutureBlock { .. })),
+            "Block at current + CLOCK_SKEW_SLOTS must not be FutureBlock, got {result:?}"
+        );
+    }
+
+    /// Clock-skew: a block ONE BEYOND the skew boundary (current + 3) MUST be
+    /// rejected as FutureBlock.
+    #[test]
+    fn clock_skew_beyond_boundary_rejected() {
+        let praos = OuroborosPraos::new(11);
+        let header = make_valid_header(103); // block at current + CLOCK_SKEW_SLOTS + 1
+        let current_slot = SlotNo(100);
+        let result = praos.validate_header(&header, current_slot, ValidationMode::Replay, None);
+        assert!(
+            matches!(result, Err(ConsensusError::FutureBlock { .. })),
+            "Block beyond CLOCK_SKEW_SLOTS must be FutureBlock, got {result:?}"
         );
     }
 }
