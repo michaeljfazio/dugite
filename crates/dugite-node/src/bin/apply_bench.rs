@@ -381,6 +381,51 @@ fn main() {
         ledger.utxo.utxo_set.len()
     );
 
+    // Diagnostic probe (issue: epoch-boundary reward-pots divergence).
+    // When DUGITE_DUMP_LEDGER_PROBE is set, print the reward-update inputs and
+    // pots straight from the loaded snapshot, then exit — used to confirm
+    // whether `bprev_blocks_by_pool` (eta numerator) is empty at the boundary.
+    if std::env::var("DUGITE_DUMP_LEDGER_PROBE").is_ok() {
+        let e = &ledger.epochs;
+        let bprev_sum: u64 = e.snapshots.bprev_blocks_by_pool.values().sum();
+        eprintln!("[probe] epoch={}", ledger.epoch.0);
+        eprintln!("[probe] treasury={}", e.treasury.0);
+        eprintln!("[probe] reserves={}", e.reserves.0);
+        eprintln!(
+            "[probe] bprev_block_count={} bprev_blocks_by_pool.len={} bprev_sum={}",
+            e.snapshots.bprev_block_count,
+            e.snapshots.bprev_blocks_by_pool.len(),
+            bprev_sum
+        );
+        eprintln!("[probe] ss_fee={}", e.snapshots.ss_fee.0);
+        match e.snapshots.go.as_ref() {
+            Some(g) => eprintln!(
+                "[probe] go: epoch={} pools={} stake_creds={} go_block_count={} go_blocks_by_pool.len={}",
+                g.epoch.0,
+                g.pool_stake.len(),
+                g.stake_distribution.len(),
+                g.epoch_block_count,
+                g.epoch_blocks_by_pool.len()
+            ),
+            None => eprintln!("[probe] go: NONE"),
+        }
+        eprintln!(
+            "[probe] set_present={} mark_present={}",
+            e.snapshots.set.is_some(),
+            e.snapshots.mark.is_some()
+        );
+        eprintln!(
+            "[probe] prev_d={}/{} prev_pv_major={}",
+            e.prev_d.numerator, e.prev_d.denominator, e.prev_protocol_version_major
+        );
+        eprintln!(
+            "[probe] reward_accounts={} rupd_addrs_rew_present={}",
+            ledger.certs.reward_accounts.len(),
+            e.rupd_addrs_rew.is_some()
+        );
+        std::process::exit(0);
+    }
+
     // Note: We deliberately do NOT restore the LSM UTxO store from disk.
     // The in-memory UtxoStore populated from the snapshot is sufficient for
     // measuring the apply-path bottleneck (CBOR decode + validation + UTxO ops).

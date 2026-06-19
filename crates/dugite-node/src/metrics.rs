@@ -1452,6 +1452,22 @@ impl NodeMetrics {
             .store(u64::from(peer_sharing), Ordering::Relaxed);
     }
 
+    /// Refresh just the pots gauges (`dugite_treasury_lovelace` /
+    /// `dugite_reserves_lovelace`) from the live ledger state.
+    ///
+    /// Two O(1) atomic stores — cheap enough to run on the per-block apply
+    /// path (`post_block_apply_updates`) so the gauges stay live at tip, not
+    /// only during bulk-sync catch-up.  Without this, the at-tip apply path
+    /// (which calls `publish_ledger_view`, not `set_governance_snapshot`)
+    /// left the pots frozen at the last catch-up value, reading one epoch
+    /// stale across every boundary the node did not forge itself.
+    pub fn set_pots(&self, treasury_lovelace: u64, reserves_lovelace: u64) {
+        self.treasury_lovelace
+            .store(treasury_lovelace, Ordering::Relaxed);
+        self.reserves_lovelace
+            .store(reserves_lovelace, Ordering::Relaxed);
+    }
+
     /// Update every governance-related gauge from a flattened snapshot.
     ///
     /// Called from the node's startup init path (`run`) and the sync loop's
@@ -3373,6 +3389,39 @@ mod tests {
         assert!(output.contains("dugite_proposal_count 22\n"));
         assert!(output.contains("dugite_drep_count 8920\n"));
         assert!(output.contains("dugite_drep_active 7500\n"));
+    }
+
+    // Regression: the per-block metric refresh (`post_block_apply_updates`)
+    // must keep the pots gauges live at tip, not only during bulk-sync
+    // catch-up.  Before the fix, the at-tip apply path called
+    // `publish_ledger_view` (which does NOT touch the pots atomics) so
+    // `dugite_treasury_lovelace` / `dugite_reserves_lovelace` froze at the
+    // last catch-up value and never reflected an epoch-boundary reserves→
+    // treasury transfer — making the gauges read one epoch stale at tip and
+    // nearly triggering a false reward-divergence investigation on preview
+    // epoch 1332→1333.  `set_pots` is the O(1) seam the per-block path uses.
+    #[test]
+    fn test_set_pots_updates_gauges() {
+        let metrics = NodeMetrics::new();
+        assert_eq!(metrics.treasury_lovelace.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.reserves_lovelace.load(Ordering::Relaxed), 0);
+
+        // Preview epoch-1333 pots (byte-exact vs Koios) — the values the
+        // gauge must show once the boundary block is applied at tip.
+        metrics.set_pots(6_820_324_388_335_672, 7_916_699_786_696_095);
+
+        assert_eq!(
+            metrics.treasury_lovelace.load(Ordering::Relaxed),
+            6_820_324_388_335_672
+        );
+        assert_eq!(
+            metrics.reserves_lovelace.load(Ordering::Relaxed),
+            7_916_699_786_696_095
+        );
+
+        let output = metrics.to_prometheus();
+        assert!(output.contains("dugite_treasury_lovelace 6820324388335672\n"));
+        assert!(output.contains("dugite_reserves_lovelace 7916699786696095\n"));
     }
 
     // D5: dugite_drep_count HELP text must document the active+inactive
