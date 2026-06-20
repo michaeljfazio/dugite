@@ -64,9 +64,16 @@ use std::sync::Arc;
 
 struct Args {
     snapshot: PathBuf,
-    #[allow(dead_code)] // reserved for future LSM-path profiling
     utxo_store: PathBuf,
     immutable_dir: PathBuf,
+    /// Restore the on-disk LSM UTxO store (`--utxo-store`) and attach it to the
+    /// loaded ledger before applying blocks.  Required for v23+ (LSM/UTxO-HD)
+    /// snapshots whose `.bin` no longer embeds the UTxO set (`utxo_count: 0`) —
+    /// without it every input misses and the run falls through the
+    /// "trusting on-chain consensus" divergence path, making the timing
+    /// unrepresentative.  NOTE: applying MUTATES the store, so point
+    /// `--utxo-store` at a COW clone, never the live store.
+    restore_lsm: bool,
     /// First slot to include in the benchmark slice.
     start_slot: u64,
     /// Number of blocks to apply (0 = apply all available).
@@ -95,6 +102,7 @@ impl Args {
         let mut alonzo_preset = false;
         let mut alonzo_ep300_preset = false;
         let mut save_snapshot: Option<PathBuf> = None;
+        let mut restore_lsm = false;
 
         let mut i = 1;
         while i < args.len() {
@@ -132,6 +140,9 @@ impl Args {
                     i += 1;
                     save_snapshot = Some(PathBuf::from(&args[i]));
                 }
+                "--restore-lsm" => {
+                    restore_lsm = true;
+                }
                 "--help" | "-h" => {
                     eprintln!("{USAGE}");
                     std::process::exit(0);
@@ -168,6 +179,7 @@ impl Args {
                 verbose,
                 preset_name: "Alonzo-ep290",
                 save_snapshot,
+                restore_lsm,
             }
         } else if alonzo_ep300_preset {
             // ── Alonzo/Plutus ep300 preset ──────────────────────────────────
@@ -190,6 +202,7 @@ impl Args {
                 verbose,
                 preset_name: "Alonzo-ep300",
                 save_snapshot,
+                restore_lsm,
             }
         } else {
             // ── Mary-era default preset ─────────────────────────────────────
@@ -206,6 +219,7 @@ impl Args {
                 verbose,
                 preset_name: "Mary-ep286",
                 save_snapshot,
+                restore_lsm,
             }
         }
     }
@@ -226,6 +240,8 @@ OPTIONS:
   --alonzo                Use the Alonzo/Plutus preset (ep290 snapshot, /tmp/alonzo-bench-*)
   --alonzo-ep300          Use the Alonzo ep300 preset (ep300 snapshot, /tmp/alonzo-bench-*)
   --save-snapshot <path>  Save the final ledger state to this path (for checkpoint generation)
+  --restore-lsm           Open --utxo-store (LSM) and attach it before applying. Required for
+                          v23+ LSM snapshots (utxo_count:0). MUTATES the store — use a COW clone.
   --help / -h             This message
 
 PRESETS:
@@ -380,6 +396,44 @@ fn main() {
         "[apply_bench] UTxO set: {} entries (in-memory UtxoStore)",
         ledger.utxo.utxo_set.len()
     );
+
+    // ── Optional: restore the on-disk LSM UTxO store ─────────────────────
+    // v23+ (LSM/UTxO-HD) snapshots no longer embed the UTxO set in the `.bin`
+    // (`utxo_count: 0`); the live set lives in `utxo-store/`.  Without
+    // restoring it, every tx input misses → the apply path short-circuits
+    // through the "trusting on-chain consensus" divergence branch and the
+    // timing is NOT representative of real validation.  Mirrors the live
+    // node's `UtxoStore::open` + `attach_utxo_store` wiring (mod.rs:1784).
+    //
+    // WARNING: applying blocks MUTATES the store (memtable inserts/deletes).
+    // Always point `--utxo-store` at a COW clone (e.g. `cp -c -R`), never the
+    // live store, or the benchmark will corrupt it.
+    if args.restore_lsm {
+        eprintln!(
+            "[apply_bench] Restoring LSM UTxO store: {}",
+            args.utxo_store.display()
+        );
+        let t_store = Instant::now();
+        match dugite_ledger::utxo_store::UtxoStore::open(&args.utxo_store) {
+            Ok(mut store) => {
+                // Disable the WAL so per-UTxO inserts/deletes don't fsync to the
+                // (clone) store during the run — we only care about the in-memory
+                // apply cost, not LSM durability. Mirrors the catch-up path.
+                store.set_wal_enabled(false);
+                ledger.attach_utxo_store(store);
+                eprintln!(
+                    "[apply_bench] LSM store attached in {:.1}s — UTxO set: {} entries",
+                    t_store.elapsed().as_secs_f64(),
+                    ledger.utxo.utxo_set.len()
+                );
+            }
+            Err(e) => {
+                eprintln!("[apply_bench] ERROR opening LSM UTxO store: {e}");
+                eprintln!("             Point --utxo-store at a COW clone of db-*/utxo-store.");
+                std::process::exit(1);
+            }
+        }
+    }
 
     // Diagnostic probe (issue: epoch-boundary reward-pots divergence).
     // When DUGITE_DUMP_LEDGER_PROBE is set, print the reward-update inputs and
