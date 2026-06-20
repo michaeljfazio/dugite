@@ -59,6 +59,102 @@ fn phase2_collect_fatal_enabled() -> bool {
     })
 }
 
+/// Apply the result of a block's Phase-2 (Plutus) evaluation: convert the
+/// per-tx [`Phase2Outcome`]s into the block-fatal rejection decision (Babbage+
+/// collection error) or a divergence warning, exactly as Step 8d does inline.
+///
+/// Extracted so the deferred bulk-sync path can reproduce the identical
+/// fatality decision after pooling+evaluating work items across many blocks
+/// (see [`LedgerState::apply_block_defer_phase2`]). It is a **pure function of
+/// `(block, outcomes)`** — it mutates no ledger state (state is already applied
+/// in Step 8b), so deferring *when* it runs cannot change *what* it decides.
+///
+/// Returns `Err(Phase2CollectErrors)` for a block-fatal collection error and
+/// `Ok(())` otherwise (logging is_valid divergences warn-and-trust).
+#[cfg(feature = "parallel-verification")]
+pub fn apply_phase2_outcomes(
+    block: &Block,
+    outcomes: Vec<crate::plutus::Phase2Outcome>,
+) -> Result<(), LedgerError> {
+    for outcome in outcomes {
+        // Look up the transaction by index. Duplicate txs were skipped during
+        // the loop (not added to work_items), so every outcome.tx_idx is valid.
+        let tx = match block.transactions.get(outcome.tx_idx) {
+            Some(t) => t,
+            None => continue,
+        };
+        // #733: a phase-2 COLLECTION error is block-fatal in Babbage+ regardless
+        // of the is_valid tag — Haskell raises `UtxosFailure (CollectErrors …)`
+        // before any script runs, so every honest node rejects this block.
+        // Carve-outs: CEK panics (not a Haskell error class — correction 3) and
+        // UTxO-gap work items (inputs unresolved during best-effort partial
+        // replay — correction 4) stay warn-and-trust. Alonzo blocks never arm
+        // the time-translation horizon (correction 2) and keep warn-only
+        // semantics for the remaining collect classes (no false fatality).
+        if let Err(e) = &outcome.result {
+            if e.is_eval_panic() {
+                warn!(
+                    tx_hash = %tx.hash.to_hex(),
+                    slot = block.slot().0,
+                    error = %e,
+                    "Phase-2 evaluator PANIC on confirmed block — trusting \
+                     on-chain consensus (dugite CEK robustness gap; never \
+                     block-fatal at apply)"
+                );
+                continue;
+            }
+            if e.is_collect_error()
+                && block.era >= Era::Babbage
+                && outcome.utxo_complete
+                && phase2_collect_fatal_enabled()
+            {
+                return Err(LedgerError::Phase2CollectErrors {
+                    slot: block.slot().0,
+                    tx_hash: tx.hash.to_hex(),
+                    error: e.to_string(),
+                });
+            }
+        }
+        if outcome.is_valid {
+            // is_valid=true: phase-2 failure is a ScriptFailed on a confirmed
+            // block — log a warning and trust on-chain consensus.
+            if let Err(e) = outcome.result {
+                warn!(
+                    tx_hash = %tx.hash.to_hex(),
+                    slot = block.slot().0,
+                    error = %e,
+                    "Plutus evaluation divergence (parallel): uplc says scripts fail \
+                     but block is_valid=true on-chain — trusting on-chain consensus"
+                );
+            }
+        } else {
+            // is_valid=false: the producer's scripts failed on-chain (collateral
+            // consumed). dugite's CEK says they pass — a Phase-2 evaluation
+            // divergence. On a block received via ChainSync the is_valid flag is
+            // CONSENSUS TRUTH: honest (Haskell) nodes enforce it with a correct
+            // CEK, so any block on the selected chain carries a genuine flag and
+            // the divergence is a dugite-CEK bug, not collateral theft. The tx
+            // was ALREADY applied as invalid (collateral consumed, no outputs) in
+            // Step 8b, so the ledger state is byte-exact regardless. Trust the
+            // on-chain flag and log the divergence (symmetric with the
+            // is_valid=true branch above) instead of hard-halting the whole sync.
+            // The DUGITE_PHASE2_DUMP_DIR repro was captured in
+            // run_phase2_parallel for offline CEK root-causing.
+            if outcome.result.is_ok() {
+                warn!(
+                    tx_hash = %tx.hash.to_hex(),
+                    slot = block.slot().0,
+                    "Plutus evaluation divergence (parallel): uplc says scripts PASS \
+                     but block is_valid=false on-chain — trusting on-chain consensus \
+                     (tx applied as invalid; dugite CEK over-permissive — see \
+                     DUGITE_PHASE2_DUMP_DIR)"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 impl LedgerState {
     /// Build a read-only rule context for era rule dispatch.
     ///
@@ -106,6 +202,46 @@ impl LedgerState {
         block: &Block,
         mode: BlockValidationMode,
     ) -> Result<(), LedgerError> {
+        // Default path: apply state AND drain Phase-2 inline (byte-identical to
+        // the historic behaviour). The returned work-item vec is always empty.
+        self.apply_block_impl(block, mode, false)?;
+        Ok(())
+    }
+
+    /// Apply a block's STATE in-order but **defer** the Phase-2 (Plutus) drain,
+    /// returning the captured [`Phase2WorkItem`]s instead of evaluating them.
+    ///
+    /// Bulk-sync CPU-saturation lever: each [`Phase2WorkItem`] is fully
+    /// self-contained (resolved UTxO CBOR + script + per-block `cost_models_cbor`
+    /// / `slot_config` / `protocol_major`), so items captured here can be pooled
+    /// across many blocks and evaluated together on a rayon pool to fill all
+    /// cores — a single block's ~2-3 redeemers can never saturate a 12-core host.
+    ///
+    /// **Byte-exact contract:** ledger STATE is mutated identically to
+    /// [`apply_block`] (Plutus never writes state — it only gates acceptance), so
+    /// the caller MUST later run [`apply_phase2_outcomes`] on the drained outcomes
+    /// to reproduce the exact block-fatal rejection decision before the block is
+    /// exposed. Deferring *when* Plutus runs cannot change *what* it decides
+    /// (the fatality verdict is a pure function of the self-contained outcomes).
+    pub fn apply_block_defer_phase2(
+        &mut self,
+        block: &Block,
+        mode: BlockValidationMode,
+    ) -> Result<Vec<Phase2WorkItem>, LedgerError> {
+        self.apply_block_impl(block, mode, true)
+    }
+
+    /// Implementation shared by [`apply_block`] (inline drain) and
+    /// [`apply_block_defer_phase2`] (deferred drain). When `defer_phase2` is
+    /// `true`, Step 8d's `run_phase2_parallel` + fatality loop is skipped and the
+    /// captured `phase2_work_items` are returned for later pooled evaluation;
+    /// when `false`, the drain runs inline and an empty vec is returned.
+    fn apply_block_impl(
+        &mut self,
+        block: &Block,
+        mode: BlockValidationMode,
+        defer_phase2: bool,
+    ) -> Result<Vec<Phase2WorkItem>, LedgerError> {
         trace!(
             slot = block.slot().0,
             block_no = block.block_number().0,
@@ -535,7 +671,8 @@ impl LedgerState {
                 epoch = self.epoch.0,
                 "Ledger: Byron block applied successfully"
             );
-            return Ok(());
+            // Byron has no Phase-2; nothing to defer.
+            return Ok(Vec::new());
         }
 
         // ══════════════════════════════════════════════════════════════════
@@ -1515,98 +1652,26 @@ impl LedgerState {
         #[cfg(feature = "parallel-verification")]
         {
             crate::validation::restore_phase2_eval(_phase2_skip_guard);
-            if mode == BlockValidationMode::ValidateAll && !phase2_work_items.is_empty() {
+            // When deferring (bulk-sync pooling), DO NOT drain here — the
+            // captured `phase2_work_items` are returned to the caller, which
+            // pools them across blocks, evaluates on a rayon pool, and runs
+            // `apply_phase2_outcomes` to reproduce the exact fatality decision
+            // before exposing the block. The inline path drains immediately so
+            // its behaviour (and the apply_bench fingerprint) is unchanged.
+            if !defer_phase2
+                && mode == BlockValidationMode::ValidateAll
+                && !phase2_work_items.is_empty()
+            {
                 let t_phase2_start = if timing_enabled {
                     Some(std::time::Instant::now())
                 } else {
                     None
                 };
-                let outcomes = run_phase2_parallel(phase2_work_items);
+                let outcomes = run_phase2_parallel(std::mem::take(&mut phase2_work_items));
                 if let Some(start) = t_phase2_start {
                     t_phase2 += start.elapsed();
                 }
-                for outcome in outcomes {
-                    // Look up the transaction by index. Duplicate txs were
-                    // skipped during the loop (not added to work_items), so
-                    // every outcome.tx_idx is a valid index.
-                    let tx = match block.transactions.get(outcome.tx_idx) {
-                        Some(t) => t,
-                        None => continue,
-                    };
-                    // #733: a phase-2 COLLECTION error is block-fatal in
-                    // Babbage+ regardless of the is_valid tag — Haskell
-                    // raises `UtxosFailure (CollectErrors …)` before any
-                    // script runs, so every honest node rejects this block.
-                    // Carve-outs: CEK panics (not a Haskell error class —
-                    // correction 3) and UTxO-gap work items (inputs
-                    // unresolved during best-effort partial replay —
-                    // correction 4) stay warn-and-trust. Alonzo blocks never
-                    // arm the time-translation horizon (correction 2) and
-                    // keep warn-only semantics for the remaining collect
-                    // classes (conservative: no false fatality).
-                    if let Err(e) = &outcome.result {
-                        if e.is_eval_panic() {
-                            warn!(
-                                tx_hash = %tx.hash.to_hex(),
-                                slot = block.slot().0,
-                                error = %e,
-                                "Phase-2 evaluator PANIC on confirmed block — trusting \
-                                 on-chain consensus (dugite CEK robustness gap; never \
-                                 block-fatal at apply)"
-                            );
-                            continue;
-                        }
-                        if e.is_collect_error()
-                            && block.era >= Era::Babbage
-                            && outcome.utxo_complete
-                            && phase2_collect_fatal_enabled()
-                        {
-                            return Err(LedgerError::Phase2CollectErrors {
-                                slot: block.slot().0,
-                                tx_hash: tx.hash.to_hex(),
-                                error: e.to_string(),
-                            });
-                        }
-                    }
-                    if outcome.is_valid {
-                        // is_valid=true: phase-2 failure is a ScriptFailed on a
-                        // confirmed block — log a warning and trust on-chain consensus.
-                        if let Err(e) = outcome.result {
-                            warn!(
-                                tx_hash = %tx.hash.to_hex(),
-                                slot = block.slot().0,
-                                error = %e,
-                                "Plutus evaluation divergence (parallel): uplc says scripts fail \
-                                 but block is_valid=true on-chain — trusting on-chain consensus"
-                            );
-                        }
-                    } else {
-                        // is_valid=false: the producer's scripts failed on-chain
-                        // (collateral consumed). dugite's CEK says they pass — a
-                        // Phase-2 evaluation divergence. On a block received via
-                        // ChainSync the is_valid flag is CONSENSUS TRUTH: honest
-                        // (Haskell) nodes enforce it with a correct CEK, so any
-                        // block on the selected chain carries a genuine flag and
-                        // the divergence is a dugite-CEK bug, not collateral
-                        // theft. The tx was ALREADY applied as invalid (collateral
-                        // consumed, no outputs) in Step 8b, so the ledger state is
-                        // byte-exact regardless. Trust the on-chain flag and log
-                        // the divergence (symmetric with the is_valid=true branch
-                        // above) instead of hard-halting the whole sync. The
-                        // DUGITE_PHASE2_DUMP_DIR repro was captured in
-                        // run_phase2_parallel for offline CEK root-causing.
-                        if outcome.result.is_ok() {
-                            warn!(
-                                tx_hash = %tx.hash.to_hex(),
-                                slot = block.slot().0,
-                                "Plutus evaluation divergence (parallel): uplc says scripts PASS \
-                                 but block is_valid=false on-chain — trusting on-chain consensus \
-                                 (tx applied as invalid; dugite CEK over-permissive — see \
-                                 DUGITE_PHASE2_DUMP_DIR)"
-                            );
-                        }
-                    }
-                }
+                apply_phase2_outcomes(block, outcomes)?;
             }
         }
 
@@ -1707,7 +1772,14 @@ impl LedgerState {
             );
         }
 
-        Ok(())
+        // In deferred mode return the captured Phase-2 work items (possibly
+        // empty for ApplyOnly / Byron / script-free blocks); the inline path
+        // already drained them above and returns an empty vec.
+        Ok(if defer_phase2 {
+            std::mem::take(&mut phase2_work_items)
+        } else {
+            Vec::new()
+        })
     }
 
     /// Apply a block and produce a [`LedgerDelta`] capturing all state changes.

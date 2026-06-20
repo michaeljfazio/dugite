@@ -440,6 +440,86 @@ pub fn run_phase2_parallel(items: Vec<Phase2WorkItem>) -> Vec<Phase2Outcome> {
     outcomes
 }
 
+/// Cross-block pooled Phase-2 evaluation — the CPU-saturation primitive for
+/// bulk sync.
+///
+/// A single block carries only ~2-3 redeemers on the median preview Conway
+/// block, so its `into_par_iter` cannot fill a 12-core host. This concatenates
+/// the work items of MANY blocks into one rayon batch (all redeemers fan across
+/// every core at once), then regroups the outcomes back per input block,
+/// preserving each block's internal `tx_idx` ordering.
+///
+/// `batches[i]` are block `i`'s [`Phase2WorkItem`]s (from
+/// [`crate::state::LedgerState::apply_block_defer_phase2`]); the returned
+/// `Vec<Vec<Phase2Outcome>>` is aligned 1:1 with `batches` and each inner vec is
+/// sorted by `tx_idx`, so feeding `result[i]` to
+/// [`crate::state::apply_phase2_outcomes`] with block `i` reproduces the exact
+/// per-block fatality decision the serial path would make.
+#[cfg(feature = "parallel-verification")]
+pub fn run_phase2_parallel_pooled(batches: Vec<Vec<Phase2WorkItem>>) -> Vec<Vec<Phase2Outcome>> {
+    use rayon::prelude::*;
+
+    let n_blocks = batches.len();
+
+    // Flatten to (block_idx, item) so every redeemer across every block is a
+    // single rayon work unit — this is what actually fills the cores. Consume
+    // `batches` by value (move, no clone) since items are owned and self-contained.
+    let mut flat: Vec<(usize, Phase2WorkItem)> = Vec::new();
+    for (block_idx, items) in batches.into_iter().enumerate() {
+        for item in items {
+            flat.push((block_idx, item));
+        }
+    }
+
+    let mut tagged: Vec<(usize, Phase2Outcome)> = flat
+        .into_par_iter()
+        .map(|(block_idx, item)| {
+            let dugite_slot_config = dugite_uplc::phase_two::SlotConfig {
+                network_start_unix_seconds: item.slot_config.zero_time / 1_000,
+                slot_zero_offset: item.slot_config.zero_slot,
+                slot_length_ms: item.slot_config.slot_length,
+                safe_zone_horizon_slot: item.slot_config.safe_zone_horizon_slot,
+            };
+            let result = run_single_phase2_eval(
+                &item.tx_cbor,
+                &item.utxo_pairs,
+                item.cost_models_cbor.as_deref(),
+                item.max_ex,
+                dugite_slot_config,
+                item.protocol_major,
+            );
+            if (result.is_ok() && !item.is_valid) || (result.is_err() && item.is_valid) {
+                maybe_dump_phase2_divergence(&item);
+            }
+            (
+                block_idx,
+                Phase2Outcome {
+                    tx_idx: item.tx_idx,
+                    is_valid: item.is_valid,
+                    result,
+                    utxo_complete: item.utxo_complete,
+                },
+            )
+        })
+        .collect();
+
+    // Regroup by block index, one inner vec per input block.
+    let mut grouped: Vec<Vec<Phase2Outcome>> = (0..n_blocks).map(|_| Vec::new()).collect();
+    // Sort by (block_idx, tx_idx) so each block's outcomes land in tx order —
+    // identical to run_phase2_parallel's per-block sort_by_key(tx_idx).
+    tagged.sort_by_key(|(block_idx, o)| (*block_idx, o.tx_idx));
+    for (block_idx, outcome) in tagged {
+        grouped[block_idx].push(outcome);
+    }
+    grouped
+}
+
+/// Sequential fallback (feature gate off).
+#[cfg(not(feature = "parallel-verification"))]
+pub fn run_phase2_parallel_pooled(batches: Vec<Vec<Phase2WorkItem>>) -> Vec<Vec<Phase2Outcome>> {
+    batches.into_iter().map(run_phase2_parallel).collect()
+}
+
 /// Sequential fallback (feature gate off).
 #[cfg(not(feature = "parallel-verification"))]
 pub fn run_phase2_parallel(items: Vec<Phase2WorkItem>) -> Vec<Phase2Outcome> {
