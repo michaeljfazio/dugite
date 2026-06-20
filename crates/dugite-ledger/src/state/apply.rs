@@ -1798,6 +1798,31 @@ impl LedgerState {
         block: &Block,
         mode: BlockValidationMode,
     ) -> Result<LedgerDelta, LedgerError> {
+        let (delta, _items) = self.apply_block_with_delta_impl(block, mode, false)?;
+        Ok(delta)
+    }
+
+    /// Like [`apply_block_with_delta`] but **defers** the Phase-2 (Plutus) drain,
+    /// returning the captured [`Phase2WorkItem`]s alongside the delta for later
+    /// cross-block pooled evaluation (bulk-sync CPU-saturation; see
+    /// [`apply_block_defer_phase2`]). The state mutations and the `LedgerDelta`
+    /// are byte-identical to [`apply_block_with_delta`]; the caller MUST run
+    /// [`apply_phase2_outcomes`] on the drained outcomes before exposing the block
+    /// to reproduce the exact block-fatal rejection decision.
+    pub fn apply_block_with_delta_defer(
+        &mut self,
+        block: &Block,
+        mode: BlockValidationMode,
+    ) -> Result<(LedgerDelta, Vec<Phase2WorkItem>), LedgerError> {
+        self.apply_block_with_delta_impl(block, mode, true)
+    }
+
+    fn apply_block_with_delta_impl(
+        &mut self,
+        block: &Block,
+        mode: BlockValidationMode,
+        defer_phase2: bool,
+    ) -> Result<(LedgerDelta, Vec<Phase2WorkItem>), LedgerError> {
         let mut delta = LedgerDelta::new(block.slot(), *block.hash(), block.block_number());
 
         // Snapshot pre-block epoch to detect epoch transitions.
@@ -1817,8 +1842,9 @@ impl LedgerState {
         let pending_retirements_len_before = self.certs.pending_retirements.len();
         let future_pool_params_len_before = self.certs.future_pool_params.len();
 
-        // Apply the block (all state mutations happen here).
-        self.apply_block(block, mode)?;
+        // Apply the block (all state mutations happen here). In deferred mode
+        // this returns the captured Phase-2 work items without draining them.
+        let deferred_items = self.apply_block_impl(block, mode, defer_phase2)?;
 
         // Capture the post-block `imbl` cert maps so state reconstruction
         // (rollback_via_seq / state_at_index / anchor advance) restores them
@@ -1974,7 +2000,7 @@ impl LedgerState {
             epoch_fees: self.utxo.epoch_fees,
         };
 
-        Ok(delta)
+        Ok((delta, deferred_items))
     }
 }
 
