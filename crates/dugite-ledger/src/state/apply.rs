@@ -722,67 +722,130 @@ impl LedgerState {
         ) = if mode == BlockValidationMode::ValidateAll {
             use std::collections::{HashMap, HashSet};
             use std::sync::Arc;
-            let pools: HashSet<dugite_primitives::hash::Hash28> =
-                self.certs.pool_params.keys().copied().collect();
-            let dreps: HashSet<dugite_primitives::hash::Hash32> =
-                self.gov.governance.dreps.keys().copied().collect();
-            let vrf_keys: HashMap<
-                dugite_primitives::hash::Hash32,
-                dugite_primitives::hash::Hash28,
-            > = self
-                .certs
-                .pool_params
-                .values()
-                .map(|reg| (reg.vrf_keyhash, reg.pool_id))
-                .collect();
+
+            // ── Per-source registry cache (bulk-sync apply-ceiling fix) ───────
+            //
+            // Rebuilding these derived registries from scratch every block was
+            // ~51% of apply wall time on preview Conway blocks.  The THREE
+            // expensive registries are memoized, each keyed on the structural
+            // identity of its OWN source map (see `CachedValidationRegistry`):
+            //   • `pools` + `vrf_keys` ← `certs.pool_params`  (Arc::ptr_eq)
+            //   • `dreps`              ← `gov.dreps`           (imbl ptr_eq)
+            //   • `vote_delegations`   ← `gov.vote_delegations`(imbl ptr_eq)
+            // Per-source keying means a vote/proposal block (which bumps the
+            // `governance` Arc + `proposals` map but leaves `dreps` /
+            // `vote_delegations` structurally identical) still hits both big
+            // caches.  The small registries below are cheap and rebuilt fresh.
+            //
+            // Byte-exact: identical source pointer ⟹ identical contents ⟹
+            // identical registry; any mutation copy-on-writes a fresh root.
+            let cached = self.cached_validation_registry.take();
+
+            // `pools` + `vrf_keys` ← `certs.pool_params` (Arc ptr-eq).
+            let pp_hit = cached
+                .as_ref()
+                .is_some_and(|c| Arc::ptr_eq(&c.pool_params_src, &self.certs.pool_params));
+            let (pools, vrf_keys) = if pp_hit {
+                let c = cached.as_ref().expect("pp_hit implies Some");
+                (Arc::clone(&c.pools), Arc::clone(&c.vrf_keys))
+            } else {
+                let pools: Arc<HashSet<dugite_primitives::hash::Hash28>> =
+                    Arc::new(self.certs.pool_params.keys().copied().collect());
+                let vrf_keys: Arc<
+                    HashMap<dugite_primitives::hash::Hash32, dugite_primitives::hash::Hash28>,
+                > = Arc::new(
+                    self.certs
+                        .pool_params
+                        .values()
+                        .map(|reg| (reg.vrf_keyhash, reg.pool_id))
+                        .collect(),
+                );
+                (pools, vrf_keys)
+            };
+
+            // `dreps` ← `gov.dreps` (imbl ptr-eq).
+            let dreps_hit = cached
+                .as_ref()
+                .is_some_and(|c| c.dreps_src.ptr_eq(&self.gov.governance.dreps));
+            let dreps: Arc<HashSet<dugite_primitives::hash::Hash32>> = if dreps_hit {
+                Arc::clone(&cached.as_ref().expect("dreps_hit implies Some").dreps)
+            } else {
+                Arc::new(self.gov.governance.dreps.keys().copied().collect())
+            };
+
+            // `vote_delegations` ← `gov.vote_delegations` (imbl ptr-eq).
+            let vd_hit = cached.as_ref().is_some_and(|c| {
+                c.vote_delegations_src
+                    .ptr_eq(&self.gov.governance.vote_delegations)
+            });
+            let vote_delegations: Arc<HashSet<dugite_primitives::hash::Hash32>> = if vd_hit {
+                Arc::clone(
+                    &cached
+                        .as_ref()
+                        .expect("vd_hit implies Some")
+                        .vote_delegations,
+                )
+            } else {
+                Arc::new(
+                    self.gov
+                        .governance
+                        .vote_delegations
+                        .keys()
+                        .copied()
+                        .collect(),
+                )
+            };
+
+            // ── Small registries — cheap, always rebuilt fresh ────────────────
             // Current members ∪ `members_to_add` of live UpdateCommittee
             // proposals — Haskell GOVCERT accepts a CommitteeHotAuth from a
             // potential FUTURE member too (`isPotentialFutureMember`).
-            let committee_members: HashSet<dugite_primitives::hash::Hash32> =
-                self.gov.governance.committee_auth_eligible_members();
-            let committee_resigned: HashSet<dugite_primitives::hash::Hash32> = self
-                .gov
-                .governance
-                .committee_resigned
-                .keys()
-                .copied()
-                .collect();
-            let vote_delegations: HashSet<dugite_primitives::hash::Hash32> = self
-                .gov
-                .governance
-                .vote_delegations
-                .keys()
-                .copied()
-                .collect();
-            let active_proposals: HashMap<
-                dugite_primitives::transaction::GovActionId,
-                crate::validation::ActiveProposal,
-            > = self
-                .gov
-                .governance
-                .proposals
-                .iter()
-                .map(|(id, state)| {
-                    (
-                        id.clone(),
-                        crate::validation::ActiveProposal {
-                            gov_action: state.procedure.gov_action.clone(),
-                            return_addr: state.procedure.return_addr.clone(),
-                            deposit: state.procedure.deposit,
-                            expires_after_epoch: state.expires_epoch,
-                            proposed_in_epoch: state.proposed_epoch,
-                        },
-                    )
-                })
-                .collect();
-            let committee_authorized_hot_keys: HashSet<dugite_primitives::hash::Hash32> = self
-                .gov
-                .governance
-                .committee_hot_keys
-                .values()
-                .copied()
-                .collect();
-            let committee_authorized_elected_hot_keys: HashSet<dugite_primitives::hash::Hash32> =
+            let committee_members: Arc<HashSet<dugite_primitives::hash::Hash32>> =
+                Arc::new(self.gov.governance.committee_auth_eligible_members());
+            let committee_resigned: Arc<HashSet<dugite_primitives::hash::Hash32>> = Arc::new(
+                self.gov
+                    .governance
+                    .committee_resigned
+                    .keys()
+                    .copied()
+                    .collect(),
+            );
+            let active_proposals: Arc<
+                HashMap<
+                    dugite_primitives::transaction::GovActionId,
+                    crate::validation::ActiveProposal,
+                >,
+            > = Arc::new(
+                self.gov
+                    .governance
+                    .proposals
+                    .iter()
+                    .map(|(id, state)| {
+                        (
+                            id.clone(),
+                            crate::validation::ActiveProposal {
+                                gov_action: state.procedure.gov_action.clone(),
+                                return_addr: state.procedure.return_addr.clone(),
+                                deposit: state.procedure.deposit,
+                                expires_after_epoch: state.expires_epoch,
+                                proposed_in_epoch: state.proposed_epoch,
+                            },
+                        )
+                    })
+                    .collect(),
+            );
+            let committee_authorized_hot_keys: Arc<HashSet<dugite_primitives::hash::Hash32>> =
+                Arc::new(
+                    self.gov
+                        .governance
+                        .committee_hot_keys
+                        .values()
+                        .copied()
+                        .collect(),
+                );
+            let committee_authorized_elected_hot_keys: Arc<
+                HashSet<dugite_primitives::hash::Hash32>,
+            > = Arc::new(
                 self.gov
                     .governance
                     .committee_hot_keys
@@ -791,23 +854,38 @@ impl LedgerState {
                         self.gov.governance.committee_expiration.contains_key(*cold)
                     })
                     .map(|(_, hot)| *hot)
-                    .collect();
+                    .collect(),
+            );
             let constitution_script_hash = self
                 .gov
                 .governance
                 .constitution
                 .as_ref()
                 .and_then(|c| c.script_hash);
+
+            // Refresh the cache with the (possibly rebuilt) large registries and
+            // their current source keys.  RHS reads only `&self` immutably and
+            // local Arcs; the assignment target is a disjoint field.
+            self.cached_validation_registry = Some(crate::state::CachedValidationRegistry {
+                pool_params_src: Arc::clone(&self.certs.pool_params),
+                pools: Arc::clone(&pools),
+                vrf_keys: Arc::clone(&vrf_keys),
+                dreps_src: self.gov.governance.dreps.clone(),
+                dreps: Arc::clone(&dreps),
+                vote_delegations_src: self.gov.governance.vote_delegations.clone(),
+                vote_delegations: Arc::clone(&vote_delegations),
+            });
+
             (
-                Arc::new(pools),
-                Arc::new(dreps),
-                Arc::new(vrf_keys),
-                Arc::new(committee_members),
-                Arc::new(committee_resigned),
-                Arc::new(vote_delegations),
-                Arc::new(active_proposals),
-                Arc::new(committee_authorized_hot_keys),
-                Arc::new(committee_authorized_elected_hot_keys),
+                pools,
+                dreps,
+                vrf_keys,
+                committee_members,
+                committee_resigned,
+                vote_delegations,
+                active_proposals,
+                committee_authorized_hot_keys,
+                committee_authorized_elected_hot_keys,
                 // O(1) imbl structural clone — pre-block snapshot for stake_key_deposits validation.
                 self.certs.stake_key_deposits.clone(),
                 constitution_script_hash,

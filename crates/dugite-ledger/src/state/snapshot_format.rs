@@ -421,6 +421,7 @@ impl From<LedgerStateSnapshot> for super::LedgerState {
             conway_genesis_init: None, // Set from genesis config at startup
             max_lovelace_supply: super::MAX_LOVELACE_SUPPLY,
             phase2_apply_horizon: None,
+            cached_validation_registry: None,
         }
     }
 }
