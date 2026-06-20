@@ -12,6 +12,11 @@ mod snapshot;
 pub mod snapshot_format;
 pub mod substates;
 
+// Re-export the deferred Phase-2 fatality applier for the bulk-sync pooling
+// path (apply_bench / node). Gated identically to its definition.
+#[cfg(feature = "parallel-verification")]
+pub use apply::apply_phase2_outcomes;
+
 // Re-export governance free functions and types for use by tests
 #[cfg(test)]
 pub(crate) use governance::{
