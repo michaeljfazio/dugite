@@ -6719,6 +6719,17 @@ impl Node {
         // ValidateAll: at-tip we keep the exact synchronous path so served/forged
         // tips carry zero deferral. `at_tip` here uses the same predicate as the
         // publish gate below (peer_tip==0 ⇒ no peer yet ⇒ treat as at-tip).
+        //
+        // **Fork-in-window is structurally impossible under this gate.** Deferral
+        // engages only when `peer_tip − block_slot > stability_window = ⌈3k/f⌉`
+        // slots (≈129 600 = 36 h on mainnet/preview). Ouroboros k-finality bounds
+        // ANY fork rollback to ≤ k blocks ≈ k/f slots. A deferred block therefore
+        // sits ~3k blocks deep — 3× beyond the deepest reachable fork — so no fork
+        // can ever roll back a block whose Plutus is still pending. The window is
+        // flushed the moment `at_tip` flips (well before blocks enter the
+        // fork-reachable k window), so a deferred block is always settled/final.
+        // (This is why the deferral needs no fork-in-window handling: the gate
+        // keeps the un-confirmed prefix strictly below the finality horizon.)
         let defer_pre_at_tip = {
             let peer_tip = self.metrics.get_peer_tip();
             let sw = dugite_consensus::stability_window_slots(
