@@ -645,6 +645,7 @@ impl LedgerState {
         };
         let mut t_registry_build = std::time::Duration::ZERO;
         let mut t_validate = std::time::Duration::ZERO;
+        let mut t_phase2 = std::time::Duration::ZERO;
         let mut t_apply = std::time::Duration::ZERO;
         let mut t_diff_merge = std::time::Duration::ZERO;
         let mut t_ctx_build = std::time::Duration::ZERO;
@@ -1522,7 +1523,7 @@ impl LedgerState {
                 };
                 let outcomes = run_phase2_parallel(phase2_work_items);
                 if let Some(start) = t_phase2_start {
-                    t_validate += start.elapsed();
+                    t_phase2 += start.elapsed();
                 }
                 for outcome in outcomes {
                     // Look up the transaction by index. Duplicate txs were
@@ -1679,7 +1680,8 @@ impl LedgerState {
 
         if let Some(start) = block_start {
             let total = start.elapsed();
-            let accounted = t_registry_build + t_ctx_build + t_validate + t_apply + t_diff_merge;
+            let accounted =
+                t_registry_build + t_ctx_build + t_validate + t_phase2 + t_apply + t_diff_merge;
             let other = total.saturating_sub(accounted);
             tracing::info!(
                 target: "dugite_ledger::apply::timing",
@@ -1696,6 +1698,7 @@ impl LedgerState {
                 registry_us = t_registry_build.as_micros() as u64,
                 ctx_build_us = t_ctx_build.as_micros() as u64,
                 validate_us = t_validate.as_micros() as u64,
+                phase2_us = t_phase2.as_micros() as u64,
                 apply_us = t_apply.as_micros() as u64,
                 merge_us = t_diff_merge.as_micros() as u64,
                 other_us = other.as_micros() as u64,
