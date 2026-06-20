@@ -2852,4 +2852,73 @@ mod tests {
             "Bogus body-size approximation must not be present; got: {result:?}"
         );
     }
+
+    /// Deferred Phase-2 fatality decision — the consensus-critical verdict shared
+    /// by the inline drain (Step 8d) and the cross-block deferred/pooled path
+    /// (`apply_block_defer_phase2` → `run_phase2_parallel_pooled` →
+    /// `apply_phase2_outcomes`). Deferring *when* Plutus runs must not change
+    /// *what* it decides, so this locks the exact per-outcome semantics: only a
+    /// Babbage+ CollectError with all inputs resolved is block-fatal; panics,
+    /// partial-replay gaps, the Alonzo era, and genuine script failures all
+    /// warn-and-trust. (#733 carve-outs.)
+    #[cfg(feature = "parallel-verification")]
+    #[test]
+    fn deferred_phase2_fatality_decision_matches_semantics() {
+        use crate::plutus::{Phase2Outcome, PlutusError};
+
+        // Only block.era / block.slot / block.transactions[tx_idx].hash are read.
+        let tx = make_simple_tx(0x11, vec![], vec![make_output(1_000_000)], 0);
+        let conway = make_test_block(Era::Conway, 100, 1, 10, 0, vec![tx.clone()]);
+        let alonzo = make_test_block(Era::Alonzo, 100, 1, 6, 0, vec![tx.clone()]);
+        let oc = |result, utxo_complete| Phase2Outcome {
+            tx_idx: 0,
+            is_valid: true,
+            result,
+            utxo_complete,
+        };
+
+        // (1) Babbage+ CollectError with complete UTxOs → BLOCK-FATAL (the only
+        // case that rejects; mirrors the synchronous Err return, one window later).
+        assert!(
+            matches!(
+                apply_phase2_outcomes(
+                    &conway,
+                    vec![oc(Err(PlutusError::CollectError("x".into())), true)]
+                ),
+                Err(LedgerError::Phase2CollectErrors { .. })
+            ),
+            "Conway CollectError(utxo_complete) must be block-fatal"
+        );
+
+        // (2) CEK panic → NOT fatal (dugite robustness gap, warn-and-trust; #733 c3).
+        assert!(apply_phase2_outcomes(
+            &conway,
+            vec![oc(Err(PlutusError::EvalPanic("x".into())), true)]
+        )
+        .is_ok());
+
+        // (3) CollectError with an unresolved UTxO gap → NOT fatal (#733 c4).
+        assert!(apply_phase2_outcomes(
+            &conway,
+            vec![oc(Err(PlutusError::CollectError("x".into())), false)]
+        )
+        .is_ok());
+
+        // (4) Alonzo never arms the horizon → CollectError NOT fatal (#733 c2).
+        assert!(apply_phase2_outcomes(
+            &alonzo,
+            vec![oc(Err(PlutusError::CollectError("x".into())), true)]
+        )
+        .is_ok());
+
+        // (5) Genuine script failure on is_valid=true → warn-and-trust, NOT fatal.
+        assert!(apply_phase2_outcomes(
+            &conway,
+            vec![oc(Err(PlutusError::EvalFailed("x".into())), true)]
+        )
+        .is_ok());
+
+        // (6) All scripts pass → Ok.
+        assert!(apply_phase2_outcomes(&conway, vec![oc(Ok(()), true)]).is_ok());
+    }
 }
