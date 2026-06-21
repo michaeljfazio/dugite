@@ -731,6 +731,21 @@ pub struct Node {
     /// Cardano, so the rollback must land on a real on-chain point, not a
     /// `slot-1` guess (`handle_ledger_rollback` classifies by slot).
     pending_phase2_anchor: Option<dugite_primitives::block::Point>,
+    /// Running Σ of Phase-2 work items (redeemers) buffered in `pending_phase2`.
+    /// The pooled flush is triggered by THIS, not block count, so a dense-Plutus
+    /// region (many redeemers per block) flushes before the pooled eval's peak
+    /// memory grows unbounded. The deferral-soak wedge was a 64-block window
+    /// whose redeemer count — not block count — drove a multi-GB pooled eval.
+    pending_phase2_items: usize,
+    /// Work-item cap that forces a [`Self::flush_pending_phase2`] even before the
+    /// block window (`defer_phase2_window`) fills (`DUGITE_DEFER_PHASE2_MAX_ITEMS`,
+    /// default 256). Bounds the pooled flush's peak memory + wall time.
+    defer_phase2_max_items: usize,
+    /// Clone of the run loop's shutdown watch, observed by the pooled flush
+    /// between chunks so a SIGTERM during a long flush aborts the remaining
+    /// chunks instead of being swallowed (the original `block_in_place` flush was
+    /// not cancel-aware → SIGTERM was ignored during the soak wedge).
+    shutdown_rx_for_flush: Option<tokio::sync::watch::Receiver<bool>>,
     /// Receiver for peer failure reports from protocol tasks (e.g. fetch timeout).
     /// The main run loop drains this to call `peer_failed()` for reputation scoring.
     peer_failure_rx: Option<mpsc::Receiver<(SocketAddr, PeerFailureKind)>>,
@@ -2597,6 +2612,13 @@ impl Node {
                 .unwrap_or(0),
             pending_phase2: Vec::new(),
             pending_phase2_anchor: None,
+            pending_phase2_items: 0,
+            defer_phase2_max_items: std::env::var("DUGITE_DEFER_PHASE2_MAX_ITEMS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(256),
+            shutdown_rx_for_flush: None,
             peer_failure_rx: None,
             keepalive_rtt_rx: None,
             query_handler,
@@ -2815,6 +2837,9 @@ impl Node {
         // Setup shutdown signal (SIGINT + SIGTERM) early so the node can be
         // gracefully stopped during replay (which can take 30+ minutes).
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        // Let the pooled Phase-2 deferral flush observe shutdown between chunks
+        // (cancel-aware flush; see `flush_pending_phase2`).
+        self.shutdown_rx_for_flush = Some(shutdown_rx.clone());
         // #760: set true the instant the main run loop breaks, so the
         // shutdown watchdog can tell "loop wedged, never broke" (force-exit)
         // from "loop broke, draining cleanly" (the post-loop block has its own
@@ -4979,7 +5004,10 @@ impl Node {
                     info!("Shutdown signal received");
                     // Confirm any deferred Plutus before the shutdown snapshot so
                     // the persisted state reflects only Plutus-confirmed blocks.
-                    self.flush_pending_phase2().await;
+                    // allow_cancel = false: this flush must COMPLETE (the window
+                    // is small + memory-bounded), never observe its own shutdown
+                    // signal and bail before persisting confirmed state.
+                    self.flush_pending_phase2(false).await;
                     break;
                 }
 
@@ -5021,15 +5049,19 @@ impl Node {
                     }
                     self.apply_fetched_block(fetched).await;
                     // Cross-block Phase-2 pooling flush: drain the deferred window
-                    // when it reaches the configured size, or when the fetch queue
-                    // has drained (we've caught up to the buffered blocks, so flush
-                    // before idling / before any at-tip transition). No-op when the
-                    // window is empty (deferral off / at-tip).
+                    // when its REDEEMER count reaches the memory-safety cap
+                    // (`defer_phase2_max_items` — the primary trigger, since a
+                    // dense-Plutus region fills memory by redeemer count, not
+                    // block count), or the block window fills, or the fetch queue
+                    // has drained (we've caught up to the buffered blocks, so
+                    // flush before idling / before any at-tip transition). No-op
+                    // when the window is empty (deferral off / at-tip).
                     if !self.pending_phase2.is_empty()
-                        && (self.pending_phase2.len() >= self.defer_phase2_window
+                        && (self.pending_phase2_items >= self.defer_phase2_max_items
+                            || self.pending_phase2.len() >= self.defer_phase2_window
                             || fetched_blocks_rx.is_empty())
                     {
-                        self.flush_pending_phase2().await;
+                        self.flush_pending_phase2(true).await;
                     }
                     // After the apply, if the queue is empty we are about to
                     // block waiting → starvation Ongoing. A FULL queue during
@@ -5051,7 +5083,7 @@ impl Node {
                         blocks_since_maintenance = 0;
                         // Confirm all deferred Plutus before maintenance flushes
                         // volatile→immutable so nothing un-confirmed is finalised.
-                        self.flush_pending_phase2().await;
+                        self.flush_pending_phase2(true).await;
                         self.run_background_maintenance().await;
                     }
                 }
@@ -5064,7 +5096,7 @@ impl Node {
                 _ = maintenance_ticker.tick() => {
                     blocks_since_maintenance = 0;
                     // Confirm deferred Plutus before the volatile→immutable flush.
-                    self.flush_pending_phase2().await;
+                    self.flush_pending_phase2(true).await;
                     self.run_background_maintenance().await;
                 }
 
@@ -7028,33 +7060,81 @@ impl Node {
         // work items for the run loop's pooled flush. `block` is moved here
         // after its last borrow (the announce above), so no clone is needed.
         if should_defer_phase2 {
+            // Track the running redeemer count so the run loop flushes by
+            // work-item count (memory) before the block window fills.
+            self.pending_phase2_items += deferred_items.len();
             self.pending_phase2.push((Box::new(block), deferred_items));
         }
     }
 
     /// Drain the deferred Phase-2 (Plutus) window: evaluate every pooled block's
-    /// work items in ONE rayon batch (filling all cores), then apply each block's
-    /// fatality verdict in order. On a block-fatal collection error, roll the
-    /// ledger back to before that block and stop (mirrors the synchronous
-    /// per-block `Err` path, just deferred). A no-op when the window is empty.
+    /// work items on the memory-bounded pool, then apply each block's fatality
+    /// verdict in order. On a block-fatal collection error, roll the ledger back
+    /// to before that block and stop (mirrors the synchronous per-block `Err`
+    /// path, just deferred). A no-op when the window is empty.
+    ///
+    /// Memory + cancel safety: the pooled eval is concurrency-capped and chunked
+    /// (see [`dugite_ledger::plutus::run_phase2_parallel_pooled_cancellable`]) so
+    /// it cannot reproduce the deferral-soak RSS runaway, and — when
+    /// `allow_cancel` is true — it observes the shutdown watch between chunks so
+    /// a SIGTERM during a long flush aborts the remaining work instead of being
+    /// swallowed by `block_in_place`. The shutdown-arm flush passes
+    /// `allow_cancel = false` so it always confirms the (small, bounded) window
+    /// before the persisted snapshot.
     ///
     /// Byte-exact: state was already applied in-order by `apply_fetched_block`;
     /// this only runs the deferred read-only fatality check whose decision is a
     /// pure function of each block's self-contained work items.
-    async fn flush_pending_phase2(&mut self) {
+    async fn flush_pending_phase2(&mut self, allow_cancel: bool) {
         if self.pending_phase2.is_empty() {
             return;
         }
         let batch = std::mem::take(&mut self.pending_phase2);
         let anchor = self.pending_phase2_anchor.take();
+        self.pending_phase2_items = 0;
         let n_blocks = batch.len();
         let (blocks, items): (Vec<_>, Vec<_>) = batch.into_iter().unzip();
+        let n_items: usize = items.iter().map(Vec::len).sum();
+        let t_flush = std::time::Instant::now();
 
-        // Pooled rayon evaluation (CPU-bound) under block_in_place so the
-        // multi-thread runtime spawns relief workers for the duration.
+        // Cancellation token: observe the shutdown watch between chunks so a
+        // SIGTERM during a long flush aborts the remaining work. The shutdown-arm
+        // flush passes allow_cancel = false (None token) so it always completes.
+        let sd_rx = if allow_cancel {
+            self.shutdown_rx_for_flush.clone()
+        } else {
+            None
+        };
+        let cancel = move || sd_rx.as_ref().is_some_and(|rx| *rx.borrow());
+
+        // Pooled rayon evaluation (CPU-bound, memory-bounded) under
+        // block_in_place so the multi-thread runtime spawns relief workers.
         let outcomes_per_block = tokio::task::block_in_place(|| {
-            dugite_ledger::plutus::run_phase2_parallel_pooled(items)
+            dugite_ledger::plutus::run_phase2_parallel_pooled_cancellable(items, &cancel)
         });
+
+        let outcomes_per_block = match outcomes_per_block {
+            Some(o) => o,
+            None => {
+                // Cancelled mid-flush (shutdown in progress). Nothing was applied
+                // yet — the deferred blocks' STATE is in the in-memory ledger but
+                // their Plutus is unconfirmed, so we must NOT let them reach a
+                // persisted snapshot. Roll the ledger back to the window anchor
+                // (undoing the whole un-confirmed window) and disable deferral;
+                // the blocks are re-fetched + validated synchronously on restart.
+                warn!(
+                    pooled_blocks = n_blocks,
+                    pooled_items = n_items,
+                    "Deferred Phase-2 flush cancelled by shutdown — rolling the \
+                     ledger back to the last confirmed block and disabling deferral."
+                );
+                if let Some(rb) = anchor {
+                    let _ = self.handle_ledger_rollback(&rb).await;
+                }
+                self.defer_phase2_window = 0;
+                return;
+            }
+        };
 
         // Apply each block's fatality verdict in chain order. `prev_confirmed`
         // tracks the last block that drained non-fatal (starting at the window
@@ -7102,6 +7182,12 @@ impl Node {
                 *block.hash(),
             ));
         }
+        debug!(
+            pooled_blocks = n_blocks,
+            pooled_items = n_items,
+            elapsed_ms = t_flush.elapsed().as_millis() as u64,
+            "Deferred Phase-2 window flushed (pooled, memory-bounded)"
+        );
     }
 
     // ─── run_background_maintenance() ────────────────────────────────────────
