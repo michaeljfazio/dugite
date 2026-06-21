@@ -617,6 +617,16 @@ pub struct NodeMetrics {
     /// (0 = Praos, 1 = Ouroboros Genesis).  Set once at startup so dugite-monitor
     /// can show whether the node is running with Genesis (LoE/GDD) protection.
     pub consensus_mode_genesis: AtomicU64,
+    /// Cumulative count of deferred Phase-2 (cross-block Plutus) window flushes
+    /// (`dugite_deferred_phase2_flushes_total`). Only moves when the experimental
+    /// `DUGITE_DEFER_PHASE2_WINDOW` deferral is enabled; a non-zero, rising value
+    /// confirms the deferral path actually engaged during catch-up (vs staying
+    /// inert), so a soak can tell it exercised the pooled-flush code.
+    pub deferred_phase2_flushes: AtomicU64,
+    /// Cumulative count of blocks confirmed through the deferred Phase-2 pooled
+    /// flush (`dugite_deferred_phase2_blocks_total`). Paired with the flush
+    /// counter to show the window fill size over the run.
+    pub deferred_phase2_blocks: AtomicU64,
     /// Genesis State Machine state: 0=PreSyncing, 1=Syncing, 2=CaughtUp.
     /// `dugite_gsm_state`.
     pub gsm_state: AtomicU64,
@@ -882,6 +892,8 @@ impl NodeMetrics {
             epoch_length_slots: AtomicU64::new(0),
             slot_in_epoch: AtomicU64::new(0),
             consensus_mode_genesis: AtomicU64::new(0),
+            deferred_phase2_flushes: AtomicU64::new(0),
+            deferred_phase2_blocks: AtomicU64::new(0),
             gsm_state: AtomicU64::new(0),
             loe_tip_slot: AtomicU64::new(0),
             gdd_disconnects_total: AtomicU64::new(0),
@@ -1412,6 +1424,13 @@ impl NodeMetrics {
     /// Increment the GDD disconnect counter.
     pub fn record_gdd_disconnect(&self) {
         self.gdd_disconnects_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one completed deferred Phase-2 pooled flush over `blocks` blocks.
+    pub fn record_deferred_phase2_flush(&self, blocks: u64) {
+        self.deferred_phase2_flushes.fetch_add(1, Ordering::Relaxed);
+        self.deferred_phase2_blocks
+            .fetch_add(blocks, Ordering::Relaxed);
     }
 
     pub fn set_consensus_mode_genesis(&self, genesis: bool) {
@@ -2040,6 +2059,16 @@ impl NodeMetrics {
                 "dugite_gsm_state",
                 "Genesis State Machine state: 0=PreSyncing, 1=Syncing, 2=CaughtUp",
                 &self.gsm_state,
+            ),
+            (
+                "dugite_deferred_phase2_flushes_total",
+                "Cumulative cross-block deferred Phase-2 (Plutus) window flushes",
+                &self.deferred_phase2_flushes,
+            ),
+            (
+                "dugite_deferred_phase2_blocks_total",
+                "Cumulative blocks confirmed via the deferred Phase-2 pooled flush",
+                &self.deferred_phase2_blocks,
             ),
             (
                 "dugite_loe_tip_slot",

@@ -7209,6 +7209,7 @@ impl Node {
                 *block.hash(),
             ));
         }
+        self.metrics.record_deferred_phase2_flush(n_blocks as u64);
         debug!(
             pooled_blocks = n_blocks,
             pooled_items = n_items,
