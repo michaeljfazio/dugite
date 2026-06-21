@@ -60,6 +60,32 @@ impl TcpBearer {
 
         socket.set_tcp_nodelay(true).map_err(BearerError::Io)?;
 
+        // SO_RCVBUF / SO_SNDBUF — lift the single-stream BDP ceiling.
+        //
+        // A single TCP stream's throughput is bounded by `window / RTT`. Public
+        // Cardano relays sit at 250–500 ms RTT, where the OS default receive
+        // window (macOS `net.inet.tcp.recvspace` = 128 KiB, auto-tuning to
+        // `autorcvbufmax` = 4 MiB but in practice settling near ~1 MiB) caps a
+        // BlockFetch stream at ~1–3 MB/s. Once apply is no longer the bottleneck
+        // (registry cache + Plutus pooling), this single-peer BDP cap — not CPU
+        // — is the bulk-sync ceiling, and the bfcMaxConcurrencyBulkSync=1
+        // single-fetcher means the other hot peers can't pick up the slack.
+        //
+        // Setting SO_RCVBUF explicitly bypasses conservative auto-tuning and
+        // takes the window up to the OS hard cap (`kern.ipc.maxsockbuf`, 8 MiB
+        // default on macOS) → ~20 MB/s at 400 ms RTT. Best-effort: the kernel
+        // silently clamps to its max, and some platforms ignore it — never fatal.
+        // Tunable via `DUGITE_TCP_BUFFER_BYTES`; for windows beyond the OS cap,
+        // raise `kern.ipc.maxsockbuf` / `net.core.rmem_max` first.
+        let buf_bytes: usize = std::env::var("DUGITE_TCP_BUFFER_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8 * 1024 * 1024);
+        if buf_bytes > 0 {
+            let _ = socket.set_recv_buffer_size(buf_bytes);
+            let _ = socket.set_send_buffer_size(buf_bytes);
+        }
+
         let keepalive = TcpKeepalive::new().with_time(KEEPALIVE_INTERVAL);
         socket
             .set_tcp_keepalive(&keepalive)
@@ -125,6 +151,19 @@ impl TcpBearer {
         let _ = socket.set_reuseaddr(true);
         #[cfg(unix)]
         let _ = socket.set_reuseport(true);
+
+        // Size the receive/send buffers BEFORE connect so the TCP window scale
+        // factor is negotiated for the large window (see `new()` for the BDP
+        // rationale). `new()` also sets them post-connect as a backstop for the
+        // ephemeral-port fallback and the inbound-accept path.
+        let buf_bytes: u32 = std::env::var("DUGITE_TCP_BUFFER_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8 * 1024 * 1024);
+        if buf_bytes > 0 {
+            let _ = socket.set_recv_buffer_size(buf_bytes);
+            let _ = socket.set_send_buffer_size(buf_bytes);
+        }
 
         if socket.bind(local_addr).is_err() {
             // Bind to listen-port may fail (already in use without REUSEPORT
