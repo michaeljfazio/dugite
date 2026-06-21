@@ -310,6 +310,14 @@ pub struct NodePeerManager {
     local_root_groups: Vec<LocalRootGroupInfo>,
     /// Set of big ledger peer addresses.
     big_ledger_peers: std::collections::HashSet<SocketAddr>,
+    /// Set of bootstrap peer addresses (topology `bootstrapPeers`, always
+    /// trustable). Mirrors Haskell's bootstrap-peer set used by
+    /// `outboundConnectionsState`: in `UseBootstrapPeers` mode the
+    /// Honest-Availability-Assumption is satisfied by >=1 active (hot) bootstrap
+    /// peer (plus the "all established peers are trusted" invariant). Without
+    /// this, a from-genesis node with only bootstrap peers and no
+    /// `peerSnapshotFile` can never satisfy the HAA and stalls in PreSyncing.
+    bootstrap_peer_addrs: std::collections::HashSet<SocketAddr>,
     /// Inbound-duplex peers awaiting `inboundMaturePeerDelay`.
     ///
     /// Mirrors Haskell's `freshDuplexPeers` (OrdPSQ keyed by `(SocketAddr,
@@ -354,6 +362,7 @@ impl NodePeerManager {
             local_addr: None,
             local_root_groups: Vec::new(),
             big_ledger_peers: std::collections::HashSet::new(),
+            bootstrap_peer_addrs: std::collections::HashSet::new(),
             fresh_inbound: HashMap::new(),
             rollback_below_immutable_witnesses: HashMap::new(),
             gsm_event_tx: None,
@@ -565,6 +574,13 @@ impl NodePeerManager {
     /// Mark a peer as a big ledger peer.
     pub fn add_big_ledger_peer(&mut self, addr: SocketAddr) {
         self.big_ledger_peers.insert(addr);
+    }
+
+    /// Mark a peer as a bootstrap peer (topology `bootstrapPeers`). Bootstrap
+    /// peers are always trustable and satisfy the `UseBootstrapPeers` HAA path
+    /// (see [`Self::haa_satisfied`]).
+    pub fn add_bootstrap_peer(&mut self, addr: SocketAddr) {
+        self.bootstrap_peer_addrs.insert(addr);
     }
 
     /// Read-only view of all known big-ledger peers.
@@ -894,20 +910,28 @@ impl NodePeerManager {
     /// Honest-Availability-Assumption satisfaction (Haskell
     /// `outboundConnectionsState` → `TrustedStateWithExternalPeers`).
     ///
-    /// Two independent ways to be trusted, matching the Haskell case split:
-    /// - **Local-roots trust** (`LocalRootsOnly`): there is at least one
-    ///   active (hot) peer AND every established (warm/hot) peer is a
-    ///   trusted local root. This is how a devnet — and a mainnet node early
-    ///   in boot before ledger big-ledger peers are established — satisfies
-    ///   the HAA.
+    /// Two independent ways to be trusted, matching the Haskell
+    /// `(associationMode, bootstrapPeersFlag, consensusMode)` case split:
     /// - **Big-ledger trust** (Genesis mode, `DontUseBootstrapPeers`): at
     ///   least `min_active_blp` ACTIVE big-ledger peers.
+    /// - **Trusted-external trust** (`UseBootstrapPeers` / `LocalRootsOnly`):
+    ///   there is at least one active (hot) peer in the trusted set AND every
+    ///   established (warm/hot) outbound peer is in the trusted set, where the
+    ///   trusted set is `bootstrap peers ∪ trustable local roots`. This is how
+    ///   a from-genesis node (whose ledger has not reached `useLedgerAfterSlot`
+    ///   so no big-ledger peers are classified) satisfies the HAA via its
+    ///   bootstrap relays — mirroring Haskell `outboundConnectionsState →
+    ///   TrustedStateWithExternalPeers`. Without the bootstrap-peer term such a
+    ///   node would stall permanently in PreSyncing.
     pub fn haa_satisfied(&self, min_active_blp: usize) -> bool {
         if self.active_big_ledger_peer_count() >= min_active_blp {
             return true;
         }
-        let local_roots = self.local_root_addrs();
-        if local_roots.is_empty() {
+        // Trusted external set = bootstrap peers ∪ trustable local roots
+        // (Haskell `viewEstablishedBootstrapPeers ∪ trustableLocalRootSet`).
+        let mut trusted = self.local_root_addrs();
+        trusted.extend(self.bootstrap_peer_addrs.iter().copied());
+        if trusted.is_empty() {
             return false;
         }
         // Haskell `outboundConnectionsState` assesses only OUTBOUND-initiated
@@ -925,23 +949,24 @@ impl NodePeerManager {
                 )
             )
         };
-        // At least one ACTIVE (hot) outbound trusted local root.
-        let any_hot_root = self
+        // At least one ACTIVE (hot) outbound trusted peer (Haskell
+        // `not (Set.null viewActiveBootstrapPeers)`).
+        let any_hot_trusted = self
             .inner
             .peers_in_state(PeerState::Hot)
             .into_iter()
-            .any(|a| is_outbound(&a) && local_roots.contains(&a));
-        if !any_hot_root {
+            .any(|a| is_outbound(&a) && trusted.contains(&a));
+        if !any_hot_trusted {
             return false;
         }
-        // Every OUTBOUND established (warm + hot) peer must be a trusted
-        // local root.
+        // Every OUTBOUND established (warm + hot) peer must be trusted (Haskell
+        // `viewEstablishedPeers ⊆ viewEstablishedBootstrapPeers ∪ trustableLocalRootSet`).
         let mut established = self.inner.peers_in_state(PeerState::Warm);
         established.extend(self.inner.peers_in_state(PeerState::Hot));
         established
             .iter()
             .filter(|a| is_outbound(a))
-            .all(|a| local_roots.contains(a))
+            .all(|a| trusted.contains(a))
     }
 
     /// Get connected peer addresses.
@@ -1145,6 +1170,37 @@ mod tests {
         pm2.peer_connected(&public, ConnectionDirection::Outbound);
         pm2.inner.promote_to_hot(&public);
         assert!(!pm2.haa_satisfied(5));
+    }
+
+    #[test]
+    fn test_haa_satisfied_via_bootstrap_peers() {
+        // From-genesis genesis-mode path (Haskell UseBootstrapPeers →
+        // TrustedStateWithExternalPeers): HAA holds when there is ≥1 hot
+        // bootstrap peer AND every established outbound peer is trusted, with
+        // ZERO big-ledger peers and NO local roots. This is exactly what a
+        // from-genesis node needs to leave PreSyncing; without the bootstrap
+        // term in the trusted set it stalls forever (the genesis bulk-sync bug).
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        let boot: SocketAddr = "3.74.40.92:3001".parse().unwrap();
+        pm.add_bootstrap_peer(boot);
+        // Warm only → not satisfied (Haskell needs an ACTIVE/hot peer).
+        pm.peer_connected(&boot, ConnectionDirection::Outbound);
+        assert!(!pm.haa_satisfied(5));
+        // Hot outbound bootstrap peer → satisfied (no BLPs, no local roots).
+        pm.inner.promote_to_hot(&boot);
+        assert!(
+            pm.haa_satisfied(5),
+            "a hot bootstrap peer satisfies the UseBootstrapPeers HAA path"
+        );
+        // Condition 2 (established ⊆ trusted): an untrusted outbound hot peer
+        // must break the HAA, mirroring Haskell outboundConnectionsState.
+        let public: SocketAddr = "8.8.8.8:3001".parse().unwrap();
+        pm.peer_connected(&public, ConnectionDirection::Outbound);
+        pm.inner.promote_to_hot(&public);
+        assert!(
+            !pm.haa_satisfied(5),
+            "an established untrusted outbound peer must break the HAA"
+        );
     }
 
     #[test]

@@ -2461,9 +2461,8 @@ impl Node {
                         && age < gsm_config.syncing_startup_threshold_secs
                 );
                 // MUST mirror GenesisStateMachine::new()'s no-marker branch so the
-                // seed snapshot's state/LoE matches the GSM actor's internal state
-                // (DUGITE_GENESIS_BOOTSTRAP_SYNCING bootstrap HAA bypass).
-                if recent || crate::gsm::bootstrap_syncing_override() {
+                // seed snapshot's state matches the GSM actor's internal state.
+                if recent {
                     crate::gsm::GenesisSyncState::Syncing
                 } else {
                     crate::gsm::GenesisSyncState::PreSyncing
@@ -3615,6 +3614,12 @@ impl Node {
             };
 
             let mut resolved_peers: Vec<std::net::SocketAddr> = Vec::new();
+            // Bootstrap / trustable peers' resolved addresses, registered with
+            // the PeerManager so haa_satisfied() can recognise them as the
+            // trusted external set (Haskell UseBootstrapPeers HAA path). A
+            // `trustable` topology entry is a bootstrap peer or a trustable
+            // local root — exactly Haskell's trusted-peer set.
+            let mut resolved_bootstrap: Vec<std::net::SocketAddr> = Vec::new();
             for peer in &detailed_peers {
                 let addrs = resolve_with_srv(dns_resolver.as_ref(), &peer.address, peer.port).await;
                 if addrs.is_empty() {
@@ -3624,6 +3629,9 @@ impl Node {
                         "Failed to resolve peer address (SRV + A/AAAA both failed)"
                     );
                 } else {
+                    if peer.trustable {
+                        resolved_bootstrap.extend(addrs.iter().copied());
+                    }
                     resolved_peers.extend(addrs);
                 }
             }
@@ -3675,6 +3683,11 @@ impl Node {
             let mut pm = peer_manager.write().await;
             for socket_addr in resolved_peers {
                 pm.add_config_peer(socket_addr);
+            }
+            // Register bootstrap/trustable peers for the UseBootstrapPeers HAA
+            // path (must be AFTER add_config_peer so the peer table has them).
+            for socket_addr in resolved_bootstrap {
+                pm.add_bootstrap_peer(socket_addr);
             }
             // Register per-group valency targets.  This must happen AFTER
             // add_config_peer() calls so the peer table contains the members.
