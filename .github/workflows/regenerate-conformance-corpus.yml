@@ -46,7 +46,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Apply workflow_dispatch pin overrides to sources.toml
         if: github.event_name == 'workflow_dispatch'
