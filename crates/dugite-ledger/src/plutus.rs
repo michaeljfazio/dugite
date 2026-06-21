@@ -440,14 +440,106 @@ pub fn run_phase2_parallel(items: Vec<Phase2WorkItem>) -> Vec<Phase2Outcome> {
     outcomes
 }
 
+/// Evaluate one pooled Phase-2 work item into its `(block_idx, outcome)`.
+///
+/// Pure and self-contained (reads only the borrowed item), so it is safe to run
+/// on any rayon worker or sequentially. Shared by the parallel and sequential
+/// pooled paths so the per-item logic — including the divergence dump — lives in
+/// exactly one place.
+fn eval_phase2_item(block_idx: usize, item: &Phase2WorkItem) -> (usize, Phase2Outcome) {
+    let dugite_slot_config = dugite_uplc::phase_two::SlotConfig {
+        network_start_unix_seconds: item.slot_config.zero_time / 1_000,
+        slot_zero_offset: item.slot_config.zero_slot,
+        slot_length_ms: item.slot_config.slot_length,
+        safe_zone_horizon_slot: item.slot_config.safe_zone_horizon_slot,
+    };
+    let result = run_single_phase2_eval(
+        &item.tx_cbor,
+        &item.utxo_pairs,
+        item.cost_models_cbor.as_deref(),
+        item.max_ex,
+        dugite_slot_config,
+        item.protocol_major,
+    );
+    if (result.is_ok() && !item.is_valid) || (result.is_err() && item.is_valid) {
+        maybe_dump_phase2_divergence(item);
+    }
+    (
+        block_idx,
+        Phase2Outcome {
+            tx_idx: item.tx_idx,
+            is_valid: item.is_valid,
+            result,
+            utxo_complete: item.utxo_complete,
+        },
+    )
+}
+
+/// Default cap on CONCURRENT Plutus evaluations in the cross-block pooled flush.
+///
+/// Each in-flight CEK evaluation can hold up to roughly its declared
+/// `maxTxExUnits` mem budget worth of live term/environment data (hundreds of MB
+/// for a max-budget script), so peak RSS during a pooled flush is
+/// ≈ concurrency × per-eval peak. The original pooled path ran ONE rayon batch
+/// across EVERY core (`into_par_iter` on the global pool); in a dense-Plutus
+/// region that produced an ~11-core × ~1.2 GB ≈ 13.5 GB runaway that froze block
+/// apply (the deferral-soak wedge). Capping concurrency bounds peak RSS while
+/// still filling several cores. Tunable via `DUGITE_PHASE2_POOL_THREADS`;
+/// default = min(cores − 2, this).
+const PHASE2_POOL_DEFAULT_MAX_THREADS: usize = 6;
+
+/// Per-chunk work-item multiple (× pool width). Chunking gives the pooled flush
+/// a cancellation checkpoint between chunks and bounds the live outcome buffer,
+/// without starving the pool's work-stealing depth.
+const PHASE2_POOL_CHUNK_FACTOR: usize = 4;
+
+/// Resolve the pooled-flush concurrency cap (see [`PHASE2_POOL_DEFAULT_MAX_THREADS`]).
+fn phase2_pool_max_threads() -> usize {
+    if let Ok(v) = std::env::var("DUGITE_PHASE2_POOL_THREADS") {
+        if let Ok(n) = v.parse::<usize>() {
+            if n >= 1 {
+                return n;
+            }
+        }
+    }
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    cores
+        .saturating_sub(2)
+        .clamp(1, PHASE2_POOL_DEFAULT_MAX_THREADS)
+}
+
+/// Process-wide bounded rayon pool for the cross-block pooled flush. Built once
+/// (its width is fixed by [`phase2_pool_max_threads`] at first use); `None` only
+/// if the pool cannot be created (resource exhaustion), in which case the caller
+/// runs the chunks sequentially.
+#[cfg(feature = "parallel-verification")]
+fn phase2_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(phase2_pool_max_threads())
+            .thread_name(|i| format!("phase2-pool-{i}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
 /// Cross-block pooled Phase-2 evaluation — the CPU-saturation primitive for
 /// bulk sync.
 ///
 /// A single block carries only ~2-3 redeemers on the median preview Conway
 /// block, so its `into_par_iter` cannot fill a 12-core host. This concatenates
-/// the work items of MANY blocks into one rayon batch (all redeemers fan across
-/// every core at once), then regroups the outcomes back per input block,
-/// preserving each block's internal `tx_idx` ordering.
+/// the work items of MANY blocks (all redeemers fan across the pool at once),
+/// then regroups the outcomes back per input block, preserving each block's
+/// internal `tx_idx` ordering.
+///
+/// **Memory-bounded.** Rather than fanning every redeemer across the global
+/// rayon pool at once (which produced the deferral-soak RSS runaway), this runs
+/// on a dedicated pool capped at [`phase2_pool_max_threads`] and processes the
+/// flattened items in chunks, so peak concurrent CEK memory stays bounded.
 ///
 /// `batches[i]` are block `i`'s [`Phase2WorkItem`]s (from
 /// [`crate::state::LedgerState::apply_block_defer_phase2`]); the returned
@@ -457,13 +549,36 @@ pub fn run_phase2_parallel(items: Vec<Phase2WorkItem>) -> Vec<Phase2Outcome> {
 /// per-block fatality decision the serial path would make.
 #[cfg(feature = "parallel-verification")]
 pub fn run_phase2_parallel_pooled(batches: Vec<Vec<Phase2WorkItem>>) -> Vec<Vec<Phase2Outcome>> {
+    // Never-cancel: the offline / bench path always runs to completion.
+    run_phase2_pooled_inner(batches, &|| false)
+        .expect("pooled phase-2 eval cannot be cancelled with a never-cancel token")
+}
+
+/// Cancellable + memory-bounded variant for the live deferral flush.
+///
+/// Returns `None` if `cancel()` observed `true` between chunks (shutdown in
+/// progress) before all items were evaluated — the caller MUST treat the window
+/// as NOT confirmed (roll back / retry) and never apply a partial result. On
+/// success returns per-block outcomes aligned 1:1 with `batches`.
+#[cfg(feature = "parallel-verification")]
+pub fn run_phase2_parallel_pooled_cancellable(
+    batches: Vec<Vec<Phase2WorkItem>>,
+    cancel: &dyn Fn() -> bool,
+) -> Option<Vec<Vec<Phase2Outcome>>> {
+    run_phase2_pooled_inner(batches, cancel)
+}
+
+#[cfg(feature = "parallel-verification")]
+fn run_phase2_pooled_inner(
+    batches: Vec<Vec<Phase2WorkItem>>,
+    cancel: &dyn Fn() -> bool,
+) -> Option<Vec<Vec<Phase2Outcome>>> {
     use rayon::prelude::*;
 
     let n_blocks = batches.len();
 
-    // Flatten to (block_idx, item) so every redeemer across every block is a
-    // single rayon work unit — this is what actually fills the cores. Consume
-    // `batches` by value (move, no clone) since items are owned and self-contained.
+    // Flatten to (block_idx, item) so every redeemer is a single work unit.
+    // Consume `batches` by value (move, no clone) since items are self-contained.
     let mut flat: Vec<(usize, Phase2WorkItem)> = Vec::new();
     for (block_idx, items) in batches.into_iter().enumerate() {
         for item in items {
@@ -471,53 +586,71 @@ pub fn run_phase2_parallel_pooled(batches: Vec<Vec<Phase2WorkItem>>) -> Vec<Vec<
         }
     }
 
-    let mut tagged: Vec<(usize, Phase2Outcome)> = flat
-        .into_par_iter()
-        .map(|(block_idx, item)| {
-            let dugite_slot_config = dugite_uplc::phase_two::SlotConfig {
-                network_start_unix_seconds: item.slot_config.zero_time / 1_000,
-                slot_zero_offset: item.slot_config.zero_slot,
-                slot_length_ms: item.slot_config.slot_length,
-                safe_zone_horizon_slot: item.slot_config.safe_zone_horizon_slot,
-            };
-            let result = run_single_phase2_eval(
-                &item.tx_cbor,
-                &item.utxo_pairs,
-                item.cost_models_cbor.as_deref(),
-                item.max_ex,
-                dugite_slot_config,
-                item.protocol_major,
-            );
-            if (result.is_ok() && !item.is_valid) || (result.is_err() && item.is_valid) {
-                maybe_dump_phase2_divergence(&item);
-            }
-            (
-                block_idx,
-                Phase2Outcome {
-                    tx_idx: item.tx_idx,
-                    is_valid: item.is_valid,
-                    result,
-                    utxo_complete: item.utxo_complete,
-                },
-            )
-        })
-        .collect();
+    let pool = phase2_pool();
+    let chunk_items = phase2_pool_max_threads()
+        .saturating_mul(PHASE2_POOL_CHUNK_FACTOR)
+        .max(1);
 
-    // Regroup by block index, one inner vec per input block.
+    // Process in bounded chunks: a cancellation checkpoint between chunks (one
+    // chunk = bounded latency) and a bounded live outcome buffer. Concurrency
+    // within a chunk is capped by the dedicated pool, which is what bounds RSS.
+    let mut tagged: Vec<(usize, Phase2Outcome)> = Vec::with_capacity(flat.len());
+    let mut start = 0usize;
+    while start < flat.len() {
+        if cancel() {
+            return None;
+        }
+        let end = (start + chunk_items).min(flat.len());
+        let chunk = &flat[start..end];
+        let mut chunk_out: Vec<(usize, Phase2Outcome)> = match pool {
+            Some(p) => p.install(|| {
+                chunk
+                    .par_iter()
+                    .map(|(block_idx, item)| eval_phase2_item(*block_idx, item))
+                    .collect()
+            }),
+            // Pool unavailable (build failed): sequential, still cancellable
+            // per chunk.
+            None => chunk
+                .iter()
+                .map(|(block_idx, item)| eval_phase2_item(*block_idx, item))
+                .collect(),
+        };
+        tagged.append(&mut chunk_out);
+        start = end;
+    }
+
+    // Regroup by block index, one inner vec per input block, sorted by
+    // (block_idx, tx_idx) so each block's outcomes land in tx order — identical
+    // to run_phase2_parallel's per-block sort_by_key(tx_idx).
     let mut grouped: Vec<Vec<Phase2Outcome>> = (0..n_blocks).map(|_| Vec::new()).collect();
-    // Sort by (block_idx, tx_idx) so each block's outcomes land in tx order —
-    // identical to run_phase2_parallel's per-block sort_by_key(tx_idx).
     tagged.sort_by_key(|(block_idx, o)| (*block_idx, o.tx_idx));
     for (block_idx, outcome) in tagged {
         grouped[block_idx].push(outcome);
     }
-    grouped
+    Some(grouped)
 }
 
 /// Sequential fallback (feature gate off).
 #[cfg(not(feature = "parallel-verification"))]
 pub fn run_phase2_parallel_pooled(batches: Vec<Vec<Phase2WorkItem>>) -> Vec<Vec<Phase2Outcome>> {
     batches.into_iter().map(run_phase2_parallel).collect()
+}
+
+/// Cancellable sequential fallback (feature gate off).
+#[cfg(not(feature = "parallel-verification"))]
+pub fn run_phase2_parallel_pooled_cancellable(
+    batches: Vec<Vec<Phase2WorkItem>>,
+    cancel: &dyn Fn() -> bool,
+) -> Option<Vec<Vec<Phase2Outcome>>> {
+    let mut grouped: Vec<Vec<Phase2Outcome>> = Vec::with_capacity(batches.len());
+    for items in batches {
+        if cancel() {
+            return None;
+        }
+        grouped.push(run_phase2_parallel(items));
+    }
+    Some(grouped)
 }
 
 /// Sequential fallback (feature gate off).
@@ -919,6 +1052,92 @@ mod tests {
         assert!(
             !datum_present(&dugite_serialization::encode_transaction(&tx)),
             "encode_transaction must mangle the non-canonical datum (proves the bug)"
+        );
+    }
+
+    /// The memory-bounded + chunked pooled flush must be byte-for-byte
+    /// equivalent to the established per-block sequential-parallel path: each
+    /// item's evaluation is independent, and the regroup re-sorts by
+    /// `(block_idx, tx_idx)`, so the dedicated capped pool + chunking changes
+    /// only WHEN/WHERE an eval runs, never its outcome. This pins that invariant
+    /// (the deferral byte-exactness guarantee) and the cancellation contract.
+    #[test]
+    fn pooled_phase2_equals_sequential_reference_and_honours_cancel() {
+        let tx_cbor = hexd(include_str!("../test_data/phase2_datum_tag102_tx.hex"));
+        let mk_item = |tx_idx: usize, is_valid: bool| Phase2WorkItem {
+            tx_idx,
+            is_valid,
+            tx_cbor: tx_cbor.clone(),
+            // No resolved inputs: every eval fails fast + deterministically. We
+            // are testing scheduling-invariance, which holds for ANY deterministic
+            // per-item function regardless of the Ok/Err verdict.
+            utxo_pairs: Vec::new(),
+            cost_models_cbor: None,
+            max_ex: (10_000_000_000, 14_000_000),
+            slot_config: SlotConfig {
+                zero_time: 1_596_059_091_000,
+                zero_slot: 4_492_800,
+                slot_length: 1_000,
+                safe_zone_horizon_slot: None,
+            },
+            protocol_major: 9,
+            utxo_complete: false,
+        };
+        // Fresh blocks each call (Phase2WorkItem is not Clone). Includes an empty
+        // block and a block larger than a chunk so flatten/regroup + the chunk
+        // boundary are exercised.
+        let mk_blocks = || -> Vec<Vec<Phase2WorkItem>> {
+            vec![
+                vec![mk_item(0, true), mk_item(1, false)],
+                Vec::new(),
+                vec![mk_item(0, true)],
+                (0..40).map(|i| mk_item(i, i % 2 == 0)).collect(),
+            ]
+        };
+        let proj = |groups: Vec<Vec<Phase2Outcome>>| -> Vec<Vec<(usize, bool, bool, bool)>> {
+            groups
+                .into_iter()
+                .map(|g| {
+                    g.into_iter()
+                        .map(|o| (o.tx_idx, o.is_valid, o.result.is_ok(), o.utxo_complete))
+                        .collect()
+                })
+                .collect()
+        };
+
+        // Reference: per-block sequential-parallel (the path the pooled flush
+        // must reproduce).
+        let reference: Vec<Vec<(usize, bool, bool, bool)>> = mk_blocks()
+            .into_iter()
+            .map(|b| {
+                run_phase2_parallel(b)
+                    .into_iter()
+                    .map(|o| (o.tx_idx, o.is_valid, o.result.is_ok(), o.utxo_complete))
+                    .collect()
+            })
+            .collect();
+
+        // Pooled (memory-bounded, chunked) must align 1:1 and match exactly.
+        let pooled = run_phase2_parallel_pooled(mk_blocks());
+        assert_eq!(
+            pooled.len(),
+            4,
+            "outcome groups align 1:1 with input blocks"
+        );
+        assert_eq!(
+            proj(pooled),
+            reference,
+            "pooled outcomes must equal the sequential reference exactly"
+        );
+
+        // Cancellable: never-cancel == reference; always-cancel == None (the
+        // window is NOT confirmed, never partially applied).
+        let never = run_phase2_parallel_pooled_cancellable(mk_blocks(), &|| false)
+            .expect("never-cancel returns Some");
+        assert_eq!(proj(never), reference, "never-cancel matches the reference");
+        assert!(
+            run_phase2_parallel_pooled_cancellable(mk_blocks(), &|| true).is_none(),
+            "always-cancel returns None so the caller cannot apply a partial window"
         );
     }
 
