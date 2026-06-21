@@ -146,6 +146,13 @@ const BLOCKFETCH_INIT_AVG_BLOCK_BYTES: usize = 65_536;
 /// Real RTT-hiding throughput work is concurrent multi-peer fetch (deferred).
 const BLOCKFETCH_PIPELINE_WINDOW: usize = 2;
 
+/// GSV fetch-peer preference width (cardano-node `nPreferedPeers`). The single
+/// bulk-sync fetch slot is contested only by the top-K peers ranked by measured
+/// fetch bandwidth. Haskell uses `maxConcurrencyBulkSync = 1`; dugite keeps a
+/// hot standby (K=2) so a momentarily-busy best peer cannot stall the slot,
+/// while still concentrating fetching on the fastest peers.
+const GSV_FETCH_TOP_K: usize = 2;
+
 // Issue #747: compile-time invariant, referencing the REAL mux constant
 // directly (no hand-mirrored copy that could drift).
 // The total pipelined in-flight bytes (PIPELINE_WINDOW × RANGE_BYTE_BUDGET)
@@ -2273,6 +2280,11 @@ impl ConnectionLifecycleManager {
         let block_fetch_grace_period = self.block_fetch_grace_period;
         // GSM state for genesis-mode gate (only rotate in genesis bulk sync).
         let gsm_snapshot_rx_for_starv = self.gsm_snapshot_rx.clone();
+        // GSV peer prioritisation: rank fetch peers by measured bandwidth so the
+        // single bulk-sync fetch slot goes to the fastest-serving peer (matching
+        // cardano-node's prioritisePeerChains). Read in the claim gate; updated
+        // after each range. `None` when no peer manager (unit tests) → gate off.
+        let peer_manager_for_fetch = self.peer_manager_for_servers.clone();
 
         Box::new(move |mut channel, cancel| {
             Box::pin(async move {
@@ -2435,6 +2447,22 @@ impl ConnectionLifecycleManager {
                                 addr.hash(&mut hasher);
                                 hasher.finish() | 1
                             };
+                            // GSV gate (cardano-node prioritisePeerChains): when the
+                            // slot is FREE, only the fastest-serving peers contest it,
+                            // so the single fetcher converges on the best peer rather
+                            // than a fair race. A peer that already holds the slot
+                            // keeps it (re-claim) — the gate only filters NEW claims.
+                            // Wedge-safe: unmeasured / cold-start peers stay eligible
+                            // and the existing starvation rotation frees a stuck peer.
+                            if active_fetcher.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                                let preferred = peer_manager_for_fetch
+                                    .read()
+                                    .await
+                                    .should_claim_fetch_slot(&addr, GSV_FETCH_TOP_K);
+                                if !preferred {
+                                    continue;
+                                }
+                            }
                             let claimed = active_fetcher.compare_exchange(
                                 0,
                                 my_id,
@@ -3089,6 +3117,19 @@ impl ConnectionLifecycleManager {
                                         // bytes this range delivered (rate = rx B/s).
                                         metrics_clone
                                             .inc_blockfetch_rx_bytes(range_abort.seen_bytes() as u64);
+                                        // GSV: record this peer's measured fetch
+                                        // bandwidth (bytes/sec) so the claim gate can
+                                        // prefer the fastest-serving peers. Only count
+                                        // ranges with a meaningful sample (>0 bytes,
+                                        // >1 ms) so tiny/instant ranges don't skew it.
+                                        if range_abort.seen_bytes() > 0 && fetch_ms > 1.0 {
+                                            let bps = range_abort.seen_bytes() as f64
+                                                / (fetch_ms / 1000.0);
+                                            peer_manager_for_fetch
+                                                .write()
+                                                .await
+                                                .update_peer_fetch_bandwidth(&addr, bps);
+                                        }
                                         // Refresh the average block size for the
                                         // next range's byte-budget sizing.
                                         if let Some(avg) = range_abort.seen_bytes().checked_div(count) {
@@ -3166,6 +3207,16 @@ impl ConnectionLifecycleManager {
                                             timeout_secs = FETCH_RANGE_TIMEOUT.as_secs(),
                                             "BlockFetch range timed out, releasing fetcher",
                                         );
+                                        // GSV: a timed-out peer is effectively zero
+                                        // throughput right now — collapse its measured
+                                        // bandwidth so the claim gate de-prefers it and
+                                        // the slot converges on a healthy fast peer
+                                        // (rather than re-picking the stalled one from a
+                                        // stale-but-high EWMA).
+                                        peer_manager_for_fetch
+                                            .write()
+                                            .await
+                                            .update_peer_fetch_bandwidth(&addr, 1.0);
                                         // CSJ: a peer starving BlockFetch is
                                         // rotated out of the dynamo role so a
                                         // different peer drives the jumps

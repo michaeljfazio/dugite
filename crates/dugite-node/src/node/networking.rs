@@ -774,6 +774,21 @@ impl NodePeerManager {
         self.inner.get_latency_ms(addr)
     }
 
+    /// Record a measured BlockFetch throughput sample (bytes/second) for a peer
+    /// — the bandwidth half of the GSV estimate used to pick the fetch peer.
+    pub fn update_peer_fetch_bandwidth(&mut self, addr: &SocketAddr, bytes_per_sec: f64) {
+        self.inner.update_fetch_bandwidth(addr, bytes_per_sec);
+    }
+
+    /// Whether `addr` should contest the single fetch slot right now, ranking it
+    /// against the current HOT peers by GSV (fetch bandwidth). Self-contained
+    /// candidate derivation for the BlockFetch worker's claim loop.
+    pub fn should_claim_fetch_slot(&self, addr: &SocketAddr, top_k: usize) -> bool {
+        use dugite_network::peer::PeerState;
+        let candidates = self.inner.peers_in_state(PeerState::Hot);
+        self.inner.is_preferred_fetch_peer(addr, &candidates, top_k)
+    }
+
     /// Record blocks fetched from a peer.
     #[allow(dead_code)] // used by networking rewrite
     pub fn record_block_fetch(&mut self, addr: &SocketAddr, blocks: usize) {
