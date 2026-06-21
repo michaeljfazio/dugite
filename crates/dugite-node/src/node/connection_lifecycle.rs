@@ -2312,9 +2312,15 @@ impl ConnectionLifecycleManager {
                     /// (≈1 under the single-fetcher mutex; rises with multi-peer
                     /// fetch). Decremented on any drop (release / cancel / unwind).
                     metrics: std::sync::Arc<crate::metrics::NodeMetrics>,
+                    /// When the slot was claimed — on drop, the held duration is
+                    /// added to `blockfetch_busy_us_total` so utilization
+                    /// (busy / wall) can be computed (idle-vs-network-bound).
+                    claim_at: std::time::Instant,
                 }
                 impl Drop for ActiveFetcherGuard {
                     fn drop(&mut self) {
+                        self.metrics
+                            .inc_blockfetch_busy_us(self.claim_at.elapsed().as_micros() as u64);
                         let swapped = self.fetcher.compare_exchange(
                             self.id,
                             0,
@@ -2505,6 +2511,7 @@ impl ConnectionLifecycleManager {
                                 id: my_id,
                                 peer_slot: active_fetch_peer.clone(),
                                 metrics: metrics_clone.clone(),
+                                claim_at: std::time::Instant::now(),
                             };
 
                             // Build the list of headers to fetch from this peer.
@@ -2570,6 +2577,11 @@ impl ConnectionLifecycleManager {
                             };
 
                             if fetch_runs.is_empty() {
+                                // Header-supply-bound idle signal: the slot was
+                                // claimable but there are no headers ahead to
+                                // fetch — the fetcher has drained ChainSync's
+                                // supply and is waiting (NOT network-bound).
+                                metrics_clone.inc_blockfetch_idle_no_headers();
                                 // #742 watchdog (unproductive claim): the slot
                                 // was claimed but there is NOTHING dispatchable
                                 // from this peer. Haskell's rotation cannot
@@ -3303,6 +3315,13 @@ impl ConnectionLifecycleManager {
                                     // blockfetch task un-cancellable for an unbounded
                                     // duration — blocking demote_to_warm past the 5s
                                     // spsDeactivateTimeout and forcing a TCP teardown.
+                                    // Measure time blocked here: when the apply
+                                    // consumer is slow the channel fills and this
+                                    // send parks the fetcher (slot held, no bytes
+                                    // downloaded) — apply-backpressure, NOT a
+                                    // network limit. Surfaced as
+                                    // blockfetch_send_blocked_us_total.
+                                    let send_started = std::time::Instant::now();
                                     let send_result = tokio::select! {
                                         biased;
                                         _ = cancel.cancelled() => {
@@ -3311,6 +3330,9 @@ impl ConnectionLifecycleManager {
                                         }
                                         r = fetched_blocks_tx.send(fetched) => r
                                     };
+                                    metrics_clone.inc_blockfetch_send_blocked_us(
+                                        send_started.elapsed().as_micros() as u64,
+                                    );
                                     if let Err(e) = send_result {
                                         warn!(%addr, slot, "send to run loop failed (channel closed): {e}");
                                         // Channel closed means the run loop
