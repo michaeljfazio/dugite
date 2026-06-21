@@ -299,6 +299,30 @@ pub struct GenesisStateMachine {
     last_loe_tip_slot: u64,
 }
 
+/// Operator opt-in (`DUGITE_GENESIS_BOOTSTRAP_SYNCING=1`): start a from-genesis /
+/// far-behind genesis-mode node directly in `Syncing` instead of `PreSyncing`.
+///
+/// Default OFF. With it OFF (and no Mithril/recent-tip #757 fast-path applying), a
+/// node with no `peerSnapshotFile` whose tip is below `useLedgerAfterSlot` can
+/// never satisfy the Honest-Availability-Assumption gate — no big-ledger-peers are
+/// ever classified — so it stalls permanently in `PreSyncing` with the LoE frozen
+/// at the immutable tip (the genesis bulk-sync stall: ledger wedged ~k blocks past
+/// origin). Setting this flag bypasses that gate so the live GDD/LoE-advance path
+/// runs and the ledger can progress.
+///
+/// SECURITY TRADEOFF: this trusts the bootstrap/public peers' density-selected
+/// chain WITHOUT the honest-availability assumption — unlike the #757 recent-tip
+/// path, which is backed by a Mithril certificate or a prior caught-up run. It is
+/// intended for trusted-bootstrap from-genesis sync (e.g. testnet soak); the
+/// faithful production fix is to seed big-ledger-peers via a `peerSnapshotFile`.
+/// Kept OFF by default so mainnet / default genesis behaviour is unchanged.
+pub fn bootstrap_syncing_override() -> bool {
+    matches!(
+        std::env::var("DUGITE_GENESIS_BOOTSTRAP_SYNCING").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes")
+    )
+}
+
 impl GenesisStateMachine {
     /// Create a new GSM. If not enabled, it immediately enters CaughtUp
     /// and all constraints are disabled.
@@ -372,6 +396,21 @@ impl GenesisStateMachine {
                         threshold_secs = config.syncing_startup_threshold_secs,
                         "Genesis: tip is recent (no marker) — starting in \
                          Syncing (Mithril snapshot / fast-restart path, issue #757)"
+                    );
+                    GenesisSyncState::Syncing
+                } else if bootstrap_syncing_override() {
+                    // From-genesis / far-behind bootstrap with no peerSnapshotFile:
+                    // the HAA gate (>= min_active_blp BLPs) can never fire (no BLPs
+                    // are classified before useLedgerAfterSlot, which the stalled
+                    // ledger never reaches), so PreSyncing would freeze the LoE at
+                    // the immutable tip forever. This explicit opt-in starts in
+                    // Syncing so the live GDD/LoE-advance path runs. See
+                    // `bootstrap_syncing_override` for the security tradeoff.
+                    info!(
+                        tip_age_secs = initial_tip_age_secs,
+                        "Genesis: DUGITE_GENESIS_BOOTSTRAP_SYNCING set — starting in \
+                         Syncing (bootstrap HAA bypass; trusts peer-density chain \
+                         selection without the honest-availability assumption)"
                     );
                     GenesisSyncState::Syncing
                 } else {
@@ -1322,6 +1361,67 @@ mod tests {
         // Unknown age: trust the marker.
         let gsm = GenesisStateMachine::new(config, true, PeerStateRegistry::new(), None);
         assert_eq!(gsm.state(), GenesisSyncState::CaughtUp);
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[test]
+    fn test_bootstrap_syncing_override() {
+        // From-genesis / far-behind, no marker, OLD tip (age >> threshold so the
+        // #757 recent-tip path does NOT fire): default = PreSyncing (the stall);
+        // with DUGITE_GENESIS_BOOTSTRAP_SYNCING set = Syncing (bootstrap bypass).
+        let marker = "/tmp/gsm_bootstrap_override.marker";
+        let _ = std::fs::remove_file(marker);
+        let config = GsmConfig {
+            syncing_startup_threshold_secs: 100,
+            marker_path: PathBuf::from(marker),
+            ..Default::default()
+        };
+
+        std::env::remove_var("DUGITE_GENESIS_BOOTSTRAP_SYNCING");
+        assert!(!bootstrap_syncing_override());
+        let gsm = GenesisStateMachine::new(
+            config.clone(),
+            true,
+            PeerStateRegistry::new(),
+            Some(1_000_000),
+        );
+        assert_eq!(
+            gsm.state(),
+            GenesisSyncState::PreSyncing,
+            "default (env unset): far-behind from-genesis stalls in PreSyncing"
+        );
+
+        std::env::set_var("DUGITE_GENESIS_BOOTSTRAP_SYNCING", "1");
+        assert!(bootstrap_syncing_override());
+        let gsm = GenesisStateMachine::new(
+            config.clone(),
+            true,
+            PeerStateRegistry::new(),
+            Some(1_000_000),
+        );
+        assert_eq!(
+            gsm.state(),
+            GenesisSyncState::Syncing,
+            "opt-in: starts in Syncing (bootstrap HAA bypass)"
+        );
+
+        // The override lives ONLY in the no-marker branch: a caught_up marker must
+        // still win (the bypass must never downgrade a caught-up node).
+        std::fs::write(marker, "caught_up").unwrap();
+        let config2 = GsmConfig {
+            max_caught_up_age_secs: 10_000_000,
+            syncing_startup_threshold_secs: 100,
+            marker_path: PathBuf::from(marker),
+            ..Default::default()
+        };
+        let gsm = GenesisStateMachine::new(config2, true, PeerStateRegistry::new(), Some(10));
+        assert_eq!(
+            gsm.state(),
+            GenesisSyncState::CaughtUp,
+            "caught_up marker still wins over the override"
+        );
+
+        std::env::remove_var("DUGITE_GENESIS_BOOTSTRAP_SYNCING");
         let _ = std::fs::remove_file(marker);
     }
 
