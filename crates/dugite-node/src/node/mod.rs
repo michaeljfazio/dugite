@@ -5914,6 +5914,33 @@ impl Node {
         rollback: Vec<dugite_primitives::hash::Hash32>,
         apply: Vec<dugite_primitives::hash::Hash32>,
     ) -> ForkSwitchOutcome {
+        // ── Phase-2 deferral safety: flush BEFORE the ledger rolls back ──────
+        //
+        // A fork switch rolls the ledger backward through the volatile window,
+        // which can include blocks whose deferred Plutus is still pending. This
+        // is the SOLE ledger-rollback path that can orphan a pending block: it
+        // is reached both inline (an arriving block triggers the fork) and from
+        // the run-loop LoE arm (a GDD/LoE advance unlocks a candidate). In
+        // GENESIS mode especially, LoE/GDD makes such switches reachable while
+        // the deferral window is non-empty — the Praos "fork-in-window is
+        // structurally impossible" argument (deferred blocks ~3k deep, below the
+        // k-finality horizon) does NOT hold under LoE selection, whose switches
+        // can intersect anywhere down to the immutable tip, inside the volatile
+        // window where the pending blocks live.
+        //
+        // Flush the window FIRST so every pending block's Plutus is validated
+        // against the exact ledger it was applied to, BEFORE the rollback/replay
+        // — mirroring the existing flush-before-maintenance/snapshot/shutdown
+        // ordering. Without this, a post-switch flush would run Plutus against
+        // (or roll back to a stale anchor on) a chain the deferred blocks are no
+        // longer on. `allow_cancel = false`: complete it (the window is
+        // memory-bounded) so the ledger is deterministic before the switch.
+        // No-op when the window is empty (deferral off, or already flushed by
+        // the run loop). Cannot recurse: flush_pending_phase2 calls
+        // handle_ledger_rollback, never apply_fork_switch_plan, and it empties
+        // pending_phase2 before that call.
+        self.flush_pending_phase2(false).await;
+
         // Chain selection determined a competing fork is strictly
         // preferred.  The VolatileDB chain switch is already
         // committed — selected_chain now points at the new fork.
