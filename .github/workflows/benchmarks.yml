@@ -49,7 +49,7 @@ jobs:
           # bench`. Step branches on matrix.bench == "__stress__".
           - { name: lsm-stress,    crate: dugite-lsm,           bench: __stress__ }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -159,7 +159,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Download all bench artifacts
         uses: actions/download-artifact@v7
