@@ -2460,7 +2460,10 @@ impl Node {
                     Some(age) if gsm_config.syncing_startup_threshold_secs > 0
                         && age < gsm_config.syncing_startup_threshold_secs
                 );
-                if recent {
+                // MUST mirror GenesisStateMachine::new()'s no-marker branch so the
+                // seed snapshot's state/LoE matches the GSM actor's internal state
+                // (DUGITE_GENESIS_BOOTSTRAP_SYNCING bootstrap HAA bypass).
+                if recent || crate::gsm::bootstrap_syncing_override() {
                     crate::gsm::GenesisSyncState::Syncing
                 } else {
                     crate::gsm::GenesisSyncState::PreSyncing
