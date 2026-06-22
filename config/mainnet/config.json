@@ -1,38 +1,29 @@
 {
+  "AlonzoGenesisFile": "alonzo-genesis.json",
+  "ByronGenesisFile": "byron-genesis.json",
+  "ByronGenesisHash": "dbbdaeab0ea4ea58225892d8b1294f178b417f4a9d1ed3bbf629c40d8f74e86b",
+  "ConsensusMode": "Genesis",
+  "ConwayGenesisFile": "conway-genesis.json",
+  "DiffusionMode": "InitiatorAndResponder",
+  "LowLevelGenesisOptions": {
+    "EnableCSJ": true,
+    "EnableLoEAndGDD": true,
+    "EnableLoP": true
+  },
+  "MetricsPort": 12800,
+  "MinSeverity": "Info",
   "Network": "Mainnet",
   "NetworkMagic": 764824073,
   "Protocol": {
     "RequiresNetworkMagic": "RequiresMagic"
   },
-  "DiffusionMode": "InitiatorAndResponder",
-  "TargetNumberOfRootPeers": 60,
-  "TargetNumberOfActivePeers": 15,
-  "TargetNumberOfEstablishedPeers": 40,
-  "TargetNumberOfKnownPeers": 85,
-  "TargetNumberOfActiveBigLedgerPeers": 5,
-  "TargetNumberOfEstablishedBigLedgerPeers": 10,
-  "TargetNumberOfKnownBigLedgerPeers": 15,
-  "ByronGenesisFile": "byron-genesis.json",
-  "ByronGenesisHash": "dbbdaeab0ea4ea58225892d8b1294f178b417f4a9d1ed3bbf629c40d8f74e86b",
   "ShelleyGenesisFile": "shelley-genesis.json",
   "ShelleyGenesisHash": "1a3be38bcbb7911969283716ad7aa550250226b76a61fc51cc9a9a35d9276d81",
-  "AlonzoGenesisFile": "alonzo-genesis.json",
-  "ConwayGenesisFile": "conway-genesis.json",
-  "TraceOptions": {
-    "TraceBlockFetchClient": false,
-    "TraceBlockFetchServer": false,
-    "TraceChainDb": true,
-    "TraceChainSyncClient": true,
-    "TraceChainSyncServer": false,
-    "TraceForge": true,
-    "TraceMempool": true
-  },
-  "MinSeverity": "Info",
-  "MetricsPort": 12800,
-  "ConsensusMode": "Genesis",
-  "LowLevelGenesisOptions": {
-    "EnableCSJ": true,
-    "EnableLoEAndGDD": true,
-    "EnableLoP": true
-  }
+  "TargetNumberOfActiveBigLedgerPeers": 5,
+  "TargetNumberOfActivePeers": 15,
+  "TargetNumberOfEstablishedBigLedgerPeers": 10,
+  "TargetNumberOfEstablishedPeers": 40,
+  "TargetNumberOfKnownBigLedgerPeers": 15,
+  "TargetNumberOfKnownPeers": 85,
+  "TargetNumberOfRootPeers": 60
 }
