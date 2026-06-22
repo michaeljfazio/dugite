@@ -199,6 +199,7 @@ pub fn reload_partition(old: &NodeConfig, new: &NodeConfig) -> ReloadPlan {
     check_restart_required!(conway_genesis_hash);
     check_restart_required!(dijkstra_genesis_hash);
     check_restart_required!(metrics_port);
+    check_restart_required!(turn_on_log_metrics);
     check_restart_required!(diffusion_mode);
     check_restart_required!(experimental_hard_forks_enabled);
     check_restart_required!(consensus_mode);

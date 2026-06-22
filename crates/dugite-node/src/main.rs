@@ -1663,16 +1663,21 @@ async fn run_node(args: RunArgs, log_handle: Option<logging::LogHandle>) -> Resu
         }
     }
 
-    // Resolve effective metrics port using a three-level priority:
-    //   1. --no-metrics flag → 0 (disabled), takes highest precedence
-    //   2. --metrics-port <PORT> CLI arg → explicit operator override
-    //   3. MetricsPort field in config JSON → site-wide default from config file
-    //   4. Dugite default: 12796 (avoids collision with cardano-node's 12798)
+    // Resolve effective metrics port using priority (highest first):
+    //   1. --no-metrics flag → 0 (disabled)
+    //   2. --metrics-port <PORT> CLI arg → explicit operator override (wins
+    //      even over TurnOnLogMetrics=false)
+    //   3. TurnOnLogMetrics=false in config JSON → 0 (master off-switch,
+    //      matching cardano-node)
+    //   4. MetricsPort field in config JSON → site-wide default from config file
+    //   5. Dugite default: 12796 (avoids collision with cardano-node's 12798)
     const DEFAULT_METRICS_PORT: u16 = 12796;
     let effective_metrics_port: u16 = if args.no_metrics {
         0
     } else if let Some(cli_port) = args.metrics_port {
         cli_port
+    } else if !node_config.turn_on_log_metrics {
+        0
     } else {
         node_config.metrics_port.unwrap_or(DEFAULT_METRICS_PORT)
     };
