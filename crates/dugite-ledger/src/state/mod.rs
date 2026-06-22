@@ -12,6 +12,11 @@ mod snapshot;
 pub mod snapshot_format;
 pub mod substates;
 
+// Re-export the deferred Phase-2 fatality applier for the bulk-sync pooling
+// path (apply_bench / node). Gated identically to its definition.
+#[cfg(feature = "parallel-verification")]
+pub use apply::apply_phase2_outcomes;
+
 // Re-export governance free functions and types for use by tests
 #[cfg(test)]
 pub(crate) use governance::{
@@ -88,6 +93,45 @@ fn default_update_quorum() -> u64 {
 /// it only bumps reference counts instead of deep-copying megabytes of
 /// data.  Mutations go through `Arc::make_mut()`, which clones the inner
 /// collection only when there are other outstanding references.
+/// Memoized large validation registries — bulk-sync apply-ceiling fix.
+///
+/// Phase-1/Phase-2 validation needs read-only derived views of
+/// `certs.pool_params` and `gov.governance`.  Rebuilding all of them from
+/// scratch on EVERY block (one `.keys().collect()` / `.values().collect()` per
+/// registry) measured ~51% of `apply_block` wall time on preview Conway blocks
+/// (`apply_bench --restore-lsm` + `DUGITE_BLOCK_APPLY_TIMING=1`).
+///
+/// This memoizes the THREE expensive registries — the registered pool-id set,
+/// the VRF-key→pool map (both derived from `pool_params`), the DRep set, and the
+/// vote-delegation set — each keyed on the structural identity of its OWN source
+/// map, not on the whole `governance` Arc.  `pools`/`vrf_keys` use
+/// `Arc::ptr_eq` on `certs.pool_params`; `dreps`/`vote_delegations` use
+/// `imbl::HashMap::ptr_eq` on `gov.governance.{dreps,vote_delegations}`.  Keying
+/// per-source means a block that merely casts a vote or advances a proposal
+/// (which bumps the `governance` Arc and the `proposals` map but leaves `dreps`
+/// and `vote_delegations` structurally identical) still HITS both big caches.
+/// The remaining registries (committee sets, active proposals, constitution)
+/// are small and rebuilt fresh every block.
+///
+/// Soundness: identical source pointer ⟹ identical contents ⟹ byte-exact reuse.
+/// `Arc` and `imbl` collections copy-on-write on mutation, so any change
+/// allocates a fresh root and the next block detects the miss.  Purely
+/// transient — never serialized (snapshots use the separate
+/// `LedgerStateSnapshot`) and never part of the ledger fingerprint.
+#[derive(Debug, Clone)]
+pub(crate) struct CachedValidationRegistry {
+    /// `certs.pool_params` Arc the pool registries were derived from (ptr-eq key).
+    pub pool_params_src: std::sync::Arc<std::collections::HashMap<Hash28, PoolRegistration>>,
+    pub pools: std::sync::Arc<std::collections::HashSet<Hash28>>,
+    pub vrf_keys: std::sync::Arc<std::collections::HashMap<Hash32, Hash28>>,
+    /// `gov.governance.dreps` imbl map the DRep set was derived from (ptr-eq key).
+    pub dreps_src: ImblHashMap<Hash32, DRepRegistration>,
+    pub dreps: std::sync::Arc<std::collections::HashSet<Hash32>>,
+    /// `gov.governance.vote_delegations` imbl map the set was derived from (ptr-eq key).
+    pub vote_delegations_src: ImblHashMap<Hash32, DRep>,
+    pub vote_delegations: std::sync::Arc<std::collections::HashSet<Hash32>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct LedgerState {
     // ── Component sub-states (independently borrowable) ──────────────
@@ -164,6 +208,15 @@ pub struct LedgerState {
     /// apply-time horizon check is skipped (warn-only) — never a false
     /// fatality. Not persisted in snapshots (per-block transient).
     pub phase2_apply_horizon: Option<u64>,
+
+    /// Memoized per-block validation registries — see
+    /// [`CachedValidationRegistry`].  Reused across blocks while
+    /// `certs.pool_params` and `gov.governance` stay pointer-identical, which
+    /// eliminates the ~51%-of-apply registry rebuild on the ~95% of blocks that
+    /// carry no pool/DRep/committee/governance certificate.  Transient: `None`
+    /// on a freshly (re)constructed state forces a one-off rebuild; never
+    /// serialized and never part of the fingerprint.
+    pub(crate) cached_validation_registry: Option<CachedValidationRegistry>,
 }
 
 /// Pending reward update matching Haskell's RUPD structure.
@@ -730,6 +783,7 @@ impl LedgerState {
             conway_genesis_init: None,
             max_lovelace_supply: MAX_LOVELACE_SUPPLY,
             phase2_apply_horizon: None,
+            cached_validation_registry: None,
         }
     }
 
@@ -1219,6 +1273,7 @@ impl LedgerState {
             conway_genesis_init: None, // Will be set by caller
             max_lovelace_supply: MAX_LOVELACE_SUPPLY,
             phase2_apply_horizon: None,
+            cached_validation_registry: None,
         }
     }
 
@@ -1267,6 +1322,7 @@ impl LedgerState {
             conway_genesis_init: self.conway_genesis_init.clone(),
             max_lovelace_supply: self.max_lovelace_supply,
             phase2_apply_horizon: None,
+            cached_validation_registry: None,
         }
     }
 
