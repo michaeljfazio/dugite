@@ -1632,6 +1632,37 @@ async fn run_node(args: RunArgs, log_handle: Option<logging::LogHandle>) -> Resu
 
     node_config.validate(&config_dir)?;
 
+    // Apply config-file log verbosity at startup.
+    //
+    // `logging::init` runs in `main()` *before* the config file is parsed, so
+    // the initial filter is seeded only from `--log-level`/`RUST_LOG` (default
+    // `info`). Without this step the config's `MinSeverity`/`LogDirective`
+    // would have no effect until a SIGHUP reload — an operator who sets
+    // `MinSeverity: Debug` in config.json and starts the node would silently
+    // get INFO. Now that the config is loaded, apply it via the live reload
+    // handle, matching cardano-node (where MinSeverity drives startup
+    // verbosity).
+    //
+    // Precedence (highest first): `RUST_LOG` env > explicit `--log-level` CLI >
+    // config `LogDirective` > config `MinSeverity`. An explicit CLI/env
+    // override is therefore never clobbered by the config file.
+    if let Some(handle) = log_handle.as_ref() {
+        let cli_or_env_override =
+            args.log.log_level.is_some() || std::env::var_os("RUST_LOG").is_some();
+        if !cli_or_env_override {
+            let directive = node_config.log_directive.clone().unwrap_or_else(|| {
+                logging::min_severity_to_directive(&node_config.min_severity).to_string()
+            });
+            match handle.reload(&directive) {
+                Ok(()) => info!(directive = %directive, "Applied config-file log verbosity at startup"),
+                Err(e) => tracing::warn!(
+                    directive = %directive,
+                    "Failed to apply config-file log verbosity: {e}"
+                ),
+            }
+        }
+    }
+
     // Resolve effective metrics port using a three-level priority:
     //   1. --no-metrics flag → 0 (disabled), takes highest precedence
     //   2. --metrics-port <PORT> CLI arg → explicit operator override
