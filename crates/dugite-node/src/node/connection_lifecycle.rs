@@ -146,6 +146,13 @@ const BLOCKFETCH_INIT_AVG_BLOCK_BYTES: usize = 65_536;
 /// Real RTT-hiding throughput work is concurrent multi-peer fetch (deferred).
 const BLOCKFETCH_PIPELINE_WINDOW: usize = 2;
 
+/// GSV fetch-peer preference width (cardano-node `nPreferedPeers`). The single
+/// bulk-sync fetch slot is contested only by the top-K peers ranked by measured
+/// fetch bandwidth. Haskell uses `maxConcurrencyBulkSync = 1`; dugite keeps a
+/// hot standby (K=2) so a momentarily-busy best peer cannot stall the slot,
+/// while still concentrating fetching on the fastest peers.
+const GSV_FETCH_TOP_K: usize = 2;
+
 // Issue #747: compile-time invariant, referencing the REAL mux constant
 // directly (no hand-mirrored copy that could drift).
 // The total pipelined in-flight bytes (PIPELINE_WINDOW × RANGE_BYTE_BUDGET)
@@ -2273,6 +2280,11 @@ impl ConnectionLifecycleManager {
         let block_fetch_grace_period = self.block_fetch_grace_period;
         // GSM state for genesis-mode gate (only rotate in genesis bulk sync).
         let gsm_snapshot_rx_for_starv = self.gsm_snapshot_rx.clone();
+        // GSV peer prioritisation: rank fetch peers by measured bandwidth so the
+        // single bulk-sync fetch slot goes to the fastest-serving peer (matching
+        // cardano-node's prioritisePeerChains). Read in the claim gate; updated
+        // after each range. `None` when no peer manager (unit tests) → gate off.
+        let peer_manager_for_fetch = self.peer_manager_for_servers.clone();
 
         Box::new(move |mut channel, cancel| {
             Box::pin(async move {
@@ -2300,9 +2312,15 @@ impl ConnectionLifecycleManager {
                     /// (≈1 under the single-fetcher mutex; rises with multi-peer
                     /// fetch). Decremented on any drop (release / cancel / unwind).
                     metrics: std::sync::Arc<crate::metrics::NodeMetrics>,
+                    /// When the slot was claimed — on drop, the held duration is
+                    /// added to `blockfetch_busy_us_total` so utilization
+                    /// (busy / wall) can be computed (idle-vs-network-bound).
+                    claim_at: std::time::Instant,
                 }
                 impl Drop for ActiveFetcherGuard {
                     fn drop(&mut self) {
+                        self.metrics
+                            .inc_blockfetch_busy_us(self.claim_at.elapsed().as_micros() as u64);
                         let swapped = self.fetcher.compare_exchange(
                             self.id,
                             0,
@@ -2435,6 +2453,22 @@ impl ConnectionLifecycleManager {
                                 addr.hash(&mut hasher);
                                 hasher.finish() | 1
                             };
+                            // GSV gate (cardano-node prioritisePeerChains): when the
+                            // slot is FREE, only the fastest-serving peers contest it,
+                            // so the single fetcher converges on the best peer rather
+                            // than a fair race. A peer that already holds the slot
+                            // keeps it (re-claim) — the gate only filters NEW claims.
+                            // Wedge-safe: unmeasured / cold-start peers stay eligible
+                            // and the existing starvation rotation frees a stuck peer.
+                            if active_fetcher.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                                let preferred = peer_manager_for_fetch
+                                    .read()
+                                    .await
+                                    .should_claim_fetch_slot(&addr, GSV_FETCH_TOP_K);
+                                if !preferred {
+                                    continue;
+                                }
+                            }
                             let claimed = active_fetcher.compare_exchange(
                                 0,
                                 my_id,
@@ -2477,6 +2511,7 @@ impl ConnectionLifecycleManager {
                                 id: my_id,
                                 peer_slot: active_fetch_peer.clone(),
                                 metrics: metrics_clone.clone(),
+                                claim_at: std::time::Instant::now(),
                             };
 
                             // Build the list of headers to fetch from this peer.
@@ -2542,6 +2577,11 @@ impl ConnectionLifecycleManager {
                             };
 
                             if fetch_runs.is_empty() {
+                                // Header-supply-bound idle signal: the slot was
+                                // claimable but there are no headers ahead to
+                                // fetch — the fetcher has drained ChainSync's
+                                // supply and is waiting (NOT network-bound).
+                                metrics_clone.inc_blockfetch_idle_no_headers();
                                 // #742 watchdog (unproductive claim): the slot
                                 // was claimed but there is NOTHING dispatchable
                                 // from this peer. Haskell's rotation cannot
@@ -3089,6 +3129,19 @@ impl ConnectionLifecycleManager {
                                         // bytes this range delivered (rate = rx B/s).
                                         metrics_clone
                                             .inc_blockfetch_rx_bytes(range_abort.seen_bytes() as u64);
+                                        // GSV: record this peer's measured fetch
+                                        // bandwidth (bytes/sec) so the claim gate can
+                                        // prefer the fastest-serving peers. Only count
+                                        // ranges with a meaningful sample (>0 bytes,
+                                        // >1 ms) so tiny/instant ranges don't skew it.
+                                        if range_abort.seen_bytes() > 0 && fetch_ms > 1.0 {
+                                            let bps = range_abort.seen_bytes() as f64
+                                                / (fetch_ms / 1000.0);
+                                            peer_manager_for_fetch
+                                                .write()
+                                                .await
+                                                .update_peer_fetch_bandwidth(&addr, bps);
+                                        }
                                         // Refresh the average block size for the
                                         // next range's byte-budget sizing.
                                         if let Some(avg) = range_abort.seen_bytes().checked_div(count) {
@@ -3166,6 +3219,16 @@ impl ConnectionLifecycleManager {
                                             timeout_secs = FETCH_RANGE_TIMEOUT.as_secs(),
                                             "BlockFetch range timed out, releasing fetcher",
                                         );
+                                        // GSV: a timed-out peer is effectively zero
+                                        // throughput right now — collapse its measured
+                                        // bandwidth so the claim gate de-prefers it and
+                                        // the slot converges on a healthy fast peer
+                                        // (rather than re-picking the stalled one from a
+                                        // stale-but-high EWMA).
+                                        peer_manager_for_fetch
+                                            .write()
+                                            .await
+                                            .update_peer_fetch_bandwidth(&addr, 1.0);
                                         // CSJ: a peer starving BlockFetch is
                                         // rotated out of the dynamo role so a
                                         // different peer drives the jumps
@@ -3252,6 +3315,13 @@ impl ConnectionLifecycleManager {
                                     // blockfetch task un-cancellable for an unbounded
                                     // duration — blocking demote_to_warm past the 5s
                                     // spsDeactivateTimeout and forcing a TCP teardown.
+                                    // Measure time blocked here: when the apply
+                                    // consumer is slow the channel fills and this
+                                    // send parks the fetcher (slot held, no bytes
+                                    // downloaded) — apply-backpressure, NOT a
+                                    // network limit. Surfaced as
+                                    // blockfetch_send_blocked_us_total.
+                                    let send_started = std::time::Instant::now();
                                     let send_result = tokio::select! {
                                         biased;
                                         _ = cancel.cancelled() => {
@@ -3260,6 +3330,9 @@ impl ConnectionLifecycleManager {
                                         }
                                         r = fetched_blocks_tx.send(fetched) => r
                                     };
+                                    metrics_clone.inc_blockfetch_send_blocked_us(
+                                        send_started.elapsed().as_micros() as u64,
+                                    );
                                     if let Err(e) = send_result {
                                         warn!(%addr, slot, "send to run loop failed (channel closed): {e}");
                                         // Channel closed means the run loop

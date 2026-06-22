@@ -59,6 +59,102 @@ fn phase2_collect_fatal_enabled() -> bool {
     })
 }
 
+/// Apply the result of a block's Phase-2 (Plutus) evaluation: convert the
+/// per-tx [`Phase2Outcome`]s into the block-fatal rejection decision (Babbage+
+/// collection error) or a divergence warning, exactly as Step 8d does inline.
+///
+/// Extracted so the deferred bulk-sync path can reproduce the identical
+/// fatality decision after pooling+evaluating work items across many blocks
+/// (see [`LedgerState::apply_block_defer_phase2`]). It is a **pure function of
+/// `(block, outcomes)`** — it mutates no ledger state (state is already applied
+/// in Step 8b), so deferring *when* it runs cannot change *what* it decides.
+///
+/// Returns `Err(Phase2CollectErrors)` for a block-fatal collection error and
+/// `Ok(())` otherwise (logging is_valid divergences warn-and-trust).
+#[cfg(feature = "parallel-verification")]
+pub fn apply_phase2_outcomes(
+    block: &Block,
+    outcomes: Vec<crate::plutus::Phase2Outcome>,
+) -> Result<(), LedgerError> {
+    for outcome in outcomes {
+        // Look up the transaction by index. Duplicate txs were skipped during
+        // the loop (not added to work_items), so every outcome.tx_idx is valid.
+        let tx = match block.transactions.get(outcome.tx_idx) {
+            Some(t) => t,
+            None => continue,
+        };
+        // #733: a phase-2 COLLECTION error is block-fatal in Babbage+ regardless
+        // of the is_valid tag — Haskell raises `UtxosFailure (CollectErrors …)`
+        // before any script runs, so every honest node rejects this block.
+        // Carve-outs: CEK panics (not a Haskell error class — correction 3) and
+        // UTxO-gap work items (inputs unresolved during best-effort partial
+        // replay — correction 4) stay warn-and-trust. Alonzo blocks never arm
+        // the time-translation horizon (correction 2) and keep warn-only
+        // semantics for the remaining collect classes (no false fatality).
+        if let Err(e) = &outcome.result {
+            if e.is_eval_panic() {
+                warn!(
+                    tx_hash = %tx.hash.to_hex(),
+                    slot = block.slot().0,
+                    error = %e,
+                    "Phase-2 evaluator PANIC on confirmed block — trusting \
+                     on-chain consensus (dugite CEK robustness gap; never \
+                     block-fatal at apply)"
+                );
+                continue;
+            }
+            if e.is_collect_error()
+                && block.era >= Era::Babbage
+                && outcome.utxo_complete
+                && phase2_collect_fatal_enabled()
+            {
+                return Err(LedgerError::Phase2CollectErrors {
+                    slot: block.slot().0,
+                    tx_hash: tx.hash.to_hex(),
+                    error: e.to_string(),
+                });
+            }
+        }
+        if outcome.is_valid {
+            // is_valid=true: phase-2 failure is a ScriptFailed on a confirmed
+            // block — log a warning and trust on-chain consensus.
+            if let Err(e) = outcome.result {
+                warn!(
+                    tx_hash = %tx.hash.to_hex(),
+                    slot = block.slot().0,
+                    error = %e,
+                    "Plutus evaluation divergence (parallel): uplc says scripts fail \
+                     but block is_valid=true on-chain — trusting on-chain consensus"
+                );
+            }
+        } else {
+            // is_valid=false: the producer's scripts failed on-chain (collateral
+            // consumed). dugite's CEK says they pass — a Phase-2 evaluation
+            // divergence. On a block received via ChainSync the is_valid flag is
+            // CONSENSUS TRUTH: honest (Haskell) nodes enforce it with a correct
+            // CEK, so any block on the selected chain carries a genuine flag and
+            // the divergence is a dugite-CEK bug, not collateral theft. The tx
+            // was ALREADY applied as invalid (collateral consumed, no outputs) in
+            // Step 8b, so the ledger state is byte-exact regardless. Trust the
+            // on-chain flag and log the divergence (symmetric with the
+            // is_valid=true branch above) instead of hard-halting the whole sync.
+            // The DUGITE_PHASE2_DUMP_DIR repro was captured in
+            // run_phase2_parallel for offline CEK root-causing.
+            if outcome.result.is_ok() {
+                warn!(
+                    tx_hash = %tx.hash.to_hex(),
+                    slot = block.slot().0,
+                    "Plutus evaluation divergence (parallel): uplc says scripts PASS \
+                     but block is_valid=false on-chain — trusting on-chain consensus \
+                     (tx applied as invalid; dugite CEK over-permissive — see \
+                     DUGITE_PHASE2_DUMP_DIR)"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 impl LedgerState {
     /// Build a read-only rule context for era rule dispatch.
     ///
@@ -106,6 +202,46 @@ impl LedgerState {
         block: &Block,
         mode: BlockValidationMode,
     ) -> Result<(), LedgerError> {
+        // Default path: apply state AND drain Phase-2 inline (byte-identical to
+        // the historic behaviour). The returned work-item vec is always empty.
+        self.apply_block_impl(block, mode, false)?;
+        Ok(())
+    }
+
+    /// Apply a block's STATE in-order but **defer** the Phase-2 (Plutus) drain,
+    /// returning the captured [`Phase2WorkItem`]s instead of evaluating them.
+    ///
+    /// Bulk-sync CPU-saturation lever: each [`Phase2WorkItem`] is fully
+    /// self-contained (resolved UTxO CBOR + script + per-block `cost_models_cbor`
+    /// / `slot_config` / `protocol_major`), so items captured here can be pooled
+    /// across many blocks and evaluated together on a rayon pool to fill all
+    /// cores — a single block's ~2-3 redeemers can never saturate a 12-core host.
+    ///
+    /// **Byte-exact contract:** ledger STATE is mutated identically to
+    /// [`apply_block`] (Plutus never writes state — it only gates acceptance), so
+    /// the caller MUST later run [`apply_phase2_outcomes`] on the drained outcomes
+    /// to reproduce the exact block-fatal rejection decision before the block is
+    /// exposed. Deferring *when* Plutus runs cannot change *what* it decides
+    /// (the fatality verdict is a pure function of the self-contained outcomes).
+    pub fn apply_block_defer_phase2(
+        &mut self,
+        block: &Block,
+        mode: BlockValidationMode,
+    ) -> Result<Vec<Phase2WorkItem>, LedgerError> {
+        self.apply_block_impl(block, mode, true)
+    }
+
+    /// Implementation shared by [`apply_block`] (inline drain) and
+    /// [`apply_block_defer_phase2`] (deferred drain). When `defer_phase2` is
+    /// `true`, Step 8d's `run_phase2_parallel` + fatality loop is skipped and the
+    /// captured `phase2_work_items` are returned for later pooled evaluation;
+    /// when `false`, the drain runs inline and an empty vec is returned.
+    fn apply_block_impl(
+        &mut self,
+        block: &Block,
+        mode: BlockValidationMode,
+        defer_phase2: bool,
+    ) -> Result<Vec<Phase2WorkItem>, LedgerError> {
         trace!(
             slot = block.slot().0,
             block_no = block.block_number().0,
@@ -535,7 +671,8 @@ impl LedgerState {
                 epoch = self.epoch.0,
                 "Ledger: Byron block applied successfully"
             );
-            return Ok(());
+            // Byron has no Phase-2; nothing to defer.
+            return Ok(Vec::new());
         }
 
         // ══════════════════════════════════════════════════════════════════
@@ -645,6 +782,7 @@ impl LedgerState {
         };
         let mut t_registry_build = std::time::Duration::ZERO;
         let mut t_validate = std::time::Duration::ZERO;
+        let mut t_phase2 = std::time::Duration::ZERO;
         let mut t_apply = std::time::Duration::ZERO;
         let mut t_diff_merge = std::time::Duration::ZERO;
         let mut t_ctx_build = std::time::Duration::ZERO;
@@ -722,67 +860,130 @@ impl LedgerState {
         ) = if mode == BlockValidationMode::ValidateAll {
             use std::collections::{HashMap, HashSet};
             use std::sync::Arc;
-            let pools: HashSet<dugite_primitives::hash::Hash28> =
-                self.certs.pool_params.keys().copied().collect();
-            let dreps: HashSet<dugite_primitives::hash::Hash32> =
-                self.gov.governance.dreps.keys().copied().collect();
-            let vrf_keys: HashMap<
-                dugite_primitives::hash::Hash32,
-                dugite_primitives::hash::Hash28,
-            > = self
-                .certs
-                .pool_params
-                .values()
-                .map(|reg| (reg.vrf_keyhash, reg.pool_id))
-                .collect();
+
+            // ── Per-source registry cache (bulk-sync apply-ceiling fix) ───────
+            //
+            // Rebuilding these derived registries from scratch every block was
+            // ~51% of apply wall time on preview Conway blocks.  The THREE
+            // expensive registries are memoized, each keyed on the structural
+            // identity of its OWN source map (see `CachedValidationRegistry`):
+            //   • `pools` + `vrf_keys` ← `certs.pool_params`  (Arc::ptr_eq)
+            //   • `dreps`              ← `gov.dreps`           (imbl ptr_eq)
+            //   • `vote_delegations`   ← `gov.vote_delegations`(imbl ptr_eq)
+            // Per-source keying means a vote/proposal block (which bumps the
+            // `governance` Arc + `proposals` map but leaves `dreps` /
+            // `vote_delegations` structurally identical) still hits both big
+            // caches.  The small registries below are cheap and rebuilt fresh.
+            //
+            // Byte-exact: identical source pointer ⟹ identical contents ⟹
+            // identical registry; any mutation copy-on-writes a fresh root.
+            let cached = self.cached_validation_registry.take();
+
+            // `pools` + `vrf_keys` ← `certs.pool_params` (Arc ptr-eq).
+            let pp_hit = cached
+                .as_ref()
+                .is_some_and(|c| Arc::ptr_eq(&c.pool_params_src, &self.certs.pool_params));
+            let (pools, vrf_keys) = if pp_hit {
+                let c = cached.as_ref().expect("pp_hit implies Some");
+                (Arc::clone(&c.pools), Arc::clone(&c.vrf_keys))
+            } else {
+                let pools: Arc<HashSet<dugite_primitives::hash::Hash28>> =
+                    Arc::new(self.certs.pool_params.keys().copied().collect());
+                let vrf_keys: Arc<
+                    HashMap<dugite_primitives::hash::Hash32, dugite_primitives::hash::Hash28>,
+                > = Arc::new(
+                    self.certs
+                        .pool_params
+                        .values()
+                        .map(|reg| (reg.vrf_keyhash, reg.pool_id))
+                        .collect(),
+                );
+                (pools, vrf_keys)
+            };
+
+            // `dreps` ← `gov.dreps` (imbl ptr-eq).
+            let dreps_hit = cached
+                .as_ref()
+                .is_some_and(|c| c.dreps_src.ptr_eq(&self.gov.governance.dreps));
+            let dreps: Arc<HashSet<dugite_primitives::hash::Hash32>> = if dreps_hit {
+                Arc::clone(&cached.as_ref().expect("dreps_hit implies Some").dreps)
+            } else {
+                Arc::new(self.gov.governance.dreps.keys().copied().collect())
+            };
+
+            // `vote_delegations` ← `gov.vote_delegations` (imbl ptr-eq).
+            let vd_hit = cached.as_ref().is_some_and(|c| {
+                c.vote_delegations_src
+                    .ptr_eq(&self.gov.governance.vote_delegations)
+            });
+            let vote_delegations: Arc<HashSet<dugite_primitives::hash::Hash32>> = if vd_hit {
+                Arc::clone(
+                    &cached
+                        .as_ref()
+                        .expect("vd_hit implies Some")
+                        .vote_delegations,
+                )
+            } else {
+                Arc::new(
+                    self.gov
+                        .governance
+                        .vote_delegations
+                        .keys()
+                        .copied()
+                        .collect(),
+                )
+            };
+
+            // ── Small registries — cheap, always rebuilt fresh ────────────────
             // Current members ∪ `members_to_add` of live UpdateCommittee
             // proposals — Haskell GOVCERT accepts a CommitteeHotAuth from a
             // potential FUTURE member too (`isPotentialFutureMember`).
-            let committee_members: HashSet<dugite_primitives::hash::Hash32> =
-                self.gov.governance.committee_auth_eligible_members();
-            let committee_resigned: HashSet<dugite_primitives::hash::Hash32> = self
-                .gov
-                .governance
-                .committee_resigned
-                .keys()
-                .copied()
-                .collect();
-            let vote_delegations: HashSet<dugite_primitives::hash::Hash32> = self
-                .gov
-                .governance
-                .vote_delegations
-                .keys()
-                .copied()
-                .collect();
-            let active_proposals: HashMap<
-                dugite_primitives::transaction::GovActionId,
-                crate::validation::ActiveProposal,
-            > = self
-                .gov
-                .governance
-                .proposals
-                .iter()
-                .map(|(id, state)| {
-                    (
-                        id.clone(),
-                        crate::validation::ActiveProposal {
-                            gov_action: state.procedure.gov_action.clone(),
-                            return_addr: state.procedure.return_addr.clone(),
-                            deposit: state.procedure.deposit,
-                            expires_after_epoch: state.expires_epoch,
-                            proposed_in_epoch: state.proposed_epoch,
-                        },
-                    )
-                })
-                .collect();
-            let committee_authorized_hot_keys: HashSet<dugite_primitives::hash::Hash32> = self
-                .gov
-                .governance
-                .committee_hot_keys
-                .values()
-                .copied()
-                .collect();
-            let committee_authorized_elected_hot_keys: HashSet<dugite_primitives::hash::Hash32> =
+            let committee_members: Arc<HashSet<dugite_primitives::hash::Hash32>> =
+                Arc::new(self.gov.governance.committee_auth_eligible_members());
+            let committee_resigned: Arc<HashSet<dugite_primitives::hash::Hash32>> = Arc::new(
+                self.gov
+                    .governance
+                    .committee_resigned
+                    .keys()
+                    .copied()
+                    .collect(),
+            );
+            let active_proposals: Arc<
+                HashMap<
+                    dugite_primitives::transaction::GovActionId,
+                    crate::validation::ActiveProposal,
+                >,
+            > = Arc::new(
+                self.gov
+                    .governance
+                    .proposals
+                    .iter()
+                    .map(|(id, state)| {
+                        (
+                            id.clone(),
+                            crate::validation::ActiveProposal {
+                                gov_action: state.procedure.gov_action.clone(),
+                                return_addr: state.procedure.return_addr.clone(),
+                                deposit: state.procedure.deposit,
+                                expires_after_epoch: state.expires_epoch,
+                                proposed_in_epoch: state.proposed_epoch,
+                            },
+                        )
+                    })
+                    .collect(),
+            );
+            let committee_authorized_hot_keys: Arc<HashSet<dugite_primitives::hash::Hash32>> =
+                Arc::new(
+                    self.gov
+                        .governance
+                        .committee_hot_keys
+                        .values()
+                        .copied()
+                        .collect(),
+                );
+            let committee_authorized_elected_hot_keys: Arc<
+                HashSet<dugite_primitives::hash::Hash32>,
+            > = Arc::new(
                 self.gov
                     .governance
                     .committee_hot_keys
@@ -791,23 +992,38 @@ impl LedgerState {
                         self.gov.governance.committee_expiration.contains_key(*cold)
                     })
                     .map(|(_, hot)| *hot)
-                    .collect();
+                    .collect(),
+            );
             let constitution_script_hash = self
                 .gov
                 .governance
                 .constitution
                 .as_ref()
                 .and_then(|c| c.script_hash);
+
+            // Refresh the cache with the (possibly rebuilt) large registries and
+            // their current source keys.  RHS reads only `&self` immutably and
+            // local Arcs; the assignment target is a disjoint field.
+            self.cached_validation_registry = Some(crate::state::CachedValidationRegistry {
+                pool_params_src: Arc::clone(&self.certs.pool_params),
+                pools: Arc::clone(&pools),
+                vrf_keys: Arc::clone(&vrf_keys),
+                dreps_src: self.gov.governance.dreps.clone(),
+                dreps: Arc::clone(&dreps),
+                vote_delegations_src: self.gov.governance.vote_delegations.clone(),
+                vote_delegations: Arc::clone(&vote_delegations),
+            });
+
             (
-                Arc::new(pools),
-                Arc::new(dreps),
-                Arc::new(vrf_keys),
-                Arc::new(committee_members),
-                Arc::new(committee_resigned),
-                Arc::new(vote_delegations),
-                Arc::new(active_proposals),
-                Arc::new(committee_authorized_hot_keys),
-                Arc::new(committee_authorized_elected_hot_keys),
+                pools,
+                dreps,
+                vrf_keys,
+                committee_members,
+                committee_resigned,
+                vote_delegations,
+                active_proposals,
+                committee_authorized_hot_keys,
+                committee_authorized_elected_hot_keys,
                 // O(1) imbl structural clone — pre-block snapshot for stake_key_deposits validation.
                 self.certs.stake_key_deposits.clone(),
                 constitution_script_hash,
@@ -1436,98 +1652,26 @@ impl LedgerState {
         #[cfg(feature = "parallel-verification")]
         {
             crate::validation::restore_phase2_eval(_phase2_skip_guard);
-            if mode == BlockValidationMode::ValidateAll && !phase2_work_items.is_empty() {
+            // When deferring (bulk-sync pooling), DO NOT drain here — the
+            // captured `phase2_work_items` are returned to the caller, which
+            // pools them across blocks, evaluates on a rayon pool, and runs
+            // `apply_phase2_outcomes` to reproduce the exact fatality decision
+            // before exposing the block. The inline path drains immediately so
+            // its behaviour (and the apply_bench fingerprint) is unchanged.
+            if !defer_phase2
+                && mode == BlockValidationMode::ValidateAll
+                && !phase2_work_items.is_empty()
+            {
                 let t_phase2_start = if timing_enabled {
                     Some(std::time::Instant::now())
                 } else {
                     None
                 };
-                let outcomes = run_phase2_parallel(phase2_work_items);
+                let outcomes = run_phase2_parallel(std::mem::take(&mut phase2_work_items));
                 if let Some(start) = t_phase2_start {
-                    t_validate += start.elapsed();
+                    t_phase2 += start.elapsed();
                 }
-                for outcome in outcomes {
-                    // Look up the transaction by index. Duplicate txs were
-                    // skipped during the loop (not added to work_items), so
-                    // every outcome.tx_idx is a valid index.
-                    let tx = match block.transactions.get(outcome.tx_idx) {
-                        Some(t) => t,
-                        None => continue,
-                    };
-                    // #733: a phase-2 COLLECTION error is block-fatal in
-                    // Babbage+ regardless of the is_valid tag — Haskell
-                    // raises `UtxosFailure (CollectErrors …)` before any
-                    // script runs, so every honest node rejects this block.
-                    // Carve-outs: CEK panics (not a Haskell error class —
-                    // correction 3) and UTxO-gap work items (inputs
-                    // unresolved during best-effort partial replay —
-                    // correction 4) stay warn-and-trust. Alonzo blocks never
-                    // arm the time-translation horizon (correction 2) and
-                    // keep warn-only semantics for the remaining collect
-                    // classes (conservative: no false fatality).
-                    if let Err(e) = &outcome.result {
-                        if e.is_eval_panic() {
-                            warn!(
-                                tx_hash = %tx.hash.to_hex(),
-                                slot = block.slot().0,
-                                error = %e,
-                                "Phase-2 evaluator PANIC on confirmed block — trusting \
-                                 on-chain consensus (dugite CEK robustness gap; never \
-                                 block-fatal at apply)"
-                            );
-                            continue;
-                        }
-                        if e.is_collect_error()
-                            && block.era >= Era::Babbage
-                            && outcome.utxo_complete
-                            && phase2_collect_fatal_enabled()
-                        {
-                            return Err(LedgerError::Phase2CollectErrors {
-                                slot: block.slot().0,
-                                tx_hash: tx.hash.to_hex(),
-                                error: e.to_string(),
-                            });
-                        }
-                    }
-                    if outcome.is_valid {
-                        // is_valid=true: phase-2 failure is a ScriptFailed on a
-                        // confirmed block — log a warning and trust on-chain consensus.
-                        if let Err(e) = outcome.result {
-                            warn!(
-                                tx_hash = %tx.hash.to_hex(),
-                                slot = block.slot().0,
-                                error = %e,
-                                "Plutus evaluation divergence (parallel): uplc says scripts fail \
-                                 but block is_valid=true on-chain — trusting on-chain consensus"
-                            );
-                        }
-                    } else {
-                        // is_valid=false: the producer's scripts failed on-chain
-                        // (collateral consumed). dugite's CEK says they pass — a
-                        // Phase-2 evaluation divergence. On a block received via
-                        // ChainSync the is_valid flag is CONSENSUS TRUTH: honest
-                        // (Haskell) nodes enforce it with a correct CEK, so any
-                        // block on the selected chain carries a genuine flag and
-                        // the divergence is a dugite-CEK bug, not collateral
-                        // theft. The tx was ALREADY applied as invalid (collateral
-                        // consumed, no outputs) in Step 8b, so the ledger state is
-                        // byte-exact regardless. Trust the on-chain flag and log
-                        // the divergence (symmetric with the is_valid=true branch
-                        // above) instead of hard-halting the whole sync. The
-                        // DUGITE_PHASE2_DUMP_DIR repro was captured in
-                        // run_phase2_parallel for offline CEK root-causing.
-                        if outcome.result.is_ok() {
-                            warn!(
-                                tx_hash = %tx.hash.to_hex(),
-                                slot = block.slot().0,
-                                "Plutus evaluation divergence (parallel): uplc says scripts PASS \
-                                 but block is_valid=false on-chain — trusting on-chain consensus \
-                                 (tx applied as invalid; dugite CEK over-permissive — see \
-                                 DUGITE_PHASE2_DUMP_DIR)"
-                            );
-                        }
-                    }
-                }
+                apply_phase2_outcomes(block, outcomes)?;
             }
         }
 
@@ -1601,7 +1745,8 @@ impl LedgerState {
 
         if let Some(start) = block_start {
             let total = start.elapsed();
-            let accounted = t_registry_build + t_ctx_build + t_validate + t_apply + t_diff_merge;
+            let accounted =
+                t_registry_build + t_ctx_build + t_validate + t_phase2 + t_apply + t_diff_merge;
             let other = total.saturating_sub(accounted);
             tracing::info!(
                 target: "dugite_ledger::apply::timing",
@@ -1618,6 +1763,7 @@ impl LedgerState {
                 registry_us = t_registry_build.as_micros() as u64,
                 ctx_build_us = t_ctx_build.as_micros() as u64,
                 validate_us = t_validate.as_micros() as u64,
+                phase2_us = t_phase2.as_micros() as u64,
                 apply_us = t_apply.as_micros() as u64,
                 merge_us = t_diff_merge.as_micros() as u64,
                 other_us = other.as_micros() as u64,
@@ -1626,7 +1772,14 @@ impl LedgerState {
             );
         }
 
-        Ok(())
+        // In deferred mode return the captured Phase-2 work items (possibly
+        // empty for ApplyOnly / Byron / script-free blocks); the inline path
+        // already drained them above and returns an empty vec.
+        Ok(if defer_phase2 {
+            std::mem::take(&mut phase2_work_items)
+        } else {
+            Vec::new()
+        })
     }
 
     /// Apply a block and produce a [`LedgerDelta`] capturing all state changes.
@@ -1645,6 +1798,31 @@ impl LedgerState {
         block: &Block,
         mode: BlockValidationMode,
     ) -> Result<LedgerDelta, LedgerError> {
+        let (delta, _items) = self.apply_block_with_delta_impl(block, mode, false)?;
+        Ok(delta)
+    }
+
+    /// Like [`apply_block_with_delta`] but **defers** the Phase-2 (Plutus) drain,
+    /// returning the captured [`Phase2WorkItem`]s alongside the delta for later
+    /// cross-block pooled evaluation (bulk-sync CPU-saturation; see
+    /// [`apply_block_defer_phase2`]). The state mutations and the `LedgerDelta`
+    /// are byte-identical to [`apply_block_with_delta`]; the caller MUST run
+    /// [`apply_phase2_outcomes`] on the drained outcomes before exposing the block
+    /// to reproduce the exact block-fatal rejection decision.
+    pub fn apply_block_with_delta_defer(
+        &mut self,
+        block: &Block,
+        mode: BlockValidationMode,
+    ) -> Result<(LedgerDelta, Vec<Phase2WorkItem>), LedgerError> {
+        self.apply_block_with_delta_impl(block, mode, true)
+    }
+
+    fn apply_block_with_delta_impl(
+        &mut self,
+        block: &Block,
+        mode: BlockValidationMode,
+        defer_phase2: bool,
+    ) -> Result<(LedgerDelta, Vec<Phase2WorkItem>), LedgerError> {
         let mut delta = LedgerDelta::new(block.slot(), *block.hash(), block.block_number());
 
         // Snapshot pre-block epoch to detect epoch transitions.
@@ -1664,8 +1842,9 @@ impl LedgerState {
         let pending_retirements_len_before = self.certs.pending_retirements.len();
         let future_pool_params_len_before = self.certs.future_pool_params.len();
 
-        // Apply the block (all state mutations happen here).
-        self.apply_block(block, mode)?;
+        // Apply the block (all state mutations happen here). In deferred mode
+        // this returns the captured Phase-2 work items without draining them.
+        let deferred_items = self.apply_block_impl(block, mode, defer_phase2)?;
 
         // Capture the post-block `imbl` cert maps so state reconstruction
         // (rollback_via_seq / state_at_index / anchor advance) restores them
@@ -1821,7 +2000,7 @@ impl LedgerState {
             epoch_fees: self.utxo.epoch_fees,
         };
 
-        Ok(delta)
+        Ok((delta, deferred_items))
     }
 }
 
@@ -2672,5 +2851,74 @@ mod tests {
             !matches!(result, Err(LedgerError::WrongBlockBodySize { .. })),
             "Bogus body-size approximation must not be present; got: {result:?}"
         );
+    }
+
+    /// Deferred Phase-2 fatality decision — the consensus-critical verdict shared
+    /// by the inline drain (Step 8d) and the cross-block deferred/pooled path
+    /// (`apply_block_defer_phase2` → `run_phase2_parallel_pooled` →
+    /// `apply_phase2_outcomes`). Deferring *when* Plutus runs must not change
+    /// *what* it decides, so this locks the exact per-outcome semantics: only a
+    /// Babbage+ CollectError with all inputs resolved is block-fatal; panics,
+    /// partial-replay gaps, the Alonzo era, and genuine script failures all
+    /// warn-and-trust. (#733 carve-outs.)
+    #[cfg(feature = "parallel-verification")]
+    #[test]
+    fn deferred_phase2_fatality_decision_matches_semantics() {
+        use crate::plutus::{Phase2Outcome, PlutusError};
+
+        // Only block.era / block.slot / block.transactions[tx_idx].hash are read.
+        let tx = make_simple_tx(0x11, vec![], vec![make_output(1_000_000)], 0);
+        let conway = make_test_block(Era::Conway, 100, 1, 10, 0, vec![tx.clone()]);
+        let alonzo = make_test_block(Era::Alonzo, 100, 1, 6, 0, vec![tx.clone()]);
+        let oc = |result, utxo_complete| Phase2Outcome {
+            tx_idx: 0,
+            is_valid: true,
+            result,
+            utxo_complete,
+        };
+
+        // (1) Babbage+ CollectError with complete UTxOs → BLOCK-FATAL (the only
+        // case that rejects; mirrors the synchronous Err return, one window later).
+        assert!(
+            matches!(
+                apply_phase2_outcomes(
+                    &conway,
+                    vec![oc(Err(PlutusError::CollectError("x".into())), true)]
+                ),
+                Err(LedgerError::Phase2CollectErrors { .. })
+            ),
+            "Conway CollectError(utxo_complete) must be block-fatal"
+        );
+
+        // (2) CEK panic → NOT fatal (dugite robustness gap, warn-and-trust; #733 c3).
+        assert!(apply_phase2_outcomes(
+            &conway,
+            vec![oc(Err(PlutusError::EvalPanic("x".into())), true)]
+        )
+        .is_ok());
+
+        // (3) CollectError with an unresolved UTxO gap → NOT fatal (#733 c4).
+        assert!(apply_phase2_outcomes(
+            &conway,
+            vec![oc(Err(PlutusError::CollectError("x".into())), false)]
+        )
+        .is_ok());
+
+        // (4) Alonzo never arms the horizon → CollectError NOT fatal (#733 c2).
+        assert!(apply_phase2_outcomes(
+            &alonzo,
+            vec![oc(Err(PlutusError::CollectError("x".into())), true)]
+        )
+        .is_ok());
+
+        // (5) Genuine script failure on is_valid=true → warn-and-trust, NOT fatal.
+        assert!(apply_phase2_outcomes(
+            &conway,
+            vec![oc(Err(PlutusError::EvalFailed("x".into())), true)]
+        )
+        .is_ok());
+
+        // (6) All scripts pass → Ok.
+        assert!(apply_phase2_outcomes(&conway, vec![oc(Ok(()), true)]).is_ok());
     }
 }

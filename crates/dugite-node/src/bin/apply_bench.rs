@@ -49,7 +49,9 @@
 //! - `DUGITE_BLOCK_APPLY_TIMING=1` activates per-phase breakdown logging.
 //! - `RUST_LOG=warn` suppresses verbose ledger trace during profiling runs.
 
-use dugite_ledger::state::{BlockValidationMode, LedgerState};
+use dugite_ledger::plutus::{run_phase2_parallel_pooled, Phase2WorkItem};
+use dugite_ledger::state::{apply_phase2_outcomes, BlockValidationMode, LedgerState};
+use dugite_primitives::block::Block;
 use dugite_primitives::hash::blake2b_256;
 use dugite_serialization::decode_block_with_byron_epoch_length;
 use dugite_storage::ImmutableDB;
@@ -64,9 +66,23 @@ use std::sync::Arc;
 
 struct Args {
     snapshot: PathBuf,
-    #[allow(dead_code)] // reserved for future LSM-path profiling
     utxo_store: PathBuf,
     immutable_dir: PathBuf,
+    /// Restore the on-disk LSM UTxO store (`--utxo-store`) and attach it to the
+    /// loaded ledger before applying blocks.  Required for v23+ (LSM/UTxO-HD)
+    /// snapshots whose `.bin` no longer embeds the UTxO set (`utxo_count: 0`) —
+    /// without it every input misses and the run falls through the
+    /// "trusting on-chain consensus" divergence path, making the timing
+    /// unrepresentative.  NOTE: applying MUTATES the store, so point
+    /// `--utxo-store` at a COW clone, never the live store.
+    restore_lsm: bool,
+    /// Cross-block Plutus pooling window (0 = disabled / serial inline drain).
+    /// When > 0, apply each block's STATE in-order via `apply_block_defer_phase2`,
+    /// pool `W` blocks' Phase-2 work items, and evaluate them together on rayon
+    /// (filling all cores) on a background thread that OVERLAPS the next window's
+    /// state apply — the bulk-sync CPU-saturation path. Ledger state (and thus
+    /// the fingerprint) is unchanged; only when/where Plutus runs moves.
+    defer_phase2: usize,
     /// First slot to include in the benchmark slice.
     start_slot: u64,
     /// Number of blocks to apply (0 = apply all available).
@@ -95,6 +111,8 @@ impl Args {
         let mut alonzo_preset = false;
         let mut alonzo_ep300_preset = false;
         let mut save_snapshot: Option<PathBuf> = None;
+        let mut restore_lsm = false;
+        let mut defer_phase2 = 0usize;
 
         let mut i = 1;
         while i < args.len() {
@@ -132,6 +150,13 @@ impl Args {
                     i += 1;
                     save_snapshot = Some(PathBuf::from(&args[i]));
                 }
+                "--restore-lsm" => {
+                    restore_lsm = true;
+                }
+                "--defer-phase2" => {
+                    i += 1;
+                    defer_phase2 = args[i].parse().expect("--defer-phase2 must be a usize");
+                }
                 "--help" | "-h" => {
                     eprintln!("{USAGE}");
                     std::process::exit(0);
@@ -168,6 +193,8 @@ impl Args {
                 verbose,
                 preset_name: "Alonzo-ep290",
                 save_snapshot,
+                restore_lsm,
+                defer_phase2,
             }
         } else if alonzo_ep300_preset {
             // ── Alonzo/Plutus ep300 preset ──────────────────────────────────
@@ -190,6 +217,8 @@ impl Args {
                 verbose,
                 preset_name: "Alonzo-ep300",
                 save_snapshot,
+                restore_lsm,
+                defer_phase2,
             }
         } else {
             // ── Mary-era default preset ─────────────────────────────────────
@@ -206,6 +235,8 @@ impl Args {
                 verbose,
                 preset_name: "Mary-ep286",
                 save_snapshot,
+                restore_lsm,
+                defer_phase2,
             }
         }
     }
@@ -226,6 +257,8 @@ OPTIONS:
   --alonzo                Use the Alonzo/Plutus preset (ep290 snapshot, /tmp/alonzo-bench-*)
   --alonzo-ep300          Use the Alonzo ep300 preset (ep300 snapshot, /tmp/alonzo-bench-*)
   --save-snapshot <path>  Save the final ledger state to this path (for checkpoint generation)
+  --restore-lsm           Open --utxo-store (LSM) and attach it before applying. Required for
+                          v23+ LSM snapshots (utxo_count:0). MUTATES the store — use a COW clone.
   --help / -h             This message
 
 PRESETS:
@@ -381,6 +414,44 @@ fn main() {
         ledger.utxo.utxo_set.len()
     );
 
+    // ── Optional: restore the on-disk LSM UTxO store ─────────────────────
+    // v23+ (LSM/UTxO-HD) snapshots no longer embed the UTxO set in the `.bin`
+    // (`utxo_count: 0`); the live set lives in `utxo-store/`.  Without
+    // restoring it, every tx input misses → the apply path short-circuits
+    // through the "trusting on-chain consensus" divergence branch and the
+    // timing is NOT representative of real validation.  Mirrors the live
+    // node's `UtxoStore::open` + `attach_utxo_store` wiring (mod.rs:1784).
+    //
+    // WARNING: applying blocks MUTATES the store (memtable inserts/deletes).
+    // Always point `--utxo-store` at a COW clone (e.g. `cp -c -R`), never the
+    // live store, or the benchmark will corrupt it.
+    if args.restore_lsm {
+        eprintln!(
+            "[apply_bench] Restoring LSM UTxO store: {}",
+            args.utxo_store.display()
+        );
+        let t_store = Instant::now();
+        match dugite_ledger::utxo_store::UtxoStore::open(&args.utxo_store) {
+            Ok(mut store) => {
+                // Disable the WAL so per-UTxO inserts/deletes don't fsync to the
+                // (clone) store during the run — we only care about the in-memory
+                // apply cost, not LSM durability. Mirrors the catch-up path.
+                store.set_wal_enabled(false);
+                ledger.attach_utxo_store(store);
+                eprintln!(
+                    "[apply_bench] LSM store attached in {:.1}s — UTxO set: {} entries",
+                    t_store.elapsed().as_secs_f64(),
+                    ledger.utxo.utxo_set.len()
+                );
+            }
+            Err(e) => {
+                eprintln!("[apply_bench] ERROR opening LSM UTxO store: {e}");
+                eprintln!("             Point --utxo-store at a COW clone of db-*/utxo-store.");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Diagnostic probe (issue: epoch-boundary reward-pots divergence).
     // When DUGITE_DUMP_LEDGER_PROBE is set, print the reward-update inputs and
     // pots straight from the loaded snapshot, then exit — used to confirm
@@ -503,46 +574,144 @@ fn main() {
 
     let t_apply_start = Instant::now();
 
-    for raw in raw_blocks.iter().take(apply_count) {
-        // Decode block CBOR → in-memory Block
-        let block = match decode_block_with_byron_epoch_length(raw, BYRON_EPOCH_LENGTH) {
-            Ok(b) => b,
-            Err(e) => {
-                if args.verbose {
-                    eprintln!("[apply_bench] WARN decode error: {e}");
+    if args.defer_phase2 == 0 {
+        // ── Serial path: apply state + drain Phase-2 inline, per block ────────
+        for raw in raw_blocks.iter().take(apply_count) {
+            // Decode block CBOR → in-memory Block
+            let block = match decode_block_with_byron_epoch_length(raw, BYRON_EPOCH_LENGTH) {
+                Ok(b) => b,
+                Err(e) => {
+                    if args.verbose {
+                        eprintln!("[apply_bench] WARN decode error: {e}");
+                    }
+                    decode_errors += 1;
+                    continue;
                 }
-                decode_errors += 1;
-                continue;
-            }
-        };
+            };
 
-        let slot = block.slot().0;
-        let tx_count = block.transactions.len();
+            let slot = block.slot().0;
+            let tx_count = block.transactions.len();
 
-        // ── THE HOT PATH ──────────────────────────────────────────────
-        // Includes apply_block + publish_ledger_view simulation so we measure
-        // the full per-block cost the live node incurs at tip.
-        let t_block = Instant::now();
-        match ledger.apply_block(&block, BlockValidationMode::ValidateAll) {
-            Ok(()) => {
-                // Replicate publish_ledger_view cost INSIDE the timing window.
-                // This is the fix: iteration-2 had an O(784K) iterate+collect
-                // here that the original apply_bench never measured.
-                simulate_publish_ledger_view(&ledger);
-                let elapsed_us = t_block.elapsed().as_micros() as u64;
-                timings_us.push(elapsed_us);
-                total_txs += tx_count;
-                if args.verbose {
-                    eprintln!(
-                        "[apply_bench] slot={slot} era={:?} txs={tx_count} {:.1}ms",
-                        block.era,
-                        elapsed_us as f64 / 1000.0,
-                    );
+            // ── THE HOT PATH ──────────────────────────────────────────────
+            // Includes apply_block + publish_ledger_view simulation so we measure
+            // the full per-block cost the live node incurs at tip.
+            let t_block = Instant::now();
+            match ledger.apply_block(&block, BlockValidationMode::ValidateAll) {
+                Ok(()) => {
+                    // Replicate publish_ledger_view cost INSIDE the timing window.
+                    // This is the fix: iteration-2 had an O(784K) iterate+collect
+                    // here that the original apply_bench never measured.
+                    simulate_publish_ledger_view(&ledger);
+                    let elapsed_us = t_block.elapsed().as_micros() as u64;
+                    timings_us.push(elapsed_us);
+                    total_txs += tx_count;
+                    if args.verbose {
+                        eprintln!(
+                            "[apply_bench] slot={slot} era={:?} txs={tx_count} {:.1}ms",
+                            block.era,
+                            elapsed_us as f64 / 1000.0,
+                        );
+                    }
+                }
+                Err(e) => {
+                    if args.verbose {
+                        eprintln!("[apply_bench] WARN slot={slot}: {e}");
+                    }
+                    apply_errors += 1;
                 }
             }
-            Err(e) => {
+        }
+    } else {
+        // ── Cross-block Plutus pooling + overlap (CPU-saturation path) ────────
+        // Apply each block's STATE in-order on this (main) thread, pool W blocks'
+        // Phase-2 work items, and evaluate them together on rayon (all cores) on
+        // a background thread that OVERLAPS the next window's state apply. State
+        // mutation is byte-identical to the serial path, so the fingerprint is
+        // unchanged; only when/where Plutus runs moves.
+        let window_size = args.defer_phase2;
+
+        // Drain one window: pooled rayon eval (fills cores) + per-block fatality.
+        // Self-contained (reads only the moved-in blocks + items), so it is safe
+        // to run on a separate thread concurrently with main-thread state apply.
+        fn drain_window(batch: Vec<(Block, Vec<Phase2WorkItem>)>) -> Result<(), String> {
+            let n = batch.len();
+            let mut blocks: Vec<Block> = Vec::with_capacity(n);
+            let mut items: Vec<Vec<Phase2WorkItem>> = Vec::with_capacity(n);
+            for (b, it) in batch {
+                blocks.push(b);
+                items.push(it);
+            }
+            let outcomes = run_phase2_parallel_pooled(items);
+            for (block, oc) in blocks.iter().zip(outcomes) {
+                apply_phase2_outcomes(block, oc)
+                    .map_err(|e| format!("slot {}: {e}", block.slot().0))?;
+            }
+            Ok(())
+        }
+
+        let mut window: Vec<(Block, Vec<Phase2WorkItem>)> = Vec::with_capacity(window_size);
+        let mut pending: Option<std::thread::JoinHandle<Result<(), String>>> = None;
+
+        for raw in raw_blocks.iter().take(apply_count) {
+            let block = match decode_block_with_byron_epoch_length(raw, BYRON_EPOCH_LENGTH) {
+                Ok(b) => b,
+                Err(e) => {
+                    if args.verbose {
+                        eprintln!("[apply_bench] WARN decode error: {e}");
+                    }
+                    decode_errors += 1;
+                    continue;
+                }
+            };
+            let tx_count = block.transactions.len();
+
+            // STATE apply on the main thread (deferred Plutus drain).
+            let t_block = Instant::now();
+            match ledger.apply_block_defer_phase2(&block, BlockValidationMode::ValidateAll) {
+                Ok(items) => {
+                    simulate_publish_ledger_view(&ledger);
+                    timings_us.push(t_block.elapsed().as_micros() as u64);
+                    total_txs += tx_count;
+                    window.push((block, items));
+                    if window.len() >= window_size {
+                        // Join the PREVIOUS window's drain (it overlapped this
+                        // window's state apply), then spawn this one.
+                        if let Some(h) = pending.take() {
+                            if let Err(e) = h.join().expect("drain thread panicked") {
+                                if args.verbose {
+                                    eprintln!("[apply_bench] WARN deferred phase-2: {e}");
+                                }
+                                apply_errors += 1;
+                            }
+                        }
+                        let batch = std::mem::take(&mut window);
+                        pending = Some(std::thread::spawn(move || drain_window(batch)));
+                    }
+                }
+                Err(e) => {
+                    if args.verbose {
+                        eprintln!(
+                            "[apply_bench] WARN state-apply slot={}: {e}",
+                            block.slot().0
+                        );
+                    }
+                    apply_errors += 1;
+                }
+            }
+        }
+        // Flush: join the last in-flight drain, then drain any remainder.
+        if let Some(h) = pending.take() {
+            if let Err(e) = h.join().expect("drain thread panicked") {
                 if args.verbose {
-                    eprintln!("[apply_bench] WARN slot={slot}: {e}");
+                    eprintln!("[apply_bench] WARN deferred phase-2: {e}");
+                }
+                apply_errors += 1;
+            }
+        }
+        if !window.is_empty() {
+            if let Err(e) = drain_window(window) {
+                if args.verbose {
+                    eprintln!("[apply_bench] WARN deferred phase-2 (flush): {e}");
                 }
                 apply_errors += 1;
             }

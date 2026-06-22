@@ -708,6 +708,44 @@ pub struct Node {
     /// Receiver for blocks fetched by per-peer BlockFetch workers.
     /// The main run loop consumes these and applies them to the ledger.
     fetched_blocks_rx: Option<mpsc::Receiver<FetchedBlock>>,
+    /// Cross-block Phase-2 (Plutus) pooling window for bulk-sync CPU saturation
+    /// (`DUGITE_DEFER_PHASE2_WINDOW`, default 0 = OFF). When > 0, during catch-up
+    /// (`!at_tip`) `apply_fetched_block` applies each block's STATE inline but
+    /// DEFERS the Plutus drain, stashing `(block, work_items)` here; the run loop
+    /// flushes the window via [`Self::flush_pending_phase2`] — pooling many
+    /// blocks' redeemers into one rayon batch to fill all cores. State is
+    /// byte-identical; only when/where Plutus runs moves. Default OFF: the live
+    /// apply path is unchanged until an operator opts in (the exposure-gating /
+    /// fork-in-window gauntlet is the prerequisite for default-on).
+    defer_phase2_window: usize,
+    /// The deferred (block, Phase-2 work items) accumulated under
+    /// `defer_phase2_window`, drained by [`Self::flush_pending_phase2`].
+    pending_phase2: Vec<(
+        Box<dugite_primitives::block::Block>,
+        Vec<dugite_ledger::plutus::Phase2WorkItem>,
+    )>,
+    /// Exact ledger tip point immediately BEFORE the first block of the current
+    /// deferred window was applied (the parent of `pending_phase2[0]`). On a
+    /// deferred block-fatal at window index 0 this is the precise rollback
+    /// target; for i>0 the target is block i-1's own point. Slots are sparse in
+    /// Cardano, so the rollback must land on a real on-chain point, not a
+    /// `slot-1` guess (`handle_ledger_rollback` classifies by slot).
+    pending_phase2_anchor: Option<dugite_primitives::block::Point>,
+    /// Running Σ of Phase-2 work items (redeemers) buffered in `pending_phase2`.
+    /// The pooled flush is triggered by THIS, not block count, so a dense-Plutus
+    /// region (many redeemers per block) flushes before the pooled eval's peak
+    /// memory grows unbounded. The deferral-soak wedge was a 64-block window
+    /// whose redeemer count — not block count — drove a multi-GB pooled eval.
+    pending_phase2_items: usize,
+    /// Work-item cap that forces a [`Self::flush_pending_phase2`] even before the
+    /// block window (`defer_phase2_window`) fills (`DUGITE_DEFER_PHASE2_MAX_ITEMS`,
+    /// default 256). Bounds the pooled flush's peak memory + wall time.
+    defer_phase2_max_items: usize,
+    /// Clone of the run loop's shutdown watch, observed by the pooled flush
+    /// between chunks so a SIGTERM during a long flush aborts the remaining
+    /// chunks instead of being swallowed (the original `block_in_place` flush was
+    /// not cancel-aware → SIGTERM was ignored during the soak wedge).
+    shutdown_rx_for_flush: Option<tokio::sync::watch::Receiver<bool>>,
     /// Receiver for peer failure reports from protocol tasks (e.g. fetch timeout).
     /// The main run loop drains this to call `peer_failed()` for reputation scoring.
     peer_failure_rx: Option<mpsc::Receiver<(SocketAddr, PeerFailureKind)>>,
@@ -2422,6 +2460,8 @@ impl Node {
                     Some(age) if gsm_config.syncing_startup_threshold_secs > 0
                         && age < gsm_config.syncing_startup_threshold_secs
                 );
+                // MUST mirror GenesisStateMachine::new()'s no-marker branch so the
+                // seed snapshot's state matches the GSM actor's internal state.
                 if recent {
                     crate::gsm::GenesisSyncState::Syncing
                 } else {
@@ -2568,6 +2608,19 @@ impl Node {
             connection_lifecycle: None,
             block_fetch_task: None,
             fetched_blocks_rx: None,
+            defer_phase2_window: std::env::var("DUGITE_DEFER_PHASE2_WINDOW")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            pending_phase2: Vec::new(),
+            pending_phase2_anchor: None,
+            pending_phase2_items: 0,
+            defer_phase2_max_items: std::env::var("DUGITE_DEFER_PHASE2_MAX_ITEMS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(256),
+            shutdown_rx_for_flush: None,
             peer_failure_rx: None,
             keepalive_rtt_rx: None,
             query_handler,
@@ -2786,6 +2839,9 @@ impl Node {
         // Setup shutdown signal (SIGINT + SIGTERM) early so the node can be
         // gracefully stopped during replay (which can take 30+ minutes).
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        // Let the pooled Phase-2 deferral flush observe shutdown between chunks
+        // (cancel-aware flush; see `flush_pending_phase2`).
+        self.shutdown_rx_for_flush = Some(shutdown_rx.clone());
         // #760: set true the instant the main run loop breaks, so the
         // shutdown watchdog can tell "loop wedged, never broke" (force-exit)
         // from "loop broke, draining cleanly" (the post-loop block has its own
@@ -3558,6 +3614,12 @@ impl Node {
             };
 
             let mut resolved_peers: Vec<std::net::SocketAddr> = Vec::new();
+            // Bootstrap / trustable peers' resolved addresses, registered with
+            // the PeerManager so haa_satisfied() can recognise them as the
+            // trusted external set (Haskell UseBootstrapPeers HAA path). A
+            // `trustable` topology entry is a bootstrap peer or a trustable
+            // local root — exactly Haskell's trusted-peer set.
+            let mut resolved_bootstrap: Vec<std::net::SocketAddr> = Vec::new();
             for peer in &detailed_peers {
                 let addrs = resolve_with_srv(dns_resolver.as_ref(), &peer.address, peer.port).await;
                 if addrs.is_empty() {
@@ -3567,6 +3629,9 @@ impl Node {
                         "Failed to resolve peer address (SRV + A/AAAA both failed)"
                     );
                 } else {
+                    if peer.trustable {
+                        resolved_bootstrap.extend(addrs.iter().copied());
+                    }
                     resolved_peers.extend(addrs);
                 }
             }
@@ -3618,6 +3683,11 @@ impl Node {
             let mut pm = peer_manager.write().await;
             for socket_addr in resolved_peers {
                 pm.add_config_peer(socket_addr);
+            }
+            // Register bootstrap/trustable peers for the UseBootstrapPeers HAA
+            // path (must be AFTER add_config_peer so the peer table has them).
+            for socket_addr in resolved_bootstrap {
+                pm.add_bootstrap_peer(socket_addr);
             }
             // Register per-group valency targets.  This must happen AFTER
             // add_config_peer() calls so the peer table contains the members.
@@ -4948,6 +5018,12 @@ impl Node {
                 // ── Shutdown ────────────────────────────────────────────
                 _ = shutdown_rx.changed() => {
                     info!("Shutdown signal received");
+                    // Confirm any deferred Plutus before the shutdown snapshot so
+                    // the persisted state reflects only Plutus-confirmed blocks.
+                    // allow_cancel = false: this flush must COMPLETE (the window
+                    // is small + memory-bounded), never observe its own shutdown
+                    // signal and bail before persisting confirmed state.
+                    self.flush_pending_phase2(false).await;
                     break;
                 }
 
@@ -4988,6 +5064,21 @@ impl Node {
                         lc.chainsel_dequeued();
                     }
                     self.apply_fetched_block(fetched).await;
+                    // Cross-block Phase-2 pooling flush: drain the deferred window
+                    // when its REDEEMER count reaches the memory-safety cap
+                    // (`defer_phase2_max_items` — the primary trigger, since a
+                    // dense-Plutus region fills memory by redeemer count, not
+                    // block count), or the block window fills, or the fetch queue
+                    // has drained (we've caught up to the buffered blocks, so
+                    // flush before idling / before any at-tip transition). No-op
+                    // when the window is empty (deferral off / at-tip).
+                    if !self.pending_phase2.is_empty()
+                        && (self.pending_phase2_items >= self.defer_phase2_max_items
+                            || self.pending_phase2.len() >= self.defer_phase2_window
+                            || fetched_blocks_rx.is_empty())
+                    {
+                        self.flush_pending_phase2(true).await;
+                    }
                     // After the apply, if the queue is empty we are about to
                     // block waiting → starvation Ongoing. A FULL queue during
                     // a long apply (epoch boundary, snapshot) keeps the old
@@ -5006,6 +5097,9 @@ impl Node {
                     blocks_since_maintenance += 1;
                     if blocks_since_maintenance >= MAINTENANCE_FORCE_BLOCKS {
                         blocks_since_maintenance = 0;
+                        // Confirm all deferred Plutus before maintenance flushes
+                        // volatile→immutable so nothing un-confirmed is finalised.
+                        self.flush_pending_phase2(true).await;
                         self.run_background_maintenance().await;
                     }
                 }
@@ -5017,6 +5111,8 @@ impl Node {
                 // for why this is the from-genesis apply-rate fix.
                 _ = maintenance_ticker.tick() => {
                     blocks_since_maintenance = 0;
+                    // Confirm deferred Plutus before the volatile→immutable flush.
+                    self.flush_pending_phase2(true).await;
                     self.run_background_maintenance().await;
                 }
 
@@ -5834,6 +5930,33 @@ impl Node {
         rollback: Vec<dugite_primitives::hash::Hash32>,
         apply: Vec<dugite_primitives::hash::Hash32>,
     ) -> ForkSwitchOutcome {
+        // ── Phase-2 deferral safety: flush BEFORE the ledger rolls back ──────
+        //
+        // A fork switch rolls the ledger backward through the volatile window,
+        // which can include blocks whose deferred Plutus is still pending. This
+        // is the SOLE ledger-rollback path that can orphan a pending block: it
+        // is reached both inline (an arriving block triggers the fork) and from
+        // the run-loop LoE arm (a GDD/LoE advance unlocks a candidate). In
+        // GENESIS mode especially, LoE/GDD makes such switches reachable while
+        // the deferral window is non-empty — the Praos "fork-in-window is
+        // structurally impossible" argument (deferred blocks ~3k deep, below the
+        // k-finality horizon) does NOT hold under LoE selection, whose switches
+        // can intersect anywhere down to the immutable tip, inside the volatile
+        // window where the pending blocks live.
+        //
+        // Flush the window FIRST so every pending block's Plutus is validated
+        // against the exact ledger it was applied to, BEFORE the rollback/replay
+        // — mirroring the existing flush-before-maintenance/snapshot/shutdown
+        // ordering. Without this, a post-switch flush would run Plutus against
+        // (or roll back to a stale anchor on) a chain the deferred blocks are no
+        // longer on. `allow_cancel = false`: complete it (the window is
+        // memory-bounded) so the ledger is deterministic before the switch.
+        // No-op when the window is empty (deferral off, or already flushed by
+        // the run loop). Cannot recurse: flush_pending_phase2 calls
+        // handle_ledger_rollback, never apply_fork_switch_plan, and it empties
+        // pending_phase2 before that call.
+        self.flush_pending_phase2(false).await;
+
         // Chain selection determined a competing fork is strictly
         // preferred.  The VolatileDB chain switch is already
         // committed — selected_chain now points at the new fork.
@@ -6666,6 +6789,34 @@ impl Node {
             BlockValidationMode::ValidateAll => self.metrics.inc_apply_mode_validate_all(),
         }
 
+        // Cross-block Phase-2 pooling gate (DUGITE_DEFER_PHASE2_WINDOW, default
+        // OFF). Defer the Plutus drain ONLY during catch-up (`!at_tip`) under
+        // ValidateAll: at-tip we keep the exact synchronous path so served/forged
+        // tips carry zero deferral. `at_tip` here uses the same predicate as the
+        // publish gate below (peer_tip==0 ⇒ no peer yet ⇒ treat as at-tip).
+        //
+        // **Fork-in-window is structurally impossible under this gate.** Deferral
+        // engages only when `peer_tip − block_slot > stability_window = ⌈3k/f⌉`
+        // slots (≈129 600 = 36 h on mainnet/preview). Ouroboros k-finality bounds
+        // ANY fork rollback to ≤ k blocks ≈ k/f slots. A deferred block therefore
+        // sits ~3k blocks deep — 3× beyond the deepest reachable fork — so no fork
+        // can ever roll back a block whose Plutus is still pending. The window is
+        // flushed the moment `at_tip` flips (well before blocks enter the
+        // fork-reachable k window), so a deferred block is always settled/final.
+        // (This is why the deferral needs no fork-in-window handling: the gate
+        // keeps the un-confirmed prefix strictly below the finality horizon.)
+        let defer_pre_at_tip = {
+            let peer_tip = self.metrics.get_peer_tip();
+            let sw = dugite_consensus::stability_window_slots(
+                self.consensus.security_param,
+                self.consensus.active_slot_coeff,
+            );
+            peer_tip == 0 || block_slot.0.saturating_add(sw) >= peer_tip
+        };
+        let should_defer_phase2 = self.defer_phase2_window > 0
+            && matches!(validation_mode, BlockValidationMode::ValidateAll)
+            && !defer_pre_at_tip;
+
         // Apply to ledger state and collect the delta for LedgerSeq.
         //
         // Fix A (Bug B, 2026-05-16): use apply_block_with_delta so that every
@@ -6685,7 +6836,14 @@ impl Node {
         // NOTE: apply_fetched_block and process_blocks_bulk are mutually
         // exclusive code paths (bulk sync runs to completion, then live sync
         // starts), so there is no risk of double-pushing the same block.
-        let delta = {
+        // If this block opens a new deferred window, record the pre-apply ledger
+        // tip as the window anchor (the exact rollback target should the window's
+        // first block later prove block-fatal under pooled Plutus).
+        if should_defer_phase2 && self.pending_phase2.is_empty() {
+            let pre_tip = self.ledger_state.read().await.tip.point.clone();
+            self.pending_phase2_anchor = Some(pre_tip);
+        }
+        let (delta, deferred_items) = {
             let mut ls = self.ledger_state.write().await;
             // #733: per-block apply horizon snapshot at the pre-block
             // ledger tip (one-shot, conservative — sound across HF windows).
@@ -6706,10 +6864,19 @@ impl Node {
             // one worker for the full Phase-1/Phase-2 validation and
             // UTxO/cert/gov update window, leaving the work-stealing
             // pool unable to fan out runnable tasks elsewhere.
-            let apply_result =
-                tokio::task::block_in_place(|| ls.apply_block_with_delta(&block, validation_mode));
+            // Deferred path returns the captured Phase-2 work items (drained
+            // later by the run loop's pooled flush); inline path drains Plutus
+            // now and yields no items. Both produce a byte-identical delta.
+            let apply_result = if should_defer_phase2 {
+                tokio::task::block_in_place(|| {
+                    ls.apply_block_with_delta_defer(&block, validation_mode)
+                })
+            } else {
+                tokio::task::block_in_place(|| ls.apply_block_with_delta(&block, validation_mode))
+                    .map(|delta| (delta, Vec::new()))
+            };
             match apply_result {
-                Ok(delta) => {
+                Ok((delta, items)) => {
                     // Publish the lock-free read view (issue #651 P2 / #652 P0)
                     // — readers see the new tip without acquiring the ledger
                     // lock.
@@ -6816,7 +6983,7 @@ impl Node {
                             );
                         }
                     }
-                    delta
+                    (delta, items)
                 }
                 Err(e) => {
                     // Issue #669 — surface this as a hard operator-actionable
@@ -6931,6 +7098,140 @@ impl Node {
         // per block would replace the old O(N²) `get_all_fork_tips` cost with a
         // per-block O(k) WAL rewrite.  Batching it on the 250 ms ticker keeps
         // WAL rewrites to ~4/s while still bounding VolatileDB to the k window.
+
+        // Cross-block Phase-2 pooling: stash this block + its deferred Plutus
+        // work items for the run loop's pooled flush. `block` is moved here
+        // after its last borrow (the announce above), so no clone is needed.
+        if should_defer_phase2 {
+            // Track the running redeemer count so the run loop flushes by
+            // work-item count (memory) before the block window fills.
+            self.pending_phase2_items += deferred_items.len();
+            self.pending_phase2.push((Box::new(block), deferred_items));
+        }
+    }
+
+    /// Drain the deferred Phase-2 (Plutus) window: evaluate every pooled block's
+    /// work items on the memory-bounded pool, then apply each block's fatality
+    /// verdict in order. On a block-fatal collection error, roll the ledger back
+    /// to before that block and stop (mirrors the synchronous per-block `Err`
+    /// path, just deferred). A no-op when the window is empty.
+    ///
+    /// Memory + cancel safety: the pooled eval is concurrency-capped and chunked
+    /// (see [`dugite_ledger::plutus::run_phase2_parallel_pooled_cancellable`]) so
+    /// it cannot reproduce the deferral-soak RSS runaway, and — when
+    /// `allow_cancel` is true — it observes the shutdown watch between chunks so
+    /// a SIGTERM during a long flush aborts the remaining work instead of being
+    /// swallowed by `block_in_place`. The shutdown-arm flush passes
+    /// `allow_cancel = false` so it always confirms the (small, bounded) window
+    /// before the persisted snapshot.
+    ///
+    /// Byte-exact: state was already applied in-order by `apply_fetched_block`;
+    /// this only runs the deferred read-only fatality check whose decision is a
+    /// pure function of each block's self-contained work items.
+    async fn flush_pending_phase2(&mut self, allow_cancel: bool) {
+        if self.pending_phase2.is_empty() {
+            return;
+        }
+        let batch = std::mem::take(&mut self.pending_phase2);
+        let anchor = self.pending_phase2_anchor.take();
+        self.pending_phase2_items = 0;
+        let n_blocks = batch.len();
+        let (blocks, items): (Vec<_>, Vec<_>) = batch.into_iter().unzip();
+        let n_items: usize = items.iter().map(Vec::len).sum();
+        let t_flush = std::time::Instant::now();
+
+        // Cancellation token: observe the shutdown watch between chunks so a
+        // SIGTERM during a long flush aborts the remaining work. The shutdown-arm
+        // flush passes allow_cancel = false (None token) so it always completes.
+        let sd_rx = if allow_cancel {
+            self.shutdown_rx_for_flush.clone()
+        } else {
+            None
+        };
+        let cancel = move || sd_rx.as_ref().is_some_and(|rx| *rx.borrow());
+
+        // Pooled rayon evaluation (CPU-bound, memory-bounded) under
+        // block_in_place so the multi-thread runtime spawns relief workers.
+        let outcomes_per_block = tokio::task::block_in_place(|| {
+            dugite_ledger::plutus::run_phase2_parallel_pooled_cancellable(items, &cancel)
+        });
+
+        let outcomes_per_block = match outcomes_per_block {
+            Some(o) => o,
+            None => {
+                // Cancelled mid-flush (shutdown in progress). Nothing was applied
+                // yet — the deferred blocks' STATE is in the in-memory ledger but
+                // their Plutus is unconfirmed, so we must NOT let them reach a
+                // persisted snapshot. Roll the ledger back to the window anchor
+                // (undoing the whole un-confirmed window) and disable deferral;
+                // the blocks are re-fetched + validated synchronously on restart.
+                warn!(
+                    pooled_blocks = n_blocks,
+                    pooled_items = n_items,
+                    "Deferred Phase-2 flush cancelled by shutdown — rolling the \
+                     ledger back to the last confirmed block and disabling deferral."
+                );
+                if let Some(rb) = anchor {
+                    let _ = self.handle_ledger_rollback(&rb).await;
+                }
+                self.defer_phase2_window = 0;
+                return;
+            }
+        };
+
+        // Apply each block's fatality verdict in chain order. `prev_confirmed`
+        // tracks the last block that drained non-fatal (starting at the window
+        // anchor = parent of block[0]). The FIRST block with a block-fatal
+        // CollectError is the rejection point — identical to the block the
+        // synchronous path would have rejected.
+        let mut prev_confirmed: Option<dugite_primitives::block::Point> = anchor;
+        for (block, outcomes) in blocks.into_iter().zip(outcomes_per_block) {
+            if let Err(e) = dugite_ledger::state::apply_phase2_outcomes(&block, outcomes) {
+                let fatal_slot = block.slot().0;
+                self.metrics
+                    .block_apply_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                error!(
+                    slot = fatal_slot,
+                    pooled_blocks = n_blocks,
+                    "Deferred Phase-2 (pooled) found a block-fatal error: {e} — rolling \
+                     the ledger back to the last confirmed block and disabling deferral. \
+                     The rejected block (and any later un-confirmed window blocks) are \
+                     undone; they are re-fetched and re-validated synchronously."
+                );
+                // Roll back to the last confirmed on-chain point (real slot+hash,
+                // never a slot-1 guess). This undoes the fatal block AND every
+                // later un-confirmed block in the window via the LedgerSeq path.
+                match prev_confirmed {
+                    Some(rb) => {
+                        let _ = self.handle_ledger_rollback(&rb).await;
+                    }
+                    None => {
+                        // No anchor (should not happen) — halt deferral; the
+                        // serial re-validation on restart/refetch is the backstop.
+                        error!(
+                            "Deferred Phase-2 fatal at window head with no anchor — \
+                             cannot roll back precisely; halting deferral."
+                        );
+                    }
+                }
+                // Disable further deferral for the remainder of this run so the
+                // re-fetched blocks are validated synchronously (conservative).
+                self.defer_phase2_window = 0;
+                return;
+            }
+            prev_confirmed = Some(dugite_primitives::block::Point::Specific(
+                block.slot(),
+                *block.hash(),
+            ));
+        }
+        self.metrics.record_deferred_phase2_flush(n_blocks as u64);
+        debug!(
+            pooled_blocks = n_blocks,
+            pooled_items = n_items,
+            elapsed_ms = t_flush.elapsed().as_millis() as u64,
+            "Deferred Phase-2 window flushed (pooled, memory-bounded)"
+        );
     }
 
     // ─── run_background_maintenance() ────────────────────────────────────────

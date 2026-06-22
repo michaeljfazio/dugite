@@ -56,6 +56,12 @@ impl PeerState {
 /// EWMA smoothing factor (0-1). Higher = more weight on recent measurements.
 const EWMA_ALPHA: f64 = 0.3;
 
+/// GSV fetch-bandwidth sample is considered STALE after this long. A gated-out
+/// peer whose last sample is older re-qualifies for the fetch slot so it can be
+/// re-measured — the explore step that stops the gate latching onto a peer that
+/// has since degraded (or missing a peer that has since become faster).
+const STALE_FETCH_SAMPLE: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Failure count decay interval — halves every 5 minutes.
 const FAILURE_DECAY_INTERVAL: Duration = Duration::from_secs(300);
 
@@ -93,6 +99,16 @@ pub struct PeerInfo {
     pub state: PeerState,
     /// EWMA round-trip latency in milliseconds (None if no measurement yet).
     pub latency_ms: Option<f64>,
+    /// EWMA block-fetch throughput in bytes/second (None until this peer has
+    /// served at least one fetch range). The bandwidth half of the GSV estimate
+    /// (`G`=latency, `S`=1/bandwidth) that cardano-node's `prioritisePeerChains`
+    /// uses to prefer the fastest-serving peer for the single bulk-sync fetcher.
+    pub fetch_bandwidth_bps: Option<f64>,
+    /// When `fetch_bandwidth_bps` was last updated. Drives the GSV gate's
+    /// explore step: a peer whose sample is stale re-qualifies, so gated-out
+    /// peers periodically re-measure and the gate can never latch onto a peer
+    /// that has since degraded. `None` until the first sample.
+    pub fetch_sample_at: Option<Instant>,
     /// Reputation score (0.0 = worst, 1.0 = best).
     pub reputation: f64,
     /// Number of failures since last decay.
@@ -133,6 +149,8 @@ impl PeerInfo {
         Self {
             state: PeerState::Cold,
             latency_ms: None,
+            fetch_bandwidth_bps: None,
+            fetch_sample_at: None,
             reputation: INITIAL_REPUTATION,
             failure_count: 0,
             last_failure_decay: now,
@@ -149,6 +167,19 @@ impl PeerInfo {
             Some(prev) => prev * (1.0 - EWMA_ALPHA) + rtt_ms * EWMA_ALPHA,
             None => rtt_ms,
         });
+    }
+
+    /// Update fetch throughput with a new measurement (EWMA), in bytes/second.
+    /// Measured per completed BlockFetch range as `seen_bytes / fetch_seconds`.
+    pub fn update_fetch_bandwidth(&mut self, bytes_per_sec: f64) {
+        if !bytes_per_sec.is_finite() || bytes_per_sec <= 0.0 {
+            return;
+        }
+        self.fetch_bandwidth_bps = Some(match self.fetch_bandwidth_bps {
+            Some(prev) => prev * (1.0 - EWMA_ALPHA) + bytes_per_sec * EWMA_ALPHA,
+            None => bytes_per_sec,
+        });
+        self.fetch_sample_at = Some(Instant::now());
     }
 
     /// Record a failure — increments failure count, reduces reputation, and
@@ -385,6 +416,78 @@ impl PeerManager {
     pub fn get_latency_ms(&self, addr: &SocketAddr) -> Option<f64> {
         self.peers.get(addr).and_then(|p| p.latency_ms)
     }
+
+    /// Record a measured BlockFetch throughput sample (bytes/second) for a peer.
+    pub fn update_fetch_bandwidth(&mut self, addr: &SocketAddr, bytes_per_sec: f64) {
+        if let Some(p) = self.peers.get_mut(addr) {
+            p.update_fetch_bandwidth(bytes_per_sec);
+        }
+    }
+
+    /// EWMA fetch throughput (bytes/second) for a peer, or `None` if it has not
+    /// served a range yet.
+    pub fn get_fetch_bandwidth_bps(&self, addr: &SocketAddr) -> Option<f64> {
+        self.peers.get(addr).and_then(|p| p.fetch_bandwidth_bps)
+    }
+
+    /// GSV peer prioritisation for the single bulk-sync fetcher — should `addr`
+    /// be allowed to claim the fetch slot right now?
+    ///
+    /// Mirrors cardano-node's `prioritisePeerChains`: prefer the fastest-serving
+    /// peers. `addr` is preferred iff its measured fetch bandwidth ranks in the
+    /// top `top_k` among the `candidates` (the currently fetch-eligible / hot
+    /// peers). To stay wedge-safe and avoid a measurement chicken-and-egg:
+    ///
+    /// * a peer with NO bandwidth sample yet is always preferred (so every
+    ///   peer gets at least one range and a measurement);
+    /// * if fewer than `top_k` candidates have samples, all are preferred;
+    /// * if `addr` isn't among `candidates` (race vs a just-changed set), it
+    ///   is preferred (fail-open — never block progress).
+    ///
+    /// `top_k = 1` matches Haskell's `nPreferedPeers = maxConcurrencyBulkSync`;
+    /// using a small k > 1 keeps a hot standby so a momentarily-busy best peer
+    /// can't stall the slot.
+    pub fn is_preferred_fetch_peer(
+        &self,
+        addr: &SocketAddr,
+        candidates: &[SocketAddr],
+        top_k: usize,
+    ) -> bool {
+        // Fail-open if the caller's peer isn't in the candidate set.
+        if !candidates.contains(addr) {
+            return true;
+        }
+        let info = match self.peers.get(addr) {
+            Some(i) => i,
+            None => return true,
+        };
+        // This peer has no measurement yet → let it fetch once to bootstrap.
+        let my_bw = match info.fetch_bandwidth_bps {
+            Some(b) => b,
+            None => return true,
+        };
+        // Explore: a peer whose sample has gone stale re-qualifies so it gets
+        // re-measured (prevents latching onto a now-degraded peer).
+        if info
+            .fetch_sample_at
+            .map(|t| t.elapsed() >= STALE_FETCH_SAMPLE)
+            .unwrap_or(true)
+        {
+            return true;
+        }
+        // Rank candidates that HAVE a measurement by bandwidth (desc).
+        let mut measured: Vec<f64> = candidates
+            .iter()
+            .filter_map(|a| self.get_fetch_bandwidth_bps(a))
+            .collect();
+        if measured.len() <= top_k.max(1) {
+            return true;
+        }
+        measured.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        // `addr` is preferred iff its bandwidth is >= the k-th best.
+        let threshold = measured[top_k.max(1) - 1];
+        my_bw >= threshold
+    }
 }
 
 impl Default for PeerManager {
@@ -400,6 +503,62 @@ mod tests {
 
     fn test_addr(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), port)
+    }
+
+    #[test]
+    fn fetch_bandwidth_ewma_and_gsv_preference() {
+        let mut pm = PeerManager::new();
+        let fast = test_addr(3001);
+        let mid = test_addr(3002);
+        let slow = test_addr(3003);
+        let fresh = test_addr(3004);
+        for a in [fast, mid, slow, fresh] {
+            pm.add_peer(a, PeerSource::Topology);
+        }
+        let cands = vec![fast, mid, slow, fresh];
+
+        // Cold start: nobody measured → everyone preferred (no wedge).
+        assert!(pm.is_preferred_fetch_peer(&fast, &cands, 1));
+        assert!(pm.is_preferred_fetch_peer(&slow, &cands, 1));
+
+        // EWMA: first sample seeds, second blends (alpha=0.3).
+        pm.update_fetch_bandwidth(&fast, 10_000_000.0);
+        assert_eq!(pm.get_fetch_bandwidth_bps(&fast), Some(10_000_000.0));
+        pm.update_fetch_bandwidth(&fast, 20_000_000.0);
+        assert_eq!(pm.get_fetch_bandwidth_bps(&fast), Some(13_000_000.0)); // 10M*.7 + 20M*.3
+        pm.update_fetch_bandwidth(&mid, 5_000_000.0);
+        pm.update_fetch_bandwidth(&slow, 1_000_000.0);
+
+        // top_k=1: only the fastest measured peer is preferred...
+        assert!(pm.is_preferred_fetch_peer(&fast, &cands, 1));
+        assert!(!pm.is_preferred_fetch_peer(&mid, &cands, 1));
+        assert!(!pm.is_preferred_fetch_peer(&slow, &cands, 1));
+        // ...but an UNMEASURED peer is always preferred (bootstrap its sample).
+        assert!(pm.is_preferred_fetch_peer(&fresh, &cands, 1));
+
+        // top_k=2: the two fastest measured peers are preferred.
+        assert!(pm.is_preferred_fetch_peer(&fast, &cands, 2));
+        assert!(pm.is_preferred_fetch_peer(&mid, &cands, 2));
+        assert!(!pm.is_preferred_fetch_peer(&slow, &cands, 2));
+
+        // Fail-open: a peer not in the candidate set is never blocked.
+        assert!(pm.is_preferred_fetch_peer(&test_addr(9999), &cands, 1));
+
+        // Explore: ageing a gated (slow) peer's sample past STALE_FETCH_SAMPLE
+        // re-qualifies it, so the gate can never latch out a peer forever.
+        assert!(!pm.is_preferred_fetch_peer(&slow, &cands, 1)); // fresh + slow → gated
+        if let Some(info) = pm.peers.get_mut(&slow) {
+            info.fetch_sample_at = Some(Instant::now() - std::time::Duration::from_secs(20));
+        }
+        assert!(
+            pm.is_preferred_fetch_peer(&slow, &cands, 1),
+            "a stale-sample peer must re-qualify for exploration"
+        );
+
+        // Non-finite / non-positive samples are ignored (no NaN poisoning).
+        pm.update_fetch_bandwidth(&slow, f64::NAN);
+        pm.update_fetch_bandwidth(&slow, -1.0);
+        assert_eq!(pm.get_fetch_bandwidth_bps(&slow), Some(1_000_000.0));
     }
 
     #[test]
