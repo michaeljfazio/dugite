@@ -587,9 +587,8 @@ pub struct NodeConfig {
     /// `connectionRateLimit`.  Prevents a single source IP from exhausting all
     /// inbound connection slots with stalled half-open connections.
     ///
-    /// Note: this config field was previously defined in `ConnectionManagerConfig`
-    /// in `dugite-network` but was never wired into the accept loop.  This is the
-    /// authoritative config field going forward.
+    /// Wired into the N2N accept loop as the per-IP concurrent-connection limit
+    /// (the `ConnectionManager` `per_ip_rate_limit`).
     #[serde(default = "default_per_ip_rate_limit_n2n")]
     pub per_ip_rate_limit_n2n: usize,
 
