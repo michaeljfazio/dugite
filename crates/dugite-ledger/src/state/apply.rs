@@ -1841,6 +1841,11 @@ impl LedgerState {
         // blocks where a pending retirement is added but pool_params is unchanged).
         let pending_retirements_len_before = self.certs.pending_retirements.len();
         let future_pool_params_len_before = self.certs.future_pool_params.len();
+        // Capture the pre-block per-pool block counter Arc pointer so we can
+        // detect (by pointer) whether this block mutated it (counted a block
+        // and/or cleared it at an epoch boundary). Used to snapshot it
+        // absolutely for gap-robust reconstruction (#763).
+        let epoch_blocks_before = std::sync::Arc::clone(&self.consensus.epoch_blocks_by_pool);
 
         // Apply the block (all state mutations happen here). In deferred mode
         // this returns the captured Phase-2 work items without draining them.
@@ -1889,6 +1894,20 @@ impl LedgerState {
         // model frozen → script_data_hash divergence + deposits_proposal=0).
         if !std::sync::Arc::ptr_eq(&gov_before, &self.gov.governance) {
             delta.gov_snapshot = Some(self.gov.clone());
+        }
+
+        // Snapshot the per-pool block counter when this block changed it
+        // (counted a non-overlay block and/or cleared it at an epoch boundary).
+        // `Arc::clone` is O(1). On reconstruction, `apply_delta_to_state`
+        // restores this ABSOLUTE value instead of relying on the fragile
+        // `pool_block_increment` reconstruction, which silently under-counts
+        // when a no-delta apply path (gap-bridge advance, LSM/chunk replay,
+        // startup recovery) leaves a hole in the delta chain — the root cause
+        // of the #763 reserves/reward drift. `None` (pointer unchanged →
+        // overlay/Byron block that counted nothing) carries the map forward.
+        if !std::sync::Arc::ptr_eq(&epoch_blocks_before, &self.consensus.epoch_blocks_by_pool) {
+            delta.epoch_blocks_by_pool_snapshot =
+                Some(std::sync::Arc::clone(&self.consensus.epoch_blocks_by_pool));
         }
 
         // Extract the UTxO diff from the DiffSeq entry that apply_block just pushed.
