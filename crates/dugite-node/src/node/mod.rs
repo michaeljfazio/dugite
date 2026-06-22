@@ -2355,11 +2355,18 @@ impl Node {
             syncing_startup_threshold_secs,
             ..Default::default()
         };
+        // LoE/GDD master switch (LowLevelGenesisOptions.EnableLoEAndGDD,
+        // default true). Genesis mode normally runs LoE (Limit on Eagerness)
+        // + GDD (Genesis Density Disconnect); an operator may explicitly
+        // disable both via EnableLoEAndGDD=false, in which case chain
+        // selection is unconstrained by LoE and no density disconnects fire
+        // (CSJ / LoP / GSM state tracking remain active). Default-neutral.
+        let loe_gdd_enabled = genesis_enabled && genesis_params.options.enable_loe_and_gdd;
         // The LoE handed to chain selection. Initial value mirrors Haskell's
         // pre-setGetLoEFragment conservative default: in genesis mode an
         // empty fragment anchored at the current immutable tip (≤ k blocks
-        // of selection freedom); in praos mode Disabled (identity).
-        let initial_loe = if genesis_enabled {
+        // of selection freedom); in praos mode (or LoE/GDD disabled) Disabled.
+        let initial_loe = if loe_gdd_enabled {
             let db = chain_db
                 .try_read()
                 .expect("ChainDB lock available during startup");
@@ -2412,7 +2419,7 @@ impl Node {
                 .try_write()
                 .expect("ChainDB lock available during startup");
             db.set_loe_handle(loe_out.clone());
-            if genesis_enabled {
+            if loe_gdd_enabled {
                 // Haskell initial-chain-selection k-cap (LoE enabled): never
                 // boot onto a >k-deep selection rebuilt from the volatile WAL
                 // — it may contain an adversarial chain the LoE was deferring
@@ -3929,19 +3936,28 @@ impl Node {
 
                             // ── Step 4: apply hot-reloadable fields ───────────────
                             //
-                            // Log directive / min severity (preserves existing #473 behaviour)
+                            // Log directive / min severity (preserves existing #473 behaviour).
+                            //
+                            // `LogDirective` is full EnvFilter syntax and is applied verbatim.
+                            // `MinSeverity` is a cardano-node syslog severity and MUST be
+                            // translated to a valid tracing level — handing it raw to EnvFilter
+                            // silently mis-parses Notice/Warning/Critical/Alert/Emergency into a
+                            // bogus per-target TRACE directive.
                             if let Some(handle) = log_handle.as_ref() {
-                                let directive = new_config
-                                    .log_directive
-                                    .as_deref()
-                                    .unwrap_or(&new_config.min_severity);
-                                match handle.reload(directive) {
+                                let directive: String =
+                                    new_config.log_directive.clone().unwrap_or_else(|| {
+                                        crate::logging::min_severity_to_directive(
+                                            &new_config.min_severity,
+                                        )
+                                        .to_string()
+                                    });
+                                match handle.reload(&directive) {
                                     Ok(()) => info!(
-                                        directive,
+                                        directive = %directive,
                                         "config_reload: log directive applied"
                                     ),
                                     Err(e) => warn!(
-                                        directive,
+                                        directive = %directive,
                                         "config_reload: failed to apply log directive: {e}"
                                     ),
                                 }
@@ -4154,12 +4170,17 @@ impl Node {
             // Haskell `cardano-node` enforces limits in `Server.run` via
             // `ConnectionLimits` (maxAcceptedConnections + maxAcceptedConnectionsPerHost)
             // acquired before the TCP fd enters the handshake pipeline.
-            let n2n_max_inbound = self
-                .config
-                .accepted_connections_limit
-                .unwrap_or_default()
-                .hard_limit as usize;
-            let n2n_per_ip_limit: usize = 5; // matches Haskell maxAcceptedConnectionsPerHost default
+            let n2n_acl = self.config.accepted_connections_limit.unwrap_or_default();
+            let n2n_max_inbound = n2n_acl.hard_limit as usize;
+            // Graduated admission band: below soft_limit accept immediately;
+            // between soft and hard apply a delay ramping linearly to `delay`
+            // seconds. Matches Haskell AcceptedConnectionsLimit.
+            let n2n_soft_limit = (n2n_acl.soft_limit as usize).min(n2n_max_inbound);
+            let n2n_accept_delay = n2n_acl.delay.max(0.0);
+            // Per-IP concurrent-connection limit, now driven by the
+            // `PerIpRateLimitN2n` config field (default 5, matching Haskell
+            // maxAcceptedConnectionsPerHost) instead of a hardcoded constant.
+            let n2n_per_ip_limit: usize = self.config.per_ip_rate_limit_n2n;
 
             // The semaphore doubles as a backpressure signal: when all permits
             // are taken the accept() call still proceeds (we don't want to stop
@@ -4267,6 +4288,27 @@ impl Node {
                                             continue;
                                         }
                                     };
+
+                                    // Graduated admission delay (Haskell
+                                    // AcceptedConnectionsLimit / Ouroboros.Network.Server
+                                    // .RateLimiting): once the inbound count is in the
+                                    // [soft_limit, hard_limit) band, throttle the accept
+                                    // rate with a delay that ramps linearly from 0 (at soft)
+                                    // to `delay` seconds (at hard). hard_limit itself is
+                                    // still a hard cap (semaphore + ConnectionManager above).
+                                    if n2n_accept_delay > 0.0 && n2n_max_inbound > n2n_soft_limit {
+                                        let used = n2n_max_inbound
+                                            .saturating_sub(n2n_conn_semaphore.available_permits());
+                                        if used > n2n_soft_limit {
+                                            let frac = (used - n2n_soft_limit) as f64
+                                                / (n2n_max_inbound - n2n_soft_limit) as f64;
+                                            let delay_secs = n2n_accept_delay * frac.min(1.0);
+                                            tokio::time::sleep(
+                                                std::time::Duration::from_secs_f64(delay_secs),
+                                            )
+                                            .await;
+                                        }
+                                    }
 
                                     // A-007 (security audit 2026-05-19): downgrade to debug.
                                     // One INFO log per TCP SYN at 100 conn/s = ~50 KB/s of
@@ -4711,6 +4753,16 @@ impl Node {
 
         // ─── GSM (Genesis State Machine) ─────────────────────────────────
         let genesis_enabled = self.consensus_mode == "genesis";
+        // LoE/GDD master switch (LowLevelGenesisOptions.EnableLoEAndGDD,
+        // default true). Mirrors the construction-time gate so LoE enforcement
+        // and GDD disconnects are skipped when an operator disables them.
+        let loe_gdd_enabled = genesis_enabled
+            && self
+                .config
+                .low_level_genesis_options
+                .as_ref()
+                .map(|o| o.enable_loe_and_gdd)
+                .unwrap_or(true);
         if genesis_enabled {
             let gsm_state = self.gsm_snapshot_rx.borrow().state;
             info!(
@@ -4883,6 +4935,12 @@ impl Node {
                     target_warm_big_ledger: cfg.target_number_of_established_big_ledger_peers,
                     target_hot_big_ledger: cfg.target_number_of_active_big_ledger_peers,
                 },
+                // ChurnIntervalNormalSecs → deadline churn, ChurnIntervalSyncSecs
+                // → bulk-sync churn (selected by the governor's bulk-sync mode,
+                // driven from the at-tip signal below). Defaults 3300/900 match
+                // Haskell's deadline/bulk churn intervals.
+                hot_churn_interval: Duration::from_secs(cfg.churn_interval_normal_secs),
+                bulk_sync_churn_interval: Duration::from_secs(cfg.churn_interval_sync_secs),
                 ..Default::default()
             }
         };
@@ -5190,6 +5248,13 @@ impl Node {
                             target_warm_big_ledger: rt.target_number_of_established_big_ledger_peers,
                             target_hot_big_ledger: rt.target_number_of_active_big_ledger_peers,
                         });
+                        // Apply reloaded churn cadences (ChurnIntervalNormalSecs
+                        // / ChurnIntervalSyncSecs) so SIGHUP genuinely changes
+                        // governor behaviour rather than only reporting success.
+                        governor.update_churn_intervals(
+                            Duration::from_secs(rt.churn_interval_normal_secs),
+                            Duration::from_secs(rt.churn_interval_sync_secs),
+                        );
                         debug!(
                             active = rt.target_number_of_active_peers,
                             established = rt.target_number_of_established_peers,
@@ -5223,6 +5288,15 @@ impl Node {
                             .connection_lifecycle
                             .as_ref()
                             .and_then(|lc| lc.get_active_fetch_peer());
+                        // Drive hot-churn cadence from the catch-up signal:
+                        // bulk-syncing (behind tip) churns faster
+                        // (ChurnIntervalSyncSecs); caught-up uses
+                        // ChurnIntervalNormalSecs. Mirrors Haskell's
+                        // BulkSync/Deadline churn split.
+                        let at_tip = self
+                            .volatile_wal_sync_at_tip
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        governor.set_bulk_sync_mode(!at_tip);
                         governor.compute_actions_with_blp(
                             &pm.inner,
                             &local_root_targets,
@@ -5475,7 +5549,7 @@ impl Node {
                         Some(rx) => rx.recv().await,
                         None => std::future::pending().await,
                     }
-                } => {
+                }, if loe_gdd_enabled => {
                     warn!(%addr, "GDD: density too low — disconnecting peer");
                     self.metrics.record_gdd_disconnect();
                     let mut pm = peer_manager.write().await;
@@ -5537,7 +5611,7 @@ impl Node {
                             governor.update_targets(targets);
                         }
                     }
-                    if snap.loe_slot != last_seen_loe_slot {
+                    if loe_gdd_enabled && snap.loe_slot != last_seen_loe_slot {
                         last_seen_loe_slot = snap.loe_slot;
                         let handle = self.chain_sel_handle.clone();
                         if let Some(handle) = handle {
