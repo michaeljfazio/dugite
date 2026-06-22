@@ -396,6 +396,129 @@ const RPC_FIELDS: &[SubParamDef] = &[
     },
 ];
 
+/// Sub-fields for LowLevelGenesisOptions.
+///
+/// These match cardano-node's `LowLevelGenesisOptions` / `GenesisConfigFlags`
+/// exactly (field renames verified against `dugite-node/src/config.rs`).
+const LOW_LEVEL_GENESIS_OPTIONS_FIELDS: &[SubParamDef] = &[
+    SubParamDef {
+        key: "EnableCSJ",
+        param_type: ParamType::Bool,
+        default: "true",
+        description: "Enable ChainSync Jumping (CSJ). Allows the genesis sync protocol \
+                      to jump ahead using checkpoints rather than streaming every header.",
+        tuning_hint: "Keep enabled (default). Disabling forces header-by-header sync \
+                      which is much slower during Genesis bulk sync.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "EnableLoEAndGDD",
+        param_type: ParamType::Bool,
+        default: "true",
+        description: "Enable Limit on Eagerness (LoE) and Genesis Density Disconnection \
+                      (GDD). These enforce the core Genesis safety property: the node will \
+                      not adopt a chain that outpaces the density guarantee.",
+        tuning_hint: "Keep enabled (default). Disabling removes the primary Genesis \
+                      safety mechanism and allows eclipse attacks during sync.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "EnableLoP",
+        param_type: ParamType::Bool,
+        default: "true",
+        description: "Enable Limit on Patience (LoP) leaky bucket. Tracks per-peer \
+                      block-serving capacity and disconnects peers that serve too slowly.",
+        tuning_hint: "Keep enabled (default). Disabling allows stalled peers to block \
+                      the sync pipeline indefinitely.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "CSJJumpSize",
+        param_type: ParamType::U64 {
+            min: 1,
+            max: 100_000,
+        },
+        default: "4320",
+        description: "ChainSync Jump size in slots (default 4320 = 2 × Byron k=2160). \
+                      Controls how far ahead a CSJ dynamo peer can jump at once.",
+        tuning_hint: "4320 is the cardano-node default (twice the Byron security parameter). \
+                      Only change for private networks with different epoch/slot parameters.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "GDDRateLimit",
+        param_type: ParamType::F64 {
+            min: 0.0,
+            max: 3600.0,
+        },
+        default: "1.0",
+        description: "Minimum seconds between GDD (Genesis Density Disconnection) \
+                      evaluations. Controls how frequently the node checks whether \
+                      peers satisfy the density guarantee.",
+        tuning_hint: "1.0 s (default) matches cardano-node. Increasing reduces CPU at \
+                      the cost of slower detection of density-violating peers.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "BlockFetchGracePeriod",
+        param_type: ParamType::F64 {
+            min: 0.0,
+            max: 300.0,
+        },
+        default: "10.0",
+        description: "Seconds of block-fetch inactivity before rotating to the next \
+                      peer during Genesis bulk sync. Prevents a stalled fetcher from \
+                      blocking sync indefinitely.",
+        tuning_hint: "10 s (default) matches cardano-node. Lower values rotate peers \
+                      faster but may cause unnecessary churn on slow connections.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "BucketCapacity",
+        param_type: ParamType::U64 {
+            min: 1,
+            max: 10_000_000,
+        },
+        default: "100000",
+        description: "LoP leaky bucket capacity in tokens. Each peer starts with a full \
+                      bucket; tokens are consumed when the peer fails to deliver blocks \
+                      promptly and replenish over time at BucketRate.",
+        tuning_hint: "100000 (default) matches cardano-node. Lower values disconnect \
+                      slow peers sooner; higher values give more tolerance.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "BucketRate",
+        param_type: ParamType::U64 {
+            min: 1,
+            max: 1_000_000,
+        },
+        default: "500",
+        description: "LoP bucket replenishment rate in tokens per second. Higher values \
+                      give peers more forgiveness for occasional slow responses.",
+        tuning_hint: "500 (default) matches cardano-node. Adjust in proportion to \
+                      BucketCapacity when tuning patience.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "SnapshotMinIntervalBulkSync",
+        param_type: ParamType::F64 {
+            min: 0.0,
+            max: 86_400.0,
+        },
+        default: "1800.0",
+        description: "Minimum wall-clock seconds between epoch-boundary ledger snapshots \
+                      during Genesis bulk sync. Raising this reduces snapshot I/O \
+                      pressure during fast catch-up at the cost of a longer rollback \
+                      blast radius on unclean shutdown. Dugite-specific (not a \
+                      cardano-node key).",
+        tuning_hint: "1800 s (30 min, default) balances snapshot overhead against \
+                      restart recovery time. Lower to 300 s on fast NVMe hosts where \
+                      snapshot I/O is cheap.",
+        reloadability: Reloadability::Restart,
+    },
+];
+
 const STORAGE_FIELDS: &[SubParamDef] = &[
     SubParamDef {
         key: "profile",
@@ -503,9 +626,13 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
             values: &["RequiresNoMagic", "RequiresMagic"],
         },
         default: "RequiresMagic",
-        description: "Controls whether the network magic is enforced on peer handshakes. \
-                      Use 'RequiresMagic' for all non-mainnet deployments.",
-        tuning_hint: "Use 'RequiresMagic' for all testnets, 'RequiresNoMagic' for mainnet.",
+        description: "Accepted for cardano-node config-file compatibility; has NO runtime \
+                      effect in dugite (magic enforcement always uses the NetworkMagic field \
+                      directly). Use 'RequiresMagic' for testnets and 'RequiresNoMagic' \
+                      for mainnet to match the official config format.",
+        tuning_hint: "Use 'RequiresMagic' for all testnets, 'RequiresNoMagic' for mainnet. \
+                      This field is accepted but ignored by the dugite runtime — NetworkMagic \
+                      is the authoritative source for magic enforcement.",
         reloadability: Reloadability::Restart,
     },
     ParamDef {
@@ -547,14 +674,14 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         section: "Network",
         param_type: ParamType::Bool,
         default: "false",
-        description: "Enable peer sharing mini-protocol. When true, this node \
-                      advertises known peers to requesting peers. Automatically \
-                      disabled for block producers (when KES/VRF keys are provided) \
-                      and enabled for relays when not set explicitly. Setting this \
-                      field overrides the automatic detection.",
-        tuning_hint: "Leave unset to use the automatic default (enabled for relays, \
-                      disabled for block producers). Only set explicitly if you need \
-                      to override the detection.",
+        description: "Enable peer sharing mini-protocol. The real default is automatic: \
+                      enabled for relays, disabled for block producers (when KES/VRF keys \
+                      are provided). The schema default of 'false' is only used for display \
+                      purposes; omitting this key from the config file gives the auto \
+                      behaviour. Setting it explicitly overrides auto-detection.",
+        tuning_hint: "Leave this key absent from the config file to use auto-detection \
+                      (enabled for relays, disabled for block producers). Only set explicitly \
+                      when you need to force a specific value regardless of node role.",
         reloadability: Reloadability::Restart,
     },
     ParamDef {
@@ -733,6 +860,18 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       Only relevant when ConsensusMode is GenesisMode.",
         reloadability: Reloadability::Restart,
     },
+    ParamDef {
+        key: "MaxN2cConnections",
+        section: "Network",
+        param_type: ParamType::U64 { min: 1, max: 1024 },
+        default: "16",
+        description: "Maximum concurrent N2C (Unix socket) connections. Prevents a local \
+                      attacker or misbehaving wallet from accumulating unbounded connections \
+                      in the N2C accept loop.",
+        tuning_hint: "16 (default) is sufficient for almost all operators. Raise only if \
+                      many local tools (wallet backends, CLI scripts) connect simultaneously.",
+        reloadability: Reloadability::Restart,
+    },
     // --- Genesis section ---------------------------------------------------
     ParamDef {
         key: "ByronGenesisFile",
@@ -835,6 +974,63 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         tuning_hint: "Must exactly match the hash of the file at DijkstraGenesisFile.",
         reloadability: Reloadability::Restart,
     },
+    ParamDef {
+        key: "LowLevelGenesisOptions",
+        section: "Genesis",
+        param_type: ParamType::Object {
+            fields: LOW_LEVEL_GENESIS_OPTIONS_FIELDS,
+        },
+        default: "",
+        description: "Low-level Ouroboros Genesis tuning knobs (cardano-node \
+                      LowLevelGenesisOptions / GenesisConfigFlags). Only consulted \
+                      when ConsensusMode is 'Genesis'; in Praos mode all sub-fields \
+                      are ignored. Sub-fields: \
+                      'EnableCSJ' (bool, default true): ChainSync Jumping; \
+                      'EnableLoEAndGDD' (bool, default true): Limit on Eagerness + GDD; \
+                      'EnableLoP' (bool, default true): Limit on Patience leaky bucket; \
+                      'CSJJumpSize' (u64, default 4320): CSJ ahead-jump in slots; \
+                      'GDDRateLimit' (f64, default 1.0 s): GDD evaluation interval; \
+                      'BlockFetchGracePeriod' (f64, default 10.0 s): peer rotation timeout; \
+                      'BucketCapacity' (u64, default 100000): LoP bucket size in tokens; \
+                      'BucketRate' (u64, default 500): LoP refill rate (tokens/s); \
+                      'SnapshotMinIntervalBulkSync' (f64, default 1800.0 s): \
+                        minimum seconds between ledger snapshots during bulk sync (dugite-specific).",
+        tuning_hint: "Leave at defaults unless you are tuning Genesis sync performance. \
+                      The most impactful knob is SnapshotMinIntervalBulkSync: set to 300 s \
+                      on fast NVMe hosts to recover faster after unclean shutdown. \
+                      GDDRateLimit and BlockFetchGracePeriod control peer rotation \
+                      aggressiveness.",
+        reloadability: Reloadability::Restart,
+    },
+    ParamDef {
+        key: "CheckpointsFile",
+        section: "Genesis",
+        param_type: ParamType::Path,
+        default: "",
+        description: "Path to a lightweight-checkpoints JSON file \
+                      ({\"checkpoints\":[{\"blockNo\":N,\"hash\":hex},...]}). \
+                      Resolved relative to the config file's directory. When present, \
+                      the node enforces every listed checkpoint on header validation in \
+                      both Praos and Genesis consensus modes — a mismatch is fatal. \
+                      A hash mismatch with CheckpointsFileHash is also a fatal startup error.",
+        tuning_hint: "Leave empty unless you are using a known-good checkpoint list to \
+                      speed up or harden initial sync. A wrong checkpoint will prevent \
+                      the node from following the canonical chain.",
+        reloadability: Reloadability::Restart,
+    },
+    ParamDef {
+        key: "CheckpointsFileHash",
+        section: "Genesis",
+        param_type: ParamType::String,
+        default: "",
+        description: "Optional Blake2b-256 hex digest of the checkpoints file bytes. \
+                      If present, the node verifies this on startup and aborts if the \
+                      digest does not match — preventing accidental use of a corrupted \
+                      or wrong checkpoints file.",
+        tuning_hint: "Set alongside CheckpointsFile to get tamper-detection. Leave empty \
+                      when you do not want digest verification.",
+        reloadability: Reloadability::Restart,
+    },
     // --- Protocol section --------------------------------------------------
     ParamDef {
         key: "Protocol",
@@ -843,105 +1039,13 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
             values: &["Cardano", "TPraos", "Praos"],
         },
         default: "Cardano",
-        description: "Consensus protocol. 'Cardano' runs the full Hard Fork Combinator \
-                      covering all eras from Byron to Conway. 'TPraos' and 'Praos' are \
-                      single-era modes used only for isolated test networks.",
-        tuning_hint: "Always use 'Cardano' for mainnet and public testnets. \
-                      'TPraos'/'Praos' are for private devnet experiments only.",
-        reloadability: Reloadability::Restart,
-    },
-    ParamDef {
-        key: "TraceBlockFetchClient",
-        section: "Protocol",
-        param_type: ParamType::Bool,
-        default: "false",
-        description: "Emit detailed block-fetch client trace events. Useful for \
-                      diagnosing slow block propagation but very verbose at high sync rates.",
-        tuning_hint: "Enable only for debugging slow block propagation. \
-                      Increases log volume significantly; disable in production.",
-        reloadability: Reloadability::Restart,
-    },
-    ParamDef {
-        key: "TraceBlockFetchServer",
-        section: "Protocol",
-        param_type: ParamType::Bool,
-        default: "false",
-        description: "Emit detailed block-fetch server trace events (blocks served \
-                      to downstream peers).",
-        tuning_hint: "Enable only for debugging. Increases log volume significantly.",
-        reloadability: Reloadability::Restart,
-    },
-    ParamDef {
-        key: "TraceChainSyncClient",
-        section: "Protocol",
-        param_type: ParamType::Bool,
-        default: "false",
-        description: "Emit chain-sync client trace events (header fetch from upstream).",
-        tuning_hint: "Enable only for debugging chain-sync issues. \
-                      Very verbose during initial sync; keep off in production.",
-        reloadability: Reloadability::Restart,
-    },
-    ParamDef {
-        key: "TraceChainSyncHeaderServer",
-        section: "Protocol",
-        param_type: ParamType::Bool,
-        default: "false",
-        description: "Emit chain-sync header server trace events (headers served to \
-                      downstream peers).",
-        tuning_hint: "Enable only for debugging. Increases log volume significantly.",
-        reloadability: Reloadability::Restart,
-    },
-    ParamDef {
-        key: "TraceChainSyncBlockServer",
-        section: "Protocol",
-        param_type: ParamType::Bool,
-        default: "false",
-        description: "Emit chain-sync block server trace events.",
-        tuning_hint: "Enable only for debugging. Increases log volume significantly.",
-        reloadability: Reloadability::Restart,
-    },
-    ParamDef {
-        key: "TraceChainDb",
-        section: "Protocol",
-        param_type: ParamType::Bool,
-        default: "false",
-        description: "Emit ChainDB trace events (block storage, volatile/immutable flush, \
-                      rollback operations). Useful for diagnosing storage-layer issues.",
-        tuning_hint: "Enable to debug block storage problems or unexpected rollbacks. \
-                      Moderate log volume; safe to leave enabled in production if needed.",
-        reloadability: Reloadability::Restart,
-    },
-    ParamDef {
-        key: "TraceChainSyncServer",
-        section: "Protocol",
-        param_type: ParamType::Bool,
-        default: "false",
-        description: "Emit chain-sync server trace events (both header and block serving \
-                      to downstream N2N peers).",
-        tuning_hint: "Enable only for debugging downstream sync issues. \
-                      Increases log volume significantly under heavy peer load.",
-        reloadability: Reloadability::Restart,
-    },
-    ParamDef {
-        key: "TraceForge",
-        section: "Protocol",
-        param_type: ParamType::Bool,
-        default: "false",
-        description: "Emit block forging trace events (VRF leader check, block construction, \
-                      KES signing, block announcement). Essential for block producer debugging.",
-        tuning_hint: "Enable on block producers to diagnose missed slots or forging failures. \
-                      Low volume (one event per slot check); safe for production.",
-        reloadability: Reloadability::Restart,
-    },
-    ParamDef {
-        key: "TraceMempool",
-        section: "Protocol",
-        param_type: ParamType::Bool,
-        default: "false",
-        description: "Emit mempool trace events (transaction admission, rejection, removal \
-                      on block application, TTL expiry).",
-        tuning_hint: "Enable to debug transaction flow or mempool capacity issues. \
-                      Volume depends on transaction rate; moderate on mainnet.",
+        description: "Accepted for cardano-node config-file compatibility; has NO runtime \
+                      effect in dugite (dugite always runs the full Hard Fork Combinator \
+                      from Byron to Conway regardless of this value). Set to 'Cardano' \
+                      for mainnet/testnet compatibility with official node configs.",
+        tuning_hint: "Set to 'Cardano' to match official cardano-node configs. \
+                      This field is parsed but ignored by the dugite runtime — it exists \
+                      only to prevent JSON parse errors when loading official config files.",
         reloadability: Reloadability::Restart,
     },
     // --- Logging section ---------------------------------------------------
@@ -1000,76 +1104,29 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         section: "Logging",
         param_type: ParamType::Bool,
         default: "true",
-        description: "Enable the EKG / Prometheus metrics endpoint. When true, metrics \
-                      are published on port 12798 and can be scraped by Prometheus.",
+        description: "Enable the Prometheus metrics endpoint. When true, metrics \
+                      are published on MetricsPort and can be scraped by Prometheus. \
+                      Setting to false suppresses the endpoint regardless of MetricsPort.",
         tuning_hint: "Keep enabled. Disabling removes Prometheus scraping capability \
                       and breaks monitoring dashboards.",
-        reloadability: Reloadability::Restart,
-    },
-    ParamDef {
-        key: "TurnOnScripting",
-        section: "Logging",
-        param_type: ParamType::Bool,
-        default: "false",
-        description: "Enable scripted log routing (cardano-node legacy logging system). \
-                      Not applicable to Dugite's tracing-subscriber backend.",
-        tuning_hint: "Leave disabled for Dugite. This setting is a legacy flag \
-                      that has no effect on Dugite's tracing-subscriber backend.",
         reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "MetricsPort",
         section: "Logging",
         param_type: ParamType::U64 { min: 0, max: 65535 },
-        default: "12798",
-        description: "TCP port for the Prometheus metrics endpoint. Set to 0 to disable \
-                      the metrics server entirely. The CLI flag --metrics-port takes \
-                      precedence over this config value; --no-metrics forces port to 0.",
-        tuning_hint: "12798 (default) matches cardano-node. Change only if the port \
-                      conflicts with another service. Set to 0 in hardened environments \
-                      where metrics scraping is not needed.",
+        default: "12796",
+        description: "TCP port for the Prometheus metrics endpoint. Dugite's default is \
+                      12796 (deliberately offset from cardano-node's 12798 so both can \
+                      run side-by-side without a port clash). Set to 0 to disable the \
+                      metrics server entirely. The CLI flag --metrics-port takes \
+                      precedence; --no-metrics forces port to 0.",
+        tuning_hint: "12796 is the dugite default (not 12798). Change only if the port \
+                      conflicts with another service or to match cardano-node's 12798 for \
+                      a unified Prometheus scrape config. Set to 0 in hardened environments.",
         reloadability: Reloadability::Restart,
     },
     // --- Advanced section --------------------------------------------------
-    ParamDef {
-        key: "MaxConcurrencyBulkSync",
-        section: "Advanced",
-        param_type: ParamType::U64 { min: 1, max: 64 },
-        default: "2",
-        description: "Maximum number of parallel block-fetch workers during bulk \
-                      (catch-up) sync. Higher values saturate bandwidth faster at the \
-                      cost of higher memory usage.",
-        tuning_hint: "4-8 on fast hardware/NVMe with ample RAM. \
-                      Lower to 2 if memory is constrained below 8 GB.",
-        reloadability: Reloadability::Restart,
-    },
-    ParamDef {
-        key: "MaxConcurrencyDeadline",
-        section: "Advanced",
-        param_type: ParamType::U64 { min: 1, max: 32 },
-        default: "4",
-        description: "Maximum number of parallel block-fetch workers when near the tip \
-                      (deadline mode). Lower than bulk to reduce latency jitter.",
-        tuning_hint: "Keep lower than MaxConcurrencyBulkSync. \
-                      2-4 is optimal; higher values add latency jitter near tip.",
-        reloadability: Reloadability::Restart,
-    },
-    ParamDef {
-        key: "SnapshotInterval",
-        section: "Advanced",
-        param_type: ParamType::U64 {
-            min: 0,
-            max: 86_400,
-        },
-        default: "72",
-        description: "Interval in minutes between ledger state snapshots. \
-                      Snapshots allow faster restart after an unclean shutdown. \
-                      0 disables periodic snapshotting (not recommended).",
-        tuning_hint: "72 minutes (default) matches the Haskell node. \
-                      Never set to 0 in production — recovery from an unclean \
-                      shutdown will require a full replay from genesis.",
-        reloadability: Reloadability::Restart,
-    },
     ParamDef {
         key: "ExperimentalHardForksEnabled",
         section: "Advanced",
@@ -1112,30 +1169,6 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       unresponsive peers. Default 900 s (15 minutes) matches cardano-node.",
         tuning_hint: "Keep below 15 minutes to shed unresponsive peers during catch-up. \
                       Lower values improve sync speed at the cost of more connection churn.",
-        reloadability: Reloadability::Hot,
-    },
-    ParamDef {
-        key: "StallDemotionCycles",
-        section: "Advanced",
-        param_type: ParamType::U64 { min: 1, max: 100 },
-        default: "6",
-        description: "Number of consecutive governor evaluation cycles (each ~30 s) in \
-                      which a hot peer must serve zero new blocks before it is demoted \
-                      back to warm. Default of 6 cycles = 3 minutes of inactivity.",
-        tuning_hint: "Increase if hot peers legitimately produce zero blocks for extended \
-                      periods (e.g., low-stake pools). Decrease for aggressive stall detection.",
-        reloadability: Reloadability::Hot,
-    },
-    ParamDef {
-        key: "ErrorDemotionThreshold",
-        section: "Advanced",
-        param_type: ParamType::U64 { min: 1, max: 100 },
-        default: "5",
-        description: "Failure count threshold above which a hot peer is unconditionally \
-                      demoted to warm during each governor evaluation cycle. Local root \
-                      peers are exempt from this check.",
-        tuning_hint: "Lower to aggressively shed failing peers. Raise if peers are being \
-                      demoted too frequently due to transient network issues.",
         reloadability: Reloadability::Hot,
     },
     ParamDef {
@@ -1439,32 +1472,18 @@ pub fn network_defaults(network: Network) -> serde_json::Map<String, serde_json:
 
     // Protocol.
     map.insert("Protocol".into(), json!("Cardano"));
-    map.insert("TraceBlockFetchClient".into(), json!(false));
-    map.insert("TraceBlockFetchServer".into(), json!(false));
-    map.insert("TraceChainSyncClient".into(), json!(false));
-    map.insert("TraceChainSyncHeaderServer".into(), json!(false));
-    map.insert("TraceChainSyncBlockServer".into(), json!(false));
-    map.insert("TraceChainDb".into(), json!(false));
-    map.insert("TraceChainSyncServer".into(), json!(false));
-    map.insert("TraceForge".into(), json!(false));
-    map.insert("TraceMempool".into(), json!(false));
 
     // Logging.
     map.insert("MinSeverity".into(), json!("Info"));
     // LogDirective is optional — omit from defaults so SIGHUP is a no-op unless set.
     map.insert("TurnOnLogMetrics".into(), json!(true));
-    map.insert("TurnOnScripting".into(), json!(false));
-    map.insert("MetricsPort".into(), json!(12798));
+    // MetricsPort: dugite default is 12796 (offset from cardano-node's 12798 to avoid clash).
+    map.insert("MetricsPort".into(), json!(12796));
 
     // Advanced.
-    map.insert("MaxConcurrencyBulkSync".into(), json!(2));
-    map.insert("MaxConcurrencyDeadline".into(), json!(4));
-    map.insert("SnapshotInterval".into(), json!(72));
     map.insert("ExperimentalHardForksEnabled".into(), json!(false));
     map.insert("ChurnIntervalNormalSecs".into(), json!(3300));
     map.insert("ChurnIntervalSyncSecs".into(), json!(900));
-    map.insert("StallDemotionCycles".into(), json!(6));
-    map.insert("ErrorDemotionThreshold".into(), json!(5));
 
     // Connection management (fractional seconds, matching Haskell DiffTime).
     map.insert("ProtocolIdleTimeout".into(), json!(5));
@@ -1579,11 +1598,11 @@ mod tests {
 
         // U64 default parses to JSON number.
         let v = lookup
-            .get("MaxConcurrencyBulkSync")
+            .get("TargetNumberOfActivePeers")
             .unwrap()
             .default_as_json()
             .unwrap();
-        assert_eq!(v, Value::Number(2.into()));
+        assert_eq!(v, Value::Number(20.into()));
 
         // String default parses to JSON string (even when empty).
         let v = lookup
@@ -1949,11 +1968,16 @@ mod tests {
 
     #[test]
     fn test_known_params_count() {
-        // We expect at least 45 known parameters (audit baseline: 43 before
-        // this change; +3 new: LogDirective, AcceptedConnectionsLimit, Storage).
+        // Baseline after config-wiring audit (2026-06-21):
+        //   removed 15 orphan/dead keys (9 Trace*, TurnOnScripting,
+        //   MaxConcurrencyBulkSync, MaxConcurrencyDeadline, SnapshotInterval,
+        //   StallDemotionCycles, ErrorDemotionThreshold)
+        //   added 4 wired keys (MaxN2cConnections, LowLevelGenesisOptions,
+        //   CheckpointsFile, CheckpointsFileHash)
+        // net: 62 - 15 + 4 = 51
         assert!(
-            KNOWN_PARAMS.len() >= 45,
-            "Expected >= 45 known params, got {}",
+            KNOWN_PARAMS.len() >= 48,
+            "Expected >= 48 known params, got {}",
             KNOWN_PARAMS.len()
         );
     }

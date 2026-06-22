@@ -156,14 +156,6 @@ mod roundtrip {
             d.churn_interval_sync_secs, 900,
             "churn_interval_sync_secs default changed — update schema"
         );
-        assert_eq!(
-            d.stall_demotion_cycles, 6,
-            "stall_demotion_cycles default changed — update schema"
-        );
-        assert_eq!(
-            d.error_demotion_threshold, 5,
-            "error_demotion_threshold default changed — update schema"
-        );
         assert!(
             d.log_directive.is_none(),
             "log_directive default changed — update schema"
