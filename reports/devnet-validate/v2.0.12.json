@@ -1,0 +1,210 @@
+{
+  "schema_version": 1,
+  "timestamp": "2026-06-22T05:13:18Z",
+  "git_rev": "f20581844f11784b6a2aecb652c0483896005c13",
+  "release_tag": "v2.0.12",
+  "preset": "standard",
+  "cardano_node_version": "11.0.1",
+  "cardano_cli_version": "11.0.0.0",
+  "rounds": [
+    {
+      "name": "baseline",
+      "pass": true,
+      "evidence_dir": "evidence/20260622T044101Z",
+      "duration_seconds": 120,
+      "git_rev": "f20581844f11784b6a2aecb652c0483896005c13",
+      "cardano_node_version": "11.0.1",
+      "cardano_cli_version": "11.0.0.0",
+      "blocks": {
+        "total_forges": 71,
+        "canonical": 61,
+        "orphans": 10,
+        "orphan_rate": 0.1408
+      },
+      "tip_age": {
+        "avg_seconds": 1.48,
+        "p99_seconds": 4.0
+      },
+      "chain_density": 0.592,
+      "tx_zoo": {
+        "pass": 81,
+        "fail": 0,
+        "skip": 3,
+        "total": 84
+      },
+      "predicates": {
+        "p1_forge_cross_check": true,
+        "p2_per_bp_attribution": true,
+        "p3_tx_inclusion": null,
+        "p4_tip_parity": true,
+        "p5_tip_age": true
+      },
+      "log_errors": {
+        "dugite-bp": {"errors": 0, "warns": 2},
+        "dugite-relay": {"errors": 0, "warns": 37},
+        "cardano-bp": {"errors": 0, "warns": 0}
+      },
+      "anomalies": [],
+      "epoch_transitions_observed": 0,
+      "bidirectional_parity": {
+        "offdiag_rows": 0,
+        "scripts_tested": 19,
+        "pass": true
+      },
+      "n2n_adversarial": {
+        "pass": 0,
+        "fail": 0,
+        "panic": 0,
+        "silent_skip": 0
+      },
+      "cli_parity": {
+        "equal": 0,
+        "divergent": 0,
+        "skip": 0,
+        "error": 0
+      },
+      "cardano_bp_invalid_blocks": 0,
+      "health_probe": "HEALTHY",
+      "notes": "tx-zoo 81/84 PASS (3 SKIP: no-rewards, cli-dedupes-inputs, socat-not-found). bidirectional-parity: 0 OFFDIAG. health-probe HEALTHY both probes. analyze-evidence NO ANOMALIES."
+    },
+    {
+      "name": "epoch-boundary",
+      "pass": true,
+      "evidence_dir": "evidence/20260622T044742Z",
+      "duration_seconds": 900,
+      "git_rev": "f20581844f11784b6a2aecb652c0483896005c13",
+      "cardano_node_version": "11.0.1",
+      "cardano_cli_version": "11.0.0.0",
+      "blocks": {
+        "total_forges": 410,
+        "canonical": 393,
+        "orphans": 17,
+        "orphan_rate": 0.0415
+      },
+      "tip_age": {
+        "avg_seconds": 1.02,
+        "p99_seconds": 5.0
+      },
+      "chain_density": 0.507,
+      "tx_zoo": {
+        "pass": 0,
+        "fail": 0,
+        "skip": 0,
+        "total": 0
+      },
+      "predicates": {
+        "p1_forge_cross_check": true,
+        "p2_per_bp_attribution": true,
+        "p3_tx_inclusion": true,
+        "p4_tip_parity": true,
+        "p5_tip_age": true
+      },
+      "log_errors": {
+        "dugite-bp": {"errors": 0, "warns": 0},
+        "dugite-relay": {"errors": 0, "warns": 0},
+        "cardano-bp": {"errors": 0, "warns": 0}
+      },
+      "anomalies": [],
+      "epoch_transitions_observed": 2,
+      "pot_parity": {
+        "epoch": 2,
+        "dugite_treasury_lovelace": 3563997508658,
+        "dugite_reserves_lovelace": 5996430007854633,
+        "haskell_treasury_lovelace": 3563997508658,
+        "haskell_reserves_lovelace": 5996430007854633,
+        "byte_exact_match": true,
+        "rupd_applied": true
+      },
+      "n2n_adversarial": {
+        "pass": 0,
+        "fail": 0,
+        "panic": 0,
+        "silent_skip": 0
+      },
+      "cli_parity": {
+        "equal": 0,
+        "divergent": 0,
+        "skip": 0,
+        "error": 0
+      },
+      "cardano_bp_invalid_blocks": 0,
+      "health_probe": "HEALTHY",
+      "notes": "Boundaries 0->1 and 1->2 both crossed (epoch=2 at slot 824). treasury=3563997508658 reserves=5996430007854633 BYTE-EXACT vs Haskell. RUPD applied (treasury>0). 30 txs submitted, 23 accepted/7 rejected, all 3 nodes agree. chain density=0.507 (target 0.5). NO ANOMALIES."
+    },
+    {
+      "name": "restart",
+      "pass": true,
+      "evidence_dir": "evidence/20260622T050927Z",
+      "duration_seconds": 60,
+      "git_rev": "f20581844f11784b6a2aecb652c0483896005c13",
+      "cardano_node_version": "11.0.1",
+      "cardano_cli_version": "11.0.0.0",
+      "blocks": {
+        "total_forges": 26,
+        "canonical": 16,
+        "orphans": 10,
+        "orphan_rate": 0.3846
+      },
+      "tip_age": {
+        "avg_seconds": 1.08,
+        "p99_seconds": 3.0
+      },
+      "chain_density": 0.448,
+      "tx_zoo": {
+        "pass": 0,
+        "fail": 0,
+        "skip": 0,
+        "total": 0
+      },
+      "predicates": {
+        "p1_forge_cross_check": true,
+        "p2_per_bp_attribution": true,
+        "p3_tx_inclusion": null,
+        "p4_tip_parity": true,
+        "p5_tip_age": null
+      },
+      "log_errors": {
+        "dugite-bp": {"errors": 0, "warns": 5},
+        "dugite-relay": {"errors": 0, "warns": 3},
+        "cardano-bp": {"errors": 0, "warns": 0}
+      },
+      "anomalies": [],
+      "epoch_transitions_observed": 2,
+      "restart_resilience": {
+        "tip_before": 46,
+        "tip_after": 138,
+        "tip_advanced": true,
+        "tip_delta": 92,
+        "stale_intersection_warnings": 0,
+        "tip_age_seconds_post_restart": 0,
+        "health_probe_60s_post_restart": "HEALTHY"
+      },
+      "n2n_adversarial": {
+        "pass": 0,
+        "fail": 0,
+        "panic": 0,
+        "silent_skip": 0
+      },
+      "cli_parity": {
+        "equal": 0,
+        "divergent": 0,
+        "skip": 0,
+        "error": 0
+      },
+      "cardano_bp_invalid_blocks": 0,
+      "health_probe": "HEALTHY",
+      "notes": "TIP_BEFORE=46 TIP_AFTER=138 (advanced +92 blocks). tip_age_seconds=0 immediately after restart. 0 stale-intersection warnings. p1/p2/p4 PASS; p3/p5 SKIP (soak too short). Chain density=0.448 (within ±0.2 of 0.5). NO ANOMALIES."
+    }
+  ],
+  "summary": {
+    "pass": true,
+    "rounds_pass": 3,
+    "rounds_fail": 0,
+    "total_canonical_blocks": 470,
+    "total_tx_zoo_pass": 81,
+    "total_tx_zoo_fail": 0,
+    "invalid_forges_detected": 0,
+    "critical_anomalies": 0
+  },
+  "trend": null
+}
