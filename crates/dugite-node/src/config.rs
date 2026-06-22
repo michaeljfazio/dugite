@@ -393,7 +393,13 @@ pub struct NodeConfig {
     #[serde(default)]
     pub peer_sharing: Option<bool>,
 
-    /// Target number of root peers (default: 60, matching cardano-node)
+    /// Target number of root peers (default: 60, matching cardano-node).
+    ///
+    /// Validated at startup and exported as a Prometheus gauge. Note: dugite's
+    /// governor maintains root-peer connectivity via per-local-root-group
+    /// warm/hot valency (`LocalRootGroupTarget`) rather than this aggregate
+    /// target, so changing it affects validation/metrics, not the per-group
+    /// connection policy.
     #[serde(default = "default_root_peers")]
     pub target_number_of_root_peers: usize,
 
@@ -417,7 +423,12 @@ pub struct NodeConfig {
     #[serde(default = "default_established_big_ledger_peers")]
     pub target_number_of_established_big_ledger_peers: usize,
 
-    /// Target number of known big ledger peers (default: 15, matching cardano-node)
+    /// Target number of known big ledger peers (default: 15, matching cardano-node).
+    ///
+    /// Validated at startup and exported as a Prometheus gauge. Note: dugite
+    /// caps the known peer set as a whole via `target_number_of_known_peers`
+    /// (`max_cold`) and does not enforce a separate known-big-ledger-peer cap —
+    /// BLPs are scarce and selectively forgetting them would harm Genesis sync.
     #[serde(default = "default_known_big_ledger_peers")]
     pub target_number_of_known_big_ledger_peers: usize,
 
@@ -449,9 +460,21 @@ pub struct NodeConfig {
     /// `--metrics-port` takes precedence over this field; the CLI flag
     /// `--no-metrics` forces the port to 0 regardless of this value.
     /// If neither the CLI flag nor this field is present the node falls back
-    /// to 12798, matching cardano-node's default.
+    /// to 12796 (deliberately offset from cardano-node's 12798 so a dugite
+    /// node can run alongside a cardano-node without a Prometheus port clash).
     #[serde(default)]
     pub metrics_port: Option<u16>,
+
+    /// Master switch for the Prometheus metrics endpoint, matching
+    /// cardano-node's `TurnOnLogMetrics`.
+    ///
+    /// When `false`, the metrics server is not started regardless of
+    /// `MetricsPort` — equivalent to setting the port to 0. An explicit
+    /// `--metrics-port` CLI flag still wins (operator override), but the
+    /// config-file `MetricsPort` does not re-enable a server disabled here.
+    /// Defaults to `true` so existing configs keep metrics on.
+    #[serde(default = "default_turn_on_log_metrics")]
+    pub turn_on_log_metrics: bool,
 
     /// Storage configuration (optional overrides for storage profiles)
     #[serde(default)]
@@ -480,20 +503,6 @@ pub struct NodeConfig {
     /// unresponsive peers.  Matches cardano-node default of 900 s (15 minutes).
     #[serde(default = "default_churn_interval_sync_secs")]
     pub churn_interval_sync_secs: u64,
-
-    /// Number of consecutive governor evaluation cycles in which a hot peer
-    /// must serve zero new blocks before it is demoted back to warm (stall
-    /// detection).  A cycle runs every 30 seconds, so the default of 6 cycles
-    /// corresponds to a 3-minute stall window.
-    #[serde(default = "default_stall_demotion_cycles")]
-    pub stall_demotion_cycles: u32,
-
-    /// Failure count threshold above which a hot peer is unconditionally
-    /// demoted to warm during each governor evaluation cycle.  Local root
-    /// peers are exempt from this check and will never be demoted by the
-    /// governor.  Default: 5 failures.
-    #[serde(default = "default_error_demotion_threshold")]
-    pub error_demotion_threshold: u32,
 
     /// Enable experimental hard fork transitions (default: false).
     ///
@@ -559,25 +568,32 @@ pub struct NodeConfig {
     /// Inbound connection limits (hard/soft/delay).
     #[serde(default)]
     pub accepted_connections_limit: Option<AcceptedConnectionsLimit>,
-    /// Time before idle mini-protocol connection is pruned (seconds, default: 5).
+    /// Idle mini-protocol prune timeout (seconds).
     ///
-    /// Accepts fractional seconds, matching Haskell's `DiffTime` type.
+    /// Accepted for cardano-node config-file compatibility but NOT currently
+    /// enforced: dugite prunes idle connections via the connection manager's
+    /// own tuned `INBOUND_IDLE_TIMEOUT` (300 s), and mini-protocol lifetimes
+    /// are governed by the per-protocol drivers. Reserved for a future release.
     #[serde(default = "default_protocol_idle_timeout")]
     pub protocol_idle_timeout: f64,
-    /// Connection TIME_WAIT duration after close (seconds, default: 60).
+    /// Connection TIME_WAIT duration after close (seconds).
     ///
-    /// Accepts fractional seconds, matching Haskell's `DiffTime` type.
+    /// Accepted for cardano-node config-file compatibility but NOT currently
+    /// enforced (dugite relies on the OS TCP TIME_WAIT). Reserved.
     #[serde(default = "default_time_wait_timeout")]
     pub time_wait_timeout: f64,
-    /// Outbound governor poll interval (seconds, default: 0).
+    /// Outbound governor poll interval (seconds).
     ///
-    /// 0 means the governor runs as fast as events arrive (Haskell default).
-    /// Accepts fractional seconds, matching Haskell's `DiffTime` type.
+    /// Accepted for cardano-node config-file compatibility but NOT currently
+    /// enforced: the governor runs on a fixed, tuned 2 s tick. Reserved.
     #[serde(default = "default_egress_poll_interval")]
     pub egress_poll_interval: f64,
-    /// ChainSync-specific idle timeout (seconds, 0 = no timeout).
+    /// ChainSync-specific idle timeout (seconds).
     ///
-    /// Accepts fractional seconds, matching Haskell's `DiffTime` type.
+    /// Accepted for cardano-node config-file compatibility but NOT currently
+    /// enforced: dugite uses a randomized timeout between Haskell's
+    /// `minChainSyncTimeout` / `maxChainSyncTimeout` bounds (a fixed override
+    /// would defeat that). Reserved for a future release.
     #[serde(default)]
     pub chain_sync_idle_timeout: Option<f64>,
 
@@ -589,9 +605,8 @@ pub struct NodeConfig {
     /// `connectionRateLimit`.  Prevents a single source IP from exhausting all
     /// inbound connection slots with stalled half-open connections.
     ///
-    /// Note: this config field was previously defined in `ConnectionManagerConfig`
-    /// in `dugite-network` but was never wired into the accept loop.  This is the
-    /// authoritative config field going forward.
+    /// Wired into the N2N accept loop as the per-IP concurrent-connection limit
+    /// (the `ConnectionManager` `per_ip_rate_limit`).
     #[serde(default = "default_per_ip_rate_limit_n2n")]
     pub per_ip_rate_limit_n2n: usize,
 
@@ -727,14 +742,6 @@ fn default_churn_interval_sync_secs() -> u64 {
     900 // 15 minutes, matching cardano-node
 }
 
-fn default_stall_demotion_cycles() -> u32 {
-    6 // 6 × 30 s = 3 minutes of inactivity triggers demotion
-}
-
-fn default_error_demotion_threshold() -> u32 {
-    5 // 5 accumulated failures triggers demotion
-}
-
 fn default_hard_limit() -> u32 {
     512
 }
@@ -790,6 +797,12 @@ fn default_egress_poll_interval() -> f64 {
 
 fn default_min_severity() -> String {
     "Info".to_string()
+}
+
+/// Metrics are enabled by default (matches the prior behaviour where the
+/// endpoint was gated only by the port).
+fn default_turn_on_log_metrics() -> bool {
+    true
 }
 
 fn default_requires_network_magic() -> String {
@@ -1121,12 +1134,11 @@ impl Default for NodeConfig {
             min_severity: "Info".to_string(),
             log_directive: None,
             metrics_port: None,
+            turn_on_log_metrics: default_turn_on_log_metrics(),
             storage: None,
             rpc: None,
             churn_interval_normal_secs: default_churn_interval_normal_secs(),
             churn_interval_sync_secs: default_churn_interval_sync_secs(),
-            stall_demotion_cycles: default_stall_demotion_cycles(),
-            error_demotion_threshold: default_error_demotion_threshold(),
             experimental_hard_forks_enabled: false,
             consensus_mode: ConsensusMode::default(),
             low_level_genesis_options: None,

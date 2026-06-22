@@ -322,6 +322,39 @@ fn build_filter(level: &str) -> EnvFilter {
     EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level))
 }
 
+/// Translate a cardano-node syslog-style `MinSeverity` value into the bare
+/// `tracing_subscriber::EnvFilter` level token it corresponds to.
+///
+/// cardano-node's `MinSeverity` vocabulary is the `iohk-monitoring` `Severity`
+/// enum — `Debug`/`Info`/`Notice`/`Warning`/`Error`/`Critical`/`Alert`/
+/// `Emergency`. `tracing` only has `trace`/`debug`/`info`/`warn`/`error`, so
+/// the finer syslog levels collapse: `Notice → info`, and
+/// `Critical`/`Alert`/`Emergency → error`.
+///
+/// **Why this exists:** `MinSeverity` values were previously handed verbatim to
+/// `EnvFilter`. Only `Debug`/`Info`/`Error` happen to coincide with EnvFilter
+/// level tokens; `Notice`/`Warning`/`Critical`/`Alert`/`Emergency` are *not*
+/// valid level tokens, so EnvFilter silently reinterpreted e.g. `"Warning"` as
+/// a per-target directive `Warning=trace` — the *opposite* of the operator's
+/// intent. This helper maps every `MinSeverity` value to a valid global level.
+///
+/// Values that are already valid `tracing` tokens (`trace`/`debug`/`info`/
+/// `warn`/`error`/`off`) pass through (case-insensitively). Anything
+/// unrecognised falls back to `info`. Operators needing per-target control
+/// (e.g. `dugite_network=debug`) should use `LogDirective`, which is passed to
+/// `EnvFilter` unchanged.
+pub fn min_severity_to_directive(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "trace" => "trace",
+        "debug" => "debug",
+        "info" | "notice" => "info",
+        "warn" | "warning" => "warn",
+        "error" | "critical" | "alert" | "emergency" => "error",
+        "off" => "off",
+        _ => "info",
+    }
+}
+
 /// Check if stdout is a terminal (for auto-detecting color support).
 fn atty_stdout() -> bool {
     std::io::IsTerminal::is_terminal(&std::io::stdout())
@@ -708,5 +741,47 @@ mod tests {
             err.to_string().contains("Invalid log directive"),
             "expected 'Invalid log directive' wrapper, got: {err}"
         );
+    }
+
+    /// Every cardano-node `MinSeverity` value must translate to a bare,
+    /// *global* EnvFilter level — never a per-target directive. Before the fix,
+    /// `Warning`/`Notice`/`Critical`/`Alert`/`Emergency` were silently parsed
+    /// by EnvFilter as a bogus target at TRACE level, inverting the operator's
+    /// intent. This asserts the translation collapses every syslog value to a
+    /// valid global level whose `max_level_hint` matches expectations.
+    #[test]
+    fn test_min_severity_to_directive_maps_all_syslog_values() {
+        use tracing::level_filters::LevelFilter;
+        // (MinSeverity input, expected translated token, expected global level)
+        let cases = [
+            ("Debug", "debug", LevelFilter::DEBUG),
+            ("Info", "info", LevelFilter::INFO),
+            ("Notice", "info", LevelFilter::INFO),
+            ("Warning", "warn", LevelFilter::WARN),
+            ("Error", "error", LevelFilter::ERROR),
+            ("Critical", "error", LevelFilter::ERROR),
+            ("Alert", "error", LevelFilter::ERROR),
+            ("Emergency", "error", LevelFilter::ERROR),
+            // Case-insensitivity + already-valid tracing tokens pass through.
+            ("warning", "warn", LevelFilter::WARN),
+            ("TRACE", "trace", LevelFilter::TRACE),
+            ("off", "off", LevelFilter::OFF),
+            // Unrecognised → safe default.
+            ("nonsense", "info", LevelFilter::INFO),
+        ];
+        for (input, expected_token, expected_level) in cases {
+            let token = min_severity_to_directive(input);
+            assert_eq!(token, expected_token, "translation of {input:?}");
+            // The translated token must parse as a *global* level: EnvFilter's
+            // max_level_hint equals the level, not TRACE-via-bogus-target.
+            let filter = EnvFilter::try_new(token)
+                .unwrap_or_else(|e| panic!("{input:?}→{token:?} must be valid EnvFilter: {e}"));
+            assert_eq!(
+                filter.max_level_hint(),
+                Some(expected_level),
+                "{input:?}→{token:?} should set global level {expected_level:?}, \
+                 not be reinterpreted as a per-target TRACE directive"
+            );
+        }
     }
 }

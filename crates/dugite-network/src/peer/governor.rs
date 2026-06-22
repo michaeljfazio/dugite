@@ -69,8 +69,19 @@ impl Default for PeerTargets {
 pub struct GovernorConfig {
     /// Peer count targets.
     pub targets: PeerTargets,
-    /// Minimum interval between hot churn rotations (demote worst hot, promote best warm).
+    /// Minimum interval between hot churn rotations (demote worst hot, promote
+    /// best warm) while the node is caught up — the *deadline* churn cadence.
+    ///
+    /// Maps to Haskell `defaultDeadlineChurnInterval = 3300 s` (55 min). Used
+    /// whenever the governor is not in bulk-sync mode (see [`Governor::set_bulk_sync_mode`]).
     pub hot_churn_interval: Duration,
+    /// Minimum interval between hot churn rotations while the node is bulk
+    /// syncing (behind the network tip) — the faster *bulk-sync* churn cadence
+    /// that sheds slow peers quickly during catch-up.
+    ///
+    /// Maps to Haskell `defaultBulkChurnInterval = 900 s` (15 min). Selected
+    /// over [`hot_churn_interval`] only while [`Governor::bulk_sync_mode`] is set.
+    pub bulk_sync_churn_interval: Duration,
     /// Minimum interval between cold churn sweeps (forget lowest-reputation cold peers).
     pub cold_churn_interval: Duration,
     /// Minimum interval between warm churn rotations (demote worst warm, promote best cold).
@@ -97,7 +108,8 @@ impl Default for GovernorConfig {
             // determinism; #703 fix B adds jitter via inbound maturation.
             // Previously this was 600 s — 5.5× more aggressive than Haskell,
             // contributing to the demote-promote-demote loop in #703.
-            hot_churn_interval: Duration::from_secs(3300), // 55 minutes (Haskell default)
+            hot_churn_interval: Duration::from_secs(3300), // 55 minutes (Haskell deadline default)
+            bulk_sync_churn_interval: Duration::from_secs(900), // 15 minutes (Haskell bulk-sync default)
             cold_churn_interval: Duration::from_secs(900),
             warm_churn_interval: Duration::from_secs(600),
             // 5 minutes — matches Haskell's `policyPeerShareActivationDelay`.
@@ -185,6 +197,12 @@ pub struct Governor {
     /// the Cold→Warm reconnect path that the `#516` single-use-channel
     /// workaround forces.
     recently_demoted: HashMap<SocketAddr, Instant>,
+    /// When `true`, hot churn uses [`GovernorConfig::bulk_sync_churn_interval`]
+    /// (faster) instead of [`GovernorConfig::hot_churn_interval`]. Set by the
+    /// node from its at-tip signal: bulk-syncing (behind tip) → `true`,
+    /// caught-up → `false`. Mirrors the Haskell `FetchMode` BulkSync/Deadline
+    /// churn-cadence split.
+    bulk_sync_mode: bool,
 }
 
 impl Governor {
@@ -199,6 +217,7 @@ impl Governor {
             in_progress_promote_cold: HashSet::new(),
             in_progress_promote_warm: HashSet::new(),
             recently_demoted: HashMap::new(),
+            bulk_sync_mode: false,
         }
     }
 
@@ -238,6 +257,34 @@ impl Governor {
     /// retroactive effect on in-flight promotions.
     pub fn update_targets(&mut self, new_targets: PeerTargets) {
         self.config.targets = new_targets;
+    }
+
+    /// Update the hot-churn cadences from a live config reload (SIGHUP).
+    ///
+    /// `deadline` is the caught-up cadence (`ChurnIntervalNormalSecs`,
+    /// Haskell `defaultDeadlineChurnInterval`); `bulk_sync` is the catch-up
+    /// cadence (`ChurnIntervalSyncSecs`, Haskell `defaultBulkChurnInterval`).
+    /// Takes effect on the next churn evaluation; in-flight timers are not reset.
+    pub fn update_churn_intervals(&mut self, deadline: Duration, bulk_sync: Duration) {
+        self.config.hot_churn_interval = deadline;
+        self.config.bulk_sync_churn_interval = bulk_sync;
+    }
+
+    /// Switch the hot-churn cadence between bulk-sync (catch-up) and deadline
+    /// (caught-up). The node drives this from its at-tip signal so that, while
+    /// catching up, slow hot peers are rotated out faster — matching the
+    /// Haskell `FetchMode` BulkSync/Deadline churn split.
+    pub fn set_bulk_sync_mode(&mut self, on: bool) {
+        self.bulk_sync_mode = on;
+    }
+
+    /// The hot-churn interval currently in effect (bulk-sync vs deadline).
+    fn effective_hot_churn_interval(&self) -> Duration {
+        if self.bulk_sync_mode {
+            self.config.bulk_sync_churn_interval
+        } else {
+            self.config.hot_churn_interval
+        }
     }
 
     /// Signal that a cold→warm promotion has completed (succeeded or failed).
@@ -735,7 +782,9 @@ impl Governor {
         // ── Hot churn ───────────────────────────────────────────────────
         // Periodically rotate one hot peer to keep the active set fresh.
         // Uses scoring to demote the worst hot peer and promote the best warm.
-        if self.last_hot_churn.elapsed() >= self.config.hot_churn_interval && hot_count > 1 {
+        // The cadence is faster while bulk-syncing (catch-up) than when caught
+        // up, mirroring Haskell's BulkSync vs Deadline churn intervals.
+        if self.last_hot_churn.elapsed() >= self.effective_hot_churn_interval() && hot_count > 1 {
             if let Some(churn_out) = select_worst_hot(peer_manager) {
                 actions.push(GovernorAction::DemoteToWarm(churn_out));
                 self.record_demote(churn_out, now);
@@ -834,6 +883,7 @@ mod tests {
                 ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             warm_churn_interval: Duration::from_secs(3600),
             demote_cooldown: Duration::from_secs(3600),
@@ -874,6 +924,7 @@ mod tests {
                 ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             warm_churn_interval: Duration::from_secs(3600),
             demote_cooldown: Duration::from_secs(3600),
@@ -911,6 +962,7 @@ mod tests {
                 ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             warm_churn_interval: Duration::from_secs(3600),
             demote_cooldown: Duration::from_secs(3600),
@@ -923,6 +975,38 @@ mod tests {
             .filter(|a| matches!(a, GovernorAction::PromoteToHot(_)))
             .count();
         assert_eq!(promote_hot_count, 3);
+    }
+
+    /// Bulk-sync mode must select the faster bulk churn cadence; deadline mode
+    /// the slower one. SIGHUP `update_churn_intervals` must update both.
+    /// Mirrors Haskell's `defaultBulkChurnInterval` / `defaultDeadlineChurnInterval`.
+    #[test]
+    fn bulk_sync_mode_selects_bulk_churn_interval() {
+        let config = GovernorConfig {
+            hot_churn_interval: Duration::from_secs(3300),
+            bulk_sync_churn_interval: Duration::from_secs(900),
+            ..Default::default()
+        };
+        let mut gov = Governor::new(config);
+        // Default = caught-up → deadline cadence.
+        assert_eq!(
+            gov.effective_hot_churn_interval(),
+            Duration::from_secs(3300)
+        );
+        // Bulk-syncing → faster cadence.
+        gov.set_bulk_sync_mode(true);
+        assert_eq!(gov.effective_hot_churn_interval(), Duration::from_secs(900));
+        // Back to caught-up.
+        gov.set_bulk_sync_mode(false);
+        assert_eq!(
+            gov.effective_hot_churn_interval(),
+            Duration::from_secs(3300)
+        );
+        // SIGHUP reload updates both cadences.
+        gov.update_churn_intervals(Duration::from_secs(100), Duration::from_secs(50));
+        assert_eq!(gov.effective_hot_churn_interval(), Duration::from_secs(100));
+        gov.set_bulk_sync_mode(true);
+        assert_eq!(gov.effective_hot_churn_interval(), Duration::from_secs(50));
     }
 
     /// #703 fix C: production defaults must match Haskell
@@ -963,6 +1047,7 @@ mod tests {
                 ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             warm_churn_interval: Duration::from_secs(3600),
             demote_cooldown: Duration::from_secs(3600),
@@ -989,6 +1074,7 @@ mod tests {
                 ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             warm_churn_interval: Duration::from_secs(3600),
             demote_cooldown: Duration::from_secs(3600),
@@ -1026,6 +1112,7 @@ mod tests {
                 ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             // Trigger cold churn immediately.
             cold_churn_interval: Duration::ZERO,
             warm_churn_interval: Duration::from_secs(3600),
@@ -1075,6 +1162,7 @@ mod tests {
                 ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             // Trigger warm churn immediately.
             warm_churn_interval: Duration::ZERO,
@@ -1114,6 +1202,7 @@ mod tests {
                 ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             warm_churn_interval: Duration::ZERO,
             demote_cooldown: Duration::from_secs(3600),
@@ -1148,6 +1237,7 @@ mod tests {
                 ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             warm_churn_interval: Duration::from_secs(3600),
             demote_cooldown: Duration::from_secs(3600),
@@ -1180,6 +1270,7 @@ mod tests {
                 ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             warm_churn_interval: Duration::from_secs(3600),
             demote_cooldown: Duration::from_secs(3600),
@@ -1224,6 +1315,7 @@ mod tests {
             },
             // Trigger hot churn immediately.
             hot_churn_interval: Duration::ZERO,
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             warm_churn_interval: Duration::from_secs(3600),
             demote_cooldown: Duration::from_secs(3600),
@@ -1277,6 +1369,7 @@ mod tests {
                 ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             warm_churn_interval: Duration::from_secs(3600),
             demote_cooldown: Duration::from_secs(3600),
@@ -1321,6 +1414,7 @@ mod tests {
                 ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             warm_churn_interval: Duration::from_secs(3600),
             demote_cooldown: Duration::from_secs(3600),
@@ -1360,6 +1454,7 @@ mod tests {
                 ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             warm_churn_interval: Duration::ZERO,
             demote_cooldown: Duration::from_secs(3600),
@@ -1419,6 +1514,7 @@ mod tests {
                 ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             warm_churn_interval: Duration::from_secs(3600),
             demote_cooldown: Duration::from_secs(3600),
@@ -1473,6 +1569,7 @@ mod tests {
                 ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             warm_churn_interval: Duration::from_secs(3600),
             demote_cooldown: Duration::from_secs(3600),
@@ -1534,6 +1631,7 @@ mod tests {
                 ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             warm_churn_interval: Duration::from_secs(3600),
             demote_cooldown: Duration::from_secs(3600),
@@ -1587,6 +1685,7 @@ mod tests {
                 ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             warm_churn_interval: Duration::from_secs(3600),
             demote_cooldown: Duration::from_secs(3600),
@@ -1657,6 +1756,7 @@ mod tests {
                 ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             warm_churn_interval: Duration::from_secs(3600),
             demote_cooldown: Duration::from_secs(3600),
@@ -1741,6 +1841,7 @@ mod tests {
                 ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             warm_churn_interval: Duration::from_secs(3600),
             demote_cooldown: Duration::from_secs(3600),
@@ -1797,6 +1898,7 @@ mod tests {
                 target_hot_big_ledger: 0,
             },
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             warm_churn_interval: Duration::from_secs(3600),
             demote_cooldown: Duration::from_secs(3600),
@@ -1851,6 +1953,7 @@ mod tests {
                 target_hot_big_ledger: 2,
             },
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             warm_churn_interval: Duration::from_secs(3600),
             demote_cooldown: Duration::from_secs(3600),
@@ -1900,6 +2003,7 @@ mod tests {
                 target_hot_big_ledger: 5,
             },
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             warm_churn_interval: Duration::from_secs(3600),
             demote_cooldown: Duration::from_secs(3600),
@@ -1994,6 +2098,7 @@ mod tests {
             },
             // Long intervals so timer-gated churn doesn't fire mid-test.
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             warm_churn_interval: Duration::from_secs(3600),
             demote_cooldown: Duration::from_secs(3600),
@@ -2060,6 +2165,7 @@ mod tests {
                 target_hot_big_ledger: 5,
             },
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             warm_churn_interval: Duration::from_secs(3600),
             // Cooldown is what stops the flap.
@@ -2180,6 +2286,7 @@ mod tests {
                 target_hot_big_ledger: 5,
             },
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             warm_churn_interval: Duration::from_secs(3600),
             demote_cooldown: Duration::from_secs(3600),
@@ -2245,6 +2352,7 @@ mod tests {
                 target_hot_big_ledger: 0,
             },
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             warm_churn_interval: Duration::from_secs(3600),
             demote_cooldown: Duration::from_secs(300),
@@ -2343,6 +2451,7 @@ mod tests {
             },
             // Long enough that timer-gated churn never fires in this test.
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             warm_churn_interval: Duration::from_secs(3600),
             demote_cooldown: Duration::from_secs(300),
@@ -2427,6 +2536,7 @@ mod tests {
                 ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             warm_churn_interval: Duration::from_secs(3600),
             demote_cooldown: Duration::from_secs(3600),
@@ -2479,6 +2589,7 @@ mod tests {
                 ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             warm_churn_interval: Duration::from_secs(3600),
             demote_cooldown: Duration::from_secs(3600),
@@ -2532,6 +2643,7 @@ mod tests {
                 ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             warm_churn_interval: Duration::from_secs(3600),
             demote_cooldown: Duration::from_secs(3600),
