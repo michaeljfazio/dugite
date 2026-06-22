@@ -5498,6 +5498,7 @@ mod tests {
                 ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             warm_churn_interval: Duration::from_secs(3600),
             demote_cooldown: Duration::from_secs(3600),
@@ -5542,6 +5543,7 @@ mod tests {
                 ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
             warm_churn_interval: Duration::from_secs(3600),
             demote_cooldown: Duration::from_secs(3600),
