@@ -169,6 +169,29 @@ pub struct LedgerDelta {
     /// model → V3 script_data_hash divergence; `deposits_proposal: 0`). Same
     /// fork-reconstruction class as the reward-account fix.
     pub gov_snapshot: Option<GovSubState>,
+
+    /// Post-block snapshot of the per-pool block-production counter
+    /// (`consensus.epoch_blocks_by_pool`, `Arc<HashMap>` so the clone is O(1)).
+    ///
+    /// Unlike the other consensus scalars, this map is reconstructed during
+    /// `apply_delta_to_state` via an INCREMENT (`block_fields.pool_block_increment`
+    /// → `+= 1`), not an absolute assignment. An increment cannot recover blocks
+    /// that were applied to the live `LedgerState` through a NO-DELTA path
+    /// (gap-bridge advance in `handle_rollback_inner`, LSM/chunk replay,
+    /// startup recovery) — those mutate `self.consensus.epoch_blocks_by_pool`
+    /// directly but never push a `LedgerDelta`, leaving a hole in the delta
+    /// chain. On the next `rollback_via_seq` (`self.consensus =
+    /// seq.tip_state().consensus`) the reconstructed count is then SHORT by the
+    /// number of hole blocks, silently under-counting `BlocksMade`. That drifts
+    /// `eta = blocksMade / expectedBlocks` → `deltaR1 = floor(eta·rho·reserves)`
+    /// too low → reserves drained too little + per-account reward skew (#763 —
+    /// the bidirectional per-pool drift seen vs Koios, invisible to offline
+    /// replay which has no holes). The absolute snapshot is authoritative and
+    /// gap-robust, exactly mirroring the `reward_accounts`/`gov`/`pool_params`
+    /// snapshot restores. `None` on deltas that did not change the map
+    /// (overlay/Byron blocks) or non-`apply_block_with_delta` paths — then
+    /// reconstruction carries the previous map forward (correct, unchanged).
+    pub epoch_blocks_by_pool_snapshot: Option<Arc<HashMap<Hash28, u64>>>,
 }
 
 impl LedgerDelta {
@@ -193,6 +216,7 @@ impl LedgerDelta {
             pending_retirements_snapshot: None,
             pool_deposits_snapshot: None,
             gov_snapshot: None,
+            epoch_blocks_by_pool_snapshot: None,
         }
     }
 }
@@ -906,6 +930,21 @@ pub fn apply_delta_to_state(state: &mut LedgerState, delta: &LedgerDelta) {
     // ── 7. Per-block scalar / nonce updates ───────────────────────────────────
     apply_block_fields(state, &delta.block_fields);
 
+    // ── 7b. Absolute restore of the per-pool block counter ────────────────────
+    //
+    // Authoritative override of the `pool_block_increment` reconstruction in
+    // `apply_block_fields`. The increment cannot recover blocks applied through
+    // a no-delta path (gap-bridge advance, LSM/chunk replay, startup recovery)
+    // that mutated `self.consensus.epoch_blocks_by_pool` without pushing a
+    // delta, so increment-only reconstruction under-counts `BlocksMade` and
+    // drifts reserves/rewards (#763). When present, the post-block snapshot is
+    // exact and gap-robust. MUST run AFTER step 6 (epoch transition clears the
+    // map) and AFTER step 7 (the increment) so it has the final say. See the
+    // field docs on `LedgerDelta::epoch_blocks_by_pool_snapshot`.
+    if let Some(eb) = &delta.epoch_blocks_by_pool_snapshot {
+        state.consensus.epoch_blocks_by_pool = Arc::clone(eb);
+    }
+
     // Update tip to reflect this block.
     state.tip = dugite_primitives::block::Tip {
         point: dugite_primitives::block::Point::Specific(delta.slot, delta.hash),
@@ -1443,6 +1482,80 @@ mod tests {
             Some(Lovelace(0)),
             "after rollback the balance must be the per-block snapshot (0, \
              withdrawn), NOT the stale anchor value (100)"
+        );
+    }
+
+    /// Regression for #763: the per-pool block counter must be reconstructed
+    /// from the absolute per-block snapshot, NOT only the `pool_block_increment`.
+    ///
+    /// The live node applies some blocks through NO-DELTA paths (gap-bridge
+    /// advance in `handle_rollback_inner`, LSM/chunk replay, startup recovery):
+    /// those mutate `self.consensus.epoch_blocks_by_pool` directly but push no
+    /// `LedgerDelta`, leaving a hole in the delta chain. The subsequent delta's
+    /// `pool_block_increment` only adds +1, so increment-only reconstruction
+    /// under-counts `BlocksMade` by the number of hole blocks. That short count
+    /// then drifts `eta = blocksMade/expectedBlocks` → expansion → reserves and
+    /// per-account rewards (the bidirectional Koios drift; halted preview ep1335
+    /// with `WithdrawalAmountMismatch` +26). The absolute snapshot is exact.
+    #[test]
+    fn reconstruct_block_counter_from_absolute_snapshot_not_just_increment() {
+        let pool = Hash28::from_bytes([0xCD; 28]);
+
+        // Anchor counted 5 blocks for this pool.
+        let mut anchor = make_anchor();
+        Arc::make_mut(&mut anchor.consensus.epoch_blocks_by_pool).insert(pool, 5);
+        let mut seq = LedgerSeq::with_defaults(anchor, 2160);
+
+        // A gap-bridge advanced the LIVE state to count 40 blocks for this pool,
+        // but pushed NO deltas for the 34 hole blocks. The next real block (the
+        // ONLY delta the seq sees) carries pool_block_increment=Some (it would
+        // reconstruct to just 5+1=6) but ALSO the absolute post-block snapshot
+        // {pool: 40} that the live apply path captures.
+        let mut d = make_delta(10, 0x10, 0);
+        d.block_fields.pool_block_increment = Some(pool);
+        let mut counts = HashMap::new();
+        counts.insert(pool, 40u64);
+        d.epoch_blocks_by_pool_snapshot = Some(Arc::new(counts));
+        seq.push(d);
+
+        // Increment-only reconstruction would give 6 (the #763 under-count).
+        // The absolute snapshot must win: 40.
+        assert_eq!(
+            seq.tip_state()
+                .consensus
+                .epoch_blocks_by_pool
+                .get(&pool)
+                .copied(),
+            Some(40),
+            "block counter must be restored from the absolute snapshot (40), \
+             NOT the increment-only reconstruction (6) that loses no-delta \
+             (gap-bridge/replay) blocks — #763"
+        );
+    }
+
+    /// Deltas WITHOUT a snapshot (e.g. overlay/Byron blocks that counted
+    /// nothing, or non-`apply_block_with_delta` fixtures) must fall back to the
+    /// `pool_block_increment` reconstruction and carry the map forward.
+    #[test]
+    fn block_counter_increment_fallback_when_no_snapshot() {
+        let pool = Hash28::from_bytes([0xEF; 28]);
+        let mut anchor = make_anchor();
+        Arc::make_mut(&mut anchor.consensus.epoch_blocks_by_pool).insert(pool, 7);
+        let mut seq = LedgerSeq::with_defaults(anchor, 2160);
+
+        // No snapshot, just an increment → 7 + 1 = 8.
+        let mut d = make_delta(10, 0x10, 0);
+        d.block_fields.pool_block_increment = Some(pool);
+        seq.push(d);
+
+        assert_eq!(
+            seq.tip_state()
+                .consensus
+                .epoch_blocks_by_pool
+                .get(&pool)
+                .copied(),
+            Some(8),
+            "without a snapshot the increment fallback must apply (7+1=8)"
         );
     }
 
