@@ -1108,26 +1108,6 @@ impl Node {
                 Vec::new()
             };
 
-        // Validate Byron genesis hash if configured (parity with
-        // Alonzo/Conway/Dijkstra, which already bail on mismatch). Previously
-        // the configured ByronGenesisHash silently overrode the computed file
-        // hash with no comparison, so pointing ByronGenesisFile at the wrong
-        // file went undetected.
-        if let Some(ref expected_hex) = args.config.byron_genesis_hash {
-            if let Ok(expected) = dugite_primitives::hash::Hash32::from_hex(expected_hex) {
-                if let Some(ref actual) = byron_genesis_file_hash {
-                    if *actual != expected {
-                        anyhow::bail!(
-                            "Byron genesis hash mismatch: expected {}, got {}",
-                            expected.to_hex(),
-                            actual.to_hex()
-                        );
-                    }
-                    debug!("Byron genesis hash validated: {}", expected.to_hex());
-                }
-            }
-        }
-
         // Open ChainDB with the security parameter k from Byron genesis.
         // Uses default epoch parameters (epoch 0, length 432000) since era_history
         // isn't built yet. The active chunk gets correctly named at the first
@@ -1161,24 +1141,6 @@ impl Node {
             } else {
                 (None, None)
             };
-
-        // Validate Shelley genesis hash if configured (parity with
-        // Alonzo/Conway/Dijkstra). Previously the configured ShelleyGenesisHash
-        // silently overrode the computed file hash with no comparison.
-        if let Some(ref expected_hex) = args.config.shelley_genesis_hash {
-            if let Ok(expected) = dugite_primitives::hash::Hash32::from_hex(expected_hex) {
-                if let Some(ref actual) = shelley_genesis_hash {
-                    if *actual != expected {
-                        anyhow::bail!(
-                            "Shelley genesis hash mismatch: expected {}, got {}",
-                            expected.to_hex(),
-                            actual.to_hex()
-                        );
-                    }
-                    debug!("Shelley genesis hash validated: {}", expected.to_hex());
-                }
-            }
-        }
 
         // Load Alonzo genesis if configured (with hash validation)
         let mut alonzo_genesis_file_hash: Option<dugite_primitives::hash::Hash32> = None;
@@ -5158,32 +5120,6 @@ impl Node {
                     // exactly like Haskell.
                     if let Some(ref lc) = self.connection_lifecycle {
                         lc.chainsel_dequeued();
-                    }
-                    // Genesis-block validation (wrong-network guard).
-                    //
-                    // When syncing from genesis (empty DB → genesis_validated is
-                    // false), the first block must match the configured
-                    // Byron/Shelley genesis hash. A mismatch means the peer is
-                    // serving a different chain — abort rather than build on it.
-                    // `validate_genesis_blocks` no-ops for non-genesis blocks, and
-                    // genesis_validated is already true when resuming from an
-                    // existing DB / Mithril snapshot, so this only bites a real
-                    // from-genesis mismatch. NetworkMagic guards at the handshake;
-                    // this is the in-band defence-in-depth that was previously
-                    // dead (only the unreachable process_forward_blocks called it).
-                    if !self.genesis_validated {
-                        if let Err(e) =
-                            self.validate_genesis_blocks(std::slice::from_ref(&fetched.block))
-                        {
-                            tracing::error!(
-                                peer = %fetched.peer,
-                                "GENESIS BLOCK MISMATCH — refusing to sync a chain that \
-                                 does not match the configured genesis. Verify you are \
-                                 connecting to the correct network. {e}"
-                            );
-                            return Err(e);
-                        }
-                        self.genesis_validated = true;
                     }
                     self.apply_fetched_block(fetched).await;
                     // Cross-block Phase-2 pooling flush: drain the deferred window
