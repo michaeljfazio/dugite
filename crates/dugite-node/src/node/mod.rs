@@ -2393,11 +2393,18 @@ impl Node {
             syncing_startup_threshold_secs,
             ..Default::default()
         };
+        // LoE/GDD master switch (LowLevelGenesisOptions.EnableLoEAndGDD,
+        // default true). Genesis mode normally runs LoE (Limit on Eagerness)
+        // + GDD (Genesis Density Disconnect); an operator may explicitly
+        // disable both via EnableLoEAndGDD=false, in which case chain
+        // selection is unconstrained by LoE and no density disconnects fire
+        // (CSJ / LoP / GSM state tracking remain active). Default-neutral.
+        let loe_gdd_enabled = genesis_enabled && genesis_params.options.enable_loe_and_gdd;
         // The LoE handed to chain selection. Initial value mirrors Haskell's
         // pre-setGetLoEFragment conservative default: in genesis mode an
         // empty fragment anchored at the current immutable tip (≤ k blocks
-        // of selection freedom); in praos mode Disabled (identity).
-        let initial_loe = if genesis_enabled {
+        // of selection freedom); in praos mode (or LoE/GDD disabled) Disabled.
+        let initial_loe = if loe_gdd_enabled {
             let db = chain_db
                 .try_read()
                 .expect("ChainDB lock available during startup");
@@ -2450,7 +2457,7 @@ impl Node {
                 .try_write()
                 .expect("ChainDB lock available during startup");
             db.set_loe_handle(loe_out.clone());
-            if genesis_enabled {
+            if loe_gdd_enabled {
                 // Haskell initial-chain-selection k-cap (LoE enabled): never
                 // boot onto a >k-deep selection rebuilt from the volatile WAL
                 // — it may contain an adversarial chain the LoE was deferring
@@ -4784,6 +4791,16 @@ impl Node {
 
         // ─── GSM (Genesis State Machine) ─────────────────────────────────
         let genesis_enabled = self.consensus_mode == "genesis";
+        // LoE/GDD master switch (LowLevelGenesisOptions.EnableLoEAndGDD,
+        // default true). Mirrors the construction-time gate so LoE enforcement
+        // and GDD disconnects are skipped when an operator disables them.
+        let loe_gdd_enabled = genesis_enabled
+            && self
+                .config
+                .low_level_genesis_options
+                .as_ref()
+                .map(|o| o.enable_loe_and_gdd)
+                .unwrap_or(true);
         if genesis_enabled {
             let gsm_state = self.gsm_snapshot_rx.borrow().state;
             info!(
@@ -5596,7 +5613,7 @@ impl Node {
                         Some(rx) => rx.recv().await,
                         None => std::future::pending().await,
                     }
-                } => {
+                }, if loe_gdd_enabled => {
                     warn!(%addr, "GDD: density too low — disconnecting peer");
                     self.metrics.record_gdd_disconnect();
                     let mut pm = peer_manager.write().await;
@@ -5658,7 +5675,7 @@ impl Node {
                             governor.update_targets(targets);
                         }
                     }
-                    if snap.loe_slot != last_seen_loe_slot {
+                    if loe_gdd_enabled && snap.loe_slot != last_seen_loe_slot {
                         last_seen_loe_slot = snap.loe_slot;
                         let handle = self.chain_sel_handle.clone();
                         if let Some(handle) = handle {
