@@ -3929,19 +3929,28 @@ impl Node {
 
                             // ── Step 4: apply hot-reloadable fields ───────────────
                             //
-                            // Log directive / min severity (preserves existing #473 behaviour)
+                            // Log directive / min severity (preserves existing #473 behaviour).
+                            //
+                            // `LogDirective` is full EnvFilter syntax and is applied verbatim.
+                            // `MinSeverity` is a cardano-node syslog severity and MUST be
+                            // translated to a valid tracing level — handing it raw to EnvFilter
+                            // silently mis-parses Notice/Warning/Critical/Alert/Emergency into a
+                            // bogus per-target TRACE directive.
                             if let Some(handle) = log_handle.as_ref() {
-                                let directive = new_config
-                                    .log_directive
-                                    .as_deref()
-                                    .unwrap_or(&new_config.min_severity);
-                                match handle.reload(directive) {
+                                let directive: String =
+                                    new_config.log_directive.clone().unwrap_or_else(|| {
+                                        crate::logging::min_severity_to_directive(
+                                            &new_config.min_severity,
+                                        )
+                                        .to_string()
+                                    });
+                                match handle.reload(&directive) {
                                     Ok(()) => info!(
-                                        directive,
+                                        directive = %directive,
                                         "config_reload: log directive applied"
                                     ),
                                     Err(e) => warn!(
-                                        directive,
+                                        directive = %directive,
                                         "config_reload: failed to apply log directive: {e}"
                                     ),
                                 }
