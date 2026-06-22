@@ -110,7 +110,9 @@ pub fn validate_genesis_blocks(
 
 impl Node {
     /// Validate genesis blocks against expected hashes from the configuration.
-    #[allow(dead_code)] // retained for networking rewrite
+    ///
+    /// Called from the block-ingestion path on the first block of a
+    /// from-genesis sync (see `genesis_validated` in the run loop).
     pub(crate) fn validate_genesis_blocks(
         &self,
         blocks: &[dugite_primitives::block::Block],
