@@ -4201,12 +4201,17 @@ impl Node {
             // Haskell `cardano-node` enforces limits in `Server.run` via
             // `ConnectionLimits` (maxAcceptedConnections + maxAcceptedConnectionsPerHost)
             // acquired before the TCP fd enters the handshake pipeline.
-            let n2n_max_inbound = self
-                .config
-                .accepted_connections_limit
-                .unwrap_or_default()
-                .hard_limit as usize;
-            let n2n_per_ip_limit: usize = 5; // matches Haskell maxAcceptedConnectionsPerHost default
+            let n2n_acl = self.config.accepted_connections_limit.unwrap_or_default();
+            let n2n_max_inbound = n2n_acl.hard_limit as usize;
+            // Graduated admission band: below soft_limit accept immediately;
+            // between soft and hard apply a delay ramping linearly to `delay`
+            // seconds. Matches Haskell AcceptedConnectionsLimit.
+            let n2n_soft_limit = (n2n_acl.soft_limit as usize).min(n2n_max_inbound);
+            let n2n_accept_delay = n2n_acl.delay.max(0.0);
+            // Per-IP concurrent-connection limit, now driven by the
+            // `PerIpRateLimitN2n` config field (default 5, matching Haskell
+            // maxAcceptedConnectionsPerHost) instead of a hardcoded constant.
+            let n2n_per_ip_limit: usize = self.config.per_ip_rate_limit_n2n;
 
             // The semaphore doubles as a backpressure signal: when all permits
             // are taken the accept() call still proceeds (we don't want to stop
@@ -4314,6 +4319,27 @@ impl Node {
                                             continue;
                                         }
                                     };
+
+                                    // Graduated admission delay (Haskell
+                                    // AcceptedConnectionsLimit / Ouroboros.Network.Server
+                                    // .RateLimiting): once the inbound count is in the
+                                    // [soft_limit, hard_limit) band, throttle the accept
+                                    // rate with a delay that ramps linearly from 0 (at soft)
+                                    // to `delay` seconds (at hard). hard_limit itself is
+                                    // still a hard cap (semaphore + ConnectionManager above).
+                                    if n2n_accept_delay > 0.0 && n2n_max_inbound > n2n_soft_limit {
+                                        let used = n2n_max_inbound
+                                            .saturating_sub(n2n_conn_semaphore.available_permits());
+                                        if used > n2n_soft_limit {
+                                            let frac = (used - n2n_soft_limit) as f64
+                                                / (n2n_max_inbound - n2n_soft_limit) as f64;
+                                            let delay_secs = n2n_accept_delay * frac.min(1.0);
+                                            tokio::time::sleep(
+                                                std::time::Duration::from_secs_f64(delay_secs),
+                                            )
+                                            .await;
+                                        }
+                                    }
 
                                     // A-007 (security audit 2026-05-19): downgrade to debug.
                                     // One INFO log per TCP SYN at 100 conn/s = ~50 KB/s of
