@@ -1654,7 +1654,9 @@ async fn run_node(args: RunArgs, log_handle: Option<logging::LogHandle>) -> Resu
                 logging::min_severity_to_directive(&node_config.min_severity).to_string()
             });
             match handle.reload(&directive) {
-                Ok(()) => info!(directive = %directive, "Applied config-file log verbosity at startup"),
+                Ok(()) => {
+                    info!(directive = %directive, "Applied config-file log verbosity at startup")
+                }
                 Err(e) => tracing::warn!(
                     directive = %directive,
                     "Failed to apply config-file log verbosity: {e}"
