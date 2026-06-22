@@ -393,7 +393,13 @@ pub struct NodeConfig {
     #[serde(default)]
     pub peer_sharing: Option<bool>,
 
-    /// Target number of root peers (default: 60, matching cardano-node)
+    /// Target number of root peers (default: 60, matching cardano-node).
+    ///
+    /// Validated at startup and exported as a Prometheus gauge. Note: dugite's
+    /// governor maintains root-peer connectivity via per-local-root-group
+    /// warm/hot valency (`LocalRootGroupTarget`) rather than this aggregate
+    /// target, so changing it affects validation/metrics, not the per-group
+    /// connection policy.
     #[serde(default = "default_root_peers")]
     pub target_number_of_root_peers: usize,
 
@@ -417,7 +423,12 @@ pub struct NodeConfig {
     #[serde(default = "default_established_big_ledger_peers")]
     pub target_number_of_established_big_ledger_peers: usize,
 
-    /// Target number of known big ledger peers (default: 15, matching cardano-node)
+    /// Target number of known big ledger peers (default: 15, matching cardano-node).
+    ///
+    /// Validated at startup and exported as a Prometheus gauge. Note: dugite
+    /// caps the known peer set as a whole via `target_number_of_known_peers`
+    /// (`max_cold`) and does not enforce a separate known-big-ledger-peer cap —
+    /// BLPs are scarce and selectively forgetting them would harm Genesis sync.
     #[serde(default = "default_known_big_ledger_peers")]
     pub target_number_of_known_big_ledger_peers: usize,
 
@@ -557,25 +568,32 @@ pub struct NodeConfig {
     /// Inbound connection limits (hard/soft/delay).
     #[serde(default)]
     pub accepted_connections_limit: Option<AcceptedConnectionsLimit>,
-    /// Time before idle mini-protocol connection is pruned (seconds, default: 5).
+    /// Idle mini-protocol prune timeout (seconds).
     ///
-    /// Accepts fractional seconds, matching Haskell's `DiffTime` type.
+    /// Accepted for cardano-node config-file compatibility but NOT currently
+    /// enforced: dugite prunes idle connections via the connection manager's
+    /// own tuned `INBOUND_IDLE_TIMEOUT` (300 s), and mini-protocol lifetimes
+    /// are governed by the per-protocol drivers. Reserved for a future release.
     #[serde(default = "default_protocol_idle_timeout")]
     pub protocol_idle_timeout: f64,
-    /// Connection TIME_WAIT duration after close (seconds, default: 60).
+    /// Connection TIME_WAIT duration after close (seconds).
     ///
-    /// Accepts fractional seconds, matching Haskell's `DiffTime` type.
+    /// Accepted for cardano-node config-file compatibility but NOT currently
+    /// enforced (dugite relies on the OS TCP TIME_WAIT). Reserved.
     #[serde(default = "default_time_wait_timeout")]
     pub time_wait_timeout: f64,
-    /// Outbound governor poll interval (seconds, default: 0).
+    /// Outbound governor poll interval (seconds).
     ///
-    /// 0 means the governor runs as fast as events arrive (Haskell default).
-    /// Accepts fractional seconds, matching Haskell's `DiffTime` type.
+    /// Accepted for cardano-node config-file compatibility but NOT currently
+    /// enforced: the governor runs on a fixed, tuned 2 s tick. Reserved.
     #[serde(default = "default_egress_poll_interval")]
     pub egress_poll_interval: f64,
-    /// ChainSync-specific idle timeout (seconds, 0 = no timeout).
+    /// ChainSync-specific idle timeout (seconds).
     ///
-    /// Accepts fractional seconds, matching Haskell's `DiffTime` type.
+    /// Accepted for cardano-node config-file compatibility but NOT currently
+    /// enforced: dugite uses a randomized timeout between Haskell's
+    /// `minChainSyncTimeout` / `maxChainSyncTimeout` bounds (a fixed override
+    /// would defeat that). Reserved for a future release.
     #[serde(default)]
     pub chain_sync_idle_timeout: Option<f64>,
 
