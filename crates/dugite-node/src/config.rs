@@ -493,20 +493,6 @@ pub struct NodeConfig {
     #[serde(default = "default_churn_interval_sync_secs")]
     pub churn_interval_sync_secs: u64,
 
-    /// Number of consecutive governor evaluation cycles in which a hot peer
-    /// must serve zero new blocks before it is demoted back to warm (stall
-    /// detection).  A cycle runs every 30 seconds, so the default of 6 cycles
-    /// corresponds to a 3-minute stall window.
-    #[serde(default = "default_stall_demotion_cycles")]
-    pub stall_demotion_cycles: u32,
-
-    /// Failure count threshold above which a hot peer is unconditionally
-    /// demoted to warm during each governor evaluation cycle.  Local root
-    /// peers are exempt from this check and will never be demoted by the
-    /// governor.  Default: 5 failures.
-    #[serde(default = "default_error_demotion_threshold")]
-    pub error_demotion_threshold: u32,
-
     /// Enable experimental hard fork transitions (default: false).
     ///
     /// When true, the node signals `ProtVer 11 0` in forged block headers,
@@ -737,14 +723,6 @@ fn default_churn_interval_normal_secs() -> u64 {
 
 fn default_churn_interval_sync_secs() -> u64 {
     900 // 15 minutes, matching cardano-node
-}
-
-fn default_stall_demotion_cycles() -> u32 {
-    6 // 6 × 30 s = 3 minutes of inactivity triggers demotion
-}
-
-fn default_error_demotion_threshold() -> u32 {
-    5 // 5 accumulated failures triggers demotion
 }
 
 fn default_hard_limit() -> u32 {
@@ -1144,8 +1122,6 @@ impl Default for NodeConfig {
             rpc: None,
             churn_interval_normal_secs: default_churn_interval_normal_secs(),
             churn_interval_sync_secs: default_churn_interval_sync_secs(),
-            stall_demotion_cycles: default_stall_demotion_cycles(),
-            error_demotion_threshold: default_error_demotion_threshold(),
             experimental_hard_forks_enabled: false,
             consensus_mode: ConsensusMode::default(),
             low_level_genesis_options: None,

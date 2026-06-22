@@ -26,8 +26,6 @@
 //! | `log_directive` / `min_severity`             | Tracing filter (existing) |
 //! | `churn_interval_normal_secs`                 | Peer governor churn       |
 //! | `churn_interval_sync_secs`                   | Peer governor churn       |
-//! | `stall_demotion_cycles`                      | Peer governor stall       |
-//! | `error_demotion_threshold`                   | Peer governor errors      |
 //!
 //! # Restart-required fields
 //!
@@ -75,10 +73,6 @@ pub struct RuntimeConfig {
     pub churn_interval_normal_secs: u64,
     /// Governor churn interval during syncing (seconds).
     pub churn_interval_sync_secs: u64,
-    /// Consecutive zero-block cycles before a hot peer is demoted to warm.
-    pub stall_demotion_cycles: u32,
-    /// Accumulated failure threshold above which a hot peer is demoted.
-    pub error_demotion_threshold: u32,
 
     // ── Logging ─────────────────────────────────────────────────────────────
     /// Optional `tracing_subscriber::EnvFilter` directive, applied on SIGHUP.
@@ -101,8 +95,6 @@ impl RuntimeConfig {
             target_number_of_known_big_ledger_peers: cfg.target_number_of_known_big_ledger_peers,
             churn_interval_normal_secs: cfg.churn_interval_normal_secs,
             churn_interval_sync_secs: cfg.churn_interval_sync_secs,
-            stall_demotion_cycles: cfg.stall_demotion_cycles,
-            error_demotion_threshold: cfg.error_demotion_threshold,
             log_directive: cfg.log_directive.clone(),
             min_severity: cfg.min_severity.clone(),
         }
@@ -172,8 +164,6 @@ pub fn reload_partition(old: &NodeConfig, new: &NodeConfig) -> ReloadPlan {
     check_reloadable!(target_number_of_known_big_ledger_peers);
     check_reloadable!(churn_interval_normal_secs);
     check_reloadable!(churn_interval_sync_secs);
-    check_reloadable!(stall_demotion_cycles);
-    check_reloadable!(error_demotion_threshold);
     check_reloadable!(log_directive);
     check_reloadable!(min_severity);
 
@@ -331,28 +321,6 @@ mod tests {
     }
 
     #[test]
-    fn test_partition_stall_demotion_cycles_is_applied() {
-        let old = default_config();
-        let mut new = default_config();
-        new.stall_demotion_cycles = 10;
-
-        let plan = reload_partition(&old, &new);
-        assert!(plan.applied.contains(&"stall_demotion_cycles"));
-        assert!(plan.ignored.is_empty());
-    }
-
-    #[test]
-    fn test_partition_error_demotion_threshold_is_applied() {
-        let old = default_config();
-        let mut new = default_config();
-        new.error_demotion_threshold = 8;
-
-        let plan = reload_partition(&old, &new);
-        assert!(plan.applied.contains(&"error_demotion_threshold"));
-        assert!(plan.ignored.is_empty());
-    }
-
-    #[test]
     fn test_partition_log_directive_is_applied() {
         let old = default_config();
         let mut new = default_config();
@@ -505,11 +473,6 @@ mod tests {
             runtime.churn_interval_sync_secs,
             cfg.churn_interval_sync_secs
         );
-        assert_eq!(runtime.stall_demotion_cycles, cfg.stall_demotion_cycles);
-        assert_eq!(
-            runtime.error_demotion_threshold,
-            cfg.error_demotion_threshold
-        );
         assert_eq!(runtime.log_directive, cfg.log_directive);
         assert_eq!(runtime.min_severity, cfg.min_severity);
     }
@@ -533,8 +496,6 @@ mod tests {
             target_number_of_known_big_ledger_peers: 18,
             churn_interval_normal_secs: 1800,
             churn_interval_sync_secs: 600,
-            stall_demotion_cycles: 8,
-            error_demotion_threshold: 3,
             log_directive: Some("info,dugite_network=debug".to_string()),
             min_severity: "Debug".to_string(),
             ..NodeConfig::default()
@@ -575,11 +536,6 @@ mod tests {
         assert_eq!(
             restored.churn_interval_sync_secs,
             cfg.churn_interval_sync_secs
-        );
-        assert_eq!(restored.stall_demotion_cycles, cfg.stall_demotion_cycles);
-        assert_eq!(
-            restored.error_demotion_threshold,
-            cfg.error_demotion_threshold
         );
         assert_eq!(restored.log_directive, cfg.log_directive);
         assert_eq!(restored.min_severity, cfg.min_severity);

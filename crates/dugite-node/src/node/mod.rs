@@ -4892,6 +4892,12 @@ impl Node {
                     target_warm_big_ledger: cfg.target_number_of_established_big_ledger_peers,
                     target_hot_big_ledger: cfg.target_number_of_active_big_ledger_peers,
                 },
+                // ChurnIntervalNormalSecs → deadline churn, ChurnIntervalSyncSecs
+                // → bulk-sync churn (selected by the governor's bulk-sync mode,
+                // driven from the at-tip signal below). Defaults 3300/900 match
+                // Haskell's deadline/bulk churn intervals.
+                hot_churn_interval: Duration::from_secs(cfg.churn_interval_normal_secs),
+                bulk_sync_churn_interval: Duration::from_secs(cfg.churn_interval_sync_secs),
                 ..Default::default()
             }
         };
@@ -5199,6 +5205,13 @@ impl Node {
                             target_warm_big_ledger: rt.target_number_of_established_big_ledger_peers,
                             target_hot_big_ledger: rt.target_number_of_active_big_ledger_peers,
                         });
+                        // Apply reloaded churn cadences (ChurnIntervalNormalSecs
+                        // / ChurnIntervalSyncSecs) so SIGHUP genuinely changes
+                        // governor behaviour rather than only reporting success.
+                        governor.update_churn_intervals(
+                            Duration::from_secs(rt.churn_interval_normal_secs),
+                            Duration::from_secs(rt.churn_interval_sync_secs),
+                        );
                         debug!(
                             active = rt.target_number_of_active_peers,
                             established = rt.target_number_of_established_peers,
@@ -5232,6 +5245,15 @@ impl Node {
                             .connection_lifecycle
                             .as_ref()
                             .and_then(|lc| lc.get_active_fetch_peer());
+                        // Drive hot-churn cadence from the catch-up signal:
+                        // bulk-syncing (behind tip) churns faster
+                        // (ChurnIntervalSyncSecs); caught-up uses
+                        // ChurnIntervalNormalSecs. Mirrors Haskell's
+                        // BulkSync/Deadline churn split.
+                        let at_tip = self
+                            .volatile_wal_sync_at_tip
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        governor.set_bulk_sync_mode(!at_tip);
                         governor.compute_actions_with_blp(
                             &pm.inner,
                             &local_root_targets,
