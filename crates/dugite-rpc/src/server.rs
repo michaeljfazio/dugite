@@ -157,6 +157,13 @@ async fn run_server(
 
     let mut builder = TonicServer::builder();
 
+    // Apply the HTTP/2 max-concurrent-streams cap (0 = unlimited). Previously
+    // `MaxConcurrentStreams` flowed into RpcConfig but was never applied to the
+    // tonic server, so the limit was silently ignored.
+    if config.max_concurrent_streams > 0 {
+        builder = builder.max_concurrent_streams(Some(config.max_concurrent_streams));
+    }
+
     if let Some(identity) = tls_identity {
         builder = builder.tls_config(ServerTlsConfig::new().identity(identity))?;
     }
