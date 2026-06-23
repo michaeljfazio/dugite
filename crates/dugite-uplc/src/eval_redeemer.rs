@@ -91,7 +91,7 @@ pub fn eval_resolved_redeemer(
     let term = program.term;
 
     // 2. Build the per-version ScriptContext as Data.
-    let ctx_data = build_script_context(tx, resolved, r, slot_config)?;
+    let ctx_data = build_script_context(tx, resolved, r, slot_config, major_pv)?;
 
     if std::env::var("DUGITE_DUMP_CTX").is_ok() {
         eprintln!(
@@ -478,7 +478,13 @@ fn build_script_context(
     resolved: &[(PrimTxIn, PrimTxOut, Vec<u8>)],
     r: &ResolvedRedeemer,
     slot_config: &SlotConfig,
+    major_pv: u32,
 ) -> Result<crate::data::Data, PhaseTwoError> {
+    // The validity-range upper-bound closure in the V1/V2 ScriptContext is
+    // era-gated (#772): Conway+ (PV ≥ 9) makes a finite upper bound exclusive
+    // (`strictUpperBound`), while Alonzo/Babbage keep a ttl-only finite upper
+    // bound inclusive (`PV1.to`). See `PosixTimeRange::to_data`.
+    let conway_or_later = major_pv >= 9;
     match r.language {
         ScriptLanguage::PlutusV1 => {
             let tx_info = populate_tx_info_v1(tx, resolved, slot_config)?;
@@ -486,7 +492,7 @@ fn build_script_context(
                 tx_info,
                 purpose: r.purpose.clone(),
             };
-            Ok(ctx.to_data())
+            Ok(ctx.to_data(conway_or_later))
         }
         ScriptLanguage::PlutusV2 => {
             let tx_info = populate_tx_info_v2(tx, resolved, slot_config)?;
@@ -494,7 +500,7 @@ fn build_script_context(
                 tx_info,
                 purpose: r.purpose.clone(),
             };
-            Ok(ctx.to_data())
+            Ok(ctx.to_data(conway_or_later))
         }
         ScriptLanguage::PlutusV3 => {
             let tx_info = populate_tx_info_v3(tx, resolved, slot_config)?;
