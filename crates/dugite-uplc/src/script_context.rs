@@ -554,7 +554,7 @@ impl TxInInfo {
 }
 
 impl PosixTimeRange {
-    pub fn to_data(&self, v3_semantics: bool) -> Data {
+    pub fn to_data(&self, conway_or_later: bool) -> Data {
         // Plutus `Interval POSIXTime` is encoded as:
         //   Interval (LowerBound (Extended POSIXTime) Bool)
         //            (UpperBound (Extended POSIXTime) Bool)
@@ -611,12 +611,36 @@ impl PosixTimeRange {
             None => data_constr(2, vec![]), // PosInf = Constr 2 []
             Some(t) => data_constr(1, vec![data_i(t.into())]), // Finite t = Constr 1 [I(t)]
         };
+        // Finite upper-bound closure is ERA-GATED (NOT language-gated):
+        //
+        //   * Conway+ (`conway_or_later`): a finite upper bound is ALWAYS
+        //     exclusive (closure False). Conway's `transValidityInterval`
+        //     (`eras/conway/impl/Cardano.Ledger.Conway.TxInfo`) builds BOTH the
+        //     upper-only case and the both-bounds case with `strictUpperBound`.
+        //   * Alonzo/Babbage (pre-Conway): the upper-ONLY case uses `PV1.to`
+        //     (`eras/alonzo/impl/Cardano.Ledger.Alonzo.Plutus.TxInfo`), and
+        //     `PlutusLedgerApi.V1.Interval.to s = Interval (LowerBound NegInf True)
+        //     (upperBound s)` with `upperBound s = UpperBound (Finite s) True` —
+        //     i.e. INCLUSIVE. The both-bounds case still uses `strictUpperBound`
+        //     (exclusive). Conway deliberately unified these to exclusive.
+        //
+        // PosInf upper bound is always closed (True).
+        //
+        // #772: dugite previously gated this on LANGUAGE (V1/V2 ⇒ inclusive),
+        // emitting an inclusive upper bound for a V1/V2 script in the Conway era.
+        // That over-charged a validity-range-reading Reward redeemer by +1453 cpu
+        // vs cardano-node (empirically localised by a leaf-diff of dugite's vs
+        // cardano-ledger's constructed ScriptContext; the closure was the only
+        // differing leaf). The gate is the ERA, not the script language version.
         let upper_closed = match self.upper {
-            None => true, // PosInf upper bound is always closed (True)
-            // Finite upper: CLOSED (True) only for Alonzo/Babbage (V1/V2)
-            // with no lower bound (`PV1.to` path); OPEN (False) for V3
-            // (Conway `strictUpperBound`) and for any both-bounds interval.
-            Some(_) => !v3_semantics && self.lower.is_none(),
+            None => true,
+            Some(_) => {
+                if conway_or_later {
+                    false
+                } else {
+                    self.lower.is_none()
+                }
+            }
         };
         let upper_bound = data_constr(
             0,
@@ -899,7 +923,7 @@ impl ScriptContextV3 {
 }
 
 impl TxInfoV1 {
-    pub fn to_data(&self) -> Data {
+    pub fn to_data(&self, conway_or_later: bool) -> Data {
         // V1 TxInfo (Alonzo-era) field order — 10 fields, Constr 0:
         //   [inputs, outputs, fee, mint, dcert, wdrl, validRange,
         //    signatories, data, id]
@@ -932,9 +956,10 @@ impl TxInfoV1 {
                         })
                         .collect(),
                 ),
-                // txInfoValidRange (V1/Alonzo semantics: a ttl-only finite
-                // upper bound is CLOSED via `PV1.to`).
-                self.valid_range.to_data(false),
+                // txInfoValidRange — closure is ERA-gated (#772): pre-Conway
+                // ttl-only finite upper is CLOSED via `PV1.to`; Conway+ is OPEN
+                // via `strictUpperBound`. See `PosixTimeRange::to_data`.
+                self.valid_range.to_data(conway_or_later),
                 data_list(self.signatories.iter().map(data_bs28).collect()),
                 // V1 data :: [(DatumHash, Datum)] — AssocList, not Map.
                 // Encoded as List[Constr 0 [B32(hash), datum]].
@@ -952,13 +977,19 @@ impl TxInfoV1 {
 }
 
 impl ScriptContextV1 {
-    pub fn to_data(&self) -> Data {
-        data_constr(0, vec![self.tx_info.to_data(), self.purpose.to_data()])
+    pub fn to_data(&self, conway_or_later: bool) -> Data {
+        data_constr(
+            0,
+            vec![
+                self.tx_info.to_data(conway_or_later),
+                self.purpose.to_data(),
+            ],
+        )
     }
 }
 
 impl TxInfoV2 {
-    pub fn to_data(&self) -> Data {
+    pub fn to_data(&self, conway_or_later: bool) -> Data {
         // V2 TxInfo (Babbage-era) field order — 12 fields, Constr 0:
         //   [inputs, refInputs, outputs, fee, mint, dcert, wdrl,
         //    validRange, signatories, redeemers, data, id]
@@ -994,9 +1025,10 @@ impl TxInfoV2 {
                         .map(|(cred, amt)| (cred.to_data(), data_i(amt.clone())))
                         .collect(),
                 ),
-                // txInfoValidRange (V2/Babbage semantics: a ttl-only finite
-                // upper bound is CLOSED via `PV1.to`).
-                self.valid_range.to_data(false),
+                // txInfoValidRange — closure is ERA-gated (#772): pre-Conway
+                // ttl-only finite upper is CLOSED via `PV1.to`; Conway+ is OPEN
+                // via `strictUpperBound`. See `PosixTimeRange::to_data`.
+                self.valid_range.to_data(conway_or_later),
                 data_list(self.signatories.iter().map(data_bs28).collect()),
                 // V2 redeemers :: Map ScriptPurpose Redeemer — Data::Map.
                 data_map(
@@ -1020,8 +1052,14 @@ impl TxInfoV2 {
 }
 
 impl ScriptContextV2 {
-    pub fn to_data(&self) -> Data {
-        data_constr(0, vec![self.tx_info.to_data(), self.purpose.to_data()])
+    pub fn to_data(&self, conway_or_later: bool) -> Data {
+        data_constr(
+            0,
+            vec![
+                self.tx_info.to_data(conway_or_later),
+                self.purpose.to_data(),
+            ],
+        )
     }
 }
 
@@ -1742,7 +1780,7 @@ mod tests {
             data: vec![],
             txid: [0u8; 32],
         };
-        let d = info.to_data();
+        let d = info.to_data(false);
         let cbor = d.to_cbor().unwrap();
         let d2 = Data::from_cbor(&cbor).unwrap();
         assert_eq!(d, d2);
@@ -1767,7 +1805,7 @@ mod tests {
             data: vec![],
             txid: [0u8; 32],
         };
-        let d = info.to_data();
+        let d = info.to_data(false);
         let cbor = d.to_cbor().unwrap();
         let d2 = Data::from_cbor(&cbor).unwrap();
         assert_eq!(d, d2);
@@ -1814,8 +1852,8 @@ mod tests {
             },
             purpose: p,
         };
-        assert!(matches!(v1.to_data(), Data::Constr(0, _)));
-        assert!(matches!(v2.to_data(), Data::Constr(0, _)));
+        assert!(matches!(v1.to_data(false), Data::Constr(0, _)));
+        assert!(matches!(v2.to_data(false), Data::Constr(0, _)));
     }
 
     #[test]
