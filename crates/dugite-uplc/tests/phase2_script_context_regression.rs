@@ -224,6 +224,41 @@ fn posix_time_range_finite_bounds_have_correct_structure() {
     );
 }
 
+/// #772 regression: a ttl-ONLY validity interval (`invalid_hereafter` set, no
+/// `invalid_before`) has an ERA-GATED upper-bound closure. Pre-Conway uses
+/// `PV1.to` (INCLUSIVE, closure True); Conway+ uses `strictUpperBound`
+/// (EXCLUSIVE, closure False). dugite previously gated this on the script
+/// LANGUAGE (always inclusive for V1/V2), over-charging a validity-range-reading
+/// Reward redeemer by +1453 cpu vs cardano-node in the Conway era.
+#[test]
+fn posix_time_range_ttl_only_upper_closure_is_era_gated() {
+    let r = PosixTimeRange {
+        lower: None,
+        upper: Some(1_781_858_645_000i64),
+    };
+    let upper_closure = |conway: bool| -> Data {
+        let Data::Constr(0, outer) = r.to_data(conway) else {
+            panic!("interval must be Constr 0");
+        };
+        let Data::Constr(0, ub) = outer[1].clone() else {
+            panic!("upper bound must be Constr 0");
+        };
+        ub[1].clone()
+    };
+    // Pre-Conway (Alonzo/Babbage): `PV1.to` → UpperBound (Finite t) True.
+    assert_eq!(
+        upper_closure(false),
+        Data::Constr(1, vec![]),
+        "pre-Conway ttl-only upper closure must be True (inclusive, PV1.to)"
+    );
+    // Conway+: `strictUpperBound` → UpperBound (Finite t) False.
+    assert_eq!(
+        upper_closure(true),
+        Data::Constr(0, vec![]),
+        "Conway+ ttl-only upper closure must be False (exclusive, strictUpperBound)"
+    );
+}
+
 /// Regression: before the fix, bounds were flat Constr 1 [val, unit]
 /// without the outer LowerBound/UpperBound Constr 0 wrapper.
 #[test]
@@ -489,7 +524,7 @@ fn txinfo_v1_wdrl_is_data_list_of_constr_pairs() {
     let (sc, amt) = dummy_staking_cred();
     let mut info = minimal_txinfo_v1();
     info.wdrl = vec![(sc, amt)];
-    let d = info.to_data();
+    let d = info.to_data(false);
 
     // V1 TxInfo: Constr 0 [inputs, outputs, fee, mint, dcert, wdrl, ...]
     let Data::Constr(0, ref fields) = d else {
@@ -525,7 +560,7 @@ fn txinfo_v2_wdrl_is_data_map() {
     let (sc, amt) = dummy_staking_cred();
     let mut info = minimal_txinfo_v2();
     info.wdrl = vec![(sc, amt)];
-    let d = info.to_data();
+    let d = info.to_data(false);
 
     let Data::Constr(0, ref fields) = d else {
         panic!("TxInfoV2 must be Constr 0");
@@ -548,7 +583,7 @@ fn txinfo_v2_wdrl_is_data_map() {
 #[test]
 fn txinfo_v1_empty_wdrl_is_empty_list() {
     let info = minimal_txinfo_v1();
-    let d = info.to_data();
+    let d = info.to_data(false);
     let Data::Constr(0, ref fields) = d else {
         panic!("expected Constr 0");
     };
@@ -564,7 +599,7 @@ fn txinfo_v1_empty_wdrl_is_empty_list() {
 #[test]
 fn txinfo_v2_empty_wdrl_is_empty_map() {
     let info = minimal_txinfo_v2();
-    let d = info.to_data();
+    let d = info.to_data(false);
     let Data::Constr(0, ref fields) = d else {
         panic!("expected Constr 0");
     };
@@ -785,7 +820,7 @@ fn txinfo_v1_fee_is_ada_value_map() {
     let lovelace = 177_721u64;
     let mut info = minimal_txinfo_v1();
     info.fee = BigInt::from(lovelace);
-    let d = info.to_data();
+    let d = info.to_data(false);
 
     // V1 TxInfo: Constr 0 [inputs, outputs, fee, ...]  — fee is field 2
     let Data::Constr(0, ref fields) = d else {
@@ -836,7 +871,7 @@ fn txinfo_v1_fee_is_ada_value_map() {
 fn txinfo_v2_fee_is_ada_value_map() {
     let mut info = minimal_txinfo_v2();
     info.fee = BigInt::from(5_000_000u64);
-    let d = info.to_data();
+    let d = info.to_data(false);
     let Data::Constr(0, ref fields) = d else {
         panic!("TxInfoV2 must be Constr 0");
     };
@@ -861,7 +896,7 @@ fn txinfo_v1_data_is_list_of_constr_pairs() {
     let datum_value = Data::I(BigInt::from(99u64));
     let mut info = minimal_txinfo_v1();
     info.data = vec![(datum_hash, datum_value.clone())];
-    let d = info.to_data();
+    let d = info.to_data(false);
 
     // V1 TxInfo: Constr 0 [inputs, outputs, fee, mint, dcert, wdrl, validRange, sigs, data, id]
     // data is field index 8
@@ -903,7 +938,7 @@ fn txinfo_v2_data_is_map() {
     let datum_value = Data::B(vec![0x01, 0x02]);
     let mut info = minimal_txinfo_v2();
     info.data = vec![(datum_hash, datum_value)];
-    let d = info.to_data();
+    let d = info.to_data(false);
 
     // V2: field 10 is data
     let Data::Constr(0, ref fields) = d else {
@@ -925,7 +960,7 @@ fn txinfo_v2_data_is_map() {
 fn txinfo_v1_txid_is_constr_wrapped() {
     let mut info = minimal_txinfo_v1();
     info.txid = [0xfe; 32];
-    let d = info.to_data();
+    let d = info.to_data(false);
 
     // V1 TxInfo field 9 is txid
     let Data::Constr(0, ref fields) = d else {
@@ -947,7 +982,7 @@ fn txinfo_v1_txid_is_constr_wrapped() {
 #[test]
 fn txinfo_v1_txid_is_not_bare_bytes() {
     let info = minimal_txinfo_v1();
-    let d = info.to_data();
+    let d = info.to_data(false);
     let Data::Constr(0, ref fields) = d else {
         panic!("expected Constr 0")
     };
@@ -1062,7 +1097,7 @@ fn script_context_v1_spend_purpose_has_wrapped_txid() {
         tx_info: minimal_txinfo_v1(),
         purpose,
     };
-    let d = ctx.to_data();
+    let d = ctx.to_data(false);
     // ctx = Constr 0 [TxInfo, ScriptPurpose]
     let Data::Constr(0, ref ctx_fields) = d else {
         panic!("ScriptContext must be Constr 0");
