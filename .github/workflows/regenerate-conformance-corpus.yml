@@ -137,7 +137,7 @@ jobs:
           cabal-version: "3.10.3.0"
 
       - name: Cache cabal store
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ${{ steps.setup-haskell.outputs.cabal-store }}
           # Key on: GHC version + OS + the ledger-rules SHA from sources.toml.
@@ -148,7 +148,7 @@ jobs:
             ${{ runner.os }}-ghc-9.6.5-cabal-
 
       - name: Cache ~/.cabal (downloaded packages)
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cabal
           key: ${{ runner.os }}-cabal-home-${{ hashFiles('tests/conformance/upstream/sources.toml') }}

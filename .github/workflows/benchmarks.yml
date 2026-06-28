@@ -58,7 +58,7 @@ jobs:
       # thrashing another's. Mirrors the per-target cache shape used in
       # fuzz.yml.
       - name: Cache cargo registry and build
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -74,7 +74,7 @@ jobs:
       # baseline.
       - name: Cache Criterion baselines
         if: matrix.bench != '__stress__'
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: target/criterion
           key: ${{ runner.os }}-criterion-${{ matrix.name }}
