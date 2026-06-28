@@ -25,7 +25,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry and build
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -83,7 +83,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry and build
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -95,7 +95,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Cache upstream conformance fixtures
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: tests/conformance/upstream/fixtures
           key: upstream-fixtures-${{ hashFiles('tests/conformance/upstream/manifest.toml') }}
@@ -144,7 +144,7 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Cache cargo registry and build
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -155,7 +155,7 @@ jobs:
             ${{ runner.os }}-coverage-
 
       - name: Cache upstream conformance fixtures
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: tests/conformance/upstream/fixtures
           key: upstream-fixtures-${{ hashFiles('tests/conformance/upstream/manifest.toml') }}
@@ -208,7 +208,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry and build
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -268,7 +268,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo registry and build
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
