@@ -17,6 +17,9 @@ description = "Native UTxO RPC (gRPC) server for dugite-node — issue #672"
 tonic = { workspace = true }
 tonic-web = { workspace = true }
 tonic-reflection = { workspace = true }
+# tonic 0.14 moved the prost runtime codec out of `tonic` into `tonic-prost`;
+# the generated stubs reference it, so it must be a direct runtime dependency.
+tonic-prost = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
 
@@ -47,8 +50,9 @@ serde_json = { workspace = true }
 num-bigint = { workspace = true }
 
 [build-dependencies]
-tonic-build = { workspace = true }
-prost-build = { workspace = true }
+# tonic 0.14: codegen moved from `tonic-build`/`prost-build` into
+# `tonic-prost-build` (which re-exports both transitively).
+tonic-prost-build = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
