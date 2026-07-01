@@ -25,7 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_dir: PathBuf = std::env::var_os("OUT_DIR").ok_or("OUT_DIR not set")?.into();
     let descriptor_path = out_dir.join("utxorpc_descriptor.bin");
 
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .build_server(true)
         // Client codegen enabled so our own integration tests can drive
         // the server without pulling in the upstream `utxorpc` Rust SDK
@@ -35,7 +35,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // import them pay the per-call client-codec cost.
         .build_client(true)
         .file_descriptor_set_path(&descriptor_path)
-        .compile_protos(&proto_files, &[proto_root.as_path()])?;
+        // tonic-prost-build 0.14 unifies the `protos`/`includes` type params,
+        // so the include list must match `proto_files`' element type (PathBuf).
+        .compile_protos(&proto_files, &[proto_root])?;
 
     Ok(())
 }
