@@ -99,13 +99,17 @@ async-trait = "0.1"
 # depends on tonic/prost — dugite-node consumes the RPC server as an opaque
 # library, keeping the gRPC stack out of the node binary's transitive graph
 # when the RPC server is disabled.
-tonic = { version = "0.12", features = ["transport", "tls", "gzip"] }
-tonic-web = "0.12"
-tonic-reflection = "0.12"
-prost = "0.13"
-prost-types = "0.13"
-tonic-build = { version = "0.12", features = ["prost"] }
-prost-build = "0.13"
+# tonic 0.14 split its prost integration into `tonic-prost` (runtime codec)
+# and `tonic-prost-build` (build.rs codegen); the whole tonic-*/prost-* family
+# must move to 0.14 in lockstep (tonic 0.14 requires prost 0.14). The 0.13
+# step also renamed the rustls TLS feature `tls` -> `tls-ring`.
+tonic = { version = "0.14", features = ["transport", "tls-ring", "gzip"] }
+tonic-web = "0.14"
+tonic-reflection = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+prost-types = "0.14"
+tonic-prost-build = "0.14"
 
 # Networking
 tokio-tungstenite = "0.24"
