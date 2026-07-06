@@ -1485,4 +1485,67 @@ mod tests {
         let err = Data::from_cbor(&[]).expect_err("must reject empty");
         assert!(matches!(err, UplcError::CborDecode(_)), "got {err:?}");
     }
+
+    // ─────────────────────────────────────────────────────────────────
+    // #845: differential round-trip property test.
+    //
+    // The hand-picked round-trip cases above (small/medium/large Constr
+    // tags, nested Map/List/Constr, duplicate map keys, ...) are strong
+    // regression pins but only cover the specific shapes someone thought
+    // to write down. `cargo fuzz` (fuzz/fuzz_targets/dugite_uplc_data_
+    // decode.rs) already checks this same `to_cbor ∘ from_cbor = id`
+    // property against truly arbitrary bytes, but that only runs under
+    // `cargo +nightly fuzz run` — never as part of `cargo test`/
+    // `cargo nextest run`, i.e. never in ordinary CI. This proptest
+    // exercises the identical round-trip property, generated from
+    // arbitrary (bounded-depth) `Data` TREES rather than arbitrary
+    // bytes, entirely on stable Rust as part of the normal test suite —
+    // any regression that breaks the `serialiseData`/datum-hash
+    // round-trip for some structural shape the hand-written tests didn't
+    // think of will show up here on every `cargo test` run, not only
+    // during a manual fuzzing session.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Recursive proptest strategy for an arbitrary (bounded) `Data` tree.
+    /// Leaves are small integers/bytestrings; the recursive case adds
+    /// `Constr`/`List`/`Map`, capped at depth 4 / 64 total nodes / up to 4
+    /// items per collection to keep shrinking and generation fast.
+    fn arb_data() -> impl proptest::strategy::Strategy<Value = Data> {
+        use proptest::prelude::*;
+        let leaf = prop_oneof![
+            any::<i64>().prop_map(|n| Data::I(BigInt::from(n))),
+            prop::collection::vec(any::<u8>(), 0..32).prop_map(Data::B),
+        ];
+        leaf.prop_recursive(4, 64, 4, |inner| {
+            prop_oneof![
+                (0u64..200, prop::collection::vec(inner.clone(), 0..4))
+                    .prop_map(|(tag, args)| Data::Constr(BigInt::from(tag), args)),
+                prop::collection::vec(inner.clone(), 0..4).prop_map(Data::List),
+                prop::collection::vec((inner.clone(), inner.clone()), 0..4).prop_map(Data::Map),
+            ]
+        })
+    }
+
+    proptest::proptest! {
+        /// `Data::from_cbor(d.to_cbor())` must be the identity for any
+        /// (bounded) `Data` tree — this is the exact property that makes
+        /// `serialiseData`/datum-hash byte-exactness hold. Also confirms
+        /// the SECOND round-trip (re-encoding the decoded value) is
+        /// byte-identical to the first encode, i.e. `to_cbor()` output is
+        /// itself a fixed point, not merely "some value that happens to
+        /// decode back to something equal."
+        #[test]
+        fn data_cbor_round_trip_is_identity(d in arb_data()) {
+            let bytes = d.to_cbor().expect("encode must not fail on a well-formed Data tree");
+            let decoded = Data::from_cbor(&bytes).expect("decode must not fail on our own encoder's output");
+            proptest::prop_assert_eq!(&decoded, &d, "from_cbor(to_cbor(d)) must equal d");
+
+            let re_encoded = decoded.to_cbor().expect("re-encode must not fail");
+            proptest::prop_assert_eq!(
+                re_encoded, bytes,
+                "to_cbor() must be a fixed point: re-encoding the decoded value must reproduce \
+                 the exact same bytes"
+            );
+        }
+    }
 }

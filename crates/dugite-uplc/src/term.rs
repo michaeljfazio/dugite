@@ -154,11 +154,12 @@ pub enum Constant {
     /// — no worse than before, and free when the `Rc` is uniquely held.
     Data(Rc<Data>),
     /// BLS12-381 G1 element. Stored compressed (48 bytes) for canonical
-    /// equality — there is no decompressed-point cache; every builtin
-    /// that consumes a G1 element re-decodes it from these bytes
-    /// on demand (see `crates/dugite-uplc/src/builtin/bls.rs`, and
-    /// issue #839 for the resulting redundant-work tradeoff). Boxed
-    /// to keep the `Constant` enum compact.
+    /// equality — the decompressed point is NOT part of this value; it
+    /// is memoized separately, out-of-band, in a capped thread-local
+    /// cache keyed by these bytes (`builtin::bls::G1_DECOMPRESS_CACHE`,
+    /// #839), so equality/`Clone`/hashing of this `Constant` variant are
+    /// unaffected by whether a given point has been decompressed yet.
+    /// Boxed to keep the `Constant` enum compact.
     Bls12_381G1Element(Box<[u8; 48]>),
     /// BLS12-381 G2 element. Stored compressed (96 bytes). Boxed.
     Bls12_381G2Element(Box<[u8; 96]>),

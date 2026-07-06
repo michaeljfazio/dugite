@@ -1484,4 +1484,82 @@ mod tests {
         validate_program_availability(&t, &ver(1, 1, 0), ScriptLanguage::PlutusV3, 10)
             .expect("constr tag bound only applies from PV11");
     }
+
+    // ─────────────────────────────────────────────────────────────────
+    // #845: differential round-trip property test for the flat Term
+    // codec — the same motivation as `data::tests::data_cbor_round_trip_
+    // is_identity`: `cargo fuzz`'s `dugite_uplc_program_decode` target
+    // already fuzzes `Program::from_flat`/`to_flat` against arbitrary
+    // bytes, but only under a manual `cargo +nightly fuzz run` session,
+    // never as part of ordinary `cargo test`/`cargo nextest run`. This
+    // exercises the identical `decode ∘ encode = id` property, generated
+    // from arbitrary (bounded) `Term` TREES, entirely on stable Rust as
+    // part of the normal test suite.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Recursive proptest strategy for an arbitrary (bounded) `Term`.
+    /// Leaves are `Error`, a handful of `Constant` shapes, and a few
+    /// representative `Builtin` ids (arity doesn't matter here — we only
+    /// round-trip the flat encoding, never evaluate). The recursive case
+    /// adds `Lam`/`Delay`/`Force`/`App`/`Constr`/`Case`, capped at depth
+    /// 4 / 32 total nodes / up to 3 items per `Constr`/`Case` collection.
+    fn arb_term() -> impl proptest::strategy::Strategy<Value = Term> {
+        use proptest::prelude::*;
+        let const_leaf = prop_oneof![
+            any::<i64>().prop_map(|n| Term::Const(Constant::Integer(BigInt::from(n)))),
+            prop::collection::vec(any::<u8>(), 0..16)
+                .prop_map(|b| Term::Const(Constant::ByteString(b))),
+            any::<bool>().prop_map(|b| Term::Const(Constant::Bool(b))),
+            Just(Term::Const(Constant::Unit)),
+        ];
+        let builtin_leaf = prop_oneof![
+            Just(Term::Builtin(BuiltinId::AddInteger)),
+            Just(Term::Builtin(BuiltinId::IfThenElse)),
+            Just(Term::Builtin(BuiltinId::Trace)),
+        ];
+        let leaf = prop_oneof![
+            Just(Term::Error),
+            (0u64..20).prop_map(Term::Var),
+            const_leaf,
+            builtin_leaf,
+        ];
+        leaf.prop_recursive(4, 32, 3, |inner| {
+            prop_oneof![
+                inner.clone().prop_map(|t| Term::Lam(Rc::new(t))),
+                inner.clone().prop_map(|t| Term::Delay(Rc::new(t))),
+                inner.clone().prop_map(|t| Term::Force(Rc::new(t))),
+                (inner.clone(), inner.clone()).prop_map(|(f, a)| Term::App(Rc::new(f), Rc::new(a))),
+                (0u64..200, prop::collection::vec(inner.clone(), 0..3)).prop_map(|(tag, args)| {
+                    Term::Constr {
+                        tag,
+                        args: args.into_iter().map(Rc::new).collect(),
+                    }
+                }),
+                (inner.clone(), prop::collection::vec(inner.clone(), 0..3)).prop_map(
+                    |(scrutinee, branches)| Term::Case {
+                        scrutinee: Rc::new(scrutinee),
+                        branches: branches.into_iter().map(Rc::new).collect(),
+                    }
+                ),
+            ]
+        })
+    }
+
+    proptest::proptest! {
+        /// `decode_term(encode_term(t))` must be the identity for any
+        /// (bounded) `Term` — the flat-codec analogue of `Data`'s
+        /// serialiseData round-trip property, and the property a decoder/
+        /// encoder asymmetry (a historical source of script-hash
+        /// divergences per `dugite_uplc_program_decode`'s fuzz-target doc
+        /// comment) would break.
+        #[test]
+        fn term_flat_round_trip_is_identity(t in arb_term()) {
+            let mut w = BitWriter::new();
+            encode_term(&mut w, &t).expect("encode must not fail on a well-formed Term");
+            let bytes = w.finish();
+            let mut r = BitReader::new(&bytes);
+            let decoded = decode_term(&mut r).expect("decode must not fail on our own encoder's output");
+            proptest::prop_assert_eq!(&decoded, &t, "decode_term(encode_term(t)) must equal t");
+        }
+    }
 }
