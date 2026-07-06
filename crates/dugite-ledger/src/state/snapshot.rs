@@ -419,7 +419,16 @@ impl LedgerState {
     /// persisted here. Bumping the version quarantines any snapshot saved
     /// under the old (incomplete) delta model, forcing a clean rebuild from
     /// ImmutableDB replay instead of trusting a possibly-mis-advanced anchor.
-    pub(crate) const SNAPSHOT_VERSION: u8 = 25;
+    /// v26 (#799): `ProposalState` (embedded wholesale inside
+    /// `GovernanceState`, which is bincode-serialized as part of every
+    /// `LedgerState` snapshot) gained a new `submission_index: u64` field
+    /// used to recover on-chain proposal submission order for the
+    /// ratification tie-break sort. This is a positional bincode layout
+    /// change for every embedded `ProposalState` (live `proposals`,
+    /// `last_ratified`, and `RatificationSnapshot::proposals`) — a snapshot
+    /// written by a prior binary must be quarantined, not silently
+    /// misinterpreted.
+    pub(crate) const SNAPSHOT_VERSION: u8 = 26;
 
     /// Save ledger state snapshot to disk using bincode serialization.
     ///

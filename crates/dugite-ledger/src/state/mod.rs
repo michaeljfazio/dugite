@@ -562,6 +562,23 @@ pub struct ProposalState {
     pub yes_votes: u64,
     pub no_votes: u64,
     pub abstain_votes: u64,
+    /// Monotonic on-chain submission order (issue #799).
+    ///
+    /// Haskell's `reorderActions` (`Governance/Internal.hs:534-544`) stable-sorts
+    /// active proposals by `actionPriority` only; ties preserve the proposals
+    /// `OMap`'s insertion (on-chain submission) order — NEVER `GovActionId`
+    /// (hash) order. `proposals` here is an `ImblOrdMap<GovActionId, _>`, whose
+    /// natural iteration order is by key (hash), so this field is required to
+    /// recover submission order for the ratification tie-break sort.
+    ///
+    /// Assigned from the monotonic `GovernanceState::proposal_count` counter
+    /// (read BEFORE it is incremented) at every ingest site: `eras/conway.rs`
+    /// (live block-apply GOV rule), `state/governance.rs` `process_proposal` /
+    /// `process_proposal_with_delta` (test/dead-path), and reconstructed by
+    /// enumeration order when loading a Haskell ledger-state dump
+    /// (`state/mod.rs::from_haskell_snapshot`, which decodes proposals from an
+    /// on-wire `StrictSeq` that preserves the OMap's insertion order).
+    pub submission_index: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1073,7 +1090,7 @@ impl LedgerState {
                 use dugite_serialization::haskell_snapshot::types::HaskellVote;
 
                 let proposal_count = haskell_proposals.len();
-                for gas in haskell_proposals {
+                for (submission_index, gas) in haskell_proposals.into_iter().enumerate() {
                     let action_id = GovActionId {
                         transaction_id: gas.gas_id.tx_hash,
                         action_index: gas.gas_id.index as u32,
@@ -1146,12 +1163,28 @@ impl LedgerState {
                         yes_votes: yes,
                         no_votes: no,
                         abstain_votes: abstain,
+                        // #799: `decode_proposals` returns entries in the order
+                        // they appear on the wire, which is a `StrictSeq` that
+                        // preserves the Haskell `Proposals` OMap's insertion
+                        // (on-chain submission) order — see the doc comment on
+                        // `decode_proposals`. Enumeration index is therefore a
+                        // faithful reconstruction of `submission_index`.
+                        submission_index: submission_index as u64,
                     };
                     gov.proposals.insert(action_id.clone(), state);
                     if !votes.is_empty() {
                         gov.votes_by_action.insert(action_id, votes);
                     }
                 }
+                // #799: seed the monotonic submission counter past every
+                // reconstructed proposal so that proposals submitted AFTER
+                // this snapshot import get strictly higher `submission_index`
+                // values than all pre-existing ones (correct relative
+                // ordering for the ratification tie-break sort). Without
+                // this, `gov.proposal_count` stays at its `Default` (0),
+                // colliding with `submission_index: 0` assigned above to the
+                // first reconstructed proposal.
+                gov.proposal_count = gov.proposal_count.max(proposal_count as u64);
                 info!(
                     proposal_count,
                     "Loaded active governance proposals from Haskell snapshot"

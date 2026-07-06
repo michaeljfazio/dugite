@@ -24,10 +24,80 @@ impl LedgerState {
     /// Each field in the update, if Some, overwrites the corresponding parameter.
     /// Used by both pre-Conway update proposals and Conway governance actions.
     /// Returns an error if any governance threshold is out of range [0, 1].
+    ///
+    /// #802: this function is ATOMIC — every fallible `validate_threshold`
+    /// check below runs BEFORE the first field write, so an `Err` return
+    /// leaves `self.epochs.protocol_params` completely untouched. This
+    /// matches Haskell, where `UnitInterval`-typed fields cannot even be
+    /// decoded off the wire out of `[0, 1]` (`BoundedRatio`'s `DecCBOR`
+    /// instance rejects `numerator > denominator` at decode time) and Conway
+    /// `ENACT` (`PredicateFailure (ENACT era) = Void`) is a total function
+    /// that never re-validates at apply time. `rho`/`tau`/`d` are
+    /// `UnitInterval`-typed and get the same `[0, 1]` bound here as a
+    /// defense-in-depth backstop. `a0` is `NonNegativeInterval`-typed — it
+    /// has no upper bound in Haskell (only `numerator >= 0`, which the u64
+    /// representation already guarantees) and is intentionally NOT
+    /// bounds-checked.
     pub(crate) fn apply_protocol_param_update(
         &mut self,
         update: &ProtocolParamUpdate,
     ) -> Result<(), LedgerError> {
+        if let Some(ref v) = update.rho {
+            Self::validate_threshold("rho", v)?;
+        }
+        if let Some(ref v) = update.tau {
+            Self::validate_threshold("tau", v)?;
+        }
+        if let Some(ref v) = update.d {
+            Self::validate_threshold("d", v)?;
+        }
+        if let Some(ref v) = update.dvt_pp_network_group {
+            Self::validate_threshold("dvt_pp_network_group", v)?;
+        }
+        if let Some(ref v) = update.dvt_pp_economic_group {
+            Self::validate_threshold("dvt_pp_economic_group", v)?;
+        }
+        if let Some(ref v) = update.dvt_pp_technical_group {
+            Self::validate_threshold("dvt_pp_technical_group", v)?;
+        }
+        if let Some(ref v) = update.dvt_pp_gov_group {
+            Self::validate_threshold("dvt_pp_gov_group", v)?;
+        }
+        if let Some(ref v) = update.dvt_hard_fork {
+            Self::validate_threshold("dvt_hard_fork", v)?;
+        }
+        if let Some(ref v) = update.dvt_no_confidence {
+            Self::validate_threshold("dvt_no_confidence", v)?;
+        }
+        if let Some(ref v) = update.dvt_committee_normal {
+            Self::validate_threshold("dvt_committee_normal", v)?;
+        }
+        if let Some(ref v) = update.dvt_committee_no_confidence {
+            Self::validate_threshold("dvt_committee_no_confidence", v)?;
+        }
+        if let Some(ref v) = update.dvt_constitution {
+            Self::validate_threshold("dvt_constitution", v)?;
+        }
+        if let Some(ref v) = update.dvt_treasury_withdrawal {
+            Self::validate_threshold("dvt_treasury_withdrawal", v)?;
+        }
+        if let Some(ref v) = update.pvt_motion_no_confidence {
+            Self::validate_threshold("pvt_motion_no_confidence", v)?;
+        }
+        if let Some(ref v) = update.pvt_committee_normal {
+            Self::validate_threshold("pvt_committee_normal", v)?;
+        }
+        if let Some(ref v) = update.pvt_committee_no_confidence {
+            Self::validate_threshold("pvt_committee_no_confidence", v)?;
+        }
+        if let Some(ref v) = update.pvt_hard_fork {
+            Self::validate_threshold("pvt_hard_fork", v)?;
+        }
+        if let Some(ref v) = update.pvt_pp_security_group {
+            Self::validate_threshold("pvt_pp_security_group", v)?;
+        }
+
+        // --- All fallible checks passed: apply every field unconditionally. ---
         if let Some(v) = update.min_fee_a {
             self.epochs.protocol_params.min_fee_a = v;
         }
@@ -127,63 +197,48 @@ impl LedgerState {
             self.epochs.protocol_params.gov_action_deposit = v;
         }
         if let Some(ref v) = update.dvt_pp_network_group {
-            Self::validate_threshold("dvt_pp_network_group", v)?;
             self.epochs.protocol_params.dvt_pp_network_group = v.clone();
         }
         if let Some(ref v) = update.dvt_pp_economic_group {
-            Self::validate_threshold("dvt_pp_economic_group", v)?;
             self.epochs.protocol_params.dvt_pp_economic_group = v.clone();
         }
         if let Some(ref v) = update.dvt_pp_technical_group {
-            Self::validate_threshold("dvt_pp_technical_group", v)?;
             self.epochs.protocol_params.dvt_pp_technical_group = v.clone();
         }
         if let Some(ref v) = update.dvt_pp_gov_group {
-            Self::validate_threshold("dvt_pp_gov_group", v)?;
             self.epochs.protocol_params.dvt_pp_gov_group = v.clone();
         }
         if let Some(ref v) = update.dvt_hard_fork {
-            Self::validate_threshold("dvt_hard_fork", v)?;
             self.epochs.protocol_params.dvt_hard_fork = v.clone();
         }
         if let Some(ref v) = update.dvt_no_confidence {
-            Self::validate_threshold("dvt_no_confidence", v)?;
             self.epochs.protocol_params.dvt_no_confidence = v.clone();
         }
         if let Some(ref v) = update.dvt_committee_normal {
-            Self::validate_threshold("dvt_committee_normal", v)?;
             self.epochs.protocol_params.dvt_committee_normal = v.clone();
         }
         if let Some(ref v) = update.dvt_committee_no_confidence {
-            Self::validate_threshold("dvt_committee_no_confidence", v)?;
             self.epochs.protocol_params.dvt_committee_no_confidence = v.clone();
         }
         if let Some(ref v) = update.dvt_constitution {
-            Self::validate_threshold("dvt_constitution", v)?;
             self.epochs.protocol_params.dvt_constitution = v.clone();
         }
         if let Some(ref v) = update.dvt_treasury_withdrawal {
-            Self::validate_threshold("dvt_treasury_withdrawal", v)?;
             self.epochs.protocol_params.dvt_treasury_withdrawal = v.clone();
         }
         if let Some(ref v) = update.pvt_motion_no_confidence {
-            Self::validate_threshold("pvt_motion_no_confidence", v)?;
             self.epochs.protocol_params.pvt_motion_no_confidence = v.clone();
         }
         if let Some(ref v) = update.pvt_committee_normal {
-            Self::validate_threshold("pvt_committee_normal", v)?;
             self.epochs.protocol_params.pvt_committee_normal = v.clone();
         }
         if let Some(ref v) = update.pvt_committee_no_confidence {
-            Self::validate_threshold("pvt_committee_no_confidence", v)?;
             self.epochs.protocol_params.pvt_committee_no_confidence = v.clone();
         }
         if let Some(ref v) = update.pvt_hard_fork {
-            Self::validate_threshold("pvt_hard_fork", v)?;
             self.epochs.protocol_params.pvt_hard_fork = v.clone();
         }
         if let Some(ref v) = update.pvt_pp_security_group {
-            Self::validate_threshold("pvt_pp_security_group", v)?;
             self.epochs.protocol_params.pvt_pp_security_group = v.clone();
         }
         if let Some(v) = update.min_committee_size {
@@ -310,6 +365,88 @@ mod tests {
         assert_eq!(
             state.epochs.protocol_params.key_deposit,
             defaults.key_deposit
+        );
+    }
+
+    /// #802: an update combining an out-of-range `rho` (numerator > denominator)
+    /// with an earlier-processed plain field (`min_fee_a`) must be rejected AS
+    /// A WHOLE, leaving every field — including `min_fee_a`, which the old
+    /// non-atomic implementation would have already written before reaching
+    /// the `rho` check — completely unchanged.
+    #[test]
+    fn test_apply_update_atomic_rejection_on_invalid_rho() {
+        let mut state = make_state();
+        let defaults = ProtocolParameters::mainnet_defaults();
+
+        let update = ProtocolParamUpdate {
+            min_fee_a: Some(999_999),
+            rho: Some(Rational {
+                numerator: 3,
+                denominator: 2,
+            }), // invalid: 3/2 exceeds 1
+            ..Default::default()
+        };
+
+        let err = state
+            .apply_protocol_param_update(&update)
+            .expect_err("rho numerator > denominator must be rejected");
+        assert!(matches!(err, LedgerError::InvalidProtocolParam(_)));
+
+        // Atomicity: NOTHING was mutated, not even fields ordered before
+        // `rho` in the update-application sequence.
+        assert_eq!(
+            state.epochs.protocol_params.min_fee_a, defaults.min_fee_a,
+            "min_fee_a must be unchanged when the update is rejected"
+        );
+        assert_eq!(
+            state.epochs.protocol_params.rho, defaults.rho,
+            "rho must be unchanged when the update is rejected"
+        );
+    }
+
+    /// #802: `tau` and `d` get the same unit-interval bound as `rho`; `a0`
+    /// (`NonNegativeInterval`) must NOT be bounds-checked — Haskell has no
+    /// upper bound on it.
+    #[test]
+    fn test_apply_update_rejects_out_of_range_tau_and_d_but_not_a0() {
+        let mut state = make_state();
+
+        let bad_tau = ProtocolParamUpdate {
+            tau: Some(Rational {
+                numerator: 2,
+                denominator: 1,
+            }),
+            ..Default::default()
+        };
+        assert!(state.apply_protocol_param_update(&bad_tau).is_err());
+
+        let bad_d = ProtocolParamUpdate {
+            d: Some(Rational {
+                numerator: 5,
+                denominator: 4,
+            }),
+            ..Default::default()
+        };
+        assert!(state.apply_protocol_param_update(&bad_d).is_err());
+
+        // a0 (NonNegativeInterval) has no upper bound in Haskell — a "ratio"
+        // greater than 1 must be accepted, not rejected.
+        let large_a0 = ProtocolParamUpdate {
+            a0: Some(Rational {
+                numerator: 100,
+                denominator: 1,
+            }),
+            ..Default::default()
+        };
+        state
+            .apply_protocol_param_update(&large_a0)
+            .expect("a0 > 1 must be accepted — NonNegativeInterval has no upper bound");
+        assert_eq!(
+            state.epochs.protocol_params.a0,
+            Rational {
+                numerator: 100,
+                denominator: 1,
+            }
         );
     }
 
