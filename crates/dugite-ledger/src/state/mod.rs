@@ -1619,9 +1619,11 @@ impl LedgerState {
     /// slot depends on `d`; using the wrong (higher, pre-decrease) `d` mis-counts
     /// overlay slots and rejects the first valid Praos block of the new epoch.
     ///
-    /// This applies the SAME enactment as `process_epoch_transition` (proposals
-    /// keyed by `target_epoch - 1`, requiring the genesis-key quorum, last-writer
-    /// merge) but without mutating state. Only forecasts ONE epoch ahead; for the
+    /// This applies the SAME enactment as `process_epoch_transition`
+    /// (proposals keyed by `target_epoch - 1`, requiring a quorum of
+    /// genesis delegates to have voted the byte-identical value — see
+    /// [`crate::validation::ppup::voted_future_pparams`], issue #784) but
+    /// without mutating state. Only forecasts ONE epoch ahead; for the
     /// same epoch or anything further out it returns the current `d`.
     pub fn forecast_d_for_epoch(
         &self,
@@ -1635,19 +1637,15 @@ impl LedgerState {
         let Some(proposals) = self.epochs.pending_pp_updates.get(&lookup_epoch) else {
             return current_d;
         };
-        let distinct: std::collections::HashSet<Hash32> =
-            proposals.iter().map(|(g, _)| *g).collect();
-        if (distinct.len() as u64) < self.update_quorum {
+        let proposal_map = crate::validation::ppup::fold_pp_proposals(proposals);
+        let Some(winner) = crate::validation::ppup::voted_future_pparams(
+            &proposal_map,
+            self.update_quorum,
+            &self.epochs.protocol_params,
+        ) else {
             return current_d;
-        }
-        // Last-writer merge over `d`, matching the merge_field! macro.
-        let mut d = None;
-        for (_, ppu) in proposals {
-            if ppu.d.is_some() {
-                d = ppu.d.clone();
-            }
-        }
-        d.unwrap_or(current_d)
+        };
+        winner.d.unwrap_or(current_d)
     }
 
     /// Forecast the active extra entropy (Shelley `ppExtraEntropy`) for
@@ -1656,10 +1654,11 @@ impl LedgerState {
     /// Header validation of a block in epoch N+1 derives its VRF seed from
     /// epoch N+1's nonce, which folds in the extraEntropy that the boundary
     /// PPUP will enact. This mirrors `process_epoch_transition`'s enactment
-    /// (proposals keyed by `target_epoch - 1`, genesis-key quorum, last-writer
-    /// merge, sticky) without mutating state. Returns the current (sticky)
-    /// value for the same epoch, anything further out, or when no proposal
-    /// changes it.
+    /// (proposals keyed by `target_epoch - 1`, requiring a quorum of genesis
+    /// delegates to have voted the byte-identical value — see
+    /// [`crate::validation::ppup::voted_future_pparams`], issue #784, sticky)
+    /// without mutating state. Returns the current (sticky) value for the
+    /// same epoch, anything further out, or when no proposal changes it.
     pub fn forecast_extra_entropy_for_epoch(&self, target_epoch: u64) -> Hash32 {
         let current = self.consensus.extra_entropy;
         if target_epoch != self.epoch.0.saturating_add(1) {
@@ -1669,19 +1668,15 @@ impl LedgerState {
         let Some(proposals) = self.epochs.pending_pp_updates.get(&lookup_epoch) else {
             return current;
         };
-        let distinct: std::collections::HashSet<Hash32> =
-            proposals.iter().map(|(g, _)| *g).collect();
-        if (distinct.len() as u64) < self.update_quorum {
+        let proposal_map = crate::validation::ppup::fold_pp_proposals(proposals);
+        let Some(winner) = crate::validation::ppup::voted_future_pparams(
+            &proposal_map,
+            self.update_quorum,
+            &self.epochs.protocol_params,
+        ) else {
             return current;
-        }
-        // Last-writer merge over extra_entropy, matching the merge_field! macro.
-        let mut extra = None;
-        for (_, ppu) in proposals {
-            if ppu.extra_entropy.is_some() {
-                extra = ppu.extra_entropy;
-            }
-        }
-        extra.unwrap_or(current)
+        };
+        winner.extra_entropy.unwrap_or(current)
     }
 
     /// Forecast the active `maxBlockBodySize` for `target_epoch` while the
@@ -1698,7 +1693,10 @@ impl LedgerState {
     /// 305→306 boundary; the first epoch-306 block (6573513) has a 71271-byte
     /// body and is valid only under 73728. Mirrors
     /// [`Self::forecast_d_for_epoch`] (proposals keyed by `target_epoch - 1`,
-    /// genesis-key quorum, last-writer merge), without mutating state.
+    /// requiring a quorum of genesis delegates to have voted the
+    /// byte-identical value — see
+    /// [`crate::validation::ppup::voted_future_pparams`], issue #784),
+    /// without mutating state.
     pub fn forecast_max_block_body_size_for_epoch(&self, target_epoch: u64) -> u64 {
         let current = self.epochs.protocol_params.max_block_body_size;
         if target_epoch != self.epoch.0.saturating_add(1) {
@@ -1708,18 +1706,15 @@ impl LedgerState {
         let Some(proposals) = self.epochs.pending_pp_updates.get(&lookup_epoch) else {
             return current;
         };
-        let distinct: std::collections::HashSet<Hash32> =
-            proposals.iter().map(|(g, _)| *g).collect();
-        if (distinct.len() as u64) < self.update_quorum {
+        let proposal_map = crate::validation::ppup::fold_pp_proposals(proposals);
+        let Some(winner) = crate::validation::ppup::voted_future_pparams(
+            &proposal_map,
+            self.update_quorum,
+            &self.epochs.protocol_params,
+        ) else {
             return current;
-        }
-        let mut v = None;
-        for (_, ppu) in proposals {
-            if ppu.max_block_body_size.is_some() {
-                v = ppu.max_block_body_size;
-            }
-        }
-        v.unwrap_or(current)
+        };
+        winner.max_block_body_size.unwrap_or(current)
     }
 
     /// Set the Shelley genesis hash.

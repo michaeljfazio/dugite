@@ -724,64 +724,32 @@ impl EraRules for ShelleyRules {
         let old_params = epochs.protocol_params.clone();
 
         // Apply pre-Conway PP update proposals (PPUP/UPEC rule).
+        //
+        // Haskell's `votedFuturePParams` (Shelley.Rules.Ppup) enacts a
+        // pre-Conway PPUP only when a quorum of genesis delegates voted for
+        // the byte-identical `PParamsUpdate` value; it never counts
+        // distinct proposers and field-merges their proposals together.
+        // Ties or a value short of quorum enact nothing. Issue #784.
         let lookup_epoch = EpochNo(new_epoch.0.saturating_sub(1));
         if let Some(proposals) = epochs.pending_pp_updates.remove(&lookup_epoch) {
-            let mut proposer_set: HashSet<Hash32> = HashSet::with_capacity(proposals.len());
-            for (genesis_hash, _) in &proposals {
-                proposer_set.insert(*genesis_hash);
-            }
-            let distinct_proposers = proposer_set.len() as u64;
-
-            if distinct_proposers >= ctx.update_quorum {
-                // Merge all proposals.
-                let mut merged = dugite_primitives::transaction::ProtocolParamUpdate::default();
-                for (_, ppu) in &proposals {
-                    macro_rules! merge_field {
-                        ($field:ident) => {
-                            if ppu.$field.is_some() {
-                                merged.$field = ppu.$field.clone();
-                            }
-                        };
-                    }
-                    merge_field!(min_fee_a);
-                    merge_field!(min_fee_b);
-                    merge_field!(max_block_body_size);
-                    merge_field!(max_tx_size);
-                    merge_field!(max_block_header_size);
-                    merge_field!(key_deposit);
-                    merge_field!(pool_deposit);
-                    merge_field!(e_max);
-                    merge_field!(n_opt);
-                    merge_field!(a0);
-                    merge_field!(rho);
-                    merge_field!(tau);
-                    merge_field!(d);
-                    merge_field!(extra_entropy);
-                    merge_field!(min_pool_cost);
-                    merge_field!(ada_per_utxo_byte);
-                    merge_field!(cost_models);
-                    merge_field!(execution_costs);
-                    merge_field!(max_tx_ex_units);
-                    merge_field!(max_block_ex_units);
-                    merge_field!(max_val_size);
-                    merge_field!(collateral_percentage);
-                    merge_field!(max_collateral_inputs);
-                    merge_field!(protocol_version_major);
-                    merge_field!(protocol_version_minor);
-                }
-                // Apply the merged update to protocol params.
-                apply_pp_update(&mut epochs.protocol_params, &merged);
+            let proposal_map = crate::validation::ppup::fold_pp_proposals(&proposals);
+            if let Some(winner) = crate::validation::ppup::voted_future_pparams(
+                &proposal_map,
+                ctx.update_quorum,
+                &epochs.protocol_params,
+            ) {
+                // Apply the winning (quorum-reaching) update to protocol params.
+                apply_pp_update(&mut epochs.protocol_params, &winner);
                 // ppExtraEntropy is consumed only by the epoch-nonce TICKN, so
                 // it lives in the consensus sub-state rather than
                 // ProtocolParameters. Sticky: only an update that carries the
                 // field changes it (Some(ZERO) explicitly resets to neutral).
-                if let Some(extra) = merged.extra_entropy {
+                if let Some(extra) = winner.extra_entropy {
                     consensus.extra_entropy = extra;
                 }
                 debug!(
                     epoch = new_epoch.0,
-                    proposers = distinct_proposers,
-                    "Pre-Conway protocol parameter update applied"
+                    "Pre-Conway protocol parameter update applied (voted quorum)"
                 );
             }
         }
@@ -1991,6 +1959,66 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(utxo.pending_donations.0, 0);
         assert_eq!(epochs.treasury.0, 105_000_000);
+    }
+
+    /// Issue #784: a pre-Conway PPUP quorum requires a quorum of genesis
+    /// delegates to vote the byte-identical `PParamsUpdate` value. Counting
+    /// *distinct proposers* across two different values and field-merging
+    /// them (the pre-fix bug) is wrong — Haskell's `votedFuturePParams`
+    /// enacts nothing when no single value reaches quorum, even if the
+    /// union of proposers would.
+    #[test]
+    fn test_process_epoch_transition_ppup_split_vote_enacts_nothing() {
+        let rules = ShelleyRules::new();
+        let params = ProtocolParameters::mainnet_defaults();
+        let ctx = make_shelley_ctx(&params); // update_quorum = 5
+        let mut utxo = make_utxo_sub(vec![]);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut epochs = make_epoch_sub();
+        let mut consensus = make_consensus_sub();
+
+        let original_min_fee_a = epochs.protocol_params.min_fee_a;
+        let original_max_body = epochs.protocol_params.max_block_body_size;
+
+        // 3 genesis delegates vote for `ppu_a`, 2 vote for `ppu_b`. Union of
+        // proposers is 5 (>= quorum), but neither value alone reaches 5.
+        let ppu_a = dugite_primitives::transaction::ProtocolParamUpdate {
+            min_fee_a: Some(55),
+            ..Default::default()
+        };
+        let ppu_b = dugite_primitives::transaction::ProtocolParamUpdate {
+            max_block_body_size: Some(65536),
+            ..Default::default()
+        };
+        let mut proposals = Vec::new();
+        for i in 0u8..3 {
+            proposals.push((Hash32::from_bytes([i; 32]), ppu_a.clone()));
+        }
+        for i in 3u8..5 {
+            proposals.push((Hash32::from_bytes([i; 32]), ppu_b.clone()));
+        }
+        epochs.pending_pp_updates.insert(EpochNo(5), proposals);
+
+        let result = rules.process_epoch_transition(
+            EpochNo(6),
+            &ctx,
+            &mut utxo,
+            &mut certs,
+            &mut gov,
+            &mut epochs,
+            &mut consensus,
+        );
+        assert!(result.is_ok());
+
+        // Neither value reached quorum: enact nothing. The old bug would
+        // have field-merged `ppu_a` and `ppu_b` together and applied both.
+        assert_eq!(epochs.protocol_params.min_fee_a, original_min_fee_a);
+        assert_eq!(
+            epochs.protocol_params.max_block_body_size,
+            original_max_body
+        );
+        assert!(epochs.pending_pp_updates.is_empty());
     }
 
     #[test]
