@@ -5476,7 +5476,12 @@ mod tests {
     fn test_well_formed_reference_script_accepted() {
         use dugite_primitives::transaction::ScriptRef;
         let (utxo_set, mut tx, _) = make_valid_tx();
-        tx.body.outputs[0].script_ref = Some(ScriptRef::PlutusV2(minimal_plutus_program_flat()));
+        // Real on-chain reference scripts are CBOR-bytestring-wrapped flat
+        // (cbor(flat)), exactly like witness scripts — NOT raw flat. #792's
+        // ref-script decode check therefore requires `from_cbor` (corrected
+        // after the #836 tx6.json fixture proved the double-wrap); build the
+        // fixture to match real chain data.
+        tx.body.outputs[0].script_ref = Some(ScriptRef::PlutusV2(minimal_plutus_program_cbor()));
         let mut params = ProtocolParameters::mainnet_defaults();
         params.protocol_version_major = 9;
         let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None)

@@ -1183,17 +1183,24 @@ fn plutus_witness_script_decodes(bytes: &[u8]) -> bool {
 
 /// Decode a REFERENCE script's bytes (`ScriptRef::PlutusVN` payload).
 ///
-/// Byte-format note: `dugite-serialization`'s `read_script_ref` decoder
-/// (`script_ref = #6.24(bytes .cbor script)`, `script = [lang_tag, bytes]`)
-/// already performs the single bytestring unwrap for the Plutus
-/// `script_value`, leaving `ScriptRef::PlutusVN(bytes)` holding the RAW
-/// FLAT program bytes directly — there is no further CBOR wrapper to
-/// strip (confirmed by the Dijkstra V4 `ScriptRef` round-trip test and by
-/// `compute_script_ref_hash`, which hashes these bytes directly). Requiring
-/// `from_cbor` here (matching the witness-script convention) would reject
-/// every legitimate reference script — use `Program::from_flat` only.
+/// Byte-format note: `read_script_ref` (`script_ref = #6.24(bytes .cbor
+/// script)`, `script = [lang_tag, script_value]`) performs a SINGLE
+/// bytestring unwrap of `script_value`, leaving `ScriptRef::PlutusVN(bytes)`
+/// holding a CBOR-bytestring-WRAPPED flat program — exactly like a witness
+/// script — NOT raw flat. This is confirmed three ways: (1) an actual
+/// captured on-chain reference script (uplc fixture `tx6.json`) begins with
+/// a CBOR bytestring header whose declared length wraps a flat program; (2)
+/// `compute_script_ref_hash` hashes `lang_tag || bytes` and this must equal
+/// the on-chain script hash, which cardano-ledger computes over
+/// `lang_tag || cbor(flat)` — so `bytes` is `cbor(flat)`; (3) the phase-2
+/// eval path (`dugite_uplc::…::decode_script_bytes`, #836) decodes these
+/// very bytes with `from_cbor` and succeeds on real fixtures. A prior
+/// revision used `from_flat` here (based on a synthetic Dijkstra round-trip
+/// rather than real chain data) — that FALSE-REJECTED every legitimate
+/// reference script as `MalformedReferenceScripts` (a consensus divergence).
+/// Use `from_cbor` — the same as witness scripts.
 fn plutus_ref_script_decodes(bytes: &[u8]) -> bool {
-    dugite_uplc::program::Program::from_flat(bytes).is_ok()
+    dugite_uplc::program::Program::from_cbor(bytes).is_ok()
 }
 
 /// Return `true` when the transaction has any Plutus scripts or redeemers.
