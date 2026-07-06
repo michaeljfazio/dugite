@@ -56,7 +56,8 @@ use crate::state::governance::{
 };
 use crate::state::substates::*;
 use crate::state::{
-    BlockValidationMode, DRepRegistration, LedgerError, ProposalState, StakeSnapshot,
+    apply_reserves_delta, BlockValidationMode, DRepRegistration, LedgerError, ProposalState,
+    StakeSnapshot,
 };
 use crate::utxo_diff::UtxoDiff;
 
@@ -585,11 +586,8 @@ impl EraRules for ConwayRules {
 
         // Apply pending reward update (backward compat for old snapshots).
         if let Some(rupd) = epochs.pending_reward_update.take() {
-            epochs.reserves.0 = epochs
-                .reserves
-                .0
-                .checked_sub(rupd.delta_reserves)
-                .expect("RUPD delta_reserves exceeds reserves — ledger invariant broken");
+            // Signed reserves adjustment — see issue #796.
+            epochs.reserves.0 = apply_reserves_delta(epochs.reserves.0, rupd.delta_reserves);
             epochs.treasury.0 = epochs
                 .treasury
                 .0
@@ -702,12 +700,8 @@ impl EraRules for ConwayRules {
                 );
             }
 
-            // Apply RUPD: adjust reserves and treasury
-            epochs.reserves.0 = epochs
-                .reserves
-                .0
-                .checked_sub(rupd.delta_reserves)
-                .expect("RUPD delta_reserves exceeds reserves — ledger invariant broken");
+            // Apply RUPD: adjust reserves and treasury (signed — issue #796)
+            epochs.reserves.0 = apply_reserves_delta(epochs.reserves.0, rupd.delta_reserves);
             epochs.treasury.0 = epochs
                 .treasury
                 .0

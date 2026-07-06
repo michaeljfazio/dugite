@@ -25,6 +25,10 @@ pub(crate) use governance::{
     pp_change_spo_threshold, prev_action_as_expected, DRepPPGroup, StakePoolPPGroup,
 };
 pub use rewards::compute_reward_update;
+// Re-export for the RUPD-apply sites in `eras::shelley` / `eras::conway`,
+// which are not descendants of `state` and cannot otherwise reach the
+// private `rewards` submodule. See issue #796.
+pub(crate) use rewards::apply_reserves_delta;
 #[doc(hidden)]
 pub use rewards::Rat;
 pub use snapshot::{
@@ -231,8 +235,15 @@ pub struct PendingRewardUpdate {
     pub rewards: HashMap<Hash32, Lovelace>,
     /// Total treasury increase (tau cut + undistributed rewards).
     pub delta_treasury: u64,
-    /// Total reserves decrease (monetary expansion).
-    pub delta_reserves: u64,
+    /// Signed reserves adjustment (Haskell `RewardUpdate.deltaR`, a signed
+    /// `DeltaCoin`/`Integer`). Positive means reserves DECREASE (the normal
+    /// monetary-expansion case); negative means reserves INCREASE — this
+    /// happens in a degraded/low-block epoch where `epoch_fees` exceeds
+    /// `treasury_cut + total_distributed`, and Haskell's `applyRUpdFiltered`
+    /// credits the difference back to reserves via `addDeltaCoin`. See
+    /// issue #796. `i128` (not `u64`) so the sign can be represented; the
+    /// magnitude never exceeds the max lovelace supply, well within range.
+    pub delta_reserves: i128,
 }
 
 // ── Governance proposal priority forest types ─────────────────────────
