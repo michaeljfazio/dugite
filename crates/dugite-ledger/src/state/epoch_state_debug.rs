@@ -799,21 +799,57 @@ fn pool_summary(
 }
 
 /// Pick the future protocol parameters that are queued to take effect at
-/// the *next* epoch boundary (i.e. epoch_to + 1).  Returns None when no
-/// update is queued.  We do not attempt to apply the update here; we
-/// simply surface the latest queued value so the diff harness can flag
-/// premature/delayed enactment.
+/// the *next* epoch boundary (i.e. the transition `epoch_to -> epoch_to +
+/// 1`).  Returns `None` when nothing is queued.
+///
+/// # Lookup key
+///
+/// `state` is captured *right after* the boundary handler ran for
+/// `epoch_to` (see [`capture`]'s doc comment) — i.e. pre-boundary relative
+/// to the *next* transition. The pre-Conway PPUP enactment rule
+/// (`ShelleyRules`/`AlonzoRules`/`BabbageRules`/`ConwayRules::
+/// process_epoch_transition`) applies a proposal at the boundary entering
+/// `new_epoch` by looking it up under key `new_epoch - 1`. For the next
+/// transition (`new_epoch = epoch_to + 1`) that key is exactly `epoch_to`
+/// itself, so both `pending_pp_updates` and `future_pp_updates` are probed
+/// under `EpochNo(epoch_to)`. `future_pp_updates` is included defensively:
+/// in practice every entry is drained into `pending_pp_updates` on every
+/// boundary transition (regardless of its target epoch), so by the time
+/// this runs it is normally empty — but probing it costs nothing and
+/// guards against a future refactor of the promotion step.
+///
+/// # Scope
+///
+/// This does not attempt to replicate the on-chain quorum check
+/// (`distinct_proposers >= update_quorum`) — the debug dumper has no
+/// access to the genesis `update_quorum` value here — so every queued
+/// proposal under the key is merged and applied unconditionally. This is
+/// diagnostic/best-effort: good enough for the diff harness to flag
+/// premature/delayed enactment of scalar fields (n_opt, a0, rho, tau,
+/// etc.), not a consensus-accurate re-derivation.
+///
+/// Conway-era (PV9+) `ParameterChange` governance actions enact via
+/// ratification at the same boundary and never populate these maps (they
+/// go through `proposal_procedures`/`voting_procedures`, not the legacy
+/// `tx.body.update` field) — for Conway epochs this naturally returns
+/// `None`, which is the intended best-effort behavior.
 fn next_future_pp(epochs: &EpochSubState, epoch_to: EpochNo) -> Option<ProtocolParameters> {
-    let next = EpochNo(epoch_to.0.saturating_add(1));
-    // Future updates land in `future_pp_updates` keyed by the epoch they
-    // become active; we surface the queued ProtocolParamUpdate but cannot
-    // *materialise* it as a full `ProtocolParameters` without re-running
-    // PPUP — so we instead surface a clone of `protocol_params` annotated
-    // with the queued update's protocol_version when present.  This is
-    // good enough for the diff harness, which compares scalar fields
-    // (n_opt, a0, rho, tau) rather than the whole struct.
-    let _ = (epochs, next);
-    None
+    let mut proposals: Vec<&dugite_primitives::transaction::ProtocolParamUpdate> = Vec::new();
+    if let Some(entries) = epochs.pending_pp_updates.get(&epoch_to) {
+        proposals.extend(entries.iter().map(|(_, ppu)| ppu));
+    }
+    if let Some(entries) = epochs.future_pp_updates.get(&epoch_to) {
+        proposals.extend(entries.iter().map(|(_, ppu)| ppu));
+    }
+    if proposals.is_empty() {
+        return None;
+    }
+
+    let mut params = epochs.protocol_params.clone();
+    for ppu in proposals {
+        crate::eras::shelley::apply_pp_update(&mut params, ppu);
+    }
+    Some(params)
 }
 
 // ── I/O ────────────────────────────────────────────────────────────────
@@ -1366,5 +1402,99 @@ mod tests {
         assert_eq!(h1, h2);
         assert_ne!(h1, h_diff_threshold);
         assert_eq!(h1.len(), 64);
+    }
+
+    // -----------------------------------------------------------------------
+    // #807: next_future_pp
+    // -----------------------------------------------------------------------
+
+    /// No queued proposal under either map ⇒ `None`.
+    #[test]
+    fn next_future_pp_returns_none_when_nothing_queued() {
+        let state = make_state(); // epoch = 42
+        assert!(next_future_pp(&state.epochs, state.epoch).is_none());
+    }
+
+    /// A proposal queued in `pending_pp_updates` under the "next boundary"
+    /// key (`epoch_to` itself — see the lookup-key doc comment on
+    /// `next_future_pp`) must be surfaced, merged onto a clone of the
+    /// current `protocol_params`.
+    #[test]
+    fn next_future_pp_surfaces_pending_update() {
+        let mut state = make_state(); // epoch = 42
+        let epoch_to = state.epoch;
+        let ppu = dugite_primitives::transaction::ProtocolParamUpdate {
+            n_opt: Some(777),
+            ..Default::default()
+        };
+        state
+            .epochs
+            .pending_pp_updates
+            .insert(epoch_to, vec![(h32(0x01), ppu)]);
+
+        let future = next_future_pp(&state.epochs, epoch_to)
+            .expect("a pending_pp_updates entry under epoch_to must be surfaced");
+        assert_eq!(future.n_opt, 777);
+        // Every other field is inherited unchanged from the current params.
+        assert_eq!(
+            future.protocol_version_major,
+            state.epochs.protocol_params.protocol_version_major
+        );
+    }
+
+    /// Same lookup key, but the entry lives in `future_pp_updates` instead
+    /// of `pending_pp_updates` (the defensive second probe).
+    #[test]
+    fn next_future_pp_surfaces_future_update() {
+        let mut state = make_state(); // epoch = 42
+        let epoch_to = state.epoch;
+        let ppu = dugite_primitives::transaction::ProtocolParamUpdate {
+            n_opt: Some(555),
+            ..Default::default()
+        };
+        state
+            .epochs
+            .future_pp_updates
+            .insert(epoch_to, vec![(h32(0x02), ppu)]);
+
+        let future = next_future_pp(&state.epochs, epoch_to)
+            .expect("a future_pp_updates entry under epoch_to must be surfaced");
+        assert_eq!(future.n_opt, 555);
+    }
+
+    /// A proposal queued under a DIFFERENT epoch key (not the immediate
+    /// next boundary) must not leak into the result.
+    #[test]
+    fn next_future_pp_ignores_updates_under_other_epochs() {
+        let mut state = make_state(); // epoch = 42
+        let ppu = dugite_primitives::transaction::ProtocolParamUpdate {
+            n_opt: Some(999),
+            ..Default::default()
+        };
+        state
+            .epochs
+            .pending_pp_updates
+            .insert(EpochNo(state.epoch.0 + 5), vec![(h32(0x03), ppu)]);
+
+        assert!(next_future_pp(&state.epochs, state.epoch).is_none());
+    }
+
+    /// End-to-end: `capture`'s `pp_future` field reflects a queued update.
+    #[test]
+    fn capture_populates_pp_future_from_pending_pp_updates() {
+        let mut state = make_state(); // epoch = 42
+        let epoch_to = state.epoch;
+        let ppu = dugite_primitives::transaction::ProtocolParamUpdate {
+            n_opt: Some(333),
+            ..Default::default()
+        };
+        state
+            .epochs
+            .pending_pp_updates
+            .insert(epoch_to, vec![(h32(0x04), ppu)]);
+
+        let dump = capture(&state, epoch_to.0, 432_000, None);
+        let future = dump.pp_future.expect("pp_future must be populated");
+        assert_eq!(future.n_opt, 333);
     }
 }

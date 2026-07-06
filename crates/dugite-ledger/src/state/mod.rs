@@ -2101,6 +2101,26 @@ impl LedgerState {
             return Some(0);
         }
 
+        // #806 DEFECT A: `save_ledger_snapshot` clears `utxo.diff_seq` (to
+        // reclaim memory — diffs are `#[serde(skip)]`, not persisted) but
+        // does NOT clear `seq` (the `LedgerSeq`). If a rollback target lands
+        // further back than the diffs retained since the last snapshot,
+        // `diff_seq.len() < n` and reverse-applying only `diff_seq.len()`
+        // UTxO diffs while restoring non-UTxO state `n` blocks back would
+        // silently desync the UTxO set from the rest of ledger state. Must
+        // be checked BEFORE any mutation below (`diff_seq.rollback` /
+        // `seq.rollback` have not run yet at this point), so returning
+        // `None` here is a clean bail-out: the caller's existing snapshot
+        // reload fallback recovers safely.
+        if n > self.utxo.diff_seq.len() {
+            tracing::warn!(
+                n,
+                have = self.utxo.diff_seq.len(),
+                "LedgerSeq/DiffSeq desync: DiffSeq too short to cover rollback; falling back to snapshot recovery"
+            );
+            return None;
+        }
+
         // Step 1+2: pop the trailing n UTxO diffs and invert each one on the
         // live store.  `DiffSeq::rollback` removes them from the seq; the
         // returned `Vec` is consumed here for the reverse-apply.

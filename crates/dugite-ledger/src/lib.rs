@@ -3,7 +3,6 @@
 pub mod eras;
 pub mod ledger_seq;
 pub mod plutus;
-pub mod rules;
 pub mod state;
 pub mod utxo;
 pub mod utxo_diff;
