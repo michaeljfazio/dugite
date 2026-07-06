@@ -76,10 +76,10 @@ const DATA_CHUNK_LIMIT: usize = 64;
 /// would change the body hash for txs that gossip in non-sorted form,
 /// breaking byte-exact round-trip.
 ///
-/// `PartialEq`/`Eq`, `Hash`, and `Drop` are all hand-written (not
-/// derived) as explicit-stack iterative traversals — see the impls
+/// `Clone`, `PartialEq`/`Eq`, `Hash`, and `Drop` are all hand-written
+/// (not derived) as explicit-stack iterative traversals — see the impls
 /// below (#832).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum Data {
     /// `Constr` — tagged sum: `Constr tag args`.
     Constr(u64, Vec<Data>),
@@ -149,6 +149,99 @@ impl PartialEq for Data {
 }
 
 impl Eq for Data {}
+
+/// Explicit-stack iterative deep clone.
+///
+/// `Data` holds its recursive children by value (`Vec<Data>` /
+/// `Vec<(Data, Data)>`), so `#[derive(Clone)]` recurses one native stack
+/// frame per nesting level — the identical latent stack-overflow class
+/// that `PartialEq`, `Hash`, and `Drop` were hand-written to avoid
+/// (#832), and it was the one impl left derived. A deep clone IS
+/// reachable on the CEK hot path: a `Var` lookup (`machine::step`) clones
+/// the bound `Value`, and a `Value` wrapping a `Constant::Data(d)` whose
+/// nesting depth an adversary drove to ~10^5–10^6 (repeated
+/// `constrData`/`listData`/`mapData`, each a separately-charged builtin)
+/// would overflow the phase-2 evaluation stack (unguarded, a 2 MiB rayon
+/// worker) = process abort = remote DoS.
+///
+/// This produces the exact same value as the derived clone; only the
+/// stack behavior changes. The clone is assembled bottom-up: a work-stack
+/// of `Task`s drives a post-order traversal, each finished child is
+/// pushed onto `out`, and a `Build*` task pops its children back off
+/// `out` to reassemble the parent. Children are pushed in reverse so they
+/// pop — and therefore land in `out` — in source order (a reordered
+/// `Map`/`Constr` clone would change the body hash: byte-exactness is not
+/// optional here).
+impl Clone for Data {
+    fn clone(&self) -> Self {
+        enum Task<'a> {
+            Descend(&'a Data),
+            BuildConstr(u64, usize),
+            BuildList(usize),
+            BuildMap(usize),
+        }
+        let mut tasks: Vec<Task<'_>> = vec![Task::Descend(self)];
+        let mut out: Vec<Data> = Vec::new();
+        while let Some(task) = tasks.pop() {
+            match task {
+                Task::Descend(d) => match d {
+                    Data::Constr(tag, args) => {
+                        tasks.push(Task::BuildConstr(*tag, args.len()));
+                        for child in args.iter().rev() {
+                            tasks.push(Task::Descend(child));
+                        }
+                    }
+                    Data::List(items) => {
+                        tasks.push(Task::BuildList(items.len()));
+                        for child in items.iter().rev() {
+                            tasks.push(Task::Descend(child));
+                        }
+                    }
+                    Data::Map(entries) => {
+                        tasks.push(Task::BuildMap(entries.len()));
+                        // Push value-then-key within each pair, over the
+                        // entries in reverse, so keys and values pop back in
+                        // source order (k0, v0, k1, v1, …).
+                        for (k, v) in entries.iter().rev() {
+                            tasks.push(Task::Descend(v));
+                            tasks.push(Task::Descend(k));
+                        }
+                    }
+                    // Leaves clone directly — bounded, non-recursive.
+                    Data::I(n) => out.push(Data::I(n.clone())),
+                    Data::B(b) => out.push(Data::B(b.clone())),
+                },
+                Task::BuildConstr(tag, n) => {
+                    let start = out.len() - n;
+                    let args = out.split_off(start);
+                    out.push(Data::Constr(tag, args));
+                }
+                Task::BuildList(n) => {
+                    let start = out.len() - n;
+                    let items = out.split_off(start);
+                    out.push(Data::List(items));
+                }
+                Task::BuildMap(n) => {
+                    let start = out.len() - 2 * n;
+                    let flat = out.split_off(start);
+                    let mut entries = Vec::with_capacity(n);
+                    let mut it = flat.into_iter();
+                    while let (Some(k), Some(v)) = (it.next(), it.next()) {
+                        entries.push((k, v));
+                    }
+                    out.push(Data::Map(entries));
+                }
+            }
+        }
+        match out.pop() {
+            Some(root) => root,
+            // Unreachable: every completed subtree pushes exactly one node
+            // onto `out`, and `self` is one subtree, so `out` ends with
+            // exactly one root.
+            None => unreachable!("clone traversal always reduces to exactly one root node"),
+        }
+    }
+}
 
 /// Explicit-stack iterative `Hash`, matching the iterative `PartialEq`
 /// above (clippy's `derived_hash_with_manual_eq` correctly flags a
@@ -1217,19 +1310,28 @@ mod tests {
     /// be nested far deeper than [`DATA_MAX_DEPTH`] — a script can
     /// cheaply reach ~10^5-10^6 levels within budget. This exercises
     /// every recursive `Data` traversal an adversarial script can
-    /// trigger on such a value: `equalsData` (`PartialEq`),
-    /// `serialiseData` (`to_cbor`, stacker-guarded), and the final
-    /// `Drop` when it goes out of scope. Before #832, the derived
-    /// recursive `PartialEq`/`Drop` would overflow the native stack
-    /// (process abort — a remote DoS) at this depth. Mirrors the CEK
-    /// env's `deep_chain_extends_and_drops` (`machine/env.rs`).
+    /// trigger on such a value: `equalsData` (`PartialEq`), the deep
+    /// `Clone` a CEK `Var` lookup performs on a bound `Constant::Data`
+    /// (`machine::step`), `serialiseData` (`to_cbor`, stacker-guarded),
+    /// and the final `Drop` when it goes out of scope. Before #832, the
+    /// derived recursive `PartialEq`/`Drop` would overflow the native
+    /// stack at this depth; `Clone` was left derived until this fix and
+    /// overflowed the same way (process abort — a remote DoS). Mirrors
+    /// the CEK env's `deep_chain_extends_and_drops` (`machine/env.rs`).
     #[test]
-    fn deeply_nested_data_compares_serialises_and_drops_without_overflow() {
+    fn deeply_nested_data_compares_clones_serialises_and_drops_without_overflow() {
         const DEPTH: usize = 200_000;
         let mut d = Data::I(BigInt::from(0));
         for _ in 0..DEPTH {
             d = Data::List(vec![d]);
         }
+        // Deep `Clone` — the CEK `Var`-lookup path. Must not overflow and
+        // must reproduce the value exactly.
+        let cloned = d.clone();
+        assert!(
+            cloned == d,
+            "clone of 200k-deep Data must equal the original"
+        );
         // `equalsData d d` — exercises the iterative `PartialEq`.
         #[allow(clippy::eq_op)]
         {
@@ -1238,8 +1340,40 @@ mod tests {
         // `serialiseData d` — exercises the stacker-guarded encoder.
         let cbor = d.to_cbor().expect("serialiseData must not overflow");
         assert!(!cbor.is_empty());
-        // `d` (and `cbor`) drop here at scope exit, exercising the
-        // iterative `Drop` on the full 200k-deep structure.
+        // `d`, `cloned`, and `cbor` drop here at scope exit, exercising the
+        // iterative `Drop` on two full 200k-deep structures.
+    }
+
+    /// The iterative `Clone` must reproduce a mixed `Constr`/`Map`/`List`
+    /// value with byte-exact field order. A clone that reordered `Map`
+    /// entries or `Constr` args would change `serialiseData`/the body hash
+    /// — a silent consensus divergence.
+    #[test]
+    fn iterative_clone_preserves_structure_and_order() {
+        let d = Data::Constr(
+            7,
+            vec![
+                Data::Map(vec![
+                    (Data::I(BigInt::from(1)), Data::B(vec![0xAA])),
+                    (
+                        Data::I(BigInt::from(2)),
+                        Data::List(vec![Data::I(BigInt::from(3))]),
+                    ),
+                ]),
+                Data::List(vec![
+                    Data::I(BigInt::from(-9)),
+                    Data::Constr(0, vec![Data::B(vec![])]),
+                ]),
+                Data::B(vec![1, 2, 3, 4]),
+            ],
+        );
+        let cloned = d.clone();
+        assert!(cloned == d, "clone must be structurally equal");
+        assert_eq!(
+            cloned.to_cbor().unwrap(),
+            d.to_cbor().unwrap(),
+            "clone must serialise byte-identically (order preserved)"
+        );
     }
 
     #[test]
