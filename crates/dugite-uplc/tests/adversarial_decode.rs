@@ -35,7 +35,10 @@ fn from_flat_rejects_trailing_bytes_toomuchspace() {
 
 #[test]
 fn from_flat_rejects_empty_and_truncated_input() {
-    assert!(Program::from_flat(&[]).is_err(), "empty flat input must be rejected");
+    assert!(
+        Program::from_flat(&[]).is_err(),
+        "empty flat input must be rejected"
+    );
     let flat = minimal_program().to_flat().expect("encode");
     // Truncate to half — the term/version bits are incomplete.
     assert!(
