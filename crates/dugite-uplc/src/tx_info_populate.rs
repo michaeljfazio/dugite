@@ -301,9 +301,10 @@ pub fn required_signers_to_plutus(signers: &[dugite_primitives::hash::Hash28]) -
 /// re-cap here.
 pub fn plutus_data_to_data(p: &PrimPlutusData) -> Data {
     match p {
-        PrimPlutusData::Constr(tag, fields) => {
-            Data::Constr(*tag, fields.iter().map(plutus_data_to_data).collect())
-        }
+        PrimPlutusData::Constr(tag, fields) => Data::Constr(
+            num_bigint::BigInt::from(*tag),
+            fields.iter().map(plutus_data_to_data).collect(),
+        ),
         PrimPlutusData::Map(entries) => Data::Map(
             entries
                 .iter()
@@ -1606,7 +1607,7 @@ mod tests {
         assert_eq!(
             d,
             Data::Constr(
-                3,
+                BigInt::from(3),
                 vec![
                     Data::I(BigInt::from(1)),
                     Data::B(vec![0xff, 0xee]),

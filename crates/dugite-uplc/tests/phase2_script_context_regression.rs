@@ -130,15 +130,17 @@ fn posix_time_range_always_valid_has_correct_structure() {
     let d = r.to_data(false);
 
     // Outer: Interval = Constr 0 [lower_bound, upper_bound]
-    let Data::Constr(0, ref outer_fields) = d else {
+    let Data::Constr(ref __tag, ref outer_fields) = d else {
         panic!("Interval must be Constr 0; got {d:?}");
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     assert_eq!(outer_fields.len(), 2, "Interval has 2 fields (lb, ub)");
 
     // Lower bound: LowerBound NegInf True = Constr 0 [Constr 0 [], Constr 1 []]
-    let Data::Constr(0, ref lb_fields) = outer_fields[0] else {
+    let Data::Constr(ref __tag, ref lb_fields) = outer_fields[0] else {
         panic!("LowerBound must be Constr 0; got {:?}", outer_fields[0]);
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     assert_eq!(
         lb_fields.len(),
         2,
@@ -146,19 +148,20 @@ fn posix_time_range_always_valid_has_correct_structure() {
     );
     assert_eq!(
         lb_fields[0],
-        Data::Constr(0, vec![]),
+        Data::Constr(BigInt::from(0), vec![]),
         "LowerBound(None) extended must be NegInf = Constr 0 []"
     );
     assert_eq!(
         lb_fields[1],
-        Data::Constr(1, vec![]),
+        Data::Constr(BigInt::from(1), vec![]),
         "LowerBound closed must be True = Constr 1 []"
     );
 
     // Upper bound: UpperBound PosInf True = Constr 0 [Constr 2 [], Constr 1 []]
-    let Data::Constr(0, ref ub_fields) = outer_fields[1] else {
+    let Data::Constr(ref __tag, ref ub_fields) = outer_fields[1] else {
         panic!("UpperBound must be Constr 0; got {:?}", outer_fields[1]);
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     assert_eq!(
         ub_fields.len(),
         2,
@@ -166,12 +169,12 @@ fn posix_time_range_always_valid_has_correct_structure() {
     );
     assert_eq!(
         ub_fields[0],
-        Data::Constr(2, vec![]),
+        Data::Constr(BigInt::from(2), vec![]),
         "UpperBound(None) extended must be PosInf = Constr 2 []"
     );
     assert_eq!(
         ub_fields[1],
-        Data::Constr(1, vec![]),
+        Data::Constr(BigInt::from(1), vec![]),
         "UpperBound PosInf closed must be True = Constr 1 []"
     );
 }
@@ -189,37 +192,40 @@ fn posix_time_range_finite_bounds_have_correct_structure() {
     };
     let d = r.to_data(false);
 
-    let Data::Constr(0, ref outer) = d else {
+    let Data::Constr(ref __tag, ref outer) = d else {
         panic!("Interval must be Constr 0");
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
 
     // Lower: LowerBound (Finite vs_ms) True
-    let Data::Constr(0, ref lb) = outer[0] else {
+    let Data::Constr(ref __tag, ref lb) = outer[0] else {
         panic!("LowerBound must be Constr 0");
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     assert_eq!(
         lb[0],
-        Data::Constr(1, vec![Data::I(BigInt::from(vs_ms))]),
+        Data::Constr(BigInt::from(1), vec![Data::I(BigInt::from(vs_ms))]),
         "lower extended must be Finite vs_ms = Constr 1 [I(vs_ms)]"
     );
     assert_eq!(
         lb[1],
-        Data::Constr(1, vec![]),
+        Data::Constr(BigInt::from(1), vec![]),
         "lower closed must be True = Constr 1 []"
     );
 
     // Upper: UpperBound (Finite ttl_ms) False
-    let Data::Constr(0, ref ub) = outer[1] else {
+    let Data::Constr(ref __tag, ref ub) = outer[1] else {
         panic!("UpperBound must be Constr 0");
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     assert_eq!(
         ub[0],
-        Data::Constr(1, vec![Data::I(BigInt::from(ttl_ms))]),
+        Data::Constr(BigInt::from(1), vec![Data::I(BigInt::from(ttl_ms))]),
         "upper extended must be Finite ttl_ms = Constr 1 [I(ttl_ms)]"
     );
     assert_eq!(
         ub[1],
-        Data::Constr(0, vec![]),
+        Data::Constr(BigInt::from(0), vec![]),
         "upper closed must be False = Constr 0 [] (half-open upper)"
     );
 }
@@ -237,24 +243,26 @@ fn posix_time_range_ttl_only_upper_closure_is_era_gated() {
         upper: Some(1_781_858_645_000i64),
     };
     let upper_closure = |conway: bool| -> Data {
-        let Ok((0, outer)) = r.to_data(conway).into_constr() else {
+        let Ok((outer_tag, outer)) = r.to_data(conway).into_constr() else {
             panic!("interval must be Constr 0");
         };
-        let Ok((0, ub)) = outer[1].clone().into_constr() else {
+        assert_eq!(outer_tag, BigInt::from(0));
+        let Ok((ub_tag, ub)) = outer[1].clone().into_constr() else {
             panic!("upper bound must be Constr 0");
         };
+        assert_eq!(ub_tag, BigInt::from(0));
         ub[1].clone()
     };
     // Pre-Conway (Alonzo/Babbage): `PV1.to` → UpperBound (Finite t) True.
     assert_eq!(
         upper_closure(false),
-        Data::Constr(1, vec![]),
+        Data::Constr(BigInt::from(1), vec![]),
         "pre-Conway ttl-only upper closure must be True (inclusive, PV1.to)"
     );
     // Conway+: `strictUpperBound` → UpperBound (Finite t) False.
     assert_eq!(
         upper_closure(true),
-        Data::Constr(0, vec![]),
+        Data::Constr(BigInt::from(0), vec![]),
         "Conway+ ttl-only upper closure must be False (exclusive, strictUpperBound)"
     );
 }
@@ -268,18 +276,19 @@ fn posix_time_range_does_not_use_old_flat_encoding() {
         upper: Some(2_000_000i64),
     };
     let d = r.to_data(false);
-    let Data::Constr(0, ref outer) = d else {
+    let Data::Constr(ref __tag, ref outer) = d else {
         panic!("must be Constr 0");
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     // Old encoding: bound(Some(t)) = Constr 1 [I(t), Constr 1 []]
     // New encoding: LowerBound = Constr 0 [Constr 1 [I(t)], Bool]
     // Check that neither field is Constr 1 at the top level (that was the old bug).
     assert!(
-        !matches!(outer[0], Data::Constr(1, _)),
+        !matches!(outer[0], Data::Constr(ref tag, _) if tag == &BigInt::from(1)),
         "lower bound must NOT be Constr 1 (old buggy encoding)"
     );
     assert!(
-        !matches!(outer[1], Data::Constr(1, _)),
+        !matches!(outer[1], Data::Constr(ref tag, _) if tag == &BigInt::from(1)),
         "upper bound must NOT be Constr 1 (old buggy encoding)"
     );
 }
@@ -389,7 +398,10 @@ fn flat_round_trips_list_data_constant() {
     let items = vec![
         Constant::Data(Data::I(BigInt::from(1i64))),
         Constant::Data(Data::B(vec![0xaa, 0xbb])),
-        Constant::Data(Data::Constr(0, vec![Data::I(BigInt::from(3i64))])),
+        Constant::Data(Data::Constr(
+            BigInt::from(0),
+            vec![Data::I(BigInt::from(3i64))],
+        )),
     ];
     let program = Program {
         version: (1, 0, 0),
@@ -488,9 +500,10 @@ fn txinfo_v3_fee_is_bare_integer_not_value_map() {
     let mut info = minimal_txinfo_v3();
     info.fee = BigInt::from(lovelace);
     let d = info.to_data();
-    let Data::Constr(0, ref fields) = d else {
+    let Data::Constr(ref __tag, ref fields) = d else {
         panic!("TxInfoV3 must be Constr 0");
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     // V3 TxInfo to_data field order: [inputs, refInputs, outputs, fee, ...] —
     // fee is field index 3.
     match &fields[3] {
@@ -527,9 +540,10 @@ fn txinfo_v1_wdrl_is_data_list_of_constr_pairs() {
     let d = info.to_data(false);
 
     // V1 TxInfo: Constr 0 [inputs, outputs, fee, mint, dcert, wdrl, ...]
-    let Data::Constr(0, ref fields) = d else {
+    let Data::Constr(ref __tag, ref fields) = d else {
         panic!("TxInfoV1 must be Constr 0");
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     // wdrl is field index 5
     let wdrl_field = &fields[5];
     // V1 wdrl must be a List (not a Map).
@@ -547,7 +561,7 @@ fn txinfo_v1_wdrl_is_data_list_of_constr_pairs() {
     };
     assert_eq!(items.len(), 1, "expected 1 withdrawal entry");
     assert!(
-        matches!(&items[0], Data::Constr(0, inner) if inner.len() == 2),
+        matches!(&items[0], Data::Constr(tag, inner) if tag == &BigInt::from(0) && inner.len() == 2),
         "V1 wdrl entry must be Constr 0 [cred, amt]; got {:?}",
         items[0]
     );
@@ -562,9 +576,10 @@ fn txinfo_v2_wdrl_is_data_map() {
     info.wdrl = vec![(sc, amt)];
     let d = info.to_data(false);
 
-    let Data::Constr(0, ref fields) = d else {
+    let Data::Constr(ref __tag, ref fields) = d else {
         panic!("TxInfoV2 must be Constr 0");
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     // V2 field order: inputs=0, reference_inputs=1, outputs=2, fee=3, mint=4,
     //                 dcert=5, wdrl=6, valid_range=7, signatories=8, redeemers=9,
     //                 data=10, txid=11
@@ -584,9 +599,10 @@ fn txinfo_v2_wdrl_is_data_map() {
 fn txinfo_v1_empty_wdrl_is_empty_list() {
     let info = minimal_txinfo_v1();
     let d = info.to_data(false);
-    let Data::Constr(0, ref fields) = d else {
+    let Data::Constr(ref __tag, ref fields) = d else {
         panic!("expected Constr 0");
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     assert_eq!(
         fields[5],
         Data::List(vec![]),
@@ -600,9 +616,10 @@ fn txinfo_v1_empty_wdrl_is_empty_list() {
 fn txinfo_v2_empty_wdrl_is_empty_map() {
     let info = minimal_txinfo_v2();
     let d = info.to_data(false);
-    let Data::Constr(0, ref fields) = d else {
+    let Data::Constr(ref __tag, ref fields) = d else {
         panic!("expected Constr 0");
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     assert_eq!(
         fields[6],
         Data::Map(vec![]),
@@ -674,17 +691,19 @@ fn txoutref_txid_is_constr_wrapped() {
     };
     let d = r.to_data();
     // Outer: Constr 0 [TxId, Integer]
-    let Data::Constr(0, ref outer) = d else {
+    let Data::Constr(ref __tag, ref outer) = d else {
         panic!("TxOutRef must be Constr 0; got {d:?}");
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     assert_eq!(outer.len(), 2, "TxOutRef has 2 fields");
     // Inner TxId: must be Constr 0 [B bytes32], NOT bare B bytes32.
-    let Data::Constr(0, ref id_fields) = outer[0] else {
+    let Data::Constr(ref __tag, ref id_fields) = outer[0] else {
         panic!(
             "TxId must be Constr 0 [B bytes32]; got {:?} — this is Bug E (TxId not wrapped)",
             outer[0]
         );
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     assert_eq!(id_fields.len(), 1);
     assert!(
         matches!(&id_fields[0], Data::B(b) if b.len() == 32),
@@ -707,9 +726,10 @@ fn txoutref_txid_is_not_bare_bytes() {
         tx_id: [0x11; 32],
         idx: 0,
     };
-    let Data::Constr(0, ref outer) = r.to_data() else {
+    let Data::Constr(ref __tag, ref outer) = r.to_data() else {
         panic!("expected Constr 0");
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     assert!(
         !matches!(&outer[0], Data::B(_)),
         "TxId field must NOT be bare bytes (Bug E regression); got {:?}",
@@ -732,9 +752,10 @@ fn txoutref_v3_txid_is_bare_bytes() {
         tx_id: [0xcd; 32],
         idx: 3,
     };
-    let Data::Constr(0, ref outer) = r.to_data_v3() else {
+    let Data::Constr(ref __tag, ref outer) = r.to_data_v3() else {
         panic!("V3 TxOutRef must be Constr 0");
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     assert_eq!(outer.len(), 2);
     assert!(
         matches!(&outer[0], Data::B(b) if b.len() == 32),
@@ -767,20 +788,23 @@ fn v3_txininfo_embeds_bare_txid_outref() {
         }];
         i
     };
-    let Data::Constr(0, ref fields) = info.to_data() else {
+    let Data::Constr(ref __tag, ref fields) = info.to_data() else {
         panic!("TxInfoV3 must be Constr 0");
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     // field[0] = inputs : List[TxInInfo]
     let Data::List(ref inputs) = fields[0] else {
         panic!("inputs must be a List");
     };
-    let Data::Constr(0, ref txininfo) = inputs[0] else {
+    let Data::Constr(ref __tag, ref txininfo) = inputs[0] else {
         panic!("TxInInfo must be Constr 0");
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     // txininfo[0] = TxOutRef = Constr 0 [B32 BARE, I idx]
-    let Data::Constr(0, ref outref) = txininfo[0] else {
+    let Data::Constr(ref __tag, ref outref) = txininfo[0] else {
         panic!("TxOutRef must be Constr 0");
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     assert!(
         matches!(&outref[0], Data::B(b) if b.len() == 32),
         "V3 TxInInfo's TxOutRef txid must be BARE B(32), not Constr-wrapped; got {:?}",
@@ -795,9 +819,10 @@ fn gov_action_id_v3_txid_is_bare_bytes() {
         tx_id: [0x09; 32],
         idx: 1,
     };
-    let Data::Constr(0, ref outer) = g.to_data() else {
+    let Data::Constr(ref __tag, ref outer) = g.to_data() else {
         panic!("GovActionId must be Constr 0");
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     assert_eq!(outer.len(), 2);
     assert!(
         matches!(&outer[0], Data::B(b) if b.len() == 32),
@@ -823,9 +848,10 @@ fn txinfo_v1_fee_is_ada_value_map() {
     let d = info.to_data(false);
 
     // V1 TxInfo: Constr 0 [inputs, outputs, fee, ...]  — fee is field 2
-    let Data::Constr(0, ref fields) = d else {
+    let Data::Constr(ref __tag, ref fields) = d else {
         panic!("TxInfoV1 must be Constr 0");
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     let fee_field = &fields[2];
 
     // fee must be a Map (not I)
@@ -872,9 +898,10 @@ fn txinfo_v2_fee_is_ada_value_map() {
     let mut info = minimal_txinfo_v2();
     info.fee = BigInt::from(5_000_000u64);
     let d = info.to_data(false);
-    let Data::Constr(0, ref fields) = d else {
+    let Data::Constr(ref __tag, ref fields) = d else {
         panic!("TxInfoV2 must be Constr 0");
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     // V2: inputs=0, ref_inputs=1, outputs=2, fee=3
     let fee_field = &fields[3];
     assert!(
@@ -900,9 +927,10 @@ fn txinfo_v1_data_is_list_of_constr_pairs() {
 
     // V1 TxInfo: Constr 0 [inputs, outputs, fee, mint, dcert, wdrl, validRange, sigs, data, id]
     // data is field index 8
-    let Data::Constr(0, ref fields) = d else {
+    let Data::Constr(ref __tag, ref fields) = d else {
         panic!("TxInfoV1 must be Constr 0");
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     let data_field = &fields[8];
     assert!(
         matches!(data_field, Data::List(_)),
@@ -916,12 +944,13 @@ fn txinfo_v1_data_is_list_of_constr_pairs() {
         unreachable!()
     };
     assert_eq!(items.len(), 1, "expected 1 datum entry");
-    let Data::Constr(0, ref pair) = items[0] else {
+    let Data::Constr(ref __tag, ref pair) = items[0] else {
         panic!(
             "V1 data entry must be Constr 0 [B32, datum]; got {:?}",
             items[0]
         );
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     assert_eq!(pair.len(), 2);
     assert!(
         matches!(&pair[0], Data::B(b) if b.len() == 32),
@@ -941,9 +970,10 @@ fn txinfo_v2_data_is_map() {
     let d = info.to_data(false);
 
     // V2: field 10 is data
-    let Data::Constr(0, ref fields) = d else {
+    let Data::Constr(ref __tag, ref fields) = d else {
         panic!("TxInfoV2 must be Constr 0");
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     let data_field = &fields[10];
     assert!(
         matches!(data_field, Data::Map(_)),
@@ -963,13 +993,15 @@ fn txinfo_v1_txid_is_constr_wrapped() {
     let d = info.to_data(false);
 
     // V1 TxInfo field 9 is txid
-    let Data::Constr(0, ref fields) = d else {
+    let Data::Constr(ref __tag, ref fields) = d else {
         panic!("TxInfoV1 must be Constr 0");
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     let id_field = &fields[9];
-    let Data::Constr(0, ref inner) = id_field else {
+    let Data::Constr(ref __tag, ref inner) = id_field else {
         panic!("txInfoId (V1 field 9) must be TxId = Constr 0 [B32]; got {id_field:?}");
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     assert_eq!(inner.len(), 1);
     assert!(
         matches!(&inner[0], Data::B(b) if b.len() == 32),
@@ -983,9 +1015,10 @@ fn txinfo_v1_txid_is_constr_wrapped() {
 fn txinfo_v1_txid_is_not_bare_bytes() {
     let info = minimal_txinfo_v1();
     let d = info.to_data(false);
-    let Data::Constr(0, ref fields) = d else {
+    let Data::Constr(ref __tag, ref fields) = d else {
         panic!("expected Constr 0")
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     assert!(
         !matches!(&fields[9], Data::B(_)),
         "txInfoId (V1 field 9) must NOT be bare bytes; got {:?}",
@@ -1015,9 +1048,10 @@ fn minimal_txout_v1(datum: OutputDatum) -> TxOut {
 fn txout_v1_has_three_fields() {
     let out = minimal_txout_v1(OutputDatum::None);
     let d = out.to_data_v1();
-    let Data::Constr(0, ref fields) = d else {
+    let Data::Constr(ref __tag, ref fields) = d else {
         panic!("TxOut (V1) must be Constr 0; got {d:?}");
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     assert_eq!(
         fields.len(),
         3,
@@ -1031,9 +1065,10 @@ fn txout_v1_has_three_fields() {
 fn txout_v2_has_four_fields() {
     let out = minimal_txout_v1(OutputDatum::None);
     let d = out.to_data();
-    let Data::Constr(0, ref fields) = d else {
+    let Data::Constr(ref __tag, ref fields) = d else {
         panic!("TxOut (V2) must be Constr 0; got {d:?}");
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     assert_eq!(
         fields.len(),
         4,
@@ -1048,15 +1083,17 @@ fn txout_v1_datum_hash_is_just_b32() {
     let hash = [0x77; 32];
     let out = minimal_txout_v1(OutputDatum::Hash(hash));
     let d = out.to_data_v1();
-    let Data::Constr(0, ref fields) = d else {
+    let Data::Constr(ref __tag, ref fields) = d else {
         panic!("expected Constr 0")
     };
-    let Data::Constr(0, ref maybe_inner) = fields[2] else {
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
+    let Data::Constr(ref __tag, ref maybe_inner) = fields[2] else {
         panic!(
             "V1 DatumHash must be Just = Constr 0 [B32]; got {:?}",
             fields[2]
         );
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     assert!(
         matches!(&maybe_inner[0], Data::B(b) if b.len() == 32),
         "DatumHash inner must be B32"
@@ -1068,12 +1105,13 @@ fn txout_v1_datum_hash_is_just_b32() {
 fn txout_v1_no_datum_is_nothing() {
     let out = minimal_txout_v1(OutputDatum::None);
     let d = out.to_data_v1();
-    let Data::Constr(0, ref fields) = d else {
+    let Data::Constr(ref __tag, ref fields) = d else {
         panic!("expected Constr 0")
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     assert_eq!(
         fields[2],
-        Data::Constr(1, vec![]),
+        Data::Constr(BigInt::from(1), vec![]),
         "V1 no-datum must be Nothing = Constr 1 []; got {:?}",
         fields[2]
     );
@@ -1099,25 +1137,29 @@ fn script_context_v1_spend_purpose_has_wrapped_txid() {
     };
     let d = ctx.to_data(false);
     // ctx = Constr 0 [TxInfo, ScriptPurpose]
-    let Data::Constr(0, ref ctx_fields) = d else {
+    let Data::Constr(ref __tag, ref ctx_fields) = d else {
         panic!("ScriptContext must be Constr 0");
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     // ScriptPurpose::Spending = Constr 1 [TxOutRef]
-    let Data::Constr(1, ref purpose_fields) = ctx_fields[1] else {
+    let Data::Constr(ref __tag, ref purpose_fields) = ctx_fields[1] else {
         panic!("Spending purpose must be Constr 1; got {:?}", ctx_fields[1]);
     };
+    assert_eq!(__tag, &BigInt::from(1), "unexpected Constr tag");
     assert_eq!(purpose_fields.len(), 1);
     // TxOutRef = Constr 0 [TxId, Integer]
-    let Data::Constr(0, ref outref_fields) = purpose_fields[0] else {
+    let Data::Constr(ref __tag, ref outref_fields) = purpose_fields[0] else {
         panic!("TxOutRef must be Constr 0; got {:?}", purpose_fields[0]);
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     // TxId = Constr 0 [B bytes32]
-    let Data::Constr(0, ref txid_fields) = outref_fields[0] else {
+    let Data::Constr(ref __tag, ref txid_fields) = outref_fields[0] else {
         panic!(
             "TxId in Spending purpose must be Constr 0 [B32]; got {:?}",
             outref_fields[0]
         );
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     assert!(
         matches!(&txid_fields[0], Data::B(b) if b.len() == 32),
         "TxId inner field must be B32"
@@ -1136,24 +1178,27 @@ fn v1v2_rewarding_purpose_wraps_credential_in_staking_hash() {
     let p = ScriptPurpose::Rewarding(Credential::Script([0xab; 28]));
     let d = p.to_data();
     // Constr 2 [ Constr 0 [ Constr 1 [B28] ] ]
-    let Data::Constr(2, outer) = &d else {
+    let Data::Constr(__tag, outer) = &d else {
         panic!("Rewarding must be Constr 2, got {d:?}");
     };
+    assert_eq!(__tag, &BigInt::from(2), "unexpected Constr tag");
     assert_eq!(
         outer.len(),
         1,
         "Rewarding has one field (StakingCredential)"
     );
-    let Data::Constr(0, sh) = &outer[0] else {
+    let Data::Constr(__tag, sh) = &outer[0] else {
         panic!(
             "V1/V2 Rewarding field must be StakingHash = Constr 0, got {:?}",
             outer[0]
         );
     };
+    assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
     assert_eq!(sh.len(), 1, "StakingHash wraps one Credential");
-    let Data::Constr(1, cred) = &sh[0] else {
+    let Data::Constr(__tag, cred) = &sh[0] else {
         panic!("inner must be ScriptCredential = Constr 1, got {:?}", sh[0]);
     };
+    assert_eq!(__tag, &BigInt::from(1), "unexpected Constr tag");
     assert!(matches!(&cred[0], Data::B(b) if b.len() == 28));
 }
 
@@ -1162,15 +1207,17 @@ fn v3_rewarding_purpose_uses_bare_credential() {
     let p = ScriptPurpose::Rewarding(Credential::Script([0xab; 28]));
     let d = p.to_data_v3();
     // V3: Constr 2 [ Constr 1 [B28] ]  (Credential directly, NO StakingHash)
-    let Data::Constr(2, outer) = &d else {
+    let Data::Constr(__tag, outer) = &d else {
         panic!("Rewarding must be Constr 2, got {d:?}");
     };
-    let Data::Constr(1, cred) = &outer[0] else {
+    assert_eq!(__tag, &BigInt::from(2), "unexpected Constr tag");
+    let Data::Constr(__tag, cred) = &outer[0] else {
         panic!(
             "V3 Rewarding field must be the bare Credential = Constr 1, got {:?}",
             outer[0]
         );
     };
+    assert_eq!(__tag, &BigInt::from(1), "unexpected Constr tag");
     assert!(matches!(&cred[0], Data::B(b) if b.len() == 28));
 }
 

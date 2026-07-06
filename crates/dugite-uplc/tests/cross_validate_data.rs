@@ -139,31 +139,40 @@ fn bytestring_three_chunks() {
 #[test]
 fn constr_small_tags() {
     for tag in [0u64, 1, 6] {
-        assert_cross(&Data::Constr(tag, vec![]));
-        assert_cross(&Data::Constr(tag, vec![Data::I(BigInt::from(42))]));
+        assert_cross(&Data::Constr(BigInt::from(tag), vec![]));
+        assert_cross(&Data::Constr(
+            BigInt::from(tag),
+            vec![Data::I(BigInt::from(42))],
+        ));
     }
 }
 
 #[test]
 fn constr_medium_tags() {
     for tag in [7u64, 50, 127] {
-        assert_cross(&Data::Constr(tag, vec![]));
-        assert_cross(&Data::Constr(tag, vec![Data::I(BigInt::from(42))]));
+        assert_cross(&Data::Constr(BigInt::from(tag), vec![]));
+        assert_cross(&Data::Constr(
+            BigInt::from(tag),
+            vec![Data::I(BigInt::from(42))],
+        ));
     }
 }
 
 #[test]
 fn constr_large_tags() {
     for tag in [128u64, 1000, u32::MAX as u64, u64::MAX] {
-        assert_cross(&Data::Constr(tag, vec![]));
-        assert_cross(&Data::Constr(tag, vec![Data::I(BigInt::from(1))]));
+        assert_cross(&Data::Constr(BigInt::from(tag), vec![]));
+        assert_cross(&Data::Constr(
+            BigInt::from(tag),
+            vec![Data::I(BigInt::from(1))],
+        ));
     }
 }
 
 #[test]
 fn constr_many_fields() {
     let fields: Vec<Data> = (0..10).map(|i| Data::I(BigInt::from(i))).collect();
-    assert_cross(&Data::Constr(0, fields));
+    assert_cross(&Data::Constr(BigInt::from(0), fields));
 }
 
 // ---------------------------------------------------------------------------
@@ -222,15 +231,15 @@ fn map_short() {
 #[test]
 fn nested_constr_inside_list() {
     assert_cross(&Data::List(vec![
-        Data::Constr(0, vec![Data::I(BigInt::from(1))]),
-        Data::Constr(1, vec![Data::I(BigInt::from(2))]),
+        Data::Constr(BigInt::from(0), vec![Data::I(BigInt::from(1))]),
+        Data::Constr(BigInt::from(1), vec![Data::I(BigInt::from(2))]),
     ]));
 }
 
 #[test]
 fn nested_map_inside_constr() {
     assert_cross(&Data::Constr(
-        3,
+        BigInt::from(3),
         vec![Data::Map(vec![(
             Data::B(b"k".to_vec()),
             Data::List(vec![Data::I(BigInt::from(7))]),
@@ -242,7 +251,7 @@ fn nested_map_inside_constr() {
 fn deeply_nested() {
     let mut inner = Data::I(BigInt::from(99));
     for i in 0..20 {
-        inner = Data::Constr(i % 7, vec![inner]);
+        inner = Data::Constr(BigInt::from(i % 7), vec![inner]);
     }
     assert_cross(&inner);
 }
