@@ -510,64 +510,46 @@ pub fn denote(
         ConstrData => {
             // (tag : Integer) (args : ProtoList Data) -> Data
             //
-            // #828.5 (oracle: `PlutusCore/Default/Builtins.hs` ~L1737-1751):
-            // genuinely PV-gated, not just a perf/representation swap. At
-            // D/E (PV >= `VAN_ROSSEM_PV`) the argument type is `Word64` —
-            // unlifting itself rejects a tag outside `0..=2^64-1` as an
-            // evaluation failure. At A/B/C (PV < `VAN_ROSSEM_PV`) the
-            // argument type is plain `Integer` — Haskell accepts ANY tag
-            // (negative or arbitrarily large) and builds `Constr tag args`
-            // with it (Haskell's `Data.Constr` field is `Integer`, not
-            // `Word64` — the CBOR wire format's Word64-tag requirement is a
-            // SEPARATE, PV-independent decode-time constraint that applies
-            // only to on-chain datums/redeemers, never to a value computed
-            // transiently inside a running script).
+            // #828.5 / #859 (oracle: `PlutusCore/Default/Builtins.hs`
+            // ~L1737-1751): genuinely PV-gated, not just a perf/
+            // representation swap. At D/E (PV >= `VAN_ROSSEM_PV`) the
+            // argument type is `Word64` — unlifting itself rejects a tag
+            // outside `0..=2^64-1` as an evaluation failure. At A/B/C
+            // (PV < `VAN_ROSSEM_PV`) the argument type is plain `Integer` —
+            // Haskell accepts ANY tag (negative or arbitrarily large) and
+            // builds `Constr tag args` with it (Haskell's `Data.Constr`
+            // field is `Integer`, not `Word64` — the CBOR wire format's
+            // Word64-tag requirement is a SEPARATE, PV-independent
+            // decode-time constraint that applies only to on-chain
+            // datums/redeemers, never to a value computed transiently
+            // inside a running script).
             //
-            // KNOWN LIMITATION: dugite's `Data::Constr` tag field is `u64`
-            // (matching that on-chain decode constraint, since no valid
-            // on-chain Data can carry an out-of-range tag in ANY era). A
-            // witness script that TRANSIENTLY computes `constrData` with a
-            // negative or >u64::MAX tag at PV < 11 and does not immediately
-            // fail is therefore still mis-evaluated here: real cardano-node
-            // continues running (holding a `Data::Constr` with an arbitrary
-            // BigInt tag) while dugite cannot represent it and must error
-            // out. This is the lowest-reachability edge of #828 (transient,
-            // adversarial, pre-PV11 only, never observable on-chain) —
-            // fixing it fully requires widening `Data::Constr`'s tag to a
-            // signed/bignum type, which is out of scope here. We at least
-            // avoid mislabeling the gap as a genuine protocol-level
-            // `BuiltinFailure` (only correct for the D/E branch) by
-            // surfacing it as an `Internal` (representational) error for
-            // A/B/C instead.
+            // Since #859, `Data::Constr`'s tag is an arbitrary-precision
+            // `BigInt` (matching Haskell's `Integer` exactly), so the A/B/C
+            // branch is no longer a representational best-effort
+            // approximation: it holds precisely the same domain as
+            // Haskell. Only the D/E branch performs a range check, and an
+            // out-of-range tag there is a genuine evaluation/unlifting
+            // failure (`BuiltinFailure`), never `UplcError::Internal`.
             let mut it = args.into_iter();
             let tag = unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
             let list = it.next().ok_or_else(|| builtin_arity_mismatch(id))?;
             let (_, elems) = unwrap_proto_list(list, id)?;
-            let tag_u64 = match u64::try_from(&tag) {
-                Ok(n) => n,
-                Err(_) if variant.constr_data_requires_word64() => {
-                    return Err(builtin_failure(id, "constrData tag out of u64 range"));
-                }
-                Err(_) => {
-                    return Err(UplcError::Internal(format!(
-                        "constrData: tag {tag} is outside u64 range; dugite's Data::Constr \
-                         representation cannot hold this pre-PV11 transient value \
-                         (known limitation, see issue #828.5)"
-                    )));
-                }
-            };
+            if variant.constr_data_requires_word64() && u64::try_from(&tag).is_err() {
+                return Err(builtin_failure(id, "constrData tag out of u64 range"));
+            }
             let data_args: Result<Vec<crate::data::Data>, _> = elems
                 .into_iter()
                 .map(|c| match c {
-                    Constant::Data(d) => Ok(d),
+                    Constant::Data(d) => Ok(data_from_rc(d)),
                     _ => Err(UplcError::BuiltinTypeError {
                         builtin: id.name(),
                         reason: "constrData args must be Data".into(),
                     }),
                 })
                 .collect();
-            Ok(Value::Const(Constant::Data(crate::data::Data::Constr(
-                tag_u64, data_args?,
+            Ok(Value::Const(Constant::Data(std::rc::Rc::new(
+                crate::data::Data::Constr(tag, data_args?),
             ))))
         }
         MapData => {
@@ -578,7 +560,9 @@ pub fn denote(
                 .into_iter()
                 .map(|c| match c {
                     Constant::ProtoPair { a, b, .. } => match (*a, *b) {
-                        (Constant::Data(k), Constant::Data(vv)) => Ok((k, vv)),
+                        (Constant::Data(k), Constant::Data(vv)) => {
+                            Ok((data_from_rc(k), data_from_rc(vv)))
+                        }
                         _ => Err(UplcError::BuiltinTypeError {
                             builtin: id.name(),
                             reason: "mapData pair components must be Data".into(),
@@ -590,7 +574,9 @@ pub fn denote(
                     }),
                 })
                 .collect();
-            Ok(Value::Const(Constant::Data(crate::data::Data::Map(pairs?))))
+            Ok(Value::Const(Constant::Data(std::rc::Rc::new(
+                crate::data::Data::Map(pairs?),
+            ))))
         }
         ListData => {
             // (list : ProtoList Data) -> Data
@@ -599,37 +585,44 @@ pub fn denote(
             let datas: Result<Vec<crate::data::Data>, _> = elems
                 .into_iter()
                 .map(|c| match c {
-                    Constant::Data(d) => Ok(d),
+                    Constant::Data(d) => Ok(data_from_rc(d)),
                     _ => Err(UplcError::BuiltinTypeError {
                         builtin: id.name(),
                         reason: "listData args must be Data".into(),
                     }),
                 })
                 .collect();
-            Ok(Value::Const(Constant::Data(crate::data::Data::List(
-                datas?,
+            Ok(Value::Const(Constant::Data(std::rc::Rc::new(
+                crate::data::Data::List(datas?),
             ))))
         }
         IData => {
             let v = take_one(args, id)?;
             let i = unwrap_integer(v, id)?;
-            Ok(Value::Const(Constant::Data(crate::data::Data::I(i))))
+            Ok(Value::Const(Constant::Data(std::rc::Rc::new(
+                crate::data::Data::I(i),
+            ))))
         }
         BData => {
             let v = take_one(args, id)?;
             let b = unwrap_byte_string(v, id)?;
-            Ok(Value::Const(Constant::Data(crate::data::Data::B(b))))
+            Ok(Value::Const(Constant::Data(std::rc::Rc::new(
+                crate::data::Data::B(b),
+            ))))
         }
         UnConstrData => {
             // Data -> Pair Integer (ProtoList Data)
             let d = unwrap_data(take_one(args, id)?, id)?;
             match d.into_constr() {
                 Ok((tag, fields)) => {
-                    let elements: Vec<Constant> = fields.into_iter().map(Constant::Data).collect();
+                    let elements: Vec<Constant> = fields
+                        .into_iter()
+                        .map(|f| Constant::Data(std::rc::Rc::new(f)))
+                        .collect();
                     Ok(Value::Const(Constant::ProtoPair {
                         a_type: crate::term::TypeTag::Integer,
                         b_type: crate::term::TypeTag::List(Box::new(crate::term::TypeTag::Data)),
-                        a: Box::new(Constant::Integer(BigInt::from(tag))),
+                        a: Box::new(Constant::Integer(tag)),
                         b: Box::new(Constant::ProtoList {
                             elem_type: crate::term::TypeTag::Data,
                             elements,
@@ -648,8 +641,8 @@ pub fn denote(
                         .map(|(k, v)| Constant::ProtoPair {
                             a_type: crate::term::TypeTag::Data,
                             b_type: crate::term::TypeTag::Data,
-                            a: Box::new(Constant::Data(k)),
-                            b: Box::new(Constant::Data(v)),
+                            a: Box::new(Constant::Data(std::rc::Rc::new(k))),
+                            b: Box::new(Constant::Data(std::rc::Rc::new(v))),
                         })
                         .collect();
                     Ok(Value::Const(Constant::ProtoList {
@@ -668,7 +661,10 @@ pub fn denote(
             match d.into_list() {
                 Ok(items) => Ok(Value::Const(Constant::ProtoList {
                     elem_type: crate::term::TypeTag::Data,
-                    elements: items.into_iter().map(Constant::Data).collect(),
+                    elements: items
+                        .into_iter()
+                        .map(|d| Constant::Data(std::rc::Rc::new(d)))
+                        .collect(),
                 })),
                 Err(_) => Err(builtin_failure(id, "unListData on non-List Data")),
             }
@@ -701,8 +697,8 @@ pub fn denote(
             Ok(Value::Const(Constant::ProtoPair {
                 a_type: crate::term::TypeTag::Data,
                 b_type: crate::term::TypeTag::Data,
-                a: Box::new(Constant::Data(a)),
-                b: Box::new(Constant::Data(b)),
+                a: Box::new(Constant::Data(std::rc::Rc::new(a))),
+                b: Box::new(Constant::Data(std::rc::Rc::new(b))),
             }))
         }
         SerialiseData => {
@@ -1246,10 +1242,13 @@ pub fn denote(
         // ── PV1.1.0 list builtin ──────────────────────────────────────
         DropList => {
             // (count: Integer, list: ProtoList T) -> ProtoList T
-            // Drops the first `count` elements from the list. If count
-            // is negative or larger than the list length, returns the
-            // empty list (matching the Haskell reference's clamp-at-
-            // zero / clamp-at-length semantics).
+            // Drops the first `count` elements from the list. `count` is
+            // clamped at BOTH ends (oracle-confirmed, #828): negative ->
+            // clamped to 0, so the list is returned UNCHANGED (dropping
+            // zero elements) — NOT emptied; `count >= len` -> the empty
+            // list. `bigint_to_usize_clamped` performs the negative ->
+            // 0 clamp; the `n >= elems.len()` branch below performs the
+            // upper clamp.
             let mut it = args.into_iter();
             let count = unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
             let list = it.next().ok_or_else(|| builtin_arity_mismatch(id))?;
@@ -1522,7 +1521,9 @@ pub fn denote(
                     (Data::B(policy), Data::Map(inner_data))
                 })
                 .collect();
-            Ok(Value::Const(Constant::Data(Data::Map(outer))))
+            Ok(Value::Const(Constant::Data(std::rc::Rc::new(Data::Map(
+                outer,
+            )))))
         }
 
         ValueContains => {
@@ -1728,14 +1729,13 @@ fn bigint_to_i64_or_failure(i: &BigInt, id: BuiltinId, what: &str) -> Result<i64
         .ok_or_else(|| builtin_failure(id, &format!("{what}: value does not fit in Int64")))
 }
 
-/// Bitwise binary op on two byte strings of equal length.
-/// `pad` is the byte to use when extending the shorter input to the
-/// longer length. Per CIP-0123: padding semantics are part of the
-/// builtin (`andByteString` pads with 0xFF for max-len, `orByteString`
-/// and `xorByteString` pad with 0x00). Our current implementation
-/// requires equal-length inputs and rejects mismatched lengths as a
-/// `BuiltinFailure`; the padding-mode variant arrives with the
-/// `padded`-flavour builtins in a follow-on commit.
+/// Bitwise binary op (`andByteString` / `orByteString` /
+/// `xorByteString`) on two byte strings, with CIP-0122/0123's
+/// `padded: Bool` semantics: `padded = true` outputs at the LONGER
+/// input's length (unmatched trailing bytes from the longer input pass
+/// through unchanged); `padded = false` outputs at the SHORTER input's
+/// length (the longer input is truncated). See the CIP-122/123 doc
+/// comment on the body below for the exact algorithm.
 fn bitwise_byte_string<F>(args: Vec<Value>, id: BuiltinId, op: F) -> Result<Value, UplcError>
 where
     F: Fn(u8, u8) -> u8,
@@ -1799,9 +1799,19 @@ fn unwrap_value(v: Value, id: BuiltinId) -> Result<ValueMap, UplcError> {
     }
 }
 
+/// Take ownership of an `Rc<Data>`, sharing the allocation when we hold
+/// the only reference (the common case once a builtin argument has been
+/// moved out of its `Value`/env slot) and falling back to a deep clone
+/// only when the `Data` is still referenced elsewhere (e.g. the same
+/// ScriptContext bound to the script's `ctx` parameter and looked up
+/// again later). See the `#838 Fix 2` doc comment on `Constant::Data`.
+fn data_from_rc(d: std::rc::Rc<crate::data::Data>) -> crate::data::Data {
+    std::rc::Rc::try_unwrap(d).unwrap_or_else(|rc| (*rc).clone())
+}
+
 fn unwrap_data(v: Value, id: BuiltinId) -> Result<crate::data::Data, UplcError> {
     match v {
-        Value::Const(Constant::Data(d)) => Ok(d),
+        Value::Const(Constant::Data(d)) => Ok(data_from_rc(d)),
         other => Err(UplcError::BuiltinTypeError {
             builtin: id.name(),
             reason: format!("expected Data, got {:?}", std::mem::discriminant(&other)),
@@ -2429,16 +2439,19 @@ mod tests {
     use crate::term::TypeTag;
 
     fn data_i(n: i64) -> Constant {
-        Constant::Data(Data::I(BigInt::from(n)))
+        Constant::Data(std::rc::Rc::new(Data::I(BigInt::from(n))))
     }
     fn list_of_data(items: Vec<Data>) -> Value {
         Value::Const(Constant::ProtoList {
             elem_type: TypeTag::Data,
-            elements: items.into_iter().map(Constant::Data).collect(),
+            elements: items
+                .into_iter()
+                .map(|d| Constant::Data(std::rc::Rc::new(d)))
+                .collect(),
         })
     }
     fn data_val(d: Data) -> Value {
-        Value::Const(Constant::Data(d))
+        Value::Const(Constant::Data(std::rc::Rc::new(d)))
     }
 
     #[test]
@@ -2547,27 +2560,27 @@ mod tests {
         assert_eq!(
             v,
             data_val(Data::Constr(
-                3,
+                BigInt::from(3),
                 vec![Data::I(BigInt::from(1)), Data::I(BigInt::from(2))]
             ))
         );
     }
 
-    /// #828.5 PV-matrix golden: `constrData`'s tag argument is unlifted as
-    /// `Word64` at D/E (PV>=11) — an out-of-range tag is a genuine
-    /// `BuiltinFailure` — but as plain `Integer` at A/B/C (PV<11), where
-    /// Haskell would ACCEPT a negative or oversized tag. dugite's
-    /// `Data::Constr` tag field is `u64` and cannot represent that value,
-    /// so the A/B/C branch surfaces a distinct `Internal`
-    /// (representational-limitation) error instead of mislabeling the gap
-    /// as a modeled protocol failure — see the doc comment at the
-    /// `ConstrData` match arm for the full scoped limitation. In-range tags
-    /// behave IDENTICALLY at every variant. The conformance corpus runs a
-    /// single (LATEST=E, no-PV) harness and cannot catch a wrong PV<11
-    /// branch, hence this dedicated matrix test.
+    /// #859 (closes the #828.5 residual): `constrData`'s tag argument is
+    /// unlifted as `Word64` at D/E (PV>=11) — an out-of-range tag is a
+    /// genuine `BuiltinFailure` — but as plain arbitrary-precision
+    /// `Integer` at A/B/C (PV<11), where Haskell ACCEPTS a negative or
+    /// oversized tag and builds `Constr tag args` with it. `Data::Constr`'s
+    /// tag is now a `BigInt` (issue #859), so dugite represents this
+    /// domain exactly at A/B/C — no more `Internal`/representational-
+    /// limitation fallback. In-range tags behave IDENTICALLY at every
+    /// variant. The conformance corpus runs a single (LATEST=E, no-PV)
+    /// harness and cannot catch a wrong PV<11 branch, hence this dedicated
+    /// matrix test.
     #[test]
     fn constr_data_tag_range_is_pv_gated() {
-        // In-range tag (fits u64): succeeds identically at every variant.
+        // In-range tag (fits u64): succeeds identically at every variant —
+        // (c) regression: a small-tag Constr still round-trips exactly.
         let fields = || list_of_data(vec![]);
         for variant in [
             SemanticsVariant::A,
@@ -2577,68 +2590,82 @@ mod tests {
             SemanticsVariant::E,
         ] {
             let v = run_variant(BuiltinId::ConstrData, vec![int(7), fields()], variant).unwrap();
-            assert_eq!(v, data_val(Data::Constr(7, vec![])));
+            assert_eq!(v, data_val(Data::Constr(BigInt::from(7), vec![])));
         }
 
-        // Out-of-u64-range tag (negative): D/E reject as a genuine
-        // BuiltinFailure (Word64 unlifting failure).
+        // (b) Out-of-u64-range tag (negative): D/E reject as a genuine
+        // BuiltinFailure (Word64 unlifting failure) — NOT Internal, NOT a
+        // silent clamp.
         let neg_tag = Value::Const(Constant::Integer(BigInt::from(-1)));
-        assert!(matches!(
-            run_variant(
-                BuiltinId::ConstrData,
-                vec![neg_tag.clone(), fields()],
-                SemanticsVariant::E
-            ),
-            Err(UplcError::BuiltinFailure { .. })
-        ));
-        assert!(matches!(
-            run_variant(
-                BuiltinId::ConstrData,
-                vec![neg_tag.clone(), fields()],
-                SemanticsVariant::D
-            ),
-            Err(UplcError::BuiltinFailure { .. })
-        ));
+        for variant in [SemanticsVariant::D, SemanticsVariant::E] {
+            assert!(
+                matches!(
+                    run_variant(
+                        BuiltinId::ConstrData,
+                        vec![neg_tag.clone(), fields()],
+                        variant
+                    ),
+                    Err(UplcError::BuiltinFailure { .. })
+                ),
+                "variant {variant:?} must reject an out-of-Word64 tag as BuiltinFailure"
+            );
+        }
 
-        // A/B/C: Haskell would ACCEPT this tag (plain Integer argument);
-        // dugite cannot represent it, so it fails with the DISTINCT
-        // Internal/representational-limitation error, not BuiltinFailure.
-        assert!(matches!(
-            run_variant(
+        // (a) A/B/C: Haskell ACCEPTS a negative OR oversized (> u64::MAX)
+        // tag (plain arbitrary-precision Integer argument) and builds the
+        // wide Constr. dugite's BigInt-tagged `Data::Constr` now
+        // represents this exactly — no error, no clamp, no representational
+        // gap — and the tag round-trips through `unConstrData` unchanged.
+        let huge_tag_value: BigInt = BigInt::from(1u64) << 80;
+        let huge_tag = Value::Const(Constant::Integer(huge_tag_value.clone()));
+        for variant in [
+            SemanticsVariant::A,
+            SemanticsVariant::B,
+            SemanticsVariant::C,
+        ] {
+            let neg = run_variant(
                 BuiltinId::ConstrData,
                 vec![neg_tag.clone(), fields()],
-                SemanticsVariant::A
-            ),
-            Err(UplcError::Internal(_))
-        ));
-        assert!(matches!(
-            run_variant(
+                variant,
+            )
+            .unwrap_or_else(|e| panic!("variant {variant:?} must accept a negative tag: {e:?}"));
+            assert_eq!(neg, data_val(Data::Constr(BigInt::from(-1), vec![])));
+
+            let huge = run_variant(
                 BuiltinId::ConstrData,
-                vec![neg_tag.clone(), fields()],
-                SemanticsVariant::B
-            ),
-            Err(UplcError::Internal(_))
-        ));
-        assert!(matches!(
-            run_variant(
-                BuiltinId::ConstrData,
-                vec![neg_tag, fields()],
-                SemanticsVariant::C
-            ),
-            Err(UplcError::Internal(_))
-        ));
+                vec![huge_tag.clone(), fields()],
+                variant,
+            )
+            .unwrap_or_else(|e| panic!("variant {variant:?} must accept an oversized tag: {e:?}"));
+            assert_eq!(huge, data_val(Data::Constr(huge_tag_value.clone(), vec![])));
+
+            // The wide tag round-trips through unConstrData as a wide
+            // Integer (not truncated/clamped to u64).
+            let unpacked = run(BuiltinId::UnConstrData, vec![huge]).unwrap();
+            if let Value::Const(Constant::ProtoPair { a, .. }) = unpacked {
+                assert_eq!(*a, Constant::Integer(huge_tag_value.clone()));
+            } else {
+                panic!("expected ProtoPair from unConstrData");
+            }
+        }
     }
 
     #[test]
     fn un_constr_data_unpacks() {
-        let d = data_val(Data::Constr(3, vec![Data::I(BigInt::from(1))]));
+        let d = data_val(Data::Constr(
+            BigInt::from(3),
+            vec![Data::I(BigInt::from(1))],
+        ));
         let v = run(BuiltinId::UnConstrData, vec![d]).unwrap();
         // result is Pair(Integer, List Data)
         if let Value::Const(Constant::ProtoPair { a, b, .. }) = v {
             assert_eq!(*a, Constant::Integer(BigInt::from(3)));
             if let Constant::ProtoList { elements, .. } = *b {
                 assert_eq!(elements.len(), 1);
-                assert_eq!(elements[0], Constant::Data(Data::I(BigInt::from(1))));
+                assert_eq!(
+                    elements[0],
+                    Constant::Data(std::rc::Rc::new(Data::I(BigInt::from(1))))
+                );
             } else {
                 panic!("expected ProtoList for second pair element");
             }
@@ -2649,7 +2676,7 @@ mod tests {
 
     #[test]
     fn choose_data_picks_by_constructor() {
-        let d_constr = data_val(Data::Constr(0, vec![]));
+        let d_constr = data_val(Data::Constr(BigInt::from(0), vec![]));
         assert_eq!(
             run(
                 BuiltinId::ChooseData,
@@ -2683,7 +2710,10 @@ mod tests {
 
     #[test]
     fn serialise_data_round_trips_via_cbor() {
-        let d = data_val(Data::Constr(0, vec![Data::I(BigInt::from(42))]));
+        let d = data_val(Data::Constr(
+            BigInt::from(0),
+            vec![Data::I(BigInt::from(42))],
+        ));
         let v = run(BuiltinId::SerialiseData, vec![d]).unwrap();
         // The result is the CBOR encoding of Constr 0 [I 42]
         if let Value::Const(Constant::ByteString(bytes)) = v {
@@ -2709,9 +2739,9 @@ mod tests {
     fn serialise_data_uses_indefinite_arrays_for_nonempty_constr() {
         // Constr 1 [ Constr 0 [ B 0xab, I 7 ] ]
         let d = data_val(Data::Constr(
-            1,
+            BigInt::from(1),
             vec![Data::Constr(
-                0,
+                BigInt::from(0),
                 vec![Data::B(vec![0xab]), Data::I(BigInt::from(7))],
             )],
         ));
@@ -2752,7 +2782,7 @@ mod tests {
         // Run the actual builtin.
         let v = run(
             BuiltinId::SerialiseData,
-            vec![Value::Const(Constant::Data(d))],
+            vec![Value::Const(Constant::Data(std::rc::Rc::new(d)))],
         )
         .unwrap();
         let Value::Const(Constant::ByteString(serialised)) = v else {

@@ -138,7 +138,21 @@ pub enum Constant {
         b: Box<Constant>,
     },
     /// PlutusData — recursive sum type used by the script context.
-    Data(Data),
+    ///
+    /// `Rc`-wrapped (#838 Fix 2): the ScriptContext is a large recursive
+    /// `Data` tree bound once to the script's `ctx` parameter and then
+    /// referenced repeatedly (each `(var ctx)` occurrence in the
+    /// compiled term). Cloning a `Value`/`Constant` on every CEK env
+    /// lookup (`machine::step::compute`'s `Term::Var` arm) previously
+    /// deep-cloned the whole tree per reference — the `Rc` makes that a
+    /// refcount bump instead, matching Haskell's by-reference env. Only
+    /// the outer `Constant::Data` wrapper is `Rc`-shared; `Data`'s own
+    /// internal recursive fields (`Vec<Data>` / `Vec<(Data, Data)>`)
+    /// are unchanged, so a builtin that destructures a *shared* `Data`
+    /// (e.g. `unConstrData`) still deep-clones at that point (via
+    /// `Rc::try_unwrap`-or-clone, see `builtin::denotations::unwrap_data`)
+    /// — no worse than before, and free when the `Rc` is uniquely held.
+    Data(Rc<Data>),
     /// BLS12-381 G1 element. Stored compressed (48 bytes) for canonical
     /// equality — there is no decompressed-point cache; every builtin
     /// that consumes a G1 element re-decodes it from these bytes

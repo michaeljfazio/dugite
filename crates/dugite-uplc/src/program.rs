@@ -17,9 +17,21 @@ use crate::term::Term;
 use crate::UplcError;
 
 /// A complete UPLC program: a language version triple plus a body.
+///
+/// The version components are arbitrary-precision (`BigUint`), matching
+/// Haskell's `Natural`-typed `Version` fields exactly (issue #842
+/// residual) — Haskell's flat decoder never rejects or truncates a
+/// version component on magnitude, so neither does this one. In
+/// practice every real on-chain script declares a tiny version (`1.0.0`
+/// or `1.1.0`); the only way to reach a value that wouldn't fit in a
+/// `u64` is a deliberately adversarial flat blob.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Program {
-    pub version: (u64, u64, u64),
+    pub version: (
+        num_bigint::BigUint,
+        num_bigint::BigUint,
+        num_bigint::BigUint,
+    ),
     pub term: Term,
 }
 
@@ -46,9 +58,9 @@ impl Program {
     /// `UplcError::FlatDecode` on any truncation / malformedness.
     pub fn from_flat(bytes: &[u8]) -> Result<Self, UplcError> {
         let mut r = BitReader::new(bytes);
-        let major = r.read_natural_u64()?;
-        let minor = r.read_natural_u64()?;
-        let patch = r.read_natural_u64()?;
+        let major = r.read_natural_biguint()?;
+        let minor = r.read_natural_biguint()?;
+        let patch = r.read_natural_biguint()?;
         let term = decode_term(&mut r)?;
         // The flat encoding pads to a byte boundary with a 1-bit prefix
         // followed by 0-bit fillers. `read_filler` enforces that the
@@ -92,9 +104,9 @@ impl Program {
     /// Encode the program as raw flat bytes (no CBOR wrapper).
     pub fn to_flat(&self) -> Result<Vec<u8>, UplcError> {
         let mut w = BitWriter::new();
-        w.write_natural_u64(self.version.0)?;
-        w.write_natural_u64(self.version.1)?;
-        w.write_natural_u64(self.version.2)?;
+        w.write_natural_biguint(&self.version.0)?;
+        w.write_natural_biguint(&self.version.1)?;
+        w.write_natural_biguint(&self.version.2)?;
         encode_term(&mut w, &self.term)?;
         // `BitWriter::finish` already appends the single mandatory trailing
         // filler (see its doc comment) — an extra explicit `write_filler()`
@@ -113,12 +125,23 @@ impl Program {
 mod tests {
     use super::*;
     use crate::term::{Constant, Term};
+    use num_bigint::BigUint;
     use std::rc::Rc;
+
+    /// Test-only ergonomic constructor for the version triple, since
+    /// `BigUint` doesn't support bare integer-literal tuple syntax.
+    fn v(major: u64, minor: u64, patch: u64) -> (BigUint, BigUint, BigUint) {
+        (
+            BigUint::from(major),
+            BigUint::from(minor),
+            BigUint::from(patch),
+        )
+    }
 
     #[test]
     fn round_trips_through_flat_with_error_body() {
         let p = Program {
-            version: (1, 1, 0),
+            version: v(1, 1, 0),
             term: Term::Error,
         };
         let flat = p.to_flat().unwrap();
@@ -129,7 +152,7 @@ mod tests {
     #[test]
     fn round_trips_through_flat_with_const_integer_body() {
         let p = Program {
-            version: (1, 0, 0),
+            version: v(1, 0, 0),
             term: Term::Const(Constant::Integer(num_bigint::BigInt::from(42))),
         };
         let flat = p.to_flat().unwrap();
@@ -140,7 +163,7 @@ mod tests {
     #[test]
     fn round_trips_through_flat_with_nested_app() {
         let p = Program {
-            version: (1, 1, 0),
+            version: v(1, 1, 0),
             term: Term::App(
                 Rc::new(Term::Lam(Rc::new(Term::Var(0)))),
                 Rc::new(Term::Const(Constant::Integer(num_bigint::BigInt::from(7)))),
@@ -154,7 +177,7 @@ mod tests {
     #[test]
     fn round_trips_through_cbor_wrapped_form() {
         let p = Program {
-            version: (1, 1, 0),
+            version: v(1, 1, 0),
             term: Term::Const(Constant::Integer(num_bigint::BigInt::from(123))),
         };
         let cbor = p.to_cbor().unwrap();
@@ -191,30 +214,59 @@ mod tests {
     #[test]
     fn version_triple_is_preserved_through_roundtrip() {
         let p = Program {
-            version: (3, 4, 5),
+            version: v(3, 4, 5),
             term: Term::Error,
         };
         let back = Program::from_flat(&p.to_flat().unwrap()).unwrap();
-        assert_eq!(back.version, (3, 4, 5));
+        assert_eq!(back.version, v(3, 4, 5));
     }
 
-    /// #842: the version triple must stay on the LENIENT `u64` decode
-    /// path (`BitReader::read_natural_u64`), never the strict
-    /// `read_word64_strict` used for the De Bruijn index / `Constr`
-    /// tag (`flat/term.rs`). Haskell types `Version`'s three fields as
-    /// unbounded `Natural` (`PlutusCore.Version`), which never rejects
-    /// on overflow — a value right at the `u64` boundary (`u64::MAX`)
-    /// must round-trip cleanly, not be rejected as it would be under
-    /// the strict Word64 rule this fix introduces elsewhere.
+    /// #842: the version triple decodes via the arbitrary-precision
+    /// `BigUint` path (`BitReader::read_natural_biguint`), never the
+    /// strict `read_word64_strict` used for the De Bruijn index /
+    /// `Constr` tag (`flat/term.rs`). Haskell types `Version`'s three
+    /// fields as unbounded `Natural` (`PlutusCore.Version`), which never
+    /// rejects on overflow — a value right at the `u64` boundary
+    /// (`u64::MAX`) must round-trip cleanly, not be rejected as it would
+    /// be under the strict Word64 rule used elsewhere.
     #[test]
     fn version_component_at_u64_boundary_is_not_rejected() {
         let p = Program {
-            version: (u64::MAX, 0, 0),
+            version: (BigUint::from(u64::MAX), BigUint::ZERO, BigUint::ZERO),
             term: Term::Error,
         };
         let back = Program::from_flat(&p.to_flat().unwrap())
             .expect("version component at the u64 boundary must not be rejected");
-        assert_eq!(back.version, (u64::MAX, 0, 0));
+        assert_eq!(
+            back.version,
+            (BigUint::from(u64::MAX), BigUint::ZERO, BigUint::ZERO)
+        );
+    }
+
+    /// #842 residual: a version component that is genuinely WIDER than a
+    /// `u64` (requires an 11th flat chunk) must round-trip to its EXACT
+    /// value, not silently truncate to a smaller, wrong `u64` (the prior
+    /// lenient-`u64`-path behavior — see
+    /// `flat::bits::tests::read_natural_u64_lenient_path_unchanged_for_version_triple`,
+    /// which documents that the raw bit-level reader still keeps that
+    /// legacy behavior; `Program` itself no longer goes through it).
+    /// This is 100% adversarial (no real cardano-node release has ever
+    /// emitted anything but `1.0.0`/`1.1.0`), but Haskell's decoder would
+    /// still decode such a blob successfully with the exact wide value,
+    /// so silently substituting a different (smaller) value here would
+    /// be a genuine, if obscure, consensus divergence in
+    /// `flat::term::validate_program_availability`'s
+    /// `version >= PLC_VERSION_1_1_0` gate.
+    #[test]
+    fn version_component_wider_than_u64_round_trips_exactly() {
+        let huge: BigUint = (BigUint::from(1u8) << 70u32) + BigUint::from(999u32);
+        let p = Program {
+            version: (huge.clone(), BigUint::ZERO, BigUint::ZERO),
+            term: Term::Error,
+        };
+        let back = Program::from_flat(&p.to_flat().unwrap())
+            .expect("a >64-bit version component must not be rejected");
+        assert_eq!(back.version, (huge, BigUint::ZERO, BigUint::ZERO));
     }
 
     /// Canonical IOG always-true V1 validator (vendored by every cardano-node
@@ -229,7 +281,7 @@ mod tests {
             0x01, 0x00, 0x00, 0x33, 0x22, 0x22, 0x20, 0x05, 0x12, 0x00, 0x12, 0x00, 0x11,
         ];
         let p = Program::from_flat(&flat).expect("canonical V1 always-true must decode");
-        assert_eq!(p.version, (1, 0, 0));
+        assert_eq!(p.version, v(1, 0, 0));
     }
 
     /// Canonical IOG always-true V2 validator. cborHex `49480100002221200101`
@@ -238,7 +290,7 @@ mod tests {
     fn decodes_canonical_v2_always_true() {
         let flat = [0x01, 0x00, 0x00, 0x22, 0x21, 0x20, 0x01, 0x01];
         let p = Program::from_flat(&flat).expect("canonical V2 always-true must decode");
-        assert_eq!(p.version, (1, 0, 0));
+        assert_eq!(p.version, v(1, 0, 0));
     }
 
     /// Issue #822: a valid flat program with only the mandatory final-byte
@@ -248,7 +300,7 @@ mod tests {
     #[test]
     fn from_flat_accepts_program_with_only_mandatory_padding() {
         let p = Program {
-            version: (1, 1, 0),
+            version: v(1, 1, 0),
             term: Term::Error,
         };
         let flat = p.to_flat().unwrap();
@@ -273,7 +325,7 @@ mod tests {
     #[test]
     fn from_flat_rejects_trailing_byte_after_valid_program() {
         let p = Program {
-            version: (1, 1, 0),
+            version: v(1, 1, 0),
             term: Term::Error,
         };
         let mut flat = p.to_flat().unwrap();
