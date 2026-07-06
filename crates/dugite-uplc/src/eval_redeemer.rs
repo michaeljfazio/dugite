@@ -354,7 +354,7 @@ fn resolve_applied_costs(
         }
         ScriptLanguage::PlutusV3 => {
             let params = cm.plutus_v3.as_deref()?;
-            match crate::cost_apply::apply_v3(params) {
+            match crate::cost_apply::apply_v3(params, major_pv) {
                 Ok(applied) => Some(applied),
                 Err(e) => {
                     tracing::warn!(
