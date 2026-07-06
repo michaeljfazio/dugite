@@ -1,10 +1,20 @@
-use super::{credential_to_hash, DRepRegistration, LedgerState, PoolRegistration};
-use dugite_primitives::credentials::Credential;
-use dugite_primitives::hash::{Hash28, Hash32};
-use dugite_primitives::transaction::{Certificate, MIRSource, MIRTarget};
+use super::LedgerState;
+use dugite_primitives::hash::Hash32;
+use dugite_primitives::transaction::Certificate;
 use dugite_primitives::value::Lovelace;
-use std::sync::Arc;
 use tracing::{debug, warn};
+// Imports used ONLY by the `#[cfg(test)]` `process_certificate*` helpers (#813
+// item 2 — those are gated out of release builds, so their imports must be too).
+#[cfg(test)]
+use super::{credential_to_hash, DRepRegistration, PoolRegistration};
+#[cfg(test)]
+use dugite_primitives::credentials::Credential;
+#[cfg(test)]
+use dugite_primitives::hash::Hash28;
+#[cfg(test)]
+use dugite_primitives::transaction::{MIRSource, MIRTarget};
+#[cfg(test)]
+use std::sync::Arc;
 
 /// Returns true if the certificate is Conway-only and requires protocol version >= 9.
 #[allow(dead_code)]
@@ -159,7 +169,14 @@ impl LedgerState {
     /// StakeRegistration certificates create entries in the pointer_map,
     /// mapping (slot, tx_index, cert_index) → credential hash. This enables
     /// resolution of Pointer addresses (type 4/5) in stake_credential_hash.
-    #[allow(dead_code)]
+    // TEST-ONLY (#813 item 2): every caller lives in a `#[cfg(test)]` module,
+    // so this is gated out of release builds entirely rather than left as
+    // `#[allow(dead_code)]`. It APPROXIMATES certificate application for tests;
+    // the authoritative consensus path is `eras::common::apply_shelley_cert` /
+    // `eras::conway::apply_conway_cert`. Do not treat it as a behaviour-parity
+    // oracle for the live path. Fully re-pointing the ~236 test call sites onto
+    // the live dispatch is deferred as high-risk/low-value for a test-only helper.
+    #[cfg(test)]
     pub(crate) fn process_certificate_with_pointer(
         &mut self,
         cert: &Certificate,
@@ -220,7 +237,10 @@ impl LedgerState {
     /// tx validation rule, not a block application rule. The block producer
     /// already validated era compatibility. During replay, the in-state
     /// protocol version may lag behind the block's actual era.
-    #[allow(dead_code)]
+    // TEST-ONLY (#813 item 2): gated to test builds (all callers are in
+    // `#[cfg(test)]` modules). Authoritative live path is
+    // `eras::common::apply_shelley_cert` / `eras::conway::apply_conway_cert`.
+    #[cfg(test)]
     pub(crate) fn process_certificate(&mut self, cert: &Certificate) {
         match cert {
             Certificate::StakeRegistration(credential) => {
