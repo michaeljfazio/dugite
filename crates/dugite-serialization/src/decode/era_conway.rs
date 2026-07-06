@@ -1323,6 +1323,106 @@ fn read_script_ref(
     }
 }
 
+/// Capture the ORIGINAL wire byte span of each native script in a `native_scripts`
+/// set/array, in order. Reuses [`read_set`](Reader::read_set) (which transparently
+/// handles the pre-Conway plain array and the Conway tag-258 set form) with a
+/// [`KeepRaw`] element wrapper so each element's exact original bytes are captured.
+fn read_native_script_spans(r: &mut Reader<'_>) -> Result<Vec<Vec<u8>>, SerializationError> {
+    r.read_set(|r| {
+        let kr = KeepRaw::parse_with(r, read_native_script)?;
+        Ok(kr.raw.to_vec())
+    })
+}
+
+/// Extract the ORIGINAL wire bytes of every native script in a transaction witness
+/// set (key 1), in order, from the witness set's raw CBOR.
+///
+/// Cardano hashes a native script as `blake2b_224(0x00 || originalBytes)` over the
+/// exact decoded bytes (Haskell `hashScript` over the Timelock `MemoBytes`), NEVER a
+/// canonical re-encode. A non-canonically-but-validly-encoded native script (e.g. an
+/// indefinite-length outer array, or a non-minimal integer field) therefore hashes
+/// differently from `encode_native_script(decoded)`. This lets the ledger hash over
+/// the original bytes with a re-encode fallback only when the raw CBOR is absent
+/// (locally-constructed transactions). Era-agnostic. See issue #862.
+///
+/// Returns `None` if the witness set CBOR is unavailable/malformed or carries no
+/// `native_scripts` key.
+pub fn witness_native_script_original_bytes(witness_set_cbor: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let mut r = Reader::new(witness_set_cbor);
+    let len = r.read_map_header().ok()?;
+    let mut spans: Option<Vec<Vec<u8>>> = None;
+    let mut read_one_entry = |r: &mut Reader<'_>| -> Result<(), SerializationError> {
+        let key = r.read_uint()?;
+        if key == 1 {
+            spans = Some(read_native_script_spans(r)?);
+        } else {
+            r.skip()?;
+        }
+        Ok(())
+    };
+    match len {
+        Some(n) => {
+            for _ in 0..n {
+                read_one_entry(&mut r).ok()?;
+            }
+        }
+        None => loop {
+            if r.peek_major().ok()? == Type::Break {
+                r.expect_break().ok()?;
+                break;
+            }
+            read_one_entry(&mut r).ok()?;
+        },
+    }
+    spans
+}
+
+/// Extract the ORIGINAL wire bytes of a reference NATIVE script from a transaction
+/// output's raw CBOR (map key 3, `#6.24(bytes .cbor [0, native_script])`).
+///
+/// The reference-script hash is `blake2b_224(0x00 || originalBytes)` over the inner
+/// native script's original bytes (excluding the tag-24/bstr framing and the leading
+/// `0` type tag), same as the witness-set path. Returns `None` for legacy-array
+/// outputs, non-native reference scripts, missing script_ref, or malformed CBOR — in
+/// which case the ledger falls back to a re-encode. See issue #862.
+pub fn reference_native_script_original_bytes(output_cbor: &[u8]) -> Option<Vec<u8>> {
+    let mut r = Reader::new(output_cbor);
+    // Only post-Alonzo map-form outputs carry a script_ref; a legacy array output
+    // fails read_map_header and yields None.
+    let len = r.read_map_header().ok()?;
+    let mut found: Option<Vec<u8>> = None;
+    let mut read_one_entry = |r: &mut Reader<'_>| -> Result<(), SerializationError> {
+        let key = r.read_uint()?;
+        if key == 3 && found.is_none() {
+            // script_ref = #6.24(bytes .cbor [type, script])
+            let inner = r.read_embedded_cbor_bytes()?.to_vec();
+            let mut sr = Reader::new(&inner);
+            if matches!(sr.read_array_header()?, Some(2)) && sr.read_uint()? == 0 {
+                let kr = KeepRaw::parse_with(&mut sr, read_native_script)?;
+                found = Some(kr.raw.to_vec());
+            }
+        } else {
+            r.skip()?;
+        }
+        Ok(())
+    };
+    match len {
+        Some(n) => {
+            for _ in 0..n {
+                read_one_entry(&mut r).ok()?;
+            }
+        }
+        None => loop {
+            if r.peek_major().ok()? == Type::Break {
+                r.expect_break().ok()?;
+                break;
+            }
+            read_one_entry(&mut r).ok()?;
+        },
+    }
+    found
+}
+
 // ============================================================================
 // Certificate decoder (Conway)
 // ============================================================================
@@ -3083,6 +3183,62 @@ pub(crate) fn decode_conway_tx_output_standalone(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #862: a native script encoded with a non-canonical INDEFINITE-length outer
+    /// array is (a) accepted by the decoder and (b) has its EXACT original bytes
+    /// recovered by `witness_native_script_original_bytes`, which differ from a
+    /// canonical re-encode. This is the byte-exact property the hashScript fix needs.
+    #[test]
+    fn witness_native_original_bytes_captures_indefinite_form_862() {
+        // ScriptPubkey = [0, h28]; indefinite outer array: 0x9f 0x00 (0x581c<28>) 0xff
+        let mut ns = vec![0x9f, 0x00, 0x58, 0x1c];
+        ns.extend_from_slice(&[0xAB; 28]);
+        ns.push(0xff);
+        // Witness set map { 1 => array(1) [ ns ] } : 0xa1 0x01 0x81 <ns>
+        let mut ws = vec![0xa1, 0x01, 0x81];
+        ws.extend_from_slice(&ns);
+
+        let spans = witness_native_script_original_bytes(&ws).expect("extract native spans");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0], ns, "must capture the exact original (indefinite) bytes");
+
+        // The decoded script re-encodes to a DIFFERENT (canonical, definite) form.
+        let decoded = read_native_script(&mut Reader::new(&ns)).unwrap();
+        let reencoded = crate::encode::encode_native_script(&decoded);
+        assert_ne!(
+            reencoded, ns,
+            "canonical re-encode must differ from the indefinite original"
+        );
+    }
+
+    /// #862: a reference NATIVE script's original inner bytes are recovered from an
+    /// output's CBOR (map key 3 = #6.24(bstr .cbor [0, native_script])).
+    #[test]
+    fn reference_native_original_bytes_recovers_inner_script_862() {
+        // native script (definite): [0, h28] = 0x82 0x00 0x581c<28>
+        let mut ns = vec![0x82, 0x00, 0x58, 0x1c];
+        ns.extend_from_slice(&[0xCD; 28]);
+        // inner = [0, native_script] = 0x82 0x00 <ns>
+        let mut inner = vec![0x82, 0x00];
+        inner.extend_from_slice(&ns);
+        // script_ref = #6.24(bstr(inner)) = 0xd8 0x18 0x58 <len> <inner>
+        let mut sref = vec![0xd8, 0x18, 0x58, inner.len() as u8];
+        sref.extend_from_slice(&inner);
+        // output map { 0 => addr, 3 => script_ref }
+        let addr = {
+            let mut v = vec![0x60];
+            v.extend_from_slice(&[0u8; 28]);
+            v
+        };
+        let mut out = vec![0xa2, 0x00, 0x58, addr.len() as u8];
+        out.extend_from_slice(&addr);
+        out.push(0x03);
+        out.extend_from_slice(&sref);
+
+        let recovered =
+            reference_native_script_original_bytes(&out).expect("recover inner native bytes");
+        assert_eq!(recovered, ns, "must recover the exact inner native-script bytes");
+    }
 
     /// #730: Haskell `decodeMultiAsset` at decoder version >= 9
     /// (`decodeConway`) REJECTS zero-quantity assets:

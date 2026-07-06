@@ -1141,43 +1141,51 @@ pub(crate) fn read_native_script_from_cbor(
 }
 
 fn read_native_script(r: &mut Reader<'_>) -> Result<NativeScript, SerializationError> {
+    // OUTER ARRAY: accept BOTH definite- AND indefinite-length encodings, matching
+    // cardano-ledger's Timelock decoder (`decodeRecordSum` -> `decodeListLenOrIndef`).
+    // The previous `is_none() => Err` HARD-REJECTED indefinite-length native scripts
+    // that Haskell accepts — over-rejecting valid blocks. Mirrors the already-fixed
+    // Conway copy (`era_conway::read_native_script`). See issue #862.
     let arr_len = r.read_array_header()?;
-    if arr_len.is_none() {
-        return Err(SerializationError::CborDecode(
-            "native_script: expected definite-length array".into(),
-        ));
-    }
     let disc = r.read_uint()?;
-    match disc {
+    let script = match disc {
         0 => {
             let h28 = read_hash28_cert(r)?;
-            Ok(NativeScript::ScriptPubkey(h28.to_hash32_padded()))
+            NativeScript::ScriptPubkey(h28.to_hash32_padded())
         }
         1 => {
             let scripts = r.read_array(read_native_script)?;
-            Ok(NativeScript::ScriptAll(scripts))
+            NativeScript::ScriptAll(scripts)
         }
         2 => {
             let scripts = r.read_array(read_native_script)?;
-            Ok(NativeScript::ScriptAny(scripts))
+            NativeScript::ScriptAny(scripts)
         }
         3 => {
             let n = r.read_uint()? as u32;
             let scripts = r.read_array(read_native_script)?;
-            Ok(NativeScript::ScriptNOfK(n, scripts))
+            NativeScript::ScriptNOfK(n, scripts)
         }
         4 => {
             let slot = r.read_uint()?;
-            Ok(NativeScript::InvalidBefore(SlotNo(slot)))
+            NativeScript::InvalidBefore(SlotNo(slot))
         }
         5 => {
             let slot = r.read_uint()?;
-            Ok(NativeScript::InvalidHereafter(SlotNo(slot)))
+            NativeScript::InvalidHereafter(SlotNo(slot))
         }
-        other => Err(SerializationError::CborDecode(format!(
-            "native_script: unknown type {other}"
-        ))),
+        other => {
+            return Err(SerializationError::CborDecode(format!(
+                "native_script: unknown type {other}"
+            )))
+        }
+    };
+    // Consume the trailing CBOR break byte for an indefinite-length outer array,
+    // exactly as upstream `decodeListLikeT` does for the `Nothing` case.
+    if arr_len.is_none() {
+        r.expect_break()?;
     }
+    Ok(script)
 }
 
 /// Read a single Plutus redeemer: `[tag, index, plutus_data, ex_units]`.
