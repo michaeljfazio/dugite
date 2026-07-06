@@ -1885,6 +1885,11 @@ fn process_governance_votes_and_proposals(
             yes_votes: 0,
             no_votes: 0,
             abstain_votes: 0,
+            // #799: monotonic submission index, read BEFORE the counter below
+            // is incremented, so ties in ratification priority sort by
+            // on-chain submission order (matching Haskell's stable
+            // `reorderActions`), not by GovActionId (hash) order.
+            submission_index: governance.proposal_count,
         };
         governance
             .proposals

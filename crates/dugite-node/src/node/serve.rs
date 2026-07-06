@@ -1243,6 +1243,7 @@ mod tests {
             yes_votes: 0,
             no_votes: 0,
             abstain_votes: 0,
+            submission_index: 0,
         };
         let cold_cred = Hash32::from_bytes([0xC0; 32]);
         let hot_cred = Hash32::from_bytes([0x77; 32]);

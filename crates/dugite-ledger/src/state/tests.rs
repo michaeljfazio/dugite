@@ -1317,6 +1317,7 @@ fn test_drep_activity_tracking() {
                 expires_epoch: EpochNo(100),
                 yes_votes: 0,
                 no_votes: 0,
+                submission_index: 0,
                 abstain_votes: 0,
             },
         );
@@ -1483,6 +1484,7 @@ fn test_drep_marked_inactive_on_expiry() {
                 expires_epoch: EpochNo(100),
                 yes_votes: 0,
                 no_votes: 0,
+                submission_index: 0,
                 abstain_votes: 0,
             },
         );
@@ -2133,7 +2135,11 @@ fn test_parameter_change_ratification() {
     state.epoch_length = 100;
     // Post-bootstrap: ParameterChange requires actual DRep votes (not auto-pass)
     state.epochs.protocol_params.protocol_version_major = 10;
-    // Set CC threshold to 0 so CC auto-approves (we're testing DRep voting here)
+    // Set CC threshold to 0 so CC auto-approves (we're testing DRep voting here).
+    // #800: a 0-threshold committee only auto-passes when `active_size >=
+    // committee_min_size` (or during bootstrap); this test has no CC members
+    // at all, so zero `committee_min_size` too (mirrors `gov_test_state`).
+    state.epochs.protocol_params.committee_min_size = 0;
     Arc::make_mut(&mut state.gov.governance).committee_threshold = Some(Rational {
         numerator: 0,
         denominator: 1,
@@ -2300,6 +2306,10 @@ fn test_treasury_withdrawal_ratification() {
     state.epochs.treasury = Lovelace(10_000_000_000);
     // Post-bootstrap: TreasuryWithdrawals requires actual DRep votes (and is allowed)
     state.epochs.protocol_params.protocol_version_major = 10;
+    // #800: a 0-threshold committee only auto-passes when `active_size >=
+    // committee_min_size` (or during bootstrap); this test has no CC members
+    // at all, so zero `committee_min_size` too (mirrors `gov_test_state`).
+    state.epochs.protocol_params.committee_min_size = 0;
     Arc::make_mut(&mut state.gov.governance).committee_threshold = Some(Rational {
         numerator: 0,
         denominator: 1,
@@ -2446,6 +2456,14 @@ fn test_hard_fork_ratification() {
     // (HardForkInitiation is rejected during bootstrap phase, protocol == 9)
     state.epochs.protocol_params.protocol_version_major = 10;
     state.epochs.protocol_params.protocol_version_minor = 0;
+    // #800: a 0-threshold committee only auto-passes when `active_size >=
+    // committee_min_size` (or during bootstrap). This test has no CC members
+    // at all and only cares about the DRep/SPO thresholds for HardFork
+    // ratification, so neutralize the CC leg by zeroing `committee_min_size`
+    // (mirroring the same pattern used by `gov_test_state` in governance.rs)
+    // rather than relying on the old (buggy) unconditional zero-threshold
+    // auto-pass.
+    state.epochs.protocol_params.committee_min_size = 0;
     Arc::make_mut(&mut state.gov.governance).committee_threshold = Some(Rational {
         numerator: 0,
         denominator: 1,
@@ -12707,6 +12725,7 @@ fn test_epoch_transition_marks_inactive_drep() {
                 yes_votes: 0,
                 no_votes: 0,
                 abstain_votes: 0,
+                submission_index: 0,
             },
         );
     }
@@ -14402,7 +14421,11 @@ fn test_treasury_withdrawal_via_governance_reduces_treasury() {
     state.epochs.treasury = Lovelace(10_000_000_000); // 10B lovelace
     state.epochs.needs_stake_rebuild = false;
 
-    // Set CC threshold to 0 so CC auto-approves
+    // Set CC threshold to 0 so CC auto-approves.
+    // #800: a 0-threshold committee only auto-passes when `active_size >=
+    // committee_min_size` (or during bootstrap); this test has no CC members
+    // at all, so zero `committee_min_size` too (mirrors `gov_test_state`).
+    state.epochs.protocol_params.committee_min_size = 0;
     Arc::make_mut(&mut state.gov.governance).committee_threshold = Some(Rational {
         numerator: 0,
         denominator: 1,
