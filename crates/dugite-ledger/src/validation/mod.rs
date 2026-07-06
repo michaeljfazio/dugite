@@ -2101,14 +2101,12 @@ pub(crate) fn missing_cost_model_languages(
         .into_iter()
         .collect::<std::collections::BTreeSet<u8>>()
         .into_iter()
-        .filter(|&lang| {
-            !match lang {
-                1 => cost_models.plutus_v1.is_some(),
-                2 => cost_models.plutus_v2.is_some(),
-                3 => cost_models.plutus_v3.is_some(),
-                4 => cost_models.plutus_v4.is_some(),
-                _ => true,
-            }
+        .filter(|&lang| !match lang {
+            1 => cost_models.plutus_v1.is_some(),
+            2 => cost_models.plutus_v2.is_some(),
+            3 => cost_models.plutus_v3.is_some(),
+            4 => cost_models.plutus_v4.is_some(),
+            _ => true,
         })
         .collect()
 }
