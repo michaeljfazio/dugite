@@ -1451,7 +1451,8 @@ mod tests {
         );
         let pubkey_hash = Hash32::from_bytes([42u8; 32]);
         let native_script = NativeScript::ScriptPubkey(pubkey_hash);
-        let script_hash = compute_script_ref_hash(&ScriptRef::NativeScript(native_script.clone()));
+        let script_hash =
+            compute_script_ref_hash(&ScriptRef::NativeScript(native_script.clone()), None);
         let ref_input = TransactionInput {
             transaction_id: Hash32::from_bytes([3u8; 32]),
             index: 0,
@@ -1502,7 +1503,8 @@ mod tests {
         // Scenario: the spending input's UTxO itself carries a script_ref whose hash
         // matches the minting policy.  No reference_inputs are needed.
         let native_script = NativeScript::ScriptAll(vec![]);
-        let script_hash = compute_script_ref_hash(&ScriptRef::NativeScript(native_script.clone()));
+        let script_hash =
+            compute_script_ref_hash(&ScriptRef::NativeScript(native_script.clone()), None);
 
         let mut utxo_set = UtxoSet::new();
         // Spending input carries the script_ref
@@ -1615,7 +1617,8 @@ mod tests {
         use dugite_primitives::credentials::Credential;
 
         let native_script = NativeScript::ScriptAll(vec![]);
-        let script_hash = compute_script_ref_hash(&ScriptRef::NativeScript(native_script.clone()));
+        let script_hash =
+            compute_script_ref_hash(&ScriptRef::NativeScript(native_script.clone()), None);
 
         let mut utxo_set = UtxoSet::new();
 
@@ -1682,7 +1685,7 @@ mod tests {
     #[test]
     fn test_compute_script_ref_hash_plutus_v2() {
         let script_bytes = vec![0x01, 0x02, 0x03, 0x04];
-        let hash = compute_script_ref_hash(&ScriptRef::PlutusV2(script_bytes.clone()));
+        let hash = compute_script_ref_hash(&ScriptRef::PlutusV2(script_bytes.clone()), None);
         let mut tagged = vec![0x02];
         tagged.extend_from_slice(&script_bytes);
         let expected = dugite_primitives::hash::blake2b_224(&tagged);
@@ -2620,7 +2623,7 @@ mod tests {
         // fixture survives any future flat/CBOR-encoding tweak.
         let plutus_script_bytes = {
             let p = dugite_uplc::program::Program {
-                version: (1, 0, 0),
+                version: dugite_uplc::program::Program::version_triple(1, 0, 0),
                 term: dugite_uplc::term::Term::Const(dugite_uplc::term::Constant::Integer(
                     num_bigint::BigInt::from(0),
                 )),
@@ -3959,7 +3962,8 @@ mod tests {
         // The minting policy native script.
         let signer_hash = Hash32::from_bytes([0x7Fu8; 32]);
         let native_script = NativeScript::ScriptPubkey(signer_hash);
-        let script_hash = compute_script_ref_hash(&ScriptRef::NativeScript(native_script.clone()));
+        let script_hash =
+            compute_script_ref_hash(&ScriptRef::NativeScript(native_script.clone()), None);
 
         // Spending input — the UTxO that the minting transaction actually spends.
         let spending_input = TransactionInput {
@@ -16976,6 +16980,42 @@ mod tests {
         assert!(panic_err.is_eval_panic());
         assert!(PlutusError::CollectError("x".into()).is_collect_error());
         assert!(!PlutusError::CollectError("x".into()).is_eval_panic());
+    }
+
+    /// #826 / #860.3: an EXECUTED Plutus language with no cost model is a
+    /// `NoCostModel` collection error; a language with a cost model, or one that
+    /// is not executed, is not. Per-executed-language scope, deduped and sorted.
+    #[test]
+    fn missing_cost_model_languages_no_cost_model_826() {
+        use crate::validation::missing_cost_model_languages;
+        use dugite_primitives::transaction::CostModels;
+
+        let full = CostModels {
+            plutus_v1: Some(vec![1]),
+            plutus_v2: Some(vec![2]),
+            plutus_v3: Some(vec![3]),
+            plutus_v4: Some(vec![4]),
+            ..Default::default()
+        };
+        assert!(missing_cost_model_languages([1u8, 2, 3], &full).is_empty());
+
+        let no_v2 = CostModels {
+            plutus_v1: Some(vec![1]),
+            plutus_v3: Some(vec![3]),
+            ..Default::default()
+        };
+        // V2 executed but absent -> missing.
+        assert_eq!(missing_cost_model_languages([2u8], &no_v2), vec![2]);
+        // V2 absent but NOT executed -> not missing (per-executed scope).
+        assert!(missing_cost_model_languages([1u8, 3], &no_v2).is_empty());
+
+        // Multiple missing dedup + sort; native/unknown tags never count.
+        let none = CostModels::default();
+        assert_eq!(
+            missing_cost_model_languages([3u8, 1, 3, 2], &none),
+            vec![1, 2, 3]
+        );
+        assert!(missing_cost_model_languages([0u8], &none).is_empty());
     }
 
     /// `IsValidTagMismatch` is a proper `ValidationError` variant and can be

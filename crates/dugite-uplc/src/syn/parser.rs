@@ -68,7 +68,21 @@ impl<'a> Parser<'a> {
         let term = self.parse_term()?;
         self.skip_trivia();
         self.expect_char(')')?;
-        Ok(Program { version, term })
+        // `Program.version` is `BigUint`-typed (#842 residual — the flat
+        // decoder needs arbitrary precision to match Haskell's unbounded
+        // `Natural`). This textual parser is dev/test-only tooling (not
+        // on the consensus wire-format path), so its own version-gating
+        // (`program_version`/`version_below`) stays `u64`-based for
+        // simplicity; only the final `Program` value needs the widened
+        // type.
+        Ok(Program {
+            version: (
+                num_bigint::BigUint::from(version.0),
+                num_bigint::BigUint::from(version.1),
+                num_bigint::BigUint::from(version.2),
+            ),
+            term,
+        })
     }
 
     pub(super) fn parse_term_top(&mut self) -> Result<Term, ParseError> {
@@ -363,7 +377,7 @@ impl<'a> Parser<'a> {
                     )),
                 }
             }
-            TypeTag::Data => Ok(Constant::Data(self.parse_data()?)),
+            TypeTag::Data => Ok(Constant::Data(std::rc::Rc::new(self.parse_data()?))),
             TypeTag::List(elem) => {
                 let elems = self.parse_list_literal(elem)?;
                 Ok(Constant::ProtoList {
@@ -910,7 +924,14 @@ impl<'a> Parser<'a> {
             "List" => Ok(Data::List(self.parse_data_list()?)),
             "Map" => Ok(Data::Map(self.parse_data_map()?)),
             "Constr" => {
-                let tag = self.parse_uint_u64()?;
+                // The tag is an arbitrary-precision signed `Integer` in
+                // Haskell (`Data = Constr Integer [Data] | ...`), matching
+                // `Data::Constr`'s `BigInt` tag (#859) — use the same
+                // signed-integer parser as the `I` atom rather than the
+                // Word64-bounded `parse_uint_u64`, so the textual syntax
+                // can express the full domain (including a transient
+                // negative/oversized tag a script can construct pre-PV11).
+                let tag = self.parse_signed_int()?;
                 self.skip_trivia();
                 let args = self.parse_data_list()?;
                 Ok(Data::Constr(tag, args))

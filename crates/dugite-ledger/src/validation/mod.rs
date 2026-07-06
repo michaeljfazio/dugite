@@ -2085,6 +2085,32 @@ pub(crate) fn phase2_admission_error(
     }
 }
 
+/// The sorted set of executed Plutus language tags (1=V1, 2=V2, 3=V3, 4=V4) that
+/// have NO cost model in `cost_models`. A non-empty result corresponds to Haskell
+/// `collectPlutusScriptsWithContext` failing with `CollectErrors [NoCostModel lang]`
+/// — the transaction must be rejected regardless of `isValid`, before any script is
+/// evaluated. The lookup is keyed per-executed-script's own language (a tx with only
+/// V2 scripts never observes a missing V1 cost model); native scripts and unknown
+/// tags never need a cost model. Only TOTAL absence counts (a present-but-short cost
+/// model is `maxBound`-padded upstream, not a `NoCostModel`). See #826 / #860.3.
+pub(crate) fn missing_cost_model_languages(
+    executed_langs: impl IntoIterator<Item = u8>,
+    cost_models: &dugite_primitives::transaction::CostModels,
+) -> Vec<u8> {
+    executed_langs
+        .into_iter()
+        .collect::<std::collections::BTreeSet<u8>>()
+        .into_iter()
+        .filter(|&lang| !match lang {
+            1 => cost_models.plutus_v1.is_some(),
+            2 => cost_models.plutus_v2.is_some(),
+            3 => cost_models.plutus_v3.is_some(),
+            4 => cost_models.plutus_v4.is_some(),
+            _ => true,
+        })
+        .collect()
+}
+
 pub fn validate_transaction(
     tx: &Transaction,
     utxo_set: &dyn UtxoLookup,
@@ -3931,6 +3957,30 @@ pub fn validate_transaction_with_pools(
         }
 
         if errors.is_empty() && has_redeemers {
+            // ── #826 / #860.3: NoCostModel collection check ───────────────
+            //
+            // Haskell `collectPlutusScriptsWithContext` fails with
+            // `CollectErrors [NoCostModel lang]` — rejecting the transaction
+            // REGARDLESS of `isValid`, before any script is evaluated — when a
+            // Plutus script that is actually EXECUTED (has a matching redeemer)
+            // uses a language that has no cost model in the protocol parameters.
+            // dugite previously fell back silently to the uplc-side reference
+            // cost model, accepting a transaction cardano-node rejects. This is a
+            // *collection* error, so it runs before the (possibly-skipped) eval.
+            {
+                let version_map = crate::validation::plutus_script_version_map(tx, utxo_set);
+                let executed =
+                    crate::validation::redeemer_script_version_map(tx, utxo_set, &version_map);
+                let missing =
+                    missing_cost_model_languages(executed.values().copied(), &params.cost_models);
+                if !missing.is_empty() {
+                    errors.push(ValidationError::Phase2CollectError(format!(
+                        "NoCostModel: executed Plutus language(s) {missing:?} have no cost model \
+                         in the protocol parameters"
+                    )));
+                }
+            }
+
             // ── Parallel-phase-2 gate ─────────────────────────────────────
             //
             // When the block-apply path uses deferred-parallel Phase-2

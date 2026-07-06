@@ -61,6 +61,40 @@ fn test_conway_block() {
     smoke_test_block("conway", Era::Conway);
 }
 
+/// #857: pre-Conway (Mary/Alonzo/Babbage) tx outputs must carry `raw_cbor` when
+/// decoded through the real block path, matching Conway. Prior to the fix every
+/// pre-Conway output reached the ledger with `raw_cbor == None`, silently forcing
+/// `raw_cbor`-dependent ledger paths (Rule 5 min-UTxO size) onto a re-encode fallback.
+#[test]
+fn test_pre_conway_outputs_carry_raw_cbor_857() {
+    let mut total_checked = 0usize;
+    for (name, era) in [
+        ("mary", Era::Mary),
+        ("alonzo", Era::Alonzo),
+        ("babbage", Era::Babbage),
+    ] {
+        let cbor = load_vector(name);
+        let block = decode_block(&cbor).unwrap_or_else(|e| panic!("{name}: decode failed: {e}"));
+        assert_eq!(block.era, era, "{name}: era mismatch");
+        for tx in &block.transactions {
+            for out in &tx.body.outputs {
+                assert!(
+                    out.raw_cbor.is_some(),
+                    "{name}: output reached ledger with raw_cbor == None (#857 regression)"
+                );
+                total_checked += 1;
+            }
+        }
+    }
+    // Mary and Babbage exercise the two pre-Conway output decoders (the Alonzo-family
+    // legacy decoder and the Babbage map/legacy decoder respectively), so at least one
+    // real output must have been checked overall.
+    assert!(
+        total_checked > 0,
+        "no pre-Conway output was exercised — #857 regression is untested"
+    );
+}
+
 #[test]
 fn test_decode_block_invalid_cbor() {
     let bad_cbor = vec![0xff, 0xfe, 0xfd, 0xfc];

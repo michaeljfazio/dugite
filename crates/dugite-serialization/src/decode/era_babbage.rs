@@ -440,7 +440,7 @@ fn decode_babbage_tx_body(r: &mut Reader<'_>) -> Result<TransactionBody, Seriali
                 inputs = r.read_array(read_tx_input)?;
             }
             1 => {
-                outputs = r.read_array(|r| read_babbage_tx_output(r))?;
+                outputs = r.read_array(|r| read_babbage_tx_output_with_raw(r))?;
             }
             2 => {
                 fee = Lovelace(r.read_uint()?);
@@ -498,8 +498,10 @@ fn decode_babbage_tx_body(r: &mut Reader<'_>) -> Result<TransactionBody, Seriali
                 network_id = Some(id as u8);
             }
             16 => {
-                // collateral_return: a post-Alonzo output (map or legacy array)
-                collateral_return = Some(read_babbage_tx_output(r)?);
+                // collateral_return: a post-Alonzo output (map or legacy array).
+                // Capture raw_cbor to match Conway (#857): collateral_return is a
+                // TransactionOutput subject to the same raw_cbor-dependent size checks.
+                collateral_return = Some(read_babbage_tx_output_with_raw(r)?);
             }
             17 => {
                 // total_collateral: coin
@@ -650,6 +652,23 @@ fn read_babbage_tx_output(r: &mut Reader<'_>) -> Result<TransactionOutput, Seria
             "babbage tx_out: expected array or map, got {other}"
         ))),
     }
+}
+
+/// Read a Babbage `transaction_output` from the reader and capture its original
+/// CBOR bytes in `raw_cbor`.
+///
+/// Wraps [`read_babbage_tx_output`] with [`KeepRaw::parse_with`] so Babbage outputs
+/// carry the exact wire bytes they were decoded from, matching the Conway path's
+/// `read_babbage_tx_output_with_raw`. Without this, every Babbage output (and
+/// collateral return) reached the ledger with `raw_cbor == None`, forcing
+/// `raw_cbor`-dependent paths onto a re-encode fallback. See issue #857.
+fn read_babbage_tx_output_with_raw(
+    r: &mut Reader<'_>,
+) -> Result<TransactionOutput, SerializationError> {
+    let raw = KeepRaw::parse_with(r, read_babbage_tx_output)?;
+    let mut output = raw.value;
+    output.raw_cbor = Some(raw.raw.to_vec());
+    Ok(output)
 }
 
 fn read_babbage_legacy_output(r: &mut Reader<'_>) -> Result<TransactionOutput, SerializationError> {
@@ -1536,6 +1555,56 @@ mod tests {
             "array-form output should have is_legacy=true"
         );
         assert_eq!(out.value.coin.0, 3_000_000);
+    }
+
+    #[test]
+    fn babbage_with_raw_captures_original_bytes_857() {
+        // #857: pre-Conway output decode must populate `raw_cbor` with the ORIGINAL
+        // wire bytes (not None, not a re-encode) so raw_cbor-dependent ledger paths
+        // (Rule 5 min-UTxO size) see the exact encoding.
+        let addr_bytes: Vec<u8> = {
+            let mut v = vec![0x60];
+            v.extend_from_slice(&[0u8; 28]);
+            v
+        };
+        let mut out_arr = vec![0x82]; // array(2)
+        out_arr.extend(cbor_bytes(&addr_bytes));
+        out_arr.extend(cbor_uint(3_000_000));
+
+        let mut r = Reader::new(&out_arr);
+        let out = read_babbage_tx_output_with_raw(&mut r).unwrap();
+        assert_eq!(
+            out.raw_cbor.as_deref(),
+            Some(out_arr.as_slice()),
+            "raw_cbor must hold the exact original output bytes"
+        );
+    }
+
+    #[test]
+    fn babbage_with_raw_preserves_noncanonical_uint_value_857() {
+        // A VALID output whose coin value is encoded with a NON-MINIMAL uint
+        // (0x1a 00 00 00 05 for 5, instead of the minimal 0x05) must round-trip its
+        // ORIGINAL bytes through raw_cbor — proving the capture is the original span,
+        // not a canonical re-encode (which would differ). This is the byte-exact
+        // property the fix guarantees for downstream re-hash/size paths.
+        let addr_bytes: Vec<u8> = {
+            let mut v = vec![0x60];
+            v.extend_from_slice(&[0u8; 28]);
+            v
+        };
+        let mut out_arr = vec![0x82]; // array(2)
+        out_arr.extend(cbor_bytes(&addr_bytes));
+        // Non-minimal encoding of 5 as a 4-byte uint: 0x1a 00000005.
+        out_arr.extend_from_slice(&[0x1a, 0x00, 0x00, 0x00, 0x05]);
+
+        let mut r = Reader::new(&out_arr);
+        let out = read_babbage_tx_output_with_raw(&mut r).unwrap();
+        assert_eq!(
+            out.raw_cbor.as_deref(),
+            Some(out_arr.as_slice()),
+            "raw_cbor must preserve the non-minimal-uint bytes verbatim, not re-encode"
+        );
+        assert_eq!(out.value.coin.0, 5);
     }
 
     #[test]

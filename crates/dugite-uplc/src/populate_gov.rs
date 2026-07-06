@@ -173,7 +173,7 @@ pub fn proposal_to_plutus(p: &PrimProposal) -> Result<PlProposalProcedure, Phase
     let deposit_data = Data::I(BigInt::from(p.deposit.0));
     let gov_action_data = gov_action_to_data(&p.gov_action)?;
     Ok(PlProposalProcedure(Data::Constr(
-        0,
+        BigInt::from(0),
         vec![deposit_data, return_addr_data, gov_action_data],
     )))
 }
@@ -219,7 +219,7 @@ pub fn gov_action_to_data(action: &PrimGovAction) -> Result<Data, PhaseTwoError>
             protocol_param_update,
             policy_hash,
         } => Data::Constr(
-            0,
+            BigInt::from(0),
             vec![
                 maybe_gov_action_id(prev_action_id.as_ref()),
                 // ChangedParameters (#761): the Conway guardrails scripts that
@@ -239,12 +239,12 @@ pub fn gov_action_to_data(action: &PrimGovAction) -> Result<Data, PhaseTwoError>
             prev_action_id,
             protocol_version: (major, minor),
         } => Data::Constr(
-            1,
+            BigInt::from(1),
             vec![
                 maybe_gov_action_id(prev_action_id.as_ref()),
                 // ProtocolVersion: makeIsDataSchemaIndexed [('ProtocolVersion, 0)]
                 Data::Constr(
-                    0,
+                    BigInt::from(0),
                     vec![Data::I(BigInt::from(*major)), Data::I(BigInt::from(*minor))],
                 ),
             ],
@@ -277,14 +277,15 @@ pub fn gov_action_to_data(action: &PrimGovAction) -> Result<Data, PhaseTwoError>
                 })
                 .collect();
             Data::Constr(
-                2,
+                BigInt::from(2),
                 vec![Data::Map(entries), maybe_script_hash(policy_hash.as_ref())],
             )
         }
         // Constr 3 [Maybe GovActionId]
-        PrimGovAction::NoConfidence { prev_action_id } => {
-            Data::Constr(3, vec![maybe_gov_action_id(prev_action_id.as_ref())])
-        }
+        PrimGovAction::NoConfidence { prev_action_id } => Data::Constr(
+            BigInt::from(3),
+            vec![maybe_gov_action_id(prev_action_id.as_ref())],
+        ),
         // Constr 4 [Maybe GovActionId, [ColdCredential], Map ColdCredential Epoch, Rational]
         // ColdCommitteeCredential: newtype deriving ToData from V2.Credential → bare Credential
         // Rational: makeIsDataSchemaIndexed [('Rational, 0)] → Constr 0 [I num, I den]
@@ -331,14 +332,14 @@ pub fn gov_action_to_data(action: &PrimGovAction) -> Result<Data, PhaseTwoError>
             let (threshold_num, threshold_den) =
                 reduce_rational(threshold.numerator, threshold.denominator);
             let rational_data = Data::Constr(
-                0,
+                BigInt::from(0),
                 vec![
                     Data::I(BigInt::from(threshold_num)),
                     Data::I(BigInt::from(threshold_den)),
                 ],
             );
             Data::Constr(
-                4,
+                BigInt::from(4),
                 vec![
                     maybe_gov_action_id(prev_action_id.as_ref()),
                     Data::List(remove_list),
@@ -354,11 +355,11 @@ pub fn gov_action_to_data(action: &PrimGovAction) -> Result<Data, PhaseTwoError>
             constitution,
         } => {
             let constitution_data = Data::Constr(
-                0,
+                BigInt::from(0),
                 vec![maybe_script_hash(constitution.script_hash.as_ref())],
             );
             Data::Constr(
-                5,
+                BigInt::from(5),
                 vec![
                     maybe_gov_action_id(prev_action_id.as_ref()),
                     constitution_data,
@@ -366,7 +367,7 @@ pub fn gov_action_to_data(action: &PrimGovAction) -> Result<Data, PhaseTwoError>
             )
         }
         // Constr 6 []
-        PrimGovAction::InfoAction => Data::Constr(6, vec![]),
+        PrimGovAction::InfoAction => Data::Constr(BigInt::from(6), vec![]),
     };
     Ok(d)
 }
@@ -632,19 +633,19 @@ fn ppu_to_changed_parameters_data(ppu: &ProtocolParamUpdate) -> Data {
 /// `script_context.rs`, which already encodes bare bytes for V3).
 fn maybe_gov_action_id(id: Option<&PrimGovActionId>) -> Data {
     match id {
-        None => Data::Constr(1, vec![]),
+        None => Data::Constr(BigInt::from(1), vec![]),
         Some(gid) => {
             // GovernanceActionId = Constr 0 [B txid32, I action_idx]
             // V3 TxId = bare BuiltinByteString (deriving newtype ToData).
             // This matches GovActionId::to_data() in script_context.rs.
             let id_data = Data::Constr(
-                0,
+                BigInt::from(0),
                 vec![
                     Data::B(gid.transaction_id.0.to_vec()),
                     Data::I(BigInt::from(gid.action_index)),
                 ],
             );
-            Data::Constr(0, vec![id_data])
+            Data::Constr(BigInt::from(0), vec![id_data])
         }
     }
 }
@@ -654,8 +655,8 @@ fn maybe_gov_action_id(id: Option<&PrimGovActionId>) -> Data {
 /// `Nothing = Constr 1 []`, `Just h = Constr 0 [B28]`.
 fn maybe_script_hash(h: Option<&dugite_primitives::hash::Hash28>) -> Data {
     match h {
-        None => Data::Constr(1, vec![]),
-        Some(sh) => Data::Constr(0, vec![Data::B(sh.0.to_vec())]),
+        None => Data::Constr(BigInt::from(1), vec![]),
+        Some(sh) => Data::Constr(BigInt::from(0), vec![Data::B(sh.0.to_vec())]),
     }
 }
 
@@ -697,23 +698,27 @@ pub fn proposals_to_plutus(
 pub fn certificate_to_plutus(c: &PrimCert) -> Result<TxCert, PhaseTwoError> {
     let data = match c {
         PrimCert::StakeRegistration(cred) => {
-            Data::Constr(0, vec![cred_data(cred), option_int(None)])
+            Data::Constr(BigInt::from(0), vec![cred_data(cred), option_int(None)])
         }
         PrimCert::StakeDeregistration(cred) => {
-            Data::Constr(1, vec![cred_data(cred), option_int(None)])
+            Data::Constr(BigInt::from(1), vec![cred_data(cred), option_int(None)])
         }
         PrimCert::ConwayStakeRegistration {
             credential,
             deposit,
-        } => Data::Constr(0, vec![cred_data(credential), option_int(Some(deposit.0))]),
-        PrimCert::ConwayStakeDeregistration { credential, refund } => {
-            Data::Constr(1, vec![cred_data(credential), option_int(Some(refund.0))])
-        }
+        } => Data::Constr(
+            BigInt::from(0),
+            vec![cred_data(credential), option_int(Some(deposit.0))],
+        ),
+        PrimCert::ConwayStakeDeregistration { credential, refund } => Data::Constr(
+            BigInt::from(1),
+            vec![cred_data(credential), option_int(Some(refund.0))],
+        ),
         PrimCert::StakeDelegation {
             credential,
             pool_hash,
         } => Data::Constr(
-            2,
+            BigInt::from(2),
             vec![cred_data(credential), delegatee_to_pool(&pool_hash.0)],
         ),
         PrimCert::RegStakeDeleg {
@@ -721,7 +726,7 @@ pub fn certificate_to_plutus(c: &PrimCert) -> Result<TxCert, PhaseTwoError> {
             pool_hash,
             deposit,
         } => Data::Constr(
-            3,
+            BigInt::from(3),
             vec![
                 cred_data(credential),
                 delegatee_to_pool(&pool_hash.0),
@@ -733,46 +738,49 @@ pub fn certificate_to_plutus(c: &PrimCert) -> Result<TxCert, PhaseTwoError> {
             deposit,
             ..
         } => Data::Constr(
-            4,
+            BigInt::from(4),
             vec![cred_data(credential), Data::I(BigInt::from(deposit.0))],
         ),
-        PrimCert::UpdateDRep { credential, .. } => Data::Constr(5, vec![cred_data(credential)]),
+        PrimCert::UpdateDRep { credential, .. } => {
+            Data::Constr(BigInt::from(5), vec![cred_data(credential)])
+        }
         PrimCert::UnregDRep { credential, refund } => Data::Constr(
-            6,
+            BigInt::from(6),
             vec![cred_data(credential), Data::I(BigInt::from(refund.0))],
         ),
         PrimCert::PoolRegistration(params) => Data::Constr(
-            7,
+            BigInt::from(7),
             vec![
                 Data::B(params.operator.0.to_vec()),
                 Data::B(params.vrf_keyhash.0.to_vec()),
             ],
         ),
         PrimCert::PoolRetirement { pool_hash, epoch } => Data::Constr(
-            8,
+            BigInt::from(8),
             vec![Data::B(pool_hash.0.to_vec()), Data::I(BigInt::from(*epoch))],
         ),
         PrimCert::CommitteeHotAuth {
             cold_credential,
             hot_credential,
         } => Data::Constr(
-            9,
+            BigInt::from(9),
             vec![cred_data(cold_credential), cred_data(hot_credential)],
         ),
         PrimCert::CommitteeColdResign {
             cold_credential, ..
-        } => Data::Constr(10, vec![cred_data(cold_credential)]),
+        } => Data::Constr(BigInt::from(10), vec![cred_data(cold_credential)]),
         // Combined certs: emit as TxCertRegDeleg / TxCertDelegStaking shapes,
         // with the DRep threaded through the `Delegatee` payload (#815).
-        PrimCert::VoteDelegation { credential, drep } => {
-            Data::Constr(2, vec![cred_data(credential), delegatee_vote(drep)])
-        }
+        PrimCert::VoteDelegation { credential, drep } => Data::Constr(
+            BigInt::from(2),
+            vec![cred_data(credential), delegatee_vote(drep)],
+        ),
         PrimCert::StakeVoteDelegation {
             credential,
             pool_hash,
             drep,
         } => Data::Constr(
-            2,
+            BigInt::from(2),
             vec![
                 cred_data(credential),
                 delegatee_stake_vote(&pool_hash.0, drep),
@@ -784,7 +792,7 @@ pub fn certificate_to_plutus(c: &PrimCert) -> Result<TxCert, PhaseTwoError> {
             deposit,
             drep,
         } => Data::Constr(
-            3,
+            BigInt::from(3),
             vec![
                 cred_data(credential),
                 delegatee_stake_vote(&pool_hash.0, drep),
@@ -796,7 +804,7 @@ pub fn certificate_to_plutus(c: &PrimCert) -> Result<TxCert, PhaseTwoError> {
             deposit,
             drep,
         } => Data::Constr(
-            3,
+            BigInt::from(3),
             vec![
                 cred_data(credential),
                 delegatee_vote(drep),
@@ -829,7 +837,7 @@ fn cred_data(c: &PrimCred) -> Data {
 /// type uses `StakingCredential` everywhere a credential appears, NOT the
 /// bare `Credential` (and NOT the Conway V3 `TxCert` shapes).
 fn staking_hash_data(c: &PrimCred) -> Data {
-    Data::Constr(0, vec![cred_data(c)])
+    Data::Constr(BigInt::from(0), vec![cred_data(c)])
 }
 
 /// Translate a ledger certificate into the **PlutusV1/V2** `DCert` Data,
@@ -863,28 +871,32 @@ pub fn certificate_to_plutus_v1v2(c: &PrimCert) -> Result<TxCert, PhaseTwoError>
         )))
     };
     let data = match c {
-        PrimCert::StakeRegistration(cred) => Data::Constr(0, vec![staking_hash_data(cred)]),
-        PrimCert::StakeDeregistration(cred) => Data::Constr(1, vec![staking_hash_data(cred)]),
+        PrimCert::StakeRegistration(cred) => {
+            Data::Constr(BigInt::from(0), vec![staking_hash_data(cred)])
+        }
+        PrimCert::StakeDeregistration(cred) => {
+            Data::Constr(BigInt::from(1), vec![staking_hash_data(cred)])
+        }
         PrimCert::StakeDelegation {
             credential,
             pool_hash,
         } => Data::Constr(
-            2,
+            BigInt::from(2),
             vec![staking_hash_data(credential), Data::B(pool_hash.0.to_vec())],
         ),
         PrimCert::PoolRegistration(params) => Data::Constr(
-            3,
+            BigInt::from(3),
             vec![
                 Data::B(params.operator.0.to_vec()),
                 Data::B(params.vrf_keyhash.0.to_vec()),
             ],
         ),
         PrimCert::PoolRetirement { pool_hash, epoch } => Data::Constr(
-            4,
+            BigInt::from(4),
             vec![Data::B(pool_hash.0.to_vec()), Data::I(BigInt::from(*epoch))],
         ),
-        PrimCert::GenesisKeyDelegation { .. } => Data::Constr(5, vec![]),
-        PrimCert::MoveInstantaneousRewards { .. } => Data::Constr(6, vec![]),
+        PrimCert::GenesisKeyDelegation { .. } => Data::Constr(BigInt::from(5), vec![]),
+        PrimCert::MoveInstantaneousRewards { .. } => Data::Constr(BigInt::from(6), vec![]),
         // Conway registration / deregistration (with an explicit deposit /
         // refund) translate to the SAME legacy V1/V2 `DCert` as the no-deposit
         // Shelley form — the deposit / refund is silently DROPPED (the
@@ -898,10 +910,10 @@ pub fn certificate_to_plutus_v1v2(c: &PrimCert) -> Result<TxCert, PhaseTwoError>
         // V1/V2 script). The remaining Conway-only certs below have NO legacy
         // `DCert` form, so they correctly stay `CertificateNotSupported`.
         PrimCert::ConwayStakeRegistration { credential, .. } => {
-            Data::Constr(0, vec![staking_hash_data(credential)])
+            Data::Constr(BigInt::from(0), vec![staking_hash_data(credential)])
         }
         PrimCert::ConwayStakeDeregistration { credential, .. } => {
-            Data::Constr(1, vec![staking_hash_data(credential)])
+            Data::Constr(BigInt::from(1), vec![staking_hash_data(credential)])
         }
         PrimCert::RegStakeDeleg { .. } => return conway_only("RegStakeDeleg"),
         PrimCert::VoteDelegation { .. } => return conway_only("VoteDelegation"),
@@ -927,15 +939,15 @@ pub fn certificates_to_plutus_v1v2(certs: &[PrimCert]) -> Result<Vec<TxCert>, Ph
 /// (Some n). Matches Plutus' canonical Option encoding.
 fn option_int(v: Option<u64>) -> Data {
     match v {
-        None => Data::Constr(1, vec![]),
-        Some(n) => Data::Constr(0, vec![Data::I(BigInt::from(n))]),
+        None => Data::Constr(BigInt::from(1), vec![]),
+        Some(n) => Data::Constr(BigInt::from(0), vec![Data::I(BigInt::from(n))]),
     }
 }
 
 /// Encode a Plutus `Delegatee::DelegStake(PubKeyHash)` — `Constr 0
 /// [B pool_hash]`. Used by the stake-delegation cert variants.
 fn delegatee_to_pool(pool_hash: &[u8; 28]) -> Data {
-    Data::Constr(0, vec![Data::B(pool_hash.to_vec())])
+    Data::Constr(BigInt::from(0), vec![Data::B(pool_hash.to_vec())])
 }
 
 /// Encode a [`PrimDRep`] as the Plutus V3 `DRep` Data shape (#815).
@@ -960,29 +972,33 @@ fn delegatee_to_pool(pool_hash: &[u8; 28]) -> Data {
 fn drep_to_data(drep: &PrimDRep) -> Data {
     match drep {
         PrimDRep::KeyHash(h32) => Data::Constr(
-            0,
+            BigInt::from(0),
             vec![Data::Constr(
-                0,
+                BigInt::from(0),
                 vec![Data::B(h32.as_bytes()[..28].to_vec())],
             )],
         ),
-        PrimDRep::ScriptHash(h28) => {
-            Data::Constr(0, vec![Data::Constr(1, vec![Data::B(h28.0.to_vec())])])
-        }
-        PrimDRep::Abstain => Data::Constr(1, vec![]),
-        PrimDRep::NoConfidence => Data::Constr(2, vec![]),
+        PrimDRep::ScriptHash(h28) => Data::Constr(
+            BigInt::from(0),
+            vec![Data::Constr(BigInt::from(1), vec![Data::B(h28.0.to_vec())])],
+        ),
+        PrimDRep::Abstain => Data::Constr(BigInt::from(1), vec![]),
+        PrimDRep::NoConfidence => Data::Constr(BigInt::from(2), vec![]),
     }
 }
 
 /// Encode a Plutus `Delegatee::DelegVote(DRep)` — `Constr 1 [drep]`.
 fn delegatee_vote(drep: &PrimDRep) -> Data {
-    Data::Constr(1, vec![drep_to_data(drep)])
+    Data::Constr(BigInt::from(1), vec![drep_to_data(drep)])
 }
 
 /// Encode a Plutus `Delegatee::DelegStakeVote(PubKeyHash, DRep)` —
 /// `Constr 2 [B pool_hash, drep]`.
 fn delegatee_stake_vote(pool_hash: &[u8; 28], drep: &PrimDRep) -> Data {
-    Data::Constr(2, vec![Data::B(pool_hash.to_vec()), drep_to_data(drep)])
+    Data::Constr(
+        BigInt::from(2),
+        vec![Data::B(pool_hash.to_vec()), drep_to_data(drep)],
+    )
 }
 
 /// Translate the tx body's `certificates: Vec<Certificate>` into
@@ -1057,9 +1073,12 @@ mod tests {
         assert_eq!(
             d,
             Data::Constr(
-                2,
+                BigInt::from(2),
                 vec![
-                    Data::Constr(0, vec![Data::Constr(1, vec![Data::B(vec![0xaa; 28])])]),
+                    Data::Constr(
+                        BigInt::from(0),
+                        vec![Data::Constr(BigInt::from(1), vec![Data::B(vec![0xaa; 28])])]
+                    ),
                     Data::B(vec![0xbb; 28]),
                 ]
             )
@@ -1075,10 +1094,10 @@ mod tests {
         assert_eq!(
             d,
             Data::Constr(
-                0,
+                BigInt::from(0),
                 vec![Data::Constr(
-                    0,
-                    vec![Data::Constr(0, vec![Data::B(vec![0x11; 28])])]
+                    BigInt::from(0),
+                    vec![Data::Constr(BigInt::from(0), vec![Data::B(vec![0x11; 28])])]
                 )]
             )
         );
@@ -1099,10 +1118,10 @@ mod tests {
         assert_eq!(
             certificate_to_plutus_v1v2(&reg).unwrap().0,
             Data::Constr(
-                0,
+                BigInt::from(0),
                 vec![Data::Constr(
-                    0,
-                    vec![Data::Constr(0, vec![Data::B(vec![0x11; 28])])]
+                    BigInt::from(0),
+                    vec![Data::Constr(BigInt::from(0), vec![Data::B(vec![0x11; 28])])]
                 )]
             ),
         );
@@ -1114,10 +1133,10 @@ mod tests {
         assert_eq!(
             certificate_to_plutus_v1v2(&dereg).unwrap().0,
             Data::Constr(
-                1,
+                BigInt::from(1),
                 vec![Data::Constr(
-                    0,
-                    vec![Data::Constr(1, vec![Data::B(vec![0x22; 28])])]
+                    BigInt::from(0),
+                    vec![Data::Constr(BigInt::from(1), vec![Data::B(vec![0x22; 28])])]
                 )]
             ),
         );
@@ -1132,7 +1151,7 @@ mod tests {
         let purpose = crate::script_context::ScriptPurpose::Certifying(0, tx_cert);
         let d = purpose.to_data();
         match &d {
-            Data::Constr(3, fields) => {
+            Data::Constr(tag, fields) if tag == &BigInt::from(3) => {
                 assert_eq!(
                     fields.len(),
                     1,
@@ -1142,10 +1161,10 @@ mod tests {
                 assert_eq!(
                     fields[0],
                     Data::Constr(
-                        1,
+                        BigInt::from(1),
                         vec![Data::Constr(
-                            0,
-                            vec![Data::Constr(1, vec![Data::B(vec![0x22; 28])])]
+                            BigInt::from(0),
+                            vec![Data::Constr(BigInt::from(1), vec![Data::B(vec![0x22; 28])])]
                         )]
                     )
                 );
@@ -1273,19 +1292,22 @@ mod tests {
             anchor: anchor(),
         };
         let pl = proposal_to_plutus(&p).unwrap();
-        let Ok((0, fields)) = pl.0.into_constr() else {
+        let Ok((tag, fields)) = pl.0.into_constr() else {
             panic!("expected Constr 0 wrapper");
         };
+        assert_eq!(tag, BigInt::from(0));
         assert_eq!(fields.len(), 3);
         // deposit
         assert_eq!(fields[0], Data::I(BigInt::from(100_000)));
         // return_addr (Plutus Credential::PubKey([0x42; 28]) → Constr 0 [B ...])
-        assert!(
-            matches!(&fields[1], Data::Constr(0, inner) if inner == &vec![Data::B(vec![0x42; 28])])
-        );
+        assert!(matches!(
+            &fields[1],
+            Data::Constr(tag, inner)
+                if tag == &BigInt::from(0) && inner == &vec![Data::B(vec![0x42; 28])]
+        ));
         // gov_action: InfoAction = Constr 6 []
         // Haskell: makeIsDataSchemaIndexed ''GovernanceAction [('InfoAction, 6)]
-        assert_eq!(fields[2], Data::Constr(6, vec![]));
+        assert_eq!(fields[2], Data::Constr(BigInt::from(6), vec![]));
     }
 
     #[test]
@@ -1312,9 +1334,9 @@ mod tests {
         let Ok((tag, fields)) = d.into_constr() else {
             panic!("expected Constr");
         };
-        assert_eq!(tag, 0);
+        assert_eq!(tag, BigInt::from(0));
         assert_eq!(fields.len(), 2);
-        assert_eq!(fields[1], Data::Constr(1, vec![])); // None
+        assert_eq!(fields[1], Data::Constr(BigInt::from(1), vec![])); // None
     }
 
     #[test]
@@ -1327,10 +1349,10 @@ mod tests {
         let Ok((tag, fields)) = d.into_constr() else {
             panic!("expected Constr");
         };
-        assert_eq!(tag, 0);
+        assert_eq!(tag, BigInt::from(0));
         assert_eq!(
             fields[1],
-            Data::Constr(0, vec![Data::I(BigInt::from(2_000_000))])
+            Data::Constr(BigInt::from(0), vec![Data::I(BigInt::from(2_000_000))])
         );
     }
 
@@ -1356,7 +1378,7 @@ mod tests {
         let Ok((tag, fields)) = d.into_constr() else {
             panic!("expected Constr");
         };
-        assert_eq!(tag, 7);
+        assert_eq!(tag, BigInt::from(7));
         assert_eq!(fields[0], Data::B(vec![0xaa; 28]));
         assert_eq!(fields[1], Data::B(vec![0xbb; 32]));
     }
@@ -1371,7 +1393,7 @@ mod tests {
         let Ok((tag, fields)) = d.into_constr() else {
             panic!("expected Constr");
         };
-        assert_eq!(tag, 8);
+        assert_eq!(tag, BigInt::from(8));
         assert_eq!(fields[1], Data::I(BigInt::from(500)));
     }
 
@@ -1381,10 +1403,10 @@ mod tests {
             cold_credential: key_cred(1),
             hot_credential: script_cred(2),
         };
-        let TxCert(Data::Constr(tag, _)) = certificate_to_plutus(&c).unwrap() else {
+        let TxCert(Data::Constr(ref tag, _)) = certificate_to_plutus(&c).unwrap() else {
             panic!("expected Constr");
         };
-        assert_eq!(tag, 9);
+        assert_eq!(tag, &BigInt::from(9));
     }
 
     #[test]
@@ -1445,7 +1467,10 @@ mod tests {
         let d = drep_to_data(&drep_key(0x11));
         assert_eq!(
             d,
-            Data::Constr(0, vec![Data::Constr(0, vec![Data::B(vec![0x11; 28])])])
+            Data::Constr(
+                BigInt::from(0),
+                vec![Data::Constr(BigInt::from(0), vec![Data::B(vec![0x11; 28])])]
+            )
         );
     }
 
@@ -1454,7 +1479,10 @@ mod tests {
         let d = drep_to_data(&drep_script(0x22));
         assert_eq!(
             d,
-            Data::Constr(0, vec![Data::Constr(1, vec![Data::B(vec![0x22; 28])])])
+            Data::Constr(
+                BigInt::from(0),
+                vec![Data::Constr(BigInt::from(1), vec![Data::B(vec![0x22; 28])])]
+            )
         );
     }
 
@@ -1462,11 +1490,11 @@ mod tests {
     fn drep_to_data_abstain_and_no_confidence() {
         assert_eq!(
             drep_to_data(&dugite_primitives::transaction::DRep::Abstain),
-            Data::Constr(1, vec![])
+            Data::Constr(BigInt::from(1), vec![])
         );
         assert_eq!(
             drep_to_data(&dugite_primitives::transaction::DRep::NoConfidence),
-            Data::Constr(2, vec![])
+            Data::Constr(BigInt::from(2), vec![])
         );
     }
 
@@ -1481,14 +1509,14 @@ mod tests {
         assert_eq!(
             d,
             Data::Constr(
-                2,
+                BigInt::from(2),
                 vec![
                     cred_data(&key_cred(1)),
                     Data::Constr(
-                        1,
+                        BigInt::from(1),
                         vec![Data::Constr(
-                            0,
-                            vec![Data::Constr(0, vec![Data::B(vec![0x33; 28])])]
+                            BigInt::from(0),
+                            vec![Data::Constr(BigInt::from(0), vec![Data::B(vec![0x33; 28])])]
                         )]
                     ),
                 ]
@@ -1506,14 +1534,14 @@ mod tests {
         assert_eq!(
             d,
             Data::Constr(
-                2,
+                BigInt::from(2),
                 vec![
                     cred_data(&script_cred(1)),
                     Data::Constr(
-                        1,
+                        BigInt::from(1),
                         vec![Data::Constr(
-                            0,
-                            vec![Data::Constr(1, vec![Data::B(vec![0x44; 28])])]
+                            BigInt::from(0),
+                            vec![Data::Constr(BigInt::from(1), vec![Data::B(vec![0x44; 28])])]
                         )]
                     ),
                 ]
@@ -1531,10 +1559,10 @@ mod tests {
         assert_eq!(
             d,
             Data::Constr(
-                2,
+                BigInt::from(2),
                 vec![
                     cred_data(&key_cred(1)),
-                    Data::Constr(1, vec![Data::Constr(1, vec![])]),
+                    Data::Constr(BigInt::from(1), vec![Data::Constr(BigInt::from(1), vec![])]),
                 ]
             )
         );
@@ -1550,10 +1578,10 @@ mod tests {
         assert_eq!(
             d,
             Data::Constr(
-                2,
+                BigInt::from(2),
                 vec![
                     cred_data(&key_cred(1)),
-                    Data::Constr(1, vec![Data::Constr(2, vec![])]),
+                    Data::Constr(BigInt::from(1), vec![Data::Constr(BigInt::from(2), vec![])]),
                 ]
             )
         );
@@ -1572,14 +1600,17 @@ mod tests {
         assert_eq!(
             d,
             Data::Constr(
-                2,
+                BigInt::from(2),
                 vec![
                     cred_data(&key_cred(1)),
                     Data::Constr(
-                        2,
+                        BigInt::from(2),
                         vec![
                             Data::B(vec![0x55; 28]),
-                            Data::Constr(0, vec![Data::Constr(0, vec![Data::B(vec![0x66; 28])])]),
+                            Data::Constr(
+                                BigInt::from(0),
+                                vec![Data::Constr(BigInt::from(0), vec![Data::B(vec![0x66; 28])])]
+                            ),
                         ]
                     ),
                 ]
@@ -1601,14 +1632,17 @@ mod tests {
         assert_eq!(
             d,
             Data::Constr(
-                3,
+                BigInt::from(3),
                 vec![
                     cred_data(&script_cred(1)),
                     Data::Constr(
-                        2,
+                        BigInt::from(2),
                         vec![
                             Data::B(vec![0x77; 28]),
-                            Data::Constr(0, vec![Data::Constr(1, vec![Data::B(vec![0x88; 28])])]),
+                            Data::Constr(
+                                BigInt::from(0),
+                                vec![Data::Constr(BigInt::from(1), vec![Data::B(vec![0x88; 28])])]
+                            ),
                         ]
                     ),
                     Data::I(BigInt::from(2_000_000)),
@@ -1630,10 +1664,10 @@ mod tests {
         assert_eq!(
             d,
             Data::Constr(
-                3,
+                BigInt::from(3),
                 vec![
                     cred_data(&key_cred(1)),
-                    Data::Constr(1, vec![Data::Constr(1, vec![])]),
+                    Data::Constr(BigInt::from(1), vec![Data::Constr(BigInt::from(1), vec![])]),
                     Data::I(BigInt::from(2_000_000)),
                 ]
             )
@@ -1656,7 +1690,7 @@ mod tests {
         // Haskell: makeIsDataSchemaIndexed ''GovernanceAction [('InfoAction, 6)]
         use dugite_primitives::transaction::GovAction;
         let d = gov_action_to_data(&GovAction::InfoAction).unwrap();
-        assert_eq!(d, Data::Constr(6, vec![]));
+        assert_eq!(d, Data::Constr(BigInt::from(6), vec![]));
     }
 
     #[test]
@@ -1669,7 +1703,10 @@ mod tests {
             prev_action_id: None,
         })
         .unwrap();
-        assert_eq!(d, Data::Constr(3, vec![Data::Constr(1, vec![])]));
+        assert_eq!(
+            d,
+            Data::Constr(BigInt::from(3), vec![Data::Constr(BigInt::from(1), vec![])])
+        );
     }
 
     #[test]
@@ -1687,19 +1724,22 @@ mod tests {
         })
         .unwrap();
         // outer: Constr 3 [Maybe]
-        let Data::Constr(3, ref fields) = d else {
+        let Data::Constr(ref __tag, ref fields) = d else {
             panic!("NoConfidence must be Constr 3; got {d:?}");
         };
+        assert_eq!(__tag, &BigInt::from(3), "unexpected Constr tag");
         assert_eq!(fields.len(), 1);
         // Maybe = Just → Constr 0 [gaid_data]
-        let Data::Constr(0, ref just_fields) = fields[0] else {
+        let Data::Constr(ref __tag, ref just_fields) = fields[0] else {
             panic!("Just must be Constr 0; got {:?}", fields[0]);
         };
+        assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
         assert_eq!(just_fields.len(), 1);
         // GovernanceActionId = Constr 0 [B txid32, I 3]
-        let Data::Constr(0, ref gaid_fields) = just_fields[0] else {
+        let Data::Constr(ref __tag, ref gaid_fields) = just_fields[0] else {
             panic!("GovActionId must be Constr 0; got {:?}", just_fields[0]);
         };
+        assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
         assert_eq!(gaid_fields.len(), 2);
         assert!(
             matches!(&gaid_fields[0], Data::B(b) if b.len() == 32 && b.iter().all(|&x| x == 0xab)),
@@ -1720,17 +1760,18 @@ mod tests {
             protocol_version: (10, 0),
         })
         .unwrap();
-        let Data::Constr(1, ref fields) = d else {
+        let Data::Constr(ref __tag, ref fields) = d else {
             panic!("HardForkInitiation must be Constr 1; got {d:?}");
         };
+        assert_eq!(__tag, &BigInt::from(1), "unexpected Constr tag");
         assert_eq!(fields.len(), 2);
         // fields[0]: Maybe GovActionId = Nothing = Constr 1 []
-        assert_eq!(fields[0], Data::Constr(1, vec![]));
+        assert_eq!(fields[0], Data::Constr(BigInt::from(1), vec![]));
         // fields[1]: ProtocolVersion = Constr 0 [I 10, I 0]
         assert_eq!(
             fields[1],
             Data::Constr(
-                0,
+                BigInt::from(0),
                 vec![Data::I(BigInt::from(10u64)), Data::I(BigInt::from(0u64))]
             )
         );
@@ -1761,11 +1802,16 @@ mod tests {
             policy_hash: None,
         })
         .unwrap();
-        let Data::Constr(0, ref fields) = d else {
+        let Data::Constr(ref __tag, ref fields) = d else {
             panic!("ParameterChange must be Constr 0; got {d:?}");
         };
+        assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
         assert_eq!(fields.len(), 3);
-        assert_eq!(fields[0], Data::Constr(1, vec![]), "Nothing prev_action_id");
+        assert_eq!(
+            fields[0],
+            Data::Constr(BigInt::from(1), vec![]),
+            "Nothing prev_action_id"
+        );
         let expected_v3 = Data::List(v3.iter().map(|x| Data::I(BigInt::from(*x))).collect());
         let expected_cm = Data::Map(vec![(Data::I(BigInt::from(2u64)), expected_v3)]);
         let expected_changed = Data::Map(vec![(Data::I(BigInt::from(18u64)), expected_cm)]);
@@ -1773,7 +1819,11 @@ mod tests {
             fields[1], expected_changed,
             "ChangedParameters must be a Data::Map keyed by ppuTag (18 = costModels, lang 2 = V3)"
         );
-        assert_eq!(fields[2], Data::Constr(1, vec![]), "Nothing policy_hash");
+        assert_eq!(
+            fields[2],
+            Data::Constr(BigInt::from(1), vec![]),
+            "Nothing policy_hash"
+        );
     }
 
     #[test]
@@ -1797,9 +1847,10 @@ mod tests {
             policy_hash: None,
         })
         .unwrap();
-        let Ok((0, fields)) = d.into_constr() else {
+        let Ok((tag, fields)) = d.into_constr() else {
             panic!("ParameterChange must be Constr 0");
         };
+        assert_eq!(tag, BigInt::from(0));
         let Data::Map(entries) = &fields[1] else {
             panic!("ChangedParameters must be Map; got {:?}", fields[1]);
         };
@@ -1839,9 +1890,10 @@ mod tests {
             policy_hash: None,
         })
         .unwrap();
-        let Ok((0, fields)) = d.into_constr() else {
+        let Ok((tag, fields)) = d.into_constr() else {
             panic!("ParameterChange must be Constr 0");
         };
+        assert_eq!(tag, BigInt::from(0));
         let Data::Map(entries) = &fields[1] else {
             panic!("ChangedParameters must be Map");
         };
@@ -1874,14 +1926,18 @@ mod tests {
             },
         })
         .unwrap();
-        let Data::Constr(5, ref fields) = d else {
+        let Data::Constr(ref __tag, ref fields) = d else {
             panic!("NewConstitution must be Constr 5; got {d:?}");
         };
+        assert_eq!(__tag, &BigInt::from(5), "unexpected Constr tag");
         assert_eq!(fields.len(), 2);
         // Constitution = Constr 0 [Just(B28)]
         assert_eq!(
             fields[1],
-            Data::Constr(0, vec![Data::Constr(0, vec![Data::B(vec![0xcc; 28])])])
+            Data::Constr(
+                BigInt::from(0),
+                vec![Data::Constr(BigInt::from(0), vec![Data::B(vec![0xcc; 28])])]
+            )
         );
     }
 
@@ -1901,9 +1957,10 @@ mod tests {
             policy_hash: None,
         })
         .unwrap();
-        let Data::Constr(2, ref fields) = d else {
+        let Data::Constr(ref __tag, ref fields) = d else {
             panic!("TreasuryWithdrawals must be Constr 2; got {d:?}");
         };
+        assert_eq!(__tag, &BigInt::from(2), "unexpected Constr tag");
         assert_eq!(fields.len(), 2);
         // Map: [(Credential::PubKey([0x77;28]), I 500_000)]
         let Data::Map(ref entries) = fields[0] else {
@@ -1911,13 +1968,13 @@ mod tests {
         };
         assert_eq!(entries.len(), 1);
         assert!(
-            matches!(&entries[0].0, Data::Constr(0, inner) if inner.len() == 1),
+            matches!(&entries[0].0, Data::Constr(tag, inner) if tag == &BigInt::from(0) && inner.len() == 1),
             "map key must be PubKeyCredential (Constr 0 [B28]); got {:?}",
             entries[0].0
         );
         assert_eq!(entries[0].1, Data::I(BigInt::from(500_000u64)));
         // Maybe ScriptHash = Nothing
-        assert_eq!(fields[1], Data::Constr(1, vec![]));
+        assert_eq!(fields[1], Data::Constr(BigInt::from(1), vec![]));
     }
 
     #[test]
@@ -1940,9 +1997,10 @@ mod tests {
             },
         })
         .unwrap();
-        let Data::Constr(4, ref fields) = d else {
+        let Data::Constr(ref __tag, ref fields) = d else {
             panic!("UpdateCommittee must be Constr 4; got {d:?}");
         };
+        assert_eq!(__tag, &BigInt::from(4), "unexpected Constr tag");
         assert_eq!(fields.len(), 4);
         // fields[1]: [ColdCredential] — 1 item (key_cred 0xaa) = Constr 0 [B28]
         let Data::List(ref remove_list) = fields[1] else {
@@ -1950,7 +2008,7 @@ mod tests {
         };
         assert_eq!(remove_list.len(), 1);
         assert!(
-            matches!(&remove_list[0], Data::Constr(0, _)),
+            matches!(&remove_list[0], Data::Constr(tag, _) if tag == &BigInt::from(0)),
             "ColdCommitteeCredential must be PubKeyCredential (Constr 0); got {:?}",
             remove_list[0]
         );
@@ -1960,7 +2018,7 @@ mod tests {
         };
         assert_eq!(add_map.len(), 1);
         assert!(
-            matches!(&add_map[0].0, Data::Constr(1, _)),
+            matches!(&add_map[0].0, Data::Constr(tag, _) if tag == &BigInt::from(1)),
             "ScriptCredential must be Constr 1; got {:?}",
             add_map[0].0
         );
@@ -1970,7 +2028,7 @@ mod tests {
         assert_eq!(
             fields[3],
             Data::Constr(
-                0,
+                BigInt::from(0),
                 vec![Data::I(BigInt::from(2u64)), Data::I(BigInt::from(3u64))]
             ),
             "Rational must be Constr 0 [I num, I den]"
@@ -2028,9 +2086,10 @@ mod tests {
             policy_hash: None,
         })
         .unwrap();
-        let Data::Constr(2, ref fields) = d else {
+        let Data::Constr(ref __tag, ref fields) = d else {
             panic!("TreasuryWithdrawals must be Constr 2; got {d:?}");
         };
+        assert_eq!(__tag, &BigInt::from(2), "unexpected Constr tag");
         let Data::Map(ref entries) = fields[0] else {
             panic!("field[0] must be Map; got {:?}", fields[0]);
         };
@@ -2038,7 +2097,7 @@ mod tests {
         // entries[0] = Script credential (Constr 1 [B28]) + amount 20.
         assert_eq!(
             entries[0].0,
-            Data::Constr(1, vec![Data::B(vec![0x02u8; 28])]),
+            Data::Constr(BigInt::from(1), vec![Data::B(vec![0x02u8; 28])]),
             "entries[0] must be the SCRIPT credential (ledger Script < Key); got {:?}",
             entries[0].0
         );
@@ -2046,7 +2105,7 @@ mod tests {
         // entries[1] = Key credential (Constr 0 [B28]) + amount 10.
         assert_eq!(
             entries[1].0,
-            Data::Constr(0, vec![Data::B(vec![0x01u8; 28])]),
+            Data::Constr(BigInt::from(0), vec![Data::B(vec![0x01u8; 28])]),
             "entries[1] must be the KEY credential; got {:?}",
             entries[1].0
         );
@@ -2065,16 +2124,17 @@ mod tests {
             policy_hash: None,
         })
         .unwrap();
-        let Data::Constr(2, ref fields) = d else {
+        let Data::Constr(ref __tag, ref fields) = d else {
             panic!("TreasuryWithdrawals must be Constr 2; got {d:?}");
         };
+        assert_eq!(__tag, &BigInt::from(2), "unexpected Constr tag");
         let Data::Map(ref entries) = fields[0] else {
             panic!("field[0] must be Map; got {:?}", fields[0]);
         };
         assert_eq!(entries.len(), 1);
         assert_eq!(
             entries[0].0,
-            Data::Constr(1, vec![Data::B(vec![0x55u8; 28])])
+            Data::Constr(BigInt::from(1), vec![Data::B(vec![0x55u8; 28])])
         );
         assert_eq!(entries[0].1, Data::I(BigInt::from(7u64)));
     }
@@ -2105,9 +2165,10 @@ mod tests {
             },
         })
         .unwrap();
-        let Data::Constr(4, ref fields) = d else {
+        let Data::Constr(ref __tag, ref fields) = d else {
             panic!("UpdateCommittee must be Constr 4; got {d:?}");
         };
+        assert_eq!(__tag, &BigInt::from(4), "unexpected Constr tag");
         let Data::Map(ref add_map) = fields[2] else {
             panic!("field[2] must be Map; got {:?}", fields[2]);
         };
@@ -2115,7 +2176,7 @@ mod tests {
         // add[0] = Script credential (Constr 1) + epoch 200.
         assert_eq!(
             add_map[0].0,
-            Data::Constr(1, vec![Data::B(vec![0x02u8; 28])]),
+            Data::Constr(BigInt::from(1), vec![Data::B(vec![0x02u8; 28])]),
             "add[0] must be the SCRIPT credential (ledger Script < Key); got {:?}",
             add_map[0].0
         );
@@ -2123,7 +2184,7 @@ mod tests {
         // add[1] = Key credential (Constr 0) + epoch 100.
         assert_eq!(
             add_map[1].0,
-            Data::Constr(0, vec![Data::B(vec![0x01u8; 28])]),
+            Data::Constr(BigInt::from(0), vec![Data::B(vec![0x01u8; 28])]),
             "add[1] must be the KEY credential; got {:?}",
             add_map[1].0
         );
@@ -2146,16 +2207,17 @@ mod tests {
             },
         })
         .unwrap();
-        let Data::Constr(4, ref fields) = d else {
+        let Data::Constr(ref __tag, ref fields) = d else {
             panic!("UpdateCommittee must be Constr 4; got {d:?}");
         };
+        assert_eq!(__tag, &BigInt::from(4), "unexpected Constr tag");
         let Data::Map(ref add_map) = fields[2] else {
             panic!("field[2] must be Map; got {:?}", fields[2]);
         };
         assert_eq!(add_map.len(), 1);
         assert_eq!(
             add_map[0].0,
-            Data::Constr(1, vec![Data::B(vec![0x66u8; 28])])
+            Data::Constr(BigInt::from(1), vec![Data::B(vec![0x66u8; 28])])
         );
         assert_eq!(add_map[0].1, Data::I(BigInt::from(300u64)));
     }
@@ -2176,9 +2238,10 @@ mod tests {
             },
         })
         .unwrap();
-        let Data::Constr(4, ref fields) = d else {
+        let Data::Constr(ref __tag, ref fields) = d else {
             panic!("UpdateCommittee must be Constr 4; got {d:?}");
         };
+        assert_eq!(__tag, &BigInt::from(4), "unexpected Constr tag");
         let Data::List(ref remove_list) = fields[1] else {
             panic!("field[1] must be List; got {:?}", fields[1]);
         };
@@ -2186,14 +2249,14 @@ mod tests {
         // remove[0] = Script credential (Constr 1).
         assert_eq!(
             remove_list[0],
-            Data::Constr(1, vec![Data::B(vec![0x02u8; 28])]),
+            Data::Constr(BigInt::from(1), vec![Data::B(vec![0x02u8; 28])]),
             "remove[0] must be the SCRIPT credential (ledger Script < Key); got {:?}",
             remove_list[0]
         );
         // remove[1] = Key credential (Constr 0).
         assert_eq!(
             remove_list[1],
-            Data::Constr(0, vec![Data::B(vec![0x01u8; 28])]),
+            Data::Constr(BigInt::from(0), vec![Data::B(vec![0x01u8; 28])]),
             "remove[1] must be the KEY credential; got {:?}",
             remove_list[1]
         );
@@ -2213,16 +2276,17 @@ mod tests {
             },
         })
         .unwrap();
-        let Data::Constr(4, ref fields) = d else {
+        let Data::Constr(ref __tag, ref fields) = d else {
             panic!("UpdateCommittee must be Constr 4; got {d:?}");
         };
+        assert_eq!(__tag, &BigInt::from(4), "unexpected Constr tag");
         let Data::List(ref remove_list) = fields[1] else {
             panic!("field[1] must be List; got {:?}", fields[1]);
         };
         assert_eq!(remove_list.len(), 1);
         assert_eq!(
             remove_list[0],
-            Data::Constr(0, vec![Data::B(vec![0x77u8; 28])])
+            Data::Constr(BigInt::from(0), vec![Data::B(vec![0x77u8; 28])])
         );
     }
 

@@ -301,9 +301,10 @@ pub fn required_signers_to_plutus(signers: &[dugite_primitives::hash::Hash28]) -
 /// re-cap here.
 pub fn plutus_data_to_data(p: &PrimPlutusData) -> Data {
     match p {
-        PrimPlutusData::Constr(tag, fields) => {
-            Data::Constr(*tag, fields.iter().map(plutus_data_to_data).collect())
-        }
+        PrimPlutusData::Constr(tag, fields) => Data::Constr(
+            num_bigint::BigInt::from(*tag),
+            fields.iter().map(plutus_data_to_data).collect(),
+        ),
         PrimPlutusData::Map(entries) => Data::Map(
             entries
                 .iter()
@@ -411,6 +412,48 @@ pub fn input_to_txininfo(
     )))
 }
 
+/// Index `resolved` by `PrimTxIn` for O(1)-average lookup, used by
+/// [`inputs_to_txininfos`]/[`inputs_to_txininfos_v1`] (#844) to avoid
+/// re-scanning the whole `resolved` slice for every tx input —
+/// `input_to_txininfo`'s linear scan is O(len(resolved)) per call, so
+/// resolving all of a tx's inputs one-by-one was O(inputs · resolved),
+/// quadratic in a Plutus-dense, many-input transaction. `PrimTxIn`
+/// derives `Hash`/`Eq`, so this is a direct borrowed-key index — no
+/// extra allocation of the keys themselves.
+fn index_resolved(
+    resolved: &[(PrimTxIn, PrimTxOut, Vec<u8>)],
+) -> std::collections::HashMap<&PrimTxIn, usize> {
+    // First-occurrence-wins (via `entry().or_insert()`, NOT a plain
+    // `collect()` which would be last-wins) — matches the original
+    // linear scan's semantics exactly in the (should-never-happen,
+    // caller-side-bug) case of a duplicate `PrimTxIn` in `resolved`.
+    let mut index = std::collections::HashMap::with_capacity(resolved.len());
+    for (i, (txin, _, _)) in resolved.iter().enumerate() {
+        index.entry(txin).or_insert(i);
+    }
+    index
+}
+
+/// Same contract as [`input_to_txininfo`], but resolves `input` via a
+/// pre-built [`index_resolved`] index instead of a linear scan.
+fn input_to_txininfo_indexed(
+    input: &PrimTxIn,
+    resolved: &[(PrimTxIn, PrimTxOut, Vec<u8>)],
+    index: &std::collections::HashMap<&PrimTxIn, usize>,
+) -> Result<TxInInfo, PhaseTwoError> {
+    match index.get(input) {
+        Some(&i) => Ok(TxInInfo {
+            out_ref: input_to_outref(input),
+            resolved: output_to_plutus(&resolved[i].1)?,
+        }),
+        None => Err(PhaseTwoError::UtxoDecode(format!(
+            "input_to_txininfo: tx input {tx}@{idx} not in resolved-utxo map",
+            tx = hex::encode(input.transaction_id.0),
+            idx = input.index,
+        ))),
+    }
+}
+
 /// Sort a slice of inputs into the canonical `Set TxIn` order that
 /// cardano-ledger uses for `inputsTxBodyL`, `refInputsTxBodyL`, etc.
 ///
@@ -453,9 +496,10 @@ pub fn inputs_to_txininfos(
     inputs: &[PrimTxIn],
     resolved: &[(PrimTxIn, PrimTxOut, Vec<u8>)],
 ) -> Result<Vec<TxInInfo>, PhaseTwoError> {
+    let index = index_resolved(resolved);
     let mut out = Vec::with_capacity(inputs.len());
     for input in inputs {
-        out.push(input_to_txininfo(input, resolved)?);
+        out.push(input_to_txininfo_indexed(input, resolved, &index)?);
     }
     Ok(out)
 }
@@ -513,17 +557,16 @@ pub fn inputs_to_txininfos_v1(
     if era != dugite_primitives::era::Era::Alonzo {
         return inputs_to_txininfos(inputs, resolved);
     }
+    let index = index_resolved(resolved);
     let mut out = Vec::with_capacity(inputs.len());
     for input in inputs {
-        let byron_resolved_output = resolved.iter().any(|(i, o, _)| {
-            i.transaction_id == input.transaction_id
-                && i.index == input.index
-                && matches!(o.address, PrimAddress::Byron(_))
-        });
+        let byron_resolved_output = index
+            .get(input)
+            .is_some_and(|&i| matches!(resolved[i].1.address, PrimAddress::Byron(_)));
         if byron_resolved_output {
             continue;
         }
-        out.push(input_to_txininfo(input, resolved)?);
+        out.push(input_to_txininfo_indexed(input, resolved, &index)?);
     }
     Ok(out)
 }
@@ -1606,7 +1649,7 @@ mod tests {
         assert_eq!(
             d,
             Data::Constr(
-                3,
+                BigInt::from(3),
                 vec![
                     Data::I(BigInt::from(1)),
                     Data::B(vec![0xff, 0xee]),
@@ -1842,6 +1885,38 @@ mod tests {
         assert_eq!(
             info.resolved.value.policies[0].1[0].1,
             BigInt::from(2_000_000)
+        );
+    }
+
+    /// #844: `inputs_to_txininfos` now resolves each input via a
+    /// pre-built index (`index_resolved`) instead of `input_to_txininfo`'s
+    /// linear scan, to avoid O(inputs · resolved) rescanning on a
+    /// Plutus-dense many-input tx. Pin that the index preserves the
+    /// linear scan's FIRST-occurrence-wins semantics for the
+    /// (should-never-happen) case of a duplicate `PrimTxIn` in
+    /// `resolved` — a plain `HashMap::collect()` would be last-wins and
+    /// silently diverge from `input_to_txininfo`'s behavior.
+    #[test]
+    fn inputs_to_txininfos_first_occurrence_wins_on_duplicate_resolved_entry() {
+        let resolved = vec![
+            resolved_entry(0xaa, 0, 1_000_000),
+            resolved_entry(0xaa, 0, 9_999_999), // duplicate PrimTxIn key
+        ];
+        let inputs = vec![PrimTxIn {
+            transaction_id: h32(0xaa),
+            index: 0,
+        }];
+        let via_index = inputs_to_txininfos(&inputs, &resolved).unwrap();
+        let via_linear_scan = input_to_txininfo(&inputs[0], &resolved).unwrap();
+        assert_eq!(
+            via_index[0].resolved.value.policies[0].1[0].1,
+            BigInt::from(1_000_000),
+            "indexed path must return the FIRST matching resolved entry"
+        );
+        assert_eq!(
+            via_index[0].resolved.value.policies[0].1[0].1,
+            via_linear_scan.resolved.value.policies[0].1[0].1,
+            "indexed and linear-scan resolution must agree"
         );
     }
 

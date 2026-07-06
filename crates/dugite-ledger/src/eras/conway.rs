@@ -51,8 +51,8 @@ use super::{EraRules, RuleContext};
 use crate::state::governance::{
     capture_governance_snapshots, expire_committee_members, forest_add_proposal,
     genesis_root_is_valid, gov_action_purpose_tag, gov_action_raw_prev_id,
-    prev_action_matches_enacted_root, ratify_proposals_impl, update_dormant_epochs,
-    update_drep_activity,
+    hardfork_proposal_cant_follow, prev_action_matches_enacted_root, ratify_proposals_impl,
+    update_dormant_epochs, update_drep_activity,
 };
 use crate::state::substates::*;
 use crate::state::{
@@ -1839,6 +1839,26 @@ fn process_governance_votes_and_proposals(
                  neither a genesis root, the last enacted root, nor an active in-flight proposal"
             );
             continue;
+        }
+
+        // #858: pvCanFollow gate for HardForkInitiation on the LIVE block-apply GOV
+        // rule (previously absent — a skip-minor / skip-major target was admitted).
+        // Uses the shared `preceedingHardFork` + `pvCanFollow` reachability check
+        // (single source of truth with the dead-path processors, #812).
+        {
+            let cur_major = epochs.protocol_params.protocol_version_major;
+            let cur_minor = epochs.protocol_params.protocol_version_minor;
+            if hardfork_proposal_cant_follow(&proposal.gov_action, governance, cur_major, cur_minor)
+            {
+                debug!(
+                    tx = %tx.hash.to_hex(),
+                    action_index = idx,
+                    cur_version = %format!("{cur_major}.{cur_minor}"),
+                    "ProposalCantFollow (GOV rule): HardForkInitiation target does not follow \
+                     the base protocol version — proposal dropped (#858)"
+                );
+                continue;
+            }
         }
 
         let gov_action_lifetime = epochs.protocol_params.gov_action_lifetime;
@@ -5439,6 +5459,70 @@ mod tests {
             "proposal with stale prev_action_id must be rejected (InvalidPrevGovActionId) \
              via the GOV rule block-apply path; proposals={:?}",
             gov.governance.proposals.keys().collect::<Vec<_>>(),
+        );
+    }
+
+    /// #858: the LIVE block-apply GOV rule must drop a HardForkInitiation whose
+    /// target version does not `pvCanFollow` the current version (skip-minor), and
+    /// admit one that does (exact +1 minor). Previously the live path ran NO
+    /// pvCanFollow check, so a skip-minor target was silently admitted at block apply.
+    #[test]
+    fn test_hardfork_pvcanfollow_enforced_via_apply_path_858() {
+        use dugite_primitives::transaction::{GovAction, GovActionId};
+
+        let params = ProtocolParameters::mainnet_defaults();
+        let ctx = make_conway_ctx(&params);
+        let rules = ConwayRules::new();
+
+        let run = |seed: u8, ver: (u64, u64)| -> bool {
+            let mut utxo = make_utxo_sub(vec![]);
+            let mut certs = make_cert_sub();
+            let mut gov = make_gov_sub();
+            let mut epochs = make_epoch_sub();
+            epochs.protocol_params = params.clone();
+            epochs.protocol_params.protocol_version_major = 10;
+            epochs.protocol_params.protocol_version_minor = 0;
+
+            let proposal = ProposalProcedure {
+                deposit: Lovelace(100_000_000_000),
+                return_addr: vec![0u8; 29],
+                gov_action: GovAction::HardForkInitiation {
+                    prev_action_id: None,
+                    protocol_version: ver,
+                },
+                anchor: Anchor {
+                    url: "https://test".to_string(),
+                    data_hash: Hash32::ZERO,
+                },
+            };
+            let mut tx = make_tx(seed, vec![], vec![], 0);
+            tx.body.proposal_procedures = vec![proposal];
+
+            rules
+                .apply_valid_tx(
+                    &tx,
+                    BlockValidationMode::ApplyOnly,
+                    &ctx,
+                    &mut utxo,
+                    &mut certs,
+                    &mut gov,
+                    &mut epochs,
+                )
+                .expect("apply_valid_tx must not error — GOV rule silently drops bad proposals");
+            let id = GovActionId {
+                transaction_id: tx.hash,
+                action_index: 0,
+            };
+            gov.governance.proposals.contains_key(&id)
+        };
+
+        assert!(
+            !run(0x60, (10, 2)),
+            "skip-minor HardForkInitiation (10,0)->(10,2) must be dropped by the live GOV rule (#858)"
+        );
+        assert!(
+            run(0x61, (10, 1)),
+            "exact +1 minor HardForkInitiation (10,0)->(10,1) must be admitted by the live GOV rule"
         );
     }
 

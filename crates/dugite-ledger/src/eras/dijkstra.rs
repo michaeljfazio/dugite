@@ -571,17 +571,26 @@ fn check_guard_witnesses(tx: &Transaction, _ctx: &RuleContext) -> Result<(), Led
     let mut native_scripts_by_hash: HashMap<Hash28, &NativeScript> = HashMap::new();
     for ns in &ws.native_scripts {
         let sr = ScriptRef::NativeScript(ns.clone());
-        native_scripts_by_hash.insert(compute_script_ref_hash(&sr), ns);
+        native_scripts_by_hash.insert(compute_script_ref_hash(&sr, None), ns);
     }
     let mut plutus_script_hashes: HashSet<Hash28> = HashSet::new();
     for s in &ws.plutus_v1_scripts {
-        plutus_script_hashes.insert(compute_script_ref_hash(&ScriptRef::PlutusV1(s.clone())));
+        plutus_script_hashes.insert(compute_script_ref_hash(
+            &ScriptRef::PlutusV1(s.clone()),
+            None,
+        ));
     }
     for s in &ws.plutus_v2_scripts {
-        plutus_script_hashes.insert(compute_script_ref_hash(&ScriptRef::PlutusV2(s.clone())));
+        plutus_script_hashes.insert(compute_script_ref_hash(
+            &ScriptRef::PlutusV2(s.clone()),
+            None,
+        ));
     }
     for s in &ws.plutus_v3_scripts {
-        plutus_script_hashes.insert(compute_script_ref_hash(&ScriptRef::PlutusV3(s.clone())));
+        plutus_script_hashes.insert(compute_script_ref_hash(
+            &ScriptRef::PlutusV3(s.clone()),
+            None,
+        ));
     }
 
     // The declared-guards set: a `RequireGuard(c)` native script node
@@ -2896,8 +2905,10 @@ mod tests {
             let guard_native_script = NativeScript::ScriptAll(vec![NativeScript::RequireGuard(
                 Credential::VerificationKey(inner_vk_kh),
             )]);
-            let script_hash: Hash28 =
-                compute_script_ref_hash(&ScriptRef::NativeScript(guard_native_script.clone()));
+            let script_hash: Hash28 = compute_script_ref_hash(
+                &ScriptRef::NativeScript(guard_native_script.clone()),
+                None,
+            );
             let script_cred = Credential::Script(script_hash);
 
             // Tx skeleton: one input, one output, both at a key-locked
@@ -3224,11 +3235,11 @@ mod tests {
             // ──────────────────────────────────────────────────────────────
             let term = Term::Const(Constant::Integer(42.into()));
             let v4_program = Program {
-                version: (1, 2, 0),
+                version: dugite_uplc::program::Program::version_triple(1, 2, 0),
                 term: term.clone(),
             };
             let v3_program = Program {
-                version: (1, 1, 0),
+                version: dugite_uplc::program::Program::version_triple(1, 1, 0),
                 term: term.clone(),
             };
             let v4_cbor_wrapped = v4_program
