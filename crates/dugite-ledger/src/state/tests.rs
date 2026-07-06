@@ -16647,3 +16647,586 @@ fn test_from_haskell_snapshot_backfills_snapshot_pool_owners_issue_668() {
         );
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Regression tests for #781 / #782 / #783 — LedgerSeq rollback correctness
+//
+// All of these exercise the REAL end-to-end path: `apply_block_with_delta`
+// builds the delta from a genuine block application, `LedgerSeq::push`
+// stores it, and `LedgerState::rollback_via_seq` reconstructs the rolled-back
+// state from anchor + remaining deltas. This matters because the #783 bug in
+// particular lived in the SNAPSHOT-CAPTURE decision inside
+// `apply_block_with_delta_impl` (state/apply.rs) — a test that manually
+// constructs `LedgerDelta` values (bypassing that capture logic) would not
+// exercise the regression at all.
+// ═══════════════════════════════════════════════════════════════════════════
+
+use crate::ledger_seq::LedgerSeq;
+
+/// Build a block containing a single transaction with the given certificates
+/// and no inputs/outputs — enough to drive certificate-only state changes
+/// (pool registration/retirement) through the real `apply_block_with_delta`
+/// path. Mirrors `make_pool_registration_block`'s boilerplate, generalized to
+/// an arbitrary certificate list.
+fn make_certs_block(slot: u64, block_no: u64, prev_hash: Hash32, certs: Vec<Certificate>) -> Block {
+    let tx_hash = {
+        let mut bytes = [0u8; 32];
+        let counter = UTXO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        bytes[..8].copy_from_slice(&counter.to_be_bytes());
+        Hash32::from_bytes(bytes)
+    };
+    let tx = Transaction {
+        era: dugite_primitives::era::Era::Conway,
+        hash: tx_hash,
+        body: TransactionBody {
+            inputs: vec![],
+            outputs: vec![],
+            fee: Lovelace(0),
+            ttl: None,
+            certificates: certs,
+            withdrawals: BTreeMap::new(),
+            auxiliary_data_hash: None,
+            validity_interval_start: None,
+            mint: BTreeMap::new(),
+            script_data_hash: None,
+            collateral: vec![],
+            required_signers: vec![],
+            network_id: None,
+            collateral_return: None,
+            total_collateral: None,
+            reference_inputs: vec![],
+            update: None,
+            voting_procedures: BTreeMap::new(),
+            proposal_procedures: vec![],
+            treasury_value: None,
+            donation: None,
+            sub_transactions: vec![],
+            account_balance_intervals: vec![],
+            direct_deposits: ::std::collections::BTreeMap::new(),
+            guards: Vec::new(),
+        },
+        witness_set: TransactionWitnessSet {
+            vkey_witnesses: vec![],
+            native_scripts: vec![],
+            bootstrap_witnesses: vec![],
+            plutus_v1_scripts: vec![],
+            plutus_v2_scripts: vec![],
+            plutus_v3_scripts: vec![],
+            plutus_data: vec![],
+            redeemers: vec![],
+            raw_redeemers_cbor: None,
+            raw_plutus_data_cbor: None,
+            original_script_data_hash: None,
+        },
+        is_valid: true,
+        auxiliary_data: None,
+        raw_cbor: None,
+        raw_body_cbor: None,
+        raw_witness_cbor: None,
+    };
+    make_test_block(slot, block_no, prev_hash, vec![tx])
+}
+
+/// Minimal `PoolParams` for the given pool id — pledge/cost/margin are
+/// arbitrary but valid; tests override `pledge` where distinguishing
+/// re-registrations from each other matters.
+fn make_pool_params(pool_id: Hash28) -> PoolParams {
+    PoolParams {
+        operator: pool_id,
+        vrf_keyhash: Hash32::ZERO,
+        pledge: Lovelace(1_000_000_000),
+        cost: Lovelace(340_000_000),
+        margin: Rational {
+            numerator: 1,
+            denominator: 100,
+        },
+        reward_account: vec![0xe0u8; 29],
+        pool_owners: vec![],
+        relays: vec![],
+        pool_metadata: None,
+    }
+}
+
+/// #781: an output created by tx1 and spent by tx2 IN THE SAME BLOCK must not
+/// be resurrected by a rollback of that block. `UtxoDiff::merge` appends (no
+/// cancellation), so the block-level diff carries the txout in BOTH
+/// `inserts` (tx1's create) and `deletes` (tx2's spend) — `rollback_via_seq`
+/// must invert deletes-before-inserts (re-insert then remove) so the
+/// create-then-spend-in-block output ends up absent, not resurrected.
+#[test]
+fn rollback_does_not_resurrect_intra_block_create_then_spend_output() {
+    let params = ProtocolParameters::mainnet_defaults();
+    let mut state = LedgerState::new(params);
+
+    // Seed a genesis UTxO so tx1 has something to spend.
+    let genesis_input = TransactionInput {
+        transaction_id: Hash32::from_bytes([0xE0u8; 32]),
+        index: 0,
+    };
+    state
+        .utxo
+        .utxo_set
+        .insert(genesis_input.clone(), make_lovelace_output(10_000_000));
+
+    // Anchor the seq at the post-genesis-seed, pre-block state.
+    let mut seq = LedgerSeq::with_defaults(state.clone_without_utxos(), 100);
+
+    // tx1: spends genesis, creates X.
+    let x_input = TransactionInput {
+        transaction_id: Hash32::from_bytes([1u8; 32]),
+        index: 0,
+    };
+    let tx1 = make_simple_tx(
+        1,
+        vec![genesis_input.clone()],
+        vec![make_lovelace_output(9_800_000)],
+    );
+    // tx2: spends X, creates Y — the create+spend chain within ONE block.
+    let y_input = TransactionInput {
+        transaction_id: Hash32::from_bytes([2u8; 32]),
+        index: 0,
+    };
+    let tx2 = make_simple_tx(
+        2,
+        vec![x_input.clone()],
+        vec![make_lovelace_output(9_600_000)],
+    );
+
+    let block = make_test_block(1, 1, Hash32::ZERO, vec![tx1, tx2]);
+    let delta = state
+        .apply_block_with_delta(&block, BlockValidationMode::ApplyOnly)
+        .expect("block should apply");
+
+    // Sanity: confirm the exact overlap #781 is about — X appears in BOTH
+    // inserts (tx1) and deletes (tx2) of the merged block-level diff.
+    assert!(
+        delta.utxo_diff.inserts.iter().any(|(i, _)| *i == x_input),
+        "X must appear in inserts (created by tx1)"
+    );
+    assert!(
+        delta.utxo_diff.deletes.iter().any(|(i, _)| *i == x_input),
+        "X must appear in deletes (spent by tx2) — the create+spend overlap"
+    );
+
+    seq.push(delta);
+
+    // Live state after the block: X spent (consumed by tx2), Y present.
+    assert!(!state.utxo.utxo_set.contains(&x_input));
+    assert!(state.utxo.utxo_set.contains(&y_input));
+
+    // Roll back the entire block.
+    let n = state
+        .rollback_via_seq(&mut seq, &Point::Origin)
+        .expect("origin is the anchor");
+    assert_eq!(n, 1);
+
+    assert!(
+        !state.utxo.utxo_set.contains(&x_input),
+        "X was created and spent within the same block — it must not be \
+         resurrected by rollback (#781)"
+    );
+    assert!(
+        state.utxo.utxo_set.contains(&genesis_input),
+        "genesis UTxO must be restored by rollback"
+    );
+    assert!(
+        !state.utxo.utxo_set.contains(&y_input),
+        "Y must be gone after rolling back the block that created it"
+    );
+    assert_eq!(
+        state.utxo.utxo_set.len(),
+        1,
+        "only the restored genesis UTxO should remain"
+    );
+}
+
+/// #783(a): overwriting a pool's pending-retirement epoch (same pool,
+/// different epoch) leaves `pending_retirements.len()` unchanged. A rollback
+/// of a LATER block forces `apply_delta_to_state` to replay the overwriting
+/// delta — pre-#783 the len-based change check produced no snapshot for it,
+/// so reconstruction silently kept the stale pre-overwrite epoch.
+#[test]
+fn rollback_reconstructs_pool_retirement_epoch_overwrite() {
+    let params = ProtocolParameters::mainnet_defaults();
+    let mut state = LedgerState::new(params);
+    let pool_id = Hash28::from_bytes([0x31u8; 28]);
+
+    let mut seq = LedgerSeq::with_defaults(state.clone_without_utxos(), 100);
+
+    // Block 0: register the pool.
+    let b0 = make_certs_block(
+        1,
+        1,
+        Hash32::ZERO,
+        vec![Certificate::PoolRegistration(make_pool_params(pool_id))],
+    );
+    let d0 = state
+        .apply_block_with_delta(&b0, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d0);
+
+    // Block 1: retire at epoch 20.
+    let b1 = make_certs_block(
+        2,
+        2,
+        *b0.hash(),
+        vec![Certificate::PoolRetirement {
+            pool_hash: pool_id,
+            epoch: 20,
+        }],
+    );
+    let d1 = state
+        .apply_block_with_delta(&b1, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d1);
+    assert_eq!(
+        state.certs.pending_retirements.get(&pool_id),
+        Some(&EpochNo(20))
+    );
+
+    // Block 2: OVERWRITE — retire at epoch 25 instead. Same map length (1
+    // entry) before and after, only the content changed.
+    let b2 = make_certs_block(
+        3,
+        3,
+        *b1.hash(),
+        vec![Certificate::PoolRetirement {
+            pool_hash: pool_id,
+            epoch: 25,
+        }],
+    );
+    let d2 = state
+        .apply_block_with_delta(&b2, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d2);
+    assert_eq!(
+        state.certs.pending_retirements.get(&pool_id),
+        Some(&EpochNo(25))
+    );
+
+    // Block 3: no-op — rolling IT back forces reconstruction to replay
+    // delta2 via `state_at_index`, exactly where the pre-#783 bug surfaced.
+    let b3 = make_empty_block(4, 4, *b2.hash());
+    let d3 = state
+        .apply_block_with_delta(&b3, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d3);
+
+    let n = state
+        .rollback_via_seq(&mut seq, &Point::Specific(SlotNo(3), *b2.hash()))
+        .expect("b2 point is in the volatile window");
+    assert_eq!(n, 1);
+
+    assert_eq!(
+        state.certs.pending_retirements.get(&pool_id),
+        Some(&EpochNo(25)),
+        "reconstructed pending_retirements must reflect the epoch OVERWRITE \
+         (25), not the stale pre-overwrite value (20) — #783"
+    );
+}
+
+/// #783(b): a pool that is re-registered TWICE (double re-registration)
+/// leaves `future_pool_params.len()` unchanged between the two
+/// re-registrations. Same reconstruction-forcing shape as (a), but exercises
+/// `future_pool_params` instead of `pending_retirements`.
+#[test]
+fn rollback_reconstructs_pool_future_params_double_reregistration() {
+    let params = ProtocolParameters::mainnet_defaults();
+    let mut state = LedgerState::new(params);
+    let pool_id = Hash28::from_bytes([0x32u8; 28]);
+
+    let mut seq = LedgerSeq::with_defaults(state.clone_without_utxos(), 100);
+
+    // Block 0: first-time registration (goes straight to pool_params).
+    let b0 = make_certs_block(
+        1,
+        1,
+        Hash32::ZERO,
+        vec![Certificate::PoolRegistration(make_pool_params(pool_id))],
+    );
+    let d0 = state
+        .apply_block_with_delta(&b0, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d0);
+
+    // Block 1: re-register with pledge A (queued in future_pool_params).
+    let mut params_a = make_pool_params(pool_id);
+    params_a.pledge = Lovelace(111_000_000);
+    let b1 = make_certs_block(
+        2,
+        2,
+        *b0.hash(),
+        vec![Certificate::PoolRegistration(params_a)],
+    );
+    let d1 = state
+        .apply_block_with_delta(&b1, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d1);
+    assert_eq!(
+        state.certs.future_pool_params[&pool_id].pledge.0,
+        111_000_000
+    );
+
+    // Block 2: re-register AGAIN with pledge B — same map length (1 entry),
+    // fully different content (double re-registration overwrite).
+    let mut params_b = make_pool_params(pool_id);
+    params_b.pledge = Lovelace(222_000_000);
+    let b2 = make_certs_block(
+        3,
+        3,
+        *b1.hash(),
+        vec![Certificate::PoolRegistration(params_b)],
+    );
+    let d2 = state
+        .apply_block_with_delta(&b2, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d2);
+    assert_eq!(
+        state.certs.future_pool_params[&pool_id].pledge.0,
+        222_000_000
+    );
+
+    // Block 3: no-op — rolling it back forces reconstruction to replay
+    // delta2.
+    let b3 = make_empty_block(4, 4, *b2.hash());
+    let d3 = state
+        .apply_block_with_delta(&b3, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d3);
+
+    let n = state
+        .rollback_via_seq(&mut seq, &Point::Specific(SlotNo(3), *b2.hash()))
+        .expect("b2 point is in the volatile window");
+    assert_eq!(n, 1);
+
+    assert_eq!(
+        state.certs.future_pool_params[&pool_id].pledge.0, 222_000_000,
+        "reconstructed future_pool_params must reflect the SECOND \
+         re-registration's pledge (222M), not the stale first one (111M) — #783"
+    );
+}
+
+/// #783(c): a single block that both ADDS a new pending retirement (pool D)
+/// AND REMOVES an existing one (pool B, cancelled by re-registering it),
+/// where B is ALREADY staged in `future_pool_params` from an earlier block
+/// so the re-registration OVERWRITES that entry in place. This is
+/// deliberately constructed so that ALL THREE pre-#783 length/pointer
+/// signals stay unchanged across the compensating block:
+///   - `pool_params` Arc pointer: unchanged (no first-time registration).
+///   - `future_pool_params.len()`: unchanged (1 -> 1, B's entry overwritten).
+///   - `pending_retirements.len()`: unchanged (1 -> 1, B removed / D added).
+///
+/// yet BOTH maps' CONTENT genuinely changed — exactly the blind spot the
+/// pre-#783 `.len()`-based check could not see.
+#[test]
+fn rollback_reconstructs_pending_retirements_compensating_add_remove() {
+    let params = ProtocolParameters::mainnet_defaults();
+    let mut state = LedgerState::new(params);
+    let pool_b = Hash28::from_bytes([0x41u8; 28]);
+    let pool_d = Hash28::from_bytes([0x43u8; 28]);
+
+    let mut seq = LedgerSeq::with_defaults(state.clone_without_utxos(), 100);
+
+    // Block 0: register B and D (first-time, straight to pool_params).
+    let b0 = make_certs_block(
+        1,
+        1,
+        Hash32::ZERO,
+        vec![
+            Certificate::PoolRegistration(make_pool_params(pool_b)),
+            Certificate::PoolRegistration(make_pool_params(pool_d)),
+        ],
+    );
+    let d0 = state
+        .apply_block_with_delta(&b0, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d0);
+
+    // Block 1: stage B's re-registration (future_pool_params = {B: v1}) AND
+    // schedule B's retirement (pending_retirements = {B: 5}). Both maps can
+    // independently hold an entry for the same pool.
+    let mut params_b_v1 = make_pool_params(pool_b);
+    params_b_v1.pledge = Lovelace(111_000_000);
+    let b1 = make_certs_block(
+        2,
+        2,
+        *b0.hash(),
+        vec![
+            Certificate::PoolRegistration(params_b_v1),
+            Certificate::PoolRetirement {
+                pool_hash: pool_b,
+                epoch: 5,
+            },
+        ],
+    );
+    let d1 = state
+        .apply_block_with_delta(&b1, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d1);
+    assert_eq!(state.certs.future_pool_params.len(), 1);
+    assert_eq!(state.certs.pending_retirements.len(), 1);
+    assert_eq!(
+        state.certs.pending_retirements.get(&pool_b),
+        Some(&EpochNo(5))
+    );
+
+    // Block 2 (the compensating block): re-register B again (OVERWRITES its
+    // EXISTING future_pool_params entry — length stays 1 — and CANCELS B's
+    // pending retirement) + retire D for the first time (ADD to
+    // pending_retirements). Net: future_pool_params {B:v1} -> {B:v2} (len
+    // 1->1, content changed); pending_retirements {B:5} -> {D:8} (len 1->1,
+    // content fully replaced). `pool_params` Arc pointer is untouched (no
+    // first-time registration this block).
+    let mut params_b_v2 = make_pool_params(pool_b);
+    params_b_v2.pledge = Lovelace(222_000_000);
+    let b2 = make_certs_block(
+        3,
+        3,
+        *b1.hash(),
+        vec![
+            Certificate::PoolRegistration(params_b_v2),
+            Certificate::PoolRetirement {
+                pool_hash: pool_d,
+                epoch: 8,
+            },
+        ],
+    );
+    let d2 = state
+        .apply_block_with_delta(&b2, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d2);
+    assert_eq!(state.certs.future_pool_params.len(), 1);
+    assert_eq!(state.certs.pending_retirements.len(), 1);
+    assert_eq!(
+        state.certs.future_pool_params[&pool_b].pledge.0,
+        222_000_000
+    );
+    assert_eq!(
+        state.certs.pending_retirements.get(&pool_d),
+        Some(&EpochNo(8))
+    );
+    assert!(!state.certs.pending_retirements.contains_key(&pool_b));
+
+    // Block 3: no-op — rolling it back forces reconstruction to replay
+    // delta2.
+    let b3 = make_empty_block(4, 4, *b2.hash());
+    let d3 = state
+        .apply_block_with_delta(&b3, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d3);
+
+    let n = state
+        .rollback_via_seq(&mut seq, &Point::Specific(SlotNo(3), *b2.hash()))
+        .expect("b2 point is in the volatile window");
+    assert_eq!(n, 1);
+
+    assert_eq!(
+        state.certs.future_pool_params.len(),
+        1,
+        "reconstructed future_pool_params must have exactly 1 entry"
+    );
+    assert_eq!(
+        state.certs.future_pool_params[&pool_b].pledge.0, 222_000_000,
+        "reconstructed future_pool_params must show B's SECOND \
+         re-registration (222M), not the stale first one (111M) — #783"
+    );
+    assert_eq!(
+        state.certs.pending_retirements.len(),
+        1,
+        "reconstructed pending_retirements must have exactly 1 entry"
+    );
+    assert_eq!(
+        state.certs.pending_retirements.get(&pool_d),
+        Some(&EpochNo(8)),
+        "reconstructed pending_retirements must show D's new retirement (8) — #783"
+    );
+    assert!(
+        !state.certs.pending_retirements.contains_key(&pool_b),
+        "reconstructed pending_retirements must NOT show B (cancelled by \
+         re-registration in the same compensating block) — #783"
+    );
+}
+
+/// #782: `utxo.pending_donations` had NO delta representation at all prior to
+/// this issue (despite a doc comment on `rollback_via_seq` claiming
+/// otherwise). A rollback of a block AFTER the donation-bearing one must
+/// still reflect the donation, not regress to the pre-donation anchor value.
+#[test]
+fn rollback_restores_pending_donations_not_stale_anchor() {
+    let params = ProtocolParameters::mainnet_defaults();
+    let mut state = LedgerState::new(params);
+
+    let mut seq = LedgerSeq::with_defaults(state.clone_without_utxos(), 100);
+
+    // Block 0: a Conway donation-bearing tx accumulates pending_donations.
+    let mut tx = make_simple_tx(1, vec![], vec![]);
+    tx.body.donation = Some(Lovelace(5_000_000));
+    let b0 = make_test_block(1, 1, Hash32::ZERO, vec![tx]);
+    let d0 = state
+        .apply_block_with_delta(&b0, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d0);
+    assert_eq!(state.utxo.pending_donations.0, 5_000_000);
+
+    // Block 1: no-op.
+    let b1 = make_empty_block(2, 2, *b0.hash());
+    let d1 = state
+        .apply_block_with_delta(&b1, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d1);
+
+    // Roll back block 1 only — reconstruction must replay delta0's donation.
+    let n = state
+        .rollback_via_seq(&mut seq, &Point::Specific(SlotNo(1), *b0.hash()))
+        .expect("b0 point is in the volatile window");
+    assert_eq!(n, 1);
+
+    assert_eq!(
+        state.utxo.pending_donations.0, 5_000_000,
+        "pending_donations must survive a rollback of a LATER block, not \
+         regress to the pre-donation anchor value of 0 — #782"
+    );
+}
+
+/// #782: `LedgerState.era` had NO delta representation at all prior to this
+/// issue. A rollback across an era-transitioning block must not regress
+/// `era` back to the anchor's frozen (pre-transition) value — doing so would
+/// cause the next block applied to RE-RUN `on_era_transition` (re-zeroing
+/// `pending_donations`, re-seeding Conway DReps/committee, etc).
+#[test]
+fn rollback_does_not_regress_era_across_block() {
+    let params = ProtocolParameters::mainnet_defaults();
+    let mut state = LedgerState::new(params);
+    // Freeze the anchor at Byron; `apply_block_impl` Step 10 unconditionally
+    // sets `self.era = block.era`, so applying a Conway-tagged block below
+    // simulates an era transition without needing the full HFC machinery.
+    state.era = Era::Byron;
+
+    let mut seq = LedgerSeq::with_defaults(state.clone_without_utxos(), 100);
+
+    let b0 = make_empty_block(1, 1, Hash32::ZERO);
+    let d0 = state
+        .apply_block_with_delta(&b0, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d0);
+    assert_eq!(state.era, Era::Conway);
+
+    // Block 1: no-op, rolled back below.
+    let b1 = make_empty_block(2, 2, *b0.hash());
+    let d1 = state
+        .apply_block_with_delta(&b1, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d1);
+
+    let n = state
+        .rollback_via_seq(&mut seq, &Point::Specific(SlotNo(1), *b0.hash()))
+        .expect("b0 point is in the volatile window");
+    assert_eq!(n, 1);
+
+    assert_eq!(
+        state.era,
+        Era::Conway,
+        "era must reflect block0's era transition (Conway), not regress to \
+         the anchor's frozen Byron value — #782"
+    );
+}

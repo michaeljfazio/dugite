@@ -2033,9 +2033,12 @@ impl LedgerState {
     /// 4. Roll back the [`LedgerSeq`] (drops trailing deltas + invalidates
     ///    checkpoints that pointed into the removed range).
     /// 5. Replace every non-UTxO field on `self` with the seq's
-    ///    reconstructed tip state — and copy `epoch_fees` /
-    ///    `pending_donations` (the two UTxO-adjacent scalars the seq
-    ///    tracks via `BlockFieldsDelta`).
+    ///    reconstructed tip state — including `epoch_fees` / `pending_donations`
+    ///    (the two UTxO-adjacent scalars the seq tracks via `BlockFieldsDelta`,
+    ///    since #782) and `genesis_delegates` (a top-level field the seq
+    ///    tracks via a dedicated delta snapshot, also since #782 — it is not
+    ///    covered by the wholesale `certs`/`gov`/`consensus`/`epochs`
+    ///    sub-state copies below because it lives directly on `LedgerState`).
     ///
     /// The LSM UTxO store stays attached the whole time: the `UtxoSet`
     /// already write-throughs to the LSM store on `insert`/`remove`, so
@@ -2070,11 +2073,21 @@ impl LedgerState {
         // returned `Vec` is consumed here for the reverse-apply.
         let diffs = self.utxo.diff_seq.rollback(n);
         for (_slot, _hash, diff) in &diffs {
-            for (input, _output) in &diff.inserts {
-                self.utxo.utxo_set.remove(input);
-            }
+            // Invert `apply` exactly. Forward apply is inserts-then-deletes
+            // (`ledger_seq.rs` flattened path), so the inverse must re-insert
+            // `deletes` FIRST, then remove `inserts`. Within one block's merged
+            // diff, an output created by tx_i and spent by tx_j (j>i) appears in
+            // BOTH `inserts` and `deletes` (`UtxoDiff::merge` appends, no
+            // cancellation). Removing inserts first then re-inserting deletes
+            // would materialize that phantom UTxO (a spent-in-block output). The
+            // opposite overlap (TxIn deleted then re-created in one block) is
+            // impossible — recreating `(txhash, ix)` needs a duplicate tx hash —
+            // so this ordering is the exact inverse in all cases. (#781)
             for (input, output) in &diff.deletes {
                 self.utxo.utxo_set.insert(input.clone(), output.clone());
+            }
+            for (input, _output) in &diff.inserts {
+                self.utxo.utxo_set.remove(input);
             }
         }
 
@@ -2093,6 +2106,8 @@ impl LedgerState {
         self.pending_era_transition = new_state.pending_era_transition;
         self.utxo.epoch_fees = new_state.utxo.epoch_fees;
         self.utxo.pending_donations = new_state.utxo.pending_donations;
+        // #782: top-level field, not covered by the sub-state copies above.
+        self.genesis_delegates = new_state.genesis_delegates;
 
         Some(n)
     }

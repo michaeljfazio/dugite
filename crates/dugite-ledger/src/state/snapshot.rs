@@ -407,7 +407,19 @@ impl LedgerState {
     /// `_costModelsUnknown`), which bincode serializes as a length-prefixed
     /// sequence — changing the layout of every embedded `protocol_params` /
     /// `prev_protocol_params`.
-    pub(crate) const SNAPSHOT_VERSION: u8 = 24;
+    /// v25 (#782): no bincode layout change here, but `LedgerSeq`'s rollback
+    /// delta model (`crates/dugite-ledger/src/ledger_seq.rs`) gained snapshot
+    /// coverage for several `LedgerState` fields (`genesis_delegates`, `era`,
+    /// `pending_donations`, `opcert_counters`, pre-Conway PPUP proposal maps,
+    /// pending MIR accumulators, `pointer_map`, `script_stake_credentials`,
+    /// `total_stake_key_deposits`, `extra_entropy`) that the delta model
+    /// previously omitted entirely. An anchor advanced by an OLDER binary
+    /// (`LedgerSeq::advance_anchor` → `apply_delta_to_state`) could have
+    /// silently regressed one of those fields to a stale value before being
+    /// persisted here. Bumping the version quarantines any snapshot saved
+    /// under the old (incomplete) delta model, forcing a clean rebuild from
+    /// ImmutableDB replay instead of trusting a possibly-mis-advanced anchor.
+    pub(crate) const SNAPSHOT_VERSION: u8 = 25;
 
     /// Save ledger state snapshot to disk using bincode serialization.
     ///

@@ -1836,16 +1836,34 @@ impl LedgerState {
         // registration — that CoW breaks pointer equality, giving us a cheap
         // "did pool state change?" signal without scanning block contents.
         let pool_params_before = std::sync::Arc::clone(&self.certs.pool_params);
-        // Also capture pre-block sizes of the plain-HashMap pool fields so we can
+        // Also capture pre-block CONTENT of the plain-HashMap pool fields so we can
         // detect changes that don't go through pool_params (e.g. retirement-only
         // blocks where a pending retirement is added but pool_params is unchanged).
-        let pending_retirements_len_before = self.certs.pending_retirements.len();
-        let future_pool_params_len_before = self.certs.future_pool_params.len();
+        // Content clones (not lengths): same-length overwrites — a retirement-epoch
+        // overwrite, a second re-registration, or a compensating add+remove — leave
+        // `len` unchanged but MUST snapshot, else reconstruction keeps the stale
+        // retirement epoch / future params (#783). These maps hold only pools with a
+        // *pending* action (cleared at epoch boundaries), so the clones are small.
+        let pending_retirements_before = self.certs.pending_retirements.clone();
+        let future_pool_params_before = self.certs.future_pool_params.clone();
         // Capture the pre-block per-pool block counter Arc pointer so we can
         // detect (by pointer) whether this block mutated it (counted a block
         // and/or cleared it at an epoch boundary). Used to snapshot it
         // absolutely for gap-robust reconstruction (#763).
         let epoch_blocks_before = std::sync::Arc::clone(&self.consensus.epoch_blocks_by_pool);
+        // #782: pre-block content clones for the remaining fields that had NO
+        // delta representation at all (not even the imprecise len-based check
+        // #783 fixed for pool state). Each is content-diffed against the
+        // post-block value below; see the field docs on `LedgerDelta` for the
+        // per-field rationale (size, mutation frequency).
+        let pointer_map_before = self.certs.pointer_map.clone();
+        let script_stake_credentials_before = self.certs.script_stake_credentials.clone();
+        let pending_mir_reserves_before = self.certs.pending_mir_reserves.clone();
+        let pending_mir_treasury_before = self.certs.pending_mir_treasury.clone();
+        let pending_mir_delta_reserves_before = self.certs.pending_mir_delta_reserves;
+        let pending_mir_delta_treasury_before = self.certs.pending_mir_delta_treasury;
+        let genesis_delegates_before = self.genesis_delegates.clone();
+        let rupd_addrs_rew_before = self.epochs.rupd_addrs_rew.clone();
 
         // Apply the block (all state mutations happen here). In deferred mode
         // this returns the captured Phase-2 work items without draining them.
@@ -1869,8 +1887,8 @@ impl LedgerState {
         // anchor value — fixes fork rollback corrupting pool registrations.
         let pool_state_changed =
             !std::sync::Arc::ptr_eq(&pool_params_before, &self.certs.pool_params)
-                || self.certs.pending_retirements.len() != pending_retirements_len_before
-                || self.certs.future_pool_params.len() != future_pool_params_len_before;
+                || self.certs.pending_retirements != pending_retirements_before
+                || self.certs.future_pool_params != future_pool_params_before;
         if pool_state_changed {
             delta.pool_params_snapshot = Some(std::sync::Arc::clone(&self.certs.pool_params));
             delta.future_pool_params_snapshot = Some(self.certs.future_pool_params.clone());
@@ -1910,6 +1928,50 @@ impl LedgerState {
                 Some(std::sync::Arc::clone(&self.consensus.epoch_blocks_by_pool));
         }
 
+        // #782: content-diffed snapshots for the fields that previously had NO
+        // delta representation at all. Rare mutations (pointer-based stake
+        // regs, MIR certs, genesis key delegation) so `None` on the
+        // overwhelming majority of blocks.
+        if self.certs.pointer_map != pointer_map_before {
+            delta.pointer_map_snapshot = Some(self.certs.pointer_map.clone());
+        }
+        if self.certs.script_stake_credentials != script_stake_credentials_before {
+            delta.script_stake_credentials_snapshot =
+                Some(self.certs.script_stake_credentials.clone());
+        }
+        // total_stake_key_deposits is a plain u64 scalar — unconditional capture
+        // is free, mirroring the imbl snapshots above.
+        delta.total_stake_key_deposits_snapshot = Some(self.certs.total_stake_key_deposits);
+        if self.certs.pending_mir_reserves != pending_mir_reserves_before
+            || self.certs.pending_mir_treasury != pending_mir_treasury_before
+            || self.certs.pending_mir_delta_reserves != pending_mir_delta_reserves_before
+            || self.certs.pending_mir_delta_treasury != pending_mir_delta_treasury_before
+        {
+            delta.pending_mir_reserves_snapshot = Some(self.certs.pending_mir_reserves.clone());
+            delta.pending_mir_treasury_snapshot = Some(self.certs.pending_mir_treasury.clone());
+            delta.pending_mir_delta_reserves_snapshot = Some(self.certs.pending_mir_delta_reserves);
+            delta.pending_mir_delta_treasury_snapshot = Some(self.certs.pending_mir_delta_treasury);
+        }
+        if self.genesis_delegates != genesis_delegates_before {
+            delta.genesis_delegates_snapshot = Some(self.genesis_delegates.clone());
+        }
+        // pending_pp_updates / future_pp_updates hold only currently-active
+        // proposals (a handful of entries at most) — unconditional capture is
+        // cheap and supersedes the coarse `pending_pp_updates_cleared` bool
+        // in `EpochTransitionDelta` (see `apply_delta_to_state` step 7c).
+        delta.pending_pp_updates_snapshot = Some(self.epochs.pending_pp_updates.clone());
+        delta.future_pp_updates_snapshot = Some(self.epochs.future_pp_updates.clone());
+        // rupd_addrs_rew: change-detect via Arc pointer identity (both `None`
+        // compares equal; a None<->Some transition or a pointer change counts).
+        let rupd_changed = match (&rupd_addrs_rew_before, &self.epochs.rupd_addrs_rew) {
+            (None, None) => false,
+            (Some(a), Some(b)) => !std::sync::Arc::ptr_eq(a, b),
+            _ => true,
+        };
+        if rupd_changed {
+            delta.rupd_addrs_rew_snapshot = Some(self.epochs.rupd_addrs_rew.clone());
+        }
+
         // Extract the UTxO diff from the DiffSeq entry that apply_block just pushed.
         if let Some((_slot, _hash, utxo_diff)) = self.utxo.diff_seq.diffs.back() {
             delta.utxo_diff = utxo_diff.clone();
@@ -1930,6 +1992,7 @@ impl LedgerState {
                     && self.epochs.future_pp_updates.is_empty(),
                 epoch_nonce: self.consensus.epoch_nonce,
                 last_epoch_block_nonce: self.consensus.last_epoch_block_nonce,
+                extra_entropy: self.consensus.extra_entropy,
                 reward_credits: std::collections::HashMap::new(),
                 pools_retired: Vec::new(),
                 future_params_promoted: Vec::new(),
@@ -2004,6 +2067,21 @@ impl LedgerState {
             None
         };
 
+        // #782: `consensus.opcert_counters` is updated (at most one pool_id)
+        // by `compute_shelley_nonce` for every Shelley+ block with an issuer,
+        // unconditionally on overlay status (unlike `pool_block_increment`
+        // above). Read back the post-block value for that single key rather
+        // than content-diffing the whole (unbounded, never-cleared) map.
+        let opcert_counter_update = if block.header.issuer_vkey.is_empty() {
+            None
+        } else {
+            let pool_id = dugite_primitives::hash::blake2b_224(&block.header.issuer_vkey);
+            self.consensus
+                .opcert_counters
+                .get(&pool_id)
+                .map(|seq| (pool_id, *seq))
+        };
+
         delta.block_fields = BlockFieldsDelta {
             fees_collected: block
                 .transactions
@@ -2017,6 +2095,10 @@ impl LedgerState {
             candidate_nonce: self.consensus.candidate_nonce,
             lab_nonce: self.consensus.lab_nonce,
             epoch_fees: self.utxo.epoch_fees,
+            pending_donations: self.utxo.pending_donations,
+            era: self.era,
+            pending_avvm_return: self.epochs.pending_avvm_return,
+            opcert_counter_update,
         };
 
         Ok((delta, deferred_items))

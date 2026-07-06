@@ -20,6 +20,7 @@ use dugite_ledger::ledger_seq::{
 use dugite_ledger::state::{DRepRegistration, LedgerState, PoolRegistration};
 use dugite_primitives::block::Point;
 use dugite_primitives::credentials::Credential;
+use dugite_primitives::era::Era;
 use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::protocol_params::ProtocolParameters;
 use dugite_primitives::time::{BlockNo, EpochNo, SlotNo};
@@ -53,6 +54,10 @@ fn fee_delta(slot: u64, hash_byte: u8, running_fees: u64, block_no: u64) -> Ledg
         candidate_nonce: h(hash_byte),
         lab_nonce: h(hash_byte),
         pool_block_increment: None,
+        pending_donations: Lovelace(0),
+        era: Era::Conway,
+        pending_avvm_return: 0,
+        opcert_counter_update: None,
     };
     delta
 }
@@ -993,6 +998,10 @@ fn apply_block_with_inserts(
         candidate_nonce: h(hash_byte),
         lab_nonce: h(hash_byte),
         pool_block_increment: None,
+        pending_donations: Lovelace(0),
+        era: Era::Conway,
+        pending_avvm_return: 0,
+        opcert_counter_update: None,
     };
     // Mirror the tip update apply_delta_to_state would do.
     ls.tip = dugite_primitives::block::Tip {
