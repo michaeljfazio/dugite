@@ -42,7 +42,7 @@
 use crate::data::Data;
 use crate::phase_two::{PhaseTwoError, SlotConfig};
 use crate::populate_gov::{
-    certificates_to_plutus, proposals_to_plutus, voting_procedures_to_plutus,
+    certificate_to_plutus, certificates_to_plutus, proposals_to_plutus, voting_procedures_to_plutus,
 };
 use crate::redeemer_resolve::resolve_redeemers;
 use crate::script_context::{Credential, ScriptPurpose, TxInfoV3};
@@ -135,10 +135,33 @@ pub fn populate_tx_info_v3(
             .into_iter()
             .map(|rr| {
                 // Use V3 encoding for the map key: Spending uses bare txid.
-                // Non-Spending purposes are identical between V1/V2/V3.
-                (rr.purpose, plutus_data_to_data(&rr.redeemer_data))
+                // Non-Spending purposes are identical between V1/V2/V3 EXCEPT
+                // `Certifying` (#833): the cert payload must follow the
+                // CONTEXT language's schema (Conway `TxCert`), not the
+                // witnessing script's — `rr.purpose` was baked once at
+                // redeemer-resolve time using whichever script executes
+                // this redeemer, which diverges on a mixed-language tx
+                // (e.g. a V1/V2-witnessed cert redeemer reused inside a V3
+                // context's redeemers map). Re-encode from the tx body
+                // certificate here.
+                let purpose = match rr.purpose {
+                    ScriptPurpose::Certifying(i, _) => {
+                        let cert =
+                            tx.body.certificates.get(rr.index as usize).ok_or_else(|| {
+                                PhaseTwoError::Internal(format!(
+                                    "populate_tx_info_v3: certifying redeemer references \
+                                 certificates[{idx}] but tx has {n}",
+                                    idx = rr.index,
+                                    n = tx.body.certificates.len()
+                                ))
+                            })?;
+                        ScriptPurpose::Certifying(i, certificate_to_plutus(cert)?)
+                    }
+                    other => other,
+                };
+                Ok((purpose, plutus_data_to_data(&rr.redeemer_data)))
             })
-            .collect()
+            .collect::<Result<Vec<_>, PhaseTwoError>>()?
     };
     tracing::trace!(
         count = redeemers.len(),
