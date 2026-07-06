@@ -116,7 +116,7 @@ fn compute(term: Term, env: Env, mut kont: Kont) -> Result<State, UplcError> {
             kont.push(Frame::AwaitFunTerm {
                 argument: Rc::clone(&arg),
                 env: env.clone(),
-            })?;
+            });
             Ok(State::Compute {
                 term: rc_into_term(fun),
                 env,
@@ -139,7 +139,7 @@ fn compute(term: Term, env: Env, mut kont: Kont) -> Result<State, UplcError> {
             // rc_into_term: if sole owner (refcount=1), moves term out for free;
             // otherwise clones the Term — but since sub-terms are Rc, the clone
             // is O(1) (only enum discriminant + Rc pointer copies, no recursion).
-            kont.push(Frame::Force)?;
+            kont.push(Frame::Force);
             Ok(State::Compute {
                 term: rc_into_term(body),
                 env,
@@ -197,7 +197,7 @@ fn compute(term: Term, env: Env, mut kont: Kont) -> Result<State, UplcError> {
                 pending,
                 evaluated: Vec::new(),
                 env: env.clone(),
-            })?;
+            });
             Ok(State::Compute {
                 // rc_into_term: O(1) if sole owner; O(1) clone otherwise
                 // (sub-terms are Rc, so clone is shallow).
@@ -217,7 +217,7 @@ fn compute(term: Term, env: Env, mut kont: Kont) -> Result<State, UplcError> {
             kont.push(Frame::Cases {
                 branches,
                 env: env.clone(),
-            })?;
+            });
             Ok(State::Compute {
                 // rc_into_term: O(1) if sole owner; O(1) clone otherwise.
                 term: rc_into_term(scrutinee),
@@ -244,7 +244,7 @@ fn return_compute(
             kont.push(Frame::AwaitArg {
                 function: value,
                 env: env.clone(),
-            })?;
+            });
             Ok(State::Compute {
                 // argument is Rc<Term>; rc_into_term is O(1) since sub-terms
                 // are Rc (fallback clone is shallow even if refcount > 1).
@@ -274,7 +274,7 @@ fn return_compute(
                     pending,
                     evaluated,
                     env: env.clone(),
-                })?;
+                });
                 Ok(State::Compute {
                     // rc_into_term: O(1) since sub-terms are Rc.
                     term: rc_into_term(next_rc),
@@ -418,7 +418,7 @@ fn return_compute(
             // ApplyValue frames in REVERSE so the first arg ends up
             // on top of the stack and is popped (applied) first.
             for arg in payload.into_iter().rev() {
-                kont.push(Frame::ApplyValue { argument: arg })?;
+                kont.push(Frame::ApplyValue { argument: arg });
             }
             Ok(State::Compute {
                 // rc_into_term: O(1) move if sole owner, O(1) shallow clone otherwise.
@@ -591,6 +591,33 @@ mod tests {
             int_term(4),
         );
         assert_eq!(evaluate(t).unwrap(), int_val(7));
+    }
+
+    #[test]
+    fn deep_non_tail_recursion_succeeds_past_former_depth_cap() {
+        // Regression test for #817. `addInteger 1 (addInteger 1 (… N
+        // deep …))` builds one CEK continuation frame per nesting
+        // level: each outer `addInteger`'s second argument must be
+        // fully computed (pushing an `AwaitArg` frame) before the
+        // outer application can return. This used to trip the
+        // since-removed `MAX_KONTINUATION_DEPTH = 4096` cap well
+        // below any realistic ExBudget ceiling. The continuation
+        // stack (`Kont`) is a heap-allocated `Vec<Frame>` with no
+        // depth limit now — matching Haskell's `Context`
+        // (`UntypedPlutusCore.Evaluation.Machine.Cek.Internal`)
+        // exactly, which bounds growth only by `ExBudget`.
+        const DEPTH: i64 = 5000;
+        let mut term = int_term(0);
+        for _ in 0..DEPTH {
+            term = app(
+                app(
+                    Term::Builtin(crate::term::BuiltinId::AddInteger),
+                    int_term(1),
+                ),
+                term,
+            );
+        }
+        assert_eq!(evaluate(term).unwrap(), int_val(DEPTH));
     }
 
     #[test]

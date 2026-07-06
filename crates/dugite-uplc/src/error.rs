@@ -62,6 +62,18 @@ pub enum UplcError {
     #[error("PlutusV3 script returned non-Unit value")]
     NonUnitReturn,
 
+    /// An unbound de Bruijn variable was found by the eager `checkScope`
+    /// pass run over the fully-applied term before CEK evaluation
+    /// starts (mirrors Haskell
+    /// `UntypedPlutusCore.Check.Scope.checkScope` / its
+    /// `FreeVariableError`). This is a phase-2 script-evaluation
+    /// failure — collateral is consumed — not an internal bug: an
+    /// adversary can construct a script whose applied term contains an
+    /// out-of-scope variable in a never-dynamically-evaluated branch,
+    /// and Haskell rejects it statically regardless of reachability.
+    #[error("free variable: de Bruijn index {0} is unbound")]
+    FreeVariable(u64),
+
     /// Internal invariant violated; this indicates a bug in dugite-uplc
     /// itself, not in the input. Such errors are still returned (not
     /// panicked) so they can be surfaced cleanly in tests.
