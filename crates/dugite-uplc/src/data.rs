@@ -168,13 +168,18 @@ impl Eq for Data {}
 /// `Vec<(Data, Data)>`), so `#[derive(Clone)]` recurses one native stack
 /// frame per nesting level — the identical latent stack-overflow class
 /// that `PartialEq`, `Hash`, and `Drop` were hand-written to avoid
-/// (#832), and it was the one impl left derived. A deep clone IS
-/// reachable on the CEK hot path: a `Var` lookup (`machine::step`) clones
-/// the bound `Value`, and a `Value` wrapping a `Constant::Data(d)` whose
-/// nesting depth an adversary drove to ~10^5–10^6 (repeated
-/// `constrData`/`listData`/`mapData`, each a separately-charged builtin)
-/// would overflow the phase-2 evaluation stack (unguarded, a 2 MiB rayon
-/// worker) = process abort = remote DoS.
+/// (#832), and it was the one impl left derived. A deep clone is still
+/// reachable on the CEK hot path even after `Constant::Data` became
+/// `Rc`-shared (#838 Fix 2): a `Var` lookup (`machine::step`) now clones
+/// only the `Rc` pointer for the *common* case, but a builtin that
+/// destructures a *shared* `Data` (`Rc::strong_count > 1` — e.g.
+/// `unConstrData` on a ScriptContext still referenced elsewhere in the
+/// env) falls back to exactly this deep clone
+/// (`builtin::denotations::data_from_rc`). A nesting depth an adversary
+/// drove to ~10^5–10^6 (repeated `constrData`/`listData`/`mapData`, each
+/// a separately-charged builtin) would overflow the phase-2 evaluation
+/// stack (unguarded, a 2 MiB rayon worker) = process abort = remote DoS
+/// on that fallback path just as much as on the old always-clone path.
 ///
 /// This produces the exact same value as the derived clone; only the
 /// stack behavior changes. The clone is assembled bottom-up: a work-stack

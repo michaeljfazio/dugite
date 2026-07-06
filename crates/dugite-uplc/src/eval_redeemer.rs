@@ -421,7 +421,7 @@ pub(crate) fn eval_resolved_redeemer(
 /// Convert a [`crate::data::Data`] into the term that pre-application
 /// will pass into the script.
 fn data_const_term(d: crate::data::Data) -> Term {
-    Term::Const(Constant::Data(d))
+    Term::Const(Constant::Data(std::rc::Rc::new(d)))
 }
 
 /// Resolve the on-chain cost model for `language` into a fully-applied

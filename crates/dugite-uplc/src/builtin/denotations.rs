@@ -541,15 +541,15 @@ pub fn denote(
             let data_args: Result<Vec<crate::data::Data>, _> = elems
                 .into_iter()
                 .map(|c| match c {
-                    Constant::Data(d) => Ok(d),
+                    Constant::Data(d) => Ok(data_from_rc(d)),
                     _ => Err(UplcError::BuiltinTypeError {
                         builtin: id.name(),
                         reason: "constrData args must be Data".into(),
                     }),
                 })
                 .collect();
-            Ok(Value::Const(Constant::Data(crate::data::Data::Constr(
-                tag, data_args?,
+            Ok(Value::Const(Constant::Data(std::rc::Rc::new(
+                crate::data::Data::Constr(tag, data_args?),
             ))))
         }
         MapData => {
@@ -560,7 +560,9 @@ pub fn denote(
                 .into_iter()
                 .map(|c| match c {
                     Constant::ProtoPair { a, b, .. } => match (*a, *b) {
-                        (Constant::Data(k), Constant::Data(vv)) => Ok((k, vv)),
+                        (Constant::Data(k), Constant::Data(vv)) => {
+                            Ok((data_from_rc(k), data_from_rc(vv)))
+                        }
                         _ => Err(UplcError::BuiltinTypeError {
                             builtin: id.name(),
                             reason: "mapData pair components must be Data".into(),
@@ -572,7 +574,9 @@ pub fn denote(
                     }),
                 })
                 .collect();
-            Ok(Value::Const(Constant::Data(crate::data::Data::Map(pairs?))))
+            Ok(Value::Const(Constant::Data(std::rc::Rc::new(
+                crate::data::Data::Map(pairs?),
+            ))))
         }
         ListData => {
             // (list : ProtoList Data) -> Data
@@ -581,33 +585,40 @@ pub fn denote(
             let datas: Result<Vec<crate::data::Data>, _> = elems
                 .into_iter()
                 .map(|c| match c {
-                    Constant::Data(d) => Ok(d),
+                    Constant::Data(d) => Ok(data_from_rc(d)),
                     _ => Err(UplcError::BuiltinTypeError {
                         builtin: id.name(),
                         reason: "listData args must be Data".into(),
                     }),
                 })
                 .collect();
-            Ok(Value::Const(Constant::Data(crate::data::Data::List(
-                datas?,
+            Ok(Value::Const(Constant::Data(std::rc::Rc::new(
+                crate::data::Data::List(datas?),
             ))))
         }
         IData => {
             let v = take_one(args, id)?;
             let i = unwrap_integer(v, id)?;
-            Ok(Value::Const(Constant::Data(crate::data::Data::I(i))))
+            Ok(Value::Const(Constant::Data(std::rc::Rc::new(
+                crate::data::Data::I(i),
+            ))))
         }
         BData => {
             let v = take_one(args, id)?;
             let b = unwrap_byte_string(v, id)?;
-            Ok(Value::Const(Constant::Data(crate::data::Data::B(b))))
+            Ok(Value::Const(Constant::Data(std::rc::Rc::new(
+                crate::data::Data::B(b),
+            ))))
         }
         UnConstrData => {
             // Data -> Pair Integer (ProtoList Data)
             let d = unwrap_data(take_one(args, id)?, id)?;
             match d.into_constr() {
                 Ok((tag, fields)) => {
-                    let elements: Vec<Constant> = fields.into_iter().map(Constant::Data).collect();
+                    let elements: Vec<Constant> = fields
+                        .into_iter()
+                        .map(|f| Constant::Data(std::rc::Rc::new(f)))
+                        .collect();
                     Ok(Value::Const(Constant::ProtoPair {
                         a_type: crate::term::TypeTag::Integer,
                         b_type: crate::term::TypeTag::List(Box::new(crate::term::TypeTag::Data)),
@@ -630,8 +641,8 @@ pub fn denote(
                         .map(|(k, v)| Constant::ProtoPair {
                             a_type: crate::term::TypeTag::Data,
                             b_type: crate::term::TypeTag::Data,
-                            a: Box::new(Constant::Data(k)),
-                            b: Box::new(Constant::Data(v)),
+                            a: Box::new(Constant::Data(std::rc::Rc::new(k))),
+                            b: Box::new(Constant::Data(std::rc::Rc::new(v))),
                         })
                         .collect();
                     Ok(Value::Const(Constant::ProtoList {
@@ -650,7 +661,10 @@ pub fn denote(
             match d.into_list() {
                 Ok(items) => Ok(Value::Const(Constant::ProtoList {
                     elem_type: crate::term::TypeTag::Data,
-                    elements: items.into_iter().map(Constant::Data).collect(),
+                    elements: items
+                        .into_iter()
+                        .map(|d| Constant::Data(std::rc::Rc::new(d)))
+                        .collect(),
                 })),
                 Err(_) => Err(builtin_failure(id, "unListData on non-List Data")),
             }
@@ -683,8 +697,8 @@ pub fn denote(
             Ok(Value::Const(Constant::ProtoPair {
                 a_type: crate::term::TypeTag::Data,
                 b_type: crate::term::TypeTag::Data,
-                a: Box::new(Constant::Data(a)),
-                b: Box::new(Constant::Data(b)),
+                a: Box::new(Constant::Data(std::rc::Rc::new(a))),
+                b: Box::new(Constant::Data(std::rc::Rc::new(b))),
             }))
         }
         SerialiseData => {
@@ -1504,7 +1518,9 @@ pub fn denote(
                     (Data::B(policy), Data::Map(inner_data))
                 })
                 .collect();
-            Ok(Value::Const(Constant::Data(Data::Map(outer))))
+            Ok(Value::Const(Constant::Data(std::rc::Rc::new(Data::Map(
+                outer,
+            )))))
         }
 
         ValueContains => {
@@ -1781,9 +1797,19 @@ fn unwrap_value(v: Value, id: BuiltinId) -> Result<ValueMap, UplcError> {
     }
 }
 
+/// Take ownership of an `Rc<Data>`, sharing the allocation when we hold
+/// the only reference (the common case once a builtin argument has been
+/// moved out of its `Value`/env slot) and falling back to a deep clone
+/// only when the `Data` is still referenced elsewhere (e.g. the same
+/// ScriptContext bound to the script's `ctx` parameter and looked up
+/// again later). See the `#838 Fix 2` doc comment on `Constant::Data`.
+fn data_from_rc(d: std::rc::Rc<crate::data::Data>) -> crate::data::Data {
+    std::rc::Rc::try_unwrap(d).unwrap_or_else(|rc| (*rc).clone())
+}
+
 fn unwrap_data(v: Value, id: BuiltinId) -> Result<crate::data::Data, UplcError> {
     match v {
-        Value::Const(Constant::Data(d)) => Ok(d),
+        Value::Const(Constant::Data(d)) => Ok(data_from_rc(d)),
         other => Err(UplcError::BuiltinTypeError {
             builtin: id.name(),
             reason: format!("expected Data, got {:?}", std::mem::discriminant(&other)),
@@ -2411,16 +2437,19 @@ mod tests {
     use crate::term::TypeTag;
 
     fn data_i(n: i64) -> Constant {
-        Constant::Data(Data::I(BigInt::from(n)))
+        Constant::Data(std::rc::Rc::new(Data::I(BigInt::from(n))))
     }
     fn list_of_data(items: Vec<Data>) -> Value {
         Value::Const(Constant::ProtoList {
             elem_type: TypeTag::Data,
-            elements: items.into_iter().map(Constant::Data).collect(),
+            elements: items
+                .into_iter()
+                .map(|d| Constant::Data(std::rc::Rc::new(d)))
+                .collect(),
         })
     }
     fn data_val(d: Data) -> Value {
-        Value::Const(Constant::Data(d))
+        Value::Const(Constant::Data(std::rc::Rc::new(d)))
     }
 
     #[test]
@@ -2631,7 +2660,10 @@ mod tests {
             assert_eq!(*a, Constant::Integer(BigInt::from(3)));
             if let Constant::ProtoList { elements, .. } = *b {
                 assert_eq!(elements.len(), 1);
-                assert_eq!(elements[0], Constant::Data(Data::I(BigInt::from(1))));
+                assert_eq!(
+                    elements[0],
+                    Constant::Data(std::rc::Rc::new(Data::I(BigInt::from(1))))
+                );
             } else {
                 panic!("expected ProtoList for second pair element");
             }
@@ -2748,7 +2780,7 @@ mod tests {
         // Run the actual builtin.
         let v = run(
             BuiltinId::SerialiseData,
-            vec![Value::Const(Constant::Data(d))],
+            vec![Value::Const(Constant::Data(std::rc::Rc::new(d)))],
         )
         .unwrap();
         let Value::Const(Constant::ByteString(serialised)) = v else {

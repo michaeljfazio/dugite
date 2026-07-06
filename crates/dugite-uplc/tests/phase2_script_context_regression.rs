@@ -310,7 +310,9 @@ fn flat_round_trips_data_constant() {
     let data_val = Data::I(BigInt::from(42i64));
     let program = Program {
         version: (1, 0, 0),
-        term: Term::Lam(Rc::new(Term::Const(Constant::Data(data_val.clone())))),
+        term: Term::Lam(Rc::new(Term::Const(Constant::Data(
+            data_val.clone().into(),
+        )))),
     };
 
     let flat = program.to_flat().expect("encode Data constant program");
@@ -324,7 +326,7 @@ fn flat_round_trips_data_constant() {
     let Term::Const(Constant::Data(d)) = (*body).clone() else {
         panic!("expected Const(Data(_))");
     };
-    assert_eq!(d, data_val, "Data constant must survive flat round-trip");
+    assert_eq!(*d, data_val, "Data constant must survive flat round-trip");
 }
 
 /// A program containing a `List(Integer)` constant must round-trip.
@@ -396,12 +398,9 @@ fn flat_round_trips_list_data_constant() {
     use dugite_uplc::Program;
 
     let items = vec![
-        Constant::Data(Data::I(BigInt::from(1i64))),
-        Constant::Data(Data::B(vec![0xaa, 0xbb])),
-        Constant::Data(Data::Constr(
-            BigInt::from(0),
-            vec![Data::I(BigInt::from(3i64))],
-        )),
+        Constant::Data(Data::I(BigInt::from(1i64)).into()),
+        Constant::Data(Data::B(vec![0xaa, 0xbb]).into()),
+        Constant::Data(Data::Constr(BigInt::from(0), vec![Data::I(BigInt::from(3i64))]).into()),
     ];
     let program = Program {
         version: (1, 0, 0),

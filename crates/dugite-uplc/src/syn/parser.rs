@@ -363,7 +363,7 @@ impl<'a> Parser<'a> {
                     )),
                 }
             }
-            TypeTag::Data => Ok(Constant::Data(self.parse_data()?)),
+            TypeTag::Data => Ok(Constant::Data(std::rc::Rc::new(self.parse_data()?))),
             TypeTag::List(elem) => {
                 let elems = self.parse_list_literal(elem)?;
                 Ok(Constant::ProtoList {
