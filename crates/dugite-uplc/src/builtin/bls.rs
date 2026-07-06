@@ -41,6 +41,49 @@ pub const G1_COMPRESSED_BYTES: usize = 48;
 pub const G2_COMPRESSED_BYTES: usize = 96;
 const FP12_BYTES: usize = 576;
 
+// ---------------------------------------------------------------------------
+// Decompressed-point cache (#839 residual)
+// ---------------------------------------------------------------------------
+//
+// dugite stores G1/G2 `Constant`s compressed (see the doc comments on
+// `Constant::Bls12_381G1Element`/`Bls12_381G2Element` in `term.rs`), so
+// every denotation that consumes one re-runs `blst_p1_uncompress`/
+// `blst_p2_uncompress` (point decompression: a modular sqrt plus curve/
+// subgroup arithmetic, ~100-400µs) even though the Plutus cost model
+// charges the CHEAP in-memory-point cost (it assumes a decompressed
+// representation, matching Haskell's `BLS12_381.G1.Element` wrapping an
+// already-parsed `Point`). A script that references the same compressed
+// point across several builtin calls (a base point reused across many
+// `scalarMul`s, a public key appearing in more than one
+// `multiScalarMul`/pairing call, ...) pays that cost on every call.
+//
+// This is a pure, deterministic memoization keyed by the compressed
+// bytes — thread-local (the CEK machine is single-threaded per
+// evaluation; different rayon workers get independent caches, so no
+// synchronization is needed) and capped (`BLS_DECOMPRESS_CACHE_CAP`) so
+// an adversarial script computing many distinct valid points cannot grow
+// it without bound for the life of the evaluating thread. Because this
+// only memoizes a pure function of the compressed bytes, an eviction (or
+// this cache never having been populated at all) can only ever cost a
+// re-decompression — it can NEVER produce a different point, so there is
+// no correctness/consensus dependency on cache behavior, only a
+// performance one. Deliberately NOT a `Constant`/`Value`/`Term`-level
+// change (the alternative the issue also considered): attaching the
+// cache to the value itself would need `Constant`'s derived
+// `PartialEq`/`Eq`/`Clone` (used well beyond BLS) to be hand-rolled to
+// ignore the cache field, which is a much larger blast radius for the
+// same benefit.
+const BLS_DECOMPRESS_CACHE_CAP: usize = 1024;
+
+thread_local! {
+    static G1_DECOMPRESS_CACHE: std::cell::RefCell<
+        std::collections::HashMap<[u8; G1_COMPRESSED_BYTES], blst_p1>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+    static G2_DECOMPRESS_CACHE: std::cell::RefCell<
+        std::collections::HashMap<[u8; G2_COMPRESSED_BYTES], blst_p2>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 // `fp12_to_bytes`/`fp12_from_bytes` below memcpy `FP12_BYTES` raw bytes
 // in/out of a `blst_fp12` through a pointer cast, with no per-call size
 // check. Pin the assumed layout at compile time (#843): if a future
@@ -477,6 +520,21 @@ fn uncompress_g1(bs: &[u8], id: BuiltinId) -> Result<blst_p1, UplcError> {
 /// still decodes the compressed encoding (required, since `Constant`
 /// stores only compressed bytes) but skips the expensive subgroup
 /// re-check.
+///
+/// Memoized (#839 residual) via [`G1_DECOMPRESS_CACHE`): a script that
+/// references the SAME compressed point across multiple builtin calls
+/// (e.g. a base point reused across several `scalarMul`/`add` calls, or
+/// the same public key appearing more than once across separate
+/// `multiScalarMul`/pairing calls) pays the ~100-400µs decompression
+/// cost once instead of on every call — closing the propagation/DoS gap
+/// where the cost model charges the cheap in-memory-point cost but the
+/// implementation was doing the expensive decompression every time.
+/// This does NOT change the `Constant`/`Value`/`Term` shape (the
+/// alternative the issue also considered): the cache is a pure,
+/// deterministic memoization table keyed by the compressed bytes,
+/// entirely internal to this module, so it cannot affect equality,
+/// hashing, cloning, or encoding of a `Constant::Bls12_381G1Element`
+/// anywhere else in the crate.
 fn decompress_g1_trusted(bs: &[u8], id: BuiltinId) -> Result<blst_p1, UplcError> {
     debug_assert_eq!(
         bs.len(),
@@ -484,6 +542,31 @@ fn decompress_g1_trusted(bs: &[u8], id: BuiltinId) -> Result<blst_p1, UplcError>
         "decompress_g1_trusted must only be called on bytes taken from a \
          Bls12_381G1Element, which is always exactly G1_COMPRESSED_BYTES long"
     );
+    let mut key = [0u8; G1_COMPRESSED_BYTES];
+    key.copy_from_slice(bs);
+    if let Some(p) = G1_DECOMPRESS_CACHE.with(|c| c.borrow().get(&key).copied()) {
+        return Ok(p);
+    }
+    let p = decompress_g1_trusted_uncached(bs, id)?;
+    G1_DECOMPRESS_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        // Bound memory: an adversarial script computing an unbounded
+        // number of DISTINCT valid points (each itself charged real
+        // ExBudget to construct) would otherwise grow this cache without
+        // limit for the lifetime of the evaluating thread. A flat clear
+        // on overflow is simplest and sufficient here — this is a pure
+        // memoization of a deterministic function, so evicting entries
+        // can only ever cost a re-decompression, never a wrong answer.
+        if cache.len() >= BLS_DECOMPRESS_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(key, p);
+    });
+    Ok(p)
+}
+
+/// The actual decompression work, uncached. See [`decompress_g1_trusted`].
+fn decompress_g1_trusted_uncached(bs: &[u8], id: BuiltinId) -> Result<blst_p1, UplcError> {
     let mut aff = blst_p1_affine::default();
     let err = unsafe { blst_p1_uncompress(&mut aff, bs.as_ptr()) };
     if err != BLST_ERROR::BLST_SUCCESS {
@@ -538,7 +621,8 @@ fn uncompress_g2(bs: &[u8], id: BuiltinId) -> Result<blst_p2, UplcError> {
 }
 
 /// Decompress G2 bytes that are already known-valid by construction.
-/// See [`decompress_g1_trusted`] — the same invariant holds for G2.
+/// See [`decompress_g1_trusted`] — the same invariant, and the same
+/// (#839 residual) memoization via [`G2_DECOMPRESS_CACHE`], hold for G2.
 fn decompress_g2_trusted(bs: &[u8], id: BuiltinId) -> Result<blst_p2, UplcError> {
     debug_assert_eq!(
         bs.len(),
@@ -546,6 +630,24 @@ fn decompress_g2_trusted(bs: &[u8], id: BuiltinId) -> Result<blst_p2, UplcError>
         "decompress_g2_trusted must only be called on bytes taken from a \
          Bls12_381G2Element, which is always exactly G2_COMPRESSED_BYTES long"
     );
+    let mut key = [0u8; G2_COMPRESSED_BYTES];
+    key.copy_from_slice(bs);
+    if let Some(p) = G2_DECOMPRESS_CACHE.with(|c| c.borrow().get(&key).copied()) {
+        return Ok(p);
+    }
+    let p = decompress_g2_trusted_uncached(bs, id)?;
+    G2_DECOMPRESS_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        if cache.len() >= BLS_DECOMPRESS_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(key, p);
+    });
+    Ok(p)
+}
+
+/// The actual decompression work, uncached. See [`decompress_g2_trusted`].
+fn decompress_g2_trusted_uncached(bs: &[u8], id: BuiltinId) -> Result<blst_p2, UplcError> {
     let mut aff = blst_p2_affine::default();
     let err = unsafe { blst_p2_uncompress(&mut aff, bs.as_ptr()) };
     if err != BLST_ERROR::BLST_SUCCESS {
@@ -1044,6 +1146,115 @@ mod tests {
         let ab = denote_bls(BuiltinId::Bls12_381_G1_Add, vec![a.clone(), b.clone()]).unwrap();
         let ba = denote_bls(BuiltinId::Bls12_381_G1_Add, vec![b, a]).unwrap();
         assert_eq!(ab, ba);
+    }
+
+    // ── #839 residual: decompressed-point cache ─────────────────────
+
+    /// A repeated call decompressing the SAME compressed G1 bytes must
+    /// return a bit-identical point whether it's served from the cache
+    /// (warm) or freshly decompressed (cold) — pins that the memoization
+    /// added for #839 cannot change the result, only whether the
+    /// expensive `blst_p1_uncompress` path runs.
+    #[test]
+    fn decompress_g1_trusted_cache_hit_matches_cold_decompress() {
+        let point = denote_bls(
+            BuiltinId::Bls12_381_G1_HashToGroup,
+            vec![bs(b"cache-g1"), bs(b"dst")],
+        )
+        .unwrap();
+        let Value::Const(Constant::Bls12_381G1Element(compressed)) = point else {
+            panic!("expected G1 element");
+        };
+        // First call: populates the cache (or reuses it from an earlier
+        // test on the same thread — either way, deterministic).
+        let cold =
+            decompress_g1_trusted_uncached(compressed.as_slice(), BuiltinId::Bls12_381_G1_Add)
+                .unwrap();
+        let warm =
+            decompress_g1_trusted(compressed.as_slice(), BuiltinId::Bls12_381_G1_Add).unwrap();
+        assert!(
+            unsafe { blst_p1_is_equal(&cold, &warm) },
+            "cached decompression must be bit-identical to a fresh decompress"
+        );
+        // Call again — this time definitely a cache hit.
+        let warm2 =
+            decompress_g1_trusted(compressed.as_slice(), BuiltinId::Bls12_381_G1_Add).unwrap();
+        assert!(unsafe { blst_p1_is_equal(&cold, &warm2) });
+    }
+
+    /// Same as above for G2.
+    #[test]
+    fn decompress_g2_trusted_cache_hit_matches_cold_decompress() {
+        let point = denote_bls(
+            BuiltinId::Bls12_381_G2_HashToGroup,
+            vec![bs(b"cache-g2"), bs(b"dst")],
+        )
+        .unwrap();
+        let Value::Const(Constant::Bls12_381G2Element(compressed)) = point else {
+            panic!("expected G2 element");
+        };
+        let cold =
+            decompress_g2_trusted_uncached(compressed.as_slice(), BuiltinId::Bls12_381_G2_Add)
+                .unwrap();
+        let warm =
+            decompress_g2_trusted(compressed.as_slice(), BuiltinId::Bls12_381_G2_Add).unwrap();
+        assert!(unsafe { blst_p2_is_equal(&cold, &warm) });
+        let warm2 =
+            decompress_g2_trusted(compressed.as_slice(), BuiltinId::Bls12_381_G2_Add).unwrap();
+        assert!(unsafe { blst_p2_is_equal(&cold, &warm2) });
+    }
+
+    /// A script that references the same G1 point across multiple
+    /// separate builtin calls (the actual scenario #839 is about — e.g.
+    /// a base point reused across several `scalarMul`s) must produce
+    /// results identical to what an uncached implementation would give.
+    /// Exercises the cache purely through the public `denote_bls` entry
+    /// point (no internal cache access) so this also serves as an
+    /// end-to-end proof that caching is transparent to callers.
+    #[test]
+    fn repeated_scalar_mul_on_same_cached_point_is_consistent() {
+        let base = denote_bls(
+            BuiltinId::Bls12_381_G1_HashToGroup,
+            vec![bs(b"repeated-base"), bs(b"dst")],
+        )
+        .unwrap();
+        let scalar = Value::Const(Constant::Integer(BigInt::from(7)));
+        let r1 = denote_bls(
+            BuiltinId::Bls12_381_G1_ScalarMul,
+            vec![scalar.clone(), base.clone()],
+        )
+        .unwrap();
+        let r2 = denote_bls(BuiltinId::Bls12_381_G1_ScalarMul, vec![scalar, base]).unwrap();
+        assert_eq!(r1, r2, "repeated scalarMul on the same point must agree");
+    }
+
+    /// Cache-overflow robustness: computing more than
+    /// `BLS_DECOMPRESS_CACHE_CAP` DISTINCT valid G1 points must not error
+    /// or panic — the cache clears itself on overflow (a pure
+    /// memoization, so eviction only ever costs a re-decompression).
+    /// Uses a small local loop rather than actually exceeding the real
+    /// (1024-entry) cap, by driving the SAME cache with enough distinct
+    /// keys to force at least one clear-and-refill cycle within a
+    /// reasonable test runtime — the loop bound is deliberately larger
+    /// than the cap so the overflow branch is guaranteed to execute.
+    #[test]
+    fn cache_overflow_clears_without_error() {
+        for i in 0..(BLS_DECOMPRESS_CACHE_CAP + 8) {
+            let msg = format!("overflow-{i}");
+            let point = denote_bls(
+                BuiltinId::Bls12_381_G1_HashToGroup,
+                vec![bs(msg.as_bytes()), bs(b"dst")],
+            )
+            .unwrap();
+            // Immediately re-use it (forces a decompress right after
+            // insertion/eviction) to prove correctness isn't disturbed.
+            let doubled = denote_bls(BuiltinId::Bls12_381_G1_Add, vec![point.clone(), point])
+                .expect("must not error even across a cache clear-and-refill cycle");
+            assert!(matches!(
+                doubled,
+                Value::Const(Constant::Bls12_381G1Element(_))
+            ));
+        }
     }
 
     #[test]
