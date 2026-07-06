@@ -76,7 +76,20 @@ const CONST_TAG_WIDTH: u8 = 4;
 /// Mirrors Haskell `plcVersion110`, which gates `decodeTerm`'s tag-8/9
 /// handlers: `unless (version >= plcVersion110) $ fail "'constr' is not
 /// allowed before version 1.1.0"` (`UntypedPlutusCore/Core/Instance/Flat.hs`).
-const PLC_VERSION_1_1_0: (u64, u64, u64) = (1, 1, 0);
+///
+/// A function rather than a `const` because the version triple is
+/// `BigUint`-typed (#842 residual) and `BigUint::from` isn't `const fn`.
+fn plc_version_1_1_0() -> (
+    num_bigint::BigUint,
+    num_bigint::BigUint,
+    num_bigint::BigUint,
+) {
+    (
+        num_bigint::BigUint::from(1u8),
+        num_bigint::BigUint::from(1u8),
+        num_bigint::BigUint::ZERO,
+    )
+}
 
 /// First protocol version at which `maxBoundsByPV` bounds a `Constr` tag
 /// (and the constant-universe header) — mirrors `vanRossemPV` in
@@ -167,12 +180,47 @@ pub fn encode_constant(w: &mut BitWriter, c: &Constant) -> FlatResult<()> {
 ///    at 1024 (`maxBoundsByPV`'s `mbConstr`).
 pub fn validate_program_availability(
     term: &Term,
-    version: (u64, u64, u64),
+    version: &(
+        num_bigint::BigUint,
+        num_bigint::BigUint,
+        num_bigint::BigUint,
+    ),
     language: ScriptLanguage,
     major_pv: u32,
 ) -> FlatResult<()> {
-    let version_1_1_0_or_later = version >= PLC_VERSION_1_1_0;
+    let version_1_1_0_or_later = version >= &plc_version_1_1_0();
     validate_term_depth(term, language, major_pv, version_1_1_0_or_later, 0)
+}
+
+/// The protocol MAJOR version at which each ledger Plutus language became
+/// available — Haskell `ledgerLanguageIntroducedIn`:
+/// PlutusV1 → Alonzo (5), PlutusV2 → Babbage/Vasil (7), PlutusV3 → Conway/Chang (9).
+/// (Matches dugite-ledger's own reference-script PV gate in `validation/scripts.rs`.)
+pub fn ledger_language_introduced_in(language: ScriptLanguage) -> u32 {
+    match language {
+        ScriptLanguage::PlutusV1 => 5,
+        ScriptLanguage::PlutusV2 => 7,
+        ScriptLanguage::PlutusV3 => 9,
+    }
+}
+
+/// Reject a script whose ledger language is not yet available at `major_pv`,
+/// mirroring Haskell's `ledgerLanguageIntroducedIn ll <= pv` check, which runs
+/// BEFORE the flat blob is decoded. Emits a typed, adversary-reachable
+/// `FlatDecode` rejection (never an internal error). See issue #860.1.
+pub fn validate_ledger_language_available(
+    language: ScriptLanguage,
+    major_pv: u32,
+) -> FlatResult<()> {
+    let introduced = ledger_language_introduced_in(language);
+    if major_pv < introduced {
+        Err(UplcError::FlatDecode(format!(
+            "ledger language {language:?} is not available at protocol version {major_pv} \
+             (introduced in protocol major {introduced})"
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_term_depth(
@@ -723,7 +771,7 @@ fn decode_constant_value(r: &mut BitReader<'_>, tag: &TypeTag) -> FlatResult<Con
             let d = Data::from_cbor(&raw).map_err(|e| {
                 UplcError::FlatDecode(format!("Data constant: CBOR decode failed: {e}"))
             })?;
-            Ok(Constant::Data(d))
+            Ok(Constant::Data(std::rc::Rc::new(d)))
         }
         TypeTag::List(elem_type) => {
             // A list constant is a flat cons-list: each element is preceded
@@ -949,12 +997,52 @@ fn unreachable_zero() -> FlatResult<i64> {
 mod tests {
     use super::*;
 
+    /// #860.1: a script whose ledger language is not yet available at the current
+    /// protocol version is rejected; an available one passes. Thresholds V1@5,
+    /// V2@7, V3@9 (`ledgerLanguageIntroducedIn`).
+    #[test]
+    fn ledger_language_availability_gate_860_1() {
+        use ScriptLanguage::*;
+        // Unavailable below the introduction PV.
+        for (lang, introduced) in [(PlutusV1, 5u32), (PlutusV2, 7), (PlutusV3, 9)] {
+            assert_eq!(ledger_language_introduced_in(lang), introduced);
+            assert!(
+                validate_ledger_language_available(lang, introduced - 1).is_err(),
+                "{lang:?} must be rejected at PV {}",
+                introduced - 1
+            );
+            // Available at and above the introduction PV.
+            assert!(validate_ledger_language_available(lang, introduced).is_ok());
+            assert!(validate_ledger_language_available(lang, introduced + 3).is_ok());
+        }
+        // A V3 script at PV 8 (Babbage-ish) is the canonical rejected case.
+        assert!(validate_ledger_language_available(PlutusV3, 8).is_err());
+    }
+
     fn rt_term(t: Term) -> Term {
         let mut w = BitWriter::new();
         encode_term(&mut w, &t).expect("encode");
         let bytes = w.finish();
         let mut r = BitReader::new(&bytes);
         decode_term(&mut r).expect("decode")
+    }
+
+    /// Test-only ergonomic constructor for a `Program` version triple
+    /// (`BigUint`-typed since #842's residual arbitrary-precision fix).
+    fn ver(
+        major: u64,
+        minor: u64,
+        patch: u64,
+    ) -> (
+        num_bigint::BigUint,
+        num_bigint::BigUint,
+        num_bigint::BigUint,
+    ) {
+        (
+            num_bigint::BigUint::from(major),
+            num_bigint::BigUint::from(minor),
+            num_bigint::BigUint::from(patch),
+        )
     }
 
     fn atoms(t: &TypeTag) -> Vec<u8> {
@@ -1264,8 +1352,8 @@ mod tests {
     #[test]
     fn validate_rejects_unavailable_builtin_for_v1_before_pv11() {
         let t = Term::Builtin(BuiltinId::Bls12_381_G1_Add);
-        let err =
-            validate_program_availability(&t, (1, 0, 0), ScriptLanguage::PlutusV1, 10).unwrap_err();
+        let err = validate_program_availability(&t, &ver(1, 0, 0), ScriptLanguage::PlutusV1, 10)
+            .unwrap_err();
         assert!(matches!(err, UplcError::FlatDecode(_)), "got {err:?}");
     }
 
@@ -1274,8 +1362,8 @@ mod tests {
     #[test]
     fn validate_rejects_unavailable_bitwise_builtin_for_v1_before_pv11() {
         let t = Term::Builtin(BuiltinId::AndByteString);
-        let err =
-            validate_program_availability(&t, (1, 0, 0), ScriptLanguage::PlutusV1, 10).unwrap_err();
+        let err = validate_program_availability(&t, &ver(1, 0, 0), ScriptLanguage::PlutusV1, 10)
+            .unwrap_err();
         assert!(matches!(err, UplcError::FlatDecode(_)), "got {err:?}");
     }
 
@@ -1285,18 +1373,18 @@ mod tests {
     fn validate_accepts_available_builtin_no_false_rejection() {
         // BLS at V1/PV11 (available).
         let t = Term::Builtin(BuiltinId::Bls12_381_G1_Add);
-        validate_program_availability(&t, (1, 0, 0), ScriptLanguage::PlutusV1, 11)
+        validate_program_availability(&t, &ver(1, 0, 0), ScriptLanguage::PlutusV1, 11)
             .expect("BLS must be available to V1 at PV11");
 
         // BLS at V3/PV9 (available earlier for V3).
         let t = Term::Builtin(BuiltinId::Bls12_381_G1_Add);
-        validate_program_availability(&t, (1, 0, 0), ScriptLanguage::PlutusV3, 9)
+        validate_program_availability(&t, &ver(1, 0, 0), ScriptLanguage::PlutusV3, 9)
             .expect("BLS must be available to V3 at PV9");
 
         // Base-set builtin available to every language at their respective
         // ledger-language introduction PV.
         let t = Term::Builtin(BuiltinId::AddInteger);
-        validate_program_availability(&t, (1, 0, 0), ScriptLanguage::PlutusV1, 5)
+        validate_program_availability(&t, &ver(1, 0, 0), ScriptLanguage::PlutusV1, 5)
             .expect("addInteger must be available to V1 at PV5");
     }
 
@@ -1311,8 +1399,8 @@ mod tests {
             Rc::new(Term::Delay(Rc::new(inner))),
             Rc::new(Term::Error),
         )))));
-        let err =
-            validate_program_availability(&t, (1, 0, 0), ScriptLanguage::PlutusV1, 9).unwrap_err();
+        let err = validate_program_availability(&t, &ver(1, 0, 0), ScriptLanguage::PlutusV1, 9)
+            .unwrap_err();
         assert!(matches!(err, UplcError::FlatDecode(_)), "got {err:?}");
     }
 
@@ -1325,8 +1413,8 @@ mod tests {
             tag: 0,
             args: vec![],
         };
-        let err =
-            validate_program_availability(&t, (1, 0, 0), ScriptLanguage::PlutusV3, 11).unwrap_err();
+        let err = validate_program_availability(&t, &ver(1, 0, 0), ScriptLanguage::PlutusV3, 11)
+            .unwrap_err();
         assert!(matches!(err, UplcError::FlatDecode(_)), "got {err:?}");
     }
 
@@ -1337,8 +1425,8 @@ mod tests {
             scrutinee: Rc::new(Term::Error),
             branches: vec![],
         };
-        let err =
-            validate_program_availability(&t, (1, 0, 0), ScriptLanguage::PlutusV3, 11).unwrap_err();
+        let err = validate_program_availability(&t, &ver(1, 0, 0), ScriptLanguage::PlutusV3, 11)
+            .unwrap_err();
         assert!(matches!(err, UplcError::FlatDecode(_)), "got {err:?}");
     }
 
@@ -1350,14 +1438,14 @@ mod tests {
             tag: 0,
             args: vec![Rc::new(Term::Error)],
         };
-        validate_program_availability(&t, (1, 1, 0), ScriptLanguage::PlutusV3, 11)
+        validate_program_availability(&t, &ver(1, 1, 0), ScriptLanguage::PlutusV3, 11)
             .expect("constr must be allowed at PLC 1.1.0");
 
         let t = Term::Case {
             scrutinee: Rc::new(Term::Error),
             branches: vec![Rc::new(Term::Error)],
         };
-        validate_program_availability(&t, (1, 1, 0), ScriptLanguage::PlutusV3, 11)
+        validate_program_availability(&t, &ver(1, 1, 0), ScriptLanguage::PlutusV3, 11)
             .expect("case must be allowed at PLC 1.1.0");
     }
 
@@ -1368,8 +1456,8 @@ mod tests {
             tag: 1025,
             args: vec![],
         };
-        let err =
-            validate_program_availability(&t, (1, 1, 0), ScriptLanguage::PlutusV3, 11).unwrap_err();
+        let err = validate_program_availability(&t, &ver(1, 1, 0), ScriptLanguage::PlutusV3, 11)
+            .unwrap_err();
         assert!(matches!(err, UplcError::FlatDecode(_)), "got {err:?}");
     }
 
@@ -1380,7 +1468,7 @@ mod tests {
             tag: 1024,
             args: vec![],
         };
-        validate_program_availability(&t, (1, 1, 0), ScriptLanguage::PlutusV3, 11)
+        validate_program_availability(&t, &ver(1, 1, 0), ScriptLanguage::PlutusV3, 11)
             .expect("tag 1024 is exactly at the boundary and must be accepted");
     }
 
@@ -1393,7 +1481,85 @@ mod tests {
             tag: 50_000,
             args: vec![],
         };
-        validate_program_availability(&t, (1, 1, 0), ScriptLanguage::PlutusV3, 10)
+        validate_program_availability(&t, &ver(1, 1, 0), ScriptLanguage::PlutusV3, 10)
             .expect("constr tag bound only applies from PV11");
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // #845: differential round-trip property test for the flat Term
+    // codec — the same motivation as `data::tests::data_cbor_round_trip_
+    // is_identity`: `cargo fuzz`'s `dugite_uplc_program_decode` target
+    // already fuzzes `Program::from_flat`/`to_flat` against arbitrary
+    // bytes, but only under a manual `cargo +nightly fuzz run` session,
+    // never as part of ordinary `cargo test`/`cargo nextest run`. This
+    // exercises the identical `decode ∘ encode = id` property, generated
+    // from arbitrary (bounded) `Term` TREES, entirely on stable Rust as
+    // part of the normal test suite.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Recursive proptest strategy for an arbitrary (bounded) `Term`.
+    /// Leaves are `Error`, a handful of `Constant` shapes, and a few
+    /// representative `Builtin` ids (arity doesn't matter here — we only
+    /// round-trip the flat encoding, never evaluate). The recursive case
+    /// adds `Lam`/`Delay`/`Force`/`App`/`Constr`/`Case`, capped at depth
+    /// 4 / 32 total nodes / up to 3 items per `Constr`/`Case` collection.
+    fn arb_term() -> impl proptest::strategy::Strategy<Value = Term> {
+        use proptest::prelude::*;
+        let const_leaf = prop_oneof![
+            any::<i64>().prop_map(|n| Term::Const(Constant::Integer(BigInt::from(n)))),
+            prop::collection::vec(any::<u8>(), 0..16)
+                .prop_map(|b| Term::Const(Constant::ByteString(b))),
+            any::<bool>().prop_map(|b| Term::Const(Constant::Bool(b))),
+            Just(Term::Const(Constant::Unit)),
+        ];
+        let builtin_leaf = prop_oneof![
+            Just(Term::Builtin(BuiltinId::AddInteger)),
+            Just(Term::Builtin(BuiltinId::IfThenElse)),
+            Just(Term::Builtin(BuiltinId::Trace)),
+        ];
+        let leaf = prop_oneof![
+            Just(Term::Error),
+            (0u64..20).prop_map(Term::Var),
+            const_leaf,
+            builtin_leaf,
+        ];
+        leaf.prop_recursive(4, 32, 3, |inner| {
+            prop_oneof![
+                inner.clone().prop_map(|t| Term::Lam(Rc::new(t))),
+                inner.clone().prop_map(|t| Term::Delay(Rc::new(t))),
+                inner.clone().prop_map(|t| Term::Force(Rc::new(t))),
+                (inner.clone(), inner.clone()).prop_map(|(f, a)| Term::App(Rc::new(f), Rc::new(a))),
+                (0u64..200, prop::collection::vec(inner.clone(), 0..3)).prop_map(|(tag, args)| {
+                    Term::Constr {
+                        tag,
+                        args: args.into_iter().map(Rc::new).collect(),
+                    }
+                }),
+                (inner.clone(), prop::collection::vec(inner.clone(), 0..3)).prop_map(
+                    |(scrutinee, branches)| Term::Case {
+                        scrutinee: Rc::new(scrutinee),
+                        branches: branches.into_iter().map(Rc::new).collect(),
+                    }
+                ),
+            ]
+        })
+    }
+
+    proptest::proptest! {
+        /// `decode_term(encode_term(t))` must be the identity for any
+        /// (bounded) `Term` — the flat-codec analogue of `Data`'s
+        /// serialiseData round-trip property, and the property a decoder/
+        /// encoder asymmetry (a historical source of script-hash
+        /// divergences per `dugite_uplc_program_decode`'s fuzz-target doc
+        /// comment) would break.
+        #[test]
+        fn term_flat_round_trip_is_identity(t in arb_term()) {
+            let mut w = BitWriter::new();
+            encode_term(&mut w, &t).expect("encode must not fail on a well-formed Term");
+            let bytes = w.finish();
+            let mut r = BitReader::new(&bytes);
+            let decoded = decode_term(&mut r).expect("decode must not fail on our own encoder's output");
+            proptest::prop_assert_eq!(&decoded, &t, "decode_term(encode_term(t)) must equal t");
+        }
     }
 }

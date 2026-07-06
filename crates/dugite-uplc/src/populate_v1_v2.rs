@@ -789,10 +789,13 @@ mod tests {
         assert_eq!(
             tx_cert.0,
             Data::Constr(
-                1,
+                BigInt::from(1),
                 vec![Data::Constr(
-                    0,
-                    vec![Data::Constr(1, vec![Data::B(cert_hash.to_vec())])]
+                    BigInt::from(0),
+                    vec![Data::Constr(
+                        BigInt::from(1),
+                        vec![Data::B(cert_hash.to_vec())]
+                    )]
                 )]
             ),
             "Certifying cert Data must use the V1/V2 DCert schema (1 field), \

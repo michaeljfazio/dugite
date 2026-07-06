@@ -21,6 +21,7 @@
 //! `#[ignore]` attribute should be removed.
 
 use dugite_uplc::{Constant, Data, Program, Term};
+use num_bigint::BigInt;
 use std::rc::Rc;
 
 /// Inner flat bytes (post-CBOR-unwrap) of the canonical Aiken-built
@@ -46,7 +47,14 @@ const AIKEN_V3_ALWAYS_TRUE_CBOR: &[u8] = &[
 fn decode_succeeds() {
     let p = Program::from_cbor(AIKEN_V3_ALWAYS_TRUE_CBOR)
         .expect("Aiken-built V3 always-true must decode cleanly after #41b7a036a");
-    assert_eq!(p.version, (1, 1, 0));
+    assert_eq!(
+        p.version,
+        (
+            num_bigint::BigUint::from(1u8),
+            num_bigint::BigUint::from(1u8),
+            num_bigint::BigUint::ZERO
+        )
+    );
     // Top-level term is a single Lambda (binds ctx).
     assert!(matches!(p.term, Term::Lam(_)));
 }
@@ -66,10 +74,13 @@ fn decode_succeeds() {
 fn cek_reaches_body_no_var_lookup_failure() {
     let p = Program::from_cbor(AIKEN_V3_ALWAYS_TRUE_CBOR)
         .expect("decode canonical Aiken V3 always-true");
-    let stub_ctx = Data::Constr(0, vec![Data::Constr(0, vec![]); 4]);
+    let stub_ctx = Data::Constr(
+        BigInt::from(0),
+        vec![Data::Constr(BigInt::from(0), vec![]); 4],
+    );
     let applied = Term::App(
         Rc::new(p.term),
-        Rc::new(Term::Const(Constant::Data(stub_ctx))),
+        Rc::new(Term::Const(Constant::Data(stub_ctx.into()))),
     );
 
     let err = dugite_uplc::machine::step::evaluate(applied).expect_err(

@@ -27,6 +27,18 @@ use num_bigint::BigInt;
 /// Encoding: `tag(30) [numerator, denominator]`.
 const TAG_RATIONAL: u64 = 30;
 
+/// Greatest common divisor (Euclid). Used to reduce decoded `Rational`s to lowest
+/// terms, matching Haskell's `%` smart constructor (#860.4). Callers guarantee at
+/// least one argument is non-zero (the denominator is rejected when zero), so the
+/// result is `>= 1` and division by it is safe.
+fn gcd_u64(a: u64, b: u64) -> u64 {
+    if b == 0 {
+        a.max(1)
+    } else {
+        gcd_u64(b, a % b)
+    }
+}
+
 /// CBOR tag 2: positive bignum (big-endian byte string).
 const TAG_BIGNUM_POS: u64 = 2;
 
@@ -885,9 +897,19 @@ impl<'b> Reader<'b> {
                 "read_rational: denominator is zero".into(),
             ));
         }
+        // Reduce to lowest terms at decode time, matching Haskell's on-chain
+        // `Rational`/`BoundedRatio`, which is ALWAYS built via GHC's `%` smart
+        // constructor (dividing both sides by `gcd`) — see
+        // `cardano-ledger-binary` `decodeIntegralRational` = `toInteger n % toInteger d`.
+        // A non-reduced on-wire pair (e.g. 9/18) would otherwise be stored raw and
+        // re-emitted byte-differently from Haskell's 1/2 in ledger-state dumps,
+        // PParams/pool-margin query encoding, and the ScriptContext `Data` boundary.
+        // Real chain data is already reduced, so this is a no-op there. See #860.4 /
+        // #837.2 (the ScriptContext-side `reduce_rational` this subsumes at the root).
+        let g = gcd_u64(numerator, denominator);
         Ok(Rational {
-            numerator,
-            denominator,
+            numerator: numerator / g,
+            denominator: denominator / g,
         })
     }
 
@@ -1236,6 +1258,27 @@ mod tests {
         let rat = r.read_rational().unwrap();
         assert_eq!(rat.numerator, 3);
         assert_eq!(rat.denominator, 4);
+    }
+
+    #[test]
+    fn read_rational_reduces_to_lowest_terms_860_4() {
+        // A non-reduced on-wire pair must be reduced at decode (Haskell `%`).
+        let cases = [
+            ((9u64, 18u64), (1u64, 2u64)),
+            ((2, 1000), (1, 500)),
+            ((0, 5), (0, 1)), // 0 % d = 0/1
+            ((7, 3), (7, 3)), // already reduced / improper — unchanged
+            ((100, 100), (1, 1)),
+        ];
+        for ((n, d), (en, ed)) in cases {
+            let mut data = cbor_tag(30);
+            data.extend(cbor_array_hdr(2));
+            data.extend(cbor_uint(n));
+            data.extend(cbor_uint(d));
+            let mut r = Reader::new(&data);
+            let rat = r.read_rational().unwrap();
+            assert_eq!((rat.numerator, rat.denominator), (en, ed), "{n}/{d}");
+        }
     }
 
     #[test]

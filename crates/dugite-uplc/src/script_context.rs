@@ -341,7 +341,7 @@ fn data_map(entries: Vec<(Data, Data)>) -> Data {
 }
 
 fn data_constr(tag: u64, fields: Vec<Data>) -> Data {
-    Data::Constr(tag, fields)
+    Data::Constr(BigInt::from(tag), fields)
 }
 
 /// Encode a 32-byte hash as `TxId = Constr 0 [B bytes32]`.
@@ -1088,17 +1088,19 @@ mod tests {
     /// UpperBound]` where each bound is `Constr 0 [Extended, Bool]` and a
     /// `Bool` is `Constr 0 []` (False) / `Constr 1 []` (True).
     fn closures(d: &Data) -> (u64, u64) {
-        let Data::Constr(0, bounds) = d else {
+        let Data::Constr(outer_tag, bounds) = d else {
             panic!("interval is not Constr 0")
         };
+        assert_eq!(outer_tag, &BigInt::from(0), "interval is not Constr 0");
         let tag = |b: &Data| -> u64 {
-            let Data::Constr(0, parts) = b else {
+            let Data::Constr(bound_tag, parts) = b else {
                 panic!("bound is not Constr 0")
             };
+            assert_eq!(bound_tag, &BigInt::from(0), "bound is not Constr 0");
             let Data::Constr(t, _) = &parts[1] else {
                 panic!("closure is not a Constr")
             };
-            *t
+            u64::try_from(t).expect("closure tag must fit u64")
         };
         (tag(&bounds[0]), tag(&bounds[1]))
     }
@@ -1180,7 +1182,7 @@ mod tests {
         let c = pk(0xaa);
         let d = c.to_data();
         if let Ok((tag, fields)) = d.into_constr() {
-            assert_eq!(tag, 0);
+            assert_eq!(tag, BigInt::from(0));
             assert_eq!(fields.len(), 1);
             assert!(matches!(&fields[0], Data::B(b) if b.len() == 28));
         } else {
@@ -1192,7 +1194,7 @@ mod tests {
     fn credential_script_encodes_as_constr_1() {
         let c = Credential::Script([0xbb; 28]);
         let d = c.to_data();
-        assert!(matches!(d, Data::Constr(1, _)));
+        assert!(matches!(d, Data::Constr(ref tag, _) if tag == &BigInt::from(1)));
     }
 
     #[test]
@@ -1202,7 +1204,8 @@ mod tests {
             staking: None,
         };
         let d = a.to_data();
-        if let Ok((0, fields)) = d.into_constr() {
+        if let Ok((tag, fields)) = d.into_constr() {
+            assert_eq!(tag, BigInt::from(0));
             assert_eq!(fields.len(), 2);
         } else {
             panic!("expected Constr 0");
@@ -1218,18 +1221,20 @@ mod tests {
             idx: 3,
         };
         let d = r.to_data();
-        let Data::Constr(0, ref fields) = d else {
+        let Data::Constr(ref __tag, ref fields) = d else {
             panic!("TxOutRef must be Constr 0; got {d:?}");
         };
+        assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
         assert_eq!(
             fields.len(),
             2,
             "TxOutRef must have 2 fields (TxId, Integer)"
         );
         // fields[0] must be TxId = Constr 0 [B bytes32]
-        let Data::Constr(0, ref id_fields) = fields[0] else {
+        let Data::Constr(ref __tag, ref id_fields) = fields[0] else {
             panic!("TxId must be Constr 0; got {:?}", fields[0]);
         };
+        assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
         assert_eq!(id_fields.len(), 1, "TxId has 1 inner field (the raw bytes)");
         assert!(
             matches!(&id_fields[0], Data::B(b) if b.len() == 32 && b.iter().all(|&x| x == 7)),
@@ -1326,7 +1331,7 @@ mod tests {
 
         // Cert: TxCertUnRegStaking(PubKey([0x22;28]), None) = Constr 1 [Constr 0 [B28], Constr 1 []]
         let cert_data = Data::Constr(
-            1,
+            BigInt::from(1),
             vec![
                 data_constr(0, vec![data_bs28(&[0x22; 28])]),
                 data_constr(1, vec![]),
@@ -1392,7 +1397,7 @@ mod tests {
                 policies: vec![([0x44; 28], vec![(b"A".to_vec(), BigInt::from(10i64))])],
             },
             certs: vec![TxCert(Data::Constr(
-                1,
+                BigInt::from(1),
                 vec![
                     data_constr(0, vec![data_bs28(&[0x22; 28])]),
                     data_constr(1, vec![]),
@@ -1414,10 +1419,10 @@ mod tests {
         };
 
         let d = info.to_data();
-        let Data::Constr(tag, ref fields) = d else {
+        let Data::Constr(ref tag, ref fields) = d else {
             panic!("TxInfoV3::to_data must be Constr; got {d:?}");
         };
-        assert_eq!(tag, 0, "outer tag must be 0");
+        assert_eq!(tag, &BigInt::from(0), "outer tag must be 0");
         assert_eq!(
             fields.len(),
             16,
@@ -1503,7 +1508,7 @@ mod tests {
         );
         // Also confirm it is NOT the Constr-wrapped form
         assert!(
-            !matches!(&fields[11], Data::Constr(0, _)),
+            !matches!(&fields[11], Data::Constr(tag, _) if tag == &BigInt::from(0)),
             "field[11] (txid) must NOT be Constr 0 [...]; V3 uses bare bytes"
         );
         // Field 12: votes — Map (empty)
@@ -1543,9 +1548,10 @@ mod tests {
         // Pubkey credential
         info.wdrl = vec![(Credential::PubKey([0xaa; 28]), BigInt::from(100u64))];
         let d = info.to_data();
-        let Data::Constr(0, ref fields) = d else {
+        let Data::Constr(ref __tag, ref fields) = d else {
             panic!("expected Constr 0")
         };
+        assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
 
         // Field 6 is wdrl
         let Data::Map(ref entries) = fields[6] else {
@@ -1556,7 +1562,7 @@ mod tests {
 
         // Key must be Credential directly: Constr 0 [B28] for PubKey
         match key {
-            Data::Constr(0, inner) => {
+            Data::Constr(tag, inner) if tag == &BigInt::from(0) => {
                 assert_eq!(inner.len(), 1, "PubKeyCredential has 1 field");
                 assert!(
                     matches!(&inner[0], Data::B(b) if b.len() == 28),
@@ -1572,7 +1578,10 @@ mod tests {
 
         // Explicitly check it is NOT double-wrapped (StakingHash form would be
         // Constr 0 [Constr 0/1 [...]])
-        if let Data::Constr(0, ref outer_fields) = key {
+        if let Data::Constr(tag, ref outer_fields) = key {
+            if tag != &BigInt::from(0) {
+                panic!("wdrl key outer tag must be 0; got {tag:?}");
+            }
             if let Some(Data::Constr(_, _)) = outer_fields.first() {
                 panic!(
                     "wdrl key is double-wrapped as StakingHash; V3 must use bare Credential. \
@@ -1585,15 +1594,16 @@ mod tests {
         let mut info2 = empty_tx_info_v3();
         info2.wdrl = vec![(Credential::Script([0xbb; 28]), BigInt::from(200u64))];
         let d2 = info2.to_data();
-        let Data::Constr(0, ref fields2) = d2 else {
+        let Data::Constr(ref __tag, ref fields2) = d2 else {
             panic!()
         };
+        assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
         let Data::Map(ref entries2) = fields2[6] else {
             panic!()
         };
         // Script credential = Constr 1 [B28]
         assert!(
-            matches!(&entries2[0].0, Data::Constr(1, inner) if inner.len() == 1),
+            matches!(&entries2[0].0, Data::Constr(tag, inner) if tag == &BigInt::from(1) && inner.len() == 1),
             "ScriptCredential must be Constr 1; got {:?}",
             entries2[0].0
         );
@@ -1604,7 +1614,7 @@ mod tests {
     fn tx_cert_unreg_staking_encodes_as_constr_1_with_cred_and_maybe() {
         // TxCertUnRegStaking(PubKey([0xcc;28]), None) at V3 (PV<10 semantics = Nothing)
         let cert_data = Data::Constr(
-            1,
+            BigInt::from(1),
             vec![
                 data_constr(0, vec![data_bs28(&[0xcc; 28])]), // Credential::PubKey
                 data_constr(1, vec![]),                       // None
@@ -1614,9 +1624,10 @@ mod tests {
         let mut info = empty_tx_info_v3();
         info.certs = vec![TxCert(cert_data.clone())];
         let d = info.to_data();
-        let Data::Constr(0, ref fields) = d else {
+        let Data::Constr(ref __tag, ref fields) = d else {
             panic!()
         };
+        assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
 
         // Field 5 is certs
         let Data::List(ref cert_list) = fields[5] else {
@@ -1629,14 +1640,18 @@ mod tests {
             "TxCertUnRegStaking must be Constr 1 [Credential, Maybe Lovelace]"
         );
         // Outer tag is 1
-        let Data::Constr(tag, ref cert_fields) = cert_list[0] else {
+        let Data::Constr(ref tag, ref cert_fields) = cert_list[0] else {
             panic!()
         };
-        assert_eq!(tag, 1u64, "TxCertUnRegStaking must use Constr tag 1");
+        assert_eq!(
+            tag,
+            &BigInt::from(1),
+            "TxCertUnRegStaking must use Constr tag 1"
+        );
         assert_eq!(cert_fields.len(), 2, "must have exactly 2 fields");
         // credential is Constr 0 [B28]
         assert!(
-            matches!(&cert_fields[0], Data::Constr(0, inner) if inner.len() == 1),
+            matches!(&cert_fields[0], Data::Constr(tag, inner) if tag == &BigInt::from(0) && inner.len() == 1),
             "cert credential must be Constr 0 [B28]; got {:?}",
             cert_fields[0]
         );
@@ -1662,9 +1677,10 @@ mod tests {
         let mut info = empty_tx_info_v3();
         info.txid = [0xde; 32];
         let d = info.to_data();
-        let Data::Constr(0, ref fields) = d else {
+        let Data::Constr(ref __tag, ref fields) = d else {
             panic!()
         };
+        assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
 
         // Field 11 is txid
         match &fields[11] {
@@ -1692,7 +1708,7 @@ mod tests {
             fee: BigInt::from(170_000u64),
             mint: PlutusValue::default(),
             certs: vec![TxCert(Data::Constr(
-                1,
+                BigInt::from(1),
                 vec![
                     data_constr(0, vec![data_bs28(&[0x22; 28])]),
                     data_constr(1, vec![]),
@@ -1738,9 +1754,10 @@ mod tests {
         println!("TxInfoV3 CBOR hex:\n{hex}");
 
         // Structural sanity: 16 fields
-        let Data::Constr(0, ref fields) = d else {
+        let Data::Constr(ref __tag, ref fields) = d else {
             panic!()
         };
+        assert_eq!(__tag, &BigInt::from(0), "unexpected Constr tag");
         assert_eq!(fields.len(), 16, "eyeball test: must still have 16 fields");
 
         // Print field-by-field summary
@@ -1770,9 +1787,11 @@ mod tests {
 
     #[test]
     fn vote_constructors_have_expected_tags() {
-        assert!(matches!(Vote::No.to_data(), Data::Constr(0, _)));
-        assert!(matches!(Vote::Yes.to_data(), Data::Constr(1, _)));
-        assert!(matches!(Vote::Abstain.to_data(), Data::Constr(2, _)));
+        assert!(matches!(Vote::No.to_data(), Data::Constr(ref tag, _) if tag == &BigInt::from(0)));
+        assert!(matches!(Vote::Yes.to_data(), Data::Constr(ref tag, _) if tag == &BigInt::from(1)));
+        assert!(
+            matches!(Vote::Abstain.to_data(), Data::Constr(ref tag, _) if tag == &BigInt::from(2))
+        );
     }
 
     #[test]
@@ -1864,8 +1883,8 @@ mod tests {
             }),
             purpose: p,
         };
-        assert!(matches!(v1.to_data(false), Data::Constr(0, _)));
-        assert!(matches!(v2.to_data(false), Data::Constr(0, _)));
+        assert!(matches!(v1.to_data(false), Data::Constr(ref tag, _) if tag == &BigInt::from(0)));
+        assert!(matches!(v2.to_data(false), Data::Constr(ref tag, _) if tag == &BigInt::from(0)));
     }
 
     #[test]
@@ -1877,10 +1896,12 @@ mod tests {
             },
             datum: Some(Data::I(BigInt::from(42))),
         };
-        if let Ok((1, fields)) = si.to_data().into_constr() {
+        if let Ok((tag, fields)) = si.to_data().into_constr() {
+            assert_eq!(tag, BigInt::from(1));
             assert_eq!(fields.len(), 2);
             // datum slot: Constr 0 [Data::I(42)]
-            if let Data::Constr(0, inner) = &fields[1] {
+            if let Data::Constr(tag, inner) = &fields[1] {
+                assert_eq!(tag, &BigInt::from(0));
                 assert!(matches!(&inner[0], Data::I(i) if i == &BigInt::from(42)));
             } else {
                 panic!("expected Just-wrapped datum");

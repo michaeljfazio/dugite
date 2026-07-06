@@ -76,31 +76,26 @@ impl LedgerState {
 
         // --- Check 2: pvCanFollow for HardForkInitiation ---
         //
-        // The target protocol version must be reachable from the current version.
-        // Per Haskell `pvCanFollow cur target`:
-        //   (major+1, 0)  — major bump
-        //   (major, minor+1)  — minor bump
-        //
-        // Reject with ProposalCantFollow if neither condition is met.
-        if let GovAction::HardForkInitiation {
-            protocol_version: (tgt_major, tgt_minor),
-            ..
-        } = &proposal.gov_action
+        // The target protocol version must be reachable from the base version, with
+        // the Haskell `preceedingHardFork` three-way base resolution (chaining against
+        // an in-flight parent HardForkInitiation's target when present). Shared with
+        // the live GOV rule via `hardfork_proposal_cant_follow` — single source of
+        // truth (#812 Defect B / #858).
         {
             let cur_major = self.epochs.protocol_params.protocol_version_major;
             let cur_minor = self.epochs.protocol_params.protocol_version_minor;
-            // #812: minor bump must be EXACTLY curMinor+1 (Haskell `pvCanFollow`
-            // requires `(curMajor, curMinor+1) == (newMajor, newMinor)`), not
-            // merely any higher minor. Matches `validation/ppup.rs:225`.
-            let can_follow = (*tgt_major == cur_major + 1 && *tgt_minor == 0)
-                || (*tgt_major == cur_major && *tgt_minor == cur_minor + 1);
-            if !can_follow {
+            if hardfork_proposal_cant_follow(
+                &proposal.gov_action,
+                &self.gov.governance,
+                cur_major,
+                cur_minor,
+            ) {
                 debug!(
                     tx = %tx_hash.to_hex(),
                     action_index,
                     cur_version = %format!("{cur_major}.{cur_minor}"),
-                    target_version = %format!("{tgt_major}.{tgt_minor}"),
-                    "ProposalCantFollow: HardForkInitiation target version does not follow current version"
+                    "ProposalCantFollow: HardForkInitiation target does not follow the base \
+                     protocol version — proposal dropped (#812)"
                 );
                 // Drop proposal — do not insert into active proposals
                 return;
@@ -404,29 +399,24 @@ impl LedgerState {
 
         // --- Check 2: pvCanFollow for HardForkInitiation ---
         //
-        // Target version must be reachable from the current version.
-        // Per Haskell `pvCanFollow cur target`:
-        //   (major+1, 0)  — major bump
-        //   (major, minor+1)  — minor bump
-        if let GovAction::HardForkInitiation {
-            protocol_version: (tgt_major, tgt_minor),
-            ..
-        } = &proposal.gov_action
+        // Shared `preceedingHardFork` + `pvCanFollow` reachability check (chains
+        // against an in-flight parent HardForkInitiation's target when present).
+        // Single source of truth with the live GOV rule (#812 Defect B / #858).
         {
             let cur_major = self.epochs.protocol_params.protocol_version_major;
             let cur_minor = self.epochs.protocol_params.protocol_version_minor;
-            // #812: minor bump must be EXACTLY curMinor+1 (Haskell `pvCanFollow`
-            // requires `(curMajor, curMinor+1) == (newMajor, newMinor)`), not
-            // merely any higher minor. Matches `validation/ppup.rs:225`.
-            let can_follow = (*tgt_major == cur_major + 1 && *tgt_minor == 0)
-                || (*tgt_major == cur_major && *tgt_minor == cur_minor + 1);
-            if !can_follow {
+            if hardfork_proposal_cant_follow(
+                &proposal.gov_action,
+                &self.gov.governance,
+                cur_major,
+                cur_minor,
+            ) {
                 debug!(
                     tx = %tx_hash.to_hex(),
                     action_index,
                     cur_version = %format!("{cur_major}.{cur_minor}"),
-                    target_version = %format!("{tgt_major}.{tgt_minor}"),
-                    "ProposalCantFollow: HardForkInitiation target version does not follow current version"
+                    "ProposalCantFollow: HardForkInitiation target does not follow the base \
+                     protocol version — proposal dropped (#812)"
                 );
                 return;
             }
@@ -3624,6 +3614,80 @@ fn update_enacted_root_local(
 /// Returns `false` (invalid, must reject) when the enacted root is `Some(...)`.
 ///
 /// `TreasuryWithdrawals` and `InfoAction` have no chain requirement — always `true`.
+/// Haskell `pvCanFollow` (`Cardano.Ledger.Shelley.PParams`):
+///
+/// ```haskell
+/// pvCanFollow (ProtVer curMajor curMinor) (ProtVer newMajor newMinor) =
+///   (succVersion curMajor, 0) == (Just newMajor, newMinor)
+///     || (curMajor, curMinor + 1) == (newMajor, newMinor)
+/// ```
+///
+/// `succVersion curMajor = curMajor + 1`. A new version follows iff it is exactly a
+/// major bump (`curMajor+1`, minor reset to 0) or exactly the next minor
+/// (`curMinor+1`, same major). Any larger gap is illegal.
+pub(crate) fn pv_can_follow(
+    cur_major: u64,
+    cur_minor: u64,
+    new_major: u64,
+    new_minor: u64,
+) -> bool {
+    (new_major == cur_major + 1 && new_minor == 0)
+        || (new_major == cur_major && new_minor == cur_minor + 1)
+}
+
+/// Returns `true` when `gov_action` is a `HardForkInitiation` whose target ProtVer
+/// does NOT `pvCanFollow` its resolved base version — i.e. the proposal must be
+/// dropped with `ProposalCantFollow`. Returns `false` for any non-HardFork action,
+/// or a HardForkInitiation whose base is unresolved or whose target legally follows.
+///
+/// Implements Haskell `preceedingHardFork` (`Cardano.Ledger.Conway.Rules.Gov`,
+/// Gov.hs:673-694) three-way base resolution followed by [`pv_can_follow`]:
+///  1. base = current on-chain PV — when the proposal's prev pointer equals the
+///     enacted HardFork root, OR the target major exceeds `succVersion(curMajor)`
+///     (the short-circuit that forbids compounding two major bumps in one epoch);
+///  2. base = an in-flight parent HardForkInitiation's target PV — when the prev
+///     pointer resolves to one already in the live proposal set (including
+///     same-transaction earlier proposals, which are inserted as they are folded);
+///  3. base unresolved (prev missing / not a HardFork) — no `ProposalCantFollow`
+///     (the structural `InvalidPrevGovActionId` check owns that case).
+///
+/// Shared by the live block-apply GOV rule (`eras::conway`, #858) and the
+/// test/dead-path proposal processors here (#812) so the reachability rule has a
+/// single source of truth.
+pub(crate) fn hardfork_proposal_cant_follow(
+    gov_action: &GovAction,
+    governance: &GovernanceState,
+    cur_major: u64,
+    cur_minor: u64,
+) -> bool {
+    let GovAction::HardForkInitiation {
+        prev_action_id: hf_prev,
+        protocol_version: (tgt_major, tgt_minor),
+    } = gov_action
+    else {
+        return false;
+    };
+    let base = if hf_prev == &governance.enacted_hard_fork || *tgt_major > cur_major + 1 {
+        Some((cur_major, cur_minor))
+    } else {
+        match hf_prev
+            .as_ref()
+            .and_then(|p| governance.proposals.get(p))
+            .map(|ps| &ps.procedure.gov_action)
+        {
+            Some(GovAction::HardForkInitiation {
+                protocol_version: (pm, pn),
+                ..
+            }) => Some((*pm, *pn)),
+            _ => None,
+        }
+    };
+    match base {
+        Some((bm, bn)) => !pv_can_follow(bm, bn, *tgt_major, *tgt_minor),
+        None => false,
+    }
+}
+
 pub(crate) fn genesis_root_is_valid(action: &GovAction, governance: &GovernanceState) -> bool {
     let enacted_root = match action {
         GovAction::ParameterChange { .. } => governance.enacted_pparam_update.as_ref(),
@@ -5441,6 +5505,102 @@ mod tests {
             state.gov.governance.proposals.contains_key(&action_id2),
             "HardForkInitiation with an exact +1 minor bump must be accepted"
         );
+    }
+
+    /// #812 Defect B / #858: a HardForkInitiation that chains to an IN-FLIGHT parent
+    /// HardForkInitiation must be checked with `pvCanFollow` against the PARENT's
+    /// target version (`preceedingHardFork`), not the current on-chain version.
+    #[test]
+    fn test_process_proposal_hardfork_chains_to_in_flight_parent_812() {
+        let mut state = gov_test_state(0, 0); // PV (10,0), enacted_hard_fork = None
+        let hf = |prev: Option<GovActionId>, ver: (u64, u64)| ProposalProcedure {
+            deposit: Lovelace(100_000_000_000),
+            return_addr: vec![0u8; 29],
+            gov_action: GovAction::HardForkInitiation {
+                prev_action_id: prev,
+                protocol_version: ver,
+            },
+            anchor: make_anchor(),
+        };
+        let submit = |state: &mut LedgerState, seed: u8, p: &ProposalProcedure| {
+            let h = Hash32::from_bytes([seed; 32]);
+            state.process_proposal(&h, 0, p);
+            GovActionId {
+                transaction_id: h,
+                action_index: 0,
+            }
+        };
+
+        // Parent: (10,0) -> (11,0) major bump, genesis-root (prev=None). Accepted.
+        let parent = submit(&mut state, 70, &hf(None, (11, 0)));
+        assert!(
+            state.gov.governance.proposals.contains_key(&parent),
+            "parent major-bump HardForkInitiation (11,0) must be accepted"
+        );
+
+        // Child chaining to the in-flight parent, target (11,1) = minor+1 off the
+        // parent's (11,0). Under the OLD (base=current-PV) logic this checked
+        // pvCanFollow((10,0),(11,1)) = false and was wrongly dropped; with the
+        // preceedingHardFork chaining it checks pvCanFollow((11,0),(11,1)) = true.
+        let child_ok = submit(&mut state, 71, &hf(Some(parent.clone()), (11, 1)));
+        assert!(
+            state.gov.governance.proposals.contains_key(&child_ok),
+            "child (11,1) chaining off in-flight parent (11,0) must be ACCEPTED (#812 Defect B)"
+        );
+
+        // Child chaining to the in-flight parent but skipping a minor: (11,3) does
+        // not follow (11,0). Dropped.
+        let child_skip = submit(&mut state, 72, &hf(Some(parent.clone()), (11, 3)));
+        assert!(
+            !state.gov.governance.proposals.contains_key(&child_skip),
+            "child (11,3) skip-minor off in-flight parent must be dropped (ProposalCantFollow)"
+        );
+
+        // succVersion short-circuit: a child targeting (12,0) — two major bumps
+        // compounded in one epoch — is checked against CURRENT (10,0), not the
+        // parent, and dropped.
+        let child_double = submit(&mut state, 73, &hf(Some(parent.clone()), (12, 0)));
+        assert!(
+            !state.gov.governance.proposals.contains_key(&child_double),
+            "child (12,0) compounding two major bumps must be dropped (succVersion short-circuit)"
+        );
+    }
+
+    /// Direct unit coverage of the shared `hardfork_proposal_cant_follow` helper for
+    /// the non-HardFork and unresolved-base branches.
+    #[test]
+    fn test_hardfork_proposal_cant_follow_edge_cases() {
+        let state = gov_test_state(0, 0); // PV (10,0)
+        let gov = &state.gov.governance;
+
+        // Non-HardFork action → never a ProposalCantFollow.
+        assert!(!hardfork_proposal_cant_follow(
+            &GovAction::InfoAction,
+            gov,
+            10,
+            0
+        ));
+
+        // HardFork whose prev points at a NON-existent proposal (and not the enacted
+        // root, target not above succVersion) → base unresolved → false (the
+        // structural InvalidPrevGovActionId check owns that case, not pvCanFollow).
+        let dangling = GovActionId {
+            transaction_id: Hash32::from_bytes([0xEE; 32]),
+            action_index: 7,
+        };
+        let hf_dangling = GovAction::HardForkInitiation {
+            prev_action_id: Some(dangling),
+            protocol_version: (10, 1),
+        };
+        assert!(!hardfork_proposal_cant_follow(&hf_dangling, gov, 10, 0));
+
+        // HardFork at genesis root (prev = None = enacted_hard_fork), skip-minor
+        // target (10,2) → base = current (10,0) → cant follow → true.
+        let hf_skip = GovAction::HardForkInitiation {
+            prev_action_id: None,
+            protocol_version: (10, 2),
+        };
+        assert!(hardfork_proposal_cant_follow(&hf_skip, gov, 10, 0));
     }
 
     // ========================================================================

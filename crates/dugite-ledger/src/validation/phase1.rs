@@ -1161,12 +1161,14 @@ pub(super) fn run_phase1_rules(
     if !body.mint.is_empty() {
         let mut available_script_hashes: HashSet<Hash28> = HashSet::new();
 
-        for script in &tx.witness_set.native_scripts {
-            let script_cbor = dugite_serialization::encode_native_script(script);
-            let mut tagged = Vec::with_capacity(1 + script_cbor.len());
-            tagged.push(0x00);
-            tagged.extend_from_slice(&script_cbor);
-            available_script_hashes.insert(dugite_primitives::hash::blake2b_224(&tagged));
+        // Native scripts hash over their ORIGINAL wire bytes (#862).
+        let witness_native_raws = super::scripts::witness_native_original_bytes(tx);
+        for (i, script) in tx.witness_set.native_scripts.iter().enumerate() {
+            let original = witness_native_raws
+                .as_ref()
+                .and_then(|v| v.get(i))
+                .map(Vec::as_slice);
+            available_script_hashes.insert(super::scripts::native_script_hash(script, original));
         }
         for s in &tx.witness_set.plutus_v1_scripts {
             let mut tagged = Vec::with_capacity(1 + s.len());
@@ -1192,7 +1194,11 @@ pub(super) fn run_phase1_rules(
         for inp in body.inputs.iter().chain(body.reference_inputs.iter()) {
             if let Some(utxo) = utxo_set.lookup(inp) {
                 if let Some(script_ref) = &utxo.script_ref {
-                    let hash = super::scripts::compute_script_ref_hash(script_ref);
+                    let native_original = super::scripts::reference_native_original_bytes(&utxo);
+                    let hash = super::scripts::compute_script_ref_hash(
+                        script_ref,
+                        native_original.as_deref(),
+                    );
                     available_script_hashes.insert(hash);
                 }
             }
@@ -1802,13 +1808,15 @@ pub(super) fn run_phase1_rules(
         let invalid_before = body.validity_interval_start;
         let invalid_hereafter = body.ttl;
 
-        for script in &tx.witness_set.native_scripts {
-            // Compute this script's hash: blake2b_224(0x00 || cbor(script))
-            let script_cbor = dugite_serialization::encode_native_script(script);
-            let mut tagged = Vec::with_capacity(1 + script_cbor.len());
-            tagged.push(0x00);
-            tagged.extend_from_slice(&script_cbor);
-            let script_hash = dugite_primitives::hash::blake2b_224(&tagged);
+        // Native scripts hash over their ORIGINAL wire bytes (#862) so the hash
+        // matches the on-chain `scripts_needed` entry for a non-canonical script.
+        let witness_native_raws = super::scripts::witness_native_original_bytes(tx);
+        for (i, script) in tx.witness_set.native_scripts.iter().enumerate() {
+            let original = witness_native_raws
+                .as_ref()
+                .and_then(|v| v.get(i))
+                .map(Vec::as_slice);
+            let script_hash = super::scripts::native_script_hash(script, original);
 
             // Only evaluate scripts that are actually needed
             if scripts_needed.contains(&script_hash)
@@ -5269,7 +5277,7 @@ mod tests {
 
     fn minimal_plutus_program_flat() -> Vec<u8> {
         let p = dugite_uplc::program::Program {
-            version: (1, 0, 0),
+            version: dugite_uplc::program::Program::version_triple(1, 0, 0),
             term: dugite_uplc::term::Term::Const(dugite_uplc::term::Constant::Integer(
                 num_bigint::BigInt::from(0),
             )),
@@ -5288,7 +5296,7 @@ mod tests {
     /// `ScriptRef` tests.
     fn minimal_plutus_program_cbor() -> Vec<u8> {
         let p = dugite_uplc::program::Program {
-            version: (1, 0, 0),
+            version: dugite_uplc::program::Program::version_triple(1, 0, 0),
             term: dugite_uplc::term::Term::Const(dugite_uplc::term::Constant::Integer(
                 num_bigint::BigInt::from(0),
             )),
