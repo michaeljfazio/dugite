@@ -16978,6 +16978,42 @@ mod tests {
         assert!(!PlutusError::CollectError("x".into()).is_eval_panic());
     }
 
+    /// #826 / #860.3: an EXECUTED Plutus language with no cost model is a
+    /// `NoCostModel` collection error; a language with a cost model, or one that
+    /// is not executed, is not. Per-executed-language scope, deduped and sorted.
+    #[test]
+    fn missing_cost_model_languages_no_cost_model_826() {
+        use crate::validation::missing_cost_model_languages;
+        use dugite_primitives::transaction::CostModels;
+
+        let full = CostModels {
+            plutus_v1: Some(vec![1]),
+            plutus_v2: Some(vec![2]),
+            plutus_v3: Some(vec![3]),
+            plutus_v4: Some(vec![4]),
+            ..Default::default()
+        };
+        assert!(missing_cost_model_languages([1u8, 2, 3], &full).is_empty());
+
+        let no_v2 = CostModels {
+            plutus_v1: Some(vec![1]),
+            plutus_v3: Some(vec![3]),
+            ..Default::default()
+        };
+        // V2 executed but absent -> missing.
+        assert_eq!(missing_cost_model_languages([2u8], &no_v2), vec![2]);
+        // V2 absent but NOT executed -> not missing (per-executed scope).
+        assert!(missing_cost_model_languages([1u8, 3], &no_v2).is_empty());
+
+        // Multiple missing dedup + sort; native/unknown tags never count.
+        let none = CostModels::default();
+        assert_eq!(
+            missing_cost_model_languages([3u8, 1, 3, 2], &none),
+            vec![1, 2, 3]
+        );
+        assert!(missing_cost_model_languages([0u8], &none).is_empty());
+    }
+
     /// `IsValidTagMismatch` is a proper `ValidationError` variant and can be
     /// constructed and matched as expected.  This guards the variant definition
     /// against refactoring that accidentally removes it or changes its fields.
