@@ -677,12 +677,7 @@ pub fn denote(
             let d = unwrap_data(take_one(args, id)?, id)?;
             match d.into_integer() {
                 Ok(i) => Ok(Value::Const(Constant::Integer(i))),
-                Err(other) => {
-                    if std::env::var("DUGITE_DUMP_CTX").is_ok() {
-                        eprintln!("!!! unIData on non-I: {other:?}");
-                    }
-                    Err(builtin_failure(id, "unIData on non-I Data"))
-                }
+                Err(_) => Err(builtin_failure(id, "unIData on non-I Data")),
             }
         }
         UnBData => {
@@ -2284,8 +2279,15 @@ mod tests {
     }
 
     #[test]
-    fn unwired_builtin_returns_internal() {
-        // VerifyEcdsaSecp256k1Signature not wired yet.
+    fn builtin_wrong_arity_returns_internal() {
+        // VerifyEcdsaSecp256k1Signature IS wired (see the `run_ecdsa`
+        // dispatch arm above) — calling it with zero args instead hits the
+        // denotation's own arity guard (`builtin_arity_mismatch`), which is
+        // a genuine dugite-uplc invariant violation (the dispatch layer is
+        // supposed to guarantee the right argument count before invoking
+        // any denotation), hence `UplcError::Internal` here IS the correct
+        // classification — unlike the adversary-reachable machine errors
+        // reclassified in #840.
         let err = run(BuiltinId::VerifyEcdsaSecp256k1Signature, vec![]).unwrap_err();
         assert!(matches!(err, UplcError::Internal(_)));
     }

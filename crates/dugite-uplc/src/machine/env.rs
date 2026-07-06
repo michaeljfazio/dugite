@@ -51,14 +51,20 @@ impl Env {
     }
 
     /// Resolve a 1-based De Bruijn index. The innermost binder is index 1.
+    ///
+    /// Both failure arms below are adversary-reachable: a gossiped witness
+    /// script's applied term can legitimately contain an out-of-scope
+    /// variable (index 0, the free-variable sentinel) or an index deeper
+    /// than the current environment — neither is a dugite-uplc bug, so
+    /// both surface as [`UplcError::MachineError`], not `Internal` (#840).
     pub fn lookup(&self, index: u64) -> Result<&Value, UplcError> {
         if index == 0 {
-            return Err(UplcError::Internal(
+            return Err(UplcError::MachineError(
                 "CEK env: De Bruijn index 0 is the free-variable sentinel".into(),
             ));
         }
         let out_of_range = || {
-            UplcError::Internal(format!(
+            UplcError::MachineError(format!(
                 "CEK env: De Bruijn index {index} out of range (env depth {})",
                 self.depth
             ))
@@ -130,7 +136,7 @@ mod tests {
     #[test]
     fn index_zero_is_sentinel_error() {
         let env = Env::new().extend(int_val(1));
-        assert!(matches!(env.lookup(0), Err(UplcError::Internal(_))));
+        assert!(matches!(env.lookup(0), Err(UplcError::MachineError(_))));
     }
 
     #[test]

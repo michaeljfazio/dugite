@@ -57,6 +57,85 @@ pub struct RedeemerEvalOutcome {
     pub logs: Vec<String>,
 }
 
+/// Per-transaction cache of the per-language `TxInfo`, built lazily on
+/// first use and reused by every later redeemer sharing that language.
+///
+/// `TxInfo` is a pure function of `(tx, resolved, slot_config)` — it does
+/// not depend on which specific redeemer requested it (the redeemer's own
+/// purpose/data is layered on separately when the per-redeemer
+/// `ScriptContext` is assembled, see [`build_script_context`]). Rebuilding
+/// it from scratch for every redeemer therefore repeats identical work —
+/// including a full `resolve_redeemers` pass over **every** redeemer in the
+/// tx inside `populate_tx_info_v2`/`populate_tx_info_v3` — making a
+/// Plutus-dense block's phase-2 evaluation effectively O(n²) in the
+/// redeemer count (#838).
+///
+/// The cached value is `Rc`-shared, so handing it to
+/// [`crate::script_context::ScriptContextV1`] /
+/// [`crate::script_context::ScriptContextV2`] /
+/// [`crate::script_context::ScriptContextV3`] costs an O(1) refcount bump
+/// rather than a deep clone of the whole tx's inputs/outputs/certs/etc.
+///
+/// Building lazily (on first redeemer of a given language, rather than
+/// eagerly for every language up front) preserves today's error-surfacing
+/// order byte-for-byte: a `PhaseTwoError` from populating a language's
+/// `TxInfo` still surfaces at exactly the point the first redeemer of that
+/// language would have hit it.
+#[derive(Default)]
+pub(crate) struct TxInfoCache {
+    v1: Option<Rc<crate::script_context::TxInfoV1>>,
+    v2: Option<Rc<crate::script_context::TxInfoV2>>,
+    v3: Option<Rc<crate::script_context::TxInfoV3>>,
+}
+
+impl TxInfoCache {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    fn get_or_build_v1(
+        &mut self,
+        tx: &Transaction,
+        resolved: &[(PrimTxIn, PrimTxOut, Vec<u8>)],
+        slot_config: &SlotConfig,
+    ) -> Result<Rc<crate::script_context::TxInfoV1>, PhaseTwoError> {
+        if let Some(cached) = &self.v1 {
+            return Ok(cached.clone());
+        }
+        let built = Rc::new(populate_tx_info_v1(tx, resolved, slot_config)?);
+        self.v1 = Some(built.clone());
+        Ok(built)
+    }
+
+    fn get_or_build_v2(
+        &mut self,
+        tx: &Transaction,
+        resolved: &[(PrimTxIn, PrimTxOut, Vec<u8>)],
+        slot_config: &SlotConfig,
+    ) -> Result<Rc<crate::script_context::TxInfoV2>, PhaseTwoError> {
+        if let Some(cached) = &self.v2 {
+            return Ok(cached.clone());
+        }
+        let built = Rc::new(populate_tx_info_v2(tx, resolved, slot_config)?);
+        self.v2 = Some(built.clone());
+        Ok(built)
+    }
+
+    fn get_or_build_v3(
+        &mut self,
+        tx: &Transaction,
+        resolved: &[(PrimTxIn, PrimTxOut, Vec<u8>)],
+        slot_config: &SlotConfig,
+    ) -> Result<Rc<crate::script_context::TxInfoV3>, PhaseTwoError> {
+        if let Some(cached) = &self.v3 {
+            return Ok(cached.clone());
+        }
+        let built = Rc::new(populate_tx_info_v3(tx, resolved, slot_config)?);
+        self.v3 = Some(built.clone());
+        Ok(built)
+    }
+}
+
 /// Evaluate a single resolved redeemer against the supplied tx +
 /// resolved-UTxO context. Returns the CEK outcome on success.
 ///
@@ -69,7 +148,17 @@ pub struct RedeemerEvalOutcome {
 /// on-chain model byte-exact is what makes `consumed` agree with cardano-node
 /// — both for pass/fail classification and for the memory bound (the CEK
 /// machine's only allocation limiter is the `ExBudget` memory dimension).
-pub fn eval_resolved_redeemer(
+///
+/// `tx_info_cache` amortizes the per-language `TxInfo` build across every
+/// redeemer of a tx sharing that language (#838) — see [`TxInfoCache`]'s
+/// doc comment. Callers processing a single tx's redeemers in a loop must
+/// pass the *same* cache instance to every call.
+///
+/// Crate-internal only (called from [`crate::phase_two::eval_phase_two_raw`]
+/// and this module's own tests) — not part of the public API surface, so
+/// `TxInfoCache` can stay `pub(crate)` without a visibility mismatch.
+#[allow(clippy::too_many_arguments)] // mirrors the aiken-uplc interface + the protocol-version/cache params
+pub(crate) fn eval_resolved_redeemer(
     tx: &Transaction,
     resolved: &[(PrimTxIn, PrimTxOut, Vec<u8>)],
     r: &ResolvedRedeemer,
@@ -77,6 +166,7 @@ pub fn eval_resolved_redeemer(
     initial_budget: ExBudget,
     cost_models: Option<&CostModels>,
     major_pv: u32,
+    tx_info_cache: &mut TxInfoCache,
 ) -> Result<RedeemerEvalOutcome, PhaseTwoError> {
     // 1. Decode script bytes → typed Term.
     //
@@ -103,7 +193,7 @@ pub fn eval_resolved_redeemer(
     let term = program.term;
 
     // 2. Build the per-version ScriptContext as Data.
-    let ctx_data = build_script_context(tx, resolved, r, slot_config, major_pv)?;
+    let ctx_data = build_script_context(tx_info_cache, tx, resolved, r, slot_config, major_pv)?;
 
     if std::env::var("DUGITE_DUMP_CTX").is_ok() {
         eprintln!(
@@ -503,7 +593,13 @@ fn debug_dump_data(d: &crate::data::Data, depth: usize) {
 }
 
 /// Build the per-version `ScriptContext` as a `Data` value.
+///
+/// `tx_info_cache` supplies the (lazily-built, `Rc`-shared) per-language
+/// `TxInfo` — see [`TxInfoCache`]'s doc comment (#838). This function no
+/// longer calls `populate_tx_info_v1/v2/v3` directly: doing so per redeemer
+/// re-ran a full `resolve_redeemers` pass over the whole tx on every call.
 fn build_script_context(
+    tx_info_cache: &mut TxInfoCache,
     tx: &Transaction,
     resolved: &[(PrimTxIn, PrimTxOut, Vec<u8>)],
     r: &ResolvedRedeemer,
@@ -517,7 +613,7 @@ fn build_script_context(
     let conway_or_later = major_pv >= 9;
     match r.language {
         ScriptLanguage::PlutusV1 => {
-            let tx_info = populate_tx_info_v1(tx, resolved, slot_config)?;
+            let tx_info = tx_info_cache.get_or_build_v1(tx, resolved, slot_config)?;
             let ctx = ScriptContextV1 {
                 tx_info,
                 purpose: r.purpose.clone(),
@@ -525,7 +621,7 @@ fn build_script_context(
             Ok(ctx.to_data(conway_or_later))
         }
         ScriptLanguage::PlutusV2 => {
-            let tx_info = populate_tx_info_v2(tx, resolved, slot_config)?;
+            let tx_info = tx_info_cache.get_or_build_v2(tx, resolved, slot_config)?;
             let ctx = ScriptContextV2 {
                 tx_info,
                 purpose: r.purpose.clone(),
@@ -533,7 +629,7 @@ fn build_script_context(
             Ok(ctx.to_data(conway_or_later))
         }
         ScriptLanguage::PlutusV3 => {
-            let tx_info = populate_tx_info_v3(tx, resolved, slot_config)?;
+            let tx_info = tx_info_cache.get_or_build_v3(tx, resolved, slot_config)?;
             // V3 builds a `ScriptInfo` from the purpose + (for spend)
             // the resolved inline/witness datum.
             let script_info = purpose_to_script_info_v3(r, tx, resolved)?;
@@ -809,6 +905,7 @@ mod tests {
             budget,
             None,
             9,
+            &mut TxInfoCache::new(),
         )
         .expect("V3 unit script runs");
         assert!(matches!(outcome.result_term, Term::Const(Constant::Unit)));
@@ -1068,8 +1165,17 @@ mod tests {
             cpu: 100_000_000,
             mem: 1_000_000,
         };
-        let outcome = eval_resolved_redeemer(&tx, &resolved, &r, &slot_cfg(), budget, None, 9)
-            .expect("trace+unit script should succeed");
+        let outcome = eval_resolved_redeemer(
+            &tx,
+            &resolved,
+            &r,
+            &slot_cfg(),
+            budget,
+            None,
+            9,
+            &mut TxInfoCache::new(),
+        )
+        .expect("trace+unit script should succeed");
         assert_eq!(
             outcome.logs,
             vec!["hello from plutus"],
@@ -1085,8 +1191,17 @@ mod tests {
             cpu: 100_000_000,
             mem: 1_000_000,
         };
-        let outcome = eval_resolved_redeemer(&tx, &resolved, &r, &slot_cfg(), budget, None, 9)
-            .expect("triple-trace script should succeed");
+        let outcome = eval_resolved_redeemer(
+            &tx,
+            &resolved,
+            &r,
+            &slot_cfg(),
+            budget,
+            None,
+            9,
+            &mut TxInfoCache::new(),
+        )
+        .expect("triple-trace script should succeed");
         assert_eq!(
             outcome.logs,
             vec!["first", "second", "third"],
@@ -1102,8 +1217,17 @@ mod tests {
             cpu: 100_000_000,
             mem: 1_000_000,
         };
-        let err = eval_resolved_redeemer(&tx, &resolved, &r, &slot_cfg(), budget, None, 9)
-            .expect_err("trace+error script must fail");
+        let err = eval_resolved_redeemer(
+            &tx,
+            &resolved,
+            &r,
+            &slot_cfg(),
+            budget,
+            None,
+            9,
+            &mut TxInfoCache::new(),
+        )
+        .expect_err("trace+error script must fail");
         // The error variant must carry the trace log.
         match err {
             PhaseTwoError::ScriptEvaluationFailedWithLogs { logs, .. } => {

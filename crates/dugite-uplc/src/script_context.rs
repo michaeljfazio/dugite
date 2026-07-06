@@ -33,6 +33,7 @@
 
 use crate::data::Data;
 use num_bigint::BigInt;
+use std::rc::Rc;
 
 /// Plutus version being targeted by the script context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,9 +149,14 @@ pub struct TxInfoV1 {
 }
 
 /// V1 ScriptContext = `(TxInfo, ScriptPurpose)`.
+///
+/// `tx_info` is `Rc`-shared (#838): the same `TxInfoV1` is reused across
+/// every V1 redeemer in a transaction (it does not depend on which
+/// redeemer is being evaluated), so sharing it here turns what would
+/// otherwise be a per-redeemer deep clone into an O(1) refcount bump.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScriptContextV1 {
-    pub tx_info: TxInfoV1,
+    pub tx_info: Rc<TxInfoV1>,
     pub purpose: ScriptPurpose,
 }
 
@@ -174,9 +180,12 @@ pub struct TxInfoV2 {
 }
 
 /// V2 ScriptContext = `(TxInfo, ScriptPurpose)`.
+///
+/// `tx_info` is `Rc`-shared — see `ScriptContextV1::tx_info`'s doc
+/// comment (#838).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScriptContextV2 {
-    pub tx_info: TxInfoV2,
+    pub tx_info: Rc<TxInfoV2>,
     pub purpose: ScriptPurpose,
 }
 
@@ -294,9 +303,12 @@ pub struct GovActionId {
 pub struct ProposalProcedure(pub Data);
 
 /// Top-level V3 ScriptContext.
+///
+/// `tx_info` is `Rc`-shared — see `ScriptContextV1::tx_info`'s doc
+/// comment (#838).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScriptContextV3 {
-    pub tx_info: TxInfoV3,
+    pub tx_info: Rc<TxInfoV3>,
     pub redeemer: Data,
     pub script_info: ScriptInfo,
 }
@@ -1815,7 +1827,7 @@ mod tests {
     fn script_context_v1_v2_v3_all_top_constr_zero() {
         let p = ScriptPurpose::Minting([0u8; 28]);
         let v1 = ScriptContextV1 {
-            tx_info: TxInfoV1 {
+            tx_info: Rc::new(TxInfoV1 {
                 inputs: vec![],
                 outputs: vec![],
                 fee: BigInt::from(0),
@@ -1829,11 +1841,11 @@ mod tests {
                 signatories: vec![],
                 data: vec![],
                 txid: [0u8; 32],
-            },
+            }),
             purpose: p.clone(),
         };
         let v2 = ScriptContextV2 {
-            tx_info: TxInfoV2 {
+            tx_info: Rc::new(TxInfoV2 {
                 inputs: vec![],
                 reference_inputs: vec![],
                 outputs: vec![],
@@ -1849,7 +1861,7 @@ mod tests {
                 redeemers: vec![],
                 data: vec![],
                 txid: [0u8; 32],
-            },
+            }),
             purpose: p,
         };
         assert!(matches!(v1.to_data(false), Data::Constr(0, _)));

@@ -385,17 +385,24 @@ fn return_compute(
                             (idx, Vec::new(), None)
                         }
                         // Other constants (ByteString, String, Data,
-                        // BLS): not enumerable, `case` fails.
+                        // BLS): not enumerable, `case` fails. Adversary-
+                        // reachable (a gossiped script can freely construct
+                        // a `case` whose scrutinee reduces to one of
+                        // these) — a script/machine failure, not a
+                        // dugite-uplc bug (#840).
                         other => {
-                            return Err(UplcError::Internal(format!(
+                            return Err(UplcError::MachineError(format!(
                                 "case on non-enumerable constant: {:?}",
                                 std::mem::discriminant(&other)
                             )));
                         }
                     }
                 }
+                // Adversary-reachable: the scrutinee can reduce to a
+                // Lambda or Delay value, which `case` cannot dispatch on
+                // (#840, Haskell `NonConstrScrutinizedMachineError`).
                 other => {
-                    return Err(UplcError::Internal(format!(
+                    return Err(UplcError::MachineError(format!(
                         "Case scrutinee must reduce to Constr or enumerable Constant, got {:?}",
                         std::mem::discriminant(&other)
                     )));
@@ -457,8 +464,12 @@ fn apply(
             )?;
             Ok(State::Return { value: v, kont })
         }
+        // Adversary-reachable: a gossiped script's applied term can
+        // legitimately apply a non-function value (Haskell
+        // `NonFunctionalApplicationMachineError`) — a script/machine
+        // failure, not a dugite-uplc bug (#840).
         Value::Const(_) | Value::Delay { .. } | Value::Constr { .. } => {
-            Err(UplcError::Internal(format!(
+            Err(UplcError::MachineError(format!(
                 "applied non-function value: {:?}",
                 std::mem::discriminant(&function)
             )))
@@ -491,7 +502,11 @@ fn force_value(
                 }),
             }
         }
-        other => Err(UplcError::Internal(format!(
+        // Adversary-reachable: a gossiped script's applied term can
+        // legitimately `force` a non-`Delay` value (Haskell
+        // `OpenTermEvaluatedMachineError` family) — a script/machine
+        // failure, not a dugite-uplc bug (#840).
+        other => Err(UplcError::MachineError(format!(
             "force applied to non-Delay value: {:?}",
             std::mem::discriminant(&other)
         ))),
@@ -557,20 +572,20 @@ mod tests {
     #[test]
     fn force_of_non_delay_errors() {
         let bad = Term::Force(Rc::new(int_term(42)));
-        assert!(matches!(evaluate(bad), Err(UplcError::Internal(_))));
+        assert!(matches!(evaluate(bad), Err(UplcError::MachineError(_))));
     }
 
     #[test]
     fn apply_non_function_errors() {
         let bad = Term::App(Rc::new(int_term(1)), Rc::new(int_term(2)));
-        assert!(matches!(evaluate(bad), Err(UplcError::Internal(_))));
+        assert!(matches!(evaluate(bad), Err(UplcError::MachineError(_))));
     }
 
     #[test]
     fn open_term_var_errors() {
         assert!(matches!(
             evaluate(Term::Var(1)),
-            Err(UplcError::Internal(_))
+            Err(UplcError::MachineError(_))
         ));
     }
 
@@ -807,13 +822,14 @@ mod tests {
 
     #[test]
     fn case_with_bytestring_scrutinee_errors() {
-        // ByteString is not enumerable by case → Internal error.
+        // ByteString is not enumerable by case → adversary-reachable
+        // MachineError, not Internal (#840).
         use crate::term::Constant;
         let case = Term::Case {
             scrutinee: Rc::new(Term::Const(Constant::ByteString(vec![1, 2]))),
             branches: vec![Rc::new(int_term(99))],
         };
-        assert!(matches!(evaluate(case), Err(UplcError::Internal(_))));
+        assert!(matches!(evaluate(case), Err(UplcError::MachineError(_))));
     }
 
     /// #824 PV-matrix golden: `case` on a plain `Value::Const` scrutinee is
