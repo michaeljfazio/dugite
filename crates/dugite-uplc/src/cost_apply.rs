@@ -1345,6 +1345,20 @@ mod tests {
         assert_eq!((vfy.cpu, vfy.mem), (163 + 164 * 2, 165));
     }
 
+    /// #845 gap: V2 and V3 each had a wrong-length pad/truncate golden
+    /// (#826) but V1 did not. `apply_v1` shares `pad_or_truncate` with
+    /// V2/V3, so this pins the same never-reject contract for the
+    /// smallest/oldest cost-model shape.
+    #[test]
+    fn v1_wrong_length_is_padded_or_truncated_never_rejected() {
+        // A far-too-short array pads, it does not error (#826).
+        assert!(apply_v1(&[0i64; 10], 8).is_ok());
+        // Exactly V1_PARAM_COUNT (166) succeeds.
+        assert!(apply_v1(&[0i64; V1_PARAM_COUNT], 8).is_ok());
+        // A too-long array truncates rather than erroring.
+        assert!(apply_v1(&[0i64; 332], 8).is_ok());
+    }
+
     #[test]
     fn v2_wrong_length_is_padded_or_truncated_never_rejected() {
         // A far-too-short array pads, it does not error (#826).
