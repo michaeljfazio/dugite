@@ -398,4 +398,19 @@ mod tests {
         let err = parse_program(src).unwrap_err();
         assert!(err.message.contains("G2"), "msg: {}", err.message);
     }
+
+    #[test]
+    fn bls_mlresult_has_no_textual_literal() {
+        // The Haskell reference has no `Parsable`/`Read` instance for
+        // `BLS12_381.Pairing.MlResult` — it can only be produced at
+        // runtime by `bls12_381_millerLoop` / `bls12_381_mulMlResult`.
+        // A `(con bls12_381_mlresult 0x...)` literal must be a parse
+        // error, matching the reference (#843).
+        let src = format!(
+            "(program 1.0.0 (con bls12_381_mlresult 0x{}))",
+            "00".repeat(576)
+        );
+        let err = parse_program(&src).unwrap_err();
+        assert!(err.message.contains("mlresult"), "msg: {}", err.message);
+    }
 }

@@ -140,8 +140,11 @@ pub enum Constant {
     /// PlutusData — recursive sum type used by the script context.
     Data(Data),
     /// BLS12-381 G1 element. Stored compressed (48 bytes) for canonical
-    /// equality; uncompressed cache is materialised in the CEK machine
-    /// state when needed. Boxed to keep the `Constant` enum compact.
+    /// equality — there is no decompressed-point cache; every builtin
+    /// that consumes a G1 element re-decodes it from these bytes
+    /// on demand (see `crates/dugite-uplc/src/builtin/bls.rs`, and
+    /// issue #839 for the resulting redundant-work tradeoff). Boxed
+    /// to keep the `Constant` enum compact.
     Bls12_381G1Element(Box<[u8; 48]>),
     /// BLS12-381 G2 element. Stored compressed (96 bytes). Boxed.
     Bls12_381G2Element(Box<[u8; 96]>),

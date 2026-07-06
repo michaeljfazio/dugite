@@ -24,23 +24,29 @@
 #![allow(unsafe_code)]
 
 use crate::machine::value::Value;
-use crate::term::{BuiltinId, Constant};
+use crate::term::{BuiltinId, Constant, TypeTag};
 use crate::UplcError;
 use num_bigint::BigInt;
 
 use blst::{
-    blst_fp12, blst_fp12_inverse, blst_fp12_is_equal, blst_fp12_mul, blst_fp12_one,
-    blst_hash_to_g1, blst_hash_to_g2, blst_miller_loop, blst_p1, blst_p1_add_or_double,
-    blst_p1_affine, blst_p1_cneg, blst_p1_compress, blst_p1_from_affine, blst_p1_in_g1,
-    blst_p1_is_equal, blst_p1_mult, blst_p1_to_affine, blst_p1_uncompress, blst_p2,
-    blst_p2_add_or_double, blst_p2_affine, blst_p2_cneg, blst_p2_compress, blst_p2_from_affine,
-    blst_p2_in_g2, blst_p2_is_equal, blst_p2_mult, blst_p2_to_affine, blst_p2_uncompress,
-    BLST_ERROR,
+    blst_fp12, blst_fp12_finalverify, blst_fp12_mul, blst_hash_to_g1, blst_hash_to_g2,
+    blst_miller_loop, blst_p1, blst_p1_add_or_double, blst_p1_affine, blst_p1_cneg,
+    blst_p1_compress, blst_p1_from_affine, blst_p1_in_g1, blst_p1_is_equal, blst_p1_mult,
+    blst_p1_to_affine, blst_p1_uncompress, blst_p2, blst_p2_add_or_double, blst_p2_affine,
+    blst_p2_cneg, blst_p2_compress, blst_p2_from_affine, blst_p2_in_g2, blst_p2_is_equal,
+    blst_p2_mult, blst_p2_to_affine, blst_p2_uncompress, BLST_ERROR,
 };
 
 pub const G1_COMPRESSED_BYTES: usize = 48;
 pub const G2_COMPRESSED_BYTES: usize = 96;
 const FP12_BYTES: usize = 576;
+
+// `fp12_to_bytes`/`fp12_from_bytes` below memcpy `FP12_BYTES` raw bytes
+// in/out of a `blst_fp12` through a pointer cast, with no per-call size
+// check. Pin the assumed layout at compile time (#843): if a future
+// `blst` bump ever changed `blst_fp12`'s size, this turns what would
+// otherwise be a stack buffer overflow into a compile error.
+const _: () = assert!(std::mem::size_of::<blst_fp12>() == FP12_BYTES);
 
 /// Validate a 48-byte BLS12-381 G1 compressed encoding without
 /// materialising a `Value`.  Used by the textual parser to reject
@@ -172,7 +178,7 @@ fn g1_scalar_mul(args: Vec<Value>, id: BuiltinId) -> Result<Value, UplcError> {
     let mut it = args.into_iter();
     let s = unwrap_integer_for_bls(it.next(), id)?;
     let p_bytes = unwrap_g1_bytes(it.next(), id)?;
-    let p = uncompress_g1(&p_bytes, id)?;
+    let p = decompress_g1_trusted(&p_bytes, id)?;
     let scalar = bigint_to_blst_scalar(&s);
     let mut out = blst_p1::default();
     // SAFETY: `out`, `p` are valid `blst_p1`; `scalar` is a 32-byte
@@ -244,10 +250,15 @@ fn g1_uncompress(args: Vec<Value>, id: BuiltinId) -> Result<Value, UplcError> {
             ),
         });
     }
-    let p = uncompress_g1(&bs, id)?;
-    Ok(Value::Const(Constant::Bls12_381G1Element(Box::new(
-        compress_g1(&p),
-    ))))
+    // `uncompress_g1` validates encoding + subgroup membership; blst's
+    // compressed form is canonical, so the (already-checked) input
+    // bytes are byte-identical to `compress_g1(&p)` — return `bs`
+    // directly rather than paying for a redundant re-compression on
+    // this hot builtin (#843).
+    uncompress_g1(&bs, id)?;
+    let mut arr = [0u8; G1_COMPRESSED_BYTES];
+    arr.copy_from_slice(&bs);
+    Ok(Value::Const(Constant::Bls12_381G1Element(Box::new(arr))))
 }
 
 // ---------------------------------------------------------------------------
@@ -288,7 +299,7 @@ fn g2_scalar_mul(args: Vec<Value>, id: BuiltinId) -> Result<Value, UplcError> {
     let mut it = args.into_iter();
     let s = unwrap_integer_for_bls(it.next(), id)?;
     let p_bytes = unwrap_g2_bytes(it.next(), id)?;
-    let p = uncompress_g2(&p_bytes, id)?;
+    let p = decompress_g2_trusted(&p_bytes, id)?;
     let scalar = bigint_to_blst_scalar(&s);
     let mut out = blst_p2::default();
     unsafe { blst_p2_mult(&mut out, &p, scalar.as_ptr(), scalar.len() * 8) };
@@ -348,10 +359,13 @@ fn g2_uncompress(args: Vec<Value>, id: BuiltinId) -> Result<Value, UplcError> {
             ),
         });
     }
-    let p = uncompress_g2(&bs, id)?;
-    Ok(Value::Const(Constant::Bls12_381G2Element(Box::new(
-        compress_g2(&p),
-    ))))
+    // See `g1_uncompress`: canonical compressed form means the
+    // already-validated input bytes are byte-identical to
+    // `compress_g2(&p)` — avoid the redundant re-compression (#843).
+    uncompress_g2(&bs, id)?;
+    let mut arr = [0u8; G2_COMPRESSED_BYTES];
+    arr.copy_from_slice(&bs);
+    Ok(Value::Const(Constant::Bls12_381G2Element(Box::new(arr))))
 }
 
 // ---------------------------------------------------------------------------
@@ -362,8 +376,8 @@ fn miller_loop(args: Vec<Value>, id: BuiltinId) -> Result<Value, UplcError> {
     let mut it = args.into_iter();
     let g1_bytes = unwrap_g1_bytes(it.next(), id)?;
     let g2_bytes = unwrap_g2_bytes(it.next(), id)?;
-    let g1 = uncompress_g1(&g1_bytes, id)?;
-    let g2 = uncompress_g2(&g2_bytes, id)?;
+    let g1 = decompress_g1_trusted(&g1_bytes, id)?;
+    let g2 = decompress_g2_trusted(&g2_bytes, id)?;
     let mut g1_aff = blst_p1_affine::default();
     let mut g2_aff = blst_p2_affine::default();
     unsafe {
@@ -391,33 +405,26 @@ fn mul_ml(args: Vec<Value>, id: BuiltinId) -> Result<Value, UplcError> {
 }
 
 fn final_verify(args: Vec<Value>, id: BuiltinId) -> Result<Value, UplcError> {
-    // FinalVerify(a, b) = (a * b^-1) ^ ((q^12 - 1)/r) == 1
+    // FinalVerify(a, b) == (finalExp(a) == finalExp(b)).
+    //
+    // `blst_fp12_finalverify` computes this directly (internally via
+    // conjugation rather than a full inverse, so it is also cheaper
+    // than the manual `a * b^-1; final_exp; is_equal` sequence this
+    // used to do). Using it also removes a latent aliasing hazard
+    // (#843): the previous code passed `&mut combined` and `&combined`
+    // to `blst_final_exp` in the same call — overlapping mutable/shared
+    // references to the same place, which is Stacked-Borrows UB even
+    // though blst's C implementation happens to copy its input before
+    // writing the output.
     let mut it = args.into_iter();
     let a = unwrap_ml_bytes(it.next(), id)?;
     let b = unwrap_ml_bytes(it.next(), id)?;
     let a_fp = fp12_from_bytes(&a)?;
     let b_fp = fp12_from_bytes(&b)?;
-    let mut b_inv = blst_fp12::default();
-    unsafe { blst_fp12_inverse(&mut b_inv, &b_fp) };
-    let mut combined = blst_fp12::default();
-    unsafe { blst_fp12_mul(&mut combined, &a_fp, &b_inv) };
-    // Final exponentiation
-    let final_exp = unsafe {
-        // blst exposes `blst_final_exp` which takes &mut blst_fp12 in-place
-        blst::blst_final_exp(
-            &mut combined as *mut blst_fp12,
-            &combined as *const blst_fp12,
-        );
-        let one = blst_fp12_one_value();
-        blst_fp12_is_equal(&combined, &one)
-    };
+    // SAFETY: `a_fp`/`b_fp` are fully-initialised `blst_fp12` values;
+    // `blst_fp12_finalverify` only reads through the given pointers.
+    let final_exp = unsafe { blst_fp12_finalverify(&a_fp, &b_fp) };
     Ok(Value::Const(Constant::Bool(final_exp)))
-}
-
-fn blst_fp12_one_value() -> blst_fp12 {
-    // SAFETY: blst_fp12_one returns a static pointer to the
-    // multiplicative identity in Fp12. Dereference once + copy.
-    unsafe { *blst_fp12_one() }
 }
 
 // ---------------------------------------------------------------------------
@@ -452,6 +459,45 @@ fn uncompress_g1(bs: &[u8], id: BuiltinId) -> Result<blst_p1, UplcError> {
             reason: "G1 point not in prime-order subgroup".into(),
         });
     }
+    Ok(p)
+}
+
+/// Decompress G1 bytes that are already known-valid by construction —
+/// i.e. extracted from a `Constant::Bls12_381G1Element`, never a raw
+/// caller-supplied `ByteString` (see #816: `unwrap_g1_bytes` no longer
+/// accepts `ByteString`). A `Bls12_381G1Element` can only come into
+/// existence via a path that already performed the full subgroup check
+/// (`uncompress_g1` for the `bls12_381_G1_uncompress` builtin, the
+/// textual parser's `validate_g1_compressed`, `blst_hash_to_g1`'s
+/// RFC 9380 output, which lands in-subgroup by construction, or group
+/// arithmetic on already-valid points, which is closed under the
+/// subgroup) — flat decode of a bare G1 constant is rejected outright
+/// (no Haskell `Flat` instance exists for it). Re-running
+/// `blst_p1_in_g1` here is therefore pure redundant work (#839): it
+/// still decodes the compressed encoding (required, since `Constant`
+/// stores only compressed bytes) but skips the expensive subgroup
+/// re-check.
+fn decompress_g1_trusted(bs: &[u8], id: BuiltinId) -> Result<blst_p1, UplcError> {
+    debug_assert_eq!(
+        bs.len(),
+        G1_COMPRESSED_BYTES,
+        "decompress_g1_trusted must only be called on bytes taken from a \
+         Bls12_381G1Element, which is always exactly G1_COMPRESSED_BYTES long"
+    );
+    let mut aff = blst_p1_affine::default();
+    let err = unsafe { blst_p1_uncompress(&mut aff, bs.as_ptr()) };
+    if err != BLST_ERROR::BLST_SUCCESS {
+        // Should be unreachable: bytes came from an already-typed,
+        // already-validated G1 element. Fail closed rather than panic.
+        return Err(UplcError::Internal(format!(
+            "{}: internal invariant violated — already-validated G1 element \
+             failed to decode: {:?}",
+            id.name(),
+            err
+        )));
+    }
+    let mut p = blst_p1::default();
+    unsafe { blst_p1_from_affine(&mut p, &aff) };
     Ok(p)
 }
 
@@ -491,6 +537,30 @@ fn uncompress_g2(bs: &[u8], id: BuiltinId) -> Result<blst_p2, UplcError> {
     Ok(p)
 }
 
+/// Decompress G2 bytes that are already known-valid by construction.
+/// See [`decompress_g1_trusted`] — the same invariant holds for G2.
+fn decompress_g2_trusted(bs: &[u8], id: BuiltinId) -> Result<blst_p2, UplcError> {
+    debug_assert_eq!(
+        bs.len(),
+        G2_COMPRESSED_BYTES,
+        "decompress_g2_trusted must only be called on bytes taken from a \
+         Bls12_381G2Element, which is always exactly G2_COMPRESSED_BYTES long"
+    );
+    let mut aff = blst_p2_affine::default();
+    let err = unsafe { blst_p2_uncompress(&mut aff, bs.as_ptr()) };
+    if err != BLST_ERROR::BLST_SUCCESS {
+        return Err(UplcError::Internal(format!(
+            "{}: internal invariant violated — already-validated G2 element \
+             failed to decode: {:?}",
+            id.name(),
+            err
+        )));
+    }
+    let mut p = blst_p2::default();
+    unsafe { blst_p2_from_affine(&mut p, &aff) };
+    Ok(p)
+}
+
 fn compress_g2(p: &blst_p2) -> [u8; G2_COMPRESSED_BYTES] {
     let mut out = [0u8; G2_COMPRESSED_BYTES];
     unsafe { blst_p2_compress(out.as_mut_ptr(), p) };
@@ -521,12 +591,23 @@ fn fp12_from_bytes(bs: &[u8; FP12_BYTES]) -> Result<blst_fp12, UplcError> {
     Ok(out)
 }
 
-/// BLS12-381 scalar-field modulus r (hex).
-const BLS_R_HEX: &str = "73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001";
+/// BLS12-381 scalar-field modulus `r`, as big-endian bytes:
+/// `0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001`.
+const BLS_R_BE_BYTES: [u8; 32] = [
+    0x73, 0xed, 0xa7, 0x53, 0x29, 0x9d, 0x7d, 0x48, 0x33, 0x39, 0xd8, 0x08, 0x09, 0xa1, 0xd8, 0x05,
+    0x53, 0xbd, 0xa4, 0x02, 0xff, 0xfe, 0x5b, 0xfe, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01,
+];
 
 /// Returns the scalar-field modulus `r` as a `BigInt`.
 fn bls_scalar_r() -> BigInt {
-    BigInt::parse_bytes(BLS_R_HEX.as_bytes(), 16).unwrap_or_else(|| BigInt::from(1))
+    // Built from a fixed byte array rather than parsed from a hex
+    // string at runtime (#843): the previous
+    // `BigInt::parse_bytes(..).unwrap_or_else(|| BigInt::from(1))`
+    // fallback was a live footgun — r=1 would silently reduce every
+    // scalar to 0 (`n % 1 == 0`), turning every scalarMul/MSM into the
+    // identity instead of erroring loudly. A byte-array construction
+    // cannot fail, so there is no fallback path left to get wrong.
+    BigInt::from_bytes_be(num_bigint::Sign::Plus, &BLS_R_BE_BYTES)
 }
 
 /// Check that a MSM scalar is within the valid Plutus range.
@@ -592,36 +673,41 @@ fn bigint_to_blst_scalar(n: &BigInt) -> [u8; 32] {
 
 fn take_one_g1(args: Vec<Value>, id: BuiltinId) -> Result<blst_p1, UplcError> {
     let bytes = unwrap_g1_bytes(args.into_iter().next(), id)?;
-    uncompress_g1(&bytes, id)
+    decompress_g1_trusted(&bytes, id)
 }
 
 fn take_two_g1(args: Vec<Value>, id: BuiltinId) -> Result<(blst_p1, blst_p1), UplcError> {
     let mut it = args.into_iter();
     let a_bytes = unwrap_g1_bytes(it.next(), id)?;
     let b_bytes = unwrap_g1_bytes(it.next(), id)?;
-    Ok((uncompress_g1(&a_bytes, id)?, uncompress_g1(&b_bytes, id)?))
+    Ok((
+        decompress_g1_trusted(&a_bytes, id)?,
+        decompress_g1_trusted(&b_bytes, id)?,
+    ))
 }
 
 fn take_one_g2(args: Vec<Value>, id: BuiltinId) -> Result<blst_p2, UplcError> {
     let bytes = unwrap_g2_bytes(args.into_iter().next(), id)?;
-    uncompress_g2(&bytes, id)
+    decompress_g2_trusted(&bytes, id)
 }
 
 fn take_two_g2(args: Vec<Value>, id: BuiltinId) -> Result<(blst_p2, blst_p2), UplcError> {
     let mut it = args.into_iter();
     let a_bytes = unwrap_g2_bytes(it.next(), id)?;
     let b_bytes = unwrap_g2_bytes(it.next(), id)?;
-    Ok((uncompress_g2(&a_bytes, id)?, uncompress_g2(&b_bytes, id)?))
+    Ok((
+        decompress_g2_trusted(&a_bytes, id)?,
+        decompress_g2_trusted(&b_bytes, id)?,
+    ))
 }
 
 fn unwrap_g1_bytes(v: Option<Value>, id: BuiltinId) -> Result<Vec<u8>, UplcError> {
     match v {
         Some(Value::Const(Constant::Bls12_381G1Element(boxed))) => Ok(boxed.to_vec()),
-        Some(Value::Const(Constant::ByteString(b))) => Ok(b),
         Some(other) => Err(UplcError::BuiltinTypeError {
             builtin: id.name(),
             reason: format!(
-                "expected G1 element or ByteString, got {:?}",
+                "expected G1 element, got {:?}",
                 std::mem::discriminant(&other)
             ),
         }),
@@ -635,11 +721,10 @@ fn unwrap_g1_bytes(v: Option<Value>, id: BuiltinId) -> Result<Vec<u8>, UplcError
 fn unwrap_g2_bytes(v: Option<Value>, id: BuiltinId) -> Result<Vec<u8>, UplcError> {
     match v {
         Some(Value::Const(Constant::Bls12_381G2Element(boxed))) => Ok(boxed.to_vec()),
-        Some(Value::Const(Constant::ByteString(b))) => Ok(b),
         Some(other) => Err(UplcError::BuiltinTypeError {
             builtin: id.name(),
             reason: format!(
-                "expected G2 element or ByteString, got {:?}",
+                "expected G2 element, got {:?}",
                 std::mem::discriminant(&other)
             ),
         }),
@@ -688,8 +773,17 @@ fn unwrap_bytes(v: Option<Value>, id: BuiltinId) -> Result<Vec<u8>, UplcError> {
 /// `bls12_381_G2_multiScalarMul` (PV1.1.0).
 ///
 /// Computes `Σᵢ sᵢ·Pᵢ` (multi-scalar multiplication = sum of scalar
-/// multiples of group elements). The two lists must have equal length;
-/// mismatched lengths are a `BuiltinFailure`.
+/// multiples of group elements).
+///
+/// Per the Haskell reference (`PlutusCore.Crypto.BLS12_381.G1.multiScalarMul`
+/// / `G2.multiScalarMul`, which is a bare `zip ss ps` with no length-equality
+/// check, feeding `Cardano.Crypto.EllipticCurve.BLS12_381.Internal.blsMSM`):
+/// the two lists are **not** required to have equal length — extra entries
+/// in the longer list are silently ignored (`zip` truncates to the shorter
+/// list), and `[] `×`[]` succeeds, returning the group identity. Confirmed
+/// against the upstream conformance corpus (`multiScalarMul-08`: literal
+/// `[] []` → identity; `multiScalarMul-09a`/`10a`: a longer scalar list
+/// with "extra entries ... ignored").
 pub fn denote_multi_scalar_mul(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
     use BuiltinId::*;
     let mut it = args.into_iter();
@@ -700,21 +794,40 @@ pub fn denote_multi_scalar_mul(id: BuiltinId, args: Vec<Value>) -> Result<Value,
         .next()
         .ok_or_else(|| UplcError::Internal(format!("{}: missing points list arg", id.name())))?;
 
-    // Unwrap the scalar list (ProtoList Integer).
+    // Unwrap the scalar list (ProtoList Integer). Haskell's `readKnown`
+    // for `[Integer]` checks the list's *declared* element-type witness
+    // (`geqL` on the `DefaultUni` type tag embedded at parse/decode
+    // time) against the expected type — independent of the list's
+    // contents, and independent of whether it is empty (#827). A list
+    // declared `(list bool) []` must fail here exactly like a non-empty
+    // wrongly-typed list would, rather than unlifting as `[]`.
     let scalars: Vec<BigInt> = match scalars_val {
-        Value::Const(crate::term::Constant::ProtoList { elements, .. }) => elements
-            .into_iter()
-            .map(|c| match c {
-                crate::term::Constant::Integer(i) => Ok(i),
-                other => Err(UplcError::BuiltinTypeError {
+        Value::Const(Constant::ProtoList {
+            elem_type,
+            elements,
+        }) => {
+            if elem_type != TypeTag::Integer {
+                return Err(UplcError::BuiltinTypeError {
                     builtin: id.name(),
                     reason: format!(
-                        "scalar list must contain Integers, got {:?}",
-                        std::mem::discriminant(&other)
+                        "expected (list integer) for scalars, got (list {elem_type:?})"
                     ),
-                }),
-            })
-            .collect::<Result<_, _>>()?,
+                });
+            }
+            elements
+                .into_iter()
+                .map(|c| match c {
+                    Constant::Integer(i) => Ok(i),
+                    other => Err(UplcError::BuiltinTypeError {
+                        builtin: id.name(),
+                        reason: format!(
+                            "scalar list must contain Integers, got {:?}",
+                            std::mem::discriminant(&other)
+                        ),
+                    }),
+                })
+                .collect::<Result<_, _>>()?
+        }
         other => {
             return Err(UplcError::BuiltinTypeError {
                 builtin: id.name(),
@@ -728,21 +841,35 @@ pub fn denote_multi_scalar_mul(id: BuiltinId, args: Vec<Value>) -> Result<Value,
 
     match id {
         Bls12_381_G1_MultiScalarMul => {
-            // Unwrap the G1 point list.
+            // Unwrap the G1 point list. Same declared-elem_type check as
+            // the scalar list above (#827) — including for an empty list.
             let points_bytes: Vec<Vec<u8>> = match points_val {
-                Value::Const(crate::term::Constant::ProtoList { elements, .. }) => elements
-                    .into_iter()
-                    .map(|c| match c {
-                        crate::term::Constant::Bls12_381G1Element(boxed) => Ok(boxed.to_vec()),
-                        other => Err(UplcError::BuiltinTypeError {
+                Value::Const(Constant::ProtoList {
+                    elem_type,
+                    elements,
+                }) => {
+                    if elem_type != TypeTag::Bls12_381G1Element {
+                        return Err(UplcError::BuiltinTypeError {
                             builtin: id.name(),
                             reason: format!(
-                                "G1 list must contain G1 elements, got {:?}",
-                                std::mem::discriminant(&other)
+                                "expected (list bls12_381_G1_element) for points, got (list {elem_type:?})"
                             ),
-                        }),
-                    })
-                    .collect::<Result<_, _>>()?,
+                        });
+                    }
+                    elements
+                        .into_iter()
+                        .map(|c| match c {
+                            Constant::Bls12_381G1Element(boxed) => Ok(boxed.to_vec()),
+                            other => Err(UplcError::BuiltinTypeError {
+                                builtin: id.name(),
+                                reason: format!(
+                                    "G1 list must contain G1 elements, got {:?}",
+                                    std::mem::discriminant(&other)
+                                ),
+                            }),
+                        })
+                        .collect::<Result<_, _>>()?
+                }
                 other => {
                     return Err(UplcError::BuiltinTypeError {
                         builtin: id.name(),
@@ -767,7 +894,7 @@ pub fn denote_multi_scalar_mul(id: BuiltinId, args: Vec<Value>) -> Result<Value,
                         reason: "scalar is out of range (|s| >= r)".to_string(),
                     });
                 }
-                let p = uncompress_g1(&p_bytes, id)?;
+                let p = decompress_g1_trusted(&p_bytes, id)?;
                 let scalar = bigint_to_blst_scalar(&s);
                 let mut term = blst_p1::default();
                 // SAFETY: `term`, `p` are valid blst_p1; scalar is 32
@@ -778,20 +905,34 @@ pub fn denote_multi_scalar_mul(id: BuiltinId, args: Vec<Value>) -> Result<Value,
             Ok(g1_to_value(&acc))
         }
         Bls12_381_G2_MultiScalarMul => {
+            // Same declared-elem_type check as G1 above (#827).
             let points_bytes: Vec<Vec<u8>> = match points_val {
-                Value::Const(crate::term::Constant::ProtoList { elements, .. }) => elements
-                    .into_iter()
-                    .map(|c| match c {
-                        crate::term::Constant::Bls12_381G2Element(boxed) => Ok(boxed.to_vec()),
-                        other => Err(UplcError::BuiltinTypeError {
+                Value::Const(Constant::ProtoList {
+                    elem_type,
+                    elements,
+                }) => {
+                    if elem_type != TypeTag::Bls12_381G2Element {
+                        return Err(UplcError::BuiltinTypeError {
                             builtin: id.name(),
                             reason: format!(
-                                "G2 list must contain G2 elements, got {:?}",
-                                std::mem::discriminant(&other)
+                                "expected (list bls12_381_G2_element) for points, got (list {elem_type:?})"
                             ),
-                        }),
-                    })
-                    .collect::<Result<_, _>>()?,
+                        });
+                    }
+                    elements
+                        .into_iter()
+                        .map(|c| match c {
+                            Constant::Bls12_381G2Element(boxed) => Ok(boxed.to_vec()),
+                            other => Err(UplcError::BuiltinTypeError {
+                                builtin: id.name(),
+                                reason: format!(
+                                    "G2 list must contain G2 elements, got {:?}",
+                                    std::mem::discriminant(&other)
+                                ),
+                            }),
+                        })
+                        .collect::<Result<_, _>>()?
+                }
                 other => {
                     return Err(UplcError::BuiltinTypeError {
                         builtin: id.name(),
@@ -811,7 +952,7 @@ pub fn denote_multi_scalar_mul(id: BuiltinId, args: Vec<Value>) -> Result<Value,
                         reason: "scalar is out of range (|s| >= r)".to_string(),
                     });
                 }
-                let p = uncompress_g2(&p_bytes, id)?;
+                let p = decompress_g2_trusted(&p_bytes, id)?;
                 let scalar = bigint_to_blst_scalar(&s);
                 let mut term = blst_p2::default();
                 unsafe { blst_p2_mult(&mut term, &p, scalar.as_ptr(), scalar.len() * 8) };
@@ -970,5 +1111,286 @@ mod tests {
         let ml2 = denote_bls(BuiltinId::Bls12_381_MillerLoop, vec![g1, g2]).unwrap();
         let verify = denote_bls(BuiltinId::Bls12_381_FinalVerify, vec![ml, ml2]).unwrap();
         assert_eq!(verify, Value::Const(Constant::Bool(true)));
+    }
+
+    #[test]
+    fn final_verify_returns_false_for_non_matching_pairing() {
+        // e(hash("a"), hash("c")) != e(hash("b"), hash("c")) for a != b.
+        // Regression for #843: `final_verify` now calls
+        // `blst_fp12_finalverify` directly instead of the old manual
+        // inverse+mul+final_exp+is_equal sequence — confirm it still
+        // distinguishes non-matching pairings, not just matching ones.
+        let g1a = denote_bls(
+            BuiltinId::Bls12_381_G1_HashToGroup,
+            vec![bs(b"a"), bs(b"dst")],
+        )
+        .unwrap();
+        let g1b = denote_bls(
+            BuiltinId::Bls12_381_G1_HashToGroup,
+            vec![bs(b"b"), bs(b"dst")],
+        )
+        .unwrap();
+        let g2 = denote_bls(
+            BuiltinId::Bls12_381_G2_HashToGroup,
+            vec![bs(b"c"), bs(b"dst")],
+        )
+        .unwrap();
+        let ml_a = denote_bls(BuiltinId::Bls12_381_MillerLoop, vec![g1a, g2.clone()]).unwrap();
+        let ml_b = denote_bls(BuiltinId::Bls12_381_MillerLoop, vec![g1b, g2]).unwrap();
+        let verify = denote_bls(BuiltinId::Bls12_381_FinalVerify, vec![ml_a, ml_b]).unwrap();
+        assert_eq!(verify, Value::Const(Constant::Bool(false)));
+    }
+
+    // ── #816: G1/G2 group-consuming builtins must reject a raw
+    // ByteString where a group element is required ──────────────────
+
+    fn valid_g1_point_bytes() -> [u8; G1_COMPRESSED_BYTES] {
+        let v = denote_bls(
+            BuiltinId::Bls12_381_G1_HashToGroup,
+            vec![bs(b"816-g1"), bs(b"dst")],
+        )
+        .unwrap();
+        match v {
+            Value::Const(Constant::Bls12_381G1Element(b)) => *b,
+            _ => panic!("expected G1 element"),
+        }
+    }
+
+    fn valid_g2_point_bytes() -> [u8; G2_COMPRESSED_BYTES] {
+        let v = denote_bls(
+            BuiltinId::Bls12_381_G2_HashToGroup,
+            vec![bs(b"816-g2"), bs(b"dst")],
+        )
+        .unwrap();
+        match v {
+            Value::Const(Constant::Bls12_381G2Element(b)) => *b,
+            _ => panic!("expected G2 element"),
+        }
+    }
+
+    fn assert_type_error(result: Result<Value, UplcError>) {
+        match result {
+            Err(UplcError::BuiltinTypeError { .. }) => {}
+            other => panic!("expected BuiltinTypeError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn g1_builtins_reject_bytestring_in_place_of_element() {
+        // A `Constant::ByteString` holding a *valid* compressed G1
+        // point must still be rejected by every builtin that consumes
+        // a G1 element — Haskell's `readKnown` distinguishes the types
+        // at the unlifting boundary regardless of the byte payload.
+        let raw = valid_g1_point_bytes();
+        let as_bs = || bs(&raw);
+
+        assert_type_error(denote_bls(
+            BuiltinId::Bls12_381_G1_Add,
+            vec![as_bs(), as_bs()],
+        ));
+        assert_type_error(denote_bls(BuiltinId::Bls12_381_G1_Neg, vec![as_bs()]));
+        assert_type_error(denote_bls(
+            BuiltinId::Bls12_381_G1_ScalarMul,
+            vec![Value::Const(Constant::Integer(BigInt::from(3))), as_bs()],
+        ));
+        assert_type_error(denote_bls(
+            BuiltinId::Bls12_381_G1_Equal,
+            vec![as_bs(), as_bs()],
+        ));
+        assert_type_error(denote_bls(BuiltinId::Bls12_381_G1_Compress, vec![as_bs()]));
+
+        let g2 = denote_bls(
+            BuiltinId::Bls12_381_G2_HashToGroup,
+            vec![bs(b"pair"), bs(b"dst")],
+        )
+        .unwrap();
+        assert_type_error(denote_bls(
+            BuiltinId::Bls12_381_MillerLoop,
+            vec![as_bs(), g2],
+        ));
+    }
+
+    #[test]
+    fn g2_builtins_reject_bytestring_in_place_of_element() {
+        let raw = valid_g2_point_bytes();
+        let as_bs = || bs(&raw);
+
+        assert_type_error(denote_bls(
+            BuiltinId::Bls12_381_G2_Add,
+            vec![as_bs(), as_bs()],
+        ));
+        assert_type_error(denote_bls(BuiltinId::Bls12_381_G2_Neg, vec![as_bs()]));
+        assert_type_error(denote_bls(
+            BuiltinId::Bls12_381_G2_ScalarMul,
+            vec![Value::Const(Constant::Integer(BigInt::from(3))), as_bs()],
+        ));
+        assert_type_error(denote_bls(
+            BuiltinId::Bls12_381_G2_Equal,
+            vec![as_bs(), as_bs()],
+        ));
+        assert_type_error(denote_bls(BuiltinId::Bls12_381_G2_Compress, vec![as_bs()]));
+
+        let g1 = denote_bls(
+            BuiltinId::Bls12_381_G1_HashToGroup,
+            vec![bs(b"pair"), bs(b"dst")],
+        )
+        .unwrap();
+        assert_type_error(denote_bls(
+            BuiltinId::Bls12_381_MillerLoop,
+            vec![g1, as_bs()],
+        ));
+    }
+
+    // ── #827: multiScalarMul must check the declared list elem_type,
+    // including for empty lists; length mismatch truncates (zip) ────
+
+    #[test]
+    fn msm_g1_rejects_wrong_typed_empty_scalar_list() {
+        // `(list bool) []` fed where `[Integer]` is expected must fail
+        // even though the list is empty — matching Haskell's `geqL`
+        // universe-tag check, which never inspects list contents.
+        let bad_scalars = Value::Const(Constant::ProtoList {
+            elem_type: TypeTag::Bool,
+            elements: vec![],
+        });
+        let points = Value::Const(Constant::ProtoList {
+            elem_type: TypeTag::Bls12_381G1Element,
+            elements: vec![],
+        });
+        let err = denote_multi_scalar_mul(
+            BuiltinId::Bls12_381_G1_MultiScalarMul,
+            vec![bad_scalars, points],
+        )
+        .unwrap_err();
+        assert!(matches!(err, UplcError::BuiltinTypeError { .. }));
+    }
+
+    #[test]
+    fn msm_g1_rejects_wrong_typed_empty_points_list() {
+        // An empty G2-element list fed where `[G1.Element]` is
+        // expected must fail (wrong group), not silently unlift as `[]`.
+        let scalars = Value::Const(Constant::ProtoList {
+            elem_type: TypeTag::Integer,
+            elements: vec![],
+        });
+        let bad_points = Value::Const(Constant::ProtoList {
+            elem_type: TypeTag::Bls12_381G2Element,
+            elements: vec![],
+        });
+        let err = denote_multi_scalar_mul(
+            BuiltinId::Bls12_381_G1_MultiScalarMul,
+            vec![scalars, bad_points],
+        )
+        .unwrap_err();
+        assert!(matches!(err, UplcError::BuiltinTypeError { .. }));
+    }
+
+    #[test]
+    fn msm_g2_rejects_wrong_typed_empty_points_list() {
+        let scalars = Value::Const(Constant::ProtoList {
+            elem_type: TypeTag::Integer,
+            elements: vec![],
+        });
+        let bad_points = Value::Const(Constant::ProtoList {
+            elem_type: TypeTag::Bls12_381G1Element,
+            elements: vec![],
+        });
+        let err = denote_multi_scalar_mul(
+            BuiltinId::Bls12_381_G2_MultiScalarMul,
+            vec![scalars, bad_points],
+        )
+        .unwrap_err();
+        assert!(matches!(err, UplcError::BuiltinTypeError { .. }));
+    }
+
+    #[test]
+    fn msm_g1_empty_times_empty_is_identity() {
+        // Correctly-typed empty lists must still succeed, returning the
+        // G1 identity — Haskell's `blsMSM (zip [] [])` = `blsZero`.
+        let scalars = Value::Const(Constant::ProtoList {
+            elem_type: TypeTag::Integer,
+            elements: vec![],
+        });
+        let points = Value::Const(Constant::ProtoList {
+            elem_type: TypeTag::Bls12_381G1Element,
+            elements: vec![],
+        });
+        let result = denote_multi_scalar_mul(
+            BuiltinId::Bls12_381_G1_MultiScalarMul,
+            vec![scalars, points],
+        )
+        .unwrap();
+        match result {
+            Value::Const(Constant::Bls12_381G1Element(b)) => {
+                assert_eq!(b[0], 0xc0);
+                assert!(b[1..].iter().all(|&x| x == 0));
+            }
+            other => panic!("expected G1 element, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn msm_g1_mismatched_lengths_truncate_to_shorter_zip() {
+        // Haskell's denotation is a bare `zip ss ps` with no length
+        // check (confirmed against PlutusCore.Crypto.BLS12_381.G1 via
+        // the cardano-haskell-oracle, and the upstream conformance
+        // vectors multiScalarMul-08/09a/10a): extra entries in the
+        // longer list are silently dropped. A 2-scalar / 1-point call
+        // must equal `scalarMul(scalars[0], points[0])`.
+        let p0 = denote_bls(
+            BuiltinId::Bls12_381_G1_HashToGroup,
+            vec![bs(b"msm-p0"), bs(b"dst")],
+        )
+        .unwrap();
+        let p0_bytes = match &p0 {
+            Value::Const(Constant::Bls12_381G1Element(b)) => **b,
+            _ => panic!("expected G1 element"),
+        };
+
+        let scalars = Value::Const(Constant::ProtoList {
+            elem_type: TypeTag::Integer,
+            elements: vec![
+                Constant::Integer(BigInt::from(7)),
+                // No matching point for this second scalar — must be
+                // ignored, not cause a BuiltinFailure.
+                Constant::Integer(BigInt::from(99)),
+            ],
+        });
+        let points = Value::Const(Constant::ProtoList {
+            elem_type: TypeTag::Bls12_381G1Element,
+            elements: vec![Constant::Bls12_381G1Element(Box::new(p0_bytes))],
+        });
+        let msm_result = denote_multi_scalar_mul(
+            BuiltinId::Bls12_381_G1_MultiScalarMul,
+            vec![scalars, points],
+        )
+        .unwrap();
+
+        let expected = denote_bls(
+            BuiltinId::Bls12_381_G1_ScalarMul,
+            vec![Value::Const(Constant::Integer(BigInt::from(7))), p0],
+        )
+        .unwrap();
+
+        assert_eq!(msm_result, expected);
+    }
+
+    // ── #843: bls_scalar_r must be the real BLS12-381 scalar-field
+    // modulus, not the unreachable-but-dangerous fallback ────────────
+
+    #[test]
+    fn bls_scalar_r_matches_known_modulus() {
+        let r = bls_scalar_r();
+        let expected = BigInt::parse_bytes(
+            b"52435875175126190479447740508185965837690552500527637822603658699938581184513",
+            10,
+        )
+        .unwrap();
+        assert_eq!(r, expected);
+    }
+
+    #[test]
+    fn fp12_size_matches_blst_layout() {
+        assert_eq!(std::mem::size_of::<blst_fp12>(), FP12_BYTES);
     }
 }
