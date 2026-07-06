@@ -723,7 +723,7 @@ fn decode_constant_value(r: &mut BitReader<'_>, tag: &TypeTag) -> FlatResult<Con
             let d = Data::from_cbor(&raw).map_err(|e| {
                 UplcError::FlatDecode(format!("Data constant: CBOR decode failed: {e}"))
             })?;
-            Ok(Constant::Data(d))
+            Ok(Constant::Data(std::rc::Rc::new(d)))
         }
         TypeTag::List(elem_type) => {
             // A list constant is a flat cons-list: each element is preceded

@@ -73,7 +73,7 @@ fn cek_reaches_body_no_var_lookup_failure() {
     );
     let applied = Term::App(
         Rc::new(p.term),
-        Rc::new(Term::Const(Constant::Data(stub_ctx))),
+        Rc::new(Term::Const(Constant::Data(stub_ctx.into()))),
     );
 
     let err = dugite_uplc::machine::step::evaluate(applied).expect_err(

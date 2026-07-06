@@ -74,6 +74,39 @@ mod tests {
         assert!(!Value::Const(Constant::Bool(true)).is_unit());
     }
 
+    /// #838 Fix 2: cloning a `Value::Const(Constant::Data(..))` — the CEK
+    /// env-lookup hot path exercised on every `(var ctx)` reference to a
+    /// large ScriptContext — must be an O(1) refcount bump, not an
+    /// O(size) deep clone of the `Data` tree. `Value` derives `Clone`, so
+    /// this pins the *representation* invariant that makes that true:
+    /// `Constant::Data` holds an `Rc<Data>`, and cloning it shares the
+    /// allocation (`Rc::ptr_eq`) rather than reallocating.
+    #[test]
+    fn const_data_clone_shares_rc_allocation_not_deep_clone() {
+        let data = Rc::new(crate::data::Data::I(BigInt::from(42)));
+        let v = Value::Const(Constant::Data(Rc::clone(&data)));
+
+        // Simulate two separate CEK env lookups of the same bound value
+        // (e.g. two `(var ctx)` occurrences in the compiled term).
+        let looked_up_once = v.clone();
+        let looked_up_twice = v.clone();
+
+        let Value::Const(Constant::Data(rc1)) = looked_up_once else {
+            panic!("expected Const(Data(_))");
+        };
+        let Value::Const(Constant::Data(rc2)) = looked_up_twice else {
+            panic!("expected Const(Data(_))");
+        };
+        assert!(
+            Rc::ptr_eq(&data, &rc1) && Rc::ptr_eq(&data, &rc2),
+            "Value::clone() on a Data constant must share the allocation via Rc, \
+             not deep-clone the Data tree"
+        );
+        // data(1) + v's own Rc(2) + rc1(3) + rc2(4) — every clone is a
+        // pointer, never a fresh allocation.
+        assert_eq!(Rc::strong_count(&data), 4);
+    }
+
     #[test]
     fn lambda_eq_requires_same_body() {
         let l1 = Value::Lambda {
