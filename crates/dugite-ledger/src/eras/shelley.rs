@@ -569,7 +569,7 @@ impl EraRules for ShelleyRules {
                 .get(cred_hash)
                 .copied()
                 .unwrap_or(Lovelace(0));
-            let total_stake = Lovelace(utxo_stake.0 + reward_balance.0);
+            let total_stake = Lovelace(utxo_stake.0.saturating_add(reward_balance.0));
             *pool_stake.entry(*pool_id).or_insert(Lovelace(0)) += total_stake;
         }
 
@@ -995,6 +995,22 @@ impl EraRules for ShelleyRules {
         // node starts post-Byron with Haskell-correct reserves).
         if from_era == Era::Byron && ctx.era == Era::Shelley {
             recompute_shelley_initial_reserves(utxo, epochs, ctx.max_lovelace_supply);
+            // Byron fees are burned, not carried forward: Haskell's
+            // `translateToShelleyLedgerStateFromUtxo` constructs a brand-new
+            // `UTxOState` with `utxosFees = Coin 0` and `esSnapshots =
+            // emptySnapShots` (ssFee = Coin 0) — there is no accumulated
+            // Byron fee-pot value to preserve. The reserves recomputation
+            // above is the ONLY place burned Byron fees are accounted for
+            // (they're implicitly absent from `sumCoinUTxO(liveByronUTxO)`,
+            // which flows automatically into reserves). Oracle-confirmed
+            // 2026-07-06 against IntersectMBO/cardano-ledger
+            // `ByronTranslation.hs:103-181` (issue #797). Without this reset,
+            // ValidateAll's Byron path accumulates the real implicit fee
+            // (inputs - outputs) into `epoch_fees` while ApplyOnly
+            // accumulates `tx.body.fee.0` (always 0 for decoded Byron txs),
+            // so the two modes hold different `ss_fee` at the fork and
+            // diverge forever.
+            utxo.epoch_fees = Lovelace(0);
             return Ok(());
         }
 
@@ -1620,6 +1636,47 @@ mod tests {
             "on_era_transition must NOT bump PV — PPUP via UPEC/NEWPP does that",
         );
         assert_eq!(epochs.protocol_params.protocol_version_minor, 0);
+    }
+
+    /// Issue #797: Byron→Shelley translation must zero `epoch_fees`, mirroring
+    /// Haskell `translateToShelleyLedgerStateFromUtxo` (`ByronTranslation.hs`)
+    /// which constructs a brand-new `UTxOState { utxosFees = Coin 0, .. }` and
+    /// `esSnapshots = emptySnapShots` (`ssFee = Coin 0`) — Byron never had a
+    /// running fee-pot accumulator to carry forward; burned Byron fees are
+    /// accounted for solely via the reserves recomputation (they're absent
+    /// from `sumCoinUTxO(liveByronUTxO)`). Without this reset, ValidateAll
+    /// (which accumulates the real implicit Byron fee) and ApplyOnly (which
+    /// accumulates `tx.body.fee.0`, always 0 for decoded Byron txs) hold
+    /// different `ss_fee` at the fork and diverge forever.
+    #[test]
+    fn test_on_era_transition_byron_to_shelley_zeroes_epoch_fees() {
+        let rules = ShelleyRules::new();
+        let params = ProtocolParameters::mainnet_defaults();
+        let ctx = make_shelley_ctx(&params); // ctx.era = Era::Shelley
+        let mut utxo = make_utxo_sub(vec![]);
+        // Simulate ValidateAll's Byron path having accumulated real implicit
+        // fees (inputs - outputs) over the Byron era.
+        utxo.epoch_fees = Lovelace(123_456_789);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut epochs = make_epoch_sub();
+        let mut consensus = make_consensus_sub();
+
+        let result = rules.on_era_transition(
+            Era::Byron,
+            &ctx,
+            &mut utxo,
+            &mut certs,
+            &mut gov,
+            &mut consensus,
+            &mut epochs,
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            utxo.epoch_fees.0, 0,
+            "Byron->Shelley translation must zero epoch_fees (Byron fees are burned, \
+             not carried into the Shelley fee pot)"
+        );
     }
 
     /// Shelley -> Allegra preserves protocol_version (PPUP drives bumps).

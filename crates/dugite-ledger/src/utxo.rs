@@ -324,10 +324,16 @@ impl UtxoSet {
             return;
         }
         if self.indexing_enabled {
-            self.address_index
+            let entry = self
+                .address_index
                 .entry(output.address.clone())
-                .or_default()
-                .push(input.clone());
+                .or_default();
+            // Guard against duplicate index entries when an existing TxIn is
+            // re-inserted (e.g. replay/rollback-restore) — without this,
+            // `utxos_at_address` would return the same UTxO more than once.
+            if !entry.contains(&input) {
+                entry.push(input.clone());
+            }
         }
         self.utxos.insert(input, output);
     }
@@ -426,7 +432,7 @@ impl UtxoSet {
             return store.total_lovelace();
         }
         self.utxos.values().fold(Lovelace(0), |acc, output| {
-            Lovelace(acc.0 + output.value.coin.0)
+            Lovelace(acc.0.saturating_add(output.value.coin.0))
         })
     }
 

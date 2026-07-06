@@ -783,7 +783,7 @@ impl EraRules for ConwayRules {
                 .get(cred_hash)
                 .copied()
                 .unwrap_or(Lovelace(0));
-            let total_stake = Lovelace(utxo_stake.0 + reward_balance.0);
+            let total_stake = Lovelace(utxo_stake.0.saturating_add(reward_balance.0));
             *pool_stake.entry(*pool_id).or_insert(Lovelace(0)) += total_stake;
         }
 
