@@ -4,10 +4,12 @@
 //! (reject) test.  Integration tests via `validate_transaction_with_context`
 //! live in `validation/tests.rs`.
 
+use std::collections::HashSet;
+
 use dugite_primitives::credentials::Credential;
 use dugite_primitives::hash::Hash28;
 use dugite_primitives::protocol_params::ProtocolParameters;
-use dugite_primitives::transaction::{Certificate, MIRSource, MIRTarget};
+use dugite_primitives::transaction::{Certificate, MIRSource, MIRTarget, Transaction, VKeyWitness};
 use dugite_primitives::value::Lovelace;
 
 use super::*;
@@ -393,5 +395,137 @@ fn test_mir_produces_negative_update_fires_with_populated_accumulator() {
             .iter()
             .any(|e| matches!(e, ValidationError::MIRProducesNegativeUpdate { .. })),
         "expected MIRProducesNegativeUpdate, got {errors:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #804: `check_mir_genesis_quorum` — whole-transaction UTXOW predicate
+// `validateMIRInsufficientGenesisSigs`.
+// ---------------------------------------------------------------------------
+
+/// Build a minimal transaction carrying the given certificates and VKey
+/// witnesses (vkey bytes only — signatures are irrelevant to this check).
+fn tx_with_certs_and_witnesses(certs: Vec<Certificate>, vkeys: Vec<[u8; 32]>) -> Transaction {
+    let mut tx =
+        Transaction::empty_with_hash(dugite_primitives::hash::Hash32::from_bytes([0xAAu8; 32]));
+    tx.body.certificates = certs;
+    tx.witness_set.vkey_witnesses = vkeys
+        .into_iter()
+        .map(|vkey| VKeyWitness {
+            vkey: vkey.to_vec(),
+            signature: vec![0u8; 64],
+        })
+        .collect();
+    tx
+}
+
+/// A tx with no MIR certificate must never trigger the quorum check, even
+/// with zero witnesses and a nonzero quorum configured.
+#[test]
+fn test_mir_genesis_quorum_no_mir_cert_is_noop() {
+    let params = params_with_pv(5);
+    let ctx = ValidationContext::default()
+        .with_genesis_delegate_keys(HashSet::from([Hash28::from_bytes([0x01; 28])]))
+        .with_update_quorum(1);
+    let tx = tx_with_certs_and_witnesses(vec![], vec![]);
+
+    let mut errors = Vec::new();
+    check_mir_genesis_quorum(&tx, &params, &ctx, &mut errors);
+    assert!(errors.is_empty(), "no MIR cert => no-op, got {errors:?}");
+}
+
+/// Conway+ (PV >= 9) must never fire this predicate — MIR is structurally
+/// removed (`isInstantaneousRewards` is `AtMostEra "Babbage"` in Haskell).
+#[test]
+fn test_mir_genesis_quorum_conway_is_noop() {
+    let params = params_with_pv(9);
+    let ctx = ValidationContext::default()
+        .with_genesis_delegate_keys(HashSet::new())
+        .with_update_quorum(5);
+    let tx =
+        tx_with_certs_and_witnesses(vec![mir_cert_transfer(MIRSource::Reserves, 1_000)], vec![]);
+
+    let mut errors = Vec::new();
+    check_mir_genesis_quorum(&tx, &params, &ctx, &mut errors);
+    assert!(errors.is_empty(), "Conway+ => no-op, got {errors:?}");
+}
+
+/// Missing context (no `genesis_delegate_keys` / `update_quorum` plumbed)
+/// must be lenient, matching every other predicate in this module.
+#[test]
+fn test_mir_genesis_quorum_missing_context_is_lenient() {
+    let params = params_with_pv(5);
+    let ctx = ValidationContext::default(); // no genesis_delegate_keys, no update_quorum
+    let tx =
+        tx_with_certs_and_witnesses(vec![mir_cert_transfer(MIRSource::Reserves, 1_000)], vec![]);
+
+    let mut errors = Vec::new();
+    check_mir_genesis_quorum(&tx, &params, &ctx, &mut errors);
+    assert!(
+        errors.is_empty(),
+        "missing context => lenient skip, got {errors:?}"
+    );
+}
+
+/// A MIR-bearing tx witnessed by FEWER than `update_quorum` genesis-delegate
+/// keys must be rejected with `MIRInsufficientGenesisSigs`.
+#[test]
+fn test_mir_genesis_quorum_below_threshold_rejected() {
+    let params = params_with_pv(5);
+    let vkey_a = [0xA1u8; 32];
+    let delegate_a = dugite_primitives::hash::blake2b_224(&vkey_a);
+    // 3 genesis-delegate keys registered; quorum = 2; only 1 (delegate_a)
+    // witnesses the tx.
+    let genesis_delegate_keys = HashSet::from([
+        delegate_a,
+        Hash28::from_bytes([0xB2; 28]),
+        Hash28::from_bytes([0xB3; 28]),
+    ]);
+    let ctx = ValidationContext::default()
+        .with_genesis_delegate_keys(genesis_delegate_keys)
+        .with_update_quorum(2);
+    let tx = tx_with_certs_and_witnesses(
+        vec![mir_cert_transfer(MIRSource::Reserves, 1_000)],
+        vec![vkey_a],
+    );
+
+    let mut errors = Vec::new();
+    check_mir_genesis_quorum(&tx, &params, &ctx, &mut errors);
+    assert!(
+        errors.iter().any(|e| matches!(
+            e,
+            ValidationError::MIRInsufficientGenesisSigs {
+                present: 1,
+                required: 2,
+                ..
+            }
+        )),
+        "expected MIRInsufficientGenesisSigs(present=1, required=2), got {errors:?}"
+    );
+}
+
+/// A MIR-bearing tx witnessed by AT LEAST `update_quorum` genesis-delegate
+/// keys must be accepted.
+#[test]
+fn test_mir_genesis_quorum_met_accepted() {
+    let params = params_with_pv(5);
+    let vkey_a = [0xC1u8; 32];
+    let vkey_b = [0xC2u8; 32];
+    let delegate_a = dugite_primitives::hash::blake2b_224(&vkey_a);
+    let delegate_b = dugite_primitives::hash::blake2b_224(&vkey_b);
+    let genesis_delegate_keys = HashSet::from([delegate_a, delegate_b]);
+    let ctx = ValidationContext::default()
+        .with_genesis_delegate_keys(genesis_delegate_keys)
+        .with_update_quorum(2);
+    let tx = tx_with_certs_and_witnesses(
+        vec![mir_cert_transfer(MIRSource::Reserves, 1_000)],
+        vec![vkey_a, vkey_b],
+    );
+
+    let mut errors = Vec::new();
+    check_mir_genesis_quorum(&tx, &params, &ctx, &mut errors);
+    assert!(
+        errors.is_empty(),
+        "quorum met (2 >= 2) => accepted, got {errors:?}"
     );
 }

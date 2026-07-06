@@ -103,8 +103,9 @@ pub(super) fn extract_reward_credential(reward_account: &[u8]) -> Option<Credent
 /// | `CommitteeHotAuth`              | Cold credential key hash                |
 /// | `CommitteeColdResign`           | Cold credential key hash                |
 /// | `StakeRegistration` (Shelley)   | None (free registration)                |
-/// | `GenesisKeyDelegation`          | None (legacy)                           |
-/// | `MoveInstantaneousRewards`      | None (legacy)                           |
+/// | `GenesisKeyDelegation`          | Genesis key hash (`gk`)                 |
+/// | `MoveInstantaneousRewards`      | None here — see whole-tx genesis-quorum |
+/// |                                 | check `check_mir_genesis_quorum` (#804) |
 fn cert_required_witnesses(cert: &Certificate) -> Vec<Hash28> {
     // Helper: extract the key hash from a credential, returning None for scripts.
     let key_hash = |c: &Credential| -> Option<Hash28> {
@@ -150,10 +151,29 @@ fn cert_required_witnesses(cert: &Certificate) -> Vec<Hash28> {
         // Shelley stake registration (cert tag 0) — no witness required.
         Certificate::StakeRegistration(_) => vec![],
 
-        // Legacy certificates — no witness checks.
-        Certificate::GenesisKeyDelegation { .. } | Certificate::MoveInstantaneousRewards { .. } => {
-            vec![]
+        // GenesisDelegCert `gk _ _`: the named genesis (cold) key must sign.
+        // Reference: Haskell `shelleyWitsVKeyNeeded` /
+        // `Cardano.Ledger.Shelley.Rules.Utxow` — every `GenesisDelegCert`
+        // contributes its genesis key hash to `neededWitnessKeys`. #804:
+        // this was previously `vec![]`, silently accepting an unwitnessed
+        // genesis-key delegation on the live ValidateAll path.
+        //
+        // `genesis_hash` is Hash32 (zero-padded from the on-wire 28-byte
+        // hash); truncate to the first 28 bytes to match the Hash28 witness
+        // key-hash domain (mirrors `eras::common::enqueue_genesis_key_delegations`).
+        Certificate::GenesisKeyDelegation { genesis_hash, .. } => {
+            let mut buf = [0u8; 28];
+            buf.copy_from_slice(&genesis_hash.as_bytes()[..28]);
+            vec![Hash28::from_bytes(buf)]
         }
+
+        // MIR certs require NO per-cert VKey witness here — Haskell's
+        // genesis-delegate quorum check (`validateMIRInsufficientGenesisSigs`
+        // / `MIRInsufficientGenesisSigsUTXOW`) is a WHOLE-TRANSACTION
+        // predicate over ALL of `dsGenDelegs`'s delegate keys, not a
+        // per-certificate requirement — see `check_mir_genesis_quorum` in
+        // `validation::mir` (#804).
+        Certificate::MoveInstantaneousRewards { .. } => vec![],
     }
 }
 

@@ -16292,6 +16292,77 @@ mod tests {
     }
 
     // ===================================================================
+    // #804 — GenesisKeyDelegation genesis-key witness requirement.
+    //
+    // Haskell `shelleyWitsVKeyNeeded`: a `GenesisDelegCert gk _ _` requires
+    // a VKey witness by the named genesis key `gk`. `cert_required_witnesses`
+    // previously returned `vec![]` for this cert (see the table doc comment
+    // above `cert_required_witnesses`), silently accepting an unwitnessed
+    // genesis-key delegation.
+    // ===================================================================
+
+    #[test]
+    fn test_804_genesis_key_delegation_missing_witness_rejected() {
+        let (utxo_set, _input, mut tx, params) = make_cert_test_tx(0, 0);
+
+        // No witness supplied for this genesis key — the cert requires
+        // `blake2b_224([0xD1;32])` truncated into a Hash32 genesis_hash.
+        let (_unrelated_witness, gkey_hash) = make_cert_vkey_witness([0xD1; 32]);
+        let mut genesis_hash_bytes = [0u8; 32];
+        genesis_hash_bytes[..28].copy_from_slice(gkey_hash.as_bytes());
+
+        tx.body
+            .certificates
+            .push(Certificate::GenesisKeyDelegation {
+                genesis_hash: Hash32::from_bytes(genesis_hash_bytes),
+                genesis_delegate_hash: Hash32::from_bytes([0x22; 32]),
+                vrf_keyhash: Hash32::from_bytes([0x33; 32]),
+            });
+        // Deliberately do NOT push a witness for gkey_hash.
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::MissingCertificateWitness(_))),
+            "Expected MissingCertificateWitness for unwitnessed GenesisKeyDelegation, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_804_genesis_key_delegation_with_matching_witness_accepted() {
+        let (utxo_set, _input, mut tx, params) = make_cert_test_tx(0, 0);
+
+        let (witness, gkey_hash) = make_cert_vkey_witness([0xD2; 32]);
+        let mut genesis_hash_bytes = [0u8; 32];
+        genesis_hash_bytes[..28].copy_from_slice(gkey_hash.as_bytes());
+
+        tx.body
+            .certificates
+            .push(Certificate::GenesisKeyDelegation {
+                genesis_hash: Hash32::from_bytes(genesis_hash_bytes),
+                genesis_delegate_hash: Hash32::from_bytes([0x22; 32]),
+                vrf_keyhash: Hash32::from_bytes([0x33; 32]),
+            });
+        tx.witness_set.vkey_witnesses.push(witness);
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        match result {
+            Ok(()) => {}
+            Err(errors) => {
+                assert!(
+                    !errors
+                        .iter()
+                        .any(|e| matches!(e, ValidationError::MissingCertificateWitness(_))),
+                    "Should not have MissingCertificateWitness when the genesis key witnessed, got: {errors:?}"
+                );
+            }
+        }
+    }
+
+    // ===================================================================
     // dugite #470 — PV11 reference-input disjointness relaxation tests.
     //
     // Phase-1 disjointness was relaxed by Haskell cardano-ledger PR #5011

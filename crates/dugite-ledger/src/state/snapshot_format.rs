@@ -104,6 +104,12 @@ pub struct LedgerStateSnapshot {
     pub pointer_map: HashMap<dugite_primitives::credentials::Pointer, Hash32>,
     /// Genesis delegates: genesis_key_hash -> (delegate_key_hash, vrf_key_hash).
     pub genesis_delegates: HashMap<Hash28, (Hash28, Hash32)>,
+    /// Pending (not-yet-matured) genesis-delegate changes: `(maturity_slot,
+    /// genesis_key_hash)` -> `(delegate_key_hash, vrf_key_hash)`. Haskell
+    /// `dsFutureGenDelegs`. New in v28 (#804) — MUST be persisted: it is
+    /// historical bootstrap-era queue state that cannot be reconstructed
+    /// from the restored tip.
+    pub future_gen_delegs: HashMap<(u64, Hash28), (Hash28, Hash32)>,
     /// Fees collected in the current epoch
     pub epoch_fees: Lovelace,
     /// Number of blocks produced by each pool in the current epoch.
@@ -312,6 +318,7 @@ impl From<&super::LedgerState> for LedgerStateSnapshot {
             slot_config: s.slot_config,
             genesis_hash: s.genesis_hash,
             genesis_delegates: s.genesis_delegates.clone(),
+            future_gen_delegs: s.future_gen_delegs.clone(),
             update_quorum: s.update_quorum,
             node_network: s.node_network,
             randomness_stabilisation_window: s.randomness_stabilisation_window,
@@ -413,6 +420,7 @@ impl From<LedgerStateSnapshot> for super::LedgerState {
             slot_config: s.slot_config,
             genesis_hash: s.genesis_hash,
             genesis_delegates: s.genesis_delegates,
+            future_gen_delegs: s.future_gen_delegs,
             update_quorum: s.update_quorum,
             node_network: s.node_network,
             randomness_stabilisation_window: s.randomness_stabilisation_window,

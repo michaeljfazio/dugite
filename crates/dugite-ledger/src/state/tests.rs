@@ -4241,6 +4241,190 @@ fn test_genesis_key_delegation_updates_genesis_delegates() {
     assert_eq!(entry.1, vrf_keyhash, "vrf keyhash mismatch");
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// #804: GenesisKeyDelegation live-path two-phase queue
+// (future_gen_delegs -> genesis_delegates), via the real apply_block_with_delta
+// path -- NOT the dead `process_certificate` handler exercised by the two
+// tests immediately above.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A `GenesisKeyDelegation` cert must enqueue into `future_gen_delegs` and
+/// must NOT immediately update `genesis_delegates` -- mirrors Haskell's
+/// `dsFutureGenDelegs` two-phase queue (oracle-verified against
+/// `Cardano.Ledger.Shelley.Rules.Deleg`).
+#[test]
+fn test_804_genesis_key_delegation_enqueues_not_adopted() {
+    let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+    // Pre-Conway: the enqueue path is gated on `pv < 9` (GenesisKeyDelegation
+    // is AtMostEra Babbage).
+    state.epochs.protocol_params.protocol_version_major = 8;
+    state.stability_window_3kf = 10;
+
+    let genesis_hash = Hash32::from_bytes([0x11; 32]);
+    let delegate_hash = Hash32::from_bytes([0x22; 32]);
+    let vrf_keyhash = Hash32::from_bytes([0x33; 32]);
+
+    let block = make_certs_block(
+        5,
+        1,
+        Hash32::ZERO,
+        vec![Certificate::GenesisKeyDelegation {
+            genesis_hash,
+            genesis_delegate_hash: delegate_hash,
+            vrf_keyhash,
+        }],
+    );
+    state
+        .apply_block(&block, BlockValidationMode::ApplyOnly)
+        .expect("block should apply");
+
+    assert!(
+        state.genesis_delegates.is_empty(),
+        "GenesisKeyDelegation must NOT update genesis_delegates immediately"
+    );
+
+    let gkey = Hash28::from_bytes([0x11; 28]);
+    let dkey = Hash28::from_bytes([0x22; 28]);
+    let maturity_slot = 5 + state.stability_window_3kf;
+    let entry = state
+        .future_gen_delegs
+        .get(&(maturity_slot, gkey))
+        .expect("future_gen_delegs should contain the enqueued entry");
+    assert_eq!(entry.0, dkey);
+    assert_eq!(entry.1, vrf_keyhash);
+}
+
+/// Once a later block's slot reaches `maturity_slot = cert_slot +
+/// stability_window_3kf`, the queued entry must be adopted into
+/// `genesis_delegates` and removed from `future_gen_delegs`. Mirrors
+/// Haskell's `adoptGenesisDelegs`, which runs every block via TICK (NOT
+/// gated on an epoch boundary).
+#[test]
+fn test_804_genesis_key_delegation_adopted_after_stability_window() {
+    let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+    state.epochs.protocol_params.protocol_version_major = 8;
+    state.stability_window_3kf = 10;
+
+    let genesis_hash = Hash32::from_bytes([0x11; 32]);
+    let delegate_hash = Hash32::from_bytes([0x22; 32]);
+    let vrf_keyhash = Hash32::from_bytes([0x33; 32]);
+
+    let b0 = make_certs_block(
+        5,
+        1,
+        Hash32::ZERO,
+        vec![Certificate::GenesisKeyDelegation {
+            genesis_hash,
+            genesis_delegate_hash: delegate_hash,
+            vrf_keyhash,
+        }],
+    );
+    state
+        .apply_block(&b0, BlockValidationMode::ApplyOnly)
+        .expect("block 0 should apply");
+    let maturity_slot = 5 + state.stability_window_3kf;
+
+    // One slot before maturity: still queued, not adopted.
+    let b1 = make_test_block(maturity_slot - 1, 2, *b0.hash(), vec![]);
+    state
+        .apply_block(&b1, BlockValidationMode::ApplyOnly)
+        .expect("block 1 should apply");
+    assert!(
+        state.genesis_delegates.is_empty(),
+        "must not adopt before maturity_slot"
+    );
+    assert!(!state.future_gen_delegs.is_empty());
+
+    // At exactly maturity_slot: adopted.
+    let b2 = make_test_block(maturity_slot, 3, *b1.hash(), vec![]);
+    state
+        .apply_block(&b2, BlockValidationMode::ApplyOnly)
+        .expect("block 2 should apply");
+
+    let gkey = Hash28::from_bytes([0x11; 28]);
+    let dkey = Hash28::from_bytes([0x22; 28]);
+    let entry = state
+        .genesis_delegates
+        .get(&gkey)
+        .expect("entry should be adopted into genesis_delegates at maturity_slot");
+    assert_eq!(entry.0, dkey);
+    assert_eq!(entry.1, vrf_keyhash);
+    assert!(
+        state.future_gen_delegs.is_empty(),
+        "adopted entry must be removed from the pending queue"
+    );
+}
+
+/// A rollback across the adoption boundary must restore BOTH
+/// `future_gen_delegs` and `genesis_delegates` to their pre-adoption
+/// values -- exercises the #804 `LedgerDelta::future_gen_delegs_snapshot`
+/// wiring (capture in `apply_block_with_delta_impl`, restore in
+/// `apply_delta_to_state`, and the explicit top-level copy-back in
+/// `rollback_via_seq`).
+#[test]
+fn test_804_genesis_key_delegation_rollback_restores_queue() {
+    let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+    state.epochs.protocol_params.protocol_version_major = 8;
+    state.stability_window_3kf = 10;
+
+    let mut seq = crate::ledger_seq::LedgerSeq::with_defaults(state.clone_without_utxos(), 100);
+
+    let genesis_hash = Hash32::from_bytes([0x11; 32]);
+    let delegate_hash = Hash32::from_bytes([0x22; 32]);
+    let vrf_keyhash = Hash32::from_bytes([0x33; 32]);
+
+    // Block 0: enqueue.
+    let b0 = make_certs_block(
+        5,
+        1,
+        Hash32::ZERO,
+        vec![Certificate::GenesisKeyDelegation {
+            genesis_hash,
+            genesis_delegate_hash: delegate_hash,
+            vrf_keyhash,
+        }],
+    );
+    let d0 = state
+        .apply_block_with_delta(&b0, BlockValidationMode::ApplyOnly)
+        .expect("block 0 should apply");
+    seq.push(d0);
+
+    // Block 1: crosses maturity_slot -- adopted.
+    let maturity_slot = 5 + state.stability_window_3kf;
+    let b1 = make_test_block(maturity_slot, 2, *b0.hash(), vec![]);
+    let d1 = state
+        .apply_block_with_delta(&b1, BlockValidationMode::ApplyOnly)
+        .expect("block 1 should apply");
+    seq.push(d1);
+
+    let gkey = Hash28::from_bytes([0x11; 28]);
+    assert!(
+        state.genesis_delegates.contains_key(&gkey),
+        "sanity: adopted before rollback"
+    );
+    assert!(state.future_gen_delegs.is_empty());
+
+    // Roll back block 1 (the adoption block) -- must restore the
+    // pre-adoption state: entry back in future_gen_delegs, absent from
+    // genesis_delegates.
+    let n = state
+        .rollback_via_seq(&mut seq, &Point::Specific(SlotNo(5), *b0.hash()))
+        .expect("b0 point is in the volatile window");
+    assert_eq!(n, 1);
+
+    assert!(
+        !state.genesis_delegates.contains_key(&gkey),
+        "rollback must undo the adoption"
+    );
+    let dkey = Hash28::from_bytes([0x22; 28]);
+    let entry = state
+        .future_gen_delegs
+        .get(&(maturity_slot, gkey))
+        .expect("rollback must restore the pending queue entry");
+    assert_eq!(entry.0, dkey);
+    assert_eq!(entry.1, vrf_keyhash);
+}
+
 #[test]
 fn test_pre_conway_pp_update_quorum_met() {
     let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());

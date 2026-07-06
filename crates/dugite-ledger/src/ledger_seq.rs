@@ -245,6 +245,14 @@ pub struct LedgerDelta {
     /// `rollback_via_seq` (state/mod.rs). Content-diffed — genesis key
     /// delegation is a rare bootstrap-era cert.
     pub genesis_delegates_snapshot: Option<HashMap<Hash28, (Hash28, Hash32)>>,
+    /// Post-block snapshot of the TOP-LEVEL `LedgerState.future_gen_delegs`
+    /// map (Haskell `dsFutureGenDelegs`, the pending queue behind
+    /// `Certificate::GenesisKeyDelegation`). Same rationale as
+    /// [`Self::genesis_delegates_snapshot`] — lives directly on
+    /// `LedgerState`, so it needs both this delta field and an explicit
+    /// copy-back in `rollback_via_seq` (state/mod.rs). Content-diffed. See
+    /// issue #804.
+    pub future_gen_delegs_snapshot: Option<HashMap<(u64, Hash28), (Hash28, Hash32)>>,
     /// Post-block ABSOLUTE snapshot of `epochs.pending_pp_updates`
     /// (pre-Conway PPUP proposals pending for the current/target epoch).
     /// Unconditional: this map holds only currently-active proposals (at
@@ -297,6 +305,7 @@ impl LedgerDelta {
             pending_mir_delta_reserves_snapshot: None,
             pending_mir_delta_treasury_snapshot: None,
             genesis_delegates_snapshot: None,
+            future_gen_delegs_snapshot: None,
             pending_pp_updates_snapshot: None,
             future_pp_updates_snapshot: None,
             rupd_addrs_rew_snapshot: None,
@@ -1071,6 +1080,10 @@ pub fn apply_delta_to_state(state: &mut LedgerState, delta: &LedgerDelta) {
     if let Some(gd) = &delta.genesis_delegates_snapshot {
         state.genesis_delegates = gd.clone();
     }
+    // #804: same rationale as `genesis_delegates` immediately above.
+    if let Some(fgd) = &delta.future_gen_delegs_snapshot {
+        state.future_gen_delegs = fgd.clone();
+    }
 
     // ── 5. Governance changes ─────────────────────────────────────────────────
     for change in &delta.governance_changes {
@@ -1594,6 +1607,7 @@ fn _assert_ledger_state_fields_audited(state: LedgerState) {
         slot_config: _,
         genesis_hash: _,
         genesis_delegates: _,
+        future_gen_delegs: _,
         update_quorum: _,
         node_network: _,
         randomness_stabilisation_window: _,

@@ -620,12 +620,20 @@ impl LedgerState {
                 vrf_keyhash,
             } => {
                 // Shelley-era genesis key delegation. Update the active gen-delegate
-                // mapping directly. Haskell models this as a two-phase queue
-                // (futureGenDelegs → genDelegs after 2 * stability_window); we apply
-                // immediately, which is observationally equivalent on preview/preprod/
-                // mainnet (Conway removed this cert type) and differs only during a
-                // Byron-genesis replay. If full-Byron replay correctness is ever
-                // required, promote to a queued model.
+                // mapping directly. This function (`process_certificate`) is test-only
+                // dead code (no production callers) and intentionally keeps the
+                // simplified immediate-apply model.
+                //
+                // Haskell actually models this as a two-phase queue
+                // (`dsFutureGenDelegs` -> `dsGenDelegs`, matured after
+                // `stability_window` slots — ceil(3k/f), NOT doubled; the
+                // "2 * stability_window" figure that appears elsewhere in the
+                // ledger is a different mechanism, the PPUP/HFC "point of no
+                // return" deadline). The LIVE apply path implements the real
+                // two-phase queue in `eras::common::enqueue_genesis_key_delegations`
+                // / `adopt_matured_genesis_delegs` (see issue #804); this
+                // dead handler is NOT observationally equivalent to that and
+                // must not be treated as a reference for production behavior.
                 //
                 // The cert fields (genesis_hash, genesis_delegate_hash) are stored as
                 // Hash32 in our enum (zero-padded from the on-wire 28-byte hashes),

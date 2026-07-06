@@ -179,6 +179,19 @@ pub struct LedgerState {
     /// (Shelley-era only; Conway removed the cert type). Used for BFT overlay
     /// schedule validation during early Shelley era (when d > 0).
     pub genesis_delegates: HashMap<Hash28, (Hash28, Hash32)>,
+    /// Pending (not-yet-matured) genesis-delegate changes: `(maturity_slot,
+    /// genesis_key_hash)` -> `(delegate_key_hash, vrf_key_hash)`.
+    ///
+    /// Haskell's `dsFutureGenDelegs`: a `Certificate::GenesisKeyDelegation`
+    /// does NOT update `genesis_delegates` immediately — it enqueues here
+    /// with `maturity_slot = cert_slot + stability_window_3kf`
+    /// (`stabilityWindow = ceil(3k/f)`, NOT doubled — see
+    /// `eras::common::enqueue_genesis_key_delegations`). Entries are moved
+    /// into `genesis_delegates` by `eras::common::adopt_matured_genesis_delegs`
+    /// once `maturity_slot <= current_slot`, called every block (Haskell's
+    /// `adoptGenesisDelegs` runs at TICK, not just epoch boundaries).
+    /// See issue #804.
+    pub future_gen_delegs: HashMap<(u64, Hash28), (Hash28, Hash32)>,
     /// Quorum for pre-Conway protocol parameter updates (from Shelley genesis)
     pub update_quorum: u64,
     /// The network this node is running on (mainnet, testnet, etc.).
@@ -803,6 +816,7 @@ impl LedgerState {
             slot_config: SlotConfig::default(),
             genesis_hash: Hash32::ZERO,
             genesis_delegates: HashMap::new(),
+            future_gen_delegs: HashMap::new(),
             update_quorum: default_update_quorum(),
             node_network: None,
             randomness_stabilisation_window: 172800, // 4k/f on mainnet: ceil(4*2160/0.05)
@@ -1308,6 +1322,12 @@ impl LedgerState {
             slot_config: SlotConfig::default(), // Will be set by set_slot_config()
             genesis_hash: Hash32::ZERO,         // Will be set by set_genesis_hash()
             genesis_delegates,
+            // Haskell snapshots are imported at a Conway-era tip, where the
+            // GenesisKeyDelegation/FutureGenDeleg mechanism is retired
+            // (AtMostEra "Babbage") — there is no live queue to decode, and
+            // the Haskell snapshot decoder does not carry `dsFutureGenDelegs`
+            // in the first place. Empty is correct here.
+            future_gen_delegs: HashMap::new(),
             update_quorum: 5,
             node_network: None, // Will be set by caller
             // Will be recalculated by set_epoch_length()
@@ -1358,6 +1378,7 @@ impl LedgerState {
             slot_config: self.slot_config,
             genesis_hash: self.genesis_hash,
             genesis_delegates: self.genesis_delegates.clone(),
+            future_gen_delegs: self.future_gen_delegs.clone(),
             update_quorum: self.update_quorum,
             node_network: self.node_network,
             randomness_stabilisation_window: self.randomness_stabilisation_window,
@@ -2167,6 +2188,9 @@ impl LedgerState {
         self.utxo.pending_donations = new_state.utxo.pending_donations;
         // #782: top-level field, not covered by the sub-state copies above.
         self.genesis_delegates = new_state.genesis_delegates;
+        // #804: same rationale — `future_gen_delegs` lives directly on
+        // `LedgerState`, tracked via its own delta snapshot.
+        self.future_gen_delegs = new_state.future_gen_delegs;
 
         Some(n)
     }

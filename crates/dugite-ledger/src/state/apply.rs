@@ -544,6 +544,19 @@ impl LedgerState {
             }
         }
 
+        // #804: adopt any `GenesisKeyDelegation` certs that matured by this
+        // block's slot into `genesis_delegates`. Mirrors Haskell's
+        // `adoptGenesisDelegs`, run every block via TICK (NOT gated on an
+        // epoch boundary) and BEFORE this block's own transactions are
+        // applied — a cert enqueued in THIS block can never mature within
+        // this same call, since maturity is always strictly in the future
+        // (`slot + stability_window_3kf`).
+        crate::eras::common::adopt_matured_genesis_delegs(
+            block.slot().0,
+            &mut self.future_gen_delegs,
+            &mut self.genesis_delegates,
+        );
+
         // ── BBODY rule: block body size equality check ────────────────────
         //
         // Haskell enforces `actual_body_bytes == header.body_size`.  We extract the
@@ -1263,7 +1276,24 @@ impl LedgerState {
                         .with_stake_key_deposits_imbl(self.certs.stake_key_deposits.clone())
                         .with_vote_delegations_arc(std::sync::Arc::clone(
                             &block_vote_delegation_keys,
-                        ));
+                        ))
+                        // #804: genesis-delegate DELEGATE (hot) keys + quorum,
+                        // for `check_mir_genesis_quorum`'s whole-tx MIR
+                        // witness check. `self.genesis_delegates` holds at
+                        // most a handful of entries even at full Shelley
+                        // bootstrap (mainnet genesis seeds exactly 7), so
+                        // rebuilding this small set per-tx (rather than
+                        // hoisting into the block-level registry snapshot
+                        // above) is negligible — unlike the large
+                        // pool/DRep/reward-account registries that motivated
+                        // that hoist.
+                        .with_genesis_delegate_keys(
+                            self.genesis_delegates
+                                .values()
+                                .map(|(delegate_hash, _)| *delegate_hash)
+                                .collect(),
+                        )
+                        .with_update_quorum(self.update_quorum);
                     if let Some(net) = self.node_network {
                         ctx = ctx.with_network(net);
                     }
@@ -1573,6 +1603,23 @@ impl LedgerState {
                     t_diff_merge += start.elapsed();
                 }
 
+                // #804: enqueue any `GenesisKeyDelegation` certs into the
+                // two-phase `future_gen_delegs` queue. This lives on
+                // top-level `LedgerState` (not `CertSubState`), so it can't
+                // be handled inside `apply_shelley_cert`/`apply_valid_tx`
+                // above (see that function's doc comment). Guarded on `pv <
+                // 9` to mirror the MIR guard in `apply_shelley_cert` — the
+                // cert type is structurally AtMostEra Babbage, so this is
+                // defense-in-depth, not a live Conway condition.
+                if cached_params.protocol_version_major < 9 {
+                    crate::eras::common::enqueue_genesis_key_delegations(
+                        tx,
+                        block_slot,
+                        self.stability_window_3kf,
+                        &mut self.future_gen_delegs,
+                    );
+                }
+
                 // ── Step 8b-post: Update block_active_proposals ───────────
                 //
                 // After a proposal-containing tx is applied, `self.gov.governance.proposals`
@@ -1878,6 +1925,9 @@ impl LedgerState {
         let pending_mir_delta_reserves_before = self.certs.pending_mir_delta_reserves;
         let pending_mir_delta_treasury_before = self.certs.pending_mir_delta_treasury;
         let genesis_delegates_before = self.genesis_delegates.clone();
+        // #804: pre-block content clone of the future-genesis-delegate
+        // queue, mirroring `genesis_delegates_before` immediately above.
+        let future_gen_delegs_before = self.future_gen_delegs.clone();
         let rupd_addrs_rew_before = self.epochs.rupd_addrs_rew.clone();
 
         // Apply the block (all state mutations happen here). In deferred mode
@@ -1969,6 +2019,14 @@ impl LedgerState {
         }
         if self.genesis_delegates != genesis_delegates_before {
             delta.genesis_delegates_snapshot = Some(self.genesis_delegates.clone());
+        }
+        // #804: same content-diffed capture for the future-genesis-delegate
+        // queue (mutated by `enqueue_genesis_key_delegations` in Step 8b and
+        // drained by `adopt_matured_genesis_delegs` earlier in this
+        // function) — rare bootstrap-era mutation, `None` on almost every
+        // block.
+        if self.future_gen_delegs != future_gen_delegs_before {
+            delta.future_gen_delegs_snapshot = Some(self.future_gen_delegs.clone());
         }
         // pending_pp_updates / future_pp_updates hold only currently-active
         // proposals (a handful of entries at most) — unconditional capture is

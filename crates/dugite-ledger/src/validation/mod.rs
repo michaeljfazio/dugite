@@ -263,6 +263,27 @@ pub struct ValidationContext {
     /// Reference: Haskell `NonGenesisUpdatePPUP` in
     /// `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Ppup.hs`.
     pub genesis_delegates: Option<Arc<HashSet<Hash28>>>,
+    /// Set of currently registered genesis-DELEGATE (hot/delegate) keys —
+    /// `Map.elems (dsGenDelegs ds)`'s `genDelegKeyHash` values, i.e. the
+    /// map's VALUES.  This is the OPPOSITE side from [`Self::genesis_delegates`]
+    /// above (which holds the map's KEYS — the genesis/cold key hashes used
+    /// by `NonGenesisUpdatePPUP`). Used by the Shelley UTXOW predicate
+    /// `validateMIRInsufficientGenesisSigs` (#804): a transaction bearing a
+    /// `MoveInstantaneousRewards` cert must be witnessed by at least
+    /// `update_quorum` of these delegate keys.
+    ///
+    /// When `None`, `check_mir_genesis_quorum` is silently skipped (lenient
+    /// default, matching [`Self::genesis_delegates`]'s convention).
+    ///
+    /// Reference: Haskell `validateMIRInsufficientGenesisSigs` in
+    /// `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Utxow.hs`.
+    pub genesis_delegate_keys: Option<Arc<HashSet<Hash28>>>,
+    /// Quorum of genesis-delegate signatures required on a MIR-bearing
+    /// transaction (Haskell `Globals.quorum`, from genesis
+    /// `sgUpdateQuorum` — mainnet value 5). Used together with
+    /// [`Self::genesis_delegate_keys`] by `check_mir_genesis_quorum`.
+    /// `None` skips the check (lenient default).
+    pub update_quorum: Option<u64>,
 }
 
 impl ValidationContext {
@@ -555,6 +576,27 @@ impl ValidationContext {
 
     pub fn with_genesis_delegates_arc(mut self, keys: Arc<HashSet<Hash28>>) -> Self {
         self.genesis_delegates = Some(keys);
+        self
+    }
+
+    /// Set the set of registered genesis-DELEGATE (hot/delegate) key hashes
+    /// used by the Shelley UTXOW `validateMIRInsufficientGenesisSigs`
+    /// predicate (#804). See [`ValidationContext::genesis_delegate_keys`]
+    /// for the distinction from `genesis_delegates` above.
+    pub fn with_genesis_delegate_keys(mut self, keys: HashSet<Hash28>) -> Self {
+        self.genesis_delegate_keys = Some(Arc::new(keys));
+        self
+    }
+
+    pub fn with_genesis_delegate_keys_arc(mut self, keys: Arc<HashSet<Hash28>>) -> Self {
+        self.genesis_delegate_keys = Some(keys);
+        self
+    }
+
+    /// Set the genesis-delegate signature quorum used by
+    /// `check_mir_genesis_quorum` (#804).
+    pub fn with_update_quorum(mut self, quorum: u64) -> Self {
+        self.update_quorum = Some(quorum);
         self
     }
 
@@ -1843,6 +1885,39 @@ pub enum ValidationError {
         /// Negative transfer amount.
         amount: i64,
     },
+    /// Shelley UTXOW rule `MIRInsufficientGenesisSigsUTXOW`: a transaction
+    /// containing at least one `MoveInstantaneousRewards` certificate must
+    /// carry VKey witnesses for at least `update_quorum` of the CURRENT
+    /// genesis-delegate keys (`Map.elems (dsGenDelegs ds)`'s `genDelegKeyHash`
+    /// values — the delegate/hot keys, NOT the genesis/cold keys used by
+    /// `NonGenesisUpdatePPUP`).
+    ///
+    /// Active in Shelley–Babbage (`AtMostEra "Babbage" era`); structurally
+    /// impossible in Conway (MIR certs removed, `isInstantaneousRewards` is
+    /// type-constrained to `AtMostEra "Babbage"`).
+    ///
+    /// Skipped silently (lenient default, matching every other predicate in
+    /// this module) when [`ValidationContext::genesis_delegate_keys`] or
+    /// [`ValidationContext::update_quorum`] is `None` — callers that have
+    /// not plumbed in the genesis-delegate value-set have no way to
+    /// evaluate the quorum.
+    ///
+    /// Reference: Haskell `validateMIRInsufficientGenesisSigs` in
+    /// `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Utxow.hs`.
+    #[error(
+        "MIRInsufficientGenesisSigsUTXOW: present={present}, required={required}, \
+         signers={signers:?}"
+    )]
+    MIRInsufficientGenesisSigs {
+        /// Number of distinct genesis-delegate (hot) keys that witnessed
+        /// this transaction.
+        present: usize,
+        /// The quorum required (`update_quorum`, a genesis constant).
+        required: u64,
+        /// Hex-encoded genesis-delegate keys that DID witness the
+        /// transaction (for diagnostic visibility).
+        signers: Vec<String>,
+    },
     // ---------------------------------------------------------------------
     // PPUP (pre-Conway protocol-parameter update) predicate failures.
     //
@@ -2756,6 +2831,15 @@ pub fn validate_transaction_with_context(
                 extra_errors.extend(errs);
             }
         }
+    }
+
+    // -------------------------------------------------------------------
+    // MIR genesis-delegate quorum — Shelley–Babbage only, WHOLE-TRANSACTION
+    // (UTXOW, not DELEG — see `mir::check_mir_genesis_quorum` doc comment).
+    // Guarded identically to the per-cert MIR loop above (#804).
+    // -------------------------------------------------------------------
+    if params.protocol_version_major < 9 {
+        mir::check_mir_genesis_quorum(tx, params, &context, &mut extra_errors);
     }
 
     // -------------------------------------------------------------------
