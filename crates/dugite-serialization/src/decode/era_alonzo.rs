@@ -1288,11 +1288,23 @@ fn read_plutus_data_depth(
     let ty = r.peek_major()?;
     match ty {
         Type::Tag => {
+            // #831 finding 2: `cborg`'s `peekTokenType` (which upstream
+            // `cardano-ledger`'s `PlutusData` `Serialise` instance is
+            // built on) maps ONLY the 1-byte inline tag header (`0xc2`
+            // positive / `0xc3` negative) to `TypeInteger` -> the bignum
+            // decode path. Any wider, non-minimal encoding of the same
+            // tag value (e.g. `d8 02`, `d9 00 02`) is `TypeTag` ->
+            // `decodeConstr`, which fails since 2/3 aren't valid
+            // constructor tags. Peek the raw header byte BEFORE
+            // consuming the tag so a wide-form 2/3 can be routed away
+            // from the bignum arms and into the "unknown tag" rejection,
+            // matching Haskell's acceptance boundary exactly.
+            let is_inline_bignum_header = matches!(r.peek_byte(), Some(0xc2) | Some(0xc3));
             // Peek the tag value without consuming via skip-and-restore trick.
             // We use the raw underlying bytes to read the tag value.
             let tag_n = read_tag_value(r)?;
-            match tag_n {
-                2 => {
+            match (is_inline_bignum_header, tag_n) {
+                (true, 2) => {
                     // Positive bignum: tag was already consumed, just read bytes.
                     // CBOR §3.4.3 + Cardano `bounded_bytes`: the mantissa may
                     // be encoded as indefinite-length chunks. Use the
@@ -1303,38 +1315,53 @@ fn read_plutus_data_depth(
                     let val = BigInt::from_bytes_be(num_bigint::Sign::Plus, &bytes);
                     Ok(PlutusData::Integer(val))
                 }
-                3 => {
+                (true, 3) => {
                     // Negative bignum: tag was already consumed, just read bytes.
                     // Mantissa is a PlutusData ByteString leaf — bounded (#28).
                     let bytes = r.read_bounded_plutus_bytes()?;
                     let n = BigInt::from_bytes_be(num_bigint::Sign::Plus, &bytes);
                     Ok(PlutusData::Integer(-BigInt::from(1) - n))
                 }
-                121..=127 => {
+                (_, tag_n @ 121..=127) => {
                     // Constr alternative 0..6: tag = 121 + N
                     let constructor = tag_n - 121;
                     let fields = r.read_array(|r| read_plutus_data_depth(r, depth + 1))?;
                     Ok(PlutusData::Constr(constructor, fields))
                 }
-                1280..=1400 => {
+                (_, tag_n @ 1280..=1400) => {
                     // Constr alternative 7..127: tag = 1280 + (N - 7)
                     let constructor = tag_n - 1280 + 7;
                     let fields = r.read_array(|r| read_plutus_data_depth(r, depth + 1))?;
                     Ok(PlutusData::Constr(constructor, fields))
                 }
-                102 => {
+                (_, 102) => {
                     // Alternative encoding: [constructor_index, [* plutus_data]]
+                    //
+                    // #831 finding 1: Haskell's `decodeConstrExtended` uses
+                    // `decodeListLenOrIndef`, which accepts BOTH a
+                    // definite-length array(2) and an indefinite-length
+                    // array closed by an explicit break — it does not
+                    // require definite-length here. Accept both forms,
+                    // consuming the trailing break for the indefinite case.
                     let arr_len = r.read_array_header()?;
-                    if !matches!(arr_len, Some(2)) {
-                        return Err(SerializationError::CborDecode(format!(
-                            "plutus_data constr(102): expected array(2), got {arr_len:?}"
-                        )));
+                    match arr_len {
+                        Some(2) => {
+                            let constructor = r.read_uint()?;
+                            let fields = r.read_array(|r| read_plutus_data_depth(r, depth + 1))?;
+                            Ok(PlutusData::Constr(constructor, fields))
+                        }
+                        Some(n) => Err(SerializationError::CborDecode(format!(
+                            "plutus_data constr(102): expected array(2), got Some({n})"
+                        ))),
+                        None => {
+                            let constructor = r.read_uint()?;
+                            let fields = r.read_array(|r| read_plutus_data_depth(r, depth + 1))?;
+                            r.expect_break()?;
+                            Ok(PlutusData::Constr(constructor, fields))
+                        }
                     }
-                    let constructor = r.read_uint()?;
-                    let fields = r.read_array(|r| read_plutus_data_depth(r, depth + 1))?;
-                    Ok(PlutusData::Constr(constructor, fields))
                 }
-                other => Err(SerializationError::CborDecode(format!(
+                (_, other) => Err(SerializationError::CborDecode(format!(
                     "plutus_data: unknown tag {other}"
                 ))),
             }
@@ -2359,6 +2386,49 @@ mod tests {
     #[test]
     fn plutus_data_constr_102_wrong_arity_rejected() {
         let data = vec![0xd8, 0x66, 0x81, 0x00];
+        let mut r = Reader::new(&data);
+        assert!(read_plutus_data(&mut r).is_err());
+    }
+
+    #[test]
+    fn plutus_data_constr_102_indefinite_outer_array_accepted() {
+        // #831 finding 1: `d8 66 9f 00 80 ff` = tag 102, indefinite
+        // `[0, []]` => Constr 0 []. Haskell's `decodeConstrExtended`
+        // uses `decodeListLenOrIndef`, which accepts an indefinite
+        // outer array closed by an explicit break; `read_plutus_data`
+        // previously required `Some(2)` and rejected this.
+        let data = vec![0xd8, 0x66, 0x9f, 0x00, 0x80, 0xff];
+        let mut r = Reader::new(&data);
+        let pd = read_plutus_data(&mut r).unwrap();
+        assert_eq!(pd, PlutusData::Constr(0, vec![]));
+    }
+
+    #[test]
+    fn plutus_data_constr_102_indefinite_missing_break_rejected() {
+        // Same as above with the trailing break omitted.
+        let data = vec![0xd8, 0x66, 0x9f, 0x00, 0x80];
+        let mut r = Reader::new(&data);
+        assert!(read_plutus_data(&mut r).is_err());
+    }
+
+    #[test]
+    fn plutus_data_wide_header_bignum_tag2_rejected() {
+        // #831 finding 2: `d8 02 41 05` is tag 2 via the non-minimal
+        // 1-byte-argument header (`0xd8 0x02`) rather than the minimal
+        // inline form (`0xc2`). `cborg`'s `peekTokenType` maps ONLY the
+        // inline `0xc2`/`0xc3` headers to the bignum path; a wide-header
+        // encoding of tag 2/3 must be rejected as an unknown
+        // constructor tag, not silently accepted as a bignum.
+        let mut data = vec![0xd8, 0x02];
+        data.extend(cbor_bytes(&[0x05]));
+        let mut r = Reader::new(&data);
+        assert!(read_plutus_data(&mut r).is_err());
+    }
+
+    #[test]
+    fn plutus_data_wide_header_bignum_tag3_rejected() {
+        let mut data = vec![0xd9, 0x00, 0x03];
+        data.extend(cbor_bytes(&[0x05]));
         let mut r = Reader::new(&data);
         assert!(read_plutus_data(&mut r).is_err());
     }

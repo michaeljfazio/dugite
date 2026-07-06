@@ -344,6 +344,19 @@ pub fn denote(
             let sig_bytes: [u8; 64] = sig.try_into().map_err(|_| {
                 UplcError::Internal("ed25519 sig length check failed after success".into())
             })?;
+            if !pk_is_canonical(&pk_bytes) {
+                // libsodium's non-COMPAT ref10 verifier
+                // (`ge25519_is_canonical`, called unconditionally from
+                // `_crypto_sign_ed25519_verify_detached` before point
+                // decompression) rejects any public key whose 255-bit
+                // magnitude is >= p = 2^255-19. `ed25519_dalek`'s
+                // ZIP-215-permissive `CompressedEdwardsY::decompress`
+                // silently reduces such "p+k" aliased encodings mod p
+                // instead of rejecting them, so this check must be
+                // applied explicitly to match cardano-node byte-for-byte
+                // (issue #825).
+                return Ok(Value::Const(Constant::Bool(false)));
+            }
             let vk = match ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes) {
                 Ok(vk) => vk,
                 Err(_) => {
@@ -610,8 +623,8 @@ pub fn denote(
         UnConstrData => {
             // Data -> Pair Integer (ProtoList Data)
             let d = unwrap_data(take_one(args, id)?, id)?;
-            match d {
-                crate::data::Data::Constr(tag, fields) => {
+            match d.into_constr() {
+                Ok((tag, fields)) => {
                     let elements: Vec<Constant> = fields.into_iter().map(Constant::Data).collect();
                     Ok(Value::Const(Constant::ProtoPair {
                         a_type: crate::term::TypeTag::Integer,
@@ -623,13 +636,13 @@ pub fn denote(
                         }),
                     }))
                 }
-                _ => Err(builtin_failure(id, "unConstrData on non-Constr Data")),
+                Err(_) => Err(builtin_failure(id, "unConstrData on non-Constr Data")),
             }
         }
         UnMapData => {
             let d = unwrap_data(take_one(args, id)?, id)?;
-            match d {
-                crate::data::Data::Map(entries) => {
+            match d.into_map() {
+                Ok(entries) => {
                     let elements: Vec<Constant> = entries
                         .into_iter()
                         .map(|(k, v)| Constant::ProtoPair {
@@ -647,24 +660,24 @@ pub fn denote(
                         elements,
                     }))
                 }
-                _ => Err(builtin_failure(id, "unMapData on non-Map Data")),
+                Err(_) => Err(builtin_failure(id, "unMapData on non-Map Data")),
             }
         }
         UnListData => {
             let d = unwrap_data(take_one(args, id)?, id)?;
-            match d {
-                crate::data::Data::List(items) => Ok(Value::Const(Constant::ProtoList {
+            match d.into_list() {
+                Ok(items) => Ok(Value::Const(Constant::ProtoList {
                     elem_type: crate::term::TypeTag::Data,
                     elements: items.into_iter().map(Constant::Data).collect(),
                 })),
-                _ => Err(builtin_failure(id, "unListData on non-List Data")),
+                Err(_) => Err(builtin_failure(id, "unListData on non-List Data")),
             }
         }
         UnIData => {
             let d = unwrap_data(take_one(args, id)?, id)?;
-            match d {
-                crate::data::Data::I(i) => Ok(Value::Const(Constant::Integer(i))),
-                other => {
+            match d.into_integer() {
+                Ok(i) => Ok(Value::Const(Constant::Integer(i))),
+                Err(other) => {
                     if std::env::var("DUGITE_DUMP_CTX").is_ok() {
                         eprintln!("!!! unIData on non-I: {other:?}");
                     }
@@ -674,9 +687,9 @@ pub fn denote(
         }
         UnBData => {
             let d = unwrap_data(take_one(args, id)?, id)?;
-            match d {
-                crate::data::Data::B(b) => Ok(Value::Const(Constant::ByteString(b))),
-                _ => Err(builtin_failure(id, "unBData on non-B Data")),
+            match d.into_bytes() {
+                Ok(b) => Ok(Value::Const(Constant::ByteString(b))),
+                Err(_) => Err(builtin_failure(id, "unBData on non-B Data")),
             }
         }
         EqualsData => {
@@ -1414,19 +1427,18 @@ pub fn denote(
             // All of these are failure conditions — unValueData does NOT merge
             // duplicates or normalise zeros.
             let d = unwrap_data(take_one(args, id)?, id)?;
-            use crate::data::Data;
-            let outer_pairs = match d {
-                Data::Map(pairs) => pairs,
-                _ => return Err(builtin_failure(id, "unValueData: expected outer Map")),
+            let outer_pairs = match d.into_map() {
+                Ok(pairs) => pairs,
+                Err(_) => return Err(builtin_failure(id, "unValueData: expected outer Map")),
             };
             const MAX_KEY: usize = 32;
             use num_traits::ToPrimitive;
             let mut result: ValueMap = BTreeMap::new();
             let mut prev_policy: Option<Vec<u8>> = None;
             for (k, v) in outer_pairs {
-                let policy = match k {
-                    Data::B(b) => b,
-                    _ => return Err(builtin_failure(id, "unValueData: policy key must be B")),
+                let policy = match k.into_bytes() {
+                    Ok(b) => b,
+                    Err(_) => return Err(builtin_failure(id, "unValueData: policy key must be B")),
                 };
                 if policy.len() > MAX_KEY {
                     return Err(builtin_failure(
@@ -1445,9 +1457,9 @@ pub fn denote(
                 }
                 prev_policy = Some(policy.clone());
 
-                let inner_pairs = match v {
-                    Data::Map(pairs) => pairs,
-                    _ => {
+                let inner_pairs = match v.into_map() {
+                    Ok(pairs) => pairs,
+                    Err(_) => {
                         return Err(builtin_failure(id, "unValueData: expected inner Map"));
                     }
                 };
@@ -1458,9 +1470,11 @@ pub fn denote(
                 let inner_map = result.entry(policy).or_default();
                 let mut prev_token: Option<Vec<u8>> = None;
                 for (tk, tv) in inner_pairs {
-                    let token = match tk {
-                        Data::B(b) => b,
-                        _ => return Err(builtin_failure(id, "unValueData: token key must be B")),
+                    let token = match tk.into_bytes() {
+                        Ok(b) => b,
+                        Err(_) => {
+                            return Err(builtin_failure(id, "unValueData: token key must be B"))
+                        }
                     };
                     if token.len() > MAX_KEY {
                         return Err(builtin_failure(
@@ -1479,9 +1493,9 @@ pub fn denote(
                     }
                     prev_token = Some(token.clone());
 
-                    let amount_bi = match tv {
-                        Data::I(i) => i,
-                        _ => {
+                    let amount_bi = match tv.into_integer() {
+                        Ok(i) => i,
+                        Err(_) => {
                             return Err(builtin_failure(id, "unValueData: token amount must be I"))
                         }
                     };
@@ -1606,6 +1620,42 @@ where
     let mut it = args.into_iter();
     let input = unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
     Ok(Value::Const(Constant::ByteString(hash(&input))))
+}
+
+/// Mirrors libsodium's `ge25519_is_canonical` (called unconditionally on
+/// the public key by `_crypto_sign_ed25519_verify_detached`'s non-COMPAT
+/// `ref10` path, which is what `cardano-base`/`cardano-node` always
+/// compiles): returns `true` iff the 32-byte little-endian encoding's
+/// 255-bit magnitude — i.e. the value with the sign bit (top bit of byte
+/// 31) masked off — is strictly less than `p = 2^255 - 19`.
+///
+/// `ed25519-dalek`'s `CompressedEdwardsY::decompress` has no equivalent
+/// check (it silently reduces the field element mod `p`, per ZIP-215),
+/// so a public key encoding `p + k` for small `k` decompresses to the
+/// same curve point as the canonical encoding of `k` — an aliasing
+/// surface libsodium/cardano-node categorically reject. See #825.
+fn pk_is_canonical(pk: &[u8; 32]) -> bool {
+    // p = 2^255 - 19 as 32 little-endian bytes, with the sign-bit slot
+    // (top bit of byte 31) cleared (p < 2^255, so that bit is 0).
+    const P: [u8; 32] = {
+        let mut p = [0xffu8; 32];
+        p[0] = 0xed;
+        p[31] = 0x7f;
+        p
+    };
+    let mut magnitude = *pk;
+    magnitude[31] &= 0x7f;
+    // Big-endian-order byte comparison (MSB first) of two 255-bit
+    // magnitudes stored little-endian: canonical iff magnitude < p.
+    for i in (0..32).rev() {
+        match magnitude[i].cmp(&P[i]) {
+            std::cmp::Ordering::Less => return true,
+            std::cmp::Ordering::Greater => return false,
+            std::cmp::Ordering::Equal => {}
+        }
+    }
+    // magnitude == p exactly => >= p => non-canonical.
+    false
 }
 
 fn take_one(args: Vec<Value>, id: BuiltinId) -> Result<Value, UplcError> {
@@ -2778,6 +2828,99 @@ mod tests {
             ),
             Err(UplcError::BuiltinFailure { .. })
         ));
+    }
+
+    /// p = 2^255 - 19, little-endian 32-byte encoding with the sign-bit
+    /// slot cleared. Used to hand-construct the boundary vectors below.
+    fn p_le_bytes() -> [u8; 32] {
+        let mut p = [0xffu8; 32];
+        p[0] = 0xed;
+        p[31] = 0x7f;
+        p
+    }
+
+    #[test]
+    fn pk_is_canonical_boundary_vectors() {
+        // 0 is canonical (magnitude 0 < p).
+        assert!(pk_is_canonical(&[0u8; 32]));
+
+        // p - 1 is canonical (the largest canonical magnitude).
+        let mut p_minus_1 = p_le_bytes();
+        p_minus_1[0] -= 1;
+        assert!(pk_is_canonical(&p_minus_1));
+
+        // p itself is NOT canonical (magnitude >= p).
+        assert!(!pk_is_canonical(&p_le_bytes()));
+
+        // p + 1 is NOT canonical.
+        let mut p_plus_1 = p_le_bytes();
+        p_plus_1[0] += 1; // 0xed + 1 = 0xee, no carry out of byte 0
+        assert!(!pk_is_canonical(&p_plus_1));
+
+        // 2^255 - 1 (all high bits set, the maximum 255-bit value) is
+        // NOT canonical.
+        let all_ones = {
+            let mut b = [0xffu8; 32];
+            b[31] = 0x7f;
+            b
+        };
+        assert!(!pk_is_canonical(&all_ones));
+
+        // The sign bit (top bit of byte 31) must be masked off before
+        // comparison: setting it on an otherwise-canonical value must
+        // not change the verdict.
+        let mut zero_with_sign_bit = [0u8; 32];
+        zero_with_sign_bit[31] = 0x80;
+        assert!(pk_is_canonical(&zero_with_sign_bit));
+    }
+
+    #[test]
+    fn verify_ed25519_rejects_all_19_noncanonical_pk_aliases() {
+        // The 19 raw byte patterns whose 255-bit magnitude is in
+        // [p, 2^255-1] = [p, p+18] (y_actual = 0..=18) are exactly the
+        // "p+k" aliasing class libsodium's `ge25519_is_canonical`
+        // rejects unconditionally, before point decompression is even
+        // attempted. `ed25519-dalek`'s permissive decompress would
+        // otherwise silently reduce these mod p and (for the subset
+        // that land on an ordinary, non-small-order point) potentially
+        // accept a signature libsodium/cardano-node reject outright.
+        // The message/signature bytes are irrelevant here: canonicity
+        // must be rejected before any curve arithmetic runs.
+        let msg = b"whatever";
+        let sig = [0u8; 64];
+        for y_actual in 0u8..=18 {
+            let mut pk = p_le_bytes();
+            // p_le_bytes() + y_actual: p's low byte is 0xed, so adding
+            // y_actual in 0..=18 never carries out of byte 0 (0xed+18 =
+            // 0xff) and never touches the sign bit.
+            pk[0] += y_actual;
+            assert!(
+                !pk_is_canonical(&pk),
+                "y_actual={y_actual} should be non-canonical"
+            );
+            let v = run(
+                BuiltinId::VerifyEd25519Signature,
+                vec![bs(&pk), bs(msg), bs(&sig)],
+            )
+            .unwrap();
+            assert_eq!(
+                v,
+                b(false),
+                "non-canonical pk alias (y_actual={y_actual}) must verify to False"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_ed25519_canonical_pk_still_verifies_true() {
+        // Regression: the new canonicity gate must not disturb the
+        // existing byte-exact RFC 8032 vector (a fully canonical
+        // public key, well below p).
+        let pk = hex::decode("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+            .unwrap();
+        assert!(pk.len() >= 32);
+        let pk32: [u8; 32] = pk[..32].try_into().unwrap();
+        assert!(pk_is_canonical(&pk32));
     }
 
     // ── Hash functions ─────────────────────────────────────────────

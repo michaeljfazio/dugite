@@ -1629,7 +1629,7 @@ mod tests {
             ),
         ]);
         let d = plutus_data_to_data(&p);
-        match d {
+        match &d {
             Data::Map(entries) => {
                 assert_eq!(entries.len(), 2);
                 assert_eq!(entries[0].0, Data::I(BigInt::from(2))); // input order preserved

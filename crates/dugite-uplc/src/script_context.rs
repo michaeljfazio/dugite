@@ -1139,7 +1139,7 @@ mod tests {
         };
         // V1/V2: ada entry present and first.
         let m = v.to_mint_data_v1v2();
-        let Data::Map(entries) = m else {
+        let Ok(entries) = m.into_map() else {
             panic!("expected Map");
         };
         assert_eq!(entries.len(), 2, "ada + 1 native policy");
@@ -1156,7 +1156,7 @@ mod tests {
 
         // V3 (to_data): NO ada entry — just the native policy.
         let v3 = v.to_data();
-        let Data::Map(v3_entries) = v3 else {
+        let Ok(v3_entries) = v3.into_map() else {
             panic!("expected Map");
         };
         assert_eq!(v3_entries.len(), 1, "V3 MintValue omits ada");
@@ -1167,7 +1167,7 @@ mod tests {
     fn credential_pubkey_encodes_as_constr_0() {
         let c = pk(0xaa);
         let d = c.to_data();
-        if let Data::Constr(tag, fields) = d {
+        if let Ok((tag, fields)) = d.into_constr() {
             assert_eq!(tag, 0);
             assert_eq!(fields.len(), 1);
             assert!(matches!(&fields[0], Data::B(b) if b.len() == 28));
@@ -1190,7 +1190,7 @@ mod tests {
             staking: None,
         };
         let d = a.to_data();
-        if let Data::Constr(0, fields) = d {
+        if let Ok((0, fields)) = d.into_constr() {
             assert_eq!(fields.len(), 2);
         } else {
             panic!("expected Constr 0");
@@ -1865,7 +1865,7 @@ mod tests {
             },
             datum: Some(Data::I(BigInt::from(42))),
         };
-        if let Data::Constr(1, fields) = si.to_data() {
+        if let Ok((1, fields)) = si.to_data().into_constr() {
             assert_eq!(fields.len(), 2);
             // datum slot: Constr 0 [Data::I(42)]
             if let Data::Constr(0, inner) = &fields[1] {
