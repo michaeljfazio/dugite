@@ -4506,7 +4506,10 @@ mod tests {
         let p = read_ex_unit_prices(&mut r).unwrap();
         assert_eq!(p.mem_price.numerator, 1);
         assert_eq!(p.mem_price.denominator, 100);
-        assert_eq!(p.step_price.denominator, 1000);
+        // #860.4: rationals are reduced to lowest terms at decode (Haskell `%`), so
+        // the non-reduced wire pair 2/1000 becomes 1/500.
+        assert_eq!(p.step_price.numerator, 1);
+        assert_eq!(p.step_price.denominator, 500);
     }
 
     #[test]
