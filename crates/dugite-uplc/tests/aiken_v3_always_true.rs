@@ -47,7 +47,14 @@ const AIKEN_V3_ALWAYS_TRUE_CBOR: &[u8] = &[
 fn decode_succeeds() {
     let p = Program::from_cbor(AIKEN_V3_ALWAYS_TRUE_CBOR)
         .expect("Aiken-built V3 always-true must decode cleanly after #41b7a036a");
-    assert_eq!(p.version, (1, 1, 0));
+    assert_eq!(
+        p.version,
+        (
+            num_bigint::BigUint::from(1u8),
+            num_bigint::BigUint::from(1u8),
+            num_bigint::BigUint::ZERO
+        )
+    );
     // Top-level term is a single Lambda (binds ctx).
     assert!(matches!(p.term, Term::Lam(_)));
 }

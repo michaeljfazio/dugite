@@ -61,8 +61,18 @@ use dugite_uplc::script_context::{
     Credential, GovActionId, OutputDatum, PlutusValue, PosixTimeRange, ScriptContextV1,
     ScriptPurpose, StakingCredential, TxInInfo, TxInfoV1, TxInfoV2, TxInfoV3, TxOut, TxOutRef,
 };
-use num_bigint::BigInt;
+use num_bigint::{BigInt, BigUint};
 use std::rc::Rc;
+
+/// Test-only ergonomic constructor for a `Program` version triple
+/// (`BigUint`-typed since #842's residual arbitrary-precision fix).
+fn ver(major: u64, minor: u64, patch: u64) -> (BigUint, BigUint, BigUint) {
+    (
+        BigUint::from(major),
+        BigUint::from(minor),
+        BigUint::from(patch),
+    )
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Bug A: ADA policy key
@@ -309,7 +319,7 @@ fn flat_round_trips_data_constant() {
 
     let data_val = Data::I(BigInt::from(42i64));
     let program = Program {
-        version: (1, 0, 0),
+        version: ver(1, 0, 0),
         term: Term::Lam(Rc::new(Term::Const(Constant::Data(
             data_val.clone().into(),
         )))),
@@ -318,7 +328,7 @@ fn flat_round_trips_data_constant() {
     let flat = program.to_flat().expect("encode Data constant program");
     let decoded = Program::from_flat(&flat).expect("decode Data constant program");
 
-    assert_eq!(decoded.version, (1, 0, 0));
+    assert_eq!(decoded.version, ver(1, 0, 0));
     let Term::Lam(body) = decoded.term else {
         panic!("expected Lam");
     };
@@ -341,7 +351,7 @@ fn flat_round_trips_list_integer_constant() {
         Constant::Integer(BigInt::from(3i64)),
     ];
     let program = Program {
-        version: (1, 0, 0),
+        version: ver(1, 0, 0),
         term: Term::Const(Constant::ProtoList {
             elem_type: TypeTag::Integer,
             elements: elements.clone(),
@@ -371,7 +381,7 @@ fn flat_round_trips_pair_constant() {
     use dugite_uplc::Program;
 
     let program = Program {
-        version: (1, 0, 0),
+        version: ver(1, 0, 0),
         term: Term::Const(Constant::ProtoPair {
             a_type: TypeTag::Integer,
             b_type: TypeTag::ByteString,
@@ -403,7 +413,7 @@ fn flat_round_trips_list_data_constant() {
         Constant::Data(Data::Constr(BigInt::from(0), vec![Data::I(BigInt::from(3i64))]).into()),
     ];
     let program = Program {
-        version: (1, 0, 0),
+        version: ver(1, 0, 0),
         term: Term::Const(Constant::ProtoList {
             elem_type: TypeTag::Data,
             elements: items.clone(),
@@ -641,7 +651,7 @@ fn flat_round_trips_large_integer_constant() {
     // A large positive integer that doesn't fit in i64.
     let large: BigInt = BigInt::from(i64::MAX) + 1i64;
     let program = Program {
-        version: (1, 0, 0),
+        version: ver(1, 0, 0),
         term: Term::Const(Constant::Integer(large.clone())),
     };
     let flat = program.to_flat().expect("encode large integer");
@@ -660,7 +670,7 @@ fn flat_round_trips_negative_integer_constant() {
 
     for &n in &[-1i64, i64::MIN, -123456789i64] {
         let program = Program {
-            version: (1, 0, 0),
+            version: ver(1, 0, 0),
             term: Term::Const(Constant::Integer(BigInt::from(n))),
         };
         let flat = program.to_flat().expect("encode negative int");
