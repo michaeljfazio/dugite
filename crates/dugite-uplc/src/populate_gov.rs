@@ -1011,7 +1011,7 @@ mod tests {
             ..Default::default()
         };
         let data = cost_models_to_data(&cm);
-        match data {
+        match &data {
             Data::Map(entries) => {
                 assert_eq!(entries.len(), 2, "V3 + one unknown lang");
                 // Entry 0: (I 2, List [I 100]) — PlutusV3.
@@ -1131,7 +1131,7 @@ mod tests {
         let tx_cert = certificate_to_plutus_v1v2(&cert).unwrap();
         let purpose = crate::script_context::ScriptPurpose::Certifying(0, tx_cert);
         let d = purpose.to_data();
-        match d {
+        match &d {
             Data::Constr(3, fields) => {
                 assert_eq!(
                     fields.len(),
@@ -1273,7 +1273,7 @@ mod tests {
             anchor: anchor(),
         };
         let pl = proposal_to_plutus(&p).unwrap();
-        let Data::Constr(0, fields) = pl.0 else {
+        let Ok((0, fields)) = pl.0.into_constr() else {
             panic!("expected Constr 0 wrapper");
         };
         assert_eq!(fields.len(), 3);
@@ -1308,7 +1308,8 @@ mod tests {
     #[test]
     fn cert_stake_registration_uses_constr_0_with_none_deposit() {
         let c = PrimCert::StakeRegistration(key_cred(1));
-        let TxCert(Data::Constr(tag, fields)) = certificate_to_plutus(&c).unwrap() else {
+        let TxCert(d) = certificate_to_plutus(&c).unwrap();
+        let Ok((tag, fields)) = d.into_constr() else {
             panic!("expected Constr");
         };
         assert_eq!(tag, 0);
@@ -1322,7 +1323,8 @@ mod tests {
             credential: key_cred(1),
             deposit: Lovelace(2_000_000),
         };
-        let TxCert(Data::Constr(tag, fields)) = certificate_to_plutus(&c).unwrap() else {
+        let TxCert(d) = certificate_to_plutus(&c).unwrap();
+        let Ok((tag, fields)) = d.into_constr() else {
             panic!("expected Constr");
         };
         assert_eq!(tag, 0);
@@ -1350,7 +1352,8 @@ mod tests {
             pool_metadata: None,
         };
         let c = PrimCert::PoolRegistration(params);
-        let TxCert(Data::Constr(tag, fields)) = certificate_to_plutus(&c).unwrap() else {
+        let TxCert(d) = certificate_to_plutus(&c).unwrap();
+        let Ok((tag, fields)) = d.into_constr() else {
             panic!("expected Constr");
         };
         assert_eq!(tag, 7);
@@ -1364,7 +1367,8 @@ mod tests {
             pool_hash: h28(0xcc),
             epoch: 500,
         };
-        let TxCert(Data::Constr(tag, fields)) = certificate_to_plutus(&c).unwrap() else {
+        let TxCert(d) = certificate_to_plutus(&c).unwrap();
+        let Ok((tag, fields)) = d.into_constr() else {
             panic!("expected Constr");
         };
         assert_eq!(tag, 8);
@@ -1793,7 +1797,7 @@ mod tests {
             policy_hash: None,
         })
         .unwrap();
-        let Data::Constr(0, fields) = d else {
+        let Ok((0, fields)) = d.into_constr() else {
             panic!("ParameterChange must be Constr 0");
         };
         let Data::Map(entries) = &fields[1] else {
@@ -1835,7 +1839,7 @@ mod tests {
             policy_hash: None,
         })
         .unwrap();
-        let Data::Constr(0, fields) = d else {
+        let Ok((0, fields)) = d.into_constr() else {
             panic!("ParameterChange must be Constr 0");
         };
         let Data::Map(entries) = &fields[1] else {

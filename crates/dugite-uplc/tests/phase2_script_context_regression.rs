@@ -237,10 +237,10 @@ fn posix_time_range_ttl_only_upper_closure_is_era_gated() {
         upper: Some(1_781_858_645_000i64),
     };
     let upper_closure = |conway: bool| -> Data {
-        let Data::Constr(0, outer) = r.to_data(conway) else {
+        let Ok((0, outer)) = r.to_data(conway).into_constr() else {
             panic!("interval must be Constr 0");
         };
-        let Data::Constr(0, ub) = outer[1].clone() else {
+        let Ok((0, ub)) = outer[1].clone().into_constr() else {
             panic!("upper bound must be Constr 0");
         };
         ub[1].clone()
