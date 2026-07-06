@@ -48,12 +48,14 @@
 //! | `multiplyInteger`  | `added_sizes`                             | `added_sizes`      |
 
 use crate::builtin::cost::{
-    AboveBelowDiagP, BuiltinCosts, ConstAboveDiagMulP, ConstAboveDiagP, CostPair, CostingFun,
-    DiagLinearP, Linear1, LinearYZP, QuadXY, Quadratic1, SubtractedSizesP,
+    AboveBelowDiagP, BuiltinCosts, ConstAboveDiagLinXYP, ConstAboveDiagMulP, ConstAboveDiagP,
+    CostPair, CostingFun, DiagLinearP, ExpModP, InteractionXYP, Linear1, LinearYZP, QuadXY,
+    Quadratic1, SubtractedSizesP,
 };
 use crate::machine::cost::MachineCosts;
 use crate::machine::ExBudget;
 use crate::term::BuiltinId;
+use std::borrow::Cow;
 
 /// Number of parameters in a PlutusV1 cost model (`ParamName` enum size).
 pub const V1_PARAM_COUNT: usize = 166;
@@ -61,10 +63,18 @@ pub const V1_PARAM_COUNT: usize = 166;
 /// Number of parameters in a PlutusV2 cost model at the Vasil/Babbage
 /// deployment (`PlutusLedgerApi.V2.ParamName`): the 166 V1 params plus the
 /// nine added by `serialiseData` (4), `verifyEcdsaSecp256k1Signature` (2),
-/// and `verifySchnorrSecp256k1Signature` (3). Per `tagWithParamNames`'
-/// `zip`-truncation rule, a longer on-chain array (Plomin-era V2) is
-/// accepted and the trailing params are ignored.
+/// and `verifySchnorrSecp256k1Signature` (3).
 pub const V2_PARAM_COUNT: usize = 175;
+
+/// Number of parameters in a PlutusV2 cost model after the Plomin (PV10)
+/// `integerToByteString`/`byteStringToInteger` addition (10 more params):
+/// 185 total. Per `tagWithParamNames`'s `zip`-pad/truncate rule
+/// (oracle-confirmed 2026-07-06), this is the length [`apply_v2`] now pads
+/// short arrays up to / truncates long arrays down to (#826/#830) — a V2
+/// array shorter than this has its i2b/b2i tail padded with
+/// `maxBound::Int64`, making those builtins unaffordable rather than
+/// silently cheap.
+pub const V2_PARAM_COUNT_PLOMIN: usize = 185;
 
 /// A cost model resolved from on-chain parameters, ready to drive a CEK run.
 #[derive(Debug, Clone)]
@@ -98,6 +108,43 @@ impl std::fmt::Display for CostModelApplyError {
 }
 
 impl std::error::Error for CostModelApplyError {}
+
+/// Pad a short cost-model array with `i64::MAX` (Haskell's `maxBound ::
+/// Int64`) or truncate a long one down to `expected` entries. Never
+/// rejects on length and never substitutes a different reference model —
+/// mirrors `tagWithParamNames`'s `zip`-based pad/truncate rule
+/// (IntersectMBO/plutus `PlutusLedgerApi.Common.ParamName`,
+/// oracle-confirmed 2026-07-06 against `cardano-ledger`'s
+/// `decodeCostModelLenient`/`mkCostModel`, live since protocol version 9):
+///
+/// ```haskell
+/// case lenExpected `compare` lenActual of
+///   EQ -> pure $ zip paramNames ledgerParams
+///   LT -> do tell [CMTooManyParamsWarn ...]
+///            pure $ zip paramNames ledgerParams          -- zip truncates
+///   GT -> do tell [CMTooFewParamsWarn ...]
+///            pure $ zip paramNames (ledgerParams ++ repeat maxBound)
+/// ```
+///
+/// `mkCostModel` always evaluates on the actual (possibly padded/
+/// truncated) supplied coefficients — "we always retain the original
+/// values that were supplied" — it never falls back to a different
+/// reference model (#826). A too-short array's padded tail becomes
+/// `maxBound`: an "unpriced" builtin at that protocol version becomes
+/// practically unaffordable, matching Haskell, rather than silently
+/// keeping a cheap reference-model default (#830).
+fn pad_or_truncate(p: &[i64], expected: usize) -> Cow<'_, [i64]> {
+    match p.len().cmp(&expected) {
+        std::cmp::Ordering::Equal => Cow::Borrowed(p),
+        std::cmp::Ordering::Less => {
+            let mut v = Vec::with_capacity(expected);
+            v.extend_from_slice(p);
+            v.resize(expected, i64::MAX);
+            Cow::Owned(v)
+        }
+        std::cmp::Ordering::Greater => Cow::Borrowed(&p[..expected]),
+    }
+}
 
 /// Sequential reader over the flat parameter array.
 struct Cursor<'a> {
@@ -303,16 +350,14 @@ fn verify_ed25519(cur: &mut Cursor<'_>, variant_b: bool) -> CostPair {
 }
 
 /// Apply a flat PlutusV1 cost-model array (166 entries, canonical
-/// `ParamName` order) to a fresh [`AppliedCosts`].
+/// `ParamName` order) to a fresh [`AppliedCosts`]. A wrong-length input is
+/// padded with `maxBound::Int64` (too short) or truncated (too long) per
+/// [`pad_or_truncate`] — never rejected (#826).
 pub fn apply_v1(p: &[i64], major_pv: u32) -> Result<AppliedCosts, CostModelApplyError> {
     let variant_b = is_variant_b(major_pv);
     let variant_d = is_variant_d(major_pv);
-    if p.len() != V1_PARAM_COUNT {
-        return Err(CostModelApplyError::WrongLength {
-            expected: V1_PARAM_COUNT,
-            got: p.len(),
-        });
-    }
+    let padded = pad_or_truncate(p, V1_PARAM_COUNT);
+    let p: &[i64] = padded.as_ref();
     use BuiltinId::*;
     let mut b = BuiltinCosts::DEFAULT.clone();
     let mut m = MachineCosts::DEFAULT;
@@ -394,12 +439,6 @@ pub fn apply_v1(p: &[i64], major_pv: u32) -> Result<AppliedCosts, CostModelApply
         cur.i, V1_PARAM_COUNT,
         "V1 cost-model walk must consume exactly {V1_PARAM_COUNT} params"
     );
-    if cur.i != V1_PARAM_COUNT {
-        return Err(CostModelApplyError::WrongLength {
-            expected: V1_PARAM_COUNT,
-            got: cur.i,
-        });
-    }
 
     Ok(AppliedCosts {
         machine: m,
@@ -421,21 +460,20 @@ pub fn apply_v1(p: &[i64], major_pv: u32) -> Result<AppliedCosts, CostModelApply
 ///   * `verifySchnorrSecp256k1Signature` (linear_in_y / constant) — after
 ///     `verifyEd25519Signature`.
 ///
-/// A longer on-chain array (Plomin-era V2 appends `integerToByteString`,
-/// the bitwise group, …) is accepted: only the leading 175 params are
-/// consumed and the rest ignored, exactly as `tagWithParamNames`' `zip`
-/// truncates for a node whose `ParamName` enum predates those additions.
-/// Builtins beyond index 174 therefore retain the reference default — a
-/// no-op for any V2 script that does not call a Plomin-era builtin.
+/// The on-chain array is padded/truncated to [`V2_PARAM_COUNT_PLOMIN`]
+/// (185) per [`pad_or_truncate`] before the walk (#826/#830): a
+/// pre-Plomin (175-length) array gets its `integerToByteString`/
+/// `byteStringToInteger` tail padded with `maxBound::Int64` (those
+/// builtins become unaffordable rather than silently cheap-DEFAULT), and
+/// a longer array is truncated to 185. This is never observable for a
+/// genuine pre-Plomin V2 script: the flat-term builtin-availability gate
+/// already rejects `integerToByteString`/`byteStringToInteger` bytecode
+/// before PV10, so the padded/truncated tail is never actually costed.
 pub fn apply_v2(p: &[i64], major_pv: u32) -> Result<AppliedCosts, CostModelApplyError> {
     let variant_b = is_variant_b(major_pv);
     let variant_d = is_variant_d(major_pv);
-    if p.len() < V2_PARAM_COUNT {
-        return Err(CostModelApplyError::WrongLength {
-            expected: V2_PARAM_COUNT,
-            got: p.len(),
-        });
-    }
+    let padded = pad_or_truncate(p, V2_PARAM_COUNT_PLOMIN);
+    let p: &[i64] = padded.as_ref();
     use BuiltinId::*;
     let mut b = BuiltinCosts::DEFAULT.clone();
     let mut m = MachineCosts::DEFAULT;
@@ -523,14 +561,22 @@ pub fn apply_v2(p: &[i64], major_pv: u32) -> Result<AppliedCosts, CostModelApply
 
     debug_assert_eq!(
         cur.i, V2_PARAM_COUNT,
-        "V2 cost-model walk must consume exactly {V2_PARAM_COUNT} params"
+        "V2 base cost-model walk must consume exactly {V2_PARAM_COUNT} params"
     );
-    if cur.i != V2_PARAM_COUNT {
-        return Err(CostModelApplyError::WrongLength {
-            expected: V2_PARAM_COUNT,
-            got: cur.i,
-        });
-    }
+
+    // Plomin (PV10) tail: integerToByteString / byteStringToInteger (10
+    // params, indices 175..=184). Same shapes as V3's i2b/b2i (#830) —
+    // these builtins were added to V2 and V3 at the same protocol version
+    // with identical cost-function shapes.
+    let i2b = integer_to_bytestring_cost(cur);
+    b.set_cost_pair(IntegerToByteString, i2b);
+    let b2i = bytestring_to_integer_cost(cur);
+    b.set_cost_pair(ByteStringToInteger, b2i);
+
+    debug_assert_eq!(
+        cur.i, V2_PARAM_COUNT_PLOMIN,
+        "V2 cost-model walk must consume exactly {V2_PARAM_COUNT_PLOMIN} params"
+    );
 
     Ok(AppliedCosts {
         machine: m,
@@ -544,14 +590,19 @@ pub fn apply_v2(p: &[i64], major_pv: u32) -> Result<AppliedCosts, CostModelApply
 /// CPU coefficients, +5 each = +20; serialiseData/secp unchanged) plus the
 /// `cekConstr`/`cekCase` machine costs (4) and the batch-4 builtins
 /// (BLS12-381, keccak_256, blake2b_224, integerToByteString,
-/// byteStringToInteger). Per `tagWithParamNames`' `zip`-truncation rule a
-/// longer on-chain array (Plomin PV10 = 297, van Rossem PV11 = 350) is
-/// accepted: the bitwise batch (251..=296) is consumed when present and any
-/// PV11 tail is ignored (those builtins are not yet implemented).
+/// byteStringToInteger).
 pub const V3_PARAM_COUNT_BASE: usize = 251;
 
 /// PlutusV3 cost-model parameter count after the Plomin (PV10) bitwise batch.
 pub const V3_PARAM_COUNT_BITWISE: usize = 297;
+
+/// PlutusV3 cost-model parameter count after the van Rossem (PV11 /
+/// PV1.1.0) batch6 tail (`expModInteger` .. `scaleValue`, 53 more params —
+/// see [`van_rossem_tail`]). Per `tagWithParamNames`'s `zip`-pad/truncate
+/// rule, [`apply_v3`] now always pads/truncates to this length rather than
+/// conditionally skipping the tail when the on-chain array is shorter
+/// (#826/#830).
+pub const V3_PARAM_COUNT_VANROSSEM: usize = 350;
 
 /// V3 integer-division CPU, quadratic-in-x-and-y sub-model. Flat sub-order
 /// is the `ParamName` declaration order: `constant`, then the quadratic
@@ -621,9 +672,11 @@ fn v3_division_mod_rem(cur: &mut Cursor<'_>, above_and_below_cpu: bool) -> CostP
     CostPair { cpu, mem }
 }
 
-/// V3 `integerToByteString`: CPU `quadratic_in_z` (`c0, c1, c2`); memory
-/// `literal_in_y_or_linear_in_z` (`intercept, slope`).
-fn v3_integer_to_bytestring(cur: &mut Cursor<'_>) -> CostPair {
+/// `integerToByteString`: CPU `quadratic_in_z` (`c0, c1, c2`); memory
+/// `literal_in_y_or_linear_in_z` (`intercept, slope`). Shared by V2's
+/// Plomin tail and V3's base walk — same shape at every protocol version
+/// (#830).
+fn integer_to_bytestring_cost(cur: &mut Cursor<'_>) -> CostPair {
     let cpu = CostingFun::QuadraticInZ(Quadratic1 {
         c0: cur.next(),
         c1: cur.next(),
@@ -633,9 +686,10 @@ fn v3_integer_to_bytestring(cur: &mut Cursor<'_>) -> CostPair {
     CostPair { cpu, mem }
 }
 
-/// V3 `byteStringToInteger`: CPU `quadratic_in_y` (`c0, c1, c2`); memory
-/// `linear_in_y` (`intercept, slope`).
-fn v3_bytestring_to_integer(cur: &mut Cursor<'_>) -> CostPair {
+/// `byteStringToInteger`: CPU `quadratic_in_y` (`c0, c1, c2`); memory
+/// `linear_in_y` (`intercept, slope`). Shared by V2's Plomin tail and V3's
+/// base walk (#830).
+fn bytestring_to_integer_cost(cur: &mut Cursor<'_>) -> CostPair {
     let cpu = CostingFun::QuadraticInY(Quadratic1 {
         c0: cur.next(),
         c1: cur.next(),
@@ -683,13 +737,20 @@ fn v3_bitwise_logical(cur: &mut Cursor<'_>) -> CostPair {
 /// `major_pv` is the block's major protocol version, used only to select
 /// the `divideInteger`/`modInteger` CPU shape described above (#820); every
 /// other builtin's shape is PV-independent within V3.
+///
+/// The on-chain array is padded/truncated to [`V3_PARAM_COUNT_VANROSSEM`]
+/// (350) per [`pad_or_truncate`] before the walk (#826/#830): the Plomin
+/// bitwise batch (251..=296) and the van Rossem batch6 tail (297..=349,
+/// see [`van_rossem_tail`]) are now ALWAYS applied — a pre-Plomin
+/// (251-length) array gets both tails padded with `maxBound::Int64`
+/// instead of silently leaving those builtins on the cheap reference
+/// DEFAULT. This is never observable for a genuine pre-Plomin/pre-van-
+/// Rossem V3 script: the flat-term builtin-availability gate already
+/// rejects those builtins' bytecode before their protocol version, so the
+/// padded tail is never actually costed.
 pub fn apply_v3(p: &[i64], major_pv: u32) -> Result<AppliedCosts, CostModelApplyError> {
-    if p.len() < V3_PARAM_COUNT_BASE {
-        return Err(CostModelApplyError::WrongLength {
-            expected: V3_PARAM_COUNT_BASE,
-            got: p.len(),
-        });
-    }
+    let padded = pad_or_truncate(p, V3_PARAM_COUNT_VANROSSEM);
+    let p: &[i64] = padded.as_ref();
     // `divideInteger`/`modInteger` CPU shape gate (#820). Shares the same
     // `vanRossemPV` (11) threshold as PlutusV1/V2's variant B→D switch
     // (`is_variant_d`); for V3 this is the C→E switch. `quotientInteger`/
@@ -817,60 +878,198 @@ pub fn apply_v3(p: &[i64], major_pv: u32) -> Result<AppliedCosts, CostModelApply
     refill_builtin(&mut b, Keccak_256, cur)?;
     refill_builtin(&mut b, Blake2b_224, cur)?;
     // [241..=250] integerToByteString, byteStringToInteger (special shapes).
-    let i2b = v3_integer_to_bytestring(cur);
+    let i2b = integer_to_bytestring_cost(cur);
     b.set_cost_pair(IntegerToByteString, i2b);
-    let b2i = v3_bytestring_to_integer(cur);
+    let b2i = bytestring_to_integer_cost(cur);
     b.set_cost_pair(ByteStringToInteger, b2i);
 
     debug_assert_eq!(
         cur.i, V3_PARAM_COUNT_BASE,
         "V3 base cost-model walk must consume exactly {V3_PARAM_COUNT_BASE} params"
     );
-    if cur.i != V3_PARAM_COUNT_BASE {
-        return Err(CostModelApplyError::WrongLength {
-            expected: V3_PARAM_COUNT_BASE,
-            got: cur.i,
-        });
-    }
 
-    // [251..=296] Plomin (PV10) bitwise batch — only present when the on-chain
-    // array advertises them. Consumed when `p.len() >= 297`; a PV11 (350) tail
-    // beyond index 296 is ignored (those builtins are not yet implemented, so
-    // they retain the reference default and a script calling one fails
-    // elsewhere rather than mis-costing).
-    if p.len() >= V3_PARAM_COUNT_BITWISE {
-        let and = v3_bitwise_logical(cur);
-        b.set_cost_pair(AndByteString, and);
-        let or = v3_bitwise_logical(cur);
-        b.set_cost_pair(OrByteString, or);
-        let xor = v3_bitwise_logical(cur);
-        b.set_cost_pair(XorByteString, xor);
-        refill_builtin(&mut b, ComplementByteString, cur)?;
-        refill_builtin(&mut b, ReadBit, cur)?;
-        refill_builtin(&mut b, WriteBits, cur)?;
-        refill_builtin(&mut b, ReplicateByte, cur)?;
-        refill_builtin(&mut b, ShiftByteString, cur)?;
-        refill_builtin(&mut b, RotateByteString, cur)?;
-        refill_builtin(&mut b, CountSetBits, cur)?;
-        refill_builtin(&mut b, FindFirstSetBit, cur)?;
-        refill_builtin(&mut b, Ripemd_160, cur)?;
+    // [251..=296] Plomin (PV10) bitwise batch. Always walked now (#826/#830)
+    // — `pad_or_truncate` already guarantees `p` is exactly
+    // `V3_PARAM_COUNT_VANROSSEM` long, so a pre-Plomin array's slice here is
+    // `maxBound` padding rather than being skipped outright.
+    let and = v3_bitwise_logical(cur);
+    b.set_cost_pair(AndByteString, and);
+    let or = v3_bitwise_logical(cur);
+    b.set_cost_pair(OrByteString, or);
+    let xor = v3_bitwise_logical(cur);
+    b.set_cost_pair(XorByteString, xor);
+    refill_builtin(&mut b, ComplementByteString, cur)?;
+    refill_builtin(&mut b, ReadBit, cur)?;
+    refill_builtin(&mut b, WriteBits, cur)?;
+    refill_builtin(&mut b, ReplicateByte, cur)?;
+    refill_builtin(&mut b, ShiftByteString, cur)?;
+    refill_builtin(&mut b, RotateByteString, cur)?;
+    refill_builtin(&mut b, CountSetBits, cur)?;
+    refill_builtin(&mut b, FindFirstSetBit, cur)?;
+    refill_builtin(&mut b, Ripemd_160, cur)?;
 
-        debug_assert_eq!(
-            cur.i, V3_PARAM_COUNT_BITWISE,
-            "V3 bitwise batch must consume exactly {V3_PARAM_COUNT_BITWISE} params"
-        );
-        if cur.i != V3_PARAM_COUNT_BITWISE {
-            return Err(CostModelApplyError::WrongLength {
-                expected: V3_PARAM_COUNT_BITWISE,
-                got: cur.i,
-            });
-        }
-    }
+    debug_assert_eq!(
+        cur.i, V3_PARAM_COUNT_BITWISE,
+        "V3 bitwise batch must consume exactly {V3_PARAM_COUNT_BITWISE} params"
+    );
+
+    // [297..=349] van Rossem (PV11 / PV1.1.0) batch6 tail — always walked
+    // now for the same reason as the bitwise batch above (#830).
+    van_rossem_tail(&mut b, cur)?;
+
+    debug_assert_eq!(
+        cur.i, V3_PARAM_COUNT_VANROSSEM,
+        "V3 cost-model walk must consume exactly {V3_PARAM_COUNT_VANROSSEM} params"
+    );
 
     Ok(AppliedCosts {
         machine: m,
         builtins: b,
     })
+}
+
+/// Van Rossem (PV11 / PV1.1.0) batch6 tail: 53 flat params (indices
+/// 297..=349 of the padded/truncated V3 array) across 14 builtins —
+/// `expModInteger`, `dropList`, `lengthOfArray`, `listToArray`,
+/// `indexArray`, the two BLS12-381 `multiScalarMul`s, `insertCoin`,
+/// `lookupCoin`, `unionValue`, `valueContains`, `valueData`,
+/// `unValueData`, `scaleValue`.
+///
+/// Field order and shapes are oracle-confirmed 2026-07-06 against
+/// `IntersectMBO/plutus` `PlutusLedgerApi.V3.ParamName` +
+/// `plutus-core/.../CostingFun/Core.hs` +
+/// `builtinCostModelE.json`, cross-checked against the live PV11 preview
+/// `PlutusV3` cost-model array (length 350) and against dugite's own
+/// `BuiltinCosts::DEFAULT` table for `BuiltinId` 87..=100 (which already
+/// encodes this exact shape set — see `builtin::cost`). The 10
+/// single/two-field builtins below (`ExpModInteger`'s mem, `DropList`,
+/// `LengthOfArray`, `ListToArray`, `IndexArray`, both `MultiScalarMul`s,
+/// `InsertCoin`, `LookupCoin`, `ValueData`, `ScaleValue`) reuse the
+/// universal `linear`/single-value cursor convention via
+/// [`refill_builtin`] — HIGH confidence, same convention as every other
+/// builtin in this file. Four builtins need dedicated field-order
+/// handling because their shape isn't one `refill_shape` knows how to
+/// refill generically:
+///   * `expModInteger` cpu (`exp_mod_cost`: `coefficient00, coefficient11,
+///     coefficient12`) — HIGH confidence, direct Haskell record-field quote;
+///   * `unValueData` cpu (`quadratic_in_x`: `c0, c1, c2`) — HIGH confidence,
+///     same `c0,c1,c2` convention as [`v3_division_cpu`]'s siblings;
+///   * `unionValue` cpu (`with_interaction_in_x_and_y`: `c00, c10, c01,
+///     c11`) — MODERATE confidence on this exact sub-order (not
+///     alphabetical; not independently re-derivable from the Rust struct's
+///     field declaration order the way the others are);
+///   * `valueContains` cpu (`const_above_diagonal{linear_in_x_and_y}`:
+///     `constant, intercept, slope1, slope2`) — MODERATE-HIGH confidence
+///     (matches the existing `ConstAboveDiagLinXYP` struct's field
+///     declaration order, which a prior contributor already had to source
+///     correctly to build byte-exact `DEFAULT` coefficients for this
+///     builtin).
+///
+/// None of these 14 builtins are exercised by a pre-PV11 V3 script (the
+/// flat-term builtin-availability gate rejects their bytecode before
+/// PV11), so this tail is inert for every V3 tx on mainnet/preprod today;
+/// preview (PV11) is the first network where it is live. A dedicated
+/// live-array fixture test cross-checked against a real `cardano-ledger`
+/// dump is recommended follow-up for the two MODERATE-confidence entries
+/// (`unionValue`, `valueContains`) per the issue's own test guidance.
+fn van_rossem_tail(b: &mut BuiltinCosts, cur: &mut Cursor<'_>) -> Result<(), CostModelApplyError> {
+    use BuiltinId::*;
+
+    // expModInteger — exp_mod_cost(coefficient00, coefficient11,
+    // coefficient12) / linear_in_z(intercept, slope).
+    let exp_mod_cpu = CostingFun::ExpModCost(ExpModP {
+        coefficient00: cur.next(),
+        coefficient11: cur.next(),
+        coefficient12: cur.next(),
+    });
+    let exp_mod_mem = CostingFun::LinearInZ(cur.linear());
+    b.set_cost_pair(
+        ExpModInteger,
+        CostPair {
+            cpu: exp_mod_cpu,
+            mem: exp_mod_mem,
+        },
+    );
+
+    // dropList, lengthOfArray, listToArray, indexArray — all generic
+    // linear/constant shapes, refillable from the DEFAULT template.
+    refill_builtin(b, DropList, cur)?;
+    refill_builtin(b, LengthOfArray, cur)?;
+    refill_builtin(b, ListToArray, cur)?;
+    refill_builtin(b, IndexArray, cur)?;
+
+    // bls12_381_G1/G2_multiScalarMul — linear_in_x / constant_cost.
+    refill_builtin(b, Bls12_381_G1_MultiScalarMul, cur)?;
+    refill_builtin(b, Bls12_381_G2_MultiScalarMul, cur)?;
+
+    // insertCoin, lookupCoin — generic linear shapes (dugite's `cost_for`
+    // only carries 3 argument sizes; `insertCoin`'s true 4th-arg
+    // `linear_in_u` model is approximated via the existing DEFAULT
+    // shape — see the `builtin::cost` DEFAULT table comment).
+    refill_builtin(b, InsertCoin, cur)?;
+    refill_builtin(b, LookupCoin, cur)?;
+
+    // unionValue — with_interaction_in_x_and_y(c00, c10, c01, c11) /
+    // added_sizes(intercept, slope). Sub-order per oracle: c00, c10, c01,
+    // c11 (NOT alphabetical) — MODERATE confidence, see doc comment above.
+    let union_c00 = cur.next();
+    let union_c10 = cur.next();
+    let union_c01 = cur.next();
+    let union_c11 = cur.next();
+    let union_cpu = CostingFun::WithInteractionXY(InteractionXYP {
+        c00: union_c00,
+        c01: union_c01,
+        c10: union_c10,
+        c11: union_c11,
+    });
+    let union_mem = CostingFun::AddedSizes(cur.linear());
+    b.set_cost_pair(
+        UnionValue,
+        CostPair {
+            cpu: union_cpu,
+            mem: union_mem,
+        },
+    );
+
+    // valueContains — const_above_diagonal{linear_in_x_and_y}(constant,
+    // intercept, slope1, slope2) / constant_cost.
+    let value_contains_cpu = CostingFun::ConstAboveDiagonalLinearXY(ConstAboveDiagLinXYP {
+        constant: cur.next(),
+        intercept: cur.next(),
+        slope1: cur.next(),
+        slope2: cur.next(),
+    });
+    let value_contains_mem = CostingFun::Constant(cur.next());
+    b.set_cost_pair(
+        ValueContains,
+        CostPair {
+            cpu: value_contains_cpu,
+            mem: value_contains_mem,
+        },
+    );
+
+    // valueData — generic linear_in_x / linear_in_x, refillable.
+    refill_builtin(b, ValueData, cur)?;
+
+    // unValueData — quadratic_in_x(c0, c1, c2) / linear_in_x(intercept, slope).
+    let un_value_data_cpu = CostingFun::QuadraticInX(Quadratic1 {
+        c0: cur.next(),
+        c1: cur.next(),
+        c2: cur.next(),
+    });
+    let un_value_data_mem = CostingFun::LinearInX(cur.linear());
+    b.set_cost_pair(
+        UnValueData,
+        CostPair {
+            cpu: un_value_data_cpu,
+            mem: un_value_data_mem,
+        },
+    );
+
+    // scaleValue — generic linear_in_y / linear_in_y, refillable.
+    refill_builtin(b, ScaleValue, cur)?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -919,17 +1118,183 @@ mod tests {
         }
     }
 
+    // ── #826/#830: pad-short / truncate-long, never reject / never
+    // fall back to a different reference model ──────────────────────────
+
     #[test]
-    fn wrong_length_is_rejected() {
-        assert_eq!(
-            apply_v1(&[0i64; 10], 8).unwrap_err(),
-            CostModelApplyError::WrongLength {
-                expected: 166,
-                got: 10,
-            }
-        );
-        // 166 succeeds.
-        assert!(apply_v1(&[0i64; 166], 8).is_ok());
+    fn v1_pads_short_array_with_max_bound() {
+        // 150 < 166: the walk must succeed (never reject on length), and
+        // the missing tail (padded with Haskell `maxBound :: Int64`) must
+        // actually be applied — verifyEd25519Signature's mem `constant`
+        // (the very last V1 param, index 165) lands in the padded region.
+        let short = vec![0i64; 150];
+        let applied = apply_v1(&short, 8).expect("short array must pad, not error");
+        let vfy = applied
+            .builtins
+            .cost_for(BuiltinId::VerifyEd25519Signature, 0, 0, 0);
+        assert_eq!(vfy.mem, i64::MAX);
+    }
+
+    #[test]
+    fn v1_exact_length_succeeds_unpadded() {
+        let exact = vec![0i64; 166];
+        let applied = apply_v1(&exact, 8).expect("exact-length array must succeed");
+        let vfy = applied
+            .builtins
+            .cost_for(BuiltinId::VerifyEd25519Signature, 0, 0, 0);
+        assert_eq!(vfy.mem, 0, "exact-length array must not be padded");
+    }
+
+    #[test]
+    fn v1_truncates_long_array() {
+        // 167 > 166: `zip` truncates — the extra trailing param must be
+        // silently dropped, never applied, and the walk must succeed.
+        let mut long = vec![0i64; 166];
+        long.push(999_999);
+        let applied = apply_v1(&long, 8).expect("long array must truncate, not error");
+        let vfy = applied
+            .builtins
+            .cost_for(BuiltinId::VerifyEd25519Signature, 0, 0, 0);
+        assert_eq!(vfy.mem, 0, "the 167th param must never be read");
+    }
+
+    #[test]
+    fn v2_pads_short_plomin_tail_with_max_bound() {
+        // A pre-Plomin exact-175 array must succeed, and the
+        // integerToByteString/byteStringToInteger tail (175..=184) must be
+        // padded with maxBound rather than erroring or staying on DEFAULT.
+        let base = vec![0i64; 175];
+        let applied = apply_v2(&base, 9).expect("175-length V2 array must pad, not error");
+        let i2b = applied
+            .builtins
+            .cost_for(BuiltinId::IntegerToByteString, 0, 0, 0);
+        assert_eq!(i2b.cpu, i64::MAX, "i2b cpu c0 must be padded with maxBound");
+    }
+
+    #[test]
+    fn v2_applies_supplied_plomin_tail_coefficients() {
+        let p: Vec<i64> = (0..185).collect();
+        let applied = apply_v2(&p, 9).unwrap();
+        // integerToByteString cpu = quadratic_in_z(c0=175,c1=176,c2=177);
+        // at z=0, eval = c0.
+        let i2b = applied
+            .builtins
+            .cost_for(BuiltinId::IntegerToByteString, 0, 0, 0);
+        assert_eq!(i2b.cpu, 175);
+        // byteStringToInteger cpu = quadratic_in_y(c0=180,c1=181,c2=182);
+        // at y=0, eval = c0.
+        let b2i = applied
+            .builtins
+            .cost_for(BuiltinId::ByteStringToInteger, 0, 0, 0);
+        assert_eq!(b2i.cpu, 180);
+    }
+
+    #[test]
+    fn v2_truncates_long_array_to_plomin_length() {
+        let mut long: Vec<i64> = (0..185).collect();
+        long.push(-1); // extra trailing param must be ignored.
+        let applied = apply_v2(&long, 9).expect("long V2 array must truncate, not error");
+        let b2i = applied
+            .builtins
+            .cost_for(BuiltinId::ByteStringToInteger, 0, 0, 0);
+        assert_eq!(b2i.cpu, 180);
+    }
+
+    #[test]
+    fn v3_pads_short_array_and_applies_van_rossem_tail_as_max_bound() {
+        // A pre-van-Rossem exact-297 array must succeed, and the batch6
+        // tail (297..=349) must be padded with maxBound rather than
+        // erroring or staying on DEFAULT.
+        let base = vec![0i64; 297];
+        let applied = apply_v3(&base, 11).expect("297-length V3 array must pad, not error");
+        // expModInteger cpu = c00 + c11*ee*mm + c12*ee*mm*mm; at ee=mm=0
+        // (aa<=mm branch), eval = c00.
+        let exp_mod = applied.builtins.cost_for(BuiltinId::ExpModInteger, 0, 0, 0);
+        assert_eq!(exp_mod.cpu, i64::MAX);
+    }
+
+    #[test]
+    fn v3_partial_van_rossem_tail_pads_only_the_missing_suffix() {
+        // 320 real entries: base(251)+bitwise(46)+23 more van-Rossem
+        // entries (297..=319, through insertCoin's cpu intercept); the
+        // remaining 30 (320..=349, insertCoin's cpu slope onward) must be
+        // padded with maxBound — proving the pad is per-FIELD, not just
+        // applied when the whole array is short.
+        let p: Vec<i64> = (0..320).collect();
+        let applied = apply_v3(&p, 11).unwrap();
+        let insert_coin = applied.builtins.cost_for(BuiltinId::InsertCoin, 0, 0, 1);
+        // cpu = linear_in_z(intercept=319 [real], slope=MAX [padded]) at
+        // z=1: 319.saturating_add(MAX) saturates to MAX (also exercises
+        // #829's saturating arithmetic).
+        assert_eq!(insert_coin.cpu, i64::MAX);
+        let lookup_coin = applied.builtins.cost_for(BuiltinId::LookupCoin, 0, 0, 0);
+        assert_eq!(lookup_coin.cpu, i64::MAX, "lookupCoin is entirely past 320");
+    }
+
+    /// Pins the exact flat-index → field mapping this port chose for the
+    /// van Rossem tail (#830) so any accidental reordering regresses a
+    /// test immediately. This does NOT independently prove the mapping
+    /// matches Haskell for the two MODERATE-confidence builtins
+    /// (`unionValue`, `valueContains` — see [`van_rossem_tail`]'s doc
+    /// comment); it documents the CHOSEN order for future audit.
+    #[test]
+    fn v3_van_rossem_tail_synthetic_index_mapping() {
+        let p: Vec<i64> = (0..350).collect();
+        let a = apply_v3(&p, 11).unwrap();
+
+        let exp_mod = a.builtins.cost_for(BuiltinId::ExpModInteger, 0, 0, 0);
+        assert_eq!((exp_mod.cpu, exp_mod.mem), (297, 300));
+
+        let drop_list = a.builtins.cost_for(BuiltinId::DropList, 0, 0, 0);
+        assert_eq!((drop_list.cpu, drop_list.mem), (302, 304));
+
+        let length_of_array = a.builtins.cost_for(BuiltinId::LengthOfArray, 0, 0, 0);
+        assert_eq!((length_of_array.cpu, length_of_array.mem), (305, 306));
+
+        let list_to_array = a.builtins.cost_for(BuiltinId::ListToArray, 0, 0, 0);
+        assert_eq!((list_to_array.cpu, list_to_array.mem), (307, 309));
+
+        let index_array = a.builtins.cost_for(BuiltinId::IndexArray, 0, 0, 0);
+        assert_eq!((index_array.cpu, index_array.mem), (311, 312));
+
+        let g1_msm = a
+            .builtins
+            .cost_for(BuiltinId::Bls12_381_G1_MultiScalarMul, 0, 0, 0);
+        assert_eq!((g1_msm.cpu, g1_msm.mem), (313, 315));
+
+        let g2_msm = a
+            .builtins
+            .cost_for(BuiltinId::Bls12_381_G2_MultiScalarMul, 0, 0, 0);
+        assert_eq!((g2_msm.cpu, g2_msm.mem), (316, 318));
+
+        let insert_coin = a.builtins.cost_for(BuiltinId::InsertCoin, 0, 0, 0);
+        assert_eq!((insert_coin.cpu, insert_coin.mem), (319, 321));
+
+        let lookup_coin = a.builtins.cost_for(BuiltinId::LookupCoin, 0, 0, 0);
+        assert_eq!((lookup_coin.cpu, lookup_coin.mem), (323, 325));
+
+        let union_value = a.builtins.cost_for(BuiltinId::UnionValue, 0, 0, 0);
+        assert_eq!((union_value.cpu, union_value.mem), (326, 330));
+        // Spot-check c10/c01 are wired to the right axis.
+        let union_value_x1 = a.builtins.cost_for(BuiltinId::UnionValue, 1, 0, 0);
+        assert_eq!(union_value_x1.cpu, 326 + 327);
+        let union_value_y1 = a.builtins.cost_for(BuiltinId::UnionValue, 0, 1, 0);
+        assert_eq!(union_value_y1.cpu, 326 + 328);
+
+        let value_contains = a.builtins.cost_for(BuiltinId::ValueContains, 0, 0, 0);
+        assert_eq!((value_contains.cpu, value_contains.mem), (333, 336));
+        // Below-diagonal branch (x < y) returns the `constant` field.
+        let value_contains_below = a.builtins.cost_for(BuiltinId::ValueContains, 0, 1, 0);
+        assert_eq!(value_contains_below.cpu, 332);
+
+        let value_data = a.builtins.cost_for(BuiltinId::ValueData, 0, 0, 0);
+        assert_eq!((value_data.cpu, value_data.mem), (337, 339));
+
+        let un_value_data = a.builtins.cost_for(BuiltinId::UnValueData, 0, 0, 0);
+        assert_eq!((un_value_data.cpu, un_value_data.mem), (341, 344));
+
+        let scale_value = a.builtins.cost_for(BuiltinId::ScaleValue, 0, 0, 0);
+        assert_eq!((scale_value.cpu, scale_value.mem), (346, 348));
     }
 
     /// Feed `p[i] = i` so every flat index is a distinct value, then assert
@@ -981,15 +1346,11 @@ mod tests {
     }
 
     #[test]
-    fn v2_wrong_length_is_rejected() {
-        assert_eq!(
-            apply_v2(&[0i64; 10], 9).unwrap_err(),
-            CostModelApplyError::WrongLength {
-                expected: 175,
-                got: 10,
-            }
-        );
-        // Exactly 175 succeeds; a longer (Plomin-era) array is truncated.
+    fn v2_wrong_length_is_padded_or_truncated_never_rejected() {
+        // A far-too-short array pads, it does not error (#826).
+        assert!(apply_v2(&[0i64; 10], 9).is_ok());
+        // Exactly 175 succeeds; a longer (Plomin-era or beyond) array is
+        // padded/truncated to V2_PARAM_COUNT_PLOMIN (185).
         assert!(apply_v2(&[0i64; 175], 9).is_ok());
         assert!(apply_v2(&[0i64; 332], 9).is_ok());
     }
@@ -1035,20 +1396,17 @@ mod tests {
     }
 
     #[test]
-    fn v3_wrong_length_is_rejected() {
-        assert_eq!(
-            apply_v3(&[0i64; 10], 9).unwrap_err(),
-            CostModelApplyError::WrongLength {
-                expected: 251,
-                got: 10,
-            }
-        );
+    fn v3_wrong_length_is_padded_or_truncated_never_rejected() {
+        // A far-too-short array pads, it does not error (#826).
+        assert!(apply_v3(&[0i64; 10], 9).is_ok());
         // Exactly 251 (PV9) succeeds; 297 (PV10 bitwise) succeeds; a longer
-        // (PV11, 350) array is accepted and the tail beyond 296 ignored.
+        // (PV11, 350) array succeeds; all are padded/truncated to
+        // V3_PARAM_COUNT_VANROSSEM (350).
         assert!(apply_v3(&[0i64; 251], 9).is_ok());
         assert!(apply_v3(&[0i64; 297], 10).is_ok());
         assert!(apply_v3(&[0i64; 350], 11).is_ok());
-        // 251 < len < 297 still consumes only the base 251 (no bitwise batch).
+        // 251 < len < 297 pads the bitwise batch + van Rossem tail with
+        // maxBound rather than skipping them outright (#830).
         assert!(apply_v3(&[0i64; 280], 10).is_ok());
     }
 

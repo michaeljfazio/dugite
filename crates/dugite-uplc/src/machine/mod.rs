@@ -48,15 +48,36 @@ impl ExBudget {
     /// Subtract `other` from `self` in place. Returns `false` if either
     /// dimension would go negative (caller treats this as
     /// budget-exhaustion).
+    ///
+    /// Uses saturating subtraction (#829) to mirror Haskell's
+    /// `CostingInteger = SatInt` (`minusSI` saturates to
+    /// `minBound`/`maxBound :: Int64` rather than wrapping or panicking).
+    /// This also covers the pathological `cost == i64::MIN` case a plain
+    /// `-` would overflow on. On failure, `self` is left unmutated — the
+    /// caller may want to retry with a different budget or surface a
+    /// `BudgetExhausted` error using the pre-attempt remaining.
     pub fn try_subtract(&mut self, other: ExBudget) -> bool {
-        let new_cpu = self.cpu - other.cpu;
-        let new_mem = self.mem - other.mem;
+        let new_cpu = self.cpu.saturating_sub(other.cpu);
+        let new_mem = self.mem.saturating_sub(other.mem);
         if new_cpu < 0 || new_mem < 0 {
             return false;
         }
         self.cpu = new_cpu;
         self.mem = new_mem;
         true
+    }
+
+    /// Subtract `other` unconditionally, allowing either dimension to go
+    /// negative (saturating at `i64::MIN`, never wrapping/panicking).
+    /// Mirrors Haskell's unconditional `SatInt` subtraction for the CEK
+    /// machine's startup cost (`cekStartupCost`): the shortfall is
+    /// detected as an ordinary comparison on the NEXT [`try_subtract`]
+    /// call, not by this call itself returning a "don't mutate" failure
+    /// like `try_subtract` does. Used only at machine boot, before any
+    /// step has charged anything (#844).
+    pub fn subtract_saturating(&mut self, other: ExBudget) {
+        self.cpu = self.cpu.saturating_sub(other.cpu);
+        self.mem = self.mem.saturating_sub(other.mem);
     }
 }
 

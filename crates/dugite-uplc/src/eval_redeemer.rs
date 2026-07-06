@@ -336,10 +336,18 @@ fn data_const_term(d: crate::data::Data) -> Term {
 
 /// Resolve the on-chain cost model for `language` into a fully-applied
 /// [`crate::cost_apply::AppliedCosts`]. Returns `None` (→ fall back to the
-/// latest reference model) when no array was supplied for that version, the
-/// array is malformed, or no byte-exact applier exists for that version yet
-/// (PlutusV2/V3 land in follow-ups). Mirrors how `mkEvaluationContext`
-/// consumes the ledger's flat `[Int64]` per language in the Haskell node.
+/// latest reference model) ONLY when no array was supplied at all for that
+/// version (`cost_models` map has no entry) — the ledger-side
+/// `NoCostModel`/`CollectErrors` phase-1 rejection for an in-use language
+/// with no cost model belongs one layer up in `dugite-ledger`; this
+/// function's `None` here is a defensive fallback, not the correct
+/// consensus behavior for that case (tracked as a known gap, #826 item 3).
+///
+/// A wrong-length array is NEVER a `None`/fallback case: `apply_v1/v2/v3`
+/// pad/truncate per `pad_or_truncate` (#826) and therefore only return
+/// `Err` for a genuine internal `UnsupportedShape` (a coding bug, not a
+/// data-quality issue) — the `Err` arms below exist purely as
+/// defense-in-depth and should be unreachable in practice.
 fn resolve_applied_costs(
     cost_models: Option<&CostModels>,
     language: ScriptLanguage,

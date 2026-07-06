@@ -826,7 +826,12 @@ pub fn denote(
         CountSetBits => {
             let v = take_one(args, id)?;
             let bs = unwrap_byte_string(v, id)?;
-            let count: u32 = bs.iter().map(|b| b.count_ones()).sum();
+            // `u64` (#844): a `u32` accumulator overflows for a bytestring
+            // over 512 MiB (`u32::MAX / 8` bytes, all-ones), wrapping in
+            // release / panicking in debug. Haskell's `Integer` result is
+            // arbitrary-precision; `u64` is the widest cheap accumulator
+            // that cannot overflow under any real memory budget.
+            let count: u64 = bs.iter().map(|b| u64::from(b.count_ones())).sum();
             Ok(Value::Const(Constant::Integer(BigInt::from(count))))
         }
         FindFirstSetBit => {
@@ -932,10 +937,19 @@ pub fn denote(
             } else {
                 shift.clone()
             };
-            let abs_shift_u = bigint_to_usize_or_failure(&abs_shift_int, id, "shift amount")?;
-            if abs_shift_u >= len_bits {
+            // The `>= len_bits` early-out (#844) MUST run on the wide
+            // `BigInt`/`i64` value BEFORE narrowing to `usize`: on a
+            // 32-bit host, `abs_shift_int` can exceed `usize::MAX` (e.g. a
+            // shift of 3_000_000_000, still a valid `i64`) even though
+            // Haskell's `>= len_bits` comparison (done on the wider `Int`)
+            // would simply return the all-zeros result here. Doing the
+            // narrowing first would fail a shift Haskell accepts.
+            // Irrelevant on the 64-bit targets dugite ships today, but
+            // this keeps the code correct independent of `usize` width.
+            if abs_shift_int >= BigInt::from(len_bits) {
                 return Ok(Value::Const(Constant::ByteString(vec![0u8; bs.len()])));
             }
+            let abs_shift_u = bigint_to_usize_or_failure(&abs_shift_int, id, "shift amount")?;
             let mut out = vec![0u8; bs.len()];
             for target_idx in 0..len_bits {
                 // For a left-shift of N: target bit T comes from source bit (T - N).
@@ -3320,5 +3334,56 @@ mod tests {
             run(BuiltinId::DecodeUtf8, vec![bs(&[0x80])]),
             Err(UplcError::BuiltinFailure { .. })
         ));
+    }
+
+    // ── #844: countSetBits u64 accumulator ─────────────────────────
+
+    #[test]
+    fn count_set_bits_basic() {
+        // 0xFF has 8 set bits per byte.
+        assert_eq!(
+            run(BuiltinId::CountSetBits, vec![bs(&[0xFF, 0x00, 0x0F])]).unwrap(),
+            int(12)
+        );
+    }
+
+    #[test]
+    fn count_set_bits_moderate_size_does_not_overflow_u32_style_accumulator() {
+        // 100_000 bytes of 0xFF = 800_000 set bits — comfortably inside a
+        // `u32` (this alone would not have caught the pre-fix bug, which
+        // only manifests past `u32::MAX` / 8 bytes of all-ones; a fixture
+        // that large is impractical for a unit test). This test pins the
+        // `u64`-accumulator code path stays correct for a realistic size.
+        let big = vec![0xFFu8; 100_000];
+        assert_eq!(
+            run(BuiltinId::CountSetBits, vec![bs(&big)]).unwrap(),
+            int(800_000)
+        );
+    }
+
+    // ── #844: shiftByteString wide early-out before usize narrowing ─
+
+    #[test]
+    fn shift_byte_string_large_shift_returns_all_zeros() {
+        // A shift far beyond the bit length must return all-zeros via the
+        // wide (BigInt) `>= len_bits` comparison, not fail while
+        // narrowing to `usize` (only observable on a 32-bit host, but the
+        // all-zeros result must hold on every host).
+        let input = bs(&[0xFF, 0xFF]);
+        let huge_shift = int(1_000_000_000);
+        assert_eq!(
+            run(BuiltinId::ShiftByteString, vec![input, huge_shift]).unwrap(),
+            bs(&[0x00, 0x00])
+        );
+    }
+
+    #[test]
+    fn shift_byte_string_negative_large_shift_returns_all_zeros() {
+        let input = bs(&[0xFF, 0xFF]);
+        let huge_negative_shift = int(-1_000_000_000);
+        assert_eq!(
+            run(BuiltinId::ShiftByteString, vec![input, huge_negative_shift]).unwrap(),
+            bs(&[0x00, 0x00])
+        );
     }
 }
