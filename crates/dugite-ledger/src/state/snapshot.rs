@@ -437,7 +437,16 @@ impl LedgerState {
     /// is a positional bincode layout change — a snapshot written by a
     /// prior binary must be quarantined, not silently misinterpreted as a
     /// `u64`.
-    pub(crate) const SNAPSHOT_VERSION: u8 = 27;
+    /// v28 (#804): `LedgerState` gained a new top-level field
+    /// `future_gen_delegs` (Haskell `dsFutureGenDelegs`, the pending queue
+    /// behind `Certificate::GenesisKeyDelegation`), added to
+    /// `LedgerStateSnapshot` right after `genesis_delegates` — a positional
+    /// bincode layout change for every snapshot. Also closes the live-path
+    /// gap where `GenesisKeyDelegation` certs were silently dropped
+    /// (`eras::common::apply_shelley_cert`'s catch-all), leaving
+    /// `genesis_delegates` permanently stale for any chain that crossed a
+    /// real genesis-delegate rotation.
+    pub(crate) const SNAPSHOT_VERSION: u8 = 28;
 
     /// Save ledger state snapshot to disk using bincode serialization.
     ///

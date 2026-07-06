@@ -56,14 +56,15 @@ fn snapshot_format_hash_stability() {
     // This hash was computed from the current LedgerStateSnapshot layout.
     // If this changes, existing snapshot files become unreadable.
     //
-    // Last update: SNAPSHOT_VERSION 23 → 24 (#770, 2026-06-16) —
-    // `CostModels` gained `unknown_cost_models: BTreeMap<u8, Vec<i64>>`
-    // (unknown-language cost-model entries preserved per Haskell
-    // `_costModelsUnknown`), which bincode serializes as a length-prefixed
-    // sequence, changing the layout of every embedded `protocol_params` /
-    // `prev_protocol_params`. Pre-existing snapshots are quarantined on load
-    // and operators re-sync (no migration shim — see SNAPSHOT_VERSION docs).
-    const EXPECTED_HASH: &str = "891da88c1b446ccbc321220ca5209e0bd064fa82d07ad20c26d0023daf697bc6";
+    // Last update: SNAPSHOT_VERSION 27 → 28 (#804, 2026-07-06) —
+    // `LedgerStateSnapshot` gained a new `future_gen_delegs:
+    // HashMap<(u64, Hash28), (Hash28, Hash32)>` field (Haskell
+    // `dsFutureGenDelegs`, the pending queue behind a
+    // `Certificate::GenesisKeyDelegation`), inserted right after
+    // `genesis_delegates` — a positional bincode layout change. Pre-existing
+    // snapshots are quarantined on load and operators re-sync (no migration
+    // shim — see SNAPSHOT_VERSION docs).
+    const EXPECTED_HASH: &str = "de7754e72474ef9126157a88fdc9d8db161ccf92df3bf88a9d362238c46c082f";
 
     if EXPECTED_HASH == "COMPUTE_ON_FIRST_RUN" {
         panic!(
