@@ -31,7 +31,6 @@ use std::collections::HashSet;
 use dugite_primitives::credentials::Credential;
 use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::protocol_params::ProtocolParameters;
-use dugite_primitives::time::SlotNo;
 use dugite_primitives::transaction::{Certificate, Transaction};
 
 use crate::utxo::UtxoLookup;
@@ -774,11 +773,27 @@ pub(super) fn run_phase1_rules(
     //
     // Per Haskell's Conway DELEG rule: `ConwayStakeRegistration` carries
     // an inline deposit amount that must equal `keyDeposit` from the
-    // current protocol parameters.
+    // current protocol parameters. The three combined register+delegate
+    // certificates (`RegStakeDeleg` tag 11, `VoteRegDeleg` tag 12,
+    // `RegStakeVoteDeleg` tag 13) decode in Haskell to the SAME
+    // `ConwayRegDelegCert` constructor and go through the identical
+    // `checkDepositAgainstPParams` check unconditionally — the delegatee
+    // shape (pool/DRep/both) does not change the deposit predicate.
+    // Failure name: `IncorrectDepositDELEG` (PV 9-10) / `DepositIncorrectDELEG`
+    // (PV >= 11); dugite surfaces both under `StakeRegistrationDepositMismatch`.
+    //
+    // Reference: `Conway.Rules.Deleg.conwayDelegTransition` (issue #785).
     // ------------------------------------------------------------------
     if params.protocol_version_major >= 9 {
         for cert in &body.certificates {
-            if let Certificate::ConwayStakeRegistration { deposit, .. } = cert {
+            let deposit = match cert {
+                Certificate::ConwayStakeRegistration { deposit, .. } => Some(deposit),
+                Certificate::RegStakeDeleg { deposit, .. } => Some(deposit),
+                Certificate::RegStakeVoteDeleg { deposit, .. } => Some(deposit),
+                Certificate::VoteRegDeleg { deposit, .. } => Some(deposit),
+                _ => None,
+            };
+            if let Some(deposit) = deposit {
                 if deposit.0 != params.key_deposit.0 {
                     errors.push(ValidationError::StakeRegistrationDepositMismatch {
                         declared: deposit.0,
@@ -798,9 +813,13 @@ pub(super) fn run_phase1_rules(
     // time (stored per-credential in `stake_key_deposits`). This ensures
     // correct refunds even if `keyDeposit` has changed via governance.
     //
-    // Falls back to the current `keyDeposit` parameter when the per-credential
-    // deposit map is not available or the credential is not found (e.g. old
-    // snapshots before per-credential tracking was added).
+    // Haskell's `ConwayUnRegCert` branch binds `mAccountState` and, when the
+    // credential is NOT registered, binds `Nothing` and SKIPS the
+    // refund-mismatch check entirely — only `StakeKeyNotRegisteredDELEG`
+    // fires for an unregistered credential (issue #811). Mirror that: only
+    // compare when the credential IS present in `stake_key_deposits`;
+    // otherwise there is nothing to compare against and no error is raised
+    // here (the not-registered predicate, if any, is raised elsewhere).
     //
     // This check applies only in Conway (protocol >= 9) where the new
     // certificate tag is used.  Pre-Conway `StakeDeregistration` (tag 1)
@@ -810,14 +829,13 @@ pub(super) fn run_phase1_rules(
         for cert in &body.certificates {
             if let Certificate::ConwayStakeDeregistration { credential, refund } = cert {
                 let key = credential.to_typed_hash32();
-                let expected = stake_key_deposits
-                    .and_then(|m| m.get(&key).copied())
-                    .unwrap_or(params.key_deposit.0);
-                if refund.0 != expected {
-                    errors.push(ValidationError::StakeDeregistrationRefundMismatch {
-                        declared: refund.0,
-                        expected,
-                    });
+                if let Some(expected) = stake_key_deposits.and_then(|m| m.get(&key).copied()) {
+                    if refund.0 != expected {
+                        errors.push(ValidationError::StakeDeregistrationRefundMismatch {
+                            declared: refund.0,
+                            expected,
+                        });
+                    }
                 }
             }
         }
@@ -972,9 +990,31 @@ pub(super) fn run_phase1_rules(
 
     // ------------------------------------------------------------------
     // Rule 2: All inputs must exist in the UTxO set
+    //
+    // At PV < 9 the wire decoder does not dedup the raw `Vec` of inputs —
+    // only the Conway decoder (PV >= 9) uses `read_set_strict` (see Rule
+    // 1b above). Haskell decodes pre-Conway TxIn lists via `Set.fromList`,
+    // silently collapsing physical duplicates BEFORE the existence check
+    // and the ADA/multi-asset conservation sums. Failing to mirror this
+    // double-counts a duplicated spend input's value and produces a false
+    // `ValueNotConserved` on historically-valid mainnet Babbage txs (e.g.
+    // `fixtures/tx-5ca83e21.hex`, issue #786). Iterate the DISTINCT inputs
+    // at PV < 9; at PV >= 9 iterate the wire order as-is — Rule 1b already
+    // emits `DuplicateInput` there and gates Rules 3/3b off via
+    // `errors.is_empty()`, so no double-count can reach the conservation
+    // checks. The wire `body.inputs` Vec itself is never mutated (its raw
+    // order is required for hashing/serialization).
     // ------------------------------------------------------------------
+    let distinct_inputs: Vec<&dugite_primitives::transaction::TransactionInput> =
+        if params.protocol_version_major < 9 {
+            let mut seen = HashSet::new();
+            body.inputs.iter().filter(|i| seen.insert(*i)).collect()
+        } else {
+            body.inputs.iter().collect()
+        };
+
     let mut input_value: u128 = 0;
-    for input in &body.inputs {
+    for input in distinct_inputs.iter().copied() {
         match utxo_set.lookup(input) {
             Some(output) => {
                 input_value += output.value.coin.0 as u128;
@@ -1054,7 +1094,10 @@ pub(super) fn run_phase1_rules(
 
         let mut asset_balance: BTreeMap<(PolicyId, AssetName), i128> = BTreeMap::new();
 
-        for input in &body.inputs {
+        // Same PV<9 dedup as Rule 2 above — a duplicated spend input's
+        // multi-asset bundle must be counted once, matching Haskell's
+        // `Set.fromList` decode (issue #786).
+        for input in distinct_inputs.iter().copied() {
             if let Some(output) = utxo_set.lookup(input) {
                 for (policy, assets) in &output.value.multi_asset {
                     for (name, qty) in assets {
@@ -1160,13 +1203,23 @@ pub(super) fn run_phase1_rules(
 
     // ------------------------------------------------------------------
     // Rule 5: All outputs >= minimum UTxO value
+    //
+    // Haskell's Babbage/Conway minimum is `(160 + |out|) * coinsPerUTxOByte`
+    // where `|out|` is the output's TRUE serialized CBOR byte length. When
+    // `raw_cbor` is unavailable (the output was constructed in-memory
+    // rather than decoded from the wire) fall back to re-encoding the
+    // output via dugite's own CBOR encoder to get its exact size, instead
+    // of the 29-byte ADA-only floor — which under-estimates (and thus
+    // under-charges the minimum for) any multi-asset or datum/script-ref
+    // carrying output (issue #810).
     // ------------------------------------------------------------------
-    let default_min_utxo = params.min_utxo_value();
     for output in &body.outputs {
-        let min_utxo = if let Some(ref cbor) = output.raw_cbor {
-            params.min_utxo_for_output_size(cbor.len() as u64)
-        } else {
-            default_min_utxo
+        let min_utxo = match &output.raw_cbor {
+            Some(cbor) => params.min_utxo_for_output_size(cbor.len() as u64),
+            None => {
+                let encoded = dugite_serialization::encode_transaction_output(output);
+                params.min_utxo_for_output_size(encoded.len() as u64)
+            }
         };
         if output.value.coin.0 < min_utxo.0 {
             errors.push(ValidationError::OutputTooSmall {
@@ -1722,7 +1775,12 @@ pub(super) fn run_phase1_rules(
                 dugite_primitives::hash::blake2b_224(&w.vkey).to_hash32_padded()
             })
             .collect();
-        let slot = SlotNo(current_slot);
+        // Issue #787: timelocks (`InvalidBefore`/`InvalidHereafter`) must be
+        // evaluated against the TX'S OWN ValidityInterval, never the
+        // application/current slot — `body.validity_interval_start` is
+        // Haskell's `invalid_before` and `body.ttl` is `invalid_hereafter`.
+        let invalid_before = body.validity_interval_start;
+        let invalid_hereafter = body.ttl;
 
         for script in &tx.witness_set.native_scripts {
             // Compute this script's hash: blake2b_224(0x00 || cbor(script))
@@ -1734,7 +1792,7 @@ pub(super) fn run_phase1_rules(
 
             // Only evaluate scripts that are actually needed
             if scripts_needed.contains(&script_hash)
-                && !evaluate_native_script(script, &signers, slot)
+                && !evaluate_native_script(script, &signers, invalid_before, invalid_hereafter)
             {
                 errors.push(ValidationError::NativeScriptFailed);
                 break;
@@ -2997,6 +3055,108 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Test 31d — Rule 2/3b (issue #786): a duplicated spend input against a
+    // POPULATED UTxO set must not double-count the input's value at PV < 9.
+    //
+    // Haskell decodes pre-PV9 TxIn lists via `Set.fromList` (silent dedup)
+    // and sums each distinct TxIn once. dugite previously summed the raw
+    // `Vec` — a physical duplicate was counted twice, producing a false
+    // `ValueNotConserved` on a historically-valid tx. The existing Test
+    // 31b/31c regression only used an EMPTY UTxO (all `InputNotFound`), so
+    // it never exercised the double-count in the ADA conservation sum.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_duplicate_input_not_double_counted_at_pv8_with_populated_utxo() {
+        let (utxo_set, mut tx, input) = make_valid_tx();
+        // Physically duplicate the (already-existing, populated) input —
+        // simulating the PV8 wire encoding (`fixtures/tx-5ca83e21.hex`
+        // class). The UTxO is worth 10_000_000; output=9_800_000 +
+        // fee=200_000 already balances against ONE occurrence.
+        tx.body.inputs.push(input);
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 8; // Babbage — Haskell silently dedups
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        assert!(
+            result.is_ok(),
+            "PV8 duplicate input against a populated UTxO must not double-count the \
+             input's value (false ValueNotConserved); got {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 31e — Rule 3b (issue #786): a duplicated spend input carrying a
+    // multi-asset bundle must not double-count the asset quantity at
+    // PV < 9 either — same `Set.fromList` dedup as Rule 2's ADA sum.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_duplicate_input_multi_asset_not_double_counted_at_pv8() {
+        let policy = dugite_primitives::hash::Hash28::from_bytes([0x77u8; 28]);
+        let asset = AssetName::new(b"Token".to_vec()).unwrap();
+
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0xBBu8; 32]),
+            index: 0,
+        };
+        let mut input_value = Value::lovelace(10_000_000);
+        input_value
+            .multi_asset
+            .entry(policy)
+            .or_default()
+            .insert(asset.clone(), 100);
+
+        let mut utxo_set = UtxoSet::new();
+        utxo_set.insert(
+            input.clone(),
+            TransactionOutput {
+                address: Address::Byron(dugite_primitives::address::ByronAddress {
+                    payload: vec![0x82, 0x00, 0x01],
+                }),
+                value: input_value,
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: false,
+                raw_cbor: None,
+            },
+        );
+
+        // Output carries the SAME 100 tokens back — value/asset conserved
+        // against exactly ONE occurrence of the input.
+        let mut output_value = Value::lovelace(9_800_000);
+        output_value
+            .multi_asset
+            .entry(policy)
+            .or_default()
+            .insert(asset, 100);
+
+        let (_, mut tx, _) = make_valid_tx();
+        // Physically duplicate the input (twice) to simulate the PV8 wire
+        // encoding; the UTxO/output above are value- and asset-balanced
+        // against exactly ONE occurrence.
+        tx.body.inputs = vec![input.clone(), input];
+        tx.body.outputs = vec![TransactionOutput {
+            address: Address::Byron(dugite_primitives::address::ByronAddress {
+                payload: vec![0x82, 0x00, 0x01],
+            }),
+            value: output_value,
+            datum: OutputDatum::None,
+            script_ref: None,
+            is_legacy: false,
+            raw_cbor: None,
+        }];
+
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 8; // Babbage — Haskell silently dedups
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        assert!(
+            result.is_ok(),
+            "PV8 duplicate multi-asset input must not double-count the asset quantity \
+             (false MultiAssetNotConserved); got {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Test 32 — Rule 7: TTL exactly at current_slot fails (slot >= TTL = invalid)
     //
     // Haskell `inInterval` (Cardano.Ledger.Shelley.Rules.Utxo): the tx is
@@ -3267,6 +3427,84 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Test 40b — Rule 1f (issue #785): the three combined register+delegate
+    // certificates (RegStakeDeleg tag 11, VoteRegDeleg tag 12,
+    // RegStakeVoteDeleg tag 13) must ALSO enforce deposit == key_deposit —
+    // they decode in Haskell to the same `ConwayRegDelegCert` constructor
+    // as `ConwayStakeRegistration` and go through the identical
+    // `checkDepositAgainstPParams` check.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_reg_stake_deleg_deposit_mismatch_rejected() {
+        use dugite_primitives::transaction::Certificate;
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // Conway+
+        params.key_deposit = Lovelace(2_000_000);
+
+        tx.body.certificates.push(Certificate::RegStakeDeleg {
+            credential: Credential::VerificationKey(Hash28::from_bytes([0x51u8; 28])),
+            pool_hash: Hash28::from_bytes([0x52u8; 28]),
+            deposit: Lovelace(999_999), // Wrong deposit amount
+        });
+
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::StakeRegistrationDepositMismatch { .. })),
+            "RegStakeDeleg with wrong deposit must produce StakeRegistrationDepositMismatch, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_reg_stake_vote_deleg_deposit_mismatch_rejected() {
+        use dugite_primitives::transaction::{Certificate, DRep};
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // Conway+
+        params.key_deposit = Lovelace(2_000_000);
+
+        tx.body.certificates.push(Certificate::RegStakeVoteDeleg {
+            credential: Credential::VerificationKey(Hash28::from_bytes([0x53u8; 28])),
+            pool_hash: Hash28::from_bytes([0x54u8; 28]),
+            drep: DRep::Abstain,
+            deposit: Lovelace(1), // Wrong deposit amount
+        });
+
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::StakeRegistrationDepositMismatch { .. })),
+            "RegStakeVoteDeleg with wrong deposit must produce StakeRegistrationDepositMismatch, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_vote_reg_deleg_deposit_mismatch_rejected() {
+        use dugite_primitives::transaction::{Certificate, DRep};
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // Conway+
+        params.key_deposit = Lovelace(2_000_000);
+
+        tx.body.certificates.push(Certificate::VoteRegDeleg {
+            credential: Credential::VerificationKey(Hash28::from_bytes([0x55u8; 28])),
+            drep: DRep::NoConfidence,
+            deposit: Lovelace(0), // Wrong deposit amount
+        });
+
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::StakeRegistrationDepositMismatch { .. })),
+            "VoteRegDeleg with wrong deposit must produce StakeRegistrationDepositMismatch, got {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Test 41 — Rule 1g: Conway stake deregistration refund mismatch rejected
     // -----------------------------------------------------------------------
     #[test]
@@ -3320,6 +3558,65 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, ValidationError::StakeDeregistrationRefundMismatch { .. })),
             "ConwayStakeDeregistration with wrong refund must produce StakeDeregistrationRefundMismatch, got {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 41b — Rule 1g (issue #811): an UNREGISTERED credential's dereg
+    // refund must NOT produce StakeDeregistrationRefundMismatch. Haskell's
+    // `ConwayUnRegCert` binds `Nothing` for an unregistered credential and
+    // skips the refund-mismatch predicate entirely.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_conway_stake_dereg_unregistered_no_refund_mismatch() {
+        use dugite_primitives::transaction::Certificate;
+
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // Conway+
+        params.key_deposit = Lovelace(2_000_000);
+
+        let cred = dugite_primitives::credentials::Credential::VerificationKey(Hash28::from_bytes(
+            [0x45u8; 28],
+        ));
+
+        // stake_key_deposits is present but does NOT contain this
+        // credential — simulating an unregistered stake credential.
+        let stake_key_deposits: imbl::HashMap<Hash32, u64> = imbl::HashMap::new();
+
+        tx.body
+            .certificates
+            .push(Certificate::ConwayStakeDeregistration {
+                credential: cred,
+                refund: Lovelace(1_000_000), // Differs from key_deposit
+            });
+
+        let result = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,                      // slot_config
+            None,                      // registered_pools
+            None,                      // current_treasury
+            None,                      // reward_accounts
+            None,                      // current_epoch
+            None,                      // registered_dreps
+            None,                      // registered_vrf_keys
+            None,                      // node_network
+            None,                      // committee_members
+            None,                      // committee_resigned
+            Some(&stake_key_deposits), // stake_key_deposits (present, credential absent)
+            None,                      // constitution_script_hash
+            None,                      // vote_delegations
+        );
+        let has_refund_mismatch = matches!(&result, Err(errors) if errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::StakeDeregistrationRefundMismatch { .. })));
+        assert!(
+            !has_refund_mismatch,
+            "Unregistered credential must not produce StakeDeregistrationRefundMismatch, got {result:?}"
         );
     }
 
@@ -4960,6 +5257,25 @@ mod tests {
         p.to_flat().expect("flat-encode minimal Plutus program")
     }
 
+    /// CBOR-wrapped form of [`minimal_plutus_program_flat`] — the format
+    /// real on-chain Plutus WITNESS scripts use. The witness-set array
+    /// element (`[* bytes]`), once unwrapped off the wire, is itself a
+    /// CBOR bytestring wrapping the flat program (`Program::from_cbor`
+    /// requires this — issue #792). `ScriptRef` (reference scripts) does
+    /// NOT carry this extra wrapper (`dugite-serialization`'s
+    /// `read_script_ref` already strips it), so
+    /// [`minimal_plutus_program_flat`] remains the correct fixture for
+    /// `ScriptRef` tests.
+    fn minimal_plutus_program_cbor() -> Vec<u8> {
+        let p = dugite_uplc::program::Program {
+            version: (1, 0, 0),
+            term: dugite_uplc::term::Term::Const(dugite_uplc::term::Constant::Integer(
+                num_bigint::BigInt::from(0),
+            )),
+        };
+        p.to_cbor().expect("cbor-encode minimal Plutus program")
+    }
+
     /// Garbage bytes in `witness_set.plutus_v1_scripts` → MalformedScriptWitnesses.
     #[test]
     fn test_malformed_plutus_v1_witness_rejected() {
@@ -5044,13 +5360,16 @@ mod tests {
         }
     }
 
-    /// Real flat-encoded Plutus V1 bytes at PV >= 5 → no MalformedScriptWitnesses.
+    /// Real CBOR-wrapped-flat Plutus V1 witness bytes at PV >= 5 → no
+    /// MalformedScriptWitnesses. Witness scripts require the CBOR
+    /// bytestring wrapper (issue #792) — `minimal_plutus_program_cbor`
+    /// supplies it.
     #[test]
     fn test_well_formed_plutus_v1_witness_accepted() {
         let (utxo_set, mut tx, _) = make_valid_tx();
         tx.witness_set
             .plutus_v1_scripts
-            .push(minimal_plutus_program_flat());
+            .push(minimal_plutus_program_cbor());
         let mut params = ProtocolParameters::mainnet_defaults();
         params.protocol_version_major = 9;
         let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None)
@@ -5061,6 +5380,31 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, ValidationError::MalformedScriptWitnesses { .. })),
             "well-formed Plutus V1 witness must not produce MalformedScriptWitnesses, got {errors:?}"
+        );
+    }
+
+    /// Issue #792: a raw-flat (unwrapped) witness script — i.e. the exact
+    /// bytes `minimal_plutus_program_flat` produces, WITHOUT the mandatory
+    /// CBOR bytestring wrapper — must now be rejected as
+    /// MalformedScriptWitnesses. Haskell's `deserialiseScript` requires
+    /// `CBOR.decodeBytes` to succeed before flat-decoding; skipping the
+    /// wrapper is a hard decode error for every Plutus language.
+    #[test]
+    fn test_raw_flat_witness_without_cbor_wrapper_rejected() {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        tx.witness_set
+            .plutus_v1_scripts
+            .push(minimal_plutus_program_flat());
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9;
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None)
+            .err()
+            .unwrap_or_default();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::MalformedScriptWitnesses { .. })),
+            "raw-flat (unwrapped) witness script must produce MalformedScriptWitnesses, got {errors:?}"
         );
     }
 

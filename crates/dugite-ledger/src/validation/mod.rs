@@ -3719,8 +3719,28 @@ pub fn validate_transaction_with_pools(
     // `MalformedReferenceScripts` predicate.
     scripts::check_malformed_reference_scripts(tx, params, &mut errors);
 
+    // Rule 12: script data hash (mkScriptIntegrity) — covers redeemers,
+    // datums, cost models, and language versions. Runs UNCONDITIONALLY
+    // (not gated on `has_plutus_scripts`, issue #790): a tx with ONLY
+    // supplemental witness datums (no witness Plutus scripts, no
+    // redeemers) still needs `script_data_hash = hash(dats)` validated,
+    // and `has_plutus_scripts` does not count `plutus_data`. The function
+    // itself already self-gates on `has_redeemers || has_datums` /
+    // `body.script_data_hash.is_some()`, so this is a no-op for ordinary
+    // vkey-only txs.
+    scripts::check_script_data_hash(tx, utxo_set, params, &mut errors);
+
+    // Babbage/Conway UTXOW: scripts in the witness set that are not needed
+    // by any script purpose are rejected as extraneous. Runs
+    // UNCONDITIONALLY (not gated on `has_plutus_scripts`, issue #791):
+    // Haskell's `ExtraneousScriptWitnessesUTXOW` covers ALL witness
+    // scripts, native included, so a tx with only an unneeded native
+    // witness script (no Plutus content at all) must still be checked.
+    // The function self-gates on "has any witness script" internally.
+    scripts::check_extraneous_script_witnesses(tx, utxo_set, &mut errors);
+
     // ------------------------------------------------------------------
-    // Rules 11, 11b, 11c, 12 — Plutus-transaction-specific checks
+    // Rules 11, 11b, 11c — Plutus-transaction-specific checks
     //
     // These are only enforced when the transaction includes Plutus scripts
     // or redeemers. They are split into their own modules to keep the rule
@@ -3753,16 +3773,6 @@ pub fn validate_transaction_with_pools(
             &mut errors,
         );
 
-        // Rule 12: script data hash (mkScriptIntegrity) — covers redeemers,
-        // datums, cost models, and language versions.
-        scripts::check_script_data_hash(tx, utxo_set, params, &mut errors);
-
-        // Babbage/Conway UTXOW: scripts in the witness set that are not
-        // needed by any script purpose are rejected as extraneous.
-        // Matches Haskell's `ExtraneousScriptWitnessesUTXOW` /
-        // `babbageMissingScripts` check.
-        scripts::check_extraneous_script_witnesses(tx, utxo_set, &mut errors);
-
         // Babbage+ UTXOW: every script in the witness set must pass
         // `validScript pv script` — Plutus scripts must decode and their
         // language must be supported at the current PV; native scripts are
@@ -3770,8 +3780,10 @@ pub fn validate_transaction_with_pools(
         // `MalformedScriptWitnesses` predicate.
         scripts::check_malformed_script_witnesses(tx, params, &mut errors);
 
-        // (MalformedReferenceScripts is enforced unconditionally above,
-        //  not just when the tx carries witness Plutus scripts.)
+        // (MalformedReferenceScripts, check_script_data_hash, and
+        //  check_extraneous_script_witnesses are all enforced
+        //  unconditionally above, not just when the tx carries witness
+        //  Plutus scripts / redeemers.)
 
         // ------------------------------------------------------------------
         // Phase-2: Execute Plutus scripts when redeemers are present.
