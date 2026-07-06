@@ -80,12 +80,13 @@ pub fn eval_resolved_redeemer(
 ) -> Result<RedeemerEvalOutcome, PhaseTwoError> {
     // 1. Decode script bytes → typed Term.
     //
-    // Plutus scripts live in the witness set as **double-CBOR-wrapped**
-    // bytes: the outer wrapper is a CBOR byte-string holding another
-    // CBOR byte-string, which in turn holds the flat-encoded program.
-    // We accept either single-wrapped (raw flat bytes inside a CBOR
-    // bytes wrapper) or unwrapped flat depending on which decoder
-    // succeeds first.
+    // On-chain Plutus scripts (witness-set AND reference-script alike)
+    // are CBOR-bytestring-wrapped flat: Haskell `deserialiseScript` =
+    // `CBOR.decodeBytes >=> unflat` (#836). This is byte-verified
+    // against REAL captured on-chain fixtures for both sources — see
+    // [`decode_script_bytes_uncached`]'s doc comment for the evidence;
+    // there is no legitimate raw-flat (unwrapped) input this decoder
+    // should ever accept.
     let program = decode_script_bytes(&r.script_bytes)?;
     // Availability / version validation (#821) runs unconditionally here,
     // regardless of whether `program` was a cache hit — see the module-level
@@ -183,6 +184,17 @@ pub fn eval_resolved_redeemer(
             Term::App(Rc::new(term), Rc::new(ctx_term))
         }
     };
+
+    // Eager scope check (#823, oracle-confirmed). Mirrors Haskell's
+    // `mkTermToEvaluate`, which runs `UPLC.checkScope` over the
+    // fully-applied term BEFORE the CEK machine starts. A free de
+    // Bruijn variable is a phase-2 (collateral-consuming) failure even
+    // if the machine would never dynamically reach it — e.g. a free
+    // var under an unforced `Delay`, or inside a lambda body that's
+    // never applied. `?` converts `UplcError::FreeVariable` into
+    // `PhaseTwoError::ScriptEvaluationFailed`, which
+    // `is_script_evaluation_failure()` already classifies correctly.
+    crate::scope_check::check_scope(&applied_term)?;
 
     // Debug aid (like DUGITE_DUMP_CTX above): dump the fully-applied
     // program as flat so it can be replayed through an external reference
@@ -403,14 +415,23 @@ const SCRIPT_DECODE_CACHE_CAP: usize = 4096;
 
 /// Decode the script bytes the wire / reference-input provides.
 ///
-/// On-chain Plutus scripts are CBOR-encoded byte-strings holding the
-/// flat-encoded program (`from_cbor` handles this). Raw flat bytes
-/// (no CBOR wrapper) are accepted as a fallback for scripts that were
-/// extracted from the inner byte-string by an upstream decoder.
-///
-/// If the outer byte looks like a CBOR byte-string (major type 2) and
-/// `from_cbor` fails, we propagate that error directly — the bytes are
-/// structurally CBOR and it makes no sense to re-attempt as raw flat.
+/// On-chain Plutus scripts are CBOR-bytestring-wrapped flat, for BOTH
+/// witness-set entries AND reference scripts (#836): Haskell
+/// `deserialiseScript` = `CBOR.decodeBytes >=> unflat` applies uniformly
+/// regardless of where the script bytes are attached. This is verified
+/// byte-for-byte against real captured on-chain fixtures
+/// (`crates/dugite-uplc/tests/fixtures/phase2_onchain/*.json`) for
+/// BOTH sources: every sampled witness script AND every sampled
+/// `script_ref` payload (as produced by
+/// `dugite_serialization::decode_transaction_output`'s `read_script_ref`)
+/// fails `Program::from_flat` and succeeds `Program::from_cbor` — there
+/// is no legitimate raw-flat (unwrapped) input this decoder should ever
+/// accept, so the prior first-byte heuristic (and an earlier revision of
+/// this fix that special-cased reference scripts as pre-unwrapped, based
+/// on an unverified assumption) are both wrong. A malformed/garbage
+/// input is a script-evaluation failure in Haskell (`PlutusFailure` on
+/// deserialisation), not a collection error — it legitimises
+/// `is_valid=false` (#734).
 ///
 /// The decode is memoized per thread (see [`SCRIPT_DECODE_CACHE`]) — a pure
 /// performance optimisation that does not change the decoded program.
@@ -429,21 +450,11 @@ fn decode_script_bytes(bytes: &[u8]) -> Result<Program, PhaseTwoError> {
     Ok(prog)
 }
 
-/// The uncached decode (the actual flat/CBOR deserialization).
+/// The uncached decode (the actual CBOR-then-flat deserialization). See
+/// [`decode_script_bytes`]'s doc comment for the on-chain-verified
+/// rationale for always requiring the CBOR-bytestring wrapper.
 fn decode_script_bytes_uncached(bytes: &[u8]) -> Result<Program, PhaseTwoError> {
-    // CBOR major-type 2 (byte-string) = 0x40-0x5f (short) or 0x58/0x59/0x5a/0x5b (extended).
-    let looks_like_cbor_bytes = bytes.first().is_some_and(|&b| b >> 5 == 2);
-
-    if looks_like_cbor_bytes {
-        // Bytes are CBOR-wrapped — decode once and propagate any error.
-        // Undecodable SCRIPT bytes are a script-evaluation failure in
-        // Haskell (PlutusFailure on deserialisation), not a collection
-        // error — they legitimise is_valid=false (#734).
-        return Program::from_cbor(bytes).map_err(PhaseTwoError::ScriptEvaluationFailed);
-    }
-
-    // Raw flat bytes (already unwrapped by the caller / serialization layer).
-    Program::from_flat(bytes).map_err(PhaseTwoError::ScriptEvaluationFailed)
+    Program::from_cbor(bytes).map_err(PhaseTwoError::ScriptEvaluationFailed)
 }
 
 fn debug_dump_data(d: &crate::data::Data, depth: usize) {
@@ -624,12 +635,39 @@ mod tests {
 
     #[test]
     fn decode_script_bytes_rejects_garbage() {
-        // Pure garbage — neither CBOR-wrapped nor valid flat.  Undecodable
-        // SCRIPT bytes are a script-evaluation failure (Haskell
-        // PlutusFailure), not a collection error (#734).
+        // Pure garbage — not a valid CBOR byte-string wrapper.
+        // Undecodable SCRIPT bytes are a script-evaluation failure
+        // (Haskell PlutusFailure), not a collection error (#734).
         let err = decode_script_bytes(&[0xfe, 0xfe, 0xfe]).unwrap_err();
         assert!(matches!(err, PhaseTwoError::ScriptEvaluationFailed(_)));
         assert!(err.is_script_evaluation_failure());
+    }
+
+    #[test]
+    fn decode_script_bytes_requires_cbor_wrapper_rejects_bare_flat() {
+        // #836, on-chain-verified: EVERY real captured witness AND
+        // reference script sample decodes only via `Program::from_cbor`
+        // (double CBOR-bytestring-wrapped flat) — never via bare/raw
+        // flat. A script whose bytes are unwrapped flat (no CBOR
+        // wrapper at all) must be rejected, matching Haskell
+        // `deserialiseScript` = `CBOR.decodeBytes >=> unflat`, which
+        // hard-fails on non-CBOR input before ever reaching `unflat`.
+        let bare_flat = Program {
+            version: (1, 0, 0),
+            term: Term::Const(Constant::Unit),
+        }
+        .to_flat()
+        .unwrap();
+        assert!(decode_script_bytes(&bare_flat).is_err());
+
+        // The CBOR-wrapped form of the exact same program must decode.
+        let cbor_wrapped = Program {
+            version: (1, 0, 0),
+            term: Term::Const(Constant::Unit),
+        }
+        .to_cbor()
+        .unwrap();
+        assert!(decode_script_bytes(&cbor_wrapped).is_ok());
     }
 
     /// Build a minimal `ResolvedRedeemer` that points at the smallest
@@ -662,16 +700,14 @@ mod tests {
         use std::collections::BTreeMap;
 
         let script_cbor = unit_returning_v3_script();
-        // The witness-set Plutus-script entry is the inner flat bytes
-        // (cardano stores them unwrapped at the witness-set level —
-        // see `Program::from_cbor` which decodes the outer wrapper).
+        // The witness-set Plutus-script entry is STILL CBOR-bytestring
+        // -wrapped flat (#836/#792): `witness_set.plutus_vN_scripts[i]`
+        // needs `Program::from_cbor` to reach the flat program, matching
+        // the real on-chain `deserialiseScript` = `CBOR.decodeBytes >=>
+        // unflat` convention and the script-hash-over-wire-bytes rule
+        // (`hashScript = tag <> serialize(script)`).
         let mut buf = vec![3u8];
-        // Pull the inner flat bytes out of the CBOR wrapper.
-        let inner = {
-            let mut d = minicbor::Decoder::new(&script_cbor);
-            d.bytes().unwrap().to_vec()
-        };
-        buf.extend_from_slice(&inner);
+        buf.extend_from_slice(&script_cbor);
         let script_hash = dugite_primitives::hash::blake2b_224(&buf).0;
         let input = TransactionInput {
             transaction_id: Hash::<32>([0xaa; 32]),
@@ -721,7 +757,7 @@ mod tests {
             bootstrap_witnesses: vec![],
             plutus_v1_scripts: vec![],
             plutus_v2_scripts: vec![],
-            plutus_v3_scripts: vec![inner.clone()],
+            plutus_v3_scripts: vec![script_cbor.clone()],
             plutus_data: vec![],
             redeemers: vec![Redeemer {
                 tag: RedeemerTag::Spend,
@@ -928,12 +964,10 @@ mod tests {
         use dugite_primitives::value::{Lovelace, Value};
         use std::collections::BTreeMap;
 
-        let inner = {
-            let mut d = minicbor::Decoder::new(&script_cbor);
-            d.bytes().unwrap().to_vec()
-        };
+        // Witness-set entry stays CBOR-bytestring-wrapped flat (#836/#792)
+        // — see the comment in `smoke_v3_unit_script_runs_and_returns_unit`.
         let mut buf = vec![3u8];
-        buf.extend_from_slice(&inner);
+        buf.extend_from_slice(&script_cbor);
         let script_hash = dugite_primitives::hash::blake2b_224(&buf).0;
         let input = TransactionInput {
             transaction_id: Hash::<32>([0xcc; 32]),
@@ -983,7 +1017,7 @@ mod tests {
             bootstrap_witnesses: vec![],
             plutus_v1_scripts: vec![],
             plutus_v2_scripts: vec![],
-            plutus_v3_scripts: vec![inner.clone()],
+            plutus_v3_scripts: vec![script_cbor.clone()],
             plutus_data: vec![],
             redeemers: vec![Redeemer {
                 tag: RedeemerTag::Spend,

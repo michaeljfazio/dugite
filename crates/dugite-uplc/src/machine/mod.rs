@@ -18,11 +18,15 @@
 //!     the cost model and aborts the moment either dimension goes
 //!     negative — *before* taking the step's allocations, not after.
 //!
-//! Defensive bound: a hard `MAX_KONTINUATION_DEPTH` cap on the
-//! continuation stack protects against pathological terms that spawn
-//! exponentially-deep frame stacks without consuming proportional CPU
-//! budget (a Cardano-specific DoS concern noted in the original Plutus
-//! tech report).
+//! The continuation stack (`Kont`) has no depth cap: it is a
+//! heap-allocated `Vec<Frame>`, not OS call-stack recursion, so it
+//! cannot overflow the native stack. Its growth is bounded purely by
+//! `ExBudget` exhaustion — exactly like Haskell's `Context`
+//! (`UntypedPlutusCore.Evaluation.Machine.Cek.Internal`), which has no
+//! depth field at all. An earlier hard `MAX_KONTINUATION_DEPTH` cap was
+//! removed (#817): it rejected budget-valid, non-tail-recursive scripts
+//! that cardano-node accepts, which is a live consensus-fork risk, not
+//! a DoS mitigation Haskell itself relies on.
 
 pub mod context;
 pub mod cost;
@@ -32,10 +36,6 @@ pub mod value;
 
 pub use self::step::{evaluate, State};
 pub use self::value::Value;
-
-/// Cap on the continuation-stack depth. Mainnet scripts never reach
-/// anywhere close to this; the limit is purely a DoS guard.
-pub const MAX_KONTINUATION_DEPTH: usize = 4 * 1024;
 
 /// `(cpu, mem)` units, mirroring the Haskell `ExBudget` record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

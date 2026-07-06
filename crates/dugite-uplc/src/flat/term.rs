@@ -289,7 +289,11 @@ fn decode_term_inner(r: &mut BitReader<'_>, depth: usize) -> FlatResult<Term> {
     let tag = r.read_bits8(TERM_TAG_WIDTH)?;
     match tag {
         0 => {
-            let idx = r.read_natural_u64()?;
+            // De Bruijn `Index` is a genuinely-bounded `Word64` in
+            // Haskell (`PlutusCore.DeBruijn.Internal`) — use the strict
+            // decode that rejects (rather than silently truncates) a
+            // value beyond `u64::MAX` (issue #842).
+            let idx = r.read_word64_strict()?;
             Ok(Term::Var(idx))
         }
         1 => {
@@ -330,7 +334,10 @@ fn decode_term_inner(r: &mut BitReader<'_>, depth: usize) -> FlatResult<Term> {
             // Constr: varint(tag) + cons-list(term).  Matches Haskell
             // `encodeTerm (Constr _ i ts) = encodeTermTag 8 <> encode i
             //                                              <> encodeListWith encode ts`.
-            let ctag = r.read_natural_u64()?;
+            // `Constr`'s tag is a genuinely-bounded `Word64` in Haskell
+            // (`UntypedPlutusCore.Core.Type`) — same strict decode as
+            // the De Bruijn index above (issue #842).
+            let ctag = r.read_word64_strict()?;
             let args = decode_term_list(r, depth + 1)?;
             Ok(Term::Constr { tag: ctag, args })
         }
@@ -1154,6 +1161,47 @@ mod tests {
             matches!(result, Err(UplcError::FlatDecode(_))),
             "expected depth-limit error, got {result:?}"
         );
+    }
+
+    /// Hand-craft the bits of a malformed `Word64` varint: 9 chunks of
+    /// `(continuation=true, value=0)` followed by a 10th chunk
+    /// `(continuation=false, value=2)`. Chunk 10 lands at `shift=63`,
+    /// where any value `> 1` requires a 65th value bit that doesn't
+    /// exist in a `u64` — Haskell's `dWord64` rejects this exact shape
+    /// (issue #842). No legitimate `u64` input can ever produce this
+    /// encoding (`write_natural_u64` never emits it), so this can only
+    /// be constructed by hand, matching an adversarial wire input.
+    fn write_malformed_word64_overflow(w: &mut BitWriter) {
+        for _ in 0..9 {
+            w.write_bit(true);
+            w.write_bits8(0, 7).unwrap();
+        }
+        w.write_bit(false);
+        w.write_bits8(2, 7).unwrap();
+    }
+
+    #[test]
+    fn var_index_beyond_u64_max_is_rejected() {
+        // Var tag = 0b0000.
+        let mut w = BitWriter::new();
+        w.write_bits8(0, TERM_TAG_WIDTH).unwrap();
+        write_malformed_word64_overflow(&mut w);
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        let err = decode_term(&mut r).unwrap_err();
+        assert!(matches!(err, UplcError::FlatDecode(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn constr_tag_beyond_u64_max_is_rejected() {
+        // Constr tag = 8 = 0b1000.
+        let mut w = BitWriter::new();
+        w.write_bits8(8, TERM_TAG_WIDTH).unwrap();
+        write_malformed_word64_overflow(&mut w);
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        let err = decode_term(&mut r).unwrap_err();
+        assert!(matches!(err, UplcError::FlatDecode(_)), "got {err:?}");
     }
 
     #[test]

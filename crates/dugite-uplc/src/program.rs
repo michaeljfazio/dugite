@@ -198,6 +198,25 @@ mod tests {
         assert_eq!(back.version, (3, 4, 5));
     }
 
+    /// #842: the version triple must stay on the LENIENT `u64` decode
+    /// path (`BitReader::read_natural_u64`), never the strict
+    /// `read_word64_strict` used for the De Bruijn index / `Constr`
+    /// tag (`flat/term.rs`). Haskell types `Version`'s three fields as
+    /// unbounded `Natural` (`PlutusCore.Version`), which never rejects
+    /// on overflow — a value right at the `u64` boundary (`u64::MAX`)
+    /// must round-trip cleanly, not be rejected as it would be under
+    /// the strict Word64 rule this fix introduces elsewhere.
+    #[test]
+    fn version_component_at_u64_boundary_is_not_rejected() {
+        let p = Program {
+            version: (u64::MAX, 0, 0),
+            term: Term::Error,
+        };
+        let back = Program::from_flat(&p.to_flat().unwrap())
+            .expect("version component at the u64 boundary must not be rejected");
+        assert_eq!(back.version, (u64::MAX, 0, 0));
+    }
+
     /// Canonical IOG always-true V1 validator (vendored by every cardano-node
     /// integration test fixture). cborHex `4e4d01000033222220051200120011`
     /// decomposes as: outer CBOR byte string of 14 bytes → inner CBOR byte
