@@ -88,6 +88,44 @@ impl ShelleyRules {
 /// the Byron-era burned transaction fees (removed from the UTxO, credited
 /// nowhere) are reflected — the bootstrap path's `max − Σ(genesis avvmDistr)`
 /// init misses them. At the fork treasury/rewards/deposits are all 0.
+/// Byron→Shelley: drop every UTxO entry whose coin value is zero, matching the
+/// `coinTxOutL /= zero` filter in Haskell `translateUTxOByronToShelley`
+/// (`Cardano.Ledger.Shelley.API.ByronTranslation`). At this boundary every live
+/// UTxO entry is a Byron-era output, so this scans the whole set. A zero-value
+/// Byron output that survived into Shelley would let dugite accept a spend that
+/// cardano-node rejects with `BadInputsUTxO` — a permanent membership divergence.
+/// See issue #798.
+fn drop_zero_value_byron_txouts(utxo: &mut UtxoSubState) {
+    // scan-collect-remove (cannot mutate the set mid-scan), mirroring
+    // `return_redeem_addrs_to_reserves`.
+    let mut zero_inputs: Vec<TransactionInput> = Vec::new();
+    let scan_failures = utxo.utxo_set.scan_all(|input, output| {
+        if output.value.coin.0 == 0 {
+            zero_inputs.push(input.clone());
+        }
+    });
+    // A partial scan could miss zero-value entries, leaving spend-able ghosts in
+    // the live set — a consensus divergence. Crash rather than diverge on a
+    // corrupt on-disk store (#806).
+    assert_eq!(
+        scan_failures, 0,
+        "Byron->Shelley zero-value TxOut purge: {scan_failures} UTxO entries failed to \
+         decode during the scan — the on-disk UTxO store is corrupt; refusing to purge \
+         from a partial scan. Wipe `<database-path>/utxo-store` and restart."
+    );
+    let dropped = zero_inputs.len();
+    for input in &zero_inputs {
+        utxo.utxo_set.remove(input);
+    }
+    if dropped > 0 {
+        info!(
+            dropped,
+            "Byron->Shelley: purged zero-value Byron TxOuts (translateUTxOByronToShelley \
+             coinTxOutL /= zero filter, #798)"
+        );
+    }
+}
+
 fn recompute_shelley_initial_reserves(
     utxo: &mut UtxoSubState,
     epochs: &mut EpochSubState,
@@ -974,6 +1012,18 @@ impl EraRules for ShelleyRules {
         // reserves now. On the Mithril-import path this branch never fires (the
         // node starts post-Byron with Haskell-correct reserves).
         if from_era == Era::Byron && ctx.era == Era::Shelley {
+            // Haskell `translateUTxOByronToShelley`
+            // (Cardano.Ledger.Shelley.API.ByronTranslation) filters the translated
+            // UTxO with the guard `txOutShelley ^. coinTxOutL /= zero`:
+            //   "In some testnets there are a few TxOuts with zero values injected at
+            //    initialization of Byron. We do not allow zero values in TxOuts in
+            //    Shelley."
+            // Drop them BEFORE recomputing reserves so the live Shelley UTxO membership
+            // matches Haskell exactly. (Zero-coin entries contribute 0 to sumCoinUTxO,
+            // so reserves is unaffected; the divergence this prevents is a later spend
+            // of a zero-value Byron output that Haskell would reject as BadInputsUTxO.)
+            // See issue #798.
+            drop_zero_value_byron_txouts(utxo);
             recompute_shelley_initial_reserves(utxo, epochs, ctx.max_lovelace_supply);
             // Byron fees are burned, not carried forward: Haskell's
             // `translateToShelleyLedgerStateFromUtxo` constructs a brand-new
@@ -2248,6 +2298,48 @@ mod tests {
         ]);
         let mut epochs = make_epoch_sub();
         recompute_shelley_initial_reserves(&mut utxo, &mut epochs, max);
+    }
+
+    /// #798: the Byron→Shelley translation drops zero-value TxOuts
+    /// (`translateUTxOByronToShelley` guard `coinTxOutL /= zero`). A zero-value
+    /// entry must be removed from the live UTxO set; a non-zero entry must remain.
+    #[test]
+    fn byron_to_shelley_drops_zero_value_txouts_798() {
+        let zero_in = make_redeem_input(0x0a, 0);
+        let live_in = make_redeem_input(0x0b, 0);
+        let mut utxo = make_utxo_sub(vec![
+            (zero_in.clone(), make_byron_output(0, 0)), // zero-value — must be dropped
+            (live_in.clone(), make_byron_output(0, 5_000_000)), // must survive
+        ]);
+        drop_zero_value_byron_txouts(&mut utxo);
+        assert!(
+            utxo.utxo_set.lookup(&zero_in).is_none(),
+            "zero-value Byron TxOut must be purged at the Byron->Shelley boundary (#798)"
+        );
+        assert!(
+            utxo.utxo_set.lookup(&live_in).is_some(),
+            "non-zero Byron TxOut must survive the purge"
+        );
+    }
+
+    /// Reserves are identical whether or not zero-value entries are purged (they
+    /// contribute 0 to sumCoinUTxO), so the #798 filter must not perturb the
+    /// reserves recomputation — only UTxO-set membership.
+    #[test]
+    fn byron_to_shelley_zero_purge_does_not_change_reserves_798() {
+        let max = 45_000_000_000_000_000u64;
+        let mut utxo = make_utxo_sub(vec![
+            (make_redeem_input(0x01, 0), make_byron_output(0, 10_000_000)),
+            (make_redeem_input(0x02, 0), make_byron_output(0, 0)),
+        ]);
+        let mut epochs = make_epoch_sub();
+        drop_zero_value_byron_txouts(&mut utxo);
+        recompute_shelley_initial_reserves(&mut utxo, &mut epochs, max);
+        assert_eq!(
+            epochs.reserves.0,
+            max - 10_000_000,
+            "reserves must equal maxLovelaceSupply minus the non-zero UTxO sum"
+        );
     }
 
     /// Shelley → Allegra transition purges AVVM (redeem) UTxOs from the UTxO
