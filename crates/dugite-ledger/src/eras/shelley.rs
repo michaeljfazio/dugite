@@ -101,7 +101,7 @@ fn recompute_shelley_initial_reserves(
     let mut redeem_sum: u64 = 0;
     let mut redeem_count: u64 = 0;
     let mut scan_count: u64 = 0;
-    utxo.utxo_set.scan_all(|_input, output| {
+    let scan_failures = utxo.utxo_set.scan_all(|_input, output| {
         // Shelley-era outputs are ADA-only; coin == full value.
         utxo_sum = utxo_sum.saturating_add(output.value.coin.0);
         scan_count += 1;
@@ -110,6 +110,15 @@ fn recompute_shelley_initial_reserves(
             redeem_count += 1;
         }
     });
+    // A partial scan understates `utxo_sum`, which would silently INFLATE
+    // reserves (`maxLovelaceSupply - sumCoinUTxO`) — a permanently wrong
+    // ledger. Crash rather than diverge on a corrupt on-disk store (#806).
+    assert_eq!(
+        scan_failures, 0,
+        "Byron->Shelley reserves init: {scan_failures} UTxO entries failed to decode \
+         during sumCoinUTxO — the on-disk UTxO store is corrupt; refusing to derive \
+         reserves from a partial scan. Wipe `<database-path>/utxo-store` and restart."
+    );
     // Invariant tripwire: the live UTxO can never sum to MORE than the maximum
     // lovelace supply — `sumCoinUTxO ≤ maxLovelaceSupply` always holds on a
     // correct chain (Haskell computes `reserves = maxLovelaceSupply <-> sumCoinUTxO`
@@ -154,7 +163,7 @@ fn return_redeem_addrs_to_reserves(utxo: &mut UtxoSubState, epochs: &mut EpochSu
     let mut redeem_inputs: Vec<TransactionInput> = Vec::new();
     let mut redeem_coin: u64 = 0;
 
-    utxo.utxo_set.scan_all(|input, output| {
+    let scan_failures = utxo.utxo_set.scan_all(|input, output| {
         let is_redeem = matches!(&output.address, Address::Byron(b) if b.is_redeem());
         if is_redeem {
             redeem_inputs.push(input.clone());
@@ -163,6 +172,16 @@ fn return_redeem_addrs_to_reserves(utxo: &mut UtxoSubState, epochs: &mut EpochSu
             redeem_coin = redeem_coin.saturating_add(output.value.coin.0);
         }
     });
+    // A partial scan could miss redeem UTxOs, under-crediting reserves and
+    // leaving un-returned AVVM entries in the live set — a consensus
+    // divergence. Crash rather than diverge on a corrupt on-disk store (#806).
+    assert_eq!(
+        scan_failures, 0,
+        "AVVM redeem return: {scan_failures} UTxO entries failed to decode during the \
+         redeem scan — the on-disk UTxO store is corrupt; refusing to return AVVM \
+         balances to reserves from a partial scan. Wipe `<database-path>/utxo-store` \
+         and restart."
+    );
 
     let redeem_count = redeem_inputs.len();
 

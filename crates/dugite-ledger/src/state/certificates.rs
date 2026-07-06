@@ -115,20 +115,32 @@ pub(crate) fn apply_pending_mir(
     let available_reserves = epochs.reserves.0 as i128 - dr + dt;
     let available_treasury = epochs.treasury.0 as i128 + dr - dt;
 
+    // A credential may appear in BOTH the reserves and treasury maps; its
+    // reward balance moves by the SUM of the two deltas. Haskell credits
+    // accounts via the union (`Map.unionWith (+)`) of the two reward maps,
+    // in one step. Fold to the per-credential net delta here so both the
+    // non-negativity check (Step 4) and the credit (Step 5) operate on that
+    // net: checking or applying each map independently against the
+    // pre-apply balance lets a credential that is individually solvent in
+    // each map but jointly negative pass the guard and then wrap `as u64`
+    // in Step 5's sequential apply (issue #803 follow-up).
+    let mut combined_deltas: std::collections::HashMap<Hash32, i128> =
+        std::collections::HashMap::with_capacity(filtered_reserves.len() + filtered_treasury.len());
+    for (cred, delta) in filtered_reserves.iter().chain(filtered_treasury.iter()) {
+        *combined_deltas.entry(*cred).or_insert(0) += delta;
+    }
+
     // Step 4: all-or-nothing solvency, plus the defensive per-credential
-    // non-negativity check described above.
+    // non-negativity check described above (over the combined net delta).
     let solvent = tot_r <= available_reserves && tot_t <= available_treasury;
-    let all_non_negative = filtered_reserves
-        .iter()
-        .chain(filtered_treasury.iter())
-        .all(|(cred, delta)| {
-            let existing = certs
-                .reward_accounts
-                .get(cred)
-                .map(|l| l.0 as i128)
-                .unwrap_or(0);
-            existing + delta >= 0
-        });
+    let all_non_negative = combined_deltas.iter().all(|(cred, delta)| {
+        let existing = certs
+            .reward_accounts
+            .get(cred)
+            .map(|l| l.0 as i128)
+            .unwrap_or(0);
+        existing + delta >= 0
+    });
 
     if !solvent || !all_non_negative {
         warn!(
@@ -148,9 +160,14 @@ pub(crate) fn apply_pending_mir(
         return;
     }
 
-    // Step 5: apply — byte-identical to the previous unconditional path for
-    // all valid (solvent) history.
-    for (cred, delta) in filtered_reserves.iter().chain(filtered_treasury.iter()) {
+    // Step 5: apply the per-credential *combined* net delta exactly once,
+    // so a credential present in both maps never transiently wraps through
+    // an intermediate negative `as u64`. Byte-identical to the previous
+    // per-map sequential path for all valid (solvent) history — associativity
+    // of the two credits, which never underflow on correct history. Iteration
+    // order over the map is irrelevant: each credential is assigned exactly
+    // once from its own pre-apply balance.
+    for (cred, delta) in &combined_deltas {
         if let Some(entry) = certs.reward_accounts.get_mut(cred) {
             entry.0 = (entry.0 as i128 + delta) as u64;
         }
@@ -1959,6 +1976,90 @@ mod tests {
         assert_eq!(
             balance.0, 0,
             "credential balance must be untouched on the NoMirTransfer path"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 28c — MIR cross-map (reserves + treasury) joint underflow (#803
+    // follow-up): a credential present in BOTH pending maps whose deltas each
+    // pass the per-map non-negativity guard against the pre-apply balance but
+    // are JOINTLY negative must be caught (NoMirTransfer), not applied.
+    // -----------------------------------------------------------------------
+
+    /// Before the fix, Step 4 checked each map entry independently against the
+    /// pre-apply balance and Step 5 applied reserves-then-treasury
+    /// sequentially. A credential in both maps could pass both checks yet go
+    /// negative mid-apply, wrapping `(balance as i128 + delta) as u64` into a
+    /// ~1.8e19-lovelace reward balance (main panicked here; the #803 rewrite
+    /// turned that panic into a silent wrap). The guard and the credit must
+    /// operate on the per-credential COMBINED net delta (Haskell credits
+    /// accounts via the union of the two reward maps).
+    #[test]
+    fn test_mir_cross_map_joint_underflow_no_mir_transfer_803() {
+        use dugite_primitives::transaction::{MIRSource, MIRTarget};
+
+        let mut state = make_state();
+        let initial_reserves: u64 = 1_000_000_000_000;
+        let initial_treasury: u64 = 1_000_000_000_000;
+        state.epochs.reserves.0 = initial_reserves;
+        state.epochs.treasury.0 = initial_treasury;
+
+        let cred = test_credential();
+        let key = credential_to_hash(&cred);
+        state.process_certificate(&Certificate::StakeRegistration(cred.clone()));
+
+        // Round 1: credit the credential to a starting balance of 8_000_000.
+        state.process_certificate(&Certificate::MoveInstantaneousRewards {
+            source: MIRSource::Reserves,
+            target: MIRTarget::StakeCredentials(vec![(cred.clone(), 8_000_000i64)]),
+        });
+        super::apply_pending_mir(&mut state.certs, &mut state.epochs);
+        assert_eq!(
+            state
+                .certs
+                .reward_accounts
+                .get(&key)
+                .copied()
+                .unwrap_or(Lovelace(0))
+                .0,
+            8_000_000,
+            "precondition: credential should hold 8_000_000 after round 1"
+        );
+        let reserves_after_r1 = state.epochs.reserves.0;
+
+        // Round 2: -5_000_000 from reserves AND -5_000_000 from treasury for the
+        // same credential. Each passes independently (8M - 5M = 3M >= 0), but
+        // combined 8M - 10M = -2M < 0.
+        state.process_certificate(&Certificate::MoveInstantaneousRewards {
+            source: MIRSource::Reserves,
+            target: MIRTarget::StakeCredentials(vec![(cred.clone(), -5_000_000i64)]),
+        });
+        state.process_certificate(&Certificate::MoveInstantaneousRewards {
+            source: MIRSource::Treasury,
+            target: MIRTarget::StakeCredentials(vec![(cred, -5_000_000i64)]),
+        });
+        super::apply_pending_mir(&mut state.certs, &mut state.epochs);
+
+        // NoMirTransfer: pots and the credential balance are all byte-unchanged,
+        // and crucially the balance did NOT wrap to a ~1.8e19 value.
+        assert_eq!(
+            state
+                .certs
+                .reward_accounts
+                .get(&key)
+                .copied()
+                .unwrap_or(Lovelace(0))
+                .0,
+            8_000_000,
+            "cross-map joint underflow must be caught: balance unchanged, no u64 wrap"
+        );
+        assert_eq!(
+            state.epochs.reserves.0, reserves_after_r1,
+            "NoMirTransfer: reserves must be unchanged"
+        );
+        assert_eq!(
+            state.epochs.treasury.0, initial_treasury,
+            "NoMirTransfer: treasury must be unchanged"
         );
     }
 
