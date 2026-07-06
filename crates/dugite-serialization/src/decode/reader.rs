@@ -111,6 +111,21 @@ impl<'b> Reader<'b> {
             .map_err(|e| SerializationError::CborDecode(format!("peek_major: {e}")))
     }
 
+    /// Peek at the raw header byte at the current position without advancing.
+    ///
+    /// Returns `None` if the buffer is exhausted. Used to distinguish a
+    /// minimal-width CBOR tag header (single byte, value inlined in the low
+    /// 5 bits) from a wider, non-minimal encoding of the same tag value —
+    /// `cborg`'s `peekTokenType` (which upstream `cardano-ledger`'s
+    /// `PlutusData` decoder is built on) only recognizes the 1-byte inline
+    /// form of tags 2/3 as the bignum path (`TypeInteger`); any wider
+    /// encoding (e.g. `d8 02`) is routed to `TypeTag` → `decodeConstr`,
+    /// which rejects it. See #831.
+    #[inline]
+    pub fn peek_byte(&self) -> Option<u8> {
+        self.origin.get(self.inner.position()).copied()
+    }
+
     /// Consume exactly one CBOR break byte (`0xff`) at the current position.
     ///
     /// Errors if the current value is not a break. This mirrors the upstream

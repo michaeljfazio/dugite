@@ -25,6 +25,10 @@ pub(crate) use governance::{
     pp_change_spo_threshold, prev_action_as_expected, DRepPPGroup, StakePoolPPGroup,
 };
 pub use rewards::compute_reward_update;
+// Re-export for the RUPD-apply sites in `eras::shelley` / `eras::conway`,
+// which are not descendants of `state` and cannot otherwise reach the
+// private `rewards` submodule. See issue #796.
+pub(crate) use rewards::apply_reserves_delta;
 #[doc(hidden)]
 pub use rewards::Rat;
 pub use snapshot::{
@@ -175,6 +179,19 @@ pub struct LedgerState {
     /// (Shelley-era only; Conway removed the cert type). Used for BFT overlay
     /// schedule validation during early Shelley era (when d > 0).
     pub genesis_delegates: HashMap<Hash28, (Hash28, Hash32)>,
+    /// Pending (not-yet-matured) genesis-delegate changes: `(maturity_slot,
+    /// genesis_key_hash)` -> `(delegate_key_hash, vrf_key_hash)`.
+    ///
+    /// Haskell's `dsFutureGenDelegs`: a `Certificate::GenesisKeyDelegation`
+    /// does NOT update `genesis_delegates` immediately — it enqueues here
+    /// with `maturity_slot = cert_slot + stability_window_3kf`
+    /// (`stabilityWindow = ceil(3k/f)`, NOT doubled — see
+    /// `eras::common::enqueue_genesis_key_delegations`). Entries are moved
+    /// into `genesis_delegates` by `eras::common::adopt_matured_genesis_delegs`
+    /// once `maturity_slot <= current_slot`, called every block (Haskell's
+    /// `adoptGenesisDelegs` runs at TICK, not just epoch boundaries).
+    /// See issue #804.
+    pub future_gen_delegs: HashMap<(u64, Hash28), (Hash28, Hash32)>,
     /// Quorum for pre-Conway protocol parameter updates (from Shelley genesis)
     pub update_quorum: u64,
     /// The network this node is running on (mainnet, testnet, etc.).
@@ -231,8 +248,15 @@ pub struct PendingRewardUpdate {
     pub rewards: HashMap<Hash32, Lovelace>,
     /// Total treasury increase (tau cut + undistributed rewards).
     pub delta_treasury: u64,
-    /// Total reserves decrease (monetary expansion).
-    pub delta_reserves: u64,
+    /// Signed reserves adjustment (Haskell `RewardUpdate.deltaR`, a signed
+    /// `DeltaCoin`/`Integer`). Positive means reserves DECREASE (the normal
+    /// monetary-expansion case); negative means reserves INCREASE — this
+    /// happens in a degraded/low-block epoch where `epoch_fees` exceeds
+    /// `treasury_cut + total_distributed`, and Haskell's `applyRUpdFiltered`
+    /// credits the difference back to reserves via `addDeltaCoin`. See
+    /// issue #796. `i128` (not `u64`) so the sign can be represented; the
+    /// magnitude never exceeds the max lovelace supply, well within range.
+    pub delta_reserves: i128,
 }
 
 // ── Governance proposal priority forest types ─────────────────────────
@@ -562,6 +586,23 @@ pub struct ProposalState {
     pub yes_votes: u64,
     pub no_votes: u64,
     pub abstain_votes: u64,
+    /// Monotonic on-chain submission order (issue #799).
+    ///
+    /// Haskell's `reorderActions` (`Governance/Internal.hs:534-544`) stable-sorts
+    /// active proposals by `actionPriority` only; ties preserve the proposals
+    /// `OMap`'s insertion (on-chain submission) order — NEVER `GovActionId`
+    /// (hash) order. `proposals` here is an `ImblOrdMap<GovActionId, _>`, whose
+    /// natural iteration order is by key (hash), so this field is required to
+    /// recover submission order for the ratification tie-break sort.
+    ///
+    /// Assigned from the monotonic `GovernanceState::proposal_count` counter
+    /// (read BEFORE it is incremented) at every ingest site: `eras/conway.rs`
+    /// (live block-apply GOV rule), `state/governance.rs` `process_proposal` /
+    /// `process_proposal_with_delta` (test/dead-path), and reconstructed by
+    /// enumeration order when loading a Haskell ledger-state dump
+    /// (`state/mod.rs::from_haskell_snapshot`, which decodes proposals from an
+    /// on-wire `StrictSeq` that preserves the OMap's insertion order).
+    pub submission_index: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -775,6 +816,7 @@ impl LedgerState {
             slot_config: SlotConfig::default(),
             genesis_hash: Hash32::ZERO,
             genesis_delegates: HashMap::new(),
+            future_gen_delegs: HashMap::new(),
             update_quorum: default_update_quorum(),
             node_network: None,
             randomness_stabilisation_window: 172800, // 4k/f on mainnet: ceil(4*2160/0.05)
@@ -1073,7 +1115,7 @@ impl LedgerState {
                 use dugite_serialization::haskell_snapshot::types::HaskellVote;
 
                 let proposal_count = haskell_proposals.len();
-                for gas in haskell_proposals {
+                for (submission_index, gas) in haskell_proposals.into_iter().enumerate() {
                     let action_id = GovActionId {
                         transaction_id: gas.gas_id.tx_hash,
                         action_index: gas.gas_id.index as u32,
@@ -1146,12 +1188,28 @@ impl LedgerState {
                         yes_votes: yes,
                         no_votes: no,
                         abstain_votes: abstain,
+                        // #799: `decode_proposals` returns entries in the order
+                        // they appear on the wire, which is a `StrictSeq` that
+                        // preserves the Haskell `Proposals` OMap's insertion
+                        // (on-chain submission) order — see the doc comment on
+                        // `decode_proposals`. Enumeration index is therefore a
+                        // faithful reconstruction of `submission_index`.
+                        submission_index: submission_index as u64,
                     };
                     gov.proposals.insert(action_id.clone(), state);
                     if !votes.is_empty() {
                         gov.votes_by_action.insert(action_id, votes);
                     }
                 }
+                // #799: seed the monotonic submission counter past every
+                // reconstructed proposal so that proposals submitted AFTER
+                // this snapshot import get strictly higher `submission_index`
+                // values than all pre-existing ones (correct relative
+                // ordering for the ratification tie-break sort). Without
+                // this, `gov.proposal_count` stays at its `Default` (0),
+                // colliding with `submission_index: 0` assigned above to the
+                // first reconstructed proposal.
+                gov.proposal_count = gov.proposal_count.max(proposal_count as u64);
                 info!(
                     proposal_count,
                     "Loaded active governance proposals from Haskell snapshot"
@@ -1264,6 +1322,12 @@ impl LedgerState {
             slot_config: SlotConfig::default(), // Will be set by set_slot_config()
             genesis_hash: Hash32::ZERO,         // Will be set by set_genesis_hash()
             genesis_delegates,
+            // Haskell snapshots are imported at a Conway-era tip, where the
+            // GenesisKeyDelegation/FutureGenDeleg mechanism is retired
+            // (AtMostEra "Babbage") — there is no live queue to decode, and
+            // the Haskell snapshot decoder does not carry `dsFutureGenDelegs`
+            // in the first place. Empty is correct here.
+            future_gen_delegs: HashMap::new(),
             update_quorum: 5,
             node_network: None, // Will be set by caller
             // Will be recalculated by set_epoch_length()
@@ -1314,6 +1378,7 @@ impl LedgerState {
             slot_config: self.slot_config,
             genesis_hash: self.genesis_hash,
             genesis_delegates: self.genesis_delegates.clone(),
+            future_gen_delegs: self.future_gen_delegs.clone(),
             update_quorum: self.update_quorum,
             node_network: self.node_network,
             randomness_stabilisation_window: self.randomness_stabilisation_window,
@@ -1575,9 +1640,11 @@ impl LedgerState {
     /// slot depends on `d`; using the wrong (higher, pre-decrease) `d` mis-counts
     /// overlay slots and rejects the first valid Praos block of the new epoch.
     ///
-    /// This applies the SAME enactment as `process_epoch_transition` (proposals
-    /// keyed by `target_epoch - 1`, requiring the genesis-key quorum, last-writer
-    /// merge) but without mutating state. Only forecasts ONE epoch ahead; for the
+    /// This applies the SAME enactment as `process_epoch_transition`
+    /// (proposals keyed by `target_epoch - 1`, requiring a quorum of
+    /// genesis delegates to have voted the byte-identical value — see
+    /// [`crate::validation::ppup::voted_future_pparams`], issue #784) but
+    /// without mutating state. Only forecasts ONE epoch ahead; for the
     /// same epoch or anything further out it returns the current `d`.
     pub fn forecast_d_for_epoch(
         &self,
@@ -1591,19 +1658,15 @@ impl LedgerState {
         let Some(proposals) = self.epochs.pending_pp_updates.get(&lookup_epoch) else {
             return current_d;
         };
-        let distinct: std::collections::HashSet<Hash32> =
-            proposals.iter().map(|(g, _)| *g).collect();
-        if (distinct.len() as u64) < self.update_quorum {
+        let proposal_map = crate::validation::ppup::fold_pp_proposals(proposals);
+        let Some(winner) = crate::validation::ppup::voted_future_pparams(
+            &proposal_map,
+            self.update_quorum,
+            &self.epochs.protocol_params,
+        ) else {
             return current_d;
-        }
-        // Last-writer merge over `d`, matching the merge_field! macro.
-        let mut d = None;
-        for (_, ppu) in proposals {
-            if ppu.d.is_some() {
-                d = ppu.d.clone();
-            }
-        }
-        d.unwrap_or(current_d)
+        };
+        winner.d.unwrap_or(current_d)
     }
 
     /// Forecast the active extra entropy (Shelley `ppExtraEntropy`) for
@@ -1612,10 +1675,11 @@ impl LedgerState {
     /// Header validation of a block in epoch N+1 derives its VRF seed from
     /// epoch N+1's nonce, which folds in the extraEntropy that the boundary
     /// PPUP will enact. This mirrors `process_epoch_transition`'s enactment
-    /// (proposals keyed by `target_epoch - 1`, genesis-key quorum, last-writer
-    /// merge, sticky) without mutating state. Returns the current (sticky)
-    /// value for the same epoch, anything further out, or when no proposal
-    /// changes it.
+    /// (proposals keyed by `target_epoch - 1`, requiring a quorum of genesis
+    /// delegates to have voted the byte-identical value — see
+    /// [`crate::validation::ppup::voted_future_pparams`], issue #784, sticky)
+    /// without mutating state. Returns the current (sticky) value for the
+    /// same epoch, anything further out, or when no proposal changes it.
     pub fn forecast_extra_entropy_for_epoch(&self, target_epoch: u64) -> Hash32 {
         let current = self.consensus.extra_entropy;
         if target_epoch != self.epoch.0.saturating_add(1) {
@@ -1625,19 +1689,15 @@ impl LedgerState {
         let Some(proposals) = self.epochs.pending_pp_updates.get(&lookup_epoch) else {
             return current;
         };
-        let distinct: std::collections::HashSet<Hash32> =
-            proposals.iter().map(|(g, _)| *g).collect();
-        if (distinct.len() as u64) < self.update_quorum {
+        let proposal_map = crate::validation::ppup::fold_pp_proposals(proposals);
+        let Some(winner) = crate::validation::ppup::voted_future_pparams(
+            &proposal_map,
+            self.update_quorum,
+            &self.epochs.protocol_params,
+        ) else {
             return current;
-        }
-        // Last-writer merge over extra_entropy, matching the merge_field! macro.
-        let mut extra = None;
-        for (_, ppu) in proposals {
-            if ppu.extra_entropy.is_some() {
-                extra = ppu.extra_entropy;
-            }
-        }
-        extra.unwrap_or(current)
+        };
+        winner.extra_entropy.unwrap_or(current)
     }
 
     /// Forecast the active `maxBlockBodySize` for `target_epoch` while the
@@ -1654,7 +1714,10 @@ impl LedgerState {
     /// 305→306 boundary; the first epoch-306 block (6573513) has a 71271-byte
     /// body and is valid only under 73728. Mirrors
     /// [`Self::forecast_d_for_epoch`] (proposals keyed by `target_epoch - 1`,
-    /// genesis-key quorum, last-writer merge), without mutating state.
+    /// requiring a quorum of genesis delegates to have voted the
+    /// byte-identical value — see
+    /// [`crate::validation::ppup::voted_future_pparams`], issue #784),
+    /// without mutating state.
     pub fn forecast_max_block_body_size_for_epoch(&self, target_epoch: u64) -> u64 {
         let current = self.epochs.protocol_params.max_block_body_size;
         if target_epoch != self.epoch.0.saturating_add(1) {
@@ -1664,18 +1727,15 @@ impl LedgerState {
         let Some(proposals) = self.epochs.pending_pp_updates.get(&lookup_epoch) else {
             return current;
         };
-        let distinct: std::collections::HashSet<Hash32> =
-            proposals.iter().map(|(g, _)| *g).collect();
-        if (distinct.len() as u64) < self.update_quorum {
+        let proposal_map = crate::validation::ppup::fold_pp_proposals(proposals);
+        let Some(winner) = crate::validation::ppup::voted_future_pparams(
+            &proposal_map,
+            self.update_quorum,
+            &self.epochs.protocol_params,
+        ) else {
             return current;
-        }
-        let mut v = None;
-        for (_, ppu) in proposals {
-            if ppu.max_block_body_size.is_some() {
-                v = ppu.max_block_body_size;
-            }
-        }
-        v.unwrap_or(current)
+        };
+        winner.max_block_body_size.unwrap_or(current)
     }
 
     /// Set the Shelley genesis hash.
@@ -2033,9 +2093,12 @@ impl LedgerState {
     /// 4. Roll back the [`LedgerSeq`] (drops trailing deltas + invalidates
     ///    checkpoints that pointed into the removed range).
     /// 5. Replace every non-UTxO field on `self` with the seq's
-    ///    reconstructed tip state — and copy `epoch_fees` /
-    ///    `pending_donations` (the two UTxO-adjacent scalars the seq
-    ///    tracks via `BlockFieldsDelta`).
+    ///    reconstructed tip state — including `epoch_fees` / `pending_donations`
+    ///    (the two UTxO-adjacent scalars the seq tracks via `BlockFieldsDelta`,
+    ///    since #782) and `genesis_delegates` (a top-level field the seq
+    ///    tracks via a dedicated delta snapshot, also since #782 — it is not
+    ///    covered by the wholesale `certs`/`gov`/`consensus`/`epochs`
+    ///    sub-state copies below because it lives directly on `LedgerState`).
     ///
     /// The LSM UTxO store stays attached the whole time: the `UtxoSet`
     /// already write-throughs to the LSM store on `insert`/`remove`, so
@@ -2065,16 +2128,46 @@ impl LedgerState {
             return Some(0);
         }
 
+        // #806 DEFECT A: `save_ledger_snapshot` clears `utxo.diff_seq` (to
+        // reclaim memory — diffs are `#[serde(skip)]`, not persisted) but
+        // does NOT clear `seq` (the `LedgerSeq`). If a rollback target lands
+        // further back than the diffs retained since the last snapshot,
+        // `diff_seq.len() < n` and reverse-applying only `diff_seq.len()`
+        // UTxO diffs while restoring non-UTxO state `n` blocks back would
+        // silently desync the UTxO set from the rest of ledger state. Must
+        // be checked BEFORE any mutation below (`diff_seq.rollback` /
+        // `seq.rollback` have not run yet at this point), so returning
+        // `None` here is a clean bail-out: the caller's existing snapshot
+        // reload fallback recovers safely.
+        if n > self.utxo.diff_seq.len() {
+            tracing::warn!(
+                n,
+                have = self.utxo.diff_seq.len(),
+                "LedgerSeq/DiffSeq desync: DiffSeq too short to cover rollback; falling back to snapshot recovery"
+            );
+            return None;
+        }
+
         // Step 1+2: pop the trailing n UTxO diffs and invert each one on the
         // live store.  `DiffSeq::rollback` removes them from the seq; the
         // returned `Vec` is consumed here for the reverse-apply.
         let diffs = self.utxo.diff_seq.rollback(n);
         for (_slot, _hash, diff) in &diffs {
-            for (input, _output) in &diff.inserts {
-                self.utxo.utxo_set.remove(input);
-            }
+            // Invert `apply` exactly. Forward apply is inserts-then-deletes
+            // (`ledger_seq.rs` flattened path), so the inverse must re-insert
+            // `deletes` FIRST, then remove `inserts`. Within one block's merged
+            // diff, an output created by tx_i and spent by tx_j (j>i) appears in
+            // BOTH `inserts` and `deletes` (`UtxoDiff::merge` appends, no
+            // cancellation). Removing inserts first then re-inserting deletes
+            // would materialize that phantom UTxO (a spent-in-block output). The
+            // opposite overlap (TxIn deleted then re-created in one block) is
+            // impossible — recreating `(txhash, ix)` needs a duplicate tx hash —
+            // so this ordering is the exact inverse in all cases. (#781)
             for (input, output) in &diff.deletes {
                 self.utxo.utxo_set.insert(input.clone(), output.clone());
+            }
+            for (input, _output) in &diff.inserts {
+                self.utxo.utxo_set.remove(input);
             }
         }
 
@@ -2093,6 +2186,11 @@ impl LedgerState {
         self.pending_era_transition = new_state.pending_era_transition;
         self.utxo.epoch_fees = new_state.utxo.epoch_fees;
         self.utxo.pending_donations = new_state.utxo.pending_donations;
+        // #782: top-level field, not covered by the sub-state copies above.
+        self.genesis_delegates = new_state.genesis_delegates;
+        // #804: same rationale — `future_gen_delegs` lives directly on
+        // `LedgerState`, tracked via its own delta snapshot.
+        self.future_gen_delegs = new_state.future_gen_delegs;
 
         Some(n)
     }

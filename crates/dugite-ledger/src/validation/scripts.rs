@@ -29,10 +29,17 @@ use super::ValidationError;
 // ---------------------------------------------------------------------------
 
 /// Evaluate a native script given the set of key hashes that signed
-/// the transaction and the current slot validity interval.
+/// the transaction and the transaction's own `ValidityInterval`.
 ///
 /// This is the canonical recursive evaluator matching the Cardano ledger
 /// specification for native scripts (Shelley multi-sig and Mary timelocks).
+///
+/// **Timelock semantics (issue #787)**: Haskell's `evalTimelock` evaluates
+/// `RequireTimeStart`/`RequireTimeExpire` against the transaction body's
+/// OWN `ValidityInterval` bounds (`invalid_before` / `invalid_hereafter`),
+/// never against the current chain slot — `SNothing` (an unset bound)
+/// always evaluates to `False`. `invalid_before` and `invalid_hereafter`
+/// are exactly `body.validity_interval_start` and `body.ttl`.
 ///
 /// **Dijkstra `RequireGuard`**: the per-tx `guards` set is NOT visible to
 /// this entry point — pre-Dijkstra callers never see a `RequireGuard`
@@ -44,9 +51,16 @@ use super::ValidationError;
 pub fn evaluate_native_script(
     script: &NativeScript,
     signers: &HashSet<Hash32>,
-    current_slot: SlotNo,
+    invalid_before: Option<SlotNo>,
+    invalid_hereafter: Option<SlotNo>,
 ) -> bool {
-    evaluate_native_script_with_guards(script, signers, current_slot, &HashSet::new())
+    evaluate_native_script_with_guards(
+        script,
+        signers,
+        invalid_before,
+        invalid_hereafter,
+        &HashSet::new(),
+    )
 }
 
 /// Dijkstra-aware native script evaluator. Identical to
@@ -63,31 +77,60 @@ pub fn evaluate_native_script(
 /// `satisfied_guards` is the post-witness-check projection: the subset
 /// of the tx's declared `guards` (TxBody key 14) that the Dijkstra
 /// witness pipeline has confirmed as satisfied. Issue #475 Phase 3.5.
+///
+/// `invalid_before` / `invalid_hereafter` are the transaction's own
+/// `ValidityInterval` bounds (see [`evaluate_native_script`] doc for the
+/// #787 rationale) — NOT the current chain slot.
 pub fn evaluate_native_script_with_guards(
     script: &NativeScript,
     signers: &HashSet<Hash32>,
-    current_slot: SlotNo,
+    invalid_before: Option<SlotNo>,
+    invalid_hereafter: Option<SlotNo>,
     satisfied_guards: &HashSet<Credential>,
 ) -> bool {
     match script {
         NativeScript::ScriptPubkey(keyhash) => signers.contains(keyhash),
         NativeScript::ScriptAll(scripts) => scripts.iter().all(|s| {
-            evaluate_native_script_with_guards(s, signers, current_slot, satisfied_guards)
+            evaluate_native_script_with_guards(
+                s,
+                signers,
+                invalid_before,
+                invalid_hereafter,
+                satisfied_guards,
+            )
         }),
         NativeScript::ScriptAny(scripts) => scripts.iter().any(|s| {
-            evaluate_native_script_with_guards(s, signers, current_slot, satisfied_guards)
+            evaluate_native_script_with_guards(
+                s,
+                signers,
+                invalid_before,
+                invalid_hereafter,
+                satisfied_guards,
+            )
         }),
         NativeScript::ScriptNOfK(n, scripts) => {
             let count = scripts
                 .iter()
                 .filter(|s| {
-                    evaluate_native_script_with_guards(s, signers, current_slot, satisfied_guards)
+                    evaluate_native_script_with_guards(
+                        s,
+                        signers,
+                        invalid_before,
+                        invalid_hereafter,
+                        satisfied_guards,
+                    )
                 })
                 .count();
             count >= *n as usize
         }
-        NativeScript::InvalidBefore(slot) => current_slot >= *slot,
-        NativeScript::InvalidHereafter(slot) => current_slot < *slot,
+        // `RequireTimeStart lockStart` succeeds iff `txStart = SJust s ∧
+        // lockStart <= s`; `SNothing` ⇒ False. Never the application slot.
+        NativeScript::InvalidBefore(lock_start) => invalid_before.is_some_and(|s| *lock_start <= s),
+        // `RequireTimeExpire lockExp` succeeds iff `txExp = SJust e ∧
+        // e <= lockExp`; `SNothing` ⇒ False. Never the application slot.
+        NativeScript::InvalidHereafter(lock_exp) => {
+            invalid_hereafter.is_some_and(|e| e <= *lock_exp)
+        }
         NativeScript::RequireGuard(cred) => satisfied_guards.contains(cred),
     }
 }
@@ -95,6 +138,19 @@ pub fn evaluate_native_script_with_guards(
 // ---------------------------------------------------------------------------
 // Script hash utilities
 // ---------------------------------------------------------------------------
+
+/// Compute the witness-set / native-script hash: `blake2b_224(0x00 || cbor(script))`.
+///
+/// Shared by [`compute_script_ref_hash`]'s `NativeScript` arm, Phase-1
+/// Rule 13 (`phase1.rs`), and [`check_extraneous_script_witnesses`]'s
+/// native-witness `received` set (issue #791).
+fn native_script_hash(ns: &NativeScript) -> Hash28 {
+    let script_cbor = dugite_serialization::encode_native_script(ns);
+    let mut tagged = Vec::with_capacity(1 + script_cbor.len());
+    tagged.push(0x00);
+    tagged.extend_from_slice(&script_cbor);
+    dugite_primitives::hash::blake2b_224(&tagged)
+}
 
 /// Compute the canonical script hash for a reference script.
 ///
@@ -106,13 +162,7 @@ pub fn evaluate_native_script_with_guards(
 /// - `0x04` — Plutus V4 (Dijkstra, issue #475 Phase 5)
 pub(crate) fn compute_script_ref_hash(script_ref: &ScriptRef) -> Hash28 {
     match script_ref {
-        ScriptRef::NativeScript(ns) => {
-            let script_cbor = dugite_serialization::encode_native_script(ns);
-            let mut tagged = Vec::with_capacity(1 + script_cbor.len());
-            tagged.push(0x00);
-            tagged.extend_from_slice(&script_cbor);
-            dugite_primitives::hash::blake2b_224(&tagged)
-        }
+        ScriptRef::NativeScript(ns) => native_script_hash(ns),
         ScriptRef::PlutusV1(bytes) => {
             let mut tagged = Vec::with_capacity(1 + bytes.len());
             tagged.push(0x01);
@@ -235,10 +285,16 @@ pub(crate) fn calculate_ref_script_size(
     reference_inputs: &[TransactionInput],
     utxo_set: &dyn UtxoLookup,
 ) -> u64 {
+    // Haskell: `inputs txb `Set.union` referenceInputs txb` — a TxIn present
+    // in BOTH the spending inputs and the reference inputs is only counted
+    // ONCE. `.chain()` is concatenation, not set union, and double-counts a
+    // shared TxIn's script_ref bytes (issue #788); dedup into a set first.
+    let mut seen: HashSet<&TransactionInput> = HashSet::new();
     let mut total_size: u64 = 0;
-    // Iterate both spending inputs and reference inputs, matching Haskell's
-    // `inputs txb <> referenceInputs txb` set union.
     for inp in inputs.iter().chain(reference_inputs.iter()) {
+        if !seen.insert(inp) {
+            continue;
+        }
         if let Some(utxo) = utxo_set.lookup(inp) {
             if let Some(script_ref) = &utxo.script_ref {
                 total_size = total_size.saturating_add(script_ref_byte_size(script_ref));
@@ -508,30 +564,25 @@ fn gcd_u128(mut a: u128, mut b: u128) -> u128 {
 // Output value size estimation (used by Rule 5a)
 // ---------------------------------------------------------------------------
 
-/// Estimate the CBOR-encoded size of a `Value`.
+/// Compute the EXACT CBOR-encoded size of a `Value`.
 ///
-/// For ADA-only values this is just the CBOR integer encoding. For multi-asset
-/// values this estimates the `[coin, multiasset_map]` array encoding.
+/// Matches Haskell `validateOutputTooBigUTxO`'s `serSize = BSL.length
+/// (serialize v)` byte-exactly by serializing the value with dugite's own
+/// CBOR encoder and taking the encoded length — rather than a hand-rolled
+/// header-size estimate. The prior estimate under-counted the 28-byte
+/// policy-ID bytestring header (2 bytes, not 1), map headers with >= 24
+/// entries, and asset names >= 24 bytes, which let a maliciously-sized
+/// multi-asset output slip under `maxValSize` (issue #793).
 pub(super) fn estimate_value_cbor_size(value: &dugite_primitives::value::Value) -> u64 {
-    if value.multi_asset.is_empty() {
-        return cbor_uint_size(value.coin.0);
-    }
-    // Multi-asset: array(2) [coin, map]
-    let mut size: u64 = 1; // array header
-    size += cbor_uint_size(value.coin.0); // coin
-    size += 1; // map header (or more for large maps)
-    for assets in value.multi_asset.values() {
-        size += 1 + 28; // bytes header + 28-byte policy ID
-        size += 1; // nested map header
-        for (asset_name, quantity) in assets {
-            size += 1 + asset_name.0.len() as u64; // bytes header + name
-            size += cbor_uint_size(*quantity); // quantity
-        }
-    }
-    size
+    dugite_serialization::encode_value(value).len() as u64
 }
 
 /// Estimate the CBOR encoding size of an unsigned integer.
+///
+/// No longer used by [`estimate_value_cbor_size`] (issue #793 replaced the
+/// hand-rolled estimate with the exact serialized length), but retained —
+/// and still exercised — as a standalone regression-guard unit under test.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn cbor_uint_size(value: u64) -> u64 {
     if value < 24 {
         1
@@ -553,9 +604,12 @@ pub(super) fn cbor_uint_size(value: u64) -> u64 {
 /// Check the script integrity hash (Rule 12).
 ///
 /// If the transaction has redeemers or Plutus data, `script_data_hash` must be
-/// set and match the computed value. If neither is present but
-/// `script_data_hash` is set, it is only valid when reference inputs carry
-/// reference scripts (otherwise `UnexpectedScriptDataHash`).
+/// set and match the computed value (this covers the "supplemental datums
+/// only, no redeemers/scripts" case too — see [`has_plutus_scripts`]/its
+/// caller, issue #790). If neither redeemers nor datums are present but
+/// `script_data_hash` is set anyway, it is ALWAYS `UnexpectedScriptDataHash`
+/// — there is no reference-script carve-out (issue #790): a `script_ref`
+/// only contributes to `langViews` when actually invoked via a redeemer.
 ///
 /// On success the function also returns whether Phase-2 Plutus evaluation is
 /// needed (i.e. `has_redeemers`).
@@ -774,56 +828,54 @@ pub(super) fn check_script_data_hash(
         && tx.witness_set.plutus_v2_scripts.is_empty()
         && tx.witness_set.plutus_v3_scripts.is_empty()
     {
-        // Allow script_data_hash when reference inputs OR spending inputs
-        // carry reference scripts.
-        //
-        // Per the Cardano ledger spec, `txNonDistinctRefScriptsSize` counts
-        // script_ref bytes from BOTH spending inputs and reference inputs.
-        // A transaction that spends a UTxO carrying a script_ref has a
-        // legitimate cost-model contribution and therefore a legitimate reason
-        // to include a script_data_hash even when it carries no inline Plutus
-        // scripts.  Checking only `reference_inputs` was the bug — spending
-        // inputs carrying script_refs were causing `UnexpectedScriptDataHash`
-        // false positives.
-        let has_ref_scripts = body
-            .reference_inputs
-            .iter()
-            .chain(body.inputs.iter())
-            .any(|inp| {
-                utxo_set
-                    .lookup(inp)
-                    .is_some_and(|utxo| utxo.script_ref.is_some())
-            });
-        if !has_ref_scripts {
-            errors.push(ValidationError::UnexpectedScriptDataHash);
-        }
+        // Issue #790: a declared `script_data_hash` with EMPTY redeemers,
+        // langViews, AND datums must ALWAYS be `UnexpectedScriptDataHash` —
+        // there is no ref-script carve-out. Per Haskell `mkScriptIntegrity`,
+        // a reference script only enters `langViews` when it is actually
+        // INVOKED via a redeemer (`has_redeemers` above); merely spending or
+        // referencing a script_ref-carrying UTxO contributes nothing to the
+        // script-integrity hash. The previous carve-out (skip the error
+        // whenever ANY touched UTxO carried a script_ref, even unused)
+        // let an adversary attach a junk `script_data_hash` to a vkey-only
+        // tx that happens to reference a script_ref UTxO — over-accepting a
+        // tx/block Haskell rejects with `PPViewHashesDontMatch`.
+        errors.push(ValidationError::UnexpectedScriptDataHash);
     }
 }
 
-/// Check for extraneous script witnesses (Haskell `babbageMissingScripts`).
+/// Check for extraneous script witnesses (Haskell `babbageMissingScripts` /
+/// `ExtraneousScriptWitnessesUTXOW`).
 ///
-/// `extra = witness_scripts \ (scripts_needed \ ref_scripts)`
-///
-/// Witness scripts not needed by any script purpose (after accounting for
-/// reference scripts) are reported. A script provided as a witness that is
-/// only needed via a reference script IS considered extraneous.
+/// `extra = received \ (needed ∪ refs)` where `received = Map.keysSet
+/// scriptTxWits` is Haskell's set of ALL witness scripts — native included,
+/// not just Plutus (issue #791). Witness scripts not needed by any script
+/// purpose (after accounting for reference scripts) are reported. A script
+/// provided as a witness that is only needed via a reference script IS
+/// considered extraneous.
 pub(super) fn check_extraneous_script_witnesses(
     tx: &Transaction,
     utxo_set: &dyn UtxoLookup,
     errors: &mut Vec<ValidationError>,
 ) {
-    // Only check when the transaction has witness scripts.
+    // Only check when the transaction has ANY witness scripts — native
+    // scripts count too (issue #791); a native-only witness set must not
+    // early-return, or an unneeded `ScriptPubkey` witness would never be
+    // flagged.
     let has_witness_scripts = !tx.witness_set.plutus_v1_scripts.is_empty()
         || !tx.witness_set.plutus_v2_scripts.is_empty()
-        || !tx.witness_set.plutus_v3_scripts.is_empty();
+        || !tx.witness_set.plutus_v3_scripts.is_empty()
+        || !tx.witness_set.native_scripts.is_empty();
     if !has_witness_scripts {
         return;
     }
 
     let body = &tx.body;
 
-    // 1. Witness script hashes.
+    // 1. Witness script hashes ("received" — ALL scripts, native included).
     let mut witness_hashes: HashSet<Hash28> = HashSet::new();
+    for ns in &tx.witness_set.native_scripts {
+        witness_hashes.insert(native_script_hash(ns));
+    }
     for s in &tx.witness_set.plutus_v1_scripts {
         witness_hashes.insert(dugite_primitives::hash::blake2b_224_tagged(1, s));
     }
@@ -917,24 +969,15 @@ pub(super) fn check_extraneous_script_witnesses(
         }
     }
 
-    // 3. Reference script hashes (from spending inputs AND reference inputs).
+    // 3. Reference script hashes (from spending inputs AND reference
+    //    inputs). Haskell's `sRefs` includes NATIVE reference scripts too
+    //    (issue #791) — `compute_script_ref_hash` covers every `ScriptRef`
+    //    variant (native + PlutusV1-V4) uniformly.
     let mut ref_script_hashes: HashSet<Hash28> = HashSet::new();
     for input in body.inputs.iter().chain(body.reference_inputs.iter()) {
         if let Some(utxo) = utxo_set.lookup(input) {
-            let hash = match &utxo.script_ref {
-                Some(ScriptRef::PlutusV1(b)) => {
-                    Some(dugite_primitives::hash::blake2b_224_tagged(1, b))
-                }
-                Some(ScriptRef::PlutusV2(b)) => {
-                    Some(dugite_primitives::hash::blake2b_224_tagged(2, b))
-                }
-                Some(ScriptRef::PlutusV3(b)) => {
-                    Some(dugite_primitives::hash::blake2b_224_tagged(3, b))
-                }
-                _ => None,
-            };
-            if let Some(h) = hash {
-                ref_script_hashes.insert(h);
+            if let Some(script_ref) = &utxo.script_ref {
+                ref_script_hashes.insert(compute_script_ref_hash(script_ref));
             }
         }
     }
@@ -998,19 +1041,19 @@ pub(super) fn check_malformed_script_witnesses(
 
     // Plutus V1 → PV5+
     for s in &tx.witness_set.plutus_v1_scripts {
-        if pv < 5 || !plutus_script_decodes(s) {
+        if pv < 5 || !plutus_witness_script_decodes(s) {
             malformed.push(dugite_primitives::hash::blake2b_224_tagged(1, s).to_hex());
         }
     }
     // Plutus V2 → PV7+
     for s in &tx.witness_set.plutus_v2_scripts {
-        if pv < 7 || !plutus_script_decodes(s) {
+        if pv < 7 || !plutus_witness_script_decodes(s) {
             malformed.push(dugite_primitives::hash::blake2b_224_tagged(2, s).to_hex());
         }
     }
     // Plutus V3 → PV9+
     for s in &tx.witness_set.plutus_v3_scripts {
-        if pv < 9 || !plutus_script_decodes(s) {
+        if pv < 9 || !plutus_witness_script_decodes(s) {
             malformed.push(dugite_primitives::hash::blake2b_224_tagged(3, s).to_hex());
         }
     }
@@ -1073,24 +1116,24 @@ pub(super) fn check_malformed_reference_scripts(
                 // Decoded successfully into our enum → trivially OK.
             }
             ScriptRef::PlutusV1(bytes) => {
-                if pv < 5 || !plutus_script_decodes(bytes) {
+                if pv < 5 || !plutus_ref_script_decodes(bytes) {
                     malformed.push(compute_script_ref_hash(script_ref).to_hex());
                 }
             }
             ScriptRef::PlutusV2(bytes) => {
-                if pv < 7 || !plutus_script_decodes(bytes) {
+                if pv < 7 || !plutus_ref_script_decodes(bytes) {
                     malformed.push(compute_script_ref_hash(script_ref).to_hex());
                 }
             }
             ScriptRef::PlutusV3(bytes) => {
-                if pv < 9 || !plutus_script_decodes(bytes) {
+                if pv < 9 || !plutus_ref_script_decodes(bytes) {
                     malformed.push(compute_script_ref_hash(script_ref).to_hex());
                 }
             }
             ScriptRef::PlutusV4(bytes) => {
                 // Dijkstra era; PV gate to be confirmed. Conservative: require
                 // PV >= 11 (post-Conway) AND decodes.
-                if pv < 11 || !plutus_script_decodes(bytes) {
+                if pv < 11 || !plutus_ref_script_decodes(bytes) {
                     malformed.push(compute_script_ref_hash(script_ref).to_hex());
                 }
             }
@@ -1104,19 +1147,72 @@ pub(super) fn check_malformed_reference_scripts(
     }
 }
 
-/// Try to decode a Plutus script's bytes via the same path used by phase-2
-/// evaluation: CBOR-wrapped flat first, falling back to raw flat. Returns
-/// `false` only when both decoders error.
+/// Decode a WITNESS-SET Plutus script's bytes (`witness_set.plutus_vN_scripts`
+/// element).
 ///
-/// Mirrors Haskell `decodePlutusRunnable v bs` — the flat decode is the
-/// "well-formedness" check. The cost-model / language-version semantic
-/// check is handled separately by the PV gate in the callers.
-fn plutus_script_decodes(bytes: &[u8]) -> bool {
+/// Mirrors Haskell `decodePlutusRunnable v bs`, which requires the
+/// **mandatory CBOR-bytestring wrapper**: `deserialiseScript` first runs
+/// `CBOR.decodeBytes` to recover the flat payload, then flat-decodes it —
+/// a script whose flat bytes are NOT wrapped in a CBOR bytestring is a
+/// hard decode error for every language. This is `Program::from_cbor`
+/// ONLY (issue #792) — the previous `|| Program::from_flat(bytes)`
+/// fallback let an adversary attach a raw-flat (unwrapped) witness script
+/// that Haskell rejects but dugite accepted.
+///
+/// Byte-format note: the witness-set array element (`[* bytes]` per CDDL)
+/// is itself a CBOR bytestring whose CONTENT is *another* CBOR-encoded
+/// bytestring wrapping the flat program — i.e. `witness_set.plutus_vN_scripts[i]`,
+/// once read off the wire (one bytestring unwrap performed by the array
+/// decoder), still needs the `from_cbor` unwrap to reach the flat bytes.
+/// This matches `dugite_uplc::eval_redeemer::decode_script_bytes_uncached`'s
+/// own documented convention ("on-chain Plutus scripts are CBOR-encoded
+/// byte-strings holding the flat-encoded program") and
+/// `crate::plutus`'s production Phase-2 test fixtures, which build witness
+/// scripts via `Program::to_cbor()` (not `to_flat()`).
+///
+/// Do NOT reuse this for `ScriptRef` (reference scripts) — see
+/// [`plutus_ref_script_decodes`], which uses the opposite (already
+/// singly-unwrapped) convention.
+///
+/// V3+ trailing-byte (`RemainderError`) decoder-exhaustion enforcement is
+/// explicitly OUT OF SCOPE here — that root cause lives in `dugite-uplc`
+/// (tracked separately, issues #822/#836).
+fn plutus_witness_script_decodes(bytes: &[u8]) -> bool {
     dugite_uplc::program::Program::from_cbor(bytes).is_ok()
-        || dugite_uplc::program::Program::from_flat(bytes).is_ok()
+}
+
+/// Decode a REFERENCE script's bytes (`ScriptRef::PlutusVN` payload).
+///
+/// Byte-format note: `read_script_ref` (`script_ref = #6.24(bytes .cbor
+/// script)`, `script = [lang_tag, script_value]`) performs a SINGLE
+/// bytestring unwrap of `script_value`, leaving `ScriptRef::PlutusVN(bytes)`
+/// holding a CBOR-bytestring-WRAPPED flat program — exactly like a witness
+/// script — NOT raw flat. This is confirmed three ways: (1) an actual
+/// captured on-chain reference script (uplc fixture `tx6.json`) begins with
+/// a CBOR bytestring header whose declared length wraps a flat program; (2)
+/// `compute_script_ref_hash` hashes `lang_tag || bytes` and this must equal
+/// the on-chain script hash, which cardano-ledger computes over
+/// `lang_tag || cbor(flat)` — so `bytes` is `cbor(flat)`; (3) the phase-2
+/// eval path (`dugite_uplc::…::decode_script_bytes`, #836) decodes these
+/// very bytes with `from_cbor` and succeeds on real fixtures. A prior
+/// revision used `from_flat` here (based on a synthetic Dijkstra round-trip
+/// rather than real chain data) — that FALSE-REJECTED every legitimate
+/// reference script as `MalformedReferenceScripts` (a consensus divergence).
+/// Use `from_cbor` — the same as witness scripts.
+fn plutus_ref_script_decodes(bytes: &[u8]) -> bool {
+    dugite_uplc::program::Program::from_cbor(bytes).is_ok()
 }
 
 /// Return `true` when the transaction has any Plutus scripts or redeemers.
+///
+/// Used by `validate_transaction` to gate the COLLATERAL / redeemer-purpose
+/// / Phase-2-execution checks, which only make sense when a script might
+/// actually run. Deliberately does NOT count `witness_set.plutus_data`
+/// (supplemental datums) — a datum-only tx never runs a script and must
+/// NOT be forced through the collateral gate (issue #790). `Rule 12`
+/// (`check_script_data_hash`) needs a wider "has redeemers OR datums"
+/// condition than this, so it is called unconditionally in
+/// `validate_transaction` rather than being gated on this function.
 pub(super) fn has_plutus_scripts(tx: &Transaction) -> bool {
     !tx.witness_set.plutus_v1_scripts.is_empty()
         || !tx.witness_set.plutus_v2_scripts.is_empty()
@@ -1343,7 +1439,7 @@ mod tests {
         let script = NativeScript::ScriptPubkey(kh);
         let mut signers = HashSet::new();
         signers.insert(kh);
-        assert!(evaluate_native_script(&script, &signers, SlotNo(0)));
+        assert!(evaluate_native_script(&script, &signers, None, None));
     }
 
     /// A ScriptPubkey script fails when its keyhash is absent from the signer set.
@@ -1354,7 +1450,7 @@ mod tests {
         let script = NativeScript::ScriptPubkey(kh);
         let mut signers = HashSet::new();
         signers.insert(other);
-        assert!(!evaluate_native_script(&script, &signers, SlotNo(0)));
+        assert!(!evaluate_native_script(&script, &signers, None, None));
     }
 
     /// ScriptAll requires every sub-script to pass.
@@ -1372,15 +1468,20 @@ mod tests {
         let mut signers = HashSet::new();
         signers.insert(kh_a);
         signers.insert(kh_b);
-        assert!(evaluate_native_script(&script, &signers, SlotNo(0)));
+        assert!(evaluate_native_script(&script, &signers, None, None));
 
         // Only one signer — should fail.
         let mut signers_one = HashSet::new();
         signers_one.insert(kh_a);
-        assert!(!evaluate_native_script(&script, &signers_one, SlotNo(0)));
+        assert!(!evaluate_native_script(&script, &signers_one, None, None));
 
         // No signers — should fail.
-        assert!(!evaluate_native_script(&script, &HashSet::new(), SlotNo(0)));
+        assert!(!evaluate_native_script(
+            &script,
+            &HashSet::new(),
+            None,
+            None
+        ));
     }
 
     /// ScriptAny requires at least one sub-script to pass.
@@ -1396,15 +1497,20 @@ mod tests {
         // Only signer A — should pass (any one is enough).
         let mut signers_a = HashSet::new();
         signers_a.insert(kh_a);
-        assert!(evaluate_native_script(&script, &signers_a, SlotNo(0)));
+        assert!(evaluate_native_script(&script, &signers_a, None, None));
 
         // Only signer B — should also pass.
         let mut signers_b = HashSet::new();
         signers_b.insert(kh_b);
-        assert!(evaluate_native_script(&script, &signers_b, SlotNo(0)));
+        assert!(evaluate_native_script(&script, &signers_b, None, None));
 
         // No signers — should fail.
-        assert!(!evaluate_native_script(&script, &HashSet::new(), SlotNo(0)));
+        assert!(!evaluate_native_script(
+            &script,
+            &HashSet::new(),
+            None,
+            None
+        ));
     }
 
     /// ScriptNOfK(2, [a, b, c]) passes only when at least 2 sub-scripts satisfy.
@@ -1426,45 +1532,126 @@ mod tests {
         let mut signers_ab = HashSet::new();
         signers_ab.insert(kh_a);
         signers_ab.insert(kh_b);
-        assert!(evaluate_native_script(&script, &signers_ab, SlotNo(0)));
+        assert!(evaluate_native_script(&script, &signers_ab, None, None));
 
         // All 3 signers — should still pass.
         let mut signers_all = HashSet::new();
         signers_all.insert(kh_a);
         signers_all.insert(kh_b);
         signers_all.insert(kh_c);
-        assert!(evaluate_native_script(&script, &signers_all, SlotNo(0)));
+        assert!(evaluate_native_script(&script, &signers_all, None, None));
 
         // Only 1 of 3 — should fail.
         let mut signers_one = HashSet::new();
         signers_one.insert(kh_a);
-        assert!(!evaluate_native_script(&script, &signers_one, SlotNo(0)));
+        assert!(!evaluate_native_script(&script, &signers_one, None, None));
 
         // No signers — should fail.
-        assert!(!evaluate_native_script(&script, &HashSet::new(), SlotNo(0)));
+        assert!(!evaluate_native_script(
+            &script,
+            &HashSet::new(),
+            None,
+            None
+        ));
     }
 
-    /// InvalidBefore(100): slot 99 → false, slot 100 → true (inclusive lower bound).
-    /// InvalidHereafter(100): slot 99 → true, slot 100 → false (exclusive upper bound).
+    /// Issue #787: timelocks are evaluated against the TRANSACTION'S OWN
+    /// `ValidityInterval` bounds (`invalid_before` / `invalid_hereafter`),
+    /// never an application/current slot. `SNothing` (an unset bound)
+    /// always evaluates to `False` — Haskell `evalTimelock`.
+    ///
+    /// `InvalidBefore(100)` succeeds iff `invalid_before = Some(s)` with
+    /// `100 <= s`. `InvalidHereafter(100)` succeeds iff
+    /// `invalid_hereafter = Some(e)` with `e <= 100`.
     #[test]
     fn test_native_script_time_locks() {
         let signers: HashSet<Hash32> = HashSet::new();
 
         let before = NativeScript::InvalidBefore(SlotNo(100));
-        // Slot 99 is before the lower bound — tx not yet valid.
-        assert!(!evaluate_native_script(&before, &signers, SlotNo(99)));
-        // Slot 100 equals the lower bound — tx is now valid.
-        assert!(evaluate_native_script(&before, &signers, SlotNo(100)));
-        // Slot 200 is well past the lower bound — valid.
-        assert!(evaluate_native_script(&before, &signers, SlotNo(200)));
+        // Unset validity-interval-start ⇒ always False, regardless of bound.
+        assert!(!evaluate_native_script(&before, &signers, None, None));
+        // tx invalid_before(99) < lockStart(100) — not yet valid.
+        assert!(!evaluate_native_script(
+            &before,
+            &signers,
+            Some(SlotNo(99)),
+            None
+        ));
+        // tx invalid_before(100) == lockStart(100) — valid.
+        assert!(evaluate_native_script(
+            &before,
+            &signers,
+            Some(SlotNo(100)),
+            None
+        ));
+        // tx invalid_before(200) > lockStart(100) — valid.
+        assert!(evaluate_native_script(
+            &before,
+            &signers,
+            Some(SlotNo(200)),
+            None
+        ));
 
         let hereafter = NativeScript::InvalidHereafter(SlotNo(100));
-        // Slot 99 is strictly before the upper bound — valid.
-        assert!(evaluate_native_script(&hereafter, &signers, SlotNo(99)));
-        // Slot 100 equals (and thus is not strictly less than) the upper bound — invalid.
-        assert!(!evaluate_native_script(&hereafter, &signers, SlotNo(100)));
-        // Slot 101 is past the upper bound — invalid.
-        assert!(!evaluate_native_script(&hereafter, &signers, SlotNo(101)));
+        // Unset TTL ⇒ always False, regardless of bound.
+        assert!(!evaluate_native_script(&hereafter, &signers, None, None));
+        // tx ttl(99) <= lockExp(100) — valid.
+        assert!(evaluate_native_script(
+            &hereafter,
+            &signers,
+            None,
+            Some(SlotNo(99))
+        ));
+        // tx ttl(100) == lockExp(100) — valid (non-strict upper bound on the tx side).
+        assert!(evaluate_native_script(
+            &hereafter,
+            &signers,
+            None,
+            Some(SlotNo(100))
+        ));
+        // tx ttl(101) > lockExp(100) — invalid.
+        assert!(!evaluate_native_script(
+            &hereafter,
+            &signers,
+            None,
+            Some(SlotNo(101))
+        ));
+    }
+
+    /// Issue #787 regression: a "loose" ValidityInterval that a naive
+    /// current-slot check would have satisfied must still fail when the
+    /// TX'S OWN declared bound does not satisfy the timelock. This is the
+    /// exact over-acceptance the bug allowed: a native script
+    /// `InvalidBefore(100)` with tx `invalid_before = Some(50)` (the tx
+    /// itself claims validity from slot 50) must fail even though a
+    /// contemporaneous chain slot of, say, 150 would have looked valid
+    /// under the old (buggy) `current_slot >= lockStart` semantics.
+    #[test]
+    fn test_native_script_time_lock_uses_tx_bound_not_current_slot() {
+        let signers: HashSet<Hash32> = HashSet::new();
+        let before = NativeScript::InvalidBefore(SlotNo(100));
+
+        // The tx's own bound (50) does not satisfy lockStart(100), even
+        // though a "current slot" of 150 (not a parameter anymore) would
+        // have satisfied the old, incorrect `current_slot >= lockStart`
+        // check.
+        assert!(!evaluate_native_script(
+            &before,
+            &signers,
+            Some(SlotNo(50)),
+            None
+        ));
+
+        let hereafter = NativeScript::InvalidHereafter(SlotNo(100));
+        // The tx's own ttl (200) does not satisfy `e <= lockExp(100)`,
+        // even though a "current slot" of 50 would have looked valid
+        // under the old `current_slot < lockExp` check.
+        assert!(!evaluate_native_script(
+            &hereafter,
+            &signers,
+            None,
+            Some(SlotNo(200))
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -1744,6 +1931,233 @@ mod tests {
         );
     }
 
+    /// Issue #791: a native `ScriptPubkey` witness script that is NOT
+    /// needed by any script purpose must be rejected as extraneous.
+    /// Haskell's `ExtraneousScriptWitnessesUTXOW` (`sReceived = Map.keysSet
+    /// scriptTxWits`) covers ALL scripts, native included — this also
+    /// exercises the early-return fix: a NATIVE-ONLY witness set (no
+    /// Plutus scripts/redeemers at all) must not skip the check.
+    #[test]
+    fn test_extraneous_native_witness_script_rejected() {
+        let kh = key_hash(0x77);
+        let ns = NativeScript::ScriptPubkey(kh);
+        let ns_hash = native_script_hash(&ns);
+
+        let mut tx = Transaction::empty_with_hash(TransactionHash::from_bytes([0xCC; 32]));
+        tx.witness_set.native_scripts.push(ns);
+
+        // Spend a VKey-locked UTxO — not script-locked, so nothing is "needed".
+        let input = tx_input(0x03);
+        tx.body.inputs.push(input.clone());
+        let mut utxo_set = UtxoSet::new();
+        utxo_set.insert(input, simple_output());
+
+        let mut errors = Vec::new();
+        check_extraneous_script_witnesses(&tx, &utxo_set, &mut errors);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "Expected exactly one ExtraneousScriptWitness error for the unneeded native script"
+        );
+        match &errors[0] {
+            ValidationError::ExtraneousScriptWitness { hashes } => {
+                assert_eq!(hashes.len(), 1);
+                assert_eq!(hashes[0], ns_hash.to_hex());
+            }
+            other => panic!("Expected ExtraneousScriptWitness, got: {other:?}"),
+        }
+    }
+
+    /// A native `ScriptPubkey` witness script whose hash matches the
+    /// payment credential of a script-locked spending input must NOT be
+    /// flagged as extraneous — it is needed (positive-side counterpart to
+    /// `test_extraneous_native_witness_script_rejected`, issue #791).
+    #[test]
+    fn test_needed_native_witness_script_accepted() {
+        use dugite_primitives::address::{Address, BaseAddress};
+        use dugite_primitives::credentials::Credential;
+
+        let kh = key_hash(0x78);
+        let ns = NativeScript::ScriptPubkey(kh);
+        let ns_hash = native_script_hash(&ns);
+
+        let address = Address::Base(BaseAddress {
+            network: dugite_primitives::network::NetworkId::Testnet,
+            payment: Credential::Script(ns_hash),
+            stake: Credential::VerificationKey(hash28(0xEE)),
+        });
+        let input = tx_input(0x04);
+        let utxo = TransactionOutput {
+            address,
+            value: Value::lovelace(2_000_000),
+            datum: OutputDatum::None,
+            script_ref: None,
+            is_legacy: false,
+            raw_cbor: None,
+        };
+        let mut utxo_set = UtxoSet::new();
+        utxo_set.insert(input.clone(), utxo);
+
+        let mut tx = Transaction::empty_with_hash(TransactionHash::from_bytes([0xDD; 32]));
+        tx.body.inputs.push(input);
+        tx.witness_set.native_scripts.push(ns);
+
+        let mut errors = Vec::new();
+        check_extraneous_script_witnesses(&tx, &utxo_set, &mut errors);
+
+        assert!(
+            errors.is_empty(),
+            "Native witness script matching a script-locked input must not be flagged as extraneous; got: {errors:?}"
+        );
+    }
+
+    /// Issue #791 (`ref_script_hashes`/`sRefs`): a native witness script
+    /// that is only "needed" via a NATIVE reference script (not invoked as
+    /// a spending/minting/cert credential) is still extraneous — a witness
+    /// script that duplicates a reference script is not required.
+    #[test]
+    fn test_native_witness_script_matching_only_a_native_ref_script_is_extraneous() {
+        let kh = key_hash(0x79);
+        let ns = NativeScript::ScriptPubkey(kh);
+        let ns_hash = native_script_hash(&ns);
+
+        // The script-locked spending input is satisfied via a NATIVE
+        // reference script attached to a reference input — not via the
+        // witness set.
+        let spend_input = tx_input(0x05);
+        let ref_input = tx_input(0x06);
+
+        use dugite_primitives::address::{Address, BaseAddress};
+        use dugite_primitives::credentials::Credential;
+        let script_locked_address = Address::Base(BaseAddress {
+            network: dugite_primitives::network::NetworkId::Testnet,
+            payment: Credential::Script(ns_hash),
+            stake: Credential::VerificationKey(hash28(0xEE)),
+        });
+        let mut utxo_set = UtxoSet::new();
+        utxo_set.insert(
+            spend_input.clone(),
+            TransactionOutput {
+                address: script_locked_address,
+                value: Value::lovelace(2_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: false,
+                raw_cbor: None,
+            },
+        );
+        let mut ref_output = simple_output();
+        ref_output.script_ref = Some(ScriptRef::NativeScript(ns.clone()));
+        utxo_set.insert(ref_input.clone(), ref_output);
+
+        let mut tx = Transaction::empty_with_hash(TransactionHash::from_bytes([0xEE; 32]));
+        tx.body.inputs.push(spend_input);
+        tx.body.reference_inputs.push(ref_input);
+        // The SAME native script is ALSO redundantly attached as a witness.
+        tx.witness_set.native_scripts.push(ns);
+
+        let mut errors = Vec::new();
+        check_extraneous_script_witnesses(&tx, &utxo_set, &mut errors);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "A witness script satisfied only via a native reference script must be extraneous"
+        );
+        match &errors[0] {
+            ValidationError::ExtraneousScriptWitness { hashes } => {
+                assert_eq!(hashes, &vec![ns_hash.to_hex()]);
+            }
+            other => panic!("Expected ExtraneousScriptWitness, got: {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Script data hash (Rule 12) — issue #790
+    // -----------------------------------------------------------------------
+
+    /// A vkey-only tx (no redeemers, no datums, no witness Plutus scripts,
+    /// no reference inputs at all) with a junk `script_data_hash` must
+    /// ALWAYS be rejected with `UnexpectedScriptDataHash`.
+    #[test]
+    fn test_script_data_hash_junk_rejected_no_ref_scripts() {
+        let mut tx = Transaction::empty_with_hash(TransactionHash::from_bytes([0x10; 32]));
+        tx.body.script_data_hash = Some(Hash32::from_bytes([0xAB; 32]));
+
+        let utxo_set = UtxoSet::new();
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut errors = Vec::new();
+        check_script_data_hash(&tx, &utxo_set, &params, &mut errors);
+
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::UnexpectedScriptDataHash)),
+            "Expected UnexpectedScriptDataHash; got {errors:?}"
+        );
+    }
+
+    /// Issue #790: a vkey-only tx with a junk `script_data_hash` is
+    /// rejected EVEN WHEN a reference input carries an (unused)
+    /// `script_ref` — the removed `has_ref_scripts` carve-out incorrectly
+    /// excused this exact adversarial shape.
+    #[test]
+    fn test_script_data_hash_junk_rejected_with_unused_ref_script() {
+        let ref_input = tx_input(0x11);
+        let mut utxo_set = UtxoSet::new();
+        let mut ref_output = simple_output();
+        ref_output.script_ref = Some(ScriptRef::PlutusV2(vec![0xCA, 0xFE]));
+        utxo_set.insert(ref_input.clone(), ref_output);
+
+        let mut tx = Transaction::empty_with_hash(TransactionHash::from_bytes([0x12; 32]));
+        tx.body.reference_inputs.push(ref_input);
+        tx.body.script_data_hash = Some(Hash32::from_bytes([0xAB; 32]));
+
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut errors = Vec::new();
+        check_script_data_hash(&tx, &utxo_set, &params, &mut errors);
+
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::UnexpectedScriptDataHash)),
+            "Expected UnexpectedScriptDataHash even with an unused ref script; got {errors:?}"
+        );
+    }
+
+    /// Issue #790(b): a supplemental-datum-only tx (no redeemers, no
+    /// witness Plutus scripts) with the WRONG `script_data_hash` must be
+    /// rejected with `ScriptDataHashMismatch`. This is exactly the case
+    /// `has_plutus_scripts` misses (it does not count `plutus_data`) —
+    /// `check_script_data_hash` itself already self-gates on
+    /// `has_redeemers || has_datums`, so calling it directly here confirms
+    /// the datum-only path is validated at the unit level; the
+    /// `validate_transaction` caller now invokes it unconditionally so
+    /// this path is reachable end-to-end too.
+    #[test]
+    fn test_script_data_hash_supplemental_datum_only_wrong_hash_rejected() {
+        let mut tx = Transaction::empty_with_hash(TransactionHash::from_bytes([0x13; 32]));
+        tx.witness_set
+            .plutus_data
+            .push(dugite_primitives::transaction::PlutusData::Integer(
+                num_bigint::BigInt::from(0),
+            ));
+        tx.body.script_data_hash = Some(Hash32::from_bytes([0x00; 32])); // deliberately wrong
+
+        let utxo_set = UtxoSet::new();
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut errors = Vec::new();
+        check_script_data_hash(&tx, &utxo_set, &params, &mut errors);
+
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::ScriptDataHashMismatch { .. })),
+            "Expected ScriptDataHashMismatch for wrong hash on a datum-only tx; got {errors:?}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Fix #743 — ref-script fee must be PV>=9 only
     // -----------------------------------------------------------------------
@@ -1826,6 +2240,38 @@ mod tests {
         assert_eq!(
             fee, expected,
             "Conway (PV9) must charge ref-script fee: got {fee:?}, expected {expected:?}"
+        );
+    }
+
+    /// Issue #788: a UTxO carrying a `script_ref` that is listed as BOTH a
+    /// spending input and a reference input must have its script bytes
+    /// counted ONCE, not twice. Haskell: `inputs txb `Set.union`
+    /// referenceInputs txb` — `.chain()` (concatenation) double-counts a
+    /// shared TxIn, inflating the tiered ref-script fee and causing a
+    /// false `FeeTooSmall` rejection of an otherwise-honest PV11 block.
+    #[test]
+    fn test_calculate_ref_script_size_dedups_shared_input() {
+        let script_bytes = vec![0x01u8, 0x02, 0x03, 0x04, 0x05]; // 5 bytes
+        let shared_input = tx_input(0x9A);
+        let mut output = simple_output();
+        output.script_ref = Some(ScriptRef::PlutusV2(script_bytes.clone()));
+        let mut utxo_set = UtxoSet::new();
+        utxo_set.insert(shared_input.clone(), output);
+
+        // The SAME TxIn listed as both a spending input AND a reference
+        // input (legal at PV >= 11 for non-V3 txs, per the disjointness
+        // relaxation).
+        let size = calculate_ref_script_size(
+            std::slice::from_ref(&shared_input),
+            std::slice::from_ref(&shared_input),
+            &utxo_set,
+        );
+
+        assert_eq!(
+            size,
+            script_bytes.len() as u64,
+            "a script_ref on a TxIn present in both inputs and reference_inputs \
+             must be counted exactly once, got {size}"
         );
     }
 
@@ -1981,5 +2427,65 @@ mod tests {
             260_125 + 38_415,
             "PV9 must add tiered ref-script fee (2,561 B × 15 = 38,415)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #793 — estimate_value_cbor_size must equal the EXACT serialized
+    // length across randomly-generated Values (multi-asset under-counting
+    // regression guard).
+    // -----------------------------------------------------------------------
+    mod proptests {
+        use super::*;
+        use dugite_primitives::value::AssetName;
+        use proptest::collection::{btree_map, vec as pvec};
+        use proptest::prelude::*;
+
+        /// Generate an arbitrary `AssetName` (0-32 bytes, per Cardano's cap).
+        fn asset_name_strategy() -> impl Strategy<Value = AssetName> {
+            pvec(any::<u8>(), 0..=32).prop_map(AssetName)
+        }
+
+        /// Generate an arbitrary 28-byte policy ID.
+        fn policy_strategy() -> impl Strategy<Value = dugite_primitives::hash::Hash28> {
+            pvec(any::<u8>(), 28..=28)
+                .prop_map(|b| dugite_primitives::hash::Hash28::from_bytes(b.try_into().unwrap()))
+        }
+
+        /// Generate an arbitrary multi-asset `Value`: a random coin plus 0-4
+        /// policies, each with 0-4 assets, exercising both short (<24-byte)
+        /// and long CBOR header cases for names, policy counts, and asset
+        /// counts (map headers >= 24 entries are exercised implicitly by
+        /// birthday-collision-free random policies at the upper end of the
+        /// range — the header-size formula itself is validated exactly by
+        /// `dugite_serialization::encode_value`, so this proptest's job is
+        /// only to confirm `estimate_value_cbor_size` never drifts from it).
+        fn value_strategy() -> impl Strategy<Value = Value> {
+            (
+                any::<u64>(),
+                btree_map(
+                    policy_strategy(),
+                    btree_map(asset_name_strategy(), any::<u64>(), 0..=4),
+                    0..=4,
+                ),
+            )
+                .prop_map(|(coin, multi_asset)| Value {
+                    coin: Lovelace(coin),
+                    multi_asset,
+                })
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(500))]
+
+            /// `estimate_value_cbor_size` must always equal the TRUE
+            /// serialized byte length (`encode_value(v).len()`), matching
+            /// Haskell `validateOutputTooBigUTxO`'s exact `serSize`.
+            #[test]
+            fn estimate_value_cbor_size_matches_true_serialized_length(v in value_strategy()) {
+                let estimated = estimate_value_cbor_size(&v);
+                let exact = dugite_serialization::encode_value(&v).len() as u64;
+                prop_assert_eq!(estimated, exact);
+            }
+        }
     }
 }

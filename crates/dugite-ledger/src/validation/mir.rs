@@ -47,9 +47,9 @@
 use std::collections::HashMap;
 
 use dugite_primitives::credentials::Credential;
-use dugite_primitives::hash::Hash32;
+use dugite_primitives::hash::{blake2b_224, Hash32};
 use dugite_primitives::protocol_params::ProtocolParameters;
-use dugite_primitives::transaction::{Certificate, MIRSource, MIRTarget};
+use dugite_primitives::transaction::{Certificate, MIRSource, MIRTarget, Transaction};
 
 use super::{ValidationContext, ValidationError};
 
@@ -274,6 +274,89 @@ pub(crate) fn check_send_to_opposite_pot_mir(
             pot: source.clone(),
             requested: coin,
             available,
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `validateMIRInsufficientGenesisSigs` — whole-transaction, UTXOW-level (#804)
+// ---------------------------------------------------------------------------
+
+/// Whole-transaction check: if `tx` carries at least one
+/// `MoveInstantaneousRewards` certificate, at least
+/// [`ValidationContext::update_quorum`] of the CURRENT genesis-delegate
+/// (hot/delegate) keys — [`ValidationContext::genesis_delegate_keys`] —
+/// must appear among the transaction's VKey witnesses.
+///
+/// Unlike every other predicate in this module, this is NOT a per-certificate
+/// check folded into [`validate_mir_cert`] — it is a property of the whole
+/// transaction (a single set of witnesses is checked against ALL MIR certs
+/// in the tx collectively), matching Haskell's `validateMIRInsufficientGenesisSigs`
+/// living in the UTXOW rule rather than DELEG.
+///
+/// Returns `Ok(())` (no-op) when:
+/// - the protocol version is Conway+ (`>= 9`) — MIR certs are structurally
+///   impossible there (`isInstantaneousRewards` is `AtMostEra "Babbage"` in
+///   Haskell; `babbageUtxowMirTransition` is not in Conway's `transitionRules`
+///   at all);
+/// - `tx` has no `MoveInstantaneousRewards` certificate;
+/// - [`ValidationContext::genesis_delegate_keys`] or
+///   [`ValidationContext::update_quorum`] is `None` (lenient default —
+///   callers without genesis-delegate plumbing cannot evaluate the quorum).
+///
+/// Reference: Haskell `validateMIRInsufficientGenesisSigs` in
+/// `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Utxow.hs`:
+/// ```text
+/// genDelegates = Set.fromList $ asWitness . genDelegKeyHash <$> Map.elems genMapping
+/// genSig = Set.intersection genDelegates witsKeyHashes
+/// failureUnless (not (null mirCerts) ==> Set.size genSig >= fromIntegral quorum)
+/// ```
+pub fn check_mir_genesis_quorum(
+    tx: &Transaction,
+    params: &ProtocolParameters,
+    ctx: &ValidationContext,
+    errors: &mut Vec<ValidationError>,
+) {
+    if params.protocol_version_major >= 9 {
+        return;
+    }
+    let has_mir_cert = tx
+        .body
+        .certificates
+        .iter()
+        .any(|c| matches!(c, Certificate::MoveInstantaneousRewards { .. }));
+    if !has_mir_cert {
+        return;
+    }
+    let (Some(genesis_delegate_keys), Some(quorum)) =
+        (ctx.genesis_delegate_keys.as_ref(), ctx.update_quorum)
+    else {
+        return;
+    };
+
+    // Same 32-byte-vkey guard as the general witness-completeness check
+    // (`phase1::run_phase1_rules`, Rule 9b) — a malformed vkey must not be
+    // hashed and counted toward the quorum.
+    let vkey_witness_hashes: std::collections::HashSet<dugite_primitives::hash::Hash28> = tx
+        .witness_set
+        .vkey_witnesses
+        .iter()
+        .filter(|w| w.vkey.len() == 32)
+        .map(|w| blake2b_224(&w.vkey))
+        .collect();
+
+    let signers: Vec<dugite_primitives::hash::Hash28> = genesis_delegate_keys
+        .intersection(&vkey_witness_hashes)
+        .copied()
+        .collect();
+
+    if (signers.len() as u64) < quorum {
+        let mut signer_hexes: Vec<String> = signers.iter().map(|h| h.to_hex()).collect();
+        signer_hexes.sort(); // deterministic for diagnostic stability
+        errors.push(ValidationError::MIRInsufficientGenesisSigs {
+            present: signers.len(),
+            required: quorum,
+            signers: signer_hexes,
         });
     }
 }

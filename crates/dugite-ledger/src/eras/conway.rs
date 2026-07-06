@@ -56,7 +56,8 @@ use crate::state::governance::{
 };
 use crate::state::substates::*;
 use crate::state::{
-    BlockValidationMode, DRepRegistration, LedgerError, ProposalState, StakeSnapshot,
+    apply_reserves_delta, BlockValidationMode, DRepRegistration, LedgerError, ProposalState,
+    StakeSnapshot,
 };
 use crate::utxo_diff::UtxoDiff;
 
@@ -461,50 +462,20 @@ impl EraRules for ConwayRules {
         // be submitted (Conway TxBody silently drops key 6), so this block
         // is effectively a no-op on every Conway boundary except the
         // era-crossing one. Issue #685.
+        // Haskell's `votedFuturePParams` (Shelley.Rules.Ppup) enacts a
+        // pre-Conway PPUP only when a quorum of genesis delegates voted for
+        // the byte-identical `PParamsUpdate` value; it never counts
+        // distinct proposers and field-merges their proposals together.
+        // Ties or a value short of quorum enact nothing. Issue #784.
         let lookup_epoch = EpochNo(new_epoch.0.saturating_sub(1));
         if let Some(proposals) = epochs.pending_pp_updates.remove(&lookup_epoch) {
-            let mut proposer_set: HashSet<Hash32> = HashSet::with_capacity(proposals.len());
-            for (genesis_hash, _) in &proposals {
-                proposer_set.insert(*genesis_hash);
-            }
-            let distinct_proposers = proposer_set.len() as u64;
-
-            if distinct_proposers >= ctx.update_quorum {
-                let mut merged = dugite_primitives::transaction::ProtocolParamUpdate::default();
-                for (_, ppu) in &proposals {
-                    macro_rules! merge_field {
-                        ($field:ident) => {
-                            if ppu.$field.is_some() {
-                                merged.$field = ppu.$field.clone();
-                            }
-                        };
-                    }
-                    merge_field!(min_fee_a);
-                    merge_field!(min_fee_b);
-                    merge_field!(max_block_body_size);
-                    merge_field!(max_tx_size);
-                    merge_field!(max_block_header_size);
-                    merge_field!(key_deposit);
-                    merge_field!(pool_deposit);
-                    merge_field!(e_max);
-                    merge_field!(n_opt);
-                    merge_field!(a0);
-                    merge_field!(rho);
-                    merge_field!(tau);
-                    merge_field!(d);
-                    merge_field!(min_pool_cost);
-                    merge_field!(ada_per_utxo_byte);
-                    merge_field!(cost_models);
-                    merge_field!(execution_costs);
-                    merge_field!(max_tx_ex_units);
-                    merge_field!(max_block_ex_units);
-                    merge_field!(max_val_size);
-                    merge_field!(collateral_percentage);
-                    merge_field!(max_collateral_inputs);
-                    merge_field!(protocol_version_major);
-                    merge_field!(protocol_version_minor);
-                }
-                super::shelley::apply_pp_update(&mut epochs.protocol_params, &merged);
+            let proposal_map = crate::validation::ppup::fold_pp_proposals(&proposals);
+            if let Some(winner) = crate::validation::ppup::voted_future_pparams(
+                &proposal_map,
+                ctx.update_quorum,
+                &epochs.protocol_params,
+            ) {
+                super::shelley::apply_pp_update(&mut epochs.protocol_params, &winner);
                 // #764 Part A — re-seed PlutusV3 after a pre-Conway PPUP wipe.
                 //
                 // At the Babbage→Conway boundary `on_era_transition` (block-apply
@@ -544,9 +515,9 @@ impl EraRules for ConwayRules {
                 }
                 debug!(
                     epoch = new_epoch.0,
-                    proposers = distinct_proposers,
                     new_pv_major = epochs.protocol_params.protocol_version_major,
-                    "Pre-Conway PPUP applied at Conway epoch boundary (era-crossing edge case)"
+                    "Pre-Conway PPUP applied at Conway epoch boundary (voted quorum, \
+                     era-crossing edge case)"
                 );
             }
         }
@@ -585,11 +556,8 @@ impl EraRules for ConwayRules {
 
         // Apply pending reward update (backward compat for old snapshots).
         if let Some(rupd) = epochs.pending_reward_update.take() {
-            epochs.reserves.0 = epochs
-                .reserves
-                .0
-                .checked_sub(rupd.delta_reserves)
-                .expect("RUPD delta_reserves exceeds reserves — ledger invariant broken");
+            // Signed reserves adjustment — see issue #796.
+            epochs.reserves.0 = apply_reserves_delta(epochs.reserves.0, rupd.delta_reserves);
             epochs.treasury.0 = epochs
                 .treasury
                 .0
@@ -702,12 +670,8 @@ impl EraRules for ConwayRules {
                 );
             }
 
-            // Apply RUPD: adjust reserves and treasury
-            epochs.reserves.0 = epochs
-                .reserves
-                .0
-                .checked_sub(rupd.delta_reserves)
-                .expect("RUPD delta_reserves exceeds reserves — ledger invariant broken");
+            // Apply RUPD: adjust reserves and treasury (signed — issue #796)
+            epochs.reserves.0 = apply_reserves_delta(epochs.reserves.0, rupd.delta_reserves);
             epochs.treasury.0 = epochs
                 .treasury
                 .0
@@ -783,7 +747,7 @@ impl EraRules for ConwayRules {
                 .get(cred_hash)
                 .copied()
                 .unwrap_or(Lovelace(0));
-            let total_stake = Lovelace(utxo_stake.0 + reward_balance.0);
+            let total_stake = Lovelace(utxo_stake.0.saturating_add(reward_balance.0));
             *pool_stake.entry(*pool_id).or_insert(Lovelace(0)) += total_stake;
         }
 
@@ -1885,6 +1849,11 @@ fn process_governance_votes_and_proposals(
             yes_votes: 0,
             no_votes: 0,
             abstain_votes: 0,
+            // #799: monotonic submission index, read BEFORE the counter below
+            // is incremented, so ties in ratification priority sort by
+            // on-chain submission order (matching Haskell's stable
+            // `reorderActions`), not by GovActionId (hash) order.
+            submission_index: governance.proposal_count,
         };
         governance
             .proposals
@@ -3498,6 +3467,85 @@ mod tests {
         );
         // PV bumped to 9 by the PPUP.
         assert_eq!(epochs.protocol_params.protocol_version_major, 9);
+    }
+
+    /// Issue #784: same fix at the Conway era-crossing PPUP enactment site.
+    /// 3 genesis delegates vote for a PV9 bump, 2 vote for a distinct PV9
+    /// bump-plus-cost-model update. The union of proposers (5) meets the
+    /// old buggy distinct-proposer quorum, but neither value alone reaches
+    /// quorum under `votedFuturePParams` — nothing should be enacted, and
+    /// in particular the protocol version must NOT bump to 9.
+    #[test]
+    fn test_process_epoch_transition_ppup_split_vote_enacts_nothing_era_crossing() {
+        use crate::eras::ConwayGenesisInit;
+
+        let rules = ConwayRules::new();
+        let params = ProtocolParameters::mainnet_defaults();
+        let genesis = ConwayGenesisInit::default();
+        let delegates = Box::leak(Box::new(HashMap::new()));
+        let ctx = RuleContext {
+            params: &params,
+            current_slot: 133_660_800,
+            current_epoch: EpochNo(506),
+            era: Era::Conway,
+            slot_config: None,
+            node_network: None,
+            genesis_delegates: delegates,
+            update_quorum: 5,
+            epoch_length: 432000,
+            shelley_transition_epoch: 208,
+            byron_epoch_length: 21600,
+            stability_window: 129600,
+            stability_window_3kf: 129600,
+            randomness_stabilisation_window: 129600,
+            tx_index: 0,
+            conway_genesis: Some(&genesis),
+            max_lovelace_supply: crate::state::MAX_LOVELACE_SUPPLY,
+        };
+
+        let mut utxo = make_utxo_sub(vec![]);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut consensus = make_consensus_sub();
+        let mut epochs = make_epoch_sub();
+        let original_pv_major = epochs.protocol_params.protocol_version_major;
+
+        let ppu_a = dugite_primitives::transaction::ProtocolParamUpdate {
+            protocol_version_major: Some(9),
+            protocol_version_minor: Some(0),
+            ..Default::default()
+        };
+        let ppu_b = dugite_primitives::transaction::ProtocolParamUpdate {
+            protocol_version_major: Some(9),
+            protocol_version_minor: Some(0),
+            min_fee_a: Some(55),
+            ..Default::default()
+        };
+        let mut proposals = Vec::new();
+        for i in 0u8..3 {
+            proposals.push((Hash32::from_bytes([i; 32]), ppu_a.clone()));
+        }
+        for i in 3u8..5 {
+            proposals.push((Hash32::from_bytes([i; 32]), ppu_b.clone()));
+        }
+        epochs.pending_pp_updates.insert(EpochNo(506), proposals);
+
+        rules
+            .process_epoch_transition(
+                EpochNo(507),
+                &ctx,
+                &mut utxo,
+                &mut certs,
+                &mut gov,
+                &mut epochs,
+                &mut consensus,
+            )
+            .expect("epoch transition should succeed");
+
+        assert_eq!(
+            epochs.protocol_params.protocol_version_major, original_pv_major,
+            "neither ppu_a nor ppu_b reached quorum alone; nothing should enact (#784)"
+        );
     }
 
     /// Verify committee members and threshold are set from ConwayGenesis.

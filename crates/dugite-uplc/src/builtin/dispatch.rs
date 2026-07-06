@@ -65,7 +65,7 @@ pub fn force_builtin(
         // final force fires the denotation immediately.
         if new_forces == required_forces && required_arity == 0 {
             if let Some(t) = tracker {
-                let cost = t.builtin_costs.charge_for_args(id, &[]);
+                let cost = t.builtin_costs.charge_for_args(id, &[], variant);
                 t.charge(cost)?;
             }
             let result = denote(id, vec![], trace_log, variant)?;
@@ -134,7 +134,7 @@ pub fn apply_builtin(
     // this order: chargeAndRun fires cost BEFORE the denotation), then
     // invoke the denotation.
     if let Some(t) = tracker {
-        let cost = t.builtin_costs.charge_for_args(id, &args);
+        let cost = t.builtin_costs.charge_for_args(id, &args, variant);
         record_builtin_charge(id, cost);
         t.charge(cost)?;
     }

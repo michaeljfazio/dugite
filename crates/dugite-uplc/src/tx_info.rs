@@ -239,7 +239,7 @@ mod tests {
             treasury_donation: None,
         });
         let ctx = ScriptContextV3 {
-            tx_info: info,
+            tx_info: std::rc::Rc::new(info),
             redeemer: Data::I(BigInt::from(0)),
             script_info: ScriptInfo::Rewarding(Credential::PubKey([1u8; 28])),
         };

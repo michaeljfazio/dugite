@@ -89,8 +89,11 @@ impl LedgerState {
         {
             let cur_major = self.epochs.protocol_params.protocol_version_major;
             let cur_minor = self.epochs.protocol_params.protocol_version_minor;
+            // #812: minor bump must be EXACTLY curMinor+1 (Haskell `pvCanFollow`
+            // requires `(curMajor, curMinor+1) == (newMajor, newMinor)`), not
+            // merely any higher minor. Matches `validation/ppup.rs:225`.
             let can_follow = (*tgt_major == cur_major + 1 && *tgt_minor == 0)
-                || (*tgt_major == cur_major && *tgt_minor > cur_minor);
+                || (*tgt_major == cur_major && *tgt_minor == cur_minor + 1);
             if !can_follow {
                 debug!(
                     tx = %tx_hash.to_hex(),
@@ -231,6 +234,8 @@ impl LedgerState {
             yes_votes: 0,
             no_votes: 0,
             abstain_votes: 0,
+            // #799: read the monotonic counter BEFORE it is incremented below.
+            submission_index: self.gov.governance.proposal_count,
         };
 
         debug!(
@@ -410,8 +415,11 @@ impl LedgerState {
         {
             let cur_major = self.epochs.protocol_params.protocol_version_major;
             let cur_minor = self.epochs.protocol_params.protocol_version_minor;
+            // #812: minor bump must be EXACTLY curMinor+1 (Haskell `pvCanFollow`
+            // requires `(curMajor, curMinor+1) == (newMajor, newMinor)`), not
+            // merely any higher minor. Matches `validation/ppup.rs:225`.
             let can_follow = (*tgt_major == cur_major + 1 && *tgt_minor == 0)
-                || (*tgt_major == cur_major && *tgt_minor > cur_minor);
+                || (*tgt_major == cur_major && *tgt_minor == cur_minor + 1);
             if !can_follow {
                 debug!(
                     tx = %tx_hash.to_hex(),
@@ -532,6 +540,8 @@ impl LedgerState {
             yes_votes: 0,
             no_votes: 0,
             abstain_votes: 0,
+            // #799: read the monotonic counter BEFORE it is incremented below.
+            submission_index: self.gov.governance.proposal_count,
         };
 
         // Clone before moving into the insert so the delta entry carries an identical copy.
@@ -2436,10 +2446,80 @@ pub(crate) fn enact_gov_action_impl(
 /// This is the free-function equivalent of `LedgerState::apply_protocol_param_update`.
 /// Each field in the update, if Some, overwrites the corresponding parameter.
 /// Returns an error if any governance threshold is out of range [0, 1].
+///
+/// #802: this function is ATOMIC — every fallible `validate_threshold` check
+/// below runs BEFORE the first field write, so an `Err` return leaves
+/// `params` completely untouched. This matches Haskell, where
+/// `UnitInterval`-typed fields cannot even be decoded off the wire out of
+/// `[0, 1]` (`BoundedRatio`'s `DecCBOR` instance rejects `numerator >
+/// denominator` at decode time) and Conway `ENACT` (`PredicateFailure
+/// (ENACT era) = Void`) is a total function that never re-validates at
+/// apply time. `rho`/`tau`/`d` are `UnitInterval`-typed and get the same
+/// `[0, 1]` bound here as a defense-in-depth backstop. `a0` is
+/// `NonNegativeInterval`-typed — it has no upper bound in Haskell (only
+/// `numerator >= 0`, which the u64 representation already guarantees) and
+/// is intentionally NOT bounds-checked. Keep this function's validation
+/// block byte-identical to `LedgerState::apply_protocol_param_update`.
 fn apply_protocol_param_update_impl(
     params: &mut ProtocolParameters,
     update: &dugite_primitives::transaction::ProtocolParamUpdate,
 ) -> Result<(), super::LedgerError> {
+    if let Some(ref v) = update.rho {
+        LedgerState::validate_threshold("rho", v)?;
+    }
+    if let Some(ref v) = update.tau {
+        LedgerState::validate_threshold("tau", v)?;
+    }
+    if let Some(ref v) = update.d {
+        LedgerState::validate_threshold("d", v)?;
+    }
+    if let Some(ref v) = update.dvt_pp_network_group {
+        LedgerState::validate_threshold("dvt_pp_network_group", v)?;
+    }
+    if let Some(ref v) = update.dvt_pp_economic_group {
+        LedgerState::validate_threshold("dvt_pp_economic_group", v)?;
+    }
+    if let Some(ref v) = update.dvt_pp_technical_group {
+        LedgerState::validate_threshold("dvt_pp_technical_group", v)?;
+    }
+    if let Some(ref v) = update.dvt_pp_gov_group {
+        LedgerState::validate_threshold("dvt_pp_gov_group", v)?;
+    }
+    if let Some(ref v) = update.dvt_hard_fork {
+        LedgerState::validate_threshold("dvt_hard_fork", v)?;
+    }
+    if let Some(ref v) = update.dvt_no_confidence {
+        LedgerState::validate_threshold("dvt_no_confidence", v)?;
+    }
+    if let Some(ref v) = update.dvt_committee_normal {
+        LedgerState::validate_threshold("dvt_committee_normal", v)?;
+    }
+    if let Some(ref v) = update.dvt_committee_no_confidence {
+        LedgerState::validate_threshold("dvt_committee_no_confidence", v)?;
+    }
+    if let Some(ref v) = update.dvt_constitution {
+        LedgerState::validate_threshold("dvt_constitution", v)?;
+    }
+    if let Some(ref v) = update.dvt_treasury_withdrawal {
+        LedgerState::validate_threshold("dvt_treasury_withdrawal", v)?;
+    }
+    if let Some(ref v) = update.pvt_motion_no_confidence {
+        LedgerState::validate_threshold("pvt_motion_no_confidence", v)?;
+    }
+    if let Some(ref v) = update.pvt_committee_normal {
+        LedgerState::validate_threshold("pvt_committee_normal", v)?;
+    }
+    if let Some(ref v) = update.pvt_committee_no_confidence {
+        LedgerState::validate_threshold("pvt_committee_no_confidence", v)?;
+    }
+    if let Some(ref v) = update.pvt_hard_fork {
+        LedgerState::validate_threshold("pvt_hard_fork", v)?;
+    }
+    if let Some(ref v) = update.pvt_pp_security_group {
+        LedgerState::validate_threshold("pvt_pp_security_group", v)?;
+    }
+
+    // --- All fallible checks passed: apply every field unconditionally. ---
     if let Some(v) = update.min_fee_a {
         params.min_fee_a = v;
     }
@@ -2540,63 +2620,48 @@ fn apply_protocol_param_update_impl(
         params.gov_action_deposit = v;
     }
     if let Some(ref v) = update.dvt_pp_network_group {
-        LedgerState::validate_threshold("dvt_pp_network_group", v)?;
         params.dvt_pp_network_group = v.clone();
     }
     if let Some(ref v) = update.dvt_pp_economic_group {
-        LedgerState::validate_threshold("dvt_pp_economic_group", v)?;
         params.dvt_pp_economic_group = v.clone();
     }
     if let Some(ref v) = update.dvt_pp_technical_group {
-        LedgerState::validate_threshold("dvt_pp_technical_group", v)?;
         params.dvt_pp_technical_group = v.clone();
     }
     if let Some(ref v) = update.dvt_pp_gov_group {
-        LedgerState::validate_threshold("dvt_pp_gov_group", v)?;
         params.dvt_pp_gov_group = v.clone();
     }
     if let Some(ref v) = update.dvt_hard_fork {
-        LedgerState::validate_threshold("dvt_hard_fork", v)?;
         params.dvt_hard_fork = v.clone();
     }
     if let Some(ref v) = update.dvt_no_confidence {
-        LedgerState::validate_threshold("dvt_no_confidence", v)?;
         params.dvt_no_confidence = v.clone();
     }
     if let Some(ref v) = update.dvt_committee_normal {
-        LedgerState::validate_threshold("dvt_committee_normal", v)?;
         params.dvt_committee_normal = v.clone();
     }
     if let Some(ref v) = update.dvt_committee_no_confidence {
-        LedgerState::validate_threshold("dvt_committee_no_confidence", v)?;
         params.dvt_committee_no_confidence = v.clone();
     }
     if let Some(ref v) = update.dvt_constitution {
-        LedgerState::validate_threshold("dvt_constitution", v)?;
         params.dvt_constitution = v.clone();
     }
     if let Some(ref v) = update.dvt_treasury_withdrawal {
-        LedgerState::validate_threshold("dvt_treasury_withdrawal", v)?;
         params.dvt_treasury_withdrawal = v.clone();
     }
     if let Some(ref v) = update.pvt_motion_no_confidence {
-        LedgerState::validate_threshold("pvt_motion_no_confidence", v)?;
         params.pvt_motion_no_confidence = v.clone();
     }
     if let Some(ref v) = update.pvt_committee_normal {
-        LedgerState::validate_threshold("pvt_committee_normal", v)?;
         params.pvt_committee_normal = v.clone();
     }
     if let Some(ref v) = update.pvt_committee_no_confidence {
-        LedgerState::validate_threshold("pvt_committee_no_confidence", v)?;
         params.pvt_committee_no_confidence = v.clone();
     }
     if let Some(ref v) = update.pvt_hard_fork {
-        LedgerState::validate_threshold("pvt_hard_fork", v)?;
         params.pvt_hard_fork = v.clone();
     }
     if let Some(ref v) = update.pvt_pp_security_group {
-        LedgerState::validate_threshold("pvt_pp_security_group", v)?;
         params.pvt_pp_security_group = v.clone();
     }
     if let Some(v) = update.min_committee_size {
@@ -2741,17 +2806,25 @@ pub(crate) fn ratify_proposals_impl(
     };
     let snap_vote_delegations_ref = snap_vote_delegations.as_ref();
 
-    let mut candidates: Vec<(GovActionId, GovAction, EpochNo)> = snap_proposals
+    // #799: `snap_proposals` is an `ImblOrdMap<GovActionId, _>`, whose `.iter()`
+    // yields entries in GovActionId (hash) order — NOT on-chain submission
+    // order. Haskell's `reorderActions` (Governance/Internal.hs:534-544) is a
+    // STABLE sort keyed only on `actionPriority`; ties preserve the proposals
+    // OMap's insertion (submission) order. Carrying `submission_index` into the
+    // candidate tuple and sorting on `(priority, submission_index)` recovers
+    // that exact tie-break, independent of the map's iteration order.
+    let mut candidates: Vec<(GovActionId, GovAction, EpochNo, u64)> = snap_proposals
         .iter()
         .map(|(id, state)| {
             (
                 id.clone(),
                 state.procedure.gov_action.clone(),
                 state.expires_epoch,
+                state.submission_index,
             )
         })
         .collect();
-    candidates.sort_by_key(|(_, action, _)| gov_action_priority(action));
+    candidates.sort_by_key(|(_, action, _, seq)| (gov_action_priority(action), *seq));
 
     let bootstrap = epochs.protocol_params.protocol_version_major == 9;
 
@@ -2787,7 +2860,7 @@ pub(crate) fn ratify_proposals_impl(
     // `disbursed == fold wdrls`, so the two stay equal and behavior is identical.
     let mut cap_treasury = epochs.treasury.0;
 
-    for (action_id, action, expires) in &candidates {
+    for (action_id, action, expires, _submission_index) in &candidates {
         if *expires < epoch {
             continue;
         }
@@ -3375,11 +3448,6 @@ pub(crate) fn check_cc_approval(
         }
     };
 
-    // If threshold is 0, auto-approve
-    if threshold.is_zero() {
-        return true;
-    }
-
     // Collect CC votes for this action indexed by hot credential
     let mut cc_votes: HashMap<Hash32, Vote> = HashMap::new();
     let empty = vec![];
@@ -3433,9 +3501,24 @@ pub(crate) fn check_cc_approval(
         }
     }
 
-    // Check committeeMinSize (skipped during bootstrap per Haskell spec)
+    // Check committeeMinSize (skipped during bootstrap per Haskell spec).
+    //
+    // This MUST run before the zero-threshold auto-pass below: Haskell's
+    // `votingThreshold` only yields a usable `VotingThreshold t` when
+    // `hardforkConwayBootstrapPhase pv || activeCommitteeSize >= minSize`;
+    // otherwise `NoVotingThreshold` fails the CC leg outright, regardless of
+    // what the configured threshold is. A 0-threshold committee below
+    // min-size must still be rejected (#800).
     if !bootstrap && active_size < committee_min_size {
         return false;
+    }
+
+    // If threshold is 0, auto-approve. Must come AFTER the min-size gate
+    // (above) but BEFORE the all-abstain short-circuit (below): Haskell's
+    // ratio comparison is `0 %? 0 <op> 0` which is `True` (0 >= 0), so an
+    // all-abstain vote on a 0-threshold committee still auto-passes.
+    if threshold.is_zero() {
+        return true;
     }
 
     // Haskell's (%?) operator: _ %? 0 = 0, so when all active members
@@ -3981,6 +4064,67 @@ mod tests {
             params.cost_models.unknown_cost_models.get(&5),
             Some(&vec![9]),
             "unknown lang=5 merged (was dropped at enactment)"
+        );
+    }
+
+    /// #802: `apply_protocol_param_update_impl` (the Conway governance
+    /// enactment path) must be ATOMIC — an update combining an out-of-range
+    /// `rho` with an earlier-processed plain field (`min_fee_a`) must be
+    /// rejected as a whole, leaving `params` completely untouched. Mirrors
+    /// `protocol_params::test_apply_update_atomic_rejection_on_invalid_rho`;
+    /// the two `apply_protocol_param_update*` functions must stay
+    /// byte-identical in their validation behavior.
+    #[test]
+    fn apply_ppu_enactment_atomic_rejection_on_invalid_rho() {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        let defaults = ProtocolParameters::mainnet_defaults();
+
+        let update = ProtocolParamUpdate {
+            min_fee_a: Some(999_999),
+            rho: Some(Rational {
+                numerator: 3,
+                denominator: 2,
+            }), // invalid: 3/2 exceeds 1
+            ..Default::default()
+        };
+
+        let err = apply_protocol_param_update_impl(&mut params, &update)
+            .expect_err("rho numerator > denominator must be rejected");
+        assert!(matches!(
+            err,
+            crate::state::LedgerError::InvalidProtocolParam(_)
+        ));
+
+        assert_eq!(
+            params.min_fee_a, defaults.min_fee_a,
+            "min_fee_a must be unchanged when the update is rejected"
+        );
+        assert_eq!(
+            params.rho, defaults.rho,
+            "rho must be unchanged when the update is rejected"
+        );
+    }
+
+    /// #802: `a0` (`NonNegativeInterval`) must NOT be bounds-checked at
+    /// enactment — Haskell has no upper bound on it.
+    #[test]
+    fn apply_ppu_enactment_does_not_bound_a0() {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        let update = ProtocolParamUpdate {
+            a0: Some(Rational {
+                numerator: 100,
+                denominator: 1,
+            }),
+            ..Default::default()
+        };
+        apply_protocol_param_update_impl(&mut params, &update)
+            .expect("a0 > 1 must be accepted — NonNegativeInterval has no upper bound");
+        assert_eq!(
+            params.a0,
+            Rational {
+                numerator: 100,
+                denominator: 1,
+            }
         );
     }
 
@@ -5155,6 +5299,150 @@ mod tests {
         assert!(result);
     }
 
+    /// #800: a 0-threshold committee must still be gated by `committeeMinSize`.
+    /// Below min-size, even a 0-threshold committee must FAIL — Haskell's
+    /// `votingThreshold` returns `NoVotingThreshold` (⇒ CC leg fails) when
+    /// `activeCommitteeSize < minSize` post-bootstrap, regardless of the
+    /// configured threshold. At/above min-size, or during bootstrap (where the
+    /// min-size gate is skipped entirely), a 0-threshold committee auto-passes.
+    #[test]
+    fn test_cc_zero_threshold_respects_min_size() {
+        let mut state = gov_test_state(5, 0);
+        Arc::make_mut(&mut state.gov.governance).committee_threshold = Some(Rational {
+            numerator: 0,
+            denominator: 1,
+        });
+
+        let action_id = make_action_id(51, 0);
+        state.process_proposal(
+            &Hash32::from_bytes([51u8; 32]),
+            0,
+            &ProposalProcedure {
+                deposit: Lovelace(100_000_000_000),
+                return_addr: vec![0u8; 29],
+                gov_action: GovAction::InfoAction,
+                anchor: make_anchor(),
+            },
+        );
+        // No CC votes are cast — with the old (buggy) code, the zero-threshold
+        // shortcut auto-passed unconditionally, before committeeMinSize was
+        // even considered.
+
+        // Post-bootstrap, active_size (1) < committee_min_size (3): must fail
+        // even though the configured threshold is 0.
+        let result = check_cc_approval(
+            &action_id,
+            &state.gov.governance.votes_by_action,
+            &state.gov.governance.committee_hot_keys,
+            &state.gov.governance.committee_expiration,
+            &state.gov.governance.committee_resigned,
+            &state.gov.governance.committee_threshold,
+            EpochNo(0),
+            3,
+            false,
+        );
+        assert!(
+            !result,
+            "0-threshold committee below committeeMinSize must not auto-pass"
+        );
+
+        // At/above min-size, a 0-threshold committee auto-passes (all-abstain
+        // ratio 0 %? 0 = True per Haskell's (%?) operator).
+        let result = check_cc_approval(
+            &action_id,
+            &state.gov.governance.votes_by_action,
+            &state.gov.governance.committee_hot_keys,
+            &state.gov.governance.committee_expiration,
+            &state.gov.governance.committee_resigned,
+            &state.gov.governance.committee_threshold,
+            EpochNo(0),
+            1,
+            false,
+        );
+        assert!(
+            result,
+            "0-threshold committee at/above committeeMinSize must auto-pass"
+        );
+
+        // During bootstrap, the min-size gate is skipped entirely, so the
+        // 0-threshold auto-pass applies unconditionally.
+        let result = check_cc_approval(
+            &action_id,
+            &state.gov.governance.votes_by_action,
+            &state.gov.governance.committee_hot_keys,
+            &state.gov.governance.committee_expiration,
+            &state.gov.governance.committee_resigned,
+            &state.gov.governance.committee_threshold,
+            EpochNo(0),
+            3,
+            true,
+        );
+        assert!(
+            result,
+            "0-threshold committee during bootstrap must auto-pass regardless of size"
+        );
+    }
+
+    /// #812 (dead-path): `process_proposal`'s `pvCanFollow` check must require
+    /// the target minor version to be EXACTLY `curMinor + 1`, not merely any
+    /// higher minor (Haskell `pvCanFollow`). A `HardForkInitiation` that skips
+    /// a minor version must be dropped (`ProposalCantFollow`); an exact +1
+    /// minor bump must be accepted.
+    #[test]
+    fn test_process_proposal_rejects_skip_minor_hard_fork() {
+        let mut state = gov_test_state(0, 0);
+        assert_eq!(state.epochs.protocol_params.protocol_version_major, 10);
+        assert_eq!(state.epochs.protocol_params.protocol_version_minor, 0);
+
+        // Skip-minor target (10,0) -> (10,2): must be rejected.
+        let tx_hash = Hash32::from_bytes([60u8; 32]);
+        state.process_proposal(
+            &tx_hash,
+            0,
+            &ProposalProcedure {
+                deposit: Lovelace(100_000_000_000),
+                return_addr: vec![0u8; 29],
+                gov_action: GovAction::HardForkInitiation {
+                    prev_action_id: None,
+                    protocol_version: (10, 2),
+                },
+                anchor: make_anchor(),
+            },
+        );
+        let action_id = GovActionId {
+            transaction_id: tx_hash,
+            action_index: 0,
+        };
+        assert!(
+            !state.gov.governance.proposals.contains_key(&action_id),
+            "HardForkInitiation skipping a minor version must be dropped (ProposalCantFollow)"
+        );
+
+        // Exact +1 minor bump (10,0) -> (10,1): must be accepted.
+        let tx_hash2 = Hash32::from_bytes([61u8; 32]);
+        state.process_proposal(
+            &tx_hash2,
+            0,
+            &ProposalProcedure {
+                deposit: Lovelace(100_000_000_000),
+                return_addr: vec![0u8; 29],
+                gov_action: GovAction::HardForkInitiation {
+                    prev_action_id: None,
+                    protocol_version: (10, 1),
+                },
+                anchor: make_anchor(),
+            },
+        );
+        let action_id2 = GovActionId {
+            transaction_id: tx_hash2,
+            action_index: 0,
+        };
+        assert!(
+            state.gov.governance.proposals.contains_key(&action_id2),
+            "HardForkInitiation with an exact +1 minor bump must be accepted"
+        );
+    }
+
     // ========================================================================
     // Threshold matrix tests (CC/DRep/SPO for each action type)
     // ========================================================================
@@ -6299,20 +6587,113 @@ mod tests {
 
         state.process_epoch_transition(EpochNo(1));
 
-        // First proposal (by BTreeMap order) should be enacted
-        // Second proposal's prevActionId (None) no longer matches enacted root
-        // The enacted_pparam_update should be set
-        assert!(state.gov.governance.enacted_pparam_update.is_some());
+        // The first-submitted proposal (id1, tx=[1u8;32]) must enact —
+        // Haskell's `reorderActions` stable-sorts by priority only, so a
+        // same-priority tie is broken by on-chain submission order (#799),
+        // not by `GovActionId` (hash) order. `update_enacted_root` runs
+        // immediately after each enactment within the same pass, so the
+        // second proposal (id2) sees the now-enacted root and fails
+        // `prevActionAsExpected`.
+        assert_eq!(
+            state.gov.governance.enacted_pparam_update,
+            Some(id1.clone()),
+            "the first-submitted proposal must enact deterministically"
+        );
+        assert_ne!(state.gov.governance.enacted_pparam_update, Some(id2));
+    }
 
-        // One proposal should still be active (the one whose prevActionId became stale)
-        // OR both could have been enacted if they're processed in order and both match
-        // at their evaluation time... Per Haskell, update_enacted_root happens after enactment,
-        // so the second one would see the updated root and fail prev_action_as_expected.
-        // But we need to check: our code does self.update_enacted_root BEFORE processing the next.
-        // Yes, line 251-252: self.enact_gov_action(action); self.update_enacted_root(action_id, action);
-        // So the second proposal should fail.
-        let enacted_id = state.gov.governance.enacted_pparam_update.as_ref().unwrap();
-        assert!(enacted_id == &id1 || enacted_id == &id2);
+    /// #799: RATIFY must break same-priority ties by ON-CHAIN SUBMISSION
+    /// order, not `GovActionId` (hash) order. Haskell's `reorderActions`
+    /// (`Governance/Internal.hs:534-544`) is a stable sort keyed only on
+    /// `actionPriority`; ties preserve the proposals OMap's insertion order.
+    ///
+    /// Construct two same-priority (`ParameterChange`), same-parent
+    /// (`prev_action_id: None`) proposals whose `GovActionId` (tx-hash)
+    /// ordering is the OPPOSITE of their submission order, so a
+    /// hash-ordered (pre-#799) implementation would pick the wrong winner.
+    #[test]
+    fn test_ratify_tie_break_uses_submission_order_not_hash_order() {
+        let mut state = gov_test_state(10, 0);
+        Arc::make_mut(&mut state.gov.governance).committee_threshold = Some(Rational {
+            numerator: 0,
+            denominator: 1,
+        });
+
+        // Submitted FIRST, but has the LARGER tx hash ([0xFF;32] > [0x01;32]).
+        let tx_first_submitted = Hash32::from_bytes([0xFFu8; 32]);
+        state.process_proposal(
+            &tx_first_submitted,
+            0,
+            &ProposalProcedure {
+                deposit: Lovelace(100_000_000_000),
+                return_addr: vec![0u8; 29],
+                gov_action: GovAction::ParameterChange {
+                    prev_action_id: None,
+                    protocol_param_update: Box::new(ProtocolParamUpdate {
+                        n_opt: Some(1000),
+                        ..Default::default()
+                    }),
+                    policy_hash: None,
+                },
+                anchor: make_anchor(),
+            },
+        );
+
+        // Submitted SECOND, but has the SMALLER tx hash — a hash-ordered
+        // `ImblOrdMap` iteration would visit this one first.
+        let tx_second_submitted = Hash32::from_bytes([0x01u8; 32]);
+        state.process_proposal(
+            &tx_second_submitted,
+            0,
+            &ProposalProcedure {
+                deposit: Lovelace(100_000_000_000),
+                return_addr: vec![0u8; 29],
+                gov_action: GovAction::ParameterChange {
+                    prev_action_id: None,
+                    protocol_param_update: Box::new(ProtocolParamUpdate {
+                        n_opt: Some(2000),
+                        ..Default::default()
+                    }),
+                    policy_hash: None,
+                },
+                anchor: make_anchor(),
+            },
+        );
+
+        let id_first = GovActionId {
+            transaction_id: tx_first_submitted,
+            action_index: 0,
+        };
+        let id_second = GovActionId {
+            transaction_id: tx_second_submitted,
+            action_index: 0,
+        };
+
+        // Sanity-check the adversarial hash ordering: without the fix,
+        // iterating `proposals` (`ImblOrdMap<GovActionId, _>`) would visit
+        // `id_second` before `id_first`.
+        assert!(
+            id_second < id_first,
+            "test setup: id_second must hash-sort before id_first"
+        );
+
+        // Both DReps vote Yes on both proposals so each independently meets
+        // threshold; only the submission-order tie-break decides the winner.
+        for i in 0..10 {
+            drep_vote(&mut state, i, &id_first, Vote::Yes);
+            drep_vote(&mut state, i, &id_second, Vote::Yes);
+        }
+
+        state.process_epoch_transition(EpochNo(1));
+
+        // The FIRST-SUBMITTED proposal must enact — NOT the one with the
+        // smaller GovActionId.
+        assert_eq!(
+            state.gov.governance.enacted_pparam_update,
+            Some(id_first),
+            "the first-submitted proposal must enact, not the one with the smaller GovActionId"
+        );
+        assert_ne!(state.gov.governance.enacted_pparam_update, Some(id_second));
     }
 
     // ========================================================================
@@ -6416,6 +6797,7 @@ mod tests {
                 yes_votes: 0,
                 no_votes: 0,
                 abstain_votes: 0,
+                submission_index: 0,
             },
         );
 
@@ -7747,6 +8129,7 @@ mod tests {
                     yes_votes: 0,
                     no_votes: 0,
                     abstain_votes: 0,
+                    submission_index: 0,
                 },
             );
         }
@@ -7831,6 +8214,7 @@ mod tests {
                     yes_votes: 0,
                     no_votes: 0,
                     abstain_votes: 0,
+                    submission_index: 0,
                 },
             );
         }

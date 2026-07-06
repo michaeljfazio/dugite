@@ -56,15 +56,8 @@ impl Kont {
         Self::default()
     }
 
-    pub fn push(&mut self, f: Frame) -> Result<(), crate::UplcError> {
-        if self.frames.len() >= super::MAX_KONTINUATION_DEPTH {
-            return Err(crate::UplcError::Internal(format!(
-                "CEK continuation depth exceeds limit ({})",
-                super::MAX_KONTINUATION_DEPTH
-            )));
-        }
+    pub fn push(&mut self, f: Frame) {
         self.frames.push(f);
-        Ok(())
     }
 
     pub fn pop(&mut self) -> Option<Frame> {
@@ -89,12 +82,11 @@ mod tests {
     #[test]
     fn push_pop_lifo() {
         let mut k = Kont::new();
-        k.push(Frame::Force).unwrap();
+        k.push(Frame::Force);
         k.push(Frame::AwaitArg {
             function: int_val(1),
             env: Env::new(),
-        })
-        .unwrap();
+        });
         assert_eq!(k.depth(), 2);
         assert!(matches!(k.pop(), Some(Frame::AwaitArg { .. })));
         assert!(matches!(k.pop(), Some(Frame::Force)));
@@ -102,12 +94,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_overdeep_push() {
+    fn push_beyond_former_hard_cap_succeeds() {
+        // The CEK continuation stack is a heap-allocated `Vec<Frame>`
+        // (no OS call-stack recursion), so depth is bounded only by
+        // `ExBudget` exhaustion, exactly as in Haskell's `Context`
+        // (`UntypedPlutusCore.Evaluation.Machine.Cek.Internal`), which
+        // has no depth field at all. Pushing well past the former
+        // 4096-frame cap must succeed (see #817).
         let mut k = Kont::new();
-        for _ in 0..super::super::MAX_KONTINUATION_DEPTH {
-            k.push(Frame::Force).unwrap();
+        for _ in 0..(4 * 1024 + 1000) {
+            k.push(Frame::Force);
         }
-        let err = k.push(Frame::Force).unwrap_err();
-        assert!(matches!(err, crate::UplcError::Internal(_)));
+        assert_eq!(k.depth(), 4 * 1024 + 1000);
     }
 }

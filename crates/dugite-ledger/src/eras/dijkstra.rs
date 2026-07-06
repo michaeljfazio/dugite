@@ -534,7 +534,7 @@ fn apply_sub_transactions(
 /// **Failure mode**: returns `LedgerError::InvalidTransaction("MissingGuardWitness: ...")`
 /// containing the offending credential so the block-application path can
 /// surface it via the usual `BlockTxValidationFailed` envelope.
-fn check_guard_witnesses(tx: &Transaction, ctx: &RuleContext) -> Result<(), LedgerError> {
+fn check_guard_witnesses(tx: &Transaction, _ctx: &RuleContext) -> Result<(), LedgerError> {
     use crate::validation::{compute_script_ref_hash, evaluate_native_script_with_guards};
     use dugite_primitives::credentials::Credential;
     use dugite_primitives::transaction::{NativeScript, ScriptRef};
@@ -598,7 +598,11 @@ fn check_guard_witnesses(tx: &Transaction, ctx: &RuleContext) -> Result<(), Ledg
     // be satisfied by its own witness — vkey signature or script
     // presence — in this same pass).
     let declared_guards: HashSet<Credential> = tx.body.guards.iter().cloned().collect();
-    let current_slot = dugite_primitives::time::SlotNo(ctx.current_slot);
+    // Issue #787: timelocks nested inside a guarded native script must be
+    // evaluated against the TX'S OWN ValidityInterval, never the
+    // application/current slot (`ctx.current_slot`).
+    let invalid_before = tx.body.validity_interval_start;
+    let invalid_hereafter = tx.body.ttl;
 
     for cred in &tx.body.guards {
         let ok = match cred {
@@ -612,7 +616,8 @@ fn check_guard_witnesses(tx: &Transaction, ctx: &RuleContext) -> Result<(), Ledg
                     evaluate_native_script_with_guards(
                         ns,
                         &signed_h32,
-                        current_slot,
+                        invalid_before,
+                        invalid_hereafter,
                         &declared_guards,
                     )
                 } else if plutus_script_hashes.contains(&hash28) {

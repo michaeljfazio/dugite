@@ -35,7 +35,7 @@ use tracing::{debug, info};
 use super::common;
 use super::{EraRules, RuleContext};
 use crate::state::substates::*;
-use crate::state::{BlockValidationMode, LedgerError, StakeSnapshot};
+use crate::state::{apply_reserves_delta, BlockValidationMode, LedgerError, StakeSnapshot};
 use crate::utxo_diff::UtxoDiff;
 
 /// Stateless Shelley/Allegra/Mary era rule strategy.
@@ -101,7 +101,7 @@ fn recompute_shelley_initial_reserves(
     let mut redeem_sum: u64 = 0;
     let mut redeem_count: u64 = 0;
     let mut scan_count: u64 = 0;
-    utxo.utxo_set.scan_all(|_input, output| {
+    let scan_failures = utxo.utxo_set.scan_all(|_input, output| {
         // Shelley-era outputs are ADA-only; coin == full value.
         utxo_sum = utxo_sum.saturating_add(output.value.coin.0);
         scan_count += 1;
@@ -110,6 +110,15 @@ fn recompute_shelley_initial_reserves(
             redeem_count += 1;
         }
     });
+    // A partial scan understates `utxo_sum`, which would silently INFLATE
+    // reserves (`maxLovelaceSupply - sumCoinUTxO`) — a permanently wrong
+    // ledger. Crash rather than diverge on a corrupt on-disk store (#806).
+    assert_eq!(
+        scan_failures, 0,
+        "Byron->Shelley reserves init: {scan_failures} UTxO entries failed to decode \
+         during sumCoinUTxO — the on-disk UTxO store is corrupt; refusing to derive \
+         reserves from a partial scan. Wipe `<database-path>/utxo-store` and restart."
+    );
     // Invariant tripwire: the live UTxO can never sum to MORE than the maximum
     // lovelace supply — `sumCoinUTxO ≤ maxLovelaceSupply` always holds on a
     // correct chain (Haskell computes `reserves = maxLovelaceSupply <-> sumCoinUTxO`
@@ -154,7 +163,7 @@ fn return_redeem_addrs_to_reserves(utxo: &mut UtxoSubState, epochs: &mut EpochSu
     let mut redeem_inputs: Vec<TransactionInput> = Vec::new();
     let mut redeem_coin: u64 = 0;
 
-    utxo.utxo_set.scan_all(|input, output| {
+    let scan_failures = utxo.utxo_set.scan_all(|input, output| {
         let is_redeem = matches!(&output.address, Address::Byron(b) if b.is_redeem());
         if is_redeem {
             redeem_inputs.push(input.clone());
@@ -163,6 +172,16 @@ fn return_redeem_addrs_to_reserves(utxo: &mut UtxoSubState, epochs: &mut EpochSu
             redeem_coin = redeem_coin.saturating_add(output.value.coin.0);
         }
     });
+    // A partial scan could miss redeem UTxOs, under-crediting reserves and
+    // leaving un-returned AVVM entries in the live set — a consensus
+    // divergence. Crash rather than diverge on a corrupt on-disk store (#806).
+    assert_eq!(
+        scan_failures, 0,
+        "AVVM redeem return: {scan_failures} UTxO entries failed to decode during the \
+         redeem scan — the on-disk UTxO store is corrupt; refusing to return AVVM \
+         balances to reserves from a partial scan. Wipe `<database-path>/utxo-store` \
+         and restart."
+    );
 
     let redeem_count = redeem_inputs.len();
 
@@ -326,11 +345,8 @@ impl EraRules for ShelleyRules {
 
         // Step 1: Apply pending reward update (backward compat for old snapshots).
         if let Some(rupd) = epochs.pending_reward_update.take() {
-            epochs.reserves.0 = epochs
-                .reserves
-                .0
-                .checked_sub(rupd.delta_reserves)
-                .expect("RUPD delta_reserves exceeds reserves — ledger invariant broken");
+            // Signed reserves adjustment — see issue #796.
+            epochs.reserves.0 = apply_reserves_delta(epochs.reserves.0, rupd.delta_reserves);
             epochs.treasury.0 = epochs
                 .treasury
                 .0
@@ -464,12 +480,8 @@ impl EraRules for ShelleyRules {
                 );
             }
 
-            // Apply RUPD: adjust reserves and treasury
-            epochs.reserves.0 = epochs
-                .reserves
-                .0
-                .checked_sub(rupd.delta_reserves)
-                .expect("RUPD delta_reserves exceeds reserves — ledger invariant broken");
+            // Apply RUPD: adjust reserves and treasury (signed — issue #796)
+            epochs.reserves.0 = apply_reserves_delta(epochs.reserves.0, rupd.delta_reserves);
             epochs.treasury.0 = epochs
                 .treasury
                 .0
@@ -569,7 +581,7 @@ impl EraRules for ShelleyRules {
                 .get(cred_hash)
                 .copied()
                 .unwrap_or(Lovelace(0));
-            let total_stake = Lovelace(utxo_stake.0 + reward_balance.0);
+            let total_stake = Lovelace(utxo_stake.0.saturating_add(reward_balance.0));
             *pool_stake.entry(*pool_id).or_insert(Lovelace(0)) += total_stake;
         }
 
@@ -731,64 +743,32 @@ impl EraRules for ShelleyRules {
         let old_params = epochs.protocol_params.clone();
 
         // Apply pre-Conway PP update proposals (PPUP/UPEC rule).
+        //
+        // Haskell's `votedFuturePParams` (Shelley.Rules.Ppup) enacts a
+        // pre-Conway PPUP only when a quorum of genesis delegates voted for
+        // the byte-identical `PParamsUpdate` value; it never counts
+        // distinct proposers and field-merges their proposals together.
+        // Ties or a value short of quorum enact nothing. Issue #784.
         let lookup_epoch = EpochNo(new_epoch.0.saturating_sub(1));
         if let Some(proposals) = epochs.pending_pp_updates.remove(&lookup_epoch) {
-            let mut proposer_set: HashSet<Hash32> = HashSet::with_capacity(proposals.len());
-            for (genesis_hash, _) in &proposals {
-                proposer_set.insert(*genesis_hash);
-            }
-            let distinct_proposers = proposer_set.len() as u64;
-
-            if distinct_proposers >= ctx.update_quorum {
-                // Merge all proposals.
-                let mut merged = dugite_primitives::transaction::ProtocolParamUpdate::default();
-                for (_, ppu) in &proposals {
-                    macro_rules! merge_field {
-                        ($field:ident) => {
-                            if ppu.$field.is_some() {
-                                merged.$field = ppu.$field.clone();
-                            }
-                        };
-                    }
-                    merge_field!(min_fee_a);
-                    merge_field!(min_fee_b);
-                    merge_field!(max_block_body_size);
-                    merge_field!(max_tx_size);
-                    merge_field!(max_block_header_size);
-                    merge_field!(key_deposit);
-                    merge_field!(pool_deposit);
-                    merge_field!(e_max);
-                    merge_field!(n_opt);
-                    merge_field!(a0);
-                    merge_field!(rho);
-                    merge_field!(tau);
-                    merge_field!(d);
-                    merge_field!(extra_entropy);
-                    merge_field!(min_pool_cost);
-                    merge_field!(ada_per_utxo_byte);
-                    merge_field!(cost_models);
-                    merge_field!(execution_costs);
-                    merge_field!(max_tx_ex_units);
-                    merge_field!(max_block_ex_units);
-                    merge_field!(max_val_size);
-                    merge_field!(collateral_percentage);
-                    merge_field!(max_collateral_inputs);
-                    merge_field!(protocol_version_major);
-                    merge_field!(protocol_version_minor);
-                }
-                // Apply the merged update to protocol params.
-                apply_pp_update(&mut epochs.protocol_params, &merged);
+            let proposal_map = crate::validation::ppup::fold_pp_proposals(&proposals);
+            if let Some(winner) = crate::validation::ppup::voted_future_pparams(
+                &proposal_map,
+                ctx.update_quorum,
+                &epochs.protocol_params,
+            ) {
+                // Apply the winning (quorum-reaching) update to protocol params.
+                apply_pp_update(&mut epochs.protocol_params, &winner);
                 // ppExtraEntropy is consumed only by the epoch-nonce TICKN, so
                 // it lives in the consensus sub-state rather than
                 // ProtocolParameters. Sticky: only an update that carries the
                 // field changes it (Some(ZERO) explicitly resets to neutral).
-                if let Some(extra) = merged.extra_entropy {
+                if let Some(extra) = winner.extra_entropy {
                     consensus.extra_entropy = extra;
                 }
                 debug!(
                     epoch = new_epoch.0,
-                    proposers = distinct_proposers,
-                    "Pre-Conway protocol parameter update applied"
+                    "Pre-Conway protocol parameter update applied (voted quorum)"
                 );
             }
         }
@@ -995,6 +975,22 @@ impl EraRules for ShelleyRules {
         // node starts post-Byron with Haskell-correct reserves).
         if from_era == Era::Byron && ctx.era == Era::Shelley {
             recompute_shelley_initial_reserves(utxo, epochs, ctx.max_lovelace_supply);
+            // Byron fees are burned, not carried forward: Haskell's
+            // `translateToShelleyLedgerStateFromUtxo` constructs a brand-new
+            // `UTxOState` with `utxosFees = Coin 0` and `esSnapshots =
+            // emptySnapShots` (ssFee = Coin 0) — there is no accumulated
+            // Byron fee-pot value to preserve. The reserves recomputation
+            // above is the ONLY place burned Byron fees are accounted for
+            // (they're implicitly absent from `sumCoinUTxO(liveByronUTxO)`,
+            // which flows automatically into reserves). Oracle-confirmed
+            // 2026-07-06 against IntersectMBO/cardano-ledger
+            // `ByronTranslation.hs:103-181` (issue #797). Without this reset,
+            // ValidateAll's Byron path accumulates the real implicit fee
+            // (inputs - outputs) into `epoch_fees` while ApplyOnly
+            // accumulates `tx.body.fee.0` (always 0 for decoded Byron txs),
+            // so the two modes hold different `ss_fee` at the fork and
+            // diverge forever.
+            utxo.epoch_fees = Lovelace(0);
             return Ok(());
         }
 
@@ -1622,6 +1618,47 @@ mod tests {
         assert_eq!(epochs.protocol_params.protocol_version_minor, 0);
     }
 
+    /// Issue #797: Byron→Shelley translation must zero `epoch_fees`, mirroring
+    /// Haskell `translateToShelleyLedgerStateFromUtxo` (`ByronTranslation.hs`)
+    /// which constructs a brand-new `UTxOState { utxosFees = Coin 0, .. }` and
+    /// `esSnapshots = emptySnapShots` (`ssFee = Coin 0`) — Byron never had a
+    /// running fee-pot accumulator to carry forward; burned Byron fees are
+    /// accounted for solely via the reserves recomputation (they're absent
+    /// from `sumCoinUTxO(liveByronUTxO)`). Without this reset, ValidateAll
+    /// (which accumulates the real implicit Byron fee) and ApplyOnly (which
+    /// accumulates `tx.body.fee.0`, always 0 for decoded Byron txs) hold
+    /// different `ss_fee` at the fork and diverge forever.
+    #[test]
+    fn test_on_era_transition_byron_to_shelley_zeroes_epoch_fees() {
+        let rules = ShelleyRules::new();
+        let params = ProtocolParameters::mainnet_defaults();
+        let ctx = make_shelley_ctx(&params); // ctx.era = Era::Shelley
+        let mut utxo = make_utxo_sub(vec![]);
+        // Simulate ValidateAll's Byron path having accumulated real implicit
+        // fees (inputs - outputs) over the Byron era.
+        utxo.epoch_fees = Lovelace(123_456_789);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut epochs = make_epoch_sub();
+        let mut consensus = make_consensus_sub();
+
+        let result = rules.on_era_transition(
+            Era::Byron,
+            &ctx,
+            &mut utxo,
+            &mut certs,
+            &mut gov,
+            &mut consensus,
+            &mut epochs,
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            utxo.epoch_fees.0, 0,
+            "Byron->Shelley translation must zero epoch_fees (Byron fees are burned, \
+             not carried into the Shelley fee pot)"
+        );
+    }
+
     /// Shelley -> Allegra preserves protocol_version (PPUP drives bumps).
     #[test]
     fn test_on_era_transition_shelley_to_allegra_does_not_bump_pv() {
@@ -1941,6 +1978,66 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(utxo.pending_donations.0, 0);
         assert_eq!(epochs.treasury.0, 105_000_000);
+    }
+
+    /// Issue #784: a pre-Conway PPUP quorum requires a quorum of genesis
+    /// delegates to vote the byte-identical `PParamsUpdate` value. Counting
+    /// *distinct proposers* across two different values and field-merging
+    /// them (the pre-fix bug) is wrong — Haskell's `votedFuturePParams`
+    /// enacts nothing when no single value reaches quorum, even if the
+    /// union of proposers would.
+    #[test]
+    fn test_process_epoch_transition_ppup_split_vote_enacts_nothing() {
+        let rules = ShelleyRules::new();
+        let params = ProtocolParameters::mainnet_defaults();
+        let ctx = make_shelley_ctx(&params); // update_quorum = 5
+        let mut utxo = make_utxo_sub(vec![]);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut epochs = make_epoch_sub();
+        let mut consensus = make_consensus_sub();
+
+        let original_min_fee_a = epochs.protocol_params.min_fee_a;
+        let original_max_body = epochs.protocol_params.max_block_body_size;
+
+        // 3 genesis delegates vote for `ppu_a`, 2 vote for `ppu_b`. Union of
+        // proposers is 5 (>= quorum), but neither value alone reaches 5.
+        let ppu_a = dugite_primitives::transaction::ProtocolParamUpdate {
+            min_fee_a: Some(55),
+            ..Default::default()
+        };
+        let ppu_b = dugite_primitives::transaction::ProtocolParamUpdate {
+            max_block_body_size: Some(65536),
+            ..Default::default()
+        };
+        let mut proposals = Vec::new();
+        for i in 0u8..3 {
+            proposals.push((Hash32::from_bytes([i; 32]), ppu_a.clone()));
+        }
+        for i in 3u8..5 {
+            proposals.push((Hash32::from_bytes([i; 32]), ppu_b.clone()));
+        }
+        epochs.pending_pp_updates.insert(EpochNo(5), proposals);
+
+        let result = rules.process_epoch_transition(
+            EpochNo(6),
+            &ctx,
+            &mut utxo,
+            &mut certs,
+            &mut gov,
+            &mut epochs,
+            &mut consensus,
+        );
+        assert!(result.is_ok());
+
+        // Neither value reached quorum: enact nothing. The old bug would
+        // have field-merged `ppu_a` and `ppu_b` together and applied both.
+        assert_eq!(epochs.protocol_params.min_fee_a, original_min_fee_a);
+        assert_eq!(
+            epochs.protocol_params.max_block_body_size,
+            original_max_body
+        );
+        assert!(epochs.pending_pp_updates.is_empty());
     }
 
     #[test]

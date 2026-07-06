@@ -324,10 +324,16 @@ impl UtxoSet {
             return;
         }
         if self.indexing_enabled {
-            self.address_index
+            let entry = self
+                .address_index
                 .entry(output.address.clone())
-                .or_default()
-                .push(input.clone());
+                .or_default();
+            // Guard against duplicate index entries when an existing TxIn is
+            // re-inserted (e.g. replay/rollback-restore) — without this,
+            // `utxos_at_address` would return the same UTxO more than once.
+            if !entry.contains(&input) {
+                entry.push(input.clone());
+            }
         }
         self.utxos.insert(input, output);
     }
@@ -426,7 +432,7 @@ impl UtxoSet {
             return store.total_lovelace();
         }
         self.utxos.values().fold(Lovelace(0), |acc, output| {
-            Lovelace(acc.0 + output.value.coin.0)
+            Lovelace(acc.0.saturating_add(output.value.coin.0))
         })
     }
 
@@ -476,17 +482,27 @@ impl UtxoSet {
     /// [`UtxoStore::scan_all`](crate::utxo_store::UtxoStore::scan_all),
     /// which splits the key space into 256 chunks so peak memory stays
     /// bounded regardless of UTxO set size (#403).
-    pub fn scan_all<F>(&self, mut f: F)
+    ///
+    /// # Returns
+    ///
+    /// The number of entries that could not be decoded and were therefore
+    /// dropped from the stream (always `0` for the in-memory backend, which
+    /// stores already-decoded values). A non-zero count means the on-disk
+    /// store is corrupt and this scan is INCOMPLETE — consensus-critical
+    /// callers that derive ledger state from the scan (stake distribution,
+    /// reserves) MUST fail rather than proceed on a partial set. See
+    /// [`UtxoStore::scan_all`](crate::utxo_store::UtxoStore::scan_all).
+    pub fn scan_all<F>(&self, mut f: F) -> usize
     where
         F: FnMut(&TransactionInput, &TransactionOutput),
     {
         if let Some(ref store) = self.store {
-            store.scan_all(|input, output| f(&input, &output));
-            return;
+            return store.scan_all(|input, output| f(&input, &output));
         }
         for (k, v) in &self.utxos {
             f(k, v);
         }
+        0
     }
 }
 

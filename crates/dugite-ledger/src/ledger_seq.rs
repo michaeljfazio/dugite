@@ -50,14 +50,16 @@ use crate::state::{
 };
 use crate::utxo_diff::UtxoDiff;
 use dugite_primitives::block::Point;
+use dugite_primitives::credentials::Pointer;
+use dugite_primitives::era::Era;
 use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::protocol_params::ProtocolParameters;
 use dugite_primitives::time::{BlockNo, EpochNo, SlotNo};
 use dugite_primitives::transaction::{
-    Anchor, Constitution, DRep, GovActionId, Rational, Voter, VotingProcedure,
+    Anchor, Constitution, DRep, GovActionId, ProtocolParamUpdate, Rational, Voter, VotingProcedure,
 };
 use dugite_primitives::value::Lovelace;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -192,6 +194,84 @@ pub struct LedgerDelta {
     /// (overlay/Byron blocks) or non-`apply_block_with_delta` paths — then
     /// reconstruction carries the previous map forward (correct, unchanged).
     pub epoch_blocks_by_pool_snapshot: Option<Arc<HashMap<Hash28, u64>>>,
+
+    // ── #782: fields omitted from the original delta allowlist ────────────
+    //
+    // The delta model above was built as an ALLOWLIST — only fields some
+    // earlier bug report (#763, the ep292 reward corruption, etc.) actually
+    // observed as stale got a snapshot. Every field below is a genuinely
+    // mutable piece of `LedgerState` that had NO delta representation at
+    // all, so a fork rollback silently regressed it to the anchor's frozen
+    // value. See `_assert_ledger_state_fields_audited` at the bottom of this
+    // file — it exists specifically to force a future field addition to
+    // `LedgerState` through the same audit.
+    /// Post-block snapshot of `certs.pointer_map` (Shelley-era pointer-address
+    /// stake registrations). Mutated by `Certificate::StakeRegistration` (with
+    /// a pointer) / deregistration in `state/certificates.rs`, which is NOT
+    /// represented by the dead `delegation_changes` vec (see
+    /// `reward_accounts_snapshot` docs). Content-diffed (not unconditional):
+    /// the map only grows during early Shelley and is never bounded/cleared,
+    /// so an unconditional clone would cost O(map size) forever; a
+    /// content-diff still costs that on every block but at least skips the
+    /// second `Some(...)` clone on the (overwhelming) common case of no
+    /// pointer-cert in the block.
+    pub pointer_map_snapshot: Option<HashMap<Pointer, Hash32>>,
+    /// Post-block snapshot of `certs.script_stake_credentials`. Same
+    /// mutation sites and rationale as [`Self::pointer_map_snapshot`].
+    pub script_stake_credentials_snapshot: Option<HashSet<Hash32>>,
+    /// Post-block snapshot of `certs.total_stake_key_deposits` (a plain
+    /// `u64` scalar, so unconditional capture is free — mirrors
+    /// `reward_accounts_snapshot`'s unconditional imbl clone).
+    pub total_stake_key_deposits_snapshot: Option<u64>,
+    /// Post-block snapshot of `certs.pending_mir_reserves` (Haskell
+    /// `dsIRewards.irwdSrcReserves`). Pre-Conway only; drained to zero at
+    /// every epoch boundary by `apply_pending_mir`. Content-diffed — MIR
+    /// certs are rare, so this is `None` on almost every block.
+    pub pending_mir_reserves_snapshot: Option<HashMap<Hash32, i128>>,
+    /// Post-block snapshot of `certs.pending_mir_treasury`. See
+    /// [`Self::pending_mir_reserves_snapshot`].
+    pub pending_mir_treasury_snapshot: Option<HashMap<Hash32, i128>>,
+    /// Post-block snapshot of `certs.pending_mir_delta_reserves` (pot-to-pot
+    /// MIR transfer accumulator). See [`Self::pending_mir_reserves_snapshot`].
+    pub pending_mir_delta_reserves_snapshot: Option<i128>,
+    /// Post-block snapshot of `certs.pending_mir_delta_treasury`. See
+    /// [`Self::pending_mir_reserves_snapshot`].
+    pub pending_mir_delta_treasury_snapshot: Option<i128>,
+    /// Post-block snapshot of the TOP-LEVEL `LedgerState.genesis_delegates`
+    /// map (Shelley `Certificate::GenesisKeyDelegation`). This field lives
+    /// directly on `LedgerState`, not inside any sub-state that
+    /// `rollback_via_seq` wholesale-copies from the reconstructed tip, so it
+    /// needs both this delta field AND an explicit copy-back in
+    /// `rollback_via_seq` (state/mod.rs). Content-diffed — genesis key
+    /// delegation is a rare bootstrap-era cert.
+    pub genesis_delegates_snapshot: Option<HashMap<Hash28, (Hash28, Hash32)>>,
+    /// Post-block snapshot of the TOP-LEVEL `LedgerState.future_gen_delegs`
+    /// map (Haskell `dsFutureGenDelegs`, the pending queue behind
+    /// `Certificate::GenesisKeyDelegation`). Same rationale as
+    /// [`Self::genesis_delegates_snapshot`] — lives directly on
+    /// `LedgerState`, so it needs both this delta field and an explicit
+    /// copy-back in `rollback_via_seq` (state/mod.rs). Content-diffed. See
+    /// issue #804.
+    pub future_gen_delegs_snapshot: Option<HashMap<(u64, Hash28), (Hash28, Hash32)>>,
+    /// Post-block ABSOLUTE snapshot of `epochs.pending_pp_updates`
+    /// (pre-Conway PPUP proposals pending for the current/target epoch).
+    /// Unconditional: this map holds only currently-active proposals (at
+    /// most a handful of entries), so the clone is cheap every block. This
+    /// supersedes the coarser `EpochTransitionDelta::pending_pp_updates_cleared`
+    /// bool (which only handles the "both maps end up completely empty"
+    /// case) — when present this snapshot MUST be applied AFTER the epoch
+    /// transition's clear-if-empty step so the exact reconstruction wins.
+    pub pending_pp_updates_snapshot: Option<BTreeMap<EpochNo, Vec<(Hash32, ProtocolParamUpdate)>>>,
+    /// Post-block ABSOLUTE snapshot of `epochs.future_pp_updates`. See
+    /// [`Self::pending_pp_updates_snapshot`].
+    pub future_pp_updates_snapshot: Option<BTreeMap<EpochNo, Vec<(Hash32, ProtocolParamUpdate)>>>,
+    /// Post-block snapshot of `epochs.rupd_addrs_rew` (the pv≤6 startStep
+    /// reward-account prefilter; see the field docs on `EpochSubState`).
+    /// Change-detected via `Arc::ptr_eq` on the inner `Arc` (both `None`s
+    /// compare equal; a `None`↔`Some` transition or a pointer change counts
+    /// as a change) — O(1) either way since cloning the outer `Option` is
+    /// just an `Arc` refcount bump.
+    pub rupd_addrs_rew_snapshot: Option<Option<Arc<HashSet<Hash32>>>>,
 }
 
 impl LedgerDelta {
@@ -217,6 +297,18 @@ impl LedgerDelta {
             pool_deposits_snapshot: None,
             gov_snapshot: None,
             epoch_blocks_by_pool_snapshot: None,
+            pointer_map_snapshot: None,
+            script_stake_credentials_snapshot: None,
+            total_stake_key_deposits_snapshot: None,
+            pending_mir_reserves_snapshot: None,
+            pending_mir_treasury_snapshot: None,
+            pending_mir_delta_reserves_snapshot: None,
+            pending_mir_delta_treasury_snapshot: None,
+            genesis_delegates_snapshot: None,
+            future_gen_delegs_snapshot: None,
+            pending_pp_updates_snapshot: None,
+            future_pp_updates_snapshot: None,
+            rupd_addrs_rew_snapshot: None,
         }
     }
 }
@@ -396,6 +488,13 @@ pub struct EpochTransitionDelta {
     pub epoch_nonce: Hash32,
     /// New last_epoch_block_nonce.
     pub last_epoch_block_nonce: Hash32,
+    /// `consensus.extra_entropy` after this transition (Shelley `ppExtraEntropy`,
+    /// set by a pre-Conway PP update and folded into the epoch nonce at TICKN).
+    /// Only mutated inside `process_epoch_transition`, so an unconditional
+    /// post-transition capture here is exact — #782 (previously omitted from
+    /// the delta entirely, so a fork rollback across an extra-entropy change
+    /// silently regressed it, corrupting the next epoch's nonce derivation).
+    pub extra_entropy: Hash32,
     /// Reward credits applied to individual accounts.
     pub reward_credits: HashMap<Hash32, Lovelace>,
     /// Pool retirements processed: pools removed.
@@ -454,6 +553,37 @@ pub struct BlockFieldsDelta {
     pub lab_nonce: Hash32,
     /// epoch_fees running total after this block.
     pub epoch_fees: Lovelace,
+    /// `utxo.pending_donations` running total after this block (Conway
+    /// treasury donations, accumulated per-tx, flushed at the epoch
+    /// boundary). Was NOT actually part of the delta prior to #782 despite
+    /// a doc comment on `rollback_via_seq` claiming otherwise — a fork
+    /// rollback across a donation-bearing block silently regressed it.
+    pub pending_donations: Lovelace,
+    /// `LedgerState.era` after this block. Omitted from the delta model
+    /// entirely prior to #782: a rollback across an era boundary (e.g.
+    /// Babbage→Conway) regressed `era`, causing the next block applied to
+    /// RE-RUN `on_era_transition` (re-zeroing `pending_donations`,
+    /// re-seeding Conway DReps/committee, re-signaling
+    /// `pending_era_transition`).
+    pub era: Era,
+    /// `epochs.pending_avvm_return` after this block (AVVM coin returned to
+    /// reserves at the Shelley→Allegra boundary; consumed by the next
+    /// `compute_reward_update`). Plain `u64` scalar — unconditional capture
+    /// is free.
+    pub pending_avvm_return: u64,
+    /// Per-block absolute update to `consensus.opcert_counters[pool_id]`
+    /// (max operational-cert sequence number observed for that pool), if
+    /// this block's header carried a non-empty `issuer_vkey`. `None` for
+    /// Byron blocks / headers without an issuer.
+    ///
+    /// This is a targeted single-key delta rather than a full-map snapshot:
+    /// `opcert_counters` is mutated for AT MOST ONE pool per block (the
+    /// block's own producer, in `compute_shelley_nonce`) and is never
+    /// bounded or cleared, so it grows for the lifetime of the chain. A
+    /// full-map content-diff (clone + compare every block, forever) would
+    /// be unbounded overhead for no extra correctness; capturing just the
+    /// touched `(pool_id, seq)` pair is O(1) and exact.
+    pub opcert_counter_update: Option<(Hash28, u64)>,
 }
 
 impl Default for BlockFieldsDelta {
@@ -466,6 +596,10 @@ impl Default for BlockFieldsDelta {
             candidate_nonce: Hash32::ZERO,
             lab_nonce: Hash32::ZERO,
             epoch_fees: Lovelace(0),
+            pending_donations: Lovelace(0),
+            era: Era::Byron,
+            pending_avvm_return: 0,
+            opcert_counter_update: None,
         }
     }
 }
@@ -916,6 +1050,40 @@ pub fn apply_delta_to_state(state: &mut LedgerState, delta: &LedgerDelta) {
     if let Some(g) = &delta.gov_snapshot {
         state.gov = g.clone();
     }
+    // #782: fields omitted from the original allowlist. See the field docs
+    // on `LedgerDelta` for why each is (or isn't) content-diffed.
+    if let Some(pm) = &delta.pointer_map_snapshot {
+        state.certs.pointer_map = pm.clone();
+    }
+    if let Some(ssc) = &delta.script_stake_credentials_snapshot {
+        state.certs.script_stake_credentials = ssc.clone();
+    }
+    if let Some(tskd) = &delta.total_stake_key_deposits_snapshot {
+        state.certs.total_stake_key_deposits = *tskd;
+    }
+    if let Some(pmr) = &delta.pending_mir_reserves_snapshot {
+        state.certs.pending_mir_reserves = pmr.clone();
+    }
+    if let Some(pmt) = &delta.pending_mir_treasury_snapshot {
+        state.certs.pending_mir_treasury = pmt.clone();
+    }
+    if let Some(pmdr) = delta.pending_mir_delta_reserves_snapshot {
+        state.certs.pending_mir_delta_reserves = pmdr;
+    }
+    if let Some(pmdt) = delta.pending_mir_delta_treasury_snapshot {
+        state.certs.pending_mir_delta_treasury = pmdt;
+    }
+    // `genesis_delegates` lives directly on `LedgerState` (not a sub-state),
+    // so unlike the fields above it also needs an explicit copy-back in
+    // `rollback_via_seq` (state/mod.rs) — this restore alone only fixes
+    // reconstruction via `state_at_index`/`advance_anchor`.
+    if let Some(gd) = &delta.genesis_delegates_snapshot {
+        state.genesis_delegates = gd.clone();
+    }
+    // #804: same rationale as `genesis_delegates` immediately above.
+    if let Some(fgd) = &delta.future_gen_delegs_snapshot {
+        state.future_gen_delegs = fgd.clone();
+    }
 
     // ── 5. Governance changes ─────────────────────────────────────────────────
     for change in &delta.governance_changes {
@@ -943,6 +1111,23 @@ pub fn apply_delta_to_state(state: &mut LedgerState, delta: &LedgerDelta) {
     // field docs on `LedgerDelta::epoch_blocks_by_pool_snapshot`.
     if let Some(eb) = &delta.epoch_blocks_by_pool_snapshot {
         state.consensus.epoch_blocks_by_pool = Arc::clone(eb);
+    }
+
+    // ── 7c. Absolute restore of pre-Conway PPUP proposal maps + rupd prefilter ──
+    //
+    // Authoritative override of `EpochTransitionDelta::pending_pp_updates_cleared`
+    // (step 6), which only models the coarse "both maps ended up completely
+    // empty" case via `.clear()`. These unconditional per-block snapshots are
+    // exact regardless of how partial/future the post-transition maps are —
+    // MUST run after step 6 so they have the final say (#782).
+    if let Some(ppu) = &delta.pending_pp_updates_snapshot {
+        state.epochs.pending_pp_updates = ppu.clone();
+    }
+    if let Some(fppu) = &delta.future_pp_updates_snapshot {
+        state.epochs.future_pp_updates = fppu.clone();
+    }
+    if let Some(rar) = &delta.rupd_addrs_rew_snapshot {
+        state.epochs.rupd_addrs_rew = rar.clone();
     }
 
     // Update tip to reflect this block.
@@ -1263,6 +1448,7 @@ fn apply_epoch_transition_delta(state: &mut LedgerState, et: &EpochTransitionDel
     state.epochs.prev_protocol_version_major = et.prev_protocol_version_major;
     state.consensus.epoch_nonce = et.epoch_nonce;
     state.consensus.last_epoch_block_nonce = et.last_epoch_block_nonce;
+    state.consensus.extra_entropy = et.extra_entropy;
     state.certs.stake_distribution = et.stake_distribution.clone();
 
     if et.pending_pp_updates_cleared {
@@ -1366,12 +1552,72 @@ fn apply_block_fields(state: &mut LedgerState, fields: &BlockFieldsDelta) {
     state.consensus.evolving_nonce = fields.evolving_nonce;
     state.consensus.candidate_nonce = fields.candidate_nonce;
     state.consensus.lab_nonce = fields.lab_nonce;
+    // #782: era/pending_donations/pending_avvm_return are post-block absolute
+    // scalars, exactly like epoch_fees above.
+    state.utxo.pending_donations = fields.pending_donations;
+    state.era = fields.era;
+    state.epochs.pending_avvm_return = fields.pending_avvm_return;
 
     if let Some(pool_id) = fields.pool_block_increment {
         *Arc::make_mut(&mut state.consensus.epoch_blocks_by_pool)
             .entry(pool_id)
             .or_insert(0) += 1;
     }
+    // #782: single-key absolute restore — see the field doc on
+    // `BlockFieldsDelta::opcert_counter_update` for why this isn't a
+    // full-map snapshot.
+    if let Some((pool_id, seq)) = fields.opcert_counter_update {
+        state.consensus.opcert_counters.insert(pool_id, seq);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #782 compile-time field audit guard
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Never called. Exists solely so that adding a new field to `LedgerState`
+/// without updating this function is a COMPILE ERROR (no `..` rest pattern
+/// below), forcing the author to also consult:
+///
+/// - `apply_block_with_delta_impl` (`crates/dugite-ledger/src/state/apply.rs`)
+///   — does the new field need a per-block capture into `LedgerDelta`?
+/// - `apply_delta_to_state` (this file) — does the new field need a restore
+///   arm during state reconstruction?
+/// - `rollback_via_seq` (`crates/dugite-ledger/src/state/mod.rs`) — if the
+///   field lives directly on `LedgerState` (not inside `certs` / `gov` /
+///   `consensus` / `epochs`), does it need an explicit copy-back?
+///
+/// See #782: the delta model was an undocumented allowlist for years, so
+/// fields added to `LedgerState` silently had no rollback coverage.
+#[allow(dead_code)]
+fn _assert_ledger_state_fields_audited(state: LedgerState) {
+    let LedgerState {
+        utxo: _,
+        certs: _,
+        gov: _,
+        consensus: _,
+        epochs: _,
+        tip: _,
+        era: _,
+        pending_era_transition: _,
+        epoch: _,
+        epoch_length: _,
+        shelley_transition_epoch: _,
+        byron_epoch_length: _,
+        slot_config: _,
+        genesis_hash: _,
+        genesis_delegates: _,
+        future_gen_delegs: _,
+        update_quorum: _,
+        node_network: _,
+        randomness_stabilisation_window: _,
+        stability_window_3kf: _,
+        security_param: _,
+        conway_genesis_init: _,
+        max_lovelace_supply: _,
+        phase2_apply_horizon: _,
+        cached_validation_registry: _,
+    } = state;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1438,6 +1684,10 @@ mod tests {
             candidate_nonce: make_hash(hash_byte),
             lab_nonce: make_hash(hash_byte),
             pool_block_increment: None,
+            pending_donations: Lovelace(0),
+            era: Era::Conway,
+            pending_avvm_return: 0,
+            opcert_counter_update: None,
         };
         delta
     }

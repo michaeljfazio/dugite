@@ -55,6 +55,7 @@ pub mod populate_v1_v2;
 pub mod populate_v3;
 pub mod program;
 pub mod redeemer_resolve;
+pub mod scope_check;
 pub mod script_context;
 pub mod term;
 pub mod tx_info;

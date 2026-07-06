@@ -407,7 +407,46 @@ impl LedgerState {
     /// `_costModelsUnknown`), which bincode serializes as a length-prefixed
     /// sequence — changing the layout of every embedded `protocol_params` /
     /// `prev_protocol_params`.
-    pub(crate) const SNAPSHOT_VERSION: u8 = 24;
+    /// v25 (#782): no bincode layout change here, but `LedgerSeq`'s rollback
+    /// delta model (`crates/dugite-ledger/src/ledger_seq.rs`) gained snapshot
+    /// coverage for several `LedgerState` fields (`genesis_delegates`, `era`,
+    /// `pending_donations`, `opcert_counters`, pre-Conway PPUP proposal maps,
+    /// pending MIR accumulators, `pointer_map`, `script_stake_credentials`,
+    /// `total_stake_key_deposits`, `extra_entropy`) that the delta model
+    /// previously omitted entirely. An anchor advanced by an OLDER binary
+    /// (`LedgerSeq::advance_anchor` → `apply_delta_to_state`) could have
+    /// silently regressed one of those fields to a stale value before being
+    /// persisted here. Bumping the version quarantines any snapshot saved
+    /// under the old (incomplete) delta model, forcing a clean rebuild from
+    /// ImmutableDB replay instead of trusting a possibly-mis-advanced anchor.
+    /// v26 (#799): `ProposalState` (embedded wholesale inside
+    /// `GovernanceState`, which is bincode-serialized as part of every
+    /// `LedgerState` snapshot) gained a new `submission_index: u64` field
+    /// used to recover on-chain proposal submission order for the
+    /// ratification tie-break sort. This is a positional bincode layout
+    /// change for every embedded `ProposalState` (live `proposals`,
+    /// `last_ratified`, and `RatificationSnapshot::proposals`) — a snapshot
+    /// written by a prior binary must be quarantined, not silently
+    /// misinterpreted.
+    /// v27 (#796): `PendingRewardUpdate::delta_reserves` changed from `u64`
+    /// to `i128` so a degraded/low-block epoch (`epoch_fees` exceeding
+    /// `treasury_cut + total_distributed`) can represent Haskell's signed
+    /// `deltaR` reserves credit instead of silently saturating it to 0.
+    /// `PendingRewardUpdate` is embedded in every `LedgerState` snapshot via
+    /// `EpochSubState::pending_reward_update` / `last_applied_rupd`, so this
+    /// is a positional bincode layout change — a snapshot written by a
+    /// prior binary must be quarantined, not silently misinterpreted as a
+    /// `u64`.
+    /// v28 (#804): `LedgerState` gained a new top-level field
+    /// `future_gen_delegs` (Haskell `dsFutureGenDelegs`, the pending queue
+    /// behind `Certificate::GenesisKeyDelegation`), added to
+    /// `LedgerStateSnapshot` right after `genesis_delegates` — a positional
+    /// bincode layout change for every snapshot. Also closes the live-path
+    /// gap where `GenesisKeyDelegation` certs were silently dropped
+    /// (`eras::common::apply_shelley_cert`'s catch-all), leaving
+    /// `genesis_delegates` permanently stale for any chain that crossed a
+    /// real genesis-delegate rotation.
+    pub(crate) const SNAPSHOT_VERSION: u8 = 28;
 
     /// Save ledger state snapshot to disk using bincode serialization.
     ///

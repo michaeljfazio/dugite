@@ -1317,6 +1317,7 @@ fn test_drep_activity_tracking() {
                 expires_epoch: EpochNo(100),
                 yes_votes: 0,
                 no_votes: 0,
+                submission_index: 0,
                 abstain_votes: 0,
             },
         );
@@ -1483,6 +1484,7 @@ fn test_drep_marked_inactive_on_expiry() {
                 expires_epoch: EpochNo(100),
                 yes_votes: 0,
                 no_votes: 0,
+                submission_index: 0,
                 abstain_votes: 0,
             },
         );
@@ -2133,7 +2135,11 @@ fn test_parameter_change_ratification() {
     state.epoch_length = 100;
     // Post-bootstrap: ParameterChange requires actual DRep votes (not auto-pass)
     state.epochs.protocol_params.protocol_version_major = 10;
-    // Set CC threshold to 0 so CC auto-approves (we're testing DRep voting here)
+    // Set CC threshold to 0 so CC auto-approves (we're testing DRep voting here).
+    // #800: a 0-threshold committee only auto-passes when `active_size >=
+    // committee_min_size` (or during bootstrap); this test has no CC members
+    // at all, so zero `committee_min_size` too (mirrors `gov_test_state`).
+    state.epochs.protocol_params.committee_min_size = 0;
     Arc::make_mut(&mut state.gov.governance).committee_threshold = Some(Rational {
         numerator: 0,
         denominator: 1,
@@ -2300,6 +2306,10 @@ fn test_treasury_withdrawal_ratification() {
     state.epochs.treasury = Lovelace(10_000_000_000);
     // Post-bootstrap: TreasuryWithdrawals requires actual DRep votes (and is allowed)
     state.epochs.protocol_params.protocol_version_major = 10;
+    // #800: a 0-threshold committee only auto-passes when `active_size >=
+    // committee_min_size` (or during bootstrap); this test has no CC members
+    // at all, so zero `committee_min_size` too (mirrors `gov_test_state`).
+    state.epochs.protocol_params.committee_min_size = 0;
     Arc::make_mut(&mut state.gov.governance).committee_threshold = Some(Rational {
         numerator: 0,
         denominator: 1,
@@ -2446,6 +2456,14 @@ fn test_hard_fork_ratification() {
     // (HardForkInitiation is rejected during bootstrap phase, protocol == 9)
     state.epochs.protocol_params.protocol_version_major = 10;
     state.epochs.protocol_params.protocol_version_minor = 0;
+    // #800: a 0-threshold committee only auto-passes when `active_size >=
+    // committee_min_size` (or during bootstrap). This test has no CC members
+    // at all and only cares about the DRep/SPO thresholds for HardFork
+    // ratification, so neutralize the CC leg by zeroing `committee_min_size`
+    // (mirroring the same pattern used by `gov_test_state` in governance.rs)
+    // rather than relying on the old (buggy) unconditional zero-threshold
+    // auto-pass.
+    state.epochs.protocol_params.committee_min_size = 0;
     Arc::make_mut(&mut state.gov.governance).committee_threshold = Some(Rational {
         numerator: 0,
         denominator: 1,
@@ -4223,6 +4241,190 @@ fn test_genesis_key_delegation_updates_genesis_delegates() {
     assert_eq!(entry.1, vrf_keyhash, "vrf keyhash mismatch");
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// #804: GenesisKeyDelegation live-path two-phase queue
+// (future_gen_delegs -> genesis_delegates), via the real apply_block_with_delta
+// path -- NOT the dead `process_certificate` handler exercised by the two
+// tests immediately above.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A `GenesisKeyDelegation` cert must enqueue into `future_gen_delegs` and
+/// must NOT immediately update `genesis_delegates` -- mirrors Haskell's
+/// `dsFutureGenDelegs` two-phase queue (oracle-verified against
+/// `Cardano.Ledger.Shelley.Rules.Deleg`).
+#[test]
+fn test_804_genesis_key_delegation_enqueues_not_adopted() {
+    let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+    // Pre-Conway: the enqueue path is gated on `pv < 9` (GenesisKeyDelegation
+    // is AtMostEra Babbage).
+    state.epochs.protocol_params.protocol_version_major = 8;
+    state.stability_window_3kf = 10;
+
+    let genesis_hash = Hash32::from_bytes([0x11; 32]);
+    let delegate_hash = Hash32::from_bytes([0x22; 32]);
+    let vrf_keyhash = Hash32::from_bytes([0x33; 32]);
+
+    let block = make_certs_block(
+        5,
+        1,
+        Hash32::ZERO,
+        vec![Certificate::GenesisKeyDelegation {
+            genesis_hash,
+            genesis_delegate_hash: delegate_hash,
+            vrf_keyhash,
+        }],
+    );
+    state
+        .apply_block(&block, BlockValidationMode::ApplyOnly)
+        .expect("block should apply");
+
+    assert!(
+        state.genesis_delegates.is_empty(),
+        "GenesisKeyDelegation must NOT update genesis_delegates immediately"
+    );
+
+    let gkey = Hash28::from_bytes([0x11; 28]);
+    let dkey = Hash28::from_bytes([0x22; 28]);
+    let maturity_slot = 5 + state.stability_window_3kf;
+    let entry = state
+        .future_gen_delegs
+        .get(&(maturity_slot, gkey))
+        .expect("future_gen_delegs should contain the enqueued entry");
+    assert_eq!(entry.0, dkey);
+    assert_eq!(entry.1, vrf_keyhash);
+}
+
+/// Once a later block's slot reaches `maturity_slot = cert_slot +
+/// stability_window_3kf`, the queued entry must be adopted into
+/// `genesis_delegates` and removed from `future_gen_delegs`. Mirrors
+/// Haskell's `adoptGenesisDelegs`, which runs every block via TICK (NOT
+/// gated on an epoch boundary).
+#[test]
+fn test_804_genesis_key_delegation_adopted_after_stability_window() {
+    let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+    state.epochs.protocol_params.protocol_version_major = 8;
+    state.stability_window_3kf = 10;
+
+    let genesis_hash = Hash32::from_bytes([0x11; 32]);
+    let delegate_hash = Hash32::from_bytes([0x22; 32]);
+    let vrf_keyhash = Hash32::from_bytes([0x33; 32]);
+
+    let b0 = make_certs_block(
+        5,
+        1,
+        Hash32::ZERO,
+        vec![Certificate::GenesisKeyDelegation {
+            genesis_hash,
+            genesis_delegate_hash: delegate_hash,
+            vrf_keyhash,
+        }],
+    );
+    state
+        .apply_block(&b0, BlockValidationMode::ApplyOnly)
+        .expect("block 0 should apply");
+    let maturity_slot = 5 + state.stability_window_3kf;
+
+    // One slot before maturity: still queued, not adopted.
+    let b1 = make_test_block(maturity_slot - 1, 2, *b0.hash(), vec![]);
+    state
+        .apply_block(&b1, BlockValidationMode::ApplyOnly)
+        .expect("block 1 should apply");
+    assert!(
+        state.genesis_delegates.is_empty(),
+        "must not adopt before maturity_slot"
+    );
+    assert!(!state.future_gen_delegs.is_empty());
+
+    // At exactly maturity_slot: adopted.
+    let b2 = make_test_block(maturity_slot, 3, *b1.hash(), vec![]);
+    state
+        .apply_block(&b2, BlockValidationMode::ApplyOnly)
+        .expect("block 2 should apply");
+
+    let gkey = Hash28::from_bytes([0x11; 28]);
+    let dkey = Hash28::from_bytes([0x22; 28]);
+    let entry = state
+        .genesis_delegates
+        .get(&gkey)
+        .expect("entry should be adopted into genesis_delegates at maturity_slot");
+    assert_eq!(entry.0, dkey);
+    assert_eq!(entry.1, vrf_keyhash);
+    assert!(
+        state.future_gen_delegs.is_empty(),
+        "adopted entry must be removed from the pending queue"
+    );
+}
+
+/// A rollback across the adoption boundary must restore BOTH
+/// `future_gen_delegs` and `genesis_delegates` to their pre-adoption
+/// values -- exercises the #804 `LedgerDelta::future_gen_delegs_snapshot`
+/// wiring (capture in `apply_block_with_delta_impl`, restore in
+/// `apply_delta_to_state`, and the explicit top-level copy-back in
+/// `rollback_via_seq`).
+#[test]
+fn test_804_genesis_key_delegation_rollback_restores_queue() {
+    let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+    state.epochs.protocol_params.protocol_version_major = 8;
+    state.stability_window_3kf = 10;
+
+    let mut seq = crate::ledger_seq::LedgerSeq::with_defaults(state.clone_without_utxos(), 100);
+
+    let genesis_hash = Hash32::from_bytes([0x11; 32]);
+    let delegate_hash = Hash32::from_bytes([0x22; 32]);
+    let vrf_keyhash = Hash32::from_bytes([0x33; 32]);
+
+    // Block 0: enqueue.
+    let b0 = make_certs_block(
+        5,
+        1,
+        Hash32::ZERO,
+        vec![Certificate::GenesisKeyDelegation {
+            genesis_hash,
+            genesis_delegate_hash: delegate_hash,
+            vrf_keyhash,
+        }],
+    );
+    let d0 = state
+        .apply_block_with_delta(&b0, BlockValidationMode::ApplyOnly)
+        .expect("block 0 should apply");
+    seq.push(d0);
+
+    // Block 1: crosses maturity_slot -- adopted.
+    let maturity_slot = 5 + state.stability_window_3kf;
+    let b1 = make_test_block(maturity_slot, 2, *b0.hash(), vec![]);
+    let d1 = state
+        .apply_block_with_delta(&b1, BlockValidationMode::ApplyOnly)
+        .expect("block 1 should apply");
+    seq.push(d1);
+
+    let gkey = Hash28::from_bytes([0x11; 28]);
+    assert!(
+        state.genesis_delegates.contains_key(&gkey),
+        "sanity: adopted before rollback"
+    );
+    assert!(state.future_gen_delegs.is_empty());
+
+    // Roll back block 1 (the adoption block) -- must restore the
+    // pre-adoption state: entry back in future_gen_delegs, absent from
+    // genesis_delegates.
+    let n = state
+        .rollback_via_seq(&mut seq, &Point::Specific(SlotNo(5), *b0.hash()))
+        .expect("b0 point is in the volatile window");
+    assert_eq!(n, 1);
+
+    assert!(
+        !state.genesis_delegates.contains_key(&gkey),
+        "rollback must undo the adoption"
+    );
+    let dkey = Hash28::from_bytes([0x22; 28]);
+    let entry = state
+        .future_gen_delegs
+        .get(&(maturity_slot, gkey))
+        .expect("rollback must restore the pending queue entry");
+    assert_eq!(entry.0, dkey);
+    assert_eq!(entry.1, vrf_keyhash);
+}
+
 #[test]
 fn test_pre_conway_pp_update_quorum_met() {
     let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
@@ -4442,6 +4644,252 @@ fn test_pre_conway_pp_update_survives_intermediate_epoch() {
     assert_eq!(state.epochs.protocol_params.protocol_version_major, 8);
     assert_eq!(state.epochs.protocol_params.protocol_version_minor, 0);
     assert!(state.epochs.pending_pp_updates.is_empty());
+}
+
+/// Issue #784: a pre-Conway PPUP quorum requires a quorum of genesis
+/// delegates to vote the byte-identical `PParamsUpdate` value. Counting
+/// *distinct proposers* across two different values and field-merging them
+/// (the pre-fix bug) is wrong — Haskell's `votedFuturePParams` enacts
+/// nothing when no single value reaches quorum, even if the union of
+/// proposers would.
+#[test]
+fn test_pre_conway_pp_update_split_vote_no_merge() {
+    let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+    state.update_quorum = 5;
+    state.epoch = EpochNo(4);
+    state.epoch_length = 100;
+
+    let original_min_fee_a = state.epochs.protocol_params.min_fee_a;
+    let original_max_body = state.epochs.protocol_params.max_block_body_size;
+
+    // 3 genesis delegates vote for `ppu_a`, 2 vote for `ppu_b`. Union of
+    // proposers is 5 (>= quorum), but neither value alone reaches 5.
+    let ppu_a = ProtocolParamUpdate {
+        min_fee_a: Some(55),
+        ..Default::default()
+    };
+    let ppu_b = ProtocolParamUpdate {
+        max_block_body_size: Some(65536),
+        ..Default::default()
+    };
+    for i in 0u8..3 {
+        state
+            .epochs
+            .pending_pp_updates
+            .entry(EpochNo(4))
+            .or_default()
+            .push((Hash32::from_bytes([i; 32]), ppu_a.clone()));
+    }
+    for i in 3u8..5 {
+        state
+            .epochs
+            .pending_pp_updates
+            .entry(EpochNo(4))
+            .or_default()
+            .push((Hash32::from_bytes([i; 32]), ppu_b.clone()));
+    }
+
+    state.process_epoch_transition(EpochNo(5));
+
+    // Neither value reached quorum: enact nothing. The old bug would have
+    // field-merged `ppu_a` and `ppu_b` together and applied both.
+    assert_eq!(state.epochs.protocol_params.min_fee_a, original_min_fee_a);
+    assert_eq!(
+        state.epochs.protocol_params.max_block_body_size,
+        original_max_body
+    );
+    assert!(state.epochs.pending_pp_updates.is_empty());
+}
+
+/// A quorum-met value that violates `maxTxSize + maxBHSize < maxBBSize`
+/// (Haskell `votedFuturePParams`'s post-apply sanity guard, lives inside
+/// `votedFuturePParams` itself per the cardano-ledger-oracle) must be
+/// silently discarded — never applied.
+#[test]
+fn test_pre_conway_pp_update_sanity_guard_rejects() {
+    let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+    state.update_quorum = 2;
+    state.epoch = EpochNo(4);
+    state.epoch_length = 100;
+
+    let original_max_tx_size = state.epochs.protocol_params.max_tx_size;
+    assert!(
+        original_max_tx_size + state.epochs.protocol_params.max_block_header_size
+            < state.epochs.protocol_params.max_block_body_size,
+        "fixture invariant: current params must satisfy the sanity guard"
+    );
+
+    // Both genesis delegates vote identically for a max_tx_size so large it
+    // breaks the size invariant against the current max_block_body_size.
+    let bad_ppu = ProtocolParamUpdate {
+        max_tx_size: Some(200_000),
+        ..Default::default()
+    };
+    state
+        .epochs
+        .pending_pp_updates
+        .entry(EpochNo(4))
+        .or_default()
+        .push((Hash32::from_bytes([1u8; 32]), bad_ppu.clone()));
+    state
+        .epochs
+        .pending_pp_updates
+        .entry(EpochNo(4))
+        .or_default()
+        .push((Hash32::from_bytes([2u8; 32]), bad_ppu));
+
+    state.process_epoch_transition(EpochNo(5));
+
+    assert_eq!(
+        state.epochs.protocol_params.max_tx_size, original_max_tx_size,
+        "sanity-guard-violating update must be discarded, not applied"
+    );
+}
+
+/// Issue #784 completeness caveat: the header/envelope forecast helpers in
+/// `state::mod` must derive their forecast from the SAME
+/// `voted_future_pparams` quorum rule as enactment, not the old
+/// distinct-proposer-count + last-writer-merge path. A split vote (3 for
+/// `d = 1/4`, 2 for `d = 1/2`, quorum = 5) must forecast the CURRENT `d`.
+#[test]
+fn test_forecast_d_for_epoch_split_vote_returns_current() {
+    let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+    state.update_quorum = 5;
+    state.epoch = EpochNo(4);
+    state.epochs.protocol_params.protocol_version_major = 6; // pre-Babbage, `d` meaningful
+    let original_d = state.epochs.protocol_params.d.clone();
+
+    let ppu_a = ProtocolParamUpdate {
+        d: Some(Rational {
+            numerator: 1,
+            denominator: 4,
+        }),
+        ..Default::default()
+    };
+    let ppu_b = ProtocolParamUpdate {
+        d: Some(Rational {
+            numerator: 1,
+            denominator: 2,
+        }),
+        ..Default::default()
+    };
+    for i in 0u8..3 {
+        state
+            .epochs
+            .pending_pp_updates
+            .entry(EpochNo(4))
+            .or_default()
+            .push((Hash32::from_bytes([i; 32]), ppu_a.clone()));
+    }
+    for i in 3u8..5 {
+        state
+            .epochs
+            .pending_pp_updates
+            .entry(EpochNo(4))
+            .or_default()
+            .push((Hash32::from_bytes([i; 32]), ppu_b.clone()));
+    }
+
+    assert_eq!(state.forecast_d_for_epoch(5), original_d);
+}
+
+/// Companion to the split-vote case above: when a quorum of genesis
+/// delegates DOES vote the byte-identical value, the forecast must return
+/// that value (not the current one).
+#[test]
+fn test_forecast_d_for_epoch_quorum_met_identical_value() {
+    let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+    state.update_quorum = 2;
+    state.epoch = EpochNo(4);
+    state.epochs.protocol_params.protocol_version_major = 6;
+
+    let target_d = Rational {
+        numerator: 1,
+        denominator: 4,
+    };
+    let ppu = ProtocolParamUpdate {
+        d: Some(target_d.clone()),
+        ..Default::default()
+    };
+    state
+        .epochs
+        .pending_pp_updates
+        .entry(EpochNo(4))
+        .or_default()
+        .push((Hash32::from_bytes([1u8; 32]), ppu.clone()));
+    state
+        .epochs
+        .pending_pp_updates
+        .entry(EpochNo(4))
+        .or_default()
+        .push((Hash32::from_bytes([2u8; 32]), ppu));
+
+    assert_eq!(state.forecast_d_for_epoch(5), target_d);
+}
+
+/// Same completeness caveat for `forecast_extra_entropy_for_epoch`: a split
+/// vote must forecast the current (sticky) value, not either proposal.
+#[test]
+fn test_forecast_extra_entropy_for_epoch_split_vote_returns_current() {
+    let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+    state.update_quorum = 5;
+    state.epoch = EpochNo(4);
+    let original = state.consensus.extra_entropy;
+
+    let ppu_a = ProtocolParamUpdate {
+        extra_entropy: Some(Hash32::from_bytes([0xAA; 32])),
+        ..Default::default()
+    };
+    let ppu_b = ProtocolParamUpdate {
+        extra_entropy: Some(Hash32::from_bytes([0xBB; 32])),
+        ..Default::default()
+    };
+    for i in 0u8..3 {
+        state
+            .epochs
+            .pending_pp_updates
+            .entry(EpochNo(4))
+            .or_default()
+            .push((Hash32::from_bytes([i; 32]), ppu_a.clone()));
+    }
+    for i in 3u8..5 {
+        state
+            .epochs
+            .pending_pp_updates
+            .entry(EpochNo(4))
+            .or_default()
+            .push((Hash32::from_bytes([i; 32]), ppu_b.clone()));
+    }
+
+    assert_eq!(state.forecast_extra_entropy_for_epoch(5), original);
+}
+
+/// Same completeness caveat for `forecast_max_block_body_size_for_epoch`: a
+/// quorum-met identical-value proposal must forecast that value.
+#[test]
+fn test_forecast_max_block_body_size_for_epoch_quorum_met() {
+    let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+    state.update_quorum = 2;
+    state.epoch = EpochNo(4);
+
+    let ppu = ProtocolParamUpdate {
+        max_block_body_size: Some(73_728),
+        ..Default::default()
+    };
+    state
+        .epochs
+        .pending_pp_updates
+        .entry(EpochNo(4))
+        .or_default()
+        .push((Hash32::from_bytes([1u8; 32]), ppu.clone()));
+    state
+        .epochs
+        .pending_pp_updates
+        .entry(EpochNo(4))
+        .or_default()
+        .push((Hash32::from_bytes([2u8; 32]), ppu));
+
+    assert_eq!(state.forecast_max_block_body_size_for_epoch(5), 73_728);
 }
 
 #[test]
@@ -4978,11 +5426,16 @@ fn test_mir_stake_credentials_debits_treasury() {
 
 #[test]
 fn test_mir_compound_credential_and_pot_transfer() {
-    // Per Haskell `applyMIR` MIR application is unconditional: any cert
-    // whose delta would underflow the source pot must have been rejected
-    // upstream by `validateMIRCert` (`InsufficientForInstantaneousRewards`).
-    // After issue #631 the apply path panics on such a scenario instead of
-    // silently capping at the available balance.
+    // Updated for issue #803 (2026-07-06): per the cardano-ledger-oracle
+    // (`Cardano.Ledger.Shelley.Rules.Mir.mirTransition`), an insolvent MIR
+    // pot-to-pot transfer is a total, non-throwing `NoMirTransfer` — both
+    // pots are left byte-identical and the pending accumulators are
+    // cleared, never a panic. `validateMIRCert`
+    // (`InsufficientForInstantaneousRewards`) *should* reject this
+    // upstream, but dugite's Phase-1 admission has documented gaps (see
+    // `validation/mir.rs`), so the apply-time boundary must fail safe.
+    // This test used to assert the opposite (a panic) — that was exactly
+    // the #803 bug.
     let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
     state.epochs.reserves = Lovelace(10_000_000);
     state.epochs.treasury = Lovelace(5_000_000);
@@ -5000,24 +5453,31 @@ fn test_mir_compound_credential_and_pot_transfer() {
     assert_eq!(state.epochs.reserves, Lovelace(2_000_000));
     assert_eq!(state.certs.reward_accounts[&key], Lovelace(8_000_000));
 
-    // Now a 5M pot transfer with only 2M reserves: invalid per Haskell.
+    // Now a 5M pot transfer with only 2M reserves: insolvent.
     state.process_certificate(&Certificate::MoveInstantaneousRewards {
         source: MIRSource::Reserves,
         target: MIRTarget::OtherAccountingPot(5_000_000),
     });
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::state::certificates::apply_pending_mir(&mut state.certs, &mut state.epochs)
-    }));
-    assert!(
-        result.is_err(),
-        "apply_pending_mir must panic when delta exceeds source pot"
+    crate::state::certificates::apply_pending_mir(&mut state.certs, &mut state.epochs);
+
+    assert_eq!(
+        state.epochs.reserves,
+        Lovelace(2_000_000),
+        "NoMirTransfer: reserves must be left unchanged, not underflowed/panicked"
     );
+    assert_eq!(
+        state.epochs.treasury,
+        Lovelace(5_000_000),
+        "NoMirTransfer: treasury must be left unchanged"
+    );
+    assert_eq!(state.certs.pending_mir_delta_reserves, 0);
 }
 
 #[test]
 fn test_mir_pot_transfer_exceeds_source_treasury() {
     // Symmetric case for treasury → reserves pot transfer that exceeds
-    // available balance.
+    // available balance — NoMirTransfer, not a panic (issue #803; see
+    // comment on `test_mir_compound_credential_and_pot_transfer`).
     let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
     state.epochs.reserves = Lovelace(20_000_000);
     state.epochs.treasury = Lovelace(3_000_000);
@@ -5036,19 +5496,25 @@ fn test_mir_pot_transfer_exceeds_source_treasury() {
         source: MIRSource::Treasury,
         target: MIRTarget::OtherAccountingPot(10_000_000),
     });
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::state::certificates::apply_pending_mir(&mut state.certs, &mut state.epochs)
-    }));
-    assert!(
-        result.is_err(),
-        "apply_pending_mir must panic when treasury delta exceeds source pot"
+    crate::state::certificates::apply_pending_mir(&mut state.certs, &mut state.epochs);
+
+    assert_eq!(
+        state.epochs.reserves,
+        Lovelace(20_000_000),
+        "NoMirTransfer: reserves must be left unchanged"
     );
+    assert_eq!(
+        state.epochs.treasury,
+        Lovelace(1_000_000),
+        "NoMirTransfer: treasury must be left unchanged, not underflowed/panicked"
+    );
+    assert_eq!(state.certs.pending_mir_delta_treasury, 0);
 }
 
 #[test]
 fn test_mir_pot_transfer_zero_source() {
-    // Edge case: a pot transfer from an already-empty source pot is an
-    // invariant violation per Haskell and panics on apply.
+    // Edge case: a pot transfer from an already-empty source pot is
+    // insolvent — NoMirTransfer, not a panic (issue #803).
     let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
     state.epochs.reserves = Lovelace(0);
     state.epochs.treasury = Lovelace(5_000_000);
@@ -5057,13 +5523,19 @@ fn test_mir_pot_transfer_zero_source() {
         source: MIRSource::Reserves,
         target: MIRTarget::OtherAccountingPot(1_000_000),
     });
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::state::certificates::apply_pending_mir(&mut state.certs, &mut state.epochs)
-    }));
-    assert!(
-        result.is_err(),
-        "apply_pending_mir must panic on pot transfer from empty source"
+    crate::state::certificates::apply_pending_mir(&mut state.certs, &mut state.epochs);
+
+    assert_eq!(
+        state.epochs.reserves,
+        Lovelace(0),
+        "NoMirTransfer: reserves must be left unchanged, not panicked"
     );
+    assert_eq!(
+        state.epochs.treasury,
+        Lovelace(5_000_000),
+        "NoMirTransfer: treasury must be left unchanged"
+    );
+    assert_eq!(state.certs.pending_mir_delta_reserves, 0);
 }
 
 #[test]
@@ -6586,8 +7058,15 @@ fn test_reward_zero_reserves_no_expansion() {
     let reserves_before = state.epochs.reserves.0;
     let treasury_before = state.epochs.treasury.0;
 
-    // With zero reserves, expansion = floor(rho * 0) = 0
-    // Only fees are distributed
+    // With zero reserves, expansion = floor(rho * 0) = 0, so
+    // total_rewards_available = epoch_fees = 1_000_000. No pools ⇒
+    // total_active_stake == 0 branch: treasury_cut = floor(tau *
+    // total_rewards_available) = floor(0.2 * 1_000_000) = 200_000, and the
+    // remaining 800_000 (fees not claimed by treasury or any pool) is
+    // refunded to RESERVES per Haskell's signed `deltaR` — issue #796.
+    // Before #796 this was silently dropped (`saturating_sub` floored the
+    // credit to 0), which is what this test used to (incorrectly) pin as
+    // "reserves should not change".
     let snapshot = StakeSnapshot {
         epoch: EpochNo(1),
         delegations: Arc::new(std::collections::HashMap::new()),
@@ -6601,13 +7080,15 @@ fn test_reward_zero_reserves_no_expansion() {
     state.calculate_and_distribute_rewards(snapshot);
 
     assert_eq!(
-        state.epochs.reserves.0, reserves_before,
-        "Reserves should not change when already at 0"
+        state.epochs.reserves.0,
+        reserves_before + 800_000,
+        "Reserves must be CREDITED with the undistributed fee remainder \
+         (fees - treasury_cut) when reserves start at 0 and no pools exist (#796)"
     );
-    // treasury gets tau * fees + undistributed
-    assert!(
-        state.epochs.treasury.0 >= treasury_before,
-        "Treasury should increase from fees"
+    assert_eq!(
+        state.epochs.treasury.0,
+        treasury_before + 200_000,
+        "Treasury should increase by exactly treasury_cut = floor(tau * fees)"
     );
 }
 
@@ -12707,6 +13188,7 @@ fn test_epoch_transition_marks_inactive_drep() {
                 yes_votes: 0,
                 no_votes: 0,
                 abstain_votes: 0,
+                submission_index: 0,
             },
         );
     }
@@ -12955,11 +13437,11 @@ fn test_reward_cross_validation_epoch_1239() {
     //   distributed=0, undistributed=reward_pot.
     // #615b: Haskell refunds undistributed to reserves via deltaR. Therefore:
     //   delta_treasury = treasury_cut
-    //   delta_reserves = treasury_cut - epoch_fees (unsigned subtract from reserves)
+    //   delta_reserves = treasury_cut - epoch_fees (signed; #796)
     let rupd = state.calculate_rewards(&go_snapshot);
 
     let expected_delta_treasury = expected_treasury_cut;
-    let expected_delta_reserves = expected_treasury_cut - FEES_1239;
+    let expected_delta_reserves: i128 = expected_treasury_cut as i128 - FEES_1239 as i128;
     assert_eq!(
         rupd.delta_treasury, expected_delta_treasury,
         "delta_treasury (no-pool, #615b) must equal treasury_cut: \
@@ -14402,7 +14884,11 @@ fn test_treasury_withdrawal_via_governance_reduces_treasury() {
     state.epochs.treasury = Lovelace(10_000_000_000); // 10B lovelace
     state.epochs.needs_stake_rebuild = false;
 
-    // Set CC threshold to 0 so CC auto-approves
+    // Set CC threshold to 0 so CC auto-approves.
+    // #800: a 0-threshold committee only auto-passes when `active_size >=
+    // committee_min_size` (or during bootstrap); this test has no CC members
+    // at all, so zero `committee_min_size` too (mirrors `gov_test_state`).
+    state.epochs.protocol_params.committee_min_size = 0;
     Arc::make_mut(&mut state.gov.governance).committee_threshold = Some(Rational {
         numerator: 0,
         denominator: 1,
@@ -16646,4 +17132,690 @@ fn test_from_haskell_snapshot_backfills_snapshot_pool_owners_issue_668() {
             "{name}: metadata must be backfilled"
         );
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Regression tests for #781 / #782 / #783 — LedgerSeq rollback correctness
+//
+// All of these exercise the REAL end-to-end path: `apply_block_with_delta`
+// builds the delta from a genuine block application, `LedgerSeq::push`
+// stores it, and `LedgerState::rollback_via_seq` reconstructs the rolled-back
+// state from anchor + remaining deltas. This matters because the #783 bug in
+// particular lived in the SNAPSHOT-CAPTURE decision inside
+// `apply_block_with_delta_impl` (state/apply.rs) — a test that manually
+// constructs `LedgerDelta` values (bypassing that capture logic) would not
+// exercise the regression at all.
+// ═══════════════════════════════════════════════════════════════════════════
+
+use crate::ledger_seq::LedgerSeq;
+
+/// Build a block containing a single transaction with the given certificates
+/// and no inputs/outputs — enough to drive certificate-only state changes
+/// (pool registration/retirement) through the real `apply_block_with_delta`
+/// path. Mirrors `make_pool_registration_block`'s boilerplate, generalized to
+/// an arbitrary certificate list.
+fn make_certs_block(slot: u64, block_no: u64, prev_hash: Hash32, certs: Vec<Certificate>) -> Block {
+    let tx_hash = {
+        let mut bytes = [0u8; 32];
+        let counter = UTXO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        bytes[..8].copy_from_slice(&counter.to_be_bytes());
+        Hash32::from_bytes(bytes)
+    };
+    let tx = Transaction {
+        era: dugite_primitives::era::Era::Conway,
+        hash: tx_hash,
+        body: TransactionBody {
+            inputs: vec![],
+            outputs: vec![],
+            fee: Lovelace(0),
+            ttl: None,
+            certificates: certs,
+            withdrawals: BTreeMap::new(),
+            auxiliary_data_hash: None,
+            validity_interval_start: None,
+            mint: BTreeMap::new(),
+            script_data_hash: None,
+            collateral: vec![],
+            required_signers: vec![],
+            network_id: None,
+            collateral_return: None,
+            total_collateral: None,
+            reference_inputs: vec![],
+            update: None,
+            voting_procedures: BTreeMap::new(),
+            proposal_procedures: vec![],
+            treasury_value: None,
+            donation: None,
+            sub_transactions: vec![],
+            account_balance_intervals: vec![],
+            direct_deposits: ::std::collections::BTreeMap::new(),
+            guards: Vec::new(),
+        },
+        witness_set: TransactionWitnessSet {
+            vkey_witnesses: vec![],
+            native_scripts: vec![],
+            bootstrap_witnesses: vec![],
+            plutus_v1_scripts: vec![],
+            plutus_v2_scripts: vec![],
+            plutus_v3_scripts: vec![],
+            plutus_data: vec![],
+            redeemers: vec![],
+            raw_redeemers_cbor: None,
+            raw_plutus_data_cbor: None,
+            original_script_data_hash: None,
+        },
+        is_valid: true,
+        auxiliary_data: None,
+        raw_cbor: None,
+        raw_body_cbor: None,
+        raw_witness_cbor: None,
+    };
+    make_test_block(slot, block_no, prev_hash, vec![tx])
+}
+
+/// Minimal `PoolParams` for the given pool id — pledge/cost/margin are
+/// arbitrary but valid; tests override `pledge` where distinguishing
+/// re-registrations from each other matters.
+fn make_pool_params(pool_id: Hash28) -> PoolParams {
+    PoolParams {
+        operator: pool_id,
+        vrf_keyhash: Hash32::ZERO,
+        pledge: Lovelace(1_000_000_000),
+        cost: Lovelace(340_000_000),
+        margin: Rational {
+            numerator: 1,
+            denominator: 100,
+        },
+        reward_account: vec![0xe0u8; 29],
+        pool_owners: vec![],
+        relays: vec![],
+        pool_metadata: None,
+    }
+}
+
+/// #781: an output created by tx1 and spent by tx2 IN THE SAME BLOCK must not
+/// be resurrected by a rollback of that block. `UtxoDiff::merge` appends (no
+/// cancellation), so the block-level diff carries the txout in BOTH
+/// `inserts` (tx1's create) and `deletes` (tx2's spend) — `rollback_via_seq`
+/// must invert deletes-before-inserts (re-insert then remove) so the
+/// create-then-spend-in-block output ends up absent, not resurrected.
+#[test]
+fn rollback_does_not_resurrect_intra_block_create_then_spend_output() {
+    let params = ProtocolParameters::mainnet_defaults();
+    let mut state = LedgerState::new(params);
+
+    // Seed a genesis UTxO so tx1 has something to spend.
+    let genesis_input = TransactionInput {
+        transaction_id: Hash32::from_bytes([0xE0u8; 32]),
+        index: 0,
+    };
+    state
+        .utxo
+        .utxo_set
+        .insert(genesis_input.clone(), make_lovelace_output(10_000_000));
+
+    // Anchor the seq at the post-genesis-seed, pre-block state.
+    let mut seq = LedgerSeq::with_defaults(state.clone_without_utxos(), 100);
+
+    // tx1: spends genesis, creates X.
+    let x_input = TransactionInput {
+        transaction_id: Hash32::from_bytes([1u8; 32]),
+        index: 0,
+    };
+    let tx1 = make_simple_tx(
+        1,
+        vec![genesis_input.clone()],
+        vec![make_lovelace_output(9_800_000)],
+    );
+    // tx2: spends X, creates Y — the create+spend chain within ONE block.
+    let y_input = TransactionInput {
+        transaction_id: Hash32::from_bytes([2u8; 32]),
+        index: 0,
+    };
+    let tx2 = make_simple_tx(
+        2,
+        vec![x_input.clone()],
+        vec![make_lovelace_output(9_600_000)],
+    );
+
+    let block = make_test_block(1, 1, Hash32::ZERO, vec![tx1, tx2]);
+    let delta = state
+        .apply_block_with_delta(&block, BlockValidationMode::ApplyOnly)
+        .expect("block should apply");
+
+    // Sanity: confirm the exact overlap #781 is about — X appears in BOTH
+    // inserts (tx1) and deletes (tx2) of the merged block-level diff.
+    assert!(
+        delta.utxo_diff.inserts.iter().any(|(i, _)| *i == x_input),
+        "X must appear in inserts (created by tx1)"
+    );
+    assert!(
+        delta.utxo_diff.deletes.iter().any(|(i, _)| *i == x_input),
+        "X must appear in deletes (spent by tx2) — the create+spend overlap"
+    );
+
+    seq.push(delta);
+
+    // Live state after the block: X spent (consumed by tx2), Y present.
+    assert!(!state.utxo.utxo_set.contains(&x_input));
+    assert!(state.utxo.utxo_set.contains(&y_input));
+
+    // Roll back the entire block.
+    let n = state
+        .rollback_via_seq(&mut seq, &Point::Origin)
+        .expect("origin is the anchor");
+    assert_eq!(n, 1);
+
+    assert!(
+        !state.utxo.utxo_set.contains(&x_input),
+        "X was created and spent within the same block — it must not be \
+         resurrected by rollback (#781)"
+    );
+    assert!(
+        state.utxo.utxo_set.contains(&genesis_input),
+        "genesis UTxO must be restored by rollback"
+    );
+    assert!(
+        !state.utxo.utxo_set.contains(&y_input),
+        "Y must be gone after rolling back the block that created it"
+    );
+    assert_eq!(
+        state.utxo.utxo_set.len(),
+        1,
+        "only the restored genesis UTxO should remain"
+    );
+}
+
+/// #783(a): overwriting a pool's pending-retirement epoch (same pool,
+/// different epoch) leaves `pending_retirements.len()` unchanged. A rollback
+/// of a LATER block forces `apply_delta_to_state` to replay the overwriting
+/// delta — pre-#783 the len-based change check produced no snapshot for it,
+/// so reconstruction silently kept the stale pre-overwrite epoch.
+#[test]
+fn rollback_reconstructs_pool_retirement_epoch_overwrite() {
+    let params = ProtocolParameters::mainnet_defaults();
+    let mut state = LedgerState::new(params);
+    let pool_id = Hash28::from_bytes([0x31u8; 28]);
+
+    let mut seq = LedgerSeq::with_defaults(state.clone_without_utxos(), 100);
+
+    // Block 0: register the pool.
+    let b0 = make_certs_block(
+        1,
+        1,
+        Hash32::ZERO,
+        vec![Certificate::PoolRegistration(make_pool_params(pool_id))],
+    );
+    let d0 = state
+        .apply_block_with_delta(&b0, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d0);
+
+    // Block 1: retire at epoch 20.
+    let b1 = make_certs_block(
+        2,
+        2,
+        *b0.hash(),
+        vec![Certificate::PoolRetirement {
+            pool_hash: pool_id,
+            epoch: 20,
+        }],
+    );
+    let d1 = state
+        .apply_block_with_delta(&b1, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d1);
+    assert_eq!(
+        state.certs.pending_retirements.get(&pool_id),
+        Some(&EpochNo(20))
+    );
+
+    // Block 2: OVERWRITE — retire at epoch 25 instead. Same map length (1
+    // entry) before and after, only the content changed.
+    let b2 = make_certs_block(
+        3,
+        3,
+        *b1.hash(),
+        vec![Certificate::PoolRetirement {
+            pool_hash: pool_id,
+            epoch: 25,
+        }],
+    );
+    let d2 = state
+        .apply_block_with_delta(&b2, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d2);
+    assert_eq!(
+        state.certs.pending_retirements.get(&pool_id),
+        Some(&EpochNo(25))
+    );
+
+    // Block 3: no-op — rolling IT back forces reconstruction to replay
+    // delta2 via `state_at_index`, exactly where the pre-#783 bug surfaced.
+    let b3 = make_empty_block(4, 4, *b2.hash());
+    let d3 = state
+        .apply_block_with_delta(&b3, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d3);
+
+    let n = state
+        .rollback_via_seq(&mut seq, &Point::Specific(SlotNo(3), *b2.hash()))
+        .expect("b2 point is in the volatile window");
+    assert_eq!(n, 1);
+
+    assert_eq!(
+        state.certs.pending_retirements.get(&pool_id),
+        Some(&EpochNo(25)),
+        "reconstructed pending_retirements must reflect the epoch OVERWRITE \
+         (25), not the stale pre-overwrite value (20) — #783"
+    );
+}
+
+/// #806 DEFECT A: `save_ledger_snapshot` (dugite-node) clears `utxo.diff_seq`
+/// to reclaim memory (diffs are `#[serde(skip)]`, not persisted) but does
+/// NOT clear the `LedgerSeq`. If a rollback target then lands further back
+/// than the diffs retained since that clear, `diff_seq.len() < n` — reverse
+/// applying only `diff_seq.len()` UTxO diffs while restoring non-UTxO state
+/// `n` blocks back would silently desync the UTxO set from the rest of
+/// ledger state. `rollback_via_seq` must detect this BEFORE mutating
+/// anything and return `None` so the caller falls back to snapshot reload,
+/// rather than performing a partial, corrupting rollback.
+#[test]
+fn rollback_via_seq_detects_diff_seq_desync_and_bails_out() {
+    let params = ProtocolParameters::mainnet_defaults();
+    let mut state = LedgerState::new(params);
+
+    let genesis_input = TransactionInput {
+        transaction_id: Hash32::from_bytes([0xF0u8; 32]),
+        index: 0,
+    };
+    state
+        .utxo
+        .utxo_set
+        .insert(genesis_input.clone(), make_lovelace_output(10_000_000));
+
+    let mut seq = LedgerSeq::with_defaults(state.clone_without_utxos(), 100);
+
+    // Block 0: spend genesis, create X.
+    let x_input = TransactionInput {
+        transaction_id: Hash32::from_bytes([1u8; 32]),
+        index: 0,
+    };
+    let b0 = make_test_block(
+        1,
+        1,
+        Hash32::ZERO,
+        vec![make_simple_tx(
+            1,
+            vec![genesis_input.clone()],
+            vec![make_lovelace_output(9_800_000)],
+        )],
+    );
+    let d0 = state
+        .apply_block_with_delta(&b0, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d0);
+
+    // Block 1: spend X, create Y.
+    let y_input = TransactionInput {
+        transaction_id: Hash32::from_bytes([2u8; 32]),
+        index: 0,
+    };
+    let b1 = make_test_block(
+        2,
+        2,
+        *b0.hash(),
+        vec![make_simple_tx(
+            2,
+            vec![x_input.clone()],
+            vec![make_lovelace_output(9_600_000)],
+        )],
+    );
+    let d1 = state
+        .apply_block_with_delta(&b1, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d1);
+
+    assert_eq!(seq.len(), 2, "both block deltas are in the volatile window");
+    assert_eq!(
+        state.utxo.diff_seq.len(),
+        2,
+        "diff_seq mirrors the seq before any snapshot clear"
+    );
+
+    // Simulate `save_ledger_snapshot`'s `ls.utxo.diff_seq.clear()` — the
+    // LedgerSeq is untouched, reproducing the desync.
+    state.utxo.diff_seq.clear();
+
+    let utxo_len_before = state.utxo.utxo_set.len();
+
+    // Roll back both blocks (to Origin). `seq` can satisfy this (n=2), but
+    // `diff_seq` was just cleared (len=0) — the guard must fire.
+    let result = state.rollback_via_seq(&mut seq, &Point::Origin);
+    assert!(
+        result.is_none(),
+        "diff_seq (len=0) cannot cover a 2-block rollback; must bail out to \
+         the snapshot-reload slow path instead of desyncing UTxO vs non-UTxO state"
+    );
+
+    // No partial mutation: `seq` must still hold both deltas and the UTxO
+    // set must be exactly what it was before the aborted rollback attempt.
+    assert_eq!(
+        seq.len(),
+        2,
+        "seq must be untouched — the guard fires before any `seq.rollback` call"
+    );
+    assert_eq!(
+        state.utxo.utxo_set.len(),
+        utxo_len_before,
+        "utxo_set must be untouched by the aborted rollback"
+    );
+    assert!(state.utxo.utxo_set.contains(&y_input));
+    assert!(!state.utxo.utxo_set.contains(&genesis_input));
+}
+
+/// #783(b): a pool that is re-registered TWICE (double re-registration)
+/// leaves `future_pool_params.len()` unchanged between the two
+/// re-registrations. Same reconstruction-forcing shape as (a), but exercises
+/// `future_pool_params` instead of `pending_retirements`.
+#[test]
+fn rollback_reconstructs_pool_future_params_double_reregistration() {
+    let params = ProtocolParameters::mainnet_defaults();
+    let mut state = LedgerState::new(params);
+    let pool_id = Hash28::from_bytes([0x32u8; 28]);
+
+    let mut seq = LedgerSeq::with_defaults(state.clone_without_utxos(), 100);
+
+    // Block 0: first-time registration (goes straight to pool_params).
+    let b0 = make_certs_block(
+        1,
+        1,
+        Hash32::ZERO,
+        vec![Certificate::PoolRegistration(make_pool_params(pool_id))],
+    );
+    let d0 = state
+        .apply_block_with_delta(&b0, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d0);
+
+    // Block 1: re-register with pledge A (queued in future_pool_params).
+    let mut params_a = make_pool_params(pool_id);
+    params_a.pledge = Lovelace(111_000_000);
+    let b1 = make_certs_block(
+        2,
+        2,
+        *b0.hash(),
+        vec![Certificate::PoolRegistration(params_a)],
+    );
+    let d1 = state
+        .apply_block_with_delta(&b1, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d1);
+    assert_eq!(
+        state.certs.future_pool_params[&pool_id].pledge.0,
+        111_000_000
+    );
+
+    // Block 2: re-register AGAIN with pledge B — same map length (1 entry),
+    // fully different content (double re-registration overwrite).
+    let mut params_b = make_pool_params(pool_id);
+    params_b.pledge = Lovelace(222_000_000);
+    let b2 = make_certs_block(
+        3,
+        3,
+        *b1.hash(),
+        vec![Certificate::PoolRegistration(params_b)],
+    );
+    let d2 = state
+        .apply_block_with_delta(&b2, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d2);
+    assert_eq!(
+        state.certs.future_pool_params[&pool_id].pledge.0,
+        222_000_000
+    );
+
+    // Block 3: no-op — rolling it back forces reconstruction to replay
+    // delta2.
+    let b3 = make_empty_block(4, 4, *b2.hash());
+    let d3 = state
+        .apply_block_with_delta(&b3, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d3);
+
+    let n = state
+        .rollback_via_seq(&mut seq, &Point::Specific(SlotNo(3), *b2.hash()))
+        .expect("b2 point is in the volatile window");
+    assert_eq!(n, 1);
+
+    assert_eq!(
+        state.certs.future_pool_params[&pool_id].pledge.0, 222_000_000,
+        "reconstructed future_pool_params must reflect the SECOND \
+         re-registration's pledge (222M), not the stale first one (111M) — #783"
+    );
+}
+
+/// #783(c): a single block that both ADDS a new pending retirement (pool D)
+/// AND REMOVES an existing one (pool B, cancelled by re-registering it),
+/// where B is ALREADY staged in `future_pool_params` from an earlier block
+/// so the re-registration OVERWRITES that entry in place. This is
+/// deliberately constructed so that ALL THREE pre-#783 length/pointer
+/// signals stay unchanged across the compensating block:
+///   - `pool_params` Arc pointer: unchanged (no first-time registration).
+///   - `future_pool_params.len()`: unchanged (1 -> 1, B's entry overwritten).
+///   - `pending_retirements.len()`: unchanged (1 -> 1, B removed / D added).
+///
+/// yet BOTH maps' CONTENT genuinely changed — exactly the blind spot the
+/// pre-#783 `.len()`-based check could not see.
+#[test]
+fn rollback_reconstructs_pending_retirements_compensating_add_remove() {
+    let params = ProtocolParameters::mainnet_defaults();
+    let mut state = LedgerState::new(params);
+    let pool_b = Hash28::from_bytes([0x41u8; 28]);
+    let pool_d = Hash28::from_bytes([0x43u8; 28]);
+
+    let mut seq = LedgerSeq::with_defaults(state.clone_without_utxos(), 100);
+
+    // Block 0: register B and D (first-time, straight to pool_params).
+    let b0 = make_certs_block(
+        1,
+        1,
+        Hash32::ZERO,
+        vec![
+            Certificate::PoolRegistration(make_pool_params(pool_b)),
+            Certificate::PoolRegistration(make_pool_params(pool_d)),
+        ],
+    );
+    let d0 = state
+        .apply_block_with_delta(&b0, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d0);
+
+    // Block 1: stage B's re-registration (future_pool_params = {B: v1}) AND
+    // schedule B's retirement (pending_retirements = {B: 5}). Both maps can
+    // independently hold an entry for the same pool.
+    let mut params_b_v1 = make_pool_params(pool_b);
+    params_b_v1.pledge = Lovelace(111_000_000);
+    let b1 = make_certs_block(
+        2,
+        2,
+        *b0.hash(),
+        vec![
+            Certificate::PoolRegistration(params_b_v1),
+            Certificate::PoolRetirement {
+                pool_hash: pool_b,
+                epoch: 5,
+            },
+        ],
+    );
+    let d1 = state
+        .apply_block_with_delta(&b1, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d1);
+    assert_eq!(state.certs.future_pool_params.len(), 1);
+    assert_eq!(state.certs.pending_retirements.len(), 1);
+    assert_eq!(
+        state.certs.pending_retirements.get(&pool_b),
+        Some(&EpochNo(5))
+    );
+
+    // Block 2 (the compensating block): re-register B again (OVERWRITES its
+    // EXISTING future_pool_params entry — length stays 1 — and CANCELS B's
+    // pending retirement) + retire D for the first time (ADD to
+    // pending_retirements). Net: future_pool_params {B:v1} -> {B:v2} (len
+    // 1->1, content changed); pending_retirements {B:5} -> {D:8} (len 1->1,
+    // content fully replaced). `pool_params` Arc pointer is untouched (no
+    // first-time registration this block).
+    let mut params_b_v2 = make_pool_params(pool_b);
+    params_b_v2.pledge = Lovelace(222_000_000);
+    let b2 = make_certs_block(
+        3,
+        3,
+        *b1.hash(),
+        vec![
+            Certificate::PoolRegistration(params_b_v2),
+            Certificate::PoolRetirement {
+                pool_hash: pool_d,
+                epoch: 8,
+            },
+        ],
+    );
+    let d2 = state
+        .apply_block_with_delta(&b2, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d2);
+    assert_eq!(state.certs.future_pool_params.len(), 1);
+    assert_eq!(state.certs.pending_retirements.len(), 1);
+    assert_eq!(
+        state.certs.future_pool_params[&pool_b].pledge.0,
+        222_000_000
+    );
+    assert_eq!(
+        state.certs.pending_retirements.get(&pool_d),
+        Some(&EpochNo(8))
+    );
+    assert!(!state.certs.pending_retirements.contains_key(&pool_b));
+
+    // Block 3: no-op — rolling it back forces reconstruction to replay
+    // delta2.
+    let b3 = make_empty_block(4, 4, *b2.hash());
+    let d3 = state
+        .apply_block_with_delta(&b3, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d3);
+
+    let n = state
+        .rollback_via_seq(&mut seq, &Point::Specific(SlotNo(3), *b2.hash()))
+        .expect("b2 point is in the volatile window");
+    assert_eq!(n, 1);
+
+    assert_eq!(
+        state.certs.future_pool_params.len(),
+        1,
+        "reconstructed future_pool_params must have exactly 1 entry"
+    );
+    assert_eq!(
+        state.certs.future_pool_params[&pool_b].pledge.0, 222_000_000,
+        "reconstructed future_pool_params must show B's SECOND \
+         re-registration (222M), not the stale first one (111M) — #783"
+    );
+    assert_eq!(
+        state.certs.pending_retirements.len(),
+        1,
+        "reconstructed pending_retirements must have exactly 1 entry"
+    );
+    assert_eq!(
+        state.certs.pending_retirements.get(&pool_d),
+        Some(&EpochNo(8)),
+        "reconstructed pending_retirements must show D's new retirement (8) — #783"
+    );
+    assert!(
+        !state.certs.pending_retirements.contains_key(&pool_b),
+        "reconstructed pending_retirements must NOT show B (cancelled by \
+         re-registration in the same compensating block) — #783"
+    );
+}
+
+/// #782: `utxo.pending_donations` had NO delta representation at all prior to
+/// this issue (despite a doc comment on `rollback_via_seq` claiming
+/// otherwise). A rollback of a block AFTER the donation-bearing one must
+/// still reflect the donation, not regress to the pre-donation anchor value.
+#[test]
+fn rollback_restores_pending_donations_not_stale_anchor() {
+    let params = ProtocolParameters::mainnet_defaults();
+    let mut state = LedgerState::new(params);
+
+    let mut seq = LedgerSeq::with_defaults(state.clone_without_utxos(), 100);
+
+    // Block 0: a Conway donation-bearing tx accumulates pending_donations.
+    let mut tx = make_simple_tx(1, vec![], vec![]);
+    tx.body.donation = Some(Lovelace(5_000_000));
+    let b0 = make_test_block(1, 1, Hash32::ZERO, vec![tx]);
+    let d0 = state
+        .apply_block_with_delta(&b0, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d0);
+    assert_eq!(state.utxo.pending_donations.0, 5_000_000);
+
+    // Block 1: no-op.
+    let b1 = make_empty_block(2, 2, *b0.hash());
+    let d1 = state
+        .apply_block_with_delta(&b1, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d1);
+
+    // Roll back block 1 only — reconstruction must replay delta0's donation.
+    let n = state
+        .rollback_via_seq(&mut seq, &Point::Specific(SlotNo(1), *b0.hash()))
+        .expect("b0 point is in the volatile window");
+    assert_eq!(n, 1);
+
+    assert_eq!(
+        state.utxo.pending_donations.0, 5_000_000,
+        "pending_donations must survive a rollback of a LATER block, not \
+         regress to the pre-donation anchor value of 0 — #782"
+    );
+}
+
+/// #782: `LedgerState.era` had NO delta representation at all prior to this
+/// issue. A rollback across an era-transitioning block must not regress
+/// `era` back to the anchor's frozen (pre-transition) value — doing so would
+/// cause the next block applied to RE-RUN `on_era_transition` (re-zeroing
+/// `pending_donations`, re-seeding Conway DReps/committee, etc).
+#[test]
+fn rollback_does_not_regress_era_across_block() {
+    let params = ProtocolParameters::mainnet_defaults();
+    let mut state = LedgerState::new(params);
+    // Freeze the anchor at Byron; `apply_block_impl` Step 10 unconditionally
+    // sets `self.era = block.era`, so applying a Conway-tagged block below
+    // simulates an era transition without needing the full HFC machinery.
+    state.era = Era::Byron;
+
+    let mut seq = LedgerSeq::with_defaults(state.clone_without_utxos(), 100);
+
+    let b0 = make_empty_block(1, 1, Hash32::ZERO);
+    let d0 = state
+        .apply_block_with_delta(&b0, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d0);
+    assert_eq!(state.era, Era::Conway);
+
+    // Block 1: no-op, rolled back below.
+    let b1 = make_empty_block(2, 2, *b0.hash());
+    let d1 = state
+        .apply_block_with_delta(&b1, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d1);
+
+    let n = state
+        .rollback_via_seq(&mut seq, &Point::Specific(SlotNo(1), *b0.hash()))
+        .expect("b0 point is in the volatile window");
+    assert_eq!(n, 1);
+
+    assert_eq!(
+        state.era,
+        Era::Conway,
+        "era must reflect block0's era transition (Conway), not regress to \
+         the anchor's frozen Byron value — #782"
+    );
 }

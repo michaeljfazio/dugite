@@ -18,11 +18,15 @@
 //!     the cost model and aborts the moment either dimension goes
 //!     negative — *before* taking the step's allocations, not after.
 //!
-//! Defensive bound: a hard `MAX_KONTINUATION_DEPTH` cap on the
-//! continuation stack protects against pathological terms that spawn
-//! exponentially-deep frame stacks without consuming proportional CPU
-//! budget (a Cardano-specific DoS concern noted in the original Plutus
-//! tech report).
+//! The continuation stack (`Kont`) has no depth cap: it is a
+//! heap-allocated `Vec<Frame>`, not OS call-stack recursion, so it
+//! cannot overflow the native stack. Its growth is bounded purely by
+//! `ExBudget` exhaustion — exactly like Haskell's `Context`
+//! (`UntypedPlutusCore.Evaluation.Machine.Cek.Internal`), which has no
+//! depth field at all. An earlier hard `MAX_KONTINUATION_DEPTH` cap was
+//! removed (#817): it rejected budget-valid, non-tail-recursive scripts
+//! that cardano-node accepts, which is a live consensus-fork risk, not
+//! a DoS mitigation Haskell itself relies on.
 
 pub mod context;
 pub mod cost;
@@ -32,10 +36,6 @@ pub mod value;
 
 pub use self::step::{evaluate, State};
 pub use self::value::Value;
-
-/// Cap on the continuation-stack depth. Mainnet scripts never reach
-/// anywhere close to this; the limit is purely a DoS guard.
-pub const MAX_KONTINUATION_DEPTH: usize = 4 * 1024;
 
 /// `(cpu, mem)` units, mirroring the Haskell `ExBudget` record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -48,15 +48,36 @@ impl ExBudget {
     /// Subtract `other` from `self` in place. Returns `false` if either
     /// dimension would go negative (caller treats this as
     /// budget-exhaustion).
+    ///
+    /// Uses saturating subtraction (#829) to mirror Haskell's
+    /// `CostingInteger = SatInt` (`minusSI` saturates to
+    /// `minBound`/`maxBound :: Int64` rather than wrapping or panicking).
+    /// This also covers the pathological `cost == i64::MIN` case a plain
+    /// `-` would overflow on. On failure, `self` is left unmutated — the
+    /// caller may want to retry with a different budget or surface a
+    /// `BudgetExhausted` error using the pre-attempt remaining.
     pub fn try_subtract(&mut self, other: ExBudget) -> bool {
-        let new_cpu = self.cpu - other.cpu;
-        let new_mem = self.mem - other.mem;
+        let new_cpu = self.cpu.saturating_sub(other.cpu);
+        let new_mem = self.mem.saturating_sub(other.mem);
         if new_cpu < 0 || new_mem < 0 {
             return false;
         }
         self.cpu = new_cpu;
         self.mem = new_mem;
         true
+    }
+
+    /// Subtract `other` unconditionally, allowing either dimension to go
+    /// negative (saturating at `i64::MIN`, never wrapping/panicking).
+    /// Mirrors Haskell's unconditional `SatInt` subtraction for the CEK
+    /// machine's startup cost (`cekStartupCost`): the shortfall is
+    /// detected as an ordinary comparison on the NEXT [`try_subtract`]
+    /// call, not by this call itself returning a "don't mutate" failure
+    /// like `try_subtract` does. Used only at machine boot, before any
+    /// step has charged anything (#844).
+    pub fn subtract_saturating(&mut self, other: ExBudget) {
+        self.cpu = self.cpu.saturating_sub(other.cpu);
+        self.mem = self.mem.saturating_sub(other.mem);
     }
 }
 

@@ -412,18 +412,21 @@ impl<'a> Parser<'a> {
                 Ok(Constant::Bls12_381G2Element(Box::new(arr)))
             }
             TypeTag::Bls12_381MlResult => {
-                // No textual literal exists in the conformance corpus;
-                // accept the same `0x...` form for symmetry.
-                let bytes = self.parse_0x_hex_bytes()?;
-                if bytes.len() != 576 {
-                    return Err(ParseError::at(
-                        self.pos,
-                        format!("BLS12-381 ML result must be 576 bytes, got {}", bytes.len()),
-                    ));
-                }
-                let mut arr = [0u8; 576];
-                arr.copy_from_slice(&bytes);
-                Ok(Constant::Bls12_381MlResult(Box::new(arr)))
+                // The Haskell reference has no textual literal syntax for
+                // `BLS12_381.Pairing.MlResult` (no `Parsable`/`Read`
+                // instance in `Pairing.hs`) — an `MlResult` can only ever
+                // be produced at runtime via `bls12_381_millerLoop` /
+                // `bls12_381_mulMlResult`. Accepting a `0x...` literal
+                // here would let a hand-written script inject 576
+                // unvalidated bytes directly into `blst_fp12` arithmetic
+                // (limbs `>= p` are possible) — reject to match the
+                // reference parser (#843). This is textual-only: the
+                // flat/CBOR on-chain path already rejects BLS constant
+                // literals outright (see `flat/term.rs`).
+                Err(ParseError::at(
+                    self.pos,
+                    "bls12_381_mlresult has no literal syntax".to_string(),
+                ))
             }
             TypeTag::Array(elem) => {
                 // `(array T)` literal uses the same `[e1, e2, ...]`

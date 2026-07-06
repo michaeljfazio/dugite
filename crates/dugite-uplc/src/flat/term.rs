@@ -53,6 +53,7 @@
 use super::bits::{BitReader, BitWriter};
 use super::{FlatResult, FLAT_MAX_DEPTH};
 use crate::data::Data;
+use crate::redeemer_resolve::ScriptLanguage;
 use crate::term::{BuiltinId, Constant, Term, TypeTag};
 
 use crate::UplcError;
@@ -70,6 +71,22 @@ const BUILTIN_TAG_WIDTH: u8 = 7;
 
 /// Width of an atomic universe-tag, in bits.
 const CONST_TAG_WIDTH: u8 = 4;
+
+/// PLC core version at which `Constr`/`Case` term syntax was introduced.
+/// Mirrors Haskell `plcVersion110`, which gates `decodeTerm`'s tag-8/9
+/// handlers: `unless (version >= plcVersion110) $ fail "'constr' is not
+/// allowed before version 1.1.0"` (`UntypedPlutusCore/Core/Instance/Flat.hs`).
+const PLC_VERSION_1_1_0: (u64, u64, u64) = (1, 1, 0);
+
+/// First protocol version at which `maxBoundsByPV` bounds a `Constr` tag
+/// (and the constant-universe header) — mirrors `vanRossemPV` in
+/// `PlutusLedgerApi.Common.ProtocolVersions`. Below this PV, Haskell's
+/// `MaxBounds` is unbounded (`maxBound :: Word64`-equivalent).
+const CONSTR_TAG_BOUND_PV: u32 = 11;
+
+/// Cap on a `Constr` tag once `maxBoundsByPV` is active (PV >= 11). Mirrors
+/// `MaxBounds { mbConstr = 1024 }` (`PlutusLedgerApi.Common.Versions`).
+const MAX_CONSTR_TAG: u64 = 1024;
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -99,6 +116,157 @@ pub fn encode_constant(w: &mut BitWriter, c: &Constant) -> FlatResult<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Availability / version validation (issue #821)
+// ---------------------------------------------------------------------------
+//
+// Haskell enforces builtin-availability, the `constr`/`case` PLC-1.1.0
+// syntax gate, and the `Constr` tag bound at *deserialisation* time, as
+// part of the flat decode itself (`scriptCBORDecoder`'s `decodeProgram
+// checkConstant checkBuiltin checkConstr`, `UntypedPlutusCore/Core/
+// Instance/Flat.hs`) — an ill-formed script never reaches evaluation
+// (phase-1 failure).
+//
+// dugite's `decode_term`/`Program::from_flat` above are a **pure function
+// of the script bytes only** — they know nothing about which ledger
+// language or protocol version the script is being evaluated under — and
+// the decoded `Program` is memoized by raw bytes in
+// `crate::eval_redeemer::SCRIPT_DECODE_CACHE`. Folding a (language,
+// major_pv)-dependent accept/reject decision into that decode (or its
+// cache) would be wrong: byte-identical flat bytes can be well-formed
+// under one (language, pv) and ill-formed under another (e.g. a script
+// referencing `bls12_381_G1_add` decodes to the same `Term` tree
+// regardless of context, but is only *available* to a PlutusV1 script
+// from protocol version 11 onward). So this validation runs as a
+// SEPARATE pass over the already-decoded term tree, unconditionally,
+// every time a `Program` — cache hit or not — is about to be evaluated.
+// See `crate::eval_redeemer::eval_resolved_redeemer`, the call site.
+//
+// A single generic `UplcError::FlatDecode` covers all three sub-gates,
+// matching Haskell's own granularity: builtin-unavailability, constr-tag-
+// bound, and the constant-universe-header bound (not yet wired) all
+// surface as the same generic `CBORDeserialiseError (OtherReason msg)`
+// there too — only ledger-language-unavailability gets a typed
+// constructor (`LedgerLanguageNotAvailableError`), which this crate has
+// no need to distinguish from the rest given `PhaseTwoError::
+// ScriptEvaluationFailed` is itself a single opaque variant.
+
+/// Validate a decoded program's term tree against the availability rules
+/// for `(language, major_pv)`. Call this once per evaluation attempt,
+/// after `decode_script_bytes` returns — regardless of whether the
+/// `Program` came from the decode cache or was freshly decoded (see the
+/// module-level note above for why this cannot be folded into the cache).
+///
+/// Checks (in Haskell terms):
+/// 1. Every `Builtin` reference is available for `(language, major_pv)`
+///    (`builtinsAvailableIn`, see [`BuiltinId::is_available_in`]).
+/// 2. `Constr`/`Case` term nodes require the program's declared version to
+///    be `>= 1.1.0` (`decodeTerm`'s `plcVersion110` check). The *textual*
+///    parser already enforces this (`syn/parser.rs`); this is the flat
+///    (consensus) path's equivalent.
+/// 3. From protocol version 11 (`vanRossemPV`), a `Constr` tag is bounded
+///    at 1024 (`maxBoundsByPV`'s `mbConstr`).
+pub fn validate_program_availability(
+    term: &Term,
+    version: (u64, u64, u64),
+    language: ScriptLanguage,
+    major_pv: u32,
+) -> FlatResult<()> {
+    let version_1_1_0_or_later = version >= PLC_VERSION_1_1_0;
+    validate_term_depth(term, language, major_pv, version_1_1_0_or_later, 0)
+}
+
+fn validate_term_depth(
+    term: &Term,
+    language: ScriptLanguage,
+    major_pv: u32,
+    version_1_1_0_or_later: bool,
+    depth: usize,
+) -> FlatResult<()> {
+    if depth > FLAT_MAX_DEPTH {
+        return Err(UplcError::FlatDecode(format!(
+            "term depth limit exceeded ({FLAT_MAX_DEPTH})"
+        )));
+    }
+    // Mirrors `decode_term_depth`'s stack-growth guard above: the term
+    // tree we're walking here already decoded successfully (so its depth
+    // is already <= FLAT_MAX_DEPTH), but a plain recursive walk without
+    // `stacker::maybe_grow` would re-introduce the same stack-overflow
+    // risk on deeply-nested (but otherwise valid) real-world validators.
+    stacker::maybe_grow(128 * 1024, 1024 * 1024, || {
+        validate_term_inner(term, language, major_pv, version_1_1_0_or_later, depth)
+    })
+}
+
+fn validate_term_inner(
+    term: &Term,
+    language: ScriptLanguage,
+    major_pv: u32,
+    version_1_1_0_or_later: bool,
+    depth: usize,
+) -> FlatResult<()> {
+    match term {
+        Term::Var(_) | Term::Error | Term::Const(_) => Ok(()),
+        Term::Lam(body) | Term::Delay(body) | Term::Force(body) => {
+            validate_term_depth(body, language, major_pv, version_1_1_0_or_later, depth + 1)
+        }
+        Term::App(fun, arg) => {
+            validate_term_depth(fun, language, major_pv, version_1_1_0_or_later, depth + 1)?;
+            validate_term_depth(arg, language, major_pv, version_1_1_0_or_later, depth + 1)
+        }
+        Term::Builtin(id) => {
+            if id.is_available_in(language, major_pv) {
+                Ok(())
+            } else {
+                Err(UplcError::FlatDecode(format!(
+                    "builtin function {} is not available in language {:?} \
+                     at and protocol version {major_pv}",
+                    id.name(),
+                    language
+                )))
+            }
+        }
+        Term::Constr { tag, args } => {
+            if !version_1_1_0_or_later {
+                return Err(UplcError::FlatDecode(
+                    "'constr' is not allowed before version 1.1.0".into(),
+                ));
+            }
+            if major_pv >= CONSTR_TAG_BOUND_PV && *tag > MAX_CONSTR_TAG {
+                return Err(UplcError::FlatDecode(format!(
+                    "constr tag {tag} exceeds the maximum of {MAX_CONSTR_TAG} \
+                     allowed from protocol version {CONSTR_TAG_BOUND_PV}"
+                )));
+            }
+            for a in args {
+                validate_term_depth(a, language, major_pv, version_1_1_0_or_later, depth + 1)?;
+            }
+            Ok(())
+        }
+        Term::Case {
+            scrutinee,
+            branches,
+        } => {
+            if !version_1_1_0_or_later {
+                return Err(UplcError::FlatDecode(
+                    "'case' is not allowed before version 1.1.0".into(),
+                ));
+            }
+            validate_term_depth(
+                scrutinee,
+                language,
+                major_pv,
+                version_1_1_0_or_later,
+                depth + 1,
+            )?;
+            for b in branches {
+                validate_term_depth(b, language, major_pv, version_1_1_0_or_later, depth + 1)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Term codec
 // ---------------------------------------------------------------------------
 
@@ -121,7 +289,11 @@ fn decode_term_inner(r: &mut BitReader<'_>, depth: usize) -> FlatResult<Term> {
     let tag = r.read_bits8(TERM_TAG_WIDTH)?;
     match tag {
         0 => {
-            let idx = r.read_natural_u64()?;
+            // De Bruijn `Index` is a genuinely-bounded `Word64` in
+            // Haskell (`PlutusCore.DeBruijn.Internal`) — use the strict
+            // decode that rejects (rather than silently truncates) a
+            // value beyond `u64::MAX` (issue #842).
+            let idx = r.read_word64_strict()?;
             Ok(Term::Var(idx))
         }
         1 => {
@@ -162,7 +334,10 @@ fn decode_term_inner(r: &mut BitReader<'_>, depth: usize) -> FlatResult<Term> {
             // Constr: varint(tag) + cons-list(term).  Matches Haskell
             // `encodeTerm (Constr _ i ts) = encodeTermTag 8 <> encode i
             //                                              <> encodeListWith encode ts`.
-            let ctag = r.read_natural_u64()?;
+            // `Constr`'s tag is a genuinely-bounded `Word64` in Haskell
+            // (`UntypedPlutusCore.Core.Type`) — same strict decode as
+            // the De Bruijn index above (issue #842).
+            let ctag = r.read_word64_strict()?;
             let args = decode_term_list(r, depth + 1)?;
             Ok(Term::Constr { tag: ctag, args })
         }
@@ -988,6 +1163,47 @@ mod tests {
         );
     }
 
+    /// Hand-craft the bits of a malformed `Word64` varint: 9 chunks of
+    /// `(continuation=true, value=0)` followed by a 10th chunk
+    /// `(continuation=false, value=2)`. Chunk 10 lands at `shift=63`,
+    /// where any value `> 1` requires a 65th value bit that doesn't
+    /// exist in a `u64` — Haskell's `dWord64` rejects this exact shape
+    /// (issue #842). No legitimate `u64` input can ever produce this
+    /// encoding (`write_natural_u64` never emits it), so this can only
+    /// be constructed by hand, matching an adversarial wire input.
+    fn write_malformed_word64_overflow(w: &mut BitWriter) {
+        for _ in 0..9 {
+            w.write_bit(true);
+            w.write_bits8(0, 7).unwrap();
+        }
+        w.write_bit(false);
+        w.write_bits8(2, 7).unwrap();
+    }
+
+    #[test]
+    fn var_index_beyond_u64_max_is_rejected() {
+        // Var tag = 0b0000.
+        let mut w = BitWriter::new();
+        w.write_bits8(0, TERM_TAG_WIDTH).unwrap();
+        write_malformed_word64_overflow(&mut w);
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        let err = decode_term(&mut r).unwrap_err();
+        assert!(matches!(err, UplcError::FlatDecode(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn constr_tag_beyond_u64_max_is_rejected() {
+        // Constr tag = 8 = 0b1000.
+        let mut w = BitWriter::new();
+        w.write_bits8(8, TERM_TAG_WIDTH).unwrap();
+        write_malformed_word64_overflow(&mut w);
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        let err = decode_term(&mut r).unwrap_err();
+        assert!(matches!(err, UplcError::FlatDecode(_)), "got {err:?}");
+    }
+
     #[test]
     fn rejects_unknown_term_tag() {
         // 4-bit tag 10 (0b1010) is reserved-but-unwired (Constr).
@@ -1036,5 +1252,148 @@ mod tests {
         let bytes = vec![0x40, 0x00];
         let mut r = BitReader::new(&bytes);
         assert!(decode_term(&mut r).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // #821: availability / version-gate validation pass
+    // -----------------------------------------------------------------
+
+    /// (a) A V1 script referencing a batch-4a builtin (BLS12-381) before
+    /// PV11 must be rejected — V1 doesn't gain BLS/Keccak/Blake2b_224 until
+    /// `vanRossemPV`.
+    #[test]
+    fn validate_rejects_unavailable_builtin_for_v1_before_pv11() {
+        let t = Term::Builtin(BuiltinId::Bls12_381_G1_Add);
+        let err =
+            validate_program_availability(&t, (1, 0, 0), ScriptLanguage::PlutusV1, 10).unwrap_err();
+        assert!(matches!(err, UplcError::FlatDecode(_)), "got {err:?}");
+    }
+
+    /// A V1 script referencing a batch5 (bitwise) builtin before PV11 must
+    /// also be rejected.
+    #[test]
+    fn validate_rejects_unavailable_bitwise_builtin_for_v1_before_pv11() {
+        let t = Term::Builtin(BuiltinId::AndByteString);
+        let err =
+            validate_program_availability(&t, (1, 0, 0), ScriptLanguage::PlutusV1, 10).unwrap_err();
+        assert!(matches!(err, UplcError::FlatDecode(_)), "got {err:?}");
+    }
+
+    /// (d) The SAME builtin at a language/PV where it IS available must be
+    /// accepted — the gate must not false-reject a valid script.
+    #[test]
+    fn validate_accepts_available_builtin_no_false_rejection() {
+        // BLS at V1/PV11 (available).
+        let t = Term::Builtin(BuiltinId::Bls12_381_G1_Add);
+        validate_program_availability(&t, (1, 0, 0), ScriptLanguage::PlutusV1, 11)
+            .expect("BLS must be available to V1 at PV11");
+
+        // BLS at V3/PV9 (available earlier for V3).
+        let t = Term::Builtin(BuiltinId::Bls12_381_G1_Add);
+        validate_program_availability(&t, (1, 0, 0), ScriptLanguage::PlutusV3, 9)
+            .expect("BLS must be available to V3 at PV9");
+
+        // Base-set builtin available to every language at their respective
+        // ledger-language introduction PV.
+        let t = Term::Builtin(BuiltinId::AddInteger);
+        validate_program_availability(&t, (1, 0, 0), ScriptLanguage::PlutusV1, 5)
+            .expect("addInteger must be available to V1 at PV5");
+    }
+
+    /// The availability gate must also fire when the offending builtin is
+    /// nested inside other term constructors (Lam/Delay/Force/App), i.e.
+    /// the walk actually recurses into children rather than only checking
+    /// the top-level term.
+    #[test]
+    fn validate_rejects_unavailable_builtin_nested_in_lambda() {
+        let inner = Term::Builtin(BuiltinId::Keccak_256);
+        let t = Term::Lam(Rc::new(Term::Force(Rc::new(Term::App(
+            Rc::new(Term::Delay(Rc::new(inner))),
+            Rc::new(Term::Error),
+        )))));
+        let err =
+            validate_program_availability(&t, (1, 0, 0), ScriptLanguage::PlutusV1, 9).unwrap_err();
+        assert!(matches!(err, UplcError::FlatDecode(_)), "got {err:?}");
+    }
+
+    /// (b) A program declaring version 1.0.0 containing a `Constr` term
+    /// must be rejected regardless of language/pv — `constr`/`case` syntax
+    /// requires PLC version >= 1.1.0.
+    #[test]
+    fn validate_rejects_constr_before_plc_1_1_0() {
+        let t = Term::Constr {
+            tag: 0,
+            args: vec![],
+        };
+        let err =
+            validate_program_availability(&t, (1, 0, 0), ScriptLanguage::PlutusV3, 11).unwrap_err();
+        assert!(matches!(err, UplcError::FlatDecode(_)), "got {err:?}");
+    }
+
+    /// Same gate for `Case`.
+    #[test]
+    fn validate_rejects_case_before_plc_1_1_0() {
+        let t = Term::Case {
+            scrutinee: Rc::new(Term::Error),
+            branches: vec![],
+        };
+        let err =
+            validate_program_availability(&t, (1, 0, 0), ScriptLanguage::PlutusV3, 11).unwrap_err();
+        assert!(matches!(err, UplcError::FlatDecode(_)), "got {err:?}");
+    }
+
+    /// A program declaring version >= 1.1.0 must accept `Constr`/`Case`
+    /// (no false rejection of legitimate PV1.1.0 scripts).
+    #[test]
+    fn validate_accepts_constr_case_at_plc_1_1_0() {
+        let t = Term::Constr {
+            tag: 0,
+            args: vec![Rc::new(Term::Error)],
+        };
+        validate_program_availability(&t, (1, 1, 0), ScriptLanguage::PlutusV3, 11)
+            .expect("constr must be allowed at PLC 1.1.0");
+
+        let t = Term::Case {
+            scrutinee: Rc::new(Term::Error),
+            branches: vec![Rc::new(Term::Error)],
+        };
+        validate_program_availability(&t, (1, 1, 0), ScriptLanguage::PlutusV3, 11)
+            .expect("case must be allowed at PLC 1.1.0");
+    }
+
+    /// (c) A `Constr` tag > 1024 at PV11 must be rejected.
+    #[test]
+    fn validate_rejects_constr_tag_over_1024_at_pv11() {
+        let t = Term::Constr {
+            tag: 1025,
+            args: vec![],
+        };
+        let err =
+            validate_program_availability(&t, (1, 1, 0), ScriptLanguage::PlutusV3, 11).unwrap_err();
+        assert!(matches!(err, UplcError::FlatDecode(_)), "got {err:?}");
+    }
+
+    /// The tag bound is inclusive: exactly 1024 must be accepted.
+    #[test]
+    fn validate_accepts_constr_tag_exactly_1024_at_pv11() {
+        let t = Term::Constr {
+            tag: 1024,
+            args: vec![],
+        };
+        validate_program_availability(&t, (1, 1, 0), ScriptLanguage::PlutusV3, 11)
+            .expect("tag 1024 is exactly at the boundary and must be accepted");
+    }
+
+    /// Below PV11 the tag bound does not apply at all (Haskell's
+    /// `maxBoundsByPV` is unbounded pre-vanRossem) — no false rejection of
+    /// a large-but-then-legal tag.
+    #[test]
+    fn validate_does_not_bound_constr_tag_before_pv11() {
+        let t = Term::Constr {
+            tag: 50_000,
+            args: vec![],
+        };
+        validate_program_availability(&t, (1, 1, 0), ScriptLanguage::PlutusV3, 10)
+            .expect("constr tag bound only applies from PV11");
     }
 }

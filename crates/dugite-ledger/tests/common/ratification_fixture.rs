@@ -1102,6 +1102,10 @@ impl RatificationFixture {
             yes_votes,
             no_votes,
             abstain_votes,
+            // This fixture format captures a single proposal per file (no
+            // multi-proposal tie-break scenarios), so submission order is
+            // not meaningful here.
+            submission_index: 0,
         };
 
         // Build the (Voter, VotingProcedure) list for `votes_by_action`.

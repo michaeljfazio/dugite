@@ -1,10 +1,20 @@
-use super::{credential_to_hash, DRepRegistration, LedgerState, PoolRegistration};
-use dugite_primitives::credentials::Credential;
-use dugite_primitives::hash::{Hash28, Hash32};
-use dugite_primitives::transaction::{Certificate, MIRSource, MIRTarget};
+use super::LedgerState;
+use dugite_primitives::hash::Hash32;
+use dugite_primitives::transaction::Certificate;
 use dugite_primitives::value::Lovelace;
+use tracing::{debug, warn};
+// Imports used ONLY by the `#[cfg(test)]` `process_certificate*` helpers (#813
+// item 2 — those are gated out of release builds, so their imports must be too).
+#[cfg(test)]
+use super::{credential_to_hash, DRepRegistration, PoolRegistration};
+#[cfg(test)]
+use dugite_primitives::credentials::Credential;
+#[cfg(test)]
+use dugite_primitives::hash::Hash28;
+#[cfg(test)]
+use dugite_primitives::transaction::{MIRSource, MIRTarget};
+#[cfg(test)]
 use std::sync::Arc;
-use tracing::debug;
 
 /// Returns true if the certificate is Conway-only and requires protocol version >= 9.
 #[allow(dead_code)]
@@ -27,90 +37,147 @@ pub(crate) fn is_conway_only_certificate(cert: &Certificate) -> bool {
 }
 
 /// Drain the pending MIR (`dsIRewards`) map and apply it to reward
-/// accounts and pots per Haskell `Cardano.Ledger.Shelley.Rules.Mir.applyMIR`.
+/// accounts and pots per Haskell `Cardano.Ledger.Shelley.Rules.Mir.mirTransition`
+/// (`eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Mir.hs`).
 ///
 /// Called at every epoch boundary AFTER SNAP/POOLREAP and BEFORE NEWPP
 /// (matching the Haskell EPOCH STS sequence).  In Conway+ MIR certs
 /// are no longer reachable, so the pending maps stay empty and the
 /// function is a no-op.
 ///
-/// Per Haskell:
-/// 1. For each (cred, delta) in `dsIRewards.irwdSrcReserves` /
-///    `dsIRewards.irwdSrcTreasury`: credit `reward_accounts[cred] += delta`,
-///    debit the source pot for the sum of all deltas (positive deltas
-///    debit the pot, negative deltas refund into it).
-/// 2. For each `deltaReserves` / `deltaTreasury` accumulator: move the
-///    coin between pots.
-/// 3. Empty all pending maps and zero the accumulators.
+/// Per Haskell (issue #803 — cardano-ledger-oracle-verified, see
+/// `.claude/agent-memory/cardano-ledger-oracle/mir-pot-transfer-semantics.md`):
+/// 1. Filter `dsIRewards.irwdSrcReserves` / `irwdSrcTreasury` to currently
+///    REGISTERED credentials (`Map.intersection accountsMap`) — payments to
+///    deregistered credentials never count and are discarded, not refunded.
+/// 2. `totR` / `totT` = the (filtered) per-credential deltas summed per pot.
+/// 3. Fold the pot-to-pot transfer accumulator into an "available" balance
+///    per pot (Haskell: `reserves \`addDeltaCoin\` deltaReserves`, own-pot
+///    delta only — no cross term in Haskell's *single signed* accumulator).
+///    dugite instead tracks the two transfer directions as independent
+///    non-negative magnitudes (`pending_mir_delta_reserves` = reserves→treasury,
+///    `pending_mir_delta_treasury` = treasury→reserves) rather than one
+///    signed `deltaReserves = -deltaTreasury` pair, so translated into
+///    dugite's fields the equivalent formula is
+///    `available_reserves = reserves - dr + dt` and
+///    `available_treasury = treasury + dr - dt` (this is NOT a Haskell cross
+///    term — it falls out of dugite's two-magnitude encoding of the same
+///    net signed value).
+/// 4. All-or-nothing solvency: `totR <= available_reserves && totT <=
+///    available_treasury`. On failure (`NoMirTransfer`): leave BOTH pots
+///    byte-identical, still drop all four pending accumulators, warn — never
+///    panic, never partially apply. This is a total, non-throwing STS
+///    (`PredicateFailure (MIR era) = Void`).
+/// 5. On success (`MirTransfer`): apply exactly as before — credit each
+///    registered credential, debit `totR`/`totT` from their source pots,
+///    then move `dr`/`dt` between pots.
+///
+/// Defense-in-depth beyond the Haskell boundary check (issue #803): Haskell
+/// itself does not re-verify per-credential non-negativity at this
+/// boundary (that is enforced by the earlier, separate DELEG-time
+/// `MIRProducesNegativeUpdate` / `InsufficientForInstantaneousRewards`
+/// checks — see `validation/mir.rs`, which documents known Phase-1
+/// admission gaps for this). Since dugite cannot yet guarantee those
+/// checks always ran, this function also requires every registered
+/// credential's resulting balance to stay non-negative before committing;
+/// any violation is folded into the same `NoMirTransfer` no-op path rather
+/// than panicking. This never changes behavior on valid history (the
+/// condition is vacuously true whenever Phase-1 admission is correct).
 pub(crate) fn apply_pending_mir(
     certs: &mut super::substates::CertSubState,
     epochs: &mut super::substates::EpochSubState,
 ) {
-    // ── 1. Per-credential MIR distributions ─────────────────────────
-    for (src, pending) in [
-        ("reserves", std::mem::take(&mut certs.pending_mir_reserves)),
-        ("treasury", std::mem::take(&mut certs.pending_mir_treasury)),
-    ] {
-        if pending.is_empty() {
-            continue;
-        }
-        let mut net_pot_debit: i128 = 0;
-        for (cred, delta) in pending {
-            // Haskell MIR rule: `irwdR = iRReserves `Map.intersection` accountsMap`
-            // Only credit registered accounts. Payments to deregistered credentials
-            // are silently dropped — the coin vanishes (NOT returned to the pot).
-            // See `Cardano.Ledger.Shelley.Rules.Mir.applyMIR` and shelley-certs.md §6.
-            if let Some(entry) = certs.reward_accounts.get_mut(&cred) {
-                let new_balance = entry.0 as i128 + delta;
-                if new_balance < 0 {
-                    panic!(
-                        "MIR: credential {} underflows reward balance ({} + {} < 0) — invariant broken",
-                        cred.to_hex(),
-                        entry.0,
-                        delta,
-                    );
-                }
-                entry.0 = new_balance as u64;
-                net_pot_debit += delta;
-            }
-            // Unregistered credential: coin silently vanishes per Haskell Map.intersection.
-        }
-        match src {
-            "reserves" => {
-                epochs.reserves.0 = (epochs.reserves.0 as i128 - net_pot_debit)
-                    .try_into()
-                    .expect("MIR reserves debit underflows reserves — invariant broken");
-            }
-            "treasury" => {
-                epochs.treasury.0 = (epochs.treasury.0 as i128 - net_pot_debit)
-                    .try_into()
-                    .expect("MIR treasury debit underflows treasury — invariant broken");
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    // ── 2. Pot-to-pot transfers ─────────────────────────────────────
+    let pending_reserves = std::mem::take(&mut certs.pending_mir_reserves);
+    let pending_treasury = std::mem::take(&mut certs.pending_mir_treasury);
     let dr = std::mem::take(&mut certs.pending_mir_delta_reserves);
     let dt = std::mem::take(&mut certs.pending_mir_delta_treasury);
-    if dr != 0 {
-        // reserves -> treasury
-        epochs.reserves.0 = (epochs.reserves.0 as i128 - dr)
-            .try_into()
-            .expect("MIR deltaReserves underflows reserves — invariant broken");
-        epochs.treasury.0 = (epochs.treasury.0 as i128 + dr)
-            .try_into()
-            .expect("MIR deltaReserves overflows treasury u64");
+
+    if pending_reserves.is_empty() && pending_treasury.is_empty() && dr == 0 && dt == 0 {
+        return;
     }
-    if dt != 0 {
-        // treasury -> reserves
-        epochs.treasury.0 = (epochs.treasury.0 as i128 - dt)
-            .try_into()
-            .expect("MIR deltaTreasury underflows treasury — invariant broken");
-        epochs.reserves.0 = (epochs.reserves.0 as i128 + dt)
-            .try_into()
-            .expect("MIR deltaTreasury overflows reserves u64");
+
+    // Step 1: filter to registered credentials only (Map.intersection).
+    let filtered_reserves: Vec<(Hash32, i128)> = pending_reserves
+        .into_iter()
+        .filter(|(cred, _)| certs.reward_accounts.contains_key(cred))
+        .collect();
+    let filtered_treasury: Vec<(Hash32, i128)> = pending_treasury
+        .into_iter()
+        .filter(|(cred, _)| certs.reward_accounts.contains_key(cred))
+        .collect();
+
+    // Step 2: totR / totT over the filtered deltas.
+    let tot_r: i128 = filtered_reserves.iter().map(|(_, d)| *d).sum();
+    let tot_t: i128 = filtered_treasury.iter().map(|(_, d)| *d).sum();
+
+    // Step 3: fold pot-to-pot accumulators into availability (see doc comment
+    // above for the dugite-representation derivation of these formulas).
+    let available_reserves = epochs.reserves.0 as i128 - dr + dt;
+    let available_treasury = epochs.treasury.0 as i128 + dr - dt;
+
+    // A credential may appear in BOTH the reserves and treasury maps; its
+    // reward balance moves by the SUM of the two deltas. Haskell credits
+    // accounts via the union (`Map.unionWith (+)`) of the two reward maps,
+    // in one step. Fold to the per-credential net delta here so both the
+    // non-negativity check (Step 4) and the credit (Step 5) operate on that
+    // net: checking or applying each map independently against the
+    // pre-apply balance lets a credential that is individually solvent in
+    // each map but jointly negative pass the guard and then wrap `as u64`
+    // in Step 5's sequential apply (issue #803 follow-up).
+    let mut combined_deltas: std::collections::HashMap<Hash32, i128> =
+        std::collections::HashMap::with_capacity(filtered_reserves.len() + filtered_treasury.len());
+    for (cred, delta) in filtered_reserves.iter().chain(filtered_treasury.iter()) {
+        *combined_deltas.entry(*cred).or_insert(0) += delta;
     }
+
+    // Step 4: all-or-nothing solvency, plus the defensive per-credential
+    // non-negativity check described above (over the combined net delta).
+    let solvent = tot_r <= available_reserves && tot_t <= available_treasury;
+    let all_non_negative = combined_deltas.iter().all(|(cred, delta)| {
+        let existing = certs
+            .reward_accounts
+            .get(cred)
+            .map(|l| l.0 as i128)
+            .unwrap_or(0);
+        existing + delta >= 0
+    });
+
+    if !solvent || !all_non_negative {
+        warn!(
+            tot_r,
+            tot_t,
+            available_reserves,
+            available_treasury,
+            solvent,
+            all_non_negative,
+            "MIR: NoMirTransfer — insolvent or would drive a credential negative; \
+             pots left unchanged, pending MIR maps cleared (issue #803, matches \
+             Haskell Mir.hs mirTransition's non-throwing NoMirTransfer path)"
+        );
+        // Pending maps were already drained via `mem::take` above, matching
+        // Haskell's unconditional `dsIRewardsL .~ emptyInstantaneousRewards`
+        // (fires on BOTH branches). Pots are left untouched.
+        return;
+    }
+
+    // Step 5: apply the per-credential *combined* net delta exactly once,
+    // so a credential present in both maps never transiently wraps through
+    // an intermediate negative `as u64`. Byte-identical to the previous
+    // per-map sequential path for all valid (solvent) history — associativity
+    // of the two credits, which never underflow on correct history. Iteration
+    // order over the map is irrelevant: each credential is assigned exactly
+    // once from its own pre-apply balance.
+    for (cred, delta) in &combined_deltas {
+        if let Some(entry) = certs.reward_accounts.get_mut(cred) {
+            entry.0 = (entry.0 as i128 + delta) as u64;
+        }
+    }
+    // Solvency above guarantees these are all non-negative once combined —
+    // compute the final pot values in i128 and cast once, rather than
+    // stepping through intermediate u64 subtractions that could underflow
+    // even though the net result is safe.
+    epochs.reserves.0 = (available_reserves - tot_r) as u64;
+    epochs.treasury.0 = (available_treasury - tot_t) as u64;
 }
 
 impl LedgerState {
@@ -119,7 +186,14 @@ impl LedgerState {
     /// StakeRegistration certificates create entries in the pointer_map,
     /// mapping (slot, tx_index, cert_index) → credential hash. This enables
     /// resolution of Pointer addresses (type 4/5) in stake_credential_hash.
-    #[allow(dead_code)]
+    // TEST-ONLY (#813 item 2): every caller lives in a `#[cfg(test)]` module,
+    // so this is gated out of release builds entirely rather than left as
+    // `#[allow(dead_code)]`. It APPROXIMATES certificate application for tests;
+    // the authoritative consensus path is `eras::common::apply_shelley_cert` /
+    // `eras::conway::apply_conway_cert`. Do not treat it as a behaviour-parity
+    // oracle for the live path. Fully re-pointing the ~236 test call sites onto
+    // the live dispatch is deferred as high-risk/low-value for a test-only helper.
+    #[cfg(test)]
     pub(crate) fn process_certificate_with_pointer(
         &mut self,
         cert: &Certificate,
@@ -180,7 +254,10 @@ impl LedgerState {
     /// tx validation rule, not a block application rule. The block producer
     /// already validated era compatibility. During replay, the in-state
     /// protocol version may lag behind the block's actual era.
-    #[allow(dead_code)]
+    // TEST-ONLY (#813 item 2): gated to test builds (all callers are in
+    // `#[cfg(test)]` modules). Authoritative live path is
+    // `eras::common::apply_shelley_cert` / `eras::conway::apply_conway_cert`.
+    #[cfg(test)]
     pub(crate) fn process_certificate(&mut self, cert: &Certificate) {
         match cert {
             Certificate::StakeRegistration(credential) => {
@@ -580,12 +657,20 @@ impl LedgerState {
                 vrf_keyhash,
             } => {
                 // Shelley-era genesis key delegation. Update the active gen-delegate
-                // mapping directly. Haskell models this as a two-phase queue
-                // (futureGenDelegs → genDelegs after 2 * stability_window); we apply
-                // immediately, which is observationally equivalent on preview/preprod/
-                // mainnet (Conway removed this cert type) and differs only during a
-                // Byron-genesis replay. If full-Byron replay correctness is ever
-                // required, promote to a queued model.
+                // mapping directly. This function (`process_certificate`) is test-only
+                // dead code (no production callers) and intentionally keeps the
+                // simplified immediate-apply model.
+                //
+                // Haskell actually models this as a two-phase queue
+                // (`dsFutureGenDelegs` -> `dsGenDelegs`, matured after
+                // `stability_window` slots — ceil(3k/f), NOT doubled; the
+                // "2 * stability_window" figure that appears elsewhere in the
+                // ledger is a different mechanism, the PPUP/HFC "point of no
+                // return" deadline). The LIVE apply path implements the real
+                // two-phase queue in `eras::common::enqueue_genesis_key_delegations`
+                // / `adopt_matured_genesis_delegs` (see issue #804); this
+                // dead handler is NOT observationally equivalent to that and
+                // must not be treated as a reference for production behavior.
                 //
                 // The cert fields (genesis_hash, genesis_delegate_hash) are stored as
                 // Hash32 in our enum (zero-padded from the on-wire 28-byte hashes),
@@ -1794,7 +1879,16 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 28 — MIR capped at available pot (no underflow)
+    // Test 28 — MIR capped at available pot: NoMirTransfer, not a panic
+    // (issue #803 — updated 2026-07-06; previously this test PINNED the
+    // panic!() that #803 reports as the bug. Haskell's `Mir.hs`
+    // `mirTransition` is a total, non-throwing STS
+    // (`PredicateFailure (MIR era) = Void`): an insolvent transfer emits
+    // `NoMirTransfer` and leaves both pots byte-identical rather than
+    // crashing. `validateMIRCert`/`InsufficientForInstantaneousRewards`
+    // *should* reject this upstream, but dugite's Phase-1 admission has
+    // documented gaps (see `validation/mir.rs`), so this boundary function
+    // must fail safe rather than assume the invariant always holds.)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1805,21 +1899,167 @@ mod tests {
         state.epochs.reserves.0 = 1_000_000;
         state.epochs.treasury.0 = 0;
 
-        // Try to move 5B from a 1M reserve.  Per Haskell `applyMIR` the
-        // pot debit is unconditional — a value that exceeds the source pot
-        // would have already been rejected upstream by `validateMIRCert`
-        // (`InsufficientForInstantaneousRewards`), so reaching apply with
-        // an over-source coin is an invariant violation and panics.
+        // Try to move 5B from a 1M reserve — insolvent.
         state.process_certificate(&Certificate::MoveInstantaneousRewards {
             source: MIRSource::Reserves,
             target: MIRTarget::OtherAccountingPot(5_000_000_000),
         });
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            super::apply_pending_mir(&mut state.certs, &mut state.epochs)
-        }));
-        assert!(
-            result.is_err(),
-            "apply_pending_mir must panic on a delta that exceeds the source pot"
+        super::apply_pending_mir(&mut state.certs, &mut state.epochs);
+
+        assert_eq!(
+            state.epochs.reserves.0, 1_000_000,
+            "NoMirTransfer: reserves must be left byte-unchanged, not underflowed/panicked"
+        );
+        assert_eq!(
+            state.epochs.treasury.0, 0,
+            "NoMirTransfer: treasury must be left byte-unchanged"
+        );
+        assert_eq!(
+            state.certs.pending_mir_delta_reserves, 0,
+            "pending MIR accumulators must still be cleared on the NoMirTransfer path"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 28b — MIR per-credential negative update: NoMirTransfer (#803)
+    // -----------------------------------------------------------------------
+
+    /// A negative MIR delta larger in magnitude than a credential's existing
+    /// balance would drive that credential negative. Haskell's `Mir.hs`
+    /// boundary check alone (`totR <= availableReserves`) does NOT catch
+    /// this — a negative per-credential delta only makes `totR` easier to
+    /// satisfy — so this is dugite's defense-in-depth guard (issue #803)
+    /// against the documented Phase-1 gap where
+    /// `MIRProducesNegativeUpdate` is silently skipped
+    /// (`validation/mir.rs` limitation #1). Must not panic; must leave
+    /// pots AND the credential's balance byte-unchanged.
+    #[test]
+    fn test_mir_insolvent_per_credential_no_mir_transfer_803() {
+        use dugite_primitives::transaction::{MIRSource, MIRTarget};
+
+        let mut state = make_state();
+        let initial_reserves: u64 = 1_000_000_000_000;
+        let initial_treasury: u64 = 0;
+        state.epochs.reserves.0 = initial_reserves;
+        state.epochs.treasury.0 = initial_treasury;
+
+        let cred = test_credential();
+        let key = credential_to_hash(&cred);
+
+        // Register with a zero starting balance.
+        state.process_certificate(&Certificate::StakeRegistration(cred.clone()));
+
+        // Aggregate solvency alone is satisfied here (tot_r = -5_000_000 <<
+        // available_reserves), but crediting this delta to the (zero-balance)
+        // credential would drive its account negative.
+        state.process_certificate(&Certificate::MoveInstantaneousRewards {
+            source: MIRSource::Reserves,
+            target: MIRTarget::StakeCredentials(vec![(cred, -5_000_000i64)]),
+        });
+
+        super::apply_pending_mir(&mut state.certs, &mut state.epochs);
+
+        assert_eq!(
+            state.epochs.reserves.0, initial_reserves,
+            "NoMirTransfer: reserves must be unchanged when a per-credential update would go negative"
+        );
+        assert_eq!(
+            state.epochs.treasury.0, initial_treasury,
+            "NoMirTransfer: treasury must be unchanged"
+        );
+        let balance = state
+            .certs
+            .reward_accounts
+            .get(&key)
+            .copied()
+            .unwrap_or(Lovelace(0));
+        assert_eq!(
+            balance.0, 0,
+            "credential balance must be untouched on the NoMirTransfer path"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 28c — MIR cross-map (reserves + treasury) joint underflow (#803
+    // follow-up): a credential present in BOTH pending maps whose deltas each
+    // pass the per-map non-negativity guard against the pre-apply balance but
+    // are JOINTLY negative must be caught (NoMirTransfer), not applied.
+    // -----------------------------------------------------------------------
+
+    /// Before the fix, Step 4 checked each map entry independently against the
+    /// pre-apply balance and Step 5 applied reserves-then-treasury
+    /// sequentially. A credential in both maps could pass both checks yet go
+    /// negative mid-apply, wrapping `(balance as i128 + delta) as u64` into a
+    /// ~1.8e19-lovelace reward balance (main panicked here; the #803 rewrite
+    /// turned that panic into a silent wrap). The guard and the credit must
+    /// operate on the per-credential COMBINED net delta (Haskell credits
+    /// accounts via the union of the two reward maps).
+    #[test]
+    fn test_mir_cross_map_joint_underflow_no_mir_transfer_803() {
+        use dugite_primitives::transaction::{MIRSource, MIRTarget};
+
+        let mut state = make_state();
+        let initial_reserves: u64 = 1_000_000_000_000;
+        let initial_treasury: u64 = 1_000_000_000_000;
+        state.epochs.reserves.0 = initial_reserves;
+        state.epochs.treasury.0 = initial_treasury;
+
+        let cred = test_credential();
+        let key = credential_to_hash(&cred);
+        state.process_certificate(&Certificate::StakeRegistration(cred.clone()));
+
+        // Round 1: credit the credential to a starting balance of 8_000_000.
+        state.process_certificate(&Certificate::MoveInstantaneousRewards {
+            source: MIRSource::Reserves,
+            target: MIRTarget::StakeCredentials(vec![(cred.clone(), 8_000_000i64)]),
+        });
+        super::apply_pending_mir(&mut state.certs, &mut state.epochs);
+        assert_eq!(
+            state
+                .certs
+                .reward_accounts
+                .get(&key)
+                .copied()
+                .unwrap_or(Lovelace(0))
+                .0,
+            8_000_000,
+            "precondition: credential should hold 8_000_000 after round 1"
+        );
+        let reserves_after_r1 = state.epochs.reserves.0;
+
+        // Round 2: -5_000_000 from reserves AND -5_000_000 from treasury for the
+        // same credential. Each passes independently (8M - 5M = 3M >= 0), but
+        // combined 8M - 10M = -2M < 0.
+        state.process_certificate(&Certificate::MoveInstantaneousRewards {
+            source: MIRSource::Reserves,
+            target: MIRTarget::StakeCredentials(vec![(cred.clone(), -5_000_000i64)]),
+        });
+        state.process_certificate(&Certificate::MoveInstantaneousRewards {
+            source: MIRSource::Treasury,
+            target: MIRTarget::StakeCredentials(vec![(cred, -5_000_000i64)]),
+        });
+        super::apply_pending_mir(&mut state.certs, &mut state.epochs);
+
+        // NoMirTransfer: pots and the credential balance are all byte-unchanged,
+        // and crucially the balance did NOT wrap to a ~1.8e19 value.
+        assert_eq!(
+            state
+                .certs
+                .reward_accounts
+                .get(&key)
+                .copied()
+                .unwrap_or(Lovelace(0))
+                .0,
+            8_000_000,
+            "cross-map joint underflow must be caught: balance unchanged, no u64 wrap"
+        );
+        assert_eq!(
+            state.epochs.reserves.0, reserves_after_r1,
+            "NoMirTransfer: reserves must be unchanged"
+        );
+        assert_eq!(
+            state.epochs.treasury.0, initial_treasury,
+            "NoMirTransfer: treasury must be unchanged"
         );
     }
 

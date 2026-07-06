@@ -237,10 +237,10 @@ fn posix_time_range_ttl_only_upper_closure_is_era_gated() {
         upper: Some(1_781_858_645_000i64),
     };
     let upper_closure = |conway: bool| -> Data {
-        let Data::Constr(0, outer) = r.to_data(conway) else {
+        let Ok((0, outer)) = r.to_data(conway).into_constr() else {
             panic!("interval must be Constr 0");
         };
-        let Data::Constr(0, ub) = outer[1].clone() else {
+        let Ok((0, ub)) = outer[1].clone().into_constr() else {
             panic!("upper bound must be Constr 0");
         };
         ub[1].clone()
@@ -1094,7 +1094,7 @@ fn script_context_v1_spend_purpose_has_wrapped_txid() {
         idx: 2,
     });
     let ctx = ScriptContextV1 {
-        tx_info: minimal_txinfo_v1(),
+        tx_info: Rc::new(minimal_txinfo_v1()),
         purpose,
     };
     let d = ctx.to_data(false);
@@ -1172,4 +1172,87 @@ fn v3_rewarding_purpose_uses_bare_credential() {
         );
     };
     assert!(matches!(&cred[0], Data::B(b) if b.len() == 28));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #845: exact-bytes ScriptContext golden (structural, non-empty fixture)
+//
+// Every test above this point pins the SHAPE of a `Data` value (via
+// `matches!`/field-by-field assertions). None pin the full exact CBOR bytes
+// of a populated (non-trivial) ScriptContext end-to-end — the audit in #845
+// flagged that gap explicitly ("exact-bytes to_flat/to_cbor goldens vs
+// captured Haskell `uplc`/cardano-ledger bytes").
+//
+// A genuine cardano-ledger-side dump for an equivalent tx is NOT available
+// in this repo today, so the hex below is a **hand-verified structural
+// golden**: derived by actually running dugite's (field-by-field unit
+// tested, doc-commented) encoder over a concrete, non-empty `ScriptContextV1`
+// and pinning the output — not a fabricated "expected" value invented
+// independently of the implementation. Its purpose is to catch any FUTURE
+// accidental encoding regression across the whole struct at once (field
+// reordering, a dropped field, a wrong wrapper) that a narrower field-level
+// assertion could miss.
+//
+// TODO(#845 follow-up): when a real `cardano-ledger`-produced ScriptContext
+// dump for an equivalent Alonzo/Babbage Spend tx becomes available (e.g. via
+// the `DUGITE_DUMP_APPLIED_DIR` / #772-harness technique against a synced
+// cardano-node), replace/augment this hand-verified golden with the
+// independently-captured bytes for true cross-implementation verification.
+#[test]
+fn script_context_v1_populated_fixture_exact_cbor_golden() {
+    let tx_out_ref = TxOutRef {
+        tx_id: [0x11; 32],
+        idx: 0,
+    };
+    let resolved_out = TxOut {
+        address: Address {
+            payment: Credential::PubKey([0x22; 28]),
+            staking: None,
+        },
+        value: PlutusValue {
+            policies: vec![([0u8; 28], vec![(Vec::new(), BigInt::from(5_000_000i64))])],
+        },
+        datum: OutputDatum::None,
+        reference_script: None,
+    };
+    let tx_info = TxInfoV1 {
+        inputs: vec![TxInInfo {
+            out_ref: tx_out_ref.clone(),
+            resolved: resolved_out.clone(),
+        }],
+        outputs: vec![resolved_out],
+        fee: BigInt::from(200_000i64),
+        mint: PlutusValue::default(),
+        dcert: vec![],
+        wdrl: vec![],
+        valid_range: PosixTimeRange {
+            lower: Some(1_000),
+            upper: Some(2_000),
+        },
+        signatories: vec![[0x33; 28]],
+        data: vec![],
+        txid: [0x44; 32],
+    };
+    let ctx = ScriptContextV1 {
+        tx_info: Rc::new(tx_info),
+        purpose: ScriptPurpose::Spending(tx_out_ref),
+    };
+    // `false` = pre-Conway (Alonzo/Babbage) validity-range upper-bound
+    // closure (#772) — matches a V1 script, which never runs post-Conway.
+    let cbor = ctx.to_data(false).to_cbor().expect("encode ScriptContext");
+
+    const EXPECTED_HEX: &str = "d8799fd8799f9fd8799fd8799fd8799f58201111111111111111111111111111111111111111111111111111111111111111ff00ffd8799fd8799fd8799f581c22222222222222222222222222222222222222222222222222222222ffd87a80ffa140a1401a004c4b40d87a80ffffff9fd8799fd8799fd8799f581c22222222222222222222222222222222222222222222222222222222ffd87a80ffa140a1401a004c4b40d87a80ffffa140a1401a00030d40a140a140008080d8799fd8799fd87a9f1903e8ffd87a80ffd8799fd87a9f1907d0ffd87980ffff9f581c33333333333333333333333333333333333333333333333333333333ff80d8799f58204444444444444444444444444444444444444444444444444444444444444444ffffd87a9fd8799fd8799f58201111111111111111111111111111111111111111111111111111111111111111ff00ffffff";
+
+    assert_eq!(
+        hex::encode(&cbor),
+        EXPECTED_HEX,
+        "ScriptContextV1 exact-bytes golden changed — if this is an \
+         intentional encoding fix, verify field-by-field against the \
+         Haskell reference before updating EXPECTED_HEX (see #845 TODO \
+         above for the real-dump follow-up)"
+    );
+
+    // Round-trip sanity: the pinned bytes must decode back to the same Data.
+    let decoded = Data::from_cbor(&cbor).expect("decode golden CBOR");
+    assert_eq!(decoded, ctx.to_data(false));
 }
