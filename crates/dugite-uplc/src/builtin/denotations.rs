@@ -1242,10 +1242,13 @@ pub fn denote(
         // ── PV1.1.0 list builtin ──────────────────────────────────────
         DropList => {
             // (count: Integer, list: ProtoList T) -> ProtoList T
-            // Drops the first `count` elements from the list. If count
-            // is negative or larger than the list length, returns the
-            // empty list (matching the Haskell reference's clamp-at-
-            // zero / clamp-at-length semantics).
+            // Drops the first `count` elements from the list. `count` is
+            // clamped at BOTH ends (oracle-confirmed, #828): negative ->
+            // clamped to 0, so the list is returned UNCHANGED (dropping
+            // zero elements) — NOT emptied; `count >= len` -> the empty
+            // list. `bigint_to_usize_clamped` performs the negative ->
+            // 0 clamp; the `n >= elems.len()` branch below performs the
+            // upper clamp.
             let mut it = args.into_iter();
             let count = unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
             let list = it.next().ok_or_else(|| builtin_arity_mismatch(id))?;
@@ -1726,14 +1729,13 @@ fn bigint_to_i64_or_failure(i: &BigInt, id: BuiltinId, what: &str) -> Result<i64
         .ok_or_else(|| builtin_failure(id, &format!("{what}: value does not fit in Int64")))
 }
 
-/// Bitwise binary op on two byte strings of equal length.
-/// `pad` is the byte to use when extending the shorter input to the
-/// longer length. Per CIP-0123: padding semantics are part of the
-/// builtin (`andByteString` pads with 0xFF for max-len, `orByteString`
-/// and `xorByteString` pad with 0x00). Our current implementation
-/// requires equal-length inputs and rejects mismatched lengths as a
-/// `BuiltinFailure`; the padding-mode variant arrives with the
-/// `padded`-flavour builtins in a follow-on commit.
+/// Bitwise binary op (`andByteString` / `orByteString` /
+/// `xorByteString`) on two byte strings, with CIP-0122/0123's
+/// `padded: Bool` semantics: `padded = true` outputs at the LONGER
+/// input's length (unmatched trailing bytes from the longer input pass
+/// through unchanged); `padded = false` outputs at the SHORTER input's
+/// length (the longer input is truncated). See the CIP-122/123 doc
+/// comment on the body below for the exact algorithm.
 fn bitwise_byte_string<F>(args: Vec<Value>, id: BuiltinId, op: F) -> Result<Value, UplcError>
 where
     F: Fn(u8, u8) -> u8,
