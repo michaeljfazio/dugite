@@ -29,6 +29,7 @@
 //! `tests/term_roundtrip.rs` (to be added with the flat decoder).
 
 use crate::data::Data;
+use crate::redeemer_resolve::ScriptLanguage;
 use std::rc::Rc;
 
 /// A UPLC term — a single AST node.
@@ -494,6 +495,91 @@ impl BuiltinId {
         *self as u8
     }
 
+    /// Whether this builtin is *available* (exists at all, independent of
+    /// its cost/denotation) for `(language, major_pv)`.
+    ///
+    /// Mirrors Haskell `builtinsAvailableIn :: PlutusLedgerLanguage ->
+    /// MajorProtocolVersion -> Set.Set DefaultFun`
+    /// (`plutus-ledger-api/src/PlutusLedgerApi/Common/Versions.hs`), which
+    /// folds `builtinsIntroducedIn` up to and including `major_pv`. This is
+    /// a **distinct axis** from [`crate::builtin::semantics::SemanticsVariant`]
+    /// (which governs the *denotation/costing* of a builtin that is already
+    /// available) — a builtin can be unavailable (this check fails, decode
+    /// must reject) or available-but-differently-costed (semantics variant
+    /// applies once evaluation proceeds).
+    ///
+    /// The six wire-ID batches below are contiguous ranges by construction
+    /// (`BuiltinId`'s discriminants are assigned in Haskell `DefaultFun`
+    /// declaration order, which is itself batch-ordered), so matching on
+    /// `as_u8()` ranges reproduces the authoritative table exactly. Batch
+    /// boundaries and the "earliest (language, PV)" cells are verified
+    /// against IntersectMBO/plutus tag `1.65.0.0`
+    /// (`.claude/agent-memory/cardano-haskell-oracle/plutus-builtin-availability-gate.md`,
+    /// section 4's compact table):
+    ///
+    /// | batch | wire IDs | V1 from | V2 from | V3 from |
+    /// |---|---|---|---|---|
+    /// | 1 (Alonzo base set)                     | 0–50   | PV5  | PV7  | PV9  |
+    /// | 2 (`serialiseData`)                     | 51     | PV11 | PV7  | PV9  |
+    /// | 3 (ECDSA/Schnorr secp256k1)              | 52–53  | PV11 | PV8  | PV9  |
+    /// | 4a (BLS12-381, `keccak_256`,`blake2b_224`)| 54–72 | PV11 | PV11 | PV9  |
+    /// | 4b (`integerToByteString`/`byteStringToInteger`) | 73–74 | PV11 | PV10 | PV9 |
+    /// | 5 (bitwise ops, `ripemd_160`)            | 75–86  | PV11 | PV11 | PV10 |
+    /// | 6 (`expModInteger`, `dropList`, array/value ops) | 87–100 | PV11 | PV11 | PV11 |
+    ///
+    /// Notably PlutusV1 is **not** frozen at the Alonzo base set forever:
+    /// from PV11 (`vanRossemPV`) a V1 script may reference every later
+    /// batch (2 through 6) at once — Haskell's `builtinsIntroducedIn
+    /// PlutusV1` has exactly two map entries (`alonzoPV`, `vanRossemPV`).
+    pub fn is_available_in(self, language: ScriptLanguage, major_pv: u32) -> bool {
+        let earliest_pv: u32 = match self.as_u8() {
+            // batch1: Alonzo-era arithmetic/bytestring/string/data/list/pair.
+            0..=50 => match language {
+                ScriptLanguage::PlutusV1 => 5,
+                ScriptLanguage::PlutusV2 => 7,
+                ScriptLanguage::PlutusV3 => 9,
+            },
+            // batch2: SerialiseData.
+            51 => match language {
+                ScriptLanguage::PlutusV1 => 11,
+                ScriptLanguage::PlutusV2 => 7,
+                ScriptLanguage::PlutusV3 => 9,
+            },
+            // batch3: VerifyEcdsaSecp256k1Signature, VerifySchnorrSecp256k1Signature.
+            52..=53 => match language {
+                ScriptLanguage::PlutusV1 => 11,
+                ScriptLanguage::PlutusV2 => 8,
+                ScriptLanguage::PlutusV3 => 9,
+            },
+            // batch4a: BLS12-381 G1/G2/pairing ops, Keccak_256, Blake2b_224.
+            54..=72 => match language {
+                ScriptLanguage::PlutusV1 => 11,
+                ScriptLanguage::PlutusV2 => 11,
+                ScriptLanguage::PlutusV3 => 9,
+            },
+            // batch4b: IntegerToByteString, ByteStringToInteger.
+            73..=74 => match language {
+                ScriptLanguage::PlutusV1 => 11,
+                ScriptLanguage::PlutusV2 => 10,
+                ScriptLanguage::PlutusV3 => 9,
+            },
+            // batch5: bitwise ops, Ripemd_160.
+            75..=86 => match language {
+                ScriptLanguage::PlutusV1 => 11,
+                ScriptLanguage::PlutusV2 => 11,
+                ScriptLanguage::PlutusV3 => 10,
+            },
+            // batch6 (87..=100, and any future addition defaults here too):
+            // ExpModInteger, DropList, array ops, value ops.
+            _ => match language {
+                ScriptLanguage::PlutusV1 => 11,
+                ScriptLanguage::PlutusV2 => 11,
+                ScriptLanguage::PlutusV3 => 11,
+            },
+        };
+        major_pv >= earliest_pv
+    }
+
     /// Lowercase identifier used in the Plutus textual syntax and in
     /// error messages. Names mirror Haskell `DefaultFun` show output
     /// (camelCase) since that's the canonical form quoted in
@@ -649,6 +735,134 @@ mod tests {
                 "placeholder name for raw={raw}: {name:?}"
             );
             assert!(seen.insert(name), "duplicate name {name:?} at raw={raw}");
+        }
+    }
+
+    #[test]
+    fn is_available_in_batch1_base_set_per_language() {
+        // batch1 (wire 0-50): V1@5, V2@7, V3@9.
+        let id = BuiltinId::AddInteger;
+        assert!(!id.is_available_in(ScriptLanguage::PlutusV1, 4));
+        assert!(id.is_available_in(ScriptLanguage::PlutusV1, 5));
+        assert!(!id.is_available_in(ScriptLanguage::PlutusV2, 6));
+        assert!(id.is_available_in(ScriptLanguage::PlutusV2, 7));
+        assert!(!id.is_available_in(ScriptLanguage::PlutusV3, 8));
+        assert!(id.is_available_in(ScriptLanguage::PlutusV3, 9));
+    }
+
+    #[test]
+    fn is_available_in_batch2_serialise_data() {
+        // batch2 (wire 51): V1@11, V2@7 (bundled with batch1), V3@9.
+        let id = BuiltinId::SerialiseData;
+        assert!(!id.is_available_in(ScriptLanguage::PlutusV1, 10));
+        assert!(id.is_available_in(ScriptLanguage::PlutusV1, 11));
+        assert!(!id.is_available_in(ScriptLanguage::PlutusV2, 6));
+        assert!(id.is_available_in(ScriptLanguage::PlutusV2, 7));
+        assert!(!id.is_available_in(ScriptLanguage::PlutusV3, 8));
+        assert!(id.is_available_in(ScriptLanguage::PlutusV3, 9));
+    }
+
+    #[test]
+    fn is_available_in_batch3_ecdsa_schnorr() {
+        // batch3 (wire 52-53): V1@11, V2@8 (valentine intra-Babbage HF), V3@9.
+        for id in [
+            BuiltinId::VerifyEcdsaSecp256k1Signature,
+            BuiltinId::VerifySchnorrSecp256k1Signature,
+        ] {
+            assert!(!id.is_available_in(ScriptLanguage::PlutusV1, 10));
+            assert!(id.is_available_in(ScriptLanguage::PlutusV1, 11));
+            assert!(!id.is_available_in(ScriptLanguage::PlutusV2, 7));
+            assert!(id.is_available_in(ScriptLanguage::PlutusV2, 8));
+            assert!(!id.is_available_in(ScriptLanguage::PlutusV3, 8));
+            assert!(id.is_available_in(ScriptLanguage::PlutusV3, 9));
+        }
+    }
+
+    #[test]
+    fn is_available_in_batch4a_bls_keccak_blake2b224() {
+        // batch4a (wire 54-72): V1@11, V2@11, V3@9 — a V1/V2 script referencing
+        // BLS12-381 before PV11 must be rejected (this is the #821 headline case).
+        for id in [
+            BuiltinId::Bls12_381_G1_Add,
+            BuiltinId::Bls12_381_G2_HashToGroup,
+            BuiltinId::Bls12_381_FinalVerify,
+            BuiltinId::Keccak_256,
+            BuiltinId::Blake2b_224,
+        ] {
+            assert!(!id.is_available_in(ScriptLanguage::PlutusV1, 10));
+            assert!(id.is_available_in(ScriptLanguage::PlutusV1, 11));
+            assert!(!id.is_available_in(ScriptLanguage::PlutusV2, 10));
+            assert!(id.is_available_in(ScriptLanguage::PlutusV2, 11));
+            assert!(!id.is_available_in(ScriptLanguage::PlutusV3, 8));
+            assert!(id.is_available_in(ScriptLanguage::PlutusV3, 9));
+        }
+    }
+
+    #[test]
+    fn is_available_in_batch4b_integer_bytestring_conversions() {
+        // batch4b (wire 73-74): V1@11, V2@10 (plomin — earlier than the rest of
+        // batch4), V3@9.
+        for id in [
+            BuiltinId::IntegerToByteString,
+            BuiltinId::ByteStringToInteger,
+        ] {
+            assert!(!id.is_available_in(ScriptLanguage::PlutusV1, 10));
+            assert!(id.is_available_in(ScriptLanguage::PlutusV1, 11));
+            assert!(!id.is_available_in(ScriptLanguage::PlutusV2, 9));
+            assert!(id.is_available_in(ScriptLanguage::PlutusV2, 10));
+            assert!(!id.is_available_in(ScriptLanguage::PlutusV3, 8));
+            assert!(id.is_available_in(ScriptLanguage::PlutusV3, 9));
+        }
+    }
+
+    #[test]
+    fn is_available_in_batch5_bitwise_and_ripemd160() {
+        // batch5 (wire 75-86): V1@11, V2@11, V3@10.
+        for id in [BuiltinId::AndByteString, BuiltinId::Ripemd_160] {
+            assert!(!id.is_available_in(ScriptLanguage::PlutusV1, 10));
+            assert!(id.is_available_in(ScriptLanguage::PlutusV1, 11));
+            assert!(!id.is_available_in(ScriptLanguage::PlutusV2, 10));
+            assert!(id.is_available_in(ScriptLanguage::PlutusV2, 11));
+            assert!(!id.is_available_in(ScriptLanguage::PlutusV3, 9));
+            assert!(id.is_available_in(ScriptLanguage::PlutusV3, 10));
+        }
+    }
+
+    #[test]
+    fn is_available_in_batch6_expmod_droplist_array_value_ops() {
+        // batch6 (wire 87-100): all languages @11 — still-open batch, so the
+        // catch-all `_` arm of `is_available_in` covers it.
+        for id in [
+            BuiltinId::ExpModInteger,
+            BuiltinId::DropList,
+            BuiltinId::LengthOfArray,
+            BuiltinId::UnionValue,
+            BuiltinId::ScaleValue,
+        ] {
+            assert!(!id.is_available_in(ScriptLanguage::PlutusV1, 10));
+            assert!(id.is_available_in(ScriptLanguage::PlutusV1, 11));
+            assert!(!id.is_available_in(ScriptLanguage::PlutusV2, 10));
+            assert!(id.is_available_in(ScriptLanguage::PlutusV2, 11));
+            assert!(!id.is_available_in(ScriptLanguage::PlutusV3, 10));
+            assert!(id.is_available_in(ScriptLanguage::PlutusV3, 11));
+        }
+    }
+
+    #[test]
+    fn is_available_in_v1_gains_every_later_batch_at_pv11_at_once() {
+        // PlutusV1 has exactly two `builtinsIntroducedIn` map entries
+        // (alonzoPV, vanRossemPV) — everything from batch2 onward becomes
+        // available simultaneously at PV11, not staggered like V2/V3.
+        for id in [
+            BuiltinId::SerialiseData,
+            BuiltinId::VerifyEcdsaSecp256k1Signature,
+            BuiltinId::Bls12_381_G1_Add,
+            BuiltinId::IntegerToByteString,
+            BuiltinId::AndByteString,
+            BuiltinId::ExpModInteger,
+        ] {
+            assert!(!id.is_available_in(ScriptLanguage::PlutusV1, 10));
+            assert!(id.is_available_in(ScriptLanguage::PlutusV1, 11));
         }
     }
 
