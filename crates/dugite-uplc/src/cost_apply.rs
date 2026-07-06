@@ -76,6 +76,25 @@ pub const V2_PARAM_COUNT: usize = 175;
 /// silently cheap.
 pub const V2_PARAM_COUNT_PLOMIN: usize = 185;
 
+/// Number of parameters in a PlutusV1 cost model after the van Rossem
+/// (PV11) hard fork (`PlutusLedgerApi.V1.ParamName`): 332 total. Per
+/// `IntersectMBO/plutus` `PlutusLedgerApi.Common.ParamName`
+/// (`plutusVXParamNames PlutusV1 = showParamName <$> [minBound..maxBound
+/// :: PVn.ParamName]`, oracle-confirmed 2026-07-07 against `ParamName.hs`
+/// 1.62.0.0 and 1.65.0.0 byte-identically), PlutusV1 is NOT frozen at 166
+/// params at PV11 — it grows the same tail V2/V3 gained at Plomin (PV10)
+/// plus the shared van-Rossem batch6 tail (#860.2). [`apply_v1`] always
+/// pads/truncates to this length per [`pad_or_truncate`] (#826/#830).
+pub const V1_PARAM_COUNT_VANROSSEM: usize = 332;
+
+/// Number of parameters in a PlutusV2 cost model after the van Rossem
+/// (PV11) hard fork (`PlutusLedgerApi.V2.ParamName`): 332 total. V2 grows from
+/// [`V2_PARAM_COUNT_PLOMIN`] (185) by the same tail as V1/V3 — `cekConstr`,
+/// `cekCase`, the BLS12-381 block, `keccak_256`, `blake2b_224`, the bitwise
+/// batch, then the van-Rossem batch6 (#860.2, oracle-confirmed against
+/// `ParamName.hs`). [`apply_v2`] always pads/truncates to this length.
+pub const V2_PARAM_COUNT_VANROSSEM: usize = 332;
+
 /// A cost model resolved from on-chain parameters, ready to drive a CEK run.
 #[derive(Debug, Clone)]
 pub struct AppliedCosts {
@@ -349,14 +368,16 @@ fn verify_ed25519(cur: &mut Cursor<'_>, variant_b: bool) -> CostPair {
     CostPair { cpu, mem }
 }
 
-/// Apply a flat PlutusV1 cost-model array (166 entries, canonical
-/// `ParamName` order) to a fresh [`AppliedCosts`]. A wrong-length input is
-/// padded with `maxBound::Int64` (too short) or truncated (too long) per
-/// [`pad_or_truncate`] — never rejected (#826).
+/// Apply a flat PlutusV1 cost-model array (166 entries pre-PV11; 332 from
+/// van Rossem (PV11) onward, canonical `ParamName` order) to a fresh
+/// [`AppliedCosts`]. A wrong-length input is padded with `maxBound::Int64`
+/// (too short) or truncated (too long) per [`pad_or_truncate`] — never
+/// rejected (#826). The base walk (0..=165) is identical at every protocol
+/// version; PV11 appends the [`V1_PARAM_COUNT_VANROSSEM`] tail (#860.2).
 pub fn apply_v1(p: &[i64], major_pv: u32) -> Result<AppliedCosts, CostModelApplyError> {
     let variant_b = is_variant_b(major_pv);
     let variant_d = is_variant_d(major_pv);
-    let padded = pad_or_truncate(p, V1_PARAM_COUNT);
+    let padded = pad_or_truncate(p, V1_PARAM_COUNT_VANROSSEM);
     let p: &[i64] = padded.as_ref();
     use BuiltinId::*;
     let mut b = BuiltinCosts::DEFAULT.clone();
@@ -437,7 +458,33 @@ pub fn apply_v1(p: &[i64], major_pv: u32) -> Result<AppliedCosts, CostModelApply
 
     debug_assert_eq!(
         cur.i, V1_PARAM_COUNT,
-        "V1 cost-model walk must consume exactly {V1_PARAM_COUNT} params"
+        "V1 base cost-model walk must consume exactly {V1_PARAM_COUNT} params"
+    );
+
+    // [166..=331] van Rossem (PV11) tail (#860.2) — V1 grows from 166 to
+    // 332 params at PV11, gaining every builtin V2/V3 gained at Plomin
+    // (PV10) plus the shared van-Rossem batch6 tail. Order:
+    // serialiseData, verifyEcdsaSecp256k1Signature,
+    // verifySchnorrSecp256k1Signature, cekConstr/cekCase, the BLS12-381
+    // block, keccak_256/blake2b_224, integerToByteString/
+    // byteStringToInteger, the Plomin bitwise batch, then van_rossem_tail
+    // — byte-identical to V2's own PV11 tail from `cekConstr` onward.
+    refill_builtin(&mut b, SerialiseData, cur)?;
+    refill_builtin(&mut b, VerifyEcdsaSecp256k1Signature, cur)?;
+    refill_builtin(&mut b, VerifySchnorrSecp256k1Signature, cur)?;
+    cek_constr_case_costs(&mut m, cur);
+    bls12_381_batch(&mut b, cur)?;
+    keccak_blake2b224_batch(&mut b, cur)?;
+    let i2b = integer_to_bytestring_cost(cur);
+    b.set_cost_pair(IntegerToByteString, i2b);
+    let b2i = bytestring_to_integer_cost(cur);
+    b.set_cost_pair(ByteStringToInteger, b2i);
+    bitwise_batch(&mut b, cur)?;
+    van_rossem_tail(&mut b, cur)?;
+
+    debug_assert_eq!(
+        cur.i, V1_PARAM_COUNT_VANROSSEM,
+        "V1 cost-model walk must consume exactly {V1_PARAM_COUNT_VANROSSEM} params"
     );
 
     Ok(AppliedCosts {
@@ -472,7 +519,7 @@ pub fn apply_v1(p: &[i64], major_pv: u32) -> Result<AppliedCosts, CostModelApply
 pub fn apply_v2(p: &[i64], major_pv: u32) -> Result<AppliedCosts, CostModelApplyError> {
     let variant_b = is_variant_b(major_pv);
     let variant_d = is_variant_d(major_pv);
-    let padded = pad_or_truncate(p, V2_PARAM_COUNT_PLOMIN);
+    let padded = pad_or_truncate(p, V2_PARAM_COUNT_VANROSSEM);
     let p: &[i64] = padded.as_ref();
     use BuiltinId::*;
     let mut b = BuiltinCosts::DEFAULT.clone();
@@ -575,7 +622,24 @@ pub fn apply_v2(p: &[i64], major_pv: u32) -> Result<AppliedCosts, CostModelApply
 
     debug_assert_eq!(
         cur.i, V2_PARAM_COUNT_PLOMIN,
-        "V2 cost-model walk must consume exactly {V2_PARAM_COUNT_PLOMIN} params"
+        "V2 base+Plomin cost-model walk must consume exactly {V2_PARAM_COUNT_PLOMIN} params"
+    );
+
+    // [185..=331] van Rossem (PV11) tail (#860.2) — V2 grows from 185 to
+    // 332 params at PV11. Unlike V1, V2 already has serialiseData/ECDSA/
+    // Schnorr/i2b/b2i in its base+Plomin walk above, so this tail starts
+    // at cekConstr/cekCase: the BLS12-381 block, keccak_256/blake2b_224,
+    // then the bitwise batch + van_rossem_tail — byte-identical to V1's
+    // own tail from the same point onward.
+    cek_constr_case_costs(&mut m, cur);
+    bls12_381_batch(&mut b, cur)?;
+    keccak_blake2b224_batch(&mut b, cur)?;
+    bitwise_batch(&mut b, cur)?;
+    van_rossem_tail(&mut b, cur)?;
+
+    debug_assert_eq!(
+        cur.i, V2_PARAM_COUNT_VANROSSEM,
+        "V2 cost-model walk must consume exactly {V2_PARAM_COUNT_VANROSSEM} params"
     );
 
     Ok(AppliedCosts {
@@ -710,6 +774,88 @@ fn v3_bitwise_logical(cur: &mut Cursor<'_>) -> CostPair {
     });
     let mem = CostingFun::LinearMaxYZ(cur.linear());
     CostPair { cpu, mem }
+}
+
+/// `cekConstrCost` / `cekCaseCost` machine-step costs, each an `ExBudget`
+/// (`exBudgetCPU` then `exBudgetMemory`), consumed in that order (4 flat
+/// params total). Added to PlutusV3 at its Conway launch and to PlutusV1/V2
+/// at the van Rossem (PV11) hard fork (#860.2) — shared by [`apply_v1`],
+/// [`apply_v2`], and [`apply_v3`] so there is one source of truth for the
+/// field shape.
+fn cek_constr_case_costs(m: &mut MachineCosts, cur: &mut Cursor<'_>) {
+    m.constr = cur.exbudget();
+    m.case_ = cur.exbudget();
+}
+
+/// Full BLS12-381 builtin block: 17 builtins / 38 flat params, alphabetical
+/// (G1 ops, G2 ops, `finalVerify`, `millerLoop`, `mulMlResult`). All
+/// `Constant` or `linear_in_x` shapes, refillable from
+/// [`BuiltinCosts::DEFAULT`]. Added to PlutusV3 at Conway and to PlutusV1/V2
+/// at van Rossem (PV11) (#860.2) — shared by [`apply_v1`], [`apply_v2`],
+/// and [`apply_v3`].
+fn bls12_381_batch(b: &mut BuiltinCosts, cur: &mut Cursor<'_>) -> Result<(), CostModelApplyError> {
+    use BuiltinId::*;
+    refill_builtin(b, Bls12_381_G1_Add, cur)?;
+    refill_builtin(b, Bls12_381_G1_Compress, cur)?;
+    refill_builtin(b, Bls12_381_G1_Equal, cur)?;
+    refill_builtin(b, Bls12_381_G1_HashToGroup, cur)?;
+    refill_builtin(b, Bls12_381_G1_Neg, cur)?;
+    refill_builtin(b, Bls12_381_G1_ScalarMul, cur)?;
+    refill_builtin(b, Bls12_381_G1_Uncompress, cur)?;
+    refill_builtin(b, Bls12_381_G2_Add, cur)?;
+    refill_builtin(b, Bls12_381_G2_Compress, cur)?;
+    refill_builtin(b, Bls12_381_G2_Equal, cur)?;
+    refill_builtin(b, Bls12_381_G2_HashToGroup, cur)?;
+    refill_builtin(b, Bls12_381_G2_Neg, cur)?;
+    refill_builtin(b, Bls12_381_G2_ScalarMul, cur)?;
+    refill_builtin(b, Bls12_381_G2_Uncompress, cur)?;
+    refill_builtin(b, Bls12_381_FinalVerify, cur)?;
+    refill_builtin(b, Bls12_381_MillerLoop, cur)?;
+    refill_builtin(b, Bls12_381_MulMlResult, cur)?;
+    Ok(())
+}
+
+/// `keccak_256` / `blake2b_224`: 2 builtins / 6 flat params (each
+/// `linear_in_x` cpu + `constant` mem), refillable. Added to PlutusV3 at
+/// Conway and to PlutusV1/V2 at van Rossem (PV11) (#860.2) — shared by
+/// [`apply_v1`], [`apply_v2`], and [`apply_v3`].
+fn keccak_blake2b224_batch(
+    b: &mut BuiltinCosts,
+    cur: &mut Cursor<'_>,
+) -> Result<(), CostModelApplyError> {
+    use BuiltinId::*;
+    refill_builtin(b, Keccak_256, cur)?;
+    refill_builtin(b, Blake2b_224, cur)?;
+    Ok(())
+}
+
+/// Plomin (PV10) bitwise batch: 12 builtins / 46 flat params —
+/// `andByteString`/`orByteString`/`xorByteString` (`linear_in_y_and_z` /
+/// `linear_in_max_yz`, via [`v3_bitwise_logical`]), then
+/// `complementByteString`, `readBit`, `writeBits`, `replicateByte`,
+/// `shiftByteString`, `rotateByteString`, `countSetBits`,
+/// `findFirstSetBit`, `ripemd_160` (generic refillable shapes). Added to
+/// PlutusV3 at Plomin and to PlutusV1/V2 at van Rossem (PV11), where it is
+/// byte-identical (#860.2) — shared by [`apply_v1`], [`apply_v2`], and
+/// [`apply_v3`].
+fn bitwise_batch(b: &mut BuiltinCosts, cur: &mut Cursor<'_>) -> Result<(), CostModelApplyError> {
+    use BuiltinId::*;
+    let and = v3_bitwise_logical(cur);
+    b.set_cost_pair(AndByteString, and);
+    let or = v3_bitwise_logical(cur);
+    b.set_cost_pair(OrByteString, or);
+    let xor = v3_bitwise_logical(cur);
+    b.set_cost_pair(XorByteString, xor);
+    refill_builtin(b, ComplementByteString, cur)?;
+    refill_builtin(b, ReadBit, cur)?;
+    refill_builtin(b, WriteBits, cur)?;
+    refill_builtin(b, ReplicateByte, cur)?;
+    refill_builtin(b, ShiftByteString, cur)?;
+    refill_builtin(b, RotateByteString, cur)?;
+    refill_builtin(b, CountSetBits, cur)?;
+    refill_builtin(b, FindFirstSetBit, cur)?;
+    refill_builtin(b, Ripemd_160, cur)?;
+    Ok(())
 }
 
 /// Apply a flat PlutusV3 cost-model array (Conway: 251 entries at PV9,
@@ -853,30 +999,12 @@ pub fn apply_v3(p: &[i64], major_pv: u32) -> Result<AppliedCosts, CostModelApply
     refill_builtin(&mut b, VerifyEd25519Signature, cur)?;
     refill_builtin(&mut b, VerifySchnorrSecp256k1Signature, cur)?;
     // [193..=196] cekConstrCost, cekCaseCost (Conway-specific machine steps).
-    m.constr = cur.exbudget();
-    m.case_ = cur.exbudget();
+    cek_constr_case_costs(&mut m, cur);
     // [197..=234] BLS12-381 batch (alphabetical: G1 ops, G2 ops, finalVerify,
     // millerLoop, mulMlResult). All Constant or linear_in_x shapes.
-    refill_builtin(&mut b, Bls12_381_G1_Add, cur)?;
-    refill_builtin(&mut b, Bls12_381_G1_Compress, cur)?;
-    refill_builtin(&mut b, Bls12_381_G1_Equal, cur)?;
-    refill_builtin(&mut b, Bls12_381_G1_HashToGroup, cur)?;
-    refill_builtin(&mut b, Bls12_381_G1_Neg, cur)?;
-    refill_builtin(&mut b, Bls12_381_G1_ScalarMul, cur)?;
-    refill_builtin(&mut b, Bls12_381_G1_Uncompress, cur)?;
-    refill_builtin(&mut b, Bls12_381_G2_Add, cur)?;
-    refill_builtin(&mut b, Bls12_381_G2_Compress, cur)?;
-    refill_builtin(&mut b, Bls12_381_G2_Equal, cur)?;
-    refill_builtin(&mut b, Bls12_381_G2_HashToGroup, cur)?;
-    refill_builtin(&mut b, Bls12_381_G2_Neg, cur)?;
-    refill_builtin(&mut b, Bls12_381_G2_ScalarMul, cur)?;
-    refill_builtin(&mut b, Bls12_381_G2_Uncompress, cur)?;
-    refill_builtin(&mut b, Bls12_381_FinalVerify, cur)?;
-    refill_builtin(&mut b, Bls12_381_MillerLoop, cur)?;
-    refill_builtin(&mut b, Bls12_381_MulMlResult, cur)?;
+    bls12_381_batch(&mut b, cur)?;
     // [235..=240] keccak_256, blake2b_224.
-    refill_builtin(&mut b, Keccak_256, cur)?;
-    refill_builtin(&mut b, Blake2b_224, cur)?;
+    keccak_blake2b224_batch(&mut b, cur)?;
     // [241..=250] integerToByteString, byteStringToInteger (special shapes).
     let i2b = integer_to_bytestring_cost(cur);
     b.set_cost_pair(IntegerToByteString, i2b);
@@ -892,21 +1020,7 @@ pub fn apply_v3(p: &[i64], major_pv: u32) -> Result<AppliedCosts, CostModelApply
     // — `pad_or_truncate` already guarantees `p` is exactly
     // `V3_PARAM_COUNT_VANROSSEM` long, so a pre-Plomin array's slice here is
     // `maxBound` padding rather than being skipped outright.
-    let and = v3_bitwise_logical(cur);
-    b.set_cost_pair(AndByteString, and);
-    let or = v3_bitwise_logical(cur);
-    b.set_cost_pair(OrByteString, or);
-    let xor = v3_bitwise_logical(cur);
-    b.set_cost_pair(XorByteString, xor);
-    refill_builtin(&mut b, ComplementByteString, cur)?;
-    refill_builtin(&mut b, ReadBit, cur)?;
-    refill_builtin(&mut b, WriteBits, cur)?;
-    refill_builtin(&mut b, ReplicateByte, cur)?;
-    refill_builtin(&mut b, ShiftByteString, cur)?;
-    refill_builtin(&mut b, RotateByteString, cur)?;
-    refill_builtin(&mut b, CountSetBits, cur)?;
-    refill_builtin(&mut b, FindFirstSetBit, cur)?;
-    refill_builtin(&mut b, Ripemd_160, cur)?;
+    bitwise_batch(&mut b, cur)?;
 
     debug_assert_eq!(
         cur.i, V3_PARAM_COUNT_BITWISE,
@@ -1343,6 +1457,46 @@ mod tests {
             .builtins
             .cost_for(BuiltinId::VerifyEd25519Signature, 0, 0, 2);
         assert_eq!((vfy.cpu, vfy.mem), (163 + 164 * 2, 165));
+    }
+
+    /// #860.2: pin the van-Rossem (PV11) TAIL start offset for V1 and V2. Feeding
+    /// `p[i] = i` makes each param equal its own index, so the CekConstr/CekCase
+    /// machine costs land at the exact tail positions:
+    ///   V1: prefix SerialiseData(4)+VerifyEcdsa(2)+VerifySchnorr(3) = 9 params, so
+    ///       CekConstr = p175/p176, CekCase = p177/p178.
+    ///   V2: those 9 are already in V2's 185-param base, so the tail STARTS at cek —
+    ///       CekConstr = p185/p186, CekCase = p187/p188.
+    /// Everything after cek reuses the V3-corpus-validated shared helpers
+    /// (`bls12_381_batch`/`keccak_blake2b224_batch`/`bitwise_batch`/`van_rossem_tail`),
+    /// so pinning this offset (plus the 332-param walk-completeness assert) validates
+    /// the whole V1/V2 tail alignment — which the PV-less conformance corpus cannot.
+    #[test]
+    fn vanrossem_v1_v2_tail_index_mapping_860_2() {
+        let p: Vec<i64> = (0..332).collect();
+
+        let v1 = apply_v1(&p, 11).unwrap();
+        assert_eq!(
+            (v1.machine.constr.cpu, v1.machine.constr.mem),
+            (175, 176),
+            "V1 CekConstr must land at params 175/176 (after the 9-param SerialiseData/ECDSA/Schnorr prefix)"
+        );
+        assert_eq!(
+            (v1.machine.case_.cpu, v1.machine.case_.mem),
+            (177, 178),
+            "V1 CekCase must land at params 177/178"
+        );
+
+        let v2 = apply_v2(&p, 11).unwrap();
+        assert_eq!(
+            (v2.machine.constr.cpu, v2.machine.constr.mem),
+            (185, 186),
+            "V2 CekConstr must land at params 185/186 (the first van-Rossem tail entry)"
+        );
+        assert_eq!(
+            (v2.machine.case_.cpu, v2.machine.case_.mem),
+            (187, 188),
+            "V2 CekCase must land at params 187/188"
+        );
     }
 
     /// #845 gap: V2 and V3 each had a wrong-length pad/truncate golden
