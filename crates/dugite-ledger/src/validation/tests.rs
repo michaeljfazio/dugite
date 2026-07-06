@@ -2620,7 +2620,7 @@ mod tests {
         // fixture survives any future flat/CBOR-encoding tweak.
         let plutus_script_bytes = {
             let p = dugite_uplc::program::Program {
-                version: (1, 0, 0),
+                version: dugite_uplc::program::Program::version_triple(1, 0, 0),
                 term: dugite_uplc::term::Term::Const(dugite_uplc::term::Constant::Integer(
                     num_bigint::BigInt::from(0),
                 )),
