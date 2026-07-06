@@ -3224,11 +3224,11 @@ mod tests {
             // ──────────────────────────────────────────────────────────────
             let term = Term::Const(Constant::Integer(42.into()));
             let v4_program = Program {
-                version: (1, 2, 0),
+                version: dugite_uplc::program::Program::version_triple(1, 2, 0),
                 term: term.clone(),
             };
             let v3_program = Program {
-                version: (1, 1, 0),
+                version: dugite_uplc::program::Program::version_triple(1, 1, 0),
                 term: term.clone(),
             };
             let v4_cbor_wrapped = v4_program

@@ -36,6 +36,24 @@ pub struct Program {
 }
 
 impl Program {
+    /// Construct a `(major, minor, patch)` version triple from `u64` components.
+    ///
+    /// Ergonomic helper for callers (chiefly tests and locally-constructed
+    /// programs) that hold small version numbers — the on-wire triple is
+    /// arbitrary-precision `Natural`/`BigUint` (#842), so a bare `(1, 0, 0)`
+    /// integer-literal tuple no longer type-checks.
+    pub fn version_triple(
+        major: u64,
+        minor: u64,
+        patch: u64,
+    ) -> (
+        num_bigint::BigUint,
+        num_bigint::BigUint,
+        num_bigint::BigUint,
+    ) {
+        (major.into(), minor.into(), patch.into())
+    }
+
     /// Decode a CBOR-wrapped flat-encoded UPLC program.
     ///
     /// The wire shape is a single CBOR byte-string (major type 2) whose

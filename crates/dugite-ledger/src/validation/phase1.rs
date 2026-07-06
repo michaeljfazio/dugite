@@ -5277,7 +5277,7 @@ mod tests {
 
     fn minimal_plutus_program_flat() -> Vec<u8> {
         let p = dugite_uplc::program::Program {
-            version: (1, 0, 0),
+            version: dugite_uplc::program::Program::version_triple(1, 0, 0),
             term: dugite_uplc::term::Term::Const(dugite_uplc::term::Constant::Integer(
                 num_bigint::BigInt::from(0),
             )),
@@ -5296,7 +5296,7 @@ mod tests {
     /// `ScriptRef` tests.
     fn minimal_plutus_program_cbor() -> Vec<u8> {
         let p = dugite_uplc::program::Program {
-            version: (1, 0, 0),
+            version: dugite_uplc::program::Program::version_triple(1, 0, 0),
             term: dugite_uplc::term::Term::Const(dugite_uplc::term::Constant::Integer(
                 num_bigint::BigInt::from(0),
             )),
