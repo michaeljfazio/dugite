@@ -248,10 +248,12 @@ pub fn compute_reward_update(
         // #615b: Haskell's RewardUpdate carries only treasury_cut in deltaT;
         // the undistributed portion of reward_pot is refunded to reserves via
         // deltaR = -expansion + undistributed. With distributed=0, undistributed
-        // = reward_pot, so delta_reserves (the unsigned subtract) is
-        // expansion - reward_pot = treasury_cut - epoch_fees.
+        // = reward_pot, so delta_reserves is expansion - reward_pot =
+        // treasury_cut - epoch_fees. #796: signed — a degraded epoch where
+        // epoch_fees > treasury_cut credits reserves (delta_reserves < 0)
+        // instead of saturating the credit away.
         let delta_treasury = treasury_cut;
-        let delta_reserves = treasury_cut.saturating_sub(epoch_fees);
+        let delta_reserves = treasury_cut as i128 - epoch_fees as i128;
         return PendingRewardUpdate {
             delta_reserves,
             delta_treasury,
@@ -270,8 +272,9 @@ pub fn compute_reward_update(
     let go = match go_snapshot {
         Some(s) => s,
         None => {
+            // #796: signed delta_reserves — see the total_stake==0 branch above.
             let delta_treasury = treasury_cut;
-            let delta_reserves = treasury_cut.saturating_sub(epoch_fees);
+            let delta_reserves = treasury_cut as i128 - epoch_fees as i128;
             return PendingRewardUpdate {
                 delta_reserves,
                 delta_treasury,
@@ -292,8 +295,9 @@ pub fn compute_reward_update(
             go.pool_stake.len()
         );
         // #615b: distributed=0, undistributed=reward_pot → reserves (not treasury).
+        // #796: signed delta_reserves — see the total_stake==0 branch above.
         let delta_treasury = treasury_cut;
-        let delta_reserves = treasury_cut.saturating_sub(epoch_fees);
+        let delta_reserves = treasury_cut as i128 - epoch_fees as i128;
         return PendingRewardUpdate {
             delta_reserves,
             delta_treasury,
@@ -561,11 +565,18 @@ pub fn compute_reward_update(
     // Conservation (Haskell RUPD):
     //   deltaT = treasury_cut
     //   deltaR (Haskell signed: applied to reserves) = -expansion + undistributed
-    //   ⇒ dugite delta_reserves (unsigned subtract from reserves)
+    //   ⇒ dugite delta_reserves (signed; positive DEBITS reserves, negative
+    //     CREDITS reserves — see issue #796)
     //     = expansion - undistributed
     //     = (treasury_cut + reward_pot - epoch_fees) - undistributed
     //     = treasury_cut + (reward_pot - undistributed) - epoch_fees
     //     = treasury_cut + total_distributed - epoch_fees ✓
+    //   In a degraded/low-block epoch, epoch_fees can exceed
+    //   treasury_cut + total_distributed, making delta_reserves NEGATIVE —
+    //   i.e. reserves grow. Haskell represents this with a signed
+    //   `DeltaCoin`/`Integer`; dugite mirrors that with `i128` (#796). Prior
+    //   to #796 this used `saturating_sub`, which floored the credit to 0
+    //   and silently broke the six-pot conservation identity below.
     //
     // Six-pot: -delta_reserves + delta_treasury + total_distributed + undistributed
     //        − epoch_fees = -(expansion - undistributed) + treasury_cut
@@ -573,9 +584,7 @@ pub fn compute_reward_update(
     //                     = -expansion + treasury_cut + reward_pot - epoch_fees
     //                     = 0 ✓  (since expansion = treasury_cut + reward_pot - epoch_fees)
     let delta_treasury = treasury_cut;
-    let delta_reserves = treasury_cut
-        .saturating_add(total_distributed)
-        .saturating_sub(epoch_fees);
+    let delta_reserves = treasury_cut as i128 + total_distributed as i128 - epoch_fees as i128;
 
     debug!(
         "Rewards calculated: {} lovelace to {} accounts, \
@@ -604,6 +613,29 @@ pub fn compute_reward_update(
     }
 }
 
+/// Apply a signed RUPD `delta_reserves` (Haskell's `deltaR`, a signed
+/// `DeltaCoin`/`Integer`) to the `u64` reserves pot.
+///
+/// `delta_reserves >= 0` DEBITS reserves (the normal monetary-expansion
+/// case). `delta_reserves < 0` CREDITS reserves — reachable in a
+/// degraded/low-block epoch where `epoch_fees` exceeds
+/// `treasury_cut + total_distributed` (issue #796); Haskell's
+/// `applyRUpdFiltered` refunds the difference to reserves via
+/// `addDeltaCoin`, which can only ever increase a `u64` pot, never
+/// underflow it, so the credit branch keeps a distinct overflow message
+/// from the debit branch's underflow message.
+pub(crate) fn apply_reserves_delta(reserves: u64, delta_reserves: i128) -> u64 {
+    if delta_reserves >= 0 {
+        reserves
+            .checked_sub(delta_reserves as u64)
+            .expect("RUPD delta_reserves exceeds reserves — ledger invariant broken")
+    } else {
+        reserves
+            .checked_add((-delta_reserves) as u64)
+            .expect("RUPD delta_reserves credit overflows reserves u64 — ledger invariant broken")
+    }
+}
+
 impl LedgerState {
     /// Apply a pending reward update to the ledger state.
     ///
@@ -612,13 +644,10 @@ impl LedgerState {
     /// deferred application pattern.
     pub(crate) fn apply_pending_reward_update(&mut self) {
         if let Some(rupd) = self.epochs.pending_reward_update.take() {
-            // Apply reserves decrease (monetary expansion)
-            self.epochs.reserves.0 = self
-                .epochs
-                .reserves
-                .0
-                .checked_sub(rupd.delta_reserves)
-                .expect("RUPD delta_reserves exceeds reserves — ledger invariant broken");
+            // Apply signed reserves adjustment (monetary expansion normally
+            // debits reserves; a degraded epoch can credit them — #796).
+            self.epochs.reserves.0 =
+                apply_reserves_delta(self.epochs.reserves.0, rupd.delta_reserves);
 
             // Apply treasury increase (tau cut only; undistributed went to reserves
             // via delta_reserves above; per-reward unregistered → treasury below).
@@ -756,12 +785,7 @@ impl LedgerState {
         let rupd =
             self.calculate_rewards_inner(&rupd_snapshot, &rupd_snapshot, self.utxo.epoch_fees.0);
         // Apply immediately (legacy behavior for test compatibility)
-        self.epochs.reserves.0 = self
-            .epochs
-            .reserves
-            .0
-            .checked_sub(rupd.delta_reserves)
-            .expect("RUPD delta_reserves exceeds reserves — ledger invariant broken");
+        self.epochs.reserves.0 = apply_reserves_delta(self.epochs.reserves.0, rupd.delta_reserves);
         self.epochs.treasury.0 = self
             .epochs
             .treasury
@@ -782,7 +806,7 @@ impl LedgerState {
 
 #[cfg(test)]
 mod tests {
-    use super::Rat;
+    use super::{apply_reserves_delta, Rat};
 
     // -----------------------------------------------------------------------
     // GCD correctness
@@ -1218,6 +1242,91 @@ mod tests {
         );
         assert_eq!(rupd.delta_treasury, 0);
         assert_eq!(rupd.delta_reserves, 0);
+    }
+
+    /// Regression test for issue #796: in a degraded/low-block epoch where
+    /// `epoch_fees` alone dwarfs `treasury_cut` (no pools ⇒
+    /// `total_distributed == 0`), Haskell's signed `deltaR` CREDITS
+    /// reserves rather than silently saturating the credit to 0. Hits the
+    /// `total_stake == 0` branch of `compute_reward_update` (reserves ==
+    /// max_lovelace_supply).
+    #[test]
+    fn test_degraded_epoch_credits_reserves_796() {
+        let mut params = dugite_primitives::protocol_params::ProtocolParameters::mainnet_defaults();
+        // Round numbers so expected values are easy to hand-verify.
+        params.rho = dugite_primitives::transaction::Rational {
+            numerator: 1,
+            denominator: 10,
+        };
+        params.tau = dugite_primitives::transaction::Rational {
+            numerator: 1,
+            denominator: 10,
+        };
+
+        let bprev_blocks_by_pool = std::collections::HashMap::new();
+        let reward_accounts = std::collections::HashMap::new();
+        let d_ge_4_5 = dugite_primitives::transaction::Rational {
+            numerator: 1,
+            denominator: 1,
+        };
+
+        const MAX_SUPPLY: u64 = 1_000_000;
+        const RESERVES: u64 = 1_000_000; // == MAX_SUPPLY ⇒ total_stake == 0
+        const EPOCH_FEES: u64 = 10_000_000; // dwarfs expansion ⇒ degraded epoch
+
+        let rupd = super::compute_reward_update(
+            &params,
+            &d_ge_4_5, // prev_d >= 4/5 ⇒ full expansion, no eta scaling
+            9,         // prev_protocol_version_major (Conway)
+            None,      // no GO snapshot — irrelevant, total_stake==0 short-circuits first
+            &bprev_blocks_by_pool,
+            dugite_primitives::value::Lovelace(EPOCH_FEES),
+            dugite_primitives::value::Lovelace(RESERVES),
+            dugite_primitives::value::Lovelace(0),
+            &reward_accounts,
+            None,
+            86_400,
+            0,
+            MAX_SUPPLY,
+        );
+
+        // expansion = floor(rho * reserves) = floor(0.1 * 1_000_000) = 100_000
+        // total_rewards_available = expansion + epoch_fees = 10_100_000
+        // treasury_cut = floor(tau * total_rewards_available) = 1_010_000
+        // delta_reserves = treasury_cut - epoch_fees = 1_010_000 - 10_000_000 = -8_990_000
+        assert_eq!(rupd.delta_treasury, 1_010_000);
+        assert_eq!(
+            rupd.delta_reserves, -8_990_000,
+            "degraded epoch (fees >> expansion) must CREDIT reserves \
+             (negative delta_reserves), not saturate the credit to 0"
+        );
+        assert!(
+            rupd.delta_reserves < 0,
+            "reserves must increase when epoch_fees exceeds treasury_cut"
+        );
+
+        // Pot-conservation identity: the only new lovelace entering the
+        // (reserves, treasury, distributed-to-accounts) system this
+        // boundary is `epoch_fees` (monetary expansion just moves reserves'
+        // own money around, net of what comes back as `delta_reserves`).
+        // So: -delta_reserves + delta_treasury + total_distributed ==
+        // epoch_fees, for ANY split between treasury/reserves/distributed —
+        // this holds independently of which branch of
+        // `compute_reward_update` produced the values, and is exactly the
+        // identity that `saturating_sub` used to silently violate by
+        // flooring a would-be-negative `delta_reserves` to 0 (issue #796).
+        let total_distributed = 0i128; // no pools in this branch
+        let conservation = -rupd.delta_reserves + rupd.delta_treasury as i128 + total_distributed;
+        assert_eq!(
+            conservation, EPOCH_FEES as i128,
+            "pot conservation identity (-delta_reserves + delta_treasury + total_distributed \
+             == epoch_fees) must hold"
+        );
+
+        // Applying the signed delta must INCREASE the u64 reserves pot
+        // without panicking (this is exactly what all 7 RUPD apply sites do).
+        let new_reserves = apply_reserves_delta(RESERVES, rupd.delta_reserves);
+        assert_eq!(new_reserves, RESERVES + 8_990_000);
     }
 
     /// Regression scaffold for GitHub issue #438 (preview epoch 1268 leader

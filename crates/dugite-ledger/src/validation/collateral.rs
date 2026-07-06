@@ -110,8 +110,16 @@ pub(crate) fn check_collateral(
         });
     }
 
-    // Account for collateral return output (Babbage+)
-    let effective_collateral = if let Some(col_return) = &body.collateral_return {
+    // Account for collateral return output (Babbage+).
+    //
+    // Kept as a SIGNED i128 (not `saturating_sub`) so that an over-declared
+    // `collateral_return` (return coin > collateral input coin) is not
+    // silently clamped to 0. Haskell keeps a signed `DeltaCoin` here; a
+    // genuinely negative balance must still fail the collateral-sufficiency
+    // check below (`100*bal >= collPerc*txfee` never holds for negative
+    // `bal`), so clamping to 0 could let an under-collateralized tx pass at
+    // fee=0 (#801).
+    let effective_collateral: i128 = if let Some(col_return) = &body.collateral_return {
         // Subtract collateral_return multi-asset from net balance
         for (policy, assets) in &col_return.value.multi_asset {
             for (name, qty) in assets {
@@ -122,41 +130,53 @@ pub(crate) fn check_collateral(
                     .or_insert(0) -= *qty as i128;
             }
         }
-        collateral_value.saturating_sub(col_return.value.coin.0)
+        collateral_value as i128 - col_return.value.coin.0 as i128
     } else {
-        collateral_value
+        collateral_value as i128
     };
 
-    // Net collateral (inputs minus return) must be pure ADA
+    // Net collateral (inputs minus return) must be pure ADA. Haskell's
+    // `isAdaOnly (collBalance <-> return)` retains ANY non-zero entry —
+    // including NEGATIVE residuals from an over-declared `collateral_return`
+    // token quantity — `Map.null`, not "any positive leftover" (#789).
     let has_net_tokens = collateral_multi_asset
         .values()
-        .any(|assets: &BTreeMap<AssetName, i128>| assets.values().any(|qty| *qty > 0));
+        .any(|assets: &BTreeMap<AssetName, i128>| assets.values().any(|qty| *qty != 0));
     if has_net_tokens {
         errors.push(ValidationError::CollateralHasTokens(
             "net collateral has non-ADA tokens after collateral_return".to_string(),
         ));
     }
 
-    // If total_collateral is declared, it must match the effective collateral
+    // If total_collateral is declared, it must match the effective collateral.
+    // Compared in i128 so a negative effective balance can never spuriously
+    // match a non-negative declared `total_collateral` (#801).
     if let Some(total_col) = body.total_collateral {
-        if total_col.0 != effective_collateral {
+        if total_col.0 as i128 != effective_collateral {
             errors.push(ValidationError::CollateralMismatch {
                 declared: total_col.0,
-                computed: effective_collateral,
+                // `ValidationError::CollateralMismatch.computed` is u64 (also
+                // used as the wire-encoded Coin in the N2C LocalTxSubmission
+                // IncorrectTotalCollateralField payload); clamp for display
+                // only — the signed comparison above already used the exact
+                // i128 value.
+                computed: effective_collateral.max(0) as u64,
             });
         }
     }
 
-    // Effective collateral must be >= ceil(fee * collateral_percentage / 100).
-    //
-    // Haskell uses `ceiling (fromIntegral fee * fromIntegral pct % 100)`, which
-    // is equivalent to ceiling division.  Truncating division under-counts by at
-    // most 1 lovelace, which would incorrectly accept transactions whose
-    // collateral sits exactly on the fractional threshold.
-    //
-    // Example: fee=101, pct=150 → exact=151.5 → required=152 (not 151).
-    let required_collateral = (body.fee.0 * params.collateral_percentage).div_ceil(100);
-    if effective_collateral < required_collateral {
+    // Effective collateral must be >= ceil(fee * collateral_percentage / 100),
+    // checked as `100 * effective_collateral >= collateral_percentage * fee`
+    // (Haskell `Integer` arithmetic: `100*bal >= collPerc*txfee`). This is the
+    // exact integer equivalent of the ceiling-division form (for integers
+    // a,b,c>0: `a >= ceil(b/c)` iff `a*c >= b`) but avoids an unchecked u64
+    // `fee * collateral_percentage` multiply that could wrap in a release
+    // build (no overflow-checks profile) on an attacker-controlled fee
+    // (#801), and naturally rejects any negative `effective_collateral`
+    // (over-declared collateral_return) regardless of fee, matching Haskell.
+    if 100i128 * effective_collateral
+        < (params.collateral_percentage as i128) * (body.fee.0 as i128)
+    {
         errors.push(ValidationError::InsufficientCollateral);
     }
 
@@ -1577,6 +1597,84 @@ mod tests {
                 }
             )),
             "expected CollateralMismatch{{declared:500_000,computed:1_000_000}}, got: {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 7b (#789): over-declared collateral_return token → negative
+    // residual must still flag CollateralHasTokens
+    // -----------------------------------------------------------------------
+
+    /// Collateral input is pure ADA (no tokens at all). `collateral_return`
+    /// declares 5 units of a token the collateral inputs never held, so the
+    /// net residual for that token is `0 - 5 = -5` — NEGATIVE, not positive.
+    /// Haskell's `isAdaOnly (collBalance <-> return)` rejects any non-zero
+    /// entry (`Map.null`), so this must still produce `CollateralHasTokens`;
+    /// a `qty > 0` predicate misses it entirely (#789).
+    #[test]
+    fn test_collateral_return_over_declares_token_negative_residual() {
+        let policy = [0xCDu8; 28];
+        let col = input(0xC5);
+
+        let mut utxo = UtxoSet::new();
+        // Collateral input: pure ADA, no multi-asset at all.
+        utxo.insert(col.clone(), ada_output(5_000_000));
+
+        // collateral_return declares a token the inputs never held.
+        let col_return = multi_asset_output(4_700_000, policy, 5);
+
+        let mut tx = make_plutus_tx(200_000, vec![col]);
+        tx.body.fee = Lovelace(200_000);
+        tx.body.collateral_return = Some(col_return);
+
+        let params = default_params();
+        let mut errors: Vec<ValidationError> = Vec::new();
+        check_collateral(&tx, &utxo, &params, &mut errors);
+
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::CollateralHasTokens(_))),
+            "over-declared collateral_return token (negative net residual) must \
+             still produce CollateralHasTokens, got: {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 7c (#801): fee=0 with over-declared collateral_return coin ->
+    // negative effective collateral must still be InsufficientCollateral
+    // -----------------------------------------------------------------------
+
+    /// `collateral_return` declares MORE ada than the collateral input held,
+    /// so `effective_collateral = 1_000_000 - 1_500_000 = -500_000`. At
+    /// `fee=0`, the old `saturating_sub`-based unsigned computation clamped
+    /// this to 0, which would have satisfied
+    /// `effective_collateral(=0) >= ceil(0 * pct / 100) = 0` — silently
+    /// accepting an under-collateralized (indeed negative-balance) tx.
+    /// Haskell's signed `DeltaCoin` never allows a negative balance to pass
+    /// (`100*bal >= collPerc*txfee` fails for any negative `bal`), so this
+    /// must produce `InsufficientCollateral` even at fee=0.
+    #[test]
+    fn test_negative_effective_collateral_at_zero_fee_is_insufficient() {
+        let col = input(0xC6);
+        let mut utxo = UtxoSet::new();
+        utxo.insert(col.clone(), ada_output(1_000_000));
+
+        let mut tx = make_plutus_tx(0, vec![col]);
+        tx.body.fee = Lovelace(0);
+        // Over-declare: return coin (1.5M) exceeds collateral input coin (1M).
+        tx.body.collateral_return = Some(ada_output(1_500_000));
+
+        let params = default_params();
+        let mut errors: Vec<ValidationError> = Vec::new();
+        check_collateral(&tx, &utxo, &params, &mut errors);
+
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::InsufficientCollateral)),
+            "negative effective collateral at fee=0 must produce \
+             InsufficientCollateral, got: {errors:?}"
         );
     }
 

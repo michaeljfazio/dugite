@@ -30,6 +30,7 @@
 //! `builtinCostModelE.json`. Variants not present in the JSON are
 //! omitted; all evaluators are `const fn`-compatible.
 
+use crate::builtin::semantics::SemanticsVariant;
 use crate::data::Data;
 use crate::machine::value::Value;
 use crate::machine::ExBudget;
@@ -48,7 +49,14 @@ pub fn size_of_constant(c: &Constant) -> i64 {
         Constant::Unit => 1,
         Constant::Bool(_) => 1,
         Constant::ProtoList { elements, .. } => elements.len() as i64,
-        Constant::ProtoPair { .. } => 1,
+        // Haskell `instance ExMemoryUsage (a,b)` is `singletonRose maxBound`
+        // — a deliberate poison value, not a real size (#844). No current
+        // cost model keys a cost on a pair argument's SIZE (fstPair/
+        // sndPair/mkPairData are all constant-cost), so this is latent: if
+        // a future cost model ever did, Haskell would fail the script
+        // (maxBound dominates any budget) where a finite placeholder here
+        // would let it run cheaply.
+        Constant::ProtoPair { .. } => i64::MAX,
         Constant::Data(d) => size_of_data(d),
         // BLS elements have fixed ExMemory sizes per the Haskell reference.
         Constant::Bls12_381G1Element(_) => 18,
@@ -93,9 +101,11 @@ fn size_of_integer(n: &num_bigint::BigInt) -> i64 {
 /// Haskell uses truncating integer division (`quot`).
 fn size_of_bytestring(bs: &[u8]) -> i64 {
     let len = bs.len() as i64;
-    ((len - 1) / 8 + 1).max(1) // for empty: ((-1)/8+1) in Rust = 0+1=1? No: -1/8 = 0 (truncation)
-                               // Actually in Rust, -1_i64 / 8 = 0 (truncation toward zero), so:
-                               // ((0 - 1) / 8 + 1) = ((-1) / 8 + 1) = (0 + 1) = 1.  ✓
+    // `.max(1)` is redundant (#844): the formula already yields exactly 1
+    // for the empty-string case via Rust's truncating (toward-zero) `/`:
+    // `((0 - 1) / 8 + 1) = ((-1) / 8 + 1) = (0 + 1) = 1`, and it only grows
+    // from there for any `len >= 1`.
+    (len - 1) / 8 + 1
 }
 
 /// `TextCostedByByteLength`: `utf8_byte_len quot 4`.
@@ -305,7 +315,12 @@ pub struct SubtractedSizesP {
 
 impl SubtractedSizesP {
     fn eval(self, x: i64, y: i64) -> i64 {
-        (self.intercept + self.slope * (x - y)).max(self.minimum)
+        // Saturating (#829) — mirrors Haskell `SatInt`; an adversarial
+        // governance-set `slope`/`x`/`y` combination must saturate at
+        // `i64::MAX`/`MIN`, never wrap or panic.
+        self.intercept
+            .saturating_add(self.slope.saturating_mul(x.saturating_sub(y)))
+            .max(self.minimum)
     }
 }
 
@@ -320,7 +335,8 @@ pub struct DiagLinearP {
 impl DiagLinearP {
     fn eval(self, x: i64, y: i64) -> i64 {
         if x == y {
-            self.intercept + self.slope * x
+            // Saturating (#829).
+            self.intercept.saturating_add(self.slope.saturating_mul(x))
         } else {
             self.constant
         }
@@ -381,7 +397,10 @@ impl ConstAboveDiagLinXYP {
         if x < y {
             self.constant
         } else {
-            self.intercept + self.slope1 * x + self.slope2 * y
+            // Saturating (#829).
+            self.intercept
+                .saturating_add(self.slope1.saturating_mul(x))
+                .saturating_add(self.slope2.saturating_mul(y))
         }
     }
 }
@@ -437,12 +456,14 @@ pub struct QuadXY {
 
 impl QuadXY {
     fn eval(self, x: i64, y: i64) -> i64 {
-        (self.c00
-            + self.c10 * x
-            + self.c01 * y
-            + self.c20 * x * x
-            + self.c11 * x * y
-            + self.c02 * y * y)
+        // Saturating (#829) — each term via `saturating_mul`, chained via
+        // `saturating_add`.
+        self.c00
+            .saturating_add(self.c10.saturating_mul(x))
+            .saturating_add(self.c01.saturating_mul(y))
+            .saturating_add(self.c20.saturating_mul(x).saturating_mul(x))
+            .saturating_add(self.c11.saturating_mul(x).saturating_mul(y))
+            .saturating_add(self.c02.saturating_mul(y).saturating_mul(y))
             .max(self.minimum)
     }
 }
@@ -481,7 +502,10 @@ pub struct LinearYZP {
 
 impl LinearYZP {
     fn eval(self, y: i64, z: i64) -> i64 {
-        self.intercept + self.slope1 * y + self.slope2 * z
+        // Saturating (#829).
+        self.intercept
+            .saturating_add(self.slope1.saturating_mul(y))
+            .saturating_add(self.slope2.saturating_mul(z))
     }
 }
 
@@ -496,12 +520,20 @@ pub struct ExpModP {
 
 impl ExpModP {
     fn eval(self, aa: i64, ee: i64, mm: i64) -> i64 {
-        let cost0 =
-            self.coefficient00 + self.coefficient11 * ee * mm + self.coefficient12 * ee * mm * mm;
+        // Saturating (#829).
+        let cost0 = self
+            .coefficient00
+            .saturating_add(self.coefficient11.saturating_mul(ee).saturating_mul(mm))
+            .saturating_add(
+                self.coefficient12
+                    .saturating_mul(ee)
+                    .saturating_mul(mm)
+                    .saturating_mul(mm),
+            );
         if aa <= mm {
             cost0
         } else {
-            cost0 + cost0 / 2
+            cost0.saturating_add(cost0 / 2)
         }
     }
 }
@@ -572,8 +604,11 @@ impl CostingFun {
             Self::LinearInX(f) => f.eval(x),
             Self::LinearInY(f) => f.eval(y),
             Self::LinearInZ(f) => f.eval(z),
-            Self::AddedSizes(f) => f.eval(x + y),
-            Self::MultipliedSizes(f) => f.eval(x * y),
+            // Saturating (#829): the size combination itself must not
+            // overflow before being fed into the (already-saturating)
+            // Linear1 model.
+            Self::AddedSizes(f) => f.eval(x.saturating_add(y)),
+            Self::MultipliedSizes(f) => f.eval(x.saturating_mul(y)),
             Self::MinSize(f) => f.eval(x.min(y)),
             Self::MaxSize(f) => f.eval(x.max(y)),
             Self::SubtractedSizes(f) => f.eval(x, y),
@@ -702,16 +737,41 @@ impl BuiltinCosts {
     ///
     /// Sizing is per the Haskell `ExMemoryUsage` rules; see module-level
     /// doc for details.
-    pub fn charge_for_args(&self, id: BuiltinId, args: &[Value]) -> ExBudget {
+    ///
+    /// `variant` is the script's [`SemanticsVariant`] (computed once by the
+    /// caller from `(language, major_pv)`). It currently gates only the
+    /// `Text` argument-sizing measure for `appendString`/`equalsString`/
+    /// `encodeUtf8` (#819): variants A/B/C (PV < `VAN_ROSSEM_PV`) size by
+    /// character count; D/E (PV ≥ `VAN_ROSSEM_PV`) size by UTF-8
+    /// byte-length ÷ 4 (`TextCostedByByteLength`). The rate parameters
+    /// (slope/intercept) are identical across B/C/D/E — only the measure
+    /// changes. Context-free callers (the UPLC conformance harness,
+    /// [`crate::machine::cost::BudgetTracker::new_counting`],
+    /// [`crate::machine::step::evaluate`]) pass [`SemanticsVariant::LATEST`]
+    /// (= E), which is the variant the corpus goldens are computed against.
+    pub fn charge_for_args(
+        &self,
+        id: BuiltinId,
+        args: &[Value],
+        variant: SemanticsVariant,
+    ) -> ExBudget {
         use BuiltinId::*;
         // Retrieve argument sizes using the correct costing wrapper for
         // each position. Most builtins use the default `size_of_value`
         // sizing; a few need special wrappers.
         let (x, y, z) = match id {
-            // ── String builtins — appendString/equalsString use TextCostedByByteLength
+            // ── String builtins — appendString/equalsString: `Text`
+            //    memory usage is PV-gated (#819). A/B/C (PV<11) = plain
+            //    `ExMemoryUsage Text` = character count; D/E (PV>=11) =
+            //    `TextCostedByByteLength` = UTF-8 byte length / 4.
             AppendString | EqualsString => {
-                let sx = args.first().map_or(0, string_costed_by_byte_len);
-                let sy = args.get(1).map_or(0, string_costed_by_byte_len);
+                let size_fn: fn(&Value) -> i64 = if variant.text_costed_by_byte_length() {
+                    string_costed_by_byte_len
+                } else {
+                    string_costed_by_char_count
+                };
+                let sx = args.first().map_or(0, size_fn);
+                let sy = args.get(1).map_or(0, size_fn);
                 (sx, sy, 0)
             }
             // ── DecodeUtf8: input is a ByteString
@@ -719,11 +779,15 @@ impl BuiltinCosts {
                 let sx = args.first().map_or(0, size_of_value);
                 (sx, 0, 0)
             }
-            // ── EncodeUtf8: input is a String costed by UTF-8 byte length
-            //    (TextCostedByByteLength in the V2 builtin semantics).
-            //    Conformance corpus computes goldens against this variant.
+            // ── EncodeUtf8: input is a String, sized the same
+            //    variant-gated way as AppendString/EqualsString (#819).
             EncodeUtf8 => {
-                let sx = args.first().map_or(0, string_costed_by_byte_len);
+                let size_fn: fn(&Value) -> i64 = if variant.text_costed_by_byte_length() {
+                    string_costed_by_byte_len
+                } else {
+                    string_costed_by_char_count
+                };
+                let sx = args.first().map_or(0, size_fn);
                 (sx, 0, 0)
             }
             // ── integerToByteString: arg2 is width (NumBytesCostedAsNumWords),
@@ -1357,6 +1421,22 @@ mod tests {
     }
 
     #[test]
+    fn size_of_proto_pair_is_poison_max_bound() {
+        // #844: Haskell `instance ExMemoryUsage (a,b)` is
+        // `singletonRose maxBound` — a deliberate poison value, not a
+        // real size. A finite placeholder here would let a future
+        // pair-sized cost model run cheaply where Haskell fails the
+        // script outright.
+        let pair = Constant::ProtoPair {
+            a_type: crate::term::TypeTag::Integer,
+            b_type: crate::term::TypeTag::Integer,
+            a: Box::new(Constant::Integer(BigInt::from(1))),
+            b: Box::new(Constant::Integer(BigInt::from(2))),
+        };
+        assert_eq!(size_of_constant(&pair), i64::MAX);
+    }
+
+    #[test]
     fn size_of_integer_small() {
         assert_eq!(size_of_integer(&BigInt::from(1)), 1);
         assert_eq!(size_of_integer(&BigInt::from(-1)), 1);
@@ -1657,6 +1737,136 @@ mod tests {
         assert_eq!(CostingFun::LinearInX(f).eval(2, 0, 0), i64::MAX);
     }
 
+    // ─── #829: saturating arithmetic (mirrors Haskell `SatInt`) ───────────
+    //
+    // A governance-inflated coefficient (decoded straight off-chain into
+    // an `i64` with no range check) combined with realistic argument
+    // sizes must saturate the cost at `i64::MAX`/`MIN`, never wrap around
+    // or panic (in debug builds, plain arithmetic would panic on
+    // overflow; in release, it would silently wrap — potentially to a
+    // NEGATIVE charge that increases the remaining budget).
+
+    #[test]
+    fn subtracted_sizes_saturates() {
+        let p = SubtractedSizesP {
+            intercept: i64::MAX,
+            slope: i64::MAX,
+            minimum: 0,
+        };
+        // intercept + slope*(x-y) must saturate at every step: the
+        // subtraction, the multiplication, and the final addition.
+        assert_eq!(p.eval(i64::MAX, i64::MIN), i64::MAX);
+    }
+
+    #[test]
+    fn diag_linear_saturates_on_diagonal() {
+        let p = DiagLinearP {
+            constant: 0,
+            intercept: i64::MAX,
+            slope: i64::MAX,
+        };
+        assert_eq!(p.eval(2, 2), i64::MAX);
+    }
+
+    #[test]
+    fn const_above_diag_lin_xy_saturates_above_diagonal() {
+        let p = ConstAboveDiagLinXYP {
+            constant: 0,
+            intercept: i64::MAX,
+            slope1: i64::MAX,
+            slope2: i64::MAX,
+        };
+        assert_eq!(p.eval(i64::MAX, 0), i64::MAX);
+    }
+
+    #[test]
+    fn quad_xy_saturates_every_term() {
+        let p = QuadXY {
+            c00: i64::MAX,
+            c10: i64::MAX,
+            c01: i64::MAX,
+            c20: i64::MAX,
+            c11: i64::MAX,
+            c02: i64::MAX,
+            minimum: 0,
+        };
+        assert_eq!(p.eval(i64::MAX, i64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn linear_yz_saturates() {
+        let p = LinearYZP {
+            intercept: i64::MAX,
+            slope1: i64::MAX,
+            slope2: i64::MAX,
+        };
+        assert_eq!(p.eval(2, 2), i64::MAX);
+    }
+
+    #[test]
+    fn exp_mod_saturates_with_and_without_penalty() {
+        let p = ExpModP {
+            coefficient00: i64::MAX,
+            coefficient11: i64::MAX,
+            coefficient12: i64::MAX,
+        };
+        // aa <= mm branch (no penalty).
+        assert_eq!(p.eval(0, i64::MAX, i64::MAX), i64::MAX);
+        // aa > mm branch (+50% penalty) must also saturate, not panic
+        // (cost0 is already i64::MAX; cost0 + cost0/2 must stay i64::MAX).
+        assert_eq!(p.eval(i64::MAX, i64::MAX, 0), i64::MAX);
+    }
+
+    #[test]
+    fn costingfun_added_and_multiplied_sizes_saturate_the_combination() {
+        // The x+y / x*y combination itself must saturate before being fed
+        // into the (already-saturating) Linear1 model, not just the
+        // model's own arithmetic.
+        let f = lin1(0, 1);
+        assert_eq!(
+            CostingFun::AddedSizes(f).eval(i64::MAX, i64::MAX, 0),
+            i64::MAX
+        );
+        assert_eq!(
+            CostingFun::MultipliedSizes(f).eval(i64::MAX, i64::MAX, 0),
+            i64::MAX
+        );
+    }
+
+    #[test]
+    fn ex_budget_try_subtract_saturates_instead_of_overflowing() {
+        use crate::machine::ExBudget;
+        // Without saturation, `i64::MIN - i64::MAX` overflows (panics in
+        // debug). `try_subtract` must saturate the intermediate instead —
+        // here the huge (saturated) cost exceeds `remaining`, so the
+        // budget is exhausted (returns false) rather than panicking or
+        // wrapping to a bogus small/negative "remaining".
+        let mut remaining = ExBudget {
+            cpu: i64::MIN,
+            mem: 0,
+        };
+        let before = remaining;
+        assert!(!remaining.try_subtract(ExBudget {
+            cpu: i64::MAX,
+            mem: 0,
+        }));
+        // No mutation on failure.
+        assert_eq!(remaining, before);
+    }
+
+    #[test]
+    fn ex_budget_subtract_saturating_never_panics_and_allows_negative() {
+        use crate::machine::ExBudget;
+        let mut remaining = ExBudget { cpu: 100, mem: 100 };
+        remaining.subtract_saturating(ExBudget {
+            cpu: i64::MAX,
+            mem: 50,
+        });
+        assert_eq!(remaining.cpu, 100_i64.saturating_sub(i64::MAX));
+        assert!(remaining.cpu < 0);
+        assert_eq!(remaining.mem, 50);
+    }
+
     #[test]
     fn costingfun_constant_pair_evaluates_to_expected_budget() {
         let pair = CostPair::constant(11, 22);
@@ -1682,5 +1892,94 @@ mod tests {
         // 2^64 needs 2 words.
         let n2 = BigInt::from(u64::MAX) + BigInt::from(1);
         assert_eq!(memory_usage_integer(&n2), 2);
+    }
+
+    // ─── #819 PV-matrix: Text arg sizing (char-count vs byte-length/4) ────
+
+    /// `equalsString`/`appendString`/`encodeUtf8` must size their `Text`
+    /// argument(s) by CHARACTER COUNT at PV<11 (variants A/B/C) and by
+    /// UTF-8 byte-length÷4 at PV>=11 (variants D/E). Uses two strings whose
+    /// char-count and byte-length diverge (`"aaa"` = 3 chars/3 bytes vs
+    /// `"日本語"` = 3 chars/9 bytes) so the two measures produce genuinely
+    /// different `ExBudget`s — the 999-case conformance corpus runs a
+    /// single (LATEST=E, no-PV) harness and cannot catch a wrong PV<11
+    /// branch, hence this dedicated matrix test.
+    #[test]
+    fn text_builtins_arg_sizing_is_pv_gated() {
+        let ascii = Value::Const(Constant::String("aaa".to_string()));
+        let multibyte = Value::Const(Constant::String("日本語".to_string()));
+
+        // Sanity on the two measures themselves.
+        assert_eq!(size_of_string_by_char_count("aaa"), 3);
+        assert_eq!(size_of_string_by_byte_length("aaa"), 0); // 3/4 floor = 0
+        assert_eq!(size_of_string_by_char_count("日本語"), 3);
+        assert_eq!(size_of_string_by_byte_length("日本語"), 2); // 9/4 floor = 2
+
+        // ── equalsString: LinearOnDiagonal(constant=39184, intercept=1000,
+        //    slope=60594). Char-count sizes are (3,3) → ON-diagonal → linear.
+        //    Byte/4 sizes are (0,2) → OFF-diagonal → flat constant.
+        let args = [ascii.clone(), multibyte.clone()];
+        let pv10 = BuiltinCosts::DEFAULT.charge_for_args(
+            BuiltinId::EqualsString,
+            &args,
+            SemanticsVariant::C, // PlutusV3, PV<11
+        );
+        let pv11 = BuiltinCosts::DEFAULT.charge_for_args(
+            BuiltinId::EqualsString,
+            &args,
+            SemanticsVariant::E, // PlutusV3, PV>=11 (LATEST)
+        );
+        assert_eq!(
+            pv10.cpu,
+            1000 + 60594 * 3,
+            "PV<11 equalsString must size by char count (on-diagonal at 3==3)"
+        );
+        assert_eq!(
+            pv11.cpu, 39184,
+            "PV>=11 equalsString must size by byte/4 (off-diagonal at 0!=2)"
+        );
+        assert_ne!(
+            pv10.cpu, pv11.cpu,
+            "char-count vs byte/4 sizing must diverge — this IS the #819 bug"
+        );
+
+        // ── appendString: AddedSizes(intercept=1000, slope=59957).
+        let pv10_append = BuiltinCosts::DEFAULT.charge_for_args(
+            BuiltinId::AppendString,
+            &args,
+            SemanticsVariant::A, // PlutusV1/V2, PV<9 (still A/B/C bucket)
+        );
+        let pv11_append = BuiltinCosts::DEFAULT.charge_for_args(
+            BuiltinId::AppendString,
+            &args,
+            SemanticsVariant::D, // PlutusV1/V2, PV>=11
+        );
+        assert_eq!(pv10_append.cpu, 1000 + 59957 * (3 + 3));
+        assert_eq!(pv11_append.cpu, 1000 + 59957 * 2); // byte/4 sizes (0,2) sum to 2
+        assert_ne!(pv10_append.cpu, pv11_append.cpu);
+
+        // ── encodeUtf8: LinearInX(intercept=1000, slope=42921), single arg.
+        let one = [multibyte];
+        let pv10_encode = BuiltinCosts::DEFAULT.charge_for_args(
+            BuiltinId::EncodeUtf8,
+            &one,
+            SemanticsVariant::B, // PlutusV1/V2, 9<=PV<11
+        );
+        let pv11_encode = BuiltinCosts::DEFAULT.charge_for_args(
+            BuiltinId::EncodeUtf8,
+            &one,
+            SemanticsVariant::LATEST,
+        );
+        assert_eq!(
+            pv10_encode.cpu,
+            1000 + 42921 * 3,
+            "PV<11 encodeUtf8 must size by char count"
+        );
+        assert_eq!(
+            pv11_encode.cpu,
+            1000 + 42921 * 2,
+            "PV>=11 encodeUtf8 must size by byte/4"
+        );
+        assert_ne!(pv10_encode.cpu, pv11_encode.cpu);
     }
 }

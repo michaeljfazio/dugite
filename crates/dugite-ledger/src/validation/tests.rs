@@ -220,7 +220,7 @@ mod tests {
         let key = Hash32::from_bytes([1u8; 32]);
         let script = NativeScript::ScriptPubkey(key);
         let signers: HashSet<Hash32> = [key].into();
-        assert!(evaluate_native_script(&script, &signers, SlotNo(100)));
+        assert!(evaluate_native_script(&script, &signers, None, None));
     }
 
     #[test]
@@ -229,7 +229,7 @@ mod tests {
         let other_key = Hash32::from_bytes([2u8; 32]);
         let script = NativeScript::ScriptPubkey(key);
         let signers: HashSet<Hash32> = [other_key].into();
-        assert!(!evaluate_native_script(&script, &signers, SlotNo(100)));
+        assert!(!evaluate_native_script(&script, &signers, None, None));
     }
 
     #[test]
@@ -241,9 +241,9 @@ mod tests {
             NativeScript::ScriptPubkey(k2),
         ]);
         let signers: HashSet<Hash32> = [k1, k2].into();
-        assert!(evaluate_native_script(&script, &signers, SlotNo(100)));
+        assert!(evaluate_native_script(&script, &signers, None, None));
         let partial: HashSet<Hash32> = [k1].into();
-        assert!(!evaluate_native_script(&script, &partial, SlotNo(100)));
+        assert!(!evaluate_native_script(&script, &partial, None, None));
     }
 
     #[test]
@@ -255,9 +255,9 @@ mod tests {
             NativeScript::ScriptPubkey(k2),
         ]);
         let signers: HashSet<Hash32> = [k2].into();
-        assert!(evaluate_native_script(&script, &signers, SlotNo(100)));
+        assert!(evaluate_native_script(&script, &signers, None, None));
         let empty: HashSet<Hash32> = HashSet::new();
-        assert!(!evaluate_native_script(&script, &empty, SlotNo(100)));
+        assert!(!evaluate_native_script(&script, &empty, None, None));
     }
 
     #[test]
@@ -274,27 +274,70 @@ mod tests {
             ],
         );
         let signers: HashSet<Hash32> = [k1, k3].into();
-        assert!(evaluate_native_script(&script, &signers, SlotNo(100)));
+        assert!(evaluate_native_script(&script, &signers, None, None));
         let one: HashSet<Hash32> = [k1].into();
-        assert!(!evaluate_native_script(&script, &one, SlotNo(100)));
+        assert!(!evaluate_native_script(&script, &one, None, None));
     }
 
+    /// Issue #787: `InvalidBefore(lockStart)` is evaluated against the TX'S
+    /// OWN `invalid_before` (validity_interval_start), never a current/
+    /// application slot — succeeds iff `invalid_before = Some(s)` with
+    /// `lockStart <= s`; `None` (unset) always fails.
     #[test]
     fn test_native_script_invalid_before() {
         let script = NativeScript::InvalidBefore(SlotNo(50));
         let signers: HashSet<Hash32> = HashSet::new();
-        assert!(evaluate_native_script(&script, &signers, SlotNo(50)));
-        assert!(evaluate_native_script(&script, &signers, SlotNo(100)));
-        assert!(!evaluate_native_script(&script, &signers, SlotNo(49)));
+        assert!(evaluate_native_script(
+            &script,
+            &signers,
+            Some(SlotNo(50)),
+            None
+        ));
+        assert!(evaluate_native_script(
+            &script,
+            &signers,
+            Some(SlotNo(100)),
+            None
+        ));
+        assert!(!evaluate_native_script(
+            &script,
+            &signers,
+            Some(SlotNo(49)),
+            None
+        ));
+        // Unset validity-interval-start ⇒ always false (Haskell `SNothing`).
+        assert!(!evaluate_native_script(&script, &signers, None, None));
     }
 
+    /// Issue #787: `InvalidHereafter(lockExp)` is evaluated against the
+    /// TX'S OWN `invalid_hereafter` (ttl), never a current/application
+    /// slot — succeeds iff `invalid_hereafter = Some(e)` with
+    /// `e <= lockExp`; `None` (unset) always fails.
     #[test]
     fn test_native_script_invalid_hereafter() {
         let script = NativeScript::InvalidHereafter(SlotNo(100));
         let signers: HashSet<Hash32> = HashSet::new();
-        assert!(evaluate_native_script(&script, &signers, SlotNo(99)));
-        assert!(!evaluate_native_script(&script, &signers, SlotNo(100)));
-        assert!(!evaluate_native_script(&script, &signers, SlotNo(101)));
+        assert!(evaluate_native_script(
+            &script,
+            &signers,
+            None,
+            Some(SlotNo(99))
+        ));
+        // Non-strict upper bound on the tx side: ttl == lockExp succeeds.
+        assert!(evaluate_native_script(
+            &script,
+            &signers,
+            None,
+            Some(SlotNo(100))
+        ));
+        assert!(!evaluate_native_script(
+            &script,
+            &signers,
+            None,
+            Some(SlotNo(101))
+        ));
+        // Unset ttl ⇒ always false (Haskell `SNothing`).
+        assert!(!evaluate_native_script(&script, &signers, None, None));
     }
 
     #[test]
@@ -306,11 +349,35 @@ mod tests {
             NativeScript::InvalidHereafter(SlotNo(200)),
         ]);
         let signers: HashSet<Hash32> = [k1].into();
-        assert!(evaluate_native_script(&script, &signers, SlotNo(100)));
-        assert!(!evaluate_native_script(&script, &signers, SlotNo(49)));
-        assert!(!evaluate_native_script(&script, &signers, SlotNo(200)));
+        // tx interval [100, 150] ⊆ [50, 200] and k1 signs — passes.
+        assert!(evaluate_native_script(
+            &script,
+            &signers,
+            Some(SlotNo(100)),
+            Some(SlotNo(150))
+        ));
+        // tx invalid_before(49) < lockStart(50) — fails.
+        assert!(!evaluate_native_script(
+            &script,
+            &signers,
+            Some(SlotNo(49)),
+            Some(SlotNo(150))
+        ));
+        // tx invalid_hereafter(201) > lockExp(200) — fails.
+        assert!(!evaluate_native_script(
+            &script,
+            &signers,
+            Some(SlotNo(100)),
+            Some(SlotNo(201))
+        ));
+        // Interval satisfied but k1 does not sign — fails.
         let empty: HashSet<Hash32> = HashSet::new();
-        assert!(!evaluate_native_script(&script, &empty, SlotNo(100)));
+        assert!(!evaluate_native_script(
+            &script,
+            &empty,
+            Some(SlotNo(100)),
+            Some(SlotNo(150))
+        ));
     }
 
     // ---------------------------------------------------------------------------
@@ -1181,12 +1248,44 @@ mod tests {
         let params = ProtocolParameters::mainnet_defaults();
         let mut tx = make_simple_tx(input, 9_800_000, 200_000);
         tx.witness_set.native_scripts.push(script);
-        // Slot 100 < InvalidBefore(200), so validation should fail
+
+        // Issue #787: timelocks are evaluated against the TX'S OWN
+        // ValidityInterval (`body.validity_interval_start`), never the
+        // `current_slot` argument passed to `validate_transaction`.
+        //
+        // Unset validity_interval_start ⇒ `InvalidBefore` always evaluates
+        // to False (Haskell `SNothing`), regardless of current_slot.
         let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
         assert!(result.is_err());
-        // Slot 200 >= InvalidBefore(200), so validation should pass
         let result = validate_transaction(&tx, &utxo_set, &params, 200, 300, None);
-        assert!(result.is_ok());
+        assert!(
+            result.is_err(),
+            "unset validity_interval_start must still fail InvalidBefore(200) \
+             even when current_slot (200) would have satisfied the old buggy check"
+        );
+
+        // Setting the tx's own validity_interval_start to 200 satisfies
+        // InvalidBefore(200) (200 <= 200). `current_slot` only needs to
+        // clear the UNRELATED Rule 8 floor (`current_slot >= start`) — a
+        // current_slot far above 200 still passes Rule 13, demonstrating
+        // that the native-script timelock itself no longer depends on
+        // `current_slot` beyond that separate rule.
+        tx.body.validity_interval_start = Some(SlotNo(200));
+        let result = validate_transaction(&tx, &utxo_set, &params, 5_000_000, 300, None);
+        assert!(
+            result.is_ok(),
+            "tx validity_interval_start(200) must satisfy InvalidBefore(200) \
+             regardless of current_slot (5_000_000); got {result:?}"
+        );
+
+        // A tx bound that does NOT satisfy the lock (e.g. 199 < 200) fails,
+        // even at a high current_slot.
+        tx.body.validity_interval_start = Some(SlotNo(199));
+        let result = validate_transaction(&tx, &utxo_set, &params, 1_000_000, 300, None);
+        assert!(
+            result.is_err(),
+            "tx validity_interval_start(199) must NOT satisfy InvalidBefore(200); got {result:?}"
+        );
     }
 
     #[test]
@@ -1685,6 +1784,15 @@ mod tests {
         assert_eq!(size, cbor_uint_size(1_000_000));
     }
 
+    /// Issue #793: `estimate_value_cbor_size` now returns the EXACT
+    /// serialized length (`dugite_serialization::encode_value(v).len()`)
+    /// rather than a hand-rolled estimate. The prior estimate under-counted
+    /// the 28-byte policy-ID bytestring header (real encoding: `0x58 0x1c`
+    /// = 2 bytes, not 1), so the old expected value here (45) was itself
+    /// the bug this issue fixes — the true encoded length is 46:
+    /// array(2)=1 + coin(1_000_000 range)=5 + outer map(1)=1 +
+    /// policy(2-byte header + 28 bytes)=30 + inner map(1)=1 +
+    /// asset-name "Token" (1-byte header + 5 bytes)=6 + qty(100)=2.
     #[test]
     fn test_estimate_value_cbor_size_multi_asset() {
         let policy = dugite_primitives::hash::Hash28::from_bytes([10u8; 28]);
@@ -1696,7 +1804,9 @@ mod tests {
             .or_default()
             .insert(asset, 100);
         let size = estimate_value_cbor_size(&value);
-        assert_eq!(size, 45);
+        let exact = dugite_serialization::encode_value(&value).len() as u64;
+        assert_eq!(size, exact, "must equal the true serialized length");
+        assert_eq!(size, 46);
     }
 
     #[test]
@@ -2499,12 +2609,15 @@ mod tests {
             transaction_id: Hash32::from_bytes([2u8; 32]),
             index: 0,
         };
-        // Plutus V1 script: minimal valid flat-encoded program
+        // Plutus V1 script: minimal valid CBOR-wrapped-flat program
         // `(program 1.0.0 (con integer 0))`. The `MalformedScriptWitnesses`
-        // predicate (Babbage+ UTXOW) now rejects garbage bytes at admission
-        // time, so the witness script must be flat-decodable. We construct
-        // a real minimal program rather than hardcoding magic bytes so the
-        // fixture survives any future flat-encoding tweak.
+        // predicate (Babbage+ UTXOW) requires the mandatory CBOR-bytestring
+        // wrapper for WITNESS scripts (issue #792) — real on-chain
+        // `witness_set.plutus_vN_scripts` entries are themselves a CBOR
+        // bytestring wrapping the flat program, so `Program::to_cbor()` (not
+        // `to_flat()`) is the correct fixture format here. We construct a
+        // real minimal program rather than hardcoding magic bytes so the
+        // fixture survives any future flat/CBOR-encoding tweak.
         let plutus_script_bytes = {
             let p = dugite_uplc::program::Program {
                 version: (1, 0, 0),
@@ -2512,7 +2625,7 @@ mod tests {
                     num_bigint::BigInt::from(0),
                 )),
             };
-            p.to_flat().expect("flat-encode minimal Plutus program")
+            p.to_cbor().expect("cbor-encode minimal Plutus program")
         };
         let script_hash = dugite_primitives::hash::blake2b_224_tagged(1, &plutus_script_bytes);
         let script_address = Address::Enterprise(dugite_primitives::address::EnterpriseAddress {
@@ -3223,8 +3336,17 @@ mod tests {
         );
     }
 
+    /// Issue #790: a declared `script_data_hash` with NO redeemers and NO
+    /// witness datums must ALWAYS be `UnexpectedScriptDataHash`, even when
+    /// a reference input carries an (unused) `script_ref`. Per Haskell
+    /// `mkScriptIntegrity`, a reference script only enters `langViews` when
+    /// actually INVOKED via a redeemer — merely referencing a script_ref
+    /// UTxO contributes nothing to the script-integrity hash. This
+    /// supersedes the removed "has_ref_scripts" carve-out, which let this
+    /// exact adversarial shape (vkey-only tx + junk script_data_hash + an
+    /// unrelated ref input) slip through.
     #[test]
-    fn test_script_data_hash_allowed_with_reference_scripts() {
+    fn test_script_data_hash_rejected_with_unused_reference_script() {
         let mut utxo_set = UtxoSet::new();
         let input = TransactionInput {
             transaction_id: Hash32::from_bytes([1u8; 32]),
@@ -3265,15 +3387,17 @@ mod tests {
         tx.body.reference_inputs = vec![ref_input];
         tx.body.script_data_hash = Some(Hash32::from_bytes([0xAB; 32]));
         let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
-        match result {
-            Ok(()) => {}
-            Err(errors) => {
-                assert!(
-                    !errors.iter().any(|e| matches!(e, ValidationError::UnexpectedScriptDataHash)),
-                    "UnexpectedScriptDataHash should not fire when reference scripts exist: {errors:?}"
-                );
-            }
-        }
+        assert!(
+            result.is_err(),
+            "vkey-only tx with junk script_data_hash + unused ref script must be rejected"
+        );
+        let errors = result.unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::UnexpectedScriptDataHash)),
+            "Expected UnexpectedScriptDataHash for an unused reference script; got: {errors:?}"
+        );
     }
 
     // ===================================================================
@@ -9229,20 +9353,27 @@ mod tests {
     // mistakenly flagged as UnexpectedScriptDataHash.
     // ---------------------------------------------------------------------------
 
-    /// A transaction that spends a UTxO carrying a `script_ref` (PlutusV2) may
-    /// legitimately include a `script_data_hash` in its body — the ref-script
-    /// byte size contributes to the cost model.  Before the fix, the
-    /// `check_script_data_hash` helper only scanned `reference_inputs` for
-    /// ref-scripts, which caused this valid transaction to be rejected with
-    /// `UnexpectedScriptDataHash`.
+    /// Issue #790 (supersedes the #182 fix): a transaction that merely
+    /// SPENDS a UTxO carrying a `script_ref` (PlutusV2), without ever
+    /// invoking it via a redeemer, does NOT get a pass on an otherwise
+    /// junk/unmatched `script_data_hash`. The #182 fix's premise — "the
+    /// ref-script byte size contributes to the cost model, so a
+    /// script_data_hash is legitimate" — conflated the tiered *fee*
+    /// (`txNonDistinctRefScriptsSize`) with the script *integrity hash*
+    /// (`mkScriptIntegrity`): a reference script only enters `langViews`
+    /// when actually invoked via a redeemer. With no redeemers and no
+    /// datums, Haskell's `mkScriptIntegrity` is `SNothing` regardless of
+    /// script_refs, so any declared `script_data_hash` is
+    /// `PPViewHashesDontMatch` / `UnexpectedScriptDataHash`.
     ///
-    /// This test verifies that the spending-input path now passes correctly.
-    /// We use a dummy (all-zeros) script_data_hash so we do NOT trigger the
-    /// `ScriptDataHashMismatch` branch — the goal is only to confirm that the
-    /// `UnexpectedScriptDataHash` error is NOT emitted when the spending input
-    /// carries a script_ref.
+    /// Also note: prior to the #790(b) fix, `check_script_data_hash` was
+    /// gated behind `has_plutus_scripts(tx)` in `validate_transaction`,
+    /// which is FALSE for this tx (no witness Plutus scripts, no
+    /// redeemers) — so this check never even ran via the full pipeline.
+    /// The gate is now unconditional (mirroring `check_malformed_reference_scripts`),
+    /// so `UnexpectedScriptDataHash` is reachable end-to-end.
     #[test]
-    fn test_issue_182_spending_input_script_ref_allows_script_data_hash() {
+    fn test_issue_182_spending_input_script_ref_still_rejects_unexpected_script_data_hash() {
         let mut utxo_set = UtxoSet::new();
 
         // Spending input: a UTxO that carries a PlutusV2 script_ref.
@@ -9267,30 +9398,25 @@ mod tests {
 
         let params = ProtocolParameters::mainnet_defaults();
 
-        // Build a simple transaction: spend the script-ref-bearing UTxO,
-        // no inline Plutus scripts in the witness set, but a script_data_hash
-        // present in the body.  The hash value is all-zeros — it won't match
-        // the real computed hash so we'll get ScriptDataHashMismatch (the hash
-        // is there, it just has the wrong value), but NOT UnexpectedScriptDataHash.
+        // Build a simple transaction: spend the script-ref-bearing UTxO
+        // (never invoked via a redeemer), no inline Plutus scripts in the
+        // witness set, but a script_data_hash present in the body.
         let mut tx = make_simple_tx(spending_input, 9_800_000, 200_000);
         tx.body.script_data_hash = Some(Hash32::ZERO);
 
         let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
 
-        // We expect either Ok (unlikely given zero hash) or an error that is
-        // NOT UnexpectedScriptDataHash.  The important invariant is that
-        // UnexpectedScriptDataHash must not appear.
-        let no_unexpected_hash = match &result {
-            Ok(_) => true,
-            Err(errors) => !errors
+        assert!(
+            result.is_err(),
+            "tx with an unused script_ref and a declared script_data_hash must be rejected"
+        );
+        let errors = result.unwrap_err();
+        assert!(
+            errors
                 .iter()
                 .any(|e| matches!(e, ValidationError::UnexpectedScriptDataHash)),
-        };
-        assert!(
-            no_unexpected_hash,
-            "Expected no UnexpectedScriptDataHash when spending input carries script_ref; \
-             got errors: {:?}",
-            result.err()
+            "Expected UnexpectedScriptDataHash even though the spending input carries an \
+             unused script_ref; got: {errors:?}"
         );
     }
 
@@ -9962,7 +10088,16 @@ mod tests {
     #[test]
     fn test_conway_stake_dereg_wrong_refund_rejected() {
         // Conway ConwayStakeDeregistration with a refund that differs from
-        // key_deposit must produce StakeDeregistrationRefundMismatch.
+        // the REGISTERED deposit must produce StakeDeregistrationRefundMismatch.
+        //
+        // Issue #811: the refund-mismatch check only fires when the
+        // credential is actually present in `stake_key_deposits` (Haskell's
+        // `ConwayUnRegCert` binds `Nothing` and skips the check entirely for
+        // an unregistered credential). This test must therefore supply an
+        // explicit `stake_key_deposits` map with the credential registered
+        // at `key_deposit` so the mismatch has a real registered amount to
+        // compare against — passing `None` (as before #811) now
+        // unconditionally skips the check and would make this test vacuous.
         let cred_bytes = [0x06u8; 28];
         let credential = dugite_primitives::credentials::Credential::VerificationKey(
             Hash28::from_bytes(cred_bytes),
@@ -9982,6 +10117,11 @@ mod tests {
             wrong_refund,
         );
         let reward_accounts = make_reward_accounts(cred_bytes, 0);
+        let mut stake_key_deposits = imbl::HashMap::new();
+        stake_key_deposits.insert(
+            Hash28::from_bytes(cred_bytes).to_hash32_padded(),
+            key_deposit,
+        );
 
         let result = validate_transaction_with_pools(
             &tx,
@@ -9999,7 +10139,7 @@ mod tests {
             None, // node_network
             None, // committee_members
             None, // committee_resigned
-            None, // stake_key_deposits
+            Some(&stake_key_deposits),
             None, // constitution_script_hash
             None, // vote_delegations
         );
@@ -10016,6 +10156,69 @@ mod tests {
                     if *declared == wrong_refund && *expected == key_deposit
             )),
             "Expected StakeDeregistrationRefundMismatch {{declared: {wrong_refund}, expected: {key_deposit}}}; got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_conway_stake_dereg_unregistered_credential_no_refund_mismatch() {
+        // Issue #811: an UNREGISTERED credential (absent from
+        // `stake_key_deposits`) must NOT produce StakeDeregistrationRefundMismatch,
+        // even when the declared refund differs from the current key_deposit.
+        // Haskell's `ConwayUnRegCert` branch binds `Nothing` for an
+        // unregistered credential and skips the refund-mismatch predicate
+        // entirely — only the not-registered predicate (raised elsewhere)
+        // applies. The predicate-set divergence (not the accept/reject
+        // outcome) is what #811 fixes.
+        let cred_bytes = [0x08u8; 28];
+        let credential = dugite_primitives::credentials::Credential::VerificationKey(
+            Hash28::from_bytes(cred_bytes),
+        );
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // Conway
+        let key_deposit = params.key_deposit.0;
+        let arbitrary_refund = key_deposit + 12_345; // differs from key_deposit
+
+        let mut utxo_set = UtxoSet::new();
+        let tx = make_dereg_tx(
+            &mut utxo_set,
+            Certificate::ConwayStakeDeregistration {
+                credential,
+                refund: dugite_primitives::value::Lovelace(arbitrary_refund),
+            },
+            arbitrary_refund,
+        );
+        // stake_key_deposits is present but does NOT contain this credential —
+        // simulating an unregistered stake credential.
+        let stake_key_deposits: imbl::HashMap<Hash32, u64> = imbl::HashMap::new();
+
+        let result = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            None,
+            None,
+            None, // reward_accounts = None → balance check skipped
+            None,
+            None, // registered_dreps
+            None, // registered_vrf_keys
+            None, // node_network
+            None, // committee_members
+            None, // committee_resigned
+            Some(&stake_key_deposits),
+            None, // constitution_script_hash
+            None, // vote_delegations
+        );
+
+        let has_refund_err = matches!(&result, Err(errors) if errors.iter().any(|e| {
+            matches!(e, ValidationError::StakeDeregistrationRefundMismatch { .. })
+        }));
+        assert!(
+            !has_refund_err,
+            "Unregistered credential must not produce StakeDeregistrationRefundMismatch \
+             (Haskell skips the check when mAccountState = Nothing); got: {result:?}"
         );
     }
 
@@ -16083,6 +16286,77 @@ mod tests {
                             | ValidationError::ConwayIncompleteWithdrawals { .. }
                     ),
                     "well-formed withdrawal must not trigger CERTS/LEDGER predicates: {e:?}"
+                );
+            }
+        }
+    }
+
+    // ===================================================================
+    // #804 — GenesisKeyDelegation genesis-key witness requirement.
+    //
+    // Haskell `shelleyWitsVKeyNeeded`: a `GenesisDelegCert gk _ _` requires
+    // a VKey witness by the named genesis key `gk`. `cert_required_witnesses`
+    // previously returned `vec![]` for this cert (see the table doc comment
+    // above `cert_required_witnesses`), silently accepting an unwitnessed
+    // genesis-key delegation.
+    // ===================================================================
+
+    #[test]
+    fn test_804_genesis_key_delegation_missing_witness_rejected() {
+        let (utxo_set, _input, mut tx, params) = make_cert_test_tx(0, 0);
+
+        // No witness supplied for this genesis key — the cert requires
+        // `blake2b_224([0xD1;32])` truncated into a Hash32 genesis_hash.
+        let (_unrelated_witness, gkey_hash) = make_cert_vkey_witness([0xD1; 32]);
+        let mut genesis_hash_bytes = [0u8; 32];
+        genesis_hash_bytes[..28].copy_from_slice(gkey_hash.as_bytes());
+
+        tx.body
+            .certificates
+            .push(Certificate::GenesisKeyDelegation {
+                genesis_hash: Hash32::from_bytes(genesis_hash_bytes),
+                genesis_delegate_hash: Hash32::from_bytes([0x22; 32]),
+                vrf_keyhash: Hash32::from_bytes([0x33; 32]),
+            });
+        // Deliberately do NOT push a witness for gkey_hash.
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::MissingCertificateWitness(_))),
+            "Expected MissingCertificateWitness for unwitnessed GenesisKeyDelegation, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_804_genesis_key_delegation_with_matching_witness_accepted() {
+        let (utxo_set, _input, mut tx, params) = make_cert_test_tx(0, 0);
+
+        let (witness, gkey_hash) = make_cert_vkey_witness([0xD2; 32]);
+        let mut genesis_hash_bytes = [0u8; 32];
+        genesis_hash_bytes[..28].copy_from_slice(gkey_hash.as_bytes());
+
+        tx.body
+            .certificates
+            .push(Certificate::GenesisKeyDelegation {
+                genesis_hash: Hash32::from_bytes(genesis_hash_bytes),
+                genesis_delegate_hash: Hash32::from_bytes([0x22; 32]),
+                vrf_keyhash: Hash32::from_bytes([0x33; 32]),
+            });
+        tx.witness_set.vkey_witnesses.push(witness);
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        match result {
+            Ok(()) => {}
+            Err(errors) => {
+                assert!(
+                    !errors
+                        .iter()
+                        .any(|e| matches!(e, ValidationError::MissingCertificateWitness(_))),
+                    "Should not have MissingCertificateWitness when the genesis key witnessed, got: {errors:?}"
                 );
             }
         }

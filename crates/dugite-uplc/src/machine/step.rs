@@ -116,7 +116,7 @@ fn compute(term: Term, env: Env, mut kont: Kont) -> Result<State, UplcError> {
             kont.push(Frame::AwaitFunTerm {
                 argument: Rc::clone(&arg),
                 env: env.clone(),
-            })?;
+            });
             Ok(State::Compute {
                 term: rc_into_term(fun),
                 env,
@@ -139,7 +139,7 @@ fn compute(term: Term, env: Env, mut kont: Kont) -> Result<State, UplcError> {
             // rc_into_term: if sole owner (refcount=1), moves term out for free;
             // otherwise clones the Term — but since sub-terms are Rc, the clone
             // is O(1) (only enum discriminant + Rc pointer copies, no recursion).
-            kont.push(Frame::Force)?;
+            kont.push(Frame::Force);
             Ok(State::Compute {
                 term: rc_into_term(body),
                 env,
@@ -197,7 +197,7 @@ fn compute(term: Term, env: Env, mut kont: Kont) -> Result<State, UplcError> {
                 pending,
                 evaluated: Vec::new(),
                 env: env.clone(),
-            })?;
+            });
             Ok(State::Compute {
                 // rc_into_term: O(1) if sole owner; O(1) clone otherwise
                 // (sub-terms are Rc, so clone is shallow).
@@ -217,7 +217,7 @@ fn compute(term: Term, env: Env, mut kont: Kont) -> Result<State, UplcError> {
             kont.push(Frame::Cases {
                 branches,
                 env: env.clone(),
-            })?;
+            });
             Ok(State::Compute {
                 // rc_into_term: O(1) if sole owner; O(1) clone otherwise.
                 term: rc_into_term(scrutinee),
@@ -244,7 +244,7 @@ fn return_compute(
             kont.push(Frame::AwaitArg {
                 function: value,
                 env: env.clone(),
-            })?;
+            });
             Ok(State::Compute {
                 // argument is Rc<Term>; rc_into_term is O(1) since sub-terms
                 // are Rc (fallback clone is shallow even if refcount > 1).
@@ -274,7 +274,7 @@ fn return_compute(
                     pending,
                     evaluated,
                     env: env.clone(),
-                })?;
+                });
                 Ok(State::Compute {
                     // rc_into_term: O(1) since sub-terms are Rc.
                     term: rc_into_term(next_rc),
@@ -314,6 +314,19 @@ fn return_compute(
             ) = match value {
                 crate::machine::value::Value::Constr { tag, args } => (tag, args, None),
                 crate::machine::value::Value::Const(c) => {
+                    // PLC 1.1.0 `case`-on-Constant (the "caser builtin") is
+                    // gated behind `vanRossemPV` (PV11): below PV11
+                    // (variants A/B/C) Haskell's `unCaserBuiltin` is
+                    // `unavailableCaserBuiltin`, so ANY `case` whose
+                    // scrutinee reduces to a plain constant fails with
+                    // `CekCaseBuiltinError` — before the constant is ever
+                    // projected into a (tag, args) shape below (#824,
+                    // oracle-confirmed). `case` on a `Value::Constr`
+                    // scrutinee (the arm above) is unaffected — it has been
+                    // available since PlutusV3's PV9 introduction.
+                    if !variant.case_on_constant_available() {
+                        return Err(UplcError::ScriptError);
+                    }
                     use crate::term::Constant;
                     match c {
                         // Bool: False = 0, True = 1.  Exactly 2 branches.
@@ -372,17 +385,24 @@ fn return_compute(
                             (idx, Vec::new(), None)
                         }
                         // Other constants (ByteString, String, Data,
-                        // BLS): not enumerable, `case` fails.
+                        // BLS): not enumerable, `case` fails. Adversary-
+                        // reachable (a gossiped script can freely construct
+                        // a `case` whose scrutinee reduces to one of
+                        // these) — a script/machine failure, not a
+                        // dugite-uplc bug (#840).
                         other => {
-                            return Err(UplcError::Internal(format!(
+                            return Err(UplcError::MachineError(format!(
                                 "case on non-enumerable constant: {:?}",
                                 std::mem::discriminant(&other)
                             )));
                         }
                     }
                 }
+                // Adversary-reachable: the scrutinee can reduce to a
+                // Lambda or Delay value, which `case` cannot dispatch on
+                // (#840, Haskell `NonConstrScrutinizedMachineError`).
                 other => {
-                    return Err(UplcError::Internal(format!(
+                    return Err(UplcError::MachineError(format!(
                         "Case scrutinee must reduce to Constr or enumerable Constant, got {:?}",
                         std::mem::discriminant(&other)
                     )));
@@ -405,7 +425,7 @@ fn return_compute(
             // ApplyValue frames in REVERSE so the first arg ends up
             // on top of the stack and is popped (applied) first.
             for arg in payload.into_iter().rev() {
-                kont.push(Frame::ApplyValue { argument: arg })?;
+                kont.push(Frame::ApplyValue { argument: arg });
             }
             Ok(State::Compute {
                 // rc_into_term: O(1) move if sole owner, O(1) shallow clone otherwise.
@@ -444,8 +464,12 @@ fn apply(
             )?;
             Ok(State::Return { value: v, kont })
         }
+        // Adversary-reachable: a gossiped script's applied term can
+        // legitimately apply a non-function value (Haskell
+        // `NonFunctionalApplicationMachineError`) — a script/machine
+        // failure, not a dugite-uplc bug (#840).
         Value::Const(_) | Value::Delay { .. } | Value::Constr { .. } => {
-            Err(UplcError::Internal(format!(
+            Err(UplcError::MachineError(format!(
                 "applied non-function value: {:?}",
                 std::mem::discriminant(&function)
             )))
@@ -478,7 +502,11 @@ fn force_value(
                 }),
             }
         }
-        other => Err(UplcError::Internal(format!(
+        // Adversary-reachable: a gossiped script's applied term can
+        // legitimately `force` a non-`Delay` value (Haskell
+        // `OpenTermEvaluatedMachineError` family) — a script/machine
+        // failure, not a dugite-uplc bug (#840).
+        other => Err(UplcError::MachineError(format!(
             "force applied to non-Delay value: {:?}",
             std::mem::discriminant(&other)
         ))),
@@ -544,20 +572,20 @@ mod tests {
     #[test]
     fn force_of_non_delay_errors() {
         let bad = Term::Force(Rc::new(int_term(42)));
-        assert!(matches!(evaluate(bad), Err(UplcError::Internal(_))));
+        assert!(matches!(evaluate(bad), Err(UplcError::MachineError(_))));
     }
 
     #[test]
     fn apply_non_function_errors() {
         let bad = Term::App(Rc::new(int_term(1)), Rc::new(int_term(2)));
-        assert!(matches!(evaluate(bad), Err(UplcError::Internal(_))));
+        assert!(matches!(evaluate(bad), Err(UplcError::MachineError(_))));
     }
 
     #[test]
     fn open_term_var_errors() {
         assert!(matches!(
             evaluate(Term::Var(1)),
-            Err(UplcError::Internal(_))
+            Err(UplcError::MachineError(_))
         ));
     }
 
@@ -578,6 +606,33 @@ mod tests {
             int_term(4),
         );
         assert_eq!(evaluate(t).unwrap(), int_val(7));
+    }
+
+    #[test]
+    fn deep_non_tail_recursion_succeeds_past_former_depth_cap() {
+        // Regression test for #817. `addInteger 1 (addInteger 1 (… N
+        // deep …))` builds one CEK continuation frame per nesting
+        // level: each outer `addInteger`'s second argument must be
+        // fully computed (pushing an `AwaitArg` frame) before the
+        // outer application can return. This used to trip the
+        // since-removed `MAX_KONTINUATION_DEPTH = 4096` cap well
+        // below any realistic ExBudget ceiling. The continuation
+        // stack (`Kont`) is a heap-allocated `Vec<Frame>` with no
+        // depth limit now — matching Haskell's `Context`
+        // (`UntypedPlutusCore.Evaluation.Machine.Cek.Internal`)
+        // exactly, which bounds growth only by `ExBudget`.
+        const DEPTH: i64 = 5000;
+        let mut term = int_term(0);
+        for _ in 0..DEPTH {
+            term = app(
+                app(
+                    Term::Builtin(crate::term::BuiltinId::AddInteger),
+                    int_term(1),
+                ),
+                term,
+            );
+        }
+        assert_eq!(evaluate(term).unwrap(), int_val(DEPTH));
     }
 
     #[test]
@@ -767,12 +822,69 @@ mod tests {
 
     #[test]
     fn case_with_bytestring_scrutinee_errors() {
-        // ByteString is not enumerable by case → Internal error.
+        // ByteString is not enumerable by case → adversary-reachable
+        // MachineError, not Internal (#840).
         use crate::term::Constant;
         let case = Term::Case {
             scrutinee: Rc::new(Term::Const(Constant::ByteString(vec![1, 2]))),
             branches: vec![Rc::new(int_term(99))],
         };
-        assert!(matches!(evaluate(case), Err(UplcError::Internal(_))));
+        assert!(matches!(evaluate(case), Err(UplcError::MachineError(_))));
+    }
+
+    /// #824 PV-matrix golden: `case` on a plain `Value::Const` scrutinee is
+    /// the PLC 1.1.0 "caser builtin" feature, gated behind `vanRossemPV`
+    /// (PV11). At PV<11 (variants A/B/C) it must fail with `ScriptError`
+    /// (Haskell `CekCaseBuiltinError`) BEFORE any branch is even selected;
+    /// at PV>=11 (D/E) it must succeed exactly as before. `case` on a
+    /// `Constr` scrutinee is unaffected by the gate at either PV. The
+    /// conformance corpus runs a single (LATEST=E, no-PV) harness and
+    /// cannot catch a wrong PV<11 branch, hence this dedicated test.
+    #[test]
+    fn case_on_constant_gated_by_pv11() {
+        use crate::builtin::semantics::SemanticsVariant;
+        use crate::machine::cost::BudgetTracker;
+        use crate::term::Constant;
+
+        // (case (con bool True) [0, 1]) — Bool scrutinee; True selects
+        // branch index 1 per the Frame::Cases Bool mapping.
+        let bool_case = || Term::Case {
+            scrutinee: Rc::new(Term::Const(Constant::Bool(true))),
+            branches: vec![Rc::new(int_term(0)), Rc::new(int_term(1))],
+        };
+
+        // PV<11 (variant C, PlutusV3 pre-vanRossem): case-on-constant is
+        // UNAVAILABLE — must fail with ScriptError, not select a branch.
+        let mut tracker_c = BudgetTracker::new_counting();
+        let result_c = evaluate_with_budget(bool_case(), &mut tracker_c, None, SemanticsVariant::C);
+        assert!(
+            matches!(result_c, Err(UplcError::ScriptError)),
+            "PV<11 case-on-constant must fail with ScriptError, got {result_c:?}"
+        );
+
+        // PV>=11 (variant E): case-on-constant IS available — succeeds,
+        // selecting the True branch (index 1).
+        let mut tracker_e = BudgetTracker::new_counting();
+        let result_e = evaluate_with_budget(bool_case(), &mut tracker_e, None, SemanticsVariant::E)
+            .expect("PV>=11 case-on-constant must succeed");
+        assert_eq!(result_e, int_val(1));
+
+        // `case` on a `Constr` scrutinee is UNAFFECTED by the gate —
+        // succeeds identically at both PV<11 and PV>=11.
+        let constr_case = || Term::Case {
+            scrutinee: Rc::new(Term::Constr {
+                tag: 1,
+                args: vec![],
+            }),
+            branches: vec![Rc::new(int_term(42)), Rc::new(int_term(99))],
+        };
+        let mut tracker_c2 = BudgetTracker::new_counting();
+        let r_c = evaluate_with_budget(constr_case(), &mut tracker_c2, None, SemanticsVariant::C)
+            .expect("case on Constr must succeed at PV<11 (unaffected by #824's gate)");
+        assert_eq!(r_c, int_val(99));
+        let mut tracker_e2 = BudgetTracker::new_counting();
+        let r_e = evaluate_with_budget(constr_case(), &mut tracker_e2, None, SemanticsVariant::E)
+            .expect("case on Constr must succeed at PV>=11");
+        assert_eq!(r_e, int_val(99));
     }
 }

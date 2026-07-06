@@ -460,6 +460,247 @@ pub fn inputs_to_txininfos(
     Ok(out)
 }
 
+/// Era-aware output translation for the Alonzo/PlutusV1 `txInfoOutputs`
+/// quirk (#837 item 3).
+///
+/// Haskell reference (`Cardano.Ledger.Alonzo.Plutus.TxInfo`,
+/// `EraPlutusTxInfo 'PlutusV1 AlonzoEra`):
+///
+/// ```haskell
+/// -- A mistake was made in Alonzo of filtering out Byron addresses, so we
+/// -- need to preserve this behavior by only retaining the Just case:
+/// PV1.txInfoOutputs = mapMaybe transTxOut $ F.toList (txBody ^. outputsTxBodyL)
+/// ```
+///
+/// i.e. Alonzo silently DROPS Byron-addressed outputs from the V1
+/// `TxInfo` rather than failing the translation. Babbage's own
+/// `EraPlutusTxInfo 'PlutusV1 BabbageEra` instance (reused unchanged by
+/// Conway) instead hard-errors with `ByronTxOutInContext` — Alonzo was
+/// the only era where V1 ran with this lenient behavior, so gating on
+/// `era == Era::Alonzo` fully captures the Haskell era-vs-instance
+/// dispatch (V1 remains runnable in later eras, but under a DIFFERENT,
+/// strict `EraPlutusTxInfo` instance). Only Byron outputs are filtered
+/// pre-emptively; any other `address_to_plutus` failure (e.g. a Reward
+/// address, which should never legitimately appear as a tx output)
+/// still propagates as a hard error.
+pub fn outputs_to_plutus_v1(
+    outputs: &[PrimTxOut],
+    era: dugite_primitives::era::Era,
+) -> Result<Vec<TxOut>, PhaseTwoError> {
+    if era == dugite_primitives::era::Era::Alonzo {
+        outputs
+            .iter()
+            .filter(|o| !matches!(o.address, PrimAddress::Byron(_)))
+            .map(output_to_plutus)
+            .collect()
+    } else {
+        outputs.iter().map(output_to_plutus).collect()
+    }
+}
+
+/// Era-aware input resolution mirroring [`outputs_to_plutus_v1`] for
+/// `txInfoInputs` (#837 item 3): in Alonzo, an input whose RESOLVED
+/// output carries a Byron address is dropped from `TxInfoV1::inputs`
+/// rather than failing the translation (`catMaybes txInsMaybes` in the
+/// Haskell source). Every other era keeps the hard error. A genuinely
+/// unresolved input (not in `resolved` at all) still surfaces the usual
+/// [`PhaseTwoError::UtxoDecode`] regardless of era.
+pub fn inputs_to_txininfos_v1(
+    inputs: &[PrimTxIn],
+    resolved: &[(PrimTxIn, PrimTxOut, Vec<u8>)],
+    era: dugite_primitives::era::Era,
+) -> Result<Vec<TxInInfo>, PhaseTwoError> {
+    if era != dugite_primitives::era::Era::Alonzo {
+        return inputs_to_txininfos(inputs, resolved);
+    }
+    let mut out = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let byron_resolved_output = resolved.iter().any(|(i, o, _)| {
+            i.transaction_id == input.transaction_id
+                && i.index == input.index
+                && matches!(o.address, PrimAddress::Byron(_))
+        });
+        if byron_resolved_output {
+            continue;
+        }
+        out.push(input_to_txininfo(input, resolved)?);
+    }
+    Ok(out)
+}
+
+/// Conway-only field-presence gate mirroring cardano-ledger's
+/// `guardConwayFeaturesForPlutusV1V2` (#818). Must run before building
+/// EITHER the V1 or V2 context — Haskell calls it unconditionally at the
+/// top of BOTH the `EraPlutusTxInfo 'PlutusV1 ConwayEra` and
+/// `'PlutusV2 ConwayEra` `toPlutusTxInfo` instances, so it fires whenever
+/// ANY V1/V2 script needs to run in the tx, regardless of that script's
+/// OWN purpose — even a plain spending script fails if the tx body ALSO
+/// carries a non-empty `voting_procedures`/`proposal_procedures`, a
+/// non-zero treasury donation, or a `current_treasury_value`.
+///
+/// These body fields are Conway-only on the wire (structurally
+/// empty/absent on every pre-Conway transaction), so this check is safe
+/// to run unconditionally across all eras rather than threading an era
+/// parameter through — it is a no-op pre-Conway.
+///
+/// A failure here is a `CollectErrors`-class hard rejection of the WHOLE
+/// transaction (`Cardano.Ledger.Alonzo.Plutus.Evaluate.CollectErrors`,
+/// via `BadTranslation`), evaluated BEFORE the tx's declared `is_valid`
+/// flag is even consulted — categorically different from a normal
+/// phase-2 script-evaluation failure. `PhaseTwoError::Internal` already
+/// classifies this way (`is_script_evaluation_failure() == false`).
+///
+/// Haskell reference (`eras/conway/impl/src/Cardano/Ledger/Conway/TxInfo.hs`,
+/// `guardConwayFeaturesForPlutusV1V2`):
+/// ```haskell
+/// unless (null $ unVotingProcedures votingProcedures) $
+///   Left $ inject $ VotingProceduresFieldNotSupported @era votingProcedures
+/// unless (null proposalProcedures) $
+///   Left $ inject $ ProposalProceduresFieldNotSupported @era proposalProcedures
+/// unless (treasuryDonation == Coin 0) $
+///   Left $ inject $ TreasuryDonationFieldNotSupported @era treasuryDonation
+/// case currentTreasuryValue of
+///   SNothing -> Right ()
+///   SJust treasury -> Left $ inject $ CurrentTreasuryFieldNotSupported @era treasury
+/// ```
+/// `treasuryDonation` is a VALUE check (`== Coin 0` passes, including an
+/// explicit-but-zero donation); `currentTreasuryValue` is a STRUCTURAL
+/// presence check (`SJust` fails for ANY wrapped amount, including
+/// `SJust (Coin 0)`) — do not conflate the two.
+pub fn guard_conway_features_for_v1v2(
+    tx: &dugite_primitives::transaction::Transaction,
+) -> Result<(), PhaseTwoError> {
+    if !tx.body.voting_procedures.is_empty() {
+        return Err(PhaseTwoError::Internal(
+            "V1/V2 ScriptContext: tx body carries voting_procedures, which Conway's V1/V2 \
+             TxInfo cannot represent (VotingProceduresFieldNotSupported)"
+                .to_string(),
+        ));
+    }
+    if !tx.body.proposal_procedures.is_empty() {
+        return Err(PhaseTwoError::Internal(
+            "V1/V2 ScriptContext: tx body carries proposal_procedures, which Conway's V1/V2 \
+             TxInfo cannot represent (ProposalProceduresFieldNotSupported)"
+                .to_string(),
+        ));
+    }
+    if tx.body.donation.map(|d| d.0).unwrap_or(0) != 0 {
+        return Err(PhaseTwoError::Internal(
+            "V1/V2 ScriptContext: tx body carries a non-zero treasury donation, which \
+             Conway's V1/V2 TxInfo cannot represent (TreasuryDonationFieldNotSupported)"
+                .to_string(),
+        ));
+    }
+    if tx.body.treasury_value.is_some() {
+        return Err(PhaseTwoError::Internal(
+            "V1/V2 ScriptContext: tx body carries a current_treasury_value, which Conway's \
+             V1/V2 TxInfo cannot represent (CurrentTreasuryFieldNotSupported)"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// V1-only per-output/per-input restrictions (#818), era-matrixed exactly
+/// per cardano-ledger's Babbage-vs-Conway `transTxOutV1` divergence.
+/// Babbage's `transTxOutV1` checks reference-script presence, inline-datum
+/// presence, AND (separately) a blanket "any reference inputs at all"
+/// rule. Conway defines its OWN `transTxOutV1`/`transTxInInfoV1`
+/// (module-local, NOT reused from Babbage) that DROPS the
+/// reference-script check and the blanket reference-inputs check, but
+/// KEEPS the inline-datum check — applied uniformly to regular inputs,
+/// reference inputs (translated then discarded, since `PV1.TxInfo` has no
+/// reference-inputs field), and created outputs. V2 is fully exempt from
+/// all of these in every era; do not call this for V2.
+///
+/// Haskell reference:
+/// ```haskell
+/// -- Babbage (eras/babbage/impl/.../Babbage/TxInfo.hs)
+/// transTxOutV1 txOutSource txOut = do
+///   when (isSJust (txOut ^. referenceScriptTxOutL)) $
+///     Left $ inject $ ReferenceScriptsNotSupported @era txOutSource
+///   when (isSJust (txOut ^. dataTxOutL)) $
+///     Left $ inject $ InlineDatumsNotSupported @era txOutSource
+///   ...
+/// -- (separately, Babbage only) unless (Set.null refInputs) $
+/// --   Left (ReferenceInputsNotSupported refInputs)
+///
+/// -- Conway (eras/conway/impl/.../Conway/TxInfo.hs, module-local override)
+/// transTxOutV1 txOutSource txOut = do
+///   when (isSJust (txOut ^. dataTxOutL)) $
+///     Left $ inject $ InlineDatumsNotSupported @era txOutSource
+///   ...
+/// -- no reference-script check, no blanket reference-inputs check
+/// ```
+///
+/// Alonzo carries neither inline datums nor reference scripts/inputs on
+/// the wire at all, so bucketing it with Babbage below is a no-op for
+/// genuine Alonzo transactions — these checks only ever fire from
+/// Babbage onward.
+pub fn check_v1_output_restrictions(
+    tx: &dugite_primitives::transaction::Transaction,
+    resolved: &[(PrimTxIn, PrimTxOut, Vec<u8>)],
+) -> Result<(), PhaseTwoError> {
+    use dugite_primitives::era::Era;
+    let conway_or_later = tx.era >= Era::Conway;
+
+    // Babbage-only blanket rule: ANY reference input at all fails V1,
+    // regardless of content. Conway drops this (dead code from Conway's
+    // perspective — a V1 script may freely have reference inputs; they
+    // are simply invisible to `PV1.TxInfo`, translated then discarded).
+    if !conway_or_later && !tx.body.reference_inputs.is_empty() {
+        return Err(PhaseTwoError::Internal(
+            "V1 ScriptContext: tx body carries reference_inputs, which pre-Conway V1 TxInfo \
+             cannot represent (ReferenceInputsNotSupported)"
+                .to_string(),
+        ));
+    }
+
+    let resolve = |input: &PrimTxIn| -> Option<&PrimTxOut> {
+        resolved
+            .iter()
+            .find(|(i, _, _)| i.transaction_id == input.transaction_id && i.index == input.index)
+            .map(|(_, out, _)| out)
+    };
+
+    // Regular inputs' resolved outputs + created outputs: checked in
+    // every era V1 can run under (inline datum both Babbage and Conway;
+    // reference script Babbage-only, checked below).
+    let mut touched: Vec<&PrimTxOut> = tx.body.inputs.iter().filter_map(resolve).collect();
+    touched.extend(tx.body.outputs.iter());
+    // Conway also translates (then discards) reference inputs — still
+    // subject to the surviving inline-datum check, just not the dropped
+    // reference-script/blanket-reference-inputs checks. A reference input
+    // that fails to resolve is covered by the standard `UtxoDecode`
+    // contract elsewhere in the pipeline (`resolved` is guaranteed to
+    // contain every input the tx references), so a missing entry here is
+    // silently skipped rather than raising a new error class.
+    if conway_or_later {
+        touched.extend(tx.body.reference_inputs.iter().filter_map(resolve));
+    }
+
+    for out in touched {
+        if matches!(
+            out.datum,
+            dugite_primitives::transaction::OutputDatum::InlineDatum { .. }
+        ) {
+            return Err(PhaseTwoError::Internal(
+                "V1 ScriptContext: an input or output carries an inline datum, which V1 \
+                 TxInfo cannot represent (InlineDatumsNotSupported)"
+                    .to_string(),
+            ));
+        }
+        if !conway_or_later && out.script_ref.is_some() {
+            return Err(PhaseTwoError::Internal(
+                "V1 ScriptContext: an input or output carries a reference script, which \
+                 pre-Conway V1 TxInfo cannot represent (ReferenceScriptsNotSupported)"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Translate a 32-byte padded required-signer hash back to its
 /// 28-byte Plutus `PubKeyHash`.
 ///
@@ -639,8 +880,23 @@ pub fn ledger_ordered_withdrawals(
 pub fn withdrawals_to_plutus(
     wdrl: &BTreeMap<Vec<u8>, dugite_primitives::value::Lovelace>,
 ) -> Result<Vec<(StakingCredential, BigInt)>, PhaseTwoError> {
-    let mut pairs: Vec<(PrimCred, dugite_primitives::value::Lovelace)> =
-        Vec::with_capacity(wdrl.len());
+    // Fold into a last-wins map keyed by the DERIVED `StakingCredential`
+    // (#844): two DISTINCT raw reward-account blobs differing only in
+    // their network-id bit decode to the SAME credential (`stake` drops
+    // the network component). Haskell's translation targets a genuine
+    // `Map StakingCredential Integer` — built by iterating the ledger's
+    // `Map RewardAccount Coin` in ascending key order and folding into a
+    // fresh map — so a later entry (larger raw reward-account bytes)
+    // overwrites an earlier one for the same credential, rather than the
+    // two coexisting as separate `txInfoWdrl` entries. `BTreeMap::insert`
+    // during a `wdrl` (already ascending-order) walk gives exactly this
+    // last-wins semantics, and its `PrimCred`-keyed iteration order below
+    // is ALSO already the correct Plutus `Credential` Ord (Key < Script,
+    // then 28-byte hash — equals the DERIVED `PrimCred` Ord, NOT
+    // `cmp_ledger`), so no separate sort is needed. Unreachable on a
+    // phase-1-valid tx (`WrongNetworkWithdrawal` already rejects a
+    // wrong-network reward account), but `wdrl` is adversarial input.
+    let mut by_cred: BTreeMap<PrimCred, dugite_primitives::value::Lovelace> = BTreeMap::new();
     for (reward_account, amount) in wdrl {
         let addr = PrimAddress::from_bytes(reward_account).map_err(|e| {
             PhaseTwoError::Internal(format!("withdrawals_to_plutus: reward_account: {e}"))
@@ -653,13 +909,10 @@ pub fn withdrawals_to_plutus(
                 )));
             }
         };
-        pairs.push((stake, *amount));
+        by_cred.insert(stake, *amount);
     }
-    // Plutus `Credential` Ord (Key < Script, then 28-byte hash) — equals the
-    // DERIVED `PrimCred` Ord, NOT `cmp_ledger`.
-    pairs.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut out = Vec::with_capacity(pairs.len());
-    for (stake, amount) in pairs {
+    let mut out = Vec::with_capacity(by_cred.len());
+    for (stake, amount) in by_cred {
         let cred = credential_to_plutus(&stake);
         out.push((StakingCredential::Hash(cred), BigInt::from(amount.0)));
     }
@@ -1060,6 +1313,46 @@ mod tests {
         );
     }
 
+    /// #844: two DISTINCT raw reward-account blobs that differ only in
+    /// network id decode to the SAME `StakingCredential` (the derived
+    /// `stake` drops the network component). `withdrawals_to_plutus` must
+    /// fold them into ONE `txInfoWdrl` entry (last-wins over the raw
+    /// ascending-byte-key order), matching a genuine
+    /// `Map StakingCredential Integer`, not emit two separate entries for
+    /// what Haskell represents as a single map key.
+    #[test]
+    fn withdrawals_to_plutus_dedups_same_credential_different_network() {
+        let hash = [0x03u8; 28];
+        // mainnet=false sorts before mainnet=true at the same header
+        // high-nibble (network id is the low nibble), so the raw blob
+        // ordering is: testnet_blob < mainnet_blob.
+        let testnet_blob = encode_reward_addr_blob(false, false, hash);
+        let mainnet_blob = encode_reward_addr_blob(true, false, hash);
+        assert!(
+            testnet_blob < mainnet_blob,
+            "test setup: testnet blob must sort before mainnet blob"
+        );
+
+        let mut wdrl: BTreeMap<Vec<u8>, Lovelace> = BTreeMap::new();
+        wdrl.insert(testnet_blob, Lovelace(10));
+        wdrl.insert(mainnet_blob, Lovelace(20));
+
+        let pl = withdrawals_to_plutus(&wdrl).unwrap();
+        assert_eq!(
+            pl.len(),
+            1,
+            "same-credential entries (differing only by network) must fold into one, got {pl:?}"
+        );
+        assert!(matches!(
+            pl[0].0,
+            StakingCredential::Hash(PlCredential::PubKey(h)) if h == hash
+        ));
+        // Last-wins in ascending raw-key order: mainnet_blob (the larger
+        // key) is inserted last, so its amount (20) must win over the
+        // testnet entry's (10).
+        assert_eq!(pl[0].1, BigInt::from(20));
+    }
+
     /// The `Rewarding` redeemer-pointer index resolves over the SCRIPT-first
     /// LEDGER order (`ledger_ordered_withdrawals`), independent of Plutus
     /// language version — matching `redeemerPointerInverse` / `Set.elemAt`.
@@ -1336,7 +1629,7 @@ mod tests {
             ),
         ]);
         let d = plutus_data_to_data(&p);
-        match d {
+        match &d {
             Data::Map(entries) => {
                 assert_eq!(entries.len(), 2);
                 assert_eq!(entries[0].0, Data::I(BigInt::from(2))); // input order preserved

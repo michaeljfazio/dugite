@@ -17,7 +17,7 @@ use dugite_primitives::address::Address;
 use dugite_primitives::hash::TransactionHash;
 use dugite_primitives::transaction::{TransactionInput, TransactionOutput};
 use dugite_primitives::value::Lovelace;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::utxo::UtxoError;
 
@@ -55,16 +55,26 @@ fn encode_key(input: &TransactionInput) -> Key {
     Key::from(&buf[..])
 }
 
+/// Decode a raw LSM key back into a [`TransactionInput`].
+///
+/// Returns `None` if `key` is shorter than [`KEY_SIZE`] — a well-formed
+/// store never produces such a key, but a crash-corrupted on-disk page
+/// could (#806 DEFECT B). Guarding here instead of slice-indexing directly
+/// turns a would-be panic on corrupt data into a value the caller can log
+/// and skip.
 #[inline]
-fn decode_key(key: &Key) -> TransactionInput {
+fn decode_key(key: &Key) -> Option<TransactionInput> {
     let bytes = key.as_ref();
+    if bytes.len() < KEY_SIZE {
+        return None;
+    }
     let mut hash_bytes = [0u8; 32];
     hash_bytes.copy_from_slice(&bytes[..32]);
     let index = u32::from_be_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]);
-    TransactionInput {
+    Some(TransactionInput {
         transaction_id: TransactionHash::from_bytes(hash_bytes),
         index,
-    }
+    })
 }
 
 #[inline]
@@ -199,14 +209,20 @@ impl UtxoStore {
     }
 
     /// Look up a UTxO by input reference.
+    ///
+    /// # Panics
+    ///
+    /// Panics on an LSM read error. Silently mapping a read error to `None`
+    /// here would make an existing UTxO look absent to callers (e.g. a
+    /// false `InputNotFound` during validation) — crash-don't-diverge, same
+    /// policy as `insert`/`delete`.
     pub fn lookup(&self, input: &TransactionInput) -> Option<TransactionOutput> {
         let key = encode_key(input);
         match self.tree.get(&key) {
             Ok(Some(value)) => decode_value(&value),
             Ok(None) => None,
             Err(e) => {
-                warn!("UtxoStore lookup error: {e}");
-                None
+                panic!("FATAL: UtxoStore lookup get failed: {e}")
             }
         }
     }
@@ -268,13 +284,25 @@ impl UtxoStore {
     /// when indexing is enabled (at-tip mode).  Callers that do not need the
     /// value (e.g., `rollback_transaction` output cleanup, Byron spent inputs)
     /// may call `remove_fast` to skip even the get.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the initial LSM `get` returns an error. Treating a read
+    /// error the same as "not found" would skip the tombstone write below
+    /// and silently resurrect a spent UTxO on the next lookup —
+    /// crash-don't-diverge.
     pub fn remove(&mut self, input: &TransactionInput) -> Option<TransactionOutput> {
         let key = encode_key(input);
 
         // Single LSM get — the only lookup required.
         let output = match self.tree.get(&key) {
             Ok(Some(value)) => decode_value(&value),
-            _ => return None,
+            Ok(None) => return None,
+            Err(e) => panic!(
+                "FATAL: UtxoStore remove get failed for {}#{}: {e}. \
+                 A swallowed read error would skip the tombstone and resurrect a spent UTxO.",
+                input.transaction_id, input.index
+            ),
         };
 
         // Key exists; write tombstone.
@@ -333,9 +361,18 @@ impl UtxoStore {
     }
 
     /// Check if a UTxO exists.
+    ///
+    /// # Panics
+    ///
+    /// Panics on an LSM read error rather than reporting `false`. Mapping a
+    /// read error to "not found" here would surface as a false
+    /// `InputNotFound` during validation — crash-don't-diverge.
     pub fn contains(&self, input: &TransactionInput) -> bool {
         let key = encode_key(input);
-        matches!(self.tree.get(&key), Ok(Some(_)))
+        match self.tree.get(&key) {
+            Ok(v) => v.is_some(),
+            Err(e) => panic!("FATAL: UtxoStore contains get failed: {e}"),
+        }
     }
 
     /// Apply a transaction: consume inputs, produce outputs.
@@ -383,9 +420,15 @@ impl UtxoStore {
                         // Key exists — remove without reading the value.
                         self.remove_fast(input);
                     }
-                    _ => {
+                    Ok(None) => {
                         return Err(UtxoError::InputNotFound(input.clone()));
                     }
+                    Err(e) => panic!(
+                        "FATAL: UtxoStore apply_transaction existence check failed for {}#{}: {e}. \
+                         A swallowed read error would mislabel this as a missing input instead of \
+                         an I/O fault.",
+                        input.transaction_id, input.index
+                    ),
                 }
             }
         }
@@ -441,7 +484,13 @@ impl UtxoStore {
                 let key = encode_key(input);
                 match self.tree.get(&key) {
                     Ok(Some(_)) => {} // exists
-                    _ => return Err(UtxoError::InputNotFound(input.clone())),
+                    Ok(None) => return Err(UtxoError::InputNotFound(input.clone())),
+                    Err(e) => panic!(
+                        "FATAL: UtxoStore apply_block_batch existence check failed for {}#{}: {e}. \
+                         A swallowed read error would mislabel this as a missing input instead of \
+                         an I/O fault.",
+                        input.transaction_id, input.index
+                    ),
                 }
             }
         }
@@ -572,10 +621,23 @@ impl UtxoStore {
     /// blake2b output and therefore uniformly distributed). Each chunk scans
     /// ~1/256 of the set, drops the per-chunk Vec, and moves on, so peak
     /// memory scales with chunk size rather than total set size.
-    pub fn scan_all<F>(&self, mut f: F)
+    ///
+    /// # Returns
+    ///
+    /// The number of entries that could not be decoded — either a key
+    /// shorter than [`KEY_SIZE`] or a value that failed `decode_value`
+    /// (#806 DEFECT B). A non-zero count means the underlying LSM tree has
+    /// corrupt/unreadable entries; every entry that failed to decode is
+    /// dropped from the callback stream (not delivered to `f`) rather than
+    /// panicking mid-scan, but callers that derive an authoritative count
+    /// from a `scan_all` pass (`count_entries`, `rebuild_address_index`)
+    /// MUST treat a non-zero return as "this scan is incomplete" and must
+    /// not silently trust the partial tally.
+    pub fn scan_all<F>(&self, mut f: F) -> usize
     where
         F: FnMut(TransactionInput, TransactionOutput),
     {
+        let mut failures = 0usize;
         // Split on the first byte of the 36-byte key so that chunks are
         // non-overlapping.  Each chunk is [[prefix, 0..0], [prefix, FF..FF]]
         // (inclusive both ends — matches LsmTree::range semantics).
@@ -593,12 +655,31 @@ impl UtxoStore {
             let from = Key::from(&from_bytes[..]);
             let to = Key::from(&to_bytes[..]);
             for (key, value) in self.tree.range(&from, &to) {
-                let input = decode_key(&key);
-                if let Some(output) = decode_value(&value) {
-                    f(input, output);
+                let Some(input) = decode_key(&key) else {
+                    warn!(
+                        key_len = key.as_ref().len(),
+                        expected = KEY_SIZE,
+                        "UtxoStore scan_all: dropping entry with malformed (too-short) key \
+                         — on-disk corruption suspected"
+                    );
+                    failures += 1;
+                    continue;
+                };
+                match decode_value(&value) {
+                    Some(output) => f(input, output),
+                    None => {
+                        warn!(
+                            tx = %input.transaction_id,
+                            index = input.index,
+                            "UtxoStore scan_all: dropping entry with undecodable value \
+                             — on-disk corruption suspected"
+                        );
+                        failures += 1;
+                    }
                 }
             }
         }
+        failures
     }
 
     /// Rebuild the address index by scanning all UTxO entries.
@@ -608,6 +689,17 @@ impl UtxoStore {
     /// multi-GB intermediate `Vec` that `iter()` + rebuild produced prior
     /// to #403.
     ///
+    /// # Corruption handling (#806 DEFECT B)
+    ///
+    /// If `scan_all` reports any decode failures, the scan is incomplete —
+    /// `self.count` is left at its previously-maintained value instead of
+    /// being overwritten with the (necessarily short) scanned total, and an
+    /// `error!` is logged. Silently reporting a shrunken count here would
+    /// mask on-disk corruption behind what looks like a normal UTxO set.
+    /// The address index itself is still replaced with whatever was
+    /// successfully scanned — a partial index is more useful than an empty
+    /// one, and is what's available either way.
+    ///
     /// [`scan_all`]: Self::scan_all
     pub fn rebuild_address_index(&mut self) {
         self.address_index.clear();
@@ -615,7 +707,7 @@ impl UtxoStore {
         // Rebuild into a local map so we don't need `&mut self` inside the
         // closure — `scan_all` takes `&self`.
         let mut address_index: HashMap<Address, HashSet<TransactionInput>> = HashMap::new();
-        self.scan_all(|input, output| {
+        let failures = self.scan_all(|input, output| {
             count += 1;
             address_index
                 .entry(output.address)
@@ -623,11 +715,28 @@ impl UtxoStore {
                 .insert(input);
         });
         self.address_index = address_index;
-        self.count = count;
+        if failures > 0 {
+            error!(
+                failures,
+                scanned = count,
+                maintained_count = self.count,
+                "UtxoStore rebuild_address_index: {failures} entries failed to decode during \
+                 scan — keeping the previously-maintained count ({}) instead of the incomplete \
+                 scanned total ({count}); this indicates on-disk corruption",
+                self.count
+            );
+        } else {
+            self.count = count;
+        }
         info!(
-            "Address index rebuilt: {} addresses, {} UTxOs",
+            "Address index rebuilt: {} addresses, {} UTxOs{}",
             self.address_index.len(),
             self.count,
+            if failures > 0 {
+                " (WARNING: decode failures detected during scan, see error log)"
+            } else {
+                ""
+            },
         );
     }
 
@@ -636,12 +745,33 @@ impl UtxoStore {
     /// Uses [`scan_all`] so that peak memory stays bounded even when the
     /// store holds millions of entries (#403).
     ///
+    /// # Corruption handling (#806 DEFECT B)
+    ///
+    /// If any entries failed to decode during the scan, `self.count` is
+    /// left unchanged (rather than being overwritten with the shorter
+    /// scanned total) and the previously-maintained count is returned. An
+    /// `error!` is logged so the corruption surfaces loudly instead of
+    /// silently shrinking the reported UTxO total.
+    ///
     /// [`scan_all`]: Self::scan_all
     pub fn count_entries(&mut self) -> usize {
         let mut count = 0usize;
-        self.scan_all(|_, _| count += 1);
-        self.count = count;
-        count
+        let failures = self.scan_all(|_, _| count += 1);
+        if failures > 0 {
+            error!(
+                failures,
+                scanned = count,
+                maintained_count = self.count,
+                "UtxoStore count_entries: {failures} entries failed to decode during scan — \
+                 keeping the previously-maintained count ({}) instead of the incomplete scanned \
+                 total ({count}); this indicates on-disk corruption",
+                self.count
+            );
+            self.count
+        } else {
+            self.count = count;
+            count
+        }
     }
 
     /// Save a persistent snapshot of the UTxO store.
@@ -912,9 +1042,17 @@ mod tests {
             index: 42,
         };
         let key = encode_key(&input);
-        let decoded = decode_key(&key);
+        let decoded = decode_key(&key).expect("well-formed KEY_SIZE key must decode");
         assert_eq!(decoded.transaction_id, input.transaction_id);
         assert_eq!(decoded.index, input.index);
+    }
+
+    /// #806 DEFECT B: a key shorter than [`KEY_SIZE`] must be reported as
+    /// `None` rather than panicking on out-of-bounds slice indexing.
+    #[test]
+    fn test_decode_key_rejects_short_key() {
+        let short = Key::from(&[0xAB; 10][..]);
+        assert!(decode_key(&short).is_none());
     }
 
     #[test]
@@ -1289,5 +1427,161 @@ mod tests {
             transaction_id: tx2_hash,
             index: 0,
         }));
+    }
+
+    // ===================================================================
+    //  Issue #805: LSM read errors must panic, not be swallowed as `None`.
+    // ===================================================================
+    //
+    // These tests force a real `Err` out of `LsmTree::get` by writing a
+    // single key with an immediate flush (memtable_size_mb = 0 forces a
+    // flush-to-disk after every insert), then flipping a byte inside the
+    // resulting SSTable page's data region so its CRC32 no longer matches.
+    // The corruption is applied to the *already-open* store/session so that
+    // the read hits `SsTableReader::read_page` (which re-reads from disk on
+    // every call) rather than going through `LsmTree::open` -> `Run::open`,
+    // which has its own (separate, out-of-scope) behavior of silently
+    // dropping unreadable runs from the manifest at startup.
+    //
+    // If dugite-lsm's on-disk page layout (see `sstable/page.rs`) ever
+    // changes, these tests will need updating alongside it.
+
+    /// Build a store with a single entry that has already been flushed to
+    /// an on-disk SSTable page, then corrupt that page's CRC so any
+    /// subsequent read of it returns `Err`. Returns the store and the input
+    /// whose backing page is now corrupt.
+    fn make_store_with_corrupt_entry() -> (UtxoStore, TransactionInput, TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let utxo_path = dir.path().join("utxo");
+
+        // memtable_size_mb = 0 forces `LsmTree::insert` to flush to disk
+        // immediately (approx_bytes() >= 0 is true as soon as the memtable
+        // is non-empty), so the entry lands in a real SSTable page.
+        let mut store = UtxoStore::open_with_config(&utxo_path, 0, 1, 1).unwrap();
+        let input = make_input(1, 0);
+        store.insert(input.clone(), make_output(5_000_000));
+
+        let active_dir = utxo_path.join("active");
+        let data_file = std::fs::read_dir(&active_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().and_then(|e| e.to_str()) == Some("data"))
+            .expect("expected a run-*.data file after forced flush");
+
+        let mut bytes = std::fs::read(&data_file).unwrap();
+        assert!(
+            bytes.len() > 32,
+            "data file too small to corrupt within the data region"
+        );
+        // Byte 15 falls inside the page's data region (header is the first
+        // 10 bytes; our 36-byte key starts at data-region offset 2), so
+        // flipping it changes the payload without touching the page-header
+        // fields (entry_count/data_end/crc32) that `Page::decode` reads
+        // before it even gets to the CRC check.
+        bytes[15] ^= 0xFF;
+        std::fs::write(&data_file, &bytes).unwrap();
+
+        (store, input, dir)
+    }
+
+    #[test]
+    #[should_panic(expected = "FATAL: UtxoStore lookup get failed")]
+    fn test_lookup_panics_on_lsm_read_error() {
+        let (store, input, _dir) = make_store_with_corrupt_entry();
+        let _ = store.lookup(&input);
+    }
+
+    #[test]
+    #[should_panic(expected = "FATAL: UtxoStore contains get failed")]
+    fn test_contains_panics_on_lsm_read_error() {
+        let (store, input, _dir) = make_store_with_corrupt_entry();
+        let _ = store.contains(&input);
+    }
+
+    #[test]
+    #[should_panic(expected = "FATAL: UtxoStore remove get failed")]
+    fn test_remove_panics_on_lsm_read_error() {
+        let (mut store, input, _dir) = make_store_with_corrupt_entry();
+        let _ = store.remove(&input);
+    }
+
+    /// Sanity check that the corruption helper does NOT panic on a
+    /// genuinely-absent key (`Ok(None)` path) — only a real read error
+    /// should trigger the panic policy above.
+    #[test]
+    fn test_lookup_returns_none_for_genuinely_missing_key() {
+        let (store, _input, _dir) = make_store_with_corrupt_entry();
+        let missing = make_input(0xEE, 0);
+        assert_eq!(store.lookup(&missing), None);
+        assert!(!store.contains(&missing));
+    }
+
+    // ===================================================================
+    //  Issue #806 DEFECT B: scan_all must report decode failures, and
+    //  count_entries/rebuild_address_index must not silently overwrite the
+    //  maintained count with an incomplete scanned total.
+    // ===================================================================
+    //
+    // A byte-flip that breaks an LSM page's CRC32 makes `LsmTree::range()`
+    // silently drop the *entire run* (see `range()`'s `if let Ok(entries) =
+    // run.scan_range(...)`), so `scan_all` never even sees a `(key, value)`
+    // pair for it — there is nothing for `decode_key`/`decode_value` to
+    // reject in that case. The realistic case `scan_all` CAN and must
+    // detect is a value whose bytes are structurally valid (correct CRC)
+    // but are not valid `TransactionOutput` bincode — e.g. after a schema
+    // change. We simulate that by writing directly through the private
+    // `tree` field (visible to this submodule), bypassing `encode_value`.
+
+    #[test]
+    fn test_scan_all_reports_undecodable_value_and_preserves_maintained_count() {
+        let mut store = UtxoStore::new_temp().unwrap();
+        let healthy = make_input(0x11, 0);
+        store.insert(healthy.clone(), make_output(1_000_000));
+
+        // Second entry: valid LSM key/value (real CRC, real bloom/fence
+        // entry) but the value bytes are not valid `TransactionOutput`
+        // bincode. `self.count` is bumped manually to model "this UTxO was
+        // counted as live before its bytes became undecodable" — exactly
+        // the scenario the maintained-count guard exists to protect.
+        let bad_input = make_input(0x22, 0);
+        let bad_key = encode_key(&bad_input);
+        store
+            .tree
+            .insert(&bad_key, &Value::from(&[0xDEu8, 0xAD, 0xBE][..]))
+            .unwrap();
+        store.count += 1;
+
+        assert_eq!(store.len(), 2, "maintained count reflects both entries");
+
+        let mut seen = 0usize;
+        let failures = store.scan_all(|_, _| seen += 1);
+        assert_eq!(
+            seen, 1,
+            "only the healthy entry is delivered to the scan_all callback"
+        );
+        assert_eq!(
+            failures, 1,
+            "the undecodable value must be reported, not silently dropped"
+        );
+
+        // count_entries must NOT overwrite the maintained count (2) with
+        // the incomplete scanned total (1).
+        let reported = store.count_entries();
+        assert_eq!(
+            reported, 2,
+            "count_entries must keep the previously-maintained count on decode failure"
+        );
+        assert_eq!(store.len(), 2);
+
+        // rebuild_address_index: same guarantee, plus the healthy entry
+        // must still be present in the rebuilt index.
+        store.rebuild_address_index();
+        assert_eq!(
+            store.len(),
+            2,
+            "rebuild_address_index must keep the previously-maintained count on decode failure"
+        );
+        assert!(store.lookup(&healthy).is_some());
     }
 }

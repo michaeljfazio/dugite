@@ -236,6 +236,30 @@ pub(crate) fn check_pv_can_follow(
 // Quorum / enactment helper (`voted_future_pparams`)
 // ---------------------------------------------------------------------------
 
+/// Fold a raw `(genesis-key, PParamsUpdate)` proposal list into a
+/// per-genesis-key map, matching Haskell's `Map (KeyHash 'Genesis)
+/// (PParamsUpdate era)` semantics: a later proposal from the same genesis
+/// delegate overwrites (never merges with) an earlier one from the same
+/// key. Truncates the wire's zero-padded `Hash32` genesis keys down to
+/// their on-chain `Hash28` form (mirrors [`check_non_genesis_update`]).
+///
+/// Callers must supply `proposals` in submission order (oldest first) so
+/// that `BTreeMap::insert`'s last-writer-wins behaviour reproduces
+/// Haskell's `Map.insert` overwrite-on-repeated-key semantics.
+///
+/// Feeds [`voted_future_pparams`] from the three enactment sites
+/// (`eras::shelley`, `eras::conway`, `state::epoch`) and the three
+/// header/envelope forecast helpers in `state::mod` (issue #784).
+pub fn fold_pp_proposals(
+    proposals: &[(Hash32, ProtocolParamUpdate)],
+) -> BTreeMap<Hash28, ProtocolParamUpdate> {
+    let mut map = BTreeMap::new();
+    for (genesis_hash, ppu) in proposals {
+        map.insert(hash32_to_hash28(genesis_hash), ppu.clone());
+    }
+    map
+}
+
 /// Tally votes among proposed protocol-parameter updates and return the
 /// single update that has reached quorum, if any.
 ///

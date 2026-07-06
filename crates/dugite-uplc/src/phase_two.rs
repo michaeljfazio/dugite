@@ -282,6 +282,19 @@ pub fn eval_phase_two_raw<O: RedeemerObserver>(
         mem: initial_budget.1 as i64,
     };
 
+    // Read once, outside the loop (#838/#841): this env var is an offline
+    // debug/repro aid (see the two call sites below), never toggled mid-run
+    // on a live node, so polling it on every redeemer was pure per-call
+    // overhead — including on the adversarial-input path (every redeemer in
+    // every tx a peer submits).
+    let phase2_uncapped = std::env::var("DUGITE_PHASE2_UNCAPPED").is_ok();
+    // Amortizes the per-language `TxInfo` build across every redeemer of
+    // this tx that shares a language (#838) — see
+    // `crate::eval_redeemer::TxInfoCache`'s doc comment. Without this, a
+    // Plutus-dense tx rebuilds (and re-resolves every OTHER redeemer while
+    // doing so) the same TxInfo once per redeemer, which is O(n²) in the
+    // redeemer count.
+    let mut tx_info_cache = crate::eval_redeemer::TxInfoCache::new();
     let mut results: Vec<RedeemerResult> = Vec::with_capacity(resolved_redeemers.len());
     for resolved_r in &resolved_redeemers {
         // The observer wants the raw redeemer CBOR — but the wire
@@ -311,8 +324,13 @@ pub fn eval_phase_two_raw<O: RedeemerObserver>(
         // adversarial). Cf. IntersectMBO/plutus
         // `PlutusLedgerApi.Common.Eval.evaluateScriptRestricting` and
         // cardano-ledger `Cardano.Ledger.Plutus.Language.evaluatePlutusRunnable`.
-        let declared_mem = resolved_r.declared_ex_units.0 as i64;
-        let declared_cpu = resolved_r.declared_ex_units.1 as i64;
+        // `i64::try_from(...).unwrap_or(i64::MAX)` (#844), not `as i64`: a
+        // declared value >= 2^63 must saturate to `i64::MAX`, matching the
+        // `redeemer_budget` conversion just below, rather than silently
+        // wrapping to a negative number that could misclassify the
+        // over-budget check further down.
+        let declared_mem = i64::try_from(resolved_r.declared_ex_units.0).unwrap_or(i64::MAX);
+        let declared_cpu = i64::try_from(resolved_r.declared_ex_units.1).unwrap_or(i64::MAX);
         let redeemer_budget = crate::machine::ExBudget {
             cpu: i64::try_from(resolved_r.declared_ex_units.1)
                 .unwrap_or(i64::MAX)
@@ -326,7 +344,7 @@ pub fn eval_phase_two_raw<O: RedeemerObserver>(
         // divergence repro can measure the FULL consumption a script would
         // need, instead of halting at the declared exUnits. Never set on a
         // running node.
-        let redeemer_budget = if std::env::var("DUGITE_PHASE2_UNCAPPED").is_ok() {
+        let redeemer_budget = if phase2_uncapped {
             initial_ex_budget
         } else {
             redeemer_budget
@@ -340,6 +358,7 @@ pub fn eval_phase_two_raw<O: RedeemerObserver>(
             redeemer_budget,
             decoded.cost_models.as_ref(),
             major_pv,
+            &mut tx_info_cache,
         )?;
 
         // The restricting cap above already guarantees `consumed <= declared`
@@ -348,7 +367,7 @@ pub fn eval_phase_two_raw<O: RedeemerObserver>(
         // Under DUGITE_PHASE2_UNCAPPED (offline repro only) report the
         // overage to stderr but keep evaluating the remaining redeemers so a
         // repro can compare EVERY redeemer's full consumption vs declared.
-        if std::env::var("DUGITE_PHASE2_UNCAPPED").is_ok() {
+        if phase2_uncapped {
             if outcome.consumed.cpu > declared_cpu || outcome.consumed.mem > declared_mem {
                 eprintln!(
                     "DUGITE_PHASE2_UNCAPPED: redeemer {tag:?}@{idx} consumed \

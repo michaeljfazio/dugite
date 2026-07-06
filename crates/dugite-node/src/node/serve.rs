@@ -1049,6 +1049,21 @@ pub(crate) fn convert_validation_error(
         VE::MIRNegativeTransfer { pot, amount } => TxValidationError::ScriptFailed {
             reason: format!("MIRNegativeTransfer: pot={pot:?}, amount={amount}"),
         },
+        // #804: Shelley UTXOW `MIRInsufficientGenesisSigsUTXOW` — a
+        // whole-transaction check (not a per-cert DELEG predicate like the
+        // MIR variants above), but riding the same `ScriptFailed` wire
+        // variant for the same reason as `Phase2CollectError`/
+        // `Phase2EvalPanic` below: no dedicated N2C wire tag exists for it
+        // yet, and the reason string carries full diagnostic detail.
+        VE::MIRInsufficientGenesisSigs {
+            present,
+            required,
+            signers,
+        } => TxValidationError::ScriptFailed {
+            reason: format!(
+                "MIRInsufficientGenesisSigsUTXOW: present={present}, required={required}, signers={signers:?}"
+            ),
+        },
         VE::NonGenesisUpdatePPUP { proposed, genesis } => TxValidationError::ScriptFailed {
             reason: format!(
                 "NonGenesisUpdatePPUP: proposed_keys not subset of genesis_delegates \
@@ -1243,6 +1258,7 @@ mod tests {
             yes_votes: 0,
             no_votes: 0,
             abstain_votes: 0,
+            submission_index: 0,
         };
         let cold_cred = Hash32::from_bytes([0xC0; 32]);
         let hot_cred = Hash32::from_bytes([0x77; 32]);

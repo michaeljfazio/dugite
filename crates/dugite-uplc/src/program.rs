@@ -54,6 +54,23 @@ impl Program {
         // followed by 0-bit fillers. `read_filler` enforces that the
         // trailing bits match this shape.
         r.read_filler()?;
+        // Haskell's flat `strictDecoder` unconditionally raises `TooMuchSpace`
+        // (oracle-confirmed, issue #822) when the input is not fully consumed
+        // to the bit after the mandatory trailing filler. A canonical writer
+        // (`to_flat`, below) never leaves bits unconsumed, so any remainder
+        // here means the caller handed us `valid_program ‖ trailing_bytes` —
+        // e.g. an adversary appending padding to a known script to mint a
+        // distinct on-chain script hash that still evaluates identically.
+        // Reject rather than silently accept: cardano-node would refuse this
+        // script at deserialisation, so accepting it here is a consensus
+        // divergence in the "too permissive" direction.
+        let remaining = r.bits_remaining();
+        if remaining != 0 {
+            return Err(UplcError::FlatDecode(format!(
+                "TooMuchSpace: {remaining} trailing bit(s) after the program's \
+                 mandatory padding"
+            )));
+        }
         Ok(Program {
             version: (major, minor, patch),
             term,
@@ -79,7 +96,15 @@ impl Program {
         w.write_natural_u64(self.version.1)?;
         w.write_natural_u64(self.version.2)?;
         encode_term(&mut w, &self.term)?;
-        w.write_filler();
+        // `BitWriter::finish` already appends the single mandatory trailing
+        // filler (see its doc comment) — an extra explicit `write_filler()`
+        // call here previously wrote it TWICE, appending a spurious sentinel
+        // byte (`0000_0001`) after the real one (issue #835). That went
+        // unnoticed only because `Program::from_flat` had no
+        // fully-consumed-input check (issue #822); now that #822 rejects any
+        // trailing bits after the mandatory padding, the double filler must
+        // go or every `to_flat`/`to_cbor`-encoded fixture in this crate's own
+        // tests would round-trip-fail as "TooMuchSpace".
         Ok(w.finish())
     }
 }
@@ -173,6 +198,25 @@ mod tests {
         assert_eq!(back.version, (3, 4, 5));
     }
 
+    /// #842: the version triple must stay on the LENIENT `u64` decode
+    /// path (`BitReader::read_natural_u64`), never the strict
+    /// `read_word64_strict` used for the De Bruijn index / `Constr`
+    /// tag (`flat/term.rs`). Haskell types `Version`'s three fields as
+    /// unbounded `Natural` (`PlutusCore.Version`), which never rejects
+    /// on overflow — a value right at the `u64` boundary (`u64::MAX`)
+    /// must round-trip cleanly, not be rejected as it would be under
+    /// the strict Word64 rule this fix introduces elsewhere.
+    #[test]
+    fn version_component_at_u64_boundary_is_not_rejected() {
+        let p = Program {
+            version: (u64::MAX, 0, 0),
+            term: Term::Error,
+        };
+        let back = Program::from_flat(&p.to_flat().unwrap())
+            .expect("version component at the u64 boundary must not be rejected");
+        assert_eq!(back.version, (u64::MAX, 0, 0));
+    }
+
     /// Canonical IOG always-true V1 validator (vendored by every cardano-node
     /// integration test fixture). cborHex `4e4d01000033222220051200120011`
     /// decomposes as: outer CBOR byte string of 14 bytes → inner CBOR byte
@@ -195,5 +239,64 @@ mod tests {
         let flat = [0x01, 0x00, 0x00, 0x22, 0x21, 0x20, 0x01, 0x01];
         let p = Program::from_flat(&flat).expect("canonical V2 always-true must decode");
         assert_eq!(p.version, (1, 0, 0));
+    }
+
+    /// Issue #822: a valid flat program with only the mandatory final-byte
+    /// padding must still decode. (This is the "don't over-tighten" half of
+    /// the trailing-bytes gate — a regression here would false-reject every
+    /// legitimate on-chain script.)
+    #[test]
+    fn from_flat_accepts_program_with_only_mandatory_padding() {
+        let p = Program {
+            version: (1, 1, 0),
+            term: Term::Error,
+        };
+        let flat = p.to_flat().unwrap();
+        let back = Program::from_flat(&flat).expect("canonical padding must decode");
+        assert_eq!(back, p);
+
+        // Canonical IOG fixtures above are the same shape: zero bytes beyond
+        // the mandatory filler.
+        let flat_v1 = [
+            0x01, 0x00, 0x00, 0x33, 0x22, 0x22, 0x20, 0x05, 0x12, 0x00, 0x12, 0x00, 0x11,
+        ];
+        Program::from_flat(&flat_v1).expect("canonical V1 fixture must still decode");
+    }
+
+    /// Issue #822: `Program::from_flat` must reject `valid_program ‖
+    /// trailing_bytes` the way Haskell's flat decoder raises `TooMuchSpace`.
+    /// An adversary can append arbitrary bytes to a known-good script; if
+    /// dugite silently ignored them the resulting bytes would hash to a
+    /// DIFFERENT on-chain script than the one Haskell would compute for the
+    /// same (rejected) bytes — a genuine consensus divergence, not just a
+    /// decode nicety.
+    #[test]
+    fn from_flat_rejects_trailing_byte_after_valid_program() {
+        let p = Program {
+            version: (1, 1, 0),
+            term: Term::Error,
+        };
+        let mut flat = p.to_flat().unwrap();
+        flat.push(0x00);
+        let err = Program::from_flat(&flat).unwrap_err();
+        assert!(matches!(err, UplcError::FlatDecode(_)), "got {err:?}");
+
+        // A non-zero trailing byte (i.e. one that itself looks like it could
+        // start a new filler) must be rejected too — the check is "any bits
+        // remain after the program's own filler", not "the trailing bytes
+        // happen to be zero".
+        let mut flat_nonzero = p.to_flat().unwrap();
+        flat_nonzero.push(0xff);
+        let err = Program::from_flat(&flat_nonzero).unwrap_err();
+        assert!(matches!(err, UplcError::FlatDecode(_)), "got {err:?}");
+
+        // Regression guard on the canonical V1 always-true fixture: appending
+        // even a single trailing byte must flip it from accept to reject.
+        let mut flat_v1 = vec![
+            0x01, 0x00, 0x00, 0x33, 0x22, 0x22, 0x20, 0x05, 0x12, 0x00, 0x12, 0x00, 0x11,
+        ];
+        flat_v1.push(0x00);
+        let err = Program::from_flat(&flat_v1).unwrap_err();
+        assert!(matches!(err, UplcError::FlatDecode(_)), "got {err:?}");
     }
 }

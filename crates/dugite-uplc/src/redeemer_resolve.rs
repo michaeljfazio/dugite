@@ -50,6 +50,13 @@ pub struct ResolvedRedeemer {
     /// The script hash this redeemer dispatches against.
     pub script_hash: [u8; 28],
     /// Where the script's raw bytes live (witness set vs reference input).
+    ///
+    /// Both sources carry the SAME wire shape — CBOR-bytestring-wrapped
+    /// flat (#836, verified byte-for-byte against real captured
+    /// on-chain fixtures for both witness scripts and reference
+    /// scripts; see `crate::eval_redeemer::decode_script_bytes`'s doc
+    /// comment). There is no source-dependent decode distinction to
+    /// track here.
     pub script_bytes: Vec<u8>,
     /// Plutus language version the script targets.
     pub language: ScriptLanguage,
@@ -1006,6 +1013,41 @@ mod tests {
         // V3 spend: datum lookup defers to ScriptContext builder.
         assert!(r[0].datum.is_none());
         assert!(matches!(r[0].purpose, ScriptPurpose::Spending(_)));
+    }
+
+    /// A redeemer whose script is a UTxO `script_ref` (not a
+    /// witness-set entry) must resolve `script_bytes` to exactly the
+    /// bytes stored in the `ScriptRef` — the same CBOR-bytestring
+    /// -wrapped-flat wire shape as a witness-set script (#836, verified
+    /// against real captured on-chain fixtures for both sources; see
+    /// `crate::eval_redeemer::decode_script_bytes`'s doc comment).
+    #[test]
+    fn spend_resolves_reference_script() {
+        let script_bytes = vec![0x11, 0x22, 0x33, 0x44];
+        let script_hash = plutus_v3_script_with_hash(&script_bytes);
+        let input = TransactionInput {
+            transaction_id: h32(0xed),
+            index: 0,
+        };
+        let mut spent_out = enterprise_script_output(script_hash, 1_000_000);
+        spent_out.script_ref = Some(PrimScriptRef::PlutusV3(script_bytes.clone()));
+        let mut body = minimal_body();
+        body.inputs = vec![input.clone()];
+        let mut ws = empty_witness();
+        // Deliberately empty: the script must resolve via `script_ref`,
+        // not the witness set.
+        ws.redeemers = vec![Redeemer {
+            tag: RedeemerTag::Spend,
+            index: 0,
+            data: PrimPlutusData::Integer(num_bigint::BigInt::from(0)),
+            ex_units: ExUnits { mem: 1, steps: 1 },
+        }];
+        let tx = build_tx(body, ws);
+        let resolved = vec![(input, spent_out, vec![])];
+        let r = resolve_redeemers(&tx, &resolved).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].language, ScriptLanguage::PlutusV3);
+        assert_eq!(r[0].script_bytes, script_bytes);
     }
 
     #[test]

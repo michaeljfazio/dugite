@@ -53,7 +53,16 @@ use num_bigint::{BigInt, Sign};
 /// Maximum nesting depth accepted by the [`Data`] CBOR decoder. The
 /// real on-chain limit is much lower than this; the cap is purely a
 /// DoS guard against pathological adversarial input.
-pub const DATA_MAX_DEPTH: usize = 256;
+///
+/// Haskell's `decodeData` has no explicit depth limit (it recurses on
+/// the heap via GHC's native stack) and accepts far deeper nesting than
+/// a naive cap would suggest — see #831 finding 3, which pins a
+/// concrete case (258 nested indefinite lists) that Haskell decodes but
+/// a 256 cap here would false-reject. This value matches
+/// `dugite_serialization`'s consensus-path
+/// `era_alonzo::MAX_PLUTUS_DATA_DEPTH`, so this decoder never
+/// false-rejects a structure the consensus decoder accepts.
+pub const DATA_MAX_DEPTH: usize = 1024;
 
 /// Maximum payload length of a single definite-length byte / bignum
 /// chunk, per the Haskell `decodeBoundedBytes` invariant.
@@ -66,7 +75,11 @@ const DATA_CHUNK_LIMIT: usize = 64;
 /// the on-chain encoding preserves insertion order — sorting on encode
 /// would change the body hash for txs that gossip in non-sorted form,
 /// breaking byte-exact round-trip.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// `Clone`, `PartialEq`/`Eq`, `Hash`, and `Drop` are all hand-written
+/// (not derived) as explicit-stack iterative traversals — see the impls
+/// below (#832).
+#[derive(Debug)]
 pub enum Data {
     /// `Constr` — tagged sum: `Constr tag args`.
     Constr(u64, Vec<Data>),
@@ -81,7 +94,304 @@ pub enum Data {
     B(Vec<u8>),
 }
 
+/// Explicit-stack iterative structural equality.
+///
+/// A script can cheaply construct a `Data` value nested ~10^5–10^6 deep
+/// (repeated `constrData`/`mkCons`/`listData`, each a separately-charged
+/// builtin call) and then call `equalsData d d`, which compares via
+/// `a == b`. The `#[derive(PartialEq)]` this replaces would recurse one
+/// native stack frame per nesting level — adversarially deep input then
+/// overflows the stack (process abort = remote DoS). This produces the
+/// exact same result as the derived structural comparison (same
+/// variant, same fields, elementwise, in order) for every input; only
+/// the stack behavior changes. See #832.
+impl PartialEq for Data {
+    fn eq(&self, other: &Self) -> bool {
+        let mut stack: Vec<(&Data, &Data)> = vec![(self, other)];
+        while let Some((a, b)) = stack.pop() {
+            match (a, b) {
+                (Data::Constr(ta, fa), Data::Constr(tb, fb)) => {
+                    if ta != tb || fa.len() != fb.len() {
+                        return false;
+                    }
+                    stack.extend(fa.iter().zip(fb.iter()));
+                }
+                (Data::Map(ea), Data::Map(eb)) => {
+                    if ea.len() != eb.len() {
+                        return false;
+                    }
+                    for ((ka, va), (kb, vb)) in ea.iter().zip(eb.iter()) {
+                        stack.push((ka, kb));
+                        stack.push((va, vb));
+                    }
+                }
+                (Data::List(la), Data::List(lb)) => {
+                    if la.len() != lb.len() {
+                        return false;
+                    }
+                    stack.extend(la.iter().zip(lb.iter()));
+                }
+                (Data::I(ia), Data::I(ib)) => {
+                    if ia != ib {
+                        return false;
+                    }
+                }
+                (Data::B(ba), Data::B(bb)) => {
+                    if ba != bb {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+
+impl Eq for Data {}
+
+/// Explicit-stack iterative deep clone.
+///
+/// `Data` holds its recursive children by value (`Vec<Data>` /
+/// `Vec<(Data, Data)>`), so `#[derive(Clone)]` recurses one native stack
+/// frame per nesting level — the identical latent stack-overflow class
+/// that `PartialEq`, `Hash`, and `Drop` were hand-written to avoid
+/// (#832), and it was the one impl left derived. A deep clone IS
+/// reachable on the CEK hot path: a `Var` lookup (`machine::step`) clones
+/// the bound `Value`, and a `Value` wrapping a `Constant::Data(d)` whose
+/// nesting depth an adversary drove to ~10^5–10^6 (repeated
+/// `constrData`/`listData`/`mapData`, each a separately-charged builtin)
+/// would overflow the phase-2 evaluation stack (unguarded, a 2 MiB rayon
+/// worker) = process abort = remote DoS.
+///
+/// This produces the exact same value as the derived clone; only the
+/// stack behavior changes. The clone is assembled bottom-up: a work-stack
+/// of `Task`s drives a post-order traversal, each finished child is
+/// pushed onto `out`, and a `Build*` task pops its children back off
+/// `out` to reassemble the parent. Children are pushed in reverse so they
+/// pop — and therefore land in `out` — in source order (a reordered
+/// `Map`/`Constr` clone would change the body hash: byte-exactness is not
+/// optional here).
+impl Clone for Data {
+    fn clone(&self) -> Self {
+        enum Task<'a> {
+            Descend(&'a Data),
+            BuildConstr(u64, usize),
+            BuildList(usize),
+            BuildMap(usize),
+        }
+        let mut tasks: Vec<Task<'_>> = vec![Task::Descend(self)];
+        let mut out: Vec<Data> = Vec::new();
+        while let Some(task) = tasks.pop() {
+            match task {
+                Task::Descend(d) => match d {
+                    Data::Constr(tag, args) => {
+                        tasks.push(Task::BuildConstr(*tag, args.len()));
+                        for child in args.iter().rev() {
+                            tasks.push(Task::Descend(child));
+                        }
+                    }
+                    Data::List(items) => {
+                        tasks.push(Task::BuildList(items.len()));
+                        for child in items.iter().rev() {
+                            tasks.push(Task::Descend(child));
+                        }
+                    }
+                    Data::Map(entries) => {
+                        tasks.push(Task::BuildMap(entries.len()));
+                        // Push value-then-key within each pair, over the
+                        // entries in reverse, so keys and values pop back in
+                        // source order (k0, v0, k1, v1, …).
+                        for (k, v) in entries.iter().rev() {
+                            tasks.push(Task::Descend(v));
+                            tasks.push(Task::Descend(k));
+                        }
+                    }
+                    // Leaves clone directly — bounded, non-recursive.
+                    Data::I(n) => out.push(Data::I(n.clone())),
+                    Data::B(b) => out.push(Data::B(b.clone())),
+                },
+                Task::BuildConstr(tag, n) => {
+                    let start = out.len() - n;
+                    let args = out.split_off(start);
+                    out.push(Data::Constr(tag, args));
+                }
+                Task::BuildList(n) => {
+                    let start = out.len() - n;
+                    let items = out.split_off(start);
+                    out.push(Data::List(items));
+                }
+                Task::BuildMap(n) => {
+                    let start = out.len() - 2 * n;
+                    let flat = out.split_off(start);
+                    let mut entries = Vec::with_capacity(n);
+                    let mut it = flat.into_iter();
+                    while let (Some(k), Some(v)) = (it.next(), it.next()) {
+                        entries.push((k, v));
+                    }
+                    out.push(Data::Map(entries));
+                }
+            }
+        }
+        match out.pop() {
+            Some(root) => root,
+            // Unreachable: every completed subtree pushes exactly one node
+            // onto `out`, and `self` is one subtree, so `out` ends with
+            // exactly one root.
+            None => unreachable!("clone traversal always reduces to exactly one root node"),
+        }
+    }
+}
+
+/// Explicit-stack iterative `Hash`, matching the iterative `PartialEq`
+/// above (clippy's `derived_hash_with_manual_eq` correctly flags a
+/// derived `Hash` alongside a hand-written `PartialEq` as a
+/// consistency risk otherwise). Not currently load-bearing — `Data` is
+/// never used as a hash-map/set key anywhere in this crate — but kept
+/// consistent and non-recursive rather than suppressing the lint,
+/// closing the same latent-recursion class of issue as `PartialEq` and
+/// `Drop` (#832).
+///
+/// Push/pop order need not match a left-to-right recursive traversal —
+/// it only needs to be deterministic for a given value, which the
+/// explicit stack guarantees, so equal `Data` values always hash
+/// identically.
+impl std::hash::Hash for Data {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let mut stack: Vec<&Data> = vec![self];
+        while let Some(d) = stack.pop() {
+            match d {
+                Data::Constr(tag, args) => {
+                    0u8.hash(state);
+                    tag.hash(state);
+                    args.len().hash(state);
+                    stack.extend(args.iter());
+                }
+                Data::Map(entries) => {
+                    1u8.hash(state);
+                    entries.len().hash(state);
+                    for (k, v) in entries {
+                        stack.push(k);
+                        stack.push(v);
+                    }
+                }
+                Data::List(items) => {
+                    2u8.hash(state);
+                    items.len().hash(state);
+                    stack.extend(items.iter());
+                }
+                Data::I(n) => {
+                    3u8.hash(state);
+                    n.hash(state);
+                }
+                Data::B(b) => {
+                    4u8.hash(state);
+                    b.hash(state);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Data {
+    /// Explicit-stack iterative teardown.
+    ///
+    /// `Data` is directly self-recursive (`Vec<Data>`/`Vec<(Data, Data)>`
+    /// fields holding `Data` by value) — unlike the CEK env's cons-list
+    /// (`machine::env::Env`), which is `Rc`-indirected through a
+    /// *separate*, non-`Drop` `Node` type. That distinction matters: a
+    /// naive port of "take children into a worklist, let each emptied
+    /// shell drop normally" does NOT terminate here, because letting a
+    /// popped, already-emptied `Data` value fall out of scope at the end
+    /// of a loop iteration re-enters `Data`'s own `Drop::drop` — forever,
+    /// for every value, since there is no separate non-`Drop` type to
+    /// bottom out into.
+    ///
+    /// Instead, for every popped node this: (1) moves any `Data`
+    /// children onto the explicit work-stack via `mem::take` on the
+    /// container field — sound even though `Data: Drop`, since
+    /// `mem::take` always leaves a fully-initialized replacement value
+    /// behind rather than partially moving out of a live place; (2)
+    /// explicitly drops any genuinely-owned non-`Data` leaf payload
+    /// (`BigInt`/`Vec<u8>`) via the same `mem::take`-then-drop technique;
+    /// and (3) `mem::forget`s the now-inert shell so its own
+    /// `Drop::drop` is never invoked again. Step (3) is leak-free: by
+    /// that point the shell owns only a `Copy` tag and
+    /// default/zero-capacity containers (`Vec::new()`, `BigInt::ZERO` —
+    /// both non-heap-allocating).
+    fn drop(&mut self) {
+        let taken = std::mem::replace(self, Data::B(Vec::new()));
+        let mut stack = vec![taken];
+        while let Some(mut node) = stack.pop() {
+            match &mut node {
+                Data::Constr(_, args) => stack.extend(std::mem::take(args)),
+                Data::List(items) => stack.extend(std::mem::take(items)),
+                Data::Map(entries) => {
+                    for (k, v) in std::mem::take(entries) {
+                        stack.push(k);
+                        stack.push(v);
+                    }
+                }
+                Data::I(n) => std::mem::drop(std::mem::take(n)),
+                Data::B(b) => std::mem::drop(std::mem::take(b)),
+            }
+            std::mem::forget(node);
+        }
+    }
+}
+
 impl Data {
+    /// Consume `self`, extracting the `Constr` tag/args if that's the
+    /// variant, or handing `self` back unchanged (`Err`) otherwise.
+    ///
+    /// Once `Data` implements `Drop` (#832), a plain
+    /// `match self { Data::Constr(tag, args) => .., }` on an *owned*
+    /// `Data` value no longer compiles (E0509: partial moves out of a
+    /// type that implements `Drop` are disallowed). This extracts the
+    /// payload via `mem::take` through a `&mut self` borrow instead —
+    /// sound because `mem::take` always leaves a fully-initialized
+    /// replacement in the field, and the shallow leftover (`self`'s
+    /// `Vec` is now empty) drops in O(1) with no recursion when this
+    /// function returns.
+    pub fn into_constr(mut self) -> Result<(u64, Vec<Data>), Data> {
+        match &mut self {
+            Data::Constr(tag, args) => Ok((*tag, std::mem::take(args))),
+            _ => Err(self),
+        }
+    }
+
+    /// See [`Data::into_constr`]; extracts the `Map` entries.
+    pub fn into_map(mut self) -> Result<Vec<(Data, Data)>, Data> {
+        match &mut self {
+            Data::Map(entries) => Ok(std::mem::take(entries)),
+            _ => Err(self),
+        }
+    }
+
+    /// See [`Data::into_constr`]; extracts the `List` items.
+    pub fn into_list(mut self) -> Result<Vec<Data>, Data> {
+        match &mut self {
+            Data::List(items) => Ok(std::mem::take(items)),
+            _ => Err(self),
+        }
+    }
+
+    /// See [`Data::into_constr`]; extracts the `I` integer.
+    pub fn into_integer(mut self) -> Result<BigInt, Data> {
+        match &mut self {
+            Data::I(n) => Ok(std::mem::take(n)),
+            _ => Err(self),
+        }
+    }
+
+    /// See [`Data::into_constr`]; extracts the `B` byte string.
+    pub fn into_bytes(mut self) -> Result<Vec<u8>, Data> {
+        match &mut self {
+            Data::B(b) => Ok(std::mem::take(b)),
+            _ => Err(self),
+        }
+    }
+
     /// Encode the `Data` value to its canonical-on-chain CBOR bytes.
     pub fn to_cbor(&self) -> Result<Vec<u8>, UplcError> {
         let mut out = Vec::new();
@@ -116,6 +426,21 @@ impl Data {
 // ---------------------------------------------------------------------------
 
 fn encode_data<W: minicbor::encode::Write>(
+    e: &mut Encoder<W>,
+    data: &Data,
+) -> Result<(), minicbor::encode::Error<W::Error>> {
+    // `encode_data` recurses mutually with `encode_constr`/`encode_args`/
+    // `encode_list` for every level of nesting. Machine-*constructed*
+    // `Data` (e.g. via repeated `mkCons`/`constrData` builtin calls) never
+    // passes through the depth-capped CBOR decoder at all, so an
+    // adversarially deep value reaching `serialiseData`/`to_cbor` could
+    // still overflow the native stack here even after `decode_data` is
+    // hardened. Extend the stack transparently, mirroring `decode_data`
+    // and the flat term decoder (`flat/term.rs`). See #832.
+    stacker::maybe_grow(128 * 1024, 1024 * 1024, || encode_data_inner(e, data))
+}
+
+fn encode_data_inner<W: minicbor::encode::Write>(
     e: &mut Encoder<W>,
     data: &Data,
 ) -> Result<(), minicbor::encode::Error<W::Error>> {
@@ -347,6 +672,18 @@ fn decode_data(d: &mut Decoder<'_>, depth: usize) -> Result<Data, UplcError> {
             "Data nesting depth exceeds limit ({DATA_MAX_DEPTH})"
         )));
     }
+    // `decode_data` recurses mutually with `decode_tagged`/`decode_array`/
+    // `decode_map`, so raising DATA_MAX_DEPTH to 1024 (to match the
+    // consensus decoder, #831 finding 3) pushes hundreds of stack frames
+    // in debug builds — enough to overflow the default thread stack
+    // before the depth check itself ever fires. Extend the stack
+    // transparently rather than relying on the depth cap alone to bound
+    // native stack usage, mirroring the flat term decoder's identical
+    // use of `stacker::maybe_grow` (`flat/term.rs`).
+    stacker::maybe_grow(128 * 1024, 1024 * 1024, || decode_data_inner(d, depth))
+}
+
+fn decode_data_inner(d: &mut Decoder<'_>, depth: usize) -> Result<Data, UplcError> {
     let ty = d
         .datatype()
         .map_err(|e| UplcError::CborDecode(format!("datatype: {e}")))?;
@@ -389,50 +726,100 @@ fn decode_data(d: &mut Decoder<'_>, depth: usize) -> Result<Data, UplcError> {
 }
 
 fn decode_tagged(d: &mut Decoder<'_>, depth: usize) -> Result<Data, UplcError> {
+    // #831 finding 2: `cborg`'s `peekTokenType` (which the Haskell
+    // `PlutusData` `Serialise` instance is built on) maps ONLY the
+    // 1-byte inline tag header (`0xc2` positive / `0xc3` negative) to
+    // `TypeInteger` -> the bignum decode path. Any wider, non-minimal
+    // encoding of the same tag value (e.g. `d8 02`, `d9 00 02`) is
+    // `TypeTag` -> `decodeConstr`, which fails since 2/3 aren't valid
+    // constructor tags. Peek the raw header byte BEFORE consuming the
+    // tag so a wide-form 2/3 is routed to the rejection arm, matching
+    // Haskell's acceptance boundary exactly.
+    let is_inline_bignum_header = matches!(
+        d.input().get(d.position()).copied(),
+        Some(0xc2) | Some(0xc3)
+    );
     let tag = d
         .tag()
         .map_err(|e| UplcError::CborDecode(format!("tag: {e}")))?
         .as_u64();
-    match tag {
-        2 => {
+    match (is_inline_bignum_header, tag) {
+        (true, 2) => {
             // Positive bignum.
             let bytes = decode_bytes(d)?;
             Ok(Data::I(BigInt::from_bytes_be(Sign::Plus, &bytes)))
         }
-        3 => {
+        (true, 3) => {
             // Negative bignum: stored as `-1 - n`, so the result is
             // `-1 - magnitude`.
             let bytes = decode_bytes(d)?;
             let magnitude = BigInt::from_bytes_be(Sign::Plus, &bytes);
             Ok(Data::I(-BigInt::from(1) - magnitude))
         }
-        tag @ 121..=127 => {
+        (_, tag @ 121..=127) => {
             let constr_tag = tag - 121;
             let args = decode_array(d, depth)?;
             Ok(Data::Constr(constr_tag, args))
         }
-        tag @ 1280..=1400 => {
+        (_, tag @ 1280..=1400) => {
             let constr_tag = tag - 1280 + 7;
             let args = decode_array(d, depth)?;
             Ok(Data::Constr(constr_tag, args))
         }
-        102 => {
+        (_, 102) => {
+            // #831 finding 1: Haskell's `decodeConstrExtended` uses
+            // `decodeListLenOrIndef`, which accepts BOTH a
+            // definite-length array(2) and an indefinite-length array
+            // closed by an explicit break — it does not require
+            // definite-length here. Accept both forms, consuming the
+            // trailing break for the indefinite case.
             let len = d
                 .array()
                 .map_err(|e| UplcError::CborDecode(format!("constr-102 outer: {e}")))?;
-            if len != Some(2) {
-                return Err(UplcError::CborDecode(format!(
-                    "tag 102: expected definite array(2), got {len:?}"
-                )));
+            match len {
+                Some(2) => {
+                    let constr_tag = d
+                        .u64()
+                        .map_err(|e| UplcError::CborDecode(format!("constr-102 tag: {e}")))?;
+                    let args = decode_array(d, depth)?;
+                    Ok(Data::Constr(constr_tag, args))
+                }
+                Some(n) => Err(UplcError::CborDecode(format!(
+                    "tag 102: expected array(2), got Some({n})"
+                ))),
+                None => {
+                    let constr_tag = d
+                        .u64()
+                        .map_err(|e| UplcError::CborDecode(format!("constr-102 tag: {e}")))?;
+                    let args = decode_array(d, depth)?;
+                    expect_break(d)?;
+                    Ok(Data::Constr(constr_tag, args))
+                }
             }
-            let constr_tag = d
-                .u64()
-                .map_err(|e| UplcError::CborDecode(format!("constr-102 tag: {e}")))?;
-            let args = decode_array(d, depth)?;
-            Ok(Data::Constr(constr_tag, args))
         }
-        other => Err(UplcError::CborDecode(format!(
+        (_, other) => Err(UplcError::CborDecode(format!(
             "unsupported CBOR tag for Data: {other}"
+        ))),
+    }
+}
+
+/// Consume exactly one CBOR break byte (`0xff`) at the current position.
+///
+/// Mirrors `dugite_serialization::decode::reader::Reader::expect_break`
+/// — closes an indefinite-length structural array whose entries were
+/// read individually rather than via [`decode_array`]. Used to close
+/// the outer indefinite-length `[i, fields]` array of an indefinite
+/// tag-102 `Constr` (#831 finding 1).
+fn expect_break(d: &mut Decoder<'_>) -> Result<(), UplcError> {
+    match d
+        .datatype()
+        .map_err(|e| UplcError::CborDecode(format!("expect_break: {e}")))?
+    {
+        Type::Break => d
+            .skip()
+            .map_err(|e| UplcError::CborDecode(format!("expect_break: {e}"))),
+        other => Err(UplcError::CborDecode(format!(
+            "expected CBOR break (0xff) to close indefinite tag-102 array, found {other:?}"
         ))),
     }
 }
@@ -778,7 +1165,7 @@ mod tests {
             (Data::B(vec![0x01]), Data::I(BigInt::from(20))),
         ]);
         let decoded = rt(&d);
-        if let Data::Map(es) = decoded {
+        if let Data::Map(es) = &decoded {
             assert_eq!(es.len(), 2);
         } else {
             panic!("expected Map");
@@ -801,12 +1188,97 @@ mod tests {
     }
 
     #[test]
+    fn accepts_tag102_indefinite_outer_array() {
+        // #831 finding 1: `d8 66 9f 00 80 ff` = tag 102, indefinite
+        // `[0, []]` => Constr 0 []. Haskell's `decodeConstrExtended`
+        // uses `decodeListLenOrIndef`, which accepts an indefinite
+        // outer array closed by an explicit break; the prior dugite
+        // decoder required `Some(2)` and rejected this.
+        let bytes = [0xd8, 0x66, 0x9f, 0x00, 0x80, 0xff];
+        let d = Data::from_cbor(&bytes).expect("must accept indefinite tag-102 array");
+        assert_eq!(d, Data::Constr(0, vec![]));
+    }
+
+    #[test]
+    fn accepts_tag102_indefinite_outer_array_with_nonempty_fields() {
+        // Same shape as above but with one field, to exercise the
+        // `decode_array` call inside the indefinite tag-102 branch:
+        // tag 102, indefinite `[1, [42]]`.
+        let mut bytes = vec![0xd8, 0x66, 0x9f, 0x01];
+        bytes.extend(
+            Data::List(vec![Data::I(BigInt::from(42))])
+                .to_cbor()
+                .unwrap(),
+        );
+        bytes.push(0xff);
+        let d = Data::from_cbor(&bytes).expect("must accept indefinite tag-102 array");
+        assert_eq!(d, Data::Constr(1, vec![Data::I(BigInt::from(42))]));
+    }
+
+    #[test]
+    fn rejects_tag102_indefinite_missing_break() {
+        // Same as `accepts_tag102_indefinite_outer_array` but with the
+        // trailing `0xff` break omitted — must still be rejected
+        // (mirrors Haskell's `decodeBreakOr` check).
+        let bytes = [0xd8, 0x66, 0x9f, 0x00, 0x80];
+        let err = Data::from_cbor(&bytes).expect_err("must reject missing break");
+        assert!(matches!(err, UplcError::CborDecode(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn rejects_tag102_wrong_definite_length() {
+        // tag 102 with a definite array of length 3 (not 2) must still
+        // be rejected — only the *indefinite* form gained new
+        // acceptance; a malformed definite length is still an error.
+        let bytes = [0xd8, 0x66, 0x83, 0x00, 0x80, 0x80];
+        let err = Data::from_cbor(&bytes).expect_err("must reject array(3)");
+        assert!(matches!(err, UplcError::CborDecode(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn rejects_wide_header_positive_bignum_tag() {
+        // #831 finding 2: `d8 02 41 05` is tag 2 encoded via the
+        // non-minimal 1-byte-argument header (`0xd8 0x02`) rather than
+        // the minimal inline form (`0xc2`). `cborg`'s `peekTokenType`
+        // (which the Haskell `PlutusData` decoder is built on) maps
+        // ONLY the inline `0xc2`/`0xc3` headers to the bignum path; a
+        // wide-header encoding of tag 2 falls through to
+        // `decodeConstr`, which rejects it (2 isn't a valid
+        // constructor tag). dugite previously decoded this as `I(5)`.
+        let bytes = [0xd8, 0x02, 0x41, 0x05];
+        let err = Data::from_cbor(&bytes).expect_err("must reject wide-header tag 2");
+        assert!(matches!(err, UplcError::CborDecode(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn rejects_wide_header_negative_bignum_tag() {
+        // Same as above for tag 3 (negative bignum), via `d9 00 03`
+        // (2-byte-argument wide header).
+        let bytes = [0xd9, 0x00, 0x03, 0x41, 0x05];
+        let err = Data::from_cbor(&bytes).expect_err("must reject wide-header tag 3");
+        assert!(matches!(err, UplcError::CborDecode(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn accepts_minimal_header_bignum_tags() {
+        // Regression: the minimal, canonical single-byte tag headers
+        // (`0xc2`/`0xc3`) must still decode via the bignum path exactly
+        // as before.
+        let pos = [0xc2, 0x41, 0x05];
+        assert_eq!(Data::from_cbor(&pos).unwrap(), Data::I(BigInt::from(5)));
+        let neg = [0xc3, 0x41, 0x05];
+        // tag 3 payload `n` decodes to `-1 - n` = `-6`.
+        assert_eq!(Data::from_cbor(&neg).unwrap(), Data::I(BigInt::from(-6)));
+    }
+
+    #[test]
     fn rejects_overlydeep_data() {
-        // Hand-craft 300 nested CBOR-tag-121 (Constr 0) wrappers each
+        // Hand-craft 1100 nested CBOR-tag-121 (Constr 0) wrappers each
         // wrapping an empty array, terminating in an empty array.
-        // Goes well past DATA_MAX_DEPTH.
+        // Goes well past DATA_MAX_DEPTH (1024, matching the consensus
+        // decoder's cap — see #831 finding 3).
         let mut bytes = Vec::new();
-        for _ in 0..300 {
+        for _ in 0..1100 {
             bytes.push(0xd8); // tag, 1-byte argument
             bytes.push(121); // tag 121
             bytes.push(0x81); // array(1)
@@ -814,6 +1286,94 @@ mod tests {
         bytes.push(0x80); // innermost empty array
         let err = Data::from_cbor(&bytes).expect_err("must reject");
         assert!(matches!(err, UplcError::CborDecode(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn accepts_data_at_haskell_depth_that_a_256_cap_would_reject() {
+        // #831 finding 3: 258 nested indefinite-length lists (well
+        // within tx size limits) decode fine under Haskell's unbounded
+        // recursion; a 256-deep cap here would have false-rejected
+        // this. Pin acceptance at a depth between the old (256) and
+        // new (1024) caps.
+        let mut bytes = Vec::new();
+        bytes.extend(std::iter::repeat_n(0x9f, 258)); // indefinite-length array opens
+        bytes.push(0x80); // innermost empty (definite) array
+        bytes.extend(std::iter::repeat_n(0xff, 258)); // close each indefinite array
+        let d = Data::from_cbor(&bytes).expect("must accept depth-258 nesting");
+        // Sanity: round-trips back through the canonical encoder.
+        assert_eq!(Data::from_cbor(&d.to_cbor().unwrap()).unwrap(), d);
+    }
+
+    /// #832: a machine-*constructed* `Data` value (e.g. built via
+    /// repeated `constrData`/`mkCons`/`listData` builtin calls) never
+    /// passes through the depth-capped CBOR decoder at all, so it can
+    /// be nested far deeper than [`DATA_MAX_DEPTH`] — a script can
+    /// cheaply reach ~10^5-10^6 levels within budget. This exercises
+    /// every recursive `Data` traversal an adversarial script can
+    /// trigger on such a value: `equalsData` (`PartialEq`), the deep
+    /// `Clone` a CEK `Var` lookup performs on a bound `Constant::Data`
+    /// (`machine::step`), `serialiseData` (`to_cbor`, stacker-guarded),
+    /// and the final `Drop` when it goes out of scope. Before #832, the
+    /// derived recursive `PartialEq`/`Drop` would overflow the native
+    /// stack at this depth; `Clone` was left derived until this fix and
+    /// overflowed the same way (process abort — a remote DoS). Mirrors
+    /// the CEK env's `deep_chain_extends_and_drops` (`machine/env.rs`).
+    #[test]
+    fn deeply_nested_data_compares_clones_serialises_and_drops_without_overflow() {
+        const DEPTH: usize = 200_000;
+        let mut d = Data::I(BigInt::from(0));
+        for _ in 0..DEPTH {
+            d = Data::List(vec![d]);
+        }
+        // Deep `Clone` — the CEK `Var`-lookup path. Must not overflow and
+        // must reproduce the value exactly.
+        let cloned = d.clone();
+        assert!(
+            cloned == d,
+            "clone of 200k-deep Data must equal the original"
+        );
+        // `equalsData d d` — exercises the iterative `PartialEq`.
+        #[allow(clippy::eq_op)]
+        {
+            assert!(d == d, "equalsData on 200k-deep Data must not overflow");
+        }
+        // `serialiseData d` — exercises the stacker-guarded encoder.
+        let cbor = d.to_cbor().expect("serialiseData must not overflow");
+        assert!(!cbor.is_empty());
+        // `d`, `cloned`, and `cbor` drop here at scope exit, exercising the
+        // iterative `Drop` on two full 200k-deep structures.
+    }
+
+    /// The iterative `Clone` must reproduce a mixed `Constr`/`Map`/`List`
+    /// value with byte-exact field order. A clone that reordered `Map`
+    /// entries or `Constr` args would change `serialiseData`/the body hash
+    /// — a silent consensus divergence.
+    #[test]
+    fn iterative_clone_preserves_structure_and_order() {
+        let d = Data::Constr(
+            7,
+            vec![
+                Data::Map(vec![
+                    (Data::I(BigInt::from(1)), Data::B(vec![0xAA])),
+                    (
+                        Data::I(BigInt::from(2)),
+                        Data::List(vec![Data::I(BigInt::from(3))]),
+                    ),
+                ]),
+                Data::List(vec![
+                    Data::I(BigInt::from(-9)),
+                    Data::Constr(0, vec![Data::B(vec![])]),
+                ]),
+                Data::B(vec![1, 2, 3, 4]),
+            ],
+        );
+        let cloned = d.clone();
+        assert!(cloned == d, "clone must be structurally equal");
+        assert_eq!(
+            cloned.to_cbor().unwrap(),
+            d.to_cbor().unwrap(),
+            "clone must serialise byte-identically (order preserved)"
+        );
     }
 
     #[test]

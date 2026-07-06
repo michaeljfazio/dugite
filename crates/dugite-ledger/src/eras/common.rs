@@ -22,6 +22,7 @@
 //! | [`drain_withdrawal_accounts`] | Shelley+ | Zero reward accounts referenced by tx withdrawals |
 //! | [`compute_shelley_nonce`] | Shelley+ | VRF-based nonce evolution and block counting |
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use dugite_primitives::address::Address;
@@ -30,7 +31,7 @@ use dugite_primitives::block::{Block, BlockHeader};
 use super::RuleContext;
 use crate::state::LedgerError;
 use dugite_primitives::credentials::{Credential, Pointer};
-use dugite_primitives::hash::{blake2b_224, blake2b_256, Hash32};
+use dugite_primitives::hash::{blake2b_224, blake2b_256, Hash28, Hash32};
 use dugite_primitives::time::EpochNo;
 use dugite_primitives::transaction::{
     Certificate, MIRSource, MIRTarget, Transaction, TransactionInput,
@@ -630,8 +631,155 @@ pub(crate) fn apply_shelley_cert(
                 }
             }
         }
+        // `GenesisKeyDelegation` is intentionally NOT handled here.
+        //
+        // Unlike every other cert above, its effect (the two-phase
+        // `future_gen_delegs` -> `genesis_delegates` queue, per Haskell
+        // `dsFutureGenDelegs`/`dsGenDelegs`) lives on TOP-LEVEL
+        // `LedgerState`, not `CertSubState` — this function only has
+        // `&mut CertSubState`. It is handled by the top-level orchestrator
+        // instead: `enqueue_genesis_key_delegations` (called from the
+        // Step 8b per-tx loop in `state/apply.rs`) and
+        // `adopt_matured_genesis_delegs` (called once per block, mirroring
+        // Haskell's TICK). See issue #804 — this arm used to fall into the
+        // catch-all below and silently drop the cert with no state update
+        // at all.
+        Certificate::GenesisKeyDelegation { .. } => {}
         // Skip non-Shelley certificates -- they are handled by era-specific code.
         _ => {}
+    }
+}
+
+// ============================================================================
+// 3b. Genesis-delegate future queue (#804)
+// ============================================================================
+
+/// Enqueue any `Certificate::GenesisKeyDelegation` certs in `tx` into the
+/// two-phase `future_gen_delegs` queue.
+///
+/// Mirrors Haskell `Cardano.Ledger.Shelley.Rules.Deleg`'s `GenesisDelegTxCert`
+/// branch: the cert does NOT update `genesis_delegates` (`dsGenDelegs`)
+/// immediately. It schedules a `FutureGenDeleg { fgdSlot = slot +
+/// stabilityWindow, fgdGenKeyHash = gk }` entry; the change only takes
+/// effect once [`adopt_matured_genesis_delegs`] observes `fgdSlot <=
+/// current_slot`.
+///
+/// `stability_window` MUST be `stabilityWindow = ceil(3k/f)` — i.e.
+/// `LedgerState::stability_window_3kf` — taken directly, NOT doubled.
+/// (Oracle-verified against the live Haskell source: the `2 *
+/// stabilityWindow` figure that appears elsewhere in the ledger is a
+/// *different* mechanism — `getTheSlotOfNoReturn`'s PPUP/HFC "point of no
+/// return" deadline — and does not apply here.)
+///
+/// Called from the top-level orchestrator (`state/apply.rs`, Step 8b)
+/// rather than from [`apply_shelley_cert`] because `future_gen_delegs`
+/// lives directly on `LedgerState`, not `CertSubState`. See issue #804.
+pub(crate) fn enqueue_genesis_key_delegations(
+    tx: &Transaction,
+    slot: u64,
+    stability_window: u64,
+    future_gen_delegs: &mut HashMap<(u64, Hash28), (Hash28, Hash32)>,
+) {
+    for cert in &tx.body.certificates {
+        if let Certificate::GenesisKeyDelegation {
+            genesis_hash,
+            genesis_delegate_hash,
+            vrf_keyhash,
+        } = cert
+        {
+            // The cert fields are Hash32 (zero-padded from the on-wire
+            // 28-byte hashes); `genesis_delegates`/`future_gen_delegs` use
+            // Hash28 keys for the genesis/delegate hashes — truncate to the
+            // first 28 bytes (mirrors `state/certificates.rs`'s dead
+            // test-only handler).
+            let gkey = Hash28::from_bytes({
+                let mut buf = [0u8; 28];
+                buf.copy_from_slice(&genesis_hash.as_bytes()[..28]);
+                buf
+            });
+            let dkey = Hash28::from_bytes({
+                let mut buf = [0u8; 28];
+                buf.copy_from_slice(&genesis_delegate_hash.as_bytes()[..28]);
+                buf
+            });
+            let maturity_slot = slot.saturating_add(stability_window);
+            future_gen_delegs.insert((maturity_slot, gkey), (dkey, *vrf_keyhash));
+            debug!(
+                "GenesisKeyDelegation enqueued: {} -> delegate={}, vrf={} (matures at slot {})",
+                genesis_hash.to_hex(),
+                genesis_delegate_hash.to_hex(),
+                vrf_keyhash.to_hex(),
+                maturity_slot,
+            );
+        }
+    }
+}
+
+/// Adopt matured `future_gen_delegs` entries into `genesis_delegates`.
+///
+/// Mirrors Haskell `adoptGenesisDelegs` (`Cardano.Ledger.Shelley.Rules.Tick`),
+/// which runs EVERY block via `validatingTickTransition` (TICK) — not just
+/// at epoch boundaries. `current_slot` is the block's own slot (the TICK
+/// signal), and comparison is `fgdSlot <= current_slot`.
+///
+/// When multiple queued entries for the SAME genesis key have matured in
+/// the same call (e.g. two `GenesisKeyDelegation` certs for one genesis key
+/// enqueued at different times, both now matured), Haskell's
+/// `adoptGenesisDelegs` keeps the entry with the LARGEST `fgdSlot`
+/// (most-recently-enqueued wins) — replicated here via an explicit
+/// per-genesis-key max-slot fold.
+///
+/// Call this BEFORE processing the block's own transactions (mirrors
+/// TICK preceding BBODY) — a cert enqueued in this same block can never
+/// mature in this same call, since maturity is always strictly in the
+/// future (`slot + stability_window`).
+pub(crate) fn adopt_matured_genesis_delegs(
+    current_slot: u64,
+    future_gen_delegs: &mut HashMap<(u64, Hash28), (Hash28, Hash32)>,
+    genesis_delegates: &mut HashMap<Hash28, (Hash28, Hash32)>,
+) {
+    if future_gen_delegs.is_empty() {
+        return;
+    }
+
+    let matured_keys: Vec<(u64, Hash28)> = future_gen_delegs
+        .keys()
+        .filter(|(fgd_slot, _)| *fgd_slot <= current_slot)
+        .copied()
+        .collect();
+    if matured_keys.is_empty() {
+        return;
+    }
+
+    // Resolve multiple matured entries for the same genesis key by largest
+    // fgdSlot (mirrors Haskell's fold over the partitioned "curr" map).
+    let mut latest_per_gkey: HashMap<Hash28, (u64, Hash28, Hash32)> = HashMap::new();
+    for key @ (fgd_slot, gkey) in &matured_keys {
+        let (dkey, vrf) = future_gen_delegs[key];
+        latest_per_gkey
+            .entry(*gkey)
+            .and_modify(|(best_slot, best_dkey, best_vrf)| {
+                if *fgd_slot > *best_slot {
+                    *best_slot = *fgd_slot;
+                    *best_dkey = dkey;
+                    *best_vrf = vrf;
+                }
+            })
+            .or_insert((*fgd_slot, dkey, vrf));
+    }
+
+    for (gkey, (_, dkey, vrf)) in &latest_per_gkey {
+        genesis_delegates.insert(*gkey, (*dkey, *vrf));
+        debug!(
+            "GenesisKeyDelegation adopted: {} -> delegate={}, vrf={}",
+            gkey.to_hex(),
+            dkey.to_hex(),
+            vrf.to_hex(),
+        );
+    }
+
+    for key in &matured_keys {
+        future_gen_delegs.remove(key);
     }
 }
 
@@ -851,21 +999,21 @@ pub(crate) fn is_overlay_slot(first_slot: u64, block_slot: u64, d_num: u64, d_de
 // 6. Block-body ExUnit budget validation (Alonzo+)
 // ============================================================================
 
-/// Validate that the total ExUnit budget (memory + steps) across all valid
+/// Validate that the total ExUnit budget (memory + steps) across all
 /// transactions in the block does not exceed the per-block limits.
 ///
-/// Matches Haskell's Alonzo BBODY rule: `totalExUnits txs <= maxBlockExUnits pp`.
-/// Only valid transactions (is_valid=true) contribute to the budget since
-/// invalid transactions do not execute scripts.
+/// Matches Haskell's Alonzo BBODY rule: `totalExUnits txs <= maxBlockExUnits pp`,
+/// where `txTotal = foldMap totExUnits txs` folds over the *entire* block body
+/// with no `IsValid` filter — an `is_valid=false` transaction still carries
+/// redeemers (and the collateral it consumes was priced assuming those
+/// redeemers would run), so its ExUnits count toward the block budget too.
 pub(crate) fn validate_block_ex_units(block: &Block, ctx: &RuleContext) -> Result<(), LedgerError> {
     let mut mem: u64 = 0;
     let mut steps: u64 = 0;
     for tx in &block.transactions {
-        if tx.is_valid {
-            for r in &tx.witness_set.redeemers {
-                mem = mem.saturating_add(r.ex_units.mem);
-                steps = steps.saturating_add(r.ex_units.steps);
-            }
+        for r in &tx.witness_set.redeemers {
+            mem = mem.saturating_add(r.ex_units.mem);
+            steps = steps.saturating_add(r.ex_units.steps);
         }
     }
 
@@ -963,7 +1111,10 @@ mod tests {
     use dugite_primitives::protocol_params::ProtocolParameters;
     use dugite_primitives::time::BlockNo;
     use dugite_primitives::time::SlotNo;
-    use dugite_primitives::transaction::{OutputDatum, TransactionInput, TransactionOutput};
+    use dugite_primitives::transaction::{
+        ExUnits, OutputDatum, PlutusData, Redeemer, RedeemerTag, TransactionInput,
+        TransactionOutput,
+    };
     use dugite_primitives::value::{Lovelace, Value};
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::sync::Arc;
@@ -2360,5 +2511,68 @@ mod tests {
         );
         assert_eq!(key_routing, credential_to_hash(&key_cred));
         assert_eq!(script_routing, credential_to_hash(&script_cred));
+    }
+
+    // -----------------------------------------------------------------------
+    // 6. validate_block_ex_units tests (#794)
+    // -----------------------------------------------------------------------
+
+    /// Regression test for #794: Haskell's Alonzo BBODY rule folds
+    /// `totExUnits` over ALL transactions in the block body
+    /// (`txTotal = foldMap totExUnits txs`) with no `IsValid` filter. An
+    /// `is_valid=false` transaction still carries redeemers, and its ExUnits
+    /// must count toward the block-level budget. A block whose only tx is
+    /// invalid, but whose redeemer ExUnits alone exceed `maxBlockExUnits`,
+    /// must be rejected.
+    #[test]
+    fn test_validate_block_ex_units_counts_invalid_tx_redeemers() {
+        let params = ProtocolParameters::mainnet_defaults();
+        let genesis_delegates = HashMap::new();
+        let ctx = RuleContext {
+            params: &params,
+            current_slot: 100,
+            current_epoch: EpochNo(5),
+            era: dugite_primitives::era::Era::Babbage,
+            slot_config: None,
+            node_network: None,
+            genesis_delegates: &genesis_delegates,
+            update_quorum: 5,
+            epoch_length: 432_000,
+            shelley_transition_epoch: 0,
+            byron_epoch_length: 21_600,
+            stability_window: 129_600,
+            stability_window_3kf: 129_600,
+            randomness_stabilisation_window: 129_600,
+            tx_index: 0,
+            conway_genesis: None,
+            max_lovelace_supply: crate::state::MAX_LOVELACE_SUPPLY,
+        };
+
+        let mut tx = make_tx(Hash32::from_bytes([7u8; 32]), vec![], vec![], 0);
+        tx.is_valid = false; // invalid tx -- must still count toward the block budget
+        tx.witness_set.redeemers.push(Redeemer {
+            tag: RedeemerTag::Spend,
+            index: 0,
+            data: PlutusData::Constr(0, vec![]),
+            ex_units: ExUnits {
+                // Exceeds mainnet's max_block_ex_units.mem (62,000,000) on its own.
+                mem: params.max_block_ex_units.mem + 1,
+                steps: 0,
+            },
+        });
+
+        let block = Block {
+            era: dugite_primitives::era::Era::Babbage,
+            header: make_header(vec![], ZERO32, vec![]),
+            transactions: vec![tx],
+            raw_cbor: None,
+        };
+
+        let result = validate_block_ex_units(&block, &ctx);
+        assert!(
+            result.is_err(),
+            "block ExUnits budget must count is_valid=false tx redeemers \
+             (Haskell has no IsValid filter in Bbody.hs)"
+        );
     }
 }

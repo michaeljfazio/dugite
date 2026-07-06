@@ -117,7 +117,7 @@ crates/dugite-uplc/
 │   │   ├── decode.rs    // bit-stream → Term
 │   │   └── encode.rs    // Term → bit-stream
 │   ├── machine/
-│   │   ├── mod.rs       // ExBudget, EvalResult, MAX_KONTINUATION_DEPTH
+│   │   ├── mod.rs       // ExBudget, EvalResult
 │   │   ├── env.rs       // De Bruijn env (cons-list)
 │   │   ├── context.rs   // continuation frames
 │   │   ├── value.rs     // CEK values
@@ -219,7 +219,8 @@ enum MachineState {
 ```
 
 - `Context` = explicit continuation stack (`Vec<Frame>`, heap-allocated,
-  capped at `MAX_KONTINUATION_DEPTH = 4096`). Frame variants follow the
+  uncapped — depth is bounded only by `ExBudget` exhaustion, matching
+  Haskell's `Context` exactly; see #817). Frame variants follow the
   spec: `AwaitArg`, `AwaitFunTerm`, `AwaitFunValue`, `Force`, `Constr`,
   `Cases`.
 - `Env` = persistent cons-list of `Value`s. De Bruijn lookup is O(index)

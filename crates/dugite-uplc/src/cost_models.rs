@@ -149,20 +149,36 @@ pub fn decode_cost_models_cbor(cbor: &[u8]) -> Result<CostModels, PhaseTwoError>
 /// Consume one (key, value) pair from the top-level map.
 ///
 /// Known keys (0/1/2/3 → V1/V2/V3/V4) populate the matching field on
-/// [`CostModels`]. Unknown keys are skipped — both the key (a single
-/// CBOR integer the decoder already consumed) and the value (which
-/// `skip` walks past in a single call).
+/// [`CostModels`]. Unknown keys are skipped — both the key and the value
+/// (which `skip` walks past in a single call).
 ///
 /// Duplicate occurrences of the same known key overwrite the prior
 /// value; this matches the CBOR-canonical semantics that the **last**
 /// occurrence wins, and lines up with how `minicbor::Decoder::map`
 /// surfaces the entries.
 fn consume_one_entry(d: &mut Decoder<'_>, out: &mut CostModels) -> Result<(), PhaseTwoError> {
-    // The key may be encoded as any unsigned integer width. We accept
-    // u8/u16/u32 and reject anything broader (the keys are tiny enums).
-    let key = d
-        .u32()
-        .map_err(|e| PhaseTwoError::CostModelDecode(format!("map key not a small uint: {e}")))?;
+    // Read the key as the general CBOR integer type (#844) rather than
+    // `d.u32()`: a negative key or one exceeding `u32::MAX` is still a
+    // *well-formed* CBOR integer — it should be treated as just another
+    // unknown key and skipped, honoring this module's own "unknown keys
+    // are skipped" forward-compat contract, rather than failing the
+    // ENTIRE decode (and thus the whole cost-models map, all languages)
+    // over one out-of-range key.
+    let key_int = d
+        .int()
+        .map_err(|e| PhaseTwoError::CostModelDecode(format!("map key not an integer: {e}")))?;
+    let key: u32 = match u32::try_from(key_int) {
+        Ok(k) => k,
+        Err(_) => {
+            tracing::debug!(
+                key = %key_int,
+                "cost_models: skipping out-of-range map key"
+            );
+            return d.skip().map_err(|e| {
+                PhaseTwoError::CostModelDecode(format!("skipping out-of-range key {key_int}: {e}"))
+            });
+        }
+    };
     match key {
         KEY_V1 => out.plutus_v1 = Some(read_int_array(d, "V1")?),
         KEY_V2 => out.plutus_v2 = Some(read_int_array(d, "V2")?),
@@ -338,6 +354,35 @@ mod tests {
         assert_eq!(cm.plutus_v2.as_deref(), Some(&[1i64, 2, 3][..]));
         assert!(cm.plutus_v1.is_none());
         assert!(cm.plutus_v3.is_none());
+    }
+
+    /// #844: a negative map key is still a well-formed CBOR integer (a
+    /// CBOR major-type-1 negative int, distinct from a decode error) — it
+    /// must be skipped like any other unknown key, not fail the whole
+    /// decode. Hand-builds the map manually since `Encoder::u32` cannot
+    /// encode a negative key.
+    #[test]
+    fn negative_map_key_is_skipped_not_rejected() {
+        use minicbor::Encoder;
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        enc.map(2).unwrap();
+        // Negative key -1 (CBOR major type 1, encodes as 0x20) mapped to
+        // an arbitrary array value that must be skipped whole.
+        enc.i8(-1).unwrap();
+        enc.array(2).unwrap();
+        enc.i64(7).unwrap();
+        enc.i64(8).unwrap();
+        // A real V3 entry must still decode correctly after the skip.
+        enc.u32(KEY_V3).unwrap();
+        enc.array(2).unwrap();
+        enc.i64(1).unwrap();
+        enc.i64(2).unwrap();
+
+        let cm = decode_cost_models_cbor(&buf).unwrap();
+        assert_eq!(cm.plutus_v3.as_deref(), Some(&[1i64, 2][..]));
+        assert!(cm.plutus_v1.is_none());
+        assert!(cm.plutus_v2.is_none());
     }
 
     #[test]

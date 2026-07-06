@@ -117,7 +117,40 @@ impl<'b> BitReader<'b> {
     ///
     /// Returns `FlatDecode("varint exceeds u64")` if the accumulated
     /// shift would exceed 64 bits — no silent wraparound.
+    ///
+    /// This is the LENIENT decode: at `shift == 63` (the 10th chunk) a
+    /// chunk value `> 1` silently loses its high bits when shifted
+    /// (`chunk << 63` drops everything above bit 63), so a genuinely
+    /// out-of-`u64`-range `Natural` truncates rather than errors. That
+    /// is the correct behavior ONLY for fields Haskell types as
+    /// arbitrary-precision `Natural` with no `u64` cap at all — e.g.
+    /// the `Program` version triple (`program.rs`), which never
+    /// rejects on overflow. Fields Haskell types as genuinely-bounded
+    /// `Word64` (the De Bruijn `Index`, the `Constr` tag) must use
+    /// [`Self::read_word64_strict`] instead (issue #842).
     pub fn read_natural_u64(&mut self) -> FlatResult<u64> {
+        self.read_natural_u64_impl(false)
+    }
+
+    /// Read a flat-encoded `Word64` varint with Haskell's exact
+    /// overflow-rejection rule (issue #842, oracle-confirmed against
+    /// `PlutusCore.Flat.Decoder.Strict.dWord64`/`lastStep`): reject
+    /// rather than truncate when the encoded value exceeds
+    /// `u64::MAX`. Haskell's rule is "the final chunk (at `shift ==
+    /// 63`) has any bit above bit 0 set" (`countLeadingZeros w < 63`),
+    /// i.e. reject iff that chunk is `> 1`.
+    ///
+    /// Use this ONLY for fields Haskell types as genuinely-bounded
+    /// `Word64` — the De Bruijn `Var` index and the `Constr` tag (both
+    /// `flat/term.rs`). Do NOT use it for the `Program` version triple,
+    /// which Haskell types as unbounded `Natural`
+    /// (`read_natural_u64`'s lenient behavior is deliberately
+    /// preserved there).
+    pub fn read_word64_strict(&mut self) -> FlatResult<u64> {
+        self.read_natural_u64_impl(true)
+    }
+
+    fn read_natural_u64_impl(&mut self, strict: bool) -> FlatResult<u64> {
         let mut value: u64 = 0;
         let mut shift: u32 = 0;
         loop {
@@ -126,6 +159,13 @@ impl<'b> BitReader<'b> {
             if shift >= u64::BITS {
                 return Err(UplcError::FlatDecode(
                     "Natural varint exceeds u64 range".into(),
+                ));
+            }
+            if strict && shift == 63 && chunk > 1 {
+                return Err(UplcError::FlatDecode(
+                    "Word64 varint exceeds 2^64-1 (final chunk at shift 63 has a bit \
+                     above bit 0 set)"
+                        .into(),
                 ));
             }
             value = value
@@ -359,6 +399,66 @@ mod tests {
             r.read_bit().unwrap();
         }
         assert!(r.read_bit().is_err());
+    }
+
+    /// Hand-craft the bits of a malformed `Word64` varint: 9 chunks of
+    /// `(continuation=true, value=0)` followed by a 10th chunk
+    /// `(continuation=false, value=2)`. The 10th chunk lands at
+    /// `shift=63`, where any value `> 1` needs a 65th value bit that
+    /// doesn't exist in a `u64` — Haskell's `dWord64`/`lastStep`
+    /// rejects exactly this shape (issue #842,
+    /// `countLeadingZeros w < 63`). No legitimate `u64` can ever
+    /// produce this encoding via `write_natural_u64` (its 10th chunk
+    /// is always 0 or 1), so this is adversary-only.
+    fn write_malformed_word64_overflow(w: &mut BitWriter) {
+        for _ in 0..9 {
+            w.write_bit(true);
+            w.write_bits8(0, 7).unwrap();
+        }
+        w.write_bit(false);
+        w.write_bits8(2, 7).unwrap();
+    }
+
+    #[test]
+    fn word64_strict_rejects_final_chunk_gt_one_at_shift_63() {
+        let mut w = BitWriter::new();
+        write_malformed_word64_overflow(&mut w);
+        let bytes = w.bytes;
+        let mut r = BitReader::new(&bytes);
+        let err = r.read_word64_strict().unwrap_err();
+        assert!(matches!(err, UplcError::FlatDecode(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn word64_strict_accepts_u64_max_boundary() {
+        // u64::MAX's 10th chunk is exactly 1 (only bit 63 exists within
+        // a u64) — the maximum value that can ever legitimately reach
+        // shift=63. Must NOT be rejected (not an off-by-one on the
+        // other side).
+        let mut w = BitWriter::new();
+        w.write_natural_u64(u64::MAX).unwrap();
+        let bytes = w.bytes;
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(r.read_word64_strict().unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn read_natural_u64_lenient_path_unchanged_for_version_triple() {
+        // `read_natural_u64` (used ONLY by the `Program` version
+        // triple, which Haskell types as an unbounded `Natural`, never
+        // rejecting) deliberately keeps its PRE-EXISTING lenient
+        // (silently-truncating) behavior — a separate, already-tracked,
+        // low-priority divergence (#842 item 3) this fix does not
+        // touch. This test documents and pins that contrast against
+        // `read_word64_strict` above: the exact same malformed bytes
+        // must NOT error here.
+        let mut w = BitWriter::new();
+        write_malformed_word64_overflow(&mut w);
+        let bytes = w.bytes;
+        let mut r = BitReader::new(&bytes);
+        let got = r.read_natural_u64().unwrap();
+        // `2u64 << 63` overflows entirely out of a u64 and drops to 0.
+        assert_eq!(got, 0);
     }
 
     #[test]

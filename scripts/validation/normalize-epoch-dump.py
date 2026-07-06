@@ -132,9 +132,15 @@ HASKELL_UNCOVERABLE: set[str] = {
     # Full materialised PParams use cn's camelCase Haskell shape; we
     # cannot map them onto dugite's snake_case `ProtocolParameters`
     # serde without a full PParams renamer.  Treat as uncoverable.
+    #
+    # `pp_future` is EXCLUDED from this set (see `_derive_pp_future`
+    # below, issue #807) — it is derived from `ppups.proposals` /
+    # `ppups.futureProposals` and translated field-by-field via
+    # `_PP_UPDATE_FIELD_MAP`, so cn *can* supply a (partial) value for
+    # it. `pp_current`/`pp_previous` still need a full PParams renamer
+    # and remain uncoverable.
     "pp_current",
     "pp_previous",
-    "pp_future",
     # Era label is not on the cn dump (only the protocol version is).
     "era",
     # Governance-class deposits are PV9+ only; cn dump pre-Conway has
@@ -268,6 +274,160 @@ def _sum_total_rewards(record: Any) -> int | None:
     return total
 
 
+# ── pp_future derivation (issue #807) ─────────────────────────────────
+#
+# Live-verified against IntersectMBO/cardano-ledger source (2026-07-06, see
+# `.claude/agent-memory/cardano-ledger-oracle/ppup-json-field-names-debug-dump.md`
+# for exact file/line citations) — the two points below are NOT obvious
+# from the Haskell record field names and are easy to get wrong:
+#
+# 1. `ShelleyGovState`'s `ToKeyValuePairs` instance
+#    (`Cardano.Ledger.Shelley.Governance`) hand-writes the JSON keys as
+#    "proposals" / "futureProposals" / "curPParams" / "prevPParams" — a
+#    straight drop of the `sgs` record prefix (`sgsFuturePParams` is
+#    silently excluded from JSON entirely). Pre-Conway shape:
+#
+#      ppups: { proposals: [[<genesisKeyHashHex>, <PParamsUpdate>], ...],
+#               futureProposals: [[<genesisKeyHashHex>, <PParamsUpdate>], ...],
+#               curPParams: <PParams>, prevPParams: <PParams> }
+#
+# 2. `ProposedPPUpdates`'s `ToJSON` instance does `toJSON (Map.toList m)` —
+#    `Map.toList` runs BEFORE `toJSON`, so it serializes as a JSON ARRAY OF
+#    2-ELEMENT [hash, update] PAIRS, NOT an object keyed by hash. Treating
+#    it as `{"<hash>": {...}}` (the natural first guess for a Map) silently
+#    reads zero proposals on every real dump — see `_iter_ppupdates_array`.
+#
+# `proposals` holds updates voted before the epoch's `tooLate` slot,
+# targeting the CURRENT epoch — they enact at the boundary immediately
+# following the one this dump was captured at, the same timing dugite's
+# `pending_pp_updates[epoch_to]` models (see the lookup-key doc comment on
+# `next_future_pp` in `crates/dugite-ledger/src/state/epoch_state_debug.rs`).
+# `futureProposals` holds updates voted at/after `tooLate`, targeting
+# `succ curEpochNo`; NEWPP promotes them into `proposals` on every boundary
+# (mirroring dugite's own future→pending promotion), so by dump time it is
+# normally empty — both are probed here defensively, same as the Rust side.
+#
+# CONWAY CAVEAT: on an actual cn 11.0.1 (Conway-era) dump, the `ppups`
+# wrapper key still exists but renders `ConwayGovState` instead — a
+# STRUCTURALLY DIFFERENT type. Its `"proposals"` key is the CIP-1694
+# `GovActionState` list (JSON objects, not `[hash, update]` pairs) and
+# there is no `futureProposals` key at all (legacy PPUP state is fully
+# replaced, not merely emptied). `_iter_ppupdates_array` discriminates the
+# two shapes structurally (pairs are `list`s; `GovActionState` entries are
+# `dict`s) rather than branching on era, so a Conway dump safely yields
+# nothing here instead of misinterpreting governance-action data as PPUP
+# proposals — consistent with dugite's own `next_future_pp`, which also
+# returns `None` for Conway (its maps are never populated post-governance).
+#
+# Only the fields dugite's `ProtocolParamUpdate` (and `apply_pp_update`)
+# understand are translated. Field names below are NOT the abbreviated
+# Shelley-paper record names (`minFeeA`, `a0`, `rho`, `tau`, ...) — the
+# `ToKeyValuePairs (PParamsUpdate era)` instance is data-driven from each
+# era's `ppName` table, which uses different (longer) names.
+_PP_UPDATE_FIELD_MAP: dict[str, str] = {
+    "txFeePerByte": "min_fee_a",
+    "txFeeFixed": "min_fee_b",
+    "maxBlockBodySize": "max_block_body_size",
+    "maxTxSize": "max_tx_size",
+    "maxBlockHeaderSize": "max_block_header_size",
+    "stakeAddressDeposit": "key_deposit",
+    "stakePoolDeposit": "pool_deposit",
+    "poolRetireMaxEpoch": "e_max",
+    "stakePoolTargetNum": "n_opt",
+    "poolPledgeInfluence": "a0",
+    "monetaryExpansion": "rho",
+    "treasuryCut": "tau",
+    # Shelley-Mary only (dropped Alonzo+, along with `d` itself post-Babbage).
+    "decentralization": "d",
+    "minPoolCost": "min_pool_cost",
+    # Same JSON key across Alonzo (per-word) and Babbage+ (per-byte) despite
+    # the unit changing underneath it — a known cross-era naming quirk.
+    "utxoCostPerByte": "ada_per_utxo_byte",
+    "costModels": "cost_models",
+    "executionUnitPrices": "execution_costs",
+    "maxTxExecutionUnits": "max_tx_ex_units",
+    "maxBlockExecutionUnits": "max_block_ex_units",
+    "maxValueSize": "max_val_size",
+    "collateralPercentage": "collateral_percentage",
+    "maxCollateralInputs": "max_collateral_inputs",
+}
+
+
+def _translate_pp_update(update: dict) -> dict[str, Any]:
+    """Translate one Haskell-shape `PParamsUpdate` dict (data-driven
+    camelCase keys, see `_PP_UPDATE_FIELD_MAP`) into dugite canonical
+    (snake_case) field names. `protocolVersion` is nested (`{major,
+    minor}`) in Haskell and is unpacked into the two flat dugite fields.
+    Fields dugite's legacy `ProtocolParamUpdate` does not model — or
+    fields from an unrelated same-shaped-key record (see the Conway
+    caveat above) — are silently dropped.
+    """
+    out: dict[str, Any] = {}
+    for haskell_key, dugite_key in _PP_UPDATE_FIELD_MAP.items():
+        if update.get(haskell_key) is not None:
+            out[dugite_key] = update[haskell_key]
+    pv = update.get("protocolVersion")
+    if isinstance(pv, dict):
+        if pv.get("major") is not None:
+            out["protocol_version_major"] = pv["major"]
+        if pv.get("minor") is not None:
+            out["protocol_version_minor"] = pv["minor"]
+    return out
+
+
+def _iter_ppupdates_array(value: Any):
+    """Yield each `PParamsUpdate` dict out of a raw `ProposedPPUpdates`
+    JSON value.
+
+    `ProposedPPUpdates`'s `ToJSON` runs `Map.toList` before `toJSON`, so
+    the real shape is a JSON ARRAY of 2-element `[hexKeyHash,
+    PParamsUpdate]` pairs — not an object keyed by hash. This also
+    doubles as the Conway-vs-Shelley shape discriminator: a Conway
+    `GovActionState` list under the same `"proposals"` key is a list of
+    plain `dict`s (not 2-element `list`s), so it structurally fails the
+    pair-shape check below and yields nothing, without needing to branch
+    on era explicitly.
+    """
+    if not isinstance(value, list):
+        return
+    for pair in value:
+        if (
+            isinstance(pair, (list, tuple))
+            and len(pair) == 2
+            and isinstance(pair[1], dict)
+        ):
+            yield pair[1]
+
+
+def _derive_pp_future(record: Any) -> dict[str, Any] | None:
+    """Merge `ppups.proposals` and `ppups.futureProposals` the same way
+    dugite's `next_future_pp` merges `pending_pp_updates`/
+    `future_pp_updates`: every proposer's fields are folded together
+    (later entries win per field on overlap), and no queued proposal at
+    all means `None`.
+
+    Returns a PARTIAL dict of only the fields actually overridden, in
+    dugite's canonical snake_case naming — NOT a full cloned
+    `ProtocolParameters`. `pp_current`/`pp_previous` remain
+    Haskell-uncoverable (no full PParams renamer exists yet), so there is
+    no canonical "base" to merge onto here. This still lets the diff tool
+    compare the specific field(s) a real PPUP proposal changes, which is
+    what issue #807 is about: catching premature/delayed PPUP enactment,
+    not full `ProtocolParameters` byte-exactness.
+    """
+    proposals = _resolve(
+        record, "currentEpochState.esLState.utxoState.ppups.proposals"
+    )
+    future = _resolve(
+        record, "currentEpochState.esLState.utxoState.ppups.futureProposals"
+    )
+    merged: dict[str, Any] = {}
+    for group in (proposals, future):
+        for update in _iter_ppupdates_array(group):
+            merged.update(_translate_pp_update(update))
+    return merged or None
+
+
 _DERIVATIONS: dict[str, Callable[[Any], Any]] = {
     "stake_mark_total": lambda r: _sum_snapshot_stake(r, "pstakeMark"),
     "stake_set_total": lambda r: _sum_snapshot_stake(r, "pstakeSet"),
@@ -279,6 +439,7 @@ _DERIVATIONS: dict[str, Callable[[Any], Any]] = {
     "pools_registered": _count_registered_pools,
     "pools_retiring": _count_retiring_pools,
     "rewards_total": _sum_total_rewards,
+    "pp_future": _derive_pp_future,
 }
 
 
@@ -427,7 +588,10 @@ HASKELL_MAP: list[tuple[str, list[str], Any]] = [
     ("governance.committee_hash", ["governance.committee_hash"], None),
     ("pp_current", ["pp_current"], None),
     ("pp_previous", ["pp_previous"], None),
-    ("pp_future", ["pp_future"], None),
+    # #807: real derivation from `ppups.proposals`/`futureProposals` (see
+    # `_derive_pp_future`); the plain `pp_future` path remains as a
+    # fixture/shortcut fallback for tests that pre-supply canonical input.
+    ("pp_future", ["fn:pp_future", "pp_future"], None),
 ]
 
 

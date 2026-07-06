@@ -62,9 +62,41 @@ pub enum UplcError {
     #[error("PlutusV3 script returned non-Unit value")]
     NonUnitReturn,
 
+    /// An unbound de Bruijn variable was found by the eager `checkScope`
+    /// pass run over the fully-applied term before CEK evaluation
+    /// starts (mirrors Haskell
+    /// `UntypedPlutusCore.Check.Scope.checkScope` / its
+    /// `FreeVariableError`). This is a phase-2 script-evaluation
+    /// failure — collateral is consumed — not an internal bug: an
+    /// adversary can construct a script whose applied term contains an
+    /// out-of-scope variable in a never-dynamically-evaluated branch,
+    /// and Haskell rejects it statically regardless of reachability.
+    #[error("free variable: de Bruijn index {0} is unbound")]
+    FreeVariable(u64),
+
+    /// A CEK **machine** error caused by the shape of the *script's own
+    /// term* — an open (unbound) variable the eager scope check didn't
+    /// already catch, an application of a non-function value, or a `case`
+    /// / `force` scrutinee that doesn't reduce to the expected shape
+    /// (#840). Mirrors Haskell's `UntypedPlutusCore.Evaluation.Machine
+    /// .Cek.Internal` "machine error" classes
+    /// (`OpenTermEvaluatedMachineError`, `NonFunctionalApplicationMachineError`,
+    /// `NonConstrScrutinizedMachineError`) — these ARE reachable from an
+    /// adversarial witness script (nothing prevents a gossiped script
+    /// from containing an ill-typed application or an out-of-range `case`
+    /// scrutinee) and are a legitimate phase-2 script-evaluation failure,
+    /// never a bug in dugite-uplc itself. Kept distinct from `Internal` so
+    /// that variant's "should never happen from adversarial input"
+    /// invariant — and any CI/monitoring gate built on it — stays
+    /// meaningful.
+    #[error("machine error: {0}")]
+    MachineError(String),
+
     /// Internal invariant violated; this indicates a bug in dugite-uplc
     /// itself, not in the input. Such errors are still returned (not
-    /// panicked) so they can be surfaced cleanly in tests.
+    /// panicked) so they can be surfaced cleanly in tests. Adversarial
+    /// input alone must never be able to trigger this variant — see
+    /// [`UplcError::MachineError`] for the adversary-reachable sibling.
     #[error("internal: {0}")]
     Internal(String),
 }

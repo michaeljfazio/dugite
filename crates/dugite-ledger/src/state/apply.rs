@@ -544,6 +544,19 @@ impl LedgerState {
             }
         }
 
+        // #804: adopt any `GenesisKeyDelegation` certs that matured by this
+        // block's slot into `genesis_delegates`. Mirrors Haskell's
+        // `adoptGenesisDelegs`, run every block via TICK (NOT gated on an
+        // epoch boundary) and BEFORE this block's own transactions are
+        // applied — a cert enqueued in THIS block can never mature within
+        // this same call, since maturity is always strictly in the future
+        // (`slot + stability_window_3kf`).
+        crate::eras::common::adopt_matured_genesis_delegs(
+            block.slot().0,
+            &mut self.future_gen_delegs,
+            &mut self.genesis_delegates,
+        );
+
         // ── BBODY rule: block body size equality check ────────────────────
         //
         // Haskell enforces `actual_body_bytes == header.body_size`.  We extract the
@@ -594,6 +607,14 @@ impl LedgerState {
                 std::collections::HashSet::with_capacity(block.transactions.len());
             for tx in &block.transactions {
                 if !seen_hashes.insert(tx.hash) {
+                    if mode == BlockValidationMode::ValidateAll {
+                        return Err(LedgerError::BlockTxValidationFailed {
+                            slot: block.slot().0,
+                            tx_hash: tx.hash.to_hex(),
+                            errors: "BadInputsUTxO: duplicate transaction hash in block"
+                                .to_string(),
+                        });
+                    }
                     warn!(
                         tx_hash = %tx.hash.to_hex(),
                         slot = block.slot().0,
@@ -1063,6 +1084,13 @@ impl LedgerState {
         // ── Step 8: Per-transaction processing loop ───────────────────────
         for (tx_idx, tx) in block.transactions.iter().enumerate() {
             if !processed_tx_hashes.insert(tx.hash) {
+                if mode == BlockValidationMode::ValidateAll {
+                    return Err(LedgerError::BlockTxValidationFailed {
+                        slot: block.slot().0,
+                        tx_hash: tx.hash.to_hex(),
+                        errors: "BadInputsUTxO: duplicate transaction hash in block".to_string(),
+                    });
+                }
                 warn!(
                     tx_hash = %tx.hash.to_hex(),
                     slot = block.slot().0,
@@ -1248,7 +1276,24 @@ impl LedgerState {
                         .with_stake_key_deposits_imbl(self.certs.stake_key_deposits.clone())
                         .with_vote_delegations_arc(std::sync::Arc::clone(
                             &block_vote_delegation_keys,
-                        ));
+                        ))
+                        // #804: genesis-delegate DELEGATE (hot) keys + quorum,
+                        // for `check_mir_genesis_quorum`'s whole-tx MIR
+                        // witness check. `self.genesis_delegates` holds at
+                        // most a handful of entries even at full Shelley
+                        // bootstrap (mainnet genesis seeds exactly 7), so
+                        // rebuilding this small set per-tx (rather than
+                        // hoisting into the block-level registry snapshot
+                        // above) is negligible — unlike the large
+                        // pool/DRep/reward-account registries that motivated
+                        // that hoist.
+                        .with_genesis_delegate_keys(
+                            self.genesis_delegates
+                                .values()
+                                .map(|(delegate_hash, _)| *delegate_hash)
+                                .collect(),
+                        )
+                        .with_update_quorum(self.update_quorum);
                     if let Some(net) = self.node_network {
                         ctx = ctx.with_network(net);
                     }
@@ -1558,6 +1603,23 @@ impl LedgerState {
                     t_diff_merge += start.elapsed();
                 }
 
+                // #804: enqueue any `GenesisKeyDelegation` certs into the
+                // two-phase `future_gen_delegs` queue. This lives on
+                // top-level `LedgerState` (not `CertSubState`), so it can't
+                // be handled inside `apply_shelley_cert`/`apply_valid_tx`
+                // above (see that function's doc comment). Guarded on `pv <
+                // 9` to mirror the MIR guard in `apply_shelley_cert` — the
+                // cert type is structurally AtMostEra Babbage, so this is
+                // defense-in-depth, not a live Conway condition.
+                if cached_params.protocol_version_major < 9 {
+                    crate::eras::common::enqueue_genesis_key_delegations(
+                        tx,
+                        block_slot,
+                        self.stability_window_3kf,
+                        &mut self.future_gen_delegs,
+                    );
+                }
+
                 // ── Step 8b-post: Update block_active_proposals ───────────
                 //
                 // After a proposal-containing tx is applied, `self.gov.governance.proposals`
@@ -1836,16 +1898,37 @@ impl LedgerState {
         // registration — that CoW breaks pointer equality, giving us a cheap
         // "did pool state change?" signal without scanning block contents.
         let pool_params_before = std::sync::Arc::clone(&self.certs.pool_params);
-        // Also capture pre-block sizes of the plain-HashMap pool fields so we can
+        // Also capture pre-block CONTENT of the plain-HashMap pool fields so we can
         // detect changes that don't go through pool_params (e.g. retirement-only
         // blocks where a pending retirement is added but pool_params is unchanged).
-        let pending_retirements_len_before = self.certs.pending_retirements.len();
-        let future_pool_params_len_before = self.certs.future_pool_params.len();
+        // Content clones (not lengths): same-length overwrites — a retirement-epoch
+        // overwrite, a second re-registration, or a compensating add+remove — leave
+        // `len` unchanged but MUST snapshot, else reconstruction keeps the stale
+        // retirement epoch / future params (#783). These maps hold only pools with a
+        // *pending* action (cleared at epoch boundaries), so the clones are small.
+        let pending_retirements_before = self.certs.pending_retirements.clone();
+        let future_pool_params_before = self.certs.future_pool_params.clone();
         // Capture the pre-block per-pool block counter Arc pointer so we can
         // detect (by pointer) whether this block mutated it (counted a block
         // and/or cleared it at an epoch boundary). Used to snapshot it
         // absolutely for gap-robust reconstruction (#763).
         let epoch_blocks_before = std::sync::Arc::clone(&self.consensus.epoch_blocks_by_pool);
+        // #782: pre-block content clones for the remaining fields that had NO
+        // delta representation at all (not even the imprecise len-based check
+        // #783 fixed for pool state). Each is content-diffed against the
+        // post-block value below; see the field docs on `LedgerDelta` for the
+        // per-field rationale (size, mutation frequency).
+        let pointer_map_before = self.certs.pointer_map.clone();
+        let script_stake_credentials_before = self.certs.script_stake_credentials.clone();
+        let pending_mir_reserves_before = self.certs.pending_mir_reserves.clone();
+        let pending_mir_treasury_before = self.certs.pending_mir_treasury.clone();
+        let pending_mir_delta_reserves_before = self.certs.pending_mir_delta_reserves;
+        let pending_mir_delta_treasury_before = self.certs.pending_mir_delta_treasury;
+        let genesis_delegates_before = self.genesis_delegates.clone();
+        // #804: pre-block content clone of the future-genesis-delegate
+        // queue, mirroring `genesis_delegates_before` immediately above.
+        let future_gen_delegs_before = self.future_gen_delegs.clone();
+        let rupd_addrs_rew_before = self.epochs.rupd_addrs_rew.clone();
 
         // Apply the block (all state mutations happen here). In deferred mode
         // this returns the captured Phase-2 work items without draining them.
@@ -1869,8 +1952,8 @@ impl LedgerState {
         // anchor value — fixes fork rollback corrupting pool registrations.
         let pool_state_changed =
             !std::sync::Arc::ptr_eq(&pool_params_before, &self.certs.pool_params)
-                || self.certs.pending_retirements.len() != pending_retirements_len_before
-                || self.certs.future_pool_params.len() != future_pool_params_len_before;
+                || self.certs.pending_retirements != pending_retirements_before
+                || self.certs.future_pool_params != future_pool_params_before;
         if pool_state_changed {
             delta.pool_params_snapshot = Some(std::sync::Arc::clone(&self.certs.pool_params));
             delta.future_pool_params_snapshot = Some(self.certs.future_pool_params.clone());
@@ -1910,6 +1993,58 @@ impl LedgerState {
                 Some(std::sync::Arc::clone(&self.consensus.epoch_blocks_by_pool));
         }
 
+        // #782: content-diffed snapshots for the fields that previously had NO
+        // delta representation at all. Rare mutations (pointer-based stake
+        // regs, MIR certs, genesis key delegation) so `None` on the
+        // overwhelming majority of blocks.
+        if self.certs.pointer_map != pointer_map_before {
+            delta.pointer_map_snapshot = Some(self.certs.pointer_map.clone());
+        }
+        if self.certs.script_stake_credentials != script_stake_credentials_before {
+            delta.script_stake_credentials_snapshot =
+                Some(self.certs.script_stake_credentials.clone());
+        }
+        // total_stake_key_deposits is a plain u64 scalar — unconditional capture
+        // is free, mirroring the imbl snapshots above.
+        delta.total_stake_key_deposits_snapshot = Some(self.certs.total_stake_key_deposits);
+        if self.certs.pending_mir_reserves != pending_mir_reserves_before
+            || self.certs.pending_mir_treasury != pending_mir_treasury_before
+            || self.certs.pending_mir_delta_reserves != pending_mir_delta_reserves_before
+            || self.certs.pending_mir_delta_treasury != pending_mir_delta_treasury_before
+        {
+            delta.pending_mir_reserves_snapshot = Some(self.certs.pending_mir_reserves.clone());
+            delta.pending_mir_treasury_snapshot = Some(self.certs.pending_mir_treasury.clone());
+            delta.pending_mir_delta_reserves_snapshot = Some(self.certs.pending_mir_delta_reserves);
+            delta.pending_mir_delta_treasury_snapshot = Some(self.certs.pending_mir_delta_treasury);
+        }
+        if self.genesis_delegates != genesis_delegates_before {
+            delta.genesis_delegates_snapshot = Some(self.genesis_delegates.clone());
+        }
+        // #804: same content-diffed capture for the future-genesis-delegate
+        // queue (mutated by `enqueue_genesis_key_delegations` in Step 8b and
+        // drained by `adopt_matured_genesis_delegs` earlier in this
+        // function) — rare bootstrap-era mutation, `None` on almost every
+        // block.
+        if self.future_gen_delegs != future_gen_delegs_before {
+            delta.future_gen_delegs_snapshot = Some(self.future_gen_delegs.clone());
+        }
+        // pending_pp_updates / future_pp_updates hold only currently-active
+        // proposals (a handful of entries at most) — unconditional capture is
+        // cheap and supersedes the coarse `pending_pp_updates_cleared` bool
+        // in `EpochTransitionDelta` (see `apply_delta_to_state` step 7c).
+        delta.pending_pp_updates_snapshot = Some(self.epochs.pending_pp_updates.clone());
+        delta.future_pp_updates_snapshot = Some(self.epochs.future_pp_updates.clone());
+        // rupd_addrs_rew: change-detect via Arc pointer identity (both `None`
+        // compares equal; a None<->Some transition or a pointer change counts).
+        let rupd_changed = match (&rupd_addrs_rew_before, &self.epochs.rupd_addrs_rew) {
+            (None, None) => false,
+            (Some(a), Some(b)) => !std::sync::Arc::ptr_eq(a, b),
+            _ => true,
+        };
+        if rupd_changed {
+            delta.rupd_addrs_rew_snapshot = Some(self.epochs.rupd_addrs_rew.clone());
+        }
+
         // Extract the UTxO diff from the DiffSeq entry that apply_block just pushed.
         if let Some((_slot, _hash, utxo_diff)) = self.utxo.diff_seq.diffs.back() {
             delta.utxo_diff = utxo_diff.clone();
@@ -1930,6 +2065,7 @@ impl LedgerState {
                     && self.epochs.future_pp_updates.is_empty(),
                 epoch_nonce: self.consensus.epoch_nonce,
                 last_epoch_block_nonce: self.consensus.last_epoch_block_nonce,
+                extra_entropy: self.consensus.extra_entropy,
                 reward_credits: std::collections::HashMap::new(),
                 pools_retired: Vec::new(),
                 future_params_promoted: Vec::new(),
@@ -1980,14 +2116,12 @@ impl LedgerState {
                     self.epochs.protocol_params.d.denominator.max(1),
                 )
             };
-            let first_slot_of_current_epoch = self
-                .epoch
-                .0
-                .saturating_mul(self.epoch_length)
-                .saturating_add(
-                    self.shelley_transition_epoch
-                        .saturating_mul(self.byron_epoch_length),
-                );
+            let first_slot_of_current_epoch = crate::eras::common::first_slot_of_shelley_epoch(
+                self.epoch.0,
+                self.shelley_transition_epoch,
+                self.byron_epoch_length,
+                self.epoch_length,
+            );
             if !crate::eras::common::is_overlay_slot(
                 first_slot_of_current_epoch,
                 block.slot().0,
@@ -2004,19 +2138,40 @@ impl LedgerState {
             None
         };
 
+        // #782: `consensus.opcert_counters` is updated (at most one pool_id)
+        // by `compute_shelley_nonce` for every Shelley+ block with an issuer,
+        // unconditionally on overlay status (unlike `pool_block_increment`
+        // above). Read back the post-block value for that single key rather
+        // than content-diffing the whole (unbounded, never-cleared) map.
+        let opcert_counter_update = if block.header.issuer_vkey.is_empty() {
+            None
+        } else {
+            let pool_id = dugite_primitives::hash::blake2b_224(&block.header.issuer_vkey);
+            self.consensus
+                .opcert_counters
+                .get(&pool_id)
+                .map(|seq| (pool_id, *seq))
+        };
+
         delta.block_fields = BlockFieldsDelta {
             fees_collected: block
                 .transactions
                 .iter()
                 .filter(|tx| tx.is_valid)
                 .map(|tx| tx.body.fee)
-                .fold(Lovelace(0), |acc, fee| Lovelace(acc.0 + fee.0)),
+                .fold(Lovelace(0), |acc, fee| {
+                    Lovelace(acc.0.saturating_add(fee.0))
+                }),
             pool_block_increment,
             epoch_block_count: self.consensus.epoch_block_count,
             evolving_nonce: self.consensus.evolving_nonce,
             candidate_nonce: self.consensus.candidate_nonce,
             lab_nonce: self.consensus.lab_nonce,
             epoch_fees: self.utxo.epoch_fees,
+            pending_donations: self.utxo.pending_donations,
+            era: self.era,
+            pending_avvm_return: self.epochs.pending_avvm_return,
+            opcert_counter_update,
         };
 
         Ok((delta, deferred_items))
@@ -2274,6 +2429,62 @@ mod tests {
         assert_eq!(
             state.consensus.opcert_counters.get(&pool_id).copied(),
             Some(99)
+        );
+    }
+
+    /// Issue #808: the `pool_block_increment` delta's first-slot-of-epoch
+    /// computation must use the canonical `first_slot_of_shelley_epoch`
+    /// helper (`byron_slots + (epoch - shelley_transition_epoch) *
+    /// epoch_length`), not the old inline formula that omitted the
+    /// `- shelley_transition_epoch` term. The old formula produced a
+    /// first-slot value far in the future for any epoch shortly after the
+    /// Byron->Shelley fork, which pins `is_overlay_slot`'s `saturating_sub`
+    /// at 0 for the entire epoch — misclassifying real Praos (counted)
+    /// slots as overlay (uncounted) whenever `0 < d < 1`.
+    ///
+    /// mainnet-shaped numbers: shelley_transition_epoch=208,
+    /// byron_epoch_length=21600, epoch_length=432000, epoch=210, d=1/10.
+    /// first_slot (correct) = 208*21600 + (210-208)*432000 = 5,356,800.
+    /// first_slot (old, buggy) = 210*432000 + 208*21600 = 95,212,800.
+    /// At block_slot = first_slot(correct) + 100_003 = 5,456,803: the
+    /// correct formula gives `s=100_003` -> step(100_003)=10_001 ==
+    /// step(100_004)=10_001 -> NOT overlay (Praos, counted). The old
+    /// formula gives `s=0` (block_slot << old first_slot) ->
+    /// step(0)=0 < step(1)=1 -> overlay (miscounted as NOT counted).
+    #[test]
+    fn test_pool_block_increment_uses_canonical_first_slot_formula() {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        // pv < 7 so the live `d` parameter (not the forced Praos d=0) gates
+        // overlay classification.
+        params.protocol_version_major = 2;
+        params.d = dugite_primitives::transaction::Rational {
+            numerator: 1,
+            denominator: 10,
+        };
+        let mut state = LedgerState::new(params);
+        state.era = Era::Shelley;
+        state.epoch = EpochNo(210);
+        state.shelley_transition_epoch = 208;
+        state.byron_epoch_length = 21_600;
+        state.epoch_length = 432_000;
+
+        let correct_first_slot = 208u64 * 21_600 + (210u64 - 208) * 432_000;
+        assert_eq!(correct_first_slot, 5_356_800);
+        let block_slot = correct_first_slot + 100_003;
+
+        let mut block = make_test_block(Era::Shelley, block_slot, 1, 2, 0, vec![]);
+        block.header.issuer_vkey = vec![0xCCu8; 32];
+
+        let delta = state
+            .apply_block_with_delta(&block, BlockValidationMode::ApplyOnly)
+            .expect("Shelley block must apply");
+
+        let expected_pool_id = dugite_primitives::hash::blake2b_224(&block.header.issuer_vkey);
+        assert_eq!(
+            delta.block_fields.pool_block_increment,
+            Some(expected_pool_id),
+            "block at a real Praos (non-overlay) slot must be counted toward \
+             the pool's BlocksMade using the canonical first-slot-of-epoch formula"
         );
     }
 
@@ -2843,6 +3054,196 @@ mod tests {
             "ApplyOnly + Byron era must retain the bypass until upstream fix. Got: {result:?}"
         );
         assert_eq!(state.tip.block_number, BlockNo(11));
+    }
+
+    // ── #795: duplicate tx hash within a block ────────────────────────────
+    //
+    // Haskell has no per-block tx-hash dedup: LEDGERS folds LEDGER over every
+    // tx in the block, so a second byte-identical copy re-applies and fails
+    // UTXO's `txins ⊆ dom utxo` with `BadInputsUTxO` (its inputs were already
+    // spent by the first copy) — invalidating the whole block. In `ValidateAll`
+    // (block-validity) mode dugite must mirror this and be block-fatal. In
+    // `ApplyOnly` (historical replay of already-canonical chains) the duplicate
+    // is still silently skipped for replay tolerance.
+
+    #[test]
+    fn test_shelley_duplicate_tx_hash_block_fatal_in_validate_all() {
+        let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0xD0u8; 32]),
+            index: 0,
+        };
+        seed_utxo(&mut state, input.clone(), make_output(5_000_000));
+
+        let tx = make_simple_tx(0xD1, vec![input], vec![make_output(4_500_000)], 500_000);
+        // Two byte-identical copies of the same transaction (same hash).
+        let block = make_test_block(Era::Conway, 1_000, 1, 9, 0, vec![tx.clone(), tx]);
+
+        let result = state.apply_block(&block, BlockValidationMode::ValidateAll);
+        assert!(
+            matches!(result, Err(LedgerError::BlockTxValidationFailed { .. })),
+            "ValidateAll must reject a block containing a duplicate tx hash \
+             (Haskell rejects the second application with BadInputsUTxO). Got: {result:?}"
+        );
+        if let Err(LedgerError::BlockTxValidationFailed { errors, .. }) = result {
+            assert!(
+                errors.contains("BadInputsUTxO") && errors.contains("duplicate"),
+                "expected a BadInputsUTxO/duplicate error, got: {errors}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_shelley_duplicate_tx_hash_apply_only_skips_second_copy() {
+        let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0xD2u8; 32]),
+            index: 0,
+        };
+        seed_utxo(&mut state, input.clone(), make_output(5_000_000));
+
+        let tx = make_simple_tx(
+            0xD3,
+            vec![input.clone()],
+            vec![make_output(4_500_000)],
+            500_000,
+        );
+        let tx_hash = tx.hash;
+        let block = make_test_block(Era::Conway, 1_000, 1, 9, 0, vec![tx.clone(), tx]);
+
+        state
+            .apply_block(&block, BlockValidationMode::ApplyOnly)
+            .expect("ApplyOnly must tolerate a duplicate tx hash by skipping the repeat copy");
+
+        // The first copy's effects applied exactly once: input consumed, one
+        // new output created (the skipped second copy did not double-apply).
+        assert!(state.utxo.utxo_set.lookup(&input).is_none());
+        let new_input = TransactionInput {
+            transaction_id: tx_hash,
+            index: 0,
+        };
+        assert!(state.utxo.utxo_set.lookup(&new_input).is_some());
+    }
+
+    #[test]
+    fn test_byron_duplicate_tx_hash_block_fatal_in_validate_all() {
+        let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+
+        let genesis_input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0x51u8; 32]),
+            index: 0,
+        };
+        let genesis_output = TransactionOutput {
+            address: Address::Byron(ByronAddress {
+                payload: vec![0u8; 32],
+            }),
+            value: Value {
+                coin: Lovelace(10_000_000),
+                multi_asset: Default::default(),
+            },
+            datum: OutputDatum::None,
+            script_ref: None,
+            is_legacy: true,
+            raw_cbor: None,
+        };
+        seed_utxo(&mut state, genesis_input.clone(), genesis_output);
+
+        // fee = min_fee at tx_size=0 (raw_cbor: None) = ByronFeePolicy summand.
+        let fee: u64 = state.epochs.protocol_params.min_fee_b;
+        let output_value = 10_000_000u64 - fee;
+        let out_output = TransactionOutput {
+            address: Address::Byron(ByronAddress {
+                payload: vec![1u8; 32],
+            }),
+            value: Value {
+                coin: Lovelace(output_value),
+                multi_asset: Default::default(),
+            },
+            datum: OutputDatum::None,
+            script_ref: None,
+            is_legacy: true,
+            raw_cbor: None,
+        };
+
+        let mut tx = Transaction::empty_with_hash(Hash32::from_bytes([0x52u8; 32]));
+        tx.body.inputs = vec![genesis_input];
+        tx.body.outputs = vec![out_output];
+        tx.body.fee = Lovelace(fee);
+
+        let block = make_test_block(Era::Byron, 100, 1, 1, 0, vec![tx.clone(), tx]);
+
+        let result = state.apply_block(&block, BlockValidationMode::ValidateAll);
+        assert!(
+            matches!(result, Err(LedgerError::BlockTxValidationFailed { .. })),
+            "ValidateAll must reject a Byron block containing a duplicate tx hash. Got: {result:?}"
+        );
+        if let Err(LedgerError::BlockTxValidationFailed { errors, .. }) = result {
+            assert!(
+                errors.contains("BadInputsUTxO") && errors.contains("duplicate"),
+                "expected a BadInputsUTxO/duplicate error, got: {errors}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_byron_duplicate_tx_hash_apply_only_skips_second_copy() {
+        let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+
+        let genesis_input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0x53u8; 32]),
+            index: 0,
+        };
+        let genesis_output = TransactionOutput {
+            address: Address::Byron(ByronAddress {
+                payload: vec![0u8; 32],
+            }),
+            value: Value {
+                coin: Lovelace(10_000_000),
+                multi_asset: Default::default(),
+            },
+            datum: OutputDatum::None,
+            script_ref: None,
+            is_legacy: true,
+            raw_cbor: None,
+        };
+        seed_utxo(&mut state, genesis_input.clone(), genesis_output);
+
+        let fee: u64 = state.epochs.protocol_params.min_fee_b;
+        let output_value = 10_000_000u64 - fee;
+        let out_output = TransactionOutput {
+            address: Address::Byron(ByronAddress {
+                payload: vec![1u8; 32],
+            }),
+            value: Value {
+                coin: Lovelace(output_value),
+                multi_asset: Default::default(),
+            },
+            datum: OutputDatum::None,
+            script_ref: None,
+            is_legacy: true,
+            raw_cbor: None,
+        };
+
+        let mut tx = Transaction::empty_with_hash(Hash32::from_bytes([0x54u8; 32]));
+        tx.body.inputs = vec![genesis_input.clone()];
+        tx.body.outputs = vec![out_output];
+        tx.body.fee = Lovelace(fee);
+        let tx_hash = tx.hash;
+
+        let block = make_test_block(Era::Byron, 100, 1, 1, 0, vec![tx.clone(), tx]);
+
+        state
+            .apply_block(&block, BlockValidationMode::ApplyOnly)
+            .expect("ApplyOnly must tolerate a Byron duplicate tx hash by skipping the repeat");
+
+        assert!(state.utxo.utxo_set.lookup(&genesis_input).is_none());
+        let new_input = TransactionInput {
+            transaction_id: tx_hash,
+            index: 0,
+        };
+        assert!(state.utxo.utxo_set.lookup(&new_input).is_some());
     }
 
     // ── Regression: bogus body-size approximation must not exist ─────────────
