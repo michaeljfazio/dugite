@@ -594,6 +594,14 @@ impl LedgerState {
                 std::collections::HashSet::with_capacity(block.transactions.len());
             for tx in &block.transactions {
                 if !seen_hashes.insert(tx.hash) {
+                    if mode == BlockValidationMode::ValidateAll {
+                        return Err(LedgerError::BlockTxValidationFailed {
+                            slot: block.slot().0,
+                            tx_hash: tx.hash.to_hex(),
+                            errors: "BadInputsUTxO: duplicate transaction hash in block"
+                                .to_string(),
+                        });
+                    }
                     warn!(
                         tx_hash = %tx.hash.to_hex(),
                         slot = block.slot().0,
@@ -1063,6 +1071,13 @@ impl LedgerState {
         // ── Step 8: Per-transaction processing loop ───────────────────────
         for (tx_idx, tx) in block.transactions.iter().enumerate() {
             if !processed_tx_hashes.insert(tx.hash) {
+                if mode == BlockValidationMode::ValidateAll {
+                    return Err(LedgerError::BlockTxValidationFailed {
+                        slot: block.slot().0,
+                        tx_hash: tx.hash.to_hex(),
+                        errors: "BadInputsUTxO: duplicate transaction hash in block".to_string(),
+                    });
+                }
                 warn!(
                     tx_hash = %tx.hash.to_hex(),
                     slot = block.slot().0,
@@ -2043,14 +2058,12 @@ impl LedgerState {
                     self.epochs.protocol_params.d.denominator.max(1),
                 )
             };
-            let first_slot_of_current_epoch = self
-                .epoch
-                .0
-                .saturating_mul(self.epoch_length)
-                .saturating_add(
-                    self.shelley_transition_epoch
-                        .saturating_mul(self.byron_epoch_length),
-                );
+            let first_slot_of_current_epoch = crate::eras::common::first_slot_of_shelley_epoch(
+                self.epoch.0,
+                self.shelley_transition_epoch,
+                self.byron_epoch_length,
+                self.epoch_length,
+            );
             if !crate::eras::common::is_overlay_slot(
                 first_slot_of_current_epoch,
                 block.slot().0,
@@ -2088,7 +2101,9 @@ impl LedgerState {
                 .iter()
                 .filter(|tx| tx.is_valid)
                 .map(|tx| tx.body.fee)
-                .fold(Lovelace(0), |acc, fee| Lovelace(acc.0 + fee.0)),
+                .fold(Lovelace(0), |acc, fee| {
+                    Lovelace(acc.0.saturating_add(fee.0))
+                }),
             pool_block_increment,
             epoch_block_count: self.consensus.epoch_block_count,
             evolving_nonce: self.consensus.evolving_nonce,
@@ -2356,6 +2371,62 @@ mod tests {
         assert_eq!(
             state.consensus.opcert_counters.get(&pool_id).copied(),
             Some(99)
+        );
+    }
+
+    /// Issue #808: the `pool_block_increment` delta's first-slot-of-epoch
+    /// computation must use the canonical `first_slot_of_shelley_epoch`
+    /// helper (`byron_slots + (epoch - shelley_transition_epoch) *
+    /// epoch_length`), not the old inline formula that omitted the
+    /// `- shelley_transition_epoch` term. The old formula produced a
+    /// first-slot value far in the future for any epoch shortly after the
+    /// Byron->Shelley fork, which pins `is_overlay_slot`'s `saturating_sub`
+    /// at 0 for the entire epoch — misclassifying real Praos (counted)
+    /// slots as overlay (uncounted) whenever `0 < d < 1`.
+    ///
+    /// mainnet-shaped numbers: shelley_transition_epoch=208,
+    /// byron_epoch_length=21600, epoch_length=432000, epoch=210, d=1/10.
+    /// first_slot (correct) = 208*21600 + (210-208)*432000 = 5,356,800.
+    /// first_slot (old, buggy) = 210*432000 + 208*21600 = 95,212,800.
+    /// At block_slot = first_slot(correct) + 100_003 = 5,456,803: the
+    /// correct formula gives `s=100_003` -> step(100_003)=10_001 ==
+    /// step(100_004)=10_001 -> NOT overlay (Praos, counted). The old
+    /// formula gives `s=0` (block_slot << old first_slot) ->
+    /// step(0)=0 < step(1)=1 -> overlay (miscounted as NOT counted).
+    #[test]
+    fn test_pool_block_increment_uses_canonical_first_slot_formula() {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        // pv < 7 so the live `d` parameter (not the forced Praos d=0) gates
+        // overlay classification.
+        params.protocol_version_major = 2;
+        params.d = dugite_primitives::transaction::Rational {
+            numerator: 1,
+            denominator: 10,
+        };
+        let mut state = LedgerState::new(params);
+        state.era = Era::Shelley;
+        state.epoch = EpochNo(210);
+        state.shelley_transition_epoch = 208;
+        state.byron_epoch_length = 21_600;
+        state.epoch_length = 432_000;
+
+        let correct_first_slot = 208u64 * 21_600 + (210u64 - 208) * 432_000;
+        assert_eq!(correct_first_slot, 5_356_800);
+        let block_slot = correct_first_slot + 100_003;
+
+        let mut block = make_test_block(Era::Shelley, block_slot, 1, 2, 0, vec![]);
+        block.header.issuer_vkey = vec![0xCCu8; 32];
+
+        let delta = state
+            .apply_block_with_delta(&block, BlockValidationMode::ApplyOnly)
+            .expect("Shelley block must apply");
+
+        let expected_pool_id = dugite_primitives::hash::blake2b_224(&block.header.issuer_vkey);
+        assert_eq!(
+            delta.block_fields.pool_block_increment,
+            Some(expected_pool_id),
+            "block at a real Praos (non-overlay) slot must be counted toward \
+             the pool's BlocksMade using the canonical first-slot-of-epoch formula"
         );
     }
 
@@ -2925,6 +2996,196 @@ mod tests {
             "ApplyOnly + Byron era must retain the bypass until upstream fix. Got: {result:?}"
         );
         assert_eq!(state.tip.block_number, BlockNo(11));
+    }
+
+    // ── #795: duplicate tx hash within a block ────────────────────────────
+    //
+    // Haskell has no per-block tx-hash dedup: LEDGERS folds LEDGER over every
+    // tx in the block, so a second byte-identical copy re-applies and fails
+    // UTXO's `txins ⊆ dom utxo` with `BadInputsUTxO` (its inputs were already
+    // spent by the first copy) — invalidating the whole block. In `ValidateAll`
+    // (block-validity) mode dugite must mirror this and be block-fatal. In
+    // `ApplyOnly` (historical replay of already-canonical chains) the duplicate
+    // is still silently skipped for replay tolerance.
+
+    #[test]
+    fn test_shelley_duplicate_tx_hash_block_fatal_in_validate_all() {
+        let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0xD0u8; 32]),
+            index: 0,
+        };
+        seed_utxo(&mut state, input.clone(), make_output(5_000_000));
+
+        let tx = make_simple_tx(0xD1, vec![input], vec![make_output(4_500_000)], 500_000);
+        // Two byte-identical copies of the same transaction (same hash).
+        let block = make_test_block(Era::Conway, 1_000, 1, 9, 0, vec![tx.clone(), tx]);
+
+        let result = state.apply_block(&block, BlockValidationMode::ValidateAll);
+        assert!(
+            matches!(result, Err(LedgerError::BlockTxValidationFailed { .. })),
+            "ValidateAll must reject a block containing a duplicate tx hash \
+             (Haskell rejects the second application with BadInputsUTxO). Got: {result:?}"
+        );
+        if let Err(LedgerError::BlockTxValidationFailed { errors, .. }) = result {
+            assert!(
+                errors.contains("BadInputsUTxO") && errors.contains("duplicate"),
+                "expected a BadInputsUTxO/duplicate error, got: {errors}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_shelley_duplicate_tx_hash_apply_only_skips_second_copy() {
+        let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0xD2u8; 32]),
+            index: 0,
+        };
+        seed_utxo(&mut state, input.clone(), make_output(5_000_000));
+
+        let tx = make_simple_tx(
+            0xD3,
+            vec![input.clone()],
+            vec![make_output(4_500_000)],
+            500_000,
+        );
+        let tx_hash = tx.hash;
+        let block = make_test_block(Era::Conway, 1_000, 1, 9, 0, vec![tx.clone(), tx]);
+
+        state
+            .apply_block(&block, BlockValidationMode::ApplyOnly)
+            .expect("ApplyOnly must tolerate a duplicate tx hash by skipping the repeat copy");
+
+        // The first copy's effects applied exactly once: input consumed, one
+        // new output created (the skipped second copy did not double-apply).
+        assert!(state.utxo.utxo_set.lookup(&input).is_none());
+        let new_input = TransactionInput {
+            transaction_id: tx_hash,
+            index: 0,
+        };
+        assert!(state.utxo.utxo_set.lookup(&new_input).is_some());
+    }
+
+    #[test]
+    fn test_byron_duplicate_tx_hash_block_fatal_in_validate_all() {
+        let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+
+        let genesis_input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0x51u8; 32]),
+            index: 0,
+        };
+        let genesis_output = TransactionOutput {
+            address: Address::Byron(ByronAddress {
+                payload: vec![0u8; 32],
+            }),
+            value: Value {
+                coin: Lovelace(10_000_000),
+                multi_asset: Default::default(),
+            },
+            datum: OutputDatum::None,
+            script_ref: None,
+            is_legacy: true,
+            raw_cbor: None,
+        };
+        seed_utxo(&mut state, genesis_input.clone(), genesis_output);
+
+        // fee = min_fee at tx_size=0 (raw_cbor: None) = ByronFeePolicy summand.
+        let fee: u64 = state.epochs.protocol_params.min_fee_b;
+        let output_value = 10_000_000u64 - fee;
+        let out_output = TransactionOutput {
+            address: Address::Byron(ByronAddress {
+                payload: vec![1u8; 32],
+            }),
+            value: Value {
+                coin: Lovelace(output_value),
+                multi_asset: Default::default(),
+            },
+            datum: OutputDatum::None,
+            script_ref: None,
+            is_legacy: true,
+            raw_cbor: None,
+        };
+
+        let mut tx = Transaction::empty_with_hash(Hash32::from_bytes([0x52u8; 32]));
+        tx.body.inputs = vec![genesis_input];
+        tx.body.outputs = vec![out_output];
+        tx.body.fee = Lovelace(fee);
+
+        let block = make_test_block(Era::Byron, 100, 1, 1, 0, vec![tx.clone(), tx]);
+
+        let result = state.apply_block(&block, BlockValidationMode::ValidateAll);
+        assert!(
+            matches!(result, Err(LedgerError::BlockTxValidationFailed { .. })),
+            "ValidateAll must reject a Byron block containing a duplicate tx hash. Got: {result:?}"
+        );
+        if let Err(LedgerError::BlockTxValidationFailed { errors, .. }) = result {
+            assert!(
+                errors.contains("BadInputsUTxO") && errors.contains("duplicate"),
+                "expected a BadInputsUTxO/duplicate error, got: {errors}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_byron_duplicate_tx_hash_apply_only_skips_second_copy() {
+        let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+
+        let genesis_input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0x53u8; 32]),
+            index: 0,
+        };
+        let genesis_output = TransactionOutput {
+            address: Address::Byron(ByronAddress {
+                payload: vec![0u8; 32],
+            }),
+            value: Value {
+                coin: Lovelace(10_000_000),
+                multi_asset: Default::default(),
+            },
+            datum: OutputDatum::None,
+            script_ref: None,
+            is_legacy: true,
+            raw_cbor: None,
+        };
+        seed_utxo(&mut state, genesis_input.clone(), genesis_output);
+
+        let fee: u64 = state.epochs.protocol_params.min_fee_b;
+        let output_value = 10_000_000u64 - fee;
+        let out_output = TransactionOutput {
+            address: Address::Byron(ByronAddress {
+                payload: vec![1u8; 32],
+            }),
+            value: Value {
+                coin: Lovelace(output_value),
+                multi_asset: Default::default(),
+            },
+            datum: OutputDatum::None,
+            script_ref: None,
+            is_legacy: true,
+            raw_cbor: None,
+        };
+
+        let mut tx = Transaction::empty_with_hash(Hash32::from_bytes([0x54u8; 32]));
+        tx.body.inputs = vec![genesis_input.clone()];
+        tx.body.outputs = vec![out_output];
+        tx.body.fee = Lovelace(fee);
+        let tx_hash = tx.hash;
+
+        let block = make_test_block(Era::Byron, 100, 1, 1, 0, vec![tx.clone(), tx]);
+
+        state
+            .apply_block(&block, BlockValidationMode::ApplyOnly)
+            .expect("ApplyOnly must tolerate a Byron duplicate tx hash by skipping the repeat");
+
+        assert!(state.utxo.utxo_set.lookup(&genesis_input).is_none());
+        let new_input = TransactionInput {
+            transaction_id: tx_hash,
+            index: 0,
+        };
+        assert!(state.utxo.utxo_set.lookup(&new_input).is_some());
     }
 
     // ── Regression: bogus body-size approximation must not exist ─────────────

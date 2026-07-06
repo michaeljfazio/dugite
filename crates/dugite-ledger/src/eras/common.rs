@@ -851,21 +851,21 @@ pub(crate) fn is_overlay_slot(first_slot: u64, block_slot: u64, d_num: u64, d_de
 // 6. Block-body ExUnit budget validation (Alonzo+)
 // ============================================================================
 
-/// Validate that the total ExUnit budget (memory + steps) across all valid
+/// Validate that the total ExUnit budget (memory + steps) across all
 /// transactions in the block does not exceed the per-block limits.
 ///
-/// Matches Haskell's Alonzo BBODY rule: `totalExUnits txs <= maxBlockExUnits pp`.
-/// Only valid transactions (is_valid=true) contribute to the budget since
-/// invalid transactions do not execute scripts.
+/// Matches Haskell's Alonzo BBODY rule: `totalExUnits txs <= maxBlockExUnits pp`,
+/// where `txTotal = foldMap totExUnits txs` folds over the *entire* block body
+/// with no `IsValid` filter — an `is_valid=false` transaction still carries
+/// redeemers (and the collateral it consumes was priced assuming those
+/// redeemers would run), so its ExUnits count toward the block budget too.
 pub(crate) fn validate_block_ex_units(block: &Block, ctx: &RuleContext) -> Result<(), LedgerError> {
     let mut mem: u64 = 0;
     let mut steps: u64 = 0;
     for tx in &block.transactions {
-        if tx.is_valid {
-            for r in &tx.witness_set.redeemers {
-                mem = mem.saturating_add(r.ex_units.mem);
-                steps = steps.saturating_add(r.ex_units.steps);
-            }
+        for r in &tx.witness_set.redeemers {
+            mem = mem.saturating_add(r.ex_units.mem);
+            steps = steps.saturating_add(r.ex_units.steps);
         }
     }
 
@@ -963,7 +963,10 @@ mod tests {
     use dugite_primitives::protocol_params::ProtocolParameters;
     use dugite_primitives::time::BlockNo;
     use dugite_primitives::time::SlotNo;
-    use dugite_primitives::transaction::{OutputDatum, TransactionInput, TransactionOutput};
+    use dugite_primitives::transaction::{
+        ExUnits, OutputDatum, PlutusData, Redeemer, RedeemerTag, TransactionInput,
+        TransactionOutput,
+    };
     use dugite_primitives::value::{Lovelace, Value};
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::sync::Arc;
@@ -2360,5 +2363,68 @@ mod tests {
         );
         assert_eq!(key_routing, credential_to_hash(&key_cred));
         assert_eq!(script_routing, credential_to_hash(&script_cred));
+    }
+
+    // -----------------------------------------------------------------------
+    // 6. validate_block_ex_units tests (#794)
+    // -----------------------------------------------------------------------
+
+    /// Regression test for #794: Haskell's Alonzo BBODY rule folds
+    /// `totExUnits` over ALL transactions in the block body
+    /// (`txTotal = foldMap totExUnits txs`) with no `IsValid` filter. An
+    /// `is_valid=false` transaction still carries redeemers, and its ExUnits
+    /// must count toward the block-level budget. A block whose only tx is
+    /// invalid, but whose redeemer ExUnits alone exceed `maxBlockExUnits`,
+    /// must be rejected.
+    #[test]
+    fn test_validate_block_ex_units_counts_invalid_tx_redeemers() {
+        let params = ProtocolParameters::mainnet_defaults();
+        let genesis_delegates = HashMap::new();
+        let ctx = RuleContext {
+            params: &params,
+            current_slot: 100,
+            current_epoch: EpochNo(5),
+            era: dugite_primitives::era::Era::Babbage,
+            slot_config: None,
+            node_network: None,
+            genesis_delegates: &genesis_delegates,
+            update_quorum: 5,
+            epoch_length: 432_000,
+            shelley_transition_epoch: 0,
+            byron_epoch_length: 21_600,
+            stability_window: 129_600,
+            stability_window_3kf: 129_600,
+            randomness_stabilisation_window: 129_600,
+            tx_index: 0,
+            conway_genesis: None,
+            max_lovelace_supply: crate::state::MAX_LOVELACE_SUPPLY,
+        };
+
+        let mut tx = make_tx(Hash32::from_bytes([7u8; 32]), vec![], vec![], 0);
+        tx.is_valid = false; // invalid tx -- must still count toward the block budget
+        tx.witness_set.redeemers.push(Redeemer {
+            tag: RedeemerTag::Spend,
+            index: 0,
+            data: PlutusData::Constr(0, vec![]),
+            ex_units: ExUnits {
+                // Exceeds mainnet's max_block_ex_units.mem (62,000,000) on its own.
+                mem: params.max_block_ex_units.mem + 1,
+                steps: 0,
+            },
+        });
+
+        let block = Block {
+            era: dugite_primitives::era::Era::Babbage,
+            header: make_header(vec![], ZERO32, vec![]),
+            transactions: vec![tx],
+            raw_cbor: None,
+        };
+
+        let result = validate_block_ex_units(&block, &ctx);
+        assert!(
+            result.is_err(),
+            "block ExUnits budget must count is_valid=false tx redeemers \
+             (Haskell has no IsValid filter in Bbody.hs)"
+        );
     }
 }
