@@ -4462,6 +4462,252 @@ fn test_pre_conway_pp_update_survives_intermediate_epoch() {
     assert!(state.epochs.pending_pp_updates.is_empty());
 }
 
+/// Issue #784: a pre-Conway PPUP quorum requires a quorum of genesis
+/// delegates to vote the byte-identical `PParamsUpdate` value. Counting
+/// *distinct proposers* across two different values and field-merging them
+/// (the pre-fix bug) is wrong — Haskell's `votedFuturePParams` enacts
+/// nothing when no single value reaches quorum, even if the union of
+/// proposers would.
+#[test]
+fn test_pre_conway_pp_update_split_vote_no_merge() {
+    let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+    state.update_quorum = 5;
+    state.epoch = EpochNo(4);
+    state.epoch_length = 100;
+
+    let original_min_fee_a = state.epochs.protocol_params.min_fee_a;
+    let original_max_body = state.epochs.protocol_params.max_block_body_size;
+
+    // 3 genesis delegates vote for `ppu_a`, 2 vote for `ppu_b`. Union of
+    // proposers is 5 (>= quorum), but neither value alone reaches 5.
+    let ppu_a = ProtocolParamUpdate {
+        min_fee_a: Some(55),
+        ..Default::default()
+    };
+    let ppu_b = ProtocolParamUpdate {
+        max_block_body_size: Some(65536),
+        ..Default::default()
+    };
+    for i in 0u8..3 {
+        state
+            .epochs
+            .pending_pp_updates
+            .entry(EpochNo(4))
+            .or_default()
+            .push((Hash32::from_bytes([i; 32]), ppu_a.clone()));
+    }
+    for i in 3u8..5 {
+        state
+            .epochs
+            .pending_pp_updates
+            .entry(EpochNo(4))
+            .or_default()
+            .push((Hash32::from_bytes([i; 32]), ppu_b.clone()));
+    }
+
+    state.process_epoch_transition(EpochNo(5));
+
+    // Neither value reached quorum: enact nothing. The old bug would have
+    // field-merged `ppu_a` and `ppu_b` together and applied both.
+    assert_eq!(state.epochs.protocol_params.min_fee_a, original_min_fee_a);
+    assert_eq!(
+        state.epochs.protocol_params.max_block_body_size,
+        original_max_body
+    );
+    assert!(state.epochs.pending_pp_updates.is_empty());
+}
+
+/// A quorum-met value that violates `maxTxSize + maxBHSize < maxBBSize`
+/// (Haskell `votedFuturePParams`'s post-apply sanity guard, lives inside
+/// `votedFuturePParams` itself per the cardano-ledger-oracle) must be
+/// silently discarded — never applied.
+#[test]
+fn test_pre_conway_pp_update_sanity_guard_rejects() {
+    let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+    state.update_quorum = 2;
+    state.epoch = EpochNo(4);
+    state.epoch_length = 100;
+
+    let original_max_tx_size = state.epochs.protocol_params.max_tx_size;
+    assert!(
+        original_max_tx_size + state.epochs.protocol_params.max_block_header_size
+            < state.epochs.protocol_params.max_block_body_size,
+        "fixture invariant: current params must satisfy the sanity guard"
+    );
+
+    // Both genesis delegates vote identically for a max_tx_size so large it
+    // breaks the size invariant against the current max_block_body_size.
+    let bad_ppu = ProtocolParamUpdate {
+        max_tx_size: Some(200_000),
+        ..Default::default()
+    };
+    state
+        .epochs
+        .pending_pp_updates
+        .entry(EpochNo(4))
+        .or_default()
+        .push((Hash32::from_bytes([1u8; 32]), bad_ppu.clone()));
+    state
+        .epochs
+        .pending_pp_updates
+        .entry(EpochNo(4))
+        .or_default()
+        .push((Hash32::from_bytes([2u8; 32]), bad_ppu));
+
+    state.process_epoch_transition(EpochNo(5));
+
+    assert_eq!(
+        state.epochs.protocol_params.max_tx_size, original_max_tx_size,
+        "sanity-guard-violating update must be discarded, not applied"
+    );
+}
+
+/// Issue #784 completeness caveat: the header/envelope forecast helpers in
+/// `state::mod` must derive their forecast from the SAME
+/// `voted_future_pparams` quorum rule as enactment, not the old
+/// distinct-proposer-count + last-writer-merge path. A split vote (3 for
+/// `d = 1/4`, 2 for `d = 1/2`, quorum = 5) must forecast the CURRENT `d`.
+#[test]
+fn test_forecast_d_for_epoch_split_vote_returns_current() {
+    let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+    state.update_quorum = 5;
+    state.epoch = EpochNo(4);
+    state.epochs.protocol_params.protocol_version_major = 6; // pre-Babbage, `d` meaningful
+    let original_d = state.epochs.protocol_params.d.clone();
+
+    let ppu_a = ProtocolParamUpdate {
+        d: Some(Rational {
+            numerator: 1,
+            denominator: 4,
+        }),
+        ..Default::default()
+    };
+    let ppu_b = ProtocolParamUpdate {
+        d: Some(Rational {
+            numerator: 1,
+            denominator: 2,
+        }),
+        ..Default::default()
+    };
+    for i in 0u8..3 {
+        state
+            .epochs
+            .pending_pp_updates
+            .entry(EpochNo(4))
+            .or_default()
+            .push((Hash32::from_bytes([i; 32]), ppu_a.clone()));
+    }
+    for i in 3u8..5 {
+        state
+            .epochs
+            .pending_pp_updates
+            .entry(EpochNo(4))
+            .or_default()
+            .push((Hash32::from_bytes([i; 32]), ppu_b.clone()));
+    }
+
+    assert_eq!(state.forecast_d_for_epoch(5), original_d);
+}
+
+/// Companion to the split-vote case above: when a quorum of genesis
+/// delegates DOES vote the byte-identical value, the forecast must return
+/// that value (not the current one).
+#[test]
+fn test_forecast_d_for_epoch_quorum_met_identical_value() {
+    let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+    state.update_quorum = 2;
+    state.epoch = EpochNo(4);
+    state.epochs.protocol_params.protocol_version_major = 6;
+
+    let target_d = Rational {
+        numerator: 1,
+        denominator: 4,
+    };
+    let ppu = ProtocolParamUpdate {
+        d: Some(target_d.clone()),
+        ..Default::default()
+    };
+    state
+        .epochs
+        .pending_pp_updates
+        .entry(EpochNo(4))
+        .or_default()
+        .push((Hash32::from_bytes([1u8; 32]), ppu.clone()));
+    state
+        .epochs
+        .pending_pp_updates
+        .entry(EpochNo(4))
+        .or_default()
+        .push((Hash32::from_bytes([2u8; 32]), ppu));
+
+    assert_eq!(state.forecast_d_for_epoch(5), target_d);
+}
+
+/// Same completeness caveat for `forecast_extra_entropy_for_epoch`: a split
+/// vote must forecast the current (sticky) value, not either proposal.
+#[test]
+fn test_forecast_extra_entropy_for_epoch_split_vote_returns_current() {
+    let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+    state.update_quorum = 5;
+    state.epoch = EpochNo(4);
+    let original = state.consensus.extra_entropy;
+
+    let ppu_a = ProtocolParamUpdate {
+        extra_entropy: Some(Hash32::from_bytes([0xAA; 32])),
+        ..Default::default()
+    };
+    let ppu_b = ProtocolParamUpdate {
+        extra_entropy: Some(Hash32::from_bytes([0xBB; 32])),
+        ..Default::default()
+    };
+    for i in 0u8..3 {
+        state
+            .epochs
+            .pending_pp_updates
+            .entry(EpochNo(4))
+            .or_default()
+            .push((Hash32::from_bytes([i; 32]), ppu_a.clone()));
+    }
+    for i in 3u8..5 {
+        state
+            .epochs
+            .pending_pp_updates
+            .entry(EpochNo(4))
+            .or_default()
+            .push((Hash32::from_bytes([i; 32]), ppu_b.clone()));
+    }
+
+    assert_eq!(state.forecast_extra_entropy_for_epoch(5), original);
+}
+
+/// Same completeness caveat for `forecast_max_block_body_size_for_epoch`: a
+/// quorum-met identical-value proposal must forecast that value.
+#[test]
+fn test_forecast_max_block_body_size_for_epoch_quorum_met() {
+    let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+    state.update_quorum = 2;
+    state.epoch = EpochNo(4);
+
+    let ppu = ProtocolParamUpdate {
+        max_block_body_size: Some(73_728),
+        ..Default::default()
+    };
+    state
+        .epochs
+        .pending_pp_updates
+        .entry(EpochNo(4))
+        .or_default()
+        .push((Hash32::from_bytes([1u8; 32]), ppu.clone()));
+    state
+        .epochs
+        .pending_pp_updates
+        .entry(EpochNo(4))
+        .or_default()
+        .push((Hash32::from_bytes([2u8; 32]), ppu));
+
+    assert_eq!(state.forecast_max_block_body_size_for_epoch(5), 73_728);
+}
+
 #[test]
 fn test_prev_action_as_expected_none_chain() {
     let governance = GovernanceState::default();

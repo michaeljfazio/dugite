@@ -529,88 +529,55 @@ impl LedgerState {
             "PPUP: checking for proposals"
         );
         if let Some(proposals) = self.epochs.pending_pp_updates.remove(&lookup_epoch) {
-            // Count distinct proposers (genesis delegate hashes)
-            let mut proposer_set: std::collections::HashSet<Hash32> =
-                std::collections::HashSet::with_capacity(proposals.len());
-            for (genesis_hash, _) in &proposals {
-                proposer_set.insert(*genesis_hash);
-            }
-            let distinct_proposers = proposer_set.len() as u64;
-
-            if distinct_proposers >= self.update_quorum {
-                // Merge all proposals: later proposals override earlier ones per field
-                let mut merged = dugite_primitives::transaction::ProtocolParamUpdate::default();
-                for (_, ppu) in &proposals {
-                    // Merge each field: if the proposal sets it, override
-                    macro_rules! merge_field {
-                        ($field:ident) => {
-                            if ppu.$field.is_some() {
-                                merged.$field = ppu.$field.clone();
-                            }
-                        };
+            // Haskell's `votedFuturePParams` (Shelley.Rules.Ppup) enacts a
+            // pre-Conway PPUP only when a quorum of genesis delegates voted
+            // for the byte-identical `PParamsUpdate` value; it never counts
+            // distinct proposers and field-merges their proposals together.
+            // Ties or a value short of quorum enact nothing. Issue #784.
+            let proposal_map = crate::validation::ppup::fold_pp_proposals(&proposals);
+            match crate::validation::ppup::voted_future_pparams(
+                &proposal_map,
+                self.update_quorum,
+                &self.epochs.protocol_params,
+            ) {
+                Some(winner) => {
+                    // Log protocol version change if applicable
+                    if winner.protocol_version_major.is_some()
+                        || winner.protocol_version_minor.is_some()
+                    {
+                        info!(
+                            "Protocol     version change {}.{} -> {}.{} (epoch {})",
+                            self.epochs.protocol_params.protocol_version_major,
+                            self.epochs.protocol_params.protocol_version_minor,
+                            winner
+                                .protocol_version_major
+                                .unwrap_or(self.epochs.protocol_params.protocol_version_major),
+                            winner
+                                .protocol_version_minor
+                                .unwrap_or(self.epochs.protocol_params.protocol_version_minor),
+                            new_epoch.0,
+                        );
                     }
-                    merge_field!(min_fee_a);
-                    merge_field!(min_fee_b);
-                    merge_field!(max_block_body_size);
-                    merge_field!(max_tx_size);
-                    merge_field!(max_block_header_size);
-                    merge_field!(key_deposit);
-                    merge_field!(pool_deposit);
-                    merge_field!(e_max);
-                    merge_field!(n_opt);
-                    merge_field!(a0);
-                    merge_field!(rho);
-                    merge_field!(tau);
-                    merge_field!(d);
-                    merge_field!(min_pool_cost);
-                    merge_field!(ada_per_utxo_byte);
-                    merge_field!(cost_models);
-                    merge_field!(execution_costs);
-                    merge_field!(max_tx_ex_units);
-                    merge_field!(max_block_ex_units);
-                    merge_field!(max_val_size);
-                    merge_field!(collateral_percentage);
-                    merge_field!(max_collateral_inputs);
-                    merge_field!(protocol_version_major);
-                    merge_field!(protocol_version_minor);
+                    if let Err(e) = self.apply_protocol_param_update(&winner) {
+                        warn!(
+                            epoch = new_epoch.0,
+                            error = %e,
+                            "Pre-Conway protocol parameter update rejected"
+                        );
+                    } else {
+                        debug!(
+                            epoch = new_epoch.0,
+                            "Pre-Conway protocol parameter update applied (voted quorum)"
+                        );
+                    }
                 }
-                // Log protocol version change if applicable
-                if merged.protocol_version_major.is_some()
-                    || merged.protocol_version_minor.is_some()
-                {
-                    info!(
-                        "Protocol     version change {}.{} -> {}.{} (epoch {})",
-                        self.epochs.protocol_params.protocol_version_major,
-                        self.epochs.protocol_params.protocol_version_minor,
-                        merged
-                            .protocol_version_major
-                            .unwrap_or(self.epochs.protocol_params.protocol_version_major),
-                        merged
-                            .protocol_version_minor
-                            .unwrap_or(self.epochs.protocol_params.protocol_version_minor),
-                        new_epoch.0,
-                    );
-                }
-                if let Err(e) = self.apply_protocol_param_update(&merged) {
-                    warn!(
-                        epoch = new_epoch.0,
-                        error = %e,
-                        "Pre-Conway protocol parameter update rejected"
-                    );
-                } else {
+                None => {
                     debug!(
                         epoch = new_epoch.0,
-                        proposers = distinct_proposers,
-                        "Pre-Conway protocol parameter update applied"
+                        quorum = self.update_quorum,
+                        "Pre-Conway protocol parameter update: no value reached quorum"
                     );
                 }
-            } else {
-                debug!(
-                    epoch = new_epoch.0,
-                    proposers = distinct_proposers,
-                    quorum = self.update_quorum,
-                    "Pre-Conway protocol parameter update: insufficient quorum"
-                );
             }
         }
         // Clean up current proposals targeting past epochs.
