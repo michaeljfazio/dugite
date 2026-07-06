@@ -880,8 +880,23 @@ pub fn ledger_ordered_withdrawals(
 pub fn withdrawals_to_plutus(
     wdrl: &BTreeMap<Vec<u8>, dugite_primitives::value::Lovelace>,
 ) -> Result<Vec<(StakingCredential, BigInt)>, PhaseTwoError> {
-    let mut pairs: Vec<(PrimCred, dugite_primitives::value::Lovelace)> =
-        Vec::with_capacity(wdrl.len());
+    // Fold into a last-wins map keyed by the DERIVED `StakingCredential`
+    // (#844): two DISTINCT raw reward-account blobs differing only in
+    // their network-id bit decode to the SAME credential (`stake` drops
+    // the network component). Haskell's translation targets a genuine
+    // `Map StakingCredential Integer` — built by iterating the ledger's
+    // `Map RewardAccount Coin` in ascending key order and folding into a
+    // fresh map — so a later entry (larger raw reward-account bytes)
+    // overwrites an earlier one for the same credential, rather than the
+    // two coexisting as separate `txInfoWdrl` entries. `BTreeMap::insert`
+    // during a `wdrl` (already ascending-order) walk gives exactly this
+    // last-wins semantics, and its `PrimCred`-keyed iteration order below
+    // is ALSO already the correct Plutus `Credential` Ord (Key < Script,
+    // then 28-byte hash — equals the DERIVED `PrimCred` Ord, NOT
+    // `cmp_ledger`), so no separate sort is needed. Unreachable on a
+    // phase-1-valid tx (`WrongNetworkWithdrawal` already rejects a
+    // wrong-network reward account), but `wdrl` is adversarial input.
+    let mut by_cred: BTreeMap<PrimCred, dugite_primitives::value::Lovelace> = BTreeMap::new();
     for (reward_account, amount) in wdrl {
         let addr = PrimAddress::from_bytes(reward_account).map_err(|e| {
             PhaseTwoError::Internal(format!("withdrawals_to_plutus: reward_account: {e}"))
@@ -894,13 +909,10 @@ pub fn withdrawals_to_plutus(
                 )));
             }
         };
-        pairs.push((stake, *amount));
+        by_cred.insert(stake, *amount);
     }
-    // Plutus `Credential` Ord (Key < Script, then 28-byte hash) — equals the
-    // DERIVED `PrimCred` Ord, NOT `cmp_ledger`.
-    pairs.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut out = Vec::with_capacity(pairs.len());
-    for (stake, amount) in pairs {
+    let mut out = Vec::with_capacity(by_cred.len());
+    for (stake, amount) in by_cred {
         let cred = credential_to_plutus(&stake);
         out.push((StakingCredential::Hash(cred), BigInt::from(amount.0)));
     }
@@ -1299,6 +1311,46 @@ mod tests {
             v1v2_first_is_key && v3_first_is_script,
             "V1/V2 (Key-first) and V3 (Script-first) withdrawal orders must be opposite"
         );
+    }
+
+    /// #844: two DISTINCT raw reward-account blobs that differ only in
+    /// network id decode to the SAME `StakingCredential` (the derived
+    /// `stake` drops the network component). `withdrawals_to_plutus` must
+    /// fold them into ONE `txInfoWdrl` entry (last-wins over the raw
+    /// ascending-byte-key order), matching a genuine
+    /// `Map StakingCredential Integer`, not emit two separate entries for
+    /// what Haskell represents as a single map key.
+    #[test]
+    fn withdrawals_to_plutus_dedups_same_credential_different_network() {
+        let hash = [0x03u8; 28];
+        // mainnet=false sorts before mainnet=true at the same header
+        // high-nibble (network id is the low nibble), so the raw blob
+        // ordering is: testnet_blob < mainnet_blob.
+        let testnet_blob = encode_reward_addr_blob(false, false, hash);
+        let mainnet_blob = encode_reward_addr_blob(true, false, hash);
+        assert!(
+            testnet_blob < mainnet_blob,
+            "test setup: testnet blob must sort before mainnet blob"
+        );
+
+        let mut wdrl: BTreeMap<Vec<u8>, Lovelace> = BTreeMap::new();
+        wdrl.insert(testnet_blob, Lovelace(10));
+        wdrl.insert(mainnet_blob, Lovelace(20));
+
+        let pl = withdrawals_to_plutus(&wdrl).unwrap();
+        assert_eq!(
+            pl.len(),
+            1,
+            "same-credential entries (differing only by network) must fold into one, got {pl:?}"
+        );
+        assert!(matches!(
+            pl[0].0,
+            StakingCredential::Hash(PlCredential::PubKey(h)) if h == hash
+        ));
+        // Last-wins in ascending raw-key order: mainnet_blob (the larger
+        // key) is inserted last, so its amount (20) must win over the
+        // testnet entry's (10).
+        assert_eq!(pl[0].1, BigInt::from(20));
     }
 
     /// The `Rewarding` redeemer-pointer index resolves over the SCRIPT-first

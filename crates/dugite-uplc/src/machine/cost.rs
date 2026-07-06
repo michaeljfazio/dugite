@@ -220,15 +220,22 @@ impl BudgetTracker {
             counting: false,
             counting_spent: ExBudget { cpu: 0, mem: 0 },
         };
-        // Charge startup so `consumed()` always includes it. We
-        // tolerate a starting budget too small to cover the startup
-        // cost (remaining goes negative) — the next flush surfaces
-        // it as a normal exhaustion error.
+        // Charge startup so `consumed()` always includes it. We tolerate a
+        // starting budget too small to cover the startup cost (remaining
+        // goes negative) — the next flush surfaces it as a normal
+        // exhaustion error. This MUST be an unconditional subtract
+        // (#844): `try_subtract` refuses to mutate `remaining` at all
+        // when it would go negative, which previously meant a too-small
+        // starting budget silently dropped the startup charge entirely
+        // (no exhaustion ever detected, and `consumed()` under-reported
+        // by the startup cost) rather than actually going negative as
+        // this comment always claimed. Mirrors Haskell's unconditional
+        // `SatInt` subtraction for `cekStartupCost`.
         if t.counting {
             t.counting_spent.cpu = t.counting_spent.cpu.saturating_add(t.costs.startup.cpu);
             t.counting_spent.mem = t.counting_spent.mem.saturating_add(t.costs.startup.mem);
         } else {
-            let _ = t.remaining.try_subtract(t.costs.startup);
+            t.remaining.subtract_saturating(t.costs.startup);
         }
         t
     }
@@ -366,6 +373,39 @@ mod tests {
         let consumed = t.consumed();
         assert_eq!(consumed.cpu, MachineCosts::DEFAULT.startup.cpu);
         assert_eq!(consumed.mem, MachineCosts::DEFAULT.startup.mem);
+    }
+
+    /// #844: a declared initial budget too small to cover the startup
+    /// cost must actually go negative (unconditional subtract) so the
+    /// very next charge detects exhaustion, rather than the startup
+    /// charge being silently dropped (the old `try_subtract`-based
+    /// no-mutate-on-failure behavior, which left `remaining` untouched
+    /// and let an undersized budget sail through undetected).
+    #[test]
+    fn new_with_undersized_budget_goes_negative_and_next_charge_fails() {
+        let mut costs = MachineCosts::DEFAULT;
+        costs.startup = ExBudget {
+            cpu: 1_000_000,
+            mem: 1_000_000,
+        };
+        let mut t = BudgetTracker::with_costs(
+            ExBudget {
+                cpu: 100, // far below the startup cost.
+                mem: 100,
+            },
+            costs,
+        );
+        assert!(
+            t.remaining.cpu < 0 && t.remaining.mem < 0,
+            "remaining must go negative after an unconditional startup subtract, got {:?}",
+            t.remaining
+        );
+        // The next charge (of any size, including zero) must now fail —
+        // the shortfall must not be silently absorbed.
+        assert!(matches!(
+            t.charge(ExBudget { cpu: 0, mem: 0 }),
+            Err(UplcError::BudgetExhausted { .. })
+        ));
     }
 
     #[test]

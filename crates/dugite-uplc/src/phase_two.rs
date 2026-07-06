@@ -311,8 +311,13 @@ pub fn eval_phase_two_raw<O: RedeemerObserver>(
         // adversarial). Cf. IntersectMBO/plutus
         // `PlutusLedgerApi.Common.Eval.evaluateScriptRestricting` and
         // cardano-ledger `Cardano.Ledger.Plutus.Language.evaluatePlutusRunnable`.
-        let declared_mem = resolved_r.declared_ex_units.0 as i64;
-        let declared_cpu = resolved_r.declared_ex_units.1 as i64;
+        // `i64::try_from(...).unwrap_or(i64::MAX)` (#844), not `as i64`: a
+        // declared value >= 2^63 must saturate to `i64::MAX`, matching the
+        // `redeemer_budget` conversion just below, rather than silently
+        // wrapping to a negative number that could misclassify the
+        // over-budget check further down.
+        let declared_mem = i64::try_from(resolved_r.declared_ex_units.0).unwrap_or(i64::MAX);
+        let declared_cpu = i64::try_from(resolved_r.declared_ex_units.1).unwrap_or(i64::MAX);
         let redeemer_budget = crate::machine::ExBudget {
             cpu: i64::try_from(resolved_r.declared_ex_units.1)
                 .unwrap_or(i64::MAX)
