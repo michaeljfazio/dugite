@@ -254,7 +254,10 @@ pub(super) fn collect_available_script_hashes(
         .as_deref()
         .and_then(dugite_serialization::witness_native_script_original_bytes);
     for (i, script) in tx.witness_set.native_scripts.iter().enumerate() {
-        let original = witness_native_raws.as_ref().and_then(|v| v.get(i)).map(Vec::as_slice);
+        let original = witness_native_raws
+            .as_ref()
+            .and_then(|v| v.get(i))
+            .map(Vec::as_slice);
         hashes.insert(native_script_hash(script, original));
     }
 
@@ -298,7 +301,10 @@ pub(super) fn collect_available_script_hashes(
                     .raw_cbor
                     .as_deref()
                     .and_then(dugite_serialization::reference_native_script_original_bytes);
-                hashes.insert(compute_script_ref_hash(script_ref, native_original.as_deref()));
+                hashes.insert(compute_script_ref_hash(
+                    script_ref,
+                    native_original.as_deref(),
+                ));
             }
         }
     }
@@ -928,7 +934,10 @@ pub(super) fn check_extraneous_script_witnesses(
     let mut witness_hashes: HashSet<Hash28> = HashSet::new();
     let witness_native_raws = witness_native_original_bytes(tx);
     for (i, ns) in tx.witness_set.native_scripts.iter().enumerate() {
-        let original = witness_native_raws.as_ref().and_then(|v| v.get(i)).map(Vec::as_slice);
+        let original = witness_native_raws
+            .as_ref()
+            .and_then(|v| v.get(i))
+            .map(Vec::as_slice);
         witness_hashes.insert(native_script_hash(ns, original));
     }
     for s in &tx.witness_set.plutus_v1_scripts {
@@ -1033,8 +1042,10 @@ pub(super) fn check_extraneous_script_witnesses(
         if let Some(utxo) = utxo_set.lookup(input) {
             if let Some(script_ref) = &utxo.script_ref {
                 let native_original = reference_native_original_bytes(&utxo);
-                ref_script_hashes
-                    .insert(compute_script_ref_hash(script_ref, native_original.as_deref()));
+                ref_script_hashes.insert(compute_script_ref_hash(
+                    script_ref,
+                    native_original.as_deref(),
+                ));
             }
         }
     }

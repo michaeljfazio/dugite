@@ -1451,7 +1451,8 @@ mod tests {
         );
         let pubkey_hash = Hash32::from_bytes([42u8; 32]);
         let native_script = NativeScript::ScriptPubkey(pubkey_hash);
-        let script_hash = compute_script_ref_hash(&ScriptRef::NativeScript(native_script.clone()), None);
+        let script_hash =
+            compute_script_ref_hash(&ScriptRef::NativeScript(native_script.clone()), None);
         let ref_input = TransactionInput {
             transaction_id: Hash32::from_bytes([3u8; 32]),
             index: 0,
@@ -1502,7 +1503,8 @@ mod tests {
         // Scenario: the spending input's UTxO itself carries a script_ref whose hash
         // matches the minting policy.  No reference_inputs are needed.
         let native_script = NativeScript::ScriptAll(vec![]);
-        let script_hash = compute_script_ref_hash(&ScriptRef::NativeScript(native_script.clone()), None);
+        let script_hash =
+            compute_script_ref_hash(&ScriptRef::NativeScript(native_script.clone()), None);
 
         let mut utxo_set = UtxoSet::new();
         // Spending input carries the script_ref
@@ -1615,7 +1617,8 @@ mod tests {
         use dugite_primitives::credentials::Credential;
 
         let native_script = NativeScript::ScriptAll(vec![]);
-        let script_hash = compute_script_ref_hash(&ScriptRef::NativeScript(native_script.clone()), None);
+        let script_hash =
+            compute_script_ref_hash(&ScriptRef::NativeScript(native_script.clone()), None);
 
         let mut utxo_set = UtxoSet::new();
 
@@ -3959,7 +3962,8 @@ mod tests {
         // The minting policy native script.
         let signer_hash = Hash32::from_bytes([0x7Fu8; 32]);
         let native_script = NativeScript::ScriptPubkey(signer_hash);
-        let script_hash = compute_script_ref_hash(&ScriptRef::NativeScript(native_script.clone()), None);
+        let script_hash =
+            compute_script_ref_hash(&ScriptRef::NativeScript(native_script.clone()), None);
 
         // Spending input — the UTxO that the minting transaction actually spends.
         let spending_input = TransactionInput {

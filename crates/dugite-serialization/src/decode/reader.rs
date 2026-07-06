@@ -1267,7 +1267,7 @@ mod tests {
             ((9u64, 18u64), (1u64, 2u64)),
             ((2, 1000), (1, 500)),
             ((0, 5), (0, 1)), // 0 % d = 0/1
-            ((7, 3), (7, 3)),  // already reduced / improper — unchanged
+            ((7, 3), (7, 3)), // already reduced / improper — unchanged
             ((100, 100), (1, 1)),
         ];
         for ((n, d), (en, ed)) in cases {

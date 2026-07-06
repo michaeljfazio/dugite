@@ -3625,7 +3625,12 @@ fn update_enacted_root_local(
 /// `succVersion curMajor = curMajor + 1`. A new version follows iff it is exactly a
 /// major bump (`curMajor+1`, minor reset to 0) or exactly the next minor
 /// (`curMinor+1`, same major). Any larger gap is illegal.
-pub(crate) fn pv_can_follow(cur_major: u64, cur_minor: u64, new_major: u64, new_minor: u64) -> bool {
+pub(crate) fn pv_can_follow(
+    cur_major: u64,
+    cur_minor: u64,
+    new_major: u64,
+    new_minor: u64,
+) -> bool {
     (new_major == cur_major + 1 && new_minor == 0)
         || (new_major == cur_major && new_minor == cur_minor + 1)
 }

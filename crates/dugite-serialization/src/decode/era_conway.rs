@@ -3200,7 +3200,10 @@ mod tests {
 
         let spans = witness_native_script_original_bytes(&ws).expect("extract native spans");
         assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0], ns, "must capture the exact original (indefinite) bytes");
+        assert_eq!(
+            spans[0], ns,
+            "must capture the exact original (indefinite) bytes"
+        );
 
         // The decoded script re-encodes to a DIFFERENT (canonical, definite) form.
         let decoded = read_native_script(&mut Reader::new(&ns)).unwrap();
@@ -3237,7 +3240,10 @@ mod tests {
 
         let recovered =
             reference_native_script_original_bytes(&out).expect("recover inner native bytes");
-        assert_eq!(recovered, ns, "must recover the exact inner native-script bytes");
+        assert_eq!(
+            recovered, ns,
+            "must recover the exact inner native-script bytes"
+        );
     }
 
     /// #730: Haskell `decodeMultiAsset` at decoder version >= 9
