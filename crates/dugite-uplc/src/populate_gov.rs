@@ -64,7 +64,7 @@ use crate::script_context::{
 use crate::tx_info_populate::credential_to_plutus;
 use dugite_primitives::credentials::Credential as PrimCred;
 use dugite_primitives::transaction::{
-    Certificate as PrimCert, CostModels, GovAction as PrimGovAction,
+    Certificate as PrimCert, CostModels, DRep as PrimDRep, GovAction as PrimGovAction,
     GovActionId as PrimGovActionId, ProposalProcedure as PrimProposal, ProtocolParamUpdate,
     Rational, Vote as PrimVote, Voter as PrimVoter, VotingProcedure as PrimVotingProcedure,
 };
@@ -326,12 +326,15 @@ pub fn gov_action_to_data(action: &PrimGovAction) -> Result<Data, PhaseTwoError>
                     )
                 })
                 .collect();
-            // Rational: makeIsDataSchemaIndexed [('Rational, 0)] → Constr 0 [I num, I den]
+            // Rational: makeIsDataSchemaIndexed [('Rational, 0)] → Constr 0 [I num, I den].
+            // #837 item 2: reduced to lowest terms — see `reduce_rational`.
+            let (threshold_num, threshold_den) =
+                reduce_rational(threshold.numerator, threshold.denominator);
             let rational_data = Data::Constr(
                 0,
                 vec![
-                    Data::I(BigInt::from(threshold.numerator)),
-                    Data::I(BigInt::from(threshold.denominator)),
+                    Data::I(BigInt::from(threshold_num)),
+                    Data::I(BigInt::from(threshold_den)),
                 ],
             );
             Data::Constr(
@@ -366,6 +369,43 @@ pub fn gov_action_to_data(action: &PrimGovAction) -> Result<Data, PhaseTwoError>
         PrimGovAction::InfoAction => Data::Constr(6, vec![]),
     };
     Ok(d)
+}
+
+/// Reduce a raw wire `(numerator, denominator)` pair to lowest terms
+/// (#837 item 2).
+///
+/// Haskell's on-chain `Rational`/`BoundedRatio` (`UnitInterval`,
+/// `NonNegativeInterval`, and the plain governance-threshold `Rational`)
+/// is always constructed via GHC's `Ratio` smart constructor (`%`), which
+/// UNCONDITIONALLY reduces to lowest terms
+/// (`libs/cardano-ledger-binary/.../DecCBOR.hs::decodeIntegralRational`
+/// does `toInteger n % toInteger d`, and `%`'s definition divides both
+/// sides by `gcd n d`). It is structurally impossible to observe a
+/// non-reduced `Ratio` value anywhere downstream in cardano-ledger,
+/// including at the `ToPlutusData`/ScriptContext boundary. dugite's wire
+/// decoder (`dugite-serialization::read_rational`) preserves the raw
+/// on-wire pair without reducing it, so a non-canonically-encoded
+/// on-chain rational (e.g. `9/18`) would otherwise emit a byte-different
+/// `Data` than Haskell's `1/2`. Normalize here, at the ScriptContext
+/// construction boundary, to match.
+///
+/// `gcd(0, 0) == 0` is the only degenerate input (both zero); returned
+/// unchanged rather than dividing by zero — this should never occur for
+/// an already phase-1-validated `Rational` (a zero denominator is
+/// rejected at CBOR decode time in Haskell and in dugite).
+fn reduce_rational(numerator: u64, denominator: u64) -> (u64, u64) {
+    fn gcd(a: u64, b: u64) -> u64 {
+        if b == 0 {
+            a
+        } else {
+            gcd(b, a % b)
+        }
+    }
+    let g = gcd(numerator, denominator);
+    match (numerator.checked_div(g), denominator.checked_div(g)) {
+        (Some(n), Some(d)) => (n, d),
+        _ => (numerator, denominator),
+    }
 }
 
 /// Conway `CostModels` → Plutus `Data::Map [(I lang, List [I cost..])]`,
@@ -432,11 +472,12 @@ fn ppu_to_changed_parameters_data(ppu: &ProtocolParamUpdate) -> Data {
     }
     // UnitInterval / NonNegativeInterval → List [I num, I den] (hand-written
     // `ToPlutusData Rational` in plutus-ledger-api — List, not Constr).
+    //
+    // #837 item 2: reduced to lowest terms before emission — see
+    // `reduce_rational` doc comment for why this must match Haskell exactly.
     fn rat(r: &Rational) -> Data {
-        Data::List(vec![
-            Data::I(BigInt::from(r.numerator)),
-            Data::I(BigInt::from(r.denominator)),
-        ])
+        let (num, den) = reduce_rational(r.numerator, r.denominator);
+        Data::List(vec![Data::I(BigInt::from(num)), Data::I(BigInt::from(den))])
     }
     let mut e: Vec<(Data, Data)> = Vec::new();
     // 0–11: classic Shelley parameters.
@@ -721,49 +762,44 @@ pub fn certificate_to_plutus(c: &PrimCert) -> Result<TxCert, PhaseTwoError> {
         PrimCert::CommitteeColdResign {
             cold_credential, ..
         } => Data::Constr(10, vec![cred_data(cold_credential)]),
-        // Combined certs: emit as TxCertRegDeleg / TxCertDelegStaking shapes.
-        PrimCert::VoteDelegation {
-            credential,
-            drep: _,
-        } => Data::Constr(
-            // For TxCertDelegStaking we'd need to encode the Delegatee
-            // properly (DelegStake / DelegVote / DelegStakeVote). The
-            // simple-Plutus-script case doesn't observe the delegatee
-            // detail, so encode an opaque marker — full Delegatee
-            // encoding lands later as part of CIP-1694 followup.
-            2,
-            vec![cred_data(credential), Data::Constr(99, vec![])],
-        ),
+        // Combined certs: emit as TxCertRegDeleg / TxCertDelegStaking shapes,
+        // with the DRep threaded through the `Delegatee` payload (#815).
+        PrimCert::VoteDelegation { credential, drep } => {
+            Data::Constr(2, vec![cred_data(credential), delegatee_vote(drep)])
+        }
         PrimCert::StakeVoteDelegation {
             credential,
             pool_hash,
-            drep: _,
+            drep,
         } => Data::Constr(
             2,
-            vec![cred_data(credential), delegatee_to_pool(&pool_hash.0)],
+            vec![
+                cred_data(credential),
+                delegatee_stake_vote(&pool_hash.0, drep),
+            ],
         ),
         PrimCert::RegStakeVoteDeleg {
             credential,
             pool_hash,
             deposit,
-            drep: _,
+            drep,
         } => Data::Constr(
             3,
             vec![
                 cred_data(credential),
-                delegatee_to_pool(&pool_hash.0),
+                delegatee_stake_vote(&pool_hash.0, drep),
                 Data::I(BigInt::from(deposit.0)),
             ],
         ),
         PrimCert::VoteRegDeleg {
             credential,
             deposit,
-            drep: _,
+            drep,
         } => Data::Constr(
             3,
             vec![
                 cred_data(credential),
-                Data::Constr(99, vec![]),
+                delegatee_vote(drep),
                 Data::I(BigInt::from(deposit.0)),
             ],
         ),
@@ -900,6 +936,53 @@ fn option_int(v: Option<u64>) -> Data {
 /// [B pool_hash]`. Used by the stake-delegation cert variants.
 fn delegatee_to_pool(pool_hash: &[u8; 28]) -> Data {
     Data::Constr(0, vec![Data::B(pool_hash.to_vec())])
+}
+
+/// Encode a [`PrimDRep`] as the Plutus V3 `DRep` Data shape (#815).
+///
+/// Haskell reference: `PlutusLedgerApi.V3.Contexts`:
+/// ```text
+/// data DRep
+///   = DRep DRepCredential      -- Constr 0 [Credential]
+///   | DRepAlwaysAbstain        -- Constr 1 []
+///   | DRepAlwaysNoConfidence   -- Constr 2 []
+/// ```
+/// `DRepCredential` is `newtype ... deriving newtype ToData` over the
+/// bare V2 `Credential` (`Constr 0 [B]` pubkey / `Constr 1 [B]` script) —
+/// same shape as [`cred_data`], just wrapped one level deeper in the
+/// `DRep` constructor.
+///
+/// `PrimDRep::KeyHash` stores the 28-byte credential hash zero-padded to
+/// 32 bytes (`Hash28::to_hash32_padded` pads bytes `[28..32]`) — strip the
+/// trailing 4 pad bytes back to the real 28-byte hash before encoding, or
+/// the emitted `Data` would carry 4 extra zero bytes cardano-ledger never
+/// produces.
+fn drep_to_data(drep: &PrimDRep) -> Data {
+    match drep {
+        PrimDRep::KeyHash(h32) => Data::Constr(
+            0,
+            vec![Data::Constr(
+                0,
+                vec![Data::B(h32.as_bytes()[..28].to_vec())],
+            )],
+        ),
+        PrimDRep::ScriptHash(h28) => {
+            Data::Constr(0, vec![Data::Constr(1, vec![Data::B(h28.0.to_vec())])])
+        }
+        PrimDRep::Abstain => Data::Constr(1, vec![]),
+        PrimDRep::NoConfidence => Data::Constr(2, vec![]),
+    }
+}
+
+/// Encode a Plutus `Delegatee::DelegVote(DRep)` — `Constr 1 [drep]`.
+fn delegatee_vote(drep: &PrimDRep) -> Data {
+    Data::Constr(1, vec![drep_to_data(drep)])
+}
+
+/// Encode a Plutus `Delegatee::DelegStakeVote(PubKeyHash, DRep)` —
+/// `Constr 2 [B pool_hash, drep]`.
+fn delegatee_stake_vote(pool_hash: &[u8; 28], drep: &PrimDRep) -> Data {
+    Data::Constr(2, vec![Data::B(pool_hash.to_vec()), drep_to_data(drep)])
 }
 
 /// Translate the tx body's `certificates: Vec<Certificate>` into
@@ -1331,6 +1414,226 @@ mod tests {
         };
         let err = certificates_to_plutus(&[ok, bad]).unwrap_err();
         assert!(matches!(err, PhaseTwoError::Internal(_)));
+    }
+
+    // Vote-delegation Delegatee encoding (#815) ──────────────────────────
+    //
+    // Haskell reference: `PlutusLedgerApi.V3.Contexts`:
+    //   data Delegatee = DelegStake PubKeyHash | DelegVote DRep
+    //                  | DelegStakeVote PubKeyHash DRep
+    //   data DRep = DRep DRepCredential | DRepAlwaysAbstain | DRepAlwaysNoConfidence
+    // `DRepCredential` newtype-derives ToData from the bare V2 `Credential`
+    // (`Constr 0 [B]` pubkey / `Constr 1 [B]` script), so `DRep (KeyHash h)`
+    // encodes as `Constr 0 [Constr 0 [B h]]`.
+
+    fn drep_key(b: u8) -> dugite_primitives::transaction::DRep {
+        dugite_primitives::transaction::DRep::KeyHash(h28(b).to_hash32_padded())
+    }
+
+    fn drep_script(b: u8) -> dugite_primitives::transaction::DRep {
+        dugite_primitives::transaction::DRep::ScriptHash(h28(b))
+    }
+
+    #[test]
+    fn drep_to_data_key_hash_strips_padding() {
+        // The 4 trailing zero-pad bytes added by `to_hash32_padded` must NOT
+        // leak into the emitted `B` — only the real 28-byte hash.
+        let d = drep_to_data(&drep_key(0x11));
+        assert_eq!(
+            d,
+            Data::Constr(0, vec![Data::Constr(0, vec![Data::B(vec![0x11; 28])])])
+        );
+    }
+
+    #[test]
+    fn drep_to_data_script_hash() {
+        let d = drep_to_data(&drep_script(0x22));
+        assert_eq!(
+            d,
+            Data::Constr(0, vec![Data::Constr(1, vec![Data::B(vec![0x22; 28])])])
+        );
+    }
+
+    #[test]
+    fn drep_to_data_abstain_and_no_confidence() {
+        assert_eq!(
+            drep_to_data(&dugite_primitives::transaction::DRep::Abstain),
+            Data::Constr(1, vec![])
+        );
+        assert_eq!(
+            drep_to_data(&dugite_primitives::transaction::DRep::NoConfidence),
+            Data::Constr(2, vec![])
+        );
+    }
+
+    #[test]
+    fn cert_vote_delegation_encodes_delegvote_with_key_cred_drep() {
+        // TxCertDelegStaking cred (DelegVote drep) = Constr 2 [cred, Constr 1 [drep]]
+        let c = PrimCert::VoteDelegation {
+            credential: key_cred(1),
+            drep: drep_key(0x33),
+        };
+        let TxCert(d) = certificate_to_plutus(&c).unwrap();
+        assert_eq!(
+            d,
+            Data::Constr(
+                2,
+                vec![
+                    cred_data(&key_cred(1)),
+                    Data::Constr(
+                        1,
+                        vec![Data::Constr(
+                            0,
+                            vec![Data::Constr(0, vec![Data::B(vec![0x33; 28])])]
+                        )]
+                    ),
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn cert_vote_delegation_encodes_delegvote_with_script_cred_drep() {
+        let c = PrimCert::VoteDelegation {
+            credential: script_cred(1),
+            drep: drep_script(0x44),
+        };
+        let TxCert(d) = certificate_to_plutus(&c).unwrap();
+        assert_eq!(
+            d,
+            Data::Constr(
+                2,
+                vec![
+                    cred_data(&script_cred(1)),
+                    Data::Constr(
+                        1,
+                        vec![Data::Constr(
+                            0,
+                            vec![Data::Constr(1, vec![Data::B(vec![0x44; 28])])]
+                        )]
+                    ),
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn cert_vote_delegation_encodes_delegvote_with_abstain() {
+        let c = PrimCert::VoteDelegation {
+            credential: key_cred(1),
+            drep: dugite_primitives::transaction::DRep::Abstain,
+        };
+        let TxCert(d) = certificate_to_plutus(&c).unwrap();
+        assert_eq!(
+            d,
+            Data::Constr(
+                2,
+                vec![
+                    cred_data(&key_cred(1)),
+                    Data::Constr(1, vec![Data::Constr(1, vec![])]),
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn cert_vote_delegation_encodes_delegvote_with_no_confidence() {
+        let c = PrimCert::VoteDelegation {
+            credential: key_cred(1),
+            drep: dugite_primitives::transaction::DRep::NoConfidence,
+        };
+        let TxCert(d) = certificate_to_plutus(&c).unwrap();
+        assert_eq!(
+            d,
+            Data::Constr(
+                2,
+                vec![
+                    cred_data(&key_cred(1)),
+                    Data::Constr(1, vec![Data::Constr(2, vec![])]),
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn cert_stake_vote_delegation_encodes_delegstakevote() {
+        // TxCertDelegStaking cred (DelegStakeVote pool drep) =
+        //   Constr 2 [cred, Constr 2 [B pool, drep]]
+        let c = PrimCert::StakeVoteDelegation {
+            credential: key_cred(1),
+            pool_hash: h28(0x55),
+            drep: drep_key(0x66),
+        };
+        let TxCert(d) = certificate_to_plutus(&c).unwrap();
+        assert_eq!(
+            d,
+            Data::Constr(
+                2,
+                vec![
+                    cred_data(&key_cred(1)),
+                    Data::Constr(
+                        2,
+                        vec![
+                            Data::B(vec![0x55; 28]),
+                            Data::Constr(0, vec![Data::Constr(0, vec![Data::B(vec![0x66; 28])])]),
+                        ]
+                    ),
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn cert_reg_stake_vote_deleg_encodes_delegstakevote_with_deposit() {
+        // TxCertRegDeleg cred (DelegStakeVote pool drep) deposit =
+        //   Constr 3 [cred, Constr 2 [B pool, drep], I deposit]
+        let c = PrimCert::RegStakeVoteDeleg {
+            credential: script_cred(1),
+            pool_hash: h28(0x77),
+            drep: drep_script(0x88),
+            deposit: Lovelace(2_000_000),
+        };
+        let TxCert(d) = certificate_to_plutus(&c).unwrap();
+        assert_eq!(
+            d,
+            Data::Constr(
+                3,
+                vec![
+                    cred_data(&script_cred(1)),
+                    Data::Constr(
+                        2,
+                        vec![
+                            Data::B(vec![0x77; 28]),
+                            Data::Constr(0, vec![Data::Constr(1, vec![Data::B(vec![0x88; 28])])]),
+                        ]
+                    ),
+                    Data::I(BigInt::from(2_000_000)),
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn cert_vote_reg_deleg_encodes_delegvote_with_deposit() {
+        // TxCertRegDeleg cred (DelegVote drep) deposit =
+        //   Constr 3 [cred, Constr 1 [drep], I deposit]
+        let c = PrimCert::VoteRegDeleg {
+            credential: key_cred(1),
+            drep: dugite_primitives::transaction::DRep::Abstain,
+            deposit: Lovelace(2_000_000),
+        };
+        let TxCert(d) = certificate_to_plutus(&c).unwrap();
+        assert_eq!(
+            d,
+            Data::Constr(
+                3,
+                vec![
+                    cred_data(&key_cred(1)),
+                    Data::Constr(1, vec![Data::Constr(1, vec![])]),
+                    Data::I(BigInt::from(2_000_000)),
+                ]
+            )
+        );
     }
 
     // GovernanceAction encoding ─────────────────────────────────────────
