@@ -87,6 +87,17 @@ pub fn eval_resolved_redeemer(
     // bytes wrapper) or unwrapped flat depending on which decoder
     // succeeds first.
     let program = decode_script_bytes(&r.script_bytes)?;
+    // Availability / version validation (#821) runs unconditionally here,
+    // regardless of whether `program` was a cache hit — see the module-level
+    // note on `crate::flat::term::validate_program_availability` for why
+    // this cannot be folded into `SCRIPT_DECODE_CACHE` (byte-keyed decode is
+    // (language, pv)-independent; this validation is not).
+    crate::flat::term::validate_program_availability(
+        &program.term,
+        program.version,
+        r.language,
+        major_pv,
+    )?;
     let version = program.version;
     let term = program.term;
 
