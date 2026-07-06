@@ -82,7 +82,19 @@ const DATA_CHUNK_LIMIT: usize = 64;
 #[derive(Debug)]
 pub enum Data {
     /// `Constr` — tagged sum: `Constr tag args`.
-    Constr(u64, Vec<Data>),
+    ///
+    /// The tag is an arbitrary-precision signed `Integer`, matching
+    /// Haskell's `Data = Constr Integer [Data] | ...` — NOT a `u64`. A
+    /// script can transiently construct a `Constr` with a negative or
+    /// `> u64::MAX` tag via the `constrData` builtin at protocol
+    /// versions before the van Rossem (PV11) `Word64`-unlifting gate
+    /// (see `builtin::denotations::ConstrData` and issue #859/#828.5).
+    /// The on-chain CBOR/flat wire encoding of a `Constr` tag is always
+    /// a `Word64` on *decode* (a wide tag can only ever exist
+    /// transiently inside a running script, never as a deserialised
+    /// datum/redeemer/script literal) — see `encode_constr`/
+    /// `decode_tagged` below.
+    Constr(BigInt, Vec<Data>),
     /// `Map` — list of key-value pairs. Insertion order preserved;
     /// duplicates permitted.
     Map(Vec<(Data, Data)>),
@@ -156,13 +168,18 @@ impl Eq for Data {}
 /// `Vec<(Data, Data)>`), so `#[derive(Clone)]` recurses one native stack
 /// frame per nesting level — the identical latent stack-overflow class
 /// that `PartialEq`, `Hash`, and `Drop` were hand-written to avoid
-/// (#832), and it was the one impl left derived. A deep clone IS
-/// reachable on the CEK hot path: a `Var` lookup (`machine::step`) clones
-/// the bound `Value`, and a `Value` wrapping a `Constant::Data(d)` whose
-/// nesting depth an adversary drove to ~10^5–10^6 (repeated
-/// `constrData`/`listData`/`mapData`, each a separately-charged builtin)
-/// would overflow the phase-2 evaluation stack (unguarded, a 2 MiB rayon
-/// worker) = process abort = remote DoS.
+/// (#832), and it was the one impl left derived. A deep clone is still
+/// reachable on the CEK hot path even after `Constant::Data` became
+/// `Rc`-shared (#838 Fix 2): a `Var` lookup (`machine::step`) now clones
+/// only the `Rc` pointer for the *common* case, but a builtin that
+/// destructures a *shared* `Data` (`Rc::strong_count > 1` — e.g.
+/// `unConstrData` on a ScriptContext still referenced elsewhere in the
+/// env) falls back to exactly this deep clone
+/// (`builtin::denotations::data_from_rc`). A nesting depth an adversary
+/// drove to ~10^5–10^6 (repeated `constrData`/`listData`/`mapData`, each
+/// a separately-charged builtin) would overflow the phase-2 evaluation
+/// stack (unguarded, a 2 MiB rayon worker) = process abort = remote DoS
+/// on that fallback path just as much as on the old always-clone path.
 ///
 /// This produces the exact same value as the derived clone; only the
 /// stack behavior changes. The clone is assembled bottom-up: a work-stack
@@ -176,7 +193,7 @@ impl Clone for Data {
     fn clone(&self) -> Self {
         enum Task<'a> {
             Descend(&'a Data),
-            BuildConstr(u64, usize),
+            BuildConstr(BigInt, usize),
             BuildList(usize),
             BuildMap(usize),
         }
@@ -186,7 +203,7 @@ impl Clone for Data {
             match task {
                 Task::Descend(d) => match d {
                     Data::Constr(tag, args) => {
-                        tasks.push(Task::BuildConstr(*tag, args.len()));
+                        tasks.push(Task::BuildConstr(tag.clone(), args.len()));
                         for child in args.iter().rev() {
                             tasks.push(Task::Descend(child));
                         }
@@ -313,10 +330,12 @@ impl Drop for Data {
     /// `mem::take` always leaves a fully-initialized replacement value
     /// behind rather than partially moving out of a live place; (2)
     /// explicitly drops any genuinely-owned non-`Data` leaf payload
-    /// (`BigInt`/`Vec<u8>`) via the same `mem::take`-then-drop technique;
-    /// and (3) `mem::forget`s the now-inert shell so its own
-    /// `Drop::drop` is never invoked again. Step (3) is leak-free: by
-    /// that point the shell owns only a `Copy` tag and
+    /// (`BigInt`/`Vec<u8>`) — including a `Constr` node's own `BigInt`
+    /// tag, which is heap-backed and MUST be taken-and-dropped here
+    /// too, not left for the final `mem::forget` — via the same
+    /// `mem::take`-then-drop technique; and (3) `mem::forget`s the
+    /// now-inert shell so its own `Drop::drop` is never invoked again.
+    /// Step (3) is leak-free: by that point the shell owns only
     /// default/zero-capacity containers (`Vec::new()`, `BigInt::ZERO` —
     /// both non-heap-allocating).
     fn drop(&mut self) {
@@ -324,7 +343,10 @@ impl Drop for Data {
         let mut stack = vec![taken];
         while let Some(mut node) = stack.pop() {
             match &mut node {
-                Data::Constr(_, args) => stack.extend(std::mem::take(args)),
+                Data::Constr(tag, args) => {
+                    std::mem::drop(std::mem::take(tag));
+                    stack.extend(std::mem::take(args));
+                }
                 Data::List(items) => stack.extend(std::mem::take(items)),
                 Data::Map(entries) => {
                     for (k, v) in std::mem::take(entries) {
@@ -341,6 +363,15 @@ impl Drop for Data {
 }
 
 impl Data {
+    /// Ergonomic `Constr` constructor: accepts anything `Into<BigInt>`
+    /// (small integer literals included) so call sites that only ever
+    /// build small, in-range tags don't need to spell out
+    /// `BigInt::from(..)` themselves. Semantically identical to
+    /// `Data::Constr(tag.into(), args)`.
+    pub fn constr(tag: impl Into<BigInt>, args: Vec<Data>) -> Data {
+        Data::Constr(tag.into(), args)
+    }
+
     /// Consume `self`, extracting the `Constr` tag/args if that's the
     /// variant, or handing `self` back unchanged (`Err`) otherwise.
     ///
@@ -353,9 +384,9 @@ impl Data {
     /// replacement in the field, and the shallow leftover (`self`'s
     /// `Vec` is now empty) drops in O(1) with no recursion when this
     /// function returns.
-    pub fn into_constr(mut self) -> Result<(u64, Vec<Data>), Data> {
+    pub fn into_constr(mut self) -> Result<(BigInt, Vec<Data>), Data> {
         match &mut self {
-            Data::Constr(tag, args) => Ok((*tag, std::mem::take(args))),
+            Data::Constr(tag, args) => Ok((std::mem::take(tag), std::mem::take(args))),
             _ => Err(self),
         }
     }
@@ -445,7 +476,7 @@ fn encode_data_inner<W: minicbor::encode::Write>(
     data: &Data,
 ) -> Result<(), minicbor::encode::Error<W::Error>> {
     match data {
-        Data::Constr(tag, args) => encode_constr(e, *tag, args),
+        Data::Constr(tag, args) => encode_constr(e, tag, args),
         Data::Map(entries) => {
             // Haskell's encoder always uses definite-length CBOR maps
             // for Data. The decoder accepts indefinite, but byte-exact
@@ -465,21 +496,38 @@ fn encode_data_inner<W: minicbor::encode::Write>(
 
 fn encode_constr<W: minicbor::encode::Write>(
     e: &mut Encoder<W>,
-    tag: u64,
+    tag: &BigInt,
     args: &[Data],
 ) -> Result<(), minicbor::encode::Error<W::Error>> {
-    if tag <= 6 {
-        e.tag(Tag::new(121 + tag))?;
-        encode_args(e, args)?;
-    } else if tag <= 127 {
-        e.tag(Tag::new(1280 + (tag - 7)))?;
-        encode_args(e, args)?;
-    } else {
-        e.tag(Tag::new(102))?;
-        e.array(2)?;
-        e.u64(tag)?;
-        encode_args(e, args)?;
+    // The compact tag-121..127 / tag-1280..1400 forms only apply to a
+    // tag in `[0, 127]`; anything else (including any negative or
+    // >u64::MAX tag a script can transiently build via `constrData` at
+    // PV<11 — see #859) falls through to the general tag-102 form. This
+    // matches Haskell's `encodeData`, whose `n >= 0 && n < 7` / `n >= 7
+    // && n < 128` guards are plain `Integer` comparisons that are simply
+    // false for a negative or huge `n`.
+    if let Ok(small) = u64::try_from(tag) {
+        if small <= 6 {
+            e.tag(Tag::new(121 + small))?;
+            return encode_args(e, args);
+        } else if small <= 127 {
+            e.tag(Tag::new(1280 + (small - 7)))?;
+            return encode_args(e, args);
+        }
     }
+    // General tag-102 form: `encodeTag 102 <> encodeListLen 2 <>
+    // encodeInteger n <> encode ds`. `encodeInteger` here is the exact
+    // same arbitrary-precision integer encoding used for `Data::I` — for
+    // an in-range tag this reproduces the plain `e.u64(tag)` byte-exact
+    // (regression-tested), and for an out-of-range tag (never
+    // on-chain-decodable — decode always requires Word64, see
+    // `decode_tagged`) it degrades "softly" to the bignum/negint form
+    // rather than panicking, matching Haskell's `encodeInteger` which
+    // has no upper/lower bound.
+    e.tag(Tag::new(102))?;
+    e.array(2)?;
+    encode_integer(e, tag)?;
+    encode_args(e, args)?;
     Ok(())
 }
 
@@ -759,12 +807,12 @@ fn decode_tagged(d: &mut Decoder<'_>, depth: usize) -> Result<Data, UplcError> {
         (_, tag @ 121..=127) => {
             let constr_tag = tag - 121;
             let args = decode_array(d, depth)?;
-            Ok(Data::Constr(constr_tag, args))
+            Ok(Data::Constr(BigInt::from(constr_tag), args))
         }
         (_, tag @ 1280..=1400) => {
             let constr_tag = tag - 1280 + 7;
             let args = decode_array(d, depth)?;
-            Ok(Data::Constr(constr_tag, args))
+            Ok(Data::Constr(BigInt::from(constr_tag), args))
         }
         (_, 102) => {
             // #831 finding 1: Haskell's `decodeConstrExtended` uses
@@ -782,7 +830,7 @@ fn decode_tagged(d: &mut Decoder<'_>, depth: usize) -> Result<Data, UplcError> {
                         .u64()
                         .map_err(|e| UplcError::CborDecode(format!("constr-102 tag: {e}")))?;
                     let args = decode_array(d, depth)?;
-                    Ok(Data::Constr(constr_tag, args))
+                    Ok(Data::Constr(BigInt::from(constr_tag), args))
                 }
                 Some(n) => Err(UplcError::CborDecode(format!(
                     "tag 102: expected array(2), got Some({n})"
@@ -793,7 +841,7 @@ fn decode_tagged(d: &mut Decoder<'_>, depth: usize) -> Result<Data, UplcError> {
                         .map_err(|e| UplcError::CborDecode(format!("constr-102 tag: {e}")))?;
                     let args = decode_array(d, depth)?;
                     expect_break(d)?;
-                    Ok(Data::Constr(constr_tag, args))
+                    Ok(Data::Constr(BigInt::from(constr_tag), args))
                 }
             }
         }
@@ -1024,7 +1072,7 @@ mod tests {
     #[test]
     fn empty_constr_args_are_definite_0x80() {
         // Constr 0 [] → tag 121 (0xd879) + empty list (0x80).
-        let d = Data::Constr(0, vec![]);
+        let d = Data::Constr(BigInt::from(0), vec![]);
         assert_eq!(hex::encode(d.to_cbor().unwrap()), "d87980");
         // Bare empty List → 0x80.
         assert_eq!(hex::encode(Data::List(vec![]).to_cbor().unwrap()), "80");
@@ -1037,9 +1085,9 @@ mod tests {
         // This is the on-chain shape `d87a9fd8799f…` of the failing-tx
         // datum: the args arrays are INDEFINITE-length.
         let d = Data::Constr(
-            1,
+            BigInt::from(1),
             vec![Data::Constr(
-                0,
+                BigInt::from(0),
                 vec![Data::B(vec![0xab]), Data::I(BigInt::from(7))],
             )],
         );
@@ -1106,7 +1154,7 @@ mod tests {
     #[test]
     fn roundtrip_constr_small_tag() {
         for tag in [0u64, 3, 6] {
-            let d = Data::Constr(tag, vec![Data::I(BigInt::from(42))]);
+            let d = Data::Constr(BigInt::from(tag), vec![Data::I(BigInt::from(42))]);
             assert_eq!(rt(&d), d, "tag={tag}");
         }
     }
@@ -1114,7 +1162,7 @@ mod tests {
     #[test]
     fn roundtrip_constr_medium_tag() {
         for tag in [7u64, 50, 127] {
-            let d = Data::Constr(tag, vec![Data::I(BigInt::from(42))]);
+            let d = Data::Constr(BigInt::from(tag), vec![Data::I(BigInt::from(42))]);
             assert_eq!(rt(&d), d, "tag={tag}");
         }
     }
@@ -1123,9 +1171,53 @@ mod tests {
     fn roundtrip_constr_large_tag() {
         // 128 and above use tag 102 wrapping [tag, args].
         for tag in [128u64, 1000, u64::MAX] {
-            let d = Data::Constr(tag, vec![]);
+            let d = Data::Constr(BigInt::from(tag), vec![]);
             assert_eq!(rt(&d), d, "tag={tag}");
         }
+    }
+
+    /// #859: a transient `Constr` tag outside the `Word64` range (only
+    /// reachable pre-PV11 via `constrData` — see
+    /// `builtin::denotations::ConstrData`) must still *encode* without
+    /// panicking, matching Haskell's `encodeInteger`, which has no
+    /// bound. Such a value can never have come FROM the on-chain CBOR
+    /// decoder (decode always requires the tag to fit `Word64` — see
+    /// `decode_tagged`), so encoding it is intentionally a "soft",
+    /// one-way, non-round-tripping degenerate case: re-decoding those
+    /// bytes must fail cleanly (never panic, never silently truncate).
+    #[test]
+    fn out_of_word64_range_constr_tag_encodes_without_panicking_and_does_not_round_trip() {
+        // Negative tag: general tag-102 form with a CBOR negint payload.
+        let neg = Data::Constr(BigInt::from(-1), vec![]);
+        let neg_bytes = neg
+            .to_cbor()
+            .expect("negative tag must encode without panicking");
+        // d8 66 = tag 102; 82 = array(2); 20 = negint(-1) (encodeInteger,
+        // same path as Data::I); 80 = empty args array.
+        assert_eq!(hex::encode(&neg_bytes), "d866822080");
+        let redecoded = Data::from_cbor(&neg_bytes);
+        assert!(
+            redecoded.is_err(),
+            "a negint constr-102 tag must be rejected on decode (Word64-only), not silently \
+             reinterpreted: {redecoded:?}"
+        );
+
+        // Oversized (> u64::MAX) tag: general tag-102 form with a bignum payload.
+        let huge_tag_value: BigInt = BigInt::from(1u64) << 80;
+        let huge = Data::Constr(huge_tag_value, vec![]);
+        let huge_bytes = huge
+            .to_cbor()
+            .expect("oversized tag must encode without panicking");
+        assert_eq!(
+            hex::encode(&huge_bytes)[0..6],
+            hex::encode([0xd8, 0x66, 0x82])
+        );
+        let redecoded_huge = Data::from_cbor(&huge_bytes);
+        assert!(
+            redecoded_huge.is_err(),
+            "a bignum-tagged constr-102 tag must be rejected on decode (Word64-only): \
+             {redecoded_huge:?}"
+        );
     }
 
     #[test]
@@ -1175,13 +1267,13 @@ mod tests {
     #[test]
     fn roundtrip_nested() {
         let d = Data::Constr(
-            0,
+            BigInt::from(0),
             vec![
                 Data::Map(vec![(
                     Data::B(b"key".to_vec()),
                     Data::List(vec![Data::I(BigInt::from(7))]),
                 )]),
-                Data::Constr(127, vec![Data::I(BigInt::from(-1))]),
+                Data::Constr(BigInt::from(127), vec![Data::I(BigInt::from(-1))]),
             ],
         );
         assert_eq!(rt(&d), d);
@@ -1196,7 +1288,7 @@ mod tests {
         // decoder required `Some(2)` and rejected this.
         let bytes = [0xd8, 0x66, 0x9f, 0x00, 0x80, 0xff];
         let d = Data::from_cbor(&bytes).expect("must accept indefinite tag-102 array");
-        assert_eq!(d, Data::Constr(0, vec![]));
+        assert_eq!(d, Data::Constr(BigInt::from(0), vec![]));
     }
 
     #[test]
@@ -1212,7 +1304,10 @@ mod tests {
         );
         bytes.push(0xff);
         let d = Data::from_cbor(&bytes).expect("must accept indefinite tag-102 array");
-        assert_eq!(d, Data::Constr(1, vec![Data::I(BigInt::from(42))]));
+        assert_eq!(
+            d,
+            Data::Constr(BigInt::from(1), vec![Data::I(BigInt::from(42))])
+        );
     }
 
     #[test]
@@ -1351,7 +1446,7 @@ mod tests {
     #[test]
     fn iterative_clone_preserves_structure_and_order() {
         let d = Data::Constr(
-            7,
+            BigInt::from(7),
             vec![
                 Data::Map(vec![
                     (Data::I(BigInt::from(1)), Data::B(vec![0xAA])),
@@ -1362,7 +1457,7 @@ mod tests {
                 ]),
                 Data::List(vec![
                     Data::I(BigInt::from(-9)),
-                    Data::Constr(0, vec![Data::B(vec![])]),
+                    Data::Constr(BigInt::from(0), vec![Data::B(vec![])]),
                 ]),
                 Data::B(vec![1, 2, 3, 4]),
             ],

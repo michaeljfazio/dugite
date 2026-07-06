@@ -178,6 +178,33 @@ impl<'b> BitReader<'b> {
         }
     }
 
+    /// Read a flat-encoded `Natural` as an arbitrary-precision
+    /// `BigUint`, with NO `u64` cap — matching Haskell's `Natural`
+    /// exactly (issue #842 residual: the `Program` version triple is
+    /// the one field genuinely typed `Natural` with no bound in
+    /// Haskell, so unlike every other `Natural`-tagged field in this
+    /// codec — which Haskell/the ledger additionally treats as
+    /// `Word64`-bounded in practice — this is the only call site that
+    /// should ever need this). Same 7-bit-chunk, low-bits-first,
+    /// continuation-flag encoding as [`Self::read_natural_u64`]; the
+    /// only difference is there is no shift/width limit to exceed, so
+    /// a genuinely huge value decodes to its exact value instead of
+    /// either erroring (`read_word64_strict`) or silently truncating
+    /// (`read_natural_u64`'s lenient `u64` path).
+    pub fn read_natural_biguint(&mut self) -> FlatResult<num_bigint::BigUint> {
+        let mut value = num_bigint::BigUint::ZERO;
+        let mut shift: u32 = 0;
+        loop {
+            let more = self.read_bit()?;
+            let chunk = self.read_bits8(7)? as u64;
+            value |= num_bigint::BigUint::from(chunk) << shift;
+            if !more {
+                return Ok(value);
+            }
+            shift += 7;
+        }
+    }
+
     /// Read a flat-encoded `Integer` (signed arbitrary-precision
     /// integer). The encoding is zig-zag from `Natural`:
     /// `n >= 0` → `2n`; `n < 0` → `2|n| - 1`.
@@ -289,6 +316,30 @@ impl BitWriter {
         }
     }
 
+    /// Append an arbitrary-precision `Natural` (`BigUint`) as 7-bit
+    /// chunks with continuation flags — the counterpart to
+    /// [`BitReader::read_natural_biguint`]. Byte-identical to
+    /// [`Self::write_natural_u64`] for any value that fits in a `u64`.
+    pub fn write_natural_biguint(&mut self, value: &num_bigint::BigUint) -> FlatResult<()> {
+        use num_bigint::BigUint;
+        let mut value = value.clone();
+        let mask = BigUint::from(0x7fu8);
+        loop {
+            let chunk_bi = &value & &mask;
+            // `chunk_bi` is masked to 7 bits, so it always fits in a u8;
+            // `to_bytes_le()` on a value < 128 yields at most one byte
+            // (or none at all for zero).
+            let chunk = chunk_bi.to_bytes_le().first().copied().unwrap_or(0);
+            value >>= 7u32;
+            let more = value > BigUint::ZERO;
+            self.write_bit(more);
+            self.write_bits8(chunk, 7)?;
+            if !more {
+                return Ok(());
+            }
+        }
+    }
+
     /// Append an `Integer` (zig-zag encoded).
     pub fn write_integer_i64(&mut self, value: i64) -> FlatResult<()> {
         let zigzag: u64 = if value >= 0 {
@@ -358,6 +409,46 @@ mod tests {
         for n in [u32::MAX as u64, u64::MAX / 2, u64::MAX] {
             roundtrip_natural(n);
         }
+    }
+
+    /// #842 residual: `read_natural_biguint`/`write_natural_biguint` must
+    /// be byte-identical to the `u64` path for every value that fits in
+    /// a `u64` (including the boundary), and must correctly round-trip a
+    /// value that does NOT fit — which is exactly the case the lenient
+    /// `u64` path silently truncates (see
+    /// `read_natural_u64_lenient_path_unchanged_for_version_triple`).
+    #[test]
+    fn natural_biguint_matches_u64_path_for_u64_range_values() {
+        for n in [0u64, 1, 127, 128, 16383, 16384, u32::MAX as u64, u64::MAX] {
+            let mut w_u64 = BitWriter::new();
+            w_u64.write_natural_u64(n).unwrap();
+            let mut w_big = BitWriter::new();
+            w_big
+                .write_natural_biguint(&num_bigint::BigUint::from(n))
+                .unwrap();
+            assert_eq!(
+                w_u64.bytes, w_big.bytes,
+                "biguint encoding must match u64 encoding byte-for-byte, n={n}"
+            );
+
+            let mut r = BitReader::new(&w_big.bytes);
+            let got = r.read_natural_biguint().unwrap();
+            assert_eq!(got, num_bigint::BigUint::from(n));
+        }
+    }
+
+    #[test]
+    fn natural_biguint_round_trips_value_wider_than_u64() {
+        // 2^70 + 12345 — needs 11 seven-bit chunks, far past the point
+        // (the 10th chunk, shift=63) where the u64 varint reader must
+        // reject/truncate. Haskell's `Natural` has no such bound.
+        let huge: num_bigint::BigUint =
+            (num_bigint::BigUint::from(1u8) << 70u32) + num_bigint::BigUint::from(12345u32);
+        let mut w = BitWriter::new();
+        w.write_natural_biguint(&huge).unwrap();
+        let mut r = BitReader::new(&w.bytes);
+        let got = r.read_natural_biguint().unwrap();
+        assert_eq!(got, huge, "a >64-bit Natural must round-trip exactly");
     }
 
     #[test]

@@ -1100,7 +1100,9 @@ const fn builtin_cost_table() -> [CostPair; 101] {
             }),
             mem: Constant(1),
         },
-        // 24 EncodeUtf8 — linear_in_x (char count)
+        // 24 EncodeUtf8 — linear_in_x, x = variant-gated size (#819):
+        //   char count for A/B/C, UTF-8 byte-length/4 for D/E — see the
+        //   `EncodeUtf8` match arm above.
         CostPair {
             cpu: LinearInX(lin1(1000, 42921)),
             mem: LinearInX(lin1(4, 2)),
@@ -1351,12 +1353,13 @@ const fn builtin_cost_table() -> [CostPair; 101] {
             cpu: LinearInX(lin1(617887431, 67302824)),
             mem: Constant(36),
         },
-        // 94 InsertCoin — linear_in_u (= 4th value-arg size); dugite's
-        //   `cost_for` only carries x/y/z, so we approximate as
-        //   linear_in_z (3rd arg = Integer amount) — for the
-        //   conformance corpus this matches because the Plutus
-        //   reference's `u` is the Value memory, which is small for
-        //   the test fixtures.
+        // 94 InsertCoin — linear_in_u where u = ValueMaxDepth(4th arg).
+        //   dugite's `cost_for` only carries x/y/z slots (no dedicated
+        //   `u`), so the `InsertCoin` arm above maps u → z directly
+        //   (`args.get(3)` is the 4th/ValueMaxDepth arg, not the 3rd/
+        //   amount arg) so this `LinearInZ` entry fires on the correct
+        //   input — not an approximation, an exact remap of which slot
+        //   carries the cost-relevant size.
         CostPair {
             cpu: LinearInZ(lin1(356924, 18413)),
             mem: LinearInZ(lin1(45, 21)),

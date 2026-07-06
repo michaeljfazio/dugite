@@ -191,7 +191,11 @@ fn cek_v3_spend_71579b77_flat_evaluates() {
     let prog = Program::from_flat(&flat_bytes).expect("applied flat should parse");
     assert_eq!(
         prog.version,
-        (1, 1, 0),
+        (
+            num_bigint::BigUint::from(1u8),
+            num_bigint::BigUint::from(1u8),
+            num_bigint::BigUint::ZERO
+        ),
         "script should be UPLC 1.1.0 (Conway)"
     );
     let mut tracker = BudgetTracker::new_counting();

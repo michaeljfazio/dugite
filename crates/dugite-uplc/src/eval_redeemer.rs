@@ -185,7 +185,7 @@ pub(crate) fn eval_resolved_redeemer(
     // (language, pv)-independent; this validation is not).
     crate::flat::term::validate_program_availability(
         &program.term,
-        program.version,
+        &program.version,
         r.language,
         major_pv,
     )?;
@@ -307,7 +307,7 @@ pub(crate) fn eval_resolved_redeemer(
             applied_for_fail_dump = Some(applied_term.clone());
         } else {
             let prog = crate::program::Program {
-                version,
+                version: version.clone(),
                 term: applied_term.clone(),
             };
             let path = format!("{dir}/applied-{:?}-{}.flat", r.tag, r.index);
@@ -421,7 +421,7 @@ pub(crate) fn eval_resolved_redeemer(
 /// Convert a [`crate::data::Data`] into the term that pre-application
 /// will pass into the script.
 fn data_const_term(d: crate::data::Data) -> Term {
-    Term::Const(Constant::Data(d))
+    Term::Const(Constant::Data(std::rc::Rc::new(d)))
 }
 
 /// Resolve the on-chain cost model for `language` into a fully-applied
@@ -719,7 +719,17 @@ mod tests {
     use super::*;
     use crate::data::Data;
     use crate::term::{Constant, Term};
-    use num_bigint::BigInt;
+    use num_bigint::{BigInt, BigUint};
+
+    /// Test-only ergonomic constructor for a `Program` version triple
+    /// (`BigUint`-typed since #842's residual arbitrary-precision fix).
+    fn ver(major: u64, minor: u64, patch: u64) -> (BigUint, BigUint, BigUint) {
+        (
+            BigUint::from(major),
+            BigUint::from(minor),
+            BigUint::from(patch),
+        )
+    }
 
     fn slot_cfg() -> SlotConfig {
         SlotConfig {
@@ -757,7 +767,7 @@ mod tests {
         // `deserialiseScript` = `CBOR.decodeBytes >=> unflat`, which
         // hard-fails on non-CBOR input before ever reaching `unflat`.
         let bare_flat = Program {
-            version: (1, 0, 0),
+            version: ver(1, 0, 0),
             term: Term::Const(Constant::Unit),
         }
         .to_flat()
@@ -766,7 +776,7 @@ mod tests {
 
         // The CBOR-wrapped form of the exact same program must decode.
         let cbor_wrapped = Program {
-            version: (1, 0, 0),
+            version: ver(1, 0, 0),
             term: Term::Const(Constant::Unit),
         }
         .to_cbor()
@@ -780,7 +790,7 @@ mod tests {
     /// V3 success check passes.
     fn unit_returning_v3_script() -> Vec<u8> {
         let program = Program {
-            version: (1, 0, 0),
+            version: ver(1, 0, 0),
             // `lam x. const_unit` — `Lam(Const Unit)`. The bound var
             // `x` is unused, so the CEK just returns the constant.
             term: Term::Lam(Rc::new(Term::Const(Constant::Unit))),
@@ -945,7 +955,7 @@ mod tests {
         );
         // Wrap in lam so the V3 single-arg calling convention is satisfied.
         let program = Program {
-            version: (1, 0, 0),
+            version: ver(1, 0, 0),
             term: Term::Lam(Rc::new(trace_call)),
         };
         program.to_cbor().unwrap()
@@ -1002,7 +1012,7 @@ mod tests {
             Rc::new(trace_call("third")),
         );
         let program = Program {
-            version: (1, 0, 0),
+            version: ver(1, 0, 0),
             term: Term::Lam(Rc::new(body)),
         };
         program.to_cbor().unwrap()
@@ -1036,7 +1046,7 @@ mod tests {
             Rc::new(trace_call),
         );
         let program = Program {
-            version: (1, 0, 0),
+            version: ver(1, 0, 0),
             term: Term::Lam(Rc::new(body)),
         };
         program.to_cbor().unwrap()
