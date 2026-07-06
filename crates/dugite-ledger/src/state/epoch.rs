@@ -766,7 +766,7 @@ impl LedgerState {
         // several GB and was one of the contributors to the #403 post-replay
         // OOM. `scan_all` walks the set one entry at a time.
         let ptr_stake_excluded = self.epochs.ptr_stake_excluded;
-        self.utxo.utxo_set.scan_all(|_, output| {
+        let scan_failures = self.utxo.utxo_set.scan_all(|_, output| {
             let coin = output.value.coin.0;
             match stake_routing(&output.address, ptr_stake_excluded) {
                 StakeRouting::Credential(cred_hash) => {
@@ -778,6 +778,17 @@ impl LedgerState {
                 StakeRouting::None => {}
             }
         });
+        // A partial scan silently understates every affected credential's
+        // stake, corrupting the mark/set/go snapshots that drive the leader
+        // schedule and reward distribution. Refuse to derive consensus state
+        // from an incomplete UTxO set — crash rather than diverge (#806).
+        assert_eq!(
+            scan_failures, 0,
+            "rebuild_stake_distribution: {scan_failures} UTxO entries failed to decode \
+             during the stake scan — the on-disk UTxO store is corrupt; refusing to \
+             derive a stake distribution from a partial set. Wipe `<database-path>/utxo-store` \
+             and restart so the replay rebuilds the UTxO set from an empty store."
+        );
         // Also ensure all registered stake credentials have entries (even with 0 stake)
         for cred_hash in self.certs.delegations.keys() {
             new_map.entry(*cred_hash).or_insert(Lovelace(0));
