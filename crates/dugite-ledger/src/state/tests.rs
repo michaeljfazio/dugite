@@ -16948,6 +16948,109 @@ fn rollback_reconstructs_pool_retirement_epoch_overwrite() {
     );
 }
 
+/// #806 DEFECT A: `save_ledger_snapshot` (dugite-node) clears `utxo.diff_seq`
+/// to reclaim memory (diffs are `#[serde(skip)]`, not persisted) but does
+/// NOT clear the `LedgerSeq`. If a rollback target then lands further back
+/// than the diffs retained since that clear, `diff_seq.len() < n` — reverse
+/// applying only `diff_seq.len()` UTxO diffs while restoring non-UTxO state
+/// `n` blocks back would silently desync the UTxO set from the rest of
+/// ledger state. `rollback_via_seq` must detect this BEFORE mutating
+/// anything and return `None` so the caller falls back to snapshot reload,
+/// rather than performing a partial, corrupting rollback.
+#[test]
+fn rollback_via_seq_detects_diff_seq_desync_and_bails_out() {
+    let params = ProtocolParameters::mainnet_defaults();
+    let mut state = LedgerState::new(params);
+
+    let genesis_input = TransactionInput {
+        transaction_id: Hash32::from_bytes([0xF0u8; 32]),
+        index: 0,
+    };
+    state
+        .utxo
+        .utxo_set
+        .insert(genesis_input.clone(), make_lovelace_output(10_000_000));
+
+    let mut seq = LedgerSeq::with_defaults(state.clone_without_utxos(), 100);
+
+    // Block 0: spend genesis, create X.
+    let x_input = TransactionInput {
+        transaction_id: Hash32::from_bytes([1u8; 32]),
+        index: 0,
+    };
+    let b0 = make_test_block(
+        1,
+        1,
+        Hash32::ZERO,
+        vec![make_simple_tx(
+            1,
+            vec![genesis_input.clone()],
+            vec![make_lovelace_output(9_800_000)],
+        )],
+    );
+    let d0 = state
+        .apply_block_with_delta(&b0, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d0);
+
+    // Block 1: spend X, create Y.
+    let y_input = TransactionInput {
+        transaction_id: Hash32::from_bytes([2u8; 32]),
+        index: 0,
+    };
+    let b1 = make_test_block(
+        2,
+        2,
+        *b0.hash(),
+        vec![make_simple_tx(
+            2,
+            vec![x_input.clone()],
+            vec![make_lovelace_output(9_600_000)],
+        )],
+    );
+    let d1 = state
+        .apply_block_with_delta(&b1, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d1);
+
+    assert_eq!(seq.len(), 2, "both block deltas are in the volatile window");
+    assert_eq!(
+        state.utxo.diff_seq.len(),
+        2,
+        "diff_seq mirrors the seq before any snapshot clear"
+    );
+
+    // Simulate `save_ledger_snapshot`'s `ls.utxo.diff_seq.clear()` — the
+    // LedgerSeq is untouched, reproducing the desync.
+    state.utxo.diff_seq.clear();
+
+    let utxo_len_before = state.utxo.utxo_set.len();
+
+    // Roll back both blocks (to Origin). `seq` can satisfy this (n=2), but
+    // `diff_seq` was just cleared (len=0) — the guard must fire.
+    let result = state.rollback_via_seq(&mut seq, &Point::Origin);
+    assert!(
+        result.is_none(),
+        "diff_seq (len=0) cannot cover a 2-block rollback; must bail out to \
+         the snapshot-reload slow path instead of desyncing UTxO vs non-UTxO state"
+    );
+
+    // No partial mutation: `seq` must still hold both deltas and the UTxO
+    // set must be exactly what it was before the aborted rollback attempt.
+    assert_eq!(
+        seq.len(),
+        2,
+        "seq must be untouched — the guard fires before any `seq.rollback` call"
+    );
+    assert_eq!(
+        state.utxo.utxo_set.len(),
+        utxo_len_before,
+        "utxo_set must be untouched by the aborted rollback"
+    );
+    assert!(state.utxo.utxo_set.contains(&y_input));
+    assert!(!state.utxo.utxo_set.contains(&genesis_input));
+}
+
 /// #783(b): a pool that is re-registered TWICE (double re-registration)
 /// leaves `future_pool_params.len()` unchanged between the two
 /// re-registrations. Same reconstruction-forcing shape as (a), but exercises

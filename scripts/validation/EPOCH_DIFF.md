@@ -36,7 +36,7 @@ Schema (top level):
 | `governance`      | drep + cc + proposals                   | See below.                                       |
 | `pp_current`      | full `ProtocolParameters` serde         |                                                  |
 | `pp_previous`     | full `ProtocolParameters` serde         |                                                  |
-| `pp_future`       | nullable                                | Currently always null (see code note).          |
+| `pp_future`       | nullable                                | `null` when nothing is queued for the next boundary; Haskell-side derivation is partial (#807, see below). |
 
 Governance sub-schema:
 
@@ -170,7 +170,7 @@ from the real-divergence count**.
 | `nonce.eta_h`                        | `chainDepState.csTickn.ticknStateEpochNonce`, not in dump.                   |
 | `nonce.eta_lj`                       | `chainDepState.csTickn.ticknStateLastEpochBlockNonce`, not in dump.          |
 | `governance.*` (all subfields)       | cn dump still emits pre-Conway `ppups`, never `utxosGovState`.               |
-| `pp_current`, `pp_previous`, `pp_future` | cn emits camelCase Haskell `PParams`; no field-by-field mapping to dugite's `ProtocolParameters` serde. |
+| `pp_current`, `pp_previous`           | cn emits camelCase Haskell `PParams`; no field-by-field mapping to dugite's `ProtocolParameters` serde. |
 | `era`                                | Not in cn dump (only `protocol_version.major` is reachable via `ppups.curPParams`). |
 | `scalars.deposits_drep`              | Conway-only; cn dump has no DRep deposit field.                              |
 | `scalars.deposits_proposal`          | Conway-only; cn dump has no proposal-deposit field.                          |
@@ -191,6 +191,7 @@ from the real-divergence count**.
 | `pools.registered`                    | `len(delegationState.pstate.stakePools)`                                  |
 | `pools.retiring`                      | `len(delegationState.pstate.retiring)`                                    |
 | `rewards.total_distributed`           | Sum `rewardAmount` across `rewardUpdate.rs[*][*].rewardAmount`            |
+| `pp_future` (partial, #807)           | Merges `ppups.proposals` + `ppups.futureProposals` — each an ARRAY of `[genesisKeyHashHex, PParamsUpdate]` pairs (`ProposedPPUpdates`'s `ToJSON` does `Map.toList` first, NOT an object keyed by hash), field names hand-written in `ShelleyGovState`'s `ToKeyValuePairs` instance. Translates the `PParamsUpdate` fields dugite's legacy `ProtocolParamUpdate` understands (`_PP_UPDATE_FIELD_MAP` — data-driven `ppName` JSON keys, e.g. `stakePoolTargetNum` not `nOpt`) into canonical snake_case names, and returns `None` when nothing is queued. On an actual Conway (cn 11.0.1) dump `ppups.proposals` is a structurally different CIP-1694 `GovActionState` list and there is no `futureProposals` key at all; the array-of-pairs shape check doubles as the era discriminator so this safely yields `None` rather than misparsing governance-action data. This is a **partial** dict — only the overridden fields — not a full `ProtocolParameters` clone, since `pp_current`/`pp_previous` still lack a full renamer to merge onto. Good enough to catch premature/delayed PPUP enactment timing; every `pp_future.*` diff stays `severity=info` regardless (see `diff-epoch-dumps.py`). |
 
 ### Other normalizer notes
 
