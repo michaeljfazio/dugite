@@ -170,6 +170,12 @@ pub(crate) fn eval_resolved_redeemer(
 ) -> Result<RedeemerEvalOutcome, PhaseTwoError> {
     // 1. Decode script bytes → typed Term.
     //
+    // #860.1: reject a script whose ledger language is not yet available at the
+    // current protocol version BEFORE flat-decoding the blob, mirroring Haskell's
+    // `ledgerLanguageIntroducedIn ll <= pv` pre-decode gate (a V3 script at PV<9, a
+    // V2 at PV<7, a V1 at PV<5 is rejected without decode).
+    crate::flat::term::validate_ledger_language_available(r.language, major_pv)?;
+
     // On-chain Plutus scripts (witness-set AND reference-script alike)
     // are CBOR-bytestring-wrapped flat: Haskell `deserialiseScript` =
     // `CBOR.decodeBytes >=> unflat` (#836). This is byte-verified

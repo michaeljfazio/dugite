@@ -192,6 +192,37 @@ pub fn validate_program_availability(
     validate_term_depth(term, language, major_pv, version_1_1_0_or_later, 0)
 }
 
+/// The protocol MAJOR version at which each ledger Plutus language became
+/// available — Haskell `ledgerLanguageIntroducedIn`:
+/// PlutusV1 → Alonzo (5), PlutusV2 → Babbage/Vasil (7), PlutusV3 → Conway/Chang (9).
+/// (Matches dugite-ledger's own reference-script PV gate in `validation/scripts.rs`.)
+pub fn ledger_language_introduced_in(language: ScriptLanguage) -> u32 {
+    match language {
+        ScriptLanguage::PlutusV1 => 5,
+        ScriptLanguage::PlutusV2 => 7,
+        ScriptLanguage::PlutusV3 => 9,
+    }
+}
+
+/// Reject a script whose ledger language is not yet available at `major_pv`,
+/// mirroring Haskell's `ledgerLanguageIntroducedIn ll <= pv` check, which runs
+/// BEFORE the flat blob is decoded. Emits a typed, adversary-reachable
+/// `FlatDecode` rejection (never an internal error). See issue #860.1.
+pub fn validate_ledger_language_available(
+    language: ScriptLanguage,
+    major_pv: u32,
+) -> FlatResult<()> {
+    let introduced = ledger_language_introduced_in(language);
+    if major_pv < introduced {
+        Err(UplcError::FlatDecode(format!(
+            "ledger language {language:?} is not available at protocol version {major_pv} \
+             (introduced in protocol major {introduced})"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_term_depth(
     term: &Term,
     language: ScriptLanguage,
@@ -965,6 +996,28 @@ fn unreachable_zero() -> FlatResult<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #860.1: a script whose ledger language is not yet available at the current
+    /// protocol version is rejected; an available one passes. Thresholds V1@5,
+    /// V2@7, V3@9 (`ledgerLanguageIntroducedIn`).
+    #[test]
+    fn ledger_language_availability_gate_860_1() {
+        use ScriptLanguage::*;
+        // Unavailable below the introduction PV.
+        for (lang, introduced) in [(PlutusV1, 5u32), (PlutusV2, 7), (PlutusV3, 9)] {
+            assert_eq!(ledger_language_introduced_in(lang), introduced);
+            assert!(
+                validate_ledger_language_available(lang, introduced - 1).is_err(),
+                "{lang:?} must be rejected at PV {}",
+                introduced - 1
+            );
+            // Available at and above the introduction PV.
+            assert!(validate_ledger_language_available(lang, introduced).is_ok());
+            assert!(validate_ledger_language_available(lang, introduced + 3).is_ok());
+        }
+        // A V3 script at PV 8 (Babbage-ish) is the canonical rejected case.
+        assert!(validate_ledger_language_available(PlutusV3, 8).is_err());
+    }
 
     fn rt_term(t: Term) -> Term {
         let mut w = BitWriter::new();
