@@ -494,7 +494,7 @@ pub(crate) fn decode_alonzo_tx_body(
                 inputs = r.read_array(read_tx_input)?;
             }
             1 => {
-                outputs = r.read_array(|r| read_alonzo_tx_output(r, era))?;
+                outputs = r.read_array(|r| read_alonzo_tx_output_with_raw(r, era))?;
             }
             2 => {
                 fee = read_lovelace(r)?;
@@ -638,6 +638,25 @@ fn read_alonzo_tx_output(
         is_legacy: true,
         raw_cbor: None,
     })
+}
+
+/// Read an Alonzo-family (Allegra / Mary / Alonzo) `transaction_output` from the
+/// reader and capture its original CBOR bytes in `raw_cbor`.
+///
+/// Wraps [`read_alonzo_tx_output`] with [`KeepRaw::parse_with`] so that pre-Conway
+/// outputs carry the exact wire bytes they were decoded from, matching the Conway
+/// path's [`crate::decode::era_conway`] `read_babbage_tx_output_with_raw`. Without
+/// this, every Mary/Alonzo output reaches the ledger with `raw_cbor == None`,
+/// forcing `raw_cbor`-dependent paths (e.g. Rule 5 min-UTxO size) onto a re-encode
+/// fallback. See issue #857.
+fn read_alonzo_tx_output_with_raw(
+    r: &mut Reader<'_>,
+    era: Era,
+) -> Result<TransactionOutput, SerializationError> {
+    let raw = KeepRaw::parse_with(r, |r| read_alonzo_tx_output(r, era))?;
+    let mut output = raw.value;
+    output.raw_cbor = Some(raw.raw.to_vec());
+    Ok(output)
 }
 
 /// Read a Value: either a plain uint (ADA only) or `[coin, multiasset_map]`.
@@ -2878,6 +2897,27 @@ mod tests {
             "raw_cbor.len()={} expected={}",
             raw.len(),
             expected_len
+        );
+    }
+
+    #[test]
+    fn alonzo_with_raw_captures_original_bytes_857() {
+        // The captured raw_cbor is the exact original span, not a re-encode.
+        let addr_bytes: Vec<u8> = {
+            let mut v = vec![0x60];
+            v.extend_from_slice(&[0u8; 28]);
+            v
+        };
+        let mut out_arr = vec![0x82]; // array(2)
+        out_arr.extend(cbor_bytes(&addr_bytes));
+        out_arr.extend(cbor_uint(3_000_000));
+
+        let mut r = Reader::new(&out_arr);
+        let out = read_alonzo_tx_output_with_raw(&mut r, Era::Alonzo).unwrap();
+        assert_eq!(
+            out.raw_cbor.as_deref(),
+            Some(out_arr.as_slice()),
+            "raw_cbor must hold the exact original Alonzo output bytes"
         );
     }
 }
