@@ -68,7 +68,21 @@ impl<'a> Parser<'a> {
         let term = self.parse_term()?;
         self.skip_trivia();
         self.expect_char(')')?;
-        Ok(Program { version, term })
+        // `Program.version` is `BigUint`-typed (#842 residual — the flat
+        // decoder needs arbitrary precision to match Haskell's unbounded
+        // `Natural`). This textual parser is dev/test-only tooling (not
+        // on the consensus wire-format path), so its own version-gating
+        // (`program_version`/`version_below`) stays `u64`-based for
+        // simplicity; only the final `Program` value needs the widened
+        // type.
+        Ok(Program {
+            version: (
+                num_bigint::BigUint::from(version.0),
+                num_bigint::BigUint::from(version.1),
+                num_bigint::BigUint::from(version.2),
+            ),
+            term,
+        })
     }
 
     pub(super) fn parse_term_top(&mut self) -> Result<Term, ParseError> {

@@ -76,7 +76,20 @@ const CONST_TAG_WIDTH: u8 = 4;
 /// Mirrors Haskell `plcVersion110`, which gates `decodeTerm`'s tag-8/9
 /// handlers: `unless (version >= plcVersion110) $ fail "'constr' is not
 /// allowed before version 1.1.0"` (`UntypedPlutusCore/Core/Instance/Flat.hs`).
-const PLC_VERSION_1_1_0: (u64, u64, u64) = (1, 1, 0);
+///
+/// A function rather than a `const` because the version triple is
+/// `BigUint`-typed (#842 residual) and `BigUint::from` isn't `const fn`.
+fn plc_version_1_1_0() -> (
+    num_bigint::BigUint,
+    num_bigint::BigUint,
+    num_bigint::BigUint,
+) {
+    (
+        num_bigint::BigUint::from(1u8),
+        num_bigint::BigUint::from(1u8),
+        num_bigint::BigUint::ZERO,
+    )
+}
 
 /// First protocol version at which `maxBoundsByPV` bounds a `Constr` tag
 /// (and the constant-universe header) — mirrors `vanRossemPV` in
@@ -167,11 +180,15 @@ pub fn encode_constant(w: &mut BitWriter, c: &Constant) -> FlatResult<()> {
 ///    at 1024 (`maxBoundsByPV`'s `mbConstr`).
 pub fn validate_program_availability(
     term: &Term,
-    version: (u64, u64, u64),
+    version: &(
+        num_bigint::BigUint,
+        num_bigint::BigUint,
+        num_bigint::BigUint,
+    ),
     language: ScriptLanguage,
     major_pv: u32,
 ) -> FlatResult<()> {
-    let version_1_1_0_or_later = version >= PLC_VERSION_1_1_0;
+    let version_1_1_0_or_later = version >= &plc_version_1_1_0();
     validate_term_depth(term, language, major_pv, version_1_1_0_or_later, 0)
 }
 
@@ -957,6 +974,24 @@ mod tests {
         decode_term(&mut r).expect("decode")
     }
 
+    /// Test-only ergonomic constructor for a `Program` version triple
+    /// (`BigUint`-typed since #842's residual arbitrary-precision fix).
+    fn ver(
+        major: u64,
+        minor: u64,
+        patch: u64,
+    ) -> (
+        num_bigint::BigUint,
+        num_bigint::BigUint,
+        num_bigint::BigUint,
+    ) {
+        (
+            num_bigint::BigUint::from(major),
+            num_bigint::BigUint::from(minor),
+            num_bigint::BigUint::from(patch),
+        )
+    }
+
     fn atoms(t: &TypeTag) -> Vec<u8> {
         let mut v = Vec::new();
         collect_type_atoms(t, &mut v).expect("collect");
@@ -1264,8 +1299,8 @@ mod tests {
     #[test]
     fn validate_rejects_unavailable_builtin_for_v1_before_pv11() {
         let t = Term::Builtin(BuiltinId::Bls12_381_G1_Add);
-        let err =
-            validate_program_availability(&t, (1, 0, 0), ScriptLanguage::PlutusV1, 10).unwrap_err();
+        let err = validate_program_availability(&t, &ver(1, 0, 0), ScriptLanguage::PlutusV1, 10)
+            .unwrap_err();
         assert!(matches!(err, UplcError::FlatDecode(_)), "got {err:?}");
     }
 
@@ -1274,8 +1309,8 @@ mod tests {
     #[test]
     fn validate_rejects_unavailable_bitwise_builtin_for_v1_before_pv11() {
         let t = Term::Builtin(BuiltinId::AndByteString);
-        let err =
-            validate_program_availability(&t, (1, 0, 0), ScriptLanguage::PlutusV1, 10).unwrap_err();
+        let err = validate_program_availability(&t, &ver(1, 0, 0), ScriptLanguage::PlutusV1, 10)
+            .unwrap_err();
         assert!(matches!(err, UplcError::FlatDecode(_)), "got {err:?}");
     }
 
@@ -1285,18 +1320,18 @@ mod tests {
     fn validate_accepts_available_builtin_no_false_rejection() {
         // BLS at V1/PV11 (available).
         let t = Term::Builtin(BuiltinId::Bls12_381_G1_Add);
-        validate_program_availability(&t, (1, 0, 0), ScriptLanguage::PlutusV1, 11)
+        validate_program_availability(&t, &ver(1, 0, 0), ScriptLanguage::PlutusV1, 11)
             .expect("BLS must be available to V1 at PV11");
 
         // BLS at V3/PV9 (available earlier for V3).
         let t = Term::Builtin(BuiltinId::Bls12_381_G1_Add);
-        validate_program_availability(&t, (1, 0, 0), ScriptLanguage::PlutusV3, 9)
+        validate_program_availability(&t, &ver(1, 0, 0), ScriptLanguage::PlutusV3, 9)
             .expect("BLS must be available to V3 at PV9");
 
         // Base-set builtin available to every language at their respective
         // ledger-language introduction PV.
         let t = Term::Builtin(BuiltinId::AddInteger);
-        validate_program_availability(&t, (1, 0, 0), ScriptLanguage::PlutusV1, 5)
+        validate_program_availability(&t, &ver(1, 0, 0), ScriptLanguage::PlutusV1, 5)
             .expect("addInteger must be available to V1 at PV5");
     }
 
@@ -1311,8 +1346,8 @@ mod tests {
             Rc::new(Term::Delay(Rc::new(inner))),
             Rc::new(Term::Error),
         )))));
-        let err =
-            validate_program_availability(&t, (1, 0, 0), ScriptLanguage::PlutusV1, 9).unwrap_err();
+        let err = validate_program_availability(&t, &ver(1, 0, 0), ScriptLanguage::PlutusV1, 9)
+            .unwrap_err();
         assert!(matches!(err, UplcError::FlatDecode(_)), "got {err:?}");
     }
 
@@ -1325,8 +1360,8 @@ mod tests {
             tag: 0,
             args: vec![],
         };
-        let err =
-            validate_program_availability(&t, (1, 0, 0), ScriptLanguage::PlutusV3, 11).unwrap_err();
+        let err = validate_program_availability(&t, &ver(1, 0, 0), ScriptLanguage::PlutusV3, 11)
+            .unwrap_err();
         assert!(matches!(err, UplcError::FlatDecode(_)), "got {err:?}");
     }
 
@@ -1337,8 +1372,8 @@ mod tests {
             scrutinee: Rc::new(Term::Error),
             branches: vec![],
         };
-        let err =
-            validate_program_availability(&t, (1, 0, 0), ScriptLanguage::PlutusV3, 11).unwrap_err();
+        let err = validate_program_availability(&t, &ver(1, 0, 0), ScriptLanguage::PlutusV3, 11)
+            .unwrap_err();
         assert!(matches!(err, UplcError::FlatDecode(_)), "got {err:?}");
     }
 
@@ -1350,14 +1385,14 @@ mod tests {
             tag: 0,
             args: vec![Rc::new(Term::Error)],
         };
-        validate_program_availability(&t, (1, 1, 0), ScriptLanguage::PlutusV3, 11)
+        validate_program_availability(&t, &ver(1, 1, 0), ScriptLanguage::PlutusV3, 11)
             .expect("constr must be allowed at PLC 1.1.0");
 
         let t = Term::Case {
             scrutinee: Rc::new(Term::Error),
             branches: vec![Rc::new(Term::Error)],
         };
-        validate_program_availability(&t, (1, 1, 0), ScriptLanguage::PlutusV3, 11)
+        validate_program_availability(&t, &ver(1, 1, 0), ScriptLanguage::PlutusV3, 11)
             .expect("case must be allowed at PLC 1.1.0");
     }
 
@@ -1368,8 +1403,8 @@ mod tests {
             tag: 1025,
             args: vec![],
         };
-        let err =
-            validate_program_availability(&t, (1, 1, 0), ScriptLanguage::PlutusV3, 11).unwrap_err();
+        let err = validate_program_availability(&t, &ver(1, 1, 0), ScriptLanguage::PlutusV3, 11)
+            .unwrap_err();
         assert!(matches!(err, UplcError::FlatDecode(_)), "got {err:?}");
     }
 
@@ -1380,7 +1415,7 @@ mod tests {
             tag: 1024,
             args: vec![],
         };
-        validate_program_availability(&t, (1, 1, 0), ScriptLanguage::PlutusV3, 11)
+        validate_program_availability(&t, &ver(1, 1, 0), ScriptLanguage::PlutusV3, 11)
             .expect("tag 1024 is exactly at the boundary and must be accepted");
     }
 
@@ -1393,7 +1428,7 @@ mod tests {
             tag: 50_000,
             args: vec![],
         };
-        validate_program_availability(&t, (1, 1, 0), ScriptLanguage::PlutusV3, 10)
+        validate_program_availability(&t, &ver(1, 1, 0), ScriptLanguage::PlutusV3, 10)
             .expect("constr tag bound only applies from PV11");
     }
 }
