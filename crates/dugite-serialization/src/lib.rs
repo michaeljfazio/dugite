@@ -22,6 +22,7 @@ pub use decode::{
     decode_native_script_cbor, decode_plutus_data_cbor, decode_transaction,
     decode_transaction_input, decode_transaction_output, decode_wire_wrapped_block_header,
     decode_wrapped_block_header, plutus_data_element_spans,
+    reference_native_script_original_bytes, witness_native_script_original_bytes,
 };
 
 // Helper exposed by the existing in-house pipeline; used by mithril chunk-file

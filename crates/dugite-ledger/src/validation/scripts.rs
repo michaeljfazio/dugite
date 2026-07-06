@@ -139,16 +139,52 @@ pub fn evaluate_native_script_with_guards(
 // Script hash utilities
 // ---------------------------------------------------------------------------
 
-/// Compute the witness-set / native-script hash: `blake2b_224(0x00 || cbor(script))`.
+/// Compute the native-script hash: `blake2b_224(0x00 || original_bytes)`.
 ///
-/// Shared by [`compute_script_ref_hash`]'s `NativeScript` arm, Phase-1
-/// Rule 13 (`phase1.rs`), and [`check_extraneous_script_witnesses`]'s
-/// native-witness `received` set (issue #791).
-fn native_script_hash(ns: &NativeScript) -> Hash28 {
-    let script_cbor = dugite_serialization::encode_native_script(ns);
+/// Haskell `hashScript` hashes over the script's ORIGINAL wire bytes (the Timelock
+/// `MemoBytes`), never a canonical re-encode — so a non-canonically-but-validly
+/// encoded native script (indefinite-length outer array, non-minimal integer field)
+/// hashes differently from `encode_native_script(decoded)`. When `original` is
+/// available (decoded transactions), hash over it; fall back to a re-encode only for
+/// locally-constructed scripts whose wire bytes we never had. See issue #862.
+///
+/// Shared by [`compute_script_ref_hash`]'s `NativeScript` arm, Phase-1 Rule 13
+/// (`phase1.rs`), and [`check_extraneous_script_witnesses`]'s native-witness
+/// `received` set (issue #791).
+/// Original wire bytes of every witness native script, indexed, recovered from the
+/// transaction's raw witness-set CBOR. `None` when the raw CBOR is absent (locally
+/// constructed tx) — callers then fall back to a re-encode via [`native_script_hash`].
+/// Every site that hashes a witness native script for matching must use this so the
+/// hash is byte-identical across the whole tx (only non-canonically-encoded scripts
+/// actually differ from a re-encode). See issue #862.
+pub(crate) fn witness_native_original_bytes(tx: &Transaction) -> Option<Vec<Vec<u8>>> {
+    tx.raw_witness_cbor
+        .as_deref()
+        .and_then(dugite_serialization::witness_native_script_original_bytes)
+}
+
+/// Original inner bytes of a reference NATIVE script carried in `utxo`, recovered
+/// from the output's raw CBOR. `None` for Plutus refs / legacy outputs / absent raw.
+pub(crate) fn reference_native_original_bytes(
+    utxo: &dugite_primitives::transaction::TransactionOutput,
+) -> Option<Vec<u8>> {
+    utxo.raw_cbor
+        .as_deref()
+        .and_then(dugite_serialization::reference_native_script_original_bytes)
+}
+
+pub(crate) fn native_script_hash(ns: &NativeScript, original: Option<&[u8]>) -> Hash28 {
+    let reencoded;
+    let script_cbor: &[u8] = match original {
+        Some(bytes) => bytes,
+        None => {
+            reencoded = dugite_serialization::encode_native_script(ns);
+            &reencoded
+        }
+    };
     let mut tagged = Vec::with_capacity(1 + script_cbor.len());
     tagged.push(0x00);
-    tagged.extend_from_slice(&script_cbor);
+    tagged.extend_from_slice(script_cbor);
     dugite_primitives::hash::blake2b_224(&tagged)
 }
 
@@ -160,9 +196,12 @@ fn native_script_hash(ns: &NativeScript) -> Hash28 {
 /// - `0x02` — Plutus V2
 /// - `0x03` — Plutus V3
 /// - `0x04` — Plutus V4 (Dijkstra, issue #475 Phase 5)
-pub(crate) fn compute_script_ref_hash(script_ref: &ScriptRef) -> Hash28 {
+pub(crate) fn compute_script_ref_hash(
+    script_ref: &ScriptRef,
+    native_original: Option<&[u8]>,
+) -> Hash28 {
     match script_ref {
-        ScriptRef::NativeScript(ns) => native_script_hash(ns),
+        ScriptRef::NativeScript(ns) => native_script_hash(ns, native_original),
         ScriptRef::PlutusV1(bytes) => {
             let mut tagged = Vec::with_capacity(1 + bytes.len());
             tagged.push(0x01);
@@ -206,13 +245,17 @@ pub(super) fn collect_available_script_hashes(
 ) -> HashSet<Hash28> {
     let mut hashes = HashSet::new();
 
-    // Native scripts: blake2b_224(0x00 || script_cbor)
-    for script in &tx.witness_set.native_scripts {
-        let script_cbor = dugite_serialization::encode_native_script(script);
-        let mut tagged = Vec::with_capacity(1 + script_cbor.len());
-        tagged.push(0x00);
-        tagged.extend_from_slice(&script_cbor);
-        hashes.insert(dugite_primitives::hash::blake2b_224(&tagged));
+    // Native scripts: blake2b_224(0x00 || original_bytes). Hash over the ORIGINAL
+    // wire bytes of each witness native script (Haskell hashScript over MemoBytes),
+    // recovered from the witness set's raw CBOR; fall back to a re-encode only when
+    // the raw CBOR is absent (locally-constructed tx). See issue #862.
+    let witness_native_raws = tx
+        .raw_witness_cbor
+        .as_deref()
+        .and_then(dugite_serialization::witness_native_script_original_bytes);
+    for (i, script) in tx.witness_set.native_scripts.iter().enumerate() {
+        let original = witness_native_raws.as_ref().and_then(|v| v.get(i)).map(Vec::as_slice);
+        hashes.insert(native_script_hash(script, original));
     }
 
     // Plutus V1: blake2b_224(0x01 || script_bytes)
@@ -248,7 +291,14 @@ pub(super) fn collect_available_script_hashes(
     for inp in tx.body.inputs.iter().chain(tx.body.reference_inputs.iter()) {
         if let Some(utxo) = utxo_set.lookup(inp) {
             if let Some(script_ref) = &utxo.script_ref {
-                hashes.insert(compute_script_ref_hash(script_ref));
+                // For a reference NATIVE script, hash over its original inner bytes
+                // recovered from the output's raw CBOR (#862); Plutus refs already
+                // carry their raw bytes so `native_original` is ignored for them.
+                let native_original = utxo
+                    .raw_cbor
+                    .as_deref()
+                    .and_then(dugite_serialization::reference_native_script_original_bytes);
+                hashes.insert(compute_script_ref_hash(script_ref, native_original.as_deref()));
             }
         }
     }
@@ -872,9 +922,14 @@ pub(super) fn check_extraneous_script_witnesses(
     let body = &tx.body;
 
     // 1. Witness script hashes ("received" — ALL scripts, native included).
+    //    Native scripts hash over their ORIGINAL wire bytes (#862) so a
+    //    non-canonically-encoded witness script matches the same hash the "needed"
+    //    set derives from the on-chain address/policy.
     let mut witness_hashes: HashSet<Hash28> = HashSet::new();
-    for ns in &tx.witness_set.native_scripts {
-        witness_hashes.insert(native_script_hash(ns));
+    let witness_native_raws = witness_native_original_bytes(tx);
+    for (i, ns) in tx.witness_set.native_scripts.iter().enumerate() {
+        let original = witness_native_raws.as_ref().and_then(|v| v.get(i)).map(Vec::as_slice);
+        witness_hashes.insert(native_script_hash(ns, original));
     }
     for s in &tx.witness_set.plutus_v1_scripts {
         witness_hashes.insert(dugite_primitives::hash::blake2b_224_tagged(1, s));
@@ -977,7 +1032,9 @@ pub(super) fn check_extraneous_script_witnesses(
     for input in body.inputs.iter().chain(body.reference_inputs.iter()) {
         if let Some(utxo) = utxo_set.lookup(input) {
             if let Some(script_ref) = &utxo.script_ref {
-                ref_script_hashes.insert(compute_script_ref_hash(script_ref));
+                let native_original = reference_native_original_bytes(&utxo);
+                ref_script_hashes
+                    .insert(compute_script_ref_hash(script_ref, native_original.as_deref()));
             }
         }
     }
@@ -1117,24 +1174,28 @@ pub(super) fn check_malformed_reference_scripts(
             }
             ScriptRef::PlutusV1(bytes) => {
                 if pv < 5 || !plutus_ref_script_decodes(bytes) {
-                    malformed.push(compute_script_ref_hash(script_ref).to_hex());
+                    // Plutus arm only — native_original is unused for Plutus refs.
+                    malformed.push(compute_script_ref_hash(script_ref, None).to_hex());
                 }
             }
             ScriptRef::PlutusV2(bytes) => {
                 if pv < 7 || !plutus_ref_script_decodes(bytes) {
-                    malformed.push(compute_script_ref_hash(script_ref).to_hex());
+                    // Plutus arm only — native_original is unused for Plutus refs.
+                    malformed.push(compute_script_ref_hash(script_ref, None).to_hex());
                 }
             }
             ScriptRef::PlutusV3(bytes) => {
                 if pv < 9 || !plutus_ref_script_decodes(bytes) {
-                    malformed.push(compute_script_ref_hash(script_ref).to_hex());
+                    // Plutus arm only — native_original is unused for Plutus refs.
+                    malformed.push(compute_script_ref_hash(script_ref, None).to_hex());
                 }
             }
             ScriptRef::PlutusV4(bytes) => {
                 // Dijkstra era; PV gate to be confirmed. Conservative: require
                 // PV >= 11 (post-Conway) AND decodes.
                 if pv < 11 || !plutus_ref_script_decodes(bytes) {
-                    malformed.push(compute_script_ref_hash(script_ref).to_hex());
+                    // Plutus arm only — native_original is unused for Plutus refs.
+                    malformed.push(compute_script_ref_hash(script_ref, None).to_hex());
                 }
             }
         }
@@ -1384,6 +1445,35 @@ mod tests {
     use dugite_primitives::hash::{Hash28, Hash32, TransactionHash};
     use dugite_primitives::protocol_params::ProtocolParameters;
     use dugite_primitives::time::SlotNo;
+
+    /// #862: `native_script_hash` hashes over the ORIGINAL wire bytes when supplied
+    /// (Haskell hashScript over MemoBytes), which — for a non-canonically-encoded
+    /// script — differs from the re-encode fallback. `blake2b_224(0x00 || original)`.
+    #[test]
+    fn native_script_hash_uses_original_bytes_862() {
+        // Non-canonical indefinite-length ScriptPubkey: 0x9f 0x00 (0x581c<28>) 0xff
+        let mut original = vec![0x9f, 0x00, 0x58, 0x1c];
+        original.extend_from_slice(&[0xAB; 28]);
+        original.push(0xff);
+        let ns = dugite_serialization::decode_native_script_cbor(&original).unwrap();
+
+        let h_orig = native_script_hash(&ns, Some(&original));
+        let mut tagged = vec![0x00];
+        tagged.extend_from_slice(&original);
+        assert_eq!(
+            h_orig,
+            dugite_primitives::hash::blake2b_224(&tagged),
+            "must hash 0x00 || original_bytes"
+        );
+
+        // The re-encode fallback yields a DIFFERENT hash for this non-canonical form,
+        // which is exactly the divergence the fix removes.
+        let h_reencode = native_script_hash(&ns, None);
+        assert_ne!(
+            h_orig, h_reencode,
+            "original-bytes hash must differ from the re-encode for a non-canonical script"
+        );
+    }
     use dugite_primitives::transaction::OutputDatum;
     use dugite_primitives::transaction::{
         NativeScript, ScriptRef, Transaction, TransactionInput, TransactionOutput,
@@ -1668,7 +1758,7 @@ mod tests {
         let ns = NativeScript::ScriptPubkey(kh);
         let script_ref_native = ScriptRef::NativeScript(ns.clone());
 
-        let computed = compute_script_ref_hash(&script_ref_native);
+        let computed = compute_script_ref_hash(&script_ref_native, None);
 
         // Manually reproduce: blake2b_224(0x00 || script_cbor)
         let script_cbor = dugite_serialization::encode_native_script(&ns);
@@ -1685,7 +1775,7 @@ mod tests {
         // --- Plutus V2: tag 0x02 ---
         let plutus_v2_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03];
         let script_ref_v2 = ScriptRef::PlutusV2(plutus_v2_bytes.clone());
-        let computed_v2 = compute_script_ref_hash(&script_ref_v2);
+        let computed_v2 = compute_script_ref_hash(&script_ref_v2, None);
 
         let mut tagged_v2 = Vec::with_capacity(1 + plutus_v2_bytes.len());
         tagged_v2.push(0x02u8);
@@ -1941,7 +2031,7 @@ mod tests {
     fn test_extraneous_native_witness_script_rejected() {
         let kh = key_hash(0x77);
         let ns = NativeScript::ScriptPubkey(kh);
-        let ns_hash = native_script_hash(&ns);
+        let ns_hash = native_script_hash(&ns, None);
 
         let mut tx = Transaction::empty_with_hash(TransactionHash::from_bytes([0xCC; 32]));
         tx.witness_set.native_scripts.push(ns);
@@ -1980,7 +2070,7 @@ mod tests {
 
         let kh = key_hash(0x78);
         let ns = NativeScript::ScriptPubkey(kh);
-        let ns_hash = native_script_hash(&ns);
+        let ns_hash = native_script_hash(&ns, None);
 
         let address = Address::Base(BaseAddress {
             network: dugite_primitives::network::NetworkId::Testnet,
@@ -2020,7 +2110,7 @@ mod tests {
     fn test_native_witness_script_matching_only_a_native_ref_script_is_extraneous() {
         let kh = key_hash(0x79);
         let ns = NativeScript::ScriptPubkey(kh);
-        let ns_hash = native_script_hash(&ns);
+        let ns_hash = native_script_hash(&ns, None);
 
         // The script-locked spending input is satisfied via a NATIVE
         // reference script attached to a reference input — not via the

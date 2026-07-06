@@ -75,6 +75,13 @@ pub use era_conway::ppu_from_cbor;
 /// typed `ScriptRef::NativeScript` from a MemPack reference-script blob.
 pub use era_conway::decode_native_script_cbor;
 
+/// Extract the original wire bytes of native scripts (witness-set key 1, and a
+/// reference script in an output) so the ledger can hash them over their ORIGINAL
+/// bytes (`hashScript` over MemoBytes) rather than a canonical re-encode. See #862.
+pub use era_conway::{
+    reference_native_script_original_bytes, witness_native_script_original_bytes,
+};
+
 /// Decode an inline-datum `PlutusData` from its bare CBOR encoding.
 /// Re-exported so the Mithril / Haskell-import UTxO loader can reconstruct a
 /// typed `OutputDatum::InlineDatum` from a MemPack TxOut (tags 4/5).

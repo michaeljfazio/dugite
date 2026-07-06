@@ -918,7 +918,8 @@ fn collect_plutus_script_hashes(tx: &Transaction, utxo_set: &dyn UtxoLookup) -> 
                     | ScriptRef::PlutusV4(_) => {
                         // V4 (Dijkstra) requires a redeemer like V1/V2/V3
                         // (issue #475 Phase 5; full validator integration TBD).
-                        hashes.insert(compute_script_ref_hash(script_ref));
+                        // Plutus refs only (native excluded above) — no native_original.
+                        hashes.insert(compute_script_ref_hash(script_ref, None));
                     }
                     // Native scripts do not require redeemers.
                     ScriptRef::NativeScript(_) => {}
@@ -960,7 +961,8 @@ pub(crate) fn plutus_script_version_map(
                     ScriptRef::PlutusV4(_) => 4,
                     ScriptRef::NativeScript(_) => continue,
                 };
-                map.insert(compute_script_ref_hash(script_ref), tag);
+                // Plutus refs only (native `continue`d above) — no native_original.
+                map.insert(compute_script_ref_hash(script_ref, None), tag);
             }
         }
     }
