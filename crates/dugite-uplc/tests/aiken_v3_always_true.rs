@@ -21,6 +21,7 @@
 //! `#[ignore]` attribute should be removed.
 
 use dugite_uplc::{Constant, Data, Program, Term};
+use num_bigint::BigInt;
 use std::rc::Rc;
 
 /// Inner flat bytes (post-CBOR-unwrap) of the canonical Aiken-built
@@ -66,7 +67,10 @@ fn decode_succeeds() {
 fn cek_reaches_body_no_var_lookup_failure() {
     let p = Program::from_cbor(AIKEN_V3_ALWAYS_TRUE_CBOR)
         .expect("decode canonical Aiken V3 always-true");
-    let stub_ctx = Data::Constr(0, vec![Data::Constr(0, vec![]); 4]);
+    let stub_ctx = Data::Constr(
+        BigInt::from(0),
+        vec![Data::Constr(BigInt::from(0), vec![]); 4],
+    );
     let applied = Term::App(
         Rc::new(p.term),
         Rc::new(Term::Const(Constant::Data(stub_ctx))),

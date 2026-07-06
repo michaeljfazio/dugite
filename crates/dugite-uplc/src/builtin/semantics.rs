@@ -154,10 +154,10 @@ impl SemanticsVariant {
     /// Whether `constrData`'s tag argument is unlifted as `Word64` (range
     /// `0..=2^64-1`, a genuine evaluation failure outside that range).
     /// `true` for D/E (PV ≥ `VAN_ROSSEM_PV`); `false` for A/B/C, where the
-    /// argument type is plain `Integer` (no bound). See issue #828.5 —
-    /// dugite's `Data::Constr` tag field is `u64`, so the A/B/C branch is
-    /// necessarily a best-effort approximation for transient values outside
-    /// the u64 range (see the call site doc comment for the scoped gap).
+    /// argument type is plain `Integer` (no bound). See issues #828.5/#859
+    /// — `Data::Constr`'s tag field is an arbitrary-precision `BigInt`
+    /// (matching Haskell's `Integer` exactly), so the A/B/C branch holds
+    /// precisely the same domain as Haskell with no representational gap.
     pub fn constr_data_requires_word64(self) -> bool {
         matches!(self, SemanticsVariant::D | SemanticsVariant::E)
     }

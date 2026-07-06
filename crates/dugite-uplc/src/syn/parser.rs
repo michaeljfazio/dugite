@@ -910,7 +910,14 @@ impl<'a> Parser<'a> {
             "List" => Ok(Data::List(self.parse_data_list()?)),
             "Map" => Ok(Data::Map(self.parse_data_map()?)),
             "Constr" => {
-                let tag = self.parse_uint_u64()?;
+                // The tag is an arbitrary-precision signed `Integer` in
+                // Haskell (`Data = Constr Integer [Data] | ...`), matching
+                // `Data::Constr`'s `BigInt` tag (#859) — use the same
+                // signed-integer parser as the `I` atom rather than the
+                // Word64-bounded `parse_uint_u64`, so the textual syntax
+                // can express the full domain (including a transient
+                // negative/oversized tag a script can construct pre-PV11).
+                let tag = self.parse_signed_int()?;
                 self.skip_trivia();
                 let args = self.parse_data_list()?;
                 Ok(Data::Constr(tag, args))

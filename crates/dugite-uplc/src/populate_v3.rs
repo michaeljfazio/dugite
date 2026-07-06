@@ -520,20 +520,21 @@ mod tests {
             panic!("cert must be Constr; got {d:?}");
         };
         assert_eq!(
-            *tag, 1u64,
+            tag,
+            &BigInt::from(1),
             "StakeDeregistration -> TxCertUnRegStaking (Constr 1)"
         );
         assert_eq!(fields.len(), 2, "must have credential + Maybe");
         // credential = PubKeyCredential([0xcc;28]) = Constr 0 [B28]
         assert!(
-            matches!(&fields[0], crate::data::Data::Constr(0, inner) if inner.len() == 1),
+            matches!(&fields[0], crate::data::Data::Constr(tag, inner) if tag == &BigInt::from(0) && inner.len() == 1),
             "credential must be Constr 0 [B28]; got {:?}",
             fields[0]
         );
         // deposit field = None (pre-Conway StakeDeregistration has no deposit) = Constr 1 []
         assert_eq!(
             fields[1],
-            crate::data::Data::Constr(1, vec![]),
+            crate::data::Data::Constr(BigInt::from(1), vec![]),
             "pre-Conway StakeDeregistration deposit must be None (Constr 1 [])"
         );
     }
@@ -783,13 +784,15 @@ mod tests {
         // Haskell: PlutusLedgerApi.V3.Contexts — TxId newtype deriving ToData from
         //   BuiltinByteString → bare B(32) in the TxOutRef payload.
         let spend_data = info.redeemers[0].0.to_data_v3();
-        let Data::Constr(1, ref spend_fields) = spend_data else {
+        let Data::Constr(ref spend_tag, ref spend_fields) = spend_data else {
             panic!("Spending ScriptPurpose must be Constr 1; got {spend_data:?}");
         };
+        assert_eq!(spend_tag, &BigInt::from(1));
         // TxOutRef = Constr 0 [B32 (bare), I idx]  — V3 bare-txid form
-        let Data::Constr(0, ref txoutref_fields) = spend_fields[0] else {
+        let Data::Constr(ref txoutref_tag, ref txoutref_fields) = spend_fields[0] else {
             panic!("TxOutRef must be Constr 0; got {:?}", spend_fields[0]);
         };
+        assert_eq!(txoutref_tag, &BigInt::from(0));
         assert_eq!(txoutref_fields.len(), 2);
         // V3: txid must be BARE B(32), NOT Constr 0 [B(32)]
         assert!(
@@ -799,7 +802,7 @@ mod tests {
         );
         // Must NOT be the double-wrapped V1/V2 Constr 0 [B32] form
         assert!(
-            !matches!(&txoutref_fields[0], Data::Constr(0, _)),
+            !matches!(&txoutref_fields[0], Data::Constr(tag, _) if tag == &BigInt::from(0)),
             "V3 TxOutRef txid must NOT be Constr-wrapped (that is V1/V2 form)"
         );
     }
@@ -852,20 +855,22 @@ mod tests {
         // makeIsDataSchemaIndexed ''ScriptPurpose [('Voting, 4)]
         // Use to_data_v3() to reflect actual serialization path (same for Voting).
         let purpose_data = info.redeemers[0].0.to_data_v3();
-        let Data::Constr(4, ref voter_fields) = purpose_data else {
+        let Data::Constr(ref purpose_tag, ref voter_fields) = purpose_data else {
             panic!("Voting ScriptPurpose must be Constr 4; got {purpose_data:?}");
         };
+        assert_eq!(purpose_tag, &BigInt::from(4));
         assert_eq!(voter_fields.len(), 1);
         // Voter::DRepVoter(DRepCredential(Script(...))) = Constr 1 [Constr 1 [B28]]
         // DRepCredential is newtype deriving ToData from Credential → bare Credential
         // ScriptCredential = Constr 1 [B28]
-        let Data::Constr(1, ref drep_fields) = voter_fields[0] else {
+        let Data::Constr(ref voter_tag, ref drep_fields) = voter_fields[0] else {
             panic!("DRepVoter must be Constr 1; got {:?}", voter_fields[0]);
         };
+        assert_eq!(voter_tag, &BigInt::from(1));
         assert_eq!(drep_fields.len(), 1);
         // DRepCredential passes through to Credential (Constr 1 for Script)
         assert!(
-            matches!(&drep_fields[0], Data::Constr(1, inner) if inner.len() == 1),
+            matches!(&drep_fields[0], Data::Constr(tag, inner) if tag == &BigInt::from(1) && inner.len() == 1),
             "DRepCredential(ScriptCredential) must be Constr 1 [B28]; got {:?}",
             drep_fields[0]
         );
