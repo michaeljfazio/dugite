@@ -45,7 +45,9 @@ pub struct Scalars {
     pub treasury_pre_rupd: u64,
     pub ss_fee: u64,
     pub bprev_total_blocks: u64,
-    pub delta_reserves: u64,
+    /// Signed RUPD reserves adjustment (see `PendingRewardUpdate::delta_reserves`
+    /// and issue #796) — negative means reserves increased this boundary.
+    pub delta_reserves: i128,
     pub delta_treasury: u64,
     pub total_rupd_credits: u64,
     /// Decentralisation `d` captured from the previous epoch — exact

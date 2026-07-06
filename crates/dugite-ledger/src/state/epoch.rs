@@ -103,12 +103,9 @@ impl LedgerState {
             };
             let rupd =
                 self.calculate_rewards_full(&go_snapshot, &bprev, self.epochs.snapshots.ss_fee);
-            self.epochs.reserves.0 = self
-                .epochs
-                .reserves
-                .0
-                .checked_sub(rupd.delta_reserves)
-                .expect("RUPD delta_reserves exceeds reserves — ledger invariant broken");
+            // Signed reserves adjustment — see issue #796.
+            self.epochs.reserves.0 =
+                super::rewards::apply_reserves_delta(self.epochs.reserves.0, rupd.delta_reserves);
             self.epochs.treasury.0 = self
                 .epochs
                 .treasury

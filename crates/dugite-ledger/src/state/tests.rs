@@ -4996,11 +4996,16 @@ fn test_mir_stake_credentials_debits_treasury() {
 
 #[test]
 fn test_mir_compound_credential_and_pot_transfer() {
-    // Per Haskell `applyMIR` MIR application is unconditional: any cert
-    // whose delta would underflow the source pot must have been rejected
-    // upstream by `validateMIRCert` (`InsufficientForInstantaneousRewards`).
-    // After issue #631 the apply path panics on such a scenario instead of
-    // silently capping at the available balance.
+    // Updated for issue #803 (2026-07-06): per the cardano-ledger-oracle
+    // (`Cardano.Ledger.Shelley.Rules.Mir.mirTransition`), an insolvent MIR
+    // pot-to-pot transfer is a total, non-throwing `NoMirTransfer` — both
+    // pots are left byte-identical and the pending accumulators are
+    // cleared, never a panic. `validateMIRCert`
+    // (`InsufficientForInstantaneousRewards`) *should* reject this
+    // upstream, but dugite's Phase-1 admission has documented gaps (see
+    // `validation/mir.rs`), so the apply-time boundary must fail safe.
+    // This test used to assert the opposite (a panic) — that was exactly
+    // the #803 bug.
     let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
     state.epochs.reserves = Lovelace(10_000_000);
     state.epochs.treasury = Lovelace(5_000_000);
@@ -5018,24 +5023,31 @@ fn test_mir_compound_credential_and_pot_transfer() {
     assert_eq!(state.epochs.reserves, Lovelace(2_000_000));
     assert_eq!(state.certs.reward_accounts[&key], Lovelace(8_000_000));
 
-    // Now a 5M pot transfer with only 2M reserves: invalid per Haskell.
+    // Now a 5M pot transfer with only 2M reserves: insolvent.
     state.process_certificate(&Certificate::MoveInstantaneousRewards {
         source: MIRSource::Reserves,
         target: MIRTarget::OtherAccountingPot(5_000_000),
     });
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::state::certificates::apply_pending_mir(&mut state.certs, &mut state.epochs)
-    }));
-    assert!(
-        result.is_err(),
-        "apply_pending_mir must panic when delta exceeds source pot"
+    crate::state::certificates::apply_pending_mir(&mut state.certs, &mut state.epochs);
+
+    assert_eq!(
+        state.epochs.reserves,
+        Lovelace(2_000_000),
+        "NoMirTransfer: reserves must be left unchanged, not underflowed/panicked"
     );
+    assert_eq!(
+        state.epochs.treasury,
+        Lovelace(5_000_000),
+        "NoMirTransfer: treasury must be left unchanged"
+    );
+    assert_eq!(state.certs.pending_mir_delta_reserves, 0);
 }
 
 #[test]
 fn test_mir_pot_transfer_exceeds_source_treasury() {
     // Symmetric case for treasury → reserves pot transfer that exceeds
-    // available balance.
+    // available balance — NoMirTransfer, not a panic (issue #803; see
+    // comment on `test_mir_compound_credential_and_pot_transfer`).
     let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
     state.epochs.reserves = Lovelace(20_000_000);
     state.epochs.treasury = Lovelace(3_000_000);
@@ -5054,19 +5066,25 @@ fn test_mir_pot_transfer_exceeds_source_treasury() {
         source: MIRSource::Treasury,
         target: MIRTarget::OtherAccountingPot(10_000_000),
     });
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::state::certificates::apply_pending_mir(&mut state.certs, &mut state.epochs)
-    }));
-    assert!(
-        result.is_err(),
-        "apply_pending_mir must panic when treasury delta exceeds source pot"
+    crate::state::certificates::apply_pending_mir(&mut state.certs, &mut state.epochs);
+
+    assert_eq!(
+        state.epochs.reserves,
+        Lovelace(20_000_000),
+        "NoMirTransfer: reserves must be left unchanged"
     );
+    assert_eq!(
+        state.epochs.treasury,
+        Lovelace(1_000_000),
+        "NoMirTransfer: treasury must be left unchanged, not underflowed/panicked"
+    );
+    assert_eq!(state.certs.pending_mir_delta_treasury, 0);
 }
 
 #[test]
 fn test_mir_pot_transfer_zero_source() {
-    // Edge case: a pot transfer from an already-empty source pot is an
-    // invariant violation per Haskell and panics on apply.
+    // Edge case: a pot transfer from an already-empty source pot is
+    // insolvent — NoMirTransfer, not a panic (issue #803).
     let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
     state.epochs.reserves = Lovelace(0);
     state.epochs.treasury = Lovelace(5_000_000);
@@ -5075,13 +5093,19 @@ fn test_mir_pot_transfer_zero_source() {
         source: MIRSource::Reserves,
         target: MIRTarget::OtherAccountingPot(1_000_000),
     });
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::state::certificates::apply_pending_mir(&mut state.certs, &mut state.epochs)
-    }));
-    assert!(
-        result.is_err(),
-        "apply_pending_mir must panic on pot transfer from empty source"
+    crate::state::certificates::apply_pending_mir(&mut state.certs, &mut state.epochs);
+
+    assert_eq!(
+        state.epochs.reserves,
+        Lovelace(0),
+        "NoMirTransfer: reserves must be left unchanged, not panicked"
     );
+    assert_eq!(
+        state.epochs.treasury,
+        Lovelace(5_000_000),
+        "NoMirTransfer: treasury must be left unchanged"
+    );
+    assert_eq!(state.certs.pending_mir_delta_reserves, 0);
 }
 
 #[test]
@@ -6604,8 +6628,15 @@ fn test_reward_zero_reserves_no_expansion() {
     let reserves_before = state.epochs.reserves.0;
     let treasury_before = state.epochs.treasury.0;
 
-    // With zero reserves, expansion = floor(rho * 0) = 0
-    // Only fees are distributed
+    // With zero reserves, expansion = floor(rho * 0) = 0, so
+    // total_rewards_available = epoch_fees = 1_000_000. No pools ⇒
+    // total_active_stake == 0 branch: treasury_cut = floor(tau *
+    // total_rewards_available) = floor(0.2 * 1_000_000) = 200_000, and the
+    // remaining 800_000 (fees not claimed by treasury or any pool) is
+    // refunded to RESERVES per Haskell's signed `deltaR` — issue #796.
+    // Before #796 this was silently dropped (`saturating_sub` floored the
+    // credit to 0), which is what this test used to (incorrectly) pin as
+    // "reserves should not change".
     let snapshot = StakeSnapshot {
         epoch: EpochNo(1),
         delegations: Arc::new(std::collections::HashMap::new()),
@@ -6619,13 +6650,15 @@ fn test_reward_zero_reserves_no_expansion() {
     state.calculate_and_distribute_rewards(snapshot);
 
     assert_eq!(
-        state.epochs.reserves.0, reserves_before,
-        "Reserves should not change when already at 0"
+        state.epochs.reserves.0,
+        reserves_before + 800_000,
+        "Reserves must be CREDITED with the undistributed fee remainder \
+         (fees - treasury_cut) when reserves start at 0 and no pools exist (#796)"
     );
-    // treasury gets tau * fees + undistributed
-    assert!(
-        state.epochs.treasury.0 >= treasury_before,
-        "Treasury should increase from fees"
+    assert_eq!(
+        state.epochs.treasury.0,
+        treasury_before + 200_000,
+        "Treasury should increase by exactly treasury_cut = floor(tau * fees)"
     );
 }
 
@@ -12974,11 +13007,11 @@ fn test_reward_cross_validation_epoch_1239() {
     //   distributed=0, undistributed=reward_pot.
     // #615b: Haskell refunds undistributed to reserves via deltaR. Therefore:
     //   delta_treasury = treasury_cut
-    //   delta_reserves = treasury_cut - epoch_fees (unsigned subtract from reserves)
+    //   delta_reserves = treasury_cut - epoch_fees (signed; #796)
     let rupd = state.calculate_rewards(&go_snapshot);
 
     let expected_delta_treasury = expected_treasury_cut;
-    let expected_delta_reserves = expected_treasury_cut - FEES_1239;
+    let expected_delta_reserves: i128 = expected_treasury_cut as i128 - FEES_1239 as i128;
     assert_eq!(
         rupd.delta_treasury, expected_delta_treasury,
         "delta_treasury (no-pool, #615b) must equal treasury_cut: \

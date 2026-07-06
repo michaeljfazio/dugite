@@ -35,7 +35,7 @@ use tracing::{debug, info};
 use super::common;
 use super::{EraRules, RuleContext};
 use crate::state::substates::*;
-use crate::state::{BlockValidationMode, LedgerError, StakeSnapshot};
+use crate::state::{apply_reserves_delta, BlockValidationMode, LedgerError, StakeSnapshot};
 use crate::utxo_diff::UtxoDiff;
 
 /// Stateless Shelley/Allegra/Mary era rule strategy.
@@ -326,11 +326,8 @@ impl EraRules for ShelleyRules {
 
         // Step 1: Apply pending reward update (backward compat for old snapshots).
         if let Some(rupd) = epochs.pending_reward_update.take() {
-            epochs.reserves.0 = epochs
-                .reserves
-                .0
-                .checked_sub(rupd.delta_reserves)
-                .expect("RUPD delta_reserves exceeds reserves — ledger invariant broken");
+            // Signed reserves adjustment — see issue #796.
+            epochs.reserves.0 = apply_reserves_delta(epochs.reserves.0, rupd.delta_reserves);
             epochs.treasury.0 = epochs
                 .treasury
                 .0
@@ -464,12 +461,8 @@ impl EraRules for ShelleyRules {
                 );
             }
 
-            // Apply RUPD: adjust reserves and treasury
-            epochs.reserves.0 = epochs
-                .reserves
-                .0
-                .checked_sub(rupd.delta_reserves)
-                .expect("RUPD delta_reserves exceeds reserves — ledger invariant broken");
+            // Apply RUPD: adjust reserves and treasury (signed — issue #796)
+            epochs.reserves.0 = apply_reserves_delta(epochs.reserves.0, rupd.delta_reserves);
             epochs.treasury.0 = epochs
                 .treasury
                 .0

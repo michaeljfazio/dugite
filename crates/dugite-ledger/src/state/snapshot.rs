@@ -428,7 +428,16 @@ impl LedgerState {
     /// `last_ratified`, and `RatificationSnapshot::proposals`) — a snapshot
     /// written by a prior binary must be quarantined, not silently
     /// misinterpreted.
-    pub(crate) const SNAPSHOT_VERSION: u8 = 26;
+    /// v27 (#796): `PendingRewardUpdate::delta_reserves` changed from `u64`
+    /// to `i128` so a degraded/low-block epoch (`epoch_fees` exceeding
+    /// `treasury_cut + total_distributed`) can represent Haskell's signed
+    /// `deltaR` reserves credit instead of silently saturating it to 0.
+    /// `PendingRewardUpdate` is embedded in every `LedgerState` snapshot via
+    /// `EpochSubState::pending_reward_update` / `last_applied_rupd`, so this
+    /// is a positional bincode layout change — a snapshot written by a
+    /// prior binary must be quarantined, not silently misinterpreted as a
+    /// `u64`.
+    pub(crate) const SNAPSHOT_VERSION: u8 = 27;
 
     /// Save ledger state snapshot to disk using bincode serialization.
     ///
