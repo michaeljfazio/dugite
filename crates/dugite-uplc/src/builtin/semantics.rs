@@ -129,6 +129,38 @@ impl SemanticsVariant {
     pub fn bitwise_max_input_enforced(self) -> bool {
         matches!(self, SemanticsVariant::D | SemanticsVariant::E)
     }
+
+    /// Whether `appendString`/`equalsString`/`encodeUtf8` size their `Text`
+    /// argument(s) by UTF-8 byte-length ÷ 4 (`TextCostedByByteLength`).
+    /// `true` for D/E (PV ≥ `VAN_ROSSEM_PV`); `false` for A/B/C
+    /// (PV < `VAN_ROSSEM_PV`), which use plain `ExMemoryUsage Text` =
+    /// character count. See issue #819 and
+    /// `PlutusCore/Default/Builtins.hs:1499-1579`
+    /// (`*_V1` char-count vs `*_V2` byte/4).
+    pub fn text_costed_by_byte_length(self) -> bool {
+        matches!(self, SemanticsVariant::D | SemanticsVariant::E)
+    }
+
+    /// Whether the PLC 1.1.0 `case`-on-Constant ("caser builtin") feature is
+    /// available. `true` for D/E (PV ≥ `VAN_ROSSEM_PV`); `false` for A/B/C,
+    /// where Haskell's `unCaserBuiltin` is `unavailableCaserBuiltin` and a
+    /// `case` whose scrutinee reduces to a plain constant fails with
+    /// `CekCaseBuiltinError`. `case` on a `Constr` scrutinee is unaffected
+    /// by this gate. See issue #824.
+    pub fn case_on_constant_available(self) -> bool {
+        matches!(self, SemanticsVariant::D | SemanticsVariant::E)
+    }
+
+    /// Whether `constrData`'s tag argument is unlifted as `Word64` (range
+    /// `0..=2^64-1`, a genuine evaluation failure outside that range).
+    /// `true` for D/E (PV ≥ `VAN_ROSSEM_PV`); `false` for A/B/C, where the
+    /// argument type is plain `Integer` (no bound). See issue #828.5 —
+    /// dugite's `Data::Constr` tag field is `u64`, so the A/B/C branch is
+    /// necessarily a best-effort approximation for transient values outside
+    /// the u64 range (see the call site doc comment for the scoped gap).
+    pub fn constr_data_requires_word64(self) -> bool {
+        matches!(self, SemanticsVariant::D | SemanticsVariant::E)
+    }
 }
 
 #[cfg(test)]

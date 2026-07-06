@@ -132,14 +132,27 @@ pub fn denote(
             let mut it = args.into_iter();
             let msg = it.next().ok_or_else(|| builtin_arity_mismatch(id))?;
             let rest = it.next().ok_or_else(|| builtin_arity_mismatch(id))?;
-            // Extract the string from the first arg; any non-String value is
-            // silently ignored (matches Haskell's `Text` expectation — the
-            // type system ensures it's always a String at the Plutus level,
-            // but we stay defensive here).
+            // `trace : Text -> a -> a`. Haskell defers unlifting to full
+            // saturation; since `trace` takes exactly 2 args, saturation
+            // unlifts the first arg as `Text` IMMEDIATELY. A non-Text
+            // constant fails with `BuiltinUnliftingEvaluationError` — a
+            // genuine evaluation FAILURE, not a silently-ignored no-op that
+            // falls through to returning the second argument (#828.1,
+            // oracle-confirmed against `PlutusCore/Default/Builtins.hs`
+            // `traceDenotation` + the unlifting machinery in
+            // `PlutusCore/Builtin/KnownType.hs`). Not semvar-gated — single
+            // impl at every protocol version.
+            let Value::Const(Constant::String(s)) = &msg else {
+                return Err(UplcError::BuiltinTypeError {
+                    builtin: id.name(),
+                    reason: format!(
+                        "trace expected Text first arg, got {:?}",
+                        std::mem::discriminant(&msg)
+                    ),
+                });
+            };
             if let Some(log) = trace_log {
-                if let Value::Const(Constant::String(s)) = &msg {
-                    log.push(s.clone());
-                }
+                log.push(s.clone());
             }
             Ok(rest)
         }
@@ -197,15 +210,27 @@ pub fn denote(
             Ok(Value::Const(Constant::ByteString(out)))
         }
         SliceByteString => {
-            // sliceByteString : start -> length -> bs -> sliced
-            // Haskell: BS.take length (BS.drop start bs).
-            // Negative or out-of-range indices clamp to zero / EOF.
+            // sliceByteString : Int -> Int -> bs -> sliced
+            // Haskell denotation: `BS.take len (BS.drop start bs)` — a pure,
+            // non-failing function once its `Int` args are in hand. BUT the
+            // PLC-visible argument type is `integer`; `Int` is unlifted from
+            // it via a bounds-check against `Int64` (`[-2^63, 2^63-1]`),
+            // throwing `operationalUnliftingError` OUTSIDE that range — this
+            // happens BEFORE `take`/`drop` ever run, so an out-of-Int64
+            // start/length is an evaluation FAILURE, not a silent clamp
+            // (#828.2, oracle-confirmed against
+            // `PlutusCore/Default/Universe.hs` `readKnownAsInteger` +
+            // `PlutusCore/Default/Builtins.hs`). Values that survive the
+            // Int64 unlift then clamp via `BS.take`/`BS.drop`'s own
+            // saturating semantics (negative → 0, past-EOF → end).
             let mut it = args.into_iter();
             let start = unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
             let len = unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
             let bs = unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
-            let start = bigint_to_usize_clamped(&start);
-            let len = bigint_to_usize_clamped(&len);
+            let start = bigint_to_i64_or_failure(&start, id, "sliceByteString start")?;
+            let len = bigint_to_i64_or_failure(&len, id, "sliceByteString length")?;
+            let start = i64_to_usize_clamped(start);
+            let len = i64_to_usize_clamped(len);
             let start_clamped = start.min(bs.len());
             let end_clamped = start_clamped.saturating_add(len).min(bs.len());
             Ok(Value::Const(Constant::ByteString(
@@ -471,13 +496,52 @@ pub fn denote(
         }
         ConstrData => {
             // (tag : Integer) (args : ProtoList Data) -> Data
+            //
+            // #828.5 (oracle: `PlutusCore/Default/Builtins.hs` ~L1737-1751):
+            // genuinely PV-gated, not just a perf/representation swap. At
+            // D/E (PV >= `VAN_ROSSEM_PV`) the argument type is `Word64` —
+            // unlifting itself rejects a tag outside `0..=2^64-1` as an
+            // evaluation failure. At A/B/C (PV < `VAN_ROSSEM_PV`) the
+            // argument type is plain `Integer` — Haskell accepts ANY tag
+            // (negative or arbitrarily large) and builds `Constr tag args`
+            // with it (Haskell's `Data.Constr` field is `Integer`, not
+            // `Word64` — the CBOR wire format's Word64-tag requirement is a
+            // SEPARATE, PV-independent decode-time constraint that applies
+            // only to on-chain datums/redeemers, never to a value computed
+            // transiently inside a running script).
+            //
+            // KNOWN LIMITATION: dugite's `Data::Constr` tag field is `u64`
+            // (matching that on-chain decode constraint, since no valid
+            // on-chain Data can carry an out-of-range tag in ANY era). A
+            // witness script that TRANSIENTLY computes `constrData` with a
+            // negative or >u64::MAX tag at PV < 11 and does not immediately
+            // fail is therefore still mis-evaluated here: real cardano-node
+            // continues running (holding a `Data::Constr` with an arbitrary
+            // BigInt tag) while dugite cannot represent it and must error
+            // out. This is the lowest-reachability edge of #828 (transient,
+            // adversarial, pre-PV11 only, never observable on-chain) —
+            // fixing it fully requires widening `Data::Constr`'s tag to a
+            // signed/bignum type, which is out of scope here. We at least
+            // avoid mislabeling the gap as a genuine protocol-level
+            // `BuiltinFailure` (only correct for the D/E branch) by
+            // surfacing it as an `Internal` (representational) error for
+            // A/B/C instead.
             let mut it = args.into_iter();
             let tag = unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
             let list = it.next().ok_or_else(|| builtin_arity_mismatch(id))?;
             let (_, elems) = unwrap_proto_list(list, id)?;
             let tag_u64 = match u64::try_from(&tag) {
                 Ok(n) => n,
-                _ => return Err(builtin_failure(id, "constrData tag out of u64 range")),
+                Err(_) if variant.constr_data_requires_word64() => {
+                    return Err(builtin_failure(id, "constrData tag out of u64 range"));
+                }
+                Err(_) => {
+                    return Err(UplcError::Internal(format!(
+                        "constrData: tag {tag} is outside u64 range; dugite's Data::Constr \
+                         representation cannot hold this pre-PV11 transient value \
+                         (known limitation, see issue #828.5)"
+                    )));
+                }
             };
             let data_args: Result<Vec<crate::data::Data>, _> = elems
                 .into_iter()
@@ -787,28 +851,38 @@ pub fn denote(
         ExpModInteger => {
             // (base: Integer) (exp: Integer) (modulus: Integer) -> Integer
             //
-            // Reference (`PlutusCore.Crypto.ExpMod.expMod`):
+            // Full two-layer contract, oracle-confirmed against
+            // `PlutusCore/Default/Builtins.hs` (outer `m < 0` guard) +
+            // `PlutusCore/Crypto/ExpMod.hs` (`expMod`, inner guards),
+            // `maxBoundN = 2^8191 - 1`, `[minBoundI, maxBoundI] =
+            // [-2^8191, 2^8191-1]` (#828.4):
             //   * m <= 0 → fail ("invalid modulus")
-            //   * m == 1 → 0
+            //   * m > 2^8191 - 1 → fail ("invalid modulus")
+            //   * m == 1 → 0 (special-cased BEFORE the b/e bounds check)
             //   * b == 0 && e < 0 → fail ("not invertible")
-            //   * |b| or |e| > 2^8191 → fail ("out of bounds")
+            //   * b or e outside [-2^8191, 2^8191-1] (ASYMMETRIC inclusive
+            //     range — note `-2^8191` itself is VALID, only `+2^8191`
+            //     and beyond are rejected) → fail ("out of bounds")
             //   * otherwise → b^e mod m, where negative e uses the
             //     modular inverse of b mod m (fails when none exists).
             let mut it = args.into_iter();
             let base = unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
             let exp = unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
             let modulus = unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            // `bound = 2^8191`. Modulus must be `0 < m <= bound - 1`;
+            // base/exp must be `-bound <= x <= bound - 1`.
+            let bound = BigInt::from(1u32) << 8191u32;
             if modulus.sign() != num_bigint::Sign::Plus {
+                return Err(builtin_failure(id, "expModInteger: invalid modulus"));
+            }
+            if modulus >= bound {
                 return Err(builtin_failure(id, "expModInteger: invalid modulus"));
             }
             if modulus == BigInt::from(1u32) {
                 return Ok(Value::Const(Constant::Integer(BigInt::from(0u32))));
             }
-            // Out-of-bounds guard matches the Plutus `maxBoundI` / `minBoundI`
-            // (= ±(2^8191)).
-            let max_bound = BigInt::from(1u32) << 8191u32;
-            if base.magnitude() >= max_bound.magnitude() || exp.magnitude() >= max_bound.magnitude()
-            {
+            let neg_bound = -&bound;
+            if base < neg_bound || base >= bound || exp < neg_bound || exp >= bound {
                 return Err(builtin_failure(id, "expModInteger: out of bounds"));
             }
             if exp.sign() == num_bigint::Sign::Minus {
@@ -1023,6 +1097,23 @@ pub fn denote(
                     ));
                 }
             };
+            // #828.3: `secp256k1_ecdsa_signature_parse_compact` (the C
+            // library Haskell's `cardano-crypto-class` wraps) only rejects
+            // scalar OVERFLOW (r or s >= curve order n) at parse time —
+            // zero is not an overflow, so a zero r or s PARSES successfully
+            // there. The zero-scalar rejection happens later, inside
+            // `secp256k1_ecdsa_sig_verify`, and produces a successful
+            // `False` result — NOT a parse/evaluation failure. k256's
+            // `Signature::from_bytes` is stricter and rejects a zero scalar
+            // at parse, which would otherwise surface as a `BuiltinFailure`
+            // here and diverge from Haskell (oracle-confirmed against
+            // bitcoin-core/secp256k1 `src/{secp256k1.c,ecdsa_impl.h}`).
+            // Detect a zero r or s half directly on the raw bytes and
+            // short-circuit to `False` before handing off to k256.
+            let (r_half, s_half) = sig_arr.split_at(32);
+            if r_half.iter().all(|&byte| byte == 0) || s_half.iter().all(|&byte| byte == 0) {
+                return Ok(Value::Const(Constant::Bool(false)));
+            }
             // Same: signature byte parse failures are an evaluation
             // failure, not `False`.
             let sig = Signature::from_bytes(&sig_arr.into())
@@ -1726,6 +1817,18 @@ fn bigint_to_usize_clamped(i: &BigInt) -> usize {
     usize::try_from(digits[0]).unwrap_or(usize::MAX)
 }
 
+/// Clamp an ALREADY-Int64-validated value to `usize` for `take`/`drop`-style
+/// indexing (#828.2): negative values clamp to 0 (mirrors `BS.drop`/
+/// `BS.take`'s own saturating semantics for in-Int64-but-out-of-bounds
+/// values); non-negative `i64` values always fit `usize` on the 64-bit
+/// platforms dugite targets. Callers MUST bounds-check the source `BigInt`
+/// against `Int64` first (via [`bigint_to_i64_or_failure`]) — this helper
+/// performs no such check itself and must never be fed a raw `BigInt`
+/// directly (that would silently reintroduce the #828.2 bug).
+fn i64_to_usize_clamped(n: i64) -> usize {
+    n.max(0) as usize
+}
+
 fn int_binop<F>(args: Vec<Value>, id: BuiltinId, op: F) -> Result<Value, UplcError>
 where
     F: FnOnce(BigInt, BigInt) -> Result<BigInt, UplcError>,
@@ -2102,14 +2205,18 @@ mod tests {
     }
 
     #[test]
-    fn trace_non_string_first_arg_does_not_panic() {
-        // If the first arg is not a String (shouldn't happen in well-typed
-        // Plutus, but we must not panic defensively), the log remains empty
-        // and the second arg is still returned.
+    fn trace_non_string_first_arg_fails_evaluation() {
+        // #828.1: Haskell unlifts `trace`'s first arg as `Text` at
+        // saturation; a non-Text constant raises
+        // `BuiltinUnliftingEvaluationError` — a genuine evaluation FAILURE.
+        // It must NOT silently fall through and return the second arg.
         let mut log: Vec<String> = Vec::new();
-        let result = run_with_log(BuiltinId::Trace, vec![int(999), int(42)], &mut log).unwrap();
-        assert_eq!(result, int(42));
-        assert!(log.is_empty(), "non-String arg must not write to log");
+        let err = run_with_log(BuiltinId::Trace, vec![int(999), int(42)], &mut log).unwrap_err();
+        assert!(
+            matches!(err, UplcError::BuiltinTypeError { .. }),
+            "expected BuiltinTypeError, got {err:?}"
+        );
+        assert!(log.is_empty(), "a failed trace must not write to log");
     }
 
     #[test]
@@ -2117,6 +2224,137 @@ mod tests {
         // VerifyEcdsaSecp256k1Signature not wired yet.
         let err = run(BuiltinId::VerifyEcdsaSecp256k1Signature, vec![]).unwrap_err();
         assert!(matches!(err, UplcError::Internal(_)));
+    }
+
+    #[test]
+    fn verify_ecdsa_zero_r_or_s_returns_false_not_failure() {
+        // #828.3: `secp256k1_ecdsa_signature_parse_compact` only rejects
+        // scalar OVERFLOW at parse; a zero r or s parses fine and fails
+        // verification with a successful `False` result, not an evaluation
+        // failure. Build a real valid pubkey so the length/parse gates
+        // upstream of the zero-scalar check pass cleanly.
+        use k256::ecdsa::SigningKey;
+
+        let sk = SigningKey::from_bytes(&[7u8; 32].into()).expect("valid scalar");
+        let pk_bytes = sk
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec();
+        assert_eq!(pk_bytes.len(), 33);
+        let msg_hash = vec![0x11u8; 32];
+
+        // r = 0 (first 32 bytes), s = arbitrary non-zero.
+        let mut sig_zero_r = vec![0u8; 32];
+        sig_zero_r.extend(std::iter::repeat_n(0x01u8, 32));
+        assert_eq!(
+            run(
+                BuiltinId::VerifyEcdsaSecp256k1Signature,
+                vec![bs(&pk_bytes), bs(&msg_hash), bs(&sig_zero_r)],
+            )
+            .unwrap(),
+            b(false),
+            "zero-r signature must return False, not fail"
+        );
+
+        // s = 0 (last 32 bytes), r = arbitrary non-zero.
+        let mut sig_zero_s = vec![0x01u8; 32];
+        sig_zero_s.extend(std::iter::repeat_n(0u8, 32));
+        assert_eq!(
+            run(
+                BuiltinId::VerifyEcdsaSecp256k1Signature,
+                vec![bs(&pk_bytes), bs(&msg_hash), bs(&sig_zero_s)],
+            )
+            .unwrap(),
+            b(false),
+            "zero-s signature must return False, not fail"
+        );
+
+        // Both-zero also returns False (not evaluated as a special case,
+        // just both halves passing the all-zero check).
+        let sig_all_zero = vec![0u8; 64];
+        assert_eq!(
+            run(
+                BuiltinId::VerifyEcdsaSecp256k1Signature,
+                vec![bs(&pk_bytes), bs(&msg_hash), bs(&sig_all_zero)],
+            )
+            .unwrap(),
+            b(false)
+        );
+    }
+
+    #[test]
+    fn exp_mod_integer_bounds_and_special_cases() {
+        // #828.4: full contract per `PlutusCore.Crypto.ExpMod`.
+        let bound = || BigInt::from(1u32) << 8191u32; // 2^8191
+
+        // m <= 0 → fail.
+        assert!(matches!(
+            run(BuiltinId::ExpModInteger, vec![int(2), int(3), int(0)]),
+            Err(UplcError::BuiltinFailure { .. })
+        ));
+        assert!(matches!(
+            run(BuiltinId::ExpModInteger, vec![int(2), int(3), int(-5)]),
+            Err(UplcError::BuiltinFailure { .. })
+        ));
+
+        // m == 1 → always 0, regardless of base/exp.
+        assert_eq!(
+            run(BuiltinId::ExpModInteger, vec![int(999), int(999), int(1)]).unwrap(),
+            int(0)
+        );
+
+        // m > 2^8191 - 1 → fail (the missing upper-bound check, #828.4a).
+        let modulus_too_big = Value::Const(Constant::Integer(bound()));
+        assert!(
+            matches!(
+                run(
+                    BuiltinId::ExpModInteger,
+                    vec![int(2), int(1), modulus_too_big]
+                ),
+                Err(UplcError::BuiltinFailure { .. })
+            ),
+            "modulus == 2^8191 must fail (valid range is m <= 2^8191 - 1)"
+        );
+
+        // base/exp == -2^8191 (minBoundI) is VALID (asymmetric inclusive
+        // range), #828.4b — must NOT fail.
+        let min_bound_base = Value::Const(Constant::Integer(-bound()));
+        assert!(
+            run(
+                BuiltinId::ExpModInteger,
+                vec![min_bound_base, int(1), int(1_000_003)]
+            )
+            .is_ok(),
+            "base == -2^8191 (minBoundI) must be ACCEPTED, not rejected"
+        );
+
+        // base/exp == +2^8191 is INVALID (max is 2^8191 - 1) — must fail.
+        let plus_bound_base = Value::Const(Constant::Integer(bound()));
+        assert!(matches!(
+            run(
+                BuiltinId::ExpModInteger,
+                vec![plus_bound_base, int(1), int(1_000_003)]
+            ),
+            Err(UplcError::BuiltinFailure { .. })
+        ));
+
+        // base/exp == +(2^8191 - 1) (maxBoundI) is VALID.
+        let max_bound_base = Value::Const(Constant::Integer(bound() - 1));
+        assert!(
+            run(
+                BuiltinId::ExpModInteger,
+                vec![max_bound_base, int(1), int(1_000_003)]
+            )
+            .is_ok(),
+            "base == 2^8191 - 1 (maxBoundI) must be ACCEPTED"
+        );
+
+        // Ordinary case still computes correctly: 3^4 mod 5 = 81 mod 5 = 1.
+        assert_eq!(
+            run(BuiltinId::ExpModInteger, vec![int(3), int(4), int(5)]).unwrap(),
+            int(1)
+        );
     }
 
     // ── List / Pair / Data builtins ─────────────────────────────────
@@ -2247,6 +2485,82 @@ mod tests {
                 vec![Data::I(BigInt::from(1)), Data::I(BigInt::from(2))]
             ))
         );
+    }
+
+    /// #828.5 PV-matrix golden: `constrData`'s tag argument is unlifted as
+    /// `Word64` at D/E (PV>=11) — an out-of-range tag is a genuine
+    /// `BuiltinFailure` — but as plain `Integer` at A/B/C (PV<11), where
+    /// Haskell would ACCEPT a negative or oversized tag. dugite's
+    /// `Data::Constr` tag field is `u64` and cannot represent that value,
+    /// so the A/B/C branch surfaces a distinct `Internal`
+    /// (representational-limitation) error instead of mislabeling the gap
+    /// as a modeled protocol failure — see the doc comment at the
+    /// `ConstrData` match arm for the full scoped limitation. In-range tags
+    /// behave IDENTICALLY at every variant. The conformance corpus runs a
+    /// single (LATEST=E, no-PV) harness and cannot catch a wrong PV<11
+    /// branch, hence this dedicated matrix test.
+    #[test]
+    fn constr_data_tag_range_is_pv_gated() {
+        // In-range tag (fits u64): succeeds identically at every variant.
+        let fields = || list_of_data(vec![]);
+        for variant in [
+            SemanticsVariant::A,
+            SemanticsVariant::B,
+            SemanticsVariant::C,
+            SemanticsVariant::D,
+            SemanticsVariant::E,
+        ] {
+            let v = run_variant(BuiltinId::ConstrData, vec![int(7), fields()], variant).unwrap();
+            assert_eq!(v, data_val(Data::Constr(7, vec![])));
+        }
+
+        // Out-of-u64-range tag (negative): D/E reject as a genuine
+        // BuiltinFailure (Word64 unlifting failure).
+        let neg_tag = Value::Const(Constant::Integer(BigInt::from(-1)));
+        assert!(matches!(
+            run_variant(
+                BuiltinId::ConstrData,
+                vec![neg_tag.clone(), fields()],
+                SemanticsVariant::E
+            ),
+            Err(UplcError::BuiltinFailure { .. })
+        ));
+        assert!(matches!(
+            run_variant(
+                BuiltinId::ConstrData,
+                vec![neg_tag.clone(), fields()],
+                SemanticsVariant::D
+            ),
+            Err(UplcError::BuiltinFailure { .. })
+        ));
+
+        // A/B/C: Haskell would ACCEPT this tag (plain Integer argument);
+        // dugite cannot represent it, so it fails with the DISTINCT
+        // Internal/representational-limitation error, not BuiltinFailure.
+        assert!(matches!(
+            run_variant(
+                BuiltinId::ConstrData,
+                vec![neg_tag.clone(), fields()],
+                SemanticsVariant::A
+            ),
+            Err(UplcError::Internal(_))
+        ));
+        assert!(matches!(
+            run_variant(
+                BuiltinId::ConstrData,
+                vec![neg_tag.clone(), fields()],
+                SemanticsVariant::B
+            ),
+            Err(UplcError::Internal(_))
+        ));
+        assert!(matches!(
+            run_variant(
+                BuiltinId::ConstrData,
+                vec![neg_tag, fields()],
+                SemanticsVariant::C
+            ),
+            Err(UplcError::Internal(_))
+        ));
     }
 
     #[test]
@@ -2848,6 +3162,56 @@ mod tests {
         assert_eq!(
             run(BuiltinId::SliceByteString, vec![int(-5), int(3), bs7]).unwrap(),
             bs(b"abc")
+        );
+    }
+
+    #[test]
+    fn slice_byte_string_fails_on_out_of_int64_args() {
+        // #828.2: `sliceByteString`'s `start`/`length` are unlifted as
+        // Haskell `Int` (bounds-checked against `Int64`), NOT plain
+        // `Integer` — a value outside `[-2^63, 2^63-1]` is an evaluation
+        // FAILURE at unlifting, never a silent clamp to 0 / usize::MAX.
+        let bs7 = bs(b"abcdefg");
+        let too_big = Value::Const(Constant::Integer(BigInt::from(i64::MAX) + 1));
+        let too_small = Value::Const(Constant::Integer(BigInt::from(i64::MIN) - 1));
+
+        assert!(
+            matches!(
+                run(
+                    BuiltinId::SliceByteString,
+                    vec![too_big.clone(), int(1), bs7.clone()]
+                ),
+                Err(UplcError::BuiltinFailure { .. })
+            ),
+            "start beyond Int64::MAX must fail, not clamp"
+        );
+        assert!(
+            matches!(
+                run(
+                    BuiltinId::SliceByteString,
+                    vec![int(0), too_big, bs7.clone()]
+                ),
+                Err(UplcError::BuiltinFailure { .. })
+            ),
+            "length beyond Int64::MAX must fail, not clamp"
+        );
+        assert!(
+            matches!(
+                run(
+                    BuiltinId::SliceByteString,
+                    vec![too_small, int(1), bs7.clone()]
+                ),
+                Err(UplcError::BuiltinFailure { .. })
+            ),
+            "start below Int64::MIN must fail, not clamp"
+        );
+
+        // A value AT the Int64 boundary still succeeds and clamps normally
+        // (the fix only rejects values OUTSIDE Int64, not extreme-but-valid
+        // ones).
+        assert_eq!(
+            run(BuiltinId::SliceByteString, vec![int(i64::MAX), int(3), bs7]).unwrap(),
+            bs(b"")
         );
     }
 

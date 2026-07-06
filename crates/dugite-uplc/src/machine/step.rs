@@ -314,6 +314,19 @@ fn return_compute(
             ) = match value {
                 crate::machine::value::Value::Constr { tag, args } => (tag, args, None),
                 crate::machine::value::Value::Const(c) => {
+                    // PLC 1.1.0 `case`-on-Constant (the "caser builtin") is
+                    // gated behind `vanRossemPV` (PV11): below PV11
+                    // (variants A/B/C) Haskell's `unCaserBuiltin` is
+                    // `unavailableCaserBuiltin`, so ANY `case` whose
+                    // scrutinee reduces to a plain constant fails with
+                    // `CekCaseBuiltinError` — before the constant is ever
+                    // projected into a (tag, args) shape below (#824,
+                    // oracle-confirmed). `case` on a `Value::Constr`
+                    // scrutinee (the arm above) is unaffected — it has been
+                    // available since PlutusV3's PV9 introduction.
+                    if !variant.case_on_constant_available() {
+                        return Err(UplcError::ScriptError);
+                    }
                     use crate::term::Constant;
                     match c {
                         // Bool: False = 0, True = 1.  Exactly 2 branches.
@@ -774,5 +787,61 @@ mod tests {
             branches: vec![Rc::new(int_term(99))],
         };
         assert!(matches!(evaluate(case), Err(UplcError::Internal(_))));
+    }
+
+    /// #824 PV-matrix golden: `case` on a plain `Value::Const` scrutinee is
+    /// the PLC 1.1.0 "caser builtin" feature, gated behind `vanRossemPV`
+    /// (PV11). At PV<11 (variants A/B/C) it must fail with `ScriptError`
+    /// (Haskell `CekCaseBuiltinError`) BEFORE any branch is even selected;
+    /// at PV>=11 (D/E) it must succeed exactly as before. `case` on a
+    /// `Constr` scrutinee is unaffected by the gate at either PV. The
+    /// conformance corpus runs a single (LATEST=E, no-PV) harness and
+    /// cannot catch a wrong PV<11 branch, hence this dedicated test.
+    #[test]
+    fn case_on_constant_gated_by_pv11() {
+        use crate::builtin::semantics::SemanticsVariant;
+        use crate::machine::cost::BudgetTracker;
+        use crate::term::Constant;
+
+        // (case (con bool True) [0, 1]) — Bool scrutinee; True selects
+        // branch index 1 per the Frame::Cases Bool mapping.
+        let bool_case = || Term::Case {
+            scrutinee: Rc::new(Term::Const(Constant::Bool(true))),
+            branches: vec![Rc::new(int_term(0)), Rc::new(int_term(1))],
+        };
+
+        // PV<11 (variant C, PlutusV3 pre-vanRossem): case-on-constant is
+        // UNAVAILABLE — must fail with ScriptError, not select a branch.
+        let mut tracker_c = BudgetTracker::new_counting();
+        let result_c = evaluate_with_budget(bool_case(), &mut tracker_c, None, SemanticsVariant::C);
+        assert!(
+            matches!(result_c, Err(UplcError::ScriptError)),
+            "PV<11 case-on-constant must fail with ScriptError, got {result_c:?}"
+        );
+
+        // PV>=11 (variant E): case-on-constant IS available — succeeds,
+        // selecting the True branch (index 1).
+        let mut tracker_e = BudgetTracker::new_counting();
+        let result_e = evaluate_with_budget(bool_case(), &mut tracker_e, None, SemanticsVariant::E)
+            .expect("PV>=11 case-on-constant must succeed");
+        assert_eq!(result_e, int_val(1));
+
+        // `case` on a `Constr` scrutinee is UNAFFECTED by the gate —
+        // succeeds identically at both PV<11 and PV>=11.
+        let constr_case = || Term::Case {
+            scrutinee: Rc::new(Term::Constr {
+                tag: 1,
+                args: vec![],
+            }),
+            branches: vec![Rc::new(int_term(42)), Rc::new(int_term(99))],
+        };
+        let mut tracker_c2 = BudgetTracker::new_counting();
+        let r_c = evaluate_with_budget(constr_case(), &mut tracker_c2, None, SemanticsVariant::C)
+            .expect("case on Constr must succeed at PV<11 (unaffected by #824's gate)");
+        assert_eq!(r_c, int_val(99));
+        let mut tracker_e2 = BudgetTracker::new_counting();
+        let r_e = evaluate_with_budget(constr_case(), &mut tracker_e2, None, SemanticsVariant::E)
+            .expect("case on Constr must succeed at PV>=11");
+        assert_eq!(r_e, int_val(99));
     }
 }

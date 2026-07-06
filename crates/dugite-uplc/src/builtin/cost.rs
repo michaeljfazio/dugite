@@ -30,6 +30,7 @@
 //! `builtinCostModelE.json`. Variants not present in the JSON are
 //! omitted; all evaluators are `const fn`-compatible.
 
+use crate::builtin::semantics::SemanticsVariant;
 use crate::data::Data;
 use crate::machine::value::Value;
 use crate::machine::ExBudget;
@@ -702,16 +703,41 @@ impl BuiltinCosts {
     ///
     /// Sizing is per the Haskell `ExMemoryUsage` rules; see module-level
     /// doc for details.
-    pub fn charge_for_args(&self, id: BuiltinId, args: &[Value]) -> ExBudget {
+    ///
+    /// `variant` is the script's [`SemanticsVariant`] (computed once by the
+    /// caller from `(language, major_pv)`). It currently gates only the
+    /// `Text` argument-sizing measure for `appendString`/`equalsString`/
+    /// `encodeUtf8` (#819): variants A/B/C (PV < `VAN_ROSSEM_PV`) size by
+    /// character count; D/E (PV ≥ `VAN_ROSSEM_PV`) size by UTF-8
+    /// byte-length ÷ 4 (`TextCostedByByteLength`). The rate parameters
+    /// (slope/intercept) are identical across B/C/D/E — only the measure
+    /// changes. Context-free callers (the UPLC conformance harness,
+    /// [`crate::machine::cost::BudgetTracker::new_counting`],
+    /// [`crate::machine::step::evaluate`]) pass [`SemanticsVariant::LATEST`]
+    /// (= E), which is the variant the corpus goldens are computed against.
+    pub fn charge_for_args(
+        &self,
+        id: BuiltinId,
+        args: &[Value],
+        variant: SemanticsVariant,
+    ) -> ExBudget {
         use BuiltinId::*;
         // Retrieve argument sizes using the correct costing wrapper for
         // each position. Most builtins use the default `size_of_value`
         // sizing; a few need special wrappers.
         let (x, y, z) = match id {
-            // ── String builtins — appendString/equalsString use TextCostedByByteLength
+            // ── String builtins — appendString/equalsString: `Text`
+            //    memory usage is PV-gated (#819). A/B/C (PV<11) = plain
+            //    `ExMemoryUsage Text` = character count; D/E (PV>=11) =
+            //    `TextCostedByByteLength` = UTF-8 byte length / 4.
             AppendString | EqualsString => {
-                let sx = args.first().map_or(0, string_costed_by_byte_len);
-                let sy = args.get(1).map_or(0, string_costed_by_byte_len);
+                let size_fn: fn(&Value) -> i64 = if variant.text_costed_by_byte_length() {
+                    string_costed_by_byte_len
+                } else {
+                    string_costed_by_char_count
+                };
+                let sx = args.first().map_or(0, size_fn);
+                let sy = args.get(1).map_or(0, size_fn);
                 (sx, sy, 0)
             }
             // ── DecodeUtf8: input is a ByteString
@@ -719,11 +745,15 @@ impl BuiltinCosts {
                 let sx = args.first().map_or(0, size_of_value);
                 (sx, 0, 0)
             }
-            // ── EncodeUtf8: input is a String costed by UTF-8 byte length
-            //    (TextCostedByByteLength in the V2 builtin semantics).
-            //    Conformance corpus computes goldens against this variant.
+            // ── EncodeUtf8: input is a String, sized the same
+            //    variant-gated way as AppendString/EqualsString (#819).
             EncodeUtf8 => {
-                let sx = args.first().map_or(0, string_costed_by_byte_len);
+                let size_fn: fn(&Value) -> i64 = if variant.text_costed_by_byte_length() {
+                    string_costed_by_byte_len
+                } else {
+                    string_costed_by_char_count
+                };
+                let sx = args.first().map_or(0, size_fn);
                 (sx, 0, 0)
             }
             // ── integerToByteString: arg2 is width (NumBytesCostedAsNumWords),
@@ -1682,5 +1712,94 @@ mod tests {
         // 2^64 needs 2 words.
         let n2 = BigInt::from(u64::MAX) + BigInt::from(1);
         assert_eq!(memory_usage_integer(&n2), 2);
+    }
+
+    // ─── #819 PV-matrix: Text arg sizing (char-count vs byte-length/4) ────
+
+    /// `equalsString`/`appendString`/`encodeUtf8` must size their `Text`
+    /// argument(s) by CHARACTER COUNT at PV<11 (variants A/B/C) and by
+    /// UTF-8 byte-length÷4 at PV>=11 (variants D/E). Uses two strings whose
+    /// char-count and byte-length diverge (`"aaa"` = 3 chars/3 bytes vs
+    /// `"日本語"` = 3 chars/9 bytes) so the two measures produce genuinely
+    /// different `ExBudget`s — the 999-case conformance corpus runs a
+    /// single (LATEST=E, no-PV) harness and cannot catch a wrong PV<11
+    /// branch, hence this dedicated matrix test.
+    #[test]
+    fn text_builtins_arg_sizing_is_pv_gated() {
+        let ascii = Value::Const(Constant::String("aaa".to_string()));
+        let multibyte = Value::Const(Constant::String("日本語".to_string()));
+
+        // Sanity on the two measures themselves.
+        assert_eq!(size_of_string_by_char_count("aaa"), 3);
+        assert_eq!(size_of_string_by_byte_length("aaa"), 0); // 3/4 floor = 0
+        assert_eq!(size_of_string_by_char_count("日本語"), 3);
+        assert_eq!(size_of_string_by_byte_length("日本語"), 2); // 9/4 floor = 2
+
+        // ── equalsString: LinearOnDiagonal(constant=39184, intercept=1000,
+        //    slope=60594). Char-count sizes are (3,3) → ON-diagonal → linear.
+        //    Byte/4 sizes are (0,2) → OFF-diagonal → flat constant.
+        let args = [ascii.clone(), multibyte.clone()];
+        let pv10 = BuiltinCosts::DEFAULT.charge_for_args(
+            BuiltinId::EqualsString,
+            &args,
+            SemanticsVariant::C, // PlutusV3, PV<11
+        );
+        let pv11 = BuiltinCosts::DEFAULT.charge_for_args(
+            BuiltinId::EqualsString,
+            &args,
+            SemanticsVariant::E, // PlutusV3, PV>=11 (LATEST)
+        );
+        assert_eq!(
+            pv10.cpu,
+            1000 + 60594 * 3,
+            "PV<11 equalsString must size by char count (on-diagonal at 3==3)"
+        );
+        assert_eq!(
+            pv11.cpu, 39184,
+            "PV>=11 equalsString must size by byte/4 (off-diagonal at 0!=2)"
+        );
+        assert_ne!(
+            pv10.cpu, pv11.cpu,
+            "char-count vs byte/4 sizing must diverge — this IS the #819 bug"
+        );
+
+        // ── appendString: AddedSizes(intercept=1000, slope=59957).
+        let pv10_append = BuiltinCosts::DEFAULT.charge_for_args(
+            BuiltinId::AppendString,
+            &args,
+            SemanticsVariant::A, // PlutusV1/V2, PV<9 (still A/B/C bucket)
+        );
+        let pv11_append = BuiltinCosts::DEFAULT.charge_for_args(
+            BuiltinId::AppendString,
+            &args,
+            SemanticsVariant::D, // PlutusV1/V2, PV>=11
+        );
+        assert_eq!(pv10_append.cpu, 1000 + 59957 * (3 + 3));
+        assert_eq!(pv11_append.cpu, 1000 + 59957 * 2); // byte/4 sizes (0,2) sum to 2
+        assert_ne!(pv10_append.cpu, pv11_append.cpu);
+
+        // ── encodeUtf8: LinearInX(intercept=1000, slope=42921), single arg.
+        let one = [multibyte];
+        let pv10_encode = BuiltinCosts::DEFAULT.charge_for_args(
+            BuiltinId::EncodeUtf8,
+            &one,
+            SemanticsVariant::B, // PlutusV1/V2, 9<=PV<11
+        );
+        let pv11_encode = BuiltinCosts::DEFAULT.charge_for_args(
+            BuiltinId::EncodeUtf8,
+            &one,
+            SemanticsVariant::LATEST,
+        );
+        assert_eq!(
+            pv10_encode.cpu,
+            1000 + 42921 * 3,
+            "PV<11 encodeUtf8 must size by char count"
+        );
+        assert_eq!(
+            pv11_encode.cpu,
+            1000 + 42921 * 2,
+            "PV>=11 encodeUtf8 must size by byte/4"
+        );
+        assert_ne!(pv10_encode.cpu, pv11_encode.cpu);
     }
 }

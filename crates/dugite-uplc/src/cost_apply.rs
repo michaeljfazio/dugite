@@ -48,8 +48,8 @@
 //! | `multiplyInteger`  | `added_sizes`                             | `added_sizes`      |
 
 use crate::builtin::cost::{
-    BuiltinCosts, ConstAboveDiagMulP, ConstAboveDiagP, CostPair, CostingFun, DiagLinearP, Linear1,
-    LinearYZP, QuadXY, Quadratic1, SubtractedSizesP,
+    AboveBelowDiagP, BuiltinCosts, ConstAboveDiagMulP, ConstAboveDiagP, CostPair, CostingFun,
+    DiagLinearP, Linear1, LinearYZP, QuadXY, Quadratic1, SubtractedSizesP,
 };
 use crate::machine::cost::MachineCosts;
 use crate::machine::ExBudget;
@@ -553,13 +553,26 @@ pub const V3_PARAM_COUNT_BASE: usize = 251;
 /// PlutusV3 cost-model parameter count after the Plomin (PV10) bitwise batch.
 pub const V3_PARAM_COUNT_BITWISE: usize = 297;
 
-/// V3 integer-division CPU: `const_above_diagonal` wrapping
-/// `quadratic_in_x_and_y`. Flat sub-order is the `ParamName` declaration
-/// order: `constant`, then the quadratic coefficients `c00, c01, c02, c10,
-/// c11, c20`, then `minimum`. Mirrors `builtinCostModelC.json` —
-/// `if size1 < size2 then constant else max(minimum, c00 + c10·x + c01·y +
-/// c20·x² + c11·x·y + c02·y²)`.
-fn v3_division_cpu(cur: &mut Cursor<'_>) -> CostingFun {
+/// V3 integer-division CPU, quadratic-in-x-and-y sub-model. Flat sub-order
+/// is the `ParamName` declaration order: `constant`, then the quadratic
+/// coefficients `c00, c01, c02, c10, c11, c20`, then `minimum` — consumed
+/// identically regardless of `above_and_below`, so the param cursor stays
+/// aligned across both shapes (#820).
+///
+/// `above_and_below` selects the cost-function SHAPE:
+///
+/// * `false` (variant C, PV < `VAN_ROSSEM_PV`): `const_above_diagonal` —
+///   `if size1 < size2 then constant else max(minimum, c00 + c10·x + c01·y +
+///   c20·x² + c11·x·y + c02·y²)`. Mirrors `builtinCostModelC.json`.
+/// * `true` (variant E, PV ≥ `VAN_ROSSEM_PV`): `above_and_below_diagonal` —
+///   ALWAYS runs the quadratic sub-model over `(max(x,y), min(x,y))`; the
+///   diagonal `constant` is dropped entirely (read from the cursor for
+///   alignment, then discarded). Mirrors `builtinCostModelE.json`.
+///
+/// Only `divideInteger`/`modInteger` ever pass `true` — `quotientInteger`/
+/// `remainderInteger` are `const_above_diagonal` at every protocol version
+/// (see the call sites in [`apply_v3`]).
+fn v3_division_cpu(cur: &mut Cursor<'_>, above_and_below: bool) -> CostingFun {
     let constant = cur.next();
     let c00 = cur.next();
     let c01 = cur.next();
@@ -568,24 +581,28 @@ fn v3_division_cpu(cur: &mut Cursor<'_>) -> CostingFun {
     let c11 = cur.next();
     let c20 = cur.next();
     let minimum = cur.next();
-    CostingFun::ConstAboveDiagonal(ConstAboveDiagP {
-        constant,
-        model: QuadXY {
-            c00,
-            c10,
-            c01,
-            c20,
-            c11,
-            c02,
-            minimum,
-        },
-    })
+    let model = QuadXY {
+        c00,
+        c10,
+        c01,
+        c20,
+        c11,
+        c02,
+        minimum,
+    };
+    if above_and_below {
+        CostingFun::AboveAndBelowDiagonal(AboveBelowDiagP { model })
+    } else {
+        CostingFun::ConstAboveDiagonal(ConstAboveDiagP { constant, model })
+    }
 }
 
-/// V3 `divideInteger` / `quotientInteger`: quadratic CPU + `subtracted_sizes`
-/// memory (`-intercept`, `-minimum`, `-slope`).
-fn v3_division_div_quot(cur: &mut Cursor<'_>) -> CostPair {
-    let cpu = v3_division_cpu(cur);
+/// V3 `divideInteger` / `quotientInteger`: quadratic CPU (shape selected by
+/// `above_and_below_cpu`, see [`v3_division_cpu`]) + `subtracted_sizes`
+/// memory (`-intercept`, `-minimum`, `-slope`) — memory shape is unaffected
+/// by the PV11 gate (#820 is CPU-shape only).
+fn v3_division_div_quot(cur: &mut Cursor<'_>, above_and_below_cpu: bool) -> CostPair {
+    let cpu = v3_division_cpu(cur, above_and_below_cpu);
     let mem = CostingFun::SubtractedSizes(SubtractedSizesP {
         intercept: cur.next(),
         minimum: cur.next(),
@@ -594,10 +611,12 @@ fn v3_division_div_quot(cur: &mut Cursor<'_>) -> CostPair {
     CostPair { cpu, mem }
 }
 
-/// V3 `modInteger` / `remainderInteger`: quadratic CPU + `linear_in_y`
-/// memory (no minimum — the result is bounded by the divisor `y`).
-fn v3_division_mod_rem(cur: &mut Cursor<'_>) -> CostPair {
-    let cpu = v3_division_cpu(cur);
+/// V3 `modInteger` / `remainderInteger`: quadratic CPU (shape selected by
+/// `above_and_below_cpu`, see [`v3_division_cpu`]) + `linear_in_y` memory
+/// (no minimum — the result is bounded by the divisor `y`; unaffected by
+/// the PV11 gate).
+fn v3_division_mod_rem(cur: &mut Cursor<'_>, above_and_below_cpu: bool) -> CostPair {
+    let cpu = v3_division_cpu(cur, above_and_below_cpu);
     let mem = CostingFun::LinearInY(cur.linear());
     CostPair { cpu, mem }
 }
@@ -645,10 +664,14 @@ fn v3_bitwise_logical(cur: &mut Cursor<'_>) -> CostPair {
 ///
 /// V3 differs from V2 in three structural ways (cf. `cardano-haskell-oracle`,
 /// `IntersectMBO/plutus` `PlutusLedgerApi.V3.ParamName` + `builtinCostModelC.json`):
-///   1. the four integer-division builtins use a `const_above_diagonal` CPU
-///      model over `quadratic_in_x_and_y` (8 CPU params each) instead of the
-///      V1/V2 `multiplied_sizes` (3); `mod`/`remainder` lose the memory
-///      `minimum` (`linear_in_y` instead of `subtracted_sizes`);
+///   1. the four integer-division builtins use a quadratic-in-x-and-y CPU
+///      model (8 CPU params each) instead of the V1/V2 `multiplied_sizes`
+///      (3); `mod`/`remainder` lose the memory `minimum` (`linear_in_y`
+///      instead of `subtracted_sizes`). `divideInteger`/`modInteger`
+///      ADDITIONALLY switch CPU shape at `major_pv >= VAN_ROSSEM_PV` (11):
+///      `const_above_diagonal` (variant C) → `above_and_below_diagonal`
+///      (variant E) — see [`v3_division_cpu`]. `quotientInteger`/
+///      `remainderInteger` stay `const_above_diagonal` at every PV (#820);
 ///   2. `multiplyInteger` CPU becomes `multiplied_sizes` (V1/V2 used
 ///      `added_sizes`); this is the reference-default shape, so `refill_builtin`
 ///      reuses it;
@@ -656,13 +679,23 @@ fn v3_bitwise_logical(cur: &mut Cursor<'_>) -> CostPair {
 ///      (between the secp builtins and the BLS batch), followed by the
 ///      BLS12-381 / keccak_256 / blake2b_224 / integerToByteString /
 ///      byteStringToInteger builtins.
-pub fn apply_v3(p: &[i64]) -> Result<AppliedCosts, CostModelApplyError> {
+///
+/// `major_pv` is the block's major protocol version, used only to select
+/// the `divideInteger`/`modInteger` CPU shape described above (#820); every
+/// other builtin's shape is PV-independent within V3.
+pub fn apply_v3(p: &[i64], major_pv: u32) -> Result<AppliedCosts, CostModelApplyError> {
     if p.len() < V3_PARAM_COUNT_BASE {
         return Err(CostModelApplyError::WrongLength {
             expected: V3_PARAM_COUNT_BASE,
             got: p.len(),
         });
     }
+    // `divideInteger`/`modInteger` CPU shape gate (#820). Shares the same
+    // `vanRossemPV` (11) threshold as PlutusV1/V2's variant B→D switch
+    // (`is_variant_d`); for V3 this is the C→E switch. `quotientInteger`/
+    // `remainderInteger` never consult this — they pass `false`
+    // unconditionally at both call sites below.
+    let divmod_above_and_below = is_variant_d(major_pv);
     use BuiltinId::*;
     let mut b = BuiltinCosts::DEFAULT.clone();
     let mut m = MachineCosts::DEFAULT;
@@ -693,8 +726,10 @@ pub fn apply_v3(p: &[i64]) -> Result<AppliedCosts, CostModelApplyError> {
     refill_builtin(&mut b, ConsByteString, cur)?;
     refill_builtin(&mut b, ConstrData, cur)?;
     refill_builtin(&mut b, DecodeUtf8, cur)?;
-    // [49..=59] divideInteger (V3 quadratic CPU + subtracted_sizes memory).
-    let div = v3_division_div_quot(cur);
+    // [49..=59] divideInteger — quadratic CPU (const_above_diagonal at
+    // PV<11 / above_and_below_diagonal at PV>=11, #820) + subtracted_sizes
+    // memory.
+    let div = v3_division_div_quot(cur, divmod_above_and_below);
     b.set_cost_pair(DivideInteger, div);
     // [60..=113] encodeUtf8 … mkPairData.
     refill_builtin(&mut b, EncodeUtf8, cur)?;
@@ -718,19 +753,25 @@ pub fn apply_v3(p: &[i64]) -> Result<AppliedCosts, CostModelApplyError> {
     refill_builtin(&mut b, MkNilData, cur)?;
     refill_builtin(&mut b, MkNilPairData, cur)?;
     refill_builtin(&mut b, MkPairData, cur)?;
-    // [114..=123] modInteger (V3 quadratic CPU + linear_in_y memory).
-    let modi = v3_division_mod_rem(cur);
+    // [114..=123] modInteger — quadratic CPU (const_above_diagonal at
+    // PV<11 / above_and_below_diagonal at PV>=11, #820) + linear_in_y
+    // memory.
+    let modi = v3_division_mod_rem(cur, divmod_above_and_below);
     b.set_cost_pair(ModInteger, modi);
     // [124..=127] multiplyInteger — V3 cpu `multiplied_sizes` / mem
     // `added_sizes` (= reference default shape).
     refill_builtin(&mut b, MultiplyInteger, cur)?;
     // [128..=129] nullList.
     refill_builtin(&mut b, NullList, cur)?;
-    // [130..=140] quotientInteger (V3 quadratic CPU + subtracted_sizes memory).
-    let quot = v3_division_div_quot(cur);
+    // [130..=140] quotientInteger — quadratic CPU, ALWAYS
+    // const_above_diagonal (unchanged at every protocol version, #820) +
+    // subtracted_sizes memory.
+    let quot = v3_division_div_quot(cur, false);
     b.set_cost_pair(QuotientInteger, quot);
-    // [141..=150] remainderInteger (V3 quadratic CPU + linear_in_y memory).
-    let rem = v3_division_mod_rem(cur);
+    // [141..=150] remainderInteger — quadratic CPU, ALWAYS
+    // const_above_diagonal (unchanged at every protocol version, #820) +
+    // linear_in_y memory.
+    let rem = v3_division_mod_rem(cur, false);
     b.set_cost_pair(RemainderInteger, rem);
     // [151..=154] serialiseData.
     refill_builtin(&mut b, SerialiseData, cur)?;
@@ -996,7 +1037,7 @@ mod tests {
     #[test]
     fn v3_wrong_length_is_rejected() {
         assert_eq!(
-            apply_v3(&[0i64; 10]).unwrap_err(),
+            apply_v3(&[0i64; 10], 9).unwrap_err(),
             CostModelApplyError::WrongLength {
                 expected: 251,
                 got: 10,
@@ -1004,21 +1045,26 @@ mod tests {
         );
         // Exactly 251 (PV9) succeeds; 297 (PV10 bitwise) succeeds; a longer
         // (PV11, 350) array is accepted and the tail beyond 296 ignored.
-        assert!(apply_v3(&[0i64; 251]).is_ok());
-        assert!(apply_v3(&[0i64; 297]).is_ok());
-        assert!(apply_v3(&[0i64; 350]).is_ok());
+        assert!(apply_v3(&[0i64; 251], 9).is_ok());
+        assert!(apply_v3(&[0i64; 297], 10).is_ok());
+        assert!(apply_v3(&[0i64; 350], 11).is_ok());
         // 251 < len < 297 still consumes only the base 251 (no bitwise batch).
-        assert!(apply_v3(&[0i64; 280]).is_ok());
+        assert!(apply_v3(&[0i64; 280], 10).is_ok());
     }
 
     /// Feed `p[i] = i` and pin the V3-specific index→shape mapping: the
     /// canonical `PlutusLedgerApi.V3.ParamName` order with the changed
     /// integer-division quadratic shapes, `cekConstr`/`cekCase` at 193–196,
     /// the BLS batch, and integerToByteString/byteStringToInteger.
+    ///
+    /// Uses `major_pv=9` (variant C, PV<11) so `divideInteger`/`modInteger`
+    /// exercise the `const_above_diagonal` shape asserted below — see
+    /// `divide_and_mod_integer_cpu_shape_is_pv_gated` for the #820 PV-matrix
+    /// coverage of the PV>=11 `above_and_below_diagonal` switch.
     #[test]
     fn v3_synthetic_index_mapping_is_canonical() {
         let p: Vec<i64> = (0..251).collect();
-        let a = apply_v3(&p).unwrap();
+        let a = apply_v3(&p, 9).unwrap();
 
         // Machine costs: shared block at 17–32, Conway constr/case at 193–196.
         assert_eq!((a.machine.apply.cpu, a.machine.apply.mem), (17, 18));
@@ -1079,13 +1125,101 @@ mod tests {
         assert_eq!(b2i.mem, 249 + 250 * 2);
     }
 
+    /// #820 PV-matrix golden: `divideInteger`/`modInteger` CPU shape must
+    /// switch from `const_above_diagonal` (PV<11, variant C) to
+    /// `above_and_below_diagonal` (PV>=11, variant E) — a genuine
+    /// observable divergence for "below diagonal" args (size1 < size2),
+    /// where C returns a flat constant and E ALWAYS runs the quadratic
+    /// sub-model over `(max, min)`. `quotientInteger`/`remainderInteger`
+    /// must NOT move — `const_above_diagonal` at both PVs. The conformance
+    /// corpus runs a single (LATEST=E, no-PV) harness and cannot catch a
+    /// wrong PV<11 branch, hence this dedicated matrix test.
+    #[test]
+    fn divide_and_mod_integer_cpu_shape_is_pv_gated() {
+        let p: Vec<i64> = (0..251).collect();
+        // PV9 and PV10 are both variant C (pre-vanRossem); PV11 is the
+        // first variant-E protocol version.
+        let a_pv9 = apply_v3(&p, 9).unwrap();
+        let a_pv10 = apply_v3(&p, 10).unwrap();
+        let a_pv11 = apply_v3(&p, 11).unwrap();
+
+        // ── divideInteger: constant=p49; c00=p50,c01=p51,c02=p52,c10=p53,
+        //    c11=p54,c20=p55,min=p56. Below-diagonal args (x=1 < y=2).
+        //    model.eval(x,y) = c00 + c10*x + c01*y + c20*x^2 + c11*x*y + c02*y^2.
+        //    above_and_below_diagonal evaluates model.eval(max(1,2), min(1,2))
+        //    = model.eval(2, 1) — identical to the "above diagonal at (2,1)"
+        //    case already pinned in `v3_synthetic_index_mapping_is_canonical`.
+        let div_quad_below = 50 + 53 * 2 + 51 + 55 * 4 + 54 * 2 + 52;
+
+        let div_pv9 = a_pv9.builtins.cost_for(BuiltinId::DivideInteger, 1, 2, 0);
+        let div_pv10 = a_pv10.builtins.cost_for(BuiltinId::DivideInteger, 1, 2, 0);
+        let div_pv11 = a_pv11.builtins.cost_for(BuiltinId::DivideInteger, 1, 2, 0);
+        assert_eq!(div_pv9.cpu, 49, "PV9 divideInteger below-diagonal must use the flat constant (const_above_diagonal, variant C)");
+        assert_eq!(div_pv10.cpu, 49, "PV10 divideInteger below-diagonal must use the flat constant (const_above_diagonal, variant C)");
+        assert_eq!(
+            div_pv11.cpu, div_quad_below,
+            "PV11 divideInteger below-diagonal must run the quadratic model \
+             over (max,min), not the constant (above_and_below_diagonal, variant E)"
+        );
+        assert_ne!(
+            div_pv10.cpu, div_pv11.cpu,
+            "PV10 vs PV11 divideInteger CPU must diverge for size1<size2 — this IS the #820 bug"
+        );
+
+        // ── modInteger: constant=p114; c00=p115,c01=p116,c02=p117,c10=p118,
+        //    c11=p119,c20=p120,min=p121. Below-diagonal args (x=1 < y=2).
+        let mod_quad_below = 115 + 118 * 2 + 116 + 120 * 4 + 119 * 2 + 117;
+        let mod_pv10 = a_pv10.builtins.cost_for(BuiltinId::ModInteger, 1, 2, 0);
+        let mod_pv11 = a_pv11.builtins.cost_for(BuiltinId::ModInteger, 1, 2, 0);
+        assert_eq!(
+            mod_pv10.cpu, 114,
+            "PV10 modInteger below-diagonal must use the flat constant"
+        );
+        assert_eq!(
+            mod_pv11.cpu, mod_quad_below,
+            "PV11 modInteger below-diagonal must run the quadratic model over (max,min)"
+        );
+        assert_ne!(mod_pv10.cpu, mod_pv11.cpu);
+
+        // ── quotientInteger / remainderInteger: UNCHANGED at every PV.
+        let quot_pv10 = a_pv10
+            .builtins
+            .cost_for(BuiltinId::QuotientInteger, 1, 2, 0);
+        let quot_pv11 = a_pv11
+            .builtins
+            .cost_for(BuiltinId::QuotientInteger, 1, 2, 0);
+        assert_eq!(
+            quot_pv10.cpu, 130,
+            "quotientInteger stays const_above_diagonal at PV10"
+        );
+        assert_eq!(
+            quot_pv10.cpu, quot_pv11.cpu,
+            "quotientInteger CPU shape must NOT move across PV11 (#820 explicitly excludes it)"
+        );
+
+        let rem_pv10 = a_pv10
+            .builtins
+            .cost_for(BuiltinId::RemainderInteger, 1, 2, 0);
+        let rem_pv11 = a_pv11
+            .builtins
+            .cost_for(BuiltinId::RemainderInteger, 1, 2, 0);
+        assert_eq!(
+            rem_pv10.cpu, 141,
+            "remainderInteger stays const_above_diagonal at PV10"
+        );
+        assert_eq!(
+            rem_pv10.cpu, rem_pv11.cpu,
+            "remainderInteger CPU shape must NOT move across PV11 (#820 explicitly excludes it)"
+        );
+    }
+
     /// With the Plomin (PV10, 297-param) batch present, the bitwise builtins
     /// land at 251–296 with their `linear_in_y_and_z` / `linear_in_max_yz`
     /// shapes.
     #[test]
     fn v3_synthetic_bitwise_batch_mapping() {
         let p: Vec<i64> = (0..297).collect();
-        let a = apply_v3(&p).unwrap();
+        let a = apply_v3(&p, 10).unwrap();
 
         // andByteString: cpu linear_in_y_and_z(intercept=p251,slope1=p252,
         //   slope2=p253) at (y=2,z=3) = 251 + 252*2 + 253*3; mem
@@ -1115,7 +1249,10 @@ mod tests {
             .map(|s| s.trim().parse::<i64>().expect("int"))
             .collect();
         assert_eq!(p.len(), 297, "real mainnet V3 model is 297 params (PV10)");
-        let a = apply_v3(&p).unwrap();
+        // PV10 (variant C): divideInteger below-diagonal must use the flat
+        // constant asserted below, not the PV>=11 above_and_below_diagonal
+        // shape (#820).
+        let a = apply_v3(&p, 10).unwrap();
 
         // cekConstr / cekCase machine costs (193..=196) = (16000,100).
         assert_eq!((a.machine.constr.cpu, a.machine.constr.mem), (16000, 100));
@@ -1171,7 +1308,7 @@ mod tests {
             .split(',')
             .map(|s| s.trim().parse::<i64>().expect("int"))
             .collect();
-        let real = apply_v3(&p).unwrap();
+        let real = apply_v3(&p, 10).unwrap();
 
         // Real on-chain V3 equalsByteString = LinearOnDiagonal(const=24548,
         // intercept=29498, slope=38) [fixture idx 64..=66]. For equal-length
