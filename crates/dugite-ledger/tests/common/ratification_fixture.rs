@@ -1235,7 +1235,8 @@ impl RatificationFixture {
             all_votes.extend(extra_action_votes);
 
             gov.proposals.insert(action_id.clone(), proposal_state);
-            gov.votes_by_action.insert(action_id.clone(), all_votes);
+            gov.votes_by_action
+                .insert(action_id.clone(), all_votes.into());
 
             // Committee state — keys are typed Hash32 (cold for membership maps,
             // hot for the lookup map's values).

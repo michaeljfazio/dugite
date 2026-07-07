@@ -2629,7 +2629,8 @@ fn test_cc_approval_with_committee() {
                     anchor: None,
                 },
             ),
-        ],
+        ]
+        .into(),
     );
     assert!(check_cc_approval(
         &action_id,
@@ -2668,7 +2669,8 @@ fn test_cc_approval_with_committee() {
                     anchor: None,
                 },
             ),
-        ],
+        ]
+        .into(),
     );
     assert!(!check_cc_approval(
         &action_id,
@@ -2738,7 +2740,8 @@ fn test_cc_approval_expired_members() {
                 vote: Vote::Yes,
                 anchor: None,
             },
-        )],
+        )]
+        .into(),
     );
     assert!(check_cc_approval(
         &action_id,
@@ -2779,7 +2782,8 @@ fn test_cc_approval_min_size_check() {
                 vote: Vote::Yes,
                 anchor: None,
             },
-        )],
+        )]
+        .into(),
     );
     // Post-bootstrap: min_size=3 but only 1 active => CC blocks
     assert!(!check_cc_approval(
@@ -2854,7 +2858,8 @@ fn test_cc_approval_abstain_excluded() {
                     anchor: None,
                 },
             ),
-        ],
+        ]
+        .into(),
     );
     assert!(!check_cc_approval(
         &action_id,
@@ -2893,7 +2898,8 @@ fn test_cc_approval_abstain_excluded() {
                     anchor: None,
                 },
             ),
-        ],
+        ]
+        .into(),
     );
     assert!(check_cc_approval(
         &action_id,
@@ -7949,7 +7955,7 @@ fn test_cc_abstain_excluded_from_denominator() {
         .entry(action_id.clone())
         .or_default();
     for (voter, procedure) in votes {
-        action_votes.push((voter, procedure));
+        action_votes.insert(voter, procedure);
     }
 
     // check_cc_approval: 1 Yes, 1 No, 1 Abstain
