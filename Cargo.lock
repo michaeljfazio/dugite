@@ -1278,9 +1278,9 @@ dependencies = [
 
 [[package]]
 name = "dashu-base"
-version = "0.4.2"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fab3f0756c8585395280bd81b384cd28bbd66d6b00e66124ecfd1f644938b38c"
+checksum = "993b95dc1b248e3f5747dcb017a41d6e75853a2e5ee4504f7d537c5b8dffdae4"
 
 [[package]]
 name = "dashu-int"
