@@ -1389,7 +1389,8 @@ mod tests {
                     (Voter::ConstitutionalCommittee(cc_cred.clone()), v_yes),
                     (Voter::DRep(drep_cred.clone()), v_no),
                     (Voter::StakePool(spo_id), v_abstain),
-                ],
+                ]
+                .into(),
             );
         }
 
@@ -1407,17 +1408,19 @@ mod tests {
 
     /// Regression test for issue #434.
     ///
-    /// `votes_by_action` stores votes as an append-only `Vec`, so a single
-    /// voter can appear multiple times if they re-vote on the same proposal.
-    /// Haskell's `proposalsAddVote` uses `Map.insert` (last-wins), and its
-    /// CBOR decoder enforces no duplicate keys in the `gasDRepVotes` /
-    /// `gasCommitteeVotes` / `gasStakePoolVotes` maps. Emitting duplicates on
-    /// the wire causes cardano-cli to abort the whole `gov-state` response
-    /// with `Final number of elements: <unique> does not match the total
-    /// count that was decoded: <raw>`, surfacing as "0 active proposals".
+    /// `votes_by_action`'s per-action votes are an `imbl::OrdMap<Voter, _>`
+    /// (matching Haskell's `Map voter Vote`), so a re-vote by the same voter
+    /// structurally overwrites the previous one (last-wins) — duplicates can no
+    /// longer accumulate. Haskell's `proposalsAddVote` uses the same `Map.insert`
+    /// semantics, and its CBOR decoder enforces no duplicate keys in the
+    /// `gasDRepVotes` / `gasCommitteeVotes` / `gasStakePoolVotes` maps. Emitting
+    /// duplicates on the wire causes cardano-cli to abort the whole `gov-state`
+    /// response with `Final number of elements: <unique> does not match the
+    /// total count that was decoded: <raw>`, surfacing as "0 active proposals".
     ///
-    /// Verify that `build_vote_maps` collapses repeated voters to the last
-    /// observed vote.
+    /// Building the map from a `Vec` with repeated voters must collapse them to
+    /// the last observed vote (`OrdMap: From<Vec>` is last-wins), and
+    /// `build_vote_maps` must then surface exactly one entry per voter.
     #[test]
     fn build_vote_maps_dedupes_repeat_voters_last_wins() {
         let mut ledger = LedgerState::new(ProtocolParameters::mainnet_defaults());
@@ -1466,7 +1469,8 @@ mod tests {
                     // SPO votes twice — last wins.
                     (Voter::StakePool(spo_id), v_yes.clone()),
                     (Voter::StakePool(spo_id), v_no.clone()),
-                ],
+                ]
+                .into(),
             );
         }
         let (cc, drep, spo) = build_vote_maps(&ledger, &action_id);

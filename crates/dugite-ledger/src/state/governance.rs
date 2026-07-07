@@ -339,17 +339,13 @@ impl LedgerState {
             }
         }
 
-        // Record the vote (indexed by action_id for efficient ratification)
-        let action_votes = Arc::make_mut(&mut self.gov.governance)
+        // Record the vote (indexed by action_id for efficient ratification).
+        // Inner map is keyed by `Voter`; insert is O(log n) last-vote-wins.
+        Arc::make_mut(&mut self.gov.governance)
             .votes_by_action
             .entry(action_id.clone())
-            .or_default();
-        // Replace existing vote from same voter, or add new
-        if let Some(existing) = action_votes.iter_mut().find(|(v, _)| v == voter) {
-            existing.1 = procedure.clone();
-        } else {
-            action_votes.push((voter.clone(), procedure.clone()));
-        }
+            .or_default()
+            .insert(voter.clone(), procedure.clone());
 
         debug!(
             "Vote cast by {:?} on {:?}: {:?}",
@@ -641,16 +637,12 @@ impl LedgerState {
         }
 
         // Record the vote (indexed by action_id for efficient ratification).
-        let action_votes = Arc::make_mut(&mut self.gov.governance)
+        // Inner map is keyed by `Voter`; insert is O(log n) last-vote-wins.
+        Arc::make_mut(&mut self.gov.governance)
             .votes_by_action
             .entry(action_id.clone())
-            .or_default();
-        // Replace existing vote from same voter, or add new.
-        if let Some(existing) = action_votes.iter_mut().find(|(v, _)| v == voter) {
-            existing.1 = procedure.clone();
-        } else {
-            action_votes.push((voter.clone(), procedure.clone()));
-        }
+            .or_default()
+            .insert(voter.clone(), procedure.clone());
 
         debug!(
             "Vote cast (with delta) by {:?} on {:?}: {:?}",
@@ -724,7 +716,7 @@ impl LedgerState {
         total_spo_stake: u64,
         drep_power_cache: &ImblHashMap<Hash32, u64>,
         no_confidence_stake: u64,
-        votes_by_action: &ImblOrdMap<GovActionId, Vec<(Voter, VotingProcedure)>>,
+        votes_by_action: &ImblOrdMap<GovActionId, ImblOrdMap<Voter, VotingProcedure>>,
         committee_hot_keys: &ImblHashMap<Hash32, Hash32>,
         committee_expiration: &ImblHashMap<Hash32, EpochNo>,
         committee_resigned: &ImblHashMap<Hash32, Option<Anchor>>,
@@ -994,7 +986,7 @@ impl LedgerState {
         action: &GovAction,
         drep_power_cache: &ImblHashMap<Hash32, u64>,
         no_confidence_stake: u64,
-        votes_by_action: &ImblOrdMap<GovActionId, Vec<(Voter, VotingProcedure)>>,
+        votes_by_action: &ImblOrdMap<GovActionId, ImblOrdMap<Voter, VotingProcedure>>,
         pool_stake_override: Option<&HashMap<Hash28, Lovelace>>,
         vote_delegations_override: Option<&ImblHashMap<Hash32, DRep>>,
     ) -> (u64, u64, u64, u64, u64, u64) {
@@ -1005,7 +997,7 @@ impl LedgerState {
         let mut drep_votes: HashMap<Hash32, Vote> = HashMap::new();
         let mut spo_votes: HashMap<Hash28, Vote> = HashMap::new();
 
-        let empty = vec![];
+        let empty = ImblOrdMap::new();
         let action_votes = votes_by_action.get(action_id).unwrap_or(&empty);
 
         for (voter, procedure) in action_votes {
@@ -1758,7 +1750,7 @@ fn count_votes_by_type_impl(
     action: &GovAction,
     drep_power_cache: &ImblHashMap<Hash32, u64>,
     no_confidence_stake: u64,
-    votes_by_action: &ImblOrdMap<GovActionId, Vec<(Voter, VotingProcedure)>>,
+    votes_by_action: &ImblOrdMap<GovActionId, ImblOrdMap<Voter, VotingProcedure>>,
     pool_stake_override: Option<&HashMap<Hash28, Lovelace>>,
     vote_delegations_override: Option<&ImblHashMap<Hash32, DRep>>,
     bootstrap: bool,
@@ -1773,7 +1765,7 @@ fn count_votes_by_type_impl(
     let mut drep_votes: HashMap<Hash32, Vote> = HashMap::new();
     let mut spo_votes: HashMap<Hash28, Vote> = HashMap::new();
 
-    let empty = vec![];
+    let empty = ImblOrdMap::new();
     let action_votes = votes_by_action.get(action_id).unwrap_or(&empty);
 
     for (voter, procedure) in action_votes {
@@ -1916,7 +1908,7 @@ fn check_ratification_impl(
     total_spo_stake: u64,
     drep_power_cache: &ImblHashMap<Hash32, u64>,
     no_confidence_stake: u64,
-    votes_by_action: &ImblOrdMap<GovActionId, Vec<(Voter, VotingProcedure)>>,
+    votes_by_action: &ImblOrdMap<GovActionId, ImblOrdMap<Voter, VotingProcedure>>,
     committee_hot_keys: &ImblHashMap<Hash32, Hash32>,
     committee_expiration: &ImblHashMap<Hash32, EpochNo>,
     committee_resigned: &ImblHashMap<Hash32, Option<Anchor>>,
@@ -3420,7 +3412,7 @@ pub(crate) fn check_threshold(yes: u64, total: u64, threshold: &Rational) -> boo
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn check_cc_approval(
     action_id: &GovActionId,
-    votes_by_action: &ImblOrdMap<GovActionId, Vec<(Voter, VotingProcedure)>>,
+    votes_by_action: &ImblOrdMap<GovActionId, ImblOrdMap<Voter, VotingProcedure>>,
     committee_hot_keys: &ImblHashMap<Hash32, Hash32>,
     committee_expiration: &ImblHashMap<Hash32, EpochNo>,
     committee_resigned: &ImblHashMap<Hash32, Option<Anchor>>,
@@ -3440,7 +3432,7 @@ pub(crate) fn check_cc_approval(
 
     // Collect CC votes for this action indexed by hot credential
     let mut cc_votes: HashMap<Hash32, Vote> = HashMap::new();
-    let empty = vec![];
+    let empty = ImblOrdMap::new();
     let action_votes = votes_by_action.get(action_id).unwrap_or(&empty);
     for (voter, procedure) in action_votes {
         if let Voter::ConstitutionalCommittee(cred) = voter {
@@ -3882,7 +3874,7 @@ pub(crate) fn forest_remove_with_descendants(
     proposals: &mut ImblOrdMap<GovActionId, ProposalState>,
     roots: &mut GovRelation<PRoot>,
     graph: &mut GovRelation<PGraph>,
-    votes_by_action: &mut ImblOrdMap<GovActionId, Vec<(Voter, VotingProcedure)>>,
+    votes_by_action: &mut ImblOrdMap<GovActionId, ImblOrdMap<Voter, VotingProcedure>>,
 ) -> Vec<(GovActionId, ProposalState)> {
     if ids.is_empty() {
         return Vec::new();
@@ -6457,11 +6449,8 @@ mod tests {
             .get(&action_id)
             .unwrap();
         let drep_cred = Credential::VerificationKey(Hash28::from_bytes([0u8; 28]));
-        let drep_vote_entry = votes
-            .iter()
-            .find(|(v, _)| *v == Voter::DRep(drep_cred.clone()))
-            .unwrap();
-        assert_eq!(drep_vote_entry.1.vote, Vote::Yes);
+        let drep_vote_entry = votes.get(&Voter::DRep(drep_cred)).unwrap();
+        assert_eq!(drep_vote_entry.vote, Vote::Yes);
     }
 
     // ========================================================================
@@ -7784,7 +7773,7 @@ mod tests {
             anchor: None,
         };
         let mut votes = ImblOrdMap::new();
-        votes.insert(action_id.clone(), vec![(voter, procedure)]);
+        votes.insert(action_id.clone(), vec![(voter, procedure)].into());
 
         let cache = ImblHashMap::new();
 
@@ -7913,7 +7902,8 @@ mod tests {
                         anchor: None,
                     },
                 ),
-            ],
+            ]
+            .into(),
         );
 
         let cache = ImblHashMap::new();
@@ -7958,7 +7948,8 @@ mod tests {
                     vote: Vote::Yes,
                     anchor: None,
                 },
-            )],
+            )]
+            .into(),
         );
 
         let cache = ImblHashMap::new();
@@ -7995,7 +7986,8 @@ mod tests {
                     vote: Vote::Yes,
                     anchor: None,
                 },
-            )],
+            )]
+            .into(),
         );
 
         let cache = ImblHashMap::new();
@@ -8053,7 +8045,8 @@ mod tests {
                         anchor: None,
                     },
                 ),
-            ],
+            ]
+            .into(),
         );
 
         let cache = ImblHashMap::new();
@@ -9126,10 +9119,7 @@ mod tests {
 
         let voter_cred = Credential::VerificationKey(Hash28::from_bytes([0u8; 28]));
         let drep_voter = Voter::DRep(voter_cred);
-        let final_vote = votes_for_action
-            .iter()
-            .find(|(v, _)| *v == drep_voter)
-            .map(|(_, p)| p.vote.clone());
+        let final_vote = votes_for_action.get(&drep_voter).map(|p| p.vote.clone());
 
         assert_eq!(
             final_vote,

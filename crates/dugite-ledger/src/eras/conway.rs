@@ -1748,6 +1748,15 @@ fn process_governance_votes_and_proposals(
     gov: &mut GovSubState,
     epochs: &EpochSubState,
 ) {
+    // Fast path: a tx with neither votes nor proposals has nothing to do here.
+    // `Arc::make_mut(&mut gov.governance)` below forces a clone of the entire
+    // GovernanceState whenever the Arc is shared (e.g. a mark/set snapshot holds
+    // a reference), so this guard skips the whole GOV rule for the overwhelming
+    // majority of Conway txs that carry neither votes nor proposals.
+    if tx.body.voting_procedures.is_empty() && tx.body.proposal_procedures.is_empty() {
+        return;
+    }
+
     let governance = Arc::make_mut(&mut gov.governance);
 
     // Process votes.
@@ -1755,19 +1764,15 @@ fn process_governance_votes_and_proposals(
     // Last-vote-wins per voter: Haskell GOV stores votes in per-action maps
     // keyed by voter (`gasCommitteeVotes` / `gasDRepVotes` /
     // `gasStakePoolVotes` are `Map voter Vote`, updated via `Map.insert`), so
-    // a re-vote OVERWRITES the previous one. Appending a duplicate entry
-    // would double-count the voter's stake at ratification.
+    // a re-vote OVERWRITES the previous one. `votes_by_action`'s inner map is
+    // keyed by `Voter`, so `insert` is an O(log n) last-vote-wins overwrite.
     for (voter, action_votes) in &tx.body.voting_procedures {
         for (action_id, vote_proc) in action_votes {
-            let entry = governance
+            governance
                 .votes_by_action
                 .entry(action_id.clone())
-                .or_default();
-            if let Some(existing) = entry.iter_mut().find(|(v, _)| v == voter) {
-                existing.1 = vote_proc.clone();
-            } else {
-                entry.push((voter.clone(), vote_proc.clone()));
-            }
+                .or_default()
+                .insert(voter.clone(), vote_proc.clone());
         }
     }
 

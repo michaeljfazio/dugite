@@ -1395,13 +1395,12 @@ fn apply_governance_change(state: &mut LedgerState, change: &GovernanceChange) {
             voter,
             procedure,
         } => {
-            let votes = gov.votes_by_action.entry(action_id.clone()).or_default();
-            // Replace existing vote from this voter or append.
-            if let Some(entry) = votes.iter_mut().find(|(v, _)| v == voter) {
-                entry.1 = procedure.clone();
-            } else {
-                votes.push((voter.clone(), procedure.clone()));
-            }
+            // Inner map is keyed by `Voter`; insert is an O(log n) last-vote-wins
+            // overwrite, matching Haskell's `Map voter Vote`.
+            gov.votes_by_action
+                .entry(action_id.clone())
+                .or_default()
+                .insert(voter.clone(), procedure.clone());
         }
         GovernanceChange::Enacted {
             action_id,

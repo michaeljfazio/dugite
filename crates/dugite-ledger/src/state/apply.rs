@@ -1810,28 +1810,36 @@ impl LedgerState {
             let accounted =
                 t_registry_build + t_ctx_build + t_validate + t_phase2 + t_apply + t_diff_merge;
             let other = total.saturating_sub(accounted);
-            tracing::info!(
-                target: "dugite_ledger::apply::timing",
-                slot = block.slot().0,
-                block_no = block.block_number().0,
-                era = ?self.era,
-                txs = tx_count,
-                valid_txs = tx_valid_count,
-                inputs = tx_input_count,
-                outputs = tx_output_count,
-                witnesses = tx_witness_count,
-                redeemers = tx_redeemer_count,
-                total_us = total.as_micros() as u64,
-                registry_us = t_registry_build.as_micros() as u64,
-                ctx_build_us = t_ctx_build.as_micros() as u64,
-                validate_us = t_validate.as_micros() as u64,
-                phase2_us = t_phase2.as_micros() as u64,
-                apply_us = t_apply.as_micros() as u64,
-                merge_us = t_diff_merge.as_micros() as u64,
-                other_us = other.as_micros() as u64,
-                utxo_count = self.utxo.utxo_set.len(),
-                "block apply timing"
-            );
+            // Optional threshold (ms) so bulk replay only logs the slow blocks
+            // (`DUGITE_BLOCK_APPLY_TIMING_MIN_MS`); default 0 = log every block.
+            let min_ms: u128 = std::env::var("DUGITE_BLOCK_APPLY_TIMING_MIN_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            if total.as_millis() >= min_ms {
+                tracing::info!(
+                    target: "dugite_ledger::apply::timing",
+                    slot = block.slot().0,
+                    block_no = block.block_number().0,
+                    era = ?self.era,
+                    txs = tx_count,
+                    valid_txs = tx_valid_count,
+                    inputs = tx_input_count,
+                    outputs = tx_output_count,
+                    witnesses = tx_witness_count,
+                    redeemers = tx_redeemer_count,
+                    total_us = total.as_micros() as u64,
+                    registry_us = t_registry_build.as_micros() as u64,
+                    ctx_build_us = t_ctx_build.as_micros() as u64,
+                    validate_us = t_validate.as_micros() as u64,
+                    phase2_us = t_phase2.as_micros() as u64,
+                    apply_us = t_apply.as_micros() as u64,
+                    merge_us = t_diff_merge.as_micros() as u64,
+                    other_us = other.as_micros() as u64,
+                    utxo_count = self.utxo.utxo_set.len(),
+                    "block apply timing"
+                );
+            }
         }
 
         // In deferred mode return the captured Phase-2 work items (possibly

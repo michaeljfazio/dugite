@@ -446,7 +446,17 @@ impl LedgerState {
     /// (`eras::common::apply_shelley_cert`'s catch-all), leaving
     /// `genesis_delegates` permanently stale for any chain that crossed a
     /// real genesis-delegate rotation.
-    pub(crate) const SNAPSHOT_VERSION: u8 = 28;
+    ///
+    /// v29: `GovernanceState.votes_by_action` (and
+    /// `RatificationSnapshot.votes_by_action`) changed its per-action value
+    /// type from `Vec<(Voter, VotingProcedure)>` to
+    /// `imbl::OrdMap<Voter, VotingProcedure>`. The linear `Vec` scan used to
+    /// implement last-vote-wins was O(n) per vote, collapsing to O(n^2) on
+    /// governance actions that accumulate hundreds of thousands of votes
+    /// (observed on preprod: ~396k votes on a single InfoAction). The map
+    /// gives O(log n) last-wins inserts, matching Haskell's `Map voter Vote`.
+    /// Serialized layout changes for every snapshot with any recorded votes.
+    pub(crate) const SNAPSHOT_VERSION: u8 = 29;
 
     /// Save ledger state snapshot to disk using bincode serialization.
     ///

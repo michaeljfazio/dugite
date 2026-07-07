@@ -385,8 +385,13 @@ pub struct GovernanceState {
     pub script_committee_hot_credentials: ImblHashSet<Hash32>,
     /// Active governance proposals indexed by GovActionId
     pub proposals: ImblOrdMap<GovActionId, ProposalState>,
-    /// Votes cast, indexed by action ID for efficient ratification lookup
-    pub votes_by_action: ImblOrdMap<GovActionId, Vec<(Voter, VotingProcedure)>>,
+    /// Votes cast, indexed by action ID for efficient ratification lookup.
+    ///
+    /// Inner map is keyed by `Voter` (O(log n) insert, inherently last-vote-wins),
+    /// matching Haskell's `Map voter Vote`. See #782-class perf note: this used to
+    /// be a `Vec<(Voter, VotingProcedure)>` with a linear `find` for last-wins,
+    /// which collapsed to O(n^2) on actions with hundreds of thousands of votes.
+    pub votes_by_action: ImblOrdMap<GovActionId, ImblOrdMap<Voter, VotingProcedure>>,
     /// Proposal forest roots: last enacted action per governance purpose + direct children.
     ///
     /// Per Haskell `pRoots :: GovRelation PRoot`.  Each of the 4 purposes tracks the
@@ -472,7 +477,7 @@ pub struct RatificationSnapshot {
     /// Proposals active at snapshot time.
     pub proposals: ImblOrdMap<GovActionId, ProposalState>,
     /// Votes indexed by action ID at snapshot time.
-    pub votes_by_action: ImblOrdMap<GovActionId, Vec<(Voter, VotingProcedure)>>,
+    pub votes_by_action: ImblOrdMap<GovActionId, ImblOrdMap<Voter, VotingProcedure>>,
     /// Committee hot key authorizations (cold → hot) at snapshot time.
     pub committee_hot_keys: ImblHashMap<Hash32, Hash32>,
     /// Committee member expiration epochs at snapshot time.
@@ -1125,9 +1130,7 @@ impl LedgerState {
                     let mut yes: u64 = 0;
                     let mut no: u64 = 0;
                     let mut abstain: u64 = 0;
-                    let mut votes: Vec<(Voter, VotingProcedure)> = Vec::with_capacity(
-                        gas.committee_votes.len() + gas.drep_votes.len() + gas.pool_votes.len(),
-                    );
+                    let mut votes: ImblOrdMap<Voter, VotingProcedure> = ImblOrdMap::new();
                     let to_vote = |v: HaskellVote| match v {
                         HaskellVote::No => Vote::No,
                         HaskellVote::Yes => Vote::Yes,
@@ -1148,23 +1151,23 @@ impl LedgerState {
                     };
                     for ((tag, hash28), v) in &gas.committee_votes {
                         tally(*v, &mut yes, &mut no, &mut abstain);
-                        votes.push((
+                        votes.insert(
                             Voter::ConstitutionalCommittee(to_credential(*tag, *hash28)),
                             VotingProcedure {
                                 vote: to_vote(*v),
                                 anchor: None,
                             },
-                        ));
+                        );
                     }
                     for ((tag, hash28), v) in &gas.drep_votes {
                         tally(*v, &mut yes, &mut no, &mut abstain);
-                        votes.push((
+                        votes.insert(
                             Voter::DRep(to_credential(*tag, *hash28)),
                             VotingProcedure {
                                 vote: to_vote(*v),
                                 anchor: None,
                             },
-                        ));
+                        );
                     }
                     for (pool_id, v) in &gas.pool_votes {
                         tally(*v, &mut yes, &mut no, &mut abstain);
@@ -1172,13 +1175,13 @@ impl LedgerState {
                         // (28-byte key hash zero-padded to 32 with type-byte 0
                         // at position 28). Pool keys are key credentials, so
                         // the type-byte stays 0 and `to_hash32_padded` suffices.
-                        votes.push((
+                        votes.insert(
                             Voter::StakePool(pool_id.to_hash32_padded()),
                             VotingProcedure {
                                 vote: to_vote(*v),
                                 anchor: None,
                             },
-                        ));
+                        );
                     }
 
                     let state = ProposalState {
