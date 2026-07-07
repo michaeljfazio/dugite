@@ -194,7 +194,17 @@ impl PipelinedChainSyncClient {
                     tip_hash,
                     tip_block_number,
                 } => {
-                    self.outstanding = self.outstanding.saturating_sub(1);
+                    // #880: a response with no request outstanding is an
+                    // unsolicited server message (agency violation). The prior
+                    // `saturating_sub(1)` silently masked it by clamping at 0.
+                    if self.outstanding == 0 {
+                        return Err(ProtocolError::StateViolation {
+                            protocol: "ChainSync",
+                            expected: "no unsolicited response (outstanding > 0)".to_string(),
+                            actual: "MsgRollForward with 0 outstanding requests".to_string(),
+                        });
+                    }
+                    self.outstanding -= 1;
 
                     // If we were at tip, we're no longer (got a new block)
                     if self.at_tip {
@@ -224,7 +234,21 @@ impl PipelinedChainSyncClient {
                     tip_hash: _,
                     tip_block_number: _,
                 } => {
-                    self.outstanding = self.outstanding.saturating_sub(1);
+                    // #880: reject an unsolicited rollback (see MsgRollForward).
+                    // NOTE: a rollback-depth (k) bound is NOT enforced here — the
+                    // pipelined client carries no chain state to compute depth;
+                    // that check belongs at the point this client is wired into a
+                    // chain-following loop (production sync uses the in-house
+                    // state machine in dugite-node/src/node/sync.rs, which does
+                    // enforce it).
+                    if self.outstanding == 0 {
+                        return Err(ProtocolError::StateViolation {
+                            protocol: "ChainSync",
+                            expected: "no unsolicited response (outstanding > 0)".to_string(),
+                            actual: "MsgRollBackward with 0 outstanding requests".to_string(),
+                        });
+                    }
+                    self.outstanding -= 1;
 
                     on_event(ChainSyncEvent::RollBackward { point, tip_slot })?;
                 }
@@ -237,7 +261,14 @@ impl PipelinedChainSyncClient {
                     on_event(ChainSyncEvent::AtTip)?;
                 }
                 ChainSyncMessage::MsgDone => {
-                    return Ok(());
+                    // #880: MsgDone is a CLIENT-agency message — the server has
+                    // no agency to terminate the protocol. Accepting it let a
+                    // server unilaterally end sync; reject as an agency violation.
+                    return Err(ProtocolError::StateViolation {
+                        protocol: "ChainSync",
+                        expected: "server response (MsgRollForward/Backward/AwaitReply)".to_string(),
+                        actual: "MsgDone from server (client-agency message)".to_string(),
+                    });
                 }
                 other => {
                     return Err(ProtocolError::StateViolation {

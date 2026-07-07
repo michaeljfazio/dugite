@@ -187,7 +187,7 @@ pub async fn run_n2c_handshake_client(
         .map_err(HandshakeError::from)?;
 
     // Decode, converting wire versions back to logical
-    decode_handshake_response_n2c(&response)
+    decode_handshake_response_n2c(&response, our_data)
 }
 
 /// Run the handshake as the server (responder) for N2C connections.
@@ -678,7 +678,10 @@ fn decode_handshake_response(
 }
 
 /// Decode a handshake response for N2C (with bit-15 version decoding).
-fn decode_handshake_response_n2c(data: &[u8]) -> Result<HandshakeResult, HandshakeError> {
+fn decode_handshake_response_n2c(
+    data: &[u8],
+    our_data: &N2CVersionData,
+) -> Result<HandshakeResult, HandshakeError> {
     let mut dec = Decoder::new(data);
     let _arr_len = dec
         .array()
@@ -693,7 +696,16 @@ fn decode_handshake_response_n2c(data: &[u8]) -> Result<HandshakeResult, Handsha
                 .u16()
                 .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
             let version = n2c::decode_n2c_version(wire_version);
-            let _ = N2CVersionData::decode(&mut dec);
+            // #880: re-validate the responder's network magic rather than
+            // discarding the accepted version_data.
+            if let Ok(their_data) = N2CVersionData::decode(&mut dec) {
+                if their_data.network_magic != our_data.network_magic {
+                    return Err(HandshakeError::NetworkMagicMismatch {
+                        ours: our_data.network_magic,
+                        theirs: their_data.network_magic,
+                    });
+                }
+            }
             Ok(HandshakeResult {
                 version,
                 simultaneous_open: false,
@@ -825,8 +837,15 @@ mod tests {
     fn n2c_accept_encode_decode() {
         let data = N2CVersionData::new(2);
         let encoded = encode_accept_version_n2c(22, &data);
-        let result = decode_handshake_response_n2c(&encoded).unwrap();
+        let result = decode_handshake_response_n2c(&encoded, &data).unwrap();
         assert_eq!(result.version, 22); // logical, not wire
+
+        // #880: a mismatched magic on the accepted version_data is rejected.
+        let ours = N2CVersionData::new(1);
+        assert!(matches!(
+            decode_handshake_response_n2c(&encoded, &ours),
+            Err(HandshakeError::NetworkMagicMismatch { .. })
+        ));
     }
 
     #[test]

@@ -291,6 +291,62 @@ impl PeerJumpState {
         }
     }
 
+    /// `MsgIntersectNotFound` at the probed midpoint, but the bisection window
+    /// has NOT yet collapsed: the fork lies at or below the midpoint, so narrow
+    /// the UPPER bound to `new_hi` and keep bisecting (#880).
+    ///
+    /// The module's own state diagram describes a binary search between `lo` and
+    /// `hi`, but `on_intersect_not_found` always jumped straight to `Objector` —
+    /// the window could never actually narrow. This transition, together with
+    /// [`Self::on_intersect_found_continue`], expresses the bisection step;
+    /// callers use `on_intersect_not_found` only once `[lo, hi)` has converged.
+    ///
+    /// Valid from: `Jumper(LookingForIntersection { .. })`
+    /// Next state: `Jumper(LookingForIntersection { lo, hi: new_hi })`
+    pub fn on_intersect_not_found_continue(
+        &mut self,
+        new_hi: Point,
+    ) -> Result<(), TransitionError> {
+        match &self.state {
+            JumpState::Jumper(JumperState::LookingForIntersection { lo, .. }) => {
+                let lo = lo.clone();
+                self.state = JumpState::Jumper(JumperState::LookingForIntersection {
+                    lo,
+                    hi: new_hi,
+                });
+                Ok(())
+            }
+            other => Err(TransitionError::InvalidState {
+                current: format!("{other:?}"),
+                attempted: "on_intersect_not_found_continue",
+            }),
+        }
+    }
+
+    /// `MsgIntersectFound` at the probed midpoint, but the bisection window has
+    /// NOT yet collapsed: the fork lies above the midpoint, so raise the LOWER
+    /// bound to `new_lo` and keep bisecting (#880 — the complement of
+    /// [`Self::on_intersect_not_found_continue`]).
+    ///
+    /// Valid from: `Jumper(LookingForIntersection { .. })`
+    /// Next state: `Jumper(LookingForIntersection { lo: new_lo, hi })`
+    pub fn on_intersect_found_continue(&mut self, new_lo: Point) -> Result<(), TransitionError> {
+        match &self.state {
+            JumpState::Jumper(JumperState::LookingForIntersection { hi, .. }) => {
+                let hi = hi.clone();
+                self.state = JumpState::Jumper(JumperState::LookingForIntersection {
+                    lo: new_lo,
+                    hi,
+                });
+                Ok(())
+            }
+            other => Err(TransitionError::InvalidState {
+                current: format!("{other:?}"),
+                attempted: "on_intersect_found_continue",
+            }),
+        }
+    }
+
     /// The bisection has been resolved (fork point determined).  The peer is
     /// disengaged from CSJ and will run normal ChainSync independently.
     ///
@@ -651,6 +707,39 @@ mod tests {
             point: pt(slot),
             era_params: era_params_mainnet_shelley(),
         }
+    }
+
+    /// #880: the bisection-continue transitions narrow the `[lo, hi)` window in
+    /// place (Phase-B CSJ) instead of jumping straight to Objector.
+    #[test]
+    fn bisection_continue_transitions_narrow_window() {
+        let mut peer = PeerJumpState::new_jumper();
+        peer.on_jump_issued(&instr(100)).expect("jump issued");
+
+        // Not found at the midpoint → fork is at/below it → narrow the upper
+        // bound, staying in LookingForIntersection.
+        peer.on_intersect_not_found_continue(pt(50)).expect("continue lo");
+        match &peer.state {
+            JumpState::Jumper(JumperState::LookingForIntersection { lo, hi }) => {
+                assert_eq!(*lo, Point::Origin);
+                assert_eq!(*hi, pt(50));
+            }
+            other => panic!("expected LookingForIntersection, got {other:?}"),
+        }
+
+        // Found at the next midpoint → fork is above it → raise the lower bound.
+        peer.on_intersect_found_continue(pt(25)).expect("continue hi");
+        match &peer.state {
+            JumpState::Jumper(JumperState::LookingForIntersection { lo, hi }) => {
+                assert_eq!(*lo, pt(25));
+                assert_eq!(*hi, pt(50));
+            }
+            other => panic!("expected LookingForIntersection, got {other:?}"),
+        }
+
+        // Window converged → terminal not-found becomes an Objector.
+        peer.on_intersect_not_found(pt(30)).expect("objector");
+        assert!(peer.is_objector());
     }
 
     /// Build a minimal single-era history (Byron instant, Shelley open) for
