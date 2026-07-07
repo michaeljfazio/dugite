@@ -195,9 +195,28 @@ impl IngressTask {
                         continue;
                     }
 
-                    // Atomically add the incoming payload size and check whether
-                    // we have exceeded the per-channel byte budget.
+                    // Hold the SwappableSender lock across the ENTIRE
+                    // counter-update + delivery critical section. This closes
+                    // the #877 race with `MuxHandle::resubscribe()`, which resets
+                    // `bytes_in_flight` to 0 and swaps the sender under the SAME
+                    // lock: without mutual exclusion, resubscribe's `store(0)`
+                    // could land between this `fetch_add` and the `try_send` that
+                    // delivers the chunk to the freshly-installed receiver, so the
+                    // consumer's later `fetch_sub` would underflow the counter to
+                    // ~usize::MAX and trip a spurious IngressQueueOverrun.
                     //
+                    // `parking_lot::Mutex` is non-poisoning and the lock is always
+                    // brief — `fetch_add`/`fetch_sub`/`try_send` are all
+                    // non-blocking. We must NOT use the blocking `.send().await`
+                    // here: if a protocol's ingress channel is full (e.g. a
+                    // ChainSync server blocked at tip while pipelined MsgRequestNext
+                    // messages fill the buffer), a blocking send would stall the
+                    // ENTIRE ingress task, starving every other protocol
+                    // (KeepAlive, BlockFetch). This matches Haskell's network-mux
+                    // demuxer which throws IngressQueueOverRun (fatal) rather than
+                    // blocking.
+                    let sender = route.tx.lock();
+
                     // `fetch_add` returns the value *before* addition, so the new
                     // total is `prev + payload_len`.
                     let prev = route
@@ -219,27 +238,9 @@ impl IngressTask {
                         });
                     }
 
-                    // Deliver to protocol channel using try_send (non-blocking).
-                    //
-                    // CRITICAL: We must NOT use the blocking `.send().await` here.
-                    // If a protocol's ingress channel is full (e.g. ChainSync server
-                    // blocked at tip waiting for announcements while pipelined
-                    // MsgRequestNext messages fill the buffer), the blocking send
-                    // would stall the ENTIRE ingress task, preventing ALL other
-                    // protocols (KeepAlive, BlockFetch) from receiving data.
-                    //
-                    // This matches Haskell's network-mux demuxer which throws
-                    // IngressQueueOverRun (fatal connection error) when a protocol's
-                    // queue overflows — the demuxer never blocks.
-                    //
                     // MuxChannel::recv() will decrement bytes_in_flight after
                     // consuming the chunk.
-                    // Lock the SwappableSender briefly to perform try_send.
-                    // `parking_lot::Mutex` is non-poisoning and lock is always brief
-                    // (try_send is non-blocking). `MuxHandle::resubscribe()` also
-                    // takes this lock to swap in a fresh sender — that swap is also
-                    // brief (single assignment + store).
-                    let send_result = route.tx.lock().try_send(Bytes::from(payload));
+                    let send_result = sender.try_send(Bytes::from(payload));
                     match send_result {
                         Ok(()) => {} // delivered successfully
                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {

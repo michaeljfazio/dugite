@@ -85,16 +85,23 @@ impl MuxHandle {
         // Create a fresh mpsc pair for the new task cycle.
         let (new_tx, new_rx) = mpsc::channel::<Bytes>(ingress::INGRESS_CHANNEL_CAPACITY);
 
-        // Atomically swap the sender inside the running IngressTask.
-        // The lock is held only for the duration of the assignment — a few
-        // nanoseconds.  The IngressTask holds the same lock only during
-        // `try_send`, which is also non-blocking.
-        *swappable_tx.lock() = new_tx;
-
-        // Reset the byte counter so the new receiver starts with zero budget
-        // consumed.  SeqCst ordering ensures the IngressTask sees the reset
-        // before it attempts to enqueue the next frame.
-        bytes_in_flight.store(0, std::sync::atomic::Ordering::SeqCst);
+        // Swap the sender AND reset the byte counter under a SINGLE hold of the
+        // sender lock. The IngressTask performs its `fetch_add` + `try_send`
+        // critical section under the same lock, so this pair is mutually
+        // exclusive with delivery: an in-flight frame is either fully accounted
+        // against the OLD receiver (its bytes discarded when the old MuxChannel
+        // drops, counter then reset to 0) or fully accounted against the NEW
+        // receiver (delivered after the swap, so its consumer `fetch_sub`
+        // balances the `fetch_add`). Neither ordering can leave a queued chunk
+        // with a zeroed counter, which was the #877 underflow window. The lock
+        // is held only for an assignment + an atomic store — a few nanoseconds.
+        {
+            let mut guard = swappable_tx.lock();
+            *guard = new_tx;
+            // SeqCst so the IngressTask observes the reset atomically with the
+            // sender swap.
+            bytes_in_flight.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
 
         Some(MuxChannel::new(
             protocol_id,
@@ -303,14 +310,6 @@ impl<B: Bearer> Mux<B> {
             tracing::debug!("mux: reader task exiting (read_rx channel closed)");
         });
 
-        // Combine into a single handle for cleanup
-        let io_handle = tokio::spawn(async move {
-            tokio::select! {
-                _ = writer_handle => {}
-                _ = reader_handle => {}
-            }
-        });
-
         // Egress task: sends SDU frames via the write channel
         let egress_task = egress::EgressTask::new(egress_rx, sdu_size, batch_size);
         let egress_handle = tokio::spawn(async move {
@@ -347,26 +346,63 @@ impl<B: Bearer> Mux<B> {
                 .await
         });
 
-        // Wait for any task to complete. If one fails, the others will
-        // eventually fail too (channels dropped / bearer closed).
+        // Abort-on-drop guard for ALL four child tasks (#866).
+        //
+        // A bare `JoinHandle` DETACHES its task on drop — it does not cancel it.
+        // The reader/writer tasks own the two socket halves and the reader blocks
+        // indefinitely in `read_exact` (Phase-1 header reads have no timeout), so
+        // detaching them leaks the FDs and the tasks forever: under peer churn
+        // (Hot→Warm→Cold demotions, rotation) every mux teardown leaked a socket
+        // → EMFILE. `run()` is itself a spawned task; when the lifecycle manager
+        // calls `mux_handle.abort()`, this future is dropped at its current await
+        // point and its locals — including this guard — are dropped, which
+        // `.abort()`s every child. Dropping the reader/writer tasks drops the
+        // bearer halves, closing the TCP/Unix socket. When `run()` returns
+        // normally the same cleanup happens.
+        struct AbortOnDrop(Vec<tokio::task::AbortHandle>);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                for h in &self.0 {
+                    h.abort();
+                }
+            }
+        }
+        let mut writer_handle = writer_handle;
+        let mut reader_handle = reader_handle;
+        let mut egress_handle = egress_handle;
+        let mut ingress_handle = ingress_handle;
+        let _abort_guard = AbortOnDrop(vec![
+            writer_handle.abort_handle(),
+            reader_handle.abort_handle(),
+            egress_handle.abort_handle(),
+            ingress_handle.abort_handle(),
+        ]);
+
+        // Wait for any task to complete. Whichever finishes first (clean EOF,
+        // error, or bearer close) tears the connection down; the guard aborts
+        // the survivors — including the reader blocked on `read_exact` — so no
+        // task and no socket FD is leaked.
         let result = tokio::select! {
-            result = egress_handle => {
+            result = &mut egress_handle => {
                 match result {
                     Ok(Ok(())) => Ok(()),
                     Ok(Err(e)) => Err(e),
                     Err(_join_err) => Err(MuxError::ChannelClosed),
                 }
             }
-            result = ingress_handle => {
+            result = &mut ingress_handle => {
                 match result {
                     Ok(Ok(())) => Ok(()),
                     Ok(Err(e)) => Err(e),
                     Err(_join_err) => Err(MuxError::ChannelClosed),
                 }
             }
+            // The bearer I/O halves live in these tasks; if either exits (socket
+            // closed, write error) the mux is done — return and let the guard
+            // abort the rest.
+            _ = &mut reader_handle => Ok(()),
+            _ = &mut writer_handle => Ok(()),
         };
-        // Clean up the bearer I/O task
-        io_handle.abort();
         result
     }
 
@@ -558,6 +594,49 @@ mod tests {
         "INGRESS_CHANNEL_CAPACITY must exceed default pipeline depth 300 \
          to prevent ingress stall under pipelining"
     );
+
+    /// #866: aborting the mux `run()` task must CANCEL its reader/writer child
+    /// tasks (not detach them), which drops the bearer halves and closes the
+    /// socket. We observe the closure from the peer side: after abort, the
+    /// peer's `read` returns EOF (`Ok(0)`). A detached reader would keep the
+    /// socket open indefinitely (the FD leak this test locks against).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_run_closes_socket_no_fd_leak() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let (mux_stream, mut peer_stream) = tokio::join!(
+            async { tokio::net::TcpStream::connect(addr).await.expect("connect") },
+            async { listener.accept().await.expect("accept").0 }
+        );
+
+        let bearer = TcpBearer::new(mux_stream).expect("bearer");
+        let mut mux = Mux::new(bearer, true);
+        // Subscribe a channel so the mux has routes; it will idle waiting for
+        // SDU headers that never come (peer sends nothing).
+        let _ch = mux.subscribe(2, Direction::InitiatorDir, 65536);
+        let mux_handle = tokio::spawn(async move { mux.run().await });
+
+        // Let the mux tasks spin up and park on read.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Abort the run() task. The AbortOnDrop guard must cancel reader+writer,
+        // dropping the socket halves and closing the connection.
+        mux_handle.abort();
+        let _ = mux_handle.await;
+
+        // Peer read must observe EOF within a short window if the socket closed.
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(5), peer_stream.read(&mut buf))
+            .await
+            .expect("peer read timed out — socket was NOT closed (reader task leaked)")
+            .expect("peer read errored");
+        assert_eq!(n, 0, "expected EOF after mux abort; socket left open (FD leak)");
+    }
 
     /// Duplex KeepAlive integration test.
     ///
