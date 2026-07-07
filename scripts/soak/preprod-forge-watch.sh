@@ -2,7 +2,7 @@
 # Poll-loop watcher for the preprod forge soak. Emits a concise heartbeat every
 # ~15 min and exits immediately when the dugite BP forges (or falls off tip /
 # crashes), so the orchestrator is notified at the decisive moment.
-LEADER=127750519
+LEADER=${1:-127750519}
 LOG=logs/bp-pair-preprod/bp.current.log
 BP_PID=$(cat logs/bp-pair-preprod/bp.pid 2>/dev/null)
 iter=0
