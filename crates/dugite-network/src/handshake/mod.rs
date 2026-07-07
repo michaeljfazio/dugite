@@ -498,8 +498,21 @@ fn decode_handshake_response(
             let version = dec
                 .u16()
                 .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
-            // Skip version data (we don't need it after acceptance)
-            let _ = N2NVersionData::decode(&mut dec);
+            // #880: re-validate the responder's network magic instead of
+            // discarding the accepted version_data. A peer that accepts with a
+            // mismatched magic is on a different network; reject at handshake
+            // rather than relying on later block validation to catch it. The
+            // accepted version is one we support, so its version_data has our
+            // shape and decodes cleanly; tolerate a decode failure (older shape)
+            // since magic was already asserted at propose time.
+            if let Ok(their_data) = N2NVersionData::decode(&mut dec) {
+                if their_data.network_magic != our_data.network_magic {
+                    return Err(HandshakeError::NetworkMagicMismatch {
+                        ours: our_data.network_magic,
+                        theirs: their_data.network_magic,
+                    });
+                }
+            }
             Ok(HandshakeResult {
                 version,
                 simultaneous_open: false,
@@ -516,14 +529,34 @@ fn decode_handshake_response(
                     HandshakeError::DecodeError("indefinite map not supported".to_string())
                 })?;
 
+            // #880: cap the version count (parity with
+            // decode_propose_versions_n2n) so a simultaneous open can't be used
+            // to peg a CPU core past the handshake window.
+            if map_len > MAX_HANDSHAKE_VERSIONS {
+                return Err(HandshakeError::DecodeError(format!(
+                    "MsgProposeVersions (simultaneous open): too many versions \
+                     ({map_len} > {MAX_HANDSHAKE_VERSIONS})"
+                )));
+            }
+
             let mut remote_versions = BTreeMap::new();
             for _ in 0..map_len {
                 let version = dec
                     .u16()
                     .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
-                let version_data = N2NVersionData::decode(&mut dec)
-                    .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
-                remote_versions.insert(version, version_data);
+                // #880: skip versions we don't know (cardano-node includes older
+                // ones like N2N v13 whose version_data has a different CBOR shape,
+                // array(3) not array(4)); decoding every one made a genuine
+                // simultaneous open fail with DecodeError instead of negotiating.
+                // Mirror decode_propose_versions_n2n's known-version filter.
+                if n2n::N2N_VERSIONS.contains(&version) {
+                    let version_data = N2NVersionData::decode(&mut dec)
+                        .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
+                    remote_versions.insert(version, version_data);
+                } else {
+                    dec.skip()
+                        .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
+                }
             }
 
             // Find highest common version (same logic as server-side negotiation)
@@ -589,6 +622,31 @@ fn decode_handshake_response_n2c(data: &[u8]) -> Result<HandshakeResult, Handsha
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #880: a MsgAcceptVersion whose version_data carries a DIFFERENT network
+    /// magic than ours must be rejected at handshake (cross-network peer),
+    /// rather than the accepted version_data being silently discarded.
+    #[test]
+    fn accept_version_with_mismatched_magic_is_rejected() {
+        let ours = N2NVersionData::new(2, false, true); // preview magic 2
+        let theirs = N2NVersionData::new(764824073, false, true); // mainnet magic
+        let accept = encode_accept_version_n2n(n2n::N2N_VERSIONS[0], &theirs);
+        let result = decode_handshake_response(&accept, &ours);
+        assert!(
+            matches!(
+                result,
+                Err(HandshakeError::NetworkMagicMismatch {
+                    ours: 2,
+                    theirs: 764824073
+                })
+            ),
+            "cross-network MsgAcceptVersion must be rejected, got: {result:?}"
+        );
+
+        // Sanity: a matching magic still accepts.
+        let ok = encode_accept_version_n2n(n2n::N2N_VERSIONS[0], &ours);
+        assert!(decode_handshake_response(&ok, &ours).is_ok());
+    }
 
     #[test]
     fn n2n_propose_encode_decode_roundtrip() {

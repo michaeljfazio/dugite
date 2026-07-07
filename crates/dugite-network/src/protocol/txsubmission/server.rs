@@ -152,12 +152,14 @@ impl TxSubmissionServer {
                     }
 
                     // Track new tx IDs, dedup against inflight.
-                    // to_fetch carries (era_id, tx_hash) pairs for MsgRequestTxs.
-                    let mut to_fetch: Vec<(u8, [u8; 32])> = Vec::new();
+                    // to_fetch carries (era_id, tx_hash, advertised_size) triples
+                    // for MsgRequestTxs; the advertised size lets us reject a peer
+                    // that later delivers a body larger than it declared (#880).
+                    let mut to_fetch: Vec<(u8, [u8; 32], u32)> = Vec::new();
                     for id in &ids {
                         if !inflight.contains(&id.tx_id) {
                             inflight.insert(id.tx_id);
-                            to_fetch.push((id.era_id, id.tx_id));
+                            to_fetch.push((id.era_id, id.tx_id, id.size_in_bytes));
                         }
                         unacked.push_back(id.clone());
                     }
@@ -182,8 +184,9 @@ impl TxSubmissionServer {
                     }
 
                     // Request full tx bodies — MsgRequestTxs carries (era_id, tx_hash) pairs.
-                    let req_txs =
-                        encode_message(&TxSubmissionMessage::MsgRequestTxs(to_fetch.clone()));
+                    let req_pairs: Vec<(u8, [u8; 32])> =
+                        to_fetch.iter().map(|(e, h, _)| (*e, *h)).collect();
+                    let req_txs = encode_message(&TxSubmissionMessage::MsgRequestTxs(req_pairs));
                     channel.send(req_txs).await.map_err(ProtocolError::from)?;
 
                     let txs_bytes = channel.recv().await.map_err(ProtocolError::from)?;
@@ -210,6 +213,24 @@ impl TxSubmissionServer {
                                 } else {
                                     [0; 32]
                                 };
+
+                                // #880: the delivered body must not exceed the
+                                // size the peer advertised in MsgReplyTxIds (which
+                                // includes the ~4-byte HFC envelope, so the
+                                // era-stripped body is always <= it). A larger body
+                                // is a flow-control / attribution violation —
+                                // convict the peer.
+                                if i < to_fetch.len() && tx_bytes.len() as u64 > to_fetch[i].2 as u64
+                                {
+                                    return Err(ProtocolError::BoundsExceeded {
+                                        protocol: "TxSubmission2",
+                                        reason: format!(
+                                            "delivered tx body is {} bytes but peer advertised {}",
+                                            tx_bytes.len(),
+                                            to_fetch[i].2
+                                        ),
+                                    });
+                                }
 
                                 // Pass raw tx bytes (era wrapper stripped) to the
                                 // callback along with the txid the PEER ATTESTED.
