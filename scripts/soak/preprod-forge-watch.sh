@@ -10,7 +10,8 @@ while true; do
   iter=$((iter+1))
   slot=$(curl -s http://localhost:12799/metrics 2>/dev/null | grep '^dugite_slot_number' | awk '{print $2}')
   net=$(grep -oE 'at slot [0-9]+' logs/bp-pair-preprod/relay.current.log 2>/dev/null | tail -1 | awk '{print $3}')
-  forge=$(grep -hE "TraceNodeIsLeader|TraceForgedBlock|TraceAdoptedBlock|TraceForgedInvalid|TraceDidntAdopt|TraceNodeCannotForge" "$LOG" 2>/dev/null | tail -1)
+  # Only a forge AT this leader slot counts (slot=$LEADER also matches current_slot=$LEADER).
+  forge=$(grep -hE "TraceNodeIsLeader|TraceForgedBlock|TraceAdoptedBlock|TraceForgedInvalid|TraceDidntAdopt|TraceNodeCannotForge" "$LOG" 2>/dev/null | grep "slot=$LEADER" | tail -1)
   # ValidateAll withdrawal rejection (tip-following failure) uses the "...: withdrawal N !=" format
   err=$(grep -hE "WithdrawalAmountMismatch: withdrawal|Block does not connect|thread '.*' panicked|FATAL" "$LOG" 2>/dev/null | tail -1)
   behind=$(( ${net:-0} - ${slot:-0} ))
