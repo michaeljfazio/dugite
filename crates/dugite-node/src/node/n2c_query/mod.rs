@@ -107,6 +107,31 @@ impl QueryHandler {
         self.state = Arc::new(snapshot);
     }
 
+    /// Build a lightweight "shadow" handler that shares everything with `self`
+    /// via cheap `Arc`/`Copy` fields, except its `state` is pinned to
+    /// `pinned_state` instead of the live `self.state`.
+    ///
+    /// This is how LocalStateQuery snapshot pinning (issue #867) is implemented:
+    /// rather than threading an explicit `state: &NodeStateSnapshot` parameter
+    /// through every internal dispatch method (~40 call sites across
+    /// `dispatch_query_with_version`, `handle_shelley_query`, and friends — all
+    /// of which are also exercised directly by unit tests in this module), we
+    /// construct a throwaway `QueryHandler` whose `state` Arc points at the
+    /// snapshot pinned at MsgAcquire time, and delegate to the SAME unmodified
+    /// internal methods on that shadow. No lock is touched here and no ledger
+    /// data is deep-cloned — only `Arc`/`Option<Arc<_>>` pointers are cloned.
+    fn with_pinned_state(&self, pinned_state: Arc<NodeStateSnapshot>) -> QueryHandler {
+        QueryHandler {
+            state: pinned_state,
+            utxo_provider: self.utxo_provider.clone(),
+            n2c_version: std::sync::atomic::AtomicU16::new(
+                self.n2c_version.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            max_major_prot_ver: self.max_major_prot_ver,
+            chain_db: self.chain_db.clone(),
+        }
+    }
+
     /// Get a reference to the current node state snapshot
     #[allow(dead_code)] // used in tests
     pub fn state(&self) -> &NodeStateSnapshot {
@@ -614,93 +639,149 @@ fn encode_result_value(result: &QueryResult) -> Vec<u8> {
 }
 
 impl dugite_network::QueryHandler for QueryHandler {
-    fn handle_query(&self, query_cbor: &[u8], n2c_version: u16) -> Result<Vec<u8>, String> {
+    /// Pinned ledger-state snapshot for a single MsgAcquire..MsgRelease session
+    /// (issue #867): `acquire()` resolves the target to one of these ONCE, and
+    /// every MsgQuery dispatch method below receives the SAME `Arc` for the
+    /// lifetime of that acquisition — guaranteeing a consistent (non-torn)
+    /// view even if `update_state()` swaps the live snapshot mid-session.
+    type Acquired = Arc<NodeStateSnapshot>;
+
+    fn acquire(
+        &self,
+        target: &dugite_network::protocol::local_state_query::AcquireTarget,
+    ) -> Result<Self::Acquired, dugite_network::protocol::local_state_query::AcquireFailure> {
+        use dugite_network::codec::Point as CodecPoint;
+        use dugite_network::protocol::local_state_query::{AcquireFailure, AcquireTarget};
+
+        match target {
+            // VolatileTip and ImmutableTip always refer to the CURRENT chain
+            // tip — pin the current state snapshot (a cheap Arc clone).
+            AcquireTarget::VolatileTip | AcquireTarget::ImmutableTip => Ok(Arc::clone(&self.state)),
+
+            // SpecificPoint: the client has requested a point. There is no
+            // machinery to rewind ledger state to an arbitrary past point
+            // (only destructive rollbacks), so the only point we can honestly
+            // materialise a snapshot for is the CURRENT tip. If the requested
+            // point equals the current tip, pin the current state. Otherwise:
+            // mirror Haskell `ouroboros-consensus` by checking whether the
+            // point exists anywhere on our chain (VolatileDB/ImmutableDB) to
+            // choose the right failure — `PointTooOld` (it exists, but we
+            // cannot rewind to it) vs `PointNotOnChain` (it never existed on
+            // our chain at all).
+            AcquireTarget::SpecificPoint(point) => match point {
+                CodecPoint::Origin => {
+                    if matches!(
+                        self.state.tip.point,
+                        dugite_primitives::block::Point::Origin
+                    ) {
+                        Ok(Arc::clone(&self.state))
+                    } else {
+                        debug!(
+                            "acquire: SpecificPoint(Origin) requested but current tip has \
+                             moved past genesis — cannot materialise a non-tip snapshot"
+                        );
+                        Err(AcquireFailure::PointTooOld)
+                    }
+                }
+                CodecPoint::Specific(slot, hash_arr) => {
+                    let block_hash = dugite_primitives::hash::Hash32::from_bytes(*hash_arr);
+                    let matches_current_tip = matches!(
+                        &self.state.tip.point,
+                        dugite_primitives::block::Point::Specific(tip_slot, tip_hash)
+                            if tip_slot.0 == *slot && tip_hash == &block_hash
+                    );
+                    if matches_current_tip {
+                        return Ok(Arc::clone(&self.state));
+                    }
+
+                    match &self.chain_db {
+                        None => {
+                            // No ChainDB wired (tests without storage) — refuse specific-point
+                            // acquires defensively rather than silently accepting a fabricated point.
+                            debug!("acquire: no chain_db wired, refusing SpecificPoint");
+                            Err(AcquireFailure::PointNotOnChain)
+                        }
+                        Some(chain_db) => {
+                            let on_chain = tokio::task::block_in_place(|| {
+                                let db = chain_db.blocking_read();
+                                db.has_block(&block_hash)
+                            });
+                            if on_chain {
+                                debug!(
+                                    hash = hex::encode(hash_arr),
+                                    "acquire: SpecificPoint is on chain but not the current tip \
+                                     — cannot materialise a historical snapshot (PointTooOld)"
+                                );
+                                Err(AcquireFailure::PointTooOld)
+                            } else {
+                                debug!(
+                                    hash = hex::encode(hash_arr),
+                                    "acquire: SpecificPoint not on chain — refusing"
+                                );
+                                Err(AcquireFailure::PointNotOnChain)
+                            }
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    fn handle_query(
+        &self,
+        acquired: &Self::Acquired,
+        query_cbor: &[u8],
+        n2c_version: u16,
+    ) -> Result<Vec<u8>, String> {
+        let shadow = self.with_pinned_state(Arc::clone(acquired));
         let mut decoder = minicbor::Decoder::new(query_cbor);
-        let result = self.dispatch_query_with_version(&mut decoder, n2c_version);
+        let result = shadow.dispatch_query_with_version(&mut decoder, n2c_version);
         match result {
             QueryResult::Error(msg) => Err(msg),
             _ => Ok(encoding::encode_query_result_payload(&result)),
         }
     }
 
-    fn handle_block_query(&self, tag: u64, query_cbor: &[u8]) -> Result<Vec<u8>, String> {
-        let mut decoder = minicbor::Decoder::new(query_cbor);
-        let result = self.handle_shelley_query(tag as u32, &mut decoder);
-        match result {
-            QueryResult::Error(msg) => Err(msg),
-            _ => Ok(encode_result_value(&result)),
-        }
-    }
-
-    fn handle_query_anytime(&self, query_cbor: &[u8]) -> Result<Vec<u8>, String> {
-        let mut decoder = minicbor::Decoder::new(query_cbor);
-        let result = self.handle_query_anytime_inner(&mut decoder);
-        match result {
-            QueryResult::Error(msg) => Err(msg),
-            _ => Ok(encode_result_value(&result)),
-        }
-    }
-
-    fn handle_query_hard_fork(&self, query_cbor: &[u8]) -> Result<Vec<u8>, String> {
-        let mut decoder = minicbor::Decoder::new(query_cbor);
-        let result = self.handle_hard_fork_query(&mut decoder);
-        match result {
-            QueryResult::Error(msg) => Err(msg),
-            _ => Ok(encode_result_value(&result)),
-        }
-    }
-
-    fn validate_acquire(
+    fn handle_block_query(
         &self,
-        target: &dugite_network::protocol::local_state_query::AcquireTarget,
-    ) -> Result<(), dugite_network::protocol::local_state_query::AcquireFailure> {
-        use dugite_network::codec::Point as CodecPoint;
-        use dugite_network::protocol::local_state_query::{AcquireFailure, AcquireTarget};
+        acquired: &Self::Acquired,
+        tag: u64,
+        query_cbor: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let shadow = self.with_pinned_state(Arc::clone(acquired));
+        let mut decoder = minicbor::Decoder::new(query_cbor);
+        let result = shadow.handle_shelley_query(tag as u32, &mut decoder);
+        match result {
+            QueryResult::Error(msg) => Err(msg),
+            _ => Ok(encode_result_value(&result)),
+        }
+    }
 
-        match target {
-            // VolatileTip and ImmutableTip always refer to the current chain
-            // tip — they are always valid acquire targets.
-            AcquireTarget::VolatileTip | AcquireTarget::ImmutableTip => Ok(()),
+    fn handle_query_anytime(
+        &self,
+        acquired: &Self::Acquired,
+        query_cbor: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let shadow = self.with_pinned_state(Arc::clone(acquired));
+        let mut decoder = minicbor::Decoder::new(query_cbor);
+        let result = shadow.handle_query_anytime_inner(&mut decoder);
+        match result {
+            QueryResult::Error(msg) => Err(msg),
+            _ => Ok(encode_result_value(&result)),
+        }
+    }
 
-            // SpecificPoint: the client has requested a historical point.
-            // Mirror Haskell `ouroboros-consensus`: the point must exist in
-            // either the VolatileDB (recent blocks) or the ImmutableDB (finalized
-            // blocks). If it is not found on any chain, return PointNotOnChain.
-            //
-            // Note: we do NOT distinguish PointTooOld from PointNotOnChain here
-            // because ImmutableDB already contains all finalized blocks — if a
-            // block is in ImmutableDB it is still addressable. A point before the
-            // immutable tip that is truly absent simply was never on our chain.
-            AcquireTarget::SpecificPoint(point) => match point {
-                CodecPoint::Origin => {
-                    // Origin is always a valid acquire target.
-                    Ok(())
-                }
-                CodecPoint::Specific(_slot, hash_arr) => match &self.chain_db {
-                    None => {
-                        // No ChainDB wired (tests without storage) — refuse specific-point
-                        // acquires defensively rather than silently accepting a fabricated point.
-                        debug!("validate_acquire: no chain_db wired, refusing SpecificPoint");
-                        Err(AcquireFailure::PointNotOnChain)
-                    }
-                    Some(chain_db) => {
-                        let block_hash = dugite_primitives::hash::Hash32::from_bytes(*hash_arr);
-                        let on_chain = tokio::task::block_in_place(|| {
-                            let db = chain_db.blocking_read();
-                            db.has_block(&block_hash)
-                        });
-                        if on_chain {
-                            Ok(())
-                        } else {
-                            debug!(
-                                hash = hex::encode(hash_arr),
-                                "validate_acquire: SpecificPoint not on chain — refusing"
-                            );
-                            Err(AcquireFailure::PointNotOnChain)
-                        }
-                    }
-                },
-            },
+    fn handle_query_hard_fork(
+        &self,
+        acquired: &Self::Acquired,
+        query_cbor: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let shadow = self.with_pinned_state(Arc::clone(acquired));
+        let mut decoder = minicbor::Decoder::new(query_cbor);
+        let result = shadow.handle_hard_fork_query(&mut decoder);
+        match result {
+            QueryResult::Error(msg) => Err(msg),
+            _ => Ok(encode_result_value(&result)),
         }
     }
 }
@@ -1670,8 +1751,11 @@ mod tests {
         use dugite_network::QueryHandler as TraitQueryHandler;
 
         let handler = super::QueryHandler::new(11);
+        let acquired = handler
+            .acquire(&AcquireTarget::VolatileTip)
+            .expect("VolatileTip acquire must succeed");
         // Tag 1 = GetEpochNo (no params needed)
-        let result = handler.handle_block_query(1, &[]);
+        let result = handler.handle_block_query(&acquired, 1, &[]);
         assert!(result.is_ok());
         // The result should be CBOR-encoded epoch number (0)
         let cbor = result.unwrap();
@@ -1684,16 +1768,19 @@ mod tests {
         use dugite_network::QueryHandler as TraitQueryHandler;
 
         let handler = super::QueryHandler::new(11);
+        let acquired = handler
+            .acquire(&AcquireTarget::VolatileTip)
+            .expect("VolatileTip acquire must succeed");
         // Sub-tag 1 = GetCurrentEra, encoded as [1]
         let mut buf = Vec::new();
         let mut enc = minicbor::Encoder::new(&mut buf);
         enc.array(1).unwrap();
         enc.u32(1).unwrap();
-        let result = handler.handle_query_hard_fork(&buf);
+        let result = handler.handle_query_hard_fork(&acquired, &buf);
         assert!(result.is_ok());
     }
 
-    // ── C1 tests: validate_acquire point-on-chain checks ─────────────────────
+    // ── C1 / #867 tests: acquire() point-on-chain + snapshot-pinning checks ──
 
     use dugite_network::codec::Point as CodecPoint;
     use dugite_network::protocol::local_state_query::{AcquireFailure, AcquireTarget};
@@ -1703,20 +1790,14 @@ mod tests {
     fn c1_volatile_tip_always_succeeds() {
         use dugite_network::QueryHandler as _;
         let handler = super::QueryHandler::new(11); // no chain_db
-        assert_eq!(
-            handler.validate_acquire(&AcquireTarget::VolatileTip),
-            Ok(())
-        );
+        assert!(handler.acquire(&AcquireTarget::VolatileTip).is_ok());
     }
 
     #[test]
     fn c1_immutable_tip_always_succeeds() {
         use dugite_network::QueryHandler as _;
         let handler = super::QueryHandler::new(11); // no chain_db
-        assert_eq!(
-            handler.validate_acquire(&AcquireTarget::ImmutableTip),
-            Ok(())
-        );
+        assert!(handler.acquire(&AcquireTarget::ImmutableTip).is_ok());
     }
 
     /// C1: SpecificPoint with no chain_db must return PointNotOnChain (defensive default).
@@ -1725,23 +1806,159 @@ mod tests {
         use dugite_network::QueryHandler as _;
         let handler = super::QueryHandler::new(11); // no chain_db
         let point = AcquireTarget::SpecificPoint(CodecPoint::Specific(1000, [0xAA; 32]));
-        assert_eq!(
-            handler.validate_acquire(&point),
-            Err(AcquireFailure::PointNotOnChain),
+        assert!(
+            matches!(
+                handler.acquire(&point),
+                Err(AcquireFailure::PointNotOnChain)
+            ),
             "SpecificPoint with no chain_db must refuse (defensive default)"
         );
     }
 
-    /// C1: Origin point is always valid even without chain_db.
+    /// C1: Origin point is valid when the current tip IS Origin (default state).
     #[test]
-    fn c1_origin_point_always_valid() {
+    fn c1_origin_point_valid_at_genesis() {
         use dugite_network::QueryHandler as _;
-        let handler = super::QueryHandler::new(11); // no chain_db
+        let handler = super::QueryHandler::new(11); // no chain_db, default state == Origin tip
         let point = AcquireTarget::SpecificPoint(CodecPoint::Origin);
+        assert!(
+            handler.acquire(&point).is_ok(),
+            "Origin point must be a valid acquire target when the current tip is Origin"
+        );
+    }
+
+    /// #867: Origin point is REJECTED (PointTooOld) once the chain has moved
+    /// past genesis, because there is no machinery to rewind ledger state
+    /// back to Origin — we can only materialise a snapshot of the CURRENT tip.
+    #[test]
+    fn issue_867_origin_point_too_old_once_tip_advances() {
+        use dugite_network::QueryHandler as _;
+        let mut handler = super::QueryHandler::new(11);
+        handler.update_state(NodeStateSnapshot {
+            tip: Tip {
+                point: Point::Specific(SlotNo(500), Hash32::from_bytes([0x33; 32])),
+                block_number: BlockNo(10),
+            },
+            ..Default::default()
+        });
+        let point = AcquireTarget::SpecificPoint(CodecPoint::Origin);
+        assert!(
+            matches!(handler.acquire(&point), Err(AcquireFailure::PointTooOld)),
+            "Origin acquire must fail with PointTooOld once the tip has advanced past genesis"
+        );
+    }
+
+    /// #867: a SpecificPoint that IS the current tip pins that tip's snapshot.
+    #[test]
+    fn issue_867_specific_point_matching_current_tip_succeeds() {
+        use dugite_network::QueryHandler as _;
+        let mut handler = super::QueryHandler::new(11);
+        let tip_hash = Hash32::from_bytes([0x44; 32]);
+        handler.update_state(NodeStateSnapshot {
+            tip: Tip {
+                point: Point::Specific(SlotNo(777), tip_hash),
+                block_number: BlockNo(20),
+            },
+            ..Default::default()
+        });
+        let point = AcquireTarget::SpecificPoint(CodecPoint::Specific(777, tip_hash.0));
+        assert!(
+            handler.acquire(&point).is_ok(),
+            "SpecificPoint matching the current tip must always succeed"
+        );
+    }
+
+    /// #867: a SpecificPoint that IS on our chain (VolatileDB/ImmutableDB) but
+    /// is NOT the current tip must return `PointTooOld` — we have no way to
+    /// rewind ledger state to serve that historical snapshot.
+    #[test]
+    fn issue_867_specific_point_on_chain_but_not_tip_returns_point_too_old() {
+        use dugite_network::QueryHandler as _;
+
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let mut chain_db = dugite_storage::ChainDB::open(tmp_dir.path()).expect("open chain_db");
+        let old_hash = Hash32::from_bytes([0x11; 32]);
+        chain_db
+            .add_block(
+                old_hash,
+                SlotNo(50),
+                BlockNo(1),
+                Hash32::from_bytes([0u8; 32]),
+                vec![0xAAu8; 4],
+            )
+            .expect("add_block");
+
+        let mut handler = super::QueryHandler::new(11);
+        // Advance the handler's current tip PAST that block, so the point is
+        // on-chain but no longer the tip.
+        handler.update_state(NodeStateSnapshot {
+            tip: Tip {
+                point: Point::Specific(SlotNo(999), Hash32::from_bytes([0x22; 32])),
+                block_number: BlockNo(2),
+            },
+            ..Default::default()
+        });
+        handler.set_chain_db(Arc::new(RwLock::new(chain_db)));
+
+        let point = AcquireTarget::SpecificPoint(CodecPoint::Specific(50, old_hash.0));
+        let result = handler.acquire(&point);
+        assert!(
+            matches!(result, Err(AcquireFailure::PointTooOld)),
+            "on-chain point that is not the current tip must return PointTooOld, got {result:?}"
+        );
+    }
+
+    /// #867: torn-read regression at the node QueryHandler level. Two queries
+    /// dispatched against the SAME pinned `Acquired` handle must answer from
+    /// the SAME snapshot, even after `update_state()` swaps the live state.
+    #[test]
+    fn issue_867_torn_read_regression_pinned_handle_survives_update_state() {
+        use dugite_network::QueryHandler as _;
+
+        let mut handler = super::QueryHandler::new(11);
+        handler.update_state(NodeStateSnapshot {
+            epoch: EpochNo(100),
+            ..Default::default()
+        });
+
+        // Pin a snapshot at epoch 100.
+        let acquired = handler
+            .acquire(&AcquireTarget::VolatileTip)
+            .expect("acquire must succeed");
+
+        // Simulate a live update landing BETWEEN two queries of one acquisition.
+        handler.update_state(NodeStateSnapshot {
+            epoch: EpochNo(200),
+            ..Default::default()
+        });
+
+        // Both queries against the PINNED handle must still see epoch 100.
+        // Tag 1 = GetEpochNo (no query-CBOR arguments needed).
+        for _ in 0..2 {
+            let result = handler
+                .handle_block_query(&acquired, 1, &[])
+                .expect("handle_block_query must succeed");
+            let mut dec = minicbor::Decoder::new(&result);
+            assert_eq!(
+                dec.u64().unwrap(),
+                100,
+                "query against the pinned handle must see epoch 100, not the \
+                 live epoch 200 set by the concurrent update_state() call"
+            );
+        }
+
+        // A FRESH acquire (new session) must see the NEW live state.
+        let acquired2 = handler
+            .acquire(&AcquireTarget::VolatileTip)
+            .expect("acquire must succeed");
+        let result = handler
+            .handle_block_query(&acquired2, 1, &[])
+            .expect("handle_block_query must succeed");
+        let mut dec = minicbor::Decoder::new(&result);
         assert_eq!(
-            handler.validate_acquire(&point),
-            Ok(()),
-            "Origin point must always be a valid acquire target"
+            dec.u64().unwrap(),
+            200,
+            "a NEW acquire must observe the latest live state"
         );
     }
 

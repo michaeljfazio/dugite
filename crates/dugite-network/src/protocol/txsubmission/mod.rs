@@ -54,6 +54,28 @@ pub struct TxIdAndSize {
     pub size_in_bytes: u32,
 }
 
+/// Outcome of handing a received transaction body to the admission callback.
+///
+/// The N2N inbound tx path must reconcile the txid a peer *attests* (in
+/// `MsgReplyTxIds`) against the canonical id `blake2b_256(raw_body_cbor)` of the
+/// body it later delivers (in `MsgReplyTxs`). A mismatch is a protocol
+/// integrity violation, not a mere validation failure, so it is distinguished
+/// from an ordinary rejection: the server converts [`Self::Convict`] into a
+/// fatal [`crate::error::ProtocolError::IntegrityViolation`] that drops the
+/// connection (#864).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxAdmission {
+    /// Tx passed validation and was admitted to the mempool (or already present).
+    Accepted,
+    /// Tx failed validation / mempool admission — NOT a protocol violation; the
+    /// connection stays up.
+    Rejected,
+    /// The peer committed a protocol integrity violation (e.g. the delivered
+    /// body's canonical id does not match the txid it attested). Convict the
+    /// peer: the server returns a fatal error and the connection is dropped.
+    Convict,
+}
+
 /// TxSubmission2 protocol messages.
 #[derive(Debug, Clone)]
 pub enum TxSubmissionMessage {

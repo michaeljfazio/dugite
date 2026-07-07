@@ -45,44 +45,57 @@ const MAX_SDUS_PER_BATCH: usize = 100;
 /// Without a cap, a single slow-reader peer can cause unbounded heap growth.
 ///
 /// Haskell's `Ouroboros.Network.Mux.Egress` uses `STM TBQueue` with finite
-/// capacity to provide natural back-pressure. We mirror this by rejecting new
-/// messages once the per-channel byte budget is exhausted.
+/// capacity to provide natural back-pressure: the *producer blocks* when the
+/// queue is full — a queued message is never dropped. We mirror that by holding
+/// the over-cap message aside and ceasing to drain the source channel until
+/// writes bring the channel below the cap (#872). Dropping the message instead
+/// would desync the peer's mini-protocol state machine (e.g. a BlockFetch client
+/// receiving fewer `MsgBlock`s than the requested range, with no error).
 ///
 /// 8 MB matches 2× the largest Cardano block (~4 MB post-Conway) so that a
-/// single in-flight large block + one pending block can coexist without false
-/// overrun rejections.
+/// single in-flight large block + one pending block can coexist without
+/// prematurely triggering back-pressure.
 ///
-/// A-010 (security audit 2026-05-19).
+/// A-010 (security audit 2026-05-19); back-pressure semantics per #872.
 pub const MAX_EGRESS_BYTES_PER_CHANNEL: usize = 8 * 1024 * 1024; // 8 MB
 
 /// Key identifying a protocol channel: (protocol_id, direction).
 type ChannelKey = (u16, Direction);
 
-/// Enqueue a message for egress, enforcing the per-channel byte cap (A-010).
+/// Try to enqueue a message for egress, enforcing the per-channel byte cap
+/// (A-010) with true back-pressure (#872).
 ///
-/// If the channel's pending byte count would exceed [`MAX_EGRESS_BYTES_PER_CHANNEL`],
-/// the message is silently dropped and a warning is emitted.  This matches
-/// Haskell's `STM TBQueue` bounded-queue back-pressure semantics.
+/// Returns `None` when the message was enqueued. Returns `Some((key, data))` —
+/// the message unchanged — when the channel already holds queued bytes and
+/// admitting this message would exceed [`MAX_EGRESS_BYTES_PER_CHANNEL`]; the
+/// caller must hold it as `pending` and stop draining the source channel until
+/// writes free space, rather than dropping it.
+///
+/// A message is always admitted when the channel is currently empty, even if it
+/// alone exceeds the cap: a single mini-protocol message (e.g. one ~4 MB
+/// `MsgBlock`) must be sent whole, and refusing it would deadlock the channel.
+#[must_use = "an over-cap message must be held as pending, not dropped"]
 fn enqueue_message(
     queues: &mut HashMap<ChannelKey, VecDeque<Bytes>>,
     channel_bytes: &mut HashMap<ChannelKey, usize>,
     key: ChannelKey,
     data: Bytes,
-) {
+) -> Option<(ChannelKey, Bytes)> {
     let current = channel_bytes.get(&key).copied().unwrap_or(0);
-    if current + data.len() > MAX_EGRESS_BYTES_PER_CHANNEL {
-        tracing::warn!(
+    if current > 0 && current + data.len() > MAX_EGRESS_BYTES_PER_CHANNEL {
+        tracing::debug!(
             protocol_id = key.0,
             direction = ?key.1,
             queued_bytes = current,
             message_bytes = data.len(),
             cap = MAX_EGRESS_BYTES_PER_CHANNEL,
-            "egress queue cap exceeded — dropping message (peer is too slow)"
+            "egress channel at cap — applying back-pressure (holding message, pausing source drain)"
         );
-        return;
+        return Some((key, data));
     }
     *channel_bytes.entry(key).or_insert(0) += data.len();
     queues.entry(key).or_default().push_back(data);
+    None
 }
 
 /// Egress task state. Created by the [`Mux`] and run as a spawned tokio task.
@@ -134,6 +147,13 @@ impl EgressTask {
 
         // Per-channel byte counters for A-010 back-pressure.
         let mut channel_bytes: HashMap<ChannelKey, usize> = HashMap::new();
+
+        // A single message that could not be enqueued because its channel was at
+        // the byte cap (#872). While this is `Some`, we stop draining `self.rx`,
+        // so producers back-pressure through the bounded egress channel instead
+        // of losing the message. It is retried after every write round; once its
+        // channel drains below the cap it is enqueued and draining resumes.
+        let mut pending: Option<(ChannelKey, Bytes)> = None;
 
         // Batch buffer for accumulating multiple SDUs before a single write.
         let mut batch_buf: Vec<u8> = Vec::with_capacity(self.batch_size);
@@ -204,19 +224,49 @@ impl EgressTask {
                 batch_buf.clear();
             }
 
+            // Retry the back-pressured message (#872): the write round above may
+            // have drained its channel below the cap. `enqueue_message` returns
+            // it again if the channel is still full.
+            if let Some((key, data)) = pending.take() {
+                pending = enqueue_message(&mut queues, &mut channel_bytes, key, data);
+            }
+
             // If we made progress, loop again to send more continuation
             // chunks (or start the next queued message).
             if made_progress {
-                // Non-blocking drain of any new messages that arrived while
-                // we were writing.
-                let mut sdu_count = 0;
-                while let Ok((pid, dir, data)) = self.rx.try_recv() {
-                    enqueue_message(&mut queues, &mut channel_bytes, (pid, dir), data);
-                    sdu_count += 1;
-                    if sdu_count >= MAX_SDUS_PER_BATCH {
-                        break;
+                // Non-blocking drain of any new messages that arrived while we
+                // were writing — but ONLY while no message is back-pressured.
+                // Holding `pending` means a channel is at its byte cap; we stop
+                // pulling from `self.rx` so producers block on the bounded egress
+                // channel (true back-pressure) instead of us buffering unbounded.
+                if pending.is_none() {
+                    let mut sdu_count = 0;
+                    while pending.is_none() {
+                        match self.rx.try_recv() {
+                            Ok((pid, dir, data)) => {
+                                pending = enqueue_message(
+                                    &mut queues,
+                                    &mut channel_bytes,
+                                    (pid, dir),
+                                    data,
+                                );
+                                sdu_count += 1;
+                                if sdu_count >= MAX_SDUS_PER_BATCH {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
                     }
                 }
+                continue;
+            }
+
+            // Whenever a message is back-pressured its channel is non-empty, so
+            // Phase 1 makes progress and this point is unreachable with
+            // `pending.is_some()`; guard anyway to avoid a busy-loop if that
+            // invariant ever changes.
+            if pending.is_some() {
                 continue;
             }
 
@@ -224,13 +274,19 @@ impl EgressTask {
             match self.rx.recv().await {
                 None => return Ok(()),
                 Some((pid, dir, data)) => {
-                    enqueue_message(&mut queues, &mut channel_bytes, (pid, dir), data);
+                    pending = enqueue_message(&mut queues, &mut channel_bytes, (pid, dir), data);
                 }
             }
 
-            // Non-blocking drain of any additional messages.
-            while let Ok((pid, dir, data)) = self.rx.try_recv() {
-                enqueue_message(&mut queues, &mut channel_bytes, (pid, dir), data);
+            // Non-blocking drain of any additional messages (paused on pending).
+            while pending.is_none() {
+                match self.rx.try_recv() {
+                    Ok((pid, dir, data)) => {
+                        pending =
+                            enqueue_message(&mut queues, &mut channel_bytes, (pid, dir), data);
+                    }
+                    Err(_) => break,
+                }
             }
         }
     }
@@ -569,6 +625,98 @@ mod tests {
             "9-byte message / SDU=4 should produce [4,4,1] chunks"
         );
         assert_eq!(reassembled, msg);
+    }
+
+    /// #872: an over-cap message is held (back-pressure), never dropped.
+    ///
+    /// A channel that is empty accepts any message (even one larger than the
+    /// cap). A channel that already holds bytes refuses a message that would
+    /// exceed the cap, returning it unchanged for the caller to hold as pending.
+    #[test]
+    fn enqueue_message_backpressures_instead_of_dropping() {
+        let mut queues: HashMap<ChannelKey, VecDeque<Bytes>> = HashMap::new();
+        let mut channel_bytes: HashMap<ChannelKey, usize> = HashMap::new();
+        let key = (3u16, Direction::ResponderDir);
+
+        // Empty channel: an oversized single message is still admitted whole.
+        let big = Bytes::from(vec![0u8; MAX_EGRESS_BYTES_PER_CHANNEL + 10]);
+        let big_len = big.len();
+        assert!(
+            enqueue_message(&mut queues, &mut channel_bytes, key, big).is_none(),
+            "empty channel must admit even an oversized message (no deadlock)"
+        );
+        assert_eq!(channel_bytes[&key], big_len);
+
+        // Channel now over cap: a second message is refused (returned), not dropped.
+        let more = Bytes::from(vec![1u8; 100]);
+        let back = enqueue_message(&mut queues, &mut channel_bytes, key, more.clone());
+        assert_eq!(
+            back,
+            Some((key, more)),
+            "over-cap message must be returned for back-pressure, not dropped"
+        );
+        // Counter unchanged — the refused message was not accounted.
+        assert_eq!(channel_bytes[&key], big_len);
+
+        // Once the channel drains below the cap, the same message is accepted.
+        channel_bytes.insert(key, 0);
+        queues.get_mut(&key).unwrap().clear();
+        let retry = Bytes::from(vec![1u8; 100]);
+        assert!(
+            enqueue_message(&mut queues, &mut channel_bytes, key, retry).is_none(),
+            "drained channel must accept the previously back-pressured message"
+        );
+        assert_eq!(channel_bytes[&key], 100);
+    }
+
+    /// #872 end-to-end: feeding more than the per-channel cap through `run()`
+    /// delivers every byte — no message is silently dropped.
+    #[tokio::test]
+    async fn run_delivers_all_bytes_beyond_channel_cap() {
+        // 120 messages × 100 KB = 12 MB on one channel, exceeding the 8 MB cap.
+        let msg_size = 100 * 1024;
+        let count = 120;
+        let (tx, rx) = mpsc::channel(count + 1);
+        let task = EgressTask::new(rx, 12288, 131072);
+
+        for i in 0..count {
+            // Distinct first byte per message so we can count deliveries.
+            let mut m = vec![(i % 251) as u8; msg_size];
+            m[0] = (i % 251) as u8;
+            tx.send((2, Direction::InitiatorDir, Bytes::from(m)))
+                .await
+                .unwrap();
+        }
+        drop(tx);
+
+        let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let cap2 = captured.clone();
+        task.run(move |data: &[u8]| {
+            let cap = cap2.clone();
+            let data = data.to_vec();
+            Box::pin(async move {
+                cap.lock().unwrap().extend_from_slice(&data);
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        // Reassemble SDU payloads and confirm total delivered bytes == total sent.
+        let bytes = captured.lock().unwrap();
+        let mut offset = 0usize;
+        let mut payload_total = 0usize;
+        while offset < bytes.len() {
+            let header = decode_header(bytes[offset..offset + 8].try_into().unwrap());
+            offset += HEADER_SIZE + header.payload_length as usize;
+            payload_total += header.payload_length as usize;
+        }
+        assert_eq!(
+            payload_total,
+            msg_size * count,
+            "all {count} messages ({} bytes) must be delivered — none dropped",
+            msg_size * count
+        );
     }
 
     /// Verify egress handles a single very large message spanning many SDUs correctly.

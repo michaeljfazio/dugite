@@ -45,6 +45,12 @@ pub struct HandshakeResult {
     pub version: u16,
     /// Whether simultaneous open was detected (received MsgProposeVersions instead of MsgAccept).
     pub simultaneous_open: bool,
+    /// Whether this was a query-mode handshake (#880): the peer opened with the
+    /// `query` flag set, so we replied with `MsgQueryReply` (the version table)
+    /// instead of `MsgAcceptVersion` and the connection carries no
+    /// mini-protocols — the caller should close it after the reply. On the
+    /// client side this is set when a `MsgQueryReply` was received.
+    pub query: bool,
 }
 
 // ─── CBOR Message Tags ───
@@ -56,7 +62,6 @@ const MSG_ACCEPT_VERSION: u64 = 1;
 /// MsgRefuse tag (server → client).
 const MSG_REFUSE: u64 = 2;
 /// MsgQueryReply tag (server → client, query mode only).
-#[allow(dead_code)]
 const MSG_QUERY_REPLY: u64 = 3;
 
 /// Maximum number of version entries accepted in a `MsgProposeVersions` map.
@@ -120,12 +125,29 @@ pub async fn run_n2n_handshake_server(
         if let Some(their_data) = remote_versions.get(&our_version) {
             // Check if we can accept this version
             if let Some(_accepted) = our_data.accept(their_data) {
+                // #880: if the peer opened in query mode, reply with
+                // MsgQueryReply (our version table, tag 3) instead of
+                // MsgAcceptVersion and flag the result as `query` so the caller
+                // closes the connection. A query-mode client (e.g. a version
+                // enumerator) has no tag-1 arm and would otherwise fail to
+                // decode our accept. The Haskell handshake OR's the query flag,
+                // so a query proposal from the peer puts us in query mode.
+                if their_data.query {
+                    let msg = encode_query_reply_n2n(n2n::N2N_VERSIONS, our_data);
+                    channel.send(msg).await.map_err(HandshakeError::from)?;
+                    return Ok(HandshakeResult {
+                        version: our_version,
+                        simultaneous_open: false,
+                        query: true,
+                    });
+                }
                 // Send MsgAcceptVersion
                 let msg = encode_accept_version_n2n(our_version, our_data);
                 channel.send(msg).await.map_err(HandshakeError::from)?;
                 return Ok(HandshakeResult {
                     version: our_version,
                     simultaneous_open: false,
+                    query: false,
                 });
             } else {
                 // Magic mismatch — use Refused (tag 2) with the matched version and a reason string
@@ -165,7 +187,7 @@ pub async fn run_n2c_handshake_client(
         .map_err(HandshakeError::from)?;
 
     // Decode, converting wire versions back to logical
-    decode_handshake_response_n2c(&response)
+    decode_handshake_response_n2c(&response, our_data)
 }
 
 /// Run the handshake as the server (responder) for N2C connections.
@@ -190,6 +212,7 @@ pub async fn run_n2c_handshake_server(
                 return Ok(HandshakeResult {
                     version: our_version,
                     simultaneous_open: false,
+                    query: false,
                 });
             } else {
                 // Magic mismatch — use Refused (tag 2); wire-encode the version number
@@ -257,6 +280,27 @@ fn encode_propose_versions_n2c(versions: &[u16], data: &N2CVersionData) -> Vec<u
     enc.map(sorted_versions.len() as u64).expect("infallible");
     for v in &sorted_versions {
         enc.u16(n2c::encode_n2c_version(*v)).expect("infallible");
+        data.encode(&mut enc);
+    }
+    buf
+}
+
+/// Encode MsgQueryReply for N2N: `[3, {version: version_data, ...}]` (#880).
+///
+/// Sent by the responder when the initiator opened the handshake in query mode:
+/// it carries our full version table (same map shape as MsgProposeVersions) so
+/// the querying tool can enumerate supported versions, then the connection is
+/// closed. Map keys MUST be sorted ascending (canonical CBOR).
+fn encode_query_reply_n2n(versions: &[u16], data: &N2NVersionData) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut enc = Encoder::new(&mut buf);
+    enc.array(2).expect("infallible");
+    enc.u64(MSG_QUERY_REPLY).expect("infallible");
+    let mut sorted_versions: Vec<u16> = versions.to_vec();
+    sorted_versions.sort();
+    enc.map(sorted_versions.len() as u64).expect("infallible");
+    for v in &sorted_versions {
+        enc.u16(*v).expect("infallible");
         data.encode(&mut enc);
     }
     buf
@@ -498,11 +542,66 @@ fn decode_handshake_response(
             let version = dec
                 .u16()
                 .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
-            // Skip version data (we don't need it after acceptance)
-            let _ = N2NVersionData::decode(&mut dec);
+            // #880: re-validate the responder's network magic instead of
+            // discarding the accepted version_data. A peer that accepts with a
+            // mismatched magic is on a different network; reject at handshake
+            // rather than relying on later block validation to catch it. The
+            // accepted version is one we support, so its version_data has our
+            // shape and decodes cleanly; tolerate a decode failure (older shape)
+            // since magic was already asserted at propose time.
+            if let Ok(their_data) = N2NVersionData::decode(&mut dec) {
+                if their_data.network_magic != our_data.network_magic {
+                    return Err(HandshakeError::NetworkMagicMismatch {
+                        ours: our_data.network_magic,
+                        theirs: their_data.network_magic,
+                    });
+                }
+            }
             Ok(HandshakeResult {
                 version,
                 simultaneous_open: false,
+                query: false,
+            })
+        }
+        MSG_QUERY_REPLY => {
+            // #880: the responder answered our query-mode proposal with its
+            // version table. Return the highest version we both support (best
+            // effort) flagged as a query result; the caller closes the
+            // connection (no mini-protocols run in query mode).
+            let map_len = dec
+                .map()
+                .map_err(|e| HandshakeError::DecodeError(e.to_string()))?
+                .ok_or_else(|| {
+                    HandshakeError::DecodeError("indefinite map not supported".to_string())
+                })?;
+            if map_len > MAX_HANDSHAKE_VERSIONS {
+                return Err(HandshakeError::DecodeError(format!(
+                    "MsgQueryReply: too many versions ({map_len} > {MAX_HANDSHAKE_VERSIONS})"
+                )));
+            }
+            let mut their_versions = std::collections::BTreeSet::new();
+            for _ in 0..map_len {
+                let version = dec
+                    .u16()
+                    .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
+                if n2n::N2N_VERSIONS.contains(&version) {
+                    // Skip the version_data of a known version.
+                    let _ = N2NVersionData::decode(&mut dec);
+                } else {
+                    dec.skip()
+                        .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
+                }
+                their_versions.insert(version);
+            }
+            let version = n2n::N2N_VERSIONS
+                .iter()
+                .find(|v| their_versions.contains(v))
+                .copied()
+                .unwrap_or(0);
+            Ok(HandshakeResult {
+                version,
+                simultaneous_open: false,
+                query: true,
             })
         }
         MSG_REFUSE => Err(decode_refuse_reason(&mut dec)),
@@ -516,14 +615,34 @@ fn decode_handshake_response(
                     HandshakeError::DecodeError("indefinite map not supported".to_string())
                 })?;
 
+            // #880: cap the version count (parity with
+            // decode_propose_versions_n2n) so a simultaneous open can't be used
+            // to peg a CPU core past the handshake window.
+            if map_len > MAX_HANDSHAKE_VERSIONS {
+                return Err(HandshakeError::DecodeError(format!(
+                    "MsgProposeVersions (simultaneous open): too many versions \
+                     ({map_len} > {MAX_HANDSHAKE_VERSIONS})"
+                )));
+            }
+
             let mut remote_versions = BTreeMap::new();
             for _ in 0..map_len {
                 let version = dec
                     .u16()
                     .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
-                let version_data = N2NVersionData::decode(&mut dec)
-                    .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
-                remote_versions.insert(version, version_data);
+                // #880: skip versions we don't know (cardano-node includes older
+                // ones like N2N v13 whose version_data has a different CBOR shape,
+                // array(3) not array(4)); decoding every one made a genuine
+                // simultaneous open fail with DecodeError instead of negotiating.
+                // Mirror decode_propose_versions_n2n's known-version filter.
+                if n2n::N2N_VERSIONS.contains(&version) {
+                    let version_data = N2NVersionData::decode(&mut dec)
+                        .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
+                    remote_versions.insert(version, version_data);
+                } else {
+                    dec.skip()
+                        .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
+                }
             }
 
             // Find highest common version (same logic as server-side negotiation)
@@ -533,6 +652,7 @@ fn decode_handshake_response(
                         return Ok(HandshakeResult {
                             version: our_version,
                             simultaneous_open: true,
+                            query: false,
                         });
                     }
                     // Magic mismatch on a matching version — reject
@@ -558,7 +678,10 @@ fn decode_handshake_response(
 }
 
 /// Decode a handshake response for N2C (with bit-15 version decoding).
-fn decode_handshake_response_n2c(data: &[u8]) -> Result<HandshakeResult, HandshakeError> {
+fn decode_handshake_response_n2c(
+    data: &[u8],
+    our_data: &N2CVersionData,
+) -> Result<HandshakeResult, HandshakeError> {
     let mut dec = Decoder::new(data);
     let _arr_len = dec
         .array()
@@ -573,10 +696,20 @@ fn decode_handshake_response_n2c(data: &[u8]) -> Result<HandshakeResult, Handsha
                 .u16()
                 .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
             let version = n2c::decode_n2c_version(wire_version);
-            let _ = N2CVersionData::decode(&mut dec);
+            // #880: re-validate the responder's network magic rather than
+            // discarding the accepted version_data.
+            if let Ok(their_data) = N2CVersionData::decode(&mut dec) {
+                if their_data.network_magic != our_data.network_magic {
+                    return Err(HandshakeError::NetworkMagicMismatch {
+                        ours: our_data.network_magic,
+                        theirs: their_data.network_magic,
+                    });
+                }
+            }
             Ok(HandshakeResult {
                 version,
                 simultaneous_open: false,
+                query: false,
             })
         }
         MSG_REFUSE => Err(decode_refuse_reason(&mut dec)),
@@ -589,6 +722,53 @@ fn decode_handshake_response_n2c(data: &[u8]) -> Result<HandshakeResult, Handsha
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #880: query mode — the responder answers a query-mode proposal with
+    /// MsgQueryReply (tag 3, the version table), and the client decodes it as a
+    /// query result rather than choking on an unexpected tag.
+    #[test]
+    fn query_mode_reply_roundtrip() {
+        let our_data = N2NVersionData::new(2, false, true);
+        // Server-side: encode MsgQueryReply as we would emit it.
+        let reply = encode_query_reply_n2n(n2n::N2N_VERSIONS, &our_data);
+        // First byte structure: array(2), tag 3.
+        let mut dec = Decoder::new(&reply);
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u64().unwrap(), MSG_QUERY_REPLY);
+
+        // Client-side: decode_handshake_response must classify it as a query.
+        let result = decode_handshake_response(&reply, &our_data).unwrap();
+        assert!(result.query, "MsgQueryReply must yield a query result");
+        assert!(
+            n2n::N2N_VERSIONS.contains(&result.version),
+            "query result reports a common version"
+        );
+    }
+
+    /// #880: a MsgAcceptVersion whose version_data carries a DIFFERENT network
+    /// magic than ours must be rejected at handshake (cross-network peer),
+    /// rather than the accepted version_data being silently discarded.
+    #[test]
+    fn accept_version_with_mismatched_magic_is_rejected() {
+        let ours = N2NVersionData::new(2, false, true); // preview magic 2
+        let theirs = N2NVersionData::new(764824073, false, true); // mainnet magic
+        let accept = encode_accept_version_n2n(n2n::N2N_VERSIONS[0], &theirs);
+        let result = decode_handshake_response(&accept, &ours);
+        assert!(
+            matches!(
+                result,
+                Err(HandshakeError::NetworkMagicMismatch {
+                    ours: 2,
+                    theirs: 764824073
+                })
+            ),
+            "cross-network MsgAcceptVersion must be rejected, got: {result:?}"
+        );
+
+        // Sanity: a matching magic still accepts.
+        let ok = encode_accept_version_n2n(n2n::N2N_VERSIONS[0], &ours);
+        assert!(decode_handshake_response(&ok, &ours).is_ok());
+    }
 
     #[test]
     fn n2n_propose_encode_decode_roundtrip() {
@@ -657,8 +837,15 @@ mod tests {
     fn n2c_accept_encode_decode() {
         let data = N2CVersionData::new(2);
         let encoded = encode_accept_version_n2c(22, &data);
-        let result = decode_handshake_response_n2c(&encoded).unwrap();
+        let result = decode_handshake_response_n2c(&encoded, &data).unwrap();
         assert_eq!(result.version, 22); // logical, not wire
+
+        // #880: a mismatched magic on the accepted version_data is rejected.
+        let ours = N2CVersionData::new(1);
+        assert!(matches!(
+            decode_handshake_response_n2c(&encoded, &ours),
+            Err(HandshakeError::NetworkMagicMismatch { .. })
+        ));
     }
 
     #[test]

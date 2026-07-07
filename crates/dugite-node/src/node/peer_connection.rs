@@ -573,6 +573,18 @@ impl PeerConnection {
             .await
             .map_err(|e| PeerConnectionError::Handshake(addr, e.to_string()))?;
 
+        // #880: a query-mode handshake enumerated our versions (we already sent
+        // MsgQueryReply) and the peer closes — no mini-protocols run on it, so
+        // drop the connection instead of spinning up protocol tasks against a
+        // socket the peer is closing.
+        if handshake_result.query {
+            info!(%addr, "N2N query-mode handshake — closing connection (no protocols)");
+            return Err(PeerConnectionError::Handshake(
+                addr,
+                "query-mode connection (version enumeration only)".to_string(),
+            ));
+        }
+
         let version = handshake_result.version;
         info!(%addr, version, "N2N handshake complete (inbound)");
 

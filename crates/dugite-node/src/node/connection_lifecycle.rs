@@ -1635,17 +1635,21 @@ impl ConnectionLifecycleManager {
             peer_manager.mark_terminating(&addr);
 
             // Close ALL connections to this remote (covers duplex pairs).
+            // #870: offload the shutdown `.await` (see demote_to_cold) so the
+            // held peer_manager write lock is not blocked on a stalled peer.
             let cids: Vec<ConnectionId> = self
                 .connections
                 .keys()
                 .filter(|c| c.remote == addr)
                 .copied()
                 .collect();
+            let mut closing: Vec<PeerConnection> = Vec::with_capacity(cids.len());
             for close_cid in &cids {
-                if let Some(mut conn) = self.connections.remove(close_cid) {
-                    conn.shutdown().await;
+                if let Some(conn) = self.connections.remove(close_cid) {
+                    closing.push(conn);
                 }
             }
+            Self::spawn_shutdown(closing);
 
             {
                 let mut chains = self.candidate_chains.write().await;
@@ -1658,6 +1662,25 @@ impl ConnectionLifecycleManager {
         }
 
         Ok(())
+    }
+
+    /// Shut down owned connections on a detached task (#870).
+    ///
+    /// `conn.shutdown()` aborts the mux + protocol tasks and can take up to
+    /// PROTOCOL_SHUTDOWN_TIMEOUT (5 s) if a protocol task is wedged behind a
+    /// stalled peer. Callers that hold the global `peer_manager` write lock must
+    /// NOT await it inline (it would freeze the connection manager for an
+    /// adversary-controlled duration); they remove the connections from the map
+    /// synchronously and hand the owned values here instead.
+    fn spawn_shutdown(mut conns: Vec<PeerConnection>) {
+        if conns.is_empty() {
+            return;
+        }
+        tokio::spawn(async move {
+            for conn in &mut conns {
+                conn.shutdown().await;
+            }
+        });
     }
 
     /// Demote a warm peer to cold: stop all protocols, close connection.
@@ -1693,11 +1716,21 @@ impl ConnectionLifecycleManager {
         // Mark connection as terminating before shutdown (for metrics).
         peer_manager.mark_terminating(&addr);
 
+        // #870: remove the connections from the map synchronously (O(1)) and
+        // OFFLOAD the shutdown `.await` to a detached task. The governor tick
+        // holds the global `peer_manager` write lock across this call, and
+        // `conn.shutdown()` can block up to PROTOCOL_SHUTDOWN_TIMEOUT (5 s) when
+        // an adversarial peer stalls its mux close — holding that lock for
+        // seconds would freeze the whole connection manager (connect results,
+        // inbound accepts, ledger discovery, metrics). Detaching the shutdown
+        // keeps the lock hold to the fast map removal + pm state update.
+        let mut closing: Vec<PeerConnection> = Vec::with_capacity(cids.len());
         for cid in &cids {
-            if let Some(mut conn) = self.connections.remove(cid) {
-                conn.shutdown().await;
+            if let Some(conn) = self.connections.remove(cid) {
+                closing.push(conn);
             }
         }
+        Self::spawn_shutdown(closing);
 
         // Clear candidate chain state.
         {
@@ -1761,11 +1794,24 @@ impl ConnectionLifecycleManager {
             GovernorAction::DemoteToWarm(addr) => {
                 if let Err(e) = self.demote_to_warm(addr, peer_manager).await {
                     warn!(%addr, error = %e, "failed to demote hot -> warm");
+                    // #880: on NotConnected the peer is Hot in the manager with
+                    // no backing connection; without reconciling, hot_count
+                    // inflates permanently and the governor re-emits DemoteToWarm
+                    // every tick while never promoting. There is genuinely no
+                    // socket, so move the peer to cold.
+                    if matches!(e, LifecycleError::NotConnected(_)) {
+                        peer_manager.peer_disconnected(&addr);
+                    }
                 }
             }
             GovernorAction::DemoteToCold(addr) => {
                 if let Err(e) = self.demote_to_cold(addr, peer_manager).await {
                     warn!(%addr, error = %e, "failed to demote warm -> cold");
+                    // #880: same reconciliation — a warm peer with no connection
+                    // must be moved to cold rather than left dangling.
+                    if matches!(e, LifecycleError::NotConnected(_)) {
+                        peer_manager.peer_disconnected(&addr);
+                    }
                 }
             }
             GovernorAction::DiscoverMore => {
@@ -1782,11 +1828,14 @@ impl ConnectionLifecycleManager {
                     .filter(|c| c.remote == addr)
                     .copied()
                     .collect();
+                // #870: offload the shutdown awaits off the held pm write lock.
+                let mut closing: Vec<PeerConnection> = Vec::with_capacity(cids.len());
                 for cid in cids {
-                    if let Some(mut conn) = self.connections.remove(&cid) {
-                        conn.shutdown().await;
+                    if let Some(conn) = self.connections.remove(&cid) {
+                        closing.push(conn);
                     }
                 }
+                Self::spawn_shutdown(closing);
                 peer_manager.inner.remove_peer(&addr);
             }
             GovernorAction::PeerShareRequest(addr) => {
@@ -1855,6 +1904,23 @@ impl ConnectionLifecycleManager {
     /// Check if any connection (inbound or outbound) exists for the given remote.
     pub fn has_connection(&self, addr: &SocketAddr) -> bool {
         self.has_any_to(*addr)
+    }
+
+    /// Number of currently-ESTABLISHED inbound connections (#865).
+    ///
+    /// The accept-side semaphore + ConnectionManager slot bound only concurrent
+    /// in-flight handshakes; they are released the instant a handshake completes.
+    /// This counts live registered inbound connections so the caller can enforce
+    /// a hard cap on established inbound connections (matching Haskell's
+    /// `AcceptedConnectionsLimit`, which holds for the whole connection lifetime)
+    /// — otherwise an attacker who completes handshakes from a botnet can hold an
+    /// unbounded number of live inbound connections (each a mux task + five
+    /// responder channels + keepalive) → memory / FD exhaustion.
+    pub fn inbound_connection_count(&self) -> usize {
+        self.connections
+            .values()
+            .filter(|p| p.direction == PeerConnectionDirection::Inbound)
+            .count()
     }
 
     /// Returns true if we have at least one outbound connection to `remote`.
@@ -2995,6 +3061,18 @@ impl ConnectionLifecycleManager {
                                     CodecPoint::Specific(s, _) => *s,
                                     CodecPoint::Origin => 0,
                                 };
+                                // #875: the lower bound of the requested range.
+                                // A BlockFetch server must only stream blocks whose
+                                // point falls in the requested [from, to] span; any
+                                // block outside it is an unrequested block the peer
+                                // has no business delivering (Haskell raises
+                                // BlockFetchProtocolFailure). We reject it as a peer
+                                // fault BEFORE it is decoded into `decoded_blocks`
+                                // and pushed toward VolatileDB/apply.
+                                let range_from_slot = match &ranges[range_idx].0 {
+                                    CodecPoint::Specific(s, _) => *s,
+                                    CodecPoint::Origin => 0,
+                                };
 
                                 // Collect decoded blocks in a local Vec inside the
                                 // sync callback, then send them via `.send().await`
@@ -3053,6 +3131,24 @@ impl ConnectionLifecycleManager {
                                         ) {
                                             Ok(block) => {
                                                 let slot = block.slot().0;
+                                                // #875: reject blocks outside the
+                                                // requested [from, to] slot span —
+                                                // an adversarial server otherwise
+                                                // rides arbitrary blocks into the
+                                                // apply loop before higher layers
+                                                // drop them. Convict the peer.
+                                                if slot < range_from_slot || slot > range_to_slot {
+                                                    warn!(
+                                                        %addr, slot, range_from_slot, range_to_slot,
+                                                        "BlockFetch: peer delivered a block outside the requested range — rejecting"
+                                                    );
+                                                    return Err(dugite_network::error::ProtocolError::IntegrityViolation {
+                                                        protocol: "BlockFetch",
+                                                        reason: format!(
+                                                            "delivered block at slot {slot} outside requested range [{range_from_slot}, {range_to_slot}]"
+                                                        ),
+                                                    });
+                                                }
                                                 debug!(%addr, slot, block_no = block.block_number().0, "BlockFetch: block decoded");
                                                 decoded_blocks.push(FetchedBlock {
                                                     peer,
@@ -3551,7 +3647,8 @@ impl ConnectionLifecycleManager {
                     let tx_mempool = mempool;
                     let tx_metrics = metrics;
                     let validator = tx_validator;
-                    move |tx_hash: [u8; 32], tx_bytes: Vec<u8>| -> bool {
+                    move |tx_hash: [u8; 32], tx_bytes: Vec<u8>| -> dugite_network::TxAdmission {
+                        use dugite_network::TxAdmission;
                         // Track every transaction received from peers in real-time.
                         tx_metrics
                             .transactions_received
@@ -3570,7 +3667,7 @@ impl ConnectionLifecycleManager {
                             tx_metrics
                                 .transactions_rejected
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            return false;
+                            return TxAdmission::Rejected;
                         }
 
                         // Run full Phase-1 + Phase-2 validation (including IsValid
@@ -3583,31 +3680,60 @@ impl ConnectionLifecycleManager {
                             if let Ok(tx) =
                                 dugite_serialization::decode_transaction(era_id, &tx_bytes)
                             {
+                                // #864: reconcile the CANONICAL txid — the decoder
+                                // computes `tx.hash = blake2b_256(raw_body_cbor)`
+                                // over the body span — against the txid the peer
+                                // ATTESTED in MsgReplyTxIds. A mismatch means the
+                                // peer delivered a valid body under a key that is
+                                // NOT its hash, breaking the mempool invariant
+                                // `key == blake2b(body)` (a censorship /
+                                // propagation-poisoning lever). This is a protocol
+                                // integrity violation, not a validation failure:
+                                // convict the peer and drop the connection.
+                                // `tx.hash` is era-independent (the body-span bytes
+                                // are the same regardless of which era schema
+                                // interprets them), so a first-decode mismatch is
+                                // authoritative.
+                                if tx.hash.as_bytes() != &tx_hash {
+                                    debug!(
+                                        %addr,
+                                        attested = %dugite_primitives::hash::Hash32::from_bytes(tx_hash).to_hex(),
+                                        computed = %tx.hash.to_hex(),
+                                        "N2N peer attested a txid != blake2b(body) — convicting"
+                                    );
+                                    tx_metrics
+                                        .transactions_rejected
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    return TxAdmission::Convict;
+                                }
+
                                 // Phase-1 + Phase-2 validation via LedgerTxValidator.
                                 if let Err(e) = validator.validate_tx(era_id, &tx_bytes) {
                                     debug!(
                                         %addr,
-                                        tx_hash = %dugite_primitives::hash::Hash32::from_bytes(tx_hash).to_hex(),
+                                        tx_hash = %tx.hash.to_hex(),
                                         reason = ?e,
                                         "N2N tx rejected by validator"
                                     );
                                     tx_metrics
                                         .transactions_rejected
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    return false;
+                                    return TxAdmission::Rejected;
                                 }
 
-                                let hash = dugite_primitives::hash::Hash32::from_bytes(tx_hash);
+                                // Key the mempool on the verified canonical hash
+                                // (== attested txid) rather than trusting the wire.
+                                let hash = tx.hash;
                                 if tx_mempool.add_tx(hash, tx, size_bytes).is_ok() {
                                     tx_metrics
                                         .transactions_validated
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    return true;
+                                    return TxAdmission::Accepted;
                                 } else {
                                     tx_metrics
                                         .transactions_rejected
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    return false;
+                                    return TxAdmission::Rejected;
                                 }
                             }
                         }
@@ -3615,7 +3741,7 @@ impl ConnectionLifecycleManager {
                         tx_metrics
                             .transactions_rejected
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        false
+                        TxAdmission::Rejected
                     }
                 };
 

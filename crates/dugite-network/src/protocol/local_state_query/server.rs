@@ -24,6 +24,27 @@ use super::{
 ///
 /// Implemented by the node integration layer, which has access to the ledger state.
 pub trait QueryHandler: Send + Sync {
+    /// Opaque handle produced by [`acquire`](QueryHandler::acquire) and threaded
+    /// back into every dispatch method for the lifetime of a single acquisition.
+    ///
+    /// This is how the server pins a consistent ledger-state snapshot at
+    /// MsgAcquire time (issue #867): the handler resolves the acquire target to a
+    /// concrete state handle ONCE, and every subsequent MsgQuery in that
+    /// acquisition dispatches against the SAME handle -- even if the node's live
+    /// tip advances mid-session. Without this, two queries issued back-to-back
+    /// under one acquisition (e.g. cardano-cli/ogmios pulling tip + pparams +
+    /// utxo + account state) could observe different ledger states (a "torn
+    /// read") if a block lands between them.
+    type Acquired: Send + Sync;
+
+    /// Resolve an acquire target to a pinned state handle.
+    ///
+    /// Returns `Ok(handle)` if the target can be acquired, or `Err(AcquireFailure)`
+    /// if the point is invalid. The returned handle must be cheap to produce
+    /// (typically an `Arc` clone of the current state) and MUST represent a
+    /// fixed point in time -- it must not silently track later state updates.
+    fn acquire(&self, target: &AcquireTarget) -> Result<Self::Acquired, AcquireFailure>;
+
     /// Handle a raw query from the MsgQuery payload.
     ///
     /// `query_cbor` is the raw CBOR after the MsgQuery tag (i.e. the consensus-level
@@ -32,9 +53,14 @@ pub trait QueryHandler: Send + Sync {
     /// HFC-level (QueryIfCurrent/QueryAnytime/QueryHardFork), and era-level dispatch.
     ///
     /// Returns the fully-encoded MsgResult payload bytes (WITHOUT the `[4, ...]`
-    /// envelope — the server adds that). For BlockQuery QueryIfCurrent results,
+    /// envelope -- the server adds that). For BlockQuery QueryIfCurrent results,
     /// wrap in HFC success `[1, result]`. For other query types, return unwrapped.
-    fn handle_query(&self, query_cbor: &[u8], n2c_version: u16) -> Result<Vec<u8>, String>;
+    fn handle_query(
+        &self,
+        acquired: &Self::Acquired,
+        query_cbor: &[u8],
+        n2c_version: u16,
+    ) -> Result<Vec<u8>, String>;
 
     /// Handle a Shelley BlockQuery by tag number.
     ///
@@ -43,19 +69,28 @@ pub trait QueryHandler: Send + Sync {
     ///
     /// Returns the CBOR-encoded result, which will be wrapped in the HFC
     /// success envelope `[1, result]` by the server.
-    fn handle_block_query(&self, tag: u64, query_cbor: &[u8]) -> Result<Vec<u8>, String>;
+    fn handle_block_query(
+        &self,
+        acquired: &Self::Acquired,
+        tag: u64,
+        query_cbor: &[u8],
+    ) -> Result<Vec<u8>, String>;
 
     /// Handle a QueryAnytime query (e.g., GetEraStart).
     /// Returns unwrapped CBOR result.
-    fn handle_query_anytime(&self, query_cbor: &[u8]) -> Result<Vec<u8>, String>;
+    fn handle_query_anytime(
+        &self,
+        acquired: &Self::Acquired,
+        query_cbor: &[u8],
+    ) -> Result<Vec<u8>, String>;
 
     /// Handle a QueryHardFork query (e.g., GetInterpreter).
     /// Returns unwrapped CBOR result.
-    fn handle_query_hard_fork(&self, query_cbor: &[u8]) -> Result<Vec<u8>, String>;
-
-    /// Validate an acquire target. Returns `Ok(())` if the target can be acquired,
-    /// or `Err(AcquireFailure)` if the point is invalid.
-    fn validate_acquire(&self, target: &AcquireTarget) -> Result<(), AcquireFailure>;
+    fn handle_query_hard_fork(
+        &self,
+        acquired: &Self::Acquired,
+        query_cbor: &[u8],
+    ) -> Result<Vec<u8>, String>;
 }
 
 /// LocalStateQuery server.
@@ -71,7 +106,7 @@ impl LocalStateQueryServer {
         handler: &H,
         n2c_version: u16,
     ) -> Result<(), ProtocolError> {
-        let mut acquired = false;
+        let mut acquired: Option<H::Acquired> = None;
 
         loop {
             let msg_bytes = channel.recv().await.map_err(ProtocolError::from)?;
@@ -96,9 +131,9 @@ impl LocalStateQueryServer {
                 // MsgAcquire: [0, point] / [8] / [10]
                 TAG_ACQUIRE_SPECIFIC | TAG_ACQUIRE_VOLATILE | TAG_ACQUIRE_IMMUTABLE => {
                     let target = decode_acquire_target(tag, &mut dec)?;
-                    match handler.validate_acquire(&target) {
-                        Ok(()) => {
-                            acquired = true;
+                    match handler.acquire(&target) {
+                        Ok(handle) => {
+                            acquired = Some(handle);
                             // MsgAcquired = [1]
                             let mut buf = Vec::new();
                             let mut enc = Encoder::new(&mut buf);
@@ -133,9 +168,9 @@ impl LocalStateQueryServer {
                 | super::TAG_REACQUIRE_IMMUTABLE => {
                     // Release old state, acquire new
                     let target = decode_acquire_target(tag, &mut dec)?;
-                    match handler.validate_acquire(&target) {
-                        Ok(()) => {
-                            acquired = true;
+                    match handler.acquire(&target) {
+                        Ok(handle) => {
+                            acquired = Some(handle);
                             let mut buf = Vec::new();
                             let mut enc = Encoder::new(&mut buf);
                             enc.array(1).expect("infallible");
@@ -143,7 +178,7 @@ impl LocalStateQueryServer {
                             channel.send(buf).await.map_err(ProtocolError::from)?;
                         }
                         Err(failure) => {
-                            acquired = false; // Old state is also lost
+                            acquired = None; // Old state is also lost
                             let mut buf = Vec::new();
                             let mut enc = Encoder::new(&mut buf);
                             enc.array(2).expect("infallible");
@@ -164,19 +199,30 @@ impl LocalStateQueryServer {
                 }
 
                 // MsgRelease = [5]
+                //
+                // Issue #880: MsgRelease is only valid from StAcquired. A client
+                // that sends MsgRelease from StIdle (never acquired, or already
+                // released) is violating the protocol state machine.
                 TAG_RELEASE => {
-                    acquired = false;
-                }
-
-                // MsgQuery = [3, query]
-                TAG_QUERY => {
-                    if !acquired {
+                    if acquired.is_none() {
                         return Err(ProtocolError::StateViolation {
                             protocol: "LocalStateQuery",
                             expected: "StAcquired".to_string(),
                             actual: "StIdle (not acquired)".to_string(),
                         });
                     }
+                    acquired = None;
+                }
+
+                // MsgQuery = [3, query]
+                TAG_QUERY => {
+                    let Some(acquired_handle) = acquired.as_ref() else {
+                        return Err(ProtocolError::StateViolation {
+                            protocol: "LocalStateQuery",
+                            expected: "StAcquired".to_string(),
+                            actual: "StIdle (not acquired)".to_string(),
+                        });
+                    };
 
                     // Pass the full consensus-level query CBOR to the handler.
                     // The handler dispatches BlockQuery/GetSystemStart/GetChainBlockNo/
@@ -202,12 +248,11 @@ impl LocalStateQueryServer {
                         });
                     }
 
-                    let result_cbor =
-                        handler.handle_query(query_cbor, n2c_version).map_err(|e| {
-                            ProtocolError::CborDecode {
-                                protocol: "LocalStateQuery",
-                                reason: format!("query dispatch: {e}"),
-                            }
+                    let result_cbor = handler
+                        .handle_query(acquired_handle, query_cbor, n2c_version)
+                        .map_err(|e| ProtocolError::CborDecode {
+                            protocol: "LocalStateQuery",
+                            reason: format!("query dispatch: {e}"),
                         })?;
 
                     // MsgResult = [4, result]
@@ -272,7 +317,28 @@ mod tests {
     struct MockQueryHandler;
 
     impl QueryHandler for MockQueryHandler {
-        fn handle_query(&self, query_cbor: &[u8], _n2c_version: u16) -> Result<Vec<u8>, String> {
+        type Acquired = ();
+
+        fn acquire(&self, target: &AcquireTarget) -> Result<(), AcquireFailure> {
+            match target {
+                AcquireTarget::VolatileTip | AcquireTarget::ImmutableTip => Ok(()),
+                AcquireTarget::SpecificPoint(codec::Point::Origin) => Ok(()),
+                AcquireTarget::SpecificPoint(codec::Point::Specific(slot, _)) => {
+                    if *slot > 1000 {
+                        Err(AcquireFailure::PointNotOnChain)
+                    } else {
+                        Ok(())
+                    }
+                }
+            }
+        }
+
+        fn handle_query(
+            &self,
+            acquired: &(),
+            query_cbor: &[u8],
+            _n2c_version: u16,
+        ) -> Result<Vec<u8>, String> {
             // Simple mock: decode the consensus-level query and return a
             // canned response. For BlockQuery(QueryIfCurrent), return the
             // shelley tag wrapped in HFC success [1, tag].
@@ -281,15 +347,15 @@ mod tests {
             let outer_tag = dec.u64().unwrap_or(999);
             match outer_tag {
                 0 => {
-                    // BlockQuery → parse HFC inner
+                    // BlockQuery -> parse HFC inner
                     let _ = dec.array();
                     let hfc_tag = dec.u64().unwrap_or(999);
                     match hfc_tag {
                         0 => {
-                            // QueryIfCurrent → parse shelley tag
+                            // QueryIfCurrent -> parse shelley tag
                             let _ = dec.array();
                             let shelley_tag = dec.u64().unwrap_or(999);
-                            let result = self.handle_block_query(shelley_tag, &[])?;
+                            let result = self.handle_block_query(acquired, shelley_tag, &[])?;
                             // Wrap in HFC success: [1, result]
                             let mut buf = Vec::new();
                             let mut enc = Encoder::new(&mut buf);
@@ -313,7 +379,12 @@ mod tests {
             }
         }
 
-        fn handle_block_query(&self, tag: u64, _query_cbor: &[u8]) -> Result<Vec<u8>, String> {
+        fn handle_block_query(
+            &self,
+            _acquired: &(),
+            tag: u64,
+            _query_cbor: &[u8],
+        ) -> Result<Vec<u8>, String> {
             // Return a simple response: the tag as a CBOR integer
             let mut buf = Vec::new();
             let mut enc = Encoder::new(&mut buf);
@@ -321,32 +392,103 @@ mod tests {
             Ok(buf)
         }
 
-        fn handle_query_anytime(&self, _query_cbor: &[u8]) -> Result<Vec<u8>, String> {
+        fn handle_query_anytime(
+            &self,
+            _acquired: &(),
+            _query_cbor: &[u8],
+        ) -> Result<Vec<u8>, String> {
             let mut buf = Vec::new();
             let mut enc = Encoder::new(&mut buf);
             enc.str("anytime").expect("infallible");
             Ok(buf)
         }
 
-        fn handle_query_hard_fork(&self, _query_cbor: &[u8]) -> Result<Vec<u8>, String> {
+        fn handle_query_hard_fork(
+            &self,
+            _acquired: &(),
+            _query_cbor: &[u8],
+        ) -> Result<Vec<u8>, String> {
             let mut buf = Vec::new();
             let mut enc = Encoder::new(&mut buf);
             enc.str("hardfork").expect("infallible");
             Ok(buf)
         }
+    }
 
-        fn validate_acquire(&self, target: &AcquireTarget) -> Result<(), AcquireFailure> {
-            match target {
-                AcquireTarget::VolatileTip | AcquireTarget::ImmutableTip => Ok(()),
-                AcquireTarget::SpecificPoint(codec::Point::Origin) => Ok(()),
-                AcquireTarget::SpecificPoint(codec::Point::Specific(slot, _)) => {
-                    if *slot > 1000 {
-                        Err(AcquireFailure::PointNotOnChain)
-                    } else {
-                        Ok(())
-                    }
-                }
+    /// A stateful mock handler whose "current tip" can be mutated after an
+    /// acquire has already pinned a handle -- used to prove that queries
+    /// within one acquisition observe a consistent (non-torn) snapshot even
+    /// as the live state moves underneath (issue #867).
+    struct TornReadMockHandler {
+        /// The handler's live "current tip" value. Mutated by the test to
+        /// simulate a concurrent `update_state()` swap between two queries.
+        live_tip: std::sync::atomic::AtomicU64,
+    }
+
+    impl TornReadMockHandler {
+        fn new(initial_tip: u64) -> Self {
+            Self {
+                live_tip: std::sync::atomic::AtomicU64::new(initial_tip),
             }
+        }
+
+        fn set_live_tip(&self, tip: u64) {
+            self.live_tip
+                .store(tip, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Query tag used by [`TornReadMockHandler`] to report the tip value
+    /// pinned in the `Acquired` handle (NOT the handler's live tip).
+    const GET_PINNED_TIP_TAG: u64 = 100;
+
+    impl QueryHandler for TornReadMockHandler {
+        /// The handle pins a copy of the live tip value AT acquire time.
+        type Acquired = u64;
+
+        fn acquire(&self, _target: &AcquireTarget) -> Result<u64, AcquireFailure> {
+            Ok(self.live_tip.load(std::sync::atomic::Ordering::SeqCst))
+        }
+
+        fn handle_query(
+            &self,
+            acquired: &u64,
+            query_cbor: &[u8],
+            _n2c_version: u16,
+        ) -> Result<Vec<u8>, String> {
+            let mut dec = Decoder::new(query_cbor);
+            let _ = dec.array();
+            let tag = dec.u64().unwrap_or(999);
+            self.handle_block_query(acquired, tag, &[])
+        }
+
+        fn handle_block_query(
+            &self,
+            acquired: &u64,
+            _tag: u64,
+            _query_cbor: &[u8],
+        ) -> Result<Vec<u8>, String> {
+            // Always echo the PINNED value, never the live one.
+            let mut buf = Vec::new();
+            let mut enc = Encoder::new(&mut buf);
+            enc.u64(*acquired).expect("infallible");
+            Ok(buf)
+        }
+
+        fn handle_query_anytime(
+            &self,
+            _acquired: &u64,
+            _query_cbor: &[u8],
+        ) -> Result<Vec<u8>, String> {
+            Ok(Vec::new())
+        }
+
+        fn handle_query_hard_fork(
+            &self,
+            _acquired: &u64,
+            _query_cbor: &[u8],
+        ) -> Result<Vec<u8>, String> {
+            Ok(Vec::new())
         }
     }
 
@@ -922,5 +1064,142 @@ mod tests {
 
         ingress_tx.send(Bytes::from(encode_done())).await.unwrap();
         handle.await.unwrap().unwrap();
+    }
+
+    // ── Issue #867: pinned-snapshot / torn-read tests ──────────────────────
+
+    /// Regression for issue #867: two queries issued within the SAME
+    /// acquisition must observe the SAME pinned state, even if the handler's
+    /// live state is mutated between them (simulating a concurrent
+    /// `update_state()` swap as new blocks are applied). Before the fix, each
+    /// MsgQuery read live state directly, so the second query would see the
+    /// post-swap value -- a torn read.
+    #[tokio::test]
+    async fn torn_read_regression_pinned_snapshot_survives_live_update() {
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let handler = std::sync::Arc::new(TornReadMockHandler::new(100));
+        let handler_for_task = handler.clone();
+
+        let handle = tokio::spawn(async move {
+            LocalStateQueryServer::run(&mut channel, handler_for_task.as_ref(), 16).await
+        });
+
+        // Acquire while live_tip == 100. The handle must pin 100.
+        ingress_tx
+            .send(Bytes::from(encode_acquire_volatile()))
+            .await
+            .unwrap();
+        let _ = egress_rx.recv().await.unwrap(); // MsgAcquired
+
+        // First query: expect the pinned value (100).
+        ingress_tx
+            .send(Bytes::from(encode_block_query(GET_PINNED_TIP_TAG)))
+            .await
+            .unwrap();
+        let (_, _, result1) = egress_rx.recv().await.unwrap();
+        let mut dec = Decoder::new(&result1);
+        dec.array().unwrap();
+        assert_eq!(dec.u64().unwrap(), TAG_RESULT);
+        let pinned1 = dec.u64().unwrap();
+        assert_eq!(pinned1, 100, "first query must see the pinned snapshot");
+
+        // Simulate a live tip advance (e.g. a new block landing) BETWEEN the
+        // two queries of this acquisition. A correctly pinned handler must
+        // NOT observe this.
+        handler.set_live_tip(999);
+
+        // Second query: must STILL return 100, not 999.
+        ingress_tx
+            .send(Bytes::from(encode_block_query(GET_PINNED_TIP_TAG)))
+            .await
+            .unwrap();
+        let (_, _, result2) = egress_rx.recv().await.unwrap();
+        let mut dec = Decoder::new(&result2);
+        dec.array().unwrap();
+        assert_eq!(dec.u64().unwrap(), TAG_RESULT);
+        let pinned2 = dec.u64().unwrap();
+        assert_eq!(
+            pinned2, 100,
+            "second query in the same acquisition must still see the \
+             ORIGINAL pinned snapshot (100), not the live tip that changed \
+             mid-acquisition (999) -- a torn read"
+        );
+
+        ingress_tx
+            .send(Bytes::from(encode_release()))
+            .await
+            .unwrap();
+        ingress_tx.send(Bytes::from(encode_done())).await.unwrap();
+        handle.await.unwrap().unwrap();
+    }
+
+    /// Regression for issue #880: MsgRelease sent from StIdle (before any
+    /// successful acquire) must be rejected with a StateViolation, mirroring
+    /// the existing MsgQuery-without-acquire rejection.
+    #[tokio::test]
+    async fn release_without_acquire_returns_state_violation() {
+        let (mut channel, _egress_rx, ingress_tx) = make_test_channel();
+        let handler = MockQueryHandler;
+
+        let handle =
+            tokio::spawn(
+                async move { LocalStateQueryServer::run(&mut channel, &handler, 16).await },
+            );
+
+        // Send MsgRelease without acquiring first.
+        ingress_tx
+            .send(Bytes::from(encode_release()))
+            .await
+            .unwrap();
+
+        let result = handle.await.unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(crate::error::ProtocolError::StateViolation { .. })
+            ),
+            "expected StateViolation for release without acquire, got: {result:?}"
+        );
+    }
+
+    /// A second MsgRelease immediately after a valid release (i.e. release
+    /// while already released) must also be rejected -- StIdle is StIdle
+    /// regardless of history.
+    #[tokio::test]
+    async fn double_release_returns_state_violation() {
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let handler = MockQueryHandler;
+
+        let handle =
+            tokio::spawn(
+                async move { LocalStateQueryServer::run(&mut channel, &handler, 16).await },
+            );
+
+        ingress_tx
+            .send(Bytes::from(encode_acquire_volatile()))
+            .await
+            .unwrap();
+        let _ = egress_rx.recv().await.unwrap(); // MsgAcquired
+
+        // First release: valid (StAcquired -> StIdle).
+        ingress_tx
+            .send(Bytes::from(encode_release()))
+            .await
+            .unwrap();
+
+        // Second release: invalid (StIdle -> StIdle is not a legal MsgRelease).
+        ingress_tx
+            .send(Bytes::from(encode_release()))
+            .await
+            .unwrap();
+
+        let result = handle.await.unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(crate::error::ProtocolError::StateViolation { .. })
+            ),
+            "expected StateViolation for double release, got: {result:?}"
+        );
     }
 }

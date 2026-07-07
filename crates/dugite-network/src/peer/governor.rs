@@ -807,7 +807,11 @@ impl Governor {
             let threshold = self.config.targets.max_cold * 3 / 2;
             if cold_count > threshold {
                 let excess = cold_count - self.config.targets.max_cold;
-                let to_forget = select_lowest_reputation_cold(peer_manager, excess);
+                // #879: exclude big-ledger peers from cold-churn eviction so an
+                // adversary flooding the cold pool cannot evict freshly-discovered
+                // top-stake peers (eclipse pressure).
+                let to_forget =
+                    select_lowest_reputation_cold(peer_manager, excess, big_ledger_peers);
                 for addr in to_forget {
                     actions.push(GovernorAction::ForgetPeer(addr));
                 }

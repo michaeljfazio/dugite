@@ -69,14 +69,25 @@ pub fn select_worst_hot(peer_manager: &PeerManager) -> Option<SocketAddr> {
 ///
 /// Returns up to `count` cold peers sorted by reputation ascending.
 /// Topology peers are excluded — root peers configured in the topology file
-/// should never be forgotten.
-pub fn select_lowest_reputation_cold(peer_manager: &PeerManager, count: usize) -> Vec<SocketAddr> {
+/// should never be forgotten. `exclude` names additional addresses that must
+/// never be cold-churned: the caller passes the Big-Ledger-Peer (and bootstrap)
+/// set so top-stake peers cannot be evicted by cold-pool flooding — an eclipse
+/// pressure lever, since Haskell never forgets big-ledger peers this way (#879).
+pub fn select_lowest_reputation_cold(
+    peer_manager: &PeerManager,
+    count: usize,
+    exclude: &std::collections::HashSet<SocketAddr>,
+) -> Vec<SocketAddr> {
     use super::manager::PeerSource;
 
     let mut scored: Vec<(SocketAddr, f64)> = peer_manager
         .peers_in_state(PeerState::Cold)
         .into_iter()
         .filter_map(|addr| {
+            // #879: never evict a big-ledger / bootstrap peer.
+            if exclude.contains(&addr) {
+                return None;
+            }
             peer_manager.get_peer(&addr).and_then(|info| {
                 // Never forget topology peers (root peers from config file).
                 if info.source == PeerSource::Topology {
@@ -230,13 +241,36 @@ mod tests {
         pm.add_peer(test_addr(3004), PeerSource::Ledger);
         pm.get_peer_mut(&test_addr(3004)).unwrap().reputation = 0.3;
 
-        let evict = select_lowest_reputation_cold(&pm, 2);
+        let empty = std::collections::HashSet::new();
+        let evict = select_lowest_reputation_cold(&pm, 2, &empty);
         assert_eq!(evict.len(), 2);
         // Should be the two lowest non-topology peers.
         assert!(evict.contains(&test_addr(3002)));
         assert!(evict.contains(&test_addr(3003)));
         // Topology peer must not appear.
         assert!(!evict.contains(&test_addr(3001)));
+    }
+
+    /// #879: a big-ledger peer in the `exclude` set must never be selected for
+    /// cold-churn eviction, even with the lowest reputation.
+    #[test]
+    fn select_lowest_reputation_cold_excludes_big_ledger_peers() {
+        let mut pm = PeerManager::new();
+        // BLP with the WORST reputation — must still be protected.
+        pm.add_peer(test_addr(4001), PeerSource::Ledger);
+        pm.get_peer_mut(&test_addr(4001)).unwrap().reputation = 0.0;
+        pm.add_peer(test_addr(4002), PeerSource::Dns);
+        pm.get_peer_mut(&test_addr(4002)).unwrap().reputation = 0.5;
+
+        let mut blp = std::collections::HashSet::new();
+        blp.insert(test_addr(4001));
+
+        let evict = select_lowest_reputation_cold(&pm, 5, &blp);
+        assert!(
+            !evict.contains(&test_addr(4001)),
+            "big-ledger peer must be excluded from cold churn"
+        );
+        assert!(evict.contains(&test_addr(4002)));
     }
 
     #[test]
