@@ -548,6 +548,11 @@ impl NodePeerManager {
         if is_non_public_ip(addr.ip()) {
             return;
         }
+        // #880: reject port 0 — an undialable address the governor would
+        // otherwise burn a connect attempt on every promotion tick.
+        if addr.port() == 0 {
+            return;
+        }
         self.inner.add_peer(addr, PeerSource::Ledger);
     }
 
@@ -568,12 +573,29 @@ impl NodePeerManager {
         if is_non_public_ip(addr.ip()) {
             return;
         }
+        // #880: reject port 0 — an undialable address the governor would
+        // otherwise burn a connect attempt on.
+        if addr.port() == 0 {
+            return;
+        }
         self.inner.add_peer(addr, PeerSource::PeerSharing);
     }
 
     /// Mark a peer as a big ledger peer.
     pub fn add_big_ledger_peer(&mut self, addr: SocketAddr) {
         self.big_ledger_peers.insert(addr);
+    }
+
+    /// Clear the big-ledger-peer set so the next ledger-discovery pass can
+    /// rebuild it from scratch (#879).
+    ///
+    /// The BLP set was previously insert-only, so cold-churn/`peer_failed`
+    /// forgets and rotating-DNS re-adds under fresh `SocketAddr`s left it
+    /// growing unbounded with stale/duplicate membership that distorted
+    /// governor decisions. Rebuilding each pass keeps it a faithful snapshot of
+    /// the current top-stake relays.
+    pub fn clear_big_ledger_peers(&mut self) {
+        self.big_ledger_peers.clear();
     }
 
     /// Mark a peer as a bootstrap peer (topology `bootstrapPeers`). Bootstrap
@@ -694,6 +716,12 @@ impl NodePeerManager {
             // Non-root peer exceeded max retries — remove from known set entirely.
             // It will only re-appear if re-discovered via ledger or peer sharing.
             self.inner.remove_peer(addr);
+            // #879: keep the BLP/bootstrap address sets in sync with the peer
+            // table. Leaving a forgotten peer in `big_ledger_peers` bloats the
+            // set with stale entries that mis-feed `is_big_ledger_peer` and the
+            // demote-exclusion set.
+            self.big_ledger_peers.remove(addr);
+            self.bootstrap_peer_addrs.remove(addr);
         } else {
             self.inner.demote_to_cold(addr);
         }

@@ -4517,10 +4517,15 @@ impl Node {
                     // BLP classification per resolved socket address.
                     let mut resolved: Vec<(SocketAddr, bool)> = Vec::new();
                     for r in &sample {
-                        if let Ok(mut addrs) =
+                        if let Ok(addrs) =
                             tokio::net::lookup_host(format!("{}:{}", r.host, r.port)).await
                         {
-                            if let Some(socket_addr) = addrs.next() {
+                            // #879: keep ALL resolved addresses, not just the
+                            // first — a BLP relay commonly has multiple A/AAAA
+                            // records; taking `.next()` biased toward whatever
+                            // the resolver happened to order first and dropped
+                            // the rest of the relay set.
+                            for socket_addr in addrs {
                                 resolved.push((socket_addr, r.is_blp));
                             }
                         }
@@ -4528,6 +4533,10 @@ impl Node {
 
                     if !resolved.is_empty() {
                         let mut pm_w = pm.write().await;
+                        // #879: rebuild the BLP set from scratch each pass so it
+                        // stays a faithful snapshot of the current top-stake
+                        // relays instead of accumulating stale/duplicate entries.
+                        pm_w.clear_big_ledger_peers();
                         let mut blp_count = 0usize;
                         for (socket_addr, is_blp) in &resolved {
                             pm_w.add_ledger_peer(*socket_addr);
@@ -5340,6 +5349,16 @@ impl Node {
                                     if lifecycle.has_connection(addr)
                                         || in_flight_connects.contains(addr)
                                     {
+                                        // #880: the connect is skipped, so no
+                                        // connect_result will ever fire for this
+                                        // peer — release the governor's in-flight
+                                        // marker now. Otherwise in_progress_promote_cold
+                                        // leaks the addr and the governor
+                                        // permanently excludes it from future
+                                        // cold->warm promotion. (Harmless if the
+                                        // pending connect later completes: the
+                                        // second clear is a no-op.)
+                                        governor.promotion_cold_completed(addr);
                                         continue;
                                     }
                                     // Look up the per-peer initiator_only flag computed
@@ -5462,18 +5481,42 @@ impl Node {
                 // starts server protocol tasks on the duplex channels.
                 Some(result) = inbound_accept_rx.recv() => {
                     match result {
-                        Ok((addr, conn, rtt_ms)) => {
+                        Ok((addr, mut conn, rtt_ms)) => {
+                            // #865: enforce a hard cap on ESTABLISHED inbound
+                            // connections, not merely concurrent handshakes. The
+                            // accept semaphore/ConnectionManager slot are freed the
+                            // instant the handshake completes, so a botnet that
+                            // completes handshakes could otherwise hold unbounded
+                            // live inbound connections and exhaust memory/FDs. The
+                            // cap is the same `accepted_connections_limit.hard_limit`
+                            // the handshake window uses. Computed before the
+                            // `self.connection_lifecycle` mutable borrow below.
+                            let inbound_cap = self
+                                .config
+                                .accepted_connections_limit
+                                .unwrap_or_default()
+                                .hard_limit as usize;
                             if let Some(ref mut lifecycle) = self.connection_lifecycle {
-                                let mut pm = peer_manager.write().await;
-                                match lifecycle.register_inbound_connection(addr, conn, rtt_ms, &mut pm).await {
-                                    Ok(()) => {
-                                        info!(%addr, rtt_ms = format_args!("{rtt_ms:.0}"), "inbound connection registered");
-                                        // Update all peer metrics (including n2n_connections_active)
-                                        // via the derived-read helper rather than a bare fetch_add.
-                                        self.update_peer_metrics(&pm);
-                                    }
-                                    Err(e) => {
-                                        warn!(%addr, "inbound registration failed: {e}");
+                                if lifecycle.inbound_connection_count() >= inbound_cap {
+                                    warn!(
+                                        %addr,
+                                        max = inbound_cap,
+                                        established = lifecycle.inbound_connection_count(),
+                                        "established inbound connection cap reached — rejecting"
+                                    );
+                                    conn.shutdown().await;
+                                } else {
+                                    let mut pm = peer_manager.write().await;
+                                    match lifecycle.register_inbound_connection(addr, conn, rtt_ms, &mut pm).await {
+                                        Ok(()) => {
+                                            info!(%addr, rtt_ms = format_args!("{rtt_ms:.0}"), "inbound connection registered");
+                                            // Update all peer metrics (including n2n_connections_active)
+                                            // via the derived-read helper rather than a bare fetch_add.
+                                            self.update_peer_metrics(&pm);
+                                        }
+                                        Err(e) => {
+                                            warn!(%addr, "inbound registration failed: {e}");
+                                        }
                                     }
                                 }
                             }
