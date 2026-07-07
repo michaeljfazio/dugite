@@ -1152,16 +1152,16 @@ pub(crate) fn build_vote_maps(
     use std::collections::BTreeMap;
     // Haskell semantics: `proposalsAddVote` calls `Map.insert k vote`,
     // i.e. the latest vote from a given voter overwrites any prior vote
-    // on the same governance action. Dugite stores votes as an append-only
-    // `Vec<(Voter, VotingProcedure)>` in `votes_by_action`, so we must
-    // collapse duplicates here before emitting the per-credential maps.
+    // on the same governance action. Dugite stores votes as
+    // `ImblOrdMap<Voter, VotingProcedure>` in `votes_by_action` (already
+    // last-vote-wins per voter), so no duplicate voter can reach this point;
+    // we still re-collect into per-credential `BTreeMap`s below to split by
+    // voter role and produce a canonically-sorted, duplicate-free wire map.
     //
-    // Without this dedup, the wire encoder writes a CBOR map header of N
-    // (raw entry count) followed by N (k, v) pairs that contain duplicate
-    // keys. Haskell's `decodeMapEnforceNoDuplicates` then fails with
-    // "Final number of elements: <unique> does not match the total count
-    // that was decoded: <raw>" and the entire gov-state response is
-    // rejected — surfacing to the user as "Active proposals: 0".
+    // (A duplicate key on the wire would make Haskell's
+    // `decodeMapEnforceNoDuplicates` fail with "Final number of elements:
+    // <unique> does not match the total count that was decoded: <raw>",
+    // rejecting the whole gov-state response as "Active proposals: 0".)
     let mut committee_map: BTreeMap<(Vec<u8>, u8), u8> = BTreeMap::new();
     let mut drep_map: BTreeMap<(Vec<u8>, u8), u8> = BTreeMap::new();
     let mut spo_map: BTreeMap<Vec<u8>, u8> = BTreeMap::new();
