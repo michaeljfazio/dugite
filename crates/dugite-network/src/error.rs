@@ -295,6 +295,18 @@ pub enum ProtocolError {
         /// Number of consecutive pong timeouts before giving up.
         consecutive_failures: u32,
     },
+    /// The remote peer violated a protocol integrity invariant. Unlike
+    /// [`Self::BoundsExceeded`] (a resource/count bound), this signals that the
+    /// peer delivered data inconsistent with what it attested — e.g. a
+    /// transaction body whose canonical id `blake2b_256(body)` does not match
+    /// the txid the peer advertised for it (#864). The peer is convicted and
+    /// the connection is dropped (adversarial posture).
+    IntegrityViolation {
+        /// Name of the mini-protocol.
+        protocol: &'static str,
+        /// Human-readable description of the integrity violation.
+        reason: String,
+    },
     /// Multiplexer error propagated through the protocol layer.
     Mux(MuxError),
 }
@@ -331,6 +343,9 @@ impl fmt::Display for ProtocolError {
             }
             Self::BoundsExceeded { protocol, reason } => {
                 write!(f, "{protocol}: bounds exceeded: {reason}")
+            }
+            Self::IntegrityViolation { protocol, reason } => {
+                write!(f, "{protocol}: integrity violation: {reason}")
             }
             Self::KeepAliveTimeout {
                 consecutive_failures,

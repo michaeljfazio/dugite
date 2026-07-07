@@ -16,7 +16,7 @@ use std::collections::{HashSet, VecDeque};
 use crate::error::ProtocolError;
 use crate::mux::channel::MuxChannel;
 
-use super::{decode_message, encode_message, TxIdAndSize, TxSubmissionMessage};
+use super::{decode_message, encode_message, TxAdmission, TxIdAndSize, TxSubmissionMessage};
 
 /// Maximum number of tx IDs to request in a single MsgRequestTxIds.
 const MAX_TX_IDS_PER_REQUEST: u16 = 10;
@@ -37,13 +37,17 @@ impl TxSubmissionServer {
     ///
     /// Drives the protocol by requesting tx IDs and bodies from the remote peer.
     /// Each received transaction is passed to `on_tx` for validation and mempool
-    /// admission. The callback returns `true` if the tx was accepted, `false` if rejected.
+    /// admission. `on_tx` receives the **attested** txid the peer advertised and
+    /// the raw tx body, and returns a [`TxAdmission`]: `Accepted`/`Rejected` keep
+    /// the connection open, while `Convict` (e.g. the delivered body's canonical
+    /// id does not match the attested txid, #864) is a fatal integrity violation
+    /// that disconnects the peer.
     pub async fn run<F>(
         channel: &mut MuxChannel,
         mut on_tx: F,
     ) -> Result<TxSubmissionStats, ProtocolError>
     where
-        F: FnMut([u8; 32], Vec<u8>) -> bool + Send,
+        F: FnMut([u8; 32], Vec<u8>) -> TxAdmission + Send,
     {
         let mut stats = TxSubmissionStats::default();
 
@@ -207,11 +211,23 @@ impl TxSubmissionServer {
                                     [0; 32]
                                 };
 
-                                // Pass raw tx bytes (era wrapper stripped) to the callback.
-                                if on_tx(tx_id, tx_bytes) {
-                                    stats.txs_accepted += 1;
-                                } else {
-                                    stats.txs_rejected += 1;
+                                // Pass raw tx bytes (era wrapper stripped) to the
+                                // callback along with the txid the PEER ATTESTED.
+                                // The callback recomputes blake2b_256(body) and
+                                // convicts the peer on mismatch (#864).
+                                match on_tx(tx_id, tx_bytes) {
+                                    TxAdmission::Accepted => stats.txs_accepted += 1,
+                                    TxAdmission::Rejected => stats.txs_rejected += 1,
+                                    TxAdmission::Convict => {
+                                        return Err(ProtocolError::IntegrityViolation {
+                                            protocol: "TxSubmission2",
+                                            reason: format!(
+                                                "delivered tx body's canonical id \
+                                                 blake2b_256(body) != attested txid {}",
+                                                hex::encode(tx_id)
+                                            ),
+                                        });
+                                    }
                                 }
 
                                 // Remove from inflight using the hash component.
@@ -287,7 +303,7 @@ mod tests {
         let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
 
         let handle = tokio::spawn(async move {
-            TxSubmissionServer::run(&mut channel, |_tx_id, _tx_bytes| true).await
+            TxSubmissionServer::run(&mut channel, |_tx_id, _tx_bytes| TxAdmission::Accepted).await
         });
 
         // Send MsgInit
@@ -346,7 +362,7 @@ mod tests {
         let handle = tokio::spawn(async move {
             TxSubmissionServer::run(&mut channel, move |tx_id, tx_bytes| {
                 accepted_clone.lock().unwrap().push((tx_id, tx_bytes));
-                true // accept all
+                TxAdmission::Accepted // accept all
             })
             .await
         });
@@ -431,7 +447,7 @@ mod tests {
         let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
 
         let handle = tokio::spawn(async move {
-            TxSubmissionServer::run(&mut channel, |_tx_id, _tx_bytes| true).await
+            TxSubmissionServer::run(&mut channel, |_tx_id, _tx_bytes| TxAdmission::Accepted).await
         });
 
         // MsgInit
@@ -468,7 +484,7 @@ mod tests {
         let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
 
         let handle = tokio::spawn(async move {
-            TxSubmissionServer::run(&mut channel, |_tx_id, _tx_bytes| true).await
+            TxSubmissionServer::run(&mut channel, |_tx_id, _tx_bytes| TxAdmission::Accepted).await
         });
 
         // MsgInit
@@ -520,13 +536,64 @@ mod tests {
         );
     }
 
+    /// #864: when the callback convicts the peer (the delivered body's canonical
+    /// id != the attested txid), the server must return a fatal
+    /// `IntegrityViolation` that drops the connection — not silently continue.
+    #[tokio::test]
+    async fn server_convicts_peer_on_txid_mismatch() {
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+
+        let handle = tokio::spawn(async move {
+            // Callback simulates the node's blake2b(body) check failing.
+            TxSubmissionServer::run(&mut channel, |_tx_id, _tx_bytes| TxAdmission::Convict).await
+        });
+
+        ingress_tx
+            .send(Bytes::from(encode_message(&TxSubmissionMessage::MsgInit)))
+            .await
+            .unwrap();
+        let _ = egress_rx.recv().await.unwrap();
+
+        // Advertise one txid so the server requests the body.
+        let reply = encode_message(&TxSubmissionMessage::MsgReplyTxIds(vec![TxIdAndSize {
+            era_id: 6,
+            tx_id: [0xAB; 32],
+            size_in_bytes: 100,
+        }]));
+        ingress_tx.send(Bytes::from(reply)).await.unwrap();
+
+        // Read MsgRequestTxs.
+        let (_, _, req_txs) = egress_rx.recv().await.unwrap();
+        assert!(matches!(
+            decode_message(&req_txs).unwrap(),
+            TxSubmissionMessage::MsgRequestTxs(_)
+        ));
+
+        // Deliver a body — the callback will convict regardless of content.
+        let reply_txs =
+            encode_message(&TxSubmissionMessage::MsgReplyTxs(vec![(6u8, vec![0x01, 0x02])]));
+        ingress_tx.send(Bytes::from(reply_txs)).await.unwrap();
+
+        let result = handle.await.unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(ProtocolError::IntegrityViolation {
+                    protocol: "TxSubmission2",
+                    ..
+                })
+            ),
+            "txid mismatch must convict the peer with IntegrityViolation, got: {result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn server_normal_flow_within_bounds() {
         // Normal flow: peer sends exactly MAX_TX_IDS_PER_REQUEST IDs, all accepted.
         let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
 
         let handle = tokio::spawn(async move {
-            TxSubmissionServer::run(&mut channel, |_tx_id, _tx_bytes| true).await
+            TxSubmissionServer::run(&mut channel, |_tx_id, _tx_bytes| TxAdmission::Accepted).await
         });
 
         // MsgInit

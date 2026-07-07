@@ -3551,7 +3551,8 @@ impl ConnectionLifecycleManager {
                     let tx_mempool = mempool;
                     let tx_metrics = metrics;
                     let validator = tx_validator;
-                    move |tx_hash: [u8; 32], tx_bytes: Vec<u8>| -> bool {
+                    move |tx_hash: [u8; 32], tx_bytes: Vec<u8>| -> dugite_network::TxAdmission {
+                        use dugite_network::TxAdmission;
                         // Track every transaction received from peers in real-time.
                         tx_metrics
                             .transactions_received
@@ -3570,7 +3571,7 @@ impl ConnectionLifecycleManager {
                             tx_metrics
                                 .transactions_rejected
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            return false;
+                            return TxAdmission::Rejected;
                         }
 
                         // Run full Phase-1 + Phase-2 validation (including IsValid
@@ -3583,31 +3584,60 @@ impl ConnectionLifecycleManager {
                             if let Ok(tx) =
                                 dugite_serialization::decode_transaction(era_id, &tx_bytes)
                             {
+                                // #864: reconcile the CANONICAL txid — the decoder
+                                // computes `tx.hash = blake2b_256(raw_body_cbor)`
+                                // over the body span — against the txid the peer
+                                // ATTESTED in MsgReplyTxIds. A mismatch means the
+                                // peer delivered a valid body under a key that is
+                                // NOT its hash, breaking the mempool invariant
+                                // `key == blake2b(body)` (a censorship /
+                                // propagation-poisoning lever). This is a protocol
+                                // integrity violation, not a validation failure:
+                                // convict the peer and drop the connection.
+                                // `tx.hash` is era-independent (the body-span bytes
+                                // are the same regardless of which era schema
+                                // interprets them), so a first-decode mismatch is
+                                // authoritative.
+                                if tx.hash.as_bytes() != &tx_hash {
+                                    debug!(
+                                        %addr,
+                                        attested = %dugite_primitives::hash::Hash32::from_bytes(tx_hash).to_hex(),
+                                        computed = %tx.hash.to_hex(),
+                                        "N2N peer attested a txid != blake2b(body) — convicting"
+                                    );
+                                    tx_metrics
+                                        .transactions_rejected
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    return TxAdmission::Convict;
+                                }
+
                                 // Phase-1 + Phase-2 validation via LedgerTxValidator.
                                 if let Err(e) = validator.validate_tx(era_id, &tx_bytes) {
                                     debug!(
                                         %addr,
-                                        tx_hash = %dugite_primitives::hash::Hash32::from_bytes(tx_hash).to_hex(),
+                                        tx_hash = %tx.hash.to_hex(),
                                         reason = ?e,
                                         "N2N tx rejected by validator"
                                     );
                                     tx_metrics
                                         .transactions_rejected
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    return false;
+                                    return TxAdmission::Rejected;
                                 }
 
-                                let hash = dugite_primitives::hash::Hash32::from_bytes(tx_hash);
+                                // Key the mempool on the verified canonical hash
+                                // (== attested txid) rather than trusting the wire.
+                                let hash = tx.hash;
                                 if tx_mempool.add_tx(hash, tx, size_bytes).is_ok() {
                                     tx_metrics
                                         .transactions_validated
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    return true;
+                                    return TxAdmission::Accepted;
                                 } else {
                                     tx_metrics
                                         .transactions_rejected
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    return false;
+                                    return TxAdmission::Rejected;
                                 }
                             }
                         }
@@ -3615,7 +3645,7 @@ impl ConnectionLifecycleManager {
                         tx_metrics
                             .transactions_rejected
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        false
+                        TxAdmission::Rejected
                     }
                 };
 
