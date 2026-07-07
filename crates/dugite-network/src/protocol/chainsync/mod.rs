@@ -40,6 +40,7 @@
 
 pub mod client;
 pub mod jumping;
+pub(crate) mod serve_core;
 pub mod server;
 
 use crate::codec::{self, Point};
