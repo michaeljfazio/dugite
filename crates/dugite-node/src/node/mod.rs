@@ -8011,6 +8011,14 @@ impl Node {
         // periodic `update_state()` write lock until the client disconnected.
         // Instead, use a per-query wrapper that acquires and releases the read lock
         // inside each dispatch method — the lock is never held across an .await point.
+        //
+        // Issue #867: `acquire()` additionally pins the CURRENT `Arc<NodeStateSnapshot>`
+        // at MsgAcquire time (a single cheap Arc clone under a momentary
+        // `blocking_read()` — the guard is dropped immediately after, preserving the
+        // C3 invariant). Every MsgQuery within that acquisition then dispatches
+        // against the pinned Arc directly (no lock at all), so multiple queries in
+        // one acquisition see a consistent ledger-state view even if `update_state()`
+        // swaps the live snapshot mid-session.
         let lsq_handler = query_handler;
         let lsq_task = tokio::spawn(async move {
             // Per-query read-lock wrapper: acquires a blocking_read() guard for each
@@ -8018,38 +8026,68 @@ impl Node {
             // update_state() can always acquire its write lock between queries.
             struct PerQueryHandler(Arc<RwLock<QueryHandler>>);
             impl dugite_network::QueryHandler for PerQueryHandler {
+                /// Pinned ledger-state snapshot for a single acquisition (#867).
+                type Acquired = Arc<n2c_query::types::NodeStateSnapshot>;
+
+                fn acquire(
+                    &self,
+                    target: &dugite_network::protocol::local_state_query::AcquireTarget,
+                ) -> Result<
+                    Self::Acquired,
+                    dugite_network::protocol::local_state_query::AcquireFailure,
+                > {
+                    // Momentary read guard: run the existing on-chain validation,
+                    // then Arc-clone the current state and drop the guard. No lock
+                    // is held once this call returns — the returned Arc is then used
+                    // for every MsgQuery in this acquisition, lock-free.
+                    let guard = tokio::task::block_in_place(|| self.0.blocking_read());
+                    dugite_network::QueryHandler::acquire(&*guard, target)
+                }
                 fn handle_query(
                     &self,
+                    acquired: &Self::Acquired,
                     query_cbor: &[u8],
                     n2c_version: u16,
                 ) -> Result<Vec<u8>, String> {
                     // Acquire read guard for this single query dispatch, then release.
                     let guard = tokio::task::block_in_place(|| self.0.blocking_read());
-                    guard.handle_query(query_cbor, n2c_version)
+                    dugite_network::QueryHandler::handle_query(
+                        &*guard,
+                        acquired,
+                        query_cbor,
+                        n2c_version,
+                    )
                 }
                 fn handle_block_query(
                     &self,
+                    acquired: &Self::Acquired,
                     tag: u64,
                     query_cbor: &[u8],
                 ) -> Result<Vec<u8>, String> {
                     let guard = tokio::task::block_in_place(|| self.0.blocking_read());
-                    guard.handle_block_query(tag, query_cbor)
+                    dugite_network::QueryHandler::handle_block_query(
+                        &*guard, acquired, tag, query_cbor,
+                    )
                 }
-                fn handle_query_anytime(&self, query_cbor: &[u8]) -> Result<Vec<u8>, String> {
-                    let guard = tokio::task::block_in_place(|| self.0.blocking_read());
-                    guard.handle_query_anytime(query_cbor)
-                }
-                fn handle_query_hard_fork(&self, query_cbor: &[u8]) -> Result<Vec<u8>, String> {
-                    let guard = tokio::task::block_in_place(|| self.0.blocking_read());
-                    guard.handle_query_hard_fork(query_cbor)
-                }
-                fn validate_acquire(
+                fn handle_query_anytime(
                     &self,
-                    target: &dugite_network::protocol::local_state_query::AcquireTarget,
-                ) -> Result<(), dugite_network::protocol::local_state_query::AcquireFailure>
-                {
+                    acquired: &Self::Acquired,
+                    query_cbor: &[u8],
+                ) -> Result<Vec<u8>, String> {
                     let guard = tokio::task::block_in_place(|| self.0.blocking_read());
-                    guard.validate_acquire(target)
+                    dugite_network::QueryHandler::handle_query_anytime(
+                        &*guard, acquired, query_cbor,
+                    )
+                }
+                fn handle_query_hard_fork(
+                    &self,
+                    acquired: &Self::Acquired,
+                    query_cbor: &[u8],
+                ) -> Result<Vec<u8>, String> {
+                    let guard = tokio::task::block_in_place(|| self.0.blocking_read());
+                    dugite_network::QueryHandler::handle_query_hard_fork(
+                        &*guard, acquired, query_cbor,
+                    )
                 }
             }
             let wrapper = PerQueryHandler(lsq_handler);
