@@ -68,6 +68,14 @@ use super::{decode_message, encode_message, BlockFetchMessage, TAG_BLOCK};
 /// upper bound to prevent unbounded memory use from malicious requests.
 pub const MAX_BLOCKS_PER_BATCH: usize = 2000;
 
+/// Blocks fetched per look-ahead chunk while streaming a range (#878).
+///
+/// Caps per-connection memory at O(STREAM_CHUNK) full block CBORs instead of
+/// pre-collecting the whole batch. A multiple of the ChainDB's internal
+/// 50-block lock chunk so the chunked-lock optimisation (which keeps
+/// `get_blocks_in_range` off the per-block `blocking_read` path) is preserved.
+pub const STREAM_CHUNK: usize = 200;
+
 /// BlockFetch server that serves block ranges to peers.
 pub struct BlockFetchServer;
 
@@ -166,76 +174,168 @@ impl BlockFetchServer {
             return Ok(());
         }
 
-        // Collect blocks in [from_slot, to_slot] via a single batched call.
-        // ChainDBBlockProvider overrides get_blocks_in_range() to acquire
-        // chain_db.read() in chunks of 50 blocks, preventing the per-block
-        // block_in_place / blocking_read pattern from exhausting the tokio
-        // async worker thread pool when the Haskell relay is syncing rapidly
-        // with pipelined batch requests.
-        let mut blocks =
-            block_provider.get_blocks_in_range(from_slot, to_slot, MAX_BLOCKS_PER_BATCH);
-
-        // Haskell BlockFetch ranges are inclusive by POINT, not by slot.  A
-        // Byron EBB shares its absolute slot with the first main block of
-        // the epoch, so the slot range may over-collect a same-slot sibling
-        // on either edge: trim leading blocks at `from_slot` that precede
-        // the requested `from` hash, and trailing blocks at `to_slot` that
-        // follow the requested `to` hash.
-        if let Point::Specific(s, h) = from {
-            while blocks.first().is_some_and(|(bs, bh, _)| bs == s && bh != h) {
-                blocks.remove(0);
-            }
-        }
-        if let Point::Specific(s, h) = to {
-            while blocks.last().is_some_and(|(bs, bh, _)| bs == s && bh != h) {
-                blocks.pop();
-            }
-        }
-
-        if blocks.is_empty() {
-            let no_blocks = encode_message(&BlockFetchMessage::MsgNoBlocks);
-            channel.send(no_blocks).await.map_err(ProtocolError::from)?;
-            return Ok(());
-        }
-
-        // Stream: MsgStartBatch → MsgBlock × N → MsgBatchDone.
-        let start = encode_message(&BlockFetchMessage::MsgStartBatch);
-        channel.send(start).await.map_err(ProtocolError::from)?;
-
-        for (slot, hash, block_cbor) in &blocks {
-            tracing::debug!(
-                slot,
-                hash = hex::encode(hash),
-                cbor_len = block_cbor.len(),
-                first_bytes = hex::encode(&block_cbor[..block_cbor.len().min(16)]),
-                "blockfetch server: serving block"
-            );
-            // Encode MsgBlock: [4, tag(24) bstr(stored_block_cbor)].
-            // The stored CBOR format [era_word, body] is identical to what
-            // Haskell's encodeDiskHfcBlock produces, so it goes verbatim
-            // inside the CBOR-in-CBOR tag(24) wrapper.
-            let block_msg = Self::encode_hfc_msg_block(block_cbor).map_err(|reason| {
-                ProtocolError::CborDecode {
-                    protocol: "BlockFetch",
-                    reason: format!("HFC wrapping failed: {reason}"),
-                }
-            })?;
-            channel.send(block_msg).await.map_err(ProtocolError::from)?;
-        }
-
-        let done = encode_message(&BlockFetchMessage::MsgBatchDone);
-        channel.send(done).await.map_err(ProtocolError::from)?;
-
-        tracing::debug!(
-            block_count = blocks.len(),
+        // #878: stream the range in bounded look-ahead chunks instead of
+        // pre-collecting the whole batch (up to MAX_BLOCKS_PER_BATCH full block
+        // CBORs ≈ 180 MB on mainnet) into one owned Vec. Per-connection memory
+        // is now O(STREAM_CHUNK) blocks regardless of range size, so N
+        // concurrent adversarial dense-range requests can no longer multiply a
+        // huge pinned allocation. The chunk size is a multiple of the ChainDB's
+        // internal 50-block lock chunk, so the chunked-lock optimisation that
+        // keeps get_blocks_in_range() off the per-block blocking_read path is
+        // preserved.
+        Self::stream_range(
+            channel,
+            block_provider,
+            from,
+            to,
             from_slot,
             to_slot,
-            first_hash = blocks
-                .first()
-                .map(|(_, h, _)| hex::encode(h))
-                .unwrap_or_default(),
-            "blockfetch server: served batch"
-        );
+            STREAM_CHUNK,
+        )
+        .await
+    }
+
+    /// Stream the blocks of `[from, to]` (inclusive by POINT) to the client in
+    /// bounded look-ahead chunks, holding at most `chunk_size` block CBORs in
+    /// memory at once (#878).
+    ///
+    /// Emits `MsgStartBatch → MsgBlock* → MsgBatchDone`, or `MsgNoBlocks` if the
+    /// range yields nothing. The cursor advances by POINT (via the last emitted
+    /// block's hash) so a Byron EBB and the same-slot first main block of the
+    /// epoch are both served across a chunk boundary, matching the point-inclusive
+    /// semantics of the previous collect-then-trim implementation:
+    /// - leading same-slot siblings that precede the requested `from` hash are
+    ///   dropped, and
+    /// - streaming stops the instant the requested `to` hash is emitted, so
+    ///   trailing same-slot siblings after `to` are never sent.
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_range<B: BlockProvider>(
+        channel: &mut MuxChannel,
+        block_provider: &B,
+        from: &Point,
+        to: &Point,
+        from_slot: u64,
+        to_slot: u64,
+        chunk_size: usize,
+    ) -> Result<(), ProtocolError> {
+        let from_hash: Option<[u8; 32]> = match from {
+            Point::Specific(_, h) => Some(*h),
+            Point::Origin => None,
+        };
+        let to_hash: Option<[u8; 32]> = match to {
+            Point::Specific(_, h) => Some(*h),
+            Point::Origin => None,
+        };
+
+        let mut cursor_slot = from_slot;
+        // Hash of the last block emitted in the previous chunk. Because a slot
+        // can hold two blocks (EBB + main) we advance the cursor by slot but
+        // re-fetch from `cursor_slot`, then skip forward through this hash so
+        // the boundary block is emitted exactly once.
+        let mut boundary_hash: Option<[u8; 32]> = None;
+        // Until the requested `from` hash is reached we are trimming leading
+        // same-slot siblings that precede it (Point::Origin has no such trim).
+        let mut reached_from = from_hash.is_none();
+        let mut started = false;
+        let mut sent = 0usize;
+
+        'chunks: loop {
+            let chunk = block_provider.get_blocks_in_range(cursor_slot, to_slot, chunk_size);
+            if chunk.is_empty() {
+                break;
+            }
+            let full_chunk = chunk.len() >= chunk_size;
+            let last_slot = chunk.last().unwrap().0;
+            let last_hash = chunk.last().unwrap().1;
+
+            // Skip the overlap already emitted at the end of the previous chunk.
+            let mut i = 0usize;
+            if let Some(b) = boundary_hash {
+                while i < chunk.len() && chunk[i].1 != b {
+                    i += 1;
+                }
+                if i < chunk.len() {
+                    i += 1; // skip the boundary block itself
+                }
+            }
+
+            let mut emitted_this_chunk = false;
+            while i < chunk.len() {
+                let (slot, hash, block_cbor) = &chunk[i];
+                i += 1;
+
+                if !reached_from {
+                    // Leading trim: drop same-slot siblings before `from`.
+                    if Some(*hash) == from_hash {
+                        reached_from = true;
+                    } else {
+                        continue;
+                    }
+                }
+
+                if !started {
+                    let start = encode_message(&BlockFetchMessage::MsgStartBatch);
+                    channel.send(start).await.map_err(ProtocolError::from)?;
+                    started = true;
+                }
+
+                tracing::debug!(
+                    slot,
+                    hash = hex::encode(hash),
+                    cbor_len = block_cbor.len(),
+                    "blockfetch server: streaming block"
+                );
+                // MsgBlock: [4, tag(24) bstr(stored_block_cbor)]. Stored CBOR is
+                // already the [era_word, body] layout encodeDiskHfcBlock emits.
+                let block_msg = Self::encode_hfc_msg_block(block_cbor).map_err(|reason| {
+                    ProtocolError::CborDecode {
+                        protocol: "BlockFetch",
+                        reason: format!("HFC wrapping failed: {reason}"),
+                    }
+                })?;
+                channel.send(block_msg).await.map_err(ProtocolError::from)?;
+                sent += 1;
+                emitted_this_chunk = true;
+
+                // Trailing trim: stop the instant we emit the `to` block, and
+                // never exceed the batch cap.
+                if to_hash == Some(*hash) || sent >= MAX_BLOCKS_PER_BATCH {
+                    break 'chunks;
+                }
+            }
+
+            if !full_chunk {
+                // The provider returned fewer than a full chunk — end of range.
+                break;
+            }
+            if emitted_this_chunk {
+                // Re-fetch from the last emitted slot next round and skip past
+                // the boundary block (handles a same-slot sibling straddling
+                // the chunk edge).
+                boundary_hash = Some(last_hash);
+                cursor_slot = last_slot;
+            } else {
+                // A full chunk whose blocks were ALL already emitted (both
+                // same-slot siblings of `last_slot` sent in prior chunks). The
+                // slot-keyed re-fetch would loop forever; advance past the slot.
+                boundary_hash = None;
+                cursor_slot = last_slot + 1;
+            }
+        }
+
+        if started {
+            let done = encode_message(&BlockFetchMessage::MsgBatchDone);
+            channel.send(done).await.map_err(ProtocolError::from)?;
+            tracing::debug!(
+                block_count = sent,
+                from_slot,
+                to_slot,
+                "blockfetch server: streamed batch"
+            );
+        } else {
+            let no_blocks = encode_message(&BlockFetchMessage::MsgNoBlocks);
+            channel.send(no_blocks).await.map_err(ProtocolError::from)?;
+        }
 
         Ok(())
     }
@@ -495,7 +595,7 @@ mod tests {
         mpsc::Receiver<(u16, crate::mux::Direction, Bytes)>,
         mpsc::Sender<Bytes>,
     ) {
-        let (egress_tx, egress_rx) = mpsc::channel(64);
+        let (egress_tx, egress_rx) = mpsc::channel(4096);
         let (ingress_tx, ingress_rx) = mpsc::channel(64);
         let channel = MuxChannel::new(
             3,
@@ -506,6 +606,121 @@ mod tests {
             std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         );
         (channel, egress_rx, ingress_tx)
+    }
+
+    /// #878: drive `stream_range` directly with a small `chunk_size` and collect
+    /// the served block bodies, so the multi-chunk look-ahead + boundary-overlap
+    /// path is exercised (the collect-then-stream path never had chunks).
+    async fn collect_stream_range(
+        provider: MockBlockProvider,
+        from: Point,
+        to: Point,
+        chunk_size: usize,
+    ) -> Vec<Vec<u8>> {
+        let (mut channel, mut egress_rx, _ingress_tx) = make_test_channel();
+        let from_slot = match &from {
+            Point::Origin => 0,
+            Point::Specific(s, _) => *s,
+        };
+        let to_slot = match &to {
+            Point::Origin => 0,
+            Point::Specific(s, _) => *s,
+        };
+        let handle = tokio::spawn(async move {
+            BlockFetchServer::stream_range(
+                &mut channel,
+                &provider,
+                &from,
+                &to,
+                from_slot,
+                to_slot,
+                chunk_size,
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut blocks = Vec::new();
+        let (_, _, first) = egress_rx.recv().await.unwrap();
+        match decode_message(&first).unwrap() {
+            BlockFetchMessage::MsgNoBlocks => {}
+            BlockFetchMessage::MsgStartBatch => loop {
+                let (_, _, msg) = egress_rx.recv().await.unwrap();
+                match decode_message(&msg).unwrap() {
+                    BlockFetchMessage::MsgBlock(body) => blocks.push(body),
+                    BlockFetchMessage::MsgBatchDone => break,
+                    other => panic!("unexpected message in batch: {other:?}"),
+                }
+            },
+            other => panic!("unexpected first response: {other:?}"),
+        }
+        handle.await.unwrap();
+        blocks
+    }
+
+    /// #878: streaming across several small chunks yields the exact same block
+    /// sequence as a single-shot serve — no gaps, no duplicates at chunk edges.
+    #[tokio::test]
+    async fn stream_range_multichunk_matches_full_sequence() {
+        let bodies: Vec<Vec<u8>> = (0u8..10).map(|i| make_storage_block(7, &[i])).collect();
+        let provider = MockBlockProvider {
+            blocks: (0u8..10)
+                .map(|i| {
+                    let mut h = [0u8; 32];
+                    h[0] = i;
+                    ((i as u64) * 10 + 10, h, bodies[i as usize].clone())
+                })
+                .collect(),
+        };
+        let mut from_h = [0u8; 32];
+        from_h[0] = 0;
+        let mut to_h = [0u8; 32];
+        to_h[0] = 9;
+
+        // chunk_size 3 forces 4 chunks with boundary overlaps.
+        let served = collect_stream_range(
+            provider,
+            Point::Specific(10, from_h),
+            Point::Specific(100, to_h),
+            3,
+        )
+        .await;
+        assert_eq!(
+            served, bodies,
+            "multi-chunk stream must equal the full range"
+        );
+    }
+
+    /// #878: a Byron EBB/main same-slot pair split across a chunk boundary must
+    /// still serve BOTH blocks exactly once (the boundary-overlap skip advances
+    /// by point, not slot).
+    #[tokio::test]
+    async fn stream_range_same_slot_pair_across_chunk_boundary() {
+        let pred = make_storage_block(7, &[0x10]);
+        let ebb = make_storage_block(7, &[0x20]);
+        let main = make_storage_block(7, &[0x30]);
+        let next = make_storage_block(7, &[0x40]);
+        let provider = MockBlockProvider {
+            blocks: vec![
+                (99, [0x01; 32], pred.clone()),
+                (100, [0x02; 32], ebb.clone()),
+                (100, [0x03; 32], main.clone()),
+                (101, [0x04; 32], next.clone()),
+            ],
+        };
+        // chunk_size 2 places the (100,ebb)/(100,main) pair straddling chunk 1/2.
+        let served = collect_stream_range(
+            provider,
+            Point::Specific(99, [0x01; 32]),
+            Point::Specific(101, [0x04; 32]),
+            2,
+        )
+        .await;
+        assert_eq!(
+            served,
+            vec![pred, ebb, main, next],
+            "same-slot pair across a chunk boundary must both be served once"
+        );
     }
 
     #[tokio::test]

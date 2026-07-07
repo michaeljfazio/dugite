@@ -514,6 +514,19 @@ impl NodePeerManager {
         for &addr in &group.addrs {
             self.add_config_peer(addr);
         }
+        // #871: upsert by (non-empty) name so periodic DNS re-resolution can
+        // refresh a group's resolved addresses in place instead of pushing a
+        // duplicate every pass. A blank name (legacy callers) always appends.
+        if !group.name.is_empty() {
+            if let Some(existing) = self
+                .local_root_groups
+                .iter_mut()
+                .find(|g| g.name == group.name)
+            {
+                *existing = group;
+                return;
+            }
+        }
         self.local_root_groups.push(group);
     }
 
@@ -548,6 +561,11 @@ impl NodePeerManager {
         if is_non_public_ip(addr.ip()) {
             return;
         }
+        // #880: reject port 0 — an undialable address the governor would
+        // otherwise burn a connect attempt on every promotion tick.
+        if addr.port() == 0 {
+            return;
+        }
         self.inner.add_peer(addr, PeerSource::Ledger);
     }
 
@@ -568,12 +586,29 @@ impl NodePeerManager {
         if is_non_public_ip(addr.ip()) {
             return;
         }
+        // #880: reject port 0 — an undialable address the governor would
+        // otherwise burn a connect attempt on.
+        if addr.port() == 0 {
+            return;
+        }
         self.inner.add_peer(addr, PeerSource::PeerSharing);
     }
 
     /// Mark a peer as a big ledger peer.
     pub fn add_big_ledger_peer(&mut self, addr: SocketAddr) {
         self.big_ledger_peers.insert(addr);
+    }
+
+    /// Clear the big-ledger-peer set so the next ledger-discovery pass can
+    /// rebuild it from scratch (#879).
+    ///
+    /// The BLP set was previously insert-only, so cold-churn/`peer_failed`
+    /// forgets and rotating-DNS re-adds under fresh `SocketAddr`s left it
+    /// growing unbounded with stale/duplicate membership that distorted
+    /// governor decisions. Rebuilding each pass keeps it a faithful snapshot of
+    /// the current top-stake relays.
+    pub fn clear_big_ledger_peers(&mut self) {
+        self.big_ledger_peers.clear();
     }
 
     /// Mark a peer as a bootstrap peer (topology `bootstrapPeers`). Bootstrap
@@ -694,6 +729,12 @@ impl NodePeerManager {
             // Non-root peer exceeded max retries — remove from known set entirely.
             // It will only re-appear if re-discovered via ledger or peer sharing.
             self.inner.remove_peer(addr);
+            // #879: keep the BLP/bootstrap address sets in sync with the peer
+            // table. Leaving a forgotten peer in `big_ledger_peers` bloats the
+            // set with stale entries that mis-feed `is_big_ledger_peer` and the
+            // demote-exclusion set.
+            self.big_ledger_peers.remove(addr);
+            self.bootstrap_peer_addrs.remove(addr);
         } else {
             self.inner.demote_to_cold(addr);
         }
@@ -1088,6 +1129,60 @@ impl std::fmt::Display for PeerManagerStats {
 mod tests {
     use super::*;
     use std::net::SocketAddr;
+
+    /// #871: re-adding a named local-root group (periodic DNS re-resolution)
+    /// must UPSERT it in place — refreshing its addresses — not push a
+    /// duplicate. A blank-named group always appends (legacy behaviour).
+    #[test]
+    fn add_local_root_group_upserts_by_name() {
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        let a1: SocketAddr = "203.0.113.1:3001".parse().unwrap();
+        let a2: SocketAddr = "203.0.113.2:3001".parse().unwrap();
+
+        pm.add_local_root_group(LocalRootGroupInfo {
+            name: "local-root-0".into(),
+            addrs: vec![a1],
+            hot_valency: 1,
+            warm_valency: 1,
+            diffusion_mode: None,
+            behind_firewall: false,
+            advertise: false,
+        });
+        assert_eq!(pm.local_root_groups().len(), 1);
+
+        // Re-resolution returns a rotated address for the SAME group name.
+        pm.add_local_root_group(LocalRootGroupInfo {
+            name: "local-root-0".into(),
+            addrs: vec![a2],
+            hot_valency: 1,
+            warm_valency: 1,
+            diffusion_mode: None,
+            behind_firewall: false,
+            advertise: false,
+        });
+        assert_eq!(
+            pm.local_root_groups().len(),
+            1,
+            "same-named group must be replaced, not duplicated"
+        );
+        assert_eq!(
+            pm.local_root_groups()[0].addrs,
+            vec![a2],
+            "group addresses must be refreshed to the newly-resolved set"
+        );
+
+        // A distinct name is a distinct group.
+        pm.add_local_root_group(LocalRootGroupInfo {
+            name: "local-root-1".into(),
+            addrs: vec![a1],
+            hot_valency: 1,
+            warm_valency: 1,
+            diffusion_mode: None,
+            behind_firewall: false,
+            advertise: false,
+        });
+        assert_eq!(pm.local_root_groups().len(), 2);
+    }
 
     #[test]
     fn test_haa_satisfied_via_trusted_local_roots() {

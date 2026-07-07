@@ -3647,6 +3647,7 @@ impl Node {
             // Each entry carries resolved addresses plus all topology metadata so
             // `add_local_root_group` can be called with fully-populated info.
             struct ResolvedGroup {
+                orig_index: usize,
                 addrs: Vec<std::net::SocketAddr>,
                 hot_valency: usize,
                 warm_valency: usize,
@@ -3655,7 +3656,7 @@ impl Node {
                 advertise: bool,
             }
             let mut resolved_groups: Vec<ResolvedGroup> = Vec::new();
-            for group in &self.topology.local_roots {
+            for (orig_index, group) in self.topology.local_roots.iter().enumerate() {
                 let hot_val = usize::from(group.effective_hot_valency());
                 let warm_val = usize::from(group.effective_warm_valency());
                 let diffusion_mode = group.diffusion_mode.as_deref().map(|s| match s {
@@ -3677,6 +3678,7 @@ impl Node {
                 }
                 if !group_addrs.is_empty() {
                     resolved_groups.push(ResolvedGroup {
+                        orig_index,
                         addrs: group_addrs,
                         hot_valency: hot_val,
                         warm_valency: warm_val,
@@ -3685,6 +3687,88 @@ impl Node {
                         advertise: group.advertise,
                     });
                 }
+            }
+
+            // #871: periodic DNS re-resolution of topology / local-root names.
+            //
+            // Topology and local-root DNS names were resolved exactly ONCE at
+            // startup, so a block producer whose relay's A/AAAA record rotated
+            // silently lost its relay (the governor retried the stale IP forever
+            // at the 160s backoff cap), and a transient DNS failure at startup
+            // dropped a local-root group with no retry. This loop re-resolves
+            // both sets periodically, re-registering resolved addresses
+            // (idempotent by SocketAddr — inner add_peer never overwrites) and
+            // upserting each local-root group by its stable `local-root-{index}`
+            // name. On an EMPTY resolution it keeps the previous addresses (never
+            // forgets a group / bootstrap set on a transient failure — this fixes
+            // the startup-drop). A fixed 5-minute interval approximates
+            // cardano-node's TTL-driven DNSActions; resolve_with_srv does not yet
+            // surface record TTLs. (Stale rotated-out IPs linger as Topology cold
+            // peers rather than being pruned; connectivity is restored via the
+            // freshly-resolved address.)
+            {
+                let re_pm = peer_manager.clone();
+                let re_peers = detailed_peers.clone();
+                let re_groups = self.topology.local_roots.clone();
+                let mut re_shutdown = shutdown_rx.clone();
+                tokio::spawn(async move {
+                    let resolver: Box<dyn DnsResolver> = match HickoryDnsResolver::new() {
+                        Ok(r) => Box::new(r),
+                        Err(_) => Box::new(NoopDnsResolver),
+                    };
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+                    interval.tick().await; // skip the immediate first tick
+                    loop {
+                        tokio::select! {
+                            _ = interval.tick() => {}
+                            _ = re_shutdown.changed() => break,
+                        }
+                        // Re-resolve bootstrap / config peers.
+                        for peer in &re_peers {
+                            let addrs =
+                                resolve_with_srv(resolver.as_ref(), &peer.address, peer.port).await;
+                            if addrs.is_empty() {
+                                continue; // keep previous on transient failure
+                            }
+                            let mut w = re_pm.write().await;
+                            for a in &addrs {
+                                w.add_config_peer(*a);
+                                if peer.trustable {
+                                    w.add_bootstrap_peer(*a);
+                                }
+                            }
+                        }
+                        // Re-resolve local-root groups, upserting by stable name.
+                        for (gi, group) in re_groups.iter().enumerate() {
+                            let hot_val = usize::from(group.effective_hot_valency());
+                            let warm_val = usize::from(group.effective_warm_valency());
+                            let diffusion_mode = group.diffusion_mode.as_deref().map(|s| match s {
+                                "InitiatorOnly" => networking::DiffusionMode::InitiatorOnly,
+                                _ => networking::DiffusionMode::InitiatorAndResponder,
+                            });
+                            let mut group_addrs = Vec::new();
+                            for ap in &group.access_points {
+                                let addrs =
+                                    resolve_with_srv(resolver.as_ref(), &ap.address, ap.port).await;
+                                group_addrs.extend(addrs);
+                            }
+                            if group_addrs.is_empty() {
+                                continue; // keep previous group on transient failure
+                            }
+                            let mut w = re_pm.write().await;
+                            w.add_local_root_group(networking::LocalRootGroupInfo {
+                                name: format!("local-root-{gi}"),
+                                addrs: group_addrs,
+                                hot_valency: hot_val,
+                                warm_valency: warm_val,
+                                diffusion_mode,
+                                behind_firewall: group.is_behind_firewall(),
+                                advertise: group.advertise,
+                            });
+                        }
+                    }
+                    tracing::debug!("DNS re-resolution loop exiting (shutdown)");
+                });
             }
 
             let mut pm = peer_manager.write().await;
@@ -3698,9 +3782,11 @@ impl Node {
             }
             // Register per-group valency targets.  This must happen AFTER
             // add_config_peer() calls so the peer table contains the members.
-            for rg in resolved_groups {
+            // #871: give each group a stable name (its topology index) so the
+            // periodic DNS re-resolution loop can upsert it in place.
+            for rg in resolved_groups.into_iter() {
                 pm.add_local_root_group(networking::LocalRootGroupInfo {
-                    name: String::new(),
+                    name: format!("local-root-{}", rg.orig_index),
                     addrs: rg.addrs,
                     hot_valency: rg.hot_valency,
                     warm_valency: rg.warm_valency,
@@ -4517,10 +4603,15 @@ impl Node {
                     // BLP classification per resolved socket address.
                     let mut resolved: Vec<(SocketAddr, bool)> = Vec::new();
                     for r in &sample {
-                        if let Ok(mut addrs) =
+                        if let Ok(addrs) =
                             tokio::net::lookup_host(format!("{}:{}", r.host, r.port)).await
                         {
-                            if let Some(socket_addr) = addrs.next() {
+                            // #879: keep ALL resolved addresses, not just the
+                            // first — a BLP relay commonly has multiple A/AAAA
+                            // records; taking `.next()` biased toward whatever
+                            // the resolver happened to order first and dropped
+                            // the rest of the relay set.
+                            for socket_addr in addrs {
                                 resolved.push((socket_addr, r.is_blp));
                             }
                         }
@@ -4528,6 +4619,10 @@ impl Node {
 
                     if !resolved.is_empty() {
                         let mut pm_w = pm.write().await;
+                        // #879: rebuild the BLP set from scratch each pass so it
+                        // stays a faithful snapshot of the current top-stake
+                        // relays instead of accumulating stale/duplicate entries.
+                        pm_w.clear_big_ledger_peers();
                         let mut blp_count = 0usize;
                         for (socket_addr, is_blp) in &resolved {
                             pm_w.add_ledger_peer(*socket_addr);
@@ -5340,6 +5435,16 @@ impl Node {
                                     if lifecycle.has_connection(addr)
                                         || in_flight_connects.contains(addr)
                                     {
+                                        // #880: the connect is skipped, so no
+                                        // connect_result will ever fire for this
+                                        // peer — release the governor's in-flight
+                                        // marker now. Otherwise in_progress_promote_cold
+                                        // leaks the addr and the governor
+                                        // permanently excludes it from future
+                                        // cold->warm promotion. (Harmless if the
+                                        // pending connect later completes: the
+                                        // second clear is a no-op.)
+                                        governor.promotion_cold_completed(addr);
                                         continue;
                                     }
                                     // Look up the per-peer initiator_only flag computed
@@ -5462,18 +5567,42 @@ impl Node {
                 // starts server protocol tasks on the duplex channels.
                 Some(result) = inbound_accept_rx.recv() => {
                     match result {
-                        Ok((addr, conn, rtt_ms)) => {
+                        Ok((addr, mut conn, rtt_ms)) => {
+                            // #865: enforce a hard cap on ESTABLISHED inbound
+                            // connections, not merely concurrent handshakes. The
+                            // accept semaphore/ConnectionManager slot are freed the
+                            // instant the handshake completes, so a botnet that
+                            // completes handshakes could otherwise hold unbounded
+                            // live inbound connections and exhaust memory/FDs. The
+                            // cap is the same `accepted_connections_limit.hard_limit`
+                            // the handshake window uses. Computed before the
+                            // `self.connection_lifecycle` mutable borrow below.
+                            let inbound_cap = self
+                                .config
+                                .accepted_connections_limit
+                                .unwrap_or_default()
+                                .hard_limit as usize;
                             if let Some(ref mut lifecycle) = self.connection_lifecycle {
-                                let mut pm = peer_manager.write().await;
-                                match lifecycle.register_inbound_connection(addr, conn, rtt_ms, &mut pm).await {
-                                    Ok(()) => {
-                                        info!(%addr, rtt_ms = format_args!("{rtt_ms:.0}"), "inbound connection registered");
-                                        // Update all peer metrics (including n2n_connections_active)
-                                        // via the derived-read helper rather than a bare fetch_add.
-                                        self.update_peer_metrics(&pm);
-                                    }
-                                    Err(e) => {
-                                        warn!(%addr, "inbound registration failed: {e}");
+                                if lifecycle.inbound_connection_count() >= inbound_cap {
+                                    warn!(
+                                        %addr,
+                                        max = inbound_cap,
+                                        established = lifecycle.inbound_connection_count(),
+                                        "established inbound connection cap reached — rejecting"
+                                    );
+                                    conn.shutdown().await;
+                                } else {
+                                    let mut pm = peer_manager.write().await;
+                                    match lifecycle.register_inbound_connection(addr, conn, rtt_ms, &mut pm).await {
+                                        Ok(()) => {
+                                            info!(%addr, rtt_ms = format_args!("{rtt_ms:.0}"), "inbound connection registered");
+                                            // Update all peer metrics (including n2n_connections_active)
+                                            // via the derived-read helper rather than a bare fetch_add.
+                                            self.update_peer_metrics(&pm);
+                                        }
+                                        Err(e) => {
+                                            warn!(%addr, "inbound registration failed: {e}");
+                                        }
                                     }
                                 }
                             }
@@ -7880,6 +8009,14 @@ impl Node {
         // periodic `update_state()` write lock until the client disconnected.
         // Instead, use a per-query wrapper that acquires and releases the read lock
         // inside each dispatch method — the lock is never held across an .await point.
+        //
+        // Issue #867: `acquire()` additionally pins the CURRENT `Arc<NodeStateSnapshot>`
+        // at MsgAcquire time (a single cheap Arc clone under a momentary
+        // `blocking_read()` — the guard is dropped immediately after, preserving the
+        // C3 invariant). Every MsgQuery within that acquisition then dispatches
+        // against the pinned Arc directly (no lock at all), so multiple queries in
+        // one acquisition see a consistent ledger-state view even if `update_state()`
+        // swaps the live snapshot mid-session.
         let lsq_handler = query_handler;
         let lsq_task = tokio::spawn(async move {
             // Per-query read-lock wrapper: acquires a blocking_read() guard for each
@@ -7887,38 +8024,68 @@ impl Node {
             // update_state() can always acquire its write lock between queries.
             struct PerQueryHandler(Arc<RwLock<QueryHandler>>);
             impl dugite_network::QueryHandler for PerQueryHandler {
+                /// Pinned ledger-state snapshot for a single acquisition (#867).
+                type Acquired = Arc<n2c_query::types::NodeStateSnapshot>;
+
+                fn acquire(
+                    &self,
+                    target: &dugite_network::protocol::local_state_query::AcquireTarget,
+                ) -> Result<
+                    Self::Acquired,
+                    dugite_network::protocol::local_state_query::AcquireFailure,
+                > {
+                    // Momentary read guard: run the existing on-chain validation,
+                    // then Arc-clone the current state and drop the guard. No lock
+                    // is held once this call returns — the returned Arc is then used
+                    // for every MsgQuery in this acquisition, lock-free.
+                    let guard = tokio::task::block_in_place(|| self.0.blocking_read());
+                    dugite_network::QueryHandler::acquire(&*guard, target)
+                }
                 fn handle_query(
                     &self,
+                    acquired: &Self::Acquired,
                     query_cbor: &[u8],
                     n2c_version: u16,
                 ) -> Result<Vec<u8>, String> {
                     // Acquire read guard for this single query dispatch, then release.
                     let guard = tokio::task::block_in_place(|| self.0.blocking_read());
-                    guard.handle_query(query_cbor, n2c_version)
+                    dugite_network::QueryHandler::handle_query(
+                        &*guard,
+                        acquired,
+                        query_cbor,
+                        n2c_version,
+                    )
                 }
                 fn handle_block_query(
                     &self,
+                    acquired: &Self::Acquired,
                     tag: u64,
                     query_cbor: &[u8],
                 ) -> Result<Vec<u8>, String> {
                     let guard = tokio::task::block_in_place(|| self.0.blocking_read());
-                    guard.handle_block_query(tag, query_cbor)
+                    dugite_network::QueryHandler::handle_block_query(
+                        &*guard, acquired, tag, query_cbor,
+                    )
                 }
-                fn handle_query_anytime(&self, query_cbor: &[u8]) -> Result<Vec<u8>, String> {
-                    let guard = tokio::task::block_in_place(|| self.0.blocking_read());
-                    guard.handle_query_anytime(query_cbor)
-                }
-                fn handle_query_hard_fork(&self, query_cbor: &[u8]) -> Result<Vec<u8>, String> {
-                    let guard = tokio::task::block_in_place(|| self.0.blocking_read());
-                    guard.handle_query_hard_fork(query_cbor)
-                }
-                fn validate_acquire(
+                fn handle_query_anytime(
                     &self,
-                    target: &dugite_network::protocol::local_state_query::AcquireTarget,
-                ) -> Result<(), dugite_network::protocol::local_state_query::AcquireFailure>
-                {
+                    acquired: &Self::Acquired,
+                    query_cbor: &[u8],
+                ) -> Result<Vec<u8>, String> {
                     let guard = tokio::task::block_in_place(|| self.0.blocking_read());
-                    guard.validate_acquire(target)
+                    dugite_network::QueryHandler::handle_query_anytime(
+                        &*guard, acquired, query_cbor,
+                    )
+                }
+                fn handle_query_hard_fork(
+                    &self,
+                    acquired: &Self::Acquired,
+                    query_cbor: &[u8],
+                ) -> Result<Vec<u8>, String> {
+                    let guard = tokio::task::block_in_place(|| self.0.blocking_read());
+                    dugite_network::QueryHandler::handle_query_hard_fork(
+                        &*guard, acquired, query_cbor,
+                    )
                 }
             }
             let wrapper = PerQueryHandler(lsq_handler);

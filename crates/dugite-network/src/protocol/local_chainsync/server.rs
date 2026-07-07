@@ -3,16 +3,30 @@
 //! Uses the same ChainSync message wire format (tags 0-7) but wraps block data
 //! in `Serialised` encoding: `tag(24)(bytes(block_cbor))` (CBOR-in-CBOR).
 //! This matches the Haskell `SerialiseNodeToClient` encoding for `Serialised blk`.
+//!
+//! Delegates all protocol logic to the shared `ServeCore` (issue #881) —
+//! see `crate::protocol::chainsync::serve_core` for the state machine.  This
+//! server differs from N2N `ChainSyncServer` in exactly one respect: the
+//! `MsgRollForward` payload is the full `Serialised`-wrapped block
+//! ([`wrap_serialised`]) rather than an HFC-wrapped header.  Before this
+//! extraction the two servers had drifted — this server was missing the
+//! duplicate-serve dedup, the `biased` rollback-first `select!` ordering,
+//! the `StMustReply` retry loop (#869), `cursor_at_origin` genesis-EBB
+//! handling, and lagged-rollback safety (Bug J) that N2N already had (#868).
+
+use std::time::Duration;
 
 use minicbor::Encoder;
 use tokio::sync::broadcast;
 
-use crate::codec::Point;
 use crate::error::ProtocolError;
 use crate::mux::channel::MuxChannel;
+use crate::protocol::chainsync::serve_core::ServeCore;
 use crate::protocol::chainsync::server::{BlockAnnouncement, RollbackAnnouncement};
-use crate::protocol::chainsync::{decode_message, encode_message, ChainSyncMessage};
 use crate::BlockProvider;
+
+#[cfg(test)]
+use crate::codec::Point;
 
 /// Wrap raw block CBOR in `Serialised` encoding: `tag(24)(bytes(block_cbor))`.
 ///
@@ -27,24 +41,54 @@ fn wrap_serialised(block_cbor: &[u8]) -> Vec<u8> {
     buf
 }
 
+/// Encode the `MsgRollForward` payload for N2C LocalChainSync: wrap the full
+/// block CBOR in `Serialised` encoding.  Infallible — no parsing required —
+/// matching the `PayloadEncoder` signature used by the shared serve core.
+fn n2c_payload_encoder(block_cbor: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    Ok(wrap_serialised(block_cbor))
+}
+
 /// LocalChainSync server that serves full blocks to N2C clients.
 ///
-/// Reuses the ChainSync message codec but wraps block bodies in HFC era encoding
-/// instead of sending just headers.
+/// A thin wrapper around the shared `ServeCore` (issue #881) — all protocol
+/// logic (cursor tracking, `MsgFindIntersect`/`MsgRequestNext` handling,
+/// rollback propagation, `StMustReply` retry loop) lives in the shared core.
+/// This type only supplies the N2C-specific payload encoder
+/// ([`n2c_payload_encoder`]: full `Serialised`-wrapped block, not just the
+/// header) and the `"LocalChainSync"` protocol label.
 pub struct LocalChainSyncServer {
-    /// Current cursor: last slot served to this client.
-    cursor_slot: u64,
-    /// Current cursor: last hash served to this client.
-    cursor_hash: [u8; 32],
+    core: ServeCore,
 }
 
 impl LocalChainSyncServer {
     /// Create a new server with no cursor.
+    ///
+    /// Draws a per-connection `StMustReply` timeout uniformly at random in
+    /// `[601 s, 911 s]`, matching N2N ChainSync and Haskell's
+    /// `ouroboros-network` ChainSync codec timeout policy.
     pub fn new() -> Self {
         Self {
-            cursor_slot: 0,
-            cursor_hash: [0; 32],
+            core: ServeCore::new(n2c_payload_encoder, "LocalChainSync"),
         }
+    }
+
+    /// Test/explicit-timeout constructor.  Production code should call
+    /// [`Self::new`] to get the random per-connection draw; tests use this to
+    /// pin the timeout to a known small value.
+    #[doc(hidden)]
+    pub fn new_with_timeout(must_reply_timeout: Duration) -> Self {
+        Self {
+            core: ServeCore::new_with_timeout(
+                must_reply_timeout,
+                n2c_payload_encoder,
+                "LocalChainSync",
+            ),
+        }
+    }
+
+    /// Configured `StMustReply` timeout (exposed for diagnostics / tests).
+    pub fn must_reply_timeout(&self) -> Duration {
+        self.core.must_reply_timeout()
     }
 
     /// Run the LocalChainSync server loop.
@@ -55,274 +99,20 @@ impl LocalChainSyncServer {
         &mut self,
         channel: &mut MuxChannel,
         block_provider: &B,
-        mut announcement_rx: broadcast::Receiver<BlockAnnouncement>,
-        mut rollback_rx: broadcast::Receiver<RollbackAnnouncement>,
+        announcement_rx: broadcast::Receiver<BlockAnnouncement>,
+        rollback_rx: broadcast::Receiver<RollbackAnnouncement>,
     ) -> Result<(), ProtocolError> {
-        loop {
-            let msg_bytes = channel.recv().await.map_err(ProtocolError::from)?;
-            let msg = decode_message(&msg_bytes).map_err(|e| ProtocolError::CborDecode {
-                protocol: "LocalChainSync",
-                reason: e,
-            })?;
-
-            match msg {
-                ChainSyncMessage::MsgFindIntersect(points) => {
-                    self.handle_find_intersect(channel, block_provider, &points)
-                        .await?;
-                }
-                ChainSyncMessage::MsgRequestNext => {
-                    self.handle_request_next(
-                        channel,
-                        block_provider,
-                        &mut announcement_rx,
-                        &mut rollback_rx,
-                    )
-                    .await?;
-                }
-                ChainSyncMessage::MsgDone => {
-                    tracing::debug!("local chainsync server: client sent MsgDone");
-                    return Ok(());
-                }
-                other => {
-                    return Err(ProtocolError::AgencyViolation {
-                        protocol: "LocalChainSync",
-                        state: "StIdle".to_string(),
-                        received_tag: format!("{other:?}")
-                            .as_bytes()
-                            .first()
-                            .copied()
-                            .unwrap_or(0),
-                    });
-                }
-            }
-        }
-    }
-
-    /// Handle MsgFindIntersect — identical to N2N ChainSync.
-    async fn handle_find_intersect<B: BlockProvider>(
-        &mut self,
-        channel: &mut MuxChannel,
-        block_provider: &B,
-        points: &[Point],
-    ) -> Result<(), ProtocolError> {
-        let tip = block_provider.get_tip();
-
-        for point in points {
-            match point {
-                Point::Origin => {
-                    self.cursor_slot = 0;
-                    self.cursor_hash = [0; 32];
-                    let response = encode_message(&ChainSyncMessage::MsgIntersectFound {
-                        point: Point::Origin,
-                        tip_slot: tip.slot,
-                        tip_hash: tip.hash,
-                        tip_block_number: tip.block_number,
-                    });
-                    channel.send(response).await.map_err(ProtocolError::from)?;
-                    return Ok(());
-                }
-                Point::Specific(slot, hash) => {
-                    if block_provider.has_block(hash) {
-                        self.cursor_slot = *slot;
-                        self.cursor_hash = *hash;
-                        let response = encode_message(&ChainSyncMessage::MsgIntersectFound {
-                            point: point.clone(),
-                            tip_slot: tip.slot,
-                            tip_hash: tip.hash,
-                            tip_block_number: tip.block_number,
-                        });
-                        channel.send(response).await.map_err(ProtocolError::from)?;
-                        return Ok(());
-                    }
-                }
-            }
-        }
-
-        let response = encode_message(&ChainSyncMessage::MsgIntersectNotFound {
-            tip_slot: tip.slot,
-            tip_hash: tip.hash,
-            tip_block_number: tip.block_number,
-        });
-        channel.send(response).await.map_err(ProtocolError::from)?;
-        Ok(())
-    }
-
-    /// Handle MsgRequestNext — sends full blocks (not headers) with HFC wrapping,
-    /// or sends MsgRollBackward if a rollback has occurred.
-    async fn handle_request_next<B: BlockProvider>(
-        &mut self,
-        channel: &mut MuxChannel,
-        block_provider: &B,
-        announcement_rx: &mut broadcast::Receiver<BlockAnnouncement>,
-        rollback_rx: &mut broadcast::Receiver<RollbackAnnouncement>,
-    ) -> Result<(), ProtocolError> {
-        // ── Check for pending rollbacks before serving ──────────────────────
-        if let Some(rb) = Self::drain_rollback(rollback_rx) {
-            if self.cursor_slot > rb.slot
-                || (self.cursor_slot == rb.slot && self.cursor_hash != rb.hash)
-            {
-                return self.send_rollback(channel, block_provider, &rb).await;
-            }
-        }
-
-        // Advance by POINT, not by slot: a Byron EBB shares its absolute
-        // slot with the first main block of the epoch, and a slot-only
-        // advance from the EBB would skip that main block.  For the origin
-        // cursor (all-zero hash, not a stored block) the point lookup falls
-        // back to the slot-based behavior.
-        if let Some((slot, hash, block_cbor)) =
-            block_provider.get_next_block_after_point(self.cursor_slot, &self.cursor_hash)
-        {
-            let tip = block_provider.get_tip();
-
-            // N2C sends full blocks wrapped in Serialised encoding: tag(24)(bytes(block_cbor)).
-            let response = encode_message(&ChainSyncMessage::MsgRollForward {
-                header: wrap_serialised(&block_cbor),
-                tip_slot: tip.slot,
-                tip_hash: tip.hash,
-                tip_block_number: tip.block_number,
-            });
-            channel.send(response).await.map_err(ProtocolError::from)?;
-            self.cursor_slot = slot;
-            self.cursor_hash = hash;
-            return Ok(());
-        }
-
-        // At tip — wait for announcement or rollback.
-        let await_msg = encode_message(&ChainSyncMessage::MsgAwaitReply);
-        channel.send(await_msg).await.map_err(ProtocolError::from)?;
-
-        tokio::select! {
-            // ── Rollback while waiting at tip ───────────────────────────────
-            rollback = rollback_rx.recv() => {
-                match rollback {
-                    Ok(rb) => {
-                        if self.cursor_slot > rb.slot
-                            || (self.cursor_slot == rb.slot && self.cursor_hash != rb.hash)
-                        {
-                            self.send_rollback(channel, block_provider, &rb).await
-                        } else {
-                            // Cursor behind rollback — serve next block from new fork.
-                            if let Some((slot, hash, block_cbor)) = block_provider
-                                .get_next_block_after_point(self.cursor_slot, &self.cursor_hash)
-                            {
-                                let tip = block_provider.get_tip();
-                                let response = encode_message(&ChainSyncMessage::MsgRollForward {
-                                    header: wrap_serialised(&block_cbor),
-                                    tip_slot: tip.slot,
-                                    tip_hash: tip.hash,
-                                    tip_block_number: tip.block_number,
-                                });
-                                channel.send(response).await.map_err(ProtocolError::from)?;
-                                self.cursor_slot = slot;
-                                self.cursor_hash = hash;
-                            }
-                            Ok(())
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let tip = block_provider.get_tip();
-                        let rb = RollbackAnnouncement {
-                            slot: tip.slot,
-                            hash: tip.hash,
-                        };
-                        self.send_rollback(channel, block_provider, &rb).await
-                    }
-                    Err(broadcast::error::RecvError::Closed) => Ok(()),
-                }
-            }
-            announcement = announcement_rx.recv() => {
-                match announcement {
-                    Ok(ann) => {
-                        if let Some(block_cbor) = block_provider.get_block(&ann.hash) {
-                            let tip = block_provider.get_tip();
-                            let response = encode_message(&ChainSyncMessage::MsgRollForward {
-                                header: wrap_serialised(&block_cbor),
-                                tip_slot: tip.slot,
-                                tip_hash: tip.hash,
-                                tip_block_number: tip.block_number,
-                            });
-                            channel.send(response).await.map_err(ProtocolError::from)?;
-                            self.cursor_slot = ann.slot;
-                            self.cursor_hash = ann.hash;
-                        }
-                        Ok(())
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        // Try to catch up from current position.
-                        if let Some((slot, hash, block_cbor)) = block_provider
-                            .get_next_block_after_point(self.cursor_slot, &self.cursor_hash)
-                        {
-                            let tip = block_provider.get_tip();
-                            let response = encode_message(&ChainSyncMessage::MsgRollForward {
-                                header: wrap_serialised(&block_cbor),
-                                tip_slot: tip.slot,
-                                tip_hash: tip.hash,
-                                tip_block_number: tip.block_number,
-                            });
-                            channel.send(response).await.map_err(ProtocolError::from)?;
-                            self.cursor_slot = slot;
-                            self.cursor_hash = hash;
-                        }
-                        Ok(())
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        // Node shutting down.
-                        Ok(())
-                    }
-                }
-            }
-        }
+        self.core
+            .run(channel, block_provider, announcement_rx, rollback_rx)
+            .await
     }
 
     /// Drain any pending rollback announcements, returning the most recent one.
-    fn drain_rollback(
+    #[doc(hidden)]
+    pub fn drain_rollback(
         rollback_rx: &mut broadcast::Receiver<RollbackAnnouncement>,
     ) -> Option<RollbackAnnouncement> {
-        let mut latest: Option<RollbackAnnouncement> = None;
-        loop {
-            match rollback_rx.try_recv() {
-                Ok(rb) => latest = Some(rb),
-                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
-                Err(_) => break,
-            }
-        }
-        latest
-    }
-
-    /// Send `MsgRollBackward` to the N2C client and rewind the cursor.
-    async fn send_rollback<B: BlockProvider>(
-        &mut self,
-        channel: &mut MuxChannel,
-        block_provider: &B,
-        rb: &RollbackAnnouncement,
-    ) -> Result<(), ProtocolError> {
-        let tip = block_provider.get_tip();
-        let point = if rb.slot == 0 && rb.hash == [0u8; 32] {
-            Point::Origin
-        } else {
-            Point::Specific(rb.slot, rb.hash)
-        };
-
-        tracing::info!(
-            rollback_slot = rb.slot,
-            cursor_slot = self.cursor_slot,
-            "local chainsync server: sending MsgRollBackward to N2C client"
-        );
-
-        let response = encode_message(&ChainSyncMessage::MsgRollBackward {
-            point,
-            tip_slot: tip.slot,
-            tip_hash: tip.hash,
-            tip_block_number: tip.block_number,
-        });
-        channel.send(response).await.map_err(ProtocolError::from)?;
-
-        // Rewind cursor to the rollback point.
-        self.cursor_slot = rb.slot;
-        self.cursor_hash = rb.hash;
-
-        Ok(())
+        ServeCore::drain_rollback(rollback_rx)
     }
 }
 
@@ -335,6 +125,9 @@ impl Default for LocalChainSyncServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::chainsync::serve_core::test_support::{
+        ForkAwareMockProvider, MockBlockProvider, MutableMockBlockProvider,
+    };
     use crate::protocol::chainsync::server::{BlockAnnouncement, RollbackAnnouncement};
     use crate::protocol::chainsync::{decode_message, encode_message, ChainSyncMessage};
     use crate::TipInfo;
@@ -359,49 +152,10 @@ mod tests {
         buf
     }
 
-    /// Mock block provider for LocalChainSync tests.
-    ///
-    /// Stores (slot, hash, block_cbor) tuples. The CBOR is raw block bytes —
-    /// LocalChainSync passes them through without header extraction (unlike N2N
-    /// ChainSync which extracts headers).
-    struct MockBlockProvider {
-        blocks: Vec<(u64, [u8; 32], Vec<u8>)>,
-    }
-
-    impl BlockProvider for MockBlockProvider {
-        fn get_block(&self, hash: &[u8; 32]) -> Option<Vec<u8>> {
-            self.blocks
-                .iter()
-                .find(|(_, h, _)| h == hash)
-                .map(|(_, _, cbor)| cbor.clone())
-        }
-
-        fn has_block(&self, hash: &[u8; 32]) -> bool {
-            self.blocks.iter().any(|(_, h, _)| h == hash)
-        }
-
-        fn get_tip(&self) -> TipInfo {
-            self.blocks
-                .last()
-                .map(|(s, h, _)| TipInfo {
-                    slot: *s,
-                    hash: *h,
-                    block_number: self.blocks.len() as u64,
-                })
-                .unwrap_or(TipInfo {
-                    slot: 0,
-                    hash: [0; 32],
-                    block_number: 0,
-                })
-        }
-
-        fn get_next_block_after_slot(&self, after_slot: u64) -> Option<(u64, [u8; 32], Vec<u8>)> {
-            self.blocks
-                .iter()
-                .find(|(s, _, _)| *s > after_slot)
-                .cloned()
-        }
-    }
+    // `MockBlockProvider` (flat, no-fork block store) is shared with the N2N
+    // ChainSync test suite via `serve_core::test_support` (issue #881) — both
+    // wirings exercise the exact same `BlockProvider` semantics against the
+    // shared `ServeCore`.
 
     /// Create a test MuxChannel with egress receiver and ingress sender.
     fn make_test_channel() -> (
@@ -889,7 +643,18 @@ mod tests {
             "expected MsgAwaitReply at tip, got {msg:?}"
         );
 
-        // Send announcement to unblock the server.
+        // Fire a SPURIOUS announcement — the provider does not actually have
+        // this block, so `try_serve_next_block` finds nothing to serve.
+        //
+        // #869 fix: this must NOT cause the server to return without a
+        // reply.  Per the Ouroboros ChainSync state machine, the client is
+        // in StMustReply and will never send another MsgRequestNext, so a
+        // silent return would wedge the connection.  Before the shared-core
+        // extraction, N2C's `select!` was NOT looped and returned
+        // immediately here — this test used to rely on that bug to
+        // terminate; now it asserts the fixed behaviour (no reply, no
+        // early return) and aborts the task to clean up rather than
+        // waiting on a `handle.await` that would never resolve.
         ann_tx
             .send(BlockAnnouncement {
                 slot: 20,
@@ -898,10 +663,14 @@ mod tests {
             })
             .unwrap();
 
-        // The server won't be able to serve the block (provider doesn't have it),
-        // but the select loop will complete. Drop channels to clean up.
-        drop(ingress_tx);
-        let _ = handle.await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), egress_rx.recv())
+                .await
+                .is_err(),
+            "server must not send anything on a spurious wake with nothing new to serve"
+        );
+
+        handle.abort();
     }
 
     #[tokio::test]
@@ -1238,7 +1007,252 @@ mod tests {
     #[test]
     fn default_creates_zero_cursor() {
         let server = LocalChainSyncServer::default();
-        assert_eq!(server.cursor_slot, 0);
-        assert_eq!(server.cursor_hash, [0; 32]);
+        assert_eq!(server.core.cursor_slot, 0);
+        assert_eq!(server.core.cursor_hash, [0; 32]);
+    }
+
+    // ─── #868: N2C now exercises the shared ServeCore — parity with N2N ──────
+    //
+    // Before the shared-core extraction (#881), `LocalChainSyncServer` had its
+    // own hand-rolled `handle_request_next` that was missing several fixes
+    // already present in N2N `ChainSyncServer`: cursor revalidation after a
+    // fork switch (Bug J), `cursor_at_origin` genesis-EBB handling, and the
+    // `StMustReply` retry loop (#869) / timeout arm.  These tests drive the
+    // N2C wiring through the same scenarios as the N2N test suite in
+    // `chainsync::server` and assert identical protocol-level behaviour.
+
+    /// #868 parity with N2N's `fork_switch_to_lower_slot_chain_sends_rollback_then_serves_new_blocks`
+    /// (Bug J): after a fork switch displaces the follower cursor's block,
+    /// the server must send `MsgRollBackward` to the most recent on-chain
+    /// ancestor, then deliver the new chain's blocks in slot order —
+    /// including blocks at slots at or below the old cursor slot.
+    #[tokio::test]
+    async fn fork_switch_sends_rollback_then_serves_new_blocks() {
+        let provider = ForkAwareMockProvider::new();
+        let genesis = [0u8; 32];
+        let a_hash = [0x0A; 32];
+        let b_hash = [0x0B; 32];
+        let c_hash = [0x0C; 32];
+        let d_hash = [0x0D; 32];
+
+        // Original chain: A@10 → B@20 → C@30 → D@40.
+        provider.push_on_chain(10, a_hash, genesis, 1, make_block_cbor(&[0xA1]));
+        provider.push_on_chain(20, b_hash, a_hash, 2, make_block_cbor(&[0xB1]));
+        provider.push_on_chain(30, c_hash, b_hash, 3, make_block_cbor(&[0xC1]));
+        provider.push_on_chain(40, d_hash, c_hash, 4, make_block_cbor(&[0xD1]));
+
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let (ann_tx, _) = broadcast::channel::<BlockAnnouncement>(16);
+        let (rb_tx, _) = broadcast::channel::<RollbackAnnouncement>(16);
+        let ann_rx = ann_tx.subscribe();
+        let rb_rx = rb_tx.subscribe();
+
+        let mut server = LocalChainSyncServer::new();
+        let handle = {
+            let provider_handle = ForkAwareMockProvider {
+                chain: provider.chain.clone(),
+                store: provider.store.clone(),
+            };
+            tokio::spawn(async move {
+                server
+                    .run(&mut channel, &provider_handle, ann_rx, rb_rx)
+                    .await
+            })
+        };
+
+        // Intersect at origin and serve A, B, C, D.
+        send_msg(
+            &ingress_tx,
+            &ChainSyncMessage::MsgFindIntersect(vec![Point::Origin]),
+        )
+        .await;
+        let _ = recv_msg(&mut egress_rx).await;
+
+        for _ in 0..4 {
+            let msg = recv_msg_after(&ingress_tx, &mut egress_rx).await;
+            assert!(matches!(msg, ChainSyncMessage::MsgRollForward { .. }));
+        }
+        // Cursor now at D@40.
+
+        // Fork switch: A → X@15 → Y@25 → Z@35 → W@50 — intermediate blocks
+        // sit at slots BELOW the cursor (40).
+        let x_hash = [0x1A; 32];
+        let y_hash = [0x2A; 32];
+        let z_hash = [0x3A; 32];
+        let w_hash = [0x4A; 32];
+        provider.put_fork(15, x_hash, a_hash, 2, make_block_cbor(&[0xAA]));
+        provider.put_fork(25, y_hash, x_hash, 3, make_block_cbor(&[0xBB]));
+        provider.put_fork(35, z_hash, y_hash, 4, make_block_cbor(&[0xCC]));
+        provider.put_fork(50, w_hash, z_hash, 5, make_block_cbor(&[0xDD]));
+        provider.replace_chain(vec![a_hash, x_hash, y_hash, z_hash, w_hash]);
+
+        ann_tx
+            .send(BlockAnnouncement {
+                slot: 50,
+                hash: w_hash,
+                block_number: 5,
+            })
+            .unwrap();
+
+        let msg = recv_msg_after(&ingress_tx, &mut egress_rx).await;
+        match msg {
+            ChainSyncMessage::MsgRollBackward { point, .. } => {
+                assert_eq!(
+                    point,
+                    Point::Specific(10, a_hash),
+                    "must rewind to most recent on-chain ancestor"
+                );
+            }
+            other => panic!("expected MsgRollBackward to A@10, got {other:?}"),
+        }
+
+        // The entire new chain past A must be delivered, in order, including
+        // slots BELOW the old cursor (40).
+        for _ in 0..4 {
+            let msg = recv_msg_after(&ingress_tx, &mut egress_rx).await;
+            match msg {
+                ChainSyncMessage::MsgRollForward { tip_slot, .. } => {
+                    assert_eq!(tip_slot, 50);
+                }
+                other => panic!("expected MsgRollForward on new chain, got {other:?}"),
+            }
+        }
+
+        send_msg(&ingress_tx, &ChainSyncMessage::MsgDone).await;
+        handle.await.unwrap().unwrap();
+    }
+
+    /// #868 parity: a block sitting exactly at slot 0 (e.g. a Byron genesis
+    /// EBB) must be served when intersecting at Origin.  Before the
+    /// shared-core extraction, N2C never tracked `cursor_at_origin` and used
+    /// a strict point-cursor lookup that silently skipped a slot-0 block.
+    #[tokio::test]
+    async fn genesis_block_at_slot_zero_served_from_origin() {
+        let (channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let (ann_tx, _) = broadcast::channel(16);
+        let (rb_tx, _) = broadcast::channel(16);
+
+        let ebb_cbor = make_block_cbor(&[0xEB]);
+        let provider = MockBlockProvider {
+            blocks: vec![
+                (0, [0xEB; 32], ebb_cbor.clone()),
+                (1, [0x01; 32], make_block_cbor(&[0x01])),
+            ],
+        };
+
+        let handle = spawn_server(channel, provider, ann_tx.subscribe(), rb_tx.subscribe());
+
+        send_msg(
+            &ingress_tx,
+            &ChainSyncMessage::MsgFindIntersect(vec![Point::Origin]),
+        )
+        .await;
+        let _ = recv_msg(&mut egress_rx).await; // MsgIntersectFound
+
+        // First MsgRequestNext must serve the slot-0 block, not skip it.
+        send_msg(&ingress_tx, &ChainSyncMessage::MsgRequestNext).await;
+        let msg = recv_msg(&mut egress_rx).await;
+        match msg {
+            ChainSyncMessage::MsgRollForward { header, .. } => {
+                assert_eq!(
+                    header,
+                    wrap_serialised(&ebb_cbor),
+                    "genesis block at slot 0 must be served, not skipped"
+                );
+            }
+            other => panic!("expected MsgRollForward for slot-0 block, got {other:?}"),
+        }
+
+        // Second request must advance past slot 0 to slot 1 (cursor_at_origin
+        // must have been cleared — otherwise the slot-0 block is re-served).
+        send_msg(&ingress_tx, &ChainSyncMessage::MsgRequestNext).await;
+        let msg = recv_msg(&mut egress_rx).await;
+        match msg {
+            ChainSyncMessage::MsgRollForward { tip_slot, .. } => {
+                assert_eq!(
+                    tip_slot, 1,
+                    "must advance past the slot-0 block, not re-serve it"
+                );
+            }
+            other => panic!("expected MsgRollForward for slot 1, got {other:?}"),
+        }
+
+        send_msg(&ingress_tx, &ChainSyncMessage::MsgDone).await;
+        handle.await.unwrap().unwrap();
+    }
+
+    /// #868 parity with N2N's `spurious_announcement_wake_does_not_return_agency_without_reply`
+    /// (#869): once `MsgAwaitReply` has been sent, a spurious wake with
+    /// nothing new to serve must not cause the server to return without a
+    /// reply — and the periodic `StMustReply` timeout re-poll (which N2C
+    /// never had before the shared-core extraction) must eventually deliver
+    /// a block that arrives after the timeout has already fired once.
+    #[tokio::test]
+    async fn idle_timeout_repolls_and_eventually_serves() {
+        let block_a = make_block_cbor(&[0x0A]);
+        let provider = MutableMockBlockProvider::new(vec![(10, [0x01; 32], block_a)]);
+        let blocks_ref = provider.blocks.clone();
+
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let (ann_tx, _) = broadcast::channel::<BlockAnnouncement>(16);
+        let (rb_tx, _) = broadcast::channel::<RollbackAnnouncement>(16);
+        let ann_rx = ann_tx.subscribe();
+        let rb_rx = rb_tx.subscribe();
+
+        // Pin a short StMustReply timeout so the timeout arm fires quickly.
+        let mut server = LocalChainSyncServer::new_with_timeout(Duration::from_millis(100));
+        let handle =
+            tokio::spawn(async move { server.run(&mut channel, &provider, ann_rx, rb_rx).await });
+
+        send_msg(
+            &ingress_tx,
+            &ChainSyncMessage::MsgFindIntersect(vec![Point::Origin]),
+        )
+        .await;
+        let _ = recv_msg(&mut egress_rx).await;
+
+        send_msg(&ingress_tx, &ChainSyncMessage::MsgRequestNext).await;
+        let msg = recv_msg(&mut egress_rx).await;
+        assert!(matches!(msg, ChainSyncMessage::MsgRollForward { .. }));
+
+        // At tip — enters StMustReply.
+        send_msg(&ingress_tx, &ChainSyncMessage::MsgRequestNext).await;
+        let msg = recv_msg(&mut egress_rx).await;
+        assert!(matches!(msg, ChainSyncMessage::MsgAwaitReply));
+
+        // Nothing new yet — let the 100ms timeout fire at least once with
+        // nothing to serve.  The server must keep waiting (not wedge, not
+        // return early) rather than requiring a second MsgRequestNext.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            egress_rx.try_recv().is_err(),
+            "server must not send anything while there is still nothing new to serve"
+        );
+
+        // Now push a genuine block — no announcement this time, proving the
+        // timeout re-poll (not just the announcement wake) picks it up.
+        let block_b = make_block_cbor(&[0x0B]);
+        blocks_ref.lock().unwrap().push((20, [0x02; 32], block_b));
+
+        let (_, _, resp) = tokio::time::timeout(Duration::from_secs(5), egress_rx.recv())
+            .await
+            .expect("server must eventually reply once a real block is available")
+            .unwrap();
+        assert!(matches!(
+            decode_message(&resp).unwrap(),
+            ChainSyncMessage::MsgRollForward { .. }
+        ));
+
+        handle.abort();
+    }
+
+    /// Helper: send `MsgRequestNext` and receive the next reply.  Used by the
+    /// fork-switch parity test where the same request/response idiom repeats.
+    async fn recv_msg_after(
+        ingress_tx: &mpsc::Sender<Bytes>,
+        egress_rx: &mut mpsc::Receiver<(u16, crate::mux::Direction, Bytes)>,
+    ) -> ChainSyncMessage {
+        send_msg(ingress_tx, &ChainSyncMessage::MsgRequestNext).await;
+        recv_msg(egress_rx).await
     }
 }

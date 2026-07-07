@@ -123,6 +123,17 @@ impl LocalTxMonitorServer {
                     channel.send(buf).await.map_err(ProtocolError::from)?;
                 }
                 TAG_RELEASE => {
+                    // #880: MsgRelease has client agency only in StAcquired.
+                    // Reject it from StIdle (no snapshot held) with a
+                    // StateViolation, mirroring the strict MsgNextTx handling —
+                    // Haskell only permits MsgRelease from StAcquired.
+                    if snapshot.is_none() {
+                        return Err(ProtocolError::StateViolation {
+                            protocol: "LocalTxMonitor",
+                            expected: "StAcquired".to_string(),
+                            actual: "StIdle (no snapshot)".to_string(),
+                        });
+                    }
                     // Release the snapshot, return to StIdle
                     snapshot = None;
                 }
@@ -140,17 +151,35 @@ impl LocalTxMonitorServer {
                         let tx_hash = &snap.tx_hashes[snap.next_tx_index];
                         snap.next_tx_index += 1;
 
-                        // Try to get the tx CBOR from mempool
+                        // Try to get the tx CBOR + era from mempool.
                         let tx_hash_obj = dugite_primitives::Hash::from_bytes(*tx_hash);
-                        if let Some(tx_cbor) = mempool.get_tx_cbor(&tx_hash_obj) {
-                            // MsgReplyNextTx with tx = [6, [era_id, tx_bytes]]
-                            enc.array(2).expect("infallible");
-                            enc.u64(TAG_REPLY_NEXT_TX).expect("infallible");
-                            enc.bytes(&tx_cbor).expect("infallible");
-                        } else {
-                            // Tx was removed from mempool since snapshot — skip
-                            enc.array(1).expect("infallible");
-                            enc.u64(TAG_REPLY_NEXT_TX).expect("infallible");
+                        match (
+                            mempool.get_tx_cbor(&tx_hash_obj),
+                            mempool.get_tx(&tx_hash_obj),
+                        ) {
+                            (Some(tx_cbor), Some(tx)) => {
+                                // #874: MsgReplyNextTx present = [6, <GenTx>] where
+                                // <GenTx> is the era-tagged CBOR-in-CBOR form
+                                // cardano-node uses (byte-identical to MsgSubmitTx),
+                                // so ogmios and other Haskell mempool monitors can
+                                // decode it:
+                                //   [6, [era_index, tag(24) bstr(tx_cbor)]]
+                                // The HFC era index is 0-based (Conway=6); the
+                                // per-era Shelley GenTx ToCBOR wraps the tx in
+                                // tag(24). Previously we emitted a bare bytestring
+                                // [6, bstr(tx)] which no Haskell decoder accepts.
+                                enc.array(2).expect("infallible");
+                                enc.u64(TAG_REPLY_NEXT_TX).expect("infallible");
+                                enc.array(2).expect("infallible");
+                                enc.u32(tx.era.to_era_index()).expect("infallible");
+                                enc.tag(minicbor::data::Tag::new(24)).expect("infallible");
+                                enc.bytes(&tx_cbor).expect("infallible");
+                            }
+                            _ => {
+                                // Tx was removed from mempool since snapshot — skip
+                                enc.array(1).expect("infallible");
+                                enc.u64(TAG_REPLY_NEXT_TX).expect("infallible");
+                            }
                         }
                     } else {
                         // No more transactions — MsgReplyNextTx with no tx
@@ -285,8 +314,15 @@ mod tests {
         fn contains(&self, tx_hash: &Hash<32>) -> bool {
             self.txs.contains_key(&tx_hash.0)
         }
-        fn get_tx(&self, _: &Hash<32>) -> Option<Transaction> {
-            None
+        fn get_tx(&self, tx_hash: &Hash<32>) -> Option<Transaction> {
+            // #874: the monitor server now needs the tx era to emit the
+            // era-tagged GenTx. The mock stores Conway-era txs; return a
+            // minimal Transaction carrying the era so the encoder can index it.
+            self.txs.get(&tx_hash.0).map(|_| {
+                let mut tx = Transaction::empty_with_hash(*tx_hash);
+                tx.era = dugite_primitives::era::Era::Conway;
+                tx
+            })
         }
         fn get_tx_size(&self, tx_hash: &Hash<32>) -> Option<usize> {
             self.txs.get(&tx_hash.0).map(|(_, s)| *s)
@@ -486,6 +522,7 @@ mod tests {
         let _ = recv_raw(&mut egress_rx).await;
 
         // Iterate: should get 2 transactions, then empty.
+        // #874: each present reply is [6, [era_index, tag(24) bstr(tx_cbor)]].
         let mut received_cbors = Vec::new();
         for _ in 0..2 {
             send_raw(&ingress_tx, encode_tag_only(TAG_NEXT_TX)).await;
@@ -495,12 +532,27 @@ mod tests {
             let tag = dec.u64().unwrap();
             assert_eq!(tag, TAG_REPLY_NEXT_TX);
             if arr_len == Some(2) {
-                // Has tx CBOR.
+                // GenTx = array(2) [era_index, tag(24) bstr(tx_cbor)].
+                assert_eq!(dec.array().unwrap(), Some(2), "GenTx must be array(2)");
+                assert_eq!(
+                    dec.u32().unwrap(),
+                    dugite_primitives::era::Era::Conway.to_era_index(),
+                    "era index must be the HFC index (Conway=6)"
+                );
+                assert_eq!(
+                    dec.tag().unwrap().as_u64(),
+                    24,
+                    "tx must be CBOR-in-CBOR tag(24)"
+                );
                 let cbor = dec.bytes().unwrap().to_vec();
                 received_cbors.push(cbor);
             }
         }
         assert_eq!(received_cbors.len(), 2, "should receive 2 transactions");
+        assert!(
+            received_cbors.contains(&tx1_cbor) && received_cbors.contains(&tx2_cbor),
+            "delivered tx CBORs must round-trip verbatim inside tag(24)"
+        );
 
         // Third NextTx → empty (array len 1, no tx body).
         send_raw(&ingress_tx, encode_tag_only(TAG_NEXT_TX)).await;
@@ -512,6 +564,33 @@ mod tests {
 
         send_raw(&ingress_tx, encode_tag_only(TAG_DONE)).await;
         handle.await.unwrap().unwrap();
+    }
+
+    /// #880: MsgRelease has client agency only in StAcquired — sending it from
+    /// StIdle (before any MsgAcquire) must be a protocol StateViolation, not a
+    /// silent no-op.
+    #[tokio::test]
+    async fn release_before_acquire_is_state_violation() {
+        let mempool = MockMempool::new(100);
+        let (mut channel, _egress_rx, ingress_tx) = make_test_channel();
+        let handle =
+            tokio::spawn(
+                async move { LocalTxMonitorServer::run(&mut channel, &mempool, || 0).await },
+            );
+
+        send_raw(&ingress_tx, encode_tag_only(TAG_RELEASE)).await;
+
+        let result = handle.await.unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(ProtocolError::StateViolation {
+                    protocol: "LocalTxMonitor",
+                    ..
+                })
+            ),
+            "MsgRelease from StIdle must be a StateViolation, got: {result:?}"
+        );
     }
 
     #[tokio::test]

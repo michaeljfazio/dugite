@@ -40,6 +40,7 @@
 
 pub mod client;
 pub mod jumping;
+pub(crate) mod serve_core;
 pub mod server;
 
 use crate::codec::{self, Point};
@@ -205,8 +206,23 @@ pub fn encode_message(msg: &ChainSyncMessage) -> Vec<u8> {
 /// Decode a ChainSync message from CBOR bytes.
 pub fn decode_message(data: &[u8]) -> Result<ChainSyncMessage, String> {
     let mut dec = Decoder::new(data);
-    let _arr_len = dec.array().map_err(|e| e.to_string())?;
+    let arr_len = dec.array().map_err(|e| e.to_string())?;
     let tag = dec.u64().map_err(|e| e.to_string())?;
+
+    // #880: assert the outer array arity matches the tag. Without this a
+    // message like `[0, <garbage...>]` decodes as a clean MsgRequestNext with
+    // the extra elements silently ignored — an adversarial-tolerance gap.
+    let expected_arity = match tag {
+        TAG_REQUEST_NEXT | TAG_AWAIT_REPLY | TAG_DONE => 1,
+        TAG_FIND_INTERSECT | TAG_INTERSECT_NOT_FOUND => 2,
+        TAG_ROLL_FORWARD | TAG_ROLL_BACKWARD | TAG_INTERSECT_FOUND => 3,
+        other => return Err(format!("unknown ChainSync message tag: {other}")),
+    };
+    if arr_len != Some(expected_arity) {
+        return Err(format!(
+            "ChainSync tag {tag}: expected definite array({expected_arity}), got {arr_len:?}"
+        ));
+    }
 
     match tag {
         TAG_REQUEST_NEXT => Ok(ChainSyncMessage::MsgRequestNext),

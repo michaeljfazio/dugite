@@ -763,10 +763,48 @@ impl N2CClient {
                 // MsgReplyNextTx — array(1) means no tx, array(2) means tx present
                 let has_tx = matches!(arr_len, Ok(Some(n)) if n >= 2);
                 if has_tx {
-                    let tx_cbor = dec.bytes().unwrap_or(&[]).to_vec();
-                    // Compute tx hash from CBOR (Blake2b-256)
-                    let tx_hash = dugite_primitives::hash::blake2b_256(&tx_cbor);
-                    Ok(Some((tx_hash.as_ref().to_vec(), tx_cbor)))
+                    // #874: the present reply is [6, <GenTx>] where
+                    //   <GenTx> = [era_index, tag(24) bstr(tx_cbor)]
+                    // (byte-identical to MsgSubmitTx). Accept a bare bytestring
+                    // defensively for interop with peers still emitting the old
+                    // flat shape.
+                    let era_index = match dec.datatype() {
+                        Ok(minicbor::data::Type::Array) => {
+                            let _ = dec
+                                .array()
+                                .map_err(|e| protocol_err(format!("bad GenTx array: {e}")))?;
+                            dec.u32()
+                                .map_err(|e| protocol_err(format!("bad GenTx era index: {e}")))?
+                        }
+                        // Legacy flat shape [6, bstr(tx)] — no era wrapper.
+                        _ => u32::MAX,
+                    };
+                    let tx_cbor = match dec.datatype() {
+                        Ok(minicbor::data::Type::Tag) => {
+                            let _ = dec.tag();
+                            dec.bytes()
+                                .map_err(|e| protocol_err(format!("bad GenTx tx bytes: {e}")))?
+                                .to_vec()
+                        }
+                        _ => dec
+                            .bytes()
+                            .map_err(|e| protocol_err(format!("bad GenTx tx bytes: {e}")))?
+                            .to_vec(),
+                    };
+                    // Canonical tx id = blake2b_256(raw_body_cbor) — the body-span
+                    // hash the decoder computes — NOT blake2b over the whole tx
+                    // CBOR (#874 Related). Fall back to the whole-tx hash only if
+                    // the era is unknown / the tx fails to decode.
+                    let tx_hash = match dugite_serialization::decode_transaction(
+                        era_index as u16,
+                        &tx_cbor,
+                    ) {
+                        Ok(tx) => tx.hash.as_bytes().to_vec(),
+                        Err(_) => dugite_primitives::hash::blake2b_256(&tx_cbor)
+                            .as_ref()
+                            .to_vec(),
+                    };
+                    Ok(Some((tx_hash, tx_cbor)))
                 } else {
                     Ok(None)
                 }
@@ -877,6 +915,22 @@ fn protocol_err(reason: String) -> NetworkError {
         protocol: "LocalStateQuery",
         reason,
     })
+}
+
+/// Clamp a CBOR array/map length header against the bytes still available in
+/// the decoder input.
+///
+/// Every CBOR data item occupies at least one byte, so a well-formed container
+/// can never declare more elements than there are remaining bytes. A malicious
+/// or buggy N2C server can otherwise send a tiny (~9-byte) header declaring a
+/// length near `2^64` and drive the client to allocate billions of elements
+/// (OOM) or spin near-forever pushing default values (#873). Clamping the loop
+/// bound to `total_len - decoder.position()` makes every such loop bounded by
+/// the actual input length. `total_len` is the length of the slice the decoder
+/// was constructed over.
+fn bounded_cbor_len(declared: u64, total_len: usize, decoder: &minicbor::Decoder<'_>) -> usize {
+    let remaining = total_len.saturating_sub(decoder.position());
+    declared.min(remaining as u64) as usize
 }
 
 /// Encode a QueryHardFork query: `MsgQuery [3, [0, [2, [sub_tag]]]]`.
@@ -1140,10 +1194,12 @@ fn parse_protocol_params_cbor(payload: &[u8]) -> Result<String, NetworkError> {
 
     match decoder.datatype() {
         Ok(minicbor::data::Type::Array) => {
-            let arr_len = decoder
+            let arr_len_declared = decoder
                 .array()
                 .map_err(|e| protocol_err(format!("bad array: {e}")))?
                 .unwrap_or(0);
+            // #873: never trust the declared count — bound it to the input.
+            let arr_len = bounded_cbor_len(arr_len_declared, payload.len(), &decoder) as u64;
 
             let field_names: &[&str] = &[
                 "txFeePerByte",
@@ -1199,6 +1255,8 @@ fn parse_protocol_params_cbor(payload: &[u8]) -> Result<String, NetworkError> {
                     15 => {
                         let mut cm_entries = Vec::new();
                         if let Ok(Some(map_len)) = decoder.map() {
+                            // #873: bound the language-count against the input.
+                            let map_len = bounded_cbor_len(map_len, payload.len(), &decoder);
                             for _ in 0..map_len {
                                 let lang = decoder.u32().unwrap_or(0);
                                 let lang_name = match lang {
@@ -1209,8 +1267,17 @@ fn parse_protocol_params_cbor(payload: &[u8]) -> Result<String, NetworkError> {
                                 };
                                 let mut costs = Vec::new();
                                 if let Ok(Some(cost_len)) = decoder.array() {
+                                    // #873: a ~9-byte header must not push billions
+                                    // of zeros — bound against remaining input.
+                                    let cost_len =
+                                        bounded_cbor_len(cost_len, payload.len(), &decoder);
                                     for _ in 0..cost_len {
-                                        costs.push(decoder.i64().unwrap_or(0));
+                                        // Stop on the first malformed cost entry
+                                        // instead of silently pushing 0 forever.
+                                        match decoder.i64() {
+                                            Ok(c) => costs.push(c),
+                                            Err(_) => break,
+                                        }
                                     }
                                 }
                                 let costs_str: Vec<String> =
@@ -1363,14 +1430,19 @@ fn parse_protocol_params_cbor(payload: &[u8]) -> Result<String, NetworkError> {
             Ok(format!("{{\n{}\n}}", entries.join(",\n")))
         }
         Ok(minicbor::data::Type::Map) => {
-            let map_len = decoder
+            let map_len_declared = decoder
                 .map()
                 .map_err(|e| protocol_err(format!("bad map: {e}")))?
                 .unwrap_or(0);
+            // #873: this branch skip()s each value and swallows decode errors, so
+            // an unbounded declared count would spin — bound it to the input.
+            let map_len = bounded_cbor_len(map_len_declared, payload.len(), &decoder);
             let mut entries = Vec::new();
             for _ in 0..map_len {
                 let key = decoder.u32().unwrap_or(999);
-                let _ = decoder.skip();
+                if decoder.skip().is_err() {
+                    break;
+                }
                 entries.push(format!("  \"key_{key}\": \"skipped\""));
             }
             Ok(format!("{{\n{}\n}}", entries.join(",\n")))
@@ -1858,6 +1930,54 @@ fn decode_txin(decoder: &mut minicbor::Decoder<'_>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #873: a declared CBOR length must be clamped to the bytes actually
+    /// available, so a tiny crafted header cannot drive a billions-iteration
+    /// loop. `bounded_cbor_len` clamps to `total_len - position`.
+    #[test]
+    fn bounded_cbor_len_clamps_to_remaining_input() {
+        // A ~9-byte header declaring u64::MAX with only 3 bytes of body left.
+        let payload = [0x00u8; 12];
+        let mut dec = minicbor::Decoder::new(&payload);
+        // Advance the decoder position to simulate 9 header bytes consumed.
+        dec.set_position(9);
+        let clamped = bounded_cbor_len(u64::MAX, payload.len(), &dec);
+        assert_eq!(
+            clamped, 3,
+            "must clamp to remaining bytes, not the wire value"
+        );
+
+        // A small honest length passes through unchanged.
+        let mut dec2 = minicbor::Decoder::new(&payload);
+        dec2.set_position(2);
+        assert_eq!(bounded_cbor_len(4, payload.len(), &dec2), 4);
+
+        // Position at or past the end clamps to zero (no underflow).
+        let mut dec3 = minicbor::Decoder::new(&payload);
+        dec3.set_position(payload.len());
+        assert_eq!(bounded_cbor_len(1000, payload.len(), &dec3), 0);
+    }
+
+    /// #873: a malicious `GetCurrentPParams` reply whose top-level array header
+    /// declares a length far larger than the payload must not hang/OOM — the
+    /// parser returns bounded output quickly.
+    #[test]
+    fn parse_protocol_params_rejects_oversized_array_header() {
+        // MsgResult [4, <hfc [era, payload]>] where payload is an array header
+        // 0x9b declaring 0xFFFFFFFFFFFFFFFF elements but with no elements.
+        // strip_msg_result expects [4, inner]; strip_hfc_wrapper expects [era, x].
+        let mut buf = Vec::new();
+        // outer: array(2) [4, inner]
+        buf.extend_from_slice(&[0x82, 0x04]);
+        // inner hfc: array(2) [6 (era), payload]
+        buf.extend_from_slice(&[0x82, 0x06]);
+        // payload: array header 0x9b + u64::MAX, then EOF (no elements).
+        buf.push(0x9b);
+        buf.extend_from_slice(&u64::MAX.to_be_bytes());
+        // Must return promptly (bounded loop), not hang. Result content is
+        // best-effort; we only assert it terminates without panic.
+        let _ = parse_protocol_params_cbor(&buf);
+    }
 
     #[test]
     fn test_format_rational_decimal_basic() {

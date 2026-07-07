@@ -28,6 +28,20 @@ impl PeerSharingClient {
 
         match response {
             PeerSharingMessage::MsgSharePeers(addrs) => {
+                // #880: a well-behaved peer never returns more addresses than the
+                // `amount` we requested. Reject an over-count reply as a protocol
+                // violation (adversarial posture: convict over silently tolerate)
+                // — the MAX_SHARED_ADDRS decode cap alone lets a peer send up to
+                // 255 regardless of what we asked for.
+                if addrs.len() > amount as usize {
+                    return Err(ProtocolError::BoundsExceeded {
+                        protocol: "PeerSharing",
+                        reason: format!(
+                            "peer returned {} addresses but only {amount} were requested",
+                            addrs.len()
+                        ),
+                    });
+                }
                 // B10: Filter addresses on the CLIENT side before returning to the
                 // PeerManager.  A malicious peer can send private/loopback/link-local
                 // addresses (127.0.0.1, 169.254.169.254, 10.0.0.0/8) to cause dugite
