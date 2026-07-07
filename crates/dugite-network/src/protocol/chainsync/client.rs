@@ -266,7 +266,8 @@ impl PipelinedChainSyncClient {
                     // server unilaterally end sync; reject as an agency violation.
                     return Err(ProtocolError::StateViolation {
                         protocol: "ChainSync",
-                        expected: "server response (MsgRollForward/Backward/AwaitReply)".to_string(),
+                        expected: "server response (MsgRollForward/Backward/AwaitReply)"
+                            .to_string(),
                         actual: "MsgDone from server (client-agency message)".to_string(),
                     });
                 }

@@ -310,10 +310,8 @@ impl PeerJumpState {
         match &self.state {
             JumpState::Jumper(JumperState::LookingForIntersection { lo, .. }) => {
                 let lo = lo.clone();
-                self.state = JumpState::Jumper(JumperState::LookingForIntersection {
-                    lo,
-                    hi: new_hi,
-                });
+                self.state =
+                    JumpState::Jumper(JumperState::LookingForIntersection { lo, hi: new_hi });
                 Ok(())
             }
             other => Err(TransitionError::InvalidState {
@@ -334,10 +332,8 @@ impl PeerJumpState {
         match &self.state {
             JumpState::Jumper(JumperState::LookingForIntersection { hi, .. }) => {
                 let hi = hi.clone();
-                self.state = JumpState::Jumper(JumperState::LookingForIntersection {
-                    lo: new_lo,
-                    hi,
-                });
+                self.state =
+                    JumpState::Jumper(JumperState::LookingForIntersection { lo: new_lo, hi });
                 Ok(())
             }
             other => Err(TransitionError::InvalidState {
@@ -718,7 +714,8 @@ mod tests {
 
         // Not found at the midpoint → fork is at/below it → narrow the upper
         // bound, staying in LookingForIntersection.
-        peer.on_intersect_not_found_continue(pt(50)).expect("continue lo");
+        peer.on_intersect_not_found_continue(pt(50))
+            .expect("continue lo");
         match &peer.state {
             JumpState::Jumper(JumperState::LookingForIntersection { lo, hi }) => {
                 assert_eq!(*lo, Point::Origin);
@@ -728,7 +725,8 @@ mod tests {
         }
 
         // Found at the next midpoint → fork is above it → raise the lower bound.
-        peer.on_intersect_found_continue(pt(25)).expect("continue hi");
+        peer.on_intersect_found_continue(pt(25))
+            .expect("continue hi");
         match &peer.state {
             JumpState::Jumper(JumperState::LookingForIntersection { lo, hi }) => {
                 assert_eq!(*lo, pt(25));

@@ -220,7 +220,8 @@ impl TxSubmissionServer {
                                 // era-stripped body is always <= it). A larger body
                                 // is a flow-control / attribution violation —
                                 // convict the peer.
-                                if i < to_fetch.len() && tx_bytes.len() as u64 > to_fetch[i].2 as u64
+                                if i < to_fetch.len()
+                                    && tx_bytes.len() as u64 > to_fetch[i].2 as u64
                                 {
                                     return Err(ProtocolError::BoundsExceeded {
                                         protocol: "TxSubmission2",
@@ -591,8 +592,10 @@ mod tests {
         ));
 
         // Deliver a body — the callback will convict regardless of content.
-        let reply_txs =
-            encode_message(&TxSubmissionMessage::MsgReplyTxs(vec![(6u8, vec![0x01, 0x02])]));
+        let reply_txs = encode_message(&TxSubmissionMessage::MsgReplyTxs(vec![(
+            6u8,
+            vec![0x01, 0x02],
+        )]));
         ingress_tx.send(Bytes::from(reply_txs)).await.unwrap();
 
         let result = handle.await.unwrap();

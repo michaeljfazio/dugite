@@ -326,7 +326,12 @@ impl BlockFetchServer {
         if started {
             let done = encode_message(&BlockFetchMessage::MsgBatchDone);
             channel.send(done).await.map_err(ProtocolError::from)?;
-            tracing::debug!(block_count = sent, from_slot, to_slot, "blockfetch server: streamed batch");
+            tracing::debug!(
+                block_count = sent,
+                from_slot,
+                to_slot,
+                "blockfetch server: streamed batch"
+            );
         } else {
             let no_blocks = encode_message(&BlockFetchMessage::MsgNoBlocks);
             channel.send(no_blocks).await.map_err(ProtocolError::from)?;
@@ -680,7 +685,10 @@ mod tests {
             3,
         )
         .await;
-        assert_eq!(served, bodies, "multi-chunk stream must equal the full range");
+        assert_eq!(
+            served, bodies,
+            "multi-chunk stream must equal the full range"
+        );
     }
 
     /// #878: a Byron EBB/main same-slot pair split across a chunk boundary must

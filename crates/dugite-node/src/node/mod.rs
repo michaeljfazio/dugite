@@ -3716,8 +3716,7 @@ impl Node {
                         Ok(r) => Box::new(r),
                         Err(_) => Box::new(NoopDnsResolver),
                     };
-                    let mut interval =
-                        tokio::time::interval(std::time::Duration::from_secs(300));
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
                     interval.tick().await; // skip the immediate first tick
                     loop {
                         tokio::select! {
@@ -3743,11 +3742,10 @@ impl Node {
                         for (gi, group) in re_groups.iter().enumerate() {
                             let hot_val = usize::from(group.effective_hot_valency());
                             let warm_val = usize::from(group.effective_warm_valency());
-                            let diffusion_mode =
-                                group.diffusion_mode.as_deref().map(|s| match s {
-                                    "InitiatorOnly" => networking::DiffusionMode::InitiatorOnly,
-                                    _ => networking::DiffusionMode::InitiatorAndResponder,
-                                });
+                            let diffusion_mode = group.diffusion_mode.as_deref().map(|s| match s {
+                                "InitiatorOnly" => networking::DiffusionMode::InitiatorOnly,
+                                _ => networking::DiffusionMode::InitiatorAndResponder,
+                            });
                             let mut group_addrs = Vec::new();
                             for ap in &group.access_points {
                                 let addrs =

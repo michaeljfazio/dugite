@@ -1942,7 +1942,10 @@ mod tests {
         // Advance the decoder position to simulate 9 header bytes consumed.
         dec.set_position(9);
         let clamped = bounded_cbor_len(u64::MAX, payload.len(), &dec);
-        assert_eq!(clamped, 3, "must clamp to remaining bytes, not the wire value");
+        assert_eq!(
+            clamped, 3,
+            "must clamp to remaining bytes, not the wire value"
+        );
 
         // A small honest length passes through unchanged.
         let mut dec2 = minicbor::Decoder::new(&payload);

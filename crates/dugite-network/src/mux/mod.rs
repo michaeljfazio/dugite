@@ -635,7 +635,10 @@ mod tests {
             .await
             .expect("peer read timed out — socket was NOT closed (reader task leaked)")
             .expect("peer read errored");
-        assert_eq!(n, 0, "expected EOF after mux abort; socket left open (FD leak)");
+        assert_eq!(
+            n, 0,
+            "expected EOF after mux abort; socket left open (FD leak)"
+        );
     }
 
     /// Duplex KeepAlive integration test.

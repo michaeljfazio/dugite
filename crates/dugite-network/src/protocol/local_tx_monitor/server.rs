@@ -153,7 +153,10 @@ impl LocalTxMonitorServer {
 
                         // Try to get the tx CBOR + era from mempool.
                         let tx_hash_obj = dugite_primitives::Hash::from_bytes(*tx_hash);
-                        match (mempool.get_tx_cbor(&tx_hash_obj), mempool.get_tx(&tx_hash_obj)) {
+                        match (
+                            mempool.get_tx_cbor(&tx_hash_obj),
+                            mempool.get_tx(&tx_hash_obj),
+                        ) {
                             (Some(tx_cbor), Some(tx)) => {
                                 // #874: MsgReplyNextTx present = [6, <GenTx>] where
                                 // <GenTx> is the era-tagged CBOR-in-CBOR form
@@ -570,9 +573,10 @@ mod tests {
     async fn release_before_acquire_is_state_violation() {
         let mempool = MockMempool::new(100);
         let (mut channel, _egress_rx, ingress_tx) = make_test_channel();
-        let handle = tokio::spawn(async move {
-            LocalTxMonitorServer::run(&mut channel, &mempool, || 0).await
-        });
+        let handle =
+            tokio::spawn(
+                async move { LocalTxMonitorServer::run(&mut channel, &mempool, || 0).await },
+            );
 
         send_raw(&ingress_tx, encode_tag_only(TAG_RELEASE)).await;
 
