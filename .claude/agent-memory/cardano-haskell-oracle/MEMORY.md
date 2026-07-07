@@ -98,6 +98,7 @@
 - [era-history-wire-format.md](era-history-wire-format.md) — GetInterpreter/EraHistory query/response, Bound/EraParams/SafeZone
 - [shelley-genesis-cbor.md](shelley-genesis-cbor.md) — GetGenesisConfig (tag 11): CompactGenesis array(15), no tag(30) on activeSlotsCoeff
 - [pparams-cbor-encoding.md](pparams-cbor-encoding.md) — PParams array(31) / PParamsUpdate map encoding, field ordering
+- [localtxmonitor-localtxsubmission-gentx-n2c-wire-format.md](localtxmonitor-localtxsubmission-gentx-n2c-wire-format.md) — MsgReplyNextTx=`82 06 82 06 D8 18 <tx>` (era-idx array + tag24 wrap at PER-ERA layer not HFC layer); MsgSubmitTx/MsgReplyNextTx byte-identical GenTx embedding; CardanoEras idx incl Dijkstra=7
 
 ## TxSubmission / Mempool
 - [txsubmission2-architecture.md](txsubmission2-architecture.md) — V1/V2 server, outbound client, governor lifecycle, mempool sync
