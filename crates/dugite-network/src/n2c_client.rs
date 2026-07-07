@@ -763,10 +763,48 @@ impl N2CClient {
                 // MsgReplyNextTx — array(1) means no tx, array(2) means tx present
                 let has_tx = matches!(arr_len, Ok(Some(n)) if n >= 2);
                 if has_tx {
-                    let tx_cbor = dec.bytes().unwrap_or(&[]).to_vec();
-                    // Compute tx hash from CBOR (Blake2b-256)
-                    let tx_hash = dugite_primitives::hash::blake2b_256(&tx_cbor);
-                    Ok(Some((tx_hash.as_ref().to_vec(), tx_cbor)))
+                    // #874: the present reply is [6, <GenTx>] where
+                    //   <GenTx> = [era_index, tag(24) bstr(tx_cbor)]
+                    // (byte-identical to MsgSubmitTx). Accept a bare bytestring
+                    // defensively for interop with peers still emitting the old
+                    // flat shape.
+                    let era_index = match dec.datatype() {
+                        Ok(minicbor::data::Type::Array) => {
+                            let _ = dec
+                                .array()
+                                .map_err(|e| protocol_err(format!("bad GenTx array: {e}")))?;
+                            dec.u32()
+                                .map_err(|e| protocol_err(format!("bad GenTx era index: {e}")))?
+                        }
+                        // Legacy flat shape [6, bstr(tx)] — no era wrapper.
+                        _ => u32::MAX,
+                    };
+                    let tx_cbor = match dec.datatype() {
+                        Ok(minicbor::data::Type::Tag) => {
+                            let _ = dec.tag();
+                            dec.bytes()
+                                .map_err(|e| protocol_err(format!("bad GenTx tx bytes: {e}")))?
+                                .to_vec()
+                        }
+                        _ => dec
+                            .bytes()
+                            .map_err(|e| protocol_err(format!("bad GenTx tx bytes: {e}")))?
+                            .to_vec(),
+                    };
+                    // Canonical tx id = blake2b_256(raw_body_cbor) — the body-span
+                    // hash the decoder computes — NOT blake2b over the whole tx
+                    // CBOR (#874 Related). Fall back to the whole-tx hash only if
+                    // the era is unknown / the tx fails to decode.
+                    let tx_hash = match dugite_serialization::decode_transaction(
+                        era_index as u16,
+                        &tx_cbor,
+                    ) {
+                        Ok(tx) => tx.hash.as_bytes().to_vec(),
+                        Err(_) => dugite_primitives::hash::blake2b_256(&tx_cbor)
+                            .as_ref()
+                            .to_vec(),
+                    };
+                    Ok(Some((tx_hash, tx_cbor)))
                 } else {
                     Ok(None)
                 }

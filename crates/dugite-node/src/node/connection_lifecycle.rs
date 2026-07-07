@@ -2995,6 +2995,18 @@ impl ConnectionLifecycleManager {
                                     CodecPoint::Specific(s, _) => *s,
                                     CodecPoint::Origin => 0,
                                 };
+                                // #875: the lower bound of the requested range.
+                                // A BlockFetch server must only stream blocks whose
+                                // point falls in the requested [from, to] span; any
+                                // block outside it is an unrequested block the peer
+                                // has no business delivering (Haskell raises
+                                // BlockFetchProtocolFailure). We reject it as a peer
+                                // fault BEFORE it is decoded into `decoded_blocks`
+                                // and pushed toward VolatileDB/apply.
+                                let range_from_slot = match &ranges[range_idx].0 {
+                                    CodecPoint::Specific(s, _) => *s,
+                                    CodecPoint::Origin => 0,
+                                };
 
                                 // Collect decoded blocks in a local Vec inside the
                                 // sync callback, then send them via `.send().await`
@@ -3053,6 +3065,24 @@ impl ConnectionLifecycleManager {
                                         ) {
                                             Ok(block) => {
                                                 let slot = block.slot().0;
+                                                // #875: reject blocks outside the
+                                                // requested [from, to] slot span —
+                                                // an adversarial server otherwise
+                                                // rides arbitrary blocks into the
+                                                // apply loop before higher layers
+                                                // drop them. Convict the peer.
+                                                if slot < range_from_slot || slot > range_to_slot {
+                                                    warn!(
+                                                        %addr, slot, range_from_slot, range_to_slot,
+                                                        "BlockFetch: peer delivered a block outside the requested range — rejecting"
+                                                    );
+                                                    return Err(dugite_network::error::ProtocolError::IntegrityViolation {
+                                                        protocol: "BlockFetch",
+                                                        reason: format!(
+                                                            "delivered block at slot {slot} outside requested range [{range_from_slot}, {range_to_slot}]"
+                                                        ),
+                                                    });
+                                                }
                                                 debug!(%addr, slot, block_no = block.block_number().0, "BlockFetch: block decoded");
                                                 decoded_blocks.push(FetchedBlock {
                                                     peer,
