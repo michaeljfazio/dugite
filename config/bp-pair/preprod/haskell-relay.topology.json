@@ -1,0 +1,23 @@
+{
+  "bootstrapPeers": [
+    { "address": "preprod-node.play.dev.cardano.org", "port": 3001 }
+  ],
+  "localRoots": [
+    {
+      "accessPoints": [
+        { "address": "127.0.0.1", "port": 3001 }
+      ],
+      "advertise": false,
+      "trustable": true,
+      "hotValency": 1,
+      "warmValency": 1
+    }
+  ],
+  "publicRoots": [
+    {
+      "accessPoints": [],
+      "advertise": false
+    }
+  ],
+  "useLedgerAfterSlot": 121478354
+}
