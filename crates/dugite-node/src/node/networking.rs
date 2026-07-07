@@ -514,6 +514,19 @@ impl NodePeerManager {
         for &addr in &group.addrs {
             self.add_config_peer(addr);
         }
+        // #871: upsert by (non-empty) name so periodic DNS re-resolution can
+        // refresh a group's resolved addresses in place instead of pushing a
+        // duplicate every pass. A blank name (legacy callers) always appends.
+        if !group.name.is_empty() {
+            if let Some(existing) = self
+                .local_root_groups
+                .iter_mut()
+                .find(|g| g.name == group.name)
+            {
+                *existing = group;
+                return;
+            }
+        }
         self.local_root_groups.push(group);
     }
 
@@ -1116,6 +1129,60 @@ impl std::fmt::Display for PeerManagerStats {
 mod tests {
     use super::*;
     use std::net::SocketAddr;
+
+    /// #871: re-adding a named local-root group (periodic DNS re-resolution)
+    /// must UPSERT it in place — refreshing its addresses — not push a
+    /// duplicate. A blank-named group always appends (legacy behaviour).
+    #[test]
+    fn add_local_root_group_upserts_by_name() {
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        let a1: SocketAddr = "203.0.113.1:3001".parse().unwrap();
+        let a2: SocketAddr = "203.0.113.2:3001".parse().unwrap();
+
+        pm.add_local_root_group(LocalRootGroupInfo {
+            name: "local-root-0".into(),
+            addrs: vec![a1],
+            hot_valency: 1,
+            warm_valency: 1,
+            diffusion_mode: None,
+            behind_firewall: false,
+            advertise: false,
+        });
+        assert_eq!(pm.local_root_groups().len(), 1);
+
+        // Re-resolution returns a rotated address for the SAME group name.
+        pm.add_local_root_group(LocalRootGroupInfo {
+            name: "local-root-0".into(),
+            addrs: vec![a2],
+            hot_valency: 1,
+            warm_valency: 1,
+            diffusion_mode: None,
+            behind_firewall: false,
+            advertise: false,
+        });
+        assert_eq!(
+            pm.local_root_groups().len(),
+            1,
+            "same-named group must be replaced, not duplicated"
+        );
+        assert_eq!(
+            pm.local_root_groups()[0].addrs,
+            vec![a2],
+            "group addresses must be refreshed to the newly-resolved set"
+        );
+
+        // A distinct name is a distinct group.
+        pm.add_local_root_group(LocalRootGroupInfo {
+            name: "local-root-1".into(),
+            addrs: vec![a1],
+            hot_valency: 1,
+            warm_valency: 1,
+            diffusion_mode: None,
+            behind_firewall: false,
+            advertise: false,
+        });
+        assert_eq!(pm.local_root_groups().len(), 2);
+    }
 
     #[test]
     fn test_haa_satisfied_via_trusted_local_roots() {

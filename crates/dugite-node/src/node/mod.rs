@@ -3647,6 +3647,7 @@ impl Node {
             // Each entry carries resolved addresses plus all topology metadata so
             // `add_local_root_group` can be called with fully-populated info.
             struct ResolvedGroup {
+                orig_index: usize,
                 addrs: Vec<std::net::SocketAddr>,
                 hot_valency: usize,
                 warm_valency: usize,
@@ -3655,7 +3656,7 @@ impl Node {
                 advertise: bool,
             }
             let mut resolved_groups: Vec<ResolvedGroup> = Vec::new();
-            for group in &self.topology.local_roots {
+            for (orig_index, group) in self.topology.local_roots.iter().enumerate() {
                 let hot_val = usize::from(group.effective_hot_valency());
                 let warm_val = usize::from(group.effective_warm_valency());
                 let diffusion_mode = group.diffusion_mode.as_deref().map(|s| match s {
@@ -3677,6 +3678,7 @@ impl Node {
                 }
                 if !group_addrs.is_empty() {
                     resolved_groups.push(ResolvedGroup {
+                        orig_index,
                         addrs: group_addrs,
                         hot_valency: hot_val,
                         warm_valency: warm_val,
@@ -3685,6 +3687,90 @@ impl Node {
                         advertise: group.advertise,
                     });
                 }
+            }
+
+            // #871: periodic DNS re-resolution of topology / local-root names.
+            //
+            // Topology and local-root DNS names were resolved exactly ONCE at
+            // startup, so a block producer whose relay's A/AAAA record rotated
+            // silently lost its relay (the governor retried the stale IP forever
+            // at the 160s backoff cap), and a transient DNS failure at startup
+            // dropped a local-root group with no retry. This loop re-resolves
+            // both sets periodically, re-registering resolved addresses
+            // (idempotent by SocketAddr — inner add_peer never overwrites) and
+            // upserting each local-root group by its stable `local-root-{index}`
+            // name. On an EMPTY resolution it keeps the previous addresses (never
+            // forgets a group / bootstrap set on a transient failure — this fixes
+            // the startup-drop). A fixed 5-minute interval approximates
+            // cardano-node's TTL-driven DNSActions; resolve_with_srv does not yet
+            // surface record TTLs. (Stale rotated-out IPs linger as Topology cold
+            // peers rather than being pruned; connectivity is restored via the
+            // freshly-resolved address.)
+            {
+                let re_pm = peer_manager.clone();
+                let re_peers = detailed_peers.clone();
+                let re_groups = self.topology.local_roots.clone();
+                let mut re_shutdown = shutdown_rx.clone();
+                tokio::spawn(async move {
+                    let resolver: Box<dyn DnsResolver> = match HickoryDnsResolver::new() {
+                        Ok(r) => Box::new(r),
+                        Err(_) => Box::new(NoopDnsResolver),
+                    };
+                    let mut interval =
+                        tokio::time::interval(std::time::Duration::from_secs(300));
+                    interval.tick().await; // skip the immediate first tick
+                    loop {
+                        tokio::select! {
+                            _ = interval.tick() => {}
+                            _ = re_shutdown.changed() => break,
+                        }
+                        // Re-resolve bootstrap / config peers.
+                        for peer in &re_peers {
+                            let addrs =
+                                resolve_with_srv(resolver.as_ref(), &peer.address, peer.port).await;
+                            if addrs.is_empty() {
+                                continue; // keep previous on transient failure
+                            }
+                            let mut w = re_pm.write().await;
+                            for a in &addrs {
+                                w.add_config_peer(*a);
+                                if peer.trustable {
+                                    w.add_bootstrap_peer(*a);
+                                }
+                            }
+                        }
+                        // Re-resolve local-root groups, upserting by stable name.
+                        for (gi, group) in re_groups.iter().enumerate() {
+                            let hot_val = usize::from(group.effective_hot_valency());
+                            let warm_val = usize::from(group.effective_warm_valency());
+                            let diffusion_mode =
+                                group.diffusion_mode.as_deref().map(|s| match s {
+                                    "InitiatorOnly" => networking::DiffusionMode::InitiatorOnly,
+                                    _ => networking::DiffusionMode::InitiatorAndResponder,
+                                });
+                            let mut group_addrs = Vec::new();
+                            for ap in &group.access_points {
+                                let addrs =
+                                    resolve_with_srv(resolver.as_ref(), &ap.address, ap.port).await;
+                                group_addrs.extend(addrs);
+                            }
+                            if group_addrs.is_empty() {
+                                continue; // keep previous group on transient failure
+                            }
+                            let mut w = re_pm.write().await;
+                            w.add_local_root_group(networking::LocalRootGroupInfo {
+                                name: format!("local-root-{gi}"),
+                                addrs: group_addrs,
+                                hot_valency: hot_val,
+                                warm_valency: warm_val,
+                                diffusion_mode,
+                                behind_firewall: group.is_behind_firewall(),
+                                advertise: group.advertise,
+                            });
+                        }
+                    }
+                    tracing::debug!("DNS re-resolution loop exiting (shutdown)");
+                });
             }
 
             let mut pm = peer_manager.write().await;
@@ -3698,9 +3784,11 @@ impl Node {
             }
             // Register per-group valency targets.  This must happen AFTER
             // add_config_peer() calls so the peer table contains the members.
-            for rg in resolved_groups {
+            // #871: give each group a stable name (its topology index) so the
+            // periodic DNS re-resolution loop can upsert it in place.
+            for rg in resolved_groups.into_iter() {
                 pm.add_local_root_group(networking::LocalRootGroupInfo {
-                    name: String::new(),
+                    name: format!("local-root-{}", rg.orig_index),
                     addrs: rg.addrs,
                     hot_valency: rg.hot_valency,
                     warm_valency: rg.warm_valency,
