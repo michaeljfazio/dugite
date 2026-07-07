@@ -837,6 +837,14 @@ pub(super) fn check_script_data_hash(
             // Compute the expected script_data_hash. When raw tx CBOR is
             // available we use the in-house KeepRaw to preserve the original encoding
             // of redeemers and datums exactly.
+            //
+            // The empty/absent-redeemers term in the script-integrity preimage is
+            // era-dependent: Alonzo/Babbage encode a LIST (empty = `0x80`), Conway
+            // a MAP (empty = `0xa0`). Conway is protocol major 9+. Getting this
+            // wrong breaks supplemental-datum-only txs (no redeemers) on pre-Conway
+            // blocks — the ScriptDataHashMismatch class seen during from-genesis
+            // replay of Babbage-era preview/preprod history.
+            let redeemers_map_form = params.protocol_version_major >= 9;
             let computed = if let Some(raw) = tx.raw_cbor.as_ref() {
                 dugite_serialization::compute_script_data_hash_from_cbor(
                     raw,
@@ -844,6 +852,7 @@ pub(super) fn check_script_data_hash(
                     has_v1,
                     has_v2,
                     has_v3,
+                    redeemers_map_form,
                 )
                 .unwrap_or_else(|| {
                     dugite_serialization::compute_script_data_hash(
@@ -855,6 +864,7 @@ pub(super) fn check_script_data_hash(
                         has_v3,
                         tx.witness_set.raw_redeemers_cbor.as_deref(),
                         tx.witness_set.raw_plutus_data_cbor.as_deref(),
+                        redeemers_map_form,
                     )
                 })
             } else {
@@ -867,6 +877,7 @@ pub(super) fn check_script_data_hash(
                     has_v3,
                     tx.witness_set.raw_redeemers_cbor.as_deref(),
                     tx.witness_set.raw_plutus_data_cbor.as_deref(),
+                    redeemers_map_form,
                 )
             };
 

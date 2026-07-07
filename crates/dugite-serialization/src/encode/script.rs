@@ -188,29 +188,44 @@ pub fn compute_script_data_hash(
     has_v3: bool,
     raw_redeemers_cbor: Option<&[u8]>,
     raw_datums_cbor: Option<&[u8]>,
+    redeemers_map_form: bool,
 ) -> Hash32 {
     let mut preimage = Vec::new();
 
     // 1. Redeemers: use raw CBOR when available, otherwise re-encode.
     //
-    // Conway uses map format for redeemers in the script data hash preimage:
-    //   { [tag, index] => [data, ex_units], ... }
-    // Empty redeemers are encoded as 0xa0 (empty map), not 0x80 (empty array),
-    // matching Haskell's `hashScriptIntegrity` which uses `encodeRedeemers` always
-    // producing a map in the Conway era.
+    // The redeemers wire form is era-dependent: Alonzo/Babbage serialize a
+    // LIST `[ [tag, index, data, ex_units], ... ]`, while Conway switched to a
+    // MAP `{ [tag, index] => [data, ex_units], ... }`. `redeemers_map_form`
+    // selects the Conway map form; otherwise the pre-Conway list form is used.
+    // Empty/absent redeemers therefore encode as `0x80` (empty list) pre-Conway
+    // and `0xa0` (empty map) from Conway on, matching Haskell's
+    // `hashScriptIntegrity` which encodes the era's `Redeemers` type verbatim.
     if let Some(raw) = raw_redeemers_cbor {
         preimage.extend_from_slice(raw);
     } else if redeemers.is_empty() {
-        // Empty redeemers: use 0xa0 (empty map) for Conway compatibility.
-        preimage.push(0xa0);
-    } else {
-        // Re-encode as Conway map format: { [tag, index] => [data, ex_units] }
+        preimage.push(if redeemers_map_form { 0xa0 } else { 0x80 });
+    } else if redeemers_map_form {
+        // Conway map format: { [tag, index] => [data, ex_units] }
         let mut redeemers_buf = encode_map_header(redeemers.len());
         for r in redeemers {
             redeemers_buf.extend(encode_array_header(2));
             redeemers_buf.extend(encode_redeemer_tag(&r.tag));
             redeemers_buf.extend(encode_uint(r.index as u64));
             redeemers_buf.extend(encode_array_header(2));
+            redeemers_buf.extend(encode_plutus_data(&r.data));
+            redeemers_buf.extend(encode_array_header(2));
+            redeemers_buf.extend(encode_uint(r.ex_units.mem));
+            redeemers_buf.extend(encode_uint(r.ex_units.steps));
+        }
+        preimage.extend(&redeemers_buf);
+    } else {
+        // Alonzo/Babbage list format: [ [tag, index, data, ex_units], ... ]
+        let mut redeemers_buf = encode_array_header(redeemers.len());
+        for r in redeemers {
+            redeemers_buf.extend(encode_array_header(4));
+            redeemers_buf.extend(encode_redeemer_tag(&r.tag));
+            redeemers_buf.extend(encode_uint(r.index as u64));
             redeemers_buf.extend(encode_plutus_data(&r.data));
             redeemers_buf.extend(encode_array_header(2));
             redeemers_buf.extend(encode_uint(r.ex_units.mem));
@@ -264,6 +279,7 @@ pub fn compute_script_data_hash_from_cbor(
     has_v1: bool,
     has_v2: bool,
     has_v3: bool,
+    redeemers_map_form: bool,
 ) -> Option<Hash32> {
     // Conway era_id = 6 in the HFC convention used by `decode_transaction`.
     let tx = crate::decode::decode_transaction(6, tx_cbor).ok()?;
@@ -275,11 +291,18 @@ pub fn compute_script_data_hash_from_cbor(
 
     let mut preimage = Vec::new();
 
-    // 1. Redeemers: prefer raw wire-CBOR; fall back to empty-map sentinel.
+    // 1. Redeemers: prefer raw wire-CBOR; fall back to the era-correct empty
+    //    sentinel. The redeemers wire form flipped from a LIST (Alonzo/Babbage)
+    //    to a MAP (Conway), so an ABSENT redeemers field must contribute
+    //    `0x80` (empty list) pre-Conway and `0xa0` (empty map) from Conway on.
+    //    This term is only reached for supplemental-datum-only txs (no
+    //    redeemers but a witness-set datum); getting the sentinel wrong there
+    //    breaks the script-integrity hash for every pre-Conway datum-only tx
+    //    (surfaced as ScriptDataHashMismatch during from-genesis replay).
     if let Some(raw) = ws.raw_redeemers_cbor.as_deref() {
         preimage.extend_from_slice(raw);
     } else {
-        preimage.push(0xa0); // empty CBOR map
+        preimage.push(if redeemers_map_form { 0xa0 } else { 0x80 });
     }
 
     // 2. Datums: per Haskell `SafeToHash (ScriptIntegrity era)`,
@@ -412,7 +435,8 @@ mod tests {
             ..Default::default()
         };
 
-        let result = compute_script_data_hash_from_cbor(&tx_cbor, &cost_models, false, true, false);
+        let result =
+            compute_script_data_hash_from_cbor(&tx_cbor, &cost_models, false, true, false, true);
 
         assert_eq!(
             result,
@@ -453,7 +477,8 @@ mod tests {
             ..Default::default()
         };
         // V3-only tx (witness keys {0 vkey, 5 redeemers, 7 plutusV3}, no datums).
-        let result = compute_script_data_hash_from_cbor(&tx_cbor, &cost_models, false, false, true);
+        let result =
+            compute_script_data_hash_from_cbor(&tx_cbor, &cost_models, false, false, true, true);
         assert_eq!(
             result,
             Some(expected),
@@ -509,9 +534,11 @@ mod tests {
             false,
             None,
             Some(&[0x80]),
+            true,
         );
-        let with_none =
-            compute_script_data_hash(&redeemers, &empty, &cm, true, false, false, None, None);
+        let with_none = compute_script_data_hash(
+            &redeemers, &empty, &cm, true, false, false, None, None, true,
+        );
         assert_eq!(
             with_0x80, with_none,
             "empty plutus_data (0x80) must be omitted from the script_data_hash preimage"
@@ -520,7 +547,7 @@ mod tests {
         // Sanity: a non-empty datum DOES change the hash.
         let one = vec![PlutusData::Integer(num_bigint::BigInt::from(7))];
         let with_datum =
-            compute_script_data_hash(&redeemers, &one, &cm, true, false, false, None, None);
+            compute_script_data_hash(&redeemers, &one, &cm, true, false, false, None, None, true);
         assert_ne!(
             with_datum, with_none,
             "a non-empty datum must contribute to the script_data_hash"
@@ -809,7 +836,7 @@ mod tests {
     // ── compute_script_data_hash (in-memory inputs) ─────────────────────────
 
     #[test]
-    fn compute_script_data_hash_empty_redeemers_uses_a0_sentinel() {
+    fn compute_script_data_hash_empty_redeemers_sentinel_is_era_dependent() {
         let cm = CostModels {
             plutus_v1: None,
             plutus_v2: None,
@@ -817,11 +844,21 @@ mod tests {
             plutus_v4: None,
             ..Default::default()
         };
-        // Empty redeemers, no datums, no languages → preimage = [0xa0, 0xa0]
-        // (empty-map sentinel + empty language-views map).
-        let h = compute_script_data_hash(&[], &[], &cm, false, false, false, None, None);
-        let expected = dugite_primitives::hash::blake2b_256(&[0xa0, 0xa0]);
-        assert_eq!(h, expected);
+        // Conway (map form): empty redeemers → 0xa0; preimage = [0xa0, 0xa0].
+        let h_conway =
+            compute_script_data_hash(&[], &[], &cm, false, false, false, None, None, true);
+        assert_eq!(
+            h_conway,
+            dugite_primitives::hash::blake2b_256(&[0xa0, 0xa0])
+        );
+        // Alonzo/Babbage (list form): empty redeemers → 0x80; preimage = [0x80, 0xa0].
+        let h_pre_conway =
+            compute_script_data_hash(&[], &[], &cm, false, false, false, None, None, false);
+        assert_eq!(
+            h_pre_conway,
+            dugite_primitives::hash::blake2b_256(&[0x80, 0xa0])
+        );
+        assert_ne!(h_conway, h_pre_conway);
     }
 
     #[test]
@@ -848,6 +885,7 @@ mod tests {
             false,
             Some(&raw_red),
             Some(&raw_dat),
+            true,
         );
         let mut preimage = raw_red.to_vec();
         preimage.extend_from_slice(&raw_dat);
@@ -866,6 +904,7 @@ mod tests {
             false,
             Some(&raw_red),
             Some(&[0x80]),
+            true,
         );
         let mut preimage2 = raw_red.to_vec();
         preimage2.extend(encode_language_views(&cm, false, false, false));
@@ -898,8 +937,10 @@ mod tests {
             false,
             None,
             None,
+            true,
         );
-        let h_empty = compute_script_data_hash(&[], &[], &cm, false, false, false, None, None);
+        let h_empty =
+            compute_script_data_hash(&[], &[], &cm, false, false, false, None, None, true);
         assert_ne!(h_with, h_empty);
     }
 
@@ -922,8 +963,53 @@ mod tests {
             false,
             None,
             None,
+            true,
         );
-        let h_empty = compute_script_data_hash(&[], &[], &cm, false, false, false, None, None);
+        let h_empty =
+            compute_script_data_hash(&[], &[], &cm, false, false, false, None, None, true);
         assert_ne!(h, h_empty);
+    }
+
+    /// Regression for the Babbage supplemental-datum `ScriptDataHashMismatch`
+    /// class seen on from-genesis preview/preprod replay: a pre-Conway tx with
+    /// NO redeemers but a witness-set datum (and no scripts, so empty
+    /// langViews) must encode the absent redeemers as `0x80` (empty list), not
+    /// `0xa0` (empty map). Uses the real preview tx
+    /// `0aa1356385e74c666b0911c14324fb16958b23f1ed742f26b83f95ac4a6d0317`
+    /// (epoch 60, Babbage), whose on-chain `script_data_hash` is `16d7bf6b…`.
+    #[test]
+    fn babbage_supplemental_datum_uses_list_empty_redeemers() {
+        let tx_cbor = hex::decode(
+            include_str!("../../test_data/sdh_babbage_supplemental_datum_tx.hex").trim(),
+        )
+        .unwrap();
+        // No scripts are invoked → langViews empty → cost models irrelevant.
+        let cm = CostModels::default();
+        let expected =
+            Hash32::from_hex("16d7bf6b90bcb2a235c8f4668db3e164b85edc3df5ef7bd64a021ec26d3f3887")
+                .unwrap();
+
+        // Pre-Conway (list form): matches the on-chain hash.
+        let ok = compute_script_data_hash_from_cbor(&tx_cbor, &cm, false, false, false, false);
+        assert_eq!(
+            ok,
+            Some(expected),
+            "Babbage datum-only tx must use 0x80 empty-list redeemers sentinel"
+        );
+
+        // Conway (map form): the pre-fix behaviour — must NOT match, proving the
+        // era gate is load-bearing (this produced the logged 9508f71b… mismatch).
+        let wrong = compute_script_data_hash_from_cbor(&tx_cbor, &cm, false, false, false, true);
+        assert_ne!(
+            wrong,
+            Some(expected),
+            "map-form empty redeemers (0xa0) must diverge for a pre-Conway tx"
+        );
+        assert_eq!(
+            wrong,
+            Hash32::from_hex("9508f71b174d244c6df411bda68a21612be1543b64922a1184d422d94e93fc68")
+                .ok(),
+            "map-form path reproduces the exact pre-fix divergence"
+        );
     }
 }

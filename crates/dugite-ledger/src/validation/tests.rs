@@ -821,6 +821,7 @@ mod tests {
             !tx.witness_set.plutus_v3_scripts.is_empty(),
             None,
             None,
+            params.protocol_version_major >= 9,
         );
         tx.body.script_data_hash = Some(computed_hash);
         tx
@@ -2684,6 +2685,7 @@ mod tests {
             false,
             None,
             None,
+            params.protocol_version_major >= 9,
         );
         let tx = Transaction {
             era: dugite_primitives::era::Era::Conway,
