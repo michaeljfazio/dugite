@@ -110,6 +110,7 @@
 
 ## Storage
 - [lsm-tree-architecture.md](lsm-tree-architecture.md) — lazy levelling merge, 4-file run format, bloom filters, NO WAL
+- [ledgerdb-v2-diff-retention-and-snapshot-decoupling.md](ledgerdb-v2-diff-retention-and-snapshot-decoupling.md) — V1 DbChangelog DELETED from main; V2 LedgerSeq/StateRef holds FULL materialized table per volatile-window block (not diffs-to-reverse-apply); rollback=pure AnchoredSeq trim; disk-snapshot (implTryTakeSnapshot) never touches live ldbSeq TVar, fully decoupled from garbageCollect (k-driven pruning)
 
 ## Misc / Ledger Semantics
 - [v1-txinfo-wdrl-encoding.md](v1-txinfo-wdrl-encoding.md) — V1 txInfoWdrl=List[Constr0[cred,amt]] (NOT Map, that's V2)

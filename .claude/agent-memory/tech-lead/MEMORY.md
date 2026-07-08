@@ -8,6 +8,9 @@
 - [#799/800/802/812 Conway gov batch](issues-799-800-802-812-batch-fix.md) — ratify tie-break (SNAPSHOT v26), CC zero-threshold ordering, atomic PParams enactment
 - [#805/806/807/813 robustness batch](issues-805-806-807-813-batch-fix.md) — UtxoStore crash-not-diverge on LSM errors, LedgerSeq/DiffSeq desync guard, pp_future PPUP diagnostic
 
+## Live-Apply Rollback Investigations
+- [DiffSeq clear vs hardened fallback (2026-07-08)](rollback-diffseq-clear-vs-caller-fallback-hardened.md) — real root cause = vestigial `diff_seq.clear()` in epoch.rs defeats already-k-bounded `push_bounded` window; node-level snapshot-reload fallback is ALREADY hardened (refutes naive "reloads latest snapshot" theory) — fix is to stop clearing, not to further harden the fallback
+
 ## UPLC CEK Machine
 - [Flat wire ID vs cost table (#761)](uplc-builtin-flat-id-mismatch.md) — BLS G1/G2 + UPLC 1.1.0 builtin IDs mis-ordered; conformance (text-format) doesn't catch flat-ID bugs
 - [PV-gates #819/#820/#824/#828 (2026-07-06)](uplc-root-cause-a-pv-gates-819-820-824-828.md) — SemanticsVariant threaded into cost layer; 999-corpus is E-only/no-PV, blind to PV<11; #828.5 ConstrData tag-overflow is a scoped known limitation
