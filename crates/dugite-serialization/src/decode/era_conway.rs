@@ -187,7 +187,7 @@ fn decode_conway_block_mode(
     let mut parsed_witnesses: Vec<Option<TransactionWitnessSet>> = Vec::new();
     r.for_each_array_item(|r| {
         if mode == DecodeMode::Full {
-            let ws = KeepRaw::parse_with(r, decode_conway_witness_set)?;
+            let ws = KeepRaw::parse_with(r, |r| decode_conway_witness_set(r, era))?;
             raw_witnesses.push(ws.raw.to_vec());
             parsed_witnesses.push(Some(ws.value));
         } else {
@@ -2349,6 +2349,7 @@ fn read_drep_voting_thresholds(
 /// - Key 7: plutus_v3_scripts
 fn decode_conway_witness_set(
     r: &mut Reader<'_>,
+    era: Era,
 ) -> Result<TransactionWitnessSet, SerializationError> {
     let mut vkey_witnesses: Vec<VKeyWitness> = Vec::new();
     let mut native_scripts = Vec::new();
@@ -2442,7 +2443,7 @@ fn decode_conway_witness_set(
             5 => {
                 // redeemers: map form (Conway) or array form (pre-Conway) — NOT a set
                 let rd_start = r.position();
-                redeemers = read_redeemers(r)?;
+                redeemers = read_redeemers(r, era)?;
                 raw_redeemers_cbor = Some(r.slice_from(rd_start).to_vec());
             }
             6 => {
@@ -2483,15 +2484,32 @@ fn decode_conway_witness_set(
 }
 
 /// Read redeemers — supports both Conway map form and pre-Conway array form.
-fn read_redeemers(r: &mut Reader<'_>) -> Result<Vec<Redeemer>, SerializationError> {
-    read_redeemers_raw(r).map(crate::decode::helpers::dedup_redeemers_last_wins)
+///
+/// `era` selects the decoder version: from Dijkstra (PV12) on, the legacy
+/// list/array encoding is a hard decode failure (see [`read_redeemers_raw`]).
+fn read_redeemers(r: &mut Reader<'_>, era: Era) -> Result<Vec<Redeemer>, SerializationError> {
+    read_redeemers_raw(r, era).map(crate::decode::helpers::dedup_redeemers_last_wins)
 }
 
 /// Wire-form reader without the Haskell `Map.fromList` dedup — every caller
 /// must go through [`read_redeemers`]. Duplicate (tag, index) entries occur
 /// on-chain (mainnet block 8,826,011, #753); Haskell collapses them
 /// (last-wins) in BOTH the map and array wire forms.
-fn read_redeemers_raw(r: &mut Reader<'_>) -> Result<Vec<Redeemer>, SerializationError> {
+///
+/// From PV12 (Dijkstra) the list/array wire form is rejected outright, matching
+/// cardano-ledger `DecCBOR (Annotator RedeemersRaw)` in `Alonzo/TxWits.hs`:
+///
+/// ```haskell
+/// ifDecoderVersionAtLeast (natVersion @12)
+///   (fail "List encoding of redeemers not supported starting with PV 12")
+///   decodeListRedeemers
+/// ```
+///
+/// The decoder version equals the protocol major version, and PV12 is the
+/// Dijkstra hard fork, so `era == Dijkstra` is the exact proxy for the gate.
+/// The whole list branch fails (empty `0x80` included) — only the Conway map
+/// form is accepted at PV12+.
+fn read_redeemers_raw(r: &mut Reader<'_>, era: Era) -> Result<Vec<Redeemer>, SerializationError> {
     let ty = r.peek_major()?;
     match ty {
         Type::Map | Type::MapIndef => {
@@ -2535,6 +2553,14 @@ fn read_redeemers_raw(r: &mut Reader<'_>) -> Result<Vec<Redeemer>, Serialization
                 })
                 .collect();
             Ok(out)
+        }
+        Type::Array | Type::ArrayIndef if era == Era::Dijkstra => {
+            // PV12 (Dijkstra) hard-rejects the legacy list encoding — matches
+            // Haskell's `fail` branch. Reject before reading any element so an
+            // empty `0x80` list is refused too.
+            Err(SerializationError::CborDecode(
+                "List encoding of redeemers not supported starting with PV 12".to_string(),
+            ))
         }
         Type::Array | Type::ArrayIndef => {
             // Pre-Conway array form: [* [tag, index, data, ex_units]]
@@ -3028,7 +3054,7 @@ pub(crate) fn decode_conway_tx_standalone(
     let body = body_raw.value;
 
     // 2. Witness set
-    let ws_raw = KeepRaw::parse_with(&mut r, decode_conway_witness_set)?;
+    let ws_raw = KeepRaw::parse_with(&mut r, |r| decode_conway_witness_set(r, era))?;
     let raw_witness_cbor = ws_raw.raw.to_vec();
     let witness_set = ws_raw.value;
 
@@ -3126,7 +3152,7 @@ pub(crate) fn decode_dijkstra_tx_standalone(
     let body = body_raw.value;
 
     // 2. Witness set.
-    let ws_raw = KeepRaw::parse_with(&mut r, decode_conway_witness_set)?;
+    let ws_raw = KeepRaw::parse_with(&mut r, |r| decode_conway_witness_set(r, Era::Dijkstra))?;
     let raw_witness_cbor = ws_raw.raw.to_vec();
     let witness_set = ws_raw.value;
 
@@ -3552,7 +3578,7 @@ mod tests {
         data.extend(&value_arr);
 
         let mut r = Reader::new(&data);
-        let redeemers = read_redeemers(&mut r).unwrap();
+        let redeemers = read_redeemers(&mut r, Era::Conway).unwrap();
         assert_eq!(redeemers.len(), 1);
         assert_eq!(redeemers[0].tag, RedeemerTag::Spend);
         assert_eq!(redeemers[0].index, 0);
@@ -3575,10 +3601,64 @@ mod tests {
         data.extend(&redeemer);
 
         let mut r = Reader::new(&data);
-        let redeemers = read_redeemers(&mut r).unwrap();
+        let redeemers = read_redeemers(&mut r, Era::Conway).unwrap();
         assert_eq!(redeemers.len(), 1);
         assert_eq!(redeemers[0].tag, RedeemerTag::Spend);
         assert_eq!(redeemers[0].ex_units.mem, 50);
+    }
+
+    /// #885: the legacy list/array redeemers encoding is accepted through
+    /// Conway (PV9/10/11) but hard-rejected from Dijkstra (PV12) on, mirroring
+    /// cardano-ledger's `ifDecoderVersionAtLeast (natVersion @12) (fail …)`.
+    #[test]
+    fn test_redeemers_list_form_rejected_from_pv12() {
+        // Same array-form bytes as `test_read_redeemers_array_form`:
+        // [[0, 0, #6.121([]), [50, 100]]] — Alonzo/Babbage list form.
+        let constr_data = {
+            let mut v = cbor_tag(121);
+            v.extend(vec![0x80]);
+            v
+        };
+        let ex_units = cbor_arr(&[&cbor_uint(50), &cbor_uint(100)]);
+        let redeemer = cbor_arr(&[&cbor_uint(0), &cbor_uint(0), &constr_data, &ex_units]);
+        let mut list_bytes = vec![0x81]; // array(1)
+        list_bytes.extend(&redeemer);
+
+        // Conway (PV11): accepted.
+        let mut r = Reader::new(&list_bytes);
+        let redeemers = read_redeemers(&mut r, Era::Conway).expect("Conway accepts list form");
+        assert_eq!(redeemers.len(), 1);
+
+        // Dijkstra (PV12): the identical bytes are a decode failure.
+        let mut r = Reader::new(&list_bytes);
+        let err = read_redeemers(&mut r, Era::Dijkstra)
+            .expect_err("Dijkstra must reject list-encoded redeemers");
+        assert!(
+            matches!(&err, SerializationError::CborDecode(m) if m.contains("PV 12")),
+            "unexpected error for PV12 list redeemers: {err:?}"
+        );
+
+        // The EMPTY list `0x80` is rejected too (whole list branch fails).
+        let empty_list = vec![0x80];
+        let mut r = Reader::new(&empty_list);
+        assert!(read_redeemers(&mut r, Era::Dijkstra).is_err());
+        // …but Conway still accepts an empty list as zero redeemers.
+        let mut r = Reader::new(&empty_list);
+        assert_eq!(read_redeemers(&mut r, Era::Conway).unwrap().len(), 0);
+
+        // The Conway MAP form is accepted in BOTH eras (only the list form is
+        // gated). { [0,0] => [#6.121([]), [50,100]] }
+        let value_arr = cbor_arr(&[&constr_data, &ex_units]);
+        let key_arr = cbor_arr(&[&cbor_uint(0), &cbor_uint(0)]);
+        let mut map_bytes = vec![0xa1]; // map(1)
+        map_bytes.extend(&key_arr);
+        map_bytes.extend(&value_arr);
+        for era in [Era::Conway, Era::Dijkstra] {
+            let mut r = Reader::new(&map_bytes);
+            let rs = read_redeemers(&mut r, era).expect("map form accepted in every era");
+            assert_eq!(rs.len(), 1);
+            assert_eq!(rs[0].ex_units.mem, 50);
+        }
     }
 
     // ── Plutus V3 script ──────────────────────────────────────────────────────
@@ -3597,7 +3677,7 @@ mod tests {
         data.extend(&scripts_arr);
 
         let mut r = Reader::new(&data);
-        let ws = decode_conway_witness_set(&mut r).unwrap();
+        let ws = decode_conway_witness_set(&mut r, Era::Conway).unwrap();
         assert_eq!(ws.plutus_v3_scripts.len(), 1);
         assert_eq!(ws.plutus_v3_scripts[0], vec![0xde, 0xad, 0xbe, 0xef]);
     }
@@ -3621,7 +3701,7 @@ mod tests {
         data.extend(cbor_uint(0));
 
         let mut r = Reader::new(&data);
-        let result = decode_conway_witness_set(&mut r);
+        let result = decode_conway_witness_set(&mut r, Era::Conway);
         assert!(
             matches!(result, Err(SerializationError::CborDecode(_))),
             "unknown witness-set key must be rejected, got {result:?}"
@@ -3643,7 +3723,7 @@ mod tests {
         data.extend(&empty_set);
 
         let mut r = Reader::new(&data);
-        let result = decode_conway_witness_set(&mut r);
+        let result = decode_conway_witness_set(&mut r, Era::Conway);
         assert!(
             matches!(result, Err(SerializationError::CborDecode(_))),
             "duplicate witness-set field key must be rejected, got {result:?}"
@@ -3818,7 +3898,7 @@ mod tests {
         data.extend(&set);
 
         let mut r = Reader::new(&data);
-        let ws = decode_conway_witness_set(&mut r)
+        let ws = decode_conway_witness_set(&mut r, Era::Conway)
             .expect("duplicate vkey witness must decode Ok at PV9-11 (Haskell accepts)");
         assert_eq!(
             ws.vkey_witnesses.len(),
@@ -3846,7 +3926,7 @@ mod tests {
         data.extend(&set);
 
         let mut r = Reader::new(&data);
-        let ws = decode_conway_witness_set(&mut r)
+        let ws = decode_conway_witness_set(&mut r, Era::Conway)
             .expect("duplicate native script must decode Ok at PV9-11 (Haskell accepts)");
         assert_eq!(
             ws.native_scripts.len(),
@@ -3879,7 +3959,7 @@ mod tests {
         data.extend(&set);
 
         let mut r = Reader::new(&data);
-        let ws = decode_conway_witness_set(&mut r)
+        let ws = decode_conway_witness_set(&mut r, Era::Conway)
             .expect("duplicate bootstrap witness must decode Ok at PV9-11 (Haskell accepts)");
         assert_eq!(
             ws.bootstrap_witnesses.len(),
@@ -3907,7 +3987,7 @@ mod tests {
         data.extend(&set);
 
         let mut r = Reader::new(&data);
-        let ws = decode_conway_witness_set(&mut r)
+        let ws = decode_conway_witness_set(&mut r, Era::Conway)
             .expect("duplicate plutus datum must decode Ok at PV9-11 (Haskell accepts)");
         assert_eq!(
             ws.plutus_data.len(),
@@ -3955,7 +4035,7 @@ mod tests {
         data.extend(&set);
 
         let mut r = Reader::new(&data);
-        let ws = decode_conway_witness_set(&mut r).expect("unique vkeys decode");
+        let ws = decode_conway_witness_set(&mut r, Era::Conway).expect("unique vkeys decode");
         assert_eq!(ws.vkey_witnesses.len(), 2);
         assert_eq!(ws.vkey_witnesses[0].vkey, vec![0x44; 32]);
         assert_eq!(ws.vkey_witnesses[1].vkey, vec![0x66; 32]);
@@ -4994,7 +5074,7 @@ mod tests {
         let mut def = vec![0xA1];
         def.extend_from_slice(&body);
         let mut rd = Reader::new(&def);
-        let rs = read_redeemers(&mut rd).expect("definite map redeemers must decode");
+        let rs = read_redeemers(&mut rd, Era::Conway).expect("definite map redeemers must decode");
         assert_eq!(rs.len(), 1);
         assert_eq!(rs[0].tag, RedeemerTag::Spend);
         assert_eq!(rs[0].index, 0);
@@ -5005,7 +5085,8 @@ mod tests {
         indef.extend_from_slice(&body);
         indef.push(0xFF);
         let mut ri = Reader::new(&indef);
-        let rs2 = read_redeemers(&mut ri).expect("indefinite map redeemers must decode");
+        let rs2 =
+            read_redeemers(&mut ri, Era::Conway).expect("indefinite map redeemers must decode");
         assert_eq!(rs2.len(), 1);
         assert_eq!(rs2[0].tag, RedeemerTag::Spend);
         assert_eq!(rs2[0].index, 0);
