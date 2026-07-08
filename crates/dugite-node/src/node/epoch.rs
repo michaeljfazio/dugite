@@ -363,10 +363,19 @@ impl Node {
             // state is the persistence vehicle.
             ls.consensus.opcert_counters = self.consensus.opcert_counters().clone();
 
-            // Free DiffSeq memory before snapshot — diffs are not
-            // persisted (#[serde(skip)]) and clearing here reclaims
-            // memory immediately.
-            ls.utxo.diff_seq.clear();
+            // Do NOT clear DiffSeq here. `diff_seq` is the k-bounded UTxO
+            // rollback window (bounded via `push_bounded(security_param)` in
+            // `apply.rs`); the `LedgerSeq` is retained across snapshots too.
+            // Clearing only the DiffSeq on every snapshot desynced the two, so
+            // any rollback taken right after a periodic snapshot (empty
+            // DiffSeq) was forced off `rollback_via_seq`'s fast path onto the
+            // snapshot-reload slow path — which stalled a live BP on a routine
+            // 1-block fork switch, diverging from the canonical chain. Haskell's
+            // LedgerDB V2 snapshots a *local copy* and never touches the
+            // in-memory rollback structure; that structure is pruned solely by
+            // immutable-tip advancement (`flush_up_to`), never by snapshot
+            // writes. Diffs are `#[serde(skip)]` (nothing to persist) and
+            // `push_bounded` already caps live memory at k entries.
 
             // Flush UTxO store to disk FIRST (cardano-lsm has no WAL).
             // MUST stay under the lock: `LsmTree::save_snapshot` takes
@@ -508,7 +517,10 @@ impl Node {
         let req = {
             let mut ls = self.ledger_state.write().await;
             ls.consensus.opcert_counters = self.consensus.opcert_counters().clone();
-            ls.utxo.diff_seq.clear();
+            // Intentionally NOT clearing `ls.utxo.diff_seq` — it is the
+            // k-bounded rollback window and must survive snapshot writes (see
+            // `save_ledger_snapshot` for the full rationale). Clearing it here
+            // stalled a live BP on a post-snapshot fork-switch rollback.
             // #767: the LSM flush (memtable→SST + possible compaction) is a
             // multi-second SYNCHRONOUS call held under `ledger_state.write()`.
             // Without `block_in_place` it pins this tokio worker for the whole

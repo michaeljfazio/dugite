@@ -17520,6 +17520,114 @@ fn rollback_via_seq_detects_diff_seq_desync_and_bails_out() {
     assert!(!state.utxo.utxo_set.contains(&genesis_input));
 }
 
+/// BUG-4 regression: a live-tip fork switch right after a periodic snapshot
+/// must take the fast `rollback_via_seq` path and restore UTxO + non-UTxO
+/// state exactly. Companion to `rollback_via_seq_detects_diff_seq_desync_and_bails_out`
+/// (the guard case). Before the fix, `save_ledger_snapshot`/`try_snapshot_async`
+/// called `diff_seq.clear()` on every snapshot, so this exact 1-block rollback
+/// hit the empty-`diff_seq` bail-out → snapshot-reload slow path → a live BP
+/// stalled on the canonical chain. `diff_seq` is now retained (k-bounded by
+/// `push_bounded`), so the rollback stays on the O(n) fast path.
+#[test]
+fn rollback_via_seq_fast_path_restores_state_when_diff_seq_retained() {
+    let params = ProtocolParameters::mainnet_defaults();
+    let mut state = LedgerState::new(params);
+
+    let genesis_input = TransactionInput {
+        transaction_id: Hash32::from_bytes([0xF0u8; 32]),
+        index: 0,
+    };
+    state
+        .utxo
+        .utxo_set
+        .insert(genesis_input.clone(), make_lovelace_output(10_000_000));
+
+    let mut seq = LedgerSeq::with_defaults(state.clone_without_utxos(), 100);
+
+    // Block 0 (slot 1): spend genesis, create X.
+    let x_input = TransactionInput {
+        transaction_id: Hash32::from_bytes([1u8; 32]),
+        index: 0,
+    };
+    let b0 = make_test_block(
+        1,
+        1,
+        Hash32::ZERO,
+        vec![make_simple_tx(
+            1,
+            vec![genesis_input.clone()],
+            vec![make_lovelace_output(9_800_000)],
+        )],
+    );
+    let d0 = state
+        .apply_block_with_delta(&b0, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d0);
+
+    // Block 1 (slot 2): spend X, create Y.
+    let y_input = TransactionInput {
+        transaction_id: Hash32::from_bytes([2u8; 32]),
+        index: 0,
+    };
+    let b1 = make_test_block(
+        2,
+        2,
+        *b0.hash(),
+        vec![make_simple_tx(
+            2,
+            vec![x_input.clone()],
+            vec![make_lovelace_output(9_600_000)],
+        )],
+    );
+    let d1 = state
+        .apply_block_with_delta(&b1, BlockValidationMode::ApplyOnly)
+        .unwrap();
+    seq.push(d1);
+
+    // Post-fix: the snapshot-save path no longer clears `diff_seq`, so both the
+    // seq and diff_seq still hold the two block deltas across the (would-be)
+    // snapshot boundary.
+    assert_eq!(seq.len(), 2);
+    assert_eq!(
+        state.utxo.diff_seq.len(),
+        2,
+        "diff_seq must be retained across the snapshot boundary (BUG-4 fix)"
+    );
+    assert!(state.utxo.utxo_set.contains(&y_input));
+
+    // Roll back exactly 1 block to block 0's tip — the fork-switch intersection.
+    // With diff_seq populated this must take the O(n) fast path (Some(1)), NOT
+    // bail out to the snapshot-reload slow path.
+    let point_after_b0 = b0.point();
+    let rolled = state.rollback_via_seq(&mut seq, &point_after_b0);
+    assert_eq!(
+        rolled,
+        Some(1),
+        "a populated diff_seq must satisfy the rollback on the fast path"
+    );
+
+    // UTxO set rolled back exactly to block 0's tip: X restored (block-1 diff
+    // reverse-applied), Y removed, genesis stays spent (block 0 kept).
+    assert!(
+        state.utxo.utxo_set.contains(&x_input),
+        "X restored by reverse-applying the block-1 diff"
+    );
+    assert!(
+        !state.utxo.utxo_set.contains(&y_input),
+        "Y (created in block 1) removed"
+    );
+    assert!(
+        !state.utxo.utxo_set.contains(&genesis_input),
+        "genesis stays spent — block 0 is kept"
+    );
+    assert_eq!(seq.len(), 1, "seq rolled back to the block-0 tip");
+    assert_eq!(
+        state.utxo.diff_seq.len(),
+        1,
+        "diff_seq trimmed by the one rolled-back block"
+    );
+}
+
 /// #783(b): a pool that is re-registered TWICE (double re-registration)
 /// leaves `future_pool_params.len()` unchanged between the two
 /// re-registrations. Same reconstruction-forcing shape as (a), but exercises
