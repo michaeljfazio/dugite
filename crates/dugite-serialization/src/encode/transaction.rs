@@ -188,6 +188,52 @@ pub fn encode_witness_set(ws: &TransactionWitnessSet) -> Vec<u8> {
     encode_witness_set_for_era(ws, Era::Conway)
 }
 
+/// Encode the `redeemers` witness term (witness-set key 5) as CBOR.
+///
+/// The wire form is era-dependent and `map_form` selects it:
+/// - Conway/Dijkstra (`map_form = true`): MAP `{ [tag, index] => [data, ex_units], … }`
+///   (Conway CDDL `nonempty_map<redeemer_key, redeemer_value>`).
+/// - Alonzo/Babbage (`map_form = false`): LIST `[* [tag, index, data, ex_units]]`.
+///
+/// An empty slice therefore encodes as the era's empty container — `0xa0`
+/// (empty map) in Conway/Dijkstra, `0x80` (empty list) pre-Conway — which is
+/// exactly the empty-redeemers sentinel used by the script-integrity preimage
+/// (see [`crate::compute_script_data_hash`]). This is the single canonical
+/// redeemers encoder, shared by the witness-set builder, the script-data-hash
+/// preimage, and `dugite-cli`'s offline tx builder so the three never diverge.
+pub fn encode_redeemers(redeemers: &[Redeemer], map_form: bool) -> Vec<u8> {
+    let mut buf = Vec::new();
+    if map_form {
+        // Conway/Dijkstra map: { [tag, index] => [data, ex_units], … }
+        buf.extend(encode_map_header(redeemers.len()));
+        for r in redeemers {
+            // Key: [tag, index]
+            buf.extend(encode_array_header(2));
+            buf.extend(encode_redeemer_tag(&r.tag));
+            buf.extend(encode_uint(r.index as u64));
+            // Value: [data, ex_units]
+            buf.extend(encode_array_header(2));
+            buf.extend(encode_plutus_data(&r.data));
+            buf.extend(encode_array_header(2));
+            buf.extend(encode_uint(r.ex_units.mem));
+            buf.extend(encode_uint(r.ex_units.steps));
+        }
+    } else {
+        // Pre-Conway list: [* [tag, index, data, ex_units]]
+        buf.extend(encode_array_header(redeemers.len()));
+        for r in redeemers {
+            buf.extend(encode_array_header(4));
+            buf.extend(encode_redeemer_tag(&r.tag));
+            buf.extend(encode_uint(r.index as u64));
+            buf.extend(encode_plutus_data(&r.data));
+            buf.extend(encode_array_header(2));
+            buf.extend(encode_uint(r.ex_units.mem));
+            buf.extend(encode_uint(r.ex_units.steps));
+        }
+    }
+    buf
+}
+
 /// Encode a transaction witness set using era-specific encoding rules.
 ///
 /// - Conway: redeemers use map format `{ [tag, index] => [data, ex_units] }`
@@ -265,37 +311,12 @@ pub(super) fn encode_witness_set_for_era(ws: &TransactionWitnessSet, era: Era) -
 
     if !ws.redeemers.is_empty() {
         buf.extend(encode_uint(5));
-        if matches!(era, Era::Conway | Era::Dijkstra) {
-            // Conway/Dijkstra map format: { [tag, index] => [data, ex_units], ... }
-            // Per Conway CDDL (also inherited by Dijkstra):
-            //   redeemers = nonempty_map<redeemer_key, redeemer_value>
-            buf.extend(encode_map_header(ws.redeemers.len()));
-            for r in &ws.redeemers {
-                // Key: [tag, index]
-                buf.extend(encode_array_header(2));
-                buf.extend(encode_redeemer_tag(&r.tag));
-                buf.extend(encode_uint(r.index as u64));
-                // Value: [data, ex_units]
-                buf.extend(encode_array_header(2));
-                buf.extend(encode_plutus_data(&r.data));
-                buf.extend(encode_array_header(2));
-                buf.extend(encode_uint(r.ex_units.mem));
-                buf.extend(encode_uint(r.ex_units.steps));
-            }
-        } else {
-            // Pre-Conway (Alonzo/Babbage) array format:
-            //   [* [tag, index, data, ex_units]]
-            buf.extend(encode_array_header(ws.redeemers.len()));
-            for r in &ws.redeemers {
-                buf.extend(encode_array_header(4));
-                buf.extend(encode_redeemer_tag(&r.tag));
-                buf.extend(encode_uint(r.index as u64));
-                buf.extend(encode_plutus_data(&r.data));
-                buf.extend(encode_array_header(2));
-                buf.extend(encode_uint(r.ex_units.mem));
-                buf.extend(encode_uint(r.ex_units.steps));
-            }
-        }
+        // Single canonical redeemers encoder — map form in Conway/Dijkstra,
+        // list form pre-Conway. Shared with the script-data-hash preimage.
+        buf.extend(encode_redeemers(
+            &ws.redeemers,
+            matches!(era, Era::Conway | Era::Dijkstra),
+        ));
     }
 
     if !ws.plutus_v2_scripts.is_empty() {

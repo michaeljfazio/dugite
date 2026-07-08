@@ -32,7 +32,7 @@ pub use script::{
 };
 pub use transaction::{
     compute_transaction_hash, compute_transaction_hash_from_tx, encode_auxiliary_data,
-    encode_dijkstra_transaction, encode_transaction, encode_transaction_body,
+    encode_dijkstra_transaction, encode_redeemers, encode_transaction, encode_transaction_body,
     encode_transaction_output, encode_witness_set,
 };
 pub use value::encode_value;

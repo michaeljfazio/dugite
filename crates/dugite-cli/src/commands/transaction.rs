@@ -1115,50 +1115,6 @@ pub(crate) fn parse_execution_units(s: &str) -> Result<ExUnits> {
     Ok(ExUnits { mem, steps })
 }
 
-/// Encode a single `Redeemer` to CBOR `[tag, index, data, [mem, steps]]`.
-///
-/// Self-contained implementation that avoids depending on the `pub(crate)`
-/// helper in `dugite-serialization`, keeping the CLI crate independent.
-fn encode_redeemer_to_cbor(r: &Redeemer) -> Vec<u8> {
-    // Redeemer = [tag, index, data, ex_units]
-    // Tag: Spend=0, Mint=1, Cert=2, Reward=3, Vote=4, Propose=5, Guarding=6
-    // (Guarding is Dijkstra-only — issue #475 Phase 3.5).
-    let tag_num: u64 = match r.tag {
-        RedeemerTag::Spend => 0,
-        RedeemerTag::Mint => 1,
-        RedeemerTag::Cert => 2,
-        RedeemerTag::Reward => 3,
-        RedeemerTag::Vote => 4,
-        RedeemerTag::Propose => 5,
-        RedeemerTag::Guarding => 6,
-    };
-
-    // Build header (array(4), tag, index) in a block so the encoder borrow ends
-    // before we extend with the data and ex_units bytes.
-    let mut header = Vec::new();
-    {
-        let mut enc = minicbor::Encoder::new(&mut header);
-        enc.array(4).unwrap();
-        enc.u64(tag_num).unwrap();
-        enc.u64(r.index as u64).unwrap();
-    }
-
-    // ex_units: [mem, steps]
-    let mut ex_units = Vec::new();
-    {
-        let mut enc = minicbor::Encoder::new(&mut ex_units);
-        enc.array(2).unwrap();
-        enc.u64(r.ex_units.mem).unwrap();
-        enc.u64(r.ex_units.steps).unwrap();
-    }
-
-    // Concatenate: header || data_cbor || ex_units
-    let mut buf = header;
-    buf.extend_from_slice(&encode_plutus_data_to_cbor(&r.data));
-    buf.extend_from_slice(&ex_units);
-    buf
-}
-
 /// Encode a `PlutusData` value to CBOR using the Cardano wire encoding.
 ///
 /// Self-contained implementation that mirrors `dugite_serialization::cbor::encode_plutus_data`
@@ -1280,13 +1236,14 @@ fn encode_plutus_data_to_cbor(data: &PlutusData) -> Vec<u8> {
 /// re-validates this hash during submission using the actual cost models.
 ///
 /// Returns `None` when no Plutus scripts are attached to the transaction.
-pub(crate) fn compute_script_data_hash_offline(witnesses: &[ScriptWitness]) -> Option<Hash32> {
-    if witnesses.is_empty() {
-        return None;
-    }
-
-    // Redeemers: one per witness, indexed by witness position (= sorted tx-input position)
-    let redeemers: Vec<Redeemer> = witnesses
+/// Build the `Redeemer` list for a set of script witnesses.
+///
+/// One `Spend` redeemer per witness, indexed by witness position (= sorted
+/// tx-input position). Shared by [`build_plutus_witness_set_cbor`] (key 5) and
+/// [`compute_script_data_hash_offline`] so the redeemers term in the witness
+/// set and the one fed into the script-integrity hash are built identically.
+fn conway_redeemers(witnesses: &[ScriptWitness]) -> Vec<Redeemer> {
+    witnesses
         .iter()
         .enumerate()
         .map(|(idx, w)| {
@@ -1299,37 +1256,71 @@ pub(crate) fn compute_script_data_hash_offline(witnesses: &[ScriptWitness]) -> O
                 ex_units: w.ex_units,
             }
         })
-        .collect();
+        .collect()
+}
 
-    // Encode redeemers as an array
-    let mut redeemer_bytes = Vec::new();
+/// Encode the datums witness term (key 4) as a bare `array(n)` of the
+/// pre-encoded per-witness datum CBOR, matching what the witness-set builder
+/// emits so the script-integrity hash preimage is byte-identical to the wire
+/// witness set (the ledger recomputes the hash from those bytes).
+fn conway_datums_term(witnesses: &[ScriptWitness]) -> Vec<u8> {
+    let mut buf = Vec::new();
     {
-        let mut enc = minicbor::Encoder::new(&mut redeemer_bytes);
-        enc.array(redeemers.len() as u64).unwrap();
-    }
-    for r in &redeemers {
-        redeemer_bytes.extend_from_slice(&encode_redeemer_to_cbor(r));
-    }
-
-    // Encode datums as an array
-    let mut datum_bytes = Vec::new();
-    {
-        let mut enc = minicbor::Encoder::new(&mut datum_bytes);
+        let mut enc = minicbor::Encoder::new(&mut buf);
         enc.array(witnesses.len() as u64).unwrap();
     }
     for w in witnesses {
-        datum_bytes.extend_from_slice(&w.datum_cbor);
+        buf.extend_from_slice(&w.datum_cbor);
+    }
+    buf
+}
+
+/// Compute the `script_data_hash` (tx body field 11) for a set of Plutus
+/// witnesses, offline (no ledger state).
+///
+/// Delegates the preimage assembly to the canonical
+/// [`dugite_serialization::compute_script_data_hash`] rather than hand-rolling
+/// it, so byte-exact fixes (era-gated empty-redeemers sentinel, empty-datums
+/// omission, language-views layout) stay in one place (#884). The redeemers
+/// term is Conway **map** form (era-correct; the legacy array form is
+/// hard-rejected from PV12 — #885) and byte-matches key 5 of the witness set
+/// built by [`build_plutus_witness_set_cbor`]. Language views are empty
+/// (`0xa0`): the offline builder carries no cost models, so it hashes as though
+/// none apply — the same behavior as before.
+pub(crate) fn compute_script_data_hash_offline(witnesses: &[ScriptWitness]) -> Option<Hash32> {
+    if witnesses.is_empty() {
+        return None;
     }
 
-    // Empty language views map: `a0`
-    let language_views: Vec<u8> = vec![0xa0];
+    // Redeemers: Conway map form, shared byte-for-byte with witness-set key 5.
+    let redeemers = conway_redeemers(witnesses);
+    let redeemers_term =
+        dugite_serialization::encode_redeemers(&redeemers, /*map_form=*/ true);
 
-    let mut preimage = Vec::new();
-    preimage.extend_from_slice(&redeemer_bytes);
-    preimage.extend_from_slice(&datum_bytes);
-    preimage.extend_from_slice(&language_views);
+    // Datums: bare array of the raw per-witness datum bytes, shared with key 4.
+    let datums_term = conway_datums_term(witnesses);
+    // Decoded datums only serve to satisfy the "datums present" gate in
+    // `compute_script_data_hash`; the raw `datums_term` bytes drive the hash so
+    // the original datum encoding (and therefore each datum hash) is preserved.
+    let plutus_data: Vec<PlutusData> = witnesses
+        .iter()
+        .map(|w| decode_plutus_data_cbor(&w.datum_cbor).unwrap_or(PlutusData::Bytes(vec![])))
+        .collect();
 
-    Some(dugite_primitives::hash::blake2b_256(&preimage))
+    // No cost models offline → empty language views (`0xa0`).
+    let cost_models = dugite_primitives::transaction::CostModels::default();
+
+    Some(dugite_serialization::compute_script_data_hash(
+        &[],
+        &plutus_data,
+        &cost_models,
+        false,
+        false,
+        false,
+        Some(&redeemers_term),
+        Some(&datums_term),
+        /*redeemers_map_form=*/ true,
+    ))
 }
 
 /// Build the Plutus witness set CBOR for inclusion in the signed transaction.
@@ -1398,37 +1389,30 @@ pub(crate) fn build_plutus_witness_set_cbor(witnesses: &[ScriptWitness]) -> Vec<
         }
     }
 
-    // Key 4: datums — array of PlutusData; each datum_cbor is a pre-encoded item
+    // Key 4: datums — bare `array(n)` of the pre-encoded per-witness datum CBOR.
+    // Shares `conway_datums_term` with the script_data_hash preimage so the two
+    // are byte-identical.
     if datum_count > 0 {
         {
             let mut enc = minicbor::Encoder::new(&mut buf);
             enc.u32(4).unwrap();
-            enc.array(datum_count as u64).unwrap();
         }
-        for w in witnesses {
-            // datum_cbor is the encoding of one PlutusData item — inject raw bytes.
-            buf.extend_from_slice(&w.datum_cbor);
-        }
+        buf.extend_from_slice(&conway_datums_term(witnesses));
     }
 
-    // Key 5: redeemers — array of [tag, index, data, ex_units]
+    // Key 5: redeemers — Conway **map** form `{ [tag, index] => [data, ex_units] }`
+    // (era-correct; the legacy array form is hard-rejected from PV12, #885).
+    // Encoded via the canonical `dugite_serialization::encode_redeemers`, shared
+    // byte-for-byte with the script_data_hash preimage (#884).
     if redeemer_count > 0 {
         {
             let mut enc = minicbor::Encoder::new(&mut buf);
             enc.u32(5).unwrap();
-            enc.array(redeemer_count as u64).unwrap();
         }
-        for (idx, w) in witnesses.iter().enumerate() {
-            let data =
-                decode_plutus_data_cbor(&w.redeemer_data_cbor).unwrap_or(PlutusData::Bytes(vec![]));
-            let r = Redeemer {
-                tag: RedeemerTag::Spend,
-                index: idx as u32,
-                data,
-                ex_units: w.ex_units,
-            };
-            buf.extend_from_slice(&encode_redeemer_to_cbor(&r));
-        }
+        let redeemers = conway_redeemers(witnesses);
+        buf.extend_from_slice(&dugite_serialization::encode_redeemers(
+            &redeemers, /*map_form=*/ true,
+        ));
     }
 
     // Key 6: PlutusV2 scripts
@@ -4856,6 +4840,82 @@ mod tests {
         let h1 = compute_script_data_hash_offline(std::slice::from_ref(&w));
         let h2 = compute_script_data_hash_offline(std::slice::from_ref(&w));
         assert_eq!(h1, h2, "Hash must be deterministic");
+    }
+
+    /// #884: the offline script_data_hash must byte-match the actual witness-set
+    /// bytes — the ledger recomputes the hash from key 4 (datums) + key 5
+    /// (redeemers) as they appear on the wire, so a divergence here would make
+    /// every CLI-built Plutus tx fail with ScriptDataHashMismatch. This locks
+    /// the two encoders (witness-set builder + hash preimage) together and
+    /// pins the redeemers to Conway **map** form.
+    #[test]
+    fn test_offline_hash_matches_witness_set_bytes() {
+        let datum = PlutusData::Constr(0, vec![PlutusData::Integer(7i64.into())]);
+        let redeemer = PlutusData::Integer(num_bigint::BigInt::from(1i64));
+        let mk = |v| ScriptWitness {
+            version: v,
+            script_bytes: vec![0xaa, 0xbb],
+            datum_cbor: encode_plutus_data_to_cbor(&datum),
+            redeemer_data_cbor: encode_plutus_data_to_cbor(&redeemer),
+            ex_units: ExUnits {
+                mem: 1234,
+                steps: 5678,
+            },
+        };
+        let witnesses = vec![mk(PlutusVersion::V3), mk(PlutusVersion::V2)];
+
+        // Redeemers term (key 5) must be Conway map form: `a2` (map(2)) header.
+        let redeemers = conway_redeemers(&witnesses);
+        let redeemers_term = dugite_serialization::encode_redeemers(&redeemers, true);
+        assert_eq!(
+            redeemers_term[0], 0xa2,
+            "Conway redeemers must be a map(2), got {:#x}",
+            redeemers_term[0]
+        );
+
+        // Rebuild the preimage the ledger would hash: extract key 4 and key 5
+        // values straight out of the witness-set CBOR the CLI emits, then append
+        // the empty language views (`0xa0`), and confirm the hash matches.
+        let ws_cbor = build_plutus_witness_set_cbor(&witnesses);
+        let entries = collect_plutus_witness_entries(Some(&hex::encode(&ws_cbor)))
+            .expect("witness set must parse");
+        let mut redeemers_from_ws = None;
+        let mut datums_from_ws = None;
+        for (key, entry) in &entries {
+            // `entry` is the raw key+value CBOR; strip the 1-byte uint key.
+            let value = &entry[1..];
+            match key {
+                4 => datums_from_ws = Some(value.to_vec()),
+                5 => redeemers_from_ws = Some(value.to_vec()),
+                _ => {}
+            }
+        }
+        let redeemers_from_ws = redeemers_from_ws.expect("key 5 present");
+        let datums_from_ws = datums_from_ws.expect("key 4 present");
+
+        // The hash's redeemers/datums terms are exactly the witness-set bytes.
+        assert_eq!(
+            redeemers_from_ws, redeemers_term,
+            "witness-set key 5 must equal the hash's redeemers term"
+        );
+        assert_eq!(
+            datums_from_ws,
+            conway_datums_term(&witnesses),
+            "witness-set key 4 must equal the hash's datums term"
+        );
+
+        let mut preimage = Vec::new();
+        preimage.extend_from_slice(&redeemers_from_ws);
+        preimage.extend_from_slice(&datums_from_ws);
+        preimage.push(0xa0); // empty language views
+        let expected = dugite_primitives::hash::blake2b_256(&preimage);
+
+        let actual = compute_script_data_hash_offline(&witnesses).expect("hash present");
+        assert_eq!(
+            actual.as_bytes(),
+            expected.as_bytes(),
+            "offline hash must equal blake2b(key5 || key4 || 0xa0)"
+        );
     }
 
     // ── Plutus witness set CBOR tests ────────────────────────────────────────

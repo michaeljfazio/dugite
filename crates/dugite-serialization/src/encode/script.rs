@@ -203,35 +203,15 @@ pub fn compute_script_data_hash(
     // `hashScriptIntegrity` which encodes the era's `Redeemers` type verbatim.
     if let Some(raw) = raw_redeemers_cbor {
         preimage.extend_from_slice(raw);
-    } else if redeemers.is_empty() {
-        preimage.push(if redeemers_map_form { 0xa0 } else { 0x80 });
-    } else if redeemers_map_form {
-        // Conway map format: { [tag, index] => [data, ex_units] }
-        let mut redeemers_buf = encode_map_header(redeemers.len());
-        for r in redeemers {
-            redeemers_buf.extend(encode_array_header(2));
-            redeemers_buf.extend(encode_redeemer_tag(&r.tag));
-            redeemers_buf.extend(encode_uint(r.index as u64));
-            redeemers_buf.extend(encode_array_header(2));
-            redeemers_buf.extend(encode_plutus_data(&r.data));
-            redeemers_buf.extend(encode_array_header(2));
-            redeemers_buf.extend(encode_uint(r.ex_units.mem));
-            redeemers_buf.extend(encode_uint(r.ex_units.steps));
-        }
-        preimage.extend(&redeemers_buf);
     } else {
-        // Alonzo/Babbage list format: [ [tag, index, data, ex_units], ... ]
-        let mut redeemers_buf = encode_array_header(redeemers.len());
-        for r in redeemers {
-            redeemers_buf.extend(encode_array_header(4));
-            redeemers_buf.extend(encode_redeemer_tag(&r.tag));
-            redeemers_buf.extend(encode_uint(r.index as u64));
-            redeemers_buf.extend(encode_plutus_data(&r.data));
-            redeemers_buf.extend(encode_array_header(2));
-            redeemers_buf.extend(encode_uint(r.ex_units.mem));
-            redeemers_buf.extend(encode_uint(r.ex_units.steps));
-        }
-        preimage.extend(&redeemers_buf);
+        // Single canonical redeemers encoder — `encode_redeemers` yields the
+        // era's empty container (`0xa0` map / `0x80` list) for an empty slice,
+        // which is exactly the empty-redeemers sentinel, so no special-casing
+        // is needed here.
+        preimage.extend(crate::encode::encode_redeemers(
+            redeemers,
+            redeemers_map_form,
+        ));
     }
 
     // 2. Datums: per Haskell `SafeToHash (ScriptIntegrity era)` the datums term
