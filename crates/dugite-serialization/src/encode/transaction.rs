@@ -201,12 +201,25 @@ pub fn encode_witness_set(ws: &TransactionWitnessSet) -> Vec<u8> {
 /// (see [`crate::compute_script_data_hash`]). This is the single canonical
 /// redeemers encoder, shared by the witness-set builder, the script-data-hash
 /// preimage, and `dugite-cli`'s offline tx builder so the three never diverge.
+///
+/// The redeemers are emitted in canonical order — ascending `(tag, index)` —
+/// matching cardano-ledger, whose `Redeemers` is a `Map (PlutusPurpose AsIx)
+/// (Data, ExUnits)` serialized via `Map.toAscList`. The `Ord` on the key is
+/// `(purpose-constructor, index)`, and the purpose constructors are numbered
+/// exactly as the redeemer tags (Spend=0, Mint=1, Cert=2, Reward=3, Vote=4,
+/// Propose=5, Guarding=6), so `(tag, index)` reproduces it (#887).
 pub fn encode_redeemers(redeemers: &[Redeemer], map_form: bool) -> Vec<u8> {
+    // Canonical ascending `(tag, index)` order via an index permutation, so we
+    // never clone the (potentially large) redeemer `data`.
+    let mut order: Vec<usize> = (0..redeemers.len()).collect();
+    order.sort_by_key(|&i| (redeemer_tag_ord(&redeemers[i].tag), redeemers[i].index));
+
     let mut buf = Vec::new();
     if map_form {
         // Conway/Dijkstra map: { [tag, index] => [data, ex_units], … }
         buf.extend(encode_map_header(redeemers.len()));
-        for r in redeemers {
+        for &i in &order {
+            let r = &redeemers[i];
             // Key: [tag, index]
             buf.extend(encode_array_header(2));
             buf.extend(encode_redeemer_tag(&r.tag));
@@ -221,7 +234,8 @@ pub fn encode_redeemers(redeemers: &[Redeemer], map_form: bool) -> Vec<u8> {
     } else {
         // Pre-Conway list: [* [tag, index, data, ex_units]]
         buf.extend(encode_array_header(redeemers.len()));
-        for r in redeemers {
+        for &i in &order {
+            let r = &redeemers[i];
             buf.extend(encode_array_header(4));
             buf.extend(encode_redeemer_tag(&r.tag));
             buf.extend(encode_uint(r.index as u64));
@@ -230,6 +244,53 @@ pub fn encode_redeemers(redeemers: &[Redeemer], map_form: bool) -> Vec<u8> {
             buf.extend(encode_uint(r.ex_units.mem));
             buf.extend(encode_uint(r.ex_units.steps));
         }
+    }
+    buf
+}
+
+/// Numeric ordering of a redeemer tag, matching both the CBOR tag value and the
+/// `PlutusPurpose` constructor order in cardano-ledger (used to sort redeemers
+/// and the redeemers map into canonical ascending-key order).
+fn redeemer_tag_ord(tag: &RedeemerTag) -> u8 {
+    match tag {
+        RedeemerTag::Spend => 0,
+        RedeemerTag::Mint => 1,
+        RedeemerTag::Cert => 2,
+        RedeemerTag::Reward => 3,
+        RedeemerTag::Vote => 4,
+        RedeemerTag::Propose => 5,
+        RedeemerTag::Guarding => 6,
+    }
+}
+
+/// Encode the `plutus_data` witness term (witness-set key 4 / the datums term
+/// of the script-integrity preimage) as CBOR.
+///
+/// Canonicalizes to match cardano-ledger's `TxDats = Map DataHash (Data era)`,
+/// serialized as `encodeWithSetTag . Map.elems`:
+/// - The datums are ordered by ascending `DataHash` (`blake2b_256` of each
+///   datum's encoding) — `Map.elems` yields ascending-key order.
+/// - `use_set_tag` (true from Conway/PV9 on) prepends the set tag 258
+///   (`encodeWithSetTag`); pre-Conway emits a bare array.
+///
+/// The caller must ensure `plutus_data` is non-empty — an empty `TxDats`
+/// contributes nothing to the preimage and is omitted by the callers (#887).
+pub fn encode_datums(plutus_data: &[PlutusData], use_set_tag: bool) -> Vec<u8> {
+    // Order by ascending datum hash via an index permutation.
+    let hashes: Vec<[u8; 32]> = plutus_data
+        .iter()
+        .map(|d| *blake2b_256(&encode_plutus_data(d)).as_bytes())
+        .collect();
+    let mut order: Vec<usize> = (0..plutus_data.len()).collect();
+    order.sort_by(|&a, &b| hashes[a].cmp(&hashes[b]));
+
+    let mut buf = Vec::new();
+    if use_set_tag {
+        buf.extend(encode_tag(258));
+    }
+    buf.extend(encode_array_header(plutus_data.len()));
+    for &i in &order {
+        buf.extend(encode_plutus_data(&plutus_data[i]));
     }
     buf
 }
@@ -303,10 +364,12 @@ pub(super) fn encode_witness_set_for_era(ws: &TransactionWitnessSet, era: Era) -
 
     if !ws.plutus_data.is_empty() {
         buf.extend(encode_uint(4));
-        buf.extend(encode_array_header(ws.plutus_data.len()));
-        for d in &ws.plutus_data {
-            buf.extend(encode_plutus_data(d));
-        }
+        // Canonical datums term — hash-sorted, tag-258 wrapped from Conway on.
+        // Shared with the script-data-hash preimage so the two stay identical.
+        buf.extend(encode_datums(
+            &ws.plutus_data,
+            matches!(era, Era::Conway | Era::Dijkstra),
+        ));
     }
 
     if !ws.redeemers.is_empty() {
@@ -943,6 +1006,7 @@ pub fn compute_transaction_hash_from_tx(tx: &Transaction) -> Hash32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encode::compute_script_data_hash;
     use dugite_primitives::{
         address::{Address, EnterpriseAddress},
         credentials::Credential,
@@ -1361,6 +1425,136 @@ mod tests {
         assert_eq!(encoded[1], 0x05, "redeemer key must be 5");
         // Babbage array: array(1) = 0x81 for one redeemer
         assert_eq!(encoded[2], 0x81, "Babbage redeemers encoded as array(1)");
+    }
+
+    // ── #887: canonical redeemers / datums ordering + tag-258 ────────────────
+
+    fn rdmr(tag: RedeemerTag, index: u32) -> Redeemer {
+        Redeemer {
+            tag,
+            index,
+            data: PlutusData::Integer(num_bigint::BigInt::from(index as i64)),
+            ex_units: ExUnits { mem: 1, steps: 2 },
+        }
+    }
+
+    /// #887: `encode_redeemers` emits the map in canonical ascending
+    /// `(tag, index)` order regardless of input order (matches Haskell's
+    /// `Map.toAscList` over `PlutusPurpose`).
+    #[test]
+    fn encode_redeemers_sorts_by_tag_then_index() {
+        // Deliberately unsorted input: (Mint,0), (Spend,3), (Spend,1).
+        let unsorted = vec![
+            rdmr(RedeemerTag::Mint, 0),
+            rdmr(RedeemerTag::Spend, 3),
+            rdmr(RedeemerTag::Spend, 1),
+        ];
+        let sorted = vec![
+            rdmr(RedeemerTag::Spend, 1),
+            rdmr(RedeemerTag::Spend, 3),
+            rdmr(RedeemerTag::Mint, 0),
+        ];
+        assert_eq!(
+            encode_redeemers(&unsorted, true),
+            encode_redeemers(&sorted, true),
+            "map form must be canonical-ordered"
+        );
+        assert_eq!(
+            encode_redeemers(&unsorted, false),
+            encode_redeemers(&sorted, false),
+            "list form must be canonical-ordered too"
+        );
+        // Empty slice → era's empty container (the sentinel).
+        assert_eq!(encode_redeemers(&[], true), vec![0xa0]);
+        assert_eq!(encode_redeemers(&[], false), vec![0x80]);
+    }
+
+    /// #887: `encode_datums` sorts by datum hash and applies the tag-258 set
+    /// wrapper from Conway on (bare array pre-Conway).
+    #[test]
+    fn encode_datums_sorts_by_hash_and_tags_conway() {
+        let a = PlutusData::Bytes(vec![0x01]);
+        let b = PlutusData::Bytes(vec![0x02, 0x03]);
+        let c = PlutusData::Integer(num_bigint::BigInt::from(9i64));
+        let forward = vec![a.clone(), b.clone(), c.clone()];
+        let shuffled = vec![c, a, b];
+
+        // Order-independent (canonical hash order).
+        assert_eq!(
+            encode_datums(&forward, true),
+            encode_datums(&shuffled, true),
+            "datums must sort by hash regardless of input order"
+        );
+
+        // Conway/Dijkstra: tag 258 prefix (0xd9 0x01 0x02).
+        let conway = encode_datums(&forward, true);
+        assert_eq!(
+            &conway[..3],
+            &[0xd9, 0x01, 0x02],
+            "Conway datums must be tag-258"
+        );
+        assert_eq!(conway[3], 0x83, "…wrapping an array(3)");
+
+        // Pre-Conway: bare array, no tag.
+        let pre = encode_datums(&forward, false);
+        assert_eq!(pre[0], 0x83, "pre-Conway datums are a bare array(3)");
+    }
+
+    /// #887 core invariant: a synthetic Conway tx built via the witness-set
+    /// builder has key-4 (datums) and key-5 (redeemers) bytes identical to the
+    /// terms the script-integrity hash re-encodes — so its `script_data_hash`
+    /// matches its own witnesses. Previously the two diverged (witness datums
+    /// were a bare array while the hash used tag-258).
+    #[test]
+    fn witness_set_and_script_data_hash_agree_on_terms() {
+        use crate::encode::{encode_datums, encode_redeemers};
+        let mut ws = empty_witness_set();
+        ws.redeemers = vec![rdmr(RedeemerTag::Mint, 0), rdmr(RedeemerTag::Spend, 2)];
+        ws.plutus_data = vec![
+            PlutusData::Bytes(vec![0xaa]),
+            PlutusData::Integer(num_bigint::BigInt::from(1i64)),
+        ];
+
+        let wire = encode_witness_set_for_era(&ws, Era::Conway);
+
+        // Extract key-4 and key-5 raw values out of the witness-set map.
+        let mut dec = minicbor::Decoder::new(&wire);
+        let n = dec.map().unwrap().unwrap();
+        let mut key4 = None;
+        let mut key5 = None;
+        for _ in 0..n {
+            let k = dec.u32().unwrap();
+            let start = dec.position();
+            dec.skip().unwrap();
+            let val = wire[start..dec.position()].to_vec();
+            match k {
+                4 => key4 = Some(val),
+                5 => key5 = Some(val),
+                _ => {}
+            }
+        }
+        // The builder's terms equal the canonical primitives …
+        assert_eq!(key4.unwrap(), encode_datums(&ws.plutus_data, true));
+        assert_eq!(key5.unwrap(), encode_redeemers(&ws.redeemers, true));
+
+        // … and the hash re-encodes the *same* bytes (raw = None path), so a
+        // self-built tx's script_data_hash matches its own witness set.
+        let cm = CostModels::default();
+        let via_slices = compute_script_data_hash(
+            &ws.redeemers,
+            &ws.plutus_data,
+            &cm,
+            false,
+            false,
+            false,
+            None,
+            None,
+            true,
+        );
+        let mut preimage = encode_redeemers(&ws.redeemers, true);
+        preimage.extend(encode_datums(&ws.plutus_data, true));
+        preimage.push(0xa0); // empty langviews
+        assert_eq!(via_slices.as_bytes(), blake2b_256(&preimage).as_bytes());
     }
 
     // ── transaction body ─────────────────────────────────────────────────────

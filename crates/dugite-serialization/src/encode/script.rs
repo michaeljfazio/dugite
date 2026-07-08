@@ -224,12 +224,14 @@ pub fn compute_script_data_hash(
         if let Some(raw) = raw_datums_cbor {
             preimage.extend_from_slice(raw);
         } else {
-            let mut datums_buf = encode_tag(258);
-            datums_buf.extend(encode_array_header(plutus_data.len()));
-            for d in plutus_data {
-                datums_buf.extend(encode_plutus_data(d));
-            }
-            preimage.extend(&datums_buf);
+            // Canonical datums term, shared with the witness-set builder so a
+            // synthetic tx's script_data_hash always matches its own witnesses.
+            // The set-tag gate is the same PV≥9 boundary as `redeemers_map_form`
+            // (tag 258 from Conway on, bare array pre-Conway).
+            preimage.extend(crate::encode::encode_datums(
+                plutus_data,
+                redeemers_map_form,
+            ));
         }
     }
 
