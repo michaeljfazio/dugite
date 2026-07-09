@@ -41,6 +41,7 @@
 - [cardano-ledger-types-wire-format.md](cardano-ledger-types-wire-format.md) — hash/key types, address header-byte table, MaryValue, script tags, PParams array(31), Rational tag(30)
 
 ## Governance (Conway / CIP-1694)
+- [drep-dormant-epoch-expiry-exact-mechanism.md](drep-dormant-epoch-expiry-exact-mechanism.md) — DEFINITIVE: numDormantEpochs is bump-at-submission (Certs.hs updateDormantDRepExpiry adds to ALL vsDReps + resets counter), NOT add-at-ratify-check-time; dRepAcceptedRatio is bare `reCurrentEpoch > drepExpiry`; exact permalinks pinned to SHA 8595dbef
 - [drep-pulser-ratification.md](drep-pulser-ratification.md) — pulser snapshot at END of EPOCH rule, pulse spreading 4k blocks, RATIFY runs once at finishDRepPulser
 - [conway-ratification-precision-audit.md](conway-ratification-precision-audit.md) — 10-pt audit: pvCanFollow(minor==cur+1), HFC prevGovActionId chains, ensTreasury includes this-boundary's RUPD — supersedes vague bits below
 - [conway-ratification-details.md](conway-ratification-details.md) — threshold functions, enactment priority, committee expiry, DRep activity, treasury cap
