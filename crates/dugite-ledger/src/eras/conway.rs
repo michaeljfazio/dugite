@@ -333,6 +333,11 @@ impl EraRules for ConwayRules {
         // Step 5: Update DRep activity for voting DReps in this transaction.
         update_drep_expiries_for_tx(tx, ctx.current_epoch, gov, epochs);
 
+        // Step 5b: updateDormantDRepExpiry — a tx carrying governance proposals
+        // "refunds" accumulated dormant epochs to every DRep and resets the
+        // dormant counter (Haskell `Cardano.Ledger.Conway.Rules.Certs`).
+        update_dormant_drep_expiry_for_tx(tx, ctx.current_epoch, gov);
+
         // Step 6: Drain withdrawal accounts.
         common::drain_withdrawal_accounts(tx, certs);
 
@@ -1737,6 +1742,58 @@ fn update_drep_expiries_for_tx(
     }
 }
 
+/// `updateDormantDRepExpiry` — Haskell `Cardano.Ledger.Conway.Rules.Certs`
+/// (`updateDormantDRepExpiry`, cardano-ledger master @8595dbef): a transaction
+/// that carries at least one governance proposal "refunds" the accumulated
+/// dormant epochs to every registered DRep and resets the dormant counter.
+///
+/// Dormant epochs (boundaries with no live proposal, tracked by
+/// `update_dormant_epochs`) are pre-subtracted from a DRep's expiry at
+/// registration/vote time (`compute_drep_expiry` = `epoch + drep_activity -
+/// num_dormant`). When governance resumes, each DRep's expiry is bumped back by
+/// `num_dormant_epochs` so those quiet epochs don't count against it — guarded so
+/// an already far-expired DRep (`expiry + num_dormant < current_epoch`) is NOT
+/// revived. Then `num_dormant_epochs` is reset to 0.
+///
+/// Without this, `num_dormant_epochs` grows unbounded and EVERY DRep eventually
+/// expires during quiet governance periods and never re-activates, emptying the
+/// DRep voting distribution. That is invisible during Conway bootstrap (PV9,
+/// where the DRep ratification threshold is 0) but at PV10 it makes every
+/// DRep-gated action (ParameterChange / HardForkInitiation / …) fail to ratify —
+/// which, via the un-refunded proposal deposit, was the true root cause of the
+/// systematic preprod reward-calc divergence (the missing deposit understated the
+/// proposer's stake, skewing `sigmaA` and every reward that epoch).
+///
+/// Fires once per proposal-carrying tx (Haskell runs it in the CERTS rule before
+/// GOV validates the proposal; the tx fails atomically if GOV later rejects it,
+/// so running it here is safe). Order vs `update_drep_expiries_for_tx` is
+/// immaterial: the vote-time `- num_dormant` and this `+ num_dormant` cancel.
+fn update_dormant_drep_expiry_for_tx(
+    tx: &Transaction,
+    current_epoch: EpochNo,
+    gov: &mut GovSubState,
+) {
+    if tx.body.proposal_procedures.is_empty() {
+        return;
+    }
+    let num_dormant = gov.governance.num_dormant_epochs;
+    if num_dormant == 0 {
+        return;
+    }
+    let governance = Arc::make_mut(&mut gov.governance);
+    governance.num_dormant_epochs = 0;
+    let keys: Vec<Hash32> = governance.dreps.keys().cloned().collect();
+    for k in keys {
+        if let Some(drep) = governance.dreps.get_mut(&k) {
+            let actual = drep.drep_expiry.0.saturating_add(num_dormant);
+            // Haskell: `if actualExpiry < currentEpoch then currentExpiry else actualExpiry`
+            if actual >= current_epoch.0 {
+                drep.drep_expiry = EpochNo(actual);
+            }
+        }
+    }
+}
+
 /// Process governance votes and proposals from a transaction (GOV rule).
 ///
 /// Implements step 8 of the Conway LEDGER pipeline:
@@ -3060,6 +3117,88 @@ mod tests {
         // DRep expiry should be updated: epoch 5 + drep_activity 20 = 25.
         let drep = &gov.governance.dreps[&key];
         assert_eq!(drep.drep_expiry, EpochNo(25));
+    }
+
+    /// `updateDormantDRepExpiry`: a proposal-carrying tx refunds accumulated
+    /// dormant epochs to every DRep and resets `num_dormant_epochs`, but does NOT
+    /// revive a DRep whose bumped expiry would still be in the past. Regression
+    /// for the systematic preprod reward-calc divergence: without the refund,
+    /// `num_dormant_epochs` grew unbounded and every DRep expired during quiet
+    /// governance periods, emptying the DRep distribution and blocking every
+    /// PV10 ParameterChange from ratifying (its unrefunded deposit then skewed
+    /// stake and rewards).
+    #[test]
+    fn test_dormant_drep_expiry_refunded_on_proposal() {
+        let mut gov = make_gov_sub();
+        let cred_a = Credential::VerificationKey(Hash28::from_bytes([0xA1; 28]));
+        let cred_b = Credential::VerificationKey(Hash28::from_bytes([0xB2; 28]));
+        let key_a = cred_a.to_typed_hash32();
+        let key_b = cred_b.to_typed_hash32();
+        {
+            let g = Arc::make_mut(&mut gov.governance);
+            g.num_dormant_epochs = 29;
+            // DRep A: expiry 22 → bumped 22+29=51 (>= current_epoch 40) → refunded.
+            g.dreps.insert(
+                key_a,
+                DRepRegistration {
+                    credential: cred_a,
+                    deposit: Lovelace(500_000_000),
+                    anchor: None,
+                    registered_epoch: EpochNo(2),
+                    drep_expiry: EpochNo(22),
+                    active: false,
+                },
+            );
+            // DRep B: far-expired, expiry 3 → bumped 3+29=32 (< 40) → NOT revived.
+            g.dreps.insert(
+                key_b,
+                DRepRegistration {
+                    credential: cred_b,
+                    deposit: Lovelace(500_000_000),
+                    anchor: None,
+                    registered_epoch: EpochNo(2),
+                    drep_expiry: EpochNo(3),
+                    active: false,
+                },
+            );
+        }
+
+        // A tx WITHOUT proposals must not touch anything.
+        let no_prop = make_tx(0x01, vec![], vec![], 0);
+        update_dormant_drep_expiry_for_tx(&no_prop, EpochNo(40), &mut gov);
+        assert_eq!(gov.governance.num_dormant_epochs, 29);
+        assert_eq!(gov.governance.dreps[&key_a].drep_expiry, EpochNo(22));
+
+        // A tx carrying a proposal refunds the dormant epochs and resets.
+        let mut tx = make_tx(0x01, vec![], vec![], 0);
+        let mut return_addr = vec![0xe0u8];
+        return_addr.extend_from_slice(&[0xBB; 28]);
+        tx.body.proposal_procedures = vec![ProposalProcedure {
+            deposit: Lovelace(100_000_000_000),
+            return_addr,
+            gov_action: dugite_primitives::transaction::GovAction::InfoAction,
+            anchor: Anchor {
+                url: "https://example.com".to_string(),
+                data_hash: Hash32::ZERO,
+            },
+        }];
+        update_dormant_drep_expiry_for_tx(&tx, EpochNo(40), &mut gov);
+
+        assert_eq!(gov.governance.num_dormant_epochs, 0, "counter reset");
+        assert_eq!(
+            gov.governance.dreps[&key_a].drep_expiry,
+            EpochNo(51),
+            "in-window DRep expiry bumped by num_dormant"
+        );
+        assert_eq!(
+            gov.governance.dreps[&key_b].drep_expiry,
+            EpochNo(3),
+            "far-expired DRep NOT revived (guard: bumped 32 < current 40)"
+        );
+
+        // Idempotent: a second proposal tx (num_dormant now 0) is a no-op.
+        update_dormant_drep_expiry_for_tx(&tx, EpochNo(41), &mut gov);
+        assert_eq!(gov.governance.dreps[&key_a].drep_expiry, EpochNo(51));
     }
 
     /// Conway DRep deregistration removes the DRep.
