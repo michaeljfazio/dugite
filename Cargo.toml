@@ -78,7 +78,7 @@ hex = "0.4"
 base64 = "0.22"
 
 # Cryptography
-ed25519-dalek = { version = "2", features = ["serde", "rand_core"] }
+ed25519-dalek = { version = "3", features = ["serde", "rand_core"] }
 blake2 = "0.10"
 blake2b_simd = "1"
 sha2 = "0.11"
