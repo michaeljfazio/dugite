@@ -835,12 +835,12 @@ impl LedgerState {
         // hoist + Arc share collapses that to micro-seconds per block.
         #[allow(clippy::type_complexity)]
         let (
-            block_registered_pool_ids,
-            block_registered_drep_ids,
-            block_registered_vrf_keys,
+            mut block_registered_pool_ids,
+            mut block_registered_drep_ids,
+            mut block_registered_vrf_keys,
             block_committee_member_keys,
-            block_committee_resigned_keys,
-            block_vote_delegation_keys,
+            mut block_committee_resigned_keys,
+            mut block_vote_delegation_keys,
             // `block_active_proposals` is `mut` so we can update it after each
             // proposal-containing tx.  Haskell's `LEDGER` rule processes txs
             // sequentially with updating state, so a vote in tx[j] on a proposal
@@ -849,8 +849,8 @@ impl LedgerState {
             // Without this update dugite logs spurious `GovActionsDoNotExist`
             // warnings for cross-tx same-block proposal+vote patterns.
             mut block_active_proposals,
-            block_committee_authorized_hot_keys,
-            block_committee_authorized_elected_hot_keys,
+            mut block_committee_authorized_hot_keys,
+            mut block_committee_authorized_elected_hot_keys,
             // Retained for registry-builder signature compatibility; the
             // per-tx ValidationContext now clones the LIVE deposits map
             // (sequential LEDGERS semantics — see the reward-accounts note).
@@ -1659,6 +1659,74 @@ impl LedgerState {
                         }
                     }
                     block_active_proposals = std::sync::Arc::new(updated_proposals);
+                }
+
+                // ── Step 8b-post: refresh cert-derived validation registries ──
+                //
+                // After a cert-containing tx applies (Step 8b inserts/removes
+                // into the live pool / DRep / committee / vote-delegation maps),
+                // a later tx in the SAME block that acts on those changes must
+                // see them: Haskell's LEDGERS rule folds LEDGER over the block's
+                // txs sequentially, threading CertState (Shelley `Ledgers.hs`
+                // `foldM`), so Conway GOVCERT `UnRegDRep` reads the *mutated*
+                // `vsDReps` — a same-block RegDRep→UnRegDRep succeeds and a
+                // same-block double-RegDRep is rejected. A pre-block snapshot
+                // gets both wrong (observed: spurious `DRepNotRegistered` on
+                // preview block 4456609 — a RegDRep then UnRegDRep of the same
+                // credential one tx apart). Mirror the `reward_accounts` /
+                // `block_active_proposals` sequential refresh for every
+                // cert-mutated registry. Guarded on cert presence so the common
+                // (payment) tx keeps the O(1) pre-block-snapshot fast path.
+                // `block_committee_member_keys` is intentionally excluded — it
+                // changes via governance ratification / `UpdateCommittee`
+                // proposals, not certificates.
+                if mode == BlockValidationMode::ValidateAll && !tx.body.certificates.is_empty() {
+                    block_registered_pool_ids =
+                        std::sync::Arc::new(self.certs.pool_params.keys().copied().collect());
+                    block_registered_vrf_keys = std::sync::Arc::new(
+                        self.certs
+                            .pool_params
+                            .values()
+                            .map(|reg| (reg.vrf_keyhash, reg.pool_id))
+                            .collect(),
+                    );
+                    block_registered_drep_ids =
+                        std::sync::Arc::new(self.gov.governance.dreps.keys().copied().collect());
+                    block_vote_delegation_keys = std::sync::Arc::new(
+                        self.gov
+                            .governance
+                            .vote_delegations
+                            .keys()
+                            .copied()
+                            .collect(),
+                    );
+                    block_committee_resigned_keys = std::sync::Arc::new(
+                        self.gov
+                            .governance
+                            .committee_resigned
+                            .keys()
+                            .copied()
+                            .collect(),
+                    );
+                    block_committee_authorized_hot_keys = std::sync::Arc::new(
+                        self.gov
+                            .governance
+                            .committee_hot_keys
+                            .values()
+                            .copied()
+                            .collect(),
+                    );
+                    block_committee_authorized_elected_hot_keys = std::sync::Arc::new(
+                        self.gov
+                            .governance
+                            .committee_hot_keys
+                            .iter()
+                            .filter(|(cold, _)| {
+                                self.gov.governance.committee_expiration.contains_key(*cold)
+                            })
+                            .map(|(_, hot)| *hot)
+                            .collect(),
+                    );
                 }
 
                 // ── Step 8c: Pre-Conway PP update proposals ───────────────
@@ -2998,6 +3066,124 @@ mod tests {
         assert!(
             reward_accounts.contains_key(&key2),
             "cred2 must be registered in reward_accounts"
+        );
+    }
+
+    // ── Test 15b: same-block DRep register→deregister (intra-block registry
+    //    staleness regression, issue #13 / preview block 4456609) ────────────
+    //
+    // A `RegDRep` in tx[i] followed by an `UnregDRep` of the SAME credential in
+    // tx[j] (j>i) of the SAME block must NOT be reported `DRepNotRegistered`.
+    // Haskell's LEDGERS rule threads CertState sequentially (Shelley
+    // `Ledgers.hs` `foldM`; Conway `GovCert.hs` `UnRegDRep` reads the mutated
+    // `vsDReps`), so the registration is visible to the later tx. Before the
+    // Step-8b-post registry refresh in `apply_block`, dugite validated tx[j]
+    // against a stale pre-block DRep snapshot and logged a spurious Phase-1
+    // divergence (`DRep unregistration rejected: ... is not registered`).
+    //
+    // The block is applied in `ValidateAll` (the only mode that builds the
+    // per-block registry snapshot). We capture WARN-level tracing output and
+    // assert the DRep-not-registered divergence is absent. Value is fully
+    // conserved so the only difference between the buggy and fixed code is the
+    // DRep check — verified to FAIL before the fix and PASS after.
+    #[test]
+    fn test_same_block_drep_register_then_deregister_no_spurious_divergence() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct BufWriter(Arc<Mutex<Vec<u8>>>);
+        impl Write for BufWriter {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufWriter {
+            type Writer = BufWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(BufWriter(Arc::clone(&buf)))
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let mut params = ProtocolParameters::mainnet_defaults();
+            params.protocol_version_major = 9;
+            let deposit = params.drep_deposit.0;
+            let mut state = LedgerState::new(params);
+            state.era = Era::Conway;
+
+            let drep_cred = Credential::VerificationKey(Hash28::from_bytes([0x7Du8; 28]));
+
+            // Seed the UTxO tx1 spends.
+            let in0 = TransactionInput {
+                transaction_id: Hash32::from_bytes([0xC0u8; 32]),
+                index: 0,
+            };
+            seed_utxo(&mut state, in0.clone(), make_output(2_000_000_000));
+
+            // tx1: spend in0 (2 ADA·10³), register the DRep (500 ADA deposit),
+            // output the change. Value is conserved: in = out + fee + deposit.
+            let mut tx1 = make_simple_tx(
+                0xD1,
+                vec![in0],
+                vec![make_output(2_000_000_000 - deposit - 1_000_000)],
+                1_000_000,
+            );
+            tx1.body.certificates = vec![Certificate::RegDRep {
+                credential: drep_cred.clone(),
+                deposit: Lovelace(deposit),
+                anchor: None,
+            }];
+
+            // tx2: spend tx1's change, deregister the SAME DRep (matching
+            // refund), output. Value conserved: in + refund = out + fee.
+            let tx1_out = TransactionInput {
+                transaction_id: tx1.hash,
+                index: 0,
+            };
+            let mut tx2 = make_simple_tx(
+                0xD2,
+                vec![tx1_out],
+                vec![make_output(2_000_000_000 - 2_000_000)],
+                1_000_000,
+            );
+            tx2.body.certificates = vec![Certificate::UnregDRep {
+                credential: drep_cred.clone(),
+                refund: Lovelace(deposit),
+            }];
+
+            let block = make_test_block(Era::Conway, 1_000, 1, 9, 0, vec![tx1, tx2]);
+            // Best-effort apply — must not panic; divergence handling is
+            // warn-and-continue, so a spurious rejection surfaces only in logs.
+            let _ = state.apply_block(&block, BlockValidationMode::ValidateAll);
+
+            // The DRep must end up correctly deregistered regardless.
+            assert!(
+                !state
+                    .gov
+                    .governance
+                    .dreps
+                    .contains_key(&drep_cred.to_typed_hash32()),
+                "DRep must be deregistered after the same-block reg→unreg pair"
+            );
+        });
+
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            !logs.contains("DRepNotRegistered") && !logs.contains("is not registered"),
+            "same-block RegDRep→UnregDRep must not produce a spurious DRep-not-registered \
+             Phase-1 divergence; captured WARN logs:\n{logs}"
         );
     }
 

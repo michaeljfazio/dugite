@@ -217,22 +217,9 @@ impl LedgerState {
             self.certs.pointer_map.insert(pointer, key);
         }
         // Also handle combined registration certificates
-        if let Certificate::RegStakeDeleg {
-            credential,
-            pool_hash: _,
-            ..
-        }
-        | Certificate::RegStakeVoteDeleg {
-            credential,
-            pool_hash: _,
-            drep: _,
-            ..
-        }
-        | Certificate::VoteRegDeleg {
-            credential,
-            drep: _,
-            ..
-        } = cert
+        if let Certificate::RegStakeDeleg { credential, .. }
+        | Certificate::RegStakeVoteDeleg { credential, .. }
+        | Certificate::VoteRegDeleg { credential, .. } = cert
         {
             let key = credential_to_hash(credential);
             let pointer = dugite_primitives::credentials::Pointer {
