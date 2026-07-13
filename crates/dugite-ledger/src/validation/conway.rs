@@ -737,7 +737,7 @@ pub(super) fn treasury_withdrawal_network_mismatches(
     };
     let expected = expected_net.to_u8();
     let mut out: Vec<(String, u8)> = Vec::new();
-    for (addr, _coin) in withdrawals.iter() {
+    for addr in withdrawals.keys() {
         // Empty address → skip (decoder-shape error, not this predicate's
         // concern; mirrors `is_proposal_return_addr_wrong_network`).
         let Some(&header) = addr.first() else {
