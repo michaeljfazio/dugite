@@ -271,7 +271,7 @@ pub struct HaskellGovActionState {
 }
 
 /// GovActionId = `array(2) [tx_hash(32), gov_action_index(uint)]`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HaskellGovActionId {
     pub tx_hash: Hash32,
     pub index: u64,

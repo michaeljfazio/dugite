@@ -1891,14 +1891,39 @@ fn process_governance_votes_and_proposals(
         };
 
         if !valid {
-            debug!(
+            // WARN, not debug: this runs on a block that consensus already
+            // accepted, so a drop here is consequential and easy to miss.
+            // Dropping a proposal strands its deposit (never refunded to the
+            // return account, which silently lowers that account's stake and
+            // therefore every pool's rewards) and leaves the corresponding
+            // enacted root un-advanced — issue #898, where a Mithril import had
+            // discarded `Proposals.pRoots` so every real `prev_action_id`
+            // mismatched, wedging chain advance ~2 epochs later with a
+            // 4-lovelace `WithdrawalAmountMismatch`.
+            //
+            // Haskell also drops such proposals without failing the tx, so this
+            // is not necessarily a divergence — but on a confirmed block it is
+            // rare enough, and expensive enough when wrong, to be worth a WARN.
+            // The enacted roots are logged alongside so a `None` root (the #898
+            // signature) is immediately visible.
+            warn!(
                 tx = %tx.hash.to_hex(),
                 action_index = idx,
                 action_type = ?std::mem::discriminant(&proposal.gov_action),
                 prev_tx = prev_id.map(|p| p.transaction_id.to_hex()),
                 prev_index = prev_id.map(|p| p.action_index),
-                "InvalidPrevGovActionId (GOV rule): proposal dropped — prev_action_id is \
-                 neither a genesis root, the last enacted root, nor an active in-flight proposal"
+                deposit = proposal.deposit.0,
+                enacted_pparam_update = ?governance.enacted_pparam_update.as_ref().map(|i| i.transaction_id.to_hex()),
+                enacted_hard_fork = ?governance.enacted_hard_fork.as_ref().map(|i| i.transaction_id.to_hex()),
+                enacted_committee = ?governance.enacted_committee.as_ref().map(|i| i.transaction_id.to_hex()),
+                enacted_constitution = ?governance.enacted_constitution.as_ref().map(|i| i.transaction_id.to_hex()),
+                active_proposals = governance.proposals.len(),
+                "InvalidPrevGovActionId (GOV rule): proposal dropped on a confirmed block — \
+                 prev_action_id is neither a genesis root, the last enacted root, nor an \
+                 active in-flight proposal. The deposit will never be refunded. If the \
+                 enacted root for this action's purpose is None on a chain that has \
+                 already enacted one, the ledger state was imported without \
+                 `Proposals.pRoots` (see #898) and must be re-imported."
             );
             continue;
         }
@@ -5603,6 +5628,113 @@ mod tests {
             "proposal with stale prev_action_id must be rejected (InvalidPrevGovActionId) \
              via the GOV rule block-apply path; proposals={:?}",
             gov.governance.proposals.keys().collect::<Vec<_>>(),
+        );
+    }
+
+    /// #898: an `UpdateCommittee` proposal chaining onto the **enacted committee
+    /// root** must be admitted — and is silently dropped when that root is `None`.
+    ///
+    /// This is the exact shape that wedged preview. Ledger snapshots imported
+    /// from Haskell (Mithril bootstrap) used to discard `Proposals.pRoots`, so
+    /// every `enacted_*` root came back `None`. Preview then produced
+    /// `UpdateCommittee` action `65c41d16…#0` with
+    /// `prev_action_id = Some(ac993231…#0)` — the real enacted committee root.
+    /// With the root missing, `prev_action_matches_enacted_root` failed and the
+    /// proposal was dropped (no error, no block rejection), which meant:
+    ///
+    /// 1. votes on it were rejected as `GovActionsDoNotExist` (masked by the
+    ///    "trusting on-chain consensus" fallback),
+    /// 2. it never ratified, so dugite's committee diverged from the chain's,
+    /// 3. its 1000-ADA deposit was never refunded to the return account, whose
+    ///    snapshot stake stayed 1_000_000_000 lovelace below Haskell's — which
+    ///    lowered `totalActiveStake`, hence every pool's `appPerf`, hence every
+    ///    reward, until an exact-drain withdrawal failed and chain advance
+    ///    halted (see `state::rewards` tests).
+    ///
+    /// The real proposal added script-hash committee members, so this test uses
+    /// script credentials too.
+    #[test]
+    fn test_update_committee_needs_enacted_root_898() {
+        use dugite_primitives::transaction::{GovAction, GovActionId};
+        use std::collections::BTreeMap;
+
+        let params = ProtocolParameters::mainnet_defaults();
+        let ctx = make_conway_ctx(&params);
+        let rules = ConwayRules::new();
+
+        // The chain's last enacted committee action (preview: ac993231…#0).
+        let enacted_root = GovActionId {
+            transaction_id: Hash32::from_bytes([0xAC; 32]),
+            action_index: 0,
+        };
+
+        // Three script-hash committee members, as in the real proposal.
+        let mut members_to_add: BTreeMap<Credential, u64> = BTreeMap::new();
+        for fill in [0x6au8, 0x88, 0xbe] {
+            members_to_add.insert(Credential::Script(Hash28::from_bytes([fill; 28])), 1720);
+        }
+
+        let build_tx = || {
+            let proposal = ProposalProcedure {
+                deposit: Lovelace(1_000_000_000),
+                return_addr: vec![0u8; 29],
+                gov_action: GovAction::UpdateCommittee {
+                    prev_action_id: Some(enacted_root.clone()),
+                    members_to_remove: vec![],
+                    members_to_add: members_to_add.clone(),
+                    threshold: dugite_primitives::transaction::Rational {
+                        numerator: 2,
+                        denominator: 3,
+                    },
+                },
+                anchor: Anchor {
+                    url: "ipfs://QmbPE322FGQBPsg26pAS97nZzMtueiihTdBorqWwJTmhgW".to_string(),
+                    data_hash: Hash32::ZERO,
+                },
+            };
+            let mut tx = make_tx(0x65, vec![], vec![], 0);
+            tx.body.proposal_procedures = vec![proposal];
+            tx
+        };
+
+        // Returns whether the proposal was admitted for a given enacted root.
+        let admitted = |root: Option<GovActionId>| -> bool {
+            let mut utxo = make_utxo_sub(vec![]);
+            let mut certs = make_cert_sub();
+            let mut gov = make_gov_sub();
+            let mut epochs = make_epoch_sub();
+            epochs.protocol_params = params.clone();
+            Arc::make_mut(&mut gov.governance).enacted_committee = root;
+
+            let tx = build_tx();
+            rules
+                .apply_valid_tx(
+                    &tx,
+                    BlockValidationMode::ApplyOnly,
+                    &ctx,
+                    &mut utxo,
+                    &mut certs,
+                    &mut gov,
+                    &mut epochs,
+                )
+                .expect("apply_valid_tx must not error — the GOV rule drops silently");
+            gov.governance.proposals.contains_key(&GovActionId {
+                transaction_id: tx.hash,
+                action_index: 0,
+            })
+        };
+
+        assert!(
+            admitted(Some(enacted_root.clone())),
+            "#898: an UpdateCommittee proposal whose prev_action_id IS the enacted \
+             committee root must be admitted. Rejecting it strands the proposal's \
+             deposit and diverges the committee from the chain."
+        );
+        assert!(
+            !admitted(None),
+            "sanity: with enacted_committee = None the same proposal is dropped — \
+             this is precisely the state a Haskell-snapshot import used to produce, \
+             and why `decode_proposals_with_roots` must populate the roots."
         );
     }
 
