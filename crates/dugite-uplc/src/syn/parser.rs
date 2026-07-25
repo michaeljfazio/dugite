@@ -497,20 +497,39 @@ impl<'a> Parser<'a> {
 
     /// Parse a `value` literal.
     ///
-    /// Syntax: `[ (#policy, [ (#token, amount), ... ]), ... ]`
+    /// Syntax: `[ (#currencyID, [ (#tokenID, amount), ... ]), ... ]`
     ///
-    /// Constraints enforced (matching the Haskell reference):
-    ///   - Policy IDs and token names: ≤ 32 bytes.
-    ///   - Duplicate (policy, token) pairs: amounts are summed.
-    ///   - Zero-amount entries: removed after summation.
-    ///   - Empty inner maps: removed.
-    ///   - Outer and inner maps are lexicographically sorted.
+    /// The literal must already be in canonical form; the parser REJECTS
+    /// anything else rather than normalising it. Per the Plutus conformance
+    /// corpus (`plutus-conformance/test-cases/uplc/evaluation/builtin/
+    /// constant/value/`, IntersectMBO/plutus 1.66.0.0):
+    ///
+    ///   - `currencyID`s are strictly ascending      (`currencyIDs-unordered`)
+    ///   - `tokenID`s are strictly ascending within a currency, which also
+    ///     rules out duplicates      (`tokenIDs-unordered`, `duplicate-tokenIDs`)
+    ///   - every token map is non-empty                     (`empty-tokens`)
+    ///   - every amount is non-zero                          (`zero-asset`)
+    ///   - `currencyID`/`tokenID` are ≤ 32 bytes
+    ///     (`currencyID-too-long-*`, `tokenID-too-long-*`)
+    ///   - amounts fit in `i128`                       (`overflow`/`underflow`)
+    ///
+    /// An empty outer list (`(con value [])`) IS valid (`empty-value`).
+    ///
+    /// Ordering is plain lexicographic byte ordering — `Vec<u8>`'s `Ord` —
+    /// so `#` < `#00` < `#0000` < `#000001` < `#11`. Hex digits are
+    /// case-insensitive on input and compare as decoded bytes, so case never
+    /// affects ordering.
+    ///
+    /// Note: plutus ≤ 1.65.0.0 *normalised* instead (summing duplicate keys and
+    /// dropping zero/empty entries); 1.66.0.0 renamed these cases
+    /// (`key-*` → `currencyID-*`/`tokenID-*`) and made them hard parse errors.
     fn parse_value_literal(&mut self) -> Result<Constant, ParseError> {
         use std::collections::BTreeMap;
         const MAX_KEY_LEN: usize = 32;
-        // Outer `[...]` — list of (policy, inner_map) pairs.
+        // Outer `[...]` — list of (currencyID, token_map) pairs.
         self.expect_char('[')?;
         let mut outer: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, i128>> = BTreeMap::new();
+        let mut prev_currency: Option<Vec<u8>> = None;
         self.skip_trivia();
         if matches!(self.peek_char(), Some(']')) {
             self.pos += 1;
@@ -518,7 +537,7 @@ impl<'a> Parser<'a> {
         }
         loop {
             self.skip_trivia();
-            // Each entry is `( #policy, [ ... ] )`
+            // Each entry is `( #currencyID, [ ... ] )`
             self.expect_char('(')?;
             self.skip_trivia();
             let policy = self.parse_hash_bytes()?;
@@ -526,17 +545,30 @@ impl<'a> Parser<'a> {
                 return Err(ParseError::at(
                     self.pos,
                     format!(
-                        "value: policy-id exceeds {MAX_KEY_LEN} bytes (got {})",
+                        "value: currencyID exceeds {MAX_KEY_LEN} bytes (got {})",
                         policy.len()
                     ),
                 ));
             }
+            if let Some(prev) = &prev_currency {
+                if policy <= *prev {
+                    return Err(ParseError::at(
+                        self.pos,
+                        format!(
+                            "value: currencyIDs must be strictly ascending —                              {} does not follow {}",
+                            hex_lower(&policy),
+                            hex_lower(prev)
+                        ),
+                    ));
+                }
+            }
             self.skip_trivia();
             self.expect_char(',')?;
             self.skip_trivia();
-            // Inner `[...]` — list of (token, amount) pairs.
+            // Inner `[...]` — list of (tokenID, amount) pairs.
             self.expect_char('[')?;
-            let inner_map = outer.entry(policy).or_default();
+            let mut inner_map: BTreeMap<Vec<u8>, i128> = BTreeMap::new();
+            let mut prev_token: Option<Vec<u8>> = None;
             self.skip_trivia();
             if !matches!(self.peek_char(), Some(']')) {
                 loop {
@@ -548,19 +580,41 @@ impl<'a> Parser<'a> {
                         return Err(ParseError::at(
                             self.pos,
                             format!(
-                                "value: token-name exceeds {MAX_KEY_LEN} bytes (got {})",
+                                "value: tokenID exceeds {MAX_KEY_LEN} bytes (got {})",
                                 token.len()
                             ),
                         ));
+                    }
+                    if let Some(prev) = &prev_token {
+                        if token <= *prev {
+                            return Err(ParseError::at(
+                                self.pos,
+                                format!(
+                                    "value: tokenIDs must be strictly ascending within a                                      currency (no duplicates) — {} does not follow {}",
+                                    hex_lower(&token),
+                                    hex_lower(prev)
+                                ),
+                            ));
+                        }
                     }
                     self.skip_trivia();
                     self.expect_char(',')?;
                     self.skip_trivia();
                     let amount = self.parse_signed_int_i128()?;
+                    if amount == 0 {
+                        return Err(ParseError::at(
+                            self.pos,
+                            format!(
+                                "value: amount must be non-zero (currencyID {}, tokenID {})",
+                                hex_lower(&policy),
+                                hex_lower(&token)
+                            ),
+                        ));
+                    }
                     self.skip_trivia();
                     self.expect_char(')')?;
-                    // Accumulate (handles duplicates by summing).
-                    *inner_map.entry(token).or_default() += amount;
+                    prev_token = Some(token.clone());
+                    inner_map.insert(token, amount);
                     self.skip_trivia();
                     match self.peek_char() {
                         Some(',') => {
@@ -588,6 +642,17 @@ impl<'a> Parser<'a> {
             } else {
                 self.pos += 1; // consume `]`
             }
+            if inner_map.is_empty() {
+                return Err(ParseError::at(
+                    self.pos,
+                    format!(
+                        "value: currencyID {} has an empty token map",
+                        hex_lower(&policy)
+                    ),
+                ));
+            }
+            prev_currency = Some(policy.clone());
+            outer.insert(policy, inner_map);
             self.skip_trivia();
             self.expect_char(')')?;
             self.skip_trivia();
@@ -614,11 +679,7 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        // Normalise: remove zero-amount tokens, then empty policy maps.
-        for inner in outer.values_mut() {
-            inner.retain(|_, amt| *amt != 0);
-        }
-        outer.retain(|_, inner| !inner.is_empty());
+        // No normalisation: a non-canonical literal was already rejected above.
         Ok(Constant::Value(outer))
     }
 
@@ -1208,4 +1269,16 @@ fn named_ascii_escape(name: &str) -> Option<char> {
         "DEL" => Some('\x7F'),
         _ => None,
     }
+}
+
+/// Render bytes as a lower-case `#`-prefixed hex literal for diagnostics —
+/// the same spelling the UPLC textual syntax uses for `bytestring`
+/// / `value` keys.
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(1 + bytes.len() * 2);
+    s.push('#');
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
