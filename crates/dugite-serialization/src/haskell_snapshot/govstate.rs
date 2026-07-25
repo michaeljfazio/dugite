@@ -395,7 +395,46 @@ const MAX_PROPOSALS: usize = 16384;
 /// Reuses `crates/dugite-serialization/src/decode/era_conway.rs` for the
 /// complex `ProposalProcedure` substructure (`Anchor`, `GovAction`,
 /// `gov_action_id`) so the tx-body and snapshot decoders stay aligned.
-pub fn decode_proposals(data: &[u8]) -> Result<Vec<HaskellGovActionState>, SerializationError> {
+/// The last-enacted governance action id per action purpose — Haskell's
+/// `GovRelation StrictMaybe`, obtained from `toPrevGovActionIds (pRoots ps)`.
+///
+/// These are the `prevGovActionId` values a new proposal of each purpose must
+/// chain onto. They are NOT derivable from the set of active proposals: a
+/// purpose's root records the last action of that purpose ever *enacted*, which
+/// on a long-lived chain is usually far older than any in-flight proposal (and
+/// may have no live descendants at all).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HaskellGovRoots {
+    /// `grPParamUpdate` — wire position [0].
+    pub pparam_update: Option<HaskellGovActionId>,
+    /// `grHardFork` — wire position [1].
+    pub hard_fork: Option<HaskellGovActionId>,
+    /// `grCommittee` — wire position [2].
+    pub committee: Option<HaskellGovActionId>,
+    /// `grConstitution` — wire position [3].
+    pub constitution: Option<HaskellGovActionId>,
+}
+
+/// Haskell `Proposals`: the enacted roots plus the active proposal list.
+#[derive(Debug, Default)]
+pub struct HaskellProposals {
+    pub roots: HaskellGovRoots,
+    pub actions: Vec<HaskellGovActionState>,
+}
+
+/// Decode the Haskell `Proposals` raw CBOR, returning BOTH the enacted roots
+/// and the active proposals.
+///
+/// There is deliberately NO roots-dropping variant of this function:
+/// dropping the roots leaves every `enacted_*` root at `None`, which makes the
+/// GOV rule reject (silently drop) every subsequent proposal that legitimately
+/// chains onto a real enacted root. Issue #898: on preview that dropped an
+/// `UpdateCommittee` proposal, so its 1000-ADA deposit was never refunded to
+/// the return account, whose snapshot stake then stayed 1_000_000_000 lovelace
+/// below Haskell's — depressing `totalActiveStake`, every pool's `appPerf`, and
+/// ultimately every reward until an exact-drain withdrawal failed and chain
+/// advance halted permanently.
+pub fn decode_proposals_with_roots(data: &[u8]) -> Result<HaskellProposals, SerializationError> {
     use crate::decode::reader::Reader;
 
     let mut r = Reader::new(data);
@@ -404,9 +443,12 @@ pub fn decode_proposals(data: &[u8]) -> Result<Vec<HaskellGovActionState>, Seria
     //
     // Haskell encodes `Proposals` as a 2-tuple:
     //   `encCBOR (toPrevGovActionIds pRoots, pProps)`
-    // so the wire format is `array(2) [roots, omap]`. Confirmed by the
-    // `cardano-haskell-oracle` against `Cardano.Ledger.Conway.Governance.
-    // Proposals.hs#L385`.
+    // so the wire format is `array(2) [roots, omap]`. Confirmed against
+    // `Cardano.Ledger.Conway.Governance.Proposals.hs`:
+    //   instance EraPParams era => EncCBOR (Proposals era) where
+    //     encCBOR ps =
+    //       let roots = toPrevGovActionIds $ ps ^. pRootsL
+    //        in encCBOR (roots, ps ^. pPropsL)
     let outer_len = r.read_array_header()?;
     if outer_len != Some(2) {
         return Err(SerializationError::CborDecode(format!(
@@ -414,26 +456,45 @@ pub fn decode_proposals(data: &[u8]) -> Result<Vec<HaskellGovActionState>, Seria
         )));
     }
 
-    // ── Element [0]: roots — `GovRelation StrictMaybe` = `array(4)` of
-    //                StrictMaybe<GovPurposeId>.  Decode + discard;
-    //                dugite rebuilds proposal-tree roots from the
-    //                `gov_action.prev_action_id` fields below.
+    // ── Element [0]: roots — `GovRelation StrictMaybe` = `array(4)` ─────
+    //
+    // `Cardano.Ledger.Conway.Governance.Procedures.hs`:
+    //   encCBOR govPurpose@(GovRelation _ _ _ _) =
+    //     let GovRelation {..} = govPurpose
+    //      in encodeListLen 4
+    //           <> encCBOR grPParamUpdate    -- [0]
+    //           <> encCBOR grHardFork        -- [1]
+    //           <> encCBOR grCommittee       -- [2]
+    //           <> encCBOR grConstitution    -- [3]
+    //
+    // Each element is `StrictMaybe (GovPurposeId p)`; `GovPurposeId` is a
+    // newtype over `GovActionId` with a derived-newtype `EncCBOR`, so it is
+    // on the wire exactly as a bare `GovActionId` (`array(2) [hash32, uint]`).
+    // `StrictMaybe` encodes as `array(0)` for `SNothing` and `array(1) [x]`
+    // for `SJust x`.
     let roots_len = r.read_array_header()?;
     if roots_len != Some(4) {
         return Err(SerializationError::CborDecode(format!(
             "Proposals.roots: expected array(4), got {roots_len:?}"
         )));
     }
-    for _ in 0..4 {
-        r.skip()?; // StrictMaybe<GovPurposeId> — array(0) or array(1)[id]
-    }
+    let pparam_update = decode_strict_maybe_gov_action_id(&mut r, "grPParamUpdate")?;
+    let hard_fork = decode_strict_maybe_gov_action_id(&mut r, "grHardFork")?;
+    let committee = decode_strict_maybe_gov_action_id(&mut r, "grCommittee")?;
+    let constitution = decode_strict_maybe_gov_action_id(&mut r, "grConstitution")?;
+    let roots = HaskellGovRoots {
+        pparam_update,
+        hard_fork,
+        committee,
+        constitution,
+    };
 
     // ── Element [1]: omap — `StrictSeq<GovActionState>` ─────────────────
     //
     // Haskell's `variableListLen` emits a definite-length array if N ≤ 23
     // and an indefinite-length array (`0x9f … 0xff`) otherwise; the
     // `for_each_array_item` helper transparently handles both.
-    let mut out: Vec<HaskellGovActionState> = Vec::new();
+    let mut actions: Vec<HaskellGovActionState> = Vec::new();
     let mut count = 0usize;
     r.for_each_array_item(|r| {
         if count >= MAX_PROPOSALS {
@@ -441,11 +502,26 @@ pub fn decode_proposals(data: &[u8]) -> Result<Vec<HaskellGovActionState>, Seria
                 "Proposals: more than {MAX_PROPOSALS} entries (allocation bomb?)"
             )));
         }
-        out.push(decode_gov_action_state(r)?);
+        actions.push(decode_gov_action_state(r)?);
         count += 1;
         Ok(())
     })?;
-    Ok(out)
+    Ok(HaskellProposals { roots, actions })
+}
+
+/// Decode a `StrictMaybe (GovPurposeId p)`: `array(0)` = `SNothing`,
+/// `array(1) [GovActionId]` = `SJust`.
+fn decode_strict_maybe_gov_action_id(
+    r: &mut crate::decode::reader::Reader<'_>,
+    field: &'static str,
+) -> Result<Option<HaskellGovActionId>, SerializationError> {
+    match r.read_array_header()? {
+        Some(0) => Ok(None),
+        Some(1) => Ok(Some(decode_gov_action_id(r)?)),
+        other => Err(SerializationError::CborDecode(format!(
+            "Proposals.roots.{field}: StrictMaybe expected array(0) or array(1), got {other:?}"
+        ))),
+    }
 }
 
 fn decode_gov_action_state(
@@ -641,4 +717,130 @@ pub fn decode_committee(data: &[u8]) -> Result<(HaskellCommittee, usize), Serial
     off += n;
 
     Ok((HaskellCommittee { members, threshold }, off))
+}
+
+#[cfg(test)]
+mod proposals_roots_tests {
+    use super::*;
+
+    /// Build `array(1) [ array(2) [ bytes(32), uint ] ]` — a `SJust GovPurposeId`.
+    fn sjust(fill: u8, index: u8) -> Vec<u8> {
+        let mut v = vec![0x81, 0x82, 0x58, 0x20];
+        v.extend_from_slice(&[fill; 32]);
+        v.push(index); // small uint, 0..=23
+        v
+    }
+
+    /// `array(0)` — `SNothing`.
+    const SNOTHING: [u8; 1] = [0x80];
+
+    /// `Proposals = array(2) [ GovRelation StrictMaybe (array(4)), omap ]`.
+    fn proposals_cbor(roots: [Option<(u8, u8)>; 4], omap: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x82, 0x84];
+        for r in roots {
+            match r {
+                None => v.extend_from_slice(&SNOTHING),
+                Some((fill, idx)) => v.extend_from_slice(&sjust(fill, idx)),
+            }
+        }
+        v.extend_from_slice(omap);
+        v
+    }
+
+    /// #898 — the four `GovRelation` roots must land in the right fields.
+    ///
+    /// Canonical order (`Cardano.Ledger.Conway.Governance.Procedures.hs`):
+    /// ```haskell
+    /// encCBOR govPurpose@(GovRelation _ _ _ _) =
+    ///   let GovRelation {..} = govPurpose
+    ///    in encodeListLen 4
+    ///         <> encCBOR grPParamUpdate    -- [0]
+    ///         <> encCBOR grHardFork        -- [1]
+    ///         <> encCBOR grCommittee       -- [2]
+    ///         <> encCBOR grConstitution    -- [3]
+    /// ```
+    ///
+    /// Every root gets a distinct fill byte and index so a transposition of any
+    /// two positions fails this test. A wrong order is strictly worse than the
+    /// pre-fix `None`: it would make the GOV rule accept proposals chaining onto
+    /// the wrong purpose's root.
+    #[test]
+    fn govrelation_roots_decode_in_canonical_field_order() {
+        let cbor = proposals_cbor(
+            [
+                Some((0x11, 1)), // grPParamUpdate
+                Some((0x22, 2)), // grHardFork
+                Some((0x33, 3)), // grCommittee
+                Some((0x44, 4)), // grConstitution
+            ],
+            &[0x80], // empty omap
+        );
+        let p = decode_proposals_with_roots(&cbor).expect("decode");
+        assert!(p.actions.is_empty(), "omap was empty");
+
+        let got = |o: &Option<HaskellGovActionId>| {
+            o.as_ref()
+                .map(|i| (i.tx_hash.as_bytes()[0], i.index))
+                .expect("root must be present")
+        };
+        assert_eq!(
+            got(&p.roots.pparam_update),
+            (0x11, 1),
+            "grPParamUpdate is [0]"
+        );
+        assert_eq!(got(&p.roots.hard_fork), (0x22, 2), "grHardFork is [1]");
+        assert_eq!(got(&p.roots.committee), (0x33, 3), "grCommittee is [2]");
+        assert_eq!(
+            got(&p.roots.constitution),
+            (0x44, 4),
+            "grConstitution is [3]"
+        );
+    }
+
+    /// `SNothing` (`array(0)`) decodes to `None`, and mixes correctly with
+    /// `SJust` siblings — the real preview snapshot has exactly this shape
+    /// (a committee root present, others absent or present independently).
+    #[test]
+    fn govrelation_roots_handle_snothing_per_position() {
+        let cbor = proposals_cbor([None, None, Some((0xab, 7)), None], &[0x80]);
+        let p = decode_proposals_with_roots(&cbor).expect("decode");
+        assert_eq!(p.roots.pparam_update, None);
+        assert_eq!(p.roots.hard_fork, None);
+        assert_eq!(
+            p.roots
+                .committee
+                .as_ref()
+                .map(|i| (i.tx_hash.as_bytes()[0], i.index)),
+            Some((0xab, 7)),
+            "only grCommittee is SJust"
+        );
+        assert_eq!(p.roots.constitution, None);
+    }
+
+    /// A `StrictMaybe` may only be `array(0)` or `array(1)`; anything else is a
+    /// malformed snapshot and must be rejected rather than silently skipped.
+    #[test]
+    fn govrelation_root_rejects_malformed_strict_maybe() {
+        // array(2) where a StrictMaybe belongs.
+        let mut cbor = vec![0x82, 0x84, 0x82, 0x00, 0x00];
+        cbor.extend_from_slice(&SNOTHING);
+        cbor.extend_from_slice(&SNOTHING);
+        cbor.extend_from_slice(&SNOTHING);
+        cbor.push(0x80);
+        let err = decode_proposals_with_roots(&cbor).expect_err("must reject array(2)");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("grPParamUpdate") && msg.contains("StrictMaybe"),
+            "error must name the offending field: {msg}"
+        );
+    }
+
+    /// All-`SNothing` roots with an empty omap is the legitimate shape for a
+    /// chain that has never enacted anything (e.g. a fresh devnet).
+    #[test]
+    fn all_snothing_roots_decode_to_an_empty_proposals_set() {
+        let p = decode_proposals_with_roots(&proposals_cbor([None; 4], &[0x80])).expect("decode");
+        assert!(p.actions.is_empty());
+        assert_eq!(p.roots, HaskellGovRoots::default());
+    }
 }

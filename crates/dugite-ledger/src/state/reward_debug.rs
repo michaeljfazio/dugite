@@ -204,11 +204,15 @@ pub fn capture(
 
     let bprev_total_blocks: u64 = bprev_blocks_by_pool.values().sum();
     let total_rupd_credits: u64 = rupd.rewards.values().map(|l| l.0).sum();
+    // #898: must mirror `compute_reward_update` exactly — Haskell's
+    // `ssTotalActiveStake = sumAllActiveStake ssActiveStake` sums the whole
+    // active-stake map, including credentials delegated to pools that are no
+    // longer registered. Filtering here made this dump disagree with the
+    // reward calculation it exists to explain.
     let go_total_active_stake: u64 = go
         .pool_stake
-        .iter()
-        .filter(|(pool_id, _)| go.pool_params.contains_key(pool_id))
-        .fold(0u64, |acc, (_, s)| acc.saturating_add(s.0));
+        .values()
+        .fold(0u64, |acc, s| acc.saturating_add(s.0));
 
     let mut pools = Vec::with_capacity(go.pool_params.len());
 
