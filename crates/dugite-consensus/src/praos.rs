@@ -855,6 +855,10 @@ impl OuroborosPraos {
                     if self.strict_verification {
                         warn!(
                             slot = header.slot.0,
+                            pool = %blake2b_224(&header.issuer_vkey),
+                            expected = %info.vrf_keyhash,
+                            got = %header_vrf_hash,
+                            vrf_vkey = %header.vrf_vkey.iter().map(|b| format!("{b:02x}")).collect::<String>(),
                             "Praos: VRF key hash mismatch — header VRF key does not match pool registration"
                         );
                         return Err(ConsensusError::VrfKeyMismatch);

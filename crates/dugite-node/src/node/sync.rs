@@ -3588,25 +3588,47 @@ pub(crate) fn eager_validate_header(
     // issuer_info=None below — the #654 unknown-pool header hardening is
     // preserved for every mid-chain case.
     let pool_id = dugite_primitives::hash::blake2b_224(&header.issuer_vkey);
-    let set_snap = match ledger_view.snapshots.set.as_ref() {
-        Some(s) if !s.pool_stake.is_empty() => s,
-        _ => return Ok(false), // incomplete view — skip eager, body apply decides
+    // Select the snapshot that governs the HEADER's epoch, not the view's.
+    //
+    // During catch-up the ChainSync header stream legitimately runs ahead of
+    // block apply, so a header may belong to epoch E+1 while the view is still
+    // at E. Haskell forecasts across that boundary because the next epoch's
+    // poolDistr is already fixed (it is the pre-rotation `mark`); using the
+    // view's `set` instead applies the WRONG epoch's distribution. A pool that
+    // first gained stake in `mark` is then absent from `set` and every valid
+    // block it issued in E+1 is rejected as `UnregisteredPool` — which, because
+    // an eager failure tears down the connection, disconnects every honest peer
+    // serving that block in turn. Observed live on preview 2026-07-16/25.
+    let snap = match ledger_view.snapshot_for_epoch(ledger_view.epoch_of_slot(header.slot.0)) {
+        Some(s) => s,
+        // No captured snapshot describes the header's epoch (genesis epochs
+        // before the first rotation, an empty snapshot, or a header further
+        // ahead than we can forecast) — skip eager, body apply decides.
+        _ => return Ok(false),
     };
-    let issuer_info = set_snap.pool_stake.get(&pool_id).map(|pool_stake| {
-        let total_active_stake: u64 = set_snap.pool_stake.values().map(|l| l.0).sum();
-        // Pool's registered VRF key hash — look up in the snapshot's
-        // pool_params (the active map at the set boundary).
-        let vrf_keyhash = set_snap
-            .pool_params
-            .get(&pool_id)
-            .map(|p| p.vrf_keyhash)
-            .unwrap_or(dugite_primitives::hash::Hash32::ZERO);
-        dugite_consensus::praos::BlockIssuerInfo {
-            vrf_keyhash,
-            pool_stake: pool_stake.0,
-            total_active_stake,
+    let issuer_info = match (
+        snap.pool_stake.get(&pool_id),
+        snap.pool_params.get(&pool_id),
+    ) {
+        (Some(pool_stake), Some(reg)) => {
+            let total_active_stake: u64 = snap.pool_stake.values().map(|l| l.0).sum();
+            Some(dugite_consensus::praos::BlockIssuerInfo {
+                vrf_keyhash: reg.vrf_keyhash,
+                pool_stake: pool_stake.0,
+                total_active_stake,
+            })
         }
-    });
+        // Stake but no registration in the SAME snapshot: the eager layer cannot
+        // state this pool's VRF key. The previous code substituted
+        // `Hash32::ZERO`, which can never equal `blake2b_256(header.vrf_vkey)`,
+        // so a header whose VRF key was in fact correctly registered was
+        // rejected with `VrfKeyMismatch` and its peers dropped (the 2026-07-16
+        // report). A fabricated hash must never drive a rejection — skip.
+        (Some(_), None) => return Ok(false),
+        // No stake entry: genuinely unknown pool for this epoch. Preserved as
+        // fatal — this is the #654 unknown-pool header hardening.
+        (None, _) => None,
+    };
 
     // Forecast horizon was already checked by `forecast_park_or_disconnect`
     // at this site; pass the same `last_applied_slot` so any further
@@ -8106,6 +8128,190 @@ mod additional_sync_tests {
         enc.tag(minicbor::data::Tag::new(6)).unwrap(); // wrong tag
         enc.bytes(b"foo").unwrap();
         assert_eq!(unwrap_hfc_header(&buf), None);
+    }
+
+    /// Build the shared eager-validation fixture: a REAL Praos header
+    /// (Babbage shape == Conway shape) re-wrapped with the WIRE Conway index,
+    /// plus the header's own decoded slot / pool id / VRF key hash.
+    #[cfg(test)]
+    fn eager_fixture_header() -> (Vec<u8>, u64, dugite_primitives::hash::Hash28, Hash32) {
+        let wrapped_block = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../dugite-serialization/tests/fixtures/babbage_indef_tx_bodies_block33760.cbor"
+        ))
+        .expect("fixture");
+        let mut dec = minicbor::Decoder::new(&wrapped_block);
+        dec.array().expect("outer");
+        let _ = dec.u64().expect("era");
+        dec.array().expect("block");
+        let start = dec.position();
+        dec.skip().expect("skip header");
+        let header_bytes = &wrapped_block[start..dec.position()];
+        let mut buf = Vec::with_capacity(header_bytes.len() + 8);
+        {
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.array(2).unwrap();
+            enc.u64(6).unwrap(); // WIRE Conway index
+            enc.tag(minicbor::data::Tag::new(24)).unwrap();
+            enc.bytes(header_bytes).unwrap();
+        }
+        let hdr = dugite_serialization::decode_wire_wrapped_block_header(&buf).expect("decode");
+        let pool_id = dugite_primitives::hash::blake2b_224(&hdr.issuer_vkey);
+        let vrf_keyhash = dugite_primitives::hash::blake2b_256(&hdr.vrf_vkey);
+        (buf, hdr.slot.0, pool_id, vrf_keyhash)
+    }
+
+    /// Root cause of the 2026-07-16 "node cannot progress" report: eager header
+    /// validation applied the view's `set` snapshot to a header belonging to the
+    /// NEXT epoch.
+    ///
+    /// Per `references/era-rules/shelley-core.md` §NEWEPOCH:
+    /// `pd' = ssStakeMarkPoolDistr (esSnapshots es)` — the distribution active in
+    /// epoch E+1 is the PRE-rotation `mark`, which only becomes `set` once the
+    /// boundary is crossed. A pool that first gained stake in the mark snapshot is
+    /// therefore absent from `set` while the ledger is still in epoch E, so every
+    /// header it issued in E+1 was rejected as `UnregisteredPool` — and because an
+    /// eager failure tears down the connection, EVERY honest peer serving that
+    /// (valid) block was disconnected in turn. Permanent wedge.
+    ///
+    /// Reproduced live on preview 2026-07-25: ledger at epoch 1357 rejected the
+    /// valid block at slot 117334934 (epoch 1358) from pool 0b553dde…, which is
+    /// present in mark(1357) with 1.009T stake but absent from set(1356).
+    #[test]
+    fn eager_validate_uses_mark_snapshot_for_next_epoch_header() {
+        use dugite_ledger::state::{PoolRegistration, StakeSnapshot};
+        use dugite_primitives::time::EpochNo;
+        use dugite_primitives::value::Lovelace;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let (buf, slot, pool_id, vrf_keyhash) = eager_fixture_header();
+
+        let mut state = dugite_ledger::LedgerState::new(
+            dugite_primitives::protocol_params::ProtocolParameters::mainnet_defaults(),
+        );
+        // Pure-Shelley epoch arithmetic so header_epoch == slot / epoch_length.
+        state.shelley_transition_epoch = 0;
+        state.epoch_length = 1000;
+        let header_epoch = slot / 1000;
+        assert!(header_epoch >= 2, "fixture slot must be past epoch 2");
+        // Ledger sits one epoch BEHIND the header — the exact catch-up window
+        // in which ChainSync headers run ahead of block apply.
+        state.epoch = EpochNo(header_epoch - 1);
+
+        let reg = PoolRegistration {
+            pool_id,
+            vrf_keyhash,
+            pledge: Lovelace(0),
+            cost: Lovelace(0),
+            margin_numerator: 0,
+            margin_denominator: 1,
+            reward_account: Vec::new(),
+            owners: Vec::new(),
+            relays: Vec::new(),
+            metadata_url: None,
+            metadata_hash: None,
+        };
+        // mark = snapshot taken at the start of the view's epoch; it is the
+        // distribution that governs epoch `header_epoch`. Contains our pool.
+        let mut mark_stake = HashMap::new();
+        mark_stake.insert(pool_id, Lovelace(1_000_000_000_000));
+        let mut mark_params = HashMap::new();
+        mark_params.insert(pool_id, reg);
+        state.epochs.snapshots.mark = Some(StakeSnapshot {
+            epoch: EpochNo(header_epoch - 1),
+            pool_stake: mark_stake,
+            pool_params: Arc::new(mark_params),
+            ..StakeSnapshot::empty(EpochNo(header_epoch - 1))
+        });
+        // set = the PREVIOUS epoch's distribution. Populated (so the
+        // incomplete-view guard does not fire) but WITHOUT our pool — exactly
+        // the newly-active-pool case that wedged preview.
+        let mut set_stake = HashMap::new();
+        set_stake.insert(
+            dugite_primitives::hash::Hash28::from_bytes([0xAB; 28]),
+            Lovelace(500_000_000_000),
+        );
+        state.epochs.snapshots.set = Some(StakeSnapshot {
+            epoch: EpochNo(header_epoch - 2),
+            pool_stake: set_stake,
+            ..StakeSnapshot::empty(EpochNo(header_epoch - 2))
+        });
+
+        let view = crate::node::ledger_view::LedgerView::from_state(&state);
+        let mut consensus = dugite_consensus::praos::OuroborosPraos::new(11);
+        consensus.set_strict_verification(true);
+        let peer: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+        let mut counters = HashMap::new();
+
+        let result = eager_validate_header(&peer, &buf, slot, &consensus, &view, &mut counters);
+
+        assert!(
+            !matches!(
+                result,
+                Err(dugite_consensus::ConsensusError::UnregisteredPool { .. })
+            ),
+            "next-epoch header must be resolved against the mark snapshot, not set \
+             — got {result:?} (this is the preview wedge)"
+        );
+        assert!(
+            !matches!(
+                result,
+                Err(dugite_consensus::ConsensusError::VrfKeyMismatch)
+            ),
+            "pool VRF key must come from the snapshot governing the header's epoch \
+             — got {result:?}"
+        );
+    }
+
+    /// A pool present in the snapshot's `pool_stake` but MISSING from its
+    /// `pool_params` must SKIP eager validation, never reject.
+    ///
+    /// The old code substituted `Hash32::ZERO` for the missing registration,
+    /// which can never equal `blake2b_256(header.vrf_vkey)` — so the header was
+    /// rejected with `VrfKeyMismatch` and every peer serving it was dropped.
+    /// That is the exact error in the 2026-07-16 report (slot 117417642, pool
+    /// 175b7c01…, whose on-chain VRF key hashes correctly to its one and only
+    /// registration). A fabricated hash must never drive a rejection.
+    #[test]
+    fn eager_validate_skips_when_snapshot_lacks_pool_params() {
+        use dugite_ledger::state::StakeSnapshot;
+        use dugite_primitives::time::EpochNo;
+        use dugite_primitives::value::Lovelace;
+        use std::collections::HashMap;
+
+        let (buf, slot, pool_id, _vrf) = eager_fixture_header();
+
+        let mut state = dugite_ledger::LedgerState::new(
+            dugite_primitives::protocol_params::ProtocolParameters::mainnet_defaults(),
+        );
+        state.shelley_transition_epoch = 0;
+        state.epoch_length = 1000;
+        let header_epoch = slot / 1000;
+        state.epoch = EpochNo(header_epoch);
+
+        // Pool HAS stake but NO registration entry in the same snapshot.
+        let mut stake = HashMap::new();
+        stake.insert(pool_id, Lovelace(1_000_000_000_000));
+        state.epochs.snapshots.set = Some(StakeSnapshot {
+            epoch: EpochNo(header_epoch - 1),
+            pool_stake: stake,
+            ..StakeSnapshot::empty(EpochNo(header_epoch - 1))
+        });
+
+        let view = crate::node::ledger_view::LedgerView::from_state(&state);
+        let mut consensus = dugite_consensus::praos::OuroborosPraos::new(11);
+        consensus.set_strict_verification(true);
+        let peer: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+        let mut counters = HashMap::new();
+
+        let result = eager_validate_header(&peer, &buf, slot, &consensus, &view, &mut counters);
+
+        assert!(
+            matches!(result, Ok(false)),
+            "missing pool_params must SKIP (defer to body apply), never reject \
+             on a fabricated ZERO VRF hash — got {result:?}"
+        );
     }
 
     /// Eager validation with an INCOMPLETE view (no/empty set snapshot —

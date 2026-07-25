@@ -214,6 +214,50 @@ impl LedgerView {
     pub fn tip_slot(&self) -> u64 {
         self.last_applied_slot.map(|s| s.0).unwrap_or(0)
     }
+
+    /// Epoch containing `slot`. Mirrors `LedgerState::epoch_of_slot` exactly —
+    /// the view captures the same three era-history fields, so header-side
+    /// epoch arithmetic agrees with the apply path bit for bit.
+    pub fn epoch_of_slot(&self, slot: u64) -> u64 {
+        let byron_slots = self
+            .byron_epoch_length
+            .saturating_mul(self.shelley_transition_epoch);
+        if slot < byron_slots {
+            slot.checked_div(self.byron_epoch_length).unwrap_or(0)
+        } else {
+            let shelley_slots = slot - byron_slots;
+            self.shelley_transition_epoch
+                .saturating_add(shelley_slots / self.epoch_length)
+        }
+    }
+
+    /// The stake snapshot that governs leader election for `header_epoch`.
+    ///
+    /// Haskell (`references/era-rules/shelley-core.md` §NEWEPOCH step 4):
+    /// `pd' = ssStakeMarkPoolDistr (esSnapshots es)` — computed from the
+    /// **pre-EPOCH** snapshots, so the distribution active in epoch `E` is the
+    /// snapshot captured at the start of epoch `E-1`. After SNAP rotates, that
+    /// same snapshot is `ssStakeSet`.
+    ///
+    /// Every `StakeSnapshot` records the epoch it was captured in, so the
+    /// selection is a direct lookup rather than positional guesswork: pick the
+    /// snapshot with `epoch == header_epoch - 1`. While the ledger is still in
+    /// epoch `E` and ChainSync is streaming epoch `E+1` headers (the normal
+    /// catch-up window), that snapshot is `mark`, not `set`.
+    ///
+    /// Returns `None` when no captured snapshot describes that epoch — the
+    /// caller must then SKIP eager validation and defer to the authoritative
+    /// body-apply path, never reject.
+    pub fn snapshot_for_epoch(
+        &self,
+        header_epoch: u64,
+    ) -> Option<&dugite_ledger::state::StakeSnapshot> {
+        let want = header_epoch.checked_sub(1)?;
+        [self.snapshots.set.as_ref(), self.snapshots.mark.as_ref()]
+            .into_iter()
+            .flatten()
+            .find(|s| s.epoch.0 == want && !s.pool_stake.is_empty())
+    }
 }
 
 #[cfg(test)]
