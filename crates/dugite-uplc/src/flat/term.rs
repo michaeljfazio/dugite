@@ -91,15 +91,62 @@ fn plc_version_1_1_0() -> (
     )
 }
 
-/// First protocol version at which `maxBoundsByPV` bounds a `Constr` tag
-/// (and the constant-universe header) — mirrors `vanRossemPV` in
-/// `PlutusLedgerApi.Common.ProtocolVersions`. Below this PV, Haskell's
-/// `MaxBounds` is unbounded (`maxBound :: Word64`-equivalent).
-const CONSTR_TAG_BOUND_PV: u32 = 11;
+/// First protocol version at which `maxBoundsByPV` applies — the van Rossem
+/// intra-era hard fork (`vanRossemPV = MajorProtocolVersion 11` in
+/// `PlutusLedgerApi.Common.ProtocolVersions`). Below this PV both bounds are
+/// `maxBound`, i.e. no limit at all.
+const VAN_ROSSEM_PV: u32 = 11;
 
-/// Cap on a `Constr` tag once `maxBoundsByPV` is active (PV >= 11). Mirrors
-/// `MaxBounds { mbConstr = 1024 }` (`PlutusLedgerApi.Common.Versions`).
-const MAX_CONSTR_TAG: u64 = 1024;
+/// Cap on a `Constr`'s NUMBER OF FIELDS once `maxBoundsByPV` is active
+/// (PV >= 11) — `MaxBounds { mbConstr = 1024 }`.
+///
+/// This bounds the field count, NOT the tag. `UntypedPlutusCore.Core.Instance.
+/// Flat.decodeTerm` applies the predicate to `length fields`:
+///
+/// ```haskell
+/// handleTerm 8 = do
+///   unless (version >= PLC.plcVersion110) $ fail ...
+///   Constr
+///     <$> decode          -- annotation
+///     <*> decode          -- the tag: a Word64, NEVER bounded
+///     <*> ( do
+///             fields <- decodeListWith go
+///             case constrPred (length fields) of
+///               Nothing -> pure fields
+///               Just e -> fail e
+///         )
+/// ```
+///
+/// and `SerialisedScript.scriptCBORDecoder` supplies
+/// `checkConstr n | n <= maxBoundConstr = Nothing | otherwise = Just $
+/// "constr with " ++ show n ++ " fields is not available in protocol version" …`.
+///
+/// Bounding the tag instead would diverge from consensus in BOTH directions:
+/// a valid script with tag > 1024 would be falsely rejected (halting chain
+/// advance, cf. issue #898), and a script with > 1024 fields would be falsely
+/// accepted (forking away from the network).
+const MAX_CONSTR_FIELDS: usize = 1024;
+
+/// Cap on a constant's TYPE size once `maxBoundsByPV` is active (PV >= 11) —
+/// `MaxBounds { mbHeader = 32 }`.
+///
+/// `SerialisedScript.scriptCBORDecoder` supplies
+/// `checkConstant (Some (ValueOf uni _)) | defaultUniSize uni <= maxBoundHeader
+/// = Nothing | otherwise = Just $ "Constant of type … is not available in
+/// protocol version …"`, and `PlutusCore.Default.Universe` defines
+///
+/// ```haskell
+/// defaultUniSize :: forall k (a :: k). DefaultUni (Esc a) -> Int
+/// defaultUniSize = \case
+///   DefaultUniApply uniF uniA -> defaultUniSize uniF + defaultUniSize uniA + 1
+///   _ -> 1
+/// ```
+///
+/// That recurrence is exactly the flat universe-tag ATOM COUNT (`encodeUni
+/// (DefaultUniApply f a) = 7 : encodeUni f ++ encodeUni a`, base types being a
+/// single atom), so this bound is equivalently "at most 32 universe-tag atoms".
+/// See [`uni_size`].
+const MAX_CONSTANT_UNI_SIZE: usize = 32;
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -176,8 +223,9 @@ pub fn encode_constant(w: &mut BitWriter, c: &Constant) -> FlatResult<()> {
 ///    be `>= 1.1.0` (`decodeTerm`'s `plcVersion110` check). The *textual*
 ///    parser already enforces this (`syn/parser.rs`); this is the flat
 ///    (consensus) path's equivalent.
-/// 3. From protocol version 11 (`vanRossemPV`), a `Constr` tag is bounded
-///    at 1024 (`maxBoundsByPV`'s `mbConstr`).
+/// 3. From protocol version 11 (`vanRossemPV`), a `Constr`'s FIELD COUNT is
+///    bounded at 1024 (`maxBoundsByPV`'s `mbConstr`). The tag is unbounded —
+///    see [`MAX_CONSTR_FIELDS`].
 pub fn validate_program_availability(
     term: &Term,
     version: &(
@@ -253,7 +301,22 @@ fn validate_term_inner(
     depth: usize,
 ) -> FlatResult<()> {
     match term {
-        Term::Var(_) | Term::Error | Term::Const(_) => Ok(()),
+        Term::Var(_) | Term::Error => Ok(()),
+        Term::Const(c) => {
+            // van Rossem `mbHeader`: reject constants whose TYPE tree exceeds
+            // 32 (`checkConstant`/`defaultUniSize`). Unbounded before PV11.
+            if major_pv >= VAN_ROSSEM_PV {
+                let size = uni_size(&c.type_tag());
+                if size > MAX_CONSTANT_UNI_SIZE {
+                    return Err(UplcError::FlatDecode(format!(
+                        "constant of type size {size} is not available in protocol \
+                         version {major_pv} (maximum {MAX_CONSTANT_UNI_SIZE} from \
+                         protocol version {VAN_ROSSEM_PV})"
+                    )));
+                }
+            }
+            Ok(())
+        }
         Term::Lam(body) | Term::Delay(body) | Term::Force(body) => {
             validate_term_depth(body, language, major_pv, version_1_1_0_or_later, depth + 1)
         }
@@ -273,16 +336,20 @@ fn validate_term_inner(
                 )))
             }
         }
-        Term::Constr { tag, args } => {
+        // NB: the `Constr` tag is deliberately ignored — `maxBoundsByPV` bounds
+        // the field count only (see `MAX_CONSTR_FIELDS`).
+        Term::Constr { tag: _, args } => {
             if !version_1_1_0_or_later {
                 return Err(UplcError::FlatDecode(
                     "'constr' is not allowed before version 1.1.0".into(),
                 ));
             }
-            if major_pv >= CONSTR_TAG_BOUND_PV && *tag > MAX_CONSTR_TAG {
+            if major_pv >= VAN_ROSSEM_PV && args.len() > MAX_CONSTR_FIELDS {
                 return Err(UplcError::FlatDecode(format!(
-                    "constr tag {tag} exceeds the maximum of {MAX_CONSTR_TAG} \
-                     allowed from protocol version {CONSTR_TAG_BOUND_PV}"
+                    "constr with {} fields is not available in protocol version \
+                     {major_pv} (maximum {MAX_CONSTR_FIELDS} from protocol version \
+                     {VAN_ROSSEM_PV})",
+                    args.len()
                 )));
             }
             for a in args {
@@ -497,6 +564,32 @@ fn encode_term_list(w: &mut BitWriter, terms: &[Rc<Term>], depth: usize) -> Flat
 // ---------------------------------------------------------------------------
 // Constant codec — universe-tag list (full DefaultUni support)
 // ---------------------------------------------------------------------------
+
+/// Haskell `PlutusCore.Default.Universe.defaultUniSize`: the size of a
+/// constant's type-application tree. Every base type counts 1, and each
+/// application adds 1 for the `DefaultUniApply` node plus its operands.
+///
+/// `List(a)` = `Apply(ProtoList, a)` ⇒ `1 + 1 + size(a)`, and
+/// `Pair(a,b)` = `Apply(Apply(ProtoPair, a), b)` ⇒ `1 + (1 + 1 + size(a)) + size(b)`.
+/// `Array` is encoded as `Apply(ProtoArray, a)`, so it matches `List`.
+pub fn uni_size(tag: &TypeTag) -> usize {
+    match tag {
+        TypeTag::Integer
+        | TypeTag::ByteString
+        | TypeTag::String
+        | TypeTag::Unit
+        | TypeTag::Bool
+        | TypeTag::Data
+        | TypeTag::Bls12_381G1Element
+        | TypeTag::Bls12_381G2Element
+        | TypeTag::Bls12_381MlResult
+        | TypeTag::Value => 1,
+        // Apply(ProtoList, a) / Apply(ProtoArray, a)
+        TypeTag::List(a) | TypeTag::Array(a) => 2 + uni_size(a),
+        // Apply(Apply(ProtoPair, a), b)
+        TypeTag::Pair(a, b) => 3 + uni_size(a) + uni_size(b),
+    }
+}
 
 /// Read a flat-encoded cons-list of 4-bit universe-tag atoms and return
 /// the full [`TypeTag`]. This is the authoritative type-tag decoder.
@@ -1449,40 +1542,192 @@ mod tests {
             .expect("case must be allowed at PLC 1.1.0");
     }
 
-    /// (c) A `Constr` tag > 1024 at PV11 must be rejected.
+    /// van Rossem (PV11) `mbConstr` bounds the FIELD COUNT, not the tag:
+    /// `constrPred (length fields)` in `UntypedPlutusCore.Core.Instance.Flat.
+    /// decodeTerm`. 1025 fields must be rejected.
     #[test]
-    fn validate_rejects_constr_tag_over_1024_at_pv11() {
+    fn validate_rejects_constr_over_1024_fields_at_pv11() {
         let t = Term::Constr {
-            tag: 1025,
-            args: vec![],
+            tag: 0,
+            args: (0..1025).map(|_| Rc::new(Term::Error)).collect(),
         };
         let err = validate_program_availability(&t, &ver(1, 1, 0), ScriptLanguage::PlutusV3, 11)
             .unwrap_err();
-        assert!(matches!(err, UplcError::FlatDecode(_)), "got {err:?}");
+        let msg = format!("{err:?}");
+        assert!(
+            matches!(err, UplcError::FlatDecode(_)) && msg.contains("1025"),
+            "must report the offending field count: {msg}"
+        );
     }
 
-    /// The tag bound is inclusive: exactly 1024 must be accepted.
+    /// The field-count bound is inclusive: exactly 1024 fields is accepted.
     #[test]
-    fn validate_accepts_constr_tag_exactly_1024_at_pv11() {
+    fn validate_accepts_constr_exactly_1024_fields_at_pv11() {
         let t = Term::Constr {
-            tag: 1024,
-            args: vec![],
+            tag: 0,
+            args: (0..1024).map(|_| Rc::new(Term::Error)).collect(),
         };
         validate_program_availability(&t, &ver(1, 1, 0), ScriptLanguage::PlutusV3, 11)
-            .expect("tag 1024 is exactly at the boundary and must be accepted");
+            .expect("1024 fields is exactly at the boundary and must be accepted");
     }
 
-    /// Below PV11 the tag bound does not apply at all (Haskell's
-    /// `maxBoundsByPV` is unbounded pre-vanRossem) — no false rejection of
-    /// a large-but-then-legal tag.
+    /// Below PV11 `maxBoundsByPV` is unbounded, so a huge field count is legal.
     #[test]
-    fn validate_does_not_bound_constr_tag_before_pv11() {
+    fn validate_does_not_bound_constr_fields_before_pv11() {
         let t = Term::Constr {
-            tag: 50_000,
-            args: vec![],
+            tag: 0,
+            args: (0..2000).map(|_| Rc::new(Term::Error)).collect(),
         };
         validate_program_availability(&t, &ver(1, 1, 0), ScriptLanguage::PlutusV3, 10)
-            .expect("constr tag bound only applies from PV11");
+            .expect("the constr field bound only applies from PV11");
+    }
+
+    /// `uni_size` must equal Haskell `defaultUniSize`:
+    /// `DefaultUniApply f a -> size f + size a + 1`, base types 1.
+    #[test]
+    fn uni_size_matches_default_uni_size() {
+        use crate::term::TypeTag as T;
+        assert_eq!(uni_size(&T::Integer), 1);
+        assert_eq!(uni_size(&T::Data), 1);
+        assert_eq!(uni_size(&T::Value), 1);
+        // Apply(ProtoList, integer) = 1 + 1 + 1
+        assert_eq!(uni_size(&T::List(Box::new(T::Integer))), 3);
+        // Apply(ProtoArray, integer) is encoded like List
+        assert_eq!(uni_size(&T::Array(Box::new(T::Integer))), 3);
+        // Apply(ProtoList, Apply(ProtoList, integer)) = 1 + 1 + 3
+        assert_eq!(
+            uni_size(&T::List(Box::new(T::List(Box::new(T::Integer))))),
+            5
+        );
+        // Apply(Apply(ProtoPair, integer), integer) = (1+1+1) + 1 + 1
+        assert_eq!(
+            uni_size(&T::Pair(Box::new(T::Integer), Box::new(T::Integer))),
+            5
+        );
+        // pair (list integer) (list integer) = 3 + 3 + 3
+        assert_eq!(
+            uni_size(&T::Pair(
+                Box::new(T::List(Box::new(T::Integer))),
+                Box::new(T::List(Box::new(T::Integer)))
+            )),
+            9
+        );
+    }
+
+    /// `uni_size` must also equal the flat universe-tag ATOM COUNT, because
+    /// `encodeUni (DefaultUniApply f a) = 7 : encodeUni f ++ encodeUni a` has
+    /// the same recurrence as `defaultUniSize`. Verified by round-tripping a
+    /// constant through the flat codec and counting the atoms on the wire.
+    #[test]
+    fn uni_size_equals_flat_atom_count() {
+        use crate::term::TypeTag as T;
+        for tag in [
+            T::Integer,
+            T::List(Box::new(T::Integer)),
+            T::List(Box::new(T::List(Box::new(T::ByteString)))),
+            T::Pair(Box::new(T::Integer), Box::new(T::Bool)),
+            T::Pair(
+                Box::new(T::List(Box::new(T::Integer))),
+                Box::new(T::List(Box::new(T::Data))),
+            ),
+        ] {
+            assert_eq!(
+                uni_size(&tag),
+                encoded_atom_count(&tag),
+                "uni_size must equal the wire atom count for {tag:?}"
+            );
+        }
+    }
+
+    /// Count the 4-bit universe atoms `encode_type_tag` emits for `tag`.
+    fn encoded_atom_count(tag: &crate::term::TypeTag) -> usize {
+        use crate::term::TypeTag as T;
+        match tag {
+            T::List(a) | T::Array(a) => 2 + encoded_atom_count(a),
+            T::Pair(a, b) => 3 + encoded_atom_count(a) + encoded_atom_count(b),
+            _ => 1,
+        }
+    }
+
+    /// van Rossem `mbHeader = 32`: a constant whose type tree exceeds 32 is
+    /// rejected from PV11 and accepted below it (`maxBoundsByPV` is unbounded
+    /// pre-vanRossem).
+    ///
+    /// Note every `DefaultUni` type size is ODD — base types are 1, `List`
+    /// adds 2, and `Pair` adds 3 to two odd operands — so 32 itself is
+    /// unreachable and the effective boundary is "accept ≤ 31, reject ≥ 33".
+    #[test]
+    fn validate_bounds_constant_uni_size_only_from_pv11() {
+        use crate::term::{Constant, TypeTag as T};
+
+        // size(list^n integer) = 2n + 1, so 15 levels = 31.
+        let mut elem = T::Integer;
+        for _ in 0..15 {
+            elem = T::List(Box::new(elem));
+        }
+        assert_eq!(uni_size(&elem), 31);
+        // The constant's own type is List(elem) ⇒ 2 + 31 = 33.
+        let too_big = Term::Const(Constant::ProtoList {
+            elem_type: elem.clone(),
+            elements: vec![],
+        });
+        assert_eq!(uni_size(&too_big_type(&too_big)), 33);
+
+        let err =
+            validate_program_availability(&too_big, &ver(1, 0, 0), ScriptLanguage::PlutusV3, 11)
+                .unwrap_err();
+        assert!(
+            matches!(err, UplcError::FlatDecode(_)) && format!("{err:?}").contains("33"),
+            "PV11 must reject a constant whose type size is 33: {err:?}"
+        );
+        validate_program_availability(&too_big, &ver(1, 0, 0), ScriptLanguage::PlutusV3, 10)
+            .expect("below PV11 mbHeader is unbounded");
+
+        // One level shallower: List(list^14 integer) ⇒ 2 + 29 = 31 ≤ 32.
+        let mut ok_elem = T::Integer;
+        for _ in 0..14 {
+            ok_elem = T::List(Box::new(ok_elem));
+        }
+        let ok = Term::Const(Constant::ProtoList {
+            elem_type: ok_elem,
+            elements: vec![],
+        });
+        assert_eq!(uni_size(&too_big_type(&ok)), 31);
+        validate_program_availability(&ok, &ver(1, 0, 0), ScriptLanguage::PlutusV3, 11)
+            .expect("a constant type of size 31 is within mbHeader = 32");
+    }
+
+    /// Helper: the `TypeTag` of a `Term::Const`.
+    fn too_big_type(t: &Term) -> crate::term::TypeTag {
+        match t {
+            Term::Const(c) => c.type_tag(),
+            other => panic!("expected Term::Const, got {other:?}"),
+        }
+    }
+
+    /// The `Constr` TAG is a `Word64` and is NEVER bounded — not even at PV11.
+    ///
+    /// dugite previously bounded the tag at 1024 instead of the field count.
+    /// That is a two-way consensus divergence: a real script with a large tag
+    /// would be falsely REJECTED (halting chain advance, cf. #898), while one
+    /// with > 1024 fields would be falsely ACCEPTED (forking from the network).
+    #[test]
+    fn validate_never_bounds_constr_tag_898_class() {
+        for pv in [10u32, 11, 12] {
+            for tag in [1025u64, 50_000, u64::MAX] {
+                let t = Term::Constr {
+                    tag,
+                    args: vec![Rc::new(Term::Error)],
+                };
+                validate_program_availability(&t, &ver(1, 1, 0), ScriptLanguage::PlutusV3, pv)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "constr tag {tag} at PV{pv} must be accepted — the tag is \
+                                never bounded by maxBoundsByPV; got {e:?}"
+                        )
+                    });
+            }
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────
