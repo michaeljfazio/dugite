@@ -178,13 +178,6 @@ def patch_exec_spec_rule_core(path: str) -> None:
     if sentinel not in content:
         _die(path, "Could not find 'import UnliftIO.Environment (lookupEnv)'")
     new_imports = (
-        # `Imp/Core.hs` imports Cardano.Ledger.Core with an explicit list that
-        # does not include `eraProtVerLow` (cardano-ledger a88b60bd narrowed it
-        # to `(EraRule)`), but the dump block below needs it for `writeCBOR`.
-        # Importing the same entity twice from the same module is legal and
-        # unambiguous in Haskell, so this is safe whether or not a future
-        # version re-adds it to the existing import list.
-        "import Cardano.Ledger.Core (eraProtVerLow)\n"
         "import Control.Monad.IO.Class (liftIO)\n"
         "import Data.IORef (IORef, atomicModifyIORef', newIORef)\n"
         "import System.IO.Unsafe (unsafePerformIO)\n"
@@ -278,11 +271,14 @@ def patch_imp_core(path: str) -> None:
         _die(path, "Could not find 'import UnliftIO (evaluateDeep)'")
     new_imports = (
         # `Imp/Core.hs` imports Cardano.Ledger.Core with an explicit list that
-        # does not include `eraProtVerLow` (cardano-ledger a88b60bd narrowed it
+        # does NOT include `eraProtVerLow` (cardano-ledger a88b60bd narrowed it
         # to `(EraRule)`), but the dump block below needs it for `writeCBOR`.
-        # Importing the same entity twice from the same module is legal and
-        # unambiguous in Haskell, so this is safe whether or not a future
-        # version re-adds it to the existing import list.
+        #
+        # This is deliberately asymmetric with `patch_exec_spec_rule_core`:
+        # `ExecSpecRule/Core.hs` already has `import Cardano.Ledger.Core
+        # (Era, EraRule, eraProtVerLow)`, and cardano-ledger builds with
+        # `-Werror=unused-imports`, so adding it there too fails the build with
+        # "The import of 'Cardano.Ledger.Core' is redundant". Add it here only.
         "import Cardano.Ledger.Core (eraProtVerLow)\n"
         "import Control.Monad.IO.Class (liftIO)\n"
         "import Data.IORef (IORef, atomicModifyIORef', newIORef)\n"
