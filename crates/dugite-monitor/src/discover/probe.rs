@@ -319,16 +319,39 @@ cardano_node_metrics_blockNum_int 12345678
         let start = std::time::Instant::now();
         let outcome = probe_metrics_url(&url).await;
         let elapsed = start.elapsed();
-        assert!(outcome.is_none(), "slow server must time out");
         // The contract is "we did not wait for the slow server to respond".
-        // Assert elapsed well below SLOW_SERVER_DELAY (30 s) so the test is
-        // not flaky under heavy parallel test-suite load (6 000+ tests).  We
-        // allow up to 10 s to absorb tokio scheduling jitter; the actual
-        // probe timeout is 500 ms, so any realistic schedule lag still
-        // satisfies this bound while the slow server is still sleeping.
+        //
+        // `serve_slow` answers with a VALID dugite body and 200 OK once
+        // `SLOW_SERVER_DELAY` elapses, so a probe that failed to time out
+        // would return `Some`. `is_none()` therefore proves the contract on
+        // its own, and does so without measuring wall-clock time at all.
         assert!(
-            elapsed < Duration::from_secs(10),
-            "probe should time out well before {:?}, but took {:?}",
+            outcome.is_none(),
+            "slow server must time out; a probe that waited would have parsed \
+             the (valid) dugite body and returned Some"
+        );
+
+        // Guard the configured budget directly rather than by timing: the
+        // probe must give up well before the server could possibly answer.
+        // This is what actually protects the property above, and unlike a
+        // measured duration it cannot flake.
+        assert!(
+            PROBE_TIMEOUT < SLOW_SERVER_DELAY / 2,
+            "PROBE_TIMEOUT ({PROBE_TIMEOUT:?}) must stay well under \
+             SLOW_SERVER_DELAY ({SLOW_SERVER_DELAY:?}) or this test stops \
+             proving anything"
+        );
+
+        // Loose wall-clock backstop. Deliberately generous: the assertion
+        // that matters is `is_none()` above, and this only catches a probe
+        // that hung for the server's full delay. A tight bound here was a
+        // recurring flake — `elapsed` includes tokio scheduling latency under
+        // the full 7 000-test parallel run, which reached 15 s on a loaded
+        // machine while the probe itself had returned in 500 ms.
+        assert!(
+            elapsed < SLOW_SERVER_DELAY,
+            "probe should return before the slow server could answer ({:?}), \
+             but took {:?}",
             SLOW_SERVER_DELAY,
             elapsed
         );
