@@ -1112,13 +1112,51 @@ impl LedgerState {
         // Without this decode the imported ledger had `proposals.len() = 0`
         // and `governance` diverged from the from-genesis ledger by the
         // full proposal-state payload (~5.7 MB on preview epoch 1308).
-        match dugite_serialization::haskell_snapshot::decode_proposals(
+        match dugite_serialization::haskell_snapshot::decode_proposals_with_roots(
             &hs.new_epoch_state.gov_state.proposals_raw,
         ) {
-            Ok(haskell_proposals) => {
+            Ok(decoded) => {
                 use dugite_primitives::transaction::{Vote, Voter, VotingProcedure};
                 use dugite_serialization::haskell_snapshot::types::HaskellVote;
 
+                // ── Enacted roots (`pRoots` / `toPrevGovActionIds`) ──────
+                //
+                // #898: these MUST come from the snapshot. They record the
+                // last *enacted* action per purpose and are not recoverable
+                // from the active proposal set — a purpose's root is usually
+                // far older than any in-flight proposal, and may have no live
+                // descendants at all.
+                //
+                // Leaving them `None` makes the GOV rule (`proposalsAddAction`
+                // / `prev_action_matches_enacted_root`) silently drop every
+                // later proposal that legitimately chains onto a real root.
+                // On preview that dropped an `UpdateCommittee` proposal, so
+                // its 1000-ADA deposit was never refunded to the return
+                // account; that account's snapshot stake stayed
+                // 1_000_000_000 lovelace below Haskell's, which depressed
+                // `totalActiveStake` → every pool's `appPerf` → every reward,
+                // until an exact-drain withdrawal failed and chain advance
+                // halted permanently.
+                let to_gid =
+                    |id: &dugite_serialization::haskell_snapshot::types::HaskellGovActionId| {
+                        GovActionId {
+                            transaction_id: id.tx_hash,
+                            action_index: id.index as u32,
+                        }
+                    };
+                gov.enacted_pparam_update = decoded.roots.pparam_update.as_ref().map(to_gid);
+                gov.enacted_hard_fork = decoded.roots.hard_fork.as_ref().map(to_gid);
+                gov.enacted_committee = decoded.roots.committee.as_ref().map(to_gid);
+                gov.enacted_constitution = decoded.roots.constitution.as_ref().map(to_gid);
+                info!(
+                    pparam_update = ?gov.enacted_pparam_update.as_ref().map(|i| i.transaction_id.to_hex()),
+                    hard_fork = ?gov.enacted_hard_fork.as_ref().map(|i| i.transaction_id.to_hex()),
+                    committee = ?gov.enacted_committee.as_ref().map(|i| i.transaction_id.to_hex()),
+                    constitution = ?gov.enacted_constitution.as_ref().map(|i| i.transaction_id.to_hex()),
+                    "Loaded enacted governance roots from Haskell snapshot"
+                );
+
+                let haskell_proposals = decoded.actions;
                 let proposal_count = haskell_proposals.len();
                 for (submission_index, gas) in haskell_proposals.into_iter().enumerate() {
                     let action_id = GovActionId {
@@ -1191,11 +1229,11 @@ impl LedgerState {
                         yes_votes: yes,
                         no_votes: no,
                         abstain_votes: abstain,
-                        // #799: `decode_proposals` returns entries in the order
+                        // #799: `decode_proposals_with_roots` returns entries in the order
                         // they appear on the wire, which is a `StrictSeq` that
                         // preserves the Haskell `Proposals` OMap's insertion
                         // (on-chain submission) order — see the doc comment on
-                        // `decode_proposals`. Enumeration index is therefore a
+                        // `decode_proposals_with_roots`. Enumeration index is therefore a
                         // faithful reconstruction of `submission_index`.
                         submission_index: submission_index as u64,
                     };

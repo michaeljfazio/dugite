@@ -2670,6 +2670,68 @@ fn apply_protocol_param_update_impl(
 /// decomposed sub-states, allowing it to be called from both the
 /// monolithic `LedgerState` path and the `EraRules` dispatch path.
 #[allow(clippy::too_many_arguments)]
+/// Refund a removed proposal's deposit to its `return_addr`, mirroring Haskell
+/// `Cardano.Ledger.Conway.Rules.Epoch`'s `proposalsApplyEnactment` /
+/// `returnProposalDeposits`: the deposit is credited to the return account's
+/// balance when that account is registered, and routed to the treasury when it
+/// is not.
+///
+/// Every proposal-removal path (expiry, enactment, sibling/descendant drop)
+/// MUST go through here. Issue #898: three hand-copied versions of this logic
+/// existed, and a proposal removed without a refund silently destroys the
+/// deposit — invisible in the pots (treasury and reserves still reconcile)
+/// but it lowers the return account's balance forever, which then depresses
+/// its snapshot stake, every pool's `appPerf`, and ultimately every reward,
+/// until an exact-drain withdrawal fails and chain advance halts.
+fn refund_proposal_deposit(
+    action_id: &GovActionId,
+    proposal_state: &ProposalState,
+    epochs: &mut EpochSubState,
+    certs: &mut CertSubState,
+    reason: &'static str,
+) {
+    let deposit = proposal_state.procedure.deposit;
+    if deposit.0 == 0 {
+        return;
+    }
+    let return_addr = &proposal_state.procedure.return_addr;
+    if return_addr.len() < 29 {
+        warn!(
+            action_id = %action_id.transaction_id.to_hex(),
+            index = action_id.action_index,
+            deposit = deposit.0,
+            return_addr_len = return_addr.len(),
+            reason,
+            "Governance proposal deposit NOT refunded: malformed return address \
+             (deposit would be destroyed) — this must never happen for a proposal \
+             that passed GOV validation"
+        );
+        return;
+    }
+    let key = LedgerState::reward_account_to_hash(return_addr);
+    if certs.reward_accounts.contains_key(&key) {
+        *certs.reward_accounts.entry(key).or_insert(Lovelace(0)) += deposit;
+        debug!(
+            action_id = %action_id.transaction_id.to_hex(),
+            index = action_id.action_index,
+            deposit = deposit.0,
+            cred = %key.to_hex(),
+            reason,
+            "Governance proposal deposit refunded to return account"
+        );
+    } else {
+        epochs.treasury += deposit;
+        debug!(
+            action_id = %action_id.transaction_id.to_hex(),
+            index = action_id.action_index,
+            deposit = deposit.0,
+            cred = %key.to_hex(),
+            reason,
+            "Governance proposal deposit -> treasury (unregistered return address)"
+        );
+    }
+}
+
 pub(crate) fn ratify_proposals_impl(
     epoch: EpochNo,
     epochs: &mut EpochSubState,
@@ -2992,27 +3054,7 @@ pub(crate) fn ratify_proposals_impl(
             &mut gov_state.votes_by_action,
         );
         for (action_id, proposal_state) in &removed {
-            let deposit = proposal_state.procedure.deposit;
-            if deposit.0 > 0 {
-                let return_addr = &proposal_state.procedure.return_addr;
-                if return_addr.len() >= 29 {
-                    let key = LedgerState::reward_account_to_hash(return_addr);
-                    if certs.reward_accounts.contains_key(&key) {
-                        *certs.reward_accounts.entry(key).or_insert(Lovelace(0)) += deposit;
-                    } else {
-                        epochs.treasury += deposit;
-                        debug!(
-                            "Governance proposal {:?} deposit {} -> treasury \
-                             (unregistered return address)",
-                            action_id, deposit.0
-                        );
-                    }
-                }
-            }
-            debug!(
-                "Governance proposal expired: {:?} (deposit {} returned)",
-                action_id, proposal_state.procedure.deposit.0
-            );
+            refund_proposal_deposit(action_id, proposal_state, epochs, certs, "expired");
         }
         if !removed.is_empty() {
             debug!(
@@ -3047,23 +3089,7 @@ pub(crate) fn ratify_proposals_impl(
                 .proposals
                 .remove(action_id)
             {
-                let deposit = proposal_state.procedure.deposit;
-                if deposit.0 > 0 {
-                    let return_addr = &proposal_state.procedure.return_addr;
-                    if return_addr.len() >= 29 {
-                        let key = LedgerState::reward_account_to_hash(return_addr);
-                        if certs.reward_accounts.contains_key(&key) {
-                            *certs.reward_accounts.entry(key).or_insert(Lovelace(0)) += deposit;
-                        } else {
-                            epochs.treasury += deposit;
-                            debug!(
-                                "Governance proposal {:?} deposit {} -> treasury \
-                                 (unregistered return address)",
-                                action_id, deposit.0
-                            );
-                        }
-                    }
-                }
+                refund_proposal_deposit(action_id, &proposal_state, epochs, certs, "enacted");
                 ratified_with_state.push((action_id.clone(), proposal_state));
             }
             Arc::make_mut(&mut gov.governance)
@@ -3100,19 +3126,14 @@ pub(crate) fn ratify_proposals_impl(
                     &mut gov_state.proposal_graph,
                     &mut gov_state.votes_by_action,
                 );
-                for (_action_id, proposal_state) in &removed {
-                    let deposit = proposal_state.procedure.deposit;
-                    if deposit.0 > 0 {
-                        let return_addr = &proposal_state.procedure.return_addr;
-                        if return_addr.len() >= 29 {
-                            let key = LedgerState::reward_account_to_hash(return_addr);
-                            if certs.reward_accounts.contains_key(&key) {
-                                *certs.reward_accounts.entry(key).or_insert(Lovelace(0)) += deposit;
-                            } else {
-                                epochs.treasury += deposit;
-                            }
-                        }
-                    }
+                for (action_id, proposal_state) in &removed {
+                    refund_proposal_deposit(
+                        action_id,
+                        proposal_state,
+                        epochs,
+                        certs,
+                        "sibling-or-descendant dropped by enactment",
+                    );
                 }
                 if !removed.is_empty() {
                     debug!(
