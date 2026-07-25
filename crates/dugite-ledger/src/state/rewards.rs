@@ -283,11 +283,49 @@ pub fn compute_reward_update(
         }
     };
 
+    // #898: `totalActiveStake` is the sum of the GO snapshot's ENTIRE
+    // per-credential active-stake map — it is NOT restricted to pools that are
+    // still registered.
+    //
+    //   -- Cardano.Ledger.State.SnapShots
+    //   mkSnapShot ssActiveStake ssStakePoolsSnapShot =
+    //     let ssTotalActiveStake = sumAllActiveStake ssActiveStake
+    //      in SnapShot {ssActiveStake, ssTotalActiveStake, ssStakePoolsSnapShot}
+    //
+    //   -- Cardano.Ledger.State.Stake
+    //   -- | Active stake: maps staking credentials to their non-zero stake
+    //   -- paired with delegation. Only credentials that are registered,
+    //   -- delegated, and have non-zero stake appear here.
+    //   sumAllActiveStake (ActiveStake m) =
+    //     VMap.foldMap (fromCompact . unNonZero . swdStake) m
+    //       `nonZeroOr` knownNonZeroCoin @1
+    //
+    // Membership requires *registered + delegated + non-zero stake*; it does
+    // NOT require the delegated-to pool to still exist. Pool retirement
+    // (POOLREAP) removes the pool from `psStakePools` but leaves its
+    // delegators' delegations dangling, so their stake keeps contributing to
+    // `ssTotalActiveStake` while contributing to no pool's `spssStake`
+    // (`ssStakePoolsSnapShot` is rebuilt from `psStakePools` alone).
+    //
+    // Filtering by `pool_params` understated `totalActiveStake`. Since
+    // `appPerf = beta / sigmaA = beta * totalActiveStake / poolStake`, a low
+    // total scales every pool's `poolPot` — and therefore every leader and
+    // member reward — down proportionally. On preview epoch 1363 a retired
+    // pool held 1000 ADA, so dugite's total was 1_000_000_000 lovelace low;
+    // the member reward for account 8fab5f50… came out 4 lovelace short of
+    // the on-chain value and the PV≥10 exact-drain withdrawal check then
+    // halted chain advance permanently.
+    //
+    // `pool_stake` and `stake_distribution` are built from the same
+    // `certs.delegations` walk in both `eras/shelley.rs` and `eras/conway.rs`
+    // (UTxO stake + reward balance, plus the Shelley-only pointer-stake
+    // resolution applied to both), so summing every `pool_stake` entry is
+    // exactly `sumAllActiveStake` over `stake_distribution` — and is O(pools)
+    // rather than O(credentials).
     let total_active_stake: u64 = go
         .pool_stake
-        .iter()
-        .filter(|(pool_id, _)| go.pool_params.contains_key(pool_id))
-        .fold(0u64, |acc, (_, s)| acc.saturating_add(s.0));
+        .values()
+        .fold(0u64, |acc, s| acc.saturating_add(s.0));
     if total_active_stake == 0 {
         debug!(
             "No active stake: GO pools={}, GO pool_stake entries={}",
@@ -303,6 +341,33 @@ pub fn compute_reward_update(
             delta_treasury,
             rewards: HashMap::new(),
         };
+    }
+
+    // #898 diagnostic: stake still delegated to pools that are no longer
+    // registered. It counts toward `totalActiveStake` (above) but earns
+    // nothing. A non-zero value here is normal after a pool retires; it is
+    // logged because a mismatch in this figure shifts EVERY pool's reward and
+    // is otherwise invisible until a withdrawal fails the PV≥10 exact-drain
+    // check (which is how #898 surfaced).
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let retired_stake: u64 = go
+            .pool_stake
+            .iter()
+            .filter(|(pool_id, _)| !go.pool_params.contains_key(pool_id))
+            .fold(0u64, |acc, (_, s)| acc.saturating_add(s.0));
+        if retired_stake > 0 {
+            debug!(
+                total_active_stake,
+                retired_stake,
+                retired_pools = go
+                    .pool_stake
+                    .keys()
+                    .filter(|p| !go.pool_params.contains_key(p))
+                    .count(),
+                "GO snapshot holds stake delegated to unregistered pools \
+                 (counted in totalActiveStake per Haskell sumAllActiveStake)"
+            );
+        }
     }
 
     let total_blocks_in_epoch: u64 = bprev_blocks_by_pool.values().sum::<u64>().max(1);
@@ -807,6 +872,19 @@ impl LedgerState {
 #[cfg(test)]
 mod tests {
     use super::{apply_reserves_delta, Rat};
+    use crate::state::{PoolRegistration, StakeSnapshot};
+    use dugite_primitives::value::Lovelace;
+    use dugite_primitives::{EpochNo, Hash28, Hash32};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    /// Exact `Rational` literal (protocol parameters are exact rationals).
+    fn rat(numerator: u64, denominator: u64) -> dugite_primitives::transaction::Rational {
+        dugite_primitives::transaction::Rational {
+            numerator,
+            denominator,
+        }
+    }
 
     // -----------------------------------------------------------------------
     // GCD correctness
@@ -1686,6 +1764,372 @@ mod tests {
         assert!(
             max_pool < 200_000_000,
             "maxPool with circulation denominator should be ~99M, got {max_pool}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #898 — `totalActiveStake` must include stake delegated to pools
+    // that are no longer registered.
+    // -----------------------------------------------------------------------
+
+    fn h28(b: u8) -> Hash28 {
+        dugite_primitives::Hash([b; 28])
+    }
+
+    fn cred32(b: u8) -> Hash32 {
+        h28(b).to_hash32_padded()
+    }
+
+    /// Build a `PoolRegistration` whose reward account resolves (via
+    /// `reward_account_to_hash`) to `cred32(reward_owner)`.
+    fn pool_reg(
+        pool: Hash28,
+        pledge: u64,
+        cost: u64,
+        margin: (u64, u64),
+        owners: Vec<Hash28>,
+        reward_owner: u8,
+    ) -> PoolRegistration {
+        let mut reward_account = vec![0xe0u8]; // stake-key header, testnet
+        reward_account.extend_from_slice(&[reward_owner; 28]);
+        PoolRegistration {
+            pool_id: pool,
+            vrf_keyhash: cred32(0xff),
+            pledge: Lovelace(pledge),
+            cost: Lovelace(cost),
+            margin_numerator: margin.0,
+            margin_denominator: margin.1,
+            reward_account,
+            owners,
+            relays: Vec::new(),
+            metadata_url: None,
+            metadata_hash: None,
+        }
+    }
+
+    /// Byte-exact replica of the **real** preview epoch-1363 reward calculation
+    /// that wedged chain advance in issue #898.
+    ///
+    /// # Ground truth (all cross-checked against Koios, preview, PV11)
+    ///
+    /// | Input | Value | Source |
+    /// |---|---|---|
+    /// | pool | `pool1fw7yf4…` = `4bbc44d7…` | — |
+    /// | pool active stake | `1_819_094_673_949` | `pool_history(1363).active_stake` |
+    /// | pool blocks | 2 | `pool_history(1363).block_cnt` |
+    /// | total blocks | 3559 | `epoch_info(1363).blk_count` |
+    /// | **total active stake** | **`3_268_739_510_060_196`** | `epoch_info(1363).active_stake` |
+    /// | fixed cost / margin | `340_000_000` / `7/100` | `pool_history(1363)` |
+    /// | ρ / τ / a0 / nOpt / d | `3/1000` / `1/5` / `3/10` / 500 / 0 | `epoch_params(1363)` |
+    /// | reserves | `7_804_831_720_526_939` | ⇒ `total_stake = 37_195_168_279_473_061` (logged by dugite) |
+    /// | `ssFee` | `1_277_034_331` | `epoch_info(1363).fees` |
+    ///
+    /// Those inputs reproduce dugite's own logged intermediates exactly
+    /// (`reward_pot = 15_432_908_345_996`, `max_pool = 580_606_552`), and then
+    /// the full Koios payout table to the lovelace:
+    /// `pool_fees = 357_239_965`, `member_rewards = 182_748_146`,
+    /// `deleg_rewards = 229_045_254`, and for the account that wedged the
+    /// chain (`8fab5f50…`, stake `52_270_631_990`) a member reward of
+    /// **`6_581_482`** — the exact amount withdrawn on-chain by tx
+    /// `9a96f16a…` at slot 117_936_318.
+    ///
+    /// # Why this test exists
+    ///
+    /// The wedge in #898 was NOT a reward-formula bug — it was 1_000_000_000
+    /// lovelace of missing *stake*. A governance proposal deposit refund was
+    /// never credited to its return account (see
+    /// `haskell_snapshot::govstate::decode_proposals_with_roots`), so that
+    /// account's snapshot stake stayed 1000 ADA below Haskell's, which lowered
+    /// `totalActiveStake` from `3_268_739_510_060_196` to
+    /// `3_268_738_510_060_196`. Because
+    /// `appPerf = beta / sigmaA = (blocks/totalBlocks) × (totalActiveStake /
+    /// poolStake)`, a low total scales every pool's pot down: this pool's pot
+    /// fell 586_285_225 → 586_285_046 and this member's reward 6_581_482 →
+    /// 6_581_478. Under the PV≥10 exact-drain rule the on-chain withdrawal of
+    /// 6_581_482 then failed with `WithdrawalAmountMismatch`, permanently
+    /// halting chain advance.
+    ///
+    /// This test pins the reward pipeline itself: given the *correct* inputs it
+    /// must reproduce the on-chain payout to the lovelace. That makes it the
+    /// discriminator that ruled the formula out as the cause — and a permanent
+    /// guard against any future change to `maxPool'`, `mkApparentPerformance`,
+    /// `leaderRew` or `memberRew` that would silently shift real payouts.
+    #[test]
+    fn test_preview_epoch_1363_reward_is_byte_exact_vs_chain() {
+        const POOL: u8 = 0x4b; // pool1fw7yf4… (ours, produces blocks)
+        const FILLER: u8 = 0x77; // registered pool holding the rest of preview's active stake
+        const RETIRED: u8 = 0x99; // stake delegated to a pool absent from pool_params
+        const BLOCKS: u8 = 0x55; // block-count filler; no stake, no rewards
+
+        let pool_stake_ours: u64 = 1_819_094_673_949;
+        let total_active_stake: u64 = 3_268_739_510_060_196; // Koios epoch_info(1363)
+        let retired_stake: u64 = 1_000_000_000; // 1000 ADA delegated to a retired pool
+        let filler_stake: u64 = total_active_stake - pool_stake_ours - retired_stake;
+
+        // The 10 real delegators of pool1fw7yf4… at epoch 1363 (Koios
+        // `pool_delegators_history`), which sum exactly to the pool's active stake.
+        // Index 8 is the pool owner; index 3 is the account that wedged the chain.
+        let deleg_stakes: [u64; 10] = [
+            1_175_693_626_668,
+            1_831_815,
+            11_069_661_648,
+            52_270_631_990, // 8fab5f50… ← the wedging account
+            10_855_654_266,
+            11_428_319_109,
+            12_480_774_198,
+            170_162_540_341,
+            367_695_114_063, // owner
+            7_436_519_851,
+        ];
+        assert_eq!(
+            deleg_stakes.iter().sum::<u64>(),
+            pool_stake_ours,
+            "Koios delegator stakes must sum to the pool's active stake"
+        );
+        const OURS_IDX: usize = 3;
+        const OWNER_IDX: usize = 8;
+        let cred_of = |i: usize| cred32(0xa0 + i as u8);
+        let owner28 = h28(0xa0 + OWNER_IDX as u8);
+
+        // ---- GO snapshot ----------------------------------------------------
+        let mut delegations: HashMap<Hash32, Hash28> = HashMap::new();
+        let mut stake_distribution: HashMap<Hash32, Lovelace> = HashMap::new();
+        for (i, s) in deleg_stakes.iter().enumerate() {
+            delegations.insert(cred_of(i), h28(POOL));
+            stake_distribution.insert(cred_of(i), Lovelace(*s));
+        }
+        delegations.insert(cred32(0xd1), h28(FILLER));
+        stake_distribution.insert(cred32(0xd1), Lovelace(filler_stake));
+        // The credential delegated to the now-retired pool. It is registered and
+        // has non-zero stake, so Haskell counts it in `ssTotalActiveStake`.
+        delegations.insert(cred32(0xd2), h28(RETIRED));
+        stake_distribution.insert(cred32(0xd2), Lovelace(retired_stake));
+
+        let mut pool_stake: HashMap<Hash28, Lovelace> = HashMap::new();
+        pool_stake.insert(h28(POOL), Lovelace(pool_stake_ours));
+        pool_stake.insert(h28(FILLER), Lovelace(filler_stake));
+        pool_stake.insert(h28(RETIRED), Lovelace(retired_stake));
+
+        // `pool_params` deliberately omits RETIRED — that is the whole point.
+        let mut pool_params: HashMap<Hash28, PoolRegistration> = HashMap::new();
+        pool_params.insert(
+            h28(POOL),
+            pool_reg(
+                h28(POOL),
+                5_000_000_000,
+                340_000_000,
+                (7, 100),
+                vec![owner28],
+                0xa0 + OWNER_IDX as u8,
+            ),
+        );
+        pool_params.insert(
+            h28(FILLER),
+            pool_reg(h28(FILLER), 0, 340_000_000, (1, 10), vec![], 0xd1),
+        );
+
+        let go = StakeSnapshot {
+            epoch: EpochNo(1362),
+            delegations: Arc::new(delegations),
+            pool_stake,
+            pool_params: Arc::new(pool_params),
+            stake_distribution: Arc::new(stake_distribution),
+            epoch_fees: Lovelace(0),
+            epoch_block_count: 0,
+            epoch_blocks_by_pool: Arc::new(HashMap::new()),
+        };
+
+        // ---- bprev: 2 blocks for our pool, 3557 elsewhere (total 3559) ------
+        let mut bprev: HashMap<Hash28, u64> = HashMap::new();
+        bprev.insert(h28(POOL), 2);
+        bprev.insert(h28(BLOCKS), 3557); // no stake/params ⇒ contributes only to totals
+        assert_eq!(bprev.values().sum::<u64>(), 3559);
+
+        // ---- protocol parameters (Koios epoch_params(1363)) -----------------
+        let mut params = dugite_primitives::protocol_params::ProtocolParameters::mainnet_defaults();
+        params.rho = rat(3, 1000);
+        params.tau = rat(1, 5);
+        params.a0 = rat(3, 10);
+        params.n_opt = 500;
+        params.active_slots_coeff = 0.05;
+
+        let reserves = Lovelace(7_804_831_720_526_939);
+        let ss_fee = Lovelace(1_277_034_331);
+
+        let rupd = super::compute_reward_update(
+            &params,
+            &rat(0, 1), // prev_d — Conway: d = 0
+            11,         // prev_protocol_version_major — van Rossem (PV11)
+            Some(&go),
+            &bprev,
+            ss_fee,
+            reserves,
+            Lovelace(0),
+            &HashMap::new(),
+            None,
+            86_400, // preview epoch length
+            0,
+            super::super::MAX_LOVELACE_SUPPLY,
+        );
+
+        // The account whose on-chain withdrawal wedged the chain.
+        let ours = rupd
+            .rewards
+            .get(&cred_of(OURS_IDX))
+            .copied()
+            .unwrap_or(Lovelace(0));
+        assert_eq!(
+            ours.0,
+            6_581_482,
+            "member reward for 8fab5f50… must equal the amount withdrawn on-chain \
+             by tx 9a96f16a… at slot 117936318. Got {} (off by {}). Any drift here \
+             means the reward pipeline (maxPool' / mkApparentPerformance / \
+             memberRew) no longer reproduces real preview payouts.",
+            ours.0,
+            6_581_482i64 - ours.0 as i64,
+        );
+
+        // Whole-pool payout table, byte-exact vs Koios `pool_history(1363)`.
+        let member_total: u64 = (0..10)
+            .filter(|i| *i != OWNER_IDX)
+            .map(|i| {
+                rupd.rewards
+                    .get(&cred_of(i))
+                    .copied()
+                    .unwrap_or(Lovelace(0))
+                    .0
+            })
+            .sum();
+        assert_eq!(
+            member_total, 182_748_146,
+            "sum of non-owner member rewards must equal Koios `member_rewards`"
+        );
+
+        // dugite folds leaderRew + memberRew(owner) into one operator credit;
+        // Koios reports them separately as `pool_fees` + (`deleg_rewards` −
+        // `member_rewards`) = 357_239_965 + 46_297_108.
+        let operator = rupd
+            .rewards
+            .get(&cred_of(OWNER_IDX))
+            .copied()
+            .unwrap_or(Lovelace(0));
+        assert_eq!(
+            operator.0,
+            357_239_965 + 46_297_108,
+            "operator credit must equal Koios pool_fees + owner-as-member"
+        );
+    }
+
+    /// `totalActiveStake` must mirror Haskell `sumAllActiveStake` — the sum of
+    /// the GO snapshot's ENTIRE per-credential active-stake map, not just the
+    /// pools still present in `pool_params`:
+    ///
+    /// ```haskell
+    /// -- Cardano.Ledger.State.SnapShots
+    /// mkSnapShot ssActiveStake ssStakePoolsSnapShot =
+    ///   let ssTotalActiveStake = sumAllActiveStake ssActiveStake
+    ///    in SnapShot {ssActiveStake, ssTotalActiveStake, ssStakePoolsSnapShot}
+    ///
+    /// -- Cardano.Ledger.State.Stake
+    /// -- | Active stake: maps staking credentials to their non-zero stake paired
+    /// -- with delegation. Only credentials that are registered, delegated, and
+    /// -- have non-zero stake appear here.
+    /// sumAllActiveStake (ActiveStake m) =
+    ///   VMap.foldMap (fromCompact . unNonZero . swdStake) m `nonZeroOr` knownNonZeroCoin @1
+    /// ```
+    ///
+    /// Membership needs *registered + delegated + non-zero*; it does NOT need
+    /// the delegated-to pool to still be registered. `ssStakePoolsSnapShot`
+    /// (the per-pool aggregates) is rebuilt from `psStakePools` alone, so the
+    /// two quantities are only equal because SNAP runs before POOLREAP.
+    ///
+    /// dugite previously summed `pool_stake` filtered to registered pools,
+    /// which relied on that ordering invariant instead of the definition. This
+    /// test pins the definition directly: the ONLY difference between the two
+    /// runs is whether an unrelated pool is still in `pool_params`, and that
+    /// must not move this pool's member reward by a single lovelace. Without
+    /// the fix the reward changes by ~4× here.
+    #[test]
+    fn test_total_active_stake_matches_haskell_sum_all_active_stake() {
+        const POOL: u8 = 0x11;
+        const OTHER: u8 = 0x22;
+        let member = cred32(0x33);
+        let other_deleg = cred32(0x44);
+
+        let build = |other_registered: bool| {
+            let mut delegations: HashMap<Hash32, Hash28> = HashMap::new();
+            delegations.insert(member, h28(POOL));
+            delegations.insert(other_deleg, h28(OTHER));
+            let mut stake_distribution: HashMap<Hash32, Lovelace> = HashMap::new();
+            stake_distribution.insert(member, Lovelace(500_000_000_000));
+            stake_distribution.insert(other_deleg, Lovelace(1_500_000_000_000));
+            let mut pool_stake: HashMap<Hash28, Lovelace> = HashMap::new();
+            pool_stake.insert(h28(POOL), Lovelace(500_000_000_000));
+            pool_stake.insert(h28(OTHER), Lovelace(1_500_000_000_000));
+
+            let mut pool_params: HashMap<Hash28, PoolRegistration> = HashMap::new();
+            pool_params.insert(
+                h28(POOL),
+                pool_reg(h28(POOL), 0, 1_000_000, (1, 10), vec![], 0x77),
+            );
+            if other_registered {
+                pool_params.insert(
+                    h28(OTHER),
+                    pool_reg(h28(OTHER), 0, 1_000_000, (1, 10), vec![], 0x88),
+                );
+            }
+
+            let go = StakeSnapshot {
+                epoch: EpochNo(7),
+                delegations: Arc::new(delegations),
+                pool_stake,
+                pool_params: Arc::new(pool_params),
+                stake_distribution: Arc::new(stake_distribution),
+                epoch_fees: Lovelace(0),
+                epoch_block_count: 0,
+                epoch_blocks_by_pool: Arc::new(HashMap::new()),
+            };
+
+            let mut bprev: HashMap<Hash28, u64> = HashMap::new();
+            bprev.insert(h28(POOL), 100);
+
+            let mut params =
+                dugite_primitives::protocol_params::ProtocolParameters::mainnet_defaults();
+            params.rho = rat(3, 1000);
+            params.tau = rat(1, 5);
+            params.a0 = rat(3, 10);
+            params.n_opt = 500;
+            params.active_slots_coeff = 0.05;
+
+            super::compute_reward_update(
+                &params,
+                &rat(0, 1),
+                11,
+                Some(&go),
+                &bprev,
+                Lovelace(0),
+                Lovelace(30_000_000_000_000_000),
+                Lovelace(0),
+                &HashMap::new(),
+                None,
+                86_400,
+                0,
+                super::super::MAX_LOVELACE_SUPPLY,
+            )
+            .rewards
+            .get(&member)
+            .copied()
+            .unwrap_or(Lovelace(0))
+            .0
+        };
+
+        let with_registered = build(true);
+        let with_retired = build(false);
+        assert!(with_registered > 0, "sanity: member must earn a reward");
+        assert_eq!(
+            with_registered, with_retired,
+            "#898: retiring an unrelated pool must not change this pool's member \
+             reward — its delegated stake stays in Haskell's `sumAllActiveStake`"
         );
     }
 }
