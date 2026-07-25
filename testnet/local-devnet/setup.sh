@@ -11,7 +11,29 @@ log_info "=== Local devnet setup ==="
 check_prereqs
 assert_ports_free
 
-log_info "Wiping prior state (genesis, keys, state, logs, evidence)"
+# Preserve evidence across rounds. The standard workflow is
+# `setup -> round -> stop -> setup -> round -> …` and only generates the
+# release report at the very end, from `ls -t evidence | sed -n '1p;2p;3p'`.
+# Deleting evidence/ here made every round but the last unreportable, so a
+# multi-round run could not produce the report that gates a release.
+#
+# Move (never delete) any existing evidence into evidence-archive/ so the
+# report generator can still be pointed at earlier rounds.
+if [ -d "$LD_EVIDENCE" ] && [ -n "$(ls -A "$LD_EVIDENCE" 2>/dev/null)" ]; then
+  archive="$LD_ROOT/evidence-archive"
+  mkdir -p "$archive"
+  for d in "$LD_EVIDENCE"/*; do
+    [ -e "$d" ] || continue
+    base=$(basename "$d")
+    if [ -e "$archive/$base" ]; then
+      base="${base}-$(date -u +%s)"
+    fi
+    mv "$d" "$archive/$base"
+    log_info "Archived prior evidence: evidence-archive/$base"
+  done
+fi
+
+log_info "Wiping prior state (genesis, keys, state, logs)"
 rm -rf "$LD_GENESIS" "$LD_KEYS" "$LD_STATE" "$LD_LOGS" "$LD_EVIDENCE"
 rm -f "$LD_CONFIG"/dugite-*.json "$LD_CONFIG"/cardano-*.json \
       "$LD_CONFIG"/relays.json "$LD_CONFIG"/genesis-hashes.env
