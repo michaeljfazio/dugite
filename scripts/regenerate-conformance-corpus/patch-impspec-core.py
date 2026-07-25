@@ -295,12 +295,33 @@ def patch_imp_core(path: str) -> None:
     # 3. Patch conformanceHook to always dump when env var is set.
     #    The original function opens with a single `impAnn` call; we prepend
     #    the dump block in a do-expression before it.
+    # Upstream has swapped the `ctx` / `trc` parameter order at least once
+    # (cardano-ledger a88b60bd moved `trc` ahead of `ctx`), so accept either
+    # spelling. The injected body below binds only names that exist in both
+    # (`ctx`, `env`, `state`, `signal`), so the order itself does not matter.
+    hook_param_orders = (
+        "globals ctx trc@(TRC (env, state, signal))",
+        "globals trc@(TRC (env, state, signal)) ctx",
+    )
+    matched_params = next(
+        (params for params in hook_param_orders
+         if f"conformanceHook {params} impRuleResult =\n" in content),
+        None,
+    )
+    if matched_params is None:
+        _die(
+            path,
+            "Could not find the `conformanceHook` equation in any known parameter "
+            "order. Upstream changed its signature again; update "
+            "`hook_param_orders`. Tried:\n  "
+            + "\n  ".join(hook_param_orders),
+        )
     old_hook_start = (
-        "conformanceHook globals ctx trc@(TRC (env, state, signal)) impRuleResult =\n"
+        f"conformanceHook {matched_params} impRuleResult =\n"
         "  impAnn (\"Conformance hook (\" <> symbolVal (Proxy @rule) <> \")\") $ do\n"
     )
     new_hook_start = (
-        "conformanceHook globals ctx trc@(TRC (env, state, signal)) impRuleResult = do\n"
+        f"conformanceHook {matched_params} impRuleResult = do\n"
         "  -- Always dump when CONFORMANCE_CBOR_DUMP_PATH is set (not divergence-gated).\n"
         "  -- Captures NEWEPOCH (epoch boundaries) and LEDGER (tx submissions) vectors.\n"
         "  mbyCborDumpPath <- lookupEnv \"CONFORMANCE_CBOR_DUMP_PATH\"\n"
