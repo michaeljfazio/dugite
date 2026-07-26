@@ -81,6 +81,12 @@ declare -gA KNOWN_ERRORS=(
     # #902 fixed it and the query now answers on both sides.
 )
 
+# Current tip of a socket as "slot:hash", or "?" if unavailable.
+_parity_tip() {
+    cardano-cli query tip --testnet-magic "$LD_MAGIC" --socket-path "$1" 2>/dev/null \
+        | jq -r '"\(.slot):\(.hash)"' 2>/dev/null || echo "?"
+}
+
 # ---- Core parity function -------------------------------------------------
 
 # parity_query_json <query_name> <cli_args...>
@@ -120,15 +126,48 @@ parity_query_json() {
     local fmt_args=()
     [ "${PARITY_OUTPUT_JSON:-1}" = "1" ] && fmt_args+=(--output-json)
 
+    # Both sides must be sampled at the SAME chain tip.
+    #
+    # The two queries are sequential, so a block applied between them makes the
+    # answers legitimately differ and the suite reports a divergence that does
+    # not exist. That is not hypothetical: `gov-state` reported
+    # txFeePerByte 44 vs 45 purely because the two calls straddled the boundary
+    # at which an enacted ParameterChange took effect — re-queried at a settled
+    # tip, both nodes agreed exactly.
+    #
+    # Read the tip on both sockets before and after; if anything moved, discard
+    # the sample and retry. Queries that are inherently tip-dependent (tip/era,
+    # mempool) opt out with PARITY_TIP_STABLE=0.
     local dugite_out cardano_out dugite_rc cardano_rc
-    dugite_out=$(cardano-cli conway query "${cli_args[@]}" \
-                    --testnet-magic "$LD_MAGIC" \
-                    --socket-path "$LD_DUGITE_BP_SOCK" \
-                    "${fmt_args[@]}" 2>&1) && dugite_rc=0 || dugite_rc=$?
-    cardano_out=$(cardano-cli conway query "${cli_args[@]}" \
-                    --testnet-magic "$LD_MAGIC" \
-                    --socket-path "$LD_CARDANO_BP_SOCK" \
-                    "${fmt_args[@]}" 2>&1) && cardano_rc=0 || cardano_rc=$?
+    local _tip_attempt=0
+    while :; do
+        local t0_d t0_c t1_d t1_c
+        t0_d=$(_parity_tip "$LD_DUGITE_BP_SOCK")
+        t0_c=$(_parity_tip "$LD_CARDANO_BP_SOCK")
+
+        dugite_out=$(cardano-cli conway query "${cli_args[@]}" \
+                        --testnet-magic "$LD_MAGIC" \
+                        --socket-path "$LD_DUGITE_BP_SOCK" \
+                        "${fmt_args[@]}" 2>&1) && dugite_rc=0 || dugite_rc=$?
+        cardano_out=$(cardano-cli conway query "${cli_args[@]}" \
+                        --testnet-magic "$LD_MAGIC" \
+                        --socket-path "$LD_CARDANO_BP_SOCK" \
+                        "${fmt_args[@]}" 2>&1) && cardano_rc=0 || cardano_rc=$?
+
+        [ "${PARITY_TIP_STABLE:-1}" = "1" ] || break
+        t1_d=$(_parity_tip "$LD_DUGITE_BP_SOCK")
+        t1_c=$(_parity_tip "$LD_CARDANO_BP_SOCK")
+        # Stable iff nothing moved during the window AND both nodes agree.
+        if [ "$t0_d" = "$t1_d" ] && [ "$t0_c" = "$t1_c" ] && [ "$t0_d" = "$t0_c" ]; then
+            break
+        fi
+        _tip_attempt=$(( _tip_attempt + 1 ))
+        if [ "$_tip_attempt" -ge 6 ]; then
+            log_warn "[09-cli-parity] $query_name: tips would not settle after $_tip_attempt attempts (dugite $t0_d->$t1_d, cardano $t0_c->$t1_c); comparing anyway"
+            break
+        fi
+        sleep 2
+    done
 
     if [ "$dugite_rc" -ne 0 ] || [ "$cardano_rc" -ne 0 ]; then
         # Attribute the failure to the side that actually failed. Both sides
