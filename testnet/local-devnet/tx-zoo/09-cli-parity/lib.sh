@@ -46,15 +46,21 @@ declare -gA KNOWN_DIVERGENCES=(
     # fixes also all targeted dugite-cli, which this suite never invokes: it
     # runs cardano-cli against BOTH sockets, so what it measures is
     # dugite-NODE's LSQ responses.
-    ["protocol-parameters"]="https://github.com/michaeljfazio/dugite/issues/905"
+    # NB: protocol-parameters is EQUAL since genesis decimals convert exactly
+    # (priceSteps 0.0000721 was rounded to 0.000072). Do not re-add blindly.
+    #
+    # The query recomputes pool stake from certs.delegations, which does not
+    # carry genesis-seeded delegations, so the fraction is wrong (and a
+    # zero-stake pool is emitted that cardano-node omits). dugite's INTERNAL
+    # distribution is sound -- reward/pot parity is byte-exact and forging
+    # matches f -- this is the query surface only.
     ["stake-distribution"]="https://github.com/michaeljfazio/dugite/issues/905"
-    # gov-state embeds the full pparams, so it inherits the same priceSteps
-    # rendering bug as protocol-parameters (0.000072 vs 0.0000721) -- one root
-    # cause, two rows. Everything else in gov-state matches after #903.
-    ["gov-state"]="https://github.com/michaeljfazio/dugite/issues/905"
-    # drep-stake-distribution diverges in the per-DRep ordering; future-pparams
-    # at field level. future-pparams matched after #903 and is no longer listed.
-    ["drep-stake-distribution"]="https://github.com/michaeljfazio/dugite/issues/905"
+    # gov-state is byte-identical to cardano-node 11.0.1 EXCEPT its embedded
+    # proposals array, so it shares the GetProposals encoder root cause. The
+    # priceSteps rendering it used to inherit is fixed (exact genesis rationals).
+    ["gov-state"]="https://github.com/michaeljfazio/dugite/issues/906"
+    # NB: drep-stake-distribution is EQUAL now that the query sums
+    # InstantStake + ProposalDeposits + AccountBalance like computeDRepDistr.
     # NB: protocol-state/version was listed here for the 7-vs-8-field PraosState
     # encoder. #902 fixed it and the row is EQUAL; do not re-add without a diff.
     # Proposal SETS now agree (#903 fixed the ratification timing). What still
