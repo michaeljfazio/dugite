@@ -23,9 +23,10 @@
 
 use crate::error::SerializationError;
 use crate::haskell_snapshot::cbor_utils::{
-    decode_array_len, decode_hash28, decode_map_len, decode_nonce, decode_uint, skip_cbor_value,
+    decode_array_len, decode_hash28, decode_map_len, decode_nonce, decode_uint,
 };
 use crate::haskell_snapshot::types::HaskellPraosState;
+use dugite_primitives::hash::Hash32;
 use dugite_primitives::time::SlotNo;
 use std::collections::HashMap;
 
@@ -139,11 +140,20 @@ pub fn decode_praos_state(data: &[u8]) -> Result<(HaskellPraosState, usize), Ser
     let (epoch_nonce, n) = decode_nonce(&data[off..])?;
     off += n;
 
-    // ── [5] previousEpochNonce (array(8) only) — skip it ─────────────────────
-    if has_previous_epoch_nonce {
-        let n = skip_cbor_value(&data[off..])?;
+    // ── [5] previousEpochNonce (array(8) only) ───────────────────────────────
+    //
+    // Retained rather than skipped since #902: dugite must be able to echo it
+    // back on the `DebugChainDepState` (LSQ tag 13) response, which
+    // cardano-node 11.0.x requires to be the full 8-element form. A 7-element
+    // snapshot predates the field, so NeutralNonce (ZERO) is the only value
+    // available — that matches what the field held before it was introduced.
+    let previous_epoch_nonce = if has_previous_epoch_nonce {
+        let (nonce, n) = decode_nonce(&data[off..])?;
         off += n;
-    }
+        nonce
+    } else {
+        Hash32::ZERO
+    };
 
     // ── [5|6] labNonce ────────────────────────────────────────────────────────
     let (lab_nonce, n) = decode_nonce(&data[off..])?;
@@ -160,6 +170,7 @@ pub fn decode_praos_state(data: &[u8]) -> Result<(HaskellPraosState, usize), Ser
             evolving_nonce,
             candidate_nonce,
             epoch_nonce,
+            previous_epoch_nonce,
             lab_nonce,
             last_epoch_block_nonce,
         },

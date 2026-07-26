@@ -49,6 +49,10 @@ pub struct HaskellPraosState {
     pub evolving_nonce: Hash32,
     pub candidate_nonce: Hash32,
     pub epoch_nonce: Hash32,
+    /// `praosStatePreviousEpochNonce` — field [5] of the 8-element PraosState.
+    /// `Hash32::ZERO` (NeutralNonce) when decoded from a 7-element snapshot
+    /// that predates the field. See #902.
+    pub previous_epoch_nonce: Hash32,
     pub lab_nonce: Hash32,
     pub last_epoch_block_nonce: Hash32,
 }

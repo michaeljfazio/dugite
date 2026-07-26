@@ -103,6 +103,19 @@ pub struct ConsensusSubState {
     pub evolving_nonce: Hash32,
     pub candidate_nonce: Hash32,
     pub epoch_nonce: Hash32,
+    /// The epoch nonce as it stood *before* the most recent epoch rotation
+    /// (`praosStatePreviousEpochNonce`). Haskell's `tickChainDepState` sets
+    /// this to the old `epochNonce` at the same tick where `epochNonce` is
+    /// rotated to `candidateNonce ⭒ lastEpochBlockNonce`, and carries it
+    /// forward unchanged on non-boundary ticks.
+    ///
+    /// It is not an input to any nonce derivation — it exists so that Peras
+    /// certificates appearing in blocks can be validated against the epoch
+    /// they were produced in. dugite tracks it because it is field [5] of the
+    /// 8-field `PraosState` that cardano-node 11.0.x expects on the
+    /// `DebugChainDepState` (LSQ tag 13) response (#902); a 7-field response
+    /// is rejected outright with an `enforceSize` mismatch.
+    pub previous_epoch_nonce: Hash32,
     pub lab_nonce: Hash32,
     pub last_epoch_block_nonce: Hash32,
     /// Active extra entropy (Shelley `ppExtraEntropy`). `Hash32::ZERO` =

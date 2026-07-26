@@ -691,7 +691,7 @@ impl LedgerState {
         //
         // Critical: use the OLD last_epoch_block_nonce FIRST, then update it.
         // In Haskell ηh = previous ticknStatePrevHashNonce (NOT the just-captured lab).
-        let _prev_epoch_nonce = self.consensus.epoch_nonce;
+        let prev_epoch_nonce = self.consensus.epoch_nonce;
         let candidate = self.consensus.candidate_nonce;
         let prev_hash_nonce = self.consensus.last_epoch_block_nonce; // ηh = OLD value
 
@@ -713,6 +713,22 @@ impl LedgerState {
             crate::eras::common::combine_nonce(candidate, prev_hash_nonce),
             self.consensus.extra_entropy,
         );
+
+        // Step 1b: record the epoch nonce we just replaced.
+        //
+        // Haskell `tickChainDepState` (ouroboros-consensus-protocol 3.0.1.0,
+        // Praos.hs) does this in the same `newEpoch` branch that rotates
+        // `epochNonce`:
+        //   praosStateEpochNonce         = candidateNonce ⭒ lastEpochBlockNonce
+        //   praosStatePreviousEpochNonce = praosStateEpochNonce   -- the OLD one
+        //   praosStateLastEpochBlockNonce = praosStateLabNonce
+        // and carries it forward untouched on non-boundary ticks.
+        //
+        // It feeds no nonce derivation — it exists so Peras certificates can be
+        // validated against the epoch they were produced in — but it is field
+        // [5] of the 8-element PraosState that cardano-node 11.0.x requires on
+        // the DebugChainDepState response (#902), so it must be real state.
+        self.consensus.previous_epoch_nonce = prev_epoch_nonce;
 
         // Step 2: NOW update prevHashNonce to current labNonce for NEXT epoch
         self.consensus.last_epoch_block_nonce = self.consensus.lab_nonce;
@@ -964,6 +980,43 @@ mod tests {
     /// Build a fresh `LedgerState` using mainnet defaults.
     fn new_state() -> LedgerState {
         LedgerState::new(ProtocolParameters::mainnet_defaults())
+    }
+
+    /// Issue #902 — `previous_epoch_nonce` must capture the epoch nonce that
+    /// was in effect *before* the rotation, and only move on a boundary.
+    ///
+    /// Haskell `tickChainDepState` (ouroboros-consensus-protocol 3.0.1.0,
+    /// Praos.hs) in its `newEpoch` branch:
+    ///   praosStateEpochNonce         = candidateNonce ⭒ lastEpochBlockNonce
+    ///   praosStatePreviousEpochNonce = praosStateEpochNonce   -- the OLD one
+    /// and leaves it untouched otherwise.
+    #[test]
+    fn previous_epoch_nonce_captures_the_replaced_epoch_nonce() {
+        let mut st = new_state();
+        let old_epoch_nonce = Hash32::from_bytes([0xAB; 32]);
+        st.consensus.epoch_nonce = old_epoch_nonce;
+        st.consensus.candidate_nonce = Hash32::from_bytes([0xCD; 32]);
+        st.consensus.last_epoch_block_nonce = Hash32::from_bytes([0xEF; 32]);
+        st.consensus.previous_epoch_nonce = Hash32::ZERO;
+
+        st.process_epoch_transition(EpochNo(st.epoch.0 + 1));
+
+        assert_eq!(
+            st.consensus.previous_epoch_nonce, old_epoch_nonce,
+            "previous_epoch_nonce must be the epoch nonce the rotation replaced"
+        );
+        assert_ne!(
+            st.consensus.epoch_nonce, old_epoch_nonce,
+            "epoch_nonce must have rotated away from the old value"
+        );
+
+        // A second transition moves it again, to whatever epoch_nonce just was.
+        let second_old = st.consensus.epoch_nonce;
+        st.process_epoch_transition(EpochNo(st.epoch.0 + 1));
+        assert_eq!(
+            st.consensus.previous_epoch_nonce, second_old,
+            "each boundary re-captures the nonce it replaced"
+        );
     }
 
     /// Minimal `PoolParams` for test pool registration certificates.

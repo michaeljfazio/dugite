@@ -780,6 +780,7 @@ impl LedgerState {
                 evolving_nonce: Hash32::ZERO,
                 candidate_nonce: Hash32::ZERO,
                 epoch_nonce: Hash32::ZERO,
+                previous_epoch_nonce: Hash32::ZERO,
                 lab_nonce: Hash32::ZERO,
                 last_epoch_block_nonce: Hash32::ZERO,
                 extra_entropy: Hash32::ZERO,
@@ -1322,6 +1323,7 @@ impl LedgerState {
                 evolving_nonce: hs.praos_state.evolving_nonce,
                 candidate_nonce: hs.praos_state.candidate_nonce,
                 epoch_nonce: hs.praos_state.epoch_nonce,
+                previous_epoch_nonce: hs.praos_state.previous_epoch_nonce,
                 lab_nonce: hs.praos_state.lab_nonce,
                 last_epoch_block_nonce: hs.praos_state.last_epoch_block_nonce,
                 // Haskell snapshots are imported for current-era (Conway) state

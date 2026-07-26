@@ -1203,6 +1203,7 @@ mod tests {
             evolving_nonce: ZERO32,
             candidate_nonce: ZERO32,
             epoch_nonce: ZERO32,
+            previous_epoch_nonce: ZERO32,
             lab_nonce: ZERO32,
             last_epoch_block_nonce: ZERO32,
             extra_entropy: ZERO32,
