@@ -2128,6 +2128,114 @@ fn test_ratify_state_tracks_expired_proposals() {
     assert_eq!(state.gov.governance.last_expired[0].transaction_id, tx_hash);
 }
 
+/// Issue #903 — a proposal must NOT be ratifiable at the first epoch boundary
+/// after it was submitted.
+///
+/// Haskell's RATIFY signal is `RatifySignal dpProposals`, where `dpProposals`
+/// is frozen into the DRep pulser by `setFreshDRepPulsingState` at the PREVIOUS
+/// boundary (`finishDRepPulser` builds the signal exclusively from it). A
+/// proposal submitted during epoch N is therefore invisible to the N→N+1 pass
+/// by construction — there is no `gasProposedIn` comparison anywhere in
+/// Ratify.hs, the exclusion is structural. At genesis `ConwayGovState` is
+/// `DRComplete def def`, i.e. an empty candidate set.
+///
+/// Before the fix dugite fell back to the LIVE proposal set whenever no
+/// snapshot existed, so it ratified and enacted a ParameterChange in the very
+/// epoch it was proposed, then removed that action's siblings via the (correct)
+/// enactment cleanup. On the devnet that made two proposals cardano-node still
+/// listed as live disappear from dugite's set, and refunded a 100k ADA deposit
+/// an epoch early.
+#[test]
+fn proposal_is_not_ratifiable_at_the_first_boundary_after_submission() {
+    let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+    state.epoch_length = 100;
+    state.epochs.protocol_params.protocol_version_major = 10;
+    state.epochs.protocol_params.committee_min_size = 0;
+    Arc::make_mut(&mut state.gov.governance).committee_threshold = Some(Rational {
+        numerator: 0,
+        denominator: 1,
+    });
+    setup_dreps_with_stake(&mut state, 10, 1_000_000_000);
+
+    // Identical setup to `test_parameter_change_ratification` — a proposal that
+    // clears every threshold — but WITHOUT seeding a pulser snapshot, so the
+    // boundary timing itself is what is under test.
+    let tx_hash = Hash32::from_bytes([0x93u8; 32]);
+    state.process_proposal(
+        &tx_hash,
+        0,
+        &ProposalProcedure {
+            deposit: Lovelace(100_000_000_000),
+            return_addr: vec![0u8; 29],
+            gov_action: GovAction::ParameterChange {
+                prev_action_id: None,
+                protocol_param_update: Box::new(
+                    dugite_primitives::transaction::ProtocolParamUpdate {
+                        n_opt: Some(1000),
+                        ..Default::default()
+                    },
+                ),
+                policy_hash: None,
+            },
+            anchor: Anchor {
+                url: "https://903".to_string(),
+                data_hash: Hash32::ZERO,
+            },
+        },
+    );
+    let action_id = GovActionId {
+        transaction_id: tx_hash,
+        action_index: 0,
+    };
+    for i in 0..10u8 {
+        state.process_vote(
+            &Voter::DRep(Credential::VerificationKey(Hash28::from_bytes([i; 28]))),
+            &action_id,
+            &VotingProcedure {
+                vote: Vote::Yes,
+                anchor: None,
+            },
+        );
+    }
+
+    assert!(
+        state.gov.governance.proposals.contains_key(&action_id),
+        "proposal must be accepted at submission — the GOV rule is not what drops it"
+    );
+    assert!(
+        state.gov.governance.ratification_snapshot.is_none(),
+        "precondition: no pulser snapshot exists yet"
+    );
+    assert_eq!(state.epochs.protocol_params.n_opt, 500, "original value");
+
+    // ── First boundary: captures the snapshot, ratifies NOTHING.
+    state.process_epoch_transition(EpochNo(1));
+    assert_eq!(
+        state.epochs.protocol_params.n_opt, 500,
+        "n_opt must be unchanged after the first boundary — the proposal was in \
+         no pulser snapshot, so RATIFY could not have seen it (#903)"
+    );
+    assert!(
+        state.gov.governance.proposals.contains_key(&action_id),
+        "proposal must SURVIVE the first boundary"
+    );
+    assert!(
+        state.gov.governance.ratification_snapshot.is_some(),
+        "the first boundary must capture the snapshot the next one consumes"
+    );
+
+    // ── Second boundary: the snapshot containing it is now the one consumed.
+    state.process_epoch_transition(EpochNo(2));
+    assert_eq!(
+        state.epochs.protocol_params.n_opt, 1000,
+        "n_opt must be updated at the SECOND boundary"
+    );
+    assert!(
+        !state.gov.governance.proposals.contains_key(&action_id),
+        "proposal must be removed once enacted"
+    );
+}
+
 #[test]
 fn test_parameter_change_ratification() {
     let params = ProtocolParameters::mainnet_defaults();
@@ -2206,6 +2314,12 @@ fn test_parameter_change_ratification() {
     assert_eq!(state.epochs.protocol_params.n_opt, 500); // original value
 
     // Epoch transition should ratify and enact
+    // #903: seed the pulser snapshot the previous epoch boundary would
+    // have captured. Haskell RATIFY consumes `dpProposals`, frozen by
+    // `setFreshDRepPulsingState` at the PRIOR boundary, so a proposal is
+    // never a candidate at the first boundary after submission. This test
+    // exercises ratification logic, not that timing.
+    state.capture_ratification_snapshot();
     state.process_epoch_transition(EpochNo(1));
 
     assert_eq!(state.epochs.protocol_params.n_opt, 1000); // updated
@@ -2364,6 +2478,12 @@ fn test_treasury_withdrawal_ratification() {
         );
     }
 
+    // #903: seed the pulser snapshot the previous epoch boundary would
+    // have captured. Haskell RATIFY consumes `dpProposals`, frozen by
+    // `setFreshDRepPulsingState` at the PRIOR boundary, so a proposal is
+    // never a candidate at the first boundary after submission. This test
+    // exercises ratification logic, not that timing.
+    state.capture_ratification_snapshot();
     state.process_epoch_transition(EpochNo(1));
 
     assert_eq!(state.epochs.treasury, Lovelace(5_000_000_000)); // 10B - 5B = 5B
@@ -2440,6 +2560,12 @@ fn test_no_confidence_ratification() {
         );
     }
 
+    // #903: seed the pulser snapshot the previous epoch boundary would
+    // have captured. Haskell RATIFY consumes `dpProposals`, frozen by
+    // `setFreshDRepPulsingState` at the PRIOR boundary, so a proposal is
+    // never a candidate at the first boundary after submission. This test
+    // exercises ratification logic, not that timing.
+    state.capture_ratification_snapshot();
     state.process_epoch_transition(EpochNo(1));
 
     // Committee should be disbanded
@@ -2523,6 +2649,12 @@ fn test_hard_fork_ratification() {
     }
 
     assert_eq!(state.epochs.protocol_params.protocol_version_major, 10);
+    // #903: seed the pulser snapshot the previous epoch boundary would
+    // have captured. Haskell RATIFY consumes `dpProposals`, frozen by
+    // `setFreshDRepPulsingState` at the PRIOR boundary, so a proposal is
+    // never a candidate at the first boundary after submission. This test
+    // exercises ratification logic, not that timing.
+    state.capture_ratification_snapshot();
     state.process_epoch_transition(EpochNo(1));
     assert_eq!(state.epochs.protocol_params.protocol_version_major, 11);
     assert_eq!(state.epochs.protocol_params.protocol_version_minor, 0);
@@ -8544,6 +8676,12 @@ fn test_update_committee_no_cc_required() {
     }
 
     // Ratify at epoch boundary
+    // #903: seed the pulser snapshot the previous epoch boundary would
+    // have captured. Haskell RATIFY consumes `dpProposals`, frozen by
+    // `setFreshDRepPulsingState` at the PRIOR boundary, so a proposal is
+    // never a candidate at the first boundary after submission. This test
+    // exercises ratification logic, not that timing.
+    state.capture_ratification_snapshot();
     state.process_epoch_transition(EpochNo(1));
 
     // Verify new CC member was added
@@ -8684,6 +8822,12 @@ fn test_chained_parameter_changes() {
     }
 
     // Ratify first proposal
+    // #903: seed the pulser snapshot the previous epoch boundary would
+    // have captured. Haskell RATIFY consumes `dpProposals`, frozen by
+    // `setFreshDRepPulsingState` at the PRIOR boundary, so a proposal is
+    // never a candidate at the first boundary after submission. This test
+    // exercises ratification logic, not that timing.
+    state.capture_ratification_snapshot();
     state.process_epoch_transition(EpochNo(1));
     assert_eq!(state.epochs.protocol_params.drep_activity, 25);
 
@@ -8824,6 +8968,12 @@ fn test_cost_model_update_via_governance() {
         );
     }
 
+    // #903: seed the pulser snapshot the previous epoch boundary would
+    // have captured. Haskell RATIFY consumes `dpProposals`, frozen by
+    // `setFreshDRepPulsingState` at the PRIOR boundary, so a proposal is
+    // never a candidate at the first boundary after submission. This test
+    // exercises ratification logic, not that timing.
+    state.capture_ratification_snapshot();
     state.process_epoch_transition(EpochNo(1));
 
     assert_eq!(
@@ -8979,6 +9129,12 @@ fn test_hard_fork_initiation_ratification() {
         );
     }
 
+    // #903: seed the pulser snapshot the previous epoch boundary would
+    // have captured. Haskell RATIFY consumes `dpProposals`, frozen by
+    // `setFreshDRepPulsingState` at the PRIOR boundary, so a proposal is
+    // never a candidate at the first boundary after submission. This test
+    // exercises ratification logic, not that timing.
+    state.capture_ratification_snapshot();
     state.process_epoch_transition(EpochNo(1));
 
     assert_eq!(
@@ -9107,6 +9263,12 @@ fn test_committee_min_size_update_via_governance() {
         );
     }
 
+    // #903: seed the pulser snapshot the previous epoch boundary would
+    // have captured. Haskell RATIFY consumes `dpProposals`, frozen by
+    // `setFreshDRepPulsingState` at the PRIOR boundary, so a proposal is
+    // never a candidate at the first boundary after submission. This test
+    // exercises ratification logic, not that timing.
+    state.capture_ratification_snapshot();
     state.process_epoch_transition(EpochNo(1));
 
     assert_eq!(
@@ -14981,6 +15143,12 @@ fn test_treasury_withdrawal_via_governance_reduces_treasury() {
     let treasury_before = state.epochs.treasury.0;
 
     // Epoch transition should ratify and enact the withdrawal
+    // #903: seed the pulser snapshot the previous epoch boundary would
+    // have captured. Haskell RATIFY consumes `dpProposals`, frozen by
+    // `setFreshDRepPulsingState` at the PRIOR boundary, so a proposal is
+    // never a candidate at the first boundary after submission. This test
+    // exercises ratification logic, not that timing.
+    state.capture_ratification_snapshot();
     state.process_epoch_transition(EpochNo(1));
 
     let treasury_after = state.epochs.treasury.0;

@@ -5432,8 +5432,19 @@ mod tests {
 
         let starting_epoch = ctx.current_epoch.0;
 
-        // ── Boundary E+1: proposal 1 ratifies (prev=None matches enacted_committee=None).
-        //    Proposals 2 and 3 are delayed (UpdateCommittee is a delaying action).
+        // ── Boundary E+1: NOTHING ratifies (#903).
+        //
+        // All three proposals were submitted during epoch E, so at the E→E+1
+        // boundary there is no pulser snapshot for them to be in yet. Haskell's
+        // RATIFY signal is `RatifySignal dpProposals`, frozen by
+        // `setFreshDRepPulsingState` at the PREVIOUS boundary; at genesis
+        // `ConwayGovState` is `DRComplete def def`, so that candidate set is
+        // empty. This boundary's job is to CAPTURE the snapshot the next one
+        // consumes.
+        //
+        // This test previously asserted proposal 1 enacted here, which is what
+        // dugite did while its no-snapshot fallback ratified over the live
+        // proposal set.
         rules
             .process_epoch_transition(
                 EpochNo(starting_epoch + 1),
@@ -5447,39 +5458,37 @@ mod tests {
             .expect("epoch transition E+1");
 
         assert!(
-            gov.governance
+            !gov.governance
                 .committee_expiration
                 .contains_key(&p1_member_key),
-            "proposal 1 must have enacted after E+1; \
-             enacted_committee={:?}, proposals_remaining={:?}",
+            "proposal 1 must NOT enact at E+1 — it was proposed in epoch E and is \
+             not in any pulser snapshot yet; enacted_committee={:?}",
             gov.governance.enacted_committee,
-            gov.governance.proposals.keys().collect::<Vec<_>>(),
         );
         assert_eq!(
-            gov.governance.enacted_committee,
-            Some(action_id_1.clone()),
-            "enacted_committee must be proposal 1's ID after E+1"
+            gov.governance.enacted_committee, None,
+            "no committee action can be enacted at the first boundary after proposal"
         );
-        // The ratification snapshot must carry enacted_id_1 so that proposal 2's
-        // prev_action_as_expected check passes at E+2 ratification.
+        // E+1 captures the snapshot that E+2 ratifies from; all three proposals
+        // must be in it, and the enacted root is still None.
         let snap = gov
             .governance
             .ratification_snapshot
             .as_ref()
             .expect("ratification snapshot must be populated after E+1");
         assert_eq!(
-            snap.enacted_committee,
-            Some(action_id_1.clone()),
-            "ratification snapshot must carry proposal 1's ID for proposal 2 chain check"
+            snap.enacted_committee, None,
+            "snapshot's enacted root is still None — nothing has enacted yet"
         );
         assert!(
-            snap.proposals.contains_key(&action_id_2),
-            "snapshot must contain proposal 2 so it is visible at E+2 ratification; \
+            snap.proposals.contains_key(&action_id_1),
+            "snapshot must contain proposal 1 so it is visible at E+2 ratification; \
              snap.proposals={:?}",
             snap.proposals.keys().collect::<Vec<_>>()
         );
 
-        // ── Boundary E+2: proposal 2 ratifies (prev=action_id_1, snapshot.enacted=action_id_1).
+        // ── Boundary E+2: proposal 1 ratifies (prev=None matches enacted_committee=None).
+        //    Proposals 2 and 3 are delayed (UpdateCommittee is a delaying action).
         rules
             .process_epoch_transition(
                 EpochNo(starting_epoch + 2),
@@ -5495,19 +5504,35 @@ mod tests {
         assert!(
             gov.governance
                 .committee_expiration
-                .contains_key(&p2_member_key),
-            "proposal 2 must have enacted after E+2; \
+                .contains_key(&p1_member_key),
+            "proposal 1 must have enacted after E+2; \
              enacted_committee={:?}, proposals_remaining={:?}",
             gov.governance.enacted_committee,
             gov.governance.proposals.keys().collect::<Vec<_>>(),
         );
         assert_eq!(
             gov.governance.enacted_committee,
-            Some(action_id_2.clone()),
-            "enacted_committee must be proposal 2's ID after E+2"
+            Some(action_id_1.clone()),
+            "enacted_committee must be proposal 1's ID after E+2"
+        );
+        let snap = gov
+            .governance
+            .ratification_snapshot
+            .as_ref()
+            .expect("ratification snapshot must be populated after E+2");
+        assert_eq!(
+            snap.enacted_committee,
+            Some(action_id_1.clone()),
+            "ratification snapshot must carry proposal 1's ID for proposal 2 chain check"
+        );
+        assert!(
+            snap.proposals.contains_key(&action_id_2),
+            "snapshot must contain proposal 2 so it is visible at E+3 ratification; \
+             snap.proposals={:?}",
+            snap.proposals.keys().collect::<Vec<_>>()
         );
 
-        // ── Boundary E+3: proposal 3 ratifies (prev=action_id_2, snapshot.enacted=action_id_2).
+        // ── Boundary E+3: proposal 2 ratifies (prev=action_id_1, snapshot.enacted=action_id_1).
         rules
             .process_epoch_transition(
                 EpochNo(starting_epoch + 3),
@@ -5520,12 +5545,40 @@ mod tests {
             )
             .expect("epoch transition E+3");
 
+        assert!(
+            gov.governance
+                .committee_expiration
+                .contains_key(&p2_member_key),
+            "proposal 2 must have enacted after E+3; \
+             enacted_committee={:?}, proposals_remaining={:?}",
+            gov.governance.enacted_committee,
+            gov.governance.proposals.keys().collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            gov.governance.enacted_committee,
+            Some(action_id_2.clone()),
+            "enacted_committee must be proposal 2's ID after E+3"
+        );
+
+        // ── Boundary E+4: proposal 3 ratifies (prev=action_id_2, snapshot.enacted=action_id_2).
+        rules
+            .process_epoch_transition(
+                EpochNo(starting_epoch + 4),
+                &ctx,
+                &mut utxo,
+                &mut certs,
+                &mut gov,
+                &mut epochs,
+                &mut consensus,
+            )
+            .expect("epoch transition E+4");
+
         // Proposal 3 removes p1_member.
         assert!(
             !gov.governance
                 .committee_expiration
                 .contains_key(&p1_member_key),
-            "proposal 3 must remove p1_member from committee after E+3; \
+            "proposal 3 must remove p1_member from committee after E+4; \
              enacted_committee={:?}, committee={:?}",
             gov.governance.enacted_committee,
             gov.governance
@@ -5538,12 +5591,12 @@ mod tests {
             gov.governance
                 .committee_expiration
                 .contains_key(&p2_member_key),
-            "p2_member must remain in committee after E+3"
+            "p2_member must remain in committee after E+4"
         );
         assert_eq!(
             gov.governance.enacted_committee,
             Some(action_id_3.clone()),
-            "enacted_committee must be proposal 3's ID after E+3"
+            "enacted_committee must be proposal 3's ID after E+4"
         );
     }
 
