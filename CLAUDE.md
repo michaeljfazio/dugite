@@ -95,26 +95,48 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 - 28-byte hash types (DRep keys, pool voter keys, required signers) must be padded to 32 bytes via `Hash28::to_hash32_padded()` — do not use `Hash<32>::from()` directly on 28-byte hashes
 
 ## Current Focus
-v2.1.0 released (2026-07-26). That release fixed #898 — Haskell-snapshot
-(Mithril) import discarded `Proposals.pRoots`, so every `enacted_*`
-governance root came back `None`, the GOV rule silently dropped proposals
-chaining onto a real root, a stranded deposit depressed `totalActiveStake`,
-and preview wedged on a 4-lovelace `WithdrawalAmountMismatch`. It also
-corrected the van Rossem (PV11) `maxBoundsByPV` gates: `mbConstr` bounds a
-`Constr`'s FIELD COUNT (not its tag), and the `mbHeader = 32` constant
-type-size gate was missing.
+v2.2.0 released (2026-07-27). Four consensus-correctness fixes, all found by
+cross-validating against cardano-node 11.0.1:
 
-**Any ledger DB bootstrapped via `mithril-import` before v2.1.0 must be
-re-imported** — the `None` roots are baked into dugite's own snapshot and
-the code fix does not repair them.
+- **Genesis decimals were rounded into millionths.** `float_to_rational` forced
+  a 1e6 denominator, so mainnet's real `priceSteps = 0.0000721` became
+  `9/125000 = 0.000072` — a 0.14% error in the price behind every Plutus script
+  min-fee. The same helper converts `a0`, `rho`, `tau`, `decentralisationParam`
+  and every `dvt_*`/`pvt_*` threshold, so it reached rewards, pool saturation,
+  leader election and ratification thresholds. Now converts exactly, as
+  Haskell's `Scientific` does.
+- **#903** — proposals were ratified in the epoch they were submitted. RATIFY's
+  signal is the pulser's `dpProposals`, frozen at the PREVIOUS boundary; dugite
+  fell back to the LIVE set before the first snapshot existed.
+- **#902** — `PraosState` was encoded with 7 fields; 11.0.x needs 8
+  (`praosStatePreviousEpochNonce`), which is now tracked consensus state.
+- **#904** — a restarted BP never forged again: `peer_tip` stayed 0 so the
+  catch-up gate measured a static tip against an advancing wall clock.
 
-Current work: byte-exact conformance vs cardano-node 11.0.1 on
-preview (PV11) / preprod via the `haskell-ledger-cross-validation` skill,
-and closing the `dugite-cli` query-surface gaps (#900). Soak testing via
-Sandstone Pool [SAND] on preview and preprod (pool IDs: preview
-`6954ec11cf7097a693721104139b96c54e7f3e2a8f9e7577630f7856`, preprod
+**SNAPSHOT_VERSION 29 → 30 — existing ledger snapshots are replayed on
+upgrade.** Pre-v2.1.0 Mithril DBs still need a full `mithril-import`.
+
+Current work: closing the two remaining query-surface divergences —
+**#905** (`query stake-distribution` rebuilds pool stake from live delegations
+and misses genesis-seeded ones) and **#906** (`GetProposals` drops govAction
+payloads and misorders results; `gov-state` is byte-identical apart from that
+embedded array). Neither affects consensus: pot parity is byte-exact and chain
+density tracks `f`.
+
+Soak testing via Sandstone Pool [SAND] on preview and preprod (pool IDs:
+preview `6954ec11cf7097a693721104139b96c54e7f3e2a8f9e7577630f7856`, preprod
 `pool1uju7fuqzv...nh0ch`). Preview is at PV11 — requires peers running
 cardano-node 11.0.1+.
+
+### Reading the cli-parity suite
+
+`tx-zoo/09-cli-parity` runs `cardano-cli` against **both** sockets and diffs the
+answers — it never invokes `dugite-cli`. What it measures is dugite-**node**'s
+LSQ responses. A failure on both sides is a harness bug, never a dugite gap
+(this misreading produced four phantom "dugite-cli gaps" in #900). ERROR rows
+fail the round, every divergence writes `evidence/<ts>/cli-parity-diffs/`, and
+the tip is pinned across both sockets so a block applied mid-comparison cannot
+manufacture a false divergence.
 
 ## Running the Node
 
