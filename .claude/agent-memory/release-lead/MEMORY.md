@@ -6,3 +6,4 @@
 - [lockfile update method](feedback_lockfile_update.md) — use cargo update --workspace (not generate-lockfile) to avoid pulling in incompatible transitive dep upgrades
 - [v1.4.0 release](project_release_v1_4_0.md) — first canonical block milestone; forge hardening, Dijkstra era, 215+ tests; CI has 6 jobs total (~45 min); pre-push rebase needed
 - [Bump Helm chart on every release](feedback_helm_chart_bump.md) — charts/dugite-node Chart.yaml (appVersion + chart version) must be bumped as part of the release, not after
+- [v2.0.14 release](project_release_v2_0_14.md) — updateDormantDRepExpiry fixed the systematic preprod reward divergence; release.yml auto-generates notes (no manual gh release create); re-verify git/tag/CI state after any long background wait

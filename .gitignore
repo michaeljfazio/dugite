@@ -63,6 +63,14 @@ testnet/local-devnet/evidence/
 # multi-round run stays reportable). The rest of evidence-archive/ is
 # hand-curated and version-controlled.
 testnet/local-devnet/evidence-archive/auto/
+# Per-socket tx-zoo state written by bidirectional-parity.sh (one dir per
+# ingestion socket). Regenerated on every run; never worth committing.
+testnet/local-devnet/tx-zoo/state-batch-*/
+
+# One-off ledger-state dumps from probe/diagnosis runs (e.g. the #898 gov-roots
+# investigation). Multi-GB and reproducible from the probe examples.
+dump-snapshot-*/
+
 .opencode
 *.pid
 epoch-dumps-*
