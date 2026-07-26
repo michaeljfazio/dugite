@@ -95,7 +95,26 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 - 28-byte hash types (DRep keys, pool voter keys, required signers) must be padded to 32 bytes via `Hash28::to_hash32_padded()` — do not use `Hash<32>::from()` directly on 28-byte hashes
 
 ## Current Focus
-v1.7.0 released. Current work: Byron-era block header decode hardening (issue #613) and epoch-diff cross-validation against cardano-node 11.0.1 on preview/preprod. UPLC CEK machine conformance is complete (all tests passing). Soak testing via Sandstone Pool [SAND] on both preview and preprod (pool IDs: preview `6954ec11cf7097a693721104139b96c54e7f3e2a8f9e7577630f7856`, preprod `pool1uju7fuqzv...nh0ch`). Preview testnet is at PV11 — requires connecting to peers running cardano-node 11.0.1+.
+v2.1.0 released (2026-07-26). That release fixed #898 — Haskell-snapshot
+(Mithril) import discarded `Proposals.pRoots`, so every `enacted_*`
+governance root came back `None`, the GOV rule silently dropped proposals
+chaining onto a real root, a stranded deposit depressed `totalActiveStake`,
+and preview wedged on a 4-lovelace `WithdrawalAmountMismatch`. It also
+corrected the van Rossem (PV11) `maxBoundsByPV` gates: `mbConstr` bounds a
+`Constr`'s FIELD COUNT (not its tag), and the `mbHeader = 32` constant
+type-size gate was missing.
+
+**Any ledger DB bootstrapped via `mithril-import` before v2.1.0 must be
+re-imported** — the `None` roots are baked into dugite's own snapshot and
+the code fix does not repair them.
+
+Current work: byte-exact conformance vs cardano-node 11.0.1 on
+preview (PV11) / preprod via the `haskell-ledger-cross-validation` skill,
+and closing the `dugite-cli` query-surface gaps (#900). Soak testing via
+Sandstone Pool [SAND] on preview and preprod (pool IDs: preview
+`6954ec11cf7097a693721104139b96c54e7f3e2a8f9e7577630f7856`, preprod
+`pool1uju7fuqzv...nh0ch`). Preview is at PV11 — requires peers running
+cardano-node 11.0.1+.
 
 ## Running the Node
 
