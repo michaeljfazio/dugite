@@ -53,12 +53,31 @@ declare -gA KNOWN_DIVERGENCES=(
     # proposal "null" envelope shape.
     ["drep-stake-distribution"]="https://github.com/michaeljfazio/dugite/issues/597"
     ["future-pparams"]="https://github.com/michaeljfazio/dugite/issues/597"
-    ["protocol-state/version"]="https://github.com/michaeljfazio/dugite/issues/597"
-    # NB: kes-period-info, proposals, slot-number and treasury were listed
-    # here until 2026-07-26. They never diverged — cardano-cli rejected the
-    # harness's own arguments, both sides failed identically, and lib.sh
-    # mislabelled that as "dugite ERROR". Fixed in #900; do not re-add
-    # without a real two-sided diff.
+    # Root-caused 2026-07-26: the "error" protocolVersion is the 7-vs-8-field
+    # PraosState encoder, same bug as the kes-period-info error below. Retargeted
+    # off the #597 umbrella onto the specific issue so both close together.
+    ["protocol-state/version"]="https://github.com/michaeljfazio/dugite/issues/902"
+    # dugite drops every ParameterChange proposal from gov state (6 vs 8 at an
+    # identical tip). Real governance divergence, found once #900 stopped the
+    # missing --all-proposals selector from masking this row as an ERROR.
+    ["proposals"]="https://github.com/michaeljfazio/dugite/issues/903"
+    # NB: slot-number and treasury were listed here until 2026-07-26. They never
+    # diverged — cardano-cli rejected the harness's own arguments, both sides
+    # failed identically, and lib.sh mislabelled that as "dugite ERROR". Fixed
+    # in #900; do not re-add without a real two-sided diff.
+)
+
+# ---- Known errors ---------------------------------------------------------
+# Queries that genuinely ERROR against dugite because of a tracked dugite bug,
+# mapped to the issue. Distinct from KNOWN_DIVERGENCES: there is no two-sided
+# comparison to make, the query does not complete at all.
+#
+# An entry here is a promise that the failure is understood and filed, NOT
+# permission to ignore it. run.sh still prints these; it just does not fail the
+# round on them. Anything erroring that is NOT listed here fails the round.
+declare -gA KNOWN_ERRORS=(
+    # PraosState array(7) vs cardano-node 11.0.x's expected array(8).
+    ["kes-period-info"]="https://github.com/michaeljfazio/dugite/issues/902"
 )
 
 # ---- Core parity function -------------------------------------------------
@@ -176,6 +195,9 @@ parity_record() {
     # that bypass parity_query_json (e.g. 09h) still get the same treatment.
     if [ "$status" = "DIVERGENT" ] && [[ -v "KNOWN_DIVERGENCES[$qname]" ]]; then
         notes="known-divergence:${KNOWN_DIVERGENCES[$qname]} ${notes}"
+    fi
+    if [ "$status" = "ERROR" ] && [[ -v "KNOWN_ERRORS[$qname]" ]]; then
+        notes="known-error:${KNOWN_ERRORS[$qname]} ${notes}"
     fi
     # `equal` is derived from the STATUS, not from a sha compare. ERROR rows
     # carry the sentinel sha "error" on both sides, so the old
