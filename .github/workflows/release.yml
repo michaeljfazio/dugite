@@ -121,8 +121,23 @@ jobs:
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Registry cache, not type=gha.
+          #
+          # The GitHub Actions cache backend has a hard 10 GB per-repo quota and
+          # evicts least-recently-used entries. A `mode=max` cache for a
+          # two-platform Rust build blows past that, so entries could be evicted
+          # WHILE the build was still importing them — buildx then aborts with
+          # `failed to solve: not_found`. That is exactly how the v2.0.16
+          # release failed, after 1h55m of QEMU arm64 compilation.
+          #
+          # The registry backend has no such quota, lives next to the image we
+          # already push, and needs no extra credentials (we are logged in to
+          # ghcr.io above).
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          # `ignore-error=true` so a cache EXPORT hiccup can never fail a
+          # release build — the image is already pushed by then, and a cold
+          # cache next time is far cheaper than a failed release.
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max,ignore-error=true
           labels: |
             org.opencontainers.image.title=dugite
             org.opencontainers.image.description=Cardano node implementation in Rust
