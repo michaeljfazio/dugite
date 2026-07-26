@@ -1347,6 +1347,13 @@ impl RatificationFixture {
             }
         }
 
+        // #903: these fixtures capture state AT an epoch boundary where the
+        // Haskell DRep pulser is populated — that is precisely the state RATIFY
+        // consumes. Seed the equivalent snapshot so `ratify_proposals()` has a
+        // candidate set; without it the fixture would exercise the genesis
+        // no-pulser path, where nothing is ratifiable by construction.
+        ledger.capture_ratification_snapshot();
+
         ledger
     }
 }
