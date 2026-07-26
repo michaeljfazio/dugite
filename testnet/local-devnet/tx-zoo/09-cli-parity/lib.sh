@@ -48,22 +48,20 @@ declare -gA KNOWN_DIVERGENCES=(
     # dugite-NODE's LSQ responses.
     ["protocol-parameters"]="https://github.com/michaeljfazio/dugite/issues/905"
     ["stake-distribution"]="https://github.com/michaeljfazio/dugite/issues/905"
-    # Proposal sets genuinely differ -- dugite ratifies a ParameterChange an
-    # epoch early and drops its sibling. Same root cause as the proposals row.
-    ["gov-state"]="https://github.com/michaeljfazio/dugite/issues/903"
+    # gov-state embeds the full pparams, so it inherits the same priceSteps
+    # rendering bug as protocol-parameters (0.000072 vs 0.0000721) -- one root
+    # cause, two rows. Everything else in gov-state matches after #903.
+    ["gov-state"]="https://github.com/michaeljfazio/dugite/issues/905"
     # drep-stake-distribution diverges in the per-DRep ordering; future-pparams
-    # in the no-pending-proposal "null" envelope shape. Neither is characterised
-    # at field level yet -- the next run writes cli-parity-diffs/ for that.
+    # at field level. future-pparams matched after #903 and is no longer listed.
     ["drep-stake-distribution"]="https://github.com/michaeljfazio/dugite/issues/905"
-    ["future-pparams"]="https://github.com/michaeljfazio/dugite/issues/905"
-    # Root-caused 2026-07-26: the "error" protocolVersion is the 7-vs-8-field
-    # PraosState encoder, same bug as the kes-period-info error below. Retargeted
-    # off the #597 umbrella onto the specific issue so both close together.
-    ["protocol-state/version"]="https://github.com/michaeljfazio/dugite/issues/902"
-    # dugite ratifies a ParameterChange in the epoch it was submitted and drops
-    # the sibling, so the live sets differ (6 vs 8 at an identical tip). Found
-    # once #900 stopped the missing --all-proposals selector masking this row.
-    ["proposals"]="https://github.com/michaeljfazio/dugite/issues/903"
+    # NB: protocol-state/version was listed here for the 7-vs-8-field PraosState
+    # encoder. #902 fixed it and the row is EQUAL; do not re-add without a diff.
+    # Proposal SETS now agree (#903 fixed the ratification timing). What still
+    # differs is the GetProposals encoder: it drops govAction payloads
+    # (HardFork version, constitution anchor, withdrawals, committee members)
+    # and orders results by txId rather than in Proposals OSet order.
+    ["proposals"]="https://github.com/michaeljfazio/dugite/issues/906"
     # NB: slot-number and treasury were listed here until 2026-07-26. They never
     # diverged — cardano-cli rejected the harness's own arguments, both sides
     # failed identically, and lib.sh mislabelled that as "dugite ERROR". Fixed
@@ -79,8 +77,8 @@ declare -gA KNOWN_DIVERGENCES=(
 # permission to ignore it. run.sh still prints these; it just does not fail the
 # round on them. Anything erroring that is NOT listed here fails the round.
 declare -gA KNOWN_ERRORS=(
-    # PraosState array(7) vs cardano-node 11.0.x's expected array(8).
-    ["kes-period-info"]="https://github.com/michaeljfazio/dugite/issues/902"
+    # Empty. kes-period-info was here for the PraosState array(7) encoder;
+    # #902 fixed it and the query now answers on both sides.
 )
 
 # ---- Core parity function -------------------------------------------------
