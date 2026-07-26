@@ -4278,6 +4278,7 @@ pub(crate) async fn read_intersect_reply(
     channel: &mut MuxChannel,
     peer_addr: SocketAddr,
     max_stale_discard: u32,
+    metrics: &crate::metrics::NodeMetrics,
 ) -> Result<Option<CodecPoint>, anyhow::Error> {
     let mut discarded: u32 = 0;
     loop {
@@ -4304,6 +4305,15 @@ pub(crate) async fn read_intersect_reply(
                          residue (reused-mux)",
                     );
                 }
+                // Issue #904: record the peer's tip HERE, not only on
+                // RollForward. `should_skip_forge_for_catch_up` falls back to
+                // the wall clock while `peer_tip == 0`, which wedges a block
+                // producer restarted onto a stalled chain: it intersects fine
+                // but never receives a RollForward, because it is itself the
+                // node that would produce the next block. The intersection
+                // reply already carries the peer's tip, so there is no reason
+                // to keep guessing from the wall clock past this point.
+                metrics.update_peer_tip(tip_slot);
                 info!(
                     %peer_addr,
                     point = %prim_point,
@@ -4332,6 +4342,10 @@ pub(crate) async fn read_intersect_reply(
                     tip_block_number,
                     "ChainSync MsgIntersectNotFound",
                 );
+                // #904: NotFound carries the peer's tip too. We have no
+                // intersection yet, but we do now know where the peer is, and
+                // that beats the wall-clock fallback in the forge gate.
+                metrics.update_peer_tip(tip_slot);
                 return Ok(None);
             }
             other => match classify_intersect_response(&other) {
@@ -4928,6 +4942,7 @@ pub async fn chainsync_client_task(
         channel: &mut MuxChannel,
         peer_addr: SocketAddr,
         points: &[CodecPoint],
+        metrics: &crate::metrics::NodeMetrics,
     ) -> Result<Option<CodecPoint>, anyhow::Error> {
         let find_msg = cs_encode(&ChainSyncMessage::MsgFindIntersect(
             points
@@ -4958,12 +4973,13 @@ pub async fn chainsync_client_task(
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(300)
             .saturating_add(16);
-        read_intersect_reply(channel, peer_addr, max_stale_discard).await
+        read_intersect_reply(channel, peer_addr, max_stale_discard, metrics).await
     }
 
     // Attempt 1: use the known_points we built above.
     let codec_points: Vec<CodecPoint> = known_points.iter().map(to_codec_point).collect();
-    let mut intersection = try_find_intersect(&mut channel, peer_addr, &codec_points).await?;
+    let mut intersection =
+        try_find_intersect(&mut channel, peer_addr, &codec_points, &metrics).await?;
 
     // Retry with progressively deeper ImmutableDB points if not found.
     if intersection.is_none() {
@@ -4994,7 +5010,9 @@ pub async fn chainsync_client_task(
             let mut retry_points = deep_points;
             retry_points.push(CodecPoint::Origin);
 
-            if let Some(found) = try_find_intersect(&mut channel, peer_addr, &retry_points).await? {
+            if let Some(found) =
+                try_find_intersect(&mut channel, peer_addr, &retry_points, &metrics).await?
+            {
                 intersection = Some(found);
                 break;
             }
@@ -7012,10 +7030,110 @@ mod chainsync_task_tests {
             tip_block_number: 10,
         });
         let mut ch = preload_chainsync_channel(vec![stale_roll_forward(), found]);
-        let res = read_intersect_reply(&mut ch, test_addr(), 16).await;
+        let res = read_intersect_reply(
+            &mut ch,
+            test_addr(),
+            16,
+            &crate::metrics::NodeMetrics::new(),
+        )
+        .await;
         assert!(
             matches!(res, Ok(Some(_))),
             "stale RollForward must be discarded then IntersectFound returned, got {res:?}"
+        );
+    }
+
+    /// Issue #904 — the intersection reply must seed `max_peer_tip_slot`.
+    ///
+    /// `should_skip_forge_for_catch_up` treats `peer_tip == 0` as "no peer has
+    /// reported yet" and falls back to comparing our tip against the WALL
+    /// CLOCK. That fallback is only sound before the first ChainSync round.
+    ///
+    /// A block producer restarted onto a stalled chain (devnet, or any network
+    /// whose forgers are all down) reaches an intersection but then receives no
+    /// RollForward — nothing is producing blocks, because this node is what
+    /// would produce them. Pre-fix, `peer_tip` stayed 0, the gate compared
+    /// wall-clock against a static tip, concluded it was hundreds of slots
+    /// behind, and silently skipped every leadership check forever. The chain
+    /// never recovered.
+    ///
+    /// `MsgIntersectFound` carries the peer's tip. Once we have it, it is
+    /// strictly better information than the wall clock and must be recorded.
+    #[tokio::test]
+    async fn read_intersect_reply_seeds_peer_tip_from_intersection() {
+        let metrics = crate::metrics::NodeMetrics::new();
+        assert_eq!(metrics.get_peer_tip(), 0, "precondition: no peer tip yet");
+
+        let found = enc(&ChainSyncMessage::MsgIntersectFound {
+            point: CodecPoint::Origin,
+            tip_slot: 65,
+            tip_hash: [7u8; 32],
+            tip_block_number: 28,
+        });
+        let mut ch = preload_chainsync_channel(vec![found]);
+        let res = read_intersect_reply(&mut ch, test_addr(), 16, &metrics).await;
+        assert!(
+            matches!(res, Ok(Some(_))),
+            "expected IntersectFound, got {res:?}"
+        );
+        assert_eq!(
+            metrics.get_peer_tip(),
+            65,
+            "IntersectFound.tip_slot must seed max_peer_tip_slot (#904)"
+        );
+
+        // IntersectNotFound also carries the peer's tip — record it too, and
+        // keep the monotonic max.
+        let not_found = enc(&ChainSyncMessage::MsgIntersectNotFound {
+            tip_slot: 90,
+            tip_hash: [8u8; 32],
+            tip_block_number: 40,
+        });
+        let mut ch = preload_chainsync_channel(vec![not_found]);
+        assert!(matches!(
+            read_intersect_reply(&mut ch, test_addr(), 16, &metrics).await,
+            Ok(None)
+        ));
+        assert_eq!(
+            metrics.get_peer_tip(),
+            90,
+            "IntersectNotFound must seed it too"
+        );
+
+        // Monotonic: a lower tip must not regress the recorded max.
+        let older = enc(&ChainSyncMessage::MsgIntersectFound {
+            point: CodecPoint::Origin,
+            tip_slot: 12,
+            tip_hash: [9u8; 32],
+            tip_block_number: 6,
+        });
+        let mut ch = preload_chainsync_channel(vec![older]);
+        let _ = read_intersect_reply(&mut ch, test_addr(), 16, &metrics).await;
+        assert_eq!(metrics.get_peer_tip(), 90, "peer tip must stay monotonic");
+    }
+
+    /// Issue #904 — the wedge itself, at the pure-gate level.
+    ///
+    /// Restarted BP: our tip is slot 65, the peer's tip is ALSO 65 (the chain
+    /// is stalled and we are exactly at it), but the wall clock has run on to
+    /// 817 because ~12 minutes of real time passed while we were down.
+    #[test]
+    fn forge_gate_does_not_wedge_when_at_a_stalled_chain_tip() {
+        use crate::node::should_skip_forge_for_catch_up;
+        let stability_window = 240; // ceil(3k/f) for devnet k=40 f=0.5
+        let tip_slot = 65;
+        let wall_clock = 817;
+
+        // Pre-fix: peer_tip never populated -> wall-clock fallback -> wedge.
+        assert!(
+            should_skip_forge_for_catch_up(tip_slot, 0, wall_clock, stability_window),
+            "documents the pre-fix behaviour: with no peer tip the gate skips"
+        );
+
+        // Post-fix: the intersection told us the peer is at 65, same as us.
+        assert!(
+            !should_skip_forge_for_catch_up(tip_slot, 65, wall_clock, stability_window),
+            "with the peer tip known and equal to ours we are AT the tip and must forge (#904)"
         );
     }
 
@@ -7030,7 +7148,13 @@ mod chainsync_task_tests {
         });
         let mut ch = preload_chainsync_channel(vec![found]);
         assert!(matches!(
-            read_intersect_reply(&mut ch, test_addr(), 16).await,
+            read_intersect_reply(
+                &mut ch,
+                test_addr(),
+                16,
+                &crate::metrics::NodeMetrics::new()
+            )
+            .await,
             Ok(Some(_))
         ));
 
@@ -7041,7 +7165,13 @@ mod chainsync_task_tests {
         });
         let mut ch = preload_chainsync_channel(vec![not_found]);
         assert!(matches!(
-            read_intersect_reply(&mut ch, test_addr(), 16).await,
+            read_intersect_reply(
+                &mut ch,
+                test_addr(),
+                16,
+                &crate::metrics::NodeMetrics::new()
+            )
+            .await,
             Ok(None)
         ));
     }
@@ -7064,7 +7194,13 @@ mod chainsync_task_tests {
         });
         let mut ch = preload_chainsync_channel(vec![rb, await_reply, nf]);
         assert!(matches!(
-            read_intersect_reply(&mut ch, test_addr(), 16).await,
+            read_intersect_reply(
+                &mut ch,
+                test_addr(),
+                16,
+                &crate::metrics::NodeMetrics::new()
+            )
+            .await,
             Ok(None)
         ));
     }
@@ -7075,7 +7211,13 @@ mod chainsync_task_tests {
     async fn read_intersect_reply_exceeds_stale_bound_errors() {
         let frames: Vec<Vec<u8>> = (0..17).map(|_| stale_roll_forward()).collect();
         let mut ch = preload_chainsync_channel(frames);
-        let res = read_intersect_reply(&mut ch, test_addr(), 16).await;
+        let res = read_intersect_reply(
+            &mut ch,
+            test_addr(),
+            16,
+            &crate::metrics::NodeMetrics::new(),
+        )
+        .await;
         let err = res.expect_err("17 stale frames must exceed the bound and error");
         assert!(
             format!("{err:?}").contains("giving up"),
@@ -7088,7 +7230,13 @@ mod chainsync_task_tests {
     #[tokio::test]
     async fn read_intersect_reply_genuine_violation_errors_immediately() {
         let mut ch = preload_chainsync_channel(vec![enc(&ChainSyncMessage::MsgDone)]);
-        let res = read_intersect_reply(&mut ch, test_addr(), 16).await;
+        let res = read_intersect_reply(
+            &mut ch,
+            test_addr(),
+            16,
+            &crate::metrics::NodeMetrics::new(),
+        )
+        .await;
         let err = res.expect_err("MsgDone in StIntersect is a violation");
         assert!(
             format!("{err:?}").contains("unexpected response"),
