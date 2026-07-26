@@ -1015,6 +1015,14 @@ impl Node {
                 .collect(),
             ratify_delayed: ls.gov.governance.last_ratify_delayed,
             epoch_nonce: ls.consensus.epoch_nonce.as_ref().to_vec(),
+            previous_epoch_nonce: ls.consensus.previous_epoch_nonce.as_ref().to_vec(),
+            last_epoch_block_nonce: ls.consensus.last_epoch_block_nonce.as_ref().to_vec(),
+            opcert_counters: ls
+                .consensus
+                .opcert_counters
+                .iter()
+                .map(|(k, v)| (k.as_ref().to_vec(), *v))
+                .collect(),
             evolving_nonce: ls.consensus.evolving_nonce.as_ref().to_vec(),
             candidate_nonce: ls.consensus.candidate_nonce.as_ref().to_vec(),
             lab_nonce: ls.consensus.lab_nonce.as_ref().to_vec(),

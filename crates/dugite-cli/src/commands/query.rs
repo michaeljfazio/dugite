@@ -716,7 +716,11 @@ fn parse_cbor_nonce(d: &mut minicbor::Decoder<'_>) -> Result<[u8; 32]> {
 
 /// Parse the raw MsgResult CBOR from `query_chain_dep_state()` and extract nonces.
 ///
-/// Wire format: MsgResult [tag, HFC [array(2)[version=0, array(7)[...PraosState fields...]]]]
+/// Wire format: MsgResult [tag, HFC [array(2)[version=0, array(8)[...PraosState fields...]]]]
+///
+/// cardano-node 11.0.x encodes 8 fields (a `praosStatePreviousEpochNonce` sits
+/// at [5], see #902); 10.x encoded 7. This parser reads only through [4] and
+/// ignores the declared array length, so it accepts either form unchanged.
 #[allow(dead_code)]
 fn parse_protocol_state_nonces(raw: &[u8]) -> Result<PraosNonces> {
     let mut d = minicbor::Decoder::new(raw);
@@ -745,7 +749,9 @@ fn parse_protocol_state_nonces(raw: &[u8]) -> Result<PraosNonces> {
         anyhow::bail!("Unexpected PraosState version: {version}");
     }
 
-    // PraosState: array(7)
+    // PraosState: array(7) on cardano-node 10.x, array(8) on 11.x. We only
+    // need fields [0]..[4], which are identically placed in both, so the
+    // length is read and discarded rather than enforced.
     let _ = d.array();
 
     // [0] lastSlot (WithOrigin) — skip

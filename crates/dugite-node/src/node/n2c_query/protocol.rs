@@ -444,36 +444,40 @@ pub(crate) fn handle_debug_new_epoch_state(state: &NodeStateSnapshot) -> QueryRe
 ///
 /// Returns the Haskell-compatible `PraosState` CBOR structure.  Haskell uses
 /// `encodeVersion 0` (from `Ouroboros.Consensus.Util.Versioned`) which wraps
-/// the payload as `array(2)[0, payload]`.  The payload is `array(7)` containing
-/// the seven `PraosState` fields from `ouroboros-consensus-protocol-0.13.0.0`
-/// (the version shipped with cardano-node 10.6.x / 10.7.x).
+/// the payload as `array(2)[0, payload]`.  The payload is `array(8)` containing
+/// the eight `PraosState` fields from `ouroboros-consensus-protocol-3.0.1.0`
+/// (the version shipped with cardano-node 11.0.1).
 ///
 /// Field order: lastSlot, ocertCounters, evolvingNonce, candidateNonce,
-/// epochNonce, labNonce, lastEpochBlockNonce.
+/// epochNonce, previousEpochNonce, labNonce, lastEpochBlockNonce.
 ///
-/// NOTE: The `praosStatePreviousEpochNonce` field (for Peras) was added to the
-/// unreleased main branch but is absent from all released cardano-node versions.
-/// We deliberately omit it to stay compatible with cardano-cli 10.15.
-///
-/// The `OCertCounters` map (`praosStateOCertCounters`) is not tracked in
-/// `NodeStateSnapshot` — we emit an empty map, which is safe because tools
-/// reading this query for nonce inspection do not use the counter map.
+/// This used to emit `array(7)`, omitting `praosStatePreviousEpochNonce` on the
+/// documented assumption that the field existed only on an unreleased branch.
+/// That assumption expired with cardano-node 11.0.x, whose decoder is
+/// `enforceSize "PraosState" 8` with no 7-field fallback, so every 11.x client
+/// rejected the response outright (#902).
 pub(crate) fn handle_debug_chain_dep_state(state: &NodeStateSnapshot) -> QueryResult {
     debug!("Query: DebugChainDepState");
     let (last_slot, is_origin) = match state.tip.point.slot() {
         Some(s) => (s.0, false),
         None => (0, true),
     };
+    // Sort by issuer key hash so the CBOR map is deterministic across calls
+    // (the source is a HashMap; iteration order would otherwise vary and the
+    // response would not be byte-stable for the parity suite).
+    let mut ocert_counters = state.opcert_counters.clone();
+    ocert_counters.sort_by(|a, b| a.0.cmp(&b.0));
+
     QueryResult::DebugChainDepState {
         last_slot,
         last_slot_is_origin: is_origin,
-        // OCertCounters: not tracked per peer; emit empty map
-        ocert_counters: Vec::new(),
+        ocert_counters,
         evolving_nonce: state.evolving_nonce.clone(),
         candidate_nonce: state.candidate_nonce.clone(),
         epoch_nonce: state.epoch_nonce.clone(),
+        previous_epoch_nonce: state.previous_epoch_nonce.clone(),
         lab_nonce: state.lab_nonce.clone(),
-        last_epoch_block_nonce: state.lab_nonce.clone(),
+        last_epoch_block_nonce: state.last_epoch_block_nonce.clone(),
     }
 }
 
