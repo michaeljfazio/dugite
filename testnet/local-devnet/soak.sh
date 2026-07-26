@@ -76,6 +76,14 @@ cleanup() {
     done
     # Snapshot logs to evidence dir
     cp "$LD_LOGS"/*.log "$EVD/logs/" 2>/dev/null || true
+    # Snapshot the tx-zoo results as this round's slice.
+    #
+    # tx-zoo/state/ lives outside $LD_STATE, so results.csv accumulates across
+    # every round of a multi-round run. Without a per-round copy here,
+    # generate-release-report.sh falls back to that shared file for EVERY round
+    # and then sums it, reporting ~3x the real tx count (and identical per-round
+    # figures). Copying it per round gives the report a real per-round slice.
+    cp "$LD_ROOT/tx-zoo/state/results.csv" "$EVD/tx-results.csv" 2>/dev/null || true
     log_info "Soak evidence saved to $EVD"
 }
 trap cleanup EXIT INT TERM

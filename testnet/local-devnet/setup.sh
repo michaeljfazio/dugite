@@ -33,6 +33,19 @@ if [ -d "$LD_EVIDENCE" ] && [ -n "$(ls -A "$LD_EVIDENCE" 2>/dev/null)" ]; then
   done
 fi
 
+# Reset the tx-zoo results ledger so each round's results.csv covers only that
+# round. tx-zoo/state/ deliberately lives outside $LD_STATE (keys and funded
+# UTxOs are reused via `run-all.sh --setup`), so results.csv would otherwise
+# accumulate across every round of a multi-round run and make the per-round
+# tx counts in the release report meaningless.
+_zoo_results="$LD_ROOT/tx-zoo/state/results.csv"
+if [ -f "$_zoo_results" ]; then
+  mkdir -p "$LD_ROOT/evidence-archive"
+  mv "$_zoo_results" \
+     "$LD_ROOT/evidence-archive/results-$(date -u +%Y%m%dT%H%M%SZ).csv"
+  log_info "Archived prior tx-zoo results.csv"
+fi
+
 log_info "Wiping prior state (genesis, keys, state, logs)"
 rm -rf "$LD_GENESIS" "$LD_KEYS" "$LD_STATE" "$LD_LOGS" "$LD_EVIDENCE"
 rm -f "$LD_CONFIG"/dugite-*.json "$LD_CONFIG"/cardano-*.json \

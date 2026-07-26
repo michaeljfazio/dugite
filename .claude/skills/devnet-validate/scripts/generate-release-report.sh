@@ -136,13 +136,22 @@ process_round() {
     # --- Tx-zoo for this round ---
     local tz_pass=0 tz_fail=0 tz_skip=0 tz_total=0
     # Check per-round tx state if round-specific dir exists, fallback to global
+    # `$evd/tx-results.csv` is the per-round slice snapshotted by soak.sh.
+    # `$TX_ZOO_STATE/results.csv` is SHARED across rounds — falling back to it
+    # yields identical numbers for every round, so it must not be summed into
+    # the totals more than once. Record which source was used.
+    local tz_source="none"
     for candidate in "$evd/tx-results.csv" "$TX_ZOO_STATE/results.csv"; do
         if [ -f "$candidate" ] && [ -s "$candidate" ]; then
             # results.csv layout: ts,script,status,txid,detail — status is $3.
             tz_pass=$(awk -F, 'NR>1 && $3=="PASS" {c++} END{print c+0}' "$candidate")
             tz_fail=$(awk -F, 'NR>1 && $3=="FAIL" {c++} END{print c+0}' "$candidate")
-            tz_skip=$(awk -F, 'NR>1 && $2=="SKIP" {c++} END{print c+0}' "$candidate")
+            tz_skip=$(awk -F, 'NR>1 && $3=="SKIP" {c++} END{print c+0}' "$candidate")
             tz_total=$(awk -F, 'NR>1 {c++} END{print c+0}' "$candidate")
+            case "$candidate" in
+                "$evd/"*) tz_source="round" ;;
+                *)        tz_source="shared" ;;
+            esac
             break
         fi
     done
@@ -268,7 +277,8 @@ process_round() {
     "pass": $tz_pass,
     "fail": $tz_fail,
     "skip": $tz_skip,
-    "total": $tz_total
+    "total": $tz_total,
+    "source": "$tz_source"
   },
   "predicates": {
     "p1_forge_cross_check": $p1,
@@ -300,7 +310,7 @@ ROUND_JSON
 ROUNDS_JSON="["
 SUMMARY_PASS=true
 ROUNDS_PASS=0; ROUNDS_FAIL=0
-TOTAL_CANONICAL=0; TOTAL_TZ_PASS=0; TOTAL_TZ_FAIL=0
+TOTAL_CANONICAL=0; TOTAL_TZ_PASS=0; TOTAL_TZ_FAIL=0; SHARED_TZ_COUNTED=0
 TOTAL_INVALID_FORGES=0; TOTAL_CRIT=0
 FIRST_GIT_REV="unknown"; FIRST_CN_VER="unknown"; FIRST_CCLI_VER="unknown"
 
@@ -322,8 +332,19 @@ for i in "${!EVIDENCE_DIRS[@]}"; do
         ROUNDS_PASS=$(( ROUNDS_PASS + 1 ))
     fi
     TOTAL_CANONICAL=$(( TOTAL_CANONICAL + r_canon ))
-    TOTAL_TZ_PASS=$(( TOTAL_TZ_PASS + r_tz_pass ))
-    TOTAL_TZ_FAIL=$(( TOTAL_TZ_FAIL + r_tz_fail ))
+    # Only accumulate a round's tx-zoo counts when they came from that round's
+    # own snapshot. A "shared" source is the same cumulative CSV for every
+    # round, so it is counted exactly once (otherwise an N-round run reports
+    # N x the real transaction count).
+    r_tz_src=$(echo "$round_json" | jq -r '.tx_zoo.source // "none"')
+    if [ "$r_tz_src" = "round" ]; then
+        TOTAL_TZ_PASS=$(( TOTAL_TZ_PASS + r_tz_pass ))
+        TOTAL_TZ_FAIL=$(( TOTAL_TZ_FAIL + r_tz_fail ))
+    elif [ "$r_tz_src" = "shared" ] && [ "$SHARED_TZ_COUNTED" = "0" ]; then
+        TOTAL_TZ_PASS=$(( TOTAL_TZ_PASS + r_tz_pass ))
+        TOTAL_TZ_FAIL=$(( TOTAL_TZ_FAIL + r_tz_fail ))
+        SHARED_TZ_COUNTED=1
+    fi
 
     # Grab versions from first round
     if [ "$i" -eq 0 ]; then
