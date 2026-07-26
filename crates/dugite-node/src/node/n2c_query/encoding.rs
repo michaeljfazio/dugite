@@ -333,6 +333,7 @@ pub(crate) fn encode_query_result_value(
             evolving_nonce,
             candidate_nonce,
             epoch_nonce,
+            previous_epoch_nonce,
             lab_nonce,
             last_epoch_block_nonce,
         } => {
@@ -344,6 +345,7 @@ pub(crate) fn encode_query_result_value(
                 evolving_nonce,
                 candidate_nonce,
                 epoch_nonce,
+                previous_epoch_nonce,
                 lab_nonce,
                 last_epoch_block_nonce,
             );
@@ -1934,23 +1936,24 @@ fn encode_debug_new_epoch_state(
 ///
 /// Haskell uses `encodeVersion 0` (from `Ouroboros.Consensus.Util.Versioned`),
 /// which wraps any payload as `array(2) [version, payload]`.  The PraosState
-/// payload is `array(7)` of the seven fields listed below.
+/// payload is `array(8)` of the eight fields listed below.
 ///
-/// Field layout (released `ouroboros-consensus-protocol-0.13.0.0`, shipped with
-/// cardano-node 10.6.x / 10.7.x):
+/// Field layout (`ouroboros-consensus-protocol-3.0.1.0`, shipped with
+/// cardano-node 11.0.1 — `Ouroboros/Consensus/Protocol/Praos.hs`):
 ///   [0] praosStateLastSlot              — WithOrigin SlotNo
 ///   [1] praosStateOCertCounters         — Map<KeyHash BlockIssuer, Word64>
 ///   [2] praosStateEvolvingNonce         — Nonce
 ///   [3] praosStateCandidateNonce        — Nonce
 ///   [4] praosStateEpochNonce            — Nonce
-///   [5] praosStateLabNonce              — Nonce
-///   [6] praosStateLastEpochBlockNonce   — Nonce
+///   [5] praosStatePreviousEpochNonce    — Nonce
+///   [6] praosStateLabNonce              — Nonce
+///   [7] praosStateLastEpochBlockNonce   — Nonce
 ///
-/// NOTE: The unreleased main branch (commit 5598d9fb, 2025-10-29) inserts a
-/// `praosStatePreviousEpochNonce` field at position [5] (shifting lab/lastEpoch
-/// to [6]/[7]) and uses `array(8)`.  That change is NOT in any released
-/// cardano-node as of 2026-04-06; encoding array(8) causes cardano-cli 10.15 to
-/// reject the response with a CBOR enforceSize mismatch.
+/// This emitted `array(7)` (no `praosStatePreviousEpochNonce`) until #902, on
+/// the assumption that the field was unreleased.  cardano-node 11.0.x decodes
+/// with `enforceSize "PraosState" 8` and registers only one version, so there
+/// is no 7-field fallback and every 11.x client rejected the short form with
+/// `Size mismatch when decoding PraosState. Expected 8, but found 7.`
 ///
 /// All nonce values use the Haskell `Nonce` encoding:
 ///   - `NeutralNonce` → `array(1) [0]`
@@ -1975,6 +1978,7 @@ fn encode_debug_chain_dep_state(
     evolving_nonce: &[u8],
     candidate_nonce: &[u8],
     epoch_nonce: &[u8],
+    previous_epoch_nonce: &[u8],
     lab_nonce: &[u8],
     last_epoch_block_nonce: &[u8],
 ) {
@@ -1982,9 +1986,10 @@ fn encode_debug_chain_dep_state(
     enc.array(2).ok();
     enc.u8(0).ok(); // version number
 
-    // PraosState: array(7) [lastSlot, ocertCounters, evolvingNonce,
-    //   candidateNonce, epochNonce, labNonce, lastEpochBlockNonce]
-    enc.array(7).ok();
+    // PraosState: array(8) [lastSlot, ocertCounters, evolvingNonce,
+    //   candidateNonce, epochNonce, previousEpochNonce, labNonce,
+    //   lastEpochBlockNonce]
+    enc.array(8).ok();
 
     // [0] praosStateLastSlot: WithOrigin SlotNo
     // WithOrigin<T> via generic Serialise: Origin=[0], At slot=[1, slot]
@@ -2026,9 +2031,11 @@ fn encode_debug_chain_dep_state(
     encode_nonce(enc, candidate_nonce);
     // [4] praosStateEpochNonce
     encode_nonce(enc, epoch_nonce);
-    // [5] praosStateLabNonce
+    // [5] praosStatePreviousEpochNonce
+    encode_nonce(enc, previous_epoch_nonce);
+    // [6] praosStateLabNonce
     encode_nonce(enc, lab_nonce);
-    // [6] praosStateLastEpochBlockNonce
+    // [7] praosStateLastEpochBlockNonce
     encode_nonce(enc, last_epoch_block_nonce);
 }
 
@@ -2533,6 +2540,81 @@ mod tests {
         dec.u32().unwrap(); // 4 = MsgResult tag
         dec.array().unwrap(); // HFC EitherMismatch success wrapper (array(1))
         cbor[dec.position()..].to_vec()
+    }
+
+    /// Issue #902 — DebugChainDepState must encode the 8-field PraosState that
+    /// cardano-node 11.0.x requires, in the exact order from
+    /// ouroboros-consensus-protocol 3.0.1.0 Praos.hs:
+    ///   encodeVersion 0 $ encodeListLen 8 <> lastSlot <> oCertCounters
+    ///     <> evolving <> candidate <> epoch <> previousEpoch <> lab
+    ///     <> lastEpochBlock
+    ///
+    /// A 7-element payload is rejected by `enforceSize "PraosState" 8` with
+    /// `Size mismatch when decoding PraosState. Expected 8, but found 7.`
+    #[test]
+    fn debug_chain_dep_state_encodes_eight_field_praos_state() {
+        let epoch = vec![0x11u8; 32];
+        let prev_epoch = vec![0x22u8; 32];
+        let lab = vec![0x33u8; 32];
+        let last_epoch_block = vec![0x44u8; 32];
+        let result = QueryResult::DebugChainDepState {
+            last_slot: 4242,
+            last_slot_is_origin: false,
+            ocert_counters: vec![(vec![0xAAu8; 28], 7)],
+            evolving_nonce: vec![0x55u8; 32],
+            candidate_nonce: vec![0x66u8; 32],
+            epoch_nonce: epoch.clone(),
+            previous_epoch_nonce: prev_epoch.clone(),
+            lab_nonce: lab.clone(),
+            last_epoch_block_nonce: last_epoch_block.clone(),
+        };
+        let buf = encode_query_result(&result);
+        let payload = strip_wrappers(&buf);
+
+        let mut d = Decoder::new(&payload);
+        assert_eq!(
+            d.array().unwrap(),
+            Some(2),
+            "encodeVersion wrapper is array(2)"
+        );
+        assert_eq!(d.u8().unwrap(), 0, "version tag must be 0");
+        assert_eq!(
+            d.array().unwrap(),
+            Some(8),
+            "PraosState must be array(8) — array(7) is rejected by cardano-node 11.0.x"
+        );
+
+        // [0] lastSlot: At 4242 -> array(2)[1, slot]
+        assert_eq!(d.array().unwrap(), Some(2));
+        assert_eq!(d.u8().unwrap(), 1);
+        assert_eq!(d.u64().unwrap(), 4242);
+
+        // [1] oCertCounters
+        assert_eq!(d.map().unwrap(), Some(1));
+        assert_eq!(d.bytes().unwrap(), &[0xAAu8; 28]);
+        assert_eq!(d.u64().unwrap(), 7);
+
+        // Helper: read one Nonce (array(1)[0] neutral, array(2)[1, bytes32]).
+        let read_nonce = |d: &mut Decoder| -> Vec<u8> {
+            let len = d.array().unwrap().unwrap();
+            let tag = d.u8().unwrap();
+            if len == 1 && tag == 0 {
+                Vec::new()
+            } else {
+                d.bytes().unwrap().to_vec()
+            }
+        };
+
+        assert_eq!(read_nonce(&mut d), vec![0x55u8; 32], "[2] evolving");
+        assert_eq!(read_nonce(&mut d), vec![0x66u8; 32], "[3] candidate");
+        assert_eq!(read_nonce(&mut d), epoch, "[4] epoch");
+        assert_eq!(
+            read_nonce(&mut d),
+            prev_epoch,
+            "[5] MUST be previousEpochNonce, between epoch and lab"
+        );
+        assert_eq!(read_nonce(&mut d), lab, "[6] lab");
+        assert_eq!(read_nonce(&mut d), last_epoch_block, "[7] lastEpochBlock");
     }
 
     // ─── Stake distribution (tags 5, 10, 30) — pool IDs must be 28 bytes ────

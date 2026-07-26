@@ -56,15 +56,15 @@ fn snapshot_format_hash_stability() {
     // This hash was computed from the current LedgerStateSnapshot layout.
     // If this changes, existing snapshot files become unreadable.
     //
-    // Last update: SNAPSHOT_VERSION 27 → 28 (#804, 2026-07-06) —
-    // `LedgerStateSnapshot` gained a new `future_gen_delegs:
-    // HashMap<(u64, Hash28), (Hash28, Hash32)>` field (Haskell
-    // `dsFutureGenDelegs`, the pending queue behind a
-    // `Certificate::GenesisKeyDelegation`), inserted right after
-    // `genesis_delegates` — a positional bincode layout change. Pre-existing
-    // snapshots are quarantined on load and operators re-sync (no migration
-    // shim — see SNAPSHOT_VERSION docs).
-    const EXPECTED_HASH: &str = "de7754e72474ef9126157a88fdc9d8db161ccf92df3bf88a9d362238c46c082f";
+    // Last update: SNAPSHOT_VERSION 29 → 30 (#902, 2026-07-26) —
+    // `ConsensusSubState` / `LedgerStateSnapshot` gained `previous_epoch_nonce:
+    // Hash32` (Haskell `praosStatePreviousEpochNonce`), inserted right after
+    // `epoch_nonce` — a positional bincode layout change. cardano-node 11.0.x
+    // decodes `PraosState` with `enforceSize "PraosState" 8`, so the field must
+    // be real tracked state for the DebugChainDepState (LSQ tag 13) response to
+    // be accepted at all. Pre-existing snapshots are quarantined on load and
+    // operators re-sync (no migration shim — see SNAPSHOT_VERSION docs).
+    const EXPECTED_HASH: &str = "1c216e05dd246f9b100c06f784a6a4b36bba2c003ff6b18621216b90ac895cc9";
 
     if EXPECTED_HASH == "COMPUTE_ON_FIRST_RUN" {
         panic!(

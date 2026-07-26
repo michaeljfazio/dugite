@@ -146,7 +146,7 @@ pub enum QueryResult {
     /// response with a CBOR size mismatch.
     ///
     /// Sources:
-    ///   - ouroboros-consensus-protocol 0.13.0.0 tag: Ouroboros/Consensus/Protocol/Praos.hs
+    ///   - ouroboros-consensus-protocol 3.0.1.0 tag: Ouroboros/Consensus/Protocol/Praos.hs
     ///   - ouroboros-consensus/Ouroboros/Consensus/Util/Versioned.hs (`encodeVersion`)
     DebugChainDepState {
         /// Last applied block slot (0 = Origin)
@@ -161,6 +161,8 @@ pub enum QueryResult {
         candidate_nonce: Vec<u8>,
         /// Epoch nonce (32 bytes), empty = NeutralNonce
         epoch_nonce: Vec<u8>,
+        /// Previous epoch nonce — the epoch nonce the last rotation replaced
+        previous_epoch_nonce: Vec<u8>,
         /// Lab nonce — derived from the VRF output of the last applied block
         lab_nonce: Vec<u8>,
         /// Last epoch block nonce — lab nonce from the last block of the prior epoch
@@ -926,6 +928,15 @@ pub struct NodeStateSnapshot {
     pub ratify_delayed: bool,
     /// Epoch nonce (32 bytes) for DebugChainDepState
     pub epoch_nonce: Vec<u8>,
+    /// `praosStatePreviousEpochNonce` (32 bytes) — field [5] of the 8-element
+    /// PraosState cardano-node 11.0.x expects (#902).
+    pub previous_epoch_nonce: Vec<u8>,
+    /// `praosStateLastEpochBlockNonce` (32 bytes). Distinct from `lab_nonce`:
+    /// this is the snapshot of lab_nonce taken at the last epoch boundary.
+    pub last_epoch_block_nonce: Vec<u8>,
+    /// `praosStateOCertCounters`: issuer cold-key hash -> latest operational
+    /// certificate sequence number, accumulated over applied headers.
+    pub opcert_counters: Vec<(Vec<u8>, u64)>,
     /// Evolving nonce (32 bytes) for DebugChainDepState
     pub evolving_nonce: Vec<u8>,
     /// Candidate nonce (32 bytes) for DebugChainDepState
@@ -1000,6 +1011,9 @@ impl Default for NodeStateSnapshot {
             ratify_expired: Vec::new(),
             ratify_delayed: false,
             epoch_nonce: vec![0u8; 32],
+            previous_epoch_nonce: vec![0u8; 32],
+            last_epoch_block_nonce: vec![0u8; 32],
+            opcert_counters: Vec::new(),
             evolving_nonce: vec![0u8; 32],
             candidate_nonce: vec![0u8; 32],
             lab_nonce: vec![0u8; 32],
