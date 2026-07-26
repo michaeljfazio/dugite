@@ -73,30 +73,48 @@ devnet-verify:
     #!/usr/bin/env bash
     set -euo pipefail
     cd testnet/local-devnet
-    latest=$(ls -t evidence 2>/dev/null | head -1)
-    [ -z "$latest" ] && { echo "No evidence directories found in testnet/local-devnet/evidence/"; exit 1; }
-    ./verify.sh "evidence/$latest"
+    # A "round" is a directory holding metadata.json (written by soak.sh at
+    # start-up). 09-cli-parity/ and protocols/ also create evidence dirs, but
+    # they hold only cli-parity.csv / n2n-trace.csv and must never be picked.
+    # setup.sh moves prior rounds to evidence-archive/auto/, so search both.
+    latest=$(
+      for d in evidence/*/ evidence-archive/auto/*/; do
+        [ -f "${d}metadata.json" ] && printf '%s\t%s\n' "$(basename "$d")" "${d%/}"
+      done | sort | cut -f2 | tail -1
+    )
+    [ -z "$latest" ] && { echo "No round evidence (metadata.json) found under testnet/local-devnet/evidence{,-archive/auto}/"; exit 1; }
+    ./verify.sh "$latest"
 
 # Stop all local-devnet processes.
 devnet-stop:
     ./testnet/local-devnet/stop.sh
 
-# Generate a release report from the most recent evidence directory (optional TAG).
+# Generate a SINGLE-round report from the most recent evidence dir (optional TAG).
+# Deliberately one round: this is the quick post-soak convenience path. For the
+# 3-round release report, use the multi-round snippet in
+# .claude/skills/devnet-validate/SKILL.md ("Final report").
 devnet-report TAG="":
     #!/usr/bin/env bash
     set -euo pipefail
     REPO_ROOT="$(pwd)"
     cd testnet/local-devnet
-    latest=$(ls -t evidence 2>/dev/null | head -1)
-    [ -z "$latest" ] && { echo "No evidence directories found in testnet/local-devnet/evidence/"; exit 1; }
+    # Same round predicate as devnet-verify — see the comment there.
+    latest=$(
+      for d in evidence/*/ evidence-archive/auto/*/; do
+        [ -f "${d}metadata.json" ] && printf '%s\t%s\n' "$(basename "$d")" "${d%/}"
+      done | sort | cut -f2 | tail -1
+    )
+    [ -z "$latest" ] && { echo "No round evidence (metadata.json) found under testnet/local-devnet/evidence{,-archive/auto}/"; exit 1; }
     tag_flag=""
     [ -n "{{TAG}}" ] && tag_flag="--tag {{TAG}}"
     mkdir -p "$REPO_ROOT/reports/devnet-validate"
     "$REPO_ROOT/.claude/skills/devnet-validate/scripts/generate-release-report.sh" \
         --preset standard \
         $tag_flag \
+        --round-names "soak" \
+        --tx-zoo-state tx-zoo/state \
         --output-dir "$REPO_ROOT/reports/devnet-validate" \
-        "evidence/$latest"
+        "$latest"
     echo "Report written to reports/devnet-validate/"
 
 # Run smoke devnet-validate (single boot, ~5 min). PR gate for core crates.
