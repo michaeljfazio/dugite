@@ -59,6 +59,10 @@ reward-dumps-issue-481/
 reports/devnet-validate/report.json
 reports/devnet-validate/report.md
 testnet/local-devnet/evidence/
+# Auto-archived devnet runs (setup.sh moves prior evidence here so a
+# multi-round run stays reportable). The rest of evidence-archive/ is
+# hand-curated and version-controlled.
+testnet/local-devnet/evidence-archive/auto/
 .opencode
 *.pid
 epoch-dumps-*

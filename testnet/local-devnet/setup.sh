@@ -17,10 +17,14 @@ assert_ports_free
 # Deleting evidence/ here made every round but the last unreportable, so a
 # multi-round run could not produce the report that gates a release.
 #
-# Move (never delete) any existing evidence into evidence-archive/ so the
+# Move (never delete) any existing evidence into evidence-archive/auto/ so the
 # report generator can still be pointed at earlier rounds.
 if [ -d "$LD_EVIDENCE" ] && [ -n "$(ls -A "$LD_EVIDENCE" 2>/dev/null)" ]; then
-  archive="$LD_ROOT/evidence-archive"
+  # Auto-archived runs go in their own subdirectory: evidence-archive/ itself
+  # holds hand-curated, version-controlled archives (bug-j-fix-1800s-soak-pass
+  # and friends), and dropping timestamped run debris beside them would leave
+  # untracked cruft in the repo after every devnet run.
+  archive="$LD_ROOT/evidence-archive/auto"
   mkdir -p "$archive"
   for d in "$LD_EVIDENCE"/*; do
     [ -e "$d" ] || continue
@@ -29,7 +33,7 @@ if [ -d "$LD_EVIDENCE" ] && [ -n "$(ls -A "$LD_EVIDENCE" 2>/dev/null)" ]; then
       base="${base}-$(date -u +%s)"
     fi
     mv "$d" "$archive/$base"
-    log_info "Archived prior evidence: evidence-archive/$base"
+    log_info "Archived prior evidence: evidence-archive/auto/$base"
   done
 fi
 
@@ -40,9 +44,9 @@ fi
 # tx counts in the release report meaningless.
 _zoo_results="$LD_ROOT/tx-zoo/state/results.csv"
 if [ -f "$_zoo_results" ]; then
-  mkdir -p "$LD_ROOT/evidence-archive"
+  mkdir -p "$LD_ROOT/evidence-archive/auto"
   mv "$_zoo_results" \
-     "$LD_ROOT/evidence-archive/results-$(date -u +%Y%m%dT%H%M%SZ).csv"
+     "$LD_ROOT/evidence-archive/auto/results-$(date -u +%Y%m%dT%H%M%SZ).csv"
   log_info "Archived prior tx-zoo results.csv"
 fi
 
