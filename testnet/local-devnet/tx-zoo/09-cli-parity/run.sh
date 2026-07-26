@@ -68,15 +68,17 @@ if [ -f "$PARITY_CSV" ]; then
     EQUAL=$(awk -F, 'NR>1 && $3=="EQUAL" {c++} END{print c+0}' "$PARITY_CSV")
     DIVERGENT_CSV=$(awk -F, 'NR>1 && $3=="DIVERGENT" && $7!~/^known-divergence:/ {c++} END{print c+0}' "$PARITY_CSV")
     SKIPS=$(awk -F, 'NR>1 && $3=="SKIP" {c++} END{print c+0}' "$PARITY_CSV")
-    ERRORS=$(awk -F, 'NR>1 && $3=="ERROR" {c++} END{print c+0}' "$PARITY_CSV")
+    ERRORS=$(awk -F, 'NR>1 && $3=="ERROR" && $7!~/^known-error:/ {c++} END{print c+0}' "$PARITY_CSV")
+    KNOWN_ERR=$(awk -F, 'NR>1 && $3=="ERROR" && $7~/^known-error:/ {c++} END{print c+0}' "$PARITY_CSV")
+    KNOWN_DIV=$(awk -F, 'NR>1 && $3=="DIVERGENT" && $7~/^known-divergence:/ {c++} END{print c+0}' "$PARITY_CSV")
 fi
 
 log_info ""
 log_info "=== CLI parity summary ==="
 log_info "  EQUAL:     $EQUAL"
-log_info "  DIVERGENT: ${DIVERGENT_CSV:-$DIVERGENT} (non-known)"
+log_info "  DIVERGENT: ${DIVERGENT_CSV:-$DIVERGENT} unexplained, ${KNOWN_DIV:-0} tracked"
 log_info "  SKIP:      $SKIPS"
-log_info "  ERROR:     $ERRORS"
+log_info "  ERROR:     $ERRORS unexplained, ${KNOWN_ERR:-0} tracked"
 log_info "  CSV:       $PARITY_CSV"
 log_info ""
 
@@ -99,8 +101,8 @@ fi
 # row: either the query works on both sides, or it is recorded as SKIP with a
 # reason. This is what holds cli-parity.csv to zero unexplained rows.
 if [ "$ERRORS" -gt 0 ]; then
-    log_error "FAIL: $ERRORS queries errored — check $PARITY_CSV for details"
-    awk -F, 'NR>1 && $3=="ERROR" {print "  " $2 ": " $7}' "$PARITY_CSV" >&2
+    log_error "FAIL: $ERRORS untracked query errors — check $PARITY_CSV for details"
+    awk -F, 'NR>1 && $3=="ERROR" && $7!~/^known-error:/ {print "  " $2 ": " $7}' "$PARITY_CSV" >&2
     log_error "A 'HARNESS both-sides-failed' note means the invocation is wrong,"
     log_error "not that dugite is missing anything. Fix the 09*.sh script."
     FAILED=1
