@@ -1150,23 +1150,104 @@ pub fn load_dijkstra_genesis_with_hash(
     Ok((genesis, hash))
 }
 
-/// Convert a float to a rational approximation
+/// Convert a JSON genesis number to the EXACT rational it denotes.
+///
+/// Haskell parses these fields (`NonNegativeInterval`, `UnitInterval`) from
+/// JSON via `Scientific`, which is an exact decimal — `0.0000721` becomes
+/// `721 % 10000000`, not an approximation. dugite must match, because every
+/// one of these values is consensus-critical:
+///
+/// * `executionPrices.priceSteps` / `priceMemory` — Plutus script fees, so the
+///   min-fee of every script transaction
+/// * `rho`, `tau` — monetary expansion and treasury cut, i.e. the reward pot
+/// * `a0` — pool reward saturation
+/// * `decentralisationParam` — leader election
+/// * every `dvt_*` / `pvt_*` governance voting threshold
+///
+/// This used to force a denominator of 1_000_000 and round into it, which is
+/// exact only for values expressible in millionths. Mainnet's real
+/// `priceSteps` is `0.0000721`: `round(0.0000721 * 1e6) = 72`, giving
+/// `9/125000 = 0.000072` — a 0.14% error in the steps price, silently applied
+/// to every script fee dugite computed.
+///
+/// f64 Display in Rust emits the shortest decimal string that round-trips to
+/// the same f64, which reproduces the literal the genesis file contained, so
+/// parsing that string recovers the intended decimal exactly.
 fn float_to_rational(f: f64) -> Rational {
-    if f == 0.0 {
+    if f == 0.0 || !f.is_finite() {
         return Rational {
             numerator: 0,
             denominator: 1,
         };
     }
-    // Use 1_000_000 as denominator for good precision
+
+    let s = format!("{f}");
+    if let Some(r) = decimal_str_to_rational(&s) {
+        return r;
+    }
+
+    // Fallback for shapes the decimal parser cannot represent in u64 (absurd
+    // exponents). Previous behaviour, which is at least bounded.
     let den = 1_000_000u64;
     let num = (f * den as f64).round() as u64;
-    // Simplify with GCD
-    let g = gcd(num, den);
+    let g = gcd(num, den).max(1);
     Rational {
         numerator: num / g,
         denominator: den / g,
     }
+}
+
+/// Parse a plain or exponential decimal string into an exact reduced rational.
+///
+/// Returns `None` if the value cannot be represented in `u64/u64` (in which
+/// case the caller falls back), or if the string is not a number we recognise.
+fn decimal_str_to_rational(s: &str) -> Option<Rational> {
+    let s = s.trim();
+    // Negative values are not valid for any of these genesis fields.
+    if s.starts_with('-') {
+        return None;
+    }
+    let (mantissa, exp) = match s.split_once(['e', 'E']) {
+        Some((m, e)) => (m, e.parse::<i32>().ok()?),
+        None => (s, 0i32),
+    };
+    let (int_part, frac_part) = match mantissa.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (mantissa, ""),
+    };
+    if !int_part.chars().all(|c| c.is_ascii_digit())
+        || !frac_part.chars().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+
+    let digits = format!("{int_part}{frac_part}");
+    let mut numerator: u128 = digits.parse().ok()?;
+    // Scale of the mantissa, then apply the exponent.
+    let scale = frac_part.len() as i32 - exp;
+    let mut denominator: u128 = 1;
+    if scale >= 0 {
+        denominator = 10u128.checked_pow(u32::try_from(scale).ok()?)?;
+    } else {
+        numerator = numerator.checked_mul(10u128.checked_pow(u32::try_from(-scale).ok()?)?)?;
+    }
+
+    let g = gcd_u128(numerator, denominator).max(1);
+    let numerator = numerator / g;
+    let denominator = denominator / g;
+    Some(Rational {
+        numerator: u64::try_from(numerator).ok()?,
+        denominator: u64::try_from(denominator).ok()?,
+    })
+}
+
+fn gcd_u128(mut a: u128, mut b: u128) -> u128 {
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
 }
 
 fn gcd(mut a: u64, mut b: u64) -> u64 {
@@ -1176,6 +1257,90 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
         a = t;
     }
     a
+}
+
+#[cfg(test)]
+mod float_to_rational_tests {
+    use super::*;
+
+    /// Genesis intervals must convert to the EXACT rational the decimal
+    /// denotes, matching Haskell's `Scientific`-based JSON parsing.
+    ///
+    /// The regression: a hardcoded 1_000_000 denominator turned mainnet's real
+    /// `priceSteps = 0.0000721` into `9/125000 = 0.000072`, a 0.14% error
+    /// applied to every Plutus script fee dugite computed.
+    #[test]
+    fn converts_genesis_decimals_exactly() {
+        let cases: &[(f64, u64, u64)] = &[
+            // The bug: 7 decimal places, not expressible in millionths.
+            (0.0000721, 721, 10_000_000),
+            // Mainnet / devnet values that were already correct.
+            (0.0577, 577, 10_000),
+            (0.003, 3, 1_000),
+            (0.2, 1, 5),
+            (0.3, 3, 10),
+            (0.05, 1, 20),
+            (0.51, 51, 100),
+            (0.67, 67, 100),
+            (0.75, 3, 4),
+            // Integers and unit bounds.
+            (1.0, 1, 1),
+            (0.0, 0, 1),
+            // Finer precision than millionths in a governance threshold.
+            (0.5100001, 5_100_001, 10_000_000),
+        ];
+        for &(input, num, den) in cases {
+            let r = float_to_rational(input);
+            assert_eq!(
+                (r.numerator, r.denominator),
+                (num, den),
+                "float_to_rational({input}) must be exactly {num}/{den}, got {}/{}",
+                r.numerator,
+                r.denominator
+            );
+        }
+    }
+
+    /// Every converted value must round-trip to the original decimal.
+    #[test]
+    fn conversion_is_lossless_for_genesis_shaped_values() {
+        for input in [0.0000721_f64, 0.0577, 0.003, 0.2, 0.3, 0.05, 0.51, 0.67] {
+            let r = float_to_rational(input);
+            let back = r.numerator as f64 / r.denominator as f64;
+            assert!(
+                (back - input).abs() < f64::EPSILON * input.max(1.0),
+                "{input} round-tripped to {back} via {}/{}",
+                r.numerator,
+                r.denominator
+            );
+        }
+    }
+
+    #[test]
+    fn handles_exponential_notation() {
+        // 7.21e-5 is the same value as 0.0000721.
+        assert_eq!(
+            decimal_str_to_rational("7.21e-5"),
+            Some(Rational {
+                numerator: 721,
+                denominator: 10_000_000
+            })
+        );
+        assert_eq!(
+            decimal_str_to_rational("5e-1"),
+            Some(Rational {
+                numerator: 1,
+                denominator: 2
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_non_numeric_and_negative() {
+        assert_eq!(decimal_str_to_rational("-0.5"), None);
+        assert_eq!(decimal_str_to_rational("abc"), None);
+        assert_eq!(decimal_str_to_rational("0.1.2"), None);
+    }
 }
 
 #[cfg(test)]

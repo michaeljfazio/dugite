@@ -736,14 +736,50 @@ impl Node {
             use dugite_primitives::transaction::DRep;
             let mut drep_stakes: std::collections::HashMap<String, (u8, Option<Vec<u8>>, u64)> =
                 std::collections::HashMap::new();
+            // Haskell `computeDRepDistr` (Conway/Governance/DRepPulser.hs:200-241)
+            // sums THREE things per delegating credential:
+            //   InstantStake[cred] + ProposalDeposits[cred] + AccountBalance[cred]
+            // i.e. UTxO-derived stake, the governance-action deposits attributed
+            // to that credential, and its reward-account balance.
+            //
+            // This query previously used only the UTxO stake map, so it under-
+            // reported every DRep. On the devnet that was 800,000 ADA of live
+            // proposal deposits missing from a single DRep's reported power.
+            //
+            // Proposal deposits are keyed by each live proposal's RETURN ADDRESS
+            // staking credential and SUMMED across proposals sharing one
+            // (`proposalsDeposits`, Conway/Governance/Proposals.hs:566-579).
+            // Registration deposits (drep/key/pool) are deliberately NOT included
+            // — Haskell never reads them here.
+            let mut proposal_deposits: std::collections::HashMap<
+                dugite_primitives::hash::Hash32,
+                u64,
+            > = std::collections::HashMap::new();
+            for proposal in ls.gov.governance.proposals.values() {
+                let cred = dugite_ledger::LedgerState::reward_account_to_hash(
+                    &proposal.procedure.return_addr,
+                );
+                *proposal_deposits.entry(cred).or_default() += proposal.procedure.deposit.0;
+            }
+
             for (stake_cred, drep) in &ls.gov.governance.vote_delegations {
-                let stake = ls
+                let utxo_stake = ls
                     .certs
                     .stake_distribution
                     .stake_map
                     .get(stake_cred)
                     .map(|l| l.0)
                     .unwrap_or(0);
+                let reward_balance = ls
+                    .certs
+                    .reward_accounts
+                    .get(stake_cred)
+                    .map(|l| l.0)
+                    .unwrap_or(0);
+                let deposits = proposal_deposits.get(stake_cred).copied().unwrap_or(0);
+                let stake = utxo_stake
+                    .saturating_add(reward_balance)
+                    .saturating_add(deposits);
                 let (key, drep_type, drep_hash) = match drep {
                     DRep::KeyHash(h) => {
                         let hb = h.as_ref()[..28].to_vec();
