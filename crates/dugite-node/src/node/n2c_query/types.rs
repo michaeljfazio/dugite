@@ -847,6 +847,9 @@ pub struct NodeStateSnapshot {
     pub proposal_count: usize,
     /// Protocol parameters for CBOR encoding
     pub protocol_params: ProtocolParamsSnapshot,
+    /// Parameters in force BEFORE the most recent epoch-boundary enactment
+    /// (`previousPParams` / Haskell `cgsPrevPParams`).
+    pub prev_protocol_params: ProtocolParamsSnapshot,
     /// Stake pool distribution data
     pub stake_pools: Vec<StakePoolSnapshot>,
     /// DRep registration data
@@ -970,6 +973,7 @@ impl Default for NodeStateSnapshot {
             drep_count: 0,
             proposal_count: 0,
             protocol_params: ProtocolParamsSnapshot::default(),
+            prev_protocol_params: ProtocolParamsSnapshot::default(),
             stake_pools: Vec::new(),
             drep_entries: Vec::new(),
             governance_proposals: Vec::new(),

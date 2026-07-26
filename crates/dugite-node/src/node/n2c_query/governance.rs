@@ -27,7 +27,7 @@ pub(crate) fn handle_gov_state(state: &NodeStateSnapshot) -> QueryResult {
         constitution_hash: state.constitution_hash.clone(),
         constitution_script: state.constitution_script.clone(),
         cur_pparams: Box::new(state.protocol_params.clone()),
-        prev_pparams: Box::new(state.protocol_params.clone()),
+        prev_pparams: Box::new(state.prev_protocol_params.clone()),
         enacted_pparam_update: state.enacted_pparam_update.clone(),
         enacted_hard_fork: state.enacted_hard_fork.clone(),
         enacted_committee: state.enacted_committee.clone(),
@@ -95,7 +95,7 @@ pub(crate) fn handle_ratify_state(state: &NodeStateSnapshot) -> QueryResult {
         constitution_hash: state.constitution_hash.clone(),
         constitution_script: state.constitution_script.clone(),
         cur_pparams: Box::new(state.protocol_params.clone()),
-        prev_pparams: Box::new(state.protocol_params.clone()), // best available
+        prev_pparams: Box::new(state.prev_protocol_params.clone()),
         enacted_pparam_update: state.enacted_pparam_update.clone(),
         enacted_hard_fork: state.enacted_hard_fork.clone(),
         enacted_committee: state.enacted_committee.clone(),
