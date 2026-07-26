@@ -28,7 +28,7 @@ _parity_ensure_csv() {
     local dir; dir="$(dirname "$csv")"
     mkdir -p "$dir"
     if [ ! -f "$csv" ]; then
-        echo "ts,query,dugite_sha256,cardano_sha256,equal,notes" > "$csv"
+        echo "ts,query,status,dugite_sha256,cardano_sha256,equal,notes" > "$csv"
     fi
 }
 
@@ -38,26 +38,27 @@ _parity_ensure_csv() {
 declare -gA KNOWN_DIVERGENCES=(
     # All tracked under the umbrella issue #597 until each query is fixed.
     #
-    # FIXED (do NOT re-add without verifying the fix has regressed):
-    #   slot-number             — `--utc-time` flag added (was positional)
-    #   treasury                — `--output-json` / `--output-text` / `--out-file` flags added
-    #   protocol-state/version  — `--output-json` flag added; emits null fields matching cardano-cli
+    # This array is ONLY for real divergences — both sides answered, the
+    # answers differ. It must never be used to paper over an ERROR row: an
+    # ERROR means cardano-cli refused the invocation or could not reach a
+    # node, which is a harness bug, not a dugite behaviour to track. See #900.
     #
     # Remaining divergences pending deeper fixes:
     ["protocol-parameters"]="https://github.com/michaeljfazio/dugite/issues/597"
     ["stake-distribution"]="https://github.com/michaeljfazio/dugite/issues/597"
     ["gov-state"]="https://github.com/michaeljfazio/dugite/issues/597"
-    ["kes-period-info"]="https://github.com/michaeljfazio/dugite/issues/597"
-    ["proposals"]="https://github.com/michaeljfazio/dugite/issues/597"
     # Newly surfaced in Round-1 retry 2026-05-28; tracked under the same
     # umbrella issue until each gets its own. drep-stake-distribution
     # diverges in the per-DRep ordering; future-pparams in the no-pending-
     # proposal "null" envelope shape.
     ["drep-stake-distribution"]="https://github.com/michaeljfazio/dugite/issues/597"
     ["future-pparams"]="https://github.com/michaeljfazio/dugite/issues/597"
-    ["treasury"]="https://github.com/michaeljfazio/dugite/issues/597"
-    ["slot-number"]="https://github.com/michaeljfazio/dugite/issues/597"
     ["protocol-state/version"]="https://github.com/michaeljfazio/dugite/issues/597"
+    # NB: kes-period-info, proposals, slot-number and treasury were listed
+    # here until 2026-07-26. They never diverged — cardano-cli rejected the
+    # harness's own arguments, both sides failed identically, and lib.sh
+    # mislabelled that as "dugite ERROR". Fixed in #900; do not re-add
+    # without a real two-sided diff.
 )
 
 # ---- Core parity function -------------------------------------------------
@@ -92,19 +93,38 @@ parity_query_json() {
         return 0
     fi
 
+    # Not every cardano-cli query accepts --output-json. `treasury` and
+    # `slot-number` (11.0.0.0) have no output-format flags at all, and passing
+    # one makes optparse-applicative reject the whole invocation before either
+    # node is contacted. Scripts opt out with PARITY_OUTPUT_JSON=0.
+    local fmt_args=()
+    [ "${PARITY_OUTPUT_JSON:-1}" = "1" ] && fmt_args+=(--output-json)
+
     local dugite_out cardano_out dugite_rc cardano_rc
     dugite_out=$(cardano-cli conway query "${cli_args[@]}" \
                     --testnet-magic "$LD_MAGIC" \
                     --socket-path "$LD_DUGITE_BP_SOCK" \
-                    --output-json 2>&1) && dugite_rc=0 || dugite_rc=$?
+                    "${fmt_args[@]}" 2>&1) && dugite_rc=0 || dugite_rc=$?
     cardano_out=$(cardano-cli conway query "${cli_args[@]}" \
                     --testnet-magic "$LD_MAGIC" \
                     --socket-path "$LD_CARDANO_BP_SOCK" \
-                    --output-json 2>&1) && cardano_rc=0 || cardano_rc=$?
+                    "${fmt_args[@]}" 2>&1) && cardano_rc=0 || cardano_rc=$?
 
     if [ "$dugite_rc" -ne 0 ] || [ "$cardano_rc" -ne 0 ]; then
-        local note="dugite_rc=$dugite_rc cardano_rc=$cardano_rc"
-        [ "$dugite_rc" -ne 0 ] && note="dugite ERROR: $(echo "$dugite_out" | head -1)"
+        # Attribute the failure to the side that actually failed. Both sides
+        # run the SAME cardano-cli binary with the SAME arguments and differ
+        # only in --socket-path, so a both-sides failure is the harness's own
+        # invocation being wrong (bad flag, missing required arg, unreadable
+        # file) — never a dugite gap. Blanket-labelling it "dugite ERROR" is
+        # what made #900 look like four dugite-cli defects.
+        local note
+        if [ "$dugite_rc" -ne 0 ] && [ "$cardano_rc" -ne 0 ]; then
+            note="HARNESS both-sides-failed rc=$dugite_rc/$cardano_rc: $(echo "$cardano_out" | head -1)"
+        elif [ "$dugite_rc" -ne 0 ]; then
+            note="dugite ERROR rc=$dugite_rc: $(echo "$dugite_out" | head -1)"
+        else
+            note="cardano ERROR rc=$cardano_rc: $(echo "$cardano_out" | head -1)"
+        fi
         parity_record "$query_name" "ERROR" "error" "error" "$note"
         return 2
     fi
@@ -157,10 +177,18 @@ parity_record() {
     if [ "$status" = "DIVERGENT" ] && [[ -v "KNOWN_DIVERGENCES[$qname]" ]]; then
         notes="known-divergence:${KNOWN_DIVERGENCES[$qname]} ${notes}"
     fi
-    printf '%s,%s,%s,%s,%s,%s\n' \
+    # `equal` is derived from the STATUS, not from a sha compare. ERROR rows
+    # carry the sentinel sha "error" on both sides, so the old
+    # `[ "$dsha" = "$csha" ]` test scored every failed query as equal=true.
+    local equal
+    case "$status" in
+        EQUAL) equal=true  ;;
+        SKIP)  equal=skip  ;;   # nothing was compared; not a failure
+        *)     equal=false ;;   # DIVERGENT, ERROR
+    esac
+    printf '%s,%s,%s,%s,%s,%s,%s\n' \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        "$qname" "$dsha" "$csha" \
-        "$([ "$dsha" = "$csha" ] && echo true || echo false)" \
+        "$qname" "$status" "$dsha" "$csha" "$equal" \
         "${notes//,/;}" \
         >> "$PARITY_CSV"
     local icon

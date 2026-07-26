@@ -136,7 +136,7 @@ tail -F logs/cardano-bp.log   | grep -E 'AddedToCurrentChain|AddBlockValidation\
 - `health-probe.sh` returns HEALTHY at end-of-round AND at every ≤60s sample during the soak (network throughput + Haskell-tip parity included)
 - `metric-audit.sh` exits 0 at end-of-round (all ~30 metric assertions pass: completeness, arithmetic invariants, counter monotonicity, BP↔relay parity, Haskell parity, range checks)
 - `analyze-evidence.sh` reports no anomalies
-- `evidence/<ts>/cli-parity.csv` has zero DIVERGENT rows that are not filed as known-divergence issues
+- `evidence/<ts>/cli-parity.csv` has zero DIVERGENT rows that are not filed as known-divergence issues, **and zero ERROR rows** (`09-cli-parity/run.sh` now exits 1 on either). An ERROR row noted `HARNESS both-sides-failed` means the suite passed cardano-cli arguments it does not accept — fix the `09*.sh` script, do not add it to `KNOWN_DIVERGENCES`
 - `evidence/<ts>/n2n-trace.csv` has zero PANIC or SILENT_SKIP rows
 - Bidirectional parity wrapper (`bidirectional-parity.sh 01-bookkeeping 04-stake 06-proposals 08-negative`) exits 0 — every script is classified identically across both sockets in `evidence/<ts>/parity-matrix.csv` (zero `OFFDIAG` rows)
 - `tx-zoo/state/cross-validate.csv` shows PASS for every representative tx submitted through `dugite-cli`
@@ -349,7 +349,7 @@ just devnet-validate-extended
 
 | File | Written by | Content |
 |------|-----------|---------|
-| `cli-parity.csv` | `09-cli-parity/run.sh` | query, dugite_sha, cardano_sha, equal |
+| `cli-parity.csv` | `09-cli-parity/run.sh` | ts, query, status, dugite_sha, cardano_sha, equal, notes |
 | `n2n-trace.csv` | `protocols/run.sh` | protocol, msg_type, outcome, notes |
 | `throughput.csv` | `sync/*.sh` | ts, scenario, blocks, seconds, blocks/sec, MB/sec |
 | `resource-samples.csv` | `perf/resource-health.sh` | ts, pid, node, cpu%, rss_kb, fds, threads |

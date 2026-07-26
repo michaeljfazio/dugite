@@ -23,4 +23,7 @@ t = datetime.datetime.fromisoformat('${FIXED_TIME%Z}').replace(tzinfo=datetime.t
 t += datetime.timedelta(seconds=1000 * ${SLOT_LEN%.*})
 print(t.strftime('%Y-%m-%dT%H:%M:%SZ'))")
 
-parity_query_json "slot-number" "slot-number" "--utc-time" "$QUERY_TIME"
+# cardano-cli 11.0.0.0: `query slot-number` takes the timestamp POSITIONALLY
+# (usage: ... --socket-path SOCKET_PATH [--volatile-tip|--immutable-tip] TIMESTAMP)
+# and has no output-format flag, so --output-json must not be sent either.
+PARITY_OUTPUT_JSON=0 parity_query_json "slot-number" "slot-number" "$QUERY_TIME"

@@ -6,7 +6,11 @@
 #   ./run.sh <evidence_dir>          — write cli-parity.csv to specified dir
 #   PARITY_IGNORE_FAIL=1 ./run.sh    — run all checks, exit 0 even on divergence
 #
-# Exit codes: 0 = all EQUAL/SKIP; 1 = ≥1 DIVERGENT (not a known divergence); 2 = setup error
+# Exit codes: 0 = all EQUAL/SKIP; 1 = ≥1 unexplained DIVERGENT or ≥1 ERROR;
+#             2 = setup error
+#
+# CSV columns: ts,query,status,dugite_sha256,cardano_sha256,equal,notes
+# where status ∈ {EQUAL, DIVERGENT, SKIP, ERROR} and is authoritative.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -58,11 +62,13 @@ for script in "$SCRIPT_DIR"/09*.sh; do
     run_check "$script"
 done
 
-# Tally from CSV
+# Tally from CSV. Column 3 is the authoritative status
+# (ts,query,status,dugite_sha256,cardano_sha256,equal,notes).
 if [ -f "$PARITY_CSV" ]; then
-    EQUAL=$(awk -F, 'NR>1 && $5=="true"  {c++} END{print c+0}' "$PARITY_CSV")
-    DIVERGENT_CSV=$(awk -F, 'NR>1 && $5=="false" && $6!~/skip/ && $6!~/^known-divergence:/ {c++} END{print c+0}' "$PARITY_CSV")
-    SKIPS=$(awk -F, 'NR>1 && $6~/^skip/ {c++} END{print c+0}' "$PARITY_CSV")
+    EQUAL=$(awk -F, 'NR>1 && $3=="EQUAL" {c++} END{print c+0}' "$PARITY_CSV")
+    DIVERGENT_CSV=$(awk -F, 'NR>1 && $3=="DIVERGENT" && $7!~/^known-divergence:/ {c++} END{print c+0}' "$PARITY_CSV")
+    SKIPS=$(awk -F, 'NR>1 && $3=="SKIP" {c++} END{print c+0}' "$PARITY_CSV")
+    ERRORS=$(awk -F, 'NR>1 && $3=="ERROR" {c++} END{print c+0}' "$PARITY_CSV")
 fi
 
 log_info ""
@@ -76,15 +82,35 @@ log_info ""
 
 DIVERGENT_FINAL="${DIVERGENT_CSV:-$DIVERGENT}"
 
-if [ "$DIVERGENT_FINAL" -gt 0 ] && [ "${PARITY_IGNORE_FAIL:-0}" != "1" ]; then
+FAILED=0
+
+if [ "$DIVERGENT_FINAL" -gt 0 ]; then
     log_error "FAIL: $DIVERGENT_FINAL divergent queries — check $PARITY_CSV for details"
     log_error "File a known-divergence issue for each divergence found."
-    log_error "Add the tracking URL to KNOWN_DIVERGENCES[] in the relevant 09*.sh script."
-    exit 1
+    log_error "Add the tracking URL to KNOWN_DIVERGENCES[] in lib.sh."
+    FAILED=1
 fi
 
+# ERROR rows are failures, not warnings. They used to be tolerated on the
+# assumption that "the node may not implement them yet", which is how the four
+# rows in #900 went untracked for a whole release — and all four turned out to
+# be this harness passing arguments cardano-cli 11.0.0.0 does not accept, with
+# both sides failing identically. There is no such thing as an acceptable ERROR
+# row: either the query works on both sides, or it is recorded as SKIP with a
+# reason. This is what holds cli-parity.csv to zero unexplained rows.
 if [ "$ERRORS" -gt 0 ]; then
-    log_warn "WARNING: $ERRORS queries returned errors (node may not implement them yet)"
+    log_error "FAIL: $ERRORS queries errored — check $PARITY_CSV for details"
+    awk -F, 'NR>1 && $3=="ERROR" {print "  " $2 ": " $7}' "$PARITY_CSV" >&2
+    log_error "A 'HARNESS both-sides-failed' note means the invocation is wrong,"
+    log_error "not that dugite is missing anything. Fix the 09*.sh script."
+    FAILED=1
+fi
+
+if [ "$FAILED" -ne 0 ] && [ "${PARITY_IGNORE_FAIL:-0}" != "1" ]; then
+    exit 1
+fi
+if [ "$FAILED" -ne 0 ]; then
+    log_warn "PARITY_IGNORE_FAIL=1 set — reporting PASS despite failures above"
 fi
 
 log_info "PASS: CLI parity check complete"
