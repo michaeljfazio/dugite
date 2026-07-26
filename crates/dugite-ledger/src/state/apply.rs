@@ -2140,6 +2140,7 @@ impl LedgerState {
                 pending_pp_updates_cleared: self.epochs.pending_pp_updates.is_empty()
                     && self.epochs.future_pp_updates.is_empty(),
                 epoch_nonce: self.consensus.epoch_nonce,
+                previous_epoch_nonce: self.consensus.previous_epoch_nonce,
                 last_epoch_block_nonce: self.consensus.last_epoch_block_nonce,
                 extra_entropy: self.consensus.extra_entropy,
                 reward_credits: std::collections::HashMap::new(),

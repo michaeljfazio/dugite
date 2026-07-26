@@ -614,6 +614,7 @@ pub fn minimal_haskell_state_for_test(
         evolving_nonce: Hash32::ZERO,
         candidate_nonce: Hash32::ZERO,
         epoch_nonce: Hash32::ZERO,
+        previous_epoch_nonce: Hash32::ZERO,
         lab_nonce: Hash32::ZERO,
         last_epoch_block_nonce: Hash32::ZERO,
     };

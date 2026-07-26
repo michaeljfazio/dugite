@@ -123,6 +123,9 @@ pub struct LedgerStateSnapshot {
     pub candidate_nonce: Hash32,
     /// Current epoch nonce.
     pub epoch_nonce: Hash32,
+    /// Epoch nonce as it stood before the most recent epoch rotation
+    /// (`praosStatePreviousEpochNonce`). Added in SNAPSHOT_VERSION 30 (#902).
+    pub previous_epoch_nonce: Hash32,
     /// LAB nonce: prev_hash of the most recent block.
     pub lab_nonce: Hash32,
     /// Snapshot of lab_nonce at epoch boundary.
@@ -283,6 +286,7 @@ impl From<&super::LedgerState> for LedgerStateSnapshot {
             evolving_nonce: s.consensus.evolving_nonce,
             candidate_nonce: s.consensus.candidate_nonce,
             epoch_nonce: s.consensus.epoch_nonce,
+            previous_epoch_nonce: s.consensus.previous_epoch_nonce,
             lab_nonce: s.consensus.lab_nonce,
             last_epoch_block_nonce: s.consensus.last_epoch_block_nonce,
             extra_entropy: s.consensus.extra_entropy,
@@ -373,6 +377,7 @@ impl From<LedgerStateSnapshot> for super::LedgerState {
                 evolving_nonce: s.evolving_nonce,
                 candidate_nonce: s.candidate_nonce,
                 epoch_nonce: s.epoch_nonce,
+                previous_epoch_nonce: s.previous_epoch_nonce,
                 lab_nonce: s.lab_nonce,
                 last_epoch_block_nonce: s.last_epoch_block_nonce,
                 extra_entropy: s.extra_entropy,

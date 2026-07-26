@@ -456,7 +456,10 @@ impl LedgerState {
     /// (observed on preprod: ~396k votes on a single InfoAction). The map
     /// gives O(log n) last-wins inserts, matching Haskell's `Map voter Vote`.
     /// Serialized layout changes for every snapshot with any recorded votes.
-    pub(crate) const SNAPSHOT_VERSION: u8 = 29;
+    /// v30 (#902): `ConsensusSubState` gained `previous_epoch_nonce`
+    /// (`praosStatePreviousEpochNonce`). Snapshots written by v29 and earlier
+    /// do not carry it, so they must be replayed rather than loaded.
+    pub(crate) const SNAPSHOT_VERSION: u8 = 30;
 
     /// Save ledger state snapshot to disk using bincode serialization.
     ///

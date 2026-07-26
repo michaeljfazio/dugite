@@ -486,6 +486,12 @@ pub struct EpochTransitionDelta {
     pub pending_pp_updates_cleared: bool,
     /// Epoch nonce updated at the transition.
     pub epoch_nonce: Hash32,
+    /// `previous_epoch_nonce` after this transition (absolute snapshot, not a
+    /// delta). Captured unconditionally for the same reason `extra_entropy` is
+    /// (#782): a fork rollback across an epoch boundary must restore it, or the
+    /// next `DebugChainDepState` response reports a nonce from an abandoned
+    /// chain. See #902.
+    pub previous_epoch_nonce: Hash32,
     /// New last_epoch_block_nonce.
     pub last_epoch_block_nonce: Hash32,
     /// `consensus.extra_entropy` after this transition (Shelley `ppExtraEntropy`,
@@ -1446,6 +1452,7 @@ fn apply_epoch_transition_delta(state: &mut LedgerState, et: &EpochTransitionDel
     state.epochs.prev_d = et.prev_d.clone();
     state.epochs.prev_protocol_version_major = et.prev_protocol_version_major;
     state.consensus.epoch_nonce = et.epoch_nonce;
+    state.consensus.previous_epoch_nonce = et.previous_epoch_nonce;
     state.consensus.last_epoch_block_nonce = et.last_epoch_block_nonce;
     state.consensus.extra_entropy = et.extra_entropy;
     state.certs.stake_distribution = et.stake_distribution.clone();
