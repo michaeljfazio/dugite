@@ -22,10 +22,22 @@ fi
 if ! [ -S "$LD_CARDANO_BP_SOCK" ]; then
     die "cardano-bp socket missing — devnet not running. Run ./run.sh first."
 fi
-if [ -S "$LD_DUGITE_BP_SOCK" ]; then
-    die "dugite-bp socket still present — process is alive. Kill it first."
+# Refuse to start a second dugite-bp, but decide that on the PROCESS, not on
+# the socket file. dugite-node does not unlink its N2C socket on SIGTERM, so
+# after a clean stop the socket path still exists — this guard used to read
+# that as "process is alive" and abort every Round 3 restart. It was also
+# self-contradictory: the very next line rm -f's the socket it just refused to
+# proceed past.
+#
+# Match the process the way stop.sh and the skill's hard-rules do: by command
+# line. $LD_STATE/dugite-bp.pid is NOT usable here — on macOS it holds the
+# caffeinate wrapper's PID and the node is its child.
+EXISTING_BP="$(pgrep -f "dugite-node run .*dugite-bp" || true)"
+if [ -n "$EXISTING_BP" ]; then
+    die "dugite-bp still running (pid $EXISTING_BP) — SIGTERM it first (never -9: it corrupts the append-only ImmutableDB)."
 fi
 
+# Stale socket + pidfile from the stopped instance.
 rm -f "$LD_DUGITE_BP_SOCK" "$LD_STATE/dugite-bp.pid"
 
 log_info "Relaunching dugite-bp (port $LD_DUGITE_BP_PORT, metrics $LD_DUGITE_BP_METRICS_PORT)"
