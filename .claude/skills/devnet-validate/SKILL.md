@@ -224,24 +224,55 @@ If Round 3 stalls past 60s, suspect the stale-intersection bug (memory: `project
 
 After all rounds complete, generate a machine-parseable + GitHub-release-ready report:
 
+Collecting the rounds needs care for two reasons:
+
+1. **Only the CURRENT round lives in `evidence/`.** Each round starts with
+   `./setup.sh`, which moves the previous round's evidence into
+   `evidence-archive/auto/` (it used to delete it, which made every round but
+   the last unreportable). So after three rounds you have one directory in
+   `evidence/` and the earlier two in `evidence-archive/auto/`.
+2. **A round can produce more than one evidence directory.** `09-cli-parity/`
+   and `protocols/` create their own before the soak does. Those hold
+   `cli-parity.csv` / `n2n-trace.csv` but no `report.md`, and must not be
+   counted as rounds.
+
+The reliable predicate is therefore "directory containing `report.md`" — that
+file is written by `verify.sh`, once per round.
+
 ```bash
 cd testnet/local-devnet
 
-# Collect the evidence directories for each completed round (most-recent first)
-EVD_ROUND3=$(ls -t evidence | sed -n '1p')
-EVD_ROUND2=$(ls -t evidence | sed -n '2p')
-EVD_ROUND1=$(ls -t evidence | sed -n '3p')
+# Reportable round dirs across both locations, oldest first, last 3 only.
+# Basenames are ISO-8601, so a lexicographic sort is chronological, which for a
+# sequential run is round order.
+ROUND_DIRS=$(
+  for d in evidence/*/ evidence-archive/auto/*/; do
+    [ -d "$d" ] && [ -f "${d}report.md" ] && printf '%s\t%s\n' "$(basename "$d")" "${d%/}"
+  done | sort | cut -f2 | tail -3
+)
+EVD_ROUND1=$(echo "$ROUND_DIRS" | sed -n '1p')
+EVD_ROUND2=$(echo "$ROUND_DIRS" | sed -n '2p')
+EVD_ROUND3=$(echo "$ROUND_DIRS" | sed -n '3p')
+[ -n "$EVD_ROUND1" ] && [ -n "$EVD_ROUND2" ] && [ -n "$EVD_ROUND3" ] || {
+    echo "expected 3 rounds with report.md, got:"; echo "$ROUND_DIRS"; exit 1; }
 
 # Optionally pass the previous release report for trend comparison:
-# --previous-report ../../reports/devnet-validate/v1.7.0.json
+# --previous-report ../../reports/devnet-validate/v2.1.0.json
 
+# NB: these are full paths already — do NOT prefix them with evidence/.
 ../../.claude/skills/devnet-validate/scripts/generate-release-report.sh \
     --preset standard \
     --round-names "baseline,epoch-boundary,restart" \
     --tx-zoo-state tx-zoo/state \
     --output-dir ../../reports/devnet-validate \
-    "evidence/$EVD_ROUND1" "evidence/$EVD_ROUND2" "evidence/$EVD_ROUND3"
+    "$EVD_ROUND1" "$EVD_ROUND2" "$EVD_ROUND3"
 ```
+
+Sanity-check the result before shipping it: each round's `tx_zoo.source` in
+`report.json` should be `"round"` (its own snapshot), not `"shared"`. A
+`"shared"` source means `soak.sh` did not snapshot `tx-results.csv` for that
+round, and the per-round transaction counts are the cumulative ledger rather
+than that round's.
 
 This writes two files:
 - `reports/devnet-validate/report.json` — schema-versioned, suitable for trend tracking and CI diffing
