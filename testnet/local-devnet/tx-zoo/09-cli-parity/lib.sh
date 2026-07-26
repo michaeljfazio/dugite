@@ -36,30 +36,33 @@ _parity_ensure_csv() {
 # Maps query name → tracking issue URL.
 # Populated by individual test scripts using: KNOWN_DIVERGENCES[name]=url
 declare -gA KNOWN_DIVERGENCES=(
-    # All tracked under the umbrella issue #597 until each query is fixed.
-    #
     # This array is ONLY for real divergences — both sides answered, the
     # answers differ. It must never be used to paper over an ERROR row: an
     # ERROR means cardano-cli refused the invocation or could not reach a
     # node, which is a harness bug, not a dugite behaviour to track. See #900.
     #
-    # Remaining divergences pending deeper fixes:
-    ["protocol-parameters"]="https://github.com/michaeljfazio/dugite/issues/597"
-    ["stake-distribution"]="https://github.com/michaeljfazio/dugite/issues/597"
-    ["gov-state"]="https://github.com/michaeljfazio/dugite/issues/597"
-    # Newly surfaced in Round-1 retry 2026-05-28; tracked under the same
-    # umbrella issue until each gets its own. drep-stake-distribution
-    # diverges in the per-DRep ordering; future-pparams in the no-pending-
-    # proposal "null" envelope shape.
-    ["drep-stake-distribution"]="https://github.com/michaeljfazio/dugite/issues/597"
-    ["future-pparams"]="https://github.com/michaeljfazio/dugite/issues/597"
+    # Tracked under #905, NOT #597 -- #597 was closed 2026-05-22 and these were
+    # re-added against it on 2026-05-28, so nothing was watching them. #597's
+    # fixes also all targeted dugite-cli, which this suite never invokes: it
+    # runs cardano-cli against BOTH sockets, so what it measures is
+    # dugite-NODE's LSQ responses.
+    ["protocol-parameters"]="https://github.com/michaeljfazio/dugite/issues/905"
+    ["stake-distribution"]="https://github.com/michaeljfazio/dugite/issues/905"
+    # Proposal sets genuinely differ -- dugite ratifies a ParameterChange an
+    # epoch early and drops its sibling. Same root cause as the proposals row.
+    ["gov-state"]="https://github.com/michaeljfazio/dugite/issues/903"
+    # drep-stake-distribution diverges in the per-DRep ordering; future-pparams
+    # in the no-pending-proposal "null" envelope shape. Neither is characterised
+    # at field level yet -- the next run writes cli-parity-diffs/ for that.
+    ["drep-stake-distribution"]="https://github.com/michaeljfazio/dugite/issues/905"
+    ["future-pparams"]="https://github.com/michaeljfazio/dugite/issues/905"
     # Root-caused 2026-07-26: the "error" protocolVersion is the 7-vs-8-field
     # PraosState encoder, same bug as the kes-period-info error below. Retargeted
     # off the #597 umbrella onto the specific issue so both close together.
     ["protocol-state/version"]="https://github.com/michaeljfazio/dugite/issues/902"
-    # dugite drops every ParameterChange proposal from gov state (6 vs 8 at an
-    # identical tip). Real governance divergence, found once #900 stopped the
-    # missing --all-proposals selector from masking this row as an ERROR.
+    # dugite ratifies a ParameterChange in the epoch it was submitted and drops
+    # the sibling, so the live sets differ (6 vs 8 at an identical tip). Found
+    # once #900 stopped the missing --all-proposals selector masking this row.
     ["proposals"]="https://github.com/michaeljfazio/dugite/issues/903"
     # NB: slot-number and treasury were listed here until 2026-07-26. They never
     # diverged — cardano-cli rejected the harness's own arguments, both sides
@@ -172,11 +175,29 @@ parity_query_json() {
         note=""
     else
         equal="false"
+        # Capture BOTH sides plus a unified diff next to the CSV.
+        #
+        # Recording only sha256 pairs made every divergence opaque: the row told
+        # you something differed but not what, so triaging one meant re-running
+        # the whole devnet by hand. That is how five rows sat parked on the
+        # closed #597 for two months without anyone able to say what they were.
+        # `jq -S .` (indented, key-sorted) makes the diff readable rather than
+        # one enormous line.
+        local diff_dir="$(dirname "$PARITY_CSV")/cli-parity-diffs"
+        mkdir -p "$diff_dir"
+        local safe_name="${query_name//\//_}"
+        printf '%s\n' "$dugite_out"  | jq -S . 2>/dev/null > "$diff_dir/${safe_name}.dugite.json"  || printf '%s\n' "$dugite_out"  > "$diff_dir/${safe_name}.dugite.json"
+        printf '%s\n' "$cardano_out" | jq -S . 2>/dev/null > "$diff_dir/${safe_name}.cardano.json" || printf '%s\n' "$cardano_out" > "$diff_dir/${safe_name}.cardano.json"
+        diff -u "$diff_dir/${safe_name}.cardano.json" "$diff_dir/${safe_name}.dugite.json" \
+            > "$diff_dir/${safe_name}.diff" 2>/dev/null || true
+        local diff_lines
+        diff_lines=$(grep -cE '^[+-][^+-]' "$diff_dir/${safe_name}.diff" 2>/dev/null || echo 0)
+
         # Check if this is a known divergence
         if [[ -v "KNOWN_DIVERGENCES[$query_name]" ]]; then
-            note="known-divergence:${KNOWN_DIVERGENCES[$query_name]}"
+            note="known-divergence:${KNOWN_DIVERGENCES[$query_name]} difflines=${diff_lines}"
         else
-            note="DIVERGENT"
+            note="DIVERGENT difflines=${diff_lines}"
         fi
     fi
 
