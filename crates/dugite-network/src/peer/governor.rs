@@ -690,7 +690,7 @@ impl Governor {
         let in_progress_warm_to_hot = self.in_progress_promote_warm.len();
         let effective_hot_count = hot_count + in_progress_warm_to_hot;
         if effective_hot_count > self.config.targets.target_hot {
-            use super::selection::peer_score;
+            use super::selection::hot_demotion_rank;
 
             let excess = effective_hot_count - self.config.targets.target_hot;
             // Candidates: already-Hot peers (not local root, not BLP — BLP
@@ -706,6 +706,15 @@ impl Governor {
             // the peer for the duration of a single download; as soon as it
             // releases the slot (after each batch) another peer may claim it and
             // receive the same protection on the next tick.
+            //
+            // #909: the identity exclusion alone leaves a gap — the slot is
+            // released BETWEEN batches, and the pre-#909 rank (`peer_score`)
+            // actively punished the downloader because keepalive RTT inflates
+            // under its own bulk transfer.  The rank is now
+            // `hot_demotion_rank`, which in bulk-sync mode sorts by
+            // fetchyness-bytes ascending exactly as Haskell's
+            // `simpleChurnModePeerSelectionPolicy` does, so the downloader is
+            // structurally last even in the between-batches window.
             let mut scored: Vec<(SocketAddr, f64)> = peer_manager
                 .peers_in_state(PeerState::Hot)
                 .into_iter()
@@ -724,7 +733,7 @@ impl Governor {
                     }
                     peer_manager
                         .get_peer(&addr)
-                        .map(|info| (addr, peer_score(info)))
+                        .map(|info| (addr, hot_demotion_rank(info, self.bulk_sync_mode)))
                 })
                 .collect();
             scored.sort_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -785,7 +794,15 @@ impl Governor {
         // The cadence is faster while bulk-syncing (catch-up) than when caught
         // up, mirroring Haskell's BulkSync vs Deadline churn intervals.
         if self.last_hot_churn.elapsed() >= self.effective_hot_churn_interval() && hot_count > 1 {
-            if let Some(churn_out) = select_worst_hot(peer_manager) {
+            // #909: the churn-rotation path had NO fetch-slot exclusion at all
+            // (only Topology peers were protected) and ranked by `peer_score`,
+            // so at the bulk-sync cadence it could rotate out the live
+            // downloader. Rank by fetchyness and exclude the slot holder, same
+            // as `aboveTargetOther` above.
+            let fetch_exclusion: HashSet<SocketAddr> = active_fetch_peer.into_iter().collect();
+            if let Some(churn_out) =
+                select_worst_hot(peer_manager, self.bulk_sync_mode, &fetch_exclusion)
+            {
                 actions.push(GovernorAction::DemoteToWarm(churn_out));
                 self.record_demote(churn_out, now);
             }
@@ -2571,6 +2588,85 @@ mod tests {
         assert!(
             !demoted.contains(&fetcher_addr),
             "active fetcher must NOT be demoted by aboveTargetOther"
+        );
+    }
+
+    /// #909: BETWEEN batches the fetch slot is released, so `active_fetch_peer`
+    /// is `None` and the identity exclusion cannot help. In bulk-sync mode the
+    /// ranking itself must protect the downloader: `hot_demotion_rank` sorts by
+    /// `fetchynessBytes` ascending, mirroring Haskell's
+    /// `simpleChurnModePeerSelectionPolicy` under `FetchModeBulkSync`.
+    ///
+    /// The downloader is given the WORST latency on purpose — that is exactly
+    /// what happens in production, because its keepalive pings queue behind its
+    /// own 2048-block payload stream, and it is why the pre-#909 `peer_score`
+    /// ranking demoted the busiest peer mid-sync (`3.12.62.57:3001`).
+    #[test]
+    fn bulk_sync_above_target_other_demotes_by_fetchyness_not_latency() {
+        let downloader = test_addr(3001);
+        let idle_a = test_addr(3002);
+        let idle_b = test_addr(3003);
+
+        let build = || {
+            let mut pm = PeerManager::new();
+            for addr in [downloader, idle_a, idle_b] {
+                pm.add_peer(addr, PeerSource::Dns);
+                pm.promote_to_warm(&addr);
+                pm.promote_to_hot(&addr);
+                pm.get_peer_mut(&addr).unwrap().reputation = 0.5;
+            }
+            // Downloader: awful RTT (self-inflicted), all the bytes.
+            pm.get_peer_mut(&downloader)
+                .unwrap()
+                .update_latency(2_000.0);
+            pm.record_fetched_bytes(&downloader, 64 * 1024 * 1024);
+            // Idle peers: pristine RTT, no bytes.
+            pm.get_peer_mut(&idle_a).unwrap().update_latency(20.0);
+            pm.get_peer_mut(&idle_b).unwrap().update_latency(25.0);
+            pm
+        };
+
+        let config = GovernorConfig {
+            targets: PeerTargets {
+                target_warm: 10,
+                target_hot: 2,
+                max_cold: 100,
+                ..Default::default()
+            },
+            hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
+            cold_churn_interval: Duration::from_secs(3600),
+            warm_churn_interval: Duration::from_secs(3600),
+            demote_cooldown: Duration::from_secs(3600),
+        };
+
+        let demotions = |gov: &mut Governor, pm: &PeerManager| -> Vec<SocketAddr> {
+            gov.compute_actions_with_blp(pm, &[], &HashSet::new(), &HashSet::new(), None)
+                .iter()
+                .filter_map(|a| match a {
+                    GovernorAction::DemoteToWarm(addr) => Some(*addr),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // Deadline (at tip): latency is a legitimate quality signal, so the
+        // high-RTT peer is the worst — the pre-#909 behaviour, preserved.
+        let pm = build();
+        let mut gov = Governor::new(config.clone());
+        gov.set_bulk_sync_mode(false);
+        let demoted = demotions(&mut gov, &pm);
+        assert_eq!(demoted, vec![downloader]);
+
+        // Bulk sync: the peer that fetched nothing goes, NOT the downloader.
+        let pm = build();
+        let mut gov = Governor::new(config);
+        gov.set_bulk_sync_mode(true);
+        let demoted = demotions(&mut gov, &pm);
+        assert_eq!(demoted.len(), 1, "exactly one excess peer is demoted");
+        assert!(
+            !demoted.contains(&downloader),
+            "bulk-sync demotion must not evict the peer serving the blocks; got {demoted:?}"
         );
     }
 

@@ -4258,6 +4258,166 @@ pub(crate) fn classify_intersect_response(msg: &ChainSyncMessage) -> IntersectOu
     }
 }
 
+/// Budget for the post-cancel ChainSync pipeline drain (#910).
+///
+/// Must stay comfortably under `PeerConnection::PROTOCOL_SHUTDOWN_TIMEOUT`
+/// (5 s — dugite's `spsDeactivateTimeout`) so a drain that cannot complete
+/// still lets the task exit normally and report the failure, rather than being
+/// abort-killed mid-drain by the deactivation timeout.
+pub(crate) const CHAINSYNC_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Drain budget when the last server message was `MsgAwaitReply` (#910).
+///
+/// In that state the protocol is at `StMustReply`: the one outstanding request
+/// is parked until the peer mints its next block, tens of seconds away. No
+/// budget we can afford would complete that drain — `demote_to_warm` holds the
+/// global peer-manager write lock across it — so fail fast and let the demotion
+/// escalate to a TCP close. The window is still non-zero so a block that is
+/// already arriving is picked up.
+pub(crate) const CHAINSYNC_DRAIN_TIMEOUT_AT_TIP: std::time::Duration =
+    std::time::Duration::from_millis(250);
+
+/// Drain budget for a cancellation observed in state `at_tip`.
+pub(crate) fn chainsync_drain_budget(at_tip: bool) -> std::time::Duration {
+    if at_tip {
+        CHAINSYNC_DRAIN_TIMEOUT_AT_TIP
+    } else {
+        CHAINSYNC_DRAIN_TIMEOUT
+    }
+}
+
+/// How deep the ChainSync pipeline may run, given the currently-known gap
+/// between our candidate tip and the peer's reported tip (#910).
+///
+/// # Haskell alignment
+///
+/// `Ouroboros.Network.Protocol.ChainSync.PipelineDecision`'s
+/// `pipelineDecisionLowHighMark` decides `Pipeline` vs `Collect` vs `Request`
+/// from BOTH the current depth `n` AND the block-number distance between the
+/// client's tip and the server's tip. When the client has caught up
+/// (`cliTipBlockNo >= srvTipBlockNo`) it stops pipelining and issues plain
+/// non-pipelined requests, so the pipeline sits at depth `Z` (zero) at the tip.
+/// That is what makes `drainThePipe`-before-`MsgDone` cheap in cardano-node.
+///
+/// Dugite used to blast `high_mark` (default 300) `MsgRequestNext` at session
+/// start and refill to `high_mark` whenever `!at_tip`, with no gap term. At the
+/// tip that parks 200–300 unanswered requests in the server's read queue
+/// indefinitely — the server only answers them as new blocks are minted — so a
+/// demotion could never drain, and the residue landed on the next session's
+/// resubscribed channel (the observed `317 stale next-phase responses in
+/// StIntersect`, 45 reconnects in one 19 h preprod log).
+///
+/// The floor of 1 is Haskell's `Request` case: even with no known gap we keep
+/// exactly one request outstanding so the server has something to answer when
+/// the next block arrives, and the loop can never wedge on a zero-depth
+/// pipeline.
+pub(crate) fn pipeline_target_depth(gap_blocks: u64, high_mark: usize) -> usize {
+    gap_blocks.min(high_mark as u64).max(1) as usize
+}
+
+/// Drain every outstanding pipelined ChainSync response, then send `MsgDone`
+/// (#910).
+///
+/// # Haskell alignment
+///
+/// `Ouroboros/Network/Protocol/ChainSync/ClientPipelined.hs` makes `SendMsgDone`
+/// constructible **only** at pipeline depth `Z`; the consensus client's
+/// `drainThePipe` (`ChainSync/Client.hs`, `terminateAfterDrain`) therefore
+/// collects and discards every outstanding pipelined response before
+/// terminating. `PeerStateActions.deactivatePeerConnection` then waits for the
+/// protocol to finish before the peer becomes Warm with the mux still alive,
+/// and `network-mux`'s `runMiniProtocol` refuses to start a new instance unless
+/// the previous one is `StatusIdle`. Together those three make it structurally
+/// impossible for a fresh ChainSync instance to receive a frame belonging to
+/// the prior instance.
+///
+/// Dugite's analogue: this drain runs in the client task's cancellation arm,
+/// and `demote_to_warm` only reuses (resubscribes) the mux when the drain
+/// reported success — otherwise it falls back to a full TCP close, mirroring
+/// Haskell's `Mux.stop` escalation on `spsDeactivateTimeout`.
+///
+/// `MsgAwaitReply` does NOT consume a pipelined request (the server still owes
+/// the eventual `MsgRollForward`/`MsgRollBackward`), so it is discarded without
+/// decrementing — the same accounting the main loop uses.
+///
+/// Returns the number of frames discarded.
+pub(crate) async fn drain_pipeline_and_terminate(
+    channel: &mut MuxChannel,
+    peer_addr: SocketAddr,
+    mut outstanding: usize,
+    budget: std::time::Duration,
+) -> Result<usize, anyhow::Error> {
+    let mut discarded = 0usize;
+    let deadline = tokio::time::Instant::now() + budget;
+
+    while outstanding > 0 {
+        let data = tokio::time::timeout_at(deadline, channel.recv())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "ChainSync drain from {peer_addr} timed out with {outstanding} \
+                     responses still outstanding (discarded {discarded})"
+                )
+            })?
+            .map_err(|e| anyhow::anyhow!("ChainSync drain recv failed: {e}"))?;
+        let msg =
+            cs_decode(&data).map_err(|e| anyhow::anyhow!("ChainSync drain decode failed: {e}"))?;
+        discarded += 1;
+        match msg {
+            ChainSyncMessage::MsgRollForward { .. } | ChainSyncMessage::MsgRollBackward { .. } => {
+                outstanding -= 1;
+            }
+            // Server has no block yet; it still owes us the reply for this
+            // request, so the depth is unchanged.
+            ChainSyncMessage::MsgAwaitReply => {}
+            // Server terminated first — the protocol is already at StDone for
+            // both sides, so there is nothing left to drain and nothing to send.
+            ChainSyncMessage::MsgDone => {
+                debug!(
+                    %peer_addr,
+                    discarded,
+                    "ChainSync drain: server sent MsgDone first"
+                );
+                return Ok(discarded);
+            }
+            other => {
+                return Err(anyhow::anyhow!(
+                    "ChainSync drain from {peer_addr}: unexpected message {other:?} \
+                     (outstanding={outstanding})"
+                ));
+            }
+        }
+    }
+
+    // Depth is now Z — `MsgDone` is legal (and, in Haskell, only now
+    // constructible). Sending it leaves the server's responder idle so the mux
+    // can host a fresh ChainSync instance after the next Warm→Hot promotion.
+    channel
+        .send(cs_encode(&ChainSyncMessage::MsgDone))
+        .await
+        .map_err(|e| anyhow::anyhow!("ChainSync drain MsgDone send failed: {e}"))?;
+    Ok(discarded)
+}
+
+/// Is this the "the peer can only serve us from genesis" outcome? (#908)
+///
+/// Two wire results mean exactly the same thing once the deepest retry set —
+/// which always ends in `Origin` — has been offered:
+///
+/// * `Some(Origin)` — the peer accepted only the genesis anchor;
+/// * `None` — `MsgIntersectNotFound` for every point INCLUDING `Origin`, so the
+///   peer's read pointer is at genesis regardless.
+///
+/// Treating `None` as "sync from Origin and see what happens" (the pre-#908
+/// behaviour) wastes a round trip and defers the peer-quality verdict to
+/// whether the peer happens to deliver a genesis-region header before hanging
+/// up — which it usually does not, so the session died via the bearer and no
+/// backoff was ever recorded. Haskell classifies this as `ForkTooDeep` at the
+/// intersection, and so do we.
+pub(crate) fn intersection_is_genesis_only(intersection: Option<&CodecPoint>) -> bool {
+    matches!(intersection, None | Some(CodecPoint::Origin))
+}
+
 /// Read the reply to a `MsgFindIntersect` we just sent (the server is in
 /// `StIntersect`), tolerating a bounded number of STALE next-phase responses.
 ///
@@ -4800,6 +4960,13 @@ pub async fn chainsync_client_task(
     // ChainSync Jumping coordinator — `None` in praos mode or when
     // `EnableCSJ=false` (Haskell `noJumping`: every peer streams normally).
     csj: Option<Arc<crate::csj::CsjRegistry>>,
+    // #910 — set to `true` exactly when this session ended with the pipelined
+    // responses drained to zero and `MsgDone` sent (or the server having sent
+    // `MsgDone` first), i.e. when the mux's ChainSync instance is genuinely
+    // idle. `demote_to_warm` reuses (resubscribes) the bearer ONLY then;
+    // otherwise it escalates to a full TCP close, mirroring Haskell's
+    // `Mux.stop` on `spsDeactivateTimeout`.
+    drain_ok: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     // Register this peer's shared chain state for the lifetime of the task.
     // The anchor starts at Origin (no intersection yet): csLatestSlot=None
@@ -4965,15 +5132,22 @@ pub async fn chainsync_client_task(
         // INVARIANT: that tolerance is sound ONLY because we do NOT pipeline any
         // request before this read — do not add a pre-intersection
         // MsgRequestNext without revisiting `read_intersect_reply`.
-        // Bound the stale-residue discard by the pipeline window + margin: a
-        // demoted prior session can leave up to DUGITE_PIPELINE_DEPTH (default
-        // 300) RollForward responses in flight on a reused mux.
-        let max_stale_discard = std::env::var("DUGITE_PIPELINE_DEPTH")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(300)
-            .saturating_add(16);
-        read_intersect_reply(channel, peer_addr, max_stale_discard, metrics).await
+        //
+        // #910: since the demotion path now drains the pipeline to zero and
+        // sends `MsgDone` before the mux may be reused — and falls back to a
+        // full TCP close when it cannot — a reused mux should carry NO residue
+        // at all, matching Haskell (whose typed-protocols codec rejects a
+        // next-phase message in `StIntersect` outright). The former bound was
+        // `DUGITE_PIPELINE_DEPTH + 16` (316), which was both a divergence and,
+        // on its own terms, undersized: at the tip one `MsgRequestNext` can
+        // yield TWO messages (`MsgAwaitReply` plus the eventual roll), so the
+        // worst-case residue was ~2x depth and the bound was observed to blow
+        // (`317 stale next-phase responses ... (bound 316)`, 45x in one 19 h
+        // preprod log). The bound is now a small belt-and-braces margin: any
+        // residue at all is a bug or a misbehaving peer, and both are better
+        // surfaced as a reconnect than absorbed silently.
+        const MAX_STALE_INTERSECT_RESIDUE: u32 = 8;
+        read_intersect_reply(channel, peer_addr, MAX_STALE_INTERSECT_RESIDUE, metrics).await
     }
 
     // Attempt 1: use the known_points we built above.
@@ -5021,7 +5195,8 @@ pub async fn chainsync_client_task(
         if intersection.is_none() {
             info!(
                 %peer_addr,
-                "ChainSync no intersection after retries — syncing from Origin",
+                "ChainSync no intersection after retries — peer shares no history \
+                 above genesis with any offered point",
             );
         }
     }
@@ -5055,7 +5230,19 @@ pub async fn chainsync_client_task(
     // overlap with any of our offered points and our local chain is past k.
     //
     // See: docs/superpowers/specs/2026-05-16-bug-a-stale-intersection-fix.md
-    if matches!(intersection, Some(CodecPoint::Origin)) && ledger_tip != Point::Origin {
+    //
+    // #908(b): `MsgIntersectNotFound` for every offered point — including the
+    // deepest retry set, which ends in `Origin` — is the SAME outcome as an
+    // Origin intersection: the peer can only serve us from genesis. Dugite used
+    // to log "syncing from Origin" and stream anyway, which wastes a round trip
+    // and, worse, only surfaces as `PeerUnsuitable` if the peer actually
+    // delivers a genesis-region header first. In the observed preprod flap the
+    // peer hung up before that, so the ChainSync task died via the bearer
+    // instead of the classified path and NO backoff was recorded — the peer was
+    // re-promoted 2–6 s later, forever. Haskell classifies
+    // intersection-only-at-genesis as `ForkTooDeep` and demotes; so do we,
+    // directly from the NotFound outcome.
+    if intersection_is_genesis_only(intersection.as_ref()) && ledger_tip != Point::Origin {
         let local_block_no = {
             let db = chain_db.read().await;
             db.get_tip_info().map(|(_, _, bn)| bn.0).unwrap_or(0)
@@ -5087,10 +5274,15 @@ pub async fn chainsync_client_task(
                  immutable tip / disjoint chain) — ending ChainSync, demoting \
                  for backoff (Haskell ForkTooDeep equivalent)"
             );
+            let outcome = if intersection.is_none() {
+                "no intersection found"
+            } else {
+                "intersection only at genesis"
+            };
             return Err(anyhow::Error::new(
                 super::connection_lifecycle::PeerUnsuitable {
                     reason: format!(
-                        "peer {peer_addr} ChainSync intersection only at genesis \
+                        "peer {peer_addr} ChainSync {outcome} \
                          (block_no={local_block_no} > k={security_param})"
                     ),
                 },
@@ -5101,6 +5293,7 @@ pub async fn chainsync_client_task(
             local_ledger_tip = %ledger_tip,
             local_block_no,
             security_param,
+            found_intersection = intersection.is_some(),
             "ChainSync intersection at Origin with non-Origin local chain — \
              accepting because local chain is within k blocks of genesis \
              (volatile window can absorb full rollback if peer's chain wins)"
@@ -5259,9 +5452,13 @@ pub async fn chainsync_client_task(
     // Phase 3: Pipeline headers with MsgRequestNext
     // ═══════════════════════════════════════════════════════════════════════
     //
-    // Send a burst of MsgRequestNext up to high_mark, then refill when
-    // outstanding drops to low_mark. This matches the Haskell pipelined
-    // ChainSync client behavior.
+    // Send a burst of MsgRequestNext, then refill when outstanding drops to
+    // low_mark. Depth is bounded by BOTH `high_mark` and the currently-known
+    // block gap to the peer's tip — see `pipeline_target_depth` (#910): at the
+    // tip the depth collapses to 1, exactly as Haskell's
+    // `pipelineDecisionLowHighMark` does, which is what makes the
+    // drain-before-MsgDone on demotion complete in milliseconds instead of
+    // never.
 
     // Pipeline depth: configurable via DUGITE_PIPELINE_DEPTH env var (default: 300).
     let high_mark: usize = std::env::var("DUGITE_PIPELINE_DEPTH")
@@ -5292,8 +5489,31 @@ pub async fn chainsync_client_task(
     let mut refill_ticker = tokio::time::interval(std::time::Duration::from_millis(100));
     refill_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // Send initial pipeline burst.
-    for _ in 0..high_mark {
+    // #910 gap tracking for `pipeline_target_depth`.
+    //
+    // `client_block_no` seeds from our own chain tip: the negotiated
+    // intersection is at or below it, so this can only UNDER-estimate the gap
+    // (a smaller pipeline, never a stalled one — the depth floor is 1), and it
+    // is corrected exactly by the first `MsgRollForward`, whose header carries
+    // the authoritative block number. `peer_tip_block_no` starts at 0 and is
+    // refreshed from the `tip_block_number` field every server message carries.
+    let mut client_block_no: u64 = {
+        let db = chain_db.read().await;
+        db.get_tip_info().map(|(_, _, bn)| bn.0).unwrap_or(0)
+    };
+    let mut peer_tip_block_no: u64 = 0;
+    let known_gap = |client: u64, peer_tip: u64| peer_tip.saturating_sub(client);
+
+    // Send the initial pipeline burst. We do not know the peer's tip block
+    // number until its first reply (the intersection reply carries a tip, but
+    // the server always follows intersection with `MsgRollBackward`, which
+    // carries it too), so open with a single request and let the first response
+    // size the pipeline. One extra round trip at session start is immaterial
+    // next to a full sync, and it is what stops a re-promoted at-tip peer from
+    // being handed 300 requests it can only answer over the following ~100
+    // minutes of block production.
+    const INITIAL_PIPELINE_DEPTH: usize = 1;
+    for _ in 0..INITIAL_PIPELINE_DEPTH {
         let req = cs_encode(&ChainSyncMessage::MsgRequestNext);
         channel
             .send(req)
@@ -5306,6 +5526,8 @@ pub async fn chainsync_client_task(
         %peer_addr,
         high_mark,
         low_mark,
+        initial_depth = INITIAL_PIPELINE_DEPTH,
+        client_block_no,
         "ChainSync pipeline started",
     );
 
@@ -5379,7 +5601,41 @@ pub async fn chainsync_client_task(
             biased;
 
             _ = cancel.cancelled() => {
-                debug!(%peer_addr, "ChainSync task cancelled");
+                // #910: Haskell's pipelined ChainSync client can only send
+                // `MsgDone` at pipeline depth Z, so `drainThePipe` collects and
+                // discards every outstanding response first. Do the same:
+                // otherwise the residue of this session is still in flight when
+                // `demote_to_warm` resubscribes the mux, and the NEXT session
+                // reads prior-session frames as the reply to its
+                // `MsgFindIntersect`.
+                //
+                // On failure we leave `drain_ok` false, which makes
+                // `demote_to_warm` fall back to a full TCP close instead of
+                // reusing the bearer — dugite's analogue of Haskell escalating
+                // to `Mux.stop` when `spsDeactivateTimeout` expires.
+                let budget = chainsync_drain_budget(at_tip);
+                match drain_pipeline_and_terminate(&mut channel, peer_addr, outstanding, budget)
+                    .await
+                {
+                    Ok(discarded) => {
+                        drain_ok.store(true, std::sync::atomic::Ordering::Release);
+                        debug!(
+                            %peer_addr,
+                            outstanding,
+                            discarded,
+                            "ChainSync task cancelled — pipeline drained, MsgDone sent"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            %peer_addr,
+                            outstanding,
+                            error = %e,
+                            "ChainSync task cancelled — pipeline drain failed; \
+                             the mux must not be reused for a new session"
+                        );
+                    }
+                }
                 break;
             }
 
@@ -5452,7 +5708,11 @@ pub async fn chainsync_client_task(
                     pending_count,
                     &mut throttled,
                 ) {
-                    let to_send = high_mark - outstanding;
+                    let to_send = pipeline_target_depth(
+                        known_gap(client_block_no, peer_tip_block_no),
+                        high_mark,
+                    )
+                    .saturating_sub(outstanding);
                     debug!(
                         %peer_addr,
                         outstanding,
@@ -5493,6 +5753,10 @@ pub async fn chainsync_client_task(
                             at_tip = false;
                         }
                         headers_received += 1;
+                        // #910: refresh the peer's tip for `pipeline_target_depth`.
+                        // (`client_block_no` is refreshed below, once the header's
+                        // own block number has been safely extracted.)
+                        peer_tip_block_no = tip_block_number;
 
                         // B12: Reject oversized headers before any parsing.
                         // Haskell's multiplexer enforces a maximum frame size of
@@ -5534,6 +5798,10 @@ pub async fn chainsync_client_task(
                                 ));
                             }
                         };
+                        // #910: the header's own block number is the authoritative
+                        // client-side term of the gap. It corrects the conservative
+                        // local-tip seed on the very first header of the session.
+                        client_block_no = header_block_no;
 
                         // Issue #654 — eager forecast-horizon check (Phase 1 of #652).
                         // If the header's slot lies beyond the ledger's current
@@ -5824,7 +6092,11 @@ pub async fn chainsync_client_task(
                             pending_count,
                             &mut throttled,
                         ) {
-                            let to_send = high_mark - outstanding;
+                            let to_send = pipeline_target_depth(
+                                known_gap(client_block_no, peer_tip_block_no),
+                                high_mark,
+                            )
+                            .saturating_sub(outstanding);
                             for _ in 0..to_send {
                                 let req = cs_encode(&ChainSyncMessage::MsgRequestNext);
                                 channel.send(req).await.map_err(|e| {
@@ -5842,6 +6114,13 @@ pub async fn chainsync_client_task(
                         tip_block_number,
                     } => {
                         outstanding = outstanding.saturating_sub(1);
+                        // #910: refresh the peer's tip for `pipeline_target_depth`.
+                        // The rollback point's block number is not on the wire, so
+                        // `client_block_no` keeps its previous value — an
+                        // over-estimate of our position, hence an UNDER-estimate of
+                        // the gap, which is the safe direction (smaller pipeline).
+                        // The next MsgRollForward supplies the exact value.
+                        peer_tip_block_no = tip_block_number;
 
                         // A rollback means we are no longer at the chain tip —
                         // the peer has new blocks to deliver on the fork branch.
@@ -6168,7 +6447,11 @@ pub async fn chainsync_client_task(
                             pending_count,
                             &mut throttled,
                         ) {
-                            let to_send = high_mark - outstanding;
+                            let to_send = pipeline_target_depth(
+                                known_gap(client_block_no, peer_tip_block_no),
+                                high_mark,
+                            )
+                            .saturating_sub(outstanding);
                             debug!(
                                 %peer_addr,
                                 outstanding,
@@ -7016,6 +7299,210 @@ mod chainsync_task_tests {
             tip_hash: [1u8; 32],
             tip_block_number: 9,
         })
+    }
+
+    // ─── #910 — pipeline depth is bounded by the known gap ─────────────────
+
+    /// The pipeline may never run deeper than the peer's known block backlog.
+    ///
+    /// This is what makes drain-before-`MsgDone` terminate: at the tip
+    /// (`gap == 0`) exactly one request is outstanding, so a demotion drains in
+    /// one message instead of waiting for 200-300 blocks to be minted.
+    #[test]
+    fn pipeline_target_depth_is_gap_bounded_with_a_floor_of_one() {
+        // At tip: Haskell's `Request` case — one non-pipelined request.
+        assert_eq!(pipeline_target_depth(0, 300), 1);
+        // Small backlog: pipeline exactly the backlog, not the high mark.
+        assert_eq!(pipeline_target_depth(1, 300), 1);
+        assert_eq!(pipeline_target_depth(7, 300), 7);
+        assert_eq!(pipeline_target_depth(299, 300), 299);
+        // Bulk sync: clamped at the high mark, so throughput is unchanged.
+        assert_eq!(pipeline_target_depth(300, 300), 300);
+        assert_eq!(pipeline_target_depth(5_000_000, 300), 300);
+        // Operator-lowered depth is still honoured.
+        assert_eq!(pipeline_target_depth(5_000_000, 32), 32);
+    }
+
+    // ─── #910 — drain to zero, then MsgDone ────────────────────────────────
+
+    fn roll_forward_frame() -> Vec<u8> {
+        stale_roll_forward()
+    }
+
+    /// Like `preload_chainsync_channel` but keeps the egress receiver alive so
+    /// the test can assert what the drain actually put on the wire.
+    #[allow(clippy::type_complexity)]
+    fn preload_chainsync_channel_with_egress(
+        frames: Vec<Vec<u8>>,
+    ) -> (
+        dugite_network::MuxChannel,
+        tokio::sync::mpsc::Receiver<(u16, dugite_network::Direction, tokio_util::bytes::Bytes)>,
+    ) {
+        use dugite_network::{Direction, MuxChannel};
+        type Bytes = tokio_util::bytes::Bytes;
+        let (egress_tx, egress_rx) = tokio::sync::mpsc::channel::<(u16, Direction, Bytes)>(8);
+        let (ingress_tx, ingress_rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+        for f in frames {
+            ingress_tx
+                .try_send(Bytes::from(f))
+                .expect("preload ingress");
+        }
+        drop(ingress_tx);
+        let ch = MuxChannel::new(
+            2,
+            Direction::InitiatorDir,
+            egress_tx,
+            ingress_rx,
+            65_536,
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        (ch, egress_rx)
+    }
+
+    /// Assert that the only thing the drain wrote was a single `MsgDone`.
+    fn assert_sent_only_msg_done(
+        egress_rx: &mut tokio::sync::mpsc::Receiver<(
+            u16,
+            dugite_network::Direction,
+            tokio_util::bytes::Bytes,
+        )>,
+    ) {
+        let (_, _, frame) = egress_rx.try_recv().expect("drain must send MsgDone");
+        assert!(
+            matches!(cs_decode(&frame), Ok(ChainSyncMessage::MsgDone)),
+            "drain must terminate the instance with MsgDone"
+        );
+        assert!(
+            egress_rx.try_recv().is_err(),
+            "the drain must not send anything else (no MsgRequestNext refills)"
+        );
+    }
+
+    /// The drain consumes exactly `outstanding` depth-consuming responses and
+    /// then sends `MsgDone` — Haskell's `drainThePipe` followed by the
+    /// depth-`Z`-only `SendMsgDone`.
+    #[tokio::test]
+    async fn drain_consumes_outstanding_then_sends_done() {
+        let (mut ch, mut egress) = preload_chainsync_channel_with_egress(vec![
+            roll_forward_frame(),
+            roll_forward_frame(),
+            roll_forward_frame(),
+        ]);
+        let discarded =
+            drain_pipeline_and_terminate(&mut ch, test_addr(), 3, CHAINSYNC_DRAIN_TIMEOUT)
+                .await
+                .expect("drain must succeed when every response is available");
+        assert_eq!(discarded, 3);
+        assert_sent_only_msg_done(&mut egress);
+    }
+
+    /// `MsgAwaitReply` does NOT consume a pipelined request — the server still
+    /// owes the eventual roll — so the drain must keep reading past it. This is
+    /// the accounting the main loop uses, and getting it wrong is what made the
+    /// old residue bound (`DUGITE_PIPELINE_DEPTH + 16`) undersized: near the tip
+    /// one request can yield two frames.
+    #[tokio::test]
+    async fn drain_does_not_count_await_reply_against_the_pipeline_depth() {
+        let (mut ch, mut egress) = preload_chainsync_channel_with_egress(vec![
+            enc(&ChainSyncMessage::MsgAwaitReply),
+            roll_forward_frame(),
+        ]);
+        let discarded =
+            drain_pipeline_and_terminate(&mut ch, test_addr(), 1, CHAINSYNC_DRAIN_TIMEOUT)
+                .await
+                .expect("AwaitReply then the roll must satisfy one outstanding request");
+        assert_eq!(discarded, 2, "both frames are discarded");
+        assert_sent_only_msg_done(&mut egress);
+    }
+
+    /// A server that terminates first leaves nothing to drain and nothing to
+    /// send — the instance is already at `StDone`.
+    #[tokio::test]
+    async fn drain_stops_when_the_server_sends_done_first() {
+        let mut ch = preload_chainsync_channel(vec![enc(&ChainSyncMessage::MsgDone)]);
+        let discarded =
+            drain_pipeline_and_terminate(&mut ch, test_addr(), 5, CHAINSYNC_DRAIN_TIMEOUT)
+                .await
+                .expect("server MsgDone ends the drain cleanly");
+        assert_eq!(discarded, 1);
+    }
+
+    /// Nothing outstanding → straight to `MsgDone`, no reads at all. (The
+    /// channel is empty and closed; a drain that tried to read would error.)
+    #[tokio::test]
+    async fn drain_with_empty_pipeline_sends_done_immediately() {
+        let (mut ch, mut egress) = preload_chainsync_channel_with_egress(vec![]);
+        let discarded =
+            drain_pipeline_and_terminate(&mut ch, test_addr(), 0, CHAINSYNC_DRAIN_TIMEOUT)
+                .await
+                .expect("an already-empty pipeline drains trivially");
+        assert_eq!(discarded, 0);
+        assert_sent_only_msg_done(&mut egress);
+    }
+
+    /// At the tip the single outstanding request is parked in `StMustReply`
+    /// until the peer mints its next block, so waiting the full budget would
+    /// hold the peer-manager write lock for seconds on every at-tip demotion.
+    /// The at-tip budget must be short enough not to stall the connection
+    /// manager, and still non-zero.
+    #[test]
+    fn drain_budget_is_short_at_tip_and_generous_during_bulk_sync() {
+        assert_eq!(chainsync_drain_budget(false), CHAINSYNC_DRAIN_TIMEOUT);
+        assert_eq!(chainsync_drain_budget(true), CHAINSYNC_DRAIN_TIMEOUT_AT_TIP);
+        assert!(CHAINSYNC_DRAIN_TIMEOUT_AT_TIP < CHAINSYNC_DRAIN_TIMEOUT);
+        assert!(!CHAINSYNC_DRAIN_TIMEOUT_AT_TIP.is_zero());
+        // Both must stay under PeerConnection::PROTOCOL_SHUTDOWN_TIMEOUT (5 s)
+        // so the task always exits normally rather than being abort-killed.
+        assert!(CHAINSYNC_DRAIN_TIMEOUT < std::time::Duration::from_secs(5));
+    }
+
+    /// A drain that cannot complete must FAIL rather than silently leaving
+    /// residue behind — that failure is what makes `demote_to_warm` escalate to
+    /// a TCP close instead of reusing the mux.
+    #[tokio::test]
+    async fn drain_fails_when_responses_are_missing() {
+        // One response available, two outstanding: the channel then closes.
+        let mut ch = preload_chainsync_channel(vec![roll_forward_frame()]);
+        let err = drain_pipeline_and_terminate(&mut ch, test_addr(), 2, CHAINSYNC_DRAIN_TIMEOUT)
+            .await
+            .expect_err("an incomplete drain must not report success");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("drain"),
+            "error must identify the drain, got: {msg}"
+        );
+    }
+
+    /// A wire-state violation during the drain is still a violation.
+    #[tokio::test]
+    async fn drain_rejects_a_client_agency_message() {
+        let mut ch = preload_chainsync_channel(vec![enc(&ChainSyncMessage::MsgRequestNext)]);
+        let err = drain_pipeline_and_terminate(&mut ch, test_addr(), 1, CHAINSYNC_DRAIN_TIMEOUT)
+            .await
+            .expect_err("MsgRequestNext has client agency and is never a response");
+        assert!(err.to_string().contains("unexpected message"));
+    }
+
+    // ─── #908(b) — NotFound is the same verdict as an Origin intersection ───
+
+    /// `MsgIntersectNotFound` for every point (the deepest retry set always ends
+    /// in `Origin`) means the peer can only serve us from genesis — exactly what
+    /// an `Origin` intersection means. Pre-#908 the `None` case fell through to
+    /// "syncing from Origin", so the ForkTooDeep verdict was only reached if the
+    /// peer went on to deliver a genesis-region header; in the observed preprod
+    /// flap it hung up first, no failure was ever classified, and the governor
+    /// re-promoted it 2-6 s later, indefinitely.
+    #[test]
+    fn intersection_none_is_treated_like_origin() {
+        assert!(
+            intersection_is_genesis_only(None),
+            "IntersectNotFound for every offered point == genesis-only"
+        );
+        assert!(intersection_is_genesis_only(Some(&CodecPoint::Origin)));
+        assert!(
+            !intersection_is_genesis_only(Some(&CodecPoint::Specific(42, [3u8; 32]))),
+            "a real intersection is usable"
+        );
     }
 
     /// THE BUG REPRO: a stale `MsgRollForward` (prior-session residue on a

@@ -43,22 +43,65 @@ pub fn select_best_cold(peer_manager: &PeerManager) -> Option<SocketAddr> {
         .map(|(addr, _)| addr)
 }
 
+/// Rank a HOT peer for demotion — **lower is demoted first**.
+///
+/// # Haskell alignment (#909)
+///
+/// `cardano-diffusion` `Cardano/Network/Diffusion/Policies.hs`
+/// `simpleChurnModePeerSelectionPolicy` picks hot-demotion candidates
+/// differently per `FetchMode`:
+///
+/// * **`FetchModeBulkSync`** — sort ASCENDING by `fetchynessBytes`
+///   (`PeerMetric.hs::fetchynessBytesImpl`, the rolling count of bytes actually
+///   fetched from the peer) and demote the lowest. With
+///   `bfcMaxConcurrencyBulkSync = 1` the sole downloader has by far the highest
+///   byte count, so it is effectively never picked. There is no identity
+///   exclusion in Haskell — the metric IS the protection.
+/// * **`FetchModeDeadline`** (at tip) — latency/quality ranking, which is what
+///   [`peer_score`] models.
+///
+/// Dugite previously used `peer_score` in both modes, and `peer_score` weights
+/// keepalive RTT at 40%. The active fetcher's keepalive pings ride the same TCP
+/// connection as the saturated 2048-block payload stream, so its measured RTT
+/// balloons and the busiest, most useful peer ranks WORST — exactly the
+/// `3.12.62.57:3001` demotion observed mid-sync on preprod.
+pub fn hot_demotion_rank(peer: &PeerInfo, bulk_sync: bool) -> f64 {
+    if bulk_sync {
+        peer.fetchyness_bytes() as f64
+    } else {
+        peer_score(peer)
+    }
+}
+
 /// Select the worst hot peer for demotion to warm.
 ///
-/// Returns the hot peer with the lowest composite score.
-/// Topology peers (local roots) are excluded — they must never be demoted.
-pub fn select_worst_hot(peer_manager: &PeerManager) -> Option<SocketAddr> {
+/// Ranks by [`hot_demotion_rank`] (fetchyness while bulk-syncing, composite
+/// score at tip) and returns the lowest.
+///
+/// Topology peers (local roots) are excluded — they must never be demoted — as
+/// are any addresses in `exclude`. The caller passes the peer currently holding
+/// the BlockFetch slot there: the fetchyness metric already de-prioritises it,
+/// but the slot is released BETWEEN batches, and a peer that has just been
+/// promoted and claimed the slot has no samples yet (#909).
+pub fn select_worst_hot(
+    peer_manager: &PeerManager,
+    bulk_sync: bool,
+    exclude: &std::collections::HashSet<SocketAddr>,
+) -> Option<SocketAddr> {
     use super::manager::PeerSource;
     peer_manager
         .peers_in_state(PeerState::Hot)
         .into_iter()
         .filter_map(|addr| {
+            if exclude.contains(&addr) {
+                return None;
+            }
             peer_manager.get_peer(&addr).and_then(|info| {
                 // Never demote local root peers (topology-configured).
                 if info.source == PeerSource::Topology {
                     return None;
                 }
-                Some((addr, peer_score(info)))
+                Some((addr, hot_demotion_rank(info, bulk_sync)))
             })
         })
         .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
@@ -331,8 +374,79 @@ mod tests {
             .unwrap()
             .update_latency(100.0);
 
-        let worst = select_worst_hot(&pm).unwrap();
+        let worst = select_worst_hot(&pm, false, &std::collections::HashSet::new()).unwrap();
         assert_eq!(worst, test_addr(3002)); // Not the topology peer
+    }
+
+    /// #909: while bulk-syncing, hot demotion must rank by `fetchynessBytes`
+    /// ascending — the peer that actually served blocks is last, even though its
+    /// keepalive RTT (and therefore `peer_score`) is the worst of the set
+    /// because its pings ride the saturated bulk-transfer connection.
+    #[test]
+    fn bulk_sync_hot_demotion_spares_the_busy_fetcher() {
+        let mut pm = PeerManager::new();
+        let fetcher = test_addr(3001);
+        let idle = test_addr(3002);
+        for a in [fetcher, idle] {
+            pm.add_peer(a, PeerSource::Ledger);
+            pm.promote_to_warm(&a);
+            pm.promote_to_hot(&a);
+        }
+        // The fetcher looks TERRIBLE by latency (its pings queue behind its own
+        // 2048-block payload stream) but has delivered every byte.
+        pm.get_peer_mut(&fetcher).unwrap().update_latency(2_000.0);
+        pm.record_fetched_bytes(&fetcher, 40 * 1024 * 1024);
+        // The idle peer has a pristine RTT and has fetched nothing.
+        pm.get_peer_mut(&idle).unwrap().update_latency(20.0);
+
+        let empty = std::collections::HashSet::new();
+        assert_eq!(
+            select_worst_hot(&pm, false, &empty),
+            Some(fetcher),
+            "at tip (deadline mode) the latency-based score still governs"
+        );
+        assert_eq!(
+            select_worst_hot(&pm, true, &empty),
+            Some(idle),
+            "bulk-sync mode must demote the peer that fetched nothing, not the \
+             downloader (Haskell simpleChurnModePeerSelectionPolicy)"
+        );
+    }
+
+    /// #909: the churn-rotation path must honour the fetch-slot exclusion —
+    /// previously only Topology peers were spared here, so a rotation could
+    /// evict the live downloader between batches.
+    #[test]
+    fn select_worst_hot_honours_the_fetch_slot_exclusion() {
+        let mut pm = PeerManager::new();
+        let holder = test_addr(3001);
+        let other = test_addr(3002);
+        for a in [holder, other] {
+            pm.add_peer(a, PeerSource::Ledger);
+            pm.promote_to_warm(&a);
+            pm.promote_to_hot(&a);
+        }
+        // `holder` has no samples at all (just promoted + claimed the slot), so
+        // fetchyness cannot protect it — only the exclusion can.
+        pm.record_fetched_bytes(&other, 1024);
+
+        let empty = std::collections::HashSet::new();
+        assert_eq!(select_worst_hot(&pm, true, &empty), Some(holder));
+
+        let mut excluded = std::collections::HashSet::new();
+        excluded.insert(holder);
+        assert_eq!(select_worst_hot(&pm, true, &excluded), Some(other));
+    }
+
+    /// The fetchyness window sums deliveries and ignores empty ranges.
+    #[test]
+    fn fetchyness_bytes_sums_the_window() {
+        let mut peer = PeerInfo::new(PeerSource::Ledger);
+        assert_eq!(peer.fetchyness_bytes(), 0);
+        peer.record_fetched_bytes(1_000);
+        peer.record_fetched_bytes(2_500);
+        peer.record_fetched_bytes(0); // empty range contributes nothing
+        assert_eq!(peer.fetchyness_bytes(), 3_500);
     }
 
     #[test]
