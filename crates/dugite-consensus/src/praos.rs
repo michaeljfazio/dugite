@@ -246,6 +246,24 @@ pub struct OuroborosPraos {
     /// Tracked opcert sequence numbers per pool (cold key hash → highest seen sequence number).
     /// Used to detect opcert counter regressions (replay protection).
     opcert_counters: HashMap<Hash28, u64>,
+    /// When set, the `CounterOverIncrementedOCERT` **upper** bound (`n <= m + 1`)
+    /// is treated as ADVISORY rather than authoritative (#911).
+    ///
+    /// Only ever set on the throwaway clone made by
+    /// [`Self::validate_header_full_with_counters`], i.e. the per-peer EAGER
+    /// header-validation path. There `m` is reconstructed from a single peer's
+    /// streamed prefix on top of a startup-frozen baseline and is reset outright
+    /// on `MsgRollBackward`, so it is provably NOT the authoritative
+    /// `currentIssueNo`: a canonical header whose pool re-issued its opcert in
+    /// blocks the eager layer never threaded reads as an over-increment.
+    ///
+    /// Advisory mode therefore (a) logs at `debug!` instead of `warn!`, and
+    /// (b) still advances the tracked high-water mark to `n` before returning
+    /// the error, so the same pool cannot re-trip on every subsequent header.
+    /// The error is still returned so the eager caller SKIPS the header and
+    /// defers to the authoritative body-apply check — the eager layer never
+    /// rejects on this bound.
+    opcert_upper_bound_advisory: bool,
 }
 
 impl OuroborosPraos {
@@ -273,6 +291,7 @@ impl OuroborosPraos {
             checkpoints: HashMap::new(),
             max_major_prot_ver,
             opcert_counters: HashMap::new(),
+            opcert_upper_bound_advisory: false,
         }
     }
 
@@ -296,6 +315,7 @@ impl OuroborosPraos {
             checkpoints: HashMap::new(),
             max_major_prot_ver,
             opcert_counters: HashMap::new(),
+            opcert_upper_bound_advisory: false,
         }
     }
 
@@ -321,6 +341,7 @@ impl OuroborosPraos {
             checkpoints: HashMap::new(),
             max_major_prot_ver,
             opcert_counters: HashMap::new(),
+            opcert_upper_bound_advisory: false,
         }
     }
 
@@ -981,6 +1002,10 @@ impl OuroborosPraos {
     ) -> Result<(), ConsensusError> {
         let mut temp = self.clone();
         temp.opcert_counters = std::mem::take(peer_counters);
+        // #911: `temp.opcert_counters` is a single peer's reconstruction, not the
+        // authoritative `currentIssueNo`, so the opcert UPPER bound here is
+        // advisory — see `opcert_upper_bound_advisory`.
+        temp.opcert_upper_bound_advisory = true;
         let result = temp.validate_header_full(
             header,
             current_slot,
@@ -1177,6 +1202,27 @@ impl OuroborosPraos {
                 // on-chain block there may carry any counter (it re-issued its
                 // opcert several times before forging; see the mainnet epoch-211
                 // counter-2 block). Gating on PV >= 7 keeps both eras byte-exact.
+                //
+                // #911: in the EAGER per-peer path `m` is not authoritative (see
+                // `opcert_upper_bound_advisory`). Log at debug, advance the
+                // high-water mark so the pool cannot re-trip on every following
+                // header, and hand the caller the error purely as a "skip this
+                // header" signal.
+                if self.opcert_upper_bound_advisory {
+                    debug!(
+                        slot = header.slot.0,
+                        pool = %pool_id,
+                        got = n,
+                        last_seen = m,
+                        "Praos: opcert counter over-increment observed against a \
+                         non-authoritative per-peer counter — deferring to body apply"
+                    );
+                    self.record_opcert_counter(pool_id, n);
+                    return Err(ConsensusError::OpcertCounterOverIncremented {
+                        got: n,
+                        last_seen: m,
+                    });
+                }
                 if self.strict_verification {
                     warn!(
                         slot = header.slot.0,
@@ -1201,7 +1247,16 @@ impl OuroborosPraos {
         }
 
         // Update tracked counter (always update, even during sync, for tracking).
-        // Hard cap prevents unbounded growth between epoch-boundary pruning cycles.
+        self.record_opcert_counter(pool_id, n);
+
+        Ok(())
+    }
+
+    /// Record `n` as this pool's opcert high-water mark.
+    ///
+    /// The hard cap prevents unbounded growth between epoch-boundary pruning
+    /// cycles: once the map is full, only pools already tracked are updated.
+    fn record_opcert_counter(&mut self, pool_id: Hash28, n: u64) {
         const MAX_OPCERT_ENTRIES: usize = 50_000;
         if self.opcert_counters.len() < MAX_OPCERT_ENTRIES
             || self.opcert_counters.contains_key(&pool_id)
@@ -1215,8 +1270,6 @@ impl OuroborosPraos {
                 })
                 .or_insert(n);
         }
-
-        Ok(())
     }
 
     /// Verify the VRF proof in the block header (Praos / Conway era).
@@ -4571,6 +4624,121 @@ mod tests {
             praos.verify_nonce_vrf_proof(&header).is_ok(),
             "Praos blocks (no separate nonce VRF) must skip the nonce VRF check"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // #911 — opcert upper bound is ADVISORY in the eager per-peer path
+    // -------------------------------------------------------------------------
+
+    /// Praos-shaped header (no separate nonce VRF cert) carrying `counter`.
+    fn make_praos_header_with_counter(counter: u64) -> BlockHeader {
+        use dugite_primitives::block::ProtocolVersion;
+        let mut h = make_tpraos_header();
+        h.protocol_version = ProtocolVersion { major: 9, minor: 0 };
+        h.nonce_vrf_proof = vec![];
+        h.nonce_vrf_output = vec![];
+        h.operational_cert.sequence_number = counter;
+        assert!(!h.is_tpraos());
+        h
+    }
+
+    fn issuer_pool_id(header: &BlockHeader) -> Hash28 {
+        dugite_primitives::hash::blake2b_224(&header.issuer_vkey)
+    }
+
+    /// #911: the AUTHORITATIVE (body-apply) path keeps the upper bound fatal and
+    /// must NOT advance the tracked counter past a rejected value — otherwise a
+    /// genuine over-increment attack would be laundered into the high-water mark.
+    #[test]
+    fn opcert_over_increment_is_fatal_and_does_not_advance_when_authoritative() {
+        let mut praos = OuroborosPraos::new(11);
+        praos.strict_verification = true;
+        let header = make_praos_header_with_counter(474);
+        let pool = issuer_pool_id(&header);
+        praos.opcert_counters.insert(pool, 472);
+
+        let err = praos
+            .check_opcert_counter(&header, None)
+            .expect_err("n > m + 1 must be fatal on the authoritative path");
+        assert!(matches!(
+            err,
+            ConsensusError::OpcertCounterOverIncremented {
+                got: 474,
+                last_seen: 472
+            }
+        ));
+        assert_eq!(
+            praos.opcert_counters.get(&pool),
+            Some(&472),
+            "a rejected counter must never become the high-water mark"
+        );
+    }
+
+    /// #911: in ADVISORY mode (the eager per-peer path) the same input still
+    /// returns the error — so the caller SKIPS the header and defers to body
+    /// apply — but the high-water mark advances, so the pool cannot re-trip on
+    /// every following header from the same peer (the observed 6-WARNs-in-3s
+    /// spam on preprod, slot 129440158, got=474 last_seen=472).
+    #[test]
+    fn opcert_over_increment_is_advisory_and_advances_for_eager_path() {
+        let mut praos = OuroborosPraos::new(11);
+        praos.strict_verification = true;
+        praos.opcert_upper_bound_advisory = true;
+        let header = make_praos_header_with_counter(474);
+        let pool = issuer_pool_id(&header);
+        praos.opcert_counters.insert(pool, 472);
+
+        let err = praos
+            .check_opcert_counter(&header, None)
+            .expect_err("advisory mode still signals SKIP to the eager caller");
+        assert!(matches!(
+            err,
+            ConsensusError::OpcertCounterOverIncremented {
+                got: 474,
+                last_seen: 472
+            }
+        ));
+        assert_eq!(
+            praos.opcert_counters.get(&pool),
+            Some(&474),
+            "advisory mode must advance the high-water mark so the same pool \
+             does not re-trip on every subsequent header"
+        );
+
+        // The very next header from the same pool now validates cleanly, which
+        // is the whole point: one deferral per opcert rotation, not one per header.
+        let next = make_praos_header_with_counter(474);
+        praos
+            .check_opcert_counter(&next, None)
+            .expect("subsequent header at the same counter must pass");
+        let rotated = make_praos_header_with_counter(475);
+        praos
+            .check_opcert_counter(&rotated, None)
+            .expect("a legitimate +1 rotation must pass");
+    }
+
+    /// #911: advisory mode relaxes ONLY the upper bound. The LOWER bound
+    /// (`CounterTooSmallOCERT`, replay regression) stays fatal — a stale
+    /// per-peer baseline can only make that check more conservative, never less.
+    #[test]
+    fn opcert_advisory_mode_keeps_lower_bound_fatal() {
+        let mut praos = OuroborosPraos::new(11);
+        praos.strict_verification = true;
+        praos.opcert_upper_bound_advisory = true;
+        let header = make_praos_header_with_counter(3);
+        let pool = issuer_pool_id(&header);
+        praos.opcert_counters.insert(pool, 10);
+
+        let err = praos
+            .check_opcert_counter(&header, None)
+            .expect_err("counter regression must stay fatal in advisory mode");
+        assert!(matches!(
+            err,
+            ConsensusError::OpcertSequenceRegression {
+                got: 3,
+                expected: 10
+            }
+        ));
     }
 
     /// Invalid nonce VRF proof is non-fatal in non-strict mode (initial sync).
