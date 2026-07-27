@@ -200,6 +200,17 @@ impl Node {
 
         // Build stake pool snapshots with actual per-pool stake
         let total_active_stake: u64 = pool_stake_map.values().sum();
+        // `getTotalStake globals nes = circulation (nesEs nes) (maxLovelaceSupply
+        // globals)` — circulation is maxLovelaceSupply MINUS RESERVES ONLY.
+        // Treasury is NOT subtracted (verified numerically against cardano-node
+        // 11.0.1: pool/(maxSupply-reserves) reproduces its fraction exactly,
+        // pool/(maxSupply-reserves-treasury) does not). The same derivation is
+        // already used by the non-myopic reward handler.
+        //
+        // This is the denominator `poolsByTotalStakeFraction` divides by; total
+        // ACTIVE stake is NOT it, which is why every pool on a fully-delegated
+        // chain used to report ~1.0 (#905).
+        let total_circulation: u64 = ls.max_lovelace_supply.saturating_sub(ls.epochs.reserves.0);
         let stake_pools: Vec<StakePoolSnapshot> = ls
             .certs
             .pool_params
@@ -209,6 +220,7 @@ impl Node {
                 stake: pool_stake_map.get(pool_id).copied().unwrap_or(0),
                 vrf_keyhash: reg.vrf_keyhash.as_ref().to_vec(),
                 total_active_stake,
+                total_circulation,
             })
             .collect();
 
@@ -287,10 +299,23 @@ impl Node {
             &dugite_primitives::transaction::GovActionId,
             &dugite_ledger::state::ProposalState,
         )> = ls.gov.governance.proposals.iter().collect();
+        // Haskell returns proposals in on-chain SUBMISSION order, not sorted by
+        // GovActionId. `queryProposals` reads the pulser's `dpProposals` /
+        // snapshot's `psProposals`, both of which come from
+        // `proposalsActions = OMap.toStrictSeq pProps`, and `pProps` is appended
+        // to (`OMap.||>`) by the GOV rule as each proposal is processed.
+        //
+        // dugite's `proposals` is an ImblOrdMap keyed by GovActionId, so its
+        // natural iteration order is by hash. `submission_index` (#799) is the
+        // monotonic counter that recovers submission order — the same field the
+        // ratification tie-break already relies on.
+        //
+        // Sorting by (proposed_epoch, txId) here put the sequence in hash order
+        // within an epoch, which is what made `proposals` and the proposals
+        // array inside `gov-state` diverge from cardano-node (#906).
         sorted_proposals.sort_by(|(a_id, a), (b_id, b)| {
-            a.proposed_epoch
-                .0
-                .cmp(&b.proposed_epoch.0)
+            a.submission_index
+                .cmp(&b.submission_index)
                 .then_with(|| {
                     a_id.transaction_id
                         .as_ref()

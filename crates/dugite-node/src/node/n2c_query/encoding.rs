@@ -9,6 +9,7 @@ use crate::node::n2c_query::types::{
     DRepDelegationGroup, DRepKey, GovActionId, ProposalSnapshot, ProtocolParamsSnapshot,
     QueryResult, RelaySnapshot, ShelleyPParamsSnapshot, SnapshotStakeData, UtxoSnapshot,
 };
+use dugite_primitives::transaction::GovAction;
 
 // ─── Top-level result encoder ────────────────────────────────────────────────
 
@@ -164,13 +165,24 @@ pub(crate) fn encode_query_result_value(
         QueryResult::StakeDistribution(pools) => {
             // Wire format: Map<pool_hash(28), IndividualPoolStake>
             // IndividualPoolStake: array(2) [tag(30)[num,den], vrf_hash(32)]
-            enc.map(pools.len() as u64).ok();
-            for pool in pools {
+            // Haskell `poolsByTotalStakeFraction` (Shelley/API/Wallet.hs:185-201)
+            // reports each pool's share of TOTAL CIRCULATING stake, not of total
+            // active stake:
+            //   individualPoolStake = (stake / totalActive) * (totalActive / totalStake)
+            //                       = stake / totalStake
+            // where totalStake = maxLovelaceSupply - reserves - treasury. Dividing
+            // by total ACTIVE stake made every pool on a fully-delegated chain
+            // report ~1.0 instead of its real share (#905).
+            //
+            // Pools with no delegators are omitted entirely — Haskell's
+            // `calculatePoolDistr'` guards on `spssNumDelegators > 0` before
+            // inserting into the map.
+            let live: Vec<_> = pools.iter().filter(|p| p.stake > 0).collect();
+            enc.map(live.len() as u64).ok();
+            for pool in live {
                 enc.bytes(&pool.pool_id).ok();
                 enc.array(2).ok();
-                // Stake fraction as tagged rational
-                let total = pool.total_active_stake.max(1); // avoid div by zero
-                encode_tagged_rational(enc, pool.stake, total);
+                encode_reduced_rational(enc, pool.stake, pool.total_circulation);
                 enc.bytes(&pool.vrf_keyhash).ok();
             }
         }
@@ -759,6 +771,33 @@ pub(crate) fn encode_protocol_params_cbor(
 }
 
 /// Helper to encode a tagged rational number: `tag(30)[numerator, denominator]`
+/// Encode a stake fraction the way Haskell's `Rational` reaches the wire.
+///
+/// `individualPoolStake` is a genuine `Data.Ratio.Ratio Integer`, and `%`
+/// always reduces via gcd, so cardano-node emits the fraction in lowest terms.
+/// Emitting `stake/total` unreduced produces a numerically equal but
+/// byte-different response (#905).
+pub(crate) fn encode_reduced_rational(
+    enc: &mut minicbor::Encoder<&mut Vec<u8>>,
+    num: u64,
+    den: u64,
+) {
+    fn gcd(mut a: u64, mut b: u64) -> u64 {
+        while b != 0 {
+            let t = b;
+            b = a % b;
+            a = t;
+        }
+        a
+    }
+    if den == 0 {
+        encode_tagged_rational(enc, 0, 1);
+        return;
+    }
+    let g = gcd(num, den).max(1);
+    encode_tagged_rational(enc, num / g, den / g);
+}
+
 pub(crate) fn encode_tagged_rational(
     enc: &mut minicbor::Encoder<&mut Vec<u8>>,
     num: u64,
@@ -850,24 +889,23 @@ fn encode_pool_distr2(
     // SL.PoolDistr: array(2)[pool_map, total_active_stake]
     // Each pool entry: array(3)[stake_rational, compact_lovelace, vrf_hash]
     enc.array(2).ok();
-    let total = total_active_stake;
-    enc.map(pools.len() as u64).ok();
-    for pool in pools {
+    // See the GetStakeDistribution arm: the rational is the pool's share of
+    // TOTAL CIRCULATING stake, reduced; `individualTotalPoolStake` and
+    // `pdTotalActiveStake` stay ACTIVE-stake based (Wallet.hs:185-201 is
+    // explicit that only the ratio is rescaled). Zero-delegator pools omitted.
+    let live: Vec<_> = pools.iter().filter(|p| p.stake > 0).collect();
+    enc.map(live.len() as u64).ok();
+    for pool in live {
         enc.bytes(&pool.pool_id).ok();
         enc.array(3).ok();
-        // stake as rational fraction
-        if total > 0 {
-            encode_tagged_rational(enc, pool.stake, total);
-        } else {
-            encode_tagged_rational(enc, 0, 1);
-        }
-        // compact lovelace (absolute pool stake)
+        encode_reduced_rational(enc, pool.stake, pool.total_circulation);
+        // compact lovelace (absolute pool stake) — active-stake based
         enc.u64(pool.stake).ok();
         // VRF key hash
         enc.bytes(&pool.vrf_keyhash).ok();
     }
-    // total active stake
-    enc.u64(total).ok();
+    // total active stake (pdTotalActiveStake stays active-stake based)
+    enc.u64(total_active_stake).ok();
 }
 
 // ─── Stake encoding ───────────────────────────────────────────────────────────
@@ -1414,7 +1452,7 @@ pub(crate) fn encode_gov_action_state(
     enc.u64(p.deposit).ok();
     enc.bytes(&p.return_addr).ok();
     // gov_action = sum type tagged by action type
-    encode_gov_action_tag(enc, &p.action_type);
+    encode_gov_action(enc, &p.gov_action);
     // anchor = array(2) [url, hash]
     enc.array(2).ok();
     enc.str(&p.anchor_url).ok();
@@ -1428,63 +1466,168 @@ pub(crate) fn encode_gov_action_state(
 /// Encode a `GovAction` as a CBOR sum type tag.
 ///
 /// We encode a simplified version since we only have the action type string.
-fn encode_gov_action_tag(enc: &mut minicbor::Encoder<&mut Vec<u8>>, action_type: &str) {
-    match action_type {
-        "ParameterChange" => {
-            // [0, prev_action_id, params, policy_hash]
+/// Encode a `GovAction` exactly as `EncCBOR (GovAction era)` does
+/// (`Conway/Governance/Procedures.hs:815-947`).
+///
+/// `Sum Ctor n !> f1 !> .. !> fN` is
+/// `encodeListLen (N+1) <> encodeWord8 n <> f1 <> .. <> fN`, so every variant is
+/// an array whose length is its field count plus one for the tag:
+///
+///   [0, gid|null, ppu, policy|null]              ParameterChange
+///   [1, gid|null, [major, minor]]                HardForkInitiation
+///   [2, {acct => coin}, policy|null]             TreasuryWithdrawals
+///   [3, gid|null]                                NoConfidence
+///   [4, gid|null, removeSet, {cred => epoch}, q] UpdateCommittee
+///   [5, gid|null, [anchor, script|null]]         NewConstitution
+///   [6]                                          InfoAction
+///
+/// `gid` is `encodeNullStrictMaybe`: null when there is no previous action.
+///
+/// This previously took only the action-type *string* and emitted hardcoded
+/// placeholders — nulls, empty maps, a zero ProtVer, an empty anchor and a
+/// literal 2/3 threshold — so every payload came back structurally valid but
+/// substantively empty (#906). `ProposalSnapshot` has carried the real
+/// `GovAction` all along.
+fn encode_gov_action(enc: &mut minicbor::Encoder<&mut Vec<u8>>, action: &GovAction) {
+    match action {
+        GovAction::ParameterChange {
+            prev_action_id,
+            protocol_param_update,
+            policy_hash,
+        } => {
             enc.array(4).ok();
             enc.u32(0).ok();
-            enc.null().ok(); // prev action id
-            enc.map(0).ok(); // empty params update
-            enc.null().ok(); // policy hash
+            encode_opt_gov_action_id(enc, prev_action_id.as_ref());
+            // Reuse the canonical tx-side encoder so the ParameterChange body is
+            // byte-identical to the one the ledger accepted on chain.
+            let ppu =
+                dugite_serialization::encode::encode_protocol_param_update(protocol_param_update);
+            enc.writer_mut().extend_from_slice(&ppu);
+            encode_opt_script_hash(enc, policy_hash.as_ref());
         }
-        "HardForkInitiation" => {
-            // [1, prev_action_id, protocol_version]
+        GovAction::HardForkInitiation {
+            prev_action_id,
+            protocol_version,
+        } => {
             enc.array(3).ok();
             enc.u32(1).ok();
-            enc.null().ok();
+            encode_opt_gov_action_id(enc, prev_action_id.as_ref());
+            // ProtVer is a CBORGroup: one slot holding array(2)[major, minor].
             enc.array(2).ok();
-            enc.u64(0).ok();
-            enc.u64(0).ok();
+            enc.u64(protocol_version.0).ok();
+            enc.u64(protocol_version.1).ok();
         }
-        "TreasuryWithdrawals" => {
-            // [2, withdrawals_map, policy_hash]
+        GovAction::TreasuryWithdrawals {
+            withdrawals,
+            policy_hash,
+        } => {
             enc.array(3).ok();
             enc.u32(2).ok();
-            enc.map(0).ok();
-            enc.null().ok();
+            // Map AccountAddress -> Coin. The key is the raw 29-byte reward
+            // account (header byte + 28-byte credential) as one bytestring.
+            enc.map(withdrawals.len() as u64).ok();
+            for (acct, coin) in withdrawals {
+                enc.bytes(acct).ok();
+                enc.u64(coin.0).ok();
+            }
+            encode_opt_script_hash(enc, policy_hash.as_ref());
         }
-        "NoConfidence" => {
-            // [3, prev_action_id]
+        GovAction::NoConfidence { prev_action_id } => {
             enc.array(2).ok();
             enc.u32(3).ok();
-            enc.null().ok();
+            encode_opt_gov_action_id(enc, prev_action_id.as_ref());
         }
-        "UpdateCommittee" => {
-            // [4, prev_action_id, remove_set, add_map, quorum]
+        GovAction::UpdateCommittee {
+            prev_action_id,
+            members_to_remove,
+            members_to_add,
+            threshold,
+        } => {
             enc.array(5).ok();
             enc.u32(4).ok();
-            enc.null().ok();
+            encode_opt_gov_action_id(enc, prev_action_id.as_ref());
+            // Set (Credential ColdCommitteeRole) — tag 258 wrapped array.
             enc.tag(minicbor::data::Tag::new(258)).ok();
-            enc.array(0).ok();
-            enc.map(0).ok();
-            encode_tagged_rational(enc, 2, 3);
+            enc.array(members_to_remove.len() as u64).ok();
+            for cred in members_to_remove {
+                encode_credential(enc, cred);
+            }
+            // Map (Credential ColdCommitteeRole) EpochNo
+            enc.map(members_to_add.len() as u64).ok();
+            for (cred, epoch) in members_to_add {
+                encode_credential(enc, cred);
+                enc.u64(*epoch).ok();
+            }
+            encode_tagged_rational(enc, threshold.numerator, threshold.denominator);
         }
-        "NewConstitution" => {
-            // [5, prev_action_id, constitution]
+        GovAction::NewConstitution {
+            prev_action_id,
+            constitution,
+        } => {
             enc.array(3).ok();
             enc.u32(5).ok();
-            enc.null().ok();
+            encode_opt_gov_action_id(enc, prev_action_id.as_ref());
+            // Constitution = array(2)[anchor, guardrails script hash | null]
             enc.array(2).ok();
             enc.array(2).ok();
-            enc.str("").ok();
-            enc.bytes(&[0u8; 32]).ok();
-            enc.null().ok();
+            enc.str(&constitution.anchor.url).ok();
+            enc.bytes(constitution.anchor.data_hash.as_ref()).ok();
+            encode_opt_script_hash(enc, constitution.script_hash.as_ref());
         }
-        _ => {
-            // [6]
+        GovAction::InfoAction => {
             enc.array(1).ok();
             enc.u32(6).ok();
+        }
+    }
+}
+
+/// `encodeNullStrictMaybe encCBOR` over a `GovActionId`: null, or array(2).
+fn encode_opt_gov_action_id(
+    enc: &mut minicbor::Encoder<&mut Vec<u8>>,
+    id: Option<&dugite_primitives::transaction::GovActionId>,
+) {
+    match id {
+        None => {
+            enc.null().ok();
+        }
+        Some(id) => {
+            enc.array(2).ok();
+            enc.bytes(id.transaction_id.as_ref()).ok();
+            enc.u32(id.action_index).ok();
+        }
+    }
+}
+
+/// `encodeNullStrictMaybe encCBOR` over a script hash: null, or bytes(28).
+fn encode_opt_script_hash(
+    enc: &mut minicbor::Encoder<&mut Vec<u8>>,
+    hash: Option<&dugite_primitives::hash::Hash28>,
+) {
+    match hash {
+        None => {
+            enc.null().ok();
+        }
+        Some(h) => {
+            enc.bytes(h.as_ref()).ok();
+        }
+    }
+}
+
+/// Credential = array(2)[0=key|1=script, hash(28)].
+fn encode_credential(
+    enc: &mut minicbor::Encoder<&mut Vec<u8>>,
+    cred: &dugite_primitives::credentials::Credential,
+) {
+    use dugite_primitives::credentials::Credential;
+    enc.array(2).ok();
+    match cred {
+        Credential::VerificationKey(h) => {
+            enc.u8(0).ok();
+            enc.bytes(h.as_ref()).ok();
+        }
+        Credential::Script(h) => {
+            enc.u8(1).ok();
+            enc.bytes(h.as_ref()).ok();
         }
     }
 }
@@ -2627,6 +2770,7 @@ mod tests {
             stake: 1_000_000,
             vrf_keyhash: vec![0u8; 32],
             total_active_stake: 1_000_000,
+            total_circulation: 54_000_000_000_000_000,
         }]);
         let encoded = encode_query_result(&result);
         let inner = strip_wrappers(&encoded);
@@ -2650,6 +2794,7 @@ mod tests {
             stake: 500_000,
             vrf_keyhash: vec![0u8; 32],
             total_active_stake: 1_000_000,
+            total_circulation: 54_000_000_000_000_000,
         }]);
         let encoded = encode_query_result(&result);
         let inner = strip_wrappers(&encoded);
@@ -3043,6 +3188,7 @@ mod tests {
                 stake: 1_000_000,
                 vrf_keyhash: vec![0u8; 32],
                 total_active_stake: 2_000_000,
+                total_circulation: 54_000_000_000_000_000,
             }],
             total_active_stake: 2_000_000,
         };

@@ -36,42 +36,28 @@ _parity_ensure_csv() {
 # Maps query name → tracking issue URL.
 # Populated by individual test scripts using: KNOWN_DIVERGENCES[name]=url
 declare -gA KNOWN_DIVERGENCES=(
-    # This array is ONLY for real divergences — both sides answered, the
-    # answers differ. It must never be used to paper over an ERROR row: an
-    # ERROR means cardano-cli refused the invocation or could not reach a
-    # node, which is a harness bug, not a dugite behaviour to track. See #900.
+    # EMPTY — every one of the 18 comparable queries is byte-identical to
+    # cardano-node 11.0.1 as of v2.2.0+.
     #
-    # Tracked under #905, NOT #597 -- #597 was closed 2026-05-22 and these were
-    # re-added against it on 2026-05-28, so nothing was watching them. #597's
-    # fixes also all targeted dugite-cli, which this suite never invokes: it
-    # runs cardano-cli against BOTH sockets, so what it measures is
-    # dugite-NODE's LSQ responses.
-    # NB: protocol-parameters is EQUAL since genesis decimals convert exactly
-    # (priceSteps 0.0000721 was rounded to 0.000072). Do not re-add blindly.
+    # This array is ONLY for real divergences: both sides answered and the
+    # answers differ. It must never be used to paper over an ERROR row (that
+    # means cardano-cli refused the invocation or could not reach a node, which
+    # is a harness bug — see #900), and never to park a row on a CLOSED issue
+    # (#597 collected five of those for two months).
     #
-    # The query recomputes pool stake from certs.delegations, which does not
-    # carry genesis-seeded delegations, so the fraction is wrong (and a
-    # zero-stake pool is emitted that cardano-node omits). dugite's INTERNAL
-    # distribution is sound -- reward/pot parity is byte-exact and forging
-    # matches f -- this is the query surface only.
-    ["stake-distribution"]="https://github.com/michaeljfazio/dugite/issues/905"
-    # gov-state is byte-identical to cardano-node 11.0.1 EXCEPT its embedded
-    # proposals array, so it shares the GetProposals encoder root cause. The
-    # priceSteps rendering it used to inherit is fixed (exact genesis rationals).
-    ["gov-state"]="https://github.com/michaeljfazio/dugite/issues/906"
-    # NB: drep-stake-distribution is EQUAL now that the query sums
-    # InstantStake + ProposalDeposits + AccountBalance like computeDRepDistr.
-    # NB: protocol-state/version was listed here for the 7-vs-8-field PraosState
-    # encoder. #902 fixed it and the row is EQUAL; do not re-add without a diff.
-    # Proposal SETS now agree (#903 fixed the ratification timing). What still
-    # differs is the GetProposals encoder: it drops govAction payloads
-    # (HardFork version, constitution anchor, withdrawals, committee members)
-    # and orders results by txId rather than in Proposals OSet order.
-    ["proposals"]="https://github.com/michaeljfazio/dugite/issues/906"
-    # NB: slot-number and treasury were listed here until 2026-07-26. They never
-    # diverged — cardano-cli rejected the harness's own arguments, both sides
-    # failed identically, and lib.sh mislabelled that as "dugite ERROR". Fixed
-    # in #900; do not re-add without a real two-sided diff.
+    # Recently retired, do not re-add without a fresh two-sided diff:
+    #   protocol-parameters, gov-state  genesis decimals now convert exactly
+    #                                   (priceSteps 0.0000721, was 0.000072)
+    #   drep-stake-distribution         query sums InstantStake + ProposalDeposits
+    #                                   + AccountBalance, per computeDRepDistr
+    #   stake-distribution              ratio is pool stake / CIRCULATION
+    #                                   (maxLovelaceSupply - reserves), reduced,
+    #                                   zero-delegator pools omitted (#905)
+    #   proposals                       GetProposals emits the real GovAction
+    #                                   payload in submission order (#906)
+    #   protocol-state/version,
+    #   kes-period-info                 8-field PraosState (#902)
+    #   slot-number, treasury           never diverged; harness argument bugs
 )
 
 # ---- Known errors ---------------------------------------------------------

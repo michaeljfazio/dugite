@@ -667,8 +667,11 @@ pub struct StakePoolSnapshot {
     pub pool_id: Vec<u8>,
     pub stake: u64,
     pub vrf_keyhash: Vec<u8>,
-    /// Total active stake across all pools (for computing stake fraction)
+    /// Total active stake across all pools (`pdTotalActiveStake`).
     pub total_active_stake: u64,
+    /// Total CIRCULATING stake: `maxLovelaceSupply - reserves - treasury`.
+    /// This is the denominator of `individualPoolStake` — see #905.
+    pub total_circulation: u64,
 }
 
 /// Snapshot of a DRep for query results.

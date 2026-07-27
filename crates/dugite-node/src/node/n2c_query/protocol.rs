@@ -532,12 +532,14 @@ mod tests {
                     stake: 500_000_000,
                     vrf_keyhash: vec![0u8; 32],
                     total_active_stake: 1_000_000_000,
+                    total_circulation: 54_000_000_000_000_000,
                 },
                 StakePoolSnapshot {
                     pool_id: vec![2u8; 28],
                     stake: 500_000_000,
                     vrf_keyhash: vec![0u8; 32],
                     total_active_stake: 1_000_000_000,
+                    total_circulation: 54_000_000_000_000_000,
                 },
             ],
             ..NodeStateSnapshot::default()
@@ -789,6 +791,7 @@ mod tests {
                     stake: 50_000_000_000,
                     vrf_keyhash: vec![0u8; 32],
                     total_active_stake: 100_000_000_000,
+                    total_circulation: 54_000_000_000_000_000,
                 },
                 // Pool B: 30B stake, pledge 1B, cost 340M, margin 1%
                 StakePoolSnapshot {
@@ -796,6 +799,7 @@ mod tests {
                     stake: 30_000_000_000,
                     vrf_keyhash: vec![0u8; 32],
                     total_active_stake: 100_000_000_000,
+                    total_circulation: 54_000_000_000_000_000,
                 },
             ],
             pool_params_entries: vec![
@@ -964,6 +968,7 @@ mod tests {
                 stake: 200_000,
                 vrf_keyhash: vec![0u8; 32],
                 total_active_stake: 200_000,
+                total_circulation: 54_000_000_000_000_000,
             }],
             pool_params_entries: vec![PoolParamsSnapshot {
                 pool_id: vec![0xCCu8; 28],
@@ -1043,6 +1048,7 @@ mod tests {
                     stake: 100_000,
                     vrf_keyhash: vec![0u8; 32],
                     total_active_stake: 200_000,
+                    total_circulation: 54_000_000_000_000_000,
                 },
                 // Pool B has no pool_params entry — should be excluded.
                 StakePoolSnapshot {
@@ -1050,6 +1056,7 @@ mod tests {
                     stake: 100_000,
                     vrf_keyhash: vec![0u8; 32],
                     total_active_stake: 200_000,
+                    total_circulation: 54_000_000_000_000_000,
                 },
             ],
             pool_params_entries: vec![PoolParamsSnapshot {
