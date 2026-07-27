@@ -5479,6 +5479,20 @@ impl Node {
                                         governor.promotion_warm_completed(&addr);
                                     }
                                     other => {
+                                        // #909 observability: surface the metric the
+                                        // demotion decision was actually made on, so a
+                                        // "why was my downloader demoted?" question is
+                                        // answerable from the log alone.
+                                        if let dugite_network::peer::governor::GovernorAction::DemoteToWarm(addr) = other {
+                                            debug!(
+                                                %addr,
+                                                fetchyness_bytes = pm.peer_fetchyness_bytes(&addr),
+                                                bulk_sync = !self
+                                                    .volatile_wal_sync_at_tip
+                                                    .load(std::sync::atomic::Ordering::Relaxed),
+                                                "governor demoting hot -> warm"
+                                            );
+                                        }
                                         lifecycle.handle_governor_action(other, &mut pm).await;
                                     }
                                 }
@@ -5776,8 +5790,29 @@ impl Node {
                 // metrics so Prometheus/monitor reflect current RTT, not
                 // cumulative handshake history.
                 Some((rtt_addr, rtt_ms)) = keepalive_rtt_rx.recv() => {
+                    // #909: DISCARD samples taken while the peer holds the
+                    // BlockFetch slot. Its keepalive ping shares the TCP
+                    // connection with a saturated 2048-block payload stream, so
+                    // the measured RTT is our own bulk transfer queuing, not the
+                    // peer's latency. Folding it into the EWMA made the busiest
+                    // peer look like the slowest and fed a demotion. Haskell
+                    // never mixes the two signals: latency drives promotion
+                    // decisions, `fetchynessBytes` drives bulk-sync demotion.
+                    let holds_fetch_slot = self
+                        .connection_lifecycle
+                        .as_ref()
+                        .and_then(|lc| lc.get_active_fetch_peer())
+                        == Some(rtt_addr);
                     let mut pm = peer_manager.write().await;
-                    pm.record_handshake_rtt(&rtt_addr, rtt_ms);
+                    if holds_fetch_slot {
+                        debug!(
+                            %rtt_addr,
+                            rtt_ms = format_args!("{rtt_ms:.0}"),
+                            "keepalive RTT sample discarded — peer holds the BlockFetch slot"
+                        );
+                    } else {
+                        pm.record_handshake_rtt(&rtt_addr, rtt_ms);
+                    }
                     // Refresh gauge metrics from current EWMA values.
                     let latencies = pm.connected_peer_latencies();
                     self.metrics.update_peer_rtt_gauges(&latencies);

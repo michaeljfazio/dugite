@@ -343,7 +343,24 @@ pub struct NodePeerManager {
     /// `GsmEvent::PeerDisconnected` so the GSM actor can update its peer
     /// tracking (LoE, GDD). `None` when GSM is not wired (e.g. in tests).
     gsm_event_tx: Option<tokio::sync::mpsc::Sender<crate::gsm::GsmEvent>>,
+    /// When each peer's last failure was recorded, for the
+    /// one-failure-per-connection-attempt dedupe in [`Self::peer_failed`] (#908).
+    last_failure_at: HashMap<SocketAddr, std::time::Instant>,
 }
+
+/// Collapse window for [`NodePeerManager::peer_failed`] (#908).
+///
+/// The unit Haskell's outbound governor backs off on is a failed *connection
+/// attempt*, not an error report: `jobPromoteColdPeer` applies exactly one
+/// `nextConnectTimes` entry per attempt. A single dugite teardown can raise two
+/// reports — the protocol task's `peer_failure_tx` and the connection-lifecycle
+/// GC that reaps the now-dead mux — so without a collapse window one death would
+/// double-count towards both the exponential backoff exponent and the
+/// `MAX_COLD_PEER_FAILURES` forget threshold.
+///
+/// Distinct attempts are always separated by at least `COLD_RETRY_BASE_SECS`
+/// (5 s) of backoff, so this window can never merge two genuine attempts.
+const PEER_FAILURE_COLLAPSE_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Maturation delay applied to inbound-duplex peers before they become
 /// eligible for `Warm→Hot` promotion by the outbound peer-selection
@@ -366,6 +383,7 @@ impl NodePeerManager {
             fresh_inbound: HashMap::new(),
             rollback_below_immutable_witnesses: HashMap::new(),
             gsm_event_tx: None,
+            last_failure_at: HashMap::new(),
         }
     }
 
@@ -711,7 +729,31 @@ impl NodePeerManager {
     /// Topology and Dns peers are never forgotten — they are retried
     /// indefinitely at the 160s backoff cap (matching Haskell local/public
     /// root peer behaviour).
+    ///
+    /// Repeat calls within [`PEER_FAILURE_COLLAPSE_WINDOW`] collapse into the
+    /// first: one teardown can be reported by both the protocol task and the
+    /// dead-connection GC, and Haskell backs off per connection *attempt* (#908).
     pub fn peer_failed(&mut self, addr: &SocketAddr) {
+        let now = std::time::Instant::now();
+        if let Some(&last) = self.last_failure_at.get(addr) {
+            if now.duration_since(last) < PEER_FAILURE_COLLAPSE_WINDOW {
+                // Same teardown, second reporter — the backoff and forget
+                // accounting have already been applied for this attempt.
+                // Still ensure the peer is out of the established pool.
+                self.conn_states.remove(addr);
+                self.inner.demote_to_cold(addr);
+                return;
+            }
+        }
+        // Bound the map: entries older than the collapse window carry no
+        // information, and cold-churn `ForgetPeer` removes peers via
+        // `inner.remove_peer` without passing through here.
+        if self.last_failure_at.len() > 1_024 {
+            self.last_failure_at
+                .retain(|_, &mut t| now.duration_since(t) < PEER_FAILURE_COLLAPSE_WINDOW);
+        }
+        self.last_failure_at.insert(*addr, now);
+
         // Check whether this failure pushes the peer over the forget threshold.
         // We read failure_count *before* calling record_failure() (+1 below).
         let should_forget = self.inner.get_peer(addr).is_some_and(|p| {
@@ -735,6 +777,7 @@ impl NodePeerManager {
             // demote-exclusion set.
             self.big_ledger_peers.remove(addr);
             self.bootstrap_peer_addrs.remove(addr);
+            self.last_failure_at.remove(addr);
         } else {
             self.inner.demote_to_cold(addr);
         }
@@ -835,6 +878,18 @@ impl NodePeerManager {
     /// — the bandwidth half of the GSV estimate used to pick the fetch peer.
     pub fn update_peer_fetch_bandwidth(&mut self, addr: &SocketAddr, bytes_per_sec: f64) {
         self.inner.update_fetch_bandwidth(addr, bytes_per_sec);
+    }
+
+    /// Record `bytes` delivered by a completed BlockFetch range — the
+    /// `fetchynessBytes` metric that ranks hot-demotion candidates while
+    /// bulk-syncing (#909).
+    pub fn record_peer_fetched_bytes(&mut self, addr: &SocketAddr, bytes: u64) {
+        self.inner.record_fetched_bytes(addr, bytes);
+    }
+
+    /// Rolling-window bytes fetched from a peer (Haskell `fetchynessBytes`).
+    pub fn peer_fetchyness_bytes(&self, addr: &SocketAddr) -> u64 {
+        self.inner.get_fetchyness_bytes(addr)
     }
 
     /// Whether `addr` should contest the single fetch slot right now, ranking it
@@ -1129,6 +1184,104 @@ impl std::fmt::Display for PeerManagerStats {
 mod tests {
     use super::*;
     use std::net::SocketAddr;
+
+    // ─── #908 — failure accounting on unexpected connection death ──────────
+
+    /// A dead-connection reap must apply real backoff. Pre-#908 that path
+    /// called only `peer_disconnected()`, so `next_connect_after` stayed unset
+    /// and the governor's `eligible_cold` re-offered the peer on the very next
+    /// tick — the observed 2-6 s reconnect loop.
+    #[test]
+    fn peer_failed_arms_the_reconnect_backoff() {
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        let addr: SocketAddr = "203.0.113.9:3001".parse().unwrap();
+        pm.inner.add_peer(addr, PeerSource::Ledger);
+        pm.peer_connected(&addr, ConnectionDirection::Outbound);
+
+        // The pre-#908 reap path: no backoff, immediately re-offered.
+        pm.peer_disconnected(&addr);
+        assert!(
+            pm.inner.peers_eligible_to_connect().contains(&addr),
+            "precondition: a bare disconnect leaves the peer instantly eligible"
+        );
+
+        pm.peer_failed(&addr);
+        assert_eq!(pm.inner.get_peer(&addr).unwrap().failure_count, 1);
+        assert!(
+            !pm.inner.peers_eligible_to_connect().contains(&addr),
+            "a recorded failure must hold the peer out for its backoff window"
+        );
+    }
+
+    /// One teardown can be reported twice — by the protocol task AND by the
+    /// dead-connection GC. Haskell backs off per connection *attempt*, so the
+    /// second report must not double the exponent or the forget counter.
+    #[test]
+    fn peer_failed_collapses_duplicate_reports_for_one_teardown() {
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        let addr: SocketAddr = "203.0.113.10:3001".parse().unwrap();
+        pm.inner.add_peer(addr, PeerSource::Ledger);
+
+        pm.peer_failed(&addr);
+        pm.peer_failed(&addr);
+        pm.peer_failed(&addr);
+        assert_eq!(
+            pm.inner.get_peer(&addr).unwrap().failure_count,
+            1,
+            "three reports of the same teardown are one failed attempt"
+        );
+        assert!(
+            !pm.inner.peers_eligible_to_connect().contains(&addr),
+            "the collapsed reports must still leave the backoff armed"
+        );
+    }
+
+    /// The forget policy (`MAX_COLD_PEER_FAILURES`) must count attempts, not
+    /// reports — otherwise the doubled accounting from the GC + protocol-task
+    /// pair would evict non-root peers after ~3 real failures instead of 5.
+    #[test]
+    fn duplicate_failure_reports_do_not_accelerate_the_forget_policy() {
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        let addr: SocketAddr = "203.0.113.11:3001".parse().unwrap();
+        pm.inner.add_peer(addr, PeerSource::Ledger);
+
+        // Two reports per teardown, three teardowns.
+        for _ in 0..3 {
+            pm.peer_failed(&addr);
+            pm.peer_failed(&addr);
+            // Age past the collapse window so the next pair is a new attempt.
+            pm.last_failure_at.remove(&addr);
+        }
+        assert_eq!(pm.inner.get_peer(&addr).unwrap().failure_count, 3);
+        assert!(
+            pm.inner.get_peer(&addr).is_some(),
+            "a Ledger peer must survive 3 attempts (forget threshold is 5)"
+        );
+    }
+
+    // ─── #909 — fetchynessBytes accounting ────────────────────────────────
+
+    /// BlockFetch deliveries must land in the rolling window that ranks
+    /// hot-demotion candidates during bulk sync.
+    #[test]
+    fn fetched_bytes_are_recorded_per_peer() {
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        let busy: SocketAddr = "203.0.113.12:3001".parse().unwrap();
+        let idle: SocketAddr = "203.0.113.13:3001".parse().unwrap();
+        pm.inner.add_peer(busy, PeerSource::Ledger);
+        pm.inner.add_peer(idle, PeerSource::Ledger);
+
+        pm.record_peer_fetched_bytes(&busy, 2_048_000);
+        pm.record_peer_fetched_bytes(&busy, 1_024_000);
+
+        assert_eq!(pm.peer_fetchyness_bytes(&busy), 3_072_000);
+        assert_eq!(pm.peer_fetchyness_bytes(&idle), 0);
+        assert_eq!(
+            pm.peer_fetchyness_bytes(&"203.0.113.99:3001".parse().unwrap()),
+            0,
+            "an unknown peer contributes nothing"
+        );
+    }
 
     /// #871: re-adding a named local-root group (periodic DNS re-resolution)
     /// must UPSERT it in place — refreshing its addresses — not push a

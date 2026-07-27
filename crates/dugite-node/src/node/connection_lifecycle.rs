@@ -1016,6 +1016,18 @@ pub struct ConnectionLifecycleManager {
     /// Prometheus metrics for recording peer latencies.
     metrics: Arc<NodeMetrics>,
 
+    /// Per-peer flag set by the current ChainSync client task once it has
+    /// drained its pipelined responses to zero and sent `MsgDone` (#910).
+    ///
+    /// Created fresh by `make_chainsync_task` on every Warm→Hot promotion, so a
+    /// stale `true` from a previous session can never authorise a reuse. Read by
+    /// [`Self::demote_to_warm`]: the mux is only resubscribed for a new
+    /// ChainSync instance when the previous one left it genuinely idle,
+    /// mirroring `network-mux`'s `StatusIdle` precondition in
+    /// `runMiniProtocol`. Otherwise the demotion escalates to a full TCP close
+    /// (Haskell's `Mux.stop` on `spsDeactivateTimeout`).
+    chainsync_drain_ok: HashMap<SocketAddr, Arc<std::sync::atomic::AtomicBool>>,
+
     /// Shared mempool for TxSubmission2 tx relay to peers.
     mempool: Arc<Mempool>,
 
@@ -1225,6 +1237,7 @@ impl ConnectionLifecycleManager {
             active_slots_coeff,
             active_fetcher: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             active_fetch_peer: Arc::new(std::sync::Mutex::new(None)),
+            chainsync_drain_ok: HashMap::new(),
             max_fetched_slot: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             blockfetch_max_range,
             // ChainSelStarvation starts `Ongoing` (0) — Haskell initializes the
@@ -1615,7 +1628,31 @@ impl ConnectionLifecycleManager {
             conn.stop_hot_protocols_and_recover().await
         };
 
-        if recovered {
+        // #910: reusing the bearer is only sound if the outgoing ChainSync
+        // instance left it IDLE — pipelined responses drained to zero and
+        // `MsgDone` sent. Haskell gets this structurally (Peano-indexed
+        // `SendMsgDone` at depth Z + `deactivatePeerConnection` waiting for the
+        // protocol to finish + `runMiniProtocol` refusing a non-`StatusIdle`
+        // restart); dugite checks the flag the client task sets after its drain.
+        //
+        // Deliberate divergence: dugite's deactivate budget is
+        // `PROTOCOL_SHUTDOWN_TIMEOUT` (5 s), not Haskell's
+        // `spsDeactivateTimeout` (300 s), because `demote_to_warm` runs
+        // synchronously under the global peer-manager write lock. A drain that
+        // cannot finish inside that budget — in practice a peer AT TIP, whose
+        // one outstanding request is parked in `StMustReply` until the next
+        // block is minted — therefore escalates to a TCP close here rather than
+        // waiting. During bulk sync, where demotions are frequent and the
+        // residue problem actually bit (45 forced reconnects in one 19 h
+        // preprod log), the server already holds the blocks and the drain
+        // completes in milliseconds.
+        let chainsync_drained = self
+            .chainsync_drain_ok
+            .get(&addr)
+            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Acquire));
+        self.chainsync_drain_ok.remove(&addr);
+
+        if recovered && chainsync_drained {
             // Hot protocols stopped and channels recovered — connection stays warm.
             // Clear only the ChainSync candidate state (no headers are streaming).
             {
@@ -1628,9 +1665,19 @@ impl ConnectionLifecycleManager {
 
             info!(%cid, "hot -> warm complete (TCP kept alive, channels recovered)");
         } else {
-            // Recovery failed (timeout or no MuxHandle) — fall back to TCP close.
-            // The governor will reconnect on the next tick (Cold → Warm → Hot).
-            warn!(%cid, "hot -> warm: channel recovery failed, falling back to TCP close");
+            // Either channel recovery failed (task timeout / no MuxHandle), or
+            // ChainSync could not drain its pipeline to zero before `MsgDone`
+            // (#910) so the mux instance is not idle. Both fall back to a TCP
+            // close; the governor reconnects on the next tick (Cold→Warm→Hot).
+            if recovered {
+                info!(
+                    %cid,
+                    "hot -> warm: ChainSync did not drain to zero before MsgDone — \
+                     closing the connection instead of reusing the mux (#910)"
+                );
+            } else {
+                warn!(%cid, "hot -> warm: channel recovery failed, falling back to TCP close");
+            }
 
             peer_manager.mark_terminating(&addr);
 
@@ -1741,6 +1788,8 @@ impl ConnectionLifecycleManager {
         // Remove the PeerSharing client request channel — dropping it signals
         // the client task to exit its loop cleanly (recv returns None).
         self.peersharing_request_txs.remove(&addr);
+        // #910: the bearer is gone, so the drain flag has nothing to authorise.
+        self.chainsync_drain_ok.remove(&addr);
 
         // Update peer manager — removes connection state entirely.
         peer_manager.peer_disconnected(&addr);
@@ -1836,6 +1885,7 @@ impl ConnectionLifecycleManager {
                     }
                 }
                 Self::spawn_shutdown(closing);
+                self.chainsync_drain_ok.remove(&addr);
                 peer_manager.inner.remove_peer(&addr);
             }
             GovernorAction::PeerShareRequest(addr) => {
@@ -1853,6 +1903,29 @@ impl ConnectionLifecycleManager {
     /// manager to reflect the disconnection and clears candidate chain state.
     ///
     /// Should be called periodically from the connection manager loop.
+    ///
+    /// # Failure accounting (#908)
+    ///
+    /// Everything this GC reaps died **unexpectedly**: every planned teardown
+    /// (`demote_to_warm` fallback, `demote_to_cold`, `ForgetPeer`, promotion
+    /// rollback, shutdown `drain_connections`) removes its connections from
+    /// `self.connections` synchronously before awaiting the shutdown, so a
+    /// connection can only still be in the map here if the remote closed it or
+    /// the mux errored.
+    ///
+    /// Such a death must therefore apply the same `peer_failed()` accounting as
+    /// a protocol-task failure report — exponential backoff via
+    /// `next_connect_after` plus the `MAX_COLD_PEER_FAILURES` forget policy.
+    /// Previously this path called only `peer_disconnected()`, which drops the
+    /// peer straight to Cold with **no** backoff, so `eligible_cold` re-offered
+    /// it on the very next governor tick: the observed 2–6 s reconnect loop
+    /// against peers that answer `MsgIntersectNotFound` and then hang up
+    /// (`149.248.207.219:3002`, 45 occurrences in one 19 h preprod log).
+    ///
+    /// `peer_failed()` collapses repeat reports for the same teardown (see
+    /// [`PEER_FAILURE_COLLAPSE_WINDOW`](super::networking)), so a peer whose
+    /// protocol task ALSO reported the failure is still charged exactly one
+    /// failed connection attempt — matching Haskell's per-attempt backoff.
     pub async fn cleanup_dead_connections(&mut self, peer_manager: &mut NodePeerManager) {
         let dead_cids: Vec<ConnectionId> = self
             .connections
@@ -1886,8 +1959,19 @@ impl ConnectionLifecycleManager {
                 }
                 // Remove the PeerSharing client channel so the client task exits.
                 self.peersharing_request_txs.remove(&addr);
+                // #910: the bearer is gone, so the drain flag has nothing to
+                // authorise.
+                self.chainsync_drain_ok.remove(&addr);
+                // #908: an unexpected death IS a failed connection attempt —
+                // apply backoff + forget accounting, not a bare disconnect.
+                // `peer_failed` performs the Cold transition itself (and the
+                // forget, past MAX_COLD_PEER_FAILURES), so it subsumes
+                // `peer_disconnected`; the GSM deregistration that
+                // `peer_disconnected` also performs is issued explicitly first
+                // so it happens even when the peer is forgotten outright.
                 peer_manager.peer_disconnected(&addr);
-                warn!(%cid, "removed dead connection (last to peer)");
+                peer_manager.peer_failed(&addr);
+                warn!(%cid, "removed dead connection (last to peer) — recording peer failure for backoff");
             } else {
                 warn!(%cid, "removed dead connection (peer still has another)");
             }
@@ -2220,7 +2304,12 @@ impl ConnectionLifecycleManager {
     ///
     /// Delegates to [`super::sync::chainsync_client_task()`] which implements
     /// the full pipelined ChainSync protocol loop.
-    fn make_chainsync_task(&self, addr: SocketAddr) -> ProtocolTaskFn {
+    fn make_chainsync_task(&mut self, addr: SocketAddr) -> ProtocolTaskFn {
+        // #910: fresh drain flag for THIS ChainSync instance. The task sets it
+        // only after draining its pipeline to zero and sending `MsgDone`;
+        // `demote_to_warm` consults it before reusing the mux.
+        let drain_ok = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.chainsync_drain_ok.insert(addr, drain_ok.clone());
         let candidate_chains = self.candidate_chains.clone();
         let chain_db = self.chain_db.clone();
         let ledger_state = self.ledger_state.clone();
@@ -2282,6 +2371,7 @@ impl ConnectionLifecycleManager {
                         lop_params,
                         historicity_cutoff_secs,
                         csj,
+                        drain_ok,
                     ) => r
                 };
                 // Report any non-cancel failure to the peer manager so the
@@ -3230,13 +3320,25 @@ impl ConnectionLifecycleManager {
                                         // prefer the fastest-serving peers. Only count
                                         // ranges with a meaningful sample (>0 bytes,
                                         // >1 ms) so tiny/instant ranges don't skew it.
-                                        if range_abort.seen_bytes() > 0 && fetch_ms > 1.0 {
-                                            let bps = range_abort.seen_bytes() as f64
-                                                / (fetch_ms / 1000.0);
-                                            peer_manager_for_fetch
-                                                .write()
-                                                .await
-                                                .update_peer_fetch_bandwidth(&addr, bps);
+                                        // #909: record the raw byte delivery in the
+                                        // rolling `fetchynessBytes` window — the
+                                        // metric that ranks hot-demotion candidates
+                                        // while bulk-syncing, so the peer doing the
+                                        // work is structurally last to be demoted.
+                                        // Recorded for EVERY non-empty range,
+                                        // including the sub-millisecond ones the
+                                        // bandwidth EWMA skips.
+                                        if range_abort.seen_bytes() > 0 {
+                                            let mut pm = peer_manager_for_fetch.write().await;
+                                            pm.record_peer_fetched_bytes(
+                                                &addr,
+                                                range_abort.seen_bytes() as u64,
+                                            );
+                                            if fetch_ms > 1.0 {
+                                                let bps = range_abort.seen_bytes() as f64
+                                                    / (fetch_ms / 1000.0);
+                                                pm.update_peer_fetch_bandwidth(&addr, bps);
+                                            }
                                         }
                                         // Refresh the average block size for the
                                         // next range's byte-budget sizing.
@@ -5366,7 +5468,8 @@ mod tests {
     #[tokio::test]
     async fn chainsync_task_reports_failure_to_peer_manager_on_error() {
         use tokio_util::sync::CancellationToken;
-        let (lc, mut peer_failure_rx) = ConnectionLifecycleManager::new_for_test_with_failure_rx();
+        let (mut lc, mut peer_failure_rx) =
+            ConnectionLifecycleManager::new_for_test_with_failure_rx();
         let addr: SocketAddr = "127.0.0.1:39499".parse().unwrap();
         let task = lc.make_chainsync_task(addr);
         let channel = closed_ingress_channel();
@@ -5394,7 +5497,8 @@ mod tests {
     #[tokio::test]
     async fn chainsync_task_does_not_report_failure_when_cancelled() {
         use tokio_util::sync::CancellationToken;
-        let (lc, mut peer_failure_rx) = ConnectionLifecycleManager::new_for_test_with_failure_rx();
+        let (mut lc, mut peer_failure_rx) =
+            ConnectionLifecycleManager::new_for_test_with_failure_rx();
         let addr: SocketAddr = "127.0.0.1:39500".parse().unwrap();
         let task = lc.make_chainsync_task(addr);
         let channel = closed_ingress_channel();
@@ -6118,7 +6222,7 @@ mod tests {
         use tokio::sync::mpsc;
         use tokio_util::sync::CancellationToken;
 
-        let lc = ConnectionLifecycleManager::new_for_test();
+        let mut lc = ConnectionLifecycleManager::new_for_test();
         let addr: std::net::SocketAddr = "10.0.0.4:3001".parse().unwrap();
 
         // Build a channel: egress works (so MsgFindIntersect can be sent),

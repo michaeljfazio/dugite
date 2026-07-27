@@ -65,6 +65,20 @@ const STALE_FETCH_SAMPLE: std::time::Duration = std::time::Duration::from_secs(1
 /// Failure count decay interval — halves every 5 minutes.
 const FAILURE_DECAY_INTERVAL: Duration = Duration::from_secs(300);
 
+/// Rolling window over which BlockFetch byte deliveries count towards a peer's
+/// "fetchyness" (#909).
+///
+/// Haskell's `PeerMetric.fetchynessBytesImpl` keeps the last
+/// `maxEntriesToTrack = 180` slot-keyed samples, which on a 1 s-slot chain is a
+/// ~3 min window and on mainnet's 20 s block cadence covers ~1 h of blocks. We
+/// bound by BOTH time and entry count so a stalled peer's contribution ages out
+/// even if no new sample arrives to trigger the length prune.
+pub const FETCHYNESS_WINDOW: Duration = Duration::from_secs(3600);
+
+/// Maximum number of retained fetch samples per peer. Matches Haskell's
+/// `maxEntriesToTrack = 180`.
+pub const FETCHYNESS_MAX_ENTRIES: usize = 180;
+
 /// Initial reputation score for new peers.
 const INITIAL_REPUTATION: f64 = 0.5;
 
@@ -104,6 +118,17 @@ pub struct PeerInfo {
     /// (`G`=latency, `S`=1/bandwidth) that cardano-node's `prioritisePeerChains`
     /// uses to prefer the fastest-serving peer for the single bulk-sync fetcher.
     pub fetch_bandwidth_bps: Option<f64>,
+    /// Rolling record of `(when, bytes)` for every BlockFetch range this peer
+    /// completed, bounded by [`FETCHYNESS_WINDOW`] / [`FETCHYNESS_MAX_ENTRIES`].
+    ///
+    /// The dugite equivalent of Haskell's `PeerMetric` fetched-bytes series.
+    /// Its sum ([`PeerInfo::fetchyness_bytes`]) is the hot-demotion rank while
+    /// bulk-syncing: `simpleChurnModePeerSelectionPolicy` in `FetchMode
+    /// BulkSync` sorts demotion candidates ASCENDING by `fetchynessBytes`, so
+    /// the peer that actually served the blocks is structurally last to be
+    /// demoted. That, not an identity exclusion, is what protects the single
+    /// bulk-sync downloader in cardano-node (#909).
+    fetched_bytes: std::collections::VecDeque<(Instant, u64)>,
     /// When `fetch_bandwidth_bps` was last updated. Drives the GSV gate's
     /// explore step: a peer whose sample is stale re-qualifies, so gated-out
     /// peers periodically re-measure and the gate can never latch onto a peer
@@ -150,6 +175,7 @@ impl PeerInfo {
             state: PeerState::Cold,
             latency_ms: None,
             fetch_bandwidth_bps: None,
+            fetched_bytes: std::collections::VecDeque::new(),
             fetch_sample_at: None,
             reputation: INITIAL_REPUTATION,
             failure_count: 0,
@@ -180,6 +206,47 @@ impl PeerInfo {
             None => bytes_per_sec,
         });
         self.fetch_sample_at = Some(Instant::now());
+    }
+
+    /// Record `bytes` delivered by a completed BlockFetch range (#909).
+    ///
+    /// Zero-byte ranges are ignored — they carry no fetch work and would only
+    /// dilute the window.
+    pub fn record_fetched_bytes(&mut self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let now = Instant::now();
+        self.fetched_bytes.push_back((now, bytes));
+        while self.fetched_bytes.len() > FETCHYNESS_MAX_ENTRIES {
+            self.fetched_bytes.pop_front();
+        }
+        self.prune_fetched_bytes(now);
+    }
+
+    /// Drop samples that have aged out of [`FETCHYNESS_WINDOW`].
+    fn prune_fetched_bytes(&mut self, now: Instant) {
+        while let Some(&(t, _)) = self.fetched_bytes.front() {
+            if now.duration_since(t) >= FETCHYNESS_WINDOW {
+                self.fetched_bytes.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Total bytes this peer delivered via BlockFetch within
+    /// [`FETCHYNESS_WINDOW`] — Haskell's `fetchynessBytes` (#909).
+    ///
+    /// Read-only, so aged-out entries are filtered rather than popped; the
+    /// deque is pruned on the next [`Self::record_fetched_bytes`].
+    pub fn fetchyness_bytes(&self) -> u64 {
+        let now = Instant::now();
+        self.fetched_bytes
+            .iter()
+            .filter(|(t, _)| now.duration_since(*t) < FETCHYNESS_WINDOW)
+            .map(|(_, b)| *b)
+            .sum()
     }
 
     /// Record a failure — increments failure count, reduces reputation, and
@@ -428,6 +495,22 @@ impl PeerManager {
     /// served a range yet.
     pub fn get_fetch_bandwidth_bps(&self, addr: &SocketAddr) -> Option<f64> {
         self.peers.get(addr).and_then(|p| p.fetch_bandwidth_bps)
+    }
+
+    /// Record `bytes` delivered by a completed BlockFetch range (#909).
+    pub fn record_fetched_bytes(&mut self, addr: &SocketAddr, bytes: u64) {
+        if let Some(p) = self.peers.get_mut(addr) {
+            p.record_fetched_bytes(bytes);
+        }
+    }
+
+    /// Rolling-window bytes fetched from a peer — Haskell `fetchynessBytes`.
+    /// `0` for an unknown peer or one that has served nothing recently.
+    pub fn get_fetchyness_bytes(&self, addr: &SocketAddr) -> u64 {
+        self.peers
+            .get(addr)
+            .map(|p| p.fetchyness_bytes())
+            .unwrap_or(0)
     }
 
     /// GSV peer prioritisation for the single bulk-sync fetcher — should `addr`
