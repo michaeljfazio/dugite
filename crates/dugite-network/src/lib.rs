@@ -90,6 +90,25 @@ pub trait BlockProvider: Send + Sync + 'static {
         self.has_block(hash)
     }
 
+    /// Actual slot of `hash` if it is on the current canonical chain, else
+    /// `None` (#908).
+    ///
+    /// Used by the ChainSync server to validate a `MsgFindIntersect` point:
+    /// the hash must be canonical AND the client's claimed slot must match.
+    ///
+    /// Default implementation: derive it from [`Self::find_chain_ancestor`],
+    /// accepting only a self-ancestor. Providers backed by real chain storage
+    /// MUST override this — `find_chain_ancestor` is a *rewind* helper and
+    /// typically resolves only the volatile window plus the immutable tip, so
+    /// it answers `None` for the deep history that clients legitimately offer
+    /// as intersection anchors.
+    fn canonical_point_slot(&self, hash: &[u8; 32]) -> Option<u64> {
+        match self.find_chain_ancestor(hash) {
+            Some((slot, found, _)) if &found == hash => Some(slot),
+            _ => None,
+        }
+    }
+
     /// Find the most recent ancestor of `start_hash` that is on the current
     /// canonical chain.  Returns `Some((slot, hash, block_number))` for the
     /// first ancestor (walking via `prev_hash` links) found on chain, or

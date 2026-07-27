@@ -724,6 +724,56 @@ impl ImmutableDB {
         self.block_index.contains(hash)
     }
 
+    /// Absolute slot of an immutable block, by header hash (#908).
+    ///
+    /// Every block in the ImmutableDB is by construction on the canonical chain
+    /// (the layer is append-only and only ever receives k-deep blocks), so this
+    /// is the authoritative "what slot is this canonical hash at?" lookup that
+    /// the ChainSync server needs to validate a client's `MsgFindIntersect`
+    /// point.
+    ///
+    /// Resolution: the block index gives the chunk and byte offset; the chunk's
+    /// secondary index maps that offset to the slot. Both the active (unflushed)
+    /// chunk's in-memory entries and on-disk chunks are covered.
+    ///
+    /// Returns `None` for an unknown hash — including a VolatileDB-only block,
+    /// which the caller must resolve against the volatile selected chain.
+    ///
+    /// Byron EBBs are excluded: per the Haskell convention the secondary index's
+    /// slot field holds the **epoch number** for an EBB, not an absolute slot,
+    /// so it is not a value a caller may compare against a wire `Point`. (The
+    /// on-disk entry does not carry the EBB flag, but an epoch number can never
+    /// equal the EBB's absolute slot for any epoch past 0, so such a point is
+    /// rejected by the caller's slot-match check anyway — the same outcome.)
+    pub fn slot_of(&self, hash: &Hash32) -> Option<u64> {
+        // Active chunk: entries are still in memory, not yet in a .secondary file.
+        if let Some(ref active) = self.active_chunk {
+            if let Some(e) = active
+                .secondary_entries
+                .iter()
+                .find(|e| &Hash32::from_bytes(e.header_hash) == hash)
+            {
+                return if e.is_ebb { None } else { Some(e.slot) };
+            }
+        }
+
+        let loc = self.block_index.lookup(hash)?;
+        let secondary_path = self.dir.join(format!("{:05}.secondary", loc.chunk_num));
+        let secondary_data = fs::read(&secondary_path).ok()?;
+
+        let mut pos = 0;
+        while pos + SECONDARY_ENTRY_SIZE <= secondary_data.len() {
+            let entry = &secondary_data[pos..];
+            if read_be_u64(&entry[0..8]) == Some(loc.block_offset)
+                && entry[16..48] == hash.as_bytes()[..]
+            {
+                return read_be_u64(&entry[48..56]);
+            }
+            pos += SECONDARY_ENTRY_SIZE;
+        }
+        None
+    }
+
     /// Total number of blocks across all chunk files.
     pub fn total_blocks(&self) -> u64 {
         self.total_blocks
