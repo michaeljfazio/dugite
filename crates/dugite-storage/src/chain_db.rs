@@ -682,6 +682,34 @@ impl ChainDB {
         self.volatile.is_on_selected_chain(hash) || self.immutable.has_block(hash)
     }
 
+    /// Actual slot of `hash` **if it is on the canonical chain** (#908).
+    ///
+    /// The canonical chain is the volatile `selected_chain` plus the whole
+    /// ImmutableDB. A fork block stored alongside the chain returns `None`, as
+    /// does an unknown hash.
+    ///
+    /// This exists because the ChainSync server must validate a client's
+    /// `MsgFindIntersect` point — is this hash canonical, and does the client's
+    /// claimed slot match? — and [`Self::find_chain_ancestor`] cannot answer
+    /// that for the deep history: it resolves only the volatile selected chain
+    /// and the single immutable *tip*, so ANY immutable block below the tip
+    /// came back `None` and the point was rejected. Dugite offers exactly such
+    /// deep anchors (`get_immutable_historical_points`), so a dugite server
+    /// answered `MsgIntersectNotFound` to every well-formed deep point a peer
+    /// offered — the server-side half of the #908 reconnect loop, and the
+    /// reason a peer could only intersect on our live tip block.
+    pub fn canonical_point_slot(&self, hash: &BlockHeaderHash) -> Option<SlotNo> {
+        if self.volatile.is_on_selected_chain(hash) {
+            return self.volatile.get_block(hash).map(|b| SlotNo(b.slot));
+        }
+        if let Some((slot, immutable_tip_hash, _)) = self.immutable_tip {
+            if &immutable_tip_hash == hash {
+                return Some(slot);
+            }
+        }
+        self.immutable.slot_of(hash).map(SlotNo)
+    }
+
     /// Find the most recent ancestor of `start_hash` that is on the current
     /// canonical chain.  Returns `Some((slot, hash, block_no))` for that
     /// ancestor, or `None` when no ancestor on the active chain can be
@@ -1616,6 +1644,76 @@ mod tests {
 
         // Volatile should have k blocks remaining
         assert_eq!(db.volatile.len(), DEFAULT_SECURITY_PARAM_K);
+    }
+
+    /// #908 (server side): a ChainSync client's `MsgFindIntersect` must resolve
+    /// against the WHOLE canonical chain, not just the volatile window plus the
+    /// single immutable tip.
+    ///
+    /// `find_chain_ancestor` — which `handle_find_intersect` used to call —
+    /// answers `None` for every immutable block below the immutable tip, so the
+    /// server replied `MsgIntersectNotFound` to exactly the deep anchors dugite's
+    /// own client offers (`get_immutable_historical_points`). A peer could only
+    /// intersect on our live tip block; anything else churned it into a
+    /// reconnect loop. `canonical_point_slot` resolves them.
+    #[test]
+    fn canonical_point_slot_resolves_deep_immutable_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = ChainDB::open(dir.path()).unwrap();
+
+        let h = |i: u64| {
+            let mut b = [0u8; 32];
+            b[0..8].copy_from_slice(&i.to_be_bytes());
+            Hash32::from_bytes(b)
+        };
+
+        let total = DEFAULT_SECURITY_PARAM_K as u64 + 10;
+        for i in 1..=total {
+            db.add_block(
+                h(i),
+                SlotNo(i * 10),
+                BlockNo(i),
+                h(i - 1),
+                format!("block{i}").into_bytes(),
+            )
+            .unwrap();
+        }
+        assert_eq!(db.flush_to_immutable().unwrap(), 10);
+
+        // Blocks 1..=10 are now immutable; 10 is the immutable tip.
+        let immutable_tip_block_no = 10u64;
+
+        // The immutable TIP resolved before this fix too.
+        assert_eq!(
+            db.canonical_point_slot(&h(immutable_tip_block_no)),
+            Some(SlotNo(immutable_tip_block_no * 10)),
+        );
+
+        // THE BUG: every immutable block BELOW the tip resolved to None.
+        for i in 1..immutable_tip_block_no {
+            assert_eq!(
+                db.find_chain_ancestor(&h(i)),
+                None,
+                "precondition: find_chain_ancestor cannot resolve deep immutable \
+                 blocks — that is why it was the wrong lookup for intersections"
+            );
+            assert_eq!(
+                db.canonical_point_slot(&h(i)),
+                Some(SlotNo(i * 10)),
+                "a deep immutable block IS canonical and must yield its slot"
+            );
+        }
+
+        // Volatile-window blocks resolve as before.
+        assert_eq!(db.canonical_point_slot(&h(total)), Some(SlotNo(total * 10)));
+        assert_eq!(
+            db.canonical_point_slot(&h(immutable_tip_block_no + 1)),
+            Some(SlotNo((immutable_tip_block_no + 1) * 10)),
+        );
+
+        // An unknown hash is still not canonical — the slot-poisoning guard in
+        // `handle_find_intersect` keeps its teeth.
+        assert_eq!(db.canonical_point_slot(&make_hash(0xEE)), None);
     }
 
     /// Verify that a custom security parameter k is respected by flush_to_immutable.

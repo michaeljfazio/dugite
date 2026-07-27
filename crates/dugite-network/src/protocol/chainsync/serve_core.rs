@@ -193,12 +193,9 @@ impl ServeCore {
     /// # Cursor poisoning fix (#876)
     ///
     /// A point is only accepted as an intersection when BOTH:
-    ///  1. `hash` is on the *canonical* chain (`is_on_chain`, not merely
-    ///     `has_block` — a fork block stored alongside the chain must be
-    ///     rejected), and
-    ///  2. the client-claimed `slot` matches the block's actual on-chain
-    ///     slot (`find_chain_ancestor` on an on-chain hash returns that
-    ///     hash's own slot).
+    ///  1. `hash` is on the *canonical* chain (not merely `has_block` — a fork
+    ///     block stored alongside the chain must be rejected), and
+    ///  2. the client-claimed `slot` matches the block's actual on-chain slot.
     ///
     /// Without this check a malicious or buggy client could claim an
     /// arbitrary slot for a real hash (e.g. `(u64::MAX, real_hash)`),
@@ -207,6 +204,22 @@ impl ServeCore {
     /// `cursor_slot`.  On mismatch we fall through exactly as we do for a
     /// point we don't recognise at all, eventually replying
     /// `MsgIntersectNotFound` if no point in the list validates.
+    ///
+    /// # Deep-history intersections (#908)
+    ///
+    /// Both conditions are now answered by the single
+    /// [`BlockProvider::canonical_point_slot`] lookup. The previous
+    /// implementation used `is_on_chain` + `find_chain_ancestor`, and
+    /// `find_chain_ancestor` is a *rewind* helper: it resolves the volatile
+    /// selected chain and the immutable **tip**, and returns `None` for every
+    /// other immutable block. So `is_on_chain` said "yes, canonical" while
+    /// `find_chain_ancestor` said "no ancestor", the point was silently
+    /// skipped, and the server answered `MsgIntersectNotFound` to any anchor
+    /// deeper than its own immutable tip — which is precisely the set of deep
+    /// anchors dugite's own client offers
+    /// (`ChainDB::get_immutable_historical_points`). A client could only
+    /// intersect on our live tip block, exactly as observed on preprod, and
+    /// every peer slightly behind us was churned.
     async fn handle_find_intersect<B: BlockProvider>(
         &mut self,
         channel: &mut MuxChannel,
@@ -235,34 +248,29 @@ impl ServeCore {
                     return Ok(());
                 }
                 Point::Specific(slot, hash) => {
-                    if block_provider.is_on_chain(hash) {
-                        if let Some((actual_slot, ancestor_hash, _block_no)) =
-                            block_provider.find_chain_ancestor(hash)
-                        {
-                            if actual_slot == *slot && ancestor_hash == *hash {
-                                self.cursor_slot = *slot;
-                                self.cursor_hash = *hash;
-                                self.cursor_initialized = true;
-                                self.cursor_at_origin = false;
+                    if let Some(actual_slot) = block_provider.canonical_point_slot(hash) {
+                        if actual_slot == *slot {
+                            self.cursor_slot = *slot;
+                            self.cursor_hash = *hash;
+                            self.cursor_initialized = true;
+                            self.cursor_at_origin = false;
 
-                                let response =
-                                    encode_message(&ChainSyncMessage::MsgIntersectFound {
-                                        point: point.clone(),
-                                        tip_slot: tip.slot,
-                                        tip_hash: tip.hash,
-                                        tip_block_number: tip.block_number,
-                                    });
-                                channel.send(response).await.map_err(ProtocolError::from)?;
-                                return Ok(());
-                            }
-                            tracing::warn!(
-                                protocol = self.protocol,
-                                claimed_slot = slot,
-                                actual_slot,
-                                "chainsync server: MsgFindIntersect point claimed a slot that \
-                                 does not match the on-chain block's actual slot; rejecting"
-                            );
+                            let response = encode_message(&ChainSyncMessage::MsgIntersectFound {
+                                point: point.clone(),
+                                tip_slot: tip.slot,
+                                tip_hash: tip.hash,
+                                tip_block_number: tip.block_number,
+                            });
+                            channel.send(response).await.map_err(ProtocolError::from)?;
+                            return Ok(());
                         }
+                        tracing::warn!(
+                            protocol = self.protocol,
+                            claimed_slot = slot,
+                            actual_slot,
+                            "chainsync server: MsgFindIntersect point claimed a slot that \
+                             does not match the on-chain block's actual slot; rejecting"
+                        );
                     }
                 }
             }

@@ -102,6 +102,14 @@ impl BlockProvider for ChainDBBlockProvider {
         })
     }
 
+    fn canonical_point_slot(&self, hash: &[u8; 32]) -> Option<u64> {
+        let block_hash = dugite_primitives::hash::Hash32::from_bytes(*hash);
+        tokio::task::block_in_place(|| {
+            let db = self.chain_db.blocking_read();
+            db.canonical_point_slot(&block_hash).map(|s| s.0)
+        })
+    }
+
     fn find_chain_ancestor(&self, start_hash: &[u8; 32]) -> Option<(u64, [u8; 32], u64)> {
         let block_hash = dugite_primitives::hash::Hash32::from_bytes(*start_hash);
         tokio::task::block_in_place(|| {
