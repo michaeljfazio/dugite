@@ -95,33 +95,61 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 - 28-byte hash types (DRep keys, pool voter keys, required signers) must be padded to 32 bytes via `Hash28::to_hash32_padded()` — do not use `Hash<32>::from()` directly on 28-byte hashes
 
 ## Current Focus
-v2.2.0 released (2026-07-27). Four consensus-correctness fixes, all found by
-cross-validating against cardano-node 11.0.1:
+v2.2.2 released (2026-07-28). Five networking/consensus fixes ending the
+preprod sync churn — the "keep connecting and disconnecting" behaviour visible
+during catch-up. All five compound; none is a ledger divergence.
 
-- **Genesis decimals were rounded into millionths.** `float_to_rational` forced
-  a 1e6 denominator, so mainnet's real `priceSteps = 0.0000721` became
-  `9/125000 = 0.000072` — a 0.14% error in the price behind every Plutus script
-  min-fee. The same helper converts `a0`, `rho`, `tau`, `decentralisationParam`
-  and every `dvt_*`/`pvt_*` threshold, so it reached rewards, pool saturation,
-  leader election and ratification thresholds. Now converts exactly, as
-  Haskell's `Scientific` does.
-- **#903** — proposals were ratified in the epoch they were submitted. RATIFY's
-  signal is the pulser's `dpProposals`, frozen at the PREVIOUS boundary; dugite
-  fell back to the LIVE set before the first snapshot existed.
-- **#902** — `PraosState` was encoded with 7 fields; 11.0.x needs 8
-  (`praosStatePreviousEpochNonce`), which is now tracked consensus state.
-- **#904** — a restarted BP never forged again: `peer_tip` stayed 0 so the
-  catch-up gate measured a static tip against an advancing wall clock.
+- **#908 (client)** — the flap loop had **no backoff**. `cleanup_dead_connections`
+  called only `peer_disconnected()`, which drops a peer to Cold with
+  `next_connect_after` unset, so `eligible_cold` re-offered it on the next
+  governor tick (10 full cycles with one peer in 90 s; 45 in one 19 h log).
+  Everything the GC reaps died *unexpectedly* — every planned teardown removes
+  its connections from the map synchronously first — so the reap now applies
+  `peer_failed()`. Repeat reports for one teardown (protocol task **and** GC)
+  collapse inside a 2 s window: Haskell backs off per connection *attempt*.
+  Also, `MsgIntersectNotFound` for every offered point now classifies as
+  `PeerUnsuitable`/ForkTooDeep directly instead of "syncing from Origin".
+- **#908 (server)** — **dugite's ChainSync server answered
+  `MsgIntersectNotFound` to every point deeper than its own immutable tip.**
+  `handle_find_intersect` validated points with `find_chain_ancestor`, which is
+  a *rewind* helper: volatile selected chain + the immutable **tip** only. That
+  is exactly the anchor set dugite's own client offers
+  (`get_immutable_historical_points`), so a peer could only intersect on our
+  live tip block. New `BlockProvider::canonical_point_slot` resolves the whole
+  canonical chain. See [[reference_find_chain_ancestor_is_not_an_intersection_lookup]].
+- **#909** — bulk-sync hot demotion evicted the **active BlockFetch downloader**.
+  `peer_score` weights keepalive RTT 40%, and the downloader's pings queue
+  behind its own 2048-block payload stream, so the busiest peer ranked worst.
+  Haskell has no identity exclusion — `simpleChurnModePeerSelectionPolicy`
+  sorts by `fetchynessBytes` ascending and the metric *is* the protection.
+  Added a rolling fetched-bytes window; `hot_demotion_rank` uses it in bulk
+  sync, `peer_score` at tip. The churn-rotation path also gained the
+  fetch-slot exclusion it never had.
+- **#910** — the pipeline **could not drain**, so `MsgDone` was never sent and
+  a reused mux carried prior-session residue (`317 stale next-phase responses
+  … (bound 316)`, 45x). Root cause: dugite blasted 300 `MsgRequestNext`
+  unconditionally and refilled to 300 whenever `!at_tip`, parking 200-300
+  requests answerable only as blocks are minted. `pipeline_target_depth` now
+  bounds depth by the known block gap (Haskell `pipelineDecisionLowHighMark`):
+  1 at tip, unchanged at 300 during bulk sync. Cancel drains to zero then
+  sends `MsgDone`; the mux is reused only if that succeeded, else TCP close.
+  Residue tolerance 316 → 8.
+- **#911** — eager OCERT upper bound is now **advisory**. In the per-peer eager
+  view `m` is a single peer's reconstruction on a startup-frozen baseline that
+  is reset on `MsgRollBackward`, so a canonical header reads as an
+  over-increment (`got=474 last_seen=472` on a Koios-verified preprod block).
+  It already deferred to body apply, but WARNed like a rejection and never
+  advanced the counter, so every following header from that pool re-tripped.
+  Now: `debug!`, advance the high-water mark, still skip. Lower bound
+  (`CounterTooSmallOCERT`) stays fatal.
 
-**SNAPSHOT_VERSION 29 → 30 — existing ledger snapshots are replayed on
-upgrade.** Pre-v2.1.0 Mithril DBs still need a full `mithril-import`.
+No SNAPSHOT_VERSION change — v2.2.2 is a drop-in upgrade from v2.2.1.
+Pre-v2.1.0 Mithril DBs still need a full `mithril-import`.
 
-Current work: closing the two remaining query-surface divergences —
-**#905** (`query stake-distribution` rebuilds pool stake from live delegations
-and misses genesis-seeded ones) and **#906** (`GetProposals` drops govAction
-payloads and misorders results; `gov-state` is byte-identical apart from that
-embedded array). Neither affects consensus: pot parity is byte-exact and chain
-density tracks `f`.
+Open query-surface work (neither affects consensus): **#905**
+(`query stake-distribution` rebuilds pool stake from live delegations and
+misses genesis-seeded ones) and **#906** (`GetProposals` drops govAction
+payloads and misorders results).
 
 Soak testing via Sandstone Pool [SAND] on preview and preprod (pool IDs:
 preview `6954ec11cf7097a693721104139b96c54e7f3e2a8f9e7577630f7856`, preprod
