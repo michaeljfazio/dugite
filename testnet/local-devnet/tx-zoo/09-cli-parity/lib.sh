@@ -36,8 +36,17 @@ _parity_ensure_csv() {
 # Maps query name → tracking issue URL.
 # Populated by individual test scripts using: KNOWN_DIVERGENCES[name]=url
 declare -gA KNOWN_DIVERGENCES=(
-    # EMPTY — every one of the 18 comparable queries is byte-identical to
-    # cardano-node 11.0.1 as of v2.2.0+.
+    # drep-state — DRep expiry is one epoch LOW after an `UpdateDRep` cert that
+    # lands while `num_dormant_epochs > 0` (dugite 21, Haskell 22). dugite
+    # pre-subtracts the dormant count in `apply_conway_cert` and refunds it in
+    # `update_dormant_drep_expiry_for_tx`; the two only cancel once a
+    # proposal-carrying tx actually arrives, so the stored value is low for the
+    # whole quiet window. Needs the canonical `Conway.Rules.GovCert` rule
+    # sourced before any fix. Timing-dependent, which is why v2.2.1 recorded 0
+    # divergences.
+    [drep-state]="https://github.com/michaeljfazio/dugite/issues/912"
+    #
+    # Every other comparable query is byte-identical to cardano-node 11.0.1.
     #
     # This array is ONLY for real divergences: both sides answered and the
     # answers differ. It must never be used to paper over an ERROR row (that
