@@ -405,10 +405,19 @@ pub enum TxValidationError {
     /// dropping let dugite's forge mint blocks cardano-node rejected.
     ///
     /// `action_type` is the proposal's action name, for operator diagnosis.
+    ///
+    /// `proposal` is the full offending `ProposalProcedure` — Haskell's
+    /// `InvalidPrevGovActionId (ProposalProcedure era)` predicate payload is
+    /// the ENTIRE proposal, so the LocalTxSubmission encoder needs the whole
+    /// value (not just the lineage fields above) to emit a byte-exact
+    /// `ConwayGovPredFailure` tag-8 frame. Boxed for the same hot-path
+    /// enum-size reason as `dugite_ledger::validation::ValidationError`'s
+    /// mirror variant (dugite issue #915).
     InvalidPrevGovActionId {
         action_index: u32,
         action_type: String,
         prev_action_id: Option<String>,
+        proposal: Box<dugite_primitives::transaction::ProposalProcedure>,
     },
     /// `DisallowedVoters` (GOV tag 5): a voter type is not authorised for
     /// the action type of the referenced governance action.

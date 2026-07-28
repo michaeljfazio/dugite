@@ -57,7 +57,9 @@ use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::network::NetworkId;
 use dugite_primitives::protocol_params::ProtocolParameters;
 use dugite_primitives::time::EpochNo;
-use dugite_primitives::transaction::{GovAction, GovActionId, Transaction, Voter};
+use dugite_primitives::transaction::{
+    GovAction, GovActionId, ProposalProcedure, Transaction, Voter,
+};
 use dugite_primitives::value::Lovelace;
 use std::cell::Cell;
 use tracing::{debug, trace, warn};
@@ -1105,11 +1107,23 @@ pub enum ValidationError {
     ///
     /// Reference: Haskell `InvalidPrevGovActionId` (GOV predicate tag 8) in
     /// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`.
+    ///
+    /// `proposal` carries the full offending `ProposalProcedure` — Haskell's
+    /// payload for this predicate is the ENTIRE proposal, not just its
+    /// lineage fields, so the N2C rejection encoder
+    /// (`dugite-network::local_tx_submission::encode`) needs the whole
+    /// value to emit a byte-exact `ConwayGovPredFailure` tag-8 frame instead
+    /// of falling back to a generic rejection reason (dugite issue #915).
+    /// Boxed because `ProposalProcedure` (which itself boxes
+    /// `ProtocolParamUpdate` for `GovAction::ParameterChange`) would
+    /// otherwise make this the largest `ValidationError` variant by far,
+    /// bloating every `Vec<ValidationError>` on the hot rejection path.
     #[error("InvalidPrevGovActionId: proposal index {action_index} ({action_type})")]
     InvalidPrevGovActionId {
         action_index: u32,
         action_type: &'static str,
         prev_action_id: Option<GovActionId>,
+        proposal: Box<ProposalProcedure>,
     },
     /// Conway GOV rule (PV >= 11 only): one or more `ConstitutionalCommittee`
     /// votes carry a hot credential whose backing cold credential is NOT in
@@ -2795,6 +2809,7 @@ pub fn validate_transaction_with_context(
                         action_index: idx as u32,
                         action_type: gov_action_type_name(action),
                         prev_action_id: prev_id.cloned(),
+                        proposal: Box::new(proposal.clone()),
                     });
                 }
             }
