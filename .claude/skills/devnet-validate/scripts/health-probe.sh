@@ -100,6 +100,18 @@ if [ $PUBLIC -eq 1 ]; then
     SLOT_PARITY=20
 fi
 
+# Praos forge-gap budget (#917). On a single-forger devnet blocks_received is
+# always 0, so "no block in the window" is NOT a stall — it happens with
+# probability (1-f)^n for an n-slot gap. Flag only when the observed gap
+# exceeds the 99.9th percentile of that geometric distribution:
+#   limit = ceil(ln(0.001) / ln(1-f))    (f=0.5 → 10 slots; f=0.05 → 135)
+ACTIVE_SLOT_COEFF=${ACTIVE_SLOT_COEFF:-0.5}
+FORGE_GAP_LIMIT_SLOTS=$(awk -v f="$ACTIVE_SLOT_COEFF" 'BEGIN{
+    if (f <= 0 || f >= 1) { print 10; exit }
+    v = log(0.001) / log(1 - f)
+    print (v == int(v)) ? v : int(v) + 1
+}')
+
 ANOMALIES=()
 SUMMARY=()
 
@@ -280,23 +292,52 @@ FORGE_PREV=0
 # Process-restart detection: counters reset to a lower value when the
 # node restarts; clamp DELTA_BLOCKS_FORGE to 0 in that case so the
 # subsequent net-stall predicate doesn't fire on a false negative.
+RESTART_DETECTED=0
 if [ "$FORGE_NOW" -lt "$FORGE_PREV" ]; then
     info "blocks_forged went $FORGE_PREV → $FORGE_NOW — process restart detected"
     DELTA_BLOCKS_FORGE=0
+    RESTART_DETECTED=1
 else
     DELTA_BLOCKS_FORGE=$((FORGE_NOW - FORGE_PREV))
 fi
 echo "$FORGE_NOW" > "$FORGE_BASE"
 
+# Slots elapsed since the PREVIOUS probe (not just the 5s scrape window), so
+# the forge-gap accumulator below measures the true inter-probe gap.
+SLOT_BASE_FILE="$BASELINE_DIR/slot-${PORT}"
+SLOT_PREV_PROBE=""
+[ -f "$SLOT_BASE_FILE" ] && SLOT_PREV_PROBE=$(toi "$(cat "$SLOT_BASE_FILE")")
+echo "$SLOT_B_I" > "$SLOT_BASE_FILE"
+if [ -n "$SLOT_PREV_PROBE" ] && [ "$SLOT_B_I" -ge "$SLOT_PREV_PROBE" ]; then
+    SLOTS_SINCE_PROBE=$((SLOT_B_I - SLOT_PREV_PROBE))
+else
+    SLOTS_SINCE_PROBE=$SLOT_DELTA
+fi
+
 NET_OK=1
 if [ "$IS_BP_INT" -eq 1 ]; then
-    # BP role: liveness = forging OR receiving (relay-side traffic if multi-stream).
-    if [ "$SLOT_DELTA" -ge 1 ] && [ "$DELTA_BLOCKS_FORGE" -le 0 ] && [ "$DELTA_BLOCKS_RX" -le 0 ] && [ "$HOT_INT" -ge 1 ]; then
+    # BP role: liveness = forging OR receiving. A sole forger legitimately
+    # goes quiet for short Praos gaps, so accumulate the stalled slot-gap
+    # across consecutive probes and flag only when it exceeds
+    # FORGE_GAP_LIMIT_SLOTS (#917). Any forge/receive activity resets it.
+    STALL_BASE="$BASELINE_DIR/forge_stall_slots-${PORT}"
+    STALL_ACC=0
+    [ -f "$STALL_BASE" ] && STALL_ACC=$(toi "$(cat "$STALL_BASE")")
+    if [ "$SLOT_DELTA" -ge 1 ] && [ "$DELTA_BLOCKS_FORGE" -le 0 ] && [ "$DELTA_BLOCKS_RX" -le 0 ] \
+       && [ "$HOT_INT" -ge 1 ] && [ "$RESTART_DETECTED" -eq 0 ]; then
+        STALL_ACC=$((STALL_ACC + SLOTS_SINCE_PROBE))
         if [ "$PUBLIC" -eq 0 ]; then
-            fail "BP forge-stall: slot advanced by ${SLOT_DELTA} but blocks_forged delta=0 AND blocks_received delta=0 with hot peer"
-            NET_OK=0
+            if [ "$STALL_ACC" -gt "$FORGE_GAP_LIMIT_SLOTS" ]; then
+                fail "BP forge-stall: no block forged or received for ${STALL_ACC} consecutive slots (Praos p99.9 budget ${FORGE_GAP_LIMIT_SLOTS} at f=${ACTIVE_SLOT_COEFF})"
+                NET_OK=0
+            else
+                info "forge gap ${STALL_ACC}/${FORGE_GAP_LIMIT_SLOTS} slots — within Praos budget"
+            fi
         fi
+    else
+        STALL_ACC=0
     fi
+    echo "$STALL_ACC" > "$STALL_BASE"
 else
     # Relay/follower: liveness = receiving blocks from upstream.
     if [ "$SLOT_DELTA" -ge 1 ] && [ "$DELTA_BLOCKS_RX" -le 0 ] && [ "$HOT_INT" -ge 1 ]; then
@@ -394,10 +435,23 @@ if [ "$IS_BP_INT" -eq 1 ] && [ "$PUBLIC" -eq 0 ] && [ -n "$CARDANO_LOG" ] && [ -
     if [ -f "$ADOPT_BASE" ]; then
         PREV=$(toi "$(cat "$ADOPT_BASE")")
         DELTA=$((ADOPT_NOW - PREV))
-        if [ "$DELTA" -ge 1 ]; then
+        if [ "$ADOPT_NOW" -lt "$PREV" ]; then
+            # Log shrank — cardano-bp restart or log rotation. Re-baseline.
+            info "cardano-bp adoption count went $PREV → $ADOPT_NOW — restart/rotation detected, baseline reset"
+        elif [ "$DELTA" -ge 1 ]; then
             ok "cardano-bp adopted $DELTA new block(s) since last probe (total=$ADOPT_NOW)"
+        elif [ "$RESTART_DETECTED" -eq 1 ]; then
+            # dugite-bp restarted this window; forge deltas are stale (#917).
+            info "cardano-bp adoption delta suppressed — dugite-bp restart detected this probe"
+        elif [ "$DELTA_BLOCKS_FORGE" -ge 1 ]; then
+            # Blocks WERE forged since last probe but cardano-bp adopted none —
+            # that is real corroborated diffusion breakage, not a Praos gap.
+            fail "cardano-bp adopted 0 new blocks since last probe while dugite forged ${DELTA_BLOCKS_FORGE} (total stayed $ADOPT_NOW) — diffusion broken"
         else
-            fail "cardano-bp adopted 0 new blocks since last probe (total stayed $ADOPT_NOW) — diffusion or forge broken"
+            # No blocks forged in the window either — a Praos gap, nothing to
+            # adopt (#917: on a single-forger devnet this is a coin-flip, and
+            # the forge-gap accumulator above owns stall detection).
+            info "cardano-bp adopted 0 new blocks — no blocks forged in window (Praos gap)"
         fi
     else
         info "cardano-bp adoptions baseline established: $ADOPT_NOW"

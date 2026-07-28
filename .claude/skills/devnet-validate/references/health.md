@@ -191,7 +191,9 @@ Health is the **rate of change** of these counters between two probes (window = 
 | `dugite_chainsync_idle_seconds` | <2 × `1/f` (so <4s) | >30 → ChainSync server has stopped pushing |
 | `dugite_blocks_announced_total` | Tracks `blocks_forged_total` (BP) | Lags forge → block diffusion broken |
 
-The probe samples these counters twice (separated by ≥5s) and computes the per-second rate. Define **net-stall** as: `dugite_slot_number` advanced ≥1 ticks AND `dugite_blocks_received_total` did not increase AND a hot peer is present. That's an instant FAIL on devnet; on public testnets it only fails if `chainsync_idle_seconds > 30` simultaneously.
+The probe samples these counters twice (separated by ≥5s) and computes the per-second rate. Define **net-stall** as: `dugite_slot_number` advanced ≥1 ticks AND `dugite_blocks_received_total` did not increase AND a hot peer is present. For a **relay** that's an instant FAIL on devnet; on public testnets it only fails if `chainsync_idle_seconds > 30` simultaneously.
+
+For a **BP** the same conjunction is NOT an instant FAIL (#917): on a single-forger devnet `blocks_received` is always 0, so "no block in the window" collapses to a Praos coin-flip — P(no block in n slots) = (1−f)^n. The probe instead accumulates the stalled slot-gap across consecutive probes (baseline file `forge_stall_slots-<port>`) and fails only when the gap exceeds the 99.9th percentile of the geometric distribution implied by `f`: `ceil(ln(0.001)/ln(1−f))` slots (f=0.5 → 10; override `f` via `ACTIVE_SLOT_COEFF`). Any forge/receive activity, or a detected process restart, resets the accumulator. A genuine forge stall persists and crosses the budget within one or two probes; a Praos gap does not.
 
 ### Connection thrash detector
 
