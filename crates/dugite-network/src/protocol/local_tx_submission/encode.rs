@@ -424,6 +424,8 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
         // ConwayGovPredFailure inner tags (distinct from Ledger tags 1-9):
         //   0  = GovActionsDoNotExist          [govActionId, ...]
         //   5  = DisallowedVoters               [(voter, govActionId), ...]
+        //   8  = InvalidPrevGovActionId         proposalProcedure (single value,
+        //        NOT wrapped in an array — see the encoder arm below)
         //   9  = VotingOnExpiredGovAction        [(voter, govActionId), ...]
         //   14 = VotersDoNotExist               [voter, ...]
         //   16 = ProposalReturnAccountDoesNotExist  return_addr_bytes
@@ -540,6 +542,32 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
             });
         }
 
+        // Tag 8: InvalidPrevGovActionId — [8, <the whole ProposalProcedure>]
+        //
+        // Haskell (`Cardano.Ledger.Conway.Rules.Gov`):
+        //   InvalidPrevGovActionId (ProposalProcedure era)
+        // encoded via the `Sum` pattern as a ONE-field constructor: the
+        // entire `ProposalProcedure` value is the single payload item, not
+        // just its lineage fields. `proposal` was plumbed through from
+        // `dugite-ledger::validation::ValidationError` (dugite issue #915)
+        // specifically so this frame can be byte-exact instead of the
+        // generic `ConwayMempoolFailure` fallback below. Re-encoded with
+        // `dugite_serialization::encode_proposal_procedure` — the SAME
+        // function used to build `ProposalProcedure`s into transaction
+        // bodies for signing, so both paths stay byte-identical.
+        //
+        // Reference: `eras/conway/impl/src/Cardano/Ledger/Conway/Governance/Procedures.hs`
+        // (`EncCBOR ProposalProcedure`) and
+        // `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`
+        // (`ConwayGovPredFailure` tag 8).
+        TxValidationError::InvalidPrevGovActionId { proposal, .. } => {
+            let raw = dugite_serialization::encode_proposal_procedure(proposal);
+            encode_gov_failure(enc, 8, |enc| {
+                let writer = enc.writer_mut();
+                writer.extend_from_slice(&raw);
+            });
+        }
+
         // ── Fallback for all unmapped variants ──
         // ConwayMempoolFailure (Ledger tag 7): [7, "descriptive text"]
         //
@@ -547,14 +575,6 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
         // field values, hashes) to the client — that leaks pool IDs, stake
         // credential hashes, and other ledger internals. Log the full detail
         // server-side at DEBUG level and send only a generic reason.
-        // `InvalidPrevGovActionId` (GOV tag 8) deliberately falls through to
-        // the generic rejection below. Haskell's payload is the ENTIRE
-        // `ProposalProcedure`, which `ValidationError` does not carry — it
-        // keeps only the index, action type and prev id. Emitting a tag-8
-        // frame with a differently-shaped payload would make cardano-cli fail
-        // to decode the rejection, which is strictly worse than a generic
-        // reason. The consensus-critical property (the tx IS rejected) holds
-        // either way; only the operator-facing detail is coarser.
         _ => {
             tracing::debug!(
                 err = ?err,
@@ -1811,6 +1831,171 @@ mod tests {
         assert!(
             reason.contains("1:"),
             "must decode script disc=1, got: {reason}"
+        );
+    }
+
+    // ── Issue #915: `InvalidPrevGovActionId` (Ledger tag 3, GOV tag 8) ──
+
+    /// CBOR golden: `InvalidPrevGovActionId` with an `InfoAction` proposal.
+    ///
+    /// Exercises the worked example from dugite issue #915: deposit
+    /// 1,000,000 lovelace; mainnet keyhash return address with credential
+    /// `0x11` x 28; `InfoAction`; anchor url `"https://x"`, hash `0xAA` x 32.
+    /// Wire (bypassing the outer HFC/era wrapper, i.e. just the
+    /// `ConwayLedgerPredFailure`):
+    ///
+    /// ```text
+    /// 8203820884 1a000f4240 581de1<11x28> 8106 82 6968747470733a2f2f78 5820<aax32>
+    /// ```
+    ///
+    /// = `array(2)[3, array(2)[8, array(4)[1000000, bstr(29), [6], [url, hash]]]]`
+    #[test]
+    fn test_encode_invalid_prev_gov_action_id_golden() {
+        use dugite_primitives::hash::Hash32;
+        use dugite_primitives::transaction::{Anchor, GovAction, ProposalProcedure};
+        use dugite_primitives::value::Lovelace;
+
+        let return_addr: Vec<u8> = std::iter::once(0xE1)
+            .chain(std::iter::repeat_n(0x11, 28))
+            .collect();
+        let proposal = ProposalProcedure {
+            deposit: Lovelace(1_000_000),
+            return_addr,
+            gov_action: GovAction::InfoAction,
+            anchor: Anchor {
+                url: "https://x".to_string(),
+                data_hash: Hash32::from_bytes([0xAA; 32]),
+            },
+        };
+        let err = TxValidationError::InvalidPrevGovActionId {
+            action_index: 0,
+            action_type: "InfoAction".to_string(),
+            prev_action_id: None,
+            proposal: Box::new(proposal),
+        };
+
+        // Encode just the `ConwayLedgerPredFailure` sub-tree (bypassing the
+        // outer HFC/era wrapper) to assert the exact worked-example bytes.
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        encode_conway_ledger_pred_failure(&mut enc, &err);
+
+        let mut expected = vec![
+            0x82, 0x03, // ConwayLedgerPredFailure: array(2)[3, ...]
+            0x82, 0x08, // ConwayGovPredFailure: array(2)[8, ...]
+            0x84, // ProposalProcedure: array(4)
+            0x1a, 0x00, 0x0f, 0x42, 0x40, // deposit = 1_000_000
+            0x58, 0x1d, // return_addr: bstr(29)
+        ];
+        expected.push(0xe1); // mainnet keyhash reward-account header
+        expected.extend(std::iter::repeat_n(0x11u8, 28));
+        expected.extend([0x81, 0x06]); // gov_action: InfoAction = array(1)[6]
+        expected.push(0x82); // anchor: array(2)
+        expected.push(0x69); // text(9)
+        expected.extend(b"https://x");
+        expected.push(0x58);
+        expected.push(0x20); // bstr(32)
+        expected.extend([0xAAu8; 32]);
+
+        assert_eq!(buf, expected, "InvalidPrevGovActionId must be byte-exact");
+    }
+
+    /// Full-envelope check: `InvalidPrevGovActionId` through
+    /// `encode_apply_tx_err` decodes with the correct Ledger/GOV tags and
+    /// round-trips the deposit + gov_action fields.
+    #[test]
+    fn test_encode_invalid_prev_gov_action_id_full_envelope() {
+        use dugite_primitives::hash::Hash32;
+        use dugite_primitives::transaction::{Anchor, GovAction, ProposalProcedure};
+        use dugite_primitives::value::Lovelace;
+
+        let return_addr: Vec<u8> = std::iter::once(0xE0)
+            .chain(std::iter::repeat_n(0x22, 28))
+            .collect();
+        let proposal = ProposalProcedure {
+            deposit: Lovelace(500_000_000),
+            return_addr,
+            gov_action: GovAction::InfoAction,
+            anchor: Anchor {
+                url: "https://example.com".to_string(),
+                data_hash: Hash32::from_bytes([0xBB; 32]),
+            },
+        };
+        let err = TxValidationError::InvalidPrevGovActionId {
+            action_index: 1,
+            action_type: "InfoAction".to_string(),
+            prev_action_id: None,
+            proposal: Box::new(proposal),
+        };
+        let bytes = encode_apply_tx_err(&err, 6);
+
+        let (era, n) = decode_outer(&bytes);
+        assert_eq!(era, 6);
+        assert_eq!(n, 1);
+
+        let mut dec = Decoder::new(&bytes);
+        let _ = dec.array().unwrap();
+        let _ = dec.array().unwrap();
+        let _ = dec.u16().unwrap();
+        let _ = dec.array().unwrap();
+
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u8().unwrap(), 3, "Ledger tag 3 = ConwayGovFailure");
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u8().unwrap(), 8, "GOV tag 8 = InvalidPrevGovActionId");
+
+        // The whole ProposalProcedure is the single payload item.
+        assert_eq!(dec.array().unwrap(), Some(4));
+        let deposit = dec.u64().unwrap();
+        assert_eq!(deposit, 500_000_000);
+        let addr = dec.bytes().unwrap();
+        assert_eq!(addr.len(), 29);
+        assert_eq!(addr[0], 0xE0);
+        // gov_action: InfoAction = array(1)[6]
+        assert_eq!(dec.array().unwrap(), Some(1));
+        assert_eq!(dec.u8().unwrap(), 6);
+        // anchor: array(2)[url, hash]
+        assert_eq!(dec.array().unwrap(), Some(2));
+        let url = dec.str().unwrap();
+        assert_eq!(url, "https://example.com");
+        let hash = dec.bytes().unwrap();
+        assert_eq!(hash, &[0xBBu8; 32][..]);
+    }
+
+    /// Round-trip: encode → decode via the n2c_client decoder. The generic
+    /// `ConwayGovPredFailure` fallback (no dedicated tag-8 decode arm yet)
+    /// must still name the tag rather than erroring out or panicking.
+    #[test]
+    fn test_roundtrip_invalid_prev_gov_action_id_through_n2c_decoder() {
+        use dugite_primitives::hash::Hash32;
+        use dugite_primitives::transaction::{Anchor, GovAction, ProposalProcedure};
+        use dugite_primitives::value::Lovelace;
+
+        let return_addr: Vec<u8> = std::iter::once(0xE1)
+            .chain(std::iter::repeat_n(0x33, 28))
+            .collect();
+        let proposal = ProposalProcedure {
+            deposit: Lovelace(42),
+            return_addr,
+            gov_action: GovAction::InfoAction,
+            anchor: Anchor {
+                url: "https://y".to_string(),
+                data_hash: Hash32::from_bytes([0xCC; 32]),
+            },
+        };
+        let err = TxValidationError::InvalidPrevGovActionId {
+            action_index: 0,
+            action_type: "InfoAction".to_string(),
+            prev_action_id: None,
+            proposal: Box::new(proposal),
+        };
+        let bytes = encode_apply_tx_err(&err, 6);
+
+        let mut dec = Decoder::new(&bytes);
+        let reason = crate::n2c_client::decode_reject_reason(&mut dec).unwrap();
+        assert!(
+            reason.contains("tag=8"),
+            "must name GOV tag 8, got: {reason}"
         );
     }
 }

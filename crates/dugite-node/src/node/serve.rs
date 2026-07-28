@@ -953,10 +953,12 @@ pub(crate) fn convert_validation_error(
             action_index,
             action_type,
             prev_action_id,
+            proposal,
         } => TxValidationError::InvalidPrevGovActionId {
             action_index,
             action_type: action_type.to_string(),
             prev_action_id: prev_action_id.as_ref().map(gov_action_id_to_string),
+            proposal,
         },
         VE::UnelectedCommitteeVoters { hot_keys } => TxValidationError::UnelectedCommitteeVoters {
             // hot_keys are Hash32 (typed: byte 28 = 0x00 key, 0x01 script).

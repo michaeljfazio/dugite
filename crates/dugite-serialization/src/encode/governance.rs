@@ -103,7 +103,16 @@ pub(crate) fn encode_voting_procedure(proc: &VotingProcedure) -> Vec<u8> {
     buf
 }
 
-pub(crate) fn encode_proposal_procedure(pp: &ProposalProcedure) -> Vec<u8> {
+/// Encode a `ProposalProcedure` byte-exactly per Haskell `EncCBOR
+/// ProposalProcedure` (`eras/conway/impl/src/Cardano/Ledger/Conway/Governance/Procedures.hs`):
+/// `Rec ProposalProcedure !> To deposit !> To returnAddr !> To govAction !> To anchor`
+/// i.e. a plain (untagged) `array(4)[deposit, return_addr, gov_action, anchor]`.
+///
+/// `pub` (not `pub(crate)`): reused by `dugite-network`'s LocalTxSubmission
+/// rejection encoder to emit a byte-exact `InvalidPrevGovActionId` (GOV tag 8)
+/// frame — the same encoder already used for transaction-body construction,
+/// so both paths stay byte-identical by construction. See dugite issue #915.
+pub fn encode_proposal_procedure(pp: &ProposalProcedure) -> Vec<u8> {
     let mut buf = encode_array_header(4);
     buf.extend(encode_uint(pp.deposit.0));
     buf.extend(encode_bytes(&pp.return_addr));
