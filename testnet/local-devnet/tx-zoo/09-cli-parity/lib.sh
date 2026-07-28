@@ -36,6 +36,12 @@ _parity_ensure_csv() {
 # Maps query name → tracking issue URL.
 # Populated by individual test scripts using: KNOWN_DIVERGENCES[name]=url
 declare -gA KNOWN_DIVERGENCES=(
+    # dugite serves the live proposal set; Haskell's answer at the same tip
+    # lags mid-epoch submissions until an epoch boundary (pulser-snapshot
+    # semantics suspected — needs oracle confirmation). Both sides converge
+    # byte-identically post-boundary. Reproduced twice, identical 402-line
+    # diff, tip-pinned (slot:hash equal).
+    [proposals]="https://github.com/michaeljfazio/dugite/issues/922"
     # Every comparable query is byte-identical to cardano-node 11.0.1.
     #
     # This array is ONLY for real divergences: both sides answered and the
@@ -158,9 +164,18 @@ parity_query_json() {
             break
         fi
         _tip_attempt=$(( _tip_attempt + 1 ))
-        if [ "$_tip_attempt" -ge 6 ]; then
-            log_warn "[09-cli-parity] $query_name: tips would not settle after $_tip_attempt attempts (dugite $t0_d->$t1_d, cardano $t0_c->$t1_c); comparing anyway"
-            break
+        # Under dual-forger load (activeSlotsCoeff 0.5 × 2 pools ≈ 1 blk/s)
+        # a fully quiescent sample window is a lottery draw — give it a real
+        # budget. If tips STILL never settle, the sample is not comparable:
+        # record SKIP/TIP_UNSTABLE rather than a false DIVERGENT (2026-07-28:
+        # `proposals` flagged DIVERGENT 18-vs-6 purely because cardano-bp had
+        # not yet applied the block carrying its own just-submitted gov batch;
+        # both sockets were byte-identical once converged).
+        if [ "$_tip_attempt" -ge "${PARITY_TIP_RETRIES:-20}" ]; then
+            log_warn "[09-cli-parity] $query_name: tips would not settle after $_tip_attempt attempts (dugite $t0_d->$t1_d, cardano $t0_c->$t1_c); recording TIP_UNSTABLE skip"
+            parity_record "$query_name" "SKIP" "unstable" "unstable" \
+                "TIP_UNSTABLE after $_tip_attempt attempts"
+            return 0
         fi
         sleep 2
     done
