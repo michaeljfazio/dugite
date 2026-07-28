@@ -47,6 +47,7 @@ fn empty_ppu() -> ProtocolParamUpdate {
         tau: None,
         min_pool_cost: None,
         ada_per_utxo_byte: None,
+        min_utxo_value: None,
         cost_models: None,
         execution_costs: None,
         max_tx_ex_units: None,

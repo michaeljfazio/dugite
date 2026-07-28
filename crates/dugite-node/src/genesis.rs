@@ -439,6 +439,11 @@ impl ShelleyGenesis {
         params.rho = float_to_rational(gp.rho);
         params.tau = float_to_rational(gp.tau);
         params.min_pool_cost = Lovelace(gp.min_pool_cost);
+        // Flat Shelley/Allegra/Mary minimum UTxO value (issue #919). Haskell
+        // `getMinCoinTxOut` returns this directly for Shelley/Allegra and
+        // scales it in Mary's `scaledMinDeposit` — see
+        // `ProtocolParameters::min_coin_for_output`.
+        params.min_utxo_value = Lovelace(gp.min_u_tx_o_value);
         params.protocol_version_major = gp.protocol_version.major;
         params.protocol_version_minor = gp.protocol_version.minor;
         params.active_slots_coeff = self.active_slots_coeff;
@@ -742,6 +747,12 @@ impl AlonzoGenesis {
             // against it, so the (rare, single-lovelace) rounding loss from
             // integer division is unobservable at consensus level.
             params.ada_per_utxo_byte = Lovelace(lovelace_per_word / 8);
+            // Preserve the exact word-denominated value too (issue #919):
+            // Alonzo's own `utxoEntrySize * coinsPerUTxOWord` minimum-UTxO
+            // formula needs the LOSSLESS word value, not the lossy `/8`
+            // byte-denominated derivation above (which is Babbage/Conway's
+            // formula and must never be applied while PV <= 6 is in force).
+            params.coins_per_utxo_word = Lovelace(lovelace_per_word);
         }
 
         // Cost models

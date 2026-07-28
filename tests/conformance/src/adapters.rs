@@ -637,6 +637,13 @@ fn make_protocol_params(pp: &crate::schema::UtxoProtocolParams) -> ProtocolParam
         },
         min_pool_cost: Lovelace(170_000_000),
         ada_per_utxo_byte: Lovelace(pp.ada_per_utxo_byte),
+        // The ImpSpec `UtxoProtocolParams` test-vector schema doesn't carry
+        // Shelley/Allegra/Mary/Alonzo-only min-UTxO fields (issue #919) — the
+        // conformance corpus this adapter feeds targets Conway-era UTXO
+        // rules, so these are defaulted to the mainnet genesis values and
+        // never consulted by `min_coin_for_output`'s PV>=7 branch.
+        min_utxo_value: Lovelace(1_000_000),
+        coins_per_utxo_word: Lovelace(34_482),
         cost_models: transaction::CostModels::default(),
         execution_costs: transaction::ExUnitPrices {
             mem_price: Rational {
