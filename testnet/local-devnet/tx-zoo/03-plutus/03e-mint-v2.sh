@@ -8,7 +8,7 @@ ZOO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NAME="$(zoo_name)"
 zoo_require_devnet
 SCRIPT="$ZOO_DIR/lib/plutus/always-true-v2.plutus"
-[ -s "$SCRIPT" ] || { zoo_skip "missing $SCRIPT"; zoo_record "$NAME" SKIP; exit 0; }
+[ -s "$SCRIPT" ] || { zoo_record_env_skip "$NAME" "missing-script-binary $(basename "$SCRIPT")"; exit 0; }
 
 ADDR=$(cat "$ZOO_PAY_ADDR_FILE")
 UTXO=$(zoo_largest_utxo "$ADDR") || { zoo_record "$NAME" FAIL "" "no-utxo"; exit 1; }

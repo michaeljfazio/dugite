@@ -24,7 +24,7 @@ ZOO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NAME="$(zoo_name)"
 zoo_require_devnet
 SCRIPT="$ZOO_DIR/lib/plutus/always-true-v2.plutus"
-[ -s "$SCRIPT" ] || { zoo_skip "missing $SCRIPT"; zoo_record "$NAME" SKIP; exit 0; }
+[ -s "$SCRIPT" ] || { zoo_record_env_skip "$NAME" "missing-script-binary $(basename "$SCRIPT")"; exit 0; }
 
 REDEEMER="$ZOO_BUILT/$NAME.redeemer.json"
 echo '{"int": 0}' > "$REDEEMER"
@@ -93,7 +93,7 @@ rc=0
 build_and_submit_expect_reject "valid" || rc=$?
 case "$rc" in
     2) zoo_record "$NAME" FAIL "" "setup (valid polarity)"; exit 1 ;;
-    3) zoo_skip "collateral utxo too small"; zoo_record "$NAME" SKIP; exit 0 ;;
+    3) zoo_skip "collateral utxo too small"; zoo_record "$NAME" SKIP "" "collateral-utxo-too-small"; exit 0 ;;
     1) exit 1 ;;
 esac
 
@@ -101,7 +101,7 @@ rc=0
 build_and_submit_expect_reject "invalid" || rc=$?
 case "$rc" in
     2) zoo_record "$NAME" FAIL "" "setup (invalid polarity)"; exit 1 ;;
-    3) zoo_skip "collateral utxo too small"; zoo_record "$NAME" SKIP; exit 0 ;;
+    3) zoo_skip "collateral utxo too small"; zoo_record "$NAME" SKIP "" "collateral-utxo-too-small"; exit 0 ;;
     1) exit 1 ;;
 esac
 
