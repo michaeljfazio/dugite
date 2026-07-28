@@ -74,6 +74,67 @@ fn hash32_padded_to_28_bytes(h: &dugite_primitives::hash::Hash32) -> Vec<u8> {
     h.as_ref()[..28].to_vec()
 }
 
+/// The `drepExpiry` value that `GetDRepState` must report for one DRep.
+///
+/// Two distinct things are going on, and dugite previously did neither (#912).
+///
+/// **1. The stored expiry is the answer — never recompute it.**
+/// `DRepRegistration::drep_expiry` mirrors Haskell's `drepExpiry` and is
+/// maintained by every rule that may move it: `ConwayRegDRep` and
+/// `ConwayUpdateDRep` (`Conway.Rules.GovCert`, via `computeDRepExpiry`) and
+/// `updateVotingDRepExpiries` (`Conway.Rules.Certs`). Deriving the answer from
+/// `registered_epoch + drep_activity` instead — as this query used to — pins
+/// the reported expiry to registration time, so an `UpdateDRep` certificate or
+/// a cast vote never moves it. It is also simply undefined on a
+/// Haskell-snapshot import, where `registered_epoch` is not carried in the
+/// snapshot and is stored as epoch 0.
+///
+/// **2. The dormant refund is applied at *query* time, not in the state.**
+/// `queryDRepState` (cardano-ledger-api `Cardano.Ledger.Api.State.Query`)
+/// returns the DRep map through `Conway.updateDormantDRepExpiry (nes ^. nesELL)`
+/// applied to a **copy** of the `VState`:
+///
+/// ```haskell
+/// queryDRepState nes creds
+///   | null creds = updateDormantDRepExpiry' vState ^. vsDRepsL
+///   | otherwise = updateDormantDRepExpiry' vStateFiltered ^. vsDRepsL
+///   where
+///     updateDormantDRepExpiry' = Conway.updateDormantDRepExpiry (nes ^. nesELL)
+/// ```
+///
+/// So the epochs a DRep spent in a quiet-governance window are added back for
+/// reporting purposes even though the ledger has not (yet) refunded them — the
+/// in-state refund only happens when a proposal-carrying tx arrives
+/// (`updateDormantDRepExpiries`). Between the dormant period starting and the
+/// next proposal, the stored value is `num_dormant_epochs` lower than what
+/// `cardano-cli query drep-state` prints.
+///
+/// The `actual < current_epoch` guard is Haskell's, verbatim: a DRep that is
+/// already expired even after the refund is not revived by it.
+///
+/// ```haskell
+/// updateExpiry =
+///   drepExpiryL %~ \currentExpiry ->
+///     let actualExpiry = binOpEpochNo (+) numDormantEpochs currentExpiry
+///      in if actualExpiry < currentEpoch then currentExpiry else actualExpiry
+/// ```
+///
+/// This is a reporting-only adjustment: it must NOT be written back into the
+/// ledger state, or the refund would be applied twice.
+pub(crate) fn query_drep_expiry(
+    drep: &dugite_ledger::state::DRepRegistration,
+    num_dormant_epochs: u64,
+    current_epoch: dugite_primitives::EpochNo,
+) -> u64 {
+    let stored = drep.drep_expiry.0;
+    let actual = stored.saturating_add(num_dormant_epochs);
+    if actual < current_epoch.0 {
+        stored
+    } else {
+        actual
+    }
+}
+
 /// Build a `SnapshotStakeData` from a single `StakeSnapshot`.
 ///
 /// The `script_creds` set distinguishes script-hash credentials (type=1) from
@@ -257,7 +318,8 @@ impl Node {
             .dreps
             .iter()
             .map(|(hash, drep)| {
-                let expiry = drep.registered_epoch.0 + ls.epochs.protocol_params.drep_activity;
+                let expiry =
+                    query_drep_expiry(drep, ls.gov.governance.num_dormant_epochs, ls.epoch);
                 let delegator_hashes = delegators_by_drep.remove(hash).unwrap_or_default();
                 DRepSnapshot {
                     // DRep hash keys are Hash32 padded from 28-byte credential hashes.
@@ -1287,6 +1349,7 @@ fn protocol_params_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dugite_ledger::state::DRepRegistration;
     use dugite_ledger::LedgerState;
     use dugite_primitives::credentials::Credential;
     use dugite_primitives::hash::{Hash28, Hash32};
@@ -1294,6 +1357,7 @@ mod tests {
     use dugite_primitives::transaction::{
         Anchor, Constitution, GovAction, GovActionId, Rational, Vote, Voter, VotingProcedure,
     };
+    use dugite_primitives::{EpochNo, Lovelace};
     use std::sync::Arc;
 
     // ─── float_to_rational ───────────────────────────────────────────────────
@@ -1333,6 +1397,76 @@ mod tests {
         assert!(d > 0);
         let approx = n as f64 / d as f64;
         assert!((approx - std::f64::consts::PI).abs() < 1e-3);
+    }
+
+    // ─── query_drep_expiry ───────────────────────────────────────────────────
+    //
+    // #912: `GetDRepState` reported `registered_epoch + drep_activity` instead
+    // of the stored `drep_expiry`, and skipped the query-time dormant refund
+    // that Haskell's `queryDRepState` applies.  `drepExpiry` gates DRep
+    // activity, and an expired DRep drops out of the voting distribution, so a
+    // divergence here can become a ratification divergence.
+
+    /// A DRep whose stored expiry has moved away from `registered_epoch +
+    /// drep_activity` — i.e. one that has since received an `UpdateDRep`
+    /// certificate or cast a vote.  This is exactly the shape that #912
+    /// mis-reported.
+    fn drep_with(registered_epoch: u64, drep_expiry: u64) -> DRepRegistration {
+        DRepRegistration {
+            credential: Credential::VerificationKey(Hash28::from_bytes([0x11; 28])),
+            deposit: Lovelace(500_000_000),
+            anchor: None,
+            registered_epoch: EpochNo(registered_epoch),
+            drep_expiry: EpochNo(drep_expiry),
+            active: true,
+        }
+    }
+
+    #[test]
+    fn query_drep_expiry_reports_stored_expiry_not_registration_epoch() {
+        // Registered in epoch 1, then updated in epoch 2 with drep_activity=20
+        // => stored expiry 22.  The old code answered 1 + 20 = 21.
+        let drep = drep_with(1, 22);
+        assert_eq!(
+            query_drep_expiry(&drep, 0, EpochNo(3)),
+            22,
+            "UpdateDRep/vote must move the reported expiry"
+        );
+    }
+
+    #[test]
+    fn query_drep_expiry_adds_dormant_epochs_back() {
+        // Haskell `queryDRepState` runs `updateDormantDRepExpiry` over a copy of
+        // the VState, so quiet-governance epochs are refunded for reporting
+        // even though the ledger has not refunded them yet.
+        let drep = drep_with(1, 21);
+        assert_eq!(query_drep_expiry(&drep, 1, EpochNo(3)), 22);
+        assert_eq!(query_drep_expiry(&drep, 4, EpochNo(3)), 25);
+    }
+
+    #[test]
+    fn query_drep_expiry_does_not_revive_an_already_expired_drep() {
+        // Haskell: `if actualExpiry < currentEpoch then currentExpiry else actualExpiry`.
+        // 5 + 2 = 7 < 20 => the refund is discarded, not applied.
+        let drep = drep_with(1, 5);
+        assert_eq!(query_drep_expiry(&drep, 2, EpochNo(20)), 5);
+        // Boundary: `actual == current_epoch` is NOT "less than", so it applies.
+        assert_eq!(query_drep_expiry(&drep, 2, EpochNo(7)), 7);
+    }
+
+    #[test]
+    fn query_drep_expiry_is_defined_after_a_haskell_snapshot_import() {
+        // A Mithril/Haskell-snapshot import cannot carry `registered_epoch` and
+        // stores 0, but it does carry `drepExpiry` verbatim.  The old formula
+        // answered `0 + drep_activity` for every DRep on such a database.
+        let drep = drep_with(0, 431);
+        assert_eq!(query_drep_expiry(&drep, 0, EpochNo(400)), 431);
+    }
+
+    #[test]
+    fn query_drep_expiry_saturates_instead_of_overflowing() {
+        let drep = drep_with(0, u64::MAX);
+        assert_eq!(query_drep_expiry(&drep, 3, EpochNo(1)), u64::MAX);
     }
 
     // ─── credential_to_bytes ─────────────────────────────────────────────────
