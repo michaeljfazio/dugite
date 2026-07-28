@@ -6,6 +6,12 @@
 # Usage: analyze-evidence.sh <evidence_dir>
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Shared level-token counting — keeps this analyzer in exact agreement with
+# generate-release-report.sh (#916).
+# shellcheck source=lib/log-level-counts.sh
+source "$SCRIPT_DIR/lib/log-level-counts.sh"
+
 EVD="${1:-}"
 if [ -z "$EVD" ] || ! [ -d "$EVD" ]; then
     echo "Usage: $0 <evidence_dir>" >&2
@@ -96,13 +102,8 @@ declare -A ERR_COUNT WARN_COUNT
 for node in dugite-bp dugite-relay cardano-bp; do
     log="$LOG_DIR/$node.log"
     [ -f "$log" ] || continue
-    # Case-sensitive match anchored to log-level position so the lowercase
-    # substring `error=...` in benign WARN/INFO lines doesn't match.
-    # cardano-node 11.0.1+ uses new-tracer namespaces — match both legacy
-    # `TraceForgedInvalidBlock` and new `AddBlockValidation.InvalidBlock` /
-    # `Forge.Loop.ForgedInvalidBlock`.
-    ec=$(grep -cE ' ERROR | panicked|TraceForgedInvalidBlock|AddBlockValidation\.InvalidBlock|Forge\.Loop\.ForgedInvalidBlock' "$log" || true)
-    wc=$(grep -cE ' WARN | stale intersection' "$log" || true)
+    ec=$(count_log_errors "$log")
+    wc=$(count_log_warns "$log")
     ERR_COUNT[$node]=$ec
     WARN_COUNT[$node]=$wc
     if [ "$ec" -gt 0 ]; then

@@ -26,6 +26,12 @@
 # Exit codes: 0 = all rounds passed; 1 = one or more rounds failed; 2 = usage error.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Shared level-token counting — keeps log_errors/log_warns in exact agreement
+# with analyze-evidence.sh (#916).
+# shellcheck source=lib/log-level-counts.sh
+source "$SCRIPT_DIR/lib/log-level-counts.sh"
+
 # ---- Defaults ----------------------------------------------------------------
 PRESET="standard"
 RELEASE_TAG="null"
@@ -191,8 +197,8 @@ process_round() {
             local log="$logs_dir/$node.log"
             [ -f "$log" ] || continue
             local ec wc
-            ec=$(grep -ciE 'ERROR|panicked|TraceForgedInvalidBlock' "$log" || echo 0)
-            wc=$(grep -ciE 'WARN|stale intersection' "$log" || echo 0)
+            ec=$(count_log_errors "$log")
+            wc=$(count_log_warns "$log")
             [ "$first" -eq 0 ] && log_json+=","
             log_json+="\"$node\":{\"errors\":$ec,\"warns\":$wc}"
             first=0
