@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Shared library for adversarial N2N protocol tests (protocols/).
 #
-# Strategy: all tests speak raw Cardano N2N via socat or nc.
-# CBOR frames are constructed as hex strings and piped via socat to the
-# dugite-relay's N2N port.  We then assert:
+# Strategy: all tests speak raw Cardano N2N. CBOR frames are constructed as
+# hex strings and written to the dugite-relay's N2N port by the vendored
+# stdlib-only writer `tx-zoo/lib/raw-socket-send.py` (#923 — the previous
+# socat dependency silently PASSED every case on hosts without socat).
+# We then assert:
 #   1. The connection is terminated (peer demoted / disconnected)
 #   2. No panic in the logs
 #   3. No ERROR-level log lines that are NOT in the allowlist
@@ -21,8 +23,11 @@ LD_ROOT="$(cd "$PROTO_DIR/.." && pwd)"
 ADV_TARGET_HOST="127.0.0.1"
 ADV_TARGET_PORT="$LD_RELAY_PORT"
 
-# Timeout in seconds for a socat connection to be terminated after sending bad data
+# Timeout in seconds for the connection to be terminated after sending bad data
 ADV_EXPECT_CLOSE_SEC="${ADV_EXPECT_CLOSE_SEC:-10}"
+
+# Vendored raw-socket writer (shared with tx-zoo 08r, see #918/#923).
+ADV_RAW_SEND="${ADV_RAW_SEND:-$LD_ROOT/tx-zoo/lib/raw-socket-send.py}"
 
 # Output CSV for adversarial test results
 ADV_CSV="${ADV_CSV:-$LD_ROOT/evidence/current/n2n-trace.csv}"
@@ -102,25 +107,23 @@ adv_send_expect_close() {
     local hex_payload="$1"
     local timeout="${2:-$ADV_EXPECT_CLOSE_SEC}"
 
-    if ! command -v socat >/dev/null 2>&1; then
-        log_warn "socat not found — skipping adversarial frame send test"
-        return 0  # skip, not fail
+    # #923: the old socat path returned 0 (a PASS) when socat was missing, so
+    # every adversarial case in 01-07 recorded REJECTED without sending a
+    # byte. Now uses the vendored stdlib-only writer (python3 is a hard
+    # harness dependency); a missing writer is a loud failure, never a pass.
+    if [ ! -f "$ADV_RAW_SEND" ]; then
+        log_error "raw-socket-send.py not found at $ADV_RAW_SEND — adversarial send cannot run"
+        return 2
     fi
 
-    local tmp; tmp=$(mktemp)
-    printf '%s' "$hex_payload" | xxd -r -p > "$tmp" 2>/dev/null || {
-        printf '%s' "$hex_payload" | python3 -c "import sys,binascii; sys.stdout.buffer.write(binascii.unhexlify(sys.stdin.read().strip()))" > "$tmp"
-    }
-
     local rc=0
-    # socat: send binary payload, wait up to $timeout for close
-    timeout "$timeout" socat - "TCP:${ADV_TARGET_HOST}:${ADV_TARGET_PORT}" < "$tmp" > /dev/null 2>&1 \
-        && rc=0 || rc=$?
-    rm -f "$tmp"
-
-    # rc=124 = timeout (connection NOT closed) → bad
-    # rc=0 or rc=1 = connection closed (expected) → good
-    [ "$rc" -ne 124 ] && return 0 || return 1
+    python3 "$ADV_RAW_SEND" --tcp "${ADV_TARGET_HOST}:${ADV_TARGET_PORT}" \
+        --hex "$hex_payload" --read-timeout "$timeout" --expect-close \
+        > /dev/null 2>&1 || rc=$?
+    # exit 0 = sent, peer closed within timeout (expected reaction)
+    # exit 3 = peer left the connection open → adversarial frame tolerated
+    # exit 2 = could not connect/send → infrastructure failure, not a pass
+    [ "$rc" -eq 0 ]
 }
 
 # Check that no new non-allowlisted ERROR lines appeared since $since_line
