@@ -347,7 +347,14 @@ impl Governor {
         local_root_groups: &[LocalRootGroupTarget],
     ) -> Vec<GovernorAction> {
         let empty: HashSet<SocketAddr> = HashSet::new();
-        self.compute_actions_with_blp(peer_manager, local_root_groups, &empty, &empty, None)
+        self.compute_actions_with_blp(
+            peer_manager,
+            local_root_groups,
+            &empty,
+            &empty,
+            None,
+            &empty,
+        )
     }
 
     /// Like [`compute_actions`] but with explicit knowledge of which peers
@@ -380,6 +387,17 @@ impl Governor {
     /// topology-mandatory or long-interval (55 min churn); only the
     /// high-frequency `aboveTargetOther` path that fires every 2-second
     /// governor tick is guarded.
+    ///
+    /// `untrusted_established` is the set of OUTBOUND warm/hot peers that
+    /// are NOT in the [`Self::sync_trusted_only`] trusted set (computed by
+    /// the node via `NodePeerManager::untrusted_established_outbound()`,
+    /// which has the connection-direction visibility this crate lacks).
+    /// While the trusted-only clamp is active, every peer in this set is
+    /// demoted straight to Cold every tick — see the "self-healing demotion"
+    /// block below (#920). This is the retroactive counterpart to the
+    /// promotion-only clamps above: a peer established during a CaughtUp
+    /// period that later regresses is already Warm/Hot and would otherwise
+    /// never be touched by the promotion-side gates alone.
     pub fn compute_actions_with_blp(
         &mut self,
         peer_manager: &PeerManager,
@@ -387,6 +405,7 @@ impl Governor {
         big_ledger_peers: &HashSet<SocketAddr>,
         fresh_inbound: &HashSet<SocketAddr>,
         active_fetch_peer: Option<SocketAddr>,
+        untrusted_established: &HashSet<SocketAddr>,
     ) -> Vec<GovernorAction> {
         use rand::seq::IndexedRandom;
 
@@ -724,6 +743,48 @@ impl Governor {
             }
         }
 
+        // ── Trusted-only clamp: demote already-established untrusted
+        // peers (self-healing, #920) ────────────────────────────────────
+        //
+        // The promotion-side clamps above only stop the governor from
+        // ESTABLISHING a new untrusted peer. They cannot fix a peer that
+        // was already Warm/Hot before the clamp activated — e.g. one
+        // established during a CaughtUp period that later regresses to
+        // Syncing/PreSyncing. Haskell's `Governor.Monitor` handles this by
+        // actively demoting non-trusted peers the instant
+        // `requiresBootstrapPeers` starts returning true (the ledger
+        // judgement flips to TooOld): this block mirrors that.
+        //
+        // `untrusted_established` is precomputed by the node (direction
+        // visibility lives there, not in this crate) as exactly the HAA
+        // clause-(b) failure set — see
+        // `NodePeerManager::untrusted_established_outbound()`. Every tick
+        // the clamp is active, every entry is demoted straight to Cold: a
+        // Hot peer skips the Hot→Warm step other demotion paths use,
+        // because it must not remain established at all while the clamp
+        // holds.
+        //
+        // No cooldown is recorded (unlike every other demotion path in
+        // this function) — this is a planned policy teardown, not a
+        // connection failure, and the peer must be immediately
+        // re-promotable the instant the clamp lifts. There is also no
+        // `active_fetch_peer` exclusion: an untrusted peer holding the
+        // BlockFetch slot is precisely what must be torn down.
+        let mut trusted_clamp_demoted: HashSet<SocketAddr> = HashSet::new();
+        let mut trusted_clamp_demoted_hot = 0usize;
+        if self.sync_trusted_only.is_some() {
+            for &addr in untrusted_established {
+                actions.push(GovernorAction::DemoteToCold(addr));
+                trusted_clamp_demoted.insert(addr);
+                if peer_manager
+                    .get_peer(&addr)
+                    .is_some_and(|p| p.state == PeerState::Hot)
+                {
+                    trusted_clamp_demoted_hot += 1;
+                }
+            }
+        }
+
         // Demote hot → warm if above target.
         // Local root members are excluded — they must never be demoted by
         // aggregate targets, matching Haskell's `Set.\\ LocalRootPeers.keysSet`.
@@ -737,7 +798,13 @@ impl Governor {
         // cluster temporarily above target. The combined effect is the
         // atomic-swap behaviour the Haskell reference exhibits.
         let in_progress_warm_to_hot = self.in_progress_promote_warm.len();
-        let effective_hot_count = hot_count + in_progress_warm_to_hot;
+        // Subtract peers the trusted-only clamp sweep above already demoted
+        // to Cold this tick — `peer_manager` is a read-only snapshot from
+        // before this tick's actions were computed, so `hot_count` still
+        // counts them. Without this adjustment an active clamp inflates the
+        // apparent excess and can needlessly demote a trusted peer too.
+        let effective_hot_count =
+            (hot_count + in_progress_warm_to_hot).saturating_sub(trusted_clamp_demoted_hot);
         if effective_hot_count > self.config.targets.target_hot {
             use super::selection::hot_demotion_rank;
 
@@ -778,6 +845,12 @@ impl Governor {
                     // killing a mid-download fetch resets throughput to near zero
                     // until another peer claims the slot after its 10ms poll tick.
                     if active_fetch_peer == Some(addr) {
+                        return None;
+                    }
+                    // Already scheduled for a straight-to-Cold demotion by
+                    // the trusted-only clamp sweep above (#920) — do not
+                    // also demote it Hot→Warm here.
+                    if trusted_clamp_demoted.contains(&addr) {
                         return None;
                     }
                     peer_manager
@@ -848,7 +921,17 @@ impl Governor {
             // so at the bulk-sync cadence it could rotate out the live
             // downloader. Rank by fetchyness and exclude the slot holder, same
             // as `aboveTargetOther` above.
-            let fetch_exclusion: HashSet<SocketAddr> = active_fetch_peer.into_iter().collect();
+            //
+            // Also exclude peers the trusted-only clamp sweep already
+            // demoted straight to Cold this tick (#920) — a redundant
+            // `DemoteToWarm` for an already-gone connection is harmless
+            // (it reconciles via `NotConnected`) but noisy, and the churn
+            // slot is better spent rotating a peer that will still be
+            // established next tick.
+            let fetch_exclusion: HashSet<SocketAddr> = active_fetch_peer
+                .into_iter()
+                .chain(trusted_clamp_demoted.iter().copied())
+                .collect();
             if let Some(churn_out) =
                 select_worst_hot(peer_manager, self.bulk_sync_mode, &fetch_exclusion)
             {
@@ -1001,7 +1084,8 @@ mod tests {
         };
         let mut gov = Governor::new(config);
 
-        let actions = gov.compute_actions_with_blp(&pm, &[], &HashSet::new(), &fresh, None);
+        let actions =
+            gov.compute_actions_with_blp(&pm, &[], &HashSet::new(), &fresh, None, &HashSet::new());
         let promote_hot_count = actions
             .iter()
             .filter(|a| matches!(a, GovernorAction::PromoteToHot(_)))
@@ -1039,7 +1123,8 @@ mod tests {
         };
         let mut gov = Governor::new(config);
 
-        let actions = gov.compute_actions_with_blp(&pm, &[], &HashSet::new(), &fresh, None);
+        let actions =
+            gov.compute_actions_with_blp(&pm, &[], &HashSet::new(), &fresh, None, &HashSet::new());
         let promote_hot_count = actions
             .iter()
             .filter(|a| matches!(a, GovernorAction::PromoteToHot(_)))
@@ -1775,6 +1860,109 @@ mod tests {
         );
     }
 
+    /// #920: the promotion-only clamps above cannot fix a peer that was
+    /// already established BEFORE the clamp activated (e.g. during a
+    /// CaughtUp period that later regresses). The governor must actively
+    /// demote it — Haskell's `Governor.Monitor` target-clamping equivalent.
+    /// Trusted peers driven to Hot beforehand must be left untouched, the
+    /// demotion must be idempotent on a second tick, and clearing the
+    /// restriction must both stop the demotion AND leave the peer
+    /// immediately re-promotable (no cooldown recorded).
+    #[test]
+    fn sync_trusted_restriction_demotes_already_established_untrusted_peers() {
+        let mut pm = PeerManager::new();
+        let trusted_addr = test_addr(7120);
+        let public_addr = test_addr(7121);
+        pm.add_peer(trusted_addr, PeerSource::Topology);
+        pm.add_peer(public_addr, PeerSource::Ledger);
+        // Both peers reach Hot BEFORE the restriction is ever applied —
+        // simulating establishment during a prior CaughtUp period.
+        pm.promote_to_warm(&trusted_addr);
+        pm.promote_to_warm(&public_addr);
+        pm.promote_to_hot(&trusted_addr);
+        pm.promote_to_hot(&public_addr);
+
+        let config = GovernorConfig {
+            targets: PeerTargets {
+                target_warm: 10,
+                target_hot: 10,
+                max_cold: 100,
+                ..Default::default()
+            },
+            hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
+            cold_churn_interval: Duration::from_secs(3600),
+            warm_churn_interval: Duration::from_secs(3600),
+            demote_cooldown: Duration::from_secs(3600),
+        };
+        let mut gov = Governor::new(config);
+
+        // GSM regresses below CaughtUp: the node stores the restriction AND
+        // recomputes `untrusted_established` (the node-side enumeration
+        // this test stands in for).
+        gov.set_sync_trusted_restriction(Some([trusted_addr].into_iter().collect()));
+        let untrusted_established: HashSet<SocketAddr> = [public_addr].into_iter().collect();
+
+        let actions = gov.compute_actions_with_blp(
+            &pm,
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            None,
+            &untrusted_established,
+        );
+        assert!(
+            actions.contains(&GovernorAction::DemoteToCold(public_addr)),
+            "the untrusted established peer must be demoted straight to Cold"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, GovernorAction::DemoteToWarm(addr) | GovernorAction::DemoteToCold(addr) if *addr == trusted_addr)),
+            "the trusted peer must not be touched by the clamp demotion"
+        );
+
+        // Idempotent: a second tick (peer still Hot in this synthetic
+        // harness since the caller hasn't applied the action) re-emits the
+        // same demotion rather than erroring or skipping.
+        let actions2 = gov.compute_actions_with_blp(
+            &pm,
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            None,
+            &untrusted_established,
+        );
+        assert!(actions2.contains(&GovernorAction::DemoteToCold(public_addr)));
+
+        // No cooldown recorded for the clamp demotion — the peer must be
+        // immediately re-eligible once the restriction clears.
+        assert_eq!(
+            gov.cooldown_size(),
+            0,
+            "a clamp-driven demotion must not record a post-demote cooldown"
+        );
+
+        // Clearing the restriction stops the demotion and the peer is
+        // re-promotable on the very next tick (simulate: apply the
+        // real-world post-demotion state — Cold, no cooldown — then clear).
+        pm.demote_to_cold(&public_addr);
+        gov.set_sync_trusted_restriction(None);
+        let actions3 = gov.compute_actions(&pm, &[]);
+        assert!(
+            !actions3
+                .iter()
+                .any(|a| matches!(a, GovernorAction::DemoteToCold(addr) if *addr == public_addr)),
+            "demotion must stop once the restriction is cleared"
+        );
+        assert!(
+            actions3
+                .iter()
+                .any(|a| matches!(a, GovernorAction::PromoteToWarm(addr) if *addr == public_addr)),
+            "the peer must be immediately re-promotable with no cooldown"
+        );
+    }
+
     /// Aggregate cold→warm (belowTargetOther) must NOT promote topology peers —
     /// they are managed exclusively by the per-group belowTargetLocal path.
     /// This mirrors Haskell's `belowTargetOther` which excludes
@@ -2093,6 +2281,7 @@ mod tests {
             &blp_set,
             &::std::collections::HashSet::new(),
             None,
+            &::std::collections::HashSet::new(),
         );
 
         let promoted_warm: Vec<SocketAddr> = actions
@@ -2148,6 +2337,7 @@ mod tests {
             &blp_set,
             &::std::collections::HashSet::new(),
             None,
+            &::std::collections::HashSet::new(),
         );
 
         let promoted_hot: Vec<SocketAddr> = actions
@@ -2191,8 +2381,14 @@ mod tests {
             demote_cooldown: Duration::from_secs(3600),
         };
         let mut gov = Governor::new(config);
-        let actions =
-            gov.compute_actions_with_blp(&pm, &[], &HashSet::new(), &HashSet::new(), None);
+        let actions = gov.compute_actions_with_blp(
+            &pm,
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            None,
+            &HashSet::new(),
+        );
 
         let promoted_warm = actions
             .iter()
@@ -2293,6 +2489,7 @@ mod tests {
             &blp_set,
             &::std::collections::HashSet::new(),
             None,
+            &::std::collections::HashSet::new(),
         );
 
         let demotes: Vec<_> = actions
@@ -2362,6 +2559,7 @@ mod tests {
             &blp_set,
             &::std::collections::HashSet::new(),
             None,
+            &::std::collections::HashSet::new(),
         );
         let blp_promotes = actions
             .iter()
@@ -2414,6 +2612,7 @@ mod tests {
             &blp_set,
             &::std::collections::HashSet::new(),
             None,
+            &::std::collections::HashSet::new(),
         );
         let bad_reconnects = actions2
             .iter()
@@ -2483,6 +2682,7 @@ mod tests {
                 &blp_set,
                 &::std::collections::HashSet::new(),
                 None,
+                &::std::collections::HashSet::new(),
             );
             let demotes = actions
                 .iter()
@@ -2548,6 +2748,7 @@ mod tests {
             &blp_set,
             &::std::collections::HashSet::new(),
             None,
+            &::std::collections::HashSet::new(),
         );
         let victims: Vec<SocketAddr> = actions
             .iter()
@@ -2571,6 +2772,7 @@ mod tests {
             &blp_set,
             &::std::collections::HashSet::new(),
             None,
+            &::std::collections::HashSet::new(),
         );
         let victim_reconnects: Vec<_> = actions2
             .iter()
@@ -2648,6 +2850,7 @@ mod tests {
                 &blp_set,
                 &::std::collections::HashSet::new(),
                 None,
+                &::std::collections::HashSet::new(),
             );
             // Mirror lifecycle: apply promotions, treat DemoteToWarm as
             // Cold (the #516 single-use-channel workaround).
@@ -2731,6 +2934,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             Some(fetcher_addr), // active fetcher
+            &HashSet::new(),
         );
 
         let demoted: Vec<SocketAddr> = actions
@@ -2802,13 +3006,20 @@ mod tests {
         };
 
         let demotions = |gov: &mut Governor, pm: &PeerManager| -> Vec<SocketAddr> {
-            gov.compute_actions_with_blp(pm, &[], &HashSet::new(), &HashSet::new(), None)
-                .iter()
-                .filter_map(|a| match a {
-                    GovernorAction::DemoteToWarm(addr) => Some(*addr),
-                    _ => None,
-                })
-                .collect()
+            gov.compute_actions_with_blp(
+                pm,
+                &[],
+                &HashSet::new(),
+                &HashSet::new(),
+                None,
+                &HashSet::new(),
+            )
+            .iter()
+            .filter_map(|a| match a {
+                GovernorAction::DemoteToWarm(addr) => Some(*addr),
+                _ => None,
+            })
+            .collect()
         };
 
         // Deadline (at tip): latency is a legitimate quality signal, so the
@@ -2863,6 +3074,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             None, // no active fetcher
+            &HashSet::new(),
         );
 
         let demoted: Vec<SocketAddr> = actions
@@ -2917,6 +3129,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             Some(fetcher_addr),
+            &HashSet::new(),
         );
 
         let demoted: Vec<SocketAddr> = actions
