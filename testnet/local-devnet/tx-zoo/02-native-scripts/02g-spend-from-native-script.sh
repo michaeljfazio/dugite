@@ -13,7 +13,7 @@ if [ ! -s "$ZOO_BUILT/native-script-addr" ]; then
 fi
 SCRIPT_ADDR=$(cat "$ZOO_BUILT/native-script-addr")
 SCRIPT="$ZOO_BUILT/02f-pay-to-native-script.script.json"
-[ -s "$SCRIPT" ] || { zoo_skip "policy file missing from 02f"; zoo_record "$NAME" SKIP; exit 0; }
+[ -s "$SCRIPT" ] || { zoo_record_env_skip "$NAME" "policy-file-missing-from-02f"; exit 0; }
 
 ADDR=$(cat "$ZOO_PAY_ADDR_FILE")
 # Pick the UTxO at the script address.

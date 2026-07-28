@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""Byte-level surgery on cardano-cli text-envelope transactions.
+
+Dependency-free (stdlib only) on purpose: tx-zoo already requires python3 for
+anchor hashing and the anchor HTTP server, and adding a pip dependency would
+make the harness unrunnable on a fresh host — exactly the failure mode that
+kept 08r SKIPped behind `socat`.
+
+Why byte-level: `cardano-cli conway transaction build-raw` silently collapses
+repeated `--tx-in` arguments (the ledger's `inputs` field is a `Set TxIn`), so
+a duplicate-input transaction cannot be produced through the CLI at all. This
+tool splices the duplicate straight into the body CBOR, and re-serialises the
+envelope so `cardano-cli transaction sign` can sign the MODIFIED body (it
+hashes what it is given; the memoised body bytes round-trip verbatim).
+
+Subcommands
+-----------
+  show      --in FILE                 dump structure: input count, distinct count
+  body-hash --in FILE                 blake2b-256 of the tx BODY span (== the txid)
+  dup-input --in FILE --out FILE      duplicate one entry of the tx-body input set
+                                      [--index N] [--copies K]
+  sign      --in FILE --out FILE --signing-key-file K [-k K2 ...]
+                                      attach vkey witnesses, replacing the
+                                      witness set, leaving every other byte of
+                                      the transaction untouched
+
+All file arguments accept either a text-envelope JSON file
+(``{"type":..,"cborHex":..}``) or a file containing bare hex. Output mirrors
+the input format.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ed25519_pure  # noqa: E402  (path shim must precede the import)
+
+# ---------------------------------------------------------------------------
+# Minimal CBOR span parser.
+#
+# We do not need values, we need BYTE SPANS: to duplicate an input we copy the
+# raw encoding of one array element and re-emit the array head with a bumped
+# count. Decoding to Python objects and re-encoding would be wrong — it would
+# canonicalise the rest of the body and change the txid for reasons unrelated
+# to the test.
+# ---------------------------------------------------------------------------
+
+MT_UINT, MT_NINT, MT_BYTES, MT_TEXT, MT_ARRAY, MT_MAP, MT_TAG, MT_SIMPLE = range(8)
+
+INDEFINITE = -1
+
+
+class CborError(ValueError):
+    pass
+
+
+def _head(buf, pos):
+    """Return (major, arg, next_pos). arg is INDEFINITE for indefinite length."""
+    if pos >= len(buf):
+        raise CborError("truncated CBOR at offset %d" % pos)
+    ib = buf[pos]
+    major = ib >> 5
+    ai = ib & 0x1F
+    pos += 1
+    if ai < 24:
+        return major, ai, pos
+    if ai == 24:
+        return major, buf[pos], pos + 1
+    if ai == 25:
+        return major, int.from_bytes(buf[pos:pos + 2], "big"), pos + 2
+    if ai == 26:
+        return major, int.from_bytes(buf[pos:pos + 4], "big"), pos + 4
+    if ai == 27:
+        return major, int.from_bytes(buf[pos:pos + 8], "big"), pos + 8
+    if ai == 31:
+        return major, INDEFINITE, pos
+    raise CborError("reserved additional-info %d at offset %d" % (ai, pos - 1))
+
+
+def skip(buf, pos):
+    """Return the offset just past the complete CBOR item starting at pos."""
+    major, arg, pos = _head(buf, pos)
+    if major in (MT_UINT, MT_NINT):
+        return pos
+    if major in (MT_BYTES, MT_TEXT):
+        if arg == INDEFINITE:
+            while buf[pos] != 0xFF:
+                pos = skip(buf, pos)
+            return pos + 1
+        return pos + arg
+    if major == MT_ARRAY:
+        if arg == INDEFINITE:
+            while buf[pos] != 0xFF:
+                pos = skip(buf, pos)
+            return pos + 1
+        for _ in range(arg):
+            pos = skip(buf, pos)
+        return pos
+    if major == MT_MAP:
+        if arg == INDEFINITE:
+            while buf[pos] != 0xFF:
+                pos = skip(buf, pos)
+                pos = skip(buf, pos)
+            return pos + 1
+        for _ in range(arg):
+            pos = skip(buf, pos)
+            pos = skip(buf, pos)
+        return pos
+    if major == MT_TAG:
+        return skip(buf, pos)
+    if major == MT_SIMPLE:
+        if arg == INDEFINITE:
+            raise CborError("unexpected break at offset %d" % pos)
+        return pos
+    raise CborError("unhandled major type %d" % major)
+
+
+def encode_head(major, arg):
+    """Minimal-length head encoding for (major, arg). Mirrors canonical CBOR."""
+    if arg < 24:
+        return bytes([(major << 5) | arg])
+    if arg < 0x100:
+        return bytes([(major << 5) | 24, arg])
+    if arg < 0x10000:
+        return bytes([(major << 5) | 25]) + arg.to_bytes(2, "big")
+    if arg < 0x100000000:
+        return bytes([(major << 5) | 26]) + arg.to_bytes(4, "big")
+    return bytes([(major << 5) | 27]) + arg.to_bytes(8, "big")
+
+
+# ---------------------------------------------------------------------------
+# Transaction navigation
+# ---------------------------------------------------------------------------
+
+def body_span(buf):
+    """Return (start, end) of the transaction BODY map.
+
+    Accepts either a full transaction (array whose first element is the body
+    map, which is what a text envelope holds for both `Tx` and `TxBody` types
+    in cardano-cli 9+) or a bare body map.
+    """
+    major, arg, pos = _head(buf, 0)
+    if major == MT_MAP:
+        return 0, len(buf)
+    if major != MT_ARRAY:
+        raise CborError("expected transaction array or body map, got major %d" % major)
+    start = pos
+    return start, skip(buf, start)
+
+
+def input_set_span(buf, bstart, bend):
+    """Locate the tx-body `inputs` field (key 0).
+
+    Returns (head_start, items_start, end, count, is_tagged) where head_start is
+    the offset of the ARRAY head (after any tag 258 wrapper), items_start the
+    first element, end one past the last. `count` is INDEFINITE for an
+    indefinite-length array — cardano-ledger encodes a set of more than 23
+    elements that way, so any transaction with 24+ inputs takes that branch.
+    """
+    major, arg, pos = _head(buf, bstart)
+    if major != MT_MAP:
+        raise CborError("tx body is not a map (major %d)" % major)
+    if arg == INDEFINITE:
+        raise CborError("indefinite-length tx body map is not supported")
+    for _ in range(arg):
+        kstart = pos
+        kmajor, karg, kpos = _head(buf, kstart)
+        vstart = skip(buf, kstart)
+        vend = skip(buf, vstart)
+        if kmajor == MT_UINT and karg == 0:
+            vpos = vstart
+            tagged = False
+            vmajor, varg, vnext = _head(buf, vpos)
+            if vmajor == MT_TAG:
+                tagged = True
+                vpos = vnext
+                vmajor, varg, vnext = _head(buf, vpos)
+            if vmajor != MT_ARRAY:
+                raise CborError("tx-body inputs is not an array (major %d)" % vmajor)
+            return vpos, vnext, vend, varg, tagged
+        pos = vend
+    raise CborError("tx body has no inputs field (key 0)")
+
+
+def element_spans(buf, items_start, count):
+    """Byte spans of each array element. `count` may be INDEFINITE."""
+    spans = []
+    pos = items_start
+    if count == INDEFINITE:
+        while buf[pos] != 0xFF:
+            nxt = skip(buf, pos)
+            spans.append((pos, nxt))
+            pos = nxt
+        return spans
+    for _ in range(count):
+        nxt = skip(buf, pos)
+        spans.append((pos, nxt))
+        pos = nxt
+    return spans
+
+
+def dup_input(buf, index=0, copies=2):
+    """Return new tx bytes with input `index` present `copies` times."""
+    bstart, bend = body_span(buf)
+    head_start, items_start, _end, count, _tagged = input_set_span(buf, bstart, bend)
+    spans = element_spans(buf, items_start, count)
+    n = len(spans)
+    if n == 0:
+        raise CborError("tx has no inputs to duplicate")
+    if index >= n:
+        raise CborError("input index %d out of range (count=%d)" % (index, n))
+    extra = copies - 1
+    if extra < 1:
+        raise CborError("--copies must be >= 2")
+    estart, eend = spans[index]
+    entry = buf[estart:eend]
+    if count == INDEFINITE:
+        # No length to rewrite — splice the copies in before the break byte.
+        return buf[:eend] + entry * extra + buf[eend:]
+    new_head = encode_head(MT_ARRAY, n + extra)
+    return (
+        buf[:head_start]
+        + new_head
+        + buf[items_start:eend]
+        + entry * extra
+        + buf[eend:]
+    )
+
+
+TAG_SET = 258
+
+
+def tx_element_spans(buf):
+    """Spans of the top-level transaction array elements [body, wits, valid, aux]."""
+    major, arg, pos = _head(buf, 0)
+    if major != MT_ARRAY or arg == INDEFINITE:
+        raise CborError("expected a definite-length transaction array")
+    return element_spans(buf, pos, arg)
+
+
+def body_hash(buf):
+    """blake2b-256 over the BODY span — this is the transaction id."""
+    bstart, bend = body_span(buf)
+    return hashlib.blake2b(buf[bstart:bend], digest_size=32).digest()
+
+
+def _read_key_payload(path):
+    """Return the raw key bytes from a cardano-cli key text envelope."""
+    buf, _env = read_envelope(path)
+    major, arg, pos = _head(buf, 0)
+    if major != MT_BYTES or arg == INDEFINITE:
+        raise CborError("%s: key payload is not a definite-length byte string" % path)
+    return buf[pos:pos + arg]
+
+
+def encode_witness_set(witnesses):
+    """CBOR for `{0: 258([[vkey, sig], ...])}` — the vkey-witness-only witness set."""
+    out = bytearray()
+    out += encode_head(MT_MAP, 1)
+    out += encode_head(MT_UINT, 0)
+    out += encode_head(MT_TAG, TAG_SET)
+    out += encode_head(MT_ARRAY, len(witnesses))
+    for vkey, sig in witnesses:
+        out += encode_head(MT_ARRAY, 2)
+        out += encode_head(MT_BYTES, len(vkey)) + vkey
+        out += encode_head(MT_BYTES, len(sig)) + sig
+    return bytes(out)
+
+
+def sign_tx(buf, key_paths):
+    """Replace the witness set with vkey witnesses over the CURRENT body bytes.
+
+    Every other byte of the transaction is preserved verbatim — in particular
+    the body, so the txid stays whatever the (possibly hand-edited) body
+    hashes to.
+    """
+    spans = tx_element_spans(buf)
+    if len(spans) < 2:
+        raise CborError("transaction array has no witness-set element")
+    msg = body_hash(buf)
+    witnesses = []
+    for path in key_paths:
+        seed = _read_key_payload(path)
+        if len(seed) != 32:
+            raise CborError(
+                "%s: expected a 32-byte Ed25519 seed, got %d bytes "
+                "(extended/BIP32 keys are not supported)" % (path, len(seed))
+            )
+        witnesses.append((ed25519_pure.public_key(seed), ed25519_pure.sign(seed, msg)))
+    # `witnessSet.vkeywitness` is a `Set (WitVKey w)` whose Ord instance keys on
+    # the KeyHash (blake2b-224 of the vkey), NOT on the raw vkey bytes. Sorting
+    # the same way makes multi-key output byte-identical to
+    # `cardano-cli transaction sign`.
+    witnesses.sort(key=lambda w: hashlib.blake2b(w[0], digest_size=28).digest())
+    wstart, wend = spans[1]
+    return buf[:wstart] + encode_witness_set(witnesses) + buf[wend:]
+
+
+def describe(buf):
+    bstart, bend = body_span(buf)
+    _head_start, items_start, _end, count, tagged = input_set_span(buf, bstart, bend)
+    spans = element_spans(buf, items_start, count)
+    inputs = []
+    for estart, eend in spans:
+        # Each entry is [ txid_bytes32, index_uint ].
+        major, arg, pos = _head(buf, estart)
+        if major != MT_ARRAY or arg != 2:
+            inputs.append(buf[estart:eend].hex())
+            continue
+        tmajor, targ, tpos = _head(buf, pos)
+        txid = buf[tpos:tpos + targ].hex()
+        _imajor, iarg, _ipos = _head(buf, skip(buf, pos))
+        inputs.append("%s#%d" % (txid, iarg))
+    return {
+        "body_span": [bstart, bend],
+        "input_set_tagged_258": tagged,
+        "input_set_indefinite": count == INDEFINITE,
+        "input_count": len(spans),
+        "inputs": inputs,
+        "distinct_inputs": len(set(inputs)),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Envelope I/O
+# ---------------------------------------------------------------------------
+
+def read_envelope(path):
+    with open(path, "r") as f:
+        raw = f.read().strip()
+    if raw.startswith("{"):
+        env = json.loads(raw)
+        return bytes.fromhex(env["cborHex"]), env
+    return bytes.fromhex(raw), None
+
+
+def write_envelope(path, buf, env):
+    if env is None:
+        with open(path, "w") as f:
+            f.write(buf.hex() + "\n")
+        return
+    out = dict(env)
+    out["cborHex"] = buf.hex()
+    with open(path, "w") as f:
+        json.dump(out, f, indent=4)
+        f.write("\n")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_show = sub.add_parser("show", help="print input-set structure as JSON")
+    p_show.add_argument("--in", dest="inp", required=True)
+
+    p_hash = sub.add_parser("body-hash", help="print blake2b-256 of the tx body (txid)")
+    p_hash.add_argument("--in", dest="inp", required=True)
+
+    p_dup = sub.add_parser("dup-input", help="duplicate one tx-body input entry")
+    p_dup.add_argument("--in", dest="inp", required=True)
+    p_dup.add_argument("--out", dest="out", required=True)
+    p_dup.add_argument("--index", type=int, default=0)
+    p_dup.add_argument("--copies", type=int, default=2)
+
+    p_sign = sub.add_parser("sign", help="attach vkey witnesses to the given body")
+    p_sign.add_argument("--in", dest="inp", required=True)
+    p_sign.add_argument("--out", dest="out", required=True)
+    p_sign.add_argument(
+        "--signing-key-file", "-k", dest="keys", action="append", required=True
+    )
+    p_sign.add_argument(
+        "--type",
+        dest="env_type",
+        default="Tx ConwayEra",
+        help="text-envelope type written to --out (default: Tx ConwayEra)",
+    )
+
+    args = ap.parse_args(argv)
+
+    try:
+        buf, env = read_envelope(args.inp)
+        if args.cmd == "show":
+            print(json.dumps(describe(buf), indent=2))
+            return 0
+        if args.cmd == "body-hash":
+            print(body_hash(buf).hex())
+            return 0
+        if args.cmd == "sign":
+            new = sign_tx(buf, args.keys)
+            if env is not None:
+                env = dict(env)
+                env["type"] = args.env_type
+                env["description"] = "Ledger Cddl Format"
+            write_envelope(args.out, new, env)
+            print(body_hash(new).hex())
+            return 0
+        new = dup_input(buf, index=args.index, copies=args.copies)
+        write_envelope(args.out, new, env)
+        print(json.dumps(describe(new), indent=2))
+        return 0
+    except (CborError, OSError, ValueError) as exc:
+        print("tx-cbor-tool: %s" % exc, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

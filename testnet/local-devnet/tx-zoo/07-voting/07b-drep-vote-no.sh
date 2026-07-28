@@ -7,7 +7,7 @@ ZOO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 NAME="$(zoo_name)"
 zoo_require_devnet
-ACTION=$(zoo_gov_action_id) || { zoo_skip "no action"; zoo_record "$NAME" SKIP; exit 0; }
+ACTION=$(zoo_gov_action_id) || { zoo_skip "no action"; zoo_record "$NAME" SKIP "" "no-action"; exit 0; }
 DREP="$ZOO_KEYS/drep-2"
 WA="$ZOO_KEYS/wallet-a"
 ADDR=$(cat "$WA/payment-stake.addr")
