@@ -20,6 +20,9 @@ tx-zoo/
 │   ├── tx-zoo-common.sh       (shared helpers — sourced by every script)
 │   ├── keygen.sh              (provisions sub-payment, stake, DRep, CC, pool keys)
 │   ├── build-plutus.sh        (compiles or vendors Plutus binaries)
+│   ├── raw-socket-send.py     (write arbitrary bytes to a unix/TCP socket)
+│   ├── tx-cbor-tool.py        (byte-level tx surgery: show/dup-input/sign)
+│   ├── ed25519_pure.py        (RFC 8032 signer — stdlib only, self-testing)
 │   ├── plutus/                (Plutus V1/V2/V3 always-true binaries)
 │   └── native/                (sample native script JSONs)
 │
@@ -53,6 +56,9 @@ cd testnet/local-devnet && ./run.sh
 
 # 6. Inspect results
 column -t -s, ./tx-zoo/state/results.csv
+
+# 7. Fail the run if any script skipped for an ENVIRONMENTAL reason
+./tx-zoo/run-all.sh --strict-skips
 ```
 
 Override the target socket per-run with `ZOO_SOCKET=<sock>` (defaults to
@@ -68,6 +74,45 @@ A script PASSES when:
 
 Negative tests (08-) invert (2): they PASS when the submit *fails* with
 a specific expected error.
+
+## Skips are classified (#918)
+
+A permanent SKIP is indistinguishable from a PASS in a summary line, which
+is how three scripts (`08r`, `08f`, `11c`) claimed coverage they had never
+once exercised. `run-all.sh` therefore splits them:
+
+- **ENV-SKIP** — the check could not run *at all* on this host: a missing
+  tool, key, binary, or harness capability. Structural: it will skip
+  identically on every future run. Listed separately in the summary, and
+  `./run-all.sh --strict-skips` exits non-zero when any are present.
+- **SKIP** — the chain legitimately lacked the precondition this round
+  (e.g. `04g no-rewards` before the first epoch boundary). Non-fatal by
+  design; a later round covers it.
+
+Record the first kind with `zoo_record_env_skip "$NAME" "<reason>"` (it
+prefixes the detail with `env:`); the status column stays `SKIP`, so every
+existing consumer of `results.csv` is unaffected. Reasons predating the
+convention are classified by the pattern tables in `lib/tx-zoo-common.sh`.
+
+Required tooling (`cardano-cli`, `jq`, `python3`, `curl`) is checked once,
+loudly, by `./run-all.sh --setup` — a missing required tool is a hard error
+there rather than a silent per-script SKIP at run time.
+
+## Vendored python helpers
+
+tx-zoo depends on `python3` already, so capabilities that would otherwise
+need an extra binary are vendored (stdlib only, no pip):
+
+- `lib/raw-socket-send.py` — writes arbitrary/malformed bytes to a unix or
+  TCP socket and reports the connection outcome. Replaces `socat`, which is
+  not installed by default on macOS or minimal CI images.
+- `lib/tx-cbor-tool.py` — `show` / `body-hash` / `dup-input` / `sign` on a
+  text-envelope transaction, operating on byte spans so nothing but the
+  edited field changes. Needed because cardano-cli cannot represent some
+  adversarial transactions at all (see `08f`).
+- `lib/ed25519_pure.py` — RFC 8032 signer used by `tx-cbor-tool sign`.
+  Never trusted blind: callers sign a body cardano-cli *can* sign and
+  byte-compare the two signatures first.
 
 ## Coverage matrix
 

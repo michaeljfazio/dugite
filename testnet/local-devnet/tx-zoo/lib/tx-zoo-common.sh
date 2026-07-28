@@ -41,6 +41,91 @@ zoo_name() {
     basename "$s" .sh
 }
 
+# ---- Vendored python helpers ----
+# tx-zoo depends on python3 already (anchor hashing, the anchor HTTP server).
+# These two tools exist so no test has to reach for a binary that may not be
+# installed — `socat` was the reason 08r skipped on every single run.
+ZOO_PY_RAW_SEND="$ZOO_LIB/raw-socket-send.py"   # write raw bytes to a socket
+ZOO_PY_TX_CBOR="$ZOO_LIB/tx-cbor-tool.py"       # byte-level tx surgery + signing
+
+# ---- Required / optional tooling ----
+#
+# REQUIRED tools are checked once, loudly, at `run-all.sh --setup` (and at the
+# start of a default run). A missing required tool is a hard error there rather
+# than a per-script SKIP at run time: a SKIP is indistinguishable from a PASS in
+# the summary line, which is exactly how 08r's malformed-CBOR coverage went
+# missing for months (#918).
+ZOO_REQUIRED_TOOLS="cardano-cli jq python3 curl"
+# OPTIONAL tools degrade coverage but do not stop the run; their absence is
+# announced so it is visible in the log.
+ZOO_OPTIONAL_TOOLS="aiken cardano-node"
+
+zoo_require_tools() {
+    local missing="" t
+    for t in $ZOO_REQUIRED_TOOLS; do
+        command -v "$t" >/dev/null 2>&1 || missing="$missing $t"
+    done
+    if [ -n "$missing" ]; then
+        die "tx-zoo: required tool(s) not installed:${missing} — install them and re-run './run-all.sh --setup'. tx-zoo refuses to run a suite whose coverage would silently disappear into SKIPs."
+    fi
+    for t in $ZOO_OPTIONAL_TOOLS; do
+        command -v "$t" >/dev/null 2>&1 \
+            || zoo_info "optional tool not found: $t — dependent cases will env-skip"
+    done
+    for t in "$ZOO_PY_RAW_SEND" "$ZOO_PY_TX_CBOR" "$ZOO_LIB/ed25519_pure.py"; do
+        [ -s "$t" ] || die "tx-zoo: vendored helper missing: $t"
+    done
+    # The vendored signer is load-bearing for 08f; prove it against the RFC 8032
+    # vectors here rather than discovering it is broken mid-suite.
+    python3 "$ZOO_LIB/ed25519_pure.py" >/dev/null \
+        || die "tx-zoo: vendored ed25519 failed its RFC 8032 self-test"
+}
+
+# ---- Skip classification ----
+#
+# Two kinds of SKIP, and conflating them is what #918 is about:
+#
+#   env   — the check could not run AT ALL on this host: a tool, binary, key
+#           file or harness capability is missing. This is structural: it will
+#           skip identically on every future run, so the surface it claims to
+#           cover is never exercised. Must be visible.
+#   state — the chain legitimately does not offer the precondition in THIS
+#           round (04g `no-rewards` before the first epoch boundary, a gov
+#           action that has not been enacted yet, a UTxO another script just
+#           spent). A later round covers it; non-fatal by design.
+#
+# New scripts record the first kind with `zoo_record_env_skip`, which prefixes
+# the detail with `env:`. The pattern tables below classify the reasons that
+# predate the convention. Status stays `SKIP` in column 3 so every existing
+# consumer of results.csv (soak.sh, generate-release-report.sh) keeps working.
+ZOO_ENV_SKIP_PREFIX="env:"
+
+# Checked FIRST: reasons that look environmental but are genuinely chain state.
+ZOO_STATE_SKIP_PATTERN='submit-failed|slot-did-not-advance|already-registered|no-rewards|not-registered|empty-committee|not-on-committee|cc-not-authorized|no-precondition|no-action|no-prior-action|no-asset|no-script-utxo|no-proposal-actionid|no-expected-min-fee-a|no-enacted-pparam-root|utxo too small|no-txs-drained'
+ZOO_ENV_SKIP_PATTERN='^env:|not[-_ ]found|not[-_ ]available|^missing|missing |dedupes|no-txs-(built|submitted)|-failed|could-not-derive|keys?$|keys? \(|socat|aiken'
+
+# Print "env" or "state" for a results.csv detail field. Unrecognised reasons
+# classify as "state" on purpose: --strict-skips must never fail on a reason
+# nobody has triaged. Use zoo_record_env_skip to opt a new reason in.
+zoo_skip_class() {
+    local detail="${1:-}"
+    if printf '%s' "$detail" | grep -qiE "$ZOO_STATE_SKIP_PATTERN"; then
+        echo state
+    elif printf '%s' "$detail" | grep -qiE "$ZOO_ENV_SKIP_PATTERN"; then
+        echo env
+    else
+        echo state
+    fi
+}
+
+# Record a SKIP that means "this coverage did not run and will not run until
+# the environment is fixed".
+zoo_record_env_skip() {
+    local name="$1" reason="${2:-unspecified}" txid="${3:-}"
+    zoo_skip "$name — $reason (ENVIRONMENTAL: coverage did not run)"
+    zoo_record "$name" SKIP "$txid" "${ZOO_ENV_SKIP_PREFIX}${reason}"
+}
+
 # ---- Devnet liveness ----
 zoo_require_devnet() {
     [ -S "$ZOO_SOCKET" ] || die "tx-zoo: socket not present at $ZOO_SOCKET — run ./run.sh"
@@ -241,6 +326,44 @@ zoo_wait_all_observers() {
         return 0
     fi
     zoo_fail "tx $txid only on $n/3 observers after ${timeout}s (relay=$relay_seen dbp=$dbp_seen cbp=$cbp_seen)"
+    return 1
+}
+
+# ---- Mempool helpers ----
+# Number of transactions currently in the mempool at $1 (default $ZOO_SOCKET).
+# Prints "0" when the query fails, so callers can use it in arithmetic.
+zoo_mempool_txcount() {
+    local sock="${1:-$ZOO_SOCKET}" n
+    n=$(cardano-cli conway query tx-mempool info \
+            --testnet-magic "$LD_MAGIC" \
+            --socket-path   "$sock" 2>/dev/null \
+        | jq -r '.numberOfTxs // 0' 2>/dev/null) || n=0
+    case "$n" in
+        ''|*[!0-9]*) echo 0 ;;
+        *)           echo "$n" ;;
+    esac
+}
+
+# Block until the mempool is empty (or $1 seconds elapse). Returns 0 when it
+# drained, 1 on timeout.
+#
+# Scripts that pick a UTxO with zoo_largest_utxo need this: the ledger view
+# still lists an input that an earlier script's *pending* transaction has
+# already claimed, so building on it yields an unavoidable input-conflict
+# rejection at submit time. That is how 11c came to record `no-txs-submitted`
+# on every run (#918) — it inherited 11a/11b's in-flight transactions.
+zoo_wait_mempool_quiet() {
+    local timeout="${1:-90}" sock="${2:-$ZOO_SOCKET}" i=0 n
+    while [ "$i" -lt "$timeout" ]; do
+        n=$(zoo_mempool_txcount "$sock")
+        if [ "$n" -eq 0 ]; then
+            [ "$i" -gt 0 ] && zoo_info "mempool drained after ${i}s"
+            return 0
+        fi
+        sleep 2
+        i=$((i + 2))
+    done
+    zoo_info "mempool still holds $(zoo_mempool_txcount "$sock") tx after ${timeout}s"
     return 1
 }
 
