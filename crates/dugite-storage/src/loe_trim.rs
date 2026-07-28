@@ -156,25 +156,30 @@ pub fn loe_verdict_for_candidate(
         return LoeVerdict::Allowed;
     }
 
-    // Walk ancestry, recording the path so a >k overshoot can be trimmed to
-    // the ancestor exactly k blocks past the LoE tip. Cap generously: an
-    // adoptable candidate is within k of the LoE tip, and the fragment has
-    // at most `members` blocks beyond the anchor.
-    let cap = view
-        .k
-        .saturating_add(view.members.len() as u64)
-        .saturating_add(2);
-    // path[i] is the block at depth (depth_at_hit − i) once the hit is found;
-    // path[0] = candidate tip.
-    let mut path: Vec<Hash32> = Vec::new();
+    // Walk ancestry until the LoE tip (or anchor) is found. The walk depth is
+    // unbounded in principle: during bulk sync BlockFetch accumulates a
+    // candidate chain arbitrarily far past a briefly-pinned LoE tip (mainnet
+    // Byron 2026-07-28: 257k blocks), and Haskell's `trimToLoE` still trims it
+    // to `candPrefix ++ takeOldest k candSuffix` — deferring it outright
+    // froze selection until the LoE jumped. The only hard cap is a cycle
+    // guard: a well-formed chain visits each VolatileDB block at most once.
+    let cap = (volatile.len() as u64).saturating_add(1);
+    // Sliding window of the last ≤ k path entries (newest at the back). At a
+    // hit of depth d > k the adoptable tip is the ancestor exactly k blocks
+    // past the hit — the FRONT of the window.
+    let mut window: std::collections::VecDeque<Hash32> = std::collections::VecDeque::new();
+    let mut depth: u64 = 0;
     let mut cur = *candidate_tip;
     loop {
         let Some(block) = volatile.get_block(&cur) else {
             // Candidate tip itself unknown — nothing to adopt.
             return LoeVerdict::Deferred;
         };
-        path.push(cur);
-        let depth = path.len() as u64; // blocks beyond a hit at `parent`
+        if view.k > 0 && window.len() as u64 == view.k {
+            window.pop_front();
+        }
+        window.push_back(cur);
+        depth += 1; // blocks beyond a hit at `parent`
         let parent = block.prev_hash;
 
         let tip_hit = view.is_tip(&parent) || (tip_is_origin && !volatile.has_block(&parent));
@@ -189,11 +194,13 @@ pub fn loe_verdict_for_candidate(
             return if depth <= view.k {
                 LoeVerdict::Allowed
             } else {
-                // Trim to the ancestor exactly k past the hit:
-                // path[depth-1] is depth 1; ancestor at depth k is
-                // path[depth - k].
-                let idx = (depth - view.k) as usize;
-                LoeVerdict::TrimmedTo(path[idx])
+                // Trim to the ancestor exactly k past the hit: with the
+                // window holding the last k entries, that is its front.
+                // (k = 0 leaves nothing adoptable.)
+                match window.front() {
+                    Some(t) if view.k > 0 => LoeVerdict::TrimmedTo(*t),
+                    _ => LoeVerdict::Deferred,
+                }
             };
         }
         if view.is_member(&parent) {
@@ -208,6 +215,7 @@ pub fn loe_verdict_for_candidate(
         }
 
         if depth >= cap {
+            // Cycle guard only — unreachable on a well-formed chain.
             return LoeVerdict::Deferred;
         }
         cur = parent;
