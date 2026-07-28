@@ -36,17 +36,7 @@ _parity_ensure_csv() {
 # Maps query name → tracking issue URL.
 # Populated by individual test scripts using: KNOWN_DIVERGENCES[name]=url
 declare -gA KNOWN_DIVERGENCES=(
-    # drep-state — DRep expiry is one epoch LOW after an `UpdateDRep` cert that
-    # lands while `num_dormant_epochs > 0` (dugite 21, Haskell 22). dugite
-    # pre-subtracts the dormant count in `apply_conway_cert` and refunds it in
-    # `update_dormant_drep_expiry_for_tx`; the two only cancel once a
-    # proposal-carrying tx actually arrives, so the stored value is low for the
-    # whole quiet window. Needs the canonical `Conway.Rules.GovCert` rule
-    # sourced before any fix. Timing-dependent, which is why v2.2.1 recorded 0
-    # divergences.
-    [drep-state]="https://github.com/michaeljfazio/dugite/issues/912"
-    #
-    # Every other comparable query is byte-identical to cardano-node 11.0.1.
+    # Every comparable query is byte-identical to cardano-node 11.0.1.
     #
     # This array is ONLY for real divergences: both sides answered and the
     # answers differ. It must never be used to paper over an ERROR row (that
@@ -55,6 +45,11 @@ declare -gA KNOWN_DIVERGENCES=(
     # (#597 collected five of those for two months).
     #
     # Recently retired, do not re-add without a fresh two-sided diff:
+    #   drep-state                      GetDRepState reports the stored
+    #                                   `drepExpiry` (not registered_epoch +
+    #                                   drepActivity) and applies the
+    #                                   query-time dormant refund, per
+    #                                   queryDRepState (#912)
     #   protocol-parameters, gov-state  genesis decimals now convert exactly
     #                                   (priceSteps 0.0000721, was 0.000072)
     #   drep-stake-distribution         query sums InstantStake + ProposalDeposits
