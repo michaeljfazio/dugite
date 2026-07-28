@@ -336,145 +336,63 @@ impl Node {
             })
             .collect();
 
-        // Build governance proposal snapshots.
+        // Build governance proposal snapshots — LIVE view (`GetGovState`'s
+        // embedded `ConwayGovState.cgsProposals`, tag 24).
+        //
         // ALL governance action types (InfoAction, ParameterChange, HardForkInitiation,
         // UpdateCommittee, NewConstitution, NoConfidence, TreasuryWithdrawals) are stored
         // in governance.proposals by process_proposal().  We faithfully convert every
         // one of them here, carrying the full GovAction enum so the CBOR encoder can
         // reproduce the complete action body on the wire (fixes issue #172).
-        // Haskell `mkProposals` rebuilds the proposal forest by folding over the
-        // OMap in insertion order: every child's `prev_action_id` must already
-        // be either an enacted root or an ancestor present in the iteration so
-        // far. Dugite stores proposals in a `BTreeMap<GovActionId, ...>` keyed
-        // by tx-hash, which gives a deterministic but arbitrary order that
-        // routinely violates this invariant — causing Haskell's decoder to
-        // bail with `mkProposals: Could not add a proposal …` on the first
-        // out-of-order child.
         //
-        // Emit proposals sorted by `(proposed_epoch, action_id)` so children
-        // always appear after their parents while keeping the result
-        // deterministic. Within an epoch, proposals are independent w.r.t.
-        // each other (a proposal cannot reference one created in the same
-        // ledger transition), so the secondary sort by action-id is purely a
-        // canonical tiebreaker.
-        let mut sorted_proposals: Vec<(
-            &dugite_primitives::transaction::GovActionId,
-            &dugite_ledger::state::ProposalState,
-        )> = ls.gov.governance.proposals.iter().collect();
-        // Haskell returns proposals in on-chain SUBMISSION order, not sorted by
-        // GovActionId. `queryProposals` reads the pulser's `dpProposals` /
-        // snapshot's `psProposals`, both of which come from
-        // `proposalsActions = OMap.toStrictSeq pProps`, and `pProps` is appended
-        // to (`OMap.||>`) by the GOV rule as each proposal is processed.
-        //
-        // dugite's `proposals` is an ImblOrdMap keyed by GovActionId, so its
-        // natural iteration order is by hash. `submission_index` (#799) is the
-        // monotonic counter that recovers submission order — the same field the
-        // ratification tie-break already relies on.
-        //
-        // Sorting by (proposed_epoch, txId) here put the sequence in hash order
-        // within an epoch, which is what made `proposals` and the proposals
-        // array inside `gov-state` diverge from cardano-node (#906).
-        sorted_proposals.sort_by(|(a_id, a), (b_id, b)| {
-            a.submission_index
-                .cmp(&b.submission_index)
-                .then_with(|| {
-                    a_id.transaction_id
-                        .as_ref()
-                        .cmp(b_id.transaction_id.as_ref())
-                })
-                .then_with(|| a_id.action_index.cmp(&b_id.action_index))
-        });
+        // `build_proposal_snapshot_list` is shared with the FROZEN DRep-pulser
+        // view built just below for `GetProposals` (tag 31, #922) so the two
+        // call sites can never drift in sort/pruning logic.
+        let governance_proposals: Vec<ProposalSnapshot> = build_proposal_snapshot_list(
+            &ls.gov.governance.proposals,
+            &ls.gov.governance.votes_by_action,
+            ls.gov.governance.enacted_pparam_update.as_ref(),
+            ls.gov.governance.enacted_hard_fork.as_ref(),
+            ls.gov.governance.enacted_committee.as_ref(),
+            ls.gov.governance.enacted_constitution.as_ref(),
+        );
 
-        // Haskell's `mkProposals` invokes `proposalsAddAction` for every
-        // GovActionState in the decoded OMap, and the fold bails the moment a
-        // proposal's `prev_action_id` does not resolve to either:
-        //   * the current enacted root for that purpose, or
-        //   * an ancestor already inserted in this fold.
+        // Build governance proposal snapshots — FROZEN DRep-pulser view,
+        // answered by `GetProposals` (tag 31, #922).
         //
-        // Dugite's `apply_block` path inserts proposals into the BTreeMap but
-        // does not always prune stale siblings when a sibling of the same
-        // purpose enacts — historical state from earlier epochs can outlive
-        // the root-update event, leaving proposals whose `prev_action_id`
-        // points at a now-superseded root. Sending those raw to cardano-cli
-        // surfaces as `mkProposals: Could not add a proposal …` and aborts
-        // the entire `gov-state` decode.
+        // Proven Haskell mechanism: `Cardano.Ledger.Api.State.Query.queryProposals`
+        // NEVER reads live `cgsProposals`. It reads `dpProposals` (while the
+        // pulser is still pulsing) or `psProposals` (once `DRComplete`) from
+        // the `DRepPulsingState` — the SAME frozen proposal list in both
+        // cases, refreshed exactly once per epoch boundary by
+        // `setFreshDRepPulsingState` inside `ConwayEPOCH`'s `epochTransition`.
+        // A proposal submitted mid-epoch is therefore invisible to this query
+        // until the *next* epoch boundary rotates the pulser, even though the
+        // live `governance_proposals` view above (and the ledger itself)
+        // already contains it.
         //
-        // To keep the query response decodable we replay the same admission
-        // check here in `query.rs` and silently drop unresolvable proposals.
-        // This makes the wire response self-consistent for `cardano-cli`
-        // while the underlying source-of-truth bug (the sibling-cleanup gap
-        // on enactment) is tracked separately.
-        use dugite_primitives::transaction::GovAction;
-        let g = &ls.gov.governance;
-        let enacted_roots: std::collections::HashSet<&dugite_primitives::transaction::GovActionId> =
-            [
-                g.enacted_pparam_update.as_ref(),
-                g.enacted_hard_fork.as_ref(),
-                g.enacted_committee.as_ref(),
-                g.enacted_constitution.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
-            .collect();
-        let extract_prev = |a: &GovAction| -> Option<dugite_primitives::transaction::GovActionId> {
-            match a {
-                GovAction::ParameterChange { prev_action_id, .. }
-                | GovAction::HardForkInitiation { prev_action_id, .. }
-                | GovAction::NoConfidence { prev_action_id, .. }
-                | GovAction::UpdateCommittee { prev_action_id, .. }
-                | GovAction::NewConstitution { prev_action_id, .. } => prev_action_id.clone(),
-                GovAction::TreasuryWithdrawals { .. } | GovAction::InfoAction => None,
-            }
-        };
-        let mut admitted_ids: std::collections::HashSet<
-            dugite_primitives::transaction::GovActionId,
-        > = std::collections::HashSet::new();
-        sorted_proposals.retain(|(action_id, state)| {
-            let prev = extract_prev(&state.procedure.gov_action);
-            let ok = match prev {
-                None => true, // Treasury/Info/root proposals always admitted.
-                Some(ref p) => admitted_ids.contains(p) || enacted_roots.contains(p),
+        // `ratification_snapshot` is dugite's existing `dpProposals`-equivalent,
+        // captured at each epoch boundary for the #903 ratification-input fix
+        // (`RatifySignal dpProposals`). Reusing it here means #903 and #922
+        // share one source of truth for "what did the pulser last freeze".
+        //
+        // `None` only at genesis or when loading a ledger-state snapshot that
+        // predates the field; `ratify_proposals()` itself falls back to the
+        // live state in that case (see `state/mod.rs`'s `RatificationSnapshot`
+        // doc comment), so mirror that fallback here rather than reporting an
+        // empty list.
+        let governance_proposals_frozen: Vec<ProposalSnapshot> =
+            match ls.gov.governance.ratification_snapshot.as_ref() {
+                Some(snap) => build_proposal_snapshot_list(
+                    &snap.proposals,
+                    &snap.votes_by_action,
+                    snap.enacted_pparam_update.as_ref(),
+                    snap.enacted_hard_fork.as_ref(),
+                    snap.enacted_committee.as_ref(),
+                    snap.enacted_constitution.as_ref(),
+                ),
+                None => governance_proposals.clone(),
             };
-            if ok {
-                admitted_ids.insert((*action_id).clone());
-            } else {
-                tracing::debug!(
-                    action_id = %action_id.transaction_id.to_hex(),
-                    idx = action_id.action_index,
-                    prev = %prev.map(|p| p.transaction_id.to_hex()).unwrap_or_default(),
-                    "gov-state: dropping proposal with unresolved prev_action_id (stale sibling after root enactment)"
-                );
-            }
-            ok
-        });
-
-        let governance_proposals: Vec<ProposalSnapshot> = sorted_proposals
-            .into_iter()
-            .map(|(action_id, state)| {
-                let action_type = gov_action_type_str(&state.procedure.gov_action);
-                // Build per-credential vote maps from votes_by_action
-                let (committee_votes, drep_votes, spo_votes) = build_vote_maps(&ls, action_id);
-                ProposalSnapshot {
-                    tx_id: action_id.transaction_id.as_ref().to_vec(),
-                    action_index: action_id.action_index,
-                    action_type: action_type.to_string(),
-                    proposed_epoch: state.proposed_epoch.0,
-                    expires_epoch: state.expires_epoch.0,
-                    yes_votes: state.yes_votes,
-                    no_votes: state.no_votes,
-                    abstain_votes: state.abstain_votes,
-                    deposit: state.procedure.deposit.0,
-                    return_addr: state.procedure.return_addr.clone(),
-                    anchor_url: state.procedure.anchor.url.clone(),
-                    anchor_hash: state.procedure.anchor.data_hash.as_ref().to_vec(),
-                    gov_action: state.procedure.gov_action.clone(),
-                    committee_votes,
-                    drep_votes,
-                    spo_votes,
-                }
-            })
-            .collect();
 
         // Build committee snapshot.
         // Iterate committee_expiration (the canonical member list) rather than
@@ -910,7 +828,8 @@ impl Node {
             .iter()
             .map(|(action_id, state)| {
                 let action_type = gov_action_type_str(&state.procedure.gov_action);
-                let (committee_votes, drep_votes, spo_votes) = build_vote_maps(&ls, action_id);
+                let (committee_votes, drep_votes, spo_votes) =
+                    build_vote_maps(&ls.gov.governance.votes_by_action, action_id);
                 let proposal = ProposalSnapshot {
                     tx_id: action_id.transaction_id.as_ref().to_vec(),
                     action_index: action_id.action_index,
@@ -963,6 +882,7 @@ impl Node {
             stake_pools,
             drep_entries,
             governance_proposals,
+            governance_proposals_frozen,
             enacted_pparam_update: ls
                 .gov
                 .governance
@@ -1197,10 +1117,178 @@ pub(crate) fn gov_action_type_str(
     }
 }
 
+/// Build a canonically-ordered, decode-safe list of `ProposalSnapshot`s from
+/// a proposals map, its companion votes map, and the four enacted-purpose
+/// roots active at that map's snapshot time.
+///
+/// Shared by both proposal views so their sort/pruning logic can never drift
+/// apart:
+///   * the LIVE view (`GetGovState`'s `ConwayGovState.cgsProposals`), fed
+///     `ls.gov.governance.{proposals,votes_by_action,enacted_*}`.
+///   * the FROZEN DRep-pulser view (`GetProposals`, tag 31, #922), fed the
+///     equivalent fields off `RatificationSnapshot`.
+///
+/// Haskell `mkProposals` rebuilds the proposal forest by folding over the
+/// OMap in insertion order: every child's `prev_action_id` must already be
+/// either an enacted root or an ancestor present in the iteration so far.
+/// Dugite stores proposals in a map keyed by `GovActionId` (hash order), so
+/// this function re-derives submission order via `submission_index` (#799,
+/// #906) and re-applies the same admission check Haskell's fold performs,
+/// dropping any proposal whose `prev_action_id` doesn't resolve — this keeps
+/// the wire response decodable when historical state outlives a root-update
+/// event (see the inline comment on the `retain` call below).
+#[allow(clippy::too_many_arguments)]
+fn build_proposal_snapshot_list(
+    proposals: &imbl::OrdMap<
+        dugite_primitives::transaction::GovActionId,
+        dugite_ledger::state::ProposalState,
+    >,
+    votes_by_action: &imbl::OrdMap<
+        dugite_primitives::transaction::GovActionId,
+        imbl::OrdMap<
+            dugite_primitives::transaction::Voter,
+            dugite_primitives::transaction::VotingProcedure,
+        >,
+    >,
+    enacted_pparam_update: Option<&dugite_primitives::transaction::GovActionId>,
+    enacted_hard_fork: Option<&dugite_primitives::transaction::GovActionId>,
+    enacted_committee: Option<&dugite_primitives::transaction::GovActionId>,
+    enacted_constitution: Option<&dugite_primitives::transaction::GovActionId>,
+) -> Vec<super::n2c_query::ProposalSnapshot> {
+    use super::n2c_query::ProposalSnapshot;
+    use dugite_primitives::transaction::GovAction;
+
+    // Haskell returns proposals in on-chain SUBMISSION order, not sorted by
+    // GovActionId. `queryProposals` reads the pulser's `dpProposals` /
+    // snapshot's `psProposals`, both of which come from
+    // `proposalsActions = OMap.toStrictSeq pProps`, and `pProps` is appended
+    // to (`OMap.||>`) by the GOV rule as each proposal is processed.
+    //
+    // dugite's `proposals` is an ImblOrdMap keyed by GovActionId, so its
+    // natural iteration order is by hash. `submission_index` (#799) is the
+    // monotonic counter that recovers submission order — the same field the
+    // ratification tie-break already relies on. Sorting by (proposed_epoch,
+    // txId) instead put the sequence in hash order within an epoch, which is
+    // what made `proposals` and the proposals array inside `gov-state`
+    // diverge from cardano-node (#906).
+    let mut sorted_proposals: Vec<(
+        &dugite_primitives::transaction::GovActionId,
+        &dugite_ledger::state::ProposalState,
+    )> = proposals.iter().collect();
+    sorted_proposals.sort_by(|(a_id, a), (b_id, b)| {
+        a.submission_index
+            .cmp(&b.submission_index)
+            .then_with(|| {
+                a_id.transaction_id
+                    .as_ref()
+                    .cmp(b_id.transaction_id.as_ref())
+            })
+            .then_with(|| a_id.action_index.cmp(&b_id.action_index))
+    });
+
+    // Haskell's `mkProposals` invokes `proposalsAddAction` for every
+    // GovActionState in the decoded OMap, and the fold bails the moment a
+    // proposal's `prev_action_id` does not resolve to either:
+    //   * the current enacted root for that purpose, or
+    //   * an ancestor already inserted in this fold.
+    //
+    // Dugite's `apply_block` path inserts proposals into the map but does not
+    // always prune stale siblings when a sibling of the same purpose enacts —
+    // historical state from earlier epochs can outlive the root-update
+    // event, leaving proposals whose `prev_action_id` points at a
+    // now-superseded root. Sending those raw to cardano-cli surfaces as
+    // `mkProposals: Could not add a proposal …` and aborts the entire decode.
+    //
+    // To keep the query response decodable we replay the same admission
+    // check here and silently drop unresolvable proposals. This makes the
+    // wire response self-consistent for `cardano-cli` while the underlying
+    // source-of-truth bug (the sibling-cleanup gap on enactment) is tracked
+    // separately.
+    let enacted_roots: std::collections::HashSet<&dugite_primitives::transaction::GovActionId> = [
+        enacted_pparam_update,
+        enacted_hard_fork,
+        enacted_committee,
+        enacted_constitution,
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let extract_prev = |a: &GovAction| -> Option<dugite_primitives::transaction::GovActionId> {
+        match a {
+            GovAction::ParameterChange { prev_action_id, .. }
+            | GovAction::HardForkInitiation { prev_action_id, .. }
+            | GovAction::NoConfidence { prev_action_id, .. }
+            | GovAction::UpdateCommittee { prev_action_id, .. }
+            | GovAction::NewConstitution { prev_action_id, .. } => prev_action_id.clone(),
+            GovAction::TreasuryWithdrawals { .. } | GovAction::InfoAction => None,
+        }
+    };
+    let mut admitted_ids: std::collections::HashSet<dugite_primitives::transaction::GovActionId> =
+        std::collections::HashSet::new();
+    sorted_proposals.retain(|(action_id, state)| {
+        let prev = extract_prev(&state.procedure.gov_action);
+        let ok = match prev {
+            None => true, // Treasury/Info/root proposals always admitted.
+            Some(ref p) => admitted_ids.contains(p) || enacted_roots.contains(p),
+        };
+        if ok {
+            admitted_ids.insert((*action_id).clone());
+        } else {
+            tracing::debug!(
+                action_id = %action_id.transaction_id.to_hex(),
+                idx = action_id.action_index,
+                prev = %prev.map(|p| p.transaction_id.to_hex()).unwrap_or_default(),
+                "gov-state: dropping proposal with unresolved prev_action_id (stale sibling after root enactment)"
+            );
+        }
+        ok
+    });
+
+    sorted_proposals
+        .into_iter()
+        .map(|(action_id, state)| {
+            let action_type = gov_action_type_str(&state.procedure.gov_action);
+            let (committee_votes, drep_votes, spo_votes) =
+                build_vote_maps(votes_by_action, action_id);
+            ProposalSnapshot {
+                tx_id: action_id.transaction_id.as_ref().to_vec(),
+                action_index: action_id.action_index,
+                action_type: action_type.to_string(),
+                proposed_epoch: state.proposed_epoch.0,
+                expires_epoch: state.expires_epoch.0,
+                yes_votes: state.yes_votes,
+                no_votes: state.no_votes,
+                abstain_votes: state.abstain_votes,
+                deposit: state.procedure.deposit.0,
+                return_addr: state.procedure.return_addr.clone(),
+                anchor_url: state.procedure.anchor.url.clone(),
+                anchor_hash: state.procedure.anchor.data_hash.as_ref().to_vec(),
+                gov_action: state.procedure.gov_action.clone(),
+                committee_votes,
+                drep_votes,
+                spo_votes,
+            }
+        })
+        .collect()
+}
+
 /// Build per-credential committee/DRep/SPO vote vectors for a governance action.
+///
+/// `votes_by_action` is passed explicitly (rather than a `&LedgerState`) so
+/// this can be sourced from either the LIVE `governance.votes_by_action` or a
+/// FROZEN [`dugite_ledger::state::RatificationSnapshot::votes_by_action`] —
+/// mirroring `count_votes_by_type`'s existing live/frozen duality and letting
+/// `GetProposals` (#922) answer with the votes AS THEY WERE at the pulser
+/// snapshot, not live votes cast after it.
 #[allow(clippy::type_complexity)]
 pub(crate) fn build_vote_maps(
-    ls: &dugite_ledger::LedgerState,
+    votes_by_action: &imbl::OrdMap<
+        dugite_primitives::transaction::GovActionId,
+        imbl::OrdMap<
+            dugite_primitives::transaction::Voter,
+            dugite_primitives::transaction::VotingProcedure,
+        >,
+    >,
     action_id: &dugite_primitives::transaction::GovActionId,
 ) -> (
     Vec<(Vec<u8>, u8, u8)>,
@@ -1224,7 +1312,7 @@ pub(crate) fn build_vote_maps(
     let mut committee_map: BTreeMap<(Vec<u8>, u8), u8> = BTreeMap::new();
     let mut drep_map: BTreeMap<(Vec<u8>, u8), u8> = BTreeMap::new();
     let mut spo_map: BTreeMap<Vec<u8>, u8> = BTreeMap::new();
-    if let Some(votes) = ls.gov.governance.votes_by_action.get(action_id) {
+    if let Some(votes) = votes_by_action.get(action_id) {
         for (voter, procedure) in votes {
             let vote_u8 = match procedure.vote {
                 dugite_primitives::transaction::Vote::No => 0u8,
@@ -1613,7 +1701,7 @@ mod tests {
             );
         }
 
-        let (cc, drep, spo) = build_vote_maps(&ledger, &action_id);
+        let (cc, drep, spo) = build_vote_maps(&ledger.gov.governance.votes_by_action, &action_id);
 
         assert_eq!(cc.len(), 1);
         assert_eq!(cc[0], (vec![0xC0; 28], 0u8, 1u8)); // VKey CC, Yes
@@ -1692,7 +1780,7 @@ mod tests {
                 .into(),
             );
         }
-        let (cc, drep, spo) = build_vote_maps(&ledger, &action_id);
+        let (cc, drep, spo) = build_vote_maps(&ledger.gov.governance.votes_by_action, &action_id);
         assert_eq!(drep.len(), 1, "drep duplicates must collapse to 1 entry");
         assert_eq!(drep[0], (vec![0xAA; 28], 0u8, 1u8), "last DRep vote=Yes");
         assert_eq!(cc.len(), 1, "cc duplicates must collapse to 1 entry");
@@ -1710,9 +1798,148 @@ mod tests {
             transaction_id: Hash32::from_bytes([0x99; 32]),
             action_index: 0,
         };
-        let (cc, drep, spo) = build_vote_maps(&ledger, &unknown);
+        let (cc, drep, spo) = build_vote_maps(&ledger.gov.governance.votes_by_action, &unknown);
         assert!(cc.is_empty());
         assert!(drep.is_empty());
         assert!(spo.is_empty());
+    }
+
+    // ─── build_proposal_snapshot_list (#922) ─────────────────────────────────
+    //
+    // `build_proposal_snapshot_list` is shared by the LIVE proposal view
+    // (`GetGovState`, tag 24 — reads `ls.gov.governance.proposals` directly)
+    // and the FROZEN DRep-pulser view (`GetProposals`, tag 31 — reads
+    // `RatificationSnapshot::proposals`, refreshed only at epoch boundaries).
+    // These tests exercise the function directly against synthetic
+    // live/frozen maps to prove: (a) a mid-epoch submission present in the
+    // live map is simply absent from a frozen map that predates it, and (b)
+    // submission order (not `GovActionId`/hash order) is preserved even after
+    // a proposal is removed (e.g. by enactment or expiry).
+
+    fn info_action_proposal(
+        submission_index: u64,
+        proposed_epoch: u64,
+    ) -> dugite_ledger::state::ProposalState {
+        dugite_ledger::state::ProposalState {
+            procedure: dugite_primitives::transaction::ProposalProcedure {
+                deposit: Lovelace(100_000_000_000),
+                return_addr: vec![0u8; 29],
+                gov_action: GovAction::InfoAction,
+                anchor: Anchor {
+                    url: "https://example.com/p".to_string(),
+                    data_hash: Hash32::from_bytes([0xAA; 32]),
+                },
+            },
+            proposed_epoch: EpochNo(proposed_epoch),
+            expires_epoch: EpochNo(proposed_epoch + 6),
+            yes_votes: 0,
+            no_votes: 0,
+            abstain_votes: 0,
+            submission_index,
+        }
+    }
+
+    /// #922 core mechanism: a proposal present in the LIVE map but not yet
+    /// folded into the FROZEN (pulser) map must not appear when
+    /// `build_proposal_snapshot_list` is run against the frozen map — this is
+    /// exactly what distinguishes `GetProposals` (frozen) from `GetGovState`
+    /// (live) at the same tip.
+    #[test]
+    fn build_proposal_snapshot_list_mid_epoch_submission_invisible_in_frozen_map() {
+        let empty_votes: imbl::OrdMap<GovActionId, imbl::OrdMap<Voter, VotingProcedure>> =
+            imbl::OrdMap::new();
+
+        let id_a = GovActionId {
+            transaction_id: Hash32::from_bytes([0x01; 32]),
+            action_index: 0,
+        };
+        let id_b_mid_epoch = GovActionId {
+            transaction_id: Hash32::from_bytes([0x02; 32]),
+            action_index: 0,
+        };
+
+        // Frozen (pulser) map as captured at the LAST epoch boundary: only
+        // proposal A existed then.
+        let mut frozen_proposals = imbl::OrdMap::new();
+        frozen_proposals.insert(id_a.clone(), info_action_proposal(0, 100));
+        let frozen =
+            build_proposal_snapshot_list(&frozen_proposals, &empty_votes, None, None, None, None);
+        assert_eq!(frozen.len(), 1);
+        assert_eq!(frozen[0].tx_id, vec![0x01u8; 32]);
+
+        // Live map: proposal B was submitted mid-epoch, after the pulser
+        // snapshot was taken but before the next boundary.
+        let mut live_proposals = frozen_proposals.clone();
+        live_proposals.insert(id_b_mid_epoch.clone(), info_action_proposal(1, 100));
+        let live =
+            build_proposal_snapshot_list(&live_proposals, &empty_votes, None, None, None, None);
+        assert_eq!(
+            live.len(),
+            2,
+            "the live view (GetGovState) must see the mid-epoch submission immediately"
+        );
+        assert!(
+            !frozen.iter().any(|p| p.tx_id == vec![0x02u8; 32]),
+            "the frozen view (GetProposals) must NOT see it before the next epoch boundary"
+        );
+
+        // Simulate the epoch-boundary pulser refresh: the new frozen map is
+        // rebuilt from what is now live, so the deferred proposal appears.
+        let refreshed =
+            build_proposal_snapshot_list(&live_proposals, &empty_votes, None, None, None, None);
+        assert_eq!(
+            refreshed.len(),
+            2,
+            "after the epoch boundary rotates the pulser, the deferred proposal must appear"
+        );
+    }
+
+    /// Submission order — not `GovActionId` (hash) order — must be preserved,
+    /// including after a proposal is removed from the map (e.g. by
+    /// enactment/expiry at a prior boundary). This guards the #906 ordering
+    /// fix for both the live and frozen call sites sharing this function.
+    #[test]
+    fn build_proposal_snapshot_list_preserves_submission_order_after_removal() {
+        let empty_votes: imbl::OrdMap<GovActionId, imbl::OrdMap<Voter, VotingProcedure>> =
+            imbl::OrdMap::new();
+
+        // Three proposals submitted in order C, A, B (deliberately NOT hash
+        // order: 0xCC > 0xAA in byte order, so a hash-order sort would put A
+        // first).
+        let id_c = GovActionId {
+            transaction_id: Hash32::from_bytes([0xCC; 32]),
+            action_index: 0,
+        };
+        let id_a = GovActionId {
+            transaction_id: Hash32::from_bytes([0xAA; 32]),
+            action_index: 0,
+        };
+        let id_b = GovActionId {
+            transaction_id: Hash32::from_bytes([0xBB; 32]),
+            action_index: 0,
+        };
+
+        let mut proposals = imbl::OrdMap::new();
+        proposals.insert(id_c.clone(), info_action_proposal(0, 100));
+        proposals.insert(id_a.clone(), info_action_proposal(1, 100));
+        proposals.insert(id_b.clone(), info_action_proposal(2, 100));
+
+        let result = build_proposal_snapshot_list(&proposals, &empty_votes, None, None, None, None);
+        assert_eq!(
+            result.iter().map(|p| p.tx_id[0]).collect::<Vec<_>>(),
+            vec![0xCC, 0xAA, 0xBB],
+            "submission order must survive even though it's not hash order"
+        );
+
+        // Now remove the middle-submitted proposal (A) — as ratification
+        // would after enactment/expiry — and confirm C, B keep their
+        // relative submission order (no reordering/compaction artifacts).
+        proposals.remove(&id_a);
+        let after_removal =
+            build_proposal_snapshot_list(&proposals, &empty_votes, None, None, None, None);
+        assert_eq!(
+            after_removal.iter().map(|p| p.tx_id[0]).collect::<Vec<_>>(),
+            vec![0xCC, 0xBB]
+        );
     }
 }

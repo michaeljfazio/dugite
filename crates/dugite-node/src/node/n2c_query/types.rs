@@ -857,8 +857,29 @@ pub struct NodeStateSnapshot {
     pub stake_pools: Vec<StakePoolSnapshot>,
     /// DRep registration data
     pub drep_entries: Vec<DRepSnapshot>,
-    /// Governance proposals
+    /// Governance proposals — LIVE view, embedded in `GetGovState`'s
+    /// (tag 24) `ConwayGovState.cgsProposals`. Haskell's `ConwayGovState`
+    /// carries the live `Proposals` structure directly (distinct from the
+    /// DRep pulser), so this field legitimately reflects mid-epoch
+    /// submissions immediately.
     pub governance_proposals: Vec<ProposalSnapshot>,
+    /// Governance proposals — FROZEN DRep-pulser view, answered by
+    /// `GetProposals` (tag 31).
+    ///
+    /// Per the proven Haskell mechanism (#922): `queryProposals` never reads
+    /// live `cgsProposals` — it reads `dpProposals`/`psProposals` from the
+    /// `DRepPulsingState`, which is refreshed exactly once per epoch boundary
+    /// (`setFreshDRepPulsingState` inside `ConwayEPOCH`). A governance action
+    /// submitted mid-epoch is invisible to this query until the *next* epoch
+    /// boundary rotates the pulser, even though it is already visible in
+    /// `governance_proposals` (the live view) and in the mempool/ledger.
+    ///
+    /// Sourced from `GovernanceState::ratification_snapshot`, dugite's
+    /// existing `dpProposals`-equivalent captured at each epoch boundary for
+    /// the #903 ratification-input fix. `None` (genesis, or a state
+    /// predating the field) falls back to the live list, mirroring
+    /// `ratify_proposals()`'s own fallback.
+    pub governance_proposals_frozen: Vec<ProposalSnapshot>,
     /// Enacted governance action roots (for GovState query)
     pub enacted_pparam_update: Option<(Vec<u8>, u32)>,
     pub enacted_hard_fork: Option<(Vec<u8>, u32)>,
@@ -980,6 +1001,7 @@ impl Default for NodeStateSnapshot {
             stake_pools: Vec::new(),
             drep_entries: Vec::new(),
             governance_proposals: Vec::new(),
+            governance_proposals_frozen: Vec::new(),
             enacted_pparam_update: None,
             enacted_hard_fork: None,
             enacted_committee: None,
