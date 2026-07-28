@@ -2369,6 +2369,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn loe_trims_candidate_arbitrarily_deep_past_tip() {
+        // The bulk-sync stall shape (mainnet Byron, 2026-07-28): BlockFetch
+        // accumulates a volatile candidate chain far deeper past the LoE tip
+        // than k + fragment length, while selection is pinned at the tip.
+        // Haskell's trimToLoE has no depth limit — the candidate must be
+        // TRIMMED to LoE tip + k, never deferred outright, no matter how deep
+        // it is. (A walk cap of k + members + 2 turned deep candidates into
+        // Deferred, freezing selection until the LoE jumped forward.)
+        let dir = tempfile::tempdir().unwrap();
+        let chain_db = make_chain_db(dir.path());
+        let loe = install_loe(&chain_db, loe_fragment(None, &[(10, 1)], 2)).await;
+        let (handle, runner) = ChainSelHandle::new(Arc::clone(&chain_db));
+        let _runner_task = tokio::spawn(runner);
+
+        // 12-block chain: b2, b3 adopt (≤ k past LoE tip b1); b4..b12 stored
+        // deferred, forming a candidate 9 blocks past the LoE tip — beyond
+        // the old cap of k + members + 2 = 5.
+        for i in 1..=12u8 {
+            let prev = if i == 1 { Hash32::ZERO } else { h(i - 1) };
+            let _ = handle
+                .submit_block(
+                    h(i),
+                    SlotNo(i as u64 * 10),
+                    BlockNo(i as u64),
+                    prev,
+                    vec![i],
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            chain_db.read().await.get_tip_info().map(|(_, h_, _)| h_),
+            Some(h(3)),
+            "selection holds at LoE tip + k"
+        );
+
+        // LoE advances to block 3. The candidate tip b12 is now 9 blocks
+        // past the new LoE tip — still far beyond the old cap. Selection
+        // must adopt exactly k more blocks (b4, b5), not defer.
+        loe.store(Arc::new(loe_fragment(
+            None,
+            &[(10, 1), (20, 2), (30, 3)],
+            2,
+        )));
+        let r = handle.reprocess_loe().await.unwrap();
+        match r {
+            AddBlockResult::TriggeredFork { apply, .. } => {
+                assert_eq!(
+                    apply,
+                    vec![h(4), h(5)],
+                    "deep candidate must be trimmed to LoE tip + k"
+                );
+            }
+            other => panic!("expected TriggeredFork adopting the k-prefix, got {other:?}"),
+        }
+        assert_eq!(
+            chain_db.read().await.get_tip_info().map(|(_, h_, _)| h_),
+            Some(h(5))
+        );
+    }
+
+    #[tokio::test]
     async fn self_forged_blocks_bypass_the_loe() {
         // A genesis-mode block producer: LoE empty@Origin, k=2 — a SYNCED
         // peer block beyond k defers, but the node's OWN forged blocks
