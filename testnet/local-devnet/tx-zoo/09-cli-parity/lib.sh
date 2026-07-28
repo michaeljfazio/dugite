@@ -36,12 +36,6 @@ _parity_ensure_csv() {
 # Maps query name → tracking issue URL.
 # Populated by individual test scripts using: KNOWN_DIVERGENCES[name]=url
 declare -gA KNOWN_DIVERGENCES=(
-    # dugite serves the live proposal set; Haskell's answer at the same tip
-    # lags mid-epoch submissions until an epoch boundary (pulser-snapshot
-    # semantics suspected — needs oracle confirmation). Both sides converge
-    # byte-identically post-boundary. Reproduced twice, identical 402-line
-    # diff, tip-pinned (slot:hash equal).
-    [proposals]="https://github.com/michaeljfazio/dugite/issues/922"
     # Every comparable query is byte-identical to cardano-node 11.0.1.
     #
     # This array is ONLY for real divergences: both sides answered and the
@@ -64,7 +58,12 @@ declare -gA KNOWN_DIVERGENCES=(
     #                                   (maxLovelaceSupply - reserves), reduced,
     #                                   zero-delegator pools omitted (#905)
     #   proposals                       GetProposals emits the real GovAction
-    #                                   payload in submission order (#906)
+    #                                   payload in submission order (#906);
+    #                                   answers from the frozen DRep-pulser
+    #                                   snapshot (dpProposals/psProposals),
+    #                                   not the live proposal set, so mid-
+    #                                   epoch submissions lag to the next
+    #                                   epoch boundary like cardano-node (#922)
     #   protocol-state/version,
     #   kes-period-info                 8-field PraosState (#902)
     #   slot-number, treasury           never diverged; harness argument bugs
