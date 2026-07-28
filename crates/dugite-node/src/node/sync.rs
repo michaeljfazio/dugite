@@ -851,6 +851,10 @@ impl Node {
                 let tx_size = tx.raw_cbor.as_ref().map(|b| b.len() as u64).unwrap_or(0);
                 let mut ctx = dugite_ledger::validation::ValidationContext::new()
                     .with_active_proposals(active_proposals.clone())
+                    // Roots come from the ROLLED-BACK ledger, so a proposal
+                    // whose parent was undone by the rollback is re-rejected
+                    // rather than silently re-admitted.
+                    .with_enacted_gov_roots(ledger.enacted_gov_roots())
                     .with_committee_authorized_hot_keys(committee_hot_keys.clone())
                     .with_committee_authorized_elected_hot_keys(
                         committee_authorized_elected_hot_keys.clone(),

@@ -395,6 +395,21 @@ pub enum TxValidationError {
     GovActionsDoNotExist {
         action_ids: Vec<String>,
     },
+    /// `InvalidPrevGovActionId` (GOV tag 8): a proposal's `prev_action_id`
+    /// does not chain onto its governance purpose — it is neither that
+    /// purpose's enacted root, nor an active in-flight proposal, nor (for
+    /// `prev_action_id = None`) is the purpose still unrooted.
+    ///
+    /// Haskell fails the whole transaction here (`failBecause`), so dugite
+    /// must reject at admission rather than silently drop the proposal —
+    /// dropping let dugite's forge mint blocks cardano-node rejected.
+    ///
+    /// `action_type` is the proposal's action name, for operator diagnosis.
+    InvalidPrevGovActionId {
+        action_index: u32,
+        action_type: String,
+        prev_action_id: Option<String>,
+    },
     /// `DisallowedVoters` (GOV tag 5): a voter type is not authorised for
     /// the action type of the referenced governance action.
     ///

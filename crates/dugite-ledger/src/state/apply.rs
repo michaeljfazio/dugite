@@ -1068,6 +1068,15 @@ impl LedgerState {
                 None,
             )
         };
+        // Enacted governance roots (Haskell `Proposals.pRoots`) for the
+        // `InvalidPrevGovActionId` predicate. Captured ONCE per block, before
+        // the tx loop: roots only advance when RATIFY enacts an action at an
+        // epoch boundary, never mid-block, so every tx in this block validates
+        // against the same roots. Chaining onto a proposal submitted earlier in
+        // the same block is handled separately via `block_active_proposals`
+        // (in-flight) and the same-tx index check inside the predicate.
+        let block_enacted_gov_roots = std::sync::Arc::new(self.enacted_gov_roots());
+
         // NOTE: the per-tx ValidationContext below takes a FRESH O(1) imbl
         // clone of `self.certs.reward_accounts` for every transaction —
         // Haskell's LEDGERS rule applies txs SEQUENTIALLY, so tx N+1 must
@@ -1250,6 +1259,7 @@ impl LedgerState {
                     };
                     let mut ctx = crate::validation::ValidationContext::new()
                         .with_active_proposals_arc(std::sync::Arc::clone(&block_active_proposals))
+                        .with_enacted_gov_roots_arc(std::sync::Arc::clone(&block_enacted_gov_roots))
                         .with_committee_authorized_hot_keys_arc(std::sync::Arc::clone(
                             &block_committee_authorized_hot_keys,
                         ))

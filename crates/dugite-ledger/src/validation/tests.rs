@@ -17653,4 +17653,274 @@ mod tests {
             "dereg of a pre-registered credential must not fire the #748 check; got: {result:?}"
         );
     }
+
+    use super::super::EnactedGovRoots;
+
+    // =====================================================================
+    // InvalidPrevGovActionId (Conway GOV tag 8)
+    // =====================================================================
+    //
+    // P0 regression guard. dugite used to WARN-and-drop a proposal whose
+    // `prev_action_id` did not chain onto its purpose, on the stated (wrong)
+    // assumption that "Haskell also drops such proposals without failing the
+    // tx". Haskell fails the transaction:
+    //
+    //   case proposalsAddAction actionState proposals of
+    //     Just updatedProposals -> pure updatedProposals
+    //     Nothing -> proposals <$ failBecause (injectFailure $
+    //                  InvalidPrevGovActionId proposal)
+    //
+    // Consequence of the gap, reproduced on the local devnet: dugite's mempool
+    // admitted a ParameterChange carrying prev_action_id=None AFTER another
+    // ParameterChange had been enacted, the forge minted it into block 894 at
+    // slot 1870, and cardano-node 11.0.1 rejected the block with
+    // `ConwayGovFailure (InvalidPrevGovActionId …)` and answered ShutdownPeer.
+    // The chain split: dugite ran on to block 1106 while cardano-node froze at
+    // 892.
+
+    fn pc_proposal(prev: Option<GovActionId>) -> ProposalProcedure {
+        ProposalProcedure {
+            deposit: Lovelace(100_000_000_000),
+            return_addr: vec![0xE0; 29],
+            gov_action: GovAction::ParameterChange {
+                prev_action_id: prev,
+                protocol_param_update: Box::new(ProtocolParamUpdate::default()),
+                policy_hash: None,
+            },
+            anchor: Anchor {
+                url: String::new(),
+                data_hash: Hash32::ZERO,
+            },
+        }
+    }
+
+    fn gid(byte: u8, idx: u32) -> GovActionId {
+        GovActionId {
+            transaction_id: Hash32::from_bytes([byte; 32]),
+            action_index: idx,
+        }
+    }
+
+    /// Run Phase-1 and report whether InvalidPrevGovActionId fired.
+    fn invalid_prev_fires(
+        proposals: Vec<ProposalProcedure>,
+        roots: Option<EnactedGovRoots>,
+        active: HashMap<GovActionId, ActiveProposal>,
+    ) -> bool {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+        let tx = make_gov_tx(proposals, BTreeMap::new());
+        let mut context = ValidationContext::new()
+            .with_active_proposals(active)
+            .with_epoch(5);
+        if let Some(r) = roots {
+            context = context.with_enacted_gov_roots(r);
+        }
+        // The tx also fails NoInputs; we only care whether OUR predicate fired.
+        match validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context) {
+            Ok(_) => false,
+            Err(errors) => errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::InvalidPrevGovActionId { .. })),
+        }
+    }
+
+    /// THE devnet bug: prev_action_id=None while the purpose already has an
+    /// enacted root. Must be rejected, not dropped.
+    #[test]
+    fn invalid_prev_gov_action_id_rejects_none_when_root_exists() {
+        let roots = EnactedGovRoots {
+            pparam_update: Some(gid(0x11, 0)),
+            ..Default::default()
+        };
+        assert!(
+            invalid_prev_fires(vec![pc_proposal(None)], Some(roots), HashMap::new()),
+            "a ParameterChange with prev_action_id=None must be REJECTED once a \
+             ParameterChange has been enacted — dropping it splits the chain"
+        );
+    }
+
+    /// Genuine genesis root: no ParameterChange enacted yet, so None is valid.
+    #[test]
+    fn invalid_prev_gov_action_id_allows_none_at_genesis_root() {
+        assert!(
+            !invalid_prev_fires(
+                vec![pc_proposal(None)],
+                Some(EnactedGovRoots::default()),
+                HashMap::new()
+            ),
+            "prev_action_id=None is the correct genesis root when nothing is enacted"
+        );
+    }
+
+    /// Chaining onto the enacted root is valid.
+    #[test]
+    fn invalid_prev_gov_action_id_allows_chaining_onto_enacted_root() {
+        let root = gid(0x11, 0);
+        let roots = EnactedGovRoots {
+            pparam_update: Some(root.clone()),
+            ..Default::default()
+        };
+        assert!(
+            !invalid_prev_fires(vec![pc_proposal(Some(root))], Some(roots), HashMap::new()),
+            "a proposal naming the enacted root as parent must be accepted"
+        );
+    }
+
+    /// Chaining onto an active in-flight proposal is valid.
+    #[test]
+    fn invalid_prev_gov_action_id_allows_chaining_onto_in_flight_proposal() {
+        let in_flight = gid(0x22, 0);
+        let mut active: HashMap<GovActionId, ActiveProposal> = HashMap::new();
+        active.insert(
+            in_flight.clone(),
+            ActiveProposal {
+                gov_action: GovAction::ParameterChange {
+                    prev_action_id: None,
+                    protocol_param_update: Box::new(ProtocolParamUpdate::default()),
+                    policy_hash: None,
+                },
+                return_addr: vec![0xE0; 29],
+                deposit: Lovelace(100_000_000_000),
+                expires_after_epoch: EpochNo(50),
+                proposed_in_epoch: EpochNo(4),
+            },
+        );
+        assert!(
+            !invalid_prev_fires(
+                vec![pc_proposal(Some(in_flight))],
+                Some(EnactedGovRoots::default()),
+                active
+            ),
+            "an in-flight proposal is a valid parent (Haskell: Map.member parentId graph)"
+        );
+    }
+
+    /// A prev_action_id that is neither root nor in-flight is rejected.
+    #[test]
+    fn invalid_prev_gov_action_id_rejects_unknown_parent() {
+        let roots = EnactedGovRoots {
+            pparam_update: Some(gid(0x11, 0)),
+            ..Default::default()
+        };
+        assert!(
+            invalid_prev_fires(
+                vec![pc_proposal(Some(gid(0xDE, 7)))],
+                Some(roots),
+                HashMap::new()
+            ),
+            "a dangling prev_action_id must be rejected"
+        );
+    }
+
+    /// Haskell folds processProposal over the tx's proposals in order, so
+    /// proposal N may chain onto proposal N-1 of the SAME tx.
+    #[test]
+    fn invalid_prev_gov_action_id_allows_same_tx_earlier_proposal_as_parent() {
+        // make_gov_tx fixes tx.hash to [0xAB; 32]; proposal 1 names proposal 0.
+        let parent = GovActionId {
+            transaction_id: Hash32::from_bytes([0xAB; 32]),
+            action_index: 0,
+        };
+        assert!(
+            !invalid_prev_fires(
+                vec![pc_proposal(None), pc_proposal(Some(parent))],
+                Some(EnactedGovRoots::default()),
+                HashMap::new()
+            ),
+            "proposal 1 chaining onto proposal 0 of the same tx must be accepted"
+        );
+    }
+
+    /// ...but a forward/self reference within the same tx is NOT yet in the
+    /// proposal set when it is processed, so it must be rejected.
+    #[test]
+    fn invalid_prev_gov_action_id_rejects_same_tx_forward_reference() {
+        let self_ref = GovActionId {
+            transaction_id: Hash32::from_bytes([0xAB; 32]),
+            action_index: 1,
+        };
+        assert!(
+            invalid_prev_fires(
+                vec![pc_proposal(Some(self_ref))],
+                Some(EnactedGovRoots::default()),
+                HashMap::new()
+            ),
+            "a proposal may not name itself or a later sibling as parent"
+        );
+    }
+
+    /// InfoAction has no lineage — never fires regardless of roots.
+    #[test]
+    fn invalid_prev_gov_action_id_ignores_lineage_free_actions() {
+        let info = ProposalProcedure {
+            deposit: Lovelace(100_000_000_000),
+            return_addr: vec![0xE0; 29],
+            gov_action: GovAction::InfoAction,
+            anchor: Anchor {
+                url: String::new(),
+                data_hash: Hash32::ZERO,
+            },
+        };
+        let roots = EnactedGovRoots {
+            pparam_update: Some(gid(0x11, 0)),
+            hard_fork: Some(gid(0x12, 0)),
+            committee: Some(gid(0x13, 0)),
+            constitution: Some(gid(0x14, 0)),
+        };
+        assert!(
+            !invalid_prev_fires(vec![info], Some(roots), HashMap::new()),
+            "InfoAction carries no prev_action_id and must never trip the predicate"
+        );
+    }
+
+    /// NoConfidence and UpdateCommittee share ONE committee lineage in Haskell
+    /// (`grCommittee`), so an enacted UpdateCommittee roots NoConfidence too.
+    #[test]
+    fn invalid_prev_gov_action_id_shares_committee_root_across_both_committee_actions() {
+        let roots = EnactedGovRoots {
+            committee: Some(gid(0x13, 0)),
+            ..Default::default()
+        };
+        let no_conf = ProposalProcedure {
+            deposit: Lovelace(100_000_000_000),
+            return_addr: vec![0xE0; 29],
+            gov_action: GovAction::NoConfidence {
+                prev_action_id: None,
+            },
+            anchor: Anchor {
+                url: String::new(),
+                data_hash: Hash32::ZERO,
+            },
+        };
+        assert!(
+            invalid_prev_fires(vec![no_conf], Some(roots.clone()), HashMap::new()),
+            "NoConfidence must chain onto the committee root set by UpdateCommittee"
+        );
+        let no_conf_ok = ProposalProcedure {
+            deposit: Lovelace(100_000_000_000),
+            return_addr: vec![0xE0; 29],
+            gov_action: GovAction::NoConfidence {
+                prev_action_id: Some(gid(0x13, 0)),
+            },
+            anchor: Anchor {
+                url: String::new(),
+                data_hash: Hash32::ZERO,
+            },
+        };
+        assert!(
+            !invalid_prev_fires(vec![no_conf_ok], Some(roots), HashMap::new()),
+            "naming the shared committee root as parent must be accepted"
+        );
+    }
+
+    /// Lenient default: without enacted roots the predicate is skipped, so
+    /// callers with no gov plumbing don't see false positives.
+    #[test]
+    fn invalid_prev_gov_action_id_skipped_without_roots_context() {
+        assert!(
+            !invalid_prev_fires(vec![pc_proposal(Some(gid(0xDE, 7)))], None, HashMap::new()),
+            "predicate must be skipped when enacted_gov_roots is None"
+        );
+    }
 }

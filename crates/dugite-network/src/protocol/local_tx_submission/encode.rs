@@ -547,6 +547,14 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
         // field values, hashes) to the client — that leaks pool IDs, stake
         // credential hashes, and other ledger internals. Log the full detail
         // server-side at DEBUG level and send only a generic reason.
+        // `InvalidPrevGovActionId` (GOV tag 8) deliberately falls through to
+        // the generic rejection below. Haskell's payload is the ENTIRE
+        // `ProposalProcedure`, which `ValidationError` does not carry — it
+        // keeps only the index, action type and prev id. Emitting a tag-8
+        // frame with a differently-shaped payload would make cardano-cli fail
+        // to decode the rejection, which is strictly worse than a generic
+        // reason. The consensus-critical property (the tx IS rejected) holds
+        // either way; only the operator-facing detail is coarser.
         _ => {
             tracing::debug!(
                 err = ?err,
