@@ -466,6 +466,10 @@ impl TxValidator for LedgerTxValidator {
             .with_pools(registered_pool_ids)
             .with_dreps(registered_drep_ids)
             .with_active_proposals(active_proposals)
+            // InvalidPrevGovActionId (#912-adjacent P0): the mempool must reject
+            // a proposal that doesn't chain onto its purpose, or the forge mints
+            // a block cardano-node rejects with ShutdownPeer.
+            .with_enacted_gov_roots(ledger.enacted_gov_roots())
             .with_committee_authorized_hot_keys(committee_hot_keys)
             .with_committee_authorized_elected_hot_keys(committee_authorized_elected_hot_keys)
             .with_committee_members(committee_members)
@@ -944,6 +948,15 @@ pub(crate) fn convert_validation_error(
         },
         VE::GovActionsDoNotExist { action_ids } => TxValidationError::GovActionsDoNotExist {
             action_ids: action_ids.iter().map(gov_action_id_to_string).collect(),
+        },
+        VE::InvalidPrevGovActionId {
+            action_index,
+            action_type,
+            prev_action_id,
+        } => TxValidationError::InvalidPrevGovActionId {
+            action_index,
+            action_type: action_type.to_string(),
+            prev_action_id: prev_action_id.as_ref().map(gov_action_id_to_string),
         },
         VE::UnelectedCommitteeVoters { hot_keys } => TxValidationError::UnelectedCommitteeVoters {
             // hot_keys are Hash32 (typed: byte 28 = 0x00 key, 0x01 script).

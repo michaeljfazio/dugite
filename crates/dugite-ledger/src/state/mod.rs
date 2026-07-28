@@ -748,6 +748,22 @@ impl LedgerState {
         }
     }
 
+    /// Snapshot the enacted governance roots (Haskell `Proposals.pRoots`) for
+    /// the `InvalidPrevGovActionId` validation predicate.
+    ///
+    /// Single source of truth for every caller that builds a
+    /// [`crate::validation::ValidationContext`] — block apply, N2C submission,
+    /// and rollback revalidation — so the mempool and the block-apply path can
+    /// never disagree about which proposals chain correctly.
+    pub fn enacted_gov_roots(&self) -> crate::validation::EnactedGovRoots {
+        crate::validation::EnactedGovRoots {
+            pparam_update: self.gov.governance.enacted_pparam_update.clone(),
+            hard_fork: self.gov.governance.enacted_hard_fork.clone(),
+            committee: self.gov.governance.enacted_committee.clone(),
+            constitution: self.gov.governance.enacted_constitution.clone(),
+        }
+    }
+
     pub fn new(params: ProtocolParameters) -> Self {
         LedgerState {
             utxo: UtxoSubState {

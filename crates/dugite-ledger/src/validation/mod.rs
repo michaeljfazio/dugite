@@ -127,6 +127,92 @@ pub struct ActiveProposal {
     pub proposed_in_epoch: EpochNo,
 }
 
+/// The last *enacted* governance action id for each lineal governance purpose —
+/// Haskell's `Proposals.pRoots`, a `GovRelation` of `prRoot` values.
+///
+/// A `None` field means that purpose has never enacted an action, which is the
+/// only state in which a proposal of that purpose may carry
+/// `prev_action_id = None`.
+///
+/// `TreasuryWithdrawals` and `InfoAction` have no lineage and therefore no root.
+///
+/// This is the value type stored in [`ValidationContext::enacted_gov_roots`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EnactedGovRoots {
+    /// Root for `ParameterChange` proposals.
+    pub pparam_update: Option<GovActionId>,
+    /// Root for `HardForkInitiation` proposals.
+    pub hard_fork: Option<GovActionId>,
+    /// Root shared by `UpdateCommittee` AND `NoConfidence` — both act on the
+    /// committee purpose and therefore share one lineage in Haskell
+    /// (`grCommittee`).
+    pub committee: Option<GovActionId>,
+    /// Root for `NewConstitution` proposals.
+    pub constitution: Option<GovActionId>,
+}
+
+impl EnactedGovRoots {
+    /// The enacted root governing `action`'s purpose, or `None` when the action
+    /// type has no lineage requirement (`TreasuryWithdrawals`, `InfoAction`).
+    ///
+    /// Mirrors the purpose selection in `genesis_root_is_valid` /
+    /// `prev_action_matches_enacted_root` (`state/governance.rs`), which is the
+    /// same mapping Haskell performs via `GovRelation` lenses.
+    pub fn root_for(&self, action: &GovAction) -> Option<&GovActionId> {
+        match action {
+            GovAction::ParameterChange { .. } => self.pparam_update.as_ref(),
+            GovAction::HardForkInitiation { .. } => self.hard_fork.as_ref(),
+            GovAction::NoConfidence { .. } | GovAction::UpdateCommittee { .. } => {
+                self.committee.as_ref()
+            }
+            GovAction::NewConstitution { .. } => self.constitution.as_ref(),
+            GovAction::TreasuryWithdrawals { .. } | GovAction::InfoAction => None,
+        }
+    }
+}
+
+/// Whether `action` participates in a lineal `prev_action_id` chain at all.
+///
+/// `TreasuryWithdrawals` and `InfoAction` are one-shot: Haskell's
+/// `GovAction` has no `PrevGovActionId` field for them, so no ancestry check
+/// applies and any `prev_action_id` is irrelevant.
+fn gov_action_has_lineage(action: &GovAction) -> bool {
+    matches!(
+        action,
+        GovAction::ParameterChange { .. }
+            | GovAction::HardForkInitiation { .. }
+            | GovAction::NoConfidence { .. }
+            | GovAction::UpdateCommittee { .. }
+            | GovAction::NewConstitution { .. }
+    )
+}
+
+/// Short stable name for a `GovAction`, used in the
+/// `InvalidPrevGovActionId` error message.
+fn gov_action_type_name(action: &GovAction) -> &'static str {
+    match action {
+        GovAction::ParameterChange { .. } => "ParameterChange",
+        GovAction::HardForkInitiation { .. } => "HardForkInitiation",
+        GovAction::NoConfidence { .. } => "NoConfidence",
+        GovAction::UpdateCommittee { .. } => "UpdateCommittee",
+        GovAction::NewConstitution { .. } => "NewConstitution",
+        GovAction::TreasuryWithdrawals { .. } => "TreasuryWithdrawals",
+        GovAction::InfoAction => "InfoAction",
+    }
+}
+
+/// Extract a proposal's `prev_action_id`, if its action type has one.
+fn gov_action_prev_id(action: &GovAction) -> Option<&GovActionId> {
+    match action {
+        GovAction::ParameterChange { prev_action_id, .. }
+        | GovAction::HardForkInitiation { prev_action_id, .. }
+        | GovAction::NoConfidence { prev_action_id }
+        | GovAction::UpdateCommittee { prev_action_id, .. }
+        | GovAction::NewConstitution { prev_action_id, .. } => prev_action_id.as_ref(),
+        GovAction::TreasuryWithdrawals { .. } | GovAction::InfoAction => None,
+    }
+}
+
 #[derive(Default)]
 pub struct ValidationContext {
     pub registered_pools: Option<Arc<HashSet<Hash28>>>,
@@ -185,6 +271,17 @@ pub struct ValidationContext {
     /// `ProposalReturnAccountDoesNotExist`) need the proposal's expiry
     /// epoch and return address, not just the action.
     pub active_proposals: Option<Arc<HashMap<GovActionId, ActiveProposal>>>,
+    /// The last *enacted* governance action id per lineal purpose — Haskell's
+    /// `Proposals.pRoots` (`GovRelation` of `prRoot`s).
+    ///
+    /// Required by the `InvalidPrevGovActionId` predicate to decide whether a
+    /// proposal's `prev_action_id` chains correctly. `None` skips the predicate
+    /// entirely (lenient default, matching `active_proposals`).
+    ///
+    /// Note these are the *enacted* roots, NOT the set of in-flight proposals —
+    /// a proposal may also chain onto an active proposal, which is checked
+    /// against [`Self::active_proposals`].
+    pub enacted_gov_roots: Option<Arc<EnactedGovRoots>>,
     /// Hot credential hashes currently authorised by Constitutional Committee
     /// members (mirrors Haskell `authorizedHotCommitteeCredentials`).  Keys are
     /// stored as `credential.to_typed_hash32()` for symmetry with the
@@ -453,6 +550,20 @@ impl ValidationContext {
         proposals: Arc<HashMap<GovActionId, ActiveProposal>>,
     ) -> Self {
         self.active_proposals = Some(proposals);
+        self
+    }
+
+    /// Supply the enacted governance roots so the `InvalidPrevGovActionId`
+    /// predicate runs. Without this the predicate is skipped entirely.
+    pub fn with_enacted_gov_roots(mut self, roots: EnactedGovRoots) -> Self {
+        self.enacted_gov_roots = Some(Arc::new(roots));
+        self
+    }
+
+    /// `Arc` variant of [`Self::with_enacted_gov_roots`] for callers that
+    /// snapshot the roots once per block.
+    pub fn with_enacted_gov_roots_arc(mut self, roots: Arc<EnactedGovRoots>) -> Self {
+        self.enacted_gov_roots = Some(roots);
         self
     }
 
@@ -959,6 +1070,47 @@ pub enum ValidationError {
     /// (`checkGovActionsExist`).
     #[error("GovActionsDoNotExist: {action_ids:?}")]
     GovActionsDoNotExist { action_ids: Vec<GovActionId> },
+    /// Conway GOV rule: a `ProposalProcedure` whose `prev_action_id` does not
+    /// chain correctly onto its governance purpose.
+    ///
+    /// A lineal-purpose action (ParameterChange, HardForkInitiation,
+    /// NoConfidence, UpdateCommittee, NewConstitution) is admissible only when
+    /// either
+    ///   (a) `prev_action_id = None` AND that purpose has no enacted root, or
+    ///   (b) `prev_action_id = Some(id)` AND `id` is that purpose's enacted
+    ///       root OR an active in-flight proposal.
+    /// TreasuryWithdrawals and InfoAction have no lineage requirement.
+    ///
+    /// This must FAIL THE TRANSACTION, not drop the proposal. Haskell's GOV
+    /// rule is explicit (`Cardano.Ledger.Conway.Rules.Gov`):
+    ///
+    /// ```haskell
+    /// case proposalsAddAction actionState proposals of
+    ///   Just updatedProposals -> pure updatedProposals
+    ///   Nothing -> proposals <$ failBecause (injectFailure $ InvalidPrevGovActionId proposal)
+    /// ```
+    ///
+    /// `failBecause` registers a predicate failure, so the tx — and any block
+    /// carrying it — is invalid. dugite previously only logged and dropped the
+    /// proposal at apply time, on the mistaken assumption that Haskell dropped
+    /// it too. The result was a P0 consensus divergence: dugite's forge
+    /// admitted such a tx, minted it, and cardano-node rejected the block with
+    /// `ConwayGovFailure (InvalidPrevGovActionId …)` and issued `ShutdownPeer`,
+    /// splitting the chain. Observed on the local devnet at slot 1870 when a
+    /// ParameterChange with `prev_action_id = None` was proposed after another
+    /// ParameterChange had already been enacted.
+    ///
+    /// Skipped when `enacted_gov_roots` is `None` (the same lenient default
+    /// used by `active_proposals` and `committee_authorized_hot_keys`).
+    ///
+    /// Reference: Haskell `InvalidPrevGovActionId` (GOV predicate tag 8) in
+    /// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`.
+    #[error("InvalidPrevGovActionId: proposal index {action_index} ({action_type})")]
+    InvalidPrevGovActionId {
+        action_index: u32,
+        action_type: &'static str,
+        prev_action_id: Option<GovActionId>,
+    },
     /// Conway GOV rule (PV >= 11 only): one or more `ConstitutionalCommittee`
     /// votes carry a hot credential whose backing cold credential is NOT in
     /// the currently-enacted committee.  At PV <= 10 this predicate is
@@ -2588,6 +2740,67 @@ pub fn validate_transaction_with_context(
     // proposal in `tx.body.proposal_procedures` (and so does nothing for
     // a tx with no proposals).
     // -------------------------------------------------------------------
+    if params.protocol_version_major >= 9 && !tx.body.proposal_procedures.is_empty() {
+        // -------------------------------------------------------------------
+        // InvalidPrevGovActionId: every lineal-purpose proposal must chain
+        // correctly onto its purpose.
+        //
+        // Haskell (`Conway.Rules.Gov`) FAILS THE TRANSACTION here:
+        //
+        //   case proposalsAddAction actionState proposals of
+        //     Just updatedProposals -> pure updatedProposals
+        //     Nothing -> proposals <$ failBecause (injectFailure $
+        //                  InvalidPrevGovActionId proposal)
+        //
+        // dugite used to only WARN and drop the proposal at apply time,
+        // believing Haskell dropped it too. It does not. That gap let dugite's
+        // forge mint a block cardano-node considered invalid, which answered
+        // `ShutdownPeer` and stalled the chain — reproduced on the devnet at
+        // slot 1870 (a ParameterChange with prev_action_id=None proposed after
+        // one had already been enacted).
+        //
+        // Proposals earlier in the SAME tx are valid parents: Haskell folds
+        // `processProposal` over the tx's proposals in order, so proposal N may
+        // chain onto proposal N-1 of the same tx. Only strictly-earlier indices
+        // count — a forward or self reference is not yet in `proposals`.
+        //
+        // Skipped entirely when `enacted_gov_roots` is None (lenient default).
+        // -------------------------------------------------------------------
+        if let Some(roots) = context.enacted_gov_roots.as_ref() {
+            for (idx, proposal) in tx.body.proposal_procedures.iter().enumerate() {
+                let action = &proposal.gov_action;
+                if !gov_action_has_lineage(action) {
+                    continue;
+                }
+                let prev_id = gov_action_prev_id(action);
+                let valid = match prev_id {
+                    // Case (a): genesis root — only when nothing of this
+                    // purpose has ever been enacted.
+                    None => roots.root_for(action).is_none(),
+                    // Case (b): must be this purpose's enacted root, an active
+                    // in-flight proposal, or an earlier proposal in this tx.
+                    Some(prev) => {
+                        let matches_root = roots.root_for(action) == Some(prev);
+                        let in_flight = context
+                            .active_proposals
+                            .as_ref()
+                            .is_some_and(|active| active.contains_key(prev));
+                        let earlier_in_tx =
+                            prev.transaction_id == tx.hash && (prev.action_index as usize) < idx;
+                        matches_root || in_flight || earlier_in_tx
+                    }
+                };
+                if !valid {
+                    extra_errors.push(ValidationError::InvalidPrevGovActionId {
+                        action_index: idx as u32,
+                        action_type: gov_action_type_name(action),
+                        prev_action_id: prev_id.cloned(),
+                    });
+                }
+            }
+        }
+    }
+
     if params.protocol_version_major >= 9 && !tx.body.proposal_procedures.is_empty() {
         let mut bad_addrs: Vec<String> = Vec::new();
         for proposal in &tx.body.proposal_procedures {
