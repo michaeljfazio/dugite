@@ -37,8 +37,8 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::node::block_fetch_logic::BlockFetchLogicTask;
 use crate::node::connection_lifecycle::{
-    CandidateChainState, ConnectResult, ConnectionLifecycleManager, FetchedBlock, LifecycleError,
-    PeerFailureKind,
+    CandidateChainState, ConnectError, ConnectResult, ConnectionLifecycleManager, FetchedBlock,
+    LifecycleError, PeerFailureKind,
 };
 use crate::node::peer_connection::PeerConnection;
 
@@ -5407,30 +5407,11 @@ impl Node {
                         // set. An empty trusted set applies NO clamp (no
                         // bootstrap/local roots configured — praos-style
                         // topologies must keep current behaviour).
-                        // The clamp keys on bootstrap peers being CONFIGURED,
-                        // not resolved: `trusted_peer_addrs()` may still be
-                        // empty while bootstrap DNS is in flight, and a
-                        // None-fallback there would leave the first governor
-                        // ticks unclamped — exactly the window in which 14
-                        // untrusted public peers got established on the
-                        // 2026-07-28 diagnosis run. An empty `Some` refuses
-                        // all outbound establishment until resolution lands
-                        // (Haskell bootstrap mode behaves the same: no
-                        // trusted peers reachable ⇒ no peers at all).
-                        let bootstrap_configured = self
-                            .topology
-                            .bootstrap_peers
-                            .as_ref()
-                            .is_some_and(|b| !b.is_empty())
-                            || !self.topology.local_roots.is_empty();
-                        let trusted_restriction = if genesis_enabled
-                            && bootstrap_configured
-                            && last_seen_gsm_state != crate::gsm::GenesisSyncState::CaughtUp
-                        {
-                            Some(pm.trusted_peer_addrs())
-                        } else {
-                            None
-                        };
+                        let trusted_restriction = self.compute_sync_trusted_restriction(
+                            genesis_enabled,
+                            last_seen_gsm_state,
+                            &pm,
+                        );
                         // Store at BOTH enforcement layers: the governor
                         // filter avoids wasted actions; the lifecycle
                         // chokepoint catches every other promotion driver
@@ -5439,12 +5420,20 @@ impl Node {
                             lc.store_sync_trusted_clamp(trusted_restriction.clone());
                         }
                         governor.set_sync_trusted_restriction(trusted_restriction);
+                        // #920: self-healing counterpart to the promotion-only
+                        // clamp — every tick the clamp is active, demote any
+                        // peer that was already established BEFORE the clamp
+                        // (e.g. during a prior CaughtUp period) straight to
+                        // Cold. See `Governor::compute_actions_with_blp` doc.
+                        let untrusted_established: std::collections::HashSet<SocketAddr> =
+                            pm.untrusted_established_outbound().into_iter().collect();
                         governor.compute_actions_with_blp(
                             &pm.inner,
                             &local_root_targets,
                             &big_ledger,
                             &fresh_inbound,
                             active_fetch_peer,
+                            &untrusted_established,
                         )
                     };
 
@@ -5599,6 +5588,16 @@ impl Node {
                                         // discard the duplicate — it drops cleanly.
                                         debug!(%addr, "background connect raced inbound; discarding duplicate");
                                     }
+                                    // #920: the trusted-only clamp activated between
+                                    // `spawn_connect`'s initiation-time check and this
+                                    // registration-time recheck (mid-handshake race). This
+                                    // is a planned policy refusal, not a connection
+                                    // failure — charging `peer_failed` here would arm a
+                                    // reconnect backoff for a peer that must be
+                                    // immediately re-eligible once the clamp lifts.
+                                    Err(LifecycleError::TrustedOnlyClamp(_)) => {
+                                        debug!(%addr, "background connect raced the trusted-only clamp; discarding");
+                                    }
                                     Err(e) => {
                                         warn!(%addr, "register_warm_connection failed: {e}");
                                         pm.peer_failed(&addr);
@@ -5607,7 +5606,18 @@ impl Node {
                                 }
                             }
                         }
-                        Err((addr, error)) => {
+                        // #920: a policy refusal (the trusted-only clamp refusing at
+                        // `spawn_connect`'s initiation-time check) must NOT charge
+                        // `peer_failed` — it is a planned, instantaneous condition, not
+                        // a network failure, and the peer must remain immediately
+                        // re-eligible once the clamp lifts. Only a genuine I/O/handshake
+                        // failure arms the reconnect backoff.
+                        Err((addr, ConnectError::PolicyRefused(reason))) => {
+                            in_flight_connects.remove(&addr);
+                            governor.promotion_cold_completed(&addr);
+                            debug!(%addr, "background cold->warm refused by policy: {reason}");
+                        }
+                        Err((addr, ConnectError::Io(error))) => {
                             in_flight_connects.remove(&addr);
                             // Clear the governor's in-flight tracking so it retries
                             // the peer on the next tick rather than skipping it forever.
@@ -5799,6 +5809,63 @@ impl Node {
                                 "GSM state change — switching peer-selection targets"
                             );
                             governor.update_targets(targets);
+
+                            // #920: one-shot self-healing sweep on the
+                            // CaughtUp→Syncing/PreSyncing regression edge
+                            // (`syncing == true` only — never on the
+                            // PreSyncing↔Syncing flap #740 already guards
+                            // against above). A peer established during the
+                            // prior CaughtUp period is already Warm/Hot and
+                            // the promotion-only clamp can never touch it;
+                            // without this sweep the HAA closure ("every
+                            // established outbound peer is trusted") stays
+                            // broken until the next 2s governor tick's
+                            // demotion catches up. Recompute + store the
+                            // clamp here immediately (rather than waiting for
+                            // that tick) so the window closes on this exact
+                            // edge.
+                            if syncing {
+                                let mut pm = peer_manager.write().await;
+                                let trusted_restriction = self
+                                    .compute_sync_trusted_restriction(
+                                        genesis_enabled,
+                                        snap.state,
+                                        &pm,
+                                    );
+                                if let Some(ref lc) = self.connection_lifecycle {
+                                    lc.store_sync_trusted_clamp(trusted_restriction.clone());
+                                }
+                                governor.set_sync_trusted_restriction(trusted_restriction);
+                                let to_demote = pm.untrusted_established_outbound();
+                                if !to_demote.is_empty() {
+                                    info!(
+                                        count = to_demote.len(),
+                                        sample = ?to_demote.iter().take(5).collect::<Vec<_>>(),
+                                        "GSM regressed below CaughtUp — demoting \
+                                         already-established untrusted peer(s) to \
+                                         restore the trusted-only clamp (#920)"
+                                    );
+                                    if let Some(ref mut lifecycle) = self.connection_lifecycle {
+                                        for addr in to_demote {
+                                            // Mirror the `GovernorAction::DemoteToCold`
+                                            // handler's reconciliation: a
+                                            // `NotConnected` result means the peer is
+                                            // already gone at the lifecycle layer but
+                                            // still Warm/Hot in the peer manager — move
+                                            // it to Cold directly rather than leaving it
+                                            // dangling.
+                                            if let Err(e) =
+                                                lifecycle.demote_to_cold(addr, &mut pm).await
+                                            {
+                                                if matches!(e, LifecycleError::NotConnected(_)) {
+                                                    pm.peer_disconnected(&addr);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    self.update_peer_metrics(&pm);
+                                }
+                            }
                         }
                     }
                     if loe_gdd_enabled && snap.loe_slot != last_seen_loe_slot {
@@ -5975,6 +6042,50 @@ impl Node {
             }
         }
         Ok(())
+    }
+
+    /// Whether the sync-time trusted-only establishment clamp should be
+    /// active, and the trusted set to enforce if so.
+    ///
+    /// `Some(set)` while genesis mode is on, bootstrap/local-root peers are
+    /// configured, and the GSM is below CaughtUp (Haskell
+    /// `requiresBootstrapPeers`); `None` otherwise (no clamp — praos-style
+    /// topologies and CaughtUp both keep unrestricted establishment).
+    ///
+    /// Shared by the per-tick governor path (which recomputes this every 2s
+    /// so late bootstrap DNS resolutions extend the set) and the one-shot
+    /// CaughtUp-boundary sweep (#920) so the two can never diverge on the
+    /// activation condition — see `sync_trusted_clamp` (connection_lifecycle.rs)
+    /// and `Governor::sync_trusted_only` for the two enforcement layers this
+    /// feeds.
+    fn compute_sync_trusted_restriction(
+        &self,
+        genesis_enabled: bool,
+        gsm_state: crate::gsm::GenesisSyncState,
+        pm: &crate::node::networking::NodePeerManager,
+    ) -> Option<std::collections::HashSet<SocketAddr>> {
+        // The clamp keys on bootstrap peers being CONFIGURED, not resolved:
+        // `trusted_peer_addrs()` may still be empty while bootstrap DNS is in
+        // flight, and a None-fallback here would leave the first governor
+        // ticks unclamped — exactly the window in which 14 untrusted public
+        // peers got established on the 2026-07-28 diagnosis run. An empty
+        // `Some` refuses all outbound establishment until resolution lands
+        // (Haskell bootstrap mode behaves the same: no trusted peers
+        // reachable ⇒ no peers at all).
+        let bootstrap_configured = self
+            .topology
+            .bootstrap_peers
+            .as_ref()
+            .is_some_and(|b| !b.is_empty())
+            || !self.topology.local_roots.is_empty();
+        if genesis_enabled
+            && bootstrap_configured
+            && gsm_state != crate::gsm::GenesisSyncState::CaughtUp
+        {
+            Some(pm.trusted_peer_addrs())
+        } else {
+            None
+        }
     }
 
     // ─── Peer Metrics ────────────────────────────────────────────────────────
