@@ -31,6 +31,7 @@
 - [chaindb-architecture.md](chaindb-architecture.md) — ChainDB internals
 - [inbound-connection-rate-limiting.md](inbound-connection-rate-limiting.md) — AcceptedConnectionsLimit hard=512/soft=384/delay=5s, no per-IP cap
 - [mithril-snapshot-ledger-init.md](mithril-snapshot-ledger-init.md) — two-archive system, ledger snapshot layout, tickThenReapply/Apply split
+- [gsm-haa-syncing-presyncing-regression.md](gsm-haa-syncing-presyncing-regression.md) — Syncing→PreSyncing is HAA-only, NO tip-age term (tip-age only gates CaughtUp↔PreSyncing); OutboundConnectionsState 4-way case split (Genesis-mode BLP-count branch has no closure-over-established-peers condition); root-caused dugite from-genesis freeze to gsm.rs/networking.rs
 
 ## Ledger State Snapshots & CBOR Format
 - [ext-ledger-state-snapshot-format.md](ext-ledger-state-snapshot-format.md) — state file CBOR: outer array(2)[1,ExtLedgerState], HeaderState telescope, PraosState 8-field array
