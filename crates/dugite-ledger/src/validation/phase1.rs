@@ -31,7 +31,7 @@ use std::collections::HashSet;
 use dugite_primitives::credentials::Credential;
 use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::protocol_params::ProtocolParameters;
-use dugite_primitives::transaction::{Certificate, Transaction};
+use dugite_primitives::transaction::{Certificate, OutputDatum, Transaction};
 
 use crate::utxo::UtxoLookup;
 
@@ -1230,23 +1230,35 @@ pub(super) fn run_phase1_rules(
     // ------------------------------------------------------------------
     // Rule 5: All outputs >= minimum UTxO value
     //
-    // Haskell's Babbage/Conway minimum is `(160 + |out|) * coinsPerUTxOByte`
-    // where `|out|` is the output's TRUE serialized CBOR byte length. When
-    // `raw_cbor` is unavailable (the output was constructed in-memory
-    // rather than decoded from the wire) fall back to re-encoding the
-    // output via dugite's own CBOR encoder to get its exact size, instead
-    // of the 29-byte ADA-only floor — which under-estimates (and thus
-    // under-charges the minimum for) any multi-asset or datum/script-ref
-    // carrying output (issue #810).
+    // Haskell's `getMinCoinTxOut` is defined PER-ERA (issue #919) — dugite
+    // previously applied the Babbage/Conway serialized-size formula
+    // unconditionally in every era, producing false `OutputTooSmall`
+    // rejections on real Shelley/Allegra/Mary mainnet transactions (the
+    // Alonzo genesis `ada_per_utxo_byte` is seeded into `ProtocolParameters`
+    // at node startup regardless of the chain's current era). See
+    // `ProtocolParameters::min_coin_for_output` for the full per-era
+    // dispatch (Shelley/Allegra flat, Mary scaled deposit, Alonzo per-word,
+    // Babbage/Conway+ per-serialized-byte).
+    //
+    // The serialized size is only meaningful (and only computed) for the
+    // Babbage/Conway+ branch. When `raw_cbor` is unavailable (the output
+    // was constructed in-memory rather than decoded from the wire) fall
+    // back to re-encoding the output via dugite's own CBOR encoder to get
+    // its exact size, instead of a fixed floor — which under-estimates
+    // (and thus under-charges the minimum for) any multi-asset or
+    // datum/script-ref carrying output (issue #810).
     // ------------------------------------------------------------------
     for output in &body.outputs {
-        let min_utxo = match &output.raw_cbor {
-            Some(cbor) => params.min_utxo_for_output_size(cbor.len() as u64),
-            None => {
-                let encoded = dugite_serialization::encode_transaction_output(output);
-                params.min_utxo_for_output_size(encoded.len() as u64)
+        let has_datum_hash = matches!(output.datum, OutputDatum::DatumHash(_));
+        let output_size_bytes = if params.protocol_version_major >= 7 {
+            match &output.raw_cbor {
+                Some(cbor) => cbor.len() as u64,
+                None => dugite_serialization::encode_transaction_output(output).len() as u64,
             }
+        } else {
+            0
         };
+        let min_utxo = params.min_coin_for_output(&output.value, has_datum_hash, output_size_bytes);
         if output.value.coin.0 < min_utxo.0 {
             errors.push(ValidationError::OutputTooSmall {
                 minimum: min_utxo.0,
@@ -3955,7 +3967,7 @@ mod tests {
     fn test_output_at_min_utxo_passes() {
         let (utxo_set, mut tx, _) = make_valid_tx();
         let params = ProtocolParameters::mainnet_defaults();
-        let min_utxo = params.min_utxo_value().0;
+        let min_utxo = params.babbage_min_utxo_ada_only().0;
         // We need total output + fee == 10_000_000
         if min_utxo + 200_000 <= 10_000_000 {
             tx.body.outputs[0].value = Value::lovelace(min_utxo);
@@ -3974,6 +3986,234 @@ mod tests {
         assert!(
             no_small_error,
             "output exactly at min UTxO must NOT produce OutputTooSmall, got {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #919 regression: Rule 5 must dispatch per-era, not apply the Babbage
+    // serialized-size formula unconditionally. `make_valid_tx()` carries
+    // input=10_000_000, so output + fee must sum to 10_000_000 to keep Rule 3
+    // (value conservation) satisfied while varying the output/fee split.
+    // -----------------------------------------------------------------------
+
+    /// Shelley (PV2): the #919 repro shape — an ~84-byte-serialized output of
+    /// exactly the flat `minUTxOValue` (1_000_000) must pass. Pre-fix, dugite
+    /// applied the Babbage formula and demanded 1_051_640 instead.
+    #[test]
+    fn test_shelley_flat_min_utxo_exactly_one_million_passes() {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 2;
+        params.min_utxo_value = Lovelace(1_000_000);
+        tx.body.outputs[0].value = Value::lovelace(1_000_000);
+        tx.body.fee = Lovelace(9_000_000);
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        assert!(
+            result.is_ok(),
+            "Shelley output at exactly the flat minUTxOValue must pass, got {result:?}"
+        );
+    }
+
+    /// Shelley (PV2): one lovelace below the flat minimum must still reject
+    /// (Haskell's comparison is strict `<`, so exactly-equal passes but one
+    /// below does not).
+    #[test]
+    fn test_shelley_flat_min_utxo_one_below_rejected() {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 2;
+        params.min_utxo_value = Lovelace(1_000_000);
+        tx.body.outputs[0].value = Value::lovelace(999_999);
+        tx.body.fee = Lovelace(9_000_001);
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::OutputTooSmall { minimum: 1_000_000, .. })),
+            "output one below the flat minUTxOValue must produce OutputTooSmall{{minimum:1_000_000}}, got {errors:?}"
+        );
+    }
+
+    /// Allegra (PV3): same flat dispatch as Shelley.
+    #[test]
+    fn test_allegra_flat_min_utxo_passes() {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 3;
+        params.min_utxo_value = Lovelace(1_000_000);
+        tx.body.outputs[0].value = Value::lovelace(1_000_000);
+        tx.body.fee = Lovelace(9_000_000);
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        assert!(
+            result.is_ok(),
+            "Allegra output at exactly the flat minUTxOValue must pass, got {result:?}"
+        );
+    }
+
+    /// Mary (PV4), ada-only output: flat dispatch, value-size formula never
+    /// consulted.
+    #[test]
+    fn test_mary_ada_only_flat_min_utxo_passes() {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 4;
+        params.min_utxo_value = Lovelace(1_000_000);
+        tx.body.outputs[0].value = Value::lovelace(1_000_000);
+        tx.body.fee = Lovelace(9_000_000);
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        assert!(
+            result.is_ok(),
+            "Mary ada-only output at exactly the flat minUTxOValue must pass, got {result:?}"
+        );
+    }
+
+    /// Mary (PV4), multi-asset output: `scaledMinDeposit` must scale by
+    /// `mary_value_size`, not the flat value. A single 0-byte-named asset
+    /// scales the minimum to 1_407_406 (oracle golden, see
+    /// `dugite-primitives::value::tests::mary_value_size_one_policy_one_zero_byte_asset_name`).
+    /// The multi-asset is placed directly in the spent UTxO (not minted) so
+    /// Rule 3c's script-witness requirement is not in play.
+    #[test]
+    fn test_mary_multi_asset_scaled_min_utxo() {
+        let (mut utxo_set, mut tx, input) = make_valid_tx();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 4;
+        params.min_utxo_value = Lovelace(1_000_000);
+
+        let policy = Hash28::from_bytes([0x11u8; 28]);
+        let asset = AssetName::empty();
+
+        // Give the spent UTxO the same multi-asset bundle the output carries,
+        // so Rule 3b (multi-asset conservation) is satisfied without minting.
+        let mut funded = TransactionOutput {
+            address: Address::Byron(dugite_primitives::address::ByronAddress {
+                payload: vec![0x82, 0x00, 0x01],
+            }),
+            value: Value::lovelace(10_000_000),
+            datum: OutputDatum::None,
+            script_ref: None,
+            is_legacy: false,
+            raw_cbor: None,
+        };
+        funded
+            .value
+            .multi_asset
+            .entry(policy)
+            .or_default()
+            .insert(asset.clone(), 1);
+        utxo_set.insert(input.clone(), funded);
+
+        // One below the scaled minimum (1_407_406) must reject.
+        tx.body.outputs[0].value = Value::lovelace(1_407_405);
+        tx.body.outputs[0]
+            .value
+            .multi_asset
+            .entry(policy)
+            .or_default()
+            .insert(asset.clone(), 1);
+        tx.body.fee = Lovelace(10_000_000 - 1_407_405);
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::OutputTooSmall {
+                    minimum: 1_407_406,
+                    ..
+                }
+            )),
+            "expected OutputTooSmall{{minimum:1_407_406}}, got {errors:?}"
+        );
+
+        // Exactly at the scaled minimum must pass.
+        tx.body.outputs[0].value = Value::lovelace(1_407_406);
+        tx.body.outputs[0]
+            .value
+            .multi_asset
+            .entry(policy)
+            .or_default()
+            .insert(asset, 1);
+        tx.body.fee = Lovelace(10_000_000 - 1_407_406);
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        assert!(
+            result.is_ok(),
+            "output exactly at the Mary scaled minimum must pass, got {result:?}"
+        );
+    }
+
+    /// Alonzo (PV5), ada-only, no datum hash: `utxoEntrySize * coinsPerUTxOWord`
+    /// with NO ada-only short-circuit — oracle golden 999_978.
+    #[test]
+    fn test_alonzo_ada_only_no_datum_golden_min_utxo() {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 5;
+        params.coins_per_utxo_word = Lovelace(34_482);
+        tx.body.outputs[0].value = Value::lovelace(999_978);
+        tx.body.fee = Lovelace(10_000_000 - 999_978);
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        assert!(
+            result.is_ok(),
+            "Alonzo ada-only output at the golden minimum (999_978) must pass, got {result:?}"
+        );
+
+        tx.body.outputs[0].value = Value::lovelace(999_977);
+        tx.body.fee = Lovelace(10_000_000 - 999_977);
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::OutputTooSmall {
+                    minimum: 999_978,
+                    ..
+                }
+            )),
+            "expected OutputTooSmall{{minimum:999_978}}, got {errors:?}"
+        );
+    }
+
+    /// Alonzo (PV6), ada-only WITH a datum hash: `dataHashSize` adds 10
+    /// words — oracle golden 1_344_798.
+    #[test]
+    fn test_alonzo_ada_only_with_datum_hash_golden_min_utxo() {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 6;
+        params.coins_per_utxo_word = Lovelace(34_482);
+        tx.body.outputs[0].datum = OutputDatum::DatumHash(Hash32::ZERO);
+        tx.body.outputs[0].value = Value::lovelace(1_344_798);
+        tx.body.fee = Lovelace(10_000_000 - 1_344_798);
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        assert!(
+            result.is_ok(),
+            "Alonzo output with datum hash at the golden minimum (1_344_798) must pass, got {result:?}"
+        );
+    }
+
+    /// Babbage (PV7): unchanged serialized-size formula (regression guard —
+    /// the per-era dispatch must not alter Babbage/Conway behavior).
+    #[test]
+    fn test_babbage_serialized_size_formula_unchanged() {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 7;
+        let min_utxo = params.babbage_min_utxo_ada_only().0;
+        if min_utxo + 200_000 <= 10_000_000 {
+            tx.body.outputs[0].value = Value::lovelace(min_utxo);
+            tx.body.fee = Lovelace(10_000_000 - min_utxo);
+        }
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        let no_small_error = result.is_ok()
+            || result
+                .as_ref()
+                .err()
+                .map(|es| {
+                    !es.iter()
+                        .any(|e| matches!(e, ValidationError::OutputTooSmall { .. }))
+                })
+                .unwrap_or(true);
+        assert!(
+            no_small_error,
+            "Babbage output at the serialized-size minimum must NOT produce OutputTooSmall, got {result:?}"
         );
     }
 

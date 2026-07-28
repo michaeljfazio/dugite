@@ -110,6 +110,51 @@ impl Value {
         self.multi_asset.is_empty()
     }
 
+    /// The Mary-era `Val` instance `size` for a `MaryValue` — a CBOR-independent
+    /// "heap word count" shared by both Mary's `scaledMinDeposit` and Alonzo's
+    /// `utxoEntrySize` minimum-UTxO formulas (Alonzo's `Value` type IS Mary's
+    /// `MaryValue`; see `eras/alonzo/impl/src/Cardano/Ledger/Alonzo/Era.hs:37`,
+    /// `type instance Value AlonzoEra = MaryValue`).
+    ///
+    /// Reference: `Cardano.Ledger.Mary.Value` (`eras/mary/impl/src/Cardano/
+    /// Ledger/Mary/Value.hs:225-244,264-282,714-728`), oracle-verified live
+    /// against IntersectMBO/cardano-ledger for issue #919 (2026-07-29).
+    ///
+    /// Ada-only (no multi-assets): `size = 2`. This is NOT a "Mary" special
+    /// case — Mary's `scaledMinDeposit` never actually calls this function
+    /// for ada-only values (it short-circuits to the flat `minUTxOValue`
+    /// first, see `ProtocolParameters::min_coin_for_output`). Alonzo's
+    /// `utxoEntrySize`, by contrast, calls `size` UNCONDITIONALLY — an
+    /// ada-only Alonzo output genuinely costs `27 + 2 + dataHashSize` words.
+    ///
+    /// Multi-asset: `6 + roundupBytesToWords(representationSize)` where
+    /// `roundupBytesToWords(b) = (b + 7) / 8` (ceiling division, word = 8
+    /// bytes) and `representationSize` sums three terms: `12*numTriples`,
+    /// `28*numDistinctPolicyIds`, and the total byte length of every
+    /// distinct asset name. `numTriples` counts every (policy, assetName)
+    /// pair with non-zero quantity; `28` is the Blake2b-224 policy-ID hash
+    /// size; the asset-name byte sum is deduplicated by NAME BYTES ALONE
+    /// across ALL policies (a Haskell `Set` of name bytestrings) — two
+    /// different policies minting a token of the identical name pay for
+    /// those name bytes only once.
+    pub fn mary_value_size(&self) -> u64 {
+        if self.multi_asset.is_empty() {
+            return 2;
+        }
+        let num_triples: u64 = self.multi_asset.values().map(|m| m.len() as u64).sum();
+        let num_policies = self.multi_asset.len() as u64;
+        let mut unique_names: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+        for assets in self.multi_asset.values() {
+            for name in assets.keys() {
+                unique_names.insert(name.0.as_slice());
+            }
+        }
+        let name_bytes: u64 = unique_names.iter().map(|n| n.len() as u64).sum();
+        let representation_size = 12 * num_triples + 28 * num_policies + name_bytes;
+        let rounded_words = representation_size.div_ceil(8);
+        6 + rounded_words
+    }
+
     pub fn add(&self, other: &Value) -> Self {
         let coin = self.coin + other.coin; // Lovelace::Add is saturating
         let mut multi_asset = self.multi_asset.clone();
@@ -463,5 +508,76 @@ mod tests {
 
         let l2 = Lovelace::from_ada(0.0);
         assert_eq!(l2, Lovelace(0));
+    }
+
+    // -----------------------------------------------------------------------
+    // #919: `mary_value_size` oracle-verified goldens (IntersectMBO/cardano-ledger,
+    // `Cardano.Ledger.Mary.Value`, live-verified 2026-07-29).
+    // -----------------------------------------------------------------------
+
+    use crate::hash::PolicyId;
+
+    #[test]
+    fn mary_value_size_ada_only_is_two() {
+        let v = Value::lovelace(1_000_000);
+        assert_eq!(v.mary_value_size(), 2);
+    }
+
+    #[test]
+    fn mary_value_size_one_policy_one_zero_byte_asset_name() {
+        // representationSize = 12*1 + 28*1 + 0 = 40 -> roundup(40/8) = 5 -> size = 6+5 = 11.
+        let mut v = Value::lovelace(0);
+        let policy = PolicyId::from_bytes([0x11u8; 28]);
+        let mut assets = BTreeMap::new();
+        assets.insert(AssetName::empty(), 1u64);
+        v.multi_asset.insert(policy, assets);
+        assert_eq!(v.mary_value_size(), 11);
+    }
+
+    #[test]
+    fn mary_value_size_one_policy_one_eight_byte_asset_name() {
+        // representationSize = 12*1 + 28*1 + 8 = 48 -> roundup(48/8) = 6 -> size = 6+6 = 12.
+        let mut v = Value::lovelace(0);
+        let policy = PolicyId::from_bytes([0x22u8; 28]);
+        let mut assets = BTreeMap::new();
+        assets.insert(AssetName::new(vec![0u8; 8]).unwrap(), 1u64);
+        v.multi_asset.insert(policy, assets);
+        assert_eq!(v.mary_value_size(), 12);
+    }
+
+    #[test]
+    fn mary_value_size_two_policies_three_entries_twelve_unique_name_bytes() {
+        // representationSize = 12*3 + 28*2 + 12 = 36+56+12 = 104 -> roundup(104/8) = 13 -> size = 19.
+        let mut v = Value::lovelace(0);
+        let policy_a = PolicyId::from_bytes([0x01u8; 28]);
+        let policy_b = PolicyId::from_bytes([0x02u8; 28]);
+        let mut assets_a = BTreeMap::new();
+        assets_a.insert(AssetName::new(vec![0u8; 4]).unwrap(), 1u64);
+        assets_a.insert(AssetName::new(vec![1u8; 4]).unwrap(), 1u64);
+        let mut assets_b = BTreeMap::new();
+        assets_b.insert(AssetName::new(vec![2u8; 4]).unwrap(), 1u64);
+        v.multi_asset.insert(policy_a, assets_a);
+        v.multi_asset.insert(policy_b, assets_b);
+        assert_eq!(v.mary_value_size(), 19);
+    }
+
+    #[test]
+    fn mary_value_size_dedups_identical_asset_names_across_policies() {
+        // Two policies both minting an identical 7-byte-named token: the name
+        // bytes are counted ONCE (a Haskell `Set` of name bytestrings), not
+        // once per (policy, name) pair.
+        // representationSize = 12*2 (numTriples) + 28*2 (numPids) + 7 (dedup'd name) = 24+56+7 = 87
+        // -> roundup(87/8) = 11 -> size = 17.
+        let mut v = Value::lovelace(0);
+        let policy_a = PolicyId::from_bytes([0xaau8; 28]);
+        let policy_b = PolicyId::from_bytes([0xbbu8; 28]);
+        let name = AssetName::new(b"MyToken".to_vec()).unwrap();
+        let mut assets_a = BTreeMap::new();
+        assets_a.insert(name.clone(), 1u64);
+        let mut assets_b = BTreeMap::new();
+        assets_b.insert(name, 1u64);
+        v.multi_asset.insert(policy_a, assets_a);
+        v.multi_asset.insert(policy_b, assets_b);
+        assert_eq!(v.mary_value_size(), 17);
     }
 }
