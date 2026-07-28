@@ -58,7 +58,8 @@ caffeinate_if_macos "$DUGITE_BIN" run \
     --port          "$LD_RELAY_PORT" \
     --metrics-port  "$LD_DUGITE_RELAY_METRICS_PORT" \
     > "$LD_LOGS/dugite-relay.log" 2>&1 &
-echo $! > "$LD_STATE/dugite-relay.pid"
+write_node_pidfile "$LD_STATE/dugite-relay.db" "$LD_STATE/dugite-relay.pid" \
+    || { echo $! > "$LD_STATE/dugite-relay.pid"; log_info "WARN: could not resolve dugite-relay node pid; pidfile may be stale"; }
 log_info "dugite-relay PID $(cat "$LD_STATE/dugite-relay.pid")"
 
 # ---- cardano-bp ----
@@ -110,7 +111,8 @@ caffeinate_if_macos "$DUGITE_BIN" run \
     --shelley-vrf-key                 "$LD_KEYS/pool1/vrf.skey" \
     --shelley-operational-certificate "$LD_KEYS/pool1/opcert.cert" \
     > "$LD_LOGS/dugite-bp.log" 2>&1 &
-echo $! > "$LD_STATE/dugite-bp.pid"
+write_node_pidfile "$LD_STATE/dugite-bp.db" "$LD_STATE/dugite-bp.pid" \
+    || { echo $! > "$LD_STATE/dugite-bp.pid"; log_info "WARN: could not resolve dugite-bp node pid; pidfile may be stale"; }
 log_info "dugite-bp PID $(cat "$LD_STATE/dugite-bp.pid")"
 
 wait_for_socket "$LD_DUGITE_BP_SOCK"  120

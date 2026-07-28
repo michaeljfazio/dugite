@@ -120,10 +120,42 @@ query_slot() {
 # ---- Caffeinate wrapper (no-op on non-macOS) ----
 caffeinate_if_macos() {
     if [ "$(uname)" = "Darwin" ]; then
-        caffeinate -dimsu "$@"
+        exec caffeinate -dimsu "$@"
     else
-        "$@"
+        exec "$@"
     fi
+}
+
+# Resolve the REAL dugite-node pid for a given --database-path and write it to
+# a pidfile.
+#
+# Why this exists: `caffeinate_if_macos ... &` backgrounds a shell FUNCTION, so
+# `$!` is the pid of the subshell running that function — not caffeinate and not
+# the node. On macOS the recorded pid was therefore stale within moments, and
+# `kill "$(cat state/dugite-bp.pid)"` — the documented Round 3 restart step —
+# silently killed nothing. Round 3 then "passed" while the node had never gone
+# down, i.e. it never tested restart resilience at all.
+#
+# `exec` above makes the subshell BECOME caffeinate (or the node on Linux), and
+# this helper additionally resolves the actual `dugite-node run` process so the
+# pidfile always names something a SIGTERM will stop. Never SIGKILL a dugite
+# node: it corrupts the append-only ImmutableDB.
+write_node_pidfile() {
+    local db_path="$1" pidfile="$2" tries=0 pid=""
+    while [ "$tries" -lt 50 ]; do
+        # Prefer the bare node process over the caffeinate wrapper.
+        pid=$(pgrep -f "dugite-node run .*--database-path $db_path" 2>/dev/null \
+              | while read -r p; do
+                    case "$(ps -o command= -p "$p" 2>/dev/null)" in
+                        caffeinate*) ;;
+                        *) echo "$p" ;;
+                    esac
+                done | head -n 1)
+        [ -n "$pid" ] && { echo "$pid" > "$pidfile"; return 0; }
+        tries=$((tries + 1))
+        sleep 0.2
+    done
+    return 1
 }
 
 # Mark sourcing successful
