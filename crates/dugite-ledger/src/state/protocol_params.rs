@@ -140,8 +140,15 @@ impl LedgerState {
         if let Some(v) = update.min_pool_cost {
             self.epochs.protocol_params.min_pool_cost = v;
         }
+        if let Some(v) = update.min_utxo_value {
+            self.epochs.protocol_params.min_utxo_value = v;
+        }
         if let Some(v) = update.ada_per_utxo_byte {
-            self.epochs.protocol_params.ada_per_utxo_byte = v;
+            // Key-17 disambiguation (Alonzo `coinsPerUTxOWord` vs Babbage+
+            // `coinsPerUTxOByte`, issue #919) — must run BEFORE
+            // `update.protocol_version_major` is applied below, so it reads
+            // the protocol version IN FORCE when this update was proposed.
+            self.epochs.protocol_params.apply_key17_update(v);
         }
         if let Some(ref v) = update.cost_models {
             if let Some(ref v1) = v.plutus_v1 {

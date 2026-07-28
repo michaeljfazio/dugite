@@ -459,7 +459,14 @@ impl LedgerState {
     /// v30 (#902): `ConsensusSubState` gained `previous_epoch_nonce`
     /// (`praosStatePreviousEpochNonce`). Snapshots written by v29 and earlier
     /// do not carry it, so they must be replayed rather than loaded.
-    pub(crate) const SNAPSHOT_VERSION: u8 = 30;
+    /// v31 (#919): `ProtocolParameters` (embedded in every `protocol_params` /
+    /// `prev_protocol_params` field) gained `min_utxo_value: Lovelace` (flat
+    /// Shelley/Allegra/Mary `minUTxOValue`) and `coins_per_utxo_word: Lovelace`
+    /// (lossless Alonzo `coinsPerUTxOWord`) — both required for the per-era
+    /// minimum-UTxO dispatch that fixes false `OutputTooSmall` rejections of
+    /// real Shelley/Allegra/Mary mainnet transactions. Positional bincode
+    /// layout change for every embedded `protocol_params`/`prev_protocol_params`.
+    pub(crate) const SNAPSHOT_VERSION: u8 = 31;
 
     /// Save ledger state snapshot to disk using bincode serialization.
     ///
