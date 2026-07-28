@@ -2556,8 +2556,17 @@ fn apply_protocol_param_update_impl(
     if let Some(v) = update.min_pool_cost {
         params.min_pool_cost = v;
     }
+    if let Some(v) = update.min_utxo_value {
+        params.min_utxo_value = v;
+    }
     if let Some(v) = update.ada_per_utxo_byte {
-        params.ada_per_utxo_byte = v;
+        // Key-17 disambiguation — must run BEFORE `update.protocol_version_major`
+        // is applied below (issue #919; see
+        // `ProtocolParameters::apply_key17_update`). In practice Conway
+        // governance ParameterChange only runs at PV >= 9, so this always
+        // takes the byte-denominated branch — kept for defense-in-depth
+        // consistency with the two other apply sites.
+        params.apply_key17_update(v);
     }
     if let Some(ref v) = update.cost_models {
         if let Some(ref v1) = v.plutus_v1 {

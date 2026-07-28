@@ -325,6 +325,14 @@ pub fn decode_pparams(data: &[u8]) -> Result<(ProtocolParameters, usize), Serial
         protocol_version_minor,
         min_pool_cost: Lovelace(min_pool_cost),
         ada_per_utxo_byte: Lovelace(ada_per_utxo_byte),
+        // Not present in the Conway `array(31)` encoding this decoder targets
+        // — `min_utxo_value` (Shelley/Allegra/Mary) and `coins_per_utxo_word`
+        // (Alonzo) are pre-Babbage-only fields (issue #919). Cross-validation
+        // against a Conway-era Haskell snapshot never exercises the per-era
+        // minimum-UTxO dispatch, so these are defaulted to the mainnet
+        // genesis values rather than left uninitialized.
+        min_utxo_value: Lovelace(1_000_000),
+        coins_per_utxo_word: Lovelace(34_482),
         cost_models,
         execution_costs: ExUnitPrices {
             mem_price: Rational {

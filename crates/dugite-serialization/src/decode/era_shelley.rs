@@ -1494,9 +1494,12 @@ pub(crate) fn read_pre_conway_update_proposal(
 /// - 12: d (unit_interval = tag 30 rational) — Shelley-Alonzo
 /// - 13: extra_entropy (nonce) — currently skipped (deprecated in Babbage+)
 /// - 14: [protocol_version_major, protocol_version_minor]
-/// - 15: min_utxo_value (coin) — Shelley-Mary only, skipped (legacy)
+/// - 15: min_utxo_value (coin) — Shelley-Mary only; decoded into
+///   `ProtocolParamUpdate.min_utxo_value` (issue #919; previously skipped)
 /// - 16: min pool cost (coin) — Alonzo+
-/// - 17: ada per utxo word (Alonzo) / coins per utxo byte (Babbage) — same wire shape
+/// - 17: ada per utxo word (Alonzo) / coins per utxo byte (Babbage) — same wire
+///   shape, disambiguated by protocol version IN FORCE at apply time (see
+///   `ProtocolParameters::apply_key17_update`, issue #919)
 /// - 18: cost models
 /// - 19: ex unit prices
 /// - 20: max tx ex units
@@ -1583,9 +1586,17 @@ pub(crate) fn read_pre_conway_protocol_param_update(
                 ppu.protocol_version_minor = Some(r.read_uint()?);
             }
             15 => {
-                // min_utxo_value (Shelley-Mary only) — not stored by dugite
-                // (replaced by ada_per_utxo_byte in Alonzo+).
-                r.skip()?;
+                // min_utxo_value (Shelley-Mary only): the flat `minUTxOValue`
+                // PParam. Alonzo removes it from the wire PParamUpdate type
+                // entirely (replaced by `coinsPerUTxOWord` at key 17), so this
+                // key is never present in an Alonzo+ proposal in practice.
+                // Previously dropped on the floor — Shelley/Allegra/Mary's
+                // `getMinCoinTxOut` uses this value directly (never the
+                // Babbage/Conway serialized-size formula), so silently
+                // discarding a genuine on-chain minUTxOValue update
+                // desynchronised the minimum-UTxO check from Haskell for any
+                // chain whose genesis or on-chain PPU changed it (issue #919).
+                ppu.min_utxo_value = Some(read_lovelace(r)?);
             }
             16 => ppu.min_pool_cost = Some(read_lovelace(r)?),
             17 => ppu.ada_per_utxo_byte = Some(read_lovelace(r)?),

@@ -586,6 +586,11 @@ pub struct ProtocolParamUpdate {
     pub tau: Option<Rational>,
     pub min_pool_cost: Option<Lovelace>,
     pub ada_per_utxo_byte: Option<Lovelace>,
+    /// Shelley/Allegra/Mary flat `minUTxOValue` (wire key 15). Alonzo+
+    /// proposals never carry this key — see `ProtocolParameters::min_utxo_value`
+    /// (issue #919).
+    #[serde(default)]
+    pub min_utxo_value: Option<Lovelace>,
     pub cost_models: Option<CostModels>,
     pub execution_costs: Option<ExUnitPrices>,
     pub max_tx_ex_units: Option<ExUnits>,

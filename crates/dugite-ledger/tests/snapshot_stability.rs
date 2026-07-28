@@ -56,15 +56,16 @@ fn snapshot_format_hash_stability() {
     // This hash was computed from the current LedgerStateSnapshot layout.
     // If this changes, existing snapshot files become unreadable.
     //
-    // Last update: SNAPSHOT_VERSION 29 → 30 (#902, 2026-07-26) —
-    // `ConsensusSubState` / `LedgerStateSnapshot` gained `previous_epoch_nonce:
-    // Hash32` (Haskell `praosStatePreviousEpochNonce`), inserted right after
-    // `epoch_nonce` — a positional bincode layout change. cardano-node 11.0.x
-    // decodes `PraosState` with `enforceSize "PraosState" 8`, so the field must
-    // be real tracked state for the DebugChainDepState (LSQ tag 13) response to
-    // be accepted at all. Pre-existing snapshots are quarantined on load and
+    // Last update: SNAPSHOT_VERSION 30 → 31 (#919, 2026-07-29) —
+    // `ProtocolParameters` (embedded in every `protocol_params` /
+    // `prev_protocol_params` field) gained `min_utxo_value: Lovelace` (flat
+    // Shelley/Allegra/Mary `minUTxOValue`) and `coins_per_utxo_word: Lovelace`
+    // (lossless Alonzo `coinsPerUTxOWord`) — both required for the per-era
+    // minimum-UTxO dispatch that fixes false `OutputTooSmall` rejections of
+    // real Shelley/Allegra/Mary mainnet transactions. Positional bincode
+    // layout change. Pre-existing snapshots are quarantined on load and
     // operators re-sync (no migration shim — see SNAPSHOT_VERSION docs).
-    const EXPECTED_HASH: &str = "1c216e05dd246f9b100c06f784a6a4b36bba2c003ff6b18621216b90ac895cc9";
+    const EXPECTED_HASH: &str = "45d8c48be6338552a0dd04a8fbd38a65eba5d6d14930644bff9351945e745a00";
 
     if EXPECTED_HASH == "COMPUTE_ON_FIRST_RUN" {
         panic!(

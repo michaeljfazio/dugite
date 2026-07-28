@@ -1,5 +1,5 @@
 use crate::transaction::{CostModels, ExUnitPrices, ExUnits, Rational};
-use crate::value::Lovelace;
+use crate::value::{Lovelace, Value};
 use serde::{Deserialize, Serialize};
 
 /// Lovelace per byte of serialized transaction body, used as the linear
@@ -90,6 +90,31 @@ pub struct ProtocolParameters {
     // Minimum values
     pub min_pool_cost: Lovelace,
     pub ada_per_utxo_byte: Lovelace,
+    /// Shelley/Allegra/Mary flat minimum UTxO value (`minUTxOValue` PParam,
+    /// wire key 15). Shelley and Allegra's `getMinCoinTxOut` return this
+    /// value UNCONDITIONALLY — the TxOut is never inspected in those eras.
+    /// Mary's `scaledMinDeposit` returns this flat value for ada-only
+    /// outputs and derives `coinsPerUTxOWord = mv \`quot\` 27` from it for
+    /// multi-asset outputs (see [`Self::min_coin_for_output`]).
+    ///
+    /// Reference: `eras/shelley/impl/src/Cardano/Ledger/Shelley/TxOut.hs:94`,
+    /// `eras/allegra/impl/src/Cardano/Ledger/Allegra/TxOut.hs:31`,
+    /// `eras/mary/impl/src/Cardano/Ledger/Mary/TxOut.hs:52-76`. Mainnet value:
+    /// 1_000_000 lovelace, set at genesis and never updated on-chain for the
+    /// whole Shelley→Mary span (issue #919).
+    #[serde(default = "default_min_utxo_value")]
+    pub min_utxo_value: Lovelace,
+    /// Alonzo-only `coinsPerUTxOWord` PParam (wire key 17 in Alonzo-era
+    /// PPUs) — an INDEPENDENT parameter, NOT derived from `min_utxo_value`.
+    /// Used in `utxoEntrySize txOut * coinsPerUTxOWord`
+    /// (`eras/alonzo/impl/src/Cardano/Ledger/Alonzo/TxOut.hs:370-372,504-517`).
+    ///
+    /// Superseded by `ada_per_utxo_byte` (`coinsPerUTxOByte`) at the
+    /// Alonzo→Babbage hard fork via the one-way
+    /// `coinsPerUTxOWordToCoinsPerUTxOByte` (÷8) translation — see
+    /// [`Self::apply_key17_update`].
+    #[serde(default = "default_coins_per_utxo_word")]
+    pub coins_per_utxo_word: Lovelace,
 
     // Plutus
     pub cost_models: CostModels,
@@ -206,6 +231,19 @@ fn default_active_slot_coeff() -> f64 {
     0.05
 }
 
+/// Mainnet Shelley genesis `minUTxOValue` — never updated on-chain across the
+/// whole Shelley→Mary span (issue #919).
+fn default_min_utxo_value() -> Lovelace {
+    Lovelace(1_000_000)
+}
+
+/// Mainnet Alonzo genesis `lovelacePerUTxOWord` (34_482), stored losslessly
+/// (the `/8` translation to `ada_per_utxo_byte` is a one-way, lossy integer
+/// division — see [`ProtocolParameters::apply_key17_update`]).
+fn default_coins_per_utxo_word() -> Lovelace {
+    Lovelace(34_482)
+}
+
 impl ProtocolParameters {
     /// Calculate the minimum fee for a transaction
     pub fn min_fee(&self, tx_size: u64) -> Lovelace {
@@ -240,9 +278,14 @@ impl ProtocolParameters {
         f64_to_rational(self.active_slots_coeff)
     }
 
-    /// Calculate minimum UTxO value (ada-only)
-    /// Minimum UTxO for a simple ADA-only output (no multi-assets, no datum)
-    pub fn min_utxo_value(&self) -> Lovelace {
+    /// Babbage/Conway minimum UTxO value for a simple ADA-only output (no
+    /// multi-assets, no datum), estimating its serialized size at 29 bytes.
+    ///
+    /// NOTE: this is a Babbage/Conway-only (PV >= 7) estimate — pre-Babbage
+    /// eras never use the serialized-size formula at all. Callers that need
+    /// the correct minimum for the era IN FORCE must use
+    /// [`Self::min_coin_for_output`] instead (issue #919).
+    pub fn babbage_min_utxo_ada_only(&self) -> Lovelace {
         // Babbage formula: coins_per_utxo_byte * (160 + output_size)
         // Simple ADA-only output is ~29 bytes serialized
         Lovelace(self.ada_per_utxo_byte.0 * (160 + 29))
@@ -251,8 +294,105 @@ impl ProtocolParameters {
     /// Minimum UTxO for an output with a specific serialized size.
     /// Uses the Babbage/Conway formula: coins_per_utxo_byte * (160 + output_size)
     /// where 160 is the constant overhead for the UTxO entry itself.
+    ///
+    /// NOTE: Babbage/Conway (PV >= 7) only. See [`Self::min_coin_for_output`]
+    /// for the full per-era dispatch (issue #919).
     pub fn min_utxo_for_output_size(&self, output_size_bytes: u64) -> Lovelace {
         Lovelace(self.ada_per_utxo_byte.0 * (160 + output_size_bytes))
+    }
+
+    /// Per-era minimum-coin dispatch for Phase-1 Rule 5 (`OutputTooSmall`).
+    ///
+    /// Haskell's `getMinCoinTxOut` is defined PER-ERA — a Babbage-shaped
+    /// calculation is structurally impossible to run against a Shelley
+    /// `TxOut` in the reference implementation, since each era's UTXO rule
+    /// only ever sees its OWN era's PParams type. Applying one formula
+    /// unconditionally across all eras (the pre-#919 bug) produces false
+    /// `OutputTooSmall` rejections on real Shelley/Allegra/Mary mainnet
+    /// transactions whenever `ada_per_utxo_byte` has already been seeded
+    /// from the Alonzo genesis file (which dugite applies unconditionally
+    /// at node startup, regardless of the chain's current era).
+    ///
+    /// `has_datum_hash` — true iff the output carries an
+    /// `OutputDatum::DatumHash` (Alonzo has no inline-datum concept; that
+    /// arrives in Babbage). `output_size_bytes` — the output's true
+    /// serialized CBOR length, only consulted by the Babbage+ branch.
+    ///
+    /// Dispatch (PV = `protocol_version_major`):
+    /// - PV <= 3 (Shelley, Allegra): flat `min_utxo_value`, TxOut ignored.
+    ///   (`eras/shelley/impl/.../TxOut.hs:94`, `eras/allegra/impl/.../TxOut.hs:31`)
+    /// - PV == 4 (Mary): `scaledMinDeposit` — ada-only short-circuits to the
+    ///   flat value; multi-asset scales by [`Value::mary_value_size`].
+    ///   (`eras/mary/impl/.../TxOut.hs:52-76`)
+    /// - PV 5-6 (Alonzo): `utxoEntrySize * coinsPerUTxOWord`, no ada-only
+    ///   short-circuit. (`eras/alonzo/impl/.../TxOut.hs:370-372,504-517`)
+    /// - PV >= 7 (Babbage/Conway+): unchanged serialized-size formula.
+    ///
+    /// The Haskell comparison predicates (`Shelley/Rules/Utxo.hs:521-538` for
+    /// Shelley/Allegra/Mary, `Alonzo/Rules/Utxo.hs:387-405` for Alonzo+) both
+    /// reduce to a coin-only `<` comparison against the value returned here:
+    /// Shelley/Allegra/Mary compare `coin(txOut) < getMinCoinTxOut` directly;
+    /// Alonzo+'s `Val.pointwise (>=)` against an injected coin-only value
+    /// additionally asserts every non-ada quantity is `>= 0`, which is a
+    /// structural invariant of dugite's `u64`-quantity `Value` and therefore
+    /// never independently fails.
+    pub fn min_coin_for_output(
+        &self,
+        value: &Value,
+        has_datum_hash: bool,
+        output_size_bytes: u64,
+    ) -> Lovelace {
+        match self.protocol_version_major {
+            0..=3 => {
+                // Shelley (2) / Allegra (3): flat param, TxOut unused.
+                self.min_utxo_value
+            }
+            4 => {
+                // Mary `scaledMinDeposit`.
+                if value.is_pure_ada() {
+                    self.min_utxo_value
+                } else {
+                    let mv = self.min_utxo_value.0;
+                    let coins_per_word = mv / 27; // `mv \`quot\` 27`
+                    let size = value.mary_value_size();
+                    Lovelace(mv.max(coins_per_word * (27 + size)))
+                }
+            }
+            5 | 6 => {
+                // Alonzo `utxoEntrySize * coinsPerUTxOWord`.
+                let data_hash_size = if has_datum_hash { 10 } else { 0 };
+                let entry_size = 27 + value.mary_value_size() + data_hash_size;
+                Lovelace(entry_size * self.coins_per_utxo_word.0)
+            }
+            _ => {
+                // Babbage/Conway+ (PV >= 7): unchanged serialized-size formula.
+                self.min_utxo_for_output_size(output_size_bytes)
+            }
+        }
+    }
+
+    /// Apply an incoming PParams wire-key-17 update, disambiguating by the
+    /// protocol version currently IN FORCE on `self` — i.e. BEFORE any
+    /// `protocol_version_major` bump carried by the SAME update is applied
+    /// (callers must invoke this before overwriting `protocol_version_major`).
+    ///
+    /// Wire key 17 is `coinsPerUTxOWord` in Alonzo-era PParamUpdates (PV <= 6)
+    /// and `coinsPerUTxOByte` in Babbage+ PParamUpdates (PV >= 7) — an
+    /// identical CBOR shape (a bare Lovelace `uint`) with two different
+    /// semantics. Haskell's own `coinsPerUTxOWordToCoinsPerUTxOByte`
+    /// translation (`eras/babbage/impl/src/Cardano/Ledger/Babbage/PParams.hs`)
+    /// runs exactly once, at the Alonzo->Babbage hard-fork era-translation
+    /// boundary. dugite instead re-derives the byte value eagerly on every
+    /// Alonzo-era key-17 update, so it is always current by the time the
+    /// hard fork lands — idempotent, since only the LAST word value before
+    /// the fork matters, and eager derivation keeps it continuously in sync.
+    pub fn apply_key17_update(&mut self, v: Lovelace) {
+        if self.protocol_version_major <= 6 {
+            self.coins_per_utxo_word = v;
+            self.ada_per_utxo_byte = Lovelace(v.0 / 8);
+        } else {
+            self.ada_per_utxo_byte = v;
+        }
     }
 
     /// Default mainnet parameters (Conway era, approximate)
@@ -281,6 +421,8 @@ impl ProtocolParameters {
             },
             min_pool_cost: Lovelace(170_000_000),
             ada_per_utxo_byte: Lovelace(4310),
+            min_utxo_value: default_min_utxo_value(),
+            coins_per_utxo_word: default_coins_per_utxo_word(),
             cost_models: CostModels::default(),
             execution_costs: ExUnitPrices {
                 mem_price: Rational {
@@ -578,5 +720,88 @@ mod tests {
         map.insert("minFeeA".to_string(), v);
         let parsed: ProtocolParameters = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.min_fee_a, base.min_fee_a);
+    }
+
+    // ── #919: per-era `min_coin_for_output` dispatch ─────────────────────────
+
+    fn params_with_pv(pv_major: u64) -> ProtocolParameters {
+        let mut p = ProtocolParameters::mainnet_defaults();
+        p.protocol_version_major = pv_major;
+        p.min_utxo_value = Lovelace(1_000_000);
+        p.coins_per_utxo_word = Lovelace(34_482);
+        p
+    }
+
+    #[test]
+    fn min_coin_shelley_flat_regardless_of_value() {
+        let p = params_with_pv(2);
+        let ada_only = Value::lovelace(1);
+        assert_eq!(
+            p.min_coin_for_output(&ada_only, false, 84).0,
+            1_000_000,
+            "Shelley must return the flat minUTxOValue, not a size-scaled amount (#919 repro)"
+        );
+    }
+
+    #[test]
+    fn min_coin_allegra_flat() {
+        let p = params_with_pv(3);
+        let v = Value::lovelace(1);
+        assert_eq!(p.min_coin_for_output(&v, false, 84).0, 1_000_000);
+    }
+
+    #[test]
+    fn min_coin_mary_ada_only_flat() {
+        let p = params_with_pv(4);
+        let v = Value::lovelace(1);
+        assert_eq!(p.min_coin_for_output(&v, false, 84).0, 1_000_000);
+    }
+
+    #[test]
+    fn min_coin_mary_multi_asset_scaled_deposit_golden() {
+        // Oracle golden: mv=1_000_000, 1 policy + one 0-byte asset name.
+        // coinsPerUTxOWord = quot(1_000_000, 27) = 37_037.
+        // size(v) = 11 (see mary_value_size_one_policy_one_zero_byte_asset_name).
+        // min = max(1_000_000, 37_037 * (27 + 11)) = 1_407_406.
+        let p = params_with_pv(4);
+        let mut v = Value::lovelace(0);
+        let policy = crate::hash::PolicyId::from_bytes([0x11u8; 28]);
+        let mut assets = std::collections::BTreeMap::new();
+        assets.insert(crate::value::AssetName::empty(), 1u64);
+        v.multi_asset.insert(policy, assets);
+        assert_eq!(p.min_coin_for_output(&v, false, 0).0, 1_407_406);
+    }
+
+    #[test]
+    fn min_coin_alonzo_ada_only_no_datum_golden() {
+        // Oracle golden: coinsPerUTxOWord=34_482, ada-only, no datum:
+        // (27 + 2 + 0) * 34_482 = 29 * 34_482 = 999_978.
+        let p = params_with_pv(5);
+        let v = Value::lovelace(1);
+        assert_eq!(p.min_coin_for_output(&v, false, 0).0, 999_978);
+    }
+
+    #[test]
+    fn min_coin_alonzo_ada_only_with_datum_hash_golden() {
+        // Oracle golden: (27 + 2 + 10) * 34_482 = 39 * 34_482 = 1_344_798.
+        let p = params_with_pv(6);
+        let v = Value::lovelace(1);
+        assert_eq!(p.min_coin_for_output(&v, true, 0).0, 1_344_798);
+    }
+
+    #[test]
+    fn min_coin_babbage_unchanged_serialized_size_formula() {
+        let p = params_with_pv(7);
+        let v = Value::lovelace(1);
+        // 4310 * (160 + 84) = 4310 * 244 = 1_051_640 (the exact #919 repro
+        // minimum that was WRONGLY applied to Shelley outputs pre-fix).
+        assert_eq!(p.min_coin_for_output(&v, false, 84).0, 1_051_640);
+    }
+
+    #[test]
+    fn min_coin_conway_unchanged_serialized_size_formula() {
+        let p = params_with_pv(9);
+        let v = Value::lovelace(1);
+        assert_eq!(p.min_coin_for_output(&v, false, 84).0, 1_051_640);
     }
 }
