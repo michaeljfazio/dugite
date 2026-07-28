@@ -95,61 +95,66 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 - 28-byte hash types (DRep keys, pool voter keys, required signers) must be padded to 32 bytes via `Hash28::to_hash32_padded()` — do not use `Hash<32>::from()` directly on 28-byte hashes
 
 ## Current Focus
-v2.2.2 released (2026-07-28). Five networking/consensus fixes ending the
-preprod sync churn — the "keep connecting and disconnecting" behaviour visible
-during catch-up. All five compound; none is a ledger divergence.
+Backlog sweep after v2.2.4 (2026-07-29). Nine open issues triaged and fixed;
+two are byte-exact ledger/LSQ divergences, the rest are correctness hygiene
+and harness defects that made suites report success while testing nothing.
 
-- **#908 (client)** — the flap loop had **no backoff**. `cleanup_dead_connections`
-  called only `peer_disconnected()`, which drops a peer to Cold with
-  `next_connect_after` unset, so `eligible_cold` re-offered it on the next
-  governor tick (10 full cycles with one peer in 90 s; 45 in one 19 h log).
-  Everything the GC reaps died *unexpectedly* — every planned teardown removes
-  its connections from the map synchronously first — so the reap now applies
-  `peer_failed()`. Repeat reports for one teardown (protocol task **and** GC)
-  collapse inside a 2 s window: Haskell backs off per connection *attempt*.
-  Also, `MsgIntersectNotFound` for every offered point now classifies as
-  `PeerUnsuitable`/ForkTooDeep directly instead of "syncing from Origin".
-- **#908 (server)** — **dugite's ChainSync server answered
-  `MsgIntersectNotFound` to every point deeper than its own immutable tip.**
-  `handle_find_intersect` validated points with `find_chain_ancestor`, which is
-  a *rewind* helper: volatile selected chain + the immutable **tip** only. That
-  is exactly the anchor set dugite's own client offers
-  (`get_immutable_historical_points`), so a peer could only intersect on our
-  live tip block. New `BlockProvider::canonical_point_slot` resolves the whole
-  canonical chain. See [[reference_find_chain_ancestor_is_not_an_intersection_lookup]].
-- **#909** — bulk-sync hot demotion evicted the **active BlockFetch downloader**.
-  `peer_score` weights keepalive RTT 40%, and the downloader's pings queue
-  behind its own 2048-block payload stream, so the busiest peer ranked worst.
-  Haskell has no identity exclusion — `simpleChurnModePeerSelectionPolicy`
-  sorts by `fetchynessBytes` ascending and the metric *is* the protection.
-  Added a rolling fetched-bytes window; `hot_demotion_rank` uses it in bulk
-  sync, `peer_score` at tip. The churn-rotation path also gained the
-  fetch-slot exclusion it never had.
-- **#910** — the pipeline **could not drain**, so `MsgDone` was never sent and
-  a reused mux carried prior-session residue (`317 stale next-phase responses
-  … (bound 316)`, 45x). Root cause: dugite blasted 300 `MsgRequestNext`
-  unconditionally and refilled to 300 whenever `!at_tip`, parking 200-300
-  requests answerable only as blocks are minted. `pipeline_target_depth` now
-  bounds depth by the known block gap (Haskell `pipelineDecisionLowHighMark`):
-  1 at tip, unchanged at 300 during bulk sync. Cancel drains to zero then
-  sends `MsgDone`; the mux is reused only if that succeeded, else TCP close.
-  Residue tolerance 316 → 8.
-- **#911** — eager OCERT upper bound is now **advisory**. In the per-peer eager
-  view `m` is a single peer's reconstruction on a startup-frozen baseline that
-  is reset on `MsgRollBackward`, so a canonical header reads as an
-  over-increment (`got=474 last_seen=472` on a Koios-verified preprod block).
-  It already deferred to body apply, but WARNed like a rejection and never
-  advanced the counter, so every following header from that pool re-tripped.
-  Now: `debug!`, advance the high-water mark, still skip. Lower bound
-  (`CounterTooSmallOCERT`) stays fatal.
+- **#919 (ledger, SNAPSHOT 30 -> 31)** — dugite had exactly ONE min-UTxO
+  helper, the Babbage `(160+size) x coinsPerUTxOByte` formula, applied in
+  every era, because `ada_per_utxo_byte` is seeded from the Alonzo genesis at
+  startup regardless of the chain's era. Mainnet Shelley txs with 1 ADA
+  outputs were rejected at `minimum=1051640` (= 4310 x 244). Haskell defines
+  `getMinCoinTxOut` per era and can never apply a Babbage calc to a Shelley
+  TxOut. Now PV-dispatched: PV<=3 flat `minUTxOValue`; PV4 Mary
+  `scaledMinDeposit` (ada-only short-circuits BEFORE `size`); PV5-6 Alonzo
+  `(27 + size + dataHashSize) x coinsPerUTxOWord`; PV>=7 unchanged. The
+  shared `Value::mary_value_size()` returns **2** for ada-only — deliberately
+  "wrong for Mary, right for Alonzo" upstream, since Mary never reaches it.
+  Also fixed: PPU key 15 was decoded then dropped, and key 17 is
+  coinsPerUTxOWord pre-Babbage but coinsPerUTxOByte after (disambiguated by
+  the PV in force before that update's own PV bump).
+- **#922 (LSQ)** — `GetProposals` served the LIVE proposal set. Haskell's
+  `queryProposals` never reads `cgsProposals`; it reads the DRep pulser's
+  frozen `dpProposals`/`psProposals`, refreshed once per epoch boundary by
+  `setFreshDRepPulsingState`, so mid-epoch submissions are invisible until
+  the next boundary. Now answers from dugite's #903 ratification snapshot
+  (the same `dpProposals` equivalent) — one mechanism, two bugs.
+  `GetGovState`'s embedded `cgsProposals` correctly stays live.
+- **#920 (network)** — the v2.2.4 trusted-only clamp gated PROMOTION only, so
+  peers established during a CaughtUp period that later regressed stayed
+  established and the HAA closure could still fail. Now self-healing: the
+  governor demotes untrusted established outbound peers straight to Cold
+  every tick the clamp holds (no cooldown, no fetch-slot exclusion — a
+  planned policy teardown, not a failure), plus a one-shot sweep on the
+  regression edge and a register-time gate closing the mid-handshake race.
+- **#914 (ledger)** — the GOV apply path silently dropped proposals with an
+  invalid `prev_action_id` under a comment claiming Haskell does the same.
+  Canonical `Conway.Rules.Gov` does the opposite (`failBecause`). Now hard
+  errors: reaching it on ApplyOnly means governance state already diverged
+  (the #898 shape), so crash rather than corrupt pots silently.
+- **#915 (network)** — `InvalidPrevGovActionId` rejections now encode as
+  canonical `ConwayGovFailure` (Ledger tag 3) / GOV tag 8 carrying the full
+  `ProposalProcedure`, instead of a generic reason.
+- **Harness defects (#916/#917/#918/#921/#923)** — the recurring shape is a
+  check that reports success while measuring nothing. The release report
+  counted the substring "error" (so `error=` fields on INFO lines showed
+  thousands of errors on a clean run); the forge-stall predicate was a ~3%
+  per-sample coin flip on a single-forger devnet; three tx-zoo scripts
+  skipped structurally on every run; `adv_send_expect_close` returned PASS
+  when socat was missing, so every adversarial N2N case in protocols/01-07
+  "passed" without sending a byte. Level counting is now shared by generator
+  and analyzer with an agreement test; forge-stall accumulates a
+  Praos-derived p99.9 gap budget; tx-zoo vendors a stdlib raw-socket writer
+  and a CBOR splicer and classifies env-vs-state skips (`--strict-skips`);
+  nextest has a `slow-timeout` terminate-after backstop.
 
-No SNAPSHOT_VERSION change — v2.2.2 is a drop-in upgrade from v2.2.1.
-Pre-v2.1.0 Mithril DBs still need a full `mithril-import`.
+**#919 bumps SNAPSHOT_VERSION 30 -> 31** — existing DBs replay chunks on
+first restart. Pre-v2.1.0 Mithril DBs still need a full `mithril-import`.
 
-Open query-surface work (neither affects consensus): **#905**
+Open query-surface work (does not affect consensus): **#905**
 (`query stake-distribution` rebuilds pool stake from live delegations and
-misses genesis-seeded ones) and **#906** (`GetProposals` drops govAction
-payloads and misorders results).
+misses genesis-seeded ones). #906 (GetProposals payload/order) was already
+fixed in `fc892e1759` before v2.2.1 — verified during the #922 work.
 
 Soak testing via Sandstone Pool [SAND] on preview and preprod (pool IDs:
 preview `6954ec11cf7097a693721104139b96c54e7f3e2a8f9e7577630f7856`, preprod
