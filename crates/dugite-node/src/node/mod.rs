@@ -5392,6 +5392,53 @@ impl Node {
                             .volatile_wal_sync_at_tip
                             .load(std::sync::atomic::Ordering::Relaxed);
                         governor.set_bulk_sync_mode(!at_tip);
+                        // Trusted-only establishment clamp while the GSM is
+                        // below CaughtUp in genesis mode (Haskell
+                        // `requiresBootstrapPeers` — see
+                        // `Governor::set_sync_trusted_restriction`). Without
+                        // it the governor establishes public peers during
+                        // bulk sync, the `haa_satisfied` closure ("every
+                        // established outbound peer is trusted") goes
+                        // structurally false, the GSM regresses Syncing →
+                        // PreSyncing, and the LoE freezes selection at
+                        // immutable-tip + k — the 2026-07-28 mainnet
+                        // from-genesis permanent stall. Recomputed every
+                        // tick so late bootstrap DNS resolutions extend the
+                        // set. An empty trusted set applies NO clamp (no
+                        // bootstrap/local roots configured — praos-style
+                        // topologies must keep current behaviour).
+                        // The clamp keys on bootstrap peers being CONFIGURED,
+                        // not resolved: `trusted_peer_addrs()` may still be
+                        // empty while bootstrap DNS is in flight, and a
+                        // None-fallback there would leave the first governor
+                        // ticks unclamped — exactly the window in which 14
+                        // untrusted public peers got established on the
+                        // 2026-07-28 diagnosis run. An empty `Some` refuses
+                        // all outbound establishment until resolution lands
+                        // (Haskell bootstrap mode behaves the same: no
+                        // trusted peers reachable ⇒ no peers at all).
+                        let bootstrap_configured = self
+                            .topology
+                            .bootstrap_peers
+                            .as_ref()
+                            .is_some_and(|b| !b.is_empty())
+                            || !self.topology.local_roots.is_empty();
+                        let trusted_restriction = if genesis_enabled
+                            && bootstrap_configured
+                            && last_seen_gsm_state != crate::gsm::GenesisSyncState::CaughtUp
+                        {
+                            Some(pm.trusted_peer_addrs())
+                        } else {
+                            None
+                        };
+                        // Store at BOTH enforcement layers: the governor
+                        // filter avoids wasted actions; the lifecycle
+                        // chokepoint catches every other promotion driver
+                        // (rotation, reconnect) — see `sync_trusted_clamp`.
+                        if let Some(ref lc) = self.connection_lifecycle {
+                            lc.store_sync_trusted_clamp(trusted_restriction.clone());
+                        }
+                        governor.set_sync_trusted_restriction(trusted_restriction);
                         governor.compute_actions_with_blp(
                             &pm.inner,
                             &local_root_targets,

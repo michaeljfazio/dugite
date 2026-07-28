@@ -203,6 +203,19 @@ pub struct Governor {
     /// caught-up → `false`. Mirrors the Haskell `FetchMode` BulkSync/Deadline
     /// churn-cadence split.
     bulk_sync_mode: bool,
+    /// When `Some`, the aggregate `belowTargetOther` promotion paths
+    /// (cold→warm and warm→hot) only establish peers in this TRUSTED set
+    /// (bootstrap peers ∪ local roots). Mirrors Haskell's
+    /// `requiresBootstrapPeers` clamping (`Cardano.Network.PeerSelection.
+    /// Governor.Monitor`): while the ledger judgement is TooOld and
+    /// bootstrap peers are in use, the governor never establishes an
+    /// untrusted peer — which is the ONLY reason the HAA closure
+    /// ("every established outbound peer is trusted",
+    /// `outboundConnectionsState` in `Governor.Types`) is satisfiable
+    /// during sync. The node sets this while the GSM is below CaughtUp in
+    /// genesis mode and clears it (`None`) at CaughtUp. Refreshed every
+    /// governor tick, so late bootstrap DNS resolutions are picked up.
+    sync_trusted_only: Option<HashSet<SocketAddr>>,
 }
 
 impl Governor {
@@ -218,6 +231,7 @@ impl Governor {
             in_progress_promote_warm: HashSet::new(),
             recently_demoted: HashMap::new(),
             bulk_sync_mode: false,
+            sync_trusted_only: None,
         }
     }
 
@@ -276,6 +290,20 @@ impl Governor {
     /// Haskell `FetchMode` BulkSync/Deadline churn split.
     pub fn set_bulk_sync_mode(&mut self, on: bool) {
         self.bulk_sync_mode = on;
+    }
+
+    /// Restrict the aggregate `belowTargetOther` promotion paths to a
+    /// trusted peer set (`Some`), or lift the restriction (`None`).
+    ///
+    /// See the [`Governor::sync_trusted_only`] field docs — this is the
+    /// dugite analogue of Haskell's `requiresBootstrapPeers` governor
+    /// clamping, driven by the node while the GSM is below CaughtUp in
+    /// genesis mode with bootstrap peers configured. Local-root peers are
+    /// managed by the per-group `belowTargetLocal` path, which this
+    /// restriction never touches (local roots are part of the trusted set
+    /// the HAA closure accepts).
+    pub fn set_sync_trusted_restriction(&mut self, trusted: Option<HashSet<SocketAddr>>) {
+        self.sync_trusted_only = trusted;
     }
 
     /// The hot-churn interval currently in effect (bulk-sync vs deadline).
@@ -630,6 +658,16 @@ impl Governor {
                 if self.in_cooldown(&addr, now) {
                     continue;
                 }
+                // Trusted-only clamp during genesis sync (Haskell
+                // `requiresBootstrapPeers`) — never ESTABLISH an untrusted
+                // peer while the HAA closure must hold.
+                if self
+                    .sync_trusted_only
+                    .as_ref()
+                    .is_some_and(|t| !t.contains(&addr))
+                {
+                    continue;
+                }
                 actions.push(GovernorAction::PromoteToWarm(addr));
                 self.in_progress_promote_cold.insert(addr);
                 already_promoted.insert(addr);
@@ -666,6 +704,17 @@ impl Governor {
                 // Skip immature inbound peers — must complete the
                 // 15-min `inboundMaturePeerDelay` before promotion.  #703 fix B.
                 if fresh_inbound.contains(&addr) {
+                    continue;
+                }
+                // Trusted-only clamp during genesis sync (Haskell
+                // `requiresBootstrapPeers`) — an untrusted peer that is
+                // already Warm (established before a GSM regression) must
+                // not be activated while the clamp holds.
+                if self
+                    .sync_trusted_only
+                    .as_ref()
+                    .is_some_and(|t| !t.contains(&addr))
+                {
                     continue;
                 }
                 actions.push(GovernorAction::PromoteToHot(addr));
@@ -1611,6 +1660,118 @@ mod tests {
         assert!(
             group_set.contains(&promote_hot[0]),
             "promoted peer should be a group member"
+        );
+    }
+
+    /// Haskell `requiresBootstrapPeers` clamping (`Cardano.Network.
+    /// PeerSelection.Governor.Monitor`): while the GSM is below CaughtUp in
+    /// genesis mode with bootstrap peers configured, the aggregate
+    /// belowTargetOther paths must establish TRUSTED peers only (bootstrap ∪
+    /// local roots). Without this the `haa_satisfied` closure ("every
+    /// established outbound peer is trusted") is structurally unsatisfiable,
+    /// the GSM regresses Syncing → PreSyncing, and the LoE freezes chain
+    /// selection (mainnet from-genesis permanent stall, 2026-07-28).
+    #[test]
+    fn sync_trusted_restriction_gates_aggregate_cold_to_warm() {
+        let mut pm = PeerManager::new();
+        let trusted_addr = test_addr(7100);
+        let public_addr = test_addr(7101);
+        pm.add_peer(trusted_addr, PeerSource::Topology);
+        pm.add_peer(public_addr, PeerSource::Ledger);
+
+        let config = GovernorConfig {
+            targets: PeerTargets {
+                target_warm: 5,
+                target_hot: 0,
+                max_cold: 100,
+                ..Default::default()
+            },
+            hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
+            cold_churn_interval: Duration::from_secs(3600),
+            warm_churn_interval: Duration::from_secs(3600),
+            demote_cooldown: Duration::from_secs(3600),
+        };
+        let mut gov = Governor::new(config);
+
+        gov.set_sync_trusted_restriction(Some([trusted_addr].into_iter().collect()));
+        let promoted: Vec<SocketAddr> = gov
+            .compute_actions(&pm, &[])
+            .iter()
+            .filter_map(|a| match a {
+                GovernorAction::PromoteToWarm(addr) => Some(*addr),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            promoted.contains(&trusted_addr),
+            "trusted peer must still be promoted under the restriction"
+        );
+        assert!(
+            !promoted.contains(&public_addr),
+            "untrusted public peer must NOT be established while restricted"
+        );
+
+        // Clearing the restriction (GSM CaughtUp) restores normal behaviour.
+        gov.set_sync_trusted_restriction(None);
+        let promoted2: Vec<SocketAddr> = gov
+            .compute_actions(&pm, &[])
+            .iter()
+            .filter_map(|a| match a {
+                GovernorAction::PromoteToWarm(addr) => Some(*addr),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            promoted2.contains(&public_addr),
+            "public peer promotion must resume once unrestricted"
+        );
+    }
+
+    /// The trusted-only restriction must also gate aggregate warm→hot: an
+    /// untrusted peer that is already Warm (e.g. established before a GSM
+    /// regression) must not be promoted to Hot while the clamp is active.
+    #[test]
+    fn sync_trusted_restriction_gates_warm_to_hot() {
+        let mut pm = PeerManager::new();
+        let trusted_addr = test_addr(7110);
+        let public_addr = test_addr(7111);
+        pm.add_peer(trusted_addr, PeerSource::Topology);
+        pm.add_peer(public_addr, PeerSource::Ledger);
+        pm.promote_to_warm(&trusted_addr);
+        pm.promote_to_warm(&public_addr);
+
+        let config = GovernorConfig {
+            targets: PeerTargets {
+                target_warm: 2,
+                target_hot: 2,
+                max_cold: 100,
+                ..Default::default()
+            },
+            hot_churn_interval: Duration::from_secs(3600),
+            bulk_sync_churn_interval: Duration::from_secs(3600),
+            cold_churn_interval: Duration::from_secs(3600),
+            warm_churn_interval: Duration::from_secs(3600),
+            demote_cooldown: Duration::from_secs(3600),
+        };
+        let mut gov = Governor::new(config);
+        gov.set_sync_trusted_restriction(Some([trusted_addr].into_iter().collect()));
+
+        let hot_promoted: Vec<SocketAddr> = gov
+            .compute_actions(&pm, &[])
+            .iter()
+            .filter_map(|a| match a {
+                GovernorAction::PromoteToHot(addr) => Some(*addr),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            hot_promoted.contains(&trusted_addr),
+            "trusted warm peer must be promoted to hot"
+        );
+        assert!(
+            !hot_promoted.contains(&public_addr),
+            "untrusted warm peer must NOT be promoted to hot while restricted"
         );
     }
 

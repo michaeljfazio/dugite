@@ -299,6 +299,10 @@ pub struct NodePeerManager {
     pub inner: PeerManager,
     /// Configuration.
     pub config: PeerManagerConfig,
+    /// Unix-seconds of the last HAA-failure WARN (0 = never) — throttles the
+    /// `haa_satisfied` diagnostics to one per 30 s; the predicate is called
+    /// from several hot paths per tick and would otherwise WARN-storm.
+    haa_warn_last_secs: std::sync::atomic::AtomicU64,
     /// Per-connection state machine (Haskell ConnectionManager state).
     ///
     /// Tracks the lifecycle state of each connection. Used to compute
@@ -375,6 +379,7 @@ impl NodePeerManager {
         Self {
             inner: PeerManager::new(),
             config,
+            haa_warn_last_secs: std::sync::atomic::AtomicU64::new(0),
             conn_states: HashMap::new(),
             local_addr: None,
             local_root_groups: Vec::new(),
@@ -1003,6 +1008,19 @@ impl NodePeerManager {
             .collect()
     }
 
+    /// The trusted external peer set: bootstrap peers ∪ local roots
+    /// (Haskell `viewEstablishedBootstrapPeers ∪ trustableLocalRootSet`).
+    ///
+    /// This is the SAME set `haa_satisfied` checks its closure against and
+    /// the set the governor's sync-time trusted-only clamp
+    /// (`Governor::set_sync_trusted_restriction`) establishes from — the two
+    /// must stay in lockstep or the HAA closure becomes unsatisfiable again.
+    pub fn trusted_peer_addrs(&self) -> std::collections::HashSet<SocketAddr> {
+        let mut trusted = self.local_root_addrs();
+        trusted.extend(self.bootstrap_peer_addrs.iter().copied());
+        trusted
+    }
+
     /// Honest-Availability-Assumption satisfaction (Haskell
     /// `outboundConnectionsState` → `TrustedStateWithExternalPeers`).
     ///
@@ -1025,8 +1043,9 @@ impl NodePeerManager {
         }
         // Trusted external set = bootstrap peers ∪ trustable local roots
         // (Haskell `viewEstablishedBootstrapPeers ∪ trustableLocalRootSet`).
-        let mut trusted = self.local_root_addrs();
-        trusted.extend(self.bootstrap_peer_addrs.iter().copied());
+        // Kept in lockstep with the governor's sync-time trusted-only clamp
+        // via the shared `trusted_peer_addrs()` — see that method's docs.
+        let trusted = self.trusted_peer_addrs();
         if trusted.is_empty() {
             return false;
         }
@@ -1047,22 +1066,63 @@ impl NodePeerManager {
         };
         // At least one ACTIVE (hot) outbound trusted peer (Haskell
         // `not (Set.null viewActiveBootstrapPeers)`).
-        let any_hot_trusted = self
-            .inner
-            .peers_in_state(PeerState::Hot)
-            .into_iter()
-            .any(|a| is_outbound(&a) && trusted.contains(&a));
+        let hot_peers = self.inner.peers_in_state(PeerState::Hot);
+        let any_hot_trusted = hot_peers
+            .iter()
+            .any(|a| is_outbound(a) && trusted.contains(a));
         if !any_hot_trusted {
+            if self.haa_warn_permitted() {
+                tracing::warn!(
+                    hot_total = hot_peers.len(),
+                    trusted_total = trusted.len(),
+                    hot_sample = ?hot_peers.iter().take(5).collect::<Vec<_>>(),
+                    "HAA clause (a) failed: no hot outbound peer is in the \
+                     trusted set (bootstrap ∪ local roots)"
+                );
+            }
             return false;
         }
         // Every OUTBOUND established (warm + hot) peer must be trusted (Haskell
         // `viewEstablishedPeers ⊆ viewEstablishedBootstrapPeers ∪ trustableLocalRootSet`).
         let mut established = self.inner.peers_in_state(PeerState::Warm);
         established.extend(self.inner.peers_in_state(PeerState::Hot));
-        established
+        let untrusted_established: Vec<SocketAddr> = established
             .iter()
-            .filter(|a| is_outbound(a))
-            .all(|a| trusted.contains(a))
+            .filter(|a| is_outbound(a) && !trusted.contains(a))
+            .copied()
+            .collect();
+        if !untrusted_established.is_empty() {
+            if self.haa_warn_permitted() {
+                tracing::warn!(
+                    untrusted_count = untrusted_established.len(),
+                    established_total = established.len(),
+                    trusted_total = trusted.len(),
+                    untrusted_sample =
+                        ?untrusted_established.iter().take(5).collect::<Vec<_>>(),
+                    "HAA clause (b) failed: untrusted outbound peer(s) are \
+                     established — the sync-time trusted-only clamp was bypassed"
+                );
+            }
+            return false;
+        }
+        true
+    }
+
+    /// Rate-limit gate for the `haa_satisfied` failure WARNs: at most one
+    /// per 30 s (the predicate runs on several hot paths per governor tick).
+    fn haa_warn_permitted(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let last = self.haa_warn_last_secs.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < 30 {
+            return false;
+        }
+        self.haa_warn_last_secs
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
     }
 
     /// Get connected peer addresses.

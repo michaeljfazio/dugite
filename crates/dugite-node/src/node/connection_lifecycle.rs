@@ -1027,6 +1027,26 @@ pub struct ConnectionLifecycleManager {
     /// `runMiniProtocol`. Otherwise the demotion escalates to a full TCP close
     /// (Haskell's `Mux.stop` on `spsDeactivateTimeout`).
     chainsync_drain_ok: HashMap<SocketAddr, Arc<std::sync::atomic::AtomicBool>>,
+    /// Sync-time trusted-only establishment clamp — CHOKEPOINT enforcement.
+    ///
+    /// `Some(set)` while the GSM is below CaughtUp in genesis mode with
+    /// bootstrap/local-root peers configured (stored per governor tick by the
+    /// node): [`Self::promote_to_warm`] (outbound establishment) and
+    /// [`Self::promote_to_hot`] (activation) refuse peers outside the set,
+    /// regardless of which driver requested the transition — governor
+    /// actions, dynamo/starvation rotation, or reconnect fallbacks.
+    ///
+    /// This is the enforcement point for the Haskell `requiresBootstrapPeers`
+    /// invariant ("the governor never establishes an untrusted peer while
+    /// the ledger judgement is TooOld") that keeps the HAA closure
+    /// satisfiable during bulk sync. The governor-side candidate filter
+    /// alone proved insufficient: rotation and reconnect paths promote
+    /// without consulting the governor, which let 44 public peers reach Hot
+    /// against a target of 5 and zeroed the hot trusted set (2026-07-28
+    /// mainnet from-genesis HAA-loss freeze). Inbound connections are
+    /// deliberately NOT gated — the HAA closure assesses outbound peers
+    /// only, and refusing inbound would hurt serving liveness.
+    sync_trusted_clamp: Arc<arc_swap::ArcSwap<Option<std::collections::HashSet<SocketAddr>>>>,
 
     /// Shared mempool for TxSubmission2 tx relay to peers.
     mempool: Arc<Mempool>,
@@ -1135,6 +1155,11 @@ pub enum LifecycleError {
     NotConnected(SocketAddr),
     /// A connection already exists for the given peer address.
     AlreadyConnected(SocketAddr),
+    /// The sync-time trusted-only clamp refused establishment/activation of
+    /// an untrusted peer (GSM below CaughtUp in genesis mode — Haskell
+    /// `requiresBootstrapPeers`). Benign: the peer becomes eligible again
+    /// once the node reaches CaughtUp.
+    TrustedOnlyClamp(SocketAddr),
 }
 
 impl std::fmt::Display for LifecycleError {
@@ -1143,6 +1168,10 @@ impl std::fmt::Display for LifecycleError {
             Self::Connection(e) => write!(f, "connection error: {e}"),
             Self::NotConnected(addr) => write!(f, "no connection to {addr}"),
             Self::AlreadyConnected(addr) => write!(f, "already connected to {addr}"),
+            Self::TrustedOnlyClamp(addr) => write!(
+                f,
+                "trusted-only clamp refused {addr} (genesis sync below CaughtUp)"
+            ),
         }
     }
 }
@@ -1238,6 +1267,7 @@ impl ConnectionLifecycleManager {
             active_fetcher: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             active_fetch_peer: Arc::new(std::sync::Mutex::new(None)),
             chainsync_drain_ok: HashMap::new(),
+            sync_trusted_clamp: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
             max_fetched_slot: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             blockfetch_max_range,
             // ChainSelStarvation starts `Ongoing` (0) — Haskell initializes the
@@ -1351,6 +1381,24 @@ impl ConnectionLifecycleManager {
             return Err(LifecycleError::AlreadyConnected(addr));
         }
 
+        // Sync-time trusted-only clamp — see the `sync_trusted_clamp` field
+        // docs. Refuse OUTBOUND establishment of untrusted peers while the
+        // clamp holds, no matter which driver asked.
+        {
+            let clamp = self.sync_trusted_clamp.load();
+            if let Some(trusted) = (**clamp).as_ref() {
+                if !trusted.contains(&addr) {
+                    debug!(
+                        %addr,
+                        trusted_total = trusted.len(),
+                        "sync trusted-only clamp: refusing outbound \
+                         establishment of untrusted peer during genesis sync"
+                    );
+                    return Err(LifecycleError::TrustedOnlyClamp(addr));
+                }
+            }
+        }
+
         info!(%addr, "promoting cold -> warm: connecting");
 
         // Resolve per-peer initiator_only from the peer manager's group config.
@@ -1437,6 +1485,36 @@ impl ConnectionLifecycleManager {
         initiator_only: bool,
         tx: mpsc::Sender<ConnectResult>,
     ) {
+        // Sync-time trusted-only clamp — see the `sync_trusted_clamp` field
+        // docs. This is the background-connect twin of the gate in
+        // `promote_to_warm`; the governor's PromoteToWarm actions execute
+        // through HERE (non-blocking path), so the chokepoint must cover it.
+        {
+            let clamp = self.sync_trusted_clamp.load();
+            if let Some(trusted) = (**clamp).as_ref() {
+                if !trusted.contains(&addr) {
+                    debug!(
+                        %addr,
+                        trusted_total = trusted.len(),
+                        "sync trusted-only clamp: refusing background \
+                         outbound connect to untrusted peer during genesis sync"
+                    );
+                    // Send the failure through the normal channel so the
+                    // caller's in-flight tracking is cleared (a silent
+                    // return would leak the promotion slot).
+                    let tx_refuse = tx.clone();
+                    tokio::spawn(async move {
+                        let _ = tx_refuse
+                            .send(Err((
+                                addr,
+                                "trusted-only clamp (genesis sync below CaughtUp)".to_string(),
+                            )))
+                            .await;
+                    });
+                    return;
+                }
+            }
+        }
         let network_magic = self.network_magic;
         let peer_sharing = self.peer_sharing;
         let connect_timeout = self.connect_timeout;
@@ -1530,6 +1608,13 @@ impl ConnectionLifecycleManager {
         Ok(())
     }
 
+    /// Store the sync-time trusted-only clamp (see the `sync_trusted_clamp`
+    /// field docs). Called by the node on every governor tick with `Some`
+    /// while the GSM is below CaughtUp in genesis mode, `None` otherwise.
+    pub fn store_sync_trusted_clamp(&self, trusted: Option<std::collections::HashSet<SocketAddr>>) {
+        self.sync_trusted_clamp.store(Arc::new(trusted));
+    }
+
     /// Promote a warm peer to hot: start ChainSync + BlockFetch + TxSubmission2.
     ///
     /// This is the Warm -> Hot transition from Haskell's `PeerStateActions`.
@@ -1552,6 +1637,25 @@ impl ConnectionLifecycleManager {
         // a remote responder. Matches Haskell's `OutboundDupState`
         // promotion path which drives initiator-side protocols on the
         // outbound connection of a duplex pair.
+        // Sync-time trusted-only clamp — see the `sync_trusted_clamp` field
+        // docs. An untrusted peer must not be ACTIVATED while the clamp
+        // holds (covers rotation/reconnect drivers that bypass the
+        // governor's candidate filter).
+        {
+            let clamp = self.sync_trusted_clamp.load();
+            if let Some(trusted) = (**clamp).as_ref() {
+                if !trusted.contains(&addr) {
+                    debug!(
+                        %addr,
+                        trusted_total = trusted.len(),
+                        "sync trusted-only clamp: refusing hot activation of \
+                         untrusted peer during genesis sync"
+                    );
+                    return Err(LifecycleError::TrustedOnlyClamp(addr));
+                }
+            }
+        }
+
         let cid = self
             .find_outbound_cid(addr)
             .or_else(|| self.find_any_cid(addr))
