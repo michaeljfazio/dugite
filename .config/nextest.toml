@@ -3,10 +3,19 @@
 fail-fast = true
 # Status output level
 status-level = "pass"
+# #921 hermeticity backstop: a wedged test (network loss, saturated disk,
+# deadlocked runtime) must never hang a run indefinitely — the v2.2.4 release
+# gate sat 2h11m at 0% CPU on a ~10-minute suite. Mark SLOW at 120s, send
+# SIGTERM after 2 periods (240s), SIGKILL 10s later. No test in the workspace
+# legitimately runs anywhere near 120s; raise per-test overrides here if one
+# ever must.
+slow-timeout = { period = "120s", terminate-after = 2, grace-period = "10s" }
 
 [profile.ci]
 # CI runs all tests even if some fail
 fail-fast = false
+# Same backstop as default (see #921), slightly looser for slower CI runners.
+slow-timeout = { period = "180s", terminate-after = 2, grace-period = "10s" }
 
 # Produce JUnit XML for Codecov Test Analytics
 [profile.ci.junit]
