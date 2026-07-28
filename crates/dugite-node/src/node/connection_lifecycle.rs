@@ -808,12 +808,41 @@ pub struct FetchedBlock {
     pub tip_block_number: u64,
 }
 
+/// Why a background cold→warm connect attempt failed.
+///
+/// Distinguishes a genuine network/handshake failure from a policy refusal
+/// (currently only the sync-time trusted-only clamp, #920). This matters
+/// because the two must be accounted for differently: a real failure
+/// charges `peer_failed()` (exponential backoff, forget-after-N-attempts);
+/// a policy refusal is a planned, instantaneous condition — the peer must
+/// remain immediately re-eligible the moment the clamp lifts, so charging
+/// backoff for it would pollute the peer's reconnect schedule for a
+/// decision the peer had no part in.
+#[derive(Debug, Clone)]
+pub enum ConnectError {
+    /// TCP connect or N2N handshake failed for a genuine network reason.
+    Io(String),
+    /// A governor/lifecycle policy refused the connect attempt before any
+    /// network I/O was attempted (e.g. the sync-time trusted-only clamp).
+    /// Benign: the peer stays Cold with no backoff and is retried on the
+    /// very next eligible governor tick once the policy no longer applies.
+    PolicyRefused(String),
+}
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(msg) | Self::PolicyRefused(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
 /// Result of a background cold->warm connection attempt.
 ///
 /// Sent from `spawn_connect` background tasks to the main run loop via an `mpsc`
 /// channel. `Ok` carries the ready `PeerConnection` and measured handshake RTT;
-/// `Err` carries the peer address and a human-readable error string.
-pub type ConnectResult = Result<(SocketAddr, PeerConnection, f64), (SocketAddr, String)>;
+/// `Err` carries the peer address and the failure reason (see [`ConnectError`]).
+pub type ConnectResult = Result<(SocketAddr, PeerConnection, f64), (SocketAddr, ConnectError)>;
 
 // ─── Lifecycle Manager ──────────────────────────────────────────────────────
 
@@ -1507,7 +1536,9 @@ impl ConnectionLifecycleManager {
                         let _ = tx_refuse
                             .send(Err((
                                 addr,
-                                "trusted-only clamp (genesis sync below CaughtUp)".to_string(),
+                                ConnectError::PolicyRefused(
+                                    "trusted-only clamp (genesis sync below CaughtUp)".to_string(),
+                                ),
                             )))
                             .await;
                     });
@@ -1540,7 +1571,7 @@ impl ConnectionLifecycleManager {
                     let _ = tx.send(Ok((addr, conn, rtt_ms))).await;
                 }
                 Err(e) => {
-                    let _ = tx.send(Err((addr, e.to_string()))).await;
+                    let _ = tx.send(Err((addr, ConnectError::Io(e.to_string())))).await;
                 }
             }
         });
@@ -1570,6 +1601,34 @@ impl ConnectionLifecycleManager {
         // inbound from the same peer can coexist (different ConnectionId).
         if self.has_outbound_to(addr) {
             return Err(LifecycleError::AlreadyConnected(addr));
+        }
+
+        // Sync-time trusted-only clamp — mid-handshake race (#920). `spawn_connect`
+        // checked the clamp at connect INITIATION, but the connect + N2N
+        // handshake can take up to `connect_timeout`, and the clamp may
+        // activate (GSM regresses below CaughtUp) while it was in flight.
+        // Re-check here at connect COMPLETION so this registration step is
+        // the authoritative chokepoint regardless of timing — the physical
+        // TCP/mux connection already succeeded, but it must not be
+        // registered as an established peer while the clamp holds.
+        {
+            let clamp = self.sync_trusted_clamp.load();
+            if let Some(trusted) = (**clamp).as_ref() {
+                if !trusted.contains(&addr) {
+                    debug!(
+                        %addr,
+                        trusted_total = trusted.len(),
+                        "sync trusted-only clamp: refusing to register untrusted \
+                         peer that completed connect after the clamp activated"
+                    );
+                    // The connection succeeded at the TCP/mux level but must
+                    // not be inserted. Offload the shutdown (mirrors
+                    // `demote_to_cold`'s `spawn_shutdown` pattern) rather
+                    // than awaiting it inline here.
+                    Self::spawn_shutdown(vec![conn]);
+                    return Err(LifecycleError::TrustedOnlyClamp(addr));
+                }
+            }
         }
 
         let cid = ConnectionId {
@@ -5201,6 +5260,62 @@ mod tests {
         lc.insert_fake_for_test(addr);
         lc.remove_fake_for_test(addr);
         assert!(!lc.has_connection(&addr));
+    }
+
+    // ─── #920 — trusted-only clamp: register-time chokepoint ──────────────
+
+    /// The sync-time trusted-only clamp must refuse `register_warm_connection`
+    /// for an untrusted peer, not just `promote_to_warm` / `spawn_connect`.
+    /// This closes the mid-handshake race: a connect that started before the
+    /// clamp activated can complete and reach this registration step after
+    /// it did. The connection must not be inserted (`connection_count()`
+    /// stays 0) and the error must be `TrustedOnlyClamp`, not a generic
+    /// connection failure.
+    #[tokio::test]
+    async fn register_warm_connection_refuses_untrusted_under_clamp() {
+        let mut lc = ConnectionLifecycleManager::new_for_test();
+        let mut pm = NodePeerManager::new(crate::node::networking::PeerManagerConfig::default());
+
+        let trusted_addr: SocketAddr = "10.0.0.9:3001".parse().unwrap();
+        let untrusted_addr: SocketAddr = "10.0.0.10:3001".parse().unwrap();
+        lc.store_sync_trusted_clamp(Some([trusted_addr].into_iter().collect()));
+
+        let conn = PeerConnection::fake_for_test(untrusted_addr);
+        let result = lc.register_warm_connection(untrusted_addr, conn, 1.0, &mut pm);
+
+        assert!(
+            matches!(result, Err(LifecycleError::TrustedOnlyClamp(addr)) if addr == untrusted_addr),
+            "an untrusted peer must be refused with TrustedOnlyClamp, got {result:?}"
+        );
+        assert_eq!(
+            lc.connection_count(),
+            0,
+            "the refused connection must not be inserted"
+        );
+    }
+
+    /// A trusted peer must register successfully even while the clamp is
+    /// active — the clamp restricts untrusted peers only.
+    #[tokio::test]
+    async fn register_warm_connection_allows_trusted_under_clamp() {
+        let mut lc = ConnectionLifecycleManager::new_for_test();
+        let mut pm = NodePeerManager::new(crate::node::networking::PeerManagerConfig::default());
+
+        let trusted_addr: SocketAddr = "10.0.0.11:3001".parse().unwrap();
+        lc.store_sync_trusted_clamp(Some([trusted_addr].into_iter().collect()));
+
+        // `fake_for_test` leaves the keepalive client channel `None`, which
+        // `start_warm_protocols` (called after the clamp check succeeds)
+        // requires — use `fake_with_hot_channels` so the happy path can
+        // actually complete registration.
+        let conn = PeerConnection::fake_with_hot_channels(trusted_addr);
+        let result = lc.register_warm_connection(trusted_addr, conn, 1.0, &mut pm);
+
+        assert!(
+            result.is_ok(),
+            "a trusted peer must register successfully under the clamp, got {result:?}"
+        );
+        assert_eq!(lc.connection_count(), 1);
     }
 
     /// connected_addrs deduplicates — one entry per remote even with duplex pair.

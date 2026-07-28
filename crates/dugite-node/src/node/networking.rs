@@ -1021,6 +1021,41 @@ impl NodePeerManager {
         trusted
     }
 
+    /// The set of OUTBOUND established (warm + hot) peers that are NOT in
+    /// the trusted set (bootstrap peers ∪ trustable local roots).
+    ///
+    /// This is exactly the HAA clause-(b) failure set (Haskell
+    /// `viewEstablishedPeers \ (viewEstablishedBootstrapPeers ∪
+    /// trustableLocalRootSet)`) — factored out so [`Self::haa_satisfied`]
+    /// and the governor's self-healing demotion sweep (#920) can never
+    /// diverge on which peers violate the trusted-only clamp. `haa_satisfied`
+    /// clause (b) fails if and only if this returns non-empty.
+    ///
+    /// Used both by the per-tick governor enforcement (which demotes every
+    /// entry straight to Cold while the sync-time clamp holds — see
+    /// `Governor::compute_actions_with_blp`) and by the one-shot sweep run
+    /// on the CaughtUp→Syncing/PreSyncing boundary edge.
+    pub fn untrusted_established_outbound(&self) -> Vec<SocketAddr> {
+        let trusted = self.trusted_peer_addrs();
+        let is_outbound = |a: &SocketAddr| {
+            matches!(
+                self.conn_states.get(a),
+                Some(
+                    ConnectionState::OutboundIdle(_)
+                        | ConnectionState::OutboundUni
+                        | ConnectionState::OutboundDup
+                        | ConnectionState::DuplexConn
+                )
+            )
+        };
+        let mut established = self.inner.peers_in_state(PeerState::Warm);
+        established.extend(self.inner.peers_in_state(PeerState::Hot));
+        established
+            .into_iter()
+            .filter(|a| is_outbound(a) && !trusted.contains(a))
+            .collect()
+    }
+
     /// Honest-Availability-Assumption satisfaction (Haskell
     /// `outboundConnectionsState` → `TrustedStateWithExternalPeers`).
     ///
@@ -1084,18 +1119,11 @@ impl NodePeerManager {
         }
         // Every OUTBOUND established (warm + hot) peer must be trusted (Haskell
         // `viewEstablishedPeers ⊆ viewEstablishedBootstrapPeers ∪ trustableLocalRootSet`).
-        let mut established = self.inner.peers_in_state(PeerState::Warm);
-        established.extend(self.inner.peers_in_state(PeerState::Hot));
-        let untrusted_established: Vec<SocketAddr> = established
-            .iter()
-            .filter(|a| is_outbound(a) && !trusted.contains(a))
-            .copied()
-            .collect();
+        let untrusted_established = self.untrusted_established_outbound();
         if !untrusted_established.is_empty() {
             if self.haa_warn_permitted() {
                 tracing::warn!(
                     untrusted_count = untrusted_established.len(),
-                    established_total = established.len(),
                     trusted_total = trusted.len(),
                     untrusted_sample =
                         ?untrusted_established.iter().take(5).collect::<Vec<_>>(),
@@ -1270,6 +1298,44 @@ mod tests {
         assert!(
             !pm.inner.peers_eligible_to_connect().contains(&addr),
             "a recorded failure must hold the peer out for its backoff window"
+        );
+    }
+
+    // ─── #920 — trusted-only clamp demotion must NOT charge backoff ───────
+
+    /// The clamp-reactivation demotion sweep is a planned policy teardown,
+    /// not a connection failure — the peer must be immediately re-eligible
+    /// the moment the clamp lifts. Reconciling through `peer_disconnected`
+    /// (as the sweep and the governor's `DemoteToCold` handler both do) must
+    /// leave `next_connect_after` unset and `failure_count` untouched, unlike
+    /// `peer_failed` (mirrors `peer_failed_arms_the_reconnect_backoff` above,
+    /// asserting the opposite outcome).
+    #[test]
+    fn trusted_clamp_demotion_does_not_arm_backoff() {
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        let addr: SocketAddr = "203.0.113.14:3001".parse().unwrap();
+        pm.inner.add_peer(addr, PeerSource::Ledger);
+        pm.peer_connected(&addr, ConnectionDirection::Outbound);
+        pm.inner.promote_to_hot(&addr);
+
+        pm.peer_disconnected(&addr);
+
+        assert_eq!(
+            pm.inner.get_peer(&addr).unwrap().failure_count,
+            0,
+            "a clamp-driven demotion must not increment the failure count"
+        );
+        assert!(
+            pm.inner
+                .get_peer(&addr)
+                .unwrap()
+                .next_connect_after
+                .is_none(),
+            "a clamp-driven demotion must not arm the reconnect backoff"
+        );
+        assert!(
+            pm.inner.peers_eligible_to_connect().contains(&addr),
+            "the peer must be immediately re-eligible once the clamp lifts"
         );
     }
 
@@ -1478,6 +1544,71 @@ mod tests {
         pm2.peer_connected(&public, ConnectionDirection::Outbound);
         pm2.inner.promote_to_hot(&public);
         assert!(!pm2.haa_satisfied(5));
+    }
+
+    // ─── #920 — untrusted_established_outbound() enumeration helper ───────
+
+    /// The helper must return an established (warm or hot) OUTBOUND public
+    /// peer that is not in the trusted set.
+    #[test]
+    fn untrusted_established_outbound_returns_outbound_public_peer() {
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        let public: SocketAddr = "8.8.8.8:3001".parse().unwrap();
+        pm.peer_connected(&public, ConnectionDirection::Outbound);
+        assert_eq!(pm.untrusted_established_outbound(), vec![public]);
+
+        pm.inner.promote_to_hot(&public);
+        assert_eq!(
+            pm.untrusted_established_outbound(),
+            vec![public],
+            "a hot untrusted outbound peer must also be enumerated"
+        );
+    }
+
+    /// Inbound peers are never part of the HAA's outbound assessment, and
+    /// trusted peers (bootstrap ∪ local roots) are by definition not a
+    /// violation — both must be excluded from the enumeration.
+    #[test]
+    fn untrusted_established_outbound_excludes_inbound_and_trusted() {
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+
+        let boot: SocketAddr = "3.74.40.92:3001".parse().unwrap();
+        pm.add_bootstrap_peer(boot);
+        pm.peer_connected(&boot, ConnectionDirection::Outbound);
+        pm.inner.promote_to_hot(&boot);
+
+        let downstream: SocketAddr = "8.8.4.4:3001".parse().unwrap();
+        pm.peer_connected(&downstream, ConnectionDirection::Inbound);
+
+        assert!(
+            pm.untrusted_established_outbound().is_empty(),
+            "trusted outbound peer and untrusted INBOUND peer must both be excluded"
+        );
+    }
+
+    /// Property: `haa_satisfied` clause (b) fails if and only if the
+    /// enumeration helper is non-empty. The two must never diverge — the
+    /// governor's self-healing demotion sweep (#920) uses the helper as its
+    /// candidate set, and `haa_satisfied` uses it to decide clause (b).
+    #[test]
+    fn untrusted_established_outbound_matches_haa_clause_b() {
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        let boot: SocketAddr = "3.74.40.92:3001".parse().unwrap();
+        pm.add_bootstrap_peer(boot);
+        pm.peer_connected(&boot, ConnectionDirection::Outbound);
+        pm.inner.promote_to_hot(&boot);
+
+        // Before: clause (a)+(b) both satisfied, helper empty.
+        assert!(pm.untrusted_established_outbound().is_empty());
+        assert!(pm.haa_satisfied(5));
+
+        // After establishing an untrusted outbound peer: helper non-empty,
+        // and haa_satisfied's clause (b) must now fail (overall false).
+        let public: SocketAddr = "8.8.8.8:3001".parse().unwrap();
+        pm.peer_connected(&public, ConnectionDirection::Outbound);
+        pm.inner.promote_to_hot(&public);
+        assert!(!pm.untrusted_established_outbound().is_empty());
+        assert!(!pm.haa_satisfied(5));
     }
 
     #[test]
