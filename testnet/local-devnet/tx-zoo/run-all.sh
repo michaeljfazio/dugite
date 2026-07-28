@@ -25,6 +25,12 @@ ALL_CATEGORIES=(
     08-negative
     10-gov-lifecycle
     11-mempool
+    # MUST run after 10-gov-lifecycle: these negatives are only meaningful once
+    # a governance action has actually been ENACTED (non-null root). Running
+    # them earlier makes them SKIP, which is how the InvalidPrevGovActionId P0
+    # went unnoticed — 06-proposals runs before any enactment, where
+    # prev_action_id=None is legitimately valid.
+    12-post-enactment
 )
 
 usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; }
