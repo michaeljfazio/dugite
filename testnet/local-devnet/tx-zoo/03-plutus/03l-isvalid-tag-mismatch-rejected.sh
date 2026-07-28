@@ -18,7 +18,7 @@ ZOO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NAME="$(zoo_name)"
 zoo_require_devnet
 SCRIPT="$ZOO_DIR/lib/plutus/always-true-v2.plutus"
-[ -s "$SCRIPT" ] || { zoo_skip "missing $SCRIPT"; zoo_record "$NAME" SKIP; exit 0; }
+[ -s "$SCRIPT" ] || { zoo_record_env_skip "$NAME" "missing-script-binary $(basename "$SCRIPT")"; exit 0; }
 
 PAIR=$(plutus_lock "$SCRIPT" inline 5000000) || { zoo_record "$NAME" FAIL "" "lock"; exit 1; }
 SCRIPT_TXIN=${PAIR%% *}
@@ -28,7 +28,7 @@ COLLAT_RAW=$(zoo_utxo_at "$(cat "$ZOO_PAY_ADDR_FILE")" 1) || { zoo_record "$NAME
 COLLAT=${COLLAT_RAW%% *}
 COLLAT_AMT=${COLLAT_RAW##* }
 RETURN_AMT=$((COLLAT_AMT - 2000000))
-[ "$RETURN_AMT" -lt 1000000 ] && { zoo_skip "collateral utxo too small ($COLLAT_AMT)"; zoo_record "$NAME" SKIP; exit 0; }
+[ "$RETURN_AMT" -lt 1000000 ] && { zoo_skip "collateral utxo too small ($COLLAT_AMT)"; zoo_record "$NAME" SKIP "" "collateral-utxo-too-small=$COLLAT_AMT"; exit 0; }
 
 REDEEMER="$ZOO_BUILT/$NAME.redeemer.json"
 echo '{"int": 0}' > "$REDEEMER"
