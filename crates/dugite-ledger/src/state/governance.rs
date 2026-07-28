@@ -114,7 +114,12 @@ impl LedgerState {
         //
         // Haskell: `parent == ps ^. pRootsL . govRelationL . prRootL` covers case (a);
         // `SJust parentId <- parent, Map.member parentId graph` covers case (b).
-        // Anything else fires `InvalidPrevGovActionId` (tag 8).
+        // Anything else fires `InvalidPrevGovActionId` (tag 8): canonical
+        // `Cardano.Ledger.Conway.Rules.Gov` FAILS the tx via `failBecause` —
+        // it does NOT drop the proposal and continue (#914). The live
+        // block-apply path (`process_governance_votes_and_proposals`) hard-errors
+        // accordingly; this test-only path keeps the drop (tests exercise the
+        // rejection branch directly) but logs at WARN so a hit is visible.
         let prev_id = match &proposal.gov_action {
             GovAction::ParameterChange { prev_action_id, .. }
             | GovAction::HardForkInitiation { prev_action_id, .. }
@@ -129,7 +134,7 @@ impl LedgerState {
                 // this purpose has been enacted. Per Haskell, SNothing only matches the
                 // purpose tree root when prRootL is also SNothing.
                 if !genesis_root_is_valid(&proposal.gov_action, &self.gov.governance) {
-                    debug!(
+                    warn!(
                         tx = %tx_hash.to_hex(),
                         action_index,
                         action_type = ?std::mem::discriminant(&proposal.gov_action),
@@ -149,7 +154,7 @@ impl LedgerState {
                 );
                 let in_flight = self.gov.governance.proposals.contains_key(prev);
                 if !valid_root && !in_flight {
-                    debug!(
+                    warn!(
                         tx = %tx_hash.to_hex(),
                         action_index,
                         prev_action = %prev.transaction_id.to_hex(),
@@ -428,7 +433,10 @@ impl LedgerState {
         //   (b) prev_action_id = Some(id)  AND  id matches the last enacted action of the
         //       same purpose  OR  id is an active (in-flight) proposal
         //
-        // Mirrors the identical check in `process_proposal`.
+        // Mirrors the identical check in `process_proposal`. Canonical
+        // `Cardano.Ledger.Conway.Rules.Gov` FAILS the tx via `failBecause
+        // (InvalidPrevGovActionId …)` — it does not drop-and-continue (#914).
+        // The live block-apply path hard-errors; this dead path drops + WARNs.
         let prev_id = match &proposal.gov_action {
             GovAction::ParameterChange { prev_action_id, .. }
             | GovAction::HardForkInitiation { prev_action_id, .. }
@@ -440,7 +448,7 @@ impl LedgerState {
         match prev_id {
             None => {
                 if !genesis_root_is_valid(&proposal.gov_action, &self.gov.governance) {
-                    debug!(
+                    warn!(
                         tx = %tx_hash.to_hex(),
                         action_index,
                         action_type = ?std::mem::discriminant(&proposal.gov_action),
@@ -458,7 +466,7 @@ impl LedgerState {
                 );
                 let in_flight = self.gov.governance.proposals.contains_key(prev);
                 if !valid_root && !in_flight {
-                    debug!(
+                    warn!(
                         tx = %tx_hash.to_hex(),
                         action_index,
                         prev_action = %prev.transaction_id.to_hex(),

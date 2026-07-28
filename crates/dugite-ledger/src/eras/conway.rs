@@ -365,7 +365,7 @@ impl EraRules for ConwayRules {
         }
 
         // Step 8: Apply GOV rule (votes + proposals).
-        process_governance_votes_and_proposals(tx, ctx, gov, epochs);
+        process_governance_votes_and_proposals(tx, ctx, gov, epochs)?;
 
         // Step 9: Apply UTxO changes and accumulate donation.
         let diff = common::apply_utxo_changes(tx, utxo, certs, epochs);
@@ -1804,14 +1804,14 @@ fn process_governance_votes_and_proposals(
     ctx: &RuleContext,
     gov: &mut GovSubState,
     epochs: &EpochSubState,
-) {
+) -> Result<(), LedgerError> {
     // Fast path: a tx with neither votes nor proposals has nothing to do here.
     // `Arc::make_mut(&mut gov.governance)` below forces a clone of the entire
     // GovernanceState whenever the Arc is shared (e.g. a mark/set snapshot holds
     // a reference), so this guard skips the whole GOV rule for the overwhelming
     // majority of Conway txs that carry neither votes nor proposals.
     if tx.body.voting_procedures.is_empty() && tx.body.proposal_procedures.is_empty() {
-        return;
+        return Ok(());
     }
 
     let governance = Arc::make_mut(&mut gov.governance);
@@ -1891,21 +1891,28 @@ fn process_governance_votes_and_proposals(
         };
 
         if !valid {
-            // WARN, not debug: this runs on a block that consensus already
-            // accepted, so a drop here is consequential and easy to miss.
-            // Dropping a proposal strands its deposit (never refunded to the
-            // return account, which silently lowers that account's stake and
-            // therefore every pool's rewards) and leaves the corresponding
-            // enacted root un-advanced — issue #898, where a Mithril import had
-            // discarded `Proposals.pRoots` so every real `prev_action_id`
-            // mismatched, wedging chain advance ~2 epochs later with a
-            // 4-lovelace `WithdrawalAmountMismatch`.
+            // Hard error, not a silent drop (#914). Canonical
+            // `Cardano.Ledger.Conway.Rules.Gov` FAILS the transaction here:
             //
-            // Haskell also drops such proposals without failing the tx, so this
-            // is not necessarily a divergence — but on a confirmed block it is
-            // rare enough, and expensive enough when wrong, to be worth a WARN.
-            // The enacted roots are logged alongside so a `None` root (the #898
-            // signature) is immediately visible.
+            //   case proposalsAddAction actionState proposals of
+            //     Just updatedProposals -> pure updatedProposals
+            //     Nothing -> proposals <$ failBecause
+            //                  (injectFailure $ InvalidPrevGovActionId proposal)
+            //
+            // In ValidateAll the Phase-1 `InvalidPrevGovActionId` predicate
+            // (#913) fires before apply, so this branch is unreachable. In
+            // ApplyOnly (replay/reapply) predicates are skipped — mirroring
+            // Haskell reapply/ValidateNone — but Haskell only ever reapplies
+            // blocks it validated itself against identical state, so reaching
+            // this branch means dugite's governance state has diverged from
+            // the state that validated the chain (the #898 shape: a dropped
+            // proposal strands its deposit, understates the return account's
+            // stake, and skews every reward that epoch, surfacing epochs later
+            // as a cryptic `WithdrawalAmountMismatch` wedge). Crash, don't
+            // diverge: fail block apply now, at the point of divergence.
+            //
+            // The enacted roots are logged so a `None` root (the #898
+            // import-without-pRoots signature) is immediately visible.
             warn!(
                 tx = %tx.hash.to_hex(),
                 action_index = idx,
@@ -1918,14 +1925,25 @@ fn process_governance_votes_and_proposals(
                 enacted_committee = ?governance.enacted_committee.as_ref().map(|i| i.transaction_id.to_hex()),
                 enacted_constitution = ?governance.enacted_constitution.as_ref().map(|i| i.transaction_id.to_hex()),
                 active_proposals = governance.proposals.len(),
-                "InvalidPrevGovActionId (GOV rule): proposal dropped on a confirmed block — \
+                "InvalidPrevGovActionId (GOV rule): failing block apply — \
                  prev_action_id is neither a genesis root, the last enacted root, nor an \
-                 active in-flight proposal. The deposit will never be refunded. If the \
-                 enacted root for this action's purpose is None on a chain that has \
-                 already enacted one, the ledger state was imported without \
-                 `Proposals.pRoots` (see #898) and must be re-imported."
+                 active in-flight proposal. If the enacted root for this action's purpose \
+                 is None on a chain that has already enacted one, the ledger state was \
+                 imported without `Proposals.pRoots` (see #898) and must be re-imported."
             );
-            continue;
+            return Err(LedgerError::BlockTxValidationFailed {
+                slot: ctx.current_slot,
+                tx_hash: tx.hash.to_hex(),
+                errors: format!(
+                    "InvalidPrevGovActionId: proposal {}#{} has prev_action_id {:?} which is \
+                     neither a genesis root, the last enacted root, nor an active in-flight \
+                     proposal (Haskell Conway.Rules.Gov failBecause; dugite #914 — reaching \
+                     this on apply means governance state diverged, e.g. #898 pRoots loss)",
+                    action_id.transaction_id.to_hex(),
+                    action_id.action_index,
+                    prev_id.map(|p| format!("{}#{}", p.transaction_id.to_hex(), p.action_index)),
+                ),
+            });
         }
 
         // #858: pvCanFollow gate for HardForkInitiation on the LIVE block-apply GOV
@@ -1978,6 +1996,7 @@ fn process_governance_votes_and_proposals(
             );
         }
     }
+    Ok(())
 }
 
 /// Extract a Hash32 from a raw reward account byte string (29 bytes).
@@ -5661,7 +5680,11 @@ mod tests {
         let mut prop_tx = make_tx(0x50, vec![], vec![], 0);
         prop_tx.body.proposal_procedures = vec![proposal];
 
-        rules
+        // #914: the apply path now HARD-ERRORS instead of silently dropping —
+        // canonical Conway.Rules.Gov `failBecause (InvalidPrevGovActionId …)`
+        // fails the tx, and reaching this branch on apply means governance
+        // state diverged from whatever validated the chain.
+        let err = rules
             .apply_valid_tx(
                 &prop_tx,
                 BlockValidationMode::ApplyOnly,
@@ -5671,7 +5694,11 @@ mod tests {
                 &mut gov,
                 &mut epochs,
             )
-            .expect("apply_valid_tx must not error — GOV rule silently drops bad proposals");
+            .expect_err("stale prev_action_id must fail block apply (#914), not drop silently");
+        assert!(
+            err.to_string().contains("InvalidPrevGovActionId"),
+            "error must name InvalidPrevGovActionId, got: {err}"
+        );
 
         let action_id = GovActionId {
             transaction_id: prop_tx.hash,
@@ -5679,8 +5706,7 @@ mod tests {
         };
         assert!(
             !gov.governance.proposals.contains_key(&action_id),
-            "proposal with stale prev_action_id must be rejected (InvalidPrevGovActionId) \
-             via the GOV rule block-apply path; proposals={:?}",
+            "proposal with stale prev_action_id must not be inserted; proposals={:?}",
             gov.governance.proposals.keys().collect::<Vec<_>>(),
         );
     }
@@ -5761,21 +5787,31 @@ mod tests {
             Arc::make_mut(&mut gov.governance).enacted_committee = root;
 
             let tx = build_tx();
-            rules
-                .apply_valid_tx(
-                    &tx,
-                    BlockValidationMode::ApplyOnly,
-                    &ctx,
-                    &mut utxo,
-                    &mut certs,
-                    &mut gov,
-                    &mut epochs,
-                )
-                .expect("apply_valid_tx must not error — the GOV rule drops silently");
-            gov.governance.proposals.contains_key(&GovActionId {
-                transaction_id: tx.hash,
-                action_index: 0,
-            })
+            // #914: an invalid prev_action_id now fails apply instead of
+            // silently dropping; "admitted" therefore means apply succeeded
+            // AND the proposal landed in the active set.
+            let result = rules.apply_valid_tx(
+                &tx,
+                BlockValidationMode::ApplyOnly,
+                &ctx,
+                &mut utxo,
+                &mut certs,
+                &mut gov,
+                &mut epochs,
+            );
+            match result {
+                Ok(_) => gov.governance.proposals.contains_key(&GovActionId {
+                    transaction_id: tx.hash,
+                    action_index: 0,
+                }),
+                Err(e) => {
+                    assert!(
+                        e.to_string().contains("InvalidPrevGovActionId"),
+                        "rejection must be InvalidPrevGovActionId, got: {e}"
+                    );
+                    false
+                }
+            }
         };
 
         assert!(
@@ -5786,9 +5822,10 @@ mod tests {
         );
         assert!(
             !admitted(None),
-            "sanity: with enacted_committee = None the same proposal is dropped — \
-             this is precisely the state a Haskell-snapshot import used to produce, \
-             and why `decode_proposals_with_roots` must populate the roots."
+            "sanity: with enacted_committee = None the same proposal now FAILS apply \
+             (#914) — this is precisely the state a Haskell-snapshot import used to \
+             produce (#898), and it must surface immediately instead of corrupting \
+             pots silently."
         );
     }
 
