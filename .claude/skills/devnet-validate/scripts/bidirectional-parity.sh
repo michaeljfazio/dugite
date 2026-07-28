@@ -249,7 +249,13 @@ awk -F, '
     FILENAME ~ /relay\.csv$/      { r_status[$2]=$3; r_detail[$2]=$5; names[$2]=1; next }
     FILENAME ~ /cardano-bp\.csv$/ { c_status[$2]=$3; c_detail[$2]=$5; names[$2]=1; next }
     END {
-        print "name,status_relay,detail_relay,status_cardano_bp,detail_cardano_bp,match"
+        # NOTE: header is emitted by the shell below, NOT here. Printing it
+        # inside awk put it through the `sort` in the pipeline, which moved it
+        # to the bottom ("name," sorts after digits); `head -n 1` then took the
+        # alphabetically-FIRST DATA ROW as the header and dropped it from the
+        # body. Every consumer that skips NR>1 — including the OFFDIAG and
+        # TOTAL counters right below — therefore ignored one real row, so an
+        # off-diagonal in the first row was invisible.
         for (n in names) {
             rs = (n in r_status) ? r_status[n] : "ABSENT"
             cs = (n in c_status) ? c_status[n] : "ABSENT"
@@ -261,8 +267,12 @@ awk -F, '
         }
     }
 ' "$ZOO_STATE_TOP/results.relay.csv" "$ZOO_STATE_TOP/results.cardano-bp.csv" \
-    | LC_ALL=C sort > "$OUT.tmp"
-{ head -n 1 "$OUT.tmp"; tail -n +2 "$OUT.tmp" | grep -v '^$' | LC_ALL=C sort; } > "$OUT"
+    | grep -v '^$' | LC_ALL=C sort > "$OUT.tmp"
+# Header first, then the sorted body — the header never enters the sort.
+{
+    echo "name,status_relay,detail_relay,status_cardano_bp,detail_cardano_bp,match"
+    cat "$OUT.tmp"
+} > "$OUT"
 rm -f "$OUT.tmp"
 
 OFFDIAG=$(awk -F, 'NR>1 && $NF=="OFFDIAG" {c++} END {print c+0}' "$OUT")
