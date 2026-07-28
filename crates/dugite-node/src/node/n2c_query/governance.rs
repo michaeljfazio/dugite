@@ -40,6 +40,16 @@ pub(crate) fn handle_gov_state(state: &NodeStateSnapshot) -> QueryResult {
 ///
 /// Argument: tag(258) Set<GovActionId> where GovActionId = [tx_hash(32), action_index]
 /// Returns: Seq (GovActionState)
+///
+/// Per the proven Haskell mechanism (#922), `queryProposals` NEVER reads live
+/// `cgsProposals` — it reads the DRep pulsing state's frozen proposal list
+/// (`dpProposals` / `psProposals`), refreshed only at epoch boundaries. This
+/// handler must therefore answer from `governance_proposals_frozen` (the
+/// #903 `RatificationSnapshot`-sourced view), NOT `governance_proposals` (the
+/// live view `GetGovState`/tag 24 legitimately uses for its embedded
+/// `ConwayGovState.cgsProposals`). Reading the live field here was the #922
+/// bug: mid-epoch submissions appeared in dugite's answer immediately instead
+/// of only after the next epoch boundary rotates the pulser.
 pub(crate) fn handle_proposals(
     state: &NodeStateSnapshot,
     decoder: &mut minicbor::Decoder<'_>,
@@ -47,10 +57,10 @@ pub(crate) fn handle_proposals(
     debug!("Query: GetProposals");
     let filter_ids = parse_gov_action_id_set(decoder);
     if filter_ids.is_empty() {
-        QueryResult::Proposals(state.governance_proposals.clone())
+        QueryResult::Proposals(state.governance_proposals_frozen.clone())
     } else {
         let filtered = state
-            .governance_proposals
+            .governance_proposals_frozen
             .iter()
             .filter(|p| {
                 filter_ids
@@ -272,45 +282,52 @@ mod tests {
     };
 
     fn make_state_with_proposals() -> NodeStateSnapshot {
+        let proposals = vec![
+            ProposalSnapshot {
+                tx_id: vec![1u8; 32],
+                action_index: 0,
+                action_type: "InfoAction".to_string(),
+                proposed_epoch: 100,
+                expires_epoch: 106,
+                yes_votes: 10,
+                no_votes: 2,
+                abstain_votes: 1,
+                deposit: 100_000_000_000,
+                return_addr: vec![0u8; 29],
+                anchor_url: "https://example.com/proposal1".to_string(),
+                anchor_hash: vec![0xAA; 32],
+                gov_action: dugite_primitives::transaction::GovAction::InfoAction,
+                committee_votes: vec![],
+                drep_votes: vec![(vec![0xCC; 28], 0, 1)], // one DRep Yes vote
+                spo_votes: vec![],
+            },
+            ProposalSnapshot {
+                tx_id: vec![2u8; 32],
+                action_index: 1,
+                action_type: "ParameterChange".to_string(),
+                proposed_epoch: 101,
+                expires_epoch: 107,
+                yes_votes: 5,
+                no_votes: 3,
+                abstain_votes: 0,
+                deposit: 100_000_000_000,
+                return_addr: vec![0u8; 29],
+                anchor_url: "https://example.com/proposal2".to_string(),
+                anchor_hash: vec![0xBB; 32],
+                gov_action: dugite_primitives::transaction::GovAction::InfoAction,
+                committee_votes: vec![],
+                drep_votes: vec![],
+                spo_votes: vec![(vec![0xDD; 28], 0)], // one SPO No vote
+            },
+        ];
         NodeStateSnapshot {
-            governance_proposals: vec![
-                ProposalSnapshot {
-                    tx_id: vec![1u8; 32],
-                    action_index: 0,
-                    action_type: "InfoAction".to_string(),
-                    proposed_epoch: 100,
-                    expires_epoch: 106,
-                    yes_votes: 10,
-                    no_votes: 2,
-                    abstain_votes: 1,
-                    deposit: 100_000_000_000,
-                    return_addr: vec![0u8; 29],
-                    anchor_url: "https://example.com/proposal1".to_string(),
-                    anchor_hash: vec![0xAA; 32],
-                    gov_action: dugite_primitives::transaction::GovAction::InfoAction,
-                    committee_votes: vec![],
-                    drep_votes: vec![(vec![0xCC; 28], 0, 1)], // one DRep Yes vote
-                    spo_votes: vec![],
-                },
-                ProposalSnapshot {
-                    tx_id: vec![2u8; 32],
-                    action_index: 1,
-                    action_type: "ParameterChange".to_string(),
-                    proposed_epoch: 101,
-                    expires_epoch: 107,
-                    yes_votes: 5,
-                    no_votes: 3,
-                    abstain_votes: 0,
-                    deposit: 100_000_000_000,
-                    return_addr: vec![0u8; 29],
-                    anchor_url: "https://example.com/proposal2".to_string(),
-                    anchor_hash: vec![0xBB; 32],
-                    gov_action: dugite_primitives::transaction::GovAction::InfoAction,
-                    committee_votes: vec![],
-                    drep_votes: vec![],
-                    spo_votes: vec![(vec![0xDD; 28], 0)], // one SPO No vote
-                },
-            ],
+            governance_proposals: proposals.clone(),
+            // `handle_proposals` (GetProposals, tag 31) reads the FROZEN
+            // view (#922); most tests here don't care about the live/frozen
+            // distinction, so mirror the live list unless a test explicitly
+            // wants to exercise a live/frozen divergence (see the dedicated
+            // #922 tests below).
+            governance_proposals_frozen: proposals,
             ..NodeStateSnapshot::default()
         }
     }
