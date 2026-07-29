@@ -19,11 +19,10 @@ adv_require_devnet
 
 PASS=0; FAIL=0
 
-if ! command -v socat >/dev/null 2>&1; then
-    log_warn "socat not found — keepalive tests require socat, skipping"
-    adv_record "keepalive" "all" "SKIP" "socat not installed"
-    exit 0
-fi
+# No socat guard: every send below goes through `adv_send_expect_close`, which
+# uses the vendored stdlib raw-socket writer (#923). The old
+# `command -v socat || SKIP` gate suppressed all four keepalive cases on any
+# host without socat — honest as a SKIP, but the coverage was still absent.
 
 # Build a valid handshake frame
 HS_CBOR="8200a10d8402182af4f4"

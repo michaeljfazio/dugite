@@ -101,7 +101,7 @@ adv_log_line() {
     [ -f "$ADV_LOG" ] && wc -l < "$ADV_LOG" || echo 0
 }
 
-# Send hex CBOR via socat and expect the connection to close within ADV_EXPECT_CLOSE_SEC
+# Write hex CBOR to the target and expect the peer to close within ADV_EXPECT_CLOSE_SEC
 # Returns 0 if connection closed (as expected), 1 if it stayed open (bad)
 adv_send_expect_close() {
     local hex_payload="$1"

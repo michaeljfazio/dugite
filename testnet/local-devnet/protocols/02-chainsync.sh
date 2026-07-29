@@ -23,7 +23,7 @@ adv_require_devnet
 PASS=0; FAIL=0
 
 # Perform a valid handshake with devnet magic, then send adversarial ChainSync.
-# We use socat in two phases: handshake + ChainSync injection.
+# Frames are written in two phases: handshake + ChainSync injection.
 # For simplicity, we send the adversarial message immediately after the
 # valid handshake (before the server responds with MsgAcceptVersion).
 # The server must handle the out-of-order message gracefully.
