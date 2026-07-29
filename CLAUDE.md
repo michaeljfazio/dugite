@@ -151,10 +151,16 @@ and harness defects that made suites report success while testing nothing.
 **#919 bumps SNAPSHOT_VERSION 30 -> 31** — existing DBs replay chunks on
 first restart. Pre-v2.1.0 Mithril DBs still need a full `mithril-import`.
 
-Open query-surface work (does not affect consensus): **#905**
-(`query stake-distribution` rebuilds pool stake from live delegations and
-misses genesis-seeded ones). #906 (GetProposals payload/order) was already
-fixed in `fc892e1759` before v2.2.1 — verified during the #922 work.
+**The GitHub issue backlog is empty as of 2026-07-29.** Previously-listed
+query-surface work is done: #905 (stake-distribution denominator) and #906
+(GetProposals payload/order, fixed in `fc892e1759` before v2.2.1 — confirmed
+during the #922 work) are both closed, as is #912 (DRep dormant-epoch expiry).
+
+Outstanding validation, not an open issue: the wire-facing changes above
+(#915 tag-8 frame vs real `cardano-cli`, #918's three un-skipped tx-zoo
+scripts, #920 demotion end-to-end) are unit-verified only and want a
+`devnet-validate` round. #922 was removed from cli-parity
+`KNOWN_DIVERGENCES`, so the next round re-verifies it on the wire.
 
 Soak testing via Sandstone Pool [SAND] on preview and preprod (pool IDs:
 preview `6954ec11cf7097a693721104139b96c54e7f3e2a8f9e7577630f7856`, preprod
