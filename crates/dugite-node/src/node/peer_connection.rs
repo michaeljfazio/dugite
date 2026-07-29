@@ -112,6 +112,39 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// (`Option::take`). When the task stops, the channel is consumed (mux
 /// channels are not reusable after protocol completion — the mux handles
 /// cleanup internally).
+/// Aborts a spawned mux task unless explicitly disarmed (#924).
+///
+/// The mux task owns the `TcpBearer`, so simply dropping its `JoinHandle` on an
+/// early return does **not** stop it — tokio detaches the task and it keeps the
+/// socket open indefinitely. Every failed handshake therefore leaked a live
+/// connection: an unauthenticated peer could send one malformed handshake per
+/// socket and hold them all open. cardano-node closes the connection on every
+/// refused handshake; dugite closed none of them.
+///
+/// Wrap the handle immediately after `tokio::spawn` and call [`Self::disarm`]
+/// only once the connection is fully established and ownership moves into
+/// `PeerConnection`.
+struct MuxAbortGuard(Option<JoinHandle<Result<(), MuxError>>>);
+
+impl MuxAbortGuard {
+    fn new(handle: JoinHandle<Result<(), MuxError>>) -> Self {
+        Self(Some(handle))
+    }
+
+    /// Take the handle back, cancelling the abort-on-drop behaviour.
+    fn disarm(mut self) -> JoinHandle<Result<(), MuxError>> {
+        self.0.take().expect("guard disarmed exactly once")
+    }
+}
+
+impl Drop for MuxAbortGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
 pub struct PeerConnection {
     /// Remote peer address.
     pub addr: SocketAddr,
@@ -407,6 +440,10 @@ impl PeerConnection {
             result
         });
 
+        // Abort the mux task (and so close the socket) if the handshake below
+        // fails — see `MuxAbortGuard` (#924).
+        let mux_guard = MuxAbortGuard::new(mux_handle);
+
         // Run N2N handshake on the handshake channel.
         let our_data = N2NVersionData::new(network_magic, initiator_only, peer_sharing);
         let handshake_result = run_n2n_handshake_client(&mut handshake_ch, &our_data)
@@ -415,6 +452,7 @@ impl PeerConnection {
 
         let version = handshake_result.version;
         info!(%addr, version, "N2N handshake complete");
+        let mux_handle = mux_guard.disarm();
 
         Ok(Self {
             addr,
@@ -567,6 +605,11 @@ impl PeerConnection {
             result
         });
 
+        // Abort the mux task (and so close the socket) on any early return
+        // below — see `MuxAbortGuard` (#924). This is the inbound path, so a
+        // leak here is remotely triggerable by an unauthenticated peer.
+        let mux_guard = MuxAbortGuard::new(mux_handle);
+
         // Run N2N handshake as server.
         let our_data = N2NVersionData::new(network_magic, initiator_only, peer_sharing);
         let handshake_result = run_n2n_handshake_server(&mut handshake_ch, &our_data)
@@ -587,6 +630,7 @@ impl PeerConnection {
 
         let version = handshake_result.version;
         info!(%addr, version, "N2N handshake complete (inbound)");
+        let mux_handle = mux_guard.disarm();
 
         Ok(Self {
             addr,
@@ -1231,6 +1275,63 @@ impl PeerConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #924: a failed inbound handshake must CLOSE the socket.
+    ///
+    /// The mux task owns the `TcpBearer`. Dropping its `JoinHandle` on the
+    /// handshake-failure early return detaches the task rather than aborting
+    /// it, so the socket stayed open for the process lifetime — an
+    /// unauthenticated peer could hold one connection per malformed handshake.
+    /// cardano-node closes the connection on every refused handshake; before
+    /// this fix dugite closed none of them.
+    ///
+    /// The test drives the real `accept()` path with a peer that sends garbage
+    /// instead of a handshake, then asserts the client side observes EOF.
+    #[tokio::test]
+    async fn failed_inbound_handshake_closes_the_socket() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            // Garbage payload => handshake fails => early return.
+            PeerConnection::accept(stream, peer, 42, false, false).await
+        });
+
+        let mut client = tokio::net::TcpStream::connect(server_addr).await.unwrap();
+        // Mux frame (ts=0, proto=0, len=8) carrying non-CBOR garbage.
+        let payload: [u8; 8] = [0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe];
+        let mut frame = vec![0u8, 0, 0, 0, 0, 0, 0, payload.len() as u8];
+        frame.extend_from_slice(&payload);
+        client.write_all(&frame).await.unwrap();
+
+        let accept_result = server.await.unwrap();
+        assert!(
+            accept_result.is_err(),
+            "garbage handshake must fail the accept"
+        );
+
+        // The peer must see EOF (read returns 0), not a connection left open.
+        let mut buf = [0u8; 64];
+        let eof = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match client.read(&mut buf).await {
+                    Ok(0) => return true,  // clean close
+                    Ok(_) => continue,     // refusal bytes, keep reading
+                    Err(_) => return true, // reset also counts as closed
+                }
+            }
+        })
+        .await;
+
+        assert!(
+            matches!(eof, Ok(true)),
+            "socket still open 5s after a failed handshake — the mux task was \
+             detached instead of aborted (#924)"
+        );
+    }
 
     /// Verify PeerConnectionError Display formatting.
     #[test]
