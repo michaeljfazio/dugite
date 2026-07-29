@@ -27,6 +27,15 @@ pub enum NetworkError {
     Protocol(ProtocolError),
     /// Connection manager error (lifecycle, rate limiting).
     Connection(ConnectionError),
+    /// The node rejected a submitted transaction (LocalTxSubmission
+    /// `MsgRejectTx`). This is a normal protocol outcome, not a codec or
+    /// state-machine failure — before #925 it was mislabelled
+    /// "LocalStateQuery: CBOR decode error", sending operators to the wrong
+    /// mini-protocol during triage.
+    TxRejected {
+        /// Decoded rejection reason from the ApplyTxErr payload.
+        reason: String,
+    },
 }
 
 impl fmt::Display for NetworkError {
@@ -37,6 +46,9 @@ impl fmt::Display for NetworkError {
             Self::Handshake(e) => write!(f, "handshake: {e}"),
             Self::Protocol(e) => write!(f, "protocol: {e}"),
             Self::Connection(e) => write!(f, "connection: {e}"),
+            Self::TxRejected { reason } => {
+                write!(f, "LocalTxSubmission: transaction rejected: {reason}")
+            }
         }
     }
 }
@@ -409,6 +421,30 @@ impl From<HandshakeError> for ConnectionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── TxRejected display (#925) ────────────────────────────────────────────
+
+    /// #925: a LocalTxSubmission rejection must name the right mini-protocol
+    /// and must not present as a codec failure. Before the fix, the N2C client
+    /// wrapped every rejection as
+    /// "LocalStateQuery: CBOR decode error: Transaction rejected: …".
+    #[test]
+    fn tx_rejected_display_names_local_tx_submission() {
+        let err = NetworkError::TxRejected {
+            reason: "transaction decode failed: set: duplicate element".to_string(),
+        };
+        let text = err.to_string();
+        assert_eq!(
+            text,
+            "LocalTxSubmission: transaction rejected: \
+             transaction decode failed: set: duplicate element"
+        );
+        assert!(!text.contains("LocalStateQuery"), "wrong protocol label");
+        assert!(
+            !text.contains("CBOR decode error"),
+            "a rejection is not a codec failure"
+        );
+    }
 
     // ─── BearerError classification from io::Error ───────────────────────────
 

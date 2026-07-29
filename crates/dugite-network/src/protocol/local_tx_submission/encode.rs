@@ -568,6 +568,18 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
             });
         }
 
+        // Decode-level rejection: the tx failed `decode_transaction` before
+        // Phase-1 ever ran (e.g. a Conway duplicate input hard-fails the
+        // strict-set decoder, mirroring Haskell `decodeSetEnforceNoDuplicates`).
+        // Haskell fails these at the codec layer with a DeserialiseFailure and
+        // drops the connection; dugite deliberately answers a structured
+        // MsgRejectTx instead. Carry the decoder's reason (#925): the rejected
+        // bytes are the client's own submission, so unlike the C8 fallback
+        // below there are no ledger internals to leak.
+        TxValidationError::DecodeFailed { reason } => {
+            encode_mempool_fallback(enc, &format!("transaction decode failed: {reason}"));
+        }
+
         // ── Fallback for all unmapped variants ──
         // ConwayMempoolFailure (Ledger tag 7): [7, "descriptive text"]
         //
@@ -1168,6 +1180,38 @@ mod tests {
         );
         // Must be the sanitized generic message.
         assert_eq!(text, "transaction validation failed");
+    }
+
+    #[test]
+    fn test_encode_decode_failed_carries_reason() {
+        // #925: a Conway duplicate-input tx fails `decode_transaction` at the
+        // strict-set layer ("set: duplicate element") — Phase-1's
+        // DuplicateInput arm never runs, so the rejection reaches the encoder
+        // as DecodeFailed. It must carry the decoder's reason instead of the
+        // generic "transaction validation failed": the submitted bytes are the
+        // client's own, so echoing the decode reason leaks no ledger
+        // internals (C8).
+        let err = TxValidationError::DecodeFailed {
+            reason: "set: duplicate element".to_string(),
+        };
+        let bytes = encode_apply_tx_err(&err, 6);
+
+        let mut dec = Decoder::new(&bytes);
+        dec.array().unwrap();
+        dec.array().unwrap();
+        dec.u16().unwrap();
+        dec.array().unwrap();
+
+        // Ledger tag 7: ConwayMempoolFailure
+        let arr_len = dec.array().unwrap().unwrap();
+        assert_eq!(arr_len, 2);
+        let tag = dec.u8().unwrap();
+        assert_eq!(tag, 7, "ConwayMempoolFailure");
+        let text = dec.str().unwrap();
+        assert_eq!(
+            text, "transaction decode failed: set: duplicate element",
+            "DecodeFailed must surface the decoder's reason (#925)"
+        );
     }
 
     #[test]

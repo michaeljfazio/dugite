@@ -647,13 +647,16 @@ impl N2CClient {
         let _ = dec.array();
         let tag = dec
             .u32()
-            .map_err(|e| protocol_err(format!("bad monitor acquire: {e}")))?;
+            .map_err(|e| protocol_err_for("LocalTxMonitor", format!("bad monitor acquire: {e}")))?;
         if tag != 2 {
-            return Err(protocol_err(format!("expected MsgAcquired(2), got {tag}")));
+            return Err(protocol_err_for(
+                "LocalTxMonitor",
+                format!("expected MsgAcquired(2), got {tag}"),
+            ));
         }
         let slot = dec
             .u64()
-            .map_err(|e| protocol_err(format!("bad mempool slot: {e}")))?;
+            .map_err(|e| protocol_err_for("LocalTxMonitor", format!("bad mempool slot: {e}")))?;
         Ok(slot)
     }
 
@@ -679,11 +682,12 @@ impl N2CClient {
         let _ = dec.array();
         let tag = dec
             .u32()
-            .map_err(|e| protocol_err(format!("bad monitor has_tx: {e}")))?;
+            .map_err(|e| protocol_err_for("LocalTxMonitor", format!("bad monitor has_tx: {e}")))?;
         if tag != 8 {
-            return Err(protocol_err(format!(
-                "expected MsgReplyHasTx(8), got {tag}"
-            )));
+            return Err(protocol_err_for(
+                "LocalTxMonitor",
+                format!("expected MsgReplyHasTx(8), got {tag}"),
+            ));
         }
         let has_tx = dec.bool().unwrap_or(false);
         Ok(has_tx)
@@ -708,24 +712,25 @@ impl N2CClient {
             .map_err(NetworkError::Mux)?;
         let mut dec = minicbor::Decoder::new(&resp);
         let _ = dec.array();
-        let tag = dec
-            .u32()
-            .map_err(|e| protocol_err(format!("bad monitor get_sizes: {e}")))?;
+        let tag = dec.u32().map_err(|e| {
+            protocol_err_for("LocalTxMonitor", format!("bad monitor get_sizes: {e}"))
+        })?;
         if tag != 10 {
-            return Err(protocol_err(format!(
-                "expected MsgReplyGetSizes(10), got {tag}"
-            )));
+            return Err(protocol_err_for(
+                "LocalTxMonitor",
+                format!("expected MsgReplyGetSizes(10), got {tag}"),
+            ));
         }
         let _ = dec.array();
         let capacity = dec
             .u32()
-            .map_err(|e| protocol_err(format!("bad capacity: {e}")))?;
+            .map_err(|e| protocol_err_for("LocalTxMonitor", format!("bad capacity: {e}")))?;
         let size = dec
             .u32()
-            .map_err(|e| protocol_err(format!("bad size: {e}")))?;
+            .map_err(|e| protocol_err_for("LocalTxMonitor", format!("bad size: {e}")))?;
         let num_txs = dec
             .u32()
-            .map_err(|e| protocol_err(format!("bad num_txs: {e}")))?;
+            .map_err(|e| protocol_err_for("LocalTxMonitor", format!("bad num_txs: {e}")))?;
         Ok((capacity, size, num_txs))
     }
 
@@ -756,7 +761,7 @@ impl N2CClient {
         let arr_len = dec.array();
         let tag = dec
             .u32()
-            .map_err(|e| protocol_err(format!("bad monitor next_tx: {e}")))?;
+            .map_err(|e| protocol_err_for("LocalTxMonitor", format!("bad monitor next_tx: {e}")))?;
 
         match tag {
             6 => {
@@ -770,11 +775,15 @@ impl N2CClient {
                     // flat shape.
                     let era_index = match dec.datatype() {
                         Ok(minicbor::data::Type::Array) => {
-                            let _ = dec
-                                .array()
-                                .map_err(|e| protocol_err(format!("bad GenTx array: {e}")))?;
-                            dec.u32()
-                                .map_err(|e| protocol_err(format!("bad GenTx era index: {e}")))?
+                            let _ = dec.array().map_err(|e| {
+                                protocol_err_for("LocalTxMonitor", format!("bad GenTx array: {e}"))
+                            })?;
+                            dec.u32().map_err(|e| {
+                                protocol_err_for(
+                                    "LocalTxMonitor",
+                                    format!("bad GenTx era index: {e}"),
+                                )
+                            })?
                         }
                         // Legacy flat shape [6, bstr(tx)] — no era wrapper.
                         _ => u32::MAX,
@@ -783,12 +792,22 @@ impl N2CClient {
                         Ok(minicbor::data::Type::Tag) => {
                             let _ = dec.tag();
                             dec.bytes()
-                                .map_err(|e| protocol_err(format!("bad GenTx tx bytes: {e}")))?
+                                .map_err(|e| {
+                                    protocol_err_for(
+                                        "LocalTxMonitor",
+                                        format!("bad GenTx tx bytes: {e}"),
+                                    )
+                                })?
                                 .to_vec()
                         }
                         _ => dec
                             .bytes()
-                            .map_err(|e| protocol_err(format!("bad GenTx tx bytes: {e}")))?
+                            .map_err(|e| {
+                                protocol_err_for(
+                                    "LocalTxMonitor",
+                                    format!("bad GenTx tx bytes: {e}"),
+                                )
+                            })?
                             .to_vec(),
                     };
                     // Canonical tx id = blake2b_256(raw_body_cbor) — the body-span
@@ -809,9 +828,10 @@ impl N2CClient {
                     Ok(None)
                 }
             }
-            other => Err(protocol_err(format!(
-                "unexpected next_tx response tag: {other}"
-            ))),
+            other => Err(protocol_err_for(
+                "LocalTxMonitor",
+                format!("unexpected next_tx response tag: {other}"),
+            )),
         }
     }
 
@@ -864,20 +884,25 @@ impl N2CClient {
         let resp = self.recv_tx_submission().await?;
         let mut dec = minicbor::Decoder::new(&resp);
         let _ = dec.array();
-        let msg_tag = dec
-            .u32()
-            .map_err(|e| protocol_err(format!("bad tx response tag: {e}")))?;
+        let msg_tag = dec.u32().map_err(|e| {
+            protocol_err_for("LocalTxSubmission", format!("bad tx response tag: {e}"))
+        })?;
 
         match msg_tag {
             1 => Ok(()),
             2 => {
+                // MsgRejectTx is a normal protocol outcome, not a codec
+                // failure — surface it as TxRejected so the CLI reports
+                // "LocalTxSubmission: transaction rejected: …" instead of the
+                // pre-#925 "LocalStateQuery: CBOR decode error: …".
                 let reason = decode_reject_reason(&mut dec)
                     .unwrap_or_else(|| "unknown rejection reason".to_string());
-                Err(protocol_err(format!("Transaction rejected: {reason}")))
+                Err(NetworkError::TxRejected { reason })
             }
-            other => Err(protocol_err(format!(
-                "unexpected tx submission response tag: {other}"
-            ))),
+            other => Err(protocol_err_for(
+                "LocalTxSubmission",
+                format!("unexpected tx submission response tag: {other}"),
+            )),
         }
     }
 
@@ -909,12 +934,17 @@ fn cbor_err<T: std::fmt::Display>(e: T) -> NetworkError {
     protocol_err(format!("CBOR encode error: {e}"))
 }
 
-/// Build a `NetworkError::Protocol` from a string message.
+/// Build a `NetworkError::Protocol` for the LocalStateQuery paths.
 fn protocol_err(reason: String) -> NetworkError {
-    NetworkError::Protocol(crate::error::ProtocolError::CborDecode {
-        protocol: "LocalStateQuery",
-        reason,
-    })
+    protocol_err_for("LocalStateQuery", reason)
+}
+
+/// Build a `NetworkError::Protocol` labelled with the mini-protocol the
+/// failure actually occurred on. Before #925 every N2C client error carried
+/// the "LocalStateQuery" label, including LocalTxSubmission and
+/// LocalTxMonitor failures.
+fn protocol_err_for(protocol: &'static str, reason: String) -> NetworkError {
+    NetworkError::Protocol(crate::error::ProtocolError::CborDecode { protocol, reason })
 }
 
 /// Clamp a CBOR array/map length header against the bytes still available in
