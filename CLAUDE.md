@@ -95,7 +95,29 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 - 28-byte hash types (DRep keys, pool voter keys, required signers) must be padded to 32 bytes via `Hash28::to_hash32_padded()` — do not use `Hash<32>::from()` directly on 28-byte hashes
 
 ## Current Focus
-**v2.3.0 released (2026-07-29)** — backlog sweep closing #914-#924. Two
+**v2.3.1 released (2026-07-30)** — patch: #925 N2C rejection diagnostics.
+Drop-in from v2.3.0, SNAPSHOT unchanged at 31. Root cause was two
+compounding defects: (1) `N2CClient`'s file-wide `protocol_err` hardcoded
+`LocalStateQuery`/`CborDecode` for EVERY client error, including
+LocalTxSubmission `MsgRejectTx` — now a dedicated `NetworkError::TxRejected`
+("LocalTxSubmission: transaction rejected: …") with real protocol labels on
+the LocalTxMonitor/LocalTxSubmission decode paths; (2) a Conway duplicate
+input fails `decode_transaction` at the strict-set layer BEFORE Phase-1, so
+the `DuplicateInput` encoder arm is unreachable for wire txs — the resulting
+`DecodeFailed` had no encoder arm and fell into the generic C8 fallback. Now
+`ConwayMempoolFailure(7, "transaction decode failed: <reason>")` (C8-safe:
+the rejected bytes are the client's own). Haskell fails these at the codec
+layer and drops the connection; dugite deliberately answers a structured
+MsgRejectTx. QA: devnet-validate standard 2/2 rounds PASS
+(`reports/devnet-validate/v2.3.1.json`) — 349 canonical blocks, 0 orphans,
+tx-zoo 168/0, all 5 predicates green both rounds; 08f-double-spend
+validates the fix on the wire. Also fixed: the dugite-monitor probe-timeout
+test's wall-clock backstop (third flake of the same shape — it measured
+nextest scheduling latency, not the probe; `is_none()` + the compile-time
+budget guard already prove the contract). **Zero open issues.**
+
+### v2.3.0 (2026-07-29)
+Backlog sweep closing #914-#924. Two
 byte-exact ledger/LSQ divergences, one remotely-triggerable connection leak,
 and five harness defects that made suites report success while measuring
 nothing. **Re-sync release: SNAPSHOT_VERSION 30 -> 31.**
@@ -178,11 +200,9 @@ Coverage caveat: bidirectional parity ran 34 scripts, not 41 —
 chain is rejected by BOTH implementations (parity holds; the zoo just reports
 it as a failure).
 
-**Open issues: #905 is CLOSED** (as are #906 and #912 — #906 was fixed in
-`fc892e1759` before v2.2.1, confirmed during the #922 work). Currently open:
-**#925** (duplicate-input rejection surfaces as `LocalStateQuery: CBOR decode
-error` + a generic reason via `dugite-cli` — diagnostic quality only, no
-consensus impact, root cause unconfirmed).
+**Open issues: none.** #905/#906/#912 CLOSED earlier; **#925 CLOSED in
+v2.3.1** (see Current Focus — it was a `dugite-cli` mislabel plus a missing
+`DecodeFailed` encoder arm, not an LSQ bug).
 
 **Adversarial results recorded on socat-less hosts (stock macOS) before
 v2.3.0 are unverified** — see #923.
