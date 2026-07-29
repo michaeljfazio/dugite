@@ -23,8 +23,16 @@ LD_ROOT="$(cd "$PROTO_DIR/.." && pwd)"
 ADV_TARGET_HOST="127.0.0.1"
 ADV_TARGET_PORT="$LD_RELAY_PORT"
 
-# Timeout in seconds for the connection to be terminated after sending bad data
-ADV_EXPECT_CLOSE_SEC="${ADV_EXPECT_CLOSE_SEC:-10}"
+# Timeout in seconds for the connection to be terminated after sending bad data.
+#
+# Must EXCEED the node's handshake timeout (10s), not equal it. At 10s the
+# probe raced the close and lost by ~3ms for the empty-payload case: dugite and
+# cardano-node 11.0.1 both close at 10.003s (measured on the same host), so the
+# old value failed a case where the two implementations are byte-identical —
+# a harness bug, not a node gap, exactly like the cli-parity both-sides-failed
+# rule. 15s leaves margin without masking a real leak (#924 kept the socket
+# open indefinitely, which no timeout value would have hidden).
+ADV_EXPECT_CLOSE_SEC="${ADV_EXPECT_CLOSE_SEC:-15}"
 
 # Vendored raw-socket writer (shared with tx-zoo 08r, see #918/#923).
 ADV_RAW_SEND="${ADV_RAW_SEND:-$LD_ROOT/tx-zoo/lib/raw-socket-send.py}"
