@@ -95,9 +95,10 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 - 28-byte hash types (DRep keys, pool voter keys, required signers) must be padded to 32 bytes via `Hash28::to_hash32_padded()` — do not use `Hash<32>::from()` directly on 28-byte hashes
 
 ## Current Focus
-Backlog sweep after v2.2.4 (2026-07-29). Nine open issues triaged and fixed;
-two are byte-exact ledger/LSQ divergences, the rest are correctness hygiene
-and harness defects that made suites report success while testing nothing.
+**v2.3.0 released (2026-07-29)** — backlog sweep closing #914-#924. Two
+byte-exact ledger/LSQ divergences, one remotely-triggerable connection leak,
+and five harness defects that made suites report success while measuring
+nothing. **Re-sync release: SNAPSHOT_VERSION 30 -> 31.**
 
 - **#919 (ledger, SNAPSHOT 30 -> 31)** — dugite had exactly ONE min-UTxO
   helper, the Babbage `(160+size) x coinsPerUTxOByte` formula, applied in
@@ -148,19 +149,43 @@ and harness defects that made suites report success while testing nothing.
   and a CBOR splicer and classifies env-vs-state skips (`--strict-skips`);
   nextest has a `slow-timeout` terminate-after backstop.
 
+- **#924 (network, found BY the validation round)** — a failed handshake
+  left the TCP connection open for the process lifetime. The mux task owns the
+  `TcpBearer`, and the handshake-failure early return dropped its `JoinHandle`
+  — which **detaches** a tokio task rather than aborting it. Unauthenticated
+  and remotely triggerable (one malformed handshake per socket), and it
+  defeated the inbound connection cap since leaked sockets are never
+  registered and so never counted. cardano-node closes all five malformed
+  cases; dugite closed none. Fixed with a `MuxAbortGuard` on both the inbound
+  and outbound paths. **It was only reachable because #923 stopped the
+  adversarial suite from passing without sending bytes** — the two compound.
+
 **#919 bumps SNAPSHOT_VERSION 30 -> 31** — existing DBs replay chunks on
 first restart. Pre-v2.1.0 Mithril DBs still need a full `mithril-import`.
 
-**The GitHub issue backlog is empty as of 2026-07-29.** Previously-listed
-query-surface work is done: #905 (stake-distribution denominator) and #906
-(GetProposals payload/order, fixed in `fc892e1759` before v2.2.1 — confirmed
-during the #922 work) are both closed, as is #912 (DRep dormant-epoch expiry).
+### QA status
 
-Outstanding validation, not an open issue: the wire-facing changes above
-(#915 tag-8 frame vs real `cardano-cli`, #918's three un-skipped tx-zoo
-scripts, #920 demotion end-to-end) are unit-verified only and want a
-`devnet-validate` round. #922 was removed from cli-parity
-`KNOWN_DIVERGENCES`, so the next round re-verifies it on the wire.
+devnet-validate standard preset, **3/3 rounds PASS** vs cardano-node 11.0.1
+(`reports/devnet-validate/v2.3.0.json`): 522 canonical blocks, 0 orphans, 0
+invalid-block events, byte-exact treasury/reserves parity after both RUPD
+boundaries, tx-zoo 84 PASS / 0 FAIL / **0 env-skip**, adversarial N2N **7/7,
+0 SILENT_SKIP**, cli-parity 18 EQUAL / 0 divergent (including `proposals`,
+which validates #922 on the wire), bidirectional parity 34/34 identical
+across both sockets, 100% tip parity every round.
+
+Coverage caveat: bidirectional parity ran 34 scripts, not 41 —
+`06-proposals` is excluded because re-submitting an already-enacted proposal
+chain is rejected by BOTH implementations (parity holds; the zoo just reports
+it as a failure).
+
+**Open issues: #905 is CLOSED** (as are #906 and #912 — #906 was fixed in
+`fc892e1759` before v2.2.1, confirmed during the #922 work). Currently open:
+**#925** (duplicate-input rejection surfaces as `LocalStateQuery: CBOR decode
+error` + a generic reason via `dugite-cli` — diagnostic quality only, no
+consensus impact, root cause unconfirmed).
+
+**Adversarial results recorded on socat-less hosts (stock macOS) before
+v2.3.0 are unverified** — see #923.
 
 Soak testing via Sandstone Pool [SAND] on preview and preprod (pool IDs:
 preview `6954ec11cf7097a693721104139b96c54e7f3e2a8f9e7577630f7856`, preprod
