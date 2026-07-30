@@ -629,6 +629,13 @@ fn gcd_u128(mut a: u128, mut b: u128) -> u128 {
 /// policy-ID bytestring header (2 bytes, not 1), map headers with >= 24
 /// entries, and asset names >= 24 bytes, which let a maliciously-sized
 /// multi-asset output slip under `maxValSize` (issue #793).
+///
+/// `encode_value` replicates cardano-ledger-binary `encodeMap` semantics
+/// for both multi-asset map levels: definite-length header for maps with
+/// <= 23 entries, indefinite-length (`0xbf` ... `0xff`) above. A
+/// definite-only encoder OVER-counted by 1 byte per map with >= 256
+/// entries, falsely rejecting a valid preprod tx measuring exactly
+/// `maxValSize` under Haskell's encoder (issue #930).
 pub(super) fn estimate_value_cbor_size(value: &dugite_primitives::value::Value) -> u64 {
     dugite_serialization::encode_value(value).len() as u64
 }
