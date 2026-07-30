@@ -219,3 +219,247 @@ fn load_verification_key(path: &PathBuf) -> Result<PaymentVerificationKey> {
     };
     Ok(PaymentVerificationKey::from_bytes(key_bytes)?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── simple_cbor_wrap (this file's copy) ─────────────────────────────────
+
+    /// The wrapper must produce *valid CBOR byte strings*: decode each output
+    /// with minicbor and require the payload to round-trip. This guards the
+    /// local copy against divergence from the one in node.rs.
+    #[test]
+    fn cbor_wrap_output_is_decodable_cbor_bytes() {
+        for len in [0usize, 1, 23, 24, 32, 64, 255, 256, 612] {
+            let payload = vec![0x5Au8; len];
+            let wrapped = simple_cbor_wrap(&payload);
+            let mut d = minicbor::Decoder::new(&wrapped);
+            let decoded = d.bytes().unwrap_or_else(|e| {
+                panic!("len={len}: wrap produced invalid CBOR: {e}");
+            });
+            assert_eq!(decoded, payload.as_slice(), "len={len}: payload mangled");
+            assert_eq!(
+                d.position(),
+                wrapped.len(),
+                "len={len}: trailing garbage after byte string"
+            );
+        }
+    }
+
+    // ── load_verification_key ────────────────────────────────────────────────
+
+    /// Write a text envelope for the given raw cborHex string.
+    fn write_envelope(dir: &std::path::Path, name: &str, cbor_hex: &str) -> PathBuf {
+        let path = dir.join(name);
+        let env = serde_json::json!({
+            "type": "PaymentVerificationKeyShelley_ed25519",
+            "description": "Payment Verification Key",
+            "cborHex": cbor_hex
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&env).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn load_verification_key_roundtrips_generated_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let sk = dugite_crypto::keys::PaymentSigningKey::generate();
+        let vk = sk.verification_key();
+        let path = write_envelope(
+            dir.path(),
+            "gen.vkey",
+            &hex::encode(simple_cbor_wrap(&vk.to_bytes())),
+        );
+
+        let loaded = load_verification_key(&path).unwrap();
+        assert_eq!(loaded.to_bytes(), vk.to_bytes());
+        assert_eq!(loaded.hash().as_bytes(), vk.hash().as_bytes());
+    }
+
+    #[test]
+    fn load_verification_key_missing_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.vkey");
+        assert!(load_verification_key(&path).is_err());
+    }
+
+    #[test]
+    fn load_verification_key_invalid_json_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("garbage.vkey");
+        std::fs::write(&path, "{{{{").unwrap();
+        assert!(load_verification_key(&path).is_err());
+    }
+
+    #[test]
+    fn load_verification_key_bad_hex_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_envelope(dir.path(), "badhex.vkey", "zz-not-hex");
+        assert!(load_verification_key(&path).is_err());
+    }
+
+    #[test]
+    fn load_verification_key_wrong_length_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        // CBOR bytes(16): too short for an Ed25519 verification key.
+        let path = write_envelope(
+            dir.path(),
+            "short.vkey",
+            &format!("5810{}", hex::encode([0u8; 16])),
+        );
+        assert!(load_verification_key(&path).is_err());
+    }
+
+    // ── AddressCmd::run flows via temp files ────────────────────────────────
+
+    /// Generate a payment key envelope on disk, returning its path.
+    fn generate_vkey_file(dir: &std::path::Path, name: &str) -> PathBuf {
+        let sk = dugite_crypto::keys::PaymentSigningKey::generate();
+        let vk = sk.verification_key();
+        write_envelope(dir, name, &hex::encode(simple_cbor_wrap(&vk.to_bytes())))
+    }
+
+    #[test]
+    fn build_enterprise_mainnet_address_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let vkey = generate_vkey_file(dir.path(), "payment.vkey");
+        let out = dir.path().join("addr.txt");
+
+        AddressCmd {
+            command: AddressSubcommand::Build {
+                payment_verification_key_file: vkey,
+                stake_verification_key_file: None,
+                network: "mainnet".to_string(),
+                out_file: Some(out.clone()),
+            },
+        }
+        .run()
+        .unwrap();
+
+        let addr = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            addr.starts_with("addr1"),
+            "mainnet address must use the `addr` HRP, got: {addr}"
+        );
+        let (hrp, bytes) = bech32::decode(&addr).unwrap();
+        assert_eq!(hrp.as_str(), "addr");
+        // Enterprise address: 1 header byte + 28-byte payment credential.
+        assert_eq!(bytes.len(), 29);
+        // Header: type 6 (enterprise/key), network 1 (mainnet) → 0x61.
+        assert_eq!(bytes[0], 0x61);
+    }
+
+    #[test]
+    fn build_base_testnet_address_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let payment = generate_vkey_file(dir.path(), "payment.vkey");
+        let stake = generate_vkey_file(dir.path(), "stake.vkey");
+        let out = dir.path().join("addr.txt");
+
+        AddressCmd {
+            command: AddressSubcommand::Build {
+                payment_verification_key_file: payment,
+                stake_verification_key_file: Some(stake),
+                network: "testnet".to_string(),
+                out_file: Some(out.clone()),
+            },
+        }
+        .run()
+        .unwrap();
+
+        let addr = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            addr.starts_with("addr_test1"),
+            "testnet address must use the `addr_test` HRP, got: {addr}"
+        );
+        let (hrp, bytes) = bech32::decode(&addr).unwrap();
+        assert_eq!(hrp.as_str(), "addr_test");
+        // Base address: 1 header byte + 28 payment + 28 stake.
+        assert_eq!(bytes.len(), 57);
+        // Header: type 0 (base/key+key), network 0 (testnet) → 0x00.
+        assert_eq!(bytes[0], 0x00);
+
+        // The built address must parse back as a Base address.
+        match Address::from_bytes(&bytes).unwrap() {
+            Address::Base(a) => assert_eq!(a.network, NetworkId::Testnet),
+            other => panic!("expected Base address, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_missing_payment_key_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = AddressCmd {
+            command: AddressSubcommand::Build {
+                payment_verification_key_file: dir.path().join("missing.vkey"),
+                stake_verification_key_file: None,
+                network: "mainnet".to_string(),
+                out_file: None,
+            },
+        }
+        .run();
+        assert!(result.is_err(), "missing payment vkey must be an error");
+    }
+
+    #[test]
+    fn info_accepts_built_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let vkey = generate_vkey_file(dir.path(), "payment.vkey");
+        let out = dir.path().join("addr.txt");
+        AddressCmd {
+            command: AddressSubcommand::Build {
+                payment_verification_key_file: vkey,
+                stake_verification_key_file: None,
+                network: "testnet".to_string(),
+                out_file: Some(out.clone()),
+            },
+        }
+        .run()
+        .unwrap();
+
+        let addr = std::fs::read_to_string(&out).unwrap();
+        AddressCmd {
+            command: AddressSubcommand::Info { address: addr },
+        }
+        .run()
+        .unwrap();
+    }
+
+    #[test]
+    fn info_rejects_invalid_bech32() {
+        let result = AddressCmd {
+            command: AddressSubcommand::Info {
+                address: "addr1qqinvalid!!checksum".to_string(),
+            },
+        }
+        .run();
+        assert!(result.is_err(), "invalid bech32 must be an error");
+    }
+
+    #[test]
+    fn keygen_writes_loadable_key_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let vk_path = dir.path().join("kg.vkey");
+        let sk_path = dir.path().join("kg.skey");
+
+        AddressCmd {
+            command: AddressSubcommand::KeyGen {
+                verification_key_file: vk_path.clone(),
+                signing_key_file: sk_path.clone(),
+            },
+        }
+        .run()
+        .unwrap();
+
+        // The generated vkey file must load back through the same helper the
+        // build command uses, and correspond to the generated skey.
+        let vk = load_verification_key(&vk_path).unwrap();
+        let sk_content = std::fs::read_to_string(&sk_path).unwrap();
+        let sk_env: TextEnvelope = serde_json::from_str(&sk_content).unwrap();
+        assert_eq!(sk_env.type_, "PaymentSigningKeyShelley_ed25519");
+        let sk_cbor = hex::decode(&sk_env.cbor_hex).unwrap();
+        let sk = dugite_crypto::keys::PaymentSigningKey::from_bytes(&sk_cbor[2..]).unwrap();
+        assert_eq!(sk.verification_key().to_bytes(), vk.to_bytes());
+    }
+}

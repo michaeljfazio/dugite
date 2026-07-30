@@ -3802,4 +3802,487 @@ mod tests {
             assert_eq!(era_name(era), "Unknown", "era {era} should be Unknown");
         }
     }
+
+    #[test]
+    fn test_decode_map_entries_indefinite() {
+        // Indefinite-length map: 0xbf {1: 10, 2: 20} 0xff — the shape a
+        // Haskell node may emit (see decode_map_entries doc comment).
+        let buf = [0xbfu8, 0x01, 0x0a, 0x02, 0x14, 0xff];
+        let mut dec = minicbor::Decoder::new(&buf);
+        let mut entries = Vec::new();
+        decode_map_entries(&mut dec, |d| {
+            let k = d.u32()?;
+            let v = d.u64()?;
+            entries.push((k, v));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(entries, vec![(1, 10), (2, 20)]);
+    }
+
+    // ── gcd_u64 / f64_to_rational_approx fallback ────────────────────────────
+
+    #[test]
+    fn test_gcd_u64_basics() {
+        assert_eq!(gcd_u64(0, 5), 5);
+        assert_eq!(gcd_u64(5, 0), 5);
+        assert_eq!(gcd_u64(12, 18), 6);
+        assert_eq!(gcd_u64(7, 13), 1);
+        assert_eq!(gcd_u64(100, 100), 100);
+    }
+
+    #[test]
+    fn test_f64_to_rational_millionths_fallback() {
+        // 1/3 matches none of the candidate denominators, so the helper must
+        // fall back to the 1e6 denominator, reduced to lowest terms.
+        let (num, den) = f64_to_rational_approx(1.0 / 3.0);
+        assert_eq!((num, den), (333_333, 1_000_000));
+    }
+
+    // ── enter_msg_result ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_enter_msg_result_rejects_non_msgresult_tag() {
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.array(2).unwrap();
+        enc.u32(6).unwrap(); // MsgReAcquire, not MsgResult
+        enc.u64(0).unwrap();
+        let err = enter_msg_result(&buf).unwrap_err();
+        assert!(
+            err.to_string().contains("Expected MsgResult tag 4"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_enter_msg_result_strips_hfc_wrapper_forms() {
+        // Form 1: array(1) HFC success wrapper around the payload.
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.array(2).unwrap();
+        enc.u32(4).unwrap();
+        enc.array(1).unwrap();
+        enc.u64(777).unwrap();
+        let mut d = enter_msg_result(&buf).unwrap();
+        assert_eq!(d.u64().unwrap(), 777, "array(1) wrapper must be consumed");
+
+        // Form 2: array(2)[tag, payload] wrapper.
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.array(2).unwrap();
+        enc.u32(4).unwrap();
+        enc.array(2).unwrap();
+        enc.u64(1).unwrap(); // HFC success tag
+        enc.u64(888).unwrap();
+        let mut d = enter_msg_result(&buf).unwrap();
+        assert_eq!(d.u64().unwrap(), 888, "array(2) wrapper must skip its tag");
+
+        // Form 3: bare (non-array) payload directly after the MsgResult tag.
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.array(2).unwrap();
+        enc.u32(4).unwrap();
+        enc.u64(999).unwrap();
+        let mut d = enter_msg_result(&buf).unwrap();
+        assert_eq!(d.u64().unwrap(), 999, "bare payload must be left in place");
+    }
+
+    // ── parse_drep_state ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_drep_state_entries() {
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.array(2).unwrap();
+        enc.u32(4).unwrap(); // MsgResult
+        enc.array(1).unwrap(); // HFC success wrapper
+        enc.map(2).unwrap();
+
+        // Entry 1: keyHash credential, no anchor.
+        enc.array(2).unwrap();
+        enc.u8(0).unwrap(); // keyHash
+        enc.bytes(&[0x11; 28]).unwrap();
+        enc.array(4).unwrap();
+        enc.u64(431).unwrap(); // expiry epoch
+        enc.array(0).unwrap(); // no anchor
+        enc.u64(500_000_000).unwrap(); // deposit
+        enc.array(0).unwrap(); // delegators (skipped)
+
+        // Entry 2: scriptHash credential with an anchor.
+        enc.array(2).unwrap();
+        enc.u8(1).unwrap(); // scriptHash
+        enc.bytes(&[0x22; 28]).unwrap();
+        enc.array(4).unwrap();
+        enc.u64(500).unwrap();
+        enc.array(1).unwrap(); // anchor present
+        enc.array(2).unwrap();
+        enc.str("https://example.com/drep.json").unwrap();
+        enc.bytes(&[0x33; 32]).unwrap();
+        enc.u64(2_000_000).unwrap();
+        enc.array(0).unwrap();
+
+        let entries = parse_drep_state(&buf).unwrap();
+        assert_eq!(entries.len(), 2);
+
+        assert_eq!(entries[0].cred_type, 0);
+        assert_eq!(entries[0].hash, vec![0x11; 28]);
+        assert_eq!(entries[0].deposit, 500_000_000);
+        assert_eq!(entries[0].expiry_epoch, 431);
+        assert!(entries[0].anchor.is_none());
+
+        assert_eq!(entries[1].cred_type, 1);
+        assert_eq!(entries[1].hash, vec![0x22; 28]);
+        assert_eq!(entries[1].deposit, 2_000_000);
+        assert_eq!(entries[1].expiry_epoch, 500);
+        let (url, hash) = entries[1].anchor.as_ref().unwrap();
+        assert_eq!(url, "https://example.com/drep.json");
+        assert_eq!(hash, &vec![0x33; 32]);
+    }
+
+    #[test]
+    fn test_parse_drep_state_rejects_wrong_tag() {
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.array(2).unwrap();
+        enc.u32(1).unwrap(); // not MsgResult
+        enc.map(0).unwrap();
+        assert!(parse_drep_state(&buf).is_err());
+    }
+
+    // ── parse_drep_stake_distr ───────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_drep_stake_distr_key_and_predefined() {
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.array(2).unwrap();
+        enc.u32(4).unwrap();
+        enc.array(1).unwrap();
+        enc.map(3).unwrap();
+
+        // keyHash DRep with stake.
+        enc.array(2).unwrap();
+        enc.u8(0).unwrap();
+        enc.bytes(&[0xAB; 28]).unwrap();
+        enc.u64(1_234_567).unwrap();
+
+        // alwaysAbstain (array(1)[2]).
+        enc.array(1).unwrap();
+        enc.u8(2).unwrap();
+        enc.u64(42_000_000).unwrap();
+
+        // alwaysNoConfidence (array(1)[3]).
+        enc.array(1).unwrap();
+        enc.u8(3).unwrap();
+        enc.u64(7_000).unwrap();
+
+        let distr = parse_drep_stake_distr(&buf).unwrap();
+        assert_eq!(distr.len(), 3);
+        assert_eq!(distr[&(0u8, vec![0xAB; 28])], 1_234_567);
+        assert_eq!(distr[&(2u8, Vec::new())], 42_000_000);
+        assert_eq!(distr[&(3u8, Vec::new())], 7_000);
+    }
+
+    // ── parse_stake_pools_set ────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_stake_pools_with_and_without_set_tag() {
+        // MsgResult prefix: [4, array(1) HFC wrapper].
+        let mut prefix = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut prefix);
+        enc.array(2).unwrap();
+        enc.u32(4).unwrap();
+        enc.array(1).unwrap();
+
+        // Pool set payload: array(2)[bytes28, bytes28].
+        let mut payload = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut payload);
+        enc.array(2).unwrap();
+        enc.bytes(&[0x01; 28]).unwrap();
+        enc.bytes(&[0x02; 28]).unwrap();
+
+        // Without the CBOR set tag.
+        let plain: Vec<u8> = [prefix.clone(), payload.clone()].concat();
+        let pools = parse_stake_pools_set(&plain).unwrap();
+        assert_eq!(pools, vec![vec![0x01; 28], vec![0x02; 28]]);
+
+        // With tag(258) in front of the array
+        // (0xd9 0x01 0x02 is the two-byte-argument encoding of tag 258).
+        let tagged: Vec<u8> = [prefix, vec![0xd9, 0x01, 0x02], payload].concat();
+        let pools = parse_stake_pools_set(&tagged).unwrap();
+        assert_eq!(pools, vec![vec![0x01; 28], vec![0x02; 28]]);
+    }
+
+    // ── parse_cbor_nonce ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_cbor_nonce_forms() {
+        // NeutralNonce: array(1)[0] → 32 zero bytes.
+        let buf = [0x81u8, 0x00];
+        let mut d = minicbor::Decoder::new(&buf);
+        assert_eq!(parse_cbor_nonce(&mut d).unwrap(), [0u8; 32]);
+
+        // Nonce: array(2)[1, bytes32].
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.array(2).unwrap();
+        enc.u8(1).unwrap();
+        enc.bytes(&[0xCD; 32]).unwrap();
+        let mut d = minicbor::Decoder::new(&buf);
+        assert_eq!(parse_cbor_nonce(&mut d).unwrap(), [0xCD; 32]);
+
+        // Invalid: array(2)[0, ...] is neither form.
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.array(2).unwrap();
+        enc.u8(0).unwrap();
+        enc.bytes(&[0u8; 32]).unwrap();
+        let mut d = minicbor::Decoder::new(&buf);
+        assert!(parse_cbor_nonce(&mut d).is_err());
+    }
+
+    // ── load_drep_key_hash_from_envelope ─────────────────────────────────────
+
+    #[test]
+    fn test_load_drep_key_hash_wrapped_and_raw() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [0x42u8; 32];
+        let expected = dugite_primitives::hash::blake2b_224(&key)
+            .as_bytes()
+            .to_vec();
+
+        // 0x5820-wrapped form (what cardano-cli writes).
+        let wrapped = dir.path().join("drep-wrapped.vkey");
+        std::fs::write(
+            &wrapped,
+            serde_json::to_string(&serde_json::json!({
+                "type": "DRepVerificationKey_ed25519",
+                "description": "",
+                "cborHex": format!("5820{}", hex::encode(key))
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            load_drep_key_hash_from_envelope(&wrapped).unwrap(),
+            expected
+        );
+
+        // Raw 32-byte form (no CBOR wrapper) must hash identically.
+        let raw = dir.path().join("drep-raw.vkey");
+        std::fs::write(
+            &raw,
+            serde_json::to_string(&serde_json::json!({
+                "type": "DRepVerificationKey_ed25519",
+                "description": "",
+                "cborHex": hex::encode(key)
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(load_drep_key_hash_from_envelope(&raw).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_load_drep_key_hash_error_paths() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Missing cborHex.
+        let p = dir.path().join("no-hex.vkey");
+        std::fs::write(&p, r#"{"type": "DRepVerificationKey_ed25519"}"#).unwrap();
+        assert!(load_drep_key_hash_from_envelope(&p).is_err());
+
+        // Non-hex cborHex.
+        let p = dir.path().join("bad-hex.vkey");
+        std::fs::write(&p, r#"{"cborHex": "not hex"}"#).unwrap();
+        assert!(load_drep_key_hash_from_envelope(&p).is_err());
+
+        // Wrong key length (30 bytes).
+        let p = dir.path().join("short.vkey");
+        std::fs::write(
+            &p,
+            serde_json::to_string(&serde_json::json!({
+                "cborHex": hex::encode([0u8; 30])
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(load_drep_key_hash_from_envelope(&p).is_err());
+    }
+
+    // ── pool_id_from_cold_vkey ───────────────────────────────────────────────
+
+    #[test]
+    fn test_pool_id_from_cold_vkey_matches_blake2b224() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [0x7Fu8; 32];
+        let path = dir.path().join("cold.vkey");
+        std::fs::write(
+            &path,
+            serde_json::to_string(&serde_json::json!({
+                "type": "StakePoolVerificationKey_ed25519",
+                "description": "",
+                "cborHex": format!("5820{}", hex::encode(key))
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let pool_id = pool_id_from_cold_vkey(&path).unwrap();
+        assert_eq!(pool_id.len(), 56, "pool ID is 28 bytes = 56 hex chars");
+        assert_eq!(
+            pool_id,
+            hex::encode(dugite_primitives::hash::blake2b_224(&key).as_bytes())
+        );
+    }
+
+    #[test]
+    fn test_pool_id_from_cold_vkey_error_paths() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Missing cborHex.
+        let p = dir.path().join("no-hex.vkey");
+        std::fs::write(&p, r#"{"type": "StakePoolVerificationKey_ed25519"}"#).unwrap();
+        assert!(pool_id_from_cold_vkey(&p).is_err());
+
+        // Wrong key length (16 bytes, 0x50-wrapped).
+        let p = dir.path().join("short.vkey");
+        std::fs::write(
+            &p,
+            serde_json::to_string(&serde_json::json!({
+                "cborHex": format!("50{}", hex::encode([0u8; 16]))
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(pool_id_from_cold_vkey(&p).is_err());
+    }
+
+    // ── read_shelley_genesis ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_read_shelley_genesis_extracts_timing_params() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shelley-genesis.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string(&serde_json::json!({
+                "activeSlotsCoeff": 0.05,
+                "epochLength": 432000,
+                "slotLength": 1,
+                "systemStart": "2022-10-25T00:00:00Z",
+                "networkMagic": 2
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let params = read_shelley_genesis(&path).unwrap();
+        assert_eq!(params.active_slots_coeff, 0.05);
+        assert_eq!(params.epoch_length, 432000);
+        assert_eq!(params.slot_length, 1);
+        // 2022-10-25T00:00:00Z (preview system start).
+        assert_eq!(params.system_start_unix, 1666656000);
+    }
+
+    #[test]
+    fn test_read_shelley_genesis_error_paths() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Nonexistent file.
+        assert!(read_shelley_genesis(&dir.path().join("missing.json")).is_err());
+
+        // Invalid JSON.
+        let p = dir.path().join("bad.json");
+        std::fs::write(&p, "not json").unwrap();
+        assert!(read_shelley_genesis(&p).is_err());
+
+        // Missing activeSlotsCoeff.
+        let p = dir.path().join("no-coeff.json");
+        std::fs::write(
+            &p,
+            serde_json::to_string(&serde_json::json!({
+                "epochLength": 432000,
+                "slotLength": 1,
+                "systemStart": "2022-10-25T00:00:00Z"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(read_shelley_genesis(&p).is_err());
+
+        // Unparseable systemStart.
+        let p = dir.path().join("bad-start.json");
+        std::fs::write(
+            &p,
+            serde_json::to_string(&serde_json::json!({
+                "activeSlotsCoeff": 0.05,
+                "epochLength": 432000,
+                "slotLength": 1,
+                "systemStart": "October 25th, 2022"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(read_shelley_genesis(&p).is_err());
+    }
+
+    // ── print_utxo_result ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_print_utxo_result_rejects_wrong_tag() {
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.array(2).unwrap();
+        enc.u32(3).unwrap(); // not MsgResult
+        enc.map(0).unwrap();
+        let err = print_utxo_result(&buf).unwrap_err();
+        assert!(
+            err.to_string().contains("Expected MsgResult tag 4"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_print_utxo_result_parses_post_alonzo_entries() {
+        // MsgResult [4, [ {[txhash, ix]: {0: addr, 1: coin}} ]] with one
+        // ADA-only output and one multi-asset output — both value shapes the
+        // parser must handle.
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.array(2).unwrap();
+        enc.u32(4).unwrap();
+        enc.array(1).unwrap(); // HFC success wrapper
+        enc.map(2).unwrap();
+
+        // Entry 1: ADA-only.
+        enc.array(2).unwrap();
+        enc.bytes(&[0xAA; 32]).unwrap();
+        enc.u32(0).unwrap();
+        enc.map(2).unwrap();
+        enc.u32(0).unwrap();
+        enc.bytes(&[0x01; 29]).unwrap(); // address
+        enc.u32(1).unwrap();
+        enc.u64(5_000_000).unwrap(); // plain coin
+
+        // Entry 2: multi-asset value [coin, {policy: {name: qty}}].
+        enc.array(2).unwrap();
+        enc.bytes(&[0xBB; 32]).unwrap();
+        enc.u32(1).unwrap();
+        enc.map(2).unwrap();
+        enc.u32(0).unwrap();
+        enc.bytes(&[0x02; 29]).unwrap();
+        enc.u32(1).unwrap();
+        enc.array(2).unwrap();
+        enc.u64(2_000_000).unwrap();
+        enc.map(1).unwrap();
+        enc.bytes(&[0x03; 28]).unwrap(); // policy id
+        enc.map(1).unwrap();
+        enc.bytes(b"token").unwrap();
+        enc.u64(9).unwrap();
+
+        // The full nested structure must decode without error.
+        print_utxo_result(&buf).unwrap();
+    }
 }

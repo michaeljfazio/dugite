@@ -577,4 +577,341 @@ mod tests {
             "counter must advance from 5 to 6"
         );
     }
+
+    // ── issue_op_cert: certificate structure + signature ─────────────────────
+
+    /// The issued opcert must decode as array(2)[array(4)[kes_vkey, seq, period,
+    /// sig], cold_vkey] and the signature must verify with the cold key over
+    /// the shared OCertSignable byte layout. This is what a Haskell node checks
+    /// when the certificate is presented in a block header.
+    #[test]
+    fn test_issue_op_cert_cbor_structure_and_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let cold_sk_path = dir.path().join("cold.skey");
+        let kes_vk_path = dir.path().join("kes.vkey");
+        let counter_path = dir.path().join("counter.json");
+        let opcert_path = dir.path().join("opcert.json");
+
+        let cold_sk = dugite_crypto::keys::PaymentSigningKey::generate();
+        let cold_vk = cold_sk.verification_key();
+        let sk_json = serde_json::json!({
+            "type": "StakePoolSigningKey_ed25519",
+            "description": "",
+            "cborHex": hex::encode(simple_cbor_wrap(&cold_sk.to_bytes()))
+        });
+        std::fs::write(&cold_sk_path, serde_json::to_string(&sk_json).unwrap()).unwrap();
+
+        let (_, kes_vk_json, kes_pk_bytes) = make_kes_key_pair();
+        std::fs::write(&kes_vk_path, &kes_vk_json).unwrap();
+
+        let mut counter_cbor = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut counter_cbor);
+        enc.array(2).unwrap();
+        enc.u64(3).unwrap();
+        enc.bytes(&simple_cbor_wrap(&cold_vk.to_bytes())).unwrap();
+        let counter_env = serde_json::json!({
+            "type": "NodeOperationalCertificateIssueCounter",
+            "description": "Next certificate issue number: 3",
+            "cborHex": hex::encode(&counter_cbor)
+        });
+        std::fs::write(&counter_path, serde_json::to_string(&counter_env).unwrap()).unwrap();
+
+        issue_op_cert(&kes_vk_path, &cold_sk_path, &counter_path, 17, &opcert_path).unwrap();
+
+        let env: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&opcert_path).unwrap()).unwrap();
+        let opcert_cbor = hex::decode(env["cborHex"].as_str().unwrap()).unwrap();
+
+        let mut d = minicbor::Decoder::new(&opcert_cbor);
+        assert_eq!(d.array().unwrap(), Some(2), "opcert must be array(2)");
+        assert_eq!(d.array().unwrap(), Some(4), "ocert body must be array(4)");
+        let hot_vkey = d.bytes().unwrap();
+        assert_eq!(
+            hot_vkey,
+            kes_pk_bytes.as_slice(),
+            "hot vkey must be the KES vkey"
+        );
+        let seq = d.u64().unwrap();
+        assert_eq!(seq, 3, "sequence number must be the pre-increment counter");
+        let period = d.u64().unwrap();
+        assert_eq!(period, 17);
+        let sig = d.bytes().unwrap().to_vec();
+        assert_eq!(sig.len(), 64, "Ed25519 signature is 64 bytes");
+        let embedded_cold_vk = d.bytes().unwrap();
+        assert_eq!(embedded_cold_vk, cold_vk.to_bytes().as_slice());
+
+        // Signature must verify over the canonical OCertSignable layout.
+        let signable = dugite_crypto::ocert::ocert_signable_bytes(&kes_pk_bytes, 3, 17);
+        cold_vk
+            .verify(&signable, &sig)
+            .expect("opcert signature must verify with the cold verification key");
+    }
+
+    // ── issue_op_cert error paths ────────────────────────────────────────────
+
+    #[test]
+    fn test_issue_op_cert_missing_kes_cbor_hex_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let kes_vk_path = dir.path().join("kes.vkey");
+        let cold_sk_path = dir.path().join("cold.skey");
+        let counter_path = dir.path().join("counter.json");
+        let opcert_path = dir.path().join("opcert.json");
+
+        // KES envelope with no cborHex field at all.
+        std::fs::write(
+            &kes_vk_path,
+            r#"{"type": "KesVerificationKey_ed25519_kes_2^6"}"#,
+        )
+        .unwrap();
+        let (cold_sk, _) = make_cold_key_pair();
+        std::fs::write(&cold_sk_path, &cold_sk).unwrap();
+        std::fs::write(&counter_path, r#"{"cborHex": "8200"}"#).unwrap();
+
+        let result = issue_op_cert(&kes_vk_path, &cold_sk_path, &counter_path, 0, &opcert_path);
+        assert!(result.is_err(), "missing cborHex in KES vkey must error");
+        assert!(
+            !opcert_path.exists(),
+            "no certificate may be written on failure"
+        );
+    }
+
+    #[test]
+    fn test_issue_op_cert_nonexistent_counter_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let kes_vk_path = dir.path().join("kes.vkey");
+        let cold_sk_path = dir.path().join("cold.skey");
+        let opcert_path = dir.path().join("opcert.json");
+
+        let (cold_sk, _) = make_cold_key_pair();
+        let (_, kes_vk, _) = make_kes_key_pair();
+        std::fs::write(&cold_sk_path, &cold_sk).unwrap();
+        std::fs::write(&kes_vk_path, &kes_vk).unwrap();
+
+        let result = issue_op_cert(
+            &kes_vk_path,
+            &cold_sk_path,
+            &dir.path().join("missing-counter.json"),
+            0,
+            &opcert_path,
+        );
+        assert!(result.is_err(), "nonexistent counter file must error");
+    }
+
+    #[test]
+    fn test_issue_op_cert_truncated_cold_key_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let kes_vk_path = dir.path().join("kes.vkey");
+        let cold_sk_path = dir.path().join("cold.skey");
+        let counter_path = dir.path().join("counter.json");
+        let opcert_path = dir.path().join("opcert.json");
+
+        let (_, kes_vk, _) = make_kes_key_pair();
+        std::fs::write(&kes_vk_path, &kes_vk).unwrap();
+        // 16-byte cold key payload — invalid for Ed25519.
+        let bad_sk = serde_json::json!({
+            "type": "StakePoolSigningKey_ed25519",
+            "description": "",
+            "cborHex": format!("5810{}", hex::encode([0u8; 16]))
+        });
+        std::fs::write(&cold_sk_path, serde_json::to_string(&bad_sk).unwrap()).unwrap();
+        std::fs::write(&counter_path, r#"{"cborHex": "8200"}"#).unwrap();
+
+        let result = issue_op_cert(&kes_vk_path, &cold_sk_path, &counter_path, 0, &opcert_path);
+        assert!(result.is_err(), "truncated cold key must error");
+    }
+
+    // ── NodeCmd::run key generation paths ────────────────────────────────────
+
+    #[test]
+    fn test_run_key_gen_writes_cold_keys_and_counter() {
+        let dir = tempfile::tempdir().unwrap();
+        let vk_path = dir.path().join("cold.vkey");
+        let sk_path = dir.path().join("cold.skey");
+        let counter_path = dir.path().join("counter.json");
+
+        NodeCmd {
+            command: NodeSubcommand::KeyGen {
+                cold_verification_key_file: vk_path.clone(),
+                cold_signing_key_file: sk_path.clone(),
+                operational_certificate_counter_file: counter_path.clone(),
+            },
+        }
+        .run()
+        .unwrap();
+
+        let vk_env: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&vk_path).unwrap()).unwrap();
+        let sk_env: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&sk_path).unwrap()).unwrap();
+        assert_eq!(vk_env["type"], "StakePoolVerificationKey_ed25519");
+        assert_eq!(sk_env["type"], "StakePoolSigningKey_ed25519");
+
+        // The written signing key must derive the written verification key.
+        let sk_cbor = hex::decode(sk_env["cborHex"].as_str().unwrap()).unwrap();
+        let vk_cbor = hex::decode(vk_env["cborHex"].as_str().unwrap()).unwrap();
+        let sk = dugite_crypto::keys::PaymentSigningKey::from_bytes(&sk_cbor[2..]).unwrap();
+        assert_eq!(
+            sk.verification_key().to_bytes().as_slice(),
+            &vk_cbor[2..],
+            "cold vkey file must match the cold skey file"
+        );
+
+        // Counter: array(2)[0, bytes(cbor-wrapped vkey)] with the vkey embedded.
+        let counter_env: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&counter_path).unwrap()).unwrap();
+        assert_eq!(
+            counter_env["type"],
+            "NodeOperationalCertificateIssueCounter"
+        );
+        let counter_cbor = hex::decode(counter_env["cborHex"].as_str().unwrap()).unwrap();
+        let mut d = minicbor::Decoder::new(&counter_cbor);
+        assert_eq!(d.array().unwrap(), Some(2));
+        assert_eq!(d.u64().unwrap(), 0, "fresh counter must start at 0");
+        assert_eq!(
+            d.bytes().unwrap(),
+            vk_cbor.as_slice(),
+            "counter must embed the cold vkey CBOR"
+        );
+    }
+
+    #[test]
+    fn test_run_key_gen_kes_envelope_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let vk_path = dir.path().join("kes.vkey");
+        let sk_path = dir.path().join("kes.skey");
+
+        NodeCmd {
+            command: NodeSubcommand::KeyGenKes {
+                verification_key_file: vk_path.clone(),
+                signing_key_file: sk_path.clone(),
+            },
+        }
+        .run()
+        .unwrap();
+
+        let vk_env: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&vk_path).unwrap()).unwrap();
+        let sk_env: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&sk_path).unwrap()).unwrap();
+        assert_eq!(vk_env["type"], "KesVerificationKey_ed25519_kes_2^6");
+        assert_eq!(sk_env["type"], "KesSigningKey_ed25519_kes_2^6");
+        // vkey: 32 bytes → 5820; skey: 612 bytes (Sum6Kes) → 590264.
+        assert!(vk_env["cborHex"].as_str().unwrap().starts_with("5820"));
+        assert!(sk_env["cborHex"].as_str().unwrap().starts_with("590264"));
+    }
+
+    #[test]
+    fn test_run_key_gen_vrf_envelope_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let vk_path = dir.path().join("vrf.vkey");
+        let sk_path = dir.path().join("vrf.skey");
+
+        NodeCmd {
+            command: NodeSubcommand::KeyGenVrf {
+                verification_key_file: vk_path.clone(),
+                signing_key_file: sk_path.clone(),
+            },
+        }
+        .run()
+        .unwrap();
+
+        let vk_env: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&vk_path).unwrap()).unwrap();
+        let sk_env: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&sk_path).unwrap()).unwrap();
+        assert_eq!(vk_env["type"], "VrfVerificationKey_PraosVRF");
+        assert_eq!(sk_env["type"], "VrfSigningKey_PraosVRF");
+        assert!(vk_env["cborHex"].as_str().unwrap().starts_with("5820"));
+        assert!(sk_env["cborHex"].as_str().unwrap().starts_with("5820"));
+    }
+
+    // ── NewCounter ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_run_new_counter_writes_requested_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let vk_path = dir.path().join("cold.vkey");
+        let counter_path = dir.path().join("counter.json");
+
+        let (_, cold_vk) = make_cold_key_pair();
+        std::fs::write(&vk_path, &cold_vk).unwrap();
+
+        NodeCmd {
+            command: NodeSubcommand::NewCounter {
+                cold_verification_key_file: vk_path.clone(),
+                counter_value: 42,
+                operational_certificate_counter_file: counter_path.clone(),
+            },
+        }
+        .run()
+        .unwrap();
+
+        let env: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&counter_path).unwrap()).unwrap();
+        assert_eq!(env["type"], "NodeOperationalCertificateIssueCounter");
+        assert_eq!(
+            env["description"].as_str().unwrap(),
+            "Next certificate issue number: 42"
+        );
+
+        let cbor = hex::decode(env["cborHex"].as_str().unwrap()).unwrap();
+        let mut d = minicbor::Decoder::new(&cbor);
+        assert_eq!(d.array().unwrap(), Some(2));
+        assert_eq!(d.u64().unwrap(), 42, "counter CBOR must carry the value");
+        // The embedded bytes must be the vkey file's cborHex bytes.
+        let vk_env: serde_json::Value = serde_json::from_str(&cold_vk).unwrap();
+        let vk_cbor = hex::decode(vk_env["cborHex"].as_str().unwrap()).unwrap();
+        assert_eq!(d.bytes().unwrap(), vk_cbor.as_slice());
+    }
+
+    #[test]
+    fn test_run_new_counter_missing_cbor_hex_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let vk_path = dir.path().join("cold.vkey");
+        let counter_path = dir.path().join("counter.json");
+        std::fs::write(&vk_path, r#"{"type": "StakePoolVerificationKey_ed25519"}"#).unwrap();
+
+        let result = NodeCmd {
+            command: NodeSubcommand::NewCounter {
+                cold_verification_key_file: vk_path,
+                counter_value: 1,
+                operational_certificate_counter_file: counter_path.clone(),
+            },
+        }
+        .run();
+        assert!(result.is_err(), "missing cborHex must error");
+        assert!(!counter_path.exists(), "no counter file on failure");
+    }
+
+    // ── KeyHashVrf error paths ───────────────────────────────────────────────
+
+    #[test]
+    fn test_run_key_hash_vrf_missing_cbor_hex_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let vk_path = dir.path().join("vrf.vkey");
+        std::fs::write(&vk_path, r#"{"type": "VrfVerificationKey_PraosVRF"}"#).unwrap();
+
+        let result = NodeCmd {
+            command: NodeSubcommand::KeyHashVrf {
+                verification_key_file: vk_path,
+            },
+        }
+        .run();
+        assert!(result.is_err(), "missing cborHex must error");
+    }
+
+    #[test]
+    fn test_run_key_hash_vrf_bad_hex_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let vk_path = dir.path().join("vrf.vkey");
+        std::fs::write(&vk_path, r#"{"cborHex": "xyz"}"#).unwrap();
+
+        let result = NodeCmd {
+            command: NodeSubcommand::KeyHashVrf {
+                verification_key_file: vk_path,
+            },
+        }
+        .run();
+        assert!(result.is_err(), "non-hex cborHex must error");
+    }
 }
