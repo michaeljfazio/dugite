@@ -45,7 +45,23 @@ pub enum ImmutableDBError {
     Io(#[from] std::io::Error),
     #[error("Malformed secondary index entry in chunk {chunk}: {reason}")]
     MalformedSecondaryEntry { chunk: u64, reason: String },
+    #[error(
+        "inconsistent chunk {chunk:05} in ImmutableDB: {reason}. Refusing to \
+         open with a hole below the tip (issues #926/#928) — restore the \
+         damaged chunk (e.g. `dugite-node mithril-import`) or remove the \
+         damaged chunk files manually"
+    )]
+    InconsistentChunk { chunk: u64, reason: String },
 }
+
+/// Clean-shutdown marker file name (issue #928).
+///
+/// Present iff the last write session ended with a graceful [`ImmutableDB::flush`].
+/// Removed when the DB is opened for writing (entering write mode means the
+/// on-disk state is no longer known-clean until the next flush). Its absence
+/// at open forces a rebuild of the persistent mmap hash index, whose entries
+/// can otherwise reflect torn OS page writeback from a killed process.
+const CLEAN_MARKER: &str = "clean";
 
 /// Read a big-endian u64 from an 8-byte slice without panicking.
 ///
@@ -73,6 +89,15 @@ struct ActiveChunk {
     /// Absolute slot number of this epoch's first slot (for relative slot calc).
     first_slot_of_epoch: u64,
     chunk_file: std::io::BufWriter<std::fs::File>,
+    /// Incrementally-appended on-disk secondary index (issue #926).
+    ///
+    /// Every `append_block` writes the 56-byte entry here immediately
+    /// (unbuffered — one small syscall per block, alongside the block
+    /// write). Haskell's ImmutableDB appends its index files per block the
+    /// same way; keeping the index memory-only until flush() is what lost
+    /// ten hours of index in the 2026-07-28 incident. A crash now loses at
+    /// most the OS-buffered tail, which open-time reconciliation truncates.
+    secondary_file: std::fs::File,
     secondary_entries: Vec<SecondaryEntry>,
     current_offset: u64,
     /// In-memory block data for the active chunk (not yet readable via memmap).
@@ -272,14 +297,13 @@ impl ImmutableDB {
     /// hash index for O(1) block lookups. For preview (~4M blocks) this
     /// uses ~300 MB of memory; mainnet will need an on-disk index.
     ///
-    /// After building the index, validates the most recent chunk to detect
-    /// partial writes or corruption from an unclean shutdown. Corrupt entries
-    /// at the tail of the last chunk are truncated so the database is always
-    /// in a consistent state before use.
+    /// Opening reconciles every chunk's index against its data first
+    /// (issues #926/#928, see [`Self::reconcile_chunks_on_disk`]): crash
+    /// damage at the chain tail is repaired on disk (truncated/quarantined,
+    /// like Haskell's ImmutableDB open-time validation), and damage below
+    /// the tail refuses to open rather than serving a chain with a hole.
     pub fn open(dir: &Path) -> Result<Self, ImmutableDBError> {
-        let mut db = Self::open_with_config(dir, &ImmutableConfig::default())?;
-        db.validate_most_recent_chunk()?;
-        Ok(db)
+        Self::open_with_config(dir, &ImmutableConfig::default())
     }
 
     /// Open an ImmutableDB from a directory of chunk files with the given config.
@@ -288,6 +312,10 @@ impl ImmutableDB {
         config: &ImmutableConfig,
     ) -> Result<Self, ImmutableDBError> {
         debug!(dir = %dir.display(), index_type = ?config.index_type, "Opening ImmutableDB");
+
+        // #926/#928: make on-disk state self-consistent (or refuse) before
+        // the scan below trusts any of it.
+        Self::reconcile_chunks_on_disk(dir)?;
 
         let mut chunk_nums = Vec::new();
         for entry in fs::read_dir(dir)? {
@@ -453,9 +481,24 @@ impl ImmutableDB {
                 BlockIndex::InMemory(idx)
             }
             crate::config::BlockIndexType::Mmap => {
-                // Try to reuse existing mmap file if count matches
+                // Reuse the existing mmap file only when the entry count
+                // matches AND the last write session shut down cleanly.
+                // After an unclean stop, mmap pages may have hit disk via OS
+                // writeback in any order (issue #928): a stale index can
+                // claim blocks no secondary entry backs, miss blocks, or
+                // point at reconciled-away offsets — and the count gate
+                // alone cannot see that. Rebuilding from the just-scanned
+                // secondary entries restores ground truth.
+                let clean_shutdown = dir.join(CLEAN_MARKER).exists();
                 let mmap_path = dir.join("hash_index.dat");
-                let reuse = if mmap_path.exists() {
+                let reuse = if mmap_path.exists() && !clean_shutdown {
+                    warn!(
+                        "ImmutableDB: unclean shutdown detected (no clean \
+                         marker) — rebuilding mmap block index from secondary \
+                         entries (#928)"
+                    );
+                    None
+                } else if mmap_path.exists() {
                     match crate::block_index::MmapBlockIndex::new(dir, config.mmap_load_factor) {
                         Ok(idx) if idx.count_matches(total_blocks) => {
                             debug!("Reusing existing mmap block index");
@@ -493,10 +536,60 @@ impl ImmutableDB {
             "ImmutableDB opened"
         );
 
-        // Try to read persisted tip metadata (block_no not in secondary index)
-        let tip_block_no = Self::read_tip_meta(dir)
-            .map(|(_, _, bn)| bn)
-            .unwrap_or(total_blocks);
+        // tip.meta carries the tip block_no (not stored in secondary
+        // entries) — but it is trusted ONLY when its (slot, hash) agree with
+        // the last indexed entry (#928). In the 2026-07-28 incident a stale
+        // tip.meta claimed a tip 38k slots past the indexed chain, seeding
+        // `last_flushed_block_no` so the flusher believed blocks were
+        // flushed that no index backed. On disagreement the indexed chain
+        // wins: recover the block_no from the tip block itself and rewrite
+        // tip.meta.
+        let tip_block_no = match Self::read_tip_meta(dir) {
+            Some((meta_slot, meta_hash, meta_bn))
+                if meta_slot == tip_slot && meta_hash == tip_hash =>
+            {
+                meta_bn
+            }
+            Some((meta_slot, meta_hash, meta_bn)) if total_blocks > 0 => {
+                let recovered = block_index
+                    .lookup(&tip_hash)
+                    .and_then(|loc| {
+                        Self::read_range_std(dir, loc.chunk_num, loc.block_offset, loc.block_end)
+                    })
+                    .and_then(|cbor| {
+                        dugite_serialization::extract_block_identity(&cbor)
+                            .ok()
+                            .map(|(_, bn, _)| bn.0)
+                    });
+                let clamped_bn = recovered.unwrap_or(total_blocks);
+                warn!(
+                    meta_slot,
+                    meta_hash = %meta_hash.to_hex(),
+                    meta_block_no = meta_bn,
+                    indexed_slot = tip_slot,
+                    indexed_hash = %tip_hash.to_hex(),
+                    clamped_block_no = clamped_bn,
+                    block_no_recovered_by_decode = recovered.is_some(),
+                    "ImmutableDB: tip.meta disagrees with the indexed chain — \
+                     preferring the indexed chain and rewriting tip.meta (#928)"
+                );
+                if let Err(e) = Self::write_tip_meta(dir, tip_slot, &tip_hash, clamped_bn) {
+                    warn!(error = %e, "ImmutableDB: failed to rewrite clamped tip.meta");
+                }
+                clamped_bn
+            }
+            Some(_) => {
+                // Stale tip.meta over an empty DB (everything reconciled
+                // away): drop it so nothing downstream trusts it.
+                warn!(
+                    "ImmutableDB: removing stale tip.meta over an empty \
+                     database (#928)"
+                );
+                let _ = fs::remove_file(dir.join("tip.meta"));
+                0
+            }
+            None => total_blocks,
+        };
 
         Ok(ImmutableDB {
             dir: dir.to_path_buf(),
@@ -511,179 +604,461 @@ impl ImmutableDB {
         })
     }
 
-    /// Validate the most recent (last) finalized chunk on disk.
+    /// Reconcile every on-disk chunk's secondary index against its data
+    /// before the open scan trusts either (issues #926/#928).
     ///
-    /// Reads the secondary index for the last chunk and checks the CRC32
-    /// of each block entry.  Any entries whose CRC32 does not match are
-    /// assumed to result from a partial write during an unclean shutdown.
+    /// Policy (mirrors Haskell `ImmutableDB.Impl.Validation`, where chunk
+    /// files are the source of truth and validation always repairs or
+    /// truncates to a definite, validated tip — never a silent skip):
     ///
-    /// When corrupt entries are found at the END of the chunk, the method:
-    /// 1. Truncates the chunk file to exclude the corrupt entries.
-    /// 2. Rewrites the secondary index without those entries.
-    /// 3. Updates in-memory state (block index, checksums, tip) accordingly.
+    /// - **Tail (highest-numbered) chunk** — full CRC verification of every
+    ///   entry against the chunk bytes, with the last entry's true block end
+    ///   recovered by CRC scan (the index stores offsets only). Invalid
+    ///   entries and un-indexed data beyond the valid prefix are physically
+    ///   truncated; the lost blocks are re-fetched by normal sync. A
+    ///   non-empty tail chunk whose index verifies NOTHING is quarantined:
+    ///   the data file is renamed to `.chunk.orphaned` (preserved for
+    ///   forensics, out of the writer's namespace) and its indexes removed.
+    ///   This is precisely the 2026-07-28 incident state — previously the
+    ///   chunk was silently skipped and `open_for_writing` then reused its
+    ///   number, `File::create` truncating live finalized-chain data.
+    /// - **Body (non-tail) chunks** — cheap structural checks only (whole
+    ///   56-byte entries, offsets strictly increasing and in-bounds). Any
+    ///   violation is a hard [`ImmutableDBError::InconsistentChunk`]: a
+    ///   damaged chunk below the tip means the served chain would have a
+    ///   hole below the claimed tip, and per the crash-don't-diverge policy
+    ///   dugite refuses to run in that state. (Read-time CRC verification
+    ///   in `get_block` still guards block content.)
+    /// - A `.secondary` without its `.chunk` is warned about and ignored;
+    ///   empty (0-byte) chunk artifacts from a previous open are removed.
+    fn reconcile_chunks_on_disk(dir: &Path) -> Result<(), ImmutableDBError> {
+        let mut chunk_nums = Vec::new();
+        let mut secondary_nums = Vec::new();
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if let Some(num_str) = name_str.strip_suffix(".chunk") {
+                if let Ok(num) = num_str.parse::<u64>() {
+                    chunk_nums.push(num);
+                }
+            } else if let Some(num_str) = name_str.strip_suffix(".secondary") {
+                if let Ok(num) = num_str.parse::<u64>() {
+                    secondary_nums.push(num);
+                }
+            }
+        }
+        chunk_nums.sort();
+
+        for &num in &secondary_nums {
+            if !chunk_nums.contains(&num) {
+                warn!(
+                    chunk = num,
+                    "ImmutableDB: secondary index without a chunk data file — ignoring"
+                );
+            }
+        }
+
+        // Tail-grade reconciliation cascades downward: when the tail chunk
+        // is removed entirely (empty open artifact, quarantined orphan), the
+        // next chunk down becomes the data tail and gets the same full CRC
+        // treatment — a crash during a previous open's own reconciliation
+        // must not leave the true tail with only body-grade checks. Pristine
+        // finalized chunks make this cheap (one chunk read per cascade step,
+        // and the cascade only continues while chunks are being removed).
+        while let Some(&tail) = chunk_nums.last() {
+            if Self::reconcile_tail_chunk(dir, tail)? {
+                chunk_nums.pop();
+                continue;
+            }
+            break;
+        }
+        if chunk_nums.is_empty() {
+            return Ok(());
+        }
+        for &num in &chunk_nums[..chunk_nums.len() - 1] {
+            Self::check_body_chunk(dir, num)?;
+        }
+
+        // Cross-chunk chain linkage (#926/#928): per-chunk validation cannot
+        // see a hole BETWEEN chunks — the incident DB's chunk 05919 carried
+        // 12 internally-CRC-valid entries while 38k slots below them were
+        // missing, and tip.meta agreed with the orphan island, so every
+        // per-chunk check passed. Haskell's validateChunk throws
+        // ChunkFileDoesntFit when a chunk's first block does not chain onto
+        // the previous chunk's tip; this is the dugite equivalent.
+        Self::check_chunk_boundaries(dir, |cbor| {
+            dugite_serialization::decode_block_minimal(cbor)
+                .ok()
+                .map(|b| *b.prev_hash().as_bytes())
+        })
+    }
+
+    /// Verify that each indexed chunk's first block chains (prev_hash) onto
+    /// the previous chunk's last indexed block.
     ///
-    /// Corrupt entries in the *middle* of the chunk (i.e. with valid entries
-    /// after them) are unusual and indicate hardware failure.  In that case
-    /// the corrupt block is removed from the index so reads don't surface it,
-    /// but the file is not truncated (truncating would discard later valid
-    /// data).  A `warn!` is emitted for diagnostic purposes.
+    /// - Mismatch at the TAIL boundary: the tail chunk is an orphan island
+    ///   above a hole — quarantine it (bounded loss; the tip falls back to
+    ///   the previous chunk and sync re-fetches forward). This automates the
+    ///   2026-07-28 incident recovery.
+    /// - Mismatch deeper in the chain: hard error. Auto-truncating from a
+    ///   deep break would discard an unbounded amount of chain; the operator
+    ///   chooses (usually `mithril-import`).
+    /// - A first block the decoder cannot read (e.g. an era gap) skips the
+    ///   check with a warning — never destroy data on a decoder limitation.
     ///
-    /// Legacy entries with CRC32 == 0 are skipped (no checksum to verify).
-    pub fn validate_most_recent_chunk(&mut self) -> Result<(), ImmutableDBError> {
-        let last_chunk = match self.chunks.last().cloned() {
-            Some(c) => c,
-            None => return Ok(()), // Nothing to validate
+    /// `decode_prev_hash` is injected so tests can exercise the policy
+    /// without crafting real decodable blocks; production passes
+    /// `decode_block_minimal`.
+    fn check_chunk_boundaries<F>(dir: &Path, decode_prev_hash: F) -> Result<(), ImmutableDBError>
+    where
+        F: Fn(&[u8]) -> Option<[u8; 32]>,
+    {
+        // Re-list: the per-chunk passes above may have quarantined the tail.
+        let mut nums: Vec<u64> = Vec::new();
+        for entry in fs::read_dir(dir)? {
+            let name = entry?.file_name();
+            let name_str = name.to_string_lossy();
+            if let Some(num_str) = name_str.strip_suffix(".chunk") {
+                if let Ok(num) = num_str.parse::<u64>() {
+                    if dir.join(format!("{num:05}.secondary")).exists() {
+                        nums.push(num);
+                    }
+                }
+            }
+        }
+        nums.sort();
+
+        for w in nums.windows(2) {
+            let (prev, next) = (w[0], w[1]);
+            let prev_entries =
+                Self::read_secondary_entries(&dir.join(format!("{prev:05}.secondary")))?;
+            let next_entries =
+                Self::read_secondary_entries(&dir.join(format!("{next:05}.secondary")))?;
+            let (Some(&(_, _, prev_tip_hash)), Some(&(first_off, first_crc, _))) =
+                (prev_entries.last(), next_entries.first())
+            else {
+                continue; // empty artifacts — nothing to link
+            };
+
+            // First block of `next`: its end is the second entry's offset,
+            // or (single-entry chunk) recovered by CRC scan.
+            let first_end = if let Some(&(second_off, _, _)) = next_entries.get(1) {
+                second_off
+            } else {
+                let chunk_data = fs::read(dir.join(format!("{next:05}.chunk")))?;
+                match Self::find_last_entry_end(&chunk_data, first_off as usize, first_crc) {
+                    Some(e) => e as u64,
+                    None => continue, // tail chunk already reconciled; be lenient
+                }
+            };
+            let Some(first_block) = Self::read_range_std(dir, next, first_off, first_end) else {
+                continue;
+            };
+
+            let Some(prev_hash) = decode_prev_hash(&first_block) else {
+                warn!(
+                    chunk = next,
+                    "ImmutableDB: cannot decode the chunk's first block to \
+                     verify chain linkage — skipping the boundary check"
+                );
+                continue;
+            };
+
+            if prev_hash == prev_tip_hash {
+                continue;
+            }
+
+            let is_tail = next == *nums.last().unwrap();
+            if is_tail {
+                let chunk_len = dir
+                    .join(format!("{next:05}.chunk"))
+                    .metadata()
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                warn!(
+                    prev_chunk = prev,
+                    prev_tip_hash = %Hash32::from_bytes(prev_tip_hash).to_hex(),
+                    first_block_prev_hash = %Hash32::from_bytes(prev_hash).to_hex(),
+                    "ImmutableDB: tail chunk does not chain onto the previous \
+                     chunk — quarantining the orphan island above the hole (#926)"
+                );
+                Self::quarantine_tail_chunk(
+                    dir,
+                    next,
+                    chunk_len,
+                    "first block does not chain onto the previous chunk's tip",
+                )?;
+                return Ok(());
+            }
+            return Err(ImmutableDBError::InconsistentChunk {
+                chunk: next,
+                reason: format!(
+                    "first block's prev_hash {} does not chain onto chunk \
+                     {prev:05}'s tip {} — the chain has a hole below the tail",
+                    Hash32::from_bytes(prev_hash).to_hex(),
+                    Hash32::from_bytes(prev_tip_hash).to_hex()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Parse a secondary index file into `(block_offset, crc, header_hash)`
+    /// triples (whole entries only).
+    fn read_secondary_entries(path: &Path) -> Result<Vec<(u64, u32, [u8; 32])>, ImmutableDBError> {
+        let data = fs::read(path)?;
+        let mut out = Vec::with_capacity(data.len() / SECONDARY_ENTRY_SIZE);
+        let mut pos = 0;
+        while pos + SECONDARY_ENTRY_SIZE <= data.len() {
+            let e = &data[pos..pos + SECONDARY_ENTRY_SIZE];
+            let offset = read_be_u64(&e[0..8]).unwrap_or(u64::MAX);
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&e[16..48]);
+            out.push((offset, read_crc32_from_entry(e), hash));
+            pos += SECONDARY_ENTRY_SIZE;
+        }
+        Ok(out)
+    }
+
+    /// Structural check for a non-tail chunk (no data read; see
+    /// [`Self::reconcile_chunks_on_disk`] for policy).
+    fn check_body_chunk(dir: &Path, num: u64) -> Result<(), ImmutableDBError> {
+        let chunk_path = dir.join(format!("{num:05}.chunk"));
+        let secondary_path = dir.join(format!("{num:05}.secondary"));
+        let chunk_len = chunk_path.metadata()?.len();
+
+        if chunk_len == 0 {
+            // Empty artifact from a prior `open_for_writing` — harmless.
+            return Ok(());
+        }
+        if !secondary_path.exists() {
+            return Err(ImmutableDBError::InconsistentChunk {
+                chunk: num,
+                reason: format!(
+                    "chunk data present ({chunk_len} bytes) but its secondary \
+                     index is missing below the chain tail"
+                ),
+            });
+        }
+        let secondary_data = fs::read(&secondary_path)?;
+        if secondary_data.is_empty() || secondary_data.len() % SECONDARY_ENTRY_SIZE != 0 {
+            return Err(ImmutableDBError::InconsistentChunk {
+                chunk: num,
+                reason: format!(
+                    "secondary index is empty or torn ({} bytes) below the chain tail",
+                    secondary_data.len()
+                ),
+            });
+        }
+        let mut prev_offset: Option<u64> = None;
+        let mut pos = 0;
+        while pos + SECONDARY_ENTRY_SIZE <= secondary_data.len() {
+            let offset = read_be_u64(&secondary_data[pos..pos + 8]).unwrap_or(u64::MAX);
+            if offset >= chunk_len || prev_offset.is_some_and(|p| offset <= p) {
+                return Err(ImmutableDBError::InconsistentChunk {
+                    chunk: num,
+                    reason: format!(
+                        "secondary entry at byte {pos} has block offset {offset} \
+                         (chunk is {chunk_len} bytes, previous offset {prev_offset:?})"
+                    ),
+                });
+            }
+            prev_offset = Some(offset);
+            pos += SECONDARY_ENTRY_SIZE;
+        }
+        Ok(())
+    }
+
+    /// Full CRC reconciliation + on-disk repair for the tail chunk (see
+    /// [`Self::reconcile_chunks_on_disk`] for policy).
+    ///
+    /// Returns `true` when the chunk no longer exists afterwards (removed
+    /// empty artifact or quarantined) — the caller then treats the next
+    /// chunk down as the tail and reconciles it too.
+    fn reconcile_tail_chunk(dir: &Path, num: u64) -> Result<bool, ImmutableDBError> {
+        let chunk_path = dir.join(format!("{num:05}.chunk"));
+        let secondary_path = dir.join(format!("{num:05}.secondary"));
+        let primary_path = dir.join(format!("{num:05}.primary"));
+        let chunk_len = chunk_path.metadata()?.len();
+
+        let secondary_data = if secondary_path.exists() {
+            fs::read(&secondary_path)?
+        } else {
+            Vec::new()
         };
 
-        let chunk_path = self.dir.join(format!("{:05}.chunk", last_chunk.chunk_num));
-        let secondary_path = self
-            .dir
-            .join(format!("{:05}.secondary", last_chunk.chunk_num));
-
-        // If either file is missing, nothing to do (can happen on first run)
-        if !chunk_path.exists() || !secondary_path.exists() {
-            return Ok(());
+        // No usable index at all.
+        if secondary_data.len() < SECONDARY_ENTRY_SIZE {
+            if chunk_len == 0 {
+                // Fresh artifact of a previous open — remove quietly so the
+                // chunk number is legitimately reusable.
+                let _ = fs::remove_file(&chunk_path);
+                let _ = fs::remove_file(&secondary_path);
+                let _ = fs::remove_file(&primary_path);
+                return Ok(true);
+            }
+            Self::quarantine_tail_chunk(dir, num, chunk_len, "no secondary index")?;
+            return Ok(true);
         }
 
-        let chunk_data = fs::read(&chunk_path)?;
-        let secondary_data = fs::read(&secondary_path)?;
-
-        let entry_count = secondary_data.len() / SECONDARY_ENTRY_SIZE;
-        if entry_count == 0 {
-            return Ok(());
+        // Torn trailing bytes (crash mid-entry-write): drop them.
+        let whole = secondary_data.len() - secondary_data.len() % SECONDARY_ENTRY_SIZE;
+        let had_torn_secondary_tail = whole != secondary_data.len();
+        if had_torn_secondary_tail {
+            warn!(
+                chunk = num,
+                torn_bytes = secondary_data.len() - whole,
+                "ImmutableDB: truncating torn trailing bytes from tail chunk's \
+                 secondary index"
+            );
         }
+        let secondary_data = &secondary_data[..whole];
 
-        // Build a list of (block_offset, block_end, hash, checksum) from the
-        // secondary index so we can verify each entry independently.
-        let mut entries_meta: Vec<(u64, u64, [u8; 32], u32)> = Vec::with_capacity(entry_count);
-        let chunk_len = chunk_data.len() as u64;
-
+        let mut entries: Vec<(u64, u32)> = Vec::with_capacity(whole / SECONDARY_ENTRY_SIZE);
         let mut pos = 0;
         while pos + SECONDARY_ENTRY_SIZE <= secondary_data.len() {
             let data = &secondary_data[pos..pos + SECONDARY_ENTRY_SIZE];
-            let Some(block_offset) = read_be_u64(&data[0..8]) else {
-                pos += SECONDARY_ENTRY_SIZE;
-                continue;
-            };
-            let checksum = read_crc32_from_entry(data);
-            let mut hash_bytes = [0u8; 32];
-            hash_bytes.copy_from_slice(&data[16..48]);
-
-            // Determine block end: start of next entry's block_offset, or chunk_len.
-            // The trailing bytes after the last full entry may be shorter than 8 bytes
-            // on a corrupt/truncated index; guard with `get` to avoid a slice panic.
-            let next_offset = secondary_data
-                .get(pos + SECONDARY_ENTRY_SIZE..pos + SECONDARY_ENTRY_SIZE + 8)
-                .and_then(read_be_u64)
-                .unwrap_or(chunk_len);
-
-            entries_meta.push((block_offset, next_offset, hash_bytes, checksum));
+            let offset = read_be_u64(&data[0..8]).unwrap_or(u64::MAX);
+            entries.push((offset, read_crc32_from_entry(data)));
             pos += SECONDARY_ENTRY_SIZE;
         }
 
-        // Scan entries for CRC32 mismatches.  Track the index of the first bad entry.
-        let mut first_bad_tail: Option<usize> = None;
-        let mut any_bad_middle = false;
+        let chunk_data = fs::read(&chunk_path)?;
 
-        for (i, &(block_offset, block_end, _hash, checksum)) in entries_meta.iter().enumerate() {
-            // Skip legacy entries without CRC
-            if checksum == 0 {
-                continue;
+        // Walk the valid prefix: each entry's data must be in-bounds,
+        // contiguous with its neighbour, and CRC-match (unless legacy CRC 0).
+        let mut valid = 0usize;
+        let mut data_end = 0u64;
+        for i in 0..entries.len() {
+            let (start, crc) = entries[i];
+            if start != data_end {
+                break; // non-contiguous / out-of-order — everything after is suspect
             }
-
-            let start = block_offset as usize;
-            let end = block_end as usize;
-
-            if end > chunk_data.len() || start > end {
-                // Truncated block data — this is a tail corruption.
-                if first_bad_tail.is_none() {
-                    first_bad_tail = Some(i);
-                }
-                continue;
-            }
-
-            let actual_crc = crc32fast::hash(&chunk_data[start..end]);
-            if actual_crc != checksum {
-                if i == entries_meta.len() - 1 || first_bad_tail.is_some() {
-                    // Bad tail entry
-                    if first_bad_tail.is_none() {
-                        first_bad_tail = Some(i);
-                    }
-                } else {
-                    // Bad middle entry — unusual, don't truncate
-                    let hash = Hash32::from_bytes(entries_meta[i].2);
-                    warn!(
-                        chunk = last_chunk.chunk_num,
-                        offset = block_offset,
-                        hash = %hash.to_hex(),
-                        "ImmutableDB: CRC32 mismatch for middle block entry — removing from index"
-                    );
-                    self.block_index.remove(&hash);
-                    self.checksums.remove(&hash);
-                    any_bad_middle = true;
-                }
-            }
-        }
-
-        if let Some(bad_start) = first_bad_tail {
-            let good_count = bad_start;
-            let truncate_at = if good_count > 0 {
-                entries_meta[bad_start].0 // block_offset of first bad entry
+            let end = if i + 1 < entries.len() {
+                entries[i + 1].0
             } else {
-                0
+                match Self::find_last_entry_end(&chunk_data, start as usize, crc) {
+                    Some(e) => e as u64,
+                    None => break,
+                }
             };
-
-            warn!(
-                chunk = last_chunk.chunk_num,
-                bad_entries = entries_meta.len() - good_count,
-                truncate_bytes = truncate_at,
-                "ImmutableDB: truncating corrupt tail entries from last chunk"
-            );
-
-            // Remove bad entries from in-memory indexes
-            for &(_offset, _end, hash_bytes, _crc) in &entries_meta[bad_start..] {
-                let hash = Hash32::from_bytes(hash_bytes);
-                self.block_index.remove(&hash);
-                self.checksums.remove(&hash);
+            if start >= end || end > chunk_data.len() as u64 {
+                break;
             }
-
-            // Truncate the chunk file
-            let file = std::fs::OpenOptions::new().write(true).open(&chunk_path)?;
-            file.set_len(truncate_at)?;
-            file.sync_all()?;
-
-            // Rewrite the secondary index with only the valid entries
-            let good_secondary = &secondary_data[..good_count * SECONDARY_ENTRY_SIZE];
-            fs::write(&secondary_path, good_secondary)?;
-
-            // Recalculate tip from the remaining entries
-            if good_count > 0 {
-                // Tip is the last good entry's hash and slot
-                let last_good = good_count - 1;
-                let data = &secondary_data[last_good * SECONDARY_ENTRY_SIZE..];
-                let slot = read_be_u64(&data[48..56]).unwrap_or(0);
-                let mut hash_bytes = [0u8; 32];
-                hash_bytes.copy_from_slice(&data[16..48]);
-                let hash = Hash32::from_bytes(hash_bytes);
-                if slot >= self.tip_slot {
-                    self.tip_slot = slot;
-                    self.tip_hash = hash;
-                }
-                self.total_blocks -= (entries_meta.len() - good_count) as u64;
-            } else {
-                // Entire last chunk is corrupt — remove it from chunks list
-                self.chunks.pop();
-                self.total_blocks -= entries_meta.len() as u64;
+            if crc != 0 && crc32fast::hash(&chunk_data[start as usize..end as usize]) != crc {
+                break;
             }
-        } else if any_bad_middle {
-            // Recalculate tip since middle entries were removed
-            debug!(
-                chunk = last_chunk.chunk_num,
-                "ImmutableDB: removed corrupt middle entries, tip unchanged"
-            );
+            valid = i + 1;
+            data_end = end;
         }
 
+        if valid == 0 {
+            if chunk_len == 0 {
+                let _ = fs::remove_file(&chunk_path);
+                let _ = fs::remove_file(&secondary_path);
+                let _ = fs::remove_file(&primary_path);
+                warn!(
+                    chunk = num,
+                    "ImmutableDB: removed empty tail chunk with unverifiable index"
+                );
+                return Ok(true);
+            }
+            Self::quarantine_tail_chunk(
+                dir,
+                num,
+                chunk_len,
+                "no secondary entry verifies against the chunk data",
+            )?;
+            return Ok(true);
+        }
+
+        let pristine = valid == entries.len() && data_end == chunk_len && !had_torn_secondary_tail;
+        if pristine {
+            return Ok(false);
+        }
+
+        warn!(
+            chunk = num,
+            valid_entries = valid,
+            dropped_entries = entries.len() - valid,
+            data_end,
+            chunk_len,
+            truncated_tail_bytes = chunk_len.saturating_sub(data_end),
+            "ImmutableDB: reconciling tail chunk — truncating to the verified \
+             prefix; dropped blocks will be re-fetched from peers (#926)"
+        );
+
+        // Truncate index first (a shorter index over longer data is the
+        // recoverable direction), then the data file.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&secondary_path)?;
+        file.set_len((valid * SECONDARY_ENTRY_SIZE) as u64)?;
+        file.sync_all()?;
+        let file = std::fs::OpenOptions::new().write(true).open(&chunk_path)?;
+        file.set_len(data_end)?;
+        file.sync_all()?;
+        // The primary index no longer matches; remove it (rebuilt on the
+        // next finalize/flush for the active chunk; historical interop
+        // consumers reconstruct from the secondary).
+        let _ = fs::remove_file(&primary_path);
+        Ok(false)
+    }
+
+    /// Quarantine a tail chunk whose data cannot be served: rename the data
+    /// file out of the writer's namespace and drop its indexes.
+    fn quarantine_tail_chunk(
+        dir: &Path,
+        num: u64,
+        chunk_len: u64,
+        reason: &str,
+    ) -> Result<(), ImmutableDBError> {
+        let chunk_path = dir.join(format!("{num:05}.chunk"));
+        let orphan_path = dir.join(format!("{num:05}.chunk.orphaned"));
+        warn!(
+            chunk = num,
+            chunk_len,
+            reason,
+            orphan = %orphan_path.display(),
+            "ImmutableDB: quarantining unservable tail chunk — data preserved, \
+             blocks will be re-fetched from peers (#926)"
+        );
+        fs::rename(&chunk_path, &orphan_path)?;
+        let _ = fs::remove_file(dir.join(format!("{num:05}.secondary")));
+        let _ = fs::remove_file(dir.join(format!("{num:05}.primary")));
         Ok(())
+    }
+
+    /// Recover the last indexed block's true end offset by CRC scan.
+    ///
+    /// The secondary index stores block start offsets only; the last entry's
+    /// end is conventionally "end of chunk", which is wrong exactly when a
+    /// crash left un-indexed data after it. Scan forward from `start`,
+    /// accepting the first position whose running CRC32 matches the stored
+    /// checksum AND which is either end-of-data or the start of another
+    /// stored block (every stored block is the multi-era envelope
+    /// `array(2) [...]`, first byte 0x82 — Byron EBBs included). Legacy
+    /// entries (CRC 0) cannot be delimited; fall back to end-of-chunk as
+    /// before (finalized legacy chunks have no tails).
+    fn find_last_entry_end(chunk_data: &[u8], start: usize, expected_crc: u32) -> Option<usize> {
+        if expected_crc == 0 {
+            return Some(chunk_data.len());
+        }
+        if start >= chunk_data.len() {
+            return None;
+        }
+        let mut hasher = crc32fast::Hasher::new();
+        let mut pos = start;
+        while pos < chunk_data.len() {
+            hasher.update(&chunk_data[pos..pos + 1]);
+            pos += 1;
+            let at_boundary = pos == chunk_data.len() || chunk_data[pos] == 0x82;
+            if at_boundary && hasher.clone().finalize() == expected_crc {
+                return Some(pos);
+            }
+        }
+        None
     }
 
     /// Get block CBOR by header hash.
@@ -722,6 +1097,21 @@ impl ImmutableDB {
     /// Check if a block exists by header hash.
     pub fn has_block(&self, hash: &Hash32) -> bool {
         self.block_index.contains(hash)
+    }
+
+    /// Check that a block exists AND its bytes actually verify (issue #928).
+    ///
+    /// `has_block` answers from the index alone, which is exactly what a
+    /// stale index gets wrong: the flush path used it to skip re-flushing
+    /// blocks whose immutable copy was unreachable, silently dropping them
+    /// when the volatile copy was then discarded. This variant reads the
+    /// block and CRC-verifies it (via [`Self::get_block`]) — a phantom index
+    /// entry or corrupt backing bytes count as absent, so the caller
+    /// re-appends the block instead of losing it. Costs one block read; use
+    /// on decision paths where a false "present" loses data, not on hot
+    /// serving paths.
+    pub fn has_verified_block(&self, hash: &Hash32) -> bool {
+        self.get_block(hash).is_some()
     }
 
     /// Absolute slot of an immutable block, by header hash (#908).
@@ -1212,6 +1602,10 @@ impl ImmutableDB {
     ) -> Result<Self, ImmutableDBError> {
         let mut db = Self::open_with_config(dir, config)?;
 
+        // Entering write mode: the on-disk state is no longer known-clean
+        // until the next graceful flush() (issue #928).
+        let _ = fs::remove_file(dir.join(CLEAN_MARKER));
+
         // Use epoch number as chunk number for Haskell-compatible naming.
         // Ensure we never overwrite an existing finalized chunk — use the
         // greater of the requested epoch and one past the last chunk.
@@ -1219,14 +1613,33 @@ impl ImmutableDB {
         let next_chunk = current_epoch.max(min_safe_chunk);
 
         let chunk_path = dir.join(format!("{next_chunk:05}.chunk"));
+        // #926 belt-and-braces: after reconciliation every non-empty chunk
+        // file is indexed (and thus below `min_safe_chunk`) or the open
+        // failed — so colliding here is unreachable. Refuse to truncate
+        // rather than trust that reasoning forever.
+        if let Ok(meta) = chunk_path.metadata() {
+            if meta.len() > 0 {
+                return Err(ImmutableDBError::InconsistentChunk {
+                    chunk: next_chunk,
+                    reason: format!(
+                        "refusing to reuse chunk number {next_chunk}: target \
+                         chunk file already contains {} bytes of un-indexed data",
+                        meta.len()
+                    ),
+                });
+            }
+        }
         let file = std::fs::File::create(&chunk_path)?;
         let writer = std::io::BufWriter::new(file);
+        let secondary_path = dir.join(format!("{next_chunk:05}.secondary"));
+        let secondary_file = std::fs::File::create(&secondary_path)?;
 
         db.active_chunk = Some(ActiveChunk {
             chunk_num: next_chunk,
             epoch_length,
             first_slot_of_epoch: epoch_first_slot,
             chunk_file: writer,
+            secondary_file,
             secondary_entries: Vec::new(),
             current_offset: 0,
             pending_blocks: HashMap::new(),
@@ -1274,9 +1687,10 @@ impl ImmutableDB {
         // Extract header offset and size for db-sync compatibility
         let (header_offset, header_size) = extract_header_bounds(cbor);
 
-        // Buffer secondary entry and block data for reads.
+        // Persist the secondary entry incrementally (issue #926) and buffer
+        // it (plus the block data) for reads and primary-index generation.
         // For EBBs, `slot` contains the epoch number (per Haskell convention).
-        active.secondary_entries.push(SecondaryEntry {
+        let entry = SecondaryEntry {
             block_offset,
             header_hash: *hash.as_bytes(),
             slot,
@@ -1284,7 +1698,9 @@ impl ImmutableDB {
             header_offset,
             header_size,
             is_ebb,
-        });
+        };
+        active.secondary_file.write_all(&entry.encode())?;
+        active.secondary_entries.push(entry);
         active.pending_blocks.insert(*hash, cbor.to_vec());
 
         // Update index for immediate reads
@@ -1332,23 +1748,17 @@ impl ImmutableDB {
         };
 
         // Flush and fsync the chunk file to guarantee durability before
-        // writing the secondary index. Without this, a crash could leave the
+        // syncing the secondary index. Without this, a crash could leave the
         // chunk file with missing tail data while the secondary index already
         // references those blocks.
         let mut chunk_file = active.chunk_file;
         chunk_file.flush()?;
         chunk_file.get_ref().sync_data()?;
 
-        // Write secondary index
-        let secondary_path = self.dir.join(format!("{:05}.secondary", active.chunk_num));
-        let mut secondary_file = std::io::BufWriter::new(std::fs::File::create(&secondary_path)?);
-        for entry in &active.secondary_entries {
-            secondary_file.write_all(&entry.encode())?;
-        }
-        secondary_file.flush()?;
-        // Fsync the secondary index so that the chunk is fully recoverable
+        // The secondary entries were appended incrementally on every
+        // append_block (issue #926); fsync so the chunk is fully recoverable
         // on restart even if the OS crashes immediately after this call.
-        secondary_file.get_ref().sync_data()?;
+        active.secondary_file.sync_data()?;
 
         // Write primary index for Haskell ImmutableDB interoperability
         Self::write_primary_index(
@@ -1374,11 +1784,14 @@ impl ImmutableDB {
         // Open new chunk for writing — named by epoch number
         let chunk_path = self.dir.join(format!("{next_epoch:05}.chunk"));
         let file = std::fs::File::create(&chunk_path)?;
+        let secondary_path = self.dir.join(format!("{next_epoch:05}.secondary"));
+        let secondary_file = std::fs::File::create(&secondary_path)?;
         self.active_chunk = Some(ActiveChunk {
             chunk_num: next_epoch,
             epoch_length: next_epoch_length,
             first_slot_of_epoch: next_epoch_first_slot,
             chunk_file: std::io::BufWriter::new(file),
+            secondary_file,
             secondary_entries: Vec::new(),
             current_offset: 0,
             pending_blocks: HashMap::new(),
@@ -1392,8 +1805,13 @@ impl ImmutableDB {
         Ok(())
     }
 
-    /// Flush the active chunk's secondary index to disk without starting
-    /// a new chunk. Call this on shutdown to ensure durability.
+    /// Flush the active chunk's data and secondary index to disk without
+    /// starting a new chunk, and stamp the clean-shutdown marker.
+    ///
+    /// Call this on graceful shutdown only — the marker asserts that all
+    /// on-disk state (including the mmap hash index) was written by an
+    /// orderly stop. If a periodic flush is ever introduced, it must NOT
+    /// write the marker (see [`CLEAN_MARKER`]).
     pub fn flush(&mut self) -> Result<(), ImmutableDBError> {
         use std::io::Write;
 
@@ -1408,14 +1826,9 @@ impl ImmutableDB {
         active.chunk_file.flush()?;
         active.chunk_file.get_ref().sync_data()?;
 
-        // Write secondary index for current state
-        let secondary_path = self.dir.join(format!("{:05}.secondary", active.chunk_num));
-        let mut secondary_file = std::io::BufWriter::new(std::fs::File::create(&secondary_path)?);
-        for entry in &active.secondary_entries {
-            secondary_file.write_all(&entry.encode())?;
-        }
-        secondary_file.flush()?;
-        secondary_file.get_ref().sync_data()?;
+        // The secondary entries were appended incrementally on every
+        // append_block (issue #926); fsync them.
+        active.secondary_file.sync_data()?;
 
         // Write primary index for Haskell ImmutableDB interoperability
         Self::write_primary_index(
@@ -1451,6 +1864,9 @@ impl ImmutableDB {
 
         // Persist block index (mmap flush)
         self.block_index.persist()?;
+
+        // Everything durable — stamp the clean-shutdown marker (#928).
+        fs::write(self.dir.join(CLEAN_MARKER), b"")?;
 
         debug!(
             chunk = active.chunk_num,
@@ -1626,6 +2042,22 @@ impl ImmutableDB {
         self.active_chunk.is_some()
     }
 
+    /// Read a byte range from a chunk file with plain std I/O.
+    ///
+    /// Repair-path only (open-time tip.meta recovery) — runs before the
+    /// configured reader backend is available.
+    fn read_range_std(dir: &Path, chunk_num: u64, start: u64, end: u64) -> Option<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        if end <= start {
+            return None;
+        }
+        let mut f = fs::File::open(dir.join(format!("{chunk_num:05}.chunk"))).ok()?;
+        f.seek(SeekFrom::Start(start)).ok()?;
+        let mut buf = vec![0u8; (end - start) as usize];
+        f.read_exact(&mut buf).ok()?;
+        Some(buf)
+    }
+
     /// Read a block from a chunk file at the given location.
     ///
     /// Uses the configured I/O backend (memmap2 or io_uring).
@@ -1723,6 +2155,455 @@ mod tests {
         let db = ImmutableDB::open(dir.path()).unwrap();
         assert_eq!(db.total_blocks(), 0);
         assert_eq!(db.tip_slot(), 0);
+    }
+
+    // ── #926 / #928 crash-durability and open-time reconciliation ──────────
+
+    /// A block payload that looks like an on-disk Cardano block for
+    /// reconciliation purposes: every stored block is the multi-era
+    /// envelope `array(2) [era_tag, inner]`, so it starts with 0x82. The
+    /// reconcile CRC-scan uses that prefix to delimit un-indexed tails.
+    /// `fill` gives each block distinct content; `len` controls whether the
+    /// write path's BufWriter writes through (len > 8 KiB) or buffers.
+    fn envelope_payload(fill: u8, len: usize) -> Vec<u8> {
+        let mut v = vec![fill; len];
+        v[0] = 0x82;
+        v
+    }
+
+    /// #926 (durability): secondary-index entries are written incrementally
+    /// on append, so a hard process kill without flush() loses at most the
+    /// buffered tail — NOT ten hours of index like the 2026-07-28 incident.
+    /// Large blocks force the chunk BufWriter to write through, so both data
+    /// and index are on disk; the reopened DB must serve all blocks.
+    #[test]
+    fn secondary_index_survives_kill_without_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 432_000, 0).unwrap();
+        let payloads: Vec<Vec<u8>> = (1..=3u8).map(|i| envelope_payload(i, 16 * 1024)).collect();
+        for (i, p) in payloads.iter().enumerate() {
+            let hash = Hash32::from_bytes([(i + 1) as u8; 32]);
+            db.append_block(100 + i as u64, 1 + i as u64, &hash, p, false)
+                .unwrap();
+        }
+        // Simulated hard kill: no flush(), no Drop (Drop would flush the
+        // BufWriter). File descriptors leak until process exit — fine.
+        std::mem::forget(db);
+
+        let db2 = ImmutableDB::open(dir.path()).unwrap();
+        assert_eq!(
+            db2.total_blocks(),
+            3,
+            "incrementally-written index must survive a kill"
+        );
+        for (i, p) in payloads.iter().enumerate() {
+            let hash = Hash32::from_bytes([(i + 1) as u8; 32]);
+            assert_eq!(
+                db2.get_block(&hash).as_deref(),
+                Some(p.as_slice()),
+                "block {i} must be readable after crash-reopen"
+            );
+        }
+    }
+
+    /// #926: chunk data beyond the last valid secondary entry (index lost
+    /// its tail in a crash) is truncated at open — never silently served,
+    /// never left to be overwritten in place. The truncated blocks are
+    /// re-fetched from peers by the normal sync path.
+    #[test]
+    fn unindexed_chunk_tail_is_truncated_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 432_000, 0).unwrap();
+        let payloads: Vec<Vec<u8>> = (1..=3u8).map(|i| envelope_payload(i, 16 * 1024)).collect();
+        for (i, p) in payloads.iter().enumerate() {
+            let hash = Hash32::from_bytes([(i + 1) as u8; 32]);
+            db.append_block(100 + i as u64, 1 + i as u64, &hash, p, false)
+                .unwrap();
+        }
+        db.flush().unwrap();
+        drop(db);
+
+        // Damage: index covers only the first 2 blocks (the incident's
+        // "index behind data" shape).
+        let secondary_path = dir.path().join("00000.secondary");
+        let sec = fs::read(&secondary_path).unwrap();
+        fs::write(&secondary_path, &sec[..2 * SECONDARY_ENTRY_SIZE]).unwrap();
+
+        let db2 = ImmutableDB::open(dir.path()).unwrap();
+        assert_eq!(db2.total_blocks(), 2, "only indexed blocks survive");
+        assert_eq!(db2.tip_slot(), 101);
+        assert!(db2.get_block(&Hash32::from_bytes([3u8; 32])).is_none());
+        // The chunk file itself must have been truncated to the indexed
+        // prefix so a later writer can never collide with orphan bytes.
+        let chunk_len = dir.path().join("00000.chunk").metadata().unwrap().len();
+        assert_eq!(
+            chunk_len,
+            (payloads[0].len() + payloads[1].len()) as u64,
+            "un-indexed tail must be physically truncated"
+        );
+    }
+
+    /// #926: a non-empty chunk with NO secondary index at the chain tail is
+    /// quarantined (renamed, never silently skipped) and its data preserved;
+    /// the DB opens consistently at the previous chunk's tip.
+    #[test]
+    fn index_less_last_chunk_is_quarantined_not_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 432_000, 0).unwrap();
+        db.append_block(
+            100,
+            1,
+            &Hash32::from_bytes([1u8; 32]),
+            &envelope_payload(1, 16 * 1024),
+            false,
+        )
+        .unwrap();
+        db.finalize_chunk(1, 432_000, 432_000).unwrap();
+        db.append_block(
+            432_100,
+            2,
+            &Hash32::from_bytes([2u8; 32]),
+            &envelope_payload(2, 16 * 1024),
+            false,
+        )
+        .unwrap();
+        db.flush().unwrap();
+        drop(db);
+
+        // External damage: chunk 1 loses its whole secondary index.
+        fs::remove_file(dir.path().join("00001.secondary")).unwrap();
+        let _ = fs::remove_file(dir.path().join("00001.primary"));
+
+        let db2 = ImmutableDB::open(dir.path()).unwrap();
+        assert_eq!(db2.total_blocks(), 1, "chunk 0 must survive");
+        assert_eq!(db2.tip_slot(), 100, "tip falls back to chunk 0's tip");
+        // Data preserved for forensics, out of the writer's namespace.
+        assert!(
+            dir.path().join("00001.chunk.orphaned").exists(),
+            "quarantined chunk data must be preserved"
+        );
+        assert!(
+            !dir.path().join("00001.chunk").exists(),
+            "an index-less chunk file must not remain where a writer could \
+             collide with it"
+        );
+    }
+
+    /// #926: an index-less chunk in the MIDDLE of the chain (not the tail)
+    /// is a hard open error — silently skipping it produced a served chain
+    /// with a hole below the claimed tip in the 2026-07-28 incident.
+    #[test]
+    fn index_less_middle_chunk_is_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_chunk(dir.path(), 0, &[(b"aaaa", [1u8; 32], 10)]);
+        create_test_chunk(dir.path(), 1, &[(b"bbbb", [2u8; 32], 20)]);
+        create_test_chunk(dir.path(), 2, &[(b"cccc", [3u8; 32], 30)]);
+        fs::remove_file(dir.path().join("00001.secondary")).unwrap();
+
+        let res = ImmutableDB::open(dir.path());
+        assert!(
+            res.is_err(),
+            "an index-less middle chunk must refuse to open, not skip"
+        );
+    }
+
+    /// #928: a stale tip.meta (pointing past the indexed chain, as in the
+    /// incident: 38k slots ahead) is clamped to the last indexed entry at
+    /// open and rewritten.
+    #[test]
+    fn stale_tip_meta_is_clamped_to_indexed_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 432_000, 0).unwrap();
+        for i in 1..=2u8 {
+            db.append_block(
+                100 + i as u64,
+                i as u64,
+                &Hash32::from_bytes([i; 32]),
+                &envelope_payload(i, 16 * 1024),
+                false,
+            )
+            .unwrap();
+        }
+        db.flush().unwrap();
+        drop(db);
+
+        // Damage: tip.meta claims a tip 38k slots past the indexed chain.
+        ImmutableDB::write_tip_meta(
+            dir.path(),
+            140_000,
+            &Hash32::from_bytes([9u8; 32]),
+            4_985_211,
+        )
+        .unwrap();
+
+        let db2 = ImmutableDB::open(dir.path()).unwrap();
+        assert_eq!(db2.tip_slot(), 102, "tip slot comes from the indexed chain");
+        assert_eq!(
+            db2.tip_hash(),
+            Hash32::from_bytes([2u8; 32]),
+            "tip hash comes from the indexed chain"
+        );
+        assert_ne!(
+            db2.tip_block_no(),
+            4_985_211,
+            "a tip.meta block_no unbacked by the index must not be trusted"
+        );
+        // And the on-disk tip.meta must have been repaired.
+        let (s, h, _) = ImmutableDB::read_tip_meta(dir.path()).unwrap();
+        assert_eq!((s, h), (102, Hash32::from_bytes([2u8; 32])));
+    }
+
+    /// #928: `has_verified_block` reads the block and checks its CRC —
+    /// an index entry whose backing bytes are corrupt must NOT count as
+    /// present (the flush path uses this so a phantom index entry can no
+    /// longer suppress the re-flush of a live volatile block).
+    #[test]
+    fn has_verified_block_rejects_corrupt_backing_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 432_000, 0).unwrap();
+        let hash = Hash32::from_bytes([1u8; 32]);
+        db.append_block(100, 1, &hash, &envelope_payload(1, 16 * 1024), false)
+            .unwrap();
+        db.flush().unwrap();
+        drop(db);
+
+        let db2 = ImmutableDB::open(dir.path()).unwrap();
+        assert!(db2.has_block(&hash));
+        assert!(db2.has_verified_block(&hash), "intact block verifies");
+
+        // Bit rot AFTER open: flip one payload byte on disk.
+        let chunk_path = dir.path().join("00000.chunk");
+        let mut data = fs::read(&chunk_path).unwrap();
+        data[1024] ^= 0xff;
+        fs::write(&chunk_path, &data).unwrap();
+
+        assert!(db2.has_block(&hash), "the index still claims the block");
+        assert!(
+            !db2.has_verified_block(&hash),
+            "corrupt backing data must not count as present"
+        );
+    }
+
+    /// #926: tail-grade reconciliation cascades below removed empty tail
+    /// artifacts — a crash-damaged data tail sitting under a fresh empty
+    /// chunk (created by an open that was itself killed) must still get the
+    /// full CRC + truncation treatment, not body-grade checks.
+    #[test]
+    fn tail_reconcile_cascades_below_empty_tail_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 432_000, 0).unwrap();
+        let payloads: Vec<Vec<u8>> = (1..=3u8).map(|i| envelope_payload(i, 16 * 1024)).collect();
+        for (i, p) in payloads.iter().enumerate() {
+            let hash = Hash32::from_bytes([(i + 1) as u8; 32]);
+            db.append_block(100 + i as u64, 1 + i as u64, &hash, p, false)
+                .unwrap();
+        }
+        db.flush().unwrap();
+        drop(db);
+
+        // Chunk 0's index loses its last entry (crash shape), and an empty
+        // chunk-1 artifact sits above it (a later open was killed before
+        // appending anything).
+        let secondary_path = dir.path().join("00000.secondary");
+        let sec = fs::read(&secondary_path).unwrap();
+        fs::write(&secondary_path, &sec[..2 * SECONDARY_ENTRY_SIZE]).unwrap();
+        fs::write(dir.path().join("00001.chunk"), b"").unwrap();
+        fs::write(dir.path().join("00001.secondary"), b"").unwrap();
+
+        let db2 = ImmutableDB::open(dir.path()).unwrap();
+        assert_eq!(db2.total_blocks(), 2, "damaged true tail must be repaired");
+        assert!(!dir.path().join("00001.chunk").exists());
+        let chunk_len = dir.path().join("00000.chunk").metadata().unwrap().len();
+        assert_eq!(
+            chunk_len,
+            (payloads[0].len() + payloads[1].len()) as u64,
+            "un-indexed tail must be truncated despite the artifact above it"
+        );
+    }
+
+    /// Stub prev-hash decoder for boundary-check tests: reads the prev hash
+    /// from bytes[1..33] of the junk payload (production uses
+    /// `decode_block_minimal`, injected at the same seam).
+    fn stub_decode_prev(cbor: &[u8]) -> Option<[u8; 32]> {
+        if cbor.len() < 33 || cbor[0] != 0x82 {
+            return None;
+        }
+        let mut h = [0u8; 32];
+        h.copy_from_slice(&cbor[1..33]);
+        Some(h)
+    }
+
+    /// Envelope payload carrying an explicit prev-hash for the stub decoder.
+    fn linked_payload(prev: [u8; 32], fill: u8, len: usize) -> Vec<u8> {
+        let mut v = vec![fill; len.max(64)];
+        v[0] = 0x82;
+        v[1..33].copy_from_slice(&prev);
+        v
+    }
+
+    /// #926: adjacent chunks whose blocks chain correctly pass the boundary
+    /// check untouched.
+    #[test]
+    fn chunk_boundary_check_passes_linked_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let h1 = [1u8; 32];
+        let h2 = [2u8; 32];
+        let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 432_000, 0).unwrap();
+        db.append_block(
+            100,
+            1,
+            &Hash32::from_bytes(h1),
+            &linked_payload([0u8; 32], 1, 64),
+            false,
+        )
+        .unwrap();
+        db.append_block(
+            101,
+            2,
+            &Hash32::from_bytes(h2),
+            &linked_payload(h1, 2, 64),
+            false,
+        )
+        .unwrap();
+        db.finalize_chunk(1, 432_000, 432_000).unwrap();
+        db.append_block(
+            432_100,
+            3,
+            &Hash32::from_bytes([3u8; 32]),
+            &linked_payload(h2, 3, 64),
+            false,
+        )
+        .unwrap();
+        db.flush().unwrap();
+        drop(db);
+
+        ImmutableDB::check_chunk_boundaries(dir.path(), stub_decode_prev).unwrap();
+        assert!(dir.path().join("00001.chunk").exists());
+        assert!(!dir.path().join("00001.chunk.orphaned").exists());
+    }
+
+    /// #926 (the incident shape): a tail chunk that does NOT chain onto the
+    /// previous chunk is an orphan island above a hole — it must be
+    /// quarantined so the tip falls back to the last connected block.
+    #[test]
+    fn chunk_boundary_break_at_tail_quarantines_orphan_island() {
+        let dir = tempfile::tempdir().unwrap();
+        let h1 = [1u8; 32];
+        let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 432_000, 0).unwrap();
+        db.append_block(
+            100,
+            1,
+            &Hash32::from_bytes(h1),
+            &linked_payload([0u8; 32], 1, 64),
+            false,
+        )
+        .unwrap();
+        db.finalize_chunk(1, 432_000, 432_000).unwrap();
+        // Tail chunk's first block claims a prev that is NOT chunk 0's tip
+        // (simulating the incident's 38k-slot indexed hole).
+        db.append_block(
+            432_100,
+            9,
+            &Hash32::from_bytes([9u8; 32]),
+            &linked_payload([0x77u8; 32], 9, 64),
+            false,
+        )
+        .unwrap();
+        db.flush().unwrap();
+        drop(db);
+
+        ImmutableDB::check_chunk_boundaries(dir.path(), stub_decode_prev).unwrap();
+        assert!(
+            dir.path().join("00001.chunk.orphaned").exists(),
+            "orphan island must be quarantined"
+        );
+        assert!(!dir.path().join("00001.secondary").exists());
+
+        // End-to-end: a subsequent open lands on the last connected block.
+        let db2 = ImmutableDB::open(dir.path()).unwrap();
+        assert_eq!(db2.total_blocks(), 1);
+        assert_eq!(db2.tip_slot(), 100);
+        assert_eq!(db2.tip_hash(), Hash32::from_bytes(h1));
+    }
+
+    /// #926: a chain break BELOW the tail refuses to open (no unbounded
+    /// auto-truncation).
+    #[test]
+    fn chunk_boundary_break_below_tail_is_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let h1 = [1u8; 32];
+        let h9 = [9u8; 32];
+        let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 432_000, 0).unwrap();
+        db.append_block(
+            100,
+            1,
+            &Hash32::from_bytes(h1),
+            &linked_payload([0u8; 32], 1, 64),
+            false,
+        )
+        .unwrap();
+        db.finalize_chunk(1, 432_000, 432_000).unwrap();
+        // Chunk 1 breaks the chain (prev = garbage)…
+        db.append_block(
+            432_100,
+            9,
+            &Hash32::from_bytes(h9),
+            &linked_payload([0x77u8; 32], 9, 64),
+            false,
+        )
+        .unwrap();
+        db.finalize_chunk(2, 432_000, 864_000).unwrap();
+        // …and chunk 2 chains onto chunk 1, so the break is NOT at the tail.
+        db.append_block(
+            864_100,
+            10,
+            &Hash32::from_bytes([10u8; 32]),
+            &linked_payload(h9, 10, 64),
+            false,
+        )
+        .unwrap();
+        db.flush().unwrap();
+        drop(db);
+
+        let res = ImmutableDB::check_chunk_boundaries(dir.path(), stub_decode_prev);
+        assert!(
+            res.is_err(),
+            "a chain break below the tail must refuse, not auto-truncate"
+        );
+    }
+
+    /// #928: clean-shutdown marker lifecycle — created by flush(), removed
+    /// when the DB is opened for writing (entering write mode means the
+    /// on-disk state is no longer known-clean until the next flush).
+    #[test]
+    fn clean_marker_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 432_000, 0).unwrap();
+        assert!(
+            !dir.path().join("clean").exists(),
+            "no marker while in write mode"
+        );
+        db.append_block(
+            100,
+            1,
+            &Hash32::from_bytes([1u8; 32]),
+            &envelope_payload(1, 64),
+            false,
+        )
+        .unwrap();
+        db.flush().unwrap();
+        assert!(
+            dir.path().join("clean").exists(),
+            "flush (graceful shutdown) writes the marker"
+        );
+        drop(db);
+
+        let db2 = ImmutableDB::open_for_writing(dir.path(), 0, 432_000, 0).unwrap();
+        assert!(
+            !dir.path().join("clean").exists(),
+            "opening for writing removes the marker"
+        );
+        drop(db2);
     }
 
     /// A Byron EBB and the first main block of the epoch share an absolute
@@ -2092,10 +2973,10 @@ mod tests {
             .write_all(&garbage)
             .unwrap();
 
-        // Should not panic — validate_most_recent_chunk runs on open and
-        // detects that the garbage secondary entry fails the CRC/offset check,
-        // so it removes the entry from the in-memory index.  The result is 0
-        // blocks rather than 1, because no valid blocks survived validation.
+        // Should not panic — open-time reconciliation detects that the
+        // garbage secondary entry fails the offset/CRC check against the
+        // chunk data, so the tail chunk is quarantined.  The result is 0
+        // blocks rather than 1, because no valid blocks survived.
         let db = ImmutableDB::open(dir.path()).unwrap();
         assert_eq!(db.total_blocks(), 0);
 
@@ -2469,8 +3350,8 @@ mod tests {
 
         let db = ImmutableDB::open(dir.path()).unwrap();
 
-        // validate_most_recent_chunk detects the CRC mismatch on startup and
-        // removes the corrupted entry from the in-memory index entirely.
+        // Open-time reconciliation detects the CRC mismatch and quarantines
+        // the unverifiable tail chunk entirely.
         // The block is no longer accessible — not just rejected at read time.
         let hash32 = Hash32::from_bytes(hash);
         assert!(
