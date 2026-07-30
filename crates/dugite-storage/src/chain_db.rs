@@ -31,6 +31,12 @@ pub enum ChainDBError {
     BlockNotFound(String),
     #[error("ImmutableDB error: {0}")]
     Immutable(#[from] crate::immutable_db::ImmutableDBError),
+    #[error(
+        "database directory is locked by another dugite process ({holder}) — \
+         refusing concurrent open of {lock_path} (issue #929: a second writer \
+         would corrupt the ImmutableDB)"
+    )]
+    DatabaseLocked { lock_path: String, holder: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -91,6 +97,10 @@ pub struct ChainDB {
     /// Cached index over the currently-published LoE (invalidated by Arc
     /// pointer identity when the governor republishes).
     loe_view: Option<crate::loe_trim::LoeView>,
+    /// Exclusive advisory lock on the database directory (issue #929).
+    /// Held for the lifetime of this ChainDB; released on drop / process
+    /// death. Prevents a second dugite process from interleaving writes.
+    _dir_lock: crate::db_lock::DbDirLock,
 }
 
 impl ChainDB {
@@ -140,6 +150,11 @@ impl ChainDB {
     ) -> Result<Self, ChainDBError> {
         debug!(path = %db_path.display(), k, index_type = ?config.index_type, "Opening ChainDB");
         std::fs::create_dir_all(db_path)?;
+
+        // Issue #929: take the exclusive DB-directory lock before touching
+        // any other file. cardano-node does the same (`withLockDB`) — a
+        // second writer on the same directory is guaranteed corruption.
+        let dir_lock = crate::db_lock::DbDirLock::acquire(db_path)?;
 
         let immutable_dir = db_path.join("immutable");
         std::fs::create_dir_all(&immutable_dir)?;
@@ -222,6 +237,7 @@ impl ChainDB {
             security_param_k: k,
             loe_handle: None,
             loe_view: None,
+            _dir_lock: dir_lock,
         })
     }
 
@@ -1392,6 +1408,33 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_open_of_same_db_dir_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let _db1 = ChainDB::open(dir.path()).unwrap();
+        // A second open of the same directory while the first is alive must
+        // fail fast instead of handing out a second interleaving writer
+        // (issue #929).
+        let err = match ChainDB::open(dir.path()) {
+            Ok(_) => panic!("second open of a locked DB must fail"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("locked") && msg.contains(&std::process::id().to_string()),
+            "error must name the lock and the holder pid: {msg}"
+        );
+    }
+
+    #[test]
+    fn db_lock_released_on_drop_allows_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let _db = ChainDB::open(dir.path()).unwrap();
+        }
+        let _db2 = ChainDB::open(dir.path()).expect("reopen after drop must succeed");
+    }
+
+    #[test]
     fn test_add_and_get_block() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = ChainDB::open(dir.path()).unwrap();
@@ -2021,8 +2064,10 @@ mod tests {
         // Tip should reflect the last block
         assert_eq!(db.tip_slot(), SlotNo(200));
 
-        // Persist and re-open — blocks should survive
+        // Persist and re-open — blocks should survive. Drop the first handle
+        // before reopening: the #929 directory lock refuses concurrent opens.
         db.persist().unwrap();
+        drop(db);
         let db2 = ChainDB::open(dir.path()).unwrap();
         assert_eq!(db2.tip_slot(), SlotNo(200));
         let mut hash_bytes = [0u8; 32];

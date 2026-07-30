@@ -4,6 +4,7 @@ pub mod chain_db;
 pub mod chain_sel_queue;
 pub(crate) mod chunk_reader;
 pub mod config;
+pub mod db_lock;
 pub mod immutable_db;
 pub mod loe_trim;
 pub mod volatile_db;
