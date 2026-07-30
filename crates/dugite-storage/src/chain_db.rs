@@ -1138,8 +1138,12 @@ impl ChainDB {
                 // Within the rollback window — stop here; the chain is ordered.
                 break;
             }
-            // Skip blocks already present in ImmutableDB (e.g. Mithril import).
-            if self.immutable.has_block(&hash) {
+            // Skip blocks already present in ImmutableDB (e.g. Mithril
+            // import). Verified-by-read (#928): a stale index entry whose
+            // backing bytes are missing or corrupt must NOT suppress the
+            // re-flush — the volatile copy is discarded below, so a false
+            // "present" here permanently loses the block.
+            if self.immutable.has_verified_block(&hash) {
                 continue;
             }
             if let Some(cbor) = self.volatile.get_block_cbor(&hash) {
