@@ -16,6 +16,7 @@
 - [SnapShots new vs old format](snapshots-encoding.md) — array(2) new format, array(3) old, StakePoolSnapShot array(10)
 - [ConwayGovState encoding](conway-gov-state-encoding-detailed.md) — array(7), nested types
 - [Conway Accounts/ConwayAccountState encoding](conway-accounts-encoding.md) — per-account array(4) with nullable delegations
+- [OutputTooBigUTxO/maxValSize exact mechanics (live-verified 2026-07-31)](outputtoobigutxo-maxvalsize-exact-mechanics.md) — Conway reuses Alonzo.validateOutputTooBigUTxO unchanged via Babbage; measures a FRESH re-encode of decoded Value (never wire bytes, contrast Sized's real ByteSpan used by min-UTxO check); encodeMap definite(<=23 entries)/indefinite(>23) threshold, byte-neutral for N in 24-255; ada-only=bare coin int no array; strict `>` comparison
 
 ## JSON Debug-Dump (aeson ToJSON) Field Names — separate from CBOR wire format
 - [PPUPState/ProposedPPUpdates/PParamsUpdate JSON keys + Conway "ppups" replacement (live-verified 2026-07-06)](ppup-json-field-names-debug-dump.md) — ShelleyGovState->proposals/futureProposals/curPParams/prevPParams; ProposedPPUpdates is array-of-pairs NOT object; PParamsUpdate keys are data-driven ppName (txFeePerByte not minFeeA, etc, full table); Conway "ppups" key survives but renders ConwayGovState (currentPParams/previousPParams renamed, no futureProposals, proposals=GovActionState list)

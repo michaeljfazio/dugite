@@ -22,6 +22,7 @@
 - [genesis-bootstrap-protocol.md](genesis-bootstrap-protocol.md) — genesis mode bootstrap protocol details
 - [ouroboros-genesis-checkpoints.md](ouroboros-genesis-checkpoints.md) — genesis checkpoints mechanism
 - [chainsync-at-tip.md](chainsync-at-tip.md) — connection stays open, MsgAwaitReply, pipeline lowMark=200/highMark=300
+- [chainsync-intersection-vs-rollback-distinction.md](chainsync-intersection-vs-rollback-distinction.md) — MsgIntersectFound is NEVER a wire MsgRollBackward (StIntersect->StIdle vs StNext->StIdle); RolledBackPastIntersection=graceful ChainSyncClientResult, InvalidIntersection=hard ChainSyncClientException/ban; mkOffsets fibonacci point-selection
 - [fork-resolution-chainsel.md](fork-resolution-chainsel.md) — ChainSel algorithm: addBlock flow, Praos tiebreaker, rollback, tentative follower
 - [fork-switching-mechanism.md](fork-switching-mechanism.md) — fork switch mechanics
 - [block-validation-modes.md](block-validation-modes.md) — tickThenReapply (replay, no crypto) vs tickThenApply (full validation)
@@ -32,6 +33,7 @@
 - [inbound-connection-rate-limiting.md](inbound-connection-rate-limiting.md) — AcceptedConnectionsLimit hard=512/soft=384/delay=5s, no per-IP cap
 - [mithril-snapshot-ledger-init.md](mithril-snapshot-ledger-init.md) — two-archive system, ledger snapshot layout, tickThenReapply/Apply split
 - [gsm-haa-syncing-presyncing-regression.md](gsm-haa-syncing-presyncing-regression.md) — Syncing→PreSyncing is HAA-only, NO tip-age term (tip-age only gates CaughtUp↔PreSyncing); OutboundConnectionsState 4-way case split (Genesis-mode BLP-count branch has no closure-over-established-peers condition); root-caused dugite from-genesis freeze to gsm.rs/networking.rs
+- [haa-outbound-connections-state-verified.md](haa-outbound-connections-state-verified.md) — SUPERSEDES prior "not tag-pinned" caveat: exact CHaP-resolved commits for cardano-node 11.0.1 (cardano-diffusion rev 17525c3, ouroboros-network rev a98c885). Praos-vs-Genesis TooOld handling genuinely differs (only Praos zeroes targets + 15min abort); trustable-closure violations are eventual not synchronous; inbound duplex peers only count once separately promoted via KnownPeers; PreSyncing does NOT pause ChainSync/BlockFetch (only LoE/GDD/LoP change)
 
 ## Ledger State Snapshots & CBOR Format
 - [ext-ledger-state-snapshot-format.md](ext-ledger-state-snapshot-format.md) — state file CBOR: outer array(2)[1,ExtLedgerState], HeaderState telescope, PraosState 8-field array
@@ -113,6 +115,8 @@
 ## Storage
 - [lsm-tree-architecture.md](lsm-tree-architecture.md) — lazy levelling merge, 4-file run format, bloom filters, NO WAL
 - [ledgerdb-v2-diff-retention-and-snapshot-decoupling.md](ledgerdb-v2-diff-retention-and-snapshot-decoupling.md) — V1 DbChangelog DELETED from main; V2 LedgerSeq/StateRef holds FULL materialized table per volatile-window block (not diffs-to-reverse-apply); rollback=pure AnchoredSeq trim; disk-snapshot (implTryTakeSnapshot) never touches live ldbSeq TVar, fully decoupled from garbageCollect (k-driven pruning)
+- [immutabledb-validation-reconstruction.md](immutabledb-validation-reconstruction.md) — ValidateMostRecentChunk vs ValidateAllChunks; chunk files=sole source of truth, indices ALWAYS silently reconstructed+overwritten on mismatch/corruption/missing; tip = last validated block, no separate tip file; ChainDB.Impl cross-checks via LedgerDB.openDB replaying to immutableDbTip
+- [dblock-directory-locking.md](dblock-directory-locking.md) — DbLock.hs: `<db-path>/lock` empty file, OS flock via ioFileLock, 2s timeout, DbLocked exception message shape; runs AFTER checkDbMarker, BEFORE ChainDB open
 
 ## Misc / Ledger Semantics
 - [v1-txinfo-wdrl-encoding.md](v1-txinfo-wdrl-encoding.md) — V1 txInfoWdrl=List[Constr0[cred,amt]] (NOT Map, that's V2)
