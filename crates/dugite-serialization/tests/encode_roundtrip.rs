@@ -208,6 +208,45 @@ fn value_multi_asset_is_array2() {
 }
 
 // ---------------------------------------------------------------------------
+// 2b. #930 — a value whose maps exceed the Haskell `encodeMap` threshold
+//     (> 23 entries → indefinite 0xbf...0xff at that map level) must
+//     round-trip through the public Conway output decoder unchanged.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tx_output_indefinite_multi_asset_maps_roundtrip_conway() {
+    // 24 policies (outer map indefinite), first policy with 30 assets
+    // (inner map indefinite), the rest 1 asset each.
+    let mut value = Value::lovelace(7_000_000);
+    for i in 0..24u8 {
+        let policy = Hash28::from_bytes([i; 28]);
+        let n_assets = if i == 0 { 30usize } else { 1 };
+        let assets: BTreeMap<AssetName, u64> = (0..n_assets)
+            .map(|j| (AssetName(vec![j as u8]), 1u64))
+            .collect();
+        value.multi_asset.insert(policy, assets);
+    }
+
+    let output = TransactionOutput {
+        address: test_addr(),
+        value: value.clone(),
+        datum: OutputDatum::None,
+        script_ref: None,
+        is_legacy: false,
+        raw_cbor: None,
+    };
+    let encoded = encode_transaction_output(&output);
+
+    // Decode via the public Conway (era 6) output decoder.
+    let decoded = dugite_serialization::decode::decode_transaction_output(6, &encoded)
+        .expect("Conway decoder must accept indefinite-length multi-asset maps");
+    assert_eq!(
+        decoded.value, value,
+        "indefinite-map multi-asset value must round-trip through the Conway decoder"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 3 & 4. Transaction output: legacy (array) vs post-Alonzo (map)
 // ---------------------------------------------------------------------------
 

@@ -2176,6 +2176,111 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Test 9b — Rule 5a (issue #930): real preprod Conway tx 96ae78f7 whose
+    // output[1] value measures EXACTLY maxValSize=5000 under Haskell's
+    // `encodeMap` semantics (definite-length map header for <= 23 entries,
+    // indefinite 0xbf...0xff above) but 5001 under a definite-only encoder
+    // (its 324-entry inner asset map costs a 3-byte definite header vs the
+    // fixed 2-byte indefinite overhead).
+    //
+    // tx 96ae78f724a27b0d76c3d6a861857af3a644de971fe0c7fcbefe4e45811e5687
+    // preprod epoch 303, slot 129586448, block 4990228 (PV10 Conway).
+    // output[1]: coin=3804474262, 6 policies, 358 assets total, one inner
+    // map of 324 entries. Every Haskell node accepted it; dugite v2.4.0
+    // rejected it with OutputValueTooLarge { maximum: 5000, actual: 5001 }.
+    //
+    // Like test 31c this validates against an empty UTxO (BadInputs et al.
+    // are expected); the invariant is solely about OutputValueTooLarge.
+    // -----------------------------------------------------------------------
+    const TX_96AE78F7_HEX: &str = include_str!("fixtures/tx-96ae78f7.hex");
+
+    #[test]
+    fn test_preprod_conway_maxvalsize_exact_bound_96ae78f7() {
+        let s = TX_96AE78F7_HEX.trim();
+        let bytes: Vec<u8> = (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("valid hex"))
+            .collect();
+        // Decode as era 6 (Conway).
+        let tx = dugite_serialization::decode::decode_transaction(6, &bytes)
+            .expect("decode real preprod Conway tx 96ae78f7");
+
+        // Pin the on-chain shape that produces the divergence.
+        assert_eq!(tx.body.outputs.len(), 3, "tx has 3 outputs");
+        let value = &tx.body.outputs[1].value;
+        assert_eq!(value.multi_asset.len(), 6, "output[1] has 6 policies");
+        let total_assets: usize = value.multi_asset.values().map(|a| a.len()).sum();
+        assert_eq!(total_assets, 358, "output[1] has 358 assets");
+        let over_23: Vec<usize> = value
+            .multi_asset
+            .values()
+            .map(|a| a.len())
+            .filter(|n| *n > 23)
+            .collect();
+        assert_eq!(
+            over_23,
+            vec![324],
+            "exactly one inner asset map above the encodeMap threshold"
+        );
+
+        // The Rule-5a measurement must match Haskell's serialize length.
+        assert_eq!(
+            crate::validation::scripts::estimate_value_cbor_size(value),
+            5000,
+            "output[1] value must measure 5000 bytes (Haskell encodeMap), not 5001"
+        );
+
+        // Full Phase-1 at maxValSize=5000 (mainnet/preprod default) must NOT
+        // report OutputValueTooLarge — the tx sits exactly at the strict
+        // `>` bound and is legal.
+        let empty_utxo = UtxoSet::new();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 10; // preprod Conway PV10
+        assert_eq!(params.max_val_size, 5000);
+        let result = validate_transaction(
+            &tx,
+            &empty_utxo,
+            &params,
+            129_586_448,
+            bytes.len() as u64,
+            None,
+        );
+        let has_too_large = match &result {
+            Ok(()) => false,
+            Err(errors) => errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::OutputValueTooLarge { .. })),
+        };
+        assert!(
+            !has_too_large,
+            "OutputValueTooLarge must not fire at maxValSize=5000 (issue #930): {result:?}"
+        );
+
+        // And at maxValSize=4999 the same output MUST be rejected, with the
+        // corrected actual=5000 measurement.
+        params.max_val_size = 4999;
+        let errors = validate_transaction(
+            &tx,
+            &empty_utxo,
+            &params,
+            129_586_448,
+            bytes.len() as u64,
+            None,
+        )
+        .expect_err("empty UTxO + maxValSize=4999 must fail");
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::OutputValueTooLarge {
+                    maximum: 4999,
+                    actual: 5000,
+                }
+            )),
+            "expected OutputValueTooLarge {{ maximum: 4999, actual: 5000 }}, got {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Test 10 — Rule 5c: output address on wrong network (testnet addr, mainnet node)
     // -----------------------------------------------------------------------
     #[test]
