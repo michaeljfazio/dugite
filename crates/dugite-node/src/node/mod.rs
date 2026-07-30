@@ -5452,6 +5452,12 @@ impl Node {
                         if let Some(ref lc) = self.connection_lifecycle {
                             lc.store_sync_trusted_clamp(trusted_restriction.clone());
                         }
+                        // #931: mirror the clamp's active/inactive state into
+                        // the peer manager so `haa_satisfied`'s failure
+                        // diagnostics WARN only while the clamp is genuinely
+                        // in force. Diagnostics-only — enforcement is the
+                        // governor filter + lifecycle chokepoints above.
+                        pm.set_sync_trusted_clamp_active(trusted_restriction.is_some());
                         governor.set_sync_trusted_restriction(trusted_restriction);
                         // #920: self-healing counterpart to the promotion-only
                         // clamp — every tick the clamp is active, demote any
@@ -5868,6 +5874,9 @@ impl Node {
                                 if let Some(ref lc) = self.connection_lifecycle {
                                     lc.store_sync_trusted_clamp(trusted_restriction.clone());
                                 }
+                                // #931: keep the diagnostics mirror in step on
+                                // the regression edge too (see the tick site).
+                                pm.set_sync_trusted_clamp_active(trusted_restriction.is_some());
                                 governor.set_sync_trusted_restriction(trusted_restriction);
                                 let to_demote = pm.untrusted_established_outbound();
                                 if !to_demote.is_empty() {

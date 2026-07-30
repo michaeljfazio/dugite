@@ -299,10 +299,17 @@ pub struct NodePeerManager {
     pub inner: PeerManager,
     /// Configuration.
     pub config: PeerManagerConfig,
-    /// Unix-seconds of the last HAA-failure WARN (0 = never) — throttles the
-    /// `haa_satisfied` diagnostics to one per 30 s; the predicate is called
-    /// from several hot paths per tick and would otherwise WARN-storm.
+    /// Unix-seconds of the last HAA-failure diagnostic (0 = never) — throttles
+    /// the `haa_satisfied` diagnostics to one per 30 s; the predicate is called
+    /// from several hot paths per tick and would otherwise log-storm.
     haa_warn_last_secs: std::sync::atomic::AtomicU64,
+    /// Whether the sync-time trusted-only clamp is currently in force,
+    /// mirrored from the governor tick's `compute_sync_trusted_restriction`
+    /// result (`Some` ⇒ true). Read ONLY by `haa_satisfied`'s failure
+    /// diagnostics to pick WARN vs debug severity (#931); it has no effect
+    /// on the predicate's return value or on clamp enforcement (which lives
+    /// in the governor filter and the connection-lifecycle chokepoints).
+    sync_trusted_clamp_active: std::sync::atomic::AtomicBool,
     /// Per-connection state machine (Haskell ConnectionManager state).
     ///
     /// Tracks the lifecycle state of each connection. Used to compute
@@ -380,6 +387,7 @@ impl NodePeerManager {
             inner: PeerManager::new(),
             config,
             haa_warn_last_secs: std::sync::atomic::AtomicU64::new(0),
+            sync_trusted_clamp_active: std::sync::atomic::AtomicBool::new(false),
             conn_states: HashMap::new(),
             local_addr: None,
             local_root_groups: Vec::new(),
@@ -1105,15 +1113,36 @@ impl NodePeerManager {
         let any_hot_trusted = hot_peers
             .iter()
             .any(|a| is_outbound(a) && trusted.contains(a));
+        // #931: the clause (a)/(b) failure diagnostics WARN only while the
+        // sync-time trusted-only clamp is actually in force. Haskell
+        // reference: `outboundConnectionsState`'s `(Unrestricted,
+        // DontUseBootstrapPeers, PraosMode)` branch is `UntrustedState` — a
+        // normal, SILENT state in cardano-node (nothing warns about
+        // untrusted established peers there). Praos mode (the dugite
+        // default) never has a clamp, so an unconditional WARN here fired on
+        // perfectly normal ledger-peer establishment.
+        let diag_level = haa_diagnostic_level(self.sync_trusted_clamp_active());
         if !any_hot_trusted {
             if self.haa_warn_permitted() {
-                tracing::warn!(
-                    hot_total = hot_peers.len(),
-                    trusted_total = trusted.len(),
-                    hot_sample = ?hot_peers.iter().take(5).collect::<Vec<_>>(),
-                    "HAA clause (a) failed: no hot outbound peer is in the \
-                     trusted set (bootstrap ∪ local roots)"
-                );
+                match diag_level {
+                    HaaDiagnosticLevel::Warn => tracing::warn!(
+                        hot_total = hot_peers.len(),
+                        trusted_total = trusted.len(),
+                        hot_sample = ?hot_peers.iter().take(5).collect::<Vec<_>>(),
+                        "HAA clause (a) failed while the sync-time \
+                         trusted-only clamp is active: no hot outbound peer \
+                         is in the trusted set (bootstrap ∪ local roots)"
+                    ),
+                    HaaDiagnosticLevel::Debug => tracing::debug!(
+                        hot_total = hot_peers.len(),
+                        trusted_total = trusted.len(),
+                        hot_sample = ?hot_peers.iter().take(5).collect::<Vec<_>>(),
+                        "HAA clause (a) not satisfied: no hot outbound peer \
+                         in the trusted set (bootstrap ∪ local roots) — no \
+                         sync-time clamp active; normal outside clamped \
+                         genesis-mode sync (Haskell UntrustedState is silent)"
+                    ),
+                }
             }
             return false;
         }
@@ -1122,22 +1151,54 @@ impl NodePeerManager {
         let untrusted_established = self.untrusted_established_outbound();
         if !untrusted_established.is_empty() {
             if self.haa_warn_permitted() {
-                tracing::warn!(
-                    untrusted_count = untrusted_established.len(),
-                    trusted_total = trusted.len(),
-                    untrusted_sample =
-                        ?untrusted_established.iter().take(5).collect::<Vec<_>>(),
-                    "HAA clause (b) failed: untrusted outbound peer(s) are \
-                     established — the sync-time trusted-only clamp was bypassed"
-                );
+                match diag_level {
+                    HaaDiagnosticLevel::Warn => tracing::warn!(
+                        untrusted_count = untrusted_established.len(),
+                        trusted_total = trusted.len(),
+                        untrusted_sample =
+                            ?untrusted_established.iter().take(5).collect::<Vec<_>>(),
+                        "HAA clause (b) failed: untrusted outbound peer(s) \
+                         are established while the sync-time trusted-only \
+                         clamp is active — the per-tick governor sweep \
+                         (#920) should demote them next tick"
+                    ),
+                    HaaDiagnosticLevel::Debug => tracing::debug!(
+                        untrusted_count = untrusted_established.len(),
+                        trusted_total = trusted.len(),
+                        untrusted_sample =
+                            ?untrusted_established.iter().take(5).collect::<Vec<_>>(),
+                        "HAA clause (b) not satisfied: untrusted outbound \
+                         peer(s) established with no sync-time clamp active \
+                         — normal ledger-peer operation (Haskell \
+                         UntrustedState is silent in Praos mode)"
+                    ),
+                }
             }
             return false;
         }
         true
     }
 
-    /// Rate-limit gate for the `haa_satisfied` failure WARNs: at most one
-    /// per 30 s (the predicate runs on several hot paths per governor tick).
+    /// Mirror of the governor tick's sync-time trusted-only clamp state
+    /// (#931): `active` = `compute_sync_trusted_restriction(...)` returned
+    /// `Some`. Diagnostics-only — see the `sync_trusted_clamp_active` field
+    /// docs; this never feeds back into clamp enforcement or the
+    /// `haa_satisfied` return value.
+    pub fn set_sync_trusted_clamp_active(&self, active: bool) {
+        self.sync_trusted_clamp_active
+            .store(active, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the sync-time trusted-only clamp was in force as of the last
+    /// governor tick (#931). Diagnostics-only.
+    fn sync_trusted_clamp_active(&self) -> bool {
+        self.sync_trusted_clamp_active
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Rate-limit gate for the `haa_satisfied` failure diagnostics: at most
+    /// one per 30 s (the predicate runs on several hot paths per governor
+    /// tick).
     fn haa_warn_permitted(&self) -> bool {
         use std::sync::atomic::Ordering;
         let now = std::time::SystemTime::now()
@@ -1265,6 +1326,38 @@ impl std::fmt::Display for PeerManagerStats {
             self.duplex,
             self.big_ledger,
         )
+    }
+}
+
+// ─── #931 — HAA failure-diagnostic severity ──────────────────────────────────
+
+/// Severity for [`NodePeerManager::haa_satisfied`]'s clause (a)/(b) failure
+/// diagnostics.
+///
+/// WARN is reserved for the one state where the failure is actionable: the
+/// sync-time trusted-only clamp is in force, so an untrusted established
+/// outbound peer should not (or should no longer) be there — the #920
+/// per-tick governor sweep demotes it on the next tick. In every other
+/// state an unsatisfied HAA is normal operation: Haskell's
+/// `outboundConnectionsState` maps `(Unrestricted, DontUseBootstrapPeers,
+/// PraosMode)` to `UntrustedState` unconditionally, and cardano-node is
+/// silent about it (issue #931) — dugite must not WARN there either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HaaDiagnosticLevel {
+    /// Sync-time trusted-only clamp active — operator-relevant WARN.
+    Warn,
+    /// No clamp in force (e.g. Praos mode, or Genesis mode at CaughtUp) —
+    /// normal state, debug-level visibility only.
+    Debug,
+}
+
+/// Pure severity decision for the HAA failure diagnostics — factored out of
+/// [`NodePeerManager::haa_satisfied`] so tests can pin the mapping (#931).
+fn haa_diagnostic_level(sync_trusted_clamp_active: bool) -> HaaDiagnosticLevel {
+    if sync_trusted_clamp_active {
+        HaaDiagnosticLevel::Warn
+    } else {
+        HaaDiagnosticLevel::Debug
     }
 }
 
@@ -1640,6 +1733,211 @@ mod tests {
             !pm.haa_satisfied(5),
             "an established untrusted outbound peer must break the HAA"
         );
+    }
+
+    // ─── #931 — HAA failure diagnostics gated on the sync-time clamp ──────
+
+    /// Captures `(level, message)` for every tracing event this module emits
+    /// while `f` runs. Same lightweight local-subscriber pattern as
+    /// `logging.rs::test_reload_filter_swaps_live` — nextest's
+    /// process-per-test isolation means no global subscriber interferes.
+    fn capture_networking_events(f: impl FnOnce()) -> Vec<(tracing::Level, String)> {
+        use std::sync::{Arc, Mutex};
+        use tracing::Subscriber;
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+        use tracing_subscriber::registry::Registry;
+
+        struct MsgVisitor(Option<String>);
+        impl tracing::field::Visit for MsgVisitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = Some(format!("{value:?}"));
+                }
+            }
+        }
+
+        struct CaptureLayer(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+        impl<S: Subscriber> Layer<S> for CaptureLayer {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                if event.metadata().target() == "dugite_node::node::networking" {
+                    let mut v = MsgVisitor(None);
+                    event.record(&mut v);
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .push((*event.metadata().level(), v.0.unwrap_or_default()));
+                }
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = Registry::default().with(CaptureLayer(Arc::clone(&captured)));
+        tracing::subscriber::with_default(subscriber, f);
+        let events = captured.lock().unwrap().clone();
+        events
+    }
+
+    /// A peer manager whose clause (b) fails: one hot trusted bootstrap peer
+    /// (clause (a) satisfied) plus one established untrusted public peer.
+    fn pm_with_clause_b_failure() -> NodePeerManager {
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        let boot: SocketAddr = "3.74.40.92:3001".parse().unwrap();
+        pm.add_bootstrap_peer(boot);
+        pm.peer_connected(&boot, ConnectionDirection::Outbound);
+        pm.inner.promote_to_hot(&boot);
+        let public: SocketAddr = "8.8.8.8:3001".parse().unwrap();
+        pm.peer_connected(&public, ConnectionDirection::Outbound);
+        pm.inner.promote_to_hot(&public);
+        pm
+    }
+
+    /// Pure decision table (#931): WARN only while the sync-time trusted-only
+    /// clamp is in force; debug otherwise (Haskell's `(Unrestricted,
+    /// DontUseBootstrapPeers, PraosMode) → UntrustedState` is normal+silent).
+    #[test]
+    fn haa_diagnostic_level_decision_table() {
+        assert_eq!(haa_diagnostic_level(true), HaaDiagnosticLevel::Warn);
+        assert_eq!(haa_diagnostic_level(false), HaaDiagnosticLevel::Debug);
+    }
+
+    /// #931 regression: with NO sync-time clamp active (Praos mode / Genesis
+    /// CaughtUp — the preprod incident state), a clause (b) failure must NOT
+    /// emit a WARN. It stays visible at debug level, without any "bypassed"
+    /// claim.
+    #[test]
+    fn haa_clause_b_is_debug_not_warn_when_clamp_inactive() {
+        let pm = pm_with_clause_b_failure();
+        // Default clamp state is inactive — exactly the Praos-mode reality.
+        let events = capture_networking_events(|| {
+            assert!(!pm.haa_satisfied(5));
+        });
+        let haa_events: Vec<_> = events
+            .iter()
+            .filter(|(_, msg)| msg.contains("HAA clause"))
+            .collect();
+        assert!(
+            !haa_events
+                .iter()
+                .any(|(lvl, _)| *lvl == tracing::Level::WARN),
+            "no WARN may fire when the sync-time clamp is not active — got {haa_events:?}"
+        );
+        assert!(
+            haa_events
+                .iter()
+                .any(|(lvl, msg)| *lvl == tracing::Level::DEBUG && msg.contains("clause (b)")),
+            "the clause (b) diagnostic must still be visible at debug level — got {events:?}"
+        );
+        assert!(
+            !haa_events.iter().any(|(_, msg)| msg.contains("bypass")),
+            "no diagnostic may claim a clamp bypass — got {haa_events:?}"
+        );
+    }
+
+    /// #931: while the sync-time clamp IS active, the clause (b) diagnostic
+    /// keeps WARN severity — but states what is known (untrusted peers
+    /// established while the clamp is active; the #920 per-tick sweep demotes
+    /// them next tick) instead of asserting a bypass.
+    #[test]
+    fn haa_clause_b_warns_without_bypass_claim_when_clamp_active() {
+        let pm = pm_with_clause_b_failure();
+        pm.set_sync_trusted_clamp_active(true);
+        let events = capture_networking_events(|| {
+            assert!(!pm.haa_satisfied(5));
+        });
+        let warn: Vec<_> = events
+            .iter()
+            .filter(|(lvl, msg)| *lvl == tracing::Level::WARN && msg.contains("clause (b)"))
+            .collect();
+        assert_eq!(
+            warn.len(),
+            1,
+            "exactly one clause (b) WARN while the clamp is active — got {events:?}"
+        );
+        assert!(
+            !warn[0].1.contains("bypass"),
+            "the WARN must not claim a bypass — got {:?}",
+            warn[0].1
+        );
+        assert!(
+            warn[0].1.contains("clamp is active"),
+            "the WARN must state the clamp is active — got {:?}",
+            warn[0].1
+        );
+    }
+
+    /// #931: clause (a) gets the same gating — debug when no clamp is
+    /// active, WARN when it is.
+    #[test]
+    fn haa_clause_a_diagnostic_severity_follows_clamp() {
+        // Clause (a) failure: a trusted local root is configured but not
+        // established; the only hot outbound peer is untrusted.
+        let make_pm = || {
+            let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+            pm.add_local_root_group(LocalRootGroupInfo {
+                name: "relays".into(),
+                addrs: vec!["127.0.0.1:3002".parse().unwrap()],
+                hot_valency: 1,
+                warm_valency: 1,
+                diffusion_mode: None,
+                behind_firewall: false,
+                advertise: false,
+            });
+            let public: SocketAddr = "8.8.8.8:3001".parse().unwrap();
+            pm.peer_connected(&public, ConnectionDirection::Outbound);
+            pm.inner.promote_to_hot(&public);
+            pm
+        };
+
+        let pm = make_pm();
+        let events = capture_networking_events(|| {
+            assert!(!pm.haa_satisfied(5));
+        });
+        assert!(
+            !events
+                .iter()
+                .any(|(lvl, msg)| *lvl == tracing::Level::WARN && msg.contains("HAA clause")),
+            "clause (a) must not WARN without an active clamp — got {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|(lvl, msg)| *lvl == tracing::Level::DEBUG && msg.contains("clause (a)")),
+            "clause (a) must stay visible at debug level — got {events:?}"
+        );
+
+        let pm = make_pm();
+        pm.set_sync_trusted_clamp_active(true);
+        let events = capture_networking_events(|| {
+            assert!(!pm.haa_satisfied(5));
+        });
+        assert!(
+            events
+                .iter()
+                .any(|(lvl, msg)| *lvl == tracing::Level::WARN && msg.contains("clause (a)")),
+            "clause (a) must WARN while the clamp is active — got {events:?}"
+        );
+    }
+
+    /// #931 behavior guard: the clamp-active flag is diagnostics-only —
+    /// `haa_satisfied`'s RETURN VALUE must be identical in both clamp states,
+    /// for both a failing and a satisfied peer set.
+    #[test]
+    fn haa_satisfied_return_value_independent_of_clamp_flag() {
+        // Failing set (clause (b) violated): false regardless of the flag.
+        let pm = pm_with_clause_b_failure();
+        assert!(!pm.haa_satisfied(5), "clamp inactive: unsatisfied");
+        pm.set_sync_trusted_clamp_active(true);
+        assert!(!pm.haa_satisfied(5), "clamp active: still unsatisfied");
+
+        // Satisfied set (hot trusted bootstrap only): true regardless.
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        let boot: SocketAddr = "3.74.40.92:3001".parse().unwrap();
+        pm.add_bootstrap_peer(boot);
+        pm.peer_connected(&boot, ConnectionDirection::Outbound);
+        pm.inner.promote_to_hot(&boot);
+        assert!(pm.haa_satisfied(5), "clamp inactive: satisfied");
+        pm.set_sync_trusted_clamp_active(true);
+        assert!(pm.haa_satisfied(5), "clamp active: still satisfied");
     }
 
     #[test]
