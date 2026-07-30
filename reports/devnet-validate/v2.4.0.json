@@ -1,0 +1,208 @@
+{
+  "schema_version": 1,
+  "timestamp": "2026-07-30T09:32:18Z",
+  "git_rev": "3ebed5ad573229f68142f214a43108ecb0022edc",
+  "release_tag": "v2.4.0",
+  "preset": "standard",
+  "cardano_node_version": "11.0.1",
+  "cardano_cli_version": "11.0.0.0",
+  "rounds": [
+    {
+      "name": "baseline",
+      "pass": true,
+      "evidence_dir": "evidence-archive/auto/20260730T090511Z",
+      "duration_seconds": 120,
+      "git_rev": "3ebed5ad573229f68142f214a43108ecb0022edc",
+      "cardano_node_version": "11.0.1",
+      "cardano_cli_version": "11.0.0.0",
+      "blocks": {
+        "total_forges": 53,
+        "canonical": 53,
+        "orphans": 0,
+        "orphan_rate": 0.0000
+      },
+      "tip_age": {
+        "avg_seconds": 1.92,
+        "p99_seconds": 8.00
+      },
+      "chain_density": 0.445,
+      "tx_zoo": {
+        "pass": 84,
+        "fail": 0,
+        "skip": 1,
+        "total": 85,
+        "source": "round"
+      },
+      "predicates": {
+        "p1_forge_cross_check": true,
+        "p2_per_bp_attribution": true,
+        "p3_tx_inclusion": null,
+        "p4_tip_parity": true,
+        "p5_tip_age": true
+      },
+      "log_errors": {
+        "dugite-bp": {
+          "errors": 0,
+          "warns": 4
+        },
+        "dugite-relay": {
+          "errors": 0,
+          "warns": 94
+        },
+        "cardano-bp": {
+          "errors": 0,
+          "warns": 0
+        }
+      },
+      "anomalies": [],
+      "epoch_transitions_observed": 1,
+      "n2n_adversarial": {
+        "pass": 0,
+        "fail": 0,
+        "panic": 0,
+        "silent_skip": 0
+      },
+      "cli_parity": {
+        "equal": 0,
+        "divergent": 0,
+        "skip": 0,
+        "error": 0
+      }
+    },
+    {
+      "name": "epoch-boundary",
+      "pass": true,
+      "evidence_dir": "evidence-archive/auto/20260730T091012Z",
+      "duration_seconds": 900,
+      "git_rev": "3ebed5ad573229f68142f214a43108ecb0022edc",
+      "cardano_node_version": "11.0.1",
+      "cardano_cli_version": "11.0.0.0",
+      "blocks": {
+        "total_forges": 454,
+        "canonical": 454,
+        "orphans": 0,
+        "orphan_rate": 0.0000
+      },
+      "tip_age": {
+        "avg_seconds": 1.11,
+        "p99_seconds": 6.00
+      },
+      "chain_density": 0.507,
+      "tx_zoo": {
+        "pass": 40,
+        "fail": 1,
+        "skip": 0,
+        "total": 41,
+        "source": "round"
+      },
+      "predicates": {
+        "p1_forge_cross_check": true,
+        "p2_per_bp_attribution": true,
+        "p3_tx_inclusion": true,
+        "p4_tip_parity": true,
+        "p5_tip_age": true
+      },
+      "log_errors": {
+        "dugite-bp": {
+          "errors": 0,
+          "warns": 7
+        },
+        "dugite-relay": {
+          "errors": 0,
+          "warns": 9
+        },
+        "cardano-bp": {
+          "errors": 0,
+          "warns": 0
+        }
+      },
+      "anomalies": [],
+      "epoch_transitions_observed": 1,
+      "n2n_adversarial": {
+        "pass": 0,
+        "fail": 0,
+        "panic": 0,
+        "silent_skip": 0
+      },
+      "cli_parity": {
+        "equal": 0,
+        "divergent": 0,
+        "skip": 0,
+        "error": 0
+      }
+    },
+    {
+      "name": "restart",
+      "pass": true,
+      "evidence_dir": "evidence/20260730T092845Z",
+      "duration_seconds": 60,
+      "git_rev": "3ebed5ad573229f68142f214a43108ecb0022edc",
+      "cardano_node_version": "11.0.1",
+      "cardano_cli_version": "11.0.0.0",
+      "blocks": {
+        "total_forges": 34,
+        "canonical": 34,
+        "orphans": 0,
+        "orphan_rate": 0.0000
+      },
+      "tip_age": {
+        "avg_seconds": 1.21,
+        "p99_seconds": 6.00
+      },
+      "chain_density": 0.642,
+      "tx_zoo": {
+        "pass": 0,
+        "fail": 0,
+        "skip": 0,
+        "total": 0,
+        "source": "none"
+      },
+      "predicates": {
+        "p1_forge_cross_check": true,
+        "p2_per_bp_attribution": true,
+        "p3_tx_inclusion": null,
+        "p4_tip_parity": true,
+        "p5_tip_age": null
+      },
+      "log_errors": {
+        "dugite-bp": {
+          "errors": 0,
+          "warns": 8
+        },
+        "dugite-relay": {
+          "errors": 0,
+          "warns": 9
+        },
+        "cardano-bp": {
+          "errors": 0,
+          "warns": 0
+        }
+      },
+      "anomalies": [],
+      "epoch_transitions_observed": 2,
+      "n2n_adversarial": {
+        "pass": 0,
+        "fail": 0,
+        "panic": 0,
+        "silent_skip": 0
+      },
+      "cli_parity": {
+        "equal": 0,
+        "divergent": 0,
+        "skip": 0,
+        "error": 0
+      }
+    }
+  ],
+  "summary": {
+    "pass": true,
+    "rounds_pass": 3,
+    "rounds_fail": 0,
+    "total_canonical_blocks": 541,
+    "total_tx_zoo_pass": 124,
+    "total_tx_zoo_fail": 1,
+    "invalid_forges_detected": 0,
+    "critical_anomalies": 0
+  },
+  "trend": null
+}

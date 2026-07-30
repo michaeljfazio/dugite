@@ -95,7 +95,58 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 - 28-byte hash types (DRep keys, pool voter keys, required signers) must be padded to 32 bytes via `Hash28::to_hash32_padded()` — do not use `Hash<32>::from()` directly on 28-byte hashes
 
 ## Current Focus
-**v2.3.1 released (2026-07-30)** — patch: #925 N2C rejection diagnostics.
+**v2.4.0 released (2026-07-30)** — storage durability & sync recovery:
+#926-#929, the full defect chain behind the 2026-07-28 preprod BP incident
+(38k-slot indexed hole + permanent all-peer sync wedge). Drop-in, SNAPSHOT
+unchanged at 31; two new DB files (`lock`, `immutable/clean`).
+
+- **#926 (storage)** — the active chunk's secondary index was memory-only
+  until the shutdown-only flush(), so a hard stop lost every entry since
+  boot (~10 h in the incident); open silently skipped the index-less chunk
+  and `open_for_writing` reused its number (File::create over live data).
+  Now: entries written per-append (Haskell-style); open-time
+  reconciliation in BOTH open paths (the old validate ran only in
+  read-only `open()` — the node never validated). Tail chunk: full CRC +
+  truncate-to-verified-prefix, last entry's true end recovered by CRC scan
+  (0x82-envelope candidates); index-less non-empty tail quarantined as
+  `.chunk.orphaned`; damage below the tail = hard `InconsistentChunk`
+  error. Cross-chunk boundary linkage (first block's prev_hash vs previous
+  chunk's tip — Haskell ChunkFileDoesntFit): per-chunk checks alone PASS
+  the incident DB (the orphan island is internally CRC-valid and tip.meta
+  agrees with it); tail-boundary break quarantines, deeper break refuses.
+- **#928 (storage)** — tip.meta trusted only when (slot,hash) == last
+  indexed entry, else clamped (block_no recovered by decoding the tip
+  block) and rewritten; `immutable/clean` marker (written by shutdown
+  flush, removed at open-for-writing) gates mmap hash_index reuse —
+  unclean stop → rebuild; flush path uses `has_verified_block` (read+CRC)
+  so a phantom index entry can't suppress re-flush.
+- **#927 (sync)** — with ledger < immutable, `build_known_points` offered
+  the stale ledger tip FIRST and the #699 guard disconnected every peer's
+  protocol-mandated initial rollback to that exact offered point (HAA
+  dead, zero progress forever). Now newest-first by slot in that state,
+  plus the guard exempts the initial rollback to the EXACT agreed
+  intersection (slot+hash) at-or-above the ledger tip — oracle-verified
+  Haskell alignment (`intersectFound` re-anchors the candidate fragment
+  without any rollback-validity check; only wire rollbacks in StNext hit
+  the k-bound). Exemption unreachable when ledger >= immutable; #699
+  divergent-peer protection intact. Startup warns on ledger < immutable.
+- **#929 (storage)** — exclusive advisory flock on `<db>/lock` in
+  `ChainDB::open` (cardano-node withLockDB equivalent); second process
+  fails fast naming the holder pid. Tests opening one dir twice must drop
+  the first handle.
+
+QA: full gate 7503/0; devnet-validate standard **3/3 rounds PASS**
+(`reports/devnet-validate/v2.4.0.json`) — 541 canonical blocks, 0 invalid
+forges, bidirectional parity 41/41 (0 off-diagonal), cli-parity clean,
+adversarial 7/7, byte-exact treasury/reserves after first RUPD.
+**Incident replay**: a copy of the preserved damaged db-preprod opens
+under v2.4.0 to tip=(129437577, block 4983447, df28215f…) with the orphan
+island quarantined — the #926 manual recovery, automated (block height
+verified vs header decode + Koios; the issue text's 4983444 was an
+off-by-three). **Zero open issues.**
+
+### v2.3.1 (2026-07-30)
+Patch: #925 N2C rejection diagnostics.
 Drop-in from v2.3.0, SNAPSHOT unchanged at 31. Root cause was two
 compounding defects: (1) `N2CClient`'s file-wide `protocol_err` hardcoded
 `LocalStateQuery`/`CborDecode` for EVERY client error, including
