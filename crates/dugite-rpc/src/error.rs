@@ -105,4 +105,45 @@ mod tests {
             assert_eq!(status.code(), expected);
         }
     }
+
+    /// The structured rejection reason must reach the client verbatim —
+    /// clients parse per-rule semantics out of the message text.
+    #[test]
+    fn tx_rejected_reason_survives_verbatim() {
+        let reason = "ConwayUtxowFailure (MissingVKeyWitnessesUTXOW ...)";
+        let status: Status = RpcError::TxRejected(reason.into()).into();
+        assert_eq!(status.message(), reason);
+    }
+
+    /// `Unimplemented` names the missing feature so operators can tell a
+    /// stubbed method from an unknown-route UNIMPLEMENTED.
+    #[test]
+    fn unimplemented_message_names_the_feature() {
+        let status: Status = RpcError::Unimplemented("EvalTx").into();
+        assert!(
+            status.message().contains("EvalTx"),
+            "message was: {}",
+            status.message()
+        );
+        assert!(status.message().contains("not implemented"));
+    }
+
+    /// Display impls carry the classification prefix — log lines rely on
+    /// them to be grep-able by failure class.
+    #[test]
+    fn display_carries_classification_prefix() {
+        assert_eq!(
+            RpcError::InvalidArgument("bad ref".into()).to_string(),
+            "invalid argument: bad ref"
+        );
+        assert_eq!(
+            RpcError::NotFound("block".into()).to_string(),
+            "not found: block"
+        );
+        assert_eq!(
+            RpcError::TxRejected("r".into()).to_string(),
+            "transaction rejected: r"
+        );
+        assert_eq!(RpcError::Cancelled.to_string(), "cancelled");
+    }
 }

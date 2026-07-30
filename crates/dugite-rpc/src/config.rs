@@ -76,3 +76,32 @@ pub struct RpcTlsConfig {
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    /// The default MUST bind loopback only — an unauthenticated TCP gRPC
+    /// endpoint silently defaulting to `0.0.0.0` would be a security
+    /// regression for every deployment that omits `Rpc.Bind`.
+    #[test]
+    fn default_binds_loopback_only() {
+        let c = RpcConfig::default();
+        assert_eq!(c.bind, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    /// Defaults must track the documented constants — a drift here changes
+    /// behaviour for every host that relies on `..Default::default()`.
+    #[test]
+    fn defaults_match_documented_constants() {
+        let c = RpcConfig::default();
+        assert_eq!(c.port, DEFAULT_RPC_PORT);
+        assert_eq!(c.stream_buffer, DEFAULT_STREAM_BUFFER);
+        assert_eq!(c.max_concurrent_streams, DEFAULT_MAX_CONCURRENT_STREAMS);
+        assert!(c.reflection_enabled, "reflection is on by default");
+        assert!(!c.web_enabled, "gRPC-Web is opt-in");
+        assert!(c.alpha_enabled, "v1alpha exposed during stabilisation");
+        assert!(c.tls.is_none(), "plaintext unless explicitly configured");
+    }
+}
