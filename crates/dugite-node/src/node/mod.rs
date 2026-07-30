@@ -2978,6 +2978,39 @@ impl Node {
             return Ok(());
         }
 
+        // Issue #927 invariant: after replay the applied ledger tip must have
+        // reached the ImmutableDB tip. A persistent ledger<immutable state
+        // (crash-recovery index hole per #926, replay apply-failure) used to
+        // be invisible apart from per-peer ChainSync churn while the node made
+        // zero progress; the known-points ordering and #699-guard exemption
+        // now keep sync alive in this state, and this warning makes the seam
+        // itself visible to the operator.
+        {
+            let ledger_slot = {
+                let ls = self.ledger_state.read().await;
+                ls.tip.point.slot().map(|s| s.0).unwrap_or(0)
+            };
+            let imm = self.chain_db.read().await.get_immutable_tip_point();
+            let imm_slot = imm
+                .as_ref()
+                .and_then(|p| p.slot())
+                .map(|s| s.0)
+                .unwrap_or(0);
+            if ledger_slot < imm_slot {
+                warn!(
+                    ledger_slot,
+                    immutable_tip_slot = imm_slot,
+                    gap_slots = imm_slot - ledger_slot,
+                    "Ledger tip is BELOW the ImmutableDB tip after replay — the \
+                     immutable chain contains blocks the ledger could not apply \
+                     (crash-damaged index per #926, or a replay apply failure). \
+                     Sync will advance the ledger from ChainDB via the gap-bridge \
+                     where possible; if this gap persists, inspect the seam and \
+                     consider re-import via `dugite-node mithril-import` (#927)."
+                );
+            }
+        }
+
         // Reseed the consensus validator's opcert counters from the post-replay
         // ledger state.
         //

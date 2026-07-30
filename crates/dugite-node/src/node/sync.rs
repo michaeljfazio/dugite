@@ -4175,26 +4175,60 @@ pub(crate) fn build_known_points(inp: &KnownPointsInputs) -> Vec<Point> {
     // intersection — it does NOT require it to be first.  A behind peer simply
     // falls through the newer points it doesn't have and matches the immutable
     // tip / deep-historical anchors lower in the list.
+    //
+    // Issue #927: the ledger-tip-first order is only newest-first while
+    // ledger >= immutable.  When the ledger tip is BEHIND the immutable tip
+    // (crash recovery, #926 index hole, replay apply-failure), offering the
+    // stale ledger tip first makes every up-to-date peer intersect there, and
+    // its protocol-mandated initial rollback to that sub-immutable point used
+    // to trip the #699 guard — every peer disconnected ~1 s after handshake,
+    // forever.  In that state the immutable tip must precede the stale ledger
+    // tip (true newest-first by slot); a peer matching the immutable tip lets
+    // the gap-bridge advance the ledger from ChainDB.
+    let ledger_slot = inp.ledger_tip.slot().map(|s| s.0).unwrap_or(0);
+    let immutable_slot = inp
+        .immutable_tip
+        .as_ref()
+        .and_then(|p| p.slot())
+        .map(|s| s.0)
+        .unwrap_or(0);
+    let ledger_behind_immutable = immutable_slot > ledger_slot;
 
-    // 1. Ledger tip — our canonical applied tip; valid even when the
-    //    surrounding volatile chain is divergent.  An up-to-date peer matches
-    //    here and streams forward with no re-fetch of already-applied blocks.
-    push_unique(&mut out, inp.ledger_tip.clone());
-
-    // 2. Volatile recent points (newest → older) — skipped when chain_diverged.
-    //    `get_chain_points` returns these newest-first; the tip itself dedupes
-    //    against the ledger tip above.
-    if !inp.chain_diverged {
-        for p in &inp.volatile_chain_points {
-            push_unique(&mut out, p.clone());
+    if ledger_behind_immutable {
+        // #927 anomalous state — newest-first by slot: volatile points are
+        // anchored at the immutable tip (above it), then the immutable tip,
+        // then the stale ledger tip as a fallback for peers that are behind
+        // our immutable tip but still carry our applied prefix.
+        if !inp.chain_diverged {
+            for p in &inp.volatile_chain_points {
+                push_unique(&mut out, p.clone());
+            }
         }
-    }
+        if let Some(imm) = inp.immutable_tip.clone() {
+            push_unique(&mut out, imm);
+        }
+        push_unique(&mut out, inp.ledger_tip.clone());
+    } else {
+        // 1. Ledger tip — our canonical applied tip; valid even when the
+        //    surrounding volatile chain is divergent.  An up-to-date peer matches
+        //    here and streams forward with no re-fetch of already-applied blocks.
+        push_unique(&mut out, inp.ledger_tip.clone());
 
-    // 3. ImmutableDB tip — unconditionally INCLUDED (issue #552), now after the
-    //    volatile window so it only serves as the fallback intersection for a
-    //    peer that is behind our volatile window.
-    if let Some(imm) = inp.immutable_tip.clone() {
-        push_unique(&mut out, imm);
+        // 2. Volatile recent points (newest → older) — skipped when chain_diverged.
+        //    `get_chain_points` returns these newest-first; the tip itself dedupes
+        //    against the ledger tip above.
+        if !inp.chain_diverged {
+            for p in &inp.volatile_chain_points {
+                push_unique(&mut out, p.clone());
+            }
+        }
+
+        // 3. ImmutableDB tip — unconditionally INCLUDED (issue #552), now after the
+        //    volatile window so it only serves as the fallback intersection for a
+        //    peer that is behind our volatile window.
+        if let Some(imm) = inp.immutable_tip.clone() {
+            push_unique(&mut out, imm);
+        }
     }
 
     // 4. Deep historical anchors from older ImmutableDB chunks (newest → oldest).
@@ -4205,6 +4239,39 @@ pub(crate) fn build_known_points(inp: &KnownPointsInputs) -> Vec<Point> {
     // 5. Final fallback — Origin always closes the list.
     out.push(Point::Origin);
     out
+}
+
+/// #927: should the immutable-tip guard exempt this `MsgRollBackward`?
+///
+/// The server's initial rollback to the exact point it answered in
+/// `MsgIntersectFound` is protocol-mandated, not evidence — Haskell's
+/// ChainSync client re-anchors the candidate fragment at the intersection
+/// without ever running the rollback-validity check on it. dugite's #699
+/// immutable-tip guard used to disconnect peers for this mandated rollback
+/// whenever the agreed intersection sat below the immutable tip, which with
+/// a persistent ledger<immutable state (#926 index hole, replay
+/// apply-failure) meant EVERY honest peer was dropped ~1 s after handshake.
+///
+/// Exempt iff ALL hold:
+/// - it is the initial (first post-intersection) rollback,
+/// - the rollback point equals the agreed intersection exactly (slot+hash —
+///   a lying server that answers one point and rolls back to another stays
+///   guarded),
+/// - the point is at-or-above our applied ledger tip: streaming forward from
+///   there is pure progress. An initial rollback BELOW the ledger tip keeps
+///   the #699 disconnect (divergent-peer stall shape). In the healthy
+///   ledger>=immutable state the exemption is unreachable, because the guard
+///   only fires for rollback < immutable <= ledger.
+pub(crate) fn is_exempt_initial_agreed_rollback(
+    is_initial: bool,
+    rollback_slot: u64,
+    rollback_hash: Option<[u8; 32]>,
+    agreed_intersection: Option<(u64, [u8; 32])>,
+    ledger_tip_slot: u64,
+) -> bool {
+    is_initial
+        && agreed_intersection.is_some_and(|(s, h)| s == rollback_slot && rollback_hash == Some(h))
+        && rollback_slot >= ledger_tip_slot
 }
 
 /// Upper bound on the number of points sent in a single `MsgFindIntersect`.
@@ -5332,6 +5399,16 @@ pub async fn chainsync_client_task(
             CodecPoint::Origin => 0,
         })
         .unwrap_or(0);
+    // #927: the exact point the server answered in `MsgIntersectFound`. The
+    // server's initial `MsgRollBackward` targets exactly this point; the
+    // immutable-tip guard must never treat that mandated rollback as
+    // divergence evidence (we offered the point ourselves). Refreshed on CSJ
+    // re-intersection below.
+    let mut agreed_intersection: Option<(u64, [u8; 32])> =
+        intersection.as_ref().and_then(|p| match p {
+            CodecPoint::Specific(s, h) => Some((*s, *h)),
+            CodecPoint::Origin => None,
+        });
     {
         let mut chains = candidate_chains.write().await;
         chains.insert(
@@ -5430,6 +5507,10 @@ pub async fn chainsync_client_task(
                 intersection_slot = match &point {
                     CodecPoint::Specific(s, _) => *s,
                     CodecPoint::Origin => 0,
+                };
+                agreed_intersection = match &point {
+                    CodecPoint::Specific(s, h) => Some((*s, *h)),
+                    CodecPoint::Origin => None,
                 };
                 let mut chains = candidate_chains.write().await;
                 if let Some(state) = chains.get_mut(&peer_addr) {
@@ -6252,7 +6333,58 @@ pub async fn chainsync_client_task(
                                 .and_then(|p| p.slot().map(|s| s.0))
                                 .unwrap_or(0);
 
-                            if immutable_slot > 0 && rollback_slot < immutable_slot {
+                            // #927: the initial rollback to the EXACT agreed
+                            // intersection point is protocol-mandated — the
+                            // server rolls the client back to the negotiated
+                            // point before streaming.  Haskell never routes
+                            // this through the rollback-validity check at all:
+                            // `intersectFound` re-anchors the candidate
+                            // fragment at the intersection directly, and only
+                            // wire rollbacks inside StNext reach the k-bound
+                            // check.  Disconnecting for it is self-inflicted
+                            // (we offered the point), and with a persistent
+                            // ledger<immutable state (#926 index hole, replay
+                            // apply-failure) it wedged the node in an all-peer
+                            // flap loop with HAA permanently lost.
+                            //
+                            // Scope: exempt ONLY when the rollback equals the
+                            // agreed intersection AND sits at-or-above our
+                            // applied ledger tip — streaming forward from
+                            // there is pure progress (the gap-bridge replays
+                            // the ChainDB suffix).  An initial rollback BELOW
+                            // the ledger tip keeps the #699 disconnect: that
+                            // is the divergent-peer stall shape the guard
+                            // exists for, and in the healthy ledger>=immutable
+                            // state this exemption can never fire (the guard
+                            // itself requires rollback < immutable <= ledger).
+                            let rollback_hash = match &point {
+                                CodecPoint::Specific(_, h) => Some(*h),
+                                CodecPoint::Origin => None,
+                            };
+                            let exempt_agreed_initial = is_exempt_initial_agreed_rollback(
+                                is_initial,
+                                rollback_slot,
+                                rollback_hash,
+                                agreed_intersection,
+                                ledger_view.load().tip_slot(),
+                            );
+
+                            if immutable_slot > 0
+                                && rollback_slot < immutable_slot
+                                && exempt_agreed_initial
+                            {
+                                warn!(
+                                    %peer_addr,
+                                    rollback_slot,
+                                    immutable_slot,
+                                    ledger_slot = ledger_view.load().tip_slot(),
+                                    "Initial MsgRollBackward to the agreed \
+                                     intersection below our immutable tip — \
+                                     accepting (#927: ledger behind immutable; \
+                                     streaming from the negotiated point \
+                                     advances the ledger)"
+                                );
+                            } else if immutable_slot > 0 && rollback_slot < immutable_slot {
                                 // A rollback below our immutable tip is only a
                                 // genuine divergence witness when it is BOTH a
                                 // mid-stream rollback (not the initial
@@ -8195,6 +8327,113 @@ mod chainsync_task_tests {
             "diverged volatile blocks must NOT be offered as intersection candidates: {pts:?}"
         );
         assert_eq!(*pts.last().unwrap(), Point::Origin);
+    }
+
+    /// Issue #927: when the ledger tip is BEHIND the immutable tip (crash
+    /// recovery, index hole per #926, replay apply-failure), the offer must
+    /// stay newest-first BY SLOT — the immutable tip must precede the stale
+    /// ledger tip. With the old ledger-tip-first order every up-to-date peer
+    /// intersected at the stale ledger tip, and the #699 guard then
+    /// disconnected the peer's mandatory initial rollback to that exact
+    /// point — an all-peer flap loop with HAA permanently lost.
+    #[test]
+    fn known_points_stale_ledger_tip_orders_immutable_first() {
+        let imm = pt(129_476_005, 1);
+        let stale_ledger = pt(129_437_577, 2);
+        let pts = build_known_points(&KnownPointsInputs {
+            ledger_tip: stale_ledger.clone(),
+            volatile_chain_points: vec![],
+            immutable_tip: Some(imm.clone()),
+            deep_historical: vec![],
+            chain_diverged: false,
+        });
+        assert_eq!(pts, vec![imm, stale_ledger, Point::Origin]);
+    }
+
+    /// Issue #927 companion: in the stale-ledger state the volatile points
+    /// (anchored at the immutable tip, so above it) still lead the list,
+    /// followed by the immutable tip, then the stale ledger tip.
+    #[test]
+    fn known_points_stale_ledger_tip_keeps_volatile_first() {
+        let imm = pt(1000, 1);
+        let stale_ledger = pt(900, 2);
+        let v0 = pt(1100, 11);
+        let v1 = pt(1050, 12);
+        let deep = pt(500, 20);
+        let pts = build_known_points(&KnownPointsInputs {
+            ledger_tip: stale_ledger.clone(),
+            volatile_chain_points: vec![v0.clone(), v1.clone()],
+            immutable_tip: Some(imm.clone()),
+            deep_historical: vec![deep.clone()],
+            chain_diverged: false,
+        });
+        assert_eq!(pts, vec![v0, v1, imm, stale_ledger, deep, Point::Origin]);
+    }
+
+    /// #927 guard exemption: the initial rollback to the exact agreed
+    /// intersection at-or-above the ledger tip is exempt; everything else
+    /// keeps the #699 disconnect.
+    #[test]
+    fn exempt_initial_agreed_rollback_scoping() {
+        let h1 = [1u8; 32];
+        let h2 = [2u8; 32];
+        let agreed = Some((900, h1));
+
+        // The #927 wedge shape: initial rollback to the agreed intersection
+        // (our stale ledger tip at slot 900, ledger_tip_slot == 900).
+        assert!(is_exempt_initial_agreed_rollback(
+            true,
+            900,
+            Some(h1),
+            agreed,
+            900
+        ));
+
+        // Mid-stream rollback to the same point: NOT exempt (#699 authority).
+        assert!(!is_exempt_initial_agreed_rollback(
+            false,
+            900,
+            Some(h1),
+            agreed,
+            900
+        ));
+
+        // Initial rollback to a DIFFERENT point than agreed (lying server):
+        // not exempt — slot mismatch and hash mismatch each guard alone.
+        assert!(!is_exempt_initial_agreed_rollback(
+            true,
+            899,
+            Some(h1),
+            agreed,
+            800
+        ));
+        assert!(!is_exempt_initial_agreed_rollback(
+            true,
+            900,
+            Some(h2),
+            agreed,
+            800
+        ));
+
+        // Agreed intersection BELOW the ledger tip (#699 divergent-peer
+        // stall shape — deep-historical anchor): not exempt.
+        assert!(!is_exempt_initial_agreed_rollback(
+            true,
+            500,
+            Some(h1),
+            Some((500, h1)),
+            900
+        ));
+
+        // Origin rollback / no agreed intersection: never exempt.
+        assert!(!is_exempt_initial_agreed_rollback(true, 0, None, agreed, 0));
+        assert!(!is_exempt_initial_agreed_rollback(
+            true,
+            900,
+            Some(h1),
+            None,
+            900
+        ));
     }
 
     /// Duplicates across inputs are dropped (first occurrence wins).
