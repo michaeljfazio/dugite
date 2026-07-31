@@ -1164,6 +1164,48 @@ impl Default for NodeConfig {
     }
 }
 
+/// Dugite's default Prometheus metrics port.
+///
+/// Deliberately **not** cardano-node's 12798: dugite is frequently run
+/// alongside a cardano-node on the same host (the devnet and the bp-pair soak
+/// rig both do), and colliding on 12798 would make one of them fail to bind.
+/// The shipped configs set `MetricsPort` explicitly anyway (preview 12796,
+/// preprod 12799, mainnet 12800, bp-pair 12796/12797).
+pub const DEFAULT_METRICS_PORT: u16 = 12796;
+
+/// Resolve the effective metrics port, highest precedence first:
+///
+///   1. `--no-metrics`                     -> 0 (disabled)
+///   2. `--metrics-port <PORT>`            -> explicit operator override, and
+///      it wins even over `TurnOnLogMetrics=false`
+///   3. `TurnOnLogMetrics: false` in JSON  -> 0 (master off-switch, matching
+///      cardano-node)
+///   4. `MetricsPort` in JSON              -> site-wide default from the file
+///   5. [`DEFAULT_METRICS_PORT`]
+///
+/// This is THE implementation — `run_node()` calls it and the tests exercise
+/// it directly. It previously existed twice: once for real in `main.rs` and
+/// once as a "plain function that mirrors the logic in run_node()" inside this
+/// file's test module. The mirror drifted on both axes — it defaulted to 12798
+/// and omitted the `TurnOnLogMetrics` branch entirely — so the tests passed
+/// while validating a rule the binary did not implement (#941).
+pub fn resolve_metrics_port(
+    no_metrics: bool,
+    cli: Option<u16>,
+    turn_on_log_metrics: bool,
+    config: Option<u16>,
+) -> u16 {
+    if no_metrics {
+        0
+    } else if let Some(p) = cli {
+        p
+    } else if !turn_on_log_metrics {
+        0
+    } else {
+        config.unwrap_or(DEFAULT_METRICS_PORT)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1326,61 +1368,69 @@ mod tests {
         assert_eq!(restored.metrics_port, Some(8080));
     }
 
-    // ── Metrics port resolution priority ─────────────────────────────────────
+    // ── Metrics port resolution priority (#941) ──────────────────────────────
     //
-    // The node binary resolves the effective port with this priority:
-    //   1. --no-metrics  → 0
-    //   2. --metrics-port → explicit CLI value
-    //   3. config MetricsPort → site-wide default from file
-    //   4. 12798 (matches cardano-node's default)
-    //
-    // We test the rule table here using plain functions that mirror the
-    // logic in run_node() so the tests stay fast and do not require spawning
-    // an actual server.
-
-    const DUGITE_DEFAULT_METRICS_PORT: u16 = 12798;
-
-    fn resolve_metrics_port(no_metrics: bool, cli: Option<u16>, config: Option<u16>) -> u16 {
-        if no_metrics {
-            0
-        } else if let Some(p) = cli {
-            p
-        } else {
-            config.unwrap_or(DUGITE_DEFAULT_METRICS_PORT)
-        }
-    }
+    // These exercise the REAL `resolve_metrics_port` from this module, not a
+    // reimplementation of it. The previous mirror drifted from the binary on
+    // two axes (default port, and a missing TurnOnLogMetrics branch).
 
     #[test]
     fn test_resolve_no_metrics_flag_wins_over_all() {
         // --no-metrics must win even when a CLI port and a config port are set.
-        assert_eq!(resolve_metrics_port(true, Some(9000), Some(8000)), 0);
+        assert_eq!(resolve_metrics_port(true, Some(9000), true, Some(8000)), 0);
     }
 
     #[test]
     fn test_resolve_cli_port_wins_over_config() {
-        assert_eq!(resolve_metrics_port(false, Some(9000), Some(8000)), 9000);
+        assert_eq!(
+            resolve_metrics_port(false, Some(9000), true, Some(8000)),
+            9000
+        );
     }
 
     #[test]
     fn test_resolve_config_port_used_when_no_cli() {
-        assert_eq!(resolve_metrics_port(false, None, Some(8080)), 8080);
+        assert_eq!(resolve_metrics_port(false, None, true, Some(8080)), 8080);
     }
 
     #[test]
-    fn test_resolve_falls_back_to_default_12798() {
-        assert_eq!(resolve_metrics_port(false, None, None), 12798);
+    fn test_resolve_falls_back_to_default_port() {
+        assert_eq!(
+            resolve_metrics_port(false, None, true, None),
+            DEFAULT_METRICS_PORT
+        );
+        assert_eq!(DEFAULT_METRICS_PORT, 12796);
     }
 
     #[test]
     fn test_resolve_cli_port_zero_disables_metrics() {
         // Passing --metrics-port 0 from the CLI should disable the server.
-        assert_eq!(resolve_metrics_port(false, Some(0), None), 0);
+        assert_eq!(resolve_metrics_port(false, Some(0), true, None), 0);
     }
 
     #[test]
     fn test_resolve_config_port_zero_disables_metrics() {
         // Setting MetricsPort=0 in the config file should also disable the server.
-        assert_eq!(resolve_metrics_port(false, None, Some(0)), 0);
+        assert_eq!(resolve_metrics_port(false, None, true, Some(0)), 0);
+    }
+
+    #[test]
+    fn test_resolve_turn_on_log_metrics_false_disables() {
+        // TurnOnLogMetrics=false is the config master off-switch (cardano-node
+        // parity) and beats a MetricsPort value in the same file. The old
+        // mirrored helper had no such branch, so this was untested (#941).
+        assert_eq!(resolve_metrics_port(false, None, false, Some(8080)), 0);
+        assert_eq!(resolve_metrics_port(false, None, false, None), 0);
+    }
+
+    #[test]
+    fn test_resolve_cli_port_beats_turn_on_log_metrics_false() {
+        // An explicit --metrics-port is an operator override and wins even
+        // over the master off-switch.
+        assert_eq!(
+            resolve_metrics_port(false, Some(9100), false, Some(8080)),
+            9100
+        );
     }
 
     // ── RPC config resolution (#672 M1.A) ────────────────────────────────────
@@ -1478,10 +1528,18 @@ mod tests {
     // ── existing metrics tests follow ────────────────────────────────────────
 
     #[test]
-    fn test_default_metrics_port_matches_cardano_node() {
-        // Dugite defaults to 12798, matching cardano-node. When co-locating
-        // multiple nodes, operators must assign distinct ports via CLI flags.
-        assert_eq!(DUGITE_DEFAULT_METRICS_PORT, 12798);
+    fn test_default_metrics_port_is_offset_from_cardano_node() {
+        // Dugite defaults to 12796, deliberately NOT cardano-node's 12798:
+        // the two are routinely co-located (local devnet, bp-pair soak rig),
+        // and sharing the port would make one fail to bind.
+        //
+        // This used to assert 12798 against a constant that only existed in
+        // this test module, while the binary used 12796 — the drift #941 fixed.
+        assert_eq!(DEFAULT_METRICS_PORT, 12796);
+        assert_ne!(
+            DEFAULT_METRICS_PORT, 12798,
+            "must not collide with cardano-node"
+        );
     }
 
     // ── DiffusionMode config field ──────────────────────────────────────────

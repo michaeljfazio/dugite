@@ -71,7 +71,7 @@ COPY --from=builder /build/target/release/dugite-monitor /usr/local/bin/dugite-m
 
 WORKDIR /opt/dugite
 
-EXPOSE 3001 12798
+EXPOSE 3001 12796
 
 VOLUME ["/opt/dugite/db", "/opt/dugite/ipc"]
 

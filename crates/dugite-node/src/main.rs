@@ -202,7 +202,7 @@ struct RunArgs {
     /// Overrides the MetricsPort value from the config file.
     /// Pass 0 to disable the metrics server.
     /// If not specified, the config file value is used; if neither is set,
-    /// the default port 12798 is used.
+    /// the default port 12796 is used.
     #[arg(long)]
     metrics_port: Option<u16>,
 
@@ -488,7 +488,7 @@ fn build_logging_opts(log: &LogArgs) -> Result<logging::LoggingOpts> {
         log_dir: log.log_dir.to_string_lossy().into_owned(),
         rotation,
         no_color: log.log_no_color,
-        _log_retention_days: log.log_retention_days,
+        log_retention_days: log.log_retention_days,
         stdout_overflow,
     })
 }
@@ -1672,17 +1672,18 @@ async fn run_node(args: RunArgs, log_handle: Option<logging::LogHandle>) -> Resu
     //   3. TurnOnLogMetrics=false in config JSON → 0 (master off-switch,
     //      matching cardano-node)
     //   4. MetricsPort field in config JSON → site-wide default from config file
-    //   5. Dugite default: 12796 (avoids collision with cardano-node's 12798)
-    const DEFAULT_METRICS_PORT: u16 = 12796;
-    let effective_metrics_port: u16 = if args.no_metrics {
-        0
-    } else if let Some(cli_port) = args.metrics_port {
-        cli_port
-    } else if !node_config.turn_on_log_metrics {
-        0
-    } else {
-        node_config.metrics_port.unwrap_or(DEFAULT_METRICS_PORT)
-    };
+    //   5. Dugite default: config::DEFAULT_METRICS_PORT (12796 — avoids
+    //      collision with cardano-node's 12798)
+    //
+    // Single implementation in config.rs, exercised directly by its tests
+    // (#941: this used to be duplicated, and the copy in the test module had
+    // drifted on both the default port and the TurnOnLogMetrics branch).
+    let effective_metrics_port: u16 = config::resolve_metrics_port(
+        args.no_metrics,
+        args.metrics_port,
+        node_config.turn_on_log_metrics,
+        node_config.metrics_port,
+    );
 
     // Resolve effective UTxO RPC config (#672 M1.A). See
     // config::resolve_rpc for the precedence table.

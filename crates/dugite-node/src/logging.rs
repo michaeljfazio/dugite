@@ -108,9 +108,10 @@ pub struct LoggingOpts {
     pub log_dir: String,
     pub rotation: LogRotation,
     pub no_color: bool,
-    /// Number of days to retain log files (default: 7). Files older than this are deleted.
-    /// Used by [`start_log_cleanup_task`] when the caller passes this value.
-    pub _log_retention_days: u64,
+    /// Number of days to retain log files (default: 7). Files older than this
+    /// are deleted by [`start_log_cleanup_task`], which [`init`] spawns when a
+    /// file output is configured and this is non-zero. `0` disables cleanup.
+    pub log_retention_days: u64,
     /// Channel-full policy for the non-blocking stdout writer (issue #650).
     /// Default `Drop` matches `tracing_appender` upstream lossy default; set
     /// `Block` for development / CI where lossless capture is required.
@@ -274,6 +275,16 @@ pub fn init(opts: &LoggingOpts) -> anyhow::Result<LogHandle> {
 
     Registry::default().with(layers).init();
 
+    // Prune old log files only when we are actually writing them (#942).
+    // `init` is called from inside `#[tokio::main] async fn main`, so a runtime
+    // is present for the spawn.
+    if outputs.contains(&LogOutput::File) {
+        start_log_cleanup_task(
+            std::path::PathBuf::from(&opts.log_dir),
+            opts.log_retention_days,
+        );
+    }
+
     Ok(LogHandle {
         inner: Arc::new(LogHandleInner {
             reload_handles,
@@ -282,11 +293,47 @@ pub fn init(opts: &LoggingOpts) -> anyhow::Result<LogHandle> {
     })
 }
 
+/// Spawn the periodic log-cleanup task.
+///
+/// Runs [`cleanup_old_logs`] once immediately, then every 24 hours, deleting
+/// `.log` files in `log_dir` older than `retention_days`.
+///
+/// A no-op when `retention_days == 0` (explicit opt-out) or when no file
+/// output is configured — there is nothing to prune when logs go to stdout or
+/// journald.
+///
+/// #942: `LoggingOpts` carried a `_log_retention_days` field whose doc comment
+/// pointed at this function, but the function did not exist and
+/// `cleanup_old_logs` was `#[cfg(test)]`. `--log-retention-days` parsed,
+/// appeared in `--help`, and never deleted anything, so a long-running node
+/// with `--log-output file` grew its log directory without bound.
+pub fn start_log_cleanup_task(log_dir: std::path::PathBuf, retention_days: u64) {
+    if retention_days == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        // 24h between sweeps; files are pruned by mtime, so the exact phase
+        // does not matter.
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(24 * 60 * 60));
+        loop {
+            ticker.tick().await;
+            let dir = log_dir.clone();
+            // Blocking fs walk — keep it off the async worker threads.
+            let _ = tokio::task::spawn_blocking(move || {
+                cleanup_old_logs(&dir, retention_days);
+            })
+            .await;
+        }
+    });
+}
+
 /// Delete `.log` files in `log_dir` that are older than `retention_days`.
 ///
 /// Scans only immediate children of the directory (not recursive). Files that
 /// cannot be inspected (e.g. permission errors) are silently skipped.
-#[cfg(test)]
+///
+/// Was `#[cfg(test)]` until #942 — it existed, was tested, and did not exist
+/// at all in release builds, so `--log-retention-days` was silently inert.
 pub fn cleanup_old_logs(log_dir: &std::path::Path, retention_days: u64) {
     let cutoff =
         std::time::SystemTime::now() - std::time::Duration::from_secs(retention_days * 86400);
@@ -439,6 +486,73 @@ mod tests {
             LogRotation::Never
         ));
         assert!("invalid".parse::<LogRotation>().is_err());
+    }
+
+    /// Backdate a file's mtime by `days`, verifying the filesystem persisted it.
+    fn backdate(path: &std::path::Path, days: u64) {
+        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86400);
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_modified(t).unwrap();
+        drop(f);
+        let actual = std::fs::metadata(path).unwrap().modified().unwrap();
+        assert!(
+            actual
+                < std::time::SystemTime::now() - std::time::Duration::from_secs((days - 1) * 86400),
+            "filesystem did not persist backdated mtime"
+        );
+    }
+
+    /// #942 end-to-end: the SPAWNED TASK must delete an expired file, not just
+    /// the helper when called directly. The old tests exercised
+    /// `cleanup_old_logs` in isolation while nothing in production ever called
+    /// it, so they passed against a flag that did nothing.
+    #[tokio::test]
+    async fn start_log_cleanup_task_deletes_expired_file() {
+        let dir = std::env::temp_dir().join("dugite_log_cleanup_task_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("dugite.2020-01-01.log");
+        let fresh = dir.join("dugite.2026-08-01.log");
+        std::fs::write(&old, b"stale").unwrap();
+        std::fs::write(&fresh, b"current").unwrap();
+        backdate(&old, 30);
+
+        start_log_cleanup_task(dir.clone(), 7);
+
+        // The task sweeps immediately on its first tick.
+        for _ in 0..100 {
+            if !old.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        assert!(
+            !old.exists(),
+            "expired log must be deleted by the spawned task"
+        );
+        assert!(fresh.exists(), "in-window log must be retained");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// retention_days == 0 is an explicit opt-out: nothing may be deleted.
+    #[tokio::test]
+    async fn start_log_cleanup_task_zero_retention_is_a_noop() {
+        let dir = std::env::temp_dir().join("dugite_log_cleanup_noop_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("dugite.2020-01-01.log");
+        std::fs::write(&old, b"stale").unwrap();
+        backdate(&old, 30);
+
+        start_log_cleanup_task(dir.clone(), 0);
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        assert!(
+            old.exists(),
+            "retention_days=0 must disable cleanup entirely"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
