@@ -95,7 +95,42 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 - 28-byte hash types (DRep keys, pool voter keys, required signers) must be padded to 32 bytes via `Hash28::to_hash32_padded()` — do not use `Hash<32>::from()` directly on 28-byte hashes
 
 ## Current Focus
-**v2.4.0 released (2026-07-30)** — storage durability & sync recovery:
+**v2.4.1 released (2026-07-31)** — encodeMap parity + diagnostics + coverage.
+Drop-in, SNAPSHOT unchanged at 31. Closes #930, #931.
+
+- **#930 (serialization/ledger)** — `encode_multi_asset`/`encode_mint` now
+  match Haskell cardano-ledger-binary `encodeMap`: indefinite-length CBOR
+  map headers (`0xbf…0xff`) for maps with >23 entries, definite otherwise,
+  at both map levels. Fixes Rule 5a (`OutputValueTooLarge`) over-counting
+  by 1 byte per >=256-entry map — preprod tx `96ae78f7…` (324-entry asset
+  map) measured 5001 vs Haskell's 5000 at maxValSize=5000 (strict `>`),
+  a false Phase-1 reject (N2C submit + forging; chain-follow was safe via
+  trust-consensus). Over-count only — never false accepts. On-chain tx
+  pinned as fixture; boundary tests at 23/24/255/256. Residual: other
+  synthetic-only encoders (withdrawals, voting-procedures, metadata…)
+  still definite-only — see #930 comment. `PlutusData::Map` is CORRECTLY
+  definite-only (different encoder — never "align" it).
+- **#931 (node)** — HAA clause (a)/(b) diagnostics now WARN only when the
+  sync-time trusted-only clamp is actually active (clamp `is_some()`
+  mirrored into `NodePeerManager`); debug otherwise, "bypassed" claim
+  removed. In Praos mode (preprod default) the clamp never exists and
+  untrusted established ledger peers are normal (Haskell
+  `outboundConnectionsState` → `UntrustedState`, silent). Zero behavior
+  change, pinned by test. Deferred: Haskell's independent 4-branch case
+  split (+ the structurally-unreachable hot-BLP clause during clamped
+  Genesis sync).
+- **Coverage** — +58 dugite-cli tests (key/address/node/query + end-to-end
+  command_files.rs), +29 dugite-rpc tests (submit/watch services had ZERO
+  coverage; config/error units). Workspace suite 7503 → 7608.
+
+QA: devnet-validate standard **3/3 rounds PASS** at 4a8a03148a
+(`reports/devnet-validate/v2.4.1.json`) — 552 canonical blocks, 0 invalid
+forges, tx-zoo 84/84 full run, bidirectional parity 41/41, byte-exact
+treasury/reserves after first RUPD, restart rejoin <60s with 0
+stale-intersection. **Zero open issues.**
+
+### v2.4.0 (2026-07-30)
+Storage durability & sync recovery:
 #926-#929, the full defect chain behind the 2026-07-28 preprod BP incident
 (38k-slot indexed hole + permanent all-peer sync wedge). Drop-in, SNAPSHOT
 unchanged at 31; two new DB files (`lock`, `immutable/clean`).
