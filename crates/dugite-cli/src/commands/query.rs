@@ -924,22 +924,11 @@ fn pool_id_from_cold_vkey(path: &std::path::Path) -> Result<String> {
     let cbor_bytes = hex::decode(cbor_hex)?;
 
     // Unwrap the CBOR wrapper only when the payload is exactly a CBOR
-    // bytes(32): 0x58 0x20 header followed by the 32 key bytes (34 bytes
-    // total). Anything else is used as-is and gated by the length check
-    // below — in particular a RAW 32-byte key whose first byte happens to
-    // fall in 0x40..=0x5F must never have a byte stripped (#934).
-    let key_bytes = if cbor_bytes.len() == 34 && cbor_bytes[0] == 0x58 && cbor_bytes[1] == 0x20 {
-        &cbor_bytes[2..]
-    } else {
-        &cbor_bytes[..]
-    };
-
-    if key_bytes.len() != 32 {
-        anyhow::bail!(
-            "Cold verification key must be 32 bytes, got {}",
-            key_bytes.len()
-        );
-    }
+    // bytes(32) — a RAW 32-byte key whose first byte happens to fall in
+    // 0x40..=0x5F must never have a byte stripped (#934). Shared with the
+    // other three envelope readers so there is one rule, not four (#935).
+    let key_bytes =
+        crate::commands::envelope::unwrap_key_bytes(&cbor_bytes, 32, "Cold verification key")?;
 
     // Pool ID = Blake2b-224(vkey)
     use blake2::digest::{consts::U28, Digest};

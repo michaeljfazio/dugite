@@ -11,6 +11,18 @@ struct Cli {
     command: TopCommand,
 }
 
+/// # Era-prefix strictness (#935 item 5)
+///
+/// cardano-cli 11 accepts ONLY the era-prefixed forms (`cardano-cli conway
+/// stake-pool ...`) and rejects the bare `stake-pool`/`stake-address`
+/// spellings. dugite accepts **both**, which makes it a strict superset:
+/// every cardano-cli invocation works unchanged, and the flat forms
+/// additionally keep working for existing dugite scripts.
+///
+/// Decision: keep the leniency. Removing it would break dugite users for no
+/// compatibility gain, since accepting a command cardano-cli rejects can never
+/// make a cardano-cli-compatible script fail.
+///
 /// Top-level commands. The era-prefixed variants (`conway`, `babbage`, ...)
 /// are aliases for the flat command surface for `cardano-cli` compatibility.
 /// All era prefixes currently route to the same handlers — dugite is

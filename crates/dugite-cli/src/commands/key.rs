@@ -1,3 +1,23 @@
+//! `dugite-cli key` — key utilities.
+//!
+//! # Relationship to cardano-cli (#935 item 4)
+//!
+//! This whole subcommand group is a **deliberate dugite extension**;
+//! cardano-cli 11 has no `key generate-payment-key`,
+//! `key generate-stake-key`, or `key verification-key-hash` counterpart. The
+//! equivalent cardano-cli workflows are:
+//!
+//! | dugite                          | cardano-cli equivalent                          |
+//! |---------------------------------|-------------------------------------------------|
+//! | `key generate-payment-key`      | `address key-gen`                               |
+//! | `key generate-stake-key`        | `stake-address key-gen`                         |
+//! | `key verification-key-hash`     | `address key-hash` / `stake-address key-hash`   |
+//!
+//! The cardano-cli spellings are all implemented too, so no script written
+//! against cardano-cli needs these. They are kept because they are convenient
+//! and already in use; they are additive and can never change the behaviour of
+//! a cardano-cli-compatible invocation.
+
 use anyhow::Result;
 use clap::{Args, Subcommand};
 use dugite_crypto::keys::{PaymentSigningKey, TextEnvelope};
