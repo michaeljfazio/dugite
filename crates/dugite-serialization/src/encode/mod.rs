@@ -22,7 +22,9 @@ mod value;
 // Re-export all public items for backwards compatibility
 pub use block::{
     compute_block_body_hash, encode_aux_data_segment, encode_block, encode_block_header,
-    encode_block_header_body, encode_operational_cert, encode_protocol_version, encode_vrf_result,
+    encode_block_header_body, encode_invalid_indices_segment, encode_operational_cert,
+    encode_protocol_version, encode_tx_bodies_segment, encode_vrf_result,
+    encode_witness_sets_segment,
 };
 pub use certificate::encode_certificate;
 pub use governance::encode_proposal_procedure;
