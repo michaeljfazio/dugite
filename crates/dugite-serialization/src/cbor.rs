@@ -283,6 +283,53 @@ pub(crate) fn encode_map_close(buf: &mut Vec<u8>, len: usize) {
     }
 }
 
+/// Haskell cardano-ledger-binary `variableListLenEncoding` threshold (#938).
+///
+/// The array/list/set counterpart of [`ENCODE_MAP_DEFINITE_MAX`]. Verbatim
+/// from `libs/cardano-ledger-binary/src/Cardano/Ledger/Binary/Encoding/Encoder.hs`:
+///
+/// ```haskell
+/// lengthThreshold :: Int
+/// lengthThreshold = 23
+///
+/// variableListLenEncoding len contents =
+///   if len <= lengthThreshold
+///     then exactListLenEncoding len contents
+///     else encodeListLenIndef <> contents <> encodeBreak
+/// ```
+///
+/// Every variable-length collection encoder funnels through it:
+/// `encodeFoldableEncoder`, `encodeStrictSeq` / `encodeSeq`, `encodeList`, and
+/// `encodeSet` (which, from PV9, emits `encodeTag 258` *before* the
+/// variable-length array — the tag wraps the whole thing, so the threshold
+/// still applies to the array inside).
+///
+/// Use [`encode_array_open`]/[`encode_array_close`] for any encoder site whose
+/// Haskell counterpart is one of those. Do **not** use them for fixed-arity
+/// structural records — Haskell writes those with a literal `encodeListLen n`
+/// (e.g. `encodeStrictMaybe`'s `encodeListLen 0`/`1`, the `[era_tag, block]`
+/// envelope, `[a, b]` pairs), which is always definite regardless of `n`.
+pub(crate) const ENCODE_ARRAY_DEFINITE_MAX: usize = 23;
+
+/// Open an array following Haskell `variableListLenEncoding` semantics:
+/// definite-length header for `len <= 23`, indefinite open byte (`0x9f`)
+/// otherwise. Pair with [`encode_array_close`].
+pub(crate) fn encode_array_open(len: usize) -> Vec<u8> {
+    if len <= ENCODE_ARRAY_DEFINITE_MAX {
+        encode_array_header(len)
+    } else {
+        vec![0x9f]
+    }
+}
+
+/// Close an array opened by [`encode_array_open`]: emit the CBOR break
+/// (`0xff`) only for the indefinite (> 23 items) form.
+pub(crate) fn encode_array_close(buf: &mut Vec<u8>, len: usize) {
+    if len > ENCODE_ARRAY_DEFINITE_MAX {
+        buf.push(0xff);
+    }
+}
+
 /// Encode a `PlutusData` `ByteString` *leaf* (the `Bytes` arm and the tag-2 /
 /// tag-3 bignum mantissa) with the plutus 64-byte-per-chunk bound.
 ///

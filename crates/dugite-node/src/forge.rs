@@ -416,49 +416,24 @@ pub fn forge_block(
 ///
 /// This must match the structure used by `compute_block_body_hash` and `encode_block`.
 fn compute_body_size(transactions: &[Transaction]) -> u64 {
-    use dugite_serialization::cbor::{encode_array_header, encode_uint};
-    use dugite_serialization::encode::{encode_transaction_body, encode_witness_set};
+    use dugite_serialization::encode::{
+        encode_aux_data_segment, encode_invalid_indices_segment, encode_tx_bodies_segment,
+        encode_witness_sets_segment,
+    };
 
-    // 1. tx_bodies array — use preserved raw CBOR for byte-exact size
-    let mut bodies_len = encode_array_header(transactions.len()).len();
-    for tx in transactions {
-        if let Some(raw) = &tx.raw_body_cbor {
-            bodies_len += raw.len();
-        } else {
-            bodies_len += encode_transaction_body(&tx.body).len();
-        }
-    }
-
-    // 2. witness_sets array — use preserved raw CBOR for byte-exact size
-    let mut wits_len = encode_array_header(transactions.len()).len();
-    for tx in transactions {
-        if let Some(raw) = &tx.raw_witness_cbor {
-            wits_len += raw.len();
-        } else {
-            wits_len += encode_witness_set(&tx.witness_set).len();
-        }
-    }
-
-    // 3. aux_data map — sized via the SAME shared segment encoder that
-    // encode_block/compute_block_body_hash emit (raw-preferred per entry,
-    // variable-length map framing), so the declared body_size can never
-    // diverge from the wire bytes (#932: the previous hand-rolled
-    // definite-length header over-declared by 1 byte at >255 aux entries).
-    let aux_len = dugite_serialization::encode::encode_aux_data_segment(transactions).len();
-
-    // 4. invalid_tx_indices array
-    let invalid_indices: Vec<_> = transactions
-        .iter()
-        .enumerate()
-        .filter(|(_, tx)| !tx.is_valid)
-        .map(|(i, _)| i)
-        .collect();
-    let mut invalid_len = encode_array_header(invalid_indices.len()).len();
-    for idx in &invalid_indices {
-        invalid_len += encode_uint(*idx as u64).len();
-    }
-
-    (bodies_len + wits_len + aux_len + invalid_len) as u64
+    // All four segments are sized via the SAME shared encoders that
+    // encode_block/compute_block_body_hash write to the wire, so the declared
+    // body_size can never diverge from the emitted bytes.
+    //
+    // Both classes of framing bug this has produced came from a hand-rolled
+    // duplicate here: #932 (definite-length aux map header over-declared by 1
+    // byte above 255 aux entries) and #938 (definite-length tx_bodies /
+    // witness_sets / invalid_indices array headers, where Haskell's
+    // `encodeFoldableEncoder` switches to indefinite above 23 transactions).
+    (encode_tx_bodies_segment(transactions).len()
+        + encode_witness_sets_segment(transactions).len()
+        + encode_aux_data_segment(transactions).len()
+        + encode_invalid_indices_segment(transactions).len()) as u64
 }
 
 /// Check if we are the slot leader for a given slot.

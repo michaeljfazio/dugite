@@ -113,47 +113,78 @@ pub fn encode_block(block: &Block, kes_signature: &[u8]) -> Vec<u8> {
     // Header
     buf.extend(encode_block_header(&block.header, kes_signature));
 
-    // Transaction bodies — prefer preserved raw CBOR from the original
-    // transaction to avoid re-serialization mismatches that would invalidate
-    // witness signatures (the tx hash is blake2b-256 of the body CBOR).
-    buf.extend(encode_array_header(block.transactions.len()));
-    for tx in &block.transactions {
+    // The four body segments, each via its shared encoder so the wire bytes,
+    // the body-hash preimage and forge's declared body_size can never diverge.
+    buf.extend(encode_tx_bodies_segment(&block.transactions));
+    buf.extend(encode_witness_sets_segment(&block.transactions));
+    buf.extend(encode_aux_data_segment(&block.transactions));
+    buf.extend(encode_invalid_indices_segment(&block.transactions));
+
+    buf
+}
+
+/// Encode the block-body transaction-bodies segment.
+///
+/// Haskell builds this with
+/// `serializeFoldablePreEncoded = serialize version . encodeFoldableEncoder encodePreEncoded`
+/// (`eras/alonzo/impl/src/Cardano/Ledger/Alonzo/BlockBody/Internal.hs`,
+/// `txSeqBodies`), and `encodeFoldableEncoder` goes through
+/// `variableListLenEncoding` — definite header at `<= 23` transactions,
+/// indefinite (`0x9f` … `0xff`) above (#938).
+///
+/// Per-entry bytes prefer each tx's preserved raw body CBOR (Haskell's
+/// `encodePreEncoded . originalBytes`) so re-serialization can never
+/// invalidate the witness signatures — the tx hash is blake2b-256 of exactly
+/// these bytes. Only the array framing is synthetic.
+pub fn encode_tx_bodies_segment(transactions: &[Transaction]) -> Vec<u8> {
+    let mut buf = encode_array_open(transactions.len());
+    for tx in transactions {
         if let Some(raw) = &tx.raw_body_cbor {
             buf.extend_from_slice(raw);
         } else {
             buf.extend(encode_transaction_body_for_era(&tx.body, tx.era));
         }
     }
+    encode_array_close(&mut buf, transactions.len());
+    buf
+}
 
-    // Transaction witness sets — prefer preserved raw CBOR to avoid encoding
-    // differences (map vs array redeemers, definite vs indefinite lengths).
-    buf.extend(encode_array_header(block.transactions.len()));
-    for tx in &block.transactions {
+/// Encode the block-body witness-sets segment.
+///
+/// Same `encodeFoldableEncoder` framing as [`encode_tx_bodies_segment`]
+/// (Haskell `txSeqWits`); per-entry bytes prefer the preserved raw witness
+/// CBOR to avoid re-encoding differences (map vs array redeemers, set tags,
+/// definite vs indefinite lengths).
+pub fn encode_witness_sets_segment(transactions: &[Transaction]) -> Vec<u8> {
+    let mut buf = encode_array_open(transactions.len());
+    for tx in transactions {
         if let Some(raw) = &tx.raw_witness_cbor {
             buf.extend_from_slice(raw);
         } else {
             buf.extend(encode_witness_set_for_era(&tx.witness_set, tx.era));
         }
     }
+    encode_array_close(&mut buf, transactions.len());
+    buf
+}
 
-    // Auxiliary data map: {tx_index: aux_data} — shared with
-    // compute_block_body_hash so the wire segment and the h3 preimage can
-    // never diverge.
-    buf.extend(encode_aux_data_segment(&block.transactions));
-
-    // Invalid transactions (indices of txs with is_valid=false)
-    let invalid_indices: Vec<_> = block
-        .transactions
+/// Encode the block-body phase-2 invalid-transaction-indices segment.
+///
+/// Haskell `txSeqIsValids = serialize version $ encCBOR $ nonValidatingIndices txns`
+/// — `encCBOR` on a list goes through `encodeList`, i.e. the same
+/// `variableListLenEncoding` threshold (#938).
+pub fn encode_invalid_indices_segment(transactions: &[Transaction]) -> Vec<u8> {
+    let invalid_indices: Vec<_> = transactions
         .iter()
         .enumerate()
         .filter(|(_, tx)| !tx.is_valid)
         .map(|(i, _)| i)
         .collect();
-    buf.extend(encode_array_header(invalid_indices.len()));
+    let mut buf = encode_array_open(invalid_indices.len());
     for idx in &invalid_indices {
         buf.extend(encode_uint(*idx as u64));
     }
-
+    encode_array_close(&mut buf, invalid_indices.len());
     buf
 }
 
@@ -204,46 +235,12 @@ pub fn encode_aux_data_segment(transactions: &[Transaction]) -> Vec<u8> {
 // NOTE: `transactions` is intentionally `&[Transaction]` rather than `&[&Transaction]`
 // so callers can pass `block.transactions.as_slice()` directly.
 pub fn compute_block_body_hash(transactions: &[Transaction]) -> Hash32 {
-    // 1. Transaction bodies — prefer preserved raw CBOR from the original
-    // transaction to ensure the body hash matches what the witnesses signed.
-    let mut bodies_cbor = encode_array_header(transactions.len());
-    for tx in transactions {
-        if let Some(raw) = &tx.raw_body_cbor {
-            bodies_cbor.extend_from_slice(raw);
-        } else {
-            bodies_cbor.extend(encode_transaction_body_for_era(&tx.body, tx.era));
-        }
-    }
-    let h1 = blake2b_256(&bodies_cbor);
-
-    // 2. Transaction witness sets — prefer preserved raw CBOR.
-    let mut wits_cbor = encode_array_header(transactions.len());
-    for tx in transactions {
-        if let Some(raw) = &tx.raw_witness_cbor {
-            wits_cbor.extend_from_slice(raw);
-        } else {
-            wits_cbor.extend(encode_witness_set_for_era(&tx.witness_set, tx.era));
-        }
-    }
-    let h2 = blake2b_256(&wits_cbor);
-
-    // 3. Auxiliary data map: {tx_index: aux_data} — same shared segment
-    // encoder as encode_block.
-    let aux_cbor = encode_aux_data_segment(transactions);
-    let h3 = blake2b_256(&aux_cbor);
-
-    // 4. Invalid transaction indices (txs with is_valid=false)
-    let invalid_indices: Vec<_> = transactions
-        .iter()
-        .enumerate()
-        .filter(|(_, tx)| !tx.is_valid)
-        .map(|(i, _)| i)
-        .collect();
-    let mut isvalid_cbor = encode_array_header(invalid_indices.len());
-    for idx in &invalid_indices {
-        isvalid_cbor.extend(encode_uint(*idx as u64));
-    }
-    let h4 = blake2b_256(&isvalid_cbor);
+    // Every segment comes from the SAME shared encoder `encode_block` writes to
+    // the wire, so the h1..h4 preimages can never diverge from the block bytes.
+    let h1 = blake2b_256(&encode_tx_bodies_segment(transactions));
+    let h2 = blake2b_256(&encode_witness_sets_segment(transactions));
+    let h3 = blake2b_256(&encode_aux_data_segment(transactions));
+    let h4 = blake2b_256(&encode_invalid_indices_segment(transactions));
 
     // Combine: blake2b_256(h1 || h2 || h3 || h4)
     let mut combined = Vec::with_capacity(128);
@@ -836,22 +833,34 @@ mod tests {
         seg
     }
 
-    /// The h3 preimage switches at the 23/24 boundary: compute the expected
-    /// block body hash from explicitly-built segments and compare.
+    /// ALL FOUR preimages switch framing at the 23/24 boundary: h3 because
+    /// Haskell's `encodeFoldableMapEncoder` uses `variableMapLenEncoding`
+    /// (#932), and h1/h2/h4 because `encodeFoldableEncoder` uses
+    /// `variableListLenEncoding` (#938) — same `lengthThreshold = 23`.
+    /// Compute the expected block body hash from explicitly-built segments.
     #[test]
     fn block_body_hash_aux_map_23_vs_24_entries_header_switch() {
         for (n, indefinite) in [(23usize, false), (24usize, true)] {
             let txs: Vec<Transaction> = (0..n).map(|_| aux_tx()).collect();
 
             let body_cbor = encode_transaction_body_for_era(&txs[0].body, Era::Conway);
-            let mut bodies = encode_array_header(n);
+            let mut bodies = encode_array_open(n);
             for _ in 0..n {
                 bodies.extend(&body_cbor);
             }
-            let mut wits = encode_array_header(n);
+            encode_array_close(&mut bodies, n);
+            let mut wits = encode_array_open(n);
             wits.resize(wits.len() + n, 0xa0);
+            encode_array_close(&mut wits, n);
             let aux = raw_aux_segment(n, indefinite);
+            // Zero invalid indices — always definite, below the threshold.
             let invalid = encode_array_header(0);
+
+            // Pin the array framing explicitly so this test fails loudly if the
+            // threshold ever regresses, rather than silently agreeing with a
+            // wrong encoder.
+            assert_eq!(bodies[0] == 0x9f, indefinite, "h1 framing at n={n}");
+            assert_eq!(wits[0] == 0x9f, indefinite, "h2 framing at n={n}");
 
             let mut combined = Vec::with_capacity(128);
             combined.extend_from_slice(blake2b_256(&bodies).as_bytes());

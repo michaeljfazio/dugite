@@ -25,28 +25,37 @@ where
     // Canonical CBOR set ordering: lexicographic on the CBOR encoding bytes.
     encoded_items.sort();
 
-    // tag(258) followed by definite-length array.
+    // tag(258) followed by a variable-length array. Haskell `encodeSet` emits
+    // `encodeTag setTag <> variableListLenEncoding (Set.size f) ...` from PV9
+    // on — the tag wraps the array, so the definite-<=23 / indefinite->23
+    // threshold still applies to the array itself (#938).
+    let len = encoded_items.len();
     let mut buf = encode_tag(258);
-    buf.extend(encode_array_header(encoded_items.len()));
+    buf.extend(encode_array_open(len));
     for encoded in encoded_items {
         buf.extend(encoded);
     }
+    encode_array_close(&mut buf, len);
     buf
 }
 
-/// Encode a sequence as a plain definite-length array (pre-Conway eras).
+/// Encode a sequence as a plain (untagged) array (pre-Conway eras).
 ///
 /// Pre-Conway CDDL uses `[* item]` for inputs, certificates, collateral, and
 /// reference inputs — NOT `set<item> = #6.258([* item])`. Items are encoded in
 /// their original order without sorting, preserving the original transaction body.
+///
+/// Still variable-length framed: Haskell `encodeSet` below PV9 drops the 258
+/// tag but keeps `variableListLenEncoding` (#938).
 fn encode_plain_array<T, F>(items: &[T], encode_item: F) -> Vec<u8>
 where
     F: Fn(&T) -> Vec<u8>,
 {
-    let mut buf = encode_array_header(items.len());
+    let mut buf = encode_array_open(items.len());
     for item in items {
         buf.extend(encode_item(item));
     }
+    encode_array_close(&mut buf, items.len());
     buf
 }
 
@@ -240,7 +249,7 @@ pub fn encode_redeemers(redeemers: &[Redeemer], map_form: bool) -> Vec<u8> {
         encode_map_close(&mut buf, redeemers.len());
     } else {
         // Pre-Conway list: [* [tag, index, data, ex_units]]
-        buf.extend(encode_array_header(redeemers.len()));
+        buf.extend(encode_array_open(redeemers.len()));
         for &i in &order {
             let r = &redeemers[i];
             buf.extend(encode_array_header(4));
@@ -251,6 +260,7 @@ pub fn encode_redeemers(redeemers: &[Redeemer], map_form: bool) -> Vec<u8> {
             buf.extend(encode_uint(r.ex_units.mem));
             buf.extend(encode_uint(r.ex_units.steps));
         }
+        encode_array_close(&mut buf, redeemers.len());
     }
     buf
 }
@@ -295,10 +305,11 @@ pub fn encode_datums(plutus_data: &[PlutusData], use_set_tag: bool) -> Vec<u8> {
     if use_set_tag {
         buf.extend(encode_tag(258));
     }
-    buf.extend(encode_array_header(plutus_data.len()));
+    buf.extend(encode_array_open(plutus_data.len()));
     for &i in &order {
         buf.extend(encode_plutus_data(&plutus_data[i]));
     }
+    encode_array_close(&mut buf, plutus_data.len());
     buf
 }
 
@@ -339,34 +350,38 @@ pub(super) fn encode_witness_set_for_era(ws: &TransactionWitnessSet, era: Era) -
 
     if !ws.vkey_witnesses.is_empty() {
         buf.extend(encode_uint(0));
-        buf.extend(encode_array_header(ws.vkey_witnesses.len()));
+        buf.extend(encode_array_open(ws.vkey_witnesses.len()));
         for w in &ws.vkey_witnesses {
             buf.extend(encode_vkey_witness(w));
         }
+        encode_array_close(&mut buf, ws.vkey_witnesses.len());
     }
 
     if !ws.native_scripts.is_empty() {
         buf.extend(encode_uint(1));
-        buf.extend(encode_array_header(ws.native_scripts.len()));
+        buf.extend(encode_array_open(ws.native_scripts.len()));
         for s in &ws.native_scripts {
             buf.extend(encode_native_script(s));
         }
+        encode_array_close(&mut buf, ws.native_scripts.len());
     }
 
     if !ws.bootstrap_witnesses.is_empty() {
         buf.extend(encode_uint(2));
-        buf.extend(encode_array_header(ws.bootstrap_witnesses.len()));
+        buf.extend(encode_array_open(ws.bootstrap_witnesses.len()));
         for w in &ws.bootstrap_witnesses {
             buf.extend(encode_bootstrap_witness(w));
         }
+        encode_array_close(&mut buf, ws.bootstrap_witnesses.len());
     }
 
     if !ws.plutus_v1_scripts.is_empty() {
         buf.extend(encode_uint(3));
-        buf.extend(encode_array_header(ws.plutus_v1_scripts.len()));
+        buf.extend(encode_array_open(ws.plutus_v1_scripts.len()));
         for s in &ws.plutus_v1_scripts {
             buf.extend(encode_bytes(s));
         }
+        encode_array_close(&mut buf, ws.plutus_v1_scripts.len());
     }
 
     if !ws.plutus_data.is_empty() {
@@ -391,18 +406,20 @@ pub(super) fn encode_witness_set_for_era(ws: &TransactionWitnessSet, era: Era) -
 
     if !ws.plutus_v2_scripts.is_empty() {
         buf.extend(encode_uint(6));
-        buf.extend(encode_array_header(ws.plutus_v2_scripts.len()));
+        buf.extend(encode_array_open(ws.plutus_v2_scripts.len()));
         for s in &ws.plutus_v2_scripts {
             buf.extend(encode_bytes(s));
         }
+        encode_array_close(&mut buf, ws.plutus_v2_scripts.len());
     }
 
     if !ws.plutus_v3_scripts.is_empty() {
         buf.extend(encode_uint(7));
-        buf.extend(encode_array_header(ws.plutus_v3_scripts.len()));
+        buf.extend(encode_array_open(ws.plutus_v3_scripts.len()));
         for s in &ws.plutus_v3_scripts {
             buf.extend(encode_bytes(s));
         }
+        encode_array_close(&mut buf, ws.plutus_v3_scripts.len());
     }
 
     buf
@@ -450,31 +467,35 @@ pub fn encode_auxiliary_data(aux: &AuxiliaryData) -> Vec<u8> {
     }
     if !aux.native_scripts.is_empty() {
         buf.extend(encode_uint(1));
-        buf.extend(encode_array_header(aux.native_scripts.len()));
+        buf.extend(encode_array_open(aux.native_scripts.len()));
         for s in &aux.native_scripts {
             buf.extend(encode_native_script(s));
         }
+        encode_array_close(&mut buf, aux.native_scripts.len());
     }
     if !aux.plutus_v1_scripts.is_empty() {
         buf.extend(encode_uint(2));
-        buf.extend(encode_array_header(aux.plutus_v1_scripts.len()));
+        buf.extend(encode_array_open(aux.plutus_v1_scripts.len()));
         for s in &aux.plutus_v1_scripts {
             buf.extend(encode_bytes(s));
         }
+        encode_array_close(&mut buf, aux.plutus_v1_scripts.len());
     }
     if !aux.plutus_v2_scripts.is_empty() {
         buf.extend(encode_uint(3));
-        buf.extend(encode_array_header(aux.plutus_v2_scripts.len()));
+        buf.extend(encode_array_open(aux.plutus_v2_scripts.len()));
         for s in &aux.plutus_v2_scripts {
             buf.extend(encode_bytes(s));
         }
+        encode_array_close(&mut buf, aux.plutus_v2_scripts.len());
     }
     if !aux.plutus_v3_scripts.is_empty() {
         buf.extend(encode_uint(4));
-        buf.extend(encode_array_header(aux.plutus_v3_scripts.len()));
+        buf.extend(encode_array_open(aux.plutus_v3_scripts.len()));
         for s in &aux.plutus_v3_scripts {
             buf.extend(encode_bytes(s));
         }
+        encode_array_close(&mut buf, aux.plutus_v3_scripts.len());
     }
 
     buf
@@ -605,10 +626,11 @@ pub(super) fn encode_transaction_body_for_era(body: &TransactionBody, era: Era) 
 
     // 1: outputs
     buf.extend(encode_uint(1));
-    buf.extend(encode_array_header(body.outputs.len()));
+    buf.extend(encode_array_open(body.outputs.len()));
     for output in &body.outputs {
         buf.extend(encode_transaction_output(output));
     }
+    encode_array_close(&mut buf, body.outputs.len());
 
     // 2: fee
     buf.extend(encode_uint(2));
@@ -691,10 +713,11 @@ pub(super) fn encode_transaction_body_for_era(body: &TransactionBody, era: Era) 
     //   Issue #475 Phase 3.5.
     if emit_key14_legacy {
         buf.extend(encode_uint(14));
-        buf.extend(encode_array_header(body.required_signers.len()));
+        buf.extend(encode_array_open(body.required_signers.len()));
         for hash in &body.required_signers {
             buf.extend(encode_bytes(&hash.as_bytes()[..28]));
         }
+        encode_array_close(&mut buf, body.required_signers.len());
     } else if emit_key14_dijkstra {
         buf.extend(encode_uint(14));
         // Compose the on-wire set from `guards` when present; otherwise fall
@@ -720,10 +743,11 @@ pub(super) fn encode_transaction_body_for_era(body: &TransactionBody, era: Era) 
         // `Credential` already carries in dugite-primitives).
         entries.sort();
         entries.dedup();
-        buf.extend(encode_array_header(entries.len()));
+        buf.extend(encode_array_open(entries.len()));
         for cred in &entries {
             buf.extend(super::certificate::encode_credential(cred));
         }
+        encode_array_close(&mut buf, entries.len());
     }
 
     // 15: network_id
@@ -765,10 +789,11 @@ pub(super) fn encode_transaction_body_for_era(body: &TransactionBody, era: Era) 
     // 20: proposal_procedures
     if !body.proposal_procedures.is_empty() {
         buf.extend(encode_uint(20));
-        buf.extend(encode_array_header(body.proposal_procedures.len()));
+        buf.extend(encode_array_open(body.proposal_procedures.len()));
         for pp in &body.proposal_procedures {
             buf.extend(encode_proposal_procedure(pp));
         }
+        encode_array_close(&mut buf, body.proposal_procedures.len());
     }
 
     // 21: treasury_value
@@ -785,22 +810,30 @@ pub(super) fn encode_transaction_body_for_era(body: &TransactionBody, era: Era) 
 
     // 23: sub_transactions (Dijkstra+) — OMap TxId (Tx SubTx era).
     //
-    // Wire shape: CBOR map keyed by the 32-byte TxId, value is the SubTx
-    // body (itself a CBOR map of integer-keyed fields, see
-    // [`encode_sub_tx_body`]). When a sub-tx was decoded from chain we
-    // round-trip its raw body bytes verbatim so the OMap key invariant
-    // `key == blake2b_256(value)` holds byte-exact. When the sub-tx was
+    // Wire shape: a bare ARRAY OF VALUES, not a map. Haskell's `OMap` never
+    // encodes its keys — they are reconstructed on decode from each value via
+    // `HasOKey.toOKey` (#936). `libs/cardano-data/src/Data/OMap/Strict.hs`:
+    //
+    //   instance (EncCBOR v, Ord k) => EncCBOR (OMap k v) where
+    //     encCBOR omap = encodeStrictSeq encCBOR (toStrictSeq omap)
+    //
+    // `encodeStrictSeq` is `variableListLenEncoding`, hence the open/close
+    // pair rather than a fixed definite header (#938).
+    //
+    // When a sub-tx was decoded from chain we round-trip its raw body bytes
+    // verbatim, so the reconstructed id is byte-exact; when it was
     // constructed in-memory we synthesise a body via `encode_sub_tx_body`.
     if emit_sub_transactions {
+        let len = body.sub_transactions.len();
         buf.extend(encode_uint(23));
-        buf.extend(encode_map_header(body.sub_transactions.len()));
+        buf.extend(encode_array_open(len));
         for sub in &body.sub_transactions {
-            buf.extend(crate::cbor::encode_bytes(sub.tx_id.as_bytes()));
             match &sub.raw_body_cbor {
                 Some(bytes) => buf.extend_from_slice(bytes),
                 None => buf.extend(encode_sub_tx_body(sub)),
             }
         }
+        encode_array_close(&mut buf, len);
     }
 
     // 25: direct_deposits (Dijkstra+) — atomic ADA flow into reward
@@ -892,10 +925,11 @@ fn encode_sub_tx_body(sub: &dugite_primitives::transaction::SubTransaction) -> V
     ));
     // 1: outputs
     buf.extend(encode_uint(1));
-    buf.extend(encode_array_header(sub.outputs.len()));
+    buf.extend(encode_array_open(sub.outputs.len()));
     for out in &sub.outputs {
         buf.extend(encode_transaction_output(out));
     }
+    encode_array_close(&mut buf, sub.outputs.len());
     // 3: ttl
     if let Some(ttl) = sub.ttl {
         buf.extend(encode_uint(3));
@@ -2823,5 +2857,237 @@ mod tests {
             decoded.body.direct_deposits, tx.body.direct_deposits,
             "indefinite direct_deposits map must round-trip"
         );
+    }
+
+    // ── #938: variableListLenEncoding boundary (definite <=23 / indefinite >23) ──
+    //
+    // Haskell `variableListLenEncoding` (cardano-ledger-binary Encoder.hs) uses
+    // `lengthThreshold = 23`, exactly like `variableMapLenEncoding` (#930/#932).
+    // Every variable-length collection encoder funnels through it:
+    // `encodeStrictSeq` (outputs), `encodeSet` (inputs, after the 258 tag),
+    // `encodeList`, `encodeFoldableEncoder` (block body segments).
+
+    /// The raw helper: the four sizes that bracket every CBOR header width.
+    #[test]
+    fn array_open_close_boundary() {
+        for (n, head) in [
+            (0usize, vec![0x80]),
+            (23, vec![0x97]),
+            (24, vec![0x9f]),
+            (255, vec![0x9f]),
+            (256, vec![0x9f]),
+        ] {
+            assert_eq!(encode_array_open(n), head, "open header at n={n}");
+            let mut buf = Vec::new();
+            encode_array_close(&mut buf, n);
+            let expect_break = if n > 23 { vec![0xff] } else { Vec::new() };
+            assert_eq!(buf, expect_break, "close byte at n={n}");
+        }
+    }
+
+    /// Above 255 the indefinite form is genuinely SHORTER than the definite
+    /// one — this is the byte that #930 over-counted for maps (a false
+    /// `OutputValueTooLarge` reject). Same arithmetic for arrays.
+    #[test]
+    fn array_indefinite_is_one_byte_shorter_at_256() {
+        // definite 256 = 0x99 0x01 0x00 (3 bytes); indefinite = 0x9f + 0xff (2).
+        assert_eq!(encode_array_header(256).len(), 3);
+        let mut framing = encode_array_open(256);
+        encode_array_close(&mut framing, 256);
+        assert_eq!(framing.len(), 2);
+
+        // 24..=255 is a wash: definite 0x98 nn (2) vs 0x9f .. 0xff (2).
+        assert_eq!(encode_array_header(255).len(), 2);
+        let mut framing = encode_array_open(255);
+        encode_array_close(&mut framing, 255);
+        assert_eq!(framing.len(), 2);
+    }
+
+    fn body_with_outputs(n: usize) -> TransactionBody {
+        let mut body = minimal_body();
+        body.outputs = (0..n)
+            .map(|i| TransactionOutput {
+                address: test_address(),
+                value: ada(1_000_000 + i as u64),
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: false,
+                raw_cbor: None,
+            })
+            .collect();
+        body
+    }
+
+    /// `ctbOutputs :: StrictSeq (Sized (TxOut era))` with `Key 1 (To ctbrOutputs)`
+    /// — `encodeStrictSeq`, so the outputs array crosses the threshold too.
+    #[test]
+    fn tx_body_outputs_cross_the_23_24_threshold() {
+        for (n, indefinite) in [(23usize, false), (24, true), (256, true)] {
+            let enc = encode_transaction_body_for_era(&body_with_outputs(n), Era::Conway);
+            // Locate key 1's value: the body map is integer-keyed and key 1
+            // follows key 0's (tag-258) input set.
+            let pos = find_key_value_start(&enc, 1);
+            if indefinite {
+                assert_eq!(enc[pos], 0x9f, "outputs must be indefinite at n={n}");
+            } else {
+                assert_eq!(enc[pos], 0x80 | 23, "outputs must be definite at n={n}");
+            }
+            // Round-trips regardless of framing.
+            let decoded = crate::decode::era_conway::decode_conway_tx_body(
+                &mut crate::decode::reader::Reader::new(&enc),
+                Era::Conway,
+            )
+            .expect("body must decode");
+            assert_eq!(decoded.outputs.len(), n, "output count at n={n}");
+        }
+    }
+
+    /// `encodeSet` emits `encodeTag 258` and THEN a variable-length array, so
+    /// the threshold applies inside the tag.
+    #[test]
+    fn tx_body_input_set_is_tagged_then_variable_length() {
+        for (n, indefinite) in [(23usize, false), (24, true)] {
+            let mut body = minimal_body();
+            body.inputs = (0..n)
+                .map(|i| TransactionInput {
+                    transaction_id: Hash32::ZERO,
+                    index: i as u32,
+                })
+                .collect();
+            let enc = encode_transaction_body_for_era(&body, Era::Conway);
+            let pos = find_key_value_start(&enc, 0);
+            // tag 258 == 0xd9 0x01 0x02
+            assert_eq!(&enc[pos..pos + 3], &[0xd9, 0x01, 0x02], "set tag at n={n}");
+            if indefinite {
+                assert_eq!(enc[pos + 3], 0x9f, "input set indefinite at n={n}");
+            } else {
+                assert_eq!(enc[pos + 3], 0x80 | 23, "input set definite at n={n}");
+            }
+            let decoded = crate::decode::era_conway::decode_conway_tx_body(
+                &mut crate::decode::reader::Reader::new(&enc),
+                Era::Conway,
+            )
+            .expect("body must decode");
+            assert_eq!(decoded.inputs.len(), n, "input count at n={n}");
+        }
+    }
+
+    /// Scan an integer-keyed CBOR map for `key` and return the offset of its
+    /// value. Only handles the small uint keys used by tx bodies.
+    fn find_key_value_start(enc: &[u8], key: u8) -> usize {
+        let mut r = crate::decode::reader::Reader::new(enc);
+        let n = r.read_map_header().expect("map header").expect("definite");
+        for _ in 0..n {
+            let k = r.read_uint().expect("key");
+            let pos = r.position();
+            if k == key as u64 {
+                return pos;
+            }
+            r.skip().expect("skip value");
+        }
+        panic!("key {key} not found");
+    }
+
+    // ── #936: Dijkstra sub_transactions is an OMap == a bare ARRAY of values ──
+
+    fn sub_tx(marker: u64) -> dugite_primitives::transaction::SubTransaction {
+        dugite_primitives::transaction::SubTransaction {
+            outputs: vec![TransactionOutput {
+                address: test_address(),
+                value: ada(1_000_000 + marker),
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: false,
+                raw_cbor: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Haskell `EncCBOR (OMap k v) = encodeStrictSeq encCBOR (toStrictSeq omap)`
+    /// — the keys are NEVER on the wire. Key 23's value must therefore be an
+    /// array, and each id must be reconstructed as the hash of its body bytes.
+    #[test]
+    fn sub_transactions_encode_as_bare_value_array_and_round_trip() {
+        let mut body = minimal_body();
+        body.sub_transactions = vec![sub_tx(1), sub_tx(2), sub_tx(3)];
+
+        let enc = encode_transaction_body_for_era(&body, Era::Dijkstra);
+        let pos = find_key_value_start(&enc, 23);
+        assert_eq!(
+            enc[pos] & 0xe0,
+            0x80,
+            "sub_transactions must be a CBOR array (major type 4), not a map"
+        );
+        assert_eq!(enc[pos], 0x83, "3 sub-txs => definite array of 3");
+
+        let decoded = crate::decode::era_conway::decode_conway_tx_body(
+            &mut crate::decode::reader::Reader::new(&enc),
+            Era::Dijkstra,
+        )
+        .expect("Dijkstra body must decode");
+        assert_eq!(decoded.sub_transactions.len(), 3);
+
+        // Keys are reconstructed via `toOKey` == blake2b_256 of the body bytes.
+        for sub in &decoded.sub_transactions {
+            let raw = sub.raw_body_cbor.as_ref().expect("raw body preserved");
+            assert_eq!(
+                sub.tx_id,
+                dugite_primitives::hash::blake2b_256(raw),
+                "sub-tx id must be the hash of its own body bytes"
+            );
+        }
+        // Distinct bodies => distinct ids.
+        assert_ne!(
+            decoded.sub_transactions[0].tx_id,
+            decoded.sub_transactions[1].tx_id
+        );
+    }
+
+    /// `decodeOMap` uses `decodeListLikeEnforceNoDuplicates`: a repeated
+    /// reconstructed key is a hard decode failure, not a last-wins merge.
+    #[test]
+    fn sub_transactions_reject_duplicates() {
+        let mut body = minimal_body();
+        // The SAME sub-tx twice => identical body bytes => identical id.
+        body.sub_transactions = vec![sub_tx(9), sub_tx(9)];
+
+        let enc = encode_transaction_body_for_era(&body, Era::Dijkstra);
+        let result = crate::decode::era_conway::decode_conway_tx_body(
+            &mut crate::decode::reader::Reader::new(&enc),
+            Era::Dijkstra,
+        );
+        let err = format!(
+            "{:?}",
+            result.expect_err("duplicate sub-tx must be rejected")
+        );
+        assert!(
+            err.contains("duplicate sub-transaction id"),
+            "expected the OMap duplicate error, got: {err}"
+        );
+    }
+
+    /// The OMap array obeys the same `variableListLenEncoding` threshold as
+    /// every other collection (#938), and both header forms decode.
+    #[test]
+    fn sub_transactions_cross_the_23_24_threshold() {
+        for (n, indefinite) in [(23usize, false), (24, true)] {
+            let mut body = minimal_body();
+            body.sub_transactions = (0..n).map(|i| sub_tx(i as u64)).collect();
+
+            let enc = encode_transaction_body_for_era(&body, Era::Dijkstra);
+            let pos = find_key_value_start(&enc, 23);
+            if indefinite {
+                assert_eq!(enc[pos], 0x9f, "sub_transactions indefinite at n={n}");
+            } else {
+                assert_eq!(enc[pos], 0x80 | 23, "sub_transactions definite at n={n}");
+            }
+            let decoded = crate::decode::era_conway::decode_conway_tx_body(
+                &mut crate::decode::reader::Reader::new(&enc),
+                Era::Dijkstra,
+            )
+            .expect("body must decode");
+            assert_eq!(decoded.sub_transactions.len(), n, "count at n={n}");
+        }
     }
 }
