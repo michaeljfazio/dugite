@@ -2634,6 +2634,10 @@ impl Node {
             peer_manager: Arc::new(RwLock::new({
                 let mut pm = NodePeerManager::new(PeerManagerConfig::default());
                 pm.set_gsm_event_tx(gsm_event_tx.clone());
+                // #933: mirror the consensus mode into the peer manager —
+                // the `consensusMode` dimension of `haa_satisfied`'s
+                // Haskell `outboundConnectionsState` case split.
+                pm.set_genesis_mode(genesis_enabled);
                 pm
             })),
             socket_path,
@@ -3469,6 +3473,10 @@ impl Node {
             pm.set_local_addr(self.listen_addr);
             // Wire GSM event sender so peer_disconnected() emits events
             pm.set_gsm_event_tx(self.gsm_event_tx.clone());
+            // #933: re-mirror the consensus mode — this instance REPLACES
+            // the construction-time one, so the `consensusMode` dimension
+            // of `haa_satisfied`'s case split must be carried over.
+            pm.set_genesis_mode(self.consensus_mode == "genesis");
             *self.peer_manager.write().await = pm;
         }
         let peer_manager = self.peer_manager.clone();
@@ -4985,11 +4993,13 @@ impl Node {
 
                     let active_blp = {
                         let pm = status_pm.read().await;
-                        // HAA satisfaction (Haskell outboundConnectionsState):
-                        // big-ledger-peer trust OR trusted-local-roots trust.
-                        // Report a synthetic count the GSM's `>= min` gate reads
-                        // (the real BLP count when below, min when HAA holds via
-                        // local roots).
+                        // HAA satisfaction (Haskell outboundConnectionsState —
+                        // an independent case split over (bootstrapPeersFlag,
+                        // consensusMode), #933). Report a synthetic count the
+                        // GSM's `>= min` gate reads (min when the HAA holds,
+                        // the real BLP count otherwise). In Praos mode the
+                        // value is inert: `evaluate()` returns None when the
+                        // GSM is disabled, and nothing else consumes it.
                         if pm.haa_satisfied(status_min_blp) {
                             status_min_blp
                         } else {

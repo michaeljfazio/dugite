@@ -416,10 +416,8 @@ pub fn forge_block(
 ///
 /// This must match the structure used by `compute_block_body_hash` and `encode_block`.
 fn compute_body_size(transactions: &[Transaction]) -> u64 {
-    use dugite_serialization::cbor::{encode_array_header, encode_map_header, encode_uint};
-    use dugite_serialization::encode::{
-        encode_auxiliary_data, encode_transaction_body, encode_witness_set,
-    };
+    use dugite_serialization::cbor::{encode_array_header, encode_uint};
+    use dugite_serialization::encode::{encode_transaction_body, encode_witness_set};
 
     // 1. tx_bodies array — use preserved raw CBOR for byte-exact size
     let mut bodies_len = encode_array_header(transactions.len()).len();
@@ -441,21 +439,12 @@ fn compute_body_size(transactions: &[Transaction]) -> u64 {
         }
     }
 
-    // 3. aux_data map — use preserved raw CBOR for byte-exact size
-    let aux_entries: Vec<_> = transactions
-        .iter()
-        .enumerate()
-        .filter_map(|(i, tx)| tx.auxiliary_data.as_ref().map(|aux| (i, aux)))
-        .collect();
-    let mut aux_len = encode_map_header(aux_entries.len()).len();
-    for (idx, aux) in &aux_entries {
-        aux_len += encode_uint(*idx as u64).len();
-        if let Some(raw) = &aux.raw_cbor {
-            aux_len += raw.len();
-        } else {
-            aux_len += encode_auxiliary_data(aux).len();
-        }
-    }
+    // 3. aux_data map — sized via the SAME shared segment encoder that
+    // encode_block/compute_block_body_hash emit (raw-preferred per entry,
+    // variable-length map framing), so the declared body_size can never
+    // diverge from the wire bytes (#932: the previous hand-rolled
+    // definite-length header over-declared by 1 byte at >255 aux entries).
+    let aux_len = dugite_serialization::encode::encode_aux_data_segment(transactions).len();
 
     // 4. invalid_tx_indices array
     let invalid_indices: Vec<_> = transactions

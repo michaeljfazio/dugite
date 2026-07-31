@@ -475,12 +475,12 @@ impl GenesisStateMachine {
                 // Haskell alignment: in `UseBootstrapPeers` mode the HAA
                 // (`outboundConnectionsState = TrustedStateWithExternalPeers`)
                 // is satisfied by ≥1 active BOOTSTRAP PEER, not by big-ledger
-                // peers.  Dugite does not yet track bootstrap peers in
-                // `haa_satisfied`, so `active_blp_count` always reads 0 in a
-                // topology with only bootstrap peers (preprod, preview with no
-                // peerSnapshotFile) — `haa_satisfied` returns the synthetic
-                // `min` only via the trusted-local-roots path, which is also
-                // empty when `localRoots = []`.
+                // peers.  `haa_satisfied` implements this as the bootstrap
+                // branch of its (bootstrapPeersFlag, consensusMode) case
+                // split (#933): while the branch's closure holds, the
+                // SyncStatus emitter reports the synthetic `min`; when it
+                // breaks (e.g. bootstrap relays all disconnect), the
+                // reported count drops to the real active-BLP count.
                 //
                 // When the node started in Syncing because its tip was recent
                 // (the Mithril-bootstrap path — `syncing_startup_threshold_secs`
