@@ -95,7 +95,45 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 - 28-byte hash types (DRep keys, pool voter keys, required signers) must be padded to 32 bytes via `Hash28::to_hash32_padded()` — do not use `Hash<32>::from()` directly on 28-byte hashes
 
 ## Current Focus
-**v2.4.1 released (2026-07-31)** — encodeMap parity + diagnostics + coverage.
+**v2.4.2 released (2026-07-31)** — full Haskell-alignment sweep. Drop-in,
+SNAPSHOT unchanged at 31. Closes #932, #933, #934.
+
+- **#932 (serialization)** — `encodeMap` semantics (definite <=23 entries,
+  indefinite `0xbf…0xff` above; shared `encode_map_open/close` in cbor.rs)
+  applied to ALL remaining Map encoder sites: withdrawals, redeemers map
+  form (PV>=9), voting-procedures (both levels), treasury-withdrawals,
+  committee, MIR creds, metadata maps, block aux-data segment, Dijkstra
+  direct_deposits + account_balance_intervals. Pinned always-definite (do
+  NOT "align"): `PlutusData::Map`, nested `Metadatum::Map`, integer-keyed
+  struct maps. Bare-metadata MapIndef decode fixed (was silently EMPTY).
+  Audit find fixed: `encode_voter` StakePool emitted 32B where CDDL
+  `voter = [4, pool_keyhash]` wants bstr(28) — synthetic SPO votes were
+  self-undecodable. Forge `compute_body_size` now shares
+  `encode_aux_data_segment` (was +1 byte declared at >255 aux txs).
+- **#933 (node)** — `haa_satisfied` = Haskell `outboundConnectionsState`'s
+  independent case split: bootstrap-configured → closure + >=1 ACTIVE
+  BOOTSTRAP peer (specifically, not any trusted peer); Praos+no-bootstrap
+  → false, silent; Genesis+no-bootstrap → hot-BLP count ONLY (untrusted
+  established peers irrelevant — the branch is now reachable).
+  associationMode documented always-Unrestricted. Clamp/#920/#931 intact.
+- **#934 (cli)** — cardano-cli compat: `key-gen-KES`/`key-gen-VRF`/
+  `key-hash-VRF` canonical casings (lowercase aliased),
+  `--operational-certificate-issue-counter[-file]` aliases, `--network`
+  hard-errors on typos (was silent Testnet fallback), typed
+  `verification-key-hash` (rejects signing/KES/VRF keys by name), exact
+  `0x58 0x20` CBOR unwrap in `pool_id_from_cold_vkey`.
+- **Deferred with issues**: #935 cli surface parity backlog, #936 Dijkstra
+  sub_transactions OMap shape (unreleased era), #937 nested-metadatum
+  MapIndef decode liberality (needs Haskell-source verification).
+
+QA: devnet-validate standard **3/3 rounds PASS** at 261b7852e3
+(`reports/devnet-validate/v2.4.2.json`) — 558 canonical blocks, 0 invalid
+forges, tx-zoo 84/84 full run, bidirectional parity 41/41, byte-exact
+treasury/reserves after first RUPD, restart rejoin <60s. Workspace suite
+7653. **Open issues: #935/#936/#937 (documented deferrals only).**
+
+### v2.4.1 (2026-07-31)
+Encodemap parity + diagnostics + coverage.
 Drop-in, SNAPSHOT unchanged at 31. Closes #930, #931.
 
 - **#930 (serialization/ledger)** — `encode_multi_asset`/`encode_mint` now
