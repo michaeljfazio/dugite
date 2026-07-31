@@ -51,7 +51,8 @@ The storage layer is pure Rust with no system dependencies. cardano-lsm (used fo
 
 ## Architecture
 
-15-crate Cargo workspace under `crates/`. Dependency flow:
+16-crate Cargo workspace under `crates/` (19 workspace members including
+`xtask`, `tests/conformance`, `tests/golden`). Dependency flow:
 
 ```
 dugite-node (binary: main node, config, pipelined sync, Mithril import, block forging)

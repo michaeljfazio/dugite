@@ -8,7 +8,7 @@ role: relay
 # to `ghcr.io/michaeljfazio/dugite` for every tagged release.
 image:
   repository: ghcr.io/michaeljfazio/dugite
-  tag: ""  # Defaults to Chart appVersion (1.7.0)
+  tag: ""  # Defaults to Chart appVersion
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []

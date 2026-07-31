@@ -2788,7 +2788,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "histogram_quantile(0.5, sum(rate(dugite_peer_block_fetch_ms_bucket[5m])) by (le))",
+          "expr": "histogram_quantile(0.5, sum(rate(dugite_peer_block_fetch_range_ms_bucket[5m])) by (le))",
           "legendFormat": "p50",
           "refId": "A"
         },
@@ -2797,7 +2797,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "histogram_quantile(0.95, sum(rate(dugite_peer_block_fetch_ms_bucket[5m])) by (le))",
+          "expr": "histogram_quantile(0.95, sum(rate(dugite_peer_block_fetch_range_ms_bucket[5m])) by (le))",
           "legendFormat": "p95",
           "refId": "A"
         },
@@ -2806,7 +2806,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "histogram_quantile(0.99, sum(rate(dugite_peer_block_fetch_ms_bucket[5m])) by (le))",
+          "expr": "histogram_quantile(0.99, sum(rate(dugite_peer_block_fetch_range_ms_bucket[5m])) by (le))",
           "legendFormat": "p99",
           "refId": "A"
         }
