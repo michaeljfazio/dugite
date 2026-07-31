@@ -395,9 +395,27 @@ pub(super) fn encode_witness_set_for_era(ws: &TransactionWitnessSet, era: Era) -
     // Key 4 (plutus_data) gets the tag inside `encode_datums`; key 5 (redeemers)
     // is a map from PV9 on and never carries it.
     //
-    // NOTE: Haskell iterates `Set` / `Map.elems`, i.e. Ord-sorted, whereas dugite
-    // preserves wire order here. That ordering difference is deliberately NOT
-    // addressed by this change — see #939.
+    // ORDERING: preserving wire order here is CORRECT, not a gap (#939).
+    //
+    // Haskell decodes these fields into `Set`/`Map`, which discards wire order
+    // entirely, and there is NO order check at any protocol version — the
+    // "enforce no duplicates" decoders compare `len == count` and nothing more.
+    // On the relay / passthrough / forge-from-received-bytes path, Haskell
+    // replays the ORIGINAL bytes verbatim: `AlonzoTxWits` is a `MemoBytes`, and
+    // `EncCBOR (MemoBytes t) = encodePreEncoded (fromShort bytes)`. It never
+    // re-sorts what it is relaying, so sorting here would itself be the
+    // divergence. dugite matches this by preferring `raw_witness_cbor`.
+    //
+    // Haskell only canonicalises on genuinely FRESH construction, where
+    // `mkMemoizedEra` re-serialises through the `Set`/`Map.elems` encoder. If a
+    // dugite path ever needs byte-identical output against cardano-cli for a
+    // from-scratch witness set, the sort keys are:
+    //   - key 0 `WitVKey`         -> `wvkKeyHash` = blake2b224(vkey)
+    //   - key 2 `BootstrapWitness`-> `bootstrapWitKeyHash`, a DIFFERENT hash:
+    //     the Byron addr-root form, blake2b224(SHA3-256(prefix ++ vkey ++
+    //     chaincode ++ attrs)) — do not reuse the key-0 hash for it
+    //   - keys 1/3/6/7            -> ScriptHash ascending, each Plutus language
+    //     bucket sorted independently
     let use_set_tag = matches!(era, Era::Conway | Era::Dijkstra);
 
     let mut buf = encode_map_header(count);
