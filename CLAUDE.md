@@ -95,7 +95,69 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 - 28-byte hash types (DRep keys, pool voter keys, required signers) must be padded to 32 bytes via `Hash28::to_hash32_padded()` — do not use `Hash<32>::from()` directly on 28-byte hashes
 
 ## Current Focus
-**v2.4.2 released (2026-07-31)** — full Haskell-alignment sweep. Drop-in,
+**v2.4.3 (2026-08-01)** — CBOR encoder alignment sweep: the non-map half of
+`cardano-ledger-binary`, never previously audited. Drop-in, SNAPSHOT unchanged
+at 31. Closes #935, #936, #937, #938, #939, #940.
+
+Three of the six were found BY oracle-verifying the first three — every claim
+in this release is backed by verbatim IntersectMBO source (pinned
+`58ba7795273f9301a9a198930e50a6ca1ee85238`).
+
+- **#938 (serialization)** — #930/#932 aligned the Map encoders with
+  `encodeMap`; the identical `lengthThreshold = 23` governs
+  `variableListLenEncoding`, and dugite emitted a DEFINITE array header at
+  every array/list/set site. Now `encode_array_open`/`encode_array_close`
+  (siblings of `encode_map_open/close`) on: tx-body outputs / required_signers
+  / proposals / sub_transactions, `encode_tagged_set` + `encode_plain_array`
+  (inputs, certs, collateral, ref inputs), witness-set collections, aux-data
+  script arrays, and the block-body segments. Fixed-arity
+  `encode_array_header(n)` records deliberately untouched (`encodeListLen n`).
+  Block body now shares ONE encoder per segment (`encode_tx_bodies_segment`,
+  `encode_witness_sets_segment`, `encode_invalid_indices_segment` alongside
+  `encode_aux_data_segment`) across `encode_block` /
+  `compute_block_body_hash` / forge `compute_body_size` — the triplication was
+  the defect mechanism for BOTH #932 and #938.
+  **Not a chain split**: Haskell's `DecCBOR (Annotator (AlonzoBlockBody))` uses
+  `withSlice` and hashes the bytes AS RECEIVED, so dugite's definite framing
+  was self-consistent and accepted. Real impact = non-canonical output, a
+  different tx id than cardano-cli for the same synthetic tx, and a 1-byte
+  over-count at >=256 elements (definite `0x99 xxxx` = 3B vs `0x9f`+`0xff` = 2B)
+  — the #930 shape, so false REJECT possible, never false accept.
+- **#940 (serialization)** — Conway `ctbrCerts`/`ctbrProposalProcedures` are
+  **OSet, not Set**. dugite ran them through the sorting `encode_tagged_set`,
+  which **reordered certificates** (order is semantically load-bearing:
+  registration must precede the delegation using it), and omitted tag 258 on
+  proposals entirely. `OSet`'s `setTag` is UNCONDITIONAL — no
+  `ifEncodingVersionAtLeast` guard, unlike `Set`'s PV>=9 gate. New
+  `encode_ordered_set` = tag + variable array, order preserved.
+- **#939 (serialization)** — Conway witness keys 0/1/2/3/6/7 omitted tag 258
+  (`encodeWithSetTag`, PV>=9). Confirmed empirically: the real `conway.hex`
+  fixture has 4 witness sets with `key0 -> tag258 -> array`. Era-gated.
+  **Ordering is correct as-is** — Haskell decodes these into `Set`/`Map`
+  (order unobservable, no order check at any PV) and its `MemoBytes`
+  `encodePreEncoded` replays original bytes on relay, so sorting would BE the
+  divergence. Sort keys recorded in-code for any future fresh-construction
+  path; note `BootstrapWitness` orders by the Byron addr-root hash, NOT
+  `WitVKey`'s blake2b224(vkey).
+- **#937 (serialization)** — three drifted copies of `read_metadatum` all gated
+  nested maps/lists/text on the definite form only. Haskell accepts BOTH forms
+  of every compound token. One shared decoder in `decode/helpers.rs` (the
+  duplication WAS the drift mechanism) + `Reader::read_str_owned`. Encoder
+  stays always-definite (`encodeMetadatum`); `TypeTag` stays rejected.
+- **#936 (serialization)** — Dijkstra `sub_transactions` is an `OMap`, which
+  encodes as a BARE ARRAY of values (`encodeStrictSeq`, keys reconstructed via
+  `toOKey`), not the `{tx_id => body}` map dugite emitted. Decoder now derives
+  each id from its own body bytes and rejects duplicates
+  (`EnforceNoDuplicates`), making key-smuggling structurally inexpressible.
+- **#935 (cli)** — 4 lenient CBOR unwrap heuristics replaced by one strict
+  `envelope::unwrap_key_bytes` (the `& 0xe0` test ate the first byte of any raw
+  key starting 0x40..=0x5f, 1-in-8). Plus `--mainnet`/`--testnet-magic`/
+  `CARDANO_NODE_NETWORK_ID`, inline verification-key STRINGs,
+  `--key-output-bech32`/`-text-envelope`/`-format`, `key-hash-VRF --out-file`.
+  Era-prefix leniency KEPT (dugite is a strict superset of cardano-cli 11).
+
+### Superseded: v2.4.2 (2026-07-31)
+Full Haskell-alignment sweep. Drop-in,
 SNAPSHOT unchanged at 31. Closes #932, #933, #934.
 
 - **#932 (serialization)** — `encodeMap` semantics (definite <=23 entries,
