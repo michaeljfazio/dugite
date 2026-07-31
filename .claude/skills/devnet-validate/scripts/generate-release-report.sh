@@ -237,10 +237,17 @@ process_round() {
     local cli_parity_equal=0 cli_parity_divergent=0 cli_parity_skip=0 cli_parity_error=0
     local parity_csv="$evd/cli-parity.csv"
     if [ -f "$parity_csv" ] && [ -s "$parity_csv" ]; then
-        cli_parity_equal=$(awk -F, 'NR>1 && $5=="true" {c++} END{print c+0}' "$parity_csv")
-        cli_parity_divergent=$(awk -F, 'NR>1 && $5=="false" && $6!~/skip|known-divergence/ {c++} END{print c+0}' "$parity_csv")
-        cli_parity_skip=$(awk -F, 'NR>1 && ($6~/^skip/ || $2~/\//) {c++} END{print c+0}' "$parity_csv" || echo 0)
-        cli_parity_error=$(awk -F, 'NR>1 && $6~/^error|ERROR/ {c++} END{print c+0}' "$parity_csv" || echo 0)
+        # Columns are ts,query,status,dugite_sha256,cardano_sha256,equal,notes (7).
+        # These used to index $5/$6, which matched the CSV's *header* — the header
+        # omitted `status` while every data row carried it, so `equal` was read
+        # from a sha256 field and every release reported cli_parity as all-zero
+        # (#945). The old skip rule also matched `$2~/\//`, firing on any query
+        # NAME containing a slash (e.g. `tip/era`), which is where the phantom
+        # skips came from. Classify off the explicit status column instead.
+        cli_parity_equal=$(awk -F, 'NR>1 && $3=="EQUAL" {c++} END{print c+0}' "$parity_csv")
+        cli_parity_divergent=$(awk -F, 'NR>1 && $3=="DIVERGENT" && $7!~/known-divergence/ {c++} END{print c+0}' "$parity_csv")
+        cli_parity_skip=$(awk -F, 'NR>1 && $3=="SKIP" {c++} END{print c+0}' "$parity_csv" || echo 0)
+        cli_parity_error=$(awk -F, 'NR>1 && $3=="ERROR" {c++} END{print c+0}' "$parity_csv" || echo 0)
     fi
 
     # --- Epoch transitions ---

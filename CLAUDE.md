@@ -162,6 +162,48 @@ in this release is backed by verbatim IntersectMBO source (pinned
   `--key-output-bech32`/`-text-envelope`/`-format`, `key-hash-VRF --out-file`.
   Era-prefix leniency KEPT (dugite is a strict superset of cardano-cli 11).
 
+### v2.4.3 second wave — found by cross-checking the DOCS against the code
+- **#941 (node)** — metrics port drifted 3 ways: `--help` said 12798, binary
+  used 12796, and `config.rs`'s test module mirrored a THIRD rule (12798 +
+  no `TurnOnLogMetrics` branch). One `config::resolve_metrics_port` now;
+  default **12796** (deliberately off cardano-node's 12798 — co-located).
+- **#942 (node)** — `--log-retention-days` deleted nothing: `cleanup_old_logs`
+  was `#[cfg(test)]` (absent from release builds) and the
+  `start_log_cleanup_task` its rustdoc referenced never existed. Now wired,
+  with tests driving the SPAWNED TASK not the helper.
+- **#943 (node)** — `BlockFetchLogicTask` spawned in production, no peer ever
+  registered ⇒ `evaluate_and_fetch` early-returned forever. Deleted. It was
+  the decoy that made the docs claim a multi-peer fetch pool. Live path is
+  `ConnectionLifecycleManager::make_blockfetch_task` (single fetcher,
+  Haskell `bfcMaxConcurrencyBulkSync=1`).
+- **#944 (harness)** — devnet-validate Round 3 queried
+  `state/dugite-bp.sock`, which does not exist (sockets are `/tmp/ld-$UID/`;
+  macOS sun_path 104B). Restart criterion never evaluated — reported FAIL
+  identically whether the node recovered or died. Now uses
+  `$LD_DUGITE_BP_SOCK` + INCONCLUSIVE guards.
+- **#945 (harness)** — `cli-parity.csv` header declared 6 columns while rows
+  had 7 (`status` missing), and the report generator indexed `$5`/`$6` off the
+  bad header, with a skip rule matching `$2~/\//` (any query NAME with a
+  slash). **Every release report ever published recorded `cli_parity` as
+  all-zero** — v2.4.2.json included; the "18 EQUAL" claims were transcribed
+  from console logs by hand. Fixed header + generator; v2.4.3 is the first
+  report with real parity numbers.
+
+### QA — v2.4.3
+devnet-validate standard **3/3 rounds PASS** at b6b9f2b024
+(`reports/devnet-validate/v2.4.3.json`) vs cardano-node 11.0.1:
+543 canonical blocks, **0 orphans**, 0 invalid forges, 0 critical anomalies,
+0 ERROR lines in any node log. tx-zoo 84/85 baseline (1 state-skip:
+no-rewards). Bidirectional parity **41/41 identical, 0 off-diagonal**.
+Adversarial N2N **26/26 handled (22 correctly REJECTED, 4 PASS), 0 panic,
+0 silent-skip**. cli-parity **18 EQUAL / 0 divergent / 4 skip**.
+Byte-exact pot parity after the first RUPD (boundary 1->2, epoch 2):
+treasury=3347997655395 reserves=5996646007361582 on BOTH dugite and Haskell.
+Restart: tip 27 -> 65 within 60s, 0 stale-intersection.
+The 2 epoch-boundary tx-zoo failures are the trickle racing itself
+(`Input conflict: input already claimed by mempool tx`) — the mempool
+input-conflict check working as designed, not a defect.
+
 ### Superseded: v2.4.2 (2026-07-31)
 Full Haskell-alignment sweep. Drop-in,
 SNAPSHOT unchanged at 31. Closes #932, #933, #934.
