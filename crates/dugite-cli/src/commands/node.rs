@@ -26,6 +26,15 @@ enum NodeSubcommand {
             alias = "operational-certificate-counter-file"
         )]
         operational_certificate_counter_file: PathBuf,
+        /// Write keys as bech32 instead of a text envelope (cardano-cli)
+        #[arg(long, conflicts_with_all = ["key_output_text_envelope", "key_output_format"])]
+        key_output_bech32: bool,
+        /// Write keys as a text envelope (cardano-cli; this is the default)
+        #[arg(long, conflicts_with = "key_output_format")]
+        key_output_text_envelope: bool,
+        /// Deprecated cardano-cli spelling: text-envelope | bech32
+        #[arg(long)]
+        key_output_format: Option<String>,
     },
     /// Generate a KES key pair
     // cardano-cli canonical spelling is uppercase (it rejects `key-gen-kes`);
@@ -36,6 +45,15 @@ enum NodeSubcommand {
         verification_key_file: PathBuf,
         #[arg(long)]
         signing_key_file: PathBuf,
+        /// Write keys as bech32 instead of a text envelope (cardano-cli)
+        #[arg(long, conflicts_with_all = ["key_output_text_envelope", "key_output_format"])]
+        key_output_bech32: bool,
+        /// Write keys as a text envelope (cardano-cli; this is the default)
+        #[arg(long, conflicts_with = "key_output_format")]
+        key_output_text_envelope: bool,
+        /// Deprecated cardano-cli spelling: text-envelope | bech32
+        #[arg(long)]
+        key_output_format: Option<String>,
     },
     /// Generate a VRF key pair
     #[command(name = "key-gen-VRF", alias = "key-gen-vrf")]
@@ -44,6 +62,15 @@ enum NodeSubcommand {
         verification_key_file: PathBuf,
         #[arg(long)]
         signing_key_file: PathBuf,
+        /// Write keys as bech32 instead of a text envelope (cardano-cli)
+        #[arg(long, conflicts_with_all = ["key_output_text_envelope", "key_output_format"])]
+        key_output_bech32: bool,
+        /// Write keys as a text envelope (cardano-cli; this is the default)
+        #[arg(long, conflicts_with = "key_output_format")]
+        key_output_text_envelope: bool,
+        /// Deprecated cardano-cli spelling: text-envelope | bech32
+        #[arg(long)]
+        key_output_format: Option<String>,
     },
     /// Issue a new operational certificate
     IssueOpCert {
@@ -79,8 +106,80 @@ enum NodeSubcommand {
     #[command(name = "key-hash-VRF", alias = "key-hash-vrf")]
     KeyHashVrf {
         #[arg(long)]
-        verification_key_file: PathBuf,
+        verification_key_file: Option<PathBuf>,
+        /// VRF verification key as an inline bech32 or hex STRING
+        /// (cardano-cli alternative to --verification-key-file)
+        #[arg(long, conflicts_with = "verification_key_file")]
+        verification_key: Option<String>,
+        /// Write the hash to a file instead of stdout (cardano-cli parity)
+        #[arg(long)]
+        out_file: Option<PathBuf>,
     },
+}
+
+/// Key output encoding selected by the cardano-cli `--key-output-*` flags
+/// (#935 item 2).
+///
+/// cardano-cli 11 exposes `--key-output-bech32` and
+/// `--key-output-text-envelope`, having deprecated the older
+/// `--key-output-format text-envelope|bech32`. All three are accepted here;
+/// the text envelope is the default, matching cardano-cli and dugite's
+/// previous unconditional behaviour.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum KeyOutputFormat {
+    TextEnvelope,
+    Bech32,
+}
+
+fn key_output_format(
+    bech32_flag: bool,
+    text_envelope_flag: bool,
+    format: Option<&str>,
+) -> Result<KeyOutputFormat> {
+    if bech32_flag {
+        return Ok(KeyOutputFormat::Bech32);
+    }
+    if text_envelope_flag {
+        return Ok(KeyOutputFormat::TextEnvelope);
+    }
+    match format {
+        None => Ok(KeyOutputFormat::TextEnvelope),
+        Some("text-envelope") => Ok(KeyOutputFormat::TextEnvelope),
+        Some("bech32") => Ok(KeyOutputFormat::Bech32),
+        Some(other) => anyhow::bail!(
+            "invalid --key-output-format \"{other}\": expected \"text-envelope\" or \"bech32\""
+        ),
+    }
+}
+
+/// Write one key file in the selected encoding.
+///
+/// `hrp` is the bech32 human-readable prefix cardano-cli uses for this key
+/// role (e.g. `kes_vk`, `vrf_sk`); `payload` is the RAW key bytes, which the
+/// text-envelope path CBOR-wraps and the bech32 path encodes directly.
+fn write_key_file(
+    path: &std::path::Path,
+    format: KeyOutputFormat,
+    hrp: &str,
+    envelope_type: &str,
+    description: &str,
+    payload: &[u8],
+) -> Result<()> {
+    match format {
+        KeyOutputFormat::TextEnvelope => {
+            let env = serde_json::json!({
+                "type": envelope_type,
+                "description": description,
+                "cborHex": hex::encode(simple_cbor_wrap(payload)),
+            });
+            std::fs::write(path, serde_json::to_string_pretty(&env)?)?;
+        }
+        KeyOutputFormat::Bech32 => {
+            let encoded = bech32::encode::<bech32::Bech32>(bech32::Hrp::parse(hrp)?, payload)?;
+            std::fs::write(path, encoded)?;
+        }
+    }
+    Ok(())
 }
 
 fn simple_cbor_wrap(data: &[u8]) -> Vec<u8> {
@@ -105,20 +204,17 @@ impl NodeCmd {
                 cold_verification_key_file,
                 cold_signing_key_file,
                 operational_certificate_counter_file,
+                key_output_bech32,
+                key_output_text_envelope,
+                key_output_format,
             } => {
                 let sk = dugite_crypto::keys::PaymentSigningKey::generate();
                 let vk = sk.verification_key();
-
-                let sk_env = serde_json::json!({
-                    "type": "StakePoolSigningKey_ed25519",
-                    "description": "Stake Pool Operator Cold Signing Key",
-                    "cborHex": hex::encode(simple_cbor_wrap(&sk.to_bytes()))
-                });
-                let vk_env = serde_json::json!({
-                    "type": "StakePoolVerificationKey_ed25519",
-                    "description": "Stake Pool Operator Cold Verification Key",
-                    "cborHex": hex::encode(simple_cbor_wrap(&vk.to_bytes()))
-                });
+                let fmt = self::key_output_format(
+                    key_output_bech32,
+                    key_output_text_envelope,
+                    key_output_format.as_deref(),
+                )?;
 
                 // Counter starts at 0, includes the cold vkey
                 let mut counter_cbor = Vec::new();
@@ -133,13 +229,21 @@ impl NodeCmd {
                     "cborHex": hex::encode(&counter_cbor)
                 });
 
-                std::fs::write(
+                write_key_file(
                     &cold_signing_key_file,
-                    serde_json::to_string_pretty(&sk_env)?,
+                    fmt,
+                    "pool_sk",
+                    "StakePoolSigningKey_ed25519",
+                    "Stake Pool Operator Cold Signing Key",
+                    &sk.to_bytes(),
                 )?;
-                std::fs::write(
+                write_key_file(
                     &cold_verification_key_file,
-                    serde_json::to_string_pretty(&vk_env)?,
+                    fmt,
+                    "pool_vk",
+                    "StakePoolVerificationKey_ed25519",
+                    "Stake Pool Operator Cold Verification Key",
+                    &vk.to_bytes(),
                 )?;
                 std::fs::write(
                     &operational_certificate_counter_file,
@@ -161,7 +265,15 @@ impl NodeCmd {
             NodeSubcommand::KeyGenKes {
                 verification_key_file,
                 signing_key_file,
+                key_output_bech32,
+                key_output_text_envelope,
+                key_output_format,
             } => {
+                let fmt = self::key_output_format(
+                    key_output_bech32,
+                    key_output_text_envelope,
+                    key_output_format.as_deref(),
+                )?;
                 // Generate proper Sum6Kes key pair (depth-6 binary sum composition)
                 use rand::RngCore;
                 let mut seed = [0u8; 32];
@@ -170,21 +282,21 @@ impl NodeCmd {
                 let (sk_bytes, pk_bytes) = dugite_crypto::kes::kes_keygen(&seed)
                     .map_err(|e| anyhow::anyhow!("KES key generation failed: {e}"))?;
 
-                let sk_env = serde_json::json!({
-                    "type": "KesSigningKey_ed25519_kes_2^6",
-                    "description": "KES Signing Key",
-                    "cborHex": hex::encode(simple_cbor_wrap(&sk_bytes))
-                });
-                let vk_env = serde_json::json!({
-                    "type": "KesVerificationKey_ed25519_kes_2^6",
-                    "description": "KES Period Verification Key",
-                    "cborHex": hex::encode(simple_cbor_wrap(&pk_bytes))
-                });
-
-                std::fs::write(&signing_key_file, serde_json::to_string_pretty(&sk_env)?)?;
-                std::fs::write(
+                write_key_file(
+                    &signing_key_file,
+                    fmt,
+                    "kes_sk",
+                    "KesSigningKey_ed25519_kes_2^6",
+                    "KES Signing Key",
+                    &sk_bytes,
+                )?;
+                write_key_file(
                     &verification_key_file,
-                    serde_json::to_string_pretty(&vk_env)?,
+                    fmt,
+                    "kes_vk",
+                    "KesVerificationKey_ed25519_kes_2^6",
+                    "KES Period Verification Key",
+                    &pk_bytes,
                 )?;
 
                 println!("KES key pair generated.");
@@ -195,24 +307,32 @@ impl NodeCmd {
             NodeSubcommand::KeyGenVrf {
                 verification_key_file,
                 signing_key_file,
+                key_output_bech32,
+                key_output_text_envelope,
+                key_output_format,
             } => {
                 let kp = dugite_crypto::vrf::generate_vrf_keypair();
+                let fmt = self::key_output_format(
+                    key_output_bech32,
+                    key_output_text_envelope,
+                    key_output_format.as_deref(),
+                )?;
 
-                let sk_env = serde_json::json!({
-                    "type": "VrfSigningKey_PraosVRF",
-                    "description": "VRF Signing Key",
-                    "cborHex": hex::encode(simple_cbor_wrap(kp.secret_key()))
-                });
-                let vk_env = serde_json::json!({
-                    "type": "VrfVerificationKey_PraosVRF",
-                    "description": "VRF Verification Key",
-                    "cborHex": hex::encode(simple_cbor_wrap(&kp.public_key))
-                });
-
-                std::fs::write(&signing_key_file, serde_json::to_string_pretty(&sk_env)?)?;
-                std::fs::write(
+                write_key_file(
+                    &signing_key_file,
+                    fmt,
+                    "vrf_sk",
+                    "VrfSigningKey_PraosVRF",
+                    "VRF Signing Key",
+                    kp.secret_key(),
+                )?;
+                write_key_file(
                     &verification_key_file,
-                    serde_json::to_string_pretty(&vk_env)?,
+                    fmt,
+                    "vrf_vk",
+                    "VrfVerificationKey_PraosVRF",
+                    "VRF Verification Key",
+                    &kp.public_key,
                 )?;
 
                 println!("VRF key pair generated.");
@@ -270,22 +390,45 @@ impl NodeCmd {
             }
             NodeSubcommand::KeyHashVrf {
                 verification_key_file,
+                verification_key,
+                out_file,
             } => {
-                let content = std::fs::read_to_string(&verification_key_file)?;
-                let env: serde_json::Value = serde_json::from_str(&content)?;
-                let cbor_hex = env["cborHex"].as_str().ok_or_else(|| {
-                    anyhow::anyhow!("Missing cborHex in {}", verification_key_file.display())
-                })?;
-                let cbor = hex::decode(cbor_hex)?;
-                let vrf_key_bytes = if cbor.len() > 2 && cbor[0] == 0x58 {
-                    &cbor[2..]
-                } else if cbor.len() > 1 && (cbor[0] & 0xe0) == 0x40 {
-                    &cbor[1..]
-                } else {
-                    &cbor
+                let vrf_key_bytes = match (&verification_key_file, &verification_key) {
+                    (Some(path), _) => {
+                        let content = std::fs::read_to_string(path)?;
+                        let env: serde_json::Value = serde_json::from_str(&content)?;
+                        let cbor_hex = env["cborHex"].as_str().ok_or_else(|| {
+                            anyhow::anyhow!("Missing cborHex in {}", path.display())
+                        })?;
+                        let cbor = hex::decode(cbor_hex)?;
+                        // Strict exact-match unwrap (#935 item 6 / #934 rule):
+                        // the old `(b[0] & 0xe0) == 0x40` heuristic silently ate
+                        // the first byte of any RAW key starting in 0x40..=0x5f.
+                        crate::commands::envelope::unwrap_key_bytes(
+                            &cbor,
+                            32,
+                            "VRF verification key",
+                        )?
+                        .to_vec()
+                    }
+                    (None, Some(s)) => crate::commands::envelope::parse_inline_verification_key(
+                        s,
+                        32,
+                        "VRF verification key",
+                    )?,
+                    (None, None) => anyhow::bail!(
+                        "one of --verification-key-file or --verification-key is required"
+                    ),
                 };
-                let hash = dugite_primitives::hash::blake2b_256(vrf_key_bytes);
-                println!("{}", hex::encode(hash.as_bytes()));
+                let hash = dugite_primitives::hash::blake2b_256(&vrf_key_bytes);
+                let rendered = hex::encode(hash.as_bytes());
+                match out_file {
+                    Some(path) => {
+                        std::fs::write(&path, &rendered)?;
+                        println!("VRF key hash written to: {}", path.display());
+                    }
+                    None => println!("{rendered}"),
+                }
                 Ok(())
             }
         }
@@ -307,11 +450,8 @@ pub fn issue_op_cert(
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Missing cborHex in KES vkey file"))?;
     let kes_cbor = hex::decode(kes_cbor_hex)?;
-    let kes_vkey = if kes_cbor.len() > 2 {
-        &kes_cbor[2..]
-    } else {
-        &kes_cbor
-    };
+    let kes_vkey =
+        crate::commands::envelope::unwrap_key_bytes(&kes_cbor, 32, "KES verification key")?;
 
     // Read the cold signing key
     let cold_content = std::fs::read_to_string(cold_signing_key_file)?;
@@ -320,11 +460,8 @@ pub fn issue_op_cert(
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Missing cborHex in cold skey file"))?;
     let cold_cbor = hex::decode(cold_cbor_hex)?;
-    let cold_key_bytes = if cold_cbor.len() > 2 {
-        &cold_cbor[2..]
-    } else {
-        &cold_cbor
-    };
+    let cold_key_bytes =
+        crate::commands::envelope::unwrap_key_bytes(&cold_cbor, 32, "cold signing key")?;
     let cold_sk = dugite_crypto::keys::PaymentSigningKey::from_bytes(cold_key_bytes)?;
 
     // Read the counter
@@ -752,6 +889,9 @@ mod tests {
 
         NodeCmd {
             command: NodeSubcommand::KeyGen {
+                key_output_bech32: false,
+                key_output_text_envelope: false,
+                key_output_format: None,
                 cold_verification_key_file: vk_path.clone(),
                 cold_signing_key_file: sk_path.clone(),
                 operational_certificate_counter_file: counter_path.clone(),
@@ -803,6 +943,9 @@ mod tests {
 
         NodeCmd {
             command: NodeSubcommand::KeyGenKes {
+                key_output_bech32: false,
+                key_output_text_envelope: false,
+                key_output_format: None,
                 verification_key_file: vk_path.clone(),
                 signing_key_file: sk_path.clone(),
             },
@@ -829,6 +972,9 @@ mod tests {
 
         NodeCmd {
             command: NodeSubcommand::KeyGenVrf {
+                key_output_bech32: false,
+                key_output_text_envelope: false,
+                key_output_format: None,
                 verification_key_file: vk_path.clone(),
                 signing_key_file: sk_path.clone(),
             },
@@ -914,7 +1060,9 @@ mod tests {
 
         let result = NodeCmd {
             command: NodeSubcommand::KeyHashVrf {
-                verification_key_file: vk_path,
+                verification_key: None,
+                out_file: None,
+                verification_key_file: Some(vk_path),
             },
         }
         .run();
@@ -929,7 +1077,9 @@ mod tests {
 
         let result = NodeCmd {
             command: NodeSubcommand::KeyHashVrf {
-                verification_key_file: vk_path,
+                verification_key: None,
+                out_file: None,
+                verification_key_file: Some(vk_path),
             },
         }
         .run();

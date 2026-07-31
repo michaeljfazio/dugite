@@ -33,13 +33,26 @@ enum AddressSubcommand {
     Build {
         /// Payment verification key file
         #[arg(long)]
-        payment_verification_key_file: PathBuf,
+        payment_verification_key_file: Option<PathBuf>,
+        /// Payment verification key as an inline bech32 or hex STRING
+        #[arg(long, conflicts_with = "payment_verification_key_file")]
+        payment_verification_key: Option<String>,
         /// Stake verification key file (optional - creates base address if provided)
         #[arg(long)]
         stake_verification_key_file: Option<PathBuf>,
-        /// Network (mainnet or testnet)
-        #[arg(long, default_value = "mainnet")]
-        network: String,
+        /// Stake verification key as an inline bech32 or hex STRING
+        #[arg(long, conflicts_with = "stake_verification_key_file")]
+        stake_verification_key: Option<String>,
+        /// Use the mainnet network (cardano-cli compatible)
+        #[arg(long, conflicts_with_all = ["testnet_magic", "network"])]
+        mainnet: bool,
+        /// Use a testnet with the given network magic (cardano-cli compatible)
+        #[arg(long, conflicts_with = "network")]
+        testnet_magic: Option<u32>,
+        /// Network (mainnet or testnet) — dugite extension; cardano-cli uses
+        /// --mainnet / --testnet-magic instead
+        #[arg(long)]
+        network: Option<String>,
         /// Output file (prints to stdout if not provided)
         #[arg(long)]
         out_file: Option<PathBuf>,
@@ -109,31 +122,58 @@ impl AddressCmd {
             }
             AddressSubcommand::Build {
                 payment_verification_key_file,
+                payment_verification_key,
                 stake_verification_key_file,
+                stake_verification_key,
+                mainnet,
+                testnet_magic,
                 network,
                 out_file,
             } => {
-                // Note: cardano-cli has no `--network` string flag (it takes
-                // `--mainnet | --testnet-magic NATURAL`); this flag is a
-                // dugite extension. An unknown value must be a hard error —
-                // the old silent Testnet fallback turned typos like
-                // "mainnnet" into valid-looking testnet addresses (#934).
-                let network_id = match network.as_str() {
-                    "mainnet" => NetworkId::Mainnet,
-                    "testnet" | "testnet-magic" => NetworkId::Testnet,
-                    other => anyhow::bail!(
-                        "invalid --network value \"{other}\": accepted values are \
-                         \"mainnet\" and \"testnet\" (synonym: \"testnet-magic\")"
+                // cardano-cli takes `--mainnet | --testnet-magic NATURAL` and
+                // honours CARDANO_NODE_NETWORK_ID; `--network` is a dugite
+                // extension kept for compatibility. A typo in any explicit
+                // source is a hard error — the old silent Testnet fallback
+                // turned "mainnnet" into a valid-looking testnet address
+                // (#934). See resolve_network for the precedence rules (#935).
+                let network_id = crate::commands::envelope::resolve_network(
+                    mainnet,
+                    testnet_magic,
+                    network.as_deref(),
+                )?;
+
+                let payment_hash = match (&payment_verification_key_file, &payment_verification_key)
+                {
+                    (Some(f), _) => load_verification_key(f)?.hash(),
+                    (None, Some(s)) => {
+                        let bytes = crate::commands::envelope::parse_inline_verification_key(
+                            s,
+                            32,
+                            "payment verification key",
+                        )?;
+                        PaymentVerificationKey::from_bytes(&bytes)?.hash()
+                    }
+                    (None, None) => anyhow::bail!(
+                        "one of --payment-verification-key-file or \
+                             --payment-verification-key is required"
                     ),
                 };
-
-                let payment_vk = load_verification_key(&payment_verification_key_file)?;
-                let payment_hash = payment_vk.hash();
                 let payment_cred = Credential::VerificationKey(payment_hash);
 
-                let address = if let Some(stake_vk_file) = stake_verification_key_file {
-                    let stake_vk = load_verification_key(&stake_vk_file)?;
-                    let stake_hash = stake_vk.hash();
+                let stake_hash = match (&stake_verification_key_file, &stake_verification_key) {
+                    (Some(f), _) => Some(load_verification_key(f)?.hash()),
+                    (None, Some(s)) => {
+                        let bytes = crate::commands::envelope::parse_inline_verification_key(
+                            s,
+                            32,
+                            "stake verification key",
+                        )?;
+                        Some(PaymentVerificationKey::from_bytes(&bytes)?.hash())
+                    }
+                    (None, None) => None,
+                };
+
+                let address = if let Some(stake_hash) = stake_hash {
                     let stake_cred = Credential::VerificationKey(stake_hash);
                     Address::Base(BaseAddress {
                         network: network_id,
@@ -220,11 +260,10 @@ fn load_verification_key(path: &PathBuf) -> Result<PaymentVerificationKey> {
     let content = std::fs::read_to_string(path)?;
     let envelope: TextEnvelope = serde_json::from_str(&content)?;
     let cbor_bytes = hex::decode(&envelope.cbor_hex)?;
-    let key_bytes = if cbor_bytes.len() > 2 {
-        &cbor_bytes[2..]
-    } else {
-        &cbor_bytes
-    };
+    // Strict exact-match unwrap (#935 item 6): the old unconditional `[2..]`
+    // corrupted every already-raw 32-byte key it was handed.
+    let key_bytes =
+        crate::commands::envelope::unwrap_key_bytes(&cbor_bytes, 32, "verification key")?;
     Ok(PaymentVerificationKey::from_bytes(key_bytes)?)
 }
 
@@ -336,9 +375,13 @@ mod tests {
 
         AddressCmd {
             command: AddressSubcommand::Build {
-                payment_verification_key_file: vkey,
+                payment_verification_key_file: Some(vkey),
+                payment_verification_key: None,
+                stake_verification_key: None,
+                mainnet: false,
+                testnet_magic: None,
                 stake_verification_key_file: None,
-                network: "mainnet".to_string(),
+                network: Some("mainnet".to_string()),
                 out_file: Some(out.clone()),
             },
         }
@@ -367,9 +410,13 @@ mod tests {
 
         AddressCmd {
             command: AddressSubcommand::Build {
-                payment_verification_key_file: payment,
+                payment_verification_key: None,
+                stake_verification_key: None,
+                mainnet: false,
+                testnet_magic: None,
+                payment_verification_key_file: Some(payment),
                 stake_verification_key_file: Some(stake),
-                network: "testnet".to_string(),
+                network: Some("testnet".to_string()),
                 out_file: Some(out.clone()),
             },
         }
@@ -405,9 +452,13 @@ mod tests {
 
         let err = AddressCmd {
             command: AddressSubcommand::Build {
-                payment_verification_key_file: vkey,
+                payment_verification_key_file: Some(vkey),
+                payment_verification_key: None,
+                stake_verification_key: None,
+                mainnet: false,
+                testnet_magic: None,
                 stake_verification_key_file: None,
-                network: "mainnnet".to_string(),
+                network: Some("mainnnet".to_string()),
                 out_file: None,
             },
         }
@@ -431,9 +482,13 @@ mod tests {
 
         AddressCmd {
             command: AddressSubcommand::Build {
-                payment_verification_key_file: vkey,
+                payment_verification_key_file: Some(vkey),
+                payment_verification_key: None,
+                stake_verification_key: None,
+                mainnet: false,
+                testnet_magic: None,
                 stake_verification_key_file: None,
-                network: "testnet-magic".to_string(),
+                network: Some("testnet-magic".to_string()),
                 out_file: Some(out.clone()),
             },
         }
@@ -448,9 +503,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = AddressCmd {
             command: AddressSubcommand::Build {
-                payment_verification_key_file: dir.path().join("missing.vkey"),
+                payment_verification_key: None,
+                stake_verification_key: None,
+                mainnet: false,
+                testnet_magic: None,
+                payment_verification_key_file: Some(dir.path().join("missing.vkey")),
                 stake_verification_key_file: None,
-                network: "mainnet".to_string(),
+                network: Some("mainnet".to_string()),
                 out_file: None,
             },
         }
@@ -465,9 +524,13 @@ mod tests {
         let out = dir.path().join("addr.txt");
         AddressCmd {
             command: AddressSubcommand::Build {
-                payment_verification_key_file: vkey,
+                payment_verification_key_file: Some(vkey),
+                payment_verification_key: None,
+                stake_verification_key: None,
+                mainnet: false,
+                testnet_magic: None,
                 stake_verification_key_file: None,
-                network: "testnet".to_string(),
+                network: Some("testnet".to_string()),
                 out_file: Some(out.clone()),
             },
         }

@@ -9,3 +9,5 @@ pub mod stake_address;
 pub mod stake_pool;
 pub mod text_view;
 pub mod transaction;
+
+pub mod envelope;
