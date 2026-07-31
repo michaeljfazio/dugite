@@ -1488,7 +1488,9 @@ pub(crate) fn decode_alonzo_auxiliary_data(
     let mut plutus_v1_scripts: Vec<Vec<u8>> = Vec::new();
 
     match ty {
-        Type::Map => {
+        // Bare Shelley-form metadata map — Haskell `encodeMap` emits an
+        // INDEFINITE map for > 23 labels (#932), so accept both forms.
+        Type::Map | Type::MapIndef => {
             metadata = decode_metadata_map(&mut aux_r)?;
         }
         Type::Array => {

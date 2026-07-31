@@ -21,8 +21,8 @@ mod value;
 
 // Re-export all public items for backwards compatibility
 pub use block::{
-    compute_block_body_hash, encode_block, encode_block_header, encode_block_header_body,
-    encode_operational_cert, encode_protocol_version, encode_vrf_result,
+    compute_block_body_hash, encode_aux_data_segment, encode_block, encode_block_header,
+    encode_block_header_body, encode_operational_cert, encode_protocol_version, encode_vrf_result,
 };
 pub use certificate::encode_certificate;
 pub use governance::encode_proposal_procedure;

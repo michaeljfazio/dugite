@@ -3,32 +3,11 @@ use dugite_primitives::hash::Hash28;
 use dugite_primitives::value::{AssetName, Value};
 use std::collections::BTreeMap;
 
-/// Haskell cardano-ledger-binary `encodeMap` threshold (issue #930).
-///
-/// From encoding version >= 2 (i.e. every Shelley+ era) `encodeMap` uses
-/// `variableMapLenEncoding`: a DEFINITE-length map header for maps with at
-/// most 23 entries, and an INDEFINITE-length map (`0xbf` open ... `0xff`
-/// break) above that. This applies independently at every map nesting level
-/// of a `MultiAsset` (the outer policy map AND each inner asset-name map).
-const ENCODE_MAP_DEFINITE_MAX: usize = 23;
-
-/// Open a map following Haskell `encodeMap` semantics: definite-length
-/// header for `len <= 23`, indefinite open byte (`0xbf`) otherwise.
-fn encode_map_open(len: usize) -> Vec<u8> {
-    if len <= ENCODE_MAP_DEFINITE_MAX {
-        encode_map_header(len)
-    } else {
-        vec![0xbf]
-    }
-}
-
-/// Close a map opened by [`encode_map_open`]: emit the CBOR break (`0xff`)
-/// only for the indefinite (> 23 entries) form.
-fn encode_map_close(buf: &mut Vec<u8>, len: usize) {
-    if len > ENCODE_MAP_DEFINITE_MAX {
-        buf.push(0xff);
-    }
-}
+// The Haskell `encodeMap` helpers (`encode_map_open`/`encode_map_close`,
+// threshold `ENCODE_MAP_DEFINITE_MAX = 23`) were introduced here for issue
+// #930 and promoted to `crate::cbor` for issue #932 so every encodeMap-shaped
+// site in the encoder tree shares ONE implementation. They arrive via the
+// `use crate::cbor::*` glob above.
 
 /// Encode a Value to CBOR.
 ///

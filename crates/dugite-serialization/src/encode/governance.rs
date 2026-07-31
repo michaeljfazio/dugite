@@ -36,19 +36,27 @@ pub(crate) fn encode_drep(drep: &DRep) -> Vec<u8> {
     buf
 }
 
-/// Encode voting procedures map
+/// Encode voting procedures map.
+///
+/// Haskell `VotingProcedures` is `deriving newtype EncCBOR` over
+/// `Map Voter (Map GovActionId VotingProcedure)` — the generic Map instance
+/// at BOTH nesting levels — so `encodeMap` semantics apply independently at
+/// each level (#932): definite header <= 23 entries, indefinite
+/// (`0xbf` ... `0xff`) above.
 pub(crate) fn encode_voting_procedures(
     procedures: &BTreeMap<Voter, BTreeMap<GovActionId, VotingProcedure>>,
 ) -> Vec<u8> {
-    let mut buf = encode_map_header(procedures.len());
+    let mut buf = encode_map_open(procedures.len());
     for (voter, actions) in procedures {
         buf.extend(encode_voter(voter));
-        buf.extend(encode_map_header(actions.len()));
+        buf.extend(encode_map_open(actions.len()));
         for (action_id, procedure) in actions {
             buf.extend(encode_gov_action_id(action_id));
             buf.extend(encode_voting_procedure(procedure));
         }
+        encode_map_close(&mut buf, actions.len());
     }
+    encode_map_close(&mut buf, procedures.len());
     buf
 }
 
@@ -79,7 +87,12 @@ pub(crate) fn encode_voter(voter: &Voter) -> Vec<u8> {
         }
         Voter::StakePool(hash) => {
             buf.extend(encode_uint(4));
-            buf.extend(encode_hash32(hash));
+            // CDDL `voter = [4, pool_keyhash]`, pool_keyhash = $hash28. The
+            // stored Hash32 is the keyhash padded via to_hash32_padded
+            // (leading 28 real bytes) — emit only those, mirroring
+            // read_voter's bstr(28) + re-pad. Emitting all 32 bytes made
+            // synthetic SPO-vote re-encodes undecodable (issue #932 audit).
+            buf.extend(encode_bytes(&hash.as_bytes()[..28]));
         }
     }
     buf
@@ -158,11 +171,14 @@ pub(crate) fn encode_gov_action(action: &GovAction) -> Vec<u8> {
         } => {
             let mut buf = encode_array_header(3);
             buf.extend(encode_uint(2));
-            buf.extend(encode_map_header(withdrawals.len()));
+            // Haskell: `To ws` on `Map AccountAddress Coin` — generic Map
+            // instance — `encodeMap` semantics (#932).
+            buf.extend(encode_map_open(withdrawals.len()));
             for (addr, amount) in withdrawals {
                 buf.extend(encode_bytes(addr));
                 buf.extend(encode_uint(amount.0));
             }
+            encode_map_close(&mut buf, withdrawals.len());
             match policy_hash {
                 Some(h) => buf.extend(encode_hash28(h)),
                 None => buf.extend(encode_null()),
@@ -188,11 +204,14 @@ pub(crate) fn encode_gov_action(action: &GovAction) -> Vec<u8> {
             for cred in members_to_remove {
                 buf.extend(encode_credential(cred));
             }
-            buf.extend(encode_map_header(members_to_add.len()));
+            // Haskell: `To new` on `Map (Credential ColdCommitteeRole)
+            // EpochNo` — generic Map instance — `encodeMap` semantics (#932).
+            buf.extend(encode_map_open(members_to_add.len()));
             for (cred, epoch) in members_to_add {
                 buf.extend(encode_credential(cred));
                 buf.extend(encode_uint(*epoch));
             }
+            encode_map_close(&mut buf, members_to_add.len());
             buf.extend(encode_rational(threshold));
             buf
         }
@@ -361,18 +380,26 @@ mod tests {
         assert_eq!(&encoded[4..], &[0x04u8; 28]);
     }
 
-    /// StakePool → type tag 4, followed by 32-byte hash
+    /// StakePool → type tag 4, followed by the 28-byte pool keyhash.
+    ///
+    /// CDDL: `voter = [4, pool_keyhash]` with `pool_keyhash = $hash28`.
+    /// `Voter::StakePool` stores the keyhash padded to `Hash32`
+    /// (`Hash28::to_hash32_padded`, leading 28 bytes real, trailing 4 zero) —
+    /// the wire form must emit ONLY the 28 real bytes, matching both Haskell
+    /// and dugite's own `read_voter` (which reads bstr(28) and re-pads).
     #[test]
     fn test_encode_voter_stake_pool() {
-        let voter = Voter::StakePool(hash32(0x05));
+        let mut padded = [0u8; 32];
+        padded[..28].copy_from_slice(&[0x05u8; 28]);
+        let voter = Voter::StakePool(Hash32::from_bytes(padded));
         let encoded = encode_voter(&voter);
 
         assert_eq!(encoded[0], 0x82); // array(2)
         assert_eq!(encoded[1], 0x04); // uint(4) — StakePool
         assert_eq!(encoded[2], 0x58);
-        assert_eq!(encoded[3], 32);
-        assert_eq!(&encoded[4..], &[0x05u8; 32]);
-        assert_eq!(encoded.len(), 36); // 1 + 1 + 2 + 32
+        assert_eq!(encoded[3], 28, "pool voter keyhash must be bstr(28)");
+        assert_eq!(&encoded[4..], &[0x05u8; 28]);
+        assert_eq!(encoded.len(), 32); // 1 + 1 + 2 + 28
     }
 
     // ── encode_gov_action_id ─────────────────────────────────────────────────
@@ -703,5 +730,300 @@ mod tests {
         let encoded = encode_optional_gov_action_id(&Some(id));
         assert_eq!(encoded[0], 0x82); // array(2)
         assert_ne!(encoded, vec![0xf6]);
+    }
+
+    // ── #932: Haskell `encodeMap` semantics for governance Map fields ───────
+    //
+    // `VotingProcedures` (both nesting levels), `TreasuryWithdrawals`'
+    // withdrawal map, and `UpdateCommittee`'s members-to-add map are all
+    // plain Haskell `Map`s reached via the generic `EncCBOR (Map k v)`
+    // instance (oracle-verified 2026-07-31) => `encodeMap`: definite header
+    // for <= 23 entries, indefinite (0xbf ... 0xff) for > 23, independently
+    // at every level.
+
+    /// Distinct StakePool voter for index `i` (BTreeMap-ordered by hash).
+    fn pool_voter(i: usize) -> Voter {
+        let mut b = [0u8; 32];
+        b[0] = (i / 256) as u8;
+        b[1] = (i % 256) as u8;
+        Voter::StakePool(Hash32::from_bytes(b))
+    }
+
+    /// Distinct GovActionId for index `i`.
+    fn action_id_n(i: usize) -> GovActionId {
+        let mut b = [0u8; 32];
+        b[0] = (i / 256) as u8;
+        b[1] = (i % 256) as u8;
+        GovActionId {
+            transaction_id: Hash32::from_bytes(b),
+            action_index: 0,
+        }
+    }
+
+    /// `n` gov actions, each voted No with no anchor (3-byte procedure).
+    fn actions_n(n: usize) -> std::collections::BTreeMap<GovActionId, VotingProcedure> {
+        (0..n)
+            .map(|i| {
+                (
+                    action_id_n(i),
+                    VotingProcedure {
+                        vote: Vote::No,
+                        anchor: None,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Outer voting-procedures map: 23 voters definite (0xb7), 24 indefinite.
+    #[test]
+    fn voting_procedures_outer_map_23_vs_24_voters_header_switch() {
+        let procs23: std::collections::BTreeMap<_, _> =
+            (0..23).map(|i| (pool_voter(i), actions_n(1))).collect();
+        let enc23 = encode_voting_procedures(&procs23);
+        assert_eq!(enc23[0], 0xb7, "23-voter outer map must stay definite");
+        assert_ne!(*enc23.last().unwrap(), 0xff);
+
+        let procs24: std::collections::BTreeMap<_, _> =
+            (0..24).map(|i| (pool_voter(i), actions_n(1))).collect();
+        let enc24 = encode_voting_procedures(&procs24);
+        assert_eq!(enc24[0], 0xbf, "24-voter outer map must open indefinite");
+        assert_eq!(*enc24.last().unwrap(), 0xff, "outer map break byte");
+    }
+
+    /// Inner per-voter action map switches independently of the outer map.
+    /// Voter bytes are 36 long (0x82 0x04 0x58 0x20 + 32), so with a single
+    /// voter the inner header sits at offset 37.
+    #[test]
+    fn voting_procedures_inner_map_23_vs_24_actions_header_switch() {
+        // StakePool voter wire size: 0x82 + 0x04 + bstr(28) = 32 bytes
+        // (pool keyhash is $hash28 — see test_encode_voter_stake_pool), so
+        // the inner map header sits at offset 1 + 32 = 33.
+        let mut procs23 = std::collections::BTreeMap::new();
+        procs23.insert(pool_voter(0), actions_n(23));
+        let enc23 = encode_voting_procedures(&procs23);
+        assert_eq!(enc23[0], 0xa1, "outer map(1) stays definite");
+        assert_eq!(enc23[33], 0xb7, "23-action inner map must stay definite");
+
+        let mut procs24 = std::collections::BTreeMap::new();
+        procs24.insert(pool_voter(0), actions_n(24));
+        let enc24 = encode_voting_procedures(&procs24);
+        assert_eq!(enc24[0], 0xa1, "outer map(1) stays definite");
+        assert_eq!(enc24[33], 0xbf, "24-action inner map must open indefinite");
+        assert_eq!(*enc24.last().unwrap(), 0xff, "inner map break byte");
+    }
+
+    /// 256-action inner map: indefinite saves exactly 1 byte over the
+    /// 3-byte definite header (0xb9 0x01 0x00).
+    /// Entry size: gov_action_id 36 (0x82 + hash32(34) + 0x00) +
+    /// procedure 3 (0x82 0x00 0xf6) = 39 bytes.
+    #[test]
+    fn voting_procedures_inner_map_256_actions_indefinite_saves_one_byte() {
+        let mut procs = std::collections::BTreeMap::new();
+        procs.insert(pool_voter(0), actions_n(256));
+        let enc = encode_voting_procedures(&procs);
+        assert_eq!(enc[33], 0xbf);
+        assert_eq!(*enc.last().unwrap(), 0xff);
+        // 1 (outer 0xa1) + 32 (voter, bstr(28) form) + 1 (0xbf) + 256*39
+        // + 1 (0xff) = 10019. Definite (0xb9 0x01 0x00) would be 10020.
+        assert_eq!(enc.len(), 10019, "must be 1 byte shorter than definite");
+    }
+
+    /// `n` distinct 29-byte reward accounts, 1 lovelace each.
+    fn reward_accounts_n(n: usize) -> std::collections::BTreeMap<Vec<u8>, Lovelace> {
+        (0..n)
+            .map(|i| {
+                let mut addr = vec![0xe1u8; 29];
+                addr[1] = (i / 256) as u8;
+                addr[2] = (i % 256) as u8;
+                (addr, Lovelace(1))
+            })
+            .collect()
+    }
+
+    /// TreasuryWithdrawals gov action: withdrawal map follows `encodeMap`.
+    /// Wire prefix is array(3)[2, map, policy]: header byte sits at offset 2;
+    /// policy None encodes as trailing 0xf6.
+    #[test]
+    fn treasury_withdrawals_map_23_vs_24_entries_header_switch() {
+        let action23 = GovAction::TreasuryWithdrawals {
+            withdrawals: reward_accounts_n(23),
+            policy_hash: None,
+        };
+        let enc23 = encode_gov_action(&action23);
+        assert_eq!(&enc23[..2], &[0x83, 0x02], "sanity: array(3), tag 2");
+        assert_eq!(
+            enc23[2], 0xb7,
+            "23-entry withdrawals map must stay definite"
+        );
+
+        let action24 = GovAction::TreasuryWithdrawals {
+            withdrawals: reward_accounts_n(24),
+            policy_hash: None,
+        };
+        let enc24 = encode_gov_action(&action24);
+        assert_eq!(
+            enc24[2], 0xbf,
+            "24-entry withdrawals map must open indefinite"
+        );
+        assert_eq!(
+            enc24[enc24.len() - 2],
+            0xff,
+            "break byte must close the map (before the null policy)"
+        );
+        assert_eq!(*enc24.last().unwrap(), 0xf6, "policy None trails the map");
+    }
+
+    /// UpdateCommittee members-to-add map follows `encodeMap`. Prefix is
+    /// array(5)[4, null, [], map, threshold]: header byte sits at offset 4;
+    /// threshold 1/2 encodes as the 5-byte tail 0xd8 0x1e 0x82 0x01 0x02.
+    #[test]
+    fn committee_members_map_23_vs_24_entries_header_switch() {
+        use dugite_primitives::transaction::Rational;
+
+        fn members_n(n: usize) -> std::collections::BTreeMap<Credential, u64> {
+            (0..n)
+                .map(|i| {
+                    let mut b = [0u8; 28];
+                    b[0] = i as u8;
+                    (Credential::VerificationKey(Hash28::from_bytes(b)), i as u64)
+                })
+                .collect()
+        }
+        fn committee_action(n: usize) -> GovAction {
+            GovAction::UpdateCommittee {
+                prev_action_id: None,
+                members_to_remove: vec![],
+                members_to_add: members_n(n),
+                threshold: Rational {
+                    numerator: 1,
+                    denominator: 2,
+                },
+            }
+        }
+
+        let enc23 = encode_gov_action(&committee_action(23));
+        assert_eq!(&enc23[..4], &[0x85, 0x04, 0xf6, 0x80], "sanity: prefix");
+        assert_eq!(enc23[4], 0xb7, "23-member map must stay definite");
+
+        let enc24 = encode_gov_action(&committee_action(24));
+        assert_eq!(enc24[4], 0xbf, "24-member map must open indefinite");
+        // Break byte immediately precedes the 5-byte rational tail.
+        assert_eq!(
+            enc24[enc24.len() - 6],
+            0xff,
+            "break byte must close the map before the threshold"
+        );
+    }
+
+    /// Distinct DRep key voter for index `i` (28-byte credential — the
+    /// StakePool voter arm of `encode_voter` has a pre-existing hash-width
+    /// asymmetry vs the decoder, unrelated to #932, so DRep voters are used
+    /// for the roundtrip).
+    fn drep_voter(i: usize) -> Voter {
+        let mut b = [0u8; 28];
+        b[0] = (i / 256) as u8;
+        b[1] = (i % 256) as u8;
+        Voter::DRep(Credential::VerificationKey(Hash28::from_bytes(b)))
+    }
+
+    /// Decode-roundtrip: a Conway tx carrying an indefinite voting-procedures
+    /// outer map (24 voters, one with 24 actions) and a TreasuryWithdrawals
+    /// proposal with a 24-entry (indefinite) withdrawal map must decode back
+    /// identically through the era-appropriate dispatch.
+    #[test]
+    fn indefinite_governance_maps_roundtrip_through_conway_decoder() {
+        use dugite_primitives::address::{Address, EnterpriseAddress};
+        use dugite_primitives::network::NetworkId;
+        use dugite_primitives::transaction::{
+            OutputDatum, TransactionBody, TransactionInput, TransactionOutput,
+            TransactionWitnessSet,
+        };
+        use dugite_primitives::value::Value;
+
+        let mut voting: std::collections::BTreeMap<_, _> =
+            (0..24).map(|i| (drep_voter(i), actions_n(1))).collect();
+        voting.insert(drep_voter(0), actions_n(24));
+
+        let proposal = ProposalProcedure {
+            deposit: Lovelace(100_000_000),
+            return_addr: vec![0xe1; 29],
+            gov_action: GovAction::TreasuryWithdrawals {
+                withdrawals: reward_accounts_n(24),
+                policy_hash: None,
+            },
+            anchor: anchor(0x11),
+        };
+
+        let body = TransactionBody {
+            inputs: vec![TransactionInput {
+                transaction_id: Hash32::ZERO,
+                index: 0,
+            }],
+            outputs: vec![TransactionOutput {
+                address: Address::Enterprise(EnterpriseAddress {
+                    network: NetworkId::Testnet,
+                    payment: Credential::VerificationKey(Hash28::ZERO),
+                }),
+                value: Value {
+                    coin: Lovelace(1_000_000),
+                    multi_asset: std::collections::BTreeMap::new(),
+                },
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: false,
+                raw_cbor: None,
+            }],
+            fee: Lovelace(200_000),
+            voting_procedures: voting.clone(),
+            proposal_procedures: vec![proposal.clone()],
+            ..Default::default()
+        };
+        let witness_set = TransactionWitnessSet {
+            vkey_witnesses: vec![],
+            native_scripts: vec![],
+            bootstrap_witnesses: vec![],
+            plutus_v1_scripts: vec![],
+            plutus_v2_scripts: vec![],
+            plutus_v3_scripts: vec![],
+            plutus_data: vec![],
+            redeemers: vec![],
+            raw_redeemers_cbor: None,
+            raw_plutus_data_cbor: None,
+            original_script_data_hash: None,
+        };
+        let tx = dugite_primitives::transaction::Transaction {
+            hash: Hash32::ZERO,
+            era: dugite_primitives::era::Era::Conway,
+            body,
+            witness_set,
+            is_valid: true,
+            auxiliary_data: None,
+            raw_cbor: None,
+            raw_body_cbor: None,
+            raw_witness_cbor: None,
+        };
+        let encoded = crate::encode::encode_transaction(&tx);
+        let decoded =
+            crate::decode::decode_transaction(6, &encoded).expect("Conway tx must decode");
+        assert_eq!(
+            decoded.body.voting_procedures, voting,
+            "indefinite voting-procedures maps must round-trip"
+        );
+        assert_eq!(
+            decoded.body.proposal_procedures.len(),
+            1,
+            "proposal must survive"
+        );
+        match &decoded.body.proposal_procedures[0].gov_action {
+            GovAction::TreasuryWithdrawals { withdrawals, .. } => {
+                assert_eq!(
+                    withdrawals,
+                    &reward_accounts_n(24),
+                    "indefinite treasury-withdrawals map must round-trip"
+                );
+            }
+            other => panic!("expected TreasuryWithdrawals, got {other:?}"),
+        }
     }
 }

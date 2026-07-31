@@ -247,6 +247,42 @@ pub fn encode_map_header(len: usize) -> Vec<u8> {
     buf
 }
 
+/// Haskell cardano-ledger-binary `encodeMap` threshold (issues #930/#932).
+///
+/// From encoding version >= 2 (i.e. every Shelley+ era) `encodeMap` uses
+/// `variableMapLenEncoding`: a DEFINITE-length map header for maps with at
+/// most 23 entries, and an INDEFINITE-length map (`0xbf` open ... `0xff`
+/// break) above that. The rule applies independently at every map nesting
+/// level of a structure encoded via Haskell's generic `EncCBOR (Map k v)`
+/// instance (and `encodeFoldableMapEncoder`'s `wrapCBORMap`, which shares
+/// the same threshold).
+///
+/// Use [`encode_map_open`]/[`encode_map_close`] for any encoder site whose
+/// Haskell counterpart goes through `encodeMap`. Do NOT use them for
+/// integer-keyed struct-as-map encodings (tx body, witness set, PParams
+/// updates — Haskell `Keyed`/`Omit` coders, always definite) or for
+/// `PlutusData::Map` (plutus `encodeData` — a different encoder, correctly
+/// definite-only).
+pub(crate) const ENCODE_MAP_DEFINITE_MAX: usize = 23;
+
+/// Open a map following Haskell `encodeMap` semantics: definite-length
+/// header for `len <= 23`, indefinite open byte (`0xbf`) otherwise.
+pub(crate) fn encode_map_open(len: usize) -> Vec<u8> {
+    if len <= ENCODE_MAP_DEFINITE_MAX {
+        encode_map_header(len)
+    } else {
+        vec![0xbf]
+    }
+}
+
+/// Close a map opened by [`encode_map_open`]: emit the CBOR break (`0xff`)
+/// only for the indefinite (> 23 entries) form.
+pub(crate) fn encode_map_close(buf: &mut Vec<u8>, len: usize) {
+    if len > ENCODE_MAP_DEFINITE_MAX {
+        buf.push(0xff);
+    }
+}
+
 /// Encode a `PlutusData` `ByteString` *leaf* (the `Bytes` arm and the tag-2 /
 /// tag-3 bignum mantissa) with the plutus 64-byte-per-chunk bound.
 ///

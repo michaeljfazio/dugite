@@ -136,25 +136,10 @@ pub fn encode_block(block: &Block, kes_signature: &[u8]) -> Vec<u8> {
         }
     }
 
-    // Auxiliary data map: {tx_index: aux_data}
-    // Prefer preserved raw CBOR to avoid re-encoding mismatches that would
-    // cause ConflictingMetadataHash failures (the auxiliary_data_hash in the
-    // body was computed from the original CBOR).
-    let aux_entries: Vec<_> = block
-        .transactions
-        .iter()
-        .enumerate()
-        .filter_map(|(i, tx)| tx.auxiliary_data.as_ref().map(|aux| (i, aux)))
-        .collect();
-    buf.extend(encode_map_header(aux_entries.len()));
-    for (idx, aux) in &aux_entries {
-        buf.extend(encode_uint(*idx as u64));
-        if let Some(raw) = &aux.raw_cbor {
-            buf.extend_from_slice(raw);
-        } else {
-            buf.extend(encode_auxiliary_data(aux));
-        }
-    }
+    // Auxiliary data map: {tx_index: aux_data} — shared with
+    // compute_block_body_hash so the wire segment and the h3 preimage can
+    // never diverge.
+    buf.extend(encode_aux_data_segment(&block.transactions));
 
     // Invalid transactions (indices of txs with is_valid=false)
     let invalid_indices: Vec<_> = block
@@ -169,6 +154,41 @@ pub fn encode_block(block: &Block, kes_signature: &[u8]) -> Vec<u8> {
         buf.extend(encode_uint(*idx as u64));
     }
 
+    buf
+}
+
+/// Encode the block-body auxiliary-data segment: `{ tx_index => aux_data }`.
+///
+/// Shared by [`encode_block`] and [`compute_block_body_hash`] so the on-wire
+/// segment and the h3 hash preimage can never diverge. Haskell builds this
+/// map with `encodeFoldableMapEncoder` (Shelley/Alonzo `BlockBody.Internal`
+/// `txSeqAuxDatas`), which calls `variableMapLenEncoding` — the SAME
+/// definite-<=23 / indefinite->23 threshold as `encodeMap` (#932).
+///
+/// Per-entry values prefer each tx's preserved raw aux bytes (Haskell
+/// `encodePreEncoded originalBytes`) to avoid ConflictingMetadataHash from
+/// re-encoding differences — only the map framing is synthetic.
+///
+/// `pub` so dugite-node's forge `compute_body_size` sizes the segment via
+/// this exact function instead of a hand-rolled duplicate (which used a
+/// definite-length header and over-declared body_size by 1 byte for blocks
+/// with >255 aux-carrying txs — #932 audit).
+pub fn encode_aux_data_segment(transactions: &[Transaction]) -> Vec<u8> {
+    let aux_entries: Vec<_> = transactions
+        .iter()
+        .enumerate()
+        .filter_map(|(i, tx)| tx.auxiliary_data.as_ref().map(|aux| (i, aux)))
+        .collect();
+    let mut buf = encode_map_open(aux_entries.len());
+    for (idx, aux) in &aux_entries {
+        buf.extend(encode_uint(*idx as u64));
+        if let Some(raw) = &aux.raw_cbor {
+            buf.extend_from_slice(raw);
+        } else {
+            buf.extend(encode_auxiliary_data(aux));
+        }
+    }
+    encode_map_close(&mut buf, aux_entries.len());
     buf
 }
 
@@ -207,22 +227,9 @@ pub fn compute_block_body_hash(transactions: &[Transaction]) -> Hash32 {
     }
     let h2 = blake2b_256(&wits_cbor);
 
-    // 3. Auxiliary data map: {tx_index: aux_data} — prefer preserved raw CBOR
-    // to avoid ConflictingMetadataHash from re-encoding differences.
-    let aux_entries: Vec<_> = transactions
-        .iter()
-        .enumerate()
-        .filter_map(|(i, tx)| tx.auxiliary_data.as_ref().map(|aux| (i, aux)))
-        .collect();
-    let mut aux_cbor = encode_map_header(aux_entries.len());
-    for (idx, aux) in &aux_entries {
-        aux_cbor.extend(encode_uint(*idx as u64));
-        if let Some(raw) = &aux.raw_cbor {
-            aux_cbor.extend_from_slice(raw);
-        } else {
-            aux_cbor.extend(encode_auxiliary_data(aux));
-        }
-    }
+    // 3. Auxiliary data map: {tx_index: aux_data} — same shared segment
+    // encoder as encode_block.
+    let aux_cbor = encode_aux_data_segment(transactions);
     let h3 = blake2b_256(&aux_cbor);
 
     // 4. Invalid transaction indices (txs with is_valid=false)
@@ -761,5 +768,171 @@ mod tests {
             actual, expected,
             "empty block body hash must match step-by-step computation"
         );
+    }
+
+    // ── #932: Haskell `encodeFoldableMapEncoder` semantics for the block
+    //    auxiliary-data segment ────────────────────────────────────────────
+    //
+    // The `{tx_index => aux_data}` block-body segment (hashed as h3) is
+    // built by Haskell's `encodeFoldableMapEncoder`, which calls
+    // `variableMapLenEncoding` — the SAME <= 23-definite / > 23-indefinite
+    // threshold as `encodeMap` (oracle-verified 2026-07-31, Shelley/Alonzo
+    // `BlockBody.Internal` `txSeqAuxDatas`). Values are the txs' preserved
+    // raw aux bytes (`encodePreEncoded`), so only the map framing is
+    // synthetic.
+
+    /// A Conway tx whose auxiliary data carries the raw bytes {0 => 1}
+    /// (0xa1 0x00 0x01) — spliced verbatim into the aux segment.
+    fn aux_tx() -> Transaction {
+        use dugite_primitives::transaction::{
+            AuxiliaryData, TransactionBody, TransactionWitnessSet,
+        };
+        Transaction {
+            hash: Hash32::ZERO,
+            era: Era::Conway,
+            body: TransactionBody::default(),
+            witness_set: TransactionWitnessSet {
+                vkey_witnesses: vec![],
+                native_scripts: vec![],
+                bootstrap_witnesses: vec![],
+                plutus_v1_scripts: vec![],
+                plutus_v2_scripts: vec![],
+                plutus_v3_scripts: vec![],
+                plutus_data: vec![],
+                redeemers: vec![],
+                raw_redeemers_cbor: None,
+                raw_plutus_data_cbor: None,
+                original_script_data_hash: None,
+            },
+            is_valid: true,
+            auxiliary_data: Some(AuxiliaryData {
+                metadata: std::collections::BTreeMap::new(),
+                native_scripts: vec![],
+                plutus_v1_scripts: vec![],
+                plutus_v2_scripts: vec![],
+                plutus_v3_scripts: vec![],
+                raw_cbor: Some(vec![0xa1, 0x00, 0x01]),
+            }),
+            raw_cbor: None,
+            raw_body_cbor: None,
+            raw_witness_cbor: None,
+        }
+    }
+
+    /// Explicitly-built aux segment `{i => raw}` in definite/indefinite form.
+    fn raw_aux_segment(n: usize, indefinite: bool) -> Vec<u8> {
+        let mut seg = if indefinite {
+            vec![0xbf]
+        } else {
+            encode_map_header(n)
+        };
+        for i in 0..n {
+            seg.extend(encode_uint(i as u64));
+            seg.extend([0xa1, 0x00, 0x01]);
+        }
+        if indefinite {
+            seg.push(0xff);
+        }
+        seg
+    }
+
+    /// The h3 preimage switches at the 23/24 boundary: compute the expected
+    /// block body hash from explicitly-built segments and compare.
+    #[test]
+    fn block_body_hash_aux_map_23_vs_24_entries_header_switch() {
+        for (n, indefinite) in [(23usize, false), (24usize, true)] {
+            let txs: Vec<Transaction> = (0..n).map(|_| aux_tx()).collect();
+
+            let body_cbor = encode_transaction_body_for_era(&txs[0].body, Era::Conway);
+            let mut bodies = encode_array_header(n);
+            for _ in 0..n {
+                bodies.extend(&body_cbor);
+            }
+            let mut wits = encode_array_header(n);
+            wits.resize(wits.len() + n, 0xa0);
+            let aux = raw_aux_segment(n, indefinite);
+            let invalid = encode_array_header(0);
+
+            let mut combined = Vec::with_capacity(128);
+            combined.extend_from_slice(blake2b_256(&bodies).as_bytes());
+            combined.extend_from_slice(blake2b_256(&wits).as_bytes());
+            combined.extend_from_slice(blake2b_256(&aux).as_bytes());
+            combined.extend_from_slice(blake2b_256(&invalid).as_bytes());
+            let expected = blake2b_256(&combined);
+
+            assert_eq!(
+                compute_block_body_hash(&txs),
+                expected,
+                "aux segment with {n} entries must use {} framing",
+                if indefinite { "indefinite" } else { "definite" }
+            );
+        }
+    }
+
+    /// encode_block emits the same indefinite aux segment (the two call
+    /// sites share one implementation): the exact 24-entry segment bytes
+    /// must appear in the wire block, and a 256-entry segment must be
+    /// 1 byte shorter than its definite form.
+    #[test]
+    fn encode_block_aux_map_24_and_256_entries_indefinite() {
+        let txs: Vec<Transaction> = (0..24).map(|_| aux_tx()).collect();
+        let block = Block {
+            header: make_header(),
+            transactions: txs,
+            era: Era::Conway,
+            raw_cbor: None,
+        };
+        let enc = encode_block(&block, &[0x07; 448]);
+        let segment = raw_aux_segment(24, true);
+        assert!(
+            enc.windows(segment.len()).any(|w| w == segment),
+            "24-entry indefinite aux segment must appear in the encoded block"
+        );
+
+        // 256 entries: indefinite (0xbf + entries + 0xff) is exactly 1 byte
+        // shorter than definite (0xb9 0x01 0x00 + entries).
+        let indefinite = raw_aux_segment(256, true);
+        let definite = raw_aux_segment(256, false);
+        assert_eq!(indefinite.len() + 1, definite.len());
+        let txs256: Vec<Transaction> = (0..256).map(|_| aux_tx()).collect();
+        let block256 = Block {
+            header: make_header(),
+            transactions: txs256,
+            era: Era::Conway,
+            raw_cbor: None,
+        };
+        let enc256 = encode_block(&block256, &[0x07; 448]);
+        assert!(
+            enc256.windows(indefinite.len()).any(|w| w == indefinite),
+            "256-entry indefinite aux segment must appear in the encoded block"
+        );
+    }
+
+    /// Decode-roundtrip: a full Conway block whose aux segment is indefinite
+    /// (24 aux-carrying txs) decodes back with all 24 auxiliary-data entries
+    /// attached to their transactions.
+    #[test]
+    fn indefinite_aux_segment_roundtrips_through_block_decoder() {
+        let txs: Vec<Transaction> = (0..24).map(|_| aux_tx()).collect();
+        let block = Block {
+            header: make_header(),
+            transactions: txs,
+            era: Era::Conway,
+            raw_cbor: None,
+        };
+        let enc = encode_block(&block, &[0x07; 448]);
+        let decoded = crate::decode::decode_block(&enc).expect("block must decode");
+        assert_eq!(decoded.transactions.len(), 24);
+        for (i, tx) in decoded.transactions.iter().enumerate() {
+            let aux = tx
+                .auxiliary_data
+                .as_ref()
+                .unwrap_or_else(|| panic!("tx {i} must keep its auxiliary data"));
+            assert_eq!(
+                aux.raw_cbor.as_deref(),
+                Some(&[0xa1, 0x00, 0x01][..]),
+                "tx {i} aux raw bytes must round-trip"
+            );
+        }
     }
 }

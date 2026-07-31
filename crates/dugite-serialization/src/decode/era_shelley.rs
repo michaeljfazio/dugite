@@ -1244,8 +1244,10 @@ fn decode_auxiliary_data(r: &mut Reader<'_>) -> Result<AuxiliaryData, Serializat
     let mut aux_r = Reader::new(&raw_bytes);
     let ty = aux_r.peek_major()?;
     let metadata = match ty {
-        Type::Map => {
-            // Plain Shelley metadata map
+        Type::Map | Type::MapIndef => {
+            // Plain Shelley metadata map. Haskell `ShelleyTxAuxData` goes
+            // through `encodeMap`, which emits an INDEFINITE map for > 23
+            // labels (#932) — accept both header forms.
             decode_metadata_map(&mut aux_r)?
         }
         Type::Array => {

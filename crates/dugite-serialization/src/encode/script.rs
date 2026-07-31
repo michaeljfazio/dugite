@@ -153,14 +153,22 @@ pub(crate) fn encode_bootstrap_witness(w: &BootstrapWitness) -> Vec<u8> {
 }
 
 /// Encode a metadata map: {label: metadatum}
+///
+/// The top-level `Map Word64 Metadatum` goes through Haskell's generic
+/// `EncCBOR (Map k v)` instance in both the Shelley (`ShelleyTxAuxData`
+/// newtype) and Alonzo (tag-259 key-0 `To atadrMetadata`) forms, so
+/// `encodeMap` semantics apply (#932): definite header <= 23 entries,
+/// indefinite above. NESTED metadatum maps do NOT follow this rule — see
+/// [`crate::cbor::encode_metadatum`].
 pub(crate) fn encode_metadata_map(
     metadata: &std::collections::BTreeMap<u64, TransactionMetadatum>,
 ) -> Vec<u8> {
-    let mut buf = encode_map_header(metadata.len());
+    let mut buf = encode_map_open(metadata.len());
     for (label, value) in metadata {
         buf.extend(encode_uint(*label));
         buf.extend(encode_metadatum(value));
     }
+    encode_map_close(&mut buf, metadata.len());
     buf
 }
 
@@ -383,6 +391,163 @@ pub(crate) fn encode_language_views(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── #932: Haskell `encodeMap` semantics for the metadata label map ──────
+    //
+    // The TOP-LEVEL `Map Word64 Metadatum` (Shelley `ShelleyTxAuxData`
+    // newtype / Alonzo tag-259 key-0 field) goes through the generic
+    // `EncCBOR (Map k v)` instance => `encodeMap` (oracle-verified
+    // 2026-07-31): definite header <= 23 entries, indefinite (0xbf ... 0xff)
+    // above. A NESTED `Metadatum` map, by contrast, is a hand-written
+    // Haskell encoder using bare `encodeMapLen` — ALWAYS definite, no
+    // version gate — and must NOT follow the threshold.
+
+    /// `n` labels, each mapping to Int(1).
+    fn metadata_n(n: usize) -> std::collections::BTreeMap<u64, TransactionMetadatum> {
+        (0..n as u64)
+            .map(|i| (i, TransactionMetadatum::Int(1)))
+            .collect()
+    }
+
+    /// Explicitly-built expected bytes for the label map.
+    fn raw_metadata_map(
+        m: &std::collections::BTreeMap<u64, TransactionMetadatum>,
+        indefinite: bool,
+    ) -> Vec<u8> {
+        let mut buf = if indefinite {
+            vec![0xbf]
+        } else {
+            crate::cbor::encode_map_header(m.len())
+        };
+        for label in m.keys() {
+            buf.extend(crate::cbor::encode_uint(*label));
+            buf.push(0x01); // Int(1)
+        }
+        if indefinite {
+            buf.push(0xff);
+        }
+        buf
+    }
+
+    /// 23 labels: definite map(23). 24 labels: indefinite (0xbf ... 0xff).
+    #[test]
+    fn metadata_map_23_vs_24_labels_header_switch() {
+        let m23 = metadata_n(23);
+        assert_eq!(
+            encode_metadata_map(&m23),
+            raw_metadata_map(&m23, false),
+            "23-label metadata map must stay definite"
+        );
+
+        let m24 = metadata_n(24);
+        assert_eq!(
+            encode_metadata_map(&m24),
+            raw_metadata_map(&m24, true),
+            "24-label metadata map must switch to indefinite"
+        );
+    }
+
+    /// 256 labels: indefinite saves exactly 1 byte over the 3-byte definite
+    /// header (0xb9 0x01 0x00).
+    #[test]
+    fn metadata_map_256_labels_indefinite_saves_one_byte() {
+        let m = metadata_n(256);
+        let enc = encode_metadata_map(&m);
+        let indefinite = raw_metadata_map(&m, true);
+        let definite = raw_metadata_map(&m, false);
+        assert_eq!(indefinite.len() + 1, definite.len());
+        assert_eq!(enc, indefinite, "must be 1 byte shorter than definite");
+    }
+
+    /// A NESTED metadatum map with > 23 entries must STAY definite —
+    /// Haskell `encodeMetadatum (Map kvs)` is a bespoke `encodeMapLen`
+    /// encoder with no `variableMapLenEncoding` gate. Pinning this prevents
+    /// #932 over-reach.
+    #[test]
+    fn nested_metadatum_map_over_23_entries_stays_definite() {
+        let inner: Vec<(TransactionMetadatum, TransactionMetadatum)> = (0..30i128)
+            .map(|i| (TransactionMetadatum::Int(i), TransactionMetadatum::Int(1)))
+            .collect();
+        let mut outer = std::collections::BTreeMap::new();
+        outer.insert(7u64, TransactionMetadatum::Map(inner));
+        let enc = encode_metadata_map(&outer);
+        // {7 => map(30)}: 0xa1 0x07 0xb8 0x1e ...
+        assert_eq!(
+            &enc[..4],
+            &[0xa1, 0x07, 0xb8, 0x1e],
+            "nested 30-entry metadatum map must use the DEFINITE 2-byte header"
+        );
+        assert_ne!(
+            *enc.last().unwrap(),
+            0xff,
+            "nested metadatum map must not emit a break byte"
+        );
+    }
+
+    /// Decode-roundtrip: a Conway tx whose auxiliary data carries a 24-label
+    /// (indefinite) metadata map decodes back identically.
+    #[test]
+    fn indefinite_metadata_map_roundtrips_through_conway_decoder() {
+        use dugite_primitives::era::Era;
+        use dugite_primitives::hash::Hash32;
+        use dugite_primitives::transaction::{
+            AuxiliaryData, TransactionBody, TransactionInput, TransactionWitnessSet,
+        };
+        use dugite_primitives::value::Lovelace;
+
+        let metadata = metadata_n(24);
+        let aux = AuxiliaryData {
+            metadata: metadata.clone(),
+            native_scripts: vec![],
+            plutus_v1_scripts: vec![],
+            plutus_v2_scripts: vec![],
+            plutus_v3_scripts: vec![],
+            raw_cbor: None,
+        };
+        let body = TransactionBody {
+            inputs: vec![TransactionInput {
+                transaction_id: Hash32::ZERO,
+                index: 0,
+            }],
+            outputs: vec![],
+            fee: Lovelace(170_000),
+            ..Default::default()
+        };
+        let witness_set = TransactionWitnessSet {
+            vkey_witnesses: vec![],
+            native_scripts: vec![],
+            bootstrap_witnesses: vec![],
+            plutus_v1_scripts: vec![],
+            plutus_v2_scripts: vec![],
+            plutus_v3_scripts: vec![],
+            plutus_data: vec![],
+            redeemers: vec![],
+            raw_redeemers_cbor: None,
+            raw_plutus_data_cbor: None,
+            original_script_data_hash: None,
+        };
+        let tx = dugite_primitives::transaction::Transaction {
+            hash: Hash32::ZERO,
+            era: Era::Conway,
+            body,
+            witness_set,
+            is_valid: true,
+            auxiliary_data: Some(aux),
+            raw_cbor: None,
+            raw_body_cbor: None,
+            raw_witness_cbor: None,
+        };
+        let encoded = crate::encode::encode_transaction(&tx);
+        let decoded =
+            crate::decode::decode_transaction(6, &encoded).expect("Conway tx must decode");
+        let decoded_aux = decoded
+            .auxiliary_data
+            .expect("auxiliary data must survive decode");
+        assert_eq!(
+            decoded_aux.metadata, metadata,
+            "indefinite metadata map must round-trip"
+        );
+    }
 
     #[test]
     fn test_script_data_hash_from_real_tx_cbor() {

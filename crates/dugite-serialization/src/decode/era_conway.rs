@@ -2878,7 +2878,11 @@ fn decode_auxiliary_data(r: &mut Reader<'_>) -> Result<AuxiliaryData, Serializat
 
     let (metadata, native_scripts, plutus_v1_scripts, plutus_v2_scripts, plutus_v3_scripts) =
         match ty {
-            Type::Map => {
+            // Bare Shelley-form metadata map. Haskell `ShelleyTxAuxData`
+            // goes through `encodeMap`, which emits an INDEFINITE map for
+            // > 23 labels (#932) — so both header forms must be accepted
+            // (`decode_metadata_map` handles either via `read_map`).
+            Type::Map | Type::MapIndef => {
                 let meta = decode_metadata_map(&mut aux_r)?;
                 (meta, Vec::new(), Vec::new(), Vec::new(), Vec::new())
             }
