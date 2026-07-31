@@ -51,6 +51,18 @@ fn assert_fails(args: &[&str]) {
     );
 }
 
+/// Like `assert_fails`, but returns stderr so callers can assert on the
+/// error message the user actually sees.
+fn run_fail_stderr(args: &[&str]) -> String {
+    let out = run(args);
+    assert!(
+        !out.status.success(),
+        "{args:?} must exit nonzero, got stdout={}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
 /// Read a text-envelope JSON file, returning the parsed value.
 fn read_envelope(path: &Path) -> serde_json::Value {
     let content = std::fs::read_to_string(path)
@@ -474,4 +486,201 @@ fn node_new_counter_writes_value_and_rejects_bad_vkey() {
         "--operational-certificate-counter-file",
         dir.path().join("never.counter").to_str().unwrap(),
     ]);
+}
+
+// ── #934: cardano-cli drop-in compatibility ─────────────────────────────────
+
+/// cardano-cli 11.0.0.0 spells these `key-gen-KES` / `key-gen-VRF` /
+/// `key-hash-VRF` (and rejects the lowercase forms: "Invalid argument
+/// `key-gen-kes'"). dugite-cli must accept the canonical uppercase
+/// spellings; the lowercase forms stay as aliases (exercised by the
+/// other node tests in this file).
+#[test]
+fn node_uppercase_canonical_subcommand_spellings() {
+    let dir = tempfile::tempdir().unwrap();
+    let kes_vkey = dir.path().join("kes.vkey");
+    let kes_skey = dir.path().join("kes.skey");
+    let vrf_vkey = dir.path().join("vrf.vkey");
+    let vrf_skey = dir.path().join("vrf.skey");
+
+    run_ok(&[
+        "node",
+        "key-gen-KES",
+        "--verification-key-file",
+        kes_vkey.to_str().unwrap(),
+        "--signing-key-file",
+        kes_skey.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        read_envelope(&kes_vkey)["type"],
+        "KesVerificationKey_ed25519_kes_2^6"
+    );
+
+    run_ok(&[
+        "node",
+        "key-gen-VRF",
+        "--verification-key-file",
+        vrf_vkey.to_str().unwrap(),
+        "--signing-key-file",
+        vrf_skey.to_str().unwrap(),
+    ]);
+    let vrf_env = read_envelope(&vrf_vkey);
+    assert_eq!(vrf_env["type"], "VrfVerificationKey_PraosVRF");
+
+    let printed = run_ok(&[
+        "node",
+        "key-hash-VRF",
+        "--verification-key-file",
+        vrf_vkey.to_str().unwrap(),
+    ]);
+    let raw = raw32_from_envelope(&vrf_env);
+    let expected = hex::encode(dugite_primitives::hash::blake2b_256(&raw).as_bytes());
+    assert_eq!(printed.trim(), expected);
+}
+
+/// cardano-cli's canonical counter flag is
+/// `--operational-certificate-issue-counter-file`, and it also accepts the
+/// bare `--operational-certificate-issue-counter` on `node key-gen`,
+/// `node new-counter`, and `node issue-op-cert` (verified against
+/// cardano-cli 11.0.0.0). dugite's historical
+/// `--operational-certificate-counter-file` stays as an alias (exercised
+/// by node_opcert_issue_flow above).
+#[test]
+fn node_counter_flag_accepts_cardano_cli_spellings() {
+    let dir = tempfile::tempdir().unwrap();
+    let cold_vkey = dir.path().join("cold.vkey");
+    let cold_skey = dir.path().join("cold.skey");
+    let counter = dir.path().join("opcert.counter");
+    let kes_vkey = dir.path().join("kes.vkey");
+    let kes_skey = dir.path().join("kes.skey");
+    let opcert = dir.path().join("node.opcert");
+
+    // key-gen with the canonical cardano-cli spelling.
+    run_ok(&[
+        "node",
+        "key-gen",
+        "--cold-verification-key-file",
+        cold_vkey.to_str().unwrap(),
+        "--cold-signing-key-file",
+        cold_skey.to_str().unwrap(),
+        "--operational-certificate-issue-counter-file",
+        counter.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        read_envelope(&counter)["type"],
+        "NodeOperationalCertificateIssueCounter"
+    );
+
+    run_ok(&[
+        "node",
+        "key-gen-kes",
+        "--verification-key-file",
+        kes_vkey.to_str().unwrap(),
+        "--signing-key-file",
+        kes_skey.to_str().unwrap(),
+    ]);
+
+    // issue-op-cert with the bare `--operational-certificate-issue-counter`.
+    run_ok(&[
+        "node",
+        "issue-op-cert",
+        "--kes-verification-key-file",
+        kes_vkey.to_str().unwrap(),
+        "--cold-signing-key-file",
+        cold_skey.to_str().unwrap(),
+        "--operational-certificate-issue-counter",
+        counter.to_str().unwrap(),
+        "--kes-period",
+        "3",
+        "--out-file",
+        opcert.to_str().unwrap(),
+    ]);
+    assert_eq!(read_envelope(&opcert)["type"], "NodeOperationalCertificate");
+    assert_eq!(
+        read_envelope(&counter)["description"],
+        "Next certificate issue number: 1"
+    );
+
+    // new-counter with the canonical cardano-cli spelling.
+    let fresh = dir.path().join("fresh.counter");
+    run_ok(&[
+        "node",
+        "new-counter",
+        "--cold-verification-key-file",
+        cold_vkey.to_str().unwrap(),
+        "--counter-value",
+        "7",
+        "--operational-certificate-issue-counter-file",
+        fresh.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        read_envelope(&fresh)["description"],
+        "Next certificate issue number: 7"
+    );
+}
+
+/// An unknown `--network` value must be a hard error naming the accepted
+/// forms — never a silent fallback to testnet. (cardano-cli has no
+/// `--network` string flag at all; it takes `--mainnet | --testnet-magic
+/// NATURAL`, so a typo there is a parse error. dugite's `--network` is its
+/// own extension and must fail just as loudly.)
+#[test]
+fn address_build_unknown_network_is_hard_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let vkey = dir.path().join("payment.vkey");
+    let skey = dir.path().join("payment.skey");
+    run_ok(&[
+        "address",
+        "key-gen",
+        "--verification-key-file",
+        vkey.to_str().unwrap(),
+        "--signing-key-file",
+        skey.to_str().unwrap(),
+    ]);
+
+    let stderr = run_fail_stderr(&[
+        "address",
+        "build",
+        "--payment-verification-key-file",
+        vkey.to_str().unwrap(),
+        "--network",
+        "mainnnet",
+    ]);
+    assert!(
+        stderr.contains("mainnnet"),
+        "error must name the offending value, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("mainnet") && stderr.contains("testnet"),
+        "error must list the accepted forms, got: {stderr}"
+    );
+}
+
+/// `key verification-key-hash` must refuse to hash a SIGNING key envelope:
+/// silently hashing one prints a value nothing on chain matches and
+/// normalizes pasting secret-key files into commands.
+#[test]
+fn key_verification_key_hash_rejects_signing_key_envelope() {
+    let dir = tempfile::tempdir().unwrap();
+    let skey = dir.path().join("payment.skey");
+    let vkey = dir.path().join("payment.vkey");
+    run_ok(&[
+        "key",
+        "generate-payment-key",
+        "--signing-key-file",
+        skey.to_str().unwrap(),
+        "--verification-key-file",
+        vkey.to_str().unwrap(),
+    ]);
+
+    let stderr = run_fail_stderr(&[
+        "key",
+        "verification-key-hash",
+        "--verification-key-file",
+        skey.to_str().unwrap(),
+    ]);
+    assert!(
+        stderr.contains("PaymentSigningKeyShelley_ed25519"),
+        "error must name the offending envelope type, got: {stderr}"
+    );
 }

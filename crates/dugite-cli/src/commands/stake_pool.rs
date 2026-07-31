@@ -45,7 +45,13 @@ enum StakePoolSubcommand {
         kes_verification_key_file: PathBuf,
         #[arg(long)]
         cold_signing_key_file: PathBuf,
-        #[arg(long)]
+        /// Same flag spellings as `node issue-op-cert` (cardano-cli canonical
+        /// plus the legacy dugite name).
+        #[arg(
+            long = "operational-certificate-issue-counter-file",
+            alias = "operational-certificate-issue-counter",
+            alias = "operational-certificate-counter-file"
+        )]
         operational_certificate_counter_file: PathBuf,
         #[arg(long)]
         kes_period: u64,
