@@ -197,12 +197,16 @@ cd testnet/local-devnet
 ./setup.sh
 ./run.sh
 sleep 60
-TIP_BEFORE=$(cardano-cli query tip --testnet-magic 42 --socket-path state/dugite-bp.sock | jq -r .block)
+TIP_BEFORE=$(cardano-cli query tip --testnet-magic 42 --socket-path "$LD_DUGITE_BP_SOCK" | jq -r .block)
 kill "$(cat state/dugite-bp.pid)"
 sleep 90                            # 90s offline — relay's chain advances
 .claude/skills/devnet-validate/scripts/restart-dugite-bp.sh
 sleep 60
-TIP_AFTER=$(cardano-cli query tip --testnet-magic 42 --socket-path state/dugite-bp.sock | jq -r .block)
+TIP_AFTER=$(cardano-cli query tip --testnet-magic 42 --socket-path "$LD_DUGITE_BP_SOCK" | jq -r .block)
+# Fail loudly when the criterion could not be MEASURED — an empty tip must not
+# be reported the same way as a tip that did not advance (#944).
+[ -n "$TIP_BEFORE" ] || { echo "RESTART INCONCLUSIVE: could not read tip before restart"; exit 1; }
+[ -n "$TIP_AFTER" ]  || { echo "RESTART INCONCLUSIVE: could not read tip after restart"; exit 1; }
 [ "$TIP_AFTER" -gt "$TIP_BEFORE" ] || { echo "RESTART FAIL: chain did not advance"; exit 1; }
 ./soak.sh 60
 ./verify.sh evidence/$(ls -t evidence | head -1)
