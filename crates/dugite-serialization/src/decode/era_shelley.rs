@@ -80,7 +80,9 @@
 //! skipped entirely (empty `TransactionWitnessSet`). Auxiliary data is always parsed.
 
 use crate::decode::era_conway::{read_cost_models, read_ex_unit_prices, read_ex_units};
-use crate::decode::helpers::{read_hash28, read_hash32, read_lovelace};
+use crate::decode::helpers::{
+    read_hash28, read_hash32, read_lovelace, read_metadata_map as decode_metadata_map,
+};
 use crate::decode::raw::KeepRaw;
 use crate::decode::reader::Reader;
 use crate::error::SerializationError;
@@ -93,8 +95,7 @@ use dugite_primitives::time::{BlockNo, SlotNo};
 use dugite_primitives::transaction::{
     AuxiliaryData, BootstrapWitness, Certificate, MIRSource, MIRTarget, NativeScript, OutputDatum,
     PoolMetadata, PoolParams, ProtocolParamUpdate, Rational, Relay, Transaction, TransactionBody,
-    TransactionInput, TransactionMetadatum, TransactionOutput, TransactionWitnessSet,
-    UpdateProposal, VKeyWitness,
+    TransactionInput, TransactionOutput, TransactionWitnessSet, UpdateProposal, VKeyWitness,
 };
 use dugite_primitives::value::{AssetName, Lovelace, Value};
 use minicbor::data::Type;
@@ -1276,58 +1277,6 @@ fn decode_auxiliary_data(r: &mut Reader<'_>) -> Result<AuxiliaryData, Serializat
     })
 }
 
-fn decode_metadata_map(
-    r: &mut Reader<'_>,
-) -> Result<BTreeMap<u64, TransactionMetadatum>, SerializationError> {
-    // Handle both definite- and indefinite-length CBOR maps. cn 11.0.1
-    // emits indef-length metadata maps on preview / preprod for some
-    // CIP-20 message transactions — see #673.
-    let mut result = BTreeMap::new();
-    r.for_each_map_entry(|r| {
-        let label = r.read_uint()?;
-        let value = read_metadatum(r)?;
-        result.insert(label, value);
-        Ok(())
-    })?;
-    Ok(result)
-}
-
-fn read_metadatum(r: &mut Reader<'_>) -> Result<TransactionMetadatum, SerializationError> {
-    let ty = r.peek_major()?;
-    match ty {
-        Type::Map => {
-            let entries = r.read_map(read_metadatum, read_metadatum)?;
-            Ok(TransactionMetadatum::Map(entries))
-        }
-        Type::Array => {
-            let items = r.read_array(read_metadatum)?;
-            Ok(TransactionMetadatum::List(items))
-        }
-        Type::U8 | Type::U16 | Type::U32 | Type::U64 => {
-            let v = r.read_uint()?;
-            Ok(TransactionMetadatum::Int(v as i128))
-        }
-        Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::Int => {
-            let v = r.read_int()?;
-            Ok(TransactionMetadatum::Int(v))
-        }
-        Type::Bytes => {
-            let bytes = r.read_bytes_owned()?;
-            Ok(TransactionMetadatum::Bytes(bytes))
-        }
-        Type::String => {
-            let s = r.read_str()?.to_string();
-            Ok(TransactionMetadatum::Text(s))
-        }
-        other => {
-            // Unexpected type — skip
-            Err(SerializationError::CborDecode(format!(
-                "metadatum: unexpected type {other}"
-            )))
-        }
-    }
-}
-
 // ============================================================================
 // Standalone tx decoder (Shelley era)
 // ============================================================================
@@ -1624,6 +1573,7 @@ pub(crate) fn read_pre_conway_protocol_param_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dugite_primitives::transaction::TransactionMetadatum;
 
     // -----------------------------------------------------------------------
     // CBOR encoding helpers

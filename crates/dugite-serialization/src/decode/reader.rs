@@ -628,6 +628,54 @@ impl<'b> Reader<'b> {
         Ok(out)
     }
 
+    /// Read a CBOR text string (definite or indefinite) and return an owned `String`.
+    ///
+    /// Mirrors the Haskell `decodeMetadatum` `TypeString` / `TypeStringIndef`
+    /// arms in `libs/cardano-ledger-core/src/Cardano/Ledger/Metadata.hs`. The
+    /// indefinite form (`0x7f <chunk>* 0xff`) is decoded by `decodeStringIndefLen`,
+    /// which concatenates every chunk in wire order:
+    ///
+    /// ```haskell
+    /// decodeStringIndefLen acc = do
+    ///   stop <- decodeBreakOr
+    ///   if stop then return $! T.concat (reverse acc)
+    ///   else do { !str <- decodeString; decodeStringIndefLen (str : acc) }
+    /// ```
+    ///
+    /// Wire-order concatenation is load-bearing for the same reason as
+    /// [`Reader::read_indef_bytes`]: re-chunking would change the value.
+    ///
+    /// Note that, exactly as in Haskell, the chunk elements must themselves be
+    /// definite-length text strings — a nested indefinite string is rejected.
+    pub fn read_str_owned(&mut self) -> Result<String, SerializationError> {
+        if self.peek_major()? != Type::StringIndef {
+            // Definite-length fallback — copy to satisfy the owned return.
+            return Ok(self.read_str()?.to_string());
+        }
+        // Consume the 0x7f header byte.
+        let pos = self.inner.position();
+        self.inner.set_position(pos + 1);
+
+        let mut out = String::new();
+        loop {
+            match self.peek_major()? {
+                Type::Break => {
+                    // Consume the break byte (0xff).
+                    let pos = self.inner.position();
+                    self.inner.set_position(pos + 1);
+                    break;
+                }
+                Type::String => out.push_str(self.read_str()?),
+                other => {
+                    return Err(SerializationError::CborDecode(format!(
+                        "read_str_owned: expected String or Break, got {other}"
+                    )));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Maximum length of a single `PlutusData` `ByteString` *leaf chunk*, in bytes.
     ///
     /// Mirrors the Haskell `plutus` `PlutusCore.Data.decodeData` "Note [The
