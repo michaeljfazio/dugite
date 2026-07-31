@@ -35,7 +35,10 @@ export PARITY_CSV="$OUT_DIR/cli-parity.csv"
 mkdir -p "$OUT_DIR"
 
 # Reset CSV
-echo "ts,query,dugite_sha256,cardano_sha256,equal,notes" > "$PARITY_CSV"
+# 7 columns, matching the rows actually written below. The header used to omit
+# `status`, so every header-based consumer misread the file and the release
+# report recorded cli_parity as all-zero in every release (#945).
+echo "ts,query,status,dugite_sha256,cardano_sha256,equal,notes" > "$PARITY_CSV"
 
 log_info "=== 09-cli-parity: checking socket availability ==="
 parity_check_sockets || exit 2
