@@ -888,14 +888,6 @@ impl NodePeerManager {
         }
     }
 
-    /// Return the EWMA latency (ms) for a peer address, or `None` if no
-    /// KeepAlive RTT sample has been recorded yet.
-    ///
-    /// Used by the BlockFetch decision engine to prefer lower-latency peers.
-    pub fn peer_latency_ms(&self, addr: &SocketAddr) -> Option<f64> {
-        self.inner.get_latency_ms(addr)
-    }
-
     /// Record a measured BlockFetch throughput sample (bytes/second) for a peer
     /// — the bandwidth half of the GSV estimate used to pick the fetch peer.
     pub fn update_peer_fetch_bandwidth(&mut self, addr: &SocketAddr, bytes_per_sec: f64) {

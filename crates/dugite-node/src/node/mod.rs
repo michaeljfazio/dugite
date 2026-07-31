@@ -9,8 +9,6 @@
 //! - [`sync`]   — Pipelined ChainSync loop, block processing, rollback, replay
 
 #[allow(dead_code)] // networking rewrite module, wired in soon
-pub(crate) mod block_fetch_logic;
-#[allow(dead_code)] // networking rewrite module, wired in soon
 pub(crate) mod connection_lifecycle;
 pub(crate) mod epoch;
 pub(crate) mod ledger_view;
@@ -32,10 +30,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::signal;
 use tokio::sync::{mpsc, watch, RwLock, Semaphore};
-use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::node::block_fetch_logic::BlockFetchLogicTask;
 use crate::node::connection_lifecycle::{
     CandidateChainState, ConnectError, ConnectResult, ConnectionLifecycleManager, FetchedBlock,
     LifecycleError, PeerFailureKind,
@@ -704,7 +700,6 @@ pub struct Node {
     connection_lifecycle: Option<ConnectionLifecycleManager>,
     /// Handle to the BlockFetch decision task (independent tokio task).
     /// Runs the decision loop that assigns fetch ranges to per-peer workers.
-    block_fetch_task: Option<JoinHandle<()>>,
     /// Receiver for blocks fetched by per-peer BlockFetch workers.
     /// The main run loop consumes these and applies them to the ledger.
     fetched_blocks_rx: Option<mpsc::Receiver<FetchedBlock>>,
@@ -2613,7 +2608,6 @@ impl Node {
             // Lifecycle manager, fetch task, and fetch channel are initialized
             // in run() once the block_announcement_tx is created.
             connection_lifecycle: None,
-            block_fetch_task: None,
             fetched_blocks_rx: None,
             defer_phase2_window: std::env::var("DUGITE_DEFER_PHASE2_WINDOW")
                 .ok()
@@ -4767,7 +4761,7 @@ impl Node {
                 .effective_peer_sharing(self.block_producer.is_some()),
             connect_timeout,
             candidate_chains.clone(),
-            fetched_blocks_tx.clone(),
+            fetched_blocks_tx,
             self.block_announcement_tx
                 .as_ref()
                 .expect("block_announcement_tx was just set")
@@ -4858,34 +4852,20 @@ impl Node {
         self.peer_failure_rx = Some(peer_failure_rx);
         self.keepalive_rtt_rx = Some(keepalive_rtt_rx);
 
-        // ─── Spawn BlockFetch Decision Task ──────────────────────────────
+        // NOTE: there is deliberately no separate "BlockFetch decision task".
         //
-        // Independent task matching Haskell's `blockFetchLogic` thread.
-        // Reads candidate chain state from ChainSync tasks, dispatches
-        // fetch ranges to per-peer BlockFetch workers.
-        {
-            let bf_cancel = tokio_util::sync::CancellationToken::new();
-            let mut bf_task = BlockFetchLogicTask::new_with_peer_manager(
-                candidate_chains.clone(),
-                fetched_blocks_tx,
-                self.byron_epoch_length,
-                bf_cancel.clone(),
-                Some(self.chain_db.clone()),
-                Some(self.peer_manager.clone()),
-            );
-            let bf_shutdown = shutdown_rx.clone();
-            let bf_handle = tokio::spawn(async move {
-                // Shut down the decision task when the node shuts down.
-                let mut shutdown = bf_shutdown;
-                tokio::select! {
-                    _ = bf_task.run() => {}
-                    _ = shutdown.changed() => {
-                        bf_cancel.cancel();
-                    }
-                }
-            });
-            self.block_fetch_task = Some(bf_handle);
-        }
+        // A `BlockFetchLogicTask` used to be spawned here, described as the
+        // analogue of Haskell's `blockFetchLogic` thread. Nothing ever called
+        // its `register_peer`, so `evaluate_and_fetch` early-returned on an
+        // empty `fetch_senders` on every tick for the lifetime of the node —
+        // it did nothing, while reading like the live implementation (which is
+        // how the architecture docs came to describe a multi-peer fetch pool
+        // dugite does not have). Removed in #943.
+        //
+        // The real BlockFetch path is `ConnectionLifecycleManager::
+        // make_blockfetch_task`, where the single contested fetcher slot lives
+        // (`active_fetcher` + GSV top-K standby, matching Haskell's
+        // `bfcMaxConcurrencyBulkSync = 1`).
 
         // ─── GSM (Genesis State Machine) ─────────────────────────────────
         let genesis_enabled = self.consensus_mode == "genesis";
@@ -6022,11 +6002,6 @@ impl Node {
                     ),
                 }
             }
-        }
-
-        // Abort the BlockFetch decision task.
-        if let Some(handle) = self.block_fetch_task.take() {
-            handle.abort();
         }
 
         // Flush volatile blocks, persist ChainDB, and quiesce the snapshot
