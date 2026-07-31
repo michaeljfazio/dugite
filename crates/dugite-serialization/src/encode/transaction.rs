@@ -217,7 +217,13 @@ pub fn encode_redeemers(redeemers: &[Redeemer], map_form: bool) -> Vec<u8> {
     let mut buf = Vec::new();
     if map_form {
         // Conway/Dijkstra map: { [tag, index] => [data, ex_units], … }
-        buf.extend(encode_map_header(redeemers.len()));
+        //
+        // Haskell `Redeemers` at PV>=9 is a bare `encCBOR` on the underlying
+        // `Map` — the generic instance — so `encodeMap` semantics apply
+        // (#932): definite header <= 23 entries, indefinite above. An EMPTY
+        // map (0 <= 23) stays the definite `0xa0` — the era-gated
+        // script-integrity sentinel is untouched.
+        buf.extend(encode_map_open(redeemers.len()));
         for &i in &order {
             let r = &redeemers[i];
             // Key: [tag, index]
@@ -231,6 +237,7 @@ pub fn encode_redeemers(redeemers: &[Redeemer], map_form: bool) -> Vec<u8> {
             buf.extend(encode_uint(r.ex_units.mem));
             buf.extend(encode_uint(r.ex_units.steps));
         }
+        encode_map_close(&mut buf, redeemers.len());
     } else {
         // Pre-Conway list: [* [tag, index, data, ex_units]]
         buf.extend(encode_array_header(redeemers.len()));
@@ -626,13 +633,18 @@ pub(super) fn encode_transaction_body_for_era(body: &TransactionBody, era: Era) 
     }
 
     // 5: withdrawals
+    //
+    // Haskell `Withdrawals` is `deriving newtype EncCBOR` over
+    // `Map AccountAddress Coin` — generic Map instance — so `encodeMap`
+    // semantics apply (#932): definite <= 23 entries, indefinite above.
     if !body.withdrawals.is_empty() {
         buf.extend(encode_uint(5));
-        buf.extend(encode_map_header(body.withdrawals.len()));
+        buf.extend(encode_map_open(body.withdrawals.len()));
         for (addr, amount) in &body.withdrawals {
             buf.extend(encode_bytes(addr));
             buf.extend(encode_uint(amount.0));
         }
+        encode_map_close(&mut buf, body.withdrawals.len());
     }
 
     // 7: auxiliary_data_hash
@@ -796,14 +808,17 @@ pub(super) fn encode_transaction_body_for_era(body: &TransactionBody, era: Era) 
     //   map { reward_account_bytes => coin }
     // The encoder uses the canonical map ordering BTreeMap provides; this
     // matches the Haskell `encodeFoldable . Map.toAscList` discipline.
-    // Issue #475 Phase 3.4.
+    // Issue #475 Phase 3.4. Haskell `DirectDeposits` is `deriving newtype
+    // EncCBOR` over `Map AccountAddress Coin` (same shape as Withdrawals),
+    // so `encodeMap` semantics apply (#932).
     if emit_direct_deposits {
         buf.extend(encode_uint(25));
-        buf.extend(encode_map_header(body.direct_deposits.len()));
+        buf.extend(encode_map_open(body.direct_deposits.len()));
         for (addr, amount) in &body.direct_deposits {
             buf.extend(encode_bytes(addr));
             buf.extend(encode_uint(amount.0));
         }
+        encode_map_close(&mut buf, body.direct_deposits.len());
     }
 
     // 26: account_balance_intervals (Dijkstra+) — per-account balance
@@ -815,13 +830,17 @@ pub(super) fn encode_transaction_body_for_era(body: &TransactionBody, era: Era) 
     // such entries here because the only way to construct one in-memory
     // is via the public `AccountBalanceInterval::is_degenerate()` check,
     // which callers should run first.
+    // Haskell `AccountBalanceIntervals` is `deriving newtype EncCBOR` over
+    // `Map AccountId (AccountBalanceInterval era)` — generic Map instance —
+    // so `encodeMap` semantics apply (#932).
     if emit_account_balance_intervals {
         buf.extend(encode_uint(26));
-        buf.extend(encode_map_header(body.account_balance_intervals.len()));
+        buf.extend(encode_map_open(body.account_balance_intervals.len()));
         for (cred, iv) in &body.account_balance_intervals {
             buf.extend(encode_credential(cred));
             buf.extend(encode_account_balance_interval(iv));
         }
+        encode_map_close(&mut buf, body.account_balance_intervals.len());
     }
 
     buf
@@ -2498,5 +2517,311 @@ mod tests {
     fn redeemer_tag_guarding_is_six() {
         let cbor = encode_redeemer_tag(&RedeemerTag::Guarding);
         assert_eq!(cbor, vec![0x06], "Guarding tag must encode as bare 0x06");
+    }
+
+    // ── #932: Haskell `encodeMap` semantics for tx-body Map fields ──────────
+    //
+    // cardano-ledger-binary `encodeMap` (encoding version >= 2) emits a
+    // DEFINITE-length map header for <= 23 entries and an INDEFINITE map
+    // (0xbf ... 0xff) for > 23. `Withdrawals` (tx-body key 5),
+    // `DirectDeposits` (Dijkstra key 25), `AccountBalanceIntervals`
+    // (Dijkstra key 26) and the Conway map-form `Redeemers` are all plain
+    // `Map`s on the Haskell side (generic `EncCBOR (Map k v)` instance;
+    // oracle-verified 2026-07-31), so their synthetic re-encodes must follow
+    // the same threshold. Expected bytes below are built EXPLICITLY (not via
+    // the shared production helper) so a helper bug cannot self-verify.
+
+    /// `n` distinct 29-byte reward-account keys, 1 lovelace each.
+    fn withdrawals_n(n: usize) -> BTreeMap<Vec<u8>, Lovelace> {
+        (0..n)
+            .map(|i| {
+                let mut addr = vec![0xe1u8; 29];
+                addr[1] = (i / 256) as u8;
+                addr[2] = (i % 256) as u8;
+                (addr, Lovelace(1))
+            })
+            .collect()
+    }
+
+    /// Explicitly-built `{reward_account => coin}` map bytes in the definite
+    /// or indefinite form (also reused for Dijkstra direct_deposits, which is
+    /// wire-symmetric with withdrawals).
+    fn raw_account_coin_map(w: &BTreeMap<Vec<u8>, Lovelace>, indefinite: bool) -> Vec<u8> {
+        let mut buf = if indefinite {
+            vec![0xbf]
+        } else {
+            encode_map_header(w.len())
+        };
+        for (addr, amount) in w {
+            buf.extend(encode_bytes(addr));
+            buf.extend(encode_uint(amount.0));
+        }
+        if indefinite {
+            buf.push(0xff);
+        }
+        buf
+    }
+
+    /// 23 withdrawals: definite map(23) header (0xb7), no break byte.
+    /// Withdrawals (key 5) is the last emitted field of this body, so the
+    /// encoded body must END with the exact expected map bytes.
+    #[test]
+    fn withdrawals_23_entries_definite_header() {
+        let mut body = minimal_body();
+        body.withdrawals = withdrawals_n(23);
+        let enc = encode_transaction_body_for_era(&body, Era::Conway);
+        let expected = raw_account_coin_map(&body.withdrawals, false);
+        assert_eq!(expected[0], 0xb7, "sanity: 23-entry definite header");
+        assert!(
+            enc.ends_with(&expected),
+            "23-entry withdrawals must stay a definite map(23)"
+        );
+    }
+
+    /// 24 withdrawals: indefinite map (0xbf ... 0xff).
+    #[test]
+    fn withdrawals_24_entries_indefinite() {
+        let mut body = minimal_body();
+        body.withdrawals = withdrawals_n(24);
+        let enc = encode_transaction_body_for_era(&body, Era::Conway);
+        let expected = raw_account_coin_map(&body.withdrawals, true);
+        assert!(
+            enc.ends_with(&expected),
+            "24-entry withdrawals must open indefinite (0xbf) and close with break"
+        );
+        assert_eq!(*enc.last().unwrap(), 0xff, "break byte must terminate map");
+    }
+
+    /// 256 withdrawals: the indefinite form saves exactly 1 byte over the
+    /// 3-byte definite header (0xb9 0x01 0x00) — the #930 divergence class.
+    #[test]
+    fn withdrawals_256_entries_indefinite_saves_one_byte() {
+        let mut body = minimal_body();
+        body.withdrawals = withdrawals_n(256);
+        let enc = encode_transaction_body_for_era(&body, Era::Conway);
+        let indefinite = raw_account_coin_map(&body.withdrawals, true);
+        let definite = raw_account_coin_map(&body.withdrawals, false);
+        assert_eq!(
+            indefinite.len() + 1,
+            definite.len(),
+            "indefinite form must be exactly 1 byte shorter at 256 entries"
+        );
+        assert!(enc.ends_with(&indefinite));
+    }
+
+    /// `n` Spend redeemers with ascending indexes (already canonical order).
+    fn spend_redeemers_n(n: usize) -> Vec<Redeemer> {
+        (0..n)
+            .map(|i| Redeemer {
+                tag: RedeemerTag::Spend,
+                index: i as u32,
+                data: PlutusData::Integer(num_bigint::BigInt::from(1i64)),
+                ex_units: ExUnits { mem: 1, steps: 1 },
+            })
+            .collect()
+    }
+
+    /// Explicit expected bytes for the Conway MAP-form redeemers term.
+    fn raw_redeemers_map(rs: &[Redeemer], indefinite: bool) -> Vec<u8> {
+        let mut buf = if indefinite {
+            vec![0xbf]
+        } else {
+            encode_map_header(rs.len())
+        };
+        for r in rs {
+            buf.extend(encode_array_header(2));
+            buf.push(0x00); // RedeemerTag::Spend
+            buf.extend(encode_uint(r.index as u64));
+            buf.extend(encode_array_header(2));
+            buf.extend(encode_plutus_data(&r.data));
+            buf.extend(encode_array_header(2));
+            buf.extend(encode_uint(r.ex_units.mem));
+            buf.extend(encode_uint(r.ex_units.steps));
+        }
+        if indefinite {
+            buf.push(0xff);
+        }
+        buf
+    }
+
+    /// Conway map-form redeemers at the 23/24 boundary: definite map(23)
+    /// vs indefinite (0xbf ... 0xff). Haskell: `Redeemers` PV>=9 branch is a
+    /// bare `encCBOR` on the Map — generic instance — `encodeMap`.
+    #[test]
+    fn redeemers_map_form_23_vs_24_entries_header_switch() {
+        let rs23 = spend_redeemers_n(23);
+        assert_eq!(
+            encode_redeemers(&rs23, true),
+            raw_redeemers_map(&rs23, false),
+            "23-entry redeemers map must stay definite"
+        );
+
+        let rs24 = spend_redeemers_n(24);
+        assert_eq!(
+            encode_redeemers(&rs24, true),
+            raw_redeemers_map(&rs24, true),
+            "24-entry redeemers map must switch to indefinite"
+        );
+    }
+
+    /// 256-entry map-form redeemers: 1-byte saving vs the definite header.
+    #[test]
+    fn redeemers_map_form_256_entries_indefinite_saves_one_byte() {
+        let rs = spend_redeemers_n(256);
+        let enc = encode_redeemers(&rs, true);
+        let indefinite = raw_redeemers_map(&rs, true);
+        let definite = raw_redeemers_map(&rs, false);
+        assert_eq!(indefinite.len() + 1, definite.len());
+        assert_eq!(enc, indefinite, "must be 1 byte shorter than definite");
+    }
+
+    /// #932 must NOT disturb the empty-redeemers sentinel: an empty map has
+    /// 0 <= 23 entries, so the Conway form stays the definite `0xa0` and the
+    /// pre-Conway list form stays `0x80` — exactly the era-gated
+    /// script-integrity sentinel (see `compute_script_data_hash`).
+    #[test]
+    fn redeemers_empty_sentinel_unchanged_by_encode_map_threshold() {
+        assert_eq!(
+            encode_redeemers(&[], true),
+            vec![0xa0],
+            "Conway empty-redeemers sentinel must remain definite empty map"
+        );
+        assert_eq!(
+            encode_redeemers(&[], false),
+            vec![0x80],
+            "pre-Conway empty-redeemers sentinel must remain empty list"
+        );
+    }
+
+    /// Dijkstra direct_deposits (key 25) follows `encodeMap` semantics —
+    /// Haskell `DirectDeposits` is `deriving newtype EncCBOR` over
+    /// `Map AccountAddress Coin`, exactly like `Withdrawals`.
+    #[test]
+    fn direct_deposits_23_vs_24_entries_header_switch() {
+        let mut body23 = minimal_body();
+        body23.direct_deposits = withdrawals_n(23);
+        let enc23 = encode_transaction_body_for_era(&body23, Era::Dijkstra);
+        let expected23 = raw_account_coin_map(&body23.direct_deposits, false);
+        assert!(
+            enc23.ends_with(&expected23),
+            "23-entry direct_deposits must stay definite"
+        );
+
+        let mut body24 = minimal_body();
+        body24.direct_deposits = withdrawals_n(24);
+        let enc24 = encode_transaction_body_for_era(&body24, Era::Dijkstra);
+        let expected24 = raw_account_coin_map(&body24.direct_deposits, true);
+        assert!(
+            enc24.ends_with(&expected24),
+            "24-entry direct_deposits must switch to indefinite"
+        );
+        assert_eq!(*enc24.last().unwrap(), 0xff);
+    }
+
+    /// Dijkstra account_balance_intervals (key 26) follows `encodeMap` —
+    /// Haskell `AccountBalanceIntervals` is `deriving newtype EncCBOR` over
+    /// `Map AccountId (AccountBalanceInterval era)`.
+    #[test]
+    fn account_balance_intervals_23_vs_24_entries_header_switch() {
+        use dugite_primitives::transaction::AccountBalanceInterval;
+
+        fn intervals_n(n: usize) -> Vec<(Credential, AccountBalanceInterval)> {
+            (0..n)
+                .map(|i| {
+                    let mut b = [0u8; 28];
+                    b[0] = (i / 256) as u8;
+                    b[1] = (i % 256) as u8;
+                    (
+                        Credential::VerificationKey(Hash28::from_bytes(b)),
+                        AccountBalanceInterval {
+                            lower: Some(Lovelace(1)),
+                            upper: None,
+                        },
+                    )
+                })
+                .collect()
+        }
+
+        let mut body23 = minimal_body();
+        body23.account_balance_intervals = intervals_n(23);
+        let enc23 = encode_transaction_body_for_era(&body23, Era::Dijkstra);
+        // key 26 is the LAST field of this body; each entry is
+        // credential(32 bytes: 0x82 0x00 0x58 0x1c + 28) + [1, null](3 bytes:
+        // 0x82 0x01 0xf6) = 35 bytes. With 23 entries the map is definite: 0xb7.
+        let map_start = enc23.len() - 23 * 35 - 1;
+        assert_eq!(
+            enc23[map_start], 0xb7,
+            "23-entry account_balance_intervals must stay definite"
+        );
+
+        let mut body24 = minimal_body();
+        body24.account_balance_intervals = intervals_n(24);
+        let enc24 = encode_transaction_body_for_era(&body24, Era::Dijkstra);
+        let map_start24 = enc24.len() - 1 - 24 * 35 - 1;
+        assert_eq!(
+            enc24[map_start24], 0xbf,
+            "24-entry account_balance_intervals must open indefinite"
+        );
+        assert_eq!(*enc24.last().unwrap(), 0xff, "break byte must close map");
+    }
+
+    /// Decode-roundtrip: a Conway tx whose withdrawals map (24 entries) and
+    /// witness-set redeemers map (25 entries) are both encoded INDEFINITE
+    /// must decode back identically through the era-appropriate dispatch.
+    #[test]
+    fn indefinite_tx_maps_roundtrip_through_conway_decoder() {
+        let mut body = minimal_body();
+        body.withdrawals = withdrawals_n(24);
+        let mut ws = empty_witness_set();
+        ws.redeemers = spend_redeemers_n(25);
+        let tx = dugite_primitives::transaction::Transaction {
+            hash: Hash32::ZERO,
+            era: Era::Conway,
+            body,
+            witness_set: ws,
+            is_valid: true,
+            auxiliary_data: None,
+            raw_cbor: None,
+            raw_body_cbor: None,
+            raw_witness_cbor: None,
+        };
+        let encoded = encode_transaction(&tx);
+        let decoded =
+            crate::decode::decode_transaction(6, &encoded).expect("Conway tx must decode");
+        assert_eq!(
+            decoded.body.withdrawals, tx.body.withdrawals,
+            "indefinite withdrawals map must round-trip"
+        );
+        assert_eq!(
+            decoded.witness_set.redeemers.len(),
+            25,
+            "indefinite redeemers map must round-trip"
+        );
+    }
+
+    /// Decode-roundtrip: Dijkstra direct_deposits with 24 entries
+    /// (indefinite on the wire) survives the Dijkstra dispatch.
+    #[test]
+    fn indefinite_direct_deposits_roundtrip_through_dijkstra_decoder() {
+        let mut body = minimal_body();
+        body.direct_deposits = withdrawals_n(24);
+        let tx = dugite_primitives::transaction::Transaction {
+            hash: Hash32::ZERO,
+            era: Era::Dijkstra,
+            body,
+            witness_set: empty_witness_set(),
+            is_valid: true,
+            auxiliary_data: None,
+            raw_cbor: None,
+            raw_body_cbor: None,
+            raw_witness_cbor: None,
+        };
+        let encoded = encode_transaction(&tx);
+        let decoded =
+            crate::decode::decode_transaction(7, &encoded).expect("Dijkstra tx must decode");
+        assert_eq!(
+            decoded.body.direct_deposits, tx.body.direct_deposits,
+            "indefinite direct_deposits map must round-trip"
+        );
     }
 }

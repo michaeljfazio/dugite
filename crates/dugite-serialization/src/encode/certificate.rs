@@ -297,11 +297,18 @@ pub fn encode_certificate(cert: &Certificate) -> Vec<u8> {
             }));
             match target {
                 MIRTarget::StakeCredentials(creds) => {
-                    mir_buf.extend(encode_map_header(creds.len()));
+                    // Haskell `StakeAddressesMIR` is a bare `encCBOR` on
+                    // `Map (Credential Staking) DeltaCoin` — generic Map
+                    // instance — `encodeMap` semantics (#932). Shelley's
+                    // pinned encoding version is exactly 2, so the <= 23
+                    // definite / > 23 indefinite regime has applied since
+                    // the first Shelley release.
+                    mir_buf.extend(encode_map_open(creds.len()));
                     for (cred, amount) in creds {
                         mir_buf.extend(encode_credential(cred));
                         mir_buf.extend(encode_int(*amount as i128));
                     }
+                    encode_map_close(&mut mir_buf, creds.len());
                 }
                 MIRTarget::OtherAccountingPot(coin) => {
                     mir_buf.extend(encode_uint(*coin));
@@ -908,5 +915,121 @@ mod tests {
         let encoded = encode_certificate(&cert);
         assert_eq!(encoded[0], 0x83);
         assert_eq!(encoded[1], 0x09);
+    }
+
+    // ── #932: Haskell `encodeMap` semantics for the MIR credentials map ─────
+    //
+    // `MIRTarget::StakeAddressesMIR (Map (Credential Staking) DeltaCoin)` is
+    // encoded via a bare `encCBOR m` on the Map — the generic
+    // `EncCBOR (Map k v)` instance => `encodeMap` (oracle-verified
+    // 2026-07-31). Shelley's pinned encoding version is exactly 2, so the
+    // variable (<= 23 definite / > 23 indefinite) regime has applied since
+    // the first Shelley release. Wire prefix is
+    // array(2)[6, array(2)[source, map]]: the map header sits at offset 4.
+
+    /// `n` distinct key credentials, delta +1 each.
+    fn mir_creds_n(n: usize) -> Vec<(Credential, i64)> {
+        (0..n)
+            .map(|i| {
+                let mut b = [0u8; 28];
+                b[0] = (i / 256) as u8;
+                b[1] = (i % 256) as u8;
+                (Credential::VerificationKey(Hash28::from_bytes(b)), 1i64)
+            })
+            .collect()
+    }
+
+    fn mir_cert(n: usize) -> Certificate {
+        Certificate::MoveInstantaneousRewards {
+            source: MIRSource::Reserves,
+            target: MIRTarget::StakeCredentials(mir_creds_n(n)),
+        }
+    }
+
+    /// 23 credentials: definite map(23) header (0xb7), no break byte.
+    #[test]
+    fn mir_creds_map_23_entries_definite_header() {
+        let enc = encode_certificate(&mir_cert(23));
+        assert_eq!(&enc[..4], &[0x82, 0x06, 0x82, 0x00], "sanity: MIR prefix");
+        assert_eq!(enc[4], 0xb7, "23-cred MIR map must stay definite");
+        assert_ne!(*enc.last().unwrap(), 0xff);
+        // 4 (prefix) + 1 (header) + 23 * (32 cred + 1 delta) = 764.
+        assert_eq!(enc.len(), 764);
+    }
+
+    /// 24 credentials: indefinite map (0xbf ... 0xff), same total length as
+    /// the 2-byte definite header would give.
+    #[test]
+    fn mir_creds_map_24_entries_indefinite() {
+        let enc = encode_certificate(&mir_cert(24));
+        assert_eq!(enc[4], 0xbf, "24-cred MIR map must open indefinite");
+        assert_eq!(*enc.last().unwrap(), 0xff, "break byte must close the map");
+        // 4 + 1 (0xbf) + 24*33 + 1 (0xff) = 798 — ties with definite.
+        assert_eq!(enc.len(), 798);
+    }
+
+    /// 256 credentials: indefinite saves exactly 1 byte over the 3-byte
+    /// definite header (0xb9 0x01 0x00).
+    #[test]
+    fn mir_creds_map_256_entries_indefinite_saves_one_byte() {
+        let enc = encode_certificate(&mir_cert(256));
+        assert_eq!(enc[4], 0xbf);
+        assert_eq!(*enc.last().unwrap(), 0xff);
+        // 4 + 1 + 256*33 + 1 = 8454; definite would be 4 + 3 + 8448 = 8455.
+        assert_eq!(enc.len(), 8454, "must be 1 byte shorter than definite");
+    }
+
+    /// Decode-roundtrip: a Shelley tx carrying a MIR cert with a 24-entry
+    /// (indefinite) credentials map decodes back identically through the
+    /// era-appropriate dispatch. (Mainnet's first Shelley MIR certs really
+    /// do use indefinite maps — the decoder already handles them; this pins
+    /// the encoder now emitting the same form for > 23 entries.)
+    #[test]
+    fn indefinite_mir_creds_map_roundtrips_through_shelley_decoder() {
+        use dugite_primitives::era::Era;
+        use dugite_primitives::transaction::{TransactionBody, TransactionInput};
+
+        let cert = mir_cert(24);
+        let body = TransactionBody {
+            inputs: vec![TransactionInput {
+                transaction_id: zero32(),
+                index: 0,
+            }],
+            outputs: vec![],
+            fee: Lovelace(200_000),
+            certificates: vec![cert.clone()],
+            ..Default::default()
+        };
+        let body_cbor =
+            super::super::transaction::encode_transaction_body_for_era(&body, Era::Shelley);
+        // Shelley standalone tx wire shape: [body, witness_set, is_valid, aux].
+        let mut tx_cbor = vec![0x84];
+        tx_cbor.extend(body_cbor);
+        tx_cbor.push(0xa0); // empty witness set
+        tx_cbor.push(0xf5); // is_valid (ignored by the Shelley decoder)
+        tx_cbor.push(0xf6); // no auxiliary data
+        let decoded =
+            crate::decode::decode_transaction(1, &tx_cbor).expect("Shelley tx must decode");
+        assert_eq!(
+            decoded.body.certificates.len(),
+            1,
+            "MIR cert must survive decode"
+        );
+        match &decoded.body.certificates[0] {
+            Certificate::MoveInstantaneousRewards { source, target } => {
+                assert_eq!(*source, MIRSource::Reserves);
+                match target {
+                    MIRTarget::StakeCredentials(creds) => {
+                        assert_eq!(
+                            creds,
+                            &mir_creds_n(24),
+                            "indefinite MIR credentials map must round-trip"
+                        );
+                    }
+                    other => panic!("expected StakeCredentials, got {other:?}"),
+                }
+            }
+            other => panic!("expected MIR cert, got {other:?}"),
+        }
     }
 }
