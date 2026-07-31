@@ -2340,7 +2340,7 @@ fn read_drep_voting_thresholds(
 /// Conway adds:
 /// - Key 5: redeemers in MAP form `{ [tag, index] => [data, ex_units] }` OR array form
 /// - Key 7: plutus_v3_scripts
-fn decode_conway_witness_set(
+pub(crate) fn decode_conway_witness_set(
     r: &mut Reader<'_>,
     era: Era,
 ) -> Result<TransactionWitnessSet, SerializationError> {

@@ -950,14 +950,17 @@ fn test_encode_vkey_witness_structure() {
         }],
         ..empty_witness_set()
     };
+    // encode_witness_set defaults to Conway, so key 0 carries the 258 set tag
+    // (Haskell `Key 0 $ To vkeys` over a `Set`, i.e. `encodeSet` at PV>=9 — #939).
     let enc = encode_witness_set(&ws);
-    // map(1) { 0: array(1) [ array(2) [bstr(32), bstr(64)] ] }
+    // map(1) { 0: 258(array(1) [ array(2) [bstr(32), bstr(64)] ]) }
     assert_eq!(enc[0], 0xA1); // map(1)
     assert_eq!(enc[1], 0x00); // key 0
-    assert_eq!(enc[2], 0x81); // array(1)
-    assert_eq!(enc[3], 0x82); // array(2) for the single vkey witness
-    assert_eq!(enc[4], 0x58); // bstr with 1-byte length prefix
-    assert_eq!(enc[5], 32); // 32-byte vkey
+    assert_eq!(&enc[2..5], &[0xd9, 0x01, 0x02]); // tag(258)
+    assert_eq!(enc[5], 0x81); // array(1)
+    assert_eq!(enc[6], 0x82); // array(2) for the single vkey witness
+    assert_eq!(enc[7], 0x58); // bstr with 1-byte length prefix
+    assert_eq!(enc[8], 32); // 32-byte vkey
 }
 
 #[test]
@@ -971,12 +974,14 @@ fn test_encode_bootstrap_witness_structure() {
         }],
         ..empty_witness_set()
     };
+    // Conway default => key 2 carries the 258 set tag as well (#939).
     let enc = encode_witness_set(&ws);
-    // map(1) { 2: array(1) [ array(4) [...] ] }
+    // map(1) { 2: 258(array(1) [ array(4) [...] ]) }
     assert_eq!(enc[0], 0xA1); // map(1)
     assert_eq!(enc[1], 0x02); // key 2 (bootstrap)
-    assert_eq!(enc[2], 0x81); // array(1)
-    assert_eq!(enc[3], 0x84); // array(4) for the bootstrap witness
+    assert_eq!(&enc[2..5], &[0xd9, 0x01, 0x02]); // tag(258)
+    assert_eq!(enc[5], 0x81); // array(1)
+    assert_eq!(enc[6], 0x84); // array(4) for the bootstrap witness
 }
 
 // ===========================================================================
