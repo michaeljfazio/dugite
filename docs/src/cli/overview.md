@@ -13,13 +13,34 @@ dugite-cli [COMMAND] [OPTIONS]
 | Command | Description |
 |---------|-------------|
 | `address` | Address generation and manipulation |
-| `key` | Payment and stake key generation |
+| `key` | Payment and stake key generation (dugite extension — see below) |
 | `transaction` | Transaction building, signing, and submission |
 | `query` | Node queries (tip, UTxO, protocol parameters, etc.) |
 | `stake-address` | Stake address registration, delegation, and vote delegation |
-| `stake-pool` | Stake pool operations (retirement certificates) |
+| `stake-pool` | Stake pool operations (key generation, registration, retirement certificates) |
 | `governance` | Conway governance (DRep, voting, proposals) |
 | `node` | Node key operations (cold keys, KES, VRF, operational certificates) |
+| `byron` | Byron-era key conversion commands (`byron key ...`) |
+| `genesis` | Genesis block/bundle commands (keys, delegation certs, `genesis create`) |
+| `text-view` | Decode a text-envelope file's CBOR representation |
+
+The `key` command group (`generate-payment-key`, `generate-stake-key`,
+`verification-key-hash`) is a dugite-only convenience extension with no
+cardano-cli counterpart. The cardano-cli equivalents — `address key-gen`,
+`stake-address key-gen`, and `address key-hash` — are also implemented, so
+scripts written against cardano-cli work unchanged. See
+[Key Generation](key-generation.md) for the mapping.
+
+### Era Prefixes
+
+cardano-cli 11 accepts commands only in their era-prefixed form, e.g.
+`cardano-cli conway stake-pool registration-certificate ...`. dugite accepts
+**both** the era-prefixed form (`conway`, `babbage`, `alonzo`, `mary`,
+`allegra`, `shelley`, `latest`) and the flat form (`dugite-cli stake-pool
+registration-certificate ...`) — every era prefix routes to the same
+handler, since dugite is era-agnostic at the CLI surface. This makes dugite a
+strict superset: any cardano-cli-compatible script works unchanged, and
+existing dugite scripts using the flat form keep working too.
 
 ## Common Patterns
 

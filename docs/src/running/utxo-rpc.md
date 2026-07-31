@@ -38,8 +38,10 @@ grpcurl -plaintext localhost:50051 utxorpc.v1beta.sync.SyncService/ReadTip
 ## Services exposed
 
 Every service ships in both **`v1alpha`** (for backwards compatibility
-with older clients) and **`v1beta`** (current). The spec is pinned
-in-tree at `crates/dugite-rpc/proto/VERSION`.
+with older clients) and **`v1beta`** (current), with one exception:
+`QueryService.ReadState` exists only in `v1beta` — upstream added it
+after `v1alpha` was frozen. The spec is pinned in-tree at
+`crates/dugite-rpc/proto/VERSION` (currently `v0.19.2`).
 
 | Service | Method | Status |
 |---|---|---|
@@ -54,7 +56,7 @@ in-tree at `crates/dugite-rpc/proto/VERSION`.
 | `QueryService` | `SearchUtxos` | ✅ implemented (`exact_address` / `payment_part` / `delegation_part` / `asset` plus `not` / `all_of` / `any_of` composites) |
 | `QueryService` | `ReadData` | ✅ implemented (bounded scan: live inline datums + mempool tx witness sets) |
 | `QueryService` | `ReadTx` | ✅ implemented (bounded scan: mempool + last ~43 200 slots of VolatileDB) |
-| `QueryService` | `ReadState` | ✅ implemented (minimum-viable envelope: epoch + tip slot) |
+| `QueryService` | `ReadState` | ✅ implemented, **`v1beta` only** (minimum-viable envelope: epoch + tip slot) |
 | `SubmitService` | `SubmitTx` | ✅ implemented |
 | `SubmitService` | `ReadMempool` | ✅ implemented |
 | `SubmitService` | `WaitForTx` (stream) | ✅ implemented |
@@ -138,12 +140,16 @@ reverse proxy (Envoy, nginx) and leave Dugite's `Tls` block absent.
 
 ### Metrics
 
-The RPC server emits standard Prometheus counters / histograms via the
-node's existing metrics endpoint:
+**The RPC server currently emits no Prometheus metrics.** `dugite-rpc`
+defines an `RpcMetricsSink` trait (`request_started`,
+`request_completed`, `stream_started`, `stream_ended`) so a host can plug
+in Prometheus or OpenTelemetry, but `dugite-node` wires
+`dugite_rpc::noop_metrics()` — every callback is a no-op. No
+`dugite_rpc_*` series appear on the node's `/metrics` endpoint.
 
-* `dugite_rpc_requests_total{service, method, status}` (counter)
-* `dugite_rpc_request_duration_seconds{service, method}` (histogram)
-* `dugite_rpc_active_streams{service, method}` (gauge)
+Until a real sink is wired, observe the RPC server through logs (below)
+and through the node-level metrics it drives indirectly
+(`dugite_mempool_tx_count`, `dugite_n2c_txs_*`, and friends).
 
 ### Logging
 

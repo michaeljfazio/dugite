@@ -16,9 +16,13 @@ The chart is published as an OCI artifact on every tagged release. Install direc
 ```bash
 helm install dugite-relay \
   oci://ghcr.io/michaeljfazio/charts/dugite-node \
-  --version 0.4.0 \
+  --version 0.9.3 \
   --set network.name=preview
 ```
+
+The chart version (`0.9.3`) and the node version it deploys (`appVersion
+2.4.3`) move independently — check `charts/dugite-node/Chart.yaml` for the
+current pair. Omit `--version` to take the latest published chart.
 
 Or install from a local checkout:
 
@@ -177,6 +181,82 @@ topology:
   useLedgerAfterSlot: 102729600   # mainnet=0, preview=102729600, preprod=76723200
 ```
 
+### Peer targets and governor tuning
+
+These mirror cardano-node's defaults. Leave them alone unless you have a
+measured reason to change them.
+
+```yaml
+network:
+  targetRootPeers: 60
+  targetActivePeers: 20
+  targetEstablishedPeers: 30
+  targetKnownPeers: 150
+  targetActiveBigLedgerPeers: 5
+  targetEstablishedBigLedgerPeers: 10
+  targetKnownBigLedgerPeers: 15
+
+peerGovernor:
+  churnIntervalNormalSecs: 3300   # 55 min
+  churnIntervalSyncSecs: 900      # 15 min
+  stallDemotionCycles: 6          # each ~30s
+  errorDemotionThreshold: 5
+```
+
+### Probes
+
+```yaml
+livenessProbe:
+  httpGet: { path: /live, port: metrics }
+  initialDelaySeconds: 120
+  periodSeconds: 30
+  failureThreshold: 5
+
+readinessProbe:
+  httpGet: { path: /health, port: metrics }
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  failureThreshold: 3
+```
+
+Both probes are automatically disabled when `metrics.enabled=false`, since
+they target the metrics port. Liveness uses `/live` (forward progress —
+restarts a wedged node) rather than `/ready` (sync progress), so a node that
+is merely still syncing is never restart-looped. See
+[Monitoring](./monitoring.md) for the endpoint semantics.
+
+### Security contexts
+
+The chart runs as non-root with a read-only root filesystem by default:
+
+```yaml
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile: { type: RuntimeDefault }
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities: { drop: [ALL] }
+```
+
+`readOnlyRootFilesystem: true` is safe because the chart mounts writable
+volumes at `/data/db`, `/ipc`, and `/tmp`.
+
+### NetworkPolicy
+
+```yaml
+networkPolicy:
+  enabled: true    # only takes effect when role=producer
+```
+
+Set to `false` if your cluster has no NetworkPolicy controller — otherwise
+the policy is written but silently unenforced, which is worse than not
+having it.
+
 ## Relay Node Deployment
 
 A relay node connects to the Cardano network, syncs blocks, and serves them to connected peers and local clients.
@@ -268,9 +348,11 @@ helm install dugite-producer ./charts/dugite-node \
 
 When `role=producer`, the chart automatically creates a `NetworkPolicy` that:
 
-- Restricts N2N ingress to pods labeled `app.kubernetes.io/component: relay`.
-- Allows metrics scraping (and, when `rpc.service=true`, RPC) from anywhere in the cluster.
-- Leaves egress unrestricted so the BP can reach its relay(s).
+- Restricts N2N ingress to pods labeled `app.kubernetes.io/component: relay` **in the same namespace** — the rule uses a bare `podSelector` with no `namespaceSelector`, so a relay deployed to a different namespace will be blocked.
+- Allows metrics scraping (and, when `rpc.enabled` and `rpc.service` are both true, RPC) from anywhere in the cluster.
+- Declares `policyTypes: [Ingress]` only, so egress stays unrestricted and the BP can reach its relay(s).
+
+Set `networkPolicy.enabled=false` to skip it — for example on a cluster with no NetworkPolicy controller, where an unenforced policy gives false assurance.
 
 Block producers should **never** be exposed directly to the internet.
 
@@ -371,10 +453,14 @@ grpcurl -plaintext localhost:50051 list
 | `role` | `relay` | Node role: `relay` or `producer` |
 | `image.repository` | `ghcr.io/michaeljfazio/dugite` | Container image |
 | `image.tag` | Chart appVersion | Image tag |
+| `replicaCount` | `1` | Keep at 1 — a node owns its ChainDB exclusively and does not scale horizontally |
+| `socketPath` | `/ipc/node.sock` | N2C socket, shared with sidecars via the `/ipc` emptyDir |
 | `network.name` | `preview` | Network: `mainnet`, `preview`, `preprod` |
+| `network.magic` | `null` | Auto-derived from `network.name`; override only for private networks |
 | `network.port` | `3001` | N2N port |
 | `network.diffusionMode` | `InitiatorAndResponder` | `InitiatorOnly` for BPs behind NAT |
 | `network.peerSharing` | `null` | `true`/`false` to override the relay/BP default |
+| `network.targetActivePeers` | `20` | Peer governor targets (mirror cardano-node defaults) |
 | `mithril.enabled` | `true` | Run Mithril import on first start |
 | `mithril.includeAncillary` | `true` | Download Haskell ledger state (~15 min bootstrap) |
 | `ledger.replayLimit` | `null` | Max blocks to replay (`null` = unlimited) |
@@ -385,6 +471,9 @@ grpcurl -plaintext localhost:50051 list
 | `experimentalHardForksEnabled` | `false` | Signal PV 11 0 in forged headers |
 | `persistence.enabled` | `true` | Enable persistent storage |
 | `persistence.size` | `100Gi` | Volume size |
+| `persistence.storageClass` | `""` | Blank = cluster default |
+| `persistence.accessMode` | `ReadWriteOnce` | |
+| `persistence.existingClaim` | `""` | Use an existing PVC instead of creating one |
 | `metrics.enabled` | `true` | Enable Prometheus metrics |
 | `metrics.port` | `12796` | Metrics port (avoids cardano-node's 12798) |
 | `metrics.compat` | `false` | Emit `cardano_node_metrics_*` aliases |
@@ -393,7 +482,16 @@ grpcurl -plaintext localhost:50051 list
 | `rpc.port` | `50051` | RPC port |
 | `rpc.service` | `false` | Expose RPC on the cluster Service |
 | `logging.format` | `text` | `text` or `json` |
+| `logging.minSeverity` | `Info` | `Debug` … `Critical` |
+| `logging.rustLog` | `info` | `EnvFilter` directive |
 | `producer.existingSecret` | `""` | Secret with `kes.skey` / `vrf.skey` / `node.cert` |
+| `producer.kesKey` / `vrfKey` / `operationalCertificate` | `""` | Inline key material (chart creates the Secret). Prefer `existingSecret`. |
+| `networkPolicy.enabled` | `true` | Create the producer NetworkPolicy (`role=producer` only) |
+| `peerGovernor.churnIntervalNormalSecs` | `3300` | Churn interval in steady state |
+| `peerGovernor.churnIntervalSyncSecs` | `900` | Churn interval while syncing |
+| `service.type` | `ClusterIP` | |
+| `serviceAccount.create` | `true` | |
 | `resources.requests.cpu` | `1` | CPU request |
 | `resources.requests.memory` | `3Gi` | Memory request |
+| `resources.limits.cpu` | `4` | CPU limit |
 | `resources.limits.memory` | `16Gi` | Memory limit |

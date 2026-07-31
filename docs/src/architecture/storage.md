@@ -34,6 +34,50 @@ Properties:
 - **Secondary indexes** — slot-to-offset and hash-to-slot mappings for efficient lookups
 - **Memory-mapped block index** — on-disk open-addressing hash table (`hash_index.dat`) provides 3-5x faster lookups than in-memory HashMap while using near-zero RSS
 
+### Crash Recovery & Integrity
+
+A 2026-07-28 preprod incident (a hard stop that lost the active chunk's secondary index and
+wedged sync for every peer) drove a durability hardening pass across the ImmutableDB, shipped in
+v2.4.0 (#926-#929):
+
+- **Per-append secondary-index writes** — each block's secondary-index entry is written to disk
+  as it is appended (`active.secondary_file.write_all(...)` per block), not buffered in memory
+  until a clean shutdown. Previously a hard stop lost every index entry written since the node
+  started, even though the block data itself was already durable.
+- **Open-time reconciliation in both open paths** — `ImmutableDB::open()` (read-only) and
+  `open_for_writing()` both run `reconcile_chunks_on_disk()` before any other file is touched.
+  Older versions only validated on the read-only path, so the node's own write-mode startup never
+  checked for damage.
+- **Tail-chunk CRC verification and truncation** — every block in the highest-numbered
+  ("tail") chunk is CRC32-verified; a chunk's true recoverable end is recovered by scanning for
+  the last CRC-matching `0x82`-envelope boundary, and the file is truncated to that verified
+  prefix. Damage strictly below the tail is refused with a hard `InconsistentChunk` error rather
+  than silently repaired.
+- **`.chunk.orphaned` quarantine** — a non-empty tail chunk with no matching secondary index is
+  renamed to `<num>.chunk.orphaned` and excluded from the chain, preserved on disk for manual
+  inspection instead of being silently skipped or overwritten.
+- **Cross-chunk boundary linkage** — adjacent chunks are checked so the first block of a chunk
+  correctly chains onto the previous chunk's tip (`prev_hash`), the dugite equivalent of
+  Haskell's `ChunkFileDoesntFit`. Per-chunk CRC checks alone are not sufficient to catch this — an
+  internally-valid orphan island can still pass every per-chunk check while being disconnected
+  from the canonical chain.
+- **`tip.meta` clamping** — the cached tip metadata is only trusted when it matches the last
+  indexed entry's `(slot, hash)`; otherwise it is clamped to the true indexed tip (recovering the
+  correct block number by decoding the tip block) and rewritten.
+- **`immutable/clean` marker** — a zero-byte `clean` marker file is written by the shutdown flush
+  and removed the moment the DB re-enters write mode. Its presence gates whether the
+  memory-mapped `hash_index.dat` can be reused as-is; its absence (an unclean stop) forces a
+  rebuild, since mmap pages may have reached disk in an order that leaves stale offsets behind.
+- **Exclusive directory lock** — `ChainDB::open` takes an advisory `flock(2)` on `<database-path>/lock`
+  before touching any other file (the dugite equivalent of Haskell's `withLockDB`). A second
+  process opening the same `--database-path` fails fast, naming the holder's pid, instead of both
+  processes silently interleaving writes into the same chunk files.
+
+**Operational consequence:** always stop dugite-node with `SIGTERM`, never `SIGKILL`. A graceful
+stop runs the shutdown flush (writes the `clean` marker, fsyncs the tail chunk's index); a killed
+process leaves `clean` absent and relies entirely on the open-time reconciliation above to recover
+— safe, but strictly more expensive and unnecessary to trigger routinely.
+
 ### VolatileDB (In-Memory HashMap)
 
 The VolatileDB stores recent blocks (the last k=2160 blocks) in an in-memory `HashMap`. This enables:
@@ -51,6 +95,12 @@ ChainDB is the unified interface for block storage. It coordinates the Immutable
 1. New blocks arrive from peers and are added to the **VolatileDB**
 2. Once a block is more than **k** slots deep (k=2160 for mainnet), it is flushed from the VolatileDB to the **ImmutableDB**
 3. Flushed blocks are removed from the VolatileDB
+
+The ChainDB write for a new block always happens **before** that block is applied to the ledger
+state — never the reverse. If the node crashes between the two steps, the block is durably stored
+but not yet reflected in the ledger, so recovery simply re-applies it; the opposite ordering could
+leave the ledger ahead of durable storage with no way to recover the block that produced that
+state.
 
 When querying for a block:
 1. The VolatileDB is checked first (fast, in-memory)
@@ -128,9 +178,15 @@ When the node restarts:
 
 ```
 database-path/
-  immutable/          # Append-only block chunk files
-    chunks/           # Block data files
-    index/            # Secondary indexes (slot, hash)
+  lock                # Advisory flock held for the ChainDB's lifetime (#929)
+  immutable/          # ImmutableDB — chunk and index files live flat, not nested
+    00000.chunk       # Block data, one file per chunk
+    00000.secondary   # Per-chunk secondary index (slot/hash -> offset), written per block append
+    00001.chunk
+    00001.secondary
+    ...
+    tip.meta          # Cached (slot, hash, block_no) tip — clamped to the indexed chain if stale
+    clean             # Zero-byte marker written on graceful shutdown; absent after a hard stop
     hash_index.dat    # Mmap block index (open-addressing hash table)
   utxo-store/         # dugite-lsm database (UTxO set)
     active/           # Current SSTables

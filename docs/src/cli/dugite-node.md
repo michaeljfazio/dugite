@@ -1,6 +1,16 @@
 # dugite-node Reference
 
-`dugite-node` is the main Dugite node binary. It supports two subcommands: `run` (start the node) and `mithril-import` (import a Mithril snapshot for fast initial sync).
+`dugite-node` is the main Dugite node binary. The two subcommands used in
+day-to-day operation are `run` (start the node) and `mithril-import` (import
+a Mithril snapshot for fast initial sync), documented below.
+
+The binary also ships several operator/debug subcommands not covered in
+detail here: `db info` (database size and block count), `dump-snapshot`
+(replay the chain and dump ledger state at epoch boundaries, for
+cross-validation), `verify-ledger-snapshot` (byte-exact comparison of two
+ledger snapshots), and `snapshot-convert` (convert a ledger snapshot between
+the in-memory and LSM UTxO backends without a chain replay). Run
+`dugite-node <subcommand> --help` for their flags.
 
 ## run
 
@@ -20,17 +30,30 @@ dugite-node run [OPTIONS]
 | `--socket-path` | `node.sock` | Unix domain socket path for N2C (local client) connections |
 | `--port` | `3001` | TCP port for N2N (node-to-node) connections |
 | `--host-addr` | `0.0.0.0` | Host address to bind to |
-| `--metrics-port` | `12798` | Prometheus metrics port (set to `0` to disable) |
-| `--consensus-mode` | `praos` | Consensus mode: `praos` (default) or `genesis` (Ouroboros Genesis with GSM) |
+| `--metrics-port` | | Prometheus metrics port. If omitted, the config file's `MetricsPort` is used; if neither is set, defaults to `12798` |
+| `--no-metrics` | `false` | Disable the Prometheus metrics server entirely. Equivalent to `--metrics-port 0` |
+| `--require-metrics` | `false` | Make a metrics bind failure a fatal startup error (default: node continues if the port can't be bound) |
+| `--rpc-host` | | UTxO RPC (gRPC) server bind address. Overrides `Rpc.ListenAddr` from the config file. Defaults to `127.0.0.1` when the server is enabled |
+| `--rpc-port` | | UTxO RPC (gRPC) server port. Overrides `Rpc.Port`; setting this implies enabling the RPC server. Defaults to `50051` when set via config |
+| `--no-rpc` | `false` | Disable the UTxO RPC (gRPC) server entirely, overriding `--rpc-host`/`--rpc-port`/`Rpc.Enabled` |
+| `--compat-metrics` | `false` | Also emit `cardano_node_metrics_*` compatibility aliases alongside the native `dugite_*` metrics, for reuse of existing cardano-node Grafana dashboards |
+| `--liveness-threshold-secs` | `600` | Liveness threshold (seconds) for the `/live` HTTP endpoint; `0` disables it (always 200) |
+| `--consensus-mode` | | Consensus mode override: `praos` or `genesis` (Ouroboros Genesis with GSM). When omitted, read from the config file's `ConsensusMode` field (default `PraosMode`) |
+| `--validate-all-blocks` | `false` | Force full Phase-2 Plutus validation on all blocks, even during initial sync (normally only blocks at tip are fully validated) |
+| `--skip-eagerly-validated-header-crypto` | `false` | Skip apply-time header re-validation for headers that already passed eager per-peer validation. Off by default; see the flag's doc comment before enabling in production |
+| `--dijkstra-genesis` | | Path to the Dijkstra-era genesis JSON file, overriding the config file's `DijkstraGenesisFile` (parsed but not yet applied to runtime protocol parameters) |
 | `--shelley-kes-key` | | Path to the KES signing key (enables block production) |
 | `--shelley-vrf-key` | | Path to the VRF signing key (enables block production) |
 | `--shelley-operational-certificate` | | Path to the operational certificate (enables block production) |
+| `--shelley-cold-key` | | Path to the cold signing key file, used for pool ID derivation |
 | `--log-output` | `stdout` | Log output target: `stdout`, `file`, or `journald`. Can be specified multiple times. |
 | `--log-format` | `text` | Log format: `text` (human-readable) or `json` (structured). |
 | `--log-level` | `info` | Log level (`trace`, `debug`, `info`, `warn`, `error`). Overridden by `RUST_LOG`. |
 | `--log-dir` | `logs` | Directory for log files (used with `--log-output file`) |
 | `--log-file-rotation` | `daily` | Log file rotation strategy: `daily`, `hourly`, or `never` |
 | `--log-no-color` | `false` | Disable ANSI colors in stdout output |
+| `--log-retention-days` | `7` | Number of days to retain log files |
+| `--stdout-overflow` | `drop` | Channel-full policy for the non-blocking stdout writer: `drop` (keep going, count dropped lines) or `block` (lossless, but re-introduces blocking on the hot path) |
 | `--mempool-max-tx` | `16384` | Maximum number of transactions in the mempool |
 | `--mempool-max-bytes` | `536870912` | Maximum mempool size in bytes (default 512 MB) |
 | `--snapshot-max-retained` | `2` | Maximum number of ledger snapshots to retain on disk |
@@ -123,12 +146,18 @@ dugite-node mithril-import [OPTIONS]
 | `--network-magic` | `764824073` | Network magic value |
 | `--database-path` | `db` | Path to the database directory |
 | `--temp-dir` | | Temporary directory for download and extraction (uses system temp if omitted) |
+| `--mithril-genesis-vkey` | | Override the Mithril genesis verification key (JSON hex-encoded Ed25519 verification key string), for private networks |
+| `--skip-certificate-verification` | `false` | Skip Mithril STM certificate chain verification (UNSAFE — testing only) |
+| `--allow-stale-pparams` | `false` | Continue the import even if the ancillary archive can't be downloaded, falling back to genesis-default protocol parameters at the imported tip. Not recommended for production |
+| `--include-ancillary` / `--no-include-ancillary` | `true` | Download and import the Mithril ancillary archive (Haskell ledger state at the immutable tip), dropping bootstrap time from multi-hour to ~15 minutes. `--no-include-ancillary` restores the pre-ancillary behavior of deriving ledger state entirely from chunk-by-chunk block replay — see [Mithril Ancillary](../running/mithril-ancillary.md) |
 | `--log-output` | `stdout` | Log output target: `stdout`, `file`, or `journald`. Can be specified multiple times. |
 | `--log-format` | `text` | Log format: `text` (human-readable) or `json` (structured). |
 | `--log-level` | `info` | Log level (`trace`, `debug`, `info`, `warn`, `error`). Overridden by `RUST_LOG`. |
 | `--log-dir` | `logs` | Directory for log files (used with `--log-output file`) |
 | `--log-file-rotation` | `daily` | Log file rotation strategy: `daily`, `hourly`, or `never` |
 | `--log-no-color` | `false` | Disable ANSI colors in stdout output |
+| `--log-retention-days` | `7` | Number of days to retain log files |
+| `--stdout-overflow` | `drop` | Channel-full policy for the non-blocking stdout writer: `drop` or `block` |
 
 ### Network Magic Values
 

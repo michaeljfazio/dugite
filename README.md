@@ -27,7 +27,24 @@ Built by [Sandstone Pool](https://www.sandstone.io/)
 
 For project status, capability matrix, and known issues see the [Developer Wiki](https://github.com/michaeljfazio/dugite/wiki).
 
+## What you get
+
+Four binaries, built from one workspace:
+
+| Binary | What it is |
+|--------|------------|
+| `dugite-node` | The node — sync, ledger, mempool, forging, Mithril import, Prometheus metrics, optional UTxO RPC (gRPC) server |
+| `dugite-cli` | cardano-cli compatible CLI: 11 command groups, era-prefix aliases |
+| `dugite-monitor` | Terminal monitoring dashboard |
+| `dugite-config` | Interactive TUI config editor |
+
+Download them from [Releases](https://github.com/michaeljfazio/dugite/releases), or build from source below.
+
 ## Quick Start
+
+Prerequisites: the latest stable [Rust](https://rustup.rs/) toolchain and `protoc`
+(`apt install protobuf-compiler libprotobuf-dev` / `brew install protobuf`) — the
+UTxO RPC crate generates its gRPC stubs at build time.
 
 Dugite ships a top-level [`justfile`](./justfile) — install [just](https://github.com/casey/just) and the most common workflows become one-liners. `just --list` shows everything.
 
@@ -39,6 +56,8 @@ just check
 just mithril-import preview
 just run-relay preview
 ```
+
+`mithril-import`, `run-relay`, and `run-bp` each take `mainnet`, `preview`, or `preprod`.
 
 Without `just`, the same steps map directly to the underlying scripts and `cargo` commands:
 
@@ -56,15 +75,17 @@ cargo build --release
 
 For installation, configuration, networks, monitoring, block-producer setup, and the full CLI reference, see the [documentation](https://michaeljfazio.github.io/dugite/).
 
-| Network | Magic |
-|---------|-------|
-| Mainnet | `764824073` |
-| Preview | `2` |
-| Preprod | `1` |
+| Network | Magic | Config |
+|---------|-------|--------|
+| Mainnet | `764824073` | `config/mainnet/` |
+| Preview | `2` | `config/preview/` |
+| Preprod | `1` | `config/preprod/` |
+
+Each config directory is self-contained: `config.json`, `topology.json`, and the Byron, Shelley, Alonzo, and Conway genesis files.
 
 ## Architecture
 
-Dugite is a 15-crate Cargo workspace with an in-house multi-era CBOR decoder and UPLC CEK machine for full Cardano wire-format compatibility. Four binaries: `dugite-node` (the node), `dugite-cli` (cardano-cli compatible), `dugite-monitor` and `dugite-config` (TUIs).
+Dugite is a 16-crate Cargo workspace (plus `xtask` and two test-suite crates under `tests/`) with an in-house multi-era CBOR decoder and UPLC CEK machine for full Cardano wire-format compatibility.
 
 ```mermaid
 graph TD
@@ -73,49 +94,65 @@ graph TD
     NODE --> LEDGER[dugite-ledger]
     NODE --> STORE[dugite-storage]
     NODE --> POOL[dugite-mempool]
+    NODE --> RPC[dugite-rpc]
+    NODE --> UPLC[dugite-uplc]
     CLI[dugite-cli] --> NET
+    CLI --> CONS
     CLI --> PRIM[dugite-primitives]
     CLI --> CRYPTO[dugite-crypto]
     CLI --> SER[dugite-serialization]
-    MON[dugite-monitor] --> PRIM
-    CFG[dugite-config] --> PRIM
+    RPC --> POOL
+    RPC --> SER
+    RPC --> PRIM
+    NET --> CONS
     NET --> PRIM
     NET --> CRYPTO
     NET --> SER
-    NET --> POOL
     CONS --> PRIM
     CONS --> CRYPTO
+    CONS --> SER
+    POOL --> LEDGER
+    POOL --> CRYPTO
+    POOL --> PRIM
     LEDGER --> PRIM
     LEDGER --> CRYPTO
     LEDGER --> SER
     LEDGER --> LSM[dugite-lsm]
-    LEDGER --> UPLC[dugite-uplc]
+    LEDGER --> UPLC
+    STORE --> CONS
+    STORE --> CRYPTO
     STORE --> PRIM
     STORE --> SER
-    POOL --> PRIM
+    UPLC --> SER
+    UPLC --> PRIM
     SER --> PRIM
     CRYPTO --> PRIM
 ```
+
+`dugite-monitor` and `dugite-config` are standalone TUIs and take no workspace
+dependencies at build time.
 
 See [Architecture Overview](https://michaeljfazio.github.io/dugite/architecture/overview.html) for the per-crate breakdown, and [Architecture Decision Records](https://github.com/michaeljfazio/dugite/wiki/Architecture-Decision-Records) for design rationale.
 
 ## Development
 
 ```bash
-# Run all tests (parallel via nextest, matches CI)
-cargo nextest run --workspace
-
-# Doc tests
-cargo test --doc
-
-# Lint
-cargo clippy --all-targets -- -D warnings
-
-# Format check
-cargo fmt --all -- --check
+just check       # full CI gate: fmt-check + clippy + build + test + test-doc
+just test        # cargo nextest run --workspace
+just test-doc    # cargo test --doc
+just clippy      # cargo clippy --all-targets -- -D warnings
+just fmt-check   # cargo fmt --all -- --check   (apply with: just fmt)
 ```
 
-Zero-warning policy is enforced: all code must compile cleanly with clippy and pass formatting checks. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow, and [Getting Started for Developers](https://github.com/michaeljfazio/dugite/wiki/Getting-Started-for-Developers) on the wiki.
+Zero-warning policy is enforced: all code must compile cleanly with clippy and pass formatting checks.
+
+A three-node loopback devnet (dugite BP + relay against a cardano-node BP) backs
+release validation — `just devnet-validate-smoke` for the PR gate,
+`just devnet-validate-extended` for the release gate. Upstream wire-format and
+evaluation fidelity is checked against a pinned corpus with
+`just download-upstream-fixtures && just test-conformance`.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow, and [Getting Started for Developers](https://github.com/michaeljfazio/dugite/wiki/Getting-Started-for-Developers) on the wiki.
 
 Benchmark instructions and tracked baselines: [Benchmarks](https://michaeljfazio.github.io/dugite/reference/benchmarks.html).
 

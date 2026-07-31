@@ -195,8 +195,15 @@ dugite-cli governance action create-protocol-parameters-update \
   --deposit 100000000000 \
   --return-addr "addr_test1qz..." \
   --protocol-parameters-update pp-changes.json \
+  --prev-governance-action-tx-id "d4e5f6a7..." \
+  --prev-governance-action-index 0 \
+  --constitution-script-hash "b8c9d0e1..." \
   --out-file pp-update.json
 ```
+
+`--prev-governance-action-tx-id`/`--prev-governance-action-index` (the
+enacted-action chain pointer) and `--constitution-script-hash` (the optional
+guardrail script hash) may be omitted.
 
 The `pp-changes.json` file contains the parameter fields to change:
 

@@ -1,6 +1,6 @@
 # Ledger
 
-Dugite's ledger layer (`dugite-ledger`) implements full Cardano transaction validation, UTxO management, stake distribution, reward calculation, and Conway-era governance. It closely follows the Haskell cardano-ledger STS (State Transition System) rules.
+Dugite's ledger layer (`dugite-ledger`) implements full Cardano transaction validation, UTxO management, stake distribution, reward calculation, and Conway-era governance, with early support for the in-progress Dijkstra era. It closely follows the Haskell cardano-ledger STS (State Transition System) rules.
 
 ## Ledger State
 
@@ -67,7 +67,24 @@ Phase-1 validation checks structural rules without executing scripts:
 5. **Witness verification** — Ed25519 signatures match required signers from inputs, withdrawals, and certificates
 6. **Multi-asset rules** — No negative quantities, minting requires policy witness
 7. **Reference inputs** — All reference inputs exist (not consumed, only read)
-8. **Output minimum** — Each output meets the minimum lovelace requirement
+8. **Output minimum** — Each output meets the minimum lovelace requirement, computed by
+   `ProtocolParameters::min_coin_for_output()`, which dispatches by the era's protocol version
+   rather than applying one formula everywhere (Haskell's `getMinCoinTxOut` is likewise defined
+   per era):
+   - **PV 0-3 (Shelley, Allegra)** — flat `minUTxOValue` protocol parameter, independent of the
+     output's contents
+   - **PV 4 (Mary)** — ada-only outputs use the same flat `minUTxOValue`; multi-asset outputs use
+     Mary's `scaledMinDeposit`, scaling `minUTxOValue / 27` by `(27 + value_size)`
+   - **PV 5-6 (Alonzo)** — `utxoEntrySize * coinsPerUTxOWord`, where `utxoEntrySize` is
+     `27 + mary_value_size + (10 if a datum hash is present else 0)`
+   - **PV >= 7 (Babbage, Conway, Dijkstra)** — the serialized-output-size formula,
+     `(160 + size) * coinsPerUTxOByte`, using the output's actual encoded byte size (from the
+     original wire CBOR when available, or dugite's own re-encoding otherwise)
+
+   This per-era split matters in practice: `ada_per_utxo_byte` is seeded from the Alonzo genesis
+   file at node startup regardless of which era the chain is currently in, so applying the
+   Babbage/Conway formula unconditionally would falsely reject real Shelley/Allegra/Mary mainnet
+   transactions with small outputs.
 9. **Transaction size** — Does not exceed max transaction size
 10. **Network ID** — Matches the expected network
 

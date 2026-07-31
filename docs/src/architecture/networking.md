@@ -176,7 +176,7 @@ All BlockQuery messages are wrapped in the Hard Fork Combinator (HFC) envelope. 
 | 35 | QueryStakePoolDefaultVote | Default vote per pool derived from its DRep delegation (AlwaysAbstain, AlwaysNoConfidence, or specific DRep vote) |
 | 36 | GetPoolDistr2 | Extended pool distribution including `total_active_stake` alongside per-pool entries |
 | 37 | GetStakeDistribution2 | Extended stake distribution including `total_active_stake` |
-| 38 | GetMaxMajorProtocolVersion | Maximum supported major protocol version (returns 10) |
+| 38 | GetMaxMajorProtocolVersion | Maximum supported major protocol version — sourced from the loaded network's protocol-version config, not hardcoded (currently 10 on mainnet, 11 on preview) |
 
 #### Cross-Era Queries
 
@@ -244,9 +244,13 @@ The PeerSharing protocol filters out non-routable addresses (RFC1918, CGNAT, loo
 
 ## Peer Manager
 
-The peer manager classifies peers into three temperature categories following the cardano-node model:
+The peer manager (`crates/dugite-network/src/peer/manager.rs`) classifies peers into four
+temperature states, mirroring Haskell's `PeerStatus` (`Cold < Cooling < Warm < Hot`):
 
-- **Cold** — Known but not connected
+- **Cold** — Known but not connected; candidate for promotion
+- **Cooling** — Cold in effect but the connection still lingers (the governor's analogue of the
+  connection manager's `TerminatingState` — dugite's version of TCP `TIME_WAIT`). Not eligible
+  for re-promotion until it transitions to `Cold`.
 - **Warm** — TCP connected, keepalive running, but not actively syncing
 - **Hot** — Fully active with ChainSync, BlockFetch, and TxSubmission2
 
@@ -256,13 +260,12 @@ The peer manager classifies peers into three temperature categories following th
 stateDiagram-v2
     [*] --> Cold: Discovered
     Cold --> Warm: TCP connect + handshake
-    Warm --> Hot: Mini-protocols activated (5s dwell)
+    Warm --> Hot: Mini-protocols activated
     Hot --> Warm: Demotion (poor performance / churn)
     Warm --> Cold: Disconnection / backoff
-    Cold --> [*]: Evicted (max failures)
+    Hot --> Cooling: Forceful disconnect
+    Cooling --> Cold: Cooldown elapsed
 ```
-
-Warm peers must dwell for at least 5 seconds before promotion to Hot, preventing rapid cycling.
 
 ### Peer Sources
 
@@ -288,14 +291,16 @@ Where:
 - **Latency score** — `1 / (1 + ms/200)`, based on EWMA latency (smoothing α=0.3)
 - **Failure score** — `max(1.0 - failures×0.1, 0.0)`, failure counts decay (halve every 5 minutes)
 
-Subnet diversity is enforced: peers from the same /24 (IPv4) or /48 (IPv6) subnet receive a selection penalty.
+Separately from this connection-quality score, `PeerManager` also tracks a per-peer EWMA
+**fetch bandwidth** ("GSV"/"fetchyness", bytes/sec from completed BlockFetch ranges). This is
+what the single-fetcher BlockFetch worker uses to pick the fastest peer during bulk sync — see
+[Sync Pipeline](./sync-pipeline.md).
 
 ### Failure Handling
 
 - **Exponential backoff** on connection failures: 5s → 10s → 20s → 40s → 80s → 160s (capped), with ±2s random fuzz
 - **Max cold failures**: 5 consecutive failures before a peer is evicted from the peer table
 - **Failure decay**: Failure counts halve every 5 minutes, allowing peers to recover reputation over time
-- **Circuit breaker**: Closed → Open → HalfOpen with exponential cooldown
 
 ### Inbound Connections
 
@@ -305,7 +310,7 @@ Subnet diversity is enforced: peers from the same /24 (IPv4) or /48 (IPv6) subne
 
 ## P2P Governor
 
-The governor runs as a tokio task on a 30-second interval, continuously evaluating peer counts against configured targets and emitting promotion/demotion/connect/disconnect actions.
+The governor runs as a tokio task on a 2-second interval, continuously evaluating peer counts against configured targets and emitting promotion/demotion/connect/disconnect actions. (Churn — periodic rotation of otherwise-healthy peers — runs on its own, much longer cadence; see below.)
 
 ### Target Counts
 
@@ -313,12 +318,16 @@ The governor maintains six independent target counts (matching cardano-node defa
 
 | Target | Default | Description |
 |--------|---------|-------------|
-| `TargetNumberOfKnownPeers` | 85 | Total peers in the peer table (cold + warm + hot) |
-| `TargetNumberOfEstablishedPeers` | 40 (30 on preview) | Warm + hot peers (TCP connected) |
-| `TargetNumberOfActivePeers` | 15 | Hot peers (fully syncing) |
+| `TargetNumberOfKnownPeers` | 150 | Total peers in the peer table (cold + warm + hot) |
+| `TargetNumberOfEstablishedPeers` | 30 | Warm + hot peers (TCP connected) |
+| `TargetNumberOfActivePeers` | 20 | Hot peers (fully syncing) |
 | `TargetNumberOfKnownBigLedgerPeers` | 15 | Known big ledger peers |
 | `TargetNumberOfEstablishedBigLedgerPeers` | 10 | Established big ledger peers |
 | `TargetNumberOfActiveBigLedgerPeers` | 5 | Active big ledger peers |
+
+During Genesis-mode sync (`PreSyncing`/`Syncing`), a separate, smaller set of `sync_target_*`
+values applies instead (active=5, established=10, known=150), concentrating the peer set on
+big-ledger peers until the node catches up.
 
 When any target is not met, the governor promotes peers to fill the deficit. When any target is exceeded, the governor demotes the lowest-scoring surplus peers. Local root peers are never demoted.
 
@@ -331,9 +340,13 @@ The governor adjusts behaviour based on sync state:
 ### Churn
 
 The governor periodically rotates a subset of peers to discover better alternatives:
-- Configurable churn interval (default: 20% target reduction cycle)
+- **Normal (caught-up) cadence**: every 3300s (55 minutes), matching cardano-node's `ChurnIntervalNormalSecs`
+- **Bulk-sync cadence**: every 900s (15 minutes) while behind tip, matching `ChurnIntervalSyncSecs` — more aggressive so peers with poor block-fetch performance are shed faster
+- Both cadences are reloadable at runtime via `SIGHUP`
 - Local root peers are exempt from churn
 - Churn ensures the node explores the peer landscape rather than settling on suboptimal connections
+
+See [P2P Governor](./p2p-governor.md) for the full peer-manager and governor implementation details.
 
 ### Prometheus Metrics
 
@@ -341,7 +354,6 @@ The P2P subsystem exports the following metrics:
 
 | Metric | Description |
 |--------|-------------|
-| `dugite_p2p_enabled` | Whether P2P governance is active (gauge: 0 or 1) |
 | `dugite_diffusion_mode` | Current diffusion mode (0=InitiatorOnly, 1=InitiatorAndResponder) |
 | `dugite_peer_sharing_enabled` | Whether peer sharing is active (gauge: 0 or 1) |
 | `dugite_peers_cold` | Number of cold (known, unconnected) peers |
@@ -378,7 +390,11 @@ Dugite implements full relay node behavior, propagating blocks received from ups
 
 ### Broadcast Architecture
 
-Block propagation uses a `tokio::sync::broadcast` channel with a capacity of 64 announcements. The architecture has three components:
+Block propagation uses a `tokio::sync::broadcast` channel with a capacity of 512 announcements
+(raised from an original 64 to absorb burst fork events without triggering the receiver's lagged
+path, which would otherwise hand a downstream peer an incorrect rollback point). A parallel
+rollback-announcement channel has capacity 256 (raised from 16). The architecture has three
+components:
 
 1. **Sender** — The node core holds a `broadcast::Sender<BlockAnnouncement>` obtained from the N2N server at startup. When the sync pipeline processes new blocks or the forge module produces a new block, it sends an announcement containing the slot, block hash, and block number.
 2. **Receivers** — Each N2N server connection spawns with its own `broadcast::Receiver` subscription. The connection handler uses `tokio::select!` to concurrently service mini-protocol messages and listen for block announcements.

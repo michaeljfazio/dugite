@@ -163,7 +163,7 @@ sudo ufw enable
 
 ## Monitoring
 
-Dugite exposes Prometheus metrics on port 12798 by default. Key metrics to watch on a relay:
+Dugite exposes Prometheus metrics on the port pinned by your config's `MetricsPort` field — 12796 for preview, 12799 for preprod, 12800 for mainnet in the shipped configs. The built-in fallback when the field is absent is 12796. Key metrics to watch on a relay:
 
 | Metric | What it tells you |
 |--------|-------------------|
@@ -171,10 +171,13 @@ Dugite exposes Prometheus metrics on port 12798 by default. Key metrics to watch
 | `dugite_sync_progress_percent` | Sync progress (10000 = 100%). Must be at 100% for the BP to produce blocks |
 | `dugite_blocks_received_total` | Total blocks received from peers. Should increase steadily |
 | `dugite_slot_number` | Current slot. Compare against network tip to verify sync |
+| `dugite_tip_age_seconds` | Seconds since the tip slot time. Sustained growth means the relay is falling behind |
 
 ```bash
-curl -s http://localhost:12798/metrics | grep -E "peers_connected|sync_progress"
+curl -s http://localhost:12800/metrics | grep -E "peers_connected|sync_progress"
 ```
+
+Also worth wiring into your supervisor: `/ready` returns 503 until sync progress reaches 99.9%, and `/live` returns 503 when no block has been applied within `--liveness-threshold-secs` (default 600).
 
 See [Monitoring](./monitoring.md) for the full list of available metrics and Grafana dashboard setup.
 

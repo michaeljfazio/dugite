@@ -70,7 +70,7 @@ Issue an operational certificate:
 dugite-cli stake-pool issue-op-cert \
   --kes-verification-key-file kes.vkey \
   --cold-signing-key-file cold.skey \
-  --operational-certificate-counter-file opcert.counter \
+  --operational-certificate-issue-counter-file opcert.counter \
   --kes-period 400 \
   --out-file opcert.cert
 ```
@@ -79,9 +79,12 @@ dugite-cli stake-pool issue-op-cert \
 |------|----------|-------------|
 | `--kes-verification-key-file` | Yes | Path to the KES verification key |
 | `--cold-signing-key-file` | Yes | Path to the cold signing key |
-| `--operational-certificate-counter-file` | Yes | Path to the opcert issue counter |
+| `--operational-certificate-issue-counter-file` | Yes | Path to the opcert issue counter. Same spellings as `node issue-op-cert`: `--operational-certificate-issue-counter` and the legacy `--operational-certificate-counter-file` are accepted as aliases |
 | `--kes-period` | Yes | Current KES period |
 | `--out-file` | Yes | Output path for the operational certificate |
+
+This is the same underlying implementation as `node issue-op-cert` (see
+[Node Commands](node-commands.md)) — the two subcommands are interchangeable.
 
 ## registration-certificate
 
