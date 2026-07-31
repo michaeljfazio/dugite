@@ -346,10 +346,30 @@ pub(super) fn encode_witness_set_for_era(ws: &TransactionWitnessSet, era: Era) -
         count += 1;
     }
 
+    // Haskell `AlonzoTxWits` (reused by Conway) wraps witness-set keys
+    // 0/1/2/3/6/7 in CBOR tag 258 from PV9 on — keys 0 and 2 because `Set`'s own
+    // `encodeSet` emits it, keys 1/3/6/7 because they go through
+    // `encodeWithSetTag` (#939):
+    //
+    //   encodeWithSetTag xs =
+    //     ifEncodingVersionAtLeast (natVersion @9)
+    //       (encodeTag setTag <> encCBOR xs) (encCBOR xs)
+    //
+    // Key 4 (plutus_data) gets the tag inside `encode_datums`; key 5 (redeemers)
+    // is a map from PV9 on and never carries it.
+    //
+    // NOTE: Haskell iterates `Set` / `Map.elems`, i.e. Ord-sorted, whereas dugite
+    // preserves wire order here. That ordering difference is deliberately NOT
+    // addressed by this change — see #939.
+    let use_set_tag = matches!(era, Era::Conway | Era::Dijkstra);
+
     let mut buf = encode_map_header(count);
 
     if !ws.vkey_witnesses.is_empty() {
         buf.extend(encode_uint(0));
+        if use_set_tag {
+            buf.extend(encode_tag(258));
+        }
         buf.extend(encode_array_open(ws.vkey_witnesses.len()));
         for w in &ws.vkey_witnesses {
             buf.extend(encode_vkey_witness(w));
@@ -359,6 +379,9 @@ pub(super) fn encode_witness_set_for_era(ws: &TransactionWitnessSet, era: Era) -
 
     if !ws.native_scripts.is_empty() {
         buf.extend(encode_uint(1));
+        if use_set_tag {
+            buf.extend(encode_tag(258));
+        }
         buf.extend(encode_array_open(ws.native_scripts.len()));
         for s in &ws.native_scripts {
             buf.extend(encode_native_script(s));
@@ -368,6 +391,9 @@ pub(super) fn encode_witness_set_for_era(ws: &TransactionWitnessSet, era: Era) -
 
     if !ws.bootstrap_witnesses.is_empty() {
         buf.extend(encode_uint(2));
+        if use_set_tag {
+            buf.extend(encode_tag(258));
+        }
         buf.extend(encode_array_open(ws.bootstrap_witnesses.len()));
         for w in &ws.bootstrap_witnesses {
             buf.extend(encode_bootstrap_witness(w));
@@ -377,6 +403,9 @@ pub(super) fn encode_witness_set_for_era(ws: &TransactionWitnessSet, era: Era) -
 
     if !ws.plutus_v1_scripts.is_empty() {
         buf.extend(encode_uint(3));
+        if use_set_tag {
+            buf.extend(encode_tag(258));
+        }
         buf.extend(encode_array_open(ws.plutus_v1_scripts.len()));
         for s in &ws.plutus_v1_scripts {
             buf.extend(encode_bytes(s));
@@ -406,6 +435,9 @@ pub(super) fn encode_witness_set_for_era(ws: &TransactionWitnessSet, era: Era) -
 
     if !ws.plutus_v2_scripts.is_empty() {
         buf.extend(encode_uint(6));
+        if use_set_tag {
+            buf.extend(encode_tag(258));
+        }
         buf.extend(encode_array_open(ws.plutus_v2_scripts.len()));
         for s in &ws.plutus_v2_scripts {
             buf.extend(encode_bytes(s));
@@ -415,6 +447,9 @@ pub(super) fn encode_witness_set_for_era(ws: &TransactionWitnessSet, era: Era) -
 
     if !ws.plutus_v3_scripts.is_empty() {
         buf.extend(encode_uint(7));
+        if use_set_tag {
+            buf.extend(encode_tag(258));
+        }
         buf.extend(encode_array_open(ws.plutus_v3_scripts.len()));
         for s in &ws.plutus_v3_scripts {
             buf.extend(encode_bytes(s));
@@ -2986,6 +3021,79 @@ mod tests {
             r.skip().expect("skip value");
         }
         panic!("key {key} not found");
+    }
+
+    // ── #939: Conway witness-set keys 0/1/2/3/6/7 carry the 258 set tag ──
+
+    /// `encodeWithSetTag` is gated on `natVersion @9`, so Conway/Dijkstra emit
+    /// the tag and every earlier era must not.
+    #[test]
+    fn witness_set_collections_are_tag_258_from_conway_on() {
+        let ws = TransactionWitnessSet {
+            vkey_witnesses: vec![VKeyWitness {
+                vkey: vec![0xAA; 32],
+                signature: vec![0xBB; 64],
+            }],
+            native_scripts: vec![NativeScript::ScriptPubkey(Hash32::ZERO)],
+            plutus_v1_scripts: vec![vec![0x01, 0x02]],
+            plutus_v2_scripts: vec![vec![0x03, 0x04]],
+            plutus_v3_scripts: vec![vec![0x05, 0x06]],
+            ..empty_witness_set()
+        };
+
+        for era in [Era::Conway, Era::Dijkstra] {
+            let enc = encode_witness_set_for_era(&ws, era);
+            for key in [0u8, 1, 3, 6, 7] {
+                let pos = find_key_value_start(&enc, key);
+                assert_eq!(
+                    &enc[pos..pos + 3],
+                    &[0xd9, 0x01, 0x02],
+                    "{era:?} witness key {key} must carry tag 258"
+                );
+            }
+        }
+
+        for era in [
+            Era::Shelley,
+            Era::Allegra,
+            Era::Mary,
+            Era::Alonzo,
+            Era::Babbage,
+        ] {
+            let enc = encode_witness_set_for_era(&ws, era);
+            for key in [0u8, 1, 3, 6, 7] {
+                let pos = find_key_value_start(&enc, key);
+                assert_ne!(
+                    &enc[pos..pos + 3],
+                    &[0xd9, 0x01, 0x02],
+                    "{era:?} predates PV9 and must NOT carry tag 258 on key {key}"
+                );
+            }
+        }
+    }
+
+    /// The tag must survive a decode/re-encode cycle rather than being dropped.
+    #[test]
+    fn tagged_witness_set_round_trips() {
+        let ws = TransactionWitnessSet {
+            vkey_witnesses: vec![VKeyWitness {
+                vkey: vec![0xAA; 32],
+                signature: vec![0xBB; 64],
+            }],
+            ..empty_witness_set()
+        };
+        let enc = encode_witness_set_for_era(&ws, Era::Conway);
+        let decoded = crate::decode::era_conway::decode_conway_witness_set(
+            &mut crate::decode::reader::Reader::new(&enc),
+            Era::Conway,
+        )
+        .expect("tagged witness set must decode");
+        assert_eq!(decoded.vkey_witnesses.len(), 1);
+        assert_eq!(
+            encode_witness_set_for_era(&decoded, Era::Conway),
+            enc,
+            "re-encode must be byte-identical"
+        );
     }
 
     // ── #936: Dijkstra sub_transactions is an OMap == a bare ARRAY of values ──
