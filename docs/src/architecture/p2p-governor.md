@@ -9,62 +9,64 @@ Ouroboros P2P peer selection governor.
 
 Two modules implement peer management in `dugite-network`:
 
-### PeerManager (`peer_manager.rs`)
+### PeerManager (`manager.rs`)
 
-The data layer. Tracks every known peer in a flat `HashMap<SocketAddr, PeerInfo>`
-together with three `HashSet`s for the cold/warm/hot buckets.
+The data layer. Tracks every known peer in a `HashMap<SocketAddr, PeerInfo>` keyed by socket
+address, with `PeerInfo.state` holding each peer's temperature.
 
 | Feature | Description |
 |---|---|
-| Cold / Warm / Hot temperature tracking | Three-tier peer classification matching Ouroboros |
-| `PeerCategory` | LocalRoot, PublicRoot, BigLedgerPeer, LedgerPeer, Shared, Bootstrap |
-| `ConnectionDirection` | Inbound / Outbound tracking |
-| `PeerSource` | Config, PeerSharing, Ledger |
-| `PeerPerformance` | EWMA handshake RTT + block fetch latency |
-| Reputation scoring | Composite of latency + volume + reliability + recency |
-| Circuit breaker | Closed / Open / HalfOpen with exponential cooldown |
-| Subnet diversity penalty | /24 IPv4, /48 IPv6 penalisation for peer selection |
-| Trustable-first ordering | Two-tier ordering for `peers_to_connect()` |
+| `PeerState` | `Cold < Cooling < Warm < Hot`, mirroring Haskell's `PeerStatus` — `Cooling` is a lingering-connection state between Hot and Cold (dugite's TCP `TIME_WAIT` analogue), not a fourth independent bucket |
+| `PeerSource` | `Topology` (topology-file config), `Dns` (SRV/A/AAAA resolution), `Ledger` (SPO relays from `pool_params`), `PeerSharing` (gossip) |
+| Big-ledger-peer / local-root tracking | Tracked as separate `HashSet<SocketAddr>` / group lists passed into the governor, not as a per-peer category enum |
+| Fetch bandwidth ("GSV"/"fetchyness") | EWMA bytes/sec per peer from completed BlockFetch ranges, used to rank peers for the single bulk-sync fetch slot (see [Sync Pipeline](./sync-pipeline.md)) |
+| Reputation scoring | `0.4×reputation + 0.4×latency_score + 0.2×failure_score`; +0.01 per success, -0.1 per failure |
+| Exponential backoff | 5s → 10s → 20s → 40s → 80s → 160s (capped) ± 2s fuzz on connection failure |
 | Inbound connection limit | Configurable max inbound connections |
 | `DiffusionMode` | InitiatorOnly / InitiatorAndResponder |
 | Failure-count time decay | Halves every 5 minutes |
 
 ### Governor (`governor.rs`)
 
-The policy layer. Runs on a 30-second `tokio::interval` in `dugite-node`.
+The policy layer. Its decision function is called on a 2-second `tokio::interval` in
+`dugite-node`; churn timers (below) run on their own, much longer independent cadences checked on
+every tick.
 
 | Feature | Description |
 |---|---|
 | `PeerTargets` | root/known/established/active + BLP variants |
-| Sync-state-aware target switching | Adjusts targets for PreSyncing / Syncing / CaughtUp |
-| Hard/soft connection limits | `ConnectionDecision` for accept/reject |
+| Sync-state-aware target switching | A separate, smaller `sync_target_*` set applies during Genesis-mode PreSyncing/Syncing |
 | Big-ledger-peer promotion priority | BLPs promoted first during sync |
 | Active (hot) peer target enforcement | Promotes/demotes to meet active target |
 | Established (warm+hot) target enforcement | Maintains established peer count |
 | Surplus reduction | Demote/disconnect lowest reputation, local-root protected |
-| Churn mechanism | 20% target reduction cycle at configurable intervals |
-| Default targets | active=15, established=30, known=85 (matching cardano-node) |
+| Three independent churn timers | Hot churn (rotate one hot peer), cold churn (forget lowest-reputation cold peers once the pool exceeds 150% of `max_cold`), warm churn (quality-based rotation) |
+| Default targets | active=20, established=30, known=150 (matching cardano-node) |
 
 ---
 
 ## Wiring
 
-The governor runs as a standalone `tokio::spawn` task in `node/mod.rs`.
-Every 30 seconds it:
+The governor runs inline in the main `select!` loop in `node/mod.rs` — not as a separate spawned
+task. Every 2 seconds (`governor_ticker`) it:
 
-1. Acquires a read lock on `Arc<RwLock<PeerManager>>` and calls
-   `governor.evaluate()` and `governor.maybe_churn()`.
-2. Acquires a write lock and applies the resulting `GovernorEvent`s by calling
-   `promote_to_hot`, `demote_to_warm`, `peer_disconnected`, and
-   `recompute_reputations`.
-3. `GovernorEvent::Connect` is acknowledged but not executed here — outbound
-   connections originate from the main connection loop via `peers_to_connect()`.
+1. Acquires a read lock on `Arc<RwLock<PeerManager>>`, snapshots local-root groups, the
+   big-ledger-peer set, and the peer currently holding the BlockFetch fetch slot (so the governor
+   never demotes the peer actively downloading blocks), then calls
+   `governor.compute_actions_with_blp(...)`, which returns a `Vec<GovernorAction>`. Churn
+   decisions are folded into this same call — there is no separate churn step.
+2. `GovernorAction::PromoteToWarm(addr)` is dispatched via a background `tokio::spawn` (through
+   `lifecycle.spawn_connect(...)`) so a slow TCP connect never blocks the block-processing side of
+   the same `select!` loop.
+3. All other actions (`PromoteToHot`, `DemoteToWarm`, `DemoteToCold`, `ForgetPeer`,
+   `PeerShareRequest`, `DiscoverMore`) are fast, O(1) operations applied inline under a write lock
+   on the same tick.
 
 ---
 
 ## Peer Selection State Machine
 
-Peers progress through a formal state machine:
+Peers progress through a formal state machine (`PeerState`, mirroring Haskell's `PeerStatus`):
 
 ```mermaid
 stateDiagram-v2
@@ -73,8 +75,14 @@ stateDiagram-v2
     Warm --> Hot: Activate mini-protocols
     Hot --> Warm: Deactivate mini-protocols
     Warm --> Cold: Disconnect
-    Hot --> Cold: Forceful disconnect
+    Hot --> Cooling: Forceful disconnect
+    Cooling --> Cold: Cooldown elapsed
 ```
+
+`Cooling` sits between `Hot`/`Warm` and `Cold` — a peer whose connection is being torn down but
+hasn't fully released yet (the outbound-governor reflection of the connection manager's
+`TerminatingState`, dugite's analogue of TCP `TIME_WAIT`). It is not eligible for re-promotion
+until it reaches `Cold`.
 
 ---
 
@@ -84,9 +92,9 @@ The governor maintains six independent target counts:
 
 | Target | Default |
 |---|---|
-| Known peers | 85 |
+| Known peers | 150 |
 | Established peers | 30 |
-| Active peers | 15 |
+| Active peers | 20 |
 | Known big-ledger peers | 15 |
 | Established big-ledger peers | 10 |
 | Active big-ledger peers | 5 |
@@ -126,9 +134,10 @@ The governor maintains a separate target bucket for BLPs. When `SyncState` is
 
 ## Thread Safety
 
-The `PeerManager` is wrapped in `Arc<RwLock<PeerManager>>`. The governor task
-acquires a read lock for `evaluate()` and a write lock only for event
-application, keeping the write-lock window minimal.
+The `PeerManager` is wrapped in `Arc<RwLock<PeerManager>>`. Each governor tick acquires a read
+lock to snapshot peer state and compute `GovernorAction`s, then a separate write lock only to
+apply the fast, inline actions (background connects are dispatched as their own tasks and never
+hold the lock), keeping the write-lock window minimal.
 
 ---
 
@@ -136,7 +145,9 @@ application, keeping the write-lock window minimal.
 
 | File | Purpose |
 |---|---|
-| `crates/dugite-network/src/governor.rs` | Policy decisions and target enforcement |
-| `crates/dugite-network/src/peer_manager.rs` | Peer state tracking and reputation |
-| `crates/dugite-node/src/node/mod.rs` | Governor task wiring |
-| `crates/dugite-node/src/config.rs` | Topology parsing |
+| `crates/dugite-network/src/peer/governor.rs` | Policy decisions and target enforcement |
+| `crates/dugite-network/src/peer/manager.rs` | Peer state tracking and reputation |
+| `crates/dugite-network/src/peer/selection.rs` | Composite scoring formula |
+| `crates/dugite-network/src/peer/discovery.rs` | Peer discovery (topology, DNS, ledger, peer-sharing) |
+| `crates/dugite-node/src/node/mod.rs` | Governor tick wiring (inline in the main `select!` loop) |
+| `crates/dugite-node/src/config.rs` | Topology parsing, target defaults |

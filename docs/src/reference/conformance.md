@@ -30,27 +30,43 @@ Upstream sources are pinned by commit SHA (or tag) in `tests/conformance/upstrea
 
 This two-level pinning separates "what upstream version we test against" (`sources.toml`, only changes when we want to bump) from "what corpus the test run consumed" (`manifest.toml`, deterministic and cacheable).
 
+Fixtures land in `tests/conformance/upstream/fixtures/`, which is gitignored — nothing in the corpus is committed. To fetch a single area rather than all seven, use `just download-upstream-fixtures-area <AREA>` (equivalently `cargo xtask download-upstream-fixtures --area <AREA>`), where `<AREA>` is one of the seven area names listed below.
+
 ## Status
 
 | Area | Source | Coverage | Status |
 |---|---|---|---|
-| UPLC (Plutus) | IntersectMBO/plutus | 999 evaluation cases | 100% — skip list empty |
+| UPLC (Plutus) | IntersectMBO/plutus | 1003 evaluation cases | 100% — skip list empty |
 | ouroboros-consensus | IntersectMBO/ouroboros-consensus | Block / header golden files per era | passing |
 | cardano-ledger | IntersectMBO/cardano-ledger | Genesis JSON, CDDL schema, golden transactions | passing |
 | cardano-node | IntersectMBO/cardano-node | Genesis spec files | passing |
-| ledger-rules (ImpSpec) | IntersectMBO/cardano-ledger | CBOR NEWEPOCH + LEDGER vectors from ImpSpec | passing — `SKIP_LIST` empty |
+| ledger-rules (ImpSpec) | IntersectMBO/cardano-ledger | ~8100 CBOR STS-rule vectors from ImpSpec, across 11 rule families | passing — `SKIP_LIST` empty |
 | cardano-base | IntersectMBO/cardano-base | VRF v03 crypto test vectors | passing |
 | mithril | input-output-hk/mithril | Certificate fixture JSON | passing |
 
 ## Per-area detail
 
+`just test-conformance` is the whole suite: `test-conformance-uplc` (crate
+`dugite-uplc`, `--test conformance`) plus `test-conformance-upstream` (crate
+`dugite-conformance`, `--test upstream_tests`). The six single-area recipes
+below are nextest filters over the latter. Because they are filters, nextest
+reports the other areas as **skipped** — that is the filter working, not a
+coverage gap.
+
 ### UPLC (Plutus)
 
-**Source:** [IntersectMBO/plutus](https://github.com/IntersectMBO/plutus), pinned to tag `1.65.0.0` in `sources.toml`.
+**Source:** [IntersectMBO/plutus](https://github.com/IntersectMBO/plutus), pinned to tag `1.66.0.0` in `sources.toml`.
 
-**What's validated:** 999 evaluation test cases from `plutus-conformance/test-cases/uplc/evaluation/`. Each test case provides a UPLC program and the expected result (a term, a budget exhaustion, or a specific runtime error). The dugite-uplc CEK machine evaluates each program and the harness compares term-for-term, budget-for-budget against the expected output.
+**What's validated:** 1003 evaluation test cases from `plutus-conformance/test-cases/uplc/evaluation/`. Each test case provides a UPLC program and the expected result (a term, a budget exhaustion, or a specific runtime error). The dugite-uplc CEK machine evaluates each program and the harness compares term-for-term, budget-for-budget against the expected output.
 
-**Status:** 100% passing. The skip list is empty as of v1.7.0. The harness covers normalisation by evaluation (NbE) readback, per-builtin cost model wiring, CIP-122 bit ordering, BLS LE scalar handling with null augmentation, and BIP-340 `verify_raw` semantics (not the SHA-256-wrapped `verify`).
+**Status:** 100% passing. The skip list (`crates/dugite-uplc/tests/conformance_skip.txt`) has been empty since v1.7.0 — it currently contains only comments. The build script fails loudly if a skip entry names a directory that is not in the downloaded corpus, so a stale entry cannot silently hide a fix. The harness covers normalisation by evaluation (NbE) readback, per-builtin cost model wiring, CIP-122 bit ordering, BLS LE scalar handling with null augmentation, and BIP-340 `verify_raw` semantics (not the SHA-256-wrapped `verify`).
+
+> **This pin is version-coupled, not just a version bump.** The UPLC parser
+> (`syn::parser::parse_value_literal`) tracks the corpus's own semantics —
+> 1.66.0.0 reworked `builtin/constant/value` (`key-*` → `currencyID-*` /
+> `tokenID-*`) and changed non-canonical `value` literals from *normalised* to
+> *rejected*. `sources.toml` and `manifest.toml` must therefore advance
+> together; bumping one alone breaks the suite.
 
 **Replay locally:**
 
@@ -108,7 +124,9 @@ just test-conformance-cardano-node
 
 **Source:** [IntersectMBO/cardano-ledger](https://github.com/IntersectMBO/cardano-ledger) ImpSpec, SHA-pinned in `sources.toml`. The corpus regeneration pipeline builds cardano-ledger from source (GHC 9.6.5 + cabal 3.10.x, ≈35 min cold / 5 min cached) and runs the upstream ImpSpec conformance suite with `CONFORMANCE_CBOR_DUMP_PATH` set to capture every test vector as CBOR.
 
-**What's validated:** Two STS-rule families — NEWEPOCH (epoch-boundary transitions) and LEDGER (transaction application). The harness replays each captured CBOR vector through the corresponding dugite ledger code path and compares the resulting state byte-for-byte.
+**What's validated:** Eleven STS-rule families, not just the two headline ones — `NEWEPOCH` and `ConwayNEWEPOCH` (epoch-boundary transitions), `LEDGER` (transaction application), `POOL`, `CERT`, `CERTS`, `DELEG`, `GOVCERT`, `GOV`, `ENACT`, and `RATIFY`. The current corpus holds roughly 8,100 captured test-case directories. The harness replays each CBOR vector through the corresponding dugite ledger code path and compares the resulting state byte-for-byte.
+
+Note that an empty `SKIP_LIST` means no vector is skipped *by policy*. A vector can still report `Skipped` at runtime if the runner cannot construct its precondition; that is visible in the run output, not hidden by the list.
 
 **Status:** passing. `SKIP_LIST` in `tests/conformance/src/upstream/ledger_rules_replay/mod.rs` is empty.
 
@@ -160,10 +178,26 @@ Fixture tarballs are cached on the CI runner, keyed by the SHA-256 content hash 
 To adopt a new upstream version:
 
 1. Edit `tests/conformance/upstream/sources.toml`, bumping the SHA (or tag for the `plutus` area) of the area you want to refresh.
-2. Trigger the `regenerate-conformance-corpus` workflow on GitHub (manual dispatch, or wait for the weekly automatic run). It produces a new dugite release tagged `conformance-corpus-v<timestamp>` with the seven tarballs attached.
-3. Update `[release].tag` in `tests/conformance/upstream/manifest.toml` to point at the new release tag.
+2. Run the `regenerate-conformance-corpus` workflow. It fires on **three** triggers: weekly cron (Sundays 02:00 UTC), manual dispatch (with optional per-area SHA/tag overrides patched into `sources.toml` for that run), and any push to `main` touching `sources.toml` or `scripts/regenerate-conformance-corpus/**`. It produces a new dugite release tagged `conformance-corpus-v<YYYYmmdd-HHMMSS>` with the seven tarballs plus a `corpus-manifest.json`.
+3. The workflow then **opens an adoption PR itself** (`chore/adopt-<NEW_TAG>`, titled `chore(conformance): adopt corpus <NEW_TAG>`) rewriting `[release].tag` in `manifest.toml`. This exists because the workflow used to publish releases nothing pointed at, and the pinned corpus silently drifted about two months stale. If you are adopting by hand, edit `[release].tag` yourself.
 4. Run `just download-upstream-fixtures && just test-conformance` locally.
 5. Fix any test fallout, then commit the `sources.toml` + `manifest.toml` updates together with the code changes.
+
+To iterate on a capture script without publishing a release, `just regenerate-corpus-local` runs the same pipeline into `target/conformance-corpus/<tag>/`.
+
+### Currently pinned
+
+`[release].tag = "conformance-corpus-v20260725-154355"`, built from:
+
+| Area | Pin |
+|---|---|
+| ouroboros-consensus | `f205a7103deb732cc07cabd51fa76ce22f84f0d0` |
+| cardano-ledger | `a88b60bdcf3248dfe5a2f9372c188c399233f479` |
+| cardano-node | `0a21a7437fb9d38060b297c5997275d316e60d5c` |
+| plutus | tag `1.66.0.0` |
+| ledger-rules | `a88b60bdcf3248dfe5a2f9372c188c399233f479` (same tree as cardano-ledger) |
+| cardano-base | `12168e4b32b44d30dd401010ccd969accaf2add7` |
+| mithril | `2eedbd254e6bb656f6c10ec83930327dd0768a4a` |
 
 ## See also
 

@@ -23,10 +23,10 @@ forgers competing for the same height).
 
 The chain boots into Conway PV10 from a fresh genesis with a single
 forging pool (pool1, 100% of active stake; pool2's keys exist but its
-stake is 0), 1-second slots, `activeSlotsCoeff = 0.2`, `epochLength = 200`,
-and `securityParam = 10`. Blocks are minted every ~5 seconds on average
-and an epoch elapses every ~3.3 minutes, so the 30-minute soak crosses
-~9 epoch boundaries (enough for reward distribution to complete before
+stake is 0), 1-second slots, `activeSlotsCoeff = 0.5`, `epochLength = 400`,
+and `securityParam = 40`. Blocks are minted every ~2 seconds on average
+and an epoch elapses every ~6.7 minutes, so the 30-minute soak crosses
+~4 epoch boundaries (enough for reward distribution to complete before
 the soak ends).
 
 > **Historical note:** prior to 2026-05-18, cardano-node also ran as a
@@ -48,6 +48,30 @@ the soak ends).
 - **macOS:** the system-builtin `caffeinate` (used to suppress App Nap during the soak). This dependency is macOS-only; on Linux the soak runs unwrapped.
 
 The setup script's prereq check will refuse to run if any of these are missing.
+
+## Justfile recipes
+
+The scripts below are the underlying entry points. For everyday use the
+`justfile` wraps them — both shapes are equivalent:
+
+| Recipe | Wraps |
+|--------|-------|
+| `just devnet-setup` | `setup.sh` |
+| `just devnet-run` | `run.sh` |
+| `just devnet-soak` | `soak.sh` (30 min) |
+| `just devnet-verify` | `verify.sh` against the most recent evidence round |
+| `just devnet-stop` | `stop.sh` |
+| `just devnet-report [TAG]` | single-round release report from the latest evidence |
+| `just devnet-validate-smoke` | one boot, ~5 min: setup + run + tx-zoo (`01`, `02`, `08`) + log-level predicate + report. PR gate for core crates. |
+| `just devnet-validate-extended` | ~75 min, 3 rounds: used for release tagging |
+
+`devnet-verify` and `devnet-report` locate the newest directory containing a
+`metadata.json` under `evidence/` or `evidence-archive/auto/` — that file is
+what distinguishes a real soak round from the evidence directories that
+`09-cli-parity` and `protocols/` also create.
+
+Both `devnet-validate-*` recipes install an `EXIT` trap that runs `stop.sh`,
+so an aborted run does not leave orphaned nodes holding ports 3001-3003.
 
 ## One-time setup
 
@@ -80,11 +104,17 @@ will refuse to start a stale chain).
 
 This starts the three nodes in the background (caffeinate-wrapped on macOS),
 records PIDs to `state/<node>.pid`, sends logs to `logs/<node>.log`, and
-exposes N2C sockets at:
+exposes N2C sockets under `/tmp/ld-$(id -u)/`:
 
-- `testnet/local-devnet/state/dugite-relay.sock`
-- `testnet/local-devnet/state/dugite-bp.sock`
-- `testnet/local-devnet/state/cardano-bp.sock`
+| Node | Socket |
+|------|--------|
+| `dugite-relay` | `/tmp/ld-<uid>/relay.sock` |
+| `dugite-bp` | `/tmp/ld-<uid>/dbp.sock` |
+| `cardano-bp` | `/tmp/ld-<uid>/cbp.sock` |
+
+> Sockets live under `/tmp/ld-<uid>/` rather than inside the repo because
+> macOS caps `sun_path` at 104 bytes, and both a worktree path and the
+> default macOS `$TMPDIR` (`/var/folders/...`) blow past that.
 
 You can query each socket with `cardano-cli` (or `dugite-cli`, which speaks
 the same N2C protocol):
@@ -92,7 +122,7 @@ the same N2C protocol):
 ```bash
 cardano-cli query tip \
   --testnet-magic 42 \
-  --socket-path testnet/local-devnet/state/dugite-bp.sock
+  --socket-path "/tmp/ld-$(id -u)/dbp.sock"
 ```
 
 To stop the network:
@@ -134,15 +164,16 @@ manually:
 ./testnet/local-devnet/verify.sh testnet/local-devnet/evidence/<timestamp>/
 ```
 
-The verifier evaluates four pass/fail predicates and writes
+The verifier evaluates five pass/fail predicates and writes
 `evidence/<timestamp>/report.md`. Predicates:
 
 | # | Predicate | Pass condition |
 |---|-----------|----------------|
-| 1 | **Block forge cross-check** | Every confirmed (slot, hash) pair is seen by all three observers in `blocks.csv`. (Most-recent 10 blocks are excluded from the check to allow rollback grace.) |
-| 2 | **Per-BP forge attribution** | dugite-bp forged >= 3 blocks; cardano-node forged 0 (it's a validator). Expected ~360 by dugite-bp at f=0.2, σ=1.0 — failure at 3 is a real wiring bug, not a slot-lottery flake. Any forge events attributed to a non-dugite-bp issuer are a setup error. |
-| 3 | **Transaction inclusion round-trip** | Every submitted tx has `submit_rc=0` and (when run with the devnet up) appears in all three nodes' UTxO sets at the genesis payment address. |
-| 4 | **Tip parity over time** | At >=95% of 5-second ticks (excluding the first 60s warmup), all three nodes report tips within 2 blocks of each other. |
+| 1 | **Block forge cross-check** | Every canonical (slot, hash) pair is seen by all three observers in `blocks.csv`. Orphans are excluded. |
+| 2 | **Per-BP forge attribution** | dugite-bp forged >= 3 blocks; pool2 forged 0 (cardano-node is a validator). Expected ~900 by dugite-bp at f=0.5, σ=1.0 — failure at 3 is a real wiring bug, not a slot-lottery flake. Any forge events attributed to a non-dugite-bp issuer are a setup error. |
+| 3 | **Transaction inclusion round-trip** | Every submitted tx has `submit_rc=0` and (when run with the devnet up) appears in all three nodes' UTxO sets at the genesis payment address. SKIPs when the round submitted no txs. |
+| 4 | **Tip parity over time** | At >=95% of 5-second ticks (excluding the warmup window), all three nodes report tips within 2 blocks of each other. |
+| 5 | **Tip age** | `dugite_tip_age_seconds` stays below threshold on every dugite node after the catch-up grace window. SKIPs when the soak is too short to sample. |
 
 The `report.md` includes a metadata snapshot (versions, genesis hashes, magic),
 counts (block events, tx submissions, tip samples), a forge-attribution
@@ -159,9 +190,9 @@ test fixtures:
 
 | Process | N2N | Metrics | Socket | Config | Topology |
 |---------|-----|---------|--------|--------|----------|
-| `dugite-bp` (pool1, sole forger) | 3001 | 12798 | `dugite-bp.sock` | `dugite-bp.config.json` | `dugite-bp.topology.json` |
-| `dugite-relay` (hub) | 3002 | 12799 | `dugite-relay.sock` | `dugite-relay.config.json` | `dugite-relay.topology.json` |
-| `cardano-node` (validator) | 3003 | — | `cardano-bp.sock` | `cardano-bp.config.json` | `cardano-bp.topology.json` |
+| `dugite-bp` (pool1, sole forger) | 3001 | 12798 | `/tmp/ld-<uid>/dbp.sock` | `dugite-bp.config.json` | `dugite-bp.topology.json` |
+| `dugite-relay` (hub) | 3002 | 12799 | `/tmp/ld-<uid>/relay.sock` | `dugite-relay.config.json` | `dugite-relay.topology.json` |
+| `cardano-node` (validator) | 3003 | — | `/tmp/ld-<uid>/cbp.sock` | `cardano-bp.config.json` | `cardano-bp.topology.json` |
 
 The devnet uses the standard Cardano N2N port (3001) for `dugite-bp` and
 single-digit increments for the relay (3002) and the Haskell BP (3003). The
@@ -202,16 +233,21 @@ differ from cardano-cli's defaults are listed below.
 | field | value | purpose |
 |-------|-------|---------|
 | `slotLength` | `1.0` | 1-second slot duration |
-| `activeSlotsCoeff` | `0.2` | f = 0.2; ~5s expected block time |
-| `epochLength` | `200` | ~3.3 minutes per epoch -> ~9 epoch transitions in the 30-min soak. The Praos lower bound is `3k/f = 150` slots; we stay safely above that while keeping reward/governance cycles short enough for tx-zoo. |
-| `securityParam` | `10` | small k -> fast immutability (3k/f ~= 150 slots) |
+| `activeSlotsCoeff` | `0.5` | f = 0.5; ~2s expected block time |
+| `epochLength` | `400` | ~6.7 minutes per epoch -> ~4 epoch transitions in the 30-min soak. The Praos lower bound is `3k/f = 240` slots; we stay safely above that while keeping reward/governance cycles short enough for tx-zoo. |
+| `securityParam` | `40` | small k -> fast immutability (3k/f = 240 slots) |
 | `updateQuorum` | `2` | matches the 3 genesis keys (2-of-3) |
 | `maxLovelaceSupply` | `60_000_000_000_000_000` | 60 B ADA, mainnet-shaped |
 | `networkMagic` | `42` | local devnet magic |
+| `protocolParams.protocolVersion` | `{major: 10, minor: 0}` | boots straight into Conway |
 
-`config/spec/conway-spec.json` carries Conway governance parameters; for a
-30-min run with no proposals only the protocol version matters. PV is set
-to 10.0 so the chain boots straight into Conway.
+Note that the protocol version lives in **`shelley-spec.json`**, not in the
+Conway spec. `config/spec/conway-spec.json` carries the Conway governance
+parameters — pool/DRep voting thresholds, `govActionLifetime` (6 epochs),
+`govActionDeposit`, `dRepDeposit`, `dRepActivity`,
+`minFeeRefScriptCostPerByte`, and the Plutus V3 cost model. Those values are
+load-bearing for the governance, proposal, and voting categories of the
+tx-zoo, so they are not inert filler even on a short run.
 
 ## Troubleshooting
 
@@ -238,7 +274,7 @@ to 10.0 so the chain boots straight into Conway.
 - Byron-era code paths (chain boots in Conway)
 - Hard-fork combinator era transitions (none occur during the soak)
 - Multi-relay diffusion topologies (single hub)
-- Plutus phase-2 / governance enactment (no proposals or scripts in the soak; the tx-zoo covers governance under a separate driver)
+- Plutus phase-2 / governance enactment — *the soak itself* submits only identical self-payments. Scripts, proposals, voting, and enactment are covered by the tx-zoo (`03`, `06`, `07`, `10`, `12`) under a separate driver
 - Symmetric multi-forger chain selection (cardano-node is a validator here, not a forger — see "Historical note" at top)
 - Mainnet-scale peer counts, NAT/firewall behaviour, or BGP-level routing
 - Mithril snapshot import (covered by other tests)
@@ -258,22 +294,31 @@ and validator accept every transaction class that mainnet allows.
 ./testnet/local-devnet/tx-zoo/run-all.sh --summary  # totals from the last run
 ```
 
-The zoo covers 8 categories (59 scripts total): bookkeeping (simple-pay,
-multi-output, metadata CIP-20/CIP-25, validity intervals, required signers,
-treasury donation, tx chaining), native scripts (all/any/atLeast policies,
-time-locked, burns, pay-to-script, spend-from-script), Plutus V1/V2/V3
-(spend, mint, inline datums, reference scripts, reference inputs, datum-hash
-reveal, collateral consumption), stake operations (register, delegate,
-combined certs, deregister, pool register/retire, reward withdrawal),
-governance certificates (DRep register/update/deregister, vote-delegation to
-DRep + always-abstain + always-no-confidence, CC hot-key authorisation,
-CC resignation), proposals (Info, ParameterChange, HardForkInitiation,
-TreasuryWithdrawal, NoConfidence, UpdateCommittee, NewConstitution), voting
-(DRep + SPO + CC yes/no/abstain), and negative paths (min-utxo violation,
-fee-too-low, expired TTL, insufficient collateral). Each script submits
-through the dugite relay socket and waits for inclusion at that same socket
-to guarantee diffusion + validation on the dugite path before recording
-PASS/FAIL/SKIP into `tx-zoo/state/results.csv`.
+The zoo covers 12 categories (111 scripts total):
+
+| Category | Scripts | Covers |
+|----------|---------|--------|
+| `01-bookkeeping` | 8 | simple-pay, multi-output, metadata CIP-20/CIP-25, validity intervals, required signers, treasury donation, tx chaining |
+| `02-native-scripts` | 7 | all/any/atLeast policies, time-locked, burns, pay-to-script, spend-from-script |
+| `03-plutus` | 14 | V1/V2/V3 spend, mint, inline datums, reference scripts, reference inputs, datum-hash reveal, collateral consumption |
+| `04-stake` | 7 | register, delegate, combined certs, deregister, pool register/retire, reward withdrawal |
+| `05-governance-certs` | 8 | DRep register/update/deregister, vote-delegation (DRep + always-abstain + always-no-confidence), CC hot-key authorisation, CC resignation |
+| `06-proposals` | 7 | Info, ParameterChange, HardForkInitiation, TreasuryWithdrawal, NoConfidence, UpdateCommittee, NewConstitution |
+| `07-voting` | 8 | DRep + SPO + CC yes/no/abstain |
+| `08-negative` | 19 | min-utxo violation, fee-too-low, expired TTL, insufficient collateral, double-spend, and other rejection paths |
+| `09-cli-parity` | 24 | runs `cardano-cli` against **both** sockets and diffs the answers |
+| `10-gov-lifecycle` | 5 | end-to-end proposal -> vote -> ratify -> enact |
+| `11-mempool` | 3 | mempool admission and eviction behaviour |
+| `12-post-enactment` | 1 | state after a governance action is enacted |
+
+Each script submits through the dugite relay socket and waits for inclusion
+at that same socket to guarantee diffusion + validation on the dugite path
+before recording PASS/FAIL/SKIP into `tx-zoo/state/results.csv`.
+
+> **Reading `09-cli-parity`:** it runs `cardano-cli` against both sockets and
+> diffs the responses — it never invokes `dugite-cli`. What it measures is
+> dugite-**node**'s LSQ responses. A failure on *both* sides is a harness bug,
+> never a dugite-cli gap.
 
 ### Requirements
 
@@ -300,9 +345,9 @@ PASS/FAIL/SKIP into `tx-zoo/state/results.csv`.
   client is submitting to the same socket — the zoo expects exclusive access.
 - **Rewards warmup**: `reward-withdrawal` cannot succeed until the delegated
   stake earns rewards, which requires at least two epoch boundaries after
-  delegation. On the 200-slot epoch this means the script SKIPs for the
-  first ~7 minutes after a fresh devnet boot. The script records SKIP with
-  reason `no-rewards` rather than failing.
+  delegation. On the 400-slot epoch this means the script SKIPs for roughly
+  the first ~13 minutes after a fresh devnet boot. The script records SKIP
+  with reason `no-rewards` rather than failing.
 
 ### Seated CC member
 

@@ -124,6 +124,23 @@ dugite-cli stake-address vote-delegation-certificate \
 | `--always-no-confidence` | No | Use the special always-no-confidence DRep |
 | `--out-file` | Yes | Output path for the certificate |
 
+## key-hash
+
+Get the Blake2b-224 hash of a stake verification key:
+
+```bash
+dugite-cli stake-address key-hash \
+  --stake-verification-key-file stake.vkey
+```
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--stake-verification-key-file` | Yes | Path to the stake verification key |
+
+This is the cardano-cli-compatible equivalent of `dugite-cli key
+verification-key-hash --verification-key-file stake.vkey` (see
+[Key Generation](key-generation.md)).
+
 ## Complete Staking Workflow
 
 ```bash

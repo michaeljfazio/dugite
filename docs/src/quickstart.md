@@ -2,19 +2,31 @@
 
 This guide walks you through getting Dugite running on the Cardano preview testnet.
 
+> **Dugite is in early development and is not recommended for production use.** Run it on testnets only — see [Project Status](./introduction.md#project-status).
+
 ## 1. Install
 
 **Option A: Pre-built binary** (fastest)
 
+The release tarball contains `dugite-node`, `dugite-cli`, and the `config/` tree.
+
 ```bash
 curl -LO https://github.com/michaeljfazio/dugite/releases/latest/download/dugite-x86_64-linux.tar.gz
 tar xzf dugite-x86_64-linux.tar.gz
-sudo mv dugite-node dugite-cli dugite-monitor dugite-config /usr/local/bin/
+sudo mv dugite-node dugite-cli /usr/local/bin/
 ```
 
-**Option B: Container image** *(coming soon — [#507](https://github.com/michaeljfazio/dugite/issues/507))*
+**Option B: Container image**
+
+```bash
+docker pull ghcr.io/michaeljfazio/dugite:latest
+```
+
+Multi-arch (`linux/amd64`, `linux/arm64`), ships all four binaries, and bundles `config/` at `/opt/dugite/config/`. See [Installation](./installation.md#container-image).
 
 **Option C: Build from source**
+
+Requires a stable Rust toolchain and `protoc` — see [Installation](./installation.md#system-dependencies).
 
 ```bash
 git clone https://github.com/michaeljfazio/dugite.git
@@ -24,7 +36,7 @@ cargo build --release
 
 ## 2. Fast Sync with Mithril (Recommended)
 
-Import a Mithril-certified snapshot to skip syncing millions of blocks from genesis:
+Import a Mithril-certified snapshot to skip syncing the chain from genesis:
 
 ```bash
 dugite-node mithril-import \
@@ -32,11 +44,17 @@ dugite-node mithril-import \
   --database-path ./db-preview
 ```
 
-This downloads the latest snapshot from the Mithril aggregator, extracts it, and imports all blocks into the database. On preview testnet this takes approximately 9 minutes (downloading a ~2.7 GB snapshot containing ~4M blocks).
+This downloads the latest snapshot from the Mithril aggregator, verifies its certificate chain, extracts it, and bulk-imports the blocks into the ImmutableDB. The ancillary archive (the Haskell ledger state at the immutable tip) is downloaded by default, which cuts bootstrap from multi-hour to roughly 15 minutes; pass `--no-include-ancillary` to replay from blocks instead. See [Mithril Snapshot Import](./running/mithril.md) for snapshot sizes, disk requirements, and the [trust model](./running/mithril-ancillary.md).
+
+Or via the justfile:
+
+```bash
+just mithril-import preview
+```
 
 ## 3. Run the Node
 
-Dugite ships with configuration files for all networks. If you built from source, they are in `config/<network>/` (`config.json`, `topology.json`, and four genesis files per network):
+Dugite ships with configuration files for `mainnet`, `preview`, and `preprod`, under `config/<network>/` — `config.json`, `topology.json`, and four genesis files (`byron-genesis.json`, `shelley-genesis.json`, `alonzo-genesis.json`, `conway-genesis.json`). The release tarball and container image both bundle this tree. Network magic is `764824073` for mainnet, `2` for preview, and `1` for preprod.
 
 ```bash
 dugite-node run \
@@ -73,15 +91,17 @@ dugite-cli query tip \
   --testnet-magic 2
 ```
 
-Example output:
+Example output (field order matches cardano-cli 10.x — alphabetical, no `network` field):
 
 ```json
 {
-    "slot": 106453897,
-    "hash": "8498ccda...",
     "block": 4094745,
     "epoch": 1232,
     "era": "Conway",
+    "hash": "8498ccda...",
+    "slot": 106453897,
+    "slotInEpoch": 9097,
+    "slotsToEpochEnd": 77303,
     "syncProgress": "100.00"
 }
 ```
@@ -100,12 +120,14 @@ dugite-cli query tx-mempool info \
 
 ## 5. Check Metrics
 
-Prometheus metrics are served on port 12798:
+Prometheus metrics are served on port **12796** by default — deliberately offset from cardano-node's 12798 so both can run on the same host. Override with `--metrics-port`, or the `MetricsPort` field in `config.json` (the shipped configs set 12796 explicitly).
 
 ```bash
-curl -s http://localhost:12798/metrics | grep sync_progress
-# sync_progress_percent 10000
+curl -s http://localhost:12796/metrics | grep dugite_sync_progress
+# dugite_sync_progress_percent 10000
 ```
+
+The value is a percentage scaled by 100 — divide by 100 for percent.
 
 ## Next Steps
 

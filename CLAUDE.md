@@ -81,7 +81,12 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 ### Wire Format
 - All Cardano wire-format compatibility via the in-house multi-era CBOR decoder under `crates/dugite-serialization/src/decode/`
 - `Transaction.hash` is `blake2b_256(raw_body_cbor)` over the bytes captured by `KeepRaw::parse_with` during decode
-- CBOR encoding for N2C protocol params uses integer keys 0-33 (not JSON strings)
+- Two DIFFERENT protocol-param wire shapes, do not conflate them:
+  - `ProtocolParamUpdate` (tx-body key 6 / gov ParameterChange) is a SPARSE
+    integer-keyed CBOR map, keys 0-37 (not JSON strings)
+  - N2C `GetCurrentPParams` (LSQ tag 3) replies with a POSITIONAL
+    `array(31)` per Haskell `ConwayPParams` — see
+    `dugite-node/src/node/n2c_query/encoding.rs`
 
 ## Key Patterns
 - `ChainSyncEvent::RollForward` uses `Box<Block>` to avoid large enum variant size

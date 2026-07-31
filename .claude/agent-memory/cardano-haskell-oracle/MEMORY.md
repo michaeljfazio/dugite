@@ -35,6 +35,10 @@
 - [gsm-haa-syncing-presyncing-regression.md](gsm-haa-syncing-presyncing-regression.md) — Syncing→PreSyncing is HAA-only, NO tip-age term (tip-age only gates CaughtUp↔PreSyncing); OutboundConnectionsState 4-way case split (Genesis-mode BLP-count branch has no closure-over-established-peers condition); root-caused dugite from-genesis freeze to gsm.rs/networking.rs
 - [haa-outbound-connections-state-verified.md](haa-outbound-connections-state-verified.md) — SUPERSEDES prior "not tag-pinned" caveat: exact CHaP-resolved commits for cardano-node 11.0.1 (cardano-diffusion rev 17525c3, ouroboros-network rev a98c885). Praos-vs-Genesis TooOld handling genuinely differs (only Praos zeroes targets + 15min abort); trustable-closure violations are eventual not synchronous; inbound duplex peers only count once separately promoted via KnownPeers; PreSyncing does NOT pause ChainSync/BlockFetch (only LoE/GDD/LoP change)
 
+## Variable-Length CBOR Framing (encodeList/Set/Seq/Foldable)
+- [variable-length-cbor-framing-and-blockbody-hash-over-original-bytes.md](variable-length-cbor-framing-and-blockbody-hash-over-original-bytes.md) — lengthThreshold=23 routing table (which container encoders actually call variableListLenEncoding vs. reimplement it — encodeList/encodeSet PV<2 do NOT); OSet always-tag vs Set PV-gated tag; DECISIVE: AlonzoBlockBody DecCBOR withSlice hashes ORIGINAL received bytes (bodiesAnn/witsAnn/auxDataAnn/isValAnn), never a re-encoding — definite-framed >23-tx blocks still ACCEPTED if self-consistently hashed
+- [witness-set-ord-instances-and-order-observability.md](witness-set-ord-instances-and-order-observability.md) — Ord WitVKey=wvkKeyHash(blake2b224 vkey), Ord BootstrapWitness=bootstrapWitKeyHash(Byron addrRoot SHA3+ADDRHASH, DIFFERENT algo); scripts sorted by ScriptHash ascending per Plutus-language map; decode enforces NO-DUPLICATES only, never order; MemoBytes replay (relay/forge-from-received-bytes) preserves wire order byte-exact, fresh mkMemoizedEra construction ALWAYS canonicalizes to ascending Ord order — dugite's wire-order-preserving relay is correct, sorting only needed for from-scratch tx building
+
 ## Ledger State Snapshots & CBOR Format
 - [ext-ledger-state-snapshot-format.md](ext-ledger-state-snapshot-format.md) — state file CBOR: outer array(2)[1,ExtLedgerState], HeaderState telescope, PraosState 8-field array
 - [ledger-state-11-0-1-format-changes.md](ledger-state-11-0-1-format-changes.md) — 10.6.2→11.0.1 breaking changes: spsAccountId array(2), Peras field added
@@ -119,6 +123,7 @@
 - [dblock-directory-locking.md](dblock-directory-locking.md) — DbLock.hs: `<db-path>/lock` empty file, OS flock via ioFileLock, 2s timeout, DbLocked exception message shape; runs AFTER checkDbMarker, BEFORE ChainDB open
 
 ## Misc / Ledger Semantics
+- [metadatum-codec-definite-indefinite-gates.md](metadatum-codec-definite-indefinite-gates.md) — Metadata.hs decode: TypeTag rejected, checkSizes>PV2, byte-chunk PV12 indef-leniency (text never gated), encoder always raw encodeListLen/encodeMapLen never generic encodeMap
 - [v1-txinfo-wdrl-encoding.md](v1-txinfo-wdrl-encoding.md) — V1 txInfoWdrl=List[Constr0[cred,amt]] (NOT Map, that's V2)
 - [native-script-hash-original-bytes-not-reencode.md](native-script-hash-original-bytes-not-reencode.md) — hashScript=prefix<>originalBytes, never re-encode; Timelock decoder accepts indefinite arrays + non-minimal ints; prefix table native=0x00/V1-V3=0x01-03
 

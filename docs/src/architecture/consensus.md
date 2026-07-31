@@ -188,7 +188,7 @@ The counter must be monotonically increasing per pool to prevent certificate rep
 
 ### KES Signature Verification
 
-Block headers are signed using the Sum6Kes scheme (depth-6 binary sum composition over Ed25519). The KES key is evolved to the correct period offset from the operational certificate's start period. Verification checks:
+Block headers are signed using the Sum6Kes scheme (depth-6 binary sum composition over Ed25519), via the `kes-summed-ed25519` crate. The signing key occupies a 612-byte buffer (608 bytes of key material + a 4-byte period counter); the upstream `Sum6Kes::drop` implementation zeroizes this buffer on drop, so any code that needs to retain key bytes past a `Sum6Kes` value's lifetime must copy them out first. The KES key is evolved to the correct period offset from the operational certificate's start period. Verification checks:
 
 1. The KES signature over the header body bytes is valid
 2. The KES period matches the expected value for the block's slot

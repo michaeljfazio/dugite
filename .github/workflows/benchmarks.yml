@@ -191,6 +191,16 @@ jobs:
           mkdir -p benches
           REPORT="benches/${DATE}-nightly.md"
 
+          # Hardware fingerprint. GitHub-hosted `ubuntu-latest` runners are not
+          # a fixed CPU model, so absolute timings are only comparable between
+          # runs that landed on the same host class. Record it rather than
+          # leaving every number in this file unattributed.
+          CPU_MODEL=$(awk -F': ' '/^model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null || echo "unknown")
+          CPU_CORES=$(nproc 2>/dev/null || echo "?")
+          MEM_TOTAL=$(awk '/^MemTotal/{printf "%.1f GiB", $2/1048576}' /proc/meminfo 2>/dev/null || echo "unknown")
+          KERNEL=$(uname -sr 2>/dev/null || echo "unknown")
+          RUSTC_VER=$(rustc --version 2>/dev/null || echo "unknown")
+
           emit_section() {
             local title="$1" file="$2"
             local full="${file%.txt}.full.txt"
@@ -216,6 +226,17 @@ jobs:
             printf '# Nightly Benchmark Results — %s\n\n' "$DATE"
             printf 'Captured on **%s** from commit [`%s`](https://github.com/MichaelJFazio/dugite/commit/%s) on `main` (GitHub Actions `ubuntu-latest`).\n\n' \
               "$DATE" "$SHORT_SHA" "$SHORT_SHA"
+            printf '### Measurement environment\n\n'
+            printf '| | |\n|---|---|\n'
+            printf '| Runner | GitHub Actions `ubuntu-latest` (shared, virtualised) |\n'
+            printf '| CPU | %s |\n' "$CPU_MODEL"
+            printf '| vCPUs | %s |\n' "$CPU_CORES"
+            printf '| Memory | %s |\n' "$MEM_TOTAL"
+            printf '| Kernel | %s |\n' "$KERNEL"
+            printf '| Toolchain | %s |\n' "$RUSTC_VER"
+            printf '| Build profile | `bench` (release + debug assertions off) |\n\n'
+            printf '> **Read absolute numbers with care.** These run on shared, virtualised GitHub-hosted runners whose CPU model is not pinned and whose neighbours are not controlled. Treat the figures as an order-of-magnitude regression tripwire, not as hardware benchmarks: a `change: ±x%%` between two dates can reflect a different host class rather than a code change. Use the interactive trend lines below, where a real regression shows as a sustained step rather than a single-day spike.\n\n'
+            printf '> **Not measured here:** end-to-end sync throughput, mainnet-scale UTxO memory, and anything requiring a live network. Those are covered by the devnet-validate and soak rigs, not by Criterion.\n\n'
             printf '> **Interactive reports**, including per-benchmark detail pages and historical trend lines, are published at <https://michaeljfazio.github.io/dugite/benchmarks/>. Each section below also links directly to its interactive report.\n\n'
             printf '> The collapsed _Raw measurements_ blocks contain the filtered `cargo bench` output (cargo build chatter and ANSI escapes are stripped). Full unfiltered logs are uploaded as the `benchmark-results-${{ github.run_number }}` workflow artifact.\n\n'
             printf -- '---\n\n'

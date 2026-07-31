@@ -6,7 +6,7 @@
 # To adopt a new corpus:
 #   1. Edit sources.toml and trigger the regenerate-conformance-corpus workflow
 #   2. Update [release].tag below to the new conformance-corpus-v<timestamp> tag
-#   3. Run: just download-upstream-fixtures && just test-upstream
+#   3. Run: just download-upstream-fixtures && just test-conformance
 #   4. Fix any test fallout, then PR the sources.toml + manifest.toml + code changes
 
 [release]

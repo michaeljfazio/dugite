@@ -2,6 +2,22 @@
 
 Captured on **2026-07-31** from commit [`a5d7cce`](https://github.com/MichaelJFazio/dugite/commit/a5d7cce) on `main` (GitHub Actions `ubuntu-latest`).
 
+### Measurement environment
+
+| | |
+|---|---|
+| Runner | GitHub Actions `ubuntu-latest` (shared, virtualised) |
+| CPU | not recorded for this run — captured from the next nightly onward |
+| vCPUs | not recorded for this run |
+| Memory | not recorded for this run |
+| Build profile | `bench` (release + debug assertions off) |
+
+> **Read absolute numbers with care.** These run on shared, virtualised GitHub-hosted runners whose CPU model is not pinned and whose neighbours are not controlled. Treat the figures as an order-of-magnitude regression tripwire, not as hardware benchmarks: a `change: ±x%` between two dates can reflect a different host class rather than a code change. Use the interactive trend lines below, where a real regression shows as a sustained step rather than a single-day spike.
+
+> **Not measured here:** end-to-end sync throughput, mainnet-scale UTxO memory, and anything requiring a live network. Those are covered by the devnet-validate and soak rigs, not by Criterion.
+
+> This page is **generated**, not hand-written — the nightly `benchmarks` workflow copies the newest `benches/YYYY-MM-DD-nightly.md` over it and commits. Edit `.github/workflows/benchmarks.yml` if you need the header to change; edits made here directly are overwritten by the next nightly run.
+
 > **Interactive reports**, including per-benchmark detail pages and historical trend lines, are published at <https://michaeljfazio.github.io/dugite/benchmarks/>. Each section below also links directly to its interactive report.
 
 > The collapsed _Raw measurements_ blocks contain the filtered `cargo bench` output (cargo build chatter and ANSI escapes are stripped). Full unfiltered logs are uploaded as the `benchmark-results-148` workflow artifact.

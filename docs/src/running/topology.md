@@ -30,7 +30,8 @@ The topology file defines the peers that the node connects to. Dugite supports t
       "advertise": false
     }
   ],
-  "useLedgerAfterSlot": 177724800
+  "useLedgerAfterSlot": 0,
+  "peerSnapshotFile": "peer-snapshot.json"
 }
 ```
 
@@ -45,6 +46,11 @@ Trusted peers from founding organizations, used during initial sync. These are t
   { "address": "backbone.cardano.iog.io", "port": 3001 }
 ]
 ```
+
+Bootstrap peers are unconditionally `trustable` — there is no per-entry flag.
+They are what satisfies the Honest-Availability-Assumption closure while the
+node is syncing, so a topology with none configured has to fall back on
+`trustable` local roots instead.
 
 Set to `null` or an empty array to disable bootstrap peers:
 
@@ -80,11 +86,15 @@ Peers the node should always maintain connections with. Typically used for:
 | `accessPoints` | array | required | List of `{address, port}` entries |
 | `advertise` | boolean | `false` | Whether to share these peers via peer sharing protocol |
 | `valency` | integer | 1 | *Deprecated.* Target number of active connections. Use `hotValency` instead |
-| `hotValency` | integer | valency | Target number of hot (actively syncing) peers |
-| `warmValency` | integer | hotValency+1 | Target number of warm (connected, not syncing) peers |
-| `trustable` | boolean | `false` | Whether these peers are trusted for sync. Trusted peers are preferred during initial sync |
+| `hotValency` | integer | `valency` | Target number of hot (actively syncing) peers. Takes precedence over `valency` when both are set |
+| `warmValency` | integer | `hotValency + 1` | Target number of warm (connected, not syncing) peers |
+| `trustable` | boolean | `false` | Whether these peers are trusted for sync. Trusted peers are preferred during initial sync, and the node disconnects from non-trusted peers when syncing from outdated state. Also accepted as `trust_able` |
 | `behindFirewall` | boolean | `false` | If `true`, the node waits for inbound connections from these peers instead of connecting outbound |
 | `diffusionMode` | string | `"InitiatorAndResponder"` | Per-group diffusion mode. `"InitiatorOnly"` for unidirectional connections |
+
+Dugite's peer governor drives root-peer connectivity from these per-group
+valencies, not from the aggregate `TargetNumberOfRootPeers` config field — so
+`hotValency` / `warmValency` are the levers that actually change behaviour here.
 
 ### Public Roots
 
@@ -109,17 +119,42 @@ After the node syncs past the `useLedgerAfterSlot` slot, it discovers peers from
 "useLedgerAfterSlot": 177724800
 ```
 
-Set to a negative value or omit to disable ledger peer discovery.
+Set to a negative value or omit to disable ledger peer discovery. `0` enables it
+immediately — which is what the shipped `config/mainnet/topology.json` uses.
 
 ### Peer Snapshot File
 
-Optional path to a big ledger peer snapshot file for Genesis bootstrap:
+Optional path to a big ledger peer snapshot, used to seed the big-ledger-peer
+candidate pool at startup before the live ledger has caught up far enough for
+`useLedgerAfterSlot` discovery to populate it:
 
 ```json
 "peerSnapshotFile": "peer-snapshot.json"
 ```
 
+The path is resolved relative to the **topology file's** directory (matching
+cardano-node), not the config file's. Two shapes are accepted: the IOG
+cardano-node 10.x format with a `bigLedgerPools` array of `{relays: [{address,
+port}]}`, and a legacy flat array of `{addr, port}` objects. Entries from either
+shape are treated as big ledger peers. Hostnames are resolved once, at startup.
+
+### Legacy Producers Format
+
+The pre-P2P `producers` list is still parsed, for older topology files:
+
+```json
+"producers": [
+  { "addr": "relay.example.com", "port": 3001, "valency": 1 }
+]
+```
+
+Legacy producers are registered as untrusted, non-advertised peers. Prefer
+`localRoots` / `publicRoots` for anything new.
+
 ## Example Topologies
+
+These are the topology files shipped in the repository under
+`config/<network>/topology.json`.
 
 ### Preview Testnet Relay
 
@@ -129,12 +164,39 @@ Optional path to a big ledger peer snapshot file for Genesis bootstrap:
     { "address": "preview-node.play.dev.cardano.org", "port": 3001 }
   ],
   "localRoots": [
-    { "accessPoints": [], "advertise": false, "valency": 1 }
+    { "accessPoints": [], "advertise": false, "trustable": false, "valency": 1 }
   ],
   "publicRoots": [
-    { "accessPoints": [], "advertise": false }
+    {
+      "accessPoints": [
+        { "address": "preview-node.play.dev.cardano.org", "port": 3001 }
+      ],
+      "advertise": false
+    }
   ],
   "useLedgerAfterSlot": 102729600
+}
+```
+
+### Preprod Testnet Relay
+
+```json
+{
+  "bootstrapPeers": [
+    { "address": "preprod-node.play.dev.cardano.org", "port": 3001 }
+  ],
+  "localRoots": [
+    { "accessPoints": [], "advertise": false, "trustable": false, "valency": 1 }
+  ],
+  "publicRoots": [
+    {
+      "accessPoints": [
+        { "address": "preprod-node.play.dev.cardano.org", "port": 3001 }
+      ],
+      "advertise": false
+    }
+  ],
+  "useLedgerAfterSlot": 76723200
 }
 ```
 
@@ -147,13 +209,18 @@ Optional path to a big ledger peer snapshot file for Genesis bootstrap:
     { "address": "backbone.mainnet.cardanofoundation.org", "port": 3001 },
     { "address": "backbone.mainnet.emurgornd.com", "port": 3001 }
   ],
-  "localRoots": [
-    { "accessPoints": [], "advertise": false, "valency": 1 }
-  ],
+  "localRoots": [],
   "publicRoots": [
-    { "accessPoints": [], "advertise": false }
+    {
+      "accessPoints": [
+        { "address": "backbone.cardano.iog.io", "port": 3001 },
+        { "address": "backbone.mainnet.cardanofoundation.org", "port": 3001 }
+      ],
+      "advertise": false
+    }
   ],
-  "useLedgerAfterSlot": 177724800
+  "useLedgerAfterSlot": 0,
+  "peerSnapshotFile": "peer-snapshot.json"
 }
 ```
 
@@ -199,7 +266,13 @@ IPv4 and IPv6 addresses are both accepted; Dugite resolves A and AAAA records co
 Dugite supports live topology reloading. Send a `SIGHUP` signal to the running node process, and it will re-read the topology file and update the peer manager with the new configuration:
 
 ```bash
-kill -HUP $(pidof dugite-node)
+kill -HUP $(pgrep -x dugite-node)
 ```
 
 This allows you to add or remove peers without restarting the node.
+
+The same signal also re-reads the node **config** file. Peer targets, churn
+intervals, and log verbosity are applied live; everything else is logged as
+needing a restart. See [Live Reload](./configuration.md#live-reload-sighup).
+
+If you use `dugite-config edit`, `Ctrl+R` saves and sends this signal for you.
