@@ -51,7 +51,9 @@
 //! tagged and untagged forms transparently.
 
 use crate::decode::era_shelley::DecodeMode;
-use crate::decode::helpers::{read_hash28, read_hash32, read_lovelace};
+use crate::decode::helpers::{
+    read_hash28, read_hash32, read_lovelace, read_metadata_map as decode_metadata_map,
+};
 use crate::decode::raw::KeepRaw;
 use crate::decode::reader::Reader;
 use crate::error::SerializationError;
@@ -65,8 +67,8 @@ use dugite_primitives::transaction::{
     Anchor, AuxiliaryData, BootstrapWitness, Certificate, Constitution, CostModels, DRep,
     ExUnitPrices, ExUnits, GovAction, GovActionId, MIRSource, MIRTarget, NativeScript, OutputDatum,
     PlutusData, PoolMetadata, PoolParams, ProposalProcedure, ProtocolParamUpdate, Rational,
-    Redeemer, RedeemerTag, Transaction, TransactionBody, TransactionInput, TransactionMetadatum,
-    TransactionOutput, TransactionWitnessSet, VKeyWitness, Vote, Voter, VotingProcedure,
+    Redeemer, RedeemerTag, Transaction, TransactionBody, TransactionInput, TransactionOutput,
+    TransactionWitnessSet, VKeyWitness, Vote, Voter, VotingProcedure,
 };
 use dugite_primitives::value::{AssetName, Lovelace, Value};
 use minicbor::data::Type;
@@ -2974,47 +2976,6 @@ fn decode_auxiliary_data(r: &mut Reader<'_>) -> Result<AuxiliaryData, Serializat
         plutus_v3_scripts,
         raw_cbor: Some(raw_bytes),
     })
-}
-
-fn decode_metadata_map(
-    r: &mut Reader<'_>,
-) -> Result<BTreeMap<u64, TransactionMetadatum>, SerializationError> {
-    // Use read_map to handle both definite- and indefinite-length maps.
-    let pairs = r.read_map(|r| r.read_uint(), read_metadatum)?;
-    Ok(pairs.into_iter().collect())
-}
-
-fn read_metadatum(r: &mut Reader<'_>) -> Result<TransactionMetadatum, SerializationError> {
-    let ty = r.peek_major()?;
-    match ty {
-        Type::Map => {
-            let entries = r.read_map(read_metadatum, read_metadatum)?;
-            Ok(TransactionMetadatum::Map(entries))
-        }
-        Type::Array => {
-            let items = r.read_array(read_metadatum)?;
-            Ok(TransactionMetadatum::List(items))
-        }
-        Type::U8 | Type::U16 | Type::U32 | Type::U64 => {
-            let v = r.read_uint()?;
-            Ok(TransactionMetadatum::Int(v as i128))
-        }
-        Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::Int => {
-            let v = r.read_int()?;
-            Ok(TransactionMetadatum::Int(v))
-        }
-        Type::Bytes => {
-            let bytes = r.read_bytes_owned()?;
-            Ok(TransactionMetadatum::Bytes(bytes))
-        }
-        Type::String => {
-            let s = r.read_str()?.to_string();
-            Ok(TransactionMetadatum::Text(s))
-        }
-        _ => Err(SerializationError::CborDecode(
-            "metadatum: unexpected type".into(),
-        )),
-    }
 }
 
 // ============================================================================
