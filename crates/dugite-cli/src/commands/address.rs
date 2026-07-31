@@ -113,10 +113,18 @@ impl AddressCmd {
                 network,
                 out_file,
             } => {
+                // Note: cardano-cli has no `--network` string flag (it takes
+                // `--mainnet | --testnet-magic NATURAL`); this flag is a
+                // dugite extension. An unknown value must be a hard error —
+                // the old silent Testnet fallback turned typos like
+                // "mainnnet" into valid-looking testnet addresses (#934).
                 let network_id = match network.as_str() {
                     "mainnet" => NetworkId::Mainnet,
                     "testnet" | "testnet-magic" => NetworkId::Testnet,
-                    _ => NetworkId::Testnet,
+                    other => anyhow::bail!(
+                        "invalid --network value \"{other}\": accepted values are \
+                         \"mainnet\" and \"testnet\" (synonym: \"testnet-magic\")"
+                    ),
                 };
 
                 let payment_vk = load_verification_key(&payment_verification_key_file)?;
@@ -385,6 +393,54 @@ mod tests {
             Address::Base(a) => assert_eq!(a.network, NetworkId::Testnet),
             other => panic!("expected Base address, got {other:?}"),
         }
+    }
+
+    /// An unknown `--network` value must be a hard error naming the accepted
+    /// forms — the old code silently fell back to Testnet, so a typo like
+    /// "mainnnet" produced a testnet address without a word of warning.
+    #[test]
+    fn build_unknown_network_errors_listing_accepted_forms() {
+        let dir = tempfile::tempdir().unwrap();
+        let vkey = generate_vkey_file(dir.path(), "payment.vkey");
+
+        let err = AddressCmd {
+            command: AddressSubcommand::Build {
+                payment_verification_key_file: vkey,
+                stake_verification_key_file: None,
+                network: "mainnnet".to_string(),
+                out_file: None,
+            },
+        }
+        .run()
+        .expect_err("unknown --network value must be an error");
+        let msg = err.to_string();
+        assert!(msg.contains("mainnnet"), "must name the bad value: {msg}");
+        assert!(
+            msg.contains("mainnet") && msg.contains("testnet"),
+            "must list accepted forms: {msg}"
+        );
+    }
+
+    /// "testnet-magic" was historically accepted as a synonym for "testnet";
+    /// keep it working.
+    #[test]
+    fn build_accepts_testnet_magic_network_synonym() {
+        let dir = tempfile::tempdir().unwrap();
+        let vkey = generate_vkey_file(dir.path(), "payment.vkey");
+        let out = dir.path().join("addr.txt");
+
+        AddressCmd {
+            command: AddressSubcommand::Build {
+                payment_verification_key_file: vkey,
+                stake_verification_key_file: None,
+                network: "testnet-magic".to_string(),
+                out_file: Some(out.clone()),
+            },
+        }
+        .run()
+        .unwrap();
+        let addr = std::fs::read_to_string(&out).unwrap();
+        assert!(addr.starts_with("addr_test1"), "got: {addr}");
     }
 
     #[test]

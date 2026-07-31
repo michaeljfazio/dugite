@@ -923,13 +923,15 @@ fn pool_id_from_cold_vkey(path: &std::path::Path) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("Missing cborHex in cold verification key file"))?;
     let cbor_bytes = hex::decode(cbor_hex)?;
 
-    // Strip CBOR wrapper (5820 prefix for 32-byte bytestring)
-    let key_bytes = if cbor_bytes.len() > 2 && cbor_bytes[0] == 0x58 && cbor_bytes[1] == 0x20 {
+    // Unwrap the CBOR wrapper only when the payload is exactly a CBOR
+    // bytes(32): 0x58 0x20 header followed by the 32 key bytes (34 bytes
+    // total). Anything else is used as-is and gated by the length check
+    // below — in particular a RAW 32-byte key whose first byte happens to
+    // fall in 0x40..=0x5F must never have a byte stripped (#934).
+    let key_bytes = if cbor_bytes.len() == 34 && cbor_bytes[0] == 0x58 && cbor_bytes[1] == 0x20 {
         &cbor_bytes[2..]
-    } else if cbor_bytes.len() > 1 && (cbor_bytes[0] & 0xe0) == 0x40 {
-        &cbor_bytes[1..]
     } else {
-        &cbor_bytes
+        &cbor_bytes[..]
     };
 
     if key_bytes.len() != 32 {
@@ -4135,6 +4137,64 @@ mod tests {
             pool_id,
             hex::encode(dugite_primitives::hash::blake2b_224(&key).as_bytes())
         );
+    }
+
+    /// A RAW (unwrapped) 32-byte key must be hashed as-is, even when its
+    /// first byte falls in 0x40..=0x5F — the old heuristic stripped one
+    /// byte whenever `(bytes[0] & 0xe0) == 0x40` and silently derived a
+    /// pool ID from a corrupted 31-byte key (#934).
+    #[test]
+    fn test_pool_id_from_cold_vkey_raw32_high_first_byte_not_stripped() {
+        let dir = tempfile::tempdir().unwrap();
+        for (i, first_two) in [[0x40u8, 0x7F], [0x41, 0x7F], [0x58, 0x20], [0x5F, 0x7F]]
+            .iter()
+            .enumerate()
+        {
+            let mut key = [0x7Fu8; 32];
+            key[0] = first_two[0];
+            key[1] = first_two[1]; // [0x58, 0x20]: worst case, looks like a bytes(32) header
+            let path = dir.path().join(format!("raw{i}.vkey"));
+            std::fs::write(
+                &path,
+                serde_json::to_string(&serde_json::json!({
+                    "type": "StakePoolVerificationKey_ed25519",
+                    "description": "",
+                    "cborHex": hex::encode(key)
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            let pool_id = pool_id_from_cold_vkey(&path).unwrap_or_else(|e| {
+                panic!(
+                    "raw 32-byte key with first byte {:#04x} must be accepted: {e}",
+                    key[0]
+                )
+            });
+            assert_eq!(
+                pool_id,
+                hex::encode(dugite_primitives::hash::blake2b_224(&key).as_bytes()),
+                "first byte {:#04x}: pool ID must hash all 32 raw bytes",
+                key[0]
+            );
+        }
+    }
+
+    /// A cborHex that CLAIMS bytes(32) (0x5820 header) but carries a short
+    /// payload must be rejected, not partially unwrapped.
+    #[test]
+    fn test_pool_id_from_cold_vkey_truncated_bytes32_wrapper_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("truncated.vkey");
+        std::fs::write(
+            &p,
+            serde_json::to_string(&serde_json::json!({
+                "cborHex": format!("5820{}", hex::encode([0u8; 31]))
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(pool_id_from_cold_vkey(&p).is_err());
     }
 
     #[test]

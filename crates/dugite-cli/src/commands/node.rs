@@ -16,10 +16,21 @@ enum NodeSubcommand {
         cold_verification_key_file: PathBuf,
         #[arg(long)]
         cold_signing_key_file: PathBuf,
-        #[arg(long)]
+        /// cardano-cli canonical: --operational-certificate-issue-counter-file
+        /// (bare --operational-certificate-issue-counter also accepted, as in
+        /// cardano-cli; --operational-certificate-counter-file is the legacy
+        /// dugite spelling).
+        #[arg(
+            long = "operational-certificate-issue-counter-file",
+            alias = "operational-certificate-issue-counter",
+            alias = "operational-certificate-counter-file"
+        )]
         operational_certificate_counter_file: PathBuf,
     },
     /// Generate a KES key pair
+    // cardano-cli canonical spelling is uppercase (it rejects `key-gen-kes`);
+    // dugite keeps the lowercase form as an alias for backward compatibility.
+    #[command(name = "key-gen-KES", alias = "key-gen-kes")]
     KeyGenKes {
         #[arg(long)]
         verification_key_file: PathBuf,
@@ -27,6 +38,7 @@ enum NodeSubcommand {
         signing_key_file: PathBuf,
     },
     /// Generate a VRF key pair
+    #[command(name = "key-gen-VRF", alias = "key-gen-vrf")]
     KeyGenVrf {
         #[arg(long)]
         verification_key_file: PathBuf,
@@ -39,7 +51,11 @@ enum NodeSubcommand {
         kes_verification_key_file: PathBuf,
         #[arg(long)]
         cold_signing_key_file: PathBuf,
-        #[arg(long)]
+        #[arg(
+            long = "operational-certificate-issue-counter-file",
+            alias = "operational-certificate-issue-counter",
+            alias = "operational-certificate-counter-file"
+        )]
         operational_certificate_counter_file: PathBuf,
         #[arg(long)]
         kes_period: u64,
@@ -52,10 +68,15 @@ enum NodeSubcommand {
         cold_verification_key_file: PathBuf,
         #[arg(long)]
         counter_value: u64,
-        #[arg(long)]
+        #[arg(
+            long = "operational-certificate-issue-counter-file",
+            alias = "operational-certificate-issue-counter",
+            alias = "operational-certificate-counter-file"
+        )]
         operational_certificate_counter_file: PathBuf,
     },
     /// Get the hash of a VRF verification key
+    #[command(name = "key-hash-VRF", alias = "key-hash-vrf")]
     KeyHashVrf {
         #[arg(long)]
         verification_key_file: PathBuf,
