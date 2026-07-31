@@ -39,6 +39,43 @@ where
     buf
 }
 
+/// Encode an `OSet`-typed field: CBOR tag 258 followed by a variable-length
+/// array, **preserving insertion order** (#940).
+///
+/// `OSet` is an *ordered* set and is NOT encoded like `Set`. Its `EncCBOR`
+/// instance (`libs/cardano-data/src/Data/OSet/Strict.hs`) is:
+///
+/// ```haskell
+/// instance EncCBOR a => EncCBOR (OSet a) where
+///   encCBOR (OSet seq _set) = encodeTag setTag <> encodeStrictSeq encCBOR seq
+/// ```
+///
+/// Two differences from [`encode_tagged_set`] that both matter:
+///
+/// 1. **No sorting.** `encodeStrictSeq` runs over the insertion-ordered
+///    sequence, so wire order is the transaction's own order. Sorting
+///    certificates would reorder them, and certificate order is semantically
+///    load-bearing (a registration must precede the delegation using it).
+/// 2. **The tag is unconditional.** There is no `ifEncodingVersionAtLeast`
+///    guard on `OSet`'s `setTag`, unlike `Set.Set`'s PV>=9-gated tag.
+///
+/// Used for Conway/Dijkstra `certificates` (key 4) and `proposal_procedures`
+/// (key 20). Pre-Conway certificates are `StrictSeq`, not `OSet` — those take
+/// [`encode_plain_array`].
+fn encode_ordered_set<T, F>(items: &[T], encode_item: F) -> Vec<u8>
+where
+    F: Fn(&T) -> Vec<u8>,
+{
+    let len = items.len();
+    let mut buf = encode_tag(258);
+    buf.extend(encode_array_open(len));
+    for item in items {
+        buf.extend(encode_item(item));
+    }
+    encode_array_close(&mut buf, len);
+    buf
+}
+
 /// Encode a sequence as a plain (untagged) array (pre-Conway eras).
 ///
 /// Pre-Conway CDDL uses `[* item]` for inputs, certificates, collateral, and
@@ -680,13 +717,18 @@ pub(super) fn encode_transaction_body_for_era(body: &TransactionBody, era: Era) 
     // 4: certificates
     // Conway CDDL: nonempty_oset<certificate> = #6.258([+ certificate])
     // Pre-Conway CDDL: [* certificate]  (plain array, no tag 258)
+    //
+    // Conway's `ctbrCerts` is an OSet, NOT a Set — insertion-ordered, so the
+    // items must never be sorted (certificate order is semantically
+    // load-bearing). Pre-Conway `stbCerts :: StrictSeq (TxCert era)` is an
+    // untagged, equally order-preserving array. #940.
     if !body.certificates.is_empty() {
         buf.extend(encode_uint(4));
-        buf.extend(encode_set_for_era(
-            era,
-            &body.certificates,
-            encode_certificate,
-        ));
+        if matches!(era, Era::Conway | Era::Dijkstra) {
+            buf.extend(encode_ordered_set(&body.certificates, encode_certificate));
+        } else {
+            buf.extend(encode_plain_array(&body.certificates, encode_certificate));
+        }
     }
 
     // 5: withdrawals
@@ -824,11 +866,12 @@ pub(super) fn encode_transaction_body_for_era(body: &TransactionBody, era: Era) 
     // 20: proposal_procedures
     if !body.proposal_procedures.is_empty() {
         buf.extend(encode_uint(20));
-        buf.extend(encode_array_open(body.proposal_procedures.len()));
-        for pp in &body.proposal_procedures {
-            buf.extend(encode_proposal_procedure(pp));
-        }
-        encode_array_close(&mut buf, body.proposal_procedures.len());
+        // OSet, like certs: unconditional tag 258 + order-preserving
+        // variable-length array (#940). Conway-only field, so no era branch.
+        buf.extend(encode_ordered_set(
+            &body.proposal_procedures,
+            encode_proposal_procedure,
+        ));
     }
 
     // 21: treasury_value
@@ -3021,6 +3064,108 @@ mod tests {
             r.skip().expect("skip value");
         }
         panic!("key {key} not found");
+    }
+
+    // ── #940: Conway certs / proposal_procedures are OSet, not Set ──
+
+    /// `OSet` encodes `encodeTag setTag <> encodeStrictSeq encCBOR seq` over the
+    /// INSERTION-ordered sequence. Sorting would reorder certificates, and
+    /// certificate order is semantically load-bearing.
+    #[test]
+    fn conway_certificates_keep_wire_order_and_are_tagged() {
+        use dugite_primitives::transaction::Certificate;
+
+        // Two certs whose CBOR encodings sort the OPPOSITE way to how they are
+        // supplied, so any sort is immediately visible.
+        let hi = Credential::VerificationKey(Hash28::from_bytes([0xff; 28]));
+        let lo = Credential::VerificationKey(Hash28::from_bytes([0x00; 28]));
+        let body_certs = vec![
+            Certificate::StakeRegistration(hi.clone()),
+            Certificate::StakeRegistration(lo.clone()),
+        ];
+
+        let mut body = minimal_body();
+        body.certificates = body_certs.clone();
+        let enc = encode_transaction_body_for_era(&body, Era::Conway);
+        let pos = find_key_value_start(&enc, 4);
+
+        // Unconditional tag 258 — OSet's setTag has no version gate.
+        assert_eq!(
+            &enc[pos..pos + 3],
+            &[0xd9, 0x01, 0x02],
+            "certs must be tagged"
+        );
+        assert_eq!(enc[pos + 3], 0x82, "definite array of 2");
+
+        // Order preserved: the 0xff cert must still come first.
+        let first = encode_certificate(&body_certs[0]);
+        assert_eq!(
+            &enc[pos + 4..pos + 4 + first.len()],
+            &first[..],
+            "certificate order must NOT be sorted"
+        );
+
+        let decoded = crate::decode::era_conway::decode_conway_tx_body(
+            &mut crate::decode::reader::Reader::new(&enc),
+            Era::Conway,
+        )
+        .expect("body must decode");
+        assert_eq!(decoded.certificates, body_certs, "order must round-trip");
+    }
+
+    /// Pre-Conway certs are `StrictSeq`: untagged, and equally order-preserving.
+    #[test]
+    fn pre_conway_certificates_are_untagged_and_ordered() {
+        use dugite_primitives::transaction::Certificate;
+
+        let hi = Credential::VerificationKey(Hash28::from_bytes([0xff; 28]));
+        let lo = Credential::VerificationKey(Hash28::from_bytes([0x00; 28]));
+        let certs = vec![
+            Certificate::StakeRegistration(hi),
+            Certificate::StakeRegistration(lo),
+        ];
+        let mut body = minimal_body();
+        body.certificates = certs.clone();
+
+        for era in [Era::Shelley, Era::Alonzo, Era::Babbage] {
+            let enc = encode_transaction_body_for_era(&body, era);
+            let pos = find_key_value_start(&enc, 4);
+            assert_ne!(
+                &enc[pos..pos + 3],
+                &[0xd9, 0x01, 0x02],
+                "{era:?} certs must NOT carry tag 258"
+            );
+            assert_eq!(enc[pos], 0x82, "{era:?} definite array of 2");
+            let first = encode_certificate(&certs[0]);
+            assert_eq!(
+                &enc[pos + 1..pos + 1 + first.len()],
+                &first[..],
+                "{era:?} certificate order must be preserved"
+            );
+        }
+    }
+
+    /// proposal_procedures is an OSet too — it was emitting a bare array.
+    #[test]
+    fn proposal_procedures_are_tagged() {
+        let mut body = minimal_body();
+        body.proposal_procedures = vec![dugite_primitives::transaction::ProposalProcedure {
+            deposit: Lovelace(100_000_000_000),
+            return_addr: vec![0xE0; 29],
+            gov_action: dugite_primitives::transaction::GovAction::InfoAction,
+            anchor: dugite_primitives::transaction::Anchor {
+                url: "https://example.com".to_string(),
+                data_hash: Hash32::ZERO,
+            },
+        }];
+        let enc = encode_transaction_body_for_era(&body, Era::Conway);
+        let pos = find_key_value_start(&enc, 20);
+        assert_eq!(
+            &enc[pos..pos + 3],
+            &[0xd9, 0x01, 0x02],
+            "proposal_procedures must carry tag 258"
+        );
+        assert_eq!(enc[pos + 3], 0x81, "definite array of 1");
     }
 
     // ── #939: Conway witness-set keys 0/1/2/3/6/7 carry the 258 set tag ──

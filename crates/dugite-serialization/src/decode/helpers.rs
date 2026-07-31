@@ -173,7 +173,21 @@ pub(crate) fn dedup_redeemers_last_wins(
 ///
 /// Rejecting `TypeTag` is deliberate and matches Haskell: a bignum-tagged
 /// integer (tag 2/3) is *not* a valid metadatum even though it denotes an
-/// integer.
+/// integer. The reference decoder's own comment says as much — "we support
+/// -(2^64) .. 2^64-1, but not big integers, not even big integer
+/// representation of values within range".
+///
+/// Chunk strictness inside the indefinite forms is asymmetric upstream, and
+/// dugite currently implements the strict side of both:
+/// - **text** — `decodeStringIndefLen` calls plain `decodeString`, which is
+///   definite-only at every version, so a nested indefinite chunk always
+///   fails. dugite matches this unconditionally.
+/// - **bytes** — `decodeBytesIndefLen` calls `decCBOR @ByteArray`, i.e.
+///   `decodeByteArray`, which is `ifDecoderVersionAtLeast (natVersion @12)`
+///   and becomes *lenient* about a nested indefinite chunk at decoder version
+///   12 or above. Every live era through Conway is PV9-11, so the strict
+///   behaviour here is correct today; revisit alongside the other
+///   PV12/Dijkstra work (#936) before that era goes live.
 ///
 /// This is decode-acceptance only. The **encoder** stays always-definite
 /// (`encodeMetadatum` uses `encodeListLen`/`encodeMapLen`, never the indefinite

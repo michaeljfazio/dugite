@@ -1576,6 +1576,9 @@ fn test_encode_gov_action_hard_fork_initiation() {
     for _ in 0..map_len {
         let k = dec.u64().unwrap();
         if k == 20 {
+            // Conway proposal_procedures is an OSet: unconditional tag 258
+            // wrapping the array (#940).
+            assert_eq!(dec.tag().unwrap(), minicbor::data::Tag::new(258));
             let pp_arr_len = dec.array().unwrap().unwrap();
             assert_eq!(pp_arr_len, 1);
             let pp_arr = dec.array().unwrap().unwrap();
@@ -1623,6 +1626,9 @@ fn test_encode_gov_action_update_committee() {
     for _ in 0..map_len {
         let k = dec.u64().unwrap();
         if k == 20 {
+            // Conway proposal_procedures is an OSet: unconditional tag 258
+            // wrapping the array (#940).
+            assert_eq!(dec.tag().unwrap(), minicbor::data::Tag::new(258));
             dec.array().unwrap(); // outer array(1)
             dec.array().unwrap(); // pp array(4)
             dec.skip().unwrap(); // deposit
@@ -1665,6 +1671,9 @@ fn test_encode_gov_action_new_constitution_with_script() {
     for _ in 0..map_len {
         let k = dec.u64().unwrap();
         if k == 20 {
+            // Conway proposal_procedures is an OSet: unconditional tag 258
+            // wrapping the array (#940).
+            assert_eq!(dec.tag().unwrap(), minicbor::data::Tag::new(258));
             dec.array().unwrap(); // array(1) of proposals
             dec.array().unwrap(); // pp: array(4)
             dec.skip().unwrap(); // deposit
@@ -1707,6 +1716,9 @@ fn test_encode_gov_action_new_constitution_no_script() {
     for _ in 0..map_len {
         let k = dec.u64().unwrap();
         if k == 20 {
+            // Conway proposal_procedures is an OSet: unconditional tag 258
+            // wrapping the array (#940).
+            assert_eq!(dec.tag().unwrap(), minicbor::data::Tag::new(258));
             dec.array().unwrap();
             dec.array().unwrap();
             dec.skip().unwrap();
@@ -2056,6 +2068,9 @@ fn encode_ppu_via_body(ppu: ProtocolParamUpdate) -> Vec<u8> {
     for _ in 0..map_len {
         let k = dec.u64().unwrap();
         if k == 20 {
+            // Conway proposal_procedures is an OSet: unconditional tag 258
+            // wrapping the array (#940).
+            assert_eq!(dec.tag().unwrap(), minicbor::data::Tag::new(258));
             dec.array().unwrap(); // array(1) proposals
             dec.array().unwrap(); // pp array(4)
             dec.skip().unwrap(); // deposit
