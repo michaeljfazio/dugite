@@ -467,7 +467,7 @@ fn read_protocol_version(r: &mut Reader<'_>) -> Result<ProtocolVersion, Serializ
 // Transaction body decoder (Conway)
 // ============================================================================
 
-fn decode_conway_tx_body(
+pub(crate) fn decode_conway_tx_body(
     r: &mut Reader<'_>,
     era: Era,
 ) -> Result<TransactionBody, SerializationError> {
@@ -764,55 +764,46 @@ fn decode_sub_transactions(
 ) -> Result<Vec<dugite_primitives::transaction::SubTransaction>, SerializationError> {
     use dugite_primitives::transaction::SubTransaction;
 
-    let len = r.read_map_header()?;
-    let mut out: Vec<SubTransaction> = match len {
-        Some(n) => Vec::with_capacity(n.min(1024) as usize),
-        None => Vec::new(),
-    };
-    let mut i: i64 = 0;
-    let total: i64 = len.map(|n| n as i64).unwrap_or(-1);
-    loop {
-        if total >= 0 && i >= total {
-            break;
-        }
-        if total < 0 {
-            let ty = r.peek_major()?;
-            if ty == minicbor::data::Type::Break {
-                r.skip()?;
-                break;
-            }
-        }
-        i += 1;
+    // Haskell `OMap` is a LIST of values on the wire — the keys are never
+    // encoded, they are reconstructed from each value via `HasOKey.toOKey`
+    // (#936). `libs/cardano-data/src/Data/OMap/Strict.hs`:
+    //
+    //   instance (EncCBOR v, Ord k) => EncCBOR (OMap k v) where
+    //     encCBOR omap = encodeStrictSeq encCBOR (toStrictSeq omap)
+    //
+    //   decodeOMap decValue =
+    //     decodeListLikeEnforceNoDuplicates decodeListLenOrIndef (flip snoc) ...
+    //
+    // `decodeListLenOrIndef` accepts either list header form, and
+    // `EnforceNoDuplicates` rejects a repeated reconstructed key outright.
+    use std::collections::HashSet;
 
-        // Key: the TxId (32-byte hash).
-        let tx_id_bytes = r.read_bytes()?;
-        let tx_id =
-            Hash32::try_from(tx_id_bytes).map_err(|_| SerializationError::InvalidLength {
-                expected: 32,
-                got: tx_id_bytes.len(),
-            })?;
+    let mut out: Vec<SubTransaction> = Vec::new();
+    let mut seen: HashSet<Hash32> = HashSet::new();
 
-        // Value: the SubTx body, captured raw so the OMap key invariant
-        // (`tx_id == blake2b_256(raw)`) can be verified after the fact.
+    r.for_each_array_item(|r| {
+        // The value is the SubTx body, captured raw so the reconstructed key
+        // is the hash of exactly the bytes that were on the wire.
         let body_raw = KeepRaw::parse_with(r, decode_sub_tx_body)?;
         let mut sub = body_raw.value;
-        sub.tx_id = tx_id;
+
+        // `toOKey` for `Tx SubTx era` is the sub-transaction id, i.e. the
+        // hash of its body bytes. Deriving it (rather than reading it from a
+        // wire key) makes the old "key smuggling" check structurally
+        // impossible: a body can only ever appear under its own id.
+        sub.tx_id = blake2b_256(body_raw.raw);
         sub.raw_body_cbor = Some(body_raw.raw.to_vec());
 
-        // Invariant: OMap.HasOKey TxId. The key must agree with the
-        // canonical hash of the body bytes. We enforce strictly here —
-        // a divergence would let an adversary smuggle one body under
-        // another body's id and have it picked up by the SUB rule.
-        let computed = blake2b_256(body_raw.raw);
-        if computed != tx_id {
+        if !seen.insert(sub.tx_id) {
             return Err(SerializationError::CborDecode(format!(
-                "sub_transactions: OMap key mismatch — key={} computed={}",
-                tx_id.to_hex(),
-                computed.to_hex()
+                "sub_transactions: duplicate sub-transaction id {} (OMap forbids duplicates)",
+                sub.tx_id.to_hex()
             )));
         }
         out.push(sub);
-    }
+        Ok(())
+    })?;
+
     Ok(out)
 }
 
@@ -4201,13 +4192,16 @@ mod tests {
     fn dijkstra_tx_body_accepts_23_25_26() {
         // A Dijkstra body carrying keys 23 (sub_transactions), 25
         // (direct_deposits) and 26 (account_balance_intervals) — each value is
-        // an empty map, the minimal valid wire form — must decode cleanly.
-        // map(4) { 2: fee, 23: {}, 25: {}, 26: {} }
+        // the minimal valid wire form — must decode cleanly.
+        // map(4) { 2: fee, 23: [], 25: {}, 26: {} }
+        //
+        // Key 23 is an OMap, which Haskell encodes as a bare ARRAY of values
+        // (`encodeStrictSeq encCBOR (toStrictSeq omap)`) — not a map (#936).
         let mut data = vec![0xa4];
         data.extend(cbor_uint(2));
         data.extend(cbor_uint(7)); // fee
         data.extend(cbor_uint(23));
-        data.extend(vec![0xa0]); // sub_transactions: empty OMap
+        data.extend(vec![0x80]); // sub_transactions: empty OMap == empty array
         data.extend(cbor_uint(25));
         data.extend(vec![0xa0]); // direct_deposits: empty map
         data.extend(cbor_uint(26));
