@@ -310,6 +310,14 @@ pub struct NodePeerManager {
     /// on the predicate's return value or on clamp enforcement (which lives
     /// in the governor filter and the connection-lifecycle chokepoints).
     sync_trusted_clamp_active: std::sync::atomic::AtomicBool,
+    /// Whether the node runs in Ouroboros Genesis consensus mode
+    /// (`ConsensusMode = Genesis`) — the `consensusMode` dimension of the
+    /// Haskell `outboundConnectionsState` case split that
+    /// [`Self::haa_satisfied`] mirrors (#933). Set once at startup from
+    /// `node/mod.rs` via [`Self::set_genesis_mode`] (same mirroring pattern
+    /// as the #931 clamp flag above); `false` = Praos, the dugite default,
+    /// matching `ConsensusMode::default()`.
+    genesis_mode: std::sync::atomic::AtomicBool,
     /// Per-connection state machine (Haskell ConnectionManager state).
     ///
     /// Tracks the lifecycle state of each connection. Used to compute
@@ -388,6 +396,7 @@ impl NodePeerManager {
             config,
             haa_warn_last_secs: std::sync::atomic::AtomicU64::new(0),
             sync_trusted_clamp_active: std::sync::atomic::AtomicBool::new(false),
+            genesis_mode: std::sync::atomic::AtomicBool::new(false),
             conn_states: HashMap::new(),
             local_addr: None,
             local_root_groups: Vec::new(),
@@ -1067,31 +1076,88 @@ impl NodePeerManager {
     /// Honest-Availability-Assumption satisfaction (Haskell
     /// `outboundConnectionsState` → `TrustedStateWithExternalPeers`).
     ///
-    /// Two independent ways to be trusted, matching the Haskell
-    /// `(associationMode, bootstrapPeersFlag, consensusMode)` case split:
-    /// - **Big-ledger trust** (Genesis mode, `DontUseBootstrapPeers`): at
-    ///   least `min_active_blp` ACTIVE big-ledger peers.
-    /// - **Trusted-external trust** (`UseBootstrapPeers` / `LocalRootsOnly`):
-    ///   there is at least one active (hot) peer in the trusted set AND every
-    ///   established (warm/hot) outbound peer is in the trusted set, where the
-    ///   trusted set is `bootstrap peers ∪ trustable local roots`. This is how
-    ///   a from-genesis node (whose ledger has not reached `useLedgerAfterSlot`
-    ///   so no big-ledger peers are classified) satisfies the HAA via its
-    ///   bootstrap relays — mirroring Haskell `outboundConnectionsState →
-    ///   TrustedStateWithExternalPeers`. Without the bootstrap-peer term such a
-    ///   node would stall permanently in PreSyncing.
+    /// Mirrors Haskell's INDEPENDENT case split over `(associationMode,
+    /// bootstrapPeersFlag, consensusMode)` — cardano-diffusion
+    /// `Cardano.Network.PeerSelection.Governor.Types.outboundConnectionsState`
+    /// at rev a98c885 (the exact pin cardano-node 11.0.1 builds against).
+    /// The branches are genuinely alternative code paths, NOT layered
+    /// AND/OR clauses (#933 — the pre-#933 layering ran the BLP count
+    /// first and fell through to the bootstrap clauses, which made the BLP
+    /// criterion structurally unreachable during clamped Genesis sync and
+    /// let a Genesis node with bootstrap peers "fall through" between
+    /// criteria in ways Haskell cannot):
+    ///
+    /// - `(LocalRootsOnly, _, _)` — NOT APPLICABLE: dugite has no
+    ///   LocalRootsOnly association mode (no configuration restricts
+    ///   dialing to local roots only — ledger-peer discovery and peer
+    ///   sharing are always available), so dugite's `associationMode` is
+    ///   always `Unrestricted`. Implement this branch (established ⊆
+    ///   trustable local roots) if such a mode is ever introduced.
+    /// - `(Unrestricted, UseBootstrapPeers{}, _)` — bootstrap peers
+    ///   configured, EITHER consensus mode: every OUTBOUND established
+    ///   (warm+hot) peer ∈ bootstrap ∪ trustable local roots AND ≥1 hot
+    ///   outbound trusted peer — see [`Self::haa_satisfied_via_bootstrap`].
+    ///   This is how a from-genesis node (whose ledger has not reached
+    ///   `useLedgerAfterSlot`, so no big-ledger peers are classified)
+    ///   satisfies the HAA via its bootstrap relays; without it such a
+    ///   node stalls permanently in PreSyncing.
+    /// - `(Unrestricted, DontUseBootstrapPeers, PraosMode)` →
+    ///   `UntrustedState`, unconditionally — and SILENTLY: this is normal
+    ///   cardano-node operation (nothing in Haskell warns here), see #931.
+    /// - `(Unrestricted, DontUseBootstrapPeers, GenesisMode)` → satisfied
+    ///   iff ≥ `min_active_blp` ACTIVE (hot) big-ledger peers, and NOTHING
+    ///   else — Haskell's branch reads only `activeNumBigLedgerPeers`,
+    ///   ignoring `viewEstablishedPeers` and local-root trust completely
+    ///   (big-ledger peers ARE the trust source in this mode).
     pub fn haa_satisfied(&self, min_active_blp: usize) -> bool {
-        if self.active_big_ledger_peer_count() >= min_active_blp {
-            return true;
+        // bootstrapPeersFlag ≙ topology `bootstrapPeers` resolved to a
+        // non-empty address set; consensusMode ≙ the startup mirror set by
+        // `set_genesis_mode`. associationMode is always Unrestricted (see
+        // the doc comment above).
+        let use_bootstrap_peers = !self.bootstrap_peer_addrs.is_empty();
+        match (use_bootstrap_peers, self.genesis_mode()) {
+            // (Unrestricted, UseBootstrapPeers{}, _)
+            (true, _) => self.haa_satisfied_via_bootstrap(),
+            // (Unrestricted, DontUseBootstrapPeers, PraosMode) →
+            // UntrustedState. Silent — Haskell treats this as normal
+            // operation; at most a throttled debug for observability.
+            (false, false) => {
+                if self.haa_warn_permitted() {
+                    tracing::debug!(
+                        "HAA not satisfied: Praos mode without bootstrap \
+                         peers is UntrustedState unconditionally (Haskell \
+                         outboundConnectionsState — normal, silent)"
+                    );
+                }
+                false
+            }
+            // (Unrestricted, DontUseBootstrapPeers, GenesisMode) →
+            // active-BLP quorum only.
+            (false, true) => self.active_big_ledger_peer_count() >= min_active_blp,
         }
+    }
+
+    /// The `(Unrestricted, UseBootstrapPeers{}, _)` branch of
+    /// [`Self::haa_satisfied`]: every OUTBOUND established (warm+hot) peer
+    /// must be in `bootstrap ∪ trustable local roots` (Haskell
+    /// `viewEstablishedPeers ⊆ viewEstablishedBootstrapPeers <>
+    /// trustableLocalRootSet`) AND at least one hot outbound peer must be
+    /// trusted. Note the deliberate (pre-#933, kept verbatim) widening of
+    /// the second condition vs Haskell's `not (Set.null
+    /// viewActiveBootstrapPeers)`: dugite accepts a hot trustable LOCAL
+    /// ROOT too, not only a hot bootstrap peer.
+    ///
+    /// Carries the #931 clamp-gated clause (a)/(b) failure diagnostics —
+    /// they only ever made sense in this branch (the clamp exists exactly
+    /// when this branch's closure is being enforced by the governor).
+    fn haa_satisfied_via_bootstrap(&self) -> bool {
         // Trusted external set = bootstrap peers ∪ trustable local roots
         // (Haskell `viewEstablishedBootstrapPeers ∪ trustableLocalRootSet`).
         // Kept in lockstep with the governor's sync-time trusted-only clamp
         // via the shared `trusted_peer_addrs()` — see that method's docs.
+        // Never empty here: this branch requires `bootstrap_peer_addrs`
+        // non-empty, and the trusted set is a superset of it.
         let trusted = self.trusted_peer_addrs();
-        if trusted.is_empty() {
-            return false;
-        }
         // Haskell `outboundConnectionsState` assesses only OUTBOUND-initiated
         // connections — peers that connect TO us (inbound) are not part of
         // the honest-availability assessment of our own chain. Without this
@@ -1107,12 +1173,15 @@ impl NodePeerManager {
                 )
             )
         };
-        // At least one ACTIVE (hot) outbound trusted peer (Haskell
-        // `not (Set.null viewActiveBootstrapPeers)`).
+        // At least one ACTIVE (hot) outbound BOOTSTRAP peer — Haskell
+        // `not (Set.null viewActiveBootstrapPeers)` is specific to bootstrap
+        // peers; a hot trustable local root satisfies the CLOSURE clause but
+        // not this one (tightened to exact Haskell semantics in #933's
+        // integration pass — previously any hot trusted peer counted).
         let hot_peers = self.inner.peers_in_state(PeerState::Hot);
         let any_hot_trusted = hot_peers
             .iter()
-            .any(|a| is_outbound(a) && trusted.contains(a));
+            .any(|a| is_outbound(a) && self.bootstrap_peer_addrs.contains(a));
         // #931: the clause (a)/(b) failure diagnostics WARN only while the
         // sync-time trusted-only clamp is actually in force. Haskell
         // reference: `outboundConnectionsState`'s `(Unrestricted,
@@ -1194,6 +1263,21 @@ impl NodePeerManager {
     fn sync_trusted_clamp_active(&self) -> bool {
         self.sync_trusted_clamp_active
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Mirror of the node's consensus mode (`ConsensusMode = Genesis` ⇒
+    /// `true`), set once at startup from `node/mod.rs` (#933). This is the
+    /// `consensusMode` dimension of the Haskell `outboundConnectionsState`
+    /// case split in [`Self::haa_satisfied`]; it is never flipped at
+    /// runtime (cardano-node's consensus mode is a boot-time constant too).
+    pub fn set_genesis_mode(&self, genesis: bool) {
+        self.genesis_mode
+            .store(genesis, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the node runs in Ouroboros Genesis consensus mode (#933).
+    fn genesis_mode(&self) -> bool {
+        self.genesis_mode.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Rate-limit gate for the `haa_satisfied` failure diagnostics: at most
@@ -1557,10 +1641,14 @@ mod tests {
     }
 
     #[test]
-    fn test_haa_satisfied_via_trusted_local_roots() {
-        // Devnet / early-boot path: HAA holds when there is ≥1 hot peer and
-        // every established peer is a trusted local root, even with zero
-        // big-ledger peers (Haskell LocalRootsOnly → TrustedStateWithExternalPeers).
+    fn test_haa_local_roots_alone_do_not_satisfy_without_bootstrap() {
+        // #933: with NO bootstrap peers configured, the case split lands in
+        // the `DontUseBootstrapPeers` branches — Praos is UntrustedState
+        // unconditionally, so a hot trustable local root alone can no longer
+        // satisfy the HAA. Haskell `outboundConnectionsState`:
+        // `(Unrestricted, DontUseBootstrapPeers, PraosMode) -> UntrustedState`
+        // (the local-root closure only appears in the LocalRootsOnly and
+        // UseBootstrapPeers branches, neither of which applies here).
         let mut pm = NodePeerManager::new(PeerManagerConfig::default());
         let root: SocketAddr = "127.0.0.1:3002".parse().unwrap();
         pm.add_local_root_group(LocalRootGroupInfo {
@@ -1572,13 +1660,47 @@ mod tests {
             behind_firewall: false,
             advertise: false,
         });
-        // Not established yet → HAA not satisfied (no BLPs, no hot peer).
-        assert!(!pm.haa_satisfied(5));
-        // Warm outbound only → still not satisfied (Haskell needs an ACTIVE peer).
+        pm.peer_connected(&root, ConnectionDirection::Outbound);
+        pm.inner.promote_to_hot(&root);
+        assert!(
+            !pm.haa_satisfied(5),
+            "Praos + DontUseBootstrapPeers is UntrustedState regardless of \
+             hot trusted local roots"
+        );
+    }
+
+    #[test]
+    fn test_haa_bootstrap_branch_requires_active_bootstrap_peer_specifically() {
+        // Haskell `(Unrestricted, UseBootstrapPeers{}, _)` requires
+        // `not (Set.null viewActiveBootstrapPeers)` — an ACTIVE (hot)
+        // BOOTSTRAP peer specifically. A hot trustable local root keeps the
+        // closure clause happy but does NOT meet the active requirement.
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        let boot: SocketAddr = "3.74.40.92:3001".parse().unwrap();
+        pm.add_bootstrap_peer(boot);
+        let root: SocketAddr = "127.0.0.1:3002".parse().unwrap();
+        pm.add_local_root_group(LocalRootGroupInfo {
+            name: "relays".into(),
+            addrs: vec![root],
+            hot_valency: 1,
+            warm_valency: 1,
+            diffusion_mode: None,
+            behind_firewall: false,
+            advertise: false,
+        });
+        // Warm local root only → not satisfied (needs an ACTIVE peer).
         pm.peer_connected(&root, ConnectionDirection::Outbound);
         assert!(!pm.haa_satisfied(5));
-        // Hot OUTBOUND trusted local root → HAA satisfied.
+        // Hot LOCAL ROOT alone → still not satisfied: Haskell demands the
+        // active peer be a BOOTSTRAP peer (`viewActiveBootstrapPeers`).
         pm.inner.promote_to_hot(&root);
+        assert!(
+            !pm.haa_satisfied(5),
+            "hot local root must not satisfy the active-bootstrap requirement"
+        );
+        // Hot BOOTSTRAP peer → satisfied (closure holds: both are trusted).
+        pm.peer_connected(&boot, ConnectionDirection::Outbound);
+        pm.inner.promote_to_hot(&boot);
         assert!(pm.haa_satisfied(5));
     }
 
@@ -1587,21 +1709,15 @@ mod tests {
         // An INBOUND connection (a downstream node connecting to us) must not
         // affect the HAA — Haskell's outboundConnectionsState assesses only
         // outbound peers. Otherwise a relay's inbound downstream flaps the HAA.
+        // (Bootstrap-configured branch: the only branch with an established-
+        // peer closure the inbound peer could otherwise violate.)
         let mut pm = NodePeerManager::new(PeerManagerConfig::default());
-        let root: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+        let boot: SocketAddr = "3.74.40.92:3001".parse().unwrap();
         let downstream: SocketAddr = "127.0.0.1:3003".parse().unwrap();
-        pm.add_local_root_group(LocalRootGroupInfo {
-            name: "upstream".into(),
-            addrs: vec![root],
-            hot_valency: 1,
-            warm_valency: 1,
-            diffusion_mode: None,
-            behind_firewall: false,
-            advertise: false,
-        });
-        pm.peer_connected(&root, ConnectionDirection::Outbound);
-        pm.inner.promote_to_hot(&root);
-        // A non-local-root INBOUND peer is established but must be ignored.
+        pm.add_bootstrap_peer(boot);
+        pm.peer_connected(&boot, ConnectionDirection::Outbound);
+        pm.inner.promote_to_hot(&boot);
+        // A non-trusted INBOUND peer is established but must be ignored.
         pm.peer_connected(&downstream, ConnectionDirection::Inbound);
         pm.inner.promote_to_hot(&downstream);
         assert!(
@@ -1613,8 +1729,7 @@ mod tests {
     #[test]
     fn test_haa_not_satisfied_with_untrusted_hot_peer() {
         // A hot peer that is NOT a local root (e.g. a public/ledger peer)
-        // does not satisfy the local-roots HAA path; only the big-ledger
-        // count can.
+        // does not satisfy the HAA in any no-bootstrap branch.
         let mut pm = NodePeerManager::new(PeerManagerConfig::default());
         let root: SocketAddr = "127.0.0.1:3002".parse().unwrap();
         let public: SocketAddr = "8.8.8.8:3001".parse().unwrap();
@@ -1869,10 +1984,13 @@ mod tests {
     /// active, WARN when it is.
     #[test]
     fn haa_clause_a_diagnostic_severity_follows_clamp() {
-        // Clause (a) failure: a trusted local root is configured but not
-        // established; the only hot outbound peer is untrusted.
+        // Clause (a) failure: a bootstrap peer is configured (so the
+        // UseBootstrapPeers branch — the only branch with clause
+        // diagnostics — governs) but not hot; the only hot outbound peer
+        // is untrusted.
         let make_pm = || {
             let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+            pm.add_bootstrap_peer("3.74.40.92:3001".parse().unwrap());
             pm.add_local_root_group(LocalRootGroupInfo {
                 name: "relays".into(),
                 addrs: vec!["127.0.0.1:3002".parse().unwrap()],
@@ -1938,6 +2056,152 @@ mod tests {
         assert!(pm.haa_satisfied(5), "clamp inactive: satisfied");
         pm.set_sync_trusted_clamp_active(true);
         assert!(pm.haa_satisfied(5), "clamp active: still satisfied");
+    }
+
+    // ─── #933 — Haskell (associationMode, bootstrapPeersFlag, consensusMode)
+    //     case split ──────────────────────────────────────────────────────────
+
+    /// Establish hot outbound big-ledger peers at indices `range`.
+    fn add_hot_blps(pm: &mut NodePeerManager, range: std::ops::Range<usize>) {
+        for i in range {
+            let addr: SocketAddr = format!("203.0.113.{}:3001", 10 + i).parse().unwrap();
+            pm.add_big_ledger_peer(addr);
+            pm.peer_connected(&addr, ConnectionDirection::Outbound);
+            pm.inner.promote_to_hot(&addr);
+        }
+    }
+
+    /// Haskell `(Unrestricted, DontUseBootstrapPeers, PraosMode) ->
+    /// UntrustedState` — unconditional. Even a full hot-BLP quorum must not
+    /// satisfy the HAA in Praos mode (pre-#933 the layered BLP clause
+    /// returned true here), and the failure must be SILENT (no WARN):
+    /// cardano-node treats Praos UntrustedState as normal operation.
+    #[test]
+    fn haa_praos_no_bootstrap_false_and_silent_even_with_blp_quorum() {
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        add_hot_blps(&mut pm, 0..5);
+        let events = capture_networking_events(|| {
+            assert!(
+                !pm.haa_satisfied(5),
+                "Praos + DontUseBootstrapPeers is UntrustedState even with \
+                 a hot-BLP quorum"
+            );
+        });
+        assert!(
+            !events.iter().any(|(lvl, _)| *lvl == tracing::Level::WARN),
+            "Praos UntrustedState is normal and must be silent — got {events:?}"
+        );
+    }
+
+    /// Haskell `(Unrestricted, DontUseBootstrapPeers, GenesisMode)` —
+    /// satisfied iff `activeNumBigLedgerPeers >= minNumberOfBigLedgerPeers`
+    /// (hot only), nothing else.
+    #[test]
+    fn haa_genesis_no_bootstrap_blp_quorum() {
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        pm.set_genesis_mode(true);
+        add_hot_blps(&mut pm, 0..4);
+        assert!(!pm.haa_satisfied(5), "4 hot BLPs < min 5 → unsatisfied");
+        add_hot_blps(&mut pm, 4..5);
+        assert!(pm.haa_satisfied(5), "5 hot BLPs >= min 5 → satisfied");
+    }
+
+    /// The Genesis `DontUseBootstrapPeers` branch ignores
+    /// `viewEstablishedPeers` and local-root trust COMPLETELY (Haskell branch
+    /// 4 reads only `activeNumBigLedgerPeers`) — established untrusted
+    /// outbound peers must NOT fail it. This is the behavior change vs the
+    /// old layering, whose clause (b) ("every established outbound peer is
+    /// trusted") could fail a Genesis node that was HAA-assessable via BLPs.
+    #[test]
+    fn haa_genesis_no_bootstrap_untrusted_established_irrelevant() {
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        pm.set_genesis_mode(true);
+        add_hot_blps(&mut pm, 0..5);
+        // Establish untrusted public outbound peers (one hot, one warm).
+        let hot_public: SocketAddr = "8.8.8.8:3001".parse().unwrap();
+        pm.peer_connected(&hot_public, ConnectionDirection::Outbound);
+        pm.inner.promote_to_hot(&hot_public);
+        let warm_public: SocketAddr = "8.8.4.4:3001".parse().unwrap();
+        pm.peer_connected(&warm_public, ConnectionDirection::Outbound);
+        assert!(!pm.untrusted_established_outbound().is_empty());
+        assert!(
+            pm.haa_satisfied(5),
+            "established untrusted outbound peers are IRRELEVANT in the \
+             Genesis DontUseBootstrapPeers branch"
+        );
+    }
+
+    /// In the Genesis `DontUseBootstrapPeers` branch, hot trustable local
+    /// roots contribute NOTHING (Haskell branch 4 has no trusted-closure
+    /// alternative) — pre-#933 the layered clause pair returned true here.
+    #[test]
+    fn haa_genesis_no_bootstrap_local_roots_cannot_satisfy() {
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        pm.set_genesis_mode(true);
+        let root: SocketAddr = "127.0.0.1:3002".parse().unwrap();
+        pm.add_local_root_group(LocalRootGroupInfo {
+            name: "relays".into(),
+            addrs: vec![root],
+            hot_valency: 1,
+            warm_valency: 1,
+            diffusion_mode: None,
+            behind_firewall: false,
+            advertise: false,
+        });
+        pm.peer_connected(&root, ConnectionDirection::Outbound);
+        pm.inner.promote_to_hot(&root);
+        assert!(
+            !pm.haa_satisfied(5),
+            "Genesis + DontUseBootstrapPeers is BLP-quorum-only; hot local \
+             roots do not satisfy it"
+        );
+    }
+
+    /// With bootstrap peers configured the `UseBootstrapPeers` branch governs
+    /// in BOTH consensus modes — a hot-BLP quorum must NOT short-circuit past
+    /// its closure (the pre-#933 layering did exactly that: the BLP clause
+    /// ran first). Haskell `(Unrestricted, UseBootstrapPeers{}, _)` requires
+    /// established ⊆ bootstrap ∪ trustable-local AND an active trusted peer,
+    /// regardless of `activeNumBigLedgerPeers`.
+    #[test]
+    fn haa_bootstrap_branch_governs_even_with_blp_quorum() {
+        for genesis in [false, true] {
+            let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+            pm.set_genesis_mode(genesis);
+            let boot: SocketAddr = "3.74.40.92:3001".parse().unwrap();
+            pm.add_bootstrap_peer(boot);
+            pm.peer_connected(&boot, ConnectionDirection::Outbound);
+            pm.inner.promote_to_hot(&boot);
+            add_hot_blps(&mut pm, 0..5);
+            // The hot BLPs are untrusted established outbound peers → the
+            // bootstrap branch's closure fails, BLP count notwithstanding.
+            assert!(
+                !pm.haa_satisfied(5),
+                "genesis={genesis}: bootstrap branch must govern (closure \
+                 violated by untrusted BLPs) even at BLP quorum"
+            );
+        }
+    }
+
+    /// The documented from-genesis property: a node with bootstrap relays
+    /// configured satisfies the HAA via them — with ZERO big-ledger peers —
+    /// in both consensus modes (Haskell `(Unrestricted, UseBootstrapPeers{},
+    /// _)` matches `_` for the mode).
+    #[test]
+    fn haa_bootstrap_branch_satisfied_with_zero_blps_both_modes() {
+        for genesis in [false, true] {
+            let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+            pm.set_genesis_mode(genesis);
+            let boot: SocketAddr = "3.74.40.92:3001".parse().unwrap();
+            pm.add_bootstrap_peer(boot);
+            pm.peer_connected(&boot, ConnectionDirection::Outbound);
+            pm.inner.promote_to_hot(&boot);
+            assert!(
+                pm.haa_satisfied(5),
+                "genesis={genesis}: a hot bootstrap relay satisfies the HAA \
+                 with zero BLPs"
+            );
+        }
     }
 
     #[test]
