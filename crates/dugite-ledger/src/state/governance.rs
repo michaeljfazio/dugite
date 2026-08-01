@@ -1651,12 +1651,42 @@ pub(crate) fn capture_governance_snapshots(
 }
 
 /// Build the DRep distribution snapshot from live state.
+///
+/// This is dugite's `psDRepDistr` analogue — captured once per epoch boundary
+/// and consumed by `ratify_proposals()`, so it IS on-chain DRep voting power,
+/// not a reporting convenience.
+///
+/// Per-credential it must sum the same three terms Haskell's `computeDRepDistr`
+/// does (`Conway/Governance/DRepPulser.hs`):
+///
+/// ```haskell
+///   stakeAndDeposits = fold $ mInstantStake <> mProposalDeposit
+///   updatedDistr = Map.insertWith (<>) dRep (stakeAndDeposits <> balance) distr
+/// ```
+///
+/// i.e. `InstantStake + ProposalDeposits + AccountBalance`. The proposal-deposit
+/// term was missing here (#949) while the LIVE query path already had it — the
+/// same term had been found missing once before and fixed only on that side, so
+/// the bug moved out of sight rather than away.
 fn capture_drep_distribution_snapshot_impl(certs: &CertSubState, gov: &mut GovSubState) {
     let mut cache: ImblHashMap<Hash32, u64> = ImblHashMap::new();
     let mut no_confidence = 0u64;
     let mut abstain = 0u64;
+
+    // Proposal deposits are keyed by each live proposal's RETURN ADDRESS staking
+    // credential and SUMMED across proposals sharing one, matching Haskell's
+    // `proposalsDeposits` (`Conway/Governance/Proposals.hs`). Registration
+    // deposits (drep/key/pool) are deliberately excluded — Haskell never reads
+    // them here.
+    let mut proposal_deposits: ImblHashMap<Hash32, u64> = ImblHashMap::new();
+    for proposal in gov.governance.proposals.values() {
+        let cred = crate::LedgerState::reward_account_to_hash(&proposal.procedure.return_addr);
+        *proposal_deposits.entry(cred).or_default() += proposal.procedure.deposit.0;
+    }
+
     for (stake_cred, drep) in &gov.governance.vote_delegations {
-        let stake = credential_stake_from(stake_cred, certs);
+        let stake = credential_stake_from(stake_cred, certs)
+            .saturating_add(proposal_deposits.get(stake_cred).copied().unwrap_or(0));
         if let Some(hash32) = drep.credential_hash32() {
             if gov.governance.dreps.get(&hash32).is_some_and(|d| d.active) {
                 *cache.entry(hash32).or_default() += stake;
@@ -9778,6 +9808,121 @@ mod tests {
         assert!(
             !still_pending_epoch5,
             "Proposal with lifetime=3 submitted at epoch 0 must expire by epoch 5"
+        );
+    }
+
+    /// #949: the FROZEN DRep distribution snapshot — the one `ratify_proposals`
+    /// consumes as on-chain voting power — must sum
+    /// `InstantStake + ProposalDeposits + AccountBalance` per delegating
+    /// credential, matching Haskell `computeDRepDistr`:
+    ///
+    /// ```haskell
+    ///   stakeAndDeposits = fold $ mInstantStake <> mProposalDeposit
+    ///   updatedDistr = Map.insertWith (<>) dRep (stakeAndDeposits <> balance) distr
+    /// ```
+    ///
+    /// The proposal-deposit term was missing here while the live query path had
+    /// it, so the bug was invisible from the query side.
+    #[test]
+    fn frozen_drep_snapshot_includes_proposal_deposits() {
+        let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        state.epochs.protocol_params.protocol_version_major = 9;
+
+        let drep_cred = Credential::VerificationKey(Hash28::from_bytes([0x7A; 28]));
+        let drep_hash = credential_to_hash(&drep_cred);
+        Arc::make_mut(&mut state.gov.governance).dreps.insert(
+            drep_hash,
+            DRepRegistration {
+                credential: drep_cred.clone(),
+                deposit: Lovelace(500_000_000),
+                anchor: None,
+                registered_epoch: EpochNo(0),
+                drep_expiry: EpochNo(100),
+                active: true,
+            },
+        );
+
+        // A stake credential that delegates its vote to that DRep, holds UTxO
+        // stake and a reward balance, AND is the return address of a live
+        // governance proposal.
+        let stake_cred = Credential::VerificationKey(Hash28::from_bytes([0x5B; 28]));
+        let stake_hash = credential_to_hash(&stake_cred);
+        Arc::make_mut(&mut state.gov.governance)
+            .vote_delegations
+            .insert(stake_hash, DRep::KeyHash(drep_hash));
+        state
+            .certs
+            .stake_distribution
+            .stake_map
+            .insert(stake_hash, Lovelace(1_000));
+        state
+            .certs
+            .reward_accounts
+            .insert(stake_hash, Lovelace(200));
+
+        // Without a proposal, the snapshot is utxo + reward.
+        state.capture_drep_distribution_snapshot();
+        assert_eq!(
+            state
+                .gov
+                .governance
+                .drep_distribution_snapshot
+                .get(&drep_hash)
+                .copied(),
+            Some(1_200),
+            "baseline must be InstantStake + AccountBalance"
+        );
+
+        // Add a live proposal whose RETURN ADDRESS is that same credential.
+        // Haskell keys deposits by the return address' staking credential and
+        // sums across proposals sharing one (`proposalsDeposits`).
+        // Reward account = 0xe0 header + the 28 credential bytes, which
+        // `reward_account_to_hash` maps back to `stake_hash`.
+        let mut return_addr = vec![0xe0u8];
+        return_addr.extend_from_slice(&stake_hash.as_ref()[..28]);
+        assert_eq!(
+            LedgerState::reward_account_to_hash(&return_addr),
+            stake_hash,
+            "return address must resolve to the delegating credential"
+        );
+
+        for i in 0..2u8 {
+            let action_id = GovActionId {
+                transaction_id: Hash32::from_bytes([0xC0 + i; 32]),
+                action_index: 0,
+            };
+            Arc::make_mut(&mut state.gov.governance).proposals.insert(
+                action_id,
+                crate::state::ProposalState {
+                    procedure: ProposalProcedure {
+                        deposit: Lovelace(100_000),
+                        return_addr: return_addr.clone(),
+                        gov_action: GovAction::InfoAction,
+                        anchor: Anchor {
+                            url: String::new(),
+                            data_hash: Hash32::ZERO,
+                        },
+                    },
+                    proposed_epoch: EpochNo(0),
+                    expires_epoch: EpochNo(100),
+                    yes_votes: 0,
+                    no_votes: 0,
+                    abstain_votes: 0,
+                    submission_index: i as u64,
+                },
+            );
+        }
+
+        state.capture_drep_distribution_snapshot();
+        assert_eq!(
+            state
+                .gov
+                .governance
+                .drep_distribution_snapshot
+                .get(&drep_hash)
+                .copied(),
+            Some(1_200 + 200_000),
+            "both proposal deposits must be summed into the frozen snapshot (#949)"
         );
     }
 }

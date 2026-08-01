@@ -663,80 +663,59 @@ impl Node {
             })
             .collect();
 
-        // Build DRep stake distribution (DRep → total delegated stake)
+        // Build DRep stake distribution (DRep -> total delegated stake).
+        //
+        // Answered from the FROZEN per-epoch snapshot, NOT live state (#950).
+        // Haskell's `queryDRepStakeDistr` (cardano-ledger-api State/Query.hs) is
+        //
+        //     distr = psDRepDistr . fst $ finishedPulserState nes
+        //
+        // and the pulser's inputs (`dpAccounts`, `dpInstantStake`,
+        // `dpDRepState`, `dpProposalDeposits`) are captured ONCE per epoch
+        // boundary by `setFreshDRepPulsingState`. Forcing the pulser to
+        // completion mid-epoch only folds chunks of that already-captured map;
+        // it never re-reads `NewEpochState`. So a mid-epoch vote delegation is
+        // invisible until the next boundary — and a credential REGISTERED
+        // mid-epoch is not in `dpAccounts` at all, so no amount of pulsing can
+        // surface it.
+        //
+        // This previously recomputed the distribution live on every snapshot
+        // build, which over-reported any DRep that had just received a
+        // delegation. Architecturally the same mistake as #922, where
+        // `GetProposals` served live `cgsProposals` instead of the pulser's
+        // frozen `dpProposals`.
+        //
+        // `drep_distribution_snapshot` + the two predefined-DRep companions are
+        // dugite's `psDRepDistr`; they already sum
+        // `InstantStake + ProposalDeposits + AccountBalance` per credential
+        // (the deposit term was added in #949).
         let drep_stake_distr: Vec<DRepStakeEntry> = {
-            use dugite_primitives::transaction::DRep;
-            let mut drep_stakes: std::collections::HashMap<String, (u8, Option<Vec<u8>>, u64)> =
-                std::collections::HashMap::new();
-            // Haskell `computeDRepDistr` (Conway/Governance/DRepPulser.hs:200-241)
-            // sums THREE things per delegating credential:
-            //   InstantStake[cred] + ProposalDeposits[cred] + AccountBalance[cred]
-            // i.e. UTxO-derived stake, the governance-action deposits attributed
-            // to that credential, and its reward-account balance.
-            //
-            // This query previously used only the UTxO stake map, so it under-
-            // reported every DRep. On the devnet that was 800,000 ADA of live
-            // proposal deposits missing from a single DRep's reported power.
-            //
-            // Proposal deposits are keyed by each live proposal's RETURN ADDRESS
-            // staking credential and SUMMED across proposals sharing one
-            // (`proposalsDeposits`, Conway/Governance/Proposals.hs:566-579).
-            // Registration deposits (drep/key/pool) are deliberately NOT included
-            // — Haskell never reads them here.
-            let mut proposal_deposits: std::collections::HashMap<
-                dugite_primitives::hash::Hash32,
-                u64,
-            > = std::collections::HashMap::new();
-            for proposal in ls.gov.governance.proposals.values() {
-                let cred = dugite_ledger::LedgerState::reward_account_to_hash(
-                    &proposal.procedure.return_addr,
-                );
-                *proposal_deposits.entry(cred).or_default() += proposal.procedure.deposit.0;
-            }
-
-            for (stake_cred, drep) in &ls.gov.governance.vote_delegations {
-                let utxo_stake = ls
-                    .certs
-                    .stake_distribution
-                    .stake_map
-                    .get(stake_cred)
-                    .map(|l| l.0)
-                    .unwrap_or(0);
-                let reward_balance = ls
-                    .certs
-                    .reward_accounts
-                    .get(stake_cred)
-                    .map(|l| l.0)
-                    .unwrap_or(0);
-                let deposits = proposal_deposits.get(stake_cred).copied().unwrap_or(0);
-                let stake = utxo_stake
-                    .saturating_add(reward_balance)
-                    .saturating_add(deposits);
-                let (key, drep_type, drep_hash) = match drep {
-                    DRep::KeyHash(h) => {
-                        let hb = h.as_ref()[..28].to_vec();
-                        (format!("0:{}", hex::encode(&hb)), 0u8, Some(hb))
-                    }
-                    DRep::ScriptHash(h) => {
-                        let hb = h.as_ref().to_vec();
-                        (format!("1:{}", hex::encode(&hb)), 1u8, Some(hb))
-                    }
-                    DRep::Abstain => ("2:abstain".to_string(), 2u8, None),
-                    DRep::NoConfidence => ("3:noconf".to_string(), 3u8, None),
-                };
-                let entry = drep_stakes
-                    .entry(key)
-                    .or_insert((drep_type, drep_hash.clone(), 0));
-                entry.2 += stake;
-            }
-            drep_stakes
-                .into_values()
-                .map(|(drep_type, drep_hash, stake)| DRepStakeEntry {
-                    drep_type,
-                    drep_hash,
-                    stake,
+            let gov = &ls.gov.governance;
+            let mut entries: Vec<DRepStakeEntry> = gov
+                .drep_distribution_snapshot
+                .iter()
+                .map(|(hash32, stake)| DRepStakeEntry {
+                    drep_type: 0,
+                    // The snapshot key is a Hash32 padded from a 28-byte DRep
+                    // key hash; the wire form is the bare 28 bytes.
+                    drep_hash: Some(hash32.as_ref()[..28].to_vec()),
+                    stake: *stake,
                 })
-                .collect()
+                .collect();
+            // Haskell keeps both predefined DReps in the SAME `psDRepDistr` map
+            // and does not special-case them (`addToDRepDistr` takes
+            // `updatedDistr` unconditionally for both), so emit them alongside.
+            entries.push(DRepStakeEntry {
+                drep_type: 2,
+                drep_hash: None,
+                stake: gov.drep_snapshot_abstain,
+            });
+            entries.push(DRepStakeEntry {
+                drep_type: 3,
+                drep_hash: None,
+                stake: gov.drep_snapshot_no_confidence,
+            });
+            entries
         };
 
         // Build vote delegatee entries.
