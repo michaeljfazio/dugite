@@ -1649,6 +1649,13 @@ fn read_hash28_cert(r: &mut Reader<'_>) -> Result<Hash28, SerializationError> {
 ///      / [2]                 ; Abstain
 ///      / [3]                 ; NoConfidence
 /// ```
+/// Test-only re-export of [`read_drep`] so the encoder's round-trip test can
+/// prove `encode_drep` produces bytes THIS decoder accepts (#948).
+#[cfg(test)]
+pub(crate) fn read_drep_for_test(r: &mut Reader<'_>) -> Result<DRep, SerializationError> {
+    read_drep(r)
+}
+
 fn read_drep(r: &mut Reader<'_>) -> Result<DRep, SerializationError> {
     let arr_len = r.read_array_header()?;
     if arr_len.is_none() {
