@@ -26,6 +26,12 @@
             openssl
             zlib
 
+            # REQUIRED to build the workspace at all: crates/dugite-rpc's
+            # build.rs runs tonic_prost_build::compile_protos, and dugite-node
+            # depends on dugite-rpc. Without this, `nix develop` hands you a
+            # shell the project cannot build in (#946).
+            protobuf
+
             # Task runner
             just
 
@@ -42,6 +48,10 @@
             darwin.apple_sdk.frameworks.SystemConfiguration
           ];
 
+        # prost-build locates protoc via $PROTOC when it is not on a
+        # conventional path.
+        PROTOC = "${pkgs.protobuf}/bin/protoc";
+
         shellHook = ''
           echo "🦀 Dugite - Cardano Node in Rust"
           echo ""
@@ -57,7 +67,8 @@
           echo "  cargo build --release              # Build release binary"
           echo "  cargo run -p dugite-node -- --help"
           echo "  cargo run -p dugite-cli -- --help"
-          echo "  cargo run -p dugite-tui"
+          echo "  cargo run -p dugite-monitor        # terminal dashboard"
+          echo "  cargo run -p dugite-config         # config editor TUI"
         '';
       };
   };
