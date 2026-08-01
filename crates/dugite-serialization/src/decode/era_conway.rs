@@ -1444,6 +1444,16 @@ pub fn reference_native_script_original_bytes(output_cbor: &[u8]) -> Option<Vec<
 /// 17 = unreg_drep (Conway: DRep deregistration)
 /// 18 = update_drep (Conway: DRep update)
 /// ```
+/// Test-only re-export of [`read_conway_certificate`] so the encoder's
+/// round-trip test can prove `encode_certificate` produces bytes THIS decoder
+/// accepts. #948 was exactly this asymmetry going unnoticed.
+#[cfg(test)]
+pub(crate) fn read_conway_certificate_for_test(
+    r: &mut Reader<'_>,
+) -> Result<Certificate, SerializationError> {
+    read_conway_certificate(r)
+}
+
 fn read_conway_certificate(r: &mut Reader<'_>) -> Result<Certificate, SerializationError> {
     let arr_len = r.read_array_header()?;
     if arr_len.is_none() {
