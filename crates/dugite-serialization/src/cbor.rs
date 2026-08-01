@@ -114,19 +114,65 @@ pub fn encode_uint(value: u64) -> Vec<u8> {
     }
     buf
 }
+/// Emit a CBOR negative integer (major type 1) from its u64 *magnitude* `m`,
+/// which denotes the value `-1 - m`. Kept separate from [`encode_int`] so the
+/// Plutus path never depends on that function's `i128 as u64` cast (#952).
+fn encode_nint_from_magnitude(m: u64) -> Vec<u8> {
+    let mut buf = Vec::new();
+    if m < 24 {
+        buf.push(0x20 | m as u8);
+    } else if m < 256 {
+        buf.push(0x38);
+        buf.push(m as u8);
+    } else if m < 65536 {
+        buf.push(0x39);
+        buf.extend_from_slice(&(m as u16).to_be_bytes());
+    } else if m < 4294967296 {
+        buf.push(0x3a);
+        buf.extend_from_slice(&(m as u32).to_be_bytes());
+    } else {
+        buf.push(0x3b);
+        buf.extend_from_slice(&m.to_be_bytes());
+    }
+    buf
+}
 
 /// Encode an arbitrary-precision Plutus integer to CBOR.
 ///
-/// Plutus values are unbounded (Haskell `Integer`). For magnitudes that fit in
-/// i128 we emit the small-int encoding (major types 0/1); larger values use
-/// CBOR tag 2 (positive bigint) or tag 3 (negative bigint) followed by a
-/// byte-string of the big-endian magnitude.
+/// Plutus values are unbounded (Haskell `Integer`). Values in
+/// `[-(2^64) .. 2^64 - 1]` — the native range of a CBOR Word64 argument — use
+/// the plain small-int encoding (major types 0/1); anything outside uses CBOR
+/// tag 2 (positive bigint) or tag 3 (negative bigint) followed by a byte-string
+/// of the big-endian magnitude (`i` for tag 2, `-1 - i` for tag 3).
 pub fn encode_plutus_int(value: &num_bigint::BigInt) -> Vec<u8> {
     use num_bigint::Sign;
     use num_traits::ToPrimitive;
-    if let Some(v) = value.to_i128() {
-        return encode_int(v);
+
+    // The plain major-type-0/1 range is EXACTLY [-(2^64) .. 2^64 - 1] — the
+    // native range of a CBOR Word64 argument (major type 1 encodes -(1+n) with
+    // n maxing at 2^64-1, giving -2^64). Haskell
+    // `PlutusCore.Data.encodeInteger`:
+    //
+    //   encodeInteger i | i >= 0, i <= fromIntegral (maxBound :: Word64) = CBOR.encodeInteger i
+    //   encodeInteger i | i < 0,  i >= -1 - fromIntegral (maxBound :: Word64) = CBOR.encodeInteger i
+    //
+    // This used to gate on `to_i128()` and hand the result to `encode_int`,
+    // whose `value as u64` is a SILENT TRUNCATING CAST — so every integer in
+    // (2^64, i128::MAX] was wrapped mod 2^64, changing script_data_hash (#952).
+    // Gate on the BigInt directly and never route the plain case through
+    // `encode_int`: that function is only safe for its i64-scale callers.
+    if value.sign() != Sign::Minus {
+        if let Some(v) = value.to_u64() {
+            return encode_uint(v);
+        }
+    } else {
+        // Major type 1 stores the magnitude m, denoting -1 - m.
+        let magnitude = -value - num_bigint::BigInt::from(1);
+        if let Some(m) = magnitude.to_u64() {
+            return encode_nint_from_magnitude(m);
+        }
     }
+
     let (tag, mag) = if value.sign() == Sign::Minus {
         let n = -value - num_bigint::BigInt::from(1);
         let (_, bytes) = n.to_bytes_be();
@@ -144,8 +190,22 @@ pub fn encode_plutus_int(value: &num_bigint::BigInt) -> Vec<u8> {
     buf
 }
 
-/// Encode a signed integer to CBOR
+/// Encode a signed integer to CBOR.
+///
+/// **Only valid for values representable by a CBOR Word64 argument**, i.e.
+/// `[-(2^64) .. 2^64 - 1]`. The casts below are truncating, so a caller passing
+/// a wider `i128` silently gets a wrong value — that is exactly how #952
+/// wrapped Plutus integers mod 2^64 and changed `script_data_hash`.
+///
+/// Every current caller (protocol params, value, certificate, script, metadatum)
+/// sources i64-scale fields. Arbitrary-precision input must go through
+/// [`encode_plutus_int`], which gates on the `BigInt` directly.
 pub fn encode_int(value: i128) -> Vec<u8> {
+    debug_assert!(
+        value <= u64::MAX as i128 && value >= -(1i128 << 64),
+        "encode_int cannot represent {value}: outside CBOR's [-(2^64), 2^64-1] \
+         (use encode_plutus_int for arbitrary precision) — see #952"
+    );
     if value >= 0 {
         encode_uint(value as u64)
     } else {
