@@ -149,6 +149,22 @@ pub fn encode_protocol_param_update(ppu: &ProtocolParamUpdate) -> Vec<u8> {
         buf.extend(encode_rational(
             ppu.dvt_committee_no_confidence.as_ref().unwrap_or(&zero),
         ));
+        // Order is load-bearing and matches Haskell `EncCBOR DRepVotingThresholds`
+        // (Conway/PParams.hs) element for element:
+        //   0 motionNoConfidence   5 ppNetworkGroup
+        //   1 committeeNormal      6 ppEconomicGroup
+        //   2 committeeNoConfidence 7 ppTechnicalGroup
+        //   3 updateToConstitution  8 ppGovGroup
+        //   4 hardForkInitiation    9 treasuryWithdrawal
+        //
+        // This previously dropped `constitution` from index 3, shifted the next
+        // six up by one, and appended it at index 9 — so a dugite-built
+        // ParameterChange proposing new DRep thresholds installed the WRONG
+        // ones (hard-fork threshold into the constitution slot, and so on).
+        // The decoder was always right; only this side was wrong (#951).
+        buf.extend(encode_rational(
+            ppu.dvt_constitution.as_ref().unwrap_or(&zero),
+        ));
         buf.extend(encode_rational(ppu.dvt_hard_fork.as_ref().unwrap_or(&zero)));
         buf.extend(encode_rational(
             ppu.dvt_pp_network_group.as_ref().unwrap_or(&zero),
@@ -164,9 +180,6 @@ pub fn encode_protocol_param_update(ppu: &ProtocolParamUpdate) -> Vec<u8> {
         ));
         buf.extend(encode_rational(
             ppu.dvt_treasury_withdrawal.as_ref().unwrap_or(&zero),
-        ));
-        buf.extend(encode_rational(
-            ppu.dvt_constitution.as_ref().unwrap_or(&zero),
         ));
         entries.push((26, buf));
     }
@@ -925,5 +938,209 @@ mod tests {
             "first byte must be a CBOR map header, got {:#04x}",
             first[0]
         );
+    }
+
+    /// Round-trip every Conway-valid `ProtocolParamUpdate` field with a
+    /// distinct value.
+    ///
+    /// This is the test that caught #951: the encoder wrote
+    /// `drep_voting_thresholds` (key 26) in the wrong order — dropping
+    /// `constitution` from index 3, shifting six fields up, and appending it at
+    /// index 9 — so a dugite-built ParameterChange installed the WRONG
+    /// thresholds. It also guards the #919 class (key 15 decoded then dropped).
+    ///
+    /// Two deliberate accommodations, both verified rather than assumed:
+    ///
+    /// 1. `min_utxo_value`, `d`, `extra_entropy` and `protocol_version_*` are
+    ///    Babbage-only (PPU keys 12-15) and are NOT part of the Conway PPU —
+    ///    Conway moves protocol-version changes to the `HardForkInitiation`
+    ///    governance action. They are asserted absent, not round-tripped.
+    /// 2. `read_rational` reduces fractions, so 10/100 comes back as 1/10.
+    ///    Rationals are therefore compared by VALUE, not struct equality.
+    ///
+    /// NOTE this is necessary but NOT sufficient: a shared wrong order on both
+    /// halves would still pass. #951 was caught only because the two disagreed.
+    /// The durable guard is a Haskell-derived fixture.
+    #[test]
+    fn protocol_param_update_round_trips_every_conway_field() {
+        use dugite_primitives::transaction::{ProtocolParamUpdate, Rational};
+        use dugite_primitives::value::Lovelace;
+
+        fn rat(n: u64) -> Option<Rational> {
+            Some(Rational {
+                numerator: n,
+                denominator: 100,
+            })
+        }
+        /// Compare by value: a/b == c/d  <=>  a*d == c*b.
+        fn rat_eq(a: &Option<Rational>, b: &Option<Rational>, what: &str) {
+            match (a, b) {
+                (Some(x), Some(y)) => assert_eq!(
+                    x.numerator as i128 * y.denominator as i128,
+                    y.numerator as i128 * x.denominator as i128,
+                    "{what}: {x:?} != {y:?} by value"
+                ),
+                (None, None) => {}
+                _ => panic!("{what}: presence mismatch {a:?} vs {b:?}"),
+            }
+        }
+
+        let ppu = ProtocolParamUpdate {
+            min_fee_a: Some(101),
+            min_fee_b: Some(102),
+            max_block_body_size: Some(103),
+            max_tx_size: Some(104),
+            max_block_header_size: Some(105),
+            key_deposit: Some(Lovelace(1006)),
+            pool_deposit: Some(Lovelace(1007)),
+            e_max: Some(108),
+            n_opt: Some(109),
+            a0: rat(10),
+            rho: rat(11),
+            tau: rat(12),
+            min_pool_cost: Some(Lovelace(1013)),
+            ada_per_utxo_byte: Some(Lovelace(1014)),
+            max_val_size: Some(116),
+            collateral_percentage: Some(117),
+            max_collateral_inputs: Some(118),
+            min_fee_ref_script_cost_per_byte: rat(19),
+            drep_deposit: Some(Lovelace(1023)),
+            gov_action_deposit: Some(Lovelace(1024)),
+            gov_action_lifetime: Some(125),
+            // 10 DRep thresholds, each distinct so any permutation shows up.
+            dvt_no_confidence: rat(31),
+            dvt_committee_normal: rat(32),
+            dvt_committee_no_confidence: rat(33),
+            dvt_constitution: rat(34),
+            dvt_hard_fork: rat(30),
+            dvt_pp_network_group: rat(26),
+            dvt_pp_economic_group: rat(27),
+            dvt_pp_technical_group: rat(28),
+            dvt_pp_gov_group: rat(29),
+            dvt_treasury_withdrawal: rat(35),
+            // 5 pool thresholds.
+            pvt_motion_no_confidence: rat(36),
+            pvt_committee_normal: rat(37),
+            pvt_committee_no_confidence: rat(38),
+            pvt_hard_fork: rat(39),
+            pvt_pp_security_group: rat(40),
+            ..Default::default()
+        };
+
+        let enc = encode_protocol_param_update(&ppu);
+        let d = crate::decode::era_conway::read_protocol_param_update_for_test(
+            &mut crate::decode::reader::Reader::new(&enc),
+        )
+        .expect("PPU must decode its own encoding");
+
+        // Scalars must survive exactly.
+        assert_eq!(d.min_fee_a, ppu.min_fee_a);
+        assert_eq!(d.min_fee_b, ppu.min_fee_b);
+        assert_eq!(d.max_block_body_size, ppu.max_block_body_size);
+        assert_eq!(d.max_tx_size, ppu.max_tx_size);
+        assert_eq!(d.max_block_header_size, ppu.max_block_header_size);
+        assert_eq!(d.key_deposit, ppu.key_deposit);
+        assert_eq!(d.pool_deposit, ppu.pool_deposit);
+        assert_eq!(d.e_max, ppu.e_max);
+        assert_eq!(d.n_opt, ppu.n_opt);
+        assert_eq!(d.min_pool_cost, ppu.min_pool_cost);
+        assert_eq!(d.ada_per_utxo_byte, ppu.ada_per_utxo_byte);
+        assert_eq!(d.max_val_size, ppu.max_val_size);
+        assert_eq!(d.collateral_percentage, ppu.collateral_percentage);
+        assert_eq!(d.max_collateral_inputs, ppu.max_collateral_inputs);
+        assert_eq!(d.drep_deposit, ppu.drep_deposit);
+        assert_eq!(d.gov_action_deposit, ppu.gov_action_deposit);
+        assert_eq!(d.gov_action_lifetime, ppu.gov_action_lifetime);
+
+        // Rationals by value.
+        for (got, want, what) in [
+            (&d.a0, &ppu.a0, "a0"),
+            (&d.rho, &ppu.rho, "rho"),
+            (&d.tau, &ppu.tau, "tau"),
+            (
+                &d.min_fee_ref_script_cost_per_byte,
+                &ppu.min_fee_ref_script_cost_per_byte,
+                "min_fee_ref_script_cost_per_byte",
+            ),
+            (
+                &d.dvt_no_confidence,
+                &ppu.dvt_no_confidence,
+                "dvt_no_confidence",
+            ),
+            (
+                &d.dvt_committee_normal,
+                &ppu.dvt_committee_normal,
+                "dvt_committee_normal",
+            ),
+            (
+                &d.dvt_committee_no_confidence,
+                &ppu.dvt_committee_no_confidence,
+                "dvt_committee_no_confidence",
+            ),
+            (
+                &d.dvt_constitution,
+                &ppu.dvt_constitution,
+                "dvt_constitution",
+            ),
+            (&d.dvt_hard_fork, &ppu.dvt_hard_fork, "dvt_hard_fork"),
+            (
+                &d.dvt_pp_network_group,
+                &ppu.dvt_pp_network_group,
+                "dvt_pp_network_group",
+            ),
+            (
+                &d.dvt_pp_economic_group,
+                &ppu.dvt_pp_economic_group,
+                "dvt_pp_economic_group",
+            ),
+            (
+                &d.dvt_pp_technical_group,
+                &ppu.dvt_pp_technical_group,
+                "dvt_pp_technical_group",
+            ),
+            (
+                &d.dvt_pp_gov_group,
+                &ppu.dvt_pp_gov_group,
+                "dvt_pp_gov_group",
+            ),
+            (
+                &d.dvt_treasury_withdrawal,
+                &ppu.dvt_treasury_withdrawal,
+                "dvt_treasury_withdrawal",
+            ),
+            (
+                &d.pvt_motion_no_confidence,
+                &ppu.pvt_motion_no_confidence,
+                "pvt_motion_no_confidence",
+            ),
+            (
+                &d.pvt_committee_normal,
+                &ppu.pvt_committee_normal,
+                "pvt_committee_normal",
+            ),
+            (
+                &d.pvt_committee_no_confidence,
+                &ppu.pvt_committee_no_confidence,
+                "pvt_committee_no_confidence",
+            ),
+            (&d.pvt_hard_fork, &ppu.pvt_hard_fork, "pvt_hard_fork"),
+            (
+                &d.pvt_pp_security_group,
+                &ppu.pvt_pp_security_group,
+                "pvt_pp_security_group",
+            ),
+        ] {
+            rat_eq(got, want, what);
+        }
+
+        // Babbage-only PPU keys 12-15 must NOT appear in a Conway encoding.
+        assert_eq!(d.min_utxo_value, None, "min_utxo_value is Babbage-only");
+        assert_eq!(d.d, None, "decentralization is Babbage-only");
+        assert_eq!(d.extra_entropy, None, "extra_entropy is Babbage-only");
+        assert_eq!(
+            d.protocol_version_major, None,
+            "Conway moves protocol version to HardForkInitiation"
+        );
+        assert_eq!(d.protocol_version_minor, None);
     }
 }

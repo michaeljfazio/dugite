@@ -1089,4 +1089,181 @@ mod tests {
             assert_eq!(enc.len(), 4 + 28, "no trailing padding bytes");
         }
     }
+
+    // ── Governance round-trip through our OWN decoders ──
+    //
+    // This area has already produced two encode/decode asymmetries: #932
+    // (`encode_voter` StakePool emitting 32B where CDDL wants bstr(28)) and
+    // #948 (`encode_drep` KeyHash, same shape). Both were invisible to tests
+    // that asserted the encoder's own output rather than reading it back.
+
+    fn rt_anchor() -> Anchor {
+        Anchor {
+            url: "https://example.com/a.json".to_string(),
+            data_hash: Hash32::from_bytes([0x9E; 32]),
+        }
+    }
+
+    fn rt_action_id(b: u8) -> GovActionId {
+        GovActionId {
+            transaction_id: Hash32::from_bytes([b; 32]),
+            action_index: 1,
+        }
+    }
+
+    /// Every `GovAction` variant must decode back to itself.
+    #[test]
+    fn every_gov_action_round_trips_through_our_own_decoder() {
+        use dugite_primitives::credentials::Credential;
+        use dugite_primitives::hash::Hash28;
+        use dugite_primitives::transaction::{
+            Constitution, GovAction, ProtocolParamUpdate, Rational,
+        };
+        use dugite_primitives::value::Lovelace;
+        use std::collections::BTreeMap;
+
+        let key = Credential::VerificationKey(Hash28::from_bytes([0x11; 28]));
+        let script = Credential::Script(Hash28::from_bytes([0x22; 28]));
+        let ppu = ProtocolParamUpdate {
+            max_block_body_size: Some(90_112),
+            ..Default::default()
+        };
+
+        let mut withdrawals: BTreeMap<Vec<u8>, Lovelace> = BTreeMap::new();
+        let mut ra = vec![0xe0u8];
+        ra.extend_from_slice(&[0x33; 28]);
+        withdrawals.insert(ra, Lovelace(1_000_000));
+
+        let mut members_to_add: BTreeMap<Credential, u64> = BTreeMap::new();
+        members_to_add.insert(key.clone(), 12);
+
+        let cases: Vec<GovAction> = vec![
+            GovAction::InfoAction,
+            GovAction::NoConfidence {
+                prev_action_id: None,
+            },
+            GovAction::NoConfidence {
+                prev_action_id: Some(rt_action_id(0xA1)),
+            },
+            GovAction::ParameterChange {
+                prev_action_id: Some(rt_action_id(0xA2)),
+                protocol_param_update: Box::new(ppu.clone()),
+                policy_hash: None,
+            },
+            GovAction::ParameterChange {
+                prev_action_id: None,
+                protocol_param_update: Box::new(ppu),
+                policy_hash: Some(Hash28::from_bytes([0x44; 28])),
+            },
+            GovAction::HardForkInitiation {
+                prev_action_id: Some(rt_action_id(0xA3)),
+                protocol_version: (11, 0),
+            },
+            GovAction::TreasuryWithdrawals {
+                withdrawals: withdrawals.clone(),
+                policy_hash: None,
+            },
+            GovAction::TreasuryWithdrawals {
+                withdrawals,
+                policy_hash: Some(Hash28::from_bytes([0x55; 28])),
+            },
+            GovAction::UpdateCommittee {
+                prev_action_id: Some(rt_action_id(0xA4)),
+                members_to_remove: vec![script.clone()],
+                members_to_add,
+                threshold: Rational {
+                    numerator: 1,
+                    denominator: 2,
+                },
+            },
+            GovAction::NewConstitution {
+                prev_action_id: None,
+                constitution: Constitution {
+                    anchor: rt_anchor(),
+                    script_hash: Some(Hash28::from_bytes([0x66; 28])),
+                },
+            },
+            GovAction::NewConstitution {
+                prev_action_id: Some(rt_action_id(0xA5)),
+                constitution: Constitution {
+                    anchor: rt_anchor(),
+                    script_hash: None,
+                },
+            },
+        ];
+
+        let mut failures = Vec::new();
+        for action in &cases {
+            let enc = encode_gov_action(action);
+            match crate::decode::era_conway::read_gov_action_for_test(
+                &mut crate::decode::reader::Reader::new(&enc),
+            ) {
+                Err(e) => failures.push(format!("{action:?}\n     FAILED to decode: {e}")),
+                Ok(d) if &d != action => failures.push(format!("{action:?}\n     became {d:?}")),
+                Ok(_) => {}
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "gov actions must decode to themselves:\n  - {}",
+            failures.join("\n  - ")
+        );
+    }
+
+    /// Every `Voter` discriminator (0-4) must decode back to itself. #932 fixed
+    /// the StakePool arm; this pins all five.
+    #[test]
+    fn every_voter_round_trips_through_our_own_decoder() {
+        use dugite_primitives::credentials::Credential;
+        use dugite_primitives::hash::Hash28;
+        use dugite_primitives::transaction::Voter;
+
+        let cases = vec![
+            Voter::ConstitutionalCommittee(Credential::VerificationKey(Hash28::from_bytes(
+                [0x11; 28],
+            ))),
+            Voter::ConstitutionalCommittee(Credential::Script(Hash28::from_bytes([0x22; 28]))),
+            Voter::DRep(Credential::VerificationKey(Hash28::from_bytes([0x33; 28]))),
+            Voter::DRep(Credential::Script(Hash28::from_bytes([0x44; 28]))),
+            Voter::StakePool(Hash28::from_bytes([0x55; 28]).to_hash32_padded()),
+        ];
+
+        let mut failures = Vec::new();
+        for voter in &cases {
+            let enc = encode_voter(voter);
+            match crate::decode::era_conway::read_voter_for_test(
+                &mut crate::decode::reader::Reader::new(&enc),
+            ) {
+                Err(e) => failures.push(format!("{voter:?} FAILED to decode: {e}")),
+                Ok(d) if &d != voter => failures.push(format!("{voter:?} became {d:?}")),
+                Ok(_) => {}
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "voters must decode to themselves:\n  - {}",
+            failures.join("\n  - ")
+        );
+    }
+
+    /// `VotingProcedure` (vote + optional anchor) must round-trip.
+    #[test]
+    fn voting_procedures_round_trip_through_our_own_decoder() {
+        use dugite_primitives::transaction::{Vote, VotingProcedure};
+
+        for vote in [Vote::Yes, Vote::No, Vote::Abstain] {
+            for anchor in [None, Some(rt_anchor())] {
+                let proc = VotingProcedure {
+                    vote: vote.clone(),
+                    anchor: anchor.clone(),
+                };
+                let enc = encode_voting_procedure(&proc);
+                let decoded = crate::decode::era_conway::read_voting_procedure_for_test(
+                    &mut crate::decode::reader::Reader::new(&enc),
+                )
+                .unwrap_or_else(|e| panic!("{proc:?} must decode: {e}"));
+                assert_eq!(decoded, proc, "{proc:?} must round-trip unchanged");
+            }
+        }
+    }
 }
