@@ -808,11 +808,15 @@ pub(super) fn encode_transaction_body_for_era(body: &TransactionBody, era: Era) 
     //   Issue #475 Phase 3.5.
     if emit_key14_legacy {
         buf.extend(encode_uint(14));
-        buf.extend(encode_array_open(body.required_signers.len()));
-        for hash in &body.required_signers {
-            buf.extend(encode_bytes(&hash.as_bytes()[..28]));
-        }
-        encode_array_close(&mut buf, body.required_signers.len());
+        // `ctbrReqSignerHashes :: Set (KeyHash Guard)` goes through `encodeSet`,
+        // so it carries tag 258 from PV9 on and is sorted by the key hash —
+        // which for a bare bstr(28) is exactly lexicographic CBOR order. This
+        // used to emit a bare untagged array (#947); key 14 lives INSIDE the tx
+        // body, so the omission changed the transaction id relative to
+        // cardano-cli for the same logical transaction.
+        buf.extend(encode_set_for_era(era, &body.required_signers, |hash| {
+            encode_bytes(&hash.as_bytes()[..28])
+        }));
     } else if emit_key14_dijkstra {
         buf.extend(encode_uint(14));
         // Compose the on-wire set from `guards` when present; otherwise fall
@@ -838,6 +842,16 @@ pub(super) fn encode_transaction_body_for_era(body: &TransactionBody, era: Era) 
         // `Credential` already carries in dugite-primitives).
         entries.sort();
         entries.dedup();
+        // OSet: tag 258 is UNCONDITIONAL upstream (no `ifEncodingVersionAtLeast`
+        // guard, unlike `Set`'s PV>=9 gate) — #940/#947.
+        //
+        // NOTE the sort above: `OSet` is insertion-ordered and `encodeStrictSeq`s
+        // its sequence, so sorting an OSet is precisely what #940 fixed for
+        // certificates. It is defensible HERE only because dugite synthesises
+        // this set from `required_signers`, leaving no meaningful insertion
+        // order to preserve. Do not copy the justification elsewhere; re-verify
+        // when Dijkstra stabilises.
+        buf.extend(encode_tag(258));
         buf.extend(encode_array_open(entries.len()));
         for cred in &entries {
             buf.extend(super::certificate::encode_credential(cred));
@@ -3082,6 +3096,59 @@ mod tests {
             r.skip().expect("skip value");
         }
         panic!("key {key} not found");
+    }
+
+    /// #947: key 14 is a `Set (KeyHash Guard)`, so it carries tag 258 from PV9
+    /// on. It is the only Set-typed body field the #939/#940 sweep missed — and
+    /// unlike the witness set, key 14 is INSIDE the body, so omitting the tag
+    /// changed the transaction id relative to cardano-cli.
+    #[test]
+    fn required_signers_are_tagged_from_conway_on() {
+        let mut body = minimal_body();
+        body.required_signers = vec![
+            Hash32::from_bytes([0xff; 32]),
+            Hash32::from_bytes([0x11; 32]),
+        ];
+
+        for era in [Era::Conway, Era::Dijkstra] {
+            let enc = encode_transaction_body_for_era(&body, era);
+            let pos = find_key_value_start(&enc, 14);
+            assert_eq!(
+                &enc[pos..pos + 3],
+                &[0xd9, 0x01, 0x02],
+                "{era:?} required_signers must carry tag 258"
+            );
+        }
+
+        // Pre-Conway CDDL has no set tag.
+        for era in [Era::Alonzo, Era::Babbage] {
+            let enc = encode_transaction_body_for_era(&body, era);
+            let pos = find_key_value_start(&enc, 14);
+            assert_ne!(
+                &enc[pos..pos + 3],
+                &[0xd9, 0x01, 0x02],
+                "{era:?} predates PV9 and must NOT carry tag 258"
+            );
+        }
+    }
+
+    /// `Set` iterates in `Ord` order, which for a bare bstr(28) is exactly
+    /// lexicographic CBOR order — so the 0x11 hash must precede the 0xff one
+    /// regardless of the order supplied.
+    #[test]
+    fn required_signers_are_sorted_like_a_haskell_set() {
+        let mut body = minimal_body();
+        body.required_signers = vec![
+            Hash32::from_bytes([0xff; 32]),
+            Hash32::from_bytes([0x11; 32]),
+        ];
+        let enc = encode_transaction_body_for_era(&body, Era::Conway);
+        let pos = find_key_value_start(&enc, 14);
+        // tag(258) + array(2) + bstr(28) header, then the first hash byte.
+        assert_eq!(enc[pos + 3], 0x82, "definite array of 2");
+        assert_eq!(enc[pos + 4], 0x58, "bstr with 1-byte length");
+        assert_eq!(enc[pos + 5], 28, "28-byte key hash");
+        assert_eq!(enc[pos + 6], 0x11, "lowest hash must sort first");
     }
 
     // ── #940: Conway certs / proposal_procedures are OSet, not Set ──

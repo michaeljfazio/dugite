@@ -2398,6 +2398,9 @@ fn test_required_signers_encoded_as_28_bytes() {
         let key = dec.u64().unwrap();
         if key == 14 {
             found_key14 = true;
+            // Conway wraps key 14 in the 258 set tag (Set (KeyHash Guard) ->
+            // encodeSet, PV>=9) — #947.
+            assert_eq!(dec.tag().unwrap(), minicbor::data::Tag::new(258));
             // required_signers is encoded as an array of bstr values
             let arr_len = dec.array().unwrap().unwrap();
             assert_eq!(arr_len, 1, "expected exactly one required signer");
