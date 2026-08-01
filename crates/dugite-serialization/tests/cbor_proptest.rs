@@ -898,3 +898,147 @@ proptest! {
         let _ = dugite_serialization::decode_bounded::decode_metadatum_from_bytes(&data);
     }
 }
+
+proptest! {
+    /// FULL structural round-trip over arbitrary `PlutusData`, including
+    /// `Constr`, `Map` and `List` — not just the integer/bytes leaves the
+    /// existing properties cover.
+    ///
+    /// This matters more than most round-trips: `script_data_hash` is computed
+    /// over the datum/redeemer encoding, so any structural asymmetry here
+    /// changes the hash and breaks phase-2 validation rather than merely
+    /// producing odd bytes. It is also the shape that caught #951 in the PPU
+    /// encoder (encoder and decoder disagreeing on element order).
+    #[test]
+    fn prop_plutus_data_full_structural_roundtrip(data in arb_plutus_data()) {
+        use dugite_serialization::decode::decode_plutus_data_cbor;
+
+        let encoded = encode_plutus_data(&data);
+        let decoded = decode_plutus_data_cbor(&encoded)
+            .expect("every encodable PlutusData must decode");
+        prop_assert_eq!(
+            decoded, data,
+            "PlutusData must decode to itself; a structural asymmetry here would \
+             change script_data_hash"
+        );
+    }
+
+    /// Re-encoding a decoded value must be byte-identical — the property that
+    /// script-integrity hashing actually depends on.
+    #[test]
+    fn prop_plutus_data_reencode_is_byte_identical(data in arb_plutus_data()) {
+        use dugite_serialization::decode::decode_plutus_data_cbor;
+
+        let once = encode_plutus_data(&data);
+        let decoded = decode_plutus_data_cbor(&once).expect("must decode");
+        let twice = encode_plutus_data(&decoded);
+        prop_assert_eq!(
+            once, twice,
+            "encode(decode(encode(x))) must be byte-stable"
+        );
+    }
+}
+
+/// PlutusData boundary cases the proptest generator cannot reach.
+///
+/// `arb_plutus_data` caps constructors at 6, integers at 1e9 and byte strings
+/// at 64 — but every interesting encoding rule lives at or past those edges:
+///
+/// - constructor tags: 121..=127 encode alternatives 0..=6, 1280..=1400 encode
+///   7..=127, and anything >= 128 must fall back to tag 102 with an explicit
+///   `[alt, fields]` pair (NOT tag 258 — a distinct trap recorded in project
+///   memory);
+/// - integers outside i64 range become tag-2/tag-3 bignums;
+/// - byte strings over 64 bytes must be emitted as indefinite CHUNKS of at
+///   most 64 ("Note [The 64-byte limit]"), and the concatenated total may
+///   exceed 64.
+///
+/// All of these feed `script_data_hash`, so an asymmetry breaks phase-2
+/// validation rather than merely producing odd bytes.
+#[test]
+fn plutus_data_boundary_cases_round_trip() {
+    use dugite_serialization::decode::decode_plutus_data_cbor;
+    use num_bigint::BigInt;
+
+    let big_pos = BigInt::parse_bytes(b"123456789012345678901234567890", 10).unwrap();
+    let big_neg = -big_pos.clone();
+
+    let cases: Vec<(&str, PlutusData)> = vec![
+        ("constr 0 (tag 121)", PlutusData::Constr(0, vec![])),
+        (
+            "constr 6 (tag 127)",
+            PlutusData::Constr(6, vec![PlutusData::Integer(1.into())]),
+        ),
+        (
+            "constr 7 (tag 1280 boundary)",
+            PlutusData::Constr(7, vec![]),
+        ),
+        (
+            "constr 127 (tag 1400 boundary)",
+            PlutusData::Constr(127, vec![]),
+        ),
+        (
+            "constr 128 (tag 102 fallback)",
+            PlutusData::Constr(128, vec![]),
+        ),
+        (
+            "constr 1000 (tag 102 fallback, with fields)",
+            PlutusData::Constr(1000, vec![PlutusData::Bytes(vec![1, 2, 3])]),
+        ),
+        ("i64::MAX", PlutusData::Integer(BigInt::from(i64::MAX))),
+        ("i64::MIN", PlutusData::Integer(BigInt::from(i64::MIN))),
+        ("u64::MAX", PlutusData::Integer(BigInt::from(u64::MAX))),
+        ("positive bignum (tag 2)", PlutusData::Integer(big_pos)),
+        ("negative bignum (tag 3)", PlutusData::Integer(big_neg)),
+        ("bytes exactly 64", PlutusData::Bytes(vec![0xAB; 64])),
+        (
+            "bytes 65 (forces chunking)",
+            PlutusData::Bytes(vec![0xCD; 65]),
+        ),
+        (
+            "bytes 200 (multi-chunk)",
+            PlutusData::Bytes(vec![0xEF; 200]),
+        ),
+        ("empty bytes", PlutusData::Bytes(vec![])),
+        ("empty list", PlutusData::List(vec![])),
+        ("empty map", PlutusData::Map(vec![])),
+        (
+            "map with 24 entries (crosses the definite/indefinite threshold)",
+            PlutusData::Map(
+                (0..24u64)
+                    .map(|i| {
+                        (
+                            PlutusData::Integer(i.into()),
+                            PlutusData::Integer((i * 2).into()),
+                        )
+                    })
+                    .collect(),
+            ),
+        ),
+        (
+            "list with 24 items",
+            PlutusData::List((0..24u64).map(|i| PlutusData::Integer(i.into())).collect()),
+        ),
+    ];
+
+    let mut failures = Vec::new();
+    for (name, data) in &cases {
+        let enc = encode_plutus_data(data);
+        match decode_plutus_data_cbor(&enc) {
+            Err(e) => failures.push(format!("{name}: FAILED to decode: {e}")),
+            Ok(d) if &d != data => failures.push(format!("{name}: became {d:?}")),
+            Ok(d) => {
+                // Re-encode must be byte-stable too.
+                let again = encode_plutus_data(&d);
+                if again != enc {
+                    failures.push(format!("{name}: re-encode not byte-identical"));
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "PlutusData boundary cases must round-trip:\n  - {}",
+        failures.join("\n  - ")
+    );
+}
