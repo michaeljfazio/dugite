@@ -18,7 +18,14 @@ pub(crate) fn encode_drep(drep: &DRep) -> Vec<u8> {
     match drep {
         DRep::KeyHash(h) => {
             buf.extend(encode_uint(0));
-            buf.extend(encode_hash32(h));
+            // CDDL `drep = [0, addr_keyhash]`, addr_keyhash = $hash28. The
+            // stored Hash32 is the keyhash padded via `to_hash32_padded`
+            // (leading 28 real bytes) — emit only those, mirroring
+            // `read_drep`'s `read_hash28_cert` + re-pad. Emitting all 32 made
+            // every synthetic DRep vote-delegation cert self-undecodable,
+            // since `read_hash28_cert` hard-rejects any width but 28. Same
+            // defect as #932's `encode_voter` StakePool arm (#948).
+            buf.extend(encode_bytes(&h.as_bytes()[..28]));
         }
         DRep::ScriptHash(h) => {
             buf.extend(encode_uint(1));
@@ -292,12 +299,14 @@ mod tests {
         assert_eq!(encoded[0], 0x82);
         // uint(0)
         assert_eq!(encoded[1], 0x00);
-        // bstr(32) header: 0x58 0x20
+        // bstr(28) header: 0x58 0x1c. CDDL `drep = [0, addr_keyhash]` and
+        // addr_keyhash = $hash28 — this test previously asserted 32 bytes,
+        // pinning the #948 bug in place.
         assert_eq!(encoded[2], 0x58);
-        assert_eq!(encoded[3], 0x20);
-        // 32 bytes of 0xAA
-        assert_eq!(&encoded[4..], &[0xAAu8; 32]);
-        assert_eq!(encoded.len(), 36); // 1 + 1 + 2 + 32
+        assert_eq!(encoded[3], 28);
+        // 28 bytes of 0xAA — the padding is NOT emitted
+        assert_eq!(&encoded[4..], &[0xAAu8; 28]);
+        assert_eq!(encoded.len(), 32); // 1 + 1 + 2 + 28
     }
 
     /// DRep::ScriptHash encodes as array(2) [1, bstr(28)]
@@ -1024,6 +1033,60 @@ mod tests {
                 );
             }
             other => panic!("expected TreasuryWithdrawals, got {other:?}"),
+        }
+    }
+
+    // ── #948: DRep key hashes are bstr(28), not bstr(32) ──
+
+    /// Every `drep` variant must round-trip through dugite's OWN decoder.
+    ///
+    /// This is the test that was missing: `encode_drep` emitted a 32-byte
+    /// KeyHash while `read_drep` calls `read_hash28_cert`, which hard-rejects
+    /// any width but 28 — so the encoder produced bytes its own decoder threw
+    /// out, and nothing noticed.
+    #[test]
+    fn drep_variants_round_trip_through_our_own_decoder() {
+        use dugite_primitives::hash::Hash28;
+        use dugite_primitives::transaction::DRep;
+
+        let key28 = Hash28::from_bytes([0xAB; 28]);
+        let cases = vec![
+            DRep::KeyHash(key28.to_hash32_padded()),
+            DRep::ScriptHash(Hash28::from_bytes([0xCD; 28])),
+            DRep::Abstain,
+            DRep::NoConfidence,
+        ];
+
+        for drep in cases {
+            let enc = encode_drep(&drep);
+            let decoded = crate::decode::era_conway::read_drep_for_test(
+                &mut crate::decode::reader::Reader::new(&enc),
+            )
+            .unwrap_or_else(|e| panic!("{drep:?} must decode its own encoding: {e}"));
+            assert_eq!(decoded, drep, "{drep:?} must round-trip unchanged");
+        }
+    }
+
+    /// Pin the width explicitly: key 0 and key 1 both carry bstr(28), per
+    /// `drep = [0, addr_keyhash] / [1, script_hash]` where both are $hash28.
+    #[test]
+    fn drep_key_and_script_hashes_are_both_28_bytes() {
+        use dugite_primitives::hash::Hash28;
+        use dugite_primitives::transaction::DRep;
+
+        for (drep, disc) in [
+            (
+                DRep::KeyHash(Hash28::from_bytes([0xAB; 28]).to_hash32_padded()),
+                0u8,
+            ),
+            (DRep::ScriptHash(Hash28::from_bytes([0xCD; 28])), 1u8),
+        ] {
+            let enc = encode_drep(&drep);
+            assert_eq!(enc[0], 0x82, "drep is a 2-element array");
+            assert_eq!(enc[1], disc, "discriminator");
+            assert_eq!(enc[2], 0x58, "bstr with 1-byte length header");
+            assert_eq!(enc[3], 28, "{drep:?} hash must be 28 bytes, not 32");
+            assert_eq!(enc.len(), 4 + 28, "no trailing padding bytes");
         }
     }
 }

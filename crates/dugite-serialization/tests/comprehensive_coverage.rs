@@ -1463,7 +1463,9 @@ fn test_encode_drep_key_hash() {
     let drep_arr = dec.array().unwrap().unwrap();
     assert_eq!(drep_arr, 2); // [0, hash]
     assert_eq!(dec.u64().unwrap(), 0); // KeyHash = 0
-    assert_eq!(dec.bytes().unwrap().len(), 32);
+                                       // addr_keyhash is $hash28 — the stored Hash32 is a padded 28-byte hash and
+                                       // only those 28 bytes go on the wire. Previously asserted 32 (#948).
+    assert_eq!(dec.bytes().unwrap().len(), 28);
 }
 
 #[test]
