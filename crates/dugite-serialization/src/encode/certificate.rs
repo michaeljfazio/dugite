@@ -1032,4 +1032,119 @@ mod tests {
             other => panic!("expected MIR cert, got {other:?}"),
         }
     }
+
+    // ── Certificate round-trip through our OWN decoder ──
+    //
+    // #948 was an encoder emitting bytes its own decoder rejected, and it hid
+    // because the tests asserted the encoder's (wrong) output shape instead of
+    // testing the round-trip. This exercises every Conway certificate variant
+    // against the real decoder so the same asymmetry cannot recur silently.
+
+    #[test]
+    fn every_conway_certificate_round_trips_through_our_own_decoder() {
+        use dugite_primitives::credentials::Credential;
+        use dugite_primitives::hash::{Hash28, Hash32};
+        use dugite_primitives::transaction::{Certificate, DRep};
+        use dugite_primitives::value::Lovelace;
+
+        let key = Credential::VerificationKey(Hash28::from_bytes([0x11; 28]));
+        let script = Credential::Script(Hash28::from_bytes([0x22; 28]));
+        let pool = Hash28::from_bytes([0x33; 28]);
+        let drep_key = DRep::KeyHash(Hash28::from_bytes([0x44; 28]).to_hash32_padded());
+        let drep_script = DRep::ScriptHash(Hash28::from_bytes([0x55; 28]));
+
+        let cases: Vec<Certificate> = vec![
+            Certificate::StakeRegistration(key.clone()),
+            Certificate::StakeDeregistration(key.clone()),
+            Certificate::ConwayStakeRegistration {
+                credential: key.clone(),
+                deposit: Lovelace(2_000_000),
+            },
+            Certificate::ConwayStakeDeregistration {
+                credential: script.clone(),
+                refund: Lovelace(2_000_000),
+            },
+            Certificate::StakeDelegation {
+                credential: key.clone(),
+                pool_hash: pool,
+            },
+            Certificate::PoolRetirement {
+                pool_hash: pool,
+                epoch: 42,
+            },
+            Certificate::RegDRep {
+                credential: key.clone(),
+                deposit: Lovelace(500_000_000),
+                anchor: None,
+            },
+            Certificate::UnregDRep {
+                credential: key.clone(),
+                refund: Lovelace(500_000_000),
+            },
+            Certificate::UpdateDRep {
+                credential: script.clone(),
+                anchor: None,
+            },
+            Certificate::VoteDelegation {
+                credential: key.clone(),
+                drep: drep_key.clone(),
+            },
+            Certificate::VoteDelegation {
+                credential: key.clone(),
+                drep: drep_script.clone(),
+            },
+            Certificate::VoteDelegation {
+                credential: key.clone(),
+                drep: DRep::Abstain,
+            },
+            Certificate::VoteDelegation {
+                credential: key.clone(),
+                drep: DRep::NoConfidence,
+            },
+            Certificate::StakeVoteDelegation {
+                credential: key.clone(),
+                pool_hash: pool,
+                drep: drep_key.clone(),
+            },
+            Certificate::RegStakeDeleg {
+                credential: key.clone(),
+                pool_hash: pool,
+                deposit: Lovelace(2_000_000),
+            },
+            Certificate::CommitteeHotAuth {
+                cold_credential: key.clone(),
+                hot_credential: script.clone(),
+            },
+            Certificate::CommitteeColdResign {
+                cold_credential: key.clone(),
+                anchor: None,
+            },
+            Certificate::RegStakeVoteDeleg {
+                credential: key.clone(),
+                pool_hash: pool,
+                drep: drep_key.clone(),
+                deposit: Lovelace(2_000_000),
+            },
+        ];
+
+        let mut failures = Vec::new();
+        for cert in &cases {
+            let enc = encode_certificate(cert);
+            match crate::decode::era_conway::read_conway_certificate_for_test(
+                &mut crate::decode::reader::Reader::new(&enc),
+            ) {
+                Err(e) => failures.push(format!("{cert:?} FAILED to decode: {e}")),
+                Ok(decoded) if &decoded != cert => {
+                    failures.push(format!("{cert:?} round-tripped to {decoded:?}"))
+                }
+                Ok(_) => {}
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "certificates must decode to themselves:\n  {}",
+            failures.join("\n  ")
+        );
+        let _ = Hash32::from_bytes([0u8; 32]); // keep the import honest
+    }
 }
