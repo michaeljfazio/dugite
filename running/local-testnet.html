@@ -198,10 +198,10 @@ reference implementation with <strong>zero risk of asymmetric forks</strong> (no
 forgers competing for the same height).</p>
 <p>The chain boots into Conway PV10 from a fresh genesis with a single
 forging pool (pool1, 100% of active stake; pool2's keys exist but its
-stake is 0), 1-second slots, <code>activeSlotsCoeff = 0.2</code>, <code>epochLength = 200</code>,
-and <code>securityParam = 10</code>. Blocks are minted every ~5 seconds on average
-and an epoch elapses every ~3.3 minutes, so the 30-minute soak crosses
-~9 epoch boundaries (enough for reward distribution to complete before
+stake is 0), 1-second slots, <code>activeSlotsCoeff = 0.5</code>, <code>epochLength = 400</code>,
+and <code>securityParam = 40</code>. Blocks are minted every ~2 seconds on average
+and an epoch elapses every ~6.7 minutes, so the 30-minute soak crosses
+~4 epoch boundaries (enough for reward distribution to complete before
 the soak ends).</p>
 <blockquote>
 <p><strong>Historical note:</strong> prior to 2026-05-18, cardano-node also ran as a
@@ -223,6 +223,26 @@ accept every dugite block byte-for-byte?).</p>
 <li><strong>macOS:</strong> the system-builtin <code>caffeinate</code> (used to suppress App Nap during the soak). This dependency is macOS-only; on Linux the soak runs unwrapped.</li>
 </ul>
 <p>The setup script's prereq check will refuse to run if any of these are missing.</p>
+<h2 id="justfile-recipes"><a class="header" href="#justfile-recipes">Justfile recipes</a></h2>
+<p>The scripts below are the underlying entry points. For everyday use the
+<code>justfile</code> wraps them — both shapes are equivalent:</p>
+<div class="table-wrapper"><table><thead><tr><th>Recipe</th><th>Wraps</th></tr></thead><tbody>
+<tr><td><code>just devnet-setup</code></td><td><code>setup.sh</code></td></tr>
+<tr><td><code>just devnet-run</code></td><td><code>run.sh</code></td></tr>
+<tr><td><code>just devnet-soak</code></td><td><code>soak.sh</code> (30 min)</td></tr>
+<tr><td><code>just devnet-verify</code></td><td><code>verify.sh</code> against the most recent evidence round</td></tr>
+<tr><td><code>just devnet-stop</code></td><td><code>stop.sh</code></td></tr>
+<tr><td><code>just devnet-report [TAG]</code></td><td>single-round release report from the latest evidence</td></tr>
+<tr><td><code>just devnet-validate-smoke</code></td><td>one boot, ~5 min: setup + run + tx-zoo (<code>01</code>, <code>02</code>, <code>08</code>) + log-level predicate + report. PR gate for core crates.</td></tr>
+<tr><td><code>just devnet-validate-extended</code></td><td>~75 min, 3 rounds: used for release tagging</td></tr>
+</tbody></table>
+</div>
+<p><code>devnet-verify</code> and <code>devnet-report</code> locate the newest directory containing a
+<code>metadata.json</code> under <code>evidence/</code> or <code>evidence-archive/auto/</code> — that file is
+what distinguishes a real soak round from the evidence directories that
+<code>09-cli-parity</code> and <code>protocols/</code> also create.</p>
+<p>Both <code>devnet-validate-*</code> recipes install an <code>EXIT</code> trap that runs <code>stop.sh</code>,
+so an aborted run does not leave orphaned nodes holding ports 3001-3003.</p>
 <h2 id="one-time-setup"><a class="header" href="#one-time-setup">One-time setup</a></h2>
 <pre><code class="language-bash">./testnet/local-devnet/setup.sh
 </code></pre>
@@ -243,17 +263,23 @@ will refuse to start a stale chain).</p>
 </code></pre>
 <p>This starts the three nodes in the background (caffeinate-wrapped on macOS),
 records PIDs to <code>state/&lt;node&gt;.pid</code>, sends logs to <code>logs/&lt;node&gt;.log</code>, and
-exposes N2C sockets at:</p>
-<ul>
-<li><code>testnet/local-devnet/state/dugite-relay.sock</code></li>
-<li><code>testnet/local-devnet/state/dugite-bp.sock</code></li>
-<li><code>testnet/local-devnet/state/cardano-bp.sock</code></li>
-</ul>
+exposes N2C sockets under <code>/tmp/ld-$(id -u)/</code>:</p>
+<div class="table-wrapper"><table><thead><tr><th>Node</th><th>Socket</th></tr></thead><tbody>
+<tr><td><code>dugite-relay</code></td><td><code>/tmp/ld-&lt;uid&gt;/relay.sock</code></td></tr>
+<tr><td><code>dugite-bp</code></td><td><code>/tmp/ld-&lt;uid&gt;/dbp.sock</code></td></tr>
+<tr><td><code>cardano-bp</code></td><td><code>/tmp/ld-&lt;uid&gt;/cbp.sock</code></td></tr>
+</tbody></table>
+</div>
+<blockquote>
+<p>Sockets live under <code>/tmp/ld-&lt;uid&gt;/</code> rather than inside the repo because
+macOS caps <code>sun_path</code> at 104 bytes, and both a worktree path and the
+default macOS <code>$TMPDIR</code> (<code>/var/folders/...</code>) blow past that.</p>
+</blockquote>
 <p>You can query each socket with <code>cardano-cli</code> (or <code>dugite-cli</code>, which speaks
 the same N2C protocol):</p>
 <pre><code class="language-bash">cardano-cli query tip \
   --testnet-magic 42 \
-  --socket-path testnet/local-devnet/state/dugite-bp.sock
+  --socket-path "/tmp/ld-$(id -u)/dbp.sock"
 </code></pre>
 <p>To stop the network:</p>
 <pre><code class="language-bash">./testnet/local-devnet/stop.sh
@@ -282,13 +308,14 @@ line is printed every 30 seconds with current tips from all three nodes.</p>
 manually:</p>
 <pre><code class="language-bash">./testnet/local-devnet/verify.sh testnet/local-devnet/evidence/&lt;timestamp&gt;/
 </code></pre>
-<p>The verifier evaluates four pass/fail predicates and writes
+<p>The verifier evaluates five pass/fail predicates and writes
 <code>evidence/&lt;timestamp&gt;/report.md</code>. Predicates:</p>
 <div class="table-wrapper"><table><thead><tr><th>#</th><th>Predicate</th><th>Pass condition</th></tr></thead><tbody>
-<tr><td>1</td><td><strong>Block forge cross-check</strong></td><td>Every confirmed (slot, hash) pair is seen by all three observers in <code>blocks.csv</code>. (Most-recent 10 blocks are excluded from the check to allow rollback grace.)</td></tr>
-<tr><td>2</td><td><strong>Per-BP forge attribution</strong></td><td>dugite-bp forged &gt;= 3 blocks; cardano-node forged 0 (it's a validator). Expected ~360 by dugite-bp at f=0.2, σ=1.0 — failure at 3 is a real wiring bug, not a slot-lottery flake. Any forge events attributed to a non-dugite-bp issuer are a setup error.</td></tr>
-<tr><td>3</td><td><strong>Transaction inclusion round-trip</strong></td><td>Every submitted tx has <code>submit_rc=0</code> and (when run with the devnet up) appears in all three nodes' UTxO sets at the genesis payment address.</td></tr>
-<tr><td>4</td><td><strong>Tip parity over time</strong></td><td>At &gt;=95% of 5-second ticks (excluding the first 60s warmup), all three nodes report tips within 2 blocks of each other.</td></tr>
+<tr><td>1</td><td><strong>Block forge cross-check</strong></td><td>Every canonical (slot, hash) pair is seen by all three observers in <code>blocks.csv</code>. Orphans are excluded.</td></tr>
+<tr><td>2</td><td><strong>Per-BP forge attribution</strong></td><td>dugite-bp forged &gt;= 3 blocks; pool2 forged 0 (cardano-node is a validator). Expected ~900 by dugite-bp at f=0.5, σ=1.0 — failure at 3 is a real wiring bug, not a slot-lottery flake. Any forge events attributed to a non-dugite-bp issuer are a setup error.</td></tr>
+<tr><td>3</td><td><strong>Transaction inclusion round-trip</strong></td><td>Every submitted tx has <code>submit_rc=0</code> and (when run with the devnet up) appears in all three nodes' UTxO sets at the genesis payment address. SKIPs when the round submitted no txs.</td></tr>
+<tr><td>4</td><td><strong>Tip parity over time</strong></td><td>At &gt;=95% of 5-second ticks (excluding the warmup window), all three nodes report tips within 2 blocks of each other.</td></tr>
+<tr><td>5</td><td><strong>Tip age</strong></td><td><code>dugite_tip_age_seconds</code> stays below threshold on every dugite node after the catch-up grace window. SKIPs when the soak is too short to sample.</td></tr>
 </tbody></table>
 </div>
 <p>The <code>report.md</code> includes a metadata snapshot (versions, genesis hashes, magic),
@@ -300,9 +327,9 @@ test fixtures:</p>
 </code></pre>
 <h2 id="topology--port-reference"><a class="header" href="#topology--port-reference">Topology &amp; port reference</a></h2>
 <div class="table-wrapper"><table><thead><tr><th>Process</th><th>N2N</th><th>Metrics</th><th>Socket</th><th>Config</th><th>Topology</th></tr></thead><tbody>
-<tr><td><code>dugite-bp</code> (pool1, sole forger)</td><td>3001</td><td>12798</td><td><code>dugite-bp.sock</code></td><td><code>dugite-bp.config.json</code></td><td><code>dugite-bp.topology.json</code></td></tr>
-<tr><td><code>dugite-relay</code> (hub)</td><td>3002</td><td>12799</td><td><code>dugite-relay.sock</code></td><td><code>dugite-relay.config.json</code></td><td><code>dugite-relay.topology.json</code></td></tr>
-<tr><td><code>cardano-node</code> (validator)</td><td>3003</td><td>—</td><td><code>cardano-bp.sock</code></td><td><code>cardano-bp.config.json</code></td><td><code>cardano-bp.topology.json</code></td></tr>
+<tr><td><code>dugite-bp</code> (pool1, sole forger)</td><td>3001</td><td>12798</td><td><code>/tmp/ld-&lt;uid&gt;/dbp.sock</code></td><td><code>dugite-bp.config.json</code></td><td><code>dugite-bp.topology.json</code></td></tr>
+<tr><td><code>dugite-relay</code> (hub)</td><td>3002</td><td>12799</td><td><code>/tmp/ld-&lt;uid&gt;/relay.sock</code></td><td><code>dugite-relay.config.json</code></td><td><code>dugite-relay.topology.json</code></td></tr>
+<tr><td><code>cardano-node</code> (validator)</td><td>3003</td><td>—</td><td><code>/tmp/ld-&lt;uid&gt;/cbp.sock</code></td><td><code>cardano-bp.config.json</code></td><td><code>cardano-bp.topology.json</code></td></tr>
 </tbody></table>
 </div>
 <p>The devnet uses the standard Cardano N2N port (3001) for <code>dugite-bp</code> and
@@ -331,17 +358,22 @@ differ from cardano-cli's defaults are listed below.</p>
 <p><code>config/spec/shelley-spec.json</code>:</p>
 <div class="table-wrapper"><table><thead><tr><th>field</th><th>value</th><th>purpose</th></tr></thead><tbody>
 <tr><td><code>slotLength</code></td><td><code>1.0</code></td><td>1-second slot duration</td></tr>
-<tr><td><code>activeSlotsCoeff</code></td><td><code>0.2</code></td><td>f = 0.2; ~5s expected block time</td></tr>
-<tr><td><code>epochLength</code></td><td><code>200</code></td><td>~3.3 minutes per epoch -&gt; ~9 epoch transitions in the 30-min soak. The Praos lower bound is <code>3k/f = 150</code> slots; we stay safely above that while keeping reward/governance cycles short enough for tx-zoo.</td></tr>
-<tr><td><code>securityParam</code></td><td><code>10</code></td><td>small k -&gt; fast immutability (3k/f ~= 150 slots)</td></tr>
+<tr><td><code>activeSlotsCoeff</code></td><td><code>0.5</code></td><td>f = 0.5; ~2s expected block time</td></tr>
+<tr><td><code>epochLength</code></td><td><code>400</code></td><td>~6.7 minutes per epoch -&gt; ~4 epoch transitions in the 30-min soak. The Praos lower bound is <code>3k/f = 240</code> slots; we stay safely above that while keeping reward/governance cycles short enough for tx-zoo.</td></tr>
+<tr><td><code>securityParam</code></td><td><code>40</code></td><td>small k -&gt; fast immutability (3k/f = 240 slots)</td></tr>
 <tr><td><code>updateQuorum</code></td><td><code>2</code></td><td>matches the 3 genesis keys (2-of-3)</td></tr>
 <tr><td><code>maxLovelaceSupply</code></td><td><code>60_000_000_000_000_000</code></td><td>60 B ADA, mainnet-shaped</td></tr>
 <tr><td><code>networkMagic</code></td><td><code>42</code></td><td>local devnet magic</td></tr>
+<tr><td><code>protocolParams.protocolVersion</code></td><td><code>{major: 10, minor: 0}</code></td><td>boots straight into Conway</td></tr>
 </tbody></table>
 </div>
-<p><code>config/spec/conway-spec.json</code> carries Conway governance parameters; for a
-30-min run with no proposals only the protocol version matters. PV is set
-to 10.0 so the chain boots straight into Conway.</p>
+<p>Note that the protocol version lives in <strong><code>shelley-spec.json</code></strong>, not in the
+Conway spec. <code>config/spec/conway-spec.json</code> carries the Conway governance
+parameters — pool/DRep voting thresholds, <code>govActionLifetime</code> (6 epochs),
+<code>govActionDeposit</code>, <code>dRepDeposit</code>, <code>dRepActivity</code>,
+<code>minFeeRefScriptCostPerByte</code>, and the Plutus V3 cost model. Those values are
+load-bearing for the governance, proposal, and voting categories of the
+tx-zoo, so they are not inert filler even on a short run.</p>
 <h2 id="troubleshooting"><a class="header" href="#troubleshooting">Troubleshooting</a></h2>
 <ul>
 <li><strong><code>ERROR: cardano-cli x.y.z &lt; 11.0.0 required</code></strong> — install a newer cardano-cli; see prerequisites.</li>
@@ -367,7 +399,7 @@ trace in <code>logs/cardano-bp.log</code>)</li>
 <li>Byron-era code paths (chain boots in Conway)</li>
 <li>Hard-fork combinator era transitions (none occur during the soak)</li>
 <li>Multi-relay diffusion topologies (single hub)</li>
-<li>Plutus phase-2 / governance enactment (no proposals or scripts in the soak; the tx-zoo covers governance under a separate driver)</li>
+<li>Plutus phase-2 / governance enactment — <em>the soak itself</em> submits only identical self-payments. Scripts, proposals, voting, and enactment are covered by the tx-zoo (<code>03</code>, <code>06</code>, <code>07</code>, <code>10</code>, <code>12</code>) under a separate driver</li>
 <li>Symmetric multi-forger chain selection (cardano-node is a validator here, not a forger — see "Historical note" at top)</li>
 <li>Mainnet-scale peer counts, NAT/firewall behaviour, or BGP-level routing</li>
 <li>Mithril snapshot import (covered by other tests)</li>
@@ -383,22 +415,31 @@ and validator accept every transaction class that mainnet allows.</p>
 ./testnet/local-devnet/tx-zoo/run-all.sh 03-plutus  # one category
 ./testnet/local-devnet/tx-zoo/run-all.sh --summary  # totals from the last run
 </code></pre>
-<p>The zoo covers 8 categories (59 scripts total): bookkeeping (simple-pay,
-multi-output, metadata CIP-20/CIP-25, validity intervals, required signers,
-treasury donation, tx chaining), native scripts (all/any/atLeast policies,
-time-locked, burns, pay-to-script, spend-from-script), Plutus V1/V2/V3
-(spend, mint, inline datums, reference scripts, reference inputs, datum-hash
-reveal, collateral consumption), stake operations (register, delegate,
-combined certs, deregister, pool register/retire, reward withdrawal),
-governance certificates (DRep register/update/deregister, vote-delegation to
-DRep + always-abstain + always-no-confidence, CC hot-key authorisation,
-CC resignation), proposals (Info, ParameterChange, HardForkInitiation,
-TreasuryWithdrawal, NoConfidence, UpdateCommittee, NewConstitution), voting
-(DRep + SPO + CC yes/no/abstain), and negative paths (min-utxo violation,
-fee-too-low, expired TTL, insufficient collateral). Each script submits
-through the dugite relay socket and waits for inclusion at that same socket
-to guarantee diffusion + validation on the dugite path before recording
-PASS/FAIL/SKIP into <code>tx-zoo/state/results.csv</code>.</p>
+<p>The zoo covers 12 categories (111 scripts total):</p>
+<div class="table-wrapper"><table><thead><tr><th>Category</th><th>Scripts</th><th>Covers</th></tr></thead><tbody>
+<tr><td><code>01-bookkeeping</code></td><td>8</td><td>simple-pay, multi-output, metadata CIP-20/CIP-25, validity intervals, required signers, treasury donation, tx chaining</td></tr>
+<tr><td><code>02-native-scripts</code></td><td>7</td><td>all/any/atLeast policies, time-locked, burns, pay-to-script, spend-from-script</td></tr>
+<tr><td><code>03-plutus</code></td><td>14</td><td>V1/V2/V3 spend, mint, inline datums, reference scripts, reference inputs, datum-hash reveal, collateral consumption</td></tr>
+<tr><td><code>04-stake</code></td><td>7</td><td>register, delegate, combined certs, deregister, pool register/retire, reward withdrawal</td></tr>
+<tr><td><code>05-governance-certs</code></td><td>8</td><td>DRep register/update/deregister, vote-delegation (DRep + always-abstain + always-no-confidence), CC hot-key authorisation, CC resignation</td></tr>
+<tr><td><code>06-proposals</code></td><td>7</td><td>Info, ParameterChange, HardForkInitiation, TreasuryWithdrawal, NoConfidence, UpdateCommittee, NewConstitution</td></tr>
+<tr><td><code>07-voting</code></td><td>8</td><td>DRep + SPO + CC yes/no/abstain</td></tr>
+<tr><td><code>08-negative</code></td><td>19</td><td>min-utxo violation, fee-too-low, expired TTL, insufficient collateral, double-spend, and other rejection paths</td></tr>
+<tr><td><code>09-cli-parity</code></td><td>24</td><td>runs <code>cardano-cli</code> against <strong>both</strong> sockets and diffs the answers</td></tr>
+<tr><td><code>10-gov-lifecycle</code></td><td>5</td><td>end-to-end proposal -&gt; vote -&gt; ratify -&gt; enact</td></tr>
+<tr><td><code>11-mempool</code></td><td>3</td><td>mempool admission and eviction behaviour</td></tr>
+<tr><td><code>12-post-enactment</code></td><td>1</td><td>state after a governance action is enacted</td></tr>
+</tbody></table>
+</div>
+<p>Each script submits through the dugite relay socket and waits for inclusion
+at that same socket to guarantee diffusion + validation on the dugite path
+before recording PASS/FAIL/SKIP into <code>tx-zoo/state/results.csv</code>.</p>
+<blockquote>
+<p><strong>Reading <code>09-cli-parity</code>:</strong> it runs <code>cardano-cli</code> against both sockets and
+diffs the responses — it never invokes <code>dugite-cli</code>. What it measures is
+dugite-<strong>node</strong>'s LSQ responses. A failure on <em>both</em> sides is a harness bug,
+never a dugite-cli gap.</p>
+</blockquote>
 <h3 id="requirements"><a class="header" href="#requirements">Requirements</a></h3>
 <ul>
 <li>The devnet must be up via <code>./run.sh</code> (the zoo refuses to start without all 3
@@ -424,9 +465,9 @@ same socket will race. If you see intermittent <code>not-included</code> in
 client is submitting to the same socket — the zoo expects exclusive access.</li>
 <li><strong>Rewards warmup</strong>: <code>reward-withdrawal</code> cannot succeed until the delegated
 stake earns rewards, which requires at least two epoch boundaries after
-delegation. On the 200-slot epoch this means the script SKIPs for the
-first ~7 minutes after a fresh devnet boot. The script records SKIP with
-reason <code>no-rewards</code> rather than failing.</li>
+delegation. On the 400-slot epoch this means the script SKIPs for roughly
+the first ~13 minutes after a fresh devnet boot. The script records SKIP
+with reason <code>no-rewards</code> rather than failing.</li>
 </ul>
 <h3 id="seated-cc-member"><a class="header" href="#seated-cc-member">Seated CC member</a></h3>
 <p><code>cardano-cli conway genesis create-testnet-data</code> emits an empty

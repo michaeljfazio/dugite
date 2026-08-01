@@ -180,31 +180,55 @@
                 <div id="content" class="content">
                     <main>
                         <h1 id="protocol-parameters-reference"><a class="header" href="#protocol-parameters-reference">Protocol Parameters Reference</a></h1>
-<p>Cardano protocol parameters control the behavior of the network, including fees, block sizes, staking mechanics, and governance. These parameters can be queried from a running node and updated through governance actions.</p>
+<p>Cardano protocol parameters control fees, block sizes, staking mechanics,
+script execution budgets, and governance. Every one of them is mutable through
+a <code>ParameterChange</code> governance action, so the values below are not constants —
+always query a node for truth.</p>
+<blockquote>
+<p><strong>Mainnet values in this page were read from mainnet epoch 646.</strong> They are
+included to give a sense of scale, not as defaults. Re-read them from a node
+before relying on any of them.</p>
+</blockquote>
 <h2 id="querying-parameters"><a class="header" href="#querying-parameters">Querying Parameters</a></h2>
 <pre><code class="language-bash">dugite-cli query protocol-parameters \
   --socket-path ./node.sock \
   --out-file protocol-params.json
 </code></pre>
+<p>The JSON key names in the tables below are the <code>cardano-cli</code>-compatible names
+that <code>dugite-cli</code> emits and accepts. They are <strong>not</strong> the Rust field names and
+they are not produced by serde — they are written by the N2C client decoder in
+<code>crates/dugite-network/src/n2c_client.rs</code>. Where <code>cardano-cli</code> accepts an older
+alias, both are listed.</p>
 <h2 id="fee-parameters"><a class="header" href="#fee-parameters">Fee Parameters</a></h2>
-<div class="table-wrapper"><table><thead><tr><th>Parameter</th><th>JSON Key</th><th>Description</th><th>Mainnet Default</th></tr></thead><tbody>
+<div class="table-wrapper"><table><thead><tr><th>Parameter</th><th>JSON Key</th><th>Description</th><th>Mainnet value</th></tr></thead><tbody>
 <tr><td>Min fee coefficient</td><td><code>txFeePerByte</code> / <code>minFeeA</code></td><td>Fee per byte of transaction size</td><td>44</td></tr>
 <tr><td>Min fee constant</td><td><code>txFeeFixed</code> / <code>minFeeB</code></td><td>Fixed fee component</td><td>155381</td></tr>
-<tr><td>Min UTxO value per byte</td><td><code>utxoCostPerByte</code> / <code>adaPerUtxoByte</code></td><td>Minimum lovelace per byte of UTxO</td><td>4310</td></tr>
+<tr><td>Min UTxO cost per byte</td><td><code>utxoCostPerByte</code> / <code>coinsPerUTxOByte</code></td><td>Minimum lovelace per byte of UTxO (Babbage+)</td><td>4310</td></tr>
+<tr><td>Reference script fee</td><td><code>minFeeRefScriptCostPerByte</code></td><td>Tiered fee per byte of reference script (Conway)</td><td>15</td></tr>
 </tbody></table>
 </div>
-<p>The transaction fee formula is:</p>
+<p>The base transaction fee formula is:</p>
 <pre><code>fee = txFeePerByte * tx_size_in_bytes + txFeeFixed
 </code></pre>
+<p>Conway adds a <strong>tiered</strong> reference-script surcharge on top, growing
+geometrically with total reference-script size.</p>
+<blockquote>
+<p><strong>Minimum-UTxO is era-dispatched, not one formula.</strong> Dugite selects the
+per-era Haskell calculation from the protocol version in force
+(issue #919): flat <code>minUTxOValue</code> at PV ≤ 3; Mary <code>scaledMinDeposit</code> at PV 4;
+Alonzo <code>(27 + size + dataHashSize) × coinsPerUTxOWord</code> at PV 5–6; Babbage
+<code>(160 + size) × coinsPerUTxOByte</code> at PV ≥ 7. Key 17 therefore means
+<code>coinsPerUTxOWord</code> before Babbage and <code>coinsPerUTxOByte</code> from Babbage on.</p>
+</blockquote>
 <h2 id="block-size-parameters"><a class="header" href="#block-size-parameters">Block Size Parameters</a></h2>
-<div class="table-wrapper"><table><thead><tr><th>Parameter</th><th>JSON Key</th><th>Description</th><th>Mainnet Default</th></tr></thead><tbody>
+<div class="table-wrapper"><table><thead><tr><th>Parameter</th><th>JSON Key</th><th>Description</th><th>Mainnet value</th></tr></thead><tbody>
 <tr><td>Max block body size</td><td><code>maxBlockBodySize</code></td><td>Maximum block body size in bytes</td><td>90112</td></tr>
 <tr><td>Max transaction size</td><td><code>maxTxSize</code></td><td>Maximum transaction size in bytes</td><td>16384</td></tr>
 <tr><td>Max block header size</td><td><code>maxBlockHeaderSize</code></td><td>Maximum block header size in bytes</td><td>1100</td></tr>
 </tbody></table>
 </div>
 <h2 id="staking-parameters"><a class="header" href="#staking-parameters">Staking Parameters</a></h2>
-<div class="table-wrapper"><table><thead><tr><th>Parameter</th><th>JSON Key</th><th>Description</th><th>Mainnet Default</th></tr></thead><tbody>
+<div class="table-wrapper"><table><thead><tr><th>Parameter</th><th>JSON Key</th><th>Description</th><th>Mainnet value</th></tr></thead><tbody>
 <tr><td>Stake address deposit</td><td><code>stakeAddressDeposit</code> / <code>keyDeposit</code></td><td>Deposit for stake key registration (lovelace)</td><td>2000000</td></tr>
 <tr><td>Pool deposit</td><td><code>stakePoolDeposit</code> / <code>poolDeposit</code></td><td>Deposit for pool registration (lovelace)</td><td>500000000</td></tr>
 <tr><td>Pool retire max epoch</td><td><code>poolRetireMaxEpoch</code> / <code>eMax</code></td><td>Maximum future epochs for pool retirement</td><td>18</td></tr>
@@ -213,67 +237,183 @@
 </tbody></table>
 </div>
 <h2 id="monetary-policy"><a class="header" href="#monetary-policy">Monetary Policy</a></h2>
-<div class="table-wrapper"><table><thead><tr><th>Parameter</th><th>Description</th></tr></thead><tbody>
-<tr><td>Monetary expansion (rho)</td><td>Rate of new ADA creation from reserves per epoch</td></tr>
-<tr><td>Treasury cut (tau)</td><td>Fraction of rewards directed to the treasury</td></tr>
-<tr><td>Pledge influence (a0)</td><td>How pledge affects reward calculations</td></tr>
+<div class="table-wrapper"><table><thead><tr><th>Parameter</th><th>JSON Key</th><th>Description</th><th>Mainnet value</th></tr></thead><tbody>
+<tr><td>Monetary expansion (rho)</td><td><code>monetaryExpansion</code></td><td>Rate of new ADA created from reserves per epoch</td><td>0.003</td></tr>
+<tr><td>Treasury cut (tau)</td><td><code>treasuryCut</code></td><td>Fraction of rewards directed to the treasury</td><td>0.20</td></tr>
+<tr><td>Pledge influence (a0)</td><td><code>poolPledgeInfluence</code></td><td>How pledge affects reward calculation</td><td>0.3</td></tr>
 </tbody></table>
 </div>
+<p>These three are <strong>exact rationals</strong> on the wire (CBOR tag 30), not floats.
+Dugite parses genesis values as exact <code>Scientific</code> and never through an
+<code>f64</code> intermediate — a lossy parse here diverges the reward calculation.</p>
 <h2 id="plutus-execution-parameters"><a class="header" href="#plutus-execution-parameters">Plutus Execution Parameters</a></h2>
-<div class="table-wrapper"><table><thead><tr><th>Parameter</th><th>JSON Key</th><th>Description</th><th>Mainnet Default</th></tr></thead><tbody>
-<tr><td>Max tx execution units</td><td><code>maxTxExecutionUnits</code></td><td><code>{memory, steps}</code> per transaction</td><td><code>{14000000, 10000000000}</code></td></tr>
-<tr><td>Max block execution units</td><td><code>maxBlockExecutionUnits</code></td><td><code>{memory, steps}</code> per block</td><td><code>{62000000, 40000000000}</code></td></tr>
+<div class="table-wrapper"><table><thead><tr><th>Parameter</th><th>JSON Key</th><th>Description</th><th>Mainnet value</th></tr></thead><tbody>
+<tr><td>Execution unit prices</td><td><code>executionUnitPrices</code></td><td><code>{priceMemory, priceSteps}</code> rationals</td><td><code>{0.0577, 0.0000721}</code></td></tr>
+<tr><td>Max tx execution units</td><td><code>maxTxExecutionUnits</code></td><td><code>{memory, steps}</code> per transaction</td><td><code>{16500000, 10000000000}</code></td></tr>
+<tr><td>Max block execution units</td><td><code>maxBlockExecutionUnits</code></td><td><code>{memory, steps}</code> per block</td><td><code>{72000000, 20000000000}</code></td></tr>
 <tr><td>Max value size</td><td><code>maxValueSize</code></td><td>Maximum serialized value size in bytes</td><td>5000</td></tr>
 <tr><td>Collateral percentage</td><td><code>collateralPercentage</code></td><td>Collateral % of total tx fee for Plutus txs</td><td>150</td></tr>
 <tr><td>Max collateral inputs</td><td><code>maxCollateralInputs</code></td><td>Maximum collateral inputs per tx</td><td>3</td></tr>
+<tr><td>Cost models</td><td><code>costModels</code></td><td>Per-language builtin cost vectors (<code>PlutusV1</code>–<code>PlutusV3</code>)</td><td>—</td></tr>
 </tbody></table>
 </div>
+<blockquote>
+<p><code>maxValueSize</code> is compared with a strict <code>&gt;</code>, against a size computed with
+Haskell <code>encodeMap</code> semantics — indefinite-length CBOR map headers above 23
+entries, definite at or below. Getting that wrong over-counts by one byte on
+large asset maps and produces a false Phase-1 rejection (issue #930).</p>
+</blockquote>
 <h2 id="governance-parameters-conway"><a class="header" href="#governance-parameters-conway">Governance Parameters (Conway)</a></h2>
-<div class="table-wrapper"><table><thead><tr><th>Parameter</th><th>JSON Key</th><th>Description</th><th>Mainnet Default</th></tr></thead><tbody>
-<tr><td>DRep deposit</td><td><code>drepDeposit</code></td><td>Deposit for DRep registration (lovelace)</td><td>500000000</td></tr>
+<div class="table-wrapper"><table><thead><tr><th>Parameter</th><th>JSON Key</th><th>Description</th><th>Mainnet value</th></tr></thead><tbody>
+<tr><td>DRep deposit</td><td><code>dRepDeposit</code></td><td>Deposit for DRep registration (lovelace)</td><td>500000000</td></tr>
+<tr><td>DRep activity</td><td><code>dRepActivity</code></td><td>Epochs of inactivity before a DRep goes dormant</td><td>20</td></tr>
 <tr><td>Gov action deposit</td><td><code>govActionDeposit</code></td><td>Deposit for governance action submission (lovelace)</td><td>100000000000</td></tr>
 <tr><td>Gov action lifetime</td><td><code>govActionLifetime</code></td><td>Governance action expiry (epochs)</td><td>6</td></tr>
+<tr><td>Committee min size</td><td><code>committeeMinSize</code></td><td>Minimum constitutional committee size</td><td>5</td></tr>
+<tr><td>Committee max term</td><td><code>committeeMaxTermLength</code></td><td>Maximum committee member term (epochs)</td><td>146</td></tr>
 </tbody></table>
 </div>
 <h3 id="voting-thresholds"><a class="header" href="#voting-thresholds">Voting Thresholds</a></h3>
-<p>Different governance action types require different voting thresholds from DReps, SPOs, and the Constitutional Committee:</p>
-<div class="table-wrapper"><table><thead><tr><th>Action Type</th><th>DRep Threshold</th><th>SPO Threshold</th><th>CC Threshold</th></tr></thead><tbody>
-<tr><td>No Confidence</td><td>dvtMotionNoConfidence</td><td>pvtMotionNoConfidence</td><td>Required</td></tr>
-<tr><td>Update Committee (normal)</td><td>dvtCommitteeNormal</td><td>pvtCommitteeNormal</td><td>N/A</td></tr>
-<tr><td>Update Committee (no confidence)</td><td>dvtCommitteeNoConfidence</td><td>pvtCommitteeNoConfidence</td><td>N/A</td></tr>
-<tr><td>New Constitution</td><td>dvtUpdateToConstitution</td><td>N/A</td><td>Required</td></tr>
-<tr><td>Hard Fork Initiation</td><td>dvtHardForkInitiation</td><td>pvtHardForkInitiation</td><td>Required</td></tr>
-<tr><td>Protocol Parameter Update (network)</td><td>dvtPPNetworkGroup</td><td>N/A</td><td>Required</td></tr>
-<tr><td>Protocol Parameter Update (economic)</td><td>dvtPPEconomicGroup</td><td>pvtPPEconomicGroup</td><td>Required</td></tr>
-<tr><td>Protocol Parameter Update (technical)</td><td>dvtPPTechnicalGroup</td><td>N/A</td><td>Required</td></tr>
-<tr><td>Protocol Parameter Update (governance)</td><td>dvtPPGovGroup</td><td>N/A</td><td>Required</td></tr>
-<tr><td>Treasury Withdrawal</td><td>dvtTreasuryWithdrawal</td><td>N/A</td><td>Required</td></tr>
+<p>The threshold parameters travel on the wire as <strong>two fixed-order arrays</strong>, not
+as individual keys: <code>poolVotingThresholds</code> (5 entries, CBOR key 25) and
+<code>drepVotingThresholds</code> (10 entries, CBOR key 26).</p>
+<p><strong><code>poolVotingThresholds</code> — array order:</strong></p>
+<div class="table-wrapper"><table><thead><tr><th>Position</th><th>JSON Key</th></tr></thead><tbody>
+<tr><td>0</td><td><code>pvtMotionNoConfidence</code></td></tr>
+<tr><td>1</td><td><code>pvtCommitteeNormal</code></td></tr>
+<tr><td>2</td><td><code>pvtCommitteeNoConfidence</code></td></tr>
+<tr><td>3</td><td><code>pvtHardForkInitiation</code></td></tr>
+<tr><td>4</td><td><code>pvtPPSecurityGroup</code></td></tr>
 </tbody></table>
 </div>
-<h2 id="cbor-field-numbers"><a class="header" href="#cbor-field-numbers">CBOR Field Numbers</a></h2>
-<p>When encoding protocol parameter updates in governance actions, each parameter maps to a CBOR field number:</p>
-<div class="table-wrapper"><table><thead><tr><th>CBOR Key</th><th>Parameter</th></tr></thead><tbody>
-<tr><td>0</td><td>txFeePerByte / minFeeA</td></tr>
-<tr><td>1</td><td>txFeeFixed / minFeeB</td></tr>
-<tr><td>2</td><td>maxBlockBodySize</td></tr>
-<tr><td>3</td><td>maxTxSize</td></tr>
-<tr><td>4</td><td>maxBlockHeaderSize</td></tr>
-<tr><td>5</td><td>stakeAddressDeposit / keyDeposit</td></tr>
-<tr><td>6</td><td>stakePoolDeposit / poolDeposit</td></tr>
-<tr><td>7</td><td>poolRetireMaxEpoch / eMax</td></tr>
-<tr><td>8</td><td>stakePoolTargetNum / nOpt</td></tr>
-<tr><td>16</td><td>minPoolCost</td></tr>
-<tr><td>17</td><td>utxoCostPerByte / adaPerUtxoByte</td></tr>
-<tr><td>20</td><td>maxTxExecutionUnits</td></tr>
-<tr><td>21</td><td>maxBlockExecutionUnits</td></tr>
-<tr><td>22</td><td>maxValueSize</td></tr>
-<tr><td>23</td><td>collateralPercentage</td></tr>
-<tr><td>24</td><td>maxCollateralInputs</td></tr>
-<tr><td>30</td><td>drepDeposit</td></tr>
-<tr><td>31</td><td>govActionDeposit</td></tr>
-<tr><td>32</td><td>govActionLifetime</td></tr>
+<p><strong><code>drepVotingThresholds</code> — array order:</strong></p>
+<div class="table-wrapper"><table><thead><tr><th>Position</th><th>JSON Key</th></tr></thead><tbody>
+<tr><td>0</td><td><code>dvtMotionNoConfidence</code></td></tr>
+<tr><td>1</td><td><code>dvtCommitteeNormal</code></td></tr>
+<tr><td>2</td><td><code>dvtCommitteeNoConfidence</code></td></tr>
+<tr><td>3</td><td><code>dvtUpdateToConstitution</code></td></tr>
+<tr><td>4</td><td><code>dvtHardForkInitiation</code></td></tr>
+<tr><td>5</td><td><code>dvtPPNetworkGroup</code></td></tr>
+<tr><td>6</td><td><code>dvtPPEconomicGroup</code></td></tr>
+<tr><td>7</td><td><code>dvtPPTechnicalGroup</code></td></tr>
+<tr><td>8</td><td><code>dvtPPGovGroup</code></td></tr>
+<tr><td>9</td><td><code>dvtTreasuryWithdrawal</code></td></tr>
 </tbody></table>
 </div>
+<h3 id="which-body-votes-on-what"><a class="header" href="#which-body-votes-on-what">Which body votes on what</a></h3>
+<p>This is the ratification matrix Dugite implements, matching Haskell
+<code>Conway.Rules.Ratify</code>. "—" means that body does not vote on the action at all
+(it is not an abstention — the check is simply absent).</p>
+<div class="table-wrapper"><table><thead><tr><th>Action type</th><th>DRep threshold</th><th>SPO threshold</th><th>Constitutional Committee</th></tr></thead><tbody>
+<tr><td>No Confidence</td><td><code>dvtMotionNoConfidence</code></td><td><code>pvtMotionNoConfidence</code></td><td>—</td></tr>
+<tr><td>Update Committee (normal)</td><td><code>dvtCommitteeNormal</code></td><td><code>pvtCommitteeNormal</code></td><td>—</td></tr>
+<tr><td>Update Committee (under no-confidence)</td><td><code>dvtCommitteeNoConfidence</code></td><td><code>pvtCommitteeNoConfidence</code></td><td>—</td></tr>
+<tr><td>New Constitution</td><td><code>dvtUpdateToConstitution</code></td><td>—</td><td>votes</td></tr>
+<tr><td>Hard Fork Initiation</td><td><code>dvtHardForkInitiation</code></td><td><code>pvtHardForkInitiation</code></td><td>votes</td></tr>
+<tr><td>Parameter Change</td><td>every affected group's <code>dvtPP*Group</code> must pass independently</td><td><code>pvtPPSecurityGroup</code>, <strong>only if</strong> a security-tagged parameter is touched</td><td>votes</td></tr>
+<tr><td>Treasury Withdrawal</td><td><code>dvtTreasuryWithdrawal</code></td><td>—</td><td>votes</td></tr>
+<tr><td>Info</td><td>never ratifies (informational only)</td><td>—</td><td>—</td></tr>
+</tbody></table>
+</div>
+<p>Two consequences worth internalising:</p>
+<ul>
+<li>There is <strong>no</strong> <code>pvtPPEconomicGroup</code>. The only SPO threshold for parameter
+changes is <code>pvtPPSecurityGroup</code>, and SPOs are excluded entirely from a
+parameter change that touches no security-tagged parameter.</li>
+<li>A parameter change spanning several groups must clear <strong>each</strong> group's DRep
+threshold, not just the highest one.</li>
+</ul>
+<p>During the Conway bootstrap phase, DRep thresholds are treated as zero (always
+met) and only the SPO and committee checks bind.</p>
+<h2 id="cbor-keys-for-a-protocolparamupdate"><a class="header" href="#cbor-keys-for-a-protocolparamupdate">CBOR keys for a <code>ProtocolParamUpdate</code></a></h2>
+<p>Governance actions carry parameter changes as a sparse CBOR <strong>map</strong> keyed by
+integer. This is the complete table Dugite encodes and decodes.</p>
+<div class="table-wrapper"><table><thead><tr><th>Key</th><th>Parameter</th><th>Notes</th></tr></thead><tbody>
+<tr><td>0</td><td><code>txFeePerByte</code> / <code>minFeeA</code></td><td></td></tr>
+<tr><td>1</td><td><code>txFeeFixed</code> / <code>minFeeB</code></td><td></td></tr>
+<tr><td>2</td><td><code>maxBlockBodySize</code></td><td></td></tr>
+<tr><td>3</td><td><code>maxTxSize</code></td><td></td></tr>
+<tr><td>4</td><td><code>maxBlockHeaderSize</code></td><td></td></tr>
+<tr><td>5</td><td><code>stakeAddressDeposit</code> / <code>keyDeposit</code></td><td></td></tr>
+<tr><td>6</td><td><code>stakePoolDeposit</code> / <code>poolDeposit</code></td><td></td></tr>
+<tr><td>7</td><td><code>poolRetireMaxEpoch</code> / <code>eMax</code></td><td></td></tr>
+<tr><td>8</td><td><code>stakePoolTargetNum</code> / <code>nOpt</code></td><td></td></tr>
+<tr><td>9</td><td><code>poolPledgeInfluence</code> (a0)</td><td>CBOR tag 30 rational</td></tr>
+<tr><td>10</td><td><code>monetaryExpansion</code> (rho)</td><td>CBOR tag 30 rational</td></tr>
+<tr><td>11</td><td><code>treasuryCut</code> (tau)</td><td>CBOR tag 30 rational</td></tr>
+<tr><td>12</td><td><code>decentralization</code> (d)</td><td><strong>pre-Conway only</strong> — decode only</td></tr>
+<tr><td>13</td><td><code>extraEntropy</code></td><td><strong>pre-Conway only</strong> — decode only</td></tr>
+<tr><td>14</td><td><code>protocolVersion</code></td><td><strong>pre-Conway only</strong> — <code>[major, minor]</code>, decode only</td></tr>
+<tr><td>15</td><td><code>minUTxOValue</code></td><td><strong>pre-Conway only</strong> — decode only (restored in #919)</td></tr>
+<tr><td>16</td><td><code>minPoolCost</code></td><td></td></tr>
+<tr><td>17</td><td><code>coinsPerUTxOWord</code> / <code>utxoCostPerByte</code></td><td>Meaning depends on the PV in force <em>before</em> this update's own PV bump</td></tr>
+<tr><td>18</td><td><code>costModels</code></td><td>map <code>{0: PlutusV1, 1: PlutusV2, 2: PlutusV3, 3: PlutusV4}</code></td></tr>
+<tr><td>19</td><td><code>executionUnitPrices</code></td><td><code>[memPrice, stepPrice]</code></td></tr>
+<tr><td>20</td><td><code>maxTxExecutionUnits</code></td><td><code>[mem, steps]</code></td></tr>
+<tr><td>21</td><td><code>maxBlockExecutionUnits</code></td><td><code>[mem, steps]</code></td></tr>
+<tr><td>22</td><td><code>maxValueSize</code></td><td></td></tr>
+<tr><td>23</td><td><code>collateralPercentage</code></td><td></td></tr>
+<tr><td>24</td><td><code>maxCollateralInputs</code></td><td></td></tr>
+<tr><td>25</td><td><code>poolVotingThresholds</code></td><td>array of 5 rationals, order above</td></tr>
+<tr><td>26</td><td><code>drepVotingThresholds</code></td><td>array of 10 rationals, order above</td></tr>
+<tr><td>27</td><td><code>committeeMinSize</code></td><td></td></tr>
+<tr><td>28</td><td><code>committeeMaxTermLength</code></td><td></td></tr>
+<tr><td>29</td><td><code>govActionLifetime</code></td><td></td></tr>
+<tr><td>30</td><td><code>govActionDeposit</code></td><td></td></tr>
+<tr><td>31</td><td><code>dRepDeposit</code></td><td></td></tr>
+<tr><td>32</td><td><code>dRepActivity</code></td><td></td></tr>
+<tr><td>33</td><td><code>minFeeRefScriptCostPerByte</code></td><td>CBOR tag 30 rational</td></tr>
+<tr><td>34</td><td><code>maxRefScriptSizePerBlock</code></td><td>Dijkstra — decode only</td></tr>
+<tr><td>35</td><td><code>maxRefScriptSizePerTx</code></td><td>Dijkstra — decode only</td></tr>
+<tr><td>36</td><td><code>refScriptCostStride</code></td><td>Dijkstra — decode only</td></tr>
+<tr><td>37</td><td><code>refScriptCostMultiplier</code></td><td>Dijkstra — decode only</td></tr>
+</tbody></table>
+</div>
+<p>Notes on asymmetry, because it bites:</p>
+<ul>
+<li>Keys <strong>12–15</strong> exist only in the pre-Conway (Shelley → Babbage) update
+shape. Dugite <strong>decodes</strong> them for historical replay; the Conway encoder
+never emits them, and the Conway decoder skips them.</li>
+<li>Keys <strong>34–37</strong> are the unreleased Dijkstra era. They decode but are not
+encoded.</li>
+<li>Key <strong>30 is <code>govActionDeposit</code> and key 31 is <code>dRepDeposit</code></strong> — the order is
+the opposite of what the alphabetical reading suggests, and swapping them
+silently produces a valid-looking but wrong proposal.</li>
+</ul>
+<p>Encoder: <code>crates/dugite-serialization/src/encode/protocol_params.rs</code>.
+Decoders: <code>crates/dugite-serialization/src/decode/era_conway.rs</code> (Conway and
+later) and <code>.../era_shelley.rs</code> (pre-Conway).</p>
+<h2 id="n2c-wire-encoding-of-the-current-parameters"><a class="header" href="#n2c-wire-encoding-of-the-current-parameters">N2C wire encoding of the current parameters</a></h2>
+<p>The <code>GetCurrentPParams</code> LocalStateQuery reply is <strong>not</strong> the sparse
+integer-keyed map above. It is a <strong>positional CBOR <code>array(31)</code>, indices 0–30</strong>,
+matching Haskell's <code>EncCBOR (ConwayPParams Identity ConwayEra)</code>. The two layouts
+are different and are not interchangeable.</p>
+<div class="table-wrapper"><table><thead><tr><th>Index</th><th>Parameter</th><th>Index</th><th>Parameter</th></tr></thead><tbody>
+<tr><td>0</td><td><code>txFeePerByte</code></td><td>16</td><td><code>executionUnitPrices</code></td></tr>
+<tr><td>1</td><td><code>txFeeFixed</code></td><td>17</td><td><code>maxTxExecutionUnits</code></td></tr>
+<tr><td>2</td><td><code>maxBlockBodySize</code></td><td>18</td><td><code>maxBlockExecutionUnits</code></td></tr>
+<tr><td>3</td><td><code>maxTxSize</code></td><td>19</td><td><code>maxValueSize</code></td></tr>
+<tr><td>4</td><td><code>maxBlockHeaderSize</code></td><td>20</td><td><code>collateralPercentage</code></td></tr>
+<tr><td>5</td><td><code>stakeAddressDeposit</code></td><td>21</td><td><code>maxCollateralInputs</code></td></tr>
+<tr><td>6</td><td><code>stakePoolDeposit</code></td><td>22</td><td><code>poolVotingThresholds</code></td></tr>
+<tr><td>7</td><td><code>poolRetireMaxEpoch</code></td><td>23</td><td><code>drepVotingThresholds</code></td></tr>
+<tr><td>8</td><td><code>stakePoolTargetNum</code></td><td>24</td><td><code>committeeMinSize</code></td></tr>
+<tr><td>9</td><td><code>poolPledgeInfluence</code></td><td>25</td><td><code>committeeMaxTermLength</code></td></tr>
+<tr><td>10</td><td><code>monetaryExpansion</code></td><td>26</td><td><code>govActionLifetime</code></td></tr>
+<tr><td>11</td><td><code>treasuryCut</code></td><td>27</td><td><code>govActionDeposit</code></td></tr>
+<tr><td>12</td><td><code>protocolVersion</code> (<code>[major, minor]</code>)</td><td>28</td><td><code>dRepDeposit</code></td></tr>
+<tr><td>13</td><td><code>minPoolCost</code></td><td>29</td><td><code>dRepActivity</code></td></tr>
+<tr><td>14</td><td><code>utxoCostPerByte</code></td><td>30</td><td><code>minFeeRefScriptCostPerByte</code></td></tr>
+<tr><td>15</td><td><code>costModels</code></td><td></td><td></td></tr>
+</tbody></table>
+</div>
+<p>Every index 0–30 is populated; there are no gaps and no Dijkstra slots.
+<code>GetGenesisConfig</code> uses a different, legacy Shelley-era layout —
+<code>array(18)</code> on N2C v16–v20 and <code>array(17)</code> on v21+.</p>
+<p>Encoder: <code>crates/dugite-node/src/node/n2c_query/encoding.rs</code>
+(<code>encode_protocol_params_cbor</code>). Client-side decoder to <code>cardano-cli</code> JSON:
+<code>crates/dugite-network/src/n2c_client.rs</code> (<code>parse_protocol_params_cbor</code>).</p>
+
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">

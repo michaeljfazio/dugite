@@ -184,38 +184,74 @@
 <h2 id="terminal-dashboard-dugite-monitor"><a class="header" href="#terminal-dashboard-dugite-monitor">Terminal Dashboard (dugite-monitor)</a></h2>
 <p><code>dugite-monitor</code> is a standalone binary that renders a real-time status dashboard in the terminal by polling the node's Prometheus endpoint. It requires no external infrastructure and works over SSH.</p>
 <p><img src="../assets/dugite-monitor.gif" alt="dugite-monitor TUI walkthrough" /></p>
-<pre><code class="language-bash"># Monitor a local node (default: http://localhost:12798/metrics)
+<pre><code class="language-bash"># Auto-discover a running dugite-node and attach
 dugite-monitor
 
-# Monitor a remote node
-dugite-monitor --metrics-url http://192.168.1.100:12798/metrics
+# Monitor a specific endpoint (skips discovery)
+dugite-monitor --metrics-url http://192.168.1.100:12796/metrics
 
-# Custom refresh interval (default: 2 seconds)
-dugite-monitor --refresh-interval 5
+# Pin the epoch length instead of auto-detecting it from dugite_network_magic
+dugite-monitor --network-magic 2
+
+# Show disk usage for the node's database volume in the Resources panel
+dugite-monitor --db-path ./db-preview
 </code></pre>
-<p>The dashboard displays four panels:</p>
+<p>When <code>--metrics-url</code> is omitted, <code>dugite-monitor</code> enumerates running <code>dugite-node</code> processes (via <code>sysinfo</code> + <code>netstat2</code>) and probes their <code>/metrics</code> endpoints. One node found: it attaches silently. Multiple: a selection dialog appears. None: it falls back to <code>http://localhost:12798/metrics</code>.</p>
+<blockquote>
+<p><strong>Careful:</strong> that fallback (12798) is <em>not</em> the node's default metrics port (12796 — see <a href="#which-port">Which port?</a> below). The fallback only matters when discovery finds nothing, in which case there is usually no node to monitor anyway. If the monitor reports no data, pass <code>--metrics-url</code> explicitly with the port your config actually pins.</p>
+</blockquote>
+<p>The dashboard displays five panels:</p>
 <ul>
-<li><strong>Chain Status</strong> — sync progress, current slot/block/epoch, tip age, GSM state</li>
-<li><strong>Peers</strong> — out/in/total connection counts, hot/warm/cold breakdown, EWMA latency</li>
-<li><strong>Performance</strong> — block rate sparkline, replay throughput, transaction counts</li>
-<li><strong>Governance</strong> — treasury balance, DRep count, active proposals, pool count</li>
+<li><strong>Node</strong> — role, network, version, era, uptime</li>
+<li><strong>Chain</strong> — epoch progress bar, block/slot/tip metrics, density, forks, tx counts</li>
+<li><strong>Connections</strong> — P2P state, inbound/outbound, cold/warm/hot, uni/bi/duplex counts</li>
+<li><strong>Resources</strong> — CPU %, live memory, RSS memory (plus disk when <code>--db-path</code> is set)</li>
+<li><strong>Peers</strong> — RTT bands (0-50 ms, 50-100 ms, 100-200 ms, 200 ms+), min/avg/max RTT</li>
 </ul>
-<p>Color-coded health indicators (green/yellow/red) reflect tip age and sync progress. The block rate sparkline shows the last 30 data points so you can spot throughput trends at a glance.</p>
-<p>Keyboard navigation: <code>q</code> to quit, <code>Tab</code> to cycle panels, <code>j</code>/<code>k</code> (vim-style) to scroll within a panel.</p>
+<p>Metrics are polled once per second. The interval is a compile-time constant — there is no flag to change it.</p>
+<div class="table-wrapper"><table><thead><tr><th>Key</th><th>Action</th></tr></thead><tbody>
+<tr><td><code>q</code> / <code>Esc</code></td><td>Quit</td></tr>
+<tr><td><code>t</code></td><td>Cycle theme</td></tr>
+<tr><td><code>r</code></td><td>Force-refresh metrics</td></tr>
+<tr><td><code>s</code></td><td>Switch to a different node</td></tr>
+<tr><td><code>h</code> / <code>?</code></td><td>Toggle help overlay</td></tr>
+</tbody></table>
+</div>
 <hr />
 <h2 id="prometheus-metrics-endpoint"><a class="header" href="#prometheus-metrics-endpoint">Prometheus Metrics Endpoint</a></h2>
 <p>Dugite exposes a Prometheus-compatible metrics endpoint for monitoring node health and sync progress.</p>
 <h2 id="metrics-endpoint"><a class="header" href="#metrics-endpoint">Metrics Endpoint</a></h2>
-<p>The metrics server runs on <strong>port 12798</strong> by default and responds to any HTTP request with Prometheus exposition format metrics:</p>
-<pre><code>http://localhost:12798/metrics
+<p>The metrics server responds to any unrecognised HTTP path with Prometheus exposition format metrics:</p>
+<pre><code>http://localhost:12796/metrics
 </code></pre>
+<h3 id="which-port"><a class="header" href="#which-port">Which port?</a></h3>
+<p>The built-in fallback is <strong>12796</strong>, deliberately offset from cardano-node's 12798 so a dugite node and a Haskell node can co-exist on one host. The shipped per-network configs each pin a port explicitly, so in practice the port comes from the config file:</p>
+<div class="table-wrapper"><table><thead><tr><th>Config</th><th><code>MetricsPort</code></th></tr></thead><tbody>
+<tr><td><code>config/preview/config.json</code></td><td>12796</td></tr>
+<tr><td><code>config/preprod/config.json</code></td><td>12799</td></tr>
+<tr><td><code>config/mainnet/config.json</code></td><td>12800</td></tr>
+<tr><td><em>(field absent)</em></td><td>12796</td></tr>
+</tbody></table>
+</div>
+<p>Resolution order, highest priority first:</p>
+<ol>
+<li><code>--no-metrics</code> → server disabled.</li>
+<li><code>--metrics-port &lt;PORT&gt;</code> → explicit operator override (wins even over <code>TurnOnLogMetrics=false</code>).</li>
+<li><code>TurnOnLogMetrics: false</code> in the config JSON → server disabled (master off-switch, matching cardano-node).</li>
+<li><code>MetricsPort</code> in the config JSON.</li>
+<li>Built-in default 12796.</li>
+</ol>
+<p>Pass <code>--require-metrics</code> to make a bind failure a fatal startup error instead of a logged warning.</p>
+<blockquote>
+<p>The examples below use 12796. Substitute your network's port from the table above.</p>
+</blockquote>
 <p>Example response:</p>
 <pre><code># HELP dugite_blocks_received_total Total blocks received from peers
-# TYPE dugite_blocks_received_total gauge
+# TYPE dugite_blocks_received_total counter
 dugite_blocks_received_total 1523847
 
 # HELP dugite_blocks_applied_total Total blocks applied to ledger
-# TYPE dugite_blocks_applied_total gauge
+# TYPE dugite_blocks_applied_total counter
 dugite_blocks_applied_total 1523845
 
 # HELP dugite_slot_number Current slot number
@@ -248,28 +284,29 @@ dugite_peers_connected 8
 </code></pre>
 <h2 id="health-endpoint"><a class="header" href="#health-endpoint">Health Endpoint</a></h2>
 <p>The metrics server exposes a <code>/health</code> endpoint for monitoring node status:</p>
-<pre><code>GET http://localhost:12798/health
+<pre><code>GET http://localhost:12796/health
 </code></pre>
-<p>Returns JSON with three possible statuses:</p>
+<p>Always returns <strong>200 OK</strong>. The <code>status</code> field carries the verdict:</p>
 <ul>
-<li><strong>healthy</strong>: Sync progress &gt;= 99.9%</li>
-<li><strong>syncing</strong>: Actively catching up to chain tip</li>
-<li><strong>stalled</strong>: No blocks received for &gt; 5 minutes AND sync &lt; 99%</li>
+<li><strong>healthy</strong> — sync progress &gt;= 99.9%</li>
+<li><strong>syncing</strong> — actively catching up to chain tip</li>
+<li><strong>stalled</strong> — no blocks received for &gt; 5 minutes AND sync &lt; 99%</li>
 </ul>
 <pre><code class="language-json">{
   "status": "healthy",
   "uptime_seconds": 3421,
-  "slot": 142857392,
-  "block": 11283746,
-  "epoch": 512,
+  "slot_number": 142857392,
+  "block_number": 11283746,
+  "epoch_number": 512,
   "sync_progress": 99.95,
-  "peers": 8,
-  "last_block_received": "2026-03-14T12:34:56.789Z"
+  "peers_connected": 8,
+  "last_block_received_at": "2026-03-14T12:34:56.789Z"
 }
 </code></pre>
+<p><code>last_block_received_at</code> is <code>null</code> until the first block arrives.</p>
 <h2 id="readiness-endpoint"><a class="header" href="#readiness-endpoint">Readiness Endpoint</a></h2>
 <p>For Kubernetes readiness probes:</p>
-<pre><code>GET http://localhost:12798/ready
+<pre><code>GET http://localhost:12796/ready
 </code></pre>
 <p>Returns <strong>200 OK</strong> when <code>sync_progress &gt;= 99.9%</code>, <strong>503 Service Unavailable</strong> otherwise:</p>
 <pre><code class="language-json">{"ready": true}
@@ -277,6 +314,23 @@ dugite_peers_connected 8
 <p>or:</p>
 <pre><code class="language-json">{"ready": false, "sync_progress": 75.42}
 </code></pre>
+<h2 id="liveness-endpoint"><a class="header" href="#liveness-endpoint">Liveness Endpoint</a></h2>
+<p>For Kubernetes liveness probes — this is the one that should restart a wedged pod:</p>
+<pre><code>GET http://localhost:12796/live
+</code></pre>
+<p>Returns <strong>200 OK</strong> when a block has been applied within <code>--liveness-threshold-secs</code> (default 600), or when no block has arrived yet but the node has been up for less than that window (warm-up grace). Otherwise <strong>503</strong>:</p>
+<pre><code class="language-json">{"alive": true, "threshold_secs": 600}
+</code></pre>
+<pre><code class="language-json">{"alive": false, "threshold_secs": 600, "last_block_received_at": "2026-03-14T12:34:56.789Z"}
+</code></pre>
+<p>Set <code>--liveness-threshold-secs 0</code> to make <code>/live</code> always return 200.</p>
+<blockquote>
+<p><code>/ready</code> tracks <em>sync progress</em>; <code>/live</code> tracks <em>forward progress</em>. A node that is 40% synced but applying blocks is correctly not-ready and alive. Wiring a liveness probe to <code>/ready</code> will restart-loop a node that is merely still syncing.</p>
+</blockquote>
+<h2 id="ekg-compatibility-endpoint"><a class="header" href="#ekg-compatibility-endpoint">EKG Compatibility Endpoint</a></h2>
+<pre><code>GET http://localhost:12796/ekg
+</code></pre>
+<p>Returns the nested-object JSON layout that cardano-node's EKG (<code>System.Remote.Monitoring</code>) exposes, so legacy gLiveView / CNTools dashboards that poll port 12788 can be pointed at dugite unmodified.</p>
 <h2 id="available-metrics"><a class="header" href="#available-metrics">Available Metrics</a></h2>
 <h3 id="counters"><a class="header" href="#counters">Counters</a></h3>
 <div class="table-wrapper"><table><thead><tr><th>Metric</th><th>Description</th></tr></thead><tbody>
@@ -286,66 +340,151 @@ dugite_peers_connected 8
 <tr><td><code>dugite_transactions_validated_total</code></td><td>Total transactions validated</td></tr>
 <tr><td><code>dugite_transactions_rejected_total</code></td><td>Total transactions rejected</td></tr>
 <tr><td><code>dugite_rollback_count_total</code></td><td>Total number of chain rollbacks</td></tr>
+<tr><td><code>dugite_block_apply_failures_total</code></td><td>Blocks that failed to apply to the ledger</td></tr>
+<tr><td><code>dugite_fetched_blocks_not_connecting_total</code></td><td>Fetched blocks that did not connect to the current chain</td></tr>
+<tr><td><code>dugite_header_full_validations_total</code></td><td>Headers that went through full crypto validation</td></tr>
+<tr><td><code>dugite_header_validation_failures_total</code></td><td>Headers that failed validation</td></tr>
 <tr><td><code>dugite_blocks_forged_total</code></td><td>Total blocks forged by this node</td></tr>
 <tr><td><code>dugite_leader_checks_total</code></td><td>Total VRF leader checks performed</td></tr>
 <tr><td><code>dugite_leader_checks_not_elected_total</code></td><td>Leader checks where node was not elected</td></tr>
 <tr><td><code>dugite_forge_failures_total</code></td><td>Block forge attempts that failed</td></tr>
 <tr><td><code>dugite_blocks_announced_total</code></td><td>Blocks successfully announced to peers</td></tr>
+<tr><td><code>dugite_forge_race_lost_total</code></td><td>Forged blocks that lost the race to another pool</td></tr>
+<tr><td><code>dugite_forge_slot_battles_total</code></td><td>Slot battles entered</td></tr>
+<tr><td><code>dugite_forge_announce_no_subscribers_total</code></td><td>Forged blocks with no peer to announce to</td></tr>
 <tr><td><code>dugite_n2n_connections_total</code></td><td>Total N2N (peer-to-peer) connections accepted</td></tr>
 <tr><td><code>dugite_n2c_connections_total</code></td><td>Total N2C (client) connections accepted</td></tr>
+<tr><td><code>dugite_apply_mode_reapply_total</code></td><td>Blocks applied in trust-consensus reapply mode</td></tr>
+<tr><td><code>dugite_apply_mode_validate_all_total</code></td><td>Blocks applied with full validation</td></tr>
+<tr><td><code>dugite_blockfetch_rx_bytes_total</code></td><td>Bytes received over BlockFetch</td></tr>
+<tr><td><code>dugite_blockfetch_busy_us_total</code></td><td>Microseconds BlockFetch spent busy</td></tr>
+<tr><td><code>dugite_blockfetch_send_blocked_us_total</code></td><td>Microseconds BlockFetch stalled on send</td></tr>
+<tr><td><code>dugite_blockfetch_idle_no_headers_total</code></td><td>BlockFetch idle periods caused by header starvation</td></tr>
+<tr><td><code>dugite_snapshot_enqueued_total</code></td><td>Ledger snapshots enqueued</td></tr>
+<tr><td><code>dugite_snapshot_skipped_busy_total</code></td><td>Snapshots skipped because the worker was busy</td></tr>
+<tr><td><code>dugite_snapshot_failed_total</code></td><td>Snapshot attempts that failed</td></tr>
+<tr><td><code>dugite_utxo_flush_failed_total</code></td><td>UTxO store flush failures</td></tr>
 <tr><td><code>dugite_validation_errors_total{error="..."}</code></td><td>Transaction validation errors, broken down by error type</td></tr>
 <tr><td><code>dugite_protocol_errors_total{error="..."}</code></td><td>Protocol-level errors by type (e.g. handshake failures, connection errors)</td></tr>
+<tr><td><code>dugite_config_reload_total{result="..."}</code></td><td>SIGHUP-triggered config reloads by result</td></tr>
 </tbody></table>
 </div>
 <h3 id="gauges"><a class="header" href="#gauges">Gauges</a></h3>
+<h4 id="chain-and-sync"><a class="header" href="#chain-and-sync">Chain and sync</a></h4>
+<div class="table-wrapper"><table><thead><tr><th>Metric</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>dugite_sync_progress_percent</code></td><td>Chain sync progress (0-10000; divide by 100 for percentage)</td></tr>
+<tr><td><code>dugite_slot_number</code></td><td>Current slot number</td></tr>
+<tr><td><code>dugite_block_number</code></td><td>Current block number</td></tr>
+<tr><td><code>dugite_epoch_number</code></td><td>Current epoch number</td></tr>
+<tr><td><code>dugite_slot_in_epoch</code></td><td>Offset of the current slot within the epoch (era-aware)</td></tr>
+<tr><td><code>dugite_epoch_length</code></td><td>Slots per epoch for the current epoch (era-aware)</td></tr>
+<tr><td><code>dugite_slot_length_ms</code></td><td>Slot duration in ms from the active Shelley genesis</td></tr>
+<tr><td><code>dugite_active_slots_coeff_x1000</code></td><td>Praos <code>f</code> scaled by 1000 (200 = f=0.20)</td></tr>
+<tr><td><code>dugite_era</code></td><td>Ledger era index: 0=Byron, 1=Shelley, 2=Allegra, 3=Mary, 4=Alonzo, 5=Babbage, 6=Conway, 7=Dijkstra</td></tr>
+<tr><td><code>dugite_protocol_major_version</code> / <code>dugite_protocol_minor_version</code></td><td>Active protocol version</td></tr>
+<tr><td><code>dugite_network_magic</code></td><td>764824073=mainnet, 2=preview, 1=preprod</td></tr>
+<tr><td><code>dugite_tip_age_seconds</code></td><td>Seconds since the tip slot time</td></tr>
+<tr><td><code>dugite_chainsync_idle_seconds</code></td><td>Seconds since last ChainSync RollForward event</td></tr>
+<tr><td><code>dugite_max_peer_tip_slot</code></td><td>Highest tip slot advertised by any peer</td></tr>
+<tr><td><code>dugite_ledger_replay_duration_seconds</code></td><td>Duration of last ledger replay in seconds</td></tr>
+<tr><td><code>dugite_gsm_state</code></td><td>Genesis State Machine state: 0=PreSyncing, 1=Syncing, 2=CaughtUp</td></tr>
+<tr><td><code>dugite_consensus_mode</code></td><td>0=Praos, 1=Ouroboros Genesis</td></tr>
+<tr><td><code>dugite_loe_tip_slot</code></td><td>Limit on Eagerness tip slot published to chain selection</td></tr>
+<tr><td><code>dugite_utxo_count</code></td><td>Number of entries in the UTxO set</td></tr>
+</tbody></table>
+</div>
+<h4 id="peers-and-connections"><a class="header" href="#peers-and-connections">Peers and connections</a></h4>
 <div class="table-wrapper"><table><thead><tr><th>Metric</th><th>Description</th></tr></thead><tbody>
 <tr><td><code>dugite_peers_connected</code></td><td>Number of connected peers</td></tr>
 <tr><td><code>dugite_peers_cold</code></td><td>Number of cold (known but unconnected) peers</td></tr>
 <tr><td><code>dugite_peers_warm</code></td><td>Number of warm (connected, not syncing) peers</td></tr>
 <tr><td><code>dugite_peers_hot</code></td><td>Number of hot (actively syncing) peers</td></tr>
-<tr><td><code>dugite_sync_progress_percent</code></td><td>Chain sync progress (0-10000; divide by 100 for percentage)</td></tr>
-<tr><td><code>dugite_slot_number</code></td><td>Current slot number</td></tr>
-<tr><td><code>dugite_block_number</code></td><td>Current block number</td></tr>
-<tr><td><code>dugite_epoch_number</code></td><td>Current epoch number</td></tr>
-<tr><td><code>dugite_utxo_count</code></td><td>Number of entries in the UTxO set</td></tr>
-<tr><td><code>dugite_mempool_tx_count</code></td><td>Number of transactions in the mempool</td></tr>
-<tr><td><code>dugite_mempool_bytes</code></td><td>Size of the mempool in bytes</td></tr>
-<tr><td><code>dugite_delegation_count</code></td><td>Number of active stake delegations</td></tr>
-<tr><td><code>dugite_treasury_lovelace</code></td><td>Total lovelace in the treasury</td></tr>
-<tr><td><code>dugite_drep_count</code></td><td>Number of registered DReps</td></tr>
-<tr><td><code>dugite_proposal_count</code></td><td>Number of active governance proposals</td></tr>
-<tr><td><code>dugite_pool_count</code></td><td>Number of registered stake pools</td></tr>
-<tr><td><code>dugite_uptime_seconds</code></td><td>Seconds since node startup</td></tr>
-<tr><td><code>dugite_disk_available_bytes</code></td><td>Available disk space on the database volume</td></tr>
+<tr><td><code>dugite_peers_inbound</code> / <code>dugite_peers_outbound</code> / <code>dugite_peers_duplex</code></td><td>Peers by connection direction</td></tr>
+<tr><td><code>dugite_conn_inbound</code> / <code>dugite_conn_outbound</code> / <code>dugite_conn_duplex</code> / <code>dugite_conn_full_duplex</code> / <code>dugite_conn_unidirectional</code> / <code>dugite_conn_terminating</code></td><td>Connection-manager state counts</td></tr>
 <tr><td><code>dugite_n2n_connections_active</code></td><td>Currently active N2N connections</td></tr>
 <tr><td><code>dugite_n2c_connections_active</code></td><td>Currently active N2C connections</td></tr>
-<tr><td><code>dugite_p2p_enabled</code></td><td>Whether P2P governance is active (0 or 1)</td></tr>
-<tr><td><code>dugite_diffusion_mode</code></td><td>Current diffusion mode (0=InitiatorOnly, 1=InitiatorAndResponder)</td></tr>
+<tr><td><code>dugite_diffusion_mode</code></td><td><strong>0 = InitiatorAndResponder, 1 = InitiatorOnly</strong></td></tr>
 <tr><td><code>dugite_peer_sharing_enabled</code></td><td>Whether peer sharing is active (0 or 1)</td></tr>
-<tr><td><code>dugite_tip_age_seconds</code></td><td>Seconds since the tip slot time</td></tr>
-<tr><td><code>dugite_chainsync_idle_seconds</code></td><td>Seconds since last ChainSync RollForward event</td></tr>
-<tr><td><code>dugite_ledger_replay_duration_seconds</code></td><td>Duration of last ledger replay in seconds</td></tr>
+<tr><td><code>dugite_blockfetch_active_peers</code></td><td>Peers currently serving BlockFetch</td></tr>
+<tr><td><code>dugite_gdd_disconnects_total</code></td><td>Genesis Density Disconnector peer disconnects</td></tr>
+<tr><td><code>dugite_csj_dynamos</code> / <code>dugite_csj_objectors</code> / <code>dugite_csj_jumpers</code> / <code>dugite_csj_disengaged</code></td><td>ChainSync Jumping peer roles</td></tr>
+<tr><td><code>dugite_peer_rtt_avg_ms</code> / <code>_min_ms</code> / <code>_max_ms</code> / <code>_samples</code></td><td>EWMA peer RTT summary</td></tr>
+<tr><td><code>dugite_peer_rtt_band_0_50</code> / <code>_50_100</code> / <code>_100_200</code> / <code>_200_plus</code></td><td>Connected peers bucketed by EWMA RTT</td></tr>
+<tr><td><code>dugite_peer_governor_target{name="..."}</code></td><td>Peer governor target counts by name</td></tr>
+</tbody></table>
+</div>
+<h4 id="mempool-and-transactions"><a class="header" href="#mempool-and-transactions">Mempool and transactions</a></h4>
+<div class="table-wrapper"><table><thead><tr><th>Metric</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>dugite_mempool_tx_count</code></td><td>Number of transactions in the mempool</td></tr>
+<tr><td><code>dugite_mempool_tx_max</code></td><td>Maximum transaction capacity of the mempool</td></tr>
+<tr><td><code>dugite_mempool_bytes</code></td><td>Size of the mempool in bytes</td></tr>
+<tr><td><code>dugite_n2c_txs_submitted_total</code> / <code>_accepted_total</code> / <code>_rejected_total</code></td><td>N2C local tx-submission outcomes</td></tr>
+</tbody></table>
+</div>
+<h4 id="ledger-and-governance"><a class="header" href="#ledger-and-governance">Ledger and governance</a></h4>
+<div class="table-wrapper"><table><thead><tr><th>Metric</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>dugite_delegation_count</code></td><td>Number of active stake delegations</td></tr>
+<tr><td><code>dugite_vote_delegation_count</code></td><td>Number of vote delegations</td></tr>
+<tr><td><code>dugite_treasury_lovelace</code></td><td>Total lovelace in the treasury</td></tr>
+<tr><td><code>dugite_reserves_lovelace</code></td><td>Total lovelace remaining in the reserves pot</td></tr>
+<tr><td><code>dugite_drep_count</code></td><td>Registered DReps (active + inactive)</td></tr>
+<tr><td><code>dugite_drep_active</code></td><td>DReps still within their activity window</td></tr>
+<tr><td><code>dugite_proposal_count</code></td><td>Number of active governance proposals</td></tr>
+<tr><td><code>dugite_pool_count</code></td><td>Number of registered stake pools</td></tr>
+<tr><td><code>dugite_committee_total_count</code> / <code>_hot_count</code> / <code>_resigned_count</code></td><td>Constitutional Committee membership</td></tr>
+<tr><td><code>dugite_committee_threshold_bps</code></td><td>CC threshold in basis points</td></tr>
+<tr><td><code>dugite_committee_no_confidence</code></td><td>1 when the committee is in a no-confidence state</td></tr>
+<tr><td><code>dugite_constitution_present</code></td><td>1 when a constitution is set</td></tr>
+<tr><td><code>dugite_gov_dormant_epochs</code></td><td>Consecutive epochs with no governance activity</td></tr>
+<tr><td><code>dugite_pparam_drep_deposit_lovelace</code>, <code>dugite_pparam_drep_activity_epochs</code>, <code>dugite_pparam_gov_action_deposit_lovelace</code>, <code>dugite_pparam_gov_action_lifetime_epochs</code>, <code>dugite_pparam_committee_min_size</code>, <code>dugite_pparam_committee_max_term_length</code></td><td>Conway governance protocol parameters</td></tr>
+</tbody></table>
+</div>
+<h4 id="process-and-host"><a class="header" href="#process-and-host">Process and host</a></h4>
+<div class="table-wrapper"><table><thead><tr><th>Metric</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>dugite_uptime_seconds</code></td><td>Seconds since node startup</td></tr>
+<tr><td><code>dugite_is_block_producer</code></td><td>1 when forge credentials are loaded, 0 for relay</td></tr>
+<tr><td><code>dugite_disk_available_bytes</code> / <code>dugite_disk_used_bytes</code> / <code>dugite_disk_total_bytes</code></td><td>Database volume disk usage</td></tr>
 <tr><td><code>dugite_mem_resident_bytes</code></td><td>Resident set size (RSS) in bytes</td></tr>
+<tr><td><code>dugite_mem_peak_bytes</code></td><td>Peak RSS in bytes</td></tr>
+<tr><td><code>dugite_mem_total_bytes</code></td><td>Total physical memory on the host</td></tr>
+<tr><td><code>dugite_cpu_percent</code></td><td>Process CPU utilisation as a percentage of one core</td></tr>
+<tr><td><code>dugite_cpu_seconds_total</code></td><td>Cumulative process CPU time in seconds</td></tr>
+<tr><td><code>dugite_snapshot_worker_alive</code></td><td>1 when the background snapshot worker is running</td></tr>
+<tr><td><code>dugite_utxo_backend_info{backend="..."}</code></td><td>Active UTxO storage backend</td></tr>
+<tr><td><code>dugite_pool_id_info{pool_id="..."}</code></td><td>Block producer pool identity (block producers only)</td></tr>
 </tbody></table>
 </div>
 <h3 id="histograms"><a class="header" href="#histograms">Histograms</a></h3>
 <div class="table-wrapper"><table><thead><tr><th>Metric</th><th>Buckets (ms)</th><th>Description</th></tr></thead><tbody>
 <tr><td><code>dugite_peer_handshake_rtt_ms</code></td><td>1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000</td><td>Peer N2N handshake round-trip time</td></tr>
-<tr><td><code>dugite_peer_block_fetch_ms</code></td><td>(same)</td><td>Per-block fetch latency</td></tr>
+<tr><td><code>dugite_peer_block_fetch_range_ms</code></td><td>(same)</td><td>BlockFetch range request latency</td></tr>
 </tbody></table>
 </div>
 <p>Histograms expose <code>_bucket</code>, <code>_count</code>, and <code>_sum</code> suffixes for standard Prometheus histogram queries.</p>
+<blockquote>
+<p><strong>Note:</strong> the block-fetch histogram is named <code>dugite_peer_block_fetch_range_ms</code>, not <code>dugite_peer_block_fetch_ms</code>. The bundled Grafana dashboard still queries the old name — see the caveat under <a href="#grafana-dashboard">Grafana Dashboard</a>.</p>
+</blockquote>
 <h2 id="prometheus-configuration"><a class="header" href="#prometheus-configuration">Prometheus Configuration</a></h2>
 <p>Add the Dugite node as a scrape target in your <code>prometheus.yml</code>:</p>
 <pre><code class="language-yaml">scrape_configs:
   - job_name: 'dugite'
     scrape_interval: 15s
     static_configs:
-      - targets: ['localhost:12798']
+      - targets: ['localhost:12800']    # mainnet; see the port table above
         labels:
           network: 'mainnet'
           node: 'relay-1'
 </code></pre>
+<p>A ready-made config is committed at <code>config/monitoring/prometheus.yml</code>. It scrapes every well-known dugite port so the dashboard works regardless of which <code>just run-{bp,relay} &lt;network&gt;</code> recipe is active — down targets simply show as DOWN in <code>/targets</code>:</p>
+<div class="table-wrapper"><table><thead><tr><th>Port</th><th>Role</th></tr></thead><tbody>
+<tr><td>12796</td><td>preview relay (also the built-in default)</td></tr>
+<tr><td>12797</td><td>preview BP</td></tr>
+<tr><td>12798</td><td>cardano-node default</td></tr>
+<tr><td>12799</td><td>preprod</td></tr>
+<tr><td>12800</td><td>mainnet</td></tr>
+</tbody></table>
+</div>
+<p>Alert rules live alongside it in <code>config/monitoring/prometheus-alerts.yml</code>, covering forge failures, rollback rate, tip age, hot-peer starvation, and RSS growth.</p>
 <h2 id="grafana-dashboard"><a class="header" href="#grafana-dashboard">Grafana Dashboard</a></h2>
 <p>Dugite ships with a pre-built Grafana dashboard at <code>config/monitoring/grafana-dashboard.json</code>. The dashboard covers all node metrics organized into nine sections:</p>
 <ul>
@@ -360,6 +499,9 @@ dugite_peers_connected 8
 <li><strong>Network Latency</strong> — Handshake RTT and block fetch latency percentiles (p50/p95/p99), request counts</li>
 <li><strong>Validation Errors</strong> — Error breakdown by type (stacked bars), error totals (bar chart)</li>
 </ul>
+<blockquote>
+<p><strong>Known stale panel:</strong> the block-fetch latency panels query <code>dugite_peer_block_fetch_ms_bucket</code>, but the node emits <code>dugite_peer_block_fetch_range_ms_bucket</code>. Those panels render empty until the dashboard JSON is updated. Every other metric referenced by the dashboard matches a metric the node actually emits.</p>
+</blockquote>
 <h3 id="quick-start-docker"><a class="header" href="#quick-start-docker">Quick Start (Docker)</a></h3>
 <p>The fastest way to start a local monitoring stack is with the included script:</p>
 <pre><code class="language-bash"># Start Prometheus + Grafana
@@ -417,7 +559,7 @@ global:
 scrape_configs:
   - job_name: dugite
     static_configs:
-      - targets: ['localhost:12798']
+      - targets: ['localhost:12796']    # match your config's MetricsPort
 EOF
 
 # Provision the datasource
@@ -465,7 +607,7 @@ open "http://localhost:3000/d/dugite-node/dugite-node"
 <tr><td>Treasury balance (ADA)</td><td><code>dugite_treasury_lovelace / 1e6</code></td></tr>
 <tr><td>Block forge rate (per hour)</td><td><code>rate(dugite_blocks_forged_total[1h]) * 3600</code></td></tr>
 <tr><td>Handshake RTT p95</td><td><code>histogram_quantile(0.95, rate(dugite_peer_handshake_rtt_ms_bucket[5m]))</code></td></tr>
-<tr><td>Block fetch latency p95</td><td><code>histogram_quantile(0.95, rate(dugite_peer_block_fetch_ms_bucket[5m]))</code></td></tr>
+<tr><td>Block fetch latency p95</td><td><code>histogram_quantile(0.95, rate(dugite_peer_block_fetch_range_ms_bucket[5m]))</code></td></tr>
 <tr><td>Validation errors by type</td><td><code>rate(dugite_validation_errors_total[5m])</code></td></tr>
 <tr><td>Protocol errors by type</td><td><code>rate(dugite_protocol_errors_total[5m])</code></td></tr>
 <tr><td>Leader election rate</td><td><code>rate(dugite_leader_checks_total[5m])</code></td></tr>
@@ -474,14 +616,17 @@ open "http://localhost:3000/d/dugite-node/dugite-node"
 </tbody></table>
 </div>
 <h2 id="console-logging"><a class="header" href="#console-logging">Console Logging</a></h2>
-<p>In addition to the Prometheus endpoint, Dugite logs sync progress to the console every 5 seconds. The log output includes:</p>
-<ul>
-<li>Current slot and block number</li>
-<li>Epoch number</li>
-<li>UTxO count</li>
-<li>Sync percentage</li>
-<li>Blocks-per-second throughput</li>
-</ul>
+<p>In addition to the Prometheus endpoint, Dugite logs sync progress to the console every 5 seconds — but only while catching up. Once the node is following the tip (<code>remaining</code> would be 0) the line stops being emitted, so silence here means "synced", not "stalled". The fields are:</p>
+<div class="table-wrapper"><table><thead><tr><th>Field</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>progress</code></td><td>Sync percentage</td></tr>
+<tr><td><code>epoch</code></td><td>Current epoch number</td></tr>
+<tr><td><code>block</code></td><td>Current block number</td></tr>
+<tr><td><code>tip</code></td><td>Best known tip block number</td></tr>
+<tr><td><code>remaining</code></td><td>Blocks left to apply</td></tr>
+<tr><td><code>speed</code></td><td>Blocks-per-second throughput</td></tr>
+<tr><td><code>utxos</code></td><td>UTxO set size</td></tr>
+</tbody></table>
+</div>
 <p>Example log line:</p>
 <pre><code>2026-03-12T12:34:56.789Z  INFO dugite_node::node: Syncing progress="95.42%" epoch=512 block=11283746 tip=11300000 remaining=16254 speed="312 blk/s" utxos=15234892
 </code></pre>

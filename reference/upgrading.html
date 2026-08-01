@@ -180,28 +180,83 @@
                 <div id="content" class="content">
                     <main>
                         <h1 id="upgrading-dugite"><a class="header" href="#upgrading-dugite">Upgrading Dugite</a></h1>
-<h2 id="version-compatibility"><a class="header" href="#version-compatibility">Version Compatibility</a></h2>
-<p>Dugite is in early development. Between releases, the following may change without backward compatibility:</p>
-<ul>
-<li><strong>Ledger snapshot format</strong> — Ledger state snapshots (saved in the <code>ledger/</code> subdirectory of the database path) use <code>bincode</code> serialization. The field order is fixed, but new fields added in a release will make old snapshot files unreadable.</li>
-<li><strong>Block storage format</strong> — ImmutableDB chunk files use the same on-disk format as <code>cardano-node</code> and are forward-compatible. These do not need to be deleted when upgrading.</li>
-<li><strong>Configuration file format</strong> — New config fields are always optional with sensible defaults. Existing config files are forward-compatible.</li>
-<li><strong>Protocol versions</strong> — Dugite tracks the N2N and N2C protocol versions supported by the current <code>cardano-node</code> release. If the network upgrades to a new era, update Dugite to avoid handshake failures.</li>
-</ul>
-<h2 id="upgrade-procedure"><a class="header" href="#upgrade-procedure">Upgrade Procedure</a></h2>
-<h3 id="1-stop-the-running-node"><a class="header" href="#1-stop-the-running-node">1. Stop the Running Node</a></h3>
-<pre><code class="language-bash"># Graceful shutdown (SIGTERM)
-kill $(pidof dugite-node)
-# or
-pkill dugite-node
+<p>This page is the operator's upgrade path: what changes between releases, what
+each release requires of your database, and the exact procedure to follow.</p>
+<p>For what changed <em>functionally</em> in a release, read the
+<a href="https://github.com/michaeljfazio/dugite/releases">GitHub Releases page</a>. This
+page only covers what you have to <strong>do</strong>.</p>
+<h2 id="the-one-thing-that-matters-snapshot_version"><a class="header" href="#the-one-thing-that-matters-snapshot_version">The one thing that matters: <code>SNAPSHOT_VERSION</code></a></h2>
+<p>Dugite's ledger state is persisted as a snapshot under <code>&lt;database-path&gt;/ledger/</code>,
+stamped with a <code>SNAPSHOT_VERSION</code> byte. That number decides how much work an
+upgrade costs you:</p>
+<div class="table-wrapper"><table><thead><tr><th>Situation</th><th>Cost</th></tr></thead><tbody>
+<tr><td><code>SNAPSHOT_VERSION</code> unchanged</td><td><strong>Drop-in.</strong> Swap the binary and restart.</td></tr>
+<tr><td><code>SNAPSHOT_VERSION</code> bumped</td><td>Snapshot rejected on load, ledger rebuilt by <strong>replaying ImmutableDB chunks</strong>. Blocks are kept; expect minutes-to-hours depending on database size.</td></tr>
+<tr><td>Import format changed</td><td><strong>Full <code>mithril-import</code> required.</strong> Replay cannot repair it.</td></tr>
+</tbody></table>
+</div>
+<p>The current value is <strong>31</strong>, defined at
+<code>crates/dugite-ledger/src/state/snapshot.rs</code>.</p>
+<p>A version mismatch is never destructive. The unreadable snapshot is <em>renamed</em>,
+not deleted — to <code>&lt;name&gt;.bin.v&lt;NN&gt;-unreadable</code> — and the node logs:</p>
+<pre><code>Quarantined unreadable ledger snapshot — chain will be replayed from ImmutableDB
+on next start. Inspect or delete the .v{NN}-unreadable file once recovery completes.
 </code></pre>
-<p>Wait for the process to exit. Dugite flushes its write buffer and closes the socket cleanly on SIGTERM.</p>
-<h3 id="2-install-the-new-binary"><a class="header" href="#2-install-the-new-binary">2. Install the New Binary</a></h3>
+<p>Delete the <code>.v*-unreadable</code> files once the node is healthy again.</p>
+<h2 id="upgrade-matrix"><a class="header" href="#upgrade-matrix">Upgrade matrix</a></h2>
+<p>Find the version you are upgrading <strong>from</strong>:</p>
+<div class="table-wrapper"><table><thead><tr><th>Upgrading from</th><th>What happens</th><th>Action needed</th></tr></thead><tbody>
+<tr><td><strong>Before v2.1.0</strong></td><td>Pre-v2.1.0 Mithril imports discarded governance roots (<code>Proposals.pRoots</code>), which silently corrupts reward calculation (issue #898). A chunk replay will not repair it.</td><td><strong>Full <code>mithril-import</code> required</strong> — see below</td></tr>
+<tr><td><strong>v2.1.0 – v2.2.x</strong></td><td><code>SNAPSHOT_VERSION</code> reached 31 in v2.3.0 (from 29 in v2.1.0, 30 in v2.2.x). Snapshot is quarantined and the ledger replays from chunks.</td><td>Stop, upgrade, restart. Allow extra time on first start</td></tr>
+<tr><td><strong>v2.3.0 – v2.4.2</strong></td><td><code>SNAPSHOT_VERSION</code> unchanged at 31.</td><td><strong>Drop-in.</strong> Stop, upgrade, restart</td></tr>
+</tbody></table>
+</div>
+<h3 id="v243-current-release"><a class="header" href="#v243-current-release">v2.4.3 (current release)</a></h3>
+<p><strong>Drop-in.</strong> <code>SNAPSHOT_VERSION</code> is unchanged at <strong>31</strong>. No re-sync, no
+re-import, no snapshot wipe, no config change. Stop the node with SIGTERM,
+replace the binaries, restart.</p>
+<h3 id="release-notes-that-changed-operator-behaviour"><a class="header" href="#release-notes-that-changed-operator-behaviour">Release notes that changed operator behaviour</a></h3>
+<p>These are the only releases since v2.1.0 that changed anything on disk or in
+the shutdown/startup contract. Everything not listed here was a pure drop-in.</p>
+<ul>
+<li><strong>v2.4.0</strong> — added two files inside the database directory: <code>&lt;db&gt;/lock</code> and
+<code>&lt;db&gt;/immutable/clean</code>. Both are created automatically and need no operator
+action. Consequence worth knowing: <code>&lt;db&gt;/lock</code> is an exclusive advisory flock
+held for the lifetime of <code>dugite-node run</code>, so a <strong>second process cannot open
+the same database directory</strong> — it fails fast naming the holder's PID. Tools
+that open the ChainDB (<code>dugite-node db info</code>) now fail against a live node by
+design. See <a href="./troubleshooting.html#database-directory-is-locked">Troubleshooting</a>.</li>
+<li><strong>v2.3.0</strong> — bumped <code>SNAPSHOT_VERSION</code> <strong>30 → 31</strong> (issue #919, per-era
+min-UTxO). This is the last release that required a chunk replay. Existing
+databases replay on first restart; blocks are not discarded.</li>
+<li><strong>v2.1.0</strong> — fixed the Mithril import path that dropped <code>Proposals.pRoots</code>
+(#898). Databases imported by any <em>earlier</em> version must be re-imported.</li>
+</ul>
+<h2 id="upgrade-procedure"><a class="header" href="#upgrade-procedure">Upgrade procedure</a></h2>
+<h3 id="1-stop-the-node--sigterm-never-sigkill"><a class="header" href="#1-stop-the-node--sigterm-never-sigkill">1. Stop the node — SIGTERM, never SIGKILL</a></h3>
+<pre><code class="language-bash"># Graceful shutdown
+kill $(pidof dugite-node)     # SIGTERM
+# or
+systemctl stop dugite-node
+</code></pre>
+<p>On SIGTERM (or SIGINT / <code>Ctrl-C</code>) the node demotes its peers, flushes volatile
+blocks to the ImmutableDB, fsyncs the chunk and index files, writes <code>tip.meta</code>,
+stamps the <code>immutable/clean</code> marker, and saves a final ledger snapshot.</p>
+<p><code>kill -9</code> skips all of that. The active chunk's index and the clean marker are
+left in an unknown state, so the next start pays for an index rebuild and
+possibly a chunk reconciliation. Wait for the process to actually exit — the
+final snapshot has its own 120 s budget on large databases.</p>
+<p>A second SIGTERM during shutdown forces an immediate exit (<code>exit 143</code>), so do
+not spam the signal.</p>
+<h3 id="2-install-the-new-binaries"><a class="header" href="#2-install-the-new-binaries">2. Install the new binaries</a></h3>
 <p><strong>From a release tarball:</strong></p>
 <pre><code class="language-bash">curl -LO https://github.com/michaeljfazio/dugite/releases/latest/download/dugite-x86_64-linux.tar.gz
 tar xzf dugite-x86_64-linux.tar.gz
 sudo mv dugite-node dugite-cli dugite-monitor dugite-config /usr/local/bin/
 </code></pre>
+<p>Published targets: <code>dugite-x86_64-linux.tar.gz</code>, <code>dugite-aarch64-linux.tar.gz</code>,
+<code>dugite-aarch64-macos.tar.gz</code>. Checksums are attached to each release as
+<code>SHA256SUMS.txt</code>.</p>
 <p><strong>From source:</strong></p>
 <pre><code class="language-bash">git pull
 cargo build --release
@@ -209,20 +264,13 @@ sudo cp target/release/dugite-node target/release/dugite-cli \
          target/release/dugite-monitor target/release/dugite-config \
          /usr/local/bin/
 </code></pre>
-<p><strong>Container:</strong> <em>(coming soon — <a href="https://github.com/michaeljfazio/dugite/issues/507">#507</a>)</em></p>
-<h3 id="3-clear-ledger-snapshots-if-the-snapshot-format-changed"><a class="header" href="#3-clear-ledger-snapshots-if-the-snapshot-format-changed">3. Clear Ledger Snapshots (if the snapshot format changed)</a></h3>
-<p>If the release notes mention a ledger snapshot format change, delete the saved snapshots before restarting:</p>
-<pre><code class="language-bash">rm -f /path/to/db/ledger/*.snapshot
+<p><strong>Container:</strong></p>
+<pre><code class="language-bash">docker pull ghcr.io/michaeljfazio/dugite:2.4.3
 </code></pre>
-<p>The node will rebuild the ledger state from the ImmutableDB (block storage) on next startup. For large databases this can take several minutes; consider using <a href="../running/mithril.html">Mithril snapshot import</a> to speed up recovery.</p>
-<blockquote>
-<p><strong>Block storage is safe to keep.</strong> Only <code>db/ledger/</code> needs to be cleared when the snapshot format changes. Do not delete <code>db/immutable/</code> or <code>db/volatile/</code> unless instructed.</p>
-</blockquote>
-<h3 id="4-verify-configuration"><a class="header" href="#4-verify-configuration">4. Verify Configuration</a></h3>
-<p>Check the release notes for any new required configuration fields. New fields are always optional; your existing config will continue to work. To validate:</p>
-<pre><code class="language-bash">dugite-config validate config.json
-</code></pre>
-<h3 id="5-restart"><a class="header" href="#5-restart">5. Restart</a></h3>
+<p><strong>Helm:</strong> the chart is published to <code>oci://ghcr.io/michaeljfazio/charts/dugite-node</code>
+and its <code>appVersion</code> tracks the node release. See
+<a href="../running/kubernetes.html">Kubernetes Deployment</a>.</p>
+<h3 id="3-restart"><a class="header" href="#3-restart">3. Restart</a></h3>
 <pre><code class="language-bash">dugite-node run \
   --config config.json \
   --topology topology.json \
@@ -231,15 +279,49 @@ sudo cp target/release/dugite-node target/release/dugite-cli \
   --host-addr 0.0.0.0 \
   --port 3001
 </code></pre>
-<p>Confirm the node resumes from the correct tip:</p>
-<pre><code class="language-bash">dugite-cli query tip --socket-path ./node.sock
-</code></pre>
-<h2 id="checking-the-installed-version"><a class="header" href="#checking-the-installed-version">Checking the Installed Version</a></h2>
+<p>Confirm the node resumed from the right place:</p>
 <pre><code class="language-bash">dugite-node --version
-dugite-cli --version
+dugite-cli query tip --socket-path ./node.sock
 </code></pre>
-<h2 id="checking-the-release-notes"><a class="header" href="#checking-the-release-notes">Checking the Release Notes</a></h2>
-<p>Release notes are published on the <a href="https://github.com/michaeljfazio/dugite/releases">GitHub Releases page</a>. Each release notes which components are affected and whether a ledger snapshot wipe is required.</p>
+<h3 id="4-watch-the-first-minute-of-logs"><a class="header" href="#4-watch-the-first-minute-of-logs">4. Watch the first minute of logs</a></h3>
+<p>An upgrade is the most likely moment for a database problem to surface. These
+lines are the ones that matter:</p>
+<div class="table-wrapper"><table><thead><tr><th>Log line</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>Quarantined unreadable ledger snapshot</code></td><td><code>SNAPSHOT_VERSION</code> changed — replay is running, this is expected on a version bump</td></tr>
+<tr><td><code>ImmutableDB: unclean shutdown detected (no clean marker)</code></td><td>Previous stop was not graceful; the block index is being rebuilt</td></tr>
+<tr><td><code>Ledger tip is BELOW the ImmutableDB tip after replay</code></td><td>Ledger/immutable seam — see <a href="./troubleshooting.html#ledger-tip-is-below-the-immutabledb-tip">Troubleshooting</a></td></tr>
+<tr><td><code>database directory is locked by another dugite process</code></td><td>The old process has not exited yet, or a second node is pointed at the same directory</td></tr>
+<tr><td><code>inconsistent chunk … Refusing to open with a hole below the tip</code></td><td>Storage damage below the tip — recovery required, see Troubleshooting</td></tr>
+</tbody></table>
+</div>
+<h2 id="re-import-only-when-the-matrix-says-so"><a class="header" href="#re-import-only-when-the-matrix-says-so">Re-import (only when the matrix says so)</a></h2>
+<pre><code class="language-bash"># Stop the node FIRST — mithril-import does not take the DB lock and will
+# happily delete the immutable directory out from under a running node.
+kill $(pidof dugite-node)
+
+dugite-node mithril-import --network-magic 1 --database-path ./db-preprod
+</code></pre>
+<p>Network magic: mainnet <code>764824073</code>, preview <code>2</code>, preprod <code>1</code>. See
+<a href="../running/mithril.html">Mithril Snapshot Import</a>.</p>
+<h2 id="configuration-compatibility"><a class="header" href="#configuration-compatibility">Configuration compatibility</a></h2>
+<p>New config fields are always optional with defaults, so an existing config file
+keeps working across upgrades. Validate before restarting if you edited it:</p>
+<pre><code class="language-bash">dugite-config validate config.json
+</code></pre>
+<p>Most config changes can also be applied to a <strong>running</strong> node with <code>SIGHUP</code>
+(topology and log directives reload live; restart-required fields are listed in
+the log and ignored). See <a href="./troubleshooting.html#sighup-topology-reload-and-log-verbosity">Troubleshooting</a>.</p>
+<h2 id="protocol-version-compatibility"><a class="header" href="#protocol-version-compatibility">Protocol version compatibility</a></h2>
+<p>Dugite tracks the handshake versions supported by the current <code>cardano-node</code>
+release: <strong>N2N v14–v15</strong> and <strong>N2C v16–v23</strong>. If the network hard-forks to an
+era your build predates, peers will refuse the handshake — upgrade Dugite
+before the fork. See the <a href="./mini-protocols.html">Mini-Protocol Reference</a>.</p>
+<h2 id="downgrading"><a class="header" href="#downgrading">Downgrading</a></h2>
+<p>Downgrading across a <code>SNAPSHOT_VERSION</code> bump does not work: the older binary
+rejects the newer snapshot and there is no forward-compatible reader. It will
+quarantine the snapshot and replay from the ImmutableDB, which is safe but slow.
+Block storage itself is format-stable and is never the reason to wipe a
+database.</p>
 
                     </main>
 

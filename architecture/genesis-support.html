@@ -198,13 +198,46 @@
 <p>When not enabled (the default <code>praos</code> mode), the GSM immediately enters <code>CaughtUp</code> and all Genesis constraints are disabled. This is the recommended mode for nodes that sync from Mithril snapshots.</p>
 <h3 id="state-transitions"><a class="header" href="#state-transitions">State Transitions</a></h3>
 <pre><code class="language-mermaid">stateDiagram-v2
-    [*] --&gt; PreSyncing: genesis enabled, no marker
-    [*] --&gt; CaughtUp: marker file exists
-    PreSyncing --&gt; Syncing: HAA satisfied (enough BLPs)
+    [*] --&gt; PreSyncing: no marker, tip stale
+    [*] --&gt; Syncing: no marker, tip recent (dugite ext.)
+    [*] --&gt; CaughtUp: marker file present, tip fresh
+    [*] --&gt; PreSyncing: marker present but tip too old (marker deleted)
+    PreSyncing --&gt; Syncing: HAA satisfied
     Syncing --&gt; CaughtUp: all peers idle + tip fresh
     CaughtUp --&gt; PreSyncing: tip becomes stale
 </code></pre>
-<p>A <code>caught_up.marker</code> file is written to the database directory when the node reaches <code>CaughtUp</code>, enabling fast restart without re-evaluating the Genesis bootstrap.</p>
+<p>A <code>caught_up.marker</code> file is written to the database directory when the node reaches <code>CaughtUp</code>, enabling fast restart without re-evaluating the Genesis bootstrap. The startup state is chosen from the marker's presence and the current tip's age (mirroring Haskell's <code>initializationGsmState</code>):</p>
+<div class="table-wrapper"><table><thead><tr><th>Marker</th><th>Tip age at startup</th><th>Initial state</th></tr></thead><tbody>
+<tr><td>Absent</td><td>Unknown, or &gt;= the stability-window threshold</td><td><code>PreSyncing</code></td></tr>
+<tr><td>Absent</td><td>Recent (&lt; threshold)</td><td><code>Syncing</code> — <strong>dugite extension</strong> (see below)</td></tr>
+<tr><td>Present</td><td>Young enough</td><td><code>CaughtUp</code></td></tr>
+<tr><td>Present</td><td>Too old</td><td><code>PreSyncing</code>, and the marker is deleted</td></tr>
+</tbody></table>
+</div>
+<p>The "absent marker + recent tip → <code>Syncing</code>" row does not exist in Haskell, where an absent
+marker always starts in <code>PreSyncing</code>. Haskell avoids the resulting stall by requiring a
+<code>peerSnapshotFile</code> in the topology so big-ledger peers are seeded instantly; dugite adds this
+startup shortcut instead, for deployments (e.g. fresh Mithril-snapshot bootstraps) without a peer
+snapshot file — without it, a node that is already near the live tip (its chain already certified
+by the Mithril certificate chain) would otherwise wait through a full HAA bootstrap it doesn't
+need, and could stall for k blocks in the interim.</p>
+<h3 id="the-historical-availability-assumption-haa-in-detail"><a class="header" href="#the-historical-availability-assumption-haa-in-detail">The Historical Availability Assumption (HAA) in detail</a></h3>
+<p><code>PreSyncing → Syncing</code> is gated by <code>haa_satisfied()</code>, which is a three-way case split (not a
+single "enough BLPs" check), mirroring Haskell's <code>outboundConnectionsState</code>:</p>
+<ol>
+<li><strong>Bootstrap peers configured</strong> (topology has a non-empty <code>bootstrapPeers</code> set) — satisfied when
+every established <em>outbound</em> peer is in <code>bootstrap ∪ trustable local roots</code> (a closure
+condition) <strong>and</strong> at least one of those peers is both hot and specifically a bootstrap peer
+(not just any trusted hot peer). Inbound connections are excluded from this assessment
+entirely.</li>
+<li><strong>No bootstrap peers, Praos mode</strong> — always <code>false</code>. Haskell treats this as ordinary
+<code>UntrustedState</code>, so this is silent (no warning), not an error condition.</li>
+<li><strong>No bootstrap peers, Genesis mode</strong> — satisfied purely by the count of active
+(hot) big-ledger peers meeting the configured minimum — untrusted peers don't factor in at all.</li>
+</ol>
+<p>Only case 3 is the direct "enough BLPs" gate for a from-scratch Genesis bootstrap; case 1 is what
+governs a bootstrap-peer-configured topology, and case 2 means Praos-mode nodes without bootstrap
+peers never satisfy HAA (irrelevant to them, since the GSM only enforces HAA in Genesis mode).</p>
 <h3 id="features"><a class="header" href="#features">Features</a></h3>
 <ul>
 <li><strong>State tracking</strong>: PreSyncing/Syncing/CaughtUp with automatic transitions</li>

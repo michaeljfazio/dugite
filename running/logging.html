@@ -226,11 +226,16 @@ dugite-node run --log-output journald ...
   --log-file-rotation daily \
   ...
 </code></pre>
-<p>File output uses non-blocking I/O with buffered writes. The buffer is flushed automatically on shutdown.</p>
+<p>File output uses non-blocking I/O with buffered writes. The buffer is flushed automatically on shutdown — which is one more reason to stop the node with SIGTERM rather than <code>kill -9</code>.</p>
+<p>Log files are named <code>dugite.log</code> (with a date/hour suffix under <code>daily</code> /
+<code>hourly</code> rotation). Note that <code>--log-retention-days</code> is accepted but the cleanup
+sweep is not currently wired into the running node, so old files accumulate
+until you rotate them out yourself (logrotate, a cron job, or a tmpfiles rule).</p>
 <h3 id="journald"><a class="header" href="#journald">Journald</a></h3>
-<p>Native systemd journal integration. This requires building Dugite with the <code>journald</code> feature:</p>
-<pre><code class="language-bash">cargo build --release --features journald
+<p>Native systemd journal integration. This requires building Dugite with the <code>journald</code> feature, which lives on the <code>dugite-node</code> crate:</p>
+<pre><code class="language-bash">cargo build --release -p dugite-node --features journald
 </code></pre>
+<p>Requesting <code>--log-output journald</code> from a binary built without the feature is a hard startup error, not a silent downgrade to stdout.</p>
 <p>Then run with:</p>
 <pre><code class="language-bash">dugite-node run --log-output journald ...
 </code></pre>
@@ -239,13 +244,28 @@ dugite-node run --log-output journald ...
 journalctl -u dugite-node --since "1 hour ago"
 </code></pre>
 <h2 id="log-levels"><a class="header" href="#log-levels">Log Levels</a></h2>
-<p>The log level can be set via the <code>--log-level</code> CLI flag or the <code>RUST_LOG</code> environment variable. If both are set, <code>RUST_LOG</code> takes priority.</p>
+<p>Verbosity is resolved with this precedence, highest first:</p>
+<ol>
+<li><code>RUST_LOG</code> environment variable</li>
+<li><code>--log-level</code> CLI flag</li>
+<li><code>LogDirective</code> config field</li>
+<li><code>MinSeverity</code> config field</li>
+</ol>
 <pre><code class="language-bash"># Via CLI flag
 dugite-node run --log-level debug ...
 
 # Via environment variable (takes priority)
 RUST_LOG=debug dugite-node run ...
 </code></pre>
+<p>The two config fields are applied by a live filter reload immediately after the
+config file is parsed, and only when neither <code>RUST_LOG</code> nor <code>--log-level</code> is
+set — so a CLI or environment override is never clobbered by the file. See
+<a href="./configuration.html#log-level-control">Configuration → Log Level Control</a>.</p>
+<p><code>MinSeverity</code> uses cardano-node's syslog vocabulary, which is wider than
+<code>tracing</code>'s. It is translated rather than passed through: <code>Notice</code> → <code>info</code>, and
+<code>Critical</code> / <code>Alert</code> / <code>Emergency</code> → <code>error</code>. An unrecognised value falls back to
+<code>info</code>. Use <code>LogDirective</code> when you need per-target control — it is handed to
+<code>EnvFilter</code> unchanged.</p>
 <p>Available levels (from most to least verbose):</p>
 <div class="table-wrapper"><table><thead><tr><th>Level</th><th>Description</th></tr></thead><tbody>
 <tr><td><code>trace</code></td><td>Very detailed internal diagnostics</td></tr>
@@ -267,16 +287,32 @@ RUST_LOG=dugite_storage=trace,debug dugite-node run ...
 RUST_LOG=info,dugite_network=warn dugite-node run ...
 </code></pre>
 <h2 id="cli-reference"><a class="header" href="#cli-reference">CLI Reference</a></h2>
-<p>All logging flags are shared between the <code>run</code> and <code>mithril-import</code> subcommands:</p>
+<p>The logging flags are shared by every subcommand that does work: <code>run</code>,
+<code>mithril-import</code>, <code>dump-snapshot</code>, <code>verify-ledger-snapshot</code>, and
+<code>snapshot-convert</code>. (<code>db info</code> does not initialise the subscriber and takes no
+logging flags.)</p>
 <div class="table-wrapper"><table><thead><tr><th>Flag</th><th>Default</th><th>Description</th></tr></thead><tbody>
-<tr><td><code>--log-output</code></td><td><code>stdout</code></td><td>Log output target: <code>stdout</code>, <code>file</code>, or <code>journald</code>. Can be specified multiple times.</td></tr>
-<tr><td><code>--log-format</code></td><td><code>text</code></td><td>Log format: <code>text</code> (human-readable) or <code>json</code> (structured).</td></tr>
-<tr><td><code>--log-level</code></td><td><code>info</code></td><td>Log level: <code>trace</code>, <code>debug</code>, <code>info</code>, <code>warn</code>, <code>error</code>. Overridden by <code>RUST_LOG</code>.</td></tr>
+<tr><td><code>--log-output</code></td><td><code>stdout</code></td><td>Log output target: <code>stdout</code>, <code>file</code>, or <code>journald</code> (aliases: <code>journal</code>, <code>systemd</code>). Can be specified multiple times. Values are case-insensitive</td></tr>
+<tr><td><code>--log-format</code></td><td><code>text</code></td><td>Log format: <code>text</code> (alias <code>plain</code>) or <code>json</code> (structured)</td></tr>
+<tr><td><code>--log-level</code></td><td><code>info</code></td><td>Log level: <code>trace</code>, <code>debug</code>, <code>info</code>, <code>warn</code>, <code>error</code>. Overridden by <code>RUST_LOG</code></td></tr>
 <tr><td><code>--log-dir</code></td><td><code>logs</code></td><td>Directory for log files (used with <code>--log-output file</code>)</td></tr>
-<tr><td><code>--log-file-rotation</code></td><td><code>daily</code></td><td>Log file rotation: <code>daily</code>, <code>hourly</code>, or <code>never</code></td></tr>
-<tr><td><code>--log-no-color</code></td><td><code>false</code></td><td>Disable ANSI colors in stdout output</td></tr>
+<tr><td><code>--log-file-rotation</code></td><td><code>daily</code></td><td>Log file rotation: <code>daily</code>, <code>hourly</code>, or <code>never</code> (alias <code>none</code>)</td></tr>
+<tr><td><code>--log-no-color</code></td><td><code>false</code></td><td>Disable ANSI colors in stdout output. Colors are auto-disabled anyway when stdout is not a terminal</td></tr>
+<tr><td><code>--log-retention-days</code></td><td><code>7</code></td><td>Accepted but <strong>currently inert</strong> — no cleanup task is wired into the running node</td></tr>
+<tr><td><code>--stdout-overflow</code></td><td><code>drop</code></td><td>Channel-full policy for the non-blocking stdout writer. <code>drop</code> (alias <code>lossy</code>) keeps the hot path unblocked and counts dropped lines; <code>block</code> (alias <code>lossless</code>) parks the producer until the writer drains</td></tr>
 </tbody></table>
 </div>
+<p>An unrecognised value for any of these is a startup error naming the valid set,
+not a silent fallback.</p>
+<h3 id="non-blocking-output-and---stdout-overflow"><a class="header" href="#non-blocking-output-and---stdout-overflow">Non-blocking output and <code>--stdout-overflow</code></a></h3>
+<p>Every <code>tracing</code> call hands its line to a background writer thread over a bounded
+channel rather than performing a synchronous <code>write(2)</code> on the emitting tokio
+worker. The default <code>drop</code> policy means that under a genuine log flood, lines
+are discarded rather than stalling block application — which is the right
+trade-off in production.</p>
+<p>Use <code>--stdout-overflow block</code> for development, CI, or forensic capture where
+every line must survive. It re-introduces blocking on the hot path, so it
+defeats the point of the non-blocking writer under real overload.</p>
 <h2 id="runtime-log-verbosity-reload-sighup"><a class="header" href="#runtime-log-verbosity-reload-sighup">Runtime Log Verbosity Reload (SIGHUP)</a></h2>
 <p>Dugite supports changing per-subsystem log verbosity at runtime without restarting the node. This is useful for debugging a specific issue (for example, enabling trace logging for the network layer) without disrupting ongoing block production or sync.</p>
 <p><strong>Workflow:</strong></p>
@@ -291,20 +327,30 @@ RUST_LOG=info,dugite_network=warn dugite-node run ...
 </li>
 <li>
 <p>Send <code>SIGHUP</code> to the running node:</p>
-<pre><code class="language-bash">kill -HUP $(pidof dugite-node)
+<pre><code class="language-bash">kill -HUP $(pgrep -x dugite-node)
 </code></pre>
-<p>The node re-reads the config file. If <code>LogDirective</code> is present and valid, the filter is reloaded immediately and logged:</p>
-<pre><code>INFO dugite_node: Reloaded log directive: "info,dugite_network=trace"
-</code></pre>
-<p>If the directive string is invalid, the previous filter is left intact.</p>
+<p>The node re-reads the config file. If <code>LogDirective</code> is present and valid, the filter is reloaded immediately across every output target and the change is logged.</p>
+<p>The directive is parsed before any filter handle is touched, so an invalid string leaves the previous filter fully intact rather than half-applied.</p>
 </li>
 <li>
 <p>To restore the original level, remove <code>LogDirective</code> from the config and send SIGHUP again, or set it back to <code>"info"</code>.</p>
 </li>
 </ol>
-<blockquote>
-<p><strong>Note:</strong> <code>LogDirective</code> is only applied via SIGHUP. The initial startup level is controlled by <code>--log-level</code> / <code>RUST_LOG</code> as before.</p>
-</blockquote>
+<p>Two details worth knowing, because they differ between startup and SIGHUP:</p>
+<ul>
+<li><strong>At startup</strong>, <code>LogDirective</code> / <code>MinSeverity</code> are applied only when neither
+<code>RUST_LOG</code> nor <code>--log-level</code> is set, so an explicit operator override is never
+clobbered by the file.</li>
+<li><strong>On SIGHUP</strong>, they are applied unconditionally, and the reload uses the
+directive directly rather than re-consulting <code>RUST_LOG</code>. A SIGHUP therefore
+<em>does</em> override a level you set on the command line or in the environment.</li>
+</ul>
+<p>The log filter is only touched when at least one hot-reloadable field actually
+changed. A SIGHUP against an unmodified config file is a no-op, logged as
+<code>config_reload: no fields changed</code>.</p>
+<p>SIGHUP also reloads the topology and the hot-reloadable peer-governor targets.
+See <a href="./configuration.html#live-reload-sighup">Live Reload</a> for the full field
+partition.</p>
 <h2 id="production-recommendations"><a class="header" href="#production-recommendations">Production Recommendations</a></h2>
 <p>For production deployments with log aggregation:</p>
 <pre><code class="language-bash">dugite-node run \

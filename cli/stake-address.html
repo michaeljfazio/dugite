@@ -278,6 +278,17 @@ dugite-cli stake-address vote-delegation-certificate \
 <tr><td><code>--out-file</code></td><td>Yes</td><td>Output path for the certificate</td></tr>
 </tbody></table>
 </div>
+<h2 id="key-hash"><a class="header" href="#key-hash">key-hash</a></h2>
+<p>Get the Blake2b-224 hash of a stake verification key:</p>
+<pre><code class="language-bash">dugite-cli stake-address key-hash \
+  --stake-verification-key-file stake.vkey
+</code></pre>
+<div class="table-wrapper"><table><thead><tr><th>Flag</th><th>Required</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>--stake-verification-key-file</code></td><td>Yes</td><td>Path to the stake verification key</td></tr>
+</tbody></table>
+</div>
+<p>This is the cardano-cli-compatible equivalent of <code>dugite-cli key verification-key-hash --verification-key-file stake.vkey</code> (see
+<a href="key-generation.html">Key Generation</a>).</p>
 <h2 id="complete-staking-workflow"><a class="header" href="#complete-staking-workflow">Complete Staking Workflow</a></h2>
 <pre><code class="language-bash"># 1. Generate stake keys
 dugite-cli stake-address key-gen \

@@ -184,26 +184,41 @@
 mini-protocol used in node-to-node (N2N) and node-to-client (N2C)
 communication. It covers the complete state machine, exact CBOR wire format,
 timing constraints, flow-control rules, and every protocol-error condition for
-each protocol. The information is derived directly from the Haskell source in
+each protocol. The protocol descriptions are derived from the Haskell source in
 the <code>IntersectMBO/ouroboros-network</code> repository.</p>
+<p>Where Dugite's own coverage, negotiated versions, or operational constants
+differ from the upstream defaults, that is recorded in
+<a href="#dugite-implementation-status">Dugite Implementation Status</a> below and called
+out inline in the affected sections.</p>
 <hr />
 <h2 id="connection-model-and-multiplexer"><a class="header" href="#connection-model-and-multiplexer">Connection Model and Multiplexer</a></h2>
 <p>All mini-protocols share a single TCP connection per peer, multiplexed by the
-<code>network-mux</code> layer using 8-byte SDU headers:</p>
+<code>network-mux</code> layer using 8-byte big-endian SDU headers:</p>
 <pre><code>  Bytes  Field
   -----  -----
-   0-3   timestamp (u32, microseconds, used for RTT measurement)
-   4-5   mini_protocol_num (u16)
-     6   flags (bit 0 = direction: 0=initiator, 1=responder)
-   7-8   payload_length (u16, max 65535)
+   0-3   transmission_time  u32 BE (microseconds, monotonic — used for RTT measurement)
+   4-5   protocol_and_dir   u16 BE (bit 15 = direction, bits 0-14 = protocol number)
+   6-7   payload_length     u16 BE (max 65535)
 </code></pre>
+<p>The direction bit is <strong>not</strong> a separate flags byte — it is the top bit of the
+protocol field, so the protocol number itself is capped at 32767. Bit 15 = 0
+means the SDU was sent by the TCP connection <em>initiator</em>, bit 15 = 1 means the
+<em>responder</em>. On ingress the bit is flipped: what the remote sends as
+<code>InitiatorDir</code> is received as <code>ResponderDir</code> locally.</p>
+<p>Dugite implementation: <code>crates/dugite-network/src/mux/segment.rs</code>.</p>
 <p>Large messages are fragmented across multiple SDUs transparently. Handshake
-(protocol 0) runs on the raw socket before the mux is started.</p>
+(protocol 0) is itself SDU-framed and runs <strong>through the mux</strong>, not on the raw
+socket — Dugite starts the mux first, subscribes the protocol-0 channel, runs
+the handshake on it, and only then subscribes the remaining protocol channels
+(<code>crates/dugite-node/src/node/peer_connection.rs</code>).</p>
+<p>Dugite's SDU payload sizes: <strong>12288 bytes</strong> over TCP (N2N) and <strong>32768 bytes</strong>
+over a Unix socket (N2C).</p>
 <p><strong>Key invariant</strong>: if any single mini-protocol thread throws an exception, the
 entire mux — and therefore the entire TCP connection — is torn down. Protocol
 errors are fatal to the connection, not just to the affected mini-protocol.</p>
 <p><strong>Sources:</strong></p>
 <ul>
+<li><code>ouroboros-network/network-mux/src/Network/Mux/Codec.hs</code></li>
 <li><code>ouroboros-network/network-mux/src/Network/Mux/Types.hs</code></li>
 <li><code>ouroboros-network/network-mux/src/Network/Mux/Egress.hs</code></li>
 </ul>
@@ -252,10 +267,13 @@ this document.</p>
 <tr><td>TxSubmission2</td><td>4</td></tr>
 <tr><td>KeepAlive</td><td>8</td></tr>
 <tr><td>PeerSharing</td><td>10</td></tr>
-<tr><td>Peras Cert</td><td>16 (future)</td></tr>
-<tr><td>Peras Vote</td><td>17 (future)</td></tr>
+<tr><td>Peras Cert</td><td>16 (spec only — not implemented by Dugite)</td></tr>
+<tr><td>Peras Vote</td><td>17 (spec only — not implemented by Dugite)</td></tr>
 </tbody></table>
 </div>
+<p>Protocol 1 is reserved (historically DeltaQ) and never carries traffic. Dugite
+silently discards any inbound SDU on protocol 1 rather than treating it as a
+protocol error.</p>
 <h2 id="n2c-mini-protocol-ids"><a class="header" href="#n2c-mini-protocol-ids">N2C Mini-Protocol IDs</a></h2>
 <div class="table-wrapper"><table><thead><tr><th>Protocol</th><th>ID</th></tr></thead><tbody>
 <tr><td>Handshake</td><td>0</td></tr>
@@ -263,6 +281,67 @@ this document.</p>
 <tr><td>LocalTxSubmission</td><td>6</td></tr>
 <tr><td>LocalStateQuery</td><td>7</td></tr>
 <tr><td>LocalTxMonitor</td><td>9</td></tr>
+</tbody></table>
+</div>
+<p>Protocol ID constants: <code>crates/dugite-network/src/protocol/mod.rs</code>.</p>
+<hr />
+<h2 id="dugite-implementation-status"><a class="header" href="#dugite-implementation-status">Dugite Implementation Status</a></h2>
+<p>Everything below in this page describes the protocol as specified by
+<code>IntersectMBO/ouroboros-network</code>. This section records what <strong>Dugite</strong> actually
+implements, and where its own constants differ from the Haskell defaults.</p>
+<h3 id="coverage"><a class="header" href="#coverage">Coverage</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Protocol</th><th>Client (initiator)</th><th>Server (responder)</th></tr></thead><tbody>
+<tr><td>N2N Handshake (0)</td><td>yes</td><td>yes</td></tr>
+<tr><td>N2N ChainSync (2)</td><td>yes</td><td>yes</td></tr>
+<tr><td>N2N BlockFetch (3)</td><td>yes</td><td>yes</td></tr>
+<tr><td>N2N TxSubmission2 (4)</td><td>yes</td><td>yes</td></tr>
+<tr><td>N2N KeepAlive (8)</td><td>yes</td><td>yes</td></tr>
+<tr><td>N2N PeerSharing (10)</td><td>yes</td><td>yes</td></tr>
+<tr><td>N2C Handshake (0)</td><td>yes</td><td>yes</td></tr>
+<tr><td>N2C LocalChainSync (5)</td><td>no state machine — raw channel only</td><td>yes</td></tr>
+<tr><td>N2C LocalTxSubmission (6)</td><td>yes (<code>submit_tx</code>)</td><td>yes</td></tr>
+<tr><td>N2C LocalStateQuery (7)</td><td>yes</td><td>yes</td></tr>
+<tr><td>N2C LocalTxMonitor (9)</td><td>yes</td><td>yes</td></tr>
+</tbody></table>
+</div>
+<p>All ten N2N channels (five protocols × initiator + responder) are subscribed on
+every connection, inbound and outbound. Negotiating <code>InitiatorOnly</code> does <strong>not</strong>
+disable Dugite's responder side.</p>
+<p>The N2N ChainSync client used in production is not the library's
+<code>PipelinedChainSyncClient</code> — the node runs its own pipelined state machine in
+<code>crates/dugite-node/src/node/sync.rs</code> over the same codec. The library client is
+exported and tested, but not on the sync path.</p>
+<h3 id="handshake-versions-actually-offered"><a class="header" href="#handshake-versions-actually-offered">Handshake versions actually offered</a></h3>
+<div class="table-wrapper"><table><thead><tr><th></th><th>Versions</th><th>Preference order</th><th>Version data</th></tr></thead><tbody>
+<tr><td><strong>N2N</strong></td><td>14, 15</td><td><code>[15, 14]</code></td><td><code>array(4)</code>: <code>[networkMagic, initiatorOnly, peerSharing, query]</code></td></tr>
+<tr><td><strong>N2C</strong></td><td>16–23 (wire <code>0x8000 | v</code>, i.e. 32784–32791)</td><td><code>[23 … 16]</code></td><td><code>array(2)</code>: <code>[networkMagic, query]</code></td></tr>
+</tbody></table>
+</div>
+<p>Negotiation rules as implemented: network magic must match exactly;
+<code>initiatorOnly</code> is OR'd (either side asking degrades both); <code>peerSharing</code> is
+AND'd (both must enable); <code>query</code> is OR'd. Unknown version numbers in a peer's
+proposal map are skipped rather than rejected, so an older <code>cardano-node</code>
+offering v13 still negotiates. The proposal map is emitted with keys in
+ascending order for canonical CBOR, capped at 32 entries. Handshake timeout is
+10 s on both roles.</p>
+<p>Implementation: <code>crates/dugite-network/src/handshake/{n2n.rs,n2c.rs,mod.rs}</code>.</p>
+<h3 id="dugites-own-limits-and-timeouts"><a class="header" href="#dugites-own-limits-and-timeouts">Dugite's own limits and timeouts</a></h3>
+<p>These are Dugite's operational values. Where the Haskell default differs, the
+per-protocol sections below give the upstream number.</p>
+<div class="table-wrapper"><table><thead><tr><th>Setting</th><th>Value</th><th>Where</th></tr></thead><tbody>
+<tr><td>ChainSync pipeline depth</td><td><code>DUGITE_PIPELINE_DEPTH</code>, default <strong>300</strong>, low mark ⅔ (~200); collapses toward 1 near the tip</td><td><code>node/sync.rs</code></td></tr>
+<tr><td>ChainSync <code>StMustReply</code> timeout</td><td>uniform random per connection in <strong>[601 s, 911 s]</strong></td><td><code>protocol/chainsync/serve_core.rs</code></td></tr>
+<tr><td>ChainSync max intersect points</td><td>100</td><td><code>protocol/chainsync/mod.rs</code></td></tr>
+<tr><td>BlockFetch batch</td><td>2000 blocks per range; 2 500 000 B per <code>MsgBlock</code>; range span ≤ 432 000 slots</td><td><code>protocol/blockfetch/</code></td></tr>
+<tr><td>BlockFetch in-flight ranges</td><td>100 per peer</td><td><code>protocol/blockfetch/decision.rs</code></td></tr>
+<tr><td>TxSubmission2</td><td>10 txids per request, <code>maxUnacked</code> 100, 1000 in-flight txids</td><td><code>protocol/txsubmission/server.rs</code></td></tr>
+<tr><td>KeepAlive</td><td>cookie <code>u16</code> randomly seeded per connection; ping every 10 s; pong timeout 30 s; 3 consecutive misses closes the connection; server accepts at most 144 000 pings/session</td><td><code>protocol/keepalive/</code></td></tr>
+<tr><td>PeerSharing</td><td>requests <strong>8</strong> peers per round, max <strong>2</strong> requests in flight globally; decode cap 255 addresses; non-routable addresses (RFC1918, CGNAT 100.64/10, loopback, link-local, IPv6 ULA) filtered on both sides</td><td><code>protocol/peersharing/</code>, <code>node/connection_lifecycle.rs</code></td></tr>
+<tr><td>Mux SDU payload read timeout</td><td>30 s after a header arrives (header wait is deliberately unbounded)</td><td><code>mux/ingress.rs</code></td></tr>
+<tr><td>Inbound connection idle timeout</td><td>300 s</td><td><code>connection/manager.rs</code></td></tr>
+<tr><td>Ingress byte limits</td><td>default 4 MB; ChainSync 512 KB; BlockFetch 48 MB; TxSubmission 8 MB; N2C channels 1 MB</td><td><code>node/peer_connection.rs</code></td></tr>
+<tr><td>Global CBOR nesting depth cap</td><td>64</td><td><code>codec.rs</code></td></tr>
+<tr><td>LocalStateQuery query blob cap</td><td>4 KB</td><td><code>protocol/local_state_query/server.rs</code></td></tr>
 </tbody></table>
 </div>
 <hr />
@@ -366,7 +445,7 @@ SDU read cycle on each side.</p>
 <li><strong>Temperature:</strong> Hot (started on warm→hot promotion)</li>
 <li><strong>Direction:</strong> N2N ChainSync streams <strong>block headers</strong> only (not full blocks).
 Full blocks are fetched via BlockFetch.</li>
-<li><strong>Versions:</strong> All N2N versions (V7+)</li>
+<li><strong>Versions:</strong> All N2N versions (V7+ upstream; Dugite offers V14/V15)</li>
 </ul>
 <h3 id="state-machine-1"><a class="header" href="#state-machine-1">State Machine</a></h3>
 <p>Source: <code>ouroboros-network/ouroboros-network/protocols/lib/Ouroboros/Network/Protocol/ChainSync/Type.hs</code></p>
@@ -460,6 +539,8 @@ Source: <code>cardano-diffusion/lib/Cardano/Network/Diffusion/Configuration.hs:d
 <h3 id="ingress-queue-limit"><a class="header" href="#ingress-queue-limit">Ingress Queue Limit</a></h3>
 <p><code>highMark × 1400 bytes × 1.1 safety factor</code></p>
 <p>With <code>highMark=300</code>: approximately 462 000 bytes.</p>
+<p>Dugite enforces a flat <strong>512 KB</strong> ingress byte limit on the ChainSync channel
+(<code>crates/dugite-node/src/node/peer_connection.rs</code>).</p>
 <hr />
 <h2 id="n2n-protocol-3-blockfetch"><a class="header" href="#n2n-protocol-3-blockfetch">N2N Protocol 3: BlockFetch</a></h2>
 <h3 id="identity-2"><a class="header" href="#identity-2">Identity</a></h3>
@@ -1049,7 +1130,7 @@ era_query = [1, tag=0]    ; GetLedgerTip
 <tr><td>1</td><td>GetEpochNo</td><td>V8</td></tr>
 <tr><td>2</td><td>GetNonMyopicMemberRewards</td><td>V8</td></tr>
 <tr><td>3</td><td>GetCurrentPParams</td><td>V8</td></tr>
-<tr><td>4</td><td>GetProposedPParamsUpdates</td><td>V8</td></tr>
+<tr><td>4</td><td>GetProposedPParamsUpdates</td><td>V8 (rejected from V20)</td></tr>
 <tr><td>5</td><td>GetStakeDistribution</td><td>V8 (removed in V21)</td></tr>
 <tr><td>6</td><td>GetUTxOByAddress</td><td>V8</td></tr>
 <tr><td>7</td><td>GetUTxOWhole</td><td>V8</td></tr>
@@ -1083,10 +1164,19 @@ era_query = [1, tag=0]    ; GetLedgerTip
 <tr><td>35</td><td>QueryStakePoolDefaultVote</td><td>V20</td></tr>
 <tr><td>36</td><td>GetPoolDistr2</td><td>V21</td></tr>
 <tr><td>37</td><td>GetStakeDistribution2</td><td>V21</td></tr>
-<tr><td>38</td><td>GetMaxMajorProtVersion</td><td>V21</td></tr>
+<tr><td>38</td><td>GetMaxMajorProtocolVersion</td><td>V21</td></tr>
 <tr><td>39</td><td>GetDRepDelegations</td><td>V23</td></tr>
 </tbody></table>
 </div>
+<p>Dugite serves <strong>every</strong> tag in this table; the dispatch lives in
+<code>crates/dugite-node/src/node/n2c_query/mod.rs</code>. <code>GetFuturePParams</code> (33) always
+answers <code>Nothing</code>. <code>GetLedgerPeerSnapshot</code> (34) has distinct V19–V22 and V23+
+shapes. The three version-gated rejections (tag 4 from V20; tags 5 and 21 from
+V21) are enforced explicitly rather than silently answered.</p>
+<p>Beyond the Shelley <code>BlockQuery</code> tags, Dugite also serves the top-level queries
+<code>GetCurrentEra</code>, <code>GetSystemStart</code>, <code>GetChainBlockNo</code>, <code>GetChainPoint</code>; the
+<code>QueryAnytime</code> queries <code>GetEraStart</code> and <code>GetCurrentEra</code>; and the <code>QueryHardFork</code>
+queries <code>GetInterpreter</code> (era history) and <code>GetCurrentEra</code>.</p>
 <p>Source: <code>cardano-diffusion/api/lib/Cardano/Network/NodeToClient/Version.hs</code> and
 <code>ouroboros-consensus/ouroboros-consensus-cardano/src/unstable-cardano-tools/Cardano/Tools/DBAnalyser/Block/Cardano.hs</code></p>
 <h3 id="msgresult-wrapping"><a class="header" href="#msgresult-wrapping">MsgResult Wrapping</a></h3>

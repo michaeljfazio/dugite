@@ -188,6 +188,27 @@
 <tr><td><strong>Preprod</strong></td><td><code>1</code></td><td>Stable testnet that mirrors mainnet behavior</td></tr>
 </tbody></table>
 </div>
+<h2 id="ready-made-configs"><a class="header" href="#ready-made-configs">Ready-Made Configs</a></h2>
+<p>The repository ships complete, self-contained config and topology files for all
+three networks under <code>config/&lt;network&gt;/</code>, alongside the genesis files they
+reference:</p>
+<pre><code>config/mainnet/{config,topology,byron-genesis,shelley-genesis,alonzo-genesis,conway-genesis}.json
+config/preview/{...}
+config/preprod/{...}
+</code></pre>
+<p>Paths inside them are relative, so they work in place:</p>
+<pre><code class="language-bash">just run-relay preview        # or: just run-bp preview
+
+# equivalently
+dugite-node run \
+  --config config/preview/config.json \
+  --topology config/preview/topology.json \
+  --database-path ./db-preview \
+  --socket-path ./node.sock \
+  --host-addr 0.0.0.0 --port 3001
+</code></pre>
+<p>The sections below show minimal hand-written equivalents if you would rather
+build your own.</p>
 <h2 id="connecting-to-mainnet"><a class="header" href="#connecting-to-mainnet">Connecting to Mainnet</a></h2>
 <p>Create a <code>config-mainnet.json</code>:</p>
 <pre><code class="language-json">{
@@ -202,9 +223,17 @@
     { "address": "backbone.mainnet.cardanofoundation.org", "port": 3001 },
     { "address": "backbone.mainnet.emurgornd.com", "port": 3001 }
   ],
-  "localRoots": [{ "accessPoints": [], "advertise": false, "valency": 1 }],
-  "publicRoots": [{ "accessPoints": [], "advertise": false }],
-  "useLedgerAfterSlot": 177724800
+  "localRoots": [],
+  "publicRoots": [
+    {
+      "accessPoints": [
+        { "address": "backbone.cardano.iog.io", "port": 3001 },
+        { "address": "backbone.mainnet.cardanofoundation.org", "port": 3001 }
+      ],
+      "advertise": false
+    }
+  ],
+  "useLedgerAfterSlot": 0
 }
 </code></pre>
 <p>Run the node:</p>
@@ -219,16 +248,25 @@
 <blockquote>
 <p><strong>Tip:</strong> For a faster initial mainnet sync, consider using <a href="./mithril.html">Mithril snapshot import</a> first.</p>
 </blockquote>
+<blockquote>
+<p><strong>Note:</strong> A config with no genesis files, like the minimal one above, starts on
+built-in default protocol parameters rather than mainnet's. Point at the real
+genesis files — <code>config/mainnet/</code> has them — before syncing for real.</p>
+</blockquote>
 <h2 id="connecting-to-preview-testnet"><a class="header" href="#connecting-to-preview-testnet">Connecting to Preview Testnet</a></h2>
 <blockquote>
 <p><strong>Note:</strong> Preview testnet is at Protocol Version 11 (PV11). Peers running
 cardano-node 10.x will reject the connection with a version mismatch. Use
 cardano-node 11.0.1+ for any preview peer or soak rig.</p>
 </blockquote>
-<p>Create a <code>config-preview.json</code>:</p>
+<p>Create a <code>config-preview.json</code>. The shipped <code>config/preview/config.json</code> sets
+<code>ExperimentalHardForksEnabled: true</code>, which makes the node signal <code>ProtVer 12 0</code>
+and accept on-chain protocol versions up to 12, rather than the default
+<code>ProtVer 11 0</code> / max 11:</p>
 <pre><code class="language-json">{
   "Network": "Testnet",
-  "NetworkMagic": 2
+  "NetworkMagic": 2,
+  "ExperimentalHardForksEnabled": true
 }
 </code></pre>
 <p>Create a <code>topology-preview.json</code>:</p>
@@ -236,8 +274,17 @@ cardano-node 11.0.1+ for any preview peer or soak rig.</p>
   "bootstrapPeers": [
     { "address": "preview-node.play.dev.cardano.org", "port": 3001 }
   ],
-  "localRoots": [{ "accessPoints": [], "advertise": false, "valency": 1 }],
-  "publicRoots": [{ "accessPoints": [], "advertise": false }],
+  "localRoots": [
+    { "accessPoints": [], "advertise": false, "trustable": false, "valency": 1 }
+  ],
+  "publicRoots": [
+    {
+      "accessPoints": [
+        { "address": "preview-node.play.dev.cardano.org", "port": 3001 }
+      ],
+      "advertise": false
+    }
+  ],
   "useLedgerAfterSlot": 102729600
 }
 </code></pre>
@@ -262,9 +309,18 @@ cardano-node 11.0.1+ for any preview peer or soak rig.</p>
   "bootstrapPeers": [
     { "address": "preprod-node.play.dev.cardano.org", "port": 3001 }
   ],
-  "localRoots": [{ "accessPoints": [], "advertise": false, "valency": 1 }],
-  "publicRoots": [{ "accessPoints": [], "advertise": false }],
-  "useLedgerAfterSlot": 76924800
+  "localRoots": [
+    { "accessPoints": [], "advertise": false, "trustable": false, "valency": 1 }
+  ],
+  "publicRoots": [
+    {
+      "accessPoints": [
+        { "address": "preprod-node.play.dev.cardano.org", "port": 3001 }
+      ],
+      "advertise": false
+    }
+  ],
+  "useLedgerAfterSlot": 76723200
 }
 </code></pre>
 <p>Run the node:</p>
@@ -296,13 +352,29 @@ dugite-cli query tip --socket-path ./node-preprod.sock --testnet-magic 1
 dugite-cli query tip --socket-path ./node-mainnet.sock
 </code></pre>
 <h2 id="multiple-nodes"><a class="header" href="#multiple-nodes">Multiple Nodes</a></h2>
-<p>You can run multiple Dugite instances on the same machine by using different ports, database paths, and socket paths:</p>
+<p>You can run multiple Dugite instances on the same machine, but every one of the
+four per-node resources has to be distinct: the N2N port, the N2C socket path,
+the database directory, and the Prometheus metrics port.</p>
 <pre><code class="language-bash"># Preview on port 3001
-dugite-node run --port 3001 --database-path ./db-preview --socket-path ./preview.sock ...
+dugite-node run --port 3001 --database-path ./db-preview \
+  --socket-path ./preview.sock --metrics-port 12796 ...
 
 # Preprod on port 3002
-dugite-node run --port 3002 --database-path ./db-preprod --socket-path ./preprod.sock ...
+dugite-node run --port 3002 --database-path ./db-preprod \
+  --socket-path ./preprod.sock --metrics-port 12799 ...
 </code></pre>
+<p>The metrics port is the one that is easy to miss, because it does not appear on
+the command line unless you put it there. Dugite's default is <strong>12796</strong>
+(deliberately offset from cardano-node's 12798 so the two can coexist), so two
+Dugite nodes started without <code>--metrics-port</code> or a <code>MetricsPort</code> config field
+will collide on it. The shipped configs pre-assign distinct ports: mainnet 12800,
+preview 12796, preprod 12799.</p>
+<p>By default a metrics bind failure is logged and the node keeps running. Pass
+<code>--require-metrics</code> to make it a fatal startup error instead, which is what you
+want under a supervisor.</p>
+<p>Each database directory is protected by an exclusive <code>flock</code> on <code>&lt;db&gt;/lock</code>, so
+pointing two nodes at the same <code>--database-path</code> fails fast and names the pid
+already holding it rather than corrupting the database.</p>
 
                     </main>
 

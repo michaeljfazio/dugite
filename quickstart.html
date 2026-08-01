@@ -181,27 +181,38 @@
                     <main>
                         <h1 id="quick-start"><a class="header" href="#quick-start">Quick Start</a></h1>
 <p>This guide walks you through getting Dugite running on the Cardano preview testnet.</p>
+<blockquote>
+<p><strong>Dugite is in early development and is not recommended for production use.</strong> Run it on testnets only — see <a href="./introduction.html#project-status">Project Status</a>.</p>
+</blockquote>
 <h2 id="1-install"><a class="header" href="#1-install">1. Install</a></h2>
 <p><strong>Option A: Pre-built binary</strong> (fastest)</p>
+<p>The release tarball contains <code>dugite-node</code>, <code>dugite-cli</code>, and the <code>config/</code> tree.</p>
 <pre><code class="language-bash">curl -LO https://github.com/michaeljfazio/dugite/releases/latest/download/dugite-x86_64-linux.tar.gz
 tar xzf dugite-x86_64-linux.tar.gz
-sudo mv dugite-node dugite-cli dugite-monitor dugite-config /usr/local/bin/
+sudo mv dugite-node dugite-cli /usr/local/bin/
 </code></pre>
-<p><strong>Option B: Container image</strong> <em>(coming soon — <a href="https://github.com/michaeljfazio/dugite/issues/507">#507</a>)</em></p>
+<p><strong>Option B: Container image</strong></p>
+<pre><code class="language-bash">docker pull ghcr.io/michaeljfazio/dugite:latest
+</code></pre>
+<p>Multi-arch (<code>linux/amd64</code>, <code>linux/arm64</code>), ships all four binaries, and bundles <code>config/</code> at <code>/opt/dugite/config/</code>. See <a href="./installation.html#container-image">Installation</a>.</p>
 <p><strong>Option C: Build from source</strong></p>
+<p>Requires a stable Rust toolchain and <code>protoc</code> — see <a href="./installation.html#system-dependencies">Installation</a>.</p>
 <pre><code class="language-bash">git clone https://github.com/michaeljfazio/dugite.git
 cd dugite
 cargo build --release
 </code></pre>
 <h2 id="2-fast-sync-with-mithril-recommended"><a class="header" href="#2-fast-sync-with-mithril-recommended">2. Fast Sync with Mithril (Recommended)</a></h2>
-<p>Import a Mithril-certified snapshot to skip syncing millions of blocks from genesis:</p>
+<p>Import a Mithril-certified snapshot to skip syncing the chain from genesis:</p>
 <pre><code class="language-bash">dugite-node mithril-import \
   --network-magic 2 \
   --database-path ./db-preview
 </code></pre>
-<p>This downloads the latest snapshot from the Mithril aggregator, extracts it, and imports all blocks into the database. On preview testnet this takes approximately 9 minutes (downloading a ~2.7 GB snapshot containing ~4M blocks).</p>
+<p>This downloads the latest snapshot from the Mithril aggregator, verifies its certificate chain, extracts it, and bulk-imports the blocks into the ImmutableDB. The ancillary archive (the Haskell ledger state at the immutable tip) is downloaded by default, which cuts bootstrap from multi-hour to roughly 15 minutes; pass <code>--no-include-ancillary</code> to replay from blocks instead. See <a href="./running/mithril.html">Mithril Snapshot Import</a> for snapshot sizes, disk requirements, and the <a href="./running/mithril-ancillary.html">trust model</a>.</p>
+<p>Or via the justfile:</p>
+<pre><code class="language-bash">just mithril-import preview
+</code></pre>
 <h2 id="3-run-the-node"><a class="header" href="#3-run-the-node">3. Run the Node</a></h2>
-<p>Dugite ships with configuration files for all networks. If you built from source, they are in <code>config/&lt;network&gt;/</code> (<code>config.json</code>, <code>topology.json</code>, and four genesis files per network):</p>
+<p>Dugite ships with configuration files for <code>mainnet</code>, <code>preview</code>, and <code>preprod</code>, under <code>config/&lt;network&gt;/</code> — <code>config.json</code>, <code>topology.json</code>, and four genesis files (<code>byron-genesis.json</code>, <code>shelley-genesis.json</code>, <code>alonzo-genesis.json</code>, <code>conway-genesis.json</code>). The release tarball and container image both bundle this tree. Network magic is <code>764824073</code> for mainnet, <code>2</code> for preview, and <code>1</code> for preprod.</p>
 <pre><code class="language-bash">dugite-node run \
   --config config/preview/config.json \
   --topology config/preview/topology.json \
@@ -228,13 +239,15 @@ dugite-cli query tip \
   --socket-path ./node.sock \
   --testnet-magic 2
 </code></pre>
-<p>Example output:</p>
+<p>Example output (field order matches cardano-cli 10.x — alphabetical, no <code>network</code> field):</p>
 <pre><code class="language-json">{
-    "slot": 106453897,
-    "hash": "8498ccda...",
     "block": 4094745,
     "epoch": 1232,
     "era": "Conway",
+    "hash": "8498ccda...",
+    "slot": 106453897,
+    "slotInEpoch": 9097,
+    "slotsToEpochEnd": 77303,
     "syncProgress": "100.00"
 }
 </code></pre>
@@ -249,10 +262,11 @@ dugite-cli query tx-mempool info \
   --testnet-magic 2
 </code></pre>
 <h2 id="5-check-metrics"><a class="header" href="#5-check-metrics">5. Check Metrics</a></h2>
-<p>Prometheus metrics are served on port 12798:</p>
-<pre><code class="language-bash">curl -s http://localhost:12798/metrics | grep sync_progress
-# sync_progress_percent 10000
+<p>Prometheus metrics are served on port <strong>12796</strong> by default — deliberately offset from cardano-node's 12798 so both can run on the same host. Override with <code>--metrics-port</code>, or the <code>MetricsPort</code> field in <code>config.json</code> (the shipped configs set 12796 explicitly).</p>
+<pre><code class="language-bash">curl -s http://localhost:12796/metrics | grep dugite_sync_progress
+# dugite_sync_progress_percent 10000
 </code></pre>
+<p>The value is a percentage scaled by 100 — divide by 100 for percent.</p>
 <h2 id="next-steps"><a class="header" href="#next-steps">Next Steps</a></h2>
 <ul>
 <li><a href="./running/configuration.html">Configuration</a> — Detailed configuration options</li>

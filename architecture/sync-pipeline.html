@@ -180,35 +180,37 @@
                 <div id="content" class="content">
                     <main>
                         <h1 id="sync-pipeline"><a class="header" href="#sync-pipeline">Sync Pipeline</a></h1>
-<p>Dugite uses a pipelined multi-peer architecture for block synchronization, separating header collection from block fetching for maximum throughput.</p>
+<p>Dugite pipelines block synchronization, separating header collection (one ChainSync task per hot
+peer) from block body fetching (deliberately serialized onto a single "best" peer at a time) for
+maximum throughput without wasting bandwidth on duplicate downloads.</p>
 <h2 id="architecture"><a class="header" href="#architecture">Architecture</a></h2>
 <pre><code class="language-mermaid">flowchart LR
-    subgraph Primary Peer
-        CS[ChainSync&lt;br/&gt;Header Collection]
+    subgraph "Hot Peers (ChainSync, per-peer tasks)"
+        CS1[Peer 1&lt;br/&gt;ChainSync]
+        CS2[Peer 2&lt;br/&gt;ChainSync]
+        CS3[Peer N&lt;br/&gt;ChainSync]
     end
 
-    CS --&gt;|headers| HQ[Header Queue]
+    CS1 --&gt;|headers| CC[Candidate Chains&lt;br/&gt;per-peer state]
+    CS2 --&gt;|headers| CC
+    CS3 --&gt;|headers| CC
 
-    subgraph Block Fetch Pool
-        BF1[Peer 1&lt;br/&gt;BlockFetch]
-        BF2[Peer 2&lt;br/&gt;BlockFetch]
-        BF3[Peer N&lt;br/&gt;BlockFetch]
-    end
+    CC --&gt;|GSV bandwidth&lt;br/&gt;preference| SLOT{{Single Active&lt;br/&gt;Fetcher Slot}}
 
-    HQ --&gt;|range 1| BF1
-    HQ --&gt;|range 2| BF2
-    HQ --&gt;|range N| BF3
+    SLOT --&gt;|MsgRequestRange| BF[BlockFetch Worker&lt;br/&gt;current best peer]
 
-    BF1 --&gt;|blocks| BP[Block Processor]
-    BF2 --&gt;|blocks| BP
-    BF3 --&gt;|blocks| BP
+    BF --&gt;|FetchedBlock| CHAN[[mpsc channel&lt;br/&gt;cap 4096]]
+    CHAN --&gt; BP[Block Processor&lt;br/&gt;apply_fetched_block]
 
     BP --&gt; CDB[(ChainDB)]
     BP --&gt; LS[Ledger State]
 </code></pre>
 <h2 id="pipeline-stages"><a class="header" href="#pipeline-stages">Pipeline Stages</a></h2>
-<h3 id="1-header-collection-chainsync"><a class="header" href="#1-header-collection-chainsync">1. Header Collection (ChainSync)</a></h3>
-<p>A primary peer is selected for the ChainSync protocol. The node requests block headers sequentially using the N2N ChainSync mini-protocol (V14+). Headers are collected into batches.</p>
+<h3 id="1-header-collection-chainsync-per-hot-peer"><a class="header" href="#1-header-collection-chainsync-per-hot-peer">1. Header Collection (ChainSync, per hot peer)</a></h3>
+<p>Every hot peer runs its own ChainSync client task using the N2N ChainSync mini-protocol (V14+).
+Each task pipelines up to <code>DUGITE_PIPELINE_DEPTH</code> (default 300) <code>MsgRequestNext</code> messages
+in flight rather than waiting for each <code>MsgRollForward</code> serially, and writes its results into a
+per-peer <code>CandidateChainState</code> entry shared with the BlockFetch decision loop.</p>
 <p>The ChainSync protocol involves:</p>
 <ol>
 <li><strong>MsgFindIntersect</strong> — Find a common point between the node and the peer</li>
@@ -216,27 +218,44 @@
 <li><strong>MsgRollForward</strong> — Receive a new header</li>
 <li><strong>MsgRollBackward</strong> — Handle a chain reorganization</li>
 </ol>
-<h3 id="2-block-fetch-pool"><a class="header" href="#2-block-fetch-pool">2. Block Fetch Pool</a></h3>
-<p>Collected headers are distributed across multiple peers for parallel block retrieval. The block fetch pool supports up to 4 concurrent peers, each fetching a range of blocks.</p>
+<h3 id="2-block-fetch--single-active-fetcher-gsv-preferred"><a class="header" href="#2-block-fetch--single-active-fetcher-gsv-preferred">2. Block Fetch — single active fetcher, GSV-preferred</a></h3>
+<p>Header collection is per-peer and concurrent, but block <strong>body</strong> downloading deliberately is not:
+only one BlockFetch worker is allowed to hold the "active fetcher" slot at a time, matching
+Haskell's <code>bfcMaxConcurrencyBulkSync = 1</code>. This was a validated finding, not an oversight —
+concurrent multi-peer body fetching was measured to be slower in practice (duplicate/wasted
+downloads and lock contention outweigh the extra bandwidth), so dugite concentrates fetching on
+whichever peer is currently serving fastest.</p>
+<p>Peer workers contend for the slot via a lock-free <code>compare_exchange</code> on a shared atomic, polled
+every 10ms (matching Haskell's <code>bfcDecisionLoopIntervalPraos</code>). When the slot is free, only the
+top <code>K=2</code> peers ranked by measured fetch bandwidth (an EWMA of bytes/sec per completed range,
+tracked per peer as "GSV" / "fetchyness" in <code>PeerManager</code>) are allowed to claim it — a hot standby
+so a momentarily-busy best peer can't stall the slot, while fetching still concentrates on the
+fastest peers rather than round-robining fairly.</p>
 <p>The BlockFetch protocol involves:</p>
 <ol>
 <li><strong>MsgRequestRange</strong> — Request a range of blocks by header hash</li>
 <li><strong>MsgBlock</strong> — Receive a block</li>
 <li><strong>MsgBatchDone</strong> — Signal the end of a batch</li>
 </ol>
-<p>Blocks are fetched in batches of 500 headers, with sub-batches of 100 headers each. Each sub-batch is decoded on a <code>spawn_blocking</code> task to avoid blocking the async runtime.</p>
+<p>Each range's size is chosen adaptively against an 8 MiB byte budget (<code>BLOCKFETCH_RANGE_BYTE_BUDGET</code>)
+using a running average of recently-seen block sizes, clamped to <code>[64, MAX_BLOCKS_PER_FETCH]</code>
+blocks (<code>MAX_BLOCKS_PER_FETCH = 2000</code>, the network's per-batch DoS cap; operator-overridable up to
+that ceiling via <code>DUGITE_BLOCKFETCH_MAX_RANGE</code>). This auto-grows toward the cap for tiny Byron
+blocks and shrinks for large Conway blocks, so the worker's per-range decode buffer stays bounded
+in every era. Up to 2 <code>MsgRequestRange</code> requests are pipelined in flight at once
+(<code>BLOCKFETCH_PIPELINE_WINDOW</code>) so the next range's network round-trip overlaps the previous
+range's receipt/decode instead of being paid serially.</p>
 <h3 id="3-block-processing"><a class="header" href="#3-block-processing">3. Block Processing</a></h3>
-<p>Fetched blocks are applied to the ledger state in order:</p>
+<p>Each <code>FetchedBlock</code> arrives over an <code>mpsc</code> channel (capacity 4096, overridable via
+<code>DUGITE_FETCHED_BLOCKS_CAP</code>) and is applied to the ledger state as it is dequeued:</p>
 <ol>
-<li><strong>Deserialization</strong> — Raw CBOR bytes are decoded into Dugite's internal <code>Block</code> type using Dugite's in-house multi-era CBOR decoder</li>
+<li><strong>Deserialization</strong> — Raw CBOR bytes are decoded into Dugite's internal <code>Block</code> type using Dugite's in-house multi-era CBOR decoder. <code>Transaction.hash</code> is computed as <code>blake2b_256</code> over the <em>original</em> wire bytes captured during decode (<code>KeepRaw::parse_with</code>), never a re-encoding — a load-bearing invariant, since a re-encode that differs from the wire bytes by even one byte would silently diverge the hash from Haskell's.</li>
 <li><strong>Ledger validation</strong> — Each block is validated against the current ledger state (UTxO checks, fee validation, certificate processing)</li>
-<li><strong>Storage</strong> — Valid blocks are added to the ChainDB (volatile database first, flushed to immutable when k-deep)</li>
+<li><strong>Storage</strong> — Valid blocks are added to the ChainDB (volatile database first, flushed to immutable when k-deep) — the ChainDB write happens <strong>before</strong> the ledger apply, so a crash mid-apply never leaves the ledger ahead of durable storage</li>
 <li><strong>Epoch transitions</strong> — At epoch boundaries, stake snapshots are rotated and rewards are calculated</li>
 </ol>
-<h3 id="batched-lock-acquisition"><a class="header" href="#batched-lock-acquisition">Batched Lock Acquisition</a></h3>
-<p>To minimize lock contention, the sync loop acquires a single lock on both the ChainDB and ledger state for each batch of 500 blocks, rather than locking per-block.</p>
 <h3 id="progress-reporting"><a class="header" href="#progress-reporting">Progress Reporting</a></h3>
-<p>Progress is logged every 5 seconds, showing:</p>
+<p>Progress is logged periodically, showing:</p>
 <ul>
 <li>Current slot and block number</li>
 <li>Epoch number</li>
@@ -258,10 +277,10 @@
 <p>This bypasses a serial ChainSync state machine in favor of a custom implementation that manages the pipeline depth directly.</p>
 <h2 id="performance-characteristics"><a class="header" href="#performance-characteristics">Performance Characteristics</a></h2>
 <ul>
-<li><strong>Header collection</strong> is pipelined per peer (up to 300 in-flight requests, configurable via <code>DUGITE_PIPELINE_DEPTH</code>)</li>
-<li><strong>Block fetching</strong> is parallelized across up to 4 concurrent peers</li>
-<li><strong>Block processing</strong> is batched (500 blocks per batch) with single-lock acquisition</li>
-<li><strong>Throughput</strong> depends on network latency, peer count, and block sizes</li>
+<li><strong>Header collection</strong> is pipelined per peer (up to 300 in-flight requests, configurable via <code>DUGITE_PIPELINE_DEPTH</code>) and runs concurrently across every hot peer</li>
+<li><strong>Block body fetching</strong> is deliberately single-peer at any instant (GSV-preferred, top-<code>K=2</code> hot standby) — measured faster in practice than concurrent multi-peer body fetching, which wasted bandwidth on duplicate/contended downloads</li>
+<li><strong>Block processing</strong> applies blocks one at a time as they are dequeued from the fetch channel, in slot order</li>
+<li><strong>Throughput</strong> depends on network latency, the current fetch peer's bandwidth, and block sizes — the sustained ceiling is set by whichever is slower: peer download bandwidth or ledger-apply throughput</li>
 </ul>
 <p>On preview testnet, full sync from genesis completes in approximately 10 hours, with block replay (from Mithril snapshot) achieving ~13,700 blocks/second.</p>
 

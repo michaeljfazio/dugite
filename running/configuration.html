@@ -182,18 +182,15 @@
                         <h1 id="configuration"><a class="header" href="#configuration">Configuration</a></h1>
 <p>Dugite reads a JSON configuration file that controls network settings, genesis file paths, P2P parameters, and tracing options. The format is compatible with the cardano-node configuration format.</p>
 <h2 id="configuration-file-format"><a class="header" href="#configuration-file-format">Configuration File Format</a></h2>
-<p>The configuration file uses PascalCase keys (matching the cardano-node convention):</p>
+<p>The configuration file uses PascalCase keys (matching the cardano-node convention). This is <code>config/preview/config.json</code> as shipped in the repository:</p>
 <pre><code class="language-json">{
   "Network": "Testnet",
   "NetworkMagic": 2,
-  "EnableP2P": true,
   "DiffusionMode": "InitiatorAndResponder",
-  "PeerSharing": null,
-  "Protocol": {
-    "RequiresNetworkMagic": "RequiresMagic"
-  },
-  "ShelleyGenesisFile": "shelley-genesis.json",
   "ByronGenesisFile": "byron-genesis.json",
+  "ByronGenesisHash": "81cf23542e33d64c541699926c2b5e6e9c286583f0c8a3fb5f22ea7b352dd174",
+  "ShelleyGenesisFile": "shelley-genesis.json",
+  "ShelleyGenesisHash": "363498d1024f84bb39d3fa9593ce391483cb40d479b87233f868d6e57c3a400d",
   "AlonzoGenesisFile": "alonzo-genesis.json",
   "ConwayGenesisFile": "conway-genesis.json",
   "TargetNumberOfRootPeers": 60,
@@ -204,41 +201,64 @@
   "TargetNumberOfEstablishedBigLedgerPeers": 10,
   "TargetNumberOfKnownBigLedgerPeers": 15,
   "MinSeverity": "Info",
-  "TraceOptions": {
-    "TraceBlockFetchClient": false,
-    "TraceBlockFetchServer": false,
-    "TraceChainDb": false,
-    "TraceChainSyncClient": false,
-    "TraceChainSyncServer": false,
-    "TraceForge": false,
-    "TraceMempool": false
-  }
+  "LogDirective": "info",
+  "MetricsPort": 12796,
+  "ExperimentalHardForksEnabled": true
 }
 </code></pre>
+<blockquote>
+<p><strong>Unknown keys are ignored.</strong> The node's deserializer does not reject fields it
+does not recognise, so a typo in a key name silently leaves the default in
+force with no warning. Run <code>dugite-config validate &lt;file&gt;</code> to have unknown keys
+reported — see <a href="./config-editor.html">Configuration Editor</a>.</p>
+</blockquote>
 <h2 id="fields-reference"><a class="header" href="#fields-reference">Fields Reference</a></h2>
 <h3 id="network-settings"><a class="header" href="#network-settings">Network Settings</a></h3>
 <div class="table-wrapper"><table><thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead><tbody>
 <tr><td><code>Network</code></td><td>string</td><td><code>"Mainnet"</code></td><td>Network identifier: <code>"Mainnet"</code> or <code>"Testnet"</code></td></tr>
 <tr><td><code>NetworkMagic</code></td><td>integer</td><td>auto</td><td>Network magic number. If omitted, derived from <code>Network</code> (764824073 for mainnet)</td></tr>
-<tr><td><code>EnableP2P</code></td><td>boolean</td><td><code>true</code></td><td>Enable P2P networking mode. When <code>true</code> (the default), the peer governor manages peer connections with automatic churn, ledger-based discovery, and peer sharing. When <code>false</code>, the node uses only static topology connections</td></tr>
 <tr><td><code>DiffusionMode</code></td><td>string</td><td><code>"InitiatorAndResponder"</code></td><td>Controls inbound connection acceptance. <code>"InitiatorAndResponder"</code> (default): relay mode, accepts inbound N2N connections. <code>"InitiatorOnly"</code>: block producer mode, outbound only (no listening port opened)</td></tr>
 <tr><td><code>PeerSharing</code></td><td>boolean/null</td><td><code>null</code></td><td>Enable the peer sharing mini-protocol. When <code>null</code> (default), peer sharing is automatically disabled for block producers (when <code>--shelley-kes-key</code> is provided) and enabled for relays. Set explicitly to override</td></tr>
+<tr><td><code>ConsensusMode</code></td><td>string</td><td><code>"Praos"</code></td><td><code>"Praos"</code> (default) or <code>"Genesis"</code> (trustless bulk sync). <code>"PraosMode"</code> / <code>"GenesisMode"</code> are accepted legacy aliases. The <code>--consensus-mode</code> CLI flag, taking <code>praos</code> or <code>genesis</code>, overrides this field</td></tr>
+<tr><td><code>ExperimentalHardForksEnabled</code></td><td>boolean</td><td><code>false</code></td><td>Advertise readiness for the next major protocol version. <code>false</code> → the node signals <code>ProtVer 11 0</code> in forged headers and rejects headers whose on-chain protocol version exceeds 11; <code>true</code> → signals <code>ProtVer 12 0</code> (Dijkstra) and accepts up to 12. Must stay <code>false</code> on mainnet. The shipped <code>config/preview/config.json</code> sets it <code>true</code></td></tr>
 </tbody></table>
 </div>
+<blockquote>
+<p><strong><code>EnableP2P</code> is not a Dugite config key.</strong> Dugite is always P2P; there is no
+non-P2P path to switch off. If your config file carries <code>EnableP2P</code> (from a
+cardano-node 8.x config) the node ignores it silently.</p>
+</blockquote>
 <h3 id="protocol"><a class="header" href="#protocol">Protocol</a></h3>
 <div class="table-wrapper"><table><thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead><tbody>
-<tr><td><code>Protocol.RequiresNetworkMagic</code></td><td>string</td><td><code>"RequiresMagic"</code></td><td>Whether network magic is required in handshake</td></tr>
+<tr><td><code>Protocol</code></td><td>string/object</td><td>absent</td><td>Accepts either a bare string (e.g. <code>"Cardano"</code>, which is ignored) or an object carrying <code>RequiresNetworkMagic</code></td></tr>
+<tr><td><code>Protocol.RequiresNetworkMagic</code></td><td>string</td><td><code>"RequiresMagic"</code></td><td>Whether network magic is required in the handshake</td></tr>
+<tr><td><code>RequiresNetworkMagic</code></td><td>string</td><td>none</td><td>The same setting at the top level, for guild-style and newer cardano-node configs</td></tr>
 </tbody></table>
 </div>
+<blockquote>
+<p><strong>These three are inert.</strong> They are parsed so a cardano-node config file drops
+in without error, but nothing in the workspace reads them — Dugite always
+sends the network magic in the N2N handshake. <code>NetworkMagic</code> is the field that
+actually decides which network you join.</p>
+</blockquote>
 <h3 id="genesis-files"><a class="header" href="#genesis-files">Genesis Files</a></h3>
 <p>Genesis file paths are resolved relative to the directory containing the configuration file. For example, if your config is at <code>/opt/cardano/config.json</code> and specifies <code>"ShelleyGenesisFile": "shelley-genesis.json"</code>, Dugite will look for <code>/opt/cardano/shelley-genesis.json</code>.</p>
 <div class="table-wrapper"><table><thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead><tbody>
-<tr><td><code>ShelleyGenesisFile</code></td><td>string</td><td>none</td><td>Path to Shelley genesis JSON</td></tr>
 <tr><td><code>ByronGenesisFile</code></td><td>string</td><td>none</td><td>Path to Byron genesis JSON</td></tr>
+<tr><td><code>ShelleyGenesisFile</code></td><td>string</td><td>none</td><td>Path to Shelley genesis JSON</td></tr>
 <tr><td><code>AlonzoGenesisFile</code></td><td>string</td><td>none</td><td>Path to Alonzo genesis JSON</td></tr>
 <tr><td><code>ConwayGenesisFile</code></td><td>string</td><td>none</td><td>Path to Conway genesis JSON</td></tr>
+<tr><td><code>DijkstraGenesisFile</code></td><td>string</td><td>none</td><td>Path to Dijkstra genesis JSON (post-Conway HFC). Parsed at startup but not yet applied to runtime ledger rules. Overridden by the <code>--dijkstra-genesis</code> CLI flag</td></tr>
+<tr><td><code>ByronGenesisHash</code></td><td>string</td><td>none</td><td>Expected Blake2b-256 of the Byron genesis file, as 64 hex characters</td></tr>
+<tr><td><code>ShelleyGenesisHash</code></td><td>string</td><td>none</td><td>Expected Blake2b-256 of the Shelley genesis file</td></tr>
+<tr><td><code>AlonzoGenesisHash</code></td><td>string</td><td>none</td><td>Expected Blake2b-256 of the Alonzo genesis file</td></tr>
+<tr><td><code>ConwayGenesisHash</code></td><td>string</td><td>none</td><td>Expected Blake2b-256 of the Conway genesis file</td></tr>
+<tr><td><code>DijkstraGenesisHash</code></td><td>string</td><td>none</td><td>Expected Blake2b-256 of the Dijkstra genesis file</td></tr>
 </tbody></table>
 </div>
+<p>At startup the node checks that every configured genesis file exists (resolved
+against the config file's directory) and that every configured hash is exactly
+64 hex characters. Either check failing is a fatal startup error naming the era.</p>
 <blockquote>
 <p><strong>Tip:</strong> Genesis files for each network can be downloaded from the <a href="https://book.world.dev.cardano.org/">Cardano Operations Book</a>.</p>
 </blockquote>
@@ -254,10 +274,116 @@
 <tr><td><code>TargetNumberOfKnownBigLedgerPeers</code></td><td>integer</td><td>15</td><td>Target number of known big ledger peers</td></tr>
 </tbody></table>
 </div>
+<p>Two of these are advisory in Dugite rather than direct policy levers:
+<code>TargetNumberOfRootPeers</code> is validated and exported as a Prometheus gauge, but
+root-peer connectivity is actually driven per-group by the topology's
+<code>hotValency</code> / <code>warmValency</code>; and <code>TargetNumberOfKnownBigLedgerPeers</code> is not
+enforced as a separate cap, because the known set as a whole is bounded by
+<code>TargetNumberOfKnownPeers</code> and selectively forgetting scarce big ledger peers
+would hurt Genesis sync.</p>
+<h4 id="genesis-mode-sync-targets"><a class="header" href="#genesis-mode-sync-targets">Genesis-mode sync targets</a></h4>
+<p>A second target set applies while the node is in Genesis-mode bulk sync. It is
+parsed and validated unconditionally, but only takes effect when
+<code>ConsensusMode</code> is <code>"Genesis"</code>.</p>
+<div class="table-wrapper"><table><thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>SyncTargetNumberOfActivePeers</code></td><td>integer</td><td>5</td><td>Active peers during Genesis bulk sync</td></tr>
+<tr><td><code>SyncTargetNumberOfEstablishedPeers</code></td><td>integer</td><td>10</td><td>Established peers during Genesis bulk sync</td></tr>
+<tr><td><code>SyncTargetNumberOfKnownPeers</code></td><td>integer</td><td>150</td><td>Known peers during Genesis bulk sync</td></tr>
+<tr><td><code>SyncTargetNumberOfRootPeers</code></td><td>integer</td><td>0</td><td>Root peers during Genesis bulk sync</td></tr>
+<tr><td><code>SyncTargetNumberOfActiveBigLedgerPeers</code></td><td>integer</td><td>30</td><td>Active big ledger peers during Genesis bulk sync</td></tr>
+<tr><td><code>SyncTargetNumberOfEstablishedBigLedgerPeers</code></td><td>integer</td><td>40</td><td>Established big ledger peers during Genesis bulk sync</td></tr>
+<tr><td><code>SyncTargetNumberOfKnownBigLedgerPeers</code></td><td>integer</td><td>100</td><td>Known big ledger peers during Genesis bulk sync</td></tr>
+<tr><td><code>MinBigLedgerPeersForTrustedState</code></td><td>integer</td><td>5</td><td>Pause sync if active big ledger peers drop below this</td></tr>
+</tbody></table>
+</div>
+<h4 id="startup-validation"><a class="header" href="#startup-validation">Startup validation</a></h4>
+<p>Both target sets are checked at startup against the same predicates as Haskell's
+<code>sanePeerSelectionTargets</code>, and a violation is a fatal startup error naming the
+set (<code>[deadline]</code> or <code>[sync]</code>):</p>
+<ul>
+<li><code>active &lt;= established &lt;= known</code>, and <code>root &lt;= known</code></li>
+<li><code>activeBigLedger &lt;= establishedBigLedger &lt;= knownBigLedger</code></li>
+<li><code>active &lt;= 100</code>, <code>established &lt;= 1000</code>, <code>known &lt;= 10000</code> (and the same three
+ceilings for the big-ledger-peer counts)</li>
+</ul>
+<h4 id="churn"><a class="header" href="#churn">Churn</a></h4>
+<div class="table-wrapper"><table><thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>ChurnIntervalNormalSecs</code></td><td>integer</td><td>3300</td><td>Governor churn interval while caught up (55 min, matching cardano-node)</td></tr>
+<tr><td><code>ChurnIntervalSyncSecs</code></td><td>integer</td><td>900</td><td>Governor churn interval while syncing (15 min)</td></tr>
+</tbody></table>
+</div>
+<h3 id="ouroboros-genesis-tuning"><a class="header" href="#ouroboros-genesis-tuning">Ouroboros Genesis Tuning</a></h3>
+<p><code>LowLevelGenesisOptions</code> mirrors cardano-node's object of the same name and is
+only consulted when <code>ConsensusMode</code> is <code>"Genesis"</code>. Omit the whole object to get
+the upstream defaults.</p>
+<pre><code class="language-json">"LowLevelGenesisOptions": {
+  "EnableCSJ": true,
+  "EnableLoEAndGDD": true,
+  "EnableLoP": true,
+  "BlockFetchGracePeriod": 10,
+  "BucketCapacity": 100000,
+  "BucketRate": 500,
+  "CSJJumpSize": 4320,
+  "GDDRateLimit": 1.0
+}
+</code></pre>
+<div class="table-wrapper"><table><thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>EnableCSJ</code></td><td>boolean</td><td><code>true</code></td><td>Enable ChainSync Jumping</td></tr>
+<tr><td><code>EnableLoEAndGDD</code></td><td>boolean</td><td><code>true</code></td><td>Enable Limit on Eagerness + Genesis Density Disconnection</td></tr>
+<tr><td><code>EnableLoP</code></td><td>boolean</td><td><code>true</code></td><td>Enable the Limit on Patience leaky bucket</td></tr>
+<tr><td><code>BlockFetchGracePeriod</code></td><td>float</td><td>10</td><td>Seconds before rotating a starving bulk-sync peer</td></tr>
+<tr><td><code>BucketCapacity</code></td><td>integer</td><td>100000</td><td>LoP bucket capacity, in tokens</td></tr>
+<tr><td><code>BucketRate</code></td><td>integer</td><td>500</td><td>LoP bucket leak rate, in tokens/second</td></tr>
+<tr><td><code>CSJJumpSize</code></td><td>integer</td><td>4320</td><td>CSJ jump size in slots (2 × 2160, the Byron forecast range)</td></tr>
+<tr><td><code>GDDRateLimit</code></td><td>float</td><td>1.0</td><td>Minimum seconds between GDD evaluations</td></tr>
+<tr><td><code>SnapshotMinIntervalBulkSync</code></td><td>float</td><td>1800</td><td>Dugite-specific (not a cardano-node key). Minimum wall-clock seconds between epoch-boundary ledger snapshots during bulk sync. Raising it cuts snapshot I/O; lowering it shrinks the rollback blast radius on an unexpected stop</td></tr>
+</tbody></table>
+</div>
+<h3 id="checkpoints"><a class="header" href="#checkpoints">Checkpoints</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>CheckpointsFile</code></td><td>string</td><td>none</td><td>Path to a lightweight-checkpoints JSON file (<code>{"checkpoints":[{"blockNo":N,"hash":"&lt;hex&gt;"},...]}</code>), resolved relative to the config file's directory. Checkpoints are enforced for every header in <strong>both</strong> consensus modes</td></tr>
+<tr><td><code>CheckpointsFileHash</code></td><td>string</td><td>none</td><td>Blake2b-256 hex of the checkpoints file bytes. A mismatch is a fatal startup error</td></tr>
+</tbody></table>
+</div>
+<h3 id="connection-management"><a class="header" href="#connection-management">Connection Management</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>AcceptedConnectionsLimit.hardLimit</code></td><td>integer</td><td>512</td><td>Refuse new inbound connections beyond this count</td></tr>
+<tr><td><code>AcceptedConnectionsLimit.softLimit</code></td><td>integer</td><td>384</td><td>Start delaying new inbound connections at this count</td></tr>
+<tr><td><code>AcceptedConnectionsLimit.delay</code></td><td>float</td><td>5.0</td><td>Maximum delay in seconds applied above the soft limit</td></tr>
+<tr><td><code>PerIpRateLimitN2n</code></td><td>integer</td><td>5</td><td>Maximum concurrent N2N inbound connections per source IP. <code>0</code> disables per-IP limiting (not recommended)</td></tr>
+<tr><td><code>MaxN2cConnections</code></td><td>integer</td><td>16</td><td>Maximum concurrent N2C (Unix socket) connections</td></tr>
+<tr><td><code>BlockFetchMaxRange</code></td><td>integer</td><td>max</td><td>Maximum blocks pulled by a single BlockFetch <code>MsgRequestRange</code>. Clamped to <code>[64, 2000]</code> at use; omitted means the 2000-block network cap. The <code>DUGITE_BLOCKFETCH_MAX_RANGE</code> env var overrides this field</td></tr>
+</tbody></table>
+</div>
+<p><code>AcceptedConnectionsLimit</code> also accepts the older long key names
+(<code>acceptedConnectionsHardLimit</code>, <code>acceptedConnectionsSoftLimit</code>,
+<code>acceptedConnectionsDelay</code>) as aliases.</p>
+<p>The following four keys are <strong>parsed for cardano-node config-file compatibility
+but not currently enforced</strong>. Setting them changes nothing; they are reserved so
+that a cardano-node config drops in without a parse error.</p>
+<div class="table-wrapper"><table><thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Why it is inert</th></tr></thead><tbody>
+<tr><td><code>ProtocolIdleTimeout</code></td><td>float</td><td>5.0</td><td>Dugite prunes idle connections via the connection manager's own 300 s <code>INBOUND_IDLE_TIMEOUT</code></td></tr>
+<tr><td><code>TimeWaitTimeout</code></td><td>float</td><td>60.0</td><td>Dugite relies on the OS TCP <code>TIME_WAIT</code></td></tr>
+<tr><td><code>EgressPollInterval</code></td><td>float</td><td>0.0</td><td>The governor runs on a fixed, tuned 2 s tick</td></tr>
+<tr><td><code>ChainSyncIdleTimeout</code></td><td>float</td><td>none</td><td>Dugite randomises the timeout between Haskell's <code>minChainSyncTimeout</code> / <code>maxChainSyncTimeout</code> bounds; a fixed override would defeat that</td></tr>
+</tbody></table>
+</div>
+<h3 id="metrics-rpc-and-storage"><a class="header" href="#metrics-rpc-and-storage">Metrics, RPC, and Storage</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>MetricsPort</code></td><td>integer</td><td>12796</td><td>Prometheus metrics port. <code>0</code> disables the server. Dugite's default is deliberately offset from cardano-node's 12798 so both can run on one host</td></tr>
+<tr><td><code>TurnOnLogMetrics</code></td><td>boolean</td><td><code>true</code></td><td>Master switch for the metrics endpoint, matching cardano-node. <code>false</code> disables the server regardless of <code>MetricsPort</code></td></tr>
+<tr><td><code>Rpc</code></td><td>object</td><td>none</td><td>UTxO RPC (gRPC) server block: <code>Enabled</code>, <code>ListenAddr</code>, <code>Port</code>, <code>MaxConcurrentStreams</code>, <code>StreamBufferSize</code>, <code>ReflectionEnabled</code>, <code>WebEnabled</code>, <code>AlphaEnabled</code>, <code>Tls: {CertPath, KeyPath}</code>. See <a href="./utxo-rpc.html">UTxO RPC</a></td></tr>
+<tr><td><code>Storage</code></td><td>object</td><td>none</td><td>Storage overrides layered on top of <code>--storage-profile</code> (index type, UTxO backend, LSM memtable/cache/bloom sizing)</td></tr>
+</tbody></table>
+</div>
+<p>Effective metrics port, highest precedence first: <code>--no-metrics</code> → <code>0</code>;
+<code>--metrics-port &lt;PORT&gt;</code>; <code>TurnOnLogMetrics: false</code> → <code>0</code>; <code>MetricsPort</code>;
+otherwise <code>12796</code>. Note that an explicit <code>--metrics-port</code> wins even over
+<code>TurnOnLogMetrics: false</code>.</p>
 <h3 id="tracing"><a class="header" href="#tracing">Tracing</a></h3>
 <div class="table-wrapper"><table><thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead><tbody>
-<tr><td><code>MinSeverity</code></td><td>string</td><td><code>"Info"</code></td><td>Minimum log severity level</td></tr>
-<tr><td><code>LogDirective</code></td><td>string</td><td>none</td><td><code>RUST_LOG</code>-style filter directive applied on SIGHUP. Set at runtime to change per-subsystem verbosity without restarting</td></tr>
+<tr><td><code>MinSeverity</code></td><td>string</td><td><code>"Info"</code></td><td>Minimum log severity, in cardano-node's syslog vocabulary: <code>Debug</code>, <code>Info</code>, <code>Notice</code>, <code>Warning</code>, <code>Error</code>, <code>Critical</code>, <code>Alert</code>, <code>Emergency</code>. Mapped onto <code>tracing</code> levels — <code>Notice</code> → <code>info</code>, and <code>Critical</code>/<code>Alert</code>/<code>Emergency</code> → <code>error</code>. Anything unrecognised falls back to <code>info</code></td></tr>
+<tr><td><code>LogDirective</code></td><td>string</td><td>none</td><td><code>RUST_LOG</code>-style filter directive (e.g. <code>"info,dugite_network=trace"</code>). Applied at startup <strong>and</strong> on SIGHUP, and takes precedence over <code>MinSeverity</code></td></tr>
 <tr><td><code>TraceOptions.TraceBlockFetchClient</code></td><td>boolean</td><td><code>false</code></td><td>Trace block fetch client activity</td></tr>
 <tr><td><code>TraceOptions.TraceBlockFetchServer</code></td><td>boolean</td><td><code>false</code></td><td>Trace block fetch server activity</td></tr>
 <tr><td><code>TraceOptions.TraceChainDb</code></td><td>boolean</td><td><code>false</code></td><td>Trace ChainDB operations</td></tr>
@@ -268,7 +394,13 @@
 </tbody></table>
 </div>
 <h2 id="log-level-control"><a class="header" href="#log-level-control">Log Level Control</a></h2>
-<p>The log level can be set via CLI flag or environment variable:</p>
+<p>Verbosity is resolved with this precedence, highest first:</p>
+<ol>
+<li><code>RUST_LOG</code> environment variable</li>
+<li><code>--log-level</code> CLI flag</li>
+<li><code>LogDirective</code> config field</li>
+<li><code>MinSeverity</code> config field</li>
+</ol>
 <pre><code class="language-bash"># Via CLI flag
 dugite-node run --log-level debug ...
 
@@ -278,7 +410,47 @@ RUST_LOG=info dugite-node run ...
 # Debug only for specific crates
 RUST_LOG=dugite_network=debug,dugite_consensus=debug dugite-node run ...
 </code></pre>
+<p>Because the config file is read after the tracing subscriber is constructed, the
+config-file values are applied via a live filter reload immediately after
+startup — but only when neither <code>RUST_LOG</code> nor <code>--log-level</code> is set, so an
+explicit operator override is never clobbered by the file.</p>
+<p>That guard applies at startup only. A later SIGHUP applies <code>LogDirective</code> /
+<code>MinSeverity</code> unconditionally, so a reload <em>will</em> override a level you set on
+the command line or in the environment.</p>
 <p>Dugite supports multiple log output targets (stdout, file, journald) and file rotation. See <a href="./logging.html">Logging</a> for full details on output configuration.</p>
+<h2 id="live-reload-sighup"><a class="header" href="#live-reload-sighup">Live Reload (SIGHUP)</a></h2>
+<p>Sending <code>SIGHUP</code> re-reads both the config file and the topology file. Changed
+fields are partitioned into those that can be applied live and those that need a
+restart; restart-required changes are logged as warnings and the reloadable ones
+are still applied.</p>
+<p><strong>Hot-reloadable:</strong> all seven <code>TargetNumberOf*</code> deadline targets,
+<code>ChurnIntervalNormalSecs</code>, <code>ChurnIntervalSyncSecs</code>, <code>LogDirective</code>,
+<code>MinSeverity</code>.</p>
+<p><strong>Restart required:</strong> <code>Network</code>, <code>NetworkMagic</code>, every genesis file path and
+hash, <code>MetricsPort</code>, <code>TurnOnLogMetrics</code>, <code>DiffusionMode</code>,
+<code>ExperimentalHardForksEnabled</code>, <code>ConsensusMode</code> — plus everything set on the
+command line (database and socket paths, listen address and port, KES/VRF/OpCert
+paths).</p>
+<pre><code class="language-bash">kill -HUP $(pgrep -x dugite-node)
+</code></pre>
+<h2 id="stopping-the-node"><a class="header" href="#stopping-the-node">Stopping the Node</a></h2>
+<p>Always stop the node with <strong>SIGTERM</strong> (or SIGINT / <code>Ctrl-C</code>), never <code>SIGKILL</code>.</p>
+<pre><code class="language-bash">kill -TERM $(pgrep -x dugite-node)     # correct
+kill -9    $(pgrep -x dugite-node)     # do not do this
+</code></pre>
+<p>On SIGTERM the node demotes its peers, flushes storage, and writes a final
+ledger snapshot. A hard kill skips all of that and risks damaging the active
+ImmutableDB chunk's secondary index. Since v2.4.0 the node reconciles that
+damage at open — verifying the tail chunk by CRC, truncating to the verified
+prefix, and quarantining an index-less tail chunk as <code>.chunk.orphaned</code> — but
+recovery still costs the un-flushed blocks, and damage below the tail chunk is a
+hard <code>InconsistentChunk</code> error rather than something the node repairs.</p>
+<p>A second SIGINT/SIGTERM during shutdown forces an immediate exit, matching
+cardano-node's behaviour, so you never need <code>kill -9</code> to get out of a wedged
+shutdown.</p>
+<p><code>ChainDB::open</code> takes an exclusive advisory <code>flock</code> on <code>&lt;database-path&gt;/lock</code>,
+so a second process pointed at the same directory fails fast and names the pid
+already holding it, instead of two nodes silently interleaving writes.</p>
 <h2 id="minimal-configuration"><a class="header" href="#minimal-configuration">Minimal Configuration</a></h2>
 <p>The smallest viable configuration file specifies only the network:</p>
 <pre><code class="language-json">{
@@ -286,43 +458,19 @@ RUST_LOG=dugite_network=debug,dugite_consensus=debug dugite-node run ...
   "NetworkMagic": 2
 }
 </code></pre>
-<p>All other fields use sensible defaults. When no genesis files are specified, the node operates with built-in default parameters.</p>
+<p>All other fields use the defaults tabulated above. Note that with no genesis
+files specified the node falls back to built-in default protocol parameters,
+which will not match a real network — for anything beyond a smoke test, point at
+the genesis files for the network you are joining.</p>
 <h2 id="format-support"><a class="header" href="#format-support">Format Support</a></h2>
-<p>Dugite supports both JSON (<code>.json</code>) and TOML (<code>.toml</code>) configuration files. The format is determined by the file extension. JSON files use the cardano-node compatible PascalCase format shown above.</p>
-<h2 id="interactive-configuration-editor-dugite-config"><a class="header" href="#interactive-configuration-editor-dugite-config">Interactive Configuration Editor (dugite-config)</a></h2>
-<p><code>dugite-config</code> is a standalone TUI tool for creating and editing Dugite configuration files interactively, without needing to remember field names or valid value ranges.</p>
-<h3 id="installation"><a class="header" href="#installation">Installation</a></h3>
-<p>Built as part of the standard workspace:</p>
-<pre><code class="language-bash">cargo build --release -p dugite-config
-</code></pre>
-<h3 id="commands"><a class="header" href="#commands">Commands</a></h3>
-<pre><code class="language-bash"># Interactively create a new configuration file
-dugite-config init --out-file config.json
-
-# Launch the interactive editor for an existing config file
-dugite-config edit config.json
-
-# Validate a configuration file and report errors
-dugite-config validate config.json
-
-# Get the value of a specific field
-dugite-config get config.json TargetNumberOfActivePeers
-
-# Set the value of a specific field
-dugite-config set config.json TargetNumberOfActivePeers 30
-</code></pre>
-<h3 id="interactive-editor-features"><a class="header" href="#interactive-editor-features">Interactive Editor Features</a></h3>
-<p>The editor provides a tree view of all configuration fields with inline editing:</p>
-<ul>
-<li><strong>Tree navigation</strong> — expand/collapse sections, navigate fields with arrow keys</li>
-<li><strong>Inline editing</strong> — press <code>Enter</code> on any field to edit its value in place</li>
-<li><strong>Type validation</strong> — invalid values are rejected with an inline error message and a description of the expected type and range</li>
-<li><strong>Tuning hints</strong> — contextual hints appear alongside each field explaining the impact of changes (for example, peer count targets and their effect on network connectivity)</li>
-<li><strong>Search/filter</strong> — press <code>/</code> to search fields by name</li>
-<li><strong>Diff view</strong> — press <code>d</code> to see a side-by-side diff of your changes before saving</li>
-<li><strong>Save/discard</strong> — <code>Ctrl+S</code> to save, <code>Ctrl+Q</code> or <code>Esc</code> to discard</li>
-</ul>
-<p>The editor validates the full configuration on save and will not write an invalid file.</p>
+<p>The parser picks its format from the file extension: <code>.json</code> is parsed as
+cardano-node-compatible JSON, and <strong>anything else</strong> is parsed as TOML. If the
+path does not exist at all, the node starts on built-in defaults rather than
+failing — so a typo in <code>--config</code> produces a mainnet-default node, not an error.</p>
+<h2 id="editing-configuration-interactively"><a class="header" href="#editing-configuration-interactively">Editing Configuration Interactively</a></h2>
+<p><code>dugite-config</code> is a standalone TUI for browsing and editing these files with
+per-field type validation, tuning hints, a diff view, and a save-and-SIGHUP live
+reload. See <a href="./config-editor.html">Configuration Editor (dugite-config)</a>.</p>
 
                     </main>
 

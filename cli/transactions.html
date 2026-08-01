@@ -189,17 +189,58 @@
   --fee &lt;lovelace&gt; \
   --out-file tx.body
 </code></pre>
+<p><code>transaction build-raw</code> accepts the identical flag set and produces
+identical output — it exists only so scripts that call <code>cardano-cli transaction build-raw</code> work unchanged.</p>
 <h3 id="arguments"><a class="header" href="#arguments">Arguments</a></h3>
 <div class="table-wrapper"><table><thead><tr><th>Argument</th><th>Description</th></tr></thead><tbody>
 <tr><td><code>--tx-in</code></td><td>Transaction input in <code>tx_hash#index</code> format. Can be specified multiple times</td></tr>
 <tr><td><code>--tx-out</code></td><td>Transaction output in <code>address+lovelace</code> format. Can be specified multiple times</td></tr>
-<tr><td><code>--change-address</code></td><td>Address to receive change</td></tr>
-<tr><td><code>--fee</code></td><td>Fee in lovelace (default: 200000)</td></tr>
+<tr><td><code>--change-address</code></td><td>Address to receive change (required for auto-balance mode)</td></tr>
+<tr><td><code>--fee</code></td><td>Fee in lovelace. If omitted and <code>--socket-path</code> is set, the fee is computed automatically (auto-balance mode, see below); if omitted without <code>--socket-path</code>, defaults to 200000</td></tr>
 <tr><td><code>--ttl</code></td><td>Time-to-live slot number (optional)</td></tr>
 <tr><td><code>--certificate-file</code></td><td>Path to a certificate file to include (can be repeated)</td></tr>
 <tr><td><code>--withdrawal</code></td><td>Withdrawal in <code>stake_address+lovelace</code> format (can be repeated)</td></tr>
 <tr><td><code>--metadata-json-file</code></td><td>Path to a JSON metadata file (optional)</td></tr>
 <tr><td><code>--out-file</code></td><td>Output file for the transaction body</td></tr>
+</tbody></table>
+</div>
+<h4 id="plutus-and-conway-flags"><a class="header" href="#plutus-and-conway-flags">Plutus and Conway flags</a></h4>
+<div class="table-wrapper"><table><thead><tr><th>Argument</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>--tx-in-script-file</code></td><td>Plutus script (text envelope, <code>PlutusScriptV1/V2/V3</code>) to attach to the most recently specified <code>--tx-in</code>. The Nth occurrence pairs with the Nth <code>--tx-in</code> by declaration order</td></tr>
+<tr><td><code>--tx-in-datum-file</code></td><td>Datum JSON file (cardano-cli PlutusData schema) for the script-bearing input at the same position</td></tr>
+<tr><td><code>--tx-in-redeemer-file</code></td><td>Redeemer JSON file (same schema) for the script-bearing input at the same position</td></tr>
+<tr><td><code>--tx-in-execution-units</code></td><td>Execution units budget for the script-bearing input, format <code>mem,steps</code></td></tr>
+<tr><td><code>--tx-in-collateral</code></td><td>Collateral input for Plutus scripts, format <code>tx_hash#index</code> (can be repeated)</td></tr>
+<tr><td><code>--required-signer-hash</code></td><td>Required signer key hash, hex (can be repeated)</td></tr>
+<tr><td><code>--mint</code></td><td>Mint/burn tokens, format <code>policy_id.asset_name+quantity</code> or <code>...-quantity</code> to burn (can be repeated)</td></tr>
+<tr><td><code>--read-only-tx-in-reference</code></td><td>Reference input visible to Plutus scripts but not consumed (CIP-31), format <code>tx_hash#index</code> (can be repeated)</td></tr>
+<tr><td><code>--tx-out-inline-datum-value</code></td><td>Inline datum for a transaction output (CIP-32), format <code>INDEX:JSON</code> or bare <code>JSON</code> (defaults to output 0)</td></tr>
+<tr><td><code>--tx-out-inline-datum-file</code></td><td>Inline datum file for a transaction output (CIP-32), format <code>INDEX:FILE</code> or bare <code>FILE</code></td></tr>
+<tr><td><code>--tx-out-reference-script-file</code></td><td>Reference script for a transaction output (CIP-33), format <code>INDEX:FILE</code> or bare <code>FILE</code></td></tr>
+<tr><td><code>--vote-file</code></td><td>Vote file to include (Conway governance, can be repeated)</td></tr>
+<tr><td><code>--proposal-file</code></td><td>Governance proposal file to include (Conway governance, can be repeated)</td></tr>
+<tr><td><code>--calculate-plutus-script-cost</code></td><td>Evaluate Plutus script execution costs and write the result to a JSON file. Requires <code>--socket-path</code> to evaluate against live ledger state</td></tr>
+</tbody></table>
+</div>
+<h4 id="auto-balance-mode"><a class="header" href="#auto-balance-mode">Auto-balance mode</a></h4>
+<p>When <code>--socket-path</code> is provided and <code>--fee</code> is <strong>not</strong> explicitly set,
+<code>transaction build</code> connects to the node, queries UTxO values for the given
+inputs and the current protocol parameters, computes the fee automatically,
+derives a change output at <code>--change-address</code>, and writes a balanced
+transaction — matching <code>cardano-cli transaction build</code>'s behavior (as
+opposed to <code>build-raw</code>'s fully manual fee/change accounting):</p>
+<pre><code class="language-bash">dugite-cli transaction build \
+  --tx-in "abc123...#0" \
+  --tx-out "addr_test1qz...+5000000" \
+  --change-address "addr_test1qp..." \
+  --socket-path ./node.sock \
+  --testnet-magic 2 \
+  --out-file tx.body
+</code></pre>
+<div class="table-wrapper"><table><thead><tr><th>Argument</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>--socket-path</code></td><td>Path to the node's Unix domain socket. Enables auto-balance mode when <code>--fee</code> is omitted</td></tr>
+<tr><td><code>--mainnet</code></td><td>Use mainnet (network magic 764824073)</td></tr>
+<tr><td><code>--testnet-magic</code></td><td>Testnet network magic (e.g. 2 for preview, 1 for preprod)</td></tr>
 </tbody></table>
 </div>
 <h3 id="example-simple-ada-transfer"><a class="header" href="#example-simple-ada-transfer">Example: Simple ADA Transfer</a></h3>
@@ -334,6 +375,19 @@
 <p>Compute the policy ID (Blake2b-224 hash) of a native script:</p>
 <pre><code class="language-bash">dugite-cli transaction policyid --script-file policy.script
 </code></pre>
+<h2 id="hash-script-data"><a class="header" href="#hash-script-data">Hash Script Data</a></h2>
+<p>Compute the script-data hash (datum + redeemers + language views) used in a
+transaction's <code>scriptDataHash</code> field:</p>
+<pre><code class="language-bash">dugite-cli transaction hash-script-data \
+  --datum-file datum.json \
+  --redeemer-file redeemer.json
+</code></pre>
+<div class="table-wrapper"><table><thead><tr><th>Argument</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>--datum-file</code></td><td>Datum JSON file (optional)</td></tr>
+<tr><td><code>--redeemer-file</code></td><td>Redeemer JSON file (optional)</td></tr>
+<tr><td><code>--script-data-file</code></td><td>Script data JSON file (optional)</td></tr>
+</tbody></table>
+</div>
 <h2 id="complete-workflow"><a class="header" href="#complete-workflow">Complete Workflow</a></h2>
 <pre><code class="language-bash"># 1. Query UTxOs to find inputs
 dugite-cli query utxo \

@@ -180,7 +180,7 @@
                 <div id="content" class="content">
                     <main>
                         <h1 id="ledger"><a class="header" href="#ledger">Ledger</a></h1>
-<p>Dugite's ledger layer (<code>dugite-ledger</code>) implements full Cardano transaction validation, UTxO management, stake distribution, reward calculation, and Conway-era governance. It closely follows the Haskell cardano-ledger STS (State Transition System) rules.</p>
+<p>Dugite's ledger layer (<code>dugite-ledger</code>) implements full Cardano transaction validation, UTxO management, stake distribution, reward calculation, and Conway-era governance, with early support for the in-progress Dijkstra era. It closely follows the Haskell cardano-ledger STS (State Transition System) rules.</p>
 <h2 id="ledger-state"><a class="header" href="#ledger-state">Ledger State</a></h2>
 <p>The <code>LedgerState</code> is the complete mutable state of the Cardano ledger at a given point in the chain:</p>
 <pre><code class="language-mermaid">flowchart TD
@@ -227,16 +227,54 @@
 <h3 id="phase-1-structural--witness"><a class="header" href="#phase-1-structural--witness">Phase-1 (Structural + Witness)</a></h3>
 <p>Phase-1 validation checks structural rules without executing scripts:</p>
 <ol>
-<li><strong>Inputs exist</strong> — All transaction inputs are present in the UTxO set</li>
-<li><strong>Fee sufficient</strong> — Fee covers minimum fee based on tx size, execution units, and reference script size (CIP-0112 tiered pricing in Conway)</li>
-<li><strong>Value conserved</strong> — Inputs = outputs + fee (+ minting/burning for multi-asset)</li>
-<li><strong>TTL valid</strong> — Transaction has not expired (time-to-live check against current slot)</li>
-<li><strong>Witness verification</strong> — Ed25519 signatures match required signers from inputs, withdrawals, and certificates</li>
-<li><strong>Multi-asset rules</strong> — No negative quantities, minting requires policy witness</li>
-<li><strong>Reference inputs</strong> — All reference inputs exist (not consumed, only read)</li>
-<li><strong>Output minimum</strong> — Each output meets the minimum lovelace requirement</li>
-<li><strong>Transaction size</strong> — Does not exceed max transaction size</li>
-<li><strong>Network ID</strong> — Matches the expected network</li>
+<li>
+<p><strong>Inputs exist</strong> — All transaction inputs are present in the UTxO set</p>
+</li>
+<li>
+<p><strong>Fee sufficient</strong> — Fee covers minimum fee based on tx size, execution units, and reference script size (CIP-0112 tiered pricing in Conway)</p>
+</li>
+<li>
+<p><strong>Value conserved</strong> — Inputs = outputs + fee (+ minting/burning for multi-asset)</p>
+</li>
+<li>
+<p><strong>TTL valid</strong> — Transaction has not expired (time-to-live check against current slot)</p>
+</li>
+<li>
+<p><strong>Witness verification</strong> — Ed25519 signatures match required signers from inputs, withdrawals, and certificates</p>
+</li>
+<li>
+<p><strong>Multi-asset rules</strong> — No negative quantities, minting requires policy witness</p>
+</li>
+<li>
+<p><strong>Reference inputs</strong> — All reference inputs exist (not consumed, only read)</p>
+</li>
+<li>
+<p><strong>Output minimum</strong> — Each output meets the minimum lovelace requirement, computed by
+<code>ProtocolParameters::min_coin_for_output()</code>, which dispatches by the era's protocol version
+rather than applying one formula everywhere (Haskell's <code>getMinCoinTxOut</code> is likewise defined
+per era):</p>
+<ul>
+<li><strong>PV 0-3 (Shelley, Allegra)</strong> — flat <code>minUTxOValue</code> protocol parameter, independent of the
+output's contents</li>
+<li><strong>PV 4 (Mary)</strong> — ada-only outputs use the same flat <code>minUTxOValue</code>; multi-asset outputs use
+Mary's <code>scaledMinDeposit</code>, scaling <code>minUTxOValue / 27</code> by <code>(27 + value_size)</code></li>
+<li><strong>PV 5-6 (Alonzo)</strong> — <code>utxoEntrySize * coinsPerUTxOWord</code>, where <code>utxoEntrySize</code> is
+<code>27 + mary_value_size + (10 if a datum hash is present else 0)</code></li>
+<li><strong>PV &gt;= 7 (Babbage, Conway, Dijkstra)</strong> — the serialized-output-size formula,
+<code>(160 + size) * coinsPerUTxOByte</code>, using the output's actual encoded byte size (from the
+original wire CBOR when available, or dugite's own re-encoding otherwise)</li>
+</ul>
+<p>This per-era split matters in practice: <code>ada_per_utxo_byte</code> is seeded from the Alonzo genesis
+file at node startup regardless of which era the chain is currently in, so applying the
+Babbage/Conway formula unconditionally would falsely reject real Shelley/Allegra/Mary mainnet
+transactions with small outputs.</p>
+</li>
+<li>
+<p><strong>Transaction size</strong> — Does not exceed max transaction size</p>
+</li>
+<li>
+<p><strong>Network ID</strong> — Matches the expected network</p>
+</li>
 </ol>
 <h3 id="phase-2-plutus-script-execution"><a class="header" href="#phase-2-plutus-script-execution">Phase-2 (Plutus Script Execution)</a></h3>
 <p>For transactions containing Plutus scripts (V1/V2/V3):</p>

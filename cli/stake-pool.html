@@ -230,18 +230,20 @@
 <pre><code class="language-bash">dugite-cli stake-pool issue-op-cert \
   --kes-verification-key-file kes.vkey \
   --cold-signing-key-file cold.skey \
-  --operational-certificate-counter-file opcert.counter \
+  --operational-certificate-issue-counter-file opcert.counter \
   --kes-period 400 \
   --out-file opcert.cert
 </code></pre>
 <div class="table-wrapper"><table><thead><tr><th>Flag</th><th>Required</th><th>Description</th></tr></thead><tbody>
 <tr><td><code>--kes-verification-key-file</code></td><td>Yes</td><td>Path to the KES verification key</td></tr>
 <tr><td><code>--cold-signing-key-file</code></td><td>Yes</td><td>Path to the cold signing key</td></tr>
-<tr><td><code>--operational-certificate-counter-file</code></td><td>Yes</td><td>Path to the opcert issue counter</td></tr>
+<tr><td><code>--operational-certificate-issue-counter-file</code></td><td>Yes</td><td>Path to the opcert issue counter. Same spellings as <code>node issue-op-cert</code>: <code>--operational-certificate-issue-counter</code> and the legacy <code>--operational-certificate-counter-file</code> are accepted as aliases</td></tr>
 <tr><td><code>--kes-period</code></td><td>Yes</td><td>Current KES period</td></tr>
 <tr><td><code>--out-file</code></td><td>Yes</td><td>Output path for the operational certificate</td></tr>
 </tbody></table>
 </div>
+<p>This is the same underlying implementation as <code>node issue-op-cert</code> (see
+<a href="node-commands.html">Node Commands</a>) — the two subcommands are interchangeable.</p>
 <h2 id="registration-certificate"><a class="header" href="#registration-certificate">registration-certificate</a></h2>
 <p>Create a stake pool registration certificate:</p>
 <pre><code class="language-bash">dugite-cli stake-pool registration-certificate \

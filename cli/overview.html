@@ -187,15 +187,32 @@
 <h2 id="command-groups"><a class="header" href="#command-groups">Command Groups</a></h2>
 <div class="table-wrapper"><table><thead><tr><th>Command</th><th>Description</th></tr></thead><tbody>
 <tr><td><code>address</code></td><td>Address generation and manipulation</td></tr>
-<tr><td><code>key</code></td><td>Payment and stake key generation</td></tr>
+<tr><td><code>key</code></td><td>Payment and stake key generation (dugite extension — see below)</td></tr>
 <tr><td><code>transaction</code></td><td>Transaction building, signing, and submission</td></tr>
 <tr><td><code>query</code></td><td>Node queries (tip, UTxO, protocol parameters, etc.)</td></tr>
 <tr><td><code>stake-address</code></td><td>Stake address registration, delegation, and vote delegation</td></tr>
-<tr><td><code>stake-pool</code></td><td>Stake pool operations (retirement certificates)</td></tr>
+<tr><td><code>stake-pool</code></td><td>Stake pool operations (key generation, registration, retirement certificates)</td></tr>
 <tr><td><code>governance</code></td><td>Conway governance (DRep, voting, proposals)</td></tr>
 <tr><td><code>node</code></td><td>Node key operations (cold keys, KES, VRF, operational certificates)</td></tr>
+<tr><td><code>byron</code></td><td>Byron-era key conversion commands (<code>byron key ...</code>)</td></tr>
+<tr><td><code>genesis</code></td><td>Genesis block/bundle commands (keys, delegation certs, <code>genesis create</code>)</td></tr>
+<tr><td><code>text-view</code></td><td>Decode a text-envelope file's CBOR representation</td></tr>
 </tbody></table>
 </div>
+<p>The <code>key</code> command group (<code>generate-payment-key</code>, <code>generate-stake-key</code>,
+<code>verification-key-hash</code>) is a dugite-only convenience extension with no
+cardano-cli counterpart. The cardano-cli equivalents — <code>address key-gen</code>,
+<code>stake-address key-gen</code>, and <code>address key-hash</code> — are also implemented, so
+scripts written against cardano-cli work unchanged. See
+<a href="key-generation.html">Key Generation</a> for the mapping.</p>
+<h3 id="era-prefixes"><a class="header" href="#era-prefixes">Era Prefixes</a></h3>
+<p>cardano-cli 11 accepts commands only in their era-prefixed form, e.g.
+<code>cardano-cli conway stake-pool registration-certificate ...</code>. dugite accepts
+<strong>both</strong> the era-prefixed form (<code>conway</code>, <code>babbage</code>, <code>alonzo</code>, <code>mary</code>,
+<code>allegra</code>, <code>shelley</code>, <code>latest</code>) and the flat form (<code>dugite-cli stake-pool registration-certificate ...</code>) — every era prefix routes to the same
+handler, since dugite is era-agnostic at the CLI surface. This makes dugite a
+strict superset: any cardano-cli-compatible script works unchanged, and
+existing dugite scripts using the flat form keep working too.</p>
 <h2 id="common-patterns"><a class="header" href="#common-patterns">Common Patterns</a></h2>
 <h3 id="socket-path"><a class="header" href="#socket-path">Socket Path</a></h3>
 <p>Most commands that interact with a running node require <code>--socket-path</code> to specify the Unix domain socket:</p>

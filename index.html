@@ -197,20 +197,28 @@
 <h2 id="key-features"><a class="header" href="#key-features">Key Features</a></h2>
 <ul>
 <li><strong>Full Ouroboros Praos consensus</strong> — Slot leader checks, VRF validation, KES period tracking, epoch nonce computation.</li>
-<li><strong>Multi-era support</strong> — Byron, Shelley, Allegra, Mary, Alonzo, Babbage, and Conway eras.</li>
+<li><strong>Multi-era support</strong> — Byron, Shelley, Allegra, Mary, Alonzo, Babbage, Conway, and Dijkstra eras.</li>
 <li><strong>Conway governance (CIP-1694)</strong> — DRep registration, voting, proposals, constitutional committee, treasury withdrawals.</li>
-<li><strong>Pipelined multi-peer sync</strong> — Header collection from a primary peer with parallel block fetching from multiple peers.</li>
-<li><strong>Plutus script execution</strong> — Plutus V1/V2/V3 evaluation via the in-house <code>dugite-uplc</code> CEK machine (fully conformant, all test vectors pass).</li>
+<li><strong>Pipelined sync</strong> — ChainSync headers are pipelined per peer (default depth 300, tunable via <code>DUGITE_PIPELINE_DEPTH</code>), decoupled from block fetching. Bulk block fetch uses a single active fetch slot contested by the fastest peers, mirroring cardano-node's <code>maxConcurrencyBulkSync = 1</code>.</li>
+<li><strong>Plutus script execution</strong> — Plutus V1/V2/V3 (and V4 from Dijkstra) evaluation via the in-house <code>dugite-uplc</code> CEK machine (fully conformant, all 999 upstream test vectors pass).</li>
 <li><strong>Node-to-Node (N2N) protocol</strong> — Full Ouroboros mini-protocol suite: ChainSync, BlockFetch, TxSubmission2, KeepAlive, PeerSharing.</li>
 <li><strong>Node-to-Client (N2C) protocol</strong> — Unix domain socket server with LocalChainSync, LocalStateQuery, LocalTxSubmission, and LocalTxMonitor.</li>
+<li><strong>UTxO RPC (gRPC) server</strong> — Optional native <code>utxorpc</code> server (sync, query, submit, watch) with reflection and gRPC-Web support. See <a href="./running/utxo-rpc.html">UTxO RPC</a>.</li>
 <li><strong>cardano-cli compatible CLI</strong> — Key generation, transaction building, signing, submission, queries, and governance commands.</li>
-<li><strong>Prometheus metrics</strong> — Real-time node metrics on port 12798.</li>
+<li><strong>Prometheus metrics</strong> — Real-time node metrics on port 12796 by default (deliberately offset from cardano-node's 12798 so both can run on one host).</li>
 <li><strong>P2P networking</strong> — Peer manager with cold/warm/hot lifecycle, DNS multi-resolution (A/AAAA/SRV), ledger-based peer discovery, and inbound rate limiting.</li>
 <li><strong>ChainSync Jumping (CSJ)</strong> — Phase A Ouroboros Genesis support: dynamic intersection discovery across multiple peers for faster tip-of-chain recovery.</li>
 <li><strong>Mithril snapshot import</strong> — Fast initial sync by importing a Mithril-certified snapshot.</li>
 <li><strong>SIGHUP topology reload</strong> — Update peer configuration without restarting the node.</li>
 </ul>
 <h2 id="project-status"><a class="header" href="#project-status">Project Status</a></h2>
+<blockquote>
+<p><strong>Dugite is in early development and is NOT recommended for production use.</strong>
+APIs, storage formats, and on-chain behavior may change without notice. Ledger
+validation is incomplete and may accept invalid transactions or reject valid
+ones. <strong>Do not use this software to operate a stake pool, manage real funds, or
+participate in mainnet governance.</strong> Use at your own risk on testnets only.</p>
+</blockquote>
 <p>Dugite is under active development. It can sync against both the Cardano mainnet and preview/preprod testnets. The node implements the full N2N and N2C protocol stacks, ledger validation, epoch transitions with stake snapshots and reward distribution, and Conway-era governance.</p>
 <p>For a detailed checklist of implemented and pending features, see the <a href="https://github.com/michaeljfazio/dugite/wiki">Developer Wiki</a>.</p>
 <h2 id="license"><a class="header" href="#license">License</a></h2>

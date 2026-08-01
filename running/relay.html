@@ -313,16 +313,18 @@ sudo ufw enable
 <p><strong>Important:</strong> The block producer should have no public-facing ports. All Cardano traffic flows exclusively through your relays.</p>
 </blockquote>
 <h2 id="monitoring"><a class="header" href="#monitoring">Monitoring</a></h2>
-<p>Dugite exposes Prometheus metrics on port 12798 by default. Key metrics to watch on a relay:</p>
+<p>Dugite exposes Prometheus metrics on the port pinned by your config's <code>MetricsPort</code> field — 12796 for preview, 12799 for preprod, 12800 for mainnet in the shipped configs. The built-in fallback when the field is absent is 12796. Key metrics to watch on a relay:</p>
 <div class="table-wrapper"><table><thead><tr><th>Metric</th><th>What it tells you</th></tr></thead><tbody>
 <tr><td><code>dugite_peers_connected</code></td><td>Number of active peer connections. Should be &gt; 0 at all times</td></tr>
 <tr><td><code>dugite_sync_progress_percent</code></td><td>Sync progress (10000 = 100%). Must be at 100% for the BP to produce blocks</td></tr>
 <tr><td><code>dugite_blocks_received_total</code></td><td>Total blocks received from peers. Should increase steadily</td></tr>
 <tr><td><code>dugite_slot_number</code></td><td>Current slot. Compare against network tip to verify sync</td></tr>
+<tr><td><code>dugite_tip_age_seconds</code></td><td>Seconds since the tip slot time. Sustained growth means the relay is falling behind</td></tr>
 </tbody></table>
 </div>
-<pre><code class="language-bash">curl -s http://localhost:12798/metrics | grep -E "peers_connected|sync_progress"
+<pre><code class="language-bash">curl -s http://localhost:12800/metrics | grep -E "peers_connected|sync_progress"
 </code></pre>
+<p>Also worth wiring into your supervisor: <code>/ready</code> returns 503 until sync progress reaches 99.9%, and <code>/live</code> returns 503 when no block has been applied within <code>--liveness-threshold-secs</code> (default 600).</p>
 <p>See <a href="./monitoring.html">Monitoring</a> for the full list of available metrics and Grafana dashboard setup.</p>
 <h2 id="next-steps"><a class="header" href="#next-steps">Next Steps</a></h2>
 <ul>

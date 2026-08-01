@@ -185,26 +185,37 @@
 <p>Mithril is a stake-based threshold multi-signature scheme that produces certified snapshots of the Cardano immutable database. These snapshots are verified by Mithril signers (stake pool operators) and made available through Mithril aggregator endpoints.</p>
 <p>The import process:</p>
 <ol>
-<li>Queries the Mithril aggregator for the latest available snapshot</li>
+<li>Queries the Mithril aggregator for the latest available Cardano Database (V2) snapshot</li>
+<li>Verifies the STM certificate chain back to the network's pinned genesis verification key</li>
 <li>Downloads the snapshot archive (compressed with zstandard)</li>
 <li>Extracts the cardano-node chunk files</li>
 <li>Parses each block using Dugite's in-house multi-era CBOR decoder</li>
 <li>Bulk-imports blocks into Dugite's ImmutableDB (append-only chunk files)</li>
+<li>Imports the ancillary archive (the Haskell ledger state at the immutable tip) unless disabled</li>
 </ol>
 <h2 id="usage"><a class="header" href="#usage">Usage</a></h2>
 <pre><code class="language-bash">dugite-node mithril-import \
   --network-magic &lt;magic&gt; \
   --database-path &lt;path&gt;
 </code></pre>
+<p>Or via the justfile wrapper, which builds the release binary if needed and picks
+the magic and database path for you (<code>./db-&lt;network&gt;</code>):</p>
+<pre><code class="language-bash">just mithril-import preview     # preview | preprod | mainnet
+</code></pre>
 <h3 id="arguments"><a class="header" href="#arguments">Arguments</a></h3>
 <div class="table-wrapper"><table><thead><tr><th>Argument</th><th>Default</th><th>Description</th></tr></thead><tbody>
 <tr><td><code>--network-magic</code></td><td><code>764824073</code></td><td>Network magic (764824073=mainnet, 2=preview, 1=preprod)</td></tr>
 <tr><td><code>--database-path</code></td><td><code>db</code></td><td>Path to the database directory</td></tr>
 <tr><td><code>--temp-dir</code></td><td>system temp</td><td>Temporary directory for download and extraction</td></tr>
-<tr><td><code>--include-ancillary</code></td><td><code>true</code></td><td>Download and import the Mithril ancillary archive (Haskell ledger state at the immutable tip). When enabled, bootstrap drops from multi-hour to ~15 minutes. Pass <code>--no-include-ancillary</code> to disable. See <a href="./mithril-ancillary.html">Mithril Ancillary — Trust Model</a>.</td></tr>
-<tr><td><code>--allow-stale-pparams</code></td><td><code>false</code></td><td>Continue even if ancillary download fails — falls back to genesis-default protocol parameters at the imported tip (issue #335). NOT recommended for production.</td></tr>
+<tr><td><code>--include-ancillary</code></td><td><code>true</code></td><td>Download and import the Mithril ancillary archive (Haskell ledger state at the immutable tip). When enabled, bootstrap drops from multi-hour to ~15 minutes. See <a href="./mithril-ancillary.html">Mithril Ancillary — Trust Model</a></td></tr>
+<tr><td><code>--no-include-ancillary</code></td><td>—</td><td>Skip the ancillary download. Equivalent to <code>--include-ancillary=false</code>, provided because the negated form reads better in scripts. Conflicts with <code>--include-ancillary</code></td></tr>
+<tr><td><code>--allow-stale-pparams</code></td><td><code>false</code></td><td>Continue even if the ancillary download fails — falls back to genesis-default protocol parameters at the imported tip (issue #335). NOT recommended for production</td></tr>
+<tr><td><code>--mithril-genesis-vkey</code></td><td>pinned</td><td>Override the Mithril genesis verification key, for private networks. Must be a JSON hex-encoded Ed25519 verification key string</td></tr>
+<tr><td><code>--skip-certificate-verification</code></td><td><code>false</code></td><td><strong>UNSAFE, testing only.</strong> Trust the snapshot digest from the aggregator without verifying the certificate chain</td></tr>
 </tbody></table>
 </div>
+<p>All the standard logging flags (<code>--log-output</code>, <code>--log-format</code>, <code>--log-level</code>, …)
+also apply to <code>mithril-import</code>. See <a href="./logging.html">Logging</a>.</p>
 <h3 id="examples"><a class="header" href="#examples">Examples</a></h3>
 <p><strong>Mainnet:</strong></p>
 <pre><code class="language-bash">dugite-node mithril-import \
@@ -229,24 +240,52 @@
 <tr><td>Preprod</td><td><code>https://aggregator.release-preprod.api.mithril.network/aggregator</code></td></tr>
 </tbody></table>
 </div>
-<h2 id="resume-support"><a class="header" href="#resume-support">Resume Support</a></h2>
-<p>The import process supports resuming interrupted downloads and imports:</p>
-<ul>
-<li>If the snapshot archive has already been downloaded (same size), the download is skipped</li>
-<li>If the archive has already been extracted, extraction is skipped</li>
-<li>Blocks already present in the database are skipped during import</li>
-</ul>
-<p>This means you can safely interrupt the import and restart it later.</p>
+<h2 id="interruption-and-re-runs"><a class="header" href="#interruption-and-re-runs">Interruption and Re-Runs</a></h2>
+<p>An interrupted import <strong>restarts from scratch</strong>. The temporary download
+directory is cleared at the start of every run so chunk files from a different
+snapshot cannot leak into the new one, and the Mithril client re-fetches
+everything. There is no partial-download resume.</p>
+<p>Re-running the import is also <strong>destructive to the target database</strong>: before
+moving the new chunk files into place, <code>mithril-import</code> deletes any existing
+<code>&lt;database-path&gt;/immutable/</code> directory, plus the Haskell <code>ledger/</code> directory and
+stale ledger snapshots. It does not take the database lock while doing so.</p>
+<blockquote>
+<p><strong>Stop the node before importing.</strong> <code>mithril-import</code> writes to the database
+directory with plain filesystem operations and does not acquire the
+<code>&lt;db&gt;/lock</code> flock that <code>dugite-node run</code> holds, so it will not detect a
+running node and will delete the immutable directory out from under it. Stop
+the node with SIGTERM first, and point <code>--database-path</code> at a fresh directory
+if you want to keep the old one.</p>
+</blockquote>
+<p>Download concurrency is tunable via <code>DUGITE_MITHRIL_DOWNLOAD_PARALLELISM</code>
+(per-immutable-file, default 20, clamped to 1–32).</p>
 <h2 id="after-import"><a class="header" href="#after-import">After Import</a></h2>
 <p>Once the import completes, start the node normally. It will detect the imported blocks and resume syncing from where the snapshot left off:</p>
 <pre><code class="language-bash">dugite-node run \
-  --config config.json \
-  --topology topology.json \
+  --config config/mainnet/config.json \
+  --topology config/mainnet/topology.json \
   --database-path ./db-mainnet \
   --socket-path ./node.sock \
   --host-addr 0.0.0.0 \
   --port 3001
 </code></pre>
+<p>Stop the node with <strong>SIGTERM</strong>, never <code>kill -9</code> — a hard kill risks the active
+ImmutableDB chunk's index. See
+<a href="./configuration.html#stopping-the-node">Stopping the Node</a>.</p>
+<h2 id="when-a-re-import-is-required"><a class="header" href="#when-a-re-import-is-required">When a Re-Import Is Required</a></h2>
+<p>The on-disk ledger snapshot carries a <code>SNAPSHOT_VERSION</code>. When a release bumps
+it, the old snapshot is rejected on load and the node replays chunks from the
+last compatible point; when the <em>import</em> format itself changed, a full
+<code>mithril-import</code> is required instead.</p>
+<div class="table-wrapper"><table><thead><tr><th>Upgrading from</th><th>Action needed</th></tr></thead><tbody>
+<tr><td>Before v2.1.0</td><td><strong>Full <code>mithril-import</code> required.</strong> Pre-v2.1.0 imports discarded governance roots (<code>Proposals.pRoots</code>), which silently corrupts reward calculation — see issue #898. Re-import; a replay will not repair it</td></tr>
+<tr><td>v2.1.0 – v2.2.x</td><td>Chunk replay on first restart (SNAPSHOT_VERSION reached 31 in v2.3.0)</td></tr>
+<tr><td>v2.3.0 or later</td><td><strong>Drop-in.</strong> SNAPSHOT_VERSION has been unchanged at 31 since v2.3.0, including the current v2.4.3 release. No re-import and no re-sync</td></tr>
+</tbody></table>
+</div>
+<p>v2.4.0 additionally introduced two new files inside the database directory —
+<code>lock</code> and <code>immutable/clean</code>. Both are created automatically; no operator action
+is required.</p>
 <h2 id="disk-space-requirements"><a class="header" href="#disk-space-requirements">Disk Space Requirements</a></h2>
 <p>Mithril snapshots are large. Approximate sizes (which grow over time):</p>
 <div class="table-wrapper"><table><thead><tr><th>Network</th><th>Compressed Archive</th><th>Extracted</th><th>Final DB</th></tr></thead><tbody>

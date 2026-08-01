@@ -189,111 +189,163 @@ cp target/release/dugite-config /usr/local/bin/
 </code></pre>
 <h2 id="commands"><a class="header" href="#commands">Commands</a></h2>
 <div class="table-wrapper"><table><thead><tr><th>Command</th><th>Description</th></tr></thead><tbody>
-<tr><td><code>init</code></td><td>Interactively create a new configuration file</td></tr>
-<tr><td><code>edit</code></td><td>Launch the full-screen TUI editor for an existing file</td></tr>
-<tr><td><code>validate</code></td><td>Validate a configuration file and report all errors</td></tr>
-<tr><td><code>get</code></td><td>Print the value of a single field</td></tr>
-<tr><td><code>set</code></td><td>Set the value of a single field non-interactively</td></tr>
+<tr><td><code>edit</code></td><td>Launch the full-screen TUI editor, optionally attaching to a running node</td></tr>
+<tr><td><code>init</code></td><td>Write a default configuration file for a named network</td></tr>
+<tr><td><code>validate</code></td><td>Validate a configuration file against the parameter schema</td></tr>
+<tr><td><code>get</code></td><td>Print the value of a single parameter</td></tr>
+<tr><td><code>set</code></td><td>Set the value of a single parameter non-interactively</td></tr>
 </tbody></table>
 </div>
-<h3 id="init"><a class="header" href="#init">init</a></h3>
-<p>Create a new configuration file, guided step by step:</p>
-<pre><code class="language-bash">dugite-config init --out-file config.json
-</code></pre>
-<p>The init wizard prompts for the network (mainnet/preview/preprod), genesis file paths, P2P targets, and tracing options, then writes a validated JSON file.</p>
+<blockquote>
+<p><strong>Argument shape:</strong> <code>get</code> and <code>set</code> take the key (and value) as <strong>positional</strong>
+arguments and the file as a <code>--config</code> flag — not the other way round.</p>
+</blockquote>
 <h3 id="edit"><a class="header" href="#edit">edit</a></h3>
-<p>Launch the full-screen interactive editor:</p>
-<pre><code class="language-bash">dugite-config edit config.json
+<pre><code class="language-bash"># Edit an explicit file
+dugite-config edit config/preview/config.json
+
+# Attach to a running node: discovers dugite-node processes on this machine,
+# auto-attaches if exactly one is running, otherwise shows a selector
+dugite-config edit
 </code></pre>
+<div class="table-wrapper"><table><thead><tr><th>Flag</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>&lt;config_file&gt;</code></td><td>Optional positional path. Omit to auto-discover running <code>dugite-node</code> instances</td></tr>
+<tr><td><code>--node-pid-file &lt;PATH&gt;</code></td><td>File containing the running node's PID, used by <code>Ctrl+R</code> to send SIGHUP. Ignored in discovery mode, where the discovered process's OS PID is used directly. Defaults to <code>./logs/bp-pair/bp.pid</code></td></tr>
+</tbody></table>
+</div>
+<p>In discovery mode the command exits with an error if no <code>dugite-node</code> process is
+running, or if the discovered processes have no readable config file.</p>
+<h3 id="init"><a class="header" href="#init">init</a></h3>
+<p><code>init</code> is <strong>not</strong> an interactive wizard. It writes a complete default config for
+a named network in one shot:</p>
+<pre><code class="language-bash"># Write a preview default config
+dugite-config init --network preview --out config.json
+
+# Print to stdout instead
+dugite-config init --network mainnet
+</code></pre>
+<div class="table-wrapper"><table><thead><tr><th>Flag</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>--network</code>, <code>-n</code></td><td>Required. One of <code>mainnet</code>, <code>preview</code>, <code>preprod</code></td></tr>
+<tr><td><code>--out</code>, <code>-o</code></td><td>Output path. Prints to stdout when omitted</td></tr>
+</tbody></table>
+</div>
 <h3 id="validate"><a class="header" href="#validate">validate</a></h3>
-<p>Check a configuration file for errors without modifying it:</p>
-<pre><code class="language-bash">dugite-config validate config.json
+<p>Check a configuration file against the schema without modifying it. Exits 0 when
+valid and 1 when it contains errors, so it drops straight into CI:</p>
+<pre><code class="language-bash">dugite-config validate config/preview/config.json
 </code></pre>
-<p>Output on success:</p>
-<pre><code>config.json: OK (all fields valid)
+<p>Known keys are validated against their declared type and range. Keys that are
+not in the schema are reported as <strong>warnings</strong>, not errors — this is how a stray
+<code>EnableP2P</code> or a typo'd key name gets surfaced, since the node itself ignores
+unknown keys silently.</p>
+<p>Output on success (written to stderr):</p>
+<pre><code>OK — 'config/preview/config.json' is valid (21 parameters, 0 unknown).
 </code></pre>
 <p>Output on failure:</p>
-<pre><code>config.json: 2 error(s)
-  Line 7 — TargetNumberOfActivePeers: value 200 exceeds maximum (100)
-  Line 12 — MinSeverity: unknown value "Verbose" (expected: Trace, Debug, Info, Warning, Error)
+<pre><code>Errors:
+  'TargetNumberOfActivePeers': value 200 exceeds maximum (100)
+Error: 'config/preview/config.json' failed validation: 1 error(s)
 </code></pre>
 <h3 id="get--set"><a class="header" href="#get--set">get / set</a></h3>
 <p>Non-interactive field access for scripting:</p>
 <pre><code class="language-bash"># Get a field
-dugite-config get config.json TargetNumberOfActivePeers
-# Output: 20
+dugite-config get TargetNumberOfActivePeers --config config.json
+# Output: 15
 
-# Set a field
-dugite-config set config.json TargetNumberOfActivePeers 30
+# Get with the schema's type, default, section, description, and tuning hint
+dugite-config get TargetNumberOfActivePeers --config config.json --verbose
 
-# Set a nested field
-dugite-config set config.json TraceOptions.TraceForge true
+# Set a field (creates config.json.bak first)
+dugite-config set TargetNumberOfActivePeers 30 --config config.json
 </code></pre>
+<p><code>set</code> validates the new value against the schema before writing, and coerces it
+to the JSON type the schema declares. A key that is in the schema but absent
+from the file is appended; a key in neither is rejected.</p>
+<p>Only <strong>top-level</strong> keys are addressable. There is no dotted-path syntax, so
+nested values such as <code>TraceOptions.TraceForge</code> or <code>Rpc.Port</code> must be edited in
+the TUI (or by hand).</p>
 <h2 id="interactive-editor"><a class="header" href="#interactive-editor">Interactive Editor</a></h2>
-<p>The interactive editor (<code>dugite-config edit</code>) renders a full-screen TUI with three panes:</p>
-<pre><code>┌─ Fields ──────────────────────┬─ Value ───────────┬─ Hints ───────────────────────────┐
-│ &gt; Network Settings            │                   │                                   │
-│     Network                   │ Testnet           │ Network identifier. Use "Mainnet" │
-│     NetworkMagic              │ 2                 │ for mainnet or "Testnet" for      │
-│     EnableP2P                 │ true              │ testnets. If omitted, defaults    │
-│ &gt; Genesis Files               │                   │ based on Network field.           │
-│     ShelleyGenesisFile        │ shelley-gen...    │                                   │
-│     ByronGenesisFile          │ byron-genesi...   │                                   │
-│     AlonzoGenesisFile         │ alonzo-genes...   │                                   │
-│     ConwayGenesisFile         │ conway-genes...   │                                   │
-│ &gt; P2P Parameters              │                   │                                   │
-│     DiffusionMode             │ InitiatorAn...    │                                   │
-│     PeerSharing               │ PeerSharing...    │                                   │
-│     TargetNumberOfActivePeers │ 15                │                                   │
-└───────────────────────────────┴───────────────────┴───────────────────────────────────┘
+<p>The interactive editor (<code>dugite-config edit</code>) renders a full-screen TUI with two
+panels: the parameter tree on the left (60%) and a description panel on the
+right (40%). Below 80 columns the right panel is hidden and the tree fills the
+terminal.</p>
+<pre><code>┌─ Parameters ──────────────────────────────┬─ TargetNumberOfActivePeers ────────┐
+│ Network                                   │ Type:    integer (1-100)           │
+│   Network                        Testnet  │ Default: 20                        │
+│   NetworkMagic                         2  │ Section: Network                   │
+│   DiffusionMode      InitiatorAndResponder│                                    │
+│   TargetNumberOfActivePeers           15  │ Target number of fully active (hot)│
+│   TargetNumberOfEstablishedPeers      30  │ peers. Raising this improves       │
+│ Genesis                                   │ propagation at the cost of CPU and │
+│   ByronGenesisFile     byron-genesis.json │ bandwidth.                         │
+│   ShelleyGenesisFile shelley-genesis.json │                                    │
+│ Logging                                   │ Hint: 20 is the cardano-node       │
+│   MinSeverity                       Info  │ default. BPs may want 10-15.       │
+└───────────────────────────────────────────┴────────────────────────────────────┘
 </code></pre>
-<h3 id="navigation"><a class="header" href="#navigation">Navigation</a></h3>
+<p>Parameters are grouped into the sections <strong>Network</strong>, <strong>Genesis</strong>, <strong>Protocol</strong>,
+<strong>Logging</strong>, <strong>Diffusion</strong>, <strong>Storage</strong>, <strong>Rpc</strong>, and <strong>Advanced</strong>. Each schema
+entry also records whether the parameter is hot-reloadable or needs a restart.</p>
+<h3 id="key-bindings"><a class="header" href="#key-bindings">Key bindings</a></h3>
 <div class="table-wrapper"><table><thead><tr><th>Key</th><th>Action</th></tr></thead><tbody>
-<tr><td>Arrow Up / Down</td><td>Move between fields</td></tr>
-<tr><td>Arrow Right / Enter</td><td>Expand a group or edit a field</td></tr>
-<tr><td>Arrow Left / Escape</td><td>Collapse a group or cancel edit</td></tr>
-<tr><td><code>/</code></td><td>Open search/filter</td></tr>
-<tr><td><code>d</code></td><td>Toggle diff view</td></tr>
-<tr><td><code>Ctrl+S</code></td><td>Save and exit</td></tr>
-<tr><td><code>Ctrl+Q</code></td><td>Discard changes and exit</td></tr>
-<tr><td><code>?</code></td><td>Toggle help overlay</td></tr>
+<tr><td><code>j</code> / Down</td><td>Move cursor down</td></tr>
+<tr><td><code>k</code> / Up</td><td>Move cursor up</td></tr>
+<tr><td><code>Enter</code> / <code>e</code></td><td>Edit selected parameter — toggles a boolean, cycles an enum, or opens a text buffer for string/number/path</td></tr>
+<tr><td><code>Tab</code></td><td>Collapse / expand the current section</td></tr>
+<tr><td><code>/</code></td><td>Enter search mode (fuzzy filter)</td></tr>
+<tr><td><code>Esc</code></td><td>Cancel the current edit, close search, or close the diff overlay</td></tr>
+<tr><td><code>Ctrl+D</code></td><td>Toggle the diff overlay (original vs. current)</td></tr>
+<tr><td><code>Ctrl+S</code></td><td>Save to disk — does <strong>not</strong> exit</td></tr>
+<tr><td><code>Ctrl+R</code></td><td>Save and send SIGHUP to the running node (live reload)</td></tr>
+<tr><td><code>q</code></td><td>Quit, prompting if there are unsaved changes</td></tr>
 </tbody></table>
 </div>
-<h3 id="inline-editing"><a class="header" href="#inline-editing">Inline Editing</a></h3>
-<p>Pressing <code>Enter</code> on a field opens it for editing in place. The current value is pre-filled. Type a new value and press <code>Enter</code> to confirm or <code>Escape</code> to cancel.</p>
-<p>Type validation runs immediately on confirmation. If the value is invalid (for example, a string where an integer is expected, or a number outside the valid range), an inline error message appears below the field. The cursor stays on the field until a valid value is entered or the edit is cancelled.</p>
-<h3 id="tuning-hints"><a class="header" href="#tuning-hints">Tuning Hints</a></h3>
-<p>The right-hand pane shows contextual hints for the selected field, including:</p>
-<ul>
-<li>A description of what the field controls</li>
-<li>The valid type and range</li>
-<li>Practical advice on the impact of different values</li>
-</ul>
-<p>For example, <code>TargetNumberOfActivePeers</code> shows advice on the trade-off between connectivity and bandwidth, and notes that values above 50 are rarely beneficial for relay nodes.</p>
-<h3 id="search-and-filter"><a class="header" href="#search-and-filter">Search and Filter</a></h3>
-<p>Press <code>/</code> to open the search bar. Typing narrows the visible fields to those whose names match the query. Press <code>Escape</code> to clear the filter and return to the full tree.</p>
-<h3 id="diff-view"><a class="header" href="#diff-view">Diff View</a></h3>
-<p>Press <code>d</code> to toggle the diff view, which shows a side-by-side comparison of the original file and your pending changes. Fields with modified values are highlighted. Use this before saving to confirm your edits.</p>
-<h2 id="scripted-workflows"><a class="header" href="#scripted-workflows">Scripted Workflows</a></h2>
-<p><code>dugite-config</code> can be used in deployment scripts for automated configuration management:</p>
+<p>Note that <code>Ctrl+S</code> saves and stays in the editor; use <code>q</code> to leave. There is no
+<code>Ctrl+Q</code> binding and no <code>?</code> help overlay.</p>
+<h3 id="inline-editing"><a class="header" href="#inline-editing">Inline editing</a></h3>
+<p>Pressing <code>Enter</code> on a field acts according to the field's type: booleans toggle
+immediately, enums cycle to the next choice, and string/number/path fields open
+a text buffer. In the text buffer, <code>Enter</code> confirms and <code>Escape</code> cancels.</p>
+<p>Validation runs on confirmation against the schema's declared type and range.</p>
+<h3 id="saving"><a class="header" href="#saving">Saving</a></h3>
+<p>Every save — from <code>Ctrl+S</code>, <code>Ctrl+R</code>, or the <code>set</code> subcommand — first copies the
+original file to <code>&lt;path&gt;.bak</code>. Only one level of backup is kept; the previous
+<code>.bak</code> is overwritten. Files are written with 4-space indentation and a trailing
+newline, matching the official Cardano config files.</p>
+<p>Parameters that are absent from the file are shown in the tree seeded from their
+schema default, and are only written out if you actually change them — so saving
+does not balloon a minimal config into a fully-pinned one.</p>
+<h3 id="live-reload-ctrlr"><a class="header" href="#live-reload-ctrlr">Live reload (Ctrl+R)</a></h3>
+<p><code>Ctrl+R</code> saves and then sends <code>SIGHUP</code> to the running node, applying the
+hot-reloadable subset of the config without a restart. If the PID cannot be
+resolved the config is still saved and the signal is skipped with an error
+message. See <a href="./configuration.html#live-reload-sighup">Live Reload</a> for which
+fields actually take effect live.</p>
+<h3 id="search-and-filter"><a class="header" href="#search-and-filter">Search and filter</a></h3>
+<p>Press <code>/</code> to enter search mode, which fuzzy-filters the tree as you type.
+<code>Backspace</code> deletes, <code>Enter</code> confirms and returns to browse mode with the cursor
+on the first match, and <code>Escape</code> clears the filter. Note that <code>j</code> and <code>k</code> move
+the cursor while in search mode rather than being typed into the query.</p>
+<h3 id="diff-overlay"><a class="header" href="#diff-overlay">Diff overlay</a></h3>
+<p><code>Ctrl+D</code> opens an overlay comparing the on-disk original against your pending
+changes. While the overlay is showing, only <code>Esc</code> is accepted — it closes the
+overlay.</p>
+<h2 id="scripted-workflows"><a class="header" href="#scripted-workflows">Scripted workflows</a></h2>
+<p><code>dugite-config</code> can be used in deployment scripts for automated configuration
+management:</p>
 <pre><code class="language-bash">#!/usr/bin/env bash
 # Example: configure a relay node for preview testnet
+set -euo pipefail
 
 CONFIG="config/preview/config.json"
 
-dugite-config init --out-file "$CONFIG" \
-  --network Testnet \
-  --network-magic 2 \
-  --shelley-genesis shelley-genesis.json \
-  --byron-genesis byron-genesis.json \
-  --alonzo-genesis alonzo-genesis.json \
-  --conway-genesis conway-genesis.json
+dugite-config init --network preview --out "$CONFIG"
 
-dugite-config set "$CONFIG" EnableP2P true
-dugite-config set "$CONFIG" DiffusionMode InitiatorAndResponder
-dugite-config set "$CONFIG" TargetNumberOfActivePeers 15
-dugite-config set "$CONFIG" TargetNumberOfEstablishedPeers 30
-dugite-config set "$CONFIG" TargetNumberOfKnownPeers 85
+dugite-config set DiffusionMode InitiatorAndResponder --config "$CONFIG"
+dugite-config set TargetNumberOfActivePeers 15        --config "$CONFIG"
+dugite-config set TargetNumberOfEstablishedPeers 30   --config "$CONFIG"
+dugite-config set TargetNumberOfKnownPeers 85         --config "$CONFIG"
+
 dugite-config validate "$CONFIG"
 </code></pre>
 

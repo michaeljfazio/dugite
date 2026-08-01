@@ -180,7 +180,16 @@
                 <div id="content" class="content">
                     <main>
                         <h1 id="dugite-node-reference"><a class="header" href="#dugite-node-reference">dugite-node Reference</a></h1>
-<p><code>dugite-node</code> is the main Dugite node binary. It supports two subcommands: <code>run</code> (start the node) and <code>mithril-import</code> (import a Mithril snapshot for fast initial sync).</p>
+<p><code>dugite-node</code> is the main Dugite node binary. The two subcommands used in
+day-to-day operation are <code>run</code> (start the node) and <code>mithril-import</code> (import
+a Mithril snapshot for fast initial sync), documented below.</p>
+<p>The binary also ships several operator/debug subcommands not covered in
+detail here: <code>db info</code> (database size and block count), <code>dump-snapshot</code>
+(replay the chain and dump ledger state at epoch boundaries, for
+cross-validation), <code>verify-ledger-snapshot</code> (byte-exact comparison of two
+ledger snapshots), and <code>snapshot-convert</code> (convert a ledger snapshot between
+the in-memory and LSM UTxO backends without a chain replay). Run
+<code>dugite-node &lt;subcommand&gt; --help</code> for their flags.</p>
 <h2 id="run"><a class="header" href="#run">run</a></h2>
 <p>Start the Dugite node:</p>
 <pre><code class="language-bash">dugite-node run [OPTIONS]
@@ -193,17 +202,30 @@
 <tr><td><code>--socket-path</code></td><td><code>node.sock</code></td><td>Unix domain socket path for N2C (local client) connections</td></tr>
 <tr><td><code>--port</code></td><td><code>3001</code></td><td>TCP port for N2N (node-to-node) connections</td></tr>
 <tr><td><code>--host-addr</code></td><td><code>0.0.0.0</code></td><td>Host address to bind to</td></tr>
-<tr><td><code>--metrics-port</code></td><td><code>12798</code></td><td>Prometheus metrics port (set to <code>0</code> to disable)</td></tr>
-<tr><td><code>--consensus-mode</code></td><td><code>praos</code></td><td>Consensus mode: <code>praos</code> (default) or <code>genesis</code> (Ouroboros Genesis with GSM)</td></tr>
+<tr><td><code>--metrics-port</code></td><td></td><td>Prometheus metrics port. If omitted, the config file's <code>MetricsPort</code> is used; if neither is set, defaults to <code>12798</code></td></tr>
+<tr><td><code>--no-metrics</code></td><td><code>false</code></td><td>Disable the Prometheus metrics server entirely. Equivalent to <code>--metrics-port 0</code></td></tr>
+<tr><td><code>--require-metrics</code></td><td><code>false</code></td><td>Make a metrics bind failure a fatal startup error (default: node continues if the port can't be bound)</td></tr>
+<tr><td><code>--rpc-host</code></td><td></td><td>UTxO RPC (gRPC) server bind address. Overrides <code>Rpc.ListenAddr</code> from the config file. Defaults to <code>127.0.0.1</code> when the server is enabled</td></tr>
+<tr><td><code>--rpc-port</code></td><td></td><td>UTxO RPC (gRPC) server port. Overrides <code>Rpc.Port</code>; setting this implies enabling the RPC server. Defaults to <code>50051</code> when set via config</td></tr>
+<tr><td><code>--no-rpc</code></td><td><code>false</code></td><td>Disable the UTxO RPC (gRPC) server entirely, overriding <code>--rpc-host</code>/<code>--rpc-port</code>/<code>Rpc.Enabled</code></td></tr>
+<tr><td><code>--compat-metrics</code></td><td><code>false</code></td><td>Also emit <code>cardano_node_metrics_*</code> compatibility aliases alongside the native <code>dugite_*</code> metrics, for reuse of existing cardano-node Grafana dashboards</td></tr>
+<tr><td><code>--liveness-threshold-secs</code></td><td><code>600</code></td><td>Liveness threshold (seconds) for the <code>/live</code> HTTP endpoint; <code>0</code> disables it (always 200)</td></tr>
+<tr><td><code>--consensus-mode</code></td><td></td><td>Consensus mode override: <code>praos</code> or <code>genesis</code> (Ouroboros Genesis with GSM). When omitted, read from the config file's <code>ConsensusMode</code> field (default <code>PraosMode</code>)</td></tr>
+<tr><td><code>--validate-all-blocks</code></td><td><code>false</code></td><td>Force full Phase-2 Plutus validation on all blocks, even during initial sync (normally only blocks at tip are fully validated)</td></tr>
+<tr><td><code>--skip-eagerly-validated-header-crypto</code></td><td><code>false</code></td><td>Skip apply-time header re-validation for headers that already passed eager per-peer validation. Off by default; see the flag's doc comment before enabling in production</td></tr>
+<tr><td><code>--dijkstra-genesis</code></td><td></td><td>Path to the Dijkstra-era genesis JSON file, overriding the config file's <code>DijkstraGenesisFile</code> (parsed but not yet applied to runtime protocol parameters)</td></tr>
 <tr><td><code>--shelley-kes-key</code></td><td></td><td>Path to the KES signing key (enables block production)</td></tr>
 <tr><td><code>--shelley-vrf-key</code></td><td></td><td>Path to the VRF signing key (enables block production)</td></tr>
 <tr><td><code>--shelley-operational-certificate</code></td><td></td><td>Path to the operational certificate (enables block production)</td></tr>
+<tr><td><code>--shelley-cold-key</code></td><td></td><td>Path to the cold signing key file, used for pool ID derivation</td></tr>
 <tr><td><code>--log-output</code></td><td><code>stdout</code></td><td>Log output target: <code>stdout</code>, <code>file</code>, or <code>journald</code>. Can be specified multiple times.</td></tr>
 <tr><td><code>--log-format</code></td><td><code>text</code></td><td>Log format: <code>text</code> (human-readable) or <code>json</code> (structured).</td></tr>
 <tr><td><code>--log-level</code></td><td><code>info</code></td><td>Log level (<code>trace</code>, <code>debug</code>, <code>info</code>, <code>warn</code>, <code>error</code>). Overridden by <code>RUST_LOG</code>.</td></tr>
 <tr><td><code>--log-dir</code></td><td><code>logs</code></td><td>Directory for log files (used with <code>--log-output file</code>)</td></tr>
 <tr><td><code>--log-file-rotation</code></td><td><code>daily</code></td><td>Log file rotation strategy: <code>daily</code>, <code>hourly</code>, or <code>never</code></td></tr>
 <tr><td><code>--log-no-color</code></td><td><code>false</code></td><td>Disable ANSI colors in stdout output</td></tr>
+<tr><td><code>--log-retention-days</code></td><td><code>7</code></td><td>Number of days to retain log files</td></tr>
+<tr><td><code>--stdout-overflow</code></td><td><code>drop</code></td><td>Channel-full policy for the non-blocking stdout writer: <code>drop</code> (keep going, count dropped lines) or <code>block</code> (lossless, but re-introduces blocking on the hot path)</td></tr>
 <tr><td><code>--mempool-max-tx</code></td><td><code>16384</code></td><td>Maximum number of transactions in the mempool</td></tr>
 <tr><td><code>--mempool-max-bytes</code></td><td><code>536870912</code></td><td>Maximum mempool size in bytes (default 512 MB)</td></tr>
 <tr><td><code>--snapshot-max-retained</code></td><td><code>2</code></td><td>Maximum number of ledger snapshots to retain on disk</td></tr>
@@ -272,12 +294,18 @@
 <tr><td><code>--network-magic</code></td><td><code>764824073</code></td><td>Network magic value</td></tr>
 <tr><td><code>--database-path</code></td><td><code>db</code></td><td>Path to the database directory</td></tr>
 <tr><td><code>--temp-dir</code></td><td></td><td>Temporary directory for download and extraction (uses system temp if omitted)</td></tr>
+<tr><td><code>--mithril-genesis-vkey</code></td><td></td><td>Override the Mithril genesis verification key (JSON hex-encoded Ed25519 verification key string), for private networks</td></tr>
+<tr><td><code>--skip-certificate-verification</code></td><td><code>false</code></td><td>Skip Mithril STM certificate chain verification (UNSAFE — testing only)</td></tr>
+<tr><td><code>--allow-stale-pparams</code></td><td><code>false</code></td><td>Continue the import even if the ancillary archive can't be downloaded, falling back to genesis-default protocol parameters at the imported tip. Not recommended for production</td></tr>
+<tr><td><code>--include-ancillary</code> / <code>--no-include-ancillary</code></td><td><code>true</code></td><td>Download and import the Mithril ancillary archive (Haskell ledger state at the immutable tip), dropping bootstrap time from multi-hour to ~15 minutes. <code>--no-include-ancillary</code> restores the pre-ancillary behavior of deriving ledger state entirely from chunk-by-chunk block replay — see <a href="../running/mithril-ancillary.html">Mithril Ancillary</a></td></tr>
 <tr><td><code>--log-output</code></td><td><code>stdout</code></td><td>Log output target: <code>stdout</code>, <code>file</code>, or <code>journald</code>. Can be specified multiple times.</td></tr>
 <tr><td><code>--log-format</code></td><td><code>text</code></td><td>Log format: <code>text</code> (human-readable) or <code>json</code> (structured).</td></tr>
 <tr><td><code>--log-level</code></td><td><code>info</code></td><td>Log level (<code>trace</code>, <code>debug</code>, <code>info</code>, <code>warn</code>, <code>error</code>). Overridden by <code>RUST_LOG</code>.</td></tr>
 <tr><td><code>--log-dir</code></td><td><code>logs</code></td><td>Directory for log files (used with <code>--log-output file</code>)</td></tr>
 <tr><td><code>--log-file-rotation</code></td><td><code>daily</code></td><td>Log file rotation strategy: <code>daily</code>, <code>hourly</code>, or <code>never</code></td></tr>
 <tr><td><code>--log-no-color</code></td><td><code>false</code></td><td>Disable ANSI colors in stdout output</td></tr>
+<tr><td><code>--log-retention-days</code></td><td><code>7</code></td><td>Number of days to retain log files</td></tr>
+<tr><td><code>--stdout-overflow</code></td><td><code>drop</code></td><td>Channel-full policy for the non-blocking stdout writer: <code>drop</code> or <code>block</code></td></tr>
 </tbody></table>
 </div>
 <h3 id="network-magic-values"><a class="header" href="#network-magic-values">Network Magic Values</a></h3>

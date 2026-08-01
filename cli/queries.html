@@ -205,6 +205,18 @@
   --socket-path ./node.sock \
   --testnet-magic 2
 </code></pre>
+<p>Alternatively, query one or more specific UTxOs by transaction input
+reference (<code>--tx-in</code> may be repeated), or dump the entire UTxO set with
+<code>--whole</code> (warning: very large on mainnet):</p>
+<pre><code class="language-bash">dugite-cli query utxo \
+  --tx-in "abc123...#0" \
+  --tx-in "def456...#1" \
+  --socket-path ./node.sock \
+  --testnet-magic 2
+
+dugite-cli query utxo --whole --socket-path ./node.sock
+</code></pre>
+<p>Exactly one of <code>--address</code>, <code>--tx-in</code>, or <code>--whole</code> must be provided.</p>
 <p>Output:</p>
 <pre><code>TxHash#Ix                                                            Datum           Lovelace
 ------------------------------------------------------------------------------------------------
@@ -230,11 +242,22 @@ dugite-cli query protocol-parameters \
 <pre><code class="language-bash">dugite-cli query stake-distribution \
   --socket-path ./node.sock
 </code></pre>
-<p>Output:</p>
-<pre><code>PoolId                                                             Stake (lovelace)   Pledge (lovelace)
-----------------------------------------------------------------------------------------------------------
-pool1abc...                                                        15234892000000      500000000000
-pool1def...                                                         8923451000000      250000000000
+<p>Output is JSON by default (matching cardano-cli), keyed by pool ID hex with
+each pool's stake expressed as an exact <code>num/den</code> fraction of total active
+stake; pass <code>--output-text</code> for the human-readable table below, or
+<code>--out-file</code> to write to a file instead of stdout.</p>
+<p>JSON output (default):</p>
+<pre><code class="language-json">{
+  "&lt;pool_id_hex&gt;": {
+    "poolId": "&lt;pool_id_hex&gt;",
+    "stakeFraction": "1/8523"
+  }
+}
+</code></pre>
+<p><code>--output-text</code> output:</p>
+<pre><code>PoolId                                                       Stake Fraction
+--------------------------------------------------------------------------------
+&lt;pool_id_hex&gt;                                                    0.0001173413
 
 Total pools: 3200
 </code></pre>
@@ -255,17 +278,21 @@ Total pools: 3200
 ]
 </code></pre>
 <h2 id="stake-pools"><a class="header" href="#stake-pools">Stake Pools</a></h2>
-<p>List all registered stake pools with their parameters:</p>
+<p>List the IDs of all registered stake pools (use <a href="#pool-parameters">Pool Parameters</a>
+below for the pledge/cost/margin of a specific pool):</p>
 <pre><code class="language-bash">dugite-cli query stake-pools \
   --socket-path ./node.sock
 </code></pre>
-<p>Output:</p>
-<pre><code>PoolId                                                      Pledge (ADA)    Cost (ADA)   Margin
-----------------------------------------------------------------------------------------------------
-pool1abc...                                                   500.000000     340.000000    1.00%
-pool1def...                                                   250.000000     340.000000    2.50%
-
-Total pools: 3200
+<p>Output is a JSON array of bech32 pool IDs by default (matching cardano-cli),
+sorted by raw hash bytes; <code>--output-text</code> prints the same IDs
+newline-separated instead. <code>--out-file</code> writes to a file instead of stdout.
+<code>--output-yaml</code> is accepted by the flag parser but not yet implemented — it
+currently errors at runtime.</p>
+<p>JSON output (default):</p>
+<pre><code class="language-json">[
+    "pool1abc...",
+    "pool1def..."
+]
 </code></pre>
 <h2 id="pool-parameters"><a class="header" href="#pool-parameters">Pool Parameters</a></h2>
 <p>Query detailed parameters for a specific pool:</p>
@@ -273,6 +300,18 @@ Total pools: 3200
   --socket-path ./node.sock \
   --stake-pool-id pool1abc...
 </code></pre>
+<h2 id="non-myopic-member-rewards"><a class="header" href="#non-myopic-member-rewards">Non-Myopic Member Rewards</a></h2>
+<p>Query expected (non-myopic) member rewards for hypothetical delegator
+stakes, matching <code>cardano-cli query non-myopic-member-rewards</code>. Returns the
+expected lovelace reward for each requested stake amount against every
+registered pool, assuming ideal performance — used as input to pool-ranking
+tools:</p>
+<pre><code class="language-bash">dugite-cli query non-myopic-member-rewards \
+  --socket-path ./node.sock \
+  --stake 1000000000
+</code></pre>
+<p><code>--stake</code> may be repeated for multiple hypothetical stake values (in
+lovelace); it defaults to 1 ADA when omitted.</p>
 <h2 id="stake-snapshots"><a class="header" href="#stake-snapshots">Stake Snapshots</a></h2>
 <p>Query the mark/set/go stake snapshots:</p>
 <pre><code class="language-bash">dugite-cli query stake-snapshot \
@@ -287,6 +326,8 @@ dugite-cli query stake-snapshot \
 <p>Query the overall governance state:</p>
 <pre><code class="language-bash">dugite-cli query gov-state --socket-path ./node.sock
 </code></pre>
+<p>Output is JSON by default (matching cardano-cli); pass <code>--output-text</code> for
+the human-readable summary shown below, or <code>--out-file</code> to write to a file.</p>
 <p>Output:</p>
 <pre><code>Governance State (Conway)
 ========================
@@ -302,15 +343,29 @@ InfoAction           a1b2c3#0    42     3        5
 TreasuryWithdrawals  d4e5f6#1    28    12        8
 </code></pre>
 <h2 id="drep-state-conway"><a class="header" href="#drep-state-conway">DRep State (Conway)</a></h2>
-<p>Query registered DReps:</p>
+<p>Query registered DReps. Exactly one DRep selector is required — there is no
+bare "all DReps" default:</p>
 <pre><code class="language-bash"># All DReps
-dugite-cli query drep-state --socket-path ./node.sock
+dugite-cli query drep-state --all-dreps --socket-path ./node.sock
 
 # Specific DRep by key hash
 dugite-cli query drep-state \
   --socket-path ./node.sock \
   --drep-key-hash a1b2c3d4...
 </code></pre>
+<div class="table-wrapper"><table><thead><tr><th>Flag</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>--all-dreps</code></td><td>Query for all DReps</td></tr>
+<tr><td><code>--drep-key-hash</code></td><td>Filter by DRep key hash (28-byte blake2b-224 hex)</td></tr>
+<tr><td><code>--drep-script-hash</code></td><td>Filter by DRep script hash (28-byte hex)</td></tr>
+<tr><td><code>--drep-verification-key</code></td><td>Derive the DRep key hash from a verification key hex string</td></tr>
+<tr><td><code>--drep-verification-key-file</code></td><td>Derive the DRep key hash from a verification key text-envelope file</td></tr>
+<tr><td><code>--include-stake</code></td><td>Include each DRep's delegated stake in the response</td></tr>
+<tr><td><code>--output-json</code></td><td>Format output as JSON (the cardano-cli default)</td></tr>
+<tr><td><code>--output-yaml</code></td><td>Format output as YAML (mutually exclusive with <code>--output-json</code>)</td></tr>
+<tr><td><code>--out-file</code></td><td>Optional output file. Default is stdout</td></tr>
+</tbody></table>
+</div>
+<p>These selector flags are mutually exclusive — pass exactly one.</p>
 <p>Output:</p>
 <pre><code>DRep State (Conway)
 ===================
@@ -355,15 +410,21 @@ dugite-cli query tx-mempool has-tx \
   Transactions: 12
 </code></pre>
 <h2 id="treasury"><a class="header" href="#treasury">Treasury</a></h2>
-<p>Query the treasury and reserves:</p>
+<p>Query the treasury balance (matches <code>cardano-cli query treasury</code>, which
+reports treasury only — not reserves):</p>
 <pre><code class="language-bash">dugite-cli query treasury --socket-path ./node.sock
 </code></pre>
-<p>Output:</p>
+<p>The default output is the bare lovelace integer (cardano-cli-compatible):</p>
+<pre><code>1234567890000000
+</code></pre>
+<p><code>--output-text</code> prints a human-readable summary that includes both treasury
+and reserves:</p>
 <pre><code>Account State
 =============
-Treasury: 1234567 ADA
-Reserves: 9876543 ADA
+Treasury: 1234567890000000 lovelace (1234567 ADA)
+Reserves: 9876543210000000 lovelace (9876543 ADA)
 </code></pre>
+<p><code>--out-file</code> writes the selected format to a file instead of stdout.</p>
 <h2 id="constitution-conway"><a class="header" href="#constitution-conway">Constitution (Conway)</a></h2>
 <p>Query the current constitution:</p>
 <pre><code class="language-bash">dugite-cli query constitution --socket-path ./node.sock
@@ -389,6 +450,24 @@ Expired proposals: 2
   e5f6a7b8c9d0...#0
 Delayed:           false
 </code></pre>
+<h2 id="governance-proposals-conway"><a class="header" href="#governance-proposals-conway">Governance Proposals (Conway)</a></h2>
+<p>Query active governance action proposals, matching <code>cardano-cli query proposals</code>:</p>
+<pre><code class="language-bash"># All live proposals
+dugite-cli query proposals --socket-path ./node.sock
+
+# Filter to a specific proposal
+dugite-cli query proposals \
+  --socket-path ./node.sock \
+  --governance-action-tx-id a1b2c3d4... \
+  --governance-action-index 0
+</code></pre>
+<div class="table-wrapper"><table><thead><tr><th>Flag</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>--all-proposals</code></td><td>Return all proposals (default)</td></tr>
+<tr><td><code>--governance-action-tx-id</code></td><td>Filter by governance action tx ID</td></tr>
+<tr><td><code>--governance-action-index</code></td><td>Filter by governance action index (requires <code>--governance-action-tx-id</code>)</td></tr>
+<tr><td><code>--out-file</code></td><td>Optional output file. Default is stdout</td></tr>
+</tbody></table>
+</div>
 <h2 id="slot-number"><a class="header" href="#slot-number">Slot Number</a></h2>
 <p>Convert a wall-clock time to a Cardano slot number:</p>
 <pre><code class="language-bash">dugite-cli query slot-number \
@@ -406,6 +485,9 @@ Delayed:           false
   --socket-path ./node.sock \
   --op-cert-file opcert.cert
 </code></pre>
+<p>Unlike the other queries above, the default output here is the
+human-readable text summary shown below; pass <code>--output-json</code> for JSON, or
+<code>--out-file</code> to write to a file.</p>
 <p>Output:</p>
 <pre><code>KES Period Info
 ===============
@@ -423,30 +505,59 @@ KES key expiry: 2026-09-14T08:00:00Z
 </code></pre>
 <p>Use this command to verify that a KES key is current and to determine when rotation is needed.</p>
 <h2 id="leadership-schedule"><a class="header" href="#leadership-schedule">Leadership Schedule</a></h2>
-<p>Compute the leader schedule for a stake pool:</p>
+<p>Compute the slots a stake pool is expected to mint a block in, matching
+<code>cardano-cli query leadership-schedule</code>. This queries the running node for
+live stake and epoch state (via <code>--socket-path</code>) rather than taking manual
+stake/coefficient inputs:</p>
 <pre><code class="language-bash">dugite-cli query leadership-schedule \
+  --socket-path ./node.sock \
+  --testnet-magic 2 \
+  --genesis config/preview/shelley-genesis.json \
+  --stake-pool-id pool1abc... \
   --vrf-signing-key-file vrf.skey \
-  --epoch-nonce a1b2c3d4... \
-  --epoch-start-slot 73000000 \
-  --epoch-length 432000 \
-  --relative-stake 0.001 \
-  --active-slot-coeff 0.05
+  --current
 </code></pre>
-<p>Output:</p>
-<pre><code>Computing leader schedule for epoch starting at slot 73000000...
-Epoch length: 432000 slots
-Relative stake: 0.001000
-Active slot coefficient: 0.05
-
-SlotNo       VRF Output (first 16 bytes)
---------------------------------------------------
-73012345     a1b2c3d4e5f6a7b8...
-73045678     d4e5f6a7b8c9d0e1...
-
-Total leader slots: 2
-Expected: ~22 (f=0.05, stake=0.001000)
+<div class="table-wrapper"><table><thead><tr><th>Flag</th><th>Required</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>--socket-path</code></td><td>No (default <code>node.sock</code>)</td><td>Path to the node socket. Overrides <code>CARDANO_NODE_SOCKET_PATH</code></td></tr>
+<tr><td><code>--mainnet</code></td><td>No</td><td>Use the mainnet magic ID (mutually exclusive with <code>--testnet-magic</code>)</td></tr>
+<tr><td><code>--testnet-magic</code></td><td>No</td><td>Testnet magic ID</td></tr>
+<tr><td><code>--genesis</code></td><td>Yes</td><td>Shelley genesis file path</td></tr>
+<tr><td><code>--stake-pool-id</code></td><td>No</td><td>Stake pool ID (hex-encoded hash)</td></tr>
+<tr><td><code>--cold-verification-key-file</code></td><td>No</td><td>Path to the cold verification key file</td></tr>
+<tr><td><code>--vrf-signing-key-file</code></td><td>Yes</td><td>Path to the VRF signing key</td></tr>
+<tr><td><code>--current</code></td><td>No</td><td>Leadership schedule for the current epoch (mutually exclusive with <code>--next</code>)</td></tr>
+<tr><td><code>--next</code></td><td>No</td><td>Leadership schedule for the following epoch</td></tr>
+<tr><td><code>--output-json</code></td><td>No</td><td>Format output as JSON (default)</td></tr>
+<tr><td><code>--output-text</code></td><td>No</td><td>Format output as text</td></tr>
+<tr><td><code>--out-file</code></td><td>No</td><td>Optional output file. Default is stdout</td></tr>
+</tbody></table>
+</div>
+<h2 id="ledger-state-debug"><a class="header" href="#ledger-state-debug">Ledger State (Debug)</a></h2>
+<p>Dump the raw ledger state (debug endpoint):</p>
+<pre><code class="language-bash">dugite-cli query ledger-state \
+  --socket-path ./node.sock \
+  --out-file ledger-state.cbor
 </code></pre>
+<div class="table-wrapper"><table><thead><tr><th>Flag</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>--out-file</code></td><td>Optional output file. Default is stdout</td></tr>
+</tbody></table>
+</div>
+<h2 id="protocol-state-debug"><a class="header" href="#protocol-state-debug">Protocol State (Debug)</a></h2>
+<p>Dump the raw protocol (consensus) state — includes the KES evolving nonce,
+candidate nonce, and epoch nonce (debug endpoint):</p>
+<pre><code class="language-bash"># Raw CBOR hex (default)
+dugite-cli query protocol-state --socket-path ./node.sock
 
+# JSON, matching cardano-cli's --output-json
+dugite-cli query protocol-state \
+  --socket-path ./node.sock \
+  --output-json
+</code></pre>
+<div class="table-wrapper"><table><thead><tr><th>Flag</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>--output-json</code></td><td>Render the response as JSON (matches cardano-cli's <code>query protocol-state --output-json</code>). Without this flag, dugite emits the raw CBOR as hex</td></tr>
+<tr><td><code>--out-file</code></td><td>Optional output file. Default is stdout</td></tr>
+</tbody></table>
+</div>
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">

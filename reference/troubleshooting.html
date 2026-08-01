@@ -215,7 +215,10 @@
 </ol>
 <h3 id="handshake-failures"><a class="header" href="#handshake-failures">Handshake failures</a></h3>
 <p><strong>Error:</strong> <code>Handshake failed: version mismatch</code></p>
-<p>This usually means the peer does not support the protocol version Dugite is requesting (V14+). Ensure you are connecting to an up-to-date cardano-node:</p>
+<p>Dugite proposes N2N versions <strong>15 and 14</strong> (preferring 15) and N2C versions
+<strong>16 through 23</strong>. This error usually means the peer supports neither N2N 14 nor
+15. Note that network-magic mismatch produces a <em>refusal</em>, not a version
+mismatch — check both. Ensure you are connecting to an up-to-date cardano-node:</p>
 <ul>
 <li><strong>Mainnet / Preprod:</strong> cardano-node 10.x+ required</li>
 <li><strong>Preview:</strong> cardano-node 11.0.1+ required (preview is at Protocol Version 11; peers running 10.x will reject the handshake)</li>
@@ -246,10 +249,126 @@ dugite-node run ...
 <h3 id="socket-permission-denied"><a class="header" href="#socket-permission-denied">Socket permission denied</a></h3>
 <p><strong>Error:</strong> <code>Permission denied (os error 13)</code></p>
 <p>The Unix socket file inherits the permissions of the process that created it. Ensure both the node and CLI processes run as the same user, or adjust the socket file permissions.</p>
+<h2 id="stopping-the-node"><a class="header" href="#stopping-the-node">Stopping the Node</a></h2>
+<p><strong>Always stop the node with SIGTERM (or SIGINT / <code>Ctrl-C</code>). Never <code>kill -9</code>.</strong></p>
+<p>On SIGTERM the node demotes its peers, flushes volatile blocks to the
+ImmutableDB, fsyncs the chunk and secondary index files, writes the primary
+index and <code>tip.meta</code>, persists the mmap block index, stamps the
+<code>immutable/clean</code> marker, and finally saves a ledger snapshot. The flush and
+persist phase has a 30 s budget; the final snapshot has its own 120 s budget on
+large databases. Wait for the process to actually exit.</p>
+<p><code>kill -9</code> skips every one of those steps. The recorded consequences are a
+rebuilt block index at minimum, and — historically — a lost active-chunk index
+that cost roughly ten hours of blocks.</p>
+<p>A <strong>second</strong> SIGINT/SIGTERM during shutdown forces an immediate exit
+(<code>exit 130</code> / <code>exit 143</code>), so do not repeat the signal while waiting.</p>
+<pre><code class="language-bash">kill $(pidof dugite-node)      # correct
+systemctl stop dugite-node     # correct
+kill -9 $(pidof dugite-node)   # do not do this
+</code></pre>
 <h2 id="storage-issues"><a class="header" href="#storage-issues">Storage Issues</a></h2>
-<h3 id="database-corruption"><a class="header" href="#database-corruption">Database corruption</a></h3>
-<p><strong>Symptoms:</strong> Node crashes on startup with storage errors.</p>
-<p><strong>Solution:</strong> The safest approach is to delete the database and resync:</p>
+<h3 id="database-directory-is-locked"><a class="header" href="#database-directory-is-locked">Database directory is locked</a></h3>
+<p><strong>Error:</strong></p>
+<pre><code>database directory is locked by another dugite process (pid 12345) — refusing
+concurrent open of /path/to/db/lock (issue #929: a second writer would corrupt
+the ImmutableDB)
+</code></pre>
+<p>Since v2.4.0 <code>dugite-node run</code> takes an <strong>exclusive advisory flock</strong> on
+<code>&lt;database-path&gt;/lock</code> before touching any other file, and holds it for the
+process lifetime. Two writers on one directory corrupt the ImmutableDB, so the
+second one fails fast and names the PID holding the lock.</p>
+<p><strong>What to do:</strong></p>
+<ol>
+<li>Check whether that PID is still alive (<code>ps -p 12345</code>). If your previous node
+is still shutting down, wait — the lock is released when its file descriptor
+closes.</li>
+<li>If two nodes are genuinely configured against the same <code>--database-path</code>,
+give each its own directory. Ports are not the only thing that must be
+distinct.</li>
+<li>A crashed process leaves <strong>no</strong> stale lock — the kernel releases the flock on
+process death. The <code>lock</code> file itself is never deleted; its presence alone
+means nothing.</li>
+</ol>
+<p>Two caveats:</p>
+<ul>
+<li><code>dugite-node db info</code> also opens the ChainDB read-write, so it takes the same
+lock and will fail against a live node. This is by design.</li>
+<li><strong><code>mithril-import</code> does not take the lock.</strong> It will happily delete the
+immutable directory out from under a running node. Stop the node first.</li>
+</ul>
+<h3 id="unclean-shutdown-detected"><a class="header" href="#unclean-shutdown-detected">Unclean shutdown detected</a></h3>
+<p><strong>Log:</strong></p>
+<pre><code>ImmutableDB: unclean shutdown detected (no clean marker) — rebuilding mmap block
+index from secondary entries (#928)
+</code></pre>
+<p>The <code>&lt;db&gt;/immutable/clean</code> marker is written by the graceful shutdown flush and
+removed the moment the node opens the database for writing. Its absence at
+startup means the previous stop was not graceful, so the persistent mmap hash
+index cannot be trusted and is rebuilt from the secondary index entries.</p>
+<p>This is recovery working, not a fault. It costs startup time proportional to
+database size, and nothing else. If you see it after every restart, your stop
+procedure is sending SIGKILL somewhere — check your service manager's
+<code>KillSignal</code> and <code>TimeoutStopSec</code>.</p>
+<h3 id="chunk-reconciliation-and-quarantine-on-open"><a class="header" href="#chunk-reconciliation-and-quarantine-on-open">Chunk reconciliation and quarantine on open</a></h3>
+<p>Every open reconciles the on-disk chunks before any index is trusted. The
+messages you may see, and what each means:</p>
+<div class="table-wrapper"><table><thead><tr><th>Log line</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>truncating torn trailing bytes from tail chunk's secondary index</code></td><td>Partial index write from a hard stop; trimmed</td></tr>
+<tr><td><code>reconciling tail chunk — truncating to the verified prefix; dropped blocks will be re-fetched from peers</code></td><td>The tail chunk was CRC-verified block by block and cut back to the last good one. The dropped blocks come back from peers</td></tr>
+<tr><td><code>quarantining unservable tail chunk — data preserved, blocks will be re-fetched from peers</code></td><td>The tail chunk could not be verified at all. Renamed to <code>&lt;NNNNN&gt;.chunk.orphaned</code>; its <code>.secondary</code> and <code>.primary</code> are deleted</td></tr>
+<tr><td><code>tail chunk does not chain onto the previous chunk — quarantining the orphan island above the hole</code></td><td>The chain has a break at the tail boundary; everything above it is quarantined</td></tr>
+</tbody></table>
+</div>
+<p>Quarantined data is <strong>preserved</strong>, never deleted. Once the node is healthy you
+can remove the <code>.chunk.orphaned</code> files.</p>
+<h3 id="inconsistent-chunk--node-refuses-to-start"><a class="header" href="#inconsistent-chunk--node-refuses-to-start">Inconsistent chunk — node refuses to start</a></h3>
+<p><strong>Error:</strong></p>
+<pre><code>inconsistent chunk 00123 in ImmutableDB: &lt;reason&gt;. Refusing to open with a hole
+below the tip (issues #926/#928) — restore the damaged chunk (e.g.
+`dugite-node mithril-import`) or remove the damaged chunk files manually
+</code></pre>
+<p>This is deliberate. Damage at the <em>tail</em> is recoverable by truncation or
+quarantine; damage <strong>below</strong> the tail would leave a hole in the middle of the
+chain, and serving from a holed chain is worse than refusing to start.</p>
+<p><strong>Recovery, in order of preference:</strong></p>
+<pre><code class="language-bash"># 1. Re-import from Mithril into a fresh directory (fastest)
+dugite-node mithril-import --network-magic &lt;magic&gt; --database-path ./db-new
+
+# 2. Full resync from genesis (slowest, always works)
+rm -rf ./db-path
+dugite-node run ...
+</code></pre>
+<h3 id="ledger-tip-is-below-the-immutabledb-tip"><a class="header" href="#ledger-tip-is-below-the-immutabledb-tip">Ledger tip is below the ImmutableDB tip</a></h3>
+<p><strong>Log (WARN, at startup after replay):</strong></p>
+<pre><code>Ledger tip is BELOW the ImmutableDB tip after replay — the immutable chain
+contains blocks the ledger could not apply ... Sync will advance the ledger from
+ChainDB via the gap-bridge where possible; if this gap persists, inspect the
+seam and consider re-import via `dugite-node mithril-import` (#927).
+</code></pre>
+<p>The immutable chain holds blocks the ledger could not apply — typically after
+crash damage or a replay apply failure. The node handles this rather than
+wedging: it offers its known points <strong>newest-first by slot</strong> (immutable tip
+ahead of the stale ledger tip), and it exempts the peer's initial protocol-
+mandated rollback to the exactly-agreed intersection from the divergent-peer
+guard. Before this behaviour existed, the guard disconnected every peer for
+rolling back to a point the node had itself offered, and sync stopped forever.</p>
+<p><strong>What to do:</strong> watch the gap. If <code>ledger_slot</code> climbs toward
+<code>immutable_tip_slot</code> over the next few minutes, it is self-healing — leave it.
+If it stays flat, re-import.</p>
+<h3 id="ledger-snapshot-rejected-on-startup"><a class="header" href="#ledger-snapshot-rejected-on-startup">Ledger snapshot rejected on startup</a></h3>
+<p><strong>Log:</strong></p>
+<pre><code>Quarantined unreadable ledger snapshot — chain will be replayed from ImmutableDB
+on next start. Inspect or delete the .v{NN}-unreadable file once recovery
+completes.
+</code></pre>
+<p>The snapshot's <code>SNAPSHOT_VERSION</code> does not match this build's. Expected after an
+upgrade that bumps it — see <a href="./upgrading.html">Upgrading</a>. The file is renamed to
+<code>&lt;name&gt;.bin.v&lt;NN&gt;-unreadable</code>, never deleted, and the ledger is rebuilt by
+replaying ImmutableDB chunks. Blocks are not lost.</p>
+<p>Related messages that do <strong>not</strong> quarantine (delete the snapshot by hand if they
+recur): <code>Snapshot is missing the DUGT framing header</code>, <code>Snapshot checksum mismatch — file may be corrupted</code>.</p>
+<h3 id="database-corruption-last-resort"><a class="header" href="#database-corruption-last-resort">Database corruption (last resort)</a></h3>
+<p>If none of the targeted recoveries above apply, delete the database and resync:</p>
 <pre><code class="language-bash">rm -rf ./db-path
 dugite-node run ...
 </code></pre>
@@ -327,7 +446,9 @@ RUST_LOG=trace dugite-node run ...
 </code></pre>
 <p>Log files are rotated daily by default. See <a href="../running/logging.html">Logging</a> for rotation options and multi-target output.</p>
 <h2 id="sighup-topology-reload-and-log-verbosity"><a class="header" href="#sighup-topology-reload-and-log-verbosity">SIGHUP: Topology Reload and Log Verbosity</a></h2>
-<p>Sending <code>SIGHUP</code> to the node triggers two live reloads without a restart:</p>
+<p>Sending <code>SIGHUP</code> to the node reloads the topology file and the hot-reloadable
+parts of the node config, without a restart. Fields that require a restart are
+named in the log and ignored (<code>config_reload: restart-required fields changed — ignored</code>), so a SIGHUP never half-applies a change.</p>
 <ol>
 <li>
 <p><strong>Topology reload</strong> — The node re-reads the topology file and updates the peer manager:</p>

@@ -180,7 +180,9 @@
                 <div id="content" class="content">
                     <main>
                         <h1 id="development"><a class="header" href="#development">Development</a></h1>
-<p>Day-to-day tasks (build, test, lint, run a network, soak, monitor) are wrapped by a top-level <a href="https://github.com/michaeljfazio/dugite/blob/main/justfile"><code>justfile</code></a>. Install <a href="https://github.com/casey/just">just</a> (<code>brew install just</code>, <code>cargo install just</code>, or your package manager) and <code>just --list</code> shows the full menu.</p>
+<p>Day-to-day tasks (build, test, lint, run a network, soak, monitor) are wrapped by a top-level <a href="https://github.com/michaeljfazio/dugite/blob/main/justfile"><code>justfile</code></a>. Install <a href="https://github.com/casey/just">just</a> (<code>brew install just</code>, <code>cargo install just</code>, or your package manager); bare <code>just</code> (or <code>just --list</code>) shows the full menu.</p>
+<p>Before your first build, install <code>protoc</code> — <code>dugite-rpc</code>'s build script needs it. See <a href="./installation.html#system-dependencies">System Dependencies</a>.</p>
+<p>Recipe arguments are <strong>positional</strong>, not named: <code>just submit-txs 100</code>, not <code>just submit-txs n=100</code> (the latter passes the literal string <code>n=100</code>).</p>
 <h2 id="quick-reference"><a class="header" href="#quick-reference">Quick reference</a></h2>
 <pre><code class="language-bash"># Full CI gate (run this before opening a PR).
 just check
@@ -198,12 +200,17 @@ just run-relay preview
 just run-bp mainnet
 just mithril-import preview
 
-# Local devnet (loopback testnet)
-just devnet-setup           # one-time
+# Local devnet (testnet/local-devnet, loopback)
+just devnet-setup           # one-time: render configs, generate keys, fetch reference binaries
 just devnet-run             # start dugite-bp + dugite-relay + cardano-node-bp
 just devnet-soak            # 30-minute soak
-just devnet-verify          # check evidence
+just devnet-verify          # check evidence from the last run/soak
+just devnet-report          # single-round report from the latest evidence dir
 just devnet-stop
+
+# devnet-validate presets (see the devnet-validate skill)
+just devnet-validate-smoke      # single boot, ~5 min — PR gate for core crates
+just devnet-validate-extended   # 3 rounds, ~75 min — used for release tagging
 
 # Preview Sandstone soak
 just soak-6h                # Haskell relay + dugite BP, 6h orchestrator
@@ -211,36 +218,53 @@ just soak-bare-bp           # dugite BP alone
 just soak-status
 
 # Monitoring (Prometheus + Grafana via Docker)
-just monitor-start
+just monitor-start          # optional arg: Prometheus port (default 9090)
 just monitor-status
 just monitor-stop
-just watch-metrics          # tail the Prometheus endpoint
+just watch-metrics          # tail the Prometheus endpoint (default port 12796)
 
 # Validation
 just compat-n2c             # cardano-cli vs dugite-cli N2C diff
 just compat-leader          # leader-schedule N2C diff
-just submit-txs n=100       # submit N test transactions
+just submit-txs 100         # submit N test transactions (positional arg)
 just stress-test
 just stress-relay
 just benchmark-pipeline
+
+# Dual-decode validation (in-house decoder vs shadow decoder)
+just dual-decode-smoke                  # serialization tests with DUGITE_DUAL_DECODE=panic
+just dual-decode-soak preview 0         # NETWORK, MAX_BLOCKS (0 = unlimited), extra flags
+just dual-decode-report                 # summarise mismatch artefacts
+
+# Upstream conformance (corpus pinned in tests/conformance/upstream/manifest.toml)
+just download-upstream-fixtures         # all seven fixture areas at the pinned tag
+just download-upstream-fixtures-area plutus
+just test-conformance                   # UPLC + every upstream golden test
+just test-conformance-uplc              # 999 plutus-core evaluation vectors
+just test-conformance-upstream          # all upstream goldens in one binary
+just regenerate-corpus-local            # rebuild corpus tarballs locally
 
 # Dev / release helpers
 just licenses               # regenerate docs/src/reference/third-party-licenses.md
 just clean-worktrees        # prune stale git worktree branches
 just query-tip              # dugite-cli query tip against ./node.sock
+just bump-utxorpc-spec v0.19.2   # refresh vendored utxorpc/spec protos
 </code></pre>
+<p>Per-area conformance filters also exist (<code>just test-conformance-cardano-base</code>, <code>-cardano-ledger</code>, <code>-cardano-node</code>, <code>-ledger-rules</code>, <code>-mithril</code>, <code>-ouroboros-consensus</code>, <code>-status</code>). These are for iteration only — the "N skipped" count they print is the tests belonging to <em>other</em> areas, not a coverage gap. Use <code>just test-conformance-upstream</code> for the unfiltered run.</p>
 <h2 id="layout"><a class="header" href="#layout">Layout</a></h2>
-<p>The recipes wrap scripts under <code>scripts/&lt;group&gt;/</code>:</p>
+<p>Most recipes wrap scripts under <code>scripts/&lt;group&gt;/</code>; the devnet recipes wrap <code>testnet/local-devnet/</code>:</p>
 <div class="table-wrapper"><table><thead><tr><th>Group</th><th>Path</th></tr></thead><tbody>
 <tr><td>Run</td><td><code>scripts/run/{bp,relay}-{mainnet,preview,preprod}.sh</code>, <code>scripts/run/dual-node.sh</code>, <code>scripts/run/haskell-relay-preview.sh</code></td></tr>
-<tr><td>Soak</td><td><code>scripts/soak/orchestrator-6h.sh</code> + helpers</td></tr>
+<tr><td>Soak</td><td><code>scripts/soak/run-6h.sh</code> (entry point; backgrounds <code>orchestrator-6h.sh</code>), <code>run-bare-bp.sh</code>, <code>status-6h.sh</code> + helpers</td></tr>
+<tr><td>Local devnet</td><td><code>testnet/local-devnet/{setup,run,soak,verify,stop,submit-txs,run-genesis}.sh</code></td></tr>
 <tr><td>Monitoring</td><td><code>scripts/monitoring/start.sh</code>, <code>watch-metrics.sh</code>, <code>health-check.sh</code>, <code>bp-watch.sh</code>, <code>relay-watchdog.sh</code></td></tr>
-<tr><td>Validation</td><td><code>scripts/validation/n2c-compat-test.sh</code>, <code>leader-schedule-compat.sh</code>, <code>stress-test*.sh</code>, <code>submit-txs.sh</code>, <code>benchmark-pipeline-depth.sh</code></td></tr>
+<tr><td>Validation</td><td><code>scripts/validation/n2c-compat-test.sh</code>, <code>leader-schedule-compat.sh</code>, <code>stress-test.sh</code>, <code>stress-test-5k.sh</code>, <code>relay-stress-test.sh</code>, <code>submit-txs.sh</code>, <code>benchmark-pipeline-depth.sh</code>, <code>dual-decode-soak.sh</code>, <code>dual-decode-report.py</code></td></tr>
 <tr><td>Mithril</td><td><code>scripts/mithril/import.sh</code></td></tr>
-<tr><td>Dev</td><td><code>scripts/dev/check.sh</code>, <code>generate-licenses.py</code>, <code>cleanup-worktree-branches.sh</code>, <code>query-tip.sh</code></td></tr>
+<tr><td>Conformance</td><td><code>scripts/regenerate-conformance-corpus/regenerate.sh</code> + per-area <code>capture-*.sh</code></td></tr>
+<tr><td>Dev</td><td><code>scripts/dev/check.sh</code>, <code>generate-licenses.py</code>, <code>cleanup-worktree-branches.sh</code>, <code>query-tip.sh</code>, <code>bump-utxorpc-spec.sh</code></td></tr>
 </tbody></table>
 </div>
-<p>Each script does <code>cd "$(dirname "$0")/../.."</code> first, so you can invoke them from anywhere — <code>just</code>, the repo root, or by absolute path. See <a href="https://github.com/michaeljfazio/dugite/blob/main/scripts/README.md">scripts/README.md</a> and <a href="https://github.com/michaeljfazio/dugite/blob/main/config/README.md">config/README.md</a> for the canonical layout description.</p>
+<p>Most scripts <code>cd "$(dirname "$0")/../.."</code> before doing work, so they resolve <code>./config/</code> and <code>./target/release/</code> regardless of cwd — you can invoke them via <code>just</code>, from the repo root, or by absolute path. A minority (notably some under <code>scripts/monitoring/</code> and <code>scripts/validation/</code>) assume the repo root; prefer the <code>just</code> recipe. See <a href="https://github.com/michaeljfazio/dugite/blob/main/scripts/README.md">scripts/README.md</a> and <a href="https://github.com/michaeljfazio/dugite/blob/main/config/README.md">config/README.md</a> for the canonical layout description.</p>
 <h2 id="hard-requirements"><a class="header" href="#hard-requirements">Hard requirements</a></h2>
 <ul>
 <li><strong>Zero warnings</strong> — <code>cargo clippy --all-targets -- -D warnings</code> (also run by <code>just clippy</code> and <code>just check</code>)</li>

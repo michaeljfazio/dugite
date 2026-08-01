@@ -211,8 +211,10 @@ grpcurl -plaintext localhost:50051 utxorpc.v1beta.sync.SyncService/ReadTip
 </code></pre>
 <h2 id="services-exposed"><a class="header" href="#services-exposed">Services exposed</a></h2>
 <p>Every service ships in both <strong><code>v1alpha</code></strong> (for backwards compatibility
-with older clients) and <strong><code>v1beta</code></strong> (current). The spec is pinned
-in-tree at <code>crates/dugite-rpc/proto/VERSION</code>.</p>
+with older clients) and <strong><code>v1beta</code></strong> (current), with one exception:
+<code>QueryService.ReadState</code> exists only in <code>v1beta</code> — upstream added it
+after <code>v1alpha</code> was frozen. The spec is pinned in-tree at
+<code>crates/dugite-rpc/proto/VERSION</code> (currently <code>v0.19.2</code>).</p>
 <div class="table-wrapper"><table><thead><tr><th>Service</th><th>Method</th><th>Status</th></tr></thead><tbody>
 <tr><td><code>SyncService</code></td><td><code>ReadTip</code></td><td>✅ implemented</td></tr>
 <tr><td><code>SyncService</code></td><td><code>FetchBlock</code></td><td>✅ implemented</td></tr>
@@ -225,7 +227,7 @@ in-tree at <code>crates/dugite-rpc/proto/VERSION</code>.</p>
 <tr><td><code>QueryService</code></td><td><code>SearchUtxos</code></td><td>✅ implemented (<code>exact_address</code> / <code>payment_part</code> / <code>delegation_part</code> / <code>asset</code> plus <code>not</code> / <code>all_of</code> / <code>any_of</code> composites)</td></tr>
 <tr><td><code>QueryService</code></td><td><code>ReadData</code></td><td>✅ implemented (bounded scan: live inline datums + mempool tx witness sets)</td></tr>
 <tr><td><code>QueryService</code></td><td><code>ReadTx</code></td><td>✅ implemented (bounded scan: mempool + last ~43 200 slots of VolatileDB)</td></tr>
-<tr><td><code>QueryService</code></td><td><code>ReadState</code></td><td>✅ implemented (minimum-viable envelope: epoch + tip slot)</td></tr>
+<tr><td><code>QueryService</code></td><td><code>ReadState</code></td><td>✅ implemented, <strong><code>v1beta</code> only</strong> (minimum-viable envelope: epoch + tip slot)</td></tr>
 <tr><td><code>SubmitService</code></td><td><code>SubmitTx</code></td><td>✅ implemented</td></tr>
 <tr><td><code>SubmitService</code></td><td><code>ReadMempool</code></td><td>✅ implemented</td></tr>
 <tr><td><code>SubmitService</code></td><td><code>WaitForTx</code> (stream)</td><td>✅ implemented</td></tr>
@@ -295,13 +297,15 @@ the server come up unsecured.</p>
 reverse proxy (Envoy, nginx) and leave Dugite's <code>Tls</code> block absent.</p>
 <h2 id="operations"><a class="header" href="#operations">Operations</a></h2>
 <h3 id="metrics"><a class="header" href="#metrics">Metrics</a></h3>
-<p>The RPC server emits standard Prometheus counters / histograms via the
-node's existing metrics endpoint:</p>
-<ul>
-<li><code>dugite_rpc_requests_total{service, method, status}</code> (counter)</li>
-<li><code>dugite_rpc_request_duration_seconds{service, method}</code> (histogram)</li>
-<li><code>dugite_rpc_active_streams{service, method}</code> (gauge)</li>
-</ul>
+<p><strong>The RPC server currently emits no Prometheus metrics.</strong> <code>dugite-rpc</code>
+defines an <code>RpcMetricsSink</code> trait (<code>request_started</code>,
+<code>request_completed</code>, <code>stream_started</code>, <code>stream_ended</code>) so a host can plug
+in Prometheus or OpenTelemetry, but <code>dugite-node</code> wires
+<code>dugite_rpc::noop_metrics()</code> — every callback is a no-op. No
+<code>dugite_rpc_*</code> series appear on the node's <code>/metrics</code> endpoint.</p>
+<p>Until a real sink is wired, observe the RPC server through logs (below)
+and through the node-level metrics it drives indirectly
+(<code>dugite_mempool_tx_count</code>, <code>dugite_n2c_txs_*</code>, and friends).</p>
 <h3 id="logging"><a class="header" href="#logging">Logging</a></h3>
 <p>Service-level events log at <code>INFO</code> or <code>DEBUG</code> under the
 <code>dugite_rpc::server</code> target. Streaming RPCs log slow-consumer drops at

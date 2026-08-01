@@ -183,9 +183,22 @@
 <p>The Mithril aggregator publishes two artefacts per snapshot:</p>
 <ol>
 <li><strong>Main archive</strong> — the certified ImmutableDB chunk files (<code>immutable/*.{chunk,primary,secondary}</code>).</li>
-<li><strong>Ancillary archive</strong> — the serialised Haskell <code>ExtLedgerState</code> at the immutable tip, plus the partial next-chunk trio (<code>ledger/&lt;slot&gt;/state</code>, <code>ledger/&lt;slot&gt;/tables</code>).</li>
+<li><strong>Ancillary archive</strong> — the serialised Haskell <code>ExtLedgerState</code> at the immutable tip (<code>ledger/&lt;slot&gt;/</code>), plus the partial tip chunk <code>N+1</code>.</li>
 </ol>
 <p>Dugite consumes both: the main archive populates <code>ImmutableDB</code>, and the ancillary archive lets the node skip the multi-hour chain-from-genesis replay normally needed to rebuild ledger state.</p>
+<p>On disk the handoff is a two-stage one:</p>
+<ol>
+<li><code>mithril-import</code> moves the unpacked <code>ledger/</code> directory to
+<code>&lt;database-path&gt;/haskell-ledger/</code>.</li>
+<li>The next <code>dugite-node run</code> picks the highest-numbered slot subdirectory under
+<code>haskell-ledger/</code>, decodes it, writes a native <code>ledger-snapshot.bin</code>, and
+deletes <code>haskell-ledger/</code> once consumed. If the decode fails the node logs a
+warning and falls back to chain replay rather than aborting.</li>
+</ol>
+<p>If ancillary is requested but no <code>ledger/</code> directory was unpacked, the import is
+a <strong>hard error</strong> — precisely so the node cannot silently come up on
+genesis-default protocol parameters (issue #335). <code>--allow-stale-pparams</code>
+downgrades that to a warning.</p>
 <p>This document records the trust model, the operator-exposure decision, and the verification harness used to confirm byte-exactness.</p>
 <h2 id="why-ancillary-matters"><a class="header" href="#why-ancillary-matters">Why ancillary matters</a></h2>
 <p>Without ancillary, after <code>mithril-import</code> returns the node still has to replay every certified block through its own validator to rebuild:</p>
@@ -202,18 +215,22 @@
 <h2 id="trust-model"><a class="header" href="#trust-model">Trust model</a></h2>
 <p>The ancillary archive is signed and certified by Mithril's threshold multi-signature scheme using the <strong>same</strong> ≥ 2/3 stake-weighted aggregator key that signs the immutable chunks. Concretely:</p>
 <ul>
-<li>Dugite downloads the <code>ancillary.tar.zst</code> from the aggregator's V2 <code>/artifact/cardano-database/{hash}/cardano-database-snapshots</code> endpoint.</li>
-<li>The manifest is a JSON map of <code>filename → SHA-256(content)</code> plus an Ed25519 signature over the sorted key+value pairs, signed by a network-specific ancillary verification key. Dugite verifies the signature before unpacking.</li>
-<li>Per-file SHA-256 hashes are checked against the manifest as files are extracted (<code>mithril.rs::verify_ancillary_manifest</code>).</li>
+<li>Dugite drives the official <code>mithril-client</code> SDK against the aggregator's Cardano Database (V2) API: <code>list()</code> for the snapshot set, <code>get(hash)</code> for the detail (Merkle root, immutables, ancillary), then a download that unpacks the standard cardano-node <code>db/</code> layout — <code>immutable/</code> for chunk files (<code>0..=N</code>, plus the ancillary tip chunk <code>N+1</code>) and <code>ledger/</code> for the Haskell ledger-state snapshot.</li>
+<li>The ancillary archive carries its own Ed25519 manifest signature. Dugite supplies the network's pinned ancillary verification key to the client builder via <code>set_ancillary_verification_key</code>, so the SDK verifies that signature during unpack. Verification is therefore performed inside <code>mithril-client</code>, not by hand in <code>mithril.rs</code>.</li>
+<li>If the network has no pinned ancillary key, the import logs a warning that the ancillary signature cannot be verified and proceeds — it does not abort.</li>
 </ul>
-<p>The Ed25519 verification keys are pinned in source:</p>
-<div class="table-wrapper"><table><thead><tr><th>Network</th><th>Pinned key location</th></tr></thead><tbody>
-<tr><td>Mainnet</td><td><code>crates/dugite-node/src/mithril.rs:2135-2176</code></td></tr>
-<tr><td>Preview</td><td><code>crates/dugite-node/src/mithril.rs:2135-2176</code></td></tr>
-<tr><td>Preprod</td><td><code>crates/dugite-node/src/mithril.rs:2135-2176</code></td></tr>
+<p>The verification keys are pinned in <code>crates/dugite-node/src/mithril.rs</code>:</p>
+<div class="table-wrapper"><table><thead><tr><th>Constant</th><th>Selected by</th></tr></thead><tbody>
+<tr><td><code>MAINNET_GENESIS_VKEY</code> / <code>MAINNET_ANCILLARY_VKEY</code></td><td>network magic 764824073</td></tr>
+<tr><td><code>PREVIEW_GENESIS_VKEY</code> / <code>PREVIEW_ANCILLARY_VKEY</code></td><td>network magic 2</td></tr>
+<tr><td><code>PREPROD_GENESIS_VKEY</code> / <code>PREPROD_ANCILLARY_VKEY</code></td><td>network magic 1</td></tr>
 </tbody></table>
 </div>
-<p>The aggregator's full STM certificate chain is also verified (back to the genesis certificate) when <code>--skip-certificate-verification</code> is not set. This is identical to the trust posture used for the main snapshot.</p>
+<p>The genesis key is resolved by <code>genesis_verification_key()</code> and the ancillary key
+by <code>ancillary_verification_key_hex()</code>. <code>--mithril-genesis-vkey</code> overrides the
+genesis key for private networks; there is no equivalent override for the
+ancillary key.</p>
+<p>The aggregator's full STM certificate chain is also verified — <code>verify_chain()</code> walks every certificate's multi-signature back to the genesis certificate — unless <code>--skip-certificate-verification</code> is set. This is identical to the trust posture used for the main snapshot.</p>
 <p><strong>What we trust when we accept the ancillary</strong></p>
 <p>We trust that <strong>a Haskell cardano-node implementation honestly computed the ledger state at the certified immutable tip and published it.</strong> We do not re-validate the state against our own from-genesis replay before using it.</p>
 <p>This is a stronger trust assumption than the main snapshot alone: the main snapshot is a certified statement that "this chain is canonical and ≥ 2/3 of stake agrees"; the ancillary is a stronger statement that "the state derived by Haskell from this chain is also correct."</p>
@@ -265,7 +282,7 @@ dugite-node mithril-import \
 </li>
 </ol>
 <h3 id="acceptance-status"><a class="header" href="#acceptance-status">Acceptance status</a></h3>
-<p>The harness must PASS for at least one preview boundary AND one preprod boundary before #670 is considered fully verified.</p>
+<p>The harness must PASS for at least one preview boundary AND one preprod boundary before the ancillary path is considered fully verified for a given era.</p>
 <p>Prior to commits in 2026 Q2 (issues #438, #481, #624, #626, #678, #685) the from-genesis replay did not match the Haskell ancillary at all boundaries — the harness reported drift in pot fields (<code>treasury</code>, <code>reserves</code>, <code>epoch_fees</code>) cascading from a missing Babbage→Conway PPUP path that left the on-chain protocol version stuck at 8 in dugite while the canonical chain ran at 9. With those resolved, a preview-mainnet-style chunk replay through to the mithril anchor now reproduces the Haskell ledger byte-exact, including:</p>
 <ul>
 <li>Pots (treasury, reserves, fees, deposits, donation)</li>
@@ -276,17 +293,20 @@ dugite-node mithril-import \
 <li>Stake distribution + per-credential deposits</li>
 </ul>
 <p>Any remaining open epoch-diff issue is a blocker for re-claiming the gate; consult the project tracker before signing off a new release that touches era-translation, governance enactment, or PPUP semantics.</p>
+<p>Note also that the adapter is era-coupled: dugite's runtime types differ from Haskell's HFC-telescope / HKD-parameterised types, so <strong>each new era needs explicit adapter coverage</strong> in <code>from_haskell_snapshot</code> before the ancillary path will work for it. A new era landing upstream is a reason to re-run this harness, not to assume it still holds.</p>
 <h2 id="code-references"><a class="header" href="#code-references">Code references</a></h2>
-<div class="table-wrapper"><table><thead><tr><th>Concern</th><th>File:line</th></tr></thead><tbody>
-<tr><td><code>--include-ancillary</code> CLI flag</td><td><code>crates/dugite-node/src/main.rs:307</code></td></tr>
-<tr><td><code>--no-include-ancillary</code> alias</td><td><code>crates/dugite-node/src/main.rs:325</code></td></tr>
-<tr><td>Ancillary download + verify</td><td><code>crates/dugite-node/src/mithril.rs:2338</code> (<code>download_ancillary</code>)</td></tr>
-<tr><td>Manifest signature verification</td><td><code>crates/dugite-node/src/mithril.rs:2203</code> (<code>verify_ancillary_manifest</code>)</td></tr>
-<tr><td>Per-network ancillary verification keys</td><td><code>crates/dugite-node/src/mithril.rs:2135</code></td></tr>
-<tr><td>Haskell snapshot decoder</td><td><code>crates/dugite-serialization/src/haskell_snapshot/</code></td></tr>
-<tr><td>Adapter (Haskell → dugite types)</td><td><code>crates/dugite-ledger/src/state/mod.rs:697</code> (<code>from_haskell_snapshot</code>)</td></tr>
-<tr><td>Node startup integration</td><td><code>crates/dugite-node/src/node/mod.rs:781</code></td></tr>
-<tr><td><code>verify-ledger-snapshot</code> subcommand</td><td><code>crates/dugite-node/src/main.rs</code> (search <code>VerifyLedgerSnapshot</code>)</td></tr>
+<p>Line numbers are deliberately omitted below — search for the named symbol
+instead, since these files change often.</p>
+<div class="table-wrapper"><table><thead><tr><th>Concern</th><th>Where</th></tr></thead><tbody>
+<tr><td><code>--include-ancillary</code> / <code>--no-include-ancillary</code> CLI flags</td><td><code>crates/dugite-node/src/main.rs</code> (<code>MithrilImportArgs</code>)</td></tr>
+<tr><td>Import driver (list → verify chain → download → place)</td><td><code>crates/dugite-node/src/mithril.rs</code> (<code>import_snapshot</code>)</td></tr>
+<tr><td>Per-network genesis verification keys</td><td><code>crates/dugite-node/src/mithril.rs</code> (<code>genesis_verification_key</code>)</td></tr>
+<tr><td>Per-network ancillary verification keys</td><td><code>crates/dugite-node/src/mithril.rs</code> (<code>ancillary_verification_key_hex</code>)</td></tr>
+<tr><td>Aggregator endpoints</td><td><code>crates/dugite-node/src/mithril.rs</code> (<code>aggregator_url</code>)</td></tr>
+<tr><td>Haskell snapshot decoder</td><td><code>crates/dugite-serialization/src/haskell_snapshot/</code> (<code>decode_state_file</code>)</td></tr>
+<tr><td>Adapter (Haskell → dugite types)</td><td><code>crates/dugite-ledger/src/state/mod.rs</code> (<code>LedgerState::from_haskell_snapshot</code>)</td></tr>
+<tr><td>Node startup integration</td><td><code>crates/dugite-node/src/node/mod.rs</code> (search <code>haskell-ledger</code>)</td></tr>
+<tr><td><code>verify-ledger-snapshot</code> subcommand</td><td><code>crates/dugite-node/src/main.rs</code> (<code>VerifyLedgerSnapshot</code>)</td></tr>
 <tr><td>Comparison harness module</td><td><code>crates/dugite-node/src/verify_snapshot.rs</code></td></tr>
 </tbody></table>
 </div>

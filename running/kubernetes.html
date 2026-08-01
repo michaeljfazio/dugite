@@ -192,9 +192,11 @@
 <p>The chart is published as an OCI artifact on every tagged release. Install directly from the registry:</p>
 <pre><code class="language-bash">helm install dugite-relay \
   oci://ghcr.io/michaeljfazio/charts/dugite-node \
-  --version 0.4.0 \
+  --version 0.9.3 \
   --set network.name=preview
 </code></pre>
+<p>The chart version (<code>0.9.3</code>) and the node version it deploys (<code>appVersion 2.4.3</code>) move independently — check <code>charts/dugite-node/Chart.yaml</code> for the
+current pair. Omit <code>--version</code> to take the latest published chart.</p>
 <p>Or install from a local checkout:</p>
 <pre><code class="language-bash">helm install dugite-relay ./charts/dugite-node \
   --set network.name=preview
@@ -302,6 +304,65 @@ role: producer
       advertise: false
   useLedgerAfterSlot: 102729600   # mainnet=0, preview=102729600, preprod=76723200
 </code></pre>
+<h3 id="peer-targets-and-governor-tuning"><a class="header" href="#peer-targets-and-governor-tuning">Peer targets and governor tuning</a></h3>
+<p>These mirror cardano-node's defaults. Leave them alone unless you have a
+measured reason to change them.</p>
+<pre><code class="language-yaml">network:
+  targetRootPeers: 60
+  targetActivePeers: 20
+  targetEstablishedPeers: 30
+  targetKnownPeers: 150
+  targetActiveBigLedgerPeers: 5
+  targetEstablishedBigLedgerPeers: 10
+  targetKnownBigLedgerPeers: 15
+
+peerGovernor:
+  churnIntervalNormalSecs: 3300   # 55 min
+  churnIntervalSyncSecs: 900      # 15 min
+  stallDemotionCycles: 6          # each ~30s
+  errorDemotionThreshold: 5
+</code></pre>
+<h3 id="probes"><a class="header" href="#probes">Probes</a></h3>
+<pre><code class="language-yaml">livenessProbe:
+  httpGet: { path: /live, port: metrics }
+  initialDelaySeconds: 120
+  periodSeconds: 30
+  failureThreshold: 5
+
+readinessProbe:
+  httpGet: { path: /health, port: metrics }
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  failureThreshold: 3
+</code></pre>
+<p>Both probes are automatically disabled when <code>metrics.enabled=false</code>, since
+they target the metrics port. Liveness uses <code>/live</code> (forward progress —
+restarts a wedged node) rather than <code>/ready</code> (sync progress), so a node that
+is merely still syncing is never restart-looped. See
+<a href="./monitoring.html">Monitoring</a> for the endpoint semantics.</p>
+<h3 id="security-contexts"><a class="header" href="#security-contexts">Security contexts</a></h3>
+<p>The chart runs as non-root with a read-only root filesystem by default:</p>
+<pre><code class="language-yaml">podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile: { type: RuntimeDefault }
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities: { drop: [ALL] }
+</code></pre>
+<p><code>readOnlyRootFilesystem: true</code> is safe because the chart mounts writable
+volumes at <code>/data/db</code>, <code>/ipc</code>, and <code>/tmp</code>.</p>
+<h3 id="networkpolicy"><a class="header" href="#networkpolicy">NetworkPolicy</a></h3>
+<pre><code class="language-yaml">networkPolicy:
+  enabled: true    # only takes effect when role=producer
+</code></pre>
+<p>Set to <code>false</code> if your cluster has no NetworkPolicy controller — otherwise
+the policy is written but silently unenforced, which is worse than not
+having it.</p>
 <h2 id="relay-node-deployment"><a class="header" href="#relay-node-deployment">Relay Node Deployment</a></h2>
 <p>A relay node connects to the Cardano network, syncs blocks, and serves them to connected peers and local clients.</p>
 <h3 id="minimal-relay"><a class="header" href="#minimal-relay">Minimal relay</a></h3>
@@ -368,10 +429,11 @@ role: producer
 <h3 id="producer-security"><a class="header" href="#producer-security">Producer security</a></h3>
 <p>When <code>role=producer</code>, the chart automatically creates a <code>NetworkPolicy</code> that:</p>
 <ul>
-<li>Restricts N2N ingress to pods labeled <code>app.kubernetes.io/component: relay</code>.</li>
-<li>Allows metrics scraping (and, when <code>rpc.service=true</code>, RPC) from anywhere in the cluster.</li>
-<li>Leaves egress unrestricted so the BP can reach its relay(s).</li>
+<li>Restricts N2N ingress to pods labeled <code>app.kubernetes.io/component: relay</code> <strong>in the same namespace</strong> — the rule uses a bare <code>podSelector</code> with no <code>namespaceSelector</code>, so a relay deployed to a different namespace will be blocked.</li>
+<li>Allows metrics scraping (and, when <code>rpc.enabled</code> and <code>rpc.service</code> are both true, RPC) from anywhere in the cluster.</li>
+<li>Declares <code>policyTypes: [Ingress]</code> only, so egress stays unrestricted and the BP can reach its relay(s).</li>
 </ul>
+<p>Set <code>networkPolicy.enabled=false</code> to skip it — for example on a cluster with no NetworkPolicy controller, where an unenforced policy gives false assurance.</p>
 <p>Block producers should <strong>never</strong> be exposed directly to the internet.</p>
 <h3 id="producer--relay-architecture"><a class="header" href="#producer--relay-architecture">Producer + Relay architecture</a></h3>
 <p>A typical production deployment uses one or more relay nodes that shield the block producer:</p>
@@ -441,10 +503,14 @@ grpcurl -plaintext localhost:50051 list
 <tr><td><code>role</code></td><td><code>relay</code></td><td>Node role: <code>relay</code> or <code>producer</code></td></tr>
 <tr><td><code>image.repository</code></td><td><code>ghcr.io/michaeljfazio/dugite</code></td><td>Container image</td></tr>
 <tr><td><code>image.tag</code></td><td>Chart appVersion</td><td>Image tag</td></tr>
+<tr><td><code>replicaCount</code></td><td><code>1</code></td><td>Keep at 1 — a node owns its ChainDB exclusively and does not scale horizontally</td></tr>
+<tr><td><code>socketPath</code></td><td><code>/ipc/node.sock</code></td><td>N2C socket, shared with sidecars via the <code>/ipc</code> emptyDir</td></tr>
 <tr><td><code>network.name</code></td><td><code>preview</code></td><td>Network: <code>mainnet</code>, <code>preview</code>, <code>preprod</code></td></tr>
+<tr><td><code>network.magic</code></td><td><code>null</code></td><td>Auto-derived from <code>network.name</code>; override only for private networks</td></tr>
 <tr><td><code>network.port</code></td><td><code>3001</code></td><td>N2N port</td></tr>
 <tr><td><code>network.diffusionMode</code></td><td><code>InitiatorAndResponder</code></td><td><code>InitiatorOnly</code> for BPs behind NAT</td></tr>
 <tr><td><code>network.peerSharing</code></td><td><code>null</code></td><td><code>true</code>/<code>false</code> to override the relay/BP default</td></tr>
+<tr><td><code>network.targetActivePeers</code></td><td><code>20</code></td><td>Peer governor targets (mirror cardano-node defaults)</td></tr>
 <tr><td><code>mithril.enabled</code></td><td><code>true</code></td><td>Run Mithril import on first start</td></tr>
 <tr><td><code>mithril.includeAncillary</code></td><td><code>true</code></td><td>Download Haskell ledger state (~15 min bootstrap)</td></tr>
 <tr><td><code>ledger.replayLimit</code></td><td><code>null</code></td><td>Max blocks to replay (<code>null</code> = unlimited)</td></tr>
@@ -455,6 +521,9 @@ grpcurl -plaintext localhost:50051 list
 <tr><td><code>experimentalHardForksEnabled</code></td><td><code>false</code></td><td>Signal PV 11 0 in forged headers</td></tr>
 <tr><td><code>persistence.enabled</code></td><td><code>true</code></td><td>Enable persistent storage</td></tr>
 <tr><td><code>persistence.size</code></td><td><code>100Gi</code></td><td>Volume size</td></tr>
+<tr><td><code>persistence.storageClass</code></td><td><code>""</code></td><td>Blank = cluster default</td></tr>
+<tr><td><code>persistence.accessMode</code></td><td><code>ReadWriteOnce</code></td><td></td></tr>
+<tr><td><code>persistence.existingClaim</code></td><td><code>""</code></td><td>Use an existing PVC instead of creating one</td></tr>
 <tr><td><code>metrics.enabled</code></td><td><code>true</code></td><td>Enable Prometheus metrics</td></tr>
 <tr><td><code>metrics.port</code></td><td><code>12796</code></td><td>Metrics port (avoids cardano-node's 12798)</td></tr>
 <tr><td><code>metrics.compat</code></td><td><code>false</code></td><td>Emit <code>cardano_node_metrics_*</code> aliases</td></tr>
@@ -463,9 +532,18 @@ grpcurl -plaintext localhost:50051 list
 <tr><td><code>rpc.port</code></td><td><code>50051</code></td><td>RPC port</td></tr>
 <tr><td><code>rpc.service</code></td><td><code>false</code></td><td>Expose RPC on the cluster Service</td></tr>
 <tr><td><code>logging.format</code></td><td><code>text</code></td><td><code>text</code> or <code>json</code></td></tr>
+<tr><td><code>logging.minSeverity</code></td><td><code>Info</code></td><td><code>Debug</code> … <code>Critical</code></td></tr>
+<tr><td><code>logging.rustLog</code></td><td><code>info</code></td><td><code>EnvFilter</code> directive</td></tr>
 <tr><td><code>producer.existingSecret</code></td><td><code>""</code></td><td>Secret with <code>kes.skey</code> / <code>vrf.skey</code> / <code>node.cert</code></td></tr>
+<tr><td><code>producer.kesKey</code> / <code>vrfKey</code> / <code>operationalCertificate</code></td><td><code>""</code></td><td>Inline key material (chart creates the Secret). Prefer <code>existingSecret</code>.</td></tr>
+<tr><td><code>networkPolicy.enabled</code></td><td><code>true</code></td><td>Create the producer NetworkPolicy (<code>role=producer</code> only)</td></tr>
+<tr><td><code>peerGovernor.churnIntervalNormalSecs</code></td><td><code>3300</code></td><td>Churn interval in steady state</td></tr>
+<tr><td><code>peerGovernor.churnIntervalSyncSecs</code></td><td><code>900</code></td><td>Churn interval while syncing</td></tr>
+<tr><td><code>service.type</code></td><td><code>ClusterIP</code></td><td></td></tr>
+<tr><td><code>serviceAccount.create</code></td><td><code>true</code></td><td></td></tr>
 <tr><td><code>resources.requests.cpu</code></td><td><code>1</code></td><td>CPU request</td></tr>
 <tr><td><code>resources.requests.memory</code></td><td><code>3Gi</code></td><td>Memory request</td></tr>
+<tr><td><code>resources.limits.cpu</code></td><td><code>4</code></td><td>CPU limit</td></tr>
 <tr><td><code>resources.limits.memory</code></td><td><code>16Gi</code></td><td>Memory limit</td></tr>
 </tbody></table>
 </div>

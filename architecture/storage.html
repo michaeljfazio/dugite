@@ -208,6 +208,48 @@
 <li><strong>Secondary indexes</strong> — slot-to-offset and hash-to-slot mappings for efficient lookups</li>
 <li><strong>Memory-mapped block index</strong> — on-disk open-addressing hash table (<code>hash_index.dat</code>) provides 3-5x faster lookups than in-memory HashMap while using near-zero RSS</li>
 </ul>
+<h3 id="crash-recovery--integrity"><a class="header" href="#crash-recovery--integrity">Crash Recovery &amp; Integrity</a></h3>
+<p>A 2026-07-28 preprod incident (a hard stop that lost the active chunk's secondary index and
+wedged sync for every peer) drove a durability hardening pass across the ImmutableDB, shipped in
+v2.4.0 (#926-#929):</p>
+<ul>
+<li><strong>Per-append secondary-index writes</strong> — each block's secondary-index entry is written to disk
+as it is appended (<code>active.secondary_file.write_all(...)</code> per block), not buffered in memory
+until a clean shutdown. Previously a hard stop lost every index entry written since the node
+started, even though the block data itself was already durable.</li>
+<li><strong>Open-time reconciliation in both open paths</strong> — <code>ImmutableDB::open()</code> (read-only) and
+<code>open_for_writing()</code> both run <code>reconcile_chunks_on_disk()</code> before any other file is touched.
+Older versions only validated on the read-only path, so the node's own write-mode startup never
+checked for damage.</li>
+<li><strong>Tail-chunk CRC verification and truncation</strong> — every block in the highest-numbered
+("tail") chunk is CRC32-verified; a chunk's true recoverable end is recovered by scanning for
+the last CRC-matching <code>0x82</code>-envelope boundary, and the file is truncated to that verified
+prefix. Damage strictly below the tail is refused with a hard <code>InconsistentChunk</code> error rather
+than silently repaired.</li>
+<li><strong><code>.chunk.orphaned</code> quarantine</strong> — a non-empty tail chunk with no matching secondary index is
+renamed to <code>&lt;num&gt;.chunk.orphaned</code> and excluded from the chain, preserved on disk for manual
+inspection instead of being silently skipped or overwritten.</li>
+<li><strong>Cross-chunk boundary linkage</strong> — adjacent chunks are checked so the first block of a chunk
+correctly chains onto the previous chunk's tip (<code>prev_hash</code>), the dugite equivalent of
+Haskell's <code>ChunkFileDoesntFit</code>. Per-chunk CRC checks alone are not sufficient to catch this — an
+internally-valid orphan island can still pass every per-chunk check while being disconnected
+from the canonical chain.</li>
+<li><strong><code>tip.meta</code> clamping</strong> — the cached tip metadata is only trusted when it matches the last
+indexed entry's <code>(slot, hash)</code>; otherwise it is clamped to the true indexed tip (recovering the
+correct block number by decoding the tip block) and rewritten.</li>
+<li><strong><code>immutable/clean</code> marker</strong> — a zero-byte <code>clean</code> marker file is written by the shutdown flush
+and removed the moment the DB re-enters write mode. Its presence gates whether the
+memory-mapped <code>hash_index.dat</code> can be reused as-is; its absence (an unclean stop) forces a
+rebuild, since mmap pages may have reached disk in an order that leaves stale offsets behind.</li>
+<li><strong>Exclusive directory lock</strong> — <code>ChainDB::open</code> takes an advisory <code>flock(2)</code> on <code>&lt;database-path&gt;/lock</code>
+before touching any other file (the dugite equivalent of Haskell's <code>withLockDB</code>). A second
+process opening the same <code>--database-path</code> fails fast, naming the holder's pid, instead of both
+processes silently interleaving writes into the same chunk files.</li>
+</ul>
+<p><strong>Operational consequence:</strong> always stop dugite-node with <code>SIGTERM</code>, never <code>SIGKILL</code>. A graceful
+stop runs the shutdown flush (writes the <code>clean</code> marker, fsyncs the tail chunk's index); a killed
+process leaves <code>clean</code> absent and relies entirely on the open-time reconciliation above to recover
+— safe, but strictly more expensive and unnecessary to trigger routinely.</p>
 <h3 id="volatiledb-in-memory-hashmap"><a class="header" href="#volatiledb-in-memory-hashmap">VolatileDB (In-Memory HashMap)</a></h3>
 <p>The VolatileDB stores recent blocks (the last k=2160 blocks) in an in-memory <code>HashMap</code>. This enables:</p>
 <ul>
@@ -223,6 +265,11 @@
 <li>Once a block is more than <strong>k</strong> slots deep (k=2160 for mainnet), it is flushed from the VolatileDB to the <strong>ImmutableDB</strong></li>
 <li>Flushed blocks are removed from the VolatileDB</li>
 </ol>
+<p>The ChainDB write for a new block always happens <strong>before</strong> that block is applied to the ledger
+state — never the reverse. If the node crashes between the two steps, the block is durably stored
+but not yet reflected in the ledger, so recovery simply re-applies it; the opposite ordering could
+leave the ledger ahead of durable storage with no way to recover the block that produced that
+state.</p>
 <p>When querying for a block:</p>
 <ol>
 <li>The VolatileDB is checked first (fast, in-memory)</li>
@@ -285,9 +332,15 @@
 </ol>
 <h2 id="disk-layout"><a class="header" href="#disk-layout">Disk Layout</a></h2>
 <pre><code>database-path/
-  immutable/          # Append-only block chunk files
-    chunks/           # Block data files
-    index/            # Secondary indexes (slot, hash)
+  lock                # Advisory flock held for the ChainDB's lifetime (#929)
+  immutable/          # ImmutableDB — chunk and index files live flat, not nested
+    00000.chunk       # Block data, one file per chunk
+    00000.secondary   # Per-chunk secondary index (slot/hash -&gt; offset), written per block append
+    00001.chunk
+    00001.secondary
+    ...
+    tip.meta          # Cached (slot, hash, block_no) tip — clamped to the indexed chain if stale
+    clean             # Zero-byte marker written on graceful shutdown; absent after a hard stop
     hash_index.dat    # Mmap block index (open-addressing hash table)
   utxo-store/         # dugite-lsm database (UTxO set)
     active/           # Current SSTables

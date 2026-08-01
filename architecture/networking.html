@@ -336,7 +336,7 @@
 <tr><td>35</td><td>QueryStakePoolDefaultVote</td><td>Default vote per pool derived from its DRep delegation (AlwaysAbstain, AlwaysNoConfidence, or specific DRep vote)</td></tr>
 <tr><td>36</td><td>GetPoolDistr2</td><td>Extended pool distribution including <code>total_active_stake</code> alongside per-pool entries</td></tr>
 <tr><td>37</td><td>GetStakeDistribution2</td><td>Extended stake distribution including <code>total_active_stake</code></td></tr>
-<tr><td>38</td><td>GetMaxMajorProtocolVersion</td><td>Maximum supported major protocol version (returns 10)</td></tr>
+<tr><td>38</td><td>GetMaxMajorProtocolVersion</td><td>Maximum supported major protocol version — sourced from the loaded network's protocol-version config, not hardcoded (currently 10 on mainnet, 11 on preview)</td></tr>
 </tbody></table>
 </div>
 <h4 id="cross-era-queries"><a class="header" href="#cross-era-queries">Cross-Era Queries</a></h4>
@@ -391,9 +391,13 @@
 <p>Override with the <code>PeerSharing</code> config field (<code>true</code>/<code>false</code>) if needed.</p>
 <p>The PeerSharing protocol filters out non-routable addresses (RFC1918, CGNAT, loopback, link-local, IPv6 ULA) before sharing.</p>
 <h2 id="peer-manager"><a class="header" href="#peer-manager">Peer Manager</a></h2>
-<p>The peer manager classifies peers into three temperature categories following the cardano-node model:</p>
+<p>The peer manager (<code>crates/dugite-network/src/peer/manager.rs</code>) classifies peers into four
+temperature states, mirroring Haskell's <code>PeerStatus</code> (<code>Cold &lt; Cooling &lt; Warm &lt; Hot</code>):</p>
 <ul>
-<li><strong>Cold</strong> — Known but not connected</li>
+<li><strong>Cold</strong> — Known but not connected; candidate for promotion</li>
+<li><strong>Cooling</strong> — Cold in effect but the connection still lingers (the governor's analogue of the
+connection manager's <code>TerminatingState</code> — dugite's version of TCP <code>TIME_WAIT</code>). Not eligible
+for re-promotion until it transitions to <code>Cold</code>.</li>
 <li><strong>Warm</strong> — TCP connected, keepalive running, but not actively syncing</li>
 <li><strong>Hot</strong> — Fully active with ChainSync, BlockFetch, and TxSubmission2</li>
 </ul>
@@ -401,12 +405,12 @@
 <pre><code class="language-mermaid">stateDiagram-v2
     [*] --&gt; Cold: Discovered
     Cold --&gt; Warm: TCP connect + handshake
-    Warm --&gt; Hot: Mini-protocols activated (5s dwell)
+    Warm --&gt; Hot: Mini-protocols activated
     Hot --&gt; Warm: Demotion (poor performance / churn)
     Warm --&gt; Cold: Disconnection / backoff
-    Cold --&gt; [*]: Evicted (max failures)
+    Hot --&gt; Cooling: Forceful disconnect
+    Cooling --&gt; Cold: Cooldown elapsed
 </code></pre>
-<p>Warm peers must dwell for at least 5 seconds before promotion to Hot, preventing rapid cycling.</p>
 <h3 id="peer-sources"><a class="header" href="#peer-sources">Peer Sources</a></h3>
 <p>Peers enter the Cold pool from four sources:</p>
 <div class="table-wrapper"><table><thead><tr><th>Source</th><th>Description</th></tr></thead><tbody>
@@ -426,13 +430,15 @@
 <li><strong>Latency score</strong> — <code>1 / (1 + ms/200)</code>, based on EWMA latency (smoothing α=0.3)</li>
 <li><strong>Failure score</strong> — <code>max(1.0 - failures×0.1, 0.0)</code>, failure counts decay (halve every 5 minutes)</li>
 </ul>
-<p>Subnet diversity is enforced: peers from the same /24 (IPv4) or /48 (IPv6) subnet receive a selection penalty.</p>
+<p>Separately from this connection-quality score, <code>PeerManager</code> also tracks a per-peer EWMA
+<strong>fetch bandwidth</strong> ("GSV"/"fetchyness", bytes/sec from completed BlockFetch ranges). This is
+what the single-fetcher BlockFetch worker uses to pick the fastest peer during bulk sync — see
+<a href="./sync-pipeline.html">Sync Pipeline</a>.</p>
 <h3 id="failure-handling"><a class="header" href="#failure-handling">Failure Handling</a></h3>
 <ul>
 <li><strong>Exponential backoff</strong> on connection failures: 5s → 10s → 20s → 40s → 80s → 160s (capped), with ±2s random fuzz</li>
 <li><strong>Max cold failures</strong>: 5 consecutive failures before a peer is evicted from the peer table</li>
 <li><strong>Failure decay</strong>: Failure counts halve every 5 minutes, allowing peers to recover reputation over time</li>
-<li><strong>Circuit breaker</strong>: Closed → Open → HalfOpen with exponential cooldown</li>
 </ul>
 <h3 id="inbound-connections"><a class="header" href="#inbound-connections">Inbound Connections</a></h3>
 <ul>
@@ -441,18 +447,21 @@
 <li><code>DiffusionMode</code> controls whether inbound connections are accepted</li>
 </ul>
 <h2 id="p2p-governor"><a class="header" href="#p2p-governor">P2P Governor</a></h2>
-<p>The governor runs as a tokio task on a 30-second interval, continuously evaluating peer counts against configured targets and emitting promotion/demotion/connect/disconnect actions.</p>
+<p>The governor runs as a tokio task on a 2-second interval, continuously evaluating peer counts against configured targets and emitting promotion/demotion/connect/disconnect actions. (Churn — periodic rotation of otherwise-healthy peers — runs on its own, much longer cadence; see below.)</p>
 <h3 id="target-counts"><a class="header" href="#target-counts">Target Counts</a></h3>
 <p>The governor maintains six independent target counts (matching cardano-node defaults):</p>
 <div class="table-wrapper"><table><thead><tr><th>Target</th><th>Default</th><th>Description</th></tr></thead><tbody>
-<tr><td><code>TargetNumberOfKnownPeers</code></td><td>85</td><td>Total peers in the peer table (cold + warm + hot)</td></tr>
-<tr><td><code>TargetNumberOfEstablishedPeers</code></td><td>40 (30 on preview)</td><td>Warm + hot peers (TCP connected)</td></tr>
-<tr><td><code>TargetNumberOfActivePeers</code></td><td>15</td><td>Hot peers (fully syncing)</td></tr>
+<tr><td><code>TargetNumberOfKnownPeers</code></td><td>150</td><td>Total peers in the peer table (cold + warm + hot)</td></tr>
+<tr><td><code>TargetNumberOfEstablishedPeers</code></td><td>30</td><td>Warm + hot peers (TCP connected)</td></tr>
+<tr><td><code>TargetNumberOfActivePeers</code></td><td>20</td><td>Hot peers (fully syncing)</td></tr>
 <tr><td><code>TargetNumberOfKnownBigLedgerPeers</code></td><td>15</td><td>Known big ledger peers</td></tr>
 <tr><td><code>TargetNumberOfEstablishedBigLedgerPeers</code></td><td>10</td><td>Established big ledger peers</td></tr>
 <tr><td><code>TargetNumberOfActiveBigLedgerPeers</code></td><td>5</td><td>Active big ledger peers</td></tr>
 </tbody></table>
 </div>
+<p>During Genesis-mode sync (<code>PreSyncing</code>/<code>Syncing</code>), a separate, smaller set of <code>sync_target_*</code>
+values applies instead (active=5, established=10, known=150), concentrating the peer set on
+big-ledger peers until the node catches up.</p>
 <p>When any target is not met, the governor promotes peers to fill the deficit. When any target is exceeded, the governor demotes the lowest-scoring surplus peers. Local root peers are never demoted.</p>
 <h3 id="sync-state-aware-targeting"><a class="header" href="#sync-state-aware-targeting">Sync-State-Aware Targeting</a></h3>
 <p>The governor adjusts behaviour based on sync state:</p>
@@ -463,14 +472,16 @@
 <h3 id="churn"><a class="header" href="#churn">Churn</a></h3>
 <p>The governor periodically rotates a subset of peers to discover better alternatives:</p>
 <ul>
-<li>Configurable churn interval (default: 20% target reduction cycle)</li>
+<li><strong>Normal (caught-up) cadence</strong>: every 3300s (55 minutes), matching cardano-node's <code>ChurnIntervalNormalSecs</code></li>
+<li><strong>Bulk-sync cadence</strong>: every 900s (15 minutes) while behind tip, matching <code>ChurnIntervalSyncSecs</code> — more aggressive so peers with poor block-fetch performance are shed faster</li>
+<li>Both cadences are reloadable at runtime via <code>SIGHUP</code></li>
 <li>Local root peers are exempt from churn</li>
 <li>Churn ensures the node explores the peer landscape rather than settling on suboptimal connections</li>
 </ul>
+<p>See <a href="./p2p-governor.html">P2P Governor</a> for the full peer-manager and governor implementation details.</p>
 <h3 id="prometheus-metrics"><a class="header" href="#prometheus-metrics">Prometheus Metrics</a></h3>
 <p>The P2P subsystem exports the following metrics:</p>
 <div class="table-wrapper"><table><thead><tr><th>Metric</th><th>Description</th></tr></thead><tbody>
-<tr><td><code>dugite_p2p_enabled</code></td><td>Whether P2P governance is active (gauge: 0 or 1)</td></tr>
 <tr><td><code>dugite_diffusion_mode</code></td><td>Current diffusion mode (0=InitiatorOnly, 1=InitiatorAndResponder)</td></tr>
 <tr><td><code>dugite_peer_sharing_enabled</code></td><td>Whether peer sharing is active (gauge: 0 or 1)</td></tr>
 <tr><td><code>dugite_peers_cold</code></td><td>Number of cold (known, unconnected) peers</td></tr>
@@ -505,7 +516,11 @@
 <h2 id="block-relay"><a class="header" href="#block-relay">Block Relay</a></h2>
 <p>Dugite implements full relay node behavior, propagating blocks received from upstream peers to all downstream N2N connections. This ensures that blocks flow through the network without requiring every node to sync directly from the block producer.</p>
 <h3 id="broadcast-architecture"><a class="header" href="#broadcast-architecture">Broadcast Architecture</a></h3>
-<p>Block propagation uses a <code>tokio::sync::broadcast</code> channel with a capacity of 64 announcements. The architecture has three components:</p>
+<p>Block propagation uses a <code>tokio::sync::broadcast</code> channel with a capacity of 512 announcements
+(raised from an original 64 to absorb burst fork events without triggering the receiver's lagged
+path, which would otherwise hand a downstream peer an incorrect rollback point). A parallel
+rollback-announcement channel has capacity 256 (raised from 16). The architecture has three
+components:</p>
 <ol>
 <li><strong>Sender</strong> — The node core holds a <code>broadcast::Sender&lt;BlockAnnouncement&gt;</code> obtained from the N2N server at startup. When the sync pipeline processes new blocks or the forge module produces a new block, it sends an announcement containing the slot, block hash, and block number.</li>
 <li><strong>Receivers</strong> — Each N2N server connection spawns with its own <code>broadcast::Receiver</code> subscription. The connection handler uses <code>tokio::select!</code> to concurrently service mini-protocol messages and listen for block announcements.</li>

@@ -181,6 +181,21 @@
                     <main>
                         <h1 id="key-generation"><a class="header" href="#key-generation">Key Generation</a></h1>
 <p>Dugite CLI supports generating all key types needed for Cardano operations.</p>
+<blockquote>
+<p><strong>The <code>key</code> group is a dugite extension.</strong> <code>key generate-payment-key</code>,
+<code>key generate-stake-key</code>, and <code>key verification-key-hash</code> have no
+cardano-cli counterpart — they are additive convenience commands. The
+cardano-cli equivalents are also implemented and produce compatible
+output:</p>
+<div class="table-wrapper"><table><thead><tr><th>dugite extension</th><th>cardano-cli equivalent</th></tr></thead><tbody>
+<tr><td><code>key generate-payment-key</code></td><td><code>address key-gen</code></td></tr>
+<tr><td><code>key generate-stake-key</code></td><td><code>stake-address key-gen</code></td></tr>
+<tr><td><code>key verification-key-hash</code></td><td><code>address key-hash</code> / <code>stake-address key-hash</code></td></tr>
+</tbody></table>
+</div>
+<p>Scripts written against cardano-cli never need the <code>key</code> group; it exists
+because it is convenient and already in use.</p>
+</blockquote>
 <h2 id="payment-keys"><a class="header" href="#payment-keys">Payment Keys</a></h2>
 <p>Generate an Ed25519 key pair for payments:</p>
 <pre><code class="language-bash">dugite-cli key generate-payment-key \
@@ -192,6 +207,7 @@
 <li><code>payment.skey</code> — Payment signing key (keep secret)</li>
 <li><code>payment.vkey</code> — Payment verification key (safe to share)</li>
 </ul>
+<p>The cardano-cli-compatible equivalent is <code>dugite-cli address key-gen --verification-key-file payment.vkey --signing-key-file payment.skey</code>.</p>
 <h2 id="stake-keys"><a class="header" href="#stake-keys">Stake Keys</a></h2>
 <p>Generate an Ed25519 key pair for staking:</p>
 <pre><code class="language-bash">dugite-cli key generate-stake-key \
@@ -203,12 +219,20 @@
 <li><code>stake.skey</code> — Stake signing key</li>
 <li><code>stake.vkey</code> — Stake verification key</li>
 </ul>
+<p>The cardano-cli-compatible equivalent is <code>dugite-cli stake-address key-gen --verification-key-file stake.vkey --signing-key-file stake.skey</code> (see
+<a href="stake-address.html">Stake Address Commands</a>).</p>
 <h2 id="verification-key-hash"><a class="header" href="#verification-key-hash">Verification Key Hash</a></h2>
 <p>Compute the Blake2b-224 hash of any verification key:</p>
 <pre><code class="language-bash">dugite-cli key verification-key-hash \
   --verification-key-file payment.vkey
 </code></pre>
 <p>This outputs the 28-byte key hash in hexadecimal, used in addresses and certificates.</p>
+<p>Only Ed25519 verification-key envelope types are accepted (payment, stake,
+stake pool, genesis, genesis-delegate, genesis-UTxO, DRep, and CC cold/hot
+verification keys). Signing keys and KES/VRF verification keys are rejected
+with an error naming the offending envelope <code>type</code> — VRF key hashes use a
+different convention and are computed with <code>node key-hash-VRF</code> instead (see
+<a href="node-commands.html">Node Commands</a>).</p>
 <h2 id="drep-keys"><a class="header" href="#drep-keys">DRep Keys</a></h2>
 <p>Generate keys for a Delegated Representative (Conway governance):</p>
 <pre><code class="language-bash">dugite-cli governance drep key-gen \
@@ -226,22 +250,32 @@ dugite-cli governance drep id \
   --output-format hex
 </code></pre>
 <h2 id="node-keys"><a class="header" href="#node-keys">Node Keys</a></h2>
+<p>See <a href="node-commands.html">Node Commands</a> for the full flag reference, including
+<code>--key-output-bech32</code> / <code>--key-output-text-envelope</code> and the canonical
+<code>--operational-certificate-issue-counter-file</code> spelling. The short version:</p>
 <h3 id="cold-keys"><a class="header" href="#cold-keys">Cold Keys</a></h3>
 <p>Generate cold keys and an operational certificate issue counter:</p>
 <pre><code class="language-bash">dugite-cli node key-gen \
   --cold-verification-key-file cold.vkey \
   --cold-signing-key-file cold.skey \
-  --operational-certificate-counter-file opcert.counter
+  --operational-certificate-issue-counter-file opcert.counter
 </code></pre>
+<p><code>--operational-certificate-issue-counter-file</code> is the cardano-cli-canonical
+spelling; <code>--operational-certificate-issue-counter</code> and
+<code>--operational-certificate-counter-file</code> are accepted as aliases.</p>
 <h3 id="kes-keys"><a class="header" href="#kes-keys">KES Keys</a></h3>
-<p>Generate Key Evolving Signature keys (rotated periodically):</p>
-<pre><code class="language-bash">dugite-cli node key-gen-kes \
+<p>Generate Key Evolving Signature keys (rotated periodically). The canonical
+cardano-cli subcommand casing is <code>key-gen-KES</code> (cardano-cli rejects
+lowercase); dugite additionally accepts <code>key-gen-kes</code> as a backward-compatible
+alias:</p>
+<pre><code class="language-bash">dugite-cli node key-gen-KES \
   --verification-key-file kes.vkey \
   --signing-key-file kes.skey
 </code></pre>
 <h3 id="vrf-keys"><a class="header" href="#vrf-keys">VRF Keys</a></h3>
-<p>Generate Verifiable Random Function keys (for slot leader election):</p>
-<pre><code class="language-bash">dugite-cli node key-gen-vrf \
+<p>Generate Verifiable Random Function keys (for slot leader election). Canonical
+casing is <code>key-gen-VRF</code>, with <code>key-gen-vrf</code> accepted as an alias:</p>
+<pre><code class="language-bash">dugite-cli node key-gen-VRF \
   --verification-key-file vrf.vkey \
   --signing-key-file vrf.skey
 </code></pre>
@@ -250,7 +284,7 @@ dugite-cli governance drep id \
 <pre><code class="language-bash">dugite-cli node issue-op-cert \
   --kes-verification-key-file kes.vkey \
   --cold-signing-key-file cold.skey \
-  --operational-certificate-counter-file opcert.counter \
+  --operational-certificate-issue-counter-file opcert.counter \
   --kes-period 400 \
   --out-file opcert.cert
 </code></pre>
@@ -274,6 +308,22 @@ dugite-cli address build \
   --stake-verification-key-file stake.vkey \
   --mainnet
 </code></pre>
+<p><code>--mainnet</code> and <code>--testnet-magic &lt;NATURAL&gt;</code> are mutually exclusive
+(cardano-cli compatible). Instead of a key file, the payment and stake keys
+can be passed inline as a bech32 or hex string:</p>
+<pre><code class="language-bash">dugite-cli address build \
+  --payment-verification-key "addr_vk1..." \
+  --stake-verification-key "stake_vk1..." \
+  --mainnet
+</code></pre>
+<p>dugite additionally accepts a <code>--network mainnet|testnet</code> flag (its own
+extension, predating <code>--mainnet</code>/<code>--testnet-magic</code>) and, when none of
+<code>--mainnet</code>, <code>--testnet-magic</code>, or <code>--network</code> is given, falls back to the
+<code>CARDANO_NODE_NETWORK_ID</code> environment variable (<code>mainnet</code> or a magic number),
+matching cardano-cli. Resolution order: explicit flags, then <code>--network</code>,
+then <code>CARDANO_NODE_NETWORK_ID</code>, then mainnet. An unrecognized value from any
+of these sources is a hard error naming the accepted forms — it never falls
+back to testnet silently.</p>
 <h2 id="key-file-format"><a class="header" href="#key-file-format">Key File Format</a></h2>
 <p>All keys are stored in the cardano-node text envelope format:</p>
 <pre><code class="language-json">{

@@ -184,7 +184,7 @@
 <h2 id="architecture"><a class="header" href="#architecture">Architecture</a></h2>
 <p>A block producer is never directly exposed to the public internet. Instead, it sits behind one or more <a href="./relay.html">relay nodes</a> that handle all external network connectivity. The relays forward blocks and transactions to the BP over a private network, and the BP announces forged blocks back through the relays.</p>
 <blockquote>
-<p><strong>Status (2026-05-09):</strong> Dugite block forging is operational and on-chain verified. Block 4265661 at slot 111661041 was forged by Dugite, accepted by the network, and confirmed on the canonical chain (Conway era, 1 tx, built upon by a subsequent block). Ongoing soak testing continues on the preview testnet via Sandstone Pool ([SAND], pool ID <code>6954ec11cf7097a693721104139b96c54e7f3e2a8f9e7577630f7856</code>).</p>
+<p><strong>Status:</strong> Dugite block forging is operational and on-chain verified. Block 4265661 at slot 111661041 was forged by Dugite, accepted by the network, and confirmed on the canonical chain (Conway era, 1 tx, built upon by a subsequent block). Ongoing soak testing runs via Sandstone Pool [SAND] on both public testnets — preview (pool ID <code>6954ec11cf7097a693721104139b96c54e7f3e2a8f9e7577630f7856</code>) and preprod. Forged blocks are additionally cross-validated byte-for-byte against cardano-node on the <a href="./local-testnet.html">local devnet</a> before every release.</p>
 </blockquote>
 <p>See the <a href="#complete-deployment">Complete Deployment</a> section at the bottom of this page for the full architecture diagram and setup checklist.</p>
 <h2 id="overview"><a class="header" href="#overview">Overview</a></h2>
@@ -201,36 +201,53 @@
 <pre><code class="language-bash">dugite-cli node key-gen \
   --cold-verification-key-file cold.vkey \
   --cold-signing-key-file cold.skey \
-  --operational-certificate-counter-file opcert.counter
+  --operational-certificate-issue-counter-file opcert.counter
 </code></pre>
+<blockquote>
+<p><code>--operational-certificate-issue-counter-file</code> is the cardano-cli canonical
+spelling. The bare <code>--operational-certificate-issue-counter</code> and the legacy
+dugite spelling <code>--operational-certificate-counter-file</code> are both still
+accepted as aliases.</p>
+</blockquote>
 <h3 id="kes-keys-hot"><a class="header" href="#kes-keys-hot">KES Keys (Hot)</a></h3>
-<p>KES (Key Evolving Signature) keys are rotated periodically. Each KES key is valid for a limited number of KES periods (typically 62 periods of 129600 slots each on mainnet, approximately 90 days total).</p>
+<p>KES (Key Evolving Signature) keys are rotated periodically. Each KES key is valid for <code>maxKESEvolutions</code> periods of <code>slotsPerKESPeriod</code> slots each. On mainnet, preprod, and preview alike this is <strong>62 periods of 129,600 slots</strong> — about 93 days.</p>
 <p>Generate KES keys:</p>
-<pre><code class="language-bash">dugite-cli node key-gen-kes \
+<pre><code class="language-bash">dugite-cli node key-gen-KES \
   --verification-key-file kes.vkey \
   --signing-key-file kes.skey
 </code></pre>
 <h3 id="vrf-keys"><a class="header" href="#vrf-keys">VRF Keys</a></h3>
 <p>VRF (Verifiable Random Function) keys are used for slot leader election. They are generated once and do not need rotation.</p>
 <p>Generate VRF keys:</p>
-<pre><code class="language-bash">dugite-cli node key-gen-vrf \
+<pre><code class="language-bash">dugite-cli node key-gen-VRF \
   --verification-key-file vrf.vkey \
   --signing-key-file vrf.skey
 </code></pre>
+<blockquote>
+<p><code>key-gen-KES</code>, <code>key-gen-VRF</code>, and <code>key-hash-VRF</code> use cardano-cli's canonical
+mixed-case spelling. All-lowercase forms are accepted as aliases.</p>
+</blockquote>
 <h2 id="operational-certificate"><a class="header" href="#operational-certificate">Operational Certificate</a></h2>
 <p>The operational certificate binds the cold key to the current KES key. It must be regenerated each time the KES key is rotated.</p>
 <p>Issue an operational certificate:</p>
 <pre><code class="language-bash">dugite-cli node issue-op-cert \
   --kes-verification-key-file kes.vkey \
   --cold-signing-key-file cold.skey \
-  --operational-certificate-counter-file opcert.counter \
+  --operational-certificate-issue-counter-file opcert.counter \
   --kes-period &lt;current-kes-period&gt; \
   --out-file opcert.cert
 </code></pre>
 <p>The <code>--kes-period</code> should be set to the current KES period at the time of issuance. You can calculate the current KES period as:</p>
 <pre><code>current_kes_period = current_slot / slots_per_kes_period
 </code></pre>
-<p>On mainnet, <code>slots_per_kes_period</code> is 129600.</p>
+<p><code>slotsPerKESPeriod</code> is 129,600 on mainnet, preprod, and preview.</p>
+<p>Rather than computing it by hand, ask a running node:</p>
+<pre><code class="language-bash">dugite-cli query kes-period-info \
+  --op-cert-file opcert.cert \
+  --socket-path ./node.sock \
+  --testnet-magic 1
+</code></pre>
+<p>This reads the opcert, decodes its counter and issue period, queries the node for the current KES period (<code>GetCurrentKESPeriod</code>), and reports whether the certificate is valid, expired, or not yet valid — matching <code>cardano-cli query kes-period-info</code>.</p>
 <h2 id="running-as-block-producer"><a class="header" href="#running-as-block-producer">Running as Block Producer</a></h2>
 <p>Pass the key and certificate paths when starting the node:</p>
 <pre><code class="language-bash">dugite-node run \
@@ -245,6 +262,7 @@
   --shelley-operational-certificate opcert.cert
 </code></pre>
 <p>When all three arguments are provided, the node enters block production mode. Without them, it operates as a relay-only node.</p>
+<p>An optional fourth flag, <code>--shelley-cold-key &lt;FILE&gt;</code>, points at the cold <em>signing</em> key and is used only to derive the pool ID for logging and the <code>dugite_pool_id_info</code> metric. It is not required for forging — and on a properly secured setup the cold key lives on an air-gapped machine, so most operators leave it unset.</p>
 <h2 id="block-producer-topology"><a class="header" href="#block-producer-topology">Block Producer Topology</a></h2>
 <p>A block producer should not be directly exposed to the public internet. Instead, it should connect only to your relay nodes:</p>
 <pre><code class="language-json">{
@@ -273,52 +291,73 @@
 <li><strong>Only local roots</strong> — All connections are to your own relay nodes.</li>
 </ul>
 <h2 id="leader-schedule"><a class="header" href="#leader-schedule">Leader Schedule</a></h2>
-<p>You can compute your pool's leader schedule for an epoch:</p>
+<p>You can compute your pool's leader schedule against a running node:</p>
 <pre><code class="language-bash">dugite-cli query leadership-schedule \
+  --socket-path ./node.sock \
+  --testnet-magic 1 \
+  --genesis config/preprod/shelley-genesis.json \
   --vrf-signing-key-file vrf.skey \
-  --epoch-nonce &lt;64-char-hex&gt; \
-  --epoch-start-slot &lt;slot&gt; \
-  --epoch-length 432000 \
-  --relative-stake 0.001 \
-  --active-slot-coeff 0.05
+  --stake-pool-id &lt;pool-id-hex&gt; \
+  --current
 </code></pre>
-<p>This outputs all slots where your pool is elected to produce a block in the given epoch.</p>
+<p>Required: <code>--genesis</code> (Shelley genesis path) and <code>--vrf-signing-key-file</code>. Identify the pool with either <code>--stake-pool-id</code> or <code>--cold-verification-key-file</code>. Choose the epoch with <code>--current</code> or <code>--next</code>. Output defaults to JSON; use <code>--output-text</code> for the human-readable table, and <code>--out-file</code> to write to disk.</p>
+<p>This outputs all slots where your pool is elected to produce a block in the given epoch. The nonce, epoch boundaries, and stake distribution are read from the node — they are not passed as flags.</p>
 <h2 id="kes-key-rotation"><a class="header" href="#kes-key-rotation">KES Key Rotation</a></h2>
-<p>KES keys must be rotated before they expire. The rotation process:</p>
+<p>KES keys must be rotated before they expire. A key issued at period <code>N</code> is valid for periods <code>N</code> through <code>N + 61</code> (<code>maxKESEvolutions = 62</code>). At 129,600 slots per period and 1-second slots, that is roughly <strong>93 days</strong>.</p>
+<h3 id="when-to-rotate"><a class="header" href="#when-to-rotate">When to rotate</a></h3>
+<p>Check where you stand at any time:</p>
+<pre><code class="language-bash">dugite-cli query kes-period-info \
+  --op-cert-file opcert.cert \
+  --socket-path ./node.sock \
+  --testnet-magic 1
+</code></pre>
+<p>Plan the rotation about two weeks before the expiry period. Missing it is not a soft failure: once the current KES period passes <code>startPeriod + 62</code>, the node can no longer sign headers and the pool silently stops producing blocks.</p>
+<h3 id="rotation-procedure"><a class="header" href="#rotation-procedure">Rotation procedure</a></h3>
 <ol>
 <li>
 <p>Generate new KES keys:</p>
-<pre><code class="language-bash">dugite-cli node key-gen-kes \
+<pre><code class="language-bash">dugite-cli node key-gen-KES \
   --verification-key-file kes-new.vkey \
   --signing-key-file kes-new.skey
 </code></pre>
 </li>
 <li>
-<p>Issue a new operational certificate with the new KES key (on the air-gapped machine):</p>
+<p>Issue a new operational certificate with the new KES key (on the air-gapped machine, where <code>cold.skey</code> lives):</p>
 <pre><code class="language-bash">dugite-cli node issue-op-cert \
   --kes-verification-key-file kes-new.vkey \
   --cold-signing-key-file cold.skey \
-  --operational-certificate-counter-file opcert.counter \
+  --operational-certificate-issue-counter-file opcert.counter \
   --kes-period &lt;current-kes-period&gt; \
   --out-file opcert-new.cert
 </code></pre>
+<p><code>issue-op-cert</code> increments the counter file in place. Carry the <strong>updated</strong> <code>opcert.counter</code> back to the air-gapped store — reusing a stale counter produces a certificate the network rejects.</p>
 </li>
 <li>
-<p>Replace the KES key and certificate on the block producer and restart:</p>
+<p>Copy <code>kes-new.skey</code> and <code>opcert-new.cert</code> to the block producer, replace the live files, and restart:</p>
 <pre><code class="language-bash">cp kes-new.skey kes.skey
 cp opcert-new.cert opcert.cert
-# Restart the node
+# Restart the node (SIGTERM, never SIGKILL — see the warning below)
 </code></pre>
 </li>
+<li>
+<p>Confirm the new cert took effect:</p>
+<pre><code class="language-bash">dugite-cli query kes-period-info --op-cert-file opcert.cert --socket-path ./node.sock --testnet-magic 1
+</code></pre>
+<p>The node also logs the operational certificate sequence number and KES period at startup.</p>
+</li>
 </ol>
-<blockquote>
-<p><strong>Important:</strong> Always rotate KES keys before they expire. If a KES key expires, your pool will stop producing blocks until a new key is issued.</p>
-</blockquote>
+<h3 id="practicalities"><a class="header" href="#practicalities">Practicalities</a></h3>
+<ul>
+<li><strong>Rotation requires a restart.</strong> There is no hot-reload path for forging credentials. Schedule it in a slot where you are not expected to be leader, and keep the restart short — a Mithril-seeded node rejoins in well under a minute, but a cold replay does not.</li>
+<li><strong>Stop with <code>SIGTERM</code>, never <code>SIGKILL</code>.</strong> A hard kill can leave the ImmutableDB's active-chunk index unflushed. The node reconciles this at open, but a clean shutdown avoids the recovery path entirely.</li>
+<li><strong>The counter is the state that matters.</strong> KES keys are cheap to regenerate; a desynchronised issue counter is what actually locks you out. Back up <code>opcert.counter</code> alongside the cold key.</li>
+<li><strong>Rotate the KES key, not the VRF key.</strong> VRF keys are permanent — regenerating one changes your leader schedule and effectively orphans the pool's registration.</li>
+</ul>
 <h2 id="security-recommendations"><a class="header" href="#security-recommendations">Security Recommendations</a></h2>
 <ul>
 <li>Keep cold keys on an air-gapped machine. They are only needed to issue new operational certificates.</li>
 <li>Restrict access to the block producer machine. Only your relay nodes should be able to connect.</li>
-<li>Monitor your pool's block production. Use the <a href="./monitoring.html">Prometheus metrics endpoint</a> to track <code>dugite_blocks_applied_total</code>.</li>
+<li>Monitor your pool's block production. Use the <a href="./monitoring.html">Prometheus metrics endpoint</a> to track <code>dugite_blocks_forged_total</code> (blocks <em>this node minted</em>) alongside <code>dugite_leader_checks_total</code> and <code>dugite_forge_failures_total</code>. <code>dugite_blocks_applied_total</code> counts every block applied from any source, so it tells you nothing about your own forging.</li>
 <li>Set up KES key rotation reminders well before expiry (2 weeks in advance is a good practice).</li>
 <li>Use firewalls to ensure the block producer is not reachable from the public internet.</li>
 </ul>

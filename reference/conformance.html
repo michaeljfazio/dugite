@@ -204,22 +204,37 @@ dugite-conformance test harness (DUGITE_REQUIRE_UPSTREAM=1)
 </code></pre>
 <p>Upstream sources are pinned by commit SHA (or tag) in <code>tests/conformance/upstream/sources.toml</code>. The <code>regenerate-conformance-corpus</code> workflow consumes those pins, materialises the seven fixture areas into tarballs, and publishes them as assets of a single dugite GitHub release. Consumers (CI and local developers alike) then pin to that <em>release tag</em> via <code>tests/conformance/upstream/manifest.toml</code>, so a single fetch lands every fixture area at a known good combination. Tarballs are cached by content hash of <code>manifest.toml</code>, so bumping the tag invalidates the cache automatically.</p>
 <p>This two-level pinning separates "what upstream version we test against" (<code>sources.toml</code>, only changes when we want to bump) from "what corpus the test run consumed" (<code>manifest.toml</code>, deterministic and cacheable).</p>
+<p>Fixtures land in <code>tests/conformance/upstream/fixtures/</code>, which is gitignored — nothing in the corpus is committed. To fetch a single area rather than all seven, use <code>just download-upstream-fixtures-area &lt;AREA&gt;</code> (equivalently <code>cargo xtask download-upstream-fixtures --area &lt;AREA&gt;</code>), where <code>&lt;AREA&gt;</code> is one of the seven area names listed below.</p>
 <h2 id="status"><a class="header" href="#status">Status</a></h2>
 <div class="table-wrapper"><table><thead><tr><th>Area</th><th>Source</th><th>Coverage</th><th>Status</th></tr></thead><tbody>
-<tr><td>UPLC (Plutus)</td><td>IntersectMBO/plutus</td><td>999 evaluation cases</td><td>100% — skip list empty</td></tr>
+<tr><td>UPLC (Plutus)</td><td>IntersectMBO/plutus</td><td>1003 evaluation cases</td><td>100% — skip list empty</td></tr>
 <tr><td>ouroboros-consensus</td><td>IntersectMBO/ouroboros-consensus</td><td>Block / header golden files per era</td><td>passing</td></tr>
 <tr><td>cardano-ledger</td><td>IntersectMBO/cardano-ledger</td><td>Genesis JSON, CDDL schema, golden transactions</td><td>passing</td></tr>
 <tr><td>cardano-node</td><td>IntersectMBO/cardano-node</td><td>Genesis spec files</td><td>passing</td></tr>
-<tr><td>ledger-rules (ImpSpec)</td><td>IntersectMBO/cardano-ledger</td><td>CBOR NEWEPOCH + LEDGER vectors from ImpSpec</td><td>passing — <code>SKIP_LIST</code> empty</td></tr>
+<tr><td>ledger-rules (ImpSpec)</td><td>IntersectMBO/cardano-ledger</td><td>~8100 CBOR STS-rule vectors from ImpSpec, across 11 rule families</td><td>passing — <code>SKIP_LIST</code> empty</td></tr>
 <tr><td>cardano-base</td><td>IntersectMBO/cardano-base</td><td>VRF v03 crypto test vectors</td><td>passing</td></tr>
 <tr><td>mithril</td><td>input-output-hk/mithril</td><td>Certificate fixture JSON</td><td>passing</td></tr>
 </tbody></table>
 </div>
 <h2 id="per-area-detail"><a class="header" href="#per-area-detail">Per-area detail</a></h2>
+<p><code>just test-conformance</code> is the whole suite: <code>test-conformance-uplc</code> (crate
+<code>dugite-uplc</code>, <code>--test conformance</code>) plus <code>test-conformance-upstream</code> (crate
+<code>dugite-conformance</code>, <code>--test upstream_tests</code>). The six single-area recipes
+below are nextest filters over the latter. Because they are filters, nextest
+reports the other areas as <strong>skipped</strong> — that is the filter working, not a
+coverage gap.</p>
 <h3 id="uplc-plutus"><a class="header" href="#uplc-plutus">UPLC (Plutus)</a></h3>
-<p><strong>Source:</strong> <a href="https://github.com/IntersectMBO/plutus">IntersectMBO/plutus</a>, pinned to tag <code>1.65.0.0</code> in <code>sources.toml</code>.</p>
-<p><strong>What's validated:</strong> 999 evaluation test cases from <code>plutus-conformance/test-cases/uplc/evaluation/</code>. Each test case provides a UPLC program and the expected result (a term, a budget exhaustion, or a specific runtime error). The dugite-uplc CEK machine evaluates each program and the harness compares term-for-term, budget-for-budget against the expected output.</p>
-<p><strong>Status:</strong> 100% passing. The skip list is empty as of v1.7.0. The harness covers normalisation by evaluation (NbE) readback, per-builtin cost model wiring, CIP-122 bit ordering, BLS LE scalar handling with null augmentation, and BIP-340 <code>verify_raw</code> semantics (not the SHA-256-wrapped <code>verify</code>).</p>
+<p><strong>Source:</strong> <a href="https://github.com/IntersectMBO/plutus">IntersectMBO/plutus</a>, pinned to tag <code>1.66.0.0</code> in <code>sources.toml</code>.</p>
+<p><strong>What's validated:</strong> 1003 evaluation test cases from <code>plutus-conformance/test-cases/uplc/evaluation/</code>. Each test case provides a UPLC program and the expected result (a term, a budget exhaustion, or a specific runtime error). The dugite-uplc CEK machine evaluates each program and the harness compares term-for-term, budget-for-budget against the expected output.</p>
+<p><strong>Status:</strong> 100% passing. The skip list (<code>crates/dugite-uplc/tests/conformance_skip.txt</code>) has been empty since v1.7.0 — it currently contains only comments. The build script fails loudly if a skip entry names a directory that is not in the downloaded corpus, so a stale entry cannot silently hide a fix. The harness covers normalisation by evaluation (NbE) readback, per-builtin cost model wiring, CIP-122 bit ordering, BLS LE scalar handling with null augmentation, and BIP-340 <code>verify_raw</code> semantics (not the SHA-256-wrapped <code>verify</code>).</p>
+<blockquote>
+<p><strong>This pin is version-coupled, not just a version bump.</strong> The UPLC parser
+(<code>syn::parser::parse_value_literal</code>) tracks the corpus's own semantics —
+1.66.0.0 reworked <code>builtin/constant/value</code> (<code>key-*</code> → <code>currencyID-*</code> /
+<code>tokenID-*</code>) and changed non-canonical <code>value</code> literals from <em>normalised</em> to
+<em>rejected</em>. <code>sources.toml</code> and <code>manifest.toml</code> must therefore advance
+together; bumping one alone breaks the suite.</p>
+</blockquote>
 <p><strong>Replay locally:</strong></p>
 <pre><code class="language-bash">just download-upstream-fixtures
 just test-conformance-uplc
@@ -250,7 +265,8 @@ just test-conformance-cardano-node
 </code></pre>
 <h3 id="ledger-rules-impspec"><a class="header" href="#ledger-rules-impspec">ledger-rules (ImpSpec)</a></h3>
 <p><strong>Source:</strong> <a href="https://github.com/IntersectMBO/cardano-ledger">IntersectMBO/cardano-ledger</a> ImpSpec, SHA-pinned in <code>sources.toml</code>. The corpus regeneration pipeline builds cardano-ledger from source (GHC 9.6.5 + cabal 3.10.x, ≈35 min cold / 5 min cached) and runs the upstream ImpSpec conformance suite with <code>CONFORMANCE_CBOR_DUMP_PATH</code> set to capture every test vector as CBOR.</p>
-<p><strong>What's validated:</strong> Two STS-rule families — NEWEPOCH (epoch-boundary transitions) and LEDGER (transaction application). The harness replays each captured CBOR vector through the corresponding dugite ledger code path and compares the resulting state byte-for-byte.</p>
+<p><strong>What's validated:</strong> Eleven STS-rule families, not just the two headline ones — <code>NEWEPOCH</code> and <code>ConwayNEWEPOCH</code> (epoch-boundary transitions), <code>LEDGER</code> (transaction application), <code>POOL</code>, <code>CERT</code>, <code>CERTS</code>, <code>DELEG</code>, <code>GOVCERT</code>, <code>GOV</code>, <code>ENACT</code>, and <code>RATIFY</code>. The current corpus holds roughly 8,100 captured test-case directories. The harness replays each CBOR vector through the corresponding dugite ledger code path and compares the resulting state byte-for-byte.</p>
+<p>Note that an empty <code>SKIP_LIST</code> means no vector is skipped <em>by policy</em>. A vector can still report <code>Skipped</code> at runtime if the runner cannot construct its precondition; that is visible in the run output, not hidden by the list.</p>
 <p><strong>Status:</strong> passing. <code>SKIP_LIST</code> in <code>tests/conformance/src/upstream/ledger_rules_replay/mod.rs</code> is empty.</p>
 <p><strong>Replay locally:</strong></p>
 <pre><code class="language-bash">just download-upstream-fixtures
@@ -279,11 +295,24 @@ just test-conformance-mithril
 <p>To adopt a new upstream version:</p>
 <ol>
 <li>Edit <code>tests/conformance/upstream/sources.toml</code>, bumping the SHA (or tag for the <code>plutus</code> area) of the area you want to refresh.</li>
-<li>Trigger the <code>regenerate-conformance-corpus</code> workflow on GitHub (manual dispatch, or wait for the weekly automatic run). It produces a new dugite release tagged <code>conformance-corpus-v&lt;timestamp&gt;</code> with the seven tarballs attached.</li>
-<li>Update <code>[release].tag</code> in <code>tests/conformance/upstream/manifest.toml</code> to point at the new release tag.</li>
+<li>Run the <code>regenerate-conformance-corpus</code> workflow. It fires on <strong>three</strong> triggers: weekly cron (Sundays 02:00 UTC), manual dispatch (with optional per-area SHA/tag overrides patched into <code>sources.toml</code> for that run), and any push to <code>main</code> touching <code>sources.toml</code> or <code>scripts/regenerate-conformance-corpus/**</code>. It produces a new dugite release tagged <code>conformance-corpus-v&lt;YYYYmmdd-HHMMSS&gt;</code> with the seven tarballs plus a <code>corpus-manifest.json</code>.</li>
+<li>The workflow then <strong>opens an adoption PR itself</strong> (<code>chore/adopt-&lt;NEW_TAG&gt;</code>, titled <code>chore(conformance): adopt corpus &lt;NEW_TAG&gt;</code>) rewriting <code>[release].tag</code> in <code>manifest.toml</code>. This exists because the workflow used to publish releases nothing pointed at, and the pinned corpus silently drifted about two months stale. If you are adopting by hand, edit <code>[release].tag</code> yourself.</li>
 <li>Run <code>just download-upstream-fixtures &amp;&amp; just test-conformance</code> locally.</li>
 <li>Fix any test fallout, then commit the <code>sources.toml</code> + <code>manifest.toml</code> updates together with the code changes.</li>
 </ol>
+<p>To iterate on a capture script without publishing a release, <code>just regenerate-corpus-local</code> runs the same pipeline into <code>target/conformance-corpus/&lt;tag&gt;/</code>.</p>
+<h3 id="currently-pinned"><a class="header" href="#currently-pinned">Currently pinned</a></h3>
+<p><code>[release].tag = "conformance-corpus-v20260725-154355"</code>, built from:</p>
+<div class="table-wrapper"><table><thead><tr><th>Area</th><th>Pin</th></tr></thead><tbody>
+<tr><td>ouroboros-consensus</td><td><code>f205a7103deb732cc07cabd51fa76ce22f84f0d0</code></td></tr>
+<tr><td>cardano-ledger</td><td><code>a88b60bdcf3248dfe5a2f9372c188c399233f479</code></td></tr>
+<tr><td>cardano-node</td><td><code>0a21a7437fb9d38060b297c5997275d316e60d5c</code></td></tr>
+<tr><td>plutus</td><td>tag <code>1.66.0.0</code></td></tr>
+<tr><td>ledger-rules</td><td><code>a88b60bdcf3248dfe5a2f9372c188c399233f479</code> (same tree as cardano-ledger)</td></tr>
+<tr><td>cardano-base</td><td><code>12168e4b32b44d30dd401010ccd969accaf2add7</code></td></tr>
+<tr><td>mithril</td><td><code>2eedbd254e6bb656f6c10ec83930327dd0768a4a</code></td></tr>
+</tbody></table>
+</div>
 <h2 id="see-also"><a class="header" href="#see-also">See also</a></h2>
 <ul>
 <li><a href="./benchmarks.html">Benchmarks</a> — performance evidence.</li>
