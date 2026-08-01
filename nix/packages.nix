@@ -86,17 +86,31 @@
           };
         });
 
-      # Dugite TUI
-      dugite-tui = craneLib.buildPackage (commonArgs
+      # Dugite monitor — terminal dashboard TUI
+      dugite-monitor = craneLib.buildPackage (commonArgs
         // {
           inherit cargoArtifacts;
-          pname = "dugite-tui";
+          pname = "dugite-monitor";
           inherit version;
-          cargoExtraArgs = "-p dugite-tui";
+          cargoExtraArgs = "-p dugite-monitor";
           doCheck = true;
 
           meta = commonArgs.meta // {
-            mainProgram = "dugite-tui";
+            mainProgram = "dugite-monitor";
+          };
+        });
+
+      # Dugite config — interactive configuration editor TUI
+      dugite-config = craneLib.buildPackage (commonArgs
+        // {
+          inherit cargoArtifacts;
+          pname = "dugite-config";
+          inherit version;
+          cargoExtraArgs = "-p dugite-config";
+          doCheck = true;
+
+          meta = commonArgs.meta // {
+            mainProgram = "dugite-config";
           };
         });
 
