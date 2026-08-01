@@ -1864,6 +1864,13 @@ fn read_voting_procedures(
 ///       / [3, drep_credential]            ; DRepScript
 ///       / [4, pool_keyhash]               ; StakePoolKey
 /// ```
+/// Test-only re-export of [`read_voter`] so the encoder's round-trip test can
+/// prove its output is accepted by THIS decoder.
+#[cfg(test)]
+pub(crate) fn read_voter_for_test(r: &mut Reader<'_>) -> Result<Voter, SerializationError> {
+    read_voter(r)
+}
+
 fn read_voter(r: &mut Reader<'_>) -> Result<Voter, SerializationError> {
     let arr_len = r.read_array_header()?;
     if !matches!(arr_len, Some(2)) {
@@ -1916,6 +1923,15 @@ pub(crate) fn read_gov_action_id(r: &mut Reader<'_>) -> Result<GovActionId, Seri
         transaction_id,
         action_index,
     })
+}
+
+/// Test-only re-export of [`read_voting_procedure`] so the encoder's round-trip test can
+/// prove its output is accepted by THIS decoder.
+#[cfg(test)]
+pub(crate) fn read_voting_procedure_for_test(
+    r: &mut Reader<'_>,
+) -> Result<VotingProcedure, SerializationError> {
+    read_voting_procedure(r)
 }
 
 fn read_voting_procedure(r: &mut Reader<'_>) -> Result<VotingProcedure, SerializationError> {
@@ -1977,6 +1993,15 @@ pub(crate) fn read_proposal_procedure(
 /// / [5, gov_action_id / null, constitution]                                 ; NewConstitution
 /// / [6]                                                                     ; InfoAction
 /// ```
+/// Test-only re-export of [`read_gov_action`] so the encoder's round-trip test can
+/// prove its output is accepted by THIS decoder.
+#[cfg(test)]
+pub(crate) fn read_gov_action_for_test(
+    r: &mut Reader<'_>,
+) -> Result<GovAction, SerializationError> {
+    read_gov_action(r)
+}
+
 fn read_gov_action(r: &mut Reader<'_>) -> Result<GovAction, SerializationError> {
     let arr_len = r.read_array_header()?;
     if arr_len.is_none() {
@@ -2104,6 +2129,17 @@ fn read_constitution(r: &mut Reader<'_>) -> Result<Constitution, SerializationEr
 }
 
 /// Read a Conway protocol parameter update (map form, keys 0-31).
+/// Test-only re-export of [`read_protocol_param_update`] so the encoder's
+/// round-trip test can prove every populated field survives the wire. #919
+/// found key 15 being decoded and then DROPPED — a full round-trip is what
+/// catches that class.
+#[cfg(test)]
+pub(crate) fn read_protocol_param_update_for_test(
+    r: &mut Reader<'_>,
+) -> Result<ProtocolParamUpdate, SerializationError> {
+    read_protocol_param_update(r)
+}
+
 fn read_protocol_param_update(
     r: &mut Reader<'_>,
 ) -> Result<ProtocolParamUpdate, SerializationError> {
