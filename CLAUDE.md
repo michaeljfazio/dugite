@@ -101,7 +101,51 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 - 28-byte hash types (DRep keys, pool voter keys, required signers) must be padded to 32 bytes via `Hash28::to_hash32_padded()` — do not use `Hash<32>::from()` directly on 28-byte hashes
 
 ## Current Focus
-**v2.4.3 (2026-08-01)** — CBOR encoder alignment sweep: the non-map half of
+**v2.4.4 (2026-08-01)** — second audit wave: encoders + DRep voting power. Drop-in, SNAPSHOT
+unchanged at 31. Closes #946, #947, #948, #949, #950.
+
+- **#948 (serialization)** — `encode_drep` emitted a **32-byte** DRep KeyHash
+  where CDDL `drep = [0, addr_keyhash]` wants **bstr(28)**, while the
+  ScriptHash arm in the SAME function emitted 28. `read_drep` builds the value
+  as `read_hash28_cert()?.to_hash32_padded()` and `read_hash28_cert` rejects
+  any width but 28 — so dugite's output was **self-undecodable**. Identical to
+  #932's `encode_voter` StakePool arm but with wider reach: every DRep
+  delegation cert (`vote_delegation`, `stake_vote_delegation`,
+  `stake_reg_deleg_vote`). **Two existing tests PINNED the bug** (asserting
+  bstr(32) / len 36).
+- **#947 (serialization)** — tx-body key 14 `required_signers` is
+  `Set (KeyHash Guard)` and needs tag 258 at PV>=9; it was the only Set-typed
+  body field the #939/#940 sweep missed. Key 14 is INSIDE the body, so the
+  omission changed the **tx id** vs cardano-cli.
+- **#946 (nix)** — flake built a `dugite-tui` package for a crate that does not
+  exist, and the devShell lacked `protobuf`, so `nix develop` gave a shell the
+  workspace cannot compile in. No CI covers the flake.
+- **#949 (ledger, CONSENSUS-relevant)** — the frozen DRep distribution snapshot
+  (dugite's `psDRepDistr`, consumed by `ratify_proposals()` as on-chain voting
+  power) summed only `InstantStake + AccountBalance`. Haskell's
+  `computeDRepDistr` sums `InstantStake + ProposalDeposits + AccountBalance`.
+  Under-counting can flip a governance action's ratification vs cardano-node.
+  The SAME term had been found missing once before and fixed ONLY in the live
+  query path — so the bug moved out of sight, not away.
+- **#950 (node)** — `GetDRepStakeDistr` (LSQ tag 26) answered from LIVE state;
+  Haskell reads `psDRepDistr . fst $ finishedPulserState`, frozen once per
+  epoch boundary. A credential REGISTERED mid-epoch is not in `dpAccounts` at
+  all. Same class as #922. Found by the cli-parity round — visible ONLY because
+  #945 fixed the all-zero reporting.
+- **Hardening** — all 18 Conway certificate variants now round-trip through the
+  REAL decoder in test. That property is what catches the #948 shape; asserting
+  the encoder's own output shape is what let it survive.
+
+### QA — v2.4.4
+devnet-validate standard **3/3 rounds PASS** (`reports/devnet-validate/v2.4.4.json`)
+vs cardano-node 11.0.1: 560 canonical blocks, **0 orphans**, **0 tx-zoo
+failures**, 0 invalid forges, 0 critical anomalies. Bidirectional parity
+**41/41, 0 off-diagonal**. Adversarial N2N **26/26, 0 panic, 0 silent-skip**.
+cli-parity **18 EQUAL / 0 divergent** — the `drep-stake-distribution`
+divergence that exposed #949/#950 is resolved on the wire. Byte-exact pot
+parity after the first RUPD. Restart tip 37 -> 71, 0 stale-intersection.
+
+### Superseded: v2.4.3 (2026-08-01) — CBOR encoder alignment sweep: the non-map half of
 `cardano-ledger-binary`, never previously audited. Drop-in, SNAPSHOT unchanged
 at 31. Closes #935, #936, #937, #938, #939, #940.
 
