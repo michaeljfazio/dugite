@@ -36,20 +36,24 @@ fi
 # by walking the parent process chain
 PARENT_PID="$BP_PID"
 FOUND_CAFFEINATE=0
+# NB: the loop variable is NOT called PPID. `PPID` is a readonly bash builtin,
+# so assigning to it aborts the script with "PPID: readonly variable" — which
+# is exactly what this scenario did on every run, making it the one chaos case
+# that could never report anything but a missing-row failure.
 for _ in 1 2 3 4 5; do
-    PPID=$(ps -o ppid= -p "$PARENT_PID" 2>/dev/null | tr -d ' ' || echo "")
-    [ -z "$PPID" ] || [ "$PPID" = "1" ] && break
-    PARENT_NAME=$(ps -o comm= -p "$PPID" 2>/dev/null || echo "")
+    NEXT_PID=$(ps -o ppid= -p "$PARENT_PID" 2>/dev/null | tr -d ' ' || echo "")
+    { [ -z "$NEXT_PID" ] || [ "$NEXT_PID" = "1" ] || [ "$NEXT_PID" = "0" ]; } && break
+    PARENT_NAME=$(ps -o comm= -p "$NEXT_PID" 2>/dev/null || echo "")
     if echo "$PARENT_NAME" | grep -q 'caffeinate'; then
         FOUND_CAFFEINATE=1
         break
     fi
-    PARENT_PID="$PPID"
+    PARENT_PID="$NEXT_PID"
 done
 
 # Check 3: verify common.sh defines caffeinate_if_macos and uses it
-CAFFEINATE_IN_COMMON=$(grep -c 'caffeinate' "$CHAOS_DIR/../lib/common.sh" 2>/dev/null || echo 0)
-CAFFEINATE_IN_RUN=$(grep -c 'caffeinate' "$CHAOS_DIR/../run.sh" 2>/dev/null || echo 0)
+CAFFEINATE_IN_COMMON=$(count_matching 'caffeinate' "$CHAOS_DIR/../lib/common.sh")
+CAFFEINATE_IN_RUN=$(count_matching 'caffeinate' "$CHAOS_DIR/../run.sh")
 
 if [ "$CAFFEINATE_IN_COMMON" -eq 0 ] && [ "$CAFFEINATE_IN_RUN" -eq 0 ]; then
     chaos_record "$SCENARIO" "caffeinate-check" "0" "FAIL" "caffeinate-not-used-in-run.sh-or-common.sh"

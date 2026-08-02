@@ -32,7 +32,7 @@ if [ ! -f "$CHAOS_RAW_SEND" ]; then
 fi
 [ -S "$LD_DUGITE_BP_SOCK" ] || die "$SCENARIO: dugite-bp socket not present"
 
-LOG_LINE_BEFORE=$(wc -l < "$LD_LOGS/dugite-bp.log" 2>/dev/null || echo 0)
+LOG_LINE_BEFORE=$(line_count "$LD_LOGS/dugite-bp.log")
 
 # Build a future-slot ChainSync RollForward frame.
 # Mux header: timestamp=0, protocol=2 (ChainSync), length=X
@@ -65,11 +65,10 @@ MUX_HDR=$(printf '%08x%04x%04x' 0 2 "$PAYLOAD_LEN")
 sleep 2
 
 # Check that dugite didn't panic and didn't produce a new error (it may just close the conn)
-LOG_LINE_AFTER=$(wc -l < "$LD_LOGS/dugite-bp.log" 2>/dev/null || echo 0)
+LOG_LINE_AFTER=$(line_count "$LD_LOGS/dugite-bp.log")
 NEW_LINES=$(( LOG_LINE_AFTER - LOG_LINE_BEFORE ))
 
-PANICS=$(tail -n "$((NEW_LINES + 10))" "$LD_LOGS/dugite-bp.log" 2>/dev/null | \
-    grep -c -E 'panic|PANIC|thread.*panicked' || echo 0)
+PANICS=$(count_matching 'panic|PANIC|thread.*panicked' "$LD_LOGS/dugite-bp.log" "$((NEW_LINES + 10))")
 
 if [ "$PANICS" -gt 0 ]; then
     log_error "$SCENARIO: PANIC detected in logs"

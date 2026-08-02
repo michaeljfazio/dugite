@@ -20,6 +20,34 @@ case "$CHAOS_OS" in
     *)      CHAOS_NET_TOOL="unknown" ;;
 esac
 
+# count_matching <extended-regex> <file> [tail_lines] -> a single integer, always
+#
+# Replaces the `... | grep -c RE || echo 0` idiom, which is BROKEN: grep -c
+# prints its count (`0`) AND exits 1 when there are no matches, so the `|| echo
+# 0` appends a SECOND line and the variable becomes the two-line string "0\n0".
+# Every arithmetic test on it then dies with "integer expected" and the script
+# falls through — which is how clock-skew and inbound-syn-flood came to report
+# PASS from a comparison that never evaluated.
+#
+# This is the same defect the release-report generator carried (#953 fix), and
+# it recurs because the idiom reads correct. awk cannot fail this way: it has
+# no match-based exit status.
+count_matching() {
+    local re="$1" file="$2" tail_n="${3:-}"
+    [ -f "$file" ] || { echo 0; return 0; }
+    if [ -n "$tail_n" ]; then
+        tail -n "$tail_n" "$file" 2>/dev/null | awk -v re="$re" 'BEGIN{c=0} $0 ~ re {c++} END{print c+0}'
+    else
+        awk -v re="$re" 'BEGIN{c=0} $0 ~ re {c++} END{print c+0}' "$file" 2>/dev/null || echo 0
+    fi
+}
+
+# line_count <file> -> a single integer, always (0 when the file is absent)
+line_count() {
+    [ -f "$1" ] || { echo 0; return 0; }
+    awk 'END{print NR+0}' "$1" 2>/dev/null || echo 0
+}
+
 chaos_record() {
     local scenario="$1" action="$2" recovery="${3:-0}" result="${4:-UNKNOWN}" detail="${5:-}"
     printf '%s,%s,%s,%s,%s,%s\n' \
