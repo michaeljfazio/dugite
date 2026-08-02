@@ -12,6 +12,8 @@ config/cardano-bp.config.json
 config/dugite-bp.topology.json
 config/dugite-relay.topology.json
 config/cardano-bp.topology.json
+config/cardano-arbiter.config.json
+config/cardano-arbiter.topology.json
 config/relays.json
 config/genesis-hashes.env
 

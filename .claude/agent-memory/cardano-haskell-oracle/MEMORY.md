@@ -125,5 +125,8 @@
 - [flat-word64-natural-overflow-semantics.md](flat-word64-natural-overflow-semantics.md) — dWord64/lastStep REJECTS iff final chunk>1; Index+Constr-tag Word64 but Program Version is unbounded Natural
 - [uplc-cek-case-scope-semantics.md](uplc-cek-case-scope-semantics.md) — checkScope skips Constr/Case (byte-exact risk); Case-on-VCon gated at vanRossemPV=PV11
 
+## Plutus V3 Authoring Toolchain (Plinth) / ScriptContext Fixtures
+- [plutus-v3-authoring-toolchain-and-scriptcontext-fixtures.md](plutus-v3-authoring-toolchain-and-scriptcontext-fixtures.md) — plinth-template AuctionValidator.hs real example; V3 single-arg proof (V3.hs `[arg]` vs V1/V2 `[Common.Data]`); exact ScriptContext/TxInfo/ScriptInfo/ScriptPurpose Data field order+tags; serialiseCompiledCode->.plutus envelope (no cardano-api needed); cardano-node-tests real compiled v3 field-inspecting fixtures (witnessRedeemer/timeRange/constitution); plutus-ledger-api-testlib ScriptContextBuilder for byte-diff w/o a validator; cardano-ledger has NO plutus-tx-plugin dep (only plutus-ledger-api)
+
 ## Test Vectors
 - [test-vectors-reference.md](test-vectors-reference.md) — catalog across all Haskell repos: consensus golden (1620 CBOR files), plutus 999 UPLC tests
