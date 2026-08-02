@@ -561,6 +561,31 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
         // (`EncCBOR ProposalProcedure`) and
         // `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`
         // (`ConwayGovPredFailure` tag 8).
+        // GOV tag 4: ProposalDepositIncorrect (Mismatch 'RelEQ Coin)
+        //
+        // Wire shape: array(2)[3, array(3)[4, declared, expected]] — the
+        // Mismatch is FLATTENED into the constructor, not nested.
+        //
+        // This is the opposite of how Mismatch appears inside Ledger tag 9
+        // IncompleteWithdrawals, where it is a map VALUE and therefore must be
+        // a self-contained array(2). In a constructor-field position Haskell
+        // encodes it as a GROUP (encodeListLen (1 + groupsize) <> tag <>
+        // encCBORGroup), so the two Coins sit directly in the constructor's
+        // array.
+        //
+        // Verified empirically against cardano-cli 11.0.0.0: the nested form
+        // produced `DecoderFailure ... DeserialiseFailure 10 "expected word"`
+        // — the client could not decode the rejection at all, which is worse
+        // than the generic reason it replaced.
+        TxValidationError::ProposalDepositIncorrect { declared, expected } => {
+            enc.array(2).expect("infallible");
+            enc.u8(3).expect("infallible"); // Ledger tag 3: ConwayGovFailure
+            enc.array(3).expect("infallible");
+            enc.u8(4).expect("infallible"); // GOV tag 4
+            enc.u64(*declared).expect("infallible");
+            enc.u64(*expected).expect("infallible");
+        }
+
         TxValidationError::InvalidPrevGovActionId { proposal, .. } => {
             let raw = dugite_serialization::encode_proposal_procedure(proposal);
             encode_gov_failure(enc, 8, |enc| {
@@ -1877,6 +1902,44 @@ mod tests {
             reason.contains("1:"),
             "must decode script disc=1, got: {reason}"
         );
+    }
+
+    /// CBOR golden: `ProposalDepositIncorrect` (Ledger tag 3, GOV tag 4).
+    ///
+    /// Payload is `Mismatch 'RelEQ Coin`, FLATTENED into the constructor
+    /// array (encCBORGroup), unlike the Mismatch values inside Ledger tag 9
+    /// `IncompleteWithdrawals`, which are map values and therefore nested.
+    ///
+    /// Expected wire (ConwayLedgerPredFailure only):
+    ///   `8203 8304 <declared> <expected>`
+    ///   = array(2)[3, array(3)[4, declared, expected]]
+    #[test]
+    fn test_encode_proposal_deposit_incorrect_golden() {
+        let err = TxValidationError::ProposalDepositIncorrect {
+            declared: 99_999_999_999,
+            expected: 100_000_000_000,
+        };
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        encode_conway_ledger_pred_failure(&mut enc, &err);
+        let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+        eprintln!("ProposalDepositIncorrect bytes = {hex}");
+
+        // Mismatch is FLATTENED into the constructor array — array(3), not
+        // array(2) wrapping a nested array(2). cardano-cli rejects the nested
+        // form with DeserialiseFailure "expected word".
+        let mut dec = Decoder::new(&buf);
+        assert_eq!(dec.array().unwrap(), Some(2), "outer array(2)");
+        assert_eq!(dec.u8().unwrap(), 3, "Ledger tag 3 = ConwayGovFailure");
+        assert_eq!(
+            dec.array().unwrap(),
+            Some(3),
+            "gov array(3) — Mismatch flattened"
+        );
+        assert_eq!(dec.u8().unwrap(), 4, "GOV tag 4 = ProposalDepositIncorrect");
+        assert_eq!(dec.u64().unwrap(), 99_999_999_999, "declared");
+        assert_eq!(dec.u64().unwrap(), 100_000_000_000, "expected");
+        assert_eq!(dec.position(), buf.len(), "no trailing bytes");
     }
 
     // ── Issue #915: `InvalidPrevGovActionId` (Ledger tag 3, GOV tag 8) ──

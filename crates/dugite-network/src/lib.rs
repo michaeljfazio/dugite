@@ -335,6 +335,18 @@ pub enum TxValidationError {
     /// without the corresponding script witness. Encodes as Utxow tag 3
     /// `MissingScriptWitnessesUTXOW`, the same as the input and withdrawal
     /// forms — Haskell does not distinguish the three on the wire.
+    /// Conway `ProposalDepositIncorrect` (ConwayGovPredFailure tag 4): a
+    /// governance proposal declares a deposit that does not equal the current
+    /// `govActionDeposit` parameter.
+    ///
+    /// The check is EXACT EQUALITY (`Mismatch 'RelEQ Coin`), not a floor —
+    /// over-depositing is rejected just as firmly as under-depositing.
+    ProposalDepositIncorrect {
+        /// Deposit declared in the ProposalProcedure.
+        declared: u64,
+        /// Expected deposit from the protocol parameter.
+        expected: u64,
+    },
     MissingCertificateScriptWitness {
         /// Hex-encoded script hash that had no witness.
         credential: String,
