@@ -358,6 +358,26 @@ pub enum TxValidationError {
         credential: String,
     },
     ValueOverflow,
+    /// Conway PV <= 10 `WithdrawalsNotInRewardsCERTS` (CERTS tag 0, wrapped in
+    /// Ledger tag 2 `ConwayCertsFailure`).
+    ///
+    /// The PV <= 10 form BUNDLES both failure modes that PV >= 11 splits into
+    /// tags 8 and 9: a reward account that is missing/wrong-network, AND a
+    /// withdrawal whose amount does not equal the balance. Haskell derives it
+    /// from `withdrawalsThatDoNotDrainAccounts` with `amountAcceptable = (==)`,
+    /// and only the SUPPLIED value survives into the payload at this PV — the
+    /// expected balance is not reported.
+    ///
+    /// This is the variant that actually fires on mainnet, preprod, preview and
+    /// the devnet, all of which run PV10. dugite implemented the two PV >= 11
+    /// encodings but not this one, so the only REACHABLE withdrawal failure
+    /// degraded to a stringly-typed `ScriptFailed` and reached clients as a
+    /// generic `ConwayMempoolFailure "transaction validation failed"`.
+    WithdrawalsNotInRewardsCERTS {
+        /// `(reward_account_hex, supplied_coin)` for every withdrawal whose
+        /// account is missing OR whose amount mismatches the balance.
+        bad: Vec<(String, u64)>,
+    },
     /// Conway PV >= 11 `ConwayWithdrawalsMissingAccounts` (Ledger tag 8).
     ///
     /// One or more withdrawals reference a reward account that is not

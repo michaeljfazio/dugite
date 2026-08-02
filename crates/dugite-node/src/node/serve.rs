@@ -728,9 +728,9 @@ pub(crate) fn convert_validation_error(
         VE::ZeroWithdrawal { account } => TxValidationError::ScriptFailed {
             reason: format!("Zero withdrawal amount for reward account: {account}"),
         },
-        VE::WithdrawalsNotInRewardsCERTS { bad } => TxValidationError::ScriptFailed {
-            reason: format!("WithdrawalsNotInRewardsCERTS: {bad:?}"),
-        },
+        VE::WithdrawalsNotInRewardsCERTS { bad } => {
+            TxValidationError::WithdrawalsNotInRewardsCERTS { bad: bad.clone() }
+        }
         VE::ConwayWithdrawalsMissingAccounts { missing } => {
             TxValidationError::WithdrawalsMissingAccounts {
                 missing: missing.clone(),
