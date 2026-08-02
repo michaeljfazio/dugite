@@ -4,6 +4,9 @@
 - [v1v2-scriptcontext-conway-gates.md](v1v2-scriptcontext-conway-gates.md) — guardConwayFeaturesForPlutusV1V2 + transPlutusPurposeV1V2 both -> BadTranslation -> CollectErrors hard-rejects whole tx; Conway's own transTxOutV1/transTxInInfoV1 drop 2 of 3 Babbage V1 restrictions, keep InlineDatumsNotSupported
 - [nocostmodel-collecterror-native-script-exclusion.md](nocostmodel-collecterror-native-script-exclusion.md) — NoCostModel built in Evaluate.hs `apply` via `Map.lookup lang costModelsValid`; per-script language key; native scripts filtered out earlier via `lookupPlutusScript`/`toPlutusScript`, never touch CostModels; merge/gg ordering can hide a later NoCostModel behind an earlier NoRedeemer
 
+## Plutus Data CBOR Wire Format (Datums/Redeemers, script_data_hash)
+- [plutus-data-integer-cbor-bignum-threshold.md](plutus-data-integer-cbor-bignum-threshold.md) — Data::I plain-int vs tag2/3 bignum threshold is EXACTLY `[-(2^64) .. 2^64-1]` (word64-based, not i128); decode accepts non-canonical bignum framing (no minimality check); found+documented live dugite bug: `encode_plutus_int` gates on `to_i128()` then truncates via `as u64` — silently wraps values in `(2^64, i128::MAX]`, corrupting script_data_hash
+
 ## Plutus Builtins / Ledger-API
 - [v2v1-paramname-vanrossem-extension-live.md](v2v1-paramname-vanrossem-extension-live.md) — V1/V2 ParamName NOT frozen at Babbage size; batch6 hits V1/V2 too at PV11 (V1=332,V2=332,V3=350), live on preview now
 - [v3-paramname-vanrossem-tail-297-349.md](v3-paramname-vanrossem-tail-297-349.md) — exact V3 ParamName idx297-349 table (53 fields/14 builtins), ExpModInteger cost formula coefficients
