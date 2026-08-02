@@ -69,7 +69,18 @@ if [ "$SKIP_SETUP" -eq 0 ]; then
     ./stop.sh >/dev/null 2>&1
     LD_TWO_FORGERS=1 LD_POOL2_STAKE_PCT="${TF_POOL2_PCT:-40}" ./setup.sh >/dev/null 2>&1 \
         || { echo "SETUP FAILED"; exit 2; }
-    ./run.sh 2>&1 | tail -12 || { echo "RUN FAILED"; exit 2; }
+    # NOT `./run.sh | tail || ...` — a pipeline's exit status is the LAST
+    # command's, so `tail` (always 0) masks a failed run.sh entirely. That is
+    # the documented `just check | tail` trap, and it bit here: run.sh reported
+    # "Socket cbp.sock did not become ready within 120s" and died, the round
+    # sailed past it, and every assertion afterwards ran against a devnet that
+    # was missing a node.
+    if ! ./run.sh > "state/two-forger-run.log" 2>&1; then
+        echo "RUN FAILED — last 20 lines:"
+        tail -20 "state/two-forger-run.log"
+        exit 2
+    fi
+    tail -12 "state/two-forger-run.log"
 fi
 
 . ./lib/common.sh
@@ -100,6 +111,29 @@ for i in "${!SOCKS[@]}"; do
 done
 [ "$FAILURES" -gt 0 ] && { echo "cannot proceed without all four nodes"; exit 1; }
 
+step "1b. the arbiter must actually see BOTH producers"
+# Assert it; do not assume it. The arbiter was first given a copy of
+# cardano-bp's config, whose peer targets are all 1 (that node needs exactly one
+# upstream, the relay). It therefore established exactly ONE connection —
+# only ever to 3001, never even attempting 3003 — so the "independent
+# arbiter" saw a single producer and could not arbitrate anything. The round
+# still reported PASS.
+ARB_PID_F="$LD_STATE/cardano-arbiter.pid"
+ARB_PEERS=0
+if [ -f "$ARB_PID_F" ]; then
+    for _ in $(seq 1 30); do
+        ARB_PEERS=$(lsof -p "$(cat "$ARB_PID_F")" -iTCP -a -P -n 2>/dev/null \
+                    | grep -c 'ESTABLISHED' || true)
+        [ "${ARB_PEERS:-0}" -ge 2 ] && break
+        sleep 2
+    done
+fi
+if [ "${ARB_PEERS:-0}" -ge 2 ]; then
+    ok "arbiter holds $ARB_PEERS established connections (both producers)"
+else
+    bad "arbiter has only ${ARB_PEERS:-0} established connection(s) — it cannot arbitrate between two producers, so every convergence verdict below would be one-sided"
+fi
+
 step "2. observation window (${DURATION}s) — let both pools forge and contend"
 END=$(( $(date +%s) + DURATION ))
 SAMPLES=0
@@ -128,9 +162,16 @@ note "$SAMPLES samples, $CONVERGED_SAMPLES with all four tips identical"
 [ -n "$LAST_DIVERGENCE" ] && note "last divergent sample: $LAST_DIVERGENCE"
 
 step "3. both pools actually forged (the round is vacuous otherwise)"
-DBP_FORGED=$(grep -acE 'TraceForgedBlock|forge:' "$LD_LOGS/dugite-bp.log" 2>/dev/null || true)
-CBP_FORGED=$(grep -acE 'Forge\.Loop\.(ForgedBlock|AdoptedBlock)|TraceForgedBlock|adoptedBlock' \
-    "$LD_LOGS/cardano-bp.log" 2>/dev/null || true)
+# Count ONLY the real forge events.
+#
+# The first version matched `TraceForgedBlock|forge:` and reported 955 forges
+# from dugite-bp across a 300-second window on a 1-second-slot chain — a
+# physically impossible number, because `forge:` is a log PREFIX that appears on
+# many unrelated lines. The assertion passed on a meaningless metric, which is
+# the failure shape this backlog exists to delete. awk counts exact matches and
+# cannot pick up a bare count-plus-fallback the way `grep -c || echo 0` does.
+DBP_FORGED=$(awk '/TraceForgedBlock/ {c++} END{print c+0}' "$LD_LOGS/dugite-bp.log" 2>/dev/null || echo 0)
+CBP_FORGED=$(awk '/Forge\.Loop\.AdoptedBlock/ {c++} END{print c+0}' "$LD_LOGS/cardano-bp.log" 2>/dev/null || echo 0)
 note "forge events: dugite-bp=$DBP_FORGED cardano-bp=$CBP_FORGED"
 if [ "${DBP_FORGED:-0}" -ge 3 ] && [ "${CBP_FORGED:-0}" -ge 3 ]; then
     ok "both pools forged (dugite-bp=$DBP_FORGED, cardano-bp=$CBP_FORGED) — contention was real"
@@ -229,16 +270,25 @@ if [ -n "$TIP_BEFORE" ] && [ -f "$LD_STATE/dugite-bp.pid" ]; then
     ARB_MID=$(tip_field "$LD_CARDANO_ARBITER_SOCK" .block)
     note "arbiter advanced to block ${ARB_MID:-?} while dugite-bp was down"
     ../../.claude/skills/devnet-validate/scripts/restart-dugite-bp.sh >/dev/null 2>&1
+    # "Advanced past its old tip" is too weak a criterion: a node that rebuilt
+    # its OWN fork also advances. The rejoin only counts if dugite-bp lands on
+    # the SAME chain the rest of the network is on, so require its tip hash to
+    # match the arbiter's — which is the whole reason the arbiter exists.
     REJOINED=0
-    for _ in $(seq 1 24); do
+    for _ in $(seq 1 36); do
         sleep 5
         TIP_AFTER=$(tip_field "$LD_DUGITE_BP_SOCK" .block)
-        [ -n "$TIP_AFTER" ] && [ "${TIP_AFTER:-0}" -gt "${TIP_BEFORE:-0}" ] && { REJOINED=1; break; }
+        DBP_H=$(tip_field "$LD_DUGITE_BP_SOCK" .hash)
+        ARB_H=$(tip_field "$LD_CARDANO_ARBITER_SOCK" .hash)
+        if [ -n "$TIP_AFTER" ] && [ "${TIP_AFTER:-0}" -gt "${TIP_BEFORE:-0}" ] \
+           && [ -n "$DBP_H" ] && [ "$DBP_H" = "$ARB_H" ]; then
+            REJOINED=1; break
+        fi
     done
     if [ "$REJOINED" -eq 1 ]; then
-        ok "dugite-bp rejoined across a fork it did not build: $TIP_BEFORE -> $TIP_AFTER"
+        ok "dugite-bp rejoined the network's chain across a fork it did not build: $TIP_BEFORE -> $TIP_AFTER (hash matches the arbiter)"
     else
-        bad "dugite-bp did not advance past $TIP_BEFORE within 120s of restart"
+        bad "dugite-bp did not rejoin the arbiter's chain within 180s (tip $TIP_BEFORE -> ${TIP_AFTER:-?}, dbp=${DBP_H:0:12} arbiter=${ARB_H:0:12}) — advancing on its OWN fork is not a rejoin"
     fi
     STALE=$(grep -acE 'stale intersection' "$LD_LOGS/dugite-bp.log" 2>/dev/null || true)
     if [ "${STALE:-0}" -eq 0 ]; then
@@ -248,6 +298,46 @@ if [ -n "$TIP_BEFORE" ] && [ -f "$LD_STATE/dugite-bp.pid" ]; then
     fi
 else
     note "restart step SKIPPED — could not read a pre-restart tip or pidfile"
+fi
+
+step "9. FINAL convergence — the network must not be left partitioned"
+# The single most important assertion, and the one the first version LACKED.
+#
+# Step 5 samples convergence BEFORE the restart. That first run passed step 5 at
+# block 148 and then finished with dugite-bp=150, relay=176, cardano-bp=176,
+# arbiter=149 — four nodes on three different chains — and still reported
+# "all assertions passed", because nothing re-checked afterwards.
+#
+# A partition here is not cosmetic. Two producers that fork at genesis each
+# build past `k` and can never adopt each other
+# (`ChainSync intersection only at genesis ... ForkTooDeep`), so the devnet
+# silently becomes two independent chains and every cross-node comparison in
+# the whole gate is meaningless.
+FINAL_CONVERGED=0
+for _ in $(seq 1 36); do
+    sleep 5
+    declare -a FT=()
+    for s in "${SOCKS[@]}"; do FT+=("$(tip_field "$s" .hash)"); done
+    same=1
+    for t in "${FT[@]}"; do
+        [ -z "$t" ] && { same=0; break; }
+        [ "$t" != "${FT[0]}" ] && same=0
+    done
+    [ "$same" -eq 1 ] && { FINAL_CONVERGED=1; break; }
+done
+if [ "$FINAL_CONVERGED" -eq 1 ]; then
+    ok "final convergence: all four nodes on one chain, block=$(tip_field "$LD_CARDANO_ARBITER_SOCK" .block)"
+else
+    DET=$(for i in "${!SOCKS[@]}"; do
+        printf '%s=%s/%.10s ' "${NAMES[$i]}" \
+            "$(tip_field "${SOCKS[$i]}" .block)" "$(tip_field "${SOCKS[$i]}" .hash)"
+    done)
+    bad "NETWORK LEFT PARTITIONED after 180s: $DET"
+    echo "    A persistent split means the producers forked deeper than k=40 and"
+    echo "    can no longer adopt each other. Check for"
+    echo "    'intersection only at genesis' in logs/dugite-relay.log — if present,"
+    echo "    the producers began forging before they were connected, which the"
+    echo "    LD_GENESIS_DELAY bump in setup.sh exists to prevent."
 fi
 
 step "SUMMARY"
