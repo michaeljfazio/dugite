@@ -57,6 +57,8 @@ caffeinate_if_macos "$DUGITE_BIN" run \
     --host-addr     127.0.0.1 \
     --port          "$LD_RELAY_PORT" \
     --metrics-port  "$LD_DUGITE_RELAY_METRICS_PORT" \
+    --rpc-host      127.0.0.1 \
+    --rpc-port      "$LD_DUGITE_RELAY_RPC_PORT" \
     > "$LD_LOGS/dugite-relay.log" 2>&1 &
 write_node_pidfile "$LD_STATE/dugite-relay.db" "$LD_STATE/dugite-relay.pid" \
     || { echo $! > "$LD_STATE/dugite-relay.pid"; log_info "WARN: could not resolve dugite-relay node pid; pidfile may be stale"; }
@@ -73,7 +75,25 @@ log_info "dugite-relay PID $(cat "$LD_STATE/dugite-relay.pid")"
 # cross-validation of every dugite-forged block without any chain
 # divergence risk. Setup.sh redirects all 20 stake-delegators to
 # pool1 so pool2 has no active stake (its absence here is fine).
-log_info "Starting cardano-bp on port $LD_CARDANO_BP_PORT (relay / validator only)"
+#
+# TWO-FORGER MODE (#957): when setup.sh was run with LD_TWO_FORGERS=1 it left a
+# marker and split the genesis delegation across both pools. In that mode
+# cardano-bp gets pool2's forging keys, so the devnet has two competing
+# producers and slot battles / rollback / chain selection become reachable.
+# The mode is read from the marker, not the environment, so a run.sh invoked
+# without the variable cannot silently produce a single-forger devnet that a
+# two-forger round then asserts against.
+CBP_FORGE_ARGS=()
+if [ -f "$LD_GENESIS/.two-forgers" ]; then
+    CBP_FORGE_ARGS=(
+        --shelley-kes-key                 "$LD_KEYS/pool2/kes.skey"
+        --shelley-vrf-key                 "$LD_KEYS/pool2/vrf.skey"
+        --shelley-operational-certificate "$LD_KEYS/pool2/opcert.cert"
+    )
+    log_info "Starting cardano-bp on port $LD_CARDANO_BP_PORT (FORGING pool2 — two-forger mode, pool2 stake $(cat "$LD_GENESIS/.two-forgers")%)"
+else
+    log_info "Starting cardano-bp on port $LD_CARDANO_BP_PORT (relay / validator only)"
+fi
 cardano-node run \
     --config        "$LD_CONFIG/cardano-bp.config.json" \
     --topology      "$LD_CONFIG/cardano-bp.topology.json" \
@@ -81,13 +101,39 @@ cardano-node run \
     --socket-path   "$LD_CARDANO_BP_SOCK" \
     --host-addr     127.0.0.1 \
     --port          "$LD_CARDANO_BP_PORT" \
+    "${CBP_FORGE_ARGS[@]+"${CBP_FORGE_ARGS[@]}"}" \
     > "$LD_LOGS/cardano-bp.log" 2>&1 &
 echo $! > "$LD_STATE/cardano-bp.pid"
 log_info "cardano-bp PID $(cat "$LD_STATE/cardano-bp.pid")"
 
+# ---- cardano-arbiter (two-forger mode only) ----
+#
+# A second, NON-forging cardano-node peered directly with both producers. It is
+# the independent Haskell oracle for "which block won this slot battle".
+#
+# Without it the round could only compare dugite-bp against dugite-relay, and
+# two dugite processes agreeing tells us nothing about whether dugite's Praos
+# tiebreaker matches cardano-node's. cardano-bp cannot play the arbiter in this
+# mode either — it is one of the two contestants, and a producer prefers its
+# own block by construction, so its view is not neutral.
+if [ -f "$LD_GENESIS/.two-forgers" ]; then
+    log_info "Starting cardano-arbiter on port $LD_CARDANO_ARBITER_PORT (Haskell tiebreak oracle, non-forging)"
+    cardano-node run \
+        --config        "$LD_CONFIG/cardano-arbiter.config.json" \
+        --topology      "$LD_CONFIG/cardano-arbiter.topology.json" \
+        --database-path "$LD_STATE/cardano-arbiter.db" \
+        --socket-path   "$LD_CARDANO_ARBITER_SOCK" \
+        --host-addr     127.0.0.1 \
+        --port          "$LD_CARDANO_ARBITER_PORT" \
+        > "$LD_LOGS/cardano-arbiter.log" 2>&1 &
+    echo $! > "$LD_STATE/cardano-arbiter.pid"
+    log_info "cardano-arbiter PID $(cat "$LD_STATE/cardano-arbiter.pid")"
+fi
+
 # Wait for relay + cardano-bp sockets first.
 wait_for_socket "$LD_RELAY_SOCK"      120
 wait_for_socket "$LD_CARDANO_BP_SOCK" 120
+[ -f "$LD_GENESIS/.two-forgers" ] && wait_for_socket "$LD_CARDANO_ARBITER_SOCK" 180
 
 # The original "Bug-A workaround" stagger that waited for cardano-bp to
 # push a block into the relay is no longer needed: cardano-bp now runs
@@ -107,6 +153,8 @@ caffeinate_if_macos "$DUGITE_BIN" run \
     --host-addr     127.0.0.1 \
     --port          "$LD_DUGITE_BP_PORT" \
     --metrics-port  "$LD_DUGITE_BP_METRICS_PORT" \
+    --rpc-host      127.0.0.1 \
+    --rpc-port      "$LD_DUGITE_BP_RPC_PORT" \
     --shelley-kes-key                 "$LD_KEYS/pool1/kes.skey" \
     --shelley-vrf-key                 "$LD_KEYS/pool1/vrf.skey" \
     --shelley-operational-certificate "$LD_KEYS/pool1/opcert.cert" \
@@ -116,6 +164,18 @@ write_node_pidfile "$LD_STATE/dugite-bp.db" "$LD_STATE/dugite-bp.pid" \
 log_info "dugite-bp PID $(cat "$LD_STATE/dugite-bp.pid")"
 
 wait_for_socket "$LD_DUGITE_BP_SOCK"  120
+
+# gRPC listeners (#960). Non-fatal: a node that failed to bind its RPC port is
+# still a usable devnet for every N2C-based suite, and failing the whole run
+# here would make an RPC regression look like a total harness outage. The rpc/
+# suite asserts reachability itself and reports a real failure if it is down.
+for _rp in "$LD_DUGITE_BP_RPC_PORT" "$LD_DUGITE_RELAY_RPC_PORT"; do
+    if wait_for_tcp_port "$_rp" 60; then
+        log_info "UTxO RPC listening on 127.0.0.1:$_rp"
+    else
+        log_warn "UTxO RPC port $_rp never came up — rpc/ suite will report it"
+    fi
+done
 
 log_info "All three sockets ready."
 log_info "Query tips:"
