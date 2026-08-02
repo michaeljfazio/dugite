@@ -21,7 +21,7 @@ FLOOD_PARALLEL="${SYN_FLOOD_PARALLEL:-20}"
 TIP_BEFORE=$(cardano-cli query tip \
     --testnet-magic "$LD_MAGIC" \
     --socket-path   "$LD_DUGITE_BP_SOCK" 2>/dev/null | jq -r '.block // 0' || echo 0)
-LOG_LINE_BEFORE=$(wc -l < "$LD_LOGS/dugite-bp.log" 2>/dev/null || echo 0)
+LOG_LINE_BEFORE=$(line_count "$LD_LOGS/dugite-bp.log")
 
 log_info "$SCENARIO: flooding port $LD_DUGITE_BP_PORT with $FLOOD_CONNS connections (parallel=$FLOOD_PARALLEL)..."
 
@@ -72,11 +72,10 @@ TIP_AFTER=$(cardano-cli query tip \
     --testnet-magic "$LD_MAGIC" \
     --socket-path   "$LD_DUGITE_BP_SOCK" 2>/dev/null | jq -r '.block // 0' || echo 0)
 
-LOG_LINE_AFTER=$(wc -l < "$LD_LOGS/dugite-bp.log" 2>/dev/null || echo 0)
+LOG_LINE_AFTER=$(line_count "$LD_LOGS/dugite-bp.log")
 NEW_LINES=$(( LOG_LINE_AFTER - LOG_LINE_BEFORE ))
 
-PANICS=$(tail -n "$((NEW_LINES + 10))" "$LD_LOGS/dugite-bp.log" 2>/dev/null | \
-    grep -c -E 'panic|PANIC|thread.*panicked' || echo 0)
+PANICS=$(count_matching 'panic|PANIC|thread.*panicked' "$LD_LOGS/dugite-bp.log" "$((NEW_LINES + 10))")
 
 if [ "$PANICS" -gt 0 ]; then
     chaos_record "$SCENARIO" "post-flood" "0" "FAIL" "panic-during-flood"
@@ -85,8 +84,7 @@ fi
 
 # Check for rate-limit log line (optional — not a hard failure if missing,
 # since the rate-limiter may not log every rejection)
-RATE_LOG=$(tail -n "$((NEW_LINES + 10))" "$LD_LOGS/dugite-bp.log" 2>/dev/null | \
-    grep -c -iE 'rate.limit|too.many.conn|conn.rate|throttl' || echo 0)
+RATE_LOG=$(count_matching 'rate.limit|too.many.conn|conn.rate|throttl|Rate.Limit|Too.Many.Conn|Conn.Rate|Throttl' "$LD_LOGS/dugite-bp.log" "$((NEW_LINES + 10))")
 
 chaos_record "$SCENARIO" "post-flood" "$FLOOD_SEC" "PASS" \
     "conns=${FLOOD_CONNS} tip_before=${TIP_BEFORE} tip_after=${TIP_AFTER} rate_log_lines=${RATE_LOG}"
