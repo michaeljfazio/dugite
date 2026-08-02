@@ -43,12 +43,27 @@ script_pay_addr()   { cat "$ZOO_KEYS/$1/payment-stake.addr"; }
 # script_file <wallet>        — the guarding script envelope
 script_file()       { echo "$ZOO_KEYS/$1/stake-script.plutus"; }
 
-# is_registered <stake-addr> -> "yes"|"no"
+# is_registered <stake-addr> [timeout_s] -> "yes"|"no"
+#
+# Polls rather than asking once. 13a can report PASS on all three observers
+# (its UTxO is visible everywhere) while `query stake-address-info` on the same
+# socket still answers empty a moment later — and 13b/13d then skip themselves
+# with "not-registered", silently removing the Certifying-purpose coverage this
+# category exists to provide. A flake that disguises itself as a legitimate
+# precondition skip is the most expensive kind, so wait for the state instead
+# of sampling it once.
 is_registered() {
-    cardano-cli conway query stake-address-info \
-        --testnet-magic "$LD_MAGIC" --socket-path "$ZOO_SOCKET" \
-        --address "$1" 2>/dev/null \
-        | jq -r 'if length>0 then "yes" else "no" end'
+    local addr="$1" timeout="${2:-20}" i=0 r
+    while [ "$i" -lt "$timeout" ]; do
+        r=$(cardano-cli conway query stake-address-info \
+                --testnet-magic "$LD_MAGIC" --socket-path "$ZOO_SOCKET" \
+                --address "$addr" 2>/dev/null \
+            | jq -r 'if length>0 then "yes" else "no" end' 2>/dev/null || echo "no")
+        [ "$r" = "yes" ] && { echo yes; return 0; }
+        sleep 1
+        i=$((i+1))
+    done
+    echo no
 }
 
 # A trivial redeemer. The always-true/false validators ignore it entirely;

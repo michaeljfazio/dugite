@@ -44,6 +44,10 @@ ALL_CATEGORIES=(
     # DRep and governance action, so keeping it after 10/12 means it cannot
     # perturb the governance lifecycle those categories assert on.
     13-script-purposes
+    # Governance NEGATIVES (#956). After 06 (which creates the actions they
+    # vote on) and after 13 (which registers/deregisters its own DRep), so a
+    # rejection here is never an artefact of another category's state.
+    14-gov-negatives
 )
 
 usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; }
