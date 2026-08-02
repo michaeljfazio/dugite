@@ -195,13 +195,61 @@ impl LocalTxMonitorServer {
                         actual: "StIdle (no snapshot)".to_string(),
                     })?;
 
-                    let tx_id_bytes = dec.bytes().map_err(|e| ProtocolError::CborDecode {
-                        protocol: "LocalTxMonitor",
-                        reason: e.to_string(),
-                    })?;
+                    // MsgHasTx = [7, GenTxId]. For a Cardano HFC block the
+                    // GenTxId is a `OneEraGenTxId`, which is an ARRAY
+                    // `[era_index, bstr(32)]` — NOT a bare byte string.
+                    //
+                    // Captured off the wire from cardano-cli 11.0.1
+                    // (`query tx-mempool ... tx-exists`), Conway:
+                    //
+                    //   82 07 82 06 5820 <32-byte txid>
+                    //   ^^ ^^ ^^ ^^ ^^^^
+                    //   |  |  |  |  +-- bstr(32) the tx id
+                    //   |  |  |  +----- era index 6 = Conway
+                    //   |  |  +-------- array(2) : the OneEraGenTxId
+                    //   |  +----------- 7 = MsgHasTx
+                    //   +-------------- array(2)
+                    //
+                    // This decoder previously read a bare `bstr`, so the real
+                    // message failed to decode and NO REPLY WAS EVER SENT —
+                    // `cardano-cli ... tx-exists` hung indefinitely against
+                    // dugite while `info` and `next-tx` worked. The unit test
+                    // helper encoded the bare form too, so the tests PINNED
+                    // the bug rather than catching it (the #948 shape).
+                    //
+                    // The bare form is still accepted: it costs one branch,
+                    // and rejecting it would break any client written against
+                    // dugite's previous behaviour. The era index is read and
+                    // discarded — a tx id is era-agnostic, and Haskell's
+                    // `HasTx` likewise only compares the hash.
                     let mut tx_id = [0u8; 32];
-                    if tx_id_bytes.len() == 32 {
-                        tx_id.copy_from_slice(tx_id_bytes);
+                    match dec.datatype() {
+                        Ok(minicbor::data::Type::Array) => {
+                            dec.array().map_err(|e| ProtocolError::CborDecode {
+                                protocol: "LocalTxMonitor",
+                                reason: format!("MsgHasTx GenTxId array header: {e}"),
+                            })?;
+                            let _era = dec.u32().map_err(|e| ProtocolError::CborDecode {
+                                protocol: "LocalTxMonitor",
+                                reason: format!("MsgHasTx GenTxId era index: {e}"),
+                            })?;
+                            let b = dec.bytes().map_err(|e| ProtocolError::CborDecode {
+                                protocol: "LocalTxMonitor",
+                                reason: format!("MsgHasTx GenTxId hash: {e}"),
+                            })?;
+                            if b.len() == 32 {
+                                tx_id.copy_from_slice(b);
+                            }
+                        }
+                        _ => {
+                            let b = dec.bytes().map_err(|e| ProtocolError::CborDecode {
+                                protocol: "LocalTxMonitor",
+                                reason: format!("MsgHasTx tx id (bare form): {e}"),
+                            })?;
+                            if b.len() == 32 {
+                                tx_id.copy_from_slice(b);
+                            }
+                        }
                     }
 
                     let has = snap.tx_set.contains(&tx_id);
@@ -379,8 +427,32 @@ mod tests {
         buf
     }
 
-    /// CBOR-encode MsgHasTx with a tx hash.
+    /// CBOR-encode MsgHasTx exactly as cardano-cli 11.0.1 puts it on the wire:
+    /// `[7, [era_index, bstr(32)]]`.
+    ///
+    /// The previous version of this helper emitted a BARE `[7, bstr(32)]`,
+    /// matching what the server's decoder happened to expect rather than what
+    /// any real client sends. Both halves agreed, both were wrong, and the
+    /// tests passed while `cardano-cli ... tx-exists` hung forever against a
+    /// live node. Encoding the true wire bytes here is what makes these tests
+    /// capable of failing.
     fn encode_has_tx(tx_hash: &[u8; 32]) -> Vec<u8> {
+        encode_has_tx_era(tx_hash, 6) // 6 = Conway
+    }
+
+    fn encode_has_tx_era(tx_hash: &[u8; 32], era: u32) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        enc.array(2).unwrap();
+        enc.u64(TAG_HAS_TX).unwrap();
+        enc.array(2).unwrap();
+        enc.u32(era).unwrap();
+        enc.bytes(tx_hash).unwrap();
+        buf
+    }
+
+    /// The legacy bare form, still accepted for backward compatibility.
+    fn encode_has_tx_bare(tx_hash: &[u8; 32]) -> Vec<u8> {
         let mut buf = Vec::new();
         let mut enc = Encoder::new(&mut buf);
         enc.array(2).unwrap();
@@ -439,6 +511,107 @@ mod tests {
     }
 
     // ─── MsgHasTx tests ─────────────────────────────────────────────────────
+
+    /// GOLDEN — the exact bytes cardano-cli 11.0.1 puts on the wire.
+    ///
+    /// Captured with a unix-socket proxy sitting between
+    /// `cardano-cli conway query tx-mempool --socket-path <sock> tx-exists <id>`
+    /// and a live cardano-node 11.0.1 on the devnet:
+    ///
+    ///   [cli->node] proto=9 len=38
+    ///     hex=8207820658200bece18e734ce8e83f662dfa904925ce25a695b8999e3d6a7ff2539e0efe5482
+    ///   [node->cli] proto=9 len=3 hex=8208f4          <- [8, false]
+    ///
+    /// dugite answered the identical request with NOTHING, and the client hung
+    /// indefinitely. A same-process round-trip could never have caught that:
+    /// the encoder and decoder in this file agreed with each other on a shape
+    /// no real client uses. Pinning the captured bytes is the durable guard.
+    #[tokio::test]
+    async fn has_tx_decodes_the_real_cardano_cli_wire_bytes() {
+        const CAPTURED: &str =
+            "8207820658200bece18e734ce8e83f662dfa904925ce25a695b8999e3d6a7ff2539e0efe5482";
+        let msg = hex::decode(CAPTURED).expect("valid hex");
+
+        let mut tx_hash = [0u8; 32];
+        tx_hash.copy_from_slice(
+            &hex::decode("0bece18e734ce8e83f662dfa904925ce25a695b8999e3d6a7ff2539e0efe5482")
+                .unwrap(),
+        );
+
+        // The tx IS in the mempool, so a correct decode must answer `true`.
+        // A decoder that mis-reads the id would answer `false`, and one that
+        // fails outright would answer nothing at all.
+        let mempool = MockMempool::with_txs(vec![(tx_hash, vec![0x01, 0x02])], 100);
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+
+        let handle =
+            tokio::spawn(
+                async move { LocalTxMonitorServer::run(&mut channel, &mempool, || 10).await },
+            );
+
+        send_raw(&ingress_tx, encode_tag_only(TAG_ACQUIRE)).await;
+        let _ = recv_raw(&mut egress_rx).await;
+
+        send_raw(&ingress_tx, msg).await;
+        let resp = recv_raw(&mut egress_rx).await;
+
+        // cardano-node's reply to the same query shape is `82 08 f4`/`f5`.
+        assert_eq!(
+            hex::encode(&resp),
+            "8208f5",
+            "must reply MsgReplyHasTx(true) with the byte shape cardano-node uses"
+        );
+
+        send_raw(&ingress_tx, encode_tag_only(TAG_DONE)).await;
+        handle.await.unwrap().unwrap();
+    }
+
+    /// The legacy bare-bstr form keeps working — dugite accepted it before, and
+    /// silently dropping support would be a gratuitous break.
+    #[tokio::test]
+    async fn has_tx_still_accepts_the_legacy_bare_form() {
+        let tx_hash = [0xAA; 32];
+        let mempool = MockMempool::with_txs(vec![(tx_hash, vec![0x01, 0x02])], 100);
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+
+        let handle =
+            tokio::spawn(
+                async move { LocalTxMonitorServer::run(&mut channel, &mempool, || 10).await },
+            );
+
+        send_raw(&ingress_tx, encode_tag_only(TAG_ACQUIRE)).await;
+        let _ = recv_raw(&mut egress_rx).await;
+
+        send_raw(&ingress_tx, encode_has_tx_bare(&tx_hash)).await;
+        let resp = recv_raw(&mut egress_rx).await;
+        assert_eq!(hex::encode(&resp), "8208f5");
+
+        send_raw(&ingress_tx, encode_tag_only(TAG_DONE)).await;
+        handle.await.unwrap().unwrap();
+    }
+
+    /// Every era index must decode — the id is era-agnostic and the server must
+    /// not special-case Conway.
+    #[tokio::test]
+    async fn has_tx_accepts_any_era_index() {
+        for era in [0u32, 1, 2, 3, 4, 5, 6, 7] {
+            let tx_hash = [0xCC; 32];
+            let mempool = MockMempool::with_txs(vec![(tx_hash, vec![0x01])], 100);
+            let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+            let handle = tokio::spawn(async move {
+                LocalTxMonitorServer::run(&mut channel, &mempool, || 10).await
+            });
+
+            send_raw(&ingress_tx, encode_tag_only(TAG_ACQUIRE)).await;
+            let _ = recv_raw(&mut egress_rx).await;
+            send_raw(&ingress_tx, encode_has_tx_era(&tx_hash, era)).await;
+            let resp = recv_raw(&mut egress_rx).await;
+            assert_eq!(hex::encode(&resp), "8208f5", "era index {era} must decode");
+
+            send_raw(&ingress_tx, encode_tag_only(TAG_DONE)).await;
+            handle.await.unwrap().unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn has_tx_returns_true_for_present_tx() {
