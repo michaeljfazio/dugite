@@ -390,6 +390,13 @@
                   "integer",
                   "null"
                 ]
+              },
+              "compared": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "Queries actually compared against BOTH sockets (EQUAL+DIVERGENT+ERROR). SKIPs are excluded \u2014 the denominator must measure comparisons made, not rows emitted."
               }
             }
           },

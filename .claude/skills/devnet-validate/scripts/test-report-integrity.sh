@@ -36,6 +36,7 @@ PASSED=0; FAILED=0
 ZOO_N=$(jq -r '.tx_zoo.expected_scripts // 85' "$DENOM" 2>/dev/null || echo 85)
 CHAOS_N=$(jq -r '.chaos.expected_cases // 6' "$DENOM" 2>/dev/null || echo 6)
 RPC_N=$(jq -r '.rpc.expected_checks // 27' "$DENOM" 2>/dev/null || echo 27)
+CLI_N=$(jq -r '.cli_parity.expected_queries // 22' "$DENOM" 2>/dev/null || echo 22)
 
 # ---- Synthetic evidence builders --------------------------------------------
 # Build one round dir that satisfies the standard preset completely.
@@ -209,6 +210,25 @@ make_round "$R1"; make_round "$R2"
   for i in $(seq 1 12); do echo "2026-08-02T00:00:01Z,script$i,PASS,txid$i,ok"; done
 } > "$R2/tx-results.csv"
 run_case "full zoo in round 1 + trickle in round 2 passes" 0 "" "$R1" "$R2"
+
+# --- Case 5d: cli-parity FULL of rows but mostly SKIPPED must FAIL ---
+#
+# Observed live: heavy tx-zoo/parity load pushed cardano-bp behind, the suite
+# emitted all 22 rows but 18 of them were `SKIP  TIP_UNSTABLE after 20
+# attempts`, and the gate reported "denominator: 22/22 queries OK".
+#
+# 22 rows, 4 comparisons. A denominator that counts rows EMITTED rather than
+# comparisons MADE is the #953 disease inside the #953 fix.
+R1="$TMP/skipped-cli/r1"; R2="$TMP/skipped-cli/r2"
+make_round "$R1"; make_round "$R2"
+{ echo "ts,query,status,dugite_sha256,cardano_sha256,equal,notes"
+  echo "2026-08-02T00:00:01Z,tip/era,EQUAL,aa,aa,true,"
+  for i in $(seq 2 "$CLI_N"); do
+    echo "2026-08-02T00:00:01Z,query$i,SKIP,,,,TIP_UNSTABLE after 20 attempts"
+  done
+} > "$R1/cli-parity.csv"
+cp "$R1/cli-parity.csv" "$R2/cli-parity.csv"
+run_case "cli-parity full of rows but mostly SKIPPED fails" 3 "below the pinned" "$R1" "$R2"
 
 # --- Case 6: cli-parity short of its denominator (finding 5) ---
 R1="$TMP/short-cli/r1"; R2="$TMP/short-cli/r2"

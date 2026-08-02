@@ -353,7 +353,7 @@ process_round() {
     # `status` ($3) is authoritative — see #945 for what indexing off the header
     # instead cost. env-skip vs state-skip are separated so a setup gap
     # ("pool1 id not found") is never mistaken for a compared query.
-    local cp_status="absent" cp_equal="null" cp_div="null" cp_env="null" cp_state="null" cp_err="null" cp_total="null"
+    local cp_status="absent" cp_equal="null" cp_div="null" cp_env="null" cp_state="null" cp_err="null" cp_total="null" cp_compared="null"
     local parity_csv="$evd/cli-parity.csv"
     if [ -f "$parity_csv" ] && [ -s "$parity_csv" ]; then
         cp_equal=$(awk -F, 'NR>1 && $3=="EQUAL" {c++} END{print c+0}' "$parity_csv")
@@ -362,7 +362,17 @@ process_round() {
         cp_state=$(awk -F, 'NR>1 && $3=="SKIP" && $7!~/env-skip/ {c++} END{print c+0}' "$parity_csv")
         cp_err=$(awk -F, 'NR>1 && $3=="ERROR" {c++} END{print c+0}' "$parity_csv")
         cp_total=$(_rows "$parity_csv")
-        cp_status=$(_status_for "$cp_total" "$EXP_CLI")
+        # COMPARED, not merely emitted. A SKIP row means the query was never
+        # actually run against both sockets, so counting it toward the
+        # denominator reports "22/22 queries" for a run that compared four.
+        #
+        # That is the #953 disease inside the #953 fix: a denominator measuring
+        # rows produced rather than comparisons made. Observed live — heavy
+        # tx-zoo/parity load pushed cardano-bp behind, cli-parity skipped 18 of
+        # 22 with `TIP_UNSTABLE after 20 attempts`, and the gate still said
+        # "denominator: 22/22 queries OK".
+        cp_compared=$(awk -F, 'NR>1 && ($3=="EQUAL" || $3=="DIVERGENT" || $3=="ERROR") {c++} END{print c+0}' "$parity_csv")
+        cp_status=$(_status_for "$cp_compared" "$EXP_CLI")
     fi
 
     # --- Bidirectional parity matrix (the strongest predicate) ---
@@ -549,6 +559,7 @@ process_round() {
     "state_skip": $cp_state,
     "error": $cp_err,
     "total": $cp_total,
+    "compared": $cp_compared,
     "expected": $EXP_CLI
   },
   "parity_matrix": {
