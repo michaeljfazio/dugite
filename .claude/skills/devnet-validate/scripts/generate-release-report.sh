@@ -119,10 +119,9 @@ EXP_CHAOS=$(_denom '.chaos.expected_cases' 0)
 #
 # A suite belongs here only once it HAS a driver that a preset invokes. The
 # manifest must describe what the preset actually runs, otherwise the gate is
-# red for a reason unrelated to the build under test. chaos-events.csv is
-# parsed and schema-slotted below but deliberately not required yet — chaos/
-# has no run.sh driver and is wired into no preset; #959 adds the driver and
-# the manifest entry together.
+# red for a reason unrelated to the build under test. chaos-events.csv was
+# held out until #959 supplied chaos/run.sh and wired it into the presets;
+# it is required from standard upward now that both exist.
 preset_manifest() {
     case "$1" in
         smoke)
@@ -142,6 +141,7 @@ tx_results|tx-results.csv|any
 cli_parity|cli-parity.csv|any
 n2n_trace|n2n-trace.csv|any
 parity_matrix|parity-matrix.csv|any
+chaos_events|chaos-events.csv|any
 EOF
             ;;
         extended)
@@ -156,6 +156,7 @@ tx_results|tx-results.csv|any
 cli_parity|cli-parity.csv|any
 n2n_trace|n2n-trace.csv|any
 parity_matrix|parity-matrix.csv|any
+chaos_events|chaos-events.csv|any
 throughput|throughput.csv|any
 resource_samples|resource-samples.csv|any
 log_anomalies|log-anomalies.csv|any

@@ -19,9 +19,11 @@ The tx-zoo lives at `testnet/local-devnet/tx-zoo/`. It exercises every Conway-er
 | 10 | gov lifecycle | 5 | propose → DRep vote → SPO vote → CC vote → assert enactment. **ParameterChange only** (#956) |
 | 11 | mempool | 3 | TTL eviction, input-conflict rejection, drain latency p99 |
 | 12 | post-enactment | 1 | InvalidPrevGovActionId — only meaningful once an action has actually enacted, so it MUST run after 10 |
+| 13 | script purposes | 9 | Plutus **Certifying / Rewarding / Voting / Proposing** purposes + native-script and Plutus stake credentials. Asserts the redeemer purpose tag is on the wire (`tx-cbor-tool.py redeemers --require`), and requires Haskell confirmation via `wait_all_strict` — no "cbp lagging" soft-pass (#955) |
+| 14 | gov negatives | 6 | Conway `ConwayGovPredFailure` rejection **classes**: GovActionsDoNotExist, VotersDoNotExist, DisallowedVoters, ProposalDepositIncorrect (below *and* above — the check is exact equality, not a floor), TreasuryWithdrawalReturnAccountsDoNotExist (#956) |
 
-Total: **85 scripts** (excluding the 22 in `09-cli-parity`, which measure the
-node's LSQ responses rather than tx admission). Sequential runtime ~6–10 minutes.
+Total: **100 scripts** (excluding the 22 in `09-cli-parity`, which measure the
+node's LSQ responses rather than tx admission). Sequential runtime ~8–12 minutes.
 
 The count is pinned in `../schemas/denominators.json` and asserted by
 `../scripts/test-denominators.sh`; adding a script without bumping the pin fails

@@ -193,6 +193,7 @@ devnet-validate-extended:
             [ "$B" -ge 5 ] && break
         done
         EVIDENCE_DIR="$EVD" ./tx-zoo/run-all.sh
+        CHAOS_SET=extended ./chaos/run.sh "$EVD"
         EVIDENCE_DIR="$EVD" ./sync/bulk-sync-throughput.sh
         EVIDENCE_DIR="$EVD" ./perf/resource-health.sh
         EVIDENCE_DIR="$EVD" ./perf/log-level-predicate.sh

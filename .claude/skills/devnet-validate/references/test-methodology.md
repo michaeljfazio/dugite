@@ -428,13 +428,14 @@ Tracked openly in this file so it's visible to every invocation of the skill:
 
 - [x] Bidirectional submission for 11-mempool tests (#954)
 - [x] Negative-tx symmetry for cardano-bp ingestion — all 19 of 08-negative now run path C, and reject *reasons* are compared, not just verdicts (#954)
-- [ ] Plutus script-eval-failure negative cases
+- [x] Plutus script-eval-failure negative cases (#955 13f: always-false Certifying)
 - [ ] Replay attack negative test
 - [ ] Equivocation / double-forge negative test
 - [ ] Mempool-size-DoS positive measurement (eviction order parity)
 - [ ] Tx-size lattice with `maxBlockBodySize` boundary check
-- [ ] Gov-lifecycle E2E for action classes other than `ParameterChange`
+- [~] Gov-lifecycle E2E for action classes other than `ParameterChange` — TreasuryWithdrawals covered by `gov-enactment-round.sh`; NoConfidence and HardForkInitiation deliberately deferred (they dissolve the committee / bump PV and so destroy later tests) (#956)
 - [ ] Per-observer mempool-event capture into `tx-flow.csv`
+- [x] Chaos suite fixed, driven and wired (#959) — kill-9 key paths, socat removal, chaos/run.sh, ENV_SKIP as a counted class
 - [ ] Round 4 (adversarial & stress) as a standard preset
 - [ ] Enable `--rpc-port` on the devnet's `run.sh` for both dugite-bp and dugite-relay
 - [ ] `09-cli-parity/` scripts for the un-covered cli subcommands (see CLI surface section)

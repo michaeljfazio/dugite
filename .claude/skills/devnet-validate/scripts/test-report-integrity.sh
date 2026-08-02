@@ -32,6 +32,10 @@ trap cleanup EXIT
 
 PASSED=0; FAILED=0
 
+# Pinned counts, so fixtures track the manifest instead of drifting from it.
+ZOO_N=$(jq -r '.tx_zoo.expected_scripts // 85' "$DENOM" 2>/dev/null || echo 85)
+CHAOS_N=$(jq -r '.chaos.expected_cases // 6' "$DENOM" 2>/dev/null || echo 6)
+
 # ---- Synthetic evidence builders --------------------------------------------
 # Build one round dir that satisfies the standard preset completely.
 make_round() { # make_round <dir> <n2n_rows> <cli_rows> <parity_rows>
@@ -75,9 +79,11 @@ EOF
 | p5 | tip-age | PASS | p99 1.5s |
 EOF
 
-    # tx-zoo per-round snapshot at the pinned denominator
+    # tx-zoo per-round snapshot AT the pinned denominator, read from the
+    # manifest rather than hardcoded — a fixture that drifts from the pin makes
+    # the control case fail for a reason unrelated to what is being tested.
     { echo "ts,script,status,txid,detail"
-      for i in $(seq 1 85); do echo "2026-08-02T00:00:01Z,script$i,PASS,txid$i,ok"; done
+      for i in $(seq 1 "$ZOO_N"); do echo "2026-08-02T00:00:01Z,script$i,PASS,txid$i,ok"; done
     } > "$d/tx-results.csv"
 
     { echo "ts,protocol,msg_type,peer,dir,size_bytes,outcome,notes"
@@ -96,7 +102,7 @@ EOF
 EOF
 
     { echo "ts,scenario,action,recovery_sec,result"
-      for i in $(seq 1 6); do echo "2026-08-02T00:00:01Z,scenario$i,act,5,PASS"; done
+      for i in $(seq 1 "$CHAOS_N"); do echo "2026-08-02T00:00:01Z,scenario$i,act,5,PASS"; done
     } > "$d/chaos-events.csv"
 }
 
@@ -211,7 +217,7 @@ adm=$(jq -r '.gate_integrity.admissible' "$OUTD/report.json" 2>/dev/null)
 nmiss=$(jq -r '.gate_integrity.missing | length' "$OUTD/report.json" 2>/dev/null)
 cli_status=$(jq -r '.rounds[0].cli_parity.status' "$OUTD/report.json" 2>/dev/null)
 cli_equal=$(jq -r '.rounds[0].cli_parity.equal' "$OUTD/report.json" 2>/dev/null)
-if [ "$rc" -eq 0 ] && [ "$adm" = "false" ] && [ "${nmiss:-0}" -ge 3 ] \
+if [ "$rc" -eq 0 ] && [ "$adm" = "false" ] && [ "${nmiss:-0}" -ge 4 ] \
    && [ "$cli_status" = "absent" ] && [ "$cli_equal" = "null" ]; then
     printf '  \033[32mPASS\033[0m  %-52s (exit %d)\n' "--no-strict records omissions, counts are null" "$rc"
     PASSED=$(( PASSED + 1 ))
@@ -219,7 +225,7 @@ else
     printf '  \033[31mFAIL\033[0m  %-52s\n' "--no-strict records omissions, counts are null"
     printf '        rc=%s admissible=%s missing=%s cli.status=%s cli.equal=%s\n' \
            "$rc" "$adm" "$nmiss" "$cli_status" "$cli_equal"
-    printf '        (want rc=0 admissible=false missing>=3 status=absent equal=null)\n'
+    printf '        (want rc=0 admissible=false missing>=4 status=absent equal=null)\n'
     FAILED=$(( FAILED + 1 ))
 fi
 

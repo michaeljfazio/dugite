@@ -146,6 +146,8 @@ EVIDENCE_DIR="$EVD" ./tx-zoo/run-all.sh   # ~3-5 min — all 85 tx scripts (via 
 ./tx-zoo/09-cli-parity/run.sh "$EVD"   # ~1 min — 22 LSQ parity checks; writes cli-parity.csv
 ./tx-zoo/cross-validate-cli.sh         # ~1 min — dugite-cli ↔ cardano-cli submit parity
 ./protocols/run.sh "$EVD"              # ~2 min — adversarial N2N framing; writes n2n-trace.csv
+./chaos/run.sh "$EVD"                  # ~3 min — kill-9 recovery + app-nap + clock-skew
+                                       #          + syn-flood; writes chaos-events.csv
 EVIDENCE_DIR="$EVD" ./soak.sh 120      # 2 min idle evidence
 ./verify.sh "$EVD"
 ../../.claude/skills/devnet-validate/scripts/analyze-evidence.sh "$EVD"
@@ -183,6 +185,8 @@ tail -F logs/cardano-bp.log   | grep -E 'AddedToCurrentChain|AddBlockValidation\
 - `analyze-evidence.sh` reports no anomalies
 - `evidence/<ts>/cli-parity.csv` has zero DIVERGENT rows that are not filed as known-divergence issues, **and zero ERROR rows** (`09-cli-parity/run.sh` now exits 1 on either). An ERROR row noted `HARNESS both-sides-failed` means the suite passed cardano-cli arguments it does not accept — fix the `09*.sh` script, do not add it to `KNOWN_DIVERGENCES`
 - `evidence/<ts>/n2n-trace.csv` has zero PANIC or SILENT_SKIP rows
+- `evidence/<ts>/chaos-events.csv` has zero FAIL rows, and any `ENV_SKIP` row is
+  a surface that was **not** exercised — investigate rather than accept it
 - Bidirectional parity wrapper (`bidirectional-parity.sh`, no args = the pinned standard set of 9 categories / 79 scripts) exits 0 — zero `OFFDIAG` and zero unexplained `CLASSDIFF` rows in `evidence/<ts>/parity-matrix.csv`
 - `tx-zoo/state/cross-validate.csv` shows PASS for every representative tx submitted through `dugite-cli`
 
@@ -375,7 +379,7 @@ The harness now covers 9 dimensions across 3 intensity presets:
 | D3 | N2N adversarial | handshake only | + all 7 protocol scripts | + slow-loris |
 | D4 | N2C CLI parity | 3 queries | 22 queries (09a–09v), all compared | all |
 | D5 | Sync paths | from-relay-tip | + bulk-throughput | + from-genesis + Mithril |
-| D6 | Chaos | — | kill-9 + app-nap check | + partition + disk-full + flood |
+| D6 | Chaos | — | kill-9 + app-nap + clock-skew + syn-flood | + partition + disk-full |
 | D7 | Epoch transitions | 1 boundary | 2 boundaries | + gov-lifecycle enactment |
 | D8 | Resource health | log-level only | + CPU/RSS/FD sampling | + 30-min leak check |
 | D9 | Determinism | — | feasibility verdict | tip-hash match |
