@@ -162,8 +162,14 @@ EVIDENCE_DIR="$EVD" ./tx-zoo/run-all.sh   # ~3-5 min — all 85 tx scripts (via 
 ./tx-zoo/09-cli-parity/run.sh "$EVD"   # ~1 min — 22 LSQ parity checks; writes cli-parity.csv
 ./tx-zoo/cross-validate-cli.sh         # ~1 min — dugite-cli ↔ cardano-cli submit parity
 ./protocols/run.sh "$EVD"              # ~2 min — adversarial N2N framing; writes n2n-trace.csv
+./rpc/run.sh "$EVD"                    # ~1 min — UTxO RPC (gRPC); writes rpc.csv.
+                                       #          REQUIRED: the standard preset
+                                       #          manifest declares rpc.csv, so a
+                                       #          round set without it fails gate
+                                       #          integrity (exit 3).
 ./chaos/run.sh "$EVD"                  # ~3 min — kill-9 recovery + app-nap + clock-skew
-                                       #          + syn-flood; writes chaos-events.csv
+                                       #          + syn-flood; writes chaos-events.csv.
+                                       #          LAST of the three: it SIGKILLs on purpose.
 EVIDENCE_DIR="$EVD" ./soak.sh 120      # 2 min idle evidence
 ./verify.sh "$EVD"
 ../../.claude/skills/devnet-validate/scripts/analyze-evidence.sh "$EVD"
@@ -289,14 +295,13 @@ TIP_AFTER=$(cardano-cli query tip --testnet-magic 42 --socket-path "$LD_DUGITE_B
 
 If Round 3 stalls past 60s, suspect the stale-intersection bug (memory: `project_stale_intersection_when_peer_behind`). Capture logs + metrics + evidence and report.
 
-### Round 4 — RPC + chaos (~3 min, runs on the Round 1 devnet)
+### Round 4 — RPC + chaos
 
-```bash
-./rpc/run.sh        # UTxO RPC (gRPC) — #960; exits 1 on any FAIL/ERROR
-./chaos/run.sh      # failure injection — #959; kill-9 LAST, it SIGKILLs on purpose
-```
+Both now run **inside Round 1** against the same pinned `$EVD` (see the command block above) — they are listed here only for their pass criteria, not as a separate boot.
 
 **PASSES iff** `rpc.csv` has zero FAIL/ERROR rows and at least one PASS (a suite producing zero passing checks is treated as a failure, not a clean sweep), and `chaos-events.csv` has zero FAIL and zero ENV_SKIP.
+
+Both suites write into the round's evidence directory and are declared in the standard/extended preset manifests, so omitting either fails gate integrity rather than silently shrinking the report.
 
 ### Round 5 — Two-forger contention (~10 min, its own devnet) — #957
 
