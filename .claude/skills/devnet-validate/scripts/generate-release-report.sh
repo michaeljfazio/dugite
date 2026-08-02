@@ -110,6 +110,7 @@ EXP_TX_ZOO=$(_denom '.tx_zoo.expected_scripts' 0)
 EXP_CLI=$(_denom '.cli_parity.expected_queries' 0)
 EXP_N2N=$(_denom '.n2n_adversarial.expected_cases' 0)
 EXP_CHAOS=$(_denom '.chaos.expected_cases' 0)
+EXP_RPC=$(_denom '.rpc.expected_checks' 0)
 
 # ---- Preset evidence manifest ------------------------------------------------
 # Format: "<key>|<filename>|<scope>"  where scope ∈ {every, any}
@@ -142,6 +143,7 @@ cli_parity|cli-parity.csv|any
 n2n_trace|n2n-trace.csv|any
 parity_matrix|parity-matrix.csv|any
 chaos_events|chaos-events.csv|any
+rpc|rpc.csv|any
 EOF
             ;;
         extended)
@@ -157,6 +159,7 @@ cli_parity|cli-parity.csv|any
 n2n_trace|n2n-trace.csv|any
 parity_matrix|parity-matrix.csv|any
 chaos_events|chaos-events.csv|any
+rpc|rpc.csv|any
 throughput|throughput.csv|any
 resource_samples|resource-samples.csv|any
 log_anomalies|log-anomalies.csv|any
@@ -424,6 +427,21 @@ process_round() {
         ch_status=$(_status_for "$ch_total" "$EXP_CHAOS")
     fi
 
+    # --- D10: UTxO RPC (gRPC) --- (#960)
+    # Columns: ts,check,api_version,endpoint,status,detail
+    local rpc_status="absent" rpc_pass="null" rpc_fail="null" rpc_err="null" \
+          rpc_envskip="null" rpc_stateskip="null" rpc_total="null"
+    local rpc_csv="$evd/rpc.csv"
+    if [ -f "$rpc_csv" ] && [ -s "$rpc_csv" ]; then
+        rpc_pass=$(awk -F, 'NR>1 && $5=="PASS"  {c++} END{print c+0}' "$rpc_csv")
+        rpc_fail=$(awk -F, 'NR>1 && $5=="FAIL"  {c++} END{print c+0}' "$rpc_csv")
+        rpc_err=$( awk -F, 'NR>1 && $5=="ERROR" {c++} END{print c+0}' "$rpc_csv")
+        rpc_envskip=$(awk -F, 'NR>1 && $5=="SKIP" && $6~/env-skip/  {c++} END{print c+0}' "$rpc_csv")
+        rpc_stateskip=$(awk -F, 'NR>1 && $5=="SKIP" && $6!~/env-skip/ {c++} END{print c+0}' "$rpc_csv")
+        rpc_total=$(_rows "$rpc_csv")
+        rpc_status=$(_status_for "$rpc_total" "$EXP_RPC")
+    fi
+
     # --- D5: Throughput ---
     local tp_status="absent" tp_scen="null" tp_max="null" tp_min="null"
     local tp_csv="$evd/throughput.csv"
@@ -552,6 +570,16 @@ process_round() {
     "env_skip": $ch_env,
     "total": $ch_total,
     "expected": $EXP_CHAOS
+  },
+  "rpc": {
+    "status": "$rpc_status",
+    "pass": $rpc_pass,
+    "fail": $rpc_fail,
+    "error": $rpc_err,
+    "env_skip": $rpc_envskip,
+    "state_skip": $rpc_stateskip,
+    "total": $rpc_total,
+    "expected": $EXP_RPC
   },
   "throughput": {
     "status": "$tp_status",

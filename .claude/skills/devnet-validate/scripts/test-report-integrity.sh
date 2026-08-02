@@ -35,6 +35,7 @@ PASSED=0; FAILED=0
 # Pinned counts, so fixtures track the manifest instead of drifting from it.
 ZOO_N=$(jq -r '.tx_zoo.expected_scripts // 85' "$DENOM" 2>/dev/null || echo 85)
 CHAOS_N=$(jq -r '.chaos.expected_cases // 6' "$DENOM" 2>/dev/null || echo 6)
+RPC_N=$(jq -r '.rpc.expected_checks // 27' "$DENOM" 2>/dev/null || echo 27)
 
 # ---- Synthetic evidence builders --------------------------------------------
 # Build one round dir that satisfies the standard preset completely.
@@ -104,6 +105,14 @@ EOF
     { echo "ts,scenario,action,recovery_sec,result"
       for i in $(seq 1 "$CHAOS_N"); do echo "2026-08-02T00:00:01Z,scenario$i,act,5,PASS"; done
     } > "$d/chaos-events.csv"
+
+    # rpc.csv (#960). Read from the manifest like ZOO_N/CHAOS_N so the fixture
+    # cannot drift away from the pinned denominator.
+    { echo "ts,check,api_version,endpoint,status,detail"
+      for i in $(seq 1 "$RPC_N"); do
+        echo "2026-08-02T00:00:01Z,check$i,v1alpha,svc/Method,PASS,ok"
+      done
+    } > "$d/rpc.csv"
 }
 
 # ---- Case runner -------------------------------------------------------------
@@ -209,7 +218,7 @@ run_case "cli-parity below pinned denominator fails" 3 "below the pinned" "$R1" 
 # --- Case 7: --no-strict records the omission instead of hiding it ---
 # Non-strict must still be HONEST: exit 0 is allowed, silence is not.
 R1="$TMP/nostrict/r1"
-make_round "$R1"; rm -f "$R1/cli-parity.csv" "$R1/n2n-trace.csv" "$R1/parity-matrix.csv" "$R1/chaos-events.csv"
+make_round "$R1"; rm -f "$R1/cli-parity.csv" "$R1/n2n-trace.csv" "$R1/parity-matrix.csv" "$R1/chaos-events.csv" "$R1/rpc.csv"
 OUTD="$TMP/out-nostrict"
 "$GEN" --preset standard --no-strict --output-dir "$OUTD" --denominators "$DENOM" "$R1" >/dev/null 2>&1
 rc=$?

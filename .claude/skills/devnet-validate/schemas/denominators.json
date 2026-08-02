@@ -4,7 +4,7 @@
     "",
     "WHY THIS FILE EXISTS (#953, same class as #945/#923): every suite in this",
     "harness reports N/N by counting the rows it produced. A stimulus that never",
-    "fires produces no row, so N/N is tautological — '26/26 adversarial' said",
+    "fires produces no row, so N/N is tautological \u2014 '26/26 adversarial' said",
     "nothing about whether 26 cases ran. A denominator is only meaningful when it",
     "comes from OUTSIDE the run that produces the numerator.",
     "",
@@ -44,7 +44,7 @@
   "n2n_adversarial": {
     "expected_scripts": 7,
     "expected_cases": 26,
-    "$comment": "Rows in n2n-trace.csv. NOT the same as the count of adv_record call sites (28) — two sites are mutually-exclusive branches. Confirmed live: see the closing evidence on #953."
+    "$comment": "Rows in n2n-trace.csv. NOT the same as the count of adv_record call sites (28) \u2014 two sites are mutually-exclusive branches. Confirmed live: see the closing evidence on #953."
   },
   "chaos": {
     "expected_scripts": 6,
@@ -68,8 +68,8 @@
     "excluded_categories": {
       "10-gov-lifecycle": "Chain-global governance lifecycle: propose -> 3-role vote -> assert enactment. Two batches would create two proposals in the same lane and both vote; ratification is a property of the whole chain, not of a batch, so the second batch's enactment assertion is not independent. Covered on path B only.",
       "12-post-enactment": "Only meaningful once a governance action has actually ENACTED, so it depends on 10 having run and on global chain state. Same reason as 10.",
-      "13-script-purposes": "The guarding scripts are fixed (always-true/false V3, one native), so their hashes are deterministic and BOTH parity batches would share one stake credential and one DRep credential. Batch 1 registers and then deregisters it, so batch 2 acts on state batch 1 already mutated — the same class as 05g/05h. These scripts instead demand Haskell confirmation directly: they use wait_all_strict, which requires all three observers and never soft-passes on 'cbp lagging'.",
-      "14-gov-negatives": "Governance negatives assert rejection CLASSES against chain-global gov state (live actions, registered DReps). Both batches would target the same actions, so batch 2's result depends on what batch 1 did — same class as 10/12. The rejection class is already compared against cardano-node directly by each script.",
+      "13-script-purposes": "The guarding scripts are fixed (always-true/false V3, one native), so their hashes are deterministic and BOTH parity batches would share one stake credential and one DRep credential. Batch 1 registers and then deregisters it, so batch 2 acts on state batch 1 already mutated \u2014 the same class as 05g/05h. These scripts instead demand Haskell confirmation directly: they use wait_all_strict, which requires all three observers and never soft-passes on 'cbp lagging'.",
+      "14-gov-negatives": "Governance negatives assert rejection CLASSES against chain-global gov state (live actions, registered DReps). Both batches would target the same actions, so batch 2's result depends on what batch 1 did \u2014 same class as 10/12. The rejection class is already compared against cardano-node directly by each script.",
       "15-asset-lattice": "Mint policies are derived from the batch's own payment key, so the two parity batches mint under DIFFERENT policy ids and the resulting values are not comparable cell-for-cell. The properties under test (encodeMap definite/indefinite boundaries at 23/24/256, multi-policy values, mint+burn) are wire-shape properties already checked against cardano-node by zoo_wait_all_observers on every script."
     },
     "excluded_scripts": {
@@ -79,5 +79,9 @@
     "known_reject_reason_differences": {
       "08f-double-spend": "#925 - a Conway duplicate input fails at the CBOR set layer. Haskell drops the connection ('mux: bearer closed'); dugite deliberately answers a structured MsgRejectTx naming the rule. dugite is more informative here; not a defect."
     }
+  },
+  "rpc": {
+    "expected_checks": 27,
+    "_comment": "Rows written by rpc/run.sh: 1 service-discovery + 8 service-present + 1 relay-reachable + 2 read-params + 2 cost-models + 2 read-tip + 2 read-utxos + 2 submit-tx + 2 malformed-cbor + 1 oversized + 1 empty-tx + 1 garbage-txoref + 1 duplicate-concurrent-submit + 1 mempool-hygiene = 27. Pinned from OUTSIDE the run so 27/27 is not tautological; a suite that silently stops emitting rows fails the gate instead of reporting a smaller clean sweep."
   }
 }

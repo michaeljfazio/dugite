@@ -17,7 +17,7 @@
     "schema_version": {
       "type": "integer",
       "const": 2,
-      "description": "Schema version — always 2 for this schema."
+      "description": "Schema version \u2014 always 2 for this schema."
     },
     "timestamp": {
       "type": "string",
@@ -51,7 +51,7 @@
     },
     "gate_integrity": {
       "type": "object",
-      "description": "Whether this report is admissible as a release gate. A report with strict=false or a non-empty `missing` list MUST NOT be used to tag a release — it is a partial run, and the counts below under-report coverage rather than measuring it.",
+      "description": "Whether this report is admissible as a release gate. A report with strict=false or a non-empty `missing` list MUST NOT be used to tag a release \u2014 it is a partial run, and the counts below under-report coverage rather than measuring it.",
       "required": [
         "strict",
         "admissible",
@@ -84,7 +84,7 @@
     },
     "rounds": {
       "type": "array",
-      "description": "One entry per round executed (baseline, epoch-boundary, restart, …).",
+      "description": "One entry per round executed (baseline, epoch-boundary, restart, \u2026).",
       "items": {
         "type": "object",
         "required": [
@@ -163,7 +163,7 @@
           },
           "tx_zoo": {
             "type": "object",
-            "description": "tx-zoo outcome for this round. status='absent' means no tx-results.csv was snapshotted for the round — the counts are null, NOT zero.",
+            "description": "tx-zoo outcome for this round. status='absent' means no tx-results.csv was snapshotted for the round \u2014 the counts are null, NOT zero.",
             "required": [
               "status"
             ],
@@ -337,7 +337,7 @@
           },
           "cli_parity": {
             "type": "object",
-            "description": "D4. LSQ parity from cli-parity.csv. env_skip is a first-class count — folding it into `equal` is what hid 4/22 uncompared queries.",
+            "description": "D4. LSQ parity from cli-parity.csv. env_skip is a first-class count \u2014 folding it into `equal` is what hid 4/22 uncompared queries.",
             "required": [
               "status"
             ],
@@ -395,7 +395,7 @@
           },
           "parity_matrix": {
             "type": "object",
-            "description": "The bidirectional accept/reject parity oracle — the harness's strongest predicate. Recorded durably here because tx-zoo/state/parity-matrix.csv is overwritten every run.",
+            "description": "The bidirectional accept/reject parity oracle \u2014 the harness's strongest predicate. Recorded durably here because tx-zoo/state/parity-matrix.csv is overwritten every run.",
             "required": [
               "status"
             ],
@@ -652,6 +652,60 @@
                 ]
               }
             }
+          },
+          "rpc": {
+            "type": "object",
+            "description": "UTxO RPC (gRPC) suite results (#960). status 'absent' means the suite did not run for this round \u2014 it must serialize as null counts, never as 0, so 'not measured' is distinguishable from 'measured and clean'.",
+            "properties": {
+              "status": {
+                "type": "string"
+              },
+              "pass": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "fail": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "error": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "env_skip": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "state_skip": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "total": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "expected": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "status"
+            ]
           }
         }
       }
