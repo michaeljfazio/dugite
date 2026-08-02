@@ -37,10 +37,6 @@ Input
 140.0
 </text>
 <polyline fill="none" opacity="1" stroke="#000000" stroke-width="1" points="80,106 85,106 "/>
-<text x="76" y="53" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="9.67741935483871" opacity="1" fill="#000000">
-160.0
-</text>
-<polyline fill="none" opacity="1" stroke="#000000" stroke-width="1" points="80,53 85,53 "/>
 <polyline fill="none" opacity="1" stroke="#000000" stroke-width="1" points="86,474 933,474 "/>
 <text x="155" y="484" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="9.67741935483871" opacity="1" fill="#000000">
 50.0
@@ -85,8 +81,8 @@ Input
 <circle cx="86" cy="473" r="3" opacity="1" fill="#B22222" stroke="none" stroke-width="1"/>
 <circle cx="155" cy="457" r="3" opacity="1" fill="#B22222" stroke="none" stroke-width="1"/>
 <circle cx="241" cy="436" r="3" opacity="1" fill="#B22222" stroke="none" stroke-width="1"/>
-<circle cx="933" cy="269" r="3" opacity="1" fill="#B22222" stroke="none" stroke-width="1"/>
-<polyline fill="none" opacity="1" stroke="#B22222" stroke-width="1" points="86,473 155,457 241,436 933,269 "/>
+<circle cx="933" cy="268" r="3" opacity="1" fill="#B22222" stroke="none" stroke-width="1"/>
+<polyline fill="none" opacity="1" stroke="#B22222" stroke-width="1" points="86,473 155,457 241,436 933,268 "/>
 <circle cx="155" cy="407" r="3" opacity="1" fill="#2E8B57" stroke="none" stroke-width="1"/>
 <circle cx="241" cy="336" r="3" opacity="1" fill="#2E8B57" stroke="none" stroke-width="1"/>
 <circle cx="587" cy="52" r="3" opacity="1" fill="#2E8B57" stroke="none" stroke-width="1"/>
