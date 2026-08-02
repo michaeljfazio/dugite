@@ -8,7 +8,7 @@
 # pattern when a peer sends a block with a slot far in the future.
 #
 # We send a crafted header with an artificially large slot via the adversarial
-# N2N harness (socat). If the adversarial test harness is not available, this
+# N2N harness (the vendored stdlib raw-socket writer). If it is not available, this
 # test skips gracefully.
 #
 # Recovery: no recovery needed — we're testing rejection, not disruption.
@@ -17,8 +17,19 @@ set -euo pipefail
 SCENARIO="clock-skew"
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
-# Require socat for adversarial send
-command -v socat >/dev/null 2>&1 || { chaos_record "$SCENARIO" "skip" "0" "SKIP" "socat-not-available"; exit 0; }
+# Raw-socket send via the VENDORED stdlib writer, not socat.
+#
+# socat is not present on a stock macOS, so this scenario skipped silently on
+# every developer machine — the exact mechanism of #923, where the adversarial
+# N2N suite "passed" 26 cases without sending a byte. protocols/ was migrated
+# off socat for that reason; chaos never was.
+#
+# An absent writer is an ENV_SKIP (a counted class), never silence.
+CHAOS_RAW_SEND="${CHAOS_RAW_SEND:-$LD_ROOT/tx-zoo/lib/raw-socket-send.py}"
+if [ ! -f "$CHAOS_RAW_SEND" ]; then
+    chaos_record "$SCENARIO" "skip" "0" "ENV_SKIP" "raw-socket-send.py-missing at $CHAOS_RAW_SEND"
+    exit 0
+fi
 [ -S "$LD_DUGITE_BP_SOCK" ] || die "$SCENARIO: dugite-bp socket not present"
 
 LOG_LINE_BEFORE=$(wc -l < "$LD_LOGS/dugite-bp.log" 2>/dev/null || echo 0)
@@ -49,7 +60,7 @@ PAYLOAD_LEN=$(( ${#PAYLOAD_CLEAN} / 2 ))
 MUX_HDR=$(printf '%08x%04x%04x' 0 2 "$PAYLOAD_LEN")
 
 (echo -n "${MUX_HDR}${PAYLOAD_CLEAN}" | xxd -r -p; sleep 2) | \
-    timeout 5 socat - "TCP:127.0.0.1:${LD_RELAY_PORT}" 2>/dev/null || true
+    timeout 5 python3 "$CHAOS_RAW_SEND" --host 127.0.0.1 --port "${LD_RELAY_PORT}" --stdin-hex 2>/dev/null || true
 
 sleep 2
 

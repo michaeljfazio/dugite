@@ -29,7 +29,18 @@ log_info "$SCENARIO: flooding port $LD_DUGITE_BP_PORT with $FLOOD_CONNS connecti
 # This simulates a client that connects but never completes the handshake.
 flood_one() {
     (echo -n "\x00"; sleep 0.1) | \
-        timeout 2 socat - "TCP:127.0.0.1:${LD_DUGITE_BP_PORT}" 2>/dev/null || true
+        # A bare TCP connect-and-drop. socat added nothing here beyond a
+        # dependency that is absent on stock macOS, which made the whole
+        # scenario skip silently (#923's shape). python3 is already required
+        # by the harness.
+        timeout 2 python3 -c '
+import socket,sys
+try:
+    s=socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=1)
+    s.close()
+except Exception:
+    pass
+' "${LD_DUGITE_BP_PORT}" 2>/dev/null || true
 }
 
 T_FLOOD_START=$(date +%s)

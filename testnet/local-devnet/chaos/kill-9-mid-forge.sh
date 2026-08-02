@@ -14,8 +14,17 @@ RECOVERY_BOUND="${KILL9_RECOVERY_SEC:-120}"
 [ -S "$LD_DUGITE_BP_SOCK" ] || die "$SCENARIO: dugite-bp socket not present — run ./run.sh first"
 [ -f "$LD_STATE/dugite-bp.pid" ] || die "$SCENARIO: dugite-bp.pid not found"
 
-BP_PID=$(cat "$LD_STATE/dugite-bp.pid")
-if ! kill -0 "$BP_PID" 2>/dev/null; then
+# Resolve the NODE pid by command line, not from the pidfile.
+#
+# On macOS run.sh launches the node under `caffeinate`, so $LD_STATE/dugite-bp.pid
+# can hold the WRAPPER's pid (restart-dugite-bp.sh documents this). SIGKILLing
+# the wrapper leaves the node running: the "process still alive after SIGKILL"
+# check passes (the wrapper really is dead), the script then starts a SECOND
+# node on the same database, and the #929 directory lock rejects it. The
+# scenario would fail for a reason entirely unrelated to SIGKILL recovery.
+BP_PID=$(pgrep -f "dugite-node run .*dugite-bp" | head -1)
+[ -n "$BP_PID" ] || BP_PID=$(cat "$LD_STATE/dugite-bp.pid" 2>/dev/null)
+if [ -z "$BP_PID" ] || ! kill -0 "$BP_PID" 2>/dev/null; then
     log_warn "$SCENARIO: dugite-bp PID $BP_PID is not running — skipping"
     chaos_record "$SCENARIO" "skip" "0" "SKIP" "dugite-bp-not-running"
     exit 0
@@ -41,18 +50,33 @@ fi
 
 log_info "$SCENARIO: process killed, restarting dugite-bp..."
 
-# Restart dugite-bp using the same command from run.sh
-"$DUGITE_BIN" run \
+# Restart dugite-bp with the SAME flags run.sh uses.
+#
+# The previous version could never have worked, and had never run: it passed
+# $LD_KEYS/kes.skey, $LD_KEYS/vrf.skey and $LD_KEYS/node.cert — none of which
+# exist. The real paths are keys/pool1/{kes.skey,vrf.skey,opcert.cert}
+# (cf. run.sh). The node would have failed to boot and the scenario would have
+# FAILed on its 120s recovery timeout, blaming dugite for a harness bug.
+#
+# It also wrote the log with `>` instead of `>>`, destroying the round's entire
+# forge history — the evidence a SIGKILL-recovery test exists to preserve.
+#
+# `--metrics-port` matters too: without it the restarted node binds the default
+# port and the health probes read a different node than the one under test.
+#
+# scripts/restart-dugite-bp.sh is the canonical reference for this invocation.
+caffeinate_if_macos "$DUGITE_BIN" run \
     --config        "$LD_CONFIG/dugite-bp.config.json" \
     --topology      "$LD_CONFIG/dugite-bp.topology.json" \
     --database-path "$LD_STATE/dugite-bp.db" \
     --socket-path   "$LD_DUGITE_BP_SOCK" \
     --host-addr     127.0.0.1 \
     --port          "$LD_DUGITE_BP_PORT" \
-    --shelley-kes-key          "$LD_KEYS/kes.skey" \
-    --shelley-vrf-key          "$LD_KEYS/vrf.skey" \
-    --shelley-operational-certificate "$LD_KEYS/node.cert" \
-    > "$LD_LOGS/dugite-bp.log" 2>&1 &
+    --metrics-port  "$LD_DUGITE_BP_METRICS_PORT" \
+    --shelley-kes-key                 "$LD_KEYS/pool1/kes.skey" \
+    --shelley-vrf-key                 "$LD_KEYS/pool1/vrf.skey" \
+    --shelley-operational-certificate "$LD_KEYS/pool1/opcert.cert" \
+    >> "$LD_LOGS/dugite-bp.log" 2>&1 &
 NEW_PID=$!
 echo "$NEW_PID" > "$LD_STATE/dugite-bp.pid"
 log_info "$SCENARIO: restarted with PID $NEW_PID"
