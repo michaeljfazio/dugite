@@ -53,10 +53,44 @@ rpc_expect_error "$ADDR" "${PKG_B}.SubmitService/SubmitTx" \
 # ---- 2. Oversized message ----------------------------------------------
 # 8 MiB of zero bytes — comfortably past any sane max-frame setting. The
 # interesting outcome is a clean ResourceExhausted, not an OOM or a hang.
-BIG_B64=$(python3 -c 'import base64,sys; sys.stdout.write(base64.b64encode(b"\x00"*(8*1024*1024)).decode())')
-rpc_expect_error "$ADDR" "${PKG_A}.SubmitService/SubmitTx" \
-    "$(jq -nc --arg t "$BIG_B64" '{tx:[{raw:$t}]}')" \
-    "oversized-message" v1alpha "8 MiB payload" || RC=1
+#
+# The request body is assembled by python straight into a FILE. Two earlier
+# attempts passed the payload through argv — first to grpcurl, then to `jq
+# --arg` — and both died with "Argument list too long", so the request was
+# never built and the call failed for the wrong reason. rpc_expect_error saw a
+# non-zero status and scored it PASS: a green row for a payload that was never
+# sent. That is precisely the defect class this suite exists to remove, and it
+# survived one round of fixing because only the grpcurl half was addressed.
+BIG_BODY="$ZOO_BUILT/rpc-oversized.json"
+mkdir -p "$(dirname "$BIG_BODY")"
+python3 - "$BIG_BODY" <<'PYEOF'
+import base64, json, sys
+payload = base64.b64encode(b"\x00" * (8 * 1024 * 1024)).decode()
+with open(sys.argv[1], "w") as fh:
+    json.dump({"tx": [{"raw": payload}]}, fh)
+PYEOF
+BIG_SIZE=$(wc -c < "$BIG_BODY" | tr -d ' ')
+if [ "${BIG_SIZE:-0}" -lt 8000000 ]; then
+    rpc_row "oversized-message" v1alpha "${PKG_A}.SubmitService/SubmitTx" ERROR \
+        "could not build the oversized body (only ${BIG_SIZE} bytes) — refusing to report a result"
+    RC=1
+else
+    OUT=$(grpcurl -plaintext -max-time 30 -d @ "$ADDR" "${PKG_A}.SubmitService/SubmitTx" \
+            < "$BIG_BODY" 2>&1)
+    if [ $? -eq 0 ]; then
+        rpc_row "oversized-message" v1alpha "${PKG_A}.SubmitService/SubmitTx" FAIL \
+            "8 MiB payload was ACCEPTED"
+        RC=1
+    elif ! rpc_available "$ADDR"; then
+        rpc_row "oversized-message" v1alpha "${PKG_A}.SubmitService/SubmitTx" FAIL \
+            "8 MiB payload left the RPC server unreachable"
+        RC=1
+    else
+        rpc_row "oversized-message" v1alpha "${PKG_A}.SubmitService/SubmitTx" PASS \
+            "8 MiB payload ($BIG_SIZE B) rejected cleanly, server alive: $(printf '%s' "$OUT" | grep -oiE 'code = [A-Za-z]+|larger than max' | head -1)"
+    fi
+fi
+rm -f "$BIG_BODY"
 
 # ---- 3. Empty transaction bytes ----------------------------------------
 rpc_expect_error "$ADDR" "${PKG_A}.SubmitService/SubmitTx" \
@@ -92,8 +126,10 @@ PAY_ADDR=$(cat "$ZOO_PAY_ADDR_FILE" 2>/dev/null)
 DUP_WORK="$ZOO_BUILT/rpc-adv"; mkdir -p "$DUP_WORK"
 DUP_OK=0
 if [ -n "$PAY_ADDR" ]; then
-    TXIN=$(zoo_largest_utxo "$PAY_ADDR")
-    if [ -n "$TXIN" ]; then
+    # zoo_largest_utxo prints "<txin> <lovelace>" — take only the first field.
+    UTXO_LINE=$(zoo_largest_utxo "$PAY_ADDR")
+    TXIN="${UTXO_LINE%% *}"
+    if [ -n "$TXIN" ] && [ "$TXIN" != "null" ]; then
         cardano-cli conway transaction build \
             --testnet-magic "$LD_MAGIC" --socket-path "$ZOO_SOCKET" \
             --tx-in "$TXIN" --tx-out "$PAY_ADDR+2000000" \
@@ -125,15 +161,26 @@ PYEOF
     wait $P1; wait $P2
 
     # Count occurrences of this txid in the mempool snapshot.
-    N=$(cardano-cli conway query tx-mempool --testnet-magic "$LD_MAGIC" \
+    #
+    # WRAPPED IN `timeout`. This exact call hung for 40 MINUTES against dugite
+    # and wedged the whole suite, because LocalTxMonitor's MsgHasTx decoder
+    # expected a bare bstr where the wire carries `[era, bstr]`, so the server
+    # never replied (#968). A harness that can block forever on a node defect
+    # cannot report that defect — the timeout converts a hang into a finding.
+    N=$(timeout 20 cardano-cli conway query tx-mempool --testnet-magic "$LD_MAGIC" \
             --socket-path "$LD_DUGITE_BP_SOCK" tx-exists "$DUP_TXID" 2>/dev/null \
         | jq -r 'if .exists then 1 else 0 end' 2>/dev/null || echo "?")
+    if [ "$N" = "?" ]; then
+        rpc_row "mempool-tx-exists" v1alpha "LocalTxMonitor/HasTx" FAIL \
+            "query tx-mempool tx-exists did not answer within 20s (see #968)"
+        RC=1
+    fi
     if ! rpc_available "$ADDR"; then
         rpc_row "duplicate-concurrent-submit" v1alpha "${PKG_A}.SubmitService/SubmitTx" FAIL \
             "concurrent duplicate submit left the RPC server unreachable"
         RC=1
     else
-        SNAP=$(cardano-cli conway query tx-mempool --testnet-magic "$LD_MAGIC" \
+        SNAP=$(timeout 20 cardano-cli conway query tx-mempool --testnet-magic "$LD_MAGIC" \
                  --socket-path "$LD_DUGITE_BP_SOCK" next-tx 2>/dev/null | head -c 120)
         rpc_row "duplicate-concurrent-submit" v1alpha "${PKG_A}.SubmitService/SubmitTx" PASS \
             "concurrent duplicate handled; tx-exists=$N server alive (snap: ${SNAP:-none})"
