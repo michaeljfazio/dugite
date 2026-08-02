@@ -113,12 +113,21 @@ check_utxos() {
             "call failed for $txin: $(printf '%s' "$out" | head -1)"
         return 1
     fi
-    # `coin` must be read as a SCALAR. `.. | objects | select(has("coin"))`
-    # matches the enclosing object too, and `head -1` then took a whole JSON
-    # object — producing the nonsense "coin rpc={". Restrict to scalar values.
+    # `coin` is a BigInt MESSAGE (`oneof {int|big_u_int|big_n_int}`), not a
+    # plain scalar, so proto3 JSON renders it as an OBJECT: {"int":"5000000"}.
+    #
+    # Two harness bugs died here. First `.. | select(has("coin")) | .coin` with
+    # `head -1` grabbed the enclosing object and printed "coin rpc={". Then
+    # restricting to scalars rejected the BigInt wrapper outright and reported
+    # "no coin amount returned" against a response that carried it correctly.
+    # Unwrap the oneof, and accept a bare number too in case the mapping ever
+    # emits one.
     local got_coin
-    got_coin=$(printf '%s' "$out" \
-        | jq -r '[.. | objects | select(has("coin")) | .coin | select(type=="string" or type=="number")] | first // empty' 2>/dev/null)
+    got_coin=$(printf '%s' "$out" | jq -r '
+        [ .. | objects | select(has("coin")) | .coin
+          | if type == "object" then (.int // .bigUInt // .bigNInt)
+            else . end
+          | select(. != null) | tostring ] | first // empty' 2>/dev/null)
     if [ -z "$got_coin" ] || [ "$got_coin" = "null" ]; then
         rpc_row "read-utxos" "$ver" "${pkg}.QueryService/ReadUtxos" FAIL \
             "no coin amount returned for known UTxO $txin (raw: $(printf '%s' "$out" | head -c 200))"

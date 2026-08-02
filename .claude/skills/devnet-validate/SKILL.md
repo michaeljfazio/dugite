@@ -104,7 +104,9 @@ is seated at genesis, so once batch 1 resigns `cc-1`, batch 2 correctly gets
 `schemas/denominators.json`, and `test-denominators.sh` asserts that every
 category is either required or explicitly excluded.
 
-In addition to tx and N2N coverage, the skill exercises **dugite-cli surface parity** (today `09-cli-parity/` covers 22 query subcommands — see methodology doc for the full surface and gaps) and **UTxO RPC gRPC coverage** (Query / Submit / Sync / Watch services across v1alpha + v1beta; RPC is currently not wired into the devnet `run.sh` — opening this gap is tracked in the coverage-debt checklist).
+In addition to tx and N2N coverage, the skill exercises **dugite-cli surface parity** (today `09-cli-parity/` covers 22 query subcommands — see methodology doc for the full surface and gaps) and **UTxO RPC gRPC coverage** via `rpc/run.sh` (#960): `run.sh` now binds RPC on 127.0.0.1:9090 (bp) and :9091 (relay), and the suite asserts service discovery for all 8 service/version combinations, `ReadParams` field-by-field against `cardano-cli query protocol-parameters` on **both** v1alpha and v1beta, `ReadTip`, `ReadUtxos`, `SubmitTx` as a fourth submit path, and an adversarial set (undecodable CBOR, 8 MiB payload, zero-length tx, malformed TxoRef, concurrent duplicate submit).
+
+> Coverage honesty: the suite covers Query/Submit/Sync **discovery** plus the Query and Submit methods listed above. `Sync.FetchBlock`/`DumpHistory`/`FollowTip` and the whole `Watch` service are advertised-and-asserted-present but their **behaviour** is not yet compared against anything. Do not read "8/8 service-present PASS" as "all four services are validated".
 
 ## Workflow — three rounds in under 20 minutes
 
