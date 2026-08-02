@@ -443,11 +443,30 @@ fi
 if [ "${TW_PROPOSED:-0}" -eq 0 ]; then
     bad "withdrawal was never proposed — this round measured nothing but the RUPD"
 elif [ "${R1:-0}" -gt "${R0:-0}" ]; then
-    ok "reward account credited: $R0 -> $R1 (delta $(( R1 - R0 )))"
-    if [ "$(( R1 - R0 ))" -eq "$WITHDRAW" ]; then
-        ok "credit is byte-exact: delta == requested transfer ($WITHDRAW)"
+    DELTA=$(( R1 - R0 ))
+    ok "reward account credited: $R0 -> $R1 (delta $DELTA)"
+    # The credit is the withdrawal PLUS the proposal deposit refund.
+    #
+    # Both land in the same reward account because this round passes the SAME
+    # stake key to `--deposit-return-stake-verification-key-file` and
+    # `--funds-receiving-stake-verification-key-file`. When the action is
+    # enacted and removed from the proposal set, Conway returns its deposit to
+    # the return account — so the observed delta is
+    # `WITHDRAW + govActionDeposit`, not `WITHDRAW`.
+    #
+    # A first version asserted `delta == WITHDRAW` and failed at
+    # 100005000000 != 5000000 on a run where the withdrawal had enacted
+    # perfectly: 100000000000 deposit + 5000000 transfer. Asserting the sum is
+    # not a weaker check but a STRONGER one — it pins the deposit refund at the
+    # same time, and a refund that silently failed to arrive (the #898 shape)
+    # would now show up here.
+    EXPECTED=$(( WITHDRAW + GOV_DEPOSIT ))
+    if [ "$DELTA" -eq "$EXPECTED" ]; then
+        ok "credit is byte-exact: $DELTA == transfer $WITHDRAW + deposit refund $GOV_DEPOSIT"
+    elif [ "$DELTA" -eq "$WITHDRAW" ]; then
+        bad "transfer arrived but the $GOV_DEPOSIT deposit was NOT refunded (delta $DELTA)"
     else
-        bad "credit delta $(( R1 - R0 )) != requested transfer $WITHDRAW"
+        bad "credit delta $DELTA != transfer $WITHDRAW + deposit refund $GOV_DEPOSIT ($EXPECTED)"
     fi
     # And the pot must have paid for it. Comparing raw before/after is not
     # possible (the RUPD moves the treasury at the same boundary), so assert
