@@ -101,7 +101,54 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 - 28-byte hash types (DRep keys, pool voter keys, required signers) must be padded to 32 bytes via `Hash28::to_hash32_padded()` — do not use `Hash<32>::from()` directly on 28-byte hashes
 
 ## Current Focus
-**v2.4.4 (2026-08-01)** — second audit wave: encoders + DRep voting power. Drop-in, SNAPSHOT
+**v2.4.5 (2026-08-02)** — round-trip audit wave. Drop-in, SNAPSHOT unchanged
+at 31. Closes #951, #952.
+
+Both found by pushing `decode(encode(x)) == x` against the REAL decoder into
+new areas, and both oracle-verified against Haskell BEFORE touching either side
+— which mattered, because the verdict went a different way each time.
+
+- **#951 (serialization)** — PPU key 26 `drep_voting_thresholds` encoder wrote
+  the 10 elements in the WRONG ORDER: dropped `constitution` from index 3,
+  shifted six up, appended it at index 9 where Haskell puts
+  `treasuryWithdrawal`. The DECODER was always right (matches
+  `EncCBOR DRepVotingThresholds` exactly) — so a dugite-built ParameterChange
+  installed the WRONG governance thresholds, the very values that decide
+  whether actions pass. Key 25 (5-element pool thresholds) verified CORRECT.
+- **#952 (serialization)** — `encode_plutus_int` gated the bignum path on
+  `to_i128()` then called `encode_int(i128)`, whose `value as u64` SILENTLY
+  TRUNCATES. Haskell's threshold is Word64: plain int only for
+  `[-(2^64) .. 2^64-1]`. Integers in `(2^64, i128::MAX]` wrapped mod 2^64 ⇒
+  wrong `script_data_hash` ⇒ wrong phase-2. `encode_int` now carries a
+  `debug_assert` + doc making its narrow contract explicit.
+
+**Clean negatives from the same wave** (recorded so they are not re-audited):
+all 18 Conway certificate variants, all 11 `GovAction` variants, all 5 `Voter`
+discriminators, `VotingProcedure`, and every `dugite-uplc` `to_i128()` site
+(those are CHECKED conversions that fail loudly, not truncating casts).
+
+**Caveat pinned in the tests**: a same-process round-trip is necessary but NOT
+sufficient — a shared wrong order on BOTH halves still passes. #951 was caught
+only because encoder and decoder disagreed. The durable guard is a
+Haskell-derived fixture.
+
+### QA — v2.4.5
+devnet-validate standard **3/3 rounds PASS** (`reports/devnet-validate/v2.4.5.json`)
+vs cardano-node 11.0.1: 524 canonical blocks, 0 orphans, 0 invalid forges, 0
+critical anomalies. Bidirectional parity **41/41, 0 off-diagonal**. Adversarial
+N2N **26/26, 0 panic, 0 silent-skip**. cli-parity **18 EQUAL / 0 divergent**.
+Byte-exact pot parity after the first RUPD. Restart tip 34 -> 71, 0
+stale-intersection.
+
+**One tx-zoo failure investigated and cleared**: R1 reported
+`03k-datum-hash-reveal` as `not-included` (tx accepted, never landed in a block
+within the harness window). NOT a regression from #952 — that datum is
+`{"int": 42}`, and #952 only alters integers above 2^64, so `to_u64()` succeeds
+and the bytes are provably identical to the old path. Re-ran the whole
+`03-plutus` category on a fresh devnet with the v2.4.5 binaries: **13/13 pass,
+including 03k**. Timing flake.
+
+### Superseded: v2.4.4 (2026-08-01) — second audit wave: encoders + DRep voting power. Drop-in, SNAPSHOT
 unchanged at 31. Closes #946, #947, #948, #949, #950.
 
 - **#948 (serialization)** — `encode_drep` emitted a **32-byte** DRep KeyHash
