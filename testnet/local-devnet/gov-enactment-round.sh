@@ -78,15 +78,28 @@ delegate_votes_to_drep() {
     [ -f "$d/staking.skey" ] || { bad "genesis delegator keys absent — DRep would have zero power"; return 1; }
     [ -f "$drep" ] || { bad "drep-1 vkey absent — run tx-zoo --setup first"; return 1; }
 
-    local ent
+    # `create-testnet-data` funds a stake delegator at its BASE address
+    # (payment + stake), not the enterprise one — the enterprise address holds
+    # nothing. Checking only the enterprise address reported "no UTxO at the
+    # genesis delegator address" against a wallet holding 1.35e15 lovelace.
+    # Try both, largest first.
+    local ent base addr txin=""
     cardano-cli conway address build --payment-verification-key-file "$d/payment.vkey" \
         --testnet-magic "$LD_MAGIC" --out-file "$tmp/ent.addr" 2>/dev/null
-    ent=$(cat "$tmp/ent.addr")
-    local txin
-    txin=$(cardano-cli conway query utxo --testnet-magic "$LD_MAGIC" --socket-path "$LD_RELAY_SOCK" \
-             --address "$ent" --output-json 2>/dev/null \
-           | jq -r 'to_entries | max_by(.value.value.lovelace) | .key // empty')
-    [ -z "$txin" ] && { bad "no UTxO at the genesis delegator address"; return 1; }
+    cardano-cli conway address build --payment-verification-key-file "$d/payment.vkey" \
+        --stake-verification-key-file "$d/staking.vkey" \
+        --testnet-magic "$LD_MAGIC" --out-file "$tmp/base.addr" 2>/dev/null
+    ent=$(cat "$tmp/ent.addr" 2>/dev/null)
+    base=$(cat "$tmp/base.addr" 2>/dev/null)
+    for a in "$base" "$ent"; do
+        [ -z "$a" ] && continue
+        txin=$(cardano-cli conway query utxo --testnet-magic "$LD_MAGIC" --socket-path "$LD_RELAY_SOCK" \
+                 --address "$a" --output-json 2>/dev/null \
+               | jq -r 'to_entries | max_by(.value.value.lovelace) | .key // empty')
+        [ -n "$txin" ] && { addr="$a"; break; }
+    done
+    [ -z "$txin" ] && { bad "no UTxO at either genesis delegator address (base=$base ent=$ent)"; return 1; }
+    # Spend change back to whichever address actually funded us.
 
     cardano-cli conway stake-address vote-delegation-certificate \
         --stake-verification-key-file "$d/staking.vkey" \
@@ -94,7 +107,7 @@ delegate_votes_to_drep() {
         --out-file "$tmp/vote.cert" 2>"$tmp/err" || { bad "vote-delegation cert build failed: $(tail -2 "$tmp/err")"; return 1; }
 
     cardano-cli conway transaction build --testnet-magic "$LD_MAGIC" --socket-path "$LD_RELAY_SOCK" \
-        --tx-in "$txin" --change-address "$ent" \
+        --tx-in "$txin" --change-address "$addr" \
         --certificate-file "$tmp/vote.cert" --out-file "$tmp/raw" 2>>"$tmp/err" \
     && cardano-cli conway transaction sign --tx-body-file "$tmp/raw" \
         --signing-key-file "$d/payment.skey" --signing-key-file "$d/staking.skey" \
