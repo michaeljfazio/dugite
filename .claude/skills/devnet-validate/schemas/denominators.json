@@ -17,7 +17,6 @@
     "",
     "Bump a number here only together with on-disk evidence of the new count."
   ],
-
   "tx_zoo": {
     "expected_scripts": 85,
     "$comment": "All tx-zoo/NN-*/[0-9]*.sh EXCLUDING 09-cli-parity (counted separately).",
@@ -35,26 +34,23 @@
       "12-post-enactment": 1
     }
   },
-
   "cli_parity": {
     "expected_queries": 22,
     "$comment": "One row per tx-zoo/09-cli-parity/09*.sh. EQUAL+DIVERGENT+SKIP+ERROR must sum to this. Env-skips are counted as their own class and never folded into EQUAL."
   },
-
   "n2n_adversarial": {
     "expected_scripts": 7,
     "expected_cases": 26,
     "$comment": "Rows in n2n-trace.csv. NOT the same as the count of adv_record call sites (28) — two sites are mutually-exclusive branches. Confirmed live: see the closing evidence on #953."
   },
-
   "chaos": {
     "expected_scripts": 6,
     "expected_cases": 6,
     "$comment": "One terminal row per chaos/*.sh (excluding lib.sh). ENV-SKIP is a counted class, never silence (#959)."
   },
-
   "parity_matrix": {
-    "$comment": "The parity denominator is per-invocation (it depends on which categories were requested), so it is carried in parity-matrix.meta.json written by bidirectional-parity.sh. This block pins the categories the STANDARD gate must cover, so a run that quietly narrows its category list fails the gate.",
+    "$comment": "The bidirectional accept/reject oracle. Per-invocation totals live in parity-matrix.meta.json (written by bidirectional-parity.sh); this block pins which categories the STANDARD gate must cover, so a run that quietly narrows its category list fails the gate. Before #954 the invocation was a hardcoded 4 categories and the release notes reported '41/41' without ever stating that the zoo has 85 scripts.",
+    "expected_scripts_standard": 79,
     "required_categories_standard": [
       "01-bookkeeping",
       "02-native-scripts",
@@ -65,6 +61,17 @@
       "07-voting",
       "08-negative",
       "11-mempool"
-    ]
+    ],
+    "excluded_categories": {
+      "10-gov-lifecycle": "Chain-global governance lifecycle: propose -> 3-role vote -> assert enactment. Two batches would create two proposals in the same lane and both vote; ratification is a property of the whole chain, not of a batch, so the second batch's enactment assertion is not independent. Covered on path B only.",
+      "12-post-enactment": "Only meaningful once a governance action has actually ENACTED, so it depends on 10 having run and on global chain state. Same reason as 10."
+    },
+    "excluded_scripts": {
+      "05g-cc-hot-key-authorization": "Constitutional committee is seated at genesis and is devnet-global. Batch 1 resigns cc-1, so batch 2 correctly receives ConwayCommitteeHasPreviouslyResigned. Giving batch 2 its own committee requires an UpdateCommittee governance action (2+ epoch boundaries). Verified live 2026-08-02, not a dugite defect.",
+      "05h-cc-resign": "Same: a cold-key resignation is one-shot per member and only cc-1/cc-2 are seated."
+    },
+    "known_reject_reason_differences": {
+      "08f-double-spend": "#925 - a Conway duplicate input fails at the CBOR set layer. Haskell drops the connection ('mux: bearer closed'); dugite deliberately answers a structured MsgRejectTx naming the rule. dugite is more informative here; not a defect."
+    }
   }
 }

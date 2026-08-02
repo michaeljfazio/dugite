@@ -107,8 +107,11 @@ ZOO_SOCKET=$LD_RELAY_SOCK    ./tx-zoo/<script>.sh    # path B: relay-mediated (d
 ZOO_SOCKET=$LD_CARDANO_BP_SOCK  ./tx-zoo/<script>.sh    # path C: Haskell-mediated (reverse mempool path)
 ```
 
-The standard playbook runs path B for the full 85-script suite, then re-runs a
-subset via path C. Off-diagonal cells in the resulting accept/reject matrix (see `test-methodology.md` for the matrix) are P0 bugs — they prove a tx that dugite admits is rejected by Haskell (or vice versa). All 19 `08-negative` scripts must produce identical rejection reasons on both paths.
+The standard playbook runs path B for the full 85-script suite, then re-runs
+**79 of them** via path C (all categories except `10-gov-lifecycle` and
+`12-post-enactment`, whose subject is chain-global governance state). Invoke
+`bidirectional-parity.sh` with no arguments to get the pinned standard set;
+naming categories at the call site is what kept it at 41 scripts (#954). Off-diagonal cells in the resulting accept/reject matrix (see `test-methodology.md` for the matrix) are P0 bugs — they prove a tx that dugite admits is rejected by Haskell (or vice versa). All 19 `08-negative` scripts must produce identical rejection reasons on both paths.
 
 For dugite-cli ↔ cardano-cli submit-layer parity (path D), use `cross-validate-cli.sh` — it submits one representative tx per category via dugite-cli to dugite-bp.sock and observes inclusion via cardano-cli on the relay socket. The two cli implementations must produce byte-identical signed-tx CBOR; a mismatch shows up as the wrong txid on inclusion.
 

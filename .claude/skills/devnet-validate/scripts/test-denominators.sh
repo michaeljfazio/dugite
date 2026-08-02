@@ -80,15 +80,38 @@ check "chaos.expected_scripts" \
       "$(find "$ROOT/chaos" -maxdepth 1 -name '*.sh' ! -name 'lib.sh' ! -name 'run.sh' | wc -l | tr -d ' ')"
 
 # --- parity-matrix required categories must all exist ---
+PARITY_SUM=0
 while IFS= read -r cat; do
     if [ -d "$ROOT/tx-zoo/$cat" ]; then
         printf '  \033[32mPASS\033[0m  %-46s exists\n' "parity required: $cat"
         PASSED=$(( PASSED + 1 ))
+        PARITY_SUM=$(( PARITY_SUM + $(ls "$ROOT/tx-zoo/$cat"/[0-9]*.sh 2>/dev/null | wc -l | tr -d ' ') ))
     else
         printf '  \033[31mFAIL\033[0m  %-46s MISSING\n' "parity required: $cat"
         FAILED=$(( FAILED + 1 ))
     fi
 done < <(jq -r '.parity_matrix.required_categories_standard[]' "$DENOM")
+
+# The parity denominator must equal the scripts in the required categories.
+# Otherwise the oracle can silently cover fewer scripts than the pin claims —
+# the exact shape of the "41/41 out of an unstated 85" problem this closed.
+check "parity_matrix.expected_scripts_standard" \
+      "$(jq -r '.parity_matrix.expected_scripts_standard' "$DENOM")" "$PARITY_SUM"
+
+# Required and excluded category sets must partition the zoo: every category
+# must be either covered by the oracle or explicitly excluded WITH a reason.
+# Silence about a category is how one gets left out unnoticed.
+while IFS= read -r cat; do
+    req=$(jq -r --arg c "$cat" '.parity_matrix.required_categories_standard | index($c) != null' "$DENOM")
+    exc=$(jq -r --arg c "$cat" '.parity_matrix.excluded_categories | has($c)' "$DENOM")
+    if [ "$req" = "true" ] || [ "$exc" = "true" ]; then
+        PASSED=$(( PASSED + 1 ))
+    else
+        printf '  \033[31mFAIL\033[0m  %-46s neither required nor excluded by the parity manifest\n' "$cat"
+        FAILED=$(( FAILED + 1 ))
+    fi
+done < <(jq -r '.tx_zoo.per_category | keys[]' "$DENOM")
+printf '  \033[32mPASS\033[0m  %-46s every category is required or excluded\n' "parity manifest partitions the zoo"
 
 echo
 echo "=== $PASSED passed, $FAILED failed ==="

@@ -65,14 +65,44 @@ If `cardano-node` is older than 11.0.1, abort: PV10 conway-genesis rejects it. S
 
 Before running rounds, understand what each round contributes to the overall coverage charter. The skill exercises six orthogonal axes (see `references/test-methodology.md` for the full catalogue):
 
-1. **Tx-type** — every Conway tx class (59 zoo scripts spanning bookkeeping, native, Plutus V1/V2/V3, stake, gov certs, gov proposals, voting) + the 19 phase-1 negatives.
+1. **Tx-type** — every Conway tx class (85 zoo scripts spanning bookkeeping, native, Plutus V1/V2/V3, stake, gov certs, gov proposals, voting, gov lifecycle, mempool, post-enactment — the 19 phase-1 negatives are among them).
 2. **Validity** — every positive class has a matched negative; both must be classified identically by dugite and Haskell.
 3. **Submit-path** — txs submitted to **every** N2C ingestion socket: `dugite-bp.sock`, `dugite-relay.sock`, `cardano-bp.sock` (override via `ZOO_SOCKET=...`), plus `dugite-cli` vs `cardano-cli` on each. Also the UTxO RPC gRPC `submit_tx` (when `--rpc-port` is enabled).
 4. **Propagation-direction** — observe each tx at every node (mempool + ledger), in both forward (dugite-bp → relay → cardano-bp) and reverse (cardano-bp → relay → dugite-bp) directions through the hub.
 5. **Actor** — good-actor inputs (zoo positives, cli parity) AND bad-actor inputs (zoo negatives, `protocols/` adversarial framing, `chaos/` failure injection, RPC oversized/replay/flood).
 6. **Workload** — quiescent (Round 1 soak), trickle (Round 2 boundary), restart (Round 3), saturation + concurrent-burst + adversarial (Round 4 — see methodology doc).
 
-The **bidirectional parity oracle** is the most important predicate this skill enforces: *for every transaction T, dugite and Haskell must reach the same accept/reject decision regardless of which node ingested it first.* Off-diagonal cells (one accepts, the other rejects) are P0 bugs. Run representative txs through `ZOO_SOCKET=$LD_RELAY_SOCK` AND `ZOO_SOCKET=$LD_CARDANO_BP_SOCK` and tabulate results into `evidence/<ts>/parity-matrix.csv`.
+The **bidirectional parity oracle** is the most important predicate this skill
+enforces: *for every transaction T, dugite and Haskell must reach the same
+accept/reject decision regardless of which node ingested it first.* Off-diagonal
+cells (one accepts, the other rejects) are P0 bugs. It covers **79 of the 85 zoo
+scripts** (9 categories); the matrix lands in `evidence/<ts>/parity-matrix.csv`
+with a `parity-matrix.meta.json` sidecar carrying the denominator the invocation
+intended to cover.
+
+Matrix verdicts:
+
+| Verdict | Meaning | Fails the run? |
+|---|---|---|
+| `MATCH` | same accept/reject decision, same reason | — |
+| `OFFDIAG` | one node accepts what the other rejects | **yes (P0)** |
+| `CLASSDIFF` | both reject, but for different reasons | **yes (P2)** |
+| `KNOWNDIFF` | reject-reason difference that is documented and deliberate | no |
+| `STATEFUL` | excluded: the subject is a global devnet resource the first batch already mutated | no |
+
+Only reject **reasons** are compared, never accepted-tx details — each batch
+runs with its own keys, so minted policy ids, script addresses and reference
+txids legitimately differ and comparing them produced 7 false `CLASSDIFF`s on
+the first full run.
+
+The 6 uncovered scripts are `10-gov-lifecycle` (5) and `12-post-enactment` (1):
+ratification is a property of the whole chain rather than of a batch, so a
+second batch's enactment assertion is not independent. Plus `05g`/`05h`
+(constitutional-committee certs) run but are recorded `STATEFUL` — the committee
+is seated at genesis, so once batch 1 resigns `cc-1`, batch 2 correctly gets
+`ConwayCommitteeHasPreviouslyResigned`. All exclusions and their reasons are in
+`schemas/denominators.json`, and `test-denominators.sh` asserts that every
+category is either required or explicitly excluded.
 
 In addition to tx and N2N coverage, the skill exercises **dugite-cli surface parity** (today `09-cli-parity/` covers 22 query subcommands — see methodology doc for the full surface and gaps) and **UTxO RPC gRPC coverage** (Query / Submit / Sync / Watch services across v1alpha + v1beta; RPC is currently not wired into the devnet `run.sh` — opening this gap is tracked in the coverage-debt checklist).
 
@@ -107,9 +137,12 @@ EVIDENCE_DIR="$EVD" ./tx-zoo/run-all.sh   # ~3-5 min — all 85 tx scripts (via 
 # accept-set asymmetry; see references/test-methodology.md "parity oracle").
 # Writes parity-matrix.csv + parity-matrix.meta.json (the meta carries the
 # denominator this invocation intended to cover).
+# With no categories named it uses the STANDARD set from
+# schemas/denominators.json (9 categories, 79 scripts). Naming categories at
+# the call site is how it stayed at 4 categories / 41 scripts while the notes
+# said "41/41" without ever stating the zoo has 85 (#954).
 ../../.claude/skills/devnet-validate/scripts/bidirectional-parity.sh \
-    --out "$EVD/parity-matrix.csv" \
-    01-bookkeeping 04-stake 06-proposals 08-negative
+    --out "$EVD/parity-matrix.csv"
 ./tx-zoo/09-cli-parity/run.sh "$EVD"   # ~1 min — 22 LSQ parity checks; writes cli-parity.csv
 ./tx-zoo/cross-validate-cli.sh         # ~1 min — dugite-cli ↔ cardano-cli submit parity
 ./protocols/run.sh "$EVD"              # ~2 min — adversarial N2N framing; writes n2n-trace.csv
@@ -141,7 +174,7 @@ tail -F logs/cardano-bp.log   | grep -E 'AddedToCurrentChain|AddBlockValidation\
 ```
 
 **Round 1 PASSES iff** all of:
-- `tx-zoo/state/results.csv` shows ≥58/59 PASS (one V3 spend may fail without `aiken` — see `references/tx-coverage.md`)
+- `tx-zoo/state/results.csv` shows 85 rows with 0 FAIL (`04g-reward-withdrawal` state-skips until rewards mature — see #958; V3 scripts need `aiken` on PATH)
 - `verify.sh` reports 4/4 predicates pass
 - Zero invalid-block events in `logs/cardano-bp.log` (match BOTH legacy `TraceForgedInvalidBlock` and cardano-node 11.x `ChainDB.AddBlockEvent.AddBlockValidation.InvalidBlock` / `Forge.Loop.ForgedInvalidBlock`)
 - `dugite_tip_age_seconds` stays <5 throughout the soak
@@ -150,7 +183,7 @@ tail -F logs/cardano-bp.log   | grep -E 'AddedToCurrentChain|AddBlockValidation\
 - `analyze-evidence.sh` reports no anomalies
 - `evidence/<ts>/cli-parity.csv` has zero DIVERGENT rows that are not filed as known-divergence issues, **and zero ERROR rows** (`09-cli-parity/run.sh` now exits 1 on either). An ERROR row noted `HARNESS both-sides-failed` means the suite passed cardano-cli arguments it does not accept — fix the `09*.sh` script, do not add it to `KNOWN_DIVERGENCES`
 - `evidence/<ts>/n2n-trace.csv` has zero PANIC or SILENT_SKIP rows
-- Bidirectional parity wrapper (`bidirectional-parity.sh 01-bookkeeping 04-stake 06-proposals 08-negative`) exits 0 — every script is classified identically across both sockets in `evidence/<ts>/parity-matrix.csv` (zero `OFFDIAG` rows)
+- Bidirectional parity wrapper (`bidirectional-parity.sh`, no args = the pinned standard set of 9 categories / 79 scripts) exits 0 — zero `OFFDIAG` and zero unexplained `CLASSDIFF` rows in `evidence/<ts>/parity-matrix.csv`
 - `tx-zoo/state/cross-validate.csv` shows PASS for every representative tx submitted through `dugite-cli`
 
 ### Round 2 — Epoch-boundary stress (~15 min)
@@ -338,9 +371,9 @@ The harness now covers 9 dimensions across 3 intensity presets:
 | Dim | Capability | Smoke | Standard | Extended |
 |-----|------------|-------|----------|----------|
 | D1 | Forge & adoption | 1 epoch | 2 epochs | 5 epochs |
-| D2 | Tx surface | 08-negative subset | 59 + 30 negatives + gov-lifecycle | + CBOR fuzz |
+| D2 | Tx surface | 08-negative subset | 85 scripts (19 negatives) + parity oracle over 79 | + CBOR fuzz |
 | D3 | N2N adversarial | handshake only | + all 7 protocol scripts | + slow-loris |
-| D4 | N2C CLI parity | 3 queries | 22 queries (09a–09v) | all |
+| D4 | N2C CLI parity | 3 queries | 22 queries (09a–09v), all compared | all |
 | D5 | Sync paths | from-relay-tip | + bulk-throughput | + from-genesis + Mithril |
 | D6 | Chaos | — | kill-9 + app-nap check | + partition + disk-full + flood |
 | D7 | Epoch transitions | 1 boundary | 2 boundaries | + gov-lifecycle enactment |

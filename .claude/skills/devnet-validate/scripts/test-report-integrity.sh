@@ -88,11 +88,11 @@ EOF
       for i in $(seq 1 "$cli"); do echo "2026-08-02T00:00:01Z,query$i,EQUAL,aa,aa,true,"; done
     } > "$d/cli-parity.csv"
 
-    { echo "name,status_relay,detail_relay,status_cardano_bp,detail_cardano_bp,match"
-      for i in $(seq 1 "$par"); do echo "01a-script$i,PASS,ok,PASS,ok,MATCH"; done
+    { echo "name,category,status_relay,detail_relay,class_relay,status_cardano_bp,detail_cardano_bp,class_cardano_bp,match"
+      for i in $(seq 1 "$par"); do echo "01a-script$i,01,PASS,ok,ok,PASS,ok,ok,MATCH"; done
     } > "$d/parity-matrix.csv"
     cat > "$d/parity-matrix.meta.json" <<EOF
-{"expected": $par, "total": $par, "match": $par, "offdiag": 0, "categories": ["01-bookkeeping"]}
+{"expected": $par, "total": $par, "match": $par, "offdiag": 0, "classdiff": 0, "categories": ["01-bookkeeping"]}
 EOF
 
     { echo "ts,scenario,action,recovery_sec,result"
@@ -234,6 +234,35 @@ if [ "${zeros:-1}" -eq 0 ]; then
     PASSED=$(( PASSED + 1 ))
 else
     printf '  \033[31mFAIL\033[0m  %-52s (%s zero-valued)\n' "absent suites serialize as null, never 0" "$zeros"
+    FAILED=$(( FAILED + 1 ))
+fi
+
+# --- Case 8b: CLASSDIFF rows are counted separately from OFFDIAG ---
+# "both rejected" is weaker than it looks: same verdict for a different reason
+# is still a compat defect, and it must not be silently absorbed into `match`.
+R1="$TMP/classdiff/r1"
+make_round "$R1"
+{ echo "name,category,status_relay,detail_relay,class_relay,status_cardano_bp,detail_cardano_bp,class_cardano_bp,match"
+  echo "08e-no-inputs,08,PASS,rejected-NoInputs,NoInputs,PASS,rejected-BadInputsUTxO,BadInputsUTxO,CLASSDIFF"
+  echo "08f-double-spend,08,PASS,rejected-x,reason-matches-rule,PASS,rejected-y,other,KNOWNDIFF"
+  echo "05g-cc-hot-key-authorization,05,PASS,ok,(accepted),FAIL,submit,submit,STATEFUL"
+  for i in $(seq 4 41); do echo "01a-script$i,01,PASS,ok,ok,PASS,ok,ok,MATCH"; done
+} > "$R1/parity-matrix.csv"
+"$GEN" --preset standard --no-strict --output-dir "$TMP/out-cd" --denominators "$DENOM" "$R1" >/dev/null 2>&1
+cd_count=$(jq -r '.rounds[0].parity_matrix.classdiff' "$TMP/out-cd/report.json" 2>/dev/null)
+cd_match=$(jq -r '.rounds[0].parity_matrix.match' "$TMP/out-cd/report.json" 2>/dev/null)
+cd_od=$(jq -r '.rounds[0].parity_matrix.offdiag' "$TMP/out-cd/report.json" 2>/dev/null)
+cd_cat=$(jq -r '.rounds[0].parity_matrix.per_category["08"].classdiff' "$TMP/out-cd/report.json" 2>/dev/null)
+cd_known=$(jq -r '.rounds[0].parity_matrix.knowndiff' "$TMP/out-cd/report.json" 2>/dev/null)
+cd_state=$(jq -r '.rounds[0].parity_matrix.stateful' "$TMP/out-cd/report.json" 2>/dev/null)
+if [ "$cd_count" = "1" ] && [ "$cd_match" = "38" ] && [ "$cd_od" = "0" ] && [ "$cd_cat" = "1" ] \
+   && [ "$cd_known" = "1" ] && [ "$cd_state" = "1" ]; then
+    printf '  \033[32mPASS\033[0m  %-52s\n' "CLASSDIFF/KNOWNDIFF/STATEFUL counted separately"
+    PASSED=$(( PASSED + 1 ))
+else
+    printf '  \033[31mFAIL\033[0m  %-52s\n' "CLASSDIFF/KNOWNDIFF/STATEFUL counted separately"
+    printf '        classdiff=%s match=%s offdiag=%s per_cat08=%s known=%s stateful=%s (want 1/38/0/1/1/1)\n' \
+           "$cd_count" "$cd_match" "$cd_od" "$cd_cat" "$cd_known" "$cd_state"
     FAILED=$(( FAILED + 1 ))
 fi
 

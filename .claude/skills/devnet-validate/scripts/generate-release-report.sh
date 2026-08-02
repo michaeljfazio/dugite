@@ -367,6 +367,7 @@ process_round() {
     # stays stable; expected/categories come from the sidecar meta written by
     # bidirectional-parity.sh.
     local pm_status="absent" pm_total="null" pm_match="null" pm_offdiag="null"
+    local pm_classdiff="null" pm_knowndiff="null" pm_stateful="null"
     local pm_expected="null" pm_cats="null" pm_percat="null"
     local pm_csv="$evd/parity-matrix.csv"
     local pm_meta="$evd/parity-matrix.meta.json"
@@ -374,20 +375,32 @@ process_round() {
         pm_total=$(_rows "$pm_csv")
         pm_match=$(awk -F, 'NR>1 && $NF=="MATCH" {c++} END{print c+0}' "$pm_csv")
         pm_offdiag=$(awk -F, 'NR>1 && $NF=="OFFDIAG" {c++} END{print c+0}' "$pm_csv")
+        pm_classdiff=$(awk -F, 'NR>1 && $NF=="CLASSDIFF" {c++} END{print c+0}' "$pm_csv")
+        pm_knowndiff=$(awk -F, 'NR>1 && $NF=="KNOWNDIFF" {c++} END{print c+0}' "$pm_csv")
+        pm_stateful=$(awk -F, 'NR>1 && $NF=="STATEFUL" {c++} END{print c+0}' "$pm_csv")
+        # Category comes from column 2 when present (matrix schema >= #954).
+        # Older matrices have no category column, so fall back to the script
+        # name's numeric prefix (01a-simple-pay -> 01) rather than mis-reading
+        # whatever happens to sit in field 2.
         pm_percat=$(awk -F, '
-            NR>1 && NF {
-                split($1, parts, "-"); pfx = parts[1]
-                # strip the trailing letter: 01a -> 01
-                gsub(/[a-z]+$/, "", pfx)
+            NR==1 { has_cat = ($2 == "category"); next }
+            NF {
+                if (has_cat) pfx = $2
+                else { split($1, parts, "-"); pfx = parts[1]; gsub(/[a-z]+$/, "", pfx) }
                 t[pfx]++
-                if ($NF=="OFFDIAG") o[pfx]++; else m[pfx]++
+                if ($NF=="OFFDIAG")        o[pfx]++
+                else if ($NF=="CLASSDIFF") d[pfx]++
+                else if ($NF=="KNOWNDIFF") k[pfx]++
+                else if ($NF=="STATEFUL")  x[pfx]++
+                else                       m[pfx]++
             }
             END {
                 printf "{"
                 first=1
-                for (k in t) {
+                for (ck in t) {
                     if (!first) printf ","
-                    printf "\"%s\":{\"total\":%d,\"match\":%d,\"offdiag\":%d}", k, t[k], m[k]+0, o[k]+0
+                    printf "\"%s\":{\"total\":%d,\"match\":%d,\"offdiag\":%d,\"classdiff\":%d,\"knowndiff\":%d,\"stateful\":%d}", \
+                           ck, t[ck], m[ck]+0, o[ck]+0, d[ck]+0, k[ck]+0, x[ck]+0
                     first=0
                 }
                 printf "}"
@@ -524,6 +537,9 @@ process_round() {
     "total": $pm_total,
     "match": $pm_match,
     "offdiag": $pm_offdiag,
+    "classdiff": $pm_classdiff,
+    "knowndiff": $pm_knowndiff,
+    "stateful": $pm_stateful,
     "expected": $pm_expected,
     "categories": $pm_cats,
     "per_category": $pm_percat
@@ -870,7 +886,18 @@ for i in "${!EVIDENCE_DIRS[@]}"; do
     if [ "$r_pm_st" = "absent" ]; then pm_cell="— not run"
     else
         od=$(echo "$ROUNDS_JSON" | jq -r ".[$i].parity_matrix.offdiag // 0")
-        pm_cell=$([ "$od" -eq 0 ] && echo "✅ $(_md ".[$i].parity_matrix.total")✓" || echo "❌ ${od} offdiag")
+        cdf=$(echo "$ROUNDS_JSON" | jq -r ".[$i].parity_matrix.classdiff // 0")
+        kdf=$(echo "$ROUNDS_JSON" | jq -r ".[$i].parity_matrix.knowndiff // 0")
+        stf=$(echo "$ROUNDS_JSON" | jq -r ".[$i].parity_matrix.stateful // 0")
+        pm_m=$(_md ".[$i].parity_matrix.match"); pm_t=$(_md ".[$i].parity_matrix.total")
+        # Show match/total, not total/total: with KNOWNDIFF and STATEFUL rows
+        # present, "79✓" would imply 79 matched when 76 did.
+        if [ "$od" -ne 0 ]; then       pm_cell="❌ ${od} offdiag"
+        elif [ "$cdf" -ne 0 ]; then    pm_cell="❌ ${cdf} class-diff"
+        else                           pm_cell="✅ ${pm_m}/${pm_t}"
+        fi
+        [ "$kdf" != "0" ] && pm_cell="$pm_cell (+${kdf} known)" || true
+        [ "$stf" != "0" ] && pm_cell="$pm_cell (+${stf} stateful)" || true
     fi
     echo "| $rname | $badge | $r_can | $tz_cell | $cp_cell | $pm_cell | ${r_tip}s | $r_dens |"
 done

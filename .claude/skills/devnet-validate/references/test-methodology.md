@@ -58,16 +58,18 @@ The cells below describe what the skill currently exercises and where the gaps a
 |---|---|---|---|
 | 01 bookkeeping | 8 | ✓ via ZOO_SOCKET | Conway only — see "Era coverage" below |
 | 02 native scripts | 7 | ✓ | Conway |
-| 03 plutus V1/V2/V3 | 11 | ✓ | Conway (V1/V2/V3 wire formats all exercised) |
+| 03 plutus V1/V2/V3 | 13 | ✓ | Conway (V1/V2/V3 wire formats all exercised); spend+mint purposes ONLY (#955) |
 | 04 stake | 7 | ✓ | Conway |
 | 05 governance certs | 8 | ✓ | Conway |
 | 06 gov proposals | 7 | ✓ | Conway |
 | 07 voting | 7 | ✓ | Conway |
 | 08 negative (phase-1) | 19 | ✓ | Conway |
-| 10 gov lifecycle | 5 | E2E | Conway (1+ epoch boundary required) |
-| 11 mempool | 3 | dugite-only — gap | Conway |
+| 10 gov lifecycle | 5 | path B only — chain-global, see denominators.json | Conway (1+ epoch boundary required) |
+| 11 mempool | 3 | ✓ (since #954) | Conway |
 
-**Gap**: 11-mempool tests only dugite. Mirror against cardano-bp (TTL eviction + input-conflict) and assert symmetric behaviour.
+~~**Gap**: 11-mempool tests only dugite.~~ Closed by #954 — 11-mempool now runs
+through the parity oracle on both sockets. The scripts were always
+`ZOO_SOCKET`-parameterised; they had simply never been *invoked* on path C.
 
 ### Axis 2 — Validity coverage
 
@@ -424,8 +426,8 @@ This corner of the system is also a natural place for a "Path D" extension to th
 
 Tracked openly in this file so it's visible to every invocation of the skill:
 
-- [ ] Bidirectional submission for 11-mempool tests
-- [ ] Negative-tx symmetry for cardano-bp ingestion (mirror 08r to path C)
+- [x] Bidirectional submission for 11-mempool tests (#954)
+- [x] Negative-tx symmetry for cardano-bp ingestion — all 19 of 08-negative now run path C, and reject *reasons* are compared, not just verdicts (#954)
 - [ ] Plutus script-eval-failure negative cases
 - [ ] Replay attack negative test
 - [ ] Equivocation / double-forge negative test
