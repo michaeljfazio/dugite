@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 OPCERT="$LD_KEYS/pool1/opcert.cert"
 if [ ! -f "$OPCERT" ]; then
-    parity_record "kes-period-info" "SKIP" "skip" "skip" "opcert not found (run setup.sh first)"
+    parity_record "kes-period-info" "SKIP" "skip" "skip" "env-skip: opcert not found (run setup.sh first)"
     exit 0
 fi
 

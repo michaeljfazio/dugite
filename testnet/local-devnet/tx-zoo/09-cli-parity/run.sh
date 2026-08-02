@@ -76,14 +76,44 @@ if [ -f "$PARITY_CSV" ]; then
     KNOWN_DIV=$(awk -F, 'NR>1 && $3=="DIVERGENT" && $7~/^known-divergence:/ {c++} END{print c+0}' "$PARITY_CSV")
 fi
 
+ENV_SKIPS=$(awk -F, 'NR>1 && $3=="SKIP" && $7~/env-skip/ {c++} END{print c+0}' "$PARITY_CSV")
+STATE_SKIPS=$(awk -F, 'NR>1 && $3=="SKIP" && $7!~/env-skip/ {c++} END{print c+0}' "$PARITY_CSV")
+ROWS=$(awk 'NR>1 && NF' "$PARITY_CSV" | wc -l | tr -d ' ')
+
 log_info ""
 log_info "=== CLI parity summary ==="
-log_info "  EQUAL:     $EQUAL"
-log_info "  DIVERGENT: ${DIVERGENT_CSV:-$DIVERGENT} unexplained, ${KNOWN_DIV:-0} tracked"
-log_info "  SKIP:      $SKIPS"
-log_info "  ERROR:     $ERRORS unexplained, ${KNOWN_ERR:-0} tracked"
-log_info "  CSV:       $PARITY_CSV"
+log_info "  EQUAL:      $EQUAL"
+log_info "  DIVERGENT:  ${DIVERGENT_CSV:-$DIVERGENT} unexplained, ${KNOWN_DIV:-0} tracked"
+log_info "  ENV-SKIP:   $ENV_SKIPS  (setup artifact missing — these are UNCOMPARED queries)"
+log_info "  STATE-SKIP: $STATE_SKIPS (legitimately not comparable this run)"
+log_info "  ERROR:      $ERRORS unexplained, ${KNOWN_ERR:-0} tracked"
+log_info "  CSV:        $PARITY_CSV"
 log_info ""
+
+# DENOMINATOR GATE (#953)
+# -----------------------
+# EQUAL is not a coverage number on its own: 18 EQUAL out of 22 queries means
+# 4 were never compared, and every release note published the 18 without the
+# 22. Assert the row count against a pin held outside this run, and surface
+# env-skips as their own class so a setup gap can never read as a clean pass.
+DENOM_FILE="${DENOM_FILE:-$SCRIPT_DIR/../../../../.claude/skills/devnet-validate/schemas/denominators.json}"
+if [ -f "$DENOM_FILE" ]; then
+    EXPECTED=$(jq -r '.cli_parity.expected_queries // 0' "$DENOM_FILE")
+    if [ "$ROWS" -lt "$EXPECTED" ]; then
+        log_error "FAIL: cli-parity.csv has $ROWS rows, pinned denominator is $EXPECTED ($DENOM_FILE)"
+        log_error "A query that produced no row was never run at all."
+        exit 1
+    fi
+    log_info "  denominator: $ROWS/$EXPECTED queries ✓"
+else
+    log_warn "denominator manifest not found ($DENOM_FILE) — query count is self-reported"
+fi
+
+if [ "$ENV_SKIPS" -gt 0 ]; then
+    log_warn "$ENV_SKIPS quer(ies) env-skipped — the compared surface is $EQUAL of $EXPECTED, not $EQUAL of $EQUAL:"
+    awk -F, 'NR>1 && $3=="SKIP" && $7~/env-skip/ {print "    " $2 ": " $7}' "$PARITY_CSV" >&2
+    log_warn "Fix the setup gap; do not report this as full parity."
+fi
 
 DIVERGENT_FINAL="${DIVERGENT_CSV:-$DIVERGENT}"
 

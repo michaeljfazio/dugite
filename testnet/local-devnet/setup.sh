@@ -222,6 +222,22 @@ for n in 1 2; do
     cp "$src/kes.skey"      "$dst/kes.skey"
     cp "$src/kes.vkey"      "$dst/kes.vkey"
     cp "$src/opcert.cert"   "$dst/opcert.cert"
+    # pool.id — the bech32 pool id, consumed by 09-cli-parity's pool-scoped
+    # queries (pool-state, stake-snapshot, stake-pool-default-vote,
+    # leadership-schedule).
+    #
+    # This file was never written. All four of those parity checks therefore
+    # short-circuited to SKIP "pool1 id not found (run setup.sh first)" on
+    # EVERY run ever recorded — 4 of the 22-query compared surface silently
+    # uncompared, while the release notes read "18 EQUAL" (#953 finding 5).
+    # The id was already being computed at Step D.4 for the stake redirect;
+    # it just was not persisted.
+    cardano-cli conway stake-pool id \
+        --cold-verification-key-file "$dst/cold.vkey" \
+        --output-bech32 > "$dst/pool.id"
+    cardano-cli conway stake-pool id \
+        --cold-verification-key-file "$dst/cold.vkey" \
+        --output-hex > "$dst/pool.id.hex"
 done
 
 # UTxO funds key — for tx submission tests
