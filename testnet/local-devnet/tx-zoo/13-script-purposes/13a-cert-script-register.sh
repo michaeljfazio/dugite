@@ -32,7 +32,9 @@ SCRIPT=$(script_file "$W")
 ADDR=$(script_pay_addr "$W")
 STAKE_ADDR=$(script_stake_addr "$W")
 
-if [ "$(is_registered "$STAKE_ADDR")" = "yes" ]; then
+# single-shot: on a fresh chain this is legitimately unregistered, and a
+# 20s poll here would just add 20s to every run.
+if [ "$(is_registered "$STAKE_ADDR" 1)" = "yes" ]; then
     zoo_skip "$STAKE_ADDR already registered"
     zoo_record "$NAME" SKIP "" "already-registered"
     exit 0
