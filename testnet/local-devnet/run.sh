@@ -22,6 +22,19 @@ if [ "$SKEW" -lt -300 ]; then
 fi
 log_info "Genesis start ${SKEW}s from now — OK"
 
+# cardano-node does NOT open its N2C socket until the chain's system start has
+# passed. In two-forger mode the genesis start is deliberately pushed ~150s out
+# (so both producers connect before slot 0 and cannot fork at genesis past k),
+# which outran the fixed 120s socket wait and made run.sh report
+# "Socket /tmp/ld-.../cbp.sock did not become ready within 120s" on a node that
+# was perfectly healthy and simply waiting. Extend every socket wait by however
+# long remains until genesis.
+SOCKET_WAIT_EXTRA=0
+if [ "$SKEW" -lt 0 ]; then
+    SOCKET_WAIT_EXTRA=$(( -SKEW ))
+    log_info "Genesis is ${SOCKET_WAIT_EXTRA}s in the future — extending socket waits accordingly"
+fi
+
 assert_ports_free
 mkdir -p "$LD_STATE" "$LD_LOGS"
 rm -f "$LD_STATE"/*.pid "$LD_STATE"/*.sock
@@ -131,9 +144,9 @@ if [ -f "$LD_GENESIS/.two-forgers" ]; then
 fi
 
 # Wait for relay + cardano-bp sockets first.
-wait_for_socket "$LD_RELAY_SOCK"      120
-wait_for_socket "$LD_CARDANO_BP_SOCK" 120
-[ -f "$LD_GENESIS/.two-forgers" ] && wait_for_socket "$LD_CARDANO_ARBITER_SOCK" 180
+wait_for_socket "$LD_RELAY_SOCK"      $(( 120 + SOCKET_WAIT_EXTRA ))
+wait_for_socket "$LD_CARDANO_BP_SOCK" $(( 120 + SOCKET_WAIT_EXTRA ))
+[ -f "$LD_GENESIS/.two-forgers" ] && wait_for_socket "$LD_CARDANO_ARBITER_SOCK" $(( 180 + SOCKET_WAIT_EXTRA ))
 
 # The original "Bug-A workaround" stagger that waited for cardano-bp to
 # push a block into the relay is no longer needed: cardano-bp now runs
@@ -163,7 +176,7 @@ write_node_pidfile "$LD_STATE/dugite-bp.db" "$LD_STATE/dugite-bp.pid" \
     || { echo $! > "$LD_STATE/dugite-bp.pid"; log_info "WARN: could not resolve dugite-bp node pid; pidfile may be stale"; }
 log_info "dugite-bp PID $(cat "$LD_STATE/dugite-bp.pid")"
 
-wait_for_socket "$LD_DUGITE_BP_SOCK"  120
+wait_for_socket "$LD_DUGITE_BP_SOCK"  $(( 120 + SOCKET_WAIT_EXTRA ))
 
 # gRPC listeners (#960). Non-fatal: a node that failed to bind its RPC port is
 # still a usable devnet for every N2C-based suite, and failing the whole run

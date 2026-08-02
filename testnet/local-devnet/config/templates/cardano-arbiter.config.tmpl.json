@@ -24,10 +24,10 @@
   "TestConwayHardForkAtEpoch": 0,
   "EnableP2P": true,
   "PeerSharing": false,
-  "TargetNumberOfRootPeers": 1,
-  "TargetNumberOfKnownPeers": 1,
-  "TargetNumberOfEstablishedPeers": 1,
-  "TargetNumberOfActivePeers": 1,
+  "TargetNumberOfRootPeers": 2,
+  "TargetNumberOfKnownPeers": 2,
+  "TargetNumberOfEstablishedPeers": 2,
+  "TargetNumberOfActivePeers": 2,
   "TargetNumberOfKnownBigLedgerPeers": 0,
   "TargetNumberOfEstablishedBigLedgerPeers": 0,
   "TargetNumberOfActiveBigLedgerPeers": 0,
@@ -39,14 +39,24 @@
   "UseTraceDispatcher": true,
   "TraceOptions": {
     "": {
-      "backends": ["Stdout MachineFormat"],
+      "backends": [
+        "Stdout MachineFormat"
+      ],
       "detail": "DNormal",
       "severity": "Info"
     },
-    "Forge": { "severity": "Info" },
-    "Forge.Loop": { "severity": "Info" },
-    "BlockFetch.Client.CompletedBlockFetch": { "severity": "Info" },
-    "ChainDB.AddBlockEvent.AddedBlockToVolatileDB": { "severity": "Info" }
+    "Forge": {
+      "severity": "Info"
+    },
+    "Forge.Loop": {
+      "severity": "Info"
+    },
+    "BlockFetch.Client.CompletedBlockFetch": {
+      "severity": "Info"
+    },
+    "ChainDB.AddBlockEvent.AddedBlockToVolatileDB": {
+      "severity": "Info"
+    }
   },
   "TraceOptionMetricsPrefix": "cardano.node.metrics.",
   "TraceOptionResourceFrequency": 1000,

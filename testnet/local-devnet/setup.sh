@@ -63,8 +63,33 @@ log_info "Dir prep complete"
 log_info "Generating genesis via cardano-cli conway genesis create-testnet-data"
 
 # Compute genesis start time = now + 30s (cardano-cli's own default; spelled out so we can sanity-check later)
-START_TIME=$(date -u -v+30S +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '+30 seconds' +%Y-%m-%dT%H:%M:%SZ)
-log_info "Genesis start time: $START_TIME"
+# Genesis start offset.
+#
+# 30s is fine for the single-forger devnet: dugite-bp is the only producer, so
+# whatever it forges before the others connect is simply the chain, and the
+# others sync to it.
+#
+# TWO-FORGER MODE NEEDS MUCH MORE (#957). If both producers reach slot 0 before
+# they are connected to each other, they each build a chain from origin
+# independently. By the time the network links up the two chains have forked AT
+# GENESIS and are already deeper than `k`, so neither may adopt the other —
+# `ChainSync intersection only at genesis ... ForkTooDeep`. That is CORRECT
+# Ouroboros behaviour, not a bug, but it produces a permanently partitioned
+# devnet on which every convergence assertion is meaningless.
+#
+# Observed exactly that: dugite-bp and its arbiter on one chain at block 239,
+# the relay and cardano-bp on another at 228, both advancing, never converging.
+#
+# So the genesis start is pushed far enough out that setup (~30s) plus node
+# startup (~60s, cardano-node's socket alone can take 30s) plus a connection
+# margin all complete BEFORE slot 0.
+LD_GENESIS_DELAY="${LD_GENESIS_DELAY:-30}"
+if [ "${LD_TWO_FORGERS:-0}" = "1" ] && [ "$LD_GENESIS_DELAY" -lt 150 ]; then
+    LD_GENESIS_DELAY=150
+fi
+START_TIME=$(date -u -v+"${LD_GENESIS_DELAY}"S +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+    || date -u -d "+${LD_GENESIS_DELAY} seconds" +%Y-%m-%dT%H:%M:%SZ)
+log_info "Genesis start time: $START_TIME (+${LD_GENESIS_DELAY}s)"
 
 # Step A: generate cardano-cli's default specs to a tmpdir so we can merge our overrides in.
 TMP_DEFAULTS="$(mktemp -d)"
