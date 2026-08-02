@@ -69,6 +69,8 @@ stop_one() {
 stop_one dugite-bp
 stop_one dugite-relay
 stop_one cardano-bp
+# Only present in two-forger mode (#957); stop_one is a no-op without a pidfile.
+stop_one cardano-arbiter
 
 rm -f "$LD_SOCK_DIR"/*.sock
 
