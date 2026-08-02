@@ -865,12 +865,13 @@ pub(crate) fn convert_validation_error(
                  (Allegra+ enforces max 64 bytes per Bytes/Text leaf)"
             ),
         },
-        VE::ProposalDepositIncorrect { declared, expected } => TxValidationError::ScriptFailed {
-            reason: format!(
-                "Governance proposal rejected: declared deposit {declared} does not match \
-                 gov_action_deposit parameter {expected} (ProposalDepositIncorrect)"
-            ),
-        },
+        // Typed, not ScriptFailed: the generic arm encoded as
+        // ConwayMempoolFailure "transaction validation failed", which told the
+        // client nothing while cardano-node answered ProposalDepositIncorrect
+        // with both amounts. Same shape as #925.
+        VE::ProposalDepositIncorrect { declared, expected } => {
+            TxValidationError::ProposalDepositIncorrect { declared, expected }
+        }
         VE::CommitteeHasPreviouslyResigned { cold_credential_hash } => {
             TxValidationError::ScriptFailed {
                 reason: format!(
@@ -1428,10 +1429,12 @@ mod tests {
                 declared: 1,
                 expected: 500_000_000,
             },
-            VE::ProposalDepositIncorrect {
-                declared: 1,
-                expected: 100_000_000_000,
-            },
+            // NOTE: ProposalDepositIncorrect deliberately does NOT belong here
+            // any more — it now maps to its own variant so the encoder can emit
+            // ConwayGovPredFailure tag 4 with both amounts. It moved to
+            // convert_validation_error_maps_gov_predicates_to_dedicated_variants
+            // below. Collapsing it meant cardano-cli only ever saw
+            // ConwayMempoolFailure "transaction validation failed".
             VE::ExtraRedeemer {
                 tag: "Spend".to_string(),
                 index: 0,
@@ -1452,6 +1455,25 @@ mod tests {
     #[test]
     fn convert_validation_error_maps_gov_predicates_to_dedicated_variants() {
         use dugite_ledger::validation::ValidationError as VE;
+
+        // ProposalDepositIncorrect: typed, carrying both amounts, so the wire
+        // form is ConwayGovPredFailure tag 4 rather than a generic mempool
+        // failure. Verified end-to-end: cardano-cli 11.0.0.0 decodes it and
+        // prints "ProposalDepositIncorrect".
+        let mapped = convert_validation_error(VE::ProposalDepositIncorrect {
+            declared: 1,
+            expected: 100_000_000_000,
+        });
+        assert!(
+            matches!(
+                mapped,
+                TxValidationError::ProposalDepositIncorrect {
+                    declared: 1,
+                    expected: 100_000_000_000
+                }
+            ),
+            "ProposalDepositIncorrect must map to its own variant, got {mapped:?}"
+        );
 
         let mapped = convert_validation_error(VE::DisallowedVoters { violations: vec![] });
         assert!(
