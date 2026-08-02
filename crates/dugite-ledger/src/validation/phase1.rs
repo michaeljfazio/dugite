@@ -177,6 +177,95 @@ fn cert_required_witnesses(cert: &Certificate) -> Vec<Hash28> {
     }
 }
 
+/// The SCRIPT hash a certificate requires a witness for, if its subject
+/// credential is script-based.
+///
+/// Mirrors Haskell `getScriptWitnessConwayTxCert`
+/// (`Cardano.Ledger.Conway.TxCert`) exactly:
+///
+/// ```haskell
+/// ConwayRegCert _ SNothing     -> Nothing            -- reg_cert (idx 0)
+/// ConwayRegCert cred (SJust _) -> credScriptHash cred -- reg_deposit_cert (idx 7)
+/// ConwayUnRegCert cred _       -> credScriptHash cred -- idx 1 / 8
+/// ConwayDelegCert cred _       -> credScriptHash cred -- idx 2 / 9 / 10
+/// ConwayRegDelegCert cred _ _  -> credScriptHash cred -- idx 11 / 12 / 13
+/// ConwayTxCertPool {}          -> Nothing            -- "PoolIds can't be Scripts"
+/// ConwayAuthCommitteeHotKey / ResignCommitteeColdKey -> cold cred
+/// ConwayRegDRep / UnRegDRep / UpdateDRep             -> cred
+/// ```
+///
+/// The ONLY permissionless case is the deposit-less Shelley-compatible
+/// `reg_cert` (index 0). Haskell's own comment explains why it is special:
+/// "we preserve the old behavior of not requiring a witness for staking
+/// credential registration, but only during the transitional period of Conway
+/// era and only for staking credential registration certificates without a
+/// deposit."
+///
+/// This is easy to get wrong in two directions, and dugite got it wrong in the
+/// widest one: `cert_required_witnesses` above returns `None` for every script
+/// credential (it only ever produced vkey requirements), and there was no
+/// complementary script check at all. The result was that dugite accepted ANY
+/// certificate whose subject is a script credential with no script witness
+/// whatsoever — registration, deregistration, delegation, DRep and committee
+/// certificates alike. cardano-node 11.0.1 rejects those with
+/// `ConwayUtxowFailure (MissingScriptWitnessesUTXOW ...)`, so this was an
+/// accept-set divergence in the dangerous direction: dugite too lax.
+fn cert_required_script_witness(cert: &Certificate) -> Option<Hash28> {
+    let script_hash = |c: &Credential| -> Option<Hash28> {
+        match c {
+            Credential::Script(h) => Some(*h),
+            Credential::VerificationKey(_) => None,
+        }
+    };
+
+    match cert {
+        // Shelley `reg_cert` (index 0), no deposit field: permissionless by
+        // design during the Conway transitional period. NOT a gap.
+        Certificate::StakeRegistration(_) => None,
+
+        // Conway `reg_deposit_cert` (index 7) carries an explicit deposit and
+        // DOES require the credential to authorise it.
+        Certificate::ConwayStakeRegistration { credential, .. } => script_hash(credential),
+
+        // Deregistration (index 1 and 8) reclaims the deposit — always witnessed.
+        Certificate::StakeDeregistration(credential)
+        | Certificate::ConwayStakeDeregistration { credential, .. } => script_hash(credential),
+
+        // Delegation (2 / 9 / 10) and the combined register+delegate forms
+        // (11 / 12 / 13) are always witnessed — note the combined forms are
+        // witnessed even though they also perform a registration.
+        Certificate::StakeDelegation { credential, .. }
+        | Certificate::VoteDelegation { credential, .. }
+        | Certificate::StakeVoteDelegation { credential, .. }
+        | Certificate::RegStakeDeleg { credential, .. }
+        | Certificate::RegStakeVoteDeleg { credential, .. }
+        | Certificate::VoteRegDeleg { credential, .. } => script_hash(credential),
+
+        // Committee certificates (14 / 15) are witnessed by the COLD credential.
+        Certificate::CommitteeHotAuth {
+            cold_credential, ..
+        }
+        | Certificate::CommitteeColdResign {
+            cold_credential, ..
+        } => script_hash(cold_credential),
+
+        // DRep certificates (16 / 17 / 18).
+        Certificate::RegDRep { credential, .. }
+        | Certificate::UnregDRep { credential, .. }
+        | Certificate::UpdateDRep { credential, .. } => script_hash(credential),
+
+        // Pool certificates can never carry a script credential — Haskell's
+        // `getScriptWitnessConwayTxCert` returns Nothing unconditionally for
+        // them ("PoolIds can't be Scripts").
+        Certificate::PoolRegistration(_) | Certificate::PoolRetirement { .. } => None,
+
+        // Pre-Conway certificates with no script-credential form.
+        Certificate::GenesisKeyDelegation { .. } | Certificate::MoveInstantaneousRewards { .. } => {
+            None
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helper: check if the transaction involves any multi-asset tokens
 // ---------------------------------------------------------------------------
@@ -1630,6 +1719,20 @@ pub(super) fn run_phase1_rules(
                     ));
                 }
             }
+            // ...and the SCRIPT half. Inputs and withdrawals both had a
+            // `Credential::Script` arm; certificates did not, so a certificate
+            // whose subject is a script credential required nothing at all and
+            // dugite accepted it unwitnessed. cardano-node 11.0.1 answers
+            // `ConwayUtxowFailure (MissingScriptWitnessesUTXOW ...)`, verified
+            // live on the devnet against a script-credential
+            // `reg_deposit_cert`: dugite ACCEPTED, Haskell REJECTED.
+            if let Some(required_script) = cert_required_script_witness(cert) {
+                if !available_script_hashes.contains(&required_script) {
+                    errors.push(ValidationError::MissingCertificateScriptWitness(
+                        required_script.to_hex(),
+                    ));
+                }
+            }
         }
 
         // Check each voting procedure has a matching witness for its voter
@@ -1890,6 +1993,70 @@ mod tests {
     use crate::validation::{
         validate_transaction, validate_transaction_with_pools, ValidationError,
     };
+
+    // -----------------------------------------------------------------------
+    // cert_required_script_witness — Haskell getScriptWitnessConwayTxCert parity
+    //
+    // dugite had NO script-witness requirement for certificates at all, so a
+    // script-credential certificate could be submitted unwitnessed and dugite
+    // accepted it while cardano-node 11.0.1 answered
+    // MissingScriptWitnessesUTXOW. These pin the per-certificate rule, and in
+    // particular the ONE case that is genuinely permissionless.
+    // -----------------------------------------------------------------------
+
+    fn script_cred() -> Credential {
+        Credential::Script(Hash28::from_bytes([0xABu8; 28]))
+    }
+    fn key_cred() -> Credential {
+        Credential::VerificationKey(Hash28::from_bytes([0xCDu8; 28]))
+    }
+    fn script_h() -> Hash28 {
+        Hash28::from_bytes([0xABu8; 28])
+    }
+
+    #[test]
+    fn reg_cert_index0_is_permissionless() {
+        // The deposit-less Shelley form is the ONLY certificate that needs no
+        // witness for a script credential — Haskell keeps it that way "only
+        // during the transitional period of Conway era".
+        use dugite_primitives::transaction::Certificate;
+        let c = Certificate::StakeRegistration(script_cred());
+        assert_eq!(super::cert_required_script_witness(&c), None);
+    }
+
+    #[test]
+    fn reg_deposit_cert_index7_requires_script_witness() {
+        // The trap: "registration" is NOT uniformly permissionless. The Conway
+        // explicit-deposit form DOES require the script to authorise it. This
+        // is the exact shape that dugite accepted and cardano-node rejected.
+        use dugite_primitives::transaction::Certificate;
+        let c = Certificate::ConwayStakeRegistration {
+            credential: script_cred(),
+            deposit: Lovelace(2_000_000),
+        };
+        assert_eq!(super::cert_required_script_witness(&c), Some(script_h()));
+    }
+
+    #[test]
+    fn key_credential_certs_need_no_script_witness() {
+        use dugite_primitives::transaction::Certificate;
+        let c = Certificate::ConwayStakeRegistration {
+            credential: key_cred(),
+            deposit: Lovelace(2_000_000),
+        };
+        assert_eq!(super::cert_required_script_witness(&c), None);
+    }
+
+    #[test]
+    fn pool_certs_are_never_script_witnessed() {
+        // Haskell: "PoolIds can't be Scripts" — Nothing unconditionally.
+        use dugite_primitives::transaction::Certificate;
+        let c = Certificate::PoolRetirement {
+            pool_hash: Hash28::from_bytes([0x11u8; 28]),
+            epoch: 5,
+        };
+        assert_eq!(super::cert_required_script_witness(&c), None);
+    }
 
     // -----------------------------------------------------------------------
     // Test fixture: a minimal valid Conway transaction

@@ -331,6 +331,14 @@ pub enum TxValidationError {
     MissingWithdrawalWitness {
         credential: String,
     },
+    /// A certificate whose subject credential is a SCRIPT was submitted
+    /// without the corresponding script witness. Encodes as Utxow tag 3
+    /// `MissingScriptWitnessesUTXOW`, the same as the input and withdrawal
+    /// forms — Haskell does not distinguish the three on the wire.
+    MissingCertificateScriptWitness {
+        /// Hex-encoded script hash that had no witness.
+        credential: String,
+    },
     MissingWithdrawalScriptWitness {
         credential: String,
     },

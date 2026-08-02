@@ -298,6 +298,7 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
 
         // Utxow tag 3: MissingScriptWitnessesUTXOW — tag(258) set of script hashes
         TxValidationError::MissingScriptWitness { credential }
+        | TxValidationError::MissingCertificateScriptWitness { credential }
         | TxValidationError::MissingWithdrawalScriptWitness { credential } => {
             if let Some(script_hash) = parse_hex_bytes(credential) {
                 encode_utxow_failure(enc, 3, |enc| {
