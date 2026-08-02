@@ -109,7 +109,14 @@ _denom() { # _denom <jq-path> <default>
 EXP_TX_ZOO=$(_denom '.tx_zoo.expected_scripts' 0)
 EXP_CLI=$(_denom '.cli_parity.expected_queries' 0)
 EXP_N2N=$(_denom '.n2n_adversarial.expected_cases' 0)
-EXP_CHAOS=$(_denom '.chaos.expected_cases' 0)
+# Chaos row count is PRESET-DEPENDENT: the standard set is 4 scenarios / 5
+# rows, extended adds network-partition + disk-full for 6. A single pin taken
+# from the extended set made every standard run fail with "chaos recorded 5
+# rows, below the pinned 6" — a denominator no standard run could satisfy.
+case "$PRESET" in
+    extended) EXP_CHAOS=$(_denom '.chaos.expected_cases_extended' 0) ;;
+    *)        EXP_CHAOS=$(_denom '.chaos.expected_cases_standard' 0) ;;
+esac
 EXP_RPC=$(_denom '.rpc.expected_checks' 0)
 
 # ---- Preset evidence manifest ------------------------------------------------

@@ -47,9 +47,10 @@
     "$comment": "Rows in n2n-trace.csv. NOT the same as the count of adv_record call sites (28) \u2014 two sites are mutually-exclusive branches. Confirmed live: see the closing evidence on #953."
   },
   "chaos": {
-    "expected_scripts": 6,
-    "expected_cases": 6,
-    "$comment": "One terminal row per chaos/*.sh (excluding lib.sh). ENV-SKIP is a counted class, never silence (#959)."
+    "expected_cases_standard": 5,
+    "expected_cases_extended": 6,
+    "_comment": "expected_scripts = scenario .sh files on disk (excluding lib.sh/run.sh). expected_cases_* = terminal ROWS a given preset produces, which is preset-dependent: the STANDARD set runs 4 scenarios for 5 rows; EXTENDED adds network-partition + disk-full for 6. Pinning a single `expected_cases: 6` from the extended set made every standard run fail gate integrity with 'chaos recorded 5 rows, below the pinned 6' \u2014 a denominator no standard run could ever satisfy. ENV-SKIP is a counted class, never silence (#959).",
+    "expected_scripts": 6
   },
   "parity_matrix": {
     "$comment": "The bidirectional accept/reject oracle. Per-invocation totals live in parity-matrix.meta.json (written by bidirectional-parity.sh); this block pins which categories the STANDARD gate must cover, so a run that quietly narrows its category list fails the gate. Before #954 the invocation was a hardcoded 4 categories and the release notes reported '41/41' without ever stating that the zoo has 85 scripts.",
