@@ -199,6 +199,39 @@ jq --arg cred1 "keyHash-${CC1_COLD_HASH}" \
 mv "$LD_GENESIS/conway-genesis.patched.json" "$LD_GENESIS/conway-genesis.json"
 log_info "conway-genesis.committee now: $(jq -c .committee "$LD_GENESIS/conway-genesis.json")"
 
+# Step D.6 (OPT-IN): seat a guardrails script on the constitution.
+#
+# The Conway `Proposing` ScriptPurpose (redeemer tag 5) is only reachable when
+# a proposal names a guardrails policy hash, and Conway's GOV rule requires
+# that hash to equal the CURRENT constitution's guardrails script EXACTLY
+# (`checkGuardrailsScriptHash`, strict equality including SNothing == SNothing).
+#
+# That cuts both ways, which is why this is off by default: with a guardrails
+# script seated, EVERY ParameterChange and TreasuryWithdrawals proposal must
+# name it — including 06b, 06d and 10a, which name none and would start failing
+# with `InvalidGuardrailsScriptHash`. So seeding it is a whole-devnet
+# configuration change, not a local one.
+#
+#   LD_SEED_GUARDRAILS=1 ./setup.sh   # enables 13h (Proposing purpose)
+#
+# The hash used is the always-true V3 script the tx-zoo already vendors, so
+# 13h can satisfy it. Any proposal that must pass under this genesis needs
+# `--constitution-script-hash <that hash>`.
+if [ "${LD_SEED_GUARDRAILS:-0}" = "1" ]; then
+    _guard_script="$LD_ROOT/tx-zoo/lib/plutus/always-true-v3.plutus"
+    if [ -s "$_guard_script" ]; then
+        _guard_hash=$(cardano-cli conway transaction policyid --script-file "$_guard_script")
+        jq --arg h "$_guard_hash" '.constitution.script = $h' \
+            "$LD_GENESIS/conway-genesis.json" > "$LD_GENESIS/conway-genesis.guard.json"
+        mv "$LD_GENESIS/conway-genesis.guard.json" "$LD_GENESIS/conway-genesis.json"
+        log_info "LD_SEED_GUARDRAILS=1 — constitution guardrails script = $_guard_hash"
+        log_info "  NOTE: every ParameterChange / TreasuryWithdrawals proposal must now"
+        log_info "        pass --constitution-script-hash $_guard_hash"
+    else
+        log_info "LD_SEED_GUARDRAILS=1 but $_guard_script is absent — run tx-zoo/lib/build-plutus.sh first; leaving constitution unguarded"
+    fi
+fi
+
 # ---- Key reorganization ----
 log_info "Reorganizing keys into testnet/local-devnet/keys/"
 

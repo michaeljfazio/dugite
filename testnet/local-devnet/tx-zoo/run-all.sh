@@ -39,6 +39,11 @@ ALL_CATEGORIES=(
     # went unnoticed — 06-proposals runs before any enactment, where
     # prev_action_id=None is legitimately valid.
     12-post-enactment
+    # Plutus ScriptPurposes beyond spend/mint (#955). Runs last: 13d
+    # deregisters the script stake credential, and 13g/13h create their own
+    # DRep and governance action, so keeping it after 10/12 means it cannot
+    # perturb the governance lifecycle those categories assert on.
+    13-script-purposes
 )
 
 usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; }
