@@ -84,26 +84,38 @@ Use TodoWrite to track each round as `in_progress` / `completed`. Each round mus
 
 Goal: happy path. Fresh setup, all three nodes up, dugite-bp forges canonical blocks, cardano-relay accepts every one, dugite-cli works against both sockets, the full transaction surface passes.
 
+**Pin ONE evidence directory for the whole round.** `09-cli-parity/run.sh`,
+`protocols/run.sh` and `bidirectional-parity.sh` all default to "newest
+directory under `evidence/`". `soak.sh` *creates* a new one. So whether those
+suites land beside the soak evidence or in a directory of their own depends
+purely on the order they happen to run in — and a suite that wrote to the other
+directory is indistinguishable, to the report generator, from a suite that never
+ran. Pass the directory explicitly and the ambiguity disappears.
+
 ```bash
 cd testnet/local-devnet
 . ./lib/common.sh                   # exports LD_RELAY_SOCK, LD_CARDANO_BP_SOCK, LD_DUGITE_BP_SOCK
 ./setup.sh                          # ~30s — fresh genesis
 ./run.sh                            # ~5s — staggered start (relay → cardano → dugite-bp)
 sleep 30                            # let the chain advance past slot 0
+
+EVD="$LD_EVIDENCE/round1-$(date -u +%Y%m%dT%H%M%SZ)"; mkdir -p "$EVD"
+
 ./tx-zoo/run-all.sh --setup         # ~20s — keys + plutus binaries (one-time per setup)
-./tx-zoo/run-all.sh                 # ~3-5 min — all 59 tx scripts (submitted via dugite-relay socket)
-# Bidirectional parity — re-run a representative subset against the Haskell socket
-# (catches accept-set asymmetry; see references/test-methodology.md "parity oracle").
-# The wrapper sources lib/common.sh, snapshots results.csv after each batch, and
-# writes evidence/<ts>/parity-matrix.csv with OFFDIAG count + non-zero exit on drift.
+EVIDENCE_DIR="$EVD" ./tx-zoo/run-all.sh   # ~3-5 min — all 85 tx scripts (via dugite-relay socket)
+# Bidirectional parity — re-run against the Haskell socket too (catches
+# accept-set asymmetry; see references/test-methodology.md "parity oracle").
+# Writes parity-matrix.csv + parity-matrix.meta.json (the meta carries the
+# denominator this invocation intended to cover).
 ../../.claude/skills/devnet-validate/scripts/bidirectional-parity.sh \
+    --out "$EVD/parity-matrix.csv" \
     01-bookkeeping 04-stake 06-proposals 08-negative
-./tx-zoo/09-cli-parity/run.sh       # ~1 min — 22 LSQ parity checks; writes cli-parity.csv
-./tx-zoo/cross-validate-cli.sh      # ~1 min — dugite-cli ↔ cardano-cli submit parity
-./protocols/run.sh                  # ~2 min — adversarial N2N framing; writes n2n-trace.csv
-./soak.sh 120                       # 2 min idle evidence
-./verify.sh evidence/$(ls -t evidence | head -1)
-../../.claude/skills/devnet-validate/scripts/analyze-evidence.sh evidence/$(ls -t evidence | head -1)
+./tx-zoo/09-cli-parity/run.sh "$EVD"   # ~1 min — 22 LSQ parity checks; writes cli-parity.csv
+./tx-zoo/cross-validate-cli.sh         # ~1 min — dugite-cli ↔ cardano-cli submit parity
+./protocols/run.sh "$EVD"              # ~2 min — adversarial N2N framing; writes n2n-trace.csv
+EVIDENCE_DIR="$EVD" ./soak.sh 120      # 2 min idle evidence
+./verify.sh "$EVD"
+../../.claude/skills/devnet-validate/scripts/analyze-evidence.sh "$EVD"
 ./stop.sh
 ```
 
@@ -338,15 +350,55 @@ The harness now covers 9 dimensions across 3 intensity presets:
 ### Quick-start v2
 
 ```bash
-# Smoke (~5 min) — smoke gate for PRs
+# Smoke (~5 min) — PR gate for core crates
 just devnet-validate-smoke
 
-# Standard — equivalent to old 3-round workflow but with all v2 suites
-cd testnet/local-devnet
-just devnet-report
+# Standard (~20 min) — THE RELEASE TAG GATE.
+# Run the Round 1-3 workflow above, then the "Final report" block.
+# `just devnet-report` is NOT this: it reports a single round from whatever
+# evidence is lying around and marks itself gate_integrity.admissible=false.
 
-# Extended (~75 min) — release tag gate
+# Extended (~75 min) — deeper pre-major-release pass, not the tag gate
 just devnet-validate-extended
+
+# Reporting-layer self-test (~10s, no devnet) — run after editing this skill
+just devnet-gate-selftest
+```
+
+### Which preset gates a tag
+
+**Standard.** `.claude/skills/release-lead/SKILL.md` is authoritative and says
+the same. Before #953 this document nominated *extended* as the tag gate while
+every command in both skills hardcoded `--preset standard` — so v2.4.3–v2.4.5
+all shipped on standard and nothing extended-only ever gated a release. Rather
+than leave the docs describing a gate nobody ran, standard is now the gate in
+name as well as in practice, and the suites that matter most (adversarial N2N,
+cli-parity, the bidirectional parity oracle, chaos) are part of the standard
+evidence manifest — the generator refuses to emit a passing report without
+them.
+
+### Gate integrity — the generator fails loudly now
+
+`generate-release-report.sh` runs **strict by default**. It hard-fails (exit 3)
+when, for the declared preset, a required evidence file is absent, a suite's row
+count is below its pinned denominator in
+`schemas/denominators.json`, or a round's tx-zoo counts were borrowed from
+another round (`source:"shared"`).
+
+An absent suite now serializes as `status:"absent"` with **null** counts. It
+never serializes as `0` — that ambiguity is what let "0 divergent" mean "never
+compared" for three releases (#945, #953).
+
+```bash
+# Never do this for a release:
+generate-release-report.sh --no-strict ...   # records the omission, marks
+                                             # gate_integrity.admissible=false
+```
+
+Always confirm before shipping:
+```bash
+jq '.gate_integrity' reports/devnet-validate/report.json
+# { "strict": true, "admissible": true, "missing": [] }
 ```
 
 ### New evidence files (v2)

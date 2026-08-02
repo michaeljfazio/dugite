@@ -13,24 +13,61 @@ Before tagging a new version:
 
 1. **Version bump** — update `Cargo.toml` workspace version; verify all crate `[dependencies]` on sibling crates reference the same version.
 2. **CI gate** — `just check` must pass (fmt + clippy + build + test).
-3. **devnet-validate** — run the standard preset and attach the report:
+3. **devnet-validate** — run the **standard** preset, all rounds, and attach the report.
+
+   **The tag gate is the standard preset, run strict.** This is the single
+   authoritative statement of that fact; `devnet-validate/SKILL.md` defers to
+   it. (Until #953 the two skills disagreed — devnet-validate's capability
+   matrix nominated the ~75-minute extended preset as the tag gate while both
+   skills' actual commands hardcoded `--preset standard`, so every release
+   v2.4.3–v2.4.5 shipped on standard and nothing extended-only ever gated a
+   tag. The docs now describe what runs.)
+
+   Do **not** hand-roll the round sequence here. Follow the Round 1–3 workflow
+   in `.claude/skills/devnet-validate/SKILL.md`, which runs every suite the
+   standard preset's evidence manifest requires — tx-zoo, cli-parity,
+   adversarial N2N, the bidirectional parity oracle, and chaos. An earlier
+   version of this checklist inlined an abbreviated recipe that ran none of the
+   last four; the resulting report recorded them as zeros. The generator now
+   refuses to produce a passing report from that evidence:
+
+   ```
+   GATE INTEGRITY: 4 violation(s)
+     - cli-parity.csv absent in EVERY round (preset 'standard' requires it in at least one)
+     - n2n-trace.csv absent in EVERY round (preset 'standard' requires it in at least one)
+     - parity-matrix.csv absent in EVERY round (preset 'standard' requires it in at least one)
+     - chaos-events.csv absent in EVERY round (preset 'standard' requires it in at least one)
+   Refusing to report a PASS over evidence that was never produced.
+   ```
+
+   Then generate the report (strict is the default — never pass `--no-strict`
+   for a tag):
+
    ```bash
-   cd testnet/local-devnet
-   ./setup.sh && ./run.sh
-   sleep 30 && ./tx-zoo/run-all.sh --setup && ./tx-zoo/run-all.sh
-   ./soak.sh 420   # 7 min — one epoch boundary
-   ./stop.sh && ./setup.sh && ./run.sh
-   sleep 30 && ./tx-zoo/run-all.sh --setup && ./tx-zoo/run-all.sh
-   ./soak.sh 300   # restart round
-   ./stop.sh
-   # Generate release report
    .claude/skills/devnet-validate/scripts/generate-release-report.sh \
      --preset standard \
      --tag <VERSION> \
+     --round-names "baseline,epoch-boundary,restart" \
+     --tx-zoo-state testnet/local-devnet/tx-zoo/state \
+     --previous-report reports/devnet-validate/<PREVIOUS_TAG>.json \
      --output-dir reports/devnet-validate \
-     evidence/$(ls -t evidence | sed -n '2p') \
-     evidence/$(ls -t evidence | head -1)
+     "$EVD_ROUND1" "$EVD_ROUND2" "$EVD_ROUND3"
    ```
+
+   Exit 3 means gate integrity failed — required evidence was absent, short of
+   its pinned denominator, or borrowed from another round. Fix the run; do not
+   work around it.
+
+   **Before trusting the report**, confirm `gate_integrity.admissible` is
+   `true`:
+   ```bash
+   jq '.gate_integrity' reports/devnet-validate/report.json
+   ```
+   `admissible: false` means the report is a partial run and must not gate a tag.
+
+   The extended preset (`just devnet-validate-extended`, ~75 min) remains
+   available as a deeper pre-major-release pass. It is not the tag gate.
+
 4. **Commit the report** — `git add reports/devnet-validate/<tag>.json` and commit.
 5. **Tag** — `git tag -s <VERSION> -m "Release <VERSION>"` then push.
 

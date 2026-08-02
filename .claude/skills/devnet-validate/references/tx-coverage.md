@@ -10,14 +10,22 @@ The tx-zoo lives at `testnet/local-devnet/tx-zoo/`. It exercises every Conway-er
 |---|---|---|---|
 | 01 | bookkeeping | 8 | Phase-1 happy path: address derivation, fee calc, witness binding, change handling, UTxO accounting, multi-input txs, multi-output txs, metadata |
 | 02 | native scripts | 7 | CIP-1 multi-sig: simple all/any/of, time-bounded, key-hash, mint+burn under native policy |
-| 03 | plutus | 11 | V1 spend, V2 spend, V3 spend; V1/V2/V3 mint; inline datum; reference scripts; reference inputs; collateral selection; cost models |
+| 03 | plutus | 13 | V1 spend, V2 spend, V3 spend; V1/V2/V3 mint; inline datum; reference scripts; reference inputs; collateral selection; cost models; is_valid=false collateral path. **Spend and mint purposes ONLY** — certifying / rewarding / voting / proposing are unexercised (#955) |
 | 04 | stake | 7 | Stake registration/deregistration, delegation, pool registration/retirement, reward withdrawal, MIR (if applicable) |
 | 05 | governance certs | 8 | DRep registration/update/deregister, vote delegation, CC hot-key authorize, CC hot-key resign, committee membership |
 | 06 | proposals | 7 | CIP-1694 gov actions: ParameterChange, HardForkInitiation, TreasuryWithdrawals, NewCommittee, NewConstitution, InfoAction, NoConfidence |
 | 07 | voting | 7 | DRep / SPO / CC votes × {Yes, No, Abstain} — six wire paths plus a vote-rationale anchor |
-| 08 | negative | 4 | Must-reject txs: fee-below-min, ttl-expired, min-utxo-violation, missing-collateral. PASS = `cardano-cli ... submit` returns non-zero with the *expected* reason |
+| 08 | negative | 19 | Must-reject txs: fee-below-min, ttl-expired, min-utxo-violation, missing-collateral, NoInputs, DuplicateInput, InputNotFound, ValueNotConserved, TxTooLarge, NotYetValid, BadSignature, MissingRequiredSigner, OutputValueTooLarge, WrongNetworkOutput, InvalidMint, NativeScriptFailed, RefInputNotFound, MalformedCBOR, StakePoolCostTooLow. PASS = `cardano-cli ... submit` returns non-zero with the *expected* reason |
+| 10 | gov lifecycle | 5 | propose → DRep vote → SPO vote → CC vote → assert enactment. **ParameterChange only** (#956) |
+| 11 | mempool | 3 | TTL eviction, input-conflict rejection, drain latency p99 |
+| 12 | post-enactment | 1 | InvalidPrevGovActionId — only meaningful once an action has actually enacted, so it MUST run after 10 |
 
-Total: **59 scripts**. Sequential runtime ~3–5 minutes.
+Total: **85 scripts** (excluding the 22 in `09-cli-parity`, which measure the
+node's LSQ responses rather than tx admission). Sequential runtime ~6–10 minutes.
+
+The count is pinned in `../schemas/denominators.json` and asserted by
+`../scripts/test-denominators.sh`; adding a script without bumping the pin fails
+that check rather than silently widening the gate.
 
 ## How each script asserts
 
@@ -27,6 +35,12 @@ A positive (01–07) script PASSES when:
 3. The tx's outputs (or effects) appear in the UTxO of ≥1 observer within 60s. Critical scripts wait for all 3 observers.
 
 A negative (08) script PASSES when step (2) FAILS with a known error pattern matched in the script.
+
+Skips are classified (`lib/tx-zoo-common.sh`, `zoo_skip_class`):
+- **ENV-SKIP** — the check could not run at all (missing tool/key/capability).
+  Structural: it skips identically every run, so the surface is *never*
+  exercised. `run-all.sh --strict-skips` turns these into failures.
+- **SKIP** — the chain legitimately lacked the precondition this round.
 
 Results are appended to `tx-zoo/state/results.csv`. Inspect with:
 ```bash
@@ -93,7 +107,8 @@ ZOO_SOCKET=$LD_RELAY_SOCK    ./tx-zoo/<script>.sh    # path B: relay-mediated (d
 ZOO_SOCKET=$LD_CARDANO_BP_SOCK  ./tx-zoo/<script>.sh    # path C: Haskell-mediated (reverse mempool path)
 ```
 
-The standard playbook runs path B for the full 59-script suite, then re-runs a balanced subset (01-bookkeeping, 04-stake, 06-proposals, 08-negative) via path C. Off-diagonal cells in the resulting accept/reject matrix (see `test-methodology.md` for the matrix) are P0 bugs — they prove a tx that dugite admits is rejected by Haskell (or vice versa). All 19 `08-negative` scripts must produce identical rejection reasons on both paths.
+The standard playbook runs path B for the full 85-script suite, then re-runs a
+subset via path C. Off-diagonal cells in the resulting accept/reject matrix (see `test-methodology.md` for the matrix) are P0 bugs — they prove a tx that dugite admits is rejected by Haskell (or vice versa). All 19 `08-negative` scripts must produce identical rejection reasons on both paths.
 
 For dugite-cli ↔ cardano-cli submit-layer parity (path D), use `cross-validate-cli.sh` — it submits one representative tx per category via dugite-cli to dugite-bp.sock and observes inclusion via cardano-cli on the relay socket. The two cli implementations must produce byte-identical signed-tx CBOR; a mismatch shows up as the wrong txid on inclusion.
 
@@ -106,4 +121,7 @@ Not in scope for the standard 3-round playbook, but useful for deeper investigat
 - Concurrent submission to all three sockets simultaneously
 - CBOR fuzz inputs to N2C (existing `cargo test -p dugite-network` has some; not yet wired to devnet)
 
-If you find a class of bug that the existing 59 scripts didn't catch, add a script to the appropriate category — the test should fail before the fix lands and pass after.
+If you find a class of bug that the existing scripts didn't catch, add a script
+to the appropriate category — the test should fail before the fix lands and pass
+after — and bump the pinned count in `../schemas/denominators.json` in the same
+commit.

@@ -1,0 +1,70 @@
+{
+  "$comment": [
+    "Pinned expected-case denominators for every devnet-validate suite.",
+    "",
+    "WHY THIS FILE EXISTS (#953, same class as #945/#923): every suite in this",
+    "harness reports N/N by counting the rows it produced. A stimulus that never",
+    "fires produces no row, so N/N is tautological — '26/26 adversarial' said",
+    "nothing about whether 26 cases ran. A denominator is only meaningful when it",
+    "comes from OUTSIDE the run that produces the numerator.",
+    "",
+    "Every count here is checked in two directions:",
+    "  1. generate-release-report.sh asserts actual >= expected (strict mode",
+    "     hard-fails below it, and records status='short' in the JSON).",
+    "  2. scripts/test-denominators.sh asserts these counts still match the",
+    "     scripts on disk, so adding a script without bumping the pin fails CI-",
+    "     style verification rather than silently widening the gate.",
+    "",
+    "Bump a number here only together with on-disk evidence of the new count."
+  ],
+
+  "tx_zoo": {
+    "expected_scripts": 85,
+    "$comment": "All tx-zoo/NN-*/[0-9]*.sh EXCLUDING 09-cli-parity (counted separately).",
+    "per_category": {
+      "01-bookkeeping": 8,
+      "02-native-scripts": 7,
+      "03-plutus": 13,
+      "04-stake": 7,
+      "05-governance-certs": 8,
+      "06-proposals": 7,
+      "07-voting": 7,
+      "08-negative": 19,
+      "10-gov-lifecycle": 5,
+      "11-mempool": 3,
+      "12-post-enactment": 1
+    }
+  },
+
+  "cli_parity": {
+    "expected_queries": 22,
+    "$comment": "One row per tx-zoo/09-cli-parity/09*.sh. EQUAL+DIVERGENT+SKIP+ERROR must sum to this. Env-skips are counted as their own class and never folded into EQUAL."
+  },
+
+  "n2n_adversarial": {
+    "expected_scripts": 7,
+    "expected_cases": 26,
+    "$comment": "Rows in n2n-trace.csv. NOT the same as the count of adv_record call sites (28) — two sites are mutually-exclusive branches. Confirmed live: see the closing evidence on #953."
+  },
+
+  "chaos": {
+    "expected_scripts": 6,
+    "expected_cases": 6,
+    "$comment": "One terminal row per chaos/*.sh (excluding lib.sh). ENV-SKIP is a counted class, never silence (#959)."
+  },
+
+  "parity_matrix": {
+    "$comment": "The parity denominator is per-invocation (it depends on which categories were requested), so it is carried in parity-matrix.meta.json written by bidirectional-parity.sh. This block pins the categories the STANDARD gate must cover, so a run that quietly narrows its category list fails the gate.",
+    "required_categories_standard": [
+      "01-bookkeeping",
+      "02-native-scripts",
+      "03-plutus",
+      "04-stake",
+      "05-governance-certs",
+      "06-proposals",
+      "07-voting",
+      "08-negative",
+      "11-mempool"
+    ]
+  }
+}

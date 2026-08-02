@@ -276,9 +276,31 @@ awk -F, '
 rm -f "$OUT.tmp"
 
 OFFDIAG=$(awk -F, 'NR>1 && $NF=="OFFDIAG" {c++} END {print c+0}' "$OUT")
-TOTAL=$(awk 'NR>1' "$OUT" | wc -l | tr -d ' ')
+MATCHED=$(awk -F, 'NR>1 && $NF=="MATCH" {c++} END {print c+0}' "$OUT")
+TOTAL=$(awk 'NR>1 && NF' "$OUT" | wc -l | tr -d ' ')
+
+# Sidecar meta — carries the denominator this invocation was MEANT to cover,
+# so the release-report generator can tell "41 of 41 requested" from "41 rows
+# happened to be produced" (#953). The CSV alone cannot express intent.
+META="${OUT%.csv}.meta.json"
+{
+    printf '{\n'
+    printf '  "expected": %d,\n' "${#EXPECTED_SCRIPTS[@]}"
+    printf '  "total": %d,\n'    "$TOTAL"
+    printf '  "match": %d,\n'    "$MATCHED"
+    printf '  "offdiag": %d,\n'  "$OFFDIAG"
+    printf '  "categories": ['
+    for ci in "${!CATS[@]}"; do
+        [ "$ci" -gt 0 ] && printf ', '
+        printf '"%s"' "${CATS[$ci]}"
+    done
+    printf ']\n'
+    printf '}\n'
+} > "$META"
+
 echo
 echo "=== parity matrix written to $OUT ==="
+echo "=== parity meta   written to $META ==="
 echo "  total scripts: $TOTAL  off-diagonal: $OFFDIAG"
 if [ "$OFFDIAG" -gt 0 ]; then
     echo

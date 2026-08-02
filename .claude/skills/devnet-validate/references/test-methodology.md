@@ -34,7 +34,7 @@ Both off-diagonal cells are bugs of the same severity. The skill MUST exercise e
 
 ### How to exercise it in practice
 
-For each representative tx (a balanced subset of all 59 zoo scripts plus the 19 negatives), run the same tx through **both** submit paths and capture both outcomes:
+For each representative tx (drawn from the 85 zoo scripts, which already include the 19 negatives), run the same tx through **both** submit paths and capture both outcomes:
 
 ```bash
 # Path A — submit to dugite (default)

@@ -1,0 +1,284 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "devnet-validate/report.v2.json",
+  "title": "devnet-validate report",
+  "description": "Machine-parseable run report for devnet-validate, v2. One file per tagged release, stored under reports/devnet-validate/<tag>.json.\n\nv2 vs v1 (#953):\n  - predicate keys renamed to match what verify.sh actually emits (v1 declared p2_no_invalid_forges / p3_tip_age / p4_tx_submissions, which no code ever wrote)\n  - cli_parity and n2n_adversarial declared (v1 emitted them undeclared)\n  - added slots for the suites v1 had no home for: parity_matrix, chaos (D6), throughput (D5), resources (D8), determinism (D9), log_anomalies\n  - every suite block carries a `status` so an ABSENT suite is distinguishable from one that ran and scored zero. This is the whole point of the bump: v1 could only say 0.\n  - added top-level `gate_integrity`, recording whether the run was allowed to omit required evidence.",
+  "type": "object",
+  "required": ["schema_version", "timestamp", "git_rev", "preset", "rounds", "summary", "gate_integrity"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 2,
+      "description": "Schema version — always 2 for this schema."
+    },
+    "timestamp": {
+      "type": "string",
+      "description": "ISO-8601 UTC timestamp of when the report was generated."
+    },
+    "git_rev": {
+      "type": "string",
+      "description": "Full 40-char SHA of dugite-node HEAD at run time."
+    },
+    "release_tag": {
+      "type": ["string", "null"],
+      "description": "Git tag (e.g. 'v2.5.0') if run was triggered by a release gate; null for ad-hoc runs."
+    },
+    "preset": {
+      "type": "string",
+      "enum": ["smoke", "standard", "extended"],
+      "description": "Which capability-matrix preset was used."
+    },
+    "cardano_node_version": { "type": "string" },
+    "cardano_cli_version": { "type": "string" },
+
+    "gate_integrity": {
+      "type": "object",
+      "description": "Whether this report is admissible as a release gate. A report with strict=false or a non-empty `missing` list MUST NOT be used to tag a release — it is a partial run, and the counts below under-report coverage rather than measuring it.",
+      "required": ["strict", "admissible", "missing"],
+      "properties": {
+        "strict": {
+          "type": "boolean",
+          "description": "True when the generator enforced the preset's evidence manifest (the default). False only when --no-strict was passed."
+        },
+        "admissible": {
+          "type": "boolean",
+          "description": "True iff strict enforcement ran AND every required artifact for the preset was present at or above its pinned denominator."
+        },
+        "missing": {
+          "type": "array",
+          "description": "Human-readable list of every required artifact that was absent, short of its denominator, or sourced from a shared (cross-round) file.",
+          "items": { "type": "string" }
+        },
+        "denominators_file": {
+          "type": ["string", "null"],
+          "description": "Path to the pinned-denominator manifest used for the assertions."
+        }
+      }
+    },
+
+    "rounds": {
+      "type": "array",
+      "description": "One entry per round executed (baseline, epoch-boundary, restart, …).",
+      "items": {
+        "type": "object",
+        "required": ["name", "pass", "evidence_dir"],
+        "properties": {
+          "name": { "type": "string" },
+          "pass": { "type": ["boolean", "null"] },
+          "evidence_dir": { "type": "string" },
+          "duration_seconds": { "type": ["integer", "number", "null"] },
+          "git_rev": { "type": "string" },
+          "cardano_node_version": { "type": "string" },
+          "cardano_cli_version": { "type": "string" },
+
+          "blocks": {
+            "type": "object",
+            "properties": {
+              "total_forges": { "type": "integer" },
+              "canonical":    { "type": "integer" },
+              "orphans":      { "type": "integer" },
+              "orphan_rate":  { "type": "number" }
+            }
+          },
+          "tip_age": {
+            "type": "object",
+            "properties": {
+              "avg_seconds": { "type": ["number", "null"] },
+              "p99_seconds": { "type": ["number", "null"] }
+            }
+          },
+          "chain_density": { "type": ["number", "null"] },
+
+          "tx_zoo": {
+            "type": "object",
+            "description": "tx-zoo outcome for this round. status='absent' means no tx-results.csv was snapshotted for the round — the counts are null, NOT zero.",
+            "required": ["status"],
+            "properties": {
+              "status": { "enum": ["ok", "absent", "short", "shared"] },
+              "pass":  { "type": ["integer", "null"] },
+              "fail":  { "type": ["integer", "null"] },
+              "skip":  { "type": ["integer", "null"] },
+              "total": { "type": ["integer", "null"] },
+              "expected": { "type": ["integer", "null"] },
+              "source": { "enum": ["round", "shared", "none"] }
+            }
+          },
+
+          "predicates": {
+            "type": "object",
+            "description": "Structured outcome of verify.sh predicates. Names match what verify.sh writes into the in-round report.md.",
+            "properties": {
+              "p1_forge_cross_check":   { "type": ["boolean", "null"] },
+              "p2_per_bp_attribution":  { "type": ["boolean", "null"] },
+              "p3_tx_inclusion":        { "type": ["boolean", "null"] },
+              "p4_tip_parity":          { "type": ["boolean", "null"] },
+              "p5_tip_age":             { "type": ["boolean", "null"] }
+            }
+          },
+
+          "log_errors": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "errors": { "type": "integer" },
+                "warns":  { "type": "integer" }
+              }
+            }
+          },
+          "anomalies": { "type": "array", "items": { "type": "string" } },
+          "epoch_transitions_observed": { "type": ["integer", "null"] },
+          "restart_catchup_seconds":    { "type": ["number", "null"] },
+
+          "n2n_adversarial": {
+            "type": "object",
+            "description": "D3. Adversarial N2N framing outcomes from n2n-trace.csv.",
+            "required": ["status"],
+            "properties": {
+              "status":      { "enum": ["ok", "absent", "short"] },
+              "pass":        { "type": ["integer", "null"] },
+              "fail":        { "type": ["integer", "null"] },
+              "panic":       { "type": ["integer", "null"] },
+              "silent_skip": { "type": ["integer", "null"] },
+              "total":       { "type": ["integer", "null"] },
+              "expected":    { "type": ["integer", "null"] }
+            }
+          },
+
+          "cli_parity": {
+            "type": "object",
+            "description": "D4. LSQ parity from cli-parity.csv. env_skip is a first-class count — folding it into `equal` is what hid 4/22 uncompared queries.",
+            "required": ["status"],
+            "properties": {
+              "status":     { "enum": ["ok", "absent", "short"] },
+              "equal":      { "type": ["integer", "null"] },
+              "divergent":  { "type": ["integer", "null"] },
+              "env_skip":   { "type": ["integer", "null"] },
+              "state_skip": { "type": ["integer", "null"] },
+              "error":      { "type": ["integer", "null"] },
+              "total":      { "type": ["integer", "null"] },
+              "expected":   { "type": ["integer", "null"] }
+            }
+          },
+
+          "parity_matrix": {
+            "type": "object",
+            "description": "The bidirectional accept/reject parity oracle — the harness's strongest predicate. Recorded durably here because tx-zoo/state/parity-matrix.csv is overwritten every run.",
+            "required": ["status"],
+            "properties": {
+              "status":    { "enum": ["ok", "absent", "short"] },
+              "total":     { "type": ["integer", "null"] },
+              "match":     { "type": ["integer", "null"] },
+              "offdiag":   { "type": ["integer", "null"] },
+              "expected":  { "type": ["integer", "null"] },
+              "categories": {
+                "type": ["array", "null"],
+                "items": { "type": "string" },
+                "description": "Categories this invocation was asked to cover."
+              },
+              "per_category": {
+                "type": ["object", "null"],
+                "additionalProperties": {
+                  "type": "object",
+                  "properties": {
+                    "total":   { "type": "integer" },
+                    "match":   { "type": "integer" },
+                    "offdiag": { "type": "integer" }
+                  }
+                }
+              }
+            }
+          },
+
+          "chaos": {
+            "type": "object",
+            "description": "D6. Failure-injection outcomes from chaos-events.csv.",
+            "required": ["status"],
+            "properties": {
+              "status":   { "enum": ["ok", "absent", "short"] },
+              "pass":     { "type": ["integer", "null"] },
+              "fail":     { "type": ["integer", "null"] },
+              "env_skip": { "type": ["integer", "null"] },
+              "total":    { "type": ["integer", "null"] },
+              "expected": { "type": ["integer", "null"] }
+            }
+          },
+
+          "throughput": {
+            "type": "object",
+            "description": "D5. Sync throughput from throughput.csv.",
+            "required": ["status"],
+            "properties": {
+              "status":            { "enum": ["ok", "absent"] },
+              "scenarios":         { "type": ["integer", "null"] },
+              "max_blocks_per_sec": { "type": ["number", "null"] },
+              "min_blocks_per_sec": { "type": ["number", "null"] }
+            }
+          },
+
+          "resources": {
+            "type": "object",
+            "description": "D8. Process resource health from resource-samples.csv.",
+            "required": ["status"],
+            "properties": {
+              "status":       { "enum": ["ok", "absent"] },
+              "samples":      { "type": ["integer", "null"] },
+              "max_rss_kb":   { "type": ["integer", "null"] },
+              "max_fds":      { "type": ["integer", "null"] },
+              "max_cpu_pct":  { "type": ["number", "null"] }
+            }
+          },
+
+          "determinism": {
+            "type": "object",
+            "description": "D9. Determinism feasibility / tip-hash match.",
+            "required": ["status"],
+            "properties": {
+              "status":  { "enum": ["ok", "absent"] },
+              "verdict": { "type": ["string", "null"] }
+            }
+          },
+
+          "log_anomalies": {
+            "type": "object",
+            "description": "Log-level predicate output from log-anomalies.csv.",
+            "required": ["status"],
+            "properties": {
+              "status": { "enum": ["ok", "absent"] },
+              "rows":   { "type": ["integer", "null"] }
+            }
+          }
+        }
+      }
+    },
+
+    "summary": {
+      "type": "object",
+      "required": ["pass", "rounds_pass", "rounds_fail"],
+      "properties": {
+        "pass":        { "type": "boolean" },
+        "rounds_pass": { "type": "integer" },
+        "rounds_fail": { "type": "integer" },
+        "total_canonical_blocks":  { "type": "integer" },
+        "total_tx_zoo_pass":       { "type": ["integer", "null"] },
+        "total_tx_zoo_fail":       { "type": ["integer", "null"] },
+        "invalid_forges_detected": { "type": "integer" },
+        "critical_anomalies":      { "type": "integer" },
+        "parity_offdiag_total":    { "type": ["integer", "null"] }
+      }
+    },
+
+    "trend": {
+      "type": ["object", "null"],
+      "properties": {
+        "baseline_tag":            { "type": "string" },
+        "canonical_blocks_delta":  { "type": ["integer", "null"] },
+        "orphan_rate_delta":       { "type": ["number",  "null"] },
+        "tip_age_p99_delta":       { "type": ["number",  "null"] },
+        "tx_zoo_pass_delta":       { "type": ["integer", "null"] },
+        "regressions":  { "type": "array", "items": { "type": "string" } },
+        "improvements": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}
