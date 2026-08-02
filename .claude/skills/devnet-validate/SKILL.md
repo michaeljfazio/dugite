@@ -360,9 +360,18 @@ cd testnet/local-devnet
 # Reportable round dirs across both locations, oldest first, last 3 only.
 # Basenames are ISO-8601, so a lexicographic sort is chronological, which for a
 # sequential run is round order.
+# Sort by the ISO-8601 timestamp EXTRACTED from the basename, not by the
+# basename itself. Two shapes coexist on any machine that has run
+# `just devnet-validate-extended`: `<TS>` and `round<N>-<TS>`. A plain
+# lexicographic sort puts every `round*` AFTER every `2026*`, so `tail -3`
+# silently selects a stale `round953-...` dir from an earlier session instead
+# of the newest round — and the report is then generated from the wrong
+# evidence without any error.
 ROUND_DIRS=$(
   for d in evidence/*/ evidence-archive/auto/*/; do
-    [ -d "$d" ] && [ -f "${d}report.md" ] && printf '%s\t%s\n' "$(basename "$d")" "${d%/}"
+    [ -d "$d" ] && [ -f "${d}report.md" ] || continue
+    ts=$(basename "$d" | grep -oE '[0-9]{8}T[0-9]{6}Z' | head -1)
+    [ -n "$ts" ] && printf '%s\t%s\n' "$ts" "${d%/}"
   done | sort | cut -f2 | tail -3
 )
 EVD_ROUND1=$(echo "$ROUND_DIRS" | sed -n '1p')
