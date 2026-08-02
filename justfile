@@ -193,6 +193,12 @@ devnet-validate-extended:
             [ "$B" -ge 5 ] && break
         done
         EVIDENCE_DIR="$EVD" ./tx-zoo/run-all.sh
+        # UTxO RPC (gRPC) suite (#960). REQUIRED: the standard and extended
+        # preset manifests declare `rpc|rpc.csv|any`, so a round set without it
+        # now fails gate integrity (exit 3) rather than silently omitting the
+        # suite. Adding the manifest entry without this line would have broken
+        # this recipe.
+        ./rpc/run.sh "$EVD"
         CHAOS_SET=extended ./chaos/run.sh "$EVD"
         EVIDENCE_DIR="$EVD" ./sync/bulk-sync-throughput.sh
         EVIDENCE_DIR="$EVD" ./perf/resource-health.sh
