@@ -18,7 +18,7 @@
     "Bump a number here only together with on-disk evidence of the new count."
   ],
   "tx_zoo": {
-    "expected_scripts": 100,
+    "expected_scripts": 105,
     "$comment": "All tx-zoo/NN-*/[0-9]*.sh EXCLUDING 09-cli-parity (counted separately).",
     "per_category": {
       "01-bookkeeping": 8,
@@ -33,7 +33,8 @@
       "11-mempool": 3,
       "12-post-enactment": 1,
       "13-script-purposes": 9,
-      "14-gov-negatives": 6
+      "14-gov-negatives": 6,
+      "15-asset-lattice": 5
     }
   },
   "cli_parity": {
@@ -68,7 +69,8 @@
       "10-gov-lifecycle": "Chain-global governance lifecycle: propose -> 3-role vote -> assert enactment. Two batches would create two proposals in the same lane and both vote; ratification is a property of the whole chain, not of a batch, so the second batch's enactment assertion is not independent. Covered on path B only.",
       "12-post-enactment": "Only meaningful once a governance action has actually ENACTED, so it depends on 10 having run and on global chain state. Same reason as 10.",
       "13-script-purposes": "The guarding scripts are fixed (always-true/false V3, one native), so their hashes are deterministic and BOTH parity batches would share one stake credential and one DRep credential. Batch 1 registers and then deregisters it, so batch 2 acts on state batch 1 already mutated — the same class as 05g/05h. These scripts instead demand Haskell confirmation directly: they use wait_all_strict, which requires all three observers and never soft-passes on 'cbp lagging'.",
-      "14-gov-negatives": "Governance negatives assert rejection CLASSES against chain-global gov state (live actions, registered DReps). Both batches would target the same actions, so batch 2's result depends on what batch 1 did — same class as 10/12. The rejection class is already compared against cardano-node directly by each script."
+      "14-gov-negatives": "Governance negatives assert rejection CLASSES against chain-global gov state (live actions, registered DReps). Both batches would target the same actions, so batch 2's result depends on what batch 1 did — same class as 10/12. The rejection class is already compared against cardano-node directly by each script.",
+      "15-asset-lattice": "Mint policies are derived from the batch's own payment key, so the two parity batches mint under DIFFERENT policy ids and the resulting values are not comparable cell-for-cell. The properties under test (encodeMap definite/indefinite boundaries at 23/24/256, multi-policy values, mint+burn) are wire-shape properties already checked against cardano-node by zoo_wait_all_observers on every script."
     },
     "excluded_scripts": {
       "05g-cc-hot-key-authorization": "Constitutional committee is seated at genesis and is devnet-global. Batch 1 resigns cc-1, so batch 2 correctly receives ConwayCommitteeHasPreviouslyResigned. Giving batch 2 its own committee requires an UpdateCommittee governance action (2+ epoch boundaries). Verified live 2026-08-02, not a dugite defect.",

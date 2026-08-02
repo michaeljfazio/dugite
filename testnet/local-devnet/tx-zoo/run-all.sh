@@ -48,6 +48,9 @@ ALL_CATEGORIES=(
     # vote on) and after 13 (which registers/deregisters its own DRep), so a
     # rejection here is never an artefact of another category's state.
     14-gov-negatives
+    # Multi-asset / size lattice (#961). Independent of governance state, so
+    # position is not load-bearing; last keeps the governance ordering intact.
+    15-asset-lattice
 )
 
 usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; }
