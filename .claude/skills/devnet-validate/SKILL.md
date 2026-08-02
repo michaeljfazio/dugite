@@ -11,13 +11,27 @@ End-to-end validation harness that exercises dugite on a local 3-node devnet, cr
 
 ```
    dugite-bp (forger)  ── N2N ──▶  dugite-relay  ── N2N ──▶  cardano-relay
-     :3000 :12798                    :3001 :12799              :3002 (Haskell)
+   :3001 :12798 :9090               :3002 :12799 :9091          :3003 (Haskell)
 ```
 
 The user-facing names map to scripts/configs as follows:
-- `dugite-bp` (sole forger, holds 95%+ stake)
+- `dugite-bp` (sole forger by default, holds 100% of the delegated stake)
 - `dugite-relay` (middle hop, no keys)
 - `cardano-relay` — implemented as `cardano-bp` in scripts, but configured as a non-forging relay (no `--shelley-{kes,vrf,operational-certificate}` flags). It is the Haskell validator.
+
+Ports are exact as of 2026-08-02 (they were previously documented as 3000/3001/3002, which matched nothing on disk): N2N 3001/3002/3003, Prometheus 12798/12799, UTxO RPC 9090/9091.
+
+**Two-forger mode** (`LD_TWO_FORGERS=1 ./setup.sh`, #957) changes this: the genesis delegation splits 60/40, `cardano-bp` gets pool2's forging keys and becomes a real competing producer, and a FOURTH node appears —
+
+```
+   dugite-bp(pool1) ──┐                  ┌── cardano-bp(pool2)
+        :3001         ├── dugite-relay ──┤        :3003
+                      │      :3002       │
+                      └── cardano-arbiter ┘
+                              :3004
+```
+
+`cardano-arbiter` is a non-forging cardano-node peered directly with both producers — the independent Haskell tiebreak oracle. See Round 5.
 
 ## When to invoke
 
@@ -52,7 +66,7 @@ command -v jq curl lsof
 test -x ./target/release/dugite-node || cargo build --release -p dugite-node
 
 # Ports must be free
-for p in 3000 3001 3002 12798 12799 12800; do
+for p in 3001 3002 3003 3004 12798 12799 9090 9091; do
   if lsof -iTCP:$p -sTCP:LISTEN -P -n 2>/dev/null | grep -q LISTEN; then
     echo "PORT BUSY: $p"; exit 1
   fi
@@ -108,7 +122,7 @@ In addition to tx and N2N coverage, the skill exercises **dugite-cli surface par
 
 > Coverage honesty: the suite covers Query/Submit/Sync **discovery** plus the Query and Submit methods listed above. `Sync.FetchBlock`/`DumpHistory`/`FollowTip` and the whole `Watch` service are advertised-and-asserted-present but their **behaviour** is not yet compared against anything. Do not read "8/8 service-present PASS" as "all four services are validated".
 
-## Workflow — three rounds in under 20 minutes
+## Workflow — three core rounds in under 20 minutes, plus four targeted rounds
 
 Use TodoWrite to track each round as `in_progress` / `completed`. Each round must end with `./stop.sh` and a fresh `./setup.sh` before the next.
 
@@ -274,6 +288,47 @@ TIP_AFTER=$(cardano-cli query tip --testnet-magic 42 --socket-path "$LD_DUGITE_B
 - `verify.sh` p1 (forge cross-check) shows zero canonical blocks with missing observers
 
 If Round 3 stalls past 60s, suspect the stale-intersection bug (memory: `project_stale_intersection_when_peer_behind`). Capture logs + metrics + evidence and report.
+
+### Round 4 — RPC + chaos (~3 min, runs on the Round 1 devnet)
+
+```bash
+./rpc/run.sh        # UTxO RPC (gRPC) — #960; exits 1 on any FAIL/ERROR
+./chaos/run.sh      # failure injection — #959; kill-9 LAST, it SIGKILLs on purpose
+```
+
+**PASSES iff** `rpc.csv` has zero FAIL/ERROR rows and at least one PASS (a suite producing zero passing checks is treated as a failure, not a clean sweep), and `chaos-events.csv` has zero FAIL and zero ENV_SKIP.
+
+### Round 5 — Two-forger contention (~10 min, its own devnet) — #957
+
+```bash
+TF_DURATION=300 ./two-forger-round.sh
+```
+
+Runs `LD_TWO_FORGERS=1 ./setup.sh`, which splits the genesis delegation 60/40, gives cardano-bp pool2's forging keys, and starts a **fourth** node — `cardano-arbiter`, a non-forging cardano-node peered directly with both producers. The arbiter exists because neither producer is neutral (a producer prefers its own block by construction) and two dugite processes agreeing would only prove dugite is self-consistent.
+
+**PASSES iff** both pools forged ≥3 blocks, the arbiter holds ≥2 established connections, all four nodes converge on one chain (asserted BOTH mid-round and at the very end), zero invalid-block events, pots byte-exact vs the arbiter, and dugite-bp rejoins **the arbiter's chain by tip hash** after a restart during which the other forger kept producing.
+
+> Two-forger mode sets the genesis start 150s out. If both producers reach slot 0 before they are connected they fork at genesis, exceed `k=40`, and can never re-converge (`ChainSync intersection only at genesis`) — a permanently partitioned devnet on which every cross-node comparison is meaningless. Do not shorten `LD_GENESIS_DELAY`.
+
+### Round 6 — Governance enactment (~40 min, its own devnet) — #956
+
+```bash
+./gov-enactment-round.sh          # GOV_PROBE_ONLY=1 skips the boundary waits
+```
+
+Proposes a TreasuryWithdrawal, votes DRep + CC (**SPOs may not vote on this action type** — `DisallowedVoters`), waits for enactment, and asserts the reward-account credit is byte-exact against the requested transfer plus treasury/gov-state/constitution parity with cardano-node.
+
+Two preconditions are established first, and both are load-bearing:
+- **DRep voting power.** `dRepAcceptedRatio` folds over the stake *distribution*, never over who voted. With no `vote_delegation` anywhere the map is empty and the ratio is 0, so every DRep-gated action is unratifiable regardless of votes.
+- **A funded `ensTreasury` one boundary earlier.** RATIFY reads the treasury sealed into the *previous* pulser, so a withdrawal proposed before the first RUPD fails on affordability even though the post-boundary state looks ample.
+
+### Round 7 — Reward withdrawal (~30 min, its own devnet) — #958
+
+```bash
+./rewards-round.sh
+```
+
+Uses a **genesis** stake delegator (reward matures at epoch 3 rather than M+4) and submits a `vote_delegation` first, because at PV10 `ConwayWdrlNotDelegatedToDRep` fires *before* any amount check and genesis registration structurally cannot set a DRep delegation. Covers the negative twin (wrong amount → `WithdrawalsNotInRewardsCERTS`), the exact-balance positive, and a multi-account withdrawal.
 
 ## Final report
 
