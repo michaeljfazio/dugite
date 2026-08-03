@@ -511,6 +511,7 @@ impl TxValidator for LedgerTxValidator {
             Err(_) => self.slot_config,
         };
 
+        let pv_major = ledger.epochs.protocol_params.protocol_version_major;
         dugite_ledger::validation::validate_transaction_with_context(
             &tx,
             &utxo_view,
@@ -528,8 +529,10 @@ impl TxValidator for LedgerTxValidator {
             for err in &errors {
                 self.metrics.record_validation_error(&format!("{:?}", err));
             }
-            let mut mapped: Vec<TxValidationError> =
-                errors.into_iter().map(convert_validation_error).collect();
+            let mut mapped: Vec<TxValidationError> = errors
+                .into_iter()
+                .map(|e| convert_validation_error_at_pv(e, pv_major))
+                .collect();
             if mapped.len() == 1 {
                 mapped.pop().expect("vec has exactly one element")
             } else {
@@ -568,7 +571,74 @@ fn gov_action_id_to_string(id: &dugite_primitives::transaction::GovActionId) -> 
     format!("{}#{}", id.transaction_id.to_hex(), id.action_index)
 }
 
+/// Map a `NetworkId` to the wire byte Haskell's `Network` uses: 0 testnet,
+/// 1 mainnet.
+fn network_id_to_wire(n: dugite_primitives::network::NetworkId) -> u8 {
+    match n {
+        dugite_primitives::network::NetworkId::Mainnet => 1,
+        _ => 0,
+    }
+}
+
+/// Map dugite's redeemer-purpose name to the `PlutusPurpose AsIx` wire tag.
+///
+/// Conway numbering (`ConwayPlutusPurpose`): 0 spending, 1 minting,
+/// 2 certifying, 3 rewarding, 4 voting, 5 proposing. An unknown name returns
+/// `None` so the caller falls back rather than inventing a tag.
+fn redeemer_tag_to_wire(tag: &str) -> Option<u8> {
+    match tag.to_ascii_lowercase().as_str() {
+        "spend" | "spending" => Some(0),
+        "mint" | "minting" => Some(1),
+        "cert" | "certifying" => Some(2),
+        "reward" | "rewarding" | "withdrawal" => Some(3),
+        "vote" | "voting" => Some(4),
+        "propose" | "proposing" => Some(5),
+        _ => None,
+    }
+}
+
+/// Convert a ledger `ValidationError` into the network-facing
+/// `TxValidationError`, at the CURRENT protocol version.
+///
+/// The protocol version is load-bearing, not decoration. Two DELEG failures
+/// changed shape at PV 11 (`hardforkConwayDELEGIncorrectDepositsAndRefunds`):
+/// below it, an incorrect stake-key deposit OR refund is
+/// `IncorrectDepositDELEG Coin` (tag 1, carrying only the supplied value);
+/// from PV 11 they split into `DepositIncorrectDELEG` (tag 7) and
+/// `RefundIncorrectDELEG` (tag 8), each carrying a full `Mismatch`.
+///
+/// Every real network runs PV 10 today, so emitting only the PV>=11 form would
+/// mean the reachable case degrades while the implemented arms are dead code —
+/// exactly the inversion #978 found in the withdrawal path.
+pub(crate) fn convert_validation_error_at_pv(
+    e: dugite_ledger::validation::ValidationError,
+    pv_major: u64,
+) -> TxValidationError {
+    use dugite_ledger::validation::ValidationError as VE;
+    // Pre-PV11 collapses both mismatches onto ONE constructor carrying only
+    // the supplied amount. Handle them here so the main table stays a plain
+    // 1:1 map.
+    if pv_major <= 10 {
+        match e {
+            VE::StakeRegistrationDepositMismatch { declared, .. } => {
+                return TxValidationError::IncorrectDepositDELEG { supplied: declared };
+            }
+            VE::StakeDeregistrationRefundMismatch { declared, .. } => {
+                // Upstream reports the REFUND through the same
+                // `IncorrectDepositDELEG` constructor pre-PV11 — there is no
+                // separate refund tag before the split.
+                return TxValidationError::IncorrectDepositDELEG { supplied: declared };
+            }
+            other => return convert_validation_error(other),
+        }
+    }
+    convert_validation_error(e)
+}
+
 /// Convert a ledger `ValidationError` into the network-facing `TxValidationError`.
+///
+/// PV-independent mappings only — see [`convert_validation_error_at_pv`] for
+/// the two that are gated.
 pub(crate) fn convert_validation_error(
     e: dugite_ledger::validation::ValidationError,
 ) -> TxValidationError {
@@ -704,11 +774,16 @@ pub(crate) fn convert_validation_error(
                 "Governance features not available pre-Conway (current protocol version: {current_version})"
             ),
         },
-        VE::TreasuryValueMismatch { declared, actual } => TxValidationError::ScriptFailed {
-            reason: format!("Treasury value mismatch: declared {declared}, actual {actual}"),
-        },
-        VE::UnelectedCommitteeMember { cold_credential_hash } => TxValidationError::ScriptFailed {
-            reason: format!("Unelected committee member: {cold_credential_hash}"),
+        VE::TreasuryValueMismatch { declared, actual } => {
+            TxValidationError::TreasuryValueMismatch {
+                supplied: declared,
+                expected: actual,
+            }
+        }
+        VE::UnelectedCommitteeMember {
+            cold_credential_hash,
+        } => TxValidationError::ConwayCommitteeIsUnknown {
+            credential: cold_credential_hash,
         },
         VE::MissingRedeemer { tag, index } => TxValidationError::ScriptFailed {
             reason: format!("Missing redeemer for {tag} at index {index}"),
@@ -744,197 +819,179 @@ pub(crate) fn convert_validation_error(
         VE::PoolRetirementTooLate {
             retirement_epoch,
             current_epoch,
-            e_max,
+            max_epoch,
             ..
-        } => TxValidationError::ScriptFailed {
-            reason: format!(
-                "Pool retirement epoch {retirement_epoch} exceeds max (current {current_epoch} + e_max {e_max})"
-            ),
+        } => TxValidationError::StakePoolRetirementWrongEpochPOOL {
+            gt_expected: current_epoch,
+            lt_supplied: retirement_epoch,
+            lt_expected: max_epoch,
         },
         VE::PoolRetirementTooEarly {
             retirement_epoch,
             current_epoch,
-        } => TxValidationError::ScriptFailed {
-            reason: format!(
-                "Pool retirement epoch {retirement_epoch} must be strictly greater than \
-                 current_epoch {current_epoch} (StakePoolRetirementWrongEpochPOOL)"
-            ),
+        } => TxValidationError::StakePoolRetirementWrongEpochPOOL {
+            // Upstream folds "too early" and "too late" into ONE constructor
+            // carrying both bounds; the early case violates the `RelGT` bound,
+            // so `lt_expected` is reported as the retirement epoch itself.
+            gt_expected: current_epoch,
+            lt_supplied: retirement_epoch,
+            lt_expected: retirement_epoch,
         },
         VE::WrongNetworkPool {
             expected,
             actual,
             pool_id,
-        } => TxValidationError::ScriptFailed {
-            reason: format!(
-                "Pool {pool_id} reward account on wrong network: expected {expected:?}, \
-                 got {actual:?} (WrongNetworkPOOL)"
-            ),
+        } => TxValidationError::WrongNetworkPOOL {
+            expected: network_id_to_wire(expected),
+            supplied: network_id_to_wire(actual),
+            pool_id,
         },
         VE::StakeRegistrationDepositMismatch { declared, expected } => {
-            TxValidationError::ScriptFailed {
-                reason: format!(
-                    "Conway stake registration deposit mismatch: declared={declared}, expected={expected}"
-                ),
+            TxValidationError::DepositIncorrectDELEG {
+                supplied: declared,
+                expected,
             }
         }
-        VE::StakeKeyHasNonZeroBalance {
-            credential_hash,
-            balance,
-        } => TxValidationError::ScriptFailed {
-            reason: format!(
-                "Stake deregistration rejected: credential {credential_hash} has non-zero balance ({balance} lovelace)"
-            ),
-        },
+        VE::StakeKeyHasNonZeroBalance { balance, .. } => {
+            // Upstream's payload is the BALANCE alone — the credential is not
+            // part of `StakeKeyHasNonZeroAccountBalanceDELEG`.
+            TxValidationError::StakeKeyHasNonZeroAccountBalanceDELEG { balance }
+        }
         VE::StakeDeregistrationRefundMismatch { declared, expected } => {
-            TxValidationError::ScriptFailed {
-                reason: format!(
-                    "Conway stake deregistration refund mismatch: declared={declared}, expected={expected}"
-                ),
+            TxValidationError::RefundIncorrectDELEG {
+                supplied: declared,
+                expected,
             }
         }
-        VE::StakeKeyAlreadyRegistered { credential_hash } => TxValidationError::ScriptFailed {
-            reason: format!(
-                "Stake registration rejected: credential {credential_hash} is already registered"
-            ),
-        },
+        VE::StakeKeyAlreadyRegistered { credential_hash } => {
+            TxValidationError::StakeKeyRegisteredDELEG {
+                credential: credential_hash.clone(),
+            }
+        }
         VE::StakeKeyNotRegisteredForDeregistration { credential_hash } => {
-            TxValidationError::ScriptFailed {
-                reason: format!(
-                    "Stake deregistration rejected: credential {credential_hash} is not registered"
-                ),
+            TxValidationError::StakeKeyNotRegisteredDELEG {
+                credential: credential_hash.clone(),
             }
         }
-        VE::DelegateePoolNotRegistered { pool_id } => TxValidationError::ScriptFailed {
-            reason: format!(
-                "Stake delegation rejected: target pool {pool_id} is not registered"
-            ),
-        },
-        VE::DRepAlreadyRegistered { credential_hash } => TxValidationError::ScriptFailed {
-            reason: format!(
-                "DRep registration rejected: credential {credential_hash} is already registered"
-            ),
-        },
-        VE::DRepIncorrectDeposit { declared, expected } => TxValidationError::ScriptFailed {
-            reason: format!(
-                "DRep registration rejected: declared deposit {declared} does not match \
-                 drep_deposit parameter {expected} (ConwayDRepIncorrectDeposit)"
-            ),
-        },
+        VE::DelegateePoolNotRegistered { pool_id } => {
+            TxValidationError::DelegateeStakePoolNotRegisteredDELEG {
+                pool_id: pool_id.clone(),
+            }
+        }
+        VE::DRepAlreadyRegistered { credential_hash } => {
+            TxValidationError::ConwayDRepAlreadyRegistered {
+                credential: credential_hash,
+            }
+        }
+        VE::DRepIncorrectDeposit { declared, expected } => {
+            TxValidationError::ConwayDRepIncorrectDeposit {
+                supplied: declared,
+                expected,
+            }
+        }
         VE::DRepIncorrectRefund {
-            credential_hash,
-            declared,
+            declared, expected, ..
+        } => TxValidationError::ConwayDRepIncorrectRefund {
+            supplied: declared,
             expected,
-        } => TxValidationError::ScriptFailed {
-            reason: format!(
-                "DRep unregistration rejected: declared refund {declared} does not match \
-                 stored deposit {expected} for credential {credential_hash} \
-                 (ConwayDRepIncorrectRefund)"
-            ),
         },
-        VE::MalformedScriptWitnesses { hashes } => TxValidationError::ScriptFailed {
-            reason: format!(
-                "Malformed script witness(es) in tx: {hashes:?} \
-                 (MalformedScriptWitnesses; PV gate or flat-decode failed)"
-            ),
-        },
-        VE::MalformedReferenceScripts { hashes } => TxValidationError::ScriptFailed {
-            reason: format!(
-                "Malformed reference script(s) on tx outputs: {hashes:?} \
-                 (MalformedReferenceScripts; PV gate or flat-decode failed)"
-            ),
-        },
-        VE::DisallowedVotesDuringBootstrap { violations } => TxValidationError::ScriptFailed {
-            reason: format!(
-                "Disallowed votes during Conway bootstrap (PV9): {} violation(s) — \
-                 DRep may only vote on InfoAction; Committee/StakePool only on \
-                 ParameterChange/HardForkInitiation/InfoAction (DisallowedVotesDuringBootstrap)",
-                violations.len()
-            ),
-        },
-        VE::TreasuryWithdrawalReturnAccountsDoNotExist { bad_addrs } => {
-            TxValidationError::ScriptFailed {
-                reason: format!(
-                    "TreasuryWithdrawals destination address(es) not registered: {bad_addrs:?} \
-                     (TreasuryWithdrawalReturnAccountsDoNotExist)"
-                ),
+        VE::MalformedScriptWitnesses { hashes } => {
+            TxValidationError::MalformedScriptWitnessesUTXOW {
+                script_hashes: hashes,
             }
         }
-        VE::InvalidMetadata { labels } => TxValidationError::ScriptFailed {
-            reason: format!(
-                "InvalidMetadata: oversize leaf at metadata label(s) {labels:?} \
-                 (Allegra+ enforces max 64 bytes per Bytes/Text leaf)"
-            ),
-        },
-        // Typed, not ScriptFailed: the generic arm encoded as
-        // ConwayMempoolFailure "transaction validation failed", which told the
-        // client nothing while cardano-node answered ProposalDepositIncorrect
-        // with both amounts. Same shape as #925.
+        VE::MalformedReferenceScripts { hashes } => {
+            TxValidationError::MalformedReferenceScriptsUTXOW {
+                script_hashes: hashes,
+            }
+        }
+        VE::DisallowedVotesDuringBootstrap { violations } => {
+            TxValidationError::DisallowedVotesDuringBootstrap {
+                violations: violations
+                    .iter()
+                    .map(|(voter, gid)| {
+                        let (disc, hex) = voter_to_disc_hex(voter);
+                        (disc, hex, gov_action_id_to_string(gid))
+                    })
+                    .collect(),
+            }
+        }
+        VE::TreasuryWithdrawalReturnAccountsDoNotExist { bad_addrs } => {
+            TxValidationError::TreasuryWithdrawalReturnAccountsDoNotExist {
+                accounts: bad_addrs,
+            }
+        }
+        VE::InvalidMetadata { .. } => TxValidationError::InvalidMetadataUTXOW,
         VE::ProposalDepositIncorrect { declared, expected } => {
             TxValidationError::ProposalDepositIncorrect { declared, expected }
         }
-        VE::CommitteeHasPreviouslyResigned { cold_credential_hash } => {
-            TxValidationError::ScriptFailed {
-                reason: format!(
-                    "CommitteeHotAuth rejected: cold credential {cold_credential_hash} has previously resigned \
-                     (ConwayCommitteeHasPreviouslyResigned)"
-                ),
-            }
-        }
+        VE::CommitteeHasPreviouslyResigned {
+            cold_credential_hash,
+        } => TxValidationError::ConwayCommitteeHasPreviouslyResigned {
+            credential: cold_credential_hash,
+        },
         VE::VrfKeyHashAlreadyRegistered {
             vrf_keyhash,
             existing_pool_id,
-        } => TxValidationError::ScriptFailed {
-            reason: format!(
-                "VRF key {vrf_keyhash} is already registered to pool {existing_pool_id}"
-            ),
+        } => TxValidationError::VrfKeyHashAlreadyRegisteredPOOL {
+            pool_id: existing_pool_id,
+            vrf_key_hash: vrf_keyhash,
         },
-        VE::StakePoolCostTooLow { actual, minimum } => TxValidationError::ScriptFailed {
-            reason: format!(
-                "Pool registration rejected: cost {actual} is below minimum pool cost {minimum} \
-                 (StakePoolCostTooLowPOOL)"
-            ),
+        VE::StakePoolCostTooLow { actual, minimum } => {
+            TxValidationError::StakePoolCostTooLowPOOL {
+                supplied: actual,
+                expected: minimum,
+            }
+        }
+        VE::PoolRewardAccountWrongNetwork {
+            expected,
+            actual,
+            pool_id,
+        } => TxValidationError::WrongNetworkPOOL {
+            expected: network_id_to_wire(expected),
+            supplied: network_id_to_wire(actual),
+            pool_id,
         },
-        VE::PoolRewardAccountWrongNetwork { expected, actual } => TxValidationError::ScriptFailed {
-            reason: format!(
-                "Pool registration rejected: reward account network {actual:?} does not match \
-                 transaction network {expected:?} (WrongNetworkInTxBody)"
-            ),
+        VE::AuxiliaryDataHashMismatch { declared, computed } => {
+            TxValidationError::ConflictingMetadataHashUTXOW {
+                supplied: declared,
+                expected: computed,
+            }
+        }
+        VE::WrongNetworkInOutput {
+            expected, addresses, ..
+        } => TxValidationError::WrongNetworkInOutput {
+            // The wire shape carries the EXPECTED network plus the offending
+            // address set — there is no "actual network" field.
+            expected: network_id_to_wire(expected),
+            addresses,
         },
-        VE::AuxiliaryDataHashMismatch => TxValidationError::ScriptFailed {
-            reason: "Auxiliary data hash mismatch: declared hash does not match blake2b_256 of \
-                     aux data bytes (AuxDataHashMismatch)"
-                .to_string(),
+        VE::WrongNetworkWithdrawal {
+            expected, accounts, ..
+        } => TxValidationError::WrongNetworkWithdrawal {
+            expected: network_id_to_wire(expected),
+            accounts,
         },
-        VE::WrongNetworkInOutput { expected, actual } => TxValidationError::ScriptFailed {
-            reason: format!(
-                "Output address network {actual:?} does not match node network {expected:?} \
-                 (WrongNetworkInOutput)"
-            ),
-        },
-        VE::WrongNetworkWithdrawal { expected, actual } => TxValidationError::ScriptFailed {
-            reason: format!(
-                "Withdrawal reward address network {actual:?} does not match node network \
-                 {expected:?} (WrongNetworkWithdrawal)"
-            ),
-        },
-        VE::ConstitutionPolicyMismatch { expected, actual } => TxValidationError::ScriptFailed {
-            reason: format!(
-                "Governance proposal policy_hash mismatch: constitution requires {expected}, \
-                 proposal has {actual} (ConstitutionPolicyMismatch)"
-            ),
-        },
-        VE::UnspendableUTxONoDatumHash { input, language } => TxValidationError::ScriptFailed {
-            reason: format!(
-                "Script-locked input {input} has no datum hash but uses {language} \
-                 (UnspendableUTxONoDatumHash)"
-            ),
-        },
-        VE::WdrlNotDelegatedToDRep { credential_hash } => TxValidationError::ScriptFailed {
-            reason: format!(
-                "Withdrawal rejected: KeyHash reward account {credential_hash} has no DRep \
-                 delegation (ConwayWdrlNotDelegatedToDRep)"
-            ),
-        },
+        VE::ConstitutionPolicyMismatch { expected, actual } => {
+            TxValidationError::InvalidGuardrailsScriptHash {
+                got: if actual.is_empty() { None } else { Some(actual) },
+                expected: if expected.is_empty() {
+                    None
+                } else {
+                    Some(expected)
+                },
+            }
+        }
+        VE::UnspendableUTxONoDatumHash { input, .. } => {
+            TxValidationError::UnspendableUTxONoDatumHashUTXOW {
+                inputs: vec![input],
+            }
+        }
+        VE::WdrlNotDelegatedToDRep { credential_hash } => {
+            TxValidationError::WdrlNotDelegatedToDRep {
+                key_hashes: vec![credential_hash],
+            }
+        }
         VE::MalformedProposal { reason } => TxValidationError::ScriptFailed {
             reason: format!("Governance proposal rejected: malformed PParamsUpdate ({reason})"),
         },
@@ -996,44 +1053,63 @@ pub(crate) fn convert_validation_error(
         VE::ProposalProcedureNetworkIdMismatch {
             expected,
             mismatched,
-        } => TxValidationError::ScriptFailed {
-            reason: format!(
-                "ProposalProcedureNetworkIdMismatch: expected={expected}, mismatched={mismatched:?}"
-            ),
+        } => match mismatched.first() {
+            // Upstream carries ONE offending account per failure
+            // (`ProposalProcedureNetworkIdMismatch AccountAddress Network`);
+            // dugite aggregates, so the first is reported and the rest are
+            // visible in the server-side log.
+            Some((account, _)) => TxValidationError::ProposalProcedureNetworkIdMismatch {
+                account: account.clone(),
+                network: expected,
+            },
+            None => TxValidationError::ScriptFailed {
+                reason: "ProposalProcedureNetworkIdMismatch".to_string(),
+            },
         },
         VE::TreasuryWithdrawalsNetworkIdMismatch {
             expected,
             mismatched,
-        } => TxValidationError::ScriptFailed {
-            reason: format!(
-                "TreasuryWithdrawalsNetworkIdMismatch: expected={expected}, mismatched={mismatched:?}"
-            ),
+        } => TxValidationError::TreasuryWithdrawalsNetworkIdMismatch {
+            accounts: mismatched.into_iter().map(|(a, _)| a).collect(),
+            network: expected,
         },
         VE::ZeroTreasuryWithdrawals {
             offending_proposals,
         } => TxValidationError::ScriptFailed {
             reason: format!("ZeroTreasuryWithdrawals: {offending_proposals:?}"),
         },
-        VE::ConflictingCommitteeUpdate { conflicts } => TxValidationError::ScriptFailed {
-            reason: format!("ConflictingCommitteeUpdate: {conflicts:?}"),
-        },
-        VE::ExpirationEpochTooSmall { invalid_members } => TxValidationError::ScriptFailed {
-            reason: format!("ExpirationEpochTooSmall: {invalid_members:?}"),
-        },
-        VE::ExtraRedeemer { tag, index } => TxValidationError::ScriptFailed {
-            reason: format!(
-                "Extra redeemer with no matching script purpose: tag={tag}, index={index}"
-            ),
+        VE::ConflictingCommitteeUpdate { conflicts } => {
+            TxValidationError::ConflictingCommitteeUpdate {
+                credentials: conflicts,
+            }
+        }
+        VE::ExpirationEpochTooSmall { invalid_members } => {
+            TxValidationError::ExpirationEpochTooSmall {
+                members: invalid_members,
+            }
+        }
+        VE::ExtraRedeemer { tag, index } => match redeemer_tag_to_wire(&tag) {
+            Some(t) => TxValidationError::ExtraRedeemersUTXOW {
+                purposes: vec![(t, index)],
+            },
+            None => TxValidationError::ScriptFailed {
+                reason: format!("ExtraRedeemer: unknown purpose {tag}"),
+            },
         },
         VE::ScriptLockedCollateral { inputs } => TxValidationError::ScriptFailed {
             reason: format!("Collateral input(s) at script-locked addresses: {inputs:?}"),
         },
-        VE::ExtraneousScriptWitness { hashes } => TxValidationError::ScriptFailed {
-            reason: format!("Extraneous script witness(es) not needed by transaction: {hashes:?}"),
-        },
-        VE::PoolMedataHashTooBig { pool, hash_size } => TxValidationError::ScriptFailed {
-            reason: format!("PoolMedataHashTooBig: pool={pool}, hash_size={hash_size}"),
-        },
+        VE::ExtraneousScriptWitness { hashes } => {
+            TxValidationError::ExtraneousScriptWitnessesUTXOW {
+                script_hashes: hashes,
+            }
+        }
+        VE::PoolMedataHashTooBig { pool, hash_size } => {
+            TxValidationError::PoolMedataHashTooBigPOOL {
+                pool_id: pool,
+                size: hash_size as u64,
+            }
+        }
         VE::OutputBootAddrAttrsTooBig { oversized_outputs } => TxValidationError::ScriptFailed {
             reason: format!("OutputBootAddrAttrsTooBig: {oversized_outputs:?}"),
         },
@@ -1122,18 +1198,14 @@ pub(crate) fn convert_validation_error(
         VE::InvalidRewardAccount(msg) => TxValidationError::ScriptFailed {
             reason: format!("InvalidRewardAccount: {msg}"),
         },
-        VE::DelegateeDRepNotRegistered { drep_id } => TxValidationError::ScriptFailed {
-            reason: format!(
-                "Vote delegation rejected: target DRep {drep_id} is not registered \
-                 (DelegateeDRepNotRegisteredDELEG)"
-            ),
-        },
+        VE::DelegateeDRepNotRegistered { drep_id } => {
+            TxValidationError::DelegateeDRepNotRegisteredDELEG {
+                credential: drep_id.clone(),
+            }
+        }
         VE::StakeKeyNotRegisteredForDelegation { credential_hash } => {
-            TxValidationError::ScriptFailed {
-                reason: format!(
-                    "Delegation rejected: stake credential {credential_hash} is not registered \
-                     (StakeKeyNotRegisteredDELEG)"
-                ),
+            TxValidationError::StakeKeyNotRegisteredDELEG {
+                credential: credential_hash.clone(),
             }
         }
     }
@@ -1413,38 +1485,416 @@ mod tests {
         );
     }
 
+    /// #979: the predicates that remain generic do so DELIBERATELY, because
+    /// Conway has no counterpart for them — not because nobody got round to
+    /// them. Each case below names why.
     #[test]
-    fn convert_validation_error_collapses_conway_predicates_to_script_failed() {
+    fn conway_predicates_without_a_haskell_counterpart_stay_generic() {
         use dugite_ledger::validation::ValidationError as VE;
 
-        // Many Conway-only predicates have no dedicated network-side variant
-        // and intentionally fold into `ScriptFailed { reason }` so cardano-cli
-        // shows a stable rejection class.  Verify a few representatives so
-        // refactoring the convert table doesn't quietly drop these branches.
+        let cases: Vec<(VE, &str)> = vec![
+            (
+                // `ZeroWithdrawal` has no constructor anywhere in the Conway
+                // failure tree. dugite raises it as a defensive check.
+                VE::ZeroWithdrawal {
+                    account: "stake_test1abc".to_string(),
+                },
+                "no Conway constructor",
+            ),
+            (
+                // MIR certificates were REMOVED in Conway, so every MIR
+                // failure is structurally unreachable for a Conway tx. The
+                // Shelley constructors still exist upstream but cannot be
+                // produced by the Conway LEDGER rule.
+                VE::MIRNegativesNotCurrentlyAllowed,
+                "MIR certs do not exist in Conway",
+            ),
+            (
+                VE::MIRTransferNotCurrentlyAllowed,
+                "MIR certs do not exist in Conway",
+            ),
+            (
+                // The PPUP rule was removed in Conway (replaced by governance
+                // actions), so its failures are likewise unreachable.
+                VE::PVCannotFollowPPUP { bad_pv: (12, 0) },
+                "PPUP rule removed in Conway",
+            ),
+            (
+                // dugite-specific era gating with no upstream analogue: Haskell
+                // enforces era shape at the DECODER, before any rule runs.
+                VE::GovernancePreConway { current_version: 8 },
+                "dugite-specific era gate",
+            ),
+        ];
+        for (v, why) in cases {
+            let mapped = convert_validation_error(v);
+            assert!(
+                matches!(mapped, TxValidationError::ScriptFailed { .. }),
+                "expected a deliberate generic failure ({why}), got {mapped:?}"
+            );
+        }
+    }
+
+    /// #979 acceptance criterion 3: the remaining generic failures are a
+    /// **closed, justified set**.
+    ///
+    /// This scans the mapping table itself and requires every arm that still
+    /// produces `ScriptFailed` to appear below with a reason. Adding a new
+    /// generic arm fails this test until it is justified, and typing one
+    /// requires removing it from the list — so the set cannot drift in either
+    /// direction.
+    ///
+    /// The reasons fall into three kinds, and only the third is outstanding
+    /// work:
+    ///
+    /// * **Removed in Conway** — the rule that raised the failure no longer
+    ///   exists, so the failure is structurally unreachable for a Conway
+    ///   transaction. MIR certificates and the PPUP rule are both gone.
+    /// * **dugite-specific** — a defensive check with no upstream analogue;
+    ///   Haskell rejects the same transaction earlier, usually at the decoder.
+    /// * **Payload insufficient** — a counterpart EXISTS, but dugite's error
+    ///   does not carry what the wire needs (a whole `GovAction`, a `TxOut`,
+    ///   a `UTxO` map, a script hash). Emitting a typed frame with an empty or
+    ///   invented payload would reach cardano-cli as `DeserialiseFailure`,
+    ///   which is strictly worse than the generic error. These need the ledger
+    ///   error enriched first, exactly as #979 did for the four that were.
+    #[test]
+    fn remaining_generic_failures_are_a_closed_justified_set() {
+        // (variant, why it is still generic)
+        const JUSTIFIED: &[(&str, &str)] = &[
+            // ── Removed in Conway: structurally unreachable ──
+            (
+                "MIRCertificateTooLateInEpoch",
+                "MIR certs removed in Conway",
+            ),
+            ("MIRInsufficientGenesisSigs", "MIR certs removed in Conway"),
+            ("MIRNegativeTransfer", "MIR certs removed in Conway"),
+            (
+                "MIRNegativesNotCurrentlyAllowed",
+                "MIR certs removed in Conway",
+            ),
+            ("MIRProducesNegativeUpdate", "MIR certs removed in Conway"),
+            (
+                "MIRTransferNotCurrentlyAllowed",
+                "MIR certs removed in Conway",
+            ),
+            (
+                "InsufficientForInstantaneousRewards",
+                "MIR certs removed in Conway",
+            ),
+            (
+                "InsufficientForTransferDELEG",
+                "MIR certs removed in Conway",
+            ),
+            ("NonGenesisUpdatePPUP", "PPUP rule removed in Conway"),
+            ("PPUpdateWrongEpoch", "PPUP rule removed in Conway"),
+            ("PVCannotFollowPPUP", "PPUP rule removed in Conway"),
+            // ── dugite-specific: no upstream analogue ──
+            (
+                "EraGatingViolation",
+                "dugite era gate; Haskell rejects at the decoder",
+            ),
+            (
+                "GovernancePreConway",
+                "dugite era gate; Haskell rejects at the decoder",
+            ),
+            (
+                "InvalidRewardAccount",
+                "dugite parse guard; no Conway constructor",
+            ),
+            ("ZeroWithdrawal", "no Conway constructor"),
+            ("ScriptFailed", "the generic failure itself"),
+            // ── Payload insufficient: counterpart exists, data does not ──
+            (
+                "MalformedProposal",
+                "GOV 1 needs the whole GovAction; dugite carries a reason string",
+            ),
+            (
+                "ZeroTreasuryWithdrawals",
+                "GOV 15 needs the whole GovAction",
+            ),
+            ("MissingDatumWitness", "UTXOW 11 needs BOTH datum-hash sets"),
+            ("ExtraDatumWitness", "UTXOW 12 needs BOTH datum-hash sets"),
+            (
+                "MissingRedeemer",
+                "UTXOW 10 needs the ScriptHash beside the purpose",
+            ),
+            (
+                "OutputBootAddrAttrsTooBig",
+                "UTXO 10 needs the TxOuts; dugite carries indices",
+            ),
+            (
+                "ScriptLockedCollateral",
+                "UTXO 13 needs a UTxO map; dugite carries input refs",
+            ),
+            (
+                "Phase2CollectError",
+                "UTXOS 1 needs the structured CollectError list",
+            ),
+            (
+                "Phase2EvalPanic",
+                "no upstream constructor for an evaluator panic",
+            ),
+            // ── Typed on the happy path; generic only when unencodable ──
+            (
+                "ExtraRedeemer",
+                "typed unless the purpose name is unrecognised",
+            ),
+            (
+                "ProposalProcedureNetworkIdMismatch",
+                "typed unless the offender list is empty",
+            ),
+        ];
+
+        let src = include_str!("serve.rs");
+        let start = src
+            .find("pub(crate) fn convert_validation_error(")
+            .expect("mapping function present");
+        // Bound the scan to the mapping function.
+        let body = &src[start..];
+        let end = body.find("\n/// ").unwrap_or(body.len());
+        let body = &body[..end];
+
+        let mut found: Vec<&str> = Vec::new();
+        let arms: Vec<(usize, &str)> = body
+            .match_indices("\n        VE::")
+            .map(|(i, _)| {
+                let rest = &body[i + "\n        VE::".len()..];
+                let name_end = rest
+                    .find(|c: char| !c.is_alphanumeric() && c != '_')
+                    .unwrap_or(rest.len());
+                (i, &rest[..name_end])
+            })
+            .collect();
+        for (k, (pos, name)) in arms.iter().enumerate() {
+            let stop = arms.get(k + 1).map(|(p, _)| *p).unwrap_or(body.len());
+            if body[*pos..stop].contains("TxValidationError::ScriptFailed") {
+                found.push(name);
+            }
+        }
+        found.sort_unstable();
+        found.dedup();
+
+        let justified: std::collections::BTreeSet<&str> =
+            JUSTIFIED.iter().map(|(n, _)| *n).collect();
+        let found_set: std::collections::BTreeSet<&str> = found.iter().copied().collect();
+
+        let unjustified: Vec<&&str> = found_set.difference(&justified).collect();
+        assert!(
+            unjustified.is_empty(),
+            "these still degrade to ScriptFailed with no recorded reason: {unjustified:?}\n\
+             Either give them a typed arm, or add them to JUSTIFIED with why."
+        );
+
+        let stale: Vec<&&str> = justified.difference(&found_set).collect();
+        assert!(
+            stale.is_empty(),
+            "these are listed as deliberately generic but are no longer generic: {stale:?}\n\
+             Remove them from JUSTIFIED — a stale entry hides the next regression."
+        );
+    }
+
+    /// #979 acceptance criterion 4 — the PV inversion.
+    ///
+    /// `hardforkConwayDELEGIncorrectDepositsAndRefunds` is `pvMajor > 10`, so
+    /// the same ledger error must produce DIFFERENT wire failures either side
+    /// of PV 11. Getting this backwards is #978 exactly: the reachable case
+    /// degrades while the implemented arm is dead code.
+    #[test]
+    fn deleg_deposit_and_refund_are_pv_gated() {
+        use dugite_ledger::validation::ValidationError as VE;
+
+        for pv in [9u64, 10] {
+            assert!(
+                matches!(
+                    convert_validation_error_at_pv(
+                        VE::StakeRegistrationDepositMismatch {
+                            declared: 1,
+                            expected: 2
+                        },
+                        pv
+                    ),
+                    TxValidationError::IncorrectDepositDELEG { supplied: 1 }
+                ),
+                "PV{pv}: deposit mismatch must use the pre-PV11 constructor"
+            );
+            assert!(
+                matches!(
+                    convert_validation_error_at_pv(
+                        VE::StakeDeregistrationRefundMismatch {
+                            declared: 3,
+                            expected: 4
+                        },
+                        pv
+                    ),
+                    // Pre-PV11 the REFUND is reported through the same
+                    // `IncorrectDepositDELEG` constructor — there is no
+                    // separate refund tag before the split.
+                    TxValidationError::IncorrectDepositDELEG { supplied: 3 }
+                ),
+                "PV{pv}: refund mismatch must also use IncorrectDepositDELEG"
+            );
+        }
+
+        for pv in [11u64, 12] {
+            assert!(matches!(
+                convert_validation_error_at_pv(
+                    VE::StakeRegistrationDepositMismatch {
+                        declared: 1,
+                        expected: 2
+                    },
+                    pv
+                ),
+                TxValidationError::DepositIncorrectDELEG {
+                    supplied: 1,
+                    expected: 2
+                }
+            ));
+            assert!(matches!(
+                convert_validation_error_at_pv(
+                    VE::StakeDeregistrationRefundMismatch {
+                        declared: 3,
+                        expected: 4
+                    },
+                    pv
+                ),
+                TxValidationError::RefundIncorrectDELEG {
+                    supplied: 3,
+                    expected: 4
+                }
+            ));
+        }
+    }
+
+    /// #979: the counterpart-bearing predicates must NOT be generic any more.
+    ///
+    /// This is the direction that regressed for years — an arm quietly falling
+    /// through to `ScriptFailed` reaches cardano-cli as
+    /// `ConwayMempoolFailure "transaction validation failed"`, which the
+    /// bidirectional parity oracle scores CLASSDIFF the moment a test
+    /// exercises it.
+    #[test]
+    fn predicates_with_a_haskell_counterpart_are_typed() {
+        use dugite_ledger::validation::ValidationError as VE;
+
         let cases: Vec<VE> = vec![
-            VE::ZeroWithdrawal {
-                account: "stake_test1abc".to_string(),
+            VE::StakeKeyAlreadyRegistered {
+                credential_hash: "00".repeat(32),
+            },
+            VE::StakeKeyNotRegisteredForDelegation {
+                credential_hash: "00".repeat(32),
+            },
+            VE::DelegateeDRepNotRegistered {
+                drep_id: "00".repeat(32),
+            },
+            VE::DelegateePoolNotRegistered {
+                pool_id: "11".repeat(28),
+            },
+            VE::StakeRegistrationDepositMismatch {
+                declared: 1,
+                expected: 2,
+            },
+            VE::StakeDeregistrationRefundMismatch {
+                declared: 1,
+                expected: 2,
+            },
+            VE::StakeKeyHasNonZeroBalance {
+                credential_hash: "00".repeat(32),
+                balance: 7,
+            },
+            VE::DRepAlreadyRegistered {
+                credential_hash: "00".repeat(32),
             },
             VE::DRepIncorrectDeposit {
                 declared: 1,
                 expected: 500_000_000,
             },
-            // NOTE: ProposalDepositIncorrect deliberately does NOT belong here
-            // any more — it now maps to its own variant so the encoder can emit
-            // ConwayGovPredFailure tag 4 with both amounts. It moved to
-            // convert_validation_error_maps_gov_predicates_to_dedicated_variants
-            // below. Collapsing it meant cardano-cli only ever saw
-            // ConwayMempoolFailure "transaction validation failed".
+            VE::DRepIncorrectRefund {
+                credential_hash: "00".repeat(32),
+                declared: 1,
+                expected: 2,
+            },
+            VE::CommitteeHasPreviouslyResigned {
+                cold_credential_hash: "00".repeat(32),
+            },
+            VE::UnelectedCommitteeMember {
+                cold_credential_hash: "00".repeat(32),
+            },
+            VE::StakePoolCostTooLow {
+                actual: 1,
+                minimum: 2,
+            },
+            VE::PoolMedataHashTooBig {
+                pool: "11".repeat(28),
+                hash_size: 64,
+            },
+            VE::VrfKeyHashAlreadyRegistered {
+                vrf_keyhash: "22".repeat(32),
+                existing_pool_id: "11".repeat(28),
+            },
+            VE::PoolRetirementTooLate {
+                retirement_epoch: 99,
+                current_epoch: 5,
+                e_max: 5,
+                max_epoch: 10,
+            },
+            VE::PoolRetirementTooEarly {
+                retirement_epoch: 1,
+                current_epoch: 5,
+            },
+            VE::InvalidMetadata { labels: vec![7] },
+            VE::ExtraneousScriptWitness {
+                hashes: vec!["33".repeat(28)],
+            },
+            VE::MalformedScriptWitnesses {
+                hashes: vec!["33".repeat(28)],
+            },
+            VE::MalformedReferenceScripts {
+                hashes: vec!["33".repeat(28)],
+            },
             VE::ExtraRedeemer {
                 tag: "Spend".to_string(),
                 index: 0,
             },
+            VE::UnspendableUTxONoDatumHash {
+                input: format!("{}#0", "44".repeat(32)),
+                language: "PlutusV2".to_string(),
+            },
+            VE::ConflictingCommitteeUpdate {
+                conflicts: vec!["00".repeat(32)],
+            },
+            VE::ExpirationEpochTooSmall {
+                invalid_members: vec![("00".repeat(32), 5)],
+            },
+            VE::TreasuryWithdrawalReturnAccountsDoNotExist {
+                bad_addrs: vec![format!("e0{}", "55".repeat(28))],
+            },
+            VE::TreasuryWithdrawalsNetworkIdMismatch {
+                expected: 0,
+                mismatched: vec![(format!("e0{}", "55".repeat(28)), 1)],
+            },
+            VE::ProposalProcedureNetworkIdMismatch {
+                expected: 0,
+                mismatched: vec![(format!("e0{}", "55".repeat(28)), 1)],
+            },
+            VE::ConstitutionPolicyMismatch {
+                expected: "66".repeat(28),
+                actual: String::new(),
+            },
+            VE::WdrlNotDelegatedToDRep {
+                credential_hash: "77".repeat(28),
+            },
+            VE::TreasuryValueMismatch {
+                declared: 1,
+                actual: 2,
+            },
         ];
         for v in cases {
+            let label = format!("{v:?}");
             let mapped = convert_validation_error(v);
             assert!(
-                matches!(mapped, TxValidationError::ScriptFailed { .. }),
-                "Conway predicate did not collapse to ScriptFailed: {mapped:?}"
+                !matches!(mapped, TxValidationError::ScriptFailed { .. }),
+                "still degrading to ScriptFailed: {label}"
             );
         }
     }
