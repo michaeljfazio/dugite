@@ -1,5 +1,6 @@
 use super::{
     credential_to_hash, GovRelation, GovernanceState, LedgerState, PGraph, PRoot, ProposalState,
+    PulsedRatifyState,
 };
 use super::{CertSubState, EpochSubState, GovSubState};
 use crate::ledger_seq::{GovernanceChange, LedgerDelta};
@@ -1638,6 +1639,68 @@ pub(crate) fn prune_committee_state(gov: &mut GovSubState) {
 /// post-transition state — after ratification/expiry have pruned proposals,
 /// enacted roots have been updated, DRep activity has been updated, and
 /// committee members have been expired.
+/// Compute the frozen pulser result for the epoch now starting (#988).
+///
+/// Haskell's `setFreshDRepPulsingState` creates the pulser at the boundary and
+/// the pulser's inputs are all frozen there; every reader forces it to
+/// completion, so its answer is CONSTANT for the whole epoch. Computing it once
+/// here reproduces that exactly — and is strictly closer to upstream than
+/// deriving it lazily, which would re-read state that has moved since the
+/// boundary.
+///
+/// It is computed by running the REAL `ratify_proposals_impl` against a CLONE
+/// of the sub-states and reading off the decisions. That is deliberate: a
+/// separate "dry-run" implementation would be a second copy of ~300 lines of
+/// threshold logic, and a second copy is how #985's overlay condition drifted
+/// (`the condition existed in TWO hand-written copies, only one current`).
+/// One implementation, no drift.
+///
+/// The clone is affordable because it happens once per epoch boundary and the
+/// large maps are `imbl` persistent structures or `Arc`s, so most of it is
+/// refcount bumps rather than deep copies.
+fn compute_pulsed_ratify_state(
+    epoch: EpochNo,
+    epochs: &EpochSubState,
+    certs: &CertSubState,
+    gov: &GovSubState,
+) -> PulsedRatifyState {
+    let mut e = epochs.clone();
+    let mut c = certs.clone();
+    let mut g = gov.clone();
+
+    // `epoch` is the boundary we are AT; ratification at the next boundary runs
+    // with that boundary's epoch, matching how `process_epoch_transition` calls
+    // it. The snapshot itself carries `snapshot_epoch`, so the skip logic
+    // inside is unaffected.
+    ratify_proposals_impl(epoch, &mut e, &mut c, &mut g);
+
+    let enacted: Vec<GovActionId> = g
+        .governance
+        .last_ratified
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect();
+
+    // Haskell `hasChangesToPParams`: only ParameterChange and
+    // HardForkInitiation cause `futurePParams` to become `Just`.
+    let has_pparams_changes = g.governance.last_ratified.iter().any(|(_, prop)| {
+        matches!(
+            prop.procedure.gov_action,
+            GovAction::ParameterChange { .. } | GovAction::HardForkInitiation { .. }
+        )
+    });
+
+    PulsedRatifyState {
+        computed_at_epoch: epoch,
+        enacted,
+        expired: g.governance.last_expired.clone(),
+        delayed: g.governance.last_ratify_delayed,
+        // `ensCurPParams` AFTER the enactments — the clone carries them.
+        cur_pparams: e.protocol_params.clone(),
+        has_pparams_changes,
+    }
+}
+
 pub(crate) fn capture_governance_snapshots(
     epoch: EpochNo,
     epochs: &EpochSubState,
@@ -1647,6 +1710,20 @@ pub(crate) fn capture_governance_snapshots(
     if epochs.protocol_params.protocol_version_major >= 9 {
         capture_drep_distribution_snapshot_impl(certs, gov);
         capture_ratification_snapshot_impl(epoch, epochs.treasury.0, gov);
+        // Order matters: the pulser is computed FROM the snapshot just frozen,
+        // so it must run after both captures. This is `setFreshDRepPulsingState`
+        // — the result describes the ratification that will be applied at the
+        // FOLLOWING boundary (#988).
+        let pulsed = compute_pulsed_ratify_state(epoch, epochs, certs, gov);
+        debug!(
+            epoch = epoch.0,
+            enacted = pulsed.enacted.len(),
+            expired = pulsed.expired.len(),
+            delayed = pulsed.delayed,
+            has_pparams_changes = pulsed.has_pparams_changes,
+            "DRep pulser: frozen ratification result for the epoch now starting"
+        );
+        Arc::make_mut(&mut gov.governance).pulsed_ratify_state = Some(pulsed);
     }
 }
 
@@ -10036,6 +10113,83 @@ mod tests {
                 .copied(),
             Some(1_200 + 200_000),
             "both proposal deposits must be summed into the frozen snapshot (#949)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pulser_tests {
+    use super::*;
+    use crate::state::test_fixtures::populated_ledger_state;
+
+    /// #988: the boundary must freeze a pulser result, stamped with the
+    /// boundary it was computed at.
+    ///
+    /// It describes the ratification that will be applied at the NEXT
+    /// boundary, which is what `queryRatifyState = snd . finishedPulserState`
+    /// returns mid-epoch. Answering from `last_ratified` instead is one
+    /// boundary stale — the same shape and direction as #922 / #950 / #966.
+    #[test]
+    fn boundary_freezes_a_pulser_result() {
+        let mut st = populated_ledger_state();
+        Arc::make_mut(&mut st.gov.governance).pulsed_ratify_state = None;
+        capture_governance_snapshots(st.epoch, &st.epochs, &st.certs, &mut st.gov);
+
+        let pulsed = st
+            .gov
+            .governance
+            .pulsed_ratify_state
+            .as_ref()
+            .expect("PV>=9 boundary must freeze a pulser result");
+        assert_eq!(
+            pulsed.computed_at_epoch, st.epoch,
+            "stamped with the boundary it was frozen at"
+        );
+    }
+
+    /// Computing the pulser must NOT mutate live state. It runs the REAL
+    /// ratification on a clone precisely so the decisions can be read off
+    /// without applying them — a second, non-mutating copy of the threshold
+    /// logic would be the N-copies trap that #985 recorded.
+    #[test]
+    fn computing_the_pulser_does_not_mutate_the_ledger() {
+        let st = populated_ledger_state();
+        let before_treasury = st.epochs.treasury;
+        let before_min_fee = st.epochs.protocol_params.min_fee_a;
+        let before_proposals = st.gov.governance.proposals.len();
+        let before_ratified = st.gov.governance.last_ratified.len();
+
+        let _ = compute_pulsed_ratify_state(st.epoch, &st.epochs, &st.certs, &st.gov);
+
+        assert_eq!(st.epochs.treasury, before_treasury, "treasury moved");
+        assert_eq!(
+            st.epochs.protocol_params.min_fee_a, before_min_fee,
+            "protocol params moved"
+        );
+        assert_eq!(
+            st.gov.governance.proposals.len(),
+            before_proposals,
+            "proposal set changed"
+        );
+        assert_eq!(
+            st.gov.governance.last_ratified.len(),
+            before_ratified,
+            "last_ratified changed — the clone leaked into live state"
+        );
+    }
+
+    /// `has_pparams_changes` is Haskell `hasChangesToPParams`: ONLY
+    /// `ParameterChange` and `HardForkInitiation` set it. #977 gates
+    /// `futurePParams` on exactly this term, so defaulting it true would make
+    /// the field `Just` where upstream leaves it `Nothing`.
+    #[test]
+    fn has_pparams_changes_is_false_when_nothing_enacts() {
+        let st = populated_ledger_state();
+        let pulsed = compute_pulsed_ratify_state(st.epoch, &st.epochs, &st.certs, &st.gov);
+        assert!(pulsed.enacted.is_empty(), "fixture enacts nothing");
+        assert!(
+            !pulsed.has_pparams_changes,
+            "no enactment must not report a pparams change"
         );
     }
 }

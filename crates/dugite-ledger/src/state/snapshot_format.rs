@@ -605,31 +605,94 @@ mod tests {
             governance.ratification_snapshot, "governance.ratification_snapshot";
         );
 
-        // Nested governance collections — `GovernanceState` is one field of the
-        // snapshot but many structures under the hash.
-        assert!(!governance.dreps.is_empty(), "governance.dreps");
-        assert!(
-            !governance.vote_delegations.is_empty(),
-            "governance.vote_delegations"
+        // `GovernanceState` is ONE field of the snapshot but many structures
+        // under the hash, so it gets its own exhaustive destructure — again
+        // with no `..`.
+        //
+        // #988 found this gap the hard way: it added `pulsed_ratify_state` to
+        // `GovernanceState`, and the top-level destructure above did not fail
+        // to compile, because `governance` is a single field there. A guard
+        // that is exhaustive at one level only is exhaustive nowhere in
+        // particular.
+        let crate::state::GovernanceState {
+            dreps,
+            vote_delegations,
+            committee_hot_keys,
+            committee_expiration,
+            committee_resigned,
+            script_committee_credentials,
+            script_committee_hot_credentials,
+            proposals: gov_proposals,
+            votes_by_action,
+            proposal_roots,
+            proposal_graph,
+            drep_registration_count,
+            proposal_count,
+            constitution,
+            no_confidence,
+            committee_threshold,
+            enacted_pparam_update,
+            enacted_hard_fork,
+            enacted_committee,
+            enacted_constitution,
+            last_ratified,
+            last_expired,
+            last_ratify_delayed,
+            num_dormant_epochs,
+            drep_distribution_snapshot,
+            drep_snapshot_no_confidence,
+            drep_snapshot_abstain,
+            ratification_snapshot: _,
+            pulsed_ratify_state,
+        } = governance;
+        let _ = (
+            script_committee_credentials,
+            script_committee_hot_credentials,
+            gov_proposals,
+            proposal_roots,
+            proposal_graph,
+            last_ratified,
+            last_expired,
         );
         assert!(
-            !governance.committee_hot_keys.is_empty(),
+            pulsed_ratify_state.is_some(),
+            "governance.pulsed_ratify_state is None — the frozen pulser's layout \
+             is invisible to the hash (#988)"
+        );
+        assert!(drep_registration_count > &0, "drep_registration_count");
+        assert!(proposal_count > &0, "proposal_count");
+        assert!(*no_confidence, "no_confidence");
+        assert!(*last_ratify_delayed, "last_ratify_delayed");
+        assert!(num_dormant_epochs > &0, "num_dormant_epochs");
+        assert!(
+            drep_snapshot_no_confidence > &0,
+            "drep_snapshot_no_confidence"
+        );
+        assert!(drep_snapshot_abstain > &0, "drep_snapshot_abstain");
+        assert!(constitution.is_some(), "constitution");
+        assert!(committee_threshold.is_some(), "committee_threshold");
+        assert!(enacted_pparam_update.is_some(), "enacted_pparam_update");
+        assert!(enacted_hard_fork.is_some(), "enacted_hard_fork");
+        assert!(enacted_committee.is_some(), "enacted_committee");
+        assert!(enacted_constitution.is_some(), "enacted_constitution");
+
+        assert!(!dreps.is_empty(), "governance.dreps");
+        assert!(!vote_delegations.is_empty(), "governance.vote_delegations");
+        assert!(
+            !committee_hot_keys.is_empty(),
             "governance.committee_hot_keys"
         );
         assert!(
-            !governance.committee_expiration.is_empty(),
+            !committee_expiration.is_empty(),
             "governance.committee_expiration"
         );
         assert!(
-            !governance.committee_resigned.is_empty(),
+            !committee_resigned.is_empty(),
             "governance.committee_resigned"
         );
+        assert!(!votes_by_action.is_empty(), "governance.votes_by_action");
         assert!(
-            !governance.votes_by_action.is_empty(),
-            "governance.votes_by_action"
-        );
-        assert!(
-            !governance.drep_distribution_snapshot.is_empty(),
+            !drep_distribution_snapshot.is_empty(),
             "governance.drep_distribution_snapshot"
         );
 

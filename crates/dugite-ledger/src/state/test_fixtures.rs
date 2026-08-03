@@ -301,6 +301,18 @@ pub fn populated_ledger_state() -> LedgerState {
         m
     });
 
+    // The frozen DRep pulser result (#988). Populated for the same reason as
+    // everything else here: bincode writes nothing for a `None`, so leaving it
+    // unset would hide `PulsedRatifyState`'s layout from the format hash.
+    gov.pulsed_ratify_state = Some(super::PulsedRatifyState {
+        computed_at_epoch: EpochNo(316),
+        enacted: vec![gid(0x60)],
+        expired: vec![gid(0x61)],
+        delayed: true,
+        cur_pparams: ProtocolParameters::mainnet_defaults(),
+        has_pparams_changes: true,
+    });
+
     // Freeze the ratification snapshot LAST, so it captures the populated
     // governance state above rather than an empty one. #966 added `treasury`
     // here and this test could not see it.

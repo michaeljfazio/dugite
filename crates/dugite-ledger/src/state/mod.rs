@@ -466,6 +466,73 @@ pub struct GovernanceState {
     /// `None` at genesis or when loading a snapshot that predates this field —
     /// `ratify_proposals()` falls back to live state in that case.
     pub ratification_snapshot: Option<RatificationSnapshot>,
+    /// The frozen pulser RESULT for the epoch now starting (#988).
+    ///
+    /// Computed at the boundary from `ratification_snapshot`, and describing
+    /// the ratification that will be applied at the FOLLOWING boundary — which
+    /// is exactly what Haskell's `queryRatifyState` returns mid-epoch.
+    /// Distinct from `last_ratified`/`last_expired`/`last_ratify_delayed`,
+    /// which record what already happened.
+    pub pulsed_ratify_state: Option<PulsedRatifyState>,
+}
+
+/// The **completed DRep pulser result** — Haskell `DRComplete (PulsingSnapshot,
+/// RatifyState)` (#988).
+///
+/// # Why this exists
+///
+/// Haskell's `DRepPulsingState` is created fresh at each epoch boundary by
+/// `setFreshDRepPulsingState`, computes incrementally through the epoch, and is
+/// consumed by RATIFY at the NEXT boundary. dugite had the frozen *inputs*
+/// (`RatificationSnapshot`, #903) but never the frozen *result*, which cost two
+/// separate divergences:
+///
+/// * `GetRatifyState` (LSQ tag 32) is `queryRatifyState = snd .
+///   finishedPulserState` upstream — the CURRENT epoch's pulser result, i.e.
+///   what **will** enact at the next boundary. dugite answered with what
+///   **did** enact at the last one: one boundary stale, the same shape and
+///   direction as #922 / #950 / #966.
+/// * `predictFuturePParams` (#977) reads `rsEnacted` and
+///   `ensCurPParams (rsEnactState …)` from the pulser mid-epoch, which is
+///   simply unavailable without it.
+///
+/// # dugite does NOT need incremental pulsing
+///
+/// Both `DRepPulsingState` constructors encode as `DRComplete`, and the
+/// `DRPulsing` arm **forces `finishDRepPulser` before encoding**:
+///
+/// ```haskell
+/// encCBOR (DRComplete x y) = encode (Rec DRComplete !> To x !> To y)
+/// encCBOR x@(DRPulsing (DRepPulser {})) = encode (Rec DRComplete !> To snap !> To ratstate)
+///   where (snap, ratstate) = finishDRepPulser x
+/// ```
+///
+/// Every reader — `queryProposals`, `queryDRepStakeDistr`, `queryRatifyState`,
+/// `predictFuturePParams` — goes through the same forcing, and `Default` is
+/// `DRComplete def def`. A partially-pulsed state is therefore never
+/// observable: the pulsing is a performance device that spreads an
+/// O(accounts) computation across the epoch, carrying no semantics. What must
+/// be modelled is the completed result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PulsedRatifyState {
+    /// The boundary this was computed at — it describes the ratification that
+    /// will be APPLIED at the following boundary.
+    pub computed_at_epoch: EpochNo,
+    /// `rsEnacted` — the actions that will enact, in enactment order.
+    pub enacted: Vec<GovActionId>,
+    /// `rsExpired`.
+    pub expired: Vec<GovActionId>,
+    /// `rsDelayed` — whether a delaying action is among them.
+    pub delayed: bool,
+    /// `ensCurPParams (rsEnactState …)` — the protocol parameters that result
+    /// once `enacted` has been applied. This is the term `predictFuturePParams`
+    /// needs (#977), and the reason the whole ratification is run rather than
+    /// only its accept/reject verdicts.
+    pub cur_pparams: ProtocolParameters,
+    /// Whether any enacted action is a `ParameterChange` or
+    /// `HardForkInitiation` — Haskell `hasChangesToPParams`, the guard that
+    /// decides whether `futurePParams` becomes `Just` or stays `Nothing`.
+    pub has_pparams_changes: bool,
 }
 
 /// Frozen ratification inputs captured at epoch boundary E.
