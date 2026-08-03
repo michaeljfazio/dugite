@@ -479,7 +479,8 @@ impl LedgerState {
     // 33: #988 added `GovernanceState.pulsed_ratify_state` — the frozen DRep
     // pulser result. A positional bincode change inside `GovernanceState`, so
     // existing snapshots cannot supply it and must be rejected.
-    pub(crate) const SNAPSHOT_VERSION: u8 = 33;
+    // 34: #977 added `GovernanceState.future_pparams`.
+    pub(crate) const SNAPSHOT_VERSION: u8 = 34;
 
     /// Save ledger state snapshot to disk using bincode serialization.
     ///

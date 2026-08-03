@@ -474,6 +474,111 @@ pub struct GovernanceState {
     /// Distinct from `last_ratified`/`last_expired`/`last_ratify_delayed`,
     /// which record what already happened.
     pub pulsed_ratify_state: Option<PulsedRatifyState>,
+    /// Haskell `cgsFuturePParams` (#977). See [`FuturePParams`] — this feeds
+    /// the ledger-view FORECAST, not only the `GetGovState` query.
+    pub future_pparams: FuturePParams,
+}
+
+/// Haskell `FuturePParams` — the protocol parameters that will be in force at
+/// the next epoch boundary, insofar as they are yet known (#977).
+///
+/// Not a convenience cache, and not only a query field. Its two readers
+/// upstream are `nextEpochPParams` at the boundary and — the reason this
+/// matters — `Conway.Rules.Tickf`, ouroboros-consensus's ledger-view FORECAST
+/// path used to validate headers AHEAD of the ledger tip:
+///
+/// ```haskell
+/// pure $! nes {nesPd = pd'}
+///   & newEpochStateGovStateL . curPParamsGovStateL  .~ nextEpochPParams govState
+///   & newEpochStateGovStateL . prevPParamsGovStateL .~ (govState ^. curPParamsGovStateL)
+///   & newEpochStateGovStateL . futurePParamsGovStateL .~ NoPParamsUpdate
+/// ```
+///
+/// Praos's `LedgerView` is `{lvPoolDistr, lvMaxHeaderSize, lvMaxBodySize,
+/// lvProtocolVersion}` and the last three come from those `curPParams`, so a
+/// node that does not model this validates next-epoch headers against THIS
+/// epoch's size limits and protocol version — divergent the moment a
+/// `ParameterChange` or `HardForkInitiation` enacts.
+///
+/// # Lifecycle — three writers
+///
+/// * `EPOCH` sets `PotentialPParamsUpdate Nothing` **unconditionally** at every
+///   boundary, whatever enacted.
+/// * `predictFuturePParams` runs on every non-boundary tick and upgrades
+///   `Nothing` to `Just pp` when the pulser's `rsEnacted` contains a
+///   `ParameterChange` or `HardForkInitiation`.
+/// * `solidifyFuturePParams` runs on every block from
+///   `firstSlotNextEpoch - 2 * stabilityWindow` onward, collapsing
+///   `Potential Nothing -> No` and `Potential (Just pp) -> Definite pp`. That
+///   is deliberately early so, per upstream's comment, "HFC has the new
+///   EnactState available 6k/f slots before the end of the epoch".
+///
+/// # Wire format
+///
+/// Verified against real preview epoch-1259 bytes by `dugite-serialization`'s
+/// `decode_future_pparams`:
+///
+/// ```text
+/// NoPParamsUpdate            -> array(1) [0]
+/// DefinitePParamsUpdate pp   -> array(2) [1, pp]
+/// PotentialPParamsUpdate m   -> array(2) [2, <array(0) | array(1) [pp]>]
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub enum FuturePParams {
+    /// Nothing will change at the next boundary.
+    #[default]
+    NoPParamsUpdate,
+    /// A change is GUARANTEED to be adopted. Only reachable after `solidify`,
+    /// i.e. within `2 * stabilityWindow` of the epoch end.
+    DefinitePParamsUpdate(Box<ProtocolParameters>),
+    /// A change may still be adopted; `None` means "nothing proposed so far".
+    /// This is the state for the early part of every epoch.
+    PotentialPParamsUpdate(Option<Box<ProtocolParameters>>),
+}
+
+impl FuturePParams {
+    /// Haskell `solidifyFuturePParams` — collapse a potential update into a
+    /// definite one, or into nothing.
+    ///
+    /// ```haskell
+    /// solidifyFuturePParams = \case
+    ///   PotentialPParamsUpdate Nothing   -> NoPParamsUpdate
+    ///   PotentialPParamsUpdate (Just pp) -> DefinitePParamsUpdate pp
+    ///   fpp                              -> fpp
+    /// ```
+    pub fn solidify(&mut self) {
+        *self = match std::mem::take(self) {
+            FuturePParams::PotentialPParamsUpdate(None) => FuturePParams::NoPParamsUpdate,
+            FuturePParams::PotentialPParamsUpdate(Some(pp)) => {
+                FuturePParams::DefinitePParamsUpdate(pp)
+            }
+            other => other,
+        };
+    }
+
+    /// Haskell `knownFuturePParams` — parameters only when their adoption is
+    /// already guaranteed.
+    pub fn known(&self) -> Option<&ProtocolParameters> {
+        match self {
+            FuturePParams::DefinitePParamsUpdate(pp) => Some(pp),
+            _ => None,
+        }
+    }
+
+    /// Haskell `nextEpochPParams govState` — the parameters that will be in
+    /// force after the next boundary, falling back to the current ones.
+    ///
+    /// This is the term the ledger-view FORECAST reads.
+    pub fn next_epoch_pparams<'a>(
+        &'a self,
+        current: &'a ProtocolParameters,
+    ) -> &'a ProtocolParameters {
+        match self {
+            FuturePParams::DefinitePParamsUpdate(pp) => pp,
+            FuturePParams::PotentialPParamsUpdate(Some(pp)) => pp,
+            _ => current,
+        }
+    }
 }
 
 /// The **completed DRep pulser result** — Haskell `DRComplete (PulsingSnapshot,

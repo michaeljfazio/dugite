@@ -304,6 +304,12 @@ pub fn populated_ledger_state() -> LedgerState {
     // The frozen DRep pulser result (#988). Populated for the same reason as
     // everything else here: bincode writes nothing for a `None`, so leaving it
     // unset would hide `PulsedRatifyState`'s layout from the format hash.
+    // #977. `Definite` rather than `Potential`, so the fixture carries a
+    // PAYLOAD — `PotentialPParamsUpdate(None)` writes no parameters and would
+    // leave `ProtocolParameters`' layout inside this enum unhashed.
+    gov.future_pparams = super::FuturePParams::DefinitePParamsUpdate(Box::new(
+        ProtocolParameters::mainnet_defaults(),
+    ));
     gov.pulsed_ratify_state = Some(super::PulsedRatifyState {
         computed_at_epoch: EpochNo(316),
         enacted: vec![gid(0x60)],
