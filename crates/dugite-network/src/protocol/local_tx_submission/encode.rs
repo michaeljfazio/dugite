@@ -639,6 +639,425 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
             encode_mempool_fallback(enc, &format!("transaction decode failed: {reason}"));
         }
 
+        // ══ #979: typed CERT / DELEG failures ═══════════════════════════
+        //
+        // Ledger 2 -> CERTS 1 -> CERT 1 -> DELEG tag. DELEG tags are 1-BASED.
+        TxValidationError::StakeKeyRegisteredDELEG { credential } => {
+            match parse_typed_credential(credential) {
+                Some((disc, h)) => encode_deleg_failure(enc, 2, |e| encode_credential(e, disc, &h)),
+                None => partial_fallback(enc, err),
+            }
+        }
+        TxValidationError::StakeKeyNotRegisteredDELEG { credential } => {
+            match parse_typed_credential(credential) {
+                Some((disc, h)) => encode_deleg_failure(enc, 3, |e| encode_credential(e, disc, &h)),
+                None => partial_fallback(enc, err),
+            }
+        }
+        TxValidationError::StakeKeyHasNonZeroAccountBalanceDELEG { balance } => {
+            // The payload is the Coin, not the credential.
+            encode_deleg_failure(enc, 4, |e| {
+                e.u64(*balance).expect("infallible");
+            });
+        }
+        TxValidationError::DelegateeDRepNotRegisteredDELEG { credential } => {
+            match parse_typed_credential(credential) {
+                Some((disc, h)) => encode_deleg_failure(enc, 5, |e| encode_credential(e, disc, &h)),
+                None => partial_fallback(enc, err),
+            }
+        }
+        TxValidationError::DelegateeStakePoolNotRegisteredDELEG { pool_id } => {
+            // `KeyHash StakePool` — a bare bstr(28), no Credential wrapper.
+            match parse_hex_28(pool_id) {
+                Some(h) => encode_deleg_failure(enc, 6, |e| {
+                    e.bytes(&h).expect("infallible");
+                }),
+                None => partial_fallback(enc, err),
+            }
+        }
+        // PV<=10: one constructor, one field, no Mismatch at all.
+        TxValidationError::IncorrectDepositDELEG { supplied } => {
+            encode_deleg_failure(enc, 1, |e| {
+                e.u64(*supplied).expect("infallible");
+            });
+        }
+        // `To mm` — the Mismatch is NESTED as array(2)[supplied, expected].
+        TxValidationError::DepositIncorrectDELEG { supplied, expected } => {
+            encode_deleg_failure(enc, 7, |e| {
+                e.array(2).expect("infallible");
+                e.u64(*supplied).expect("infallible");
+                e.u64(*expected).expect("infallible");
+            });
+        }
+        TxValidationError::RefundIncorrectDELEG { supplied, expected } => {
+            encode_deleg_failure(enc, 8, |e| {
+                e.array(2).expect("infallible");
+                e.u64(*supplied).expect("infallible");
+                e.u64(*expected).expect("infallible");
+            });
+        }
+
+        // ══ #979: typed GOVCERT failures (0-based, unlike DELEG) ════════
+        TxValidationError::ConwayDRepAlreadyRegistered { credential } => {
+            match parse_typed_credential(credential) {
+                Some((disc, h)) => {
+                    encode_govcert_failure(enc, 0, |e| encode_credential(e, disc, &h))
+                }
+                None => partial_fallback(enc, err),
+            }
+        }
+        // `ToGroup mm` — the Mismatch is FLATTENED into the constructor's own
+        // fields. Contrast DELEG 7/8 above, which nest the same type.
+        TxValidationError::ConwayDRepIncorrectDeposit { supplied, expected } => {
+            encode_govcert_failure(enc, 2, |e| {
+                e.u64(*supplied).expect("infallible");
+                e.u64(*expected).expect("infallible");
+            });
+        }
+        TxValidationError::ConwayCommitteeHasPreviouslyResigned { credential } => {
+            match parse_typed_credential(credential) {
+                Some((disc, h)) => {
+                    encode_govcert_failure(enc, 3, |e| encode_credential(e, disc, &h))
+                }
+                None => partial_fallback(enc, err),
+            }
+        }
+        TxValidationError::ConwayDRepIncorrectRefund { supplied, expected } => {
+            encode_govcert_failure(enc, 4, |e| {
+                e.u64(*supplied).expect("infallible");
+                e.u64(*expected).expect("infallible");
+            });
+        }
+        TxValidationError::ConwayCommitteeIsUnknown { credential } => {
+            match parse_typed_credential(credential) {
+                Some((disc, h)) => {
+                    encode_govcert_failure(enc, 5, |e| encode_credential(e, disc, &h))
+                }
+                None => partial_fallback(enc, err),
+            }
+        }
+
+        // ══ #979: typed POOL failures (hand-rolled arities) ═════════════
+        TxValidationError::StakePoolCostTooLowPOOL { supplied, expected } => {
+            encode_pool_failure(enc, |e| {
+                e.array(3).expect("infallible");
+                e.u8(3).expect("infallible");
+                e.u64(*supplied).expect("infallible");
+                e.u64(*expected).expect("infallible");
+            });
+        }
+        TxValidationError::WrongNetworkPOOL {
+            expected,
+            supplied,
+            pool_id,
+        } => match parse_hex_28(pool_id) {
+            // NB: expected BEFORE supplied — the reverse of every other
+            // Mismatch on this wire.
+            Some(h) => encode_pool_failure(enc, |e| {
+                e.array(4).expect("infallible");
+                e.u8(4).expect("infallible");
+                e.u8(*expected).expect("infallible");
+                e.u8(*supplied).expect("infallible");
+                e.bytes(&h).expect("infallible");
+            }),
+            None => partial_fallback(enc, err),
+        },
+        TxValidationError::PoolMedataHashTooBigPOOL { pool_id, size } => {
+            match parse_hex_28(pool_id) {
+                Some(h) => encode_pool_failure(enc, |e| {
+                    e.array(3).expect("infallible");
+                    e.u8(5).expect("infallible");
+                    e.bytes(&h).expect("infallible");
+                    e.u64(*size).expect("infallible");
+                }),
+                None => partial_fallback(enc, err),
+            }
+        }
+        TxValidationError::VrfKeyHashAlreadyRegisteredPOOL {
+            pool_id,
+            vrf_key_hash,
+        } => match (parse_hex_28(pool_id), hex::decode(vrf_key_hash)) {
+            // Pool id FIRST, then the VRF hash.
+            (Some(p), Ok(v)) if v.len() == 32 => encode_pool_failure(enc, |e| {
+                e.array(3).expect("infallible");
+                e.u8(6).expect("infallible");
+                e.bytes(&p).expect("infallible");
+                e.bytes(&v).expect("infallible");
+            }),
+            _ => partial_fallback(enc, err),
+        },
+        TxValidationError::StakePoolRetirementWrongEpochPOOL {
+            gt_expected,
+            lt_supplied,
+            lt_expected,
+        } => {
+            // THREE fields, not four: the first Mismatch's `supplied` is
+            // discarded by the encoder (`Mismatch _ gtExpected`).
+            encode_pool_failure(enc, |e| {
+                e.array(4).expect("infallible");
+                e.u8(1).expect("infallible");
+                e.u64(*gt_expected).expect("infallible");
+                e.u64(*lt_supplied).expect("infallible");
+                e.u64(*lt_expected).expect("infallible");
+            });
+        }
+
+        // ══ #979: typed UTXOW failures ══════════════════════════════════
+        TxValidationError::InvalidMetadataUTXOW => {
+            // No payload upstream: `Sum InvalidMetadata 8` with nothing after.
+            encode_utxow_failure(enc, 8, |_| {});
+        }
+        TxValidationError::ExtraneousScriptWitnessesUTXOW { script_hashes } => {
+            encode_script_hash_set_utxow(enc, err, 9, script_hashes);
+        }
+        TxValidationError::UnspendableUTxONoDatumHashUTXOW { inputs } => {
+            let parsed: Vec<([u8; 32], u32)> =
+                inputs.iter().filter_map(|s| parse_tx_input(s)).collect();
+            if parsed.len() != inputs.len() {
+                partial_fallback(enc, err);
+            } else {
+                encode_utxow_failure(enc, 14, |e| {
+                    set_open(e, parsed.len());
+                    for (hash, ix) in &parsed {
+                        e.array(2).expect("infallible");
+                        e.bytes(hash).expect("infallible");
+                        e.u32(*ix).expect("infallible");
+                    }
+                    set_close(e, parsed.len());
+                });
+            }
+        }
+        TxValidationError::ExtraRedeemersUTXOW { purposes } => {
+            // `[PlutusPurpose AsIx]` — a plain list, not a set.
+            encode_utxow_failure(enc, 15, |e| {
+                list_open(e, purposes.len());
+                for (tag, ix) in purposes {
+                    e.array(2).expect("infallible");
+                    e.u8(*tag).expect("infallible");
+                    e.u32(*ix).expect("infallible");
+                }
+                list_close(e, purposes.len());
+            });
+        }
+        TxValidationError::MalformedScriptWitnessesUTXOW { script_hashes } => {
+            encode_script_hash_set_utxow(enc, err, 16, script_hashes);
+        }
+        TxValidationError::MalformedReferenceScriptsUTXOW { script_hashes } => {
+            encode_script_hash_set_utxow(enc, err, 17, script_hashes);
+        }
+
+        // ══ #979: further typed GOV failures ════════════════════════════
+        TxValidationError::ProposalProcedureNetworkIdMismatch { account, network } => {
+            match hex::decode(account) {
+                Ok(bytes) if !bytes.is_empty() => encode_gov_failure(enc, 2, |e| {
+                    e.bytes(&bytes).expect("infallible");
+                    e.u8(*network).expect("infallible");
+                }),
+                _ => partial_fallback(enc, err),
+            }
+        }
+        TxValidationError::TreasuryWithdrawalsNetworkIdMismatch { accounts, network } => {
+            let parsed: Vec<Vec<u8>> = accounts
+                .iter()
+                .filter_map(|a| hex::decode(a).ok())
+                .collect();
+            if parsed.len() != accounts.len() || parsed.is_empty() {
+                partial_fallback(enc, err);
+            } else {
+                encode_gov_failure(enc, 3, |e| {
+                    set_open(e, parsed.len());
+                    for a in &parsed {
+                        e.bytes(a).expect("infallible");
+                    }
+                    set_close(e, parsed.len());
+                    e.u8(*network).expect("infallible");
+                });
+            }
+        }
+        TxValidationError::ConflictingCommitteeUpdate { credentials } => {
+            let parsed: Vec<(u8, [u8; 28])> = credentials
+                .iter()
+                .filter_map(|c| parse_typed_credential(c))
+                .collect();
+            if parsed.len() != credentials.len() || parsed.is_empty() {
+                partial_fallback(enc, err);
+            } else {
+                encode_gov_failure(enc, 6, |e| {
+                    set_open(e, parsed.len());
+                    for (disc, h) in &parsed {
+                        encode_credential(e, *disc, h);
+                    }
+                    set_close(e, parsed.len());
+                });
+            }
+        }
+        TxValidationError::ExpirationEpochTooSmall { members } => {
+            let parsed: Vec<((u8, [u8; 28]), u64)> = members
+                .iter()
+                .filter_map(|(c, ep)| parse_typed_credential(c).map(|p| (p, *ep)))
+                .collect();
+            if parsed.len() != members.len() || parsed.is_empty() {
+                partial_fallback(enc, err);
+            } else {
+                // `NonEmptyMap` derives its EncCBOR newtype-wise from `Map`:
+                // encodeMap, same 23-element threshold, no set tag.
+                encode_gov_failure(enc, 7, |e| {
+                    map_open(e, parsed.len());
+                    for ((disc, h), ep) in &parsed {
+                        encode_credential(e, *disc, h);
+                        e.u64(*ep).expect("infallible");
+                    }
+                    map_close(e, parsed.len());
+                });
+            }
+        }
+        TxValidationError::DisallowedVotesDuringBootstrap { violations } => {
+            let parsed: Vec<(u8, [u8; 28], [u8; 32], u32)> = violations
+                .iter()
+                .filter_map(|(d, c, a)| {
+                    let cred = parse_hex_28(c)?;
+                    let (h, i) = parse_tx_input(a)?;
+                    Some((*d, cred, h, i))
+                })
+                .collect();
+            if parsed.len() != violations.len() || parsed.is_empty() {
+                partial_fallback(enc, err);
+            } else {
+                encode_gov_failure(enc, 13, |e| {
+                    list_open(e, parsed.len());
+                    for (disc, cred, hash, ix) in &parsed {
+                        e.array(2).expect("infallible");
+                        e.array(2).expect("infallible");
+                        e.u8(*disc).expect("infallible");
+                        e.bytes(cred).expect("infallible");
+                        e.array(2).expect("infallible");
+                        e.bytes(hash).expect("infallible");
+                        e.u32(*ix).expect("infallible");
+                    }
+                    list_close(e, parsed.len());
+                });
+            }
+        }
+        TxValidationError::TreasuryWithdrawalReturnAccountsDoNotExist { accounts } => {
+            let parsed: Vec<Vec<u8>> = accounts
+                .iter()
+                .filter_map(|a| hex::decode(a).ok())
+                .collect();
+            if parsed.len() != accounts.len() || parsed.is_empty() {
+                partial_fallback(enc, err);
+            } else {
+                // `NonEmpty AccountAddress` — a plain LIST, not a set.
+                encode_gov_failure(enc, 17, |e| {
+                    list_open(e, parsed.len());
+                    for a in &parsed {
+                        e.bytes(a).expect("infallible");
+                    }
+                    list_close(e, parsed.len());
+                });
+            }
+        }
+        TxValidationError::InvalidGuardrailsScriptHash { got, expected } => {
+            // Two `StrictMaybe ScriptHash`. `encodeStrictMaybe` writes
+            // `array(0)` for SNothing and `array(1)[x]` for SJust.
+            let g = got.as_ref().map(|h| parse_hex_28(h));
+            let x = expected.as_ref().map(|h| parse_hex_28(h));
+            if matches!(g, Some(None)) || matches!(x, Some(None)) {
+                partial_fallback(enc, err);
+            } else {
+                encode_gov_failure(enc, 11, |e| {
+                    for v in [g.flatten(), x.flatten()] {
+                        match v {
+                            Some(h) => {
+                                e.array(1).expect("infallible");
+                                e.bytes(&h).expect("infallible");
+                            }
+                            None => {
+                                e.array(0).expect("infallible");
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
+        TxValidationError::ConflictingMetadataHashUTXOW { supplied, expected } => {
+            match (hex::decode(supplied), hex::decode(expected)) {
+                (Ok(a), Ok(b)) if a.len() == 32 && b.len() == 32 => {
+                    // ToGroup: the Mismatch's two fields are spliced directly
+                    // into the constructor, so arity is 3 not 2.
+                    encode_utxow_failure(enc, 7, |e| {
+                        e.bytes(&a).expect("infallible");
+                        e.bytes(&b).expect("infallible");
+                    });
+                }
+                _ => partial_fallback(enc, err),
+            }
+        }
+        TxValidationError::WrongNetworkInOutput {
+            expected,
+            addresses,
+        } => {
+            let parsed: Vec<Vec<u8>> = addresses
+                .iter()
+                .filter_map(|a| hex::decode(a).ok())
+                .collect();
+            if parsed.len() != addresses.len() || parsed.is_empty() {
+                partial_fallback(enc, err);
+            } else {
+                encode_utxo_failure(enc, 7, |e| {
+                    e.u8(*expected).expect("infallible");
+                    set_open(e, parsed.len());
+                    for a in &parsed {
+                        e.bytes(a).expect("infallible");
+                    }
+                    set_close(e, parsed.len());
+                });
+            }
+        }
+        TxValidationError::WrongNetworkWithdrawal { expected, accounts } => {
+            let parsed: Vec<Vec<u8>> = accounts
+                .iter()
+                .filter_map(|a| hex::decode(a).ok())
+                .collect();
+            if parsed.len() != accounts.len() || parsed.is_empty() {
+                partial_fallback(enc, err);
+            } else {
+                encode_utxo_failure(enc, 8, |e| {
+                    e.u8(*expected).expect("infallible");
+                    set_open(e, parsed.len());
+                    for a in &parsed {
+                        e.bytes(a).expect("infallible");
+                    }
+                    set_close(e, parsed.len());
+                });
+            }
+        }
+
+        // ══ #979: Ledger-level ══════════════════════════════════════════
+        TxValidationError::WdrlNotDelegatedToDRep { key_hashes } => {
+            // `NonEmpty (KeyHash Staking)` — bare bstr(28), NOT a Credential.
+            let parsed: Vec<[u8; 28]> = key_hashes.iter().filter_map(|h| parse_hex_28(h)).collect();
+            if parsed.len() != key_hashes.len() || parsed.is_empty() {
+                partial_fallback(enc, err);
+            } else {
+                enc.array(2).expect("infallible");
+                enc.u8(4).expect("infallible");
+                list_open(enc, parsed.len());
+                for h in &parsed {
+                    enc.bytes(h).expect("infallible");
+                }
+                list_close(enc, parsed.len());
+            }
+        }
+        TxValidationError::TreasuryValueMismatch { supplied, expected } => {
+            // FLATTENED and SWAPPED: `ToGroup (swapMismatch mm)`, which upstream
+            // annotates "The serialisation order is in reverse".
+            enc.array(3).expect("infallible");
+            enc.u8(5).expect("infallible");
+            enc.u64(*expected).expect("infallible");
+            enc.u64(*supplied).expect("infallible");
+        }
+
         // ── Fallback for all unmapped variants ──
         // ConwayMempoolFailure (Ledger tag 7): [7, "descriptive text"]
         //
@@ -654,6 +1073,258 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
             encode_mempool_fallback(enc, "transaction validation failed");
         }
     }
+}
+
+/// Log the full error server-side and send the generic rejection.
+///
+/// Used when a typed arm exists but the payload cannot be encoded faithfully —
+/// a malformed hex field, a hash of the wrong width, an empty `NonEmpty`. An
+/// arm that emitted a typed failure with a WRONG or EMPTY payload would be
+/// worse than the generic one: cardano-cli would fail to decode it and report
+/// `DeserialiseFailure` instead of a rule name. Better a truthful generic
+/// error than a confident lie.
+fn partial_fallback(enc: &mut Encoder<&mut Vec<u8>>, err: &TxValidationError) {
+    tracing::debug!(err = ?err, "LocalTxSubmission: typed arm could not encode payload faithfully");
+    encode_mempool_fallback(enc, "transaction validation failed");
+}
+
+/// The three UTXOW arms whose payload is exactly `Set ScriptHash`.
+fn encode_script_hash_set_utxow(
+    enc: &mut Encoder<&mut Vec<u8>>,
+    err: &TxValidationError,
+    utxow_tag: u8,
+    hashes: &[String],
+) {
+    let parsed: Vec<[u8; 28]> = hashes.iter().filter_map(|h| parse_hex_28(h)).collect();
+    if parsed.len() != hashes.len() || parsed.is_empty() {
+        partial_fallback(enc, err);
+        return;
+    }
+    encode_utxow_failure(enc, utxow_tag, |e| {
+        set_open(e, parsed.len());
+        for h in &parsed {
+            e.bytes(h).expect("infallible");
+        }
+        set_close(e, parsed.len());
+    });
+}
+
+// ── Container encodings (#979) ──
+//
+// Haskell `cardano-ledger-binary` `Encoder.hs`:
+//
+//   lengthThreshold = 23
+//   variableListLenEncoding len contents =
+//     if len <= lengthThreshold then exactListLenEncoding len contents
+//                               else encodeListLenIndef <> contents <> encodeBreak
+//
+// `EncCBOR [a]` and `EncCBOR (NonEmpty a)` both go through it (`NonEmpty` is
+// `encCBOR . toList`), and `encodeSet` prefixes tag 258 at PV>=9 and then
+// applies the same rule. `encodeMap` is the same threshold without the tag.
+//
+// Predicate-failure payloads are usually small, so the definite branch is what
+// runs in practice — but "usually small" is not a bound. A tx can carry more
+// than 23 extraneous script witnesses, and at 24 the header must change shape
+// or cardano-cli's decoder sees a truncated list. Same rule #938 established
+// for the tx-body encoders.
+
+/// Haskell `lengthThreshold`.
+const LIST_DEFINITE_MAX: usize = 23;
+
+/// Open a `variableListLenEncoding` list. Pair with [`list_close`].
+fn list_open(enc: &mut Encoder<&mut Vec<u8>>, len: usize) {
+    if len <= LIST_DEFINITE_MAX {
+        enc.array(len as u64).expect("infallible");
+    } else {
+        enc.begin_array().expect("infallible");
+    }
+}
+
+/// Close a list opened by [`list_open`].
+fn list_close(enc: &mut Encoder<&mut Vec<u8>>, len: usize) {
+    if len > LIST_DEFINITE_MAX {
+        enc.end().expect("infallible");
+    }
+}
+
+/// Open `encodeSet` at PV>=9: `tag(258)` then a variable-length list.
+///
+/// `NonEmptySet` derives its `EncCBOR` newtype-wise from `Set`, so it is
+/// byte-identical — the non-emptiness is a type-level claim only.
+fn set_open(enc: &mut Encoder<&mut Vec<u8>>, len: usize) {
+    enc.tag(minicbor::data::Tag::new(CBOR_TAG_SET))
+        .expect("infallible");
+    list_open(enc, len);
+}
+
+fn set_close(enc: &mut Encoder<&mut Vec<u8>>, len: usize) {
+    list_close(enc, len);
+}
+
+/// Open `encodeMap` — the same threshold as lists, without a tag.
+/// `NonEmptyMap` derives newtype-wise from `Map`.
+fn map_open(enc: &mut Encoder<&mut Vec<u8>>, len: usize) {
+    if len <= LIST_DEFINITE_MAX {
+        enc.map(len as u64).expect("infallible");
+    } else {
+        enc.begin_map().expect("infallible");
+    }
+}
+
+fn map_close(enc: &mut Encoder<&mut Vec<u8>>, len: usize) {
+    if len > LIST_DEFINITE_MAX {
+        enc.end().expect("infallible");
+    }
+}
+
+/// Encode a Haskell `Credential` — `array(2)[disc, bstr(28)]`, `disc` 0 for
+/// `KeyHashObj` and 1 for `ScriptHashObj`.
+fn encode_credential(enc: &mut Encoder<&mut Vec<u8>>, disc: u8, hash28: &[u8; 28]) {
+    enc.array(2).expect("infallible");
+    enc.u8(disc).expect("infallible");
+    enc.bytes(hash28).expect("infallible");
+}
+
+/// Split dugite's "typed-hash32" credential encoding into `(discriminator,
+/// hash28)`.
+///
+/// dugite carries stake/DRep/committee credentials as a 32-byte value whose
+/// first 28 bytes are the hash and whose **byte 28 is the credential
+/// discriminator** — `0x00` key, `0x01` script (`Credential::to_typed_hash32`).
+/// That is what makes a faithful `Credential` encoding possible at all: the
+/// wire form needs the discriminator, and a bare 28-byte hash cannot supply
+/// it.
+fn parse_typed_credential(s: &str) -> Option<(u8, [u8; 28])> {
+    let raw = hex::decode(s).ok()?;
+    if raw.len() != 32 {
+        // Tolerate a bare 28-byte hash by assuming a key credential — some
+        // call sites predate the typed form. Never guess for anything else.
+        if raw.len() == 28 {
+            let mut h = [0u8; 28];
+            h.copy_from_slice(&raw);
+            return Some((0, h));
+        }
+        return None;
+    }
+    let disc = match raw[28] {
+        0 => 0u8,
+        1 => 1u8,
+        _ => return None,
+    };
+    let mut h = [0u8; 28];
+    h.copy_from_slice(&raw[..28]);
+    Some((disc, h))
+}
+
+/// Encode a `ConwayCertsPredFailure` in the Ledger nesting: `[2, [tag, …]]`.
+fn encode_certs_failure(
+    enc: &mut Encoder<&mut Vec<u8>>,
+    certs_tag: u8,
+    encode_fields: impl FnOnce(&mut Encoder<&mut Vec<u8>>),
+) {
+    let mut field_buf = Vec::new();
+    let mut field_enc = Encoder::new(&mut field_buf);
+    encode_fields(&mut field_enc);
+    let n = count_cbor_items(&field_buf);
+
+    enc.array(2).expect("infallible");
+    enc.u8(2).expect("infallible"); // Ledger tag 2: ConwayCertsFailure
+    enc.array((n + 1) as u64).expect("infallible");
+    enc.u8(certs_tag).expect("infallible");
+    enc.writer_mut().extend_from_slice(&field_buf);
+}
+
+/// Encode a `ConwayCertPredFailure` under `CertFailure`:
+/// `[2, [1, [cert_tag, …]]]`.
+///
+/// `ConwayCertPredFailure` has **no tag 0** — it starts at 1 (`DelegFailure`),
+/// 2 (`PoolFailure`), 3 (`GovCertFailure`).
+fn encode_cert_failure(
+    enc: &mut Encoder<&mut Vec<u8>>,
+    cert_tag: u8,
+    encode_body: impl FnOnce(&mut Encoder<&mut Vec<u8>>),
+) {
+    let mut body = Vec::new();
+    let mut body_enc = Encoder::new(&mut body);
+    encode_body(&mut body_enc);
+
+    encode_certs_failure(enc, 1, |e| {
+        // CERTS tag 1 = CertFailure, whose single field is the CERT failure.
+        e.array(2).expect("infallible");
+        e.u8(cert_tag).expect("infallible");
+        e.writer_mut().extend_from_slice(&body);
+    });
+}
+
+/// `ConwayDelegPredFailure` — `[2, [1, [1, [deleg_tag, …]]]]`.
+///
+/// **DELEG tags are 1-based**: `IncorrectDepositDELEG` = 1 …
+/// `RefundIncorrectDELEG` = 8. There is no tag 0. Numbering from declaration
+/// order (which is correct for GOVCERT) is off by one on every arm.
+fn encode_deleg_failure(
+    enc: &mut Encoder<&mut Vec<u8>>,
+    deleg_tag: u8,
+    encode_fields: impl FnOnce(&mut Encoder<&mut Vec<u8>>),
+) {
+    let mut field_buf = Vec::new();
+    let mut field_enc = Encoder::new(&mut field_buf);
+    encode_fields(&mut field_enc);
+    let n = count_cbor_items(&field_buf);
+
+    encode_cert_failure(enc, 1, |e| {
+        // The CERT arm already wrote `[cert_tag, <body>]`'s opening; the body
+        // is the DELEG failure array itself.
+        e.array((n + 1) as u64).expect("infallible");
+        e.u8(deleg_tag).expect("infallible");
+        e.writer_mut().extend_from_slice(&field_buf);
+    });
+}
+
+/// `ConwayGovCertPredFailure` — `[2, [1, [3, [govcert_tag, …]]]]`.
+///
+/// GOVCERT tags ARE 0-based, unlike DELEG.
+fn encode_govcert_failure(
+    enc: &mut Encoder<&mut Vec<u8>>,
+    govcert_tag: u8,
+    encode_fields: impl FnOnce(&mut Encoder<&mut Vec<u8>>),
+) {
+    let mut field_buf = Vec::new();
+    let mut field_enc = Encoder::new(&mut field_buf);
+    encode_fields(&mut field_enc);
+    let n = count_cbor_items(&field_buf);
+
+    encode_cert_failure(enc, 3, |e| {
+        e.array((n + 1) as u64).expect("infallible");
+        e.u8(govcert_tag).expect("infallible");
+        e.writer_mut().extend_from_slice(&field_buf);
+    });
+}
+
+/// `ShelleyPoolPredFailure` — `[2, [1, [2, <raw>]]]`.
+///
+/// POOL is the one rule in this tree whose `EncCBOR` is **hand-rolled** rather
+/// than built from the `Sum`/`encode` combinators:
+///
+/// ```haskell
+/// StakePoolCostTooLowPOOL (Mismatch supplied expected) ->
+///   encodeListLen 3 <> encCBOR (3 :: Word8) <> encCBOR supplied <> encCBOR expected
+/// ```
+///
+/// So the caller writes the whole `array(n)[tag, …]` itself: the arity is not
+/// derivable from a field count, the `Mismatch` fields are spliced in
+/// individually, and `StakePoolRetirementWrongEpochPOOL` even DROPS one of
+/// them. There is also no tag 2.
+fn encode_pool_failure(
+    enc: &mut Encoder<&mut Vec<u8>>,
+    encode_raw: impl FnOnce(&mut Encoder<&mut Vec<u8>>),
+) {
+    let mut body = Vec::new();
+    let mut body_enc = Encoder::new(&mut body);
+    encode_raw(&mut body_enc);
+
+    encode_cert_failure(enc, 2, |e| {
+        e.writer_mut().extend_from_slice(&body);
+    });
 }
 
 // ── Encoding helpers ──
@@ -868,6 +1539,610 @@ mod tests {
     }
 
     // ── PV<=10 withdrawal failure (the only reachable one today) ──
+
+    // ══ #979 golden vectors ═════════════════════════════════════════════
+    //
+    // Each of these asserts the EXACT payload bytes of the
+    // `ConwayLedgerPredFailure`, not merely the tag. An arm that reaches the
+    // right tag with the wrong payload shape is worse than the generic
+    // failure it replaced: cardano-cli reports `DeserialiseFailure` instead of
+    // a rule name, which is what the first `ProposalDepositIncorrect` attempt
+    // did.
+    //
+    // Tags are from cardano-ledger @4f7cb2d6874df70561e32147084ed82cee773e8a.
+
+    /// Strip the HFC + era + failure-list wrappers and return the raw
+    /// `ConwayLedgerPredFailure` bytes.
+    fn ledger_failure_bytes(err: &TxValidationError) -> Vec<u8> {
+        let bytes = encode_apply_tx_err(err, 6);
+        let mut dec = Decoder::new(&bytes);
+        assert_eq!(dec.array().unwrap(), Some(1), "HFC wrapper");
+        assert_eq!(dec.array().unwrap(), Some(2), "[era_id, failures]");
+        assert_eq!(dec.u16().unwrap(), 6, "Conway era id");
+        assert_eq!(dec.array().unwrap(), Some(1), "exactly one failure");
+        bytes[dec.position()..].to_vec()
+    }
+
+    fn assert_ledger_bytes(err: &TxValidationError, want: &[u8], what: &str) {
+        let got = ledger_failure_bytes(err);
+        assert_eq!(
+            hex::encode(&got),
+            hex::encode(want),
+            "{what}: wrong ConwayLedgerPredFailure bytes"
+        );
+    }
+
+    /// A typed-hash32 credential: 28-byte hash + discriminator byte.
+    fn typed_cred(byte: u8, script: bool) -> String {
+        let mut v = vec![byte; 28];
+        v.push(if script { 1 } else { 0 });
+        v.extend_from_slice(&[0u8; 3]);
+        hex::encode(v)
+    }
+
+    /// `[2, [1, [1, [tag, …]]]]` — Ledger 2 / CERTS 1 / CERT 1 / DELEG.
+    fn deleg_prefix() -> Vec<u8> {
+        vec![0x82, 0x02, 0x82, 0x01, 0x82, 0x01]
+    }
+
+    /// `[2, [1, [3, [tag, …]]]]` — Ledger 2 / CERTS 1 / CERT 3 / GOVCERT.
+    fn govcert_prefix() -> Vec<u8> {
+        vec![0x82, 0x02, 0x82, 0x01, 0x82, 0x03]
+    }
+
+    /// `[2, [1, [2, …]]]` — Ledger 2 / CERTS 1 / CERT 2 / POOL.
+    fn pool_prefix() -> Vec<u8> {
+        vec![0x82, 0x02, 0x82, 0x01, 0x82, 0x02]
+    }
+
+    /// DELEG tags are **1-based**: `StakeKeyRegisteredDELEG` is 2, not 1.
+    /// A 0-based reading — correct for GOVCERT — is off by one on every arm.
+    #[test]
+    fn golden_stake_key_registered_deleg_is_tag_2() {
+        let mut want = deleg_prefix();
+        // array(2)[2, Credential] where Credential = array(2)[0, bstr28]
+        want.extend_from_slice(&[0x82, 0x02, 0x82, 0x00, 0x58, 0x1c]);
+        want.extend_from_slice(&[0xAA; 28]);
+        assert_ledger_bytes(
+            &TxValidationError::StakeKeyRegisteredDELEG {
+                credential: typed_cred(0xAA, false),
+            },
+            &want,
+            "StakeKeyRegisteredDELEG",
+        );
+    }
+
+    /// The script discriminator must survive: dugite carries it in byte 28 of
+    /// the typed-hash32, and Haskell's `Credential` needs it on the wire.
+    #[test]
+    fn golden_script_credential_keeps_its_discriminator() {
+        let mut want = deleg_prefix();
+        want.extend_from_slice(&[0x82, 0x03, 0x82, 0x01, 0x58, 0x1c]);
+        want.extend_from_slice(&[0xBB; 28]);
+        assert_ledger_bytes(
+            &TxValidationError::StakeKeyNotRegisteredDELEG {
+                credential: typed_cred(0xBB, true),
+            },
+            &want,
+            "StakeKeyNotRegisteredDELEG (script)",
+        );
+    }
+
+    /// The payload is the BALANCE, not the credential.
+    #[test]
+    fn golden_stake_key_has_non_zero_balance_carries_a_coin() {
+        let mut want = deleg_prefix();
+        want.extend_from_slice(&[0x82, 0x04, 0x19, 0x03, 0xE8]); // 1000
+        assert_ledger_bytes(
+            &TxValidationError::StakeKeyHasNonZeroAccountBalanceDELEG { balance: 1000 },
+            &want,
+            "StakeKeyHasNonZeroAccountBalanceDELEG",
+        );
+    }
+
+    /// `KeyHash StakePool` — a bare bstr(28), NOT a `Credential` array.
+    #[test]
+    fn golden_delegatee_stake_pool_not_registered_is_a_bare_key_hash() {
+        let mut want = deleg_prefix();
+        want.extend_from_slice(&[0x82, 0x06, 0x58, 0x1c]);
+        want.extend_from_slice(&[0xCC; 28]);
+        assert_ledger_bytes(
+            &TxValidationError::DelegateeStakePoolNotRegisteredDELEG {
+                pool_id: hex::encode([0xCC; 28]),
+            },
+            &want,
+            "DelegateeStakePoolNotRegisteredDELEG",
+        );
+    }
+
+    /// **The Mismatch trap.** DELEG writes `To mm` — the Mismatch NESTS as
+    /// `array(2)[supplied, expected]`. GOVCERT writes `ToGroup mm` for the
+    /// same type, which FLATTENS it. Both are asserted here so neither can
+    /// drift onto the other's shape.
+    #[test]
+    fn golden_deleg_nests_mismatch_but_govcert_flattens_it() {
+        // DELEG tag 7: [7, [supplied, expected]] — three items total.
+        let mut want = deleg_prefix();
+        want.extend_from_slice(&[0x82, 0x07, 0x82, 0x0A, 0x14]); // [7, [10, 20]]
+        assert_ledger_bytes(
+            &TxValidationError::DepositIncorrectDELEG {
+                supplied: 10,
+                expected: 20,
+            },
+            &want,
+            "DepositIncorrectDELEG (nested Mismatch)",
+        );
+
+        // GOVCERT tag 2: [2, supplied, expected] — FLATTENED, arity 3.
+        let mut want = govcert_prefix();
+        want.extend_from_slice(&[0x83, 0x02, 0x0A, 0x14]);
+        assert_ledger_bytes(
+            &TxValidationError::ConwayDRepIncorrectDeposit {
+                supplied: 10,
+                expected: 20,
+            },
+            &want,
+            "ConwayDRepIncorrectDeposit (flattened Mismatch)",
+        );
+    }
+
+    #[test]
+    fn golden_refund_incorrect_deleg_is_tag_8() {
+        let mut want = deleg_prefix();
+        want.extend_from_slice(&[0x82, 0x08, 0x82, 0x01, 0x02]);
+        assert_ledger_bytes(
+            &TxValidationError::RefundIncorrectDELEG {
+                supplied: 1,
+                expected: 2,
+            },
+            &want,
+            "RefundIncorrectDELEG",
+        );
+    }
+
+    /// GOVCERT tags ARE 0-based, unlike DELEG.
+    #[test]
+    fn golden_conway_drep_already_registered_is_govcert_tag_0() {
+        let mut want = govcert_prefix();
+        want.extend_from_slice(&[0x82, 0x00, 0x82, 0x00, 0x58, 0x1c]);
+        want.extend_from_slice(&[0xDD; 28]);
+        assert_ledger_bytes(
+            &TxValidationError::ConwayDRepAlreadyRegistered {
+                credential: typed_cred(0xDD, false),
+            },
+            &want,
+            "ConwayDRepAlreadyRegistered",
+        );
+    }
+
+    #[test]
+    fn golden_committee_govcert_tags() {
+        let mut want = govcert_prefix();
+        want.extend_from_slice(&[0x82, 0x03, 0x82, 0x00, 0x58, 0x1c]);
+        want.extend_from_slice(&[0x11; 28]);
+        assert_ledger_bytes(
+            &TxValidationError::ConwayCommitteeHasPreviouslyResigned {
+                credential: typed_cred(0x11, false),
+            },
+            &want,
+            "ConwayCommitteeHasPreviouslyResigned",
+        );
+
+        let mut want = govcert_prefix();
+        want.extend_from_slice(&[0x82, 0x05, 0x82, 0x00, 0x58, 0x1c]);
+        want.extend_from_slice(&[0x22; 28]);
+        assert_ledger_bytes(
+            &TxValidationError::ConwayCommitteeIsUnknown {
+                credential: typed_cred(0x22, false),
+            },
+            &want,
+            "ConwayCommitteeIsUnknown",
+        );
+    }
+
+    /// POOL's `EncCBOR` is hand-rolled: `encodeListLen 3 <> 3 <> supplied <>
+    /// expected`. There is no tag 2 in this rule.
+    #[test]
+    fn golden_stake_pool_cost_too_low_is_pool_tag_3() {
+        let mut want = pool_prefix();
+        want.extend_from_slice(&[0x83, 0x03, 0x18, 0x64, 0x18, 0xC8]); // [3, 100, 200]
+        assert_ledger_bytes(
+            &TxValidationError::StakePoolCostTooLowPOOL {
+                supplied: 100,
+                expected: 200,
+            },
+            &want,
+            "StakePoolCostTooLowPOOL",
+        );
+    }
+
+    /// `WrongNetworkPOOL` writes **expected before supplied** — the reverse of
+    /// every other Mismatch on this wire.
+    #[test]
+    fn golden_wrong_network_pool_writes_expected_first() {
+        let mut want = pool_prefix();
+        want.extend_from_slice(&[0x84, 0x04, 0x01, 0x00, 0x58, 0x1c]);
+        want.extend_from_slice(&[0x33; 28]);
+        assert_ledger_bytes(
+            &TxValidationError::WrongNetworkPOOL {
+                expected: 1,
+                supplied: 0,
+                pool_id: hex::encode([0x33; 28]),
+            },
+            &want,
+            "WrongNetworkPOOL",
+        );
+    }
+
+    /// Pool id FIRST, then the VRF hash — `VRFKeyHashAlreadyRegistered
+    /// (KeyHash StakePool) (VRFVerKeyHash StakePoolVRF)`.
+    #[test]
+    fn golden_vrf_key_hash_already_registered_orders_pool_then_vrf() {
+        let mut want = pool_prefix();
+        want.extend_from_slice(&[0x83, 0x06, 0x58, 0x1c]);
+        want.extend_from_slice(&[0x44; 28]);
+        want.extend_from_slice(&[0x58, 0x20]);
+        want.extend_from_slice(&[0x55; 32]);
+        assert_ledger_bytes(
+            &TxValidationError::VrfKeyHashAlreadyRegisteredPOOL {
+                pool_id: hex::encode([0x44; 28]),
+                vrf_key_hash: hex::encode([0x55; 32]),
+            },
+            &want,
+            "VRFKeyHashAlreadyRegistered",
+        );
+    }
+
+    /// THREE fields, not four: the first Mismatch's `supplied` is discarded
+    /// by the encoder (`Mismatch _ gtExpected`).
+    #[test]
+    fn golden_pool_retirement_wrong_epoch_drops_one_mismatch_field() {
+        let mut want = pool_prefix();
+        // [1, 5, 99, 10] — 99 needs the 0x18 uint8 prefix (CBOR inlines 0..23 only).
+        want.extend_from_slice(&[0x84, 0x01, 0x05, 0x18, 0x63, 0x0A]);
+        assert_ledger_bytes(
+            &TxValidationError::StakePoolRetirementWrongEpochPOOL {
+                gt_expected: 5,
+                lt_supplied: 99,
+                lt_expected: 10,
+            },
+            &want,
+            "StakePoolRetirementWrongEpochPOOL",
+        );
+    }
+
+    /// `InvalidMetadata` carries NO payload upstream — `Sum InvalidMetadata 8`
+    /// with nothing after it. dugite's own error has a `labels` field, which
+    /// must NOT be emitted.
+    #[test]
+    fn golden_invalid_metadata_has_no_payload() {
+        assert_ledger_bytes(
+            &TxValidationError::InvalidMetadataUTXOW,
+            &[0x82, 0x01, 0x81, 0x08],
+            "InvalidMetadata",
+        );
+    }
+
+    #[test]
+    fn golden_script_hash_set_utxow_arms() {
+        for (err, tag, what) in [
+            (
+                TxValidationError::ExtraneousScriptWitnessesUTXOW {
+                    script_hashes: vec![hex::encode([0x66; 28])],
+                },
+                9u8,
+                "ExtraneousScriptWitnessesUTXOW",
+            ),
+            (
+                TxValidationError::MalformedScriptWitnessesUTXOW {
+                    script_hashes: vec![hex::encode([0x66; 28])],
+                },
+                16,
+                "MalformedScriptWitnesses",
+            ),
+            (
+                TxValidationError::MalformedReferenceScriptsUTXOW {
+                    script_hashes: vec![hex::encode([0x66; 28])],
+                },
+                17,
+                "MalformedReferenceScripts",
+            ),
+        ] {
+            // [1, [tag, 258([bstr28])]]
+            let mut want = vec![0x82, 0x01, 0x82, tag, 0xD9, 0x01, 0x02, 0x81, 0x58, 0x1c];
+            want.extend_from_slice(&[0x66; 28]);
+            assert_ledger_bytes(&err, &want, what);
+        }
+    }
+
+    /// `encodeSet` uses `variableListLenEncoding`: definite up to 23 elements,
+    /// INDEFINITE above. Predicate-failure payloads are usually small, but
+    /// "usually" is not a bound — a tx can carry more than 23 extraneous
+    /// witnesses, and at 24 the header must change shape.
+    #[test]
+    fn golden_set_crosses_the_23_element_threshold() {
+        let mk = |n: usize| TxValidationError::MalformedScriptWitnessesUTXOW {
+            script_hashes: (0..n).map(|i| hex::encode([i as u8; 28])).collect(),
+        };
+
+        let at23 = ledger_failure_bytes(&mk(23));
+        // 258( array(23) ) -> d9 0102 97
+        assert_eq!(
+            &at23[4..8],
+            &[0xD9, 0x01, 0x02, 0x97],
+            "23 elements must use a DEFINITE header"
+        );
+
+        let at24 = ledger_failure_bytes(&mk(24));
+        // 258( indefinite array ) -> d9 0102 9f ... ff
+        assert_eq!(
+            &at24[4..8],
+            &[0xD9, 0x01, 0x02, 0x9F],
+            "24 elements must switch to the INDEFINITE header"
+        );
+        assert_eq!(
+            *at24.last().unwrap(),
+            0xFF,
+            "an indefinite array must be terminated by a break"
+        );
+    }
+
+    /// `ExtraRedeemers` is `[PlutusPurpose AsIx]` — a plain LIST, with no set
+    /// tag. Emitting 258(...) here would be a decode failure upstream.
+    #[test]
+    fn golden_extra_redeemers_is_a_list_not_a_set() {
+        let want = vec![0x82, 0x01, 0x82, 0x0F, 0x81, 0x82, 0x01, 0x03];
+        assert_ledger_bytes(
+            &TxValidationError::ExtraRedeemersUTXOW {
+                purposes: vec![(1, 3)],
+            },
+            &want,
+            "ExtraRedeemers",
+        );
+    }
+
+    #[test]
+    fn golden_unspendable_utxo_no_datum_hash_is_a_txin_set() {
+        let mut want = vec![
+            0x82, 0x01, 0x82, 0x0E, 0xD9, 0x01, 0x02, 0x81, 0x82, 0x58, 0x20,
+        ];
+        want.extend_from_slice(&[0x77; 32]);
+        want.push(0x05);
+        assert_ledger_bytes(
+            &TxValidationError::UnspendableUTxONoDatumHashUTXOW {
+                inputs: vec![format!("{}#5", hex::encode([0x77; 32]))],
+            },
+            &want,
+            "UnspendableUTxONoDatumHash",
+        );
+    }
+
+    /// `ConwayWdrlNotDelegatedToDRep (NonEmpty (KeyHash Staking))` — bare
+    /// bstr(28) elements in a plain list. NOT `Credential`, so no
+    /// discriminator array, and NOT a set, so no tag 258.
+    #[test]
+    fn golden_wdrl_not_delegated_to_drep_is_a_bare_key_hash_list() {
+        let mut want = vec![0x82, 0x04, 0x81, 0x58, 0x1c];
+        want.extend_from_slice(&[0x88; 28]);
+        assert_ledger_bytes(
+            &TxValidationError::WdrlNotDelegatedToDRep {
+                key_hashes: vec![hex::encode([0x88; 28])],
+            },
+            &want,
+            "ConwayWdrlNotDelegatedToDRep",
+        );
+    }
+
+    /// `ConwayTreasuryValueMismatch` is BOTH flattened and SWAPPED —
+    /// `Sum (… . unswapMismatch) 5 !> ToGroup (swapMismatch mm)`, which
+    /// upstream annotates "The serialisation order is in reverse".
+    #[test]
+    fn golden_treasury_value_mismatch_is_flattened_and_swapped() {
+        assert_ledger_bytes(
+            &TxValidationError::TreasuryValueMismatch {
+                supplied: 1,
+                expected: 2,
+            },
+            // [5, expected, supplied] — NOT [5, supplied, expected]
+            &[0x83, 0x05, 0x02, 0x01],
+            "ConwayTreasuryValueMismatch",
+        );
+    }
+
+    /// `NonEmptyMap` derives its `EncCBOR` newtype-wise from `Map`, so
+    /// `encodeMap`: no set tag, same 23-element threshold.
+    #[test]
+    fn golden_expiration_epoch_too_small_is_a_map() {
+        let mut want = vec![0x82, 0x03, 0x82, 0x07, 0xA1, 0x82, 0x00, 0x58, 0x1c];
+        want.extend_from_slice(&[0x99; 28]);
+        want.extend_from_slice(&[0x18, 0x64]); // epoch 100
+        assert_ledger_bytes(
+            &TxValidationError::ExpirationEpochTooSmall {
+                members: vec![(typed_cred(0x99, false), 100)],
+            },
+            &want,
+            "ExpirationEpochTooSmall",
+        );
+    }
+
+    /// `NonEmptySet` derives newtype-wise from `Set`, so it DOES carry tag 258
+    /// — unlike `NonEmpty`, which does not.
+    #[test]
+    fn golden_conflicting_committee_update_is_a_tagged_set() {
+        let mut want = vec![
+            0x82, 0x03, 0x82, 0x06, 0xD9, 0x01, 0x02, 0x81, 0x82, 0x00, 0x58, 0x1c,
+        ];
+        want.extend_from_slice(&[0xAB; 28]);
+        assert_ledger_bytes(
+            &TxValidationError::ConflictingCommitteeUpdate {
+                credentials: vec![typed_cred(0xAB, false)],
+            },
+            &want,
+            "ConflictingCommitteeUpdate",
+        );
+    }
+
+    /// `TreasuryWithdrawalReturnAccountsDoNotExist (NonEmpty AccountAddress)`
+    /// — a plain list of account-address BYTE STRINGS, no set tag.
+    #[test]
+    fn golden_treasury_withdrawal_return_accounts_is_an_untagged_list() {
+        let acct = format!("e0{}", hex::encode([0x01; 28]));
+        let mut want = vec![0x82, 0x03, 0x82, 0x11, 0x81, 0x58, 0x1d, 0xe0];
+        want.extend_from_slice(&[0x01; 28]);
+        assert_ledger_bytes(
+            &TxValidationError::TreasuryWithdrawalReturnAccountsDoNotExist {
+                accounts: vec![acct],
+            },
+            &want,
+            "TreasuryWithdrawalReturnAccountsDoNotExist",
+        );
+    }
+
+    /// Two `StrictMaybe ScriptHash`: `array(0)` for SNothing, `array(1)[x]`
+    /// for SJust.
+    #[test]
+    fn golden_invalid_guardrails_script_hash_uses_strict_maybe() {
+        let mut want = vec![0x82, 0x03, 0x83, 0x0B, 0x81, 0x58, 0x1c];
+        want.extend_from_slice(&[0xCD; 28]);
+        want.push(0x80); // SNothing
+        assert_ledger_bytes(
+            &TxValidationError::InvalidGuardrailsScriptHash {
+                got: Some(hex::encode([0xCD; 28])),
+                expected: None,
+            },
+            &want,
+            "InvalidGuardrailsScriptHash",
+        );
+    }
+
+    /// `ConflictingMetadataHash` is `ToGroup mm` — flattened, arity 3 — and
+    /// the DECLARED hash comes first: `Mismatch { mismatchSupplied = mdh,
+    /// mismatchExpected = hashTxAuxData md' }`.
+    #[test]
+    fn golden_conflicting_metadata_hash_is_flattened_declared_first() {
+        let mut want = vec![0x82, 0x01, 0x83, 0x07, 0x58, 0x20];
+        want.extend_from_slice(&[0xA1; 32]);
+        want.extend_from_slice(&[0x58, 0x20]);
+        want.extend_from_slice(&[0xB2; 32]);
+        assert_ledger_bytes(
+            &TxValidationError::ConflictingMetadataHashUTXOW {
+                supplied: hex::encode([0xA1; 32]),
+                expected: hex::encode([0xB2; 32]),
+            },
+            &want,
+            "ConflictingMetadataHash",
+        );
+    }
+
+    /// `WrongNetwork Network (Set Addr)` — the EXPECTED network then the set
+    /// of offending addresses. There is no "actual network" field on this
+    /// wire, and the set carries EVERY offender, not just the first.
+    #[test]
+    fn golden_wrong_network_in_output_carries_the_whole_address_set() {
+        let a1 = vec![0x01u8; 29];
+        let a2 = vec![0x02u8; 29];
+        // [1, [0, [7, network, 258([addr, addr])]]]
+        let mut want = vec![
+            0x82, 0x01, 0x82, 0x00, 0x83, 0x07, 0x01, 0xD9, 0x01, 0x02, 0x82,
+        ];
+        want.extend_from_slice(&[0x58, 0x1d]);
+        want.extend_from_slice(&a1);
+        want.extend_from_slice(&[0x58, 0x1d]);
+        want.extend_from_slice(&a2);
+        assert_ledger_bytes(
+            &TxValidationError::WrongNetworkInOutput {
+                expected: 1,
+                addresses: vec![hex::encode(&a1), hex::encode(&a2)],
+            },
+            &want,
+            "WrongNetwork",
+        );
+    }
+
+    #[test]
+    fn golden_wrong_network_withdrawal_is_utxo_tag_8() {
+        let acct = vec![0xE0u8; 29];
+        let mut want = vec![
+            0x82, 0x01, 0x82, 0x00, 0x83, 0x08, 0x00, 0xD9, 0x01, 0x02, 0x81,
+        ];
+        want.extend_from_slice(&[0x58, 0x1d]);
+        want.extend_from_slice(&acct);
+        assert_ledger_bytes(
+            &TxValidationError::WrongNetworkWithdrawal {
+                expected: 0,
+                accounts: vec![hex::encode(&acct)],
+            },
+            &want,
+            "WrongNetworkWithdrawal",
+        );
+    }
+
+    /// **The PV inversion (#978's shape, acceptance criterion 4).**
+    ///
+    /// `hardforkConwayDELEGIncorrectDepositsAndRefunds pv = pvMajor pv > 10`.
+    /// Below PV 11 an incorrect stake-key deposit OR refund is
+    /// `IncorrectDepositDELEG Coin` — DELEG tag **1**, one field, no
+    /// `Mismatch`. From PV 11 they split into tags 7 and 8, each carrying a
+    /// full `Mismatch`.
+    ///
+    /// Every real network runs PV 10 today, so an implementation carrying only
+    /// tags 7/8 would have the reachable case degrade to a generic failure
+    /// while the implemented arms sat dead — which is precisely what #978
+    /// found in the withdrawal path.
+    #[test]
+    fn golden_deleg_deposit_is_tag_1_pre_pv11_and_tag_7_after() {
+        // PV<=10: [1, supplied] — no Mismatch.
+        let mut want = deleg_prefix();
+        want.extend_from_slice(&[0x82, 0x01, 0x18, 0x64]);
+        assert_ledger_bytes(
+            &TxValidationError::IncorrectDepositDELEG { supplied: 100 },
+            &want,
+            "IncorrectDepositDELEG (PV<=10)",
+        );
+
+        // PV>=11: [7, [supplied, expected]] — nested Mismatch.
+        let mut want = deleg_prefix();
+        want.extend_from_slice(&[0x82, 0x07, 0x82, 0x18, 0x64, 0x18, 0xC8]);
+        assert_ledger_bytes(
+            &TxValidationError::DepositIncorrectDELEG {
+                supplied: 100,
+                expected: 200,
+            },
+            &want,
+            "DepositIncorrectDELEG (PV>=11)",
+        );
+    }
+
+    /// A payload that cannot be encoded faithfully must fall back to the
+    /// generic failure rather than emit a typed frame with a wrong or empty
+    /// body — the latter reaches cardano-cli as `DeserialiseFailure`, which is
+    /// strictly less useful than the generic error it replaced.
+    #[test]
+    fn malformed_payloads_fall_back_instead_of_emitting_a_broken_frame() {
+        for err in [
+            TxValidationError::StakeKeyRegisteredDELEG {
+                credential: "not-hex".into(),
+            },
+            TxValidationError::DelegateeStakePoolNotRegisteredDELEG {
+                pool_id: hex::encode([0u8; 31]),
+            },
+            TxValidationError::MalformedScriptWitnessesUTXOW {
+                script_hashes: vec![],
+            },
+            TxValidationError::WdrlNotDelegatedToDRep { key_hashes: vec![] },
+            TxValidationError::VrfKeyHashAlreadyRegisteredPOOL {
+                pool_id: hex::encode([0x44; 28]),
+                vrf_key_hash: hex::encode([0x55; 28]), // must be 32
+            },
+        ] {
+            let got = ledger_failure_bytes(&err);
+            assert_eq!(
+                got[0..2],
+                [0x82, 0x07],
+                "{err:?} must fall back to ConwayMempoolFailure (Ledger tag 7)"
+            );
+        }
+    }
 
     /// GOLDEN: `WithdrawalsNotInRewardsCERTS` must encode as
     /// `[2, [0, {account => coin}]]` — Ledger tag 2 (ConwayCertsFailure)
