@@ -215,89 +215,26 @@ devnet-validate-extended:
         EVIDENCE_DIR="$EVD" ./sync/bulk-sync-throughput.sh
         EVIDENCE_DIR="$EVD" ./perf/resource-health.sh
         EVIDENCE_DIR="$EVD" ./perf/log-level-predicate.sh
-        # Cardano-bp can fall far behind dugite-bp during tx-zoo's
-        # tx-submission bursts: dugite's chain-sync server occasionally
-        # goes silent on cardano-bp's downstream connection under heavy
-        # N2C query load (the recipe runs hundreds of cardano-cli queries
-        # against cardano-bp during wait_all_observers polling). When the
-        # chain-sync stream stops flowing, cardano-bp parks at a stale
-        # block forever; restarting just cardano-bp re-establishes the
-        # chain-sync intersection and lets it bulk-download the catch-up
-        # via blockfetch, which is robust under the same load.
-        echo "=== catch-up gate: waiting for cardano-bp tip ≤5 blocks behind dugite-bp ==="
-        for ROUND_IDX in $(seq 1 90); do
-            D=$(cardano-cli query tip --testnet-magic 42 --socket-path /tmp/ld-$(id -u)/dbp.sock 2>/dev/null | jq -r '.block // 0')
-            C=$(cardano-cli query tip --testnet-magic 42 --socket-path /tmp/ld-$(id -u)/cbp.sock 2>/dev/null | jq -r '.block // 0')
-            GAP=$(( D - C )); [ "$GAP" -lt 0 ] && GAP=$(( -GAP ))
-            echo "  attempt=$ROUND_IDX dugite-bp=$D cardano-bp=$C gap=$GAP"
-            [ "$GAP" -le 5 ] && break
-            # After 60s of no progress, restart cardano-bp to clear a
-            # silent chain-sync stall. The restart drops + reconnects
-            # the downstream connection, re-issuing MsgFindIntersect on
-            # the new socket.
-            if [ "$ROUND_IDX" -eq 30 ] && [ "$GAP" -gt 50 ]; then
-                echo "  cardano-bp not catching up — bouncing it"
-                if [ -f state/cardano-bp.pid ]; then
-                    kill "$(cat state/cardano-bp.pid)" 2>/dev/null || true
-                    sleep 5
-                fi
-                cardano-node run \
-                    --config        "config/cardano-bp.config.json" \
-                    --topology      "config/cardano-bp.topology.json" \
-                    --database-path "state/cardano-bp.db" \
-                    --socket-path   "/tmp/ld-$(id -u)/cbp.sock" \
-                    --host-addr     127.0.0.1 \
-                    --port          3003 \
-                    >> "logs/cardano-bp.log" 2>&1 &
-                echo $! > state/cardano-bp.pid
-                # Give cardano-bp time to come up and re-handshake.
-                for _ in $(seq 1 20); do
-                    sleep 2
-                    cardano-cli query tip --testnet-magic 42 --socket-path /tmp/ld-$(id -u)/cbp.sock >/dev/null 2>&1 && break
-                done
-            fi
-            sleep 2
-        done
+        # cardano-bp legitimately lags after a tx-zoo burst; wait for it.
+        #
+        # This used to RESTART cardano-bp after 60s of no progress, working
+        # around #980 (dugite's ChainSync responder went silent on a downstream
+        # peer and never recovered). #980 is fixed, so the restart is gone: a
+        # persistent gap is now a hard failure. A workaround that silently
+        # repairs the devnet mid-round makes every tip-sensitive suite after it
+        # measure a different devnet than the one under test.
+        ./wait-catchup.sh --label "catch-up gate" --max-gap 5 --timeout-seconds 180
         EVIDENCE_DIR="$EVD" ./perf/determinism-feasibility.sh
         [ "$ROUND" -eq 2 ] && {
             sleep 300  # extra wait for epoch boundary
             EVIDENCE_DIR="$EVD" ./tx-zoo/run-all.sh 10-gov-lifecycle
         }
-        # Pre-soak catch-up gate — Round 2's extra gov-lifecycle re-run
-        # puts cardano-bp back under load and it falls behind again,
-        # which would otherwise tank p4:tip-parity (we have measured
-        # 0/36 ticks in-parity here on a previous run).  Bounce cbp if
-        # it is still > 50 blocks behind after 60 s so the soak's
-        # tip-parity window opens with all three observers in lockstep.
-        echo "=== pre-soak catch-up gate ==="
-        for ROUND_IDX in $(seq 1 90); do
-            D=$(cardano-cli query tip --testnet-magic 42 --socket-path /tmp/ld-$(id -u)/dbp.sock 2>/dev/null | jq -r '.block // 0')
-            C=$(cardano-cli query tip --testnet-magic 42 --socket-path /tmp/ld-$(id -u)/cbp.sock 2>/dev/null | jq -r '.block // 0')
-            GAP=$(( D - C )); [ "$GAP" -lt 0 ] && GAP=$(( -GAP ))
-            echo "  attempt=$ROUND_IDX dugite-bp=$D cardano-bp=$C gap=$GAP"
-            [ "$GAP" -le 5 ] && break
-            if [ "$ROUND_IDX" -eq 30 ] && [ "$GAP" -gt 50 ]; then
-                echo "  cardano-bp not catching up — bouncing it"
-                if [ -f state/cardano-bp.pid ]; then
-                    kill "$(cat state/cardano-bp.pid)" 2>/dev/null || true
-                    sleep 5
-                fi
-                cardano-node run \
-                    --config        "config/cardano-bp.config.json" \
-                    --topology      "config/cardano-bp.topology.json" \
-                    --database-path "state/cardano-bp.db" \
-                    --socket-path   "/tmp/ld-$(id -u)/cbp.sock" \
-                    --host-addr     127.0.0.1 \
-                    --port          3003 \
-                    >> "logs/cardano-bp.log" 2>&1 &
-                echo $! > state/cardano-bp.pid
-                for _ in $(seq 1 20); do
-                    sleep 2
-                    cardano-cli query tip --testnet-magic 42 --socket-path /tmp/ld-$(id -u)/cbp.sock >/dev/null 2>&1 && break
-                done
-            fi
-            sleep 2
-        done
+        # Pre-soak catch-up gate — Round 2's extra gov-lifecycle re-run puts
+        # cardano-bp back under load, and the soak's tip-parity window must
+        # open with all three observers in lockstep. Same story as above: this
+        # bounced cardano-bp before #980 was fixed; now it just waits, and
+        # fails if the gap persists.
+        ./wait-catchup.sh --label "pre-soak catch-up gate" --max-gap 5 --timeout-seconds 180
         # Populate the soak-style evidence (tip-samples / blocks /
         # tx-submissions / tip-age-samples) that verify.sh's p1-p5
         # predicates read — without this the predicates fail with "no-data".
