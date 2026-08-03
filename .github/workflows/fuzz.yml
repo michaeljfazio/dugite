@@ -79,10 +79,6 @@ jobs:
           - volatile_recovery
           - chaindb_rollback
           # Phase 4 — Plutus / Phase-2
-          # NOTE: plutus_script_decode is intentionally OMITTED — upstream uplc
-          # and pallas-codec panic on malformed input (see top-doc in that file
-          # and the catch_unwind guard in dugite-ledger/src/plutus.rs). The
-          # in-house decoder is covered by dugite_uplc_program_decode below.
           - plutus_data_decode
           - cost_model_eval
           # Audit #544 — CBOR serialization strictness (D2/D3/D9/D10/D15)

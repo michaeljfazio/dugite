@@ -48,13 +48,17 @@ use arbitrary::{Arbitrary, Unstructured};
 use libfuzzer_sys::fuzz_target;
 
 use dugite_fuzz::node::n2c_query::filter::{
-    FilterArgError, OnEmptySet, SetArgShape, filter_arg, parse_set, read_credential, read_drep,
-    read_gov_action_id, read_pool_id,
+    filter_arg, parse_set, read_credential, read_drep, read_gov_action_id, read_pool_id,
+    FilterArgError, OnEmptySet, SetArgShape,
 };
 
 /// `Ok(None)` means "answer for everything". Assert it is only ever reached
 /// from input that genuinely encodes that, never from a parse failure.
-fn check_fail_closed<T>(data: &[u8], shape: SetArgShape, parsed: &Result<Option<Vec<T>>, FilterArgError>) {
+fn check_fail_closed<T>(
+    data: &[u8],
+    shape: SetArgShape,
+    parsed: &Result<Option<Vec<T>>, FilterArgError>,
+) {
     if !matches!(parsed, Ok(None)) {
         return;
     }
@@ -153,7 +157,9 @@ fuzz_target!(|data: &[u8]| {
     for _ in 0..count {
         let seed = u8::arbitrary(&mut u).unwrap_or(0);
         let mut elem = Vec::new();
-        minicbor::Encoder::new(&mut elem).bytes(&[seed; 28]).unwrap();
+        minicbor::Encoder::new(&mut elem)
+            .bytes(&[seed; 28])
+            .unwrap();
         ids.push(elem);
     }
     let arg = wrap_just(&ids);

@@ -24,11 +24,14 @@ use std::path::{Path, PathBuf};
 ///
 /// Adding an entry here is the documented way to exclude a target. Removing a
 /// target from the matrix without adding it here fails this test.
-const DOCUMENTED_EXCLUSIONS: &[(&str, &str)] = &[(
-    "plutus_script_decode",
-    "upstream Aiken `uplc` and `pallas-codec` panic on malformed input; the \
-     in-house decoder is covered by dugite_uplc_program_decode",
-)];
+/// Empty, and that is the intended steady state.
+///
+/// The one entry that lived here was `plutus_script_decode`, excluded because
+/// upstream Aiken's `uplc` panicked on malformed input. #970 deleted the
+/// target outright: it fuzzed a third-party library dugite does not ship, so
+/// it could never have found a dugite defect. `dugite_uplc_program_decode`
+/// covers the decoder that actually runs in production.
+const DOCUMENTED_EXCLUSIONS: &[(&str, &str)] = &[];
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))

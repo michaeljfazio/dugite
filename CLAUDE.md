@@ -802,8 +802,10 @@ Network magic: Mainnet=764824073, Preview=2, Preprod=1
 
 ## Fuzzing
 
-59 declared libFuzzer targets in `fuzz/`, 58 in the nightly matrix
-(`plutus_script_decode` is deliberately excluded — upstream Aiken panics),
+60 declared libFuzzer targets in `fuzz/`, all 60 in the nightly matrix
+(no exclusions — `plutus_script_decode` was the only one, and #970 deleted it
+rather than excluding it: it fuzzed the third-party Aiken `uplc` crate, which
+dugite does not ship, so it could never have found a dugite defect),
 run by `.github/workflows/fuzz.yml`:
 Mon-Sat 1200s per target, Sunday 3600s, `workflow_dispatch` overrides.
 The short weekday budget is only sound because the corpus **persists**
