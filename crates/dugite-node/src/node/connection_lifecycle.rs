@@ -38,10 +38,14 @@
 //! that translates `GovernorAction` decisions into `PeerConnection` lifecycle calls.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+
+use tokio_util::sync::CancellationToken;
 
 /// Per-range fetch deadline: maximum time a single `BlockFetchClient::fetch_range()`
 /// call is allowed to run before being cancelled.
@@ -291,6 +295,7 @@ use dugite_storage::ChainDB;
 use super::networking::{ConnectionDirection, NodePeerManager};
 use super::peer_connection::{
     PeerConnection, PeerConnectionDirection, PeerConnectionError, ProtocolTaskFn,
+    ServerProtocolOutcome, ServerProtocolTaskFn,
 };
 use super::serve::ChainDBBlockProvider;
 use crate::metrics::NodeMetrics;
@@ -3845,12 +3850,20 @@ impl ConnectionLifecycleManager {
     /// Subscribes to block announcements and rollback announcements, then runs
     /// the ChainSync server loop — streaming blocks to downstream peers as
     /// they are produced or relayed.
-    fn make_chainsync_server_task(&self, addr: SocketAddr) -> ProtocolTaskFn {
+    fn make_chainsync_server_task(&self, addr: SocketAddr) -> ServerProtocolTaskFn {
         let block_provider = self.block_provider.clone();
-        let announcement_rx = self.block_announcement_tx.subscribe();
-        let rollback_rx = self.rollback_announcement_tx.subscribe();
+        // Capture the SENDERS, not receivers: each restart of the responder
+        // must subscribe afresh. Reusing a receiver held across a Hot->Warm
+        // demotion would replay every announcement buffered while the peer was
+        // not listening, and the first thing the re-armed server would do is
+        // serve blocks the peer has already seen.
+        let announcement_tx = self.block_announcement_tx.clone();
+        let rollback_tx = self.rollback_announcement_tx.clone();
 
-        Box::new(move |mut channel, cancel| {
+        Arc::new(move |mut channel, cancel: CancellationToken| {
+            let block_provider = block_provider.clone();
+            let announcement_rx = announcement_tx.subscribe();
+            let rollback_rx = rollback_tx.subscribe();
             Box::pin(async move {
                 let mut server =
                     dugite_network::protocol::chainsync::server::ChainSyncServer::new();
@@ -3858,15 +3871,19 @@ impl ConnectionLifecycleManager {
                 tokio::select! {
                     result = server.run(&mut channel, block_provider.as_ref(), announcement_rx, rollback_rx) => {
                         match result {
-                            Ok(()) => info!(%addr, "chainsync server task completed cleanly"),
-                            Err(e) => warn!(%addr, error = %e, "chainsync server task exited with error"),
+                            Ok(()) => {
+                                info!(%addr, "chainsync server: client sent MsgDone");
+                                ServerProtocolOutcome::ClientDone
+                            }
+                            Err(e) => ServerProtocolOutcome::Failed(e.to_string()),
                         }
                     }
                     _ = cancel.cancelled() => {
                         info!(%addr, "chainsync server task cancelled");
+                        ServerProtocolOutcome::Cancelled
                     }
                 }
-            })
+            }) as Pin<Box<dyn Future<Output = ServerProtocolOutcome> + Send>>
         })
     }
 
@@ -3874,23 +3891,28 @@ impl ConnectionLifecycleManager {
     ///
     /// Serves block data from ChainDB in response to `MsgRequestRange` from
     /// downstream peers.
-    fn make_blockfetch_server_task(&self, addr: SocketAddr) -> ProtocolTaskFn {
+    fn make_blockfetch_server_task(&self, addr: SocketAddr) -> ServerProtocolTaskFn {
         let block_provider = self.block_provider.clone();
 
-        Box::new(move |mut channel, cancel| {
+        Arc::new(move |mut channel, cancel: CancellationToken| {
+            let block_provider = block_provider.clone();
             Box::pin(async move {
                 tokio::select! {
                     result = dugite_network::protocol::blockfetch::server::BlockFetchServer::run(&mut channel, block_provider.as_ref()) => {
                         match result {
-                            Ok(()) => debug!(%addr, "blockfetch server completed"),
-                            Err(e) => debug!(%addr, "blockfetch server error: {e}"),
+                            Ok(()) => {
+                                debug!(%addr, "blockfetch server: client sent MsgClientDone");
+                                ServerProtocolOutcome::ClientDone
+                            }
+                            Err(e) => ServerProtocolOutcome::Failed(e.to_string()),
                         }
                     }
                     _ = cancel.cancelled() => {
                         debug!(%addr, "blockfetch server cancelled");
+                        ServerProtocolOutcome::Cancelled
                     }
                 }
-            })
+            }) as Pin<Box<dyn Future<Output = ServerProtocolOutcome> + Send>>
         })
     }
 
@@ -3901,12 +3923,15 @@ impl ConnectionLifecycleManager {
     /// the full Phase-1 + Phase-2 ledger pipeline (including IsValid tag
     /// verification), and adds only valid ones to the mempool.
     /// Tracks received/validated/rejected metrics.
-    fn make_txsubmission_server_task(&self, addr: SocketAddr) -> ProtocolTaskFn {
+    fn make_txsubmission_server_task(&self, addr: SocketAddr) -> ServerProtocolTaskFn {
         let mempool = self.mempool.clone();
         let metrics = self.metrics.clone();
         let tx_validator = self.tx_validator.clone();
 
-        Box::new(move |mut channel, cancel| {
+        Arc::new(move |mut channel, cancel: CancellationToken| {
+            let mempool = mempool.clone();
+            let metrics = metrics.clone();
+            let tx_validator = tx_validator.clone();
             Box::pin(async move {
                 let on_tx = {
                     let tx_mempool = mempool;
@@ -4013,22 +4038,26 @@ impl ConnectionLifecycleManager {
                 tokio::select! {
                     result = dugite_network::TxSubmissionServer::run(&mut channel, on_tx) => {
                         match result {
-                            Ok(stats) => debug!(
-                                %addr,
-                                tx_ids = stats.tx_ids_received,
-                                txs_received = stats.txs_received,
-                                accepted = stats.txs_accepted,
-                                rejected = stats.txs_rejected,
-                                "txsubmission2 server completed",
-                            ),
-                            Err(e) => debug!(%addr, "txsubmission2 server error: {e}"),
+                            Ok(stats) => {
+                                debug!(
+                                    %addr,
+                                    tx_ids = stats.tx_ids_received,
+                                    txs_received = stats.txs_received,
+                                    accepted = stats.txs_accepted,
+                                    rejected = stats.txs_rejected,
+                                    "txsubmission2 server: client done",
+                                );
+                                ServerProtocolOutcome::ClientDone
+                            }
+                            Err(e) => ServerProtocolOutcome::Failed(e.to_string()),
                         }
                     }
                     _ = cancel.cancelled() => {
                         debug!(%addr, "txsubmission2 server cancelled");
+                        ServerProtocolOutcome::Cancelled
                     }
                 }
-            })
+            }) as Pin<Box<dyn Future<Output = ServerProtocolOutcome> + Send>>
         })
     }
 
@@ -4036,21 +4065,25 @@ impl ConnectionLifecycleManager {
     ///
     /// Responds to `MsgKeepAlive` pings from downstream peers with
     /// `MsgKeepAliveResponse` pongs.
-    fn make_keepalive_server_task(&self, addr: SocketAddr) -> ProtocolTaskFn {
-        Box::new(move |mut channel, cancel| {
+    fn make_keepalive_server_task(&self, addr: SocketAddr) -> ServerProtocolTaskFn {
+        Arc::new(move |mut channel, cancel: CancellationToken| {
             Box::pin(async move {
                 tokio::select! {
                     result = dugite_network::KeepAliveServer::run(&mut channel) => {
                         match result {
-                            Ok(count) => debug!(%addr, count, "keepalive server completed"),
-                            Err(e) => debug!(%addr, "keepalive server error: {e}"),
+                            Ok(count) => {
+                                debug!(%addr, count, "keepalive server: client done");
+                                ServerProtocolOutcome::ClientDone
+                            }
+                            Err(e) => ServerProtocolOutcome::Failed(e.to_string()),
                         }
                     }
                     _ = cancel.cancelled() => {
                         debug!(%addr, "keepalive server cancelled");
+                        ServerProtocolOutcome::Cancelled
                     }
                 }
-            })
+            }) as Pin<Box<dyn Future<Output = ServerProtocolOutcome> + Send>>
         })
     }
 
@@ -4063,10 +4096,11 @@ impl ConnectionLifecycleManager {
     /// local root topology groups with `advertise: false` are excluded, matching
     /// Haskell's `NodeToNodeVersion` peer sharing filter that respects the
     /// `LocalRootPeers` `advertise` field (see `Ouroboros.Network.PeerSelection.State`).
-    fn make_peersharing_server_task(&self, addr: SocketAddr) -> ProtocolTaskFn {
+    fn make_peersharing_server_task(&self, addr: SocketAddr) -> ServerProtocolTaskFn {
         let peer_manager = self.peer_manager_for_servers.clone();
 
-        Box::new(move |mut channel, cancel| {
+        Arc::new(move |mut channel, cancel: CancellationToken| {
+            let peer_manager = peer_manager.clone();
             Box::pin(async move {
                 // Snapshot only advertisable connected peer addresses at task start.
                 // Peers in local root groups with `advertise: false` are excluded so
@@ -4082,15 +4116,19 @@ impl ConnectionLifecycleManager {
                 tokio::select! {
                     result = dugite_network::protocol::peersharing::server::PeerSharingServer::run(&mut channel, &peers) => {
                         match result {
-                            Ok(()) => debug!(%addr, "peersharing server completed"),
-                            Err(e) => debug!(%addr, "peersharing server error: {e}"),
+                            Ok(()) => {
+                                debug!(%addr, "peersharing server: client done");
+                                ServerProtocolOutcome::ClientDone
+                            }
+                            Err(e) => ServerProtocolOutcome::Failed(e.to_string()),
                         }
                     }
                     _ = cancel.cancelled() => {
                         debug!(%addr, "peersharing server cancelled");
+                        ServerProtocolOutcome::Cancelled
                     }
                 }
-            })
+            }) as Pin<Box<dyn Future<Output = ServerProtocolOutcome> + Send>>
         })
     }
 

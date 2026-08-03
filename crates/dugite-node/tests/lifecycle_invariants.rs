@@ -300,3 +300,294 @@ fn mux_handle_empty_all_protocols_return_none() {
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #980 — responder (server-side) mini-protocol termination policy
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The tests above cover the INITIATOR half of Hot→Warm recovery. The responder
+// half had no equivalent, and that gap was issue #980: dugite's N2N ChainSync
+// server task logged its return value and exited, nothing observed the handle,
+// and the mux silently discards frames for a route whose receiver is gone. A
+// downstream cardano-node was left on a live connection where one mini-protocol
+// answered nothing, forever, with no error and no disconnect.
+//
+// The trigger is not exotic. cardano-node sends ChainSync `MsgDone` on every
+// Hot→Warm demotion (`deactivatePeerConnection`) and opens a fresh ChainSync
+// session on the SAME bearer when it re-promotes. dugite's server returned
+// `Ok(())` and the route was gone for the life of the connection.
+//
+// Upstream policy, which these two tests pin (ouroboros-network
+// `c45735a56c567fa977969173d18943bac6bb3821`):
+//
+//   network-mux/src/Network/Mux.hs
+//     | MiniProtocolException MiniProtocolNum MiniProtocolDir SomeException
+//       -- ^ A mini-protocol thread terminated with an exception. We always
+//       -- respond by terminating the whole mux.
+//
+//   Ouroboros/Network/InboundGovernor.hs
+//     Right _ -> runResponder tMux mpd >>= ...   -- TrResponderRestarted
+//
+// i.e. error ⇒ kill the connection, clean exit ⇒ re-arm the route. Upstream
+// cannot represent the third state dugite was in: its responders are typed so
+// that returning mid-protocol is not constructible, and an orphaned ingress
+// queue eventually overruns and kills the mux anyway.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use dugite_network::protocol::PROTOCOL_N2N_PEERSHARING;
+
+/// Stand up a loopback TCP pair with a responder-side mux on the local end and
+/// a raw initiator-side mux on the remote end, and return
+/// (connection, remote chainsync channel).
+async fn server_side_pair() -> (
+    dugite_node::node::peer_connection::PeerConnection,
+    dugite_network::mux::channel::MuxChannel,
+) {
+    use dugite_node::node::peer_connection::PeerConnection;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let listen_addr = listener.local_addr().expect("listen addr");
+
+    let accept = tokio::spawn(async move { listener.accept().await });
+    let client_stream = tokio::net::TcpStream::connect(listen_addr)
+        .await
+        .expect("connect");
+    let (server_stream, _) = accept.await.expect("join").expect("accept");
+
+    // Local (dugite) end: responder channels for all five server protocols.
+    let mut srv_mux = Mux::new(
+        dugite_network::TcpBearer::new(server_stream).expect("bearer"),
+        false,
+    );
+    let cs = srv_mux.subscribe(PROTOCOL_N2N_CHAINSYNC, Direction::ResponderDir, 512 * 1024);
+    let bf = srv_mux.subscribe(
+        PROTOCOL_N2N_BLOCKFETCH,
+        Direction::ResponderDir,
+        24 * 1024 * 1024,
+    );
+    let tx = srv_mux.subscribe(
+        PROTOCOL_N2N_TXSUBMISSION,
+        Direction::ResponderDir,
+        8 * 1024 * 1024,
+    );
+    let ka = srv_mux.subscribe(PROTOCOL_N2N_KEEPALIVE, Direction::ResponderDir, 65536);
+    let ps = srv_mux.subscribe(PROTOCOL_N2N_PEERSHARING, Direction::ResponderDir, 65536);
+    let srv_handle = srv_mux.take_handle();
+    let srv_task = tokio::spawn(async move { srv_mux.run().await });
+
+    let local_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let conn = PeerConnection::fake_with_server_channels(
+        listen_addr,
+        local_addr,
+        cs,
+        bf,
+        tx,
+        ka,
+        ps,
+        srv_task,
+        srv_handle,
+    );
+
+    // Remote (peer) end: one initiator channel to drive ChainSync.
+    let mut cli_mux = Mux::new(
+        dugite_network::TcpBearer::new(client_stream).expect("bearer"),
+        true,
+    );
+    let cli_cs = cli_mux.subscribe(PROTOCOL_N2N_CHAINSYNC, Direction::InitiatorDir, 512 * 1024);
+    tokio::spawn(async move { cli_mux.run().await });
+
+    (conn, cli_cs)
+}
+
+/// Scripted responder: echoes `PING`→`PONG` and treats `DONE` as the client's
+/// `MsgDone`, counting how many times it has been started.
+fn scripted_responder(
+    starts: Arc<AtomicUsize>,
+    fail_instead: bool,
+) -> dugite_node::node::peer_connection::ServerProtocolTaskFn {
+    use dugite_node::node::peer_connection::ServerProtocolOutcome;
+    Arc::new(
+        move |mut channel, cancel: tokio_util::sync::CancellationToken| {
+            let starts = starts.clone();
+            Box::pin(async move {
+                starts.fetch_add(1, Ordering::SeqCst);
+                loop {
+                    tokio::select! {
+                        msg = channel.recv() => {
+                            let Ok(bytes) = msg else {
+                                return ServerProtocolOutcome::Failed("bearer closed".into());
+                            };
+                            if bytes == b"\x44DONE" {
+                                if fail_instead {
+                                    return ServerProtocolOutcome::Failed("scripted failure".into());
+                                }
+                                return ServerProtocolOutcome::ClientDone;
+                            }
+                            if channel.send(b"\x44PONG".to_vec()).await.is_err() {
+                                return ServerProtocolOutcome::Failed("send failed".into());
+                            }
+                        }
+                        _ = cancel.cancelled() => return ServerProtocolOutcome::Cancelled,
+                    }
+                }
+            })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = ServerProtocolOutcome> + Send>,
+                >
+        },
+    )
+}
+
+fn idle_responder() -> dugite_node::node::peer_connection::ServerProtocolTaskFn {
+    use dugite_node::node::peer_connection::ServerProtocolOutcome;
+    Arc::new(move |_ch, cancel: tokio_util::sync::CancellationToken| {
+        Box::pin(async move {
+            cancel.cancelled().await;
+            ServerProtocolOutcome::Cancelled
+        })
+            as std::pin::Pin<Box<dyn std::future::Future<Output = ServerProtocolOutcome> + Send>>
+    })
+}
+
+/// #980: after the client's `MsgDone`, the responder must be RE-ARMED on the
+/// same connection — a fresh request has to be answered.
+///
+/// Before the fix the second `PING` produced nothing at all: the task had
+/// exited, the mux discarded the frame, and the peer waited forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn responder_is_rearmed_after_client_msgdone() {
+    let (mut conn, mut peer) = server_side_pair().await;
+    let starts = Arc::new(AtomicUsize::new(0));
+
+    conn.start_server_protocols(
+        scripted_responder(starts.clone(), false),
+        idle_responder(),
+        idle_responder(),
+        idle_responder(),
+        idle_responder(),
+    )
+    .expect("start server protocols");
+
+    // First session: request/response works.
+    peer.send(b"\x44PING".to_vec()).await.expect("send ping");
+    let reply = tokio::time::timeout(Duration::from_secs(5), peer.recv())
+        .await
+        .expect("first PONG timed out")
+        .expect("first PONG");
+    assert_eq!(reply, b"\x44PONG");
+
+    // The client ends the mini-protocol, exactly as cardano-node does on a
+    // Hot->Warm demotion.
+    peer.send(b"\x44DONE".to_vec()).await.expect("send done");
+
+    // ...and later starts a fresh session on the SAME bearer.
+    let mut got_second = false;
+    for _ in 0..20 {
+        if peer.send(b"\x44PING".to_vec()).await.is_err() {
+            break;
+        }
+        if let Ok(Ok(r)) = tokio::time::timeout(Duration::from_millis(500), peer.recv()).await {
+            assert_eq!(r, b"\x44PONG");
+            got_second = true;
+            break;
+        }
+    }
+
+    assert!(
+        got_second,
+        "responder was never re-armed after the client's MsgDone — the peer got \
+         silence on a live connection, which is #980"
+    );
+    assert!(
+        starts.load(Ordering::SeqCst) >= 2,
+        "the responder factory must be invoked again (InboundGovernor \
+         TrResponderRestarted), got {} start(s)",
+        starts.load(Ordering::SeqCst)
+    );
+
+    conn.shutdown().await;
+}
+
+/// #980: a responder that FAILS must take the whole connection down, not just
+/// its own route.
+///
+/// Haskell: "A mini-protocol thread terminated with an exception. We always
+/// respond by terminating the whole mux." Silence is the one outcome that is
+/// never acceptable — a peer that sees a disconnect reconnects, a peer that
+/// sees silence waits forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn responder_failure_tears_down_the_whole_connection() {
+    let (mut conn, mut peer) = server_side_pair().await;
+    let starts = Arc::new(AtomicUsize::new(0));
+    let cancel = conn.cancel_token_for_test();
+
+    conn.start_server_protocols(
+        scripted_responder(starts.clone(), true),
+        idle_responder(),
+        idle_responder(),
+        idle_responder(),
+        idle_responder(),
+    )
+    .expect("start server protocols");
+
+    peer.send(b"\x44PING".to_vec()).await.expect("send ping");
+    let reply = tokio::time::timeout(Duration::from_secs(5), peer.recv())
+        .await
+        .expect("PONG timed out")
+        .expect("PONG");
+    assert_eq!(reply, b"\x44PONG");
+
+    // Trigger the scripted failure.
+    peer.send(b"\x44DONE".to_vec()).await.expect("send done");
+
+    tokio::time::timeout(Duration::from_secs(5), cancel.cancelled())
+        .await
+        .expect(
+            "a failing responder must cancel the CONNECTION token; leaving the \
+             mux alive with one dead route is the state upstream cannot represent",
+        );
+
+    // The token alone proves nothing about what the PEER sees. Nothing in the
+    // node aborts the mux when the connection token fires — `shutdown()` does
+    // those as two separate steps and `is_alive()` reads only the mux handle —
+    // so a fix that cancelled the token and stopped there would leave the
+    // bearer and TCP socket open, the connection still "alive" to the reaper,
+    // and the peer still receiving nothing. That is a worse silence than the
+    // one being fixed, and it would have passed a token-only assertion.
+    //
+    // So assert the observable outcome instead: the mux is dead and the peer's
+    // channel is closed, i.e. it sees a disconnect and can reconnect.
+    let mut alive_after = true;
+    for _ in 0..50 {
+        if !conn.is_alive() {
+            alive_after = false;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        !alive_after,
+        "the mux must be torn down, not merely signalled — upstream's policy is \
+         `we always respond by terminating the whole mux`"
+    );
+
+    let peer_sees_close = tokio::time::timeout(Duration::from_secs(5), peer.recv()).await;
+    assert!(
+        matches!(peer_sees_close, Ok(Err(_))),
+        "the downstream peer must observe the connection closing, not silence; \
+         got {peer_sees_close:?}"
+    );
+
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        1,
+        "a failed responder must NOT be restarted — only a clean client MsgDone re-arms"
+    );
+
+    conn.shutdown().await;
+}
