@@ -56,7 +56,31 @@ ALL_CATEGORIES=(
     # "already registered" — they need that state to exist. Independent of
     # governance actions, so it does not perturb 06/10/12/14.
     16-cert-negatives
+    # ScriptContext-inspecting validators + the ExUnits bracket (#969). Each
+    # script locks and spends its own UTxO and touches no shared state, so the
+    # position is not load-bearing; last keeps the governance ordering intact.
+    17-context-inspecting
 )
+
+# A category on disk but NOT in the array above simply never runs, and a green
+# summary looks identical either way — this is how 17-context-inspecting was
+# added, registered in denominators.json as 121 scripts, and then quietly
+# skipped by a full run that reported 115/115 with 0 failures. Same shape as
+# #971, where eleven fuzz targets sat declared-but-dead for 2.5 months because
+# they were not in the CI matrix.
+_declared=" ${ALL_CATEGORIES[*]} "
+for _d in "$SCRIPT_DIR"/[0-9][0-9]-*/; do
+    _name="$(basename "$_d")"
+    [ "$_name" = "09-cli-parity" ] && continue   # driven by its own run.sh
+    case "$_declared" in
+        *" $_name "*) ;;
+        *)
+            echo "FATAL: tx-zoo category '$_name' exists on disk but is not in" >&2
+            echo "       ALL_CATEGORIES, so a full run would silently skip it." >&2
+            exit 2
+            ;;
+    esac
+done
 
 usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; }
 
