@@ -42,6 +42,10 @@
 // no `crate::` references at all, so compiling the file directly costs nothing
 // and keeps the fuzz workspace buildable everywhere. `dugite-node`'s own
 // lib.rs uses the same `#[path]` technique for the N2C encoder.
+// These files are `pub` in dugite-node, but inside a fuzz binary they are a
+// private module, so every item this target does not call trips dead_code.
+// That is an artefact of the inclusion, not a finding.
+#[allow(dead_code)]
 #[path = "../../crates/dugite-node/src/genesis.rs"]
 mod genesis;
 

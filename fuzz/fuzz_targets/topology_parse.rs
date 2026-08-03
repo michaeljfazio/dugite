@@ -21,6 +21,10 @@
 
 // Compiled in directly rather than via the `dugite-node` crate — see the note
 // in genesis_parse.rs. `topology.rs` has no `crate::` references.
+// These files are `pub` in dugite-node, but inside a fuzz binary they are a
+// private module, so every item this target does not call trips dead_code.
+// That is an artefact of the inclusion, not a finding.
+#[allow(dead_code)]
 #[path = "../../crates/dugite-node/src/topology.rs"]
 mod topology;
 
