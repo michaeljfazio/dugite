@@ -18,7 +18,7 @@
     "Bump a number here only together with on-disk evidence of the new count."
   ],
   "tx_zoo": {
-    "expected_scripts": 105,
+    "expected_scripts": 110,
     "$comment": "All tx-zoo/NN-*/[0-9]*.sh EXCLUDING 09-cli-parity (counted separately).",
     "per_category": {
       "01-bookkeeping": 8,
@@ -34,13 +34,14 @@
       "12-post-enactment": 1,
       "13-script-purposes": 9,
       "14-gov-negatives": 6,
-      "15-asset-lattice": 5
+      "15-asset-lattice": 5,
+      "16-cert-negatives": 5
     }
   },
   "cli_parity": {
     "expected_queries": 22,
     "expected_rows": 25,
-    "$comment": "expected_queries = tx-zoo/09-cli-parity/09*.sh on disk. expected_rows = terminal ROWS in cli-parity.csv, which is NOT the same number: three scripts emit a second row each — two from parity_assert_pool_filter, the direct (non-comparative) check added with #963 that a pool-scoped query answers for exactly the pool it was asked about, and 09h, which compares the EPOCH NONCE separately from the protocol version (#964). run.sh gates on expected_rows; test-denominators.sh derives BOTH from disk so adding either a script or an extra assertion without bumping the pin fails rather than silently widening the gate. EQUAL+DIVERGENT+COMPARED+SKIP+ERROR must sum to expected_rows. Env-skips are counted as their own class and never folded into EQUAL."
+    "$comment": "expected_queries = tx-zoo/09-cli-parity/09*.sh on disk. expected_rows = terminal ROWS in cli-parity.csv, which is NOT the same number: three scripts emit a second row each \u2014 two from parity_assert_pool_filter, the direct (non-comparative) check added with #963 that a pool-scoped query answers for exactly the pool it was asked about, and 09h, which compares the EPOCH NONCE separately from the protocol version (#964). run.sh gates on expected_rows; test-denominators.sh derives BOTH from disk so adding either a script or an extra assertion without bumping the pin fails rather than silently widening the gate. EQUAL+DIVERGENT+COMPARED+SKIP+ERROR must sum to expected_rows. Env-skips are counted as their own class and never folded into EQUAL."
   },
   "n2n_adversarial": {
     "expected_scripts": 7,
@@ -72,7 +73,8 @@
       "12-post-enactment": "Only meaningful once a governance action has actually ENACTED, so it depends on 10 having run and on global chain state. Same reason as 10.",
       "13-script-purposes": "The guarding scripts are fixed (always-true/false V3, one native), so their hashes are deterministic and BOTH parity batches would share one stake credential and one DRep credential. Batch 1 registers and then deregisters it, so batch 2 acts on state batch 1 already mutated \u2014 the same class as 05g/05h. These scripts instead demand Haskell confirmation directly: they use wait_all_strict, which requires all three observers and never soft-passes on 'cbp lagging'.",
       "14-gov-negatives": "Governance negatives assert rejection CLASSES against chain-global gov state (live actions, registered DReps). Both batches would target the same actions, so batch 2's result depends on what batch 1 did \u2014 same class as 10/12. The rejection class is already compared against cardano-node directly by each script.",
-      "15-asset-lattice": "Mint policies are derived from the batch's own payment key, so the two parity batches mint under DIFFERENT policy ids and the resulting values are not comparable cell-for-cell. The properties under test (encodeMap definite/indefinite boundaries at 23/24/256, multi-policy values, mint+burn) are wire-shape properties already checked against cardano-node by zoo_wait_all_observers on every script."
+      "15-asset-lattice": "Mint policies are derived from the batch's own payment key, so the two parity batches mint under DIFFERENT policy ids and the resulting values are not comparable cell-for-cell. The properties under test (encodeMap definite/indefinite boundaries at 23/24/256, multi-policy values, mint+burn) are wire-shape properties already checked against cardano-node by zoo_wait_all_observers on every script.",
+      "16-cert-negatives": "Reject-REASON negatives asserted directly against the constructor name by expect_cert_rejection, which is a stronger check than the parity oracle's accept/reject cell. They also mutate shared credential state (16a/16d depend on wallet-a's stake key and drep-1 already being registered), so a second parity batch would act on state the first batch already changed - the same class as 05g/05h."
     },
     "excluded_scripts": {
       "05g-cc-hot-key-authorization": "Constitutional committee is seated at genesis and is devnet-global. Batch 1 resigns cc-1, so batch 2 correctly receives ConwayCommitteeHasPreviouslyResigned. Giving batch 2 its own committee requires an UpdateCommittee governance action (2+ epoch boundaries). Verified live 2026-08-02, not a dugite defect.",

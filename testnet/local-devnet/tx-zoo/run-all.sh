@@ -51,6 +51,11 @@ ALL_CATEGORIES=(
     # Multi-asset / size lattice (#961). Independent of governance state, so
     # position is not load-bearing; last keeps the governance ordering intact.
     15-asset-lattice
+    # Certificate-level reject-REASON negatives (#979). Runs after 05 (which
+    # registers drep-1 and the wallet stake key) because 16a/16d assert on
+    # "already registered" — they need that state to exist. Independent of
+    # governance actions, so it does not perturb 06/10/12/14.
+    16-cert-negatives
 )
 
 usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; }
