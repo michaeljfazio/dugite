@@ -9,6 +9,7 @@
 - [#805/806/807/813 robustness batch](issues-805-806-807-813-batch-fix.md) — UtxoStore crash-not-diverge on LSM errors, LedgerSeq/DiffSeq desync guard, pp_future PPUP diagnostic
 
 ## Live-Apply Rollback Investigations
+- [LedgerSeq genesis-anchor overlay wedge (2026-08-03)](ledgerseq-genesis-anchor-overlay-wedge.md) — v2.5.0 quarantine boot leaves seq anchored at GENESIS (PV6/d=1); first fork switch installs chimera pparams via rollback_via_seq → TPraos overlay falsely rejects canonical Conway block → invalid_cache wedge. Overlay is TPraos-ONLY in Haskell (oracle-pinned).
 - [DiffSeq clear vs hardened fallback (2026-07-08)](rollback-diffseq-clear-vs-caller-fallback-hardened.md) — real root cause = vestigial `diff_seq.clear()` in epoch.rs defeats already-k-bounded `push_bounded` window; node-level snapshot-reload fallback is ALREADY hardened (refutes naive "reloads latest snapshot" theory) — fix is to stop clearing, not to further harden the fallback
 
 ## UPLC CEK Machine

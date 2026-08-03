@@ -35,9 +35,7 @@ fuzz_target!(|data: &[u8]| {
     let secondary_bytes = &data[1..];
 
     // Write the fuzz bytes as the secondary index file.
-    let secondary_path = tempdir
-        .path()
-        .join(format!("{chunk_num:05}.secondary"));
+    let secondary_path = tempdir.path().join(format!("{chunk_num:05}.secondary"));
     if std::fs::write(&secondary_path, secondary_bytes).is_err() {
         return;
     }

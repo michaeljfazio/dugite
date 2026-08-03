@@ -90,6 +90,25 @@ pub struct LedgerDelta {
     /// Block number.
     pub block_no: BlockNo,
 
+    /// The ledger tip this delta was computed against — i.e. the chain point
+    /// of the block's parent, captured before `apply_block_impl` ran.
+    ///
+    /// [`LedgerSeq::push`] compares this against [`LedgerSeq::tip_point`] to
+    /// verify the delta actually chains onto the sequence. Without that check
+    /// a caller that advanced `ledger_state` in bulk without re-anchoring
+    /// (startup replay, rollback slow path) silently produces a sequence whose
+    /// reconstruction — anchor + deltas — is a chimera: current in every field
+    /// a delta touches, stale in every field it does not. See #985.
+    ///
+    /// The parent point, not the parent *hash*, because it must compare equal
+    /// at the Origin seam: on a genuine sync from genesis the seq's tip and
+    /// the pre-apply ledger tip are both `Origin`, whereas the first block's
+    /// `prev_hash` is the genesis hash and would false-positive.
+    ///
+    /// `None` on deltas not produced by `apply_block_with_delta` (test
+    /// fixtures) — `push` then skips the check, preserving prior behaviour.
+    pub parent_point: Option<Point>,
+
     /// UTxO changes: inserts (new outputs) and deletes (consumed outputs).
     pub utxo_diff: UtxoDiff,
 
@@ -281,6 +300,7 @@ impl LedgerDelta {
             slot,
             hash,
             block_no,
+            parent_point: None,
             utxo_diff: UtxoDiff::new(),
             delegation_changes: Vec::new(),
             pool_changes: Vec::new(),
@@ -628,6 +648,37 @@ impl Default for BlockFieldsDelta {
 /// 3. The state at delta index `i` equals the anchor with deltas `[0..=i]`
 ///    applied.
 /// 4. `anchor_point` matches `anchor.tip.point`.
+/// 5. `deltas[0]` chains onto `anchor_point`, and `deltas[i+1]` onto
+///    `deltas[i]` — i.e. the window is a contiguous chain rooted at the
+///    anchor. This is what makes invariant 3 *meaningful* rather than merely
+///    definitional: without it, "apply the deltas to the anchor" still
+///    produces a state, just not the state at any real chain point.
+///
+///    # Why dugite needs a check where Haskell does not
+///
+///    Upstream holds this by CONSTRUCTION, not by enforcement. Contrary to a
+///    natural guess, `AnchoredSeq` does *not* validate chaining — it has no
+///    hash-chain concept at all, and its `(:>)` appends unconditionally
+///    (`ouroboros-network` `Ouroboros/Network/AnchoredSeq.hs`). The block-level
+///    `isValidSuccessorOf` check lives one layer up, on `AnchoredFragment`.
+///    What keeps `LedgerDB.V2.LedgerSeq` coherent is that `reapplyBlock`
+///    derives the new state from `currentHandle db` — the head of the very
+///    sequence being extended — and `extend` is the only way in. An
+///    incoherent element is therefore unrepresentable.
+///
+///    dugite's deltas are computed against the live `LedgerState`, not
+///    against the seq head, so the two can drift apart whenever some path
+///    advances the ledger without re-anchoring. That is a structural
+///    difference, and it is what #985 exploited. `push` cannot repair the
+///    drift (it holds a delta, not a state), so it *detects*: a delta whose
+///    [`LedgerDelta::parent_point`] disagrees with [`Self::tip_point`] sets
+///    [`Self::incoherent`], which makes [`Self::find_rollback_n`] decline
+///    every rollback and routes callers to their snapshot slow path.
+///
+///    This mirrors upstream's failure *posture* rather than its mechanism:
+///    `openStateRefAtTarget` answers a rollback it cannot satisfy with
+///    `PointTooOld` / `PointNotOnChain`, and a bad forker splice raises
+///    `CriticalInvariantViolation`. Loud and safe, never a silent chimera.
 pub struct LedgerSeq {
     /// Full ledger state at the immutable tip (the anchor point).
     ///
@@ -681,6 +732,19 @@ pub struct LedgerSeq {
     /// is restored.  Default `false` so existing callers without an
     /// at-tip toggle keep their current behaviour.
     catchup_mode: bool,
+
+    /// Set when [`Self::push`] observes a delta that does not chain onto the
+    /// current tip (invariant 5 violated).
+    ///
+    /// While set, [`Self::find_rollback_n`] returns `None` for every target,
+    /// so `rollback_via_seq` declines and the caller falls through to its
+    /// snapshot-reload slow path — slower, but reconstructed from a state
+    /// that was actually written at that point rather than from an anchor the
+    /// deltas were never computed against.
+    ///
+    /// Cleared by [`Self::reset_anchor`], which re-establishes the invariant
+    /// by definition. See #985.
+    incoherent: bool,
 }
 
 impl LedgerSeq {
@@ -706,6 +770,7 @@ impl LedgerSeq {
             checkpoint_interval,
             k,
             catchup_mode: false,
+            incoherent: false,
         }
     }
 
@@ -852,6 +917,35 @@ impl LedgerSeq {
     /// `checkpoint_interval - 1` (i.e. every N blocks), a full checkpoint
     /// is stored.
     pub fn push(&mut self, delta: LedgerDelta) {
+        // #985 invariant 5: the delta must chain onto the current tip. It is
+        // checked BEFORE `advance_anchor` below, because advancing folds a
+        // delta into the anchor and would move the tip we are comparing to.
+        //
+        // A mismatch means some caller advanced `ledger_state` in bulk without
+        // calling `reanchor_ledger_seq` — the anchor is now a state these
+        // deltas were never computed against, and reconstructing from it would
+        // yield a chimera (see the type-level docs). We cannot repair that
+        // here: `push` has a delta, not a state. So record it and let
+        // `find_rollback_n` decline, which routes callers to the snapshot slow
+        // path.
+        if let Some(parent) = &delta.parent_point {
+            let tip = self.tip_point();
+            if parent != &tip && !self.incoherent {
+                self.incoherent = true;
+                tracing::error!(
+                    seq_tip = ?tip,
+                    delta_parent = ?parent,
+                    delta_slot = delta.slot.0,
+                    anchor_slot = self.anchor_point.slot().map(|s| s.0).unwrap_or(0),
+                    deltas = self.deltas.len(),
+                    "LedgerSeq incoherent: delta does not chain onto the sequence tip. \
+                     Some path advanced the ledger without re-anchoring the LedgerSeq. \
+                     Rollbacks will use the snapshot slow path until the next re-anchor. \
+                     This is a bug — please report it with the surrounding log context (#985)."
+                );
+            }
+        }
+
         // Enforce the k-block volatile window by advancing the anchor when full.
         while self.deltas.len() >= self.k as usize {
             self.advance_anchor();
@@ -915,6 +1009,11 @@ impl LedgerSeq {
     /// - `target_point` matches some `deltas[i]` → `Some(deltas.len() - i - 1)`.
     /// - Otherwise → `None`.
     pub fn find_rollback_n(&self, target_point: &Point) -> Option<usize> {
+        // #985: an incoherent window cannot reconstruct any state correctly.
+        // Decline so the caller takes its snapshot slow path.
+        if self.incoherent {
+            return None;
+        }
         if &self.anchor_point == target_point {
             return Some(self.deltas.len());
         }
@@ -975,12 +1074,33 @@ impl LedgerSeq {
     }
 
     /// Replace the anchor with a new full state (e.g. after loading a
-    /// snapshot from disk).  Clears all volatile deltas and checkpoints.
+    /// snapshot from disk, or after a bulk ledger advance).  Clears all
+    /// volatile deltas and checkpoints.
+    ///
+    /// **Every path that mutates `ledger_state` in bulk without pushing the
+    /// corresponding deltas must call this** — startup replay, the rollback
+    /// snapshot slow path, the gap-bridge. Skipping it leaves the anchor at a
+    /// state the subsequent deltas were never computed against, which is the
+    /// #985 wedge. Node callers should go through
+    /// `Node::reanchor_ledger_seq`, which also logs the transition.
+    ///
+    /// Re-establishes invariant 5 by definition (an empty window trivially
+    /// chains onto its anchor), so it also clears [`Self::incoherent`].
     pub fn reset_anchor(&mut self, new_anchor: LedgerState) {
         self.anchor_point = new_anchor.tip.point.clone();
         *self.anchor = new_anchor;
         self.deltas.clear();
         self.checkpoints.clear();
+        self.incoherent = false;
+    }
+
+    /// Whether the volatile window has been observed to violate invariant 5
+    /// (a delta that does not chain onto the tip).
+    ///
+    /// While `true`, [`Self::find_rollback_n`] declines every rollback. Cleared
+    /// by [`Self::reset_anchor`]. See #985.
+    pub fn is_incoherent(&self) -> bool {
+        self.incoherent
     }
 
     /// Return a reference to all deltas (oldest first).  Used by the
@@ -2736,6 +2856,214 @@ mod tests {
             seq.tip_state().certs.reward_accounts.get(&cred).copied(),
             Some(Lovelace(800)),
             "tip must reflect the most recent reward_accounts snapshot (800)"
+        );
+    }
+
+    // ── #985: invariant 5 (the window chains onto its anchor) ────────────────
+
+    /// A delta as the apply path produces one: carrying the tip it was
+    /// computed against.
+    fn make_chained_delta(slot: u64, hash_byte: u8, parent: Point) -> LedgerDelta {
+        let mut d = make_delta(slot, hash_byte, 0);
+        d.parent_point = Some(parent);
+        d
+    }
+
+    /// A state shaped like the one `init_fresh_ledger` produces on preview:
+    /// PV 6, d = 1/1, tip at Origin. This is what the LedgerSeq was left
+    /// anchored at after a SNAPSHOT_VERSION quarantine boot.
+    fn make_genesis_like_anchor() -> LedgerState {
+        let mut s = make_anchor();
+        s.epochs.protocol_params.protocol_version_major = 6;
+        s.epochs.protocol_params.d = dugite_primitives::transaction::Rational {
+            numerator: 1,
+            denominator: 1,
+        };
+        s.tip.point = Point::Origin;
+        s
+    }
+
+    #[test]
+    fn contiguous_chain_never_trips_the_coherence_guard() {
+        let mut seq = LedgerSeq::with_defaults(make_anchor(), 2160);
+        // anchor is at Origin, so the first delta's parent is Origin.
+        seq.push(make_chained_delta(1, 1, Point::Origin));
+        seq.push(make_chained_delta(
+            2,
+            2,
+            Point::Specific(SlotNo(1), make_hash(1)),
+        ));
+        seq.push(make_chained_delta(
+            3,
+            3,
+            Point::Specific(SlotNo(2), make_hash(2)),
+        ));
+        assert!(
+            !seq.is_incoherent(),
+            "a properly chained window must not be flagged"
+        );
+        assert_eq!(
+            seq.find_rollback_n(&Point::Specific(SlotNo(1), make_hash(1))),
+            Some(2),
+            "a coherent window must still serve rollbacks"
+        );
+    }
+
+    /// Guards the false positive this check could easily have had: syncing
+    /// from genesis, the seq anchor and the pre-apply ledger tip are BOTH
+    /// `Origin`, while the first block's `prev_hash` is the genesis hash.
+    /// Comparing parent *points* is what makes this case coherent; comparing
+    /// parent hashes would have flagged every fresh sync.
+    #[test]
+    fn fresh_sync_from_origin_is_coherent() {
+        let mut seq = LedgerSeq::with_defaults(make_anchor(), 2160);
+        seq.push(make_chained_delta(0, 9, Point::Origin));
+        assert!(!seq.is_incoherent());
+    }
+
+    #[test]
+    fn delta_that_does_not_chain_marks_the_seq_incoherent() {
+        let mut seq = LedgerSeq::with_defaults(make_genesis_like_anchor(), 2160);
+        // The live ledger has replayed to a Conway tip; this delta was computed
+        // against it, not against the seq's Origin anchor.
+        seq.push(make_chained_delta(
+            119_084_816,
+            0xAB,
+            Point::Specific(SlotNo(119_084_815), make_hash(0xAA)),
+        ));
+        assert!(
+            seq.is_incoherent(),
+            "a delta whose parent is not the seq tip must be detected"
+        );
+    }
+
+    #[test]
+    fn incoherent_seq_declines_every_rollback() {
+        let mut seq = LedgerSeq::with_defaults(make_genesis_like_anchor(), 2160);
+        seq.push(make_chained_delta(
+            100,
+            0xAB,
+            Point::Specific(SlotNo(99), make_hash(0xAA)),
+        ));
+        seq.push(make_chained_delta(
+            101,
+            0xAC,
+            Point::Specific(SlotNo(100), make_hash(0xAB)),
+        ));
+        assert!(seq.is_incoherent());
+
+        // Every target is declined — including ones that ARE present in the
+        // window, and the anchor point itself. The window may be internally
+        // contiguous; it is the anchor seam that is broken, and nothing
+        // reconstructed across it can be trusted.
+        assert_eq!(
+            seq.find_rollback_n(&Point::Specific(SlotNo(100), make_hash(0xAB))),
+            None
+        );
+        assert_eq!(seq.find_rollback_n(&Point::Origin), None);
+    }
+
+    #[test]
+    fn reset_anchor_clears_incoherence() {
+        let mut seq = LedgerSeq::with_defaults(make_genesis_like_anchor(), 2160);
+        seq.push(make_chained_delta(
+            100,
+            0xAB,
+            Point::Specific(SlotNo(99), make_hash(0xAA)),
+        ));
+        assert!(seq.is_incoherent());
+
+        // This is what `Node::reanchor_ledger_seq` does after a bulk advance.
+        let mut recovered = make_anchor();
+        recovered.epochs.protocol_params.protocol_version_major = 11;
+        recovered.tip.point = Point::Specific(SlotNo(119_084_815), make_hash(0xAA));
+        seq.reset_anchor(recovered);
+
+        assert!(!seq.is_incoherent(), "re-anchoring restores invariant 5");
+        assert_eq!(
+            seq.find_rollback_n(&Point::Specific(SlotNo(119_084_815), make_hash(0xAA))),
+            Some(0),
+            "and rollbacks work again"
+        );
+    }
+
+    /// The mechanism of #985, stated as an assertion: reconstructing from a
+    /// stale anchor yields a state that is CURRENT in every field a delta
+    /// touches and STALE in every field none does.
+    ///
+    /// The protocol version is the field that mattered — stale at 6 while the
+    /// tip says slot 119M — because `validate_peer_header_full` read it to
+    /// decide whether to run the TPraos overlay check on a Conway block.
+    #[test]
+    fn reconstruction_from_a_stale_anchor_is_a_chimera() {
+        let mut seq = LedgerSeq::with_defaults(make_genesis_like_anchor(), 2160);
+        seq.push(make_chained_delta(
+            119_084_816,
+            0xAB,
+            Point::Specific(SlotNo(119_084_815), make_hash(0xAA)),
+        ));
+
+        let reconstructed = seq.tip_state();
+        assert_eq!(
+            reconstructed.tip.point,
+            Point::Specific(SlotNo(119_084_816), make_hash(0xAB)),
+            "delta-tracked fields are current — which is why the forecast-horizon \
+             check passed and nothing upstream noticed"
+        );
+        assert_eq!(
+            reconstructed.epochs.protocol_params.protocol_version_major, 6,
+            "pparams are whatever the anchor held — genesis PV 6 on a PV 11 chain"
+        );
+        assert_eq!(
+            reconstructed.epochs.protocol_params.d.numerator, 1,
+            "d = 1 makes EVERY slot an overlay slot"
+        );
+    }
+
+    /// End-to-end on the path that actually corrupted the live ledger:
+    /// `rollback_via_seq` must decline rather than install the chimera.
+    ///
+    /// `diff_seq` is populated so the pre-existing #806 short-circuit
+    /// (`n > diff_seq.len()`) cannot be what makes this pass — without the
+    /// coherence guard this test installs PV 6 into a PV 11 ledger.
+    #[test]
+    fn rollback_via_seq_declines_on_an_incoherent_window() {
+        let mut seq = LedgerSeq::with_defaults(make_genesis_like_anchor(), 2160);
+        seq.push(make_chained_delta(
+            100,
+            0xAB,
+            Point::Specific(SlotNo(99), make_hash(0xAA)),
+        ));
+        seq.push(make_chained_delta(
+            101,
+            0xAC,
+            Point::Specific(SlotNo(100), make_hash(0xAB)),
+        ));
+
+        // The live ledger: replayed forward to PV 11, as the node's was.
+        let mut live = make_anchor();
+        live.epochs.protocol_params.protocol_version_major = 11;
+        live.tip.point = Point::Specific(SlotNo(101), make_hash(0xAC));
+        live.utxo
+            .diff_seq
+            .push(SlotNo(100), make_hash(0xAB), UtxoDiff::new());
+        live.utxo
+            .diff_seq
+            .push(SlotNo(101), make_hash(0xAC), UtxoDiff::new());
+
+        // Measured with the guard disarmed: `Some(1)` and `pv_after = 6` —
+        // the rollback runs and installs the genesis anchor's pparams.
+        let target = Point::Specific(SlotNo(100), make_hash(0xAB));
+        assert_eq!(
+            live.rollback_via_seq(&mut seq, &target),
+            None,
+            "must decline so the caller takes its snapshot slow path"
+        );
+        assert_eq!(
+            live.epochs.protocol_params.protocol_version_major, 11,
+            "the live ledger must be left untouched — this is the assertion that \
+             fails without the guard, installing genesis PV 6 onto a PV 11 chain \
+             and arming the NotActiveOverlaySlot rejection"
         );
     }
 }

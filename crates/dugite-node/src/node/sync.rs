@@ -284,6 +284,76 @@ impl Node {
         self.handle_rollback_inner(rollback_point).await
     }
 
+    /// Re-anchor the `LedgerSeq` on the live ledger state, discarding the
+    /// volatile delta window.
+    ///
+    /// # The invariant this exists to maintain (#985)
+    ///
+    /// `LedgerSeq` is an anchor state plus a window of per-block deltas, and
+    /// `tip_state()` reconstructs the volatile tip as *anchor + deltas*. That
+    /// reconstruction is only meaningful when the anchor is the state at
+    /// `anchor_point` and the deltas chain forward from it — the same
+    /// structural guarantee Haskell gets from `AnchoredSeq`.
+    ///
+    /// dugite advances the anchor implicitly (`push` → `advance_anchor` once
+    /// the window reaches `k`), so the invariant holds automatically for the
+    /// normal path: apply a block, push its delta. It does **not** hold for
+    /// any path that moves `ledger_state` in bulk without pushing deltas —
+    /// startup replay, the rollback snapshot slow path, the gap-bridge. Those
+    /// leave the anchor at a state the deltas were never computed against.
+    ///
+    /// The consequence is not a crash but a silent chimera: a reconstructed
+    /// state whose delta-tracked fields (tip, slot) are current while every
+    /// field no delta touched — protocol params above all — is stale. On the
+    /// first v2.5.0 boot over an existing DB, the SNAPSHOT 31→32 quarantine
+    /// made that stale state *genesis*, and the first at-tip fork switch
+    /// installed preview-genesis pparams (PV6, d=1) into the live ledger. A
+    /// canonical Conway block was then judged against the TPraos overlay
+    /// schedule, rejected, and cached as invalid — wedging chain selection for
+    /// the process lifetime.
+    ///
+    /// So: **every bulk mutation of `ledger_state` outside
+    /// `apply_block_with_delta` + `seq.push` must call this.** Dropping the
+    /// window is correct rather than wasteful — those blocks are already
+    /// folded into the state being anchored, and a rollback below the new
+    /// anchor falls through to the snapshot slow path, which is exactly the
+    /// safe behaviour.
+    ///
+    /// # Relationship to Haskell (oracle-verified against
+    /// ouroboros-consensus `release-ouroboros-consensus-3.0.1.0`)
+    ///
+    /// Upstream re-anchors *per replayed block*: `initReapplyBlock` is
+    /// `reapplyThenPush`, which is `extend` followed by `pruneToImmTipOnly`,
+    /// collapsing the sequence to the block just applied. Blocks streamed
+    /// from the ImmutableDB are immutable by definition, so there is nothing
+    /// to keep in a rollback window.
+    ///
+    /// Calling this once when replay finishes reaches the identical end state
+    /// — anchor at the post-replay tip, window empty — because dugite's
+    /// replay pushes no deltas at all. The window is empty for the whole
+    /// replay, so there is no intermediate reconstruction that could differ.
+    /// Per-block collapsing would only add work.
+    ///
+    /// Note the *live* path deliberately does not collapse: upstream lets the
+    /// sequence grow under `extend` and prunes only on the k-bounded
+    /// `implGarbageCollect` from `copyToImmutableDB`, which is what dugite's
+    /// `push` → `advance_anchor` already mirrors.
+    pub(crate) async fn reanchor_ledger_seq(&self, reason: &str) {
+        // Lock order: ledger_state before ledger_seq (per Node docs).
+        let ls = self.ledger_state.read().await;
+        let mut seq = self.ledger_seq.write().await;
+        let old_anchor_slot = seq.anchor_point().slot().map(|s| s.0).unwrap_or(0);
+        let dropped = seq.deltas().len();
+        seq.reset_anchor(ls.clone_without_utxos());
+        info!(
+            reason,
+            old_anchor_slot,
+            new_anchor_slot = seq.anchor_point().slot().map(|s| s.0).unwrap_or(0),
+            dropped_deltas = dropped,
+            "LedgerSeq re-anchored on the live ledger state"
+        );
+    }
+
     async fn handle_rollback_inner(&self, rollback_point: &Point) -> bool {
         let rollback_slot = rollback_point.slot().map(|s| s.0).unwrap_or(0);
 
@@ -406,6 +476,12 @@ impl Node {
                     ledger_slot,
                     rollback_slot, replayed, "Gap-bridge: advanced ledger to meet rollback target"
                 );
+                // #985: the gap-bridge replays blocks straight into
+                // `ledger_state` without producing LedgerSeq deltas, so the
+                // seq's anchor and window now describe a chain the ledger has
+                // moved off. Re-anchor before returning.
+                drop(ls);
+                self.reanchor_ledger_seq("gap-bridge replay").await;
                 return true;
             }
         }
@@ -722,6 +798,19 @@ impl Node {
             }
         }
 
+        // #985: reaching here means the snapshot slow path ran — it replaced
+        // `ledger_state` wholesale from a snapshot and replayed forward, with
+        // no LedgerSeq deltas produced. The seq's anchor and its entire window
+        // now describe a chain the ledger is no longer on, so anything
+        // reconstructed from them would be a chimera. Re-anchor on the state
+        // we actually landed at.
+        //
+        // Placed after the slow-path block rather than inside it because every
+        // failure mode in there returns early; falling through to this point
+        // is exactly the "snapshot restored and replayed successfully" case.
+        self.reanchor_ledger_seq("rollback via snapshot slow path")
+            .await;
+
         // ── Phase 3: Update chain fragment on rollback ───────────────────────
         //
         // Roll back the chain fragment to the rollback point so that the
@@ -1022,13 +1111,20 @@ impl Node {
                 0
             };
 
-            // Build overlay context for BFT schedule validation.
-            // Only needed when d > 0 and protocol version < 7 (pre-Babbage).
-            // For Babbage+ (proto >= 7), d is always 0 and overlay is skipped.
-            let overlay_ctx = if ls.epochs.protocol_params.protocol_version_major < 7
-                && ls.epochs.protocol_params.d.numerator > 0
-                && !ls.genesis_delegates.is_empty()
-            {
+            // Build overlay context for BFT schedule validation, via the same
+            // predicate the live path uses (#985 — two hand-written copies of
+            // this condition is how one of them came to be missing the era
+            // term). This path is not currently wired
+            // (`process_forward_blocks` has no callers); sharing the predicate
+            // means re-wiring it cannot reintroduce the false-rejection wedge.
+            let overlay_ctx = if blocks.first().is_some_and(|b| {
+                super::should_build_overlay_context(
+                    b.era,
+                    ls.epochs.protocol_params.protocol_version_major,
+                    ls.epochs.protocol_params.d.numerator,
+                    !ls.genesis_delegates.is_empty(),
+                )
+            }) {
                 let epoch = ls.epoch_of_slot(blocks.first().map(|b| b.slot().0).unwrap_or(0));
                 let first_slot = ls.first_slot_of_epoch(epoch);
                 let genesis_keys: std::collections::BTreeSet<dugite_primitives::hash::Hash28> =

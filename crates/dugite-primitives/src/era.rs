@@ -26,6 +26,29 @@ impl Era {
         !matches!(self, Era::Byron)
     }
 
+    /// Whether blocks of this era are validated under **TPraos** — the
+    /// transitional Praos that carries a BFT overlay schedule — rather than
+    /// **Praos**.
+    ///
+    /// Haskell selects the consensus protocol by ERA, not by the value of `d`
+    /// in the ledger state. `ouroboros-consensus-cardano`'s `HFEras` wires
+    /// `ShelleyBlock (TPraos c)` for Shelley/Allegra/Mary/Alonzo and
+    /// `ShelleyBlock (Praos c)` for Babbage onward, and the Praos
+    /// `LedgerView` carries neither `d` nor `GenDelegs` — so the OVERLAY rule
+    /// is not merely skipped for Babbage+ headers, it is *unreachable*.
+    ///
+    /// dugite has a single header validator for both, so the overlay check is
+    /// gated at its call sites. That gate MUST key off the block's era, never
+    /// off ledger pparams: a corrupt or stale ledger state carrying
+    /// pre-Babbage pparams would otherwise run the overlay classifier on a
+    /// Praos header and falsely reject a canonical block (#985).
+    ///
+    /// Byron answers `false` — it has no Praos header crypto at all and is
+    /// validated on the ledger path, never reaching the overlay gate.
+    pub fn uses_tpraos(&self) -> bool {
+        matches!(self, Era::Shelley | Era::Allegra | Era::Mary | Era::Alonzo)
+    }
+
     pub fn supports_native_assets(&self) -> bool {
         matches!(
             self,
@@ -237,5 +260,29 @@ mod tests {
         assert!(Era::Shelley < Era::Conway);
         assert!(Era::Alonzo < Era::Babbage);
         assert!(Era::Conway < Era::Dijkstra);
+    }
+
+    /// #985. The set is spelled out rather than derived from an ordering so
+    /// that adding a future era cannot silently extend it — a new era defaults
+    /// to Praos, which is the safe answer, and this test states the whole
+    /// mapping so the intent survives.
+    ///
+    /// Mirrors `ouroboros-consensus-cardano`'s `HFEras`:
+    /// `ShelleyBlock (TPraos c)` for Shelley/Allegra/Mary/Alonzo,
+    /// `ShelleyBlock (Praos c)` for Babbage/Conway/Dijkstra.
+    #[test]
+    fn tpraos_eras_are_exactly_shelley_through_alonzo() {
+        for era in [Era::Shelley, Era::Allegra, Era::Mary, Era::Alonzo] {
+            assert!(era.uses_tpraos(), "{era:?} is a TPraos era in cardano-node");
+        }
+        for era in [Era::Babbage, Era::Conway, Era::Dijkstra] {
+            assert!(
+                !era.uses_tpraos(),
+                "{era:?} is a Praos era — its headers have no overlay schedule, \
+                 and treating one as TPraos falsely rejects canonical blocks (#985)"
+            );
+        }
+        // Byron predates both and never reaches the Praos header validator.
+        assert!(!Era::Byron.uses_tpraos());
     }
 }

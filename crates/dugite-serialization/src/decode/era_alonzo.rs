@@ -78,9 +78,8 @@ use dugite_primitives::hash::{blake2b_256, Hash28, Hash32};
 use dugite_primitives::time::{BlockNo, SlotNo};
 use dugite_primitives::transaction::{
     AuxiliaryData, BootstrapWitness, Certificate, ExUnits, MIRSource, MIRTarget, NativeScript,
-    OutputDatum, PlutusData, PoolMetadata, PoolParams, Rational, Redeemer, RedeemerTag,
-    Transaction, TransactionBody, TransactionInput, TransactionOutput, TransactionWitnessSet,
-    VKeyWitness,
+    OutputDatum, PlutusData, PoolParams, Redeemer, RedeemerTag, Transaction, TransactionBody,
+    TransactionInput, TransactionOutput, TransactionWitnessSet, VKeyWitness,
 };
 use dugite_primitives::value::{AssetName, Lovelace, Value};
 use minicbor::data::Type;
@@ -894,69 +893,13 @@ fn read_hash28_cert(r: &mut Reader<'_>) -> Result<Hash28, SerializationError> {
     })
 }
 
+/// Alonzo-family (Allegra / Mary / Alonzo / Babbage) `pool_params`.
+///
+/// Delegates to the shared implementation. This copy previously SKIPPED the
+/// relays and hardcoded `relays: Vec::new()`, so #670's fix never reached the
+/// four eras it serves.
 fn read_pool_params(r: &mut Reader<'_>) -> Result<PoolParams, SerializationError> {
-    let operator = read_hash28_cert(r)?;
-    let vrf_keyhash = read_hash32(r)?;
-    let pledge = read_lovelace(r)?;
-    let cost = read_lovelace(r)?;
-    let margin = r.read_rational()?;
-    let reward_account = r.read_bytes_owned()?;
-    let pool_owners: Vec<Hash28> = r.read_set(|r| read_hash28_cert(r))?;
-    // relays: definite OR indefinite-length array — see #673 / era_shelley.rs.
-    r.for_each_array_item(|r| {
-        r.skip()?;
-        Ok(())
-    })?;
-    let pool_metadata = read_pool_metadata(r)?;
-
-    Ok(PoolParams {
-        operator,
-        vrf_keyhash,
-        pledge,
-        cost,
-        margin: Rational {
-            numerator: margin.numerator,
-            denominator: margin.denominator,
-        },
-        reward_account,
-        pool_owners,
-        relays: Vec::new(),
-        pool_metadata,
-    })
-}
-
-fn read_pool_metadata(r: &mut Reader<'_>) -> Result<Option<PoolMetadata>, SerializationError> {
-    let ty = r.peek_major()?;
-    if ty == Type::Null {
-        r.read_null()?;
-        return Ok(None);
-    }
-    let arr_len = r.read_array_header()?;
-    if !matches!(arr_len, Some(2)) {
-        return Err(SerializationError::CborDecode(format!(
-            "pool_metadata: expected array(2) or null, got {arr_len:?}"
-        )));
-    }
-    // pool_metadata_url = text (CDDL). Mainnet uses CBOR major type 3 (text string).
-    // Handle both text and bytes for robustness against non-canonical encodings.
-    let ty = r.peek_major()?;
-    let url = match ty {
-        Type::String => r.read_str()?.to_string(),
-        _ => {
-            let url_bytes = r.read_bytes()?;
-            String::from_utf8(url_bytes.to_vec()).map_err(|_| {
-                SerializationError::CborDecode("pool_metadata url: invalid UTF-8".into())
-            })?
-        }
-    };
-    let hash = {
-        let bytes = r.read_bytes()?;
-        let mut buf = [0u8; 32];
-        let len = bytes.len().min(32);
-        buf[..len].copy_from_slice(&bytes[..len]);
-        Hash32::from_bytes(buf)
-    };
-    Ok(Some(PoolMetadata { url, hash }))
+    super::era_shelley::read_pool_params_inner(r, false)
 }
 
 fn read_mir_cert(r: &mut Reader<'_>) -> Result<Certificate, SerializationError> {
@@ -1473,9 +1416,24 @@ pub(crate) fn decode_alonzo_aux_data_map(
 /// Decode an Alonzo auxiliary data value.
 ///
 /// Wire formats:
+/// The single auxiliary-data decoder, shared by every era.
+///
+/// Three wire shapes:
 /// - Plain map (Shelley): `{ label => metadatum }`
 /// - ShelleyMa (Allegra/Mary): `[metadata_map, native_scripts]`
-/// - PostAlonzo: `tag(259) { 0 => metadata, 1 => [native_scripts], 2 => [plutus_v1] }`
+/// - PostAlonzo: `tag(259) { 0 => metadata, 1 => [native_scripts],
+///   2 => [plutus_v1], 3 => [plutus_v2], 4 => [plutus_v3] }`
+///
+/// It is shared because it was not. Three copies existed, each populating a
+/// DIFFERENT subset: this one dropped `native_scripts` and both later Plutus
+/// vectors, `era_shelley`'s had no `tag(259)` arm at all (so dugite's own
+/// encoder output decoded to entirely empty auxiliary data), and only
+/// `era_conway`'s was complete — and even that skipped the ShelleyMa scripts.
+/// Issue #984. Same mechanism as #937 (three drifted `read_metadatum` copies),
+/// #932/#938 (triplicated body encoders) and the `read_pool_params` relay gap.
+///
+/// `raw_cbor` is preserved in every branch, so the `auxiliary_data_hash` check
+/// and byte-exact relay never depended on any of this.
 pub(crate) fn decode_alonzo_auxiliary_data(
     r: &mut Reader<'_>,
 ) -> Result<AuxiliaryData, SerializationError> {
@@ -1487,8 +1445,10 @@ pub(crate) fn decode_alonzo_auxiliary_data(
     let ty = aux_r.peek_major()?;
 
     let mut metadata = BTreeMap::new();
-    let native_scripts: Vec<NativeScript> = Vec::new();
+    let mut native_scripts: Vec<NativeScript> = Vec::new();
     let mut plutus_v1_scripts: Vec<Vec<u8>> = Vec::new();
+    let mut plutus_v2_scripts: Vec<Vec<u8>> = Vec::new();
+    let mut plutus_v3_scripts: Vec<Vec<u8>> = Vec::new();
 
     match ty {
         // Bare Shelley-form metadata map — Haskell `encodeMap` emits an
@@ -1501,8 +1461,10 @@ pub(crate) fn decode_alonzo_auxiliary_data(
             let arr_len = aux_r.read_array_header()?;
             if matches!(arr_len, Some(2)) {
                 metadata = decode_metadata_map(&mut aux_r)?;
-                // Skip native scripts (we don't decode them from aux data)
-                aux_r.skip()?;
+                aux_r.for_each_array_item(|r| {
+                    native_scripts.push(read_native_script(r)?);
+                    Ok(())
+                })?;
             }
         }
         Type::Tag => {
@@ -1518,19 +1480,32 @@ pub(crate) fn decode_alonzo_auxiliary_data(
                         metadata = decode_metadata_map(r)?;
                     }
                     1 => {
-                        // native scripts — skip for now
-                        r.skip()?;
-                    }
-                    2 => {
-                        // plutus_v1_scripts (array of byte strings).
-                        // Use for_each_array_item so indefinite-length
-                        // arrays don't silently truncate.
-                        let mut local = Vec::new();
                         r.for_each_array_item(|r| {
-                            local.push(r.read_bytes_owned()?);
+                            native_scripts.push(read_native_script(r)?);
                             Ok(())
                         })?;
-                        plutus_v1_scripts.extend(local);
+                    }
+                    // Plutus script vectors, keys 2/3/4 = V1/V2/V3.
+                    //
+                    // `for_each_array_item` rather than a length-prefixed read
+                    // so indefinite-length arrays do not silently truncate.
+                    2 => {
+                        r.for_each_array_item(|r| {
+                            plutus_v1_scripts.push(r.read_bytes_owned()?);
+                            Ok(())
+                        })?;
+                    }
+                    3 => {
+                        r.for_each_array_item(|r| {
+                            plutus_v2_scripts.push(r.read_bytes_owned()?);
+                            Ok(())
+                        })?;
+                    }
+                    4 => {
+                        r.for_each_array_item(|r| {
+                            plutus_v3_scripts.push(r.read_bytes_owned()?);
+                            Ok(())
+                        })?;
                     }
                     _ => {
                         r.skip()?;
@@ -1548,8 +1523,8 @@ pub(crate) fn decode_alonzo_auxiliary_data(
         metadata,
         native_scripts,
         plutus_v1_scripts,
-        plutus_v2_scripts: Vec::new(),
-        plutus_v3_scripts: Vec::new(),
+        plutus_v2_scripts,
+        plutus_v3_scripts,
         raw_cbor: Some(raw_bytes),
     })
 }

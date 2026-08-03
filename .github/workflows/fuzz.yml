@@ -2,18 +2,42 @@ name: Fuzz Testing
 
 on:
   schedule:
-    # Nightly at 2 AM UTC
-    - cron: '0 2 * * *'
+    # Mon-Sat 02:00 UTC — short run over every target.
+    - cron: '0 2 * * 1-6'
+    # Sunday 02:00 UTC — deep run, an hour per target.
+    - cron: '0 2 * * 0'
   workflow_dispatch:
+    inputs:
+      max_total_time:
+        description: 'Seconds to fuzz each target'
+        required: false
+        default: '1200'
 
 env:
   CARGO_HOME: /home/runner/.cargo
   CARGO_INCREMENTAL: 0
   CARGO_TERM_COLOR: always
+  # Per-target fuzzing budget.
+  #
+  # This used to be a flat 3600s every night, which was the right call when
+  # every run started from an EMPTY corpus (#972) — an hour was mostly spent
+  # re-deriving CBOR framing that a persisted corpus now supplies in the first
+  # second. With the corpus cached between runs, coverage ACCUMULATES across
+  # nights, so a shorter nightly run is no longer a shorter search: it is the
+  # same search, resumed.
+  #
+  # That is what pays for #971's 11 revived targets plus the new #974/#975
+  # ones. The matrix went 41 -> 58 targets while total nightly compute went
+  # ~41h (41 x 3600s) -> ~19h (58 x 1200s). The weekly deep run keeps a long
+  # uninterrupted search in the schedule for the targets that benefit.
+  FUZZ_SECONDS: ${{ github.event.inputs.max_total_time || (github.event.schedule == '0 2 * * 0' && '3600' || '1200') }}
 
 jobs:
   fuzz:
     runs-on: ubuntu-latest
+    # Hard ceiling per target: build + fuzz + cmin. Well inside the 6-hour
+    # GitHub Actions job limit even on a cold cache and a deep Sunday run.
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -63,8 +87,12 @@ jobs:
           - cost_model_eval
           # Audit #544 — CBOR serialization strictness (D2/D3/D9/D10/D15)
           - vkey_witness_sizes
+          - bootstrap_witness_sizes
           - plutus_bignum
           - cbor_skip_value_depth
+          - skip_cbor_value
+          # Issue #554 D7 — tx metadata decoder allocation cap
+          - tx_metadata_decode
           # In-house decoders — production code path for phase-2 validation
           - dugite_uplc_program_decode
           - dugite_uplc_data_decode
@@ -72,6 +100,63 @@ jobs:
           - body_hash
           # Issue #613 — Byron block-header decode hardening
           - byron_block_decode
+          # Mini-protocol STATE MACHINES (#971). The message decoders above
+          # cannot reach sequencing/state bugs — the layer where #924 (the
+          # handshake connection leak) lived.
+          - chainsync_client_pipelined_state_machine
+          - chainsync_server_state_machine
+          - blockfetch_client_recv
+          - txsubmission2_server_state_machine
+          - peer_sharing_client_addr_injection
+          # Deep dispatch + mux ingress (#971). lsq_query_dispatch exists
+          # BECAUSE n2c_query only fuzzes the outer frame; it feeds arbitrary
+          # CBOR into handle_query_cbor_versioned across all 39 Shelley tags.
+          - lsq_query_dispatch
+          - mux_ingress
+          - propose_versions
+          # Encoder-first structured generation (#974). Every other target is
+          # decode-first, so the deep optional fields — PPU keys, governance
+          # certificates, witness sets — are unreachable by byte mutation.
+          # These generate the structure and require the decoder to reproduce
+          # it.
+          - structured_tx_encode
+          - structured_pparam_update
+          # dugite-node / dugite-cli parse surface (#975). Six of sixteen
+          # workspace crates were not fuzz dependencies at all; these are the
+          # three with real untrusted-input parse surface and a defect history.
+          - genesis_parse
+          - topology_parse
+          - n2c_pparams_encode
+          - cli_envelope
+        # Per-target -max_len overrides. The global default below is 4096, set
+        # deliberately: nothing about mutating raw wire bytes needs more, and a
+        # smaller cap keeps the in-memory corpus small over an hour.
+        #
+        # It stops being right for a target whose SEEDS are bigger than the cap
+        # (#972). libFuzzer TRUNCATES an oversized seed rather than skipping it,
+        # so a 29 KB real block loaded under -max_len=4096 becomes a 4 KB
+        # fragment that can only ever exercise the error path — the opposite of
+        # the reason it was committed. These caps are set from the largest seed
+        # in each directory (see scripts/dev/regen-fuzz-seeds.sh).
+        include:
+          - target: decode_block
+            max_len: 32768
+          - target: encode_roundtrip
+            max_len: 32768
+          - target: body_hash
+            max_len: 32768
+          - target: decode_transaction
+            max_len: 16384
+          # Structured targets consume the input as an Arbitrary entropy
+          # stream, so the cap bounds how RICH a generated transaction can be
+          # rather than how large an input is parsed.
+          - target: structured_tx_encode
+            max_len: 16384
+          - target: structured_pparam_update
+            max_len: 8192
+          # Real genesis documents run to ~9.5 KB (the Alonzo cost models).
+          - target: genesis_parse
+            max_len: 16384
     steps:
       - uses: actions/checkout@v7
 
@@ -120,8 +205,54 @@ jobs:
       # (transaction bodies, block headers, witness sets all fit comfortably),
       # restore the default cap. This meaningfully shrinks the in-memory
       # corpus size at 1-hour scale.
-      - name: Run fuzzer (1 hour)
-        run: cargo +nightly fuzz run fuzz_${{ matrix.target }} --target x86_64-unknown-linux-gnu -- -max_total_time=3600 -rss_limit_mb=12288 -max_len=4096
+      # ---- Corpus persistence (#972) ----------------------------------------
+      #
+      # Before this, every nightly run started from a COMPLETELY EMPTY corpus
+      # and spent most of its hour re-deriving CBOR framing from scratch. The
+      # cache is keyed on run_id (always a miss, so `save` always writes a new
+      # entry) with a prefix restore-key, which is GitHub's documented
+      # rolling-cache idiom: restore the newest prior entry, save an updated one.
+      - name: Restore corpus from the previous nightly run
+        uses: actions/cache/restore@v6
+        with:
+          path: fuzz/corpus/fuzz_${{ matrix.target }}
+          key: fuzz-corpus-v1-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-v1-${{ matrix.target }}-
+
+      # Committed seeds are the floor: even on a cold cache the fuzzer starts
+      # from real on-chain CBOR rather than random bytes. `cp -n` never
+      # clobbers a cached input that libFuzzer already minimised.
+      - name: Seed corpus from committed seeds
+        run: |
+          mkdir -p "fuzz/corpus/fuzz_${{ matrix.target }}"
+          if [ -d "fuzz/seeds/${{ matrix.target }}" ]; then
+            cp -n fuzz/seeds/${{ matrix.target }}/* "fuzz/corpus/fuzz_${{ matrix.target }}/" 2>/dev/null || true
+          fi
+          echo "corpus size: $(ls -1 "fuzz/corpus/fuzz_${{ matrix.target }}" | wc -l) inputs"
+
+      - name: Run fuzzer
+        # timeout-minutes caps the STEP well under the 6-hour GitHub Actions
+        # job ceiling. The fuzz budget itself is FUZZ_SECONDS; this only bounds
+        # the tail (libFuzzer finishing the in-flight unit, cmin, corpus I/O)
+        # so a wedged run fails visibly instead of burning six hours.
+        timeout-minutes: 90
+        run: cargo +nightly fuzz run fuzz_${{ matrix.target }} --target x86_64-unknown-linux-gnu -- -max_total_time=${{ env.FUZZ_SECONDS }} -rss_limit_mb=12288 -max_len=${{ matrix.max_len || 4096 }}
+
+      # Bound the corpus before caching it — an hour of libFuzzer output is
+      # mostly redundant inputs, and an unbounded corpus would eventually
+      # dominate both the cache and the next run's startup time.
+      - name: Minimize corpus
+        if: always()
+        timeout-minutes: 20
+        run: cargo +nightly fuzz cmin fuzz_${{ matrix.target }} --target x86_64-unknown-linux-gnu -- -rss_limit_mb=12288
+
+      - name: Save corpus for the next nightly run
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: fuzz/corpus/fuzz_${{ matrix.target }}
+          key: fuzz-corpus-v1-${{ matrix.target }}-${{ github.run_id }}
 
       - name: Upload corpus
         if: always()

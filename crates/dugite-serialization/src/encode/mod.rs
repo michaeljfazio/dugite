@@ -28,7 +28,10 @@ pub use block::{
 };
 pub use certificate::encode_certificate;
 pub use governance::encode_proposal_procedure;
-pub use protocol_params::{encode_cost_models, encode_protocol_param_update};
+pub use protocol_params::{
+    encode_cost_models, encode_pre_conway_protocol_param_update, encode_protocol_param_update,
+    encode_update_proposal,
+};
 pub use script::{
     compute_script_data_hash, compute_script_data_hash_from_cbor, encode_native_script,
     encode_script_ref,

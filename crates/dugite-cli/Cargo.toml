@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 description = "CLI tool for Dugite Cardano node (cardano-cli compatible)"
 
+# Library target exposing the untrusted-input parsers for fuzzing (#975).
+# The binary keeps its own `mod commands;` tree; this compiles the same source
+# files as a separate unit.
+[lib]
+name = "dugite_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "dugite-cli"
 path = "src/main.rs"

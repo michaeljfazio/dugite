@@ -647,6 +647,54 @@ Network magic: Mainnet=764824073, Preview=2, Preprod=1
 - `config/monitoring/` — Grafana dashboard, Prometheus scrape + alert rules.
 - `scripts/run/`, `scripts/soak/`, `scripts/monitoring/`, `scripts/validation/`, `scripts/mithril/`, `scripts/dev/` — see `just --list` for the entry points.
 
+## Fuzzing
+
+59 declared libFuzzer targets in `fuzz/`, 58 in the nightly matrix
+(`plutus_script_decode` is deliberately excluded — upstream Aiken panics),
+run by `.github/workflows/fuzz.yml`:
+Mon-Sat 1200s per target, Sunday 3600s, `workflow_dispatch` overrides.
+The short weekday budget is only sound because the corpus **persists**
+between runs (Actions cache + `cargo fuzz cmin` before save) — it is the
+same search resumed, not a shorter one.
+
+```bash
+just fuzz-check                      # compile-guard every target (part of `just check`)
+scripts/dev/regen-fuzz-seeds.sh      # rebuild fuzz/seeds/ from repo fixtures
+
+cd fuzz
+cp -n seeds/decode_block/* corpus/fuzz_decode_block/   # CI does this before each run
+cargo +nightly fuzz run fuzz_decode_block -- -max_total_time=300 -max_len=32768
+```
+
+Three traps, all of which shipped silently for months (#971/#972):
+
+- **A target not in `matrix.target` never runs.** Eleven sat
+  declared-but-dead for 2.5 months. `xtask/tests/fuzz_matrix_coverage.rs`
+  now fails the build on that drift; document deliberate exclusions in its
+  `DOCUMENTED_EXCLUSIONS`.
+- **`fuzz/` declares its own `[workspace]`**, so a plain
+  `cargo build --all-targets` at the repo root does not compile, format or
+  lint it. Use `just fuzz-check`.
+- **Seeds live in `fuzz/seeds/<target>/`, not `fuzz/corpus/`** — cargo-fuzz
+  owns `corpus/fuzz_<target>/` (note the prefix; it comes from the BIN
+  name). A seed must also fit `-max_len` (libFuzzer *truncates* rather than
+  skipping: cov 84 vs 1331 on the same 29 KB block) and match the target's
+  byte layout, since several read a control prefix before the payload.
+
+Encoder targets come in two directions and are complementary:
+`fuzz_encode_roundtrip` is decode-first and reaches real-world encodings no
+generator would invent; `fuzz_structured_tx_encode` /
+`fuzz_structured_pparam_update` generate the structure and reach the deep
+optional fields (PPU keys, gov certificates, witness sets) that byte
+mutation cannot synthesise. Standing caveat: a same-process round-trip
+cannot catch a wrong shape shared by BOTH halves — Haskell-derived fixtures
+remain the oracle.
+
+`dugite-node` is deliberately **not** a fuzz dependency: it pulls in
+mithril-client, whose native deps and `inventory`/`typetag` static
+initializers do not survive sancov instrumentation. Its parsers are
+compiled in via `#[path]` instead — see `fuzz/src/node/n2c_query/mod.rs`.
+
 ## Upstream Conformance Testing
 
 Dugite maintains byte-exact alignment with upstream Cardano implementations

@@ -13,8 +13,8 @@ use libfuzzer_sys::fuzz_target;
 use dugite_mempool::{Mempool, MempoolConfig};
 use dugite_primitives::hash::Hash32;
 use dugite_primitives::transaction::{
-    Transaction, TransactionBody, TransactionInput, TransactionOutput, TransactionWitnessSet,
-    OutputDatum,
+    OutputDatum, Transaction, TransactionBody, TransactionInput, TransactionOutput,
+    TransactionWitnessSet,
 };
 use dugite_primitives::value::{Lovelace, Value};
 
@@ -30,11 +30,7 @@ fn hash_from_seed(seed: u8) -> Hash32 {
 }
 
 /// Build a minimal transaction with the given hash and inputs.
-fn build_mempool_tx(
-    tx_hash: Hash32,
-    inputs: Vec<TransactionInput>,
-    fee: u64,
-) -> Transaction {
+fn build_mempool_tx(tx_hash: Hash32, inputs: Vec<TransactionInput>, fee: u64) -> Transaction {
     // Build a simple enterprise address
     let addr_bytes = [0x60u8; 29];
     let address = dugite_primitives::address::Address::from_bytes(&addr_bytes)

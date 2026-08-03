@@ -640,6 +640,13 @@ pub(super) fn encode_transaction_body_for_era(body: &TransactionBody, era: Era) 
     if !body.collateral.is_empty() {
         count += 1;
     }
+    // Key 6: pre-Conway update proposal. Conway replaces the genesis-delegate
+    // update mechanism with governance proposal_procedures (key 20), so the
+    // field is only ever populated for Shelley..Babbage.
+    let emit_update = era < Era::Conway && body.update.is_some();
+    if emit_update {
+        count += 1;
+    }
     // Key 14: required_signers (Conway) OR guards (Dijkstra+).
     //
     // - Era < Dijkstra: emit when `required_signers` is non-empty.
@@ -762,6 +769,23 @@ pub(super) fn encode_transaction_body_for_era(body: &TransactionBody, era: Era) 
             buf.extend(encode_uint(amount.0));
         }
         encode_map_close(&mut buf, body.withdrawals.len());
+    }
+
+    // 6: update proposal (Shelley..Babbage only).
+    //
+    // The Shelley, Alonzo and Babbage decoders all populate `body.update` from
+    // this key, but nothing emitted it — so a pre-Conway transaction carrying a
+    // protocol-parameter update re-encoded into a body MISSING key 6, changing
+    // `blake2b_256(body_cbor)` and therefore the transaction id. Same class as
+    // #947, but the whole field rather than a missing tag. Found by the
+    // encode-first structured fuzz target (#974).
+    if emit_update {
+        if let Some(update) = &body.update {
+            buf.extend(encode_uint(6));
+            buf.extend(crate::encode::protocol_params::encode_update_proposal(
+                update,
+            ));
+        }
     }
 
     // 7: auxiliary_data_hash
@@ -3426,6 +3450,140 @@ mod tests {
             )
             .expect("body must decode");
             assert_eq!(decoded.sub_transactions.len(), n, "count at n={n}");
+        }
+    }
+
+    /// Tx-body key 6 (`update`) must survive a decode -> encode round-trip.
+    ///
+    /// `TransactionBody.update` is populated by the Shelley, Alonzo and Babbage
+    /// decoders from wire key 6, but no encoder arm emits it. A pre-Conway
+    /// transaction carrying a protocol-parameter update proposal therefore
+    /// re-encodes into a body MISSING key 6 — which changes
+    /// `blake2b_256(body_cbor)`, i.e. the transaction id.
+    ///
+    /// Same class as #947 (a body field whose encoding changed the tx id), but
+    /// the whole field rather than a missing tag. Found by the encode-first
+    /// structured fuzz target added for #974.
+    #[test]
+    fn tx_body_key6_update_survives_roundtrip() {
+        use dugite_primitives::hash::Hash;
+
+        let ppu = ProtocolParamUpdate {
+            min_fee_a: Some(44),
+            // Decentralisation — key 12, live on mainnet throughout Shelley.
+            d: Some(Rational {
+                numerator: 1,
+                denominator: 2,
+            }),
+            ..Default::default()
+        };
+        // `genesishash` is 28 bytes on the wire; the decoder stores it via
+        // `Hash28::to_hash32_padded`, so a decoded proposal always carries four
+        // trailing zero bytes. Build the fixture the same way, or the fixture
+        // itself — not the encoder — is what fails.
+        let mut genesis_hash = [0u8; 32];
+        genesis_hash[..28].fill(7);
+
+        let body = TransactionBody {
+            update: Some(UpdateProposal {
+                proposed_updates: vec![(Hash::from_bytes(genesis_hash), ppu)],
+                epoch: 42,
+            }),
+            ..Default::default()
+        };
+
+        let tx = Transaction {
+            hash: Default::default(),
+            era: Era::Babbage,
+            body,
+            witness_set: empty_witness_set(),
+            is_valid: true,
+            auxiliary_data: None,
+            raw_cbor: None,
+            raw_body_cbor: None,
+            raw_witness_cbor: None,
+        };
+
+        let encoded = encode_transaction(&tx);
+        // HFC era id 5 == Babbage in `decode_transaction`.
+        let decoded = crate::decode::decode_transaction(5, &encoded).expect("tx must decode");
+
+        assert_eq!(
+            decoded.body.update, tx.body.update,
+            "tx-body key 6 (update proposal) was dropped by the encoder"
+        );
+    }
+
+    /// A `PoolRegistration` certificate's relays must survive a pre-Conway
+    /// transaction round-trip.
+    ///
+    /// Found by the era-sweeping structured fuzz target (#974): at Alonzo the
+    /// relays came back EMPTY from a certificate that carried three.
+    #[test]
+    fn pool_registration_relays_survive_pre_conway_roundtrip() {
+        use dugite_primitives::hash::Hash;
+
+        let params = PoolParams {
+            operator: Hash::from_bytes([1u8; 28]),
+            vrf_keyhash: Hash::from_bytes([2u8; 32]),
+            pledge: Lovelace(1_000),
+            cost: Lovelace(340),
+            margin: Rational {
+                numerator: 1,
+                denominator: 50,
+            },
+            reward_account: {
+                let mut a = vec![0xe0];
+                a.extend([3u8; 28]);
+                a
+            },
+            pool_owners: vec![Hash::from_bytes([4u8; 28])],
+            relays: vec![
+                Relay::SingleHostAddr {
+                    port: Some(3001),
+                    ipv4: Some([1, 2, 3, 4]),
+                    ipv6: None,
+                },
+                Relay::SingleHostName {
+                    port: Some(3002),
+                    dns_name: "relay.example.com".to_string(),
+                },
+                Relay::MultiHostName {
+                    dns_name: "_cardano._tcp.example.com".to_string(),
+                },
+            ],
+            pool_metadata: None,
+        };
+
+        let body = TransactionBody {
+            certificates: vec![Certificate::PoolRegistration(params.clone())],
+            ..Default::default()
+        };
+        let tx = Transaction {
+            hash: Default::default(),
+            era: Era::Alonzo,
+            body,
+            witness_set: empty_witness_set(),
+            is_valid: true,
+            auxiliary_data: None,
+            raw_cbor: None,
+            raw_body_cbor: None,
+            raw_witness_cbor: None,
+        };
+
+        // HFC era id 4 == Alonzo.
+        let encoded = encode_transaction(&tx);
+        let decoded = crate::decode::decode_transaction(4, &encoded).expect("tx must decode");
+
+        match decoded.body.certificates.first() {
+            Some(Certificate::PoolRegistration(got)) => {
+                assert_eq!(
+                    got.relays, params.relays,
+                    "pool relays did not survive the round-trip"
+                );
+                assert_eq!(*got, params, "pool params did not survive the round-trip");
+            }
+            other => panic!("expected a PoolRegistration certificate, got {other:?}"),
         }
     }
 }

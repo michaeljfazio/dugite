@@ -80,9 +80,7 @@
 //! skipped entirely (empty `TransactionWitnessSet`). Auxiliary data is always parsed.
 
 use crate::decode::era_conway::{read_cost_models, read_ex_unit_prices, read_ex_units};
-use crate::decode::helpers::{
-    read_hash28, read_hash32, read_lovelace, read_metadata_map as decode_metadata_map,
-};
+use crate::decode::helpers::{read_hash28, read_hash32, read_lovelace};
 use crate::decode::raw::KeepRaw;
 use crate::decode::reader::Reader;
 use crate::error::SerializationError;
@@ -804,6 +802,31 @@ fn read_hash28_cert(r: &mut Reader<'_>) -> Result<Hash28, SerializationError> {
 
 /// Read pool_params from the register pool certificate.
 fn read_pool_params(r: &mut Reader<'_>) -> Result<PoolParams, SerializationError> {
+    read_pool_params_inner(r, false)
+}
+
+/// The single `pool_params` decoder, shared by every era.
+///
+/// `strict_owners` selects `read_set_strict` (Conway PV9+ duplicate rejection)
+/// over the lenient `read_set`; that is the ONLY per-era difference in this
+/// structure, since the `pool_params` CDDL is unchanged from Shelley on.
+///
+/// It is shared because it was not, and that cost a real bug: #670 required
+/// relays to be decoded into `Relay` values rather than skipped, and the fix
+/// landed in this file and in the Conway copy but NOT in the Alonzo-family
+/// copy — which serves Allegra, Mary, Alonzo AND Babbage, since
+/// `era_babbage` calls `era_alonzo::read_alonzo_cert_inner`. Every
+/// `PoolRegistration` certificate in those four eras decoded with
+/// `relays: []`, which is exactly the symptom #670 was filed for
+/// (`pool_params: value_mismatches=605`) and also starves ledger-based peer
+/// discovery, which reads relay addresses out of `pool_params`.
+///
+/// Three copies of a decoder is the same mechanism behind #937 (three drifted
+/// `read_metadatum` copies) and #932/#938 (triplicated body encoders).
+pub(crate) fn read_pool_params_inner(
+    r: &mut Reader<'_>,
+    strict_owners: bool,
+) -> Result<PoolParams, SerializationError> {
     // pool_params = (
     //   operator: pool_keyhash,
     //   vrf_keyhash: vrf_keyhash,
@@ -825,7 +848,11 @@ fn read_pool_params(r: &mut Reader<'_>) -> Result<PoolParams, SerializationError
     let margin = r.read_rational()?;
     let reward_account = r.read_bytes_owned()?;
     // pool_owners: set of addr_keyhash (28 bytes each)
-    let pool_owners: Vec<Hash28> = r.read_set(|r| read_hash28_cert(r))?;
+    let pool_owners: Vec<Hash28> = if strict_owners {
+        r.read_set_strict(|r| read_hash28_cert(r))?
+    } else {
+        r.read_set(|r| read_hash28_cert(r))?
+    };
     // relays: array of relay structs (definite OR indefinite-length).
     //
     // #673: cn 11.0.1 emits indefinite-length relay arrays on preview /
@@ -1235,46 +1262,14 @@ fn decode_aux_data_map(
 /// Alonzo+ aux data is a tag(259) map.
 ///
 /// For Shelley, the aux data is always the plain metadata map form.
+/// Shelley-era auxiliary data.
+///
+/// Delegates to the shared decoder. This copy previously had NO `tag(259)`
+/// arm, so any PostAlonzo-shaped auxiliary data reaching it decoded to
+/// entirely empty auxiliary data — metadata included — and its ShelleyMa arm
+/// skipped the native scripts. Issue #984.
 fn decode_auxiliary_data(r: &mut Reader<'_>) -> Result<AuxiliaryData, SerializationError> {
-    // Capture raw CBOR bytes
-    let raw_start = r.position();
-    r.skip()?;
-    let raw_bytes = r.slice_from(raw_start).to_vec();
-
-    // Re-parse the aux data to extract metadata
-    let mut aux_r = Reader::new(&raw_bytes);
-    let ty = aux_r.peek_major()?;
-    let metadata = match ty {
-        Type::Map | Type::MapIndef => {
-            // Plain Shelley metadata map. Haskell `ShelleyTxAuxData` goes
-            // through `encodeMap`, which emits an INDEFINITE map for > 23
-            // labels (#932) — accept both header forms.
-            decode_metadata_map(&mut aux_r)?
-        }
-        Type::Array => {
-            // ShelleyMa: [metadata_map, native_scripts]
-            let arr_len = aux_r.read_array_header()?;
-            if !matches!(arr_len, Some(2)) {
-                // Unexpected format — return empty
-                BTreeMap::new()
-            } else {
-                let meta = decode_metadata_map(&mut aux_r)?;
-                // skip native scripts
-                aux_r.skip()?;
-                meta
-            }
-        }
-        _ => BTreeMap::new(),
-    };
-
-    Ok(AuxiliaryData {
-        metadata,
-        native_scripts: Vec::new(),
-        plutus_v1_scripts: Vec::new(),
-        plutus_v2_scripts: Vec::new(),
-        plutus_v3_scripts: Vec::new(),
-        raw_cbor: Some(raw_bytes),
-    })
+    super::era_alonzo::decode_alonzo_auxiliary_data(r)
 }
 
 // ============================================================================
@@ -1460,6 +1455,17 @@ pub(crate) fn read_pre_conway_update_proposal(
 /// - 24: max collateral inputs (uint)
 ///
 /// Unknown keys are skipped (forward compatibility).
+/// Decode a standalone pre-Conway `protocol_param_update` CBOR map.
+///
+/// The Shelley..Babbage counterpart of [`crate::decode::ppu_from_cbor`], and
+/// the decode half that `encode_pre_conway_protocol_param_update` must
+/// round-trip against — the two key sets genuinely differ (keys 12-15 exist
+/// only here; keys 25-37 only in Conway).
+pub fn pre_conway_ppu_from_cbor(cbor: &[u8]) -> Result<ProtocolParamUpdate, SerializationError> {
+    let mut r = Reader::new(cbor);
+    read_pre_conway_protocol_param_update(&mut r)
+}
+
 pub(crate) fn read_pre_conway_protocol_param_update(
     r: &mut Reader<'_>,
 ) -> Result<ProtocolParamUpdate, SerializationError> {

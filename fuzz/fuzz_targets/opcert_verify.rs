@@ -58,7 +58,8 @@ fuzz_target!(|data: &[u8]| {
     let kes_period = u64::from_le_bytes(kp_bytes);
 
     // Build the canonical OCertSignable payload — must never panic.
-    let signable = dugite_crypto::ocert::ocert_signable_bytes(&kes_vkey, sequence_number, kes_period);
+    let signable =
+        dugite_crypto::ocert::ocert_signable_bytes(&kes_vkey, sequence_number, kes_period);
 
     // The payload must always be exactly kes_vkey.len() + 16 bytes.
     assert_eq!(signable.len(), kes_vkey.len() + 16);
