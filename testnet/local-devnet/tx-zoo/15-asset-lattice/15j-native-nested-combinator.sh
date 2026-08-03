@@ -50,10 +50,16 @@ mint_with() {   # mint_with <suffix> <signing-key-file...>
     local utxo raw signed args=()
     utxo=$(zoo_largest_utxo "$ADDR") || return 2
     raw="$ZOO_BUILT/$NAME-$suffix.raw"; signed="$ZOO_BUILT/$NAME-$suffix.signed"
+    # --witness-override is load-bearing: `transaction build` sizes the fee for
+    # the witnesses it can infer, and this script signs with EXTRA keys
+    # afterwards to satisfy the nested script. Without it the built fee covers
+    # a smaller tx than the one submitted and the node correctly answers
+    # FeeTooSmallUTxO — a fixture error that looks like a script failure.
     cardano-cli conway transaction build \
         --testnet-magic "$LD_MAGIC" --socket-path "$ZOO_SOCKET" \
         --tx-in "${utxo%% *}" --change-address "$ADDR" \
         --mint "1 ${PID}.${ASSET}" --mint-script-file "$POLICY" \
+        --witness-override $(( $# + 1 )) \
         --out-file "$raw" >/dev/null 2> "$ZOO_LOGS/$NAME-$suffix.err" || return 2
     args=(--testnet-magic "$LD_MAGIC" --tx-body-file "$raw" --signing-key-file "$ZOO_PAY_SKEY")
     local k; for k in "$@"; do args+=(--signing-key-file "$k"); done

@@ -109,5 +109,14 @@ print(len(bytes.fromhex(json.load(open(sys.argv[1]))["cborHex"])))
 # payload. The check is stated in those terms rather than claimed as a full
 # byte round-trip.
 local_txid() {
-    cardano-cli conway transaction txid --tx-file "$1" 2>/dev/null
+    # cardano-cli 11 prints JSON — `{ "txhash": "<hex>" }` — NOT a bare hash.
+    # Passing the raw output on produced a multi-line value that broke the
+    # observer lookup (0/3 on a tx that was actually on chain) AND embedded
+    # newlines in results.csv, which is why a 115-script run reported 117 rows.
+    # Extract the hash, and fall back to the raw text for older CLI versions
+    # that printed it bare.
+    local out
+    out=$(cardano-cli conway transaction txid --tx-file "$1" 2>/dev/null) || return 1
+    printf '%s' "$out" | jq -r '.txhash // empty' 2>/dev/null \
+        || printf '%s' "$out" | tr -d '[:space:]'
 }

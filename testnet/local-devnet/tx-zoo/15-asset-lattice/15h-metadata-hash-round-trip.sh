@@ -30,6 +30,11 @@ zoo_require_devnet
 ADDR=$(cat "$ZOO_PAY_ADDR_FILE")
 
 META="$ZOO_BUILT/$NAME.meta.json"
+# Every Metadatum constructor. NOTE the 64-byte ceiling on text and byte
+# strings — a 70-character string here is rejected by cardano-cli with
+# "Value out of range within the metadata item", which is a FIXTURE error, not
+# a node verdict. `at_64` sits exactly on the boundary so the longest legal
+# string is still exercised.
 cat > "$META" <<'JSON'
 {
   "674": {
@@ -39,7 +44,7 @@ cat > "$META" <<'JSON'
     "bytes": "0xdeadbeef",
     "list": [1, "two", [3, 4], {"k": "v"}],
     "map": { "nested": { "deeper": [5, 6] } },
-    "long_text": "0123456789012345678901234567890123456789012345678901234567890123456789"
+    "at_64": "0123456789012345678901234567890123456789012345678901234567890123"
   }
 }
 JSON
