@@ -118,6 +118,11 @@ jobs:
           # reported only for input that genuinely encodes it. The pre-#963
           # parsers reported it for the live `cardano-cli` argument bytes.
           - lsq_filter_arg
+          # #983: dugite-rpc's inbound protobuf -> ledger mapping. The gRPC
+          # surface is opt-in, but it is dugite code turning attacker-chosen
+          # bytes into TransactionInput/Point, and it was silently DROPPING
+          # anything it could not parse.
+          - rpc_inbound
           - mux_ingress
           - propose_versions
           # Encoder-first structured generation (#974). Every other target is
