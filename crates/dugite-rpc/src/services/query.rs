@@ -249,18 +249,14 @@ async fn read_utxos_response_beta(
     ctx: &std::sync::Arc<dyn LedgerContext>,
     refs: Vec<v1beta::query::TxoRef>,
 ) -> Result<v1beta::query::ReadUtxosResponse, Status> {
-    // Map TxoRef → TransactionInput list.
-    let mut inputs = Vec::with_capacity(refs.len());
-    for r in &refs {
-        if r.hash.len() == 32 {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&r.hash);
-            inputs.push(dugite_primitives::transaction::TransactionInput {
-                transaction_id: dugite_primitives::hash::Hash32::from_bytes(arr),
-                index: r.index,
-            });
-        }
-    }
+    // Map TxoRef → TransactionInput, ALL OR NOTHING.
+    //
+    // This used to skip any ref whose hash was not 32 bytes. A missing UTxO
+    // legitimately yields fewer items too, so the caller had no way to tell a
+    // dropped key from a key that simply is not on chain — the request was
+    // partially ignored rather than refused (#983).
+    let inputs =
+        crate::map::inbound::txo_refs(refs.iter().map(|r| (r.hash.as_slice(), r.index)), "keys")?;
 
     let snapshots = ctx.utxo_by_ref(&inputs).await.map_err(Status::from)?;
     let ledger_tip = ledger_tip_chain_point(ctx).await?;

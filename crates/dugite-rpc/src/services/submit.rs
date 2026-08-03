@@ -194,11 +194,13 @@ impl v1alpha::submit::submit_service_server::SubmitService for SubmitSvcAlpha {
 
         // For each requested ref, check the current mempool snapshot to
         // emit STAGE_MEMPOOL immediately if already present.
-        for r in &refs {
-            if r.len() == 32 {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(r);
-                let h = dugite_primitives::hash::Hash32::from_bytes(arr);
+        // ALL OR NOTHING. Skipping an unparseable ref meant the stream simply
+        // never reported on it, so the client waited forever for a transaction
+        // the server was never watching (#983).
+        let parsed = crate::map::inbound::tx_hashes(refs.iter().map(|r| r.as_slice()), "ref")?;
+        for (r, h) in refs.iter().zip(parsed.iter()) {
+            {
+                let h = *h;
                 if self.state.context.mempool_contains(&h).await {
                     let _ = tx
                         .send(Ok(v1alpha::submit::WaitForTxResponse {
@@ -375,11 +377,13 @@ impl v1beta::submit::submit_service_server::SubmitService for SubmitSvcBeta {
         let mut events = self.state.mempool_feed.subscribe();
         let (tx, rx) = mpsc::channel(self.state.config.stream_buffer);
 
-        for r in &refs {
-            if r.len() == 32 {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(r);
-                let h = dugite_primitives::hash::Hash32::from_bytes(arr);
+        // ALL OR NOTHING. Skipping an unparseable ref meant the stream simply
+        // never reported on it, so the client waited forever for a transaction
+        // the server was never watching (#983).
+        let parsed = crate::map::inbound::tx_hashes(refs.iter().map(|r| r.as_slice()), "ref")?;
+        for (r, h) in refs.iter().zip(parsed.iter()) {
+            {
+                let h = *h;
                 if self.state.context.mempool_contains(&h).await {
                     let _ = tx
                         .send(Ok(v1beta::submit::WaitForTxResponse {

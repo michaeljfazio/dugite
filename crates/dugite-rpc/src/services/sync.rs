@@ -25,7 +25,6 @@ use std::sync::Arc;
 
 use dugite_primitives::block::Point;
 use dugite_primitives::hash::Hash32;
-use dugite_primitives::time::SlotNo;
 use dugite_serialization::decode::decode_block;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -119,14 +118,13 @@ async fn intersect_impl(
     ctx: &Arc<dyn LedgerContext>,
     refs: &[(Vec<u8>, u64)],
 ) -> Result<Option<Point>, RpcError> {
-    let mut points: Vec<Point> = Vec::with_capacity(refs.len());
-    for (hash, slot) in refs {
-        if hash.len() == 32 {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(hash);
-            points.push(Point::Specific(SlotNo(*slot), Hash32::from_bytes(arr)));
-        }
-    }
+    // ALL OR NOTHING. Skipping an unparseable ref meant the node intersected
+    // at a SUBSET of the offered points and answered with an agreed point the
+    // client never offered — a silently different answer, not a smaller one
+    // (#983).
+    let points =
+        crate::map::inbound::block_refs(refs.iter().map(|(h, s)| (h.as_slice(), *s)), "intersect")
+            .map_err(|e| RpcError::InvalidArgument(e.to_string()))?;
     ctx.intersect(&points).await
 }
 

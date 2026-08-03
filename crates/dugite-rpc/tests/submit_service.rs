@@ -767,8 +767,44 @@ async fn wait_for_tx_ignores_unwatched_hashes_and_non_mined_removals() {
     server.stop().await;
 }
 
+/// #983: a malformed ref must be REFUSED, not silently dropped.
+///
+/// This test previously asserted the opposite — that the handler "must skip
+/// the malformed ref … and still emit the immediate stage for the valid one" —
+/// and so it pinned the defect in place. Skipping is not benign here: the
+/// stream never reports on the dropped ref, so a client that asked about two
+/// transactions and got told about one waits forever for the other, with no
+/// error to distinguish "not yet in the mempool" from "never watched".
 #[tokio::test]
-async fn wait_for_tx_non_32_byte_ref_is_ignored_without_panic() {
+async fn wait_for_tx_rejects_a_non_32_byte_ref() {
+    use dugite_rpc::proto::v1beta::submit::submit_service_client::SubmitServiceClient;
+    use dugite_rpc::proto::v1beta::submit::WaitForTxRequest;
+
+    let mut mock = SubmitMock::rejecting("unused");
+    mock.resident.insert([0x66; 32]);
+    let server = TestServer::start(Arc::new(mock)).await;
+    let mut client = SubmitServiceClient::new(server.channel().await);
+
+    let err = client
+        .wait_for_tx(WaitForTxRequest {
+            r#ref: vec![vec![0xAA; 16], vec![0x66; 32]],
+        })
+        .await
+        .expect_err("a 16-byte ref must be refused, not skipped");
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("16 bytes"),
+        "the error must name the length seen: {}",
+        err.message()
+    );
+    server.stop().await;
+}
+
+/// The valid path still works — the guard rejects bad input, it does not
+/// reject everything.
+#[tokio::test]
+async fn wait_for_tx_accepts_well_formed_refs() {
     use dugite_rpc::proto::v1beta::submit::submit_service_client::SubmitServiceClient;
     use dugite_rpc::proto::v1beta::submit::{Stage, WaitForTxRequest};
 
@@ -777,12 +813,9 @@ async fn wait_for_tx_non_32_byte_ref_is_ignored_without_panic() {
     let server = TestServer::start(Arc::new(mock)).await;
     let mut client = SubmitServiceClient::new(server.channel().await);
 
-    // One malformed (16-byte) ref alongside one valid resident ref: the
-    // handler must skip the malformed ref (no panic in the [u8; 32]
-    // copy) and still emit the immediate stage for the valid one.
     let mut stream = client
         .wait_for_tx(WaitForTxRequest {
-            r#ref: vec![vec![0xAA; 16], vec![0x66; 32]],
+            r#ref: vec![vec![0x66; 32]],
         })
         .await
         .unwrap()

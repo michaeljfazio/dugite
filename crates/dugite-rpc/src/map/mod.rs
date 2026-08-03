@@ -19,6 +19,8 @@ pub mod block;
 pub mod cert;
 pub mod common;
 pub mod governance;
+/// The one INBOUND direction: attacker-controlled protobuf -> dugite types.
+pub mod inbound;
 pub mod metadatum;
 pub mod patterns;
 pub mod plutus_data;
