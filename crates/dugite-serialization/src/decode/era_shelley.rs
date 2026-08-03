@@ -1460,6 +1460,17 @@ pub(crate) fn read_pre_conway_update_proposal(
 /// - 24: max collateral inputs (uint)
 ///
 /// Unknown keys are skipped (forward compatibility).
+/// Decode a standalone pre-Conway `protocol_param_update` CBOR map.
+///
+/// The Shelley..Babbage counterpart of [`crate::decode::ppu_from_cbor`], and
+/// the decode half that `encode_pre_conway_protocol_param_update` must
+/// round-trip against — the two key sets genuinely differ (keys 12-15 exist
+/// only here; keys 25-37 only in Conway).
+pub fn pre_conway_ppu_from_cbor(cbor: &[u8]) -> Result<ProtocolParamUpdate, SerializationError> {
+    let mut r = Reader::new(cbor);
+    read_pre_conway_protocol_param_update(&mut r)
+}
+
 pub(crate) fn read_pre_conway_protocol_param_update(
     r: &mut Reader<'_>,
 ) -> Result<ProtocolParamUpdate, SerializationError> {

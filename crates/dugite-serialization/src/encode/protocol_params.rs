@@ -20,6 +20,54 @@ use super::certificate::encode_rational;
 ///   30: gov_action_deposit, 31: drep_deposit, 32: drep_activity,
 ///   33: min_fee_ref_script_cost_per_byte
 pub fn encode_protocol_param_update(ppu: &ProtocolParamUpdate) -> Vec<u8> {
+    encode_ppu_map(&ppu_entries(ppu, PpuKeySet::Conway))
+}
+
+/// Encode a pre-Conway (Shelley..Babbage) `protocol_param_update`.
+///
+/// The Conway type genuinely has no keys 12-15, but the Shelley..Babbage one
+/// does, and dugite's decoder reads all four:
+///
+/// - 12 `d` — decentralisation, live on mainnet throughout Shelley
+/// - 13 `extra_entropy` — folded into the epoch nonce at TICKN; mainnet
+///   injected a non-neutral value effective epoch 259
+/// - 14 `protocol_version` — `[major, minor]`
+/// - 15 `min_utxo_value` — the flat Shelley-Mary minUTxO (#919)
+///
+/// Emitting them is what makes `decode -> encode` a fixpoint for a pre-Conway
+/// update proposal, and therefore what keeps its transaction id stable.
+///
+/// Mirrors `read_pre_conway_protocol_param_update` in `decode/era_shelley.rs`,
+/// which carries the per-key Haskell citations
+/// (`eras/{shelley,alonzo,babbage}/impl/src/Cardano/Ledger/*/PParams.hs`).
+pub fn encode_pre_conway_protocol_param_update(ppu: &ProtocolParamUpdate) -> Vec<u8> {
+    encode_ppu_map(&ppu_entries(ppu, PpuKeySet::PreConway))
+}
+
+/// Which `protocol_param_update` key set to emit.
+///
+/// One entry builder serves both, deliberately: three drifted copies of
+/// `read_metadatum` were the mechanism behind #937, and triplicated block-body
+/// encoders were the mechanism behind BOTH #932 and #938. A second hand-written
+/// copy of a 30-key table is the same trap.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PpuKeySet {
+    /// Conway and later: keys 0-11 and 16-33.
+    Conway,
+    /// Shelley..Babbage: keys 0-24, including 12-15.
+    PreConway,
+}
+
+fn encode_ppu_map(entries: &[(u64, Vec<u8>)]) -> Vec<u8> {
+    let mut buf = encode_map_header(entries.len());
+    for (key, value) in entries {
+        buf.extend(encode_uint(*key));
+        buf.extend(value.clone());
+    }
+    buf
+}
+
+fn ppu_entries(ppu: &ProtocolParamUpdate, key_set: PpuKeySet) -> Vec<(u64, Vec<u8>)> {
     // Count non-None fields to determine map size
     let mut entries: Vec<(u64, Vec<u8>)> = Vec::new();
 
@@ -59,7 +107,41 @@ pub fn encode_protocol_param_update(ppu: &ProtocolParamUpdate) -> Vec<u8> {
     if let Some(ref v) = ppu.tau {
         entries.push((11, encode_rational(v)));
     }
-    // Key 12 is protocol_version — not in ProtocolParamUpdate (it's in HardForkInitiation)
+    // Keys 12-15 exist only in the Shelley..Babbage PParamUpdate type. The
+    // Conway type drops all four (decentralisation and extra entropy are gone;
+    // protocol_version moved to the HardForkInitiation governance action;
+    // min_utxo_value was replaced by coinsPerUTxOByte at key 17).
+    if key_set == PpuKeySet::PreConway {
+        if let Some(ref v) = ppu.d {
+            entries.push((12, encode_rational(v)));
+        }
+        if let Some(ref v) = ppu.extra_entropy {
+            // Shelley `Nonce`: [0] = NeutralNonce, [1, bstr32] = Nonce(h).
+            // `Some(ZERO)` is the explicit neutral nonce, not "absent".
+            let mut buf = Vec::new();
+            if *v == dugite_primitives::hash::Hash32::ZERO {
+                buf.extend(encode_array_header(1));
+                buf.extend(encode_uint(0));
+            } else {
+                buf.extend(encode_array_header(2));
+                buf.extend(encode_uint(1));
+                buf.extend(encode_bytes(v.as_bytes()));
+            }
+            entries.push((13, buf));
+        }
+        // protocol_version is `[major, minor]` — a single key carrying both
+        // halves, so it is emitted only when both are present.
+        if let (Some(major), Some(minor)) = (ppu.protocol_version_major, ppu.protocol_version_minor)
+        {
+            let mut buf = encode_array_header(2);
+            buf.extend(encode_uint(major));
+            buf.extend(encode_uint(minor));
+            entries.push((14, buf));
+        }
+        if let Some(ref v) = ppu.min_utxo_value {
+            entries.push((15, encode_uint(v.0)));
+        }
+    }
     if let Some(ref v) = ppu.min_pool_cost {
         entries.push((16, encode_uint(v.0)));
     }
@@ -206,11 +288,57 @@ pub fn encode_protocol_param_update(ppu: &ProtocolParamUpdate) -> Vec<u8> {
         entries.push((33, encode_rational(v)));
     }
 
-    let mut buf = encode_map_header(entries.len());
-    for (key, value) in entries {
-        buf.extend(encode_uint(key));
-        buf.extend(value);
+    // Keys 34-37 — the Dijkstra ref-script re-parameterisation
+    // (`PParams.hs` `ppuTag = 34..37` in `DijkstraEra`).
+    //
+    // `read_protocol_param_update` has read all four since #475 Phase 5, but
+    // nothing emitted them, so a dugite-built Dijkstra `ParameterChange` would
+    // have silently dropped every ref-script parameter it proposed. Same shape
+    // as the tx-body key 6 gap, and latent for the same reason — no on-chain
+    // corpus exercises it. Found by the encode-first structured fuzz target
+    // (#974).
+    //
+    // Emitting them under the Conway key set too is safe and deliberate: a
+    // Conway PPU never has them populated, so no Conway bytes change, and
+    // gating them on the era would need a key-set argument threaded through
+    // `encode_gov_action`.
+    if key_set == PpuKeySet::Conway {
+        if let Some(v) = ppu.max_ref_script_size_per_block {
+            entries.push((34, encode_uint(v as u64)));
+        }
+        if let Some(v) = ppu.max_ref_script_size_per_tx {
+            entries.push((35, encode_uint(v as u64)));
+        }
+        if let Some(v) = ppu.ref_script_cost_stride {
+            entries.push((36, encode_uint(v as u64)));
+        }
+        if let Some(ref v) = ppu.ref_script_cost_multiplier {
+            // PositiveInterval — tag-30 [num, den], same as key 33.
+            entries.push((37, encode_rational(v)));
+        }
     }
+
+    entries
+}
+
+/// Encode a pre-Conway update proposal — transaction body key 6.
+///
+/// ```text
+/// update = [ proposed_protocol_parameter_updates, epoch ]
+/// proposed_protocol_parameter_updates = { * genesishash => protocol_param_update }
+/// ```
+///
+/// `genesishash` is the 28-byte blake2b_224 of a genesis delegate vkey. The
+/// decoder pads it to `Hash32` for storage, so the low 28 bytes go back on the
+/// wire.
+pub fn encode_update_proposal(update: &UpdateProposal) -> Vec<u8> {
+    let mut buf = encode_array_header(2);
+    buf.extend(encode_map_header(update.proposed_updates.len()));
+    for (genesis_hash, ppu) in &update.proposed_updates {
+        buf.extend(encode_bytes(&genesis_hash.as_bytes()[..28]));
+        buf.extend(encode_pre_conway_protocol_param_update(ppu));
+    }
+    buf.extend(encode_uint(update.epoch));
     buf
 }
 
