@@ -71,7 +71,7 @@ check "tx_zoo.expected_scripts (sum)" \
 # parity_assert_pool_filter). Deriving both here is what keeps the seam
 # between "scripts on disk" and "rows the gate counts" from drifting.
 CLI_SCRIPTS=$(ls "$ROOT/tx-zoo/09-cli-parity"/09*.sh 2>/dev/null | wc -l | tr -d ' ')
-CLI_EXTRA=$(grep -c '^[[:space:]]*parity_assert_pool_filter ' \
+CLI_EXTRA=$(grep -cE '^[[:space:]]*(parity_assert_pool_filter|PARITY_JQ_FILTER=)' \
               "$ROOT/tx-zoo/09-cli-parity"/09*.sh 2>/dev/null \
             | awk -F: '{s+=$2} END{print s+0}')
 check "cli_parity.expected_queries" \

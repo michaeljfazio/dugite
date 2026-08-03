@@ -301,16 +301,22 @@ parity_query_json() {
     fi
 
     # Normalise for comparison
+    # `PARITY_JQ_FILTER` narrows the compared document to a subset of fields
+    # while keeping everything else this function provides — tip pinning,
+    # evidence capture, known-divergence handling. Scripts that need a subset
+    # used to hand-roll their own two-socket comparison instead, which silently
+    # opted them out of the tip pinning as well; 09h did that and, in doing so,
+    # never compared the epoch nonce at all (#964).
+    #
+    # Narrow only for a stated reason. A filter is a claim that the omitted
+    # fields are not comparable, and that claim belongs in the script.
+    local _jq="${PARITY_JQ_FILTER:-.}"
     local dugite_norm cardano_norm
     case "$mode" in
-        norm)
-            dugite_norm=$(echo "$dugite_out" | jq -Sc . 2>/dev/null || echo "$dugite_out")
-            cardano_norm=$(echo "$cardano_out" | jq -Sc . 2>/dev/null || echo "$cardano_out")
-            ;;
-        *)
-            # exact: still sort JSON keys for byte-stable comparison
-            dugite_norm=$(echo "$dugite_out" | jq -Sc . 2>/dev/null || echo "$dugite_out")
-            cardano_norm=$(echo "$cardano_out" | jq -Sc . 2>/dev/null || echo "$cardano_out")
+        norm|*)
+            # Both modes sort JSON keys for a byte-stable comparison.
+            dugite_norm=$(echo "$dugite_out" | jq -Sc "$_jq" 2>/dev/null || echo "$dugite_out")
+            cardano_norm=$(echo "$cardano_out" | jq -Sc "$_jq" 2>/dev/null || echo "$cardano_out")
             ;;
     esac
 
