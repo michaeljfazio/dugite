@@ -36,7 +36,29 @@ _parity_ensure_csv() {
 # Maps query name → tracking issue URL.
 # Populated by individual test scripts using: KNOWN_DIVERGENCES[name]=url
 declare -gA KNOWN_DIVERGENCES=(
-    # Every comparable query is byte-identical to cardano-node 11.0.1.
+    # --- Exposed 2026-08-02 by #953 -------------------------------------
+    # These three queries had been recorded as SKIP "pool1 id not found" in
+    # EVERY cli-parity run ever published, because setup.sh computed the pool
+    # id but never wrote keys/pool1/pool.id. Fixing that one-line setup gap
+    # made them run for the first time; all three diverged immediately. They
+    # are parked here (tracked, non-blocking) so the gate stays green on
+    # KNOWN state while the node bugs are fixed — NOT because they are benign.
+    [pool-state]="https://github.com/michaeljfazio/dugite/issues/963"
+    [stake-snapshot]="https://github.com/michaeljfazio/dugite/issues/963"
+    [leadership-schedule]="https://github.com/michaeljfazio/dugite/issues/964"
+    #
+    # #963 — GetPoolState / GetStakeSnapshots ignore the pool-id filter and
+    #        return ALL pools. parse_pool_id_set() degrades to an empty vector
+    #        on any decode failure, and empty means "all pools", so the parse
+    #        failure is indistinguishable from "caller asked for everything".
+    #        Fails OPEN. Asking for a different pool returns identical bytes.
+    # #964 — leadership-schedule returns a statistically UNRELATED schedule:
+    #        113 slots vs cardano's 200 (sigma ~0.48 vs ~1.0) and only 55 of
+    #        them shared, which is exactly the overlap two independent draws
+    #        would give. Forging itself is correct (~200 slots/epoch, every
+    #        block accepted by cardano-node) — the query path alone is wrong.
+    #
+    # Otherwise every comparable query is byte-identical to cardano-node 11.0.1.
     #
     # This array is ONLY for real divergences: both sides answered and the
     # answers differ. It must never be used to paper over an ERROR row (that

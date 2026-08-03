@@ -1353,7 +1353,7 @@ impl LedgerState {
 
     #[allow(dead_code)]
     pub fn capture_ratification_snapshot(&mut self) {
-        capture_ratification_snapshot_impl(self.epoch, &mut self.gov);
+        capture_ratification_snapshot_impl(self.epoch, self.epochs.treasury.0, &mut self.gov);
     }
 
     /// Compute total active DRep-delegated stake across all DReps.
@@ -1646,7 +1646,7 @@ pub(crate) fn capture_governance_snapshots(
 ) {
     if epochs.protocol_params.protocol_version_major >= 9 {
         capture_drep_distribution_snapshot_impl(certs, gov);
-        capture_ratification_snapshot_impl(epoch, gov);
+        capture_ratification_snapshot_impl(epoch, epochs.treasury.0, gov);
     }
 }
 
@@ -1712,7 +1712,7 @@ fn capture_drep_distribution_snapshot_impl(certs: &CertSubState, gov: &mut GovSu
 }
 
 /// Capture a ratification snapshot at an epoch boundary.
-fn capture_ratification_snapshot_impl(epoch: EpochNo, gov: &mut GovSubState) {
+fn capture_ratification_snapshot_impl(epoch: EpochNo, treasury: u64, gov: &mut GovSubState) {
     let gov_ref = &gov.governance;
     let snapshot = super::RatificationSnapshot {
         proposals: gov_ref.proposals.clone(),
@@ -1728,12 +1728,18 @@ fn capture_ratification_snapshot_impl(epoch: EpochNo, gov: &mut GovSubState) {
         enacted_constitution: gov_ref.enacted_constitution.clone(),
         snapshot_epoch: epoch,
         vote_delegations: gov_ref.vote_delegations.clone(),
+        // Haskell `ensTreasury` (#966). Captured HERE, at the end of the
+        // boundary, because that is where `setFreshDRepPulsingState` seals it
+        // — so the value consumed by the NEXT boundary's ratification is this
+        // boundary's post-RUPD treasury, exactly one boundary stale.
+        treasury,
     };
     debug!(
         epoch = epoch.0,
         proposals = snapshot.proposals.len(),
         votes = snapshot.votes_by_action.len(),
         committee = snapshot.committee_expiration.len(),
+        treasury,
         "Ratification snapshot captured for next epoch boundary"
     );
     Arc::make_mut(&mut gov.governance).ratification_snapshot = Some(snapshot);
@@ -2980,7 +2986,28 @@ pub(crate) fn ratify_proposals_impl(
     // `enact_gov_action_impl`, while `cap_treasury` is used solely for the
     // `withdrawalCanWithdraw` cap check below. For the all-registered case
     // `disbursed == fold wdrls`, so the two stay equal and behavior is identical.
-    let mut cap_treasury = epochs.treasury.0;
+    //
+    // #966: the BASIS is the FROZEN `ensTreasury` from the ratification
+    // snapshot, not the live pot. Haskell seals `ensTreasury` into the DRep
+    // pulser at the END of `epochTransition`
+    // (`setFreshDRepPulsingState`/`Epoch.hs:372`) and `finishDRepPulser`
+    // consumes that field verbatim one boundary later, so RATIFY cannot see
+    // the `applyRUpd` credit applied at the boundary it is running on.
+    //
+    // dugite applies RUPD (epoch.rs) BEFORE calling this function, so reading
+    // `epochs.treasury.0` here saw a pot one boundary NEWER than Haskell's. A
+    // withdrawal that only became affordable at boundary B then enacted at B
+    // on dugite and B+1 on cardano-node — a split in the accept-early
+    // direction, which is the dangerous one.
+    //
+    // The fallback to live state covers only the first boundary of a fresh or
+    // freshly-imported chain, where no snapshot has been captured yet; from
+    // the second boundary onward the snapshot always exists.
+    let mut cap_treasury = gov
+        .governance
+        .ratification_snapshot
+        .as_ref()
+        .map_or(epochs.treasury.0, |snap| snap.treasury);
 
     for (action_id, action, expires, _submission_index) in &candidates {
         if *expires < epoch {
@@ -5904,6 +5931,92 @@ mod tests {
     // ========================================================================
     // Treasury withdrawal cap tests
     // ========================================================================
+
+    /// #966 — RATIFY must gate on the FROZEN `ensTreasury`, not the live pot.
+    ///
+    /// Haskell seals `ensTreasury` into the DRep pulser at the end of
+    /// `epochTransition` and consumes it a full boundary later, so RATIFY is
+    /// structurally blind to the `applyRUpd` credit landing at the boundary it
+    /// is running on. dugite applies RUPD before ratifying, so reading the live
+    /// pot made a withdrawal affordable one boundary EARLIER than cardano-node
+    /// — an accept-early chain split.
+    ///
+    /// The test reproduces exactly that shape: poor at snapshot time, rich by
+    /// the time the boundary runs. Before the fix, ratification saw
+    /// 10_000_000_000 and enacted; after it, it sees the frozen 500_000_000 and
+    /// correctly defers. Deferral (not rejection) is the Haskell behaviour:
+    /// the action stays live and is retried each epoch until it expires.
+    #[test]
+    fn test_treasury_withdrawal_uses_frozen_not_live_treasury() {
+        let mut state = gov_test_state(10, 0);
+
+        // Poor at the moment the pulser is sealed.
+        state.epochs.treasury = Lovelace(500_000_000);
+
+        let withdrawal_key = LedgerState::reward_account_to_hash(&[0u8; 29]);
+        state
+            .certs
+            .reward_accounts
+            .insert(withdrawal_key, Lovelace(0));
+
+        let mut withdrawals = BTreeMap::new();
+        withdrawals.insert(vec![0u8; 29], Lovelace(1_000_000_000));
+
+        let tx_hash = Hash32::from_bytes([50u8; 32]);
+        state.process_proposal(
+            &tx_hash,
+            0,
+            &ProposalProcedure {
+                deposit: Lovelace(100_000_000_000),
+                return_addr: vec![0u8; 29],
+                gov_action: GovAction::TreasuryWithdrawals {
+                    withdrawals,
+                    policy_hash: None,
+                },
+                anchor: make_anchor(),
+            },
+        );
+        let action_id = make_action_id(50, 0);
+        for i in 0..7 {
+            drep_vote(&mut state, i, &action_id, Vote::Yes);
+        }
+        cc_vote_yes(&mut state, &action_id);
+
+        // Seal the pulser while the treasury is still 500M.
+        state.capture_ratification_snapshot();
+        assert_eq!(
+            state
+                .gov
+                .governance
+                .ratification_snapshot
+                .as_ref()
+                .expect("snapshot captured")
+                .treasury,
+            500_000_000,
+            "the snapshot must freeze the treasury as it stood at capture time"
+        );
+
+        // Now the boundary's RUPD lands, making the pot ample. Haskell's RATIFY
+        // cannot see this; neither may ours.
+        state.epochs.treasury = Lovelace(10_000_000_000);
+
+        state.process_epoch_transition(EpochNo(1));
+
+        assert_eq!(
+            state.epochs.treasury,
+            Lovelace(10_000_000_000),
+            "withdrawal must NOT have been paid: RATIFY gates on the frozen 500M \
+             basis, under which a 1B withdrawal is unaffordable"
+        );
+
+        // And it must be DEFERRED, not dropped — Haskell leaves an unaffordable
+        // action in `cgsProposals` to be retried by the next pulser.
+        let still_live = state.gov.governance.proposals.contains_key(&action_id);
+        assert!(
+            still_live,
+            "an unaffordable withdrawal must stay live for retry, not be discarded"
+        );
+    }
 
     #[test]
     fn test_treasury_withdrawal_insufficient_funds_not_ratified() {

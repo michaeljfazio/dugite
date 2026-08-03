@@ -63,8 +63,33 @@ log_info "Dir prep complete"
 log_info "Generating genesis via cardano-cli conway genesis create-testnet-data"
 
 # Compute genesis start time = now + 30s (cardano-cli's own default; spelled out so we can sanity-check later)
-START_TIME=$(date -u -v+30S +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '+30 seconds' +%Y-%m-%dT%H:%M:%SZ)
-log_info "Genesis start time: $START_TIME"
+# Genesis start offset.
+#
+# 30s is fine for the single-forger devnet: dugite-bp is the only producer, so
+# whatever it forges before the others connect is simply the chain, and the
+# others sync to it.
+#
+# TWO-FORGER MODE NEEDS MUCH MORE (#957). If both producers reach slot 0 before
+# they are connected to each other, they each build a chain from origin
+# independently. By the time the network links up the two chains have forked AT
+# GENESIS and are already deeper than `k`, so neither may adopt the other —
+# `ChainSync intersection only at genesis ... ForkTooDeep`. That is CORRECT
+# Ouroboros behaviour, not a bug, but it produces a permanently partitioned
+# devnet on which every convergence assertion is meaningless.
+#
+# Observed exactly that: dugite-bp and its arbiter on one chain at block 239,
+# the relay and cardano-bp on another at 228, both advancing, never converging.
+#
+# So the genesis start is pushed far enough out that setup (~30s) plus node
+# startup (~60s, cardano-node's socket alone can take 30s) plus a connection
+# margin all complete BEFORE slot 0.
+LD_GENESIS_DELAY="${LD_GENESIS_DELAY:-30}"
+if [ "${LD_TWO_FORGERS:-0}" = "1" ] && [ "$LD_GENESIS_DELAY" -lt 150 ]; then
+    LD_GENESIS_DELAY=150
+fi
+START_TIME=$(date -u -v+"${LD_GENESIS_DELAY}"S +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+    || date -u -d "+${LD_GENESIS_DELAY} seconds" +%Y-%m-%dT%H:%M:%SZ)
+log_info "Genesis start time: $START_TIME (+${LD_GENESIS_DELAY}s)"
 
 # Step A: generate cardano-cli's default specs to a tmpdir so we can merge our overrides in.
 TMP_DEFAULTS="$(mktemp -d)"
@@ -138,8 +163,29 @@ EOF
 # a heavy 95/5 skew, the 5% pool occasionally beats the propagation
 # window and produces a competing block at the same height
 # (cardano-bp forges at its own slot before dugite-bp's block reaches
-# it), creating an asymmetric fork that cardano-bp never resolves
-# (first-seen tiebreaker keeps cardano-bp on its short chain). The
+# it), creating an asymmetric fork that is slow to resolve.
+#
+# CORRECTION (2026-08-02, oracle-verified against ouroboros-consensus
+# release-ouroboros-consensus-3.0.1.0, the version cardano-node 11.0.1
+# resolves via CHaP): an earlier revision of this comment attributed
+# the stuck fork to a "first-seen tiebreaker". There is no such
+# primitive. `comparePraos` compares, in order: (1) blockNo — strictly
+# longer ALWAYS wins, independent of everything below; (2) same issuer
+# AND same slot -> higher opcert issue number; (3) otherwise the VRF
+# value, LOWER wins, but only when `vrfArmed`. Conway hardcodes
+# `RestrictedVRFTiebreaker 5`, so the VRF tiebreak is DISARMED when the
+# competing blocks' slots are more than 5 apart, and `comparePraos`
+# then returns `ShouldNotSwitch EQ`. ChainSel drops every
+# non-`ShouldSwitch` verdict, so the incumbent chain is kept — which
+# LOOKS like first-seen-wins and is the documented "Frankfurt problem"
+# the VRF tiebreak was introduced to fix. It is not permanent: rule (1)
+# forces a switch the moment either chain extends by one block. So
+# "never resolves" was an overstatement; "resolves only once someone
+# extends" is accurate. Making cardano-bp non-forging by default
+# remains the right call, because it removes the race from the
+# cross-validation path entirely rather than depending on tiebreak
+# semantics — and because with 3+ forgers the restricted tiebreaker is
+# provably non-transitive. The
 # clean fix is to make cardano-bp non-forging: dugite-bp is the sole
 # producer, cardano-bp chainsync+blockfetches and applies every block
 # through the Haskell ledger — exact cross-validation, zero
@@ -170,13 +216,58 @@ ls -1 "$LD_GENESIS"
 POOL1_HEX="$(cardano-cli conway stake-pool id \
     --cold-verification-key-file "$LD_GENESIS/pools-keys/pool1/cold.vkey" \
     --output-hex)"
-log_info "Redirecting all stake delegations to pool1=$POOL1_HEX"
-jq --arg p1 "$POOL1_HEX" '
-    .staking.stake = (
-        .staking.stake | with_entries(.value = $p1)
-    )' "$LD_GENESIS/shelley-genesis.json" \
-   > "$LD_GENESIS/shelley-genesis.patched.json"
-mv "$LD_GENESIS/shelley-genesis.patched.json" "$LD_GENESIS/shelley-genesis.json"
+POOL2_HEX="$(cardano-cli conway stake-pool id \
+    --cold-verification-key-file "$LD_GENESIS/pools-keys/pool2/cold.vkey" \
+    --output-hex)"
+
+# ---- Two-forger mode (#957) ----
+#
+# The single-forger topology makes chain selection under contention, slot
+# battles, competing-chain rollback and orphan handling STRUCTURALLY
+# impossible to exercise: with one producer there is never a second candidate
+# for the same height, so no round of any duration can reach those paths. That
+# was the largest operating-condition blind spot in the release gate, and
+# #763 established that offline replay cannot cover the rollback path either —
+# so it was validated nowhere.
+#
+#   LD_TWO_FORGERS=1 ./setup.sh && ./run.sh
+#
+# The mode is recorded in a marker file rather than relying on the environment
+# variable being re-exported for run.sh: setting it for setup and forgetting it
+# for run would silently produce a single-forger devnet that the round script
+# then asserts two-forger properties about.
+#
+# Stake split: the default is deliberately UNEVEN (see LD_POOL2_STAKE_PCT).
+# At 50/50 with f=0.5 both pools win ~50% of slots and fork constantly, which
+# is a fine stress test but a poor convergence test — you cannot tell a
+# resolved fork from a chain that never settled. An uneven split makes the
+# majority chain the expected winner while still producing regular battles.
+if [ "${LD_TWO_FORGERS:-0}" = "1" ]; then
+    POOL2_PCT="${LD_POOL2_STAKE_PCT:-40}"
+    log_info "TWO-FORGER MODE: splitting genesis delegation pool1/pool2 = $((100 - POOL2_PCT))/$POOL2_PCT"
+    jq --arg p1 "$POOL1_HEX" --arg p2 "$POOL2_HEX" --argjson pct "$POOL2_PCT" '
+        .staking.stake as $s
+        | ($s | keys | length) as $n
+        | (($n * $pct / 100) | floor) as $k
+        | .staking.stake = (
+            $s | to_entries
+               | to_entries
+               | map(.value.value = (if .key < $k then $p2 else $p1 end) | .value)
+               | from_entries
+          )' "$LD_GENESIS/shelley-genesis.json" \
+       > "$LD_GENESIS/shelley-genesis.patched.json"
+    mv "$LD_GENESIS/shelley-genesis.patched.json" "$LD_GENESIS/shelley-genesis.json"
+    echo "$POOL2_PCT" > "$LD_GENESIS/.two-forgers"
+else
+    log_info "Redirecting all stake delegations to pool1=$POOL1_HEX"
+    rm -f "$LD_GENESIS/.two-forgers"
+    jq --arg p1 "$POOL1_HEX" '
+        .staking.stake = (
+            .staking.stake | with_entries(.value = $p1)
+        )' "$LD_GENESIS/shelley-genesis.json" \
+       > "$LD_GENESIS/shelley-genesis.patched.json"
+    mv "$LD_GENESIS/shelley-genesis.patched.json" "$LD_GENESIS/shelley-genesis.json"
+fi
 log_info "stake-pool delegation counts: $(jq -c '
     .staking.stake | to_entries | group_by(.value) | map({pool: .[0].value, n: length})
 ' "$LD_GENESIS/shelley-genesis.json")"
@@ -198,6 +289,39 @@ jq --arg cred1 "keyHash-${CC1_COLD_HASH}" \
    "$LD_GENESIS/conway-genesis.json" > "$LD_GENESIS/conway-genesis.patched.json"
 mv "$LD_GENESIS/conway-genesis.patched.json" "$LD_GENESIS/conway-genesis.json"
 log_info "conway-genesis.committee now: $(jq -c .committee "$LD_GENESIS/conway-genesis.json")"
+
+# Step D.6 (OPT-IN): seat a guardrails script on the constitution.
+#
+# The Conway `Proposing` ScriptPurpose (redeemer tag 5) is only reachable when
+# a proposal names a guardrails policy hash, and Conway's GOV rule requires
+# that hash to equal the CURRENT constitution's guardrails script EXACTLY
+# (`checkGuardrailsScriptHash`, strict equality including SNothing == SNothing).
+#
+# That cuts both ways, which is why this is off by default: with a guardrails
+# script seated, EVERY ParameterChange and TreasuryWithdrawals proposal must
+# name it — including 06b, 06d and 10a, which name none and would start failing
+# with `InvalidGuardrailsScriptHash`. So seeding it is a whole-devnet
+# configuration change, not a local one.
+#
+#   LD_SEED_GUARDRAILS=1 ./setup.sh   # enables 13h (Proposing purpose)
+#
+# The hash used is the always-true V3 script the tx-zoo already vendors, so
+# 13h can satisfy it. Any proposal that must pass under this genesis needs
+# `--constitution-script-hash <that hash>`.
+if [ "${LD_SEED_GUARDRAILS:-0}" = "1" ]; then
+    _guard_script="$LD_ROOT/tx-zoo/lib/plutus/always-true-v3.plutus"
+    if [ -s "$_guard_script" ]; then
+        _guard_hash=$(cardano-cli conway transaction policyid --script-file "$_guard_script")
+        jq --arg h "$_guard_hash" '.constitution.script = $h' \
+            "$LD_GENESIS/conway-genesis.json" > "$LD_GENESIS/conway-genesis.guard.json"
+        mv "$LD_GENESIS/conway-genesis.guard.json" "$LD_GENESIS/conway-genesis.json"
+        log_info "LD_SEED_GUARDRAILS=1 — constitution guardrails script = $_guard_hash"
+        log_info "  NOTE: every ParameterChange / TreasuryWithdrawals proposal must now"
+        log_info "        pass --constitution-script-hash $_guard_hash"
+    else
+        log_info "LD_SEED_GUARDRAILS=1 but $_guard_script is absent — run tx-zoo/lib/build-plutus.sh first; leaving constitution unguarded"
+    fi
+fi
 
 # ---- Key reorganization ----
 log_info "Reorganizing keys into testnet/local-devnet/keys/"
@@ -222,6 +346,22 @@ for n in 1 2; do
     cp "$src/kes.skey"      "$dst/kes.skey"
     cp "$src/kes.vkey"      "$dst/kes.vkey"
     cp "$src/opcert.cert"   "$dst/opcert.cert"
+    # pool.id — the bech32 pool id, consumed by 09-cli-parity's pool-scoped
+    # queries (pool-state, stake-snapshot, stake-pool-default-vote,
+    # leadership-schedule).
+    #
+    # This file was never written. All four of those parity checks therefore
+    # short-circuited to SKIP "pool1 id not found (run setup.sh first)" on
+    # EVERY run ever recorded — 4 of the 22-query compared surface silently
+    # uncompared, while the release notes read "18 EQUAL" (#953 finding 5).
+    # The id was already being computed at Step D.4 for the stake redirect;
+    # it just was not persisted.
+    cardano-cli conway stake-pool id \
+        --cold-verification-key-file "$dst/cold.vkey" \
+        --output-bech32 > "$dst/pool.id"
+    cardano-cli conway stake-pool id \
+        --cold-verification-key-file "$dst/cold.vkey" \
+        --output-hex > "$dst/pool.id.hex"
 done
 
 # UTxO funds key — for tx submission tests
@@ -290,6 +430,11 @@ render_template "$LD_CONFIG/templates/cardano-bp.config.tmpl.json"     "$LD_CONF
 render_template "$LD_CONFIG/templates/dugite-bp.topology.tmpl.json"    "$LD_CONFIG/dugite-bp.topology.json"
 render_template "$LD_CONFIG/templates/dugite-relay.topology.tmpl.json" "$LD_CONFIG/dugite-relay.topology.json"
 render_template "$LD_CONFIG/templates/cardano-bp.topology.tmpl.json"   "$LD_CONFIG/cardano-bp.topology.json"
+# The two-forger arbiter (#957) — an independent cardano-node validator peered
+# DIRECTLY with both producers. Rendered unconditionally (cheap, and keeps the
+# JSON sanity check honest); only started by run.sh in two-forger mode.
+render_template "$LD_CONFIG/templates/cardano-arbiter.config.tmpl.json"   "$LD_CONFIG/cardano-arbiter.config.json"
+render_template "$LD_CONFIG/templates/cardano-arbiter.topology.tmpl.json" "$LD_CONFIG/cardano-arbiter.topology.json"
 
 # Sanity check — every rendered file must parse as JSON
 for f in "$LD_CONFIG"/dugite-*.json "$LD_CONFIG"/cardano-*.json; do

@@ -68,9 +68,23 @@ build_v3_via_aiken() {
     # required because the `aiken build` invocation otherwise fails on
     # its `todo` calls.
     rm -f validators/placeholder.ak
+    # ALL SIX Conway V3 validator handlers.
+    #
+    # mint + spend + withdraw were here already; publish (Certifying), vote
+    # (Voting) and propose (Proposing) are added for #955. Without them the zoo
+    # could only ever exercise the spend and mint ScriptPurposes — every other
+    # purpose is a distinct ScriptContext construction path and a distinct
+    # redeemer-pointer tag on the wire, which is precisely where #772 lived.
+    #
+    # A handler that is absent is not a compile error; the script simply fails
+    # at runtime for that purpose, which would look like a dugite bug. Verified
+    # against aiken v1.1.22 + stdlib v3.1.0: all six compile and
+    # `aiken blueprint convert` emits one PlutusScriptV3 envelope covering them.
     cat > "validators/always_${verdict_name}.ak" <<EOF
 use cardano/address.{Credential}
 use cardano/assets.{PolicyId}
+use cardano/certificate.{Certificate}
+use cardano/governance.{ProposalProcedure, Voter}
 use cardano/transaction.{Transaction, OutputReference}
 
 validator always_${verdict_name} {
@@ -83,6 +97,18 @@ validator always_${verdict_name} {
   }
 
   withdraw(_redeemer: Data, _account: Credential, _self: Transaction) {
+    ${verdict_body}
+  }
+
+  publish(_redeemer: Data, _certificate: Certificate, _self: Transaction) {
+    ${verdict_body}
+  }
+
+  vote(_redeemer: Data, _voter: Voter, _self: Transaction) {
+    ${verdict_body}
+  }
+
+  propose(_redeemer: Data, _proposal: ProposalProcedure, _self: Transaction) {
     ${verdict_body}
   }
 }
@@ -112,14 +138,24 @@ EOF
     return 0
 }
 
-# Skip Aiken rebuild if the existing file looks plausible (cborHex
-# length >= 100 hex chars matches a real plutus-core script; a
-# placeholder is ~14 hex chars).
+# Bump whenever the .ak source changes shape (e.g. a new validator handler).
+# Cached binaries built before the bump are stale and MUST be rebuilt: a script
+# missing the `publish`/`vote`/`propose` handlers still has a plausible cborHex
+# length, so the old "looks long enough" check happily reused a 3-handler binary
+# and every Certifying/Voting/Proposing test would fail at runtime looking
+# exactly like a dugite bug (#955).
+V3_HANDLER_SET=6
+
+# Skip Aiken rebuild only if the existing file looks plausible (cborHex length
+# >= 100 hex chars matches a real plutus-core script; a placeholder is ~14) AND
+# it was built from the current handler set.
 _v3_binary_already_good() {
     local f="$1"
     [ -s "$f" ] || return 1
     local hex; hex=$(jq -r '.cborHex' "$f" 2>/dev/null || true)
-    [ -n "$hex" ] && [ "${#hex}" -ge 100 ]
+    [ -n "$hex" ] && [ "${#hex}" -ge 100 ] || return 1
+    local marker="$PLUTUS_DIR/.v3-handler-set"
+    [ -f "$marker" ] && [ "$(cat "$marker" 2>/dev/null)" = "$V3_HANDLER_SET" ]
 }
 
 build_plutus_all() {
@@ -159,6 +195,11 @@ EOF
 }
 EOF
     fi
+
+    # Record the handler set only after BOTH V3 binaries are current. Writing it
+    # between the two would let a stale always-false binary pass the cache check
+    # on the next run.
+    echo "$V3_HANDLER_SET" > "$PLUTUS_DIR/.v3-handler-set"
 }
 
 # Allow direct execution.

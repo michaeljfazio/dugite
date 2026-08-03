@@ -8342,8 +8342,37 @@ impl Node {
             }
         });
 
-        // Wait for any protocol task to complete (usually means client disconnected),
-        // then abort all others and clean up.
+        // Wait for any protocol task to complete (usually means client
+        // disconnected), then abort all others and clean up.
+        //
+        // #968: "abort all others" is what this comment CLAIMED, but
+        // `tokio::select!` merely DROPS the losing branches' futures, and
+        // dropping a `JoinHandle` DETACHES the task rather than aborting it —
+        // the same trap as #924. So when one protocol server returned early
+        // (e.g. LocalTxMonitor hitting a decode error), every other task
+        // INCLUDING the mux kept running and the connection stayed open. A
+        // client waiting on a reply that a dead handler will never send hung
+        // forever, and an unauthenticated local peer could wedge itself and
+        // hold a mux channel indefinitely.
+        //
+        // Collect abort handles BEFORE the select so they survive the drop,
+        // and abort everything on the way out.
+        struct N2cAbortGuard(Vec<tokio::task::AbortHandle>);
+        impl Drop for N2cAbortGuard {
+            fn drop(&mut self) {
+                for h in &self.0 {
+                    h.abort();
+                }
+            }
+        }
+        let _n2c_guard = N2cAbortGuard(vec![
+            lcs_task.abort_handle(),
+            lts_task.abort_handle(),
+            lsq_task.abort_handle(),
+            ltm_task.abort_handle(),
+            mux_handle.abort_handle(),
+        ]);
+
         tokio::select! {
             _ = lcs_task => {}
             _ = lts_task => {}
