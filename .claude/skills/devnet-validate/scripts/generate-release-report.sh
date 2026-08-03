@@ -434,12 +434,37 @@ process_round() {
     fi
 
     # --- D6: Chaos ---
+    # Columns: ts,scenario,action,recovery_seconds,result,detail
+    #
+    # The verdict is `result` (column 5), NOT the last column — `detail`
+    # trails it. This counted `$NF` until 2026-08-03, i.e. it compared the
+    # free-text detail field against "PASS"/"FAIL", which never matches. So
+    # `pass` and `fail` were BOTH structurally always 0: a chaos run in which
+    # every scenario failed reported `fail: 0` and `status: "ok"` and sailed
+    # through the gate. The pinned `total` was the only real number, which is
+    # why "chaos 5/5" looked right in every release note — 5 was the row count.
+    #
+    # Same family as #916/#917/#945/#953/#959 — a check reporting success while
+    # measuring nothing — and it was living inside the #953 gate built to stop
+    # exactly this. Resolve the column by HEADER NAME so adding a column can
+    # never silently re-break it, and fail loudly if the header is missing.
     local ch_status="absent" ch_pass="null" ch_fail="null" ch_env="null" ch_total="null"
     local chaos_csv="$evd/chaos-events.csv"
     if [ -f "$chaos_csv" ] && [ -s "$chaos_csv" ]; then
-        ch_pass=$(awk -F, 'NR>1 && $NF=="PASS" {c++} END{print c+0}' "$chaos_csv")
-        ch_fail=$(awk -F, 'NR>1 && $NF=="FAIL" {c++} END{print c+0}' "$chaos_csv")
-        ch_env=$(awk -F, 'NR>1 && $NF=="ENV_SKIP" {c++} END{print c+0}' "$chaos_csv")
+        # NB: `process_round` runs inside a command substitution, so it is a
+        # SUBSHELL — appending to the global MISSING[] here would be silently
+        # discarded (itself an instance of the bug being fixed). Emit correct
+        # numbers into the round JSON and let the caller, which has MISSING in
+        # scope, enforce the gate. Header problems go to stderr.
+        local ch_col
+        ch_col=$(awk -F, 'NR==1{for(i=1;i<=NF;i++) if($i=="result"){print i; exit}}' "$chaos_csv")
+        if [ -z "$ch_col" ]; then
+            echo "WARNING: chaos-events.csv in round '$name' has no 'result' column — outcomes cannot be classified" >&2
+            ch_col=0
+        fi
+        ch_pass=$(awk -F, -v c="$ch_col" 'NR>1 && c>0 && $c=="PASS" {n++} END{print n+0}' "$chaos_csv")
+        ch_fail=$(awk -F, -v c="$ch_col" 'NR>1 && c>0 && $c=="FAIL" {n++} END{print n+0}' "$chaos_csv")
+        ch_env=$(awk -F, -v c="$ch_col" 'NR>1 && c>0 && $c=="ENV_SKIP" {n++} END{print n+0}' "$chaos_csv")
         ch_total=$(_rows "$chaos_csv")
         ch_status=$(_status_for "$ch_total" "$EXP_CHAOS")
     fi
@@ -697,6 +722,28 @@ while IFS='|' read -r key fname scope; do
             ;;
     esac
 done < <(preset_manifest "$PRESET")
+
+# A suite that emitted rows but classified NONE of them is not a clean sweep —
+# it is a suite whose outcomes were never read. That is precisely how chaos
+# reported pass=0/fail=0/status=ok for three releases while the notes quoted
+# "chaos 5/5" (which was the row count). Checked here rather than inside
+# `process_round`, because that runs in a subshell and cannot append to
+# MISSING. Applies to any round that produced a chaos CSV.
+for i in "${!EVIDENCE_DIRS[@]}"; do
+    rname="${ROUND_NAMES[$i]:-round$i}"
+    f="${EVIDENCE_DIRS[$i]}/chaos-events.csv"
+    [ -f "$f" ] && [ -s "$f" ] || continue
+    ccol=$(awk -F, 'NR==1{for(j=1;j<=NF;j++) if($j=="result"){print j; exit}}' "$f")
+    if [ -z "$ccol" ]; then
+        MISSING+=("chaos-events.csv in round '$rname' has no 'result' column — outcomes cannot be classified")
+        continue
+    fi
+    crows=$(awk 'NR>1 && NF' "$f" | wc -l | tr -d ' ')
+    cclass=$(awk -F, -v c="$ccol" 'NR>1 && ($c=="PASS"||$c=="FAIL"||$c=="ENV_SKIP"){n++} END{print n+0}' "$f")
+    if [ "$crows" -gt 0 ] && [ "$cclass" -eq 0 ]; then
+        MISSING+=("chaos-events.csv in round '$rname' has $crows rows but none classified PASS/FAIL/ENV_SKIP — the suite measured nothing")
+    fi
+done
 
 # Suite-level status violations: "short" (below pinned denominator) and
 # "shared" (tx-zoo counts borrowed from another round) are both integrity
