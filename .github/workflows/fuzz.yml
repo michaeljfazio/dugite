@@ -121,6 +121,13 @@ jobs:
           # it.
           - structured_tx_encode
           - structured_pparam_update
+          # dugite-node / dugite-cli parse surface (#975). Six of sixteen
+          # workspace crates were not fuzz dependencies at all; these are the
+          # three with real untrusted-input parse surface and a defect history.
+          - genesis_parse
+          - topology_parse
+          - n2c_pparams_encode
+          - cli_envelope
         # Per-target -max_len overrides. The global default below is 4096, set
         # deliberately: nothing about mutating raw wire bytes needs more, and a
         # smaller cap keeps the in-memory corpus small over an hour.
@@ -147,6 +154,9 @@ jobs:
             max_len: 16384
           - target: structured_pparam_update
             max_len: 8192
+          # Real genesis documents run to ~9.5 KB (the Alonzo cost models).
+          - target: genesis_parse
+            max_len: 16384
     steps:
       - uses: actions/checkout@v7
 
