@@ -14,3 +14,11 @@ fi
 
 POOL_ID=$(cat "$POOL_ID_FILE")
 parity_query_json "pool-state" "pool-state" "--stake-pool-id" "$POOL_ID"
+
+# #963: the pool-id filter was inert — both sockets were asked about pool1 and
+# dugite answered with pool1 AND pool2. The diff above catches that, but only
+# comparatively; this asserts the property itself on each socket.
+if [ -f "$LD_KEYS/pool1/pool.id.hex" ]; then
+    parity_assert_pool_filter "pool-state-filter" "pool-state" \
+        "$(cat "$LD_KEYS/pool1/pool.id.hex")" "$POOL_ID" || true
+fi
