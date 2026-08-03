@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+# test-report-integrity.sh — prove the release-report generator FAILS on the
+# evidence shapes that used to be reported as clean zeros (#953).
+#
+# WHY THIS EXISTS
+# ---------------
+# The backlog this closes (#945, #923, #953) is one repeated failure: a check
+# that reports success while measuring nothing. The fix for that class is never
+# "write a stricter check" on its own — it is "demonstrate the stricter check
+# goes RED on the exact input that used to pass". This script is that
+# demonstration, mechanized so it stays true.
+#
+# Each case below builds a synthetic evidence tree, runs the real generator
+# against it, and asserts the exit code AND the message. Case 0 is the control:
+# a complete tree must still pass, otherwise the gate is merely broken rather
+# than strict.
+#
+# Usage: test-report-integrity.sh [--keep]
+# Exit: 0 = every case behaved as specified; 1 = at least one did not.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GEN="$SCRIPT_DIR/generate-release-report.sh"
+DENOM="$SCRIPT_DIR/../schemas/denominators.json"
+
+KEEP=0
+[ "${1:-}" = "--keep" ] && KEEP=1
+
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/report-integrity.XXXXXX")
+cleanup() { [ "$KEEP" -eq 1 ] || rm -rf "$TMP"; }
+trap cleanup EXIT
+
+PASSED=0; FAILED=0
+
+# Pinned counts, so fixtures track the manifest instead of drifting from it.
+ZOO_N=$(jq -r '.tx_zoo.expected_scripts // 85' "$DENOM" 2>/dev/null || echo 85)
+CHAOS_N=$(jq -r '.chaos.expected_cases // 6' "$DENOM" 2>/dev/null || echo 6)
+RPC_N=$(jq -r '.rpc.expected_checks // 27' "$DENOM" 2>/dev/null || echo 27)
+CLI_N=$(jq -r '.cli_parity.expected_queries // 22' "$DENOM" 2>/dev/null || echo 22)
+
+# ---- Synthetic evidence builders --------------------------------------------
+# Build one round dir that satisfies the standard preset completely.
+make_round() { # make_round <dir> <n2n_rows> <cli_rows> <parity_rows>
+    local d="$1" n2n="${2:-26}" cli="${3:-22}" par="${4:-41}"
+    mkdir -p "$d/logs"
+
+    cat > "$d/metadata.json" <<'EOF'
+{"dugite_node_git":"0000000000000000000000000000000000000000",
+ "cardano_node_version":"cardano-node 11.0.1","cardano_cli_version":"cardano-cli 11.0.0.0",
+ "duration_seconds":120}
+EOF
+
+    { echo "ts,node,event,slot,hash,pool"
+      for i in $(seq 1 10); do
+          echo "2026-08-02T00:00:0${i}Z,dugite-bp,forge,$((100+i)),hash$i,pool1"
+          echo "2026-08-02T00:00:0${i}Z,cardano-bp,recv,$((100+i)),hash$i,pool1"
+      done
+    } > "$d/blocks.csv"
+
+    { echo "ts,node,slot,block,hash"
+      for i in $(seq 1 10); do echo "2026-08-02T00:00:0${i}Z,dugite-bp,$((100+i)),$i,hash$i"; done
+    } > "$d/tip-samples.csv"
+
+    { echo "ts,node,age_seconds"
+      for i in $(seq 1 10); do echo "2026-08-02T00:00:0${i}Z,dugite-bp,1.5"; done
+    } > "$d/tip-age-samples.csv"
+
+    echo "ts,txid,socket,submit_rc" > "$d/tx-submissions.csv"
+    echo "2026-08-02T00:00:01Z,deadbeef,relay,0" >> "$d/tx-submissions.csv"
+
+    # verify.sh's in-round report — all predicates PASS
+    cat > "$d/report.md" <<'EOF'
+# verify report
+
+| id | predicate | result | detail |
+|---|---|---|---|
+| p1 | forge-cross-check | PASS | 10 canonical blocks |
+| p2 | per-bp-attribution | PASS | validator-only |
+| p3 | tx-inclusion | PASS | 1/1 |
+| p4 | tip-parity | PASS | 10/10 ticks |
+| p5 | tip-age | PASS | p99 1.5s |
+EOF
+
+    # tx-zoo per-round snapshot AT the pinned denominator, read from the
+    # manifest rather than hardcoded — a fixture that drifts from the pin makes
+    # the control case fail for a reason unrelated to what is being tested.
+    { echo "ts,script,status,txid,detail"
+      for i in $(seq 1 "$ZOO_N"); do echo "2026-08-02T00:00:01Z,script$i,PASS,txid$i,ok"; done
+    } > "$d/tx-results.csv"
+
+    { echo "ts,protocol,msg_type,peer,dir,size_bytes,outcome,notes"
+      for i in $(seq 1 "$n2n"); do echo "2026-08-02T00:00:01Z,handshake,msg$i,peer,out,10,REJECTED,ok"; done
+    } > "$d/n2n-trace.csv"
+
+    { echo "ts,query,status,dugite_sha256,cardano_sha256,equal,notes"
+      for i in $(seq 1 "$cli"); do echo "2026-08-02T00:00:01Z,query$i,EQUAL,aa,aa,true,"; done
+    } > "$d/cli-parity.csv"
+
+    { echo "name,category,status_relay,detail_relay,class_relay,status_cardano_bp,detail_cardano_bp,class_cardano_bp,match"
+      for i in $(seq 1 "$par"); do echo "01a-script$i,01,PASS,ok,ok,PASS,ok,ok,MATCH"; done
+    } > "$d/parity-matrix.csv"
+    cat > "$d/parity-matrix.meta.json" <<EOF
+{"expected": $par, "total": $par, "match": $par, "offdiag": 0, "classdiff": 0, "categories": ["01-bookkeeping"]}
+EOF
+
+    { echo "ts,scenario,action,recovery_sec,result"
+      for i in $(seq 1 "$CHAOS_N"); do echo "2026-08-02T00:00:01Z,scenario$i,act,5,PASS"; done
+    } > "$d/chaos-events.csv"
+
+    # rpc.csv (#960). Read from the manifest like ZOO_N/CHAOS_N so the fixture
+    # cannot drift away from the pinned denominator.
+    { echo "ts,check,api_version,endpoint,status,detail"
+      for i in $(seq 1 "$RPC_N"); do
+        echo "2026-08-02T00:00:01Z,check$i,v1alpha,svc/Method,PASS,ok"
+      done
+    } > "$d/rpc.csv"
+}
+
+# ---- Case runner -------------------------------------------------------------
+run_case() { # run_case <name> <expected_exit> <expect_substr> <evidence dirs...>
+    local name="$1" want_rc="$2" want_msg="$3"; shift 3
+    local out rc
+    out=$("$GEN" --preset standard --output-dir "$TMP/out-$RANDOM" \
+                 --denominators "$DENOM" "$@" 2>&1)
+    rc=$?
+    local ok=1
+    [ "$rc" -eq "$want_rc" ] || ok=0
+    if [ -n "$want_msg" ]; then
+        echo "$out" | grep -qi -- "$want_msg" || ok=0
+    fi
+    if [ "$ok" -eq 1 ]; then
+        printf '  \033[32mPASS\033[0m  %-52s (exit %d)\n' "$name" "$rc"
+        PASSED=$(( PASSED + 1 ))
+    else
+        printf '  \033[31mFAIL\033[0m  %-52s (exit %d, wanted %d)\n' "$name" "$rc" "$want_rc"
+        [ -n "$want_msg" ] && printf '        wanted message match: %s\n' "$want_msg"
+        printf '%s\n' "$out" | sed 's/^/        | /' | tail -20
+        FAILED=$(( FAILED + 1 ))
+    fi
+}
+
+echo "=== report gate-integrity tests ==="
+echo
+
+# --- Case 0: CONTROL. A complete evidence tree must still PASS. ---
+# Without this, "everything fails" would look like success.
+R1="$TMP/complete/r1"; R2="$TMP/complete/r2"
+make_round "$R1"; make_round "$R2"
+run_case "control: complete evidence passes" 0 "" "$R1" "$R2"
+
+# --- Case 1: absent cli-parity.csv (the #953 finding 1 shape) ---
+# Before this change the generator emitted cli_parity {0,0,0,0} and exited 0.
+R1="$TMP/no-cli/r1"; R2="$TMP/no-cli/r2"
+make_round "$R1"; make_round "$R2"; rm -f "$R1/cli-parity.csv" "$R2/cli-parity.csv"
+run_case "absent cli-parity.csv fails the gate" 3 "cli-parity.csv absent in EVERY round" "$R1" "$R2"
+
+# --- Case 2: absent n2n-trace.csv ---
+R1="$TMP/no-n2n/r1"; R2="$TMP/no-n2n/r2"
+make_round "$R1"; make_round "$R2"; rm -f "$R1/n2n-trace.csv" "$R2/n2n-trace.csv"
+run_case "absent n2n-trace.csv fails the gate" 3 "n2n-trace.csv absent in EVERY round" "$R1" "$R2"
+
+# --- Case 3: absent parity-matrix.csv (finding 2 — no durable record) ---
+R1="$TMP/no-parity/r1"; R2="$TMP/no-parity/r2"
+make_round "$R1"; make_round "$R2"; rm -f "$R1/parity-matrix.csv" "$R2/parity-matrix.csv"
+run_case "absent parity-matrix.csv fails the gate" 3 "parity-matrix.csv absent" "$R1" "$R2"
+
+# --- Case 4: tx-results.csv missing for a round → shared fallback (finding 3) ---
+# This is the shape that manufactured v2.4.5's "+12 tx-zoo pass" trend.
+R1="$TMP/shared/r1"; R2="$TMP/shared/r2"
+make_round "$R1"; make_round "$R2"; rm -f "$R2/tx-results.csv"
+mkdir -p "$TMP/shared/state"
+{ echo "ts,script,status,txid,detail"
+  for i in $(seq 1 85); do echo "2026-08-02T00:00:01Z,script$i,PASS,txid$i,ok"; done
+} > "$TMP/shared/state/results.csv"
+out=$("$GEN" --preset standard --output-dir "$TMP/out-shared" --denominators "$DENOM" \
+             --tx-zoo-state "$TMP/shared/state" "$R1" "$R2" 2>&1); rc=$?
+if [ "$rc" -eq 3 ] && echo "$out" | grep -q 'source="shared"'; then
+    printf '  \033[32mPASS\033[0m  %-52s (exit %d)\n' "shared tx-zoo source fails the gate" "$rc"
+    PASSED=$(( PASSED + 1 ))
+else
+    printf '  \033[31mFAIL\033[0m  %-52s (exit %d, wanted 3)\n' "shared tx-zoo source fails the gate" "$rc"
+    printf '%s\n' "$out" | sed 's/^/        | /' | tail -20
+    FAILED=$(( FAILED + 1 ))
+fi
+
+# --- Case 5: n2n short of its pinned denominator (finding 4 — no denominator) ---
+# 3 rows would previously have been reported as "3/3 adversarial, 0 panic".
+R1="$TMP/short-n2n/r1"; R2="$TMP/short-n2n/r2"
+make_round "$R1" 3; make_round "$R2" 3
+run_case "n2n below pinned denominator fails" 3 "below the pinned" "$R1" "$R2"
+
+# --- Case 5b: no round ran the full tx-zoo ---
+# Rounds 2/3 legitimately hold partial slices, so the denominator is asserted
+# across rounds rather than per round. If NO round ran it to completion the
+# gate must still fail.
+R1="$TMP/short-zoo/r1"; R2="$TMP/short-zoo/r2"
+make_round "$R1"; make_round "$R2"
+for d in "$R1" "$R2"; do
+    { echo "ts,script,status,txid,detail"
+      for i in $(seq 1 12); do echo "2026-08-02T00:00:01Z,script$i,PASS,txid$i,ok"; done
+    } > "$d/tx-results.csv"
+done
+run_case "no round ran the full tx-zoo fails" 3 "no round ran the full tx-zoo" "$R1" "$R2"
+
+# --- Case 5c: one full round + partial later rounds is ACCEPTED ---
+# The realistic 3-round shape must not be a false failure.
+R1="$TMP/partial-ok/r1"; R2="$TMP/partial-ok/r2"
+make_round "$R1"; make_round "$R2"
+{ echo "ts,script,status,txid,detail"
+  for i in $(seq 1 12); do echo "2026-08-02T00:00:01Z,script$i,PASS,txid$i,ok"; done
+} > "$R2/tx-results.csv"
+run_case "full zoo in round 1 + trickle in round 2 passes" 0 "" "$R1" "$R2"
+
+# --- Case 5d: cli-parity FULL of rows but mostly SKIPPED must FAIL ---
+#
+# Observed live: heavy tx-zoo/parity load pushed cardano-bp behind, the suite
+# emitted all 22 rows but 18 of them were `SKIP  TIP_UNSTABLE after 20
+# attempts`, and the gate reported "denominator: 22/22 queries OK".
+#
+# 22 rows, 4 comparisons. A denominator that counts rows EMITTED rather than
+# comparisons MADE is the #953 disease inside the #953 fix.
+R1="$TMP/skipped-cli/r1"; R2="$TMP/skipped-cli/r2"
+make_round "$R1"; make_round "$R2"
+{ echo "ts,query,status,dugite_sha256,cardano_sha256,equal,notes"
+  echo "2026-08-02T00:00:01Z,tip/era,EQUAL,aa,aa,true,"
+  for i in $(seq 2 "$CLI_N"); do
+    echo "2026-08-02T00:00:01Z,query$i,SKIP,,,,TIP_UNSTABLE after 20 attempts"
+  done
+} > "$R1/cli-parity.csv"
+cp "$R1/cli-parity.csv" "$R2/cli-parity.csv"
+run_case "cli-parity full of rows but mostly SKIPPED fails" 3 "below the pinned" "$R1" "$R2"
+
+# --- Case 6: cli-parity short of its denominator (finding 5) ---
+R1="$TMP/short-cli/r1"; R2="$TMP/short-cli/r2"
+make_round "$R1" 26 18; make_round "$R2" 26 18
+run_case "cli-parity below pinned denominator fails" 3 "below the pinned" "$R1" "$R2"
+
+# --- Case 7: --no-strict records the omission instead of hiding it ---
+# Non-strict must still be HONEST: exit 0 is allowed, silence is not.
+R1="$TMP/nostrict/r1"
+make_round "$R1"; rm -f "$R1/cli-parity.csv" "$R1/n2n-trace.csv" "$R1/parity-matrix.csv" "$R1/chaos-events.csv" "$R1/rpc.csv"
+OUTD="$TMP/out-nostrict"
+"$GEN" --preset standard --no-strict --output-dir "$OUTD" --denominators "$DENOM" "$R1" >/dev/null 2>&1
+rc=$?
+adm=$(jq -r '.gate_integrity.admissible' "$OUTD/report.json" 2>/dev/null)
+nmiss=$(jq -r '.gate_integrity.missing | length' "$OUTD/report.json" 2>/dev/null)
+cli_status=$(jq -r '.rounds[0].cli_parity.status' "$OUTD/report.json" 2>/dev/null)
+cli_equal=$(jq -r '.rounds[0].cli_parity.equal' "$OUTD/report.json" 2>/dev/null)
+if [ "$rc" -eq 0 ] && [ "$adm" = "false" ] && [ "${nmiss:-0}" -ge 4 ] \
+   && [ "$cli_status" = "absent" ] && [ "$cli_equal" = "null" ]; then
+    printf '  \033[32mPASS\033[0m  %-52s (exit %d)\n' "--no-strict records omissions, counts are null" "$rc"
+    PASSED=$(( PASSED + 1 ))
+else
+    printf '  \033[31mFAIL\033[0m  %-52s\n' "--no-strict records omissions, counts are null"
+    printf '        rc=%s admissible=%s missing=%s cli.status=%s cli.equal=%s\n' \
+           "$rc" "$adm" "$nmiss" "$cli_status" "$cli_equal"
+    printf '        (want rc=0 admissible=false missing>=4 status=absent equal=null)\n'
+    FAILED=$(( FAILED + 1 ))
+fi
+
+# --- Case 8: an absent suite must never serialize as 0 ---
+# This is the whole thesis of the schema v2 bump: 0 and "did not run" must not
+# be the same JSON.
+zeros=$(jq -r '[.rounds[0].cli_parity.equal, .rounds[0].n2n_adversarial.pass,
+                .rounds[0].parity_matrix.total, .rounds[0].chaos.pass]
+               | map(select(. == 0)) | length' "$OUTD/report.json" 2>/dev/null)
+if [ "${zeros:-1}" -eq 0 ]; then
+    printf '  \033[32mPASS\033[0m  %-52s\n' "absent suites serialize as null, never 0"
+    PASSED=$(( PASSED + 1 ))
+else
+    printf '  \033[31mFAIL\033[0m  %-52s (%s zero-valued)\n' "absent suites serialize as null, never 0" "$zeros"
+    FAILED=$(( FAILED + 1 ))
+fi
+
+# --- Case 8b: CLASSDIFF rows are counted separately from OFFDIAG ---
+# "both rejected" is weaker than it looks: same verdict for a different reason
+# is still a compat defect, and it must not be silently absorbed into `match`.
+R1="$TMP/classdiff/r1"
+make_round "$R1"
+{ echo "name,category,status_relay,detail_relay,class_relay,status_cardano_bp,detail_cardano_bp,class_cardano_bp,match"
+  echo "08e-no-inputs,08,PASS,rejected-NoInputs,NoInputs,PASS,rejected-BadInputsUTxO,BadInputsUTxO,CLASSDIFF"
+  echo "08f-double-spend,08,PASS,rejected-x,reason-matches-rule,PASS,rejected-y,other,KNOWNDIFF"
+  echo "05g-cc-hot-key-authorization,05,PASS,ok,(accepted),FAIL,submit,submit,STATEFUL"
+  for i in $(seq 4 41); do echo "01a-script$i,01,PASS,ok,ok,PASS,ok,ok,MATCH"; done
+} > "$R1/parity-matrix.csv"
+"$GEN" --preset standard --no-strict --output-dir "$TMP/out-cd" --denominators "$DENOM" "$R1" >/dev/null 2>&1
+cd_count=$(jq -r '.rounds[0].parity_matrix.classdiff' "$TMP/out-cd/report.json" 2>/dev/null)
+cd_match=$(jq -r '.rounds[0].parity_matrix.match' "$TMP/out-cd/report.json" 2>/dev/null)
+cd_od=$(jq -r '.rounds[0].parity_matrix.offdiag' "$TMP/out-cd/report.json" 2>/dev/null)
+cd_cat=$(jq -r '.rounds[0].parity_matrix.per_category["08"].classdiff' "$TMP/out-cd/report.json" 2>/dev/null)
+cd_known=$(jq -r '.rounds[0].parity_matrix.knowndiff' "$TMP/out-cd/report.json" 2>/dev/null)
+cd_state=$(jq -r '.rounds[0].parity_matrix.stateful' "$TMP/out-cd/report.json" 2>/dev/null)
+if [ "$cd_count" = "1" ] && [ "$cd_match" = "38" ] && [ "$cd_od" = "0" ] && [ "$cd_cat" = "1" ] \
+   && [ "$cd_known" = "1" ] && [ "$cd_state" = "1" ]; then
+    printf '  \033[32mPASS\033[0m  %-52s\n' "CLASSDIFF/KNOWNDIFF/STATEFUL counted separately"
+    PASSED=$(( PASSED + 1 ))
+else
+    printf '  \033[31mFAIL\033[0m  %-52s\n' "CLASSDIFF/KNOWNDIFF/STATEFUL counted separately"
+    printf '        classdiff=%s match=%s offdiag=%s per_cat08=%s known=%s stateful=%s (want 1/38/0/1/1/1)\n' \
+           "$cd_count" "$cd_match" "$cd_od" "$cd_cat" "$cd_known" "$cd_state"
+    FAILED=$(( FAILED + 1 ))
+fi
+
+# --- Case 9: output validates against the declared schema ---
+# v1 drifted from the emitted keys because nothing ever compared them.
+if python3 -c 'import jsonschema' 2>/dev/null; then
+    R1="$TMP/schema/r1"; make_round "$R1"
+    "$GEN" --preset standard --no-strict --output-dir "$TMP/out-schema" \
+           --denominators "$DENOM" "$R1" >/dev/null 2>&1
+    if python3 - "$SCRIPT_DIR/../schemas/report.v2.json" "$TMP/out-schema/report.json" <<'PY' 2>/dev/null
+import json,sys,jsonschema
+jsonschema.validate(json.load(open(sys.argv[2])), json.load(open(sys.argv[1])))
+PY
+    then
+        printf '  \033[32mPASS\033[0m  %-52s\n' "report.json validates against report.v2.json"
+        PASSED=$(( PASSED + 1 ))
+    else
+        printf '  \033[31mFAIL\033[0m  %-52s\n' "report.json validates against report.v2.json"
+        FAILED=$(( FAILED + 1 ))
+    fi
+else
+    printf '  \033[33mSKIP\033[0m  %-52s (python3 jsonschema unavailable)\n' "schema validation"
+fi
+
+echo
+echo "=== $PASSED passed, $FAILED failed ==="
+[ "$FAILED" -eq 0 ] || exit 1

@@ -11,7 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 ADDR_FILE="$LD_KEYS/utxo/payment.addr"
 if [ ! -f "$ADDR_FILE" ]; then
-    parity_record "utxo" "SKIP" "skip" "skip" "payment addr not found (run tx-zoo --setup first)"
+    parity_record "utxo" "SKIP" "skip" "skip" "env-skip: payment addr not found (run tx-zoo --setup first)"
     exit 0
 fi
 

@@ -108,14 +108,23 @@ devnet-report TAG="":
     tag_flag=""
     [ -n "{{TAG}}" ] && tag_flag="--tag {{TAG}}"
     mkdir -p "$REPO_ROOT/reports/devnet-validate"
+    # --no-strict: this recipe deliberately reports ONE round from whatever
+    # evidence happens to be on disk, so it cannot satisfy the standard
+    # preset's manifest (cli-parity / protocols / parity-matrix run once per
+    # gate, not once per soak). The flag does not hide the omission — the
+    # generated report carries gate_integrity.admissible=false and lists every
+    # missing artifact, so this output can never be mistaken for a release
+    # gate. For a real gate use the 3-round workflow in
+    # .claude/skills/devnet-validate/SKILL.md, which runs strict.
     "$REPO_ROOT/.claude/skills/devnet-validate/scripts/generate-release-report.sh" \
         --preset standard \
+        --no-strict \
         $tag_flag \
         --round-names "soak" \
         --tx-zoo-state tx-zoo/state \
         --output-dir "$REPO_ROOT/reports/devnet-validate" \
         "$latest"
-    echo "Report written to reports/devnet-validate/"
+    echo "Report written to reports/devnet-validate/ (NOT a release gate — see gate_integrity)"
 
 # Run smoke devnet-validate (single boot, ~5 min). PR gate for core crates.
 devnet-validate-smoke:
@@ -151,6 +160,16 @@ devnet-validate-smoke:
         "$EVD"
     echo "Smoke report written to reports/devnet-validate/"
 
+# Self-test the release-gate reporting layer (no devnet required, ~10s).
+# Proves the generator goes RED on absent / short / cross-round evidence and
+# that the pinned denominators still match the suites on disk. Run this after
+# touching anything under .claude/skills/devnet-validate/.
+devnet-gate-selftest:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    .claude/skills/devnet-validate/scripts/test-report-integrity.sh
+    .claude/skills/devnet-validate/scripts/test-denominators.sh
+
 # Run extended devnet-validate (~75 min). Used for release tagging.
 devnet-validate-extended:
     #!/usr/bin/env bash
@@ -174,6 +193,13 @@ devnet-validate-extended:
             [ "$B" -ge 5 ] && break
         done
         EVIDENCE_DIR="$EVD" ./tx-zoo/run-all.sh
+        # UTxO RPC (gRPC) suite (#960). REQUIRED: the standard and extended
+        # preset manifests declare `rpc|rpc.csv|any`, so a round set without it
+        # now fails gate integrity (exit 3) rather than silently omitting the
+        # suite. Adding the manifest entry without this line would have broken
+        # this recipe.
+        ./rpc/run.sh "$EVD"
+        CHAOS_SET=extended ./chaos/run.sh "$EVD"
         EVIDENCE_DIR="$EVD" ./sync/bulk-sync-throughput.sh
         EVIDENCE_DIR="$EVD" ./perf/resource-health.sh
         EVIDENCE_DIR="$EVD" ./perf/log-level-predicate.sh

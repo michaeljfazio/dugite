@@ -34,7 +34,7 @@ Both off-diagonal cells are bugs of the same severity. The skill MUST exercise e
 
 ### How to exercise it in practice
 
-For each representative tx (a balanced subset of all 59 zoo scripts plus the 19 negatives), run the same tx through **both** submit paths and capture both outcomes:
+For each representative tx (drawn from the 85 zoo scripts, which already include the 19 negatives), run the same tx through **both** submit paths and capture both outcomes:
 
 ```bash
 # Path A — submit to dugite (default)
@@ -58,16 +58,18 @@ The cells below describe what the skill currently exercises and where the gaps a
 |---|---|---|---|
 | 01 bookkeeping | 8 | ✓ via ZOO_SOCKET | Conway only — see "Era coverage" below |
 | 02 native scripts | 7 | ✓ | Conway |
-| 03 plutus V1/V2/V3 | 11 | ✓ | Conway (V1/V2/V3 wire formats all exercised) |
+| 03 plutus V1/V2/V3 | 13 | ✓ | Conway (V1/V2/V3 wire formats all exercised); spend+mint purposes ONLY (#955) |
 | 04 stake | 7 | ✓ | Conway |
 | 05 governance certs | 8 | ✓ | Conway |
 | 06 gov proposals | 7 | ✓ | Conway |
 | 07 voting | 7 | ✓ | Conway |
 | 08 negative (phase-1) | 19 | ✓ | Conway |
-| 10 gov lifecycle | 5 | E2E | Conway (1+ epoch boundary required) |
-| 11 mempool | 3 | dugite-only — gap | Conway |
+| 10 gov lifecycle | 5 | path B only — chain-global, see denominators.json | Conway (1+ epoch boundary required) |
+| 11 mempool | 3 | ✓ (since #954) | Conway |
 
-**Gap**: 11-mempool tests only dugite. Mirror against cardano-bp (TTL eviction + input-conflict) and assert symmetric behaviour.
+~~**Gap**: 11-mempool tests only dugite.~~ Closed by #954 — 11-mempool now runs
+through the parity oracle on both sockets. The scripts were always
+`ZOO_SOCKET`-parameterised; they had simply never been *invoked* on path C.
 
 ### Axis 2 — Validity coverage
 
@@ -424,21 +426,24 @@ This corner of the system is also a natural place for a "Path D" extension to th
 
 Tracked openly in this file so it's visible to every invocation of the skill:
 
-- [ ] Bidirectional submission for 11-mempool tests
-- [ ] Negative-tx symmetry for cardano-bp ingestion (mirror 08r to path C)
-- [ ] Plutus script-eval-failure negative cases
+- [x] Bidirectional submission for 11-mempool tests (#954)
+- [x] Negative-tx symmetry for cardano-bp ingestion — all 19 of 08-negative now run path C, and reject *reasons* are compared, not just verdicts (#954)
+- [x] Plutus script-eval-failure negative cases (#955 13f: always-false Certifying)
 - [ ] Replay attack negative test
 - [ ] Equivocation / double-forge negative test
+- [x] Two-forger topology so chain selection under contention, slot battles and competing-chain rollback are reachable at all (#957) — `LD_TWO_FORGERS=1 ./setup.sh` splits genesis stake, cardano-bp forges pool2, and a FOURTH node (`cardano-arbiter`, non-forging cardano-node peered to both producers) arbitrates. Neither producer is neutral, and two dugite nodes agreeing would only prove dugite is self-consistent
+- [~] Reward-withdrawal maturity round (#958) — `rewards-round.sh` written: vote-delegates first (PV10's `ConwayWdrlNotDelegatedToDRep` fires BEFORE any amount check and genesis registration cannot set a DRep), waits for genesis-delegated rewards at epoch 3, then runs the negative twin, the exact-balance positive and a multi-withdrawal. Not yet validated end-to-end
 - [ ] Mempool-size-DoS positive measurement (eviction order parity)
-- [ ] Tx-size lattice with `maxBlockBodySize` boundary check
-- [ ] Gov-lifecycle E2E for action classes other than `ParameterChange`
+- [~] Tx-size / value-size lattice — asset-map boundaries at 23/24/256, multi-policy values and mint+burn landed as `15-asset-lattice` (#961). **Still missing**: the tx-SIZE lattice around `maxTxSize`/`maxBlockBodySize` (witness-bloat variant), `after` timelocks, nested native combinators, metadata round-trip
+- [~] Gov-lifecycle E2E for action classes other than `ParameterChange` — TreasuryWithdrawals covered by `gov-enactment-round.sh`; NoConfidence and HardForkInitiation deliberately deferred (they dissolve the committee / bump PV and so destroy later tests) (#956)
 - [ ] Per-observer mempool-event capture into `tx-flow.csv`
+- [x] Chaos suite fixed, driven and wired (#959) — kill-9 key paths, socat removal, chaos/run.sh, ENV_SKIP as a counted class
 - [ ] Round 4 (adversarial & stress) as a standard preset
-- [ ] Enable `--rpc-port` on the devnet's `run.sh` for both dugite-bp and dugite-relay
+- [x] Enable `--rpc-port` on the devnet's `run.sh` for both dugite-bp and dugite-relay (#960) — 9090 (bp) / 9091 (relay), loopback only
 - [ ] `09-cli-parity/` scripts for the un-covered cli subcommands (see CLI surface section)
 - [ ] `09-cli-parity/errors/` for cli error-path parity
-- [ ] `rpc/` subdirectory implementing the 20+ UTxO RPC parity scripts
-- [ ] Path-D extension to the parity matrix: every tx-zoo tx also submitted via gRPC `submit_tx`
-- [ ] Adversarial-RPC stimuli (oversized message, stream-disconnect, concurrent duplicates, per-IP flood)
+- [~] `rpc/` subdirectory (#960) — service discovery for all 8 service/version combos, `ReadParams` field-by-field vs cardano-cli on v1alpha AND v1beta, `ReadTip`, `ReadUtxos`, `SubmitTx`. **Not covered**: `Sync.FetchBlock`/`DumpHistory`/`FollowTip` and the entire `Watch` service — asserted present, behaviour uncompared
+- [~] Path-D extension to the parity matrix (#960) — ONE representative tx is submitted via gRPC and asserted to reach all three observers. Extending path D to every tx-zoo script is still open
+- [~] Adversarial-RPC stimuli (#960) — undecodable CBOR, 8 MiB oversized message, zero-length tx, malformed TxoRef, concurrent duplicate submit, plus a mempool-hygiene assertion. **Not covered**: stream-disconnect mid-stream, per-IP flood
 
 When closing any of these, update both the skill and the corresponding evidence schema in `cross-validation.md`.

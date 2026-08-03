@@ -49,16 +49,45 @@ for script in "$SCRIPT_DIR"/[0-9]*.sh; do
     esac
 done
 
+ROWS=$(awk 'NR>1 && NF' "$ADV_CSV" | wc -l | tr -d ' ')
+
 log_info ""
 log_info "=== Adversarial N2N summary ==="
 log_info "  PASS:  $PASS_TOTAL"
 log_info "  FAIL:  $FAIL_TOTAL"
 log_info "  SKIP:  $SKIP_TOTAL"
-log_info "  TOTAL: $TOTAL"
+log_info "  TOTAL: $TOTAL scripts / $ROWS cases"
 log_info "  CSV:   $ADV_CSV"
 
 if [ "$FAIL_TOTAL" -gt 0 ]; then
     log_error "FAIL: $FAIL_TOTAL adversarial tests failed — zero panics and zero silent skips required"
     exit 1
 fi
+
+# DENOMINATOR GATE (#953)
+# -----------------------
+# Every script exiting 0 does NOT mean every stimulus fired. A case that
+# silently no-ops writes no row, and "N/N passed" computed from the rows you
+# produced is tautological — that is precisely how "26/26 adversarial" could
+# have meant 3/3. Compare against a count pinned OUTSIDE this run.
+DENOM_FILE="${DENOM_FILE:-$SCRIPT_DIR/../../../.claude/skills/devnet-validate/schemas/denominators.json}"
+if [ -f "$DENOM_FILE" ]; then
+    EXPECTED=$(jq -r '.n2n_adversarial.expected_cases // 0' "$DENOM_FILE")
+    EXPECTED_SCRIPTS=$(jq -r '.n2n_adversarial.expected_scripts // 0' "$DENOM_FILE")
+    if [ "$TOTAL" -lt "$EXPECTED_SCRIPTS" ]; then
+        log_error "FAIL: ran $TOTAL scripts, pinned denominator is $EXPECTED_SCRIPTS ($DENOM_FILE)"
+        exit 1
+    fi
+    if [ "$ROWS" -lt "$EXPECTED" ]; then
+        log_error "FAIL: n2n-trace.csv has $ROWS cases, pinned denominator is $EXPECTED"
+        log_error "A stimulus that did not fire leaves no row. Either a case regressed"
+        log_error "into a silent no-op, or a case was removed and the pin needs updating"
+        log_error "TOGETHER WITH on-disk evidence of the new count."
+        exit 1
+    fi
+    log_info "  denominator: $ROWS/$EXPECTED cases, $TOTAL/$EXPECTED_SCRIPTS scripts ✓"
+else
+    log_warn "denominator manifest not found ($DENOM_FILE) — case count is self-reported"
+fi
+
 log_info "PASS: all adversarial tests passed"

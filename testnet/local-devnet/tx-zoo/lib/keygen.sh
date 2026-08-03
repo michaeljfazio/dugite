@@ -59,6 +59,61 @@ gen_payment_with_stake() {
     fi
 }
 
+# Script-credential stake wallet (#955).
+#
+# The zoo's certificates, withdrawals and votes were ALL key-credentialed, so
+# the Certifying / Rewarding / Voting ScriptPurposes — each a distinct
+# ScriptContext construction path and a distinct redeemer-pointer tag on the
+# wire — were never constructed at all. This builds a wallet whose PAYMENT part
+# is an ordinary key (so it can pay fees and be spent normally) and whose STAKE
+# part is a script credential, which is what makes the script the subject of a
+# certificate / withdrawal / vote.
+#
+#   gen_script_stake <name> <script-file>
+#
+# Writes into $ZOO_KEYS/<name>/:
+#   payment.{skey,vkey}     ordinary payment key
+#   stake-script.plutus     copy of the guarding script (so tests need one path)
+#   stake-script.hash       its script hash
+#   stake.addr              stake address built from the SCRIPT credential
+#   payment-stake.addr      base address: key payment + script stake
+gen_script_stake() {
+    local name="$1" script_file="$2"
+    local dir="$ZOO_KEYS/$name"
+    mkdir -p "$dir"
+    gen_payment "$name"
+
+    if [ ! -s "$dir/stake-script.plutus" ]; then
+        [ -s "$script_file" ] || die "gen_script_stake: script not found: $script_file"
+        cp "$script_file" "$dir/stake-script.plutus"
+    fi
+
+    # Hash flavour must match the script flavour: a Plutus envelope hashes with
+    # `transaction policyid --script-file`; a native script uses the same
+    # command but the resulting hash is a native-script hash. cardano-cli picks
+    # the right one off the envelope type, so one call covers both.
+    if [ ! -s "$dir/stake-script.hash" ]; then
+        cardano-cli conway transaction policyid \
+            --script-file "$dir/stake-script.plutus" > "$dir/stake-script.hash"
+    fi
+
+    if [ ! -s "$dir/stake.addr" ]; then
+        cardano-cli conway stake-address build \
+            --stake-script-file "$dir/stake-script.plutus" \
+            --testnet-magic "$LD_MAGIC" \
+            --out-file "$dir/stake.addr"
+    fi
+
+    if [ ! -s "$dir/payment-stake.addr" ]; then
+        cardano-cli conway address build \
+            --payment-verification-key-file "$dir/payment.vkey" \
+            --stake-script-file             "$dir/stake-script.plutus" \
+            --testnet-magic "$LD_MAGIC" \
+            --out-file "$dir/payment-stake.addr"
+    fi
+    zoo_info "  script-stake wallet: $name (cred $(cut -c1-16 < "$dir/stake-script.hash")…)"
+}
+
 gen_drep() {
     local name="$1"
     local dir="$ZOO_KEYS/$name"
@@ -271,6 +326,13 @@ keygen_all() {
     gen_cc   "cc-1"
     gen_cc   "cc-2"
     gen_pool "pool3"
+    # Script-credential stake wallets for the non-spend/mint script purposes
+    # (#955). always-true drives the positives; always-false is the negative
+    # twin that must take the phase-2 collateral path; the native one proves
+    # the same certificate/withdrawal surface works without Plutus at all.
+    gen_script_stake "script-stake-v3"        "$ZOO_LIB/plutus/always-true-v3.plutus"
+    gen_script_stake "script-stake-v3-false"  "$ZOO_LIB/plutus/always-false-v3.plutus"
+    gen_script_stake "script-stake-native"    "$ZOO_LIB/native/always-true.native.json"
     # Fund the sub-wallets so they can submit their own txs. The amount has
     # to cover SEVEN gov-action deposits in series (`govActionDeposit` from
     # conway-genesis.json — 100 000 000 000 lovelace = 100 K ADA on the
@@ -282,6 +344,13 @@ keygen_all() {
     # spends through it too.
     fund_address "$ZOO_KEYS/wallet-a/payment-stake.addr" 1500000000000 1000000000000
     fund_address "$ZOO_KEYS/wallet-b/payment-stake.addr" 1500000000000 1000000000000
+    # Script-stake wallets. Their PAYMENT credential is an ordinary key, so
+    # they fund and spend normally; only the stake side is script-guarded.
+    # 200 K ADA each covers the stake deposit, a DRep deposit, a gov-action
+    # deposit and fees with headroom.
+    for _w in script-stake-v3 script-stake-v3-false script-stake-native; do
+        fund_address "$ZOO_KEYS/$_w/payment-stake.addr" 200000000000 100000000000
+    done
     # Pre-split the genesis addr so plutus_collateral always finds a
     # spare UTxO (the 03 category locks + collateral pattern would
     # otherwise exhaust the single genesis UTxO).

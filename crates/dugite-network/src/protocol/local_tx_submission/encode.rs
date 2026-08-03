@@ -298,6 +298,7 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
 
         // Utxow tag 3: MissingScriptWitnessesUTXOW — tag(258) set of script hashes
         TxValidationError::MissingScriptWitness { credential }
+        | TxValidationError::MissingCertificateScriptWitness { credential }
         | TxValidationError::MissingWithdrawalScriptWitness { credential } => {
             if let Some(script_hash) = parse_hex_bytes(credential) {
                 encode_utxow_failure(enc, 3, |enc| {
@@ -379,6 +380,39 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
         // Ledger tag 5: ConwayTreasuryValueMismatch (swapped: [expected, supplied])
         // Note: This variant currently maps to ScriptFailed in serve.rs, so it won't
         // reach here. But if TxValidationError is extended, this handles it.
+
+        // Ledger tag 2: ConwayCertsFailure(ConwayCertsPredFailure)
+        //   CERTS tag 0: WithdrawalsNotInRewardsCERTS(Withdrawals)
+        //
+        // Wire shape: array(2)[2, array(2)[0, { reward_account_bytes => coin }]]
+        //
+        // This is the PV <= 10 form, and therefore the ONLY withdrawal failure
+        // reachable on mainnet/preprod/preview/devnet today. It bundles both
+        // modes that PV >= 11 splits into tags 8 and 9 — missing account and
+        // wrong amount — because Haskell builds it from
+        // `unWithdrawals invalid <> fmap mismatchSupplied incomplete`, keeping
+        // only the SUPPLIED coin. There is deliberately no expected value here.
+        //
+        // Before this arm existed the error fell through to a stringly-typed
+        // `ScriptFailed`, so cardano-cli saw
+        // `ConwayMempoolFailure "transaction validation failed"` where
+        // cardano-node returns the typed failure. Same class as #925 and the
+        // ProposalDepositIncorrect arm below: dugite reached the right VERDICT
+        // with the wrong REASON, which the parity oracle scores as CLASSDIFF.
+        TxValidationError::WithdrawalsNotInRewardsCERTS { bad } => {
+            enc.array(2).expect("infallible");
+            enc.u8(2).expect("infallible"); // Ledger tag 2: ConwayCertsFailure
+            enc.array(2).expect("infallible");
+            enc.u8(0).expect("infallible"); // CERTS tag 0
+            enc.map(bad.len() as u64).expect("infallible");
+            for (addr_hex, coin) in bad {
+                match parse_hex_bytes(addr_hex) {
+                    Some(bytes) => enc.bytes(&bytes).expect("infallible"),
+                    None => enc.bytes(addr_hex.as_bytes()).expect("infallible"),
+                };
+                enc.u64(*coin).expect("infallible");
+            }
+        }
 
         // Ledger tag 8: ConwayWithdrawalsMissingAccounts(Withdrawals)
         // Wire shape: array(2)[8, { reward_account_bytes => coin, ... }]
@@ -560,6 +594,31 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
         // (`EncCBOR ProposalProcedure`) and
         // `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`
         // (`ConwayGovPredFailure` tag 8).
+        // GOV tag 4: ProposalDepositIncorrect (Mismatch 'RelEQ Coin)
+        //
+        // Wire shape: array(2)[3, array(3)[4, declared, expected]] — the
+        // Mismatch is FLATTENED into the constructor, not nested.
+        //
+        // This is the opposite of how Mismatch appears inside Ledger tag 9
+        // IncompleteWithdrawals, where it is a map VALUE and therefore must be
+        // a self-contained array(2). In a constructor-field position Haskell
+        // encodes it as a GROUP (encodeListLen (1 + groupsize) <> tag <>
+        // encCBORGroup), so the two Coins sit directly in the constructor's
+        // array.
+        //
+        // Verified empirically against cardano-cli 11.0.0.0: the nested form
+        // produced `DecoderFailure ... DeserialiseFailure 10 "expected word"`
+        // — the client could not decode the rejection at all, which is worse
+        // than the generic reason it replaced.
+        TxValidationError::ProposalDepositIncorrect { declared, expected } => {
+            enc.array(2).expect("infallible");
+            enc.u8(3).expect("infallible"); // Ledger tag 3: ConwayGovFailure
+            enc.array(3).expect("infallible");
+            enc.u8(4).expect("infallible"); // GOV tag 4
+            enc.u64(*declared).expect("infallible");
+            enc.u64(*expected).expect("infallible");
+        }
+
         TxValidationError::InvalidPrevGovActionId { proposal, .. } => {
             let raw = dugite_serialization::encode_proposal_procedure(proposal);
             encode_gov_failure(enc, 8, |enc| {
@@ -806,6 +865,65 @@ mod tests {
     fn decode_utxo_tag(dec: &mut Decoder<'_>) -> u8 {
         let _arr = dec.array().unwrap();
         dec.u8().unwrap()
+    }
+
+    // ── PV<=10 withdrawal failure (the only reachable one today) ──
+
+    /// GOLDEN: `WithdrawalsNotInRewardsCERTS` must encode as
+    /// `[2, [0, {account => coin}]]` — Ledger tag 2 (ConwayCertsFailure)
+    /// wrapping CERTS tag 0.
+    ///
+    /// Before this arm existed the error fell through to a stringly-typed
+    /// `ScriptFailed` and reached cardano-cli as
+    /// `ConwayMempoolFailure "transaction validation failed"`. The rewards
+    /// round (#958) caught it on the first run that ever executed the
+    /// withdrawal path: dugite REJECTED the wrong-amount withdrawal — the
+    /// correct verdict — but cardano-node reported a withdrawal-class failure
+    /// and dugite reported a generic one. The parity oracle scores that
+    /// CLASSDIFF, and it is the same defect class as #925.
+    ///
+    /// Note there is deliberately NO expected-balance field: at PV<=10 Haskell
+    /// keeps only `mismatchSupplied`, so a decoder must not look for one.
+    #[test]
+    fn withdrawals_not_in_rewards_certs_encodes_as_certs_tag_0() {
+        let acct = "e0".to_string() + &"11".repeat(28);
+        let err = TxValidationError::WithdrawalsNotInRewardsCERTS {
+            bad: vec![(acct.clone(), 1_107_046_523)],
+        };
+        let bytes = encode_apply_tx_err(&err, 6);
+
+        let (era_id, n) = decode_outer(&bytes);
+        assert_eq!(era_id, 6, "Conway era id");
+        assert_eq!(n, 1, "exactly one failure");
+
+        let mut dec = Decoder::new(&bytes);
+        dec.array().unwrap();
+        dec.array().unwrap();
+        let _era = dec.u16().unwrap();
+        dec.array().unwrap();
+
+        assert_eq!(
+            decode_ledger_tag(&mut dec),
+            2,
+            "Ledger tag 2 = ConwayCertsFailure"
+        );
+
+        let _certs_arr = dec.array().unwrap();
+        assert_eq!(
+            dec.u8().unwrap(),
+            0,
+            "CERTS tag 0 = WithdrawalsNotInRewardsCERTS"
+        );
+
+        let map_len = dec.map().unwrap().unwrap();
+        assert_eq!(map_len, 1, "one bad withdrawal");
+        let key = dec.bytes().unwrap();
+        assert_eq!(
+            key.len(),
+            29,
+            "reward account is 29 bytes (header + 28-byte cred)"
+        );
+        assert_eq!(dec.u64().unwrap(), 1_107_046_523, "the SUPPLIED amount");
     }
 
     // ── Parsing tests ──
@@ -1876,6 +1994,44 @@ mod tests {
             reason.contains("1:"),
             "must decode script disc=1, got: {reason}"
         );
+    }
+
+    /// CBOR golden: `ProposalDepositIncorrect` (Ledger tag 3, GOV tag 4).
+    ///
+    /// Payload is `Mismatch 'RelEQ Coin`, FLATTENED into the constructor
+    /// array (encCBORGroup), unlike the Mismatch values inside Ledger tag 9
+    /// `IncompleteWithdrawals`, which are map values and therefore nested.
+    ///
+    /// Expected wire (ConwayLedgerPredFailure only):
+    ///   `8203 8304 <declared> <expected>`
+    ///   = array(2)[3, array(3)[4, declared, expected]]
+    #[test]
+    fn test_encode_proposal_deposit_incorrect_golden() {
+        let err = TxValidationError::ProposalDepositIncorrect {
+            declared: 99_999_999_999,
+            expected: 100_000_000_000,
+        };
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        encode_conway_ledger_pred_failure(&mut enc, &err);
+        let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+        eprintln!("ProposalDepositIncorrect bytes = {hex}");
+
+        // Mismatch is FLATTENED into the constructor array — array(3), not
+        // array(2) wrapping a nested array(2). cardano-cli rejects the nested
+        // form with DeserialiseFailure "expected word".
+        let mut dec = Decoder::new(&buf);
+        assert_eq!(dec.array().unwrap(), Some(2), "outer array(2)");
+        assert_eq!(dec.u8().unwrap(), 3, "Ledger tag 3 = ConwayGovFailure");
+        assert_eq!(
+            dec.array().unwrap(),
+            Some(3),
+            "gov array(3) — Mismatch flattened"
+        );
+        assert_eq!(dec.u8().unwrap(), 4, "GOV tag 4 = ProposalDepositIncorrect");
+        assert_eq!(dec.u64().unwrap(), 99_999_999_999, "declared");
+        assert_eq!(dec.u64().unwrap(), 100_000_000_000, "expected");
+        assert_eq!(dec.position(), buf.len(), "no trailing bytes");
     }
 
     // ── Issue #915: `InvalidPrevGovActionId` (Ledger tag 3, GOV tag 8) ──

@@ -78,7 +78,7 @@ log_info "$SCENARIO: scratch ${AVAIL}K free after fill"
 
 # Start dugite-bp targeting the nearly-full scratch DB
 SCRATCH_SOCK="/tmp/ld-$(id -u)/chaos-disk.sock"
-LOG_LINE_BEFORE=$(wc -l < "$LD_LOGS/dugite-bp.log" 2>/dev/null || echo 0)
+LOG_LINE_BEFORE=$(line_count "$LD_LOGS/dugite-bp.log")
 
 "$DUGITE_BIN" run \
     --config        "$LD_CONFIG/dugite-bp.config.json" \
@@ -92,8 +92,7 @@ SCRATCH_PID=$!
 
 sleep 10  # Give it time to attempt writes and hit the full-disk condition
 
-PANICS=$(cat /tmp/disk-chaos-node.log 2>/dev/null | \
-    grep -c -E 'panic|PANIC|thread.*panicked' || echo 0)
+PANICS=$(count_matching 'panic|PANIC|thread.*panicked' /tmp/disk-chaos-node.log)
 
 # The node may exit cleanly with an IO error, or may still be running (if
 # it hasn't tried to write yet). Both are acceptable — what's NOT acceptable

@@ -466,7 +466,17 @@ impl LedgerState {
     /// minimum-UTxO dispatch that fixes false `OutputTooSmall` rejections of
     /// real Shelley/Allegra/Mary mainnet transactions. Positional bincode
     /// layout change for every embedded `protocol_params`/`prev_protocol_params`.
-    pub(crate) const SNAPSHOT_VERSION: u8 = 31;
+    /// v32 (#966): `RatificationSnapshot` (embedded in `GovernanceState`, which
+    /// is bincode-serialized as part of every `LedgerState` snapshot) gained
+    /// `treasury: u64` — Haskell `ensTreasury`, the frozen pot that
+    /// `withdrawalCanWithdraw` gates `TreasuryWithdrawals` against. It was the
+    /// one `dpEnactState` term never captured, so ratification fell back to the
+    /// LIVE `epochs.treasury`, which by that point already included the current
+    /// boundary's `applyRUpd`. Haskell's is sealed one boundary earlier, so a
+    /// withdrawal that became affordable at boundary B enacted at B on dugite
+    /// and at B+1 on cardano-node. Positional bincode layout change: snapshots
+    /// written by v31 and earlier must be replayed, not loaded.
+    pub(crate) const SNAPSHOT_VERSION: u8 = 32;
 
     /// Save ledger state snapshot to disk using bincode serialization.
     ///

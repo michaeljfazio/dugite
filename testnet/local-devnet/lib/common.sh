@@ -23,11 +23,31 @@ LD_MAGIC=42
 LD_DUGITE_BP_PORT=3001
 LD_RELAY_PORT=3002
 LD_CARDANO_BP_PORT=3003
+# Two-forger arbiter (#957) — a THIRD cardano-node, non-forging, peered
+# directly with BOTH producers.
+#
+# Why an independent Haskell node is required rather than reading the winner
+# off dugite-relay: in two-forger mode the relay is itself a dugite process, so
+# "both dugite nodes agree on the fork winner" would only prove dugite is
+# self-consistent. Praos chain selection at equal block height is decided by a
+# tiebreaker, and the question this round exists to answer is whether dugite
+# applies the SAME tiebreaker as cardano-node — which needs a Haskell node that
+# saw both candidate blocks to arbitrate.
+LD_CARDANO_ARBITER_PORT=3004
 # Prometheus metrics ports — single-digit-incremented from 12798 (the
 # dugite-monitor default). dugite-bp keeps 12798. The relay gets 12799 to
 # avoid the two dugite processes fighting for the same listener.
 LD_DUGITE_BP_METRICS_PORT=12798
 LD_DUGITE_RELAY_METRICS_PORT=12799
+# UTxO RPC (gRPC) ports — #960.
+#
+# Until now `run.sh` never passed `--rpc-port` at all, so dugite-rpc's four
+# services (Query/Submit/Sync/Watch at v1alpha + v1beta) had ZERO end-to-end
+# coverage while SKILL.md listed gRPC `submit_tx` as a covered submit path and
+# "RPC oversized/replay/flood" as a covered actor. Both nodes now expose it,
+# bound to loopback only.
+LD_DUGITE_BP_RPC_PORT=9090
+LD_DUGITE_RELAY_RPC_PORT=9091
 # Unix-domain socket paths.
 #
 # macOS imposes a 104-byte SUN_LEN limit on sun_path; both the worktree path
@@ -38,6 +58,7 @@ mkdir -p "$LD_SOCK_DIR" 2>/dev/null || true
 LD_RELAY_SOCK="$LD_SOCK_DIR/relay.sock"
 LD_DUGITE_BP_SOCK="$LD_SOCK_DIR/dbp.sock"
 LD_CARDANO_BP_SOCK="$LD_SOCK_DIR/cbp.sock"
+LD_CARDANO_ARBITER_SOCK="$LD_SOCK_DIR/carb.sock"
 
 # Dugite binary discovered relative to repo root (LD_ROOT/../..)
 LD_REPO_ROOT="$(cd "$LD_ROOT/../.." && pwd)"
@@ -79,9 +100,24 @@ port_free() {
 }
 
 assert_ports_free() {
-    for p in "$LD_RELAY_PORT" "$LD_DUGITE_BP_PORT" "$LD_CARDANO_BP_PORT"; do
+    for p in "$LD_RELAY_PORT" "$LD_DUGITE_BP_PORT" "$LD_CARDANO_BP_PORT" \
+             "$LD_CARDANO_ARBITER_PORT" \
+             "$LD_DUGITE_BP_RPC_PORT" "$LD_DUGITE_RELAY_RPC_PORT"; do
         port_free "$p" || die "Port $p is in use — stop the conflicting process first"
     done
+}
+
+# ---- Wait for a TCP listener (gRPC has no unix socket to poll) ----
+wait_for_tcp_port() {
+    local port="$1" timeout="${2:-60}" i=0
+    while [ "$i" -lt "$timeout" ]; do
+        if lsof -iTCP:"$port" -sTCP:LISTEN -t >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
 }
 
 # ---- Wait for a unix socket to appear and be queryable ----

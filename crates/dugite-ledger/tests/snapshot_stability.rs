@@ -11,7 +11,27 @@ use dugite_primitives::protocol_params::ProtocolParameters;
 
 /// Create a deterministic LedgerState with known default values.
 fn canonical_ledger_state() -> LedgerState {
-    LedgerState::new(ProtocolParameters::mainnet_defaults())
+    let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+
+    // Populate the governance ratification snapshot.
+    //
+    // WHY: `LedgerState::new()` alone leaves every Option `None` and every
+    // collection empty, so the format hash below only ever covered top-level
+    // scalars. A positional bincode change INSIDE a nested optional structure
+    // was invisible to it — the guard could not go red for exactly the class
+    // of change it exists to catch.
+    //
+    // That is not hypothetical: adding `treasury` to `RatificationSnapshot`
+    // (#966) is a real layout change requiring SNAPSHOT_VERSION 31 -> 32, and
+    // this test stayed green through it because `ratification_snapshot` was
+    // `None` in the fixture. A guard that cannot fail is not a guard.
+    //
+    // `RatificationSnapshot` is embedded in `GovernanceState`, which is
+    // serialized as part of every `LedgerState` snapshot, so populating it
+    // here brings its layout under the hash.
+    state.capture_ratification_snapshot();
+
+    state
 }
 
 /// Round-trip: serialize → deserialize → serialize produces identical bytes.
@@ -56,16 +76,24 @@ fn snapshot_format_hash_stability() {
     // This hash was computed from the current LedgerStateSnapshot layout.
     // If this changes, existing snapshot files become unreadable.
     //
-    // Last update: SNAPSHOT_VERSION 30 → 31 (#919, 2026-07-29) —
-    // `ProtocolParameters` (embedded in every `protocol_params` /
-    // `prev_protocol_params` field) gained `min_utxo_value: Lovelace` (flat
-    // Shelley/Allegra/Mary `minUTxOValue`) and `coins_per_utxo_word: Lovelace`
-    // (lossless Alonzo `coinsPerUTxOWord`) — both required for the per-era
-    // minimum-UTxO dispatch that fixes false `OutputTooSmall` rejections of
-    // real Shelley/Allegra/Mary mainnet transactions. Positional bincode
-    // layout change. Pre-existing snapshots are quarantined on load and
-    // operators re-sync (no migration shim — see SNAPSHOT_VERSION docs).
-    const EXPECTED_HASH: &str = "45d8c48be6338552a0dd04a8fbd38a65eba5d6d14930644bff9351945e745a00";
+    // Last update: SNAPSHOT_VERSION 31 → 32 (#966, 2026-08-02) —
+    // `RatificationSnapshot` gained `treasury: u64` (Haskell `ensTreasury`,
+    // the frozen pot `withdrawalCanWithdraw` gates `TreasuryWithdrawals`
+    // against). It was the one `dpEnactState` term never captured, so
+    // ratification fell back to the LIVE treasury, which already included the
+    // current boundary's `applyRUpd` — one boundary newer than Haskell's,
+    // enacting withdrawals an epoch early.
+    //
+    // The same commit populates the fixture with a ratification snapshot. The
+    // fixture was previously a bare `LedgerState::new()`, so nested optional
+    // structures were absent from the serialized bytes and this hash could not
+    // detect a layout change inside them — the #966 field was added and this
+    // test stayed green. The hash therefore moves for TWO reasons here: the
+    // new field, and the fixture now actually covering the structure.
+    //
+    // Prior baseline (empty fixture, pre-#966):
+    //   45d8c48be6338552a0dd04a8fbd38a65eba5d6d14930644bff9351945e745a00
+    const EXPECTED_HASH: &str = "24039764909a573f5549262574928132b8e15d3bc9a6acc9e550e218db3a02e3";
 
     if EXPECTED_HASH == "COMPUTE_ON_FIRST_RUN" {
         panic!(

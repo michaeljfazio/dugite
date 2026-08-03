@@ -39,6 +39,18 @@ ALL_CATEGORIES=(
     # went unnoticed — 06-proposals runs before any enactment, where
     # prev_action_id=None is legitimately valid.
     12-post-enactment
+    # Plutus ScriptPurposes beyond spend/mint (#955). Runs last: 13d
+    # deregisters the script stake credential, and 13g/13h create their own
+    # DRep and governance action, so keeping it after 10/12 means it cannot
+    # perturb the governance lifecycle those categories assert on.
+    13-script-purposes
+    # Governance NEGATIVES (#956). After 06 (which creates the actions they
+    # vote on) and after 13 (which registers/deregisters its own DRep), so a
+    # rejection here is never an artefact of another category's state.
+    14-gov-negatives
+    # Multi-asset / size lattice (#961). Independent of governance state, so
+    # position is not load-bearing; last keeps the governance ordering intact.
+    15-asset-lattice
 )
 
 usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; }

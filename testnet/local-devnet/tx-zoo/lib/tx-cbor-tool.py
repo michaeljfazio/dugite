@@ -299,6 +299,97 @@ def sign_tx(buf, key_paths):
     return buf[:wstart] + encode_witness_set(witnesses) + buf[wend:]
 
 
+PURPOSE_NAMES = {
+    0: "Spending", 1: "Minting", 2: "Certifying",
+    3: "Rewarding", 4: "Voting", 5: "Proposing",
+}
+
+
+def redeemer_purposes(buf):
+    """Return [(tag, index, purpose_name), ...] for every redeemer in the tx.
+
+    Why this exists (#955): a test that submits a certificate guarded by a
+    script and merely checks the tx was accepted does NOT prove the Certifying
+    ScriptPurpose was constructed — cardano-cli might have built something else
+    entirely, or the credential might not have been script-based at all. Reading
+    the redeemer tags back off the wire turns "we think we exercised this
+    purpose" into "the bytes we submitted contained purpose N".
+
+    Conway (PV>=9) encodes redeemers as a MAP  {[tag, index] => [data, exunits]}.
+    Pre-Conway they are an ARRAY of [tag, index, data, exunits]. Both are
+    handled: the era gate is exactly the kind of thing this harness exists to
+    catch, so refusing to parse one of them would be self-defeating.
+    """
+    spans = tx_element_spans(buf)
+    if len(spans) < 2:
+        return []
+    wstart, wend = spans[1]
+    major, arg, pos = _head(buf, wstart)
+    if major != MT_MAP:
+        return []
+    out = []
+    n = arg
+    indefinite = (arg == INDEFINITE)
+    i = 0
+    while True:
+        if indefinite:
+            if buf[pos] == 0xFF:
+                break
+        elif i >= n:
+            break
+        i += 1
+        kmaj, karg, kpos = _head(buf, pos)
+        after_key = skip(buf, pos)
+        vpos = after_key
+        if kmaj == MT_UINT and karg == 5:
+            out.extend(_parse_redeemers(buf, vpos))
+        pos = skip(buf, vpos)
+    return out
+
+
+def _parse_redeemers(buf, pos):
+    """Parse the value of witness-set key 5 into [(tag, index, name), ...]."""
+    found = []
+    major, arg, p = _head(buf, pos)
+    if major == MT_MAP:
+        # Conway: {[tag, index] => [data, exunits]}
+        indefinite = (arg == INDEFINITE)
+        i = 0
+        while True:
+            if indefinite:
+                if buf[p] == 0xFF:
+                    break
+            elif i >= arg:
+                break
+            i += 1
+            # key is a 2-element array [tag, index]
+            kmaj, karg, kp = _head(buf, p)
+            if kmaj == MT_ARRAY:
+                tmaj, tag, tp = _head(buf, kp)
+                imaj, idx, ip = _head(buf, tp)
+                found.append((tag, idx, PURPOSE_NAMES.get(tag, "Unknown")))
+            p = skip(buf, p)      # past key
+            p = skip(buf, p)      # past value
+    elif major == MT_ARRAY:
+        # Pre-Conway: [ [tag, index, data, exunits], ... ]
+        indefinite = (arg == INDEFINITE)
+        i = 0
+        while True:
+            if indefinite:
+                if buf[p] == 0xFF:
+                    break
+            elif i >= arg:
+                break
+            i += 1
+            emaj, earg, ep = _head(buf, p)
+            if emaj == MT_ARRAY:
+                tmaj, tag, tp = _head(buf, ep)
+                imaj, idx, ip = _head(buf, tp)
+                found.append((tag, idx, PURPOSE_NAMES.get(tag, "Unknown")))
+            p = skip(buf, p)
+    return found
+
+
 def describe(buf):
     bstart, bend = body_span(buf)
     _head_start, items_start, _end, count, tagged = input_set_span(buf, bstart, bend)
@@ -359,6 +450,19 @@ def main(argv=None):
     p_hash = sub.add_parser("body-hash", help="print blake2b-256 of the tx body (txid)")
     p_hash.add_argument("--in", dest="inp", required=True)
 
+    p_rdmr = sub.add_parser(
+        "redeemers",
+        help="list the ScriptPurpose tag of every redeemer in the witness set",
+    )
+    p_rdmr.add_argument("--in", dest="inp", required=True)
+    p_rdmr.add_argument(
+        "--require",
+        dest="require",
+        default=None,
+        help="purpose name that MUST be present (Spending|Minting|Certifying|"
+             "Rewarding|Voting|Proposing); exit 1 if absent",
+    )
+
     p_dup = sub.add_parser("dup-input", help="duplicate one tx-body input entry")
     p_dup.add_argument("--in", dest="inp", required=True)
     p_dup.add_argument("--out", dest="out", required=True)
@@ -387,6 +491,21 @@ def main(argv=None):
             return 0
         if args.cmd == "body-hash":
             print(body_hash(buf).hex())
+            return 0
+        if args.cmd == "redeemers":
+            rs = redeemer_purposes(buf)
+            for tag, idx, name in rs:
+                print("%d %d %s" % (tag, idx, name))
+            if args.require:
+                if not any(name == args.require for _, _, name in rs):
+                    print(
+                        "tx-cbor-tool: no %s redeemer in this transaction "
+                        "(found: %s)"
+                        % (args.require,
+                           ", ".join(n for _, _, n in rs) or "none"),
+                        file=sys.stderr,
+                    )
+                    return 1
             return 0
         if args.cmd == "sign":
             new = sign_tx(buf, args.keys)

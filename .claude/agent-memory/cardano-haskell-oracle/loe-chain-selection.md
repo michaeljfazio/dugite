@@ -9,7 +9,23 @@ metadata:
 
 Tag: `release-ouroboros-consensus-0.30.0.1`
 SHA: `96a9e1b210c092485c8ec3d676c87ac16e2b3c1f`
-(Matches cardano-node 11.0.1 pinned dependency)
+
+**2026-08-02 CORRECTION: the claim that this SHA "matches cardano-node
+11.0.1 pinned dependency" is WRONG.** cardano-node has no git pin for
+ouroboros-consensus at all — it depends on it via CHaP with the version
+bound `ouroboros-consensus ^>= 3.0.1` (verified directly from
+`cardano-node/cardano-node.cabal` at tag `11.0.1`), which resolves to git
+tag `release-ouroboros-consensus-3.0.1.0`
+(SHA `c87aa760001e60f0f0d3353f793eb089adb917e7`), NOT `0.30.0.1`. See
+[[praos-chain-order-v3-verified]] for the resolution method and for
+confirmation that the `ChainOrder`/`preferCandidate` API itself changed
+shape between these two versions (Bool -> ShouldSwitch(reason), plus new
+Peras-weight parameters). The LoE-specific algorithm described below
+(`trimToLoE`, GDD governor, GSM-gating) has NOT been re-verified against
+`3.0.1.0` — treat it as plausible/likely-still-accurate background but not
+re-confirmed, and re-check `Storage/ChainDB/Impl/ChainSel.hs` +
+`Genesis/Governor.hs` at `release-ouroboros-consensus-3.0.1.0` before citing
+line-level specifics from this file in anything load-bearing.
 
 ## Key file locations
 

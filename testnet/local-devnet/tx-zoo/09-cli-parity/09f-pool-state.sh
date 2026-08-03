@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 POOL_ID_FILE="$LD_KEYS/pool1/pool.id"
 if [ ! -f "$POOL_ID_FILE" ]; then
-    parity_record "pool-state" "SKIP" "skip" "skip" "pool1 id not found (run setup.sh first)"
+    parity_record "pool-state" "SKIP" "skip" "skip" "env-skip: pool1 id not found (run setup.sh first)"
     exit 0
 fi
 

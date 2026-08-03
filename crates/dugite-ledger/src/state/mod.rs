@@ -496,6 +496,28 @@ pub struct RatificationSnapshot {
     pub enacted_constitution: Option<GovActionId>,
     /// The epoch when this snapshot was captured.
     pub snapshot_epoch: EpochNo,
+    /// Treasury pot at snapshot time — Haskell `ensTreasury` (#966).
+    ///
+    /// `withdrawalCanWithdraw` gates a `TreasuryWithdrawals` action on this
+    /// value, and Haskell reads it from the frozen pulser, NOT from live
+    /// state. `setFreshDRepPulsingState` seals it at the end of
+    /// `epochTransition`:
+    ///
+    /// ```haskell
+    /// dpEnactState = mkEnactState govState & ensTreasuryL .~ epochState ^. treasuryL
+    /// ```
+    ///
+    /// The pulser sealed at boundary N->N+1 is consumed at boundary
+    /// N+1->N+2, so RATIFY is structurally blind to the `applyRUpd` credit
+    /// landing at the boundary it is running on — it sees the treasury as of
+    /// ONE BOUNDARY EARLIER.
+    ///
+    /// Before this field existed, ratification seeded its cap basis from the
+    /// live `epochs.treasury`, which at that point already included the
+    /// current boundary's RUPD. A withdrawal that only became affordable at
+    /// boundary B would therefore enact at B on dugite and at B+1 on
+    /// cardano-node — a chain split, in the accept-early direction.
+    pub treasury: u64,
     /// Vote delegations (credential → DRep) at snapshot time.
     ///
     /// Used by `default_spo_vote()` during ratification to determine the

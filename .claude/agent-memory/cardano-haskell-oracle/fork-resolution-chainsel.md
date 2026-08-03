@@ -4,6 +4,37 @@ description: Complete ChainSel algorithm: addBlock flow, preferAnchoredCandidate
 type: reference
 ---
 
+**2026-08-02 CORRECTION**: this file was written against an unstated/older
+ouroboros-consensus version. Re-verified 2026-08-02 directly against the tag
+that actually matches cardano-node 11.0.1
+(`release-ouroboros-consensus-3.0.1.0`, resolved from cardano-node's own
+`.cabal` bound `ouroboros-consensus ^>= 3.0.1` — see
+[[praos-chain-order-v3-verified]] for the resolution method). Findings below
+are STILL CORRECT in spirit (ShouldSwitch/ShouldNotSwitch semantics,
+incumbent-wins-ties, comparePraos decision table, sort-always-uses-
+UnrestrictedVRFTiebreaker) but two naming details are stale:
+- `preferAnchoredCandidate`/`preferCandidate` do genuinely return
+  `ShouldSwitch (ReasonForSwitch sv)` at 3.0.1.0 (this file's ADT
+  terminology was right), but the actual reason constructors are
+  `PraosReasonForSwitch = HigherOCert (Comparing Word64) | VRFTiebreak
+  (Comparing (OutputVRF (VRF c)))` and `SelectViewReasonForSwitch = Longer
+  (Comparing (WithOrigin BlockNo)) | SelectViewTiebreak (...)` — not the
+  bare `Right`/`HigherOCert`/`VRFTiebreak`/`Longer` sketch below in isolation
+  (close, but see the verified file for exact shape incl. the `Comparing`
+  wrapper and the Peras-related `Either`-wrapping at the
+  `preferAnchoredCandidate` level: `ReasonForSwitch' blk = Either (...
+  weighted ...) (ReasonForSwitch (SelectView p))`).
+- Candidate sorting uses `compareAnchoredFragments`, not a function named
+  `compareChainDiffs` (no such name exists in the 3.0.1.0 source; may have
+  been a paraphrase in the original write-up).
+- `preferAnchoredCandidate`/`compareAnchoredFragments` at 3.0.1.0 also take a
+  `PerasWeightSnapshot blk` parameter (dormant no-op today — see the
+  verified file for why this doesn't change current behavior).
+
+See [[praos-chain-order-v3-verified]] for source-quoted, tag-pinned detail,
+and [[chaindb-addblock-tracer-namespaces]] for the cardano-node trace
+namespace strings this file's "addBlock flow" section corresponds to.
+
 # Fork Resolution / Chain Selection in ouroboros-consensus
 
 ## Primary Files

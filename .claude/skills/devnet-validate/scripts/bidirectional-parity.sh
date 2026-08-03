@@ -46,17 +46,42 @@ CATS=()
 # cardano-bp batch and reporting PASS off the relay batch alone.
 BATCH_FUND_LOVELACE=6000000000000
 SKIP_FUNDING=0
+# Reject-reason comparison. `both rejected` is a weaker predicate than it looks:
+# dugite and Haskell can agree a tx is invalid while disagreeing about WHY, and
+# a wrong-reason rejection is a real compatibility defect (a client cannot act
+# on it). The methodology doc grades accept-set mismatches P0 and reject-reason
+# mismatches P2 — both are reported, and both fail by default, because a check
+# that reports without enforcing is the disease this harness keeps catching.
+ALLOW_CLASS_DRIFT=0
+SCRIPT_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DENOM_FILE="${DENOM_FILE:-$SCRIPT_SELF_DIR/../schemas/denominators.json}"
 while [ $# -gt 0 ]; do
     case "$1" in
         --out) OUT="$2"; shift 2 ;;
         --fund) BATCH_FUND_LOVELACE="$2"; shift 2 ;;
         --skip-funding) SKIP_FUNDING=1; shift ;;
+        --allow-class-drift) ALLOW_CLASS_DRIFT=1; shift ;;
+        --denominators) DENOM_FILE="$2"; shift 2 ;;
         -h|--help) sed -n '2,/^set -e/p' "$0" | sed 's/^# \{0,1\}//' ; exit 0 ;;
         --*) echo "unknown flag: $1" >&2; exit 2 ;;
         *) CATS+=("$1"); shift ;;
     esac
 done
-[ ${#CATS[@]} -eq 0 ] && { echo "usage: $0 [--out file] [--fund lovelace] CAT [CAT ...]" >&2; exit 2; }
+
+# No categories named => use the standard gate set from the pinned manifest.
+# Hardcoding the list at every call site is how it stayed at 4 categories (41 of
+# 85 scripts) while the release notes said "41/41" without ever stating the 85.
+if [ ${#CATS[@]} -eq 0 ]; then
+    if [ -f "$DENOM_FILE" ]; then
+        while IFS= read -r c; do CATS+=("$c"); done < <(
+            jq -r '.parity_matrix.required_categories_standard[]' "$DENOM_FILE")
+        echo "no categories given — using the standard set from $(basename "$DENOM_FILE"): ${CATS[*]}" >&2
+    else
+        echo "usage: $0 [--out file] [--fund lovelace] CAT [CAT ...]" >&2
+        echo "(and no denominator manifest at $DENOM_FILE to take the default set from)" >&2
+        exit 2
+    fi
+fi
 
 if [ ! -d tx-zoo ] || [ ! -f lib/common.sh ]; then
     echo "must be run from testnet/local-devnet/ (no tx-zoo/ or lib/common.sh here)" >&2
@@ -245,6 +270,50 @@ fi
 mkdir -p "$(dirname "$OUT")"
 
 awk -F, '
+    # Normalise a result detail into a comparable REJECTION CLASS.
+    #
+    # tx-zoo records the rule it matched in the detail column, e.g.
+    #   rejected-NoInputs / rejected-InputNotFound / rejected-ValueNotConserved
+    #   rejected-as-expected                      (generic: script matched only a pattern)
+    #   duplicate-input-rejected rc=1 reason-matches-rule: <node text>
+    # Reduce to the discriminating token so the two sockets can be compared
+    # without dragging in node-specific prose, txids or timings.
+    #
+    # CRITICAL: only ACCEPTANCE-side details that describe a rejection are
+    # comparable. For a tx that was accepted, the detail is free-form metadata
+    # about THIS run — a minted policy id, a script address, a reference txid —
+    # and every one of those legitimately differs between batches because each
+    # batch uses its own keys. Comparing those produced 7 false CLASSDIFFs on
+    # the first full run (02a-02d, 02f, 03h, 03i). Gate on the detail actually
+    # looking like a rejection.
+    function is_rejection(d) { return (d ~ /reject/) }
+    function rclass(d,    m, parts) {
+        if (d == "") return ""
+        if (!is_rejection(d)) return "(accepted)"
+        if (match(d, /rejected-[A-Za-z0-9_]+/)) {
+            m = substr(d, RSTART, RLENGTH)
+            sub(/^rejected-/, "", m)
+            return m
+        }
+        if (d ~ /reason-matches-rule/) return "reason-matches-rule"
+        split(d, parts, /[ \t]+/)
+        return parts[1]
+    }
+    # Scripts whose subject is a GLOBAL, non-replicable devnet resource, so the
+    # second batch necessarily operates on state the first batch already
+    # mutated. These are not parity defects and must not be counted as such —
+    # but they must not be silently dropped either, so they get their own
+    # verdict and appear in the matrix with the reason.
+    BEGIN {
+        stateful["05g-cc-hot-key-authorization"] = "constitutional committee is seated at genesis and is devnet-global: batch 1 resigns cc-1, so batch 2 correctly gets ConwayCommitteeHasPreviouslyResigned. Giving batch 2 its own committee needs an UpdateCommittee governance action (2+ epoch boundaries)."
+        stateful["05h-cc-resign"] = "same: a cold-key resignation is one-shot per member, and only cc-1/cc-2 are seated."
+        # Deliberate, documented protocol difference (#925): a Conway duplicate
+        # input fails at the CBOR set layer. Haskell drops the connection
+        # ("mux: bearer closed"); dugite answers a structured MsgRejectTx naming
+        # the rule. dugite is deliberately more informative here — this is not a
+        # defect and must not be normalised away silently.
+        known_class_diff["08f-double-spend"] = "#925 — Haskell drops the connection at the codec layer; dugite returns a structured MsgRejectTx"
+    }
     FNR==1 { next }
     FILENAME ~ /relay\.csv$/      { r_status[$2]=$3; r_detail[$2]=$5; names[$2]=1; next }
     FILENAME ~ /cardano-bp\.csv$/ { c_status[$2]=$3; c_detail[$2]=$5; names[$2]=1; next }
@@ -262,29 +331,101 @@ awk -F, '
             rd = (n in r_detail) ? r_detail[n] : ""
             cd = (n in c_detail) ? c_detail[n] : ""
             gsub(/,/," ",rd); gsub(/,/," ",cd)
-            match_flag = (rs == cs) ? "MATCH" : "OFFDIAG"
-            print n "," rs "," rd "," cs "," cd "," match_flag
+            rc = rclass(rd); cc = rclass(cd)
+            # Derive the category from the numeric prefix (01a-... -> 01).
+            split(n, np, "-"); pfx = np[1]; gsub(/[a-z]+$/, "", pfx)
+            # STATEFUL is claimed only when the row ACTUALLY differs. If a
+            # future genesis seats enough committee members for batch 2 to have
+            # its own resign target, 05g/05h start matching and are counted as
+            # MATCH — the exclusion retires itself instead of becoming a
+            # permanent blind spot. An exclusion that cannot notice it is no
+            # longer needed is just another silent gap.
+            if ((n in stateful) && rs != cs) match_flag = "STATEFUL"
+            else if (rs != cs)             match_flag = "OFFDIAG"   # P0: accept-set differs
+            else if (rc != cc) {
+                match_flag = (n in known_class_diff) ? "KNOWNDIFF" : "CLASSDIFF"
+            }
+            else                           match_flag = "MATCH"
+            print n "," pfx "," rs "," rd "," rc "," cs "," cd "," cc "," match_flag
         }
     }
 ' "$ZOO_STATE_TOP/results.relay.csv" "$ZOO_STATE_TOP/results.cardano-bp.csv" \
     | grep -v '^$' | LC_ALL=C sort > "$OUT.tmp"
 # Header first, then the sorted body — the header never enters the sort.
 {
-    echo "name,status_relay,detail_relay,status_cardano_bp,detail_cardano_bp,match"
+    echo "name,category,status_relay,detail_relay,class_relay,status_cardano_bp,detail_cardano_bp,class_cardano_bp,match"
     cat "$OUT.tmp"
 } > "$OUT"
 rm -f "$OUT.tmp"
 
 OFFDIAG=$(awk -F, 'NR>1 && $NF=="OFFDIAG" {c++} END {print c+0}' "$OUT")
-TOTAL=$(awk 'NR>1' "$OUT" | wc -l | tr -d ' ')
+CLASSDIFF=$(awk -F, 'NR>1 && $NF=="CLASSDIFF" {c++} END {print c+0}' "$OUT")
+KNOWNDIFF=$(awk -F, 'NR>1 && $NF=="KNOWNDIFF" {c++} END {print c+0}' "$OUT")
+STATEFUL=$(awk -F, 'NR>1 && $NF=="STATEFUL" {c++} END {print c+0}' "$OUT")
+MATCHED=$(awk -F, 'NR>1 && $NF=="MATCH" {c++} END {print c+0}' "$OUT")
+TOTAL=$(awk 'NR>1 && NF' "$OUT" | wc -l | tr -d ' ')
+
+# Sidecar meta — carries the denominator this invocation was MEANT to cover,
+# so the release-report generator can tell "41 of 41 requested" from "41 rows
+# happened to be produced" (#953). The CSV alone cannot express intent.
+META="${OUT%.csv}.meta.json"
+{
+    printf '{\n'
+    printf '  "expected": %d,\n' "${#EXPECTED_SCRIPTS[@]}"
+    printf '  "total": %d,\n'    "$TOTAL"
+    printf '  "match": %d,\n'    "$MATCHED"
+    printf '  "offdiag": %d,\n'  "$OFFDIAG"
+    printf '  "classdiff": %d,\n' "$CLASSDIFF"
+    printf '  "knowndiff": %d,\n' "$KNOWNDIFF"
+    printf '  "stateful": %d,\n'  "$STATEFUL"
+    printf '  "categories": ['
+    for ci in "${!CATS[@]}"; do
+        [ "$ci" -gt 0 ] && printf ', '
+        printf '"%s"' "${CATS[$ci]}"
+    done
+    printf ']\n'
+    printf '}\n'
+} > "$META"
+
 echo
 echo "=== parity matrix written to $OUT ==="
-echo "  total scripts: $TOTAL  off-diagonal: $OFFDIAG"
+echo "=== parity meta   written to $META ==="
+echo "  total scripts: $TOTAL  match: $MATCHED  off-diagonal: $OFFDIAG"
+echo "  class-diff: $CLASSDIFF  known-diff: $KNOWNDIFF  stateful-excluded: $STATEFUL"
+echo "  per category:"
+awk -F, 'NR>1 && NF {t[$2]++; if($NF=="OFFDIAG") o[$2]++; else if($NF=="CLASSDIFF") c[$2]++}
+         END {for (k in t) printf "    %-6s %3d scripts  offdiag=%d classdiff=%d\n", k, t[k], o[k]+0, c[k]+0}' \
+    "$OUT" | LC_ALL=C sort
 if [ "$OFFDIAG" -gt 0 ]; then
     echo
-    echo "OFF-DIAGONAL CELLS:"
-    awk -F, 'NR>1 && $NF=="OFFDIAG" {printf "  %-44s relay=%-6s cardano-bp=%-6s\n", $1, $2, $4}' "$OUT"
+    echo "OFF-DIAGONAL CELLS (P0 — one node accepts what the other rejects):"
+    awk -F, 'NR>1 && $NF=="OFFDIAG" {printf "  %-44s relay=%-8s cardano-bp=%-8s\n", $1, $3, $6}' "$OUT"
     exit 1
+fi
+if [ "$STATEFUL" -gt 0 ]; then
+    echo
+    echo "PATH-C STATEFUL EXCLUSIONS (not parity defects — global devnet resource):"
+    awk -F, 'NR>1 && $NF=="STATEFUL" {printf "  %-44s relay=%-8s cardano-bp=%-8s\n", $1, $3, $6}' "$OUT"
+    echo "  Reasons are recorded in the BEGIN block of this script."
+fi
+if [ "$KNOWNDIFF" -gt 0 ]; then
+    echo
+    echo "KNOWN REJECT-REASON DIFFERENCES (documented, deliberate):"
+    awk -F, 'NR>1 && $NF=="KNOWNDIFF" {printf "  %-44s relay=%-22s cardano-bp=%-22s\n", $1, $5, $8}' "$OUT"
+fi
+if [ "$CLASSDIFF" -gt 0 ]; then
+    echo
+    echo "REJECT-REASON MISMATCHES (P2 — same verdict, different reason):"
+    awk -F, 'NR>1 && $NF=="CLASSDIFF" {printf "  %-44s relay=%-24s cardano-bp=%-24s\n", $1, $5, $8}' "$OUT"
+    if [ "$ALLOW_CLASS_DRIFT" -eq 0 ]; then
+        echo
+        echo "Both nodes agree the transaction is invalid but disagree about WHY."
+        echo "A client cannot act on a wrong reason, so this is a real compat defect."
+        echo "Fix it, or — if the difference is cosmetic — normalise it in rclass()"
+        echo "rather than passing --allow-class-drift, which silences ALL of them."
+        exit 1
+    fi
+    echo "  (--allow-class-drift set — reported, not fatal)"
 fi
 
 # COMPLETENESS GATE — a symmetric matrix is worthless if it is also empty.
@@ -310,5 +451,5 @@ if [ ${#MISSING[@]} -gt 0 ]; then
     exit 1
 fi
 
-echo "  verdict: PASS ($TOTAL/${#EXPECTED_SCRIPTS[@]} requested scripts classified identically on both sockets)"
+echo "  verdict: PASS ($MATCHED/${#EXPECTED_SCRIPTS[@]} classified identically; $KNOWNDIFF known reason-diff, $STATEFUL stateful-excluded)"
 exit 0

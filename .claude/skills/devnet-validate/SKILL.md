@@ -11,13 +11,27 @@ End-to-end validation harness that exercises dugite on a local 3-node devnet, cr
 
 ```
    dugite-bp (forger)  ── N2N ──▶  dugite-relay  ── N2N ──▶  cardano-relay
-     :3000 :12798                    :3001 :12799              :3002 (Haskell)
+   :3001 :12798 :9090               :3002 :12799 :9091          :3003 (Haskell)
 ```
 
 The user-facing names map to scripts/configs as follows:
-- `dugite-bp` (sole forger, holds 95%+ stake)
+- `dugite-bp` (sole forger by default, holds 100% of the delegated stake)
 - `dugite-relay` (middle hop, no keys)
 - `cardano-relay` — implemented as `cardano-bp` in scripts, but configured as a non-forging relay (no `--shelley-{kes,vrf,operational-certificate}` flags). It is the Haskell validator.
+
+Ports are exact as of 2026-08-02 (they were previously documented as 3000/3001/3002, which matched nothing on disk): N2N 3001/3002/3003, Prometheus 12798/12799, UTxO RPC 9090/9091.
+
+**Two-forger mode** (`LD_TWO_FORGERS=1 ./setup.sh`, #957) changes this: the genesis delegation splits 60/40, `cardano-bp` gets pool2's forging keys and becomes a real competing producer, and a FOURTH node appears —
+
+```
+   dugite-bp(pool1) ──┐                  ┌── cardano-bp(pool2)
+        :3001         ├── dugite-relay ──┤        :3003
+                      │      :3002       │
+                      └── cardano-arbiter ┘
+                              :3004
+```
+
+`cardano-arbiter` is a non-forging cardano-node peered directly with both producers — the independent Haskell tiebreak oracle. See Round 5.
 
 ## When to invoke
 
@@ -52,7 +66,7 @@ command -v jq curl lsof
 test -x ./target/release/dugite-node || cargo build --release -p dugite-node
 
 # Ports must be free
-for p in 3000 3001 3002 12798 12799 12800; do
+for p in 3001 3002 3003 3004 12798 12799 9090 9091; do
   if lsof -iTCP:$p -sTCP:LISTEN -P -n 2>/dev/null | grep -q LISTEN; then
     echo "PORT BUSY: $p"; exit 1
   fi
@@ -65,18 +79,50 @@ If `cardano-node` is older than 11.0.1, abort: PV10 conway-genesis rejects it. S
 
 Before running rounds, understand what each round contributes to the overall coverage charter. The skill exercises six orthogonal axes (see `references/test-methodology.md` for the full catalogue):
 
-1. **Tx-type** — every Conway tx class (59 zoo scripts spanning bookkeeping, native, Plutus V1/V2/V3, stake, gov certs, gov proposals, voting) + the 19 phase-1 negatives.
+1. **Tx-type** — every Conway tx class (85 zoo scripts spanning bookkeeping, native, Plutus V1/V2/V3, stake, gov certs, gov proposals, voting, gov lifecycle, mempool, post-enactment — the 19 phase-1 negatives are among them).
 2. **Validity** — every positive class has a matched negative; both must be classified identically by dugite and Haskell.
 3. **Submit-path** — txs submitted to **every** N2C ingestion socket: `dugite-bp.sock`, `dugite-relay.sock`, `cardano-bp.sock` (override via `ZOO_SOCKET=...`), plus `dugite-cli` vs `cardano-cli` on each. Also the UTxO RPC gRPC `submit_tx` (when `--rpc-port` is enabled).
 4. **Propagation-direction** — observe each tx at every node (mempool + ledger), in both forward (dugite-bp → relay → cardano-bp) and reverse (cardano-bp → relay → dugite-bp) directions through the hub.
 5. **Actor** — good-actor inputs (zoo positives, cli parity) AND bad-actor inputs (zoo negatives, `protocols/` adversarial framing, `chaos/` failure injection, RPC oversized/replay/flood).
 6. **Workload** — quiescent (Round 1 soak), trickle (Round 2 boundary), restart (Round 3), saturation + concurrent-burst + adversarial (Round 4 — see methodology doc).
 
-The **bidirectional parity oracle** is the most important predicate this skill enforces: *for every transaction T, dugite and Haskell must reach the same accept/reject decision regardless of which node ingested it first.* Off-diagonal cells (one accepts, the other rejects) are P0 bugs. Run representative txs through `ZOO_SOCKET=$LD_RELAY_SOCK` AND `ZOO_SOCKET=$LD_CARDANO_BP_SOCK` and tabulate results into `evidence/<ts>/parity-matrix.csv`.
+The **bidirectional parity oracle** is the most important predicate this skill
+enforces: *for every transaction T, dugite and Haskell must reach the same
+accept/reject decision regardless of which node ingested it first.* Off-diagonal
+cells (one accepts, the other rejects) are P0 bugs. It covers **79 of the 85 zoo
+scripts** (9 categories); the matrix lands in `evidence/<ts>/parity-matrix.csv`
+with a `parity-matrix.meta.json` sidecar carrying the denominator the invocation
+intended to cover.
 
-In addition to tx and N2N coverage, the skill exercises **dugite-cli surface parity** (today `09-cli-parity/` covers 22 query subcommands — see methodology doc for the full surface and gaps) and **UTxO RPC gRPC coverage** (Query / Submit / Sync / Watch services across v1alpha + v1beta; RPC is currently not wired into the devnet `run.sh` — opening this gap is tracked in the coverage-debt checklist).
+Matrix verdicts:
 
-## Workflow — three rounds in under 20 minutes
+| Verdict | Meaning | Fails the run? |
+|---|---|---|
+| `MATCH` | same accept/reject decision, same reason | — |
+| `OFFDIAG` | one node accepts what the other rejects | **yes (P0)** |
+| `CLASSDIFF` | both reject, but for different reasons | **yes (P2)** |
+| `KNOWNDIFF` | reject-reason difference that is documented and deliberate | no |
+| `STATEFUL` | excluded: the subject is a global devnet resource the first batch already mutated | no |
+
+Only reject **reasons** are compared, never accepted-tx details — each batch
+runs with its own keys, so minted policy ids, script addresses and reference
+txids legitimately differ and comparing them produced 7 false `CLASSDIFF`s on
+the first full run.
+
+The 6 uncovered scripts are `10-gov-lifecycle` (5) and `12-post-enactment` (1):
+ratification is a property of the whole chain rather than of a batch, so a
+second batch's enactment assertion is not independent. Plus `05g`/`05h`
+(constitutional-committee certs) run but are recorded `STATEFUL` — the committee
+is seated at genesis, so once batch 1 resigns `cc-1`, batch 2 correctly gets
+`ConwayCommitteeHasPreviouslyResigned`. All exclusions and their reasons are in
+`schemas/denominators.json`, and `test-denominators.sh` asserts that every
+category is either required or explicitly excluded.
+
+In addition to tx and N2N coverage, the skill exercises **dugite-cli surface parity** (today `09-cli-parity/` covers 22 query subcommands — see methodology doc for the full surface and gaps) and **UTxO RPC gRPC coverage** via `rpc/run.sh` (#960): `run.sh` now binds RPC on 127.0.0.1:9090 (bp) and :9091 (relay), and the suite asserts service discovery for all 8 service/version combinations, `ReadParams` field-by-field against `cardano-cli query protocol-parameters` on **both** v1alpha and v1beta, `ReadTip`, `ReadUtxos`, `SubmitTx` as a fourth submit path, and an adversarial set (undecodable CBOR, 8 MiB payload, zero-length tx, malformed TxoRef, concurrent duplicate submit).
+
+> Coverage honesty: the suite covers Query/Submit/Sync **discovery** plus the Query and Submit methods listed above. `Sync.FetchBlock`/`DumpHistory`/`FollowTip` and the whole `Watch` service are advertised-and-asserted-present but their **behaviour** is not yet compared against anything. Do not read "8/8 service-present PASS" as "all four services are validated".
+
+## Workflow — three core rounds in under 20 minutes, plus four targeted rounds
 
 Use TodoWrite to track each round as `in_progress` / `completed`. Each round must end with `./stop.sh` and a fresh `./setup.sh` before the next.
 
@@ -84,26 +130,49 @@ Use TodoWrite to track each round as `in_progress` / `completed`. Each round mus
 
 Goal: happy path. Fresh setup, all three nodes up, dugite-bp forges canonical blocks, cardano-relay accepts every one, dugite-cli works against both sockets, the full transaction surface passes.
 
+**Pin ONE evidence directory for the whole round.** `09-cli-parity/run.sh`,
+`protocols/run.sh` and `bidirectional-parity.sh` all default to "newest
+directory under `evidence/`". `soak.sh` *creates* a new one. So whether those
+suites land beside the soak evidence or in a directory of their own depends
+purely on the order they happen to run in — and a suite that wrote to the other
+directory is indistinguishable, to the report generator, from a suite that never
+ran. Pass the directory explicitly and the ambiguity disappears.
+
 ```bash
 cd testnet/local-devnet
 . ./lib/common.sh                   # exports LD_RELAY_SOCK, LD_CARDANO_BP_SOCK, LD_DUGITE_BP_SOCK
 ./setup.sh                          # ~30s — fresh genesis
 ./run.sh                            # ~5s — staggered start (relay → cardano → dugite-bp)
 sleep 30                            # let the chain advance past slot 0
+
+EVD="$LD_EVIDENCE/round1-$(date -u +%Y%m%dT%H%M%SZ)"; mkdir -p "$EVD"
+
 ./tx-zoo/run-all.sh --setup         # ~20s — keys + plutus binaries (one-time per setup)
-./tx-zoo/run-all.sh                 # ~3-5 min — all 59 tx scripts (submitted via dugite-relay socket)
-# Bidirectional parity — re-run a representative subset against the Haskell socket
-# (catches accept-set asymmetry; see references/test-methodology.md "parity oracle").
-# The wrapper sources lib/common.sh, snapshots results.csv after each batch, and
-# writes evidence/<ts>/parity-matrix.csv with OFFDIAG count + non-zero exit on drift.
+EVIDENCE_DIR="$EVD" ./tx-zoo/run-all.sh   # ~3-5 min — all 85 tx scripts (via dugite-relay socket)
+# Bidirectional parity — re-run against the Haskell socket too (catches
+# accept-set asymmetry; see references/test-methodology.md "parity oracle").
+# Writes parity-matrix.csv + parity-matrix.meta.json (the meta carries the
+# denominator this invocation intended to cover).
+# With no categories named it uses the STANDARD set from
+# schemas/denominators.json (9 categories, 79 scripts). Naming categories at
+# the call site is how it stayed at 4 categories / 41 scripts while the notes
+# said "41/41" without ever stating the zoo has 85 (#954).
 ../../.claude/skills/devnet-validate/scripts/bidirectional-parity.sh \
-    01-bookkeeping 04-stake 06-proposals 08-negative
-./tx-zoo/09-cli-parity/run.sh       # ~1 min — 22 LSQ parity checks; writes cli-parity.csv
-./tx-zoo/cross-validate-cli.sh      # ~1 min — dugite-cli ↔ cardano-cli submit parity
-./protocols/run.sh                  # ~2 min — adversarial N2N framing; writes n2n-trace.csv
-./soak.sh 120                       # 2 min idle evidence
-./verify.sh evidence/$(ls -t evidence | head -1)
-../../.claude/skills/devnet-validate/scripts/analyze-evidence.sh evidence/$(ls -t evidence | head -1)
+    --out "$EVD/parity-matrix.csv"
+./tx-zoo/09-cli-parity/run.sh "$EVD"   # ~1 min — 22 LSQ parity checks; writes cli-parity.csv
+./tx-zoo/cross-validate-cli.sh         # ~1 min — dugite-cli ↔ cardano-cli submit parity
+./protocols/run.sh "$EVD"              # ~2 min — adversarial N2N framing; writes n2n-trace.csv
+./rpc/run.sh "$EVD"                    # ~1 min — UTxO RPC (gRPC); writes rpc.csv.
+                                       #          REQUIRED: the standard preset
+                                       #          manifest declares rpc.csv, so a
+                                       #          round set without it fails gate
+                                       #          integrity (exit 3).
+./chaos/run.sh "$EVD"                  # ~3 min — kill-9 recovery + app-nap + clock-skew
+                                       #          + syn-flood; writes chaos-events.csv.
+                                       #          LAST of the three: it SIGKILLs on purpose.
+EVIDENCE_DIR="$EVD" ./soak.sh 120      # 2 min idle evidence
+./verify.sh "$EVD"
+../../.claude/skills/devnet-validate/scripts/analyze-evidence.sh "$EVD"
 ./stop.sh
 ```
 
@@ -129,7 +198,7 @@ tail -F logs/cardano-bp.log   | grep -E 'AddedToCurrentChain|AddBlockValidation\
 ```
 
 **Round 1 PASSES iff** all of:
-- `tx-zoo/state/results.csv` shows ≥58/59 PASS (one V3 spend may fail without `aiken` — see `references/tx-coverage.md`)
+- `tx-zoo/state/results.csv` shows 85 rows with 0 FAIL (`04g-reward-withdrawal` state-skips until rewards mature — see #958; V3 scripts need `aiken` on PATH)
 - `verify.sh` reports 4/4 predicates pass
 - Zero invalid-block events in `logs/cardano-bp.log` (match BOTH legacy `TraceForgedInvalidBlock` and cardano-node 11.x `ChainDB.AddBlockEvent.AddBlockValidation.InvalidBlock` / `Forge.Loop.ForgedInvalidBlock`)
 - `dugite_tip_age_seconds` stays <5 throughout the soak
@@ -138,7 +207,9 @@ tail -F logs/cardano-bp.log   | grep -E 'AddedToCurrentChain|AddBlockValidation\
 - `analyze-evidence.sh` reports no anomalies
 - `evidence/<ts>/cli-parity.csv` has zero DIVERGENT rows that are not filed as known-divergence issues, **and zero ERROR rows** (`09-cli-parity/run.sh` now exits 1 on either). An ERROR row noted `HARNESS both-sides-failed` means the suite passed cardano-cli arguments it does not accept — fix the `09*.sh` script, do not add it to `KNOWN_DIVERGENCES`
 - `evidence/<ts>/n2n-trace.csv` has zero PANIC or SILENT_SKIP rows
-- Bidirectional parity wrapper (`bidirectional-parity.sh 01-bookkeeping 04-stake 06-proposals 08-negative`) exits 0 — every script is classified identically across both sockets in `evidence/<ts>/parity-matrix.csv` (zero `OFFDIAG` rows)
+- `evidence/<ts>/chaos-events.csv` has zero FAIL rows, and any `ENV_SKIP` row is
+  a surface that was **not** exercised — investigate rather than accept it
+- Bidirectional parity wrapper (`bidirectional-parity.sh`, no args = the pinned standard set of 9 categories / 79 scripts) exits 0 — zero `OFFDIAG` and zero unexplained `CLASSDIFF` rows in `evidence/<ts>/parity-matrix.csv`
 - `tx-zoo/state/cross-validate.csv` shows PASS for every representative tx submitted through `dugite-cli`
 
 ### Round 2 — Epoch-boundary stress (~15 min)
@@ -224,6 +295,46 @@ TIP_AFTER=$(cardano-cli query tip --testnet-magic 42 --socket-path "$LD_DUGITE_B
 
 If Round 3 stalls past 60s, suspect the stale-intersection bug (memory: `project_stale_intersection_when_peer_behind`). Capture logs + metrics + evidence and report.
 
+### Round 4 — RPC + chaos
+
+Both now run **inside Round 1** against the same pinned `$EVD` (see the command block above) — they are listed here only for their pass criteria, not as a separate boot.
+
+**PASSES iff** `rpc.csv` has zero FAIL/ERROR rows and at least one PASS (a suite producing zero passing checks is treated as a failure, not a clean sweep), and `chaos-events.csv` has zero FAIL and zero ENV_SKIP.
+
+Both suites write into the round's evidence directory and are declared in the standard/extended preset manifests, so omitting either fails gate integrity rather than silently shrinking the report.
+
+### Round 5 — Two-forger contention (~10 min, its own devnet) — #957
+
+```bash
+TF_DURATION=300 ./two-forger-round.sh
+```
+
+Runs `LD_TWO_FORGERS=1 ./setup.sh`, which splits the genesis delegation 60/40, gives cardano-bp pool2's forging keys, and starts a **fourth** node — `cardano-arbiter`, a non-forging cardano-node peered directly with both producers. The arbiter exists because neither producer is neutral (a producer prefers its own block by construction) and two dugite processes agreeing would only prove dugite is self-consistent.
+
+**PASSES iff** both pools forged ≥3 blocks, the arbiter holds ≥2 established connections, all four nodes converge on one chain (asserted BOTH mid-round and at the very end), zero invalid-block events, pots byte-exact vs the arbiter, and dugite-bp rejoins **the arbiter's chain by tip hash** after a restart during which the other forger kept producing.
+
+> Two-forger mode sets the genesis start 150s out. If both producers reach slot 0 before they are connected they fork at genesis, exceed `k=40`, and can never re-converge (`ChainSync intersection only at genesis`) — a permanently partitioned devnet on which every cross-node comparison is meaningless. Do not shorten `LD_GENESIS_DELAY`.
+
+### Round 6 — Governance enactment (~40 min, its own devnet) — #956
+
+```bash
+./gov-enactment-round.sh          # GOV_PROBE_ONLY=1 skips the boundary waits
+```
+
+Proposes a TreasuryWithdrawal, votes DRep + CC (**SPOs may not vote on this action type** — `DisallowedVoters`), waits for enactment, and asserts the reward-account credit is byte-exact against the requested transfer plus treasury/gov-state/constitution parity with cardano-node.
+
+Two preconditions are established first, and both are load-bearing:
+- **DRep voting power.** `dRepAcceptedRatio` folds over the stake *distribution*, never over who voted. With no `vote_delegation` anywhere the map is empty and the ratio is 0, so every DRep-gated action is unratifiable regardless of votes.
+- **A funded `ensTreasury` one boundary earlier.** RATIFY reads the treasury sealed into the *previous* pulser, so a withdrawal proposed before the first RUPD fails on affordability even though the post-boundary state looks ample.
+
+### Round 7 — Reward withdrawal (~30 min, its own devnet) — #958
+
+```bash
+./rewards-round.sh
+```
+
+Uses a **genesis** stake delegator (reward matures at epoch 3 rather than M+4) and submits a `vote_delegation` first, because at PV10 `ConwayWdrlNotDelegatedToDRep` fires *before* any amount check and genesis registration structurally cannot set a DRep delegation. Covers the negative twin (wrong amount → `WithdrawalsNotInRewardsCERTS`), the exact-balance positive, and a multi-account withdrawal.
+
 ## Final report
 
 After all rounds complete, generate a machine-parseable + GitHub-release-ready report:
@@ -249,9 +360,18 @@ cd testnet/local-devnet
 # Reportable round dirs across both locations, oldest first, last 3 only.
 # Basenames are ISO-8601, so a lexicographic sort is chronological, which for a
 # sequential run is round order.
+# Sort by the ISO-8601 timestamp EXTRACTED from the basename, not by the
+# basename itself. Two shapes coexist on any machine that has run
+# `just devnet-validate-extended`: `<TS>` and `round<N>-<TS>`. A plain
+# lexicographic sort puts every `round*` AFTER every `2026*`, so `tail -3`
+# silently selects a stale `round953-...` dir from an earlier session instead
+# of the newest round — and the report is then generated from the wrong
+# evidence without any error.
 ROUND_DIRS=$(
   for d in evidence/*/ evidence-archive/auto/*/; do
-    [ -d "$d" ] && [ -f "${d}report.md" ] && printf '%s\t%s\n' "$(basename "$d")" "${d%/}"
+    [ -d "$d" ] && [ -f "${d}report.md" ] || continue
+    ts=$(basename "$d" | grep -oE '[0-9]{8}T[0-9]{6}Z' | head -1)
+    [ -n "$ts" ] && printf '%s\t%s\n' "$ts" "${d%/}"
   done | sort | cut -f2 | tail -3
 )
 EVD_ROUND1=$(echo "$ROUND_DIRS" | sed -n '1p')
@@ -326,11 +446,11 @@ The harness now covers 9 dimensions across 3 intensity presets:
 | Dim | Capability | Smoke | Standard | Extended |
 |-----|------------|-------|----------|----------|
 | D1 | Forge & adoption | 1 epoch | 2 epochs | 5 epochs |
-| D2 | Tx surface | 08-negative subset | 59 + 30 negatives + gov-lifecycle | + CBOR fuzz |
+| D2 | Tx surface | 08-negative subset | 85 scripts (19 negatives) + parity oracle over 79 | + CBOR fuzz |
 | D3 | N2N adversarial | handshake only | + all 7 protocol scripts | + slow-loris |
-| D4 | N2C CLI parity | 3 queries | 22 queries (09a–09v) | all |
+| D4 | N2C CLI parity | 3 queries | 22 queries (09a–09v), all compared | all |
 | D5 | Sync paths | from-relay-tip | + bulk-throughput | + from-genesis + Mithril |
-| D6 | Chaos | — | kill-9 + app-nap check | + partition + disk-full + flood |
+| D6 | Chaos | — | kill-9 + app-nap + clock-skew + syn-flood | + partition + disk-full |
 | D7 | Epoch transitions | 1 boundary | 2 boundaries | + gov-lifecycle enactment |
 | D8 | Resource health | log-level only | + CPU/RSS/FD sampling | + 30-min leak check |
 | D9 | Determinism | — | feasibility verdict | tip-hash match |
@@ -338,15 +458,55 @@ The harness now covers 9 dimensions across 3 intensity presets:
 ### Quick-start v2
 
 ```bash
-# Smoke (~5 min) — smoke gate for PRs
+# Smoke (~5 min) — PR gate for core crates
 just devnet-validate-smoke
 
-# Standard — equivalent to old 3-round workflow but with all v2 suites
-cd testnet/local-devnet
-just devnet-report
+# Standard (~20 min) — THE RELEASE TAG GATE.
+# Run the Round 1-3 workflow above, then the "Final report" block.
+# `just devnet-report` is NOT this: it reports a single round from whatever
+# evidence is lying around and marks itself gate_integrity.admissible=false.
 
-# Extended (~75 min) — release tag gate
+# Extended (~75 min) — deeper pre-major-release pass, not the tag gate
 just devnet-validate-extended
+
+# Reporting-layer self-test (~10s, no devnet) — run after editing this skill
+just devnet-gate-selftest
+```
+
+### Which preset gates a tag
+
+**Standard.** `.claude/skills/release-lead/SKILL.md` is authoritative and says
+the same. Before #953 this document nominated *extended* as the tag gate while
+every command in both skills hardcoded `--preset standard` — so v2.4.3–v2.4.5
+all shipped on standard and nothing extended-only ever gated a release. Rather
+than leave the docs describing a gate nobody ran, standard is now the gate in
+name as well as in practice, and the suites that matter most (adversarial N2N,
+cli-parity, the bidirectional parity oracle, chaos) are part of the standard
+evidence manifest — the generator refuses to emit a passing report without
+them.
+
+### Gate integrity — the generator fails loudly now
+
+`generate-release-report.sh` runs **strict by default**. It hard-fails (exit 3)
+when, for the declared preset, a required evidence file is absent, a suite's row
+count is below its pinned denominator in
+`schemas/denominators.json`, or a round's tx-zoo counts were borrowed from
+another round (`source:"shared"`).
+
+An absent suite now serializes as `status:"absent"` with **null** counts. It
+never serializes as `0` — that ambiguity is what let "0 divergent" mean "never
+compared" for three releases (#945, #953).
+
+```bash
+# Never do this for a release:
+generate-release-report.sh --no-strict ...   # records the omission, marks
+                                             # gate_integrity.admissible=false
+```
+
+Always confirm before shipping:
+```bash
+jq '.gate_integrity' reports/devnet-validate/report.json
+# { "strict": true, "admissible": true, "missing": [] }
 ```
 
 ### New evidence files (v2)
