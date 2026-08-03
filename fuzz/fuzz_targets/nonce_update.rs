@@ -12,8 +12,8 @@
 
 #![no_main]
 
-use libfuzzer_sys::fuzz_target;
 use dugite_primitives::hash::blake2b_256;
+use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     // Simulate the nonce update: evolving' = blake2b_256(evolving || blake2b_256(eta))

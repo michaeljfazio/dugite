@@ -37,8 +37,20 @@ fmt:
 fmt-check:
     cargo fmt --all -- --check
 
-# Full CI gate: fmt-check, clippy, build, test, doc-test.
-check: fmt-check clippy build test test-doc
+# Compile-guard the fuzz targets (#971).
+#
+# fuzz/ declares its own `[workspace]`, so `cargo build/clippy --all-targets`
+# above never touches it. Without this a crate API change silently breaks a
+# fuzz target and the only signal is a nightly job failing to build.
+# RUSTFLAGS mirrors ci.yml's job-level env. Without it this recipe passes
+# locally and the CI step fails, which is exactly what happened when the guard
+# was first added.
+fuzz-check:
+    cargo fmt --manifest-path fuzz/Cargo.toml --all -- --check
+    RUSTFLAGS="-D warnings" cargo check --manifest-path fuzz/Cargo.toml --all-targets
+
+# Full CI gate: fmt-check, clippy, build, test, doc-test, fuzz compile guard.
+check: fmt-check clippy build test test-doc fuzz-check
 
 # ─── Run a network ───────────────────────────────────────────────────────────
 

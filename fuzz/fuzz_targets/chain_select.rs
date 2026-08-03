@@ -20,9 +20,7 @@
 use libfuzzer_sys::fuzz_target;
 
 use dugite_consensus::chain_fragment::ChainFragment;
-use dugite_consensus::chain_selection::{
-    chain_preference, ChainPreference, ChainSelection,
-};
+use dugite_consensus::chain_selection::{chain_preference, ChainPreference, ChainSelection};
 use dugite_primitives::block::{
     BlockHeader, OperationalCert, Point, ProtocolVersion, Tip, VrfOutput,
 };
@@ -101,7 +99,11 @@ fuzz_target!(|data: &[u8]| {
     let current_slot = SlotNo(read_u64(data, 17));
     let candidate_slot = SlotNo(read_u64(data, 25));
     let raw_window = read_u64(data, 33);
-    let slot_window = if raw_window == 0 { u64::MAX } else { raw_window };
+    let slot_window = if raw_window == 0 {
+        u64::MAX
+    } else {
+        raw_window
+    };
 
     // --- ChainSelection::prefer_chain (uses Tip, no headers) ---
     let current_tip = Tip {
@@ -146,8 +148,6 @@ fuzz_target!(|data: &[u8]| {
     let result = chain_preference(&current_frag, &candidate_frag, slot_window);
     let _ = matches!(
         result,
-        ChainPreference::PreferCurrent
-            | ChainPreference::PreferCandidate
-            | ChainPreference::Equal
+        ChainPreference::PreferCurrent | ChainPreference::PreferCandidate | ChainPreference::Equal
     );
 });

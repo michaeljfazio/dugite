@@ -52,6 +52,17 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # The fuzz crate declares `[workspace] members = ["."]`, so it is NOT
+      # part of the main workspace and `cargo build --all-targets` above never
+      # compiles it. Without this guard a crate API change silently breaks a
+      # fuzz target and the only signal is a nightly job failing to build —
+      # which is how 11 targets sat unnoticed for 2.5 months (#971).
+      #
+      # `check` on stable, not `build` on nightly: this is a compile guard, not
+      # a fuzzing run, and it must not add a nightly toolchain to the gate.
+      - name: Guard — fuzz targets still compile
+        run: cargo check --manifest-path fuzz/Cargo.toml --all-targets
+
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
 

@@ -12,10 +12,10 @@ use libfuzzer_sys::fuzz_target;
 
 use dugite_ledger::state::{BlockValidationMode, LedgerState};
 use dugite_primitives::block::{Block, BlockHeader, OperationalCert, ProtocolVersion};
-use dugite_primitives::time::{BlockNo, SlotNo};
 use dugite_primitives::era::Era;
 use dugite_primitives::hash::Hash32;
 use dugite_primitives::protocol_params::ProtocolParameters;
+use dugite_primitives::time::{BlockNo, SlotNo};
 use dugite_primitives::transaction::{
     OutputDatum, Transaction, TransactionBody, TransactionInput, TransactionOutput,
     TransactionWitnessSet,

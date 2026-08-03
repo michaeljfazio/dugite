@@ -1972,6 +1972,11 @@ impl LedgerState {
         defer_phase2: bool,
     ) -> Result<(LedgerDelta, Vec<Phase2WorkItem>), LedgerError> {
         let mut delta = LedgerDelta::new(block.slot(), *block.hash(), block.block_number());
+        // #985: record the pre-apply ledger tip — the parent this delta is
+        // computed against — so `LedgerSeq::push` can verify the delta chains
+        // onto the sequence. Must be captured here, before `apply_block_impl`
+        // advances `self.tip`.
+        delta.parent_point = Some(self.tip.point.clone());
 
         // Snapshot pre-block epoch to detect epoch transitions.
         let pre_epoch = self.epoch;

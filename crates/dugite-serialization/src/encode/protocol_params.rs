@@ -20,6 +20,54 @@ use super::certificate::encode_rational;
 ///   30: gov_action_deposit, 31: drep_deposit, 32: drep_activity,
 ///   33: min_fee_ref_script_cost_per_byte
 pub fn encode_protocol_param_update(ppu: &ProtocolParamUpdate) -> Vec<u8> {
+    encode_ppu_map(&ppu_entries(ppu, PpuKeySet::Conway))
+}
+
+/// Encode a pre-Conway (Shelley..Babbage) `protocol_param_update`.
+///
+/// The Conway type genuinely has no keys 12-15, but the Shelley..Babbage one
+/// does, and dugite's decoder reads all four:
+///
+/// - 12 `d` — decentralisation, live on mainnet throughout Shelley
+/// - 13 `extra_entropy` — folded into the epoch nonce at TICKN; mainnet
+///   injected a non-neutral value effective epoch 259
+/// - 14 `protocol_version` — `[major, minor]`
+/// - 15 `min_utxo_value` — the flat Shelley-Mary minUTxO (#919)
+///
+/// Emitting them is what makes `decode -> encode` a fixpoint for a pre-Conway
+/// update proposal, and therefore what keeps its transaction id stable.
+///
+/// Mirrors `read_pre_conway_protocol_param_update` in `decode/era_shelley.rs`,
+/// which carries the per-key Haskell citations
+/// (`eras/{shelley,alonzo,babbage}/impl/src/Cardano/Ledger/*/PParams.hs`).
+pub fn encode_pre_conway_protocol_param_update(ppu: &ProtocolParamUpdate) -> Vec<u8> {
+    encode_ppu_map(&ppu_entries(ppu, PpuKeySet::PreConway))
+}
+
+/// Which `protocol_param_update` key set to emit.
+///
+/// One entry builder serves both, deliberately: three drifted copies of
+/// `read_metadatum` were the mechanism behind #937, and triplicated block-body
+/// encoders were the mechanism behind BOTH #932 and #938. A second hand-written
+/// copy of a 30-key table is the same trap.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PpuKeySet {
+    /// Conway and later: keys 0-11 and 16-33.
+    Conway,
+    /// Shelley..Babbage: keys 0-24, including 12-15.
+    PreConway,
+}
+
+fn encode_ppu_map(entries: &[(u64, Vec<u8>)]) -> Vec<u8> {
+    let mut buf = encode_map_header(entries.len());
+    for (key, value) in entries {
+        buf.extend(encode_uint(*key));
+        buf.extend(value.clone());
+    }
+    buf
+}
+
+fn ppu_entries(ppu: &ProtocolParamUpdate, key_set: PpuKeySet) -> Vec<(u64, Vec<u8>)> {
     // Count non-None fields to determine map size
     let mut entries: Vec<(u64, Vec<u8>)> = Vec::new();
 
@@ -59,7 +107,41 @@ pub fn encode_protocol_param_update(ppu: &ProtocolParamUpdate) -> Vec<u8> {
     if let Some(ref v) = ppu.tau {
         entries.push((11, encode_rational(v)));
     }
-    // Key 12 is protocol_version — not in ProtocolParamUpdate (it's in HardForkInitiation)
+    // Keys 12-15 exist only in the Shelley..Babbage PParamUpdate type. The
+    // Conway type drops all four (decentralisation and extra entropy are gone;
+    // protocol_version moved to the HardForkInitiation governance action;
+    // min_utxo_value was replaced by coinsPerUTxOByte at key 17).
+    if key_set == PpuKeySet::PreConway {
+        if let Some(ref v) = ppu.d {
+            entries.push((12, encode_rational(v)));
+        }
+        if let Some(ref v) = ppu.extra_entropy {
+            // Shelley `Nonce`: [0] = NeutralNonce, [1, bstr32] = Nonce(h).
+            // `Some(ZERO)` is the explicit neutral nonce, not "absent".
+            let mut buf = Vec::new();
+            if *v == dugite_primitives::hash::Hash32::ZERO {
+                buf.extend(encode_array_header(1));
+                buf.extend(encode_uint(0));
+            } else {
+                buf.extend(encode_array_header(2));
+                buf.extend(encode_uint(1));
+                buf.extend(encode_bytes(v.as_bytes()));
+            }
+            entries.push((13, buf));
+        }
+        // protocol_version is `[major, minor]` — a single key carrying both
+        // halves, so it is emitted only when both are present.
+        if let (Some(major), Some(minor)) = (ppu.protocol_version_major, ppu.protocol_version_minor)
+        {
+            let mut buf = encode_array_header(2);
+            buf.extend(encode_uint(major));
+            buf.extend(encode_uint(minor));
+            entries.push((14, buf));
+        }
+        if let Some(ref v) = ppu.min_utxo_value {
+            entries.push((15, encode_uint(v.0)));
+        }
+    }
     if let Some(ref v) = ppu.min_pool_cost {
         entries.push((16, encode_uint(v.0)));
     }
@@ -206,11 +288,57 @@ pub fn encode_protocol_param_update(ppu: &ProtocolParamUpdate) -> Vec<u8> {
         entries.push((33, encode_rational(v)));
     }
 
-    let mut buf = encode_map_header(entries.len());
-    for (key, value) in entries {
-        buf.extend(encode_uint(key));
-        buf.extend(value);
+    // Keys 34-37 — the Dijkstra ref-script re-parameterisation
+    // (`PParams.hs` `ppuTag = 34..37` in `DijkstraEra`).
+    //
+    // `read_protocol_param_update` has read all four since #475 Phase 5, but
+    // nothing emitted them, so a dugite-built Dijkstra `ParameterChange` would
+    // have silently dropped every ref-script parameter it proposed. Same shape
+    // as the tx-body key 6 gap, and latent for the same reason — no on-chain
+    // corpus exercises it. Found by the encode-first structured fuzz target
+    // (#974).
+    //
+    // Emitting them under the Conway key set too is safe and deliberate: a
+    // Conway PPU never has them populated, so no Conway bytes change, and
+    // gating them on the era would need a key-set argument threaded through
+    // `encode_gov_action`.
+    if key_set == PpuKeySet::Conway {
+        if let Some(v) = ppu.max_ref_script_size_per_block {
+            entries.push((34, encode_uint(v as u64)));
+        }
+        if let Some(v) = ppu.max_ref_script_size_per_tx {
+            entries.push((35, encode_uint(v as u64)));
+        }
+        if let Some(v) = ppu.ref_script_cost_stride {
+            entries.push((36, encode_uint(v as u64)));
+        }
+        if let Some(ref v) = ppu.ref_script_cost_multiplier {
+            // PositiveInterval — tag-30 [num, den], same as key 33.
+            entries.push((37, encode_rational(v)));
+        }
     }
+
+    entries
+}
+
+/// Encode a pre-Conway update proposal — transaction body key 6.
+///
+/// ```text
+/// update = [ proposed_protocol_parameter_updates, epoch ]
+/// proposed_protocol_parameter_updates = { * genesishash => protocol_param_update }
+/// ```
+///
+/// `genesishash` is the 28-byte blake2b_224 of a genesis delegate vkey. The
+/// decoder pads it to `Hash32` for storage, so the low 28 bytes go back on the
+/// wire.
+pub fn encode_update_proposal(update: &UpdateProposal) -> Vec<u8> {
+    let mut buf = encode_array_header(2);
+    buf.extend(encode_map_header(update.proposed_updates.len()));
+    for (genesis_hash, ppu) in &update.proposed_updates {
+        buf.extend(encode_bytes(&genesis_hash.as_bytes()[..28]));
+        buf.extend(encode_pre_conway_protocol_param_update(ppu));
+    }
+    buf.extend(encode_uint(update.epoch));
     buf
 }
 
@@ -803,97 +931,263 @@ mod tests {
 
     // ── encode→decode round-trip (key correctness regression) ────────────────
 
-    /// Encode a PPU covering all key ranges (0-11, 16-17, 18, 19-21, 22-24,
-    /// 25-26, 27-33), decode it back via ppu_from_cbor, and assert field parity.
-    /// This pins that every CBOR key matches the Conway decoder's dispatch table.
+    /// Every Conway PPU key round-trips, compared as a WHOLE struct.
+    ///
+    /// The previous version of this test claimed in its own docstring to cover
+    /// "keys ... 25-26" and populated NEITHER — every threshold was left at
+    /// `..Default::default()`, and the assertions were a hand-written list of
+    /// nine fields. That is why #951 survived: the PPU key 26 encoder wrote the
+    /// ten `drep_voting_thresholds` in the wrong order, and nothing here ever
+    /// put a value in key 26 to notice.
+    ///
+    /// Two changes make it hold: every field is populated with a DISTINCT
+    /// value, so a permutation shows up as two fields swapping; and the
+    /// comparison is `assert_eq!` on the whole `ProtocolParamUpdate`, so a key
+    /// added later cannot escape by not being listed.
     #[test]
-    fn test_ppu_round_trip_all_key_ranges() {
+    fn test_ppu_round_trip_all_conway_keys() {
         use crate::decode::ppu_from_cbor;
 
-        let original = ProtocolParamUpdate {
-            // Keys 0-11 (always-correct range)
-            min_fee_a: Some(44),                        // key 0
-            min_pool_cost: Some(Lovelace(170_000_000)), // key 16
-            // Key 17: ada_per_utxo_byte
-            ada_per_utxo_byte: Some(Lovelace(4_310)), // key 17
-            // Key 18: cost_models
-            cost_models: Some(CostModels {
-                plutus_v1: None,
-                plutus_v2: Some(vec![100, 200]),
-                plutus_v3: None,
-                plutus_v4: None,
-                ..Default::default()
-            }), // key 18
-            // Key 22: max_val_size
-            max_val_size: Some(5_000), // key 22
-            // Key 30: gov_action_deposit
-            gov_action_deposit: Some(Lovelace(100_000_000_000)), // key 30
-            // Key 31: drep_deposit
-            drep_deposit: Some(Lovelace(500_000_000)), // key 31
-            // Key 32: drep_activity
-            drep_activity: Some(20), // key 32
-            // Key 33: min_fee_ref_script_cost_per_byte (rational)
-            min_fee_ref_script_cost_per_byte: Some(Rational {
-                numerator: 15,
-                denominator: 1,
-            }), // key 33
-            ..Default::default()
-        };
+        let original = conway_ppu_all_keys();
+
+        // Guard the guard: if a field is left None the round-trip is trivially
+        // satisfied for it, which is exactly how this test used to pass.
+        assert_eq!(
+            conway_populated_field_count(&original),
+            CONWAY_PPU_FIELD_COUNT,
+            "the fixture must populate every Conway PPU field; an unpopulated \
+             field is a field this test does not check"
+        );
 
         let encoded = encode_protocol_param_update(&original);
         let decoded = ppu_from_cbor(&encoded).expect("round-trip decode must succeed");
 
-        assert_eq!(decoded.min_fee_a, original.min_fee_a, "min_fee_a (key 0)");
         assert_eq!(
-            decoded.min_pool_cost.as_ref().map(|v| v.0),
-            original.min_pool_cost.as_ref().map(|v| v.0),
-            "min_pool_cost (key 16)"
+            decoded, original,
+            "Conway PPU did not survive encode -> decode. A field holding \
+             ANOTHER field's value is the #951 shape: keys 25 and 26 are \
+             POSITIONAL arrays of 5 and 10 thresholds, so a wrong write order \
+             is invisible to any per-key check."
+        );
+
+        // Idempotence, so a non-canonical encoding cannot hide behind a lenient
+        // decode.
+        assert_eq!(
+            encode_protocol_param_update(&decoded),
+            encoded,
+            "PPU encoder must be idempotent"
+        );
+    }
+
+    /// The pre-Conway key set, including keys 12-15, which the Conway type does
+    /// not have and which had NO encoder at all until the fuzz work for #974
+    /// surfaced it. `d` was live on mainnet throughout Shelley and
+    /// `extra_entropy` carried the one-time non-neutral value at epoch 259.
+    #[test]
+    fn test_ppu_round_trip_all_pre_conway_keys() {
+        use crate::decode::pre_conway_ppu_from_cbor;
+
+        let original = ProtocolParamUpdate {
+            min_fee_a: Some(44),
+            min_fee_b: Some(155_381),
+            max_block_body_size: Some(90_112),
+            max_tx_size: Some(16_384),
+            max_block_header_size: Some(1_100),
+            key_deposit: Some(Lovelace(2_000_000)),
+            pool_deposit: Some(Lovelace(500_000_000)),
+            e_max: Some(18),
+            n_opt: Some(500),
+            a0: Some(rat(3, 10)),
+            rho: Some(rat(3, 1000)),
+            tau: Some(rat(1, 5)),
+            // Keys 12-15 — pre-Conway only.
+            d: Some(rat(1, 2)),
+            extra_entropy: Some(dugite_primitives::hash::Hash::from_bytes([0x5a; 32])),
+            protocol_version_major: Some(8),
+            protocol_version_minor: Some(1),
+            min_utxo_value: Some(Lovelace(1_000_000)),
+            min_pool_cost: Some(Lovelace(170_000_000)),
+            ada_per_utxo_byte: Some(Lovelace(4_310)),
+            cost_models: Some(CostModels {
+                plutus_v1: Some(vec![100, 200]),
+                plutus_v2: Some(vec![300]),
+                plutus_v3: None,
+                plutus_v4: None,
+                ..Default::default()
+            }),
+            execution_costs: Some(ExUnitPrices {
+                mem_price: rat(577, 10_000),
+                step_price: rat(721, 10_000_000),
+            }),
+            max_tx_ex_units: Some(ExUnits {
+                mem: 14_000_000,
+                steps: 10_000_000_000,
+            }),
+            max_block_ex_units: Some(ExUnits {
+                mem: 62_000_000,
+                steps: 20_000_000_000,
+            }),
+            max_val_size: Some(5_000),
+            collateral_percentage: Some(150),
+            max_collateral_inputs: Some(3),
+            ..Default::default()
+        };
+
+        let encoded = encode_pre_conway_protocol_param_update(&original);
+        let decoded = pre_conway_ppu_from_cbor(&encoded).expect("round-trip decode must succeed");
+
+        assert_eq!(
+            decoded, original,
+            "pre-Conway PPU did not survive encode -> decode"
         );
         assert_eq!(
-            decoded.ada_per_utxo_byte.as_ref().map(|v| v.0),
-            original.ada_per_utxo_byte.as_ref().map(|v| v.0),
-            "ada_per_utxo_byte (key 17)"
+            encode_pre_conway_protocol_param_update(&decoded),
+            encoded,
+            "pre-Conway PPU encoder must be idempotent"
         );
-        assert_eq!(
-            decoded
-                .cost_models
-                .as_ref()
-                .and_then(|cm| cm.plutus_v2.as_ref()),
-            original
-                .cost_models
-                .as_ref()
-                .and_then(|cm| cm.plutus_v2.as_ref()),
-            "cost_models.plutus_v2 (key 18)"
-        );
-        assert_eq!(
-            decoded.max_val_size, original.max_val_size,
-            "max_val_size (key 22)"
-        );
-        assert_eq!(
-            decoded.gov_action_deposit.as_ref().map(|v| v.0),
-            original.gov_action_deposit.as_ref().map(|v| v.0),
-            "gov_action_deposit (key 30)"
-        );
-        assert_eq!(
-            decoded.drep_deposit.as_ref().map(|v| v.0),
-            original.drep_deposit.as_ref().map(|v| v.0),
-            "drep_deposit (key 31)"
-        );
-        assert_eq!(
-            decoded.drep_activity, original.drep_activity,
-            "drep_activity (key 32)"
-        );
-        assert_eq!(
-            decoded
-                .min_fee_ref_script_cost_per_byte
-                .as_ref()
-                .map(|r| (r.numerator, r.denominator)),
-            original
-                .min_fee_ref_script_cost_per_byte
-                .as_ref()
-                .map(|r| (r.numerator, r.denominator)),
-            "min_fee_ref_script_cost_per_byte (key 33)"
-        );
+    }
+
+    /// Fields the Conway PPU wire type carries (keys 0-11, 16-33, 34-37).
+    ///
+    /// Keys 12-15 are pre-Conway only and are excluded deliberately: including
+    /// them would make the Conway round-trip fail on fields the Conway encoder
+    /// is correct not to emit.
+    const CONWAY_PPU_FIELD_COUNT: usize = 47;
+
+    fn conway_populated_field_count(ppu: &ProtocolParamUpdate) -> usize {
+        let mut n = 0;
+        let mut count = |present: bool| {
+            if present {
+                n += 1;
+            }
+        };
+        count(ppu.min_fee_a.is_some());
+        count(ppu.min_fee_b.is_some());
+        count(ppu.max_block_body_size.is_some());
+        count(ppu.max_tx_size.is_some());
+        count(ppu.max_block_header_size.is_some());
+        count(ppu.key_deposit.is_some());
+        count(ppu.pool_deposit.is_some());
+        count(ppu.e_max.is_some());
+        count(ppu.n_opt.is_some());
+        count(ppu.a0.is_some());
+        count(ppu.rho.is_some());
+        count(ppu.tau.is_some());
+        count(ppu.min_pool_cost.is_some());
+        count(ppu.ada_per_utxo_byte.is_some());
+        count(ppu.cost_models.is_some());
+        count(ppu.execution_costs.is_some());
+        count(ppu.max_tx_ex_units.is_some());
+        count(ppu.max_block_ex_units.is_some());
+        count(ppu.max_val_size.is_some());
+        count(ppu.collateral_percentage.is_some());
+        count(ppu.max_collateral_inputs.is_some());
+        count(ppu.min_fee_ref_script_cost_per_byte.is_some());
+        count(ppu.drep_deposit.is_some());
+        count(ppu.gov_action_deposit.is_some());
+        count(ppu.gov_action_lifetime.is_some());
+        count(ppu.dvt_pp_network_group.is_some());
+        count(ppu.dvt_pp_economic_group.is_some());
+        count(ppu.dvt_pp_technical_group.is_some());
+        count(ppu.dvt_pp_gov_group.is_some());
+        count(ppu.dvt_hard_fork.is_some());
+        count(ppu.dvt_no_confidence.is_some());
+        count(ppu.dvt_committee_normal.is_some());
+        count(ppu.dvt_committee_no_confidence.is_some());
+        count(ppu.dvt_constitution.is_some());
+        count(ppu.dvt_treasury_withdrawal.is_some());
+        count(ppu.pvt_motion_no_confidence.is_some());
+        count(ppu.pvt_committee_normal.is_some());
+        count(ppu.pvt_committee_no_confidence.is_some());
+        count(ppu.pvt_hard_fork.is_some());
+        count(ppu.pvt_pp_security_group.is_some());
+        count(ppu.min_committee_size.is_some());
+        count(ppu.committee_term_limit.is_some());
+        count(ppu.drep_activity.is_some());
+        count(ppu.max_ref_script_size_per_block.is_some());
+        count(ppu.max_ref_script_size_per_tx.is_some());
+        count(ppu.ref_script_cost_stride.is_some());
+        count(ppu.ref_script_cost_multiplier.is_some());
+        n
+    }
+
+    /// Every Conway PPU field, each with a DISTINCT value.
+    ///
+    /// Distinctness is the point: identical thresholds would round-trip through
+    /// a permuted encoder unchanged, which is precisely how a wrong order hides.
+    fn conway_ppu_all_keys() -> ProtocolParamUpdate {
+        ProtocolParamUpdate {
+            min_fee_a: Some(44),
+            min_fee_b: Some(155_381),
+            max_block_body_size: Some(90_112),
+            max_tx_size: Some(16_384),
+            max_block_header_size: Some(1_100),
+            key_deposit: Some(Lovelace(2_000_000)),
+            pool_deposit: Some(Lovelace(500_000_000)),
+            e_max: Some(18),
+            n_opt: Some(500),
+            a0: Some(rat(3, 10)),
+            rho: Some(rat(3, 1_000)),
+            tau: Some(rat(1, 5)),
+            min_pool_cost: Some(Lovelace(170_000_000)),
+            ada_per_utxo_byte: Some(Lovelace(4_310)),
+            cost_models: Some(CostModels {
+                plutus_v1: Some(vec![100, 200]),
+                plutus_v2: Some(vec![300, 400]),
+                plutus_v3: Some(vec![500]),
+                plutus_v4: Some(vec![600]),
+                ..Default::default()
+            }),
+            execution_costs: Some(ExUnitPrices {
+                mem_price: rat(577, 10_000),
+                step_price: rat(721, 10_000_000),
+            }),
+            max_tx_ex_units: Some(ExUnits {
+                mem: 14_000_000,
+                steps: 10_000_000_000,
+            }),
+            max_block_ex_units: Some(ExUnits {
+                mem: 62_000_000,
+                steps: 20_000_000_000,
+            }),
+            max_val_size: Some(5_000),
+            collateral_percentage: Some(150),
+            max_collateral_inputs: Some(3),
+            min_fee_ref_script_cost_per_byte: Some(rat(15, 1)),
+            drep_deposit: Some(Lovelace(500_000_001)),
+            gov_action_deposit: Some(Lovelace(100_000_000_000)),
+            gov_action_lifetime: Some(6),
+            // Key 26 — ten DISTINCT thresholds, in Haskell's
+            // `EncCBOR DRepVotingThresholds` order. Every value is already in
+            // LOWEST TERMS: `Reader::read_rational` divides by the gcd at
+            // decode time to match Haskell's `%` smart constructor, so a
+            // non-reduced fixture fails the round-trip on the fixture's fault.
+            dvt_pp_network_group: Some(rat(501, 1_000)),
+            dvt_pp_economic_group: Some(rat(503, 1_000)),
+            dvt_pp_technical_group: Some(rat(507, 1_000)),
+            dvt_pp_gov_group: Some(rat(509, 1_000)),
+            dvt_hard_fork: Some(rat(511, 1_000)),
+            dvt_no_confidence: Some(rat(513, 1_000)),
+            dvt_committee_normal: Some(rat(517, 1_000)),
+            dvt_committee_no_confidence: Some(rat(519, 1_000)),
+            dvt_constitution: Some(rat(521, 1_000)),
+            dvt_treasury_withdrawal: Some(rat(523, 1_000)),
+            // Key 25 — five DISTINCT pool thresholds.
+            pvt_motion_no_confidence: Some(rat(301, 1_000)),
+            pvt_committee_normal: Some(rat(303, 1_000)),
+            pvt_committee_no_confidence: Some(rat(307, 1_000)),
+            pvt_hard_fork: Some(rat(309, 1_000)),
+            pvt_pp_security_group: Some(rat(311, 1_000)),
+            min_committee_size: Some(5),
+            committee_term_limit: Some(146),
+            drep_activity: Some(20),
+            // Dijkstra keys 34-37.
+            max_ref_script_size_per_block: Some(1_000_000),
+            max_ref_script_size_per_tx: Some(200_000),
+            ref_script_cost_stride: Some(25_600),
+            ref_script_cost_multiplier: Some(rat(6, 5)),
+            ..Default::default()
+        }
     }
 
     // ── round-trip of a realistic PPU ────────────────────────────────────────
@@ -911,7 +1205,7 @@ mod tests {
             pool_deposit: Some(Lovelace(500_000_000)),
             a0: Some(rat(3, 10)),
             rho: Some(rat(3, 1000)),
-            tau: Some(rat(2, 10)),
+            tau: Some(rat(1, 5)),
             n_opt: Some(500),
             min_pool_cost: Some(Lovelace(170_000_000)),
             ada_per_utxo_byte: Some(Lovelace(4_310)),

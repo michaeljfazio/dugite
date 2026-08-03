@@ -54,8 +54,8 @@
 use libfuzzer_sys::fuzz_target;
 
 use dugite_ledger::evaluate_plutus_scripts;
-use dugite_ledger::SlotConfig;
 use dugite_ledger::utxo::UtxoLookup;
+use dugite_ledger::SlotConfig;
 use dugite_primitives::transaction::{TransactionInput, TransactionOutput};
 
 // ---------------------------------------------------------------------------
@@ -198,8 +198,8 @@ fuzz_target!(|data: &[u8]| {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         uplc::tx::eval_phase_two_raw(
             data,
-            &[],   // no UTxOs
-            None,  // no cost model
+            &[],  // no UTxOs
+            None, // no cost model
             FUZZ_BUDGET,
             MAINNET_SLOT_CONFIG,
             false, // skip phase one (we are testing phase two decoding)

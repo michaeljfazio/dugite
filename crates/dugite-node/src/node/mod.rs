@@ -1002,6 +1002,53 @@ pub(crate) struct GsmActorParts {
     pub loe_out: Arc<arc_swap::ArcSwap<dugite_consensus::loe::LoeState>>,
 }
 
+// ─── BFT overlay gate (#985) ─────────────────────────────────────────────────
+
+/// Whether a block's header should be checked against the TPraos BFT overlay
+/// schedule.
+///
+/// # Why the era is the primary term
+///
+/// Haskell binds the consensus protocol to the era at the *type* level —
+/// `ouroboros-consensus-cardano`'s `HFEras` declares
+/// `ShelleyBlock (TPraos c)` for Shelley/Allegra/Mary/Alonzo and
+/// `ShelleyBlock (Praos c)` for Babbage onward — and `Praos`'s
+/// `updateChainDepState` is only `validateKESSignature` + `validateVRFSignature`.
+/// Its `PraosValidationErr` has eleven constructors, all VRF/KES/OCert, none
+/// overlay-related, and the Praos `LedgerView` carries neither `d` nor
+/// `GenDelegs`. So for a Babbage+ header the OVERLAY rule is not skipped at
+/// runtime — it is *unreachable*, whatever the ledger state happens to hold.
+///
+/// dugite runs one header validator across both protocols, so that structural
+/// guarantee has to be reproduced by this gate. Before #985 the gate keyed off
+/// ledger pparams alone (`protocol_version_major < 7 && d > 0 && …`). A
+/// LedgerSeq anchored at a genesis state reconstructed preview-genesis pparams
+/// — PV 6, d = 1 — into the live ledger, which opened the gate on a *canonical
+/// Conway block*: every slot classified as an overlay slot, offset 25616 of
+/// epoch 1378 not divisible by `asc_inv = 20`, so `NonActiveSlot` →
+/// `NotActiveOverlaySlot`. The node rejected block 4535827, cached it as
+/// invalid, and refused every descendant forever.
+///
+/// With `era` leading, that outcome is unreachable regardless of how corrupt
+/// or stale the ledger state is. The remaining terms are retained because
+/// *within* the TPraos eras they are the correct, load-bearing test.
+///
+/// # Parameters
+///
+/// - `era` — the BLOCK's era, never the ledger's.
+/// - `pv_major` — enacted protocol version major from the ledger.
+/// - `forecast_d_numerator` — `d` forecast for the block's epoch (see the call
+///   site: it must be the block's epoch value, not the un-ticked current one).
+/// - `has_genesis_delegates` — whether the ledger holds any genesis delegates.
+pub(crate) fn should_build_overlay_context(
+    era: dugite_primitives::era::Era,
+    pv_major: u64,
+    forecast_d_numerator: u64,
+    has_genesis_delegates: bool,
+) -> bool {
+    era.uses_tpraos() && pv_major < 7 && forecast_d_numerator > 0 && has_genesis_delegates
+}
+
 // ─── Node impl: new() ────────────────────────────────────────────────────────
 
 impl Node {
@@ -2971,6 +3018,27 @@ impl Node {
         self.replay_ledger_from_storage(shutdown_rx.clone()).await;
         self.metrics
             .set_replay_duration_secs(replay_start.elapsed().as_secs());
+
+        // #985: replay advances `ledger_state` in bulk without pushing any
+        // deltas, and every one of its sub-paths (chunk replay, LSM replay,
+        // and the fork-rollback inside LSM replay) can move the tip. The
+        // LedgerSeq was anchored in `Node::new` on the PRE-replay state, so
+        // without this the anchor stays behind for the whole process lifetime
+        // while at-tip deltas pile on top of it.
+        //
+        // Worst case that made this a P0: on the first boot after a
+        // SNAPSHOT_VERSION bump every on-disk snapshot is quarantined, so
+        // `Node::new` falls back to `init_fresh_ledger` and the anchor is
+        // GENESIS. The first at-tip fork switch then reconstructed
+        // genesis pparams — PV6, d=1 — into the live ledger, which ran the
+        // TPraos overlay classifier over a canonical Conway block, rejected
+        // it, and poisoned chain selection permanently.
+        //
+        // Unconditional rather than gated on "did replay do anything": the
+        // no-op case is a cheap `clone_without_utxos` of a state we already
+        // hold, and a gate is one more thing that can be wrong.
+        self.reanchor_ledger_seq("startup replay complete").await;
+
         if *shutdown_rx.borrow() {
             info!("Shutdown requested during replay, exiting");
             return Ok(());
@@ -6236,10 +6304,12 @@ impl Node {
         // the first valid Praos block of the new epoch.
         let block_epoch = ls.epoch_of_slot(block.slot().0);
         let forecast_d = ls.forecast_d_for_epoch(block_epoch);
-        let overlay_ctx = if ls.epochs.protocol_params.protocol_version_major < 7
-            && forecast_d.numerator > 0
-            && !ls.genesis_delegates.is_empty()
-        {
+        let overlay_ctx = if should_build_overlay_context(
+            block.era,
+            ls.epochs.protocol_params.protocol_version_major,
+            forecast_d.numerator,
+            !ls.genesis_delegates.is_empty(),
+        ) {
             let first_slot = ls.first_slot_of_epoch(block_epoch);
             let genesis_keys: std::collections::BTreeSet<dugite_primitives::hash::Hash28> =
                 ls.genesis_delegates.keys().copied().collect();
@@ -7446,9 +7516,41 @@ impl Node {
             }
         };
         // Push delta to LedgerSeq (ledger_state lock already released above).
-        {
+        let seq_incoherent = {
             let mut seq = self.ledger_seq.write().await;
             seq.push(delta);
+            seq.is_incoherent()
+        };
+
+        // #985 self-heal. `push` flags a delta that does not chain onto the
+        // window, which means some path advanced `ledger_state` in bulk
+        // without calling `reanchor_ledger_seq`. The guard already prevents
+        // corruption — `find_rollback_n` declines while flagged, so rollbacks
+        // take the snapshot slow path — but that costs rollback *capability*
+        // until something re-anchors.
+        //
+        // Here we can simply fix it: `ledger_state` has just had this block
+        // applied, so it is exactly the state to anchor at. One re-anchor and
+        // the window rebuilds coherently from the next block on.
+        //
+        // That turns a missed re-anchor site from "degraded for the process
+        // lifetime" into "degraded for one block", which is the property that
+        // would have kept #985 from being a permanent wedge. The other push
+        // sites (fork replay, forge) need no copy of this: any of them is
+        // followed by live applies through here.
+        //
+        // WARN not ERROR — the condition is already handled; the log exists to
+        // get the missing re-anchor site found and fixed.
+        if seq_incoherent {
+            warn!(
+                slot = block_slot.0,
+                block = block_number.0,
+                "LedgerSeq was incoherent at block apply — re-anchoring on the live \
+                 ledger. Some path advanced the ledger without re-anchoring; please \
+                 report this with the preceding log context (#985)."
+            );
+            self.reanchor_ledger_seq("coherence guard tripped at block apply")
+                .await;
         }
 
         // Update chain fragment.
@@ -11843,5 +11945,71 @@ mod tests {
         // In a dev session with the env var set it may be true — that is fine.
         // We cannot assert a specific value here without controlling the env.
         let _ = v1; // suppress unused warning
+    }
+
+    // ── #985: the BFT overlay gate ──────────────────────────────────────────
+
+    /// The exact state the wedged preview BP was in: a LedgerSeq anchored at
+    /// preview genesis reconstructed PV 6 / d = 1 / 7 genesis delegates into
+    /// the live ledger, and a canonical Conway block arrived.
+    ///
+    /// Every non-era term is satisfied here — that is the point. Before the
+    /// fix this returned `true`, the overlay classifier ran on a Praos header,
+    /// slot 119084816 (offset 25616 of epoch 1378, `25616 % 20 = 16`) came
+    /// back `NonActiveSlot`, and block 4535827 was rejected and cached as
+    /// invalid, wedging chain selection for the process lifetime.
+    #[test]
+    fn conway_block_never_gets_an_overlay_context_even_on_corrupt_pparams() {
+        assert!(
+            !super::should_build_overlay_context(Era::Conway, 6, 1, true),
+            "a Conway header must never be judged against the TPraos overlay \
+             schedule, whatever the ledger state says (#985)"
+        );
+        for era in [Era::Babbage, Era::Conway, Era::Dijkstra] {
+            assert!(
+                !super::should_build_overlay_context(era, 6, 1, true),
+                "{era:?} is a Praos era"
+            );
+        }
+    }
+
+    /// The era term must not have broken the check where it is genuinely
+    /// needed — a mainnet Shelley block during the decentralisation ramp.
+    #[test]
+    fn tpraos_era_with_d_still_gets_an_overlay_context() {
+        assert!(super::should_build_overlay_context(
+            Era::Shelley,
+            2,
+            1,
+            true
+        ));
+        assert!(super::should_build_overlay_context(Era::Alonzo, 6, 1, true));
+    }
+
+    /// The pre-existing terms still gate independently within a TPraos era.
+    #[test]
+    fn overlay_gate_still_honours_d_pv_and_delegates() {
+        // d == 0: fully decentralised, no overlay slots.
+        assert!(!super::should_build_overlay_context(
+            Era::Shelley,
+            2,
+            0,
+            true
+        ));
+        // No genesis delegates: nothing to validate an overlay slot against.
+        assert!(!super::should_build_overlay_context(
+            Era::Shelley,
+            2,
+            1,
+            false
+        ));
+        // PV >= 7 cannot occur in a TPraos era on a real chain, but the term is
+        // retained as defence in depth and must still gate.
+        assert!(!super::should_build_overlay_context(
+            Era::Alonzo,
+            7,
+            1,
+            true
+        ));
     }
 }

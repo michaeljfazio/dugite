@@ -12,8 +12,8 @@
 
 #![no_main]
 
-use libfuzzer_sys::fuzz_target;
 use dugite_primitives::hash::{blake2b_224, blake2b_224_tagged, blake2b_256, Blake2b256Hasher};
+use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     // --- one-shot hashes ---
