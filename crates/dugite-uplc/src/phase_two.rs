@@ -4,10 +4,11 @@
 //!
 //! ## API shape
 //!
-//! `eval_phase_two_raw` mirrors the function signature from
-//! aiken-lang/uplc that dugite-ledger currently invokes, so the
-//! ledger-side switch from aiken-uplc to dugite-uplc is a one-line
-//! import change. The signature is:
+//! `eval_phase_two_raw` keeps the signature of the `aiken-lang/uplc`
+//! function this crate REPLACED, which is why the ledger-side switch was a
+//! one-line import change. That is the only remaining connection: the
+//! evaluator is dugite's, and nothing in this crate treats Aiken as a
+//! correctness reference (see #970). The signature is:
 //!
 //! ```text
 //! fn eval_phase_two_raw(
@@ -119,14 +120,19 @@ pub struct RedeemerResult {
     pub logs: Vec<String>,
 }
 
-/// All failure modes the phase-2 evaluator can surface to the
-/// ledger. Mirrors the typed taxonomy from aiken-uplc.
+/// All failure modes the phase-2 evaluator can surface to the ledger.
+///
+/// The taxonomy was inherited from the `aiken-lang/uplc` crate this one
+/// replaced, so the ledger's match arms did not have to change.
 #[derive(Debug, thiserror::Error)]
 pub enum PhaseTwoError {
     /// The evaluator is wired into the dependency graph but the
-    /// per-version `TxInfo` builder and CEK glue have not yet
-    /// landed. dugite-ledger should keep calling aiken-uplc until
-    /// this variant disappears.
+    /// per-version `TxInfo` builder and CEK glue have not yet landed.
+    ///
+    /// Historical: this dated from when `dugite-ledger` still called
+    /// `aiken-uplc` and was migrating off it. That migration is long done —
+    /// dugite-uplc is the only phase-2 evaluator — so the variant is now
+    /// purely a not-implemented signal.
     #[error(
         "phase-2 evaluator not yet fully implemented (see crates/dugite-uplc/src/phase_two.rs)"
     )]
