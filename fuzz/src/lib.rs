@@ -618,7 +618,26 @@ impl Gen<'_> {
     /// `choice` covers the full range so no variant is unreachable; a byte
     /// mutator flipping one byte moves between adjacent variants.
     pub fn certificate(&mut self) -> Certificate {
-        match self.choice(19) {
+        self.certificate_for(Era::Conway)
+    }
+
+    /// A certificate valid for `era`.
+    ///
+    /// Pre-Conway decoders accept wire tags 0-6 only; Conway adds 7-18 (the
+    /// CIP-1694 governance certificates). Generating a Conway certificate in a
+    /// Babbage body is rejected at decode — a false positive, not a finding.
+    ///
+    /// The variant indices below are this generator's own; the mapping to wire
+    /// tags is in `encode_certificate`.
+    pub fn certificate_for(&mut self, era: Era) -> Certificate {
+        // Indices whose wire tag is <= 6, i.e. representable before Conway.
+        const PRE_CONWAY_VARIANTS: [u8; 7] = [0, 1, 4, 5, 6, 17, 18];
+        let index = if era >= Era::Conway {
+            self.choice(19)
+        } else {
+            PRE_CONWAY_VARIANTS[(self.byte() as usize) % PRE_CONWAY_VARIANTS.len()]
+        };
+        match index {
             0 => Certificate::StakeRegistration(self.credential()),
             1 => Certificate::StakeDeregistration(self.credential()),
             2 => Certificate::ConwayStakeRegistration {
@@ -880,6 +899,13 @@ impl Gen<'_> {
     }
 
     pub fn tx_output(&mut self) -> TransactionOutput {
+        self.tx_output_for(true)
+    }
+
+    /// A transaction output. `allow_map_form` is false before Babbage, where
+    /// the post-Alonzo map encoding (and therefore inline datums and script
+    /// references) does not exist.
+    pub fn tx_output_for(&mut self, allow_map_form: bool) -> TransactionOutput {
         // The two output encodings are not interchangeable, and `is_legacy`
         // selects between them:
         //
@@ -891,7 +917,7 @@ impl Gen<'_> {
         // drops it and the round-trip reports a difference the encoder did not
         // cause. Conway bodies do still contain legacy outputs (simple change
         // outputs), so both shapes are generated; they are just kept coherent.
-        let is_legacy = self.bool();
+        let is_legacy = !allow_map_form || self.bool();
 
         let datum = if is_legacy {
             match self.choice(2) {
@@ -933,6 +959,22 @@ impl Gen<'_> {
     /// witnesses (key 2) sort by the Byron address-root hash, NOT `WitVKey`'s
     /// blake2b224(vkey), and appear in no fixture in this repo.
     pub fn witness_set(&mut self) -> TransactionWitnessSet {
+        self.witness_set_for(Era::Conway)
+    }
+
+    /// A witness set valid for `era`.
+    ///
+    /// The witness-set key space grew with the eras and the decoders hard-reject
+    /// an out-of-era key:
+    ///
+    ///   Shelley   keys 0-2   (vkey, native scripts, bootstrap)
+    ///   Alonzo    + 3 (plutus_v1), 4 (plutus_data), 5 (redeemers)
+    ///   Babbage   + 6 (plutus_v2)
+    ///   Conway    + 7 (plutus_v3)
+    pub fn witness_set_for(&mut self, era: Era) -> TransactionWitnessSet {
+        let has_plutus_v1 = era >= Era::Alonzo;
+        let has_plutus_v2 = era >= Era::Babbage;
+        let has_plutus_v3 = era >= Era::Conway;
         let vkeys = self.collection_len(24);
         let boots = self.collection_len(8);
         let natives = self.collection_len(8);
@@ -997,11 +1039,31 @@ impl Gen<'_> {
                     })
                     .collect(),
             ),
-            plutus_v1_scripts: script_list(self, 4),
-            plutus_v2_scripts: script_list(self, 4),
-            plutus_v3_scripts: script_list(self, 4),
-            plutus_data: dedup_preserving_order((0..datums).map(|_| self.plutus_data(2)).collect()),
-            redeemers: redeemer_set,
+            plutus_v1_scripts: if has_plutus_v1 {
+                script_list(self, 4)
+            } else {
+                Vec::new()
+            },
+            plutus_v2_scripts: if has_plutus_v2 {
+                script_list(self, 4)
+            } else {
+                Vec::new()
+            },
+            plutus_v3_scripts: if has_plutus_v3 {
+                script_list(self, 4)
+            } else {
+                Vec::new()
+            },
+            plutus_data: if has_plutus_v1 {
+                dedup_preserving_order((0..datums).map(|_| self.plutus_data(2)).collect())
+            } else {
+                Vec::new()
+            },
+            redeemers: if has_plutus_v1 {
+                redeemer_set
+            } else {
+                Vec::new()
+            },
             raw_redeemers_cbor: None,
             raw_plutus_data_cbor: None,
             original_script_data_hash: None,
@@ -1009,8 +1071,29 @@ impl Gen<'_> {
     }
 
     pub fn auxiliary_data(&mut self) -> AuxiliaryData {
+        self.auxiliary_data_for(Era::Conway)
+    }
+
+    /// Auxiliary data for `era`.
+    ///
+    /// `native_scripts` (and the plutus script vectors) are generated ONLY from
+    /// Conway on, because only `era_conway::decode_auxiliary_data` parses them.
+    /// `era_shelley::decode_auxiliary_data` — which serves the standalone
+    /// Shelley..Babbage paths — skips the scripts and returns every vector
+    /// empty, so generating them there fails the round-trip on a decoder gap
+    /// rather than on the encoder.
+    ///
+    /// That gap is real but latent: `raw_cbor` IS preserved, so the
+    /// `auxiliary_data_hash` check and byte-exact relay are unaffected, and
+    /// nothing in dugite-ledger or dugite-consensus reads the parsed vectors.
+    /// Tracked separately rather than widened into this change.
+    pub fn auxiliary_data_for(&mut self, era: Era) -> AuxiliaryData {
         let labels = self.collection_len(8);
-        let natives = self.collection_len(4);
+        let natives = if era >= Era::Conway {
+            self.collection_len(4)
+        } else {
+            0
+        };
         let mut metadata = BTreeMap::new();
         for _ in 0..labels {
             metadata.insert(self.u64(), self.metadatum(2));
@@ -1025,13 +1108,37 @@ impl Gen<'_> {
         }
     }
 
-    /// A whole transaction for `era`.
+    /// A whole transaction for `era`, populating every body field the era's
+    /// wire type actually carries.
     ///
-    /// Only Conway is generated for now: it is the era dugite forges, it is a
-    /// strict superset of the pre-Conway body shape for every field this
-    /// exercises, and the pre-Conway-only key 6 is covered directly by
-    /// `fuzz_structured_pparam_update` plus a deterministic unit test.
+    /// Era-awareness is the point, not a nicety. Leaving the era-specific
+    /// fields empty is what let tx-body key 6 (`update`) sit with NO encoder
+    /// arm at all while three decoders populated it — a pre-Conway transaction
+    /// carrying a param update re-encoded into a body missing key 6, changing
+    /// the transaction id. The Dijkstra-only fields (`sub_transactions`,
+    /// `account_balance_intervals`, `direct_deposits`, `guards`) were in the
+    /// same position: decoded, never generated, never checked.
     pub fn transaction(&mut self, era: Era) -> Transaction {
+        let pre_conway = era < Era::Conway;
+        let dijkstra = era >= Era::Dijkstra;
+
+        // The per-era tx-body key matrix, taken from what the decoders actually
+        // ACCEPT (they hard-reject an out-of-era key, per upstream's per-era
+        // `SparseKeyed` `bodyFields` catch-all). Generating a field the target
+        // era cannot carry is a false positive, not a finding — a Shelley body
+        // with key 8 is rejected by the Shelley decoder, and correctly so.
+        //
+        //   Shelley                  keys 0-7
+        //   Allegra / Mary / Alonzo  + 8 (validity_interval_start), 9 (mint)
+        //   Alonzo only              + 11, 13, 14, 15
+        //   Babbage                  + 11, 13-18
+        //   Conway+                  + 19-22; key 6 (update) is GONE
+        //   Dijkstra                 + 23, 25, 26 and key-14 guards
+        let has_validity_start = era >= Era::Allegra;
+        let has_mint = era >= Era::Allegra;
+        let has_alonzo_keys = era >= Era::Alonzo; // 11, 13, 14, 15
+        let has_babbage_keys = era >= Era::Babbage; // 16, 17, 18
+        let has_conway_gov = era >= Era::Conway; // 19-22
         let inputs = self.collection_len(30);
         let outputs = self.collection_len(24);
         let certs = self.collection_len(19);
@@ -1113,7 +1220,7 @@ impl Gen<'_> {
         // #940. Dedup here keeps first occurrence and preserves order.
         let mut cert_set: Vec<Certificate> = Vec::new();
         for _ in 0..certs {
-            let cert = self.certificate();
+            let cert = self.certificate_for(era);
             if !cert_set.contains(&cert) {
                 cert_set.push(cert);
             }
@@ -1126,42 +1233,141 @@ impl Gen<'_> {
             }
         }
 
+        // ── Dijkstra-only body fields (keys 23, 25, 26 and the key-14 guards)
+        let mut sub_txs: Vec<SubTransaction> = Vec::new();
+        let mut balance_intervals: Vec<(Credential, AccountBalanceInterval)> = Vec::new();
+        let mut direct_deposits: BTreeMap<Vec<u8>, Lovelace> = BTreeMap::new();
+        let mut guard_set: Vec<Credential> = Vec::new();
+        if dijkstra {
+            let n = self.collection_len(4);
+            for _ in 0..n {
+                sub_txs.push(self.sub_transaction());
+            }
+            // `sub_transactions` is an OMap keyed by TxId; duplicates are
+            // rejected (`EnforceNoDuplicates`) and the decoder derives each key
+            // from the sub-body's own bytes.
+            sub_txs = dedup_preserving_order(sub_txs);
+
+            let n = self.collection_len(8);
+            for _ in 0..n {
+                // At least one bound MUST be Some — the decoder rejects
+                // `[null, null]`, so generating it would be a false positive.
+                let (lower, upper) = match self.choice(3) {
+                    0 => (Some(self.lovelace()), None),
+                    1 => (None, Some(self.lovelace())),
+                    _ => (Some(self.lovelace()), Some(self.lovelace())),
+                };
+                balance_intervals
+                    .push((self.credential(), AccountBalanceInterval { lower, upper }));
+            }
+            // Keyed by credential on the wire, so duplicates collapse.
+            let mut seen: Vec<Credential> = Vec::new();
+            balance_intervals.retain(|(cred, _)| {
+                if seen.contains(cred) {
+                    false
+                } else {
+                    seen.push(cred.clone());
+                    true
+                }
+            });
+
+            let n = self.collection_len(8);
+            for _ in 0..n {
+                direct_deposits.insert(self.reward_account(), self.lovelace());
+            }
+
+            let n = self.collection_len(16);
+            guard_set = dedup_preserving_order((0..n).map(|_| self.credential()).collect());
+            guard_set.sort();
+        }
+
         let body = TransactionBody {
             inputs: input_set,
-            outputs: (0..outputs).map(|_| self.tx_output()).collect(),
+            outputs: (0..outputs)
+                .map(|_| self.tx_output_for(has_babbage_keys))
+                .collect(),
             fee: self.lovelace(),
             ttl: self.chance(180).then(|| SlotNo(self.u64())),
             certificates: cert_set,
             withdrawals,
             auxiliary_data_hash: self.chance(180).then(|| self.hash32()),
-            validity_interval_start: self.chance(180).then(|| SlotNo(self.u64())),
-            mint,
-            script_data_hash: self.chance(180).then(|| self.hash32()),
-            collateral: collateral_set,
-            required_signers: signer_set,
-            network_id: self.chance(128).then(|| self.byte() & 1),
-            collateral_return: self.chance(128).then(|| self.tx_output()),
-            total_collateral: self.chance(128).then(|| self.lovelace()),
-            reference_inputs: ref_input_set,
-            // Pre-Conway only; a Conway body must not carry it.
-            update: None,
-            voting_procedures,
-            proposal_procedures: proposal_set,
-            treasury_value: self.chance(128).then(|| self.lovelace()),
-            donation: self.chance(128).then(|| self.lovelace()),
-            sub_transactions: Vec::new(),
-            account_balance_intervals: Vec::new(),
-            direct_deposits: BTreeMap::new(),
-            guards: Vec::new(),
+            validity_interval_start: (has_validity_start && self.chance(180))
+                .then(|| SlotNo(self.u64())),
+            mint: if has_mint { mint } else { BTreeMap::new() },
+            script_data_hash: (has_alonzo_keys && self.chance(180)).then(|| self.hash32()),
+            collateral: if has_alonzo_keys {
+                collateral_set
+            } else {
+                Vec::new()
+            },
+            // Key 14 has one wire slot. On Dijkstra the encoder composes it
+            // from `guards`; generating both would make the projection
+            // ambiguous, so only one is populated per era.
+            required_signers: if dijkstra || !has_alonzo_keys {
+                Vec::new()
+            } else {
+                signer_set
+            },
+            network_id: (has_alonzo_keys && self.chance(128)).then(|| self.byte() & 1),
+            collateral_return: (has_babbage_keys && self.chance(128)).then(|| self.tx_output()),
+            total_collateral: (has_babbage_keys && self.chance(128)).then(|| self.lovelace()),
+            reference_inputs: if has_babbage_keys {
+                ref_input_set
+            } else {
+                Vec::new()
+            },
+            // Body key 6 — pre-Conway only. Conway replaces the
+            // genesis-delegate update mechanism with governance
+            // proposal_procedures (key 20), so a Conway body must not carry it.
+            update: (pre_conway && self.chance(180)).then(|| self.update_proposal()),
+            voting_procedures: if has_conway_gov {
+                voting_procedures
+            } else {
+                BTreeMap::new()
+            },
+            proposal_procedures: if has_conway_gov {
+                proposal_set
+            } else {
+                Vec::new()
+            },
+            treasury_value: (has_conway_gov && self.chance(128)).then(|| self.lovelace()),
+            donation: (has_conway_gov && self.chance(128)).then(|| self.lovelace()),
+            sub_transactions: if dijkstra { sub_txs } else { Vec::new() },
+            account_balance_intervals: if dijkstra {
+                balance_intervals
+            } else {
+                Vec::new()
+            },
+            direct_deposits: if dijkstra {
+                direct_deposits
+            } else {
+                BTreeMap::new()
+            },
+            // Body key 14 is `guards` from Dijkstra on and `required_signers`
+            // before it. The decoder populates BOTH from the same wire set, so
+            // only one of them is generated per era.
+            guards: if dijkstra { guard_set } else { Vec::new() },
         };
 
         Transaction {
             hash: Default::default(),
             era,
             body,
-            witness_set: self.witness_set(),
-            is_valid: self.bool(),
-            auxiliary_data: self.chance(180).then(|| self.auxiliary_data()),
+            witness_set: self.witness_set_for(era),
+            // `is_valid` is only on the wire for Alonzo..Conway.
+            //
+            // Before Alonzo the phase-2 validity flag does not exist — dugite's
+            // standalone format keeps a byte for it, and the Shelley/Allegra/
+            // Mary decoders read it and force `true`. From Dijkstra it is
+            // removed again (CIP-0167: the standalone shape is array(3), and
+            // validity is determined by phase-2 evaluation rather than
+            // signalled by the author), so the encoder omits it and the decoder
+            // defaults to `true`.
+            //
+            // Generating `false` outside that window fails the round-trip on a
+            // field the era does not carry.
+            is_valid: !(Era::Alonzo..=Era::Conway).contains(&era) || self.bool(),
+            auxiliary_data: self.chance(180).then(|| self.auxiliary_data_for(era)),
             raw_cbor: None,
             raw_body_cbor: None,
             raw_witness_cbor: None,
@@ -1211,6 +1417,11 @@ pub fn normalise_for_comparison(tx: &mut Transaction) {
     }
     for sub in &mut tx.body.sub_transactions {
         sub.raw_body_cbor = None;
+        // `tx_id` is `blake2b_256(raw_sub_body_cbor)`, recomputed by the
+        // decoder from the sub-body's own bytes — the same derived-from-wire
+        // family as `Transaction.hash`, and equally not something the encoder
+        // round-trips.
+        sub.tx_id = Default::default();
         for output in &mut sub.outputs {
             clear_output_caches(output);
         }
@@ -1290,6 +1501,8 @@ fn canonicalise_set_order(tx: &mut Transaction) {
     // introduced. Pre-Dijkstra, `guards` is not independently representable,
     // so it is replaced by that projection on both sides.
     if tx.era < Era::Dijkstra {
+        // Pre-Dijkstra, key 14 IS `required_signers`; `guards` is only the
+        // decoder's derived view, so it is replaced by that projection.
         tx.body.guards = tx
             .body
             .required_signers
@@ -1300,6 +1513,20 @@ fn canonicalise_set_order(tx: &mut Transaction) {
                 Credential::VerificationKey(Hash::from_bytes(bytes))
             })
             .collect();
+    } else {
+        // From Dijkstra, key 14 IS `guards`; `required_signers` is the derived
+        // view (the key-hash subset, padded to Hash32), so it is replaced by
+        // that projection instead. Same field, opposite direction.
+        tx.body.required_signers = tx
+            .body
+            .guards
+            .iter()
+            .filter_map(|cred| match cred {
+                Credential::VerificationKey(h28) => Some(h28.to_hash32_padded()),
+                Credential::Script(_) => None,
+            })
+            .collect();
+        tx.body.required_signers.sort_by_key(|h| h.0);
     }
 
     // Either way the wire form is sorted, so the field mirroring it comes back
@@ -1357,5 +1584,70 @@ fn clear_output_caches(output: &mut TransactionOutput) {
     output.raw_cbor = None;
     if let OutputDatum::InlineDatum { raw_cbor, .. } = &mut output.datum {
         *raw_cbor = None;
+    }
+}
+
+impl Gen<'_> {
+    /// A pre-Conway update proposal — transaction body key 6.
+    ///
+    /// This field had NO encoder arm while Shelley, Alonzo and Babbage all
+    /// decoded it, so a pre-Conway transaction carrying one re-encoded into a
+    /// body missing key 6 and changed its own transaction id. Found by this
+    /// generator's sibling target; the fix is in `encode_update_proposal`.
+    pub fn update_proposal(&mut self) -> UpdateProposal {
+        let n = self.collection_len(6).max(1);
+        let mut proposed_updates = Vec::new();
+        for _ in 0..n {
+            // `genesishash` is bstr(28) on the wire; the decoder stores it via
+            // `Hash28::to_hash32_padded`, so a full-width Hash32 would come
+            // back truncated.
+            proposed_updates.push((
+                self.hash28().to_hash32_padded(),
+                self.ppu_for(PpuShape::PreConway),
+            ));
+        }
+        // Keyed by genesis hash on the wire — duplicates collapse.
+        let mut seen = Vec::new();
+        proposed_updates.retain(|(hash, _)| {
+            if seen.contains(hash) {
+                false
+            } else {
+                seen.push(*hash);
+                true
+            }
+        });
+        UpdateProposal {
+            proposed_updates,
+            epoch: self.u64(),
+        }
+    }
+
+    /// A Dijkstra sub-transaction (body key 23).
+    pub fn sub_transaction(&mut self) -> SubTransaction {
+        let inputs = self.collection_len(8);
+        let outputs = self.collection_len(8);
+        let ref_inputs = self.collection_len(4);
+
+        let mut input_set: Vec<TransactionInput> = (0..inputs).map(|_| self.tx_input()).collect();
+        input_set.sort();
+        input_set.dedup();
+        let mut ref_input_set: Vec<TransactionInput> =
+            (0..ref_inputs).map(|_| self.tx_input()).collect();
+        ref_input_set.sort();
+        ref_input_set.dedup();
+
+        SubTransaction {
+            // Recomputed by the decoder from the sub-body's own bytes, so the
+            // generated value is irrelevant and is normalised out before
+            // comparison.
+            tx_id: Default::default(),
+            inputs: input_set,
+            outputs: (0..outputs).map(|_| self.tx_output()).collect(),
+            ttl: self.chance(160).then(|| SlotNo(self.u64())),
+            validity_interval_start: self.chance(160).then(|| SlotNo(self.u64())),
+            reference_inputs: ref_input_set,
+            auxiliary_data_hash: self.chance(160).then(|| self.hash32()),
+            raw_body_cbor: None,
+        }
     }
 }

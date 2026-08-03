@@ -42,20 +42,42 @@ use dugite_primitives::era::Era;
 use dugite_serialization::{decode_transaction, encode_transaction};
 use libfuzzer_sys::fuzz_target;
 
-/// HFC era id for Conway, matching `decode_transaction`'s dispatch table.
-const CONWAY_ERA_ID: u16 = 6;
+/// Every era `encode_transaction` can emit, with its HFC id from
+/// `decode_transaction`'s dispatch table.
+///
+/// Byron is excluded: its standalone form is `tag(30, bstr(...))` and there is
+/// no Byron encoder, so P1-P3 do not apply.
+///
+/// Sweeping all of them is not thoroughness for its own sake — the era-specific
+/// body fields are exactly the ones that sat unfuzzed. Key 6 (`update`) is
+/// pre-Conway only and had no encoder arm at all; `sub_transactions`,
+/// `account_balance_intervals`, `direct_deposits` and `guards` are Dijkstra
+/// only and were never generated.
+const ENCODABLE_ERAS: [(Era, u16); 7] = [
+    (Era::Shelley, 1),
+    (Era::Allegra, 2),
+    (Era::Mary, 3),
+    (Era::Alonzo, 4),
+    (Era::Babbage, 5),
+    (Era::Conway, 6),
+    (Era::Dijkstra, 7),
+];
 
 fuzz_target!(|data: &[u8]| {
     let mut gen = Gen::new(data);
-    let tx = gen.transaction(Era::Conway);
+
+    // One era per input, selected from the entropy stream: generating all seven
+    // per run would spend most of the budget re-encoding near-identical bodies.
+    let (era, era_id) = ENCODABLE_ERAS[(gen.byte() as usize) % ENCODABLE_ERAS.len()];
+    let tx = gen.transaction(era);
 
     let encoded = encode_transaction(&tx);
 
     // P1 — self-decodability. Hard failure, never a skip.
-    let decoded = match decode_transaction(CONWAY_ERA_ID, &encoded) {
+    let decoded = match decode_transaction(era_id, &encoded) {
         Ok(t) => t,
         Err(e) => panic!(
-            "encode_transaction emitted bytes its OWN decoder rejects: {e}\n\
+            "era {era:?}: encode_transaction emitted bytes its OWN decoder rejects: {e}\n\
              This is the #948 shape (encoder and decoder disagreeing on a \
              field's wire width or framing) and is always a bug.\n\
              tx      = {tx:#?}\n\
@@ -69,7 +91,7 @@ fuzz_target!(|data: &[u8]| {
     let re_encoded = encode_transaction(&decoded);
     assert!(
         encoded == re_encoded,
-        "encoder is not idempotent — E(D(E(tx))) != E(tx)\n\
+        "era {era:?}: encoder is not idempotent — E(D(E(tx))) != E(tx)\n\
          first  = {}\n\
          second = {}",
         hex(&encoded),
@@ -83,7 +105,7 @@ fuzz_target!(|data: &[u8]| {
     normalise_for_comparison(&mut round_tripped);
     assert!(
         original == round_tripped,
-        "generated transaction did not survive encode -> decode intact\n\
+        "era {era:?}: generated transaction did not survive encode -> decode intact\n\
          before = {original:#?}\n\
          after  = {round_tripped:#?}",
     );
