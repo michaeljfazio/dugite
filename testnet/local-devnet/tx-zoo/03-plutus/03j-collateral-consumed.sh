@@ -21,7 +21,31 @@ ZOO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 NAME="$(zoo_name)"
 zoo_require_devnet
-SCRIPT="$ZOO_DIR/lib/plutus/always-false-v3.plutus"
+# Spending WITH an inline datum, and this test needs the script to FAIL.
+# `alwaysFailsNoDatum` returns TRUE for spending-with-datum — the inverse of
+# what is wanted — so the failure has to come from `alwaysFailsWithDatum`.
+# With the wrong one the test still passed, but only because the execution
+# budget was exhausted; a pass for the wrong reason is not a pass.
+# Execution budget for a REAL plutus-tx program (#969/#970).
+#
+# This was (1000000,1000000), tuned for a trivial always-true validator.
+# Upstream's compiled output exceeds that, and running out of budget IS a
+# phase-2 failure — which silently changed what these two tests measure:
+# 03l stopped asserting "is_valid=false over a SUCCEEDING script is rejected"
+# (the script no longer succeeded), and 03j started passing for the wrong
+# reason (budget exhaustion rather than the script's own verdict).
+#
+# Devnet maxTxExecutionUnits = (steps 10000000000, memory 140000000).
+EXUNITS="(2000000000,20000000)"
+
+# The fee must cover the DECLARED execution units — Cardano prices the budget a
+# tx RESERVES, not what it consumes — so raising EXUNITS raised the minimum fee
+# with it, and the old 500000 became FeeTooSmallUTxO against an expected
+# 1474393. Kept clear of that so a pricing tweak does not turn this into a
+# flake.
+FEE=2000000
+
+SCRIPT="$ZOO_DIR/lib/plutus/always-false-v3-spend.plutus"
 [ -s "$SCRIPT" ] || { zoo_record_env_skip "$NAME" "missing-script-binary $(basename "$SCRIPT")"; exit 0; }
 
 PAIR=$(plutus_lock "$SCRIPT" inline 5000000) || { zoo_record "$NAME" FAIL "" "lock"; exit 1; }
@@ -31,8 +55,18 @@ SCRIPT_AMT=${PAIR##* }
 COLLAT_PAIR=$(plutus_collateral_pair) || { zoo_record "$NAME" FAIL "" "collat"; exit 1; }
 COLLAT=${COLLAT_PAIR%% *}
 COLLAT_AMT=${COLLAT_PAIR##* }
-RETURN_AMT=$((COLLAT_AMT - 2000000))
-[ "$RETURN_AMT" -lt 1000000 ] && { zoo_skip "collateral utxo too small ($COLLAT_AMT)"; zoo_record "$NAME" SKIP "" "collateral-utxo-too-small=$COLLAT_AMT"; exit 0; }
+# Collateral must be DERIVED from the fee, not pinned.
+#
+# The ledger requires total_collateral >= ceil(fee * collateralPercentage/100).
+# This used to hardcode a 2000000 margin, which happened to satisfy a 500000
+# fee — so raising the fee for the bigger upstream script (#969/#970) turned it
+# into `InsufficientCollateral`, a failure with nothing to do with what the
+# test is about. Read the percentage from the chain and add 25% slack.
+COLLAT_PCT=$(jq -r '.collateralPercentage // 150' "$(zoo_pparams_file)")
+COLLAT_NEEDED=$(( (FEE * COLLAT_PCT + 99) / 100 ))
+COLLAT_MARGIN=$(( COLLAT_NEEDED + COLLAT_NEEDED / 4 ))
+RETURN_AMT=$((COLLAT_AMT - COLLAT_MARGIN))
+[ "$RETURN_AMT" -lt 1000000 ] && { zoo_skip "collateral utxo too small ($COLLAT_AMT for margin $COLLAT_MARGIN)"; zoo_record "$NAME" SKIP "" "collateral-utxo-too-small=$COLLAT_AMT"; exit 0; }
 
 REDEEMER="$ZOO_BUILT/$NAME.redeemer.json"
 echo '{"int": 0}' > "$REDEEMER"
@@ -54,14 +88,13 @@ TTL=$((TIP + 100))
 RAW="$ZOO_BUILT/$NAME.raw"
 SIGNED="$ZOO_BUILT/$NAME.signed"
 PPARAMS=$(zoo_pparams_file)
-FEE=500000
 REG_OUT=$((SCRIPT_AMT - FEE))
 cardano-cli conway transaction build-raw \
     --tx-in         "$SCRIPT_TXIN" \
     --tx-in-script-file "$SCRIPT" \
     --tx-in-inline-datum-present \
     --tx-in-redeemer-file "$REDEEMER" \
-    --tx-in-execution-units "(1000000,1000000)" \
+    --tx-in-execution-units "$EXUNITS" \
     --tx-in-collateral  "$COLLAT" \
     --tx-total-collateral "$((COLLAT_AMT - RETURN_AMT))" \
     --tx-out-return-collateral "${ADDR}+${RETURN_AMT}" \

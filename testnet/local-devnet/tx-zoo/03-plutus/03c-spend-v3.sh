@@ -9,7 +9,10 @@ ZOO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 NAME="$(zoo_name)"
 zoo_require_devnet
-SCRIPT="$ZOO_DIR/lib/plutus/always-true-v3.plutus"
+# Spending WITH a datum (inline, below), so this is the WithDatum variant:
+# upstream's `alwaysSucceedsNoDatum` FAILS outright on a spending script that
+# carries one. See lib/build-plutus.sh.
+SCRIPT="$ZOO_DIR/lib/plutus/always-true-v3-spend.plutus"
 [ -s "$SCRIPT" ] || { zoo_record_env_skip "$NAME" "missing-script-binary $(basename "$SCRIPT")"; exit 0; }
 
 PAIR=$(plutus_lock "$SCRIPT" inline 5000000) || { zoo_record "$NAME" FAIL "" "lock"; exit 1; }

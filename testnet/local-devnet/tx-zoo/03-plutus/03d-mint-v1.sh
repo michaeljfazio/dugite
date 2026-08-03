@@ -8,7 +8,10 @@ ZOO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 NAME="$(zoo_name)"
 zoo_require_devnet
-SCRIPT="$ZOO_DIR/lib/plutus/always-true-v1.plutus"
+# Minting has no datum, so this must be the NoDatum variant: upstream's
+# `alwaysSucceedsWithDatum` (what always-true-v1.plutus aliases) succeeds ONLY
+# for a spending script that carries a datum. See lib/build-plutus.sh.
+SCRIPT="$ZOO_DIR/lib/plutus/always-true-v1-mint.plutus"
 [ -s "$SCRIPT" ] || { zoo_record_env_skip "$NAME" "missing-script-binary $(basename "$SCRIPT")"; exit 0; }
 
 ADDR=$(cat "$ZOO_PAY_ADDR_FILE")
