@@ -30,7 +30,8 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -281,6 +282,51 @@ pub enum PeerConnectionDirection {
 pub type ProtocolTaskFn = Box<
     dyn FnOnce(MuxChannel, CancellationToken) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send,
 >;
+
+/// How a server-side (responder) mini-protocol instance ended.
+///
+/// Upstream `ouroboros-network` has exactly two terminal outcomes for a
+/// responder, and dugite must reproduce both — see [`ServerProtocolTaskFn`].
+#[derive(Debug)]
+pub enum ServerProtocolOutcome {
+    /// The remote ended this mini-protocol normally — its `MsgDone`.
+    ///
+    /// This is NOT the end of the connection. cardano-node sends ChainSync
+    /// `MsgDone` on every Hot->Warm demotion (`deactivatePeerConnection`) and
+    /// starts a fresh ChainSync session on the SAME bearer when it re-promotes.
+    ClientDone,
+    /// The task was cancelled through its token — the connection is being torn
+    /// down by us, so there is nothing to re-arm.
+    Cancelled,
+    /// A protocol error. Fatal to the whole connection, not just this route.
+    Failed(String),
+}
+
+/// A RESTARTABLE server-side protocol task factory.
+///
+/// `Fn`, not `FnOnce`: a responder must be re-runnable on the same connection.
+/// That is the whole point — see [`PeerConnection::start_server_protocols`].
+pub type ServerProtocolTaskFn = Arc<
+    dyn Fn(
+            MuxChannel,
+            CancellationToken,
+        ) -> Pin<Box<dyn Future<Output = ServerProtocolOutcome> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// More than this many responder restarts inside
+/// [`SERVER_RESTART_WINDOW`] is treated as abuse and kills the connection.
+///
+/// Legitimate Hot->Warm->Hot churn runs at roughly one demotion per tens of
+/// seconds. A peer that can make us re-arm a route hundreds of times a second
+/// is spamming `MsgDone`, and each re-arm allocates a fresh ingress channel.
+/// Upstream needs no such guard because its re-arm is lazy (`StartOnDemand`
+/// costs nothing until a byte arrives); dugite's spawns a task, so it does.
+const SERVER_RESTART_BURST: u32 = 64;
+
+/// Window over which [`SERVER_RESTART_BURST`] is measured.
+const SERVER_RESTART_WINDOW: Duration = Duration::from_secs(10);
 
 impl PeerConnection {
     /// Returns `true` if this connection has server-side (responder) channels.
@@ -852,93 +898,236 @@ impl PeerConnection {
         Self::stop_tasks(&mut self.warm_tasks, "warm", self.addr).await;
     }
 
-    /// Start server-side (responder) protocol tasks.
-    ///
-    /// Takes the server channels and spawns each protocol as an independent
-    /// tokio task using the provided factory functions. Each factory receives
-    /// its channel and a cancellation token.
+    /// Start all five server-side (responder) protocol tasks on this
+    /// connection, each under a supervisor that reproduces upstream's
+    /// responder-termination policy (#980).
     ///
     /// Server protocols run the responder side: they wait for requests from
     /// the remote peer's client protocols and respond accordingly. In duplex
     /// mode, both client and server protocols run simultaneously on the same
     /// multiplexed connection.
     ///
-    /// # Arguments
+    /// # Why a supervisor at all
     ///
-    /// * `chainsync_server_fn` — Factory for the ChainSync server task
-    /// * `blockfetch_server_fn` — Factory for the BlockFetch server task
-    /// * `txsubmission_server_fn` — Factory for the TxSubmission2 server task
-    /// * `keepalive_server_fn` — Factory for the KeepAlive server task
-    /// * `peersharing_server_fn` — Factory for the PeerSharing server task
+    /// These tasks used to be spawned bare: whatever the protocol returned was
+    /// logged and the task exited. Nothing observed the handles. The mux, the
+    /// bearer and the TCP socket all stayed up, and
+    /// [`crate::node::peer_connection`]'s ingress task silently discards frames
+    /// for a route whose receiver has been dropped. So a downstream peer kept a
+    /// live connection on which one mini-protocol answered nothing, forever,
+    /// with no error and no disconnect — issue #980's exact fingerprint,
+    /// including "restarting the downstream fixes it" (a new connection gets a
+    /// new task).
+    ///
+    /// The trigger is ordinary, not exotic: cardano-node sends ChainSync
+    /// `MsgDone` on every Hot->Warm demotion, dugite's server returned
+    /// `Ok(())`, and the route was gone for the life of the connection. Under
+    /// load the peer governor churns more, so it reproduced as "load-dependent".
+    ///
+    /// # The policy, from ouroboros-network
+    ///
+    /// `network-mux/src/Network/Mux.hs` on an exception in a mini-protocol:
+    ///
+    /// ```text
+    /// | MiniProtocolException MiniProtocolNum MiniProtocolDir SomeException
+    ///   -- ^ A mini-protocol thread terminated with an exception. We always
+    ///   -- respond by terminating the whole mux.
+    /// ```
+    ///
+    /// and `Ouroboros/Network/InboundGovernor.hs` on a clean termination:
+    ///
+    /// ```text
+    /// MiniProtocolTerminated Terminated { tConnId, tMux, tMiniProtocolData = mpd, tResult } -> do
+    ///   case tResult' of
+    ///     Left e  -> ...  -- mux will shutdown, connection manager tears down the socket
+    ///     Right _ -> runResponder tMux mpd >>= ...  -- TrResponderRestarted
+    /// ```
+    ///
+    /// So: **error => kill the connection, clean exit => re-arm the route.**
+    /// Upstream cannot even express the third state dugite was in — its
+    /// responders are typed so that returning mid-protocol is not constructible,
+    /// and an orphaned ingress queue eventually overruns and kills the mux
+    /// anyway.
+    ///
+    /// Re-arming uses [`MuxHandle::resubscribe`], the same mechanism already
+    /// used for initiator-side Hot->Warm recovery; only the responder half was
+    /// missing.
     pub fn start_server_protocols(
         &mut self,
-        chainsync_server_fn: ProtocolTaskFn,
-        blockfetch_server_fn: ProtocolTaskFn,
-        txsubmission_server_fn: ProtocolTaskFn,
-        keepalive_server_fn: ProtocolTaskFn,
-        peersharing_server_fn: ProtocolTaskFn,
+        chainsync_server_fn: ServerProtocolTaskFn,
+        blockfetch_server_fn: ServerProtocolTaskFn,
+        txsubmission_server_fn: ServerProtocolTaskFn,
+        keepalive_server_fn: ServerProtocolTaskFn,
+        peersharing_server_fn: ServerProtocolTaskFn,
     ) -> Result<(), PeerConnectionError> {
-        let cs_ch = self
-            .chainsync_server_channel
-            .take()
-            .ok_or(PeerConnectionError::ChannelUnavailable("chainsync_server"))?;
-        let bf_ch = self
-            .blockfetch_server_channel
-            .take()
-            .ok_or(PeerConnectionError::ChannelUnavailable("blockfetch_server"))?;
-        let tx_ch = self.txsubmission_server_channel.take().ok_or(
-            PeerConnectionError::ChannelUnavailable("txsubmission_server"),
-        )?;
-        let ka_ch = self
-            .keepalive_server_channel
-            .take()
-            .ok_or(PeerConnectionError::ChannelUnavailable("keepalive_server"))?;
-        let ps_ch = self.peersharing_server_channel.take().ok_or(
-            PeerConnectionError::ChannelUnavailable("peersharing_server"),
-        )?;
+        let specs: [(&'static str, u16, ServerProtocolTaskFn, Option<MuxChannel>); 5] = [
+            (
+                "chainsync",
+                PROTOCOL_N2N_CHAINSYNC,
+                chainsync_server_fn,
+                self.chainsync_server_channel.take(),
+            ),
+            (
+                "blockfetch",
+                PROTOCOL_N2N_BLOCKFETCH,
+                blockfetch_server_fn,
+                self.blockfetch_server_channel.take(),
+            ),
+            (
+                "txsubmission",
+                PROTOCOL_N2N_TXSUBMISSION,
+                txsubmission_server_fn,
+                self.txsubmission_server_channel.take(),
+            ),
+            (
+                "keepalive",
+                PROTOCOL_N2N_KEEPALIVE,
+                keepalive_server_fn,
+                self.keepalive_server_channel.take(),
+            ),
+            (
+                "peersharing",
+                PROTOCOL_N2N_PEERSHARING,
+                peersharing_server_fn,
+                self.peersharing_server_channel.take(),
+            ),
+        ];
 
-        // Spawn ChainSync server task.
-        let cs_token = self.cancel.child_token();
-        let cs_token_clone = cs_token.clone();
-        let cs_handle = tokio::spawn(async move {
-            (chainsync_server_fn)(cs_ch, cs_token_clone).await;
-        });
-        self.server_tasks.push((cs_handle, cs_token));
-
-        // Spawn BlockFetch server task.
-        let bf_token = self.cancel.child_token();
-        let bf_token_clone = bf_token.clone();
-        let bf_handle = tokio::spawn(async move {
-            (blockfetch_server_fn)(bf_ch, bf_token_clone).await;
-        });
-        self.server_tasks.push((bf_handle, bf_token));
-
-        // Spawn TxSubmission2 server task.
-        let tx_token = self.cancel.child_token();
-        let tx_token_clone = tx_token.clone();
-        let tx_handle = tokio::spawn(async move {
-            (txsubmission_server_fn)(tx_ch, tx_token_clone).await;
-        });
-        self.server_tasks.push((tx_handle, tx_token));
-
-        // Spawn KeepAlive server task.
-        let ka_token = self.cancel.child_token();
-        let ka_token_clone = ka_token.clone();
-        let ka_handle = tokio::spawn(async move {
-            (keepalive_server_fn)(ka_ch, ka_token_clone).await;
-        });
-        self.server_tasks.push((ka_handle, ka_token));
-
-        // Spawn PeerSharing server task.
-        let ps_token = self.cancel.child_token();
-        let ps_token_clone = ps_token.clone();
-        let ps_handle = tokio::spawn(async move {
-            (peersharing_server_fn)(ps_ch, ps_token_clone).await;
-        });
-        self.server_tasks.push((ps_handle, ps_token));
+        for (label, protocol_id, factory, channel) in specs {
+            let channel = channel.ok_or(PeerConnectionError::ChannelUnavailable(label))?;
+            let task_token = self.cancel.child_token();
+            let handle = Self::spawn_server_supervisor(
+                label,
+                protocol_id,
+                factory,
+                channel,
+                self.mux_resubscribe.clone(),
+                task_token.clone(),
+                self.cancel.clone(),
+                self.mux_handle.abort_handle(),
+                self.addr,
+            );
+            self.server_tasks.push((handle, task_token));
+        }
 
         debug!(addr = %self.addr, "started server protocols (ChainSync, BlockFetch, TxSubmission2, KeepAlive, PeerSharing)");
         Ok(())
+    }
+
+    /// Run one responder to termination, then apply the upstream policy.
+    ///
+    /// Tearing down means BOTH `conn_cancel.cancel()` and `mux_abort.abort()`.
+    /// The token alone is not enough and would have been a silent no-op for the
+    /// purpose at hand: nothing in the node aborts the mux when the connection
+    /// token fires — `shutdown()` cancels the token and aborts `mux_handle` as
+    /// two separate steps, and `is_alive()` reads only the mux handle. Cancel
+    /// on its own would therefore stop the five protocol tasks while leaving
+    /// the bearer and TCP socket open and the connection still "alive" to the
+    /// reaper, which is a strictly worse version of the silence this whole fix
+    /// exists to remove.
+    ///
+    /// Aborting the mux drops the bearer, closes the socket, and lets the
+    /// downstream peer observe a disconnect and reconnect — the same
+    /// observable outcome as upstream's mux dying on a `MiniProtocolException`.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_server_supervisor(
+        label: &'static str,
+        protocol_id: u16,
+        factory: ServerProtocolTaskFn,
+        initial_channel: MuxChannel,
+        mux_resubscribe: MuxHandle,
+        task_token: CancellationToken,
+        conn_cancel: CancellationToken,
+        mux_abort: tokio::task::AbortHandle,
+        addr: SocketAddr,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut channel = initial_channel;
+            let mut window_start = Instant::now();
+            let mut restarts_in_window: u32 = 0;
+
+            loop {
+                match (factory)(channel, task_token.clone()).await {
+                    ServerProtocolOutcome::Cancelled => {
+                        debug!(%addr, protocol = label, "server protocol cancelled");
+                        return;
+                    }
+                    ServerProtocolOutcome::Failed(reason) => {
+                        // Haskell: "We always respond by terminating the whole
+                        // mux." Reject loudly beats going quiet — a peer that
+                        // sees a disconnect reconnects; a peer that sees
+                        // silence waits forever.
+                        warn!(
+                            %addr,
+                            protocol = label,
+                            reason = %reason,
+                            "server protocol failed — tearing down the connection \
+                             (a mini-protocol error is fatal to the whole mux upstream)"
+                        );
+                        conn_cancel.cancel();
+                        mux_abort.abort();
+                        return;
+                    }
+                    ServerProtocolOutcome::ClientDone => {
+                        if task_token.is_cancelled() {
+                            return;
+                        }
+                        // Rate guard — see SERVER_RESTART_BURST.
+                        if window_start.elapsed() > SERVER_RESTART_WINDOW {
+                            window_start = Instant::now();
+                            restarts_in_window = 0;
+                        }
+                        restarts_in_window += 1;
+                        if restarts_in_window > SERVER_RESTART_BURST {
+                            warn!(
+                                %addr,
+                                protocol = label,
+                                restarts = restarts_in_window,
+                                window_secs = SERVER_RESTART_WINDOW.as_secs(),
+                                "server protocol restarted too often — treating as \
+                                 abusive and tearing down the connection"
+                            );
+                            conn_cancel.cancel();
+                            mux_abort.abort();
+                            return;
+                        }
+
+                        // Between the responder returning and the swap below,
+                        // frames for this route land on the dropped receiver
+                        // and are discarded. The window is a few microseconds
+                        // and the peer has just said it is done with this
+                        // mini-protocol, so it cannot legitimately be sending;
+                        // upstream's `StartOnDemand` re-arm has the same shape.
+                        match mux_resubscribe.resubscribe(protocol_id, Direction::ResponderDir) {
+                            Some(fresh) => {
+                                debug!(
+                                    %addr,
+                                    protocol = label,
+                                    "responder re-armed after client MsgDone \
+                                     (InboundGovernor TrResponderRestarted)"
+                                );
+                                channel = fresh;
+                            }
+                            None => {
+                                // The route is not registered, so it cannot be
+                                // re-armed and would be silent from here on.
+                                // Silence is the one outcome that is never
+                                // acceptable: kill the connection instead.
+                                warn!(
+                                    %addr,
+                                    protocol = label,
+                                    "responder ended but the route cannot be re-armed \
+                                     — tearing down rather than going silent"
+                                );
+                                conn_cancel.cancel();
+                                mux_abort.abort();
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        })
     }
 
     /// Stop server-side protocol tasks.
@@ -1217,6 +1406,57 @@ impl PeerConnection {
             hot_tasks: Vec::new(),
             server_tasks: Vec::new(),
         }
+    }
+
+    /// Build a `PeerConnection` with real, mux-backed SERVER (responder)
+    /// channels, for the #980 responder-restart integration test.
+    ///
+    /// The initiator-side twin already exists ([`Self::fake_with_mux_resubscribe`]).
+    /// This one is what makes the responder half testable at all: the property
+    /// under test — "a responder that ends cleanly is re-armed on the same
+    /// bearer" — is only observable when `MuxHandle::resubscribe` has genuine
+    /// `SwappableSender` entries for `ResponderDir`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fake_with_server_channels(
+        addr: SocketAddr,
+        local_addr: SocketAddr,
+        cs_ch: MuxChannel,
+        bf_ch: MuxChannel,
+        tx_ch: MuxChannel,
+        ka_ch: MuxChannel,
+        ps_ch: MuxChannel,
+        mux_task: JoinHandle<Result<(), MuxError>>,
+        mux_resubscribe: MuxHandle,
+    ) -> Self {
+        Self {
+            addr,
+            local_addr,
+            direction: PeerConnectionDirection::Inbound,
+            version: 0,
+            network_magic: 0,
+            chainsync_client_channel: None,
+            blockfetch_client_channel: None,
+            txsubmission_client_channel: None,
+            keepalive_client_channel: None,
+            peersharing_client_channel: None,
+            chainsync_server_channel: Some(cs_ch),
+            blockfetch_server_channel: Some(bf_ch),
+            txsubmission_server_channel: Some(tx_ch),
+            keepalive_server_channel: Some(ka_ch),
+            peersharing_server_channel: Some(ps_ch),
+            mux_handle: mux_task,
+            mux_resubscribe,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            warm_tasks: Vec::new(),
+            hot_tasks: Vec::new(),
+            server_tasks: Vec::new(),
+        }
+    }
+
+    /// The connection-wide cancellation token, so a test can observe that a
+    /// failing responder tore the whole connection down (#980).
+    pub fn cancel_token_for_test(&self) -> CancellationToken {
+        self.cancel.clone()
     }
 
     /// Create a `PeerConnection` backed by caller-supplied channels and a real

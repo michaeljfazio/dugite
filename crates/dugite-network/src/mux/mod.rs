@@ -47,6 +47,12 @@ pub use segment::{Direction, SduHeader, HEADER_SIZE};
 /// `SwappableSender`s — no TCP teardown required.
 ///
 /// Obtained via [`Mux::take_handle()`] BEFORE calling [`Mux::run()`].
+///
+/// `Clone` so that each protocol supervisor can hold one: re-arming a
+/// RESPONDER route after its mini-protocol terminates cleanly is the same
+/// operation as re-arming an initiator route after Hot->Warm demotion, and
+/// upstream's InboundGovernor does it per mini-protocol (#980).
+#[derive(Clone)]
 pub struct MuxHandle {
     /// Per-(protocol_id, direction) swappable sender + ingress limit +
     /// shared `bytes_in_flight` counter.
