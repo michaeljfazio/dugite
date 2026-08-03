@@ -259,8 +259,7 @@ impl Node {
             *pool_stake_map.entry(*pool_id).or_default() += utxo_stake + reward_balance;
         }
 
-        // Build stake pool snapshots with actual per-pool stake
-        let total_active_stake: u64 = pool_stake_map.values().sum();
+        // Build stake pool snapshots with actual per-pool stake.
         // `getTotalStake globals nes = circulation (nesEs nes) (maxLovelaceSupply
         // globals)` — circulation is maxLovelaceSupply MINUS RESERVES ONLY.
         // Treasury is NOT subtracted (verified numerically against cardano-node
@@ -280,10 +279,65 @@ impl Node {
                 pool_id: pool_id.as_ref().to_vec(),
                 stake: pool_stake_map.get(pool_id).copied().unwrap_or(0),
                 vrf_keyhash: reg.vrf_keyhash.as_ref().to_vec(),
-                total_active_stake,
                 total_circulation,
             })
             .collect();
+
+        // `PoolDistr` as GetPoolDistr(2) must answer it (#964).
+        //
+        // NOT the live map above. `GetPoolDistr2 mPoolIds` is
+        //   `calculatePoolDistr' pred (ssStakeSet . esSnapshots $ getEpochState st)`
+        // — the FROZEN `set` snapshot — and its ratio is
+        //   `spssStakeRatio = spssStake / ssTotalActiveStake`
+        // *of that snapshot*, with no rescale to circulation. The circulation
+        // rescale belongs to `poolsByTotalStakeFraction` (tag 37), which is a
+        // different function over `currentSnapshot` (live instant stake); #905
+        // established that for tag 37 and it was then applied to tag 36 as
+        // well, which is half of #964.
+        //
+        // The consequence was operational, not cosmetic: `cardano-cli query
+        // leadership-schedule` computes the schedule CLIENT-side and takes σ
+        // straight from this answer, so a denominator inflated from active
+        // stake to circulation shrinks σ and drops leader slots.
+        let (pool_distr, pool_distr_total_active_stake) = {
+            match ls.epochs.snapshots.set.as_ref() {
+                None => (Vec::new(), 0u64),
+                Some(snap) => {
+                    // `spssNumDelegators` — the count of credentials delegating
+                    // to the pool IN THIS SNAPSHOT.
+                    let mut delegators: std::collections::HashMap<
+                        dugite_primitives::hash::Hash28,
+                        u64,
+                    > = std::collections::HashMap::new();
+                    for pool_id in snap.delegations.values() {
+                        *delegators.entry(*pool_id).or_default() += 1;
+                    }
+                    // `ssTotalActiveStake` of the snapshot — the denominator of
+                    // every ratio below and the `pdTotalActiveStake` field.
+                    let total: u64 = snap.pool_stake.values().map(|l| l.0).sum();
+                    let mut entries: Vec<crate::node::n2c_query::types::PoolDistrEntry> = snap
+                        .pool_stake
+                        .iter()
+                        .map(
+                            |(pool_id, stake)| crate::node::n2c_query::types::PoolDistrEntry {
+                                pool_id: pool_id.as_ref().to_vec(),
+                                stake: stake.0,
+                                vrf_keyhash: snap
+                                    .pool_params
+                                    .get(pool_id)
+                                    .map(|p| p.vrf_keyhash.as_ref().to_vec())
+                                    .unwrap_or_default(),
+                                delegator_count: delegators.get(pool_id).copied().unwrap_or(0),
+                            },
+                        )
+                        .collect();
+                    // `VMap.toMap` yields ascending key order; the response is a
+                    // CBOR map, so a stable order keeps it byte-comparable.
+                    entries.sort_by(|a, b| a.pool_id.cmp(&b.pool_id));
+                    (entries, total)
+                }
+            }
+        };
 
         // Build DRep snapshots with delegator lookup.
         //
@@ -909,6 +963,8 @@ impl Node {
                 .and_then(|c| c.script_hash.as_ref().map(|h| h.as_ref().to_vec())),
             stake_addresses,
             stake_snapshots,
+            pool_distr,
+            pool_distr_total_active_stake,
             snap_mark,
             snap_set,
             snap_go,

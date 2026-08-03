@@ -57,8 +57,17 @@ pub enum QueryResult {
         data_hash: Vec<u8>,
         script_hash: Option<Vec<u8>>,
     },
-    /// Pool distribution: Map<pool_hash, IndividualPoolStake> (tag 21)
-    PoolDistr(Vec<StakePoolSnapshot>),
+    /// Pool distribution: Map<pool_hash, IndividualPoolStake> (tag 21).
+    ///
+    /// Carries `total_active_stake` separately because it is
+    /// `pdTotalActiveStake` — the whole `set` snapshot's total — and must NOT
+    /// be re-derived from `pools`, which may have been filtered down to a
+    /// single entry by the query argument. Deriving it from the filtered list
+    /// would make every filtered answer report σ = 1.
+    PoolDistr {
+        pools: Vec<PoolDistrEntry>,
+        total_active_stake: u64,
+    },
     /// Stake delegation deposits: Map<Credential, Coin> (tag 22)
     StakeDelegDeposits(Vec<StakeDelegDepositEntry>),
     /// DRep stake distribution: Map<DRep, Coin> (tag 26)
@@ -192,6 +201,18 @@ pub enum QueryResult {
     /// GetStakeDistribution2 / GetPoolDistr2 (tags 36, 37): new PoolDistr format
     /// array(2)[map{pool_hash -> array(3)[rational, lovelace, vrf_hash]}, total_active_stake]
     PoolDistr2 {
+        pools: Vec<PoolDistrEntry>,
+        total_active_stake: u64,
+    },
+    /// GetStakeDistribution2 (tag 37) — `poolsByTotalStakeFraction`.
+    ///
+    /// Wire-identical to `PoolDistr2` but computed from DIFFERENT state with a
+    /// DIFFERENT ratio, so it gets its own variant: sharing one is how #964
+    /// happened. Here the ratio is the pool's share of total CIRCULATION
+    /// (`maxLovelaceSupply - reserves`, #905) over the LIVE `currentSnapshot`;
+    /// `PoolDistr2` is the share of the frozen `set` snapshot's own
+    /// `ssTotalActiveStake`.
+    StakeDistribution2 {
         pools: Vec<StakePoolSnapshot>,
         total_active_stake: u64,
     },
@@ -659,6 +680,37 @@ pub struct ShelleyPParamsSnapshot {
     pub min_pool_cost: u64,
 }
 
+/// One entry of Haskell's `PoolDistr` — an `IndividualPoolStake`, plus the
+/// delegator count that decides whether it appears at all.
+///
+/// Deliberately NOT [`StakePoolSnapshot`]. The two are computed from different
+/// ledger state with different denominators, and conflating them was #964:
+///
+/// * `GetStakeDistribution2` (tag 37) is `poolsByTotalStakeFraction`, which
+///   builds `currentSnapshot` from the **live** instant stake and then rescales
+///   the ratio by `totalActiveStake / circulation`, so its ratio is
+///   `stake / (maxLovelaceSupply - reserves)` (#905).
+/// * `GetPoolDistr2` (tag 36) is `calculatePoolDistr' pred (ssStakeSet …)`,
+///   which reads the **frozen `set` snapshot** and does not rescale at all —
+///   its ratio is `spssStake / ssTotalActiveStake` *of that snapshot*.
+///
+/// dugite served tag 36 from live state with tag 37's circulation denominator.
+/// Both are wrong, and the denominator alone shrank σ by the ratio of active
+/// stake to circulation — which is what made `query leadership-schedule`
+/// report roughly half the leader slots cardano-node reports.
+#[derive(Debug, Clone, Default)]
+pub struct PoolDistrEntry {
+    pub pool_id: Vec<u8>,
+    /// `individualTotalPoolStake` — the pool's stake in the `set` snapshot.
+    pub stake: u64,
+    /// `individualPoolStakeVrf`.
+    pub vrf_keyhash: Vec<u8>,
+    /// `spssNumDelegators`. `calculatePoolDistr'` drops pools with NO
+    /// DELEGATORS — not pools with no stake. A pool with delegators whose
+    /// stake happens to be zero stays in the map, at ratio 0.
+    pub delegator_count: u64,
+}
+
 /// Snapshot of a stake pool for query results (GetStakeDistribution).
 ///
 /// Wire format: Map<pool_hash(28), [tag(30)[num,den], vrf_hash(32)]>
@@ -667,10 +719,12 @@ pub struct StakePoolSnapshot {
     pub pool_id: Vec<u8>,
     pub stake: u64,
     pub vrf_keyhash: Vec<u8>,
-    /// Total active stake across all pools (`pdTotalActiveStake`).
-    pub total_active_stake: u64,
-    /// Total CIRCULATING stake: `maxLovelaceSupply - reserves - treasury`.
-    /// This is the denominator of `individualPoolStake` — see #905.
+    /// Total CIRCULATING stake: `maxLovelaceSupply - reserves`.
+    ///
+    /// The denominator of `individualPoolStake` for `GetStakeDistribution2`
+    /// (tag 37) only — see #905, and [`PoolDistrEntry`] for why tags 21/36 use
+    /// a different one. `pdTotalActiveStake` is carried by the `QueryResult`
+    /// variant rather than repeated on every entry.
     pub total_circulation: u64,
 }
 
@@ -853,8 +907,20 @@ pub struct NodeStateSnapshot {
     /// Parameters in force BEFORE the most recent epoch-boundary enactment
     /// (`previousPParams` / Haskell `cgsPrevPParams`).
     pub prev_protocol_params: ProtocolParamsSnapshot,
-    /// Stake pool distribution data
+    /// Stake pool distribution data, built from LIVE ledger state. Feeds
+    /// `GetStakePools` (tag 16) and `GetStakeDistribution2` (tag 37), both of
+    /// which upstream computes from live state — `poolsByTotalStakeFraction`
+    /// calls `currentSnapshot`, which is `snapShotFromInstantStake` over the
+    /// live instant stake. Do NOT use it for `GetPoolDistr(2)`; see
+    /// `pool_distr` below and [`PoolDistrEntry`].
     pub stake_pools: Vec<StakePoolSnapshot>,
+    /// `PoolDistr` as `GetPoolDistr` (tag 21) / `GetPoolDistr2` (tag 36) must
+    /// answer it: `calculatePoolDistr'` over the FROZEN `set` snapshot
+    /// (`ssStakeSet`), not live state (#964).
+    pub pool_distr: Vec<PoolDistrEntry>,
+    /// `pdTotalActiveStake` — the `set` snapshot's own `ssTotalActiveStake`,
+    /// and the denominator of every `individualPoolStake` above.
+    pub pool_distr_total_active_stake: u64,
     /// DRep registration data
     pub drep_entries: Vec<DRepSnapshot>,
     /// Governance proposals — LIVE view, embedded in `GetGovState`'s
@@ -999,6 +1065,8 @@ impl Default for NodeStateSnapshot {
             protocol_params: ProtocolParamsSnapshot::default(),
             prev_protocol_params: ProtocolParamsSnapshot::default(),
             stake_pools: Vec::new(),
+            pool_distr: Vec::new(),
+            pool_distr_total_active_stake: 0,
             drep_entries: Vec::new(),
             governance_proposals: Vec::new(),
             governance_proposals_frozen: Vec::new(),

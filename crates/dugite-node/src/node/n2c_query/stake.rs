@@ -170,7 +170,7 @@ pub(crate) fn handle_stake_distribution2(state: &NodeStateSnapshot) -> QueryResu
     debug!("Query: GetStakeDistribution2");
     // Use the pre-computed total that includes orphaned delegations to retired pools.
     let total_active_stake = state.total_active_stake.max(1); // NonZero
-    QueryResult::PoolDistr2 {
+    QueryResult::StakeDistribution2 {
         pools: state.stake_pools.clone(),
         total_active_stake,
     }
@@ -199,16 +199,17 @@ pub(crate) fn handle_pool_distr2(
         Ok(f) => f,
         Err(e) => return *e,
     };
-    // Use the pre-computed total that includes orphaned delegations to retired pools.
-    let total_active_stake = state.total_active_stake.max(1); // NonZero
+    // `pdTotalActiveStake` is the `set` snapshot's own `ssTotalActiveStake`,
+    // not the live total (#964).
+    let total_active_stake = state.pool_distr_total_active_stake.max(1); // NonZero
     match filter_pools {
         None => QueryResult::PoolDistr2 {
-            pools: state.stake_pools.clone(),
+            pools: state.pool_distr.clone(),
             total_active_stake,
         },
         Some(ids) => {
             let filtered: Vec<_> = state
-                .stake_pools
+                .pool_distr
                 .iter()
                 .filter(|p| ids.iter().any(|h| h == &p.pool_id))
                 .cloned()
@@ -339,16 +340,25 @@ pub(crate) fn handle_pool_distr(
         Ok(f) => f,
         Err(e) => return *e,
     };
+    // `pdTotalActiveStake` is global — the whole `set` snapshot's total — and
+    // stays so under a filter, exactly as the tag-36 arm does.
+    let total_active_stake = state.pool_distr_total_active_stake.max(1);
     match filter_pools {
-        None => QueryResult::PoolDistr(state.stake_pools.clone()),
+        None => QueryResult::PoolDistr {
+            pools: state.pool_distr.clone(),
+            total_active_stake,
+        },
         Some(ids) => {
             let filtered = state
-                .stake_pools
+                .pool_distr
                 .iter()
                 .filter(|p| ids.iter().any(|h| h == &p.pool_id))
                 .cloned()
                 .collect();
-            QueryResult::PoolDistr(filtered)
+            QueryResult::PoolDistr {
+                pools: filtered,
+                total_active_stake,
+            }
         }
     }
 }
@@ -589,7 +599,8 @@ pub(crate) fn handle_ledger_peer_snapshot_v23(state: &NodeStateSnapshot, big: bo
 mod tests {
     use super::*;
     use crate::node::n2c_query::types::{
-        NodeStateSnapshot, PoolParamsSnapshot, ProtocolParamsSnapshot, StakePoolSnapshot,
+        NodeStateSnapshot, PoolDistrEntry, PoolParamsSnapshot, ProtocolParamsSnapshot,
+        StakePoolSnapshot,
     };
 
     fn make_state_with_pools() -> NodeStateSnapshot {
@@ -613,18 +624,35 @@ mod tests {
                     pool_id: vec![1u8; 28],
                     stake: 600_000_000,
                     vrf_keyhash: vec![0u8; 32],
-                    total_active_stake,
                     total_circulation: 54_000_000_000_000_000,
                 },
                 StakePoolSnapshot {
                     pool_id: vec![2u8; 28],
                     stake: 400_000_000,
                     vrf_keyhash: vec![0u8; 32],
-                    total_active_stake,
                     total_circulation: 54_000_000_000_000_000,
                 },
             ],
             total_active_stake,
+            // `GetPoolDistr(2)` answers from the frozen `set` snapshot, not
+            // from `stake_pools` (#964). The fixture mirrors the live pools so
+            // the filter tests still read naturally, but through the field the
+            // handlers actually use.
+            pool_distr: vec![
+                PoolDistrEntry {
+                    pool_id: vec![1u8; 28],
+                    stake: 600_000_000,
+                    vrf_keyhash: vec![0u8; 32],
+                    delegator_count: 3,
+                },
+                PoolDistrEntry {
+                    pool_id: vec![2u8; 28],
+                    stake: 400_000_000,
+                    vrf_keyhash: vec![0u8; 32],
+                    delegator_count: 2,
+                },
+            ],
+            pool_distr_total_active_stake: total_active_stake,
             pool_params_entries: vec![
                 PoolParamsSnapshot {
                     pool_id: vec![1u8; 28],
@@ -1042,6 +1070,178 @@ mod tests {
         }
     }
 
+    // ─── #964: PoolDistr σ ──────────────────────────────────────────────
+    //
+    // `cardano-cli query leadership-schedule` is computed CLIENT-side; it takes
+    // σ straight out of this query's answer. A wrong denominator here does not
+    // show up as a malformed response, it shows up as an operator being told
+    // their pool leads the wrong number of slots.
+
+    /// `calculatePoolDistr'` sets `individualPoolStake = spssStakeRatio =
+    /// spssStake / ssTotalActiveStake`. It does NOT rescale to circulation —
+    /// that is `poolsByTotalStakeFraction` (tag 37), a different function.
+    #[test]
+    fn test_pool_distr2_ratio_is_over_active_stake_not_circulation() {
+        use crate::node::n2c_query::encoding::encode_query_result;
+
+        let state = make_state_with_pools();
+        let cbor = make_nothing_filter_cbor();
+        let mut dec = minicbor::Decoder::new(&cbor);
+        let encoded = encode_query_result(&handle_pool_distr2(&state, &mut dec));
+
+        // The reduced rational for pool 1 must be 600M/1000M = 3/5, not
+        // 600M/54_000_000_000_000_000.
+        let (num, den) = first_pool_distr_ratio(&encoded);
+        assert_eq!(
+            (num, den),
+            (3, 5),
+            "σ must be pool stake over the snapshot's total ACTIVE stake"
+        );
+    }
+
+    /// The two queries answer with genuinely different ratios for the same
+    /// pool, which is exactly why they must not share a code path.
+    #[test]
+    fn test_stake_distribution2_ratio_is_over_circulation() {
+        use crate::node::n2c_query::encoding::encode_query_result;
+
+        let state = make_state_with_pools();
+        let encoded = encode_query_result(&handle_stake_distribution2(&state));
+        let (num, den) = first_pool_distr_ratio(&encoded);
+        // 600_000_000 / 54_000_000_000_000_000 reduced = 1 / 90_000_000.
+        assert_eq!(
+            (num, den),
+            (1, 90_000_000),
+            "tag 37 keeps the #905 circulation denominator"
+        );
+    }
+
+    /// `pdTotalActiveStake` is the whole snapshot's total. Filtering to one
+    /// pool must not renormalise σ to 1.
+    #[test]
+    fn test_pool_distr2_total_is_global_under_a_filter() {
+        use crate::node::n2c_query::encoding::encode_query_result;
+
+        let state = make_state_with_pools();
+        let cbor = make_just_pools_filter_cbor(&[&[1u8; 28]]);
+        let mut dec = minicbor::Decoder::new(&cbor);
+        let result = handle_pool_distr2(&state, &mut dec);
+        match &result {
+            QueryResult::PoolDistr2 {
+                pools,
+                total_active_stake,
+            } => {
+                assert_eq!(pools.len(), 1);
+                assert_eq!(*total_active_stake, 1_000_000_000);
+            }
+            other => panic!("Expected PoolDistr2, got {other:?}"),
+        }
+        let (num, den) = first_pool_distr_ratio(&encode_query_result(&result));
+        assert_eq!(
+            (num, den),
+            (3, 5),
+            "σ must not be renormalised by the filter"
+        );
+    }
+
+    /// `guard (spssNumDelegators spss > 0)` — pools with no DELEGATORS are
+    /// dropped; a pool with delegators and zero stake stays, at ratio 0.
+    #[test]
+    fn test_pool_distr2_drops_zero_delegator_pools_not_zero_stake_pools() {
+        use crate::node::n2c_query::encoding::encode_query_result;
+
+        let mut state = make_state_with_pools();
+        state.pool_distr.push(PoolDistrEntry {
+            pool_id: vec![3u8; 28],
+            stake: 0,
+            vrf_keyhash: vec![0u8; 32],
+            delegator_count: 1, // has a delegator, no stake -> STAYS
+        });
+        state.pool_distr.push(PoolDistrEntry {
+            pool_id: vec![4u8; 28],
+            stake: 999,
+            vrf_keyhash: vec![0u8; 32],
+            delegator_count: 0, // has stake, no delegators -> DROPPED
+        });
+
+        let cbor = make_nothing_filter_cbor();
+        let mut dec = minicbor::Decoder::new(&cbor);
+        let encoded = encode_query_result(&handle_pool_distr2(&state, &mut dec));
+        let ids = pool_distr_ids(&encoded);
+        assert!(
+            ids.contains(&vec![3u8; 28]),
+            "a delegated pool with zero stake must remain, at ratio 0"
+        );
+        assert!(
+            !ids.contains(&vec![4u8; 28]),
+            "a pool with no delegators must be dropped"
+        );
+    }
+
+    /// Tag 21 is upstream-defined as tag 36's answer in the older wire shape
+    /// (`fromLedgerPoolDistr $ answerPureBlockQuery cfg (GetPoolDistr2 …)`), so
+    /// the two must agree on σ. They did not: the tag-21 encoder divided by
+    /// active stake and tag 36 by circulation, and tag 36 is the only one a
+    /// V21+ client can reach.
+    #[test]
+    fn test_pool_distr_and_pool_distr2_agree_on_sigma() {
+        use crate::node::n2c_query::encoding::encode_query_result;
+
+        let state = make_state_with_pools();
+
+        let cbor = make_nothing_filter_cbor();
+        let mut d1 = minicbor::Decoder::new(&cbor);
+        let legacy = encode_query_result(&handle_pool_distr(&state, &mut d1));
+        let mut d2 = minicbor::Decoder::new(&cbor);
+        let current = encode_query_result(&handle_pool_distr2(&state, &mut d2));
+
+        assert_eq!(
+            first_pool_distr_ratio_legacy(&legacy),
+            first_pool_distr_ratio(&current),
+            "tag 21 and tag 36 must report the same σ for the same pool"
+        );
+    }
+
+    /// Skip the MsgResult/HFC wrappers and read the first pool's `tag(30)`
+    /// rational out of a tag-36/37 response (`array(2)[map, total]`, each entry
+    /// `array(3)[ratio, stake, vrf]`).
+    fn first_pool_distr_ratio(encoded: &[u8]) -> (u64, u64) {
+        let inner = crate::node::n2c_query::encoding::strip_wrappers_for_test(encoded);
+        let mut dec = minicbor::Decoder::new(&inner);
+        dec.array().unwrap();
+        dec.map().unwrap();
+        dec.bytes().unwrap(); // pool id
+        dec.array().unwrap(); // array(3)
+        dec.tag().unwrap();
+        dec.array().unwrap();
+        (dec.u64().unwrap(), dec.u64().unwrap())
+    }
+
+    /// Same for the tag-21 shape (`map`, each entry `array(2)[ratio, vrf]`).
+    fn first_pool_distr_ratio_legacy(encoded: &[u8]) -> (u64, u64) {
+        let inner = crate::node::n2c_query::encoding::strip_wrappers_for_test(encoded);
+        let mut dec = minicbor::Decoder::new(&inner);
+        dec.map().unwrap();
+        dec.bytes().unwrap();
+        dec.array().unwrap(); // array(2)
+        dec.tag().unwrap();
+        dec.array().unwrap();
+        (dec.u64().unwrap(), dec.u64().unwrap())
+    }
+
+    fn pool_distr_ids(encoded: &[u8]) -> Vec<Vec<u8>> {
+        let inner = crate::node::n2c_query::encoding::strip_wrappers_for_test(encoded);
+        let mut dec = minicbor::Decoder::new(&inner);
+        dec.array().unwrap();
+        let n = dec.map().unwrap().unwrap();
+        let mut out = Vec::new();
+        for _ in 0..n {
+            out.push(dec.bytes().unwrap().to_vec());
+            dec.skip().unwrap(); // the IndividualPoolStake
+        }
+        out
+    }
+
     // ─── #963: the pool-id filter argument ──────────────────────────────
     //
     // The filter was not merely wrong, it was *inert*: `parse_pool_id_set`
@@ -1123,7 +1323,7 @@ mod tests {
 
         let mut d = minicbor::Decoder::new(&just_one);
         match handle_pool_distr(&state, &mut d) {
-            QueryResult::PoolDistr(p) => assert_eq!(p.len(), 1),
+            QueryResult::PoolDistr { pools: p, .. } => assert_eq!(p.len(), 1),
             other => panic!("tag 21: {other:?}"),
         }
         let mut d = minicbor::Decoder::new(&just_one);
@@ -1134,7 +1334,7 @@ mod tests {
 
         let mut d = minicbor::Decoder::new(&nothing);
         match handle_pool_distr(&state, &mut d) {
-            QueryResult::PoolDistr(p) => assert_eq!(p.len(), 2),
+            QueryResult::PoolDistr { pools: p, .. } => assert_eq!(p.len(), 2),
             other => panic!("tag 21 Nothing: {other:?}"),
         }
         let mut d = minicbor::Decoder::new(&nothing);
@@ -1505,7 +1705,7 @@ mod tests {
         let mut dec = minicbor::Decoder::new(&cbor);
         let result = handle_pool_distr(&state, &mut dec);
         match result {
-            QueryResult::PoolDistr(pools) => assert_eq!(pools.len(), 2),
+            QueryResult::PoolDistr { pools, .. } => assert_eq!(pools.len(), 2),
             _ => panic!("Expected PoolDistr"),
         }
     }
@@ -1517,7 +1717,7 @@ mod tests {
         let mut dec = minicbor::Decoder::new(&cbor);
         let result = handle_pool_distr(&state, &mut dec);
         match result {
-            QueryResult::PoolDistr(pools) => {
+            QueryResult::PoolDistr { pools, .. } => {
                 assert_eq!(pools.len(), 1);
                 assert_eq!(pools[0].pool_id, vec![2u8; 28]);
             }
@@ -1598,14 +1798,14 @@ mod tests {
         let state = make_state_with_pools();
         let result = handle_stake_distribution2(&state);
         match result {
-            QueryResult::PoolDistr2 {
+            QueryResult::StakeDistribution2 {
                 pools,
                 total_active_stake,
             } => {
                 assert_eq!(pools.len(), 2);
                 assert_eq!(total_active_stake, 1_000_000_000);
             }
-            _ => panic!("Expected PoolDistr2"),
+            _ => panic!("Expected StakeDistribution2"),
         }
     }
 
@@ -1614,14 +1814,14 @@ mod tests {
         let state = NodeStateSnapshot::default();
         let result = handle_stake_distribution2(&state);
         match result {
-            QueryResult::PoolDistr2 {
+            QueryResult::StakeDistribution2 {
                 pools,
                 total_active_stake,
             } => {
                 assert!(pools.is_empty());
                 assert_eq!(total_active_stake, 1); // NonZero
             }
-            _ => panic!("Expected PoolDistr2"),
+            _ => panic!("Expected StakeDistribution2"),
         }
     }
 
