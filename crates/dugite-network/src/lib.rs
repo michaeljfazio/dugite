@@ -469,6 +469,317 @@ pub enum TxValidationError {
         /// Each `(voter_disc, credential_hex, action_id)` triple.
         violations: Vec<(u8, String, String)>,
     },
+    // ── #979: typed CERT / DELEG failures ───────────────────────────────
+    //
+    // Nesting: Ledger 2 (ConwayCertsFailure) -> CERTS 1 (CertFailure)
+    //          -> CERT 1 (DelegFailure) -> DELEG tag.
+    //
+    // **DELEG tags are 1-based.** `IncorrectDepositDELEG` = 1 through
+    // `RefundIncorrectDELEG` = 8; there is no tag 0. GOVCERT below IS 0-based,
+    // so the two cannot share a numbering assumption.
+    //
+    // Credentials are dugite "typed-hash32": 28-byte hash + byte 28 as the
+    // key/script discriminator. Both halves are needed — Haskell's
+    // `Credential` is `array(2)[disc, bstr(28)]`.
+    /// `StakeKeyRegisteredDELEG` (DELEG tag 2).
+    StakeKeyRegisteredDELEG {
+        /// Typed-hash32 hex of the stake credential.
+        credential: String,
+    },
+    /// `StakeKeyNotRegisteredDELEG` (DELEG tag 3).
+    ///
+    /// dugite distinguishes the delegation and deregistration cases
+    /// internally; upstream has ONE constructor, so both map here and the
+    /// extra precision is deliberately dropped rather than given a tag that
+    /// does not exist.
+    StakeKeyNotRegisteredDELEG {
+        /// Typed-hash32 hex of the stake credential.
+        credential: String,
+    },
+    /// `StakeKeyHasNonZeroAccountBalanceDELEG` (DELEG tag 4).
+    ///
+    /// The payload is the BALANCE (a `Coin`), not the credential.
+    StakeKeyHasNonZeroAccountBalanceDELEG {
+        /// Remaining reward balance in lovelace.
+        balance: u64,
+    },
+    /// `DelegateeDRepNotRegisteredDELEG` (DELEG tag 5).
+    DelegateeDRepNotRegisteredDELEG {
+        /// Typed-hash32 hex of the DRep credential.
+        credential: String,
+    },
+    /// `DelegateeStakePoolNotRegisteredDELEG` (DELEG tag 6).
+    ///
+    /// A `KeyHash StakePool` — a bare `bstr(28)`, NOT a `Credential`.
+    DelegateeStakePoolNotRegisteredDELEG {
+        /// Hex-encoded 28-byte pool key hash.
+        pool_id: String,
+    },
+    /// `IncorrectDepositDELEG` (DELEG tag 1) — the **PV<=10** form.
+    ///
+    /// `hardforkConwayDELEGIncorrectDepositsAndRefunds` is `pvMajor > 10`, so
+    /// below PV 11 an incorrect stake-key deposit *or refund* is reported
+    /// through this one constructor, carrying only the SUPPLIED amount. Every
+    /// real network runs PV 10 today, which makes this the only DELEG
+    /// deposit/refund failure currently reachable — tags 7 and 8 below are the
+    /// PV>=11 replacements.
+    IncorrectDepositDELEG {
+        /// The amount the certificate declared.
+        supplied: u64,
+    },
+    /// `DepositIncorrectDELEG` (DELEG tag 7) — the **PV>=11** form.
+    ///
+    /// `Mismatch RelEQ Coin` written with `To` — i.e. **nested** as
+    /// `array(2)[supplied, expected]`. GOVCERT writes the same type with
+    /// `ToGroup`, which flattens it. Getting this backwards is what produced
+    /// `DeserialiseFailure … "expected word"` on the first
+    /// `ProposalDepositIncorrect` attempt.
+    DepositIncorrectDELEG {
+        /// Deposit the certificate declared.
+        supplied: u64,
+        /// Deposit the protocol parameters require.
+        expected: u64,
+    },
+    /// `RefundIncorrectDELEG` (DELEG tag 8). Nested `Mismatch`, as tag 7.
+    RefundIncorrectDELEG {
+        /// Refund the certificate declared.
+        supplied: u64,
+        /// Refund the ledger holds for the credential.
+        expected: u64,
+    },
+
+    // ── #979: typed GOVCERT failures ────────────────────────────────────
+    //
+    // Ledger 2 -> CERTS 1 -> CERT 3 (GovCertFailure) -> GOVCERT tag.
+    // These tags ARE 0-based.
+    /// `ConwayDRepAlreadyRegistered` (GOVCERT tag 0).
+    ConwayDRepAlreadyRegistered {
+        /// Typed-hash32 hex of the DRep credential.
+        credential: String,
+    },
+    /// `ConwayDRepIncorrectDeposit` (GOVCERT tag 2).
+    ///
+    /// `ToGroup mm` — the `Mismatch` is **FLATTENED** into the constructor's
+    /// own fields, unlike DELEG tags 7/8 which nest it.
+    ConwayDRepIncorrectDeposit {
+        /// Deposit the certificate declared.
+        supplied: u64,
+        /// Deposit the protocol parameters require.
+        expected: u64,
+    },
+    /// `ConwayCommitteeHasPreviouslyResigned` (GOVCERT tag 3).
+    ConwayCommitteeHasPreviouslyResigned {
+        /// Typed-hash32 hex of the cold committee credential.
+        credential: String,
+    },
+    /// `ConwayDRepIncorrectRefund` (GOVCERT tag 4). Flattened `Mismatch`.
+    ConwayDRepIncorrectRefund {
+        /// Refund the certificate declared.
+        supplied: u64,
+        /// Refund the ledger holds for the DRep.
+        expected: u64,
+    },
+    /// `ConwayCommitteeIsUnknown` (GOVCERT tag 5).
+    ConwayCommitteeIsUnknown {
+        /// Typed-hash32 hex of the cold committee credential.
+        credential: String,
+    },
+
+    // ── #979: typed POOL failures ───────────────────────────────────────
+    //
+    // Ledger 2 -> CERTS 1 -> CERT 2 (PoolFailure) -> POOL.
+    //
+    // `ShelleyPoolPredFailure`'s `EncCBOR` is HAND-ROLLED rather than built
+    // from the `Sum` combinators, so each arm states its own `encodeListLen`
+    // and splices `Mismatch` fields in individually. There is no tag 2.
+    /// `StakePoolCostTooLowPOOL` — `array(3)[3, supplied, expected]`.
+    StakePoolCostTooLowPOOL {
+        /// Cost the pool registration declared.
+        supplied: u64,
+        /// `minPoolCost` protocol parameter.
+        expected: u64,
+    },
+    /// `WrongNetworkPOOL` — `array(4)[4, expected, supplied, pool_id]`.
+    ///
+    /// Note the field order: **expected precedes supplied**, the reverse of
+    /// every other `Mismatch` on this wire.
+    WrongNetworkPOOL {
+        /// Network the node is configured for.
+        expected: u8,
+        /// Network found in the pool's reward account.
+        supplied: u8,
+        /// Hex-encoded 28-byte pool key hash.
+        pool_id: String,
+    },
+    /// `PoolMedataHashTooBig` — `array(3)[5, pool_id, size]`.
+    PoolMedataHashTooBigPOOL {
+        /// Hex-encoded 28-byte pool key hash.
+        pool_id: String,
+        /// Size of the offending metadata hash, in bytes.
+        size: u64,
+    },
+    /// `VRFKeyHashAlreadyRegistered` — `array(3)[6, pool_id, vrf_key_hash]`.
+    ///
+    /// Pool id FIRST, then the VRF hash.
+    VrfKeyHashAlreadyRegisteredPOOL {
+        /// Hex-encoded 28-byte pool key hash.
+        pool_id: String,
+        /// Hex-encoded 32-byte VRF verification key hash.
+        vrf_key_hash: String,
+    },
+    /// `StakePoolRetirementWrongEpochPOOL` —
+    /// `array(4)[1, gt_expected, lt_supplied, lt_expected]`.
+    ///
+    /// Two `Mismatch`es, and the first one's `supplied` is **discarded** by
+    /// the encoder (`Mismatch _ gtExpected`). Three fields, not four.
+    StakePoolRetirementWrongEpochPOOL {
+        /// Current epoch — the `RelGT` bound the retirement must exceed.
+        gt_expected: u64,
+        /// Retirement epoch the certificate declared.
+        lt_supplied: u64,
+        /// `current epoch + eMax` — the `RelLTEQ` bound.
+        lt_expected: u64,
+    },
+
+    // ── #979: typed UTXOW failures (Ledger 1 -> UTXOW tag) ──────────────
+    /// `InvalidMetadata` (UTXOW tag 8) — carries **no payload** upstream.
+    InvalidMetadataUTXOW,
+    /// `ExtraneousScriptWitnessesUTXOW` (UTXOW tag 9) — `Set ScriptHash`.
+    ExtraneousScriptWitnessesUTXOW {
+        /// Hex-encoded 28-byte script hashes.
+        script_hashes: Vec<String>,
+    },
+    /// `UnspendableUTxONoDatumHash` (UTXOW tag 14) — `Set TxIn`.
+    UnspendableUTxONoDatumHashUTXOW {
+        /// `"<txhash>#<index>"` inputs.
+        inputs: Vec<String>,
+    },
+    /// `ExtraRedeemers` (UTXOW tag 15) — `[PlutusPurpose AsIx]`, each
+    /// `array(2)[purpose_tag, index]`.
+    ExtraRedeemersUTXOW {
+        /// `(purpose_tag, index)` pairs. Purpose tags follow the redeemer
+        /// tag numbering: 0 spend, 1 mint, 2 cert, 3 reward, 4 voting,
+        /// 5 proposing.
+        purposes: Vec<(u8, u32)>,
+    },
+    /// `MalformedScriptWitnesses` (UTXOW tag 16) — `Set ScriptHash`.
+    MalformedScriptWitnessesUTXOW {
+        /// Hex-encoded 28-byte script hashes.
+        script_hashes: Vec<String>,
+    },
+    /// `MalformedReferenceScripts` (UTXOW tag 17) — `Set ScriptHash`.
+    MalformedReferenceScriptsUTXOW {
+        /// Hex-encoded 28-byte script hashes.
+        script_hashes: Vec<String>,
+    },
+
+    // ── #979: further typed GOV failures (Ledger 3 -> GOV tag) ──────────
+    //
+    // `AccountAddress` encodes as a byte string of the serialized account
+    // address (network header byte + 28-byte credential = 29 bytes), via
+    // `encCBOR . runPut . putAccountAddress`.
+    /// `ProposalProcedureNetworkIdMismatch` (GOV tag 2).
+    ProposalProcedureNetworkIdMismatch {
+        /// Hex-encoded account address bytes of the offending return account.
+        account: String,
+        /// Network the node is configured for.
+        network: u8,
+    },
+    /// `TreasuryWithdrawalsNetworkIdMismatch` (GOV tag 3).
+    TreasuryWithdrawalsNetworkIdMismatch {
+        /// Hex-encoded account address bytes.
+        accounts: Vec<String>,
+        /// Network the node is configured for.
+        network: u8,
+    },
+    /// `ConflictingCommitteeUpdate` (GOV tag 6) —
+    /// `NonEmptySet (Credential ColdCommitteeRole)`.
+    ConflictingCommitteeUpdate {
+        /// Typed-hash32 hex of each conflicting cold credential.
+        credentials: Vec<String>,
+    },
+    /// `ExpirationEpochTooSmall` (GOV tag 7) —
+    /// `NonEmptyMap (Credential ColdCommitteeRole) EpochNo`.
+    ExpirationEpochTooSmall {
+        /// `(typed-hash32 hex, expiry epoch)` per offending member.
+        members: Vec<(String, u64)>,
+    },
+    /// `DisallowedVotesDuringBootstrap` (GOV tag 13) —
+    /// `NonEmpty (Voter, GovActionId)`.
+    DisallowedVotesDuringBootstrap {
+        /// `(voter_disc, credential_hex, "<txhash>#<index>")` triples, the
+        /// same shape as [`TxValidationError::DisallowedVoters`].
+        violations: Vec<(u8, String, String)>,
+    },
+    /// `TreasuryWithdrawalReturnAccountsDoNotExist` (GOV tag 17) —
+    /// `NonEmpty AccountAddress`.
+    TreasuryWithdrawalReturnAccountsDoNotExist {
+        /// Hex-encoded account address bytes.
+        accounts: Vec<String>,
+    },
+    /// `InvalidGuardrailsScriptHash` (GOV tag 11) — two
+    /// `StrictMaybe ScriptHash` values: the hash in the proposal, then the
+    /// current constitution's.
+    InvalidGuardrailsScriptHash {
+        /// Hex-encoded 28-byte script hash from the proposal, if any.
+        got: Option<String>,
+        /// Hex-encoded 28-byte script hash of the constitution, if any.
+        expected: Option<String>,
+    },
+
+    /// `ConflictingMetadataHash` (UTXOW tag 7).
+    ///
+    /// `ToGroup mm` — FLATTENED. `Mismatch { mismatchSupplied = mdh,
+    /// mismatchExpected = hashTxAuxData md' }`, i.e. the hash the body
+    /// DECLARED comes first and the recomputed one second.
+    ConflictingMetadataHashUTXOW {
+        /// Hex-encoded auxiliary-data hash declared in the transaction body.
+        supplied: String,
+        /// Hex-encoded hash recomputed over the auxiliary data.
+        expected: String,
+    },
+    /// `WrongNetwork` (UTXO tag 7) — `Network` then `Set Addr`.
+    ///
+    /// The network field is the EXPECTED one; the set holds the offending
+    /// addresses. There is no "actual network" field on this wire.
+    WrongNetworkInOutput {
+        /// Network the node is configured for.
+        expected: u8,
+        /// Hex-encoded raw address bytes of every offending output.
+        addresses: Vec<String>,
+    },
+    /// `WrongNetworkWithdrawal` (UTXO tag 8) — `Network` then
+    /// `Set RewardAccount`.
+    WrongNetworkWithdrawal {
+        /// Network the node is configured for.
+        expected: u8,
+        /// Hex-encoded reward-account bytes of every offending withdrawal.
+        accounts: Vec<String>,
+    },
+
+    // ── #979: Ledger-level ──────────────────────────────────────────────
+    /// `ConwayWdrlNotDelegatedToDRep` (Ledger tag 4) —
+    /// `NonEmpty (KeyHash Staking)`.
+    ///
+    /// A bare `bstr(28)` per element, **not** a `Credential`: there is no
+    /// discriminator on this wire.
+    WdrlNotDelegatedToDRep {
+        /// Hex-encoded 28-byte staking key hashes.
+        key_hashes: Vec<String>,
+    },
+    /// `ConwayTreasuryValueMismatch` (Ledger tag 5).
+    ///
+    /// `Sum (… . unswapMismatch) 5 !> ToGroup (swapMismatch mm)` — flattened
+    /// AND swapped, so the wire order is `expected` then `supplied`. Upstream
+    /// flags this in a comment of its own: "The serialisation order is in
+    /// reverse".
+    TreasuryValueMismatch {
+        /// Treasury value the transaction declared.
+        supplied: u64,
+        /// Treasury value the ledger holds.
+        expected: u64,
+    },
+
     /// `VotersDoNotExist` (GOV tag 14): a voter is not in the corresponding
     /// credential registry (DRep map, pool map, CC hot-key map).
     VotersDoNotExist {
