@@ -24,7 +24,9 @@ fn main() {
     // `--flat <file>`: eval a single applied UPLC term (flat) alone with a huge
     // budget (so it always COMPLETES — no per-redeemer cap), and report full
     // step/builtin counts + total consumed. Used to localize a per-redeemer
-    // divergence by diffing against aiken's per-step/per-builtin breakdown.
+    // divergence by diffing against the Haskell `uplc evaluate --counting`
+    // per-step/per-builtin breakdown — the authoritative one. A third-party
+    // evaluator can corroborate but cannot settle a disagreement (#970).
     if args.get(1).map(|s| s.as_str()) == Some("--flat") {
         let file = args
             .get(2)
