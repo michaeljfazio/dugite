@@ -101,8 +101,53 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 - 28-byte hash types (DRep keys, pool voter keys, required signers) must be padded to 32 bytes via `Hash28::to_hash32_padded()` — do not use `Hash<32>::from()` directly on 28-byte hashes
 
 ## Current Focus
-**v2.4.5 (2026-08-02)** — round-trip audit wave. Drop-in, SNAPSHOT unchanged
-at 31. Closes #951, #952.
+**v2.5.0 (2026-08-03)** — release-gate coverage wave. **RE-SYNC RELEASE:
+SNAPSHOT_VERSION 31 -> 32.** Closes #953-#961 (the #962 audit backlog) plus
+#965, #966, #968, #978.
+
+The theme: nearly every defect this wave — in the harness AND in the node — was
+a check reporting success while measuring nothing. The node bugs were found
+*because* those checks were repaired.
+
+### Node fixes
+- **#966 (ledger, CONSENSUS, SNAPSHOT 31->32)** — RATIFY gated
+  `TreasuryWithdrawals` on the LIVE post-RUPD treasury. Haskell reads
+  `ensTreasury` sealed into the DRep pulser one boundary EARLIER
+  (`setFreshDRepPulsingState`), so RATIFY is structurally blind to the
+  `applyRUpd` landing at the boundary it runs on. dugite would enact a
+  withdrawal an epoch EARLY — a split in the accept-early direction.
+  `RatificationSnapshot` already froze every other `dpEnactState` term;
+  `treasury` was the one left reading live. Same shape as #949.
+- **#968 (network)** — `MsgHasTx` carries `[era, bstr32]` (a `OneEraGenTxId`),
+  not a bare bstr, so `cardano-cli query tx-mempool tx-exists` HUNG FOREVER.
+  Both existing tests PINNED the bug: the test helper encoded the same wrong
+  shape. Second half: `tokio::select!` DROPS the losing branches and dropping a
+  `JoinHandle` DETACHES — so a protocol error left the mux running and the
+  socket open. The #924 trap, recurring in the N2C path.
+- **#965 (ledger)** — certificates never required a SCRIPT witness. Only the
+  deposit-less `reg_cert` (idx 0) is permissionless; index 7 is not. dugite
+  accepted what cardano-node rejects.
+- **#978 (n2c)** — `WithdrawalsNotInRewardsCERTS` had no encoder arm. dugite
+  had implemented BOTH PV>=11 withdrawal encodings but not the PV<=10 one —
+  and PV10 is what every real network runs, so the only REACHABLE variant
+  degraded to a generic mempool error while the two implemented arms were dead
+  code. Sweep of 36 more: #979.
+
+### Gate coverage (#962 backlog)
+Two-forger topology with an independent Haskell arbiter (#957); governance
+enactment with real DRep voting power and a funded `ensTreasury` (#956);
+the reward-withdrawal path executing POSITIVELY for the first time ever
+(#958); UTxO RPC wired and asserted (#960); chaos repaired (#959); Plutus
+script purposes beyond spend/mint (#955); the parity oracle widened 41 -> 79
+scripts comparing reject REASONS (#954); and a release gate that hard-fails on
+evidence never produced (#953).
+
+### Open, found but not fixed
+#963/#964 (LSQ), #967 (snapshot guard fixture), #969/#970 (ScriptContext
+coverage + replace Aiken with plutus-tx — Aiken parity is circular), #977
+(`futurePParams` hardcoded), #979 (36 generic rejections), **#980 (dugite's
+ChainSync server stops feeding a Haskell peer under load and never recovers —
+its documented restart workaround provably does not work)**.
 
 Both found by pushing `decode(encode(x)) == x` against the REAL decoder into
 new areas, and both oracle-verified against Haskell BEFORE touching either side
@@ -131,6 +176,33 @@ discriminators, `VotingProcedure`, and every `dugite-uplc` `to_i128()` site
 sufficient — a shared wrong order on BOTH halves still passes. #951 was caught
 only because encoder and decoder disagreed. The durable guard is a
 Haskell-derived fixture.
+
+### QA — v2.5.0
+devnet-validate standard preset, **4/4 rounds PASS**
+(`reports/devnet-validate/v2.5.0.json`) vs cardano-node 11.0.1.
+`gate_integrity.admissible = true`, zero missing evidence.
+
+- tx-zoo **105 scripts**, source="round" in every round (no shared counts)
+- bidirectional parity **79 scripts, 0 OFFDIAG, 0 CLASSDIFF**
+- cli-parity **22/22 COMPARED** (not merely 22 rows emitted — see below)
+- adversarial N2N **26/26**, UTxO RPC **27/27**, chaos **5/5**
+- tip-parity **100% in all four rounds** (24/24, 12/12, 175/175, 12/12)
+- byte-exact treasury+reserves vs Haskell after the RUPD boundary
+- restart 52 -> 84, all predicates green
+
+**The parity oracle now runs in its OWN round.** It re-executes the zoo twice
+(once per socket), and combining that with Round 1's full zoo put ~263 script
+executions on one devnet — up from ~167 before #954 widened it 41 -> 79. That
+volume reliably tips cardano-bp into the **#980** stall, after which every
+tip-sensitive suite becomes UNMEASURABLE rather than failing. Splitting it out
+is not a coverage reduction; the same 79 scripts still run through both
+sockets.
+
+**Two gate defects found by this run, both of the "measures nothing" family:**
+- the cli-parity denominator counted rows EMITTED, not comparisons MADE, and
+  reported `22/22 queries OK` for a run that compared FOUR;
+- `chaos.expected_cases` was pinned from the EXTENDED set (6) while the
+  standard set produces 5 — a denominator no standard run could ever satisfy.
 
 ### QA — v2.4.5
 devnet-validate standard **3/3 rounds PASS** (`reports/devnet-validate/v2.4.5.json`)
