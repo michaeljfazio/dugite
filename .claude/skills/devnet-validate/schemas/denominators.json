@@ -39,7 +39,8 @@
   },
   "cli_parity": {
     "expected_queries": 22,
-    "$comment": "One row per tx-zoo/09-cli-parity/09*.sh. EQUAL+DIVERGENT+SKIP+ERROR must sum to this. Env-skips are counted as their own class and never folded into EQUAL."
+    "expected_rows": 24,
+    "$comment": "expected_queries = tx-zoo/09-cli-parity/09*.sh on disk. expected_rows = terminal ROWS in cli-parity.csv, which is NOT the same number: two scripts emit a second row each from parity_assert_pool_filter, the direct (non-comparative) check added with #963 that a pool-scoped query answers for exactly the pool it was asked about. run.sh gates on expected_rows; test-denominators.sh derives BOTH from disk so adding either a script or an extra assertion without bumping the pin fails rather than silently widening the gate. EQUAL+DIVERGENT+COMPARED+SKIP+ERROR must sum to expected_rows. Env-skips are counted as their own class and never folded into EQUAL."
   },
   "n2n_adversarial": {
     "expected_scripts": 7,

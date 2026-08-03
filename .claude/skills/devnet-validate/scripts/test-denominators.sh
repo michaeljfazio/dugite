@@ -65,9 +65,20 @@ check "tx_zoo.expected_scripts (sum)" \
       "$(jq -r '.tx_zoo.expected_scripts' "$DENOM")" "$TOTAL_DISK"
 
 # --- cli-parity ---
+# Two pins, both derived from disk. `expected_queries` is the script count;
+# `expected_rows` is what actually lands in cli-parity.csv, and they differ
+# because some scripts emit an extra assertion row (#963's
+# parity_assert_pool_filter). Deriving both here is what keeps the seam
+# between "scripts on disk" and "rows the gate counts" from drifting.
+CLI_SCRIPTS=$(ls "$ROOT/tx-zoo/09-cli-parity"/09*.sh 2>/dev/null | wc -l | tr -d ' ')
+CLI_EXTRA=$(grep -c '^[[:space:]]*parity_assert_pool_filter ' \
+              "$ROOT/tx-zoo/09-cli-parity"/09*.sh 2>/dev/null \
+            | awk -F: '{s+=$2} END{print s+0}')
 check "cli_parity.expected_queries" \
-      "$(jq -r '.cli_parity.expected_queries' "$DENOM")" \
-      "$(ls "$ROOT/tx-zoo/09-cli-parity"/09*.sh 2>/dev/null | wc -l | tr -d ' ')"
+      "$(jq -r '.cli_parity.expected_queries' "$DENOM")" "$CLI_SCRIPTS"
+check "cli_parity.expected_rows" \
+      "$(jq -r '.cli_parity.expected_rows' "$DENOM")" \
+      "$(( CLI_SCRIPTS + CLI_EXTRA ))"
 
 # --- adversarial N2N ---
 check "n2n_adversarial.expected_scripts" \

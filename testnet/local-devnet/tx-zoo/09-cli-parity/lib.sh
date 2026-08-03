@@ -43,15 +43,8 @@ declare -gA KNOWN_DIVERGENCES=(
     # made them run for the first time; all three diverged immediately. They
     # are parked here (tracked, non-blocking) so the gate stays green on
     # KNOWN state while the node bugs are fixed — NOT because they are benign.
-    [pool-state]="https://github.com/michaeljfazio/dugite/issues/963"
-    [stake-snapshot]="https://github.com/michaeljfazio/dugite/issues/963"
     [leadership-schedule]="https://github.com/michaeljfazio/dugite/issues/964"
     #
-    # #963 — GetPoolState / GetStakeSnapshots ignore the pool-id filter and
-    #        return ALL pools. parse_pool_id_set() degrades to an empty vector
-    #        on any decode failure, and empty means "all pools", so the parse
-    #        failure is indistinguishable from "caller asked for everything".
-    #        Fails OPEN. Asking for a different pool returns identical bytes.
     # #964 — leadership-schedule returns a statistically UNRELATED schedule:
     #        113 slots vs cardano's 200 (sigma ~0.48 vs ~1.0) and only 55 of
     #        them shared, which is exactly the overlap two independent draws
@@ -67,6 +60,16 @@ declare -gA KNOWN_DIVERGENCES=(
     # (#597 collected five of those for two months).
     #
     # Recently retired, do not re-add without a fresh two-sided diff:
+    #   pool-state, stake-snapshot      the pool-id filter was INERT: the
+    #                                   argument is `Maybe (Set (KeyHash
+    #                                   StakePool))` and the `Just` wrapper was
+    #                                   never handled, so the parse failed and
+    #                                   degraded to an empty set — which every
+    #                                   caller read as "all pools". Fixed in
+    #                                   #963 along with the other five filter
+    #                                   parsers; `parity_assert_pool_filter`
+    #                                   below now asserts the property directly
+    #                                   as well as comparatively
     #   drep-state                      GetDRepState reports the stored
     #                                   `drepExpiry` (not registered_epoch +
     #                                   drepActivity) and applies the
@@ -126,6 +129,83 @@ _parity_tip() {
 #   skip      — record SKIP without comparing (for inherently divergent queries)
 #
 # Returns: 0 (equal or skip), 1 (divergent), 2 (error on one or both sides)
+# parity_assert_pool_filter <row-name> <cli-query> <pool-id-bech32> <pool-id-hex>
+#
+# Assert that a pool-scoped query answers for EXACTLY the pool it was asked
+# about, on each socket independently.
+#
+# `parity_query_json` is the primary signal but it is *comparative*: it goes
+# green whenever both sides agree, including if both were to answer with every
+# pool. #963 was precisely an unfiltered answer, so this suite keeps one direct
+# assertion of the property itself. The devnet registers two pools (pool1 and
+# pool2), which is what makes a superset detectable at all — on a one-pool
+# devnet the filtered and unfiltered answers coincide and this check is vacuous,
+# so it fails loudly rather than passing if it cannot see a second pool.
+#
+# Pool ids are extracted shape-agnostically: every object key anywhere in the
+# document that is 56 lowercase hex characters. That is what the #963
+# reproduction did by hand, and it survives the response layouts differing
+# between `pool-state` (keys under stakePoolParams/retiring/deposits) and
+# `stake-snapshot` (keys under pools).
+parity_assert_pool_filter() {
+    local row_name="$1" cli_query="$2" pool_hex="$3"
+
+    _parity_ensure_csv
+    if [ "${PARITY_MODE:-exact}" = "skip" ]; then
+        parity_record "$row_name" "SKIP" "skip" "skip" "skip-mode"
+        return 0
+    fi
+
+    local sock label rc out keys extra failed=0 notes=""
+    for label in dugite cardano; do
+        if [ "$label" = "dugite" ]; then sock="$LD_DUGITE_BP_SOCK"; else sock="$LD_CARDANO_BP_SOCK"; fi
+
+        out=$(cardano-cli conway query "$cli_query" \
+                 --stake-pool-id "$4" \
+                 --testnet-magic "$LD_MAGIC" \
+                 --socket-path "$sock" \
+                 --output-json 2>&1) && rc=0 || rc=$?
+        if [ "$rc" -ne 0 ]; then
+            # Both sides run the same binary with the same arguments, so a
+            # failure on BOTH is the harness's own invocation (see #900).
+            parity_record "$row_name" "ERROR" "error" "error" \
+                "$label ERROR rc=$rc: $(echo "$out" | head -1)"
+            return 2
+        fi
+
+        keys=$(printf '%s' "$out" | jq -r '
+            [.. | objects | keys[]? | select(test("^[0-9a-f]{56}$"))] | unique | .[]
+        ' 2>/dev/null || true)
+        extra=$(printf '%s\n' "$keys" | grep -v '^$' | grep -vFx "$pool_hex" || true)
+        if [ -n "$extra" ]; then
+            failed=1
+            notes="$notes $label returned unrequested pools: $(printf '%s' "$extra" | tr '\n' ',');"
+        fi
+    done
+
+    # Guard against the check becoming vacuous: if the devnet only ever had one
+    # pool, an unfiltered answer would be indistinguishable from a filtered one
+    # and this row would pass while measuring nothing.
+    local all_pools
+    all_pools=$(cardano-cli conway query stake-pools \
+                   --testnet-magic "$LD_MAGIC" \
+                   --socket-path "$LD_CARDANO_BP_SOCK" \
+                   --output-json 2>/dev/null | jq -r 'length' 2>/dev/null || echo 0)
+    if [ "${all_pools:-0}" -lt 2 ]; then
+        parity_record "$row_name" "SKIP" "skip" "skip" \
+            "INCONCLUSIVE: devnet has ${all_pools:-0} registered pool(s); a filter cannot be observed with fewer than 2"
+        return 0
+    fi
+
+    if [ "$failed" -eq 1 ]; then
+        parity_record "$row_name" "DIVERGENT" "superset" "exact" "$notes"
+        return 1
+    fi
+    parity_record "$row_name" "COMPARED" "exact" "exact" \
+        "filter honoured on both sockets ($all_pools pools registered)"
+    return 0
+}
+
 parity_query_json() {
     local query_name="$1"
     shift

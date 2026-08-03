@@ -69,6 +69,12 @@ done
 # (ts,query,status,dugite_sha256,cardano_sha256,equal,notes).
 if [ -f "$PARITY_CSV" ]; then
     EQUAL=$(awk -F, 'NR>1 && $3=="EQUAL" {c++} END{print c+0}' "$PARITY_CSV")
+    # COMPARED rows are direct property assertions (parity_assert_pool_filter,
+    # #963) rather than two-sided sha diffs. They must have their own bucket:
+    # a row that lands in the denominator but in no printed class is a row
+    # nobody reads, which is how this harness has repeatedly ended up counting
+    # things it was not measuring.
+    COMPARED=$(awk -F, 'NR>1 && $3=="COMPARED" {c++} END{print c+0}' "$PARITY_CSV")
     DIVERGENT_CSV=$(awk -F, 'NR>1 && $3=="DIVERGENT" && $7!~/^known-divergence:/ {c++} END{print c+0}' "$PARITY_CSV")
     SKIPS=$(awk -F, 'NR>1 && $3=="SKIP" {c++} END{print c+0}' "$PARITY_CSV")
     ERRORS=$(awk -F, 'NR>1 && $3=="ERROR" && $7!~/^known-error:/ {c++} END{print c+0}' "$PARITY_CSV")
@@ -83,6 +89,7 @@ ROWS=$(awk 'NR>1 && NF' "$PARITY_CSV" | wc -l | tr -d ' ')
 log_info ""
 log_info "=== CLI parity summary ==="
 log_info "  EQUAL:      $EQUAL"
+log_info "  COMPARED:   ${COMPARED:-0}  (direct property assertions, not sha diffs)"
 log_info "  DIVERGENT:  ${DIVERGENT_CSV:-$DIVERGENT} unexplained, ${KNOWN_DIV:-0} tracked"
 log_info "  ENV-SKIP:   $ENV_SKIPS  (setup artifact missing — these are UNCOMPARED queries)"
 log_info "  STATE-SKIP: $STATE_SKIPS (legitimately not comparable this run)"
@@ -98,7 +105,10 @@ log_info ""
 # env-skips as their own class so a setup gap can never read as a clean pass.
 DENOM_FILE="${DENOM_FILE:-$SCRIPT_DIR/../../../../.claude/skills/devnet-validate/schemas/denominators.json}"
 if [ -f "$DENOM_FILE" ]; then
-    EXPECTED=$(jq -r '.cli_parity.expected_queries // 0' "$DENOM_FILE")
+    # Gate on expected_ROWS, not expected_queries: two scripts emit a second
+    # row each (parity_assert_pool_filter, #963), so a script count is a slack
+    # lower bound that would not notice an assertion row going missing.
+    EXPECTED=$(jq -r '.cli_parity.expected_rows // .cli_parity.expected_queries // 0' "$DENOM_FILE")
     if [ "$ROWS" -lt "$EXPECTED" ]; then
         log_error "FAIL: cli-parity.csv has $ROWS rows, pinned denominator is $EXPECTED ($DENOM_FILE)"
         log_error "A query that produced no row was never run at all."
