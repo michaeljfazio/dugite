@@ -29,6 +29,10 @@ dugite-storage = { path = "../crates/dugite-storage" }
 # #975: dugite-cli's key-envelope parsers — #935's strict replacement for a
 # heuristic that silently ate a byte 1-in-8.
 dugite-cli = { path = "../crates/dugite-cli" }
+# #983: dugite-rpc's INBOUND mapping layer — attacker-controlled protobuf
+# turned into ledger types. Unlike dugite-node this crate pulls in no
+# mithril-client, so it can be a normal dependency (no `#[path]` inclusion).
+dugite-rpc = { path = "../crates/dugite-rpc" }
 #
 # dugite-node is deliberately NOT a dependency. It pulls in mithril-client,
 # whose native deps (blst, aws-lc-sys) and `inventory`/`typetag` static
@@ -259,6 +263,13 @@ doc = false
 [[bin]]
 name = "fuzz_lsq_filter_arg"
 path = "fuzz_targets/lsq_filter_arg.rs"
+doc = false
+
+# #983: the gRPC inbound mapping surface. Asserts all-or-nothing, not just
+# "no panic" — a partially-honoured request is the real hazard here.
+[[bin]]
+name = "fuzz_rpc_inbound"
+path = "fuzz_targets/rpc_inbound.rs"
 doc = false
 
 [[bin]]
