@@ -83,8 +83,20 @@ gen_script_stake() {
     mkdir -p "$dir"
     gen_payment "$name"
 
-    if [ ! -s "$dir/stake-script.plutus" ]; then
-        [ -s "$script_file" ] || die "gen_script_stake: script not found: $script_file"
+    [ -s "$script_file" ] || die "gen_script_stake: script not found: $script_file"
+
+    # Re-derive EVERYTHING whenever the source script changes.
+    #
+    # These four artefacts are all functions of the script bytes, and caching
+    # them independently of those bytes is how a stale credential survives a
+    # toolchain change: swap the .plutus binary (as #969/#970 did, from Aiken's
+    # always-true to upstream's plutus-tx `alwaysSucceedsNoDatum`) and the
+    # cached stake.addr still points at the OLD script hash, so every
+    # certificate and withdrawal fails with a witness mismatch that looks
+    # exactly like a dugite bug. Compare bytes, not existence.
+    if ! cmp -s "$script_file" "$dir/stake-script.plutus"; then
+        rm -f "$dir/stake-script.plutus" "$dir/stake-script.hash" \
+              "$dir/stake.addr" "$dir/payment-stake.addr"
         cp "$script_file" "$dir/stake-script.plutus"
     fi
 

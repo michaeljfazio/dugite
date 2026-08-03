@@ -58,7 +58,11 @@ ZOO_PY_TX_CBOR="$ZOO_LIB/tx-cbor-tool.py"       # byte-level tx surgery + signin
 ZOO_REQUIRED_TOOLS="cardano-cli jq python3 curl"
 # OPTIONAL tools degrade coverage but do not stop the run; their absence is
 # announced so it is visible in the log.
-ZOO_OPTIONAL_TOOLS="aiken cardano-node"
+# `aiken` is deliberately absent (#970). The Plutus binaries now come from
+# IntersectMBO's own plutus-tx-compiled artifacts, vendored at
+# tests/conformance/upstream/plutus-examples.json — no third-party compiler,
+# and no env-skip for a missing one.
+ZOO_OPTIONAL_TOOLS="cardano-node"
 
 zoo_require_tools() {
     local missing="" t
@@ -102,7 +106,7 @@ ZOO_ENV_SKIP_PREFIX="env:"
 
 # Checked FIRST: reasons that look environmental but are genuinely chain state.
 ZOO_STATE_SKIP_PATTERN='submit-failed|slot-did-not-advance|already-registered|no-rewards|not-registered|empty-committee|not-on-committee|cc-not-authorized|no-precondition|no-action|no-prior-action|no-asset|no-script-utxo|no-proposal-actionid|no-expected-min-fee-a|no-enacted-pparam-root|utxo too small|no-txs-drained'
-ZOO_ENV_SKIP_PATTERN='^env:|not[-_ ]found|not[-_ ]available|^missing|missing |dedupes|no-txs-(built|submitted)|-failed|could-not-derive|keys?$|keys? \(|socat|aiken'
+ZOO_ENV_SKIP_PATTERN='^env:|not[-_ ]found|not[-_ ]available|^missing|missing |dedupes|no-txs-(built|submitted)|-failed|could-not-derive|keys?$|keys? \(|socat'
 
 # Print "env" or "state" for a results.csv detail field. Unrecognised reasons
 # classify as "state" on purpose: --strict-skips must never fail on a reason

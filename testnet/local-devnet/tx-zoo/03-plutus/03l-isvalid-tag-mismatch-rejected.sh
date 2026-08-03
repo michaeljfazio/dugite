@@ -17,6 +17,18 @@ ZOO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 NAME="$(zoo_name)"
 zoo_require_devnet
+# Execution budget for a REAL plutus-tx program (#969/#970).
+#
+# This was (1000000,1000000), tuned for a trivial always-true validator.
+# Upstream's compiled output exceeds that, and running out of budget IS a
+# phase-2 failure — which silently changed what these two tests measure:
+# 03l stopped asserting "is_valid=false over a SUCCEEDING script is rejected"
+# (the script no longer succeeded), and 03j started passing for the wrong
+# reason (budget exhaustion rather than the script's own verdict).
+#
+# Devnet maxTxExecutionUnits = (steps 10000000000, memory 140000000).
+EXUNITS="(2000000000,20000000)"
+
 SCRIPT="$ZOO_DIR/lib/plutus/always-true-v2.plutus"
 [ -s "$SCRIPT" ] || { zoo_record_env_skip "$NAME" "missing-script-binary $(basename "$SCRIPT")"; exit 0; }
 
@@ -56,7 +68,7 @@ cardano-cli conway transaction build-raw \
     --tx-in-script-file "$SCRIPT" \
     --tx-in-inline-datum-present \
     --tx-in-redeemer-file "$REDEEMER" \
-    --tx-in-execution-units "(1000000,1000000)" \
+    --tx-in-execution-units "$EXUNITS" \
     --tx-in-collateral  "$COLLAT" \
     --tx-total-collateral "$((COLLAT_AMT - RETURN_AMT))" \
     --tx-out-return-collateral "${ADDR}+${RETURN_AMT}" \
