@@ -12768,7 +12768,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| matches!(e, ValidationError::AuxiliaryDataHashMismatch)),
+                .any(|e| matches!(e, ValidationError::AuxiliaryDataHashMismatch { .. })),
             "Expected AuxiliaryDataHashMismatch; got: {errors:?}"
         );
     }
@@ -12808,7 +12808,7 @@ mod tests {
 
         // Content matches — no mismatch error.
         let has_mismatch = matches!(&result, Err(errs) if errs.iter().any(|e| {
-            matches!(e, ValidationError::AuxiliaryDataHashMismatch)
+            matches!(e, ValidationError::AuxiliaryDataHashMismatch { .. })
         }));
         assert!(
             !has_mismatch,
@@ -12850,7 +12850,7 @@ mod tests {
         // The content check is skipped when raw_cbor is absent; this should
         // pass (the hash/data presence checks both pass since both are present).
         let has_mismatch = matches!(&result, Err(errs) if errs.iter().any(|e| {
-            matches!(e, ValidationError::AuxiliaryDataHashMismatch)
+            matches!(e, ValidationError::AuxiliaryDataHashMismatch { .. })
         }));
         assert!(
             !has_mismatch,
@@ -12920,6 +12920,7 @@ mod tests {
                 ValidationError::WrongNetworkInOutput {
                     expected: NetworkId::Mainnet,
                     actual: NetworkId::Testnet,
+                    ..
                 }
             )),
             "Expected WrongNetworkInOutput {{Mainnet, Testnet}}; got: {errors:?}"
@@ -13055,6 +13056,7 @@ mod tests {
                 ValidationError::WrongNetworkWithdrawal {
                     expected: NetworkId::Mainnet,
                     actual: NetworkId::Testnet,
+                    ..
                 }
             )
         }));

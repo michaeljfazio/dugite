@@ -1809,6 +1809,12 @@ pub enum ValidationError {
     PoolRewardAccountWrongNetwork {
         expected: dugite_primitives::network::NetworkId,
         actual: dugite_primitives::network::NetworkId,
+        /// Hex-encoded 28-byte operator key hash of the offending pool.
+        ///
+        /// Carried because Haskell's counterpart is `WrongNetworkPOOL
+        /// (Mismatch Network) (KeyHash StakePool)` — the pool id is part of
+        /// the wire shape, so an error without it cannot be encoded (#979).
+        pool_id: String,
     },
     /// Pool registration: reward account has wrong length.
     ///
@@ -1831,7 +1837,14 @@ pub enum ValidationError {
         "Auxiliary data hash mismatch: declared hash does not match blake2b_256 of aux data bytes \
          (AuxDataHashMismatch)"
     )]
-    AuxiliaryDataHashMismatch,
+    AuxiliaryDataHashMismatch {
+        /// Hex-encoded auxiliary-data hash declared in the transaction body
+        /// (Haskell `mismatchSupplied`).
+        declared: String,
+        /// Hex-encoded hash actually computed over the auxiliary data
+        /// (Haskell `mismatchExpected`).
+        computed: String,
+    },
     /// Output address network does not match the node's configured network.
     ///
     /// Every transaction output address must be on the same network as the node.
@@ -1847,6 +1860,11 @@ pub enum ValidationError {
     WrongNetworkInOutput {
         expected: dugite_primitives::network::NetworkId,
         actual: dugite_primitives::network::NetworkId,
+        /// Hex-encoded raw address bytes of EVERY offending output.
+        ///
+        /// Haskell's `WrongNetwork Network (Set Addr)` reports the whole set,
+        /// not the first offender — so this collects them all (#979).
+        addresses: Vec<String>,
     },
     /// Withdrawal reward address network does not match the node's configured network.
     ///
@@ -1861,6 +1879,11 @@ pub enum ValidationError {
     WrongNetworkWithdrawal {
         expected: dugite_primitives::network::NetworkId,
         actual: dugite_primitives::network::NetworkId,
+        /// Hex-encoded reward-account bytes of EVERY offending withdrawal.
+        ///
+        /// Haskell's `WrongNetworkWithdrawal Network (Set RewardAccount)`
+        /// reports the whole set (#979).
+        accounts: Vec<String>,
     },
     /// Conway GOV rule: a `ParameterChange` or `TreasuryWithdrawals` proposal's
     /// `policy_hash` does not match the constitution's guardrail script hash.

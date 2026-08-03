@@ -106,6 +106,12 @@ pub(super) fn extract_reward_credential(reward_account: &[u8]) -> Option<Credent
 /// | `GenesisKeyDelegation`          | Genesis key hash (`gk`)                 |
 /// | `MoveInstantaneousRewards`      | None here — see whole-tx genesis-quorum |
 /// |                                 | check `check_mir_genesis_quorum` (#804) |
+/// Lowercase hex, without pulling in the `hex` crate (dugite-ledger does not
+/// depend on it).
+fn to_hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn cert_required_witnesses(cert: &Certificate) -> Vec<Hash28> {
     // Helper: extract the key hash from a credential, returning None for scripts.
     let key_hash = |c: &Credential| -> Option<Hash28> {
@@ -782,7 +788,13 @@ pub(super) fn run_phase1_rules(
             if let Some(ref raw_cbor) = aux_data.raw_cbor {
                 let computed = dugite_primitives::hash::blake2b_256(raw_cbor);
                 if computed != *declared_hash {
-                    errors.push(ValidationError::AuxiliaryDataHashMismatch);
+                    // Haskell: `Mismatch { mismatchSupplied = mdh,
+                    // mismatchExpected = hashTxAuxData md' }` — the DECLARED
+                    // hash is "supplied", the recomputed one is "expected".
+                    errors.push(ValidationError::AuxiliaryDataHashMismatch {
+                        declared: declared_hash.to_hex(),
+                        computed: computed.to_hex(),
+                    });
                 }
             }
         }
@@ -1087,6 +1099,7 @@ pub(super) fn run_phase1_rules(
                         errors.push(ValidationError::PoolRewardAccountWrongNetwork {
                             expected: expected_network,
                             actual: actual_network,
+                            pool_id: pool_params.operator.to_hex(),
                         });
                         // Report once per transaction — multiple pools with wrong
                         // network are caught by the same error.
@@ -1433,17 +1446,25 @@ pub(super) fn run_phase1_rules(
     // `cardano-ledger-shelley:Cardano.Ledger.Shelley.Rules.Utxo`.
     // ------------------------------------------------------------------
     if let Some(expected_net) = node_network {
+        // Haskell's `WrongNetwork Network (Set Addr)` carries the WHOLE set of
+        // offending addresses, so collect them all rather than reporting the
+        // first: a one-element answer is not the same predicate failure (#979).
+        let mut wrong_outputs: Vec<String> = Vec::new();
+        let mut wrong_output_net = None;
         for output in &body.outputs {
             if let Some(addr_network) = output.address.network_id() {
                 if addr_network != expected_net {
-                    errors.push(ValidationError::WrongNetworkInOutput {
-                        expected: expected_net,
-                        actual: addr_network,
-                    });
-                    // Report once per transaction to avoid flooding.
-                    break;
+                    wrong_output_net = Some(addr_network);
+                    wrong_outputs.push(to_hex_bytes(&output.address.to_bytes()));
                 }
             }
+        }
+        if let Some(actual) = wrong_output_net {
+            errors.push(ValidationError::WrongNetworkInOutput {
+                expected: expected_net,
+                actual,
+                addresses: wrong_outputs,
+            });
         }
     }
 
@@ -1495,6 +1516,10 @@ pub(super) fn run_phase1_rules(
     // `cardano-ledger-shelley:Cardano.Ledger.Shelley.Rules.Utxow`.
     // ------------------------------------------------------------------
     if let Some(expected_net) = node_network {
+        // As above: `WrongNetworkWithdrawal Network (Set RewardAccount)`
+        // reports the whole set, not the first offender (#979).
+        let mut wrong_accounts: Vec<String> = Vec::new();
+        let mut wrong_wdrl_net = None;
         for reward_account in body.withdrawals.keys() {
             if let Some(header) = reward_account.first() {
                 let network_bit = header & 0x01;
@@ -1504,13 +1529,17 @@ pub(super) fn run_phase1_rules(
                     dugite_primitives::network::NetworkId::Mainnet
                 };
                 if actual_net != expected_net {
-                    errors.push(ValidationError::WrongNetworkWithdrawal {
-                        expected: expected_net,
-                        actual: actual_net,
-                    });
-                    break;
+                    wrong_wdrl_net = Some(actual_net);
+                    wrong_accounts.push(to_hex_bytes(reward_account));
                 }
             }
+        }
+        if let Some(actual) = wrong_wdrl_net {
+            errors.push(ValidationError::WrongNetworkWithdrawal {
+                expected: expected_net,
+                actual,
+                accounts: wrong_accounts,
+            });
         }
     }
 
