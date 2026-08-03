@@ -1704,12 +1704,22 @@ mod tests {
         let crate_src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut hits = Vec::new();
         scan(&crate_src, &mut hits);
-        // Filter snapshot_format.rs (pass-through clone of an Option field
-        // for backward-compat snapshot loading) — that is NOT a writer of
-        // a fresh Some, it's structural.
+        // Two files are structurally exempt, and neither is a *production*
+        // writer — which is what this invariant is actually about:
+        //
+        //   snapshot_format.rs  pass-through clone of an `Option` field for
+        //                       backward-compat snapshot loading.
+        //   test_fixtures.rs    the #967 snapshot-layout fixture, which must
+        //                       set every field to `Some` precisely so the
+        //                       format hash covers the layout INSIDE it.
+        //                       bincode writes no payload for a `None`, so a
+        //                       fixture that left this field `None` would make
+        //                       `PendingRewardUpdate`'s layout invisible to the
+        //                       guard — the exact blind spot #967 closed. It is
+        //                       never linked into a running node.
         let real: Vec<_> = hits
             .into_iter()
-            .filter(|(p, _)| !p.ends_with("snapshot_format.rs"))
+            .filter(|(p, _)| !p.ends_with("snapshot_format.rs") && !p.ends_with("test_fixtures.rs"))
             .collect();
         assert!(
             real.is_empty(),

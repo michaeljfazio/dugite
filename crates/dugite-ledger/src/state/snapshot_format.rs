@@ -444,6 +444,276 @@ mod tests {
     use super::*;
     use crate::LedgerState;
 
+    /// Every field the snapshot serializes must be non-trivial in the shared
+    /// fixture (#967).
+    ///
+    /// The destructuring below has **no `..` rest pattern on purpose**. Adding
+    /// a field to `LedgerStateSnapshot` makes this test fail to COMPILE until
+    /// `test_fixtures::populated_ledger_state` populates it, which is what
+    /// keeps the layout guard from silently narrowing again. Populating the
+    /// fixture once would not have been enough: the fixture was empty for
+    /// years and every SNAPSHOT_VERSION bump in that time was caught by review
+    /// rather than by the hash.
+    ///
+    /// bincode writes nothing for a `None` and nothing for an empty
+    /// collection, so a field left at its default contributes ZERO bytes and
+    /// its layout is invisible to `snapshot_format_hash_stability`.
+    #[test]
+    fn fixture_populates_every_snapshot_field() {
+        let state = crate::state::test_fixtures::populated_ledger_state();
+        let snap = LedgerStateSnapshot::from(&state);
+
+        let LedgerStateSnapshot {
+            utxo_set,
+            tip,
+            era,
+            pending_era_transition,
+            epoch,
+            epoch_length,
+            shelley_transition_epoch,
+            byron_epoch_length,
+            protocol_params,
+            prev_protocol_params,
+            prev_d,
+            prev_protocol_version_major,
+            stake_distribution,
+            treasury,
+            pending_donations,
+            reserves,
+            delegations,
+            pool_params,
+            future_pool_params,
+            pending_retirements,
+            snapshots,
+            reward_accounts,
+            pointer_map,
+            genesis_delegates,
+            future_gen_delegs,
+            epoch_fees,
+            epoch_blocks_by_pool,
+            epoch_block_count,
+            evolving_nonce,
+            candidate_nonce,
+            epoch_nonce,
+            previous_epoch_nonce,
+            lab_nonce,
+            last_epoch_block_nonce,
+            extra_entropy,
+            randomness_stabilisation_window,
+            stability_window_3kf,
+            genesis_hash,
+            rolling_nonce,
+            stability_window,
+            first_block_hash_of_epoch,
+            prev_epoch_first_block_hash,
+            pending_pp_updates,
+            future_pp_updates,
+            update_quorum,
+            governance,
+            slot_config,
+            needs_stake_rebuild,
+            ptr_stake,
+            ptr_stake_excluded,
+            pending_reward_update,
+            total_stake_key_deposits,
+            script_stake_credentials,
+            pending_mir_reserves,
+            pending_mir_treasury,
+            pending_mir_delta_reserves,
+            pending_mir_delta_treasury,
+            diff_seq,
+            node_network,
+            opcert_counters,
+            stake_key_deposits,
+            pool_deposits,
+            rupd_addrs_rew,
+            pending_avvm_return,
+        } = &snap;
+
+        // ── fields that are NOT serialized ──────────────────────────────
+        //
+        // `#[serde(skip)]`, so they contribute no bytes and cannot affect the
+        // layout hash. Bound above only so the exhaustive match still compiles
+        // and still forces a decision about any new field.
+        let _ = (
+            pending_era_transition,
+            needs_stake_rebuild,
+            diff_seq,
+            node_network,
+        );
+
+        // ── deliberately left at its default ────────────────────────────
+        //
+        // `stability_window` is a legacy field the `From` impl hardcodes to 0
+        // for every new snapshot. It still occupies bytes, so it is under the
+        // hash; there is simply no non-zero value to give it.
+        assert_eq!(*stability_window, 0, "legacy field is always written as 0");
+
+        macro_rules! nonempty {
+            ($($v:expr, $name:literal);* $(;)?) => {
+                $(assert!(!$v.is_empty(), concat!($name, " is empty — the layout of its \
+                     elements contributes no bytes and is invisible to the hash"));)*
+            };
+        }
+        nonempty!(
+            delegations, "delegations";
+            pool_params, "pool_params";
+            future_pool_params, "future_pool_params";
+            pending_retirements, "pending_retirements";
+            reward_accounts, "reward_accounts";
+            pointer_map, "pointer_map";
+            genesis_delegates, "genesis_delegates";
+            future_gen_delegs, "future_gen_delegs";
+            epoch_blocks_by_pool, "epoch_blocks_by_pool";
+            pending_pp_updates, "pending_pp_updates";
+            future_pp_updates, "future_pp_updates";
+            ptr_stake, "ptr_stake";
+            script_stake_credentials, "script_stake_credentials";
+            pending_mir_reserves, "pending_mir_reserves";
+            pending_mir_treasury, "pending_mir_treasury";
+            opcert_counters, "opcert_counters";
+            stake_key_deposits, "stake_key_deposits";
+            pool_deposits, "pool_deposits";
+        );
+        assert!(
+            !stake_distribution.stake_map.is_empty(),
+            "stake_distribution"
+        );
+
+        macro_rules! present {
+            ($($v:expr, $name:literal);* $(;)?) => {
+                $(assert!($v.is_some(), concat!($name, " is None — bincode writes no \
+                     payload for a None, so the layout inside it is invisible"));)*
+            };
+        }
+        present!(
+            first_block_hash_of_epoch, "first_block_hash_of_epoch";
+            prev_epoch_first_block_hash, "prev_epoch_first_block_hash";
+            pending_reward_update, "pending_reward_update";
+            rupd_addrs_rew, "rupd_addrs_rew";
+            snapshots.mark, "snapshots.mark";
+            snapshots.set, "snapshots.set";
+            snapshots.go, "snapshots.go";
+            governance.constitution, "governance.constitution";
+            governance.committee_threshold, "governance.committee_threshold";
+            governance.enacted_pparam_update, "governance.enacted_pparam_update";
+            governance.enacted_hard_fork, "governance.enacted_hard_fork";
+            governance.enacted_committee, "governance.enacted_committee";
+            governance.enacted_constitution, "governance.enacted_constitution";
+            // The #966 field. This is the specific structure whose layout
+            // change the guard failed to notice.
+            governance.ratification_snapshot, "governance.ratification_snapshot";
+        );
+
+        // Nested governance collections — `GovernanceState` is one field of the
+        // snapshot but many structures under the hash.
+        assert!(!governance.dreps.is_empty(), "governance.dreps");
+        assert!(
+            !governance.vote_delegations.is_empty(),
+            "governance.vote_delegations"
+        );
+        assert!(
+            !governance.committee_hot_keys.is_empty(),
+            "governance.committee_hot_keys"
+        );
+        assert!(
+            !governance.committee_expiration.is_empty(),
+            "governance.committee_expiration"
+        );
+        assert!(
+            !governance.committee_resigned.is_empty(),
+            "governance.committee_resigned"
+        );
+        assert!(
+            !governance.votes_by_action.is_empty(),
+            "governance.votes_by_action"
+        );
+        assert!(
+            !governance.drep_distribution_snapshot.is_empty(),
+            "governance.drep_distribution_snapshot"
+        );
+
+        // Scalars must be distinguishable from the value a bare
+        // `LedgerState::new()` would leave them at, so a field that silently
+        // stopped being written is visible.
+        macro_rules! nonzero {
+            ($($v:expr, $name:literal);* $(;)?) => {
+                $(assert_ne!($v, 0, concat!($name, " is zero — indistinguishable \
+                     from an unpopulated fixture"));)*
+            };
+        }
+        nonzero!(
+            epoch.0, "epoch";
+            *epoch_length, "epoch_length";
+            *shelley_transition_epoch, "shelley_transition_epoch";
+            *byron_epoch_length, "byron_epoch_length";
+            *prev_protocol_version_major, "prev_protocol_version_major";
+            treasury.0, "treasury";
+            pending_donations.0, "pending_donations";
+            reserves.0, "reserves";
+            epoch_fees.0, "epoch_fees";
+            *epoch_block_count, "epoch_block_count";
+            *randomness_stabilisation_window, "randomness_stabilisation_window";
+            *stability_window_3kf, "stability_window_3kf";
+            *update_quorum, "update_quorum";
+            *total_stake_key_deposits, "total_stake_key_deposits";
+            *pending_mir_delta_reserves, "pending_mir_delta_reserves";
+            *pending_mir_delta_treasury, "pending_mir_delta_treasury";
+            *pending_avvm_return, "pending_avvm_return";
+            prev_d.numerator, "prev_d";
+        );
+        macro_rules! nonzero_hash {
+            ($($v:expr, $name:literal);* $(;)?) => {
+                $(assert_ne!(*$v, Hash32::ZERO, concat!($name, " is the zero hash"));)*
+            };
+        }
+        nonzero_hash!(
+            evolving_nonce, "evolving_nonce";
+            candidate_nonce, "candidate_nonce";
+            epoch_nonce, "epoch_nonce";
+            previous_epoch_nonce, "previous_epoch_nonce";
+            lab_nonce, "lab_nonce";
+            last_epoch_block_nonce, "last_epoch_block_nonce";
+            extra_entropy, "extra_entropy";
+            genesis_hash, "genesis_hash";
+            rolling_nonce, "rolling_nonce";
+        );
+        assert!(*ptr_stake_excluded, "ptr_stake_excluded is at its default");
+
+        // These have no meaningful `Default` to compare against; assert they
+        // are at least reachable and structurally sound.
+        let _ = (
+            utxo_set,
+            tip,
+            era,
+            protocol_params,
+            prev_protocol_params,
+            slot_config,
+        );
+
+        // A size floor, so a future refactor that accidentally empties the
+        // fixture fails loudly instead of silently narrowing coverage again.
+        let bytes = bincode::serialize(&snap).expect("serialize");
+        // The floor is set ABOVE what a bare `LedgerState::new()` produces, so
+        // a refactor that quietly reverts the fixture fails here rather than
+        // silently narrowing coverage again. Measured 2026-08-03:
+        //   populated  11_282 bytes
+        //   empty       2_467 bytes   <- the old fixture
+        // A floor of 2_000 would have passed on the empty one, which is the
+        // same "assertion that cannot fail" shape this whole test is about.
+        let empty =
+            LedgerStateSnapshot::from(&LedgerState::new(ProtocolParameters::mainnet_defaults()));
+        let empty_len = bincode::serialize(&empty).expect("serialize empty").len();
+        assert!(
+            bytes.len() > empty_len * 3,
+            "populated snapshot serialized to {} bytes against an EMPTY fixture's \
+             {} — the fixture has been gutted and the layout hash covers almost \
+             nothing",
+            bytes.len(),
+            empty_len
+        );
+    }
+
     #[test]
     fn test_ledger_state_snapshot_roundtrip() {
         // Create a LedgerState with non-default values to catch field mismatches
