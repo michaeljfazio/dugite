@@ -25,3 +25,9 @@ pub mod types;
 #[allow(dead_code)]
 #[path = "../../../../crates/dugite-node/src/node/n2c_query/encoding.rs"]
 pub mod encoding;
+
+/// The LSQ filter-argument parsers (#963). Self-contained apart from
+/// `QueryResult`, which `types` above provides.
+#[allow(dead_code)]
+#[path = "../../../../crates/dugite-node/src/node/n2c_query/filter.rs"]
+pub mod filter;

@@ -112,6 +112,12 @@ jobs:
           # BECAUSE n2c_query only fuzzes the outer frame; it feeds arbitrary
           # CBOR into handle_query_cbor_versioned across all 39 Shelley tags.
           - lsq_query_dispatch
+          # #963: the LSQ filter arguments. Distinct from lsq_query_dispatch,
+          # which asserts only "no panic" — this one asserts the parsers are
+          # fail-CLOSED, i.e. that "no filter, answer for everything" is
+          # reported only for input that genuinely encodes it. The pre-#963
+          # parsers reported it for the live `cardano-cli` argument bytes.
+          - lsq_filter_arg
           - mux_ingress
           - propose_versions
           # Encoder-first structured generation (#974). Every other target is

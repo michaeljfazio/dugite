@@ -254,6 +254,13 @@ name = "fuzz_lsq_query_dispatch"
 path = "fuzz_targets/lsq_query_dispatch.rs"
 doc = false
 
+# #963: the LSQ filter-argument parsers. Asserts fail-CLOSED — "no filter" is
+# only ever reported for input that encodes it — not merely "no panic".
+[[bin]]
+name = "fuzz_lsq_filter_arg"
+path = "fuzz_targets/lsq_filter_arg.rs"
+doc = false
+
 [[bin]]
 name = "fuzz_skip_cbor_value"
 path = "fuzz_targets/skip_cbor_value.rs"
