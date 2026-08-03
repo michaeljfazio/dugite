@@ -2,7 +2,7 @@
 
 use tracing::debug;
 
-use super::parse_credential_set;
+use super::filter::{filter_arg, read_credential, read_pool_id, OnEmptySet, SetArgShape};
 use crate::node::n2c_query::types::{
     LedgerPeerEntry, NodeStateSnapshot, PoolRewardInfo, QueryResult,
 };
@@ -15,17 +15,36 @@ pub(crate) fn handle_filtered_delegations(
     decoder: &mut minicbor::Decoder<'_>,
 ) -> QueryResult {
     debug!("Query: GetFilteredDelegationsAndRewardAccounts");
-    let filter_hashes = parse_credential_set(decoder);
-    if filter_hashes.is_empty() {
-        QueryResult::StakeAddressInfo(state.stake_addresses.clone())
-    } else {
-        let filtered = state
-            .stake_addresses
-            .iter()
-            .filter(|s| filter_hashes.iter().any(|h| h == &s.credential_hash))
-            .cloned()
-            .collect();
-        QueryResult::StakeAddressInfo(filtered)
+    // `queryStakePoolDelegsAndRewards nes creds` is `accountsMap
+    // \`Map.restrictKeys\` creds` with no `null` guard, so an empty set selects
+    // nothing. dugite answered with every account until #963.
+    let filter_creds = match filter_arg(
+        decoder,
+        "GetFilteredDelegationsAndRewardAccounts",
+        SetArgShape::Required,
+        OnEmptySet::NoItems,
+        read_credential,
+    ) {
+        Ok(f) => f,
+        Err(e) => return *e,
+    };
+    match filter_creds {
+        None => QueryResult::StakeAddressInfo(state.stake_addresses.clone()),
+        Some(creds) => {
+            // `StakeAddressSnapshot` does not carry the credential
+            // discriminator, so the match is on the hash alone. Distinguishing
+            // them would need a blake2b-224 collision between a key hash and a
+            // script hash, which is a cryptographic break rather than a wire
+            // case, but the discriminator is still *parsed* and validated so a
+            // malformed credential cannot slip through as a bare hash.
+            let filtered = state
+                .stake_addresses
+                .iter()
+                .filter(|s| creds.iter().any(|(_, h)| h == &s.credential_hash))
+                .cloned()
+                .collect();
+            QueryResult::StakeAddressInfo(filtered)
+        }
     }
 }
 
@@ -42,53 +61,85 @@ pub(crate) fn handle_stake_pools(state: &NodeStateSnapshot) -> QueryResult {
 
 /// Handle GetStakePoolParams (tag 17).
 ///
-/// Argument: tag(258) Set<KeyHash StakePool>
+/// Argument: `Set (KeyHash StakePool)` — `tag(258)` + array, no `Maybe`.
+///
+/// An empty set selects **no** pools: `queryPoolParameters` is
+/// `Map.restrictKeys pools poolKeys`, with no `null` guard
+/// (cardano-ledger `Cardano/Ledger/Api/State/Query.hs`).
 pub(crate) fn handle_stake_pool_params(
     state: &NodeStateSnapshot,
     decoder: &mut minicbor::Decoder<'_>,
 ) -> QueryResult {
     debug!("Query: GetStakePoolParams");
-    let filter_pools = parse_pool_id_set(decoder);
-    if filter_pools.is_empty() {
-        QueryResult::PoolParams(state.pool_params_entries.clone())
-    } else {
-        let filtered = state
-            .pool_params_entries
-            .iter()
-            .filter(|p| filter_pools.iter().any(|h| h == &p.pool_id))
-            .cloned()
-            .collect();
-        QueryResult::PoolParams(filtered)
+    let filter_pools = match filter_arg(
+        decoder,
+        "GetStakePoolParams",
+        SetArgShape::Required,
+        OnEmptySet::NoItems,
+        read_pool_id,
+    ) {
+        Ok(f) => f,
+        Err(e) => return *e,
+    };
+    match filter_pools {
+        None => QueryResult::PoolParams(state.pool_params_entries.clone()),
+        Some(ids) => {
+            let filtered = state
+                .pool_params_entries
+                .iter()
+                .filter(|p| ids.iter().any(|h| h == &p.pool_id))
+                .cloned()
+                .collect();
+            QueryResult::PoolParams(filtered)
+        }
     }
 }
 
 /// Handle GetPoolState (tag 19) -- returns QueryPoolStateResult.
 ///
 /// Wire format: array(4) [poolParams_map, futurePoolParams_map, retiring_map, deposits_map]
-/// Argument: tag(258) Set<KeyHash StakePool>
+///
+/// Argument: `Maybe (Set (KeyHash StakePool))` — `array(0)` for `Nothing`,
+/// `array(1) <set>` for `Just`.
+///
+/// `queryPoolState nes mPoolKeys` builds
+/// `f = case mPoolKeys of Nothing -> id; Just keys -> (`Map.restrictKeys` keys)`
+/// and applies that **one** `f` to every map in the result, so an empty `Just`
+/// selects nothing (cardano-ledger `Cardano/Ledger/Api/State/Query.hs`).
 pub(crate) fn handle_pool_state(
     state: &NodeStateSnapshot,
     decoder: &mut minicbor::Decoder<'_>,
 ) -> QueryResult {
     debug!("Query: GetPoolState");
-    let filter_pools = parse_pool_id_set(decoder);
-
-    let pool_params = if filter_pools.is_empty() {
-        state.pool_params_entries.clone()
-    } else {
-        state
-            .pool_params_entries
-            .iter()
-            .filter(|p| filter_pools.iter().any(|h| h == &p.pool_id))
-            .cloned()
-            .collect()
+    let filter_pools = match filter_arg(
+        decoder,
+        "GetPoolState",
+        SetArgShape::Optional,
+        OnEmptySet::NoItems,
+        read_pool_id,
+    ) {
+        Ok(f) => f,
+        Err(e) => return *e,
     };
 
-    // Build retiring map: filter pending_retirements by pool filter
+    let pool_params = match &filter_pools {
+        None => state.pool_params_entries.clone(),
+        Some(ids) => state
+            .pool_params_entries
+            .iter()
+            .filter(|p| ids.iter().any(|h| h == &p.pool_id))
+            .cloned()
+            .collect(),
+    };
+
+    // `mkQueryPoolStateResult` applies the same restriction to `psRetiring`.
     let retiring: Vec<(Vec<u8>, u64)> = state
         .pending_retirements
         .iter()
-        .filter(|(pool_id, _)| filter_pools.is_empty() || filter_pools.iter().any(|h| h == pool_id))
+        .filter(|(pool_id, _)| match &filter_pools {
+            None => true,
+            Some(ids) => ids.iter().any(|h| h == pool_id),
+        })
         .cloned()
         .collect();
 
@@ -138,24 +189,34 @@ pub(crate) fn handle_pool_distr2(
     decoder: &mut minicbor::Decoder<'_>,
 ) -> QueryResult {
     debug!("Query: GetPoolDistr2");
-    let filter_pools = parse_pool_id_set(decoder);
+    let filter_pools = match filter_arg(
+        decoder,
+        "GetPoolDistr2",
+        SetArgShape::Optional,
+        OnEmptySet::NoItems,
+        read_pool_id,
+    ) {
+        Ok(f) => f,
+        Err(e) => return *e,
+    };
     // Use the pre-computed total that includes orphaned delegations to retired pools.
     let total_active_stake = state.total_active_stake.max(1); // NonZero
-    if filter_pools.is_empty() {
-        QueryResult::PoolDistr2 {
+    match filter_pools {
+        None => QueryResult::PoolDistr2 {
             pools: state.stake_pools.clone(),
             total_active_stake,
-        }
-    } else {
-        let filtered: Vec<_> = state
-            .stake_pools
-            .iter()
-            .filter(|p| filter_pools.iter().any(|h| h == &p.pool_id))
-            .cloned()
-            .collect();
-        QueryResult::PoolDistr2 {
-            pools: filtered,
-            total_active_stake,
+        },
+        Some(ids) => {
+            let filtered: Vec<_> = state
+                .stake_pools
+                .iter()
+                .filter(|p| ids.iter().any(|h| h == &p.pool_id))
+                .cloned()
+                .collect();
+            QueryResult::PoolDistr2 {
+                pools: filtered,
+                total_active_stake,
+            }
         }
     }
 }
@@ -174,80 +235,121 @@ pub(crate) fn handle_spo_stake_distr(
     decoder: &mut minicbor::Decoder<'_>,
 ) -> QueryResult {
     debug!("Query: GetSPOStakeDistr");
-    let filter_pools = parse_pool_id_set(decoder);
-    let entries: Vec<(Vec<u8>, u64)> = if filter_pools.is_empty() {
-        state
+    // `querySPOStakeDistr nes keys | null keys = <every pool>` — this query does
+    // carry the explicit `null` guard, so unlike GetStakePoolParams (tag 17) an
+    // empty set here means everything.
+    let filter_pools = match filter_arg(
+        decoder,
+        "GetSPOStakeDistr",
+        SetArgShape::Required,
+        OnEmptySet::AllItems,
+        read_pool_id,
+    ) {
+        Ok(f) => f,
+        Err(e) => return *e,
+    };
+    let entries: Vec<(Vec<u8>, u64)> = match filter_pools {
+        None => state
             .stake_pools
             .iter()
             .map(|p| (p.pool_id.clone(), p.stake))
-            .collect()
-    } else {
-        state
+            .collect(),
+        Some(ids) => state
             .stake_pools
             .iter()
-            .filter(|p| filter_pools.iter().any(|h| h == &p.pool_id))
+            .filter(|p| ids.iter().any(|h| h == &p.pool_id))
             .map(|p| (p.pool_id.clone(), p.stake))
-            .collect()
+            .collect(),
     };
     QueryResult::SPOStakeDistr(entries)
 }
 
 /// Handle GetStakeSnapshots (tag 20).
 ///
-/// Argument: mandatory `tag(258) Set<KeyHash StakePool>`. An empty set
-/// requests all pools (Haskell's `getStakeSnapshots` semantics).
+/// Argument: `Maybe (Set (KeyHash StakePool))` — `array(0)` for `Nothing`,
+/// `array(1) <set>` for `Just`.
+///
+/// `queryStakeSnapshots nes mPoolIds` picks the pool set as
+/// `Nothing -> <every pool with stake across mark/set/go>; Just ids -> ids`,
+/// so an empty `Just` yields an empty map (cardano-ledger
+/// `Cardano/Ledger/Api/State/Query.hs`).
 ///
 /// Before the fix for issue #406 the argument was ignored entirely and the
 /// response always contained every pool. This both violated the wire protocol
 /// (trailing CBOR bytes in the decoder) and broke compatibility with
-/// `cardano-cli query stake-snapshot --stake-pool-id <id>`.
+/// `cardano-cli query stake-snapshot --stake-pool-id <id>`. #963 then found the
+/// filter still inert on the wire, because the `Maybe` wrapper was unhandled.
 pub(crate) fn handle_stake_snapshots(
     state: &NodeStateSnapshot,
     decoder: &mut minicbor::Decoder<'_>,
 ) -> QueryResult {
     debug!("Query: GetStakeSnapshots");
-    let filter_pools = parse_pool_id_set(decoder);
+    let filter_pools = match filter_arg(
+        decoder,
+        "GetStakeSnapshots",
+        SetArgShape::Optional,
+        OnEmptySet::NoItems,
+        read_pool_id,
+    ) {
+        Ok(f) => f,
+        Err(e) => return *e,
+    };
     let snapshots = &state.stake_snapshots;
-    if filter_pools.is_empty() {
-        QueryResult::StakeSnapshots(snapshots.clone())
-    } else {
-        let filtered_pools = snapshots
-            .pools
-            .iter()
-            .filter(|p| filter_pools.iter().any(|h| h == &p.pool_id))
-            .cloned()
-            .collect();
-        // Totals are global — matching Haskell's `StakeSnapshots` record, where
-        // `ssMarkTotal` / `ssSetTotal` / `ssGoTotal` are the total active stake
-        // across the whole epoch snapshot regardless of any pool filter.
-        QueryResult::StakeSnapshots(crate::node::n2c_query::types::StakeSnapshotsResult {
-            pools: filtered_pools,
-            total_mark_stake: snapshots.total_mark_stake,
-            total_set_stake: snapshots.total_set_stake,
-            total_go_stake: snapshots.total_go_stake,
-        })
+    match filter_pools {
+        None => QueryResult::StakeSnapshots(snapshots.clone()),
+        Some(ids) => {
+            let filtered_pools = snapshots
+                .pools
+                .iter()
+                .filter(|p| ids.iter().any(|h| h == &p.pool_id))
+                .cloned()
+                .collect();
+            // Totals are global — matching Haskell's `StakeSnapshots` record, where
+            // `ssMarkTotal` / `ssSetTotal` / `ssGoTotal` are the total active stake
+            // across the whole epoch snapshot regardless of any pool filter.
+            QueryResult::StakeSnapshots(crate::node::n2c_query::types::StakeSnapshotsResult {
+                pools: filtered_pools,
+                total_mark_stake: snapshots.total_mark_stake,
+                total_set_stake: snapshots.total_set_stake,
+                total_go_stake: snapshots.total_go_stake,
+            })
+        }
     }
 }
 
 /// Handle GetPoolDistr (tag 21) -- returns pool stake distribution.
 ///
-/// Argument: tag(258) Set<KeyHash StakePool> (optional filter)
+/// Argument: `Maybe (Set (KeyHash StakePool))`. Upstream answers this one by
+/// delegating straight to `GetPoolDistr2` with the same argument
+/// (`fromLedgerPoolDistr $ answerPureBlockQuery cfg (GetPoolDistr2 mPoolIds)`),
+/// whose filter is `maybe (const True) (flip Set.member) mPoolIds` — so an
+/// empty `Just` selects nothing.
 pub(crate) fn handle_pool_distr(
     state: &NodeStateSnapshot,
     decoder: &mut minicbor::Decoder<'_>,
 ) -> QueryResult {
     debug!("Query: GetPoolDistr");
-    let filter_pools = parse_pool_id_set(decoder);
-    if filter_pools.is_empty() {
-        QueryResult::PoolDistr(state.stake_pools.clone())
-    } else {
-        let filtered = state
-            .stake_pools
-            .iter()
-            .filter(|p| filter_pools.iter().any(|h| h == &p.pool_id))
-            .cloned()
-            .collect();
-        QueryResult::PoolDistr(filtered)
+    let filter_pools = match filter_arg(
+        decoder,
+        "GetPoolDistr",
+        SetArgShape::Optional,
+        OnEmptySet::NoItems,
+        read_pool_id,
+    ) {
+        Ok(f) => f,
+        Err(e) => return *e,
+    };
+    match filter_pools {
+        None => QueryResult::PoolDistr(state.stake_pools.clone()),
+        Some(ids) => {
+            let filtered = state
+                .stake_pools
+                .iter()
+                .filter(|p| ids.iter().any(|h| h == &p.pool_id))
+                .cloned()
+                .collect();
+            QueryResult::PoolDistr(filtered)
+        }
     }
 }
 
@@ -260,17 +362,34 @@ pub(crate) fn handle_stake_deleg_deposits(
     decoder: &mut minicbor::Decoder<'_>,
 ) -> QueryResult {
     debug!("Query: GetStakeDelegDeposits");
-    let filter_hashes = parse_credential_set(decoder);
-    if filter_hashes.is_empty() {
-        QueryResult::StakeDelegDeposits(state.stake_deleg_deposits.clone())
-    } else {
-        let filtered = state
-            .stake_deleg_deposits
-            .iter()
-            .filter(|d| filter_hashes.iter().any(|h| h == &d.credential_hash))
-            .cloned()
-            .collect();
-        QueryResult::StakeDelegDeposits(filtered)
+    // Upstream answers this one with `Set.foldl\' lookupInsert Map.empty
+    // stakeCreds` — it iterates the *requested* set, so an empty set yields an
+    // empty map. dugite answered with every deposit until #963.
+    let filter_creds = match filter_arg(
+        decoder,
+        "GetStakeDelegDeposits",
+        SetArgShape::Required,
+        OnEmptySet::NoItems,
+        read_credential,
+    ) {
+        Ok(f) => f,
+        Err(e) => return *e,
+    };
+    match filter_creds {
+        None => QueryResult::StakeDelegDeposits(state.stake_deleg_deposits.clone()),
+        Some(creds) => {
+            let filtered = state
+                .stake_deleg_deposits
+                .iter()
+                .filter(|d| {
+                    creds
+                        .iter()
+                        .any(|(k, h)| *k == d.credential_type && h == &d.credential_hash)
+                })
+                .cloned()
+                .collect();
+            QueryResult::StakeDelegDeposits(filtered)
+        }
     }
 }
 
@@ -464,21 +583,6 @@ pub(crate) fn handle_ledger_peer_snapshot_v23(state: &NodeStateSnapshot, big: bo
         network_magic: state.network_magic,
         peers,
     }
-}
-
-/// Parse a set of pool ID hashes from CBOR.
-/// Handles: tag(258) [pool_hash_bytes, ...] or plain array of bytes.
-fn parse_pool_id_set(decoder: &mut minicbor::Decoder<'_>) -> Vec<Vec<u8>> {
-    let mut pools = Vec::new();
-    let _ = decoder.tag();
-    if let Ok(Some(n)) = decoder.array() {
-        for _ in 0..n {
-            if let Ok(bytes) = decoder.bytes() {
-                pools.push(bytes.to_vec());
-            }
-        }
-    }
-    pools
 }
 
 #[cfg(test)]
@@ -769,7 +873,22 @@ mod tests {
         }
     }
 
-    fn make_empty_filter_cbor() -> Vec<u8> {
+    /// Haskell `Nothing` — `encodeMaybe Nothing = encodeListLen 0`.
+    /// This is what `cardano-cli` sends when no `--stake-pool-id` is given, and
+    /// the only encoding that means "every pool" for tags 19/20/21/36.
+    fn make_nothing_filter_cbor() -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.array(0).ok();
+        buf
+    }
+
+    /// An explicitly **empty** `Set` — `tag(258) array(0)`.
+    ///
+    /// Not the same thing as `Nothing`: `Map.restrictKeys m mempty` is empty, so
+    /// for every query whose Haskell handler restricts rather than guarding on
+    /// `null`, this selects no pools at all.
+    fn make_empty_set_filter_cbor() -> Vec<u8> {
         let mut buf = Vec::new();
         let mut enc = minicbor::Encoder::new(&mut buf);
         enc.tag(minicbor::data::Tag::new(258)).ok();
@@ -777,12 +896,34 @@ mod tests {
         buf
     }
 
+    /// A bare `Set` of one pool id — `tag(258) array(1) bstr(28)`. This is the
+    /// `toCBOR (Set …)` argument of tags 17 and 30.
     fn make_pool_filter_cbor(pool_id: &[u8]) -> Vec<u8> {
         let mut buf = Vec::new();
         let mut enc = minicbor::Encoder::new(&mut buf);
         enc.tag(minicbor::data::Tag::new(258)).ok();
         enc.array(1).ok();
         enc.bytes(pool_id).ok();
+        buf
+    }
+
+    /// The **live** argument `cardano-cli` sends for tags 19/20/21/36:
+    /// `toCBOR (Just (Set.singleton poolid))`
+    ///   = `array(1)` (the `Maybe`) `tag(258) array(1) bstr(28)` (the `Set`).
+    ///
+    /// #963: dugite never handled the `array(1)` `Maybe` wrapper, so this exact
+    /// shape decoded to an empty filter and every caller answered with *all*
+    /// pools. The pre-existing tests all fed the bare-`Set` form and so could
+    /// not see it.
+    fn make_just_pools_filter_cbor(pool_ids: &[&[u8]]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.array(1).ok();
+        enc.tag(minicbor::data::Tag::new(258)).ok();
+        enc.array(pool_ids.len() as u64).ok();
+        for id in pool_ids {
+            enc.bytes(id).ok();
+        }
         buf
     }
 
@@ -817,13 +958,31 @@ mod tests {
             ],
             ..NodeStateSnapshot::default()
         };
-        let cbor = make_empty_filter_cbor();
+        // `queryStakePoolDelegsAndRewards` is `restrictKeys creds` with no
+        // `null` guard, so an explicitly empty set selects nothing. dugite
+        // answered with every account until #963.
+        let cbor = make_empty_set_filter_cbor();
         let mut dec = minicbor::Decoder::new(&cbor);
-        let result = handle_filtered_delegations(&state, &mut dec);
-        match result {
-            QueryResult::StakeAddressInfo(addrs) => assert_eq!(addrs.len(), 2),
-            _ => panic!("Expected StakeAddressInfo"),
+        match handle_filtered_delegations(&state, &mut dec) {
+            QueryResult::StakeAddressInfo(addrs) => assert!(addrs.is_empty()),
+            other => panic!("Expected StakeAddressInfo, got {other:?}"),
         }
+
+        // No argument bytes at all is still tolerated as "no filter".
+        let mut dec = minicbor::Decoder::new(&[]);
+        match handle_filtered_delegations(&state, &mut dec) {
+            QueryResult::StakeAddressInfo(addrs) => assert_eq!(addrs.len(), 2),
+            other => panic!("Expected StakeAddressInfo, got {other:?}"),
+        }
+
+        // A malformed credential set must not degrade to "every account".
+        let mut buf = Vec::new();
+        minicbor::Encoder::new(&mut buf).u32(4).unwrap();
+        let mut dec = minicbor::Decoder::new(&buf);
+        assert!(matches!(
+            handle_filtered_delegations(&state, &mut dec),
+            QueryResult::Error(_)
+        ));
     }
 
     #[test]
@@ -883,13 +1042,250 @@ mod tests {
         }
     }
 
+    // ─── #963: the pool-id filter argument ──────────────────────────────
+    //
+    // The filter was not merely wrong, it was *inert*: `parse_pool_id_set`
+    // degraded to an empty vector on every failure path and every caller read
+    // an empty vector as "all pools", so asking for pool A returned A and B.
+    // These tests drive the exact bytes `cardano-cli` emits.
+
+    /// The live shape: `toCBOR (Just (Set.singleton poolid))`. A one-element
+    /// filter must produce a one-element answer.
+    #[test]
+    fn test_pool_state_just_single_pool_filters_to_that_pool() {
+        let mut state = make_state_with_pools();
+        state.pending_retirements = vec![(vec![2u8; 28], 150)];
+        state.pool_deposit = 500_000_000;
+        let cbor = make_just_pools_filter_cbor(&[&[1u8; 28]]);
+        let mut dec = minicbor::Decoder::new(&cbor);
+        match handle_pool_state(&state, &mut dec) {
+            QueryResult::PoolState {
+                pool_params,
+                retiring,
+                deposits,
+                ..
+            } => {
+                assert_eq!(pool_params.len(), 1, "asked for one pool, got a superset");
+                assert_eq!(pool_params[0].pool_id, vec![1u8; 28]);
+                // pool 2's pending retirement must not leak through either.
+                assert!(retiring.is_empty());
+                assert_eq!(deposits.len(), 1);
+            }
+            other => panic!("Expected PoolState, got {other:?}"),
+        }
+    }
+
+    /// Same for tag 20 — the other query #963 reproduced on the wire.
+    #[test]
+    fn test_stake_snapshots_just_single_pool_filters_to_that_pool() {
+        let state = make_stake_snapshots_state();
+        let cbor = make_just_pools_filter_cbor(&[&[2u8; 28]]);
+        let mut dec = minicbor::Decoder::new(&cbor);
+        match handle_stake_snapshots(&state, &mut dec) {
+            QueryResult::StakeSnapshots(ss) => {
+                assert_eq!(ss.pools.len(), 1, "asked for one pool, got a superset");
+                assert_eq!(ss.pools[0].pool_id, vec![2u8; 28]);
+            }
+            other => panic!("Expected StakeSnapshots, got {other:?}"),
+        }
+    }
+
+    /// Asking for a *different* pool must produce a different answer. Under the
+    /// #963 defect the two responses were byte-identical, which is what made
+    /// the filter provably inert rather than merely mis-applied.
+    #[test]
+    fn test_pool_state_different_filters_give_different_answers() {
+        let state = make_state_with_pools();
+
+        let a = make_just_pools_filter_cbor(&[&[1u8; 28]]);
+        let b = make_just_pools_filter_cbor(&[&[2u8; 28]]);
+        let mut da = minicbor::Decoder::new(&a);
+        let mut db = minicbor::Decoder::new(&b);
+
+        let ids = |r: QueryResult| match r {
+            QueryResult::PoolState { pool_params, .. } => pool_params
+                .into_iter()
+                .map(|p| p.pool_id)
+                .collect::<Vec<_>>(),
+            other => panic!("Expected PoolState, got {other:?}"),
+        };
+
+        assert_eq!(ids(handle_pool_state(&state, &mut da)), vec![vec![1u8; 28]]);
+        assert_eq!(ids(handle_pool_state(&state, &mut db)), vec![vec![2u8; 28]]);
+    }
+
+    /// Every one of the four `Maybe`-carrying tags takes the same wrapper.
+    #[test]
+    fn test_all_optional_arg_queries_accept_the_maybe_wrapper() {
+        let state = make_state_with_pools();
+        let just_one = make_just_pools_filter_cbor(&[&[1u8; 28]]);
+        let nothing = make_nothing_filter_cbor();
+
+        let mut d = minicbor::Decoder::new(&just_one);
+        match handle_pool_distr(&state, &mut d) {
+            QueryResult::PoolDistr(p) => assert_eq!(p.len(), 1),
+            other => panic!("tag 21: {other:?}"),
+        }
+        let mut d = minicbor::Decoder::new(&just_one);
+        match handle_pool_distr2(&state, &mut d) {
+            QueryResult::PoolDistr2 { pools, .. } => assert_eq!(pools.len(), 1),
+            other => panic!("tag 36: {other:?}"),
+        }
+
+        let mut d = minicbor::Decoder::new(&nothing);
+        match handle_pool_distr(&state, &mut d) {
+            QueryResult::PoolDistr(p) => assert_eq!(p.len(), 2),
+            other => panic!("tag 21 Nothing: {other:?}"),
+        }
+        let mut d = minicbor::Decoder::new(&nothing);
+        match handle_pool_distr2(&state, &mut d) {
+            QueryResult::PoolDistr2 { pools, .. } => assert_eq!(pools.len(), 2),
+            other => panic!("tag 36 Nothing: {other:?}"),
+        }
+    }
+
+    /// The multi-element `Just` form.
+    #[test]
+    fn test_just_multiple_pools_filters_to_exactly_those() {
+        let state = make_state_with_pools();
+        let cbor = make_just_pools_filter_cbor(&[&[1u8; 28], &[2u8; 28]]);
+        let mut dec = minicbor::Decoder::new(&cbor);
+        match handle_pool_state(&state, &mut dec) {
+            QueryResult::PoolState { pool_params, .. } => assert_eq!(pool_params.len(), 2),
+            other => panic!("Expected PoolState, got {other:?}"),
+        }
+    }
+
+    /// `encodeContainerSkel` always writes a definite array, but #938 settled
+    /// that dugite reads both framings wherever upstream might produce either.
+    #[test]
+    fn test_indefinite_length_set_is_accepted() {
+        let state = make_state_with_pools();
+        let mut cbor = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut cbor);
+        enc.array(1).unwrap(); // Just
+        enc.tag(minicbor::data::Tag::new(258)).unwrap();
+        enc.begin_array().unwrap();
+        enc.bytes(&[1u8; 28]).unwrap();
+        enc.end().unwrap();
+
+        let mut dec = minicbor::Decoder::new(&cbor);
+        match handle_pool_state(&state, &mut dec) {
+            QueryResult::PoolState { pool_params, .. } => {
+                assert_eq!(pool_params.len(), 1);
+                assert_eq!(pool_params[0].pool_id, vec![1u8; 28]);
+            }
+            other => panic!("Expected PoolState, got {other:?}"),
+        }
+    }
+
+    /// A malformed argument must answer with an error, never with a superset.
+    /// This is the actual severity of #963: the filter failed **open**, so a
+    /// parse failure was indistinguishable from "give me everything".
+    #[test]
+    fn test_malformed_filter_argument_errors_rather_than_returning_all_pools() {
+        let state = make_state_with_pools();
+
+        // A bare integer where the argument should be.
+        let mut cbor = Vec::new();
+        minicbor::Encoder::new(&mut cbor).u32(7).unwrap();
+        let mut dec = minicbor::Decoder::new(&cbor);
+        assert!(
+            matches!(handle_pool_state(&state, &mut dec), QueryResult::Error(_)),
+            "malformed argument must not answer with every pool"
+        );
+
+        // A `Maybe` wrapper of an impossible length.
+        let mut cbor = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut cbor);
+        enc.array(3).unwrap();
+        enc.u32(1).unwrap();
+        enc.u32(2).unwrap();
+        enc.u32(3).unwrap();
+        let mut dec = minicbor::Decoder::new(&cbor);
+        assert!(matches!(
+            handle_stake_snapshots(&state, &mut dec),
+            QueryResult::Error(_)
+        ));
+
+        // The wrong set tag.
+        let mut cbor = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut cbor);
+        enc.array(1).unwrap();
+        enc.tag(minicbor::data::Tag::new(259)).unwrap();
+        enc.array(1).unwrap();
+        enc.bytes(&[1u8; 28]).unwrap();
+        let mut dec = minicbor::Decoder::new(&cbor);
+        assert!(matches!(
+            handle_pool_distr(&state, &mut dec),
+            QueryResult::Error(_)
+        ));
+
+        // A set element that is not a 28-byte pool key hash. Silently keeping a
+        // hash that can never match would report "no such pool" for a pool that
+        // exists — the same quiet wrong answer in the other direction.
+        let mut cbor = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut cbor);
+        enc.array(1).unwrap();
+        enc.tag(minicbor::data::Tag::new(258)).unwrap();
+        enc.array(1).unwrap();
+        enc.bytes(&[1u8; 32]).unwrap();
+        let mut dec = minicbor::Decoder::new(&cbor);
+        assert!(matches!(
+            handle_pool_distr2(&state, &mut dec),
+            QueryResult::Error(_)
+        ));
+    }
+
+    /// tag 30 is the one pool-id query whose Haskell handler *does* guard on
+    /// `null keys`, so its empty set means everything. Pinned so the two rules
+    /// cannot be collapsed into one by a later refactor.
+    #[test]
+    fn test_spo_stake_distr_empty_set_means_all_pools_unlike_tag_17() {
+        let state = make_state_with_pools();
+
+        let cbor = make_empty_set_filter_cbor();
+        let mut dec = minicbor::Decoder::new(&cbor);
+        match handle_spo_stake_distr(&state, &mut dec) {
+            QueryResult::SPOStakeDistr(e) => {
+                assert_eq!(e.len(), 2, "querySPOStakeDistr: null keys")
+            }
+            other => panic!("Expected SPOStakeDistr, got {other:?}"),
+        }
+
+        let cbor = make_empty_set_filter_cbor();
+        let mut dec = minicbor::Decoder::new(&cbor);
+        match handle_stake_pool_params(&state, &mut dec) {
+            QueryResult::PoolParams(p) => {
+                assert!(p.is_empty(), "queryPoolParameters: restrictKeys")
+            }
+            other => panic!("Expected PoolParams, got {other:?}"),
+        }
+    }
+
     // ─── GetStakePoolParams (tag 17) ──────────────────────────────────
 
+    /// `queryPoolParameters` is `Map.restrictKeys pools poolKeys` with no `null`
+    /// guard, so an empty set selects nothing. dugite answered with every pool
+    /// until #963.
     #[test]
-    fn test_stake_pool_params_no_filter() {
+    fn test_stake_pool_params_empty_set_selects_no_pools() {
         let state = make_state_with_pools();
-        let cbor = make_empty_filter_cbor();
+        let cbor = make_empty_set_filter_cbor();
         let mut dec = minicbor::Decoder::new(&cbor);
+        let result = handle_stake_pool_params(&state, &mut dec);
+        match result {
+            QueryResult::PoolParams(params) => assert!(params.is_empty()),
+            _ => panic!("Expected PoolParams"),
+        }
+    }
+
+    /// Tag 17 has no `Maybe`, so "no argument at all" is not a shape any client
+    /// sends; dugite tolerates it as "no filter" rather than erroring.
+    #[test]
+    fn test_stake_pool_params_absent_argument_returns_all_pools() {
+        let state = make_state_with_pools();
+        let mut dec = minicbor::Decoder::new(&[]);
         let result = handle_stake_pool_params(&state, &mut dec);
         match result {
             QueryResult::PoolParams(params) => assert_eq!(params.len(), 2),
@@ -920,7 +1316,7 @@ mod tests {
         let mut state = make_state_with_pools();
         state.pending_retirements = vec![(vec![2u8; 28], 150)];
         state.pool_deposit = 500_000_000;
-        let cbor = make_empty_filter_cbor();
+        let cbor = make_nothing_filter_cbor();
         let mut dec = minicbor::Decoder::new(&cbor);
         let result = handle_pool_state(&state, &mut dec);
         match result {
@@ -995,10 +1391,11 @@ mod tests {
         }
     }
 
+    /// `Nothing` — every pool.
     #[test]
-    fn test_stake_snapshots_empty_filter_returns_all_pools() {
+    fn test_stake_snapshots_nothing_returns_all_pools() {
         let state = make_stake_snapshots_state();
-        let cbor = make_empty_filter_cbor();
+        let cbor = make_nothing_filter_cbor();
         let mut dec = minicbor::Decoder::new(&cbor);
         let result = handle_stake_snapshots(&state, &mut dec);
         match result {
@@ -1007,6 +1404,24 @@ mod tests {
                 assert_eq!(ss.total_mark_stake, 10_100);
                 assert_eq!(ss.total_set_stake, 20_200);
                 assert_eq!(ss.total_go_stake, 30_300);
+            }
+            _ => panic!("Expected StakeSnapshots"),
+        }
+    }
+
+    /// `Just mempty` — no pools. `queryStakeSnapshots` takes `poolIds = ids`
+    /// straight from the `Just`, and `Map.fromSet f mempty` is empty. The
+    /// totals stay global either way.
+    #[test]
+    fn test_stake_snapshots_empty_set_selects_no_pools() {
+        let state = make_stake_snapshots_state();
+        let cbor = make_empty_set_filter_cbor();
+        let mut dec = minicbor::Decoder::new(&cbor);
+        let result = handle_stake_snapshots(&state, &mut dec);
+        match result {
+            QueryResult::StakeSnapshots(ss) => {
+                assert!(ss.pools.is_empty());
+                assert_eq!(ss.total_mark_stake, 10_100);
             }
             _ => panic!("Expected StakeSnapshots"),
         }
@@ -1086,7 +1501,7 @@ mod tests {
     #[test]
     fn test_pool_distr_no_filter() {
         let state = make_state_with_pools();
-        let cbor = make_empty_filter_cbor();
+        let cbor = make_nothing_filter_cbor();
         let mut dec = minicbor::Decoder::new(&cbor);
         let result = handle_pool_distr(&state, &mut dec);
         match result {
@@ -1130,12 +1545,19 @@ mod tests {
             ],
             ..NodeStateSnapshot::default()
         };
-        let cbor = make_empty_filter_cbor();
+        // Upstream iterates the *requested* set (`Set.foldl' lookupInsert
+        // Map.empty stakeCreds`), so an empty set yields an empty map.
+        let cbor = make_empty_set_filter_cbor();
         let mut dec = minicbor::Decoder::new(&cbor);
-        let result = handle_stake_deleg_deposits(&state, &mut dec);
-        match result {
+        match handle_stake_deleg_deposits(&state, &mut dec) {
+            QueryResult::StakeDelegDeposits(deps) => assert!(deps.is_empty()),
+            other => panic!("Expected StakeDelegDeposits, got {other:?}"),
+        }
+
+        let mut dec = minicbor::Decoder::new(&[]);
+        match handle_stake_deleg_deposits(&state, &mut dec) {
             QueryResult::StakeDelegDeposits(deps) => assert_eq!(deps.len(), 2),
-            _ => panic!("Expected StakeDelegDeposits"),
+            other => panic!("Expected StakeDelegDeposits, got {other:?}"),
         }
     }
 
@@ -1206,7 +1628,7 @@ mod tests {
     #[test]
     fn test_pool_distr2_no_filter() {
         let state = make_state_with_pools();
-        let cbor = make_empty_filter_cbor();
+        let cbor = make_nothing_filter_cbor();
         let mut dec = minicbor::Decoder::new(&cbor);
         let result = handle_pool_distr2(&state, &mut dec);
         match result {
