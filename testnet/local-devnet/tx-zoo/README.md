@@ -120,7 +120,7 @@ need an extra binary are vendored (stdlib only, no pip):
 |---|----------|---------|--------|
 | 01 | bookkeeping       | 8 | implemented |
 | 02 | native scripts    | 7 | implemented |
-| 03 | plutus            | 11 | implemented (V3 may need aiken — see below) |
+| 03 | plutus            | 13 | implemented |
 | 04 | stake             | 7 | implemented |
 | 05 | governance certs  | 8 | implemented |
 | 06 | governance props  | 7 | implemented |
@@ -130,15 +130,23 @@ need an extra binary are vendored (stdlib only, no pip):
 
 ## Plutus binaries
 
-`lib/build-plutus.sh` builds always-true validators for V1/V2/V3.
+`lib/build-plutus.sh` materialises them from
+`tests/conformance/upstream/plutus-examples.json` — IntersectMBO's own
+plutus-tx-compiled scripts, vendored from cardano-ledger — and verifies every
+envelope against the ScriptHash upstream recorded beside the bytes before the
+zoo uses it. No compiler to install (#970).
 
-- If `aiken` is installed (`brew install aiken-lang/tap/aiken`), it
-  compiles real binaries. Preferred.
-- Otherwise it vendors known-good bytes for V1 and V2 from the IOG
-  cardano-node integration test fixtures, plus a best-effort V3
-  candidate. The V3 wire shape changed several times during Conway
-  development; if a V3 spend/mint submit fails, install aiken and
-  rerun `lib/build-plutus.sh`.
+They are **not** "always true". They assert on the script purpose and on datum
+presence, which is the point: an always-true validator never reads the
+ScriptContext, so it cannot catch a context-construction defect (#772, #969).
+
+- spending tests want `alwaysSucceedsWithDatum` — every spend in the zoo
+  carries a datum, including V3's inline one
+- mint / certify / reward / vote / propose want `alwaysSucceedsNoDatum`
+- a spend that must FAIL wants `alwaysFailsWithDatum`; `alwaysFailsNoDatum` is
+  TRUE for spending-with-datum
+
+`17-context-inspecting` drives the ones that read `TxInfo` contents.
 
 ## State and reruns
 

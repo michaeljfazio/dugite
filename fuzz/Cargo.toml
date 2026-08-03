@@ -56,11 +56,9 @@ bs58 = "0.5"
 bech32 = "0.11"
 # In-house UPLC implementation — the decoder/evaluator that runs in production.
 # This is the target the new fuzz_dugite_uplc_* binaries exercise; the upstream
-# aiken `uplc` dep below is kept around for the upstream-bug-surface targets.
 dugite-uplc = { path = "../crates/dugite-uplc" }
 # Direct uplc dep surfaces eval_phase_two_raw, Program::from_cbor/from_flat,
 # uplc::plutus_data, and apply_params_to_script for Plutus Phase-4 fuzz targets.
-uplc = { git = "https://github.com/aiken-lang/aiken.git", rev = "6806d52211fbb469ae13aa0e0290aeb6b9b3e8cf" }
 tempfile = "3"
 tokio = { version = "1", features = ["rt"] }
 
@@ -228,10 +226,6 @@ name = "fuzz_chaindb_rollback"
 path = "fuzz_targets/chaindb_rollback.rs"
 doc = false
 
-[[bin]]
-name = "fuzz_plutus_script_decode"
-path = "fuzz_targets/plutus_script_decode.rs"
-doc = false
 
 [[bin]]
 name = "fuzz_plutus_data_decode"
@@ -343,7 +337,7 @@ path = "fuzz_targets/tx_metadata_decode.rs"
 doc = false
 
 # In-house dugite-uplc Program decoder (production phase-2 script entry).
-# Distinct from fuzz_plutus_script_decode, which exercises the upstream
+# Distinct from the removed fuzz_plutus_script_decode, which exercised the upstream
 # Aiken `uplc` crate — that is NOT the decoder dugite runs in production.
 [[bin]]
 name = "fuzz_dugite_uplc_program_decode"
