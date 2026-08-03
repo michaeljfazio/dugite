@@ -101,7 +101,66 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 - 28-byte hash types (DRep keys, pool voter keys, required signers) must be padded to 32 bytes via `Hash28::to_hash32_padded()` — do not use `Hash<32>::from()` directly on 28-byte hashes
 
 ## Current Focus
-**v2.5.0 (2026-08-03)** — release-gate coverage wave. **RE-SYNC RELEASE:
+**v2.5.1 (2026-08-03)** — P0 hotfix. Drop-in from v2.5.0, SNAPSHOT unchanged
+at 32. Closes #985 (found in the field by a tester) and #971-#976 + #984 (the
+fuzz-coverage backlog, PR #982).
+
+### #985 — a canonical Conway block rejected as a non-active overlay slot
+A v2.5.0 preview BP rejected canonical block 4535827 as
+`NotActiveOverlaySlot`, cached it in `invalid_cache`, and then refused every
+descendant (`StoreButDontChange`) for the rest of the process lifetime — no
+self-healing, while its forge loop kept running against a corrupted ledger.
+Three defects, all three now closed:
+
+- **The LedgerSeq was never re-anchored after a bulk ledger advance.** It is
+  anchored once in `Node::new`, BEFORE replay; startup replay, the rollback
+  snapshot slow path and the gap-bridge all move `ledger_state` without
+  pushing deltas. `startup::recover_ledger_seq` and `LedgerSeq::reset_anchor`
+  both existed with **zero production callers** — dead code that read as an
+  implemented feature. The SNAPSHOT 31->32 quarantine is what made it a P0:
+  `Node::new` falls back to `init_fresh_ledger`, so the stale anchor is
+  *genesis* (preview: PV 6, d = 1/1, 7 genDelegs).
+- **`rollback_via_seq` then installed a chimera.** Reconstruction from a stale
+  anchor is CURRENT in every field a delta touches (tip/slot — so the
+  forecast-horizon check passed and nothing upstream noticed) and STALE in
+  every field none does. `advance_anchor` does not save you: it folds tip
+  deltas INTO the genesis anchor, so pparams stay at genesis forever.
+- **The overlay gate keyed off ledger pparams, not the block's era.** With
+  PV 6 / d = 1 / delegates present, all three terms held on a PV 11 chain.
+  d=1 ⇒ every slot is an overlay slot; slot 119084816 is offset 25616 in
+  epoch 1378 and `25616 % 20 = 16` ⇒ `NonActiveSlot`. The arithmetic
+  reproduces the log to the slot.
+
+Fix: `Era::uses_tpraos()` leads a single shared
+`should_build_overlay_context` (the condition existed in TWO hand-written
+copies, only one current — the recurring N-copies trap);
+`Node::reanchor_ledger_seq` at all three bulk sites; `LedgerDelta::parent_point`
++ `LedgerSeq::incoherent` so `find_rollback_n` declines rather than
+reconstructing; and **self-heal** at the live apply path, so a future missed
+re-anchor costs ONE BLOCK, not the process lifetime.
+
+**Haskell (oracle-verified, cardano-ledger `4f7cb2d6…`, ouroboros-consensus
+`release-ouroboros-consensus-3.0.1.0`)**: `HFEras` binds `TPraos` to
+Shelley-Alonzo and `Praos` to Babbage+ at the TYPE level; Praos's
+`updateChainDepState` is only KES+VRF, its `PraosValidationErr` has 11
+constructors and none is overlay-related, and its `LedgerView` carries neither
+`d` nor `GenDelegs`. A Conway header can never be overlay-rejected upstream.
+The same check **corrected a wrong assumption**: `AnchoredSeq` does NOT
+enforce chaining (no hash-chain concept; `(:>)` appends unconditionally —
+`isValidSuccessorOf` is on `AnchoredFragment`, the block layer). Upstream
+`LedgerSeq` is coherent BY CONSTRUCTION (`reapplyBlock` derives from
+`currentHandle db`), which is exactly why dugite needs a guard where upstream
+needs none. Do not "align" this away.
+
+**Testing caveat — the devnet is structurally blind to this** (it runs PV >= 7,
+so the chimera's symptom cannot appear). A green devnet-validate is NOT
+evidence. Live signal: a node applying blocks WITHOUT logging `LedgerSeq was
+incoherent at block apply` is positive evidence the startup re-anchor fired.
+Both fix layers were confirmed RED before green by disarming them — with the
+guard off, `rollback_via_seq` returns `Some(1)` and leaves `pv_after = 6` on a
+PV 11 ledger.
+
+### Superseded: v2.5.0 (2026-08-03) — release-gate coverage wave. **RE-SYNC RELEASE:
 SNAPSHOT_VERSION 31 -> 32.** Closes #953-#961 (the #962 audit backlog) plus
 #965, #966, #968, #978.
 
