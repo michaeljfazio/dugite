@@ -1008,14 +1008,12 @@ mod tests {
                     stake: 1_000_000_000,
                     vrf_keyhash: vec![0x11; 32],
                     total_circulation: 54_000_000_000_000_000,
-                    total_active_stake: 3_000_000_000,
                 },
                 StakePoolSnapshot {
                     pool_id: vec![0xbb; 28],
                     stake: 2_000_000_000,
                     vrf_keyhash: vec![0x22; 32],
                     total_circulation: 54_000_000_000_000_000,
-                    total_active_stake: 3_000_000_000,
                 },
             ],
             ..Default::default()
@@ -1375,30 +1373,38 @@ mod tests {
     #[test]
     fn test_query_handler_pool_distr() {
         let mut handler = QueryHandler::new(11);
+        // `GetPoolDistr` answers from the frozen `set` snapshot, not from
+        // `stake_pools` (#964) — populating only the latter used to satisfy
+        // this test while the query it names read a different field.
         handler.update_state(NodeStateSnapshot {
-            stake_pools: vec![
-                StakePoolSnapshot {
+            pool_distr: vec![
+                crate::node::n2c_query::types::PoolDistrEntry {
                     pool_id: vec![0xaa; 28],
                     stake: 1_000_000_000,
                     vrf_keyhash: vec![0x11; 32],
-                    total_circulation: 54_000_000_000_000_000,
-                    total_active_stake: 3_000_000_000,
+                    delegator_count: 4,
                 },
-                StakePoolSnapshot {
+                crate::node::n2c_query::types::PoolDistrEntry {
                     pool_id: vec![0xbb; 28],
                     stake: 2_000_000_000,
                     vrf_keyhash: vec![0x22; 32],
-                    total_circulation: 54_000_000_000_000_000,
-                    total_active_stake: 3_000_000_000,
+                    delegator_count: 7,
                 },
             ],
+            pool_distr_total_active_stake: 3_000_000_000,
             ..Default::default()
         });
 
         // Tag 21: GetPoolDistr
         match query(&handler, 21) {
-            QueryResult::PoolDistr(pools) => {
+            QueryResult::PoolDistr {
+                pools,
+                total_active_stake,
+            } => {
                 assert_eq!(pools.len(), 2);
+                // The `set` snapshot's own total, not a value re-derived from
+                // whatever survived the filter.
+                assert_eq!(total_active_stake, 3_000_000_000);
             }
             other => panic!("Expected PoolDistr, got {other:?}"),
         }

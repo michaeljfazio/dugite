@@ -250,20 +250,19 @@ pub(crate) fn encode_query_result_value(
         } => {
             encode_constitution(enc, url, data_hash, script_hash.as_deref());
         }
-        QueryResult::PoolDistr(pools) => {
+        QueryResult::PoolDistr {
+            pools,
+            total_active_stake,
+        } => {
             // Wire format: Map<pool_hash(28), IndividualPoolStake>
             // IndividualPoolStake: array(2) [tag(30)[num,den], vrf_hash(32)]
-            enc.map(pools.len() as u64).ok();
-            for pool in pools {
-                enc.bytes(&pool.pool_id).ok();
-                enc.array(2).ok();
-                // Rational as tag(30) [numerator, denominator]
-                enc.tag(minicbor::data::Tag::new(30)).ok();
-                enc.array(2).ok();
-                enc.u64(pool.stake).ok();
-                enc.u64(pool.total_active_stake.max(1)).ok();
-                enc.bytes(&pool.vrf_keyhash).ok();
-            }
+            //
+            // Deprecated at N2C V21 in favour of tag 36, and upstream answers
+            // it by delegating to `GetPoolDistr2` with the same argument
+            // (`fromLedgerPoolDistr $ answerPureBlockQuery cfg (GetPoolDistr2
+            // mPoolIds)`), so it reads the same `set`-snapshot distribution and
+            // applies the same zero-delegator filter (#964).
+            encode_pool_distr_legacy(enc, pools, *total_active_stake);
         }
         QueryResult::StakeDelegDeposits(deposits) => {
             // Wire format: Map<Credential, Coin>
@@ -407,6 +406,12 @@ pub(crate) fn encode_query_result_value(
             total_active_stake,
         } => {
             encode_pool_distr2(enc, pools, *total_active_stake);
+        }
+        QueryResult::StakeDistribution2 {
+            pools,
+            total_active_stake,
+        } => {
+            encode_stake_distribution2(enc, pools, *total_active_stake);
         }
         QueryResult::MaxMajorProtocolVersion(v) => {
             // Plain integer
@@ -881,30 +886,114 @@ fn encode_pool_state(
     }
 }
 
-fn encode_pool_distr2(
+/// `GetStakeDistribution2` (tag 37) — `poolsByTotalStakeFraction`.
+///
+/// Wire-identical to `encode_pool_distr2` but a different computation, and the
+/// two must not be merged back together (#964).
+///
+///   poolsByTotalStakeFraction globals nes = PoolDistr poolsByTotalStake totalActiveStake
+///     where stakeRatio  = totalActiveStake %? getTotalStake globals nes
+///           poolsByTotalStake = Map.map (\(IndividualPoolStake s c vrf) ->
+///                                 IndividualPoolStake (s * stakeRatio) c vrf) ...
+///
+/// `s` is already `stake / activeStake`, so `s * (activeStake / circulation)`
+/// is `stake / circulation` — which is what #905 established and what this
+/// encoder writes. `individualTotalPoolStake` and `pdTotalActiveStake` are NOT
+/// rescaled; only the ratio is. `currentSnapshot` is built from the LIVE
+/// instant stake, so `stake_pools` (live) is the right source here.
+fn encode_stake_distribution2(
     enc: &mut minicbor::Encoder<&mut Vec<u8>>,
     pools: &[crate::node::n2c_query::types::StakePoolSnapshot],
     total_active_stake: u64,
 ) {
-    // SL.PoolDistr: array(2)[pool_map, total_active_stake]
-    // Each pool entry: array(3)[stake_rational, compact_lovelace, vrf_hash]
     enc.array(2).ok();
-    // See the GetStakeDistribution arm: the rational is the pool's share of
-    // TOTAL CIRCULATING stake, reduced; `individualTotalPoolStake` and
-    // `pdTotalActiveStake` stay ACTIVE-stake based (Wallet.hs:185-201 is
-    // explicit that only the ratio is rescaled). Zero-delegator pools omitted.
     let live: Vec<_> = pools.iter().filter(|p| p.stake > 0).collect();
     enc.map(live.len() as u64).ok();
     for pool in live {
         enc.bytes(&pool.pool_id).ok();
         enc.array(3).ok();
         encode_reduced_rational(enc, pool.stake, pool.total_circulation);
-        // compact lovelace (absolute pool stake) — active-stake based
         enc.u64(pool.stake).ok();
-        // VRF key hash
         enc.bytes(&pool.vrf_keyhash).ok();
     }
-    // total active stake (pdTotalActiveStake stays active-stake based)
+    enc.u64(total_active_stake).ok();
+}
+
+/// `GetPoolDistr` (tag 21) — the pre-V21 wire shape of the same distribution.
+///
+/// `IndividualPoolStake` here is `array(2)` (ratio + VRF hash) rather than
+/// tag 36's `array(3)`, but the DATA is identical: same `set` snapshot, same
+/// `spssStake / ssTotalActiveStake` ratio, same zero-delegator filter.
+fn encode_pool_distr_legacy(
+    enc: &mut minicbor::Encoder<&mut Vec<u8>>,
+    pools: &[crate::node::n2c_query::types::PoolDistrEntry],
+    total_active_stake: u64,
+) {
+    let total = total_active_stake.max(1);
+    let included: Vec<_> = pools.iter().filter(|p| p.delegator_count > 0).collect();
+    enc.map(included.len() as u64).ok();
+    for pool in included {
+        enc.bytes(&pool.pool_id).ok();
+        enc.array(2).ok();
+        // Reduced, like every other rational on this wire: a Haskell `Rational`
+        // is in lowest terms by construction (`%` normalises), and
+        // `spssStakeRatio` is built with `%.`. This arm wrote the raw
+        // numerator/denominator, so it disagreed with tag 36 byte-for-byte even
+        // once both used the same denominator.
+        encode_reduced_rational(enc, pool.stake, total);
+        enc.bytes(&pool.vrf_keyhash).ok();
+    }
+}
+
+fn encode_pool_distr2(
+    enc: &mut minicbor::Encoder<&mut Vec<u8>>,
+    pools: &[crate::node::n2c_query::types::PoolDistrEntry],
+    total_active_stake: u64,
+) {
+    // SL.PoolDistr: array(2)[pool_map, total_active_stake]
+    // Each pool entry: array(3)[stake_rational, compact_lovelace, vrf_hash]
+    enc.array(2).ok();
+    //
+    // #964: the ratio is `spssStakeRatio = spssStake / ssTotalActiveStake` of
+    // the `set` snapshot, with NO rescale.
+    //
+    //   calculatePoolDistr' includeHash (SnapShot _ activeStake stakePoolSnapShot) =
+    //     ... IndividualPoolStake { individualPoolStake = spssStakeRatio spss, ... }
+    //     ... pdTotalActiveStake = activeStake
+    //
+    // This used to divide by TOTAL CIRCULATION, citing the
+    // `GetStakeDistribution` arm. That citation is real but belongs to a
+    // *different* function: `poolsByTotalStakeFraction` (tag 37) computes
+    // `calculatePoolDistr` and then rescales every ratio by
+    // `totalActiveStake / circulation`, which is #905. `calculatePoolDistr'`
+    // (tags 21/36) performs no such rescale.
+    //
+    // Since circulation ≫ active stake, the wrong denominator shrank σ by that
+    // whole factor — and `cardano-cli query leadership-schedule` reads σ
+    // straight out of this answer, so a pool was told it led roughly half the
+    // slots cardano-node said it led.
+    //
+    // Note the two encoders DISAGREED with each other: the tag-21 arm above
+    // divides by `total_active_stake` and is right, while tag 36 — the only
+    // one a V21+ client can reach, since tag 21 is deprecated there — was
+    // wrong. The reachable arm broken and the dead arm correct is the #978
+    // inversion, again.
+    //
+    // `guard (spssNumDelegators spss > 0)` drops pools with NO DELEGATORS, not
+    // pools with no stake: a pool with delegators whose stake is zero stays in
+    // the map at ratio 0.
+    let included: Vec<_> = pools.iter().filter(|p| p.delegator_count > 0).collect();
+    enc.map(included.len() as u64).ok();
+    for pool in included {
+        enc.bytes(&pool.pool_id).ok();
+        enc.array(3).ok();
+        encode_reduced_rational(enc, pool.stake, total_active_stake.max(1));
+        // `individualTotalPoolStake` — the pool's absolute stake.
+        enc.u64(pool.stake).ok();
+        // `individualPoolStakeVrf`.
+        enc.bytes(&pool.vrf_keyhash).ok();
+    }
+    // `pdTotalActiveStake`.
     enc.u64(total_active_stake).ok();
 }
 
@@ -2664,13 +2753,28 @@ pub(crate) fn encode_ledger_peer_snapshot_v23_all(
 // 32-byte hashes causes cardano-cli to reject with "hash bytes wrong size".
 //
 // See GitHub issue #97.
+/// Strip the `MsgResult [4, [payload]]` + HFC success wrappers from a full
+/// `encode_query_result` output, leaving the inner payload.
+///
+/// Shared with sibling test modules (`stake.rs` asserts on the encoded σ, which
+/// is the only place the #964 denominator is observable).
+#[cfg(test)]
+pub(crate) fn strip_wrappers_for_test(cbor: &[u8]) -> Vec<u8> {
+    let mut dec = minicbor::Decoder::new(cbor);
+    dec.array().unwrap();
+    dec.u32().unwrap(); // 4 = MsgResult
+    dec.array().unwrap(); // HFC EitherMismatch success wrapper
+    cbor[dec.position()..].to_vec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::node::n2c_query::types::{
         CommitteeMemberSnapshot, CommitteeSnapshot, DRepDelegationGroup, DRepKey, DRepSnapshot,
-        DRepStakeEntry, PoolParamsSnapshot, PoolStakeSnapshotEntry, StakeAddressSnapshot,
-        StakeDelegDepositEntry, StakePoolSnapshot, StakeSnapshotsResult, VoteDelegateeEntry,
+        DRepStakeEntry, PoolDistrEntry, PoolParamsSnapshot, PoolStakeSnapshotEntry,
+        StakeAddressSnapshot, StakeDelegDepositEntry, StakePoolSnapshot, StakeSnapshotsResult,
+        VoteDelegateeEntry,
     };
     use minicbor::Decoder;
 
@@ -2769,7 +2873,6 @@ mod tests {
             pool_id: vec![0xAB; 28],
             stake: 1_000_000,
             vrf_keyhash: vec![0u8; 32],
-            total_active_stake: 1_000_000,
             total_circulation: 54_000_000_000_000_000,
         }]);
         let encoded = encode_query_result(&result);
@@ -2789,13 +2892,15 @@ mod tests {
 
     #[test]
     fn test_pool_distr_pool_id_is_28_bytes() {
-        let result = QueryResult::PoolDistr(vec![StakePoolSnapshot {
-            pool_id: vec![0xCD; 28],
-            stake: 500_000,
-            vrf_keyhash: vec![0u8; 32],
+        let result = QueryResult::PoolDistr {
+            pools: vec![PoolDistrEntry {
+                pool_id: vec![0xCD; 28],
+                stake: 500_000,
+                vrf_keyhash: vec![0u8; 32],
+                delegator_count: 1,
+            }],
             total_active_stake: 1_000_000,
-            total_circulation: 54_000_000_000_000_000,
-        }]);
+        };
         let encoded = encode_query_result(&result);
         let inner = strip_wrappers(&encoded);
 
@@ -3183,12 +3288,11 @@ mod tests {
     #[test]
     fn test_pool_distr2_pool_id_is_28_bytes() {
         let result = QueryResult::PoolDistr2 {
-            pools: vec![StakePoolSnapshot {
+            pools: vec![PoolDistrEntry {
                 pool_id: vec![0x78; 28],
                 stake: 1_000_000,
                 vrf_keyhash: vec![0u8; 32],
-                total_active_stake: 2_000_000,
-                total_circulation: 54_000_000_000_000_000,
+                delegator_count: 1,
             }],
             total_active_stake: 2_000_000,
         };
