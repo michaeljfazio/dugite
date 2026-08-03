@@ -79,7 +79,7 @@ If `cardano-node` is older than 11.0.1, abort: PV10 conway-genesis rejects it. S
 
 Before running rounds, understand what each round contributes to the overall coverage charter. The skill exercises six orthogonal axes (see `references/test-methodology.md` for the full catalogue):
 
-1. **Tx-type** — every Conway tx class (85 zoo scripts spanning bookkeeping, native, Plutus V1/V2/V3, stake, gov certs, gov proposals, voting, gov lifecycle, mempool, post-enactment — the 19 phase-1 negatives are among them).
+1. **Tx-type** — every Conway tx class (105 zoo scripts spanning bookkeeping, native, Plutus V1/V2/V3, stake, gov certs, gov proposals, voting, gov lifecycle, mempool, post-enactment, script purposes, gov negatives, asset lattice — the 19 phase-1 negatives are among them). The authoritative count is `tx_zoo.expected_scripts` in `schemas/denominators.json`.
 2. **Validity** — every positive class has a matched negative; both must be classified identically by dugite and Haskell.
 3. **Submit-path** — txs submitted to **every** N2C ingestion socket: `dugite-bp.sock`, `dugite-relay.sock`, `cardano-bp.sock` (override via `ZOO_SOCKET=...`), plus `dugite-cli` vs `cardano-cli` on each. Also the UTxO RPC gRPC `submit_tx` (when `--rpc-port` is enabled).
 4. **Propagation-direction** — observe each tx at every node (mempool + ledger), in both forward (dugite-bp → relay → cardano-bp) and reverse (cardano-bp → relay → dugite-bp) directions through the hub.
@@ -89,10 +89,13 @@ Before running rounds, understand what each round contributes to the overall cov
 The **bidirectional parity oracle** is the most important predicate this skill
 enforces: *for every transaction T, dugite and Haskell must reach the same
 accept/reject decision regardless of which node ingested it first.* Off-diagonal
-cells (one accepts, the other rejects) are P0 bugs. It covers **79 of the 85 zoo
-scripts** (9 categories); the matrix lands in `evidence/<ts>/parity-matrix.csv`
+cells (one accepts, the other rejects) are P0 bugs. It covers **79 zoo scripts**
+across 9 categories; the matrix lands in `evidence/<ts>/parity-matrix.csv`
 with a `parity-matrix.meta.json` sidecar carrying the denominator the invocation
 intended to cover.
+
+It runs in **its own round on its own devnet** — see "Round 1p". Running it
+alongside Round 1's full zoo breaks both.
 
 Matrix verdicts:
 
@@ -148,17 +151,9 @@ sleep 30                            # let the chain advance past slot 0
 EVD="$LD_EVIDENCE/round1-$(date -u +%Y%m%dT%H%M%SZ)"; mkdir -p "$EVD"
 
 ./tx-zoo/run-all.sh --setup         # ~20s — keys + plutus binaries (one-time per setup)
-EVIDENCE_DIR="$EVD" ./tx-zoo/run-all.sh   # ~3-5 min — all 85 tx scripts (via dugite-relay socket)
-# Bidirectional parity — re-run against the Haskell socket too (catches
-# accept-set asymmetry; see references/test-methodology.md "parity oracle").
-# Writes parity-matrix.csv + parity-matrix.meta.json (the meta carries the
-# denominator this invocation intended to cover).
-# With no categories named it uses the STANDARD set from
-# schemas/denominators.json (9 categories, 79 scripts). Naming categories at
-# the call site is how it stayed at 4 categories / 41 scripts while the notes
-# said "41/41" without ever stating the zoo has 85 (#954).
-../../.claude/skills/devnet-validate/scripts/bidirectional-parity.sh \
-    --out "$EVD/parity-matrix.csv"
+EVIDENCE_DIR="$EVD" ./tx-zoo/run-all.sh   # ~15 min — all 105 tx scripts (via dugite-relay socket)
+# NB: the bidirectional parity oracle deliberately does NOT run in this round.
+# See "Round 1p" below — it needs its own devnet.
 ./tx-zoo/09-cli-parity/run.sh "$EVD"   # ~1 min — 22 LSQ parity checks; writes cli-parity.csv
 ./tx-zoo/cross-validate-cli.sh         # ~1 min — dugite-cli ↔ cardano-cli submit parity
 ./protocols/run.sh "$EVD"              # ~2 min — adversarial N2N framing; writes n2n-trace.csv
@@ -198,7 +193,7 @@ tail -F logs/cardano-bp.log   | grep -E 'AddedToCurrentChain|AddBlockValidation\
 ```
 
 **Round 1 PASSES iff** all of:
-- `tx-zoo/state/results.csv` shows 85 rows with 0 FAIL (`04g-reward-withdrawal` state-skips until rewards mature — see #958; V3 scripts need `aiken` on PATH)
+- `tx-zoo/state/results.csv` shows 105 rows with 0 FAIL (`04g-reward-withdrawal` state-skips until rewards mature — see #958; V3 scripts need `aiken` on PATH). 105 is the pin in `schemas/denominators.json`; if you see 85 quoted anywhere it is stale
 - `verify.sh` reports 4/4 predicates pass
 - Zero invalid-block events in `logs/cardano-bp.log` (match BOTH legacy `TraceForgedInvalidBlock` and cardano-node 11.x `ChainDB.AddBlockEvent.AddBlockValidation.InvalidBlock` / `Forge.Loop.ForgedInvalidBlock`)
 - `dugite_tip_age_seconds` stays <5 throughout the soak
@@ -209,8 +204,54 @@ tail -F logs/cardano-bp.log   | grep -E 'AddedToCurrentChain|AddBlockValidation\
 - `evidence/<ts>/n2n-trace.csv` has zero PANIC or SILENT_SKIP rows
 - `evidence/<ts>/chaos-events.csv` has zero FAIL rows, and any `ENV_SKIP` row is
   a surface that was **not** exercised — investigate rather than accept it
-- Bidirectional parity wrapper (`bidirectional-parity.sh`, no args = the pinned standard set of 9 categories / 79 scripts) exits 0 — zero `OFFDIAG` and zero unexplained `CLASSDIFF` rows in `evidence/<ts>/parity-matrix.csv`
 - `tx-zoo/state/cross-validate.csv` shows PASS for every representative tx submitted through `dugite-cli`
+
+### Round 1p — Bidirectional parity oracle (~35 min, its own devnet)
+
+**The oracle needs a devnet to itself.** It re-executes the zoo twice, once per
+socket. Stacking that on top of Round 1's own 105-script run puts ~263 script
+executions on a single devnet, and that reliably breaks the round in two ways
+(observed 2026-08-02 and again on 2026-08-03 during the v2.5.1 gate):
+
+1. **The oracle's second batch cannot fund itself.** cardano-node rejects the
+   funding tx with `ConwayMempoolFailure "All inputs are spent. Transaction has
+   probably already been included"`, and **no `parity-matrix.csv` is written at
+   all** — the suite contributes nothing rather than a partial matrix.
+2. **cardano-bp parks at a stale block (#980)** and never recovers. Every
+   tip-sensitive suite after that point records `TIP_UNSTABLE` skips, i.e.
+   becomes *unmeasurable* rather than failing.
+
+Splitting it out costs no coverage: the same 79 scripts still run through both
+sockets, and the standard preset manifest scopes `parity-matrix.csv` as `any`
+(required in *at least one* round, never every round).
+
+```bash
+cd testnet/local-devnet
+. ./lib/common.sh
+./setup.sh && ./run.sh && sleep 30
+EVD="$LD_EVIDENCE/round1p-$(date -u +%Y%m%dT%H%M%SZ)"; mkdir -p "$EVD"
+./tx-zoo/run-all.sh --setup
+# No full zoo run here — the oracle runs it twice itself.
+# With no categories named it uses the STANDARD set from
+# schemas/denominators.json (9 categories, 79 scripts). Naming categories at
+# the call site is how it stayed at 4 categories / 41 scripts while the notes
+# said "41/41" (#954).
+../../.claude/skills/devnet-validate/scripts/bidirectional-parity.sh \
+    --out "$EVD/parity-matrix.csv"
+EVIDENCE_DIR="$EVD" ./soak.sh 120      # so the round produces report.md and is reportable
+./verify.sh "$EVD"
+./stop.sh
+```
+
+**Round 1p PASSES iff** `bidirectional-parity.sh` exits 0 — zero `OFFDIAG` and
+zero unexplained `CLASSDIFF` rows in `evidence/<ts>/parity-matrix.csv`, and the
+matrix actually exists with its pinned row count.
+
+> Diagnosing a suspected #980 stall: a single tip comparison is not enough. Both
+> nodes reading the same slot can mean "in parity" **or** "both stopped, one
+> about to move on" — that ambiguity cost 25 minutes on 2026-08-03. The
+> fingerprint is a pair that is each internally stable and differs across nodes,
+> e.g. `dugite 1338->1338, cardano 1082->1082`. Sample twice, seconds apart.
 
 ### Round 2 — Epoch-boundary stress (~15 min)
 
@@ -446,7 +487,7 @@ The harness now covers 9 dimensions across 3 intensity presets:
 | Dim | Capability | Smoke | Standard | Extended |
 |-----|------------|-------|----------|----------|
 | D1 | Forge & adoption | 1 epoch | 2 epochs | 5 epochs |
-| D2 | Tx surface | 08-negative subset | 85 scripts (19 negatives) + parity oracle over 79 | + CBOR fuzz |
+| D2 | Tx surface | 08-negative subset | 105 scripts (19 negatives) + parity oracle over 79, own devnet | + CBOR fuzz |
 | D3 | N2N adversarial | handshake only | + all 7 protocol scripts | + slow-loris |
 | D4 | N2C CLI parity | 3 queries | 22 queries (09a–09v), all compared | all |
 | D5 | Sync paths | from-relay-tip | + bulk-throughput | + from-genesis + Mithril |
