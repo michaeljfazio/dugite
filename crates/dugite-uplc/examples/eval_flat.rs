@@ -2,7 +2,8 @@
 //! `DUGITE_DUMP_APPLIED_DIR`, see `eval_redeemer.rs`) in Haskell "counting"
 //! mode with the DEFAULT cost model, printing the result shape and consumed
 //! budget. Used to cross-check dugite's CEK against external reference
-//! evaluators (Haskell `uplc evaluate --counting`, `aiken uplc eval`) on the
+//! evaluator (Haskell `uplc evaluate --counting` — the authoritative one; see
+//! #970 on why a third-party evaluator is not a reference) on the
 //! same term when root-causing a budget divergence offline.
 //!
 //! Usage: `cargo run -p dugite-uplc --example eval_flat -- <file.flat> [A|B|C|D|E]`
