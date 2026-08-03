@@ -34,14 +34,22 @@ PASSED=0; FAILED=0
 
 # Pinned counts, so fixtures track the manifest instead of drifting from it.
 ZOO_N=$(jq -r '.tx_zoo.expected_scripts // 85' "$DENOM" 2>/dev/null || echo 85)
-CHAOS_N=$(jq -r '.chaos.expected_cases // 6' "$DENOM" 2>/dev/null || echo 6)
+# `expected_cases` was split into per-preset keys by #959; reading the retired
+# name silently fell back to the literal default, which is the same
+# fixture-drifts-from-manifest failure this block exists to prevent.
+CHAOS_N=$(jq -r '.chaos.expected_cases_standard // .chaos.expected_cases // 5' "$DENOM" 2>/dev/null || echo 5)
 RPC_N=$(jq -r '.rpc.expected_checks // 27' "$DENOM" 2>/dev/null || echo 27)
-CLI_N=$(jq -r '.cli_parity.expected_queries // 22' "$DENOM" 2>/dev/null || echo 22)
+# ROWS, not scripts: two cli-parity scripts emit a second assertion row each
+# (#963's parity_assert_pool_filter), and the gate counts rows.
+CLI_N=$(jq -r '.cli_parity.expected_rows // .cli_parity.expected_queries // 24' "$DENOM" 2>/dev/null || echo 24)
 
 # ---- Synthetic evidence builders --------------------------------------------
 # Build one round dir that satisfies the standard preset completely.
 make_round() { # make_round <dir> <n2n_rows> <cli_rows> <parity_rows>
-    local d="$1" n2n="${2:-26}" cli="${3:-22}" par="${4:-41}"
+    # Defaults come from the manifest, never from a literal — a hardcoded 22
+    # here is exactly the drift the pinned counts above exist to prevent, and
+    # it is what made this suite red when the cli-parity pin moved to rows.
+    local d="$1" n2n="${2:-26}" cli="${3:-$CLI_N}" par="${4:-41}"
     mkdir -p "$d/logs"
 
     cat > "$d/metadata.json" <<'EOF'
@@ -103,8 +111,12 @@ EOF
 {"expected": $par, "total": $par, "match": $par, "offdiag": 0, "classdiff": 0, "categories": ["01-bookkeeping"]}
 EOF
 
-    { echo "ts,scenario,action,recovery_sec,result"
-      for i in $(seq 1 "$CHAOS_N"); do echo "2026-08-02T00:00:01Z,scenario$i,act,5,PASS"; done
+    # `detail` TRAILS `result` — this is the real layout, and reproducing it is
+    # the whole point: the fixture used to stop at `result`, so the last column
+    # WAS the verdict and `$NF` looked correct here while being wrong in
+    # production. A fixture that cannot express the bug cannot catch it (#987).
+    { echo "ts,scenario,action,recovery_seconds,result,detail"
+      for i in $(seq 1 "$CHAOS_N"); do echo "2026-08-02T00:00:01Z,scenario$i,act,5,PASS,tip_before=1 tip_after=1"; done
     } > "$d/chaos-events.csv"
 
     # rpc.csv (#960). Read from the manifest like ZOO_N/CHAOS_N so the fixture
@@ -232,7 +244,7 @@ run_case "cli-parity full of rows but mostly SKIPPED fails" 3 "below the pinned"
 
 # --- Case 6: cli-parity short of its denominator (finding 5) ---
 R1="$TMP/short-cli/r1"; R2="$TMP/short-cli/r2"
-make_round "$R1" 26 18; make_round "$R2" 26 18
+make_round "$R1" 26 "$(( CLI_N - 4 ))"; make_round "$R2" 26 "$(( CLI_N - 4 ))"
 run_case "cli-parity below pinned denominator fails" 3 "below the pinned" "$R1" "$R2"
 
 # --- Case 7: --no-strict records the omission instead of hiding it ---
@@ -271,6 +283,103 @@ else
     printf '  \033[31mFAIL\033[0m  %-52s (%s zero-valued)\n' "absent suites serialize as null, never 0" "$zeros"
     FAILED=$(( FAILED + 1 ))
 fi
+
+# --- Case 8a: every verdict column is resolved by NAME, not by position ---
+#
+# #987 closed one instance of "the verdict column moved and the count silently
+# went to zero". This closes the CLASS: shuffle a trailing field into every
+# verdict CSV and require the counts to be unchanged. Under positional reads
+# each of these lands on the wrong field, matches nothing, and serializes a
+# clean sweep — which is exactly how "chaos 5/5" survived five releases.
+R1="$TMP/colshuffle/r1"
+make_round "$R1"
+# Insert a new column immediately BEFORE each verdict column, so a positional
+# read is off by one in the direction that finds free text.
+python3 - "$R1" <<'PYEOF'
+import csv, sys, pathlib
+d = pathlib.Path(sys.argv[1])
+for name, verdict in [("chaos-events.csv", "result"),
+                      ("n2n-trace.csv", "outcome"),
+                      ("rpc.csv", "status"),
+                      ("cli-parity.csv", "status"),
+                      ("parity-matrix.csv", "match")]:
+    f = d / name
+    rows = list(csv.reader(f.open()))
+    i = rows[0].index(verdict)
+    rows[0].insert(i, "injected_column")
+    for r in rows[1:]:
+        r.insert(i, "PASS")          # decoy that a positional read would match
+    with f.open("w", newline="") as fh:
+        csv.writer(fh).writerows(rows)
+PYEOF
+"$GEN" --preset standard --no-strict --output-dir "$TMP/out-shuf" --denominators "$DENOM" "$R1" >/dev/null 2>&1
+shuf_ok=1
+read -r sh_chaos sh_n2n sh_rpc sh_cli sh_pm <<EOF2
+$(jq -r '[.rounds[0].chaos.pass, .rounds[0].n2n_adversarial.pass,
+          .rounds[0].rpc.pass, .rounds[0].cli_parity.equal,
+          .rounds[0].parity_matrix.match] | @tsv' "$TMP/out-shuf/report.json" 2>/dev/null)
+EOF2
+[ "${sh_chaos:-0}" = "$CHAOS_N" ] || shuf_ok=0
+[ "${sh_n2n:-0}"   = "26" ]       || shuf_ok=0
+[ "${sh_rpc:-0}"   = "$RPC_N" ]   || shuf_ok=0
+[ "${sh_cli:-0}"   = "$CLI_N" ]   || shuf_ok=0
+[ "${sh_pm:-0}"    = "41" ]       || shuf_ok=0
+if [ "$shuf_ok" -eq 1 ]; then
+    printf '  \033[32mPASS\033[0m  %-52s\n' "verdict columns survive a column being inserted"
+    PASSED=$(( PASSED + 1 ))
+else
+    printf '  \033[31mFAIL\033[0m  %-52s\n' "verdict columns survive a column being inserted"
+    printf '        chaos=%s (want %s) n2n=%s (want 26) rpc=%s (want %s) cli=%s (want %s) parity=%s (want 41)\n' \
+           "$sh_chaos" "$CHAOS_N" "$sh_n2n" "$sh_rpc" "$RPC_N" "$sh_cli" "$CLI_N" "$sh_pm"
+    FAILED=$(( FAILED + 1 ))
+fi
+
+# --- Case 8a2: a RENAMED verdict column is reported, not silently zeroed ---
+# The other direction. If the column cannot be found at all, the honest answer
+# is "cannot classify" on stderr and a count of 0 that the denominator gate then
+# rejects — never a clean sweep.
+R1="$TMP/colrename/r1"
+make_round "$R1"
+sed -i.bak '1s/,result,/,verdict,/' "$R1/chaos-events.csv" && rm -f "$R1/chaos-events.csv.bak"
+rename_err=$("$GEN" --preset standard --no-strict --output-dir "$TMP/out-ren" \
+                    --denominators "$DENOM" "$R1" 2>&1 >/dev/null || true)
+ren_pass=$(jq -r '.rounds[0].chaos.pass' "$TMP/out-ren/report.json" 2>/dev/null)
+if printf '%s' "$rename_err" | grep -q "no 'result' column" && [ "${ren_pass:-x}" = "0" ]; then
+    printf '  \033[32mPASS\033[0m  %-52s\n' "a renamed verdict column warns instead of passing"
+    PASSED=$(( PASSED + 1 ))
+else
+    printf '  \033[31mFAIL\033[0m  %-52s\n' "a renamed verdict column warns instead of passing"
+    printf '        chaos.pass=%s stderr=%s\n' "$ren_pass" "$(printf '%s' "$rename_err" | head -1)"
+    FAILED=$(( FAILED + 1 ))
+fi
+
+# --- Case 8a3: rows present but NONE classified is a gate-integrity failure ---
+# The residual hole after a renamed column: `total` is still the row count, so
+# `status` reads "ok" and the round passes with pass=0. Now generalised from
+# chaos to every verdict CSV, so any suite whose outcomes were never read is
+# reported rather than serialized as a clean sweep.
+for vf in chaos-events.csv n2n-trace.csv rpc.csv cli-parity.csv parity-matrix.csv; do
+    R1="$TMP/unclassified-${vf%%.*}/r1"; R2="$TMP/unclassified-${vf%%.*}/r2"
+    make_round "$R1"; make_round "$R2"
+    for d in "$R1" "$R2"; do
+        # Overwrite every verdict cell with a value outside the vocabulary,
+        # leaving the row count untouched.
+        python3 - "$d/$vf" <<'PYEOF'
+import csv, sys, pathlib
+f = pathlib.Path(sys.argv[1])
+rows = list(csv.reader(f.open()))
+hdr = {"chaos-events.csv": "result", "n2n-trace.csv": "outcome",
+       "rpc.csv": "status", "cli-parity.csv": "status",
+       "parity-matrix.csv": "match"}[f.name]
+i = rows[0].index(hdr)
+for r in rows[1:]:
+    r[i] = "unreadable"
+with f.open("w", newline="") as fh:
+    csv.writer(fh).writerows(rows)
+PYEOF
+    done
+    run_case "$vf with no classified rows fails the gate" 3 "none classified" "$R1" "$R2"
+done
 
 # --- Case 8b: CLASSDIFF rows are counted separately from OFFDIAG ---
 # "both rejected" is weaker than it looks: same verdict for a different reason

@@ -107,7 +107,10 @@ _denom() { # _denom <jq-path> <default>
     fi
 }
 EXP_TX_ZOO=$(_denom '.tx_zoo.expected_scripts' 0)
-EXP_CLI=$(_denom '.cli_parity.expected_queries' 0)
+# Rows, not scripts: two cli-parity scripts emit a second assertion row each
+# (#963's parity_assert_pool_filter), so a script count is a slack lower bound.
+EXP_CLI=$(_denom '.cli_parity.expected_rows' 0)
+[ "${EXP_CLI:-0}" -gt 0 ] || EXP_CLI=$(_denom '.cli_parity.expected_queries' 0)
 EXP_N2N=$(_denom '.n2n_adversarial.expected_cases' 0)
 # Chaos row count is PRESET-DEPENDENT: the standard set is 4 scenarios / 5
 # rows, extended adds network-partition + disk-full for 6. A single pin taken
@@ -188,6 +191,48 @@ _rows() { [ -f "$1" ] && [ -s "$1" ] && awk 'NR>1 && NF' "$1" | wc -l | tr -d ' 
 # Emit a suite status given actual vs expected. Echoes ok|short.
 _status_for() { # _status_for <actual> <expected>
     if [ "${2:-0}" -gt 0 ] && [ "${1:-0}" -lt "${2}" ]; then echo "short"; else echo "ok"; fi
+}
+
+# _col <csv> <header-name>  ->  1-based column index, or 0 if absent.
+#
+# Resolve every verdict column BY NAME. #987: chaos was classified with `$NF`
+# while its verdict lives in `result`, column 5 of 6, with `detail` trailing —
+# so `chaos.pass` and `chaos.fail` were structurally always 0 and a run in
+# which every scenario failed serialized `fail: 0, status: "ok"`. The pinned
+# `total` was the only real number, which is why "chaos 5/5" looked right in
+# every release note: 5 was the row count.
+#
+# That was the fourth occurrence of the family behind #916/#917/#945/#953/#959,
+# and it was living inside the #953 gate built to eliminate it. The instance is
+# fixed by resolving one column by name; the CLASS is only closed by resolving
+# ALL of them by name — n2n-trace (`outcome`, 7 of 8) and rpc (`status`, 5 of
+# 6) both have trailing columns and both happened to be right by index, which
+# is luck, not a property. Adding a column anywhere can no longer silently
+# re-break a count.
+_col() { # _col <csv> <header>
+    [ -f "$1" ] || { echo 0; return; }
+    awk -F, -v want="$2" 'NR==1{for(i=1;i<=NF;i++){h=$i; gsub(/^[ \t"]+|[ \t"\r]+$/,"",h); if(h==want){print i; exit}} print 0; exit}' "$1"
+}
+
+# _count_by <csv> <header> <value...>  -> rows whose <header> column equals any
+# <value>. Echoes the count; echoes 0 and warns to stderr if the header is
+# absent, so a renamed column reads as "cannot classify" rather than as a clean
+# sweep. Callers record the header failure in gate_integrity.
+_count_by() { # _count_by <csv> <header> <value>...
+    local csv="$1" header="$2"; shift 2
+    local col; col=$(_col "$csv" "$header")
+    if [ "${col:-0}" -eq 0 ]; then
+        echo "WARNING: $(basename "$csv") has no '$header' column — outcomes cannot be classified" >&2
+        echo 0
+        return
+    fi
+    awk -F, -v c="$col" -v vals="$*" '
+        BEGIN { n=split(vals, want, " "); }
+        NR>1 && NF {
+            v=$c; gsub(/^[ \t"]+|[ \t"\r]+$/,"",v)
+            for (i=1;i<=n;i++) if (v==want[i]) { c2++; next }
+        }
+        END { print c2+0 }' "$csv"
 }
 
 # ---- Per-round extraction ----------------------------------------------------
@@ -347,27 +392,34 @@ process_round() {
     local n2n_status="absent" n2n_pass="null" n2n_fail="null" n2n_panic="null" n2n_silent="null" n2n_total="null"
     local n2n_csv="$evd/n2n-trace.csv"
     if [ -f "$n2n_csv" ] && [ -s "$n2n_csv" ]; then
-        n2n_pass=$(awk -F, 'NR>1 && ($7=="PASS"||$7=="REJECTED") {c++} END{print c+0}' "$n2n_csv")
-        n2n_fail=$(awk -F, 'NR>1 && ($7=="PANIC"||$7=="SILENT_SKIP"||$7=="ERROR") {c++} END{print c+0}' "$n2n_csv")
-        n2n_panic=$(awk -F, 'NR>1 && $7=="PANIC" {c++} END{print c+0}' "$n2n_csv")
-        n2n_silent=$(awk -F, 'NR>1 && $7=="SILENT_SKIP" {c++} END{print c+0}' "$n2n_csv")
+        # `outcome` is column 7 of 8 — `detail` trails it, the same layout that
+        # made #987. Resolved by name so it stays right if a column is added.
+        n2n_pass=$(_count_by "$n2n_csv" outcome PASS REJECTED)
+        n2n_fail=$(_count_by "$n2n_csv" outcome PANIC SILENT_SKIP ERROR)
+        n2n_panic=$(_count_by "$n2n_csv" outcome PANIC)
+        n2n_silent=$(_count_by "$n2n_csv" outcome SILENT_SKIP)
         n2n_total=$(_rows "$n2n_csv")
         n2n_status=$(_status_for "$n2n_total" "$EXP_N2N")
     fi
 
     # --- D4: CLI parity ---
     # Columns: ts,query,status,dugite_sha256,cardano_sha256,equal,notes (7).
-    # `status` ($3) is authoritative — see #945 for what indexing off the header
-    # instead cost. env-skip vs state-skip are separated so a setup gap
+    # `status` is authoritative and is resolved by NAME — see #945 for what
+    # indexing off the header instead cost, and #987 for the same defect one
+    # layer down. env-skip vs state-skip are separated so a setup gap
     # ("pool1 id not found") is never mistaken for a compared query.
     local cp_status="absent" cp_equal="null" cp_div="null" cp_env="null" cp_state="null" cp_err="null" cp_total="null" cp_compared="null"
     local parity_csv="$evd/cli-parity.csv"
     if [ -f "$parity_csv" ] && [ -s "$parity_csv" ]; then
-        cp_equal=$(awk -F, 'NR>1 && $3=="EQUAL" {c++} END{print c+0}' "$parity_csv")
-        cp_div=$(awk -F, 'NR>1 && $3=="DIVERGENT" && $7!~/known-divergence/ {c++} END{print c+0}' "$parity_csv")
-        cp_env=$(awk -F, 'NR>1 && $3=="SKIP" && $7~/env-skip/ {c++} END{print c+0}' "$parity_csv")
-        cp_state=$(awk -F, 'NR>1 && $3=="SKIP" && $7!~/env-skip/ {c++} END{print c+0}' "$parity_csv")
-        cp_err=$(awk -F, 'NR>1 && $3=="ERROR" {c++} END{print c+0}' "$parity_csv")
+        local _cp_sc _cp_nc
+        _cp_sc=$(_col "$parity_csv" status); _cp_nc=$(_col "$parity_csv" notes)
+        cp_equal=$(_count_by "$parity_csv" status EQUAL)
+        # COMPARED rows are #963's direct property assertions rather than
+        # two-sided sha diffs; they are compared work and count as such.
+        cp_err=$(_count_by "$parity_csv" status ERROR)
+        cp_div=$(awk -F, -v s="$_cp_sc" -v n="$_cp_nc" 'NR>1 && s>0 && n>0 && $s=="DIVERGENT" && $n!~/known-divergence/ {c++} END{print c+0}' "$parity_csv")
+        cp_env=$(awk -F, -v s="$_cp_sc" -v n="$_cp_nc" 'NR>1 && s>0 && n>0 && $s=="SKIP" && $n~/env-skip/ {c++} END{print c+0}' "$parity_csv")
+        cp_state=$(awk -F, -v s="$_cp_sc" -v n="$_cp_nc" 'NR>1 && s>0 && n>0 && $s=="SKIP" && $n!~/env-skip/ {c++} END{print c+0}' "$parity_csv")
         cp_total=$(_rows "$parity_csv")
         # COMPARED, not merely emitted. A SKIP row means the query was never
         # actually run against both sockets, so counting it toward the
@@ -378,7 +430,9 @@ process_round() {
         # tx-zoo/parity load pushed cardano-bp behind, cli-parity skipped 18 of
         # 22 with `TIP_UNSTABLE after 20 attempts`, and the gate still said
         # "denominator: 22/22 queries OK".
-        cp_compared=$(awk -F, 'NR>1 && ($3=="EQUAL" || $3=="DIVERGENT" || $3=="ERROR") {c++} END{print c+0}' "$parity_csv")
+        # COMPARED is #963's direct per-socket property assertion rather than a
+        # two-sided sha diff; it is comparison work and counts as such.
+        cp_compared=$(_count_by "$parity_csv" status EQUAL DIVERGENT ERROR COMPARED)
         cp_status=$(_status_for "$cp_compared" "$EXP_CLI")
     fi
 
@@ -394,25 +448,29 @@ process_round() {
     local pm_meta="$evd/parity-matrix.meta.json"
     if [ -f "$pm_csv" ] && [ -s "$pm_csv" ]; then
         pm_total=$(_rows "$pm_csv")
-        pm_match=$(awk -F, 'NR>1 && $NF=="MATCH" {c++} END{print c+0}' "$pm_csv")
-        pm_offdiag=$(awk -F, 'NR>1 && $NF=="OFFDIAG" {c++} END{print c+0}' "$pm_csv")
-        pm_classdiff=$(awk -F, 'NR>1 && $NF=="CLASSDIFF" {c++} END{print c+0}' "$pm_csv")
-        pm_knowndiff=$(awk -F, 'NR>1 && $NF=="KNOWNDIFF" {c++} END{print c+0}' "$pm_csv")
-        pm_stateful=$(awk -F, 'NR>1 && $NF=="STATEFUL" {c++} END{print c+0}' "$pm_csv")
+        # `match` genuinely IS the last column today, so `$NF` was correct — but
+        # correct-by-luck is what #987 was. Resolved by name like every other
+        # verdict column, so adding a trailing field cannot silently zero these.
+        pm_match=$(_count_by "$pm_csv" match MATCH)
+        pm_offdiag=$(_count_by "$pm_csv" match OFFDIAG)
+        pm_classdiff=$(_count_by "$pm_csv" match CLASSDIFF)
+        pm_knowndiff=$(_count_by "$pm_csv" match KNOWNDIFF)
+        pm_stateful=$(_count_by "$pm_csv" match STATEFUL)
         # Category comes from column 2 when present (matrix schema >= #954).
         # Older matrices have no category column, so fall back to the script
         # name's numeric prefix (01a-simple-pay -> 01) rather than mis-reading
         # whatever happens to sit in field 2.
-        pm_percat=$(awk -F, '
+        local _pm_mc; _pm_mc=$(_col "$pm_csv" match)
+        pm_percat=$(awk -F, -v mc="$_pm_mc" '
             NR==1 { has_cat = ($2 == "category"); next }
             NF {
                 if (has_cat) pfx = $2
                 else { split($1, parts, "-"); pfx = parts[1]; gsub(/[a-z]+$/, "", pfx) }
                 t[pfx]++
-                if ($NF=="OFFDIAG")        o[pfx]++
-                else if ($NF=="CLASSDIFF") d[pfx]++
-                else if ($NF=="KNOWNDIFF") k[pfx]++
-                else if ($NF=="STATEFUL")  x[pfx]++
+                if (mc>0 && $mc=="OFFDIAG")        o[pfx]++
+                else if (mc>0 && $mc=="CLASSDIFF") d[pfx]++
+                else if (mc>0 && $mc=="KNOWNDIFF") k[pfx]++
+                else if (mc>0 && $mc=="STATEFUL")  x[pfx]++
                 else                       m[pfx]++
             }
             END {
@@ -456,15 +514,9 @@ process_round() {
         # discarded (itself an instance of the bug being fixed). Emit correct
         # numbers into the round JSON and let the caller, which has MISSING in
         # scope, enforce the gate. Header problems go to stderr.
-        local ch_col
-        ch_col=$(awk -F, 'NR==1{for(i=1;i<=NF;i++) if($i=="result"){print i; exit}}' "$chaos_csv")
-        if [ -z "$ch_col" ]; then
-            echo "WARNING: chaos-events.csv in round '$name' has no 'result' column — outcomes cannot be classified" >&2
-            ch_col=0
-        fi
-        ch_pass=$(awk -F, -v c="$ch_col" 'NR>1 && c>0 && $c=="PASS" {n++} END{print n+0}' "$chaos_csv")
-        ch_fail=$(awk -F, -v c="$ch_col" 'NR>1 && c>0 && $c=="FAIL" {n++} END{print n+0}' "$chaos_csv")
-        ch_env=$(awk -F, -v c="$ch_col" 'NR>1 && c>0 && $c=="ENV_SKIP" {n++} END{print n+0}' "$chaos_csv")
+        ch_pass=$(_count_by "$chaos_csv" result PASS)
+        ch_fail=$(_count_by "$chaos_csv" result FAIL)
+        ch_env=$(_count_by "$chaos_csv" result ENV_SKIP)
         ch_total=$(_rows "$chaos_csv")
         ch_status=$(_status_for "$ch_total" "$EXP_CHAOS")
     fi
@@ -475,11 +527,14 @@ process_round() {
           rpc_envskip="null" rpc_stateskip="null" rpc_total="null"
     local rpc_csv="$evd/rpc.csv"
     if [ -f "$rpc_csv" ] && [ -s "$rpc_csv" ]; then
-        rpc_pass=$(awk -F, 'NR>1 && $5=="PASS"  {c++} END{print c+0}' "$rpc_csv")
-        rpc_fail=$(awk -F, 'NR>1 && $5=="FAIL"  {c++} END{print c+0}' "$rpc_csv")
-        rpc_err=$( awk -F, 'NR>1 && $5=="ERROR" {c++} END{print c+0}' "$rpc_csv")
-        rpc_envskip=$(awk -F, 'NR>1 && $5=="SKIP" && $6~/env-skip/  {c++} END{print c+0}' "$rpc_csv")
-        rpc_stateskip=$(awk -F, 'NR>1 && $5=="SKIP" && $6!~/env-skip/ {c++} END{print c+0}' "$rpc_csv")
+        # `status` is column 5 of 6 with `detail` trailing — #987's exact shape.
+        rpc_pass=$(_count_by "$rpc_csv" status PASS)
+        rpc_fail=$(_count_by "$rpc_csv" status FAIL)
+        rpc_err=$(_count_by "$rpc_csv" status ERROR)
+        local _rpc_sc _rpc_dc
+        _rpc_sc=$(_col "$rpc_csv" status); _rpc_dc=$(_col "$rpc_csv" detail)
+        rpc_envskip=$(awk -F, -v s="$_rpc_sc" -v d="$_rpc_dc" 'NR>1 && s>0 && d>0 && $s=="SKIP" && $d~/env-skip/  {c++} END{print c+0}' "$rpc_csv")
+        rpc_stateskip=$(awk -F, -v s="$_rpc_sc" -v d="$_rpc_dc" 'NR>1 && s>0 && d>0 && $s=="SKIP" && $d!~/env-skip/ {c++} END{print c+0}' "$rpc_csv")
         rpc_total=$(_rows "$rpc_csv")
         rpc_status=$(_status_for "$rpc_total" "$EXP_RPC")
     fi
@@ -726,23 +781,40 @@ done < <(preset_manifest "$PRESET")
 # A suite that emitted rows but classified NONE of them is not a clean sweep —
 # it is a suite whose outcomes were never read. That is precisely how chaos
 # reported pass=0/fail=0/status=ok for three releases while the notes quoted
-# "chaos 5/5" (which was the row count). Checked here rather than inside
-# `process_round`, because that runs in a subshell and cannot append to
-# MISSING. Applies to any round that produced a chaos CSV.
+# "chaos 5/5" (which was the row count).
+#
+# #987 added this for chaos alone. Every verdict CSV has the same exposure, so
+# it is table-driven: `<file>|<verdict header>|<space-separated vocabulary>`.
+# A row count is not evidence; a classified row count is. Checked here rather
+# than inside `process_round`, because that runs in a command substitution —
+# a subshell — and `MISSING+=` from there is silently discarded, which would
+# reproduce the very defect being guarded.
+VERDICT_CSVS='chaos-events.csv|result|PASS FAIL ENV_SKIP
+n2n-trace.csv|outcome|PASS REJECTED PANIC SILENT_SKIP ERROR
+rpc.csv|status|PASS FAIL ERROR SKIP
+cli-parity.csv|status|EQUAL DIVERGENT COMPARED SKIP ERROR
+parity-matrix.csv|match|MATCH OFFDIAG CLASSDIFF KNOWNDIFF STATEFUL'
 for i in "${!EVIDENCE_DIRS[@]}"; do
     rname="${ROUND_NAMES[$i]:-round$i}"
-    f="${EVIDENCE_DIRS[$i]}/chaos-events.csv"
-    [ -f "$f" ] && [ -s "$f" ] || continue
-    ccol=$(awk -F, 'NR==1{for(j=1;j<=NF;j++) if($j=="result"){print j; exit}}' "$f")
-    if [ -z "$ccol" ]; then
-        MISSING+=("chaos-events.csv in round '$rname' has no 'result' column — outcomes cannot be classified")
-        continue
-    fi
-    crows=$(awk 'NR>1 && NF' "$f" | wc -l | tr -d ' ')
-    cclass=$(awk -F, -v c="$ccol" 'NR>1 && ($c=="PASS"||$c=="FAIL"||$c=="ENV_SKIP"){n++} END{print n+0}' "$f")
-    if [ "$crows" -gt 0 ] && [ "$cclass" -eq 0 ]; then
-        MISSING+=("chaos-events.csv in round '$rname' has $crows rows but none classified PASS/FAIL/ENV_SKIP — the suite measured nothing")
-    fi
+    while IFS='|' read -r vfile vhdr vvocab; do
+        [ -n "$vfile" ] || continue
+        f="${EVIDENCE_DIRS[$i]}/$vfile"
+        [ -f "$f" ] && [ -s "$f" ] || continue
+        ccol=$(_col "$f" "$vhdr")
+        if [ "${ccol:-0}" -eq 0 ]; then
+            MISSING+=("$vfile in round '$rname' has no '$vhdr' column — outcomes cannot be classified")
+            continue
+        fi
+        crows=$(_rows "$f")
+        cclass=$(awk -F, -v c="$ccol" -v vals="$vvocab" '
+            BEGIN { n=split(vals, want, " ") }
+            NR>1 && NF { v=$c; gsub(/^[ \t"]+|[ \t"\r]+$/,"",v)
+                         for (j=1;j<=n;j++) if (v==want[j]) { k++; next } }
+            END { print k+0 }' "$f")
+        if [ "$crows" -gt 0 ] && [ "$cclass" -eq 0 ]; then
+            MISSING+=("$vfile in round '$rname' has $crows rows but none classified $vvocab — the suite measured nothing")
+        fi
+    done <<< "$VERDICT_CSVS"
 done
 
 # Suite-level status violations: "short" (below pinned denominator) and
