@@ -50,3 +50,64 @@ assets_at() {
         --address "$addr" --output-json 2>/dev/null \
       | jq --arg p "$pid" '[.[].value[$p] // {} | keys[]] | unique | length' 2>/dev/null || echo 0
 }
+
+# ── Tx-size lattice + metadata helpers (#961) ─────────────────────────
+#
+# 08i already proves a 20 KB metadata blob trips TxTooLarge, but a single
+# far-over-the-line case is a weak bound: it cannot tell a correct limit from
+# one that is wrong in the ACCEPTING direction. The lattice pairs a tx just
+# UNDER maxTxSize (must be accepted and land on every observer) with one just
+# OVER (must be refused), so the limit is bracketed rather than merely
+# exceeded.
+
+# max_tx_size — the live maxTxSize protocol parameter.
+max_tx_size() {
+    jq -r '.maxTxSize // 16384' "$(zoo_pparams_file)"
+}
+
+# metadata_blob <name> <bytes> — write a metadata JSON whose payload is
+# roughly <bytes> long; echo the file path.
+#
+# Built as a list of 64-byte strings rather than one enormous string: CBOR text
+# above 64 bytes is chunked, and the chunked form is what the node actually
+# encodes. One huge string would measure a different shape from real metadata.
+metadata_blob() {
+    local out="$ZOO_BUILT/$1.meta.json" bytes="$2"
+    python3 -c '
+import json, sys
+out, n = sys.argv[1], int(sys.argv[2])
+chunks = ["A" * 64 for _ in range(max(1, n // 64))]
+json.dump({"674": {"msg": chunks}}, open(out, "w"))
+' "$out" "$bytes"
+    printf '%s' "$out"
+}
+
+# signed_tx_size <signed-file> — serialized size in bytes of a signed tx.
+signed_tx_size() {
+    python3 -c '
+import json, sys
+print(len(bytes.fromhex(json.load(open(sys.argv[1]))["cborHex"])))
+' "$1"
+}
+
+# local_txid <signed-file> — the txid cardano-cli computes locally.
+#
+# WHAT A METADATA ROUND-TRIP CAN AND CANNOT CHECK HERE
+# ----------------------------------------------------
+# No LSQ query returns a transaction's metadata, so "re-query the metadata
+# bytes" is not reachable through cardano-cli. What IS checkable is the part
+# that can actually diverge:
+#
+#   txid = blake2b256(tx_body_cbor), and the body carries
+#   auxiliary_data_hash = blake2b256(metadata_cbor)
+#
+# So a metadata-bearing tx appearing under this locally-computed txid on BOTH
+# dugite and cardano-node proves both hashed the same metadata bytes to the
+# same aux-data hash, and the same body to the same id. A divergence in
+# metadata encoding surfaces either as ConflictingMetadataHash at submission or
+# as the tx never appearing under this id — never as a silently different
+# payload. The check is stated in those terms rather than claimed as a full
+# byte round-trip.
+local_txid() {
+    cardano-cli conway transaction txid --tx-file "$1" 2>/dev/null
+}
