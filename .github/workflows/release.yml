@@ -229,6 +229,24 @@ jobs:
         id: version
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
+      # The CHART version is independent of the app version, and `helm --version`
+      # takes the chart's. Interpolating the app version there produced an
+      # install command that could not work: on v2.5.1 it emitted
+      # `--version 2.5.1`, and
+      #   helm show chart oci://.../dugite-node --version 2.5.1
+      #   -> Error: FetchReference ... dugite-node:2.5.1: not found
+      # while the pushed artefact was dugite-node-0.10.1.tgz. Read it from
+      # Chart.yaml, which `publish-chart` has already verified against the tag.
+      - name: Extract chart version
+        id: chart
+        run: |
+          cv=$(awk '/^version:/{print $2; exit}' charts/dugite-node/Chart.yaml)
+          if [ -z "$cv" ]; then
+            echo "::error::could not read version from charts/dugite-node/Chart.yaml" >&2
+            exit 1
+          fi
+          echo "chart_version=$cv" >> "$GITHUB_OUTPUT"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
@@ -254,7 +272,7 @@ jobs:
             ```bash
             helm install dugite-relay \
               oci://ghcr.io/michaeljfazio/charts/dugite-node \
-              --version ${{ steps.version.outputs.version }} \
+              --version ${{ steps.chart.outputs.chart_version }} \
               --set network.name=preview
             ```
 
