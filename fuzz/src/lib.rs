@@ -44,6 +44,9 @@
 //! because the two disagreed. This raises reachability; Haskell-derived
 //! fixtures remain the oracle.
 
+/// Node modules compiled directly into this crate — see `node::n2c_query`.
+pub mod node;
+
 use arbitrary::{Arbitrary, Unstructured};
 use dugite_primitives::address::{Address, BaseAddress, EnterpriseAddress, RewardAddress};
 use dugite_primitives::credentials::Credential;

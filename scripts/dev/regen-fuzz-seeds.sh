@@ -147,35 +147,55 @@ for net in mainnet preview preprod; do
     done
     for topo in topology cn-topology; do
         src="config/$net/$topo.json"
-        [ -f "$src" ] && seed_raw "$src" "$net-$topo.json" topology_parse
+        # fuzz_topology_parse reads the first 8 bytes as a current-slot value
+        # and the rest as the document, so a bare JSON seed is misaligned — the
+        # opening `{"Producers"` gets eaten as the slot and the parse fails.
+        # Prefix 8 zero bytes to match the layout. (Same class as body_hash's
+        # 33-byte prefix; a seed that does not match the target's input layout
+        # is not a seed.)
+        if [ -f "$src" ] && declared topology_parse; then
+            mkdir -p "$SEEDS/topology_parse"
+            { head -c 8 /dev/zero; cat "$src"; } > "$SEEDS/topology_parse/$net-$topo.json"
+        fi
     done
 done
 
 # ---------------------------------------------------------------------------
-# CLI text envelopes (#975).
+# CLI key material (#975).
 #
-# Synthesised rather than copied: the repo holds no committed key material,
-# and it must stay that way. These are structurally real envelopes over
-# all-zero key bytes.
+# Synthesised, not copied: the repo holds no committed key material and must
+# not start. These are structurally real key encodings over all-zero bytes.
+#
+# fuzz_cli_envelope reads byte 0 as a width selector and everything after it as
+# the payload, so each seed carries that prefix. Index 3 of the target's WIDTHS
+# table is 32 — the Ed25519 key width.
 # ---------------------------------------------------------------------------
-write_envelope() {
-    local file="$1" type="$2" desc="$3" hex="$4"
+seed_cli() {
+    local name="$1" hexbody="$2"
     declared cli_envelope || return 0
     mkdir -p "$SEEDS/cli_envelope"
-    printf '{\n    "type": "%s",\n    "description": "%s",\n    "cborHex": "%s"\n}\n' \
-        "$type" "$desc" "$hex" > "$SEEDS/cli_envelope/$file"
+    { printf '\x03'; printf '%s' "$hexbody" | xxd -r -p; } > "$SEEDS/cli_envelope/$name"
 }
-# 0x5820 = bstr(32) wrapping 32 zero bytes — the canonical shape
-# envelope::unwrap_key_bytes must accept.
+seed_cli_text() {
+    local name="$1" text="$2"
+    declared cli_envelope || return 0
+    mkdir -p "$SEEDS/cli_envelope"
+    { printf '\x03'; printf '%s' "$text"; } > "$SEEDS/cli_envelope/$name"
+}
 ZERO32="0000000000000000000000000000000000000000000000000000000000000000"
-write_envelope "payment-vkey.json" "PaymentVerificationKeyShelley_ed25519" \
-    "Payment Verification Key" "5820$ZERO32"
-write_envelope "stake-skey.json" "StakeSigningKeyShelley_ed25519" \
-    "Stake Signing Key" "5820$ZERO32"
-# A raw (unwrapped) key whose first byte falls in 0x40..=0x5f — the 1-in-8
-# range the pre-#935 `& 0xe0` heuristic silently ate a byte from.
-write_envelope "vrf-vkey-0x58-lead.json" "VrfVerificationKey_PraosVRF" \
-    "VRF Verification Key" "58${ZERO32:2}"
+# 0x58 0x20 — the canonical 2-byte CBOR header for a 32-byte payload, the shape
+# unwrap_key_bytes must accept.
+seed_cli "cbor-wrapped-32" "5820$ZERO32"
+# The same 32 bytes with NO CBOR wrapper. Its first byte is 0x00 here, but the
+# pre-#935 `& 0xe0` heuristic ate the first byte of any raw key starting
+# 0x40..=0x5f — so mutation around this seed walks straight into that range.
+seed_cli "raw-32" "$ZERO32"
+# A raw key that BEGINS 0x58, i.e. one that looks like a CBOR header and is not.
+seed_cli "raw-32-leading-0x58" "58${ZERO32:2}"
+# Text forms for parse_inline_verification_key: hex and bech32.
+seed_cli_text "hex-32.txt" "$ZERO32"
+seed_cli_text "bech32-vkey.txt" \
+    "ed25519_pk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqz5sqce"
 
 # ---------------------------------------------------------------------------
 echo
