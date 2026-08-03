@@ -13,6 +13,7 @@
 //! - [`utxo`]       — UTxO query handlers (tags 6, 7, 15)
 
 pub(crate) mod encoding;
+mod filter;
 mod governance;
 pub(crate) mod protocol;
 mod stake;
@@ -547,7 +548,7 @@ impl QueryHandler {
             23 => governance::handle_constitution(&self.state),
             24 => governance::handle_gov_state(&self.state),
             25 => governance::handle_drep_state(&self.state, decoder),
-            26 => governance::handle_drep_stake_distr(&self.state),
+            26 => governance::handle_drep_stake_distr(&self.state, decoder),
             27 => governance::handle_committee_state(&self.state),
             28 => governance::handle_filtered_vote_delegatees(&self.state, decoder),
             29 => protocol::handle_account_state(&self.state),
@@ -784,37 +785,6 @@ impl dugite_network::QueryHandler for QueryHandler {
             _ => Ok(encode_result_value(&result)),
         }
     }
-}
-
-/// Parse a set of credential hashes from CBOR.
-/// Handles: tag(258) [credential, ...] where credential = [0|1, hash(28)]
-/// Also handles plain array of bytes (legacy/simplified format).
-fn parse_credential_set(decoder: &mut minicbor::Decoder<'_>) -> Vec<Vec<u8>> {
-    let mut hashes = Vec::new();
-    // Try to consume tag(258) if present
-    let _ = decoder.tag();
-    if let Ok(Some(n)) = decoder.array() {
-        for _ in 0..n {
-            let pos = decoder.position();
-            // Try as credential structure: [0|1, hash(28)]
-            if let Ok(Some(2)) = decoder.array() {
-                let _ = decoder.u32(); // credential type tag
-                if let Ok(bytes) = decoder.bytes() {
-                    hashes.push(bytes.to_vec());
-                }
-            } else {
-                // Fall back to plain bytes
-                decoder.set_position(pos);
-                if let Ok(bytes) = decoder.bytes() {
-                    hashes.push(bytes.to_vec());
-                } else {
-                    decoder.set_position(pos);
-                    decoder.skip().ok();
-                }
-            }
-        }
-    }
-    hashes
 }
 
 #[cfg(test)]

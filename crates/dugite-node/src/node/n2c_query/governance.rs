@@ -2,7 +2,9 @@
 
 use tracing::debug;
 
-use super::parse_credential_set;
+use super::filter::{
+    filter_arg, read_credential, read_drep, read_gov_action_id, OnEmptySet, SetArgShape,
+};
 use crate::node::n2c_query::types::{
     DRepDelegationGroup, DRepKey, GovStateSnapshot, NodeStateSnapshot, QueryResult,
 };
@@ -55,39 +57,33 @@ pub(crate) fn handle_proposals(
     decoder: &mut minicbor::Decoder<'_>,
 ) -> QueryResult {
     debug!("Query: GetProposals");
-    let filter_ids = parse_gov_action_id_set(decoder);
-    if filter_ids.is_empty() {
-        QueryResult::Proposals(state.governance_proposals_frozen.clone())
-    } else {
-        let filtered = state
-            .governance_proposals_frozen
-            .iter()
-            .filter(|p| {
-                filter_ids
-                    .iter()
-                    .any(|(tx_id, idx)| tx_id == &p.tx_id && *idx == p.action_index)
-            })
-            .cloned()
-            .collect();
-        QueryResult::Proposals(filtered)
-    }
-}
-
-/// Parse a Set<GovActionId> from CBOR.
-/// GovActionId = [tx_hash(32), action_index(u32)]
-fn parse_gov_action_id_set(decoder: &mut minicbor::Decoder<'_>) -> Vec<(Vec<u8>, u32)> {
-    let mut ids = Vec::new();
-    let _ = decoder.tag(); // tag(258) for Set
-    if let Ok(Some(n)) = decoder.array() {
-        for _ in 0..n {
-            if let Ok(Some(_)) = decoder.array() {
-                if let (Ok(tx_hash), Ok(idx)) = (decoder.bytes(), decoder.u32()) {
-                    ids.push((tx_hash.to_vec(), idx));
-                }
-            }
+    // `queryProposals nes gids | null gids = proposals` — an explicit `null`
+    // guard, so an empty set means every proposal.
+    let filter_ids = match filter_arg(
+        decoder,
+        "GetProposals",
+        SetArgShape::Required,
+        OnEmptySet::AllItems,
+        read_gov_action_id,
+    ) {
+        Ok(f) => f,
+        Err(e) => return *e,
+    };
+    match filter_ids {
+        None => QueryResult::Proposals(state.governance_proposals_frozen.clone()),
+        Some(ids) => {
+            let filtered = state
+                .governance_proposals_frozen
+                .iter()
+                .filter(|p| {
+                    ids.iter()
+                        .any(|(tx_id, idx)| tx_id == &p.tx_id && *idx == p.action_index)
+                })
+                .cloned()
+                .collect();
+            QueryResult::Proposals(filtered)
         }
     }
-    ids
 }
 
 /// Handle GetRatifyState (tag 32) — current ratification state.
@@ -128,28 +124,72 @@ pub(crate) fn handle_drep_state(
     decoder: &mut minicbor::Decoder<'_>,
 ) -> QueryResult {
     debug!("Query: GetDRepState");
-    let filter_hashes = parse_credential_set(decoder);
-    if filter_hashes.is_empty() {
-        QueryResult::DRepState(state.drep_entries.clone())
-    } else {
-        let filtered = state
-            .drep_entries
-            .iter()
-            .filter(|d| filter_hashes.iter().any(|h| h == &d.credential_hash))
-            .cloned()
-            .collect();
-        QueryResult::DRepState(filtered)
+    // `queryDRepState nes creds | null creds = <every DRep>` — explicit guard,
+    // so an empty set means everything.
+    let filter_creds = match filter_arg(
+        decoder,
+        "GetDRepState",
+        SetArgShape::Required,
+        OnEmptySet::AllItems,
+        read_credential,
+    ) {
+        Ok(f) => f,
+        Err(e) => return *e,
+    };
+    match filter_creds {
+        None => QueryResult::DRepState(state.drep_entries.clone()),
+        Some(creds) => {
+            let filtered = state
+                .drep_entries
+                .iter()
+                .filter(|d| creds.iter().any(|(_, h)| h == &d.credential_hash))
+                .cloned()
+                .collect();
+            QueryResult::DRepState(filtered)
+        }
     }
 }
 
 /// Handle GetDRepStakeDistr (tag 26).
 ///
-/// Argument: tag(258) Set<DRep>
-/// Returns: Map<DRep, Coin> -- total delegated stake per DRep
-pub(crate) fn handle_drep_stake_distr(state: &NodeStateSnapshot) -> QueryResult {
+/// Argument: `Set DRep`. Returns `Map DRep Coin` — total delegated stake per
+/// DRep, read from the frozen `psDRepDistr` (#950).
+///
+/// `queryDRepStakeDistr nes creds | null creds = <every DRep> | otherwise =
+/// distr `Map.restrictKeys` creds`. dugite ignored the argument entirely until
+/// #963 — it did not even consume the bytes — and answered with every DRep for
+/// every request, so a client asking about one DRep was told about all of them.
+pub(crate) fn handle_drep_stake_distr(
+    state: &NodeStateSnapshot,
+    decoder: &mut minicbor::Decoder<'_>,
+) -> QueryResult {
     debug!("Query: GetDRepStakeDistr");
-    // Return all DRep stake distribution (filtering by DRep is complex, return all)
-    QueryResult::DRepStakeDistr(state.drep_stake_distr.clone())
+    let filter_dreps = match filter_arg(
+        decoder,
+        "GetDRepStakeDistr",
+        SetArgShape::Required,
+        OnEmptySet::AllItems,
+        read_drep,
+    ) {
+        Ok(f) => f,
+        Err(e) => return *e,
+    };
+    match filter_dreps {
+        None => QueryResult::DRepStakeDistr(state.drep_stake_distr.clone()),
+        Some(dreps) => {
+            let filtered = state
+                .drep_stake_distr
+                .iter()
+                .filter(|d| {
+                    dreps
+                        .iter()
+                        .any(|(kind, hash)| *kind == d.drep_type && hash == &d.drep_hash)
+                })
+                .cloned()
+                .collect();
+            QueryResult::DRepStakeDistr(filtered)
+        }
+    }
 }
 
 /// Handle GetCommitteeMembersState (tag 27).
@@ -167,17 +207,32 @@ pub(crate) fn handle_filtered_vote_delegatees(
     decoder: &mut minicbor::Decoder<'_>,
 ) -> QueryResult {
     debug!("Query: GetFilteredVoteDelegatees");
-    let filter_hashes = parse_credential_set(decoder);
-    if filter_hashes.is_empty() {
-        QueryResult::FilteredVoteDelegatees(state.vote_delegatees.clone())
-    } else {
-        let filtered = state
-            .vote_delegatees
-            .iter()
-            .filter(|v| filter_hashes.iter().any(|h| h == &v.credential_hash))
-            .cloned()
-            .collect();
-        QueryResult::FilteredVoteDelegatees(filtered)
+    // `getFilteredVoteDelegatees ss creds | Set.null creds = <all accounts>`.
+    let filter_creds = match filter_arg(
+        decoder,
+        "GetFilteredVoteDelegatees",
+        SetArgShape::Required,
+        OnEmptySet::AllItems,
+        read_credential,
+    ) {
+        Ok(f) => f,
+        Err(e) => return *e,
+    };
+    match filter_creds {
+        None => QueryResult::FilteredVoteDelegatees(state.vote_delegatees.clone()),
+        Some(creds) => {
+            let filtered = state
+                .vote_delegatees
+                .iter()
+                .filter(|v| {
+                    creds
+                        .iter()
+                        .any(|(k, h)| *k == v.credential_type && h == &v.credential_hash)
+                })
+                .cloned()
+                .collect();
+            QueryResult::FilteredVoteDelegatees(filtered)
+        }
     }
 }
 
@@ -201,19 +256,32 @@ pub(crate) fn handle_drep_delegations(
     decoder: &mut minicbor::Decoder<'_>,
 ) -> QueryResult {
     debug!("Query: GetDRepDelegations (tag 39)");
-    let requested = parse_drep_set(decoder);
-    if requested.is_empty() {
+    let requested = match filter_arg(
+        decoder,
+        "GetDRepDelegations",
+        SetArgShape::Required,
+        OnEmptySet::AllItems,
+        read_drep,
+    ) {
+        Ok(f) => f,
+        Err(e) => return *e,
+    };
+    let Some(requested) = requested else {
         // No filter — return all known DRep groups (every DRep that has at
         // least one delegator in the ledger).
         return QueryResult::DRepDelegations(state.drep_delegations.clone());
-    }
+    };
     // Filter: return one group per requested DRep, with possibly-empty
     // credential set if no delegators currently point at that DRep.  This
     // mirrors the Haskell semantics for `Map.restrictKeys` over the
     // DRep→delegators map.
     let filtered: Vec<DRepDelegationGroup> = requested
         .into_iter()
-        .map(|drep| {
+        .map(|(drep_type, drep_hash)| {
+            let drep = DRepKey {
+                drep_type,
+                drep_hash,
+            };
             let credentials = state
                 .drep_delegations
                 .iter()
@@ -224,54 +292,6 @@ pub(crate) fn handle_drep_delegations(
         })
         .collect();
     QueryResult::DRepDelegations(filtered)
-}
-
-/// Parse a `Set<DRep>` from CBOR.
-///
-/// Wire format: `tag(258) array(n) [DRep, ...]` where each `DRep` is either
-/// `array(2) [0|1, bstr(28)]` (KeyHash / ScriptHash) or `array(1) [2|3]`
-/// (AlwaysAbstain / AlwaysNoConfidence).
-///
-/// Also tolerates an untagged top-level array (some clients omit tag 258 for
-/// sets), matching the lenient parsing in `parse_credential_set`.
-fn parse_drep_set(decoder: &mut minicbor::Decoder<'_>) -> Vec<DRepKey> {
-    let mut out = Vec::new();
-    let _ = decoder.tag(); // optional tag(258)
-    let Ok(Some(n)) = decoder.array() else {
-        return out;
-    };
-    for _ in 0..n {
-        let pos = decoder.position();
-        let Ok(Some(arr_len)) = decoder.array() else {
-            decoder.set_position(pos);
-            decoder.skip().ok();
-            continue;
-        };
-        match arr_len {
-            2 => {
-                let drep_type = decoder.u8().unwrap_or(0);
-                let hash = decoder.bytes().ok().map(|b| b.to_vec());
-                out.push(DRepKey {
-                    drep_type,
-                    drep_hash: hash,
-                });
-            }
-            1 => {
-                let drep_type = decoder.u8().unwrap_or(2);
-                out.push(DRepKey {
-                    drep_type,
-                    drep_hash: None,
-                });
-            }
-            _ => {
-                // Unknown DRep shape — skip remaining elements of this array.
-                for _ in 0..arr_len {
-                    decoder.skip().ok();
-                }
-            }
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -768,15 +788,85 @@ mod tests {
             ],
             ..NodeStateSnapshot::default()
         };
-        let result = handle_drep_stake_distr(&state);
-        match result {
+        // `Nothing`/empty set: `queryDRepStakeDistr` guards on `null creds`.
+        let mut dec = minicbor::Decoder::new(&[]);
+        match handle_drep_stake_distr(&state, &mut dec) {
             QueryResult::DRepStakeDistr(entries) => {
                 assert_eq!(entries.len(), 2);
                 assert_eq!(entries[0].stake, 1_000_000_000);
                 assert_eq!(entries[1].drep_type, 2);
             }
-            _ => panic!("Expected DRepStakeDistr"),
+            other => panic!("Expected DRepStakeDistr, got {other:?}"),
         }
+    }
+
+    /// #963: tag 26 ignored its `Set DRep` argument entirely — it did not even
+    /// consume the bytes — so every request was answered with every DRep.
+    #[test]
+    fn test_drep_stake_distr_honours_its_filter() {
+        use crate::node::n2c_query::types::DRepStakeEntry;
+        let state = NodeStateSnapshot {
+            drep_stake_distr: vec![
+                DRepStakeEntry {
+                    drep_type: 0,
+                    drep_hash: Some(vec![0xAA; 28]),
+                    stake: 1_000_000_000,
+                },
+                DRepStakeEntry {
+                    drep_type: 0,
+                    drep_hash: Some(vec![0xBB; 28]),
+                    stake: 7,
+                },
+                DRepStakeEntry {
+                    drep_type: 2,
+                    drep_hash: None,
+                    stake: 500_000_000,
+                },
+            ],
+            ..NodeStateSnapshot::default()
+        };
+
+        // `Just {DRepKeyHash 0xAA}` — exactly one entry.
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.tag(minicbor::data::Tag::new(258)).unwrap();
+        enc.array(1).unwrap();
+        enc.array(2).unwrap();
+        enc.u8(0).unwrap();
+        enc.bytes(&[0xAA; 28]).unwrap();
+        let mut dec = minicbor::Decoder::new(&buf);
+        match handle_drep_stake_distr(&state, &mut dec) {
+            QueryResult::DRepStakeDistr(e) => {
+                assert_eq!(e.len(), 1, "asked for one DRep, got a superset");
+                assert_eq!(e[0].drep_hash, Some(vec![0xAA; 28]));
+            }
+            other => panic!("Expected DRepStakeDistr, got {other:?}"),
+        }
+
+        // The payload-less `AlwaysAbstain` constructor is selectable too.
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.tag(minicbor::data::Tag::new(258)).unwrap();
+        enc.array(1).unwrap();
+        enc.array(1).unwrap();
+        enc.u8(2).unwrap();
+        let mut dec = minicbor::Decoder::new(&buf);
+        match handle_drep_stake_distr(&state, &mut dec) {
+            QueryResult::DRepStakeDistr(e) => {
+                assert_eq!(e.len(), 1);
+                assert_eq!(e[0].drep_type, 2);
+            }
+            other => panic!("Expected DRepStakeDistr, got {other:?}"),
+        }
+
+        // A malformed argument must not degrade to "every DRep".
+        let mut buf = Vec::new();
+        minicbor::Encoder::new(&mut buf).u32(9).unwrap();
+        let mut dec = minicbor::Decoder::new(&buf);
+        assert!(matches!(
+            handle_drep_stake_distr(&state, &mut dec),
+            QueryResult::Error(_)
+        ));
     }
 
     #[test]
