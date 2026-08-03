@@ -114,6 +114,13 @@ jobs:
           - lsq_query_dispatch
           - mux_ingress
           - propose_versions
+          # Encoder-first structured generation (#974). Every other target is
+          # decode-first, so the deep optional fields — PPU keys, governance
+          # certificates, witness sets — are unreachable by byte mutation.
+          # These generate the structure and require the decoder to reproduce
+          # it.
+          - structured_tx_encode
+          - structured_pparam_update
         # Per-target -max_len overrides. The global default below is 4096, set
         # deliberately: nothing about mutating raw wire bytes needs more, and a
         # smaller cap keeps the in-memory corpus small over an hour.
@@ -133,6 +140,13 @@ jobs:
             max_len: 32768
           - target: decode_transaction
             max_len: 16384
+          # Structured targets consume the input as an Arbitrary entropy
+          # stream, so the cap bounds how RICH a generated transaction can be
+          # rather than how large an input is parsed.
+          - target: structured_tx_encode
+            max_len: 16384
+          - target: structured_pparam_update
+            max_len: 8192
     steps:
       - uses: actions/checkout@v7
 

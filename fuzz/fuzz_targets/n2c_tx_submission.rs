@@ -33,7 +33,7 @@ fuzz_target!(|data: &[u8]| {
         // TAG_SUBMIT_TX = 0: [0, [era_id, tx_bytes]]
         0 => {
             let _ = dec.array();
-            let _ = dec.u16();   // era_id
+            let _ = dec.u16(); // era_id
             let _ = dec.bytes(); // tx_bytes
         }
         // TAG_DONE = 3: [3]  — no payload

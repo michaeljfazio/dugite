@@ -14,11 +14,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use dugite_ledger::state::{LedgerState, PoolRegistration};
-use imbl::HashMap as ImblHashMap;
 use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::protocol_params::ProtocolParameters;
 use dugite_primitives::time::EpochNo;
 use dugite_primitives::value::Lovelace;
+use imbl::HashMap as ImblHashMap;
 
 /// Helper: read a u64 from fuzz bytes at offset (little-endian).
 fn read_u64(data: &[u8], offset: usize) -> u64 {
@@ -91,10 +91,8 @@ fuzz_target!(|data: &[u8]| {
 
     for i in 0..num_pools {
         let pool_id = hash28_from_seed(i as u8);
-        let pledge = (read_u64(
-            data,
-            (33 + i * 8).min(data.len().saturating_sub(8)),
-        ) % 100_000_000_000)
+        let pledge = (read_u64(data, (33 + i * 8).min(data.len().saturating_sub(8)))
+            % 100_000_000_000)
             .max(1_000_000); // At least 1 ADA pledge
         let cost = (read_u64(
             data,
@@ -105,8 +103,7 @@ fuzz_target!(|data: &[u8]| {
         pool_params.insert(pool_id, make_pool_registration(pool_id, pledge, cost));
 
         // Give each pool some blocks
-        let block_count =
-            read_u64(data, (33 + i * 4).min(data.len().saturating_sub(4))) % 1000;
+        let block_count = read_u64(data, (33 + i * 4).min(data.len().saturating_sub(4))) % 1000;
         blocks_by_pool.insert(pool_id, block_count);
     }
     // Set epoch block count before moving blocks_by_pool into Arc
@@ -115,8 +112,7 @@ fuzz_target!(|data: &[u8]| {
     state.consensus.epoch_blocks_by_pool = Arc::new(blocks_by_pool);
 
     // Seed delegations (1-16 delegators)
-    let num_delegators =
-        ((data.get(33 + num_pools).copied().unwrap_or(0) % 16) + 1) as usize;
+    let num_delegators = ((data.get(33 + num_pools).copied().unwrap_or(0) % 16) + 1) as usize;
     let mut delegations: ImblHashMap<_, _> = ImblHashMap::new();
     let mut reward_accounts: ImblHashMap<_, _> = ImblHashMap::new();
 
@@ -128,10 +124,8 @@ fuzz_target!(|data: &[u8]| {
         delegations.insert(staker, pool_id);
 
         // Give each delegator some stake
-        let stake = read_u64(
-            data,
-            (40 + i * 8).min(data.len().saturating_sub(8)),
-        ) % 10_000_000_000_000;
+        let stake =
+            read_u64(data, (40 + i * 8).min(data.len().saturating_sub(8))) % 10_000_000_000_000;
         reward_accounts.insert(staker, Lovelace(stake));
     }
     state.certs.delegations = delegations;

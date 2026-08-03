@@ -18,9 +18,9 @@
 
 #![no_main]
 
-use libfuzzer_sys::fuzz_target;
-use dugite_ledger::LedgerState;
 use dugite_ledger::state::snapshot_format::LedgerStateSnapshot;
+use dugite_ledger::LedgerState;
+use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     // --- Test 1: Direct bincode deserialization ---

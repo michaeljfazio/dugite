@@ -83,11 +83,7 @@ fn parse_ops(data: &[u8], max_ops: usize) -> Vec<Op> {
                     .copied()
                     .map(|b| b as u64 * 1000 + hash_idx as u64)
                     .unwrap_or(hash_idx as u64);
-                let block_no = data
-                    .get(pos + 2)
-                    .copied()
-                    .map(|b| b as u64)
-                    .unwrap_or(0);
+                let block_no = data.get(pos + 2).copied().map(|b| b as u64).unwrap_or(0);
                 pos += 3;
 
                 // Use a tiny fixed CBOR payload — ChainDB does not decode it.
@@ -103,11 +99,7 @@ fn parse_ops(data: &[u8], max_ops: usize) -> Vec<Op> {
             }
             1 => {
                 // RollbackTo: consume 1 byte for a synthetic slot value
-                let slot = data
-                    .get(pos)
-                    .copied()
-                    .map(|b| b as u64 * 1000)
-                    .unwrap_or(0);
+                let slot = data.get(pos).copied().map(|b| b as u64 * 1000).unwrap_or(0);
                 pos += 1;
                 ops.push(Op::RollbackTo { hash_idx, slot });
             }
