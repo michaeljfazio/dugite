@@ -72,9 +72,15 @@ fn snapshot_format_hash_stability() {
     // This hash was computed from the current LedgerStateSnapshot layout.
     // If this changes, existing snapshot files become unreadable.
     //
-    // Last update: #967, 2026-08-03 — the FIXTURE changed, not the layout.
+    // Last update: #988 — SNAPSHOT_VERSION 32 -> 33. `GovernanceState` gained
+    // `pulsed_ratify_state`, the frozen DRep pulser result. This IS a layout
+    // change: existing snapshots cannot supply the field and are rejected.
     //
-    // **Do not bump SNAPSHOT_VERSION for this move.** The on-disk format is
+    // The prior move (#967) was the opposite case and the distinction is the
+    // point of the two rules below: it changed only the FIXTURE, so the hash
+    // moved while the on-disk format did not.
+    //
+    // **Do not bump SNAPSHOT_VERSION for a fixture-only move.** The format is
     // byte-for-byte unchanged; what changed is that the fixture now populates
     // every field, so the serialized bytes are ~2.5 KB of real structure
     // instead of a few hundred bytes of top-level scalars. A hash over an
@@ -92,13 +98,15 @@ fn snapshot_format_hash_stability() {
     // Prior baselines:
     //   45d8c48be6338552a0dd04a8fbd38a65eba5d6d14930644bff9351945e745a00
     //     empty fixture, pre-#966
+    //   4f914e63503247701e098638d7b2948ed3a1d8d7d0478c7da3e91b1cb706d099
+    //     populated fixture, pre-#988 (SNAPSHOT 32)
     //   24039764909a573f5549262574928132b8e15d3bc9a6acc9e550e218db3a02e3
     //     empty fixture + a ratification snapshot (#966, SNAPSHOT 31 -> 32:
     //     `RatificationSnapshot` gained `treasury: u64`. That was a genuine
     //     layout change and this test stayed GREEN through it, because
     //     `ratification_snapshot` was `None` in the fixture — which is what
     //     #967 is about.)
-    const EXPECTED_HASH: &str = "4f914e63503247701e098638d7b2948ed3a1d8d7d0478c7da3e91b1cb706d099";
+    const EXPECTED_HASH: &str = "4f5f06fba4d024e4c0370f52a3d7f92418dafad8391baf8b04a96126e1e46aaa";
 
     if EXPECTED_HASH == "COMPUTE_ON_FIRST_RUN" {
         panic!(

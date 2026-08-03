@@ -605,7 +605,48 @@ impl LedgerState {
         // cleanup after enactment, per Haskell `proposalsApplyEnactment`.
         // The ratification skip uses self.epoch (the old epoch), matching
         // Haskell's reCurrentEpoch from the DRep pulser.
+        // The plan the pulser froze at the PREVIOUS boundary, for the
+        // consistency check below.
+        let predicted = self.gov.governance.pulsed_ratify_state.clone();
+
         ratify_proposals_impl(self.epoch, &mut self.epochs, &mut self.certs, &mut self.gov);
+
+        // #988 consistency detector.
+        //
+        // The frozen pulser result is computed at boundary B from the snapshot
+        // frozen at B, and applied here at B+1 from that same snapshot — so the
+        // two MUST agree. Where they can still diverge is the handful of live
+        // reads remaining inside the threshold path (notably `vote_delegations`
+        // when attributing proposal deposits), which Haskell freezes into
+        // `psDRepDistr` and dugite currently re-reads.
+        //
+        // This does not paper over that: it makes it LOUD. A mismatch means
+        // `GetRatifyState` told a client one thing and the chain then did
+        // another, which is precisely the class of silent divergence this
+        // repository keeps having to find the hard way. Warned rather than
+        // asserted because a false crash on a live node is worse than a false
+        // green — but it is a WARN, not a debug, so it cannot be missed.
+        if let Some(pred) = predicted {
+            let actual: Vec<_> = self
+                .gov
+                .governance
+                .last_ratified
+                .iter()
+                .map(|(id, _)| id.clone())
+                .collect();
+            if pred.enacted != actual || pred.delayed != self.gov.governance.last_ratify_delayed {
+                warn!(
+                    boundary_epoch = new_epoch.0,
+                    predicted_at = pred.computed_at_epoch.0,
+                    predicted_enacted = pred.enacted.len(),
+                    actual_enacted = actual.len(),
+                    predicted_delayed = pred.delayed,
+                    actual_delayed = self.gov.governance.last_ratify_delayed,
+                    "DRep pulser prediction did not match the applied ratification — \
+                     GetRatifyState reported a result the chain did not produce (#988)"
+                );
+            }
+        }
 
         // Update dormant epoch counter per Haskell Conway.Rules.Epoch `updateNumDormantEpochs`.
         update_dormant_epochs(new_epoch, &self.epochs, &mut self.gov);

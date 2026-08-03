@@ -476,7 +476,10 @@ impl LedgerState {
     /// withdrawal that became affordable at boundary B enacted at B on dugite
     /// and at B+1 on cardano-node. Positional bincode layout change: snapshots
     /// written by v31 and earlier must be replayed, not loaded.
-    pub(crate) const SNAPSHOT_VERSION: u8 = 32;
+    // 33: #988 added `GovernanceState.pulsed_ratify_state` — the frozen DRep
+    // pulser result. A positional bincode change inside `GovernanceState`, so
+    // existing snapshots cannot supply it and must be rejected.
+    pub(crate) const SNAPSHOT_VERSION: u8 = 33;
 
     /// Save ledger state snapshot to disk using bincode serialization.
     ///
