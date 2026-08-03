@@ -53,7 +53,7 @@ column -t -s, testnet/local-devnet/tx-zoo/state/results.csv
 
 | Script | Failure mode | Workaround |
 |---|---|---|
-| `03-plutus/03e-spend-v3.sh` (or similar V3) | Vendored V3 binary uses an older wire shape | Install `aiken` (`brew install aiken-lang/tap/aiken`), then rerun `tx-zoo/lib/build-plutus.sh` to regenerate the V3 always-true binary |
+| A `03-plutus` / `17-context-inspecting` script fails phase-2 | Wrong upstream validator for the call site, or an execution budget sized for a trivial one | `rm -f tx-zoo/lib/plutus/.plutus-set && tx-zoo/lib/build-plutus.sh`; see `troubleshooting.md` for the NoDatum/WithDatum rule. No compiler needed since #970 |
 | Anything that submits to `cardano-bp.sock` | cardano-node socket appears 1–2s after the process starts | tx-zoo's helpers already wait for the socket; only an issue if `run.sh` was interrupted mid-boot |
 
 Treat anything else failing as a **real** failure. Do not auto-skip.

@@ -57,15 +57,19 @@ rm -f testnet/local-devnet/state/*.sock testnet/local-devnet/state/*.pid
 
 ## Tx-zoo V3 spend fails
 
-**Symptom**: `03e-spend-v3.sh` (or similar) fails with a Plutus decoding error.
+**Symptom**: a `03-plutus` or `17-context-inspecting` script fails with a Plutus decoding error, or with `PT5` / "The machine terminated because of an error".
 
-**Cause**: Vendored V3 always-true binary is stale — the V3 wire shape changed multiple times during Conway development.
+**Cause**: since #969/#970 the validators are IntersectMBO's own plutus-tx output, vendored at `tests/conformance/upstream/plutus-examples.json`. There is no compiler to install — but the scripts are NOT "always true", so the wrong one for a call site fails loudly:
+
+- `alwaysSucceedsNoDatum` FAILS on a spending script that carries a datum (and in V1/V2 fails on Spending outright). Spending tests want `alwaysSucceedsWithDatum`, including in V3 where the datum is optional.
+- `alwaysFailsNoDatum` is TRUE for spending-with-datum. A spending test that wants a guaranteed failure wants `alwaysFailsWithDatum`.
 
 **Fix**:
 ```bash
-brew install aiken-lang/tap/aiken
-testnet/local-devnet/tx-zoo/lib/build-plutus.sh   # regenerates with aiken
+rm -f testnet/local-devnet/tx-zoo/lib/plutus/.plutus-set
+testnet/local-devnet/tx-zoo/lib/build-plutus.sh   # re-materialises + hash-verifies all 55
 ```
+If the script itself is right, check the execution-unit budget: these are real programs, and the old `(1000000,1000000)` budgets tuned for a trivial validator are exceeded. Running out of budget IS a phase-2 failure, so an under-budgeted test does not fail loudly — it quietly starts measuring something else.
 
 ## `cardano-cli` against dugite socket hangs
 
