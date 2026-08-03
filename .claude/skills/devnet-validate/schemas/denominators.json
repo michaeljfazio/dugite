@@ -18,7 +18,7 @@
     "Bump a number here only together with on-disk evidence of the new count."
   ],
   "tx_zoo": {
-    "expected_scripts": 121,
+    "expected_scripts": 123,
     "$comment": "All tx-zoo/NN-*/[0-9]*.sh EXCLUDING 09-cli-parity (counted separately).",
     "per_category": {
       "01-bookkeeping": 8,
@@ -36,7 +36,7 @@
       "14-gov-negatives": 6,
       "15-asset-lattice": 10,
       "16-cert-negatives": 5,
-      "17-context-inspecting": 6
+      "17-context-inspecting": 8
     }
   },
   "cli_parity": {

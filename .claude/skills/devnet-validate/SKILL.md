@@ -79,7 +79,7 @@ If `cardano-node` is older than 11.0.1, abort: PV10 conway-genesis rejects it. S
 
 Before running rounds, understand what each round contributes to the overall coverage charter. The skill exercises six orthogonal axes (see `references/test-methodology.md` for the full catalogue):
 
-1. **Tx-type** — every Conway tx class (121 zoo scripts spanning bookkeeping, native, Plutus V1/V2/V3, stake, gov certs, gov proposals, voting, gov lifecycle, mempool, post-enactment, script purposes, gov negatives, asset lattice, context-inspecting — the 19 phase-1 negatives are among them). The authoritative count is `tx_zoo.expected_scripts` in `schemas/denominators.json`; a number quoted in prose is stale by construction.
+1. **Tx-type** — every Conway tx class (123 zoo scripts spanning bookkeeping, native, Plutus V1/V2/V3, stake, gov certs, gov proposals, voting, gov lifecycle, mempool, post-enactment, script purposes, gov negatives, asset lattice, context-inspecting — the 19 phase-1 negatives are among them). The authoritative count is `tx_zoo.expected_scripts` in `schemas/denominators.json`; a number quoted in prose is stale by construction.
 2. **Validity** — every positive class has a matched negative; both must be classified identically by dugite and Haskell.
 3. **Submit-path** — txs submitted to **every** N2C ingestion socket: `dugite-bp.sock`, `dugite-relay.sock`, `cardano-bp.sock` (override via `ZOO_SOCKET=...`), plus `dugite-cli` vs `cardano-cli` on each. Also the UTxO RPC gRPC `submit_tx` (when `--rpc-port` is enabled).
 4. **Propagation-direction** — observe each tx at every node (mempool + ledger), in both forward (dugite-bp → relay → cardano-bp) and reverse (cardano-bp → relay → dugite-bp) directions through the hub.
@@ -155,7 +155,7 @@ sleep 30                            # let the chain advance past slot 0
 EVD="$LD_EVIDENCE/round1-$(date -u +%Y%m%dT%H%M%SZ)"; mkdir -p "$EVD"
 
 ./tx-zoo/run-all.sh --setup         # ~20s — keys + plutus binaries (one-time per setup)
-EVIDENCE_DIR="$EVD" ./tx-zoo/run-all.sh   # ~17 min — all 121 tx scripts (via dugite-relay socket)
+EVIDENCE_DIR="$EVD" ./tx-zoo/run-all.sh   # ~17 min — all 123 tx scripts (via dugite-relay socket)
 # NB: the bidirectional parity oracle deliberately does NOT run in this round.
 # See "Round 1p" below — it needs its own devnet.
 ./tx-zoo/09-cli-parity/run.sh "$EVD"   # ~1 min — 22 LSQ parity checks; writes cli-parity.csv
@@ -197,7 +197,7 @@ tail -F logs/cardano-bp.log   | grep -E 'AddedToCurrentChain|AddBlockValidation\
 ```
 
 **Round 1 PASSES iff** all of:
-- `tx-zoo/state/results.csv` shows `tx_zoo.expected_scripts` rows (121 as of #969) with 0 FAIL (`04g-reward-withdrawal` state-skips until rewards mature — see #958). No Plutus toolchain is required: the validators are IntersectMBO's own plutus-tx output, vendored at `tests/conformance/upstream/plutus-examples.json` and materialised by `lib/build-plutus.sh`, which verifies every envelope against cardano-ledger's recorded ScriptHash before use (#969/#970). the pin lives in `schemas/denominators.json`; if you see 85 or 105 quoted anywhere it is stale
+- `tx-zoo/state/results.csv` shows `tx_zoo.expected_scripts` rows (123 as of #969) with 0 FAIL (`04g-reward-withdrawal` state-skips until rewards mature — see #958). No Plutus toolchain is required: the validators are IntersectMBO's own plutus-tx output, vendored at `tests/conformance/upstream/plutus-examples.json` and materialised by `lib/build-plutus.sh`, which verifies every envelope against cardano-ledger's recorded ScriptHash before use (#969/#970). the pin lives in `schemas/denominators.json`; if you see 85 or 105 quoted anywhere it is stale
 - `verify.sh` reports 4/4 predicates pass
 - Zero invalid-block events in `logs/cardano-bp.log` (match BOTH legacy `TraceForgedInvalidBlock` and cardano-node 11.x `ChainDB.AddBlockEvent.AddBlockValidation.InvalidBlock` / `Forge.Loop.ForgedInvalidBlock`)
 - `dugite_tip_age_seconds` stays <5 throughout the soak
