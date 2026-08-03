@@ -271,8 +271,20 @@ sleep 30
   done ) &
 TRICKLE=$!
 
+# futurePParams boundary parity (#977). Runs FOR the soak duration, in parallel:
+# the field's only interesting state — `PotentialPParamsUpdate` — survives from
+# the boundary block until the very next one, ~3 slots out of 400, so it has to
+# be sampled continuously. A one-shot `09k-gov-state` lands in that window ~1%
+# of the time and `NoPParamsUpdate` is correct for the rest, which is why the
+# hardcoded value in #977 survived every previous release gate.
+../../.claude/skills/devnet-validate/scripts/futurepparams-boundary-parity.sh \
+    --seconds 900 --out "$LD_EVIDENCE/current/futurepparams-parity.csv" &
+FPP=$!
+
 ./soak.sh 900                       # 15 min — covers boundaries 0→1 AND 1→2 (first RUPD)
 kill $TRICKLE 2>/dev/null
+wait $FPP; FPP_RC=$?
+[ "$FPP_RC" -eq 0 ] || { echo "FUTUREPPARAMS PARITY FAIL/INCONCLUSIVE (rc=$FPP_RC)"; exit 1; }
 
 # Pot-movement parity check at end (must be post-boundary 1→2, i.e. epoch >= 2)
 DBP_T=$(curl -s localhost:12798/metrics | awk '/^dugite_treasury_lovelace /{print $2}')
@@ -298,6 +310,7 @@ echo "haskell treasury=$HSK_T reserves=$HSK_R"
 - `analyze-evidence.sh` chain-density proxy (canonical blocks ÷ slots) stays within ±20% of `activeSlotsCoeff` (0.5 on devnet)
 - After boundary 1→2: `dugite_treasury_lovelace > 0` AND `dugite_reserves_lovelace < genesis_reserves` (RUPD applied)
 - `dugite_treasury_lovelace` **byte-exactly equals** `cardano-bp.esChainAccountState.treasury` AND `dugite_reserves_lovelace` **byte-exactly equals** `cardano-bp.esChainAccountState.reserves` (the only acceptable ledger semantic per `feedback_haskell_byte_exact_only`)
+- `futurepparams-boundary-parity.sh` exits 0 — zero `DIFF` rows, at least one boundary crossed, and at least one `PotentialPParamsUpdate` sample actually observed. It exits non-zero on "no boundary crossed" and on "boundary crossed but the post-boundary window never sampled" **as well as** on a real divergence: a run that never entered the interesting state proves nothing, and reporting that as a pass is the failure family #953/#987 kept finding
 - Boundary 0→1 having `treasury=0, reserves=genesis` is **expected and correct**: epoch 0's pulser runs (anchor `4k/f=320` fits inside `epoch_len=400`) but applies at boundary 1→2, not 0→1; the pot-movement check applies post-1→2 only
 
 ### Round 3 — Restart resilience (~5 min)
