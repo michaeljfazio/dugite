@@ -26,10 +26,10 @@ env:
   # nights, so a shorter nightly run is no longer a shorter search: it is the
   # same search, resumed.
   #
-  # That is what pays for #971's 11 revived targets and #975's new ones. The
-  # matrix went 41 -> 52 targets while total nightly compute went
-  # 41h -> ~17h. The weekly deep run keeps a long uninterrupted search in the
-  # schedule for the targets that benefit from one.
+  # That is what pays for #971's 11 revived targets plus the new #974/#975
+  # ones. The matrix went 41 -> 58 targets while total nightly compute went
+  # ~41h (41 x 3600s) -> ~19h (58 x 1200s). The weekly deep run keeps a long
+  # uninterrupted search in the schedule for the targets that benefit.
   FUZZ_SECONDS: ${{ github.event.inputs.max_total_time || (github.event.schedule == '0 2 * * 0' && '3600' || '1200') }}
 
 jobs:

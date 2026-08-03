@@ -649,7 +649,9 @@ Network magic: Mainnet=764824073, Preview=2, Preprod=1
 
 ## Fuzzing
 
-56 libFuzzer targets in `fuzz/`, run by `.github/workflows/fuzz.yml`:
+59 declared libFuzzer targets in `fuzz/`, 58 in the nightly matrix
+(`plutus_script_decode` is deliberately excluded — upstream Aiken panics),
+run by `.github/workflows/fuzz.yml`:
 Mon-Sat 1200s per target, Sunday 3600s, `workflow_dispatch` overrides.
 The short weekday budget is only sound because the corpus **persists**
 between runs (Actions cache + `cargo fuzz cmin` before save) — it is the
