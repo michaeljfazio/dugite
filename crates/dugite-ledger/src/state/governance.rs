@@ -1775,13 +1775,39 @@ fn compute_pulsed_ratify_state(
     }
 }
 
-pub(crate) fn capture_governance_snapshots(
+/// The Conway EPOCH rule's governance step, run once per boundary.
+///
+/// This is deliberately ONE function rather than a reset plus a capture at
+/// each call site. There are two boundary paths in this crate — the per-era
+/// `EraRulesImpl::process_epoch_transition` (production) and the
+/// `#[doc(hidden)]` `LedgerState::process_epoch_transition` (tests) — and
+/// #977's `futurePParams` reset was originally written into the test one
+/// ONLY. Every unit test passed, because the unit tests use that path; the
+/// devnet caught it by diffing against cardano-node across a live boundary.
+/// That is the N-copies trap #985 called out, recurring. Folding both steps
+/// into a single shared function is what makes the drift inexpressible.
+///
+/// Order is load-bearing and matches `Cardano.Ledger.Conway.Rules.Epoch`:
+///
+/// 1. `cgsFuturePParamsL .~ PotentialPParamsUpdate Nothing`, UNCONDITIONALLY
+///    — whatever enacted, the epoch just ended's prediction is discarded
+///    wholesale and rebuilt by `predict_future_pparams` on later blocks.
+/// 2. `setFreshDRepPulsingState` — the DRep distribution, the ratification
+///    snapshot, and the frozen pulser result, in that order, each computed
+///    from the state the previous step left.
+///
+/// The reset must come FIRST: the pulser frozen in step 2 describes the NEXT
+/// boundary, and prediction may only read it on LATER blocks. Haskell's
+/// NEWEPOCH takes the boundary branch or the predict branch, never both.
+pub(crate) fn epoch_boundary_governance_step(
     epoch: EpochNo,
     epochs: &EpochSubState,
     certs: &CertSubState,
     gov: &mut GovSubState,
 ) {
     if epochs.protocol_params.protocol_version_major >= 9 {
+        Arc::make_mut(&mut gov.governance).future_pparams =
+            FuturePParams::PotentialPParamsUpdate(None);
         capture_drep_distribution_snapshot_impl(certs, gov);
         capture_ratification_snapshot_impl(epoch, epochs.treasury.0, gov);
         // Order matters: the pulser is computed FROM the snapshot just frozen,
@@ -10207,7 +10233,7 @@ mod pulser_tests {
     fn boundary_freezes_a_pulser_result() {
         let mut st = populated_ledger_state();
         Arc::make_mut(&mut st.gov.governance).pulsed_ratify_state = None;
-        capture_governance_snapshots(st.epoch, &st.epochs, &st.certs, &mut st.gov);
+        epoch_boundary_governance_step(st.epoch, &st.epochs, &st.certs, &mut st.gov);
 
         let pulsed = st
             .gov

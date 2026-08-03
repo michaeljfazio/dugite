@@ -49,7 +49,7 @@ use tracing::{debug, warn};
 use super::common;
 use super::{EraRules, RuleContext};
 use crate::state::governance::{
-    capture_governance_snapshots, expire_committee_members, forest_add_proposal,
+    epoch_boundary_governance_step, expire_committee_members, forest_add_proposal,
     genesis_root_is_valid, gov_action_purpose_tag, gov_action_raw_prev_id,
     hardfork_proposal_cant_follow, prev_action_matches_enacted_root, ratify_proposals_impl,
     update_dormant_epochs, update_drep_activity,
@@ -926,7 +926,7 @@ impl EraRules for ConwayRules {
         // Pass the OLD epoch (ctx.current_epoch) for the snapshot label, matching
         // the old LedgerState::process_epoch_transition which passes self.epoch
         // (before self.epoch = new_epoch).
-        capture_governance_snapshots(ctx.current_epoch, epochs, certs, gov);
+        epoch_boundary_governance_step(ctx.current_epoch, epochs, certs, gov);
 
         // prevPParams was already captured at the top of this function
         // (BEFORE pre-Conway PPUP application and BEFORE
@@ -2206,6 +2206,100 @@ mod tests {
             epoch_block_count: 0,
             opcert_counters: HashMap::new(),
         }
+    }
+
+    /// #977: `futurePParams` must be reset at the boundary on the PRODUCTION
+    /// path, not just the `#[doc(hidden)]` test helper.
+    ///
+    /// This test exists because the reset was originally written into
+    /// `LedgerState::process_epoch_transition` only. That helper's own rustdoc
+    /// says "Production code MUST go through `Self::apply_block`", and every
+    /// unit test in the crate uses the helper — so the whole suite passed
+    /// while `EraRulesImpl::process_epoch_transition`, the path a real block
+    /// actually takes, did nothing. It was caught by diffing `gov-state`
+    /// against cardano-node across a live devnet boundary, where Haskell held
+    /// `PotentialPParamsUpdate` for the ~12 slots until the next block and
+    /// dugite reported `NoPParamsUpdate` throughout.
+    ///
+    /// So: drive the trait method, the same one `apply_block` dispatches to.
+    #[test]
+    fn conway_boundary_resets_future_pparams_on_the_production_path() {
+        let rules = ConwayRules::new();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 10;
+        let ctx = make_conway_ctx(&params);
+
+        let mut utxo = make_utxo_sub(vec![]);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut epochs = make_epoch_sub();
+        let mut consensus = make_consensus_sub();
+        epochs.protocol_params = params.clone();
+
+        // Start from the settled state a mid-epoch block would leave behind.
+        Arc::make_mut(&mut gov.governance).future_pparams =
+            crate::state::FuturePParams::NoPParamsUpdate;
+
+        rules
+            .process_epoch_transition(
+                EpochNo(6),
+                &ctx,
+                &mut utxo,
+                &mut certs,
+                &mut gov,
+                &mut epochs,
+                &mut consensus,
+            )
+            .expect("conway boundary");
+
+        assert_eq!(
+            gov.governance.future_pparams,
+            crate::state::FuturePParams::PotentialPParamsUpdate(None),
+            "Conway EPOCH resets futurePParams UNCONDITIONALLY at every \
+             boundary; the production path skipped it entirely"
+        );
+    }
+
+    /// The reset is unconditional — it must not be skipped just because the
+    /// incoming value already looks "pending".
+    ///
+    /// `DefinitePParamsUpdate pp` is the state at a boundary that is about to
+    /// ENACT `pp`. Haskell discards it there: the update has now been applied,
+    /// so nothing is queued any more. Leaving it would make the node report an
+    /// update as still-pending for a whole epoch after it landed.
+    #[test]
+    fn conway_boundary_reset_discards_a_definite_update() {
+        let rules = ConwayRules::new();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 10;
+        let ctx = make_conway_ctx(&params);
+
+        let mut utxo = make_utxo_sub(vec![]);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut epochs = make_epoch_sub();
+        let mut consensus = make_consensus_sub();
+        epochs.protocol_params = params.clone();
+
+        Arc::make_mut(&mut gov.governance).future_pparams =
+            crate::state::FuturePParams::DefinitePParamsUpdate(Box::new(params.clone()));
+
+        rules
+            .process_epoch_transition(
+                EpochNo(6),
+                &ctx,
+                &mut utxo,
+                &mut certs,
+                &mut gov,
+                &mut epochs,
+                &mut consensus,
+            )
+            .expect("conway boundary");
+
+        assert_eq!(
+            gov.governance.future_pparams,
+            crate::state::FuturePParams::PotentialPParamsUpdate(None),
+        );
     }
 
     fn make_output(address: Address, coin: u64) -> TransactionOutput {
