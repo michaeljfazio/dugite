@@ -404,6 +404,26 @@ impl LedgerState {
         // import), process each intermediate epoch transition individually.
         // Dispatched through EraRulesImpl for the block's era (post-HFC).
         let block_epoch = EpochNo(self.epoch_of_slot(block.slot().0));
+
+        // #977: `solidifyNextEpochPParams` runs FIRST, before the boundary or
+        // the prediction — `validatingTickTransition` is
+        //
+        //     (curEpochNo, nes) <- solidifyNextEpochPParams nes0 slot
+        //     nes' <- trans NEWEPOCH (TRC ((), nes, curEpochNo))
+        //
+        // so on a boundary block the solidify happens and is then overwritten
+        // by the reset. That ordering is reproduced rather than optimised away:
+        // it is only unobservable while the reset stays unconditional.
+        if self.era != Era::Byron && self.epochs.protocol_params.protocol_version_major >= 9 {
+            let first_slot_next_epoch = self.first_slot_of_epoch(block_epoch.0.saturating_add(1));
+            crate::state::governance::solidify_next_epoch_pparams(
+                block.slot().0,
+                first_slot_next_epoch,
+                self.stability_window_3kf,
+                &mut self.gov,
+            );
+        }
+
         if block_epoch > self.epoch {
             debug!(
                 "Ledger: epoch transition {} -> {} at slot {}",
@@ -507,6 +527,12 @@ impl LedgerState {
                 // boundary accounts, matching Haskell's forced startStep.)
                 self.epochs.rupd_addrs_rew = None;
             }
+        } else if self.era != Era::Byron && self.epochs.protocol_params.protocol_version_major >= 9
+        {
+            // #977: `predictFuturePParams` runs on every NON-boundary tick.
+            // Haskell's NEWEPOCH takes the boundary branch or this one, never
+            // both — which is why this is an `else`.
+            crate::state::governance::predict_future_pparams(&mut self.gov);
         }
 
         // #11 startStep capture: the first time this (Shelley+) epoch's

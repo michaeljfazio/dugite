@@ -1,6 +1,6 @@
 use super::{
-    credential_to_hash, GovRelation, GovernanceState, LedgerState, PGraph, PRoot, ProposalState,
-    PulsedRatifyState,
+    credential_to_hash, FuturePParams, GovRelation, GovernanceState, LedgerState, PGraph, PRoot,
+    ProposalState, PulsedRatifyState,
 };
 use super::{CertSubState, EpochSubState, GovSubState};
 use crate::ledger_seq::{GovernanceChange, LedgerDelta};
@@ -1639,6 +1639,80 @@ pub(crate) fn prune_committee_state(gov: &mut GovSubState) {
 /// post-transition state — after ratification/expiry have pruned proposals,
 /// enacted roots have been updated, DRep activity has been updated, and
 /// committee members have been expired.
+/// Haskell `solidifyNextEpochPParams` — collapse `futurePParams` once the slot
+/// passes the point of no return (#977).
+///
+/// ```haskell
+/// getTheSlotOfNoReturn slot = ...
+///   pointOfNoReturn = firstSlotNextEpoch *- Duration (2 * stabilityWindow)
+///
+/// solidifyNextEpochPParams nes slot =
+///   if slot < slotOfNoReturn then nes
+///   else nes & futurePParamsGovStateL %~ solidifyFuturePParams
+/// ```
+///
+/// `stabilityWindow` here is `3k/f` — dugite's `stability_window_3kf`, NOT the
+/// randomness-stabilisation window (`4k/f`) used by the RUPD pulser. The two
+/// are different constants and are easy to confuse.
+///
+/// Runs on EVERY block, before the boundary/predict step, matching
+/// `validatingTickTransition`.
+pub(crate) fn solidify_next_epoch_pparams(
+    slot: u64,
+    first_slot_next_epoch: u64,
+    stability_window_3kf: u64,
+    gov: &mut GovSubState,
+) {
+    let point_of_no_return = first_slot_next_epoch.saturating_sub(2 * stability_window_3kf);
+    if slot < point_of_no_return {
+        return;
+    }
+    let g = Arc::make_mut(&mut gov.governance);
+    let before = g.future_pparams.clone();
+    g.future_pparams.solidify();
+    if before != g.future_pparams {
+        debug!(
+            slot,
+            point_of_no_return, "futurePParams solidified at the point of no return"
+        );
+    }
+}
+
+/// Haskell `predictFuturePParams` — run on every NON-boundary tick (#977).
+///
+/// ```haskell
+/// predictFuturePParams govState = case cgsFuturePParams govState of
+///   NoPParamsUpdate         -> govState
+///   DefinitePParamsUpdate _ -> govState
+///   _ -> govState { cgsFuturePParams = PotentialPParamsUpdate newFuturePParams }
+///   where
+///     newFuturePParams = do
+///       guard (any hasChangesToPParams (rsEnacted ratifyState))
+///       pure (ensCurPParams (rsEnactState ratifyState))
+///     ratifyState = extractDRepPulsingState (cgsDRepPulsingState govState)
+/// ```
+///
+/// `rsEnacted`/`rsEnactState` are the DRep pulser's, which is why this needed
+/// #988 first: without a frozen pulser result dugite simply could not answer
+/// "what will enact". Both terms come from `pulsed_ratify_state`.
+///
+/// Note the two early returns: once the value is `No` or `Definite` it is
+/// settled and prediction must NOT reopen it.
+pub(crate) fn predict_future_pparams(gov: &mut GovSubState) {
+    match gov.governance.future_pparams {
+        FuturePParams::NoPParamsUpdate | FuturePParams::DefinitePParamsUpdate(_) => return,
+        FuturePParams::PotentialPParamsUpdate(_) => {}
+    }
+    let predicted = gov
+        .governance
+        .pulsed_ratify_state
+        .as_ref()
+        .filter(|p| p.has_pparams_changes)
+        .map(|p| Box::new(p.cur_pparams.clone()));
+    let g = Arc::make_mut(&mut gov.governance);
+    g.future_pparams = FuturePParams::PotentialPParamsUpdate(predicted);
+}
+
 /// Compute the frozen pulser result for the epoch now starting (#988).
 ///
 /// Haskell's `setFreshDRepPulsingState` creates the pulser at the boundary and
@@ -10191,5 +10265,147 @@ mod pulser_tests {
             !pulsed.has_pparams_changes,
             "no enactment must not report a pparams change"
         );
+    }
+}
+
+#[cfg(test)]
+mod future_pparams_tests {
+    use super::*;
+    use crate::state::test_fixtures::populated_ledger_state;
+
+    fn potential(pp: Option<ProtocolParameters>) -> FuturePParams {
+        FuturePParams::PotentialPParamsUpdate(pp.map(Box::new))
+    }
+
+    /// `solidifyFuturePParams`: Potential Nothing -> No,
+    /// Potential (Just pp) -> Definite pp, anything else unchanged.
+    #[test]
+    fn solidify_collapses_potential_only() {
+        let mut f = potential(None);
+        f.solidify();
+        assert_eq!(f, FuturePParams::NoPParamsUpdate);
+
+        let mut f = potential(Some(ProtocolParameters::mainnet_defaults()));
+        f.solidify();
+        assert!(matches!(f, FuturePParams::DefinitePParamsUpdate(_)));
+
+        // Idempotent, and the settled variants are untouched.
+        let mut f = FuturePParams::NoPParamsUpdate;
+        f.solidify();
+        assert_eq!(f, FuturePParams::NoPParamsUpdate);
+        let mut f =
+            FuturePParams::DefinitePParamsUpdate(Box::new(ProtocolParameters::mainnet_defaults()));
+        let before = f.clone();
+        f.solidify();
+        assert_eq!(f, before);
+    }
+
+    /// The point of no return is `firstSlotNextEpoch - 2 * stabilityWindow`,
+    /// and `stabilityWindow` is 3k/f — NOT the 4k/f randomness window the RUPD
+    /// pulser uses. Confusing the two moves the boundary by a third.
+    #[test]
+    fn solidify_fires_only_at_the_point_of_no_return() {
+        let first_next = 10_000u64;
+        let window = 1_000u64; // point of no return = 10_000 - 2_000 = 8_000
+        let mut st = populated_ledger_state();
+
+        for (slot, should_collapse) in [(7_999u64, false), (8_000, true)] {
+            Arc::make_mut(&mut st.gov.governance).future_pparams = potential(None);
+            solidify_next_epoch_pparams(slot, first_next, window, &mut st.gov);
+            let got = &st.gov.governance.future_pparams;
+            if should_collapse {
+                assert_eq!(*got, FuturePParams::NoPParamsUpdate, "slot {slot}");
+            } else {
+                assert_eq!(*got, potential(None), "slot {slot} is before the point");
+            }
+        }
+    }
+
+    /// `predictFuturePParams` must NOT reopen a settled value — its first two
+    /// arms return the state unchanged.
+    #[test]
+    fn predict_never_reopens_a_settled_value() {
+        let mut st = populated_ledger_state();
+
+        Arc::make_mut(&mut st.gov.governance).future_pparams = FuturePParams::NoPParamsUpdate;
+        predict_future_pparams(&mut st.gov);
+        assert_eq!(
+            st.gov.governance.future_pparams,
+            FuturePParams::NoPParamsUpdate,
+            "No must stay No"
+        );
+
+        let definite =
+            FuturePParams::DefinitePParamsUpdate(Box::new(ProtocolParameters::mainnet_defaults()));
+        Arc::make_mut(&mut st.gov.governance).future_pparams = definite.clone();
+        predict_future_pparams(&mut st.gov);
+        assert_eq!(
+            st.gov.governance.future_pparams, definite,
+            "Definite must stay Definite"
+        );
+    }
+
+    /// `guard (any hasChangesToPParams (rsEnacted ratifyState))` — the payload
+    /// appears ONLY when the pulser says a ParameterChange or
+    /// HardForkInitiation will enact.
+    #[test]
+    fn predict_carries_a_payload_only_when_the_pulser_says_so() {
+        let mut st = populated_ledger_state();
+
+        // Pulser reports no pparams change -> Potential(None).
+        {
+            let g = Arc::make_mut(&mut st.gov.governance);
+            g.future_pparams = potential(None);
+            if let Some(p) = g.pulsed_ratify_state.as_mut() {
+                p.has_pparams_changes = false;
+            }
+        }
+        predict_future_pparams(&mut st.gov);
+        assert_eq!(st.gov.governance.future_pparams, potential(None));
+
+        // Pulser reports one -> Potential(Some(cur_pparams)).
+        {
+            let g = Arc::make_mut(&mut st.gov.governance);
+            g.future_pparams = potential(None);
+            if let Some(p) = g.pulsed_ratify_state.as_mut() {
+                p.has_pparams_changes = true;
+                p.cur_pparams.min_fee_a = 12_345;
+            }
+        }
+        predict_future_pparams(&mut st.gov);
+        match &st.gov.governance.future_pparams {
+            FuturePParams::PotentialPParamsUpdate(Some(pp)) => {
+                assert_eq!(pp.min_fee_a, 12_345, "must carry ensCurPParams");
+            }
+            other => panic!("expected Potential(Some(..)), got {other:?}"),
+        }
+    }
+
+    /// `nextEpochPParams` is what the ledger-view FORECAST reads, and is the
+    /// reason this is not merely a query field.
+    #[test]
+    fn next_epoch_pparams_prefers_the_queued_update() {
+        let mut cur = ProtocolParameters::mainnet_defaults();
+        cur.min_fee_a = 1;
+        let mut queued = ProtocolParameters::mainnet_defaults();
+        queued.min_fee_a = 2;
+
+        assert_eq!(
+            FuturePParams::NoPParamsUpdate
+                .next_epoch_pparams(&cur)
+                .min_fee_a,
+            1
+        );
+        assert_eq!(
+            FuturePParams::DefinitePParamsUpdate(Box::new(queued.clone()))
+                .next_epoch_pparams(&cur)
+                .min_fee_a,
+            2
+        );
+        assert_eq!(
+            potential(Some(queued)).next_epoch_pparams(&cur).min_fee_a,
+            2
+        );
+        assert_eq!(potential(None).next_epoch_pparams(&cur).min_fee_a, 1);
     }
 }

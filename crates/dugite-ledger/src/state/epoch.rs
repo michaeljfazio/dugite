@@ -2,7 +2,7 @@ use super::governance::{
     capture_governance_snapshots, expire_committee_members, ratify_proposals_impl,
     update_dormant_epochs, update_drep_activity,
 };
-use super::{LedgerState, StakeSnapshot};
+use super::{FuturePParams, LedgerState, StakeSnapshot};
 use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::time::EpochNo;
 use dugite_primitives::value::Lovelace;
@@ -656,6 +656,25 @@ impl LedgerState {
 
         // Expire committee members that have passed their expiration epoch.
         expire_committee_members(new_epoch, &mut self.gov);
+
+        // Reset `futurePParams` for the epoch just starting (#977).
+        //
+        // Haskell's `Conway.Rules.Epoch` does this UNCONDITIONALLY at every
+        // boundary, whatever enacted:
+        //
+        //     & cgsFuturePParamsL .~ PotentialPParamsUpdate Nothing
+        //
+        // The epoch then re-derives it: `predict_future_pparams` on each
+        // subsequent non-boundary block may upgrade `None` to `Some(pp)`, and
+        // `solidify_next_epoch_pparams` collapses it once the slot passes
+        // `firstSlotNextEpoch - 2 * stabilityWindow`.
+        //
+        // Ordering: this runs BEFORE `capture_governance_snapshots`, because
+        // the pulser frozen there describes the NEXT boundary and prediction
+        // must read it only on later blocks — never on this one. Haskell's
+        // NEWEPOCH takes the boundary branch OR the predict branch, never both.
+        Arc::make_mut(&mut self.gov.governance).future_pparams =
+            FuturePParams::PotentialPParamsUpdate(None);
 
         // Capture the ratification snapshot AND DRep distribution for the NEXT
         // epoch boundary.

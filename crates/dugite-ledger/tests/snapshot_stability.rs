@@ -72,7 +72,11 @@ fn snapshot_format_hash_stability() {
     // This hash was computed from the current LedgerStateSnapshot layout.
     // If this changes, existing snapshot files become unreadable.
     //
-    // Last update: #988 — SNAPSHOT_VERSION 32 -> 33. `GovernanceState` gained
+    // Last update: #977 — SNAPSHOT_VERSION 33 -> 34. `GovernanceState` gained
+    // `future_pparams`. Another positional bincode change inside
+    // `GovernanceState`, so existing snapshots are rejected.
+    //
+    // Previously: #988 — SNAPSHOT_VERSION 32 -> 33. `GovernanceState` gained
     // `pulsed_ratify_state`, the frozen DRep pulser result. This IS a layout
     // change: existing snapshots cannot supply the field and are rejected.
     //
@@ -98,6 +102,8 @@ fn snapshot_format_hash_stability() {
     // Prior baselines:
     //   45d8c48be6338552a0dd04a8fbd38a65eba5d6d14930644bff9351945e745a00
     //     empty fixture, pre-#966
+    //   4f5f06fba4d024e4c0370f52a3d7f92418dafad8391baf8b04a96126e1e46aaa
+    //     SNAPSHOT 33 (#988, pulsed_ratify_state)
     //   4f914e63503247701e098638d7b2948ed3a1d8d7d0478c7da3e91b1cb706d099
     //     populated fixture, pre-#988 (SNAPSHOT 32)
     //   24039764909a573f5549262574928132b8e15d3bc9a6acc9e550e218db3a02e3
@@ -106,7 +112,7 @@ fn snapshot_format_hash_stability() {
     //     layout change and this test stayed GREEN through it, because
     //     `ratification_snapshot` was `None` in the fixture — which is what
     //     #967 is about.)
-    const EXPECTED_HASH: &str = "4f5f06fba4d024e4c0370f52a3d7f92418dafad8391baf8b04a96126e1e46aaa";
+    const EXPECTED_HASH: &str = "0c193be7d13ccea5ef8e66f856221a3fb7fd768e5184066574d3f7fcc0fd87ba";
 
     if EXPECTED_HASH == "COMPUTE_ON_FIRST_RUN" {
         panic!(

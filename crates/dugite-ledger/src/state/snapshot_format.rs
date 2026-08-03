@@ -644,6 +644,7 @@ mod tests {
             drep_snapshot_abstain,
             ratification_snapshot: _,
             pulsed_ratify_state,
+            future_pparams,
         } = governance;
         let _ = (
             script_committee_credentials,
@@ -653,6 +654,11 @@ mod tests {
             proposal_graph,
             last_ratified,
             last_expired,
+        );
+        assert!(
+            future_pparams.known().is_some(),
+            "governance.future_pparams carries no payload — `ProtocolParameters`' \
+             layout inside the enum is invisible to the hash (#977)"
         );
         assert!(
             pulsed_ratify_state.is_some(),
