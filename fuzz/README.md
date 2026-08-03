@@ -59,12 +59,42 @@ done
 
 ## Corpus Management
 
-Seed corpora live in `corpus/<target>/`. The fuzzer automatically saves
-interesting inputs (new coverage) to this directory. Commit interesting
-corpus files to the repository so future runs start from better seeds.
+Two directories, and the distinction matters:
 
-For `fuzz_decode_block`, the corpus is seeded with real block CBOR from
-Cardano eras (Alonzo, Babbage, Conway).
+| Directory | Tracked? | Written by | Read by |
+|---|---|---|---|
+| `seeds/<target>/` | **yes** | `scripts/dev/regen-fuzz-seeds.sh` | CI, copied into `corpus/` before each run |
+| `corpus/fuzz_<target>/` | no (gitignored) | libFuzzer, during a run | libFuzzer, at startup |
+
+cargo-fuzz derives the corpus path from the **binary** name, so the corpus
+for target `decode_block` is `corpus/fuzz_decode_block/` — note the prefix.
+Until #972 this repo's committed seeds sat in `corpus/decode_block/`, which
+nothing has ever read. That is why seeds now live in their own tracked
+directory instead of inside the one cargo-fuzz owns.
+
+To seed a local run the way CI does:
+
+```bash
+cp -n fuzz/seeds/decode_block/* fuzz/corpus/fuzz_decode_block/
+cargo +nightly fuzz run fuzz_decode_block -- -max_total_time=300 -max_len=32768
+```
+
+`-max_len` matters here: libFuzzer **truncates** a seed larger than the cap
+rather than skipping it, so a 29 KB real block read under the default 4 KB
+cap becomes a fragment that only exercises the decoder's error path. The
+nightly workflow sets a per-target cap from the largest seed in each
+directory (`.github/workflows/fuzz.yml`, `matrix.include`).
+
+Seeds are regenerated from material already in the repo — real block and
+transaction fixtures, and every network's genesis and topology JSON:
+
+```bash
+scripts/dev/regen-fuzz-seeds.sh
+```
+
+Between nightly runs CI persists `corpus/fuzz_<target>/` in the Actions
+cache and runs `cargo fuzz cmin` before saving, so coverage accumulates
+instead of resetting to empty every night.
 
 ## Coverage-Guided Fuzzing Tips
 
@@ -87,4 +117,14 @@ Cardano eras (Alonzo, Babbage, Conway).
 1. Create `fuzz/fuzz_targets/<name>.rs` with a `fuzz_target!` macro.
 2. Add the `[[bin]]` entry to `fuzz/Cargo.toml`.
 3. Add any new crate dependencies to `[dependencies]` in `fuzz/Cargo.toml`.
-4. Optionally seed `fuzz/corpus/<name>/` with representative inputs.
+4. **Add `<name>` to `matrix.target` in `.github/workflows/fuzz.yml`.**
+   A target that is not in the matrix never runs. Eleven of them sat
+   declared-but-dead for 2.5 months (#971), including every mini-protocol
+   state machine.
+5. Optionally add seeds under `fuzz/seeds/<name>/` via
+   `scripts/dev/regen-fuzz-seeds.sh`, and a `matrix.include` entry raising
+   `max_len` if any seed exceeds 4 KiB.
+
+`just fuzz-check` compile-guards every target and is part of `just check`.
+The fuzz crate declares its own `[workspace]`, so a plain
+`cargo build --all-targets` at the repo root does **not** cover it.
