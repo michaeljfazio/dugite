@@ -73,6 +73,9 @@
 - [conway-validation-rules.md](conway-validation-rules.md) — validation rules, predicate failures, reward formula, epoch transition order
 - [apply-chain-tick-forge-mutations.md](apply-chain-tick-forge-mutations.md) — TICK/NEWEPOCH fields visible to forge: intra-epoch vs epoch-boundary
 
+## TPraos Overlay Schedule vs Praos (no overlay check post-Babbage)
+- [tpraos-overlay-vs-praos-no-overlay.md](tpraos-overlay-vs-praos-no-overlay.md) — OVERLAY/PRTCL STS is TPraos-only (Overlay.hs/Prtcl.hs); Praos.hs updateChainDepState = KES+VRF only, PraosValidationErr has 11 ctors none overlay-shaped; Praos LedgerView has no lvD/GenDelegs (TPraos's does, w/ verbatim "not present in Babbage" comment); HFEras.hs era->protocol table
+
 ## Forging / VRF / KES
 - [vrf-input-construction.md](vrf-input-construction.md) / [vrf-leader-check.md](vrf-leader-check.md) — VRF seed (TPraos vs Praos, mkInputVRF); checkLeaderValue, taylorExpCmp, FixedPoint E34, certNat/certNatMax
 - [block-forging-deep-dive.md](block-forging-deep-dive.md) — slot tick->leader check->tx selection->body hash->header->KES sign (see also block-forging-flow.md)
@@ -111,7 +114,8 @@
 
 ## Storage
 - [lsm-tree-architecture.md](lsm-tree-architecture.md) — lazy levelling merge, 4-file run format, bloom filters, NO WAL
-- [ledgerdb-v2-diff-retention-and-snapshot-decoupling.md](ledgerdb-v2-diff-retention-and-snapshot-decoupling.md) — V1 DbChangelog deleted; V2 LedgerSeq holds FULL materialized table per volatile-window block; rollback=pure AnchoredSeq trim; disk-snapshot decoupled from garbageCollect
+- [ledgerdb-v2-diff-retention-and-snapshot-decoupling.md](ledgerdb-v2-diff-retention-and-snapshot-decoupling.md) — fetched from unpinned `main`; V2 LedgerSeq holds FULL materialized table per volatile-window block; rollback=pure AnchoredSeq trim; disk-snapshot decoupled from garbageCollect. V1-deleted claim CORRECTED by next entry.
+- [ledgerdb-init-replay-rollback-anchor-mechanism-pinned.md](ledgerdb-init-replay-rollback-anchor-mechanism-pinned.md) — PINNED at oc 3.0.1.0 (matches cn 11.0.1): V1 still exists, V2 is default. Anchor is reassigned on EVERY replayed block (extend+pruneToImmTipOnly collapse), never "set once at startup". AnchoredSeq has NO hash-chain invariant (that's AnchoredFragment.valid); LedgerSeq coherence is construction-discipline not a checked invariant. Rollback/fork-switch = pure AnchoredSeq index, never disk re-derive.
 - [immutabledb-validation-reconstruction.md](immutabledb-validation-reconstruction.md) — ValidateMostRecentChunk vs ValidateAllChunks; chunk files=sole truth, indices ALWAYS reconstructed on mismatch; tip=last validated block, no tip file
 - [dblock-directory-locking.md](dblock-directory-locking.md) — DbLock.hs: `<db-path>/lock`, OS flock via ioFileLock, 2s timeout, runs AFTER checkDbMarker BEFORE ChainDB open
 
