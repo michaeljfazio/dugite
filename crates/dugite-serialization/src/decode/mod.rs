@@ -69,6 +69,7 @@ use dugite_primitives::transaction::{Transaction, TransactionInput, TransactionO
 /// Accepts the map bytes directly (without a block or tx context).
 /// Conway keys 0-33 and Dijkstra keys 34-37 are all handled.
 pub use era_conway::ppu_from_cbor;
+pub use era_shelley::pre_conway_ppu_from_cbor;
 
 /// Decode a native (timelock) script from its bare CBOR array encoding.
 /// Re-exported so the Mithril / Haskell-import UTxO loader can reconstruct a
