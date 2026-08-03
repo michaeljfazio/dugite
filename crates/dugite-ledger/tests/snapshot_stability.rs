@@ -7,31 +7,27 @@
 
 use dugite_ledger::state::snapshot_format::LedgerStateSnapshot;
 use dugite_ledger::LedgerState;
-use dugite_primitives::protocol_params::ProtocolParameters;
 
-/// Create a deterministic LedgerState with known default values.
+/// The shared, fully-populated fixture (#967).
+///
+/// Deliberately NOT a bare `LedgerState::new()`. bincode writes nothing for a
+/// `None` and nothing for an empty collection, so an empty fixture makes the
+/// hash below cover top-level scalars and essentially nothing else — any
+/// positional change inside a nested structure is invisible to it.
+///
+/// That is demonstrated, not theoretical: #966 added `treasury: u64` to
+/// `RatificationSnapshot`, a real layout change requiring SNAPSHOT_VERSION
+/// 31 -> 32, and this test stayed green through it because
+/// `ratification_snapshot` was `None`.
+///
+/// The fixture lives in the crate rather than here so that ONE definition
+/// serves both this hash and the in-crate
+/// `fixture_populates_every_snapshot_field`, which exhaustively destructures
+/// `LedgerStateSnapshot` and therefore fails to COMPILE when a new field is
+/// added without being populated. Two fixtures would drift, and a drifting
+/// fixture is how the blind spot opened in the first place.
 fn canonical_ledger_state() -> LedgerState {
-    let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
-
-    // Populate the governance ratification snapshot.
-    //
-    // WHY: `LedgerState::new()` alone leaves every Option `None` and every
-    // collection empty, so the format hash below only ever covered top-level
-    // scalars. A positional bincode change INSIDE a nested optional structure
-    // was invisible to it — the guard could not go red for exactly the class
-    // of change it exists to catch.
-    //
-    // That is not hypothetical: adding `treasury` to `RatificationSnapshot`
-    // (#966) is a real layout change requiring SNAPSHOT_VERSION 31 -> 32, and
-    // this test stayed green through it because `ratification_snapshot` was
-    // `None` in the fixture. A guard that cannot fail is not a guard.
-    //
-    // `RatificationSnapshot` is embedded in `GovernanceState`, which is
-    // serialized as part of every `LedgerState` snapshot, so populating it
-    // here brings its layout under the hash.
-    state.capture_ratification_snapshot();
-
-    state
+    dugite_ledger::state::test_fixtures::populated_ledger_state()
 }
 
 /// Round-trip: serialize → deserialize → serialize produces identical bytes.
@@ -76,24 +72,33 @@ fn snapshot_format_hash_stability() {
     // This hash was computed from the current LedgerStateSnapshot layout.
     // If this changes, existing snapshot files become unreadable.
     //
-    // Last update: SNAPSHOT_VERSION 31 → 32 (#966, 2026-08-02) —
-    // `RatificationSnapshot` gained `treasury: u64` (Haskell `ensTreasury`,
-    // the frozen pot `withdrawalCanWithdraw` gates `TreasuryWithdrawals`
-    // against). It was the one `dpEnactState` term never captured, so
-    // ratification fell back to the LIVE treasury, which already included the
-    // current boundary's `applyRUpd` — one boundary newer than Haskell's,
-    // enacting withdrawals an epoch early.
+    // Last update: #967, 2026-08-03 — the FIXTURE changed, not the layout.
     //
-    // The same commit populates the fixture with a ratification snapshot. The
-    // fixture was previously a bare `LedgerState::new()`, so nested optional
-    // structures were absent from the serialized bytes and this hash could not
-    // detect a layout change inside them — the #966 field was added and this
-    // test stayed green. The hash therefore moves for TWO reasons here: the
-    // new field, and the fixture now actually covering the structure.
+    // **Do not bump SNAPSHOT_VERSION for this move.** The on-disk format is
+    // byte-for-byte unchanged; what changed is that the fixture now populates
+    // every field, so the serialized bytes are ~2.5 KB of real structure
+    // instead of a few hundred bytes of top-level scalars. A hash over an
+    // empty fixture and a hash over a populated one are simply not the same
+    // number.
     //
-    // Prior baseline (empty fixture, pre-#966):
+    // Two distinct rules for changing this constant, and only the first is a
+    // format change:
+    //   * The layout of `LedgerStateSnapshot` (or anything nested in it)
+    //     changed -> bump SNAPSHOT_VERSION as well. Existing snapshots on disk
+    //     are now unreadable.
+    //   * `test_fixtures::populated_ledger_state` gained a value -> update
+    //     this constant alone. Nothing on disk is affected.
+    //
+    // Prior baselines:
     //   45d8c48be6338552a0dd04a8fbd38a65eba5d6d14930644bff9351945e745a00
-    const EXPECTED_HASH: &str = "24039764909a573f5549262574928132b8e15d3bc9a6acc9e550e218db3a02e3";
+    //     empty fixture, pre-#966
+    //   24039764909a573f5549262574928132b8e15d3bc9a6acc9e550e218db3a02e3
+    //     empty fixture + a ratification snapshot (#966, SNAPSHOT 31 -> 32:
+    //     `RatificationSnapshot` gained `treasury: u64`. That was a genuine
+    //     layout change and this test stayed GREEN through it, because
+    //     `ratification_snapshot` was `None` in the fixture — which is what
+    //     #967 is about.)
+    const EXPECTED_HASH: &str = "4f914e63503247701e098638d7b2948ed3a1d8d7d0478c7da3e91b1cb706d099";
 
     if EXPECTED_HASH == "COMPUTE_ON_FIRST_RUN" {
         panic!(
@@ -106,7 +111,9 @@ fn snapshot_format_hash_stability() {
         hash_hex, EXPECTED_HASH,
         "LedgerState serialization format changed — existing snapshots will be incompatible.\n\
          If this change was intentional, update EXPECTED_HASH to: {hash_hex}\n\
-         and bump SNAPSHOT_VERSION in state/mod.rs."
+         AND bump SNAPSHOT_VERSION in state/mod.rs — unless all you changed was\n\
+         the fixture in state/test_fixtures.rs, which moves this hash without\n\
+         touching the on-disk format."
     );
 }
 

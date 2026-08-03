@@ -11,6 +11,8 @@ mod rewards;
 mod snapshot;
 pub mod snapshot_format;
 pub mod substates;
+/// Shared, fully-populated fixtures for the snapshot-layout guards (#967).
+pub mod test_fixtures;
 
 // Re-export the deferred Phase-2 fatality applier for the bulk-sync pooling
 // path (apply_bench / node). Gated identically to its definition.
