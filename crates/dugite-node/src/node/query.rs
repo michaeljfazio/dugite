@@ -1057,6 +1057,24 @@ impl Node {
                     action_index: id.action_index,
                 })
                 .collect(),
+            // #977: the real `futurePParams` variant, not a constant. The
+            // payload is only carried for the variants that have one, so a
+            // client can distinguish "nothing queued" from "an update is
+            // queued but not yet known".
+            future_pparams_tag: match &ls.gov.governance.future_pparams {
+                dugite_ledger::state::FuturePParams::NoPParamsUpdate => 0,
+                dugite_ledger::state::FuturePParams::DefinitePParamsUpdate(_) => 1,
+                dugite_ledger::state::FuturePParams::PotentialPParamsUpdate(_) => 2,
+            },
+            future_pparams: match &ls.gov.governance.future_pparams {
+                dugite_ledger::state::FuturePParams::DefinitePParamsUpdate(pp) => {
+                    Some(Box::new(protocol_params_snapshot(pp)))
+                }
+                dugite_ledger::state::FuturePParams::PotentialPParamsUpdate(Some(pp)) => {
+                    Some(Box::new(protocol_params_snapshot(pp)))
+                }
+                _ => None,
+            },
             ratify_delayed: pulsed
                 .map(|p| p.delayed)
                 .unwrap_or(ls.gov.governance.last_ratify_delayed),

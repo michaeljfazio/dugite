@@ -1266,9 +1266,52 @@ fn encode_gov_state(
     // [4] prevPParams = array(31)
     encode_protocol_params_cbor(enc, &gov.prev_pparams);
 
-    // [5] FuturePParams = Sum: [0] = NoPParamsUpdate
-    enc.array(1).ok();
-    enc.u32(0).ok();
+    // [5] FuturePParams (#977) — a real tagged sum, not a constant.
+    //
+    // Verified against real preview epoch-1259 bytes by
+    // `dugite-serialization`'s `decode_future_pparams`:
+    //
+    //   NoPParamsUpdate          -> array(1) [0]
+    //   DefinitePParamsUpdate pp -> array(2) [1, pp]
+    //   PotentialPParamsUpdate m -> array(2) [2, <array(0) | array(1) [pp]>]
+    //
+    // The inner value of tag 2 is a `StrictMaybe`: `array(0)` for SNothing,
+    // `array(1) [pp]` for SJust. This was hardcoded to tag 0 until #977, which
+    // is right for the LATER part of every epoch and wrong for the earlier
+    // part — on mainnet, the first ~40%.
+    match (gov.future_pparams_tag, gov.future_pparams.as_ref()) {
+        // Definite ALWAYS carries the params, directly — no StrictMaybe
+        // wrapper, unlike Potential below.
+        (1, Some(pp)) => {
+            enc.array(2).ok();
+            enc.u32(1).ok();
+            encode_protocol_params_cbor(enc, pp);
+        }
+        // A Definite update with no payload is not representable upstream, so
+        // the tag must NOT be written at all: degrade wholly to
+        // NoPParamsUpdate rather than emit a frame cardano-cli cannot decode.
+        (1, None) => {
+            enc.array(1).ok();
+            enc.u32(0).ok();
+        }
+        (2, payload) => {
+            enc.array(2).ok();
+            enc.u32(2).ok();
+            match payload {
+                Some(pp) => {
+                    enc.array(1).ok(); // SJust
+                    encode_protocol_params_cbor(enc, pp);
+                }
+                None => {
+                    enc.array(0).ok(); // SNothing
+                }
+            }
+        }
+        _ => {
+            enc.array(1).ok();
+            enc.u32(0).ok();
+        }
+    }
 
     // [6] DRepPulsingState = DRComplete (Rec, no constructor tag): array(2)
     //     [PulsingSnapshot, RatifyState]
@@ -2777,6 +2820,94 @@ mod tests {
         VoteDelegateeEntry,
     };
     use minicbor::Decoder;
+
+    /// GOLDEN (#977): `futurePParams` must encode as a real tagged sum.
+    ///
+    /// Shapes verified against real preview epoch-1259 bytes by
+    /// `dugite-serialization`'s `decode_future_pparams`:
+    ///
+    /// ```text
+    /// NoPParamsUpdate            -> array(1) [0]
+    /// DefinitePParamsUpdate pp   -> array(2) [1, pp]
+    /// PotentialPParamsUpdate m   -> array(2) [2, <array(0) | array(1) [pp]>]
+    /// ```
+    ///
+    /// This was hardcoded to tag 0 — right for the LATER part of every epoch
+    /// and wrong for the earlier part, which on mainnet is the first ~40%.
+    #[test]
+    fn golden_future_pparams_encodes_all_three_variants() {
+        use crate::node::n2c_query::types::{GovStateSnapshot, ProtocolParamsSnapshot};
+
+        fn gov_with(tag: u8, payload: bool) -> GovStateSnapshot {
+            let pp = Box::new(ProtocolParamsSnapshot::default());
+            GovStateSnapshot {
+                proposals: Vec::new(),
+                committee: CommitteeSnapshot::default(),
+                constitution_url: String::new(),
+                constitution_hash: vec![0u8; 32],
+                constitution_script: None,
+                cur_pparams: pp.clone(),
+                prev_pparams: pp.clone(),
+                enacted_pparam_update: None,
+                enacted_hard_fork: None,
+                enacted_committee: None,
+                enacted_constitution: None,
+                treasury: 0,
+                future_pparams_tag: tag,
+                future_pparams: payload.then_some(pp),
+            }
+        }
+
+        /// Locate the futurePParams element by DECODING the GovState array up
+        /// to index 5, rather than by byte-offset arithmetic that would drift
+        /// silently if an earlier field changed size.
+        fn future_pparams_bytes(gov: &GovStateSnapshot) -> Vec<u8> {
+            let encoded = encode_query_result(&QueryResult::GovState(Box::new(gov.clone())));
+            let inner = strip_wrappers_for_test(&encoded);
+            let mut dec = Decoder::new(&inner);
+            dec.array().unwrap();
+            for _ in 0..5 {
+                dec.skip().unwrap();
+            }
+            let start = dec.position();
+            dec.skip().unwrap();
+            inner[start..dec.position()].to_vec()
+        }
+
+        assert_eq!(
+            future_pparams_bytes(&gov_with(0, false)),
+            vec![0x81, 0x00],
+            "NoPParamsUpdate"
+        );
+        assert_eq!(
+            future_pparams_bytes(&gov_with(2, false)),
+            vec![0x82, 0x02, 0x80],
+            "PotentialPParamsUpdate Nothing"
+        );
+
+        let potential_just = future_pparams_bytes(&gov_with(2, true));
+        assert_eq!(
+            &potential_just[..3],
+            &[0x82, 0x02, 0x81],
+            "PotentialPParamsUpdate Just wraps the params in a StrictMaybe array(1)"
+        );
+
+        let definite = future_pparams_bytes(&gov_with(1, true));
+        assert_eq!(&definite[..2], &[0x82, 0x01], "DefinitePParamsUpdate");
+        assert_ne!(
+            definite[2], 0x81,
+            "Definite carries the params DIRECTLY — no StrictMaybe wrapper, \
+             unlike Potential"
+        );
+
+        // A Definite with no payload is not representable upstream; degrade to
+        // NoPParamsUpdate rather than emit a frame cardano-cli cannot decode.
+        assert_eq!(
+            future_pparams_bytes(&gov_with(1, false)),
+            vec![0x81, 0x00],
+            "Definite without params degrades to NoPParamsUpdate"
+        );
+    }
 
     // ── Helper: strip the MsgResult [4, [result]] wrappers from a full
     //    encode_query_result() output and return just the inner payload. ──────

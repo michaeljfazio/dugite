@@ -35,6 +35,8 @@ pub(crate) fn handle_gov_state(state: &NodeStateSnapshot) -> QueryResult {
         enacted_committee: state.enacted_committee.clone(),
         enacted_constitution: state.enacted_constitution.clone(),
         treasury: state.treasury,
+        future_pparams_tag: state.future_pparams_tag,
+        future_pparams: state.future_pparams.clone(),
     }))
 }
 
@@ -107,6 +109,8 @@ pub(crate) fn handle_ratify_state(state: &NodeStateSnapshot) -> QueryResult {
         enacted_committee: state.enacted_committee.clone(),
         enacted_constitution: state.enacted_constitution.clone(),
         treasury: state.treasury,
+        future_pparams_tag: state.future_pparams_tag,
+        future_pparams: state.future_pparams.clone(),
     };
     QueryResult::RatifyState {
         gov: Box::new(gov),
