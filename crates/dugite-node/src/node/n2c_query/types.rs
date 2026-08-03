@@ -780,6 +780,12 @@ pub struct GovStateSnapshot {
     pub enacted_constitution: Option<(Vec<u8>, u32)>,
     /// Treasury balance (lovelace) — needed for EnactState in DRepPulsingState
     pub treasury: u64,
+    /// `futurePParams` (#977): 0 = NoPParamsUpdate, 1 = DefinitePParamsUpdate,
+    /// 2 = PotentialPParamsUpdate. The payload is present for tag 1 always and
+    /// for tag 2 when the update is already known.
+    pub future_pparams_tag: u8,
+    /// The parameters carried by tags 1 and 2, when present.
+    pub future_pparams: Option<Box<ProtocolParamsSnapshot>>,
 }
 
 /// Vote entry: (credential_hash, credential_type, vote)
@@ -1019,6 +1025,10 @@ pub struct NodeStateSnapshot {
     pub ratify_expired: Vec<GovActionId>,
     /// Whether ratification was delayed by a delaying action
     pub ratify_delayed: bool,
+    /// `futurePParams` variant for `GetGovState` (#977).
+    pub future_pparams_tag: u8,
+    /// Its payload, when the variant carries one.
+    pub future_pparams: Option<Box<ProtocolParamsSnapshot>>,
     /// Epoch nonce (32 bytes) for DebugChainDepState
     pub epoch_nonce: Vec<u8>,
     /// `praosStatePreviousEpochNonce` (32 bytes) — field [5] of the 8-element
@@ -1105,6 +1115,8 @@ impl Default for NodeStateSnapshot {
             update_quorum: 5,
             max_lovelace_supply: 45_000_000_000_000_000,
             ratify_enacted: Vec::new(),
+            future_pparams_tag: 0,
+            future_pparams: None,
             ratify_expired: Vec::new(),
             ratify_delayed: false,
             epoch_nonce: vec![0u8; 32],
