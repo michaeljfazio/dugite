@@ -851,13 +851,50 @@ impl Node {
                 .collect()
         };
 
-        // Build ratify_enacted proposals from governance.last_ratified.
-        // Include the full GovAction so the CBOR encoder can faithfully reproduce
-        // the action body in GetRatifyState responses (same fix as for governance_proposals).
-        let ratify_enacted = ls
-            .gov
-            .governance
-            .last_ratified
+        // `GetRatifyState` (tag 32) answers with the FROZEN PULSER RESULT — the
+        // ratification that WILL be applied at the next boundary — not with
+        // what already happened (#988).
+        //
+        //   queryRatifyState = snd . finishedPulserState
+        //
+        // dugite previously answered from `last_ratified`/`last_expired`/
+        // `last_ratify_delayed`, which record the LAST boundary's outcome: one
+        // boundary stale, the same shape and direction as #922 (GetProposals
+        // live vs frozen), #950 (GetDRepStakeDistr live vs frozen) and #966
+        // (RATIFY reading the live treasury).
+        //
+        // `pulsed_ratify_state` carries only the action IDs, so the full
+        // `ProposalState` is looked up in the frozen proposal set the pulser
+        // ran over — falling back to the live set for an action already swept
+        // out of it.
+        let pulsed = ls.gov.governance.pulsed_ratify_state.as_ref();
+        let ratify_source: Vec<(
+            dugite_primitives::transaction::GovActionId,
+            dugite_ledger::state::ProposalState,
+        )> = match pulsed {
+            Some(p) => {
+                let frozen = ls
+                    .gov
+                    .governance
+                    .ratification_snapshot
+                    .as_ref()
+                    .map(|s| &s.proposals);
+                p.enacted
+                    .iter()
+                    .filter_map(|id| {
+                        frozen
+                            .and_then(|m| m.get(id))
+                            .or_else(|| ls.gov.governance.proposals.get(id))
+                            .map(|st| (id.clone(), st.clone()))
+                    })
+                    .collect()
+            }
+            // No pulser yet (pre-Conway, or the first boundary after an
+            // upgrade): fall back to the last applied result rather than
+            // answering with nothing.
+            None => ls.gov.governance.last_ratified.to_vec(),
+        };
+        let ratify_enacted = ratify_source
             .iter()
             .map(|(action_id, state)| {
                 let action_type = gov_action_type_str(&state.procedure.gov_action);
@@ -1009,17 +1046,20 @@ impl Node {
                 .as_ref()
                 .map_or(45_000_000_000_000_000, |g| g.max_lovelace_supply),
             ratify_enacted,
-            ratify_expired: ls
-                .gov
-                .governance
-                .last_expired
+            // Same source as `ratify_enacted`: the frozen pulser, not the last
+            // applied result (#988).
+            ratify_expired: pulsed
+                .map(|p| &p.expired)
+                .unwrap_or(&ls.gov.governance.last_expired)
                 .iter()
                 .map(|id| super::n2c_query::GovActionId {
                     tx_id: id.transaction_id.as_ref().to_vec(),
                     action_index: id.action_index,
                 })
                 .collect(),
-            ratify_delayed: ls.gov.governance.last_ratify_delayed,
+            ratify_delayed: pulsed
+                .map(|p| p.delayed)
+                .unwrap_or(ls.gov.governance.last_ratify_delayed),
             epoch_nonce: ls.consensus.epoch_nonce.as_ref().to_vec(),
             previous_epoch_nonce: ls.consensus.previous_epoch_nonce.as_ref().to_vec(),
             last_epoch_block_nonce: ls.consensus.last_epoch_block_nonce.as_ref().to_vec(),
