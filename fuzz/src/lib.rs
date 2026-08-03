@@ -1076,24 +1076,14 @@ impl Gen<'_> {
 
     /// Auxiliary data for `era`.
     ///
-    /// `native_scripts` (and the plutus script vectors) are generated ONLY from
-    /// Conway on, because only `era_conway::decode_auxiliary_data` parses them.
-    /// `era_shelley::decode_auxiliary_data` — which serves the standalone
-    /// Shelley..Babbage paths — skips the scripts and returns every vector
-    /// empty, so generating them there fails the round-trip on a decoder gap
-    /// rather than on the encoder.
-    ///
-    /// That gap is real but latent: `raw_cbor` IS preserved, so the
-    /// `auxiliary_data_hash` check and byte-exact relay are unaffected, and
-    /// nothing in dugite-ledger or dugite-consensus reads the parsed vectors.
-    /// Tracked as #984 rather than widened into this change.
-    pub fn auxiliary_data_for(&mut self, era: Era) -> AuxiliaryData {
+    /// Scripts are generated for every era: #984 consolidated the three
+    /// auxiliary-data decoders, which each populated a different subset (one
+    /// had no `tag(259)` arm at all, so dugite's own encoder output decoded to
+    /// entirely empty auxiliary data). Before that fix this generator had to
+    /// exclude them from pre-Conway eras to avoid a permanent false positive.
+    pub fn auxiliary_data_for(&mut self, _era: Era) -> AuxiliaryData {
         let labels = self.collection_len(8);
-        let natives = if era >= Era::Conway {
-            self.collection_len(4)
-        } else {
-            0
-        };
+        let natives = self.collection_len(4);
         let mut metadata = BTreeMap::new();
         for _ in 0..labels {
             metadata.insert(self.u64(), self.metadatum(2));

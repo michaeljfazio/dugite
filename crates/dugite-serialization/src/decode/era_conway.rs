@@ -51,9 +51,7 @@
 //! tagged and untagged forms transparently.
 
 use crate::decode::era_shelley::DecodeMode;
-use crate::decode::helpers::{
-    read_hash28, read_hash32, read_lovelace, read_metadata_map as decode_metadata_map,
-};
+use crate::decode::helpers::{read_hash28, read_hash32, read_lovelace};
 use crate::decode::raw::KeepRaw;
 use crate::decode::reader::Reader;
 use crate::error::SerializationError;
@@ -2849,112 +2847,12 @@ fn decode_aux_data_map(
     Ok(pairs.into_iter().collect())
 }
 
+/// Conway/Dijkstra auxiliary data.
+///
+/// Delegates to the shared decoder. This copy handled all three shapes but
+/// still skipped the ShelleyMa array's native scripts. Issue #984.
 fn decode_auxiliary_data(r: &mut Reader<'_>) -> Result<AuxiliaryData, SerializationError> {
-    let raw_start = r.position();
-    r.skip()?;
-    let raw_bytes = r.slice_from(raw_start).to_vec();
-
-    let mut aux_r = Reader::new(&raw_bytes);
-    let ty = aux_r.peek_major()?;
-
-    let (metadata, native_scripts, plutus_v1_scripts, plutus_v2_scripts, plutus_v3_scripts) =
-        match ty {
-            // Bare Shelley-form metadata map. Haskell `ShelleyTxAuxData`
-            // goes through `encodeMap`, which emits an INDEFINITE map for
-            // > 23 labels (#932) — so both header forms must be accepted
-            // (`decode_metadata_map` handles either via `read_map`).
-            Type::Map | Type::MapIndef => {
-                let meta = decode_metadata_map(&mut aux_r)?;
-                (meta, Vec::new(), Vec::new(), Vec::new(), Vec::new())
-            }
-            Type::Array => {
-                let arr_len = aux_r.read_array_header()?;
-                if !matches!(arr_len, Some(2)) {
-                    (
-                        BTreeMap::new(),
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                    )
-                } else {
-                    let meta = decode_metadata_map(&mut aux_r)?;
-                    aux_r.skip()?;
-                    (meta, Vec::new(), Vec::new(), Vec::new(), Vec::new())
-                }
-            }
-            Type::Tag => {
-                // Alonzo+ PostAlonzoAuxiliaryData: tag(259) { ... }
-                // or tag(11311) in some representations; skip the tag
-                let _tag = aux_r.read_tag()?;
-                // Now read map
-                let mut meta = BTreeMap::new();
-                let mut ns = Vec::new();
-                let mut v1 = Vec::new();
-                let mut v2 = Vec::new();
-                let mut v3 = Vec::new();
-                if let Ok(Some(n)) = aux_r.read_map_header() {
-                    for _ in 0..n {
-                        if let Ok(key) = aux_r.read_uint() {
-                            match key {
-                                0 => {
-                                    if let Ok(m) = decode_metadata_map(&mut aux_r) {
-                                        meta = m;
-                                    } else {
-                                        let _ = aux_r.skip();
-                                    }
-                                }
-                                1 => {
-                                    let _ = aux_r.read_array(|r| {
-                                        let s = read_native_script(r)?;
-                                        ns.push(s);
-                                        Ok(())
-                                    });
-                                }
-                                2 => {
-                                    let _ = aux_r.read_array(|r| {
-                                        v1.push(r.read_bytes_owned()?);
-                                        Ok(())
-                                    });
-                                }
-                                3 => {
-                                    let _ = aux_r.read_array(|r| {
-                                        v2.push(r.read_bytes_owned()?);
-                                        Ok(())
-                                    });
-                                }
-                                4 => {
-                                    let _ = aux_r.read_array(|r| {
-                                        v3.push(r.read_bytes_owned()?);
-                                        Ok(())
-                                    });
-                                }
-                                _ => {
-                                    let _ = aux_r.skip();
-                                }
-                            }
-                        }
-                    }
-                }
-                (meta, ns, v1, v2, v3)
-            }
-            _ => (
-                BTreeMap::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            ),
-        };
-
-    Ok(AuxiliaryData {
-        metadata,
-        native_scripts,
-        plutus_v1_scripts,
-        plutus_v2_scripts,
-        plutus_v3_scripts,
-        raw_cbor: Some(raw_bytes),
-    })
+    super::era_alonzo::decode_alonzo_auxiliary_data(r)
 }
 
 // ============================================================================

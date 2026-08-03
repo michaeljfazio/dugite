@@ -80,9 +80,7 @@
 //! skipped entirely (empty `TransactionWitnessSet`). Auxiliary data is always parsed.
 
 use crate::decode::era_conway::{read_cost_models, read_ex_unit_prices, read_ex_units};
-use crate::decode::helpers::{
-    read_hash28, read_hash32, read_lovelace, read_metadata_map as decode_metadata_map,
-};
+use crate::decode::helpers::{read_hash28, read_hash32, read_lovelace};
 use crate::decode::raw::KeepRaw;
 use crate::decode::reader::Reader;
 use crate::error::SerializationError;
@@ -1264,46 +1262,14 @@ fn decode_aux_data_map(
 /// Alonzo+ aux data is a tag(259) map.
 ///
 /// For Shelley, the aux data is always the plain metadata map form.
+/// Shelley-era auxiliary data.
+///
+/// Delegates to the shared decoder. This copy previously had NO `tag(259)`
+/// arm, so any PostAlonzo-shaped auxiliary data reaching it decoded to
+/// entirely empty auxiliary data — metadata included — and its ShelleyMa arm
+/// skipped the native scripts. Issue #984.
 fn decode_auxiliary_data(r: &mut Reader<'_>) -> Result<AuxiliaryData, SerializationError> {
-    // Capture raw CBOR bytes
-    let raw_start = r.position();
-    r.skip()?;
-    let raw_bytes = r.slice_from(raw_start).to_vec();
-
-    // Re-parse the aux data to extract metadata
-    let mut aux_r = Reader::new(&raw_bytes);
-    let ty = aux_r.peek_major()?;
-    let metadata = match ty {
-        Type::Map | Type::MapIndef => {
-            // Plain Shelley metadata map. Haskell `ShelleyTxAuxData` goes
-            // through `encodeMap`, which emits an INDEFINITE map for > 23
-            // labels (#932) — accept both header forms.
-            decode_metadata_map(&mut aux_r)?
-        }
-        Type::Array => {
-            // ShelleyMa: [metadata_map, native_scripts]
-            let arr_len = aux_r.read_array_header()?;
-            if !matches!(arr_len, Some(2)) {
-                // Unexpected format — return empty
-                BTreeMap::new()
-            } else {
-                let meta = decode_metadata_map(&mut aux_r)?;
-                // skip native scripts
-                aux_r.skip()?;
-                meta
-            }
-        }
-        _ => BTreeMap::new(),
-    };
-
-    Ok(AuxiliaryData {
-        metadata,
-        native_scripts: Vec::new(),
-        plutus_v1_scripts: Vec::new(),
-        plutus_v2_scripts: Vec::new(),
-        plutus_v3_scripts: Vec::new(),
-        raw_cbor: Some(raw_bytes),
-    })
+    super::era_alonzo::decode_alonzo_auxiliary_data(r)
 }
 
 // ============================================================================

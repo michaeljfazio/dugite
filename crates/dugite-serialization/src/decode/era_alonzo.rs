@@ -1416,9 +1416,24 @@ pub(crate) fn decode_alonzo_aux_data_map(
 /// Decode an Alonzo auxiliary data value.
 ///
 /// Wire formats:
+/// The single auxiliary-data decoder, shared by every era.
+///
+/// Three wire shapes:
 /// - Plain map (Shelley): `{ label => metadatum }`
 /// - ShelleyMa (Allegra/Mary): `[metadata_map, native_scripts]`
-/// - PostAlonzo: `tag(259) { 0 => metadata, 1 => [native_scripts], 2 => [plutus_v1] }`
+/// - PostAlonzo: `tag(259) { 0 => metadata, 1 => [native_scripts],
+///   2 => [plutus_v1], 3 => [plutus_v2], 4 => [plutus_v3] }`
+///
+/// It is shared because it was not. Three copies existed, each populating a
+/// DIFFERENT subset: this one dropped `native_scripts` and both later Plutus
+/// vectors, `era_shelley`'s had no `tag(259)` arm at all (so dugite's own
+/// encoder output decoded to entirely empty auxiliary data), and only
+/// `era_conway`'s was complete — and even that skipped the ShelleyMa scripts.
+/// Issue #984. Same mechanism as #937 (three drifted `read_metadatum` copies),
+/// #932/#938 (triplicated body encoders) and the `read_pool_params` relay gap.
+///
+/// `raw_cbor` is preserved in every branch, so the `auxiliary_data_hash` check
+/// and byte-exact relay never depended on any of this.
 pub(crate) fn decode_alonzo_auxiliary_data(
     r: &mut Reader<'_>,
 ) -> Result<AuxiliaryData, SerializationError> {
@@ -1430,8 +1445,10 @@ pub(crate) fn decode_alonzo_auxiliary_data(
     let ty = aux_r.peek_major()?;
 
     let mut metadata = BTreeMap::new();
-    let native_scripts: Vec<NativeScript> = Vec::new();
+    let mut native_scripts: Vec<NativeScript> = Vec::new();
     let mut plutus_v1_scripts: Vec<Vec<u8>> = Vec::new();
+    let mut plutus_v2_scripts: Vec<Vec<u8>> = Vec::new();
+    let mut plutus_v3_scripts: Vec<Vec<u8>> = Vec::new();
 
     match ty {
         // Bare Shelley-form metadata map — Haskell `encodeMap` emits an
@@ -1444,8 +1461,10 @@ pub(crate) fn decode_alonzo_auxiliary_data(
             let arr_len = aux_r.read_array_header()?;
             if matches!(arr_len, Some(2)) {
                 metadata = decode_metadata_map(&mut aux_r)?;
-                // Skip native scripts (we don't decode them from aux data)
-                aux_r.skip()?;
+                aux_r.for_each_array_item(|r| {
+                    native_scripts.push(read_native_script(r)?);
+                    Ok(())
+                })?;
             }
         }
         Type::Tag => {
@@ -1461,19 +1480,32 @@ pub(crate) fn decode_alonzo_auxiliary_data(
                         metadata = decode_metadata_map(r)?;
                     }
                     1 => {
-                        // native scripts — skip for now
-                        r.skip()?;
-                    }
-                    2 => {
-                        // plutus_v1_scripts (array of byte strings).
-                        // Use for_each_array_item so indefinite-length
-                        // arrays don't silently truncate.
-                        let mut local = Vec::new();
                         r.for_each_array_item(|r| {
-                            local.push(r.read_bytes_owned()?);
+                            native_scripts.push(read_native_script(r)?);
                             Ok(())
                         })?;
-                        plutus_v1_scripts.extend(local);
+                    }
+                    // Plutus script vectors, keys 2/3/4 = V1/V2/V3.
+                    //
+                    // `for_each_array_item` rather than a length-prefixed read
+                    // so indefinite-length arrays do not silently truncate.
+                    2 => {
+                        r.for_each_array_item(|r| {
+                            plutus_v1_scripts.push(r.read_bytes_owned()?);
+                            Ok(())
+                        })?;
+                    }
+                    3 => {
+                        r.for_each_array_item(|r| {
+                            plutus_v2_scripts.push(r.read_bytes_owned()?);
+                            Ok(())
+                        })?;
+                    }
+                    4 => {
+                        r.for_each_array_item(|r| {
+                            plutus_v3_scripts.push(r.read_bytes_owned()?);
+                            Ok(())
+                        })?;
                     }
                     _ => {
                         r.skip()?;
@@ -1491,8 +1523,8 @@ pub(crate) fn decode_alonzo_auxiliary_data(
         metadata,
         native_scripts,
         plutus_v1_scripts,
-        plutus_v2_scripts: Vec::new(),
-        plutus_v3_scripts: Vec::new(),
+        plutus_v2_scripts,
+        plutus_v3_scripts,
         raw_cbor: Some(raw_bytes),
     })
 }
