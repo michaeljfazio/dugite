@@ -804,6 +804,31 @@ fn read_hash28_cert(r: &mut Reader<'_>) -> Result<Hash28, SerializationError> {
 
 /// Read pool_params from the register pool certificate.
 fn read_pool_params(r: &mut Reader<'_>) -> Result<PoolParams, SerializationError> {
+    read_pool_params_inner(r, false)
+}
+
+/// The single `pool_params` decoder, shared by every era.
+///
+/// `strict_owners` selects `read_set_strict` (Conway PV9+ duplicate rejection)
+/// over the lenient `read_set`; that is the ONLY per-era difference in this
+/// structure, since the `pool_params` CDDL is unchanged from Shelley on.
+///
+/// It is shared because it was not, and that cost a real bug: #670 required
+/// relays to be decoded into `Relay` values rather than skipped, and the fix
+/// landed in this file and in the Conway copy but NOT in the Alonzo-family
+/// copy — which serves Allegra, Mary, Alonzo AND Babbage, since
+/// `era_babbage` calls `era_alonzo::read_alonzo_cert_inner`. Every
+/// `PoolRegistration` certificate in those four eras decoded with
+/// `relays: []`, which is exactly the symptom #670 was filed for
+/// (`pool_params: value_mismatches=605`) and also starves ledger-based peer
+/// discovery, which reads relay addresses out of `pool_params`.
+///
+/// Three copies of a decoder is the same mechanism behind #937 (three drifted
+/// `read_metadatum` copies) and #932/#938 (triplicated body encoders).
+pub(crate) fn read_pool_params_inner(
+    r: &mut Reader<'_>,
+    strict_owners: bool,
+) -> Result<PoolParams, SerializationError> {
     // pool_params = (
     //   operator: pool_keyhash,
     //   vrf_keyhash: vrf_keyhash,
@@ -825,7 +850,11 @@ fn read_pool_params(r: &mut Reader<'_>) -> Result<PoolParams, SerializationError
     let margin = r.read_rational()?;
     let reward_account = r.read_bytes_owned()?;
     // pool_owners: set of addr_keyhash (28 bytes each)
-    let pool_owners: Vec<Hash28> = r.read_set(|r| read_hash28_cert(r))?;
+    let pool_owners: Vec<Hash28> = if strict_owners {
+        r.read_set_strict(|r| read_hash28_cert(r))?
+    } else {
+        r.read_set(|r| read_hash28_cert(r))?
+    };
     // relays: array of relay structs (definite OR indefinite-length).
     //
     // #673: cn 11.0.1 emits indefinite-length relay arrays on preview /

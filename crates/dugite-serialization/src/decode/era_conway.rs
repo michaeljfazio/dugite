@@ -66,8 +66,8 @@ use dugite_primitives::time::{BlockNo, SlotNo};
 use dugite_primitives::transaction::{
     Anchor, AuxiliaryData, BootstrapWitness, Certificate, Constitution, CostModels, DRep,
     ExUnitPrices, ExUnits, GovAction, GovActionId, MIRSource, MIRTarget, NativeScript, OutputDatum,
-    PlutusData, PoolMetadata, PoolParams, ProposalProcedure, ProtocolParamUpdate, Rational,
-    Redeemer, RedeemerTag, Transaction, TransactionBody, TransactionInput, TransactionOutput,
+    PlutusData, PoolParams, ProposalProcedure, ProtocolParamUpdate, Rational, Redeemer,
+    RedeemerTag, Transaction, TransactionBody, TransactionInput, TransactionOutput,
     TransactionWitnessSet, VKeyWitness, Vote, Voter, VotingProcedure,
 };
 use dugite_primitives::value::{AssetName, Lovelace, Value};
@@ -1726,77 +1726,12 @@ pub(crate) fn read_anchor(r: &mut Reader<'_>) -> Result<Anchor, SerializationErr
     Ok(Anchor { url, data_hash })
 }
 
+/// Conway/Dijkstra `pool_params`.
+///
+/// Delegates to the shared implementation with `strict_owners`, since Conway
+/// PV9+ rejects duplicate set elements.
 fn read_pool_params(r: &mut Reader<'_>) -> Result<PoolParams, SerializationError> {
-    let operator = read_hash28_cert(r)?;
-    let vrf_keyhash = read_hash32(r)?;
-    let pledge = read_lovelace(r)?;
-    let cost = read_lovelace(r)?;
-    let margin = r.read_rational()?;
-    let reward_account = r.read_bytes_owned()?;
-    let pool_owners: Vec<Hash28> = r.read_set_strict(|r| read_hash28_cert(r))?;
-    // relays: definite OR indefinite-length array — see #673 / era_shelley.rs.
-    //
-    // Issue #670: decode relays into `Relay` values (not skip) so the
-    // from-genesis ledger state matches the Mithril ancillary import
-    // byte-exact on `pool_params`.  See era_shelley::read_relay for the
-    // CDDL.  Without this the verify-ledger-snapshot harness reported
-    // `pool_params: value_mismatches=605` against the ancillary on
-    // preview epoch 1308.
-    let mut relays: Vec<dugite_primitives::transaction::Relay> = Vec::new();
-    r.for_each_array_item(|r| {
-        relays.push(super::era_shelley::read_relay(r)?);
-        Ok(())
-    })?;
-    let pool_metadata = read_pool_metadata(r)?;
-    Ok(PoolParams {
-        operator,
-        vrf_keyhash,
-        pledge,
-        cost,
-        margin: Rational {
-            numerator: margin.numerator,
-            denominator: margin.denominator,
-        },
-        reward_account,
-        pool_owners,
-        relays,
-        pool_metadata,
-    })
-}
-
-fn read_pool_metadata(r: &mut Reader<'_>) -> Result<Option<PoolMetadata>, SerializationError> {
-    let ty = r.peek_major()?;
-    if ty == Type::Null {
-        r.read_null()?;
-        return Ok(None);
-    }
-    let arr_len = r.read_array_header()?;
-    if !matches!(arr_len, Some(2)) {
-        return Err(SerializationError::CborDecode(format!(
-            "pool_metadata: expected array(2) or null, got {arr_len:?}"
-        )));
-    }
-    // pool_metadata_url is defined as `text` in the CDDL (Shelley+).
-    // Mainnet blocks use CBOR major type 3 (text string) for the URL.
-    // Handle both text and bytes for robustness against non-canonical encodings.
-    let ty = r.peek_major()?;
-    let url = match ty {
-        minicbor::data::Type::String => r.read_str()?.to_string(),
-        _ => {
-            let url_bytes = r.read_bytes()?;
-            String::from_utf8(url_bytes.to_vec()).map_err(|_| {
-                SerializationError::CborDecode("pool_metadata url: invalid UTF-8".into())
-            })?
-        }
-    };
-    let hash = {
-        let bytes = r.read_bytes()?;
-        let mut buf = [0u8; 32];
-        let len = bytes.len().min(32);
-        buf[..len].copy_from_slice(&bytes[..len]);
-        Hash32::from_bytes(buf)
-    };
-    Ok(Some(PoolMetadata { url, hash }))
+    super::era_shelley::read_pool_params_inner(r, true)
 }
 
 fn read_mir_cert(r: &mut Reader<'_>) -> Result<Certificate, SerializationError> {
