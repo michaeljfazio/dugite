@@ -11,8 +11,8 @@
 use libfuzzer_sys::fuzz_target;
 use std::collections::HashMap;
 
-use dugite_ledger::validation::validate_transaction;
 use dugite_ledger::utxo::UtxoLookup;
+use dugite_ledger::validation::validate_transaction;
 use dugite_primitives::address::Address;
 use dugite_primitives::hash::Hash32;
 use dugite_primitives::protocol_params::ProtocolParameters;
@@ -141,11 +141,8 @@ fuzz_target!(|data: &[u8]| {
     // Build transaction outputs
     let mut outputs = Vec::new();
     for i in 0..num_outputs {
-        let output_ada = (read_u64(
-            data,
-            (offset + i * 8).min(data.len().saturating_sub(8)),
-        )
-        .wrapping_rem(50_000_000_000))
+        let output_ada = (read_u64(data, (offset + i * 8).min(data.len().saturating_sub(8)))
+            .wrapping_rem(50_000_000_000))
         .max(1_000_000);
 
         let addr_seed = [((i as u8).wrapping_add(100).wrapping_mul(13)); 28];
@@ -224,6 +221,6 @@ fuzz_target!(|data: &[u8]| {
         &params,
         current_slot,
         data.len() as u64, // Use fuzz data length as an approximation of tx size
-        None,               // No slot config (skip Plutus evaluation)
+        None,              // No slot config (skip Plutus evaluation)
     );
 });

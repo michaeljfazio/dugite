@@ -28,8 +28,7 @@ fuzz_target!(|data: &[u8]| {
     let period_end = data.len().min(36);
     let mut period_bytes = [0u8; 4];
     if period_end > period_start {
-        period_bytes[..period_end - period_start]
-            .copy_from_slice(&data[period_start..period_end]);
+        period_bytes[..period_end - period_start].copy_from_slice(&data[period_start..period_end]);
     }
     // Clamp to [0, MAX_KES_EVOLUTIONS] so we hit the valid-period path often.
     let raw_period = u32::from_le_bytes(period_bytes);

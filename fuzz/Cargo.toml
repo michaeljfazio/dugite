@@ -9,6 +9,11 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+# Structured generation (#974). Every target used to be `|data: &[u8]|`, which
+# bounds the reachable encoder surface to what a byte mutator can synthesise —
+# the mechanical reason the v2.4.1-v2.4.5 encoder wave went undetected.
+arbitrary = { version = "1", features = ["derive"] }
+num-bigint = { version = "0.4", features = ["serde"] }
 bincode = "1"
 minicbor = { version = "0.25", features = ["std"] }
 imbl = { version = "7.0.0", features = ["serde"] }
@@ -34,6 +39,11 @@ tokio = { version = "1", features = ["rt"] }
 # Prevent this from interfering with workspaces
 [workspace]
 members = ["."]
+
+# Shared structured generators for the encode-first targets (#974).
+[lib]
+name = "dugite_fuzz"
+path = "src/lib.rs"
 
 [[bin]]
 name = "fuzz_decode_block"
@@ -313,4 +323,25 @@ doc = false
 [[bin]]
 name = "fuzz_byron_block_decode"
 path = "fuzz_targets/byron_block_decode.rs"
+doc = false
+
+# ── Encode-first structured targets (#974) ──────────────────────────────────
+#
+# These invert the direction of every other target: they GENERATE the
+# structure and require the decoder to reproduce it, instead of requiring the
+# fuzzer to synthesise valid CBOR before the encoder runs at all.
+
+# Whole-transaction round-trip over generated bodies, certificates,
+# governance, witness sets and auxiliary data.
+[[bin]]
+name = "fuzz_structured_tx_encode"
+path = "fuzz_targets/structured_tx_encode.rs"
+doc = false
+
+# ProtocolParamUpdate keys 0-37. This is the shape #951 lived in: PPU key 26
+# wrote the ten drep_voting_thresholds in the wrong order, and the decoder was
+# right, so a generated round-trip separates them immediately.
+[[bin]]
+name = "fuzz_structured_pparam_update"
+path = "fuzz_targets/structured_pparam_update.rs"
 doc = false

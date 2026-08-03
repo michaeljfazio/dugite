@@ -15,8 +15,8 @@
 
 #![no_main]
 
-use libfuzzer_sys::fuzz_target;
 use dugite_primitives::address::Address;
+use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     // Address::from_bytes must never panic, regardless of input.
