@@ -1086,7 +1086,7 @@ impl Gen<'_> {
     /// That gap is real but latent: `raw_cbor` IS preserved, so the
     /// `auxiliary_data_hash` check and byte-exact relay are unaffected, and
     /// nothing in dugite-ledger or dugite-consensus reads the parsed vectors.
-    /// Tracked separately rather than widened into this change.
+    /// Tracked as #984 rather than widened into this change.
     pub fn auxiliary_data_for(&mut self, era: Era) -> AuxiliaryData {
         let labels = self.collection_len(8);
         let natives = if era >= Era::Conway {
