@@ -293,9 +293,10 @@ pub(crate) fn eval_resolved_redeemer(
     crate::scope_check::check_scope(&applied_term)?;
 
     // Debug aid (like DUGITE_DUMP_CTX above): dump the fully-applied
-    // program as flat so it can be replayed through an external reference
-    // CEK (Haskell `uplc evaluate`, `aiken uplc eval`) when root-causing a
-    // budget/trace divergence offline. Two modes:
+    // program as flat so it can be replayed through the reference CEK
+    // (Haskell `uplc evaluate` — the authoritative one; a third-party
+    // evaluator can corroborate but cannot settle a divergence, see #970)
+    // when root-causing a budget/trace difference offline. Two modes:
     //  - `DUGITE_DUMP_APPLIED_DIR` alone: dump EVERY applied term (file name
     //    `applied-{tag}-{idx}.flat`, OVERWRITES per tag/index) — for single-tx
     //    offline repro.

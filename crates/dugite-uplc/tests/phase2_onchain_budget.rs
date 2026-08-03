@@ -167,8 +167,14 @@ fn onchain_v3_spend_71579b77_validates() {
 /// flat-encoded applied program (script + ctx already pre-applied) through
 /// dugite's CEK machine with LATEST (V3 strict) semantics.
 ///
-/// The identical flat file passes in `aiken uplc eval --flat`, so any failure
-/// here is a pure CEK bug independent of ScriptContext construction.
+/// The program and its context are already applied, so any failure here is a
+/// pure CEK bug independent of ScriptContext construction — which is the whole
+/// point of isolating it this way.
+///
+/// The expected result is `(con unit ())`: this is a real on-chain V3 spend
+/// (tx 71579b77) that the CHAIN accepted, so the transaction's own inclusion is
+/// the oracle. An earlier version of this comment cited `aiken uplc eval` as
+/// the authority; that was circular and is not why the expectation holds.
 ///
 /// The flat file was captured at:
 /// `DUGITE_DUMP_APPLIED_DIR=/tmp/v3_dump cargo nextest run … onchain_v3_spend_71579b77_validates`
@@ -178,8 +184,8 @@ fn cek_v3_spend_71579b77_flat_evaluates() {
     // Flat bytes of the applied program (script applied to ctx), captured from
     // DUGITE_DUMP_APPLIED_DIR and committed as a hermetic fixture so this test
     // runs in CI (no /tmp runtime dependency).
-    // aiken uplc eval --flat <this> → { "result": "(con unit ())", ... }
-    // dugite should also produce unit without error.
+    // Expected: unit, with no error — the tx this was captured from is on
+    // chain, so the reference implementations accepted it by construction.
     // To regenerate: DUGITE_DUMP_APPLIED_DIR=/tmp/v3_dump cargo nextest run -p
     //   dugite-uplc -E 'test(onchain_v3_spend_71579b77_validates)' then copy
     //   /tmp/v3_dump/applied-Spend-0.flat over the fixture below.

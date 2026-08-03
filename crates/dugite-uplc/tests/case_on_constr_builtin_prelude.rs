@@ -1,9 +1,9 @@
-//! Reproducer for issue #656 — Aiken-built PlutusV3 always-true validator
-//! fails phase-2 evaluation with `De Bruijn index 2 out of range (env depth 0)`.
+//! Golden vector for issue #656 — a UPLC program that binds its builtins as
+//! locals via `case`-on-`Constr` before entering the body.
 //!
-//! The script bytes are vendored from the `aiken` 1.1.22 toolchain via
-//! `testnet/local-devnet/tx-zoo/lib/build-plutus.sh`. The decoded shape
-//! (per `aiken uplc decode --cbor`) is:
+//! # What this pins
+//!
+//! The decoded shape is:
 //!
 //! ```text
 //! (program 1.1.0
@@ -12,26 +12,43 @@
 //!       (lam i_1 (lam i_2 (lam i_3 (lam i_4 (lam i_5 …))))))))
 //! ```
 //!
-//! i.e. it first binds the 5 list/pair/ifThenElse builtins as locals via
-//! `case`-on-`Constr`, then enters the script body. Applied to a `Data`
-//! ctx, it should reduce without raising `CekFailure`.
+//! i.e. five list/pair/ifThenElse builtins are bound as locals through a
+//! `case` scrutinising a `Constr`, and only then does the script body run.
+//! dugite's CEK machine got the environment depth wrong for that shape and
+//! raised `De Bruijn index 2 out of range (env depth 0)` — issue #656, a real
+//! defect in this crate, not in whatever produced the bytes.
 //!
-//! This test passes on `aiken uplc eval` for the same flat bytes. It is
-//! expected to FAIL on dugite until #656 is fixed; once a fix lands, the
-//! `#[ignore]` attribute should be removed.
+//! # Provenance, as history rather than authority
+//!
+//! These bytes were originally emitted by the `aiken` 1.1.22 toolchain, which
+//! the devnet used before #969/#970 replaced it with IntersectMBO's own
+//! plutus-tx artifacts. That is recorded because it explains where the shape
+//! came from, NOT because Aiken is a reference: a third-party compiler cannot
+//! settle what is correct, and #772 recorded that appealing to it is circular.
+//!
+//! The bytes are kept as an OPAQUE golden vector precisely so that removing the
+//! toolchain does not remove the regression coverage. Nothing here asserts that
+//! Aiken's evaluator agrees with dugite; the assertion is that this UPLC shape
+//! reduces without a De Bruijn failure, which is a property of dugite's CEK
+//! machine alone. If plutus-tx never emits this shape, deleting the fixture
+//! would silently drop the only guard against #656 returning.
+//!
+//! Upstream plutus-tx programs are exercised separately, and as an oracle
+//! rather than a shape sample, in `upstream_plutus_examples.rs`.
 
 use dugite_uplc::{Constant, Data, Program, Term};
 use num_bigint::BigInt;
 use std::rc::Rc;
 
-/// Inner flat bytes (post-CBOR-unwrap) of the canonical Aiken-built
-/// PlutusV3 always-true validator. Source:
-/// `testnet/local-devnet/tx-zoo/lib/plutus/always-true-v3.plutus`,
+/// Inner flat bytes (post-CBOR-unwrap) of the program described above.
+/// Historically `testnet/local-devnet/tx-zoo/lib/plutus/always-true-v3.plutus`
+/// as built by aiken 1.1.22; that path now holds an upstream plutus-tx script,
+/// so these bytes live here and only here.
 /// cborHex = `588d588b<139 bytes>` → strip outer CBOR (58 8d) and inner
 /// CBOR (58 8b) to get the 139-byte flat program. This constant inlines
 /// the inner-CBOR-wrapped form (141 bytes) so we can use
 /// `Program::from_cbor`.
-const AIKEN_V3_ALWAYS_TRUE_CBOR: &[u8] = &[
+const CASE_ON_CONSTR_PRELUDE_CBOR: &[u8] = &[
     0x58, 0x8b, 0x01, 0x01, 0x00, 0x29, 0x80, 0x0a, 0xba, 0x2a, 0xba, 0x1a, 0xab, 0x9e, 0xaa, 0xb9,
     0xda, 0xb9, 0xa4, 0x88, 0x88, 0x96, 0x60, 0x02, 0x64, 0x64, 0x65, 0x30, 0x01, 0x30, 0x05, 0x37,
     0x54, 0x00, 0x33, 0x00, 0x70, 0x03, 0x98, 0x03, 0x80, 0x12, 0x44, 0x4b, 0x30, 0x01, 0x33, 0x70,
@@ -45,7 +62,7 @@ const AIKEN_V3_ALWAYS_TRUE_CBOR: &[u8] = &[
 
 #[test]
 fn decode_succeeds() {
-    let p = Program::from_cbor(AIKEN_V3_ALWAYS_TRUE_CBOR)
+    let p = Program::from_cbor(CASE_ON_CONSTR_PRELUDE_CBOR)
         .expect("Aiken-built V3 always-true must decode cleanly after #41b7a036a");
     assert_eq!(
         p.version,
@@ -72,7 +89,7 @@ fn decode_succeeds() {
 /// signature — exactly because we now reach the script body intact.
 #[test]
 fn cek_reaches_body_no_var_lookup_failure() {
-    let p = Program::from_cbor(AIKEN_V3_ALWAYS_TRUE_CBOR)
+    let p = Program::from_cbor(CASE_ON_CONSTR_PRELUDE_CBOR)
         .expect("decode canonical Aiken V3 always-true");
     let stub_ctx = Data::Constr(
         BigInt::from(0),
