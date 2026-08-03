@@ -78,9 +78,8 @@ use dugite_primitives::hash::{blake2b_256, Hash28, Hash32};
 use dugite_primitives::time::{BlockNo, SlotNo};
 use dugite_primitives::transaction::{
     AuxiliaryData, BootstrapWitness, Certificate, ExUnits, MIRSource, MIRTarget, NativeScript,
-    OutputDatum, PlutusData, PoolMetadata, PoolParams, Rational, Redeemer, RedeemerTag,
-    Transaction, TransactionBody, TransactionInput, TransactionOutput, TransactionWitnessSet,
-    VKeyWitness,
+    OutputDatum, PlutusData, PoolParams, Redeemer, RedeemerTag, Transaction, TransactionBody,
+    TransactionInput, TransactionOutput, TransactionWitnessSet, VKeyWitness,
 };
 use dugite_primitives::value::{AssetName, Lovelace, Value};
 use minicbor::data::Type;
@@ -894,69 +893,13 @@ fn read_hash28_cert(r: &mut Reader<'_>) -> Result<Hash28, SerializationError> {
     })
 }
 
+/// Alonzo-family (Allegra / Mary / Alonzo / Babbage) `pool_params`.
+///
+/// Delegates to the shared implementation. This copy previously SKIPPED the
+/// relays and hardcoded `relays: Vec::new()`, so #670's fix never reached the
+/// four eras it serves.
 fn read_pool_params(r: &mut Reader<'_>) -> Result<PoolParams, SerializationError> {
-    let operator = read_hash28_cert(r)?;
-    let vrf_keyhash = read_hash32(r)?;
-    let pledge = read_lovelace(r)?;
-    let cost = read_lovelace(r)?;
-    let margin = r.read_rational()?;
-    let reward_account = r.read_bytes_owned()?;
-    let pool_owners: Vec<Hash28> = r.read_set(|r| read_hash28_cert(r))?;
-    // relays: definite OR indefinite-length array — see #673 / era_shelley.rs.
-    r.for_each_array_item(|r| {
-        r.skip()?;
-        Ok(())
-    })?;
-    let pool_metadata = read_pool_metadata(r)?;
-
-    Ok(PoolParams {
-        operator,
-        vrf_keyhash,
-        pledge,
-        cost,
-        margin: Rational {
-            numerator: margin.numerator,
-            denominator: margin.denominator,
-        },
-        reward_account,
-        pool_owners,
-        relays: Vec::new(),
-        pool_metadata,
-    })
-}
-
-fn read_pool_metadata(r: &mut Reader<'_>) -> Result<Option<PoolMetadata>, SerializationError> {
-    let ty = r.peek_major()?;
-    if ty == Type::Null {
-        r.read_null()?;
-        return Ok(None);
-    }
-    let arr_len = r.read_array_header()?;
-    if !matches!(arr_len, Some(2)) {
-        return Err(SerializationError::CborDecode(format!(
-            "pool_metadata: expected array(2) or null, got {arr_len:?}"
-        )));
-    }
-    // pool_metadata_url = text (CDDL). Mainnet uses CBOR major type 3 (text string).
-    // Handle both text and bytes for robustness against non-canonical encodings.
-    let ty = r.peek_major()?;
-    let url = match ty {
-        Type::String => r.read_str()?.to_string(),
-        _ => {
-            let url_bytes = r.read_bytes()?;
-            String::from_utf8(url_bytes.to_vec()).map_err(|_| {
-                SerializationError::CborDecode("pool_metadata url: invalid UTF-8".into())
-            })?
-        }
-    };
-    let hash = {
-        let bytes = r.read_bytes()?;
-        let mut buf = [0u8; 32];
-        let len = bytes.len().min(32);
-        buf[..len].copy_from_slice(&bytes[..len]);
-        Hash32::from_bytes(buf)
-    };
-    Ok(Some(PoolMetadata { url, hash }))
+    super::era_shelley::read_pool_params_inner(r, false)
 }
 
 fn read_mir_cert(r: &mut Reader<'_>) -> Result<Certificate, SerializationError> {
