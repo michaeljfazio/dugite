@@ -15,8 +15,13 @@
 //! These two files are self-contained: `types.rs` has no `crate::` references
 //! and `encoding.rs` refers only to `types`.
 
+// Both files are `pub` in dugite-node; only the items a target actually calls
+// are reachable here, so dead_code fires on the rest. An artefact of the
+// inclusion, not a finding.
+#[allow(dead_code)]
 #[path = "../../../../crates/dugite-node/src/node/n2c_query/types.rs"]
 pub mod types;
 
+#[allow(dead_code)]
 #[path = "../../../../crates/dugite-node/src/node/n2c_query/encoding.rs"]
 pub mod encoding;
