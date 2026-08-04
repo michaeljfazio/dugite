@@ -102,6 +102,69 @@ pub(crate) fn restore_phase2_eval(prev: bool) {
     SKIP_PHASE2_EVAL.with(|c| c.set(prev));
 }
 
+/// Re-validate an already-admitted mempool transaction against the current
+/// ledger — dugite's equivalent of Haskell's `reapplyTx` (#996).
+///
+/// # Upstream semantics
+///
+/// `Ouroboros.Consensus.Mempool.Impl.Common.revalidateTxsFor` re-checks EVERY
+/// remaining mempool transaction whenever the tip changes, via `reapplyTxs`
+/// (not `applyTx`). At the ledger layer that is
+/// `Cardano.Ledger.Shelley.API.Mempool`:
+///
+/// ```haskell
+/// reapplyTx globals env state (Validated tx) =
+///   fst <$> internalApplyTxWithValidation (ValidateSuchThat (notElem lblStatic)) globals env state tx
+/// ```
+///
+/// `ValidateSuchThat (notElem lblStatic)` re-runs every **state-dependent**
+/// predicate and skips only the **static** (context-free) ones. So a
+/// transaction that was valid at admission and became invalid because a later
+/// block changed the ledger IS dropped upstream —
+/// `ConwayCommitteeHasPreviouslyResigned` is asserted with `failOnJust`, the
+/// non-static form, and is therefore re-run.
+///
+/// dugite previously re-checked a hand-written list instead (consumed inputs,
+/// TTL, missing UTxO, dangling gov-action votes), so every other predicate was
+/// invisible after admission. That is #996: a `CommitteeHotAuth` for a cold
+/// credential that resigned in an intervening block stayed in the mempool, was
+/// forged, and cardano-node rejected the block permanently.
+///
+/// # What dugite skips
+///
+/// Phase-2 Plutus evaluation only — the static/context-free check, and the
+/// expensive one. Everything else, including the witness checks Haskell also
+/// labels static, is re-run: for a transaction whose inputs are unchanged
+/// those are deterministic re-passes, so re-running them is a superset of
+/// upstream's skip-set that cannot change any verdict.
+///
+/// # Errors
+///
+/// Returns the accumulated [`ValidationError`]s; any non-empty result means
+/// the transaction must be evicted from the mempool.
+pub fn reapply_tx_for_mempool(
+    tx: &Transaction,
+    utxo_set: &dyn UtxoLookup,
+    params: &ProtocolParameters,
+    current_slot: u64,
+    tx_size: u64,
+    slot_config: Option<&SlotConfig>,
+    context: ValidationContext,
+) -> Result<(), Vec<ValidationError>> {
+    let prev = suppress_phase2_eval();
+    let result = validate_transaction_with_context(
+        tx,
+        utxo_set,
+        params,
+        current_slot,
+        tx_size,
+        slot_config,
+        context,
+    );
+    restore_phase2_eval(prev);
+    result
+}
+
 /// On-chain governance proposal record used by validation rules that need
 /// access to a proposal's full state (not just the action itself).
 ///
@@ -215,7 +278,10 @@ fn gov_action_prev_id(action: &GovAction) -> Option<&GovActionId> {
     }
 }
 
-#[derive(Default)]
+/// `Clone` is cheap by construction: every heavyweight field is an [`Arc`] or
+/// an `imbl` persistent map, so a clone is a refcount bump, not a deep copy.
+/// Post-block mempool revalidation (#996) needs one context per transaction.
+#[derive(Default, Clone)]
 pub struct ValidationContext {
     pub registered_pools: Option<Arc<HashSet<Hash28>>>,
     pub current_treasury: Option<u64>,
