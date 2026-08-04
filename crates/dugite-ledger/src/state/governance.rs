@@ -4783,7 +4783,7 @@ mod tests {
         state
     }
 
-    fn cc_vote_yes(state: &mut LedgerState, action_id: &GovActionId) {
+    pub(super) fn cc_vote_yes(state: &mut LedgerState, action_id: &GovActionId) {
         let hot_cred = Credential::VerificationKey(Hash28::from_bytes([20u8; 28]));
         state.process_vote(
             &Voter::ConstitutionalCommittee(hot_cred),
@@ -10937,6 +10937,74 @@ mod pulser_tests {
         assert!(
             !pulsed.has_pparams_changes,
             "no enactment must not report a pparams change"
+        );
+    }
+
+    /// …and TRUE when a `ParameterChange` is about to enact.
+    ///
+    /// Only the negative case was ever tested, so `has_pparams_changes` could
+    /// be wired to a constant `false` and every test still passed. It feeds
+    /// `predictFuturePParams`'s guard:
+    ///
+    /// ```haskell
+    /// newFuturePParams = do
+    ///   guard (any hasChangesToPParams (rsEnacted ratifyState))
+    ///   pure (ensCurPParams (rsEnactState ratifyState))
+    /// ```
+    ///
+    /// so a false negative means dugite answers `NoPParamsUpdate` for an epoch
+    /// in which cardano-node answers `DefinitePParamsUpdate` — caught by the
+    /// v2.6.0 release gate once Round 2 started driving the gov lifecycle, 235
+    /// divergent samples confined entirely to the epoch with a pending
+    /// ParameterChange.
+    #[test]
+    fn has_pparams_changes_is_true_when_a_parameter_change_enacts() {
+        let mut state = super::tests::gov_test_state(10, 10);
+        let mut update = dugite_primitives::transaction::ProtocolParamUpdate::default();
+        update.min_fee_a = Some(999);
+        state.process_proposal(
+            &Hash32::from_bytes([50u8; 32]),
+            0,
+            &ProposalProcedure {
+                deposit: Lovelace(100_000_000_000),
+                return_addr: vec![0u8; 29],
+                gov_action: GovAction::ParameterChange {
+                    prev_action_id: None,
+                    protocol_param_update: Box::new(update),
+                    policy_hash: None,
+                },
+                anchor: super::tests::make_anchor(),
+            },
+        );
+        let action_id = super::tests::make_action_id(50, 0);
+        for i in 0..9 {
+            super::tests::drep_vote(&mut state, i, &action_id, Vote::Yes);
+        }
+        for i in 0..9 {
+            super::tests::spo_vote(&mut state, i, &action_id, Vote::Yes);
+        }
+        super::tests::cc_vote_yes(&mut state, &action_id);
+
+        state.freeze_prior_boundary_pulser();
+        let pulsed = state
+            .gov
+            .governance
+            .ratify_plan()
+            .cloned()
+            .expect("a pulser must be frozen");
+
+        assert_eq!(
+            pulsed.enacted,
+            vec![action_id],
+            "fixture is wrong: the ParameterChange must be ratifiable"
+        );
+        assert!(
+            pulsed.has_pparams_changes,
+            "an enacted ParameterChange IS a change to pparams — this is              `hasChangesToPParams`, the guard predictFuturePParams reads"
+        );
+        assert_eq!(
+            pulsed.cur_pparams.min_fee_a, 999,
+            "`ensCurPParams` must carry the enacted value, since that is what              `predictFuturePParams` publishes as the future parameters"
         );
     }
 }
