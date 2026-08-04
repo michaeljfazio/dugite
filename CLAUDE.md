@@ -104,8 +104,93 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 **v2.6.0 (2026-08-04) — the DRep pulser becomes one mechanism.**
 **RE-SYNC RELEASE: SNAPSHOT_VERSION 32 -> 37**, so existing DBs replay chunks
 on first restart. Closes #977, #980, #969, #970 (the earlier backlog) plus
-#988, #989, #990, #991, #992, #993, #994. Open: #995 (devnet-only, non-consensus
-`previousPParams` genesis seeding).
+#988, #989, #990, #991, #992, #993, #995, #996, #997. Open: #994 (devnet-only,
+non-consensus `previousPParams` genesis seeding — deliberately deferred).
+
+### #996 — the mempool re-checked a CHECKLIST, not the rules
+
+A tx valid at admission can be invalidated by a later block. Haskell drops it:
+`revalidateTxsFor` re-checks EVERY remaining mempool tx on each tip change via
+`reapplyTxs`, which at the ledger layer is
+
+```haskell
+reapplyTx globals env state (Validated tx) =
+  fst <$> internalApplyTxWithValidation
+            (ValidateSuchThat (notElem lblStatic)) globals env state tx
+```
+
+— every state-dependent predicate re-run, only the static ones skipped.
+
+dugite re-checked a hand-written list instead: consumed inputs, TTL, missing
+UTxO, dangling gov-action votes. Every other predicate was invisible after
+admission, and each entry on that list had been added REACTIVELY after a
+Haskell peer rejected one of our blocks (the gov-action entry says so in its own
+comment). The list was always one defect behind.
+
+The case that outran it: a `CommitteeHotAuth` admitted while its cold credential
+was still seated, a later block carrying that member's `CommitteeColdResign`,
+and the stale certificate forged at slot 1363. cardano-node rejected the block
+with `ConwayCommitteeHasPreviouslyResigned` and — because a Haskell peer
+re-requests the same block on every reconnect — **never recovered**. The
+reported symptoms (connection churn every ~10 s, the per-IP rate-limiter
+lockout, cardano-bp frozen) were all downstream of that one ledger divergence.
+The relay's N2C path had rejected the identical tx correctly 7 s earlier; only
+the after-admission path was blind.
+
+**One context builder now.** There were THREE hand-rolled copies (N2C admission,
+the rollback re-admission path, and one inlined "to avoid a cross-module
+dependency on that private fn"). The admission copy was a strict SUBSET of what
+block-apply builds — missing `registered_vrf_keys`, `current_treasury`,
+`current_epoch`, `stake_key_deposits`, `vote_delegations`,
+`genesis_delegate_keys`, `update_quorum`, `constitution_script_hash` — and each
+omission is its own way to admit a tx block-apply rejects.
+`LedgerState::mempool_validation_context` is the only one now. It also settled a
+live divergence: admission keyed `CommitteeHotAuth` membership off
+`committee_expiration` alone while block-apply uses
+`committee_auth_eligible_members`; Haskell's GOVCERT accepts a pre-authorization
+from an incoming member of a live `UpdateCommittee` proposal
+(`isPotentialFutureMember`), so the narrow set was a false reject.
+
+Wired into all three revalidation sites. The epoch-boundary one had been calling
+bare `validate_transaction` with NO context at all — and the boundary is exactly
+where the governance registries change most, so a tx invalidated BY the boundary
+was guaranteed to survive it.
+
+Second half: the per-IP inbound rate limiter now EXEMPTS local roots. Upstream
+has no per-IP window at all — `Ouroboros.Network.Server.RateLimiting` is a
+global soft/hard limit plus a graduated accept delay — and a declared peer is
+trusted, never throttled by source address. It also collapsed co-located and
+NAT'd peers into one bucket: on the devnet all three nodes are 127.0.0.1. The
+window still applies to undeclared IPs. It only ever amplified; with the
+revalidation fix the reconnect storm does not happen.
+
+### #997 — Ed25519 accepted small-order keys (CONSENSUS)
+
+`verify` used `ed25519_dalek`'s permissive `Verifier::verify`. cardano-base
+implements Ed25519 DSIGN over libsodium's `crypto_sign_verify_detached`, which
+rejects small-order and non-canonical public keys and small-order `R`.
+
+With `A` = identity (`0x01 00 … 00`), `R` = identity and `s` = 0, the
+cofactorless equation `[s]B = R + [k]A` degenerates to `identity = identity` and
+verification succeeds **for any message** — so those bytes in a Byron bootstrap
+witness authenticated an arbitrary tx. Accept-where-Haskell-rejects, i.e. the
+#996 wedge one layer down. Fixed with `verify_strict`; real keys and real `R`
+have full order so only degenerate input is newly rejected.
+
+**Found on the first nightly fuzz run after the workflow was repaired** — every
+target had been failing to BUILD because #983 made `dugite-rpc` a fuzz
+dependency and `fuzz.yml` never installed `protoc` (ci.yml and release.yml
+install it in every job that builds; this workflow was simply missed).
+
+The finder had its own defect, and it is the more instructive half: the target
+asserted the canonical bootstrap `public_key` is 64 bytes. Shelley CDDL says
+**32** — the 64-byte Byron *extended* key is `public_key || chain_code` and the
+halves travel in separate fields, recombined only for address-root derivation.
+So the target demanded that a CANONICAL witness be rejected, an assertion that
+held only while every such witness happened to fail the signature check for some
+other reason. The identity-point input is exactly the case where it did not,
+which is why a soundness bug surfaced disguised as a harness assertion. **A
+wrong invariant can hide a real bug behind its own false premise.**
 
 ### #988 — the epoch boundary APPLIES the frozen pulser; it does not re-decide
 
