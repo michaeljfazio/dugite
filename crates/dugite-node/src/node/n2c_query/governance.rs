@@ -40,6 +40,10 @@ fn gov_state_snapshot(state: &NodeStateSnapshot) -> GovStateSnapshot {
         constitution_script: state.constitution_script.clone(),
         cur_pparams: Box::new(state.protocol_params.clone()),
         prev_pparams: Box::new(state.prev_protocol_params.clone()),
+        // #994: the EnactState inside `nextRatifyState` reports what the pulser
+        // SEALED, not the live params. Identical mid-chain; differs only before
+        // the first boundary.
+        enact_cur_pparams: Box::new(state.ratify_cur_protocol_params.clone()),
         enacted_pparam_update: state.enacted_pparam_update.clone(),
         enacted_hard_fork: state.enacted_hard_fork.clone(),
         enacted_committee: state.enacted_committee.clone(),

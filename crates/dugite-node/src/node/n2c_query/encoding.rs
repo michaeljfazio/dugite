@@ -1753,8 +1753,8 @@ fn encode_ratify_state(
     } else {
         enc.null().ok();
     }
-    // ensCurPParams
-    encode_protocol_params_cbor(enc, &gov.cur_pparams);
+    // ensCurPParams — the pulser's FROZEN params (#994), not the live ones.
+    encode_protocol_params_cbor(enc, &gov.enact_cur_pparams);
     // ensPrevPParams
     encode_protocol_params_cbor(enc, &gov.prev_pparams);
     // ensTreasury
@@ -2802,6 +2802,7 @@ mod tests {
                 constitution_hash: vec![0u8; 32],
                 constitution_script: None,
                 cur_pparams: pp.clone(),
+                enact_cur_pparams: pp.clone(),
                 prev_pparams: pp.clone(),
                 enacted_pparam_update: None,
                 enacted_hard_fork: None,
@@ -2922,6 +2923,7 @@ mod tests {
             constitution_hash: vec![0u8; 32],
             constitution_script: None,
             cur_pparams: pp.clone(),
+            enact_cur_pparams: pp.clone(),
             prev_pparams: pp,
             enacted_pparam_update: None,
             enacted_hard_fork: None,

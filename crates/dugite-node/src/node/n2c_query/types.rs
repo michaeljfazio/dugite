@@ -770,6 +770,9 @@ pub struct GovStateSnapshot {
     pub constitution_script: Option<Vec<u8>>,
     /// Current protocol parameters
     pub cur_pparams: Box<ProtocolParamsSnapshot>,
+    /// `ensCurPParams` for the EnactState embedded in `nextRatifyState` — the
+    /// pulser's frozen params (#994), NOT the live `cur_pparams` above.
+    pub enact_cur_pparams: Box<ProtocolParamsSnapshot>,
     /// Previous protocol parameters (defaults to current if not tracked)
     pub prev_pparams: Box<ProtocolParamsSnapshot>,
     /// Enacted governance roots (prev_action_ids per purpose)
@@ -939,6 +942,17 @@ pub struct NodeStateSnapshot {
     /// Parameters in force BEFORE the most recent epoch-boundary enactment
     /// (`previousPParams` / Haskell `cgsPrevPParams`).
     pub prev_protocol_params: ProtocolParamsSnapshot,
+    /// `ensCurPParams` of the FROZEN ratification state — the params sealed
+    /// into the DRep pulser at the last boundary, which is what
+    /// `nextRatifyState.nextEnactState` reports (#994).
+    ///
+    /// Mid-chain this equals `protocol_params`, because protocol parameters
+    /// only ever change AT a boundary and `setFreshDRepPulsingState` seals
+    /// them there. It differs exactly once: before the first boundary there is
+    /// no pulser, and upstream's initial `EnactState` carries the
+    /// genesis-translated params — which on a Conway-genesis chain lack the
+    /// injected `defaultV2CostModel`.
+    pub ratify_cur_protocol_params: ProtocolParamsSnapshot,
     /// Stake pool distribution data, built from LIVE ledger state. Feeds
     /// `GetStakePools` (tag 16) and `GetStakeDistribution2` (tag 37), both of
     /// which upstream computes from live state — `poolsByTotalStakeFraction`
@@ -1100,6 +1114,7 @@ impl Default for NodeStateSnapshot {
             proposal_count: 0,
             protocol_params: ProtocolParamsSnapshot::default(),
             prev_protocol_params: ProtocolParamsSnapshot::default(),
+            ratify_cur_protocol_params: ProtocolParamsSnapshot::default(),
             stake_pools: Vec::new(),
             pool_distr: Vec::new(),
             pool_distr_total_active_stake: 0,

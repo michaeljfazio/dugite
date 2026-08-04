@@ -1227,6 +1227,11 @@ impl Node {
         let mut conway_initial_dreps: Vec<(dugite_primitives::hash::Hash28, u64)> = Vec::new();
         let mut conway_genesis_file_hash: Option<dugite_primitives::hash::Hash32> = None;
         let mut conway_v3_cost_model: Option<Vec<i64>> = None;
+        // #994: did a genesis FILE supply the PlutusV2 cost model, or is the one
+        // we end up with the built-in default? `ConwayGenesis::apply_to_protocol_params`
+        // injects `defaultV2CostModel` when none is present, so this has to be
+        // sampled before that call. See `genesis_prev_protocol_params` below.
+        let v2_cost_model_from_genesis = protocol_params.cost_models.plutus_v2.is_some();
         if let Some(ref genesis_path) = args.config.conway_genesis_file {
             let genesis_path = config_dir.join(genesis_path);
             match ConwayGenesis::load_with_hash(&genesis_path) {
@@ -1266,6 +1271,37 @@ impl Node {
                 }
             }
         }
+
+        // #994: `cgsPrevPParams` at genesis carries only the cost models the
+        // genesis FILES supplied — never the built-in `defaultV2CostModel`.
+        //
+        // On a chain whose FIRST era is Conway (`create-testnet-data`, i.e. the
+        // local devnet) cardano-node reports
+        //     cur  = [PlutusV1, PlutusV2, PlutusV3]
+        //     prev = [PlutusV1,           PlutusV3]
+        // with `prev` otherwise byte-identical to `cur` — V1 and V3 match
+        // exactly, and every non-costModels field matches. The devnet's
+        // alonzo-genesis defines only `PlutusV1` and its conway-genesis only
+        // `plutusV3CostModel`, so neither file supplies V2: the V2 in `cur` is
+        // the default both implementations inject so V2 scripts are runnable.
+        // It never reaches `prev`.
+        //
+        // dugite seeded `prev` by cloning `cur` wholesale, so the defaulted V2
+        // leaked in and `gov-state` diverged three times over (the same value is
+        // embedded in `nextRatifyState.nextEnactState.{curPParams,prevPParams}`).
+        //
+        // Inert on mainnet/preview/preprod: those alonzo-genesis files DO define
+        // PlutusV2, so `v2_cost_model_from_genesis` is true and `prev` is an
+        // exact clone as before. Those chains also start in Byron, where
+        // `prev` is overwritten by the first epoch boundary regardless — which
+        // is precisely why this is reachable only on a Conway-genesis chain.
+        let genesis_prev_protocol_params = {
+            let mut prev = protocol_params.clone();
+            if !v2_cost_model_from_genesis {
+                prev.cost_models.plutus_v2 = None;
+            }
+            prev
+        };
 
         // Load Dijkstra genesis if configured (issue #462 Phase 6 — parse only).
         //
@@ -1666,6 +1702,7 @@ impl Node {
                             warn!("No canonical snapshot found — replaying from genesis");
                             Self::init_fresh_ledger(
                                 &protocol_params,
+                                &genesis_prev_protocol_params,
                                 shelley_genesis.as_ref(),
                                 shelley_genesis_hash,
                                 &byron_genesis_utxos,
@@ -1680,6 +1717,7 @@ impl Node {
                     warn!("Failed to load ledger snapshot, starting fresh: {e}");
                     Self::init_fresh_ledger(
                         &protocol_params,
+                        &genesis_prev_protocol_params,
                         shelley_genesis.as_ref(),
                         shelley_genesis_hash,
                         &byron_genesis_utxos,
@@ -1694,6 +1732,7 @@ impl Node {
             // (Haskell ledger state import is not supported for UTxO-HD format.)
             Self::init_fresh_ledger(
                 &protocol_params,
+                &genesis_prev_protocol_params,
                 shelley_genesis.as_ref(),
                 shelley_genesis_hash,
                 &byron_genesis_utxos,
@@ -9020,8 +9059,10 @@ impl Node {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // genesis assembly legitimately needs every era's inputs
     pub(crate) fn init_fresh_ledger(
         protocol_params: &ProtocolParameters,
+        genesis_prev_protocol_params: &ProtocolParameters,
         shelley_genesis: Option<&ShelleyGenesis>,
         shelley_genesis_hash: Option<dugite_primitives::Hash32>,
         byron_genesis_utxos: &[(Vec<u8>, u64)],
@@ -9030,6 +9071,10 @@ impl Node {
         byron_slot_duration_ms: u64,
     ) -> LedgerState {
         let mut ledger = LedgerState::new(protocol_params.clone());
+        // #994: `LedgerState::new` seeds prev = cur. At genesis `cgsPrevPParams`
+        // carries only the cost models the genesis FILES supplied, never the
+        // injected `defaultV2CostModel` — see `genesis_prev_protocol_params`.
+        ledger.epochs.prev_protocol_params = genesis_prev_protocol_params.clone();
         let shelley_transition_epoch = epoch::shelley_transition_epoch_for_magic(network_magic);
         if let Some(genesis) = shelley_genesis {
             // Must run BEFORE seed_genesis_utxos so reserves init from the
