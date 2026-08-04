@@ -16,7 +16,7 @@ use dugite_ledger::LedgerState;
 /// positional change inside a nested structure is invisible to it.
 ///
 /// That is demonstrated, not theoretical: #966 added `treasury: u64` to
-/// `RatificationSnapshot`, a real layout change requiring SNAPSHOT_VERSION
+/// `PulsingSnapshot`, a real layout change requiring SNAPSHOT_VERSION
 /// 31 -> 32, and this test stayed green through it because
 /// `ratification_snapshot` was `None`.
 ///
@@ -108,11 +108,11 @@ fn snapshot_format_hash_stability() {
     //     populated fixture, pre-#988 (SNAPSHOT 32)
     //   24039764909a573f5549262574928132b8e15d3bc9a6acc9e550e218db3a02e3
     //     empty fixture + a ratification snapshot (#966, SNAPSHOT 31 -> 32:
-    //     `RatificationSnapshot` gained `treasury: u64`. That was a genuine
+    //     `PulsingSnapshot` gained `treasury: u64`. That was a genuine
     //     layout change and this test stayed GREEN through it, because
     //     `ratification_snapshot` was `None` in the fixture — which is what
     //     #967 is about.)
-    const EXPECTED_HASH: &str = "0c193be7d13ccea5ef8e66f856221a3fb7fd768e5184066574d3f7fcc0fd87ba";
+    const EXPECTED_HASH: &str = "4bc1ca12491c041e064242ea18af63282ee7f1e3bfa959db6010d19ffe4200c0";
 
     if EXPECTED_HASH == "COMPUTE_ON_FIRST_RUN" {
         panic!(

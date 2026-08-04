@@ -1049,6 +1049,10 @@ impl RatificationFixture {
     /// * `gov.governance.enacted_*` roots from `parent_enacted`.
     pub fn into_ledger_state(self) -> LedgerState {
         let mut ledger = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        // Written into the pulser AFTER the freeze — see the end of this fn.
+        let mut fixture_drep_distr: imbl::HashMap<Hash32, u64> = imbl::HashMap::new();
+        let fixture_drep_no_confidence: u64;
+        let fixture_drep_abstain: u64;
         ledger.epoch = EpochNo(self.pparams_epoch);
 
         // Apply the captured threshold subset on top of mainnet defaults.
@@ -1264,7 +1268,7 @@ impl RatificationFixture {
             // populated (it short-circuits on empty maps).
             for (drep_hex, stake) in &drep_power {
                 let cred_hash = parse_hash32(drep_hex, "drep_power credential hash");
-                gov.drep_distribution_snapshot.insert(cred_hash, *stake);
+                fixture_drep_distr.insert(cred_hash, *stake);
                 // Seed a minimal placeholder registration with a far-future
                 // expiry so the DRep is not skipped by activity filters.
                 gov.dreps
@@ -1278,8 +1282,8 @@ impl RatificationFixture {
                         active: true,
                     });
             }
-            gov.drep_snapshot_no_confidence = drep_no_confidence;
-            gov.drep_snapshot_abstain = drep_abstain;
+            fixture_drep_no_confidence = drep_no_confidence;
+            fixture_drep_abstain = drep_abstain;
 
             // Live no_confidence flag — read by the `UpdateCommittee` branch.
             gov.no_confidence = no_confidence_flag;
@@ -1353,6 +1357,21 @@ impl RatificationFixture {
         // candidate set; without it the fixture would exercise the genesis
         // no-pulser path, where nothing is ratifiable by construction.
         ledger.capture_ratification_snapshot();
+
+        // The fixture's DRep distribution is authoritative — it is the Haskell
+        // `reDRepDistr` the golden case was recorded against, not something to
+        // recompute from dugite's own cert state. Since #988 step 3 the
+        // distribution lives INSIDE the pulser, so it is written after the
+        // freeze rather than before it.
+        {
+            let pulser = std::sync::Arc::make_mut(&mut ledger.gov.governance)
+                .drep_pulsing_state
+                .as_mut()
+                .expect("capture must have frozen a pulser");
+            pulser.snapshot.drep_distr = fixture_drep_distr;
+            pulser.snapshot.drep_no_confidence = fixture_drep_no_confidence;
+            pulser.snapshot.drep_abstain = fixture_drep_abstain;
+        }
 
         ledger
     }

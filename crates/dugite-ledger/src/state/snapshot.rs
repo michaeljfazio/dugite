@@ -425,7 +425,7 @@ impl LedgerState {
     /// used to recover on-chain proposal submission order for the
     /// ratification tie-break sort. This is a positional bincode layout
     /// change for every embedded `ProposalState` (live `proposals`,
-    /// `last_ratified`, and `RatificationSnapshot::proposals`) — a snapshot
+    /// `last_ratified`, and `PulsingSnapshot::proposals`) — a snapshot
     /// written by a prior binary must be quarantined, not silently
     /// misinterpreted.
     /// v27 (#796): `PendingRewardUpdate::delta_reserves` changed from `u64`
@@ -448,7 +448,7 @@ impl LedgerState {
     /// real genesis-delegate rotation.
     ///
     /// v29: `GovernanceState.votes_by_action` (and
-    /// `RatificationSnapshot.votes_by_action`) changed its per-action value
+    /// `PulsingSnapshot.votes_by_action`) changed its per-action value
     /// type from `Vec<(Voter, VotingProcedure)>` to
     /// `imbl::OrdMap<Voter, VotingProcedure>`. The linear `Vec` scan used to
     /// implement last-vote-wins was O(n) per vote, collapsing to O(n^2) on
@@ -466,7 +466,7 @@ impl LedgerState {
     /// minimum-UTxO dispatch that fixes false `OutputTooSmall` rejections of
     /// real Shelley/Allegra/Mary mainnet transactions. Positional bincode
     /// layout change for every embedded `protocol_params`/`prev_protocol_params`.
-    /// v32 (#966): `RatificationSnapshot` (embedded in `GovernanceState`, which
+    /// v32 (#966): `PulsingSnapshot` (embedded in `GovernanceState`, which
     /// is bincode-serialized as part of every `LedgerState` snapshot) gained
     /// `treasury: u64` — Haskell `ensTreasury`, the frozen pot that
     /// `withdrawalCanWithdraw` gates `TreasuryWithdrawals` against. It was the
@@ -491,7 +491,14 @@ impl LedgerState {
     //     would load and its plan would be applied verbatim; rejecting them is
     //     what stops a plan decided under the old semantics from driving a
     //     boundary under the new ones.
-    pub(crate) const SNAPSHOT_VERSION: u8 = 35;
+    // 36: #988 step 3 — the five ad-hoc frozen fields
+    //     (`drep_distribution_snapshot` + its two companions,
+    //     `ratification_snapshot`, `pulsed_ratify_state`) collapsed into one
+    //     `drep_pulsing_state: Option<DRepPulsingState>`, Haskell's
+    //     `DRComplete PulsingSnapshot RatifyState`. A positional bincode
+    //     layout change; a v35 snapshot would mis-deserialize, and v35 DID
+    //     reach disk during validation.
+    pub(crate) const SNAPSHOT_VERSION: u8 = 36;
 
     /// Save ledger state snapshot to disk using bincode serialization.
     ///

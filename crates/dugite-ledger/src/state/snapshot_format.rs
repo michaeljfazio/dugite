@@ -602,7 +602,7 @@ mod tests {
             governance.enacted_constitution, "governance.enacted_constitution";
             // The #966 field. This is the specific structure whose layout
             // change the guard failed to notice.
-            governance.ratification_snapshot, "governance.ratification_snapshot";
+            governance.drep_pulsing_state, "governance.drep_pulsing_state";
         );
 
         // `GovernanceState` is ONE field of the snapshot but many structures
@@ -639,11 +639,7 @@ mod tests {
             last_expired,
             last_ratify_delayed,
             num_dormant_epochs,
-            drep_distribution_snapshot,
-            drep_snapshot_no_confidence,
-            drep_snapshot_abstain,
-            ratification_snapshot: _,
-            pulsed_ratify_state,
+            drep_pulsing_state,
             future_pparams,
         } = governance;
         let _ = (
@@ -660,10 +656,29 @@ mod tests {
             "governance.future_pparams carries no payload — `ProtocolParameters`' \
              layout inside the enum is invisible to the hash (#977)"
         );
+        // The pulser is ONE field here but two whole structures under the
+        // hash, so it gets the same exhaustive treatment `GovernanceState`
+        // does — the #988 gap was precisely a guard that stopped being
+        // exhaustive one level down.
+        let crate::state::DRepPulsingState {
+            snapshot: pulsing_snapshot,
+            ratify_state,
+        } = drep_pulsing_state.as_ref().expect(
+            "governance.drep_pulsing_state is None — the frozen pulser's \
+                     layout is invisible to the hash (#988)",
+        );
         assert!(
-            pulsed_ratify_state.is_some(),
-            "governance.pulsed_ratify_state is None — the frozen pulser's layout \
-             is invisible to the hash (#988)"
+            !ratify_state.enacted.is_empty() && !ratify_state.expired.is_empty(),
+            "the frozen RatifyState carries no ids — its Vec layouts are \
+             invisible to the hash (#988)"
+        );
+        assert!(
+            !pulsing_snapshot.proposals.is_empty(),
+            "the frozen PulsingSnapshot carries no proposals (#903)"
+        );
+        assert!(
+            pulsing_snapshot.treasury > 0,
+            "PulsingSnapshot.treasury (#966)"
         );
         assert!(drep_registration_count > &0, "drep_registration_count");
         assert!(proposal_count > &0, "proposal_count");
@@ -671,10 +686,13 @@ mod tests {
         assert!(*last_ratify_delayed, "last_ratify_delayed");
         assert!(num_dormant_epochs > &0, "num_dormant_epochs");
         assert!(
-            drep_snapshot_no_confidence > &0,
-            "drep_snapshot_no_confidence"
+            pulsing_snapshot.drep_no_confidence > 0,
+            "PulsingSnapshot.drep_no_confidence"
         );
-        assert!(drep_snapshot_abstain > &0, "drep_snapshot_abstain");
+        assert!(
+            pulsing_snapshot.drep_abstain > 0,
+            "PulsingSnapshot.drep_abstain"
+        );
         assert!(constitution.is_some(), "constitution");
         assert!(committee_threshold.is_some(), "committee_threshold");
         assert!(enacted_pparam_update.is_some(), "enacted_pparam_update");
@@ -698,8 +716,8 @@ mod tests {
         );
         assert!(!votes_by_action.is_empty(), "governance.votes_by_action");
         assert!(
-            !drep_distribution_snapshot.is_empty(),
-            "governance.drep_distribution_snapshot"
+            !pulsing_snapshot.drep_distr.is_empty(),
+            "PulsingSnapshot.drep_distr"
         );
 
         // Scalars must be distinguishable from the value a bare

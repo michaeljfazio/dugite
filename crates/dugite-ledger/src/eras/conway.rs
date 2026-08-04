@@ -5586,8 +5586,7 @@ mod tests {
         // must be in it, and the enacted root is still None.
         let snap = gov
             .governance
-            .ratification_snapshot
-            .as_ref()
+            .pulsing_snapshot()
             .expect("ratification snapshot must be populated after E+1");
         assert_eq!(
             snap.enacted_committee, None,
@@ -5630,8 +5629,7 @@ mod tests {
         );
         let snap = gov
             .governance
-            .ratification_snapshot
-            .as_ref()
+            .pulsing_snapshot()
             .expect("ratification snapshot must be populated after E+2");
         assert_eq!(
             snap.enacted_committee,

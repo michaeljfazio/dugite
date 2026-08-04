@@ -2203,7 +2203,7 @@ fn proposal_is_not_ratifiable_at_the_first_boundary_after_submission() {
         "proposal must be accepted at submission — the GOV rule is not what drops it"
     );
     assert!(
-        state.gov.governance.ratification_snapshot.is_none(),
+        state.gov.governance.pulsing_snapshot().is_none(),
         "precondition: no pulser snapshot exists yet"
     );
     assert_eq!(state.epochs.protocol_params.n_opt, 500, "original value");
@@ -2220,7 +2220,7 @@ fn proposal_is_not_ratifiable_at_the_first_boundary_after_submission() {
         "proposal must SURVIVE the first boundary"
     );
     assert!(
-        state.gov.governance.ratification_snapshot.is_some(),
+        state.gov.governance.pulsing_snapshot().is_some(),
         "the first boundary must capture the snapshot the next one consumes"
     );
 
