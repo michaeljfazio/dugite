@@ -921,13 +921,18 @@ pub struct PoolRegistration {
 }
 
 impl LedgerState {
-    /// Reset the ledger tip to origin, forcing a full re-replay from storage.
-    /// Used when the UTxO store is empty but the ledger snapshot has state
-    /// (indicating data loss from crash or session lock issues).
-    pub fn reset_to_origin(&mut self) {
-        self.tip = Tip::origin();
-        self.epoch = EpochNo(0);
-    }
+    // NOTE (#989): `reset_to_origin` used to live here. It reset `tip` and
+    // `epoch` and nothing else, so a "forced re-replay" restarted at slot 0
+    // carrying the snapshot's treasury, reserves, certificate state,
+    // governance state, nonces and protocol parameters — #985's chimera
+    // shape, ending with a snapshot of the chimera saved back to disk.
+    //
+    // It is deliberately NOT replaced with a fuller reset: genesis state
+    // cannot be reconstructed from a `LedgerState` alone (it needs the
+    // genesis UTxOs, delegates and parameters), so any in-place reset is
+    // structurally incapable of being correct. The only caller now rebuilds
+    // through `Node::init_fresh_ledger`, the same path a from-genesis start
+    // takes, and wipes the UTxO store alongside it.
 
     /// Compute `drepExpiry` for a DRep whose last activity is the current epoch,
     /// matching Haskell's `computeDRepExpiryVersioned` / `computeDRepExpiry`.
