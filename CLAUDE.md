@@ -102,9 +102,10 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 
 ## Current Focus
 **v2.6.0 (2026-08-04) — the DRep pulser becomes one mechanism.**
-**RE-SYNC RELEASE: SNAPSHOT_VERSION 32 -> 36**, so existing DBs replay chunks
+**RE-SYNC RELEASE: SNAPSHOT_VERSION 32 -> 37**, so existing DBs replay chunks
 on first restart. Closes #977, #980, #969, #970 (the earlier backlog) plus
-#988, #989, #990, #991, #992, #993.
+#988, #989, #990, #991, #992, #993, #994. Open: #995 (devnet-only, non-consensus
+`previousPParams` genesis seeding).
 
 ### #988 — the epoch boundary APPLIES the frozen pulser; it does not re-decide
 
