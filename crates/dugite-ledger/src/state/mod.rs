@@ -1047,6 +1047,105 @@ impl LedgerState {
         }
     }
 
+    /// The ledger-derived [`crate::validation::ValidationContext`] shared by
+    /// every mempool path — N2C/N2N admission and post-block revalidation.
+    ///
+    /// # Why this exists (#996)
+    ///
+    /// Admission and block-apply each used to build their own context, and the
+    /// admission one was a strict subset: it omitted `registered_vrf_keys`,
+    /// `current_treasury`, `current_epoch`, `stake_key_deposits`,
+    /// `vote_delegations`, `genesis_delegate_keys`, `update_quorum` and
+    /// `constitution_script_hash`. Every omission is the same wedge — dugite
+    /// admits a transaction the block-apply path (and therefore cardano-node)
+    /// rejects, forges it, and every Haskell peer refuses the block forever.
+    /// That is exactly how #996 presented: a `CommitteeHotAuth` for a resigned
+    /// cold credential reached a forged block and permanently detached
+    /// cardano-bp from the chain.
+    ///
+    /// It also unifies one live divergence: admission keyed the
+    /// `CommitteeHotAuth` membership check off `committee_expiration` alone,
+    /// while block-apply uses [`GovernanceState::committee_auth_eligible_members`],
+    /// which additionally admits the `members_to_add` of any live
+    /// `UpdateCommittee` proposal. Haskell's GOVCERT rule accepts a
+    /// pre-authorization from such an incoming member
+    /// (`isPotentialFutureMember`), so the narrower admission set was a false
+    /// reject. The wider set is the correct one and is now the only one.
+    ///
+    /// Callers add their own non-ledger extras (network id, Plutus
+    /// `SlotConfig`, mempool virtual-UTxO overlay) on top of this.
+    pub fn mempool_validation_context(&self) -> crate::validation::ValidationContext {
+        let gov = &self.gov.governance;
+
+        let active_proposals: HashMap<
+            dugite_primitives::transaction::GovActionId,
+            crate::validation::ActiveProposal,
+        > = gov
+            .proposals
+            .iter()
+            .map(|(id, state)| {
+                (
+                    id.clone(),
+                    crate::validation::ActiveProposal {
+                        gov_action: state.procedure.gov_action.clone(),
+                        return_addr: state.procedure.return_addr.clone(),
+                        deposit: state.procedure.deposit,
+                        expires_after_epoch: state.expires_epoch,
+                        proposed_in_epoch: state.proposed_epoch,
+                    },
+                )
+            })
+            .collect();
+
+        // `authorizedElectedHotCommitteeCredentials` in Haskell: the hot keys
+        // of cold credentials that are in the ENACTED committee (drives the
+        // PV >= 11 `UnelectedCommitteeVoters` predicate).
+        let committee_authorized_elected_hot_keys: std::collections::HashSet<Hash32> = gov
+            .committee_hot_keys
+            .iter()
+            .filter(|(cold, _)| gov.committee_expiration.contains_key(*cold))
+            .map(|(_, hot)| *hot)
+            .collect();
+
+        let mut ctx = crate::validation::ValidationContext::new()
+            .with_pools(self.certs.pool_params.keys().copied().collect())
+            .with_dreps(gov.dreps.keys().copied().collect())
+            .with_vrf_keys(
+                self.certs
+                    .pool_params
+                    .values()
+                    .map(|reg| (reg.vrf_keyhash, reg.pool_id))
+                    .collect(),
+            )
+            .with_active_proposals(active_proposals)
+            .with_enacted_gov_roots(self.enacted_gov_roots())
+            .with_committee_authorized_hot_keys(gov.committee_hot_keys.values().copied().collect())
+            .with_committee_authorized_elected_hot_keys(committee_authorized_elected_hot_keys)
+            .with_committee_members(gov.committee_auth_eligible_members())
+            .with_committee_resigned(gov.committee_resigned.keys().copied().collect())
+            .with_vote_delegations(gov.vote_delegations.keys().copied().collect())
+            .with_treasury(self.epochs.treasury.0)
+            .with_epoch(self.epoch.0)
+            // O(1) imbl structural clones, not deep copies.
+            .with_reward_accounts_imbl(self.certs.reward_accounts.clone())
+            .with_stake_key_deposits_imbl(self.certs.stake_key_deposits.clone())
+            .with_genesis_delegate_keys(
+                self.genesis_delegates
+                    .values()
+                    .map(|(delegate_hash, _)| *delegate_hash)
+                    .collect(),
+            )
+            .with_update_quorum(self.update_quorum);
+
+        if let Some(net) = self.node_network {
+            ctx = ctx.with_network(net);
+        }
+        if let Some(h) = gov.constitution.as_ref().and_then(|c| c.script_hash) {
+            ctx = ctx.with_constitution_script_hash(h);
+        }
+        ctx
+    }
+
     pub fn new(params: ProtocolParameters) -> Self {
         LedgerState {
             utxo: UtxoSubState {
