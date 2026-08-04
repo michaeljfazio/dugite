@@ -22,7 +22,17 @@ pub(crate) fn handle_constitution(state: &NodeStateSnapshot) -> QueryResult {
 /// Handle GetGovState (tag 24).
 pub(crate) fn handle_gov_state(state: &NodeStateSnapshot) -> QueryResult {
     debug!("Query: GetGovState");
-    QueryResult::GovState(Box::new(GovStateSnapshot {
+    QueryResult::GovState(Box::new(gov_state_snapshot(state)))
+}
+
+/// Build `ConwayGovState` from the node snapshot.
+///
+/// Shared by `GetGovState` (tag 24) and `GetRatifyState` (tag 32) — tag 32
+/// needs the same `EnactState`, and building it a second time by hand is how
+/// tag 24's copy came to be a hardcoded empty pulser while tag 32's was real
+/// (#992).
+fn gov_state_snapshot(state: &NodeStateSnapshot) -> GovStateSnapshot {
+    GovStateSnapshot {
         proposals: state.governance_proposals.clone(),
         committee: state.committee.clone(),
         constitution_url: state.constitution_url.clone(),
@@ -37,7 +47,17 @@ pub(crate) fn handle_gov_state(state: &NodeStateSnapshot) -> QueryResult {
         treasury: state.treasury,
         future_pparams_tag: state.future_pparams_tag,
         future_pparams: state.future_pparams.clone(),
-    }))
+        // The embedded `DRepPulsingState` (#992). Every component comes from
+        // the same field the dedicated query for it serves, so tag 24 cannot
+        // disagree with tags 25/26/31/32 about what the pulser froze.
+        pulser_proposals: state.governance_proposals_frozen.clone(),
+        pulser_drep_distr: state.drep_stake_distr.clone(),
+        pulser_drep_state: state.drep_entries.clone(),
+        pulser_pool_distr: state.stake_pools.clone(),
+        ratify_enacted: state.ratify_enacted.clone(),
+        ratify_expired: state.ratify_expired.clone(),
+        ratify_delayed: state.ratify_delayed,
+    }
 }
 
 /// Handle GetProposals (tag 31) — filtered governance proposals.
@@ -95,28 +115,12 @@ pub(crate) fn handle_proposals(
 /// results from the most recent epoch transition's ratification pass.
 pub(crate) fn handle_ratify_state(state: &NodeStateSnapshot) -> QueryResult {
     debug!("Query: GetRatifyState");
-    // Build a GovStateSnapshot from NodeStateSnapshot fields for EnactState encoding.
-    let gov = crate::node::n2c_query::types::GovStateSnapshot {
-        proposals: state.governance_proposals.clone(),
-        committee: state.committee.clone(),
-        constitution_url: state.constitution_url.clone(),
-        constitution_hash: state.constitution_hash.clone(),
-        constitution_script: state.constitution_script.clone(),
-        cur_pparams: Box::new(state.protocol_params.clone()),
-        prev_pparams: Box::new(state.prev_protocol_params.clone()),
-        enacted_pparam_update: state.enacted_pparam_update.clone(),
-        enacted_hard_fork: state.enacted_hard_fork.clone(),
-        enacted_committee: state.enacted_committee.clone(),
-        enacted_constitution: state.enacted_constitution.clone(),
-        treasury: state.treasury,
-        future_pparams_tag: state.future_pparams_tag,
-        future_pparams: state.future_pparams.clone(),
-    };
+    let gov = gov_state_snapshot(state);
     QueryResult::RatifyState {
+        enacted: gov.ratify_enacted.clone(),
+        expired: gov.ratify_expired.clone(),
+        delayed: gov.ratify_delayed,
         gov: Box::new(gov),
-        enacted: state.ratify_enacted.clone(),
-        expired: state.ratify_expired.clone(),
-        delayed: state.ratify_delayed,
     }
 }
 

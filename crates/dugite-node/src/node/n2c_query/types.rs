@@ -786,6 +786,32 @@ pub struct GovStateSnapshot {
     pub future_pparams_tag: u8,
     /// The parameters carried by tags 1 and 2, when present.
     pub future_pparams: Option<Box<ProtocolParamsSnapshot>>,
+    /// `cgsDRepPulsingState`, always in its `DRComplete` form (#992).
+    ///
+    /// `ConwayGovState` embeds the whole pulser, and cardano-cli renders its
+    /// `RatifyState` half as `nextRatifyState`. dugite used to encode a
+    /// hardcoded EMPTY pulser here — no proposals, no distributions, no
+    /// enacted or expired actions, `rsDelayed` always false — while answering
+    /// `GetRatifyState` (tag 32) from the real one. Correct on every devnet
+    /// sample where nothing is enacting, wrong on exactly the boundaries that
+    /// matter; the #977 shape.
+    ///
+    /// `psProposals` — the pulser's frozen candidate set, same source as
+    /// `GetProposals` (tag 31).
+    pub pulser_proposals: Vec<ProposalSnapshot>,
+    /// `psDRepDistr` — same source as `GetDRepStakeDistr` (tag 26).
+    pub pulser_drep_distr: Vec<DRepStakeEntry>,
+    /// `psDRepState` — same source as `GetDRepState` (tag 25).
+    pub pulser_drep_state: Vec<DRepSnapshot>,
+    /// `psPoolDistr` — same source as `GetStakeDistribution` (tag 5).
+    pub pulser_pool_distr: Vec<StakePoolSnapshot>,
+    /// `rsEnacted` — what WILL enact at the next boundary, and since #988
+    /// step 2 what the boundary actually applies.
+    pub ratify_enacted: Vec<(ProposalSnapshot, GovActionId)>,
+    /// `rsExpired`.
+    pub ratify_expired: Vec<GovActionId>,
+    /// `rsDelayed`.
+    pub ratify_delayed: bool,
 }
 
 /// Vote entry: (credential_hash, credential_type, vote)

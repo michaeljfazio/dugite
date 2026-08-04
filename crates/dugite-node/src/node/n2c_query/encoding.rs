@@ -1313,8 +1313,23 @@ fn encode_gov_state(
         }
     }
 
-    // [6] DRepPulsingState = DRComplete (Rec, no constructor tag): array(2)
-    //     [PulsingSnapshot, RatifyState]
+    // [6] DRepPulsingState — always the `DRComplete` form (#992).
+    //
+    // ```haskell
+    // instance EncCBOR (DRepPulsingState era) where
+    //   encCBOR (DRComplete x y) = encode (Rec DRComplete !> To x !> To y)
+    //   encCBOR x@(DRPulsing (DRepPulser {})) = encode (Rec DRComplete !> To snap !> To ratstate)
+    //     where (snap, ratstate) = finishDRepPulser x
+    // ```
+    //
+    // A `Rec` with no constructor tag: array(2) [PulsingSnapshot, RatifyState].
+    //
+    // This was hardcoded EMPTY — four empty collections and `rsDelayed =
+    // false` — beside an `EnactState` that was a second hand-written copy of
+    // the one in `encode_ratify_state`. Both halves of that are now gone: the
+    // real pulser is encoded, and the `RatifyState` (EnactState included) is
+    // produced by the SAME function tag 32 uses, so tag 24 and tag 32 cannot
+    // drift apart.
     enc.array(2).ok();
 
     // PulsingSnapshot = array(4):
@@ -1323,99 +1338,26 @@ fn encode_gov_state(
     //   [2] psDRepState:  Map (Credential DRepRole) DRepState
     //   [3] psPoolDistr:  Map (KeyHash StakePool) (CompactForm Coin)
     enc.array(4).ok();
-    enc.array(0).ok(); // psProposals: empty StrictSeq (array, NOT map)
-    enc.map(0).ok(); // psDRepDistr
-    enc.map(0).ok(); // psDRepState
-    enc.map(0).ok(); // psPoolDistr
-
-    // RatifyState = array(4):
-    //   [0] rsEnactState:  EnactState (array(7))
-    //   [1] rsEnacted:     Seq GovActionState (plain array, no tag 258)
-    //   [2] rsExpired:     Set GovActionId (tag(258) + array)
-    //   [3] rsDelayed:     Bool
-    enc.array(4).ok();
-
-    // [0] EnactState = array(7):
-    //   [0] ensCommittee       StrictMaybe Committee
-    //   [1] ensConstitution    Constitution
-    //   [2] ensCurPParams      PParams
-    //   [3] ensPrevPParams     PParams
-    //   [4] ensTreasury        Coin
-    //   [5] ensWithdrawals     Map (Credential Staking) Coin
-    //   [6] ensPrevGovActionIds GovRelation StrictMaybe (array(4))
-    enc.array(7).ok();
-
-    // ensCommittee: reuse committee from ConwayGovState
-    if gov.committee.members.is_empty() && gov.committee.threshold.is_none() {
-        enc.array(0).ok(); // SNothing
-    } else {
-        enc.array(1).ok(); // SJust
-        enc.array(2).ok();
-        // Map<ColdCredential, EpochNo>
-        enc.map(gov.committee.members.len() as u64).ok();
-        for m in &gov.committee.members {
-            enc.array(2).ok();
-            enc.u8(m.cold_credential_type).ok();
-            enc.bytes(&m.cold_credential).ok();
-            enc.u64(m.expiry_epoch.unwrap_or(0)).ok();
-        }
-        // Quorum threshold
-        if let Some((num, den)) = gov.committee.threshold {
-            encode_tagged_rational(enc, num, den);
-        } else {
-            encode_tagged_rational(enc, 2, 3);
-        }
+    enc.array(gov.pulser_proposals.len() as u64).ok();
+    for p in &gov.pulser_proposals {
+        encode_gov_action_state(enc, p);
+    }
+    encode_drep_stake_distr(enc, &gov.pulser_drep_distr);
+    encode_drep_state(enc, &gov.pulser_drep_state);
+    enc.map(gov.pulser_pool_distr.len() as u64).ok();
+    for pool in &gov.pulser_pool_distr {
+        enc.bytes(&pool.pool_id).ok();
+        enc.u64(pool.stake).ok();
     }
 
-    // ensConstitution: array(2) [Anchor, StrictMaybe ScriptHash]
-    enc.array(2).ok();
-    enc.array(2).ok();
-    enc.str(&gov.constitution_url).ok();
-    enc.bytes(&gov.constitution_hash).ok();
-    if let Some(ref script) = gov.constitution_script {
-        enc.bytes(script).ok();
-    } else {
-        enc.null().ok();
-    }
-
-    // ensCurPParams
-    encode_protocol_params_cbor(enc, &gov.cur_pparams);
-    // ensPrevPParams
-    encode_protocol_params_cbor(enc, &gov.prev_pparams);
-    // ensTreasury
-    enc.u64(gov.treasury).ok();
-    // ensWithdrawals: empty map
-    enc.map(0).ok();
-    // ensPrevGovActionIds: GovRelation StrictMaybe = array(4) of StrictMaybe GovPurposeId
-    // Order: [PParamUpdate, HardFork, Committee, Constitution]
-    enc.array(4).ok();
-    let roots = [
-        &gov.enacted_pparam_update,
-        &gov.enacted_hard_fork,
-        &gov.enacted_committee,
-        &gov.enacted_constitution,
-    ];
-    for root in &roots {
-        match root {
-            Some((tx_hash, action_index)) => {
-                enc.array(1).ok(); // SJust
-                enc.array(2).ok(); // GovActionId
-                enc.bytes(tx_hash).ok();
-                enc.u32(*action_index).ok();
-            }
-            None => {
-                enc.array(0).ok(); // SNothing
-            }
-        }
-    }
-
-    // [1] rsEnacted: Seq GovActionState (plain array, NOT tagged set)
-    enc.array(0).ok();
-    // [2] rsExpired: Set GovActionId (tag(258) + array)
-    enc.tag(minicbor::data::Tag::new(258)).ok();
-    enc.array(0).ok();
-    // [3] rsDelayed: Bool
-    enc.bool(false).ok();
+    // RatifyState — shared with tag 32.
+    encode_ratify_state(
+        enc,
+        gov,
+        &gov.ratify_enacted,
+        &gov.ratify_expired,
+        gov.ratify_delayed,
+    );
 }
 
 fn encode_drep_state(
@@ -2855,6 +2797,13 @@ mod tests {
                 treasury: 0,
                 future_pparams_tag: tag,
                 future_pparams: payload.then_some(pp),
+                pulser_proposals: Vec::new(),
+                pulser_drep_distr: Vec::new(),
+                pulser_drep_state: Vec::new(),
+                pulser_pool_distr: Vec::new(),
+                ratify_enacted: Vec::new(),
+                ratify_expired: Vec::new(),
+                ratify_delayed: false,
             }
         }
 
@@ -2907,6 +2856,134 @@ mod tests {
             vec![0x81, 0x00],
             "Definite without params degrades to NoPParamsUpdate"
         );
+    }
+
+    /// #992 — `GetGovState`'s embedded `DRepPulsingState` must carry the REAL
+    /// pulser, and its `RatifyState` half must be byte-identical to the one
+    /// `GetRatifyState` (tag 32) serves.
+    ///
+    /// Both were hand-written: tag 32 encoded the real values while tag 24
+    /// encoded a hardcoded empty pulser next to a second copy of `EnactState`.
+    /// Nothing compared them, and on a devnet where nothing is enacting the
+    /// empty answer is indistinguishable from the right one — the #977 shape.
+    /// Asserting the BYTES match is what makes the drift inexpressible; it
+    /// fails whichever copy someone edits.
+    #[test]
+    fn gov_state_embeds_the_same_ratify_state_tag_32_serves() {
+        use crate::node::n2c_query::types::{
+            GovActionId, GovStateSnapshot, ProposalSnapshot, ProtocolParamsSnapshot,
+        };
+
+        let enacted_id = GovActionId {
+            tx_id: vec![0xAA; 32],
+            action_index: 0,
+        };
+        let expired_id = GovActionId {
+            tx_id: vec![0xBB; 32],
+            action_index: 3,
+        };
+        let proposal = ProposalSnapshot {
+            tx_id: vec![0xAA; 32],
+            action_index: 0,
+            action_type: "InfoAction".to_string(),
+            proposed_epoch: 40,
+            expires_epoch: 46,
+            yes_votes: 5,
+            no_votes: 1,
+            abstain_votes: 0,
+            deposit: 100_000_000_000,
+            return_addr: vec![0xe0; 29],
+            anchor_url: "https://example.invalid/a.json".to_string(),
+            anchor_hash: vec![0x11; 32],
+            gov_action: dugite_primitives::transaction::GovAction::InfoAction,
+            committee_votes: Vec::new(),
+            drep_votes: Vec::new(),
+            spo_votes: Vec::new(),
+        };
+
+        let pp = Box::new(ProtocolParamsSnapshot::default());
+        let gov = GovStateSnapshot {
+            proposals: Vec::new(),
+            committee: CommitteeSnapshot::default(),
+            constitution_url: String::new(),
+            constitution_hash: vec![0u8; 32],
+            constitution_script: None,
+            cur_pparams: pp.clone(),
+            prev_pparams: pp,
+            enacted_pparam_update: None,
+            enacted_hard_fork: None,
+            enacted_committee: None,
+            enacted_constitution: None,
+            treasury: 12_345,
+            future_pparams_tag: 2,
+            future_pparams: None,
+            pulser_proposals: vec![proposal.clone()],
+            pulser_drep_distr: Vec::new(),
+            pulser_drep_state: Vec::new(),
+            pulser_pool_distr: Vec::new(),
+            ratify_enacted: vec![(proposal, enacted_id)],
+            ratify_expired: vec![expired_id],
+            ratify_delayed: true,
+        };
+
+        // Element 6 of ConwayGovState is the DRepPulsingState: array(2)
+        // [PulsingSnapshot, RatifyState].
+        let encoded = encode_query_result(&QueryResult::GovState(Box::new(gov.clone())));
+        let inner = strip_wrappers_for_test(&encoded);
+        let mut dec = Decoder::new(&inner);
+        dec.array().unwrap();
+        for _ in 0..6 {
+            dec.skip().unwrap();
+        }
+        let pulser_start = dec.position();
+        dec.skip().unwrap();
+        let pulser = &inner[pulser_start..dec.position()];
+
+        let mut pd = Decoder::new(pulser);
+        assert_eq!(pd.array().unwrap(), Some(2), "DRComplete is array(2)");
+        let snap_start = pd.position();
+        pd.skip().unwrap();
+        let snap = &pulser[snap_start..pd.position()];
+        let rs_start = pd.position();
+        pd.skip().unwrap();
+        let embedded_ratify = &pulser[rs_start..pd.position()];
+
+        // The PulsingSnapshot half must carry the frozen candidate set, not an
+        // empty placeholder.
+        let mut sd = Decoder::new(snap);
+        assert_eq!(sd.array().unwrap(), Some(4), "PulsingSnapshot is array(4)");
+        assert_eq!(
+            sd.array().unwrap(),
+            Some(1),
+            "psProposals must carry the pulser's frozen proposals, not array(0)"
+        );
+
+        // And the RatifyState half must be exactly what tag 32 serves.
+        let tag32 = encode_query_result(&QueryResult::RatifyState {
+            gov: Box::new(gov.clone()),
+            enacted: gov.ratify_enacted.clone(),
+            expired: gov.ratify_expired.clone(),
+            delayed: gov.ratify_delayed,
+        });
+        let tag32_inner = strip_wrappers_for_test(&tag32);
+        assert_eq!(
+            embedded_ratify,
+            tag32_inner.as_slice(),
+            "GetGovState's embedded RatifyState must be byte-identical to \
+             GetRatifyState's (#992)"
+        );
+
+        // Belt and braces: the values really are non-empty, so the equality
+        // above is not two empty encodings agreeing.
+        let mut rd = Decoder::new(embedded_ratify);
+        assert_eq!(rd.array().unwrap(), Some(4), "RatifyState is array(4)");
+        rd.skip().unwrap(); // EnactState
+        assert_eq!(rd.array().unwrap(), Some(1), "rsEnacted carries one action");
+        rd.skip().unwrap();
+        assert_eq!(rd.tag().unwrap().as_u64(), 258, "rsExpired is a tagged set");
+        assert_eq!(rd.array().unwrap(), Some(1), "rsExpired carries one id");
+        rd.skip().unwrap();
+        assert!(rd.bool().unwrap(), "rsDelayed must be the real value");
     }
 
     // ── Helper: strip the MsgResult [4, [result]] wrappers from a full
