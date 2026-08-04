@@ -297,15 +297,23 @@ FPP=$!
 RSP=$!
 
 # The gov lifecycle must run DURING this round, or the sampler above sees an
-# empty `nextRatifyState` from end to end — and an empty answer is exactly what
-# #992's hardcoded pulser produced, so an all-empty run cannot tell the two
-# apart. It reports INCONCLUSIVE rather than passing in that case.
-( for s in 10-gov-lifecycle/10a-propose-param-change.sh \
-           10-gov-lifecycle/10b-drep-vote.sh \
-           10-gov-lifecycle/10c-spo-vote.sh \
-           10-gov-lifecycle/10d-cc-vote.sh; do
-      ./tx-zoo/"$s" >/dev/null 2>&1 || break
-  done ) &
+# empty `nextRatifyState` from end to end — and two implementations agreeing
+# that nothing is about to happen is not evidence. The sampler reports
+# INCONCLUSIVE rather than passing in that case.
+#
+# `04-stake` and `05-governance-certs` are NOT optional here. The lifecycle has
+# three on-chain prerequisites and fails at SUBMIT without them, each as a
+# cardano-cli error rather than a zoo assertion, which is what makes it easy to
+# get wrong:
+#
+#   10a  needs a REGISTERED stake credential for the deposit return address,
+#        else `Stake credential specified in the proposal is not registered`
+#   10b  needs a registered DRep, else `VotersDoNotExist (DRepVoter …)`
+#   10d  needs an authorised CC hot key, else `VotersDoNotExist (CommitteeVoter …)`
+#
+# A full `run-all.sh` satisfies all three by category ordering, which is why
+# they are invisible in Round 1. Naming the categories preserves that order.
+( ./tx-zoo/run-all.sh 04-stake 05-governance-certs 10-gov-lifecycle >/dev/null 2>&1 ) &
 GOV=$!
 
 ./soak.sh 900                       # 15 min — covers boundaries 0→1 AND 1→2 (first RUPD)
@@ -316,9 +324,8 @@ wait $RSP; RSP_RC=$?
 [ "$FPP_RC" -eq 0 ] || { echo "FUTUREPPARAMS PARITY FAIL/INCONCLUSIVE (rc=$FPP_RC)"; exit 1; }
 [ "$RSP_RC" -eq 0 ] || { echo "RATIFY-STATE PARITY FAIL/INCONCLUSIVE (rc=$RSP_RC)"; exit 1; }
 
-# The enactment assertion itself, once the boundary that applies the plan has
-# passed.
-./tx-zoo/10-gov-lifecycle/10e-assert-enactment.sh || { echo "GOV ENACTMENT FAIL"; exit 1; }
+# `10e-assert-enactment` runs as part of the category above, once the boundary
+# that applies the plan has passed; its verdict lands in tx-results.csv.
 
 # Pot-movement parity check at end (must be post-boundary 1→2, i.e. epoch >= 2)
 DBP_T=$(curl -s localhost:12798/metrics | awk '/^dugite_treasury_lovelace /{print $2}')
