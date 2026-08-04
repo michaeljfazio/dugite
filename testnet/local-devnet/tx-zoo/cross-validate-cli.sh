@@ -153,7 +153,16 @@ EOF
 xv_03_plutus_spend() {
     local name="xv-03-plutus-spend-v3"
     local WA="$ZOO_KEYS/wallet-a"
-    local plutus="$SCRIPT_DIR/lib/plutus/always-true-v3.plutus"
+    # `-spend`, NOT the bare name. Since #969/#970 the legacy aliases point at
+    # the upstream plutus-tx scripts, where `always-true-v3.plutus` is
+    # `alwaysSucceedsNoDatum` — TRUE for every purpose EXCEPT spending with a
+    # datum. This case locks with an inline datum, so it needs
+    # `alwaysSucceedsWithDatum` or the spend fails phase-2 with PT5.
+    #
+    # The #969/#970 sweep fixed every call site inside a zoo CATEGORY and
+    # missed this file, because cross-validate is not in `ALL_CATEGORIES` and
+    # so is not covered by run-all.sh's drift guard.
+    local plutus="$SCRIPT_DIR/lib/plutus/always-true-v3-spend.plutus"
     [ -s "$plutus" ] || { xv_record "$name" FAIL "" "no-plutus"; return 1; }
     local pay_addr; pay_addr=$(cat "$WA/payment-stake.addr")
     local script_addr; script_addr=$(cardano-cli conway address build \
@@ -325,14 +334,58 @@ xv_05_drep_register() {
         || { xv_record "$name" FAIL "$txid" "not-included"; return 1; }
 }
 
-# 06 — info-action proposal. Uses wallet-a because the
-# `deposit-return-stake-verification-key-file` must reference a stake
-# credential that's already registered on-chain. The suite's 04a registers
-# wallet-a's stake key and never deregisters it (04d targets wallet-b).
+# Register a wallet's stake credential if the chain does not already know it.
+# Idempotent: a no-op when `stake-address-info` already returns a row.
+xv_ensure_stake_registered() {
+    local dir="$1" from_addr="$2"
+    local stake_addr; stake_addr=$(cat "$dir/stake.addr" 2>/dev/null) || return 1
+    local info
+    info=$(cardano-cli conway query stake-address-info \
+               --address "$stake_addr" --testnet-magic "$LD_MAGIC" \
+               --socket-path "$LD_DUGITE_BP_SOCK" 2>/dev/null)
+    [ "$(printf '%s' "$info" | jq 'length' 2>/dev/null || echo 0)" -gt 0 ] && return 0
+
+    local pparams; pparams=$(zoo_pparams_file)
+    local dep; dep=$(jq -r '.stakeAddressDeposit // .stakeAddrDeposit // 2000000' "$pparams")
+    local cert="$ZOO_BUILT/xv-stake-precondition.cert"
+    cardano-cli conway stake-address registration-certificate \
+        --stake-verification-key-file "$dir/stake.vkey" \
+        --key-reg-deposit-amt "$dep" \
+        --out-file "$cert" >/dev/null 2>&1 || return 1
+    local utxo; utxo=$(zoo_largest_utxo "$from_addr") || return 1
+    local txin=${utxo%% *}
+    local raw="$ZOO_BUILT/xv-stake-precondition.raw"
+    local signed="$ZOO_BUILT/xv-stake-precondition.signed"
+    cardano-cli conway transaction build \
+        --testnet-magic "$LD_MAGIC" --socket-path "$ZOO_SOCKET" \
+        --tx-in "$txin" --change-address "$from_addr" \
+        --certificate-file "$cert" \
+        --out-file "$raw" >/dev/null 2> "$XV_LOGS/xv-stake-precondition-build.err" \
+        || return 1
+    cardano-cli conway transaction sign \
+        --testnet-magic "$LD_MAGIC" --tx-body-file "$raw" \
+        --signing-key-file "$dir/payment.skey" \
+        --signing-key-file "$dir/stake.skey" \
+        --out-file "$signed" >/dev/null 2>&1 || return 1
+    local txid; txid=$(xv_submit_dugite "$signed") || return 1
+    xv_wait_inclusion "$txid" "$from_addr" 90
+}
+
+# 06 — info-action proposal. `deposit-return-stake-verification-key-file` must
+# reference a stake credential that is registered ON-CHAIN, so this registers
+# it first if it is not.
+#
+# It used to assume 04a had done so and that nothing deregisters it. That
+# assumption was false in practice — a full zoo run leaves wallet-a's stake key
+# unregistered — and it failed as a cardano-cli build error rather than an
+# assertion, so it read as a dugite defect rather than a missing precondition.
+# Depending on another suite's leftover state is the bug; checking is the fix.
 xv_06_info_proposal() {
     local name="xv-06-info-action"
     local WA="$ZOO_KEYS/wallet-a"
     local from_addr; from_addr=$(cat "$WA/payment-stake.addr")
+    xv_ensure_stake_registered "$WA" "$from_addr" \
+        || { xv_record "$name" FAIL "" "stake-register-precondition"; return 1; }
     local pparams; pparams=$(zoo_pparams_file)
     local deposit; deposit=$(jq -r '.govActionDeposit // .govDeposit // 100000000000' "$pparams")
     local action="$ZOO_BUILT/$name.action"
