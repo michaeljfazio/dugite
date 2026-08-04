@@ -66,6 +66,38 @@ is_registered() {
     echo no
 }
 
+# is_deregistered <stake-addr> [timeout_s] -> "yes"|"no"
+#
+# The POSTCONDITION twin of `is_registered`, and it has to exist separately
+# because the polarity of the wait is what makes each one correct.
+#
+# `is_registered` returns as soon as it sees the address present and only says
+# "no" after the full timeout — right for "wait until registered". Reusing it to
+# assert the OPPOSITE state inverts that: it returns "yes" on the very first
+# poll that still sees the old registration, so the assertion gets 20 s of
+# patience for "became registered" and ZERO for "became deregistered".
+#
+# That is a coin flip, not a check. `wait_all_strict` only proves the tx is in a
+# block at every node; `query stake-address-info` is answered from dugite's N2C
+# query snapshot, which is rebuilt on an interval (~1 Hz at tip), so there is a
+# real window where the certificate has applied and the snapshot has not caught
+# up. 13d failed `still-registered-after-dereg` intermittently for exactly this
+# reason — observed 2026-08-02 and again during the v2.6.0 gate, with the
+# deregistration itself perfectly valid both times.
+is_deregistered() {
+    local addr="$1" timeout="${2:-20}" i=0 r
+    while [ "$i" -lt "$timeout" ]; do
+        r=$(cardano-cli conway query stake-address-info \
+                --testnet-magic "$LD_MAGIC" --socket-path "$ZOO_SOCKET" \
+                --address "$addr" 2>/dev/null \
+            | jq -r 'if length>0 then "yes" else "no" end' 2>/dev/null || echo "yes")
+        [ "$r" = "no" ] && { echo yes; return 0; }
+        sleep 1
+        i=$((i+1))
+    done
+    echo no
+}
+
 # A trivial redeemer. The always-true/false validators ignore it entirely;
 # what matters is that a redeemer EXISTS, because that is what forces the
 # ledger to build the ScriptPurpose and the node to evaluate it.
