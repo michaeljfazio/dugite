@@ -49,7 +49,7 @@ pub(crate) fn handle_gov_state(state: &NodeStateSnapshot) -> QueryResult {
 /// `cgsProposals` — it reads the DRep pulsing state's frozen proposal list
 /// (`dpProposals` / `psProposals`), refreshed only at epoch boundaries. This
 /// handler must therefore answer from `governance_proposals_frozen` (the
-/// #903 `RatificationSnapshot`-sourced view), NOT `governance_proposals` (the
+/// #903 `PulsingSnapshot`-sourced view), NOT `governance_proposals` (the
 /// live view `GetGovState`/tag 24 legitimately uses for its embedded
 /// `ConwayGovState.cgsProposals`). Reading the live field here was the #922
 /// bug: mid-epoch submissions appeared in dugite's answer immediately instead

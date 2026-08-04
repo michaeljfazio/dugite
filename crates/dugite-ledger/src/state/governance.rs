@@ -1,6 +1,6 @@
 use super::{
-    credential_to_hash, FuturePParams, GovRelation, GovernanceState, LedgerState, PGraph, PRoot,
-    ProposalState, PulsedRatifyState,
+    credential_to_hash, DRepPulsingState, FuturePParams, GovRelation, GovernanceState, LedgerState,
+    PGraph, PRoot, ProposalState, PulsedRatifyState,
 };
 use super::{CertSubState, EpochSubState, GovSubState};
 use crate::ledger_seq::{GovernanceChange, LedgerDelta};
@@ -980,7 +980,7 @@ impl LedgerState {
     /// - Inactive/expired DReps are excluded (handled by drep_power_cache)
     ///
     /// The `votes_by_action` parameter is passed explicitly so that `ratify_proposals()`
-    /// can supply either live votes or a [`RatificationSnapshot`]'s frozen votes.
+    /// can supply either live votes or a [`PulsingSnapshot`]'s frozen votes.
     ///
     /// The `pool_stake_override` parameter, when `Some`, provides the SPO stake
     /// distribution to use instead of `self.epochs.snapshots.mark`.  During ratification
@@ -1216,30 +1216,6 @@ impl LedgerState {
         utxo + reward
     }
 
-    /// Build a map of credential → total proposal deposits for that credential.
-    ///
-    /// Matches Haskell's `proposalsDeposits` in the DRep pulser: credentials that
-    /// submitted governance proposals have their deposited ADA counted toward
-    /// DRep/SPO voting power.
-    fn proposal_deposits_by_credential(&self) -> HashMap<Hash32, u64> {
-        Self::proposal_deposits_from(&self.gov.governance.proposals)
-    }
-
-    /// Compute proposal deposits per credential from a given proposals map.
-    ///
-    /// Used by both `proposal_deposits_by_credential` (live proposals) and
-    /// `build_drep_power_cache` (ratification snapshot proposals).
-    fn proposal_deposits_from(
-        proposals: &ImblOrdMap<GovActionId, ProposalState>,
-    ) -> HashMap<Hash32, u64> {
-        let mut deposits: HashMap<Hash32, u64> = HashMap::new();
-        for proposal in proposals.values() {
-            let cred = Self::reward_account_to_hash(&proposal.procedure.return_addr);
-            *deposits.entry(cred).or_default() += proposal.procedure.deposit.0;
-        }
-        deposits
-    }
-
     /// Build a cache of DRep voting power (Hash32 -> delegated stake) for ratification.
     ///
     /// Per Haskell `reDRepDistr` (`Conway.Rules.Epoch`), ratification must use the
@@ -1250,92 +1226,7 @@ impl LedgerState {
     ///
     /// Returns `(drep_power_cache, always_no_confidence_stake, always_abstain_stake)`.
     pub fn build_drep_power_cache(&self) -> (ImblHashMap<Hash32, u64>, u64, u64) {
-        // Use epoch-boundary snapshot when available (preferred — matches Haskell).
-        if !self.gov.governance.drep_distribution_snapshot.is_empty()
-            || self.gov.governance.drep_snapshot_no_confidence > 0
-            || self.gov.governance.drep_snapshot_abstain > 0
-        {
-            // The stored snapshot is the BASE distribution (without proposal deposits),
-            // matching Haskell's `computeDRepDistr`.  Add proposal deposits from the
-            // ratification snapshot's proposals (= `dpProposalDeposits` in Haskell's
-            // DRep pulser), so that proposal submitters' deposits count toward their
-            // DRep's voting power.
-            let mut cache = self.gov.governance.drep_distribution_snapshot.clone();
-            let mut no_confidence = self.gov.governance.drep_snapshot_no_confidence;
-            let mut abstain = self.gov.governance.drep_snapshot_abstain;
-
-            // Add proposal deposits from the ratification snapshot's proposals,
-            // matching Haskell's `dpProposalDeposits` added during DRep pulsing.
-            // Fall back to live proposals if no ratification snapshot exists.
-            let proposals = if let Some(ref snap) = self.gov.governance.ratification_snapshot {
-                &snap.proposals
-            } else {
-                &self.gov.governance.proposals
-            };
-            let prop_deposits = Self::proposal_deposits_from(proposals);
-            for (cred, deposit) in &prop_deposits {
-                if let Some(drep) = self.gov.governance.vote_delegations.get(cred) {
-                    if let Some(hash32) = drep.credential_hash32() {
-                        if cache.contains_key(&hash32) {
-                            *cache.entry(hash32).or_default() += deposit;
-                        }
-                    } else {
-                        match drep {
-                            DRep::NoConfidence => no_confidence += deposit,
-                            DRep::Abstain => abstain += deposit,
-                            _ => {}
-                        }
-                    }
-                }
-            }
-
-            return (cache, no_confidence, abstain);
-        }
-
-        // Fallback: compute from live state.  This path runs during the first epoch
-        // (before any snapshot has been captured) or when loading an older ledger
-        // snapshot that predates this field.
-        debug!("DRep power cache: using live vote_delegations (snapshot not yet populated)");
-        self.build_drep_power_cache_live()
-    }
-
-    /// Compute DRep voting power directly from live `vote_delegations`.
-    ///
-    /// Iterates vote_delegations once, O(n), instead of per-DRep O(n) lookups.
-    /// Only includes active DReps (inactive DReps are excluded from voting power).
-    /// Returns (drep_power_cache, always_no_confidence_stake, always_abstain_stake).
-    pub(crate) fn build_drep_power_cache_live(&self) -> (ImblHashMap<Hash32, u64>, u64, u64) {
-        let mut cache: ImblHashMap<Hash32, u64> = ImblHashMap::new();
-        let mut no_confidence_stake = 0u64;
-        let mut abstain_stake = 0u64;
-        // Precompute proposal deposits per credential (Haskell: proposalDeposits
-        // passed into DRepPulser, added to each credential's voting power).
-        let prop_deposits = self.proposal_deposits_by_credential();
-        for (stake_cred, drep) in &self.gov.governance.vote_delegations {
-            let stake = self.credential_stake(stake_cred)
-                + prop_deposits.get(stake_cred).copied().unwrap_or(0);
-            if let Some(hash32) = drep.credential_hash32() {
-                // Only count stake for active DReps.
-                if self
-                    .gov
-                    .governance
-                    .dreps
-                    .get(&hash32)
-                    .is_some_and(|d| d.active)
-                {
-                    *cache.entry(hash32).or_default() += stake;
-                }
-            } else {
-                match drep {
-                    DRep::NoConfidence => no_confidence_stake += stake,
-                    DRep::Abstain => abstain_stake += stake,
-                    _ => {}
-                }
-            }
-        }
-        // Per Haskell `reDRepDistr`: only DReps with actual delegated stake appear.
-        // DReps registered but with no delegators have 0 voting power.
-        (cache, no_confidence_stake, abstain_stake)
+        build_drep_power_cache_from(&self.gov, &self.certs)
     }
 
     /// Capture the DRep distribution snapshot at the end of an epoch transition.
@@ -1349,7 +1240,7 @@ impl LedgerState {
     /// lifecycle.
     #[allow(dead_code)]
     pub(crate) fn capture_drep_distribution_snapshot(&mut self) {
-        capture_drep_distribution_snapshot_impl(&self.certs, &mut self.gov);
+        set_fresh_drep_pulsing_state(self.epoch, &self.epochs, &self.certs, &mut self.gov);
     }
 
     /// Freeze only the ratification INPUTS — Haskell's `PulsingSnapshot` half.
@@ -1360,7 +1251,7 @@ impl LedgerState {
     /// instead.
     #[allow(dead_code)]
     pub fn capture_ratification_snapshot(&mut self) {
-        capture_ratification_snapshot_impl(self.epoch, self.epochs.treasury.0, &mut self.gov);
+        set_fresh_drep_pulsing_state(self.epoch, &self.epochs, &self.certs, &mut self.gov);
     }
 
     /// Stand in for the epoch boundary that PRECEDES the one under test.
@@ -1385,56 +1276,7 @@ impl LedgerState {
     /// Includes stake delegated to Abstain and NoConfidence (they are part of total DRep ecosystem).
     #[allow(dead_code)]
     pub(crate) fn compute_total_drep_stake(&self) -> u64 {
-        // Use the epoch-boundary DRep distribution snapshot when available,
-        // matching Haskell's `reDRepDistr` from the DRep pulser.  The snapshot
-        // is captured at the END of the previous epoch transition, giving it a
-        // one-epoch lag that matches Haskell's pulser lifecycle.  Summing the
-        // snapshot values also ensures the total is consistent with the per-DRep
-        // power returned by `build_drep_power_cache()` (both include proposal
-        // deposits).
-        if !self.gov.governance.drep_distribution_snapshot.is_empty()
-            || self.gov.governance.drep_snapshot_no_confidence > 0
-            || self.gov.governance.drep_snapshot_abstain > 0
-        {
-            let drep_sum: u64 = self
-                .gov
-                .governance
-                .drep_distribution_snapshot
-                .values()
-                .fold(0u64, |acc, v| acc.saturating_add(*v));
-            let total = drep_sum
-                .saturating_add(self.gov.governance.drep_snapshot_no_confidence)
-                .saturating_add(self.gov.governance.drep_snapshot_abstain);
-            return total.max(1);
-        }
-
-        // Fallback: compute from live state (first epoch or old snapshot).
-        let prop_deposits = self.proposal_deposits_by_credential();
-        let mut total = 0u64;
-        for (stake_cred, drep) in &self.gov.governance.vote_delegations {
-            let stake = self.credential_stake(stake_cred)
-                + prop_deposits.get(stake_cred).copied().unwrap_or(0);
-            match drep {
-                DRep::Abstain | DRep::NoConfidence => {
-                    total += stake;
-                }
-                _ => {
-                    // Safe: KeyHash/ScriptHash both yield Some(hash32).
-                    if let Some(hash32) = drep.credential_hash32() {
-                        if self
-                            .gov
-                            .governance
-                            .dreps
-                            .get(&hash32)
-                            .is_some_and(|d| d.active)
-                        {
-                            total += stake;
-                        }
-                    }
-                }
-            }
-        }
-        total.max(1) // Ensure non-zero to avoid division by zero
+        compute_total_drep_stake_from(&self.gov, &self.certs)
     }
 
     /// Compute the voting power of a stake pool: total delegated stake.
@@ -1728,8 +1570,7 @@ pub(crate) fn predict_future_pparams(gov: &mut GovSubState) {
     }
     let predicted = gov
         .governance
-        .pulsed_ratify_state
-        .as_ref()
+        .ratify_plan()
         .filter(|p| p.has_pparams_changes)
         .map(|p| Box::new(p.cur_pparams.clone()));
     let g = Arc::make_mut(&mut gov.governance);
@@ -1768,7 +1609,7 @@ pub(crate) fn ratify_at_boundary(
     certs: &mut CertSubState,
     gov: &mut GovSubState,
 ) {
-    let Some(plan) = gov.governance.pulsed_ratify_state.clone() else {
+    let Some(plan) = gov.governance.ratify_plan().cloned() else {
         // Haskell's `Default (DRepPulsingState era)` is `DRComplete def def` —
         // an EMPTY result. Nothing enacts and nothing expires at a boundary
         // with no pulser, which is reachable only at the first Conway boundary
@@ -1847,7 +1688,7 @@ fn apply_ratify_decision(
     certs: &mut CertSubState,
     gov: &mut GovSubState,
 ) {
-    let frozen = gov.governance.ratification_snapshot.clone();
+    let frozen = gov.governance.pulsing_snapshot().cloned();
 
     let (
         mut enacted_pparam,
@@ -2036,22 +1877,56 @@ pub(crate) fn epoch_boundary_governance_step(
     if epochs.protocol_params.protocol_version_major >= 9 {
         Arc::make_mut(&mut gov.governance).future_pparams =
             FuturePParams::PotentialPParamsUpdate(None);
-        capture_drep_distribution_snapshot_impl(certs, gov);
-        capture_ratification_snapshot_impl(new_epoch, epochs.treasury.0, gov);
-        // Order matters: the pulser is computed FROM the snapshot just frozen,
-        // so it must run after both captures. This is `setFreshDRepPulsingState`
-        // — the result describes the ratification that will be applied at the
-        // FOLLOWING boundary (#988).
-        let pulsed = compute_pulsed_ratify_state(new_epoch, epochs, certs, gov);
-        debug!(
-            epoch = new_epoch.0,
-            enacted = pulsed.enacted.len(),
-            expired = pulsed.expired.len(),
-            delayed = pulsed.delayed,
-            has_pparams_changes = pulsed.has_pparams_changes,
-            "DRep pulser: frozen ratification result for the epoch now starting"
-        );
-        Arc::make_mut(&mut gov.governance).pulsed_ratify_state = Some(pulsed);
+        set_fresh_drep_pulsing_state(new_epoch, epochs, certs, gov);
+    }
+}
+
+/// Haskell `setFreshDRepPulsingState eNo stakePoolDistr epochState` — freeze a
+/// new pulser for the epoch now starting (#988).
+///
+/// The ONLY writer of [`GovernanceState::drep_pulsing_state`]. Upstream this is
+/// two states: `setFreshDRepPulsingState` installs `DRPulsing` with the inputs
+/// frozen and the result not yet computed, and `finishDRepPulser` collapses it
+/// to `DRComplete` when a reader forces it. dugite has no incremental pulsing,
+/// so both happen here — which is why the inputs are installed first and the
+/// result written over them: the decision reads its inputs from `gov`, exactly
+/// as `finishDRepPulser` reads them from the pulser record.
+///
+/// The intermediate state is never observable outside this function.
+fn set_fresh_drep_pulsing_state(
+    new_epoch: EpochNo,
+    epochs: &EpochSubState,
+    certs: &CertSubState,
+    gov: &mut GovSubState,
+) {
+    let snapshot = build_pulsing_snapshot(new_epoch, epochs.treasury.0, certs, gov);
+    Arc::make_mut(&mut gov.governance).drep_pulsing_state = Some(DRepPulsingState {
+        snapshot,
+        // Placeholder: overwritten below, before this function returns.
+        ratify_state: PulsedRatifyState {
+            computed_at_epoch: new_epoch,
+            enacted: Vec::new(),
+            expired: Vec::new(),
+            delayed: false,
+            cur_pparams: epochs.protocol_params.clone(),
+            has_pparams_changes: false,
+        },
+    });
+
+    let pulsed = compute_pulsed_ratify_state(new_epoch, epochs, certs, gov);
+    debug!(
+        epoch = new_epoch.0,
+        enacted = pulsed.enacted.len(),
+        expired = pulsed.expired.len(),
+        delayed = pulsed.delayed,
+        has_pparams_changes = pulsed.has_pparams_changes,
+        "DRep pulser: frozen ratification result for the epoch now starting"
+    );
+    if let Some(p) = Arc::make_mut(&mut gov.governance)
+        .drep_pulsing_state
+        .as_mut()
+    {
+        p.ratify_state = pulsed;
     }
 }
 
@@ -2073,10 +1948,15 @@ pub(crate) fn epoch_boundary_governance_step(
 /// term was missing here (#949) while the LIVE query path already had it — the
 /// same term had been found missing once before and fixed only on that side, so
 /// the bug moved out of sight rather than away.
-fn capture_drep_distribution_snapshot_impl(certs: &CertSubState, gov: &mut GovSubState) {
-    let mut cache: ImblHashMap<Hash32, u64> = ImblHashMap::new();
-    let mut no_confidence = 0u64;
-    let mut abstain = 0u64;
+fn build_pulsing_snapshot(
+    epoch: EpochNo,
+    treasury: u64,
+    certs: &CertSubState,
+    gov: &GovSubState,
+) -> super::PulsingSnapshot {
+    let mut drep_distr: ImblHashMap<Hash32, u64> = ImblHashMap::new();
+    let mut drep_no_confidence = 0u64;
+    let mut drep_abstain = 0u64;
 
     // Proposal deposits are keyed by each live proposal's RETURN ADDRESS staking
     // credential and SUMMED across proposals sharing one, matching Haskell's
@@ -2094,32 +1974,19 @@ fn capture_drep_distribution_snapshot_impl(certs: &CertSubState, gov: &mut GovSu
             .saturating_add(proposal_deposits.get(stake_cred).copied().unwrap_or(0));
         if let Some(hash32) = drep.credential_hash32() {
             if gov.governance.dreps.get(&hash32).is_some_and(|d| d.active) {
-                *cache.entry(hash32).or_default() += stake;
+                *drep_distr.entry(hash32).or_default() += stake;
             }
         } else {
             match drep {
-                DRep::NoConfidence => no_confidence += stake,
-                DRep::Abstain => abstain += stake,
+                DRep::NoConfidence => drep_no_confidence += stake,
+                DRep::Abstain => drep_abstain += stake,
                 _ => {}
             }
         }
     }
-    let gov_state = Arc::make_mut(&mut gov.governance);
-    gov_state.drep_distribution_snapshot = cache;
-    gov_state.drep_snapshot_no_confidence = no_confidence;
-    gov_state.drep_snapshot_abstain = abstain;
-    debug!(
-        "DRep distribution snapshot captured: {} DReps, no_confidence={}, abstain={}",
-        gov_state.drep_distribution_snapshot.len(),
-        gov_state.drep_snapshot_no_confidence,
-        gov_state.drep_snapshot_abstain,
-    );
-}
 
-/// Capture a ratification snapshot at an epoch boundary.
-fn capture_ratification_snapshot_impl(epoch: EpochNo, treasury: u64, gov: &mut GovSubState) {
     let gov_ref = &gov.governance;
-    let snapshot = super::RatificationSnapshot {
+    let snapshot = super::PulsingSnapshot {
         proposals: gov_ref.proposals.clone(),
         votes_by_action: gov_ref.votes_by_action.clone(),
         committee_hot_keys: gov_ref.committee_hot_keys.clone(),
@@ -2138,16 +2005,22 @@ fn capture_ratification_snapshot_impl(epoch: EpochNo, treasury: u64, gov: &mut G
         // — so the value consumed by the NEXT boundary's ratification is this
         // boundary's post-RUPD treasury, exactly one boundary stale.
         treasury,
+        drep_distr,
+        drep_no_confidence,
+        drep_abstain,
     };
     debug!(
         epoch = epoch.0,
         proposals = snapshot.proposals.len(),
         votes = snapshot.votes_by_action.len(),
         committee = snapshot.committee_expiration.len(),
+        dreps = snapshot.drep_distr.len(),
+        no_confidence = snapshot.drep_no_confidence,
+        abstain = snapshot.drep_abstain,
         treasury,
-        "Ratification snapshot captured for next epoch boundary"
+        "DRep pulser: inputs frozen for the epoch now starting"
     );
-    Arc::make_mut(&mut gov.governance).ratification_snapshot = Some(snapshot);
+    snapshot
 }
 
 /// Compute the stake for a credential from sub-state components.
@@ -2581,18 +2454,20 @@ fn check_ratification_impl(
 ///
 /// Equivalent to `LedgerState::compute_total_drep_stake`.
 fn compute_total_drep_stake_from(gov: &GovSubState, certs: &CertSubState) -> u64 {
-    if !gov.governance.drep_distribution_snapshot.is_empty()
-        || gov.governance.drep_snapshot_no_confidence > 0
-        || gov.governance.drep_snapshot_abstain > 0
-    {
-        let drep_sum: u64 = gov
-            .governance
-            .drep_distribution_snapshot
+    // Gated on the pulser EXISTING, not on its distribution being non-empty.
+    // An empty `reDRepDistr` is a legitimate answer — `dRepAcceptedRatio` folds
+    // the distribution rather than the voter set, so it makes every DRep-gated
+    // action unratifiable — and substituting a live one for it would count
+    // DReps registered during the epoch that just ended, which is precisely the
+    // one-boundary-early error of #922 / #950 / #966.
+    if let Some(snap) = gov.governance.pulsing_snapshot() {
+        let drep_sum: u64 = snap
+            .drep_distr
             .values()
             .fold(0u64, |acc, v| acc.saturating_add(*v));
         let total = drep_sum
-            .saturating_add(gov.governance.drep_snapshot_no_confidence)
-            .saturating_add(gov.governance.drep_snapshot_abstain);
+            .saturating_add(snap.drep_no_confidence)
+            .saturating_add(snap.drep_abstain);
         return total.max(1);
     }
 
@@ -2637,37 +2512,24 @@ fn build_drep_power_cache_from(
     gov: &GovSubState,
     certs: &CertSubState,
 ) -> (ImblHashMap<Hash32, u64>, u64, u64) {
-    if !gov.governance.drep_distribution_snapshot.is_empty()
-        || gov.governance.drep_snapshot_no_confidence > 0
-        || gov.governance.drep_snapshot_abstain > 0
-    {
-        let mut cache = gov.governance.drep_distribution_snapshot.clone();
-        let mut no_confidence = gov.governance.drep_snapshot_no_confidence;
-        let mut abstain = gov.governance.drep_snapshot_abstain;
-
-        let proposals = if let Some(ref snap) = gov.governance.ratification_snapshot {
-            &snap.proposals
-        } else {
-            &gov.governance.proposals
-        };
-        let prop_deposits = proposal_deposits_from_map(proposals);
-        for (cred, deposit) in &prop_deposits {
-            if let Some(drep) = gov.governance.vote_delegations.get(cred) {
-                if let Some(hash32) = drep.credential_hash32() {
-                    if cache.contains_key(&hash32) {
-                        *cache.entry(hash32).or_default() += deposit;
-                    }
-                } else {
-                    match drep {
-                        DRep::NoConfidence => no_confidence += deposit,
-                        DRep::Abstain => abstain += deposit,
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        return (cache, no_confidence, abstain);
+    // The frozen distribution is returned VERBATIM. `computeDRepDistr` folds
+    // `mInstantStake <> mProposalDeposit <> balance` in one pass, so the
+    // deposits are already in it — and until #991 this function added them a
+    // SECOND time. `compute_total_drep_stake_from` sums the same map and never
+    // did, so the per-DRep numerator carried deposits twice against a
+    // denominator that carried them once, inflating `dRepAcceptedRatio` in the
+    // accept-early direction.
+    //
+    // Gated on the pulser EXISTING, not on the distribution being non-empty:
+    // an empty `reDRepDistr` is a legitimate answer, and substituting a live
+    // one for it would count DReps that registered during the epoch that just
+    // ended.
+    if let Some(snap) = gov.governance.pulsing_snapshot() {
+        return (
+            snap.drep_distr.clone(),
+            snap.drep_no_confidence,
+            snap.drep_abstain,
+        );
     }
 
     // Fallback: compute from live state.
@@ -3273,7 +3135,7 @@ pub(crate) fn ratify_proposals_impl(
         })
         .unwrap_or_else(|| compute_total_spo_stake_from(certs, epochs));
 
-    let snapshot = gov.governance.ratification_snapshot.clone();
+    let snapshot = gov.governance.pulsing_snapshot().cloned();
     let using_snapshot = snapshot.is_some();
 
     // The committee fields are mutable because Haskell's RATIFY threads
@@ -3433,8 +3295,7 @@ pub(crate) fn ratify_proposals_impl(
     // the second boundary onward the snapshot always exists.
     let mut cap_treasury = gov
         .governance
-        .ratification_snapshot
-        .as_ref()
+        .pulsing_snapshot()
         .map_or(epochs.treasury.0, |snap| snap.treasury);
 
     // Haskell `rsExpired`, and it is built from the pulser's OWN proposal set,
@@ -4032,7 +3893,7 @@ pub(crate) fn check_threshold(yes: u64, total: u64, threshold: &Rational) -> boo
 /// Post-bootstrap, if active_size < committeeMinSize, CC blocks ratification.
 ///
 /// The committee data is passed explicitly (not via `&GovernanceState`) so that
-/// `ratify_proposals()` can supply either live state or a [`RatificationSnapshot`]'s
+/// `ratify_proposals()` can supply either live state or a [`PulsingSnapshot`]'s
 /// committee fields, matching Haskell's `committeeAccepted` which reads from the
 /// frozen `RatifyEnv`.
 #[allow(clippy::too_many_arguments)]
@@ -5768,18 +5629,29 @@ mod tests {
             .stake_map
             .insert(stake_cred, Lovelace(1_000_000_000));
 
-        let (cache, _, _) = state.build_drep_power_cache_live();
-        assert_eq!(
-            cache.get(&dreps_key),
-            Some(&1_000_000_000u64),
-            "script DRep stake must be routed under the typed-Hash32 key"
-        );
-        // The padded (untyped) form must NOT appear — that was the bug.
+        // Both routings: the pulser freeze (the consensus path since #988) and
+        // the live fallback that answers before the first Conway boundary.
+        let frozen = build_pulsing_snapshot(
+            state.epoch,
+            state.epochs.treasury.0,
+            &state.certs,
+            &state.gov,
+        )
+        .drep_distr;
+        let (live, _, _) = build_drep_power_cache_live_from(&state.gov, &state.certs);
         let padded = Hash28::from_bytes(raw).to_hash32_padded();
-        assert!(
-            !cache.contains_key(&padded),
-            "padded (no-discriminator) form must not leak into the cache"
-        );
+        for (label, cache) in [("frozen", &frozen), ("live", &live)] {
+            assert_eq!(
+                cache.get(&dreps_key),
+                Some(&1_000_000_000u64),
+                "{label}: script DRep stake must be routed under the typed-Hash32 key"
+            );
+            // The padded (untyped) form must NOT appear — that was the bug.
+            assert!(
+                !cache.contains_key(&padded),
+                "{label}: padded (no-discriminator) form must not leak into the cache"
+            );
+        }
     }
 
     #[test]
@@ -6493,8 +6365,7 @@ mod tests {
             state
                 .gov
                 .governance
-                .ratification_snapshot
-                .as_ref()
+                .pulsing_snapshot()
                 .expect("snapshot captured")
                 .treasury,
             500_000_000,
@@ -10484,8 +10355,8 @@ mod tests {
             state
                 .gov
                 .governance
-                .drep_distribution_snapshot
-                .get(&drep_hash)
+                .drep_distr()
+                .and_then(|d| d.get(&drep_hash))
                 .copied(),
             Some(1_200),
             "baseline must be InstantStake + AccountBalance"
@@ -10536,11 +10407,31 @@ mod tests {
             state
                 .gov
                 .governance
-                .drep_distribution_snapshot
-                .get(&drep_hash)
+                .drep_distr()
+                .and_then(|d| d.get(&drep_hash))
                 .copied(),
             Some(1_200 + 200_000),
             "both proposal deposits must be summed into the frozen snapshot (#949)"
+        );
+
+        // #991: and exactly ONCE. `computeDRepDistr` folds instant stake,
+        // proposal deposits and balance in a single pass, so a consumer that
+        // adds the deposits again produces a numerator carrying them twice
+        // against a denominator carrying them once.
+        let (cache, _, _) = build_drep_power_cache_from(&state.gov, &state.certs);
+        assert_eq!(
+            cache.get(&drep_hash).copied(),
+            Some(1_200 + 200_000),
+            "the consumer must not re-add deposits already in the frozen \
+             distribution (#991)"
+        );
+
+        // The same quantity must reach the ratification denominator, or the
+        // ratio is computed against a different distribution than the powers.
+        assert_eq!(
+            compute_total_drep_stake_from(&state.gov, &state.certs),
+            1_200 + 200_000,
+            "numerator and denominator must be the same distribution (#991)"
         );
     }
 }
@@ -10597,15 +10488,14 @@ mod pulser_tests {
         let mut st = populated_ledger_state();
         let ending = st.epoch;
         let starting = EpochNo(ending.0 + 1);
-        Arc::make_mut(&mut st.gov.governance).pulsed_ratify_state = None;
+        Arc::make_mut(&mut st.gov.governance).drep_pulsing_state = None;
 
         epoch_boundary_governance_step(starting, &st.epochs, &st.certs, &mut st.gov);
 
         let stamp = st
             .gov
             .governance
-            .pulsed_ratify_state
-            .as_ref()
+            .ratify_plan()
             .expect("a pulser must be frozen")
             .computed_at_epoch;
         assert_eq!(
@@ -10615,6 +10505,20 @@ mod pulser_tests {
              boundary's RATIFY will use — not the epoch that just ended \
              ({ending:?})"
         );
+    }
+
+    /// Install a ratification plan into an already-frozen pulser.
+    ///
+    /// There is deliberately no way to set a plan without a pulser: the two
+    /// halves of `DRComplete` are frozen together, and a test that could
+    /// install one without the other would be testing a state the ledger
+    /// cannot reach.
+    fn set_plan(state: &mut LedgerState, plan: PulsedRatifyState) {
+        Arc::make_mut(&mut state.gov.governance)
+            .drep_pulsing_state
+            .as_mut()
+            .expect("freeze a pulser before planting a plan")
+            .ratify_state = plan;
     }
 
     /// Collect the WARN messages emitted while `f` runs.
@@ -10707,7 +10611,7 @@ mod pulser_tests {
             cur_pparams: state.epochs.protocol_params.clone(),
             has_pparams_changes: false,
         };
-        Arc::make_mut(&mut state.gov.governance).pulsed_ratify_state = Some(plan);
+        set_plan(&mut state, plan);
 
         state.process_epoch_transition(EpochNo(state.epoch.0 + 1));
 
@@ -10756,8 +10660,8 @@ mod pulser_tests {
         let planned = state
             .gov
             .governance
-            .pulsed_ratify_state
-            .clone()
+            .ratify_plan()
+            .cloned()
             .expect("a pulser must be frozen");
         assert_eq!(
             planned.enacted,
@@ -10765,11 +10669,14 @@ mod pulser_tests {
             "fixture is wrong: this proposal must be ratifiable"
         );
 
-        Arc::make_mut(&mut state.gov.governance).pulsed_ratify_state = Some(PulsedRatifyState {
-            enacted: Vec::new(),
-            delayed: false,
-            ..planned
-        });
+        set_plan(
+            &mut state,
+            PulsedRatifyState {
+                enacted: Vec::new(),
+                delayed: false,
+                ..planned
+            },
+        );
 
         state.process_epoch_transition(EpochNo(state.epoch.0 + 1));
 
@@ -10797,7 +10704,7 @@ mod pulser_tests {
         for i in 0..6 {
             super::tests::spo_vote(&mut state, i, &action_id, Vote::Yes);
         }
-        Arc::make_mut(&mut state.gov.governance).pulsed_ratify_state = None;
+        Arc::make_mut(&mut state.gov.governance).drep_pulsing_state = None;
 
         state.process_epoch_transition(EpochNo(state.epoch.0 + 1));
 
@@ -10814,17 +10721,22 @@ mod pulser_tests {
     #[test]
     fn a_plan_naming_an_unknown_action_warns() {
         let (mut state, _) = state_with_unratifiable_proposal();
-        Arc::make_mut(&mut state.gov.governance).pulsed_ratify_state = Some(PulsedRatifyState {
-            computed_at_epoch: state.epoch,
-            enacted: vec![GovActionId {
-                transaction_id: Hash32::from_bytes([0xAB; 32]),
-                action_index: 0,
-            }],
-            expired: Vec::new(),
-            delayed: false,
-            cur_pparams: state.epochs.protocol_params.clone(),
-            has_pparams_changes: false,
-        });
+        let epoch = state.epoch;
+        let pp = state.epochs.protocol_params.clone();
+        set_plan(
+            &mut state,
+            PulsedRatifyState {
+                computed_at_epoch: epoch,
+                enacted: vec![GovActionId {
+                    transaction_id: Hash32::from_bytes([0xAB; 32]),
+                    action_index: 0,
+                }],
+                expired: Vec::new(),
+                delayed: false,
+                cur_pparams: pp,
+                has_pparams_changes: false,
+            },
+        );
 
         let msgs = warnings_during(|| {
             ratify_at_boundary(
@@ -10854,11 +10766,11 @@ mod pulser_tests {
             ..state
                 .gov
                 .governance
-                .pulsed_ratify_state
-                .clone()
+                .ratify_plan()
+                .cloned()
                 .expect("a pulser must be frozen")
         };
-        Arc::make_mut(&mut state.gov.governance).pulsed_ratify_state = Some(stale);
+        set_plan(&mut state, stale);
 
         let msgs = warnings_during(|| {
             ratify_at_boundary(
@@ -10930,8 +10842,8 @@ mod pulser_tests {
         let decision = state
             .gov
             .governance
-            .pulsed_ratify_state
-            .clone()
+            .ratify_plan()
+            .cloned()
             .expect("a pulser must be frozen");
 
         assert_eq!(
@@ -10957,14 +10869,13 @@ mod pulser_tests {
     #[test]
     fn boundary_freezes_a_pulser_result() {
         let mut st = populated_ledger_state();
-        Arc::make_mut(&mut st.gov.governance).pulsed_ratify_state = None;
+        Arc::make_mut(&mut st.gov.governance).drep_pulsing_state = None;
         epoch_boundary_governance_step(st.epoch, &st.epochs, &st.certs, &mut st.gov);
 
         let pulsed = st
             .gov
             .governance
-            .pulsed_ratify_state
-            .as_ref()
+            .ratify_plan()
             .expect("PV>=9 boundary must freeze a pulser result");
         assert_eq!(
             pulsed.computed_at_epoch, st.epoch,
@@ -11107,7 +11018,7 @@ mod future_pparams_tests {
         {
             let g = Arc::make_mut(&mut st.gov.governance);
             g.future_pparams = potential(None);
-            if let Some(p) = g.pulsed_ratify_state.as_mut() {
+            if let Some(p) = g.drep_pulsing_state.as_mut().map(|d| &mut d.ratify_state) {
                 p.has_pparams_changes = false;
             }
         }
@@ -11118,7 +11029,7 @@ mod future_pparams_tests {
         {
             let g = Arc::make_mut(&mut st.gov.governance);
             g.future_pparams = potential(None);
-            if let Some(p) = g.pulsed_ratify_state.as_mut() {
+            if let Some(p) = g.drep_pulsing_state.as_mut().map(|d| &mut d.ratify_state) {
                 p.has_pparams_changes = true;
                 p.cur_pparams.min_fee_a = 12_345;
             }

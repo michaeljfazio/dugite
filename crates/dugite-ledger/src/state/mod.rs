@@ -447,33 +447,20 @@ pub struct GovernanceState {
     /// epoch, not the live state.  This prevents mid-epoch stake movements from
     /// affecting in-flight governance ratification.
     ///
-    /// Populated by `process_epoch_transition` at each epoch boundary.
-    pub drep_distribution_snapshot: ImblHashMap<Hash32, u64>,
-    /// Snapshot of total `AlwaysNoConfidence`-delegated stake at the last epoch boundary.
-    /// Companion to `drep_distribution_snapshot`.
-    pub drep_snapshot_no_confidence: u64,
-    /// Snapshot of total `AlwaysAbstain`-delegated stake at the last epoch boundary.
-    /// Companion to `drep_distribution_snapshot`.
-    pub drep_snapshot_abstain: u64,
-    /// Frozen ratification snapshot from the previous epoch boundary.
+    /// Haskell `cgsDRepPulsingState` — the frozen DRep pulser (#988).
     ///
-    /// Analogous to Haskell's `DRepPulsingState` / `PulsingSnapshot`.  Captured at
-    /// epoch boundary E (after ratification/expiry/enactment); consumed by
-    /// `ratify_proposals()` at boundary E+1.  This ensures proposals and votes
-    /// submitted during epoch E are not considered for ratification until E+1→E+2,
-    /// matching the Haskell DRep pulser timing.
+    /// Captured at epoch boundary E and consumed at boundary E+1, so proposals
+    /// and votes submitted during epoch E are not considered for ratification
+    /// until E+1→E+2. It carries BOTH halves of `DRComplete`: the frozen inputs
+    /// RATIFY ran over, and the decision it reached.
     ///
-    /// `None` at genesis or when loading a snapshot that predates this field —
-    /// `ratify_proposals()` falls back to live state in that case.
-    pub ratification_snapshot: Option<RatificationSnapshot>,
-    /// The frozen pulser RESULT for the epoch now starting (#988).
+    /// `None` before the first Conway boundary of a chain. Since #988 step 2
+    /// that means nothing ratifies, matching Haskell's `Default` of
+    /// `DRComplete def def` — never a fall back to live state, which is #903's
+    /// bug with an extra step.
     ///
-    /// Computed at the boundary from `ratification_snapshot`, and describing
-    /// the ratification that will be applied at the FOLLOWING boundary — which
-    /// is exactly what Haskell's `queryRatifyState` returns mid-epoch.
-    /// Distinct from `last_ratified`/`last_expired`/`last_ratify_delayed`,
-    /// which record what already happened.
-    pub pulsed_ratify_state: Option<PulsedRatifyState>,
+    /// Replaced five separately-`Option`al fields; see [`DRepPulsingState`].
+    pub drep_pulsing_state: Option<DRepPulsingState>,
     /// Haskell `cgsFuturePParams` (#977). See [`FuturePParams`] — this feeds
     /// the ledger-view FORECAST, not only the `GetGovState` query.
     pub future_pparams: FuturePParams,
@@ -589,7 +576,7 @@ impl FuturePParams {
 /// Haskell's `DRepPulsingState` is created fresh at each epoch boundary by
 /// `setFreshDRepPulsingState`, computes incrementally through the epoch, and is
 /// consumed by RATIFY at the NEXT boundary. dugite had the frozen *inputs*
-/// (`RatificationSnapshot`, #903) but never the frozen *result*, which cost two
+/// (`PulsingSnapshot`, #903) but never the frozen *result*, which cost two
 /// separate divergences:
 ///
 /// * `GetRatifyState` (LSQ tag 32) is `queryRatifyState = snd .
@@ -647,7 +634,7 @@ pub struct PulsedRatifyState {
 /// Analogous to Haskell's `DRepPulsingState` snapshot fields (`dpProposals`,
 /// `dpCommitteeState`, `dpEnactState`, etc.).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RatificationSnapshot {
+pub struct PulsingSnapshot {
     /// Proposals active at snapshot time.
     pub proposals: ImblOrdMap<GovActionId, ProposalState>,
     /// Votes indexed by action ID at snapshot time.
@@ -698,6 +685,55 @@ pub struct RatificationSnapshot {
     /// implicit vote for non-voting SPOs, matching Haskell's
     /// `dpDefaultDRepVoteDelegs` captured in the DRep pulser.
     pub vote_delegations: ImblHashMap<Hash32, DRep>,
+    /// `psDRepDistr` — DRep voting power, credential → stake.
+    ///
+    /// Haskell's `finishDRepPulser` computes this with `computeDRepDistr` over
+    /// the pulser's own frozen `dpInstantStake` / `dpDRepState` /
+    /// `dpProposalDeposits`, and RATIFY consumes it as `reDRepDistr`. Only
+    /// active DReps appear.
+    pub drep_distr: ImblHashMap<Hash32, u64>,
+    /// Total stake delegated to `AlwaysNoConfidence` at freeze time.
+    pub drep_no_confidence: u64,
+    /// Total stake delegated to `AlwaysAbstain` at freeze time.
+    pub drep_abstain: u64,
+}
+
+/// Haskell `DRepPulsingState`, always in its `DRComplete` form (#988).
+///
+/// ```haskell
+/// data DRepPulsingState era
+///   = DRPulsing !(DRepPulser era Identity (RatifyState era))
+///   | DRComplete !(PulsingSnapshot era) !(RatifyState era)
+/// ```
+///
+/// dugite has no incremental pulsing and does not need it: both constructors
+/// encode as `DRComplete`, the `DRPulsing` arm forcing `finishDRepPulser`
+/// first, and every reader goes through the same forcing. The pulsing is a
+/// performance device that spreads an O(accounts) computation across the epoch
+/// and carries no semantics.
+///
+/// # Why one struct rather than five fields
+///
+/// dugite reached this shape by accretion — a separate frozen field added each
+/// time a divergence was traced to reading live state: the proposal/vote set
+/// (#903), the DRep distribution (#949/#950), `ensTreasury` (#966), and finally
+/// the ratification result itself (#988). Five independently-`Option`al fields
+/// admit two failure modes that upstream's single sum type does not:
+///
+/// * a **torn** pulser — inputs frozen at one boundary, result at another, or
+///   one captured and the other not, which is only prevented by every write
+///   path remembering to do all of them; and
+/// * a reader picking the live equivalent of one term while its neighbours read
+///   the frozen one, which is exactly how #949's proposal-deposit term came to
+///   be fixed in the query path and left broken in the consensus path.
+///
+/// Neither is expressible now: there is one `Option`, written in one place.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DRepPulsingState {
+    /// `PulsingSnapshot` — the frozen INPUTS.
+    pub snapshot: PulsingSnapshot,
+    /// `RatifyState` — the frozen RESULT, decided over `snapshot`.
+    pub ratify_state: PulsedRatifyState,
 }
 
 /// Registration state for a DRep
@@ -721,6 +757,35 @@ pub struct DRepRegistration {
 }
 
 impl GovernanceState {
+    /// The frozen pulser's INPUTS, if a pulser exists.
+    ///
+    /// Every reader of frozen ratification inputs goes through this, so a
+    /// caller cannot read one term from the pulser and its neighbour from live
+    /// state — the mistake behind #949.
+    pub fn pulsing_snapshot(&self) -> Option<&PulsingSnapshot> {
+        self.drep_pulsing_state.as_ref().map(|p| &p.snapshot)
+    }
+
+    /// The frozen pulser's RESULT — Haskell `queryRatifyState = snd .
+    /// finishedPulserState`. This is what WILL enact at the next boundary, and
+    /// since #988 step 2 it is also what the boundary applies.
+    pub fn ratify_plan(&self) -> Option<&PulsedRatifyState> {
+        self.drep_pulsing_state.as_ref().map(|p| &p.ratify_state)
+    }
+
+    /// `reDRepDistr` — DRep voting power for ratification.
+    ///
+    /// Empty with no pulser, matching Haskell's `DRComplete def def`. It
+    /// deliberately does NOT fall back to live delegations: `dRepAcceptedRatio`
+    /// folds `reDRepDistr`, never the voter set, so an empty distribution makes
+    /// every DRep-gated action unratifiable and that is the correct answer, not
+    /// a reason to substitute a newer one.
+    pub fn drep_distr(&self) -> Option<&ImblHashMap<Hash32, u64>> {
+        self.drep_pulsing_state
+            .as_ref()
+            .map(|p| &p.snapshot.drep_distr)
+    }
+
     /// Count of DReps whose `active` flag is currently `true`.
     ///
     /// This is the number that external tools (Koios, cardano-cli) report as

@@ -14,7 +14,7 @@
 //! hash.
 //!
 //! That is demonstrated, not theoretical: #966 added `treasury: u64` to
-//! `RatificationSnapshot` — a genuine positional bincode change inside
+//! `PulsingSnapshot` — a genuine positional bincode change inside
 //! `GovernanceState`, requiring SNAPSHOT_VERSION 31 -> 32 — and the test stayed
 //! green through it, because `ratification_snapshot` was `None`. Several past
 //! SNAPSHOT_VERSION bumps were about exactly the structures the fixture left
@@ -284,9 +284,6 @@ pub fn populated_ledger_state() -> LedgerState {
     gov.last_expired = vec![gid(0x54)];
     gov.last_ratify_delayed = true;
     gov.num_dormant_epochs = 2;
-    gov.drep_distribution_snapshot.insert(h32(0x41), 1_000_000);
-    gov.drep_snapshot_no_confidence = 10;
-    gov.drep_snapshot_abstain = 20;
     gov.votes_by_action.insert(gid(0x55), {
         let mut m = imbl::OrdMap::new();
         m.insert(
@@ -310,19 +307,59 @@ pub fn populated_ledger_state() -> LedgerState {
     gov.future_pparams = super::FuturePParams::DefinitePParamsUpdate(Box::new(
         ProtocolParameters::mainnet_defaults(),
     ));
-    gov.pulsed_ratify_state = Some(super::PulsedRatifyState {
-        computed_at_epoch: EpochNo(316),
-        enacted: vec![gid(0x60)],
-        expired: vec![gid(0x61)],
-        delayed: true,
-        cur_pparams: ProtocolParameters::mainnet_defaults(),
-        has_pparams_changes: true,
-    });
 
-    // Freeze the ratification snapshot LAST, so it captures the populated
-    // governance state above rather than an empty one. #966 added `treasury`
-    // here and this test could not see it.
+    // A live proposal, so `PulsingSnapshot.proposals` is non-empty once frozen.
+    // Without one, `ProposalState`'s layout inside the pulser is invisible to
+    // the format hash — a gap that has been open since #903, found by #988
+    // step 3 tightening the guard.
+    gov.proposals.insert(
+        gid(0x56),
+        super::ProposalState {
+            procedure: dugite_primitives::transaction::ProposalProcedure {
+                deposit: Lovelace(100_000_000_000),
+                return_addr: vec![0xe0; 29],
+                gov_action: dugite_primitives::transaction::GovAction::InfoAction,
+                anchor: Anchor {
+                    url: "https://example.invalid/proposal.json".to_string(),
+                    data_hash: h32(0x57),
+                },
+            },
+            proposed_epoch: EpochNo(315),
+            expires_epoch: EpochNo(320),
+            yes_votes: 3,
+            no_votes: 2,
+            abstain_votes: 1,
+            submission_index: 7,
+        },
+    );
+
+    // Freeze the pulser LAST, so its snapshot captures the populated governance
+    // state above rather than an empty one. #966 added `treasury` to it and
+    // this test could not see it.
     state.capture_ratification_snapshot();
+
+    // Then overwrite both halves with distinctive values. Every field must be
+    // non-default: bincode writes nothing for a `None` and zeroes are
+    // indistinguishable from an unwritten field, so a default here would hide
+    // that part of the layout from the format hash.
+    {
+        let gov = std::sync::Arc::make_mut(&mut state.gov.governance);
+        let pulser = gov
+            .drep_pulsing_state
+            .as_mut()
+            .expect("the fixture must carry a frozen pulser");
+        pulser.snapshot.drep_distr.insert(h32(0x41), 1_000_000);
+        pulser.snapshot.drep_no_confidence = 10;
+        pulser.snapshot.drep_abstain = 20;
+        pulser.ratify_state = super::PulsedRatifyState {
+            computed_at_epoch: EpochNo(316),
+            enacted: vec![gid(0x60)],
+            expired: vec![gid(0x61)],
+            delayed: true,
+            cur_pparams: ProtocolParameters::mainnet_defaults(),
+            has_pparams_changes: true,
+        };
+    }
 
     state
 }

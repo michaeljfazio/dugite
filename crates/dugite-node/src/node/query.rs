@@ -432,11 +432,11 @@ impl Node {
         //
         // `None` only at genesis or when loading a ledger-state snapshot that
         // predates the field; `ratify_proposals()` itself falls back to the
-        // live state in that case (see `state/mod.rs`'s `RatificationSnapshot`
+        // live state in that case (see `state/mod.rs`'s `PulsingSnapshot`
         // doc comment), so mirror that fallback here rather than reporting an
         // empty list.
         let governance_proposals_frozen: Vec<ProposalSnapshot> =
-            match ls.gov.governance.ratification_snapshot.as_ref() {
+            match ls.gov.governance.pulsing_snapshot() {
                 Some(snap) => build_proposal_snapshot_list(
                     &snap.proposals,
                     &snap.votes_by_action,
@@ -744,10 +744,11 @@ impl Node {
         // `InstantStake + ProposalDeposits + AccountBalance` per credential
         // (the deposit term was added in #949).
         let drep_stake_distr: Vec<DRepStakeEntry> = {
-            let gov = &ls.gov.governance;
-            let mut entries: Vec<DRepStakeEntry> = gov
-                .drep_distribution_snapshot
-                .iter()
+            let pulser = ls.gov.governance.pulsing_snapshot();
+            let mut entries: Vec<DRepStakeEntry> = pulser
+                .map(|s| &s.drep_distr)
+                .into_iter()
+                .flatten()
                 .map(|(hash32, stake)| DRepStakeEntry {
                     drep_type: 0,
                     // The snapshot key is a Hash32 padded from a 28-byte DRep
@@ -762,12 +763,12 @@ impl Node {
             entries.push(DRepStakeEntry {
                 drep_type: 2,
                 drep_hash: None,
-                stake: gov.drep_snapshot_abstain,
+                stake: pulser.map_or(0, |s| s.drep_abstain),
             });
             entries.push(DRepStakeEntry {
                 drep_type: 3,
                 drep_hash: None,
-                stake: gov.drep_snapshot_no_confidence,
+                stake: pulser.map_or(0, |s| s.drep_no_confidence),
             });
             entries
         };
@@ -867,18 +868,13 @@ impl Node {
         // `ProposalState` is looked up in the frozen proposal set the pulser
         // ran over — falling back to the live set for an action already swept
         // out of it.
-        let pulsed = ls.gov.governance.pulsed_ratify_state.as_ref();
+        let pulsed = ls.gov.governance.ratify_plan();
         let ratify_source: Vec<(
             dugite_primitives::transaction::GovActionId,
             dugite_ledger::state::ProposalState,
         )> = match pulsed {
             Some(p) => {
-                let frozen = ls
-                    .gov
-                    .governance
-                    .ratification_snapshot
-                    .as_ref()
-                    .map(|s| &s.proposals);
+                let frozen = ls.gov.governance.pulsing_snapshot().map(|s| &s.proposals);
                 p.enacted
                     .iter()
                     .filter_map(|id| {
@@ -1219,7 +1215,7 @@ pub(crate) fn gov_action_type_str(
 ///   * the LIVE view (`GetGovState`'s `ConwayGovState.cgsProposals`), fed
 ///     `ls.gov.governance.{proposals,votes_by_action,enacted_*}`.
 ///   * the FROZEN DRep-pulser view (`GetProposals`, tag 31, #922), fed the
-///     equivalent fields off `RatificationSnapshot`.
+///     equivalent fields off `PulsingSnapshot`.
 ///
 /// Haskell `mkProposals` rebuilds the proposal forest by folding over the
 /// OMap in insertion order: every child's `prev_action_id` must already be
@@ -1369,7 +1365,7 @@ fn build_proposal_snapshot_list(
 ///
 /// `votes_by_action` is passed explicitly (rather than a `&LedgerState`) so
 /// this can be sourced from either the LIVE `governance.votes_by_action` or a
-/// FROZEN [`dugite_ledger::state::RatificationSnapshot::votes_by_action`] —
+/// FROZEN [`dugite_ledger::state::PulsingSnapshot::votes_by_action`] —
 /// mirroring `count_votes_by_type`'s existing live/frozen duality and letting
 /// `GetProposals` (#922) answer with the votes AS THEY WERE at the pulser
 /// snapshot, not live votes cast after it.
@@ -1902,7 +1898,7 @@ mod tests {
     // `build_proposal_snapshot_list` is shared by the LIVE proposal view
     // (`GetGovState`, tag 24 — reads `ls.gov.governance.proposals` directly)
     // and the FROZEN DRep-pulser view (`GetProposals`, tag 31 — reads
-    // `RatificationSnapshot::proposals`, refreshed only at epoch boundaries).
+    // `PulsingSnapshot::proposals`, refreshed only at epoch boundaries).
     // These tests exercise the function directly against synthetic
     // live/frozen maps to prove: (a) a mid-epoch submission present in the
     // live map is simply absent from a frozen map that predates it, and (b)
