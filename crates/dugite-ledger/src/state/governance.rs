@@ -1811,10 +1811,38 @@ fn compute_pulsed_ratify_state(
     let mut c = certs.clone();
     let mut g = gov.clone();
 
-    // `epoch` is the boundary we are AT; ratification at the next boundary runs
-    // with that boundary's epoch, matching how `process_epoch_transition` calls
-    // it. The snapshot itself carries `snapshot_epoch`, so the skip logic
-    // inside is unaffected.
+    // Rotate the stake snapshot the way the NEXT boundary will, before
+    // predicting what it will do.
+    //
+    // `ratify_proposals_impl` reads `snapshots.set` for SPO voting power. At a
+    // boundary, dugite rotates `set <- mark` (eras/conway.rs) BEFORE ratifying,
+    // so the run being predicted here will see the `mark` that exists now. This
+    // function runs at the END of the current boundary, where `set` is still the
+    // PREVIOUS boundary's mark — one generation too old.
+    //
+    // Haskell freezes the right one into the pulser directly
+    // (`Conway.Rules.Epoch`):
+    //
+    // ```haskell
+    // snapshots1 <- trans @(EraRule "SNAP" era) $ TRC (...)   -- rotation
+    // stakePoolDistr = ssStakeMarkPoolDistr snapshots1        -- the NEW mark
+    // ...
+    // liftSTS $ setFreshDRepPulsingState eNo stakePoolDistr epochState2
+    // ```
+    //
+    // and RATIFY at the next boundary uses it as `reStakePoolDistr`. Since
+    // `mark` here becomes `set` there, copying it across reproduces that
+    // exactly.
+    //
+    // This was the residual cause of the #988 divergence. On a full preview
+    // replay it accounted for all 6 mismatches in 733 Conway boundaries, and
+    // every one was a boundary where the chain really did enact something —
+    // so `GetRatifyState` was correct on the 727 boundaries where nothing
+    // happened and wrong on all 6 that mattered.
+    if e.snapshots.mark.is_some() {
+        e.snapshots.set = e.snapshots.mark.clone();
+    }
+
     ratify_proposals_impl(epoch, &mut e, &mut c, &mut g);
 
     let enacted: Vec<GovActionId> = g
