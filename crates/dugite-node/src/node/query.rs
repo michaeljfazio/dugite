@@ -694,6 +694,17 @@ impl Node {
         let protocol_params = protocol_params_snapshot(&ls.epochs.protocol_params);
         // `previousPParams`: the params in force before the last enactment.
         let prev_protocol_params = protocol_params_snapshot(&ls.epochs.prev_protocol_params);
+        // #994: `nextRatifyState.nextEnactState.ensCurPParams` is the params
+        // SEALED INTO THE PULSER at the last boundary, not the live ones. They
+        // coincide mid-chain (pparams change only at boundaries, and
+        // `setFreshDRepPulsingState` seals them there), so this matters only
+        // before the first boundary — where upstream reports the
+        // genesis-translated params, without the injected defaultV2CostModel.
+        let ratify_cur_protocol_params =
+            match ls.gov.governance.ratify_plan().map(|r| &r.cur_pparams) {
+                Some(pp) => protocol_params_snapshot(pp),
+                None => prev_protocol_params.clone(),
+            };
 
         // Build stake delegation deposits (registered stake credentials → per-credential deposit).
         // Uses the stored deposit paid at registration time for correct values when
@@ -956,6 +967,7 @@ impl Node {
             proposal_count: ls.gov.governance.proposals.len(),
             protocol_params,
             prev_protocol_params,
+            ratify_cur_protocol_params,
             stake_pools,
             drep_entries,
             governance_proposals,
