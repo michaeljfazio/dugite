@@ -480,7 +480,18 @@ impl LedgerState {
     // pulser result. A positional bincode change inside `GovernanceState`, so
     // existing snapshots cannot supply it and must be rejected.
     // 34: #977 added `GovernanceState.future_pparams`.
-    pub(crate) const SNAPSHOT_VERSION: u8 = 34;
+    // 35: #988 step 2 — the epoch boundary now APPLIES `pulsed_ratify_state`
+    //     instead of recomputing the ratification there, so the stored plan
+    //     stopped being advisory and became consensus-bearing. Its `expired`
+    //     field also changed meaning: it used to be `last_expired`, i.e. the
+    //     ids actually removed INCLUDING descendants, and is now Haskell's
+    //     `rsExpired` — only the candidates that failed ratification while past
+    //     their expiry, with descendant expansion left to
+    //     `proposalsApplyEnactment`. The layout is unchanged, so a v34 snapshot
+    //     would load and its plan would be applied verbatim; rejecting them is
+    //     what stops a plan decided under the old semantics from driving a
+    //     boundary under the new ones.
+    pub(crate) const SNAPSHOT_VERSION: u8 = 35;
 
     /// Save ledger state snapshot to disk using bincode serialization.
     ///
