@@ -1341,7 +1341,7 @@ impl LedgerState {
     /// Capture the DRep distribution snapshot at the end of an epoch transition.
     ///
     /// Called AFTER ratification, DRep activity updates, and committee expiry —
-    /// alongside `capture_ratification_snapshot()` — matching Haskell's
+    /// alongside `freeze_prior_boundary_pulser()` — matching Haskell's
     /// `setFreshDRepPulsingState` which captures `dpDRepDistr` from the
     /// post-EPOCH state.  The snapshot is consumed by `build_drep_power_cache()`
     /// and `compute_total_drep_stake()` at the NEXT epoch boundary, providing
@@ -1352,9 +1352,32 @@ impl LedgerState {
         capture_drep_distribution_snapshot_impl(&self.certs, &mut self.gov);
     }
 
+    /// Freeze only the ratification INPUTS — Haskell's `PulsingSnapshot` half.
+    ///
+    /// For fixtures that drive [`Self::ratify_proposals`] directly (the RATIFY
+    /// decision in isolation) and so need a candidate set but no plan. Tests
+    /// that cross an epoch boundary want [`Self::freeze_prior_boundary_pulser`]
+    /// instead.
     #[allow(dead_code)]
     pub fn capture_ratification_snapshot(&mut self) {
         capture_ratification_snapshot_impl(self.epoch, self.epochs.treasury.0, &mut self.gov);
+    }
+
+    /// Stand in for the epoch boundary that PRECEDES the one under test.
+    ///
+    /// A proposal is never a candidate at the first boundary after it is
+    /// submitted: Haskell's RATIFY signal is the pulser's `dpProposals`, frozen
+    /// by `setFreshDRepPulsingState` one boundary earlier (#903). Tests that
+    /// exercise ratification logic rather than that timing call this to say
+    /// "assume the previous boundary happened".
+    ///
+    /// It runs the whole governance step, not just the input capture. Since
+    /// #988 step 2 the boundary APPLIES a frozen decision instead of computing
+    /// one, so a test that froze only the inputs would find no plan and watch
+    /// nothing ratify — correctly, but for a reason it never meant to test.
+    #[allow(dead_code)]
+    pub fn freeze_prior_boundary_pulser(&mut self) {
+        epoch_boundary_governance_step(self.epoch, &self.epochs, &self.certs, &mut self.gov);
     }
 
     /// Compute total active DRep-delegated stake across all DReps.
@@ -1745,41 +1768,159 @@ pub(crate) fn ratify_at_boundary(
     certs: &mut CertSubState,
     gov: &mut GovSubState,
 ) {
-    let predicted = gov.governance.pulsed_ratify_state.clone();
+    let Some(plan) = gov.governance.pulsed_ratify_state.clone() else {
+        // Haskell's `Default (DRepPulsingState era)` is `DRComplete def def` —
+        // an EMPTY result. Nothing enacts and nothing expires at a boundary
+        // with no pulser, which is reachable only at the first Conway boundary
+        // of a chain and on the first boundary after loading a snapshot older
+        // than the field. Re-deriving a decision here instead would ratify from
+        // inputs frozen at the WRONG boundary, which is #903 all over again.
+        if epochs.protocol_params.protocol_version_major >= 9 {
+            warn!(
+                boundary_epoch = boundary_epoch.0,
+                "No frozen DRep pulser at a Conway epoch boundary — nothing can \
+                 ratify (expected once at the first Conway boundary, or once \
+                 after loading a pre-v33 snapshot) (#988)"
+            );
+        }
+        let g = Arc::make_mut(&mut gov.governance);
+        g.last_ratified = Vec::new();
+        g.last_expired = Vec::new();
+        g.last_ratify_delayed = false;
+        return;
+    };
 
-    ratify_proposals_impl(epoch, epochs, certs, gov);
-
-    let Some(pred) = predicted else { return };
-    let actual: Vec<_> = gov
-        .governance
-        .last_ratified
-        .iter()
-        .map(|(id, _)| id.clone())
-        .collect();
-    if pred.enacted != actual || pred.delayed != gov.governance.last_ratify_delayed {
+    // The plan carries the epoch it was computed under — Haskell's
+    // `dpCurrentEpoch`, which RATIFY consumed as `reCurrentEpoch`. This
+    // boundary must be the very next one. A mismatch means the pulser was
+    // stamped or frozen at the wrong point, which is exactly the defect the
+    // prediction-vs-outcome detector caught on preview (`boundary_epoch=743
+    // predicted_at=741`) and the one thing that stops being self-evident once
+    // the plan is applied rather than compared.
+    if plan.computed_at_epoch != epoch {
         warn!(
             boundary_epoch = boundary_epoch.0,
-            predicted_at = pred.computed_at_epoch.0,
-            predicted_enacted = pred.enacted.len(),
-            actual_enacted = actual.len(),
-            predicted_delayed = pred.delayed,
-            actual_delayed = gov.governance.last_ratify_delayed,
-            "DRep pulser prediction did not match the applied ratification — \
-             GetRatifyState reported a result the chain did not produce (#988)"
-        );
-    } else {
-        // Positive evidence, at INFO deliberately. A run with no WARN is
-        // indistinguishable from a run where the detector never executed —
-        // which is precisely what went wrong the first time, and a debug! here
-        // would have reproduced it, since the devnet runs at INFO. One line per
-        // epoch boundary is negligible volume for the only signal that proves
-        // the check was live.
-        info!(
-            boundary_epoch = boundary_epoch.0,
-            enacted = actual.len(),
-            "DRep pulser prediction matched the applied ratification (#988)"
+            ratify_epoch = epoch.0,
+            plan_epoch = plan.computed_at_epoch.0,
+            "DRep pulser plan is stamped with the wrong epoch — it was frozen at \
+             a boundary other than the immediately preceding one (#988)"
         );
     }
+
+    apply_ratify_decision(&plan, epoch, epochs, certs, gov);
+
+    // Positive evidence, at INFO deliberately: a run that logs nothing here is
+    // indistinguishable from a run where the boundary never reached this code,
+    // and that ambiguity is what made the original #988 evidence worthless.
+    // One line per epoch boundary is negligible volume.
+    info!(
+        boundary_epoch = boundary_epoch.0,
+        planned_at = plan.computed_at_epoch.0,
+        enacted = gov.governance.last_ratified.len(),
+        expired = gov.governance.last_expired.len(),
+        delayed = gov.governance.last_ratify_delayed,
+        "Applied the frozen DRep pulser result at the epoch boundary (#988)"
+    );
+}
+
+/// Apply a completed pulser's `RatifyState`, as Haskell's EPOCH rule does.
+///
+/// Upstream this is not a separate function — it is the body of
+/// `epochTransition` between `extractDRepPulsingState` and
+/// `setFreshDRepPulsingState`. The two halves it performs are:
+///
+/// 1. the effects of `rsEnactState`, which dugite realises by replaying
+///    [`enact_gov_action_impl`] over `rsEnacted` in order (upstream threads an
+///    `EnactState` record through RATIFY and copies its fields onto the gov
+///    state here; dugite mutates the live state directly, which is the same
+///    state transition expressed differently); and
+/// 2. `proposalsApplyEnactment rsEnacted rsExpired`, against the LIVE proposal
+///    superset.
+///
+/// The actions themselves are looked up in the frozen proposal set the plan was
+/// decided over — that set IS Haskell's `rsEnacted`, which carries whole
+/// `GovActionState`s rather than bare ids.
+fn apply_ratify_decision(
+    plan: &PulsedRatifyState,
+    epoch: EpochNo,
+    epochs: &mut EpochSubState,
+    certs: &mut CertSubState,
+    gov: &mut GovSubState,
+) {
+    let frozen = gov.governance.ratification_snapshot.clone();
+
+    let (
+        mut enacted_pparam,
+        mut enacted_hardfork,
+        mut enacted_committee_root,
+        mut enacted_constitution,
+    ) = match frozen {
+        Some(ref snap) => (
+            snap.enacted_pparam_update.clone(),
+            snap.enacted_hard_fork.clone(),
+            snap.enacted_committee.clone(),
+            snap.enacted_constitution.clone(),
+        ),
+        None => {
+            let g = &gov.governance;
+            (
+                g.enacted_pparam_update.clone(),
+                g.enacted_hard_fork.clone(),
+                g.enacted_committee.clone(),
+                g.enacted_constitution.clone(),
+            )
+        }
+    };
+
+    for action_id in &plan.enacted {
+        // The frozen set is the decision's own candidate set, so this is where
+        // the action must come from. The live set is a fallback only: it is a
+        // superset, and an enacted id is by construction present in both, but
+        // reaching for it silently would hide a plan/candidate-set mismatch.
+        let action = frozen
+            .as_ref()
+            .and_then(|snap| snap.proposals.get(action_id))
+            .or_else(|| gov.governance.proposals.get(action_id))
+            .map(|state| state.procedure.gov_action.clone());
+
+        let Some(action) = action else {
+            warn!(
+                action_id = %action_id.transaction_id.to_hex(),
+                index = action_id.action_index,
+                epoch = epoch.0,
+                "DRep pulser planned to enact a governance action that is in \
+                 neither the frozen nor the live proposal set — skipping (#988)"
+            );
+            continue;
+        };
+
+        debug!(
+            action_id = %action_id.transaction_id.to_hex(),
+            action_type = ?std::mem::discriminant(&action),
+            "Governance proposal ENACTED from the frozen pulser plan"
+        );
+        enact_gov_action_impl(&action, epochs, certs, gov);
+        update_enacted_root_local(
+            action_id,
+            &action,
+            &mut enacted_pparam,
+            &mut enacted_hardfork,
+            &mut enacted_committee_root,
+            &mut enacted_constitution,
+        );
+    }
+
+    {
+        let gov_state = Arc::make_mut(&mut gov.governance);
+        gov_state.enacted_pparam_update = enacted_pparam;
+        gov_state.enacted_hard_fork = enacted_hardfork;
+        gov_state.enacted_committee = enacted_committee_root;
+        gov_state.enacted_constitution = enacted_constitution;
+    }
+
+    proposals_apply_enactment(&plan.enacted, &plan.expired, epoch, epochs, certs, gov);
+
+    Arc::make_mut(&mut gov.governance).last_ratify_delayed = plan.delayed;
 }
 
 /// Compute the frozen pulser result for the epoch now starting (#988).
@@ -1843,33 +1984,7 @@ fn compute_pulsed_ratify_state(
         e.snapshots.set = e.snapshots.mark.clone();
     }
 
-    ratify_proposals_impl(epoch, &mut e, &mut c, &mut g);
-
-    let enacted: Vec<GovActionId> = g
-        .governance
-        .last_ratified
-        .iter()
-        .map(|(id, _)| id.clone())
-        .collect();
-
-    // Haskell `hasChangesToPParams`: only ParameterChange and
-    // HardForkInitiation cause `futurePParams` to become `Just`.
-    let has_pparams_changes = g.governance.last_ratified.iter().any(|(_, prop)| {
-        matches!(
-            prop.procedure.gov_action,
-            GovAction::ParameterChange { .. } | GovAction::HardForkInitiation { .. }
-        )
-    });
-
-    PulsedRatifyState {
-        computed_at_epoch: epoch,
-        enacted,
-        expired: g.governance.last_expired.clone(),
-        delayed: g.governance.last_ratify_delayed,
-        // `ensCurPParams` AFTER the enactments — the clone carries them.
-        cur_pparams: e.protocol_params.clone(),
-        has_pparams_changes,
-    }
+    ratify_proposals_impl(epoch, &mut e, &mut c, &mut g)
 }
 
 /// The Conway EPOCH rule's governance step, run once per boundary.
@@ -3079,12 +3194,35 @@ fn refund_proposal_deposit(
     }
 }
 
+/// Haskell RATIFY — `Conway.Rules.Ratify.ratifyTransition` (#988).
+///
+/// This is the DECISION, and upstream it runs **inside the DRep pulser**, not
+/// at the epoch boundary. `finishDRepPulser` builds `RatifyEnv` from the
+/// pulser's frozen fields, seeds `RatifyState` from `dpEnactState`, and runs
+/// `runConwayRatify` over `RatifySignal dpProposals`. The boundary that then
+/// consumes the result does not re-run any of it:
+///
+/// ```haskell
+/// pulsingState = epochState0 ^. epochStateDRepPulsingStateL
+/// ratifyState@RatifyState {rsEnactState, rsEnacted, rsExpired} =
+///   extractDRepPulsingState pulsingState
+/// ```
+///
+/// So this function is called at the boundary that FREEZES the pulser (against
+/// a clone, via [`compute_pulsed_ratify_state`]), and its result is applied one
+/// boundary later by [`apply_ratify_decision`]. It still enacts as it goes,
+/// because that is how the `EnactState` threading is expressed — each enactment
+/// is visible to the proposals evaluated after it, matching the recursive
+/// `trans @(RATIFY era)` call that passes `st'`.
+///
+/// The returned [`PulsedRatifyState`] is the `RatifyState` half of Haskell's
+/// `DRComplete PulsingSnapshot RatifyState`.
 pub(crate) fn ratify_proposals_impl(
     epoch: EpochNo,
     epochs: &mut EpochSubState,
     certs: &mut CertSubState,
     gov: &mut GovSubState,
-) {
+) -> PulsedRatifyState {
     // Lazy forest reconstruction for backward compatibility with old snapshots
     if gov.governance.proposal_roots == GovRelation::default()
         && !gov.governance.proposals.is_empty()
@@ -3299,12 +3437,38 @@ pub(crate) fn ratify_proposals_impl(
         .as_ref()
         .map_or(epochs.treasury.0, |snap| snap.treasury);
 
-    for (action_id, action, expires, _submission_index) in &candidates {
-        if *expires < epoch {
-            continue;
-        }
+    // Haskell `rsExpired`, and it is built from the pulser's OWN proposal set,
+    // never from live state (`Ratify.hs`, the `else` branch of
+    // `ratifyTransition`). dugite used to rescan the live proposals for
+    // `expires_epoch < epoch` down in `proposalsApplyEnactment`; the two sets
+    // coincide, because a proposal submitted during the epoch that just ended
+    // cannot already have expired, but deriving it here is what makes that a
+    // property of the code rather than of the arithmetic.
+    let mut expired_from_pulser: Vec<GovActionId> = Vec::new();
 
-        if !prev_action_as_expected(
+    for (action_id, action, expires, _submission_index) in &candidates {
+        // Haskell evaluates EVERY element of the signal, expired or not. The
+        // expiry test lives in the `else` branch — *after* the ratification
+        // attempt fails:
+        //
+        // ```haskell
+        // else do
+        //   st' <- trans @(RATIFY era) $ TRC (env, st, RatifySignal sigs)
+        //   if gasExpiresAfter < reCurrentEpoch
+        //     then pure $ st' & rsExpiredL %~ Set.insert gasId
+        //     else pure st'
+        // ```
+        //
+        // dugite used to `continue` on `expires < epoch` BEFORE the threshold
+        // check, which silently removed the last ratification opportunity from
+        // every proposal (#990). It is reachable: an action with
+        // `expires_epoch == E-1` is not expired at the boundary where
+        // `reCurrentEpoch == E-1`, so it survives into the pulser frozen there
+        // — together with the votes cast during epoch E-1 — and is evaluated
+        // once more at `reCurrentEpoch == E`, the same pass that expires it.
+        // cardano-node enacts it if it crossed threshold on those votes;
+        // dugite dropped it. A split in the reject direction.
+        let ratified_now = if !prev_action_as_expected(
             action,
             &enacted_pparam,
             &enacted_hardfork,
@@ -3316,18 +3480,14 @@ pub(crate) fn ratify_proposals_impl(
                 action_type = ?std::mem::discriminant(action),
                 "Governance proposal: prev_action_id chain mismatch — skipping"
             );
-            continue;
-        }
-
-        if delayed {
+            false
+        } else if delayed {
             debug!(
                 action_id = %action_id.transaction_id.to_hex(),
                 "Governance proposal: delayed by previously enacted action"
             );
-            continue;
-        }
-
-        if let Some(state) = snap_proposals.get(action_id) {
+            false
+        } else if let Some(state) = snap_proposals.get(action_id) {
             // Cap basis is the transient `cap_treasury` — mirroring Haskell
             // Conway `Ratify.hs` `withdrawalCanWithdraw`, which checks
             // `fold(wdrls) <= ensTreasury` against the threaded `ensTreasury`.
@@ -3339,7 +3499,7 @@ pub(crate) fn ratify_proposals_impl(
             // the cap basis whenever a prior withdrawal targeted an unregistered
             // account — wrongly admitting a later withdrawal Haskell blocks.
             let remaining_treasury = cap_treasury;
-            let met = check_ratification_impl(
+            check_ratification_impl(
                 action_id,
                 state,
                 total_drep_stake,
@@ -3358,8 +3518,13 @@ pub(crate) fn ratify_proposals_impl(
                 epochs,
                 certs,
                 gov,
-            );
-            if met {
+            )
+        } else {
+            false
+        };
+
+        {
+            if ratified_now {
                 debug!(
                     action_id = %action_id.transaction_id.to_hex(),
                     action_type = ?std::mem::discriminant(action),
@@ -3408,12 +3573,20 @@ pub(crate) fn ratify_proposals_impl(
                 if is_delaying_action(action) {
                     delayed = true;
                 }
-            } else if !matches!(action, GovAction::InfoAction) {
-                trace!(
-                    action_id = %action_id.transaction_id.to_hex(),
-                    action_type = ?std::mem::discriminant(action),
-                    "Governance proposal NOT ratified"
-                );
+            } else {
+                if !matches!(action, GovAction::InfoAction) {
+                    trace!(
+                        action_id = %action_id.transaction_id.to_hex(),
+                        action_type = ?std::mem::discriminant(action),
+                        "Governance proposal NOT ratified"
+                    );
+                }
+                // `if gasExpiresAfter < reCurrentEpoch then rsExpired += gasId`
+                // — reachable only from the not-ratified branch, so an action
+                // that enacts in its final epoch is never also expired.
+                if *expires < epoch {
+                    expired_from_pulser.push(action_id.clone());
+                }
             }
         }
     }
@@ -3427,22 +3600,58 @@ pub(crate) fn ratify_proposals_impl(
         gov_state.enacted_constitution = enacted_constitution;
     }
 
-    // ── proposalsApplyEnactment ──────────────────────────────────────
+    proposals_apply_enactment(&ratified, &expired_from_pulser, epoch, epochs, certs, gov);
+    Arc::make_mut(&mut gov.governance).last_ratify_delayed = delayed;
 
+    // Haskell `hasChangesToPParams` — only these two make `futurePParams`
+    // become `Just` (#977).
+    let has_pparams_changes = gov.governance.last_ratified.iter().any(|(_, prop)| {
+        matches!(
+            prop.procedure.gov_action,
+            GovAction::ParameterChange { .. } | GovAction::HardForkInitiation { .. }
+        )
+    });
+
+    PulsedRatifyState {
+        computed_at_epoch: epoch,
+        enacted: ratified,
+        expired: expired_from_pulser,
+        delayed,
+        // `ensCurPParams` AFTER the enactments.
+        cur_pparams: epochs.protocol_params.clone(),
+        has_pparams_changes,
+    }
+}
+
+/// Haskell `proposalsApplyEnactment rsEnacted rsExpired (govState0 ^.
+/// proposalsGovStateL)` — the EPOCH rule's application of a completed RATIFY.
+///
+/// Deliberately takes the enacted and expired ids as ARGUMENTS rather than
+/// deriving them: upstream they come from the pulser's `RatifyState`, computed
+/// one boundary earlier over the pulser's own frozen proposal set, while the
+/// set they are applied TO is the live superset — it also contains everything
+/// proposed during the epoch that just ended, plus every vote cast on the
+/// older proposals. Upstream's comment on that asymmetry is explicit:
+///
+/// > We only need to apply the enactment operations to this superset to get a
+/// > new set of proposals with: enacted actions and their sibling subtrees, as
+/// > well as expired actions and their subtrees, removed, and with all the
+/// > votes intact for the rest of them.
+fn proposals_apply_enactment(
+    ratified: &[GovActionId],
+    expired_ids: &[GovActionId],
+    epoch: EpochNo,
+    epochs: &mut EpochSubState,
+    certs: &mut CertSubState,
+    gov: &mut GovSubState,
+) {
     // ── Step 1: Expire proposals with descendants ─────────────────────
     let current_epoch = epoch;
-    let expired_ids: Vec<GovActionId> = gov
-        .governance
-        .proposals
-        .iter()
-        .filter(|(_, state)| state.expires_epoch < current_epoch)
-        .map(|(id, _)| id.clone())
-        .collect();
 
     let expired_removed = if !expired_ids.is_empty() {
         let gov_state = Arc::make_mut(&mut gov.governance);
         let removed = forest_remove_with_descendants(
-            &expired_ids,
+            expired_ids,
             &mut gov_state.proposals,
             &mut gov_state.proposal_roots,
             &mut gov_state.proposal_graph,
@@ -3467,7 +3676,7 @@ pub(crate) fn ratify_proposals_impl(
     let mut ratified_with_state = Vec::new();
 
     if !ratified.is_empty() {
-        for action_id in &ratified {
+        for action_id in ratified {
             if let Some(state) = gov.governance.proposals.get(action_id) {
                 let purpose = gov_action_purpose_tag(&state.procedure.gov_action);
                 if let Some(tag) = purpose {
@@ -3549,11 +3758,12 @@ pub(crate) fn ratify_proposals_impl(
         }
     }
 
-    // Store ratification and expiry results
+    // Store ratification and expiry results. `last_ratify_delayed` is NOT set
+    // here: it is a property of the RATIFY decision, not of applying it, so
+    // each caller writes it from the decision it holds.
     let gov_state = Arc::make_mut(&mut gov.governance);
     gov_state.last_ratified = ratified_with_state;
     gov_state.last_expired = expired_removed;
-    gov_state.last_ratify_delayed = delayed;
 }
 
 /// DRep voting group for protocol parameter classification per CIP-1694.
@@ -4600,14 +4810,14 @@ mod tests {
         );
     }
 
-    fn make_anchor() -> Anchor {
+    pub(super) fn make_anchor() -> Anchor {
         Anchor {
             url: "https://example.com".to_string(),
             data_hash: Hash32::ZERO,
         }
     }
 
-    fn make_action_id(byte: u8, index: u32) -> GovActionId {
+    pub(super) fn make_action_id(byte: u8, index: u32) -> GovActionId {
         GovActionId {
             transaction_id: Hash32::from_bytes([byte; 32]),
             action_index: index,
@@ -4617,7 +4827,7 @@ mod tests {
     /// Set up a LedgerState with DReps, SPOs, and CC for governance testing.
     /// Returns the state with `n_dreps` DReps (1B stake each), `n_spos` SPOs (1B stake each),
     /// and 1 CC member. Protocol version 10 (post-bootstrap).
-    fn gov_test_state(n_dreps: usize, n_spos: usize) -> LedgerState {
+    pub(super) fn gov_test_state(n_dreps: usize, n_spos: usize) -> LedgerState {
         let mut params = ProtocolParameters::mainnet_defaults();
         params.protocol_version_major = 10; // Post-bootstrap
         params.committee_min_size = 0; // Don't require min committee size in tests
@@ -4713,14 +4923,19 @@ mod tests {
         );
     }
 
-    fn drep_vote(state: &mut LedgerState, i: usize, action_id: &GovActionId, vote: Vote) {
+    pub(super) fn drep_vote(
+        state: &mut LedgerState,
+        i: usize,
+        action_id: &GovActionId,
+        vote: Vote,
+    ) {
         let voter = Voter::DRep(Credential::VerificationKey(Hash28::from_bytes(
             [i as u8; 28],
         )));
         state.process_vote(&voter, action_id, &VotingProcedure { vote, anchor: None });
     }
 
-    fn spo_vote(state: &mut LedgerState, i: usize, action_id: &GovActionId, vote: Vote) {
+    pub(super) fn spo_vote(state: &mut LedgerState, i: usize, action_id: &GovActionId, vote: Vote) {
         let pool_hash = Hash28::from_bytes([100 + i as u8; 28]).to_hash32_padded();
         let voter = Voter::StakePool(pool_hash);
         state.process_vote(&voter, action_id, &VotingProcedure { vote, anchor: None });
@@ -4885,7 +5100,7 @@ mod tests {
         // never a candidate at the first boundary after submission. This test
         // exercises ratification logic, not that timing, so it stands in for
         // the prior boundary explicitly.
-        state.capture_ratification_snapshot();
+        state.freeze_prior_boundary_pulser();
         state.process_epoch_transition(EpochNo(1));
 
         // NoConfidence should be enacted (delaying action)
@@ -6063,7 +6278,7 @@ mod tests {
         // never a candidate at the first boundary after submission. This test
         // exercises ratification logic, not that timing, so it stands in for
         // the prior boundary explicitly.
-        state.capture_ratification_snapshot();
+        state.freeze_prior_boundary_pulser();
         state.process_epoch_transition(EpochNo(1));
         assert!(state.gov.governance.no_confidence);
         assert!(state.gov.governance.proposals.is_empty());
@@ -6118,7 +6333,7 @@ mod tests {
         // never a candidate at the first boundary after submission. This test
         // exercises ratification logic, not that timing, so it stands in for
         // the prior boundary explicitly.
-        state.capture_ratification_snapshot();
+        state.freeze_prior_boundary_pulser();
         state.process_epoch_transition(EpochNo(1));
         // UpdateCommittee restores confidence
         assert!(!state.gov.governance.no_confidence);
@@ -6162,7 +6377,7 @@ mod tests {
         // never a candidate at the first boundary after submission. This test
         // exercises ratification logic, not that timing, so it stands in for
         // the prior boundary explicitly.
-        state.capture_ratification_snapshot();
+        state.freeze_prior_boundary_pulser();
         state.process_epoch_transition(EpochNo(1));
         assert!(state.gov.governance.constitution.is_some());
         assert!(state.gov.governance.proposals.is_empty());
@@ -6213,7 +6428,7 @@ mod tests {
         // never a candidate at the first boundary after submission. This test
         // exercises ratification logic, not that timing, so it stands in for
         // the prior boundary explicitly.
-        state.capture_ratification_snapshot();
+        state.freeze_prior_boundary_pulser();
         state.process_epoch_transition(EpochNo(1));
         assert_eq!(state.epochs.treasury, Lovelace(5_000_000_000));
     }
@@ -6273,7 +6488,7 @@ mod tests {
         cc_vote_yes(&mut state, &action_id);
 
         // Seal the pulser while the treasury is still 500M.
-        state.capture_ratification_snapshot();
+        state.freeze_prior_boundary_pulser();
         assert_eq!(
             state
                 .gov
@@ -6410,7 +6625,7 @@ mod tests {
         // never a candidate at the first boundary after submission. This test
         // exercises ratification logic, not that timing, so it stands in for
         // the prior boundary explicitly.
-        state.capture_ratification_snapshot();
+        state.freeze_prior_boundary_pulser();
         state.process_epoch_transition(EpochNo(1));
 
         // First 400M enacted, second 400M blocked (would exceed remaining 200M)
@@ -6498,7 +6713,7 @@ mod tests {
         // never a candidate at the first boundary after submission. This test
         // exercises ratification logic, not that timing, so it stands in for
         // the prior boundary explicitly.
-        state.capture_ratification_snapshot();
+        state.freeze_prior_boundary_pulser();
         state.process_epoch_transition(EpochNo(1));
 
         // BOTH withdrawals must enact: each target credited exactly 400M.
@@ -6632,7 +6847,7 @@ mod tests {
         // never a candidate at the first boundary after submission. This test
         // exercises ratification logic, not that timing, so it stands in for
         // the prior boundary explicitly.
-        state.capture_ratification_snapshot();
+        state.freeze_prior_boundary_pulser();
         state.process_epoch_transition(EpochNo(1));
 
         // A enacted: target is UNREGISTERED so it is credited 0 (silently
@@ -6796,7 +7011,7 @@ mod tests {
         // never a candidate at the first boundary after submission. This test
         // exercises ratification logic, not that timing, so it stands in for
         // the prior boundary explicitly.
-        state.capture_ratification_snapshot();
+        state.freeze_prior_boundary_pulser();
         state.process_epoch_transition(EpochNo(1));
 
         assert!(state.gov.governance.no_confidence);
@@ -6925,7 +7140,7 @@ mod tests {
         // never a candidate at the first boundary after submission. This test
         // exercises ratification logic, not that timing, so it stands in for
         // the prior boundary explicitly.
-        state.capture_ratification_snapshot();
+        state.freeze_prior_boundary_pulser();
         state.process_epoch_transition(EpochNo(1));
 
         // Deposit should be returned to reward account
@@ -7088,7 +7303,7 @@ mod tests {
         // never a candidate at the first boundary after submission. This test
         // exercises ratification logic, not that timing, so it stands in for
         // the prior boundary explicitly.
-        state.capture_ratification_snapshot();
+        state.freeze_prior_boundary_pulser();
         state.process_epoch_transition(EpochNo(1));
         assert!(
             state.gov.governance.enacted_pparam_update.is_some(),
@@ -7319,7 +7534,7 @@ mod tests {
         // never a candidate at the first boundary after submission. This test
         // exercises ratification logic, not that timing, so it stands in for
         // the prior boundary explicitly.
-        state.capture_ratification_snapshot();
+        state.freeze_prior_boundary_pulser();
         state.process_epoch_transition(EpochNo(1));
 
         // The first-submitted proposal (id1, tx=[1u8;32]) must enact —
@@ -7425,7 +7640,7 @@ mod tests {
         // never a candidate at the first boundary after submission. This test
         // exercises ratification logic, not that timing, so it stands in for
         // the prior boundary explicitly.
-        state.capture_ratification_snapshot();
+        state.freeze_prior_boundary_pulser();
         state.process_epoch_transition(EpochNo(1));
 
         // The FIRST-SUBMITTED proposal must enact — NOT the one with the
@@ -7935,7 +8150,7 @@ mod tests {
         // never a candidate at the first boundary after submission. This test
         // exercises ratification logic, not that timing, so it stands in for
         // the prior boundary explicitly.
-        state.capture_ratification_snapshot();
+        state.freeze_prior_boundary_pulser();
         state.process_epoch_transition(EpochNo(1));
 
         // The proposal must have been consumed (ratified and enacted).
@@ -9171,7 +9386,7 @@ mod tests {
         // never a candidate at the first boundary after submission. This test
         // exercises ratification logic, not that timing, so it stands in for
         // the prior boundary explicitly.
-        state.capture_ratification_snapshot();
+        state.freeze_prior_boundary_pulser();
         state.process_epoch_transition(EpochNo(1));
 
         // ── ASSERTIONS ──
@@ -9350,7 +9565,7 @@ mod tests {
         // never a candidate at the first boundary after submission. This test
         // exercises ratification logic, not that timing, so it stands in for
         // the prior boundary explicitly.
-        state.capture_ratification_snapshot();
+        state.freeze_prior_boundary_pulser();
         state.process_epoch_transition(EpochNo(1));
 
         assert!(
@@ -9473,7 +9688,7 @@ mod tests {
         // never a candidate at the first boundary after submission. This test
         // exercises ratification logic, not that timing, so it stands in for
         // the prior boundary explicitly.
-        state.capture_ratification_snapshot();
+        state.freeze_prior_boundary_pulser();
         state.process_epoch_transition(EpochNo(1));
 
         assert!(
@@ -9644,7 +9859,7 @@ mod tests {
         // never a candidate at the first boundary after submission. This test
         // exercises ratification logic, not that timing, so it stands in for
         // the prior boundary explicitly.
-        state.capture_ratification_snapshot();
+        state.freeze_prior_boundary_pulser();
         state.process_epoch_transition(EpochNo(1));
 
         // Treasury must be reduced by withdrawal
@@ -9709,7 +9924,7 @@ mod tests {
         // never a candidate at the first boundary after submission. This test
         // exercises ratification logic, not that timing, so it stands in for
         // the prior boundary explicitly.
-        state.capture_ratification_snapshot();
+        state.freeze_prior_boundary_pulser();
         state.process_epoch_transition(EpochNo(1));
 
         assert!(
@@ -9955,7 +10170,7 @@ mod tests {
         // never a candidate at the first boundary after submission. This test
         // exercises ratification logic, not that timing, so it stands in for
         // the prior boundary explicitly.
-        state.capture_ratification_snapshot();
+        state.freeze_prior_boundary_pulser();
         state.process_epoch_transition(EpochNo(1));
 
         let treasury_after = state.epochs.treasury.0;
@@ -10113,7 +10328,7 @@ mod tests {
         // never a candidate at the first boundary after submission. This test
         // exercises ratification logic, not that timing, so it stands in for
         // the prior boundary explicitly.
-        state.capture_ratification_snapshot();
+        state.freeze_prior_boundary_pulser();
         state.process_epoch_transition(EpochNo(1));
 
         // NoConfidence should be enacted
@@ -10402,15 +10617,8 @@ mod pulser_tests {
         );
     }
 
-    /// #988: the detector must actually FIRE on a mismatch.
-    ///
-    /// It was written inline in the `#[doc(hidden)]` test-only boundary path,
-    /// so it never ran on a real node and the "0 mismatches observed" evidence
-    /// recorded when #988 was closed was measuring nothing. A detector nobody
-    /// has seen go off is indistinguishable from no detector, so this plants a
-    /// deliberately wrong plan and asserts the WARN happens.
-    #[test]
-    fn pulser_mismatch_is_detected() {
+    /// Collect the WARN messages emitted while `f` runs.
+    fn warnings_during(f: impl FnOnce()) -> String {
         use tracing::subscriber;
         use tracing_subscriber::layer::SubscriberExt;
 
@@ -10422,8 +10630,8 @@ mod pulser_tests {
                 event: &tracing::Event<'_>,
                 _: tracing_subscriber::layer::Context<'_, S>,
             ) {
-                if *event.metadata().level() == tracing::Level::WARN {
-                    self.0.lock().unwrap().push(event.metadata().name().into());
+                if *event.metadata().level() != tracing::Level::WARN {
+                    return;
                 }
                 struct V(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
                 impl tracing::field::Visit for V {
@@ -10439,37 +10647,303 @@ mod pulser_tests {
 
         let caught = Caught::default();
         let sink = caught.clone();
-        let mut st = populated_ledger_state();
+        subscriber::with_default(tracing_subscriber::registry().with(caught), f);
+        let msgs = sink.0.lock().unwrap().join(" | ");
+        msgs
+    }
 
-        // A plan that claims something will enact which cannot: a gov action
-        // id that is not in the proposal set at all.
-        Arc::make_mut(&mut st.gov.governance).pulsed_ratify_state = Some(PulsedRatifyState {
-            computed_at_epoch: st.epoch,
+    /// A NoConfidence proposal with no votes at all, plus a frozen pulser.
+    fn state_with_unratifiable_proposal() -> (LedgerState, GovActionId) {
+        let mut state = super::tests::gov_test_state(10, 10);
+        state.process_proposal(
+            &Hash32::from_bytes([50u8; 32]),
+            0,
+            &ProposalProcedure {
+                deposit: Lovelace(100_000_000_000),
+                return_addr: vec![0u8; 29],
+                gov_action: GovAction::NoConfidence {
+                    prev_action_id: None,
+                },
+                anchor: super::tests::make_anchor(),
+            },
+        );
+        state.freeze_prior_boundary_pulser();
+        (state, super::tests::make_action_id(50, 0))
+    }
+
+    /// #988 step 2: the boundary APPLIES the frozen plan. It does not re-decide.
+    ///
+    /// Upstream the epoch boundary never runs RATIFY. It reads the completed
+    /// pulser and applies the result:
+    ///
+    /// ```haskell
+    /// pulsingState = epochState0 ^. epochStateDRepPulsingStateL
+    /// ratifyState@RatifyState {rsEnactState, rsEnacted, rsExpired} =
+    ///   extractDRepPulsingState pulsingState
+    /// ```
+    ///
+    /// The plan here enacts a proposal that has NOT ONE VOTE, so any boundary
+    /// that re-decides must reject it. Enactment is therefore proof that the
+    /// stored decision was applied verbatim rather than recomputed — which is
+    /// the whole point, because the recomputation reads live state that has
+    /// moved on by a full epoch.
+    #[test]
+    fn boundary_applies_the_frozen_plan_rather_than_re_deciding() {
+        let (mut state, action_id) = state_with_unratifiable_proposal();
+
+        // Sanity: on its own merits this proposal cannot ratify.
+        let fresh =
+            compute_pulsed_ratify_state(state.epoch, &state.epochs, &state.certs, &state.gov);
+        assert!(
+            fresh.enacted.is_empty(),
+            "fixture is wrong: an unvoted NoConfidence must not ratify"
+        );
+
+        let plan = PulsedRatifyState {
+            computed_at_epoch: state.epoch,
+            enacted: vec![action_id.clone()],
+            expired: Vec::new(),
+            delayed: true,
+            cur_pparams: state.epochs.protocol_params.clone(),
+            has_pparams_changes: false,
+        };
+        Arc::make_mut(&mut state.gov.governance).pulsed_ratify_state = Some(plan);
+
+        state.process_epoch_transition(EpochNo(state.epoch.0 + 1));
+
+        assert!(
+            state.gov.governance.no_confidence,
+            "the boundary must enact what the frozen pulser decided, even though \
+             re-deciding here would reject it (#988 step 2)"
+        );
+        assert!(
+            !state.gov.governance.proposals.contains_key(&action_id),
+            "an enacted proposal must be removed from the live set"
+        );
+        assert!(
+            state.gov.governance.last_ratify_delayed,
+            "`rsDelayed` comes from the plan, not from a fresh decision"
+        );
+    }
+
+    /// The mirror image: what the plan omits must NOT enact, however popular.
+    #[test]
+    fn boundary_does_not_enact_what_the_plan_omits() {
+        let mut state = super::tests::gov_test_state(10, 10);
+        state.process_proposal(
+            &Hash32::from_bytes([50u8; 32]),
+            0,
+            &ProposalProcedure {
+                deposit: Lovelace(100_000_000_000),
+                return_addr: vec![0u8; 29],
+                gov_action: GovAction::NoConfidence {
+                    prev_action_id: None,
+                },
+                anchor: super::tests::make_anchor(),
+            },
+        );
+        let action_id = super::tests::make_action_id(50, 0);
+        for i in 0..7 {
+            super::tests::drep_vote(&mut state, i, &action_id, Vote::Yes);
+        }
+        for i in 0..6 {
+            super::tests::spo_vote(&mut state, i, &action_id, Vote::Yes);
+        }
+        state.freeze_prior_boundary_pulser();
+
+        // Confirm the fixture really is ratifiable, so the assertion below is
+        // about the plan being authoritative and not about a dud proposal.
+        let planned = state
+            .gov
+            .governance
+            .pulsed_ratify_state
+            .clone()
+            .expect("a pulser must be frozen");
+        assert_eq!(
+            planned.enacted,
+            vec![action_id.clone()],
+            "fixture is wrong: this proposal must be ratifiable"
+        );
+
+        Arc::make_mut(&mut state.gov.governance).pulsed_ratify_state = Some(PulsedRatifyState {
+            enacted: Vec::new(),
+            delayed: false,
+            ..planned
+        });
+
+        state.process_epoch_transition(EpochNo(state.epoch.0 + 1));
+
+        assert!(
+            !state.gov.governance.no_confidence,
+            "the boundary must not enact an action the frozen pulser did not \
+             decide on, however the live votes now stand (#988 step 2)"
+        );
+        assert!(
+            state.gov.governance.proposals.contains_key(&action_id),
+            "a proposal the plan neither enacted nor expired must survive"
+        );
+    }
+
+    /// No pulser ⇒ nothing ratifies. Haskell's `Default` is `DRComplete def
+    /// def`, an empty result, so a boundary with no frozen pulser enacts
+    /// nothing — it must not fall back to deciding from live state, which is
+    /// #903's bug with an extra step.
+    #[test]
+    fn a_boundary_with_no_pulser_ratifies_nothing() {
+        let (mut state, action_id) = state_with_unratifiable_proposal();
+        for i in 0..7 {
+            super::tests::drep_vote(&mut state, i, &action_id, Vote::Yes);
+        }
+        for i in 0..6 {
+            super::tests::spo_vote(&mut state, i, &action_id, Vote::Yes);
+        }
+        Arc::make_mut(&mut state.gov.governance).pulsed_ratify_state = None;
+
+        state.process_epoch_transition(EpochNo(state.epoch.0 + 1));
+
+        assert!(
+            !state.gov.governance.no_confidence,
+            "with no frozen pulser nothing is a candidate (Haskell `DRComplete \
+             def def`)"
+        );
+    }
+
+    /// A plan naming an action that exists in neither the frozen nor the live
+    /// proposal set is not something that can happen — so it must be loud
+    /// rather than silently skipped.
+    #[test]
+    fn a_plan_naming_an_unknown_action_warns() {
+        let (mut state, _) = state_with_unratifiable_proposal();
+        Arc::make_mut(&mut state.gov.governance).pulsed_ratify_state = Some(PulsedRatifyState {
+            computed_at_epoch: state.epoch,
             enacted: vec![GovActionId {
                 transaction_id: Hash32::from_bytes([0xAB; 32]),
                 action_index: 0,
             }],
             expired: Vec::new(),
             delayed: false,
-            cur_pparams: st.epochs.protocol_params.clone(),
+            cur_pparams: state.epochs.protocol_params.clone(),
             has_pparams_changes: false,
         });
 
-        subscriber::with_default(tracing_subscriber::registry().with(caught.clone()), || {
+        let msgs = warnings_during(|| {
             ratify_at_boundary(
-                st.epoch,
-                EpochNo(st.epoch.0 + 1),
-                &mut st.epochs,
-                &mut st.certs,
-                &mut st.gov,
+                state.epoch,
+                EpochNo(state.epoch.0 + 1),
+                &mut state.epochs,
+                &mut state.certs,
+                &mut state.gov,
             );
         });
-
-        let msgs = sink.0.lock().unwrap().join(" | ");
         assert!(
-            msgs.contains("did not match the applied ratification"),
-            "the #988 detector must WARN when the frozen plan and the applied \
-             ratification disagree; captured: {msgs}"
+            msgs.contains("neither the frozen nor the live proposal set"),
+            "captured: {msgs}"
+        );
+    }
+
+    /// The plan carries the epoch it was decided under — Haskell's
+    /// `dpCurrentEpoch`, consumed as `reCurrentEpoch`. Applying one from the
+    /// wrong boundary is the defect the preview run caught
+    /// (`boundary_epoch=743 predicted_at=741`), and once the plan is applied
+    /// instead of compared it is the only place that can still show up.
+    #[test]
+    fn a_plan_stamped_with_the_wrong_epoch_warns() {
+        let (mut state, _) = state_with_unratifiable_proposal();
+        let stale = PulsedRatifyState {
+            computed_at_epoch: EpochNo(state.epoch.0.wrapping_sub(2)),
+            ..state
+                .gov
+                .governance
+                .pulsed_ratify_state
+                .clone()
+                .expect("a pulser must be frozen")
+        };
+        Arc::make_mut(&mut state.gov.governance).pulsed_ratify_state = Some(stale);
+
+        let msgs = warnings_during(|| {
+            ratify_at_boundary(
+                state.epoch,
+                EpochNo(state.epoch.0 + 1),
+                &mut state.epochs,
+                &mut state.certs,
+                &mut state.gov,
+            );
+        });
+        assert!(
+            msgs.contains("stamped with the wrong epoch"),
+            "captured: {msgs}"
+        );
+    }
+
+    /// #990: an action in its final epoch still gets ONE ratification attempt.
+    ///
+    /// `ratifyTransition` tests expiry only in the `else` branch — *after* the
+    /// ratification attempt has failed:
+    ///
+    /// ```haskell
+    /// else do
+    ///   st' <- trans @(RATIFY era) $ TRC (env, st, RatifySignal sigs)
+    ///   if gasExpiresAfter < reCurrentEpoch
+    ///     then pure $ st' & rsExpiredL %~ Set.insert gasId
+    ///     else pure st'
+    /// ```
+    ///
+    /// dugite skipped expired candidates BEFORE the threshold check, so a
+    /// proposal that crossed threshold on votes cast during its last epoch was
+    /// enacted by cardano-node and dropped here.
+    #[test]
+    fn an_expired_action_still_gets_a_final_ratification_attempt() {
+        let mut state = super::tests::gov_test_state(10, 10);
+        state.epoch = EpochNo(5);
+        state.process_proposal(
+            &Hash32::from_bytes([50u8; 32]),
+            0,
+            &ProposalProcedure {
+                deposit: Lovelace(100_000_000_000),
+                return_addr: vec![0u8; 29],
+                gov_action: GovAction::NoConfidence {
+                    prev_action_id: None,
+                },
+                anchor: super::tests::make_anchor(),
+            },
+        );
+        let action_id = super::tests::make_action_id(50, 0);
+        for i in 0..7 {
+            super::tests::drep_vote(&mut state, i, &action_id, Vote::Yes);
+        }
+        for i in 0..6 {
+            super::tests::spo_vote(&mut state, i, &action_id, Vote::Yes);
+        }
+
+        // Age it so this is its LAST pass: `gasExpiresAfter < reCurrentEpoch`.
+        // Done BEFORE the freeze, so the aged proposal is what the pulser's
+        // candidate set carries — expiry is decided over `dpProposals`, never
+        // over live state.
+        {
+            let g = Arc::make_mut(&mut state.gov.governance);
+            let mut ps = g.proposals.get(&action_id).expect("proposal").clone();
+            ps.expires_epoch = EpochNo(state.epoch.0 - 1);
+            g.proposals.insert(action_id.clone(), ps);
+        }
+        state.freeze_prior_boundary_pulser();
+
+        let decision = state
+            .gov
+            .governance
+            .pulsed_ratify_state
+            .clone()
+            .expect("a pulser must be frozen");
+
+        assert_eq!(
+            decision.enacted,
+            vec![action_id.clone()],
+            "an action whose votes crossed threshold must ratify on the same \
+             pass that would otherwise expire it (#990)"
+        );
+        assert!(
+            !decision.expired.contains(&action_id),
+            "`rsExpired` is only reachable from the not-ratified branch, so an \
+             action that enacts is never also expired (#990)"
         );
     }
 

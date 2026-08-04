@@ -2319,7 +2319,7 @@ fn test_parameter_change_ratification() {
     // `setFreshDRepPulsingState` at the PRIOR boundary, so a proposal is
     // never a candidate at the first boundary after submission. This test
     // exercises ratification logic, not that timing.
-    state.capture_ratification_snapshot();
+    state.freeze_prior_boundary_pulser();
     state.process_epoch_transition(EpochNo(1));
 
     assert_eq!(state.epochs.protocol_params.n_opt, 1000); // updated
@@ -2483,7 +2483,7 @@ fn test_treasury_withdrawal_ratification() {
     // `setFreshDRepPulsingState` at the PRIOR boundary, so a proposal is
     // never a candidate at the first boundary after submission. This test
     // exercises ratification logic, not that timing.
-    state.capture_ratification_snapshot();
+    state.freeze_prior_boundary_pulser();
     state.process_epoch_transition(EpochNo(1));
 
     assert_eq!(state.epochs.treasury, Lovelace(5_000_000_000)); // 10B - 5B = 5B
@@ -2565,7 +2565,7 @@ fn test_no_confidence_ratification() {
     // `setFreshDRepPulsingState` at the PRIOR boundary, so a proposal is
     // never a candidate at the first boundary after submission. This test
     // exercises ratification logic, not that timing.
-    state.capture_ratification_snapshot();
+    state.freeze_prior_boundary_pulser();
     state.process_epoch_transition(EpochNo(1));
 
     // Committee should be disbanded
@@ -2654,7 +2654,7 @@ fn test_hard_fork_ratification() {
     // `setFreshDRepPulsingState` at the PRIOR boundary, so a proposal is
     // never a candidate at the first boundary after submission. This test
     // exercises ratification logic, not that timing.
-    state.capture_ratification_snapshot();
+    state.freeze_prior_boundary_pulser();
     state.process_epoch_transition(EpochNo(1));
     assert_eq!(state.epochs.protocol_params.protocol_version_major, 11);
     assert_eq!(state.epochs.protocol_params.protocol_version_minor, 0);
@@ -8681,7 +8681,7 @@ fn test_update_committee_no_cc_required() {
     // `setFreshDRepPulsingState` at the PRIOR boundary, so a proposal is
     // never a candidate at the first boundary after submission. This test
     // exercises ratification logic, not that timing.
-    state.capture_ratification_snapshot();
+    state.freeze_prior_boundary_pulser();
     state.process_epoch_transition(EpochNo(1));
 
     // Verify new CC member was added
@@ -8827,7 +8827,7 @@ fn test_chained_parameter_changes() {
     // `setFreshDRepPulsingState` at the PRIOR boundary, so a proposal is
     // never a candidate at the first boundary after submission. This test
     // exercises ratification logic, not that timing.
-    state.capture_ratification_snapshot();
+    state.freeze_prior_boundary_pulser();
     state.process_epoch_transition(EpochNo(1));
     assert_eq!(state.epochs.protocol_params.drep_activity, 25);
 
@@ -8973,7 +8973,7 @@ fn test_cost_model_update_via_governance() {
     // `setFreshDRepPulsingState` at the PRIOR boundary, so a proposal is
     // never a candidate at the first boundary after submission. This test
     // exercises ratification logic, not that timing.
-    state.capture_ratification_snapshot();
+    state.freeze_prior_boundary_pulser();
     state.process_epoch_transition(EpochNo(1));
 
     assert_eq!(
@@ -9134,7 +9134,7 @@ fn test_hard_fork_initiation_ratification() {
     // `setFreshDRepPulsingState` at the PRIOR boundary, so a proposal is
     // never a candidate at the first boundary after submission. This test
     // exercises ratification logic, not that timing.
-    state.capture_ratification_snapshot();
+    state.freeze_prior_boundary_pulser();
     state.process_epoch_transition(EpochNo(1));
 
     assert_eq!(
@@ -9268,7 +9268,7 @@ fn test_committee_min_size_update_via_governance() {
     // `setFreshDRepPulsingState` at the PRIOR boundary, so a proposal is
     // never a candidate at the first boundary after submission. This test
     // exercises ratification logic, not that timing.
-    state.capture_ratification_snapshot();
+    state.freeze_prior_boundary_pulser();
     state.process_epoch_transition(EpochNo(1));
 
     assert_eq!(
@@ -15148,7 +15148,7 @@ fn test_treasury_withdrawal_via_governance_reduces_treasury() {
     // `setFreshDRepPulsingState` at the PRIOR boundary, so a proposal is
     // never a candidate at the first boundary after submission. This test
     // exercises ratification logic, not that timing.
-    state.capture_ratification_snapshot();
+    state.freeze_prior_boundary_pulser();
     state.process_epoch_transition(EpochNo(1));
 
     let treasury_after = state.epochs.treasury.0;
