@@ -1780,14 +1780,27 @@ fn encode_ratify_state(
         }
     }
 
-    // [1] rsEnacted: Seq of GovActionState (plain array, no tag 258)
+    // [1] rsEnacted: `Seq (GovActionState era)` — a plain array, no tag 258,
+    // and each element is JUST the `GovActionState`.
+    //
+    // dugite used to wrap every element in an `array(2) [GovActionState,
+    // GovActionId]`. That pair does not exist upstream, and the id is already
+    // `gasId`, field [0] of the record — so it was both wrong and duplicated.
+    // cardano-cli fails the whole reply with
+    //
+    //     Size mismatch when decoding Record RecD. Expected 7, but found 2.
+    //
+    // reading the wrapper where the 7-field record should start (#993).
+    //
+    // Unreachable until `rsEnacted` is non-empty, which is only true during the
+    // epoch BEFORE something enacts — so every test and every preview sample
+    // took the empty path and the arm was dead. `GetRatifyState` was therefore
+    // undecodable exactly when it has something to say.
     enc.array(enacted.len() as u64).ok();
-    for (proposal, action_id) in enacted {
-        enc.array(2).ok();
+    for (proposal, _gas_id) in enacted {
+        // `gasId` is encoded from the proposal itself, so the separate id is
+        // not read here; it stays in the tuple because callers key on it.
         encode_gov_action_state(enc, proposal);
-        enc.array(2).ok();
-        enc.bytes(&action_id.tx_id).ok();
-        enc.u32(action_id.action_index).ok();
     }
     // [2] rsExpired: Set of GovActionId (tag(258) + array per Haskell Set encoding)
     enc.tag(minicbor::data::Tag::new(258)).ok();
@@ -2979,7 +2992,19 @@ mod tests {
         assert_eq!(rd.array().unwrap(), Some(4), "RatifyState is array(4)");
         rd.skip().unwrap(); // EnactState
         assert_eq!(rd.array().unwrap(), Some(1), "rsEnacted carries one action");
-        rd.skip().unwrap();
+        // …and that action is a bare GovActionState (array(7)), NOT a
+        // [GovActionState, GovActionId] pair. Asserting only the count is what
+        // let #993 through: both shapes give a one-element Seq.
+        assert_eq!(
+            rd.array().unwrap(),
+            Some(7),
+            "each rsEnacted element is a bare GovActionState — the id is its \
+             field [0], not a sibling (#993)"
+        );
+        rd.skip().unwrap(); // gasId
+        for _ in 0..6 {
+            rd.skip().unwrap();
+        }
         assert_eq!(rd.tag().unwrap().as_u64(), 258, "rsExpired is a tagged set");
         assert_eq!(rd.array().unwrap(), Some(1), "rsExpired carries one id");
         rd.skip().unwrap();
