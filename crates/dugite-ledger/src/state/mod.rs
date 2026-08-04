@@ -696,6 +696,23 @@ pub struct PulsingSnapshot {
     pub drep_no_confidence: u64,
     /// Total stake delegated to `AlwaysAbstain` at freeze time.
     pub drep_abstain: u64,
+    /// Whether ANY account delegates to `AlwaysNoConfidence` / `AlwaysAbstain`.
+    ///
+    /// Upstream `psDRepDistr` is a single `Map DRep (CompactForm Coin)` in
+    /// which the two predefined DReps are ordinary keys, created by
+    /// `Map.insertWith` only when an account actually delegates to one — so an
+    /// undelegated predefined DRep is ABSENT, not present-with-zero. dugite
+    /// splits the map into a credential-keyed part plus two scalars, and a
+    /// scalar cannot distinguish "absent" from "zero"; these two flags carry
+    /// that bit so `GetDRepStakeDistr` can reproduce the key set exactly.
+    ///
+    /// Without them dugite padded every reply with `drep-alwaysAbstain: 0` and
+    /// `drep-alwaysNoConfidence: 0` where cardano-node returned `{}` (#994).
+    /// Gating on `stake > 0` instead would be wrong in the other direction: a
+    /// zero-balance account that delegates its vote creates the key upstream
+    /// with a value of zero.
+    pub drep_no_confidence_delegated: bool,
+    pub drep_abstain_delegated: bool,
 }
 
 /// Haskell `DRepPulsingState`, always in its `DRComplete` form (#988).

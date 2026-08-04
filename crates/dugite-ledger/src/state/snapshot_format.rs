@@ -693,6 +693,12 @@ mod tests {
             pulsing_snapshot.drep_abstain > 0,
             "PulsingSnapshot.drep_abstain"
         );
+        assert!(
+            pulsing_snapshot.drep_no_confidence_delegated
+                && pulsing_snapshot.drep_abstain_delegated,
+            "PulsingSnapshot delegation flags must both be true — `false` is \
+             the bincode default and so indistinguishable from unwritten (#994)"
+        );
         assert!(constitution.is_some(), "constitution");
         assert!(committee_threshold.is_some(), "committee_threshold");
         assert!(enacted_pparam_update.is_some(), "enacted_pparam_update");

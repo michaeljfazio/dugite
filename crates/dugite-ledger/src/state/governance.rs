@@ -1957,6 +1957,9 @@ fn build_pulsing_snapshot(
     let mut drep_distr: ImblHashMap<Hash32, u64> = ImblHashMap::new();
     let mut drep_no_confidence = 0u64;
     let mut drep_abstain = 0u64;
+    // Presence, not amount — see `PulsingSnapshot::drep_abstain_delegated`.
+    let mut drep_no_confidence_delegated = false;
+    let mut drep_abstain_delegated = false;
 
     // Proposal deposits are keyed by each live proposal's RETURN ADDRESS staking
     // credential and SUMMED across proposals sharing one, matching Haskell's
@@ -1978,8 +1981,14 @@ fn build_pulsing_snapshot(
             }
         } else {
             match drep {
-                DRep::NoConfidence => drep_no_confidence += stake,
-                DRep::Abstain => drep_abstain += stake,
+                DRep::NoConfidence => {
+                    drep_no_confidence += stake;
+                    drep_no_confidence_delegated = true;
+                }
+                DRep::Abstain => {
+                    drep_abstain += stake;
+                    drep_abstain_delegated = true;
+                }
                 _ => {}
             }
         }
@@ -2008,6 +2017,8 @@ fn build_pulsing_snapshot(
         drep_distr,
         drep_no_confidence,
         drep_abstain,
+        drep_no_confidence_delegated,
+        drep_abstain_delegated,
     };
     debug!(
         epoch = epoch.0,

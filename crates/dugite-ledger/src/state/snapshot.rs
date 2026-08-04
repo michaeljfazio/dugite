@@ -498,7 +498,11 @@ impl LedgerState {
     //     `DRComplete PulsingSnapshot RatifyState`. A positional bincode
     //     layout change; a v35 snapshot would mis-deserialize, and v35 DID
     //     reach disk during validation.
-    pub(crate) const SNAPSHOT_VERSION: u8 = 36;
+    // 37: #994 added the two `PulsingSnapshot` presence flags. A scalar total
+    //     cannot distinguish "no account delegates to AlwaysAbstain" from
+    //     "accounts delegate zero stake", and upstream's `psDRepDistr` is one
+    //     map whose keys exist only for the former. Positional bincode change.
+    pub(crate) const SNAPSHOT_VERSION: u8 = 37;
 
     /// Save ledger state snapshot to disk using bincode serialization.
     ///

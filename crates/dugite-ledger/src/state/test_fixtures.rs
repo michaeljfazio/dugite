@@ -351,6 +351,8 @@ pub fn populated_ledger_state() -> LedgerState {
         pulser.snapshot.drep_distr.insert(h32(0x41), 1_000_000);
         pulser.snapshot.drep_no_confidence = 10;
         pulser.snapshot.drep_abstain = 20;
+        pulser.snapshot.drep_no_confidence_delegated = true;
+        pulser.snapshot.drep_abstain_delegated = true;
         pulser.ratify_state = super::PulsedRatifyState {
             computed_at_epoch: EpochNo(316),
             enacted: vec![gid(0x60)],
