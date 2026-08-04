@@ -1388,7 +1388,32 @@ impl Node {
         // Try to load existing ledger snapshot (with the backend-mismatch
         // guard — a snapshot tagged for a different UTxO backend is rejected
         // here and the node rebuilds from chain).
-        let mut ledger = if snapshot_path.exists() {
+        // #989: a ledger snapshot is only usable if its UTxO store still exists
+        // and is complete. Checked HERE, before the snapshot is loaded and before
+        // the genesis setup below runs, because a rebuild after that point skips
+        // the setup (see `utxo_store_is_usable`). `wipe_utxo_store_before_replay`
+        // is honoured in the LSM block further down.
+        let mut wipe_utxo_store_before_replay = false;
+        let snapshot_usable = if snapshot_path.exists()
+            && matches!(
+                args.storage_config.utxo.backend,
+                dugite_storage::UtxoBackend::Lsm
+            ) {
+            let probe_slot = Self::peek_snapshot_slot(&snapshot_path).unwrap_or(0);
+            let ok = Self::utxo_store_is_usable(
+                &args.database_path.join("utxo-store"),
+                &args.storage_config.utxo,
+                probe_slot,
+            );
+            if !ok {
+                wipe_utxo_store_before_replay = true;
+            }
+            ok
+        } else {
+            true
+        };
+
+        let mut ledger = if snapshot_path.exists() && snapshot_usable {
             match Self::load_snapshot_with_backend_guard(
                 &snapshot_path,
                 &args.database_path,
@@ -1842,7 +1867,9 @@ impl Node {
             // MIR reserves-debit underflows and panics. Wipe the stale store so
             // the replay rebuilds the UTxO set from scratch. (A truly fresh node
             // has no `utxo-store/` yet, so this is a no-op there.)
-            if ledger.tip.point == Point::Origin && utxo_path.exists() {
+            if (ledger.tip.point == Point::Origin || wipe_utxo_store_before_replay)
+                && utxo_path.exists()
+            {
                 warn!(
                     path = %utxo_path.display(),
                     "Ledger is at origin (from-genesis replay) but a UTxO store exists on disk — \
@@ -1913,36 +1940,15 @@ impl Node {
                              at-tip / producing blocks."
                         );
                     }
-                    // attach_utxo_store calls rebuild_address_index() which populates
-                    // the in-memory count from the LSM. Read the count AFTER attach
-                    // to avoid a false-zero from the freshly-opened store (count starts
-                    // at 0 and is only set correctly once rebuild_address_index runs).
+                    // The incomplete-store decision is NOT made here (#989). It
+                    // has to happen BEFORE the ledger is chosen, because a
+                    // rebuild at this point would skip the Conway genesis
+                    // committee seeding that runs between the two — which is
+                    // exactly the bug the first attempt at #989 introduced, and
+                    // which a preview replay caught as `InvalidPrevGovActionId`.
+                    // See `utxo_store_is_usable` and its use at the ledger-choice
+                    // site above.
                     ledger.attach_utxo_store(store);
-                    let store_count = ledger.utxo.utxo_set.len();
-
-                    // If the ledger has a non-origin tip but the UTxO store has
-                    // significantly fewer entries than expected, the store data
-                    // was lost or incomplete (crash, session lock, etc.).
-                    // Force a full re-replay by resetting the ledger tip to origin.
-                    let ledger_slot = ledger.tip.point.slot().map(|s| s.0).unwrap_or(0);
-                    if ledger_slot > 0 {
-                        // A synced preview testnet has ~3M UTxOs, mainnet ~15M.
-                        // If the store has less than 100K entries for a non-trivial
-                        // ledger tip, the data is almost certainly incomplete.
-                        let min_expected = if ledger_slot > 10_000_000 { 100_000 } else { 0 };
-                        if store_count < min_expected {
-                            warn!(
-                                utxo_count = store_count,
-                                ledger_slot,
-                                min_expected,
-                                "UTxO store appears incomplete ({} entries for slot {}). \
-                                 Resetting ledger to force full re-replay.",
-                                store_count,
-                                ledger_slot
-                            );
-                            ledger.reset_to_origin();
-                        }
-                    }
                 }
                 Err(e) => {
                     warn!(
@@ -8901,6 +8907,99 @@ impl Node {
     // ─── init_fresh_ledger() ─────────────────────────────────────────────────
 
     /// Create a fresh ledger state with genesis configuration applied.
+    /// Read a snapshot's tip slot from its `.meta.json` sidecar, without
+    /// loading the (100 MB+) payload.
+    ///
+    /// Used only to size the UTxO-store completeness check (#989), so a missing
+    /// or unreadable sidecar returning `None` is fine — the caller treats that
+    /// as "no slot known" and skips the check rather than rejecting a snapshot
+    /// it cannot measure.
+    fn peek_snapshot_slot(bin_path: &std::path::Path) -> Option<u64> {
+        dugite_ledger::state::SnapshotMeta::load(bin_path).map(|m| m.slot)
+    }
+
+    /// Is the on-disk UTxO store complete enough to trust a ledger snapshot
+    /// taken at `snapshot_slot`? (#989)
+    ///
+    /// A snapshot restores the ledger tip, pots and governance state, but the
+    /// UTxO set itself lives in the LSM store. If the store was lost or
+    /// truncated — crash, killed process, partial copy, disk-full during
+    /// compaction — the pair is unusable and the node must replay from
+    /// genesis instead.
+    ///
+    /// This probe exists so that decision can be made BEFORE the snapshot is
+    /// loaded. The previous code discovered it afterwards and called a
+    /// `reset_to_origin` that reset only `tip` and `epoch`, leaving the
+    /// treasury, certificates, governance state and protocol parameters at
+    /// their snapshot values while the replay restarted at slot 0 — #985's
+    /// chimera shape, ending with a snapshot of the chimera written back to
+    /// disk (observed on preview as a ~4.9e15 lovelace treasury delta).
+    ///
+    /// Deciding late is not fixable by resetting harder: the ledger-choice
+    /// site is followed by genesis setup (Conway committee threshold and
+    /// members), so a rebuild after that point silently skips it. The first
+    /// attempt at this fix did exactly that and a preview replay caught it as
+    /// `InvalidPrevGovActionId` — governance state diverged mid-replay.
+    ///
+    /// Opens the store read-only, counts, and drops it. Cheap relative to the
+    /// replay it prevents.
+    fn utxo_store_is_usable(
+        utxo_path: &std::path::Path,
+        utxo_cfg: &dugite_storage::UtxoConfig,
+        snapshot_slot: u64,
+    ) -> bool {
+        // A synced preview testnet has ~3M UTxOs, mainnet ~15M. Below slot 10M
+        // a small store is legitimate, so nothing is required of it.
+        let min_expected = if snapshot_slot > 10_000_000 {
+            100_000
+        } else {
+            0
+        };
+        if snapshot_slot == 0 || min_expected == 0 {
+            return true;
+        }
+        if !utxo_path.exists() {
+            warn!(
+                path = %utxo_path.display(),
+                snapshot_slot,
+                "Ledger snapshot is for a synced chain but no UTxO store exists — \
+                 ignoring the snapshot and replaying from genesis."
+            );
+            return false;
+        }
+        match dugite_ledger::utxo_store::UtxoStore::open_with_config(
+            utxo_path,
+            utxo_cfg.memtable_size_mb,
+            utxo_cfg.block_cache_size_mb,
+            utxo_cfg.bloom_filter_bits_per_key,
+        ) {
+            Ok(mut store) => {
+                let count = store.count_entries();
+                if count < min_expected {
+                    warn!(
+                        utxo_count = count,
+                        snapshot_slot,
+                        min_expected,
+                        "UTxO store appears incomplete ({count} entries for a snapshot at \
+                         slot {snapshot_slot}) — ignoring the snapshot and replaying from \
+                         genesis. The store will be wiped so the replay rebuilds it."
+                    );
+                    false
+                } else {
+                    true
+                }
+            }
+            Err(e) => {
+                warn!(
+                    path = %utxo_path.display(),
+                    "Cannot open the UTxO store to validate it against the ledger snapshot: \
+                     {e} — ignoring the snapshot and replaying from genesis."
+                );
+                false
+            }
+        }
+    }
+
     pub(crate) fn init_fresh_ledger(
         protocol_params: &ProtocolParameters,
         shelley_genesis: Option<&ShelleyGenesis>,
