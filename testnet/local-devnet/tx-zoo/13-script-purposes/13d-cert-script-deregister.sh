@@ -66,8 +66,11 @@ assert_purpose "$SIGNED" Certifying || { zoo_record "$NAME" FAIL "" "no-certifyi
 TXID=$(zoo_submit "$SIGNED") || { zoo_record "$NAME" FAIL "" "submit"; exit 1; }
 if wait_all_strict "$TXID" 150 "$ADDR"; then
     # The deposit must come back and the account must be gone.
-    STILL=$(is_registered "$STAKE_ADDR")
-    if [ "$STILL" = "no" ]; then
+    # Poll for ABSENCE — see `is_deregistered`. Asking `is_registered` here
+    # inverts the wait and turns the assertion into a race against the N2C
+    # query-snapshot refresh.
+    GONE=$(is_deregistered "$STAKE_ADDR")
+    if [ "$GONE" = "yes" ]; then
         zoo_record "$NAME" PASS "$TXID" "certifying-purpose deregistered refund=$DEPOSIT"
     else
         zoo_record "$NAME" FAIL "$TXID" "still-registered-after-dereg"
