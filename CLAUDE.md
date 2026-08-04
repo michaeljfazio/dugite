@@ -101,9 +101,83 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 - 28-byte hash types (DRep keys, pool voter keys, required signers) must be padded to 32 bytes via `Hash28::to_hash32_padded()` — do not use `Hash<32>::from()` directly on 28-byte hashes
 
 ## Current Focus
-**Backlog to zero (2026-08-04)** — closes the last four open issues: #977,
-#980, #969, #970. **SNAPSHOT_VERSION 32 -> 34** (33 for #988's pulser, 34 for
-#977's `futurePParams`), so existing DBs replay chunks on first restart.
+**v2.6.0 (2026-08-04) — the DRep pulser becomes one mechanism.**
+**RE-SYNC RELEASE: SNAPSHOT_VERSION 32 -> 36**, so existing DBs replay chunks
+on first restart. Closes #977, #980, #969, #970 (the earlier backlog) plus
+#988, #989, #990, #991, #992, #993.
+
+### #988 — the epoch boundary APPLIES the frozen pulser; it does not re-decide
+
+Conway's EPOCH rule never runs RATIFY:
+
+```haskell
+pulsingState = epochState0 ^. epochStateDRepPulsingStateL
+ratifyState@RatifyState {rsEnactState, rsEnacted, rsExpired} =
+  extractDRepPulsingState pulsingState
+```
+
+RATIFY runs inside `finishDRepPulser`, over inputs frozen one boundary earlier.
+dugite froze a plan for `GetRatifyState` and then independently RECOMPUTED the
+decision at the next boundary — the same answer only as long as four separate
+patches (#903/#922/#950/#966) each kept their term frozen by hand.
+
+Step 3 collapsed those five independently-`Option`al fields into ONE
+`Option<DRepPulsingState>` (`{snapshot, ratify_state}` = Haskell's
+`DRComplete PulsingSnapshot RatifyState`). A torn pulser and a reader mixing
+frozen with live terms are now both inexpressible. **That consolidation is what
+found #991** — the capture and the consumer being separate fields IS the
+mechanism.
+
+### The three defects it surfaced, all consensus- or wire-affecting
+
+- **#990 (ledger, CONSENSUS)** — `ratifyTransition` tests expiry in its `else`
+  branch, *after* the ratification attempt fails, so an action gets a final
+  ratification pass on the same boundary that expires it. dugite `continue`d on
+  `expires < epoch` BEFORE the threshold check, discarding **every vote cast in
+  a proposal's final epoch**. False reject.
+- **#991 (ledger, CONSENSUS)** — proposal deposits added TWICE to DRep voting
+  power (once at capture per `computeDRepDistr`, again at consumption) while
+  `compute_total_drep_stake_from` counted them once. Numerator inflated against
+  an unchanged denominator ⇒ `dRepAcceptedRatio` too high ⇒ **accept-early**.
+  Introduced by #949 adding the missing term to the capture without removing it
+  from the consumer: a missing term became a doubled one. Present since v2.4.4.
+- **#993 (n2c)** — `rsEnacted` elements were encoded as an
+  `array(2) [GovActionState, GovActionId]` pair that does not exist upstream,
+  with the id duplicated (`gasId` is already field [0]). cardano-cli rejected
+  the whole reply with `Expected 7, but found 2`. `GetRatifyState` was
+  **undecodable exactly when it has something to say** — `rsEnacted` is
+  non-empty only during the epoch before something enacts. The #968 shape.
+
+Plus **#992** — `GetGovState` embedded a hardcoded EMPTY `DRepPulsingState`
+beside a second hand-written copy of `EnactState`. Narrower than it looks:
+cardano-cli renders `nextRatifyState` from tag 32, NOT from the tag-24 embedded
+pulser, so this has no cardano-cli-visible form and is guarded at the encoder.
+
+### #989 — a snapshot whose UTxO store is gone is rejected, not "reset"
+
+`LedgerState::reset_to_origin` reset only `tip` and `epoch`, so a forced
+re-replay ran from slot 0 carrying epoch-1379 pots — #985's chimera, ending in
+a snapshot OF the chimera. Deleted rather than repaired: genesis state needs
+genesis inputs, so no in-place reset can be correct. The check now runs BEFORE
+the snapshot is loaded.
+
+### Testing — preview replay is the gate, not the devnet
+
+The devnet produces ONE boundary with `enacted=0`. A preview replay from
+genesis gives **733 Conway boundaries with real governance in ~4 minutes**, and
+Koios provides independent pot truth. Every ledger change here was gated on it:
+733/733 boundaries applied with `planned_at == boundary_epoch - 1`, the same 14
+enactment boundaries before and after, 0 apply failures, 0 ERROR, and final
+pots byte-exact vs Koios for epoch 1379 (treasury `6975097769635306`, reserves
+`7743240562481380`).
+
+**#993 was found only by RUNNING the new devnet oracle** — see
+`ratify-state-parity.sh`. Writing a gate-enforced check and never executing it
+is the defect class the check exists to catch; one run also exposed three
+missing gov-lifecycle prerequisites in the Round 2 recipe and a `null#null`
+tautology in the check's own jq.
+
+### Superseded within v2.6.0 — the earlier backlog (#977, #980, #969, #970)
 
 ### #977 — `futurePParams` was a hardcoded constant, and the fix landed in a dead path
 The LSQ encoder wrote `NoPParamsUpdate` unconditionally; dugite had no
