@@ -51,7 +51,7 @@ use super::{EraRules, RuleContext};
 use crate::state::governance::{
     epoch_boundary_governance_step, expire_committee_members, forest_add_proposal,
     genesis_root_is_valid, gov_action_purpose_tag, gov_action_raw_prev_id,
-    hardfork_proposal_cant_follow, prev_action_matches_enacted_root, ratify_proposals_impl,
+    hardfork_proposal_cant_follow, prev_action_matches_enacted_root, ratify_at_boundary,
     update_dormant_epochs, update_drep_activity,
 };
 use crate::state::substates::*;
@@ -876,7 +876,7 @@ impl EraRules for ConwayRules {
         // Haskell's reCurrentEpoch from the DRep pulser. Proposals with
         // expires_epoch == current_epoch are still eligible for ratification;
         // they only expire AFTER ratification fails at this boundary.
-        ratify_proposals_impl(ctx.current_epoch, epochs, certs, gov);
+        ratify_at_boundary(ctx.current_epoch, new_epoch, epochs, certs, gov);
 
         // === Step 6: Deposit returns handled by ratify_proposals_impl above ===
 
@@ -926,7 +926,7 @@ impl EraRules for ConwayRules {
         // Pass the OLD epoch (ctx.current_epoch) for the snapshot label, matching
         // the old LedgerState::process_epoch_transition which passes self.epoch
         // (before self.epoch = new_epoch).
-        epoch_boundary_governance_step(ctx.current_epoch, epochs, certs, gov);
+        epoch_boundary_governance_step(new_epoch, epochs, certs, gov);
 
         // prevPParams was already captured at the top of this function
         // (BEFORE pre-Conway PPUP application and BEFORE
