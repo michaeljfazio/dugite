@@ -87,16 +87,39 @@ _tip_slot() {
 # the full pparams and committee, which `09k-gov-state` already diffs, and
 # including it here would turn every unrelated pparam difference into a
 # ratify-state failure.
-# A GovActionId renders as `{"govActionIx":N,"txId":"…"}` both inside
-# `nextRatifyState` and as `.proposals[].actionId`, so one flattener serves
-# both and the two are directly comparable. Verified against a live node
-# rather than assumed — the field names are not the wire names.
+# A GovActionId renders as `{"govActionIx":N,"txId":"…"}`, and this flattens it
+# to `txId#ix` so both sockets' answers are directly comparable.
+#
+# The two lists nest it DIFFERENTLY, and getting that wrong is silent:
+#
+#   .enactedGovActions[]  is a whole GovActionState — id at `.actionId`
+#   .expiredGovActions[]  is a bare GovActionId     — id at the top level
+#   .proposals[]          is a whole GovActionState — id at `.actionId`
+#
+# Applying the bare-id form to `enactedGovActions` yields `"null#null"` for
+# every entry, which compares EQUAL across sockets no matter which actions each
+# one listed. That is the "reports success while measuring nothing" family this
+# harness keeps finding, and it happened here on the first run — caught only
+# because the CSV records the flattened value rather than just a verdict.
+# `_assert_ids` below makes it fail loudly instead.
 _gid_expr='"\(.txId)#\(.govActionIx)"'
+
+# Fail the run if a flattened id came out degenerate. A shape change upstream
+# must break this suite, not quietly turn it into a tautology.
+_assert_ids() {
+    case "$1" in
+        *'"null#null"'*|*'"#"'*)
+            echo "HARNESS BUG: a GovActionId flattened to a null id — the JSON \
+shape changed and every comparison would now be vacuously equal. Sample: $1" >&2
+            return 1 ;;
+    esac
+    return 0
+}
 
 _ratify() {
     cardano-cli conway query gov-state --testnet-magic "$MAGIC" --socket-path "$1" 2>/dev/null \
         | jq -Sc "(.nextRatifyState // {}) | {
-              enacted: [ (.enactedGovActions // [])[] | $_gid_expr ] | sort,
+              enacted: [ (.enactedGovActions // [])[] | .actionId | $_gid_expr ] | sort,
               expired: [ (.expiredGovActions // [])[] | $_gid_expr ] | sort,
               delayed: (.ratificationDelayed // false)
           }"
@@ -105,7 +128,7 @@ _ratify() {
 echo "ts,slot,epoch,socket_agree,dugite,cardano,verdict" > "$OUT"
 
 deadline=$(( $(date +%s) + SECONDS_TO_RUN ))
-compared=0; diffs=0; unstable=0; boundaries=0; nonempty=0
+compared=0; diffs=0; unstable=0; boundaries=0; nonempty=0; rc_harness=0
 last_epoch=""
 # The plan observed during the epoch that is about to end. Checked against the
 # enactment once the boundary has passed.
@@ -161,6 +184,8 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
         pending_plan="$dr"
     fi
 
+    _assert_ids "$dr" || { rc_harness=1; break; }
+
     compared=$((compared + 1))
     if [ "$dr" = "$cr" ]; then
         v=MATCH
@@ -175,6 +200,10 @@ boundaries_crossed=$boundaries nonempty_samples=$nonempty \
 plan_checks=$plan_checks plan_breaks=$plan_breaks"
 
 rc=0
+if [ "$rc_harness" -ne 0 ]; then
+    echo "FAIL: harness aborted — see the HARNESS BUG line above" >&2
+    rc=1
+fi
 if [ "$diffs" -gt 0 ]; then
     echo "FAIL: $diffs nextRatifyState divergence(s) vs cardano-node — see $OUT" >&2
     rc=1
