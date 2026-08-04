@@ -1878,6 +1878,36 @@ pub(crate) fn epoch_boundary_governance_step(
         Arc::make_mut(&mut gov.governance).future_pparams =
             FuturePParams::PotentialPParamsUpdate(None);
         set_fresh_drep_pulsing_state(new_epoch, epochs, certs, gov);
+        // 3. …and predict IMMEDIATELY, from the pulser just frozen.
+        //
+        // `setFreshDRepPulsingState` ends with exactly this, applied to the
+        // govState that already carries the new pulser:
+        //
+        // ```haskell
+        // govState' =
+        //   predictFuturePParams $
+        //     govState & cgsDRepPulsingStateL .~ DRPulsing (DRepPulser {..})
+        // ```
+        //
+        // So the boundary does NOT leave `PotentialPParamsUpdate Nothing`
+        // behind — it leaves `Just pp` whenever the fresh plan enacts a
+        // `ParameterChange` or `HardForkInitiation`. dugite reset and froze but
+        // never predicted, so the value stayed `Nothing` until some LATER
+        // non-boundary tick predicted it (#995).
+        //
+        // On a chain where `2 * stabilityWindow >= epochLength` there is no
+        // such later tick: `solidifyNextEpochPParams` fires on the very next
+        // block and collapses `Potential Nothing` to `NoPParamsUpdate`, which
+        // prediction then refuses to reopen. That is the devnet, where dugite
+        // answered `NoPParamsUpdate` for an entire epoch in which cardano-node
+        // answered `DefinitePParamsUpdate` — 235 divergent samples confined to
+        // the epoch before the change enacted.
+        //
+        // It matters beyond the query: `futurePParams` feeds `nextEpochPParams`,
+        // which `Conway.Rules.Tickf` uses for the ledger-view FORECAST, so a
+        // node that gets this wrong validates next-epoch headers against the
+        // current epoch's protocol version and size limits.
+        predict_future_pparams(gov);
     }
 }
 
@@ -10940,6 +10970,72 @@ mod pulser_tests {
         );
     }
 
+    /// #995: the boundary must leave a PREDICTED `futurePParams`, not
+    /// `Potential(None)`.
+    ///
+    /// `setFreshDRepPulsingState` ends with `predictFuturePParams` applied to
+    /// the govState carrying the freshly-installed pulser, so a boundary whose
+    /// new plan enacts a `ParameterChange` leaves `Potential(Just pp)`.
+    ///
+    /// dugite reset to `Potential(None)` and stopped. On a chain where
+    /// `2 * stabilityWindow >= epochLength` — the devnet — the next block
+    /// solidifies that to `NoPParamsUpdate` before any non-boundary tick can
+    /// predict, and prediction refuses to reopen a settled value. dugite then
+    /// reported `NoPParamsUpdate` for a whole epoch where cardano-node
+    /// reported `DefinitePParamsUpdate`.
+    #[test]
+    fn the_boundary_predicts_from_the_pulser_it_just_froze() {
+        let mut state = super::tests::gov_test_state(10, 10);
+        let update = dugite_primitives::transaction::ProtocolParamUpdate {
+            min_fee_a: Some(999),
+            ..Default::default()
+        };
+        state.process_proposal(
+            &Hash32::from_bytes([50u8; 32]),
+            0,
+            &ProposalProcedure {
+                deposit: Lovelace(100_000_000_000),
+                return_addr: vec![0u8; 29],
+                gov_action: GovAction::ParameterChange {
+                    prev_action_id: None,
+                    protocol_param_update: Box::new(update),
+                    policy_hash: None,
+                },
+                anchor: super::tests::make_anchor(),
+            },
+        );
+        let action_id = super::tests::make_action_id(50, 0);
+        for i in 0..9 {
+            super::tests::drep_vote(&mut state, i, &action_id, Vote::Yes);
+        }
+        for i in 0..9 {
+            super::tests::spo_vote(&mut state, i, &action_id, Vote::Yes);
+        }
+        super::tests::cc_vote_yes(&mut state, &action_id);
+
+        // The boundary: reset, freeze, predict.
+        epoch_boundary_governance_step(
+            EpochNo(state.epoch.0 + 1),
+            &state.epochs,
+            &state.certs,
+            &mut state.gov,
+        );
+
+        match &state.gov.governance.future_pparams {
+            FuturePParams::PotentialPParamsUpdate(Some(pp)) => {
+                assert_eq!(
+                    pp.min_fee_a, 999,
+                    "the prediction must carry `ensCurPParams` from the plan"
+                );
+            }
+            other => panic!(
+                "the boundary must leave a PREDICTED futurePParams when the \
+                 fresh pulser enacts a ParameterChange — `setFreshDRepPulsingState` \
+                 ends with `predictFuturePParams` (#995); got {other:?}"
+            ),
+        }
+    }
+
     /// …and TRUE when a `ParameterChange` is about to enact.
     ///
     /// Only the negative case was ever tested, so `has_pparams_changes` could
@@ -10960,8 +11056,10 @@ mod pulser_tests {
     #[test]
     fn has_pparams_changes_is_true_when_a_parameter_change_enacts() {
         let mut state = super::tests::gov_test_state(10, 10);
-        let mut update = dugite_primitives::transaction::ProtocolParamUpdate::default();
-        update.min_fee_a = Some(999);
+        let update = dugite_primitives::transaction::ProtocolParamUpdate {
+            min_fee_a: Some(999),
+            ..Default::default()
+        };
         state.process_proposal(
             &Hash32::from_bytes([50u8; 32]),
             0,
