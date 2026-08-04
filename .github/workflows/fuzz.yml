@@ -169,6 +169,16 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@nightly
 
+      - name: Install protoc
+        # dugite-rpc's build.rs invokes tonic-build → prost-build → protoc to
+        # generate the gRPC stubs. #983 made dugite-rpc a fuzz dependency (the
+        # inbound protobuf → ledger mapping is attacker-controlled), which put
+        # that build script on the fuzz build path too — every job in this
+        # matrix failed to compile until this step existed. ci.yml and
+        # release.yml install it in every job that builds; this workflow was
+        # simply missed.
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: Cache cargo registry and build
         uses: actions/cache@v6
         with:
