@@ -263,6 +263,48 @@ is the defect class the check exists to catch; one run also exposed three
 missing gov-lifecycle prerequisites in the Round 2 recipe and a `null#null`
 tautology in the check's own jq.
 
+### QA — v2.6.0 (SHIPPED)
+
+devnet-validate standard preset, **4/4 rounds PASS**
+(`reports/devnet-validate/v2.6.0.json`) vs cardano-node 11.0.1, strict,
+`gate_integrity.admissible = true`, zero missing evidence — run against the
+tagged commit, not an earlier one.
+
+- 651 canonical blocks, 0 invalid forges, 0 critical anomalies
+- tx-zoo 120/123 baseline, **0 fail**; bidirectional parity **79 scripts,
+  0 OFFDIAG, 0 CLASSDIFF**; cli-parity 25/25; adversarial N2N 26/26;
+  UTxO RPC 27/27; chaos 5/5 with 0 ENV_SKIP
+- tip-parity **100% in all four rounds** (24/24, 24/24, 176/176, 36/36)
+- treasury+reserves **byte-exact** vs cardano-node after the RUPD boundary
+- futurePParams parity 548 compared / 0 diffs / **6 samples inside the
+  `PotentialPParamsUpdate` window**; ratify-state parity 544 compared /
+  0 diffs / **181 non-empty `nextRatifyState` samples**. Both samplers reached
+  their NON-VACUOUS condition — two implementations agreeing that nothing is
+  about to happen is not evidence, and that is precisely what #992's hardcoded
+  empty pulser produced for every previous gate.
+
+The 3 tx-zoo failures are all `01a-simple-pay` from the Round 2 trickle racing
+itself (one address, every 20 s ⇒ `Input conflict: input already claimed by
+mempool tx`). Verify the REASON before dismissing these — the identical count
+appears in v2.4.3 for the identical cause, which makes it easy to wave through
+a real one.
+
+**Preprod soak, 3 h on v2.6.0** — the 32→37 re-sync replayed 2.6M blocks at
+~45k blk/s and came up clean. Byte-exact against Koios throughout: tip
+(delta 0 at every sample), treasury `1952221204641186`, reserves
+`12986390967589170`, protocol params at PV11, and the **entire registered pool
+set (558/558, zero set difference)**. 0 ERROR, 0 apply failures, 15 peers,
+RSS flat (a 1.8 GB reclaim mid-run, no growth). 2 ledger rollbacks, both clean
+1-block fork switches with **0** `LedgerSeq was incoherent` — positive evidence
+the #985 startup re-anchor fired. No epoch boundary falls inside a 3 h preprod
+window (5-day epochs), so the soak validates steady-state sync/apply/serve;
+boundary handling is the devnet gate's job.
+
+**Trap seen twice this run**: starting `soak.sh` immediately after a
+deliberate disruption (the chaos suite's SIGKILL, or Round 3's 90 s outage)
+samples tip-parity DURING reconvergence and fails p4 on noise. Gate the soak on
+`wait-catchup.sh` — an added assertion, not a relaxed predicate.
+
 ### Superseded within v2.6.0 — the earlier backlog (#977, #980, #969, #970)
 
 ### #977 — `futurePParams` was a hardcoded constant, and the fix landed in a dead path
