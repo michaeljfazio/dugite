@@ -16,7 +16,7 @@ use imbl::OrdMap as ImblOrdMap;
 use imbl::OrdSet as ImblOrdSet;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 impl LedgerState {
     /// Process a governance proposal.
@@ -1713,6 +1713,75 @@ pub(crate) fn predict_future_pparams(gov: &mut GovSubState) {
     g.future_pparams = FuturePParams::PotentialPParamsUpdate(predicted);
 }
 
+/// Ratify at an epoch boundary, and check the outcome against the plan the
+/// pulser froze at the PREVIOUS boundary (#988).
+///
+/// **Every** boundary path must go through this rather than calling
+/// [`ratify_proposals_impl`] directly. The detector originally lived inline in
+/// `LedgerState::process_epoch_transition` — the `#[doc(hidden)]` test-only
+/// path — so it never executed on a real node, and the "0 mismatches observed"
+/// evidence recorded when #988 was closed was measuring nothing. Same trap as
+/// #977, in the same change. One shared function is what makes that
+/// unrepeatable.
+///
+/// # What the check means
+///
+/// The plan is computed at boundary B from the snapshot frozen at B, and
+/// applied here at B+1 from that same snapshot, so the two MUST agree. Where
+/// they can still diverge is the handful of live reads remaining inside the
+/// threshold path — notably `vote_delegations` when attributing proposal
+/// deposits, which Haskell freezes into `psDRepDistr` and dugite re-reads.
+///
+/// This does not paper over that; it makes it LOUD. A mismatch means
+/// `GetRatifyState` told a client one thing and the chain then did another,
+/// which is exactly the class of silent divergence this repository keeps
+/// having to find the hard way. It WARNs rather than asserts because a false
+/// crash on a live node is worse than a false green — but a WARN cannot be
+/// missed by the evidence analyzer, which a debug! can.
+pub(crate) fn ratify_at_boundary(
+    epoch: EpochNo,
+    boundary_epoch: EpochNo,
+    epochs: &mut EpochSubState,
+    certs: &mut CertSubState,
+    gov: &mut GovSubState,
+) {
+    let predicted = gov.governance.pulsed_ratify_state.clone();
+
+    ratify_proposals_impl(epoch, epochs, certs, gov);
+
+    let Some(pred) = predicted else { return };
+    let actual: Vec<_> = gov
+        .governance
+        .last_ratified
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect();
+    if pred.enacted != actual || pred.delayed != gov.governance.last_ratify_delayed {
+        warn!(
+            boundary_epoch = boundary_epoch.0,
+            predicted_at = pred.computed_at_epoch.0,
+            predicted_enacted = pred.enacted.len(),
+            actual_enacted = actual.len(),
+            predicted_delayed = pred.delayed,
+            actual_delayed = gov.governance.last_ratify_delayed,
+            "DRep pulser prediction did not match the applied ratification — \
+             GetRatifyState reported a result the chain did not produce (#988)"
+        );
+    } else {
+        // Positive evidence, at INFO deliberately. A run with no WARN is
+        // indistinguishable from a run where the detector never executed —
+        // which is precisely what went wrong the first time, and a debug! here
+        // would have reproduced it, since the devnet runs at INFO. One line per
+        // epoch boundary is negligible volume for the only signal that proves
+        // the check was live.
+        info!(
+            boundary_epoch = boundary_epoch.0,
+            enacted = actual.len(),
+            "DRep pulser prediction matched the applied ratification (#988)"
+        );
+    }
+}
+
 /// Compute the frozen pulser result for the epoch now starting (#988).
 ///
 /// Haskell's `setFreshDRepPulsingState` creates the pulser at the boundary and
@@ -1799,8 +1868,24 @@ fn compute_pulsed_ratify_state(
 /// The reset must come FIRST: the pulser frozen in step 2 describes the NEXT
 /// boundary, and prediction may only read it on LATER blocks. Haskell's
 /// NEWEPOCH takes the boundary branch or the predict branch, never both.
+///
+/// # `new_epoch` is Haskell's `eNo`, and it is NOT the epoch that just ended
+///
+/// `Conway.Rules.Epoch.epochTransition` ends with
+/// `setFreshDRepPulsingState eNo stakePoolDistr epochState2`, and NEWEPOCH
+/// reaches EPOCH only when `eNo == succ eL` — so `eNo` is the epoch STARTING
+/// at this boundary. `setFreshDRepPulsingState` stores it as
+/// `dpCurrentEpoch`, and the NEXT boundary's RATIFY runs with
+/// `reCurrentEpoch = dpCurrentEpoch`.
+///
+/// So the pulser must be computed with the epoch the next boundary will
+/// ratify under, not the one just ending. Passing the ending epoch here made
+/// `GetRatifyState` answer from a ratification run one epoch behind — caught
+/// on preview by the #988 detector (`boundary_epoch=743 predicted_at=741`),
+/// not by any test, because both the prediction and the application are
+/// self-consistent in isolation.
 pub(crate) fn epoch_boundary_governance_step(
-    epoch: EpochNo,
+    new_epoch: EpochNo,
     epochs: &EpochSubState,
     certs: &CertSubState,
     gov: &mut GovSubState,
@@ -1809,14 +1894,14 @@ pub(crate) fn epoch_boundary_governance_step(
         Arc::make_mut(&mut gov.governance).future_pparams =
             FuturePParams::PotentialPParamsUpdate(None);
         capture_drep_distribution_snapshot_impl(certs, gov);
-        capture_ratification_snapshot_impl(epoch, epochs.treasury.0, gov);
+        capture_ratification_snapshot_impl(new_epoch, epochs.treasury.0, gov);
         // Order matters: the pulser is computed FROM the snapshot just frozen,
         // so it must run after both captures. This is `setFreshDRepPulsingState`
         // — the result describes the ratification that will be applied at the
         // FOLLOWING boundary (#988).
-        let pulsed = compute_pulsed_ratify_state(epoch, epochs, certs, gov);
+        let pulsed = compute_pulsed_ratify_state(new_epoch, epochs, certs, gov);
         debug!(
-            epoch = epoch.0,
+            epoch = new_epoch.0,
             enacted = pulsed.enacted.len(),
             expired = pulsed.expired.len(),
             delayed = pulsed.delayed,
@@ -10221,6 +10306,144 @@ mod tests {
 mod pulser_tests {
     use super::*;
     use crate::state::test_fixtures::populated_ledger_state;
+
+    /// Every epoch-boundary path must ratify through [`ratify_at_boundary`].
+    ///
+    /// A source-level guard, because the failure it prevents is invisible at
+    /// runtime: a boundary that calls `ratify_proposals_impl` directly still
+    /// ratifies correctly and still passes every behavioural test — it just
+    /// silently stops comparing the outcome against the frozen plan. That is
+    /// how the detector came to exist in only the test-only path, and how a
+    /// "0 mismatches" result got recorded from a check that never ran.
+    #[test]
+    fn no_boundary_path_bypasses_the_pulser_check() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let boundary_paths = ["eras/conway.rs", "state/epoch.rs"];
+        for rel in boundary_paths {
+            let src = std::fs::read_to_string(root.join(rel))
+                .unwrap_or_else(|e| panic!("read {rel}: {e}"));
+            for (i, line) in src.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                assert!(
+                    !code.contains("ratify_proposals_impl("),
+                    "{rel}:{} calls ratify_proposals_impl directly. Epoch \
+                     boundaries must go through ratify_at_boundary, which also \
+                     checks the applied ratification against the plan the \
+                     pulser froze at the previous boundary (#988).",
+                    i + 1
+                );
+            }
+        }
+    }
+
+    /// The pulser must be stamped with the epoch the NEXT boundary ratifies
+    /// under — Haskell's `eNo`, not the epoch that just ended.
+    ///
+    /// `setFreshDRepPulsingState eNo` stores `dpCurrentEpoch = eNo`, and EPOCH
+    /// is only reached when `eNo == succ eL`, so `eNo` is the epoch STARTING at
+    /// the boundary. The next boundary's RATIFY then runs with
+    /// `reCurrentEpoch = dpCurrentEpoch`.
+    ///
+    /// Passing the ending epoch made `GetRatifyState` answer from a
+    /// ratification run one epoch behind. No unit test caught it, because the
+    /// prediction and the application are each self-consistent in isolation —
+    /// only comparing them across a real boundary shows it, which is what the
+    /// preview run did (`boundary_epoch=743 predicted_at=741`).
+    #[test]
+    fn pulser_is_stamped_with_the_epoch_the_next_boundary_ratifies_under() {
+        let mut st = populated_ledger_state();
+        let ending = st.epoch;
+        let starting = EpochNo(ending.0 + 1);
+        Arc::make_mut(&mut st.gov.governance).pulsed_ratify_state = None;
+
+        epoch_boundary_governance_step(starting, &st.epochs, &st.certs, &mut st.gov);
+
+        let stamp = st
+            .gov
+            .governance
+            .pulsed_ratify_state
+            .as_ref()
+            .expect("a pulser must be frozen")
+            .computed_at_epoch;
+        assert_eq!(
+            stamp, starting,
+            "the pulser carries Haskell's `eNo` (the epoch STARTING at this \
+             boundary), because that is the `reCurrentEpoch` the next \
+             boundary's RATIFY will use — not the epoch that just ended \
+             ({ending:?})"
+        );
+    }
+
+    /// #988: the detector must actually FIRE on a mismatch.
+    ///
+    /// It was written inline in the `#[doc(hidden)]` test-only boundary path,
+    /// so it never ran on a real node and the "0 mismatches observed" evidence
+    /// recorded when #988 was closed was measuring nothing. A detector nobody
+    /// has seen go off is indistinguishable from no detector, so this plants a
+    /// deliberately wrong plan and asserts the WARN happens.
+    #[test]
+    fn pulser_mismatch_is_detected() {
+        use tracing::subscriber;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Default, Clone)]
+        struct Caught(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Caught {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if *event.metadata().level() == tracing::Level::WARN {
+                    self.0.lock().unwrap().push(event.metadata().name().into());
+                }
+                struct V(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+                impl tracing::field::Visit for V {
+                    fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                        if f.name() == "message" {
+                            self.0.lock().unwrap().push(format!("{v:?}"));
+                        }
+                    }
+                }
+                event.record(&mut V(self.0.clone()));
+            }
+        }
+
+        let caught = Caught::default();
+        let sink = caught.clone();
+        let mut st = populated_ledger_state();
+
+        // A plan that claims something will enact which cannot: a gov action
+        // id that is not in the proposal set at all.
+        Arc::make_mut(&mut st.gov.governance).pulsed_ratify_state = Some(PulsedRatifyState {
+            computed_at_epoch: st.epoch,
+            enacted: vec![GovActionId {
+                transaction_id: Hash32::from_bytes([0xAB; 32]),
+                action_index: 0,
+            }],
+            expired: Vec::new(),
+            delayed: false,
+            cur_pparams: st.epochs.protocol_params.clone(),
+            has_pparams_changes: false,
+        });
+
+        subscriber::with_default(tracing_subscriber::registry().with(caught.clone()), || {
+            ratify_at_boundary(
+                st.epoch,
+                EpochNo(st.epoch.0 + 1),
+                &mut st.epochs,
+                &mut st.certs,
+                &mut st.gov,
+            );
+        });
+
+        let msgs = sink.0.lock().unwrap().join(" | ");
+        assert!(
+            msgs.contains("did not match the applied ratification"),
+            "the #988 detector must WARN when the frozen plan and the applied \
+             ratification disagree; captured: {msgs}"
+        );
+    }
 
     /// #988: the boundary must freeze a pulser result, stamped with the
     /// boundary it was computed at.
