@@ -113,8 +113,29 @@ impl PaymentVerificationKey {
         blake2b_224(&self.to_bytes())
     }
 
+    /// Verify an Ed25519 signature the way cardano-node does.
+    ///
+    /// Uses `verify_strict`, NOT the permissive `Verifier::verify`. cardano-base
+    /// implements Ed25519 DSIGN over libsodium's `crypto_sign_verify_detached`,
+    /// which rejects a small-order or non-canonical public key and a small-order
+    /// `R` outright. `ed25519_dalek`'s default `verify` accepts all of those.
+    ///
+    /// That difference is a consensus divergence in the accept-where-Haskell-
+    /// rejects direction. Concretely, with `A` = the identity point
+    /// (`0x01 00 … 00`), `R` = identity and `s` = 0, the cofactorless equation
+    /// `[s]B = R + [k]A` degenerates to `identity = identity` and verification
+    /// succeeds for ANY message — so a Byron bootstrap witness carrying those
+    /// bytes authenticated an arbitrary transaction. dugite would accept the
+    /// block; every cardano-node peer would reject it, which is the #996 wedge
+    /// shape (a Haskell peer that refuses a block re-requests it forever).
+    ///
+    /// Found by `fuzz_bootstrap_witness_sizes` on the first nightly run after
+    /// the workflow was repaired — the fuzzers had been failing to build.
+    ///
+    /// Legitimate signatures are unaffected: real keys and real `R` values have
+    /// full order, so the added checks only ever reject degenerate input.
     pub fn verify(&self, message: &[u8], signature: &[u8]) -> Result<(), KeyError> {
-        use ed25519_dalek::{Signature, Verifier};
+        use ed25519_dalek::Signature;
         if signature.len() != 64 {
             return Err(KeyError::InvalidLength {
                 expected: 64,
@@ -123,7 +144,7 @@ impl PaymentVerificationKey {
         }
         // Safety: signature.len() == 64 is verified above, so try_into cannot fail
         let sig = Signature::from_bytes(signature.try_into().expect("64-byte slice"));
-        self.inner.verify(message, &sig)?;
+        self.inner.verify_strict(message, &sig)?;
         Ok(())
     }
 
@@ -342,5 +363,52 @@ mod tests {
         let json = serde_json::to_string_pretty(&envelope).unwrap();
         let recovered: TextEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(envelope.type_, recovered.type_);
+    }
+}
+
+#[cfg(test)]
+mod small_order_tests {
+    use super::*;
+
+    /// The identity point as a public key, with `R` = identity and `s` = 0,
+    /// verifies under the cofactorless equation for ANY message. libsodium —
+    /// and therefore cardano-node — rejects it; `ed25519_dalek::verify` accepts
+    /// it. dugite must reject, or it accepts a Byron bootstrap witness every
+    /// Haskell peer refuses.
+    #[test]
+    fn identity_public_key_with_zero_signature_is_rejected() {
+        let mut vkey = [0u8; 32];
+        vkey[0] = 1; // canonical encoding of the identity point
+        let mut sig = [0u8; 64];
+        sig[0] = 1; // R = identity, s = 0
+
+        let vk = PaymentVerificationKey::from_bytes(&vkey)
+            .expect("identity point is a decodable Ed25519 key");
+        assert!(
+            vk.verify(b"any message at all", &sig).is_err(),
+            "a small-order public key must never authenticate anything — \
+             cardano-node's libsodium rejects it, so dugite must too"
+        );
+        assert!(
+            vk.verify(b"a completely different message", &sig).is_err(),
+            "the same degenerate pair must not verify for a second message either"
+        );
+    }
+
+    /// The strictness must not cost us real signatures.
+    #[test]
+    fn genuine_signatures_still_verify() {
+        let sk = PaymentSigningKey::generate();
+        let vk = sk.verification_key();
+        let msg = b"a real transaction body hash";
+        let sig = sk.sign(msg);
+        assert!(
+            vk.verify(msg, sig.as_ref()).is_ok(),
+            "verify_strict must still accept an honestly produced signature"
+        );
+        assert!(
+            vk.verify(b"tampered", sig.as_ref()).is_err(),
+            "a signature over a different message must still fail"
+        );
     }
 }

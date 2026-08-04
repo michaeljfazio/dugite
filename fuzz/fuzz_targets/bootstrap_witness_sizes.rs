@@ -6,8 +6,8 @@
 //! bootstrap witness verification — zero cryptographic verification on Byron-era inputs.
 //!
 //! The fix introduces `verify_single_bootstrap_witness` with:
-//!   - Pre-flight: vkey=64, sig=64, chain_code=32 (malformed → hard reject)
-//!   - Ed25519 verify over vkey[0..32] (the scalar part of the extended key)
+//!   - Pre-flight: vkey=32, sig=64, chain_code=32 (malformed → hard reject)
+//!   - Ed25519 verify over the 32-byte public_key directly
 //!   - Address-binding: root = blake2b_224(sha3_256(CBOR([0, [0, vkey64], attrs])))
 //!
 //! This fuzz target stresses the Phase-1 validation pipeline with arbitrary bootstrap
@@ -176,8 +176,20 @@ fuzz_target!(|data: &[u8]| {
     let result = validate_transaction(&tx, &utxo_set, &params, 1_000_000, 300, None);
 
     // Invariant 2: Malformed sizes → MUST be rejected, never silently skipped.
-    // "Silent skip" was the pre-fix bug: 64-byte vkey triggers len()!=32 guard → Ok.
-    let sizes_malformed = vkey_len != 64 || sig_len != 64 || chain_code_len != 32;
+    // "Silent skip" was the pre-fix bug: a 64-byte vkey tripped the len()!=32
+    // guard in the generic verifier and skipped verification entirely.
+    //
+    // The canonical `public_key` is 32 bytes, NOT 64. Shelley CDDL:
+    //     bootstrap_witness = [ public_key : $vkey        ; $vkey = bytes .size 32
+    //                         , signature  : $signature   ; bytes .size 64
+    //                         , chain_code : bytes .size 32
+    //                         , attributes : bytes ]
+    // The 64-byte Byron *extended* key is public_key||chain_code, and the two
+    // halves travel in separate fields here; only address-root derivation
+    // recombines them. This target asserted 64 and therefore demanded that a
+    // perfectly canonical witness be rejected — it happened to hold only while
+    // every such witness failed the signature check for some other reason.
+    let sizes_malformed = vkey_len != 32 || sig_len != 64 || chain_code_len != 32;
     if sizes_malformed {
         assert!(
             result.is_err(),
@@ -185,6 +197,6 @@ fuzz_target!(|data: &[u8]| {
              vkey={vkey_len}, sig={sig_len}, chain_code={chain_code_len}"
         );
     }
-    // When sizes are canonical (64/64/32) the validator may still reject (bad sig,
+    // When sizes are canonical (32/64/32) the validator may still reject (bad sig,
     // address-binding mismatch with zero-root UTxO) — we only assert no-panic.
 });
