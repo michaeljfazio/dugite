@@ -126,6 +126,23 @@ EOF
         echo "2026-08-02T00:00:01Z,check$i,v1alpha,svc/Method,PASS,ok"
       done
     } > "$d/rpc.csv"
+
+    # The two continuous boundary-parity samplers (#977, #988). Both are
+    # `any`-scoped: required in at least one round, not every round. Their
+    # verdict column is `verdict` and their vocabularies differ, so both are in
+    # VERDICT_CSVS and both are exercised by the vocabulary cases below.
+    { echo "ts,slot,epoch,dugite_tag,cardano_tag,equal,verdict"
+      for i in $(seq 1 40); do
+        echo "2026-08-02T00:00:0${i}Z,$((800+i)),2,NoPParamsUpdate,NoPParamsUpdate,true,MATCH"
+      done
+    } > "$d/futurepparams-parity.csv"
+
+    { echo "ts,slot,epoch,socket_agree,dugite,cardano,verdict"
+      for i in $(seq 1 40); do
+        echo "2026-08-02T00:00:0${i}Z,$((800+i)),2,true,{},{},MATCH"
+      done
+      echo "2026-08-02T00:00:41Z,1200,3,true,{},,PLAN_APPLIED"
+    } > "$d/ratify-state-parity.csv"
 }
 
 # ---- Case runner -------------------------------------------------------------
@@ -250,7 +267,7 @@ run_case "cli-parity below pinned denominator fails" 3 "below the pinned" "$R1" 
 # --- Case 7: --no-strict records the omission instead of hiding it ---
 # Non-strict must still be HONEST: exit 0 is allowed, silence is not.
 R1="$TMP/nostrict/r1"
-make_round "$R1"; rm -f "$R1/cli-parity.csv" "$R1/n2n-trace.csv" "$R1/parity-matrix.csv" "$R1/chaos-events.csv" "$R1/rpc.csv"
+make_round "$R1"; rm -f "$R1/cli-parity.csv" "$R1/n2n-trace.csv" "$R1/parity-matrix.csv" "$R1/chaos-events.csv" "$R1/rpc.csv" "$R1/futurepparams-parity.csv" "$R1/ratify-state-parity.csv"
 OUTD="$TMP/out-nostrict"
 "$GEN" --preset standard --no-strict --output-dir "$OUTD" --denominators "$DENOM" "$R1" >/dev/null 2>&1
 rc=$?
@@ -358,19 +375,22 @@ fi
 # `status` reads "ok" and the round passes with pass=0. Now generalised from
 # chaos to every verdict CSV, so any suite whose outcomes were never read is
 # reported rather than serialized as a clean sweep.
-for vf in chaos-events.csv n2n-trace.csv rpc.csv cli-parity.csv parity-matrix.csv; do
+#
+# The file list and each file's verdict header are READ OUT OF THE GENERATOR's
+# own `VERDICT_CSVS` table rather than restated here. A second copy is how this
+# case came to cover five CSVs while the generator guarded seven — the same
+# N-copies drift the guard itself exists to catch.
+while IFS='|' read -r vf vhdr _vocab; do
+    [ -n "$vf" ] || continue
     R1="$TMP/unclassified-${vf%%.*}/r1"; R2="$TMP/unclassified-${vf%%.*}/r2"
     make_round "$R1"; make_round "$R2"
     for d in "$R1" "$R2"; do
         # Overwrite every verdict cell with a value outside the vocabulary,
         # leaving the row count untouched.
-        python3 - "$d/$vf" <<'PYEOF'
+        python3 - "$d/$vf" "$vhdr" <<'PYEOF'
 import csv, sys, pathlib
-f = pathlib.Path(sys.argv[1])
+f, hdr = pathlib.Path(sys.argv[1]), sys.argv[2]
 rows = list(csv.reader(f.open()))
-hdr = {"chaos-events.csv": "result", "n2n-trace.csv": "outcome",
-       "rpc.csv": "status", "cli-parity.csv": "status",
-       "parity-matrix.csv": "match"}[f.name]
 i = rows[0].index(hdr)
 for r in rows[1:]:
     r[i] = "unreadable"
@@ -379,7 +399,9 @@ with f.open("w", newline="") as fh:
 PYEOF
     done
     run_case "$vf with no classified rows fails the gate" 3 "none classified" "$R1" "$R2"
-done
+done <<EOF
+$(sed -n "/^VERDICT_CSVS='/,/'\$/p" "$GEN" | sed "s/^VERDICT_CSVS='//; s/'\$//")
+EOF
 
 # --- Case 8b: CLASSDIFF rows are counted separately from OFFDIAG ---
 # "both rejected" is weaker than it looks: same verdict for a different reason

@@ -154,6 +154,8 @@ n2n_trace|n2n-trace.csv|any
 parity_matrix|parity-matrix.csv|any
 chaos_events|chaos-events.csv|any
 rpc|rpc.csv|any
+futurepparams_parity|futurepparams-parity.csv|any
+ratify_state_parity|ratify-state-parity.csv|any
 EOF
             ;;
         extended)
@@ -170,6 +172,8 @@ n2n_trace|n2n-trace.csv|any
 parity_matrix|parity-matrix.csv|any
 chaos_events|chaos-events.csv|any
 rpc|rpc.csv|any
+futurepparams_parity|futurepparams-parity.csv|any
+ratify_state_parity|ratify-state-parity.csv|any
 throughput|throughput.csv|any
 resource_samples|resource-samples.csv|any
 log_anomalies|log-anomalies.csv|any
@@ -793,7 +797,9 @@ VERDICT_CSVS='chaos-events.csv|result|PASS FAIL ENV_SKIP
 n2n-trace.csv|outcome|PASS REJECTED PANIC SILENT_SKIP ERROR
 rpc.csv|status|PASS FAIL ERROR SKIP
 cli-parity.csv|status|EQUAL DIVERGENT COMPARED SKIP ERROR
-parity-matrix.csv|match|MATCH OFFDIAG CLASSDIFF KNOWNDIFF STATEFUL'
+parity-matrix.csv|match|MATCH OFFDIAG CLASSDIFF KNOWNDIFF STATEFUL
+futurepparams-parity.csv|verdict|MATCH DIFF TIP_UNSTABLE
+ratify-state-parity.csv|verdict|MATCH DIFF TIP_UNSTABLE PLAN_APPLIED PLAN_NOT_APPLIED'
 for i in "${!EVIDENCE_DIRS[@]}"; do
     rname="${ROUND_NAMES[$i]:-round$i}"
     while IFS='|' read -r vfile vhdr vvocab; do

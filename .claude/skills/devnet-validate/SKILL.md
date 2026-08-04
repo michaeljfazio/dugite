@@ -285,10 +285,40 @@ TRICKLE=$!
     --seconds 900 --out "$LD_EVIDENCE/current/futurepparams-parity.csv" &
 FPP=$!
 
+# Frozen-DRep-pulser parity (#988/#990/#991/#992), same reasoning and same
+# duration. `nextRatifyState` is Haskell's `queryRatifyState = snd .
+# finishedPulserState` — the ratification decided at the LAST boundary, which
+# the NEXT one applies verbatim. That makes it a consensus check, not only a
+# query check: #991 (doubled proposal deposits inflating `dRepAcceptedRatio`)
+# has NO other external symptom, because `GetDRepStakeDistr` serves the
+# distribution itself, which was never doubled.
+../../.claude/skills/devnet-validate/scripts/ratify-state-parity.sh \
+    --seconds 900 --out "$LD_EVIDENCE/current/ratify-state-parity.csv" &
+RSP=$!
+
+# The gov lifecycle must run DURING this round, or the sampler above sees an
+# empty `nextRatifyState` from end to end — and an empty answer is exactly what
+# #992's hardcoded pulser produced, so an all-empty run cannot tell the two
+# apart. It reports INCONCLUSIVE rather than passing in that case.
+( for s in 10-gov-lifecycle/10a-propose-param-change.sh \
+           10-gov-lifecycle/10b-drep-vote.sh \
+           10-gov-lifecycle/10c-spo-vote.sh \
+           10-gov-lifecycle/10d-cc-vote.sh; do
+      ./tx-zoo/"$s" >/dev/null 2>&1 || break
+  done ) &
+GOV=$!
+
 ./soak.sh 900                       # 15 min — covers boundaries 0→1 AND 1→2 (first RUPD)
 kill $TRICKLE 2>/dev/null
+wait $GOV 2>/dev/null
 wait $FPP; FPP_RC=$?
+wait $RSP; RSP_RC=$?
 [ "$FPP_RC" -eq 0 ] || { echo "FUTUREPPARAMS PARITY FAIL/INCONCLUSIVE (rc=$FPP_RC)"; exit 1; }
+[ "$RSP_RC" -eq 0 ] || { echo "RATIFY-STATE PARITY FAIL/INCONCLUSIVE (rc=$RSP_RC)"; exit 1; }
+
+# The enactment assertion itself, once the boundary that applies the plan has
+# passed.
+./tx-zoo/10-gov-lifecycle/10e-assert-enactment.sh || { echo "GOV ENACTMENT FAIL"; exit 1; }
 
 # Pot-movement parity check at end (must be post-boundary 1→2, i.e. epoch >= 2)
 DBP_T=$(curl -s localhost:12798/metrics | awk '/^dugite_treasury_lovelace /{print $2}')
@@ -314,6 +344,7 @@ echo "haskell treasury=$HSK_T reserves=$HSK_R"
 - `analyze-evidence.sh` chain-density proxy (canonical blocks ÷ slots) stays within ±20% of `activeSlotsCoeff` (0.5 on devnet)
 - After boundary 1→2: `dugite_treasury_lovelace > 0` AND `dugite_reserves_lovelace < genesis_reserves` (RUPD applied)
 - `dugite_treasury_lovelace` **byte-exactly equals** `cardano-bp.esChainAccountState.treasury` AND `dugite_reserves_lovelace` **byte-exactly equals** `cardano-bp.esChainAccountState.reserves` (the only acceptable ledger semantic per `feedback_haskell_byte_exact_only`)
+- `ratify-state-parity.sh` exits 0 — zero `DIFF` rows in `evidence/<ts>/ratify-state-parity.csv`, zero `PLAN_NOT_APPLIED` rows, at least one boundary crossed, and at least one **non-empty** `nextRatifyState` sampled. The last condition is the one that matters: dugite and cardano-node agreeing that nothing is about to enact is not evidence, and it is precisely what #992's hardcoded empty pulser produced for every sample of every previous release gate
 - `futurepparams-boundary-parity.sh` exits 0 — zero `DIFF` rows, at least one boundary crossed, and at least one `PotentialPParamsUpdate` sample actually observed. It exits non-zero on "no boundary crossed" and on "boundary crossed but the post-boundary window never sampled" **as well as** on a real divergence: a run that never entered the interesting state proves nothing, and reporting that as a pass is the failure family #953/#987 kept finding
 - Boundary 0→1 having `treasury=0, reserves=genesis` is **expected and correct**: epoch 0's pulser runs (anchor `4k/f=320` fits inside `epoch_len=400`) but applies at boundary 1→2, not 0→1; the pot-movement check applies post-1→2 only
 
