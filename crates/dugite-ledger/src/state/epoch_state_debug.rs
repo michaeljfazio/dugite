@@ -506,20 +506,20 @@ fn governance_summary(
     proposal_deposit_total: u64,
     drep_deposit_total: u64,
 ) -> GovernanceSummary {
-    // Top-20 DReps by voting power.  Voting power is taken from the
-    // boundary snapshot (`drep_distribution_snapshot`) because that is
-    // what ratification uses; the live `vote_delegations` map is in
-    // flux.
+    // Top-20 DReps by voting power.  Voting power is taken from the DRep
+    // pulser's frozen `drep_distr` (#988's `psDRepDistr`) because that is
+    // what ratification uses; the live `vote_delegations` map is in flux.
+    //
+    // The pulser is absent only before the first epoch boundary has run, in
+    // which case every DRep reports 0 — the same answer the pre-#988 empty
+    // snapshot gave.
+    let drep_distr = gov.pulsing_snapshot().map(|s| &s.drep_distr);
     let dreps: Vec<DRepEntry> = gov
         .dreps
         .iter()
         .filter(|(_, d)| d.active)
         .map(|(hash, d)| {
-            let voting_power = gov
-                .drep_distribution_snapshot
-                .get(hash)
-                .copied()
-                .unwrap_or(0);
+            let voting_power = drep_distr.and_then(|m| m.get(hash)).copied().unwrap_or(0);
             DRepEntry {
                 drep_id_hex: hash.to_hex(),
                 voting_power,
