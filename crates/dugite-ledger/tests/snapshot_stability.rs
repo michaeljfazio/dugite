@@ -112,7 +112,7 @@ fn snapshot_format_hash_stability() {
     //     layout change and this test stayed GREEN through it, because
     //     `ratification_snapshot` was `None` in the fixture — which is what
     //     #967 is about.)
-    const EXPECTED_HASH: &str = "4bc1ca12491c041e064242ea18af63282ee7f1e3bfa959db6010d19ffe4200c0";
+    const EXPECTED_HASH: &str = "474c7869c31088f4310932825ca44657df5be7bfebd1da93abf57732b1f72f2e";
 
     if EXPECTED_HASH == "COMPUTE_ON_FIRST_RUN" {
         panic!(

@@ -760,16 +760,27 @@ impl Node {
             // Haskell keeps both predefined DReps in the SAME `psDRepDistr` map
             // and does not special-case them (`addToDRepDistr` takes
             // `updatedDistr` unconditionally for both), so emit them alongside.
-            entries.push(DRepStakeEntry {
-                drep_type: 2,
-                drep_hash: None,
-                stake: pulser.map_or(0, |s| s.drep_abstain),
-            });
-            entries.push(DRepStakeEntry {
-                drep_type: 3,
-                drep_hash: None,
-                stake: pulser.map_or(0, |s| s.drep_no_confidence),
-            });
+            // Emitted only when something actually delegates to them.
+            // `psDRepDistr` is one map whose keys are created by
+            // `Map.insertWith` per delegating account, so an undelegated
+            // predefined DRep is ABSENT — not present with zero. dugite used to
+            // pad both in unconditionally, so every reply carried
+            // `drep-alwaysAbstain: 0` / `drep-alwaysNoConfidence: 0` where
+            // cardano-node returned `{}` (#994).
+            if pulser.is_some_and(|s| s.drep_abstain_delegated) {
+                entries.push(DRepStakeEntry {
+                    drep_type: 2,
+                    drep_hash: None,
+                    stake: pulser.map_or(0, |s| s.drep_abstain),
+                });
+            }
+            if pulser.is_some_and(|s| s.drep_no_confidence_delegated) {
+                entries.push(DRepStakeEntry {
+                    drep_type: 3,
+                    drep_hash: None,
+                    stake: pulser.map_or(0, |s| s.drep_no_confidence),
+                });
+            }
             entries
         };
 
