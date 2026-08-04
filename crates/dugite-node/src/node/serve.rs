@@ -290,105 +290,6 @@ impl UtxoQueryProvider for LedgerUtxoProvider {
 
 // ─── LedgerTxValidator ───────────────────────────────────────────────────────
 
-/// Project the live `LedgerState`'s Conway governance fields into the shapes
-/// expected by [`dugite_ledger::validation::ValidationContext`]:
-///
-/// * `active_proposals`: every active on-chain governance proposal keyed by
-///   its `GovActionId`, carrying enough state for the cross-tx voting
-///   predicates (`DisallowedVoters`, `VotingOnExpiredGovAction`,
-///   `ProposalReturnAccountDoesNotExist`).
-/// * `committee_authorized_hot_keys`: the set of hot credentials that have
-///   been authorised by Constitutional Committee members.  Used by
-///   `VotersDoNotExist` to reject votes from a CC voter whose hot
-///   credential is unknown to the ledger.
-///
-/// Mirrors Haskell's `GovEnv` exposing both `proposals` and
-/// `authorizedHotCommitteeCredentials` to the GOV rule.
-#[allow(clippy::type_complexity)]
-fn build_governance_validation_state(
-    ledger: &LedgerState,
-) -> (
-    std::collections::HashMap<
-        dugite_primitives::transaction::GovActionId,
-        dugite_ledger::validation::ActiveProposal,
-    >,
-    std::collections::HashSet<dugite_primitives::hash::Hash32>,
-    std::collections::HashSet<dugite_primitives::hash::Hash32>,
-    std::collections::HashSet<dugite_primitives::hash::Hash32>,
-    std::collections::HashSet<dugite_primitives::hash::Hash32>,
-) {
-    let active_proposals = ledger
-        .gov
-        .governance
-        .proposals
-        .iter()
-        .map(|(id, state)| {
-            (
-                id.clone(),
-                dugite_ledger::validation::ActiveProposal {
-                    gov_action: state.procedure.gov_action.clone(),
-                    return_addr: state.procedure.return_addr.clone(),
-                    deposit: state.procedure.deposit,
-                    expires_after_epoch: state.expires_epoch,
-                    proposed_in_epoch: state.proposed_epoch,
-                },
-            )
-        })
-        .collect();
-    let committee_hot_keys: std::collections::HashSet<dugite_primitives::hash::Hash32> = ledger
-        .gov
-        .governance
-        .committee_hot_keys
-        .values()
-        .copied()
-        .collect();
-    // Mempool admission must enforce the same Conway predicate failures the
-    // block-apply path does — without these two sets, `CommitteeHotAuth`
-    // certificates with unelected (or resigned) cold keys are silently admitted
-    // and forged into blocks that cardano-node correctly rejects. See #551.
-    let committee_members = ledger
-        .gov
-        .governance
-        .committee_expiration
-        .keys()
-        .copied()
-        .collect();
-    let committee_resigned = ledger
-        .gov
-        .governance
-        .committee_resigned
-        .keys()
-        .copied()
-        .collect();
-    // `authorizedElectedHotCommitteeCredentials` in Haskell:
-    //   intersection of csCommitteeCreds (cold→hot, post-resignation) and
-    //   the enacted-committee cold-key set (committee_expiration here).
-    // Used by the PV >= 11 `UnelectedCommitteeVoters` predicate.
-    let committee_authorized_elected_hot_keys: std::collections::HashSet<
-        dugite_primitives::hash::Hash32,
-    > = ledger
-        .gov
-        .governance
-        .committee_hot_keys
-        .iter()
-        .filter(|(cold, _)| {
-            ledger
-                .gov
-                .governance
-                .committee_expiration
-                .contains_key(*cold)
-        })
-        .map(|(_, hot)| *hot)
-        .collect();
-    (
-        active_proposals,
-        committee_hot_keys,
-        committee_members,
-        committee_resigned,
-        committee_authorized_elected_hot_keys,
-    )
-}
-
 /// Validates transactions against the live ledger state (Phase-1 + Phase-2 Plutus).
 ///
 /// When `mempool` is provided, validation uses a `CompositeUtxoView` that
@@ -435,55 +336,19 @@ impl TxValidator for LedgerTxValidator {
         let utxo_view =
             dugite_ledger::utxo::CompositeUtxoView::new(&ledger.utxo.utxo_set, virtual_utxos);
 
-        // Build ledger context for validation — pool re-registrations need the
-        // registered pool set to avoid charging a duplicate deposit (#436).
-        let registered_pool_ids: std::collections::HashSet<dugite_primitives::hash::Hash28> =
-            ledger.certs.pool_params.keys().copied().collect();
-
-        // Plumb the on-chain Conway governance state into the validator so the
-        // cross-tx voting predicates (`DisallowedVoters`, `VotersDoNotExist`,
-        // `VotingOnExpiredGovAction`) can reject votes against active on-chain
-        // proposals — not just proposals submitted in the same transaction.
+        // The ledger-derived context — pool/DRep/VRF registries, the Conway
+        // governance state (so `DisallowedVoters`, `VotersDoNotExist`,
+        // `VotingOnExpiredGovAction`, `InvalidPrevGovActionId` and the
+        // committee predicates fire here and not first at forge time), the
+        // reward accounts behind `WithdrawalsNotInRewardsCERTS`, and the
+        // deposit/treasury/epoch terms.
         //
-        // Mirrors Haskell's GovEnv exposing both `proposals` and
-        // `authorizedHotCommitteeCredentials` to the GOV rule.
-        let (
-            active_proposals,
-            committee_hot_keys,
-            committee_members,
-            committee_resigned,
-            committee_authorized_elected_hot_keys,
-        ) = build_governance_validation_state(&ledger);
-
-        // Populate the DRep registry so `VotersDoNotExist` checks reject DRep
-        // votes from credentials not yet registered on-chain.  Without this,
-        // the N2C path silently admitted invalid DRep votes (the lenient default
-        // for `registered_dreps = None` skips the check entirely).
-        let registered_drep_ids: std::collections::HashSet<dugite_primitives::hash::Hash32> =
-            ledger.gov.governance.dreps.keys().copied().collect();
-
-        let context = dugite_ledger::validation::ValidationContext::new()
-            .with_pools(registered_pool_ids)
-            .with_dreps(registered_drep_ids)
-            .with_active_proposals(active_proposals)
-            // InvalidPrevGovActionId (#912-adjacent P0): the mempool must reject
-            // a proposal that doesn't chain onto its purpose, or the forge mints
-            // a block cardano-node rejects with ShutdownPeer.
-            .with_enacted_gov_roots(ledger.enacted_gov_roots())
-            .with_committee_authorized_hot_keys(committee_hot_keys)
-            .with_committee_authorized_elected_hot_keys(committee_authorized_elected_hot_keys)
-            .with_committee_members(committee_members)
-            .with_committee_resigned(committee_resigned)
-            // Pass the live reward-accounts map (Arc::clone — refcount bump,
-            // not a deep copy) so the validator's
-            // `WithdrawalsNotInRewardsCERTS` / `ConwayIncompleteWithdrawals`
-            // checks fire at mempool admission. Round-1 retry surfaced a
-            // chain-divergence bug where dugite-relay admitted a 200K-ADA
-            // withdrawal for an account with insufficient rewards, dugite-bp
-            // forged the block, and cardano-bp rejected with
-            // `ConwayCertsFailure (WithdrawalsNotInRewardsCERTS ...)`.
-            // See audit-findings/2026-05-28-round1-retry.md.
-            .with_reward_accounts_imbl(ledger.certs.reward_accounts.clone())
+        // #996: this is now the SAME builder the post-block revalidation uses.
+        // It was previously hand-rolled here and was a strict subset of what
+        // block-apply builds, so each missing field was a way to admit a
+        // transaction that block-apply — and therefore cardano-node — rejects.
+        let context = ledger
+            .mempool_validation_context()
             .with_network(self.network);
 
         // Compute the per-tx safe-zone horizon and inject it into the
@@ -1328,13 +1193,14 @@ mod tests {
     use dugite_primitives::transaction::{Anchor, GovAction, GovActionId, ProposalProcedure};
     use dugite_primitives::value::Lovelace;
 
-    /// Verifies that `build_governance_validation_state` projects the live
-    /// `LedgerState` Conway governance fields into the shapes expected by
-    /// `ValidationContext`.  This is the production wiring used by the N2C
-    /// tx-submission path; getting the projection wrong would silently
-    /// disable the cross-tx voting predicates (`DisallowedVoters` etc.).
+    /// Verifies that `LedgerState::mempool_validation_context` projects the
+    /// live Conway governance fields into the shapes expected by
+    /// `ValidationContext`.  This is the production wiring used by BOTH the
+    /// N2C tx-submission path and the post-block revalidation (#996); getting
+    /// the projection wrong would silently disable the cross-tx voting
+    /// predicates (`DisallowedVoters` etc.).
     #[test]
-    fn build_governance_validation_state_projects_proposals_and_hot_keys() {
+    fn mempool_validation_context_projects_proposals_and_hot_keys() {
         let mut ledger = LedgerState::new(ProtocolParameters::mainnet_defaults());
 
         // Seed one active proposal and one committee hot-key authorisation.
@@ -1368,8 +1234,12 @@ mod tests {
             gov.committee_hot_keys.insert(cold_cred, hot_cred);
         }
 
-        let (active, hot_keys, _members, _resigned, _authorized_elected) =
-            build_governance_validation_state(&ledger);
+        let ctx = ledger.mempool_validation_context();
+        let active = ctx.active_proposals.clone().expect("proposals projected");
+        let hot_keys = ctx
+            .committee_authorized_hot_keys
+            .clone()
+            .expect("hot keys projected");
 
         // Proposal projection: every ActiveProposal field must mirror the
         // ProposalState/ProposalProcedure source.
@@ -1394,15 +1264,17 @@ mod tests {
     /// i.e. the cross-tx predicates default to no-op, matching the
     /// pre-task behaviour for chains that haven't entered Conway.
     #[test]
-    fn build_governance_validation_state_empty_for_fresh_ledger() {
+    fn mempool_validation_context_empty_for_fresh_ledger() {
         let ledger = LedgerState::new(ProtocolParameters::mainnet_defaults());
-        let (active, hot_keys, members, resigned, authorized_elected) =
-            build_governance_validation_state(&ledger);
-        assert!(active.is_empty());
-        assert!(hot_keys.is_empty());
-        assert!(members.is_empty());
-        assert!(resigned.is_empty());
-        assert!(authorized_elected.is_empty());
+        let ctx = ledger.mempool_validation_context();
+        assert!(ctx.active_proposals.expect("set").is_empty());
+        assert!(ctx.committee_authorized_hot_keys.expect("set").is_empty());
+        assert!(ctx.committee_members.expect("set").is_empty());
+        assert!(ctx.committee_resigned.expect("set").is_empty());
+        assert!(ctx
+            .committee_authorized_elected_hot_keys
+            .expect("set")
+            .is_empty());
     }
 
     // ─── convert_validation_error ────────────────────────────────────────────

@@ -4345,14 +4345,14 @@ impl Node {
             // Non-public-IP inbound peers NOT in this set are rejected, so
             // an adversarial peer cannot trick us into accepting connections
             // that appear to come from internal/intranet hosts.
-            let static_non_public_ips: std::collections::HashSet<std::net::IpAddr> = self
-                .peer_manager
-                .read()
-                .await
-                .static_topology_ips()
-                .into_iter()
-                .filter(|ip| crate::node::networking::is_non_public_ip(*ip))
-                .collect();
+            let static_topology_ips: std::collections::HashSet<std::net::IpAddr> =
+                self.peer_manager.read().await.static_topology_ips();
+            let static_non_public_ips: std::collections::HashSet<std::net::IpAddr> =
+                static_topology_ips
+                    .iter()
+                    .copied()
+                    .filter(|ip| crate::node::networking::is_non_public_ip(*ip))
+                    .collect();
 
             // A-001 / A-002 (security audit 2026-05-19): gate every inbound
             // connection through a Semaphore (global cap) and a ConnectionManager
@@ -4428,7 +4428,22 @@ impl Node {
                                     }
                                     // G1 (#547): per-IP sliding-window rate limit
                                     // (catches tight reconnect loops). 60-second window.
-                                    if !n2n_conn_mgr.check_and_record_inbound_ip(peer_addr.ip()).await {
+                                    //
+                                    // #996: local roots are EXEMPT. Upstream has no
+                                    // per-IP window at all — `Ouroboros.Network.Server
+                                    // .RateLimiting` is a global soft/hard limit plus an
+                                    // accept delay, and a local root peer is trusted and
+                                    // never throttled by source address. Applying a
+                                    // 5-per-60s window to a declared peer turns any
+                                    // reconnect churn into a long outage, and collapses
+                                    // every co-located or NAT'd peer into one bucket:
+                                    // on the devnet all three nodes are 127.0.0.1, so
+                                    // the limiter could not tell them apart and locked
+                                    // cardano-bp out of the chain. The window still
+                                    // applies to every IP the operator has not declared,
+                                    // which is where the DoS concern actually lives.
+                                    if !static_topology_ips.contains(&peer_addr.ip())
+                                        && !n2n_conn_mgr.check_and_record_inbound_ip(peer_addr.ip()).await {
                                         debug!(
                                             %peer_addr,
                                             "N2N inbound rejected: per-IP sliding-window rate limit exceeded"
@@ -8016,18 +8031,31 @@ impl Node {
                 .collect();
             let tip_slot = block_slot;
             let ls = self.ledger_state.read().await;
-            // Snapshot the currently-active gov action ids so we can drop any
-            // mempool tx whose votes reference a `GovActionId` that no longer
-            // exists in the proposals registry — typically because the action
-            // was ratified-and-removed at the most-recent epoch boundary, or
-            // expired. Mirrors the same check in `sync.rs::apply_fetched_block`
-            // so dugite-bp's own-forge path also drops stale votes. Without
-            // this, the next forged block carries a vote that cardano-node
-            // rejects with `ConwayGovFailure (GovActionsDoNotExist …)`.
-            let active_action_ids: std::collections::HashSet<
-                dugite_primitives::transaction::GovActionId,
-            > = ls.gov.governance.proposals.keys().cloned().collect();
+            // #996: this is dugite-bp's OWN-FORGE path — the one that minted
+            // the block cardano-node rejected with
+            // `ConwayCommitteeHasPreviouslyResigned` and then refused for the
+            // rest of the run. Like the two other revalidation sites it used to
+            // re-check a hand-written list (inputs, TTL, UTxO, gov-action
+            // votes), so any other predicate invalidated by the block just
+            // applied stayed invisible until a Haskell peer rejected the next
+            // block. Haskell's `reapplyTxs` re-runs every state-dependent
+            // predicate here; so do we now.
+            let slot_config = {
+                let mut sc = ls.slot_config;
+                let eh = self.era_history.read().await;
+                if let Some(h) = eh.safe_zone_horizon_slot(tip_slot) {
+                    sc.safe_zone_horizon_slot = Some(h);
+                }
+                sc
+            };
+            let virtual_utxos = self.mempool.virtual_utxo_snapshot();
+            let utxo_view =
+                dugite_ledger::utxo::CompositeUtxoView::new(&ls.utxo.utxo_set, virtual_utxos);
+            let ctx = ls.mempool_validation_context();
             self.mempool.revalidate_all(|tx| {
+                // Cheap first pass: an input consumed by the block just applied
+                // is gone even though the virtual-UTxO overlay may still list
+                // it.
                 if tx.body.inputs.iter().any(|i| consumed_inputs.contains(i)) {
                     return false;
                 }
@@ -8036,35 +8064,27 @@ impl Node {
                         return false;
                     }
                 }
-                for input in &tx.body.inputs {
-                    if !ls.utxo.utxo_set.contains(input)
-                        && self.mempool.lookup_virtual_utxo(input).is_none()
-                    {
-                        return false;
+                let tx_size = tx.raw_cbor.as_ref().map(|b| b.len() as u64).unwrap_or(0);
+                match dugite_ledger::validation::reapply_tx_for_mempool(
+                    tx,
+                    &utxo_view,
+                    &ls.epochs.protocol_params,
+                    tip_slot.0,
+                    tx_size,
+                    Some(&slot_config),
+                    ctx.clone(),
+                ) {
+                    Ok(()) => true,
+                    Err(errors) => {
+                        tracing::info!(
+                            tx_hash = %tx.hash,
+                            ?errors,
+                            "Mempool: tx became invalid at the new tip — evicting \
+                             before it can be forged (#996)"
+                        );
+                        false
                     }
                 }
-                // Drop txs whose votes reference a removed/expired gov action.
-                // Same-tx proposals are admissible by definition.
-                if !tx.body.voting_procedures.is_empty() {
-                    let local_action_ids: std::collections::HashSet<
-                        dugite_primitives::transaction::GovActionId,
-                    > = (0..tx.body.proposal_procedures.len())
-                        .map(|idx| dugite_primitives::transaction::GovActionId {
-                            transaction_id: tx.hash,
-                            action_index: idx as u32,
-                        })
-                        .collect();
-                    for votes in tx.body.voting_procedures.values() {
-                        for action_id in votes.keys() {
-                            if !active_action_ids.contains(action_id)
-                                && !local_action_ids.contains(action_id)
-                            {
-                                return false;
-                            }
-                        }
-                    }
-                }
-                true
             });
             drop(ls); // Release before update_query_state re-acquires.
         }

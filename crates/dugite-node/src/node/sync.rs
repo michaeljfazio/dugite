@@ -865,101 +865,22 @@ impl Node {
                 }
                 sc
             };
-
-            // Build governance context from the rolled-back ledger state so that
-            // votes referencing proposals that were rolled back are rejected.
-            // Matches `build_governance_validation_state` in serve.rs but
-            // inlined here to avoid a cross-module dependency on that private fn.
-            let active_proposals: std::collections::HashMap<
-                dugite_primitives::transaction::GovActionId,
-                dugite_ledger::validation::ActiveProposal,
-            > = ledger
-                .gov
-                .governance
-                .proposals
-                .iter()
-                .map(|(id, state)| {
-                    (
-                        id.clone(),
-                        dugite_ledger::validation::ActiveProposal {
-                            gov_action: state.procedure.gov_action.clone(),
-                            return_addr: state.procedure.return_addr.clone(),
-                            deposit: state.procedure.deposit,
-                            expires_after_epoch: state.expires_epoch,
-                            proposed_in_epoch: state.proposed_epoch,
-                        },
-                    )
-                })
-                .collect();
-            let committee_hot_keys: std::collections::HashSet<dugite_primitives::hash::Hash32> =
-                ledger
-                    .gov
-                    .governance
-                    .committee_hot_keys
-                    .values()
-                    .copied()
-                    .collect();
-            // Current members ∪ `members_to_add` of live UpdateCommittee
-            // proposals — Haskell GOVCERT accepts a CommitteeHotAuth from a
-            // potential FUTURE member too (`isPotentialFutureMember`).
-            let committee_members: std::collections::HashSet<dugite_primitives::hash::Hash32> =
-                ledger.gov.governance.committee_auth_eligible_members();
-            let committee_resigned: std::collections::HashSet<dugite_primitives::hash::Hash32> =
-                ledger
-                    .gov
-                    .governance
-                    .committee_resigned
-                    .keys()
-                    .copied()
-                    .collect();
-            let committee_authorized_elected_hot_keys: std::collections::HashSet<
-                dugite_primitives::hash::Hash32,
-            > = ledger
-                .gov
-                .governance
-                .committee_hot_keys
-                .iter()
-                .filter(|(cold, _)| {
-                    ledger
-                        .gov
-                        .governance
-                        .committee_expiration
-                        .contains_key(*cold)
-                })
-                .map(|(_, hot)| *hot)
-                .collect();
-            let registered_pool_ids: std::collections::HashSet<dugite_primitives::hash::Hash28> =
-                ledger.certs.pool_params.keys().copied().collect();
-            let registered_drep_ids: std::collections::HashSet<dugite_primitives::hash::Hash32> =
-                ledger.gov.governance.dreps.keys().copied().collect();
             let node_network = ledger.node_network;
+            let mut revalidated = 0usize;
+            let mut evicted = 0usize;
 
-            let mut revalidated = 0u64;
-            let mut evicted = 0u64;
             for tx in pending_txs {
                 let tx_size = tx.raw_cbor.as_ref().map(|b| b.len() as u64).unwrap_or(0);
-                let mut ctx = dugite_ledger::validation::ValidationContext::new()
-                    .with_active_proposals(active_proposals.clone())
-                    // Roots come from the ROLLED-BACK ledger, so a proposal
-                    // whose parent was undone by the rollback is re-rejected
-                    // rather than silently re-admitted.
-                    .with_enacted_gov_roots(ledger.enacted_gov_roots())
-                    .with_committee_authorized_hot_keys(committee_hot_keys.clone())
-                    .with_committee_authorized_elected_hot_keys(
-                        committee_authorized_elected_hot_keys.clone(),
-                    )
-                    .with_committee_members(committee_members.clone())
-                    .with_committee_resigned(committee_resigned.clone())
-                    .with_pools(registered_pool_ids.clone())
-                    .with_dreps(registered_drep_ids.clone())
-                    // Post-rollback the reward-account map may have shrunk
-                    // (a rolled-back block's reward credit reverted). Pass
-                    // the live `reward_accounts` so the
-                    // `WithdrawalsNotInRewardsCERTS` check evicts any
-                    // mempool tx whose declared withdrawal no longer
-                    // matches the new balance. Same fix-pattern as
-                    // serve.rs:LedgerTxValidator.
-                    .with_reward_accounts_imbl(ledger.certs.reward_accounts.clone());
+                // #996: the ONE shared ledger-derived context, identical to
+                // the one N2C admission and post-block revalidation use. This
+                // was a third hand-inlined copy ("to avoid a cross-module
+                // dependency on that private fn"), and copies drift: it was
+                // missing the VRF/deposit/treasury/epoch terms block-apply
+                // enforces. Roots come from the ROLLED-BACK ledger, so a
+                // proposal whose parent was undone is re-rejected rather than
+                // silently re-admitted; likewise a shrunken reward-account map
+                // re-evicts a now-oversized withdrawal.
+                let mut ctx = ledger.mempool_validation_context();
                 if let Some(net) = node_network {
                     ctx = ctx.with_network(net);
                 }
@@ -1932,9 +1853,31 @@ impl Node {
                 self.mempool.remove_txs(&confirmed_hashes);
             }
 
-            // Full revalidation against the updated ledger state.
-            // Build a set of consumed inputs for a quick first-pass check,
-            // plus check TTL against the new tip slot.
+            // ── Post-block mempool revalidation (#996) ───────────────────
+            //
+            // Haskell `Ouroboros.Consensus.Mempool.Impl.Common.revalidateTxsFor`
+            // re-checks EVERY remaining mempool transaction whenever the tip
+            // changes, via `reapplyTxs`; at the ledger layer that is
+            // `reapplyTx = internalApplyTxWithValidation (ValidateSuchThat
+            // (notElem lblStatic))`, i.e. re-run every state-dependent
+            // predicate and skip only the static ones.
+            //
+            // dugite used to re-check a HAND-WRITTEN LIST instead — consumed
+            // inputs, TTL, missing UTxO, dangling gov-action votes — so every
+            // other predicate was invisible once a tx had been admitted. Each
+            // entry on that list had been added reactively after a Haskell peer
+            // rejected one of our blocks (the gov-action-vote entry says so in
+            // its own comment), and the list was always one defect behind.
+            //
+            // #996 is the case that outran it: a `CommitteeHotAuth` was
+            // admitted while its cold credential was still serving, a later
+            // block carried that member's `CommitteeColdResign`, and nothing
+            // rechecked. dugite forged the now-invalid certificate and
+            // cardano-node rejected the block with
+            // `ConwayCommitteeHasPreviouslyResigned` — permanently, since the
+            // peer re-requests the same block on every reconnect. The
+            // transaction was valid at admission and invalid at forge time,
+            // which is precisely the window `reapplyTxs` exists to close.
             let consumed_inputs: std::collections::HashSet<_> = blocks
                 .iter()
                 .flat_map(|b| b.transactions.iter())
@@ -1942,23 +1885,34 @@ impl Node {
                 .collect();
             let current_slot = blocks.last().map(|b| b.slot());
 
-            // Also check if the tx's inputs exist in the on-chain UTxO set.
-            // This catches chained txs whose parents were removed: their inputs
-            // no longer exist in the UTxO set and mempool virtual UTxO.
             let ls = self.ledger_state.read().await;
-            // Snapshot the currently-active gov action ids so we can drop any
-            // mempool tx whose votes reference a `GovActionId` that no longer
-            // exists in the proposals registry — typically because the action
-            // was ratified-and-removed at the most-recent epoch boundary, or
-            // expired. Without this, dugite's forge picks up such votes and
-            // the resulting block is rejected by cardano-node with
-            // `ConwayGovFailure (GovActionsDoNotExist …)`, stalling the
-            // chain on every downstream Haskell observer.
-            let active_action_ids: std::collections::HashSet<
-                dugite_primitives::transaction::GovActionId,
-            > = ls.gov.governance.proposals.keys().cloned().collect();
+            let tip_slot = ls.tip.point.slot().map(|s| s.0).unwrap_or(0);
+            // Same safe-zone horizon the admission path injects, so a tx whose
+            // validity bound now crosses the horizon is evicted rather than
+            // forged (Haskell `TimeTranslationPastHorizon`).
+            let slot_config = {
+                let mut sc = ls.slot_config;
+                let eh = self.era_history.read().await;
+                if let Some(h) =
+                    eh.safe_zone_horizon_slot(dugite_primitives::time::SlotNo(tip_slot))
+                {
+                    sc.safe_zone_horizon_slot = Some(h);
+                }
+                sc
+            };
+            // Chained txs spend outputs that exist only in the mempool, so
+            // revalidation must see the same composite view admission did or it
+            // would evict every child on the next block.
+            let virtual_utxos = self.mempool.virtual_utxo_snapshot();
+            let utxo_view =
+                dugite_ledger::utxo::CompositeUtxoView::new(&ls.utxo.utxo_set, virtual_utxos);
+            let ctx = ls.mempool_validation_context();
+
             self.mempool.revalidate_all(|tx| {
-                // Reject if any input was consumed by the new block
+                // Cheap first pass: an input consumed by the block just applied
+                // is gone even though the virtual-UTxO overlay may still list
+                // it, so this is checked directly rather than left to the
+                // UTxO lookup below.
                 if tx
                     .body
                     .inputs
@@ -1967,45 +1921,33 @@ impl Node {
                 {
                     return false;
                 }
-                // Reject if TTL has expired (half-open: slot >= ttl means expired)
                 if let (Some(ttl), Some(slot)) = (tx.body.ttl, current_slot) {
                     if slot.0 >= ttl.0 {
                         return false;
                     }
                 }
-                // Reject if any input is not in on-chain UTxO or mempool virtual UTxO.
-                // This catches orphaned chained txs whose parents were removed.
-                for input in &tx.body.inputs {
-                    if !ls.utxo.utxo_set.contains(input)
-                        && self.mempool.lookup_virtual_utxo(input).is_none()
-                    {
-                        return false;
+
+                let tx_size = tx.raw_cbor.as_ref().map(|b| b.len() as u64).unwrap_or(0);
+                match dugite_ledger::validation::reapply_tx_for_mempool(
+                    tx,
+                    &utxo_view,
+                    &ls.epochs.protocol_params,
+                    tip_slot,
+                    tx_size,
+                    Some(&slot_config),
+                    ctx.clone(),
+                ) {
+                    Ok(()) => true,
+                    Err(errors) => {
+                        tracing::info!(
+                            tx_hash = %tx.hash,
+                            ?errors,
+                            "Mempool: tx became invalid at the new tip — evicting \
+                             before it can be forged (#996)"
+                        );
+                        false
                     }
                 }
-                // Reject if any vote references a gov action that no longer
-                // exists. Same-tx proposals are admissible by definition (the
-                // action enters the registry as part of this tx's apply step).
-                if !tx.body.voting_procedures.is_empty() {
-                    // Compute same-tx local action ids once per candidate.
-                    let local_action_ids: std::collections::HashSet<
-                        dugite_primitives::transaction::GovActionId,
-                    > = (0..tx.body.proposal_procedures.len())
-                        .map(|idx| dugite_primitives::transaction::GovActionId {
-                            transaction_id: tx.hash,
-                            action_index: idx as u32,
-                        })
-                        .collect();
-                    for votes in tx.body.voting_procedures.values() {
-                        for action_id in votes.keys() {
-                            if !active_action_ids.contains(action_id)
-                                && !local_action_ids.contains(action_id)
-                            {
-                                return false;
-                            }
-                        }
-                    }
-                }
-                true
             });
             drop(ls);
 
@@ -2265,16 +2207,29 @@ impl Node {
                             }
                             sc
                         };
-                        let utxo_ref = &ledger.utxo.utxo_set;
+                        let virtual_utxos = self.mempool.virtual_utxo_snapshot();
+                        let utxo_view = dugite_ledger::utxo::CompositeUtxoView::new(
+                            &ledger.utxo.utxo_set,
+                            virtual_utxos,
+                        );
+                        // #996: the epoch boundary is the point where the
+                        // governance registries change most — actions ratify
+                        // and leave `proposals`, committees rotate, DRep and
+                        // deposit state moves. Revalidating with the bare
+                        // `validate_transaction` (no ValidationContext at all)
+                        // meant every one of those predicates was skipped here,
+                        // so a tx invalidated BY the boundary survived it.
+                        let ctx = ledger.mempool_validation_context();
                         let evicted = self.mempool.revalidate_all(|tx| {
                             let tx_size = tx.raw_cbor.as_ref().map(|b| b.len() as u64).unwrap_or(0);
-                            dugite_ledger::validation::validate_transaction(
+                            dugite_ledger::validation::reapply_tx_for_mempool(
                                 tx,
-                                utxo_ref,
+                                &utxo_view,
                                 &new_params,
                                 current_slot,
                                 tx_size,
                                 Some(&slot_config),
+                                ctx.clone(),
                             )
                             .is_ok()
                         });
