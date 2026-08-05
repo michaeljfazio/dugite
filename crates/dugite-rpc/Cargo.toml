@@ -48,6 +48,9 @@ hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 num-bigint = { workspace = true }
+# Runtime FieldMask application over the FILE_DESCRIPTOR_SET we already
+# generate for gRPC reflection — see `src/masking.rs`.
+prost-reflect = { workspace = true }
 
 [build-dependencies]
 # tonic 0.14: codegen moved from `tonic-build`/`prost-build` into
@@ -60,3 +63,7 @@ tempfile = { workspace = true }
 # tonic-reflection registration to confirm the descriptor set is wire-
 # discoverable.
 tonic-reflection = { workspace = true }
+# Integration tests construct `prost_types::FieldMask` literals directly
+# to drive real FieldMask requests over the wire (masking.rs tests cover
+# the pruning logic in isolation; these prove it end-to-end).
+prost-types = { workspace = true }
