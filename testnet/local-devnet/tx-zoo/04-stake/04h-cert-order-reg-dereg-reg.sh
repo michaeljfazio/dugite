@@ -1,11 +1,40 @@
 #!/usr/bin/env bash
-# 04h — one tx carrying reg/dereg/reg/dereg/reg (5 certs, odd count) for a
-# FRESH stake key. Certificates apply in sequence WITHIN one tx, so the final
-# state must be REGISTERED and the net deposit charged exactly once (the
-# alternating +D/-D/+D/-D/+D telescopes to a single +D).
+# 04h — submit reg/dereg/reg/dereg/reg (5 certificate-file args, odd count)
+# for a FRESH stake key in one tx, mirroring cardano-node-tests'
+# test_addr_registration_certificate_order EXACTLY (same file passed 5x).
+#
+# What actually reaches the wire is NOT 5 certs. `cardano-cli conway
+# transaction build` collapses certificate-file arguments through a
+# client-side Set/OSet before it ever serialises CBOR: this is confirmed by
+# `tx-cbor-tool.py show-certs` on the built raw body, which reports
+# cert_count=2, tags=[7,8] (registration, deregistration) — the 3 duplicate
+# entries never leave the CLI. Both dugite and cardano-node therefore receive
+# and apply the IDENTICAL 2-cert sequence [reg, dereg], never the 5 upstream
+# intended to prove an ordering effect with.
+#
+# This is not a dugite gap or a script bug to route around — it is the exact
+# known, still-open cardano-ledger defect upstream's own test documents and
+# XFAILs on for every Conway protocol version (9, 10, 11):
+# cardano-ledger#4566 "Repeated certificates stripped from Conway
+# transaction" (see cardano-node-tests/cardano_node_tests/tests/issues.py
+# `ledger_4566`, referenced from
+# test_addr_registration.py::test_addr_registration_certificate_order, which
+# calls `issues.ledger_4566.finish_test(force_blocked=True)` and never
+# reaches its own "must be REGISTERED" assertion at PV9-11).
+#
+# So this script asserts what ACTUALLY happens end-to-end, which is a parity
+# claim rather than the originally-intended ordering claim: after the
+# stripped [reg, dereg] pair applies, the stake address ends up
+# DEREGISTERED (not registered) on BOTH sockets, and because the deposit is
+# charged by the registration then immediately refunded by the
+# deregistration IN THE SAME TX, the net deposit effect telescopes to ZERO
+# (only the fee is charged) — not "charged exactly once" as originally
+# claimed. What this script actually verifies: dugite and cardano-node agree
+# byte-for-byte on the (upstream-limited) outcome of this construction.
 #
 # Upstream precedent: cardano-node-tests stake-registration/deregistration
-# ordering coverage (#1032, cardano-node-tests adoption P0.1).
+# ordering coverage (#1032, cardano-node-tests adoption P0.1) — the test this
+# script mirrors is itself blocked by cardano-ledger#4566 on every Conway PV.
 set -euo pipefail
 ZOO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$ZOO_DIR/lib/tx-zoo-common.sh"
@@ -81,8 +110,9 @@ TXIN=${UTXO%% *}
 TXIN_AMT=${UTXO##* }
 RAW="$ZOO_BUILT/$NAME.raw"
 SIGNED="$ZOO_BUILT/$NAME.signed"
-# Order is the point: reg, dereg, reg, dereg, reg — 5 certs, odd count, so
-# the final ledger state must be REGISTERED.
+# Pass the same reg/dereg cert files 5x, exactly like upstream's
+# certificate_files=[reg, dereg, reg, dereg, reg] — this is EXPECTED to
+# collapse to 2 distinct certs at build time (cardano-ledger#4566).
 cardano-cli conway transaction build \
     --testnet-magic "$LD_MAGIC" \
     --socket-path   "$ZOO_SOCKET" \
@@ -108,9 +138,24 @@ if ! zoo_wait_all_observers "$TXID" 120 "$ADDR"; then
     exit 1
 fi
 
-# ── Final state must be REGISTERED on BOTH sockets ──────────────────────────
-# RED-PROOF: flip this check to accept "no" (or skip it) to hide a node that
-# processes the 5 certs out of order and ends up deregistered.
+# ── Pin the wire-level dedup: exactly 2 certs made it into the body ────────
+# This is the load-bearing evidence for the header's claim. If this ever
+# reports 5, cardano-ledger#4566 has been fixed upstream and this whole
+# script (and its expected final state) needs revisiting.
+CERT_COUNT=$(python3 "$ZOO_PY_TX_CBOR" show-certs --in "$RAW" | jq -r '.cert_count')
+if [ "$CERT_COUNT" != "2" ]; then
+    zoo_fail "expected cardano-ledger#4566 to strip 5 certs down to 2, got $CERT_COUNT — upstream may have fixed the dedup; script needs revisiting"
+    zoo_record "$NAME" FAIL "$TXID" "cert-count-changed=$CERT_COUNT"
+    exit 1
+fi
+
+# ── Final state must be DEREGISTERED on BOTH sockets ────────────────────────
+# Not REGISTERED: the effective sequence is [reg, dereg] (see header), so the
+# address ends up deregistered again. What matters here is that dugite and
+# cardano-node reach the IDENTICAL outcome — a parity claim, not an ordering
+# claim.
+# RED-PROOF: flip this check to accept "yes" (or skip it) to hide a node that
+# diverges from cardano-node on the stripped 2-cert sequence's outcome.
 FAIL_SOCKS=""
 for sock in "$ZOO_SOCKET" "$LD_CARDANO_BP_SOCK"; do
     [ -S "$sock" ] || continue
@@ -118,27 +163,27 @@ for sock in "$ZOO_SOCKET" "$LD_CARDANO_BP_SOCK"; do
             --testnet-magic "$LD_MAGIC" --socket-path "$sock" \
             --address "$STAKE_ADDR" 2>/dev/null \
         | jq -r 'if length>0 then "yes" else "no" end')
-    [ "$REG" = "yes" ] || FAIL_SOCKS="$FAIL_SOCKS $sock"
+    [ "$REG" = "no" ] || FAIL_SOCKS="$FAIL_SOCKS $sock"
 done
 if [ -n "$FAIL_SOCKS" ]; then
-    zoo_fail "$STAKE_ADDR not REGISTERED after reg/dereg/reg/dereg/reg on:$FAIL_SOCKS"
-    zoo_record "$NAME" FAIL "$TXID" "final-state-not-registered$FAIL_SOCKS"
+    zoo_fail "$STAKE_ADDR not DEREGISTERED after the stripped [reg,dereg] sequence on:$FAIL_SOCKS"
+    zoo_record "$NAME" FAIL "$TXID" "final-state-not-deregistered$FAIL_SOCKS"
     exit 1
 fi
 
-# ── Net deposit charged exactly once ────────────────────────────────────────
+# ── Net deposit telescopes to ZERO (charged then refunded in the same tx) ──
 FEE_TEXT=$(cardano-cli debug transaction view --tx-body-file "$RAW" 2>/dev/null | jq -r '.fee')
 FEE=${FEE_TEXT%% *}
-EXPECTED_CHANGE=$((TXIN_AMT - FEE - DEPOSIT))
+EXPECTED_CHANGE=$((TXIN_AMT - FEE))
 ACTUAL_CHANGE=$(cardano-cli conway query utxo \
         --testnet-magic "$LD_MAGIC" --socket-path "$ZOO_SOCKET" \
         --address "$ADDR" --output-json 2>/dev/null \
     | jq -r --arg t "$TXID" '[to_entries[] | select(.key | startswith($t))][0].value.value.lovelace // empty')
 
 # RED-PROOF: relax this equality (e.g. to a range check) to hide a deposit
-# charged twice, zero times, or refunded at the wrong step.
+# net-charged or net-refunded when it should telescope to zero.
 if [ "${ACTUAL_CHANGE:-}" = "$EXPECTED_CHANGE" ]; then
-    zoo_record "$NAME" PASS "$TXID" "registered deposit=$DEPOSIT balance=$ACTUAL_CHANGE"
+    zoo_record "$NAME" PASS "$TXID" "deregistered net-deposit=0 (charged+refunded $DEPOSIT) balance=$ACTUAL_CHANGE"
 else
     zoo_record "$NAME" FAIL "$TXID" "deposit-mismatch expected=$EXPECTED_CHANGE actual=${ACTUAL_CHANGE:-none}"
     exit 1

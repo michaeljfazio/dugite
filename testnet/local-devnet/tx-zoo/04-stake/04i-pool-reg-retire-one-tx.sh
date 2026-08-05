@@ -36,6 +36,13 @@ MIN_POOL_COST=$(jq -r '.minPoolCost' "$PPARAMS")
 CURRENT_EPOCH=$(zoo_tip_epoch)
 RETIRE_EPOCH=$((CURRENT_EPOCH + 2))   # earliest valid retire epoch, as in 04f
 
+# run-all.sh normally starts the shared anchor HTTP server once, before any
+# script runs. When this script runs standalone (as it did on first attempt)
+# nothing has seeded $ZOO_ANCHOR_DIR yet, so `zoo_anchor_hash pool3` dies with
+# "anchor file missing". zoo_anchor_start is idempotent (checks its pid file
+# first) so it is always safe to call here too.
+zoo_anchor_start >/dev/null 2>&1
+
 REG_CERT="$ZOO_BUILT/$NAME.reg.cert"
 DEREG_CERT="$ZOO_BUILT/$NAME.dereg.cert"
 cardano-cli conway stake-pool registration-certificate \
@@ -88,9 +95,12 @@ POOL_ID_HEX=$(cardano-cli conway stake-pool id \
 
 # ── Retirement scheduled on BOTH sockets ────────────────────────────────────
 # `query pool-state` is the current name (`pool-params` is the deprecated
-# alias). The exact JSON shape of the retiring map is unconfirmed offline —
-# this checks for the pool id AND the retirement epoch appearing together
-# anywhere in the reply, which is robust to the surrounding key names.
+# alias). Confirmed live shape (both dugite and cardano-node):
+#   { "<pool-id-hex>": { "poolParams": {...}, "futurePoolParams": null,
+#                          "retiring": <epoch> } }
+# i.e. the retirement epoch is a plain integer keyed by pool id at the TOP
+# level of that pool's object — not nested under a `poolRetiring`/`retiring`
+# map as originally guessed.
 # RED-PROOF: loosen the `grep -q "$POOL_ID_HEX"` (or drop the epoch check) to
 # hide a retirement that never got scheduled, or got scheduled for the wrong
 # epoch.
@@ -105,7 +115,7 @@ for sock in "$ZOO_SOCKET" "$LD_CARDANO_BP_SOCK"; do
         continue
     fi
     RETIRING_EPOCH=$(printf '%s' "$OUT" | jq -r --arg id "$POOL_ID_HEX" \
-        '(.poolRetiring // .retiring // {})[$id] // empty')
+        '(.[$id].retiring) // empty')
     if [ "$RETIRING_EPOCH" != "$RETIRE_EPOCH" ]; then
         FAIL_SOCKS="$FAIL_SOCKS $sock(retiring=${RETIRING_EPOCH:-none})"
     fi

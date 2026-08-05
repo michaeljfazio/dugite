@@ -9,6 +9,26 @@
 # the encode and decode side.
 #
 # Upstream: cardano-node-tests test_native_tokens.py — empty-asset-name minting.
+#
+# First live run recorded FAIL "mint-build" with the captured error reading
+# only "runClientCommand, called at app/cardano-cli.hs:58:14 in
+# cardano-cli-11.0.0.0-...:Main" — the tail of a Haskell CallStack, not the
+# actual "Error: ..." line, because the old capture used `tail -2` (fixed
+# below to print the first non-blank lines instead).
+#
+# That truncation left the real cause unprovable from the log alone, so both
+# candidate syntaxes were tested directly against a live UTxO on this devnet:
+# `--mint "5 <policyid>"` (bare, no suffix) and `--mint "5 <policyid>."`
+# (trailing dot) both build successfully under cardano-cli 11.0.0.0 and both
+# produce the IDENTICAL on-chain asset — `cardano-cli debug transaction view`
+# shows `"policy <id>": {"default asset": 5}` either way, i.e. the CLI treats
+# a trailing "." as an empty name suffix, same as omitting it outright. So
+# this was never a syntax rejection. The one build error actually reproduced
+# while investigating was "The UTxO is empty" against a since-spent --tx-in —
+# a stale-UTxO race, the same "11c lesson, #918" class as 04i/11f: this script
+# had no `zoo_wait_mempool_quiet` guard while its siblings in the same batch
+# do, so a `--tx-in` picked right after another script's tx could already be
+# gone by the time `transaction build` re-queries the node.
 set -euo pipefail
 ZOO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$ZOO_DIR/lib/tx-zoo-common.sh"
@@ -16,6 +36,13 @@ ZOO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 NAME="$(zoo_name)"
 zoo_require_devnet
+
+# Earlier scripts may still have transactions in flight against the shared
+# genesis funder; building on a UTxO the ledger view reports but that a
+# pending tx has already claimed (or a since-included tx has already spent)
+# is an unavoidable build/submit failure (the 11c lesson, #918).
+zoo_wait_mempool_quiet 90 || true
+
 ADDR=$(cat "$ZOO_PAY_ADDR_FILE")
 read -r POLICY POLICY_ID <<<"$(mint_policy "$NAME")"
 
@@ -50,7 +77,7 @@ cardano-cli conway transaction build \
     --change-address "$ADDR" \
     --mint "${QTY} ${ASSET}" --mint-script-file "$POLICY" \
     --out-file "$RAW" >/dev/null 2> "$ZOO_LOGS/$NAME.mint.err" \
-    || { zoo_fail "mint build: $(tail -2 "$ZOO_LOGS/$NAME.mint.err")"; zoo_record "$NAME" FAIL "" "mint-build"; exit 1; }
+    || { zoo_fail "mint build: $(grep -m2 -v '^[[:space:]]*$' "$ZOO_LOGS/$NAME.mint.err" | tr '\n' ' ')"; zoo_record "$NAME" FAIL "" "mint-build"; exit 1; }
 cardano-cli conway transaction sign --testnet-magic "$LD_MAGIC" \
     --tx-body-file "$RAW" --signing-key-file "$ZOO_PAY_SKEY" --out-file "$SIGNED" >/dev/null
 MINT_TXID=$(zoo_submit "$SIGNED") || { zoo_record "$NAME" FAIL "" "mint-submit"; exit 1; }
@@ -89,7 +116,7 @@ cardano-cli conway transaction build --testnet-magic "$LD_MAGIC" --socket-path "
     --change-address "$ADDR" \
     --mint "-${QTY} ${ASSET}" --mint-script-file "$POLICY" \
     --out-file "$BRAW" >/dev/null 2> "$ZOO_LOGS/$NAME.burn.err" \
-    || { zoo_fail "burn build: $(tail -2 "$ZOO_LOGS/$NAME.burn.err")"; zoo_record "$NAME" FAIL "$MINT_TXID" "burn-build"; exit 1; }
+    || { zoo_fail "burn build: $(grep -m2 -v '^[[:space:]]*$' "$ZOO_LOGS/$NAME.burn.err" | tr '\n' ' ')"; zoo_record "$NAME" FAIL "$MINT_TXID" "burn-build"; exit 1; }
 cardano-cli conway transaction sign --testnet-magic "$LD_MAGIC" \
     --tx-body-file "$BRAW" --signing-key-file "$ZOO_PAY_SKEY" --out-file "$BSIGNED" >/dev/null
 BURN_TXID=$(zoo_submit "$BSIGNED") || { zoo_record "$NAME" FAIL "$MINT_TXID" "burn-submit"; exit 1; }
