@@ -16,6 +16,10 @@
 //! is nothing to filter); with a predicate set, an event lacking bytes
 //! to evaluate it against is dropped rather than guessed at — the same
 //! reject/skip-over-silent-pass-through rule `WatchTx` already follows.
+//! A predicate naming `TxPattern.consumes` / `has_certificate` (neither
+//! implemented — see `map::patterns::tx_predicate_has_unsupported_leaf`)
+//! is rejected with `Status::unimplemented` before subscribing, rather
+//! than silently accepted and under-filtered.
 //!
 //! Tx era inference: SubmitTx infers the era from the SubmitTxRequest's
 //! oneof variant — only `raw` is defined at v1beta v0.19.2, so we
@@ -36,7 +40,7 @@ use tracing::warn;
 
 use super::{mask_paths, send_masked, ServiceState};
 use crate::map::message_names;
-use crate::map::patterns::matches_tx_predicate;
+use crate::map::patterns::{matches_tx_predicate, tx_predicate_has_unsupported_leaf};
 use crate::map::tx::tx_to_proto;
 use crate::masking;
 use crate::proto::{v1alpha, v1beta};
@@ -377,8 +381,6 @@ impl v1alpha::submit::submit_service_server::SubmitService for SubmitSvcAlpha {
         self.state
             .metrics
             .stream_started(SERVICE_LABEL, "watch_mempool");
-        let mut events = self.state.mempool_feed.subscribe();
-        let (tx, rx) = mpsc::channel(self.state.config.stream_buffer);
         let req = request.into_inner();
         let mask = mask_paths(req.field_mask);
         // Recode the v1alpha predicate to v1beta — same shape at
@@ -390,6 +392,17 @@ impl v1alpha::submit::submit_service_server::SubmitService for SubmitSvcAlpha {
                 .map(|p| p.encode_to_vec())
                 .and_then(|b| v1beta::watch::TxPredicate::decode(b.as_slice()).ok())
         };
+        if predicate_beta
+            .as_ref()
+            .is_some_and(tx_predicate_has_unsupported_leaf)
+        {
+            return Err(Status::unimplemented(
+                "WatchMempool: TxPattern.consumes / has_certificate matching is not \
+                 implemented; resubmit without those fields set",
+            ));
+        }
+        let mut events = self.state.mempool_feed.subscribe();
+        let (tx, rx) = mpsc::channel(self.state.config.stream_buffer);
         tokio::spawn(async move {
             loop {
                 match events.recv().await {
@@ -574,8 +587,6 @@ impl v1beta::submit::submit_service_server::SubmitService for SubmitSvcBeta {
         self.state
             .metrics
             .stream_started(SERVICE_LABEL, "watch_mempool");
-        let mut events = self.state.mempool_feed.subscribe();
-        let (tx, rx) = mpsc::channel(self.state.config.stream_buffer);
         let req = request.into_inner();
         let mask = mask_paths(req.field_mask);
         // `submit.proto` declares its own `TxPredicate` (identical shape
@@ -588,6 +599,17 @@ impl v1beta::submit::submit_service_server::SubmitService for SubmitSvcBeta {
                 .map(|p| p.encode_to_vec())
                 .and_then(|b| v1beta::watch::TxPredicate::decode(b.as_slice()).ok())
         };
+        if predicate
+            .as_ref()
+            .is_some_and(tx_predicate_has_unsupported_leaf)
+        {
+            return Err(Status::unimplemented(
+                "WatchMempool: TxPattern.consumes / has_certificate matching is not \
+                 implemented; resubmit without those fields set",
+            ));
+        }
+        let mut events = self.state.mempool_feed.subscribe();
+        let (tx, rx) = mpsc::channel(self.state.config.stream_buffer);
         tokio::spawn(async move {
             loop {
                 match events.recv().await {

@@ -162,6 +162,27 @@ fn payment_part_predicate_submit(
     }
 }
 
+/// Build a `submit::TxPredicate` naming `consumes` — a leaf
+/// `matches_tx_predicate` cannot evaluate. Local sibling of
+/// `watch_service.rs`'s `consumes_predicate`, over `submit`'s own
+/// generated `TxPredicate` type.
+fn consumes_predicate_submit() -> dugite_rpc::proto::v1beta::submit::TxPredicate {
+    use dugite_rpc::proto::v1beta::submit::{any_chain_tx_pattern, AnyChainTxPattern, TxPredicate};
+    TxPredicate {
+        r#match: Some(AnyChainTxPattern {
+            chain: Some(any_chain_tx_pattern::Chain::Cardano(
+                dugite_rpc::proto::v1beta::cardano::TxPattern {
+                    consumes: Some(dugite_rpc::proto::v1beta::cardano::TxOutputPattern::default()),
+                    ..Default::default()
+                },
+            )),
+        }),
+        not: vec![],
+        all_of: vec![],
+        any_of: vec![],
+    }
+}
+
 // ─── SubmitMock ──────────────────────────────────────────────────────────
 
 #[derive(Default)]
@@ -1215,6 +1236,30 @@ async fn watch_mempool_field_mask_prunes_streamed_items() {
     assert!(item.r#ref.is_empty(), "unmasked leaf cleared");
 
     drop(stream);
+    server.stop().await;
+}
+
+/// A `WatchMempool` request naming an unsupported `TxPattern` leaf
+/// (`consumes`) must be REJECTED outright — same guard as `WatchTx`,
+/// same reason: silently accepting it would under-filter with no signal
+/// to the client.
+#[tokio::test]
+async fn watch_mempool_rejects_predicate_naming_consumes() {
+    use dugite_rpc::proto::v1beta::submit::submit_service_client::SubmitServiceClient;
+    use dugite_rpc::proto::v1beta::submit::WatchMempoolRequest;
+
+    let mock = Arc::new(SubmitMock::rejecting("unused"));
+    let server = TestServer::start(mock).await;
+    let mut client = SubmitServiceClient::new(server.channel().await);
+    let status = client
+        .watch_mempool(WatchMempoolRequest {
+            predicate: Some(consumes_predicate_submit()),
+            field_mask: None,
+        })
+        .await
+        .expect_err("a `consumes` predicate must be rejected, not silently accepted");
+    assert_eq!(status.code(), tonic::Code::Unimplemented);
+
     server.stop().await;
 }
 

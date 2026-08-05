@@ -3,13 +3,16 @@
 //! `WatchTx` streams transactions observed in the mempool via
 //! `MempoolFeed`, filtered through the real `TxPredicate` matcher
 //! (`crate::map::patterns::matches_tx_predicate` — address / asset /
-//! mint via `produces` / `has_address` / `moves_asset` / `mints_asset`;
-//! `consumes` / `has_certificate` are NOT matched, since those need
-//! resolved-input lookups the mempool path doesn't have — documented in
-//! `docs/src/running/utxo-rpc.md`'s Limitations section, not silently
-//! dropped). A non-matching tx is filtered out of the stream entirely —
-//! never delivered "just in case", per this project's reject/filter-over
-//! -silent-pass-through rule.
+//! mint via `produces` / `has_address` / `moves_asset` / `mints_asset`).
+//! `consumes` (needs resolved-input lookups the mempool path doesn't
+//! have) and `has_certificate` (needs a certificate-type matcher not
+//! yet built) are NOT matched — and a request naming either (anywhere,
+//! including nested under `not` / `all_of` / `any_of`) is REJECTED with
+//! `Status::unimplemented` before it ever subscribes
+//! (`tx_predicate_has_unsupported_leaf`), rather than silently accepted
+//! and under-filtered. A non-matching tx is filtered out of the stream
+//! entirely — never delivered "just in case", per this project's
+//! reject-over-silent-skip rule.
 //!
 //! `AnyChainTx.block` is unconditionally unset: the proto's own comment
 //! on `WatchTx` says "stream transactions from the **chain**", but this
@@ -37,7 +40,7 @@ use tracing::warn;
 
 use super::{mask_paths, send_masked, ServiceState};
 use crate::map::message_names;
-use crate::map::patterns::matches_tx_predicate;
+use crate::map::patterns::{matches_tx_predicate, tx_predicate_has_unsupported_leaf};
 use crate::map::tx::tx_to_proto;
 use crate::masking;
 use crate::proto::{v1alpha, v1beta};
@@ -67,8 +70,6 @@ impl v1alpha::watch::watch_service_server::WatchService for WatchSvcAlpha {
         request: Request<v1alpha::watch::WatchTxRequest>,
     ) -> Result<Response<Self::WatchTxStream>, Status> {
         self.state.metrics.stream_started(SERVICE_LABEL, "watch_tx");
-        let mut events = self.state.mempool_feed.subscribe();
-        let (tx, rx) = mpsc::channel(self.state.config.stream_buffer);
         let req = request.into_inner();
         let mask = mask_paths(req.field_mask);
         // Recode the v1alpha predicate to v1beta — they share the same
@@ -79,6 +80,17 @@ impl v1alpha::watch::watch_service_server::WatchService for WatchSvcAlpha {
                 .map(|p| p.encode_to_vec())
                 .and_then(|b| v1beta::watch::TxPredicate::decode(b.as_slice()).ok())
         };
+        if predicate_beta
+            .as_ref()
+            .is_some_and(tx_predicate_has_unsupported_leaf)
+        {
+            return Err(Status::unimplemented(
+                "WatchTx: TxPattern.consumes / has_certificate matching is not \
+                 implemented; resubmit without those fields set",
+            ));
+        }
+        let mut events = self.state.mempool_feed.subscribe();
+        let (tx, rx) = mpsc::channel(self.state.config.stream_buffer);
         tokio::spawn(async move {
             loop {
                 match events.recv().await {
@@ -149,11 +161,20 @@ impl v1beta::watch::watch_service_server::WatchService for WatchSvcBeta {
         request: Request<v1beta::watch::WatchTxRequest>,
     ) -> Result<Response<Self::WatchTxStream>, Status> {
         self.state.metrics.stream_started(SERVICE_LABEL, "watch_tx");
-        let mut events = self.state.mempool_feed.subscribe();
-        let (tx, rx) = mpsc::channel(self.state.config.stream_buffer);
         let req = request.into_inner();
         let mask = mask_paths(req.field_mask);
         let predicate_beta = req.predicate;
+        if predicate_beta
+            .as_ref()
+            .is_some_and(tx_predicate_has_unsupported_leaf)
+        {
+            return Err(Status::unimplemented(
+                "WatchTx: TxPattern.consumes / has_certificate matching is not \
+                 implemented; resubmit without those fields set",
+            ));
+        }
+        let mut events = self.state.mempool_feed.subscribe();
+        let (tx, rx) = mpsc::channel(self.state.config.stream_buffer);
         tokio::spawn(async move {
             loop {
                 match events.recv().await {

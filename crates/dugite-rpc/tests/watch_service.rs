@@ -333,6 +333,75 @@ fn payment_part_predicate(payment_byte: u8) -> v1beta::watch::TxPredicate {
     }
 }
 
+/// Build a `TxPredicate` naming `consumes` — a leaf `matches_tx_predicate`
+/// cannot evaluate (needs resolved-input UTxO data unavailable on the
+/// mempool-only watch path).
+fn consumes_predicate() -> v1beta::watch::TxPredicate {
+    v1beta::watch::TxPredicate {
+        r#match: Some(v1beta::watch::AnyChainTxPattern {
+            chain: Some(v1beta::watch::any_chain_tx_pattern::Chain::Cardano(
+                v1beta::cardano::TxPattern {
+                    consumes: Some(v1beta::cardano::TxOutputPattern::default()),
+                    ..Default::default()
+                },
+            )),
+        }),
+        not: vec![],
+        all_of: vec![],
+        any_of: vec![],
+    }
+}
+
+/// A `WatchTx` request naming an unsupported `TxPattern` leaf
+/// (`consumes`) must be REJECTED outright, not silently accepted and
+/// under-filtered (a subscriber asking to watch for spends of a
+/// specific input has no way to know its filter was quietly ignored).
+#[tokio::test]
+async fn watch_tx_rejects_predicate_naming_consumes() {
+    use v1beta::watch::watch_service_client::WatchServiceClient;
+    use v1beta::watch::WatchTxRequest;
+
+    let server = TestServer::start().await;
+    let mut client = WatchServiceClient::new(server.channel().await);
+    let status = client
+        .watch_tx(WatchTxRequest {
+            predicate: Some(consumes_predicate()),
+            field_mask: None,
+            intersect: vec![],
+        })
+        .await
+        .expect_err("a `consumes` predicate must be rejected, not silently accepted");
+    assert_eq!(status.code(), tonic::Code::Unimplemented);
+
+    server.stop().await;
+}
+
+/// Same rejection, nested under `all_of` — proves a client can't smuggle
+/// the unsupported leaf past a combinator to bypass the guard.
+#[tokio::test]
+async fn watch_tx_rejects_consumes_nested_under_all_of() {
+    use v1beta::watch::watch_service_client::WatchServiceClient;
+    use v1beta::watch::WatchTxRequest;
+
+    let server = TestServer::start().await;
+    let mut client = WatchServiceClient::new(server.channel().await);
+    let predicate = v1beta::watch::TxPredicate {
+        all_of: vec![consumes_predicate(), payment_part_predicate(0x11)],
+        ..Default::default()
+    };
+    let status = client
+        .watch_tx(WatchTxRequest {
+            predicate: Some(predicate),
+            field_mask: None,
+            intersect: vec![],
+        })
+        .await
+        .expect_err("nested `consumes` under all_of must still be rejected");
+    assert_eq!(status.code(), tonic::Code::Unimplemented);
+
+    server.stop().await;
+}
+
 // ─── WatchTx v1beta ──────────────────────────────────────────────────────
 
 #[tokio::test]
