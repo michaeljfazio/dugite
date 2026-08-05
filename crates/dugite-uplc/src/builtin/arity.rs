@@ -76,11 +76,11 @@ pub const fn arity_of(id: BuiltinId) -> (u8, u8) {
         Bls12_381_MillerLoop | Bls12_381_MulMlResult => (0, 2),
         Bls12_381_FinalVerify => (0, 2),
 
-        // V3 hashes (CIP-0127 + CIP-0101).
+        // V3 hashes: keccak_256 = CIP-0101, ripemd_160 = CIP-0127.
         Keccak_256 | Blake2b_224 => (0, 1),
         Ripemd_160 => (0, 1),
 
-        // V3 Int↔ByteString (CIP-0117).
+        // V3 Int↔ByteString (CIP-0121).
         IntegerToByteString => (0, 3),
         ByteStringToInteger => (0, 2),
 

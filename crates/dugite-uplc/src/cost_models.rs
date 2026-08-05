@@ -23,7 +23,7 @@
 //! PV11) are documented for reference but **not enforced** at the
 //! decode boundary. cardano-node accepts on-chain ParameterChange
 //! actions that grow or shrink the array as new builtins land (see
-//! e.g. CIP-0117 / CIP-0123) — the decoder must tolerate arrays of
+//! e.g. CIP-0121 / CIP-0123) — the decoder must tolerate arrays of
 //! arbitrary size up to a defensive cap so adversarial cost models
 //! cannot trigger an unbounded `Vec::with_capacity`. V4 (Dijkstra)
 //! ships at the same 297-entry length as V3 (no new builtins in
