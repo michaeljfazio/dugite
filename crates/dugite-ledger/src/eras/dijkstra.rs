@@ -518,13 +518,27 @@ impl EraRules for DijkstraRules {
 ///     apply_valid_tx` propagates that `Err` before EVER calling
 ///     `self.conway().apply_valid_tx(..)` for the parent's own effects, so
 ///     the whole top-level tx — parent included — has no partial effects.
-///     (Upstream's `foldM` actually keeps folding past a failure inside
-///     one `applySTS` call, accumulating a `NonEmpty` list of failures —
-///     see the citation on `apply_valid_tx` — but since the external
-///     result is all-or-nothing either way and dugite's `LedgerError`
-///     carries one message, short-circuiting on the first failure is
-///     externally equivalent and matches this file's existing
-///     single-message convention.)
+///     (A nuance worth being precise about: whether upstream's `foldM`
+///     itself short-circuits at the first failing sub-tx's nested `trans`
+///     call, or continues folding to accumulate a `NonEmpty` list of ALL
+///     sub-tx failures, is NOT independently confirmed here. `foldM`
+///     requires a lawful `Monad`, which rules out a pure
+///     accumulating-`Validation` semantics for the fold's own bind chain —
+///     but `SUBLEDGER`'s internal rule composition could still batch
+///     multiple predicate failures PER sub-tx before that bind ever sees
+///     them. Which of these is true is immaterial to correctness here:
+///     Haskell's STS state is a pure value threaded through `foldM`'s
+///     accumulator, so a `Left` from `SUBLEDGERS` — triggered by ANY
+///     sub-tx's `trans` failing, under ANY internal accumulation scheme —
+///     means the CALLER (`dijkstraLedgerTransition`) never receives an
+///     updated `LedgerState` at all; every sub-tx's effect is equally
+///     absent whether it was "evaluated then discarded" or "never
+///     evaluated". dugite's pass 1 chooses the simpler short-circuit
+///     behaviour for exactly that reason — the two are externally
+///     indistinguishable from outside `SUBLEDGERS`, and dugite's
+///     `LedgerError` carries a single message anyway, matching this
+///     file's existing single-message convention for every other Dijkstra
+///     predicate failure.)
 ///   - **Pass 2 (commit).** Only reached if every sub-tx validated. Replays
 ///     the exact same sequence for real against `utxo.utxo_set` /
 ///     `certs.stake_distribution.stake_map` / `epochs.ptr_stake`, mirroring
