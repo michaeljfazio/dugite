@@ -398,7 +398,6 @@ enum QuerySubcommand {
 /// f64_to_rational helper inside dugite-crypto's leader_check module, so
 /// callers that pass `f = 0.05` will always get `(1, 20)` rather than some
 /// floating-point approximation.
-#[allow(dead_code)]
 fn f64_to_rational_approx(value: f64) -> (u64, u64) {
     for den in [1u64, 2, 4, 5, 10, 20, 25, 50, 100, 200, 1000, 10000] {
         let num = (value * den as f64).round() as u64;
@@ -414,7 +413,6 @@ fn f64_to_rational_approx(value: f64) -> (u64, u64) {
     (num / g, den / g)
 }
 
-#[allow(dead_code)]
 fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
     while b != 0 {
         let t = b;
@@ -684,7 +682,6 @@ fn load_drep_key_hash_from_envelope(path: &std::path::Path) -> Result<Vec<u8>> {
 // ── Task 2: Protocol State CBOR Parser ──────────────────────────────────────
 
 /// Nonce values extracted from PraosState (protocol state query).
-#[allow(dead_code)]
 struct PraosNonces {
     /// The epoch nonce used for VRF leader checks in the current epoch.
     epoch_nonce: [u8; 32],
@@ -694,7 +691,6 @@ struct PraosNonces {
 
 /// Parse a Nonce CBOR value: array(1)[0] = NeutralNonce, array(2)[1, bytes32] = Nonce.
 /// Returns 32 zero bytes for NeutralNonce.
-#[allow(dead_code)]
 fn parse_cbor_nonce(d: &mut minicbor::Decoder<'_>) -> Result<[u8; 32]> {
     let len = d
         .array()?
@@ -721,7 +717,6 @@ fn parse_cbor_nonce(d: &mut minicbor::Decoder<'_>) -> Result<[u8; 32]> {
 /// cardano-node 11.0.x encodes 8 fields (a `praosStatePreviousEpochNonce` sits
 /// at [5], see #902); 10.x encoded 7. This parser reads only through [4] and
 /// ignores the declared array length, so it accepts either form unchanged.
-#[allow(dead_code)]
 fn parse_protocol_state_nonces(raw: &[u8]) -> Result<PraosNonces> {
     let mut d = minicbor::Decoder::new(raw);
 
@@ -788,7 +783,6 @@ fn parse_protocol_state_nonces(raw: &[u8]) -> Result<PraosNonces> {
 // ── Task 3: Stake Snapshot Parser ───────────────────────────────────────────
 
 /// Pool stake and total active stake from a stake snapshot query.
-#[allow(dead_code)]
 struct PoolStakeInfo {
     /// Pool's delegated stake (lovelace) from the "set" snapshot (current) or "mark" (next).
     pool_stake: u64,
@@ -802,7 +796,6 @@ struct PoolStakeInfo {
 /// pool_map: Map<pool_hash(28B), array(3)[mark, set, go]>
 ///
 /// `use_mark` controls which snapshot to use: true = mark (for --next), false = set (for --current).
-#[allow(dead_code)]
 fn parse_stake_for_pool(raw: &[u8], pool_id_hex: &str, use_mark: bool) -> Result<PoolStakeInfo> {
     let mut d = minicbor::Decoder::new(raw);
 
@@ -864,7 +857,6 @@ fn parse_stake_for_pool(raw: &[u8], pool_id_hex: &str, use_mark: bool) -> Result
 // ── Task 4: Genesis Reader Helper ───────────────────────────────────────────
 
 /// Parameters extracted from the Shelley genesis file needed for leadership schedule.
-#[allow(dead_code)]
 struct ShelleyGenesisParams {
     active_slots_coeff: f64,
     epoch_length: u64,
@@ -873,7 +865,6 @@ struct ShelleyGenesisParams {
 }
 
 /// Read the shelley genesis file and extract timing parameters.
-#[allow(dead_code)]
 fn read_shelley_genesis(path: &std::path::Path) -> Result<ShelleyGenesisParams> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("Cannot read genesis file '{}': {e}", path.display()))?;
@@ -913,7 +904,6 @@ fn read_shelley_genesis(path: &std::path::Path) -> Result<ShelleyGenesisParams> 
 ///
 /// The key file is a Cardano text envelope with `cborHex` containing a CBOR-wrapped
 /// Ed25519 public key (32 bytes). The pool ID is Blake2b-224 of the raw key bytes.
-#[allow(dead_code)]
 fn pool_id_from_cold_vkey(path: &std::path::Path) -> Result<String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("Cannot read cold key file '{}': {e}", path.display()))?;
@@ -948,7 +938,6 @@ fn is_leap_year(y: u64) -> bool {
 ///
 /// `system_start_unix` is the Unix timestamp (seconds since 1970) of slot 0.
 /// `slot_length` is the duration of each slot in seconds (usually 1 for mainnet/testnet).
-#[allow(dead_code)]
 fn slot_to_utc(slot: u64, system_start_unix: u64, slot_length: u64) -> String {
     let unix_secs = system_start_unix + slot * slot_length;
     let secs_per_day = 86_400u64;
