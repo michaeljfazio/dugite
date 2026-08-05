@@ -3553,7 +3553,7 @@ mod tests {
     /// Issue #1000 (PlutusV4/Dijkstra): the SAME key-8 probe rejected for
     /// Conway above, but decoded under `Era::Dijkstra`. Oracle-verified
     /// (`IntersectMBO/cardano-ledger` @
-    /// `c4f649fac4a18929f550ffebf07c9e7371355d9d`): Dijkstra's `TxWits`
+    /// `4849c13d6f70e5ab46add9af6e0ec5c537b61f69`): Dijkstra's `TxWits`
     /// is literally `type TxWits DijkstraEra = AlonzoTxWits DijkstraEra` and
     /// its `natVersion @12`-gated `decoderByKey` still enumerates ONLY keys
     /// 0-7 — there is no `plutus_v4_scripts` witness-set field upstream (the

@@ -247,7 +247,7 @@ pub fn validate_program_availability(
 /// (Matches dugite-ledger's own reference-script PV gate in `validation/scripts.rs`.)
 ///
 /// PlutusV4: `IntersectMBO/cardano-ledger` @
-/// `c4f649fac4a18929f550ffebf07c9e7371355d9d`,
+/// `4849c13d6f70e5ab46add9af6e0ec5c537b61f69`,
 /// `libs/cardano-ledger-core/.../Language.hs` `guardPlutus`:
 /// `PlutusV4 -> natVersion @12`.
 pub fn ledger_language_introduced_in(language: ScriptLanguage) -> u32 {

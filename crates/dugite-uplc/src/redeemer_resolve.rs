@@ -35,7 +35,7 @@ use dugite_primitives::transaction::{
 ///
 /// ## PlutusV4 (Dijkstra) — oracle-verified as of 2026-08-05
 ///
-/// `IntersectMBO/cardano-ledger` @ `c4f649fac4a18929f550ffebf07c9e7371355d9d`,
+/// `IntersectMBO/cardano-ledger` @ `4849c13d6f70e5ab46add9af6e0ec5c537b61f69`,
 /// `libs/cardano-ledger-core/src/Cardano/Ledger/Plutus/Language.hs`:
 ///
 /// ```haskell
@@ -585,7 +585,7 @@ fn proposal_script_hash(p: &dugite_primitives::transaction::ProposalProcedure) -
 ///
 /// Unlike V1/V2/V3, there is no `tx.witness_set.plutus_v4_scripts` step
 /// here, and `TransactionWitnessSet` has no such field. This is NOT a gap:
-/// `IntersectMBO/cardano-ledger` @ `c4f649fac4a18929f550ffebf07c9e7371355d9d`
+/// `IntersectMBO/cardano-ledger` @ `4849c13d6f70e5ab46add9af6e0ec5c537b61f69`
 /// has `type TxWits DijkstraEra = AlonzoTxWits DijkstraEra` — Dijkstra
 /// reuses Alonzo's witness-set type verbatim — and BOTH branches of its
 /// `DecCBOR` (the `natVersion @12`-gated `decoderByKey` and the legacy
