@@ -192,8 +192,8 @@ pub(crate) fn encode_query_result_value(
         QueryResult::DRepState(dreps) => {
             encode_drep_state(enc, dreps);
         }
-        QueryResult::CommitteeState(committee) => {
-            encode_committee_state(enc, committee);
+        QueryResult::CommitteeState(committee, next_committee) => {
+            encode_committee_state(enc, committee, next_committee);
         }
         QueryResult::UtxoByAddress(utxos) => {
             encode_utxo_by_address(enc, utxos);
@@ -1428,14 +1428,52 @@ fn encode_drep_state(
     }
 }
 
+/// `GetCommitteeMembersState` (tag 27).
+///
+/// The member set is the UNION of the live committee and the post-ratification
+/// one, per `queryCommitteeMembersState`:
+///
+/// ```haskell
+/// relevantColdKeys = withFilteredColdCreds $ Set.unions
+///   [ Map.keysSet comMembers, Map.keysSet comStateMembers, Map.keysSet nextComMembers ]
+/// ```
+///
+/// A member present only in `nextComMembers` reports `MemberStatus` =
+/// `Unrecognized` (status is "not in comMembers"), `cmsExpiration` = `SNothing`
+/// (`Map.lookup ck comMembers`), and `NextEpochChange` = `ToBeEnacted`. Without
+/// the union that outcome is unreachable, so this cannot be narrowed back to
+/// the live members alone.
 fn encode_committee_state(
     enc: &mut minicbor::Encoder<&mut Vec<u8>>,
     committee: &crate::node::n2c_query::types::CommitteeSnapshot,
+    next: &crate::node::n2c_query::types::NextCommittee,
 ) {
+    let next_members = next.as_ref().map(|n| &n.members);
+    let current_epoch = committee.current_epoch;
+
+    // Members present in the next committee but not the live one — the
+    // `ToBeEnacted` set. Emitted after the live members; the wire type is a
+    // `Map`, whose CBOR key order is ascending, so the whole set is sorted
+    // together below rather than appended blind.
+    let live_keys: std::collections::BTreeSet<(u8, Vec<u8>)> = committee
+        .members
+        .iter()
+        .map(|m| (m.cold_credential_type, m.cold_credential.clone()))
+        .collect();
+    let incoming: Vec<(u8, Vec<u8>)> = next_members
+        .map(|nm| {
+            nm.keys()
+                .filter(|k| !live_keys.contains(*k))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Wire format: array(3) [map_members, maybe_threshold, epoch]
     enc.array(3).ok();
     // [0] Map<ColdCredential, CommitteeMemberState>
-    enc.map(committee.members.len() as u64).ok();
+    enc.map((committee.members.len() + incoming.len()) as u64)
+        .ok();
     for member in &committee.members {
         // Key: Credential [type, hash(28)]
         enc.array(2).ok();
@@ -1476,9 +1514,65 @@ fn encode_committee_state(
         } else {
             enc.array(0).ok();
         }
-        // [3] NextEpochChange: NoChangeExpected [2]
+        // [3] NextEpochChange — a pure comparison of the live committee
+        // against the post-ratification one:
+        //
+        //   nextEpochChange ck
+        //     | not inCurrent && inNext = ToBeEnacted
+        //     | not inNext              = ToBeRemoved
+        //     | Just curTerm <- lookupCurrent, Just nextTerm <- lookupNext
+        //     , curTerm /= nextTerm, not expiringNext = TermAdjusted nextTerm
+        //     | expiringCurrent || expiringNext = ToBeExpired
+        //     | otherwise = NoChangeExpected
+        //     where expiringCurrent = lookupCurrent == Just currentEpoch
+        //           expiringNext    = lookupNext    == Just currentEpoch
+        //
+        // (cardano-ledger `Api/State/Query.hs`.) Encoded as a Sum:
+        // 0 ToBeEnacted, 1 ToBeRemoved, 2 NoChangeExpected, 3 ToBeExpired,
+        // 4 TermAdjusted EpochNo. This was unconditionally `NoChangeExpected`.
+        {
+            let key = (member.cold_credential_type, member.cold_credential.clone());
+            let lookup_current = member.expiry_epoch;
+            let lookup_next = next_members.and_then(|nm| nm.get(&key).copied());
+            let expiring_current = lookup_current == Some(current_epoch);
+            let expiring_next = lookup_next == Some(current_epoch);
+            match (lookup_current, lookup_next) {
+                // `not inNext` — includes the SNothing case (NoConfidence),
+                // where every sitting member is on its way out.
+                (_, None) => {
+                    enc.array(1).ok();
+                    enc.u32(1).ok(); // ToBeRemoved
+                }
+                (Some(cur), Some(nxt)) if cur != nxt && !expiring_next => {
+                    enc.array(2).ok();
+                    enc.u32(4).ok(); // TermAdjusted
+                    enc.u64(nxt).ok();
+                }
+                _ if expiring_current || expiring_next => {
+                    enc.array(1).ok();
+                    enc.u32(3).ok(); // ToBeExpired
+                }
+                _ => {
+                    enc.array(1).ok();
+                    enc.u32(2).ok(); // NoChangeExpected
+                }
+            }
+        }
+    }
+    // Incoming members: in the next committee only. `ToBeEnacted`, status
+    // Unrecognized, no expiration (upstream reads `cmsExpiration` from the
+    // CURRENT committee, which does not contain them).
+    for key in &incoming {
+        enc.array(2).ok();
+        enc.u8(key.0).ok();
+        enc.bytes(&key.1).ok();
+        enc.array(4).ok();
         enc.array(1).ok();
-        enc.u32(2).ok();
+        enc.u32(1).ok(); // HotCredAuthStatus: MemberNotAuthorized
+        enc.u8(2).ok(); // MemberStatus: Unrecognized
+        enc.array(0).ok(); // cmsExpiration: SNothing
+        enc.array(1).ok();
+        enc.u32(0).ok(); // NextEpochChange: ToBeEnacted
     }
     // [1] Maybe UnitInterval (threshold)
     if let Some((num, den)) = committee.threshold {
@@ -1733,6 +1827,109 @@ fn encode_credential(
     }
 }
 
+/// The committee AFTER this epoch's ratification pass applies — Haskell's
+/// `getNextEpochCommitteeMembers`:
+///
+/// ```haskell
+/// getNextEpochCommitteeMembers nes =
+///   let ratifyState = queryRatifyState nes
+///       committee = ratifyState ^. rsEnactStateL . ensCommitteeL
+///    in foldMap' committeeMembers committee
+/// ```
+///
+/// `EnactState` is RATIFY's fold accumulator: `mkEnactState` seeds
+/// `ensCommittee` from the live committee at boundary time and the fold then
+/// updates it in place for each ACCEPTED action. So the value a client sees is
+/// the live committee with this pass's accepted committee-changing actions
+/// already applied — not the still-live one.
+///
+/// Oracle-verified against `Conway/Rules/Enact.hs`:
+///
+/// ```haskell
+/// NoConfidence _ -> st & ensCommitteeL .~ SNothing
+///
+/// UpdateCommittee _ membersToRemove membersToAdd newThreshold ->
+///   st & ensCommitteeL %~ SJust . updatedCommittee membersToRemove membersToAdd newThreshold
+///
+/// updatedCommittee membersToRemove membersToAdd newThreshold committee =
+///   case committee of
+///     SNothing -> Committee membersToAdd newThreshold
+///     SJust (Committee currentMembers _) ->
+///       let newCommitteeMembers =
+///             Map.union membersToAdd (currentMembers `Map.withoutKeys` membersToRemove)
+///        in Committee newCommitteeMembers newThreshold
+/// ```
+///
+/// `Map.union` is LEFT-biased, so an added member overrides a surviving one of
+/// the same credential (remove-then-insert reproduces that), and the threshold
+/// is REPLACED rather than merged.
+///
+/// This one derivation feeds both halves of #1020: `EnactState.ensCommittee`
+/// in `encode_ratify_state`, and `NextEpochChange` in `encode_committee_state`
+/// — which is defined purely as a comparison against exactly this value.
+pub(crate) fn committee_after_enacted(
+    live: &crate::node::n2c_query::types::CommitteeSnapshot,
+    enacted: &[(ProposalSnapshot, GovActionId)],
+) -> crate::node::n2c_query::types::NextCommittee {
+    use crate::node::n2c_query::types::NextCommitteeData;
+    use dugite_primitives::credentials::Credential;
+
+    fn cred_key(c: &Credential) -> (u8, Vec<u8>) {
+        match c {
+            Credential::VerificationKey(h) => (0, h.as_ref().to_vec()),
+            Credential::Script(h) => (1, h.as_ref().to_vec()),
+        }
+    }
+
+    // `SNothing` iff there is no committee at all — the same test
+    // `encode_ratify_state` has always used for the live value.
+    let mut present = !(live.members.is_empty() && live.threshold.is_none());
+    let mut members: std::collections::BTreeMap<(u8, Vec<u8>), u64> = live
+        .members
+        .iter()
+        .map(|m| {
+            (
+                (m.cold_credential_type, m.cold_credential.clone()),
+                m.expiry_epoch.unwrap_or(0),
+            )
+        })
+        .collect();
+    let mut threshold = live.threshold.unwrap_or((2, 3));
+
+    for (proposal, _gas_id) in enacted {
+        match &proposal.gov_action {
+            GovAction::NoConfidence { .. } => {
+                present = false;
+                members.clear();
+            }
+            GovAction::UpdateCommittee {
+                members_to_remove,
+                members_to_add,
+                threshold: new_threshold,
+                ..
+            } => {
+                // `SNothing -> Committee membersToAdd newThreshold`: a committee
+                // cleared earlier in the SAME fold starts from empty, it does
+                // not resurrect the live members.
+                if !present {
+                    members.clear();
+                }
+                for c in members_to_remove {
+                    members.remove(&cred_key(c));
+                }
+                for (c, expiry) in members_to_add {
+                    members.insert(cred_key(c), *expiry);
+                }
+                threshold = (new_threshold.numerator, new_threshold.denominator);
+                present = true;
+            }
+            _ => {}
+        }
+    }
+
+    present.then_some(NextCommitteeData { members, threshold })
+}
+
 fn encode_ratify_state(
     enc: &mut minicbor::Encoder<&mut Vec<u8>>,
     gov: &crate::node::n2c_query::types::GovStateSnapshot,
@@ -1751,23 +1948,27 @@ fn encode_ratify_state(
     // version in encode_gov_state. See lines 991-1059 for the canonical
     // EnactState field order.
     enc.array(7).ok();
-    // ensCommittee: StrictMaybe Committee
-    if gov.committee.members.is_empty() && gov.committee.threshold.is_none() {
-        enc.array(0).ok(); // SNothing
-    } else {
-        enc.array(1).ok(); // SJust
-        enc.array(2).ok();
-        enc.map(gov.committee.members.len() as u64).ok();
-        for m in &gov.committee.members {
-            enc.array(2).ok();
-            enc.u8(m.cold_credential_type).ok();
-            enc.bytes(&m.cold_credential).ok();
-            enc.u64(m.expiry_epoch.unwrap_or(0)).ok();
+    // ensCommittee: StrictMaybe Committee.
+    //
+    // The POST-ratification committee, not the live one — see
+    // `committee_after_enacted`. Reading `gov.committee` here was the same
+    // class of bug as #966 (`ensTreasury`) and #994 (`ensCurPParams`): a term
+    // of RATIFY's frozen fold accumulator served live (#1020).
+    match committee_after_enacted(&gov.committee, enacted) {
+        None => {
+            enc.array(0).ok(); // SNothing
         }
-        if let Some((num, den)) = gov.committee.threshold {
-            encode_tagged_rational(enc, num, den);
-        } else {
-            encode_tagged_rational(enc, 2, 3);
+        Some(next) => {
+            enc.array(1).ok(); // SJust
+            enc.array(2).ok();
+            enc.map(next.members.len() as u64).ok();
+            for ((cred_type, hash), expiry) in &next.members {
+                enc.array(2).ok();
+                enc.u8(*cred_type).ok();
+                enc.bytes(hash).ok();
+                enc.u64(*expiry).ok();
+            }
+            encode_tagged_rational(enc, next.threshold.0, next.threshold.1);
         }
     }
     // ensConstitution: array(2) [Anchor, StrictMaybe ScriptHash]
@@ -3939,7 +4140,7 @@ mod tests {
 
     #[test]
     fn test_committee_state_cold_credential_is_28_bytes() {
-        let result = QueryResult::CommitteeState(CommitteeSnapshot {
+        let snapshot = CommitteeSnapshot {
             members: vec![CommitteeMemberSnapshot {
                 cold_credential: vec![0x44; 28],
                 cold_credential_type: 0,
@@ -3951,7 +4152,12 @@ mod tests {
             }],
             threshold: Some((2, 3)),
             current_epoch: 100,
-        });
+        };
+        // No enacted actions => the next committee is the live one, so every
+        // member reports NoChangeExpected. These two tests are about credential
+        // WIDTHS; the identity case keeps them measuring exactly that.
+        let next = committee_after_enacted(&snapshot, &[]);
+        let result = QueryResult::CommitteeState(snapshot, next);
         let encoded = encode_query_result(&result);
         let inner = strip_wrappers(&encoded);
 
@@ -3973,7 +4179,7 @@ mod tests {
 
     #[test]
     fn test_committee_state_hot_credential_is_28_bytes() {
-        let result = QueryResult::CommitteeState(CommitteeSnapshot {
+        let snapshot = CommitteeSnapshot {
             members: vec![CommitteeMemberSnapshot {
                 cold_credential: vec![0x66; 28],
                 cold_credential_type: 0,
@@ -3985,7 +4191,12 @@ mod tests {
             }],
             threshold: Some((2, 3)),
             current_epoch: 100,
-        });
+        };
+        // No enacted actions => the next committee is the live one, so every
+        // member reports NoChangeExpected. These two tests are about credential
+        // WIDTHS; the identity case keeps them measuring exactly that.
+        let next = committee_after_enacted(&snapshot, &[]);
+        let result = QueryResult::CommitteeState(snapshot, next);
         let encoded = encode_query_result(&result);
         let inner = strip_wrappers(&encoded);
 
@@ -4012,6 +4223,206 @@ mod tests {
             "CommitteeState hot credential hash must be 28 bytes, got {}",
             hot_hash.len()
         );
+    }
+
+    /// Minimal `ProposalSnapshot` for tests that only care about `gov_action`.
+    fn sample_proposal() -> ProposalSnapshot {
+        ProposalSnapshot {
+            tx_id: vec![0xAA; 32],
+            action_index: 0,
+            action_type: "InfoAction".to_string(),
+            proposed_epoch: 40,
+            expires_epoch: 46,
+            yes_votes: 0,
+            no_votes: 0,
+            abstain_votes: 0,
+            deposit: 100_000_000_000,
+            return_addr: vec![0xe0; 29],
+            anchor_url: "https://example.invalid/a.json".to_string(),
+            anchor_hash: vec![0x11; 32],
+            gov_action: dugite_primitives::transaction::GovAction::InfoAction,
+            committee_votes: Vec::new(),
+            drep_votes: Vec::new(),
+            spo_votes: Vec::new(),
+        }
+    }
+
+    /// #1020: `NextEpochChange` was hardcoded `NoChangeExpected`, so the four
+    /// outcomes that actually carry information were unreachable.
+    ///
+    /// Drives ONE `UpdateCommittee` in `ratify_enacted` that simultaneously
+    /// adds a member, removes a member and adjusts a third's term, plus a
+    /// fourth member whose term expires this epoch, and asserts all five
+    /// outcomes appear. Asserting only `NoChangeExpected`'s absence would pass
+    /// against several wrong implementations.
+    #[test]
+    fn next_epoch_change_reports_all_five_outcomes() {
+        use crate::node::n2c_query::types::CommitteeMemberSnapshot;
+        use dugite_primitives::credentials::Credential;
+        use dugite_primitives::hash::Hash28;
+        use dugite_primitives::transaction::{GovAction, Rational};
+        use std::collections::BTreeMap;
+
+        const CURRENT_EPOCH: u64 = 100;
+
+        fn member(tag: u8, expiry: u64) -> CommitteeMemberSnapshot {
+            CommitteeMemberSnapshot {
+                cold_credential: vec![tag; 28],
+                cold_credential_type: 0,
+                hot_status: 1,
+                hot_credential: None,
+                hot_credential_type: 0,
+                member_status: 0,
+                expiry_epoch: Some(expiry),
+            }
+        }
+        fn cred(tag: u8) -> Credential {
+            Credential::VerificationKey(Hash28::from_bytes([tag; 28]))
+        }
+
+        let live = CommitteeSnapshot {
+            members: vec![
+                member(0xA1, 500),           // stays, untouched      -> NoChangeExpected
+                member(0xA2, 500),           // removed               -> ToBeRemoved
+                member(0xA3, 500),           // term changed to 900   -> TermAdjusted 900
+                member(0xA4, CURRENT_EPOCH), // expires now -> ToBeExpired
+            ],
+            threshold: Some((2, 3)),
+            current_epoch: CURRENT_EPOCH,
+        };
+
+        let mut members_to_add = BTreeMap::new();
+        members_to_add.insert(cred(0xA3), 900u64); // adjust a sitting term
+        members_to_add.insert(cred(0xB1), 700u64); // brand new -> ToBeEnacted
+        let action = GovAction::UpdateCommittee {
+            prev_action_id: None,
+            members_to_remove: vec![cred(0xA2)],
+            members_to_add,
+            threshold: Rational {
+                numerator: 3,
+                denominator: 5,
+            },
+        };
+
+        let mut proposal = sample_proposal();
+        proposal.gov_action = action;
+        let enacted = vec![(
+            proposal,
+            GovActionId {
+                tx_id: vec![0x01; 32],
+                action_index: 0,
+            },
+        )];
+
+        let next = committee_after_enacted(&live, &enacted);
+        let next_data = next.as_ref().expect("committee must still exist");
+        assert_eq!(
+            next_data.threshold,
+            (3, 5),
+            "UpdateCommittee REPLACES the threshold"
+        );
+        assert!(
+            !next_data.members.contains_key(&(0u8, vec![0xA2; 28])),
+            "removed member must not survive"
+        );
+        assert_eq!(
+            next_data.members.get(&(0u8, vec![0xA3; 28])),
+            Some(&900),
+            "Map.union is left-biased on membersToAdd, so an add overrides a \
+             surviving member's term"
+        );
+
+        let result = QueryResult::CommitteeState(live, next);
+        let encoded = encode_query_result(&result);
+        let inner = strip_wrappers(&encoded);
+
+        let mut dec = Decoder::new(&inner);
+        dec.array().unwrap(); // array(3)
+        let n = dec.map().unwrap().unwrap();
+        assert_eq!(
+            n, 5,
+            "the member map is the UNION of live and next committees — the \
+             incoming member must appear or ToBeEnacted is unobservable"
+        );
+
+        let mut seen: BTreeMap<Vec<u8>, (u32, Option<u64>)> = BTreeMap::new();
+        for _ in 0..n {
+            dec.array().unwrap(); // Credential
+            dec.u8().unwrap();
+            let cold = dec.bytes().unwrap().to_vec();
+            dec.array().unwrap(); // CommitteeMemberState array(4)
+            dec.skip().unwrap(); // [0] HotCredAuthStatus
+            dec.u8().unwrap(); // [1] MemberStatus
+            dec.skip().unwrap(); // [2] cmsExpiration
+            let arity = dec.array().unwrap().unwrap(); // [3] NextEpochChange
+            let tag = dec.u32().unwrap();
+            let payload = if arity == 2 {
+                Some(dec.u64().unwrap())
+            } else {
+                None
+            };
+            seen.insert(cold, (tag, payload));
+        }
+
+        assert_eq!(seen[&vec![0xA1; 28]], (2, None), "A1: NoChangeExpected");
+        assert_eq!(seen[&vec![0xA2; 28]], (1, None), "A2: ToBeRemoved");
+        assert_eq!(
+            seen[&vec![0xA3; 28]],
+            (4, Some(900)),
+            "A3: TermAdjusted carries the NEW term"
+        );
+        assert_eq!(seen[&vec![0xA4; 28]], (3, None), "A4: ToBeExpired");
+        assert_eq!(seen[&vec![0xB1; 28]], (0, None), "B1: ToBeEnacted");
+    }
+
+    /// A ratified `NoConfidence` clears the committee (`ensCommittee = SNothing`),
+    /// so every sitting member is `ToBeRemoved` — the `not inNext` branch.
+    #[test]
+    fn no_confidence_clears_the_next_committee() {
+        use crate::node::n2c_query::types::CommitteeMemberSnapshot;
+
+        let live = CommitteeSnapshot {
+            members: vec![CommitteeMemberSnapshot {
+                cold_credential: vec![0xC1; 28],
+                cold_credential_type: 0,
+                hot_status: 1,
+                hot_credential: None,
+                hot_credential_type: 0,
+                member_status: 0,
+                expiry_epoch: Some(500),
+            }],
+            threshold: Some((2, 3)),
+            current_epoch: 10,
+        };
+        let mut proposal = sample_proposal();
+        proposal.gov_action = GovAction::NoConfidence {
+            prev_action_id: None,
+        };
+        let enacted = vec![(
+            proposal,
+            GovActionId {
+                tx_id: vec![0x02; 32],
+                action_index: 0,
+            },
+        )];
+
+        let next = committee_after_enacted(&live, &enacted);
+        assert!(next.is_none(), "NoConfidence sets ensCommittee to SNothing");
+
+        let result = QueryResult::CommitteeState(live, next);
+        let inner = strip_wrappers(&encode_query_result(&result));
+        let mut dec = Decoder::new(&inner);
+        dec.array().unwrap();
+        assert_eq!(dec.map().unwrap(), Some(1));
+        dec.array().unwrap();
+        dec.u8().unwrap();
+        dec.bytes().unwrap();
+        dec.array().unwrap();
+        dec.skip().unwrap();
+        dec.u8().unwrap();
+        dec.skip().unwrap();
+        assert_eq!(dec.array().unwrap(), Some(1));
+        assert_eq!(dec.u32().unwrap(), 1, "ToBeRemoved");
     }
 
     // ─── Stake address info (tag 10) — credential hashes must be 28 bytes ───
