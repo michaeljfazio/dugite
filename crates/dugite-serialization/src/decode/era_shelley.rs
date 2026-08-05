@@ -497,7 +497,7 @@ fn decode_shelley_tx_body(r: &mut Reader<'_>) -> Result<TransactionBody, Seriali
                 // `isOverlaySlot` returns true for every slot under d=1
                 // → no blocks ever attribute to pools → bprev=0 at every
                 // boundary. Tracked as issue #624 (root cause of #621).
-                update = Some(read_pre_conway_update_proposal(r)?);
+                update = Some(read_pre_conway_update_proposal(r, Era::Shelley)?);
             }
             7 => {
                 // auxiliary_data_hash
@@ -1414,8 +1414,12 @@ pub(crate) fn decode_shelley_tx_standalone(cbor: &[u8]) -> Result<Transaction, S
 /// `genesishash` is a 28-byte blake2b_224 hash of a genesis delegate's vkey.
 /// We pad to 32 bytes via [`Hash28::to_hash32_padded`] for storage as
 /// `Hash32` in `UpdateProposal::proposed_updates`.
+///
+/// `era` selects the embedded `protocol_param_update`'s valid key set (issue
+/// #1013) — see [`read_pre_conway_protocol_param_update`].
 pub(crate) fn read_pre_conway_update_proposal(
     r: &mut Reader<'_>,
+    era: Era,
 ) -> Result<UpdateProposal, SerializationError> {
     let arr_len = r.read_array_header()?;
     if !matches!(arr_len, Some(2)) {
@@ -1428,7 +1432,7 @@ pub(crate) fn read_pre_conway_update_proposal(
             let h28 = read_hash28(r)?;
             Ok(h28.to_hash32_padded())
         },
-        read_pre_conway_protocol_param_update,
+        |r| read_pre_conway_protocol_param_update(r, era),
     )?;
     let epoch = r.read_uint()?;
     Ok(UpdateProposal {
@@ -1437,11 +1441,13 @@ pub(crate) fn read_pre_conway_update_proposal(
     })
 }
 
-/// Decode a pre-Conway `protocol_param_update` map covering the union of
-/// Shelley/Allegra/Mary/Alonzo/Babbage key sets (keys 0–24).
+/// Decode a pre-Conway `protocol_param_update` map (Shelley/Allegra/Mary/
+/// Alonzo/Babbage — `era` selects which sub-era's key set applies).
 ///
 /// Cross-referenced against Haskell:
 ///   `eras/shelley/impl/src/Cardano/Ledger/Shelley/PParams.hs`
+///   `eras/allegra/impl/src/Cardano/Ledger/Allegra/PParams.hs`
+///   `eras/mary/impl/src/Cardano/Ledger/Mary/PParams.hs`
 ///   `eras/alonzo/impl/src/Cardano/Ledger/Alonzo/PParams.hs`
 ///   `eras/babbage/impl/src/Cardano/Ledger/Babbage/PParams.hs`
 ///
@@ -1458,60 +1464,82 @@ pub(crate) fn read_pre_conway_update_proposal(
 /// - 9: a0 (nonnegative_interval = tag 30 rational)
 /// - 10: rho (unit_interval = tag 30 rational)
 /// - 11: tau (unit_interval = tag 30 rational)
-/// - 12: d (unit_interval = tag 30 rational) — Shelley-Alonzo
-/// - 13: extra_entropy (nonce) — currently skipped (deprecated in Babbage+)
-/// - 14: [protocol_version_major, protocol_version_minor]
-/// - 15: min_utxo_value (coin) — Shelley-Mary only; decoded into
+/// - 12: d (unit_interval = tag 30 rational) — Shelley/Allegra/Mary/Alonzo
+/// - 13: extra_entropy (nonce) — Shelley/Allegra/Mary/Alonzo
+/// - 14: [protocol_version_major, protocol_version_minor] — every pre-Conway era
+/// - 15: min_utxo_value (coin) — Shelley/Allegra/Mary ONLY; decoded into
 ///   `ProtocolParamUpdate.min_utxo_value` (issue #919; previously skipped)
-/// - 16: min pool cost (coin) — Alonzo+
-/// - 17: ada per utxo word (Alonzo) / coins per utxo byte (Babbage) — same wire
-///   shape, disambiguated by protocol version IN FORCE at apply time (see
+/// - 16: min pool cost (coin) — every pre-Conway era
+/// - 17: ada per utxo word (Alonzo) / coins per utxo byte (Babbage) — Alonzo/
+///   Babbage only (Plutus-era concept); same wire shape, disambiguated by
+///   protocol version IN FORCE at apply time (see
 ///   `ProtocolParameters::apply_key17_update`, issue #919)
-/// - 18: cost models
-/// - 19: ex unit prices
-/// - 20: max tx ex units
-/// - 21: max block ex units
-/// - 22: max value size (uint)
-/// - 23: collateral percentage (uint)
-/// - 24: max collateral inputs (uint)
+/// - 18: cost models — Alonzo/Babbage only
+/// - 19: ex unit prices — Alonzo/Babbage only
+/// - 20: max tx ex units — Alonzo/Babbage only
+/// - 21: max block ex units — Alonzo/Babbage only
+/// - 22: max value size (uint) — Alonzo/Babbage only
+/// - 23: collateral percentage (uint) — Alonzo/Babbage only
+/// - 24: max collateral inputs (uint) — Alonzo/Babbage only
 ///
-/// Unknown keys are skipped (forward compatibility).
-/// Decode a standalone pre-Conway `protocol_param_update` CBOR map.
-///
-/// The Shelley..Babbage counterpart of [`crate::decode::ppu_from_cbor`], and
-/// the decode half that `encode_pre_conway_protocol_param_update` must
-/// round-trip against — the two key sets genuinely differ (keys 12-15 exist
-/// only here; keys 25-37 only in Conway).
-pub fn pre_conway_ppu_from_cbor(cbor: &[u8]) -> Result<ProtocolParamUpdate, SerializationError> {
+/// **Unknown/out-of-era keys are HARD-REJECTED** (issue #1013), not silently
+/// skipped. Every era gate below is oracle-verified against
+/// `IntersectMBO/cardano-ledger` at pinned commit
+/// `4849c13d6f70e5ab46add9af6e0ec5c537b61f69` (SHA confirmed resolving via
+/// `gh api repos/IntersectMBO/cardano-ledger/commits/<sha>`), fetched
+/// directly rather than inferred from dugite's prior (too-permissive) match
+/// arms — see `read_protocol_param_update` in `era_conway.rs` for the shared
+/// `updateFieldMap`/`invalidField` mechanism this mirrors. Per-era
+/// `eraPParams` lists confirmed by fetching each file at the pinned SHA:
+/// - **Shelley** (`shelley_PParams.hs:338-524`): 0-16, no gaps.
+/// - **Allegra/Mary** (`allegra_PParams.hs:43`, `mary_PParams.hs:50`):
+///   `eraPParams = shelleyPParams` — literally identical to Shelley, 0-16.
+/// - **Alonzo** (`alonzo_PParams.hs:330-369`): 0-14, 16-24. Gap: 15 —
+///   `hkdMinUTxOValueCompactL = notSupportedInThisEraL`; `hkdDL`/
+///   `hkdExtraEntropyL` are REAL fields (`appD`/`appExtraEntropy`), so 12/13
+///   stay valid here, unlike Babbage.
+/// - **Babbage** (`babbage_PParams.hs:171-226`): 0-11, 14, 16-24. Gaps:
+///   12/13/15 — `hkdDL`/`hkdExtraEntropyL`/`hkdMinUTxOValueCompactL` are all
+///   `notSupportedInThisEraL`.
+pub fn pre_conway_ppu_from_cbor(
+    cbor: &[u8],
+    era: Era,
+) -> Result<ProtocolParamUpdate, SerializationError> {
     let mut r = Reader::new(cbor);
-    read_pre_conway_protocol_param_update(&mut r)
+    read_pre_conway_protocol_param_update(&mut r, era)
 }
 
 pub(crate) fn read_pre_conway_protocol_param_update(
     r: &mut Reader<'_>,
+    era: Era,
 ) -> Result<ProtocolParamUpdate, SerializationError> {
     let mut ppu = ProtocolParamUpdate::default();
-    // `for_each_map_entry` handles BOTH definite- and indefinite-length CBOR
-    // maps (last-wins on a repeated key, matching Haskell's `PParamsUpdate`
-    // decode — see #1012's oracle finding on `read_protocol_param_update`
-    // just below in `era_conway.rs`, which shares this exact shape). The
-    // original fix here (faaaed42d8) hand-rolled the same definite/indefinite
-    // sentinel loop that `for_each_map_entry` already implements and that
-    // `decode_alonzo_aux_data_map` already uses for an identical purpose;
-    // routing through the shared helper removes that second copy rather than
-    // leaving it to drift — #1012 swept for exactly this pattern. Behavior is
-    // unchanged: this refactor is covered by the same four tests
-    // faaaed42d8 added, including the two indefinite-length-map regressions.
+    // Keys 12/13 (`d`/`extra_entropy`): valid Shelley..Alonzo, gone in Babbage.
+    let has_d_and_entropy = matches!(era, Era::Shelley | Era::Allegra | Era::Mary | Era::Alonzo);
+    // Key 15 (`min_utxo_value`): valid Shelley..Mary only — Alonzo replaces it
+    // with `coinsPerUTxOWord` at key 17.
+    let has_min_utxo_value = matches!(era, Era::Shelley | Era::Allegra | Era::Mary);
+    // Keys 17-24 (Plutus-era cost/execution params): Alonzo/Babbage only —
+    // Shelley/Allegra/Mary predate Plutus entirely.
+    let has_plutus_params = matches!(era, Era::Alonzo | Era::Babbage);
+    //
+    // `for_each_field_entry` handles BOTH definite- and indefinite-length CBOR
+    // maps (last-wins on a repeated key would be wrong — see below) and
+    // hard-rejects a **duplicate** key on the same map, matching Haskell's
+    // `Set Word`-tracked `SparseKeyed`/`decodeSparseKeyed` (un-gated by
+    // protocol version — oracle-verified, `Decoder.hs:1281` /
+    // `Coders.hs`'s `applyField`). The original fix here (faaaed42d8) used
+    // `for_each_map_entry` (lenient, last-wins); #1013 tightened it to the
+    // stricter primitive #1012 introduced for exactly this SparseKeyed shape.
     //
     // Previously (pre-faaaed42d8): `read_map_header()?.unwrap_or(0)` silently
     // decoded an indefinite-length map — `encode_map_open`'s >23-entry form,
     // #932/#938 — as zero entries and desynced the reader for everything
     // after; the same bug shape as `read_withdrawals`/`read_multiasset_map_u64`/
-    // `decode_aux_data_map` above. A pre-Conway PPU has ~30 possible keys, so
+    // `decode_aux_data_map` above. A pre-Conway PPU has ~24 possible keys, so
     // a proposal setting more than 23 of them at once is exactly the case
     // this was blind to.
-    r.for_each_map_entry(|r| {
-        let key = r.read_uint()?;
+    r.for_each_field_entry(|r, key| {
         match key {
             0 => ppu.min_fee_a = Some(r.read_uint()?),
             1 => ppu.min_fee_b = Some(r.read_uint()?),
@@ -1543,14 +1571,14 @@ pub(crate) fn read_pre_conway_protocol_param_update(
                     denominator: rat.denominator,
                 });
             }
-            12 => {
+            12 if has_d_and_entropy => {
                 let rat = r.read_rational()?;
                 ppu.d = Some(Rational {
                     numerator: rat.numerator,
                     denominator: rat.denominator,
                 });
             }
-            13 => {
+            13 if has_d_and_entropy => {
                 // extra_entropy (Shelley Nonce). CBOR: [0] = NeutralNonce, or
                 // [1, bytes32] = Nonce(h). Folded into the epoch nonce at the
                 // TICKN rule (η0 = ηc ⭒ ηh ⭒ extraEntropy). Mainnet injected a
@@ -1570,7 +1598,8 @@ pub(crate) fn read_pre_conway_protocol_param_update(
                 let _ = arr;
             }
             14 => {
-                // [protocol_version_major, protocol_version_minor]
+                // [protocol_version_major, protocol_version_minor] — valid in
+                // every pre-Conway era, no gate.
                 let arr_len = r.read_array_header()?;
                 if !matches!(arr_len, Some(2)) {
                     return Err(SerializationError::CborDecode(format!(
@@ -1580,11 +1609,10 @@ pub(crate) fn read_pre_conway_protocol_param_update(
                 ppu.protocol_version_major = Some(r.read_uint()?);
                 ppu.protocol_version_minor = Some(r.read_uint()?);
             }
-            15 => {
+            15 if has_min_utxo_value => {
                 // min_utxo_value (Shelley-Mary only): the flat `minUTxOValue`
                 // PParam. Alonzo removes it from the wire PParamUpdate type
-                // entirely (replaced by `coinsPerUTxOWord` at key 17), so this
-                // key is never present in an Alonzo+ proposal in practice.
+                // entirely (replaced by `coinsPerUTxOWord` at key 17).
                 // Previously dropped on the floor — Shelley/Allegra/Mary's
                 // `getMinCoinTxOut` uses this value directly (never the
                 // Babbage/Conway serialized-size formula), so silently
@@ -1594,16 +1622,21 @@ pub(crate) fn read_pre_conway_protocol_param_update(
                 ppu.min_utxo_value = Some(read_lovelace(r)?);
             }
             16 => ppu.min_pool_cost = Some(read_lovelace(r)?),
-            17 => ppu.ada_per_utxo_byte = Some(read_lovelace(r)?),
-            18 => ppu.cost_models = Some(read_cost_models(r)?),
-            19 => ppu.execution_costs = Some(read_ex_unit_prices(r)?),
-            20 => ppu.max_tx_ex_units = Some(read_ex_units(r)?),
-            21 => ppu.max_block_ex_units = Some(read_ex_units(r)?),
-            22 => ppu.max_val_size = Some(r.read_uint()?),
-            23 => ppu.collateral_percentage = Some(r.read_uint()?),
-            24 => ppu.max_collateral_inputs = Some(r.read_uint()?),
+            17 if has_plutus_params => ppu.ada_per_utxo_byte = Some(read_lovelace(r)?),
+            18 if has_plutus_params => ppu.cost_models = Some(read_cost_models(r)?),
+            19 if has_plutus_params => ppu.execution_costs = Some(read_ex_unit_prices(r)?),
+            20 if has_plutus_params => ppu.max_tx_ex_units = Some(read_ex_units(r)?),
+            21 if has_plutus_params => ppu.max_block_ex_units = Some(read_ex_units(r)?),
+            22 if has_plutus_params => ppu.max_val_size = Some(r.read_uint()?),
+            23 if has_plutus_params => ppu.collateral_percentage = Some(r.read_uint()?),
+            24 if has_plutus_params => ppu.max_collateral_inputs = Some(r.read_uint()?),
             _ => {
-                r.skip()?;
+                // Unknown/out-of-era PPU key — HARD REJECT (issue #1013). See
+                // the function doc comment for the full oracle citation of
+                // each era's exact `eraPParams`-derived key set.
+                return Err(SerializationError::CborDecode(format!(
+                    "{era:?} protocol_param_update: unknown/invalid key {key}"
+                )));
             }
         }
         Ok(())
@@ -1686,7 +1719,7 @@ mod tests {
         cbor.extend(cbor_uint(13));
         cbor.extend(nonce_arr);
         let mut r = Reader::new(&cbor);
-        let ppu = read_pre_conway_protocol_param_update(&mut r).unwrap();
+        let ppu = read_pre_conway_protocol_param_update(&mut r, Era::Shelley).unwrap();
         assert_eq!(ppu.extra_entropy, Some(Hash32::from_bytes(entropy)));
 
         // map { 13: [0] } — NeutralNonce decodes to ZERO.
@@ -1696,13 +1729,13 @@ mod tests {
         cbor2.extend(cbor_uint(13));
         cbor2.extend(neutral);
         let mut r2 = Reader::new(&cbor2);
-        let ppu2 = read_pre_conway_protocol_param_update(&mut r2).unwrap();
+        let ppu2 = read_pre_conway_protocol_param_update(&mut r2, Era::Shelley).unwrap();
         assert_eq!(ppu2.extra_entropy, Some(Hash32::ZERO));
 
         // Absent key 13 → None (not all updates carry it).
         let empty = cbor_map0();
         let mut r3 = Reader::new(&empty);
-        let ppu3 = read_pre_conway_protocol_param_update(&mut r3).unwrap();
+        let ppu3 = read_pre_conway_protocol_param_update(&mut r3, Era::Shelley).unwrap();
         assert_eq!(ppu3.extra_entropy, None);
     }
 
@@ -1815,8 +1848,8 @@ mod tests {
         cbor.push(0xff);
 
         let mut r = Reader::new(&cbor);
-        let ppu =
-            read_pre_conway_protocol_param_update(&mut r).expect("indefinite PPU map must decode");
+        let ppu = read_pre_conway_protocol_param_update(&mut r, Era::Shelley)
+            .expect("indefinite PPU map must decode");
         assert_eq!(
             ppu.e_max,
             Some(100),

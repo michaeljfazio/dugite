@@ -1197,6 +1197,7 @@ mod tests {
             let enc = encode_gov_action(action);
             match crate::decode::era_conway::read_gov_action_for_test(
                 &mut crate::decode::reader::Reader::new(&enc),
+                dugite_primitives::Era::Conway,
             ) {
                 Err(e) => failures.push(format!("{action:?}\n     FAILED to decode: {e}")),
                 Ok(d) if &d != action => failures.push(format!("{action:?}\n     became {d:?}")),

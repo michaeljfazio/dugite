@@ -960,7 +960,8 @@ mod tests {
         );
 
         let encoded = encode_protocol_param_update(&original);
-        let decoded = ppu_from_cbor(&encoded).expect("round-trip decode must succeed");
+        let decoded = ppu_from_cbor(&encoded, dugite_primitives::Era::Conway)
+            .expect("round-trip decode must succeed");
 
         assert_eq!(
             decoded, original,
@@ -979,13 +980,62 @@ mod tests {
         );
     }
 
-    /// The pre-Conway key set, including keys 12-15, which the Conway type does
-    /// not have and which had NO encoder at all until the fuzz work for #974
-    /// surfaced it. `d` was live on mainnet throughout Shelley and
-    /// `extra_entropy` carried the one-time non-neutral value at epoch 259.
+    /// Issue #1013: the Dijkstra counterpart of the test above — every Conway
+    /// key PLUS the 4 Dijkstra-only additions (34-37), decoded under
+    /// `Era::Dijkstra`. This is the fixture `test_ppu_round_trip_all_conway_keys`
+    /// used to use (as `conway_ppu_all_keys`, before this issue split it) —
+    /// mislabeled as "Conway" while actually exercising the Dijkstra-only
+    /// wire keys too, which is exactly the gap #1013 closed: those bytes must
+    /// be REJECTED under `Era::Conway` (see
+    /// `pparam_update_keys_34_37_rejected_under_conway_accepted_under_dijkstra`
+    /// in `decode/era_conway.rs`) and are only valid here, under Dijkstra.
     #[test]
-    fn test_ppu_round_trip_all_pre_conway_keys() {
+    fn test_ppu_round_trip_all_dijkstra_keys() {
+        use crate::decode::ppu_from_cbor;
+
+        let original = dijkstra_ppu_all_keys();
+
+        assert_eq!(
+            dijkstra_populated_field_count(&original),
+            DIJKSTRA_PPU_FIELD_COUNT,
+            "the fixture must populate every Dijkstra PPU field"
+        );
+
+        let encoded = encode_protocol_param_update(&original);
+        let decoded = ppu_from_cbor(&encoded, dugite_primitives::Era::Dijkstra)
+            .expect("Dijkstra round-trip decode must succeed");
+
+        assert_eq!(
+            decoded, original,
+            "Dijkstra PPU did not survive encode -> decode"
+        );
+        assert_eq!(
+            encode_protocol_param_update(&decoded),
+            encoded,
+            "PPU encoder must be idempotent"
+        );
+    }
+
+    /// Issue #1013: the pre-Conway `protocol_param_update` decoder is now
+    /// era-gated, and its valid key set genuinely differs Shelley/Allegra/Mary
+    /// vs Alonzo vs Babbage (oracle-verified against
+    /// `IntersectMBO/cardano-ledger@4849c13d6f70e5ab46add9af6e0ec5c537b61f69` —
+    /// see the doc comment on `read_pre_conway_protocol_param_update` in
+    /// `decode/era_shelley.rs` for the full per-era citation). A single
+    /// "union of keys 0-24" fixture (this test's PRE-#1013 shape) can no
+    /// longer round-trip through any ONE era's decoder — keys 15 and
+    /// 17-24 are mutually exclusive on the real chain (Shelley/Allegra/Mary
+    /// have `min_utxo_value` but predate Plutus entirely; Alonzo/Babbage
+    /// replace it with `coinsPerUTxOWord`/`coinsPerUTxOByte`). Split into one
+    /// fixture per era family instead of testing the artificial union.
+    ///
+    /// Shelley/Allegra/Mary key set: 0-16, no gaps. `d` was live on mainnet
+    /// throughout Shelley and `extra_entropy` carried the one-time
+    /// non-neutral value at epoch 259.
+    #[test]
+    fn test_ppu_round_trip_shelley_family_keys() {
         use crate::decode::pre_conway_ppu_from_cbor;
+        use dugite_primitives::Era;
 
         let original = ProtocolParamUpdate {
             min_fee_a: Some(44),
@@ -1000,12 +1050,62 @@ mod tests {
             a0: Some(rat(3, 10)),
             rho: Some(rat(3, 1000)),
             tau: Some(rat(1, 5)),
-            // Keys 12-15 — pre-Conway only.
             d: Some(rat(1, 2)),
             extra_entropy: Some(dugite_primitives::hash::Hash::from_bytes([0x5a; 32])),
             protocol_version_major: Some(8),
             protocol_version_minor: Some(1),
             min_utxo_value: Some(Lovelace(1_000_000)),
+            min_pool_cost: Some(Lovelace(170_000_000)),
+            ..Default::default()
+        };
+
+        // Shelley, Allegra and Mary share `eraPParams = shelleyPParams`
+        // verbatim (oracle-verified — `allegra_PParams.hs:43`,
+        // `mary_PParams.hs:50`), so the identical fixture must round-trip
+        // through all three, not just Shelley.
+        for era in [Era::Shelley, Era::Allegra, Era::Mary] {
+            let encoded = encode_pre_conway_protocol_param_update(&original);
+            let decoded = pre_conway_ppu_from_cbor(&encoded, era)
+                .unwrap_or_else(|e| panic!("{era:?} round-trip decode must succeed: {e}"));
+            assert_eq!(
+                decoded, original,
+                "{era:?} PPU did not survive encode -> decode"
+            );
+            assert_eq!(
+                encode_pre_conway_protocol_param_update(&decoded),
+                encoded,
+                "{era:?} PPU encoder must be idempotent"
+            );
+        }
+    }
+
+    /// Issue #1013: Alonzo key set — 0-14, 16-24 (gap: 15 `min_utxo_value`,
+    /// replaced by `coinsPerUTxOWord` at key 17). Alonzo KEEPS `d`(12) and
+    /// `extra_entropy`(13) — oracle-verified `alonzo_PParams.hs:340-341`
+    /// (`hkdDL`/`hkdExtraEntropyL` are real fields; only
+    /// `hkdMinUTxOValueCompactL = notSupportedInThisEraL`).
+    #[test]
+    fn test_ppu_round_trip_alonzo_keys() {
+        use crate::decode::pre_conway_ppu_from_cbor;
+        use dugite_primitives::Era;
+
+        let original = ProtocolParamUpdate {
+            min_fee_a: Some(44),
+            min_fee_b: Some(155_381),
+            max_block_body_size: Some(90_112),
+            max_tx_size: Some(16_384),
+            max_block_header_size: Some(1_100),
+            key_deposit: Some(Lovelace(2_000_000)),
+            pool_deposit: Some(Lovelace(500_000_000)),
+            e_max: Some(18),
+            n_opt: Some(500),
+            a0: Some(rat(3, 10)),
+            rho: Some(rat(3, 1000)),
+            tau: Some(rat(1, 5)),
+            d: Some(rat(1, 2)),
+            extra_entropy: Some(dugite_primitives::hash::Hash::from_bytes([0x5a; 32])),
+            protocol_version_major: Some(8),
+            protocol_version_minor: Some(1),
             min_pool_cost: Some(Lovelace(170_000_000)),
             ada_per_utxo_byte: Some(Lovelace(4_310)),
             cost_models: Some(CostModels {
@@ -1034,25 +1134,159 @@ mod tests {
         };
 
         let encoded = encode_pre_conway_protocol_param_update(&original);
-        let decoded = pre_conway_ppu_from_cbor(&encoded).expect("round-trip decode must succeed");
-
+        let decoded = pre_conway_ppu_from_cbor(&encoded, Era::Alonzo)
+            .expect("Alonzo round-trip decode must succeed");
         assert_eq!(
             decoded, original,
-            "pre-Conway PPU did not survive encode -> decode"
+            "Alonzo PPU did not survive encode -> decode"
         );
         assert_eq!(
             encode_pre_conway_protocol_param_update(&decoded),
             encoded,
-            "pre-Conway PPU encoder must be idempotent"
+            "Alonzo PPU encoder must be idempotent"
         );
     }
 
-    /// Fields the Conway PPU wire type carries (keys 0-11, 16-33, 34-37).
+    /// Issue #1013: Babbage key set — 0-11, 14, 16-24 (gaps: 12 `d`, 13
+    /// `extra_entropy`, 15 `min_utxo_value` — oracle-verified
+    /// `babbage_PParams.hs:196-198`, all three `notSupportedInThisEraL`).
+    #[test]
+    fn test_ppu_round_trip_babbage_keys() {
+        use crate::decode::pre_conway_ppu_from_cbor;
+        use dugite_primitives::Era;
+
+        let original = ProtocolParamUpdate {
+            min_fee_a: Some(44),
+            min_fee_b: Some(155_381),
+            max_block_body_size: Some(90_112),
+            max_tx_size: Some(16_384),
+            max_block_header_size: Some(1_100),
+            key_deposit: Some(Lovelace(2_000_000)),
+            pool_deposit: Some(Lovelace(500_000_000)),
+            e_max: Some(18),
+            n_opt: Some(500),
+            a0: Some(rat(3, 10)),
+            rho: Some(rat(3, 1000)),
+            tau: Some(rat(1, 5)),
+            protocol_version_major: Some(8),
+            protocol_version_minor: Some(1),
+            min_pool_cost: Some(Lovelace(170_000_000)),
+            ada_per_utxo_byte: Some(Lovelace(4_310)),
+            cost_models: Some(CostModels {
+                plutus_v1: Some(vec![100, 200]),
+                plutus_v2: Some(vec![300]),
+                plutus_v3: None,
+                plutus_v4: None,
+                ..Default::default()
+            }),
+            execution_costs: Some(ExUnitPrices {
+                mem_price: rat(577, 10_000),
+                step_price: rat(721, 10_000_000),
+            }),
+            max_tx_ex_units: Some(ExUnits {
+                mem: 14_000_000,
+                steps: 10_000_000_000,
+            }),
+            max_block_ex_units: Some(ExUnits {
+                mem: 62_000_000,
+                steps: 20_000_000_000,
+            }),
+            max_val_size: Some(5_000),
+            collateral_percentage: Some(150),
+            max_collateral_inputs: Some(3),
+            ..Default::default()
+        };
+
+        let encoded = encode_pre_conway_protocol_param_update(&original);
+        let decoded = pre_conway_ppu_from_cbor(&encoded, Era::Babbage)
+            .expect("Babbage round-trip decode must succeed");
+        assert_eq!(
+            decoded, original,
+            "Babbage PPU did not survive encode -> decode"
+        );
+        assert_eq!(
+            encode_pre_conway_protocol_param_update(&decoded),
+            encoded,
+            "Babbage PPU encoder must be idempotent"
+        );
+    }
+
+    /// Issue #1013: an unrecognized/out-of-era PPU key must hard-reject, not
+    /// silently skip — per era, through the REAL decoder (not a helper).
+    /// Each case pairs a key that is invalid for the given era with a value
+    /// shape that would decode fine if the key were accepted, isolating the
+    /// key-validity check as the only thing under test.
+    #[test]
+    fn test_pre_conway_ppu_unknown_key_rejected_per_era() {
+        use crate::decode::pre_conway_ppu_from_cbor;
+        use dugite_primitives::Era;
+
+        fn ppu_map_with_key(key: u64, value: &[u8]) -> Vec<u8> {
+            let mut v = vec![0xa1]; // map(1)
+            v.extend(encode_uint_test(key));
+            v.extend_from_slice(value);
+            v
+        }
+
+        // (era, invalid key, value bytes)
+        let cases: &[(Era, u64, &[u8])] = &[
+            // Shelley/Allegra/Mary predate Plutus: keys 17-24 don't exist.
+            (Era::Shelley, 17, &[0x01]),
+            (Era::Allegra, 18, &[0xa0]),
+            (Era::Mary, 22, &[0x01]),
+            // Alonzo dropped min_utxo_value (key 15) for coinsPerUTxOWord (17).
+            (Era::Alonzo, 15, &[0x01]),
+            // Babbage dropped d(12), extra_entropy(13) AND min_utxo_value(15).
+            (Era::Babbage, 12, &[0x01]),
+            (Era::Babbage, 13, &[0x81, 0x00]),
+            (Era::Babbage, 15, &[0x01]),
+            // A key no pre-Conway era ever had (Conway-only governance key).
+            (Era::Shelley, 25, &[0x01]),
+            (Era::Babbage, 30, &[0x01]),
+            // Totally out of range, every era.
+            (Era::Shelley, 999, &[0x00]),
+            (Era::Alonzo, 999, &[0x00]),
+            (Era::Babbage, 999, &[0x00]),
+        ];
+
+        for (era, key, value) in cases {
+            let data = ppu_map_with_key(*key, value);
+            let result = pre_conway_ppu_from_cbor(&data, *era);
+            assert!(
+                result.is_err(),
+                "key {key} must be rejected under {era:?}, got {result:?}"
+            );
+        }
+    }
+
+    fn encode_uint_test(n: u64) -> Vec<u8> {
+        if n <= 23 {
+            vec![n as u8]
+        } else if n <= 0xff {
+            vec![0x18, n as u8]
+        } else if n <= 0xffff {
+            let b = (n as u16).to_be_bytes();
+            vec![0x19, b[0], b[1]]
+        } else {
+            let b = (n as u32).to_be_bytes();
+            vec![0x1a, b[0], b[1], b[2], b[3]]
+        }
+    }
+
+    /// Fields the Conway PPU wire type carries (keys 0-11, 16-33).
     ///
-    /// Keys 12-15 are pre-Conway only and are excluded deliberately: including
-    /// them would make the Conway round-trip fail on fields the Conway encoder
-    /// is correct not to emit.
-    const CONWAY_PPU_FIELD_COUNT: usize = 47;
+    /// Keys 12-15 are pre-Conway only, and keys 34-37 are Dijkstra-only
+    /// (issue #1013 — Conway's `eraPParams` has no entries for them,
+    /// oracle-verified: see `read_protocol_param_update` in
+    /// `decode/era_conway.rs`). Both are excluded deliberately: including
+    /// either would make the Conway round-trip fail on keys the Conway
+    /// DECODER now correctly rejects (this fixture used to include 34-37,
+    /// which is exactly the false-negative shape #1013 fixed — a "Conway"
+    /// test that was silently exercising the Dijkstra-only additions too).
+    const CONWAY_PPU_FIELD_COUNT: usize = 43;
+
+    /// [`CONWAY_PPU_FIELD_COUNT`] plus the 4 Dijkstra-only additions (34-37).
+    const DIJKSTRA_PPU_FIELD_COUNT: usize = CONWAY_PPU_FIELD_COUNT + 4;
 
     fn conway_populated_field_count(ppu: &ProtocolParamUpdate) -> usize {
         let mut n = 0;
@@ -1104,6 +1338,17 @@ mod tests {
         count(ppu.min_committee_size.is_some());
         count(ppu.committee_term_limit.is_some());
         count(ppu.drep_activity.is_some());
+        n
+    }
+
+    /// [`conway_populated_field_count`] plus the 4 Dijkstra-only fields.
+    fn dijkstra_populated_field_count(ppu: &ProtocolParamUpdate) -> usize {
+        let mut n = conway_populated_field_count(ppu);
+        let mut count = |present: bool| {
+            if present {
+                n += 1;
+            }
+        };
         count(ppu.max_ref_script_size_per_block.is_some());
         count(ppu.max_ref_script_size_per_tx.is_some());
         count(ppu.ref_script_cost_stride.is_some());
@@ -1181,12 +1426,19 @@ mod tests {
             min_committee_size: Some(5),
             committee_term_limit: Some(146),
             drep_activity: Some(20),
-            // Dijkstra keys 34-37.
+            ..Default::default()
+        }
+    }
+
+    /// [`conway_ppu_all_keys`] plus the 4 Dijkstra-only additions (34-37) —
+    /// valid under `Era::Dijkstra` only (issue #1013).
+    fn dijkstra_ppu_all_keys() -> ProtocolParamUpdate {
+        ProtocolParamUpdate {
             max_ref_script_size_per_block: Some(1_000_000),
             max_ref_script_size_per_tx: Some(200_000),
             ref_script_cost_stride: Some(25_600),
             ref_script_cost_multiplier: Some(rat(6, 5)),
-            ..Default::default()
+            ..conway_ppu_all_keys()
         }
     }
 
@@ -1324,6 +1576,7 @@ mod tests {
         let enc = encode_protocol_param_update(&ppu);
         let d = crate::decode::era_conway::read_protocol_param_update_for_test(
             &mut crate::decode::reader::Reader::new(&enc),
+            dugite_primitives::Era::Conway,
         )
         .expect("PPU must decode its own encoding");
 

@@ -127,14 +127,24 @@ pub fn decode_conway_block_header(inner_cbor: &[u8]) -> Result<BlockHeader, Seri
 /// Used for testing and for CLI `GetCurrentPParams` / `ParameterChange`
 /// decoding where the map is extracted from an HFC-wrapped query result.
 ///
-/// Keys 0-33 are the Conway PParams; keys 34-37 are the Dijkstra additions:
+/// `era` must be `Era::Conway` or `Era::Dijkstra` — it selects which key set
+/// is valid (issue #1013). Keys 0-33 are the Conway PParams; keys 34-37 are
+/// Dijkstra-only additions:
 /// - 34: `maxRefScriptSizePerBlock` (uint / Word32)
 /// - 35: `maxRefScriptSizePerTx` (uint / Word32)
 /// - 36: `refScriptCostStride` (uint / NonZero Word32)
 /// - 37: `refScriptCostMultiplier` (tag-30 rational)
-pub fn ppu_from_cbor(cbor: &[u8]) -> Result<ProtocolParamUpdate, SerializationError> {
+///
+/// Dijkstra upstream actually defines SIX new keys (34-39: the above four
+/// plus 38 `maxPledgeLeverage` and 39 `minPoolMargin` — oracle-verified,
+/// `eras/dijkstra/impl/src/Cardano/Ledger/Dijkstra/PParams.hs:490-572` @
+/// `4849c13d6f70e5ab46add9af6e0ec5c537b61f69`), but `ProtocolParamUpdate` has
+/// no fields for 38/39 yet. Keys 38/39 are therefore rejected as unknown even
+/// under `Era::Dijkstra` — a documented, fail-closed gap (Dijkstra is
+/// unreleased) tracked separately from this decoder's unknown-key fix.
+pub fn ppu_from_cbor(cbor: &[u8], era: Era) -> Result<ProtocolParamUpdate, SerializationError> {
     let mut r = Reader::new(cbor);
-    read_protocol_param_update(&mut r)
+    read_protocol_param_update(&mut r, era)
 }
 
 // ============================================================================
@@ -652,7 +662,7 @@ pub(crate) fn decode_conway_tx_body(
                 // count-check applies to any set/oset, and `read_set_strict`
                 // preserves wire order (it only rejects duplicates, never
                 // reorders), so the OSet ordering is unchanged.
-                proposal_procedures = r.read_set_strict(|r| read_proposal_procedure(r))?;
+                proposal_procedures = r.read_set_strict(|r| read_proposal_procedure(r, era))?;
             }
             21 => {
                 // current_treasury_value
@@ -948,7 +958,14 @@ pub(crate) fn decode_sub_tx_body(
             }
             20 => {
                 // proposal_procedures: OSet<proposal_procedure>
-                sub.proposal_procedures = r.read_set_strict(|r| read_proposal_procedure(r))?;
+                //
+                // `decode_sub_tx_body` only ever decodes a Dijkstra SubTx (the
+                // `SubTransaction` concept does not exist pre-Dijkstra), so the
+                // era passed to `read_proposal_procedure`'s PPU key-set gate
+                // (issue #1013) is unconditionally `Era::Dijkstra` here — not a
+                // behavior change, just naming what was already implicit.
+                sub.proposal_procedures =
+                    r.read_set_strict(|r| read_proposal_procedure(r, Era::Dijkstra))?;
             }
             21 => {
                 // current_treasury_value
@@ -1159,6 +1176,12 @@ fn read_legacy_tx_output(r: &mut Reader<'_>) -> Result<TransactionOutput, Serial
     })
 }
 
+/// **Unknown keys are HARD-REJECTED** (issue #1013's sweep — see
+/// `read_babbage_map_output` in `era_babbage.rs`, which carries the full
+/// oracle citation this shares: `Conway`/`Dijkstra` both reuse
+/// `BabbageTxOut`'s `DecCBOR` instance verbatim, `SparseKeyed` with
+/// `bodyFields n = invalidField n` for keys outside 0-3, no era gating
+/// needed since the key set is identical across Babbage/Conway/Dijkstra).
 fn read_map_tx_output(r: &mut Reader<'_>) -> Result<TransactionOutput, SerializationError> {
     let mut address_bytes: Option<Vec<u8>> = None;
     let mut value: Option<Value> = None;
@@ -1180,7 +1203,9 @@ fn read_map_tx_output(r: &mut Reader<'_>) -> Result<TransactionOutput, Serializa
                 script_ref = Some(read_script_ref(r)?);
             }
             _ => {
-                r.skip()?;
+                return Err(SerializationError::CborDecode(format!(
+                    "map tx_out: unknown/invalid key {key}"
+                )));
             }
         }
         Ok(())
@@ -2009,6 +2034,7 @@ fn read_vote(r: &mut Reader<'_>) -> Result<Vote, SerializationError> {
 
 pub(crate) fn read_proposal_procedure(
     r: &mut Reader<'_>,
+    era: Era,
 ) -> Result<ProposalProcedure, SerializationError> {
     // proposal_procedure = [deposit, reward_account, gov_action, anchor]
     let arr_len = r.read_array_header()?;
@@ -2019,7 +2045,7 @@ pub(crate) fn read_proposal_procedure(
     }
     let deposit = read_lovelace(r)?;
     let return_addr = r.read_bytes_owned()?;
-    let gov_action = read_gov_action(r)?;
+    let gov_action = read_gov_action(r, era)?;
     let anchor = read_anchor(r)?;
     Ok(ProposalProcedure {
         deposit,
@@ -2046,11 +2072,12 @@ pub(crate) fn read_proposal_procedure(
 #[cfg(test)]
 pub(crate) fn read_gov_action_for_test(
     r: &mut Reader<'_>,
+    era: Era,
 ) -> Result<GovAction, SerializationError> {
-    read_gov_action(r)
+    read_gov_action(r, era)
 }
 
-fn read_gov_action(r: &mut Reader<'_>) -> Result<GovAction, SerializationError> {
+fn read_gov_action(r: &mut Reader<'_>, era: Era) -> Result<GovAction, SerializationError> {
     let arr_len = r.read_array_header()?;
     if arr_len.is_none() {
         return Err(SerializationError::CborDecode(
@@ -2062,7 +2089,7 @@ fn read_gov_action(r: &mut Reader<'_>) -> Result<GovAction, SerializationError> 
         0 => {
             // ParameterChange
             let prev_action_id = read_optional_gov_action_id(r)?;
-            let protocol_param_update = Box::new(read_protocol_param_update(r)?);
+            let protocol_param_update = Box::new(read_protocol_param_update(r, era)?);
             let policy_hash = read_optional_hash28_gov(r)?;
             Ok(GovAction::ParameterChange {
                 prev_action_id,
@@ -2176,7 +2203,7 @@ fn read_constitution(r: &mut Reader<'_>) -> Result<Constitution, SerializationEr
     })
 }
 
-/// Read a Conway protocol parameter update (map form, keys 0-31).
+/// Read a Conway/Dijkstra protocol parameter update (map form).
 /// Test-only re-export of [`read_protocol_param_update`] so the encoder's
 /// round-trip test can prove every populated field survives the wire. #919
 /// found key 15 being decoded and then DROPPED — a full round-trip is what
@@ -2184,40 +2211,75 @@ fn read_constitution(r: &mut Reader<'_>) -> Result<Constitution, SerializationEr
 #[cfg(test)]
 pub(crate) fn read_protocol_param_update_for_test(
     r: &mut Reader<'_>,
+    era: Era,
 ) -> Result<ProtocolParamUpdate, SerializationError> {
-    read_protocol_param_update(r)
+    read_protocol_param_update(r, era)
 }
 
+/// Read a Conway (PV9-11) or Dijkstra (PV12+) `protocol_param_update` map.
+///
+/// Both the definite- and indefinite-length CBOR forms are accepted
+/// (`for_each_field_entry` — issue #1012; the previous
+/// `read_map_header()?.unwrap_or(0)` silently decoded an indefinite-length
+/// map as ZERO entries and desynced the reader for everything after it — a
+/// `ParameterChange` spanning more than 23 keys installed NO parameters at
+/// all while cardano-node installed the real set: a consensus divergence).
+/// `for_each_field_entry`
+/// also hard-rejects a **duplicate** key on the same map, matching Haskell's
+/// `Set Word`-tracked `decodeSparseKeyed`/`SparseKeyed` (both branches below).
+///
+/// **Unknown/out-of-era keys are HARD-REJECTED** (issue #1013), not silently
+/// skipped. Oracle-verified against `IntersectMBO/cardano-ledger` at pinned
+/// commit `4849c13d6f70e5ab46add9af6e0ec5c537b61f69` (SHA confirmed resolving
+/// via `gh api repos/IntersectMBO/cardano-ledger/commits/<sha>`):
+///
+/// `libs/cardano-ledger-core/src/Cardano/Ledger/Core/PParams.hs:262-297` —
+/// `DecCBOR (PParamsUpdate era)` splits on `ifDecoderVersionAtLeast (natVersion
+/// @12)` into `decodeSparseKeyed TypeName [] emptyPParamsUpdate decoderByKey`
+/// (PV12+/Dijkstra) vs `decode $ SparseKeyed name emptyPParamsUpdate
+/// updateField []` (PV<12/Conway) — but **both branches consult the exact same
+/// `updateFieldMap`**, built once from `eraPParams @era`:
+/// ```haskell
+/// updateFieldMap :: IntMap (Field (PParamsUpdate era))
+/// updateFieldMap =
+///   IntMap.fromList
+///     [ (fromIntegral ppuTag, mkField ppEraDecoder ppuLens)
+///     | PParam {ppEraDecoder, ppUpdate = Just PParamUpdate {ppuTag, ppuLens}} <- eraPParams @era
+///     ]
+/// ```
+/// A key absent from that map hard-fails in EITHER branch: the PV12+
+/// `decodeSparseKeyed`'s `step` returns `Nothing` -> `failMsg "Unknown field
+/// key ..."` (`Decoder.hs:1277-1287`); the pre-PV12 `updateField` falls
+/// through `IntMap.findWithDefault (invalidField k) ...` -> `invalidField` ->
+/// `cborError` (`Coders.hs`). The `natVersion @12` split changes only which
+/// decode *combinator* runs, never which keys are legal — so a single,
+/// era-gated (not PV-gated) key table is correct for both.
+///
+/// Per-era valid key sets, independently confirmed by fetching each file at
+/// the pinned SHA (not inferred from dugite's prior match arms, several of
+/// which were already too permissive before this fix):
+/// - **Conway** (`eras/conway/impl/.../Conway/PParams.hs:862-894`): 0-11,
+///   16-33. Gaps 12/13/14/15 — `ppD`/`hkdExtraEntropyL`/`hkdMinUTxOValueCompactL`
+///   are `notSupportedInThisEraL`, and `ppGovProtocolVersion` (in the array(31)
+///   positional list, at the same array slot key 14 would occupy) carries
+///   `ppUpdate = Nothing` — present for the POSITIONAL `GetCurrentPParams`
+///   encoding, absent from the sparse PPU update map.
+/// - **Dijkstra** (`eras/dijkstra/impl/.../Dijkstra/PParams.hs:450-572`): 0-11,
+///   16-39 — same four gaps as Conway (imports `ppGovProtocolVersion` directly
+///   from Conway; `hkdMinUTxOValueCompactL = notSupportedInThisEraL`). Adds SIX
+///   keys, not four: 34 `maxRefScriptSizePerBlock`, 35 `maxRefScriptSizePerTx`,
+///   36 `refScriptCostStride`, 37 `refScriptCostMultiplier`, 38
+///   `maxPledgeLeverage`, 39 `minPoolMargin`. `ProtocolParamUpdate` has no
+///   fields for 38/39 yet (dugite's prior "34-37" doc comment undercounted
+///   Dijkstra by two keys) — those two are rejected as unknown even under
+///   `Era::Dijkstra`, a documented fail-closed gap (Dijkstra is unreleased)
+///   for whoever adds the missing fields, tracked separately from this fix.
 fn read_protocol_param_update(
     r: &mut Reader<'_>,
+    era: Era,
 ) -> Result<ProtocolParamUpdate, SerializationError> {
     let mut ppu = ProtocolParamUpdate::default();
-    // `for_each_map_entry` handles BOTH definite- and indefinite-length CBOR
-    // maps (issue #1012). The previous `read_map_header()?.unwrap_or(0)`
-    // silently decoded an indefinite-length map as ZERO entries and desynced
-    // the reader for everything after it — this is the tx-body key 6 /
-    // governance `ParameterChange` decoder, so a >23-key update (crossing
-    // `cardano-ledger-binary`'s `encodeMap` indefinite threshold, #932/#938)
-    // installed NO parameters at all while cardano-node installed the real
-    // set: a consensus divergence. Oracle-verified against
-    // `IntersectMBO/cardano-ledger@4849c13d6f70e5ab46add9af6e0ec5c537b61f69`,
-    // `libs/cardano-ledger-core/.../PParams.hs` `DecCBOR (PParamsUpdate era)`:
-    // every released era (PV<=11, including Conway) decodes via
-    // `decode $ SparseKeyed name emptyPParamsUpdate updateField []`, whose
-    // `decodeSparse` calls `decodeMapLenOrIndef` and, on `Nothing`, loops via
-    // `getSparseBlockIndef` until `decodeBreakOr` — i.e. both the definite
-    // and indefinite forms are honored, matching `for_each_map_entry` here
-    // (and the sibling fix already applied to `read_pre_conway_protocol_param_update`
-    // in `era_shelley.rs`, faaaed42d8).
-    //
-    // NOTE (separate, NOT fixed here): the same oracle lookup found that
-    // Haskell hard-rejects a truly unrecognized key (`updateField k` falls
-    // through to `invalidField k` -> `cborError`), where dugite's `_ => skip`
-    // arm below silently tolerates it. That is a second, independent
-    // divergence from the one this function fixes — see the issue tracker
-    // for the follow-up rather than conflating the two here.
-    r.for_each_map_entry(|r| {
-        let key = r.read_uint()?;
+    r.for_each_field_entry(|r, key| {
         match key {
             0 => ppu.min_fee_a = Some(r.read_uint()?),
             1 => ppu.min_fee_b = Some(r.read_uint()?),
@@ -2279,23 +2341,24 @@ fn read_protocol_param_update(
                 // so truncating the denominator would diverge for a fractional value.
                 ppu.min_fee_ref_script_cost_per_byte = Some(r.read_rational()?);
             }
-            // Dijkstra-era PParams (keys 34-37)
-            // Haskell: `eras/dijkstra/impl/src/Cardano/Ledger/Dijkstra/PParams.hs`
-            // `ppuTag = 34..37`.
-            34 => {
+            // Dijkstra-era PParams (keys 34-37). Conway's `eraPParams` list has
+            // NO entries for these tags (verified — see the function doc
+            // comment), so they must hard-reject when `era == Era::Conway`;
+            // only Dijkstra's `eraPParams` list includes them.
+            34 if era == Era::Dijkstra => {
                 // maxRefScriptSizePerBlock: Word32 encoded as uint
                 ppu.max_ref_script_size_per_block = Some(r.read_uint()? as u32);
             }
-            35 => {
+            35 if era == Era::Dijkstra => {
                 // maxRefScriptSizePerTx: Word32 encoded as uint
                 ppu.max_ref_script_size_per_tx = Some(r.read_uint()? as u32);
             }
-            36 => {
+            36 if era == Era::Dijkstra => {
                 // refScriptCostStride: NonZero Word32 encoded as uint
                 // Must be >= 1 on the wire; we store as u32 (caller enforces > 0).
                 ppu.ref_script_cost_stride = Some(r.read_uint()? as u32);
             }
-            37 => {
+            37 if era == Era::Dijkstra => {
                 // refScriptCostMultiplier: PositiveInterval — CBOR rational (tag 30
                 // wrapping [numerator, denominator]) or bare [uint, uint].
                 let rat = r.read_rational()?;
@@ -2305,7 +2368,18 @@ fn read_protocol_param_update(
                 });
             }
             _ => {
-                r.skip()?;
+                // Unknown/out-of-era PPU key — HARD REJECT (issue #1013), per
+                // upstream `updateFieldMap`/`invalidField`/`decodeSparseKeyed`
+                // (see the function doc comment for the full oracle citation).
+                // This also catches keys 12/13/14/15 (never valid in Conway OR
+                // Dijkstra — no match arm exists for them above, by design),
+                // keys 34-37 reached under `Era::Conway` (guard above did not
+                // match), and keys 38/39 (Dijkstra-valid upstream, but
+                // `ProtocolParamUpdate` has no fields for them yet — a
+                // documented fail-closed gap, not this fix's scope).
+                return Err(SerializationError::CborDecode(format!(
+                    "{era:?} protocol_param_update: unknown/invalid key {key}"
+                )));
             }
         }
         Ok(())
@@ -3793,6 +3867,31 @@ mod tests {
         assert_eq!(out.value.coin.0, 5);
     }
 
+    /// Issue #1013's sweep finding: `post_alonzo_transaction_output` is
+    /// SparseKeyed 0-3 (`invalidField` catch-all — same as PPU), so an
+    /// unrecognized key must hard-reject, not silently skip.
+    #[test]
+    fn map_tx_output_unknown_key_rejected() {
+        // map(2) { 0: addr, 4: 0 } — key 4 does not exist in BabbageTxOut.
+        let addr = {
+            let mut a = vec![0x60u8];
+            a.extend([0x11u8; 28]);
+            a
+        };
+        let mut data = vec![0xa2]; // map(2)
+        data.extend(cbor_uint(0));
+        data.extend(cbor_bytes(&addr));
+        data.extend(cbor_uint(4));
+        data.extend(cbor_uint(0));
+
+        let mut r = Reader::new(&data);
+        let result = read_map_tx_output(&mut r);
+        assert!(
+            matches!(result, Err(SerializationError::CborDecode(_))),
+            "unknown map-TxOut key 4 must be rejected, got {result:?}"
+        );
+    }
+
     // ── Conway PV9+ Set duplicate rejection (backlog #31-C) ────────────────────
 
     /// Build a Conway transaction_input `[hash32, index]`.
@@ -4123,7 +4222,7 @@ mod tests {
 
         let data = cbor_arr(&[&deposit, &reward_acct, &info_action, &anchor]);
         let mut r = Reader::new(&data);
-        let pp = read_proposal_procedure(&mut r).unwrap();
+        let pp = read_proposal_procedure(&mut r, Era::Conway).unwrap();
         assert_eq!(pp.deposit, Lovelace(500_000_000));
         assert!(matches!(pp.gov_action, GovAction::InfoAction));
         assert_eq!(pp.anchor.url, "https://info.example.com");
@@ -4185,7 +4284,7 @@ mod tests {
         data.extend(cbor_uint(155381));
 
         let mut r = Reader::new(&data);
-        let ppu = read_protocol_param_update(&mut r).unwrap();
+        let ppu = read_protocol_param_update(&mut r, Era::Conway).unwrap();
         assert_eq!(ppu.min_fee_a, Some(44));
         assert_eq!(ppu.min_fee_b, Some(155381));
         assert_eq!(ppu.min_pool_cost, None);
@@ -4219,12 +4318,11 @@ mod tests {
     // this. Only a hand-built or Haskell-derived fixture reaches it, per
     // CLAUDE.md's standing round-trip caveat.
 
-    /// Every key `read_protocol_param_update` recognizes: the 30 Conway keys
-    /// (0-11, 16-33) plus the 4 Dijkstra additions (34-37) the function also
-    /// accepts unconditionally (see the "Dijkstra-era PParams" comment on the
-    /// decoder). 34 entries total — deliberately past the 23-entry indefinite
-    /// threshold so this fixture crosses it with real (not padding) keys.
-    fn all_ppu_entries() -> Vec<(u64, Vec<u8>)> {
+    /// Every key valid under `Era::Conway` (issue #1013 — keys 34-37 are
+    /// Dijkstra-only and must NOT appear here; see [`dijkstra_only_ppu_entries`]
+    /// for those). 30 entries — past the 23-entry indefinite threshold so
+    /// this fixture crosses it with real (not padding) keys.
+    fn conway_ppu_entries() -> Vec<(u64, Vec<u8>)> {
         let entries: Vec<(u64, Vec<u8>)> = vec![
             (0, cbor_uint(44)),
             (1, cbor_uint(155381)),
@@ -4288,15 +4386,22 @@ mod tests {
             (31, cbor_uint(500_000_000)),
             (32, cbor_uint(20)),
             (33, cbor_rational(15, 100)),
-            (34, cbor_uint(200_000)),
-            (35, cbor_uint(1_000_000)),
-            (36, cbor_uint(25_600)),
-            (37, cbor_rational(12, 10)),
         ];
         assert!(
             entries.len() > 23,
             "fixture must cross the encodeMap indefinite threshold"
         );
+        entries
+    }
+
+    /// `conway_ppu_entries()` plus the 4 Dijkstra-only additions (34-37) —
+    /// valid under `Era::Dijkstra` only (issue #1013).
+    fn dijkstra_ppu_entries() -> Vec<(u64, Vec<u8>)> {
+        let mut entries = conway_ppu_entries();
+        entries.push((34, cbor_uint(200_000)));
+        entries.push((35, cbor_uint(1_000_000)));
+        entries.push((36, cbor_uint(25_600)));
+        entries.push((37, cbor_rational(12, 10)));
         entries
     }
 
@@ -4334,7 +4439,7 @@ mod tests {
         let entries = vec![(7u64, cbor_uint(100)), (8u64, cbor_uint(150))];
         let cbor = ppu_map_indefinite(&entries);
         let mut r = Reader::new(&cbor);
-        let ppu = read_protocol_param_update(&mut r)
+        let ppu = read_protocol_param_update(&mut r, Era::Conway)
             .expect("indefinite ProtocolParamUpdate map must decode");
         assert_eq!(
             ppu.e_max,
@@ -4350,16 +4455,16 @@ mod tests {
         // than the 23-entry `encodeMap` indefinite-form threshold. Assert the
         // indefinite-form decode equals the definite-form decode of the exact
         // same logical entries — not merely "decodes without error".
-        let entries = all_ppu_entries();
+        let entries = conway_ppu_entries();
 
         let definite_cbor = ppu_map_definite(&entries);
         let mut dr = Reader::new(&definite_cbor);
-        let definite_ppu =
-            read_protocol_param_update(&mut dr).expect("definite-form >23-key PPU map must decode");
+        let definite_ppu = read_protocol_param_update(&mut dr, Era::Conway)
+            .expect("definite-form >23-key PPU map must decode");
 
         let indefinite_cbor = ppu_map_indefinite(&entries);
         let mut ir = Reader::new(&indefinite_cbor);
-        let indefinite_ppu = read_protocol_param_update(&mut ir)
+        let indefinite_ppu = read_protocol_param_update(&mut ir, Era::Conway)
             .expect("indefinite-form >23-key PPU map must decode");
 
         assert_eq!(
@@ -4372,7 +4477,31 @@ mod tests {
         // Sanity: this is not a vacuous equality between two empty defaults —
         // confirm the fixture actually populated the fields both sides agree on.
         assert_eq!(definite_ppu.min_fee_a, Some(44));
+        assert!(definite_ppu.min_fee_ref_script_cost_per_byte.is_some());
+        assert_ne!(definite_ppu, ProtocolParamUpdate::default());
+    }
+
+    /// Issue #1013: the Dijkstra counterpart of the test above — the same
+    /// past-23-key indefinite-map coverage, but including keys 34-37 and
+    /// decoded under `Era::Dijkstra`. Proves the era-gating added for #1013
+    /// does not regress #1012's indefinite-map fix for the Dijkstra-only keys.
+    #[test]
+    fn read_protocol_param_update_accepts_indefinite_length_map_dijkstra_over_23_keys() {
+        let entries = dijkstra_ppu_entries();
+
+        let definite_cbor = ppu_map_definite(&entries);
+        let mut dr = Reader::new(&definite_cbor);
+        let definite_ppu = read_protocol_param_update(&mut dr, Era::Dijkstra)
+            .expect("definite-form >23-key Dijkstra PPU map must decode");
+
+        let indefinite_cbor = ppu_map_indefinite(&entries);
+        let mut ir = Reader::new(&indefinite_cbor);
+        let indefinite_ppu = read_protocol_param_update(&mut ir, Era::Dijkstra)
+            .expect("indefinite-form >23-key Dijkstra PPU map must decode");
+
+        assert_eq!(indefinite_ppu, definite_ppu);
         assert!(definite_ppu.ref_script_cost_multiplier.is_some());
+        assert!(definite_ppu.max_ref_script_size_per_block.is_some());
         assert_ne!(definite_ppu, ProtocolParamUpdate::default());
     }
 
@@ -5048,7 +5177,7 @@ mod tests {
         // [6]
         let data = [0x81, 0x06];
         let mut r = Reader::new(&data);
-        let g = read_gov_action(&mut r).unwrap();
+        let g = read_gov_action(&mut r, Era::Conway).unwrap();
         assert!(matches!(g, GovAction::InfoAction));
     }
 
@@ -5057,7 +5186,7 @@ mod tests {
         // [3, null]
         let data = [0x82, 0x03, 0xf6];
         let mut r = Reader::new(&data);
-        let g = read_gov_action(&mut r).unwrap();
+        let g = read_gov_action(&mut r, Era::Conway).unwrap();
         assert!(matches!(
             g,
             GovAction::NoConfidence {
@@ -5076,7 +5205,7 @@ mod tests {
         data.extend(cbor_uint(11));
         data.extend(cbor_uint(0));
         let mut r = Reader::new(&data);
-        let g = read_gov_action(&mut r).unwrap();
+        let g = read_gov_action(&mut r, Era::Conway).unwrap();
         match g {
             GovAction::HardForkInitiation {
                 protocol_version, ..
@@ -5094,7 +5223,7 @@ mod tests {
         data.push(0x81);
         data.extend(cbor_uint(11));
         let mut r = Reader::new(&data);
-        assert!(read_gov_action(&mut r).is_err());
+        assert!(read_gov_action(&mut r, Era::Conway).is_err());
     }
 
     #[test]
@@ -5107,7 +5236,7 @@ mod tests {
         data.extend(cbor_uint(1_000_000));
         data.push(0xf6); // null policy
         let mut r = Reader::new(&data);
-        let g = read_gov_action(&mut r).unwrap();
+        let g = read_gov_action(&mut r, Era::Conway).unwrap();
         match g {
             GovAction::TreasuryWithdrawals { withdrawals, .. } => {
                 assert_eq!(withdrawals.len(), 1);
@@ -5126,7 +5255,7 @@ mod tests {
         data.extend(cbor_anchor("foo"));
         data.push(0xf6);
         let mut r = Reader::new(&data);
-        let g = read_gov_action(&mut r).unwrap();
+        let g = read_gov_action(&mut r, Era::Conway).unwrap();
         assert!(matches!(g, GovAction::NewConstitution { .. }));
     }
 
@@ -5150,7 +5279,7 @@ mod tests {
         rat.extend(cbor_uint(2));
         data.extend(&rat);
         let mut r = Reader::new(&data);
-        let g = read_gov_action(&mut r).unwrap();
+        let g = read_gov_action(&mut r, Era::Conway).unwrap();
         assert!(matches!(g, GovAction::UpdateCommittee { .. }));
     }
 
@@ -5163,7 +5292,7 @@ mod tests {
         data.push(0xa0); // empty pparam update
         data.push(0xf6); // null policy
         let mut r = Reader::new(&data);
-        let g = read_gov_action(&mut r).unwrap();
+        let g = read_gov_action(&mut r, Era::Conway).unwrap();
         assert!(matches!(g, GovAction::ParameterChange { .. }));
     }
 
@@ -5171,14 +5300,14 @@ mod tests {
     fn gov_action_unknown_disc_rejected() {
         let data = [0x82, 0x18, 0x63, 0xf6]; // [99, null]
         let mut r = Reader::new(&data);
-        assert!(read_gov_action(&mut r).is_err());
+        assert!(read_gov_action(&mut r, Era::Conway).is_err());
     }
 
     #[test]
     fn gov_action_indefinite_array_rejected() {
         let data = [0x9f, 0x06, 0xff];
         let mut r = Reader::new(&data);
-        assert!(read_gov_action(&mut r).is_err());
+        assert!(read_gov_action(&mut r, Era::Conway).is_err());
     }
 
     // ── Protocol param update ─────────────────────────────────────────────
@@ -5192,13 +5321,22 @@ mod tests {
         data.extend(cbor_uint(1));
         data.extend(cbor_uint(200));
         let mut r = Reader::new(&data);
-        let ppu = read_protocol_param_update(&mut r).unwrap();
+        let ppu = read_protocol_param_update(&mut r, Era::Conway).unwrap();
         assert_eq!(ppu.min_fee_a, Some(100));
         assert_eq!(ppu.min_fee_b, Some(200));
     }
 
+    /// Issue #1013. `{99: 0, 2: 4096}` — key 99 is not in ANY era's
+    /// `updateFieldMap`. Haskell hard-rejects the whole decode via
+    /// `invalidField`/`decodeSparseKeyed`'s `Unknown field key` (see the
+    /// `read_protocol_param_update` doc comment for the full oracle
+    /// citation), so dugite must reject too rather than silently skip key 99
+    /// and install key 2. This test previously asserted the OLD (buggy)
+    /// behavior under the name `pparam_update_unknown_key_skipped` — renamed
+    /// and inverted, not duplicated, so the buggy assertion cannot coexist
+    /// with the fix.
     #[test]
-    fn pparam_update_unknown_key_skipped() {
+    fn pparam_update_unknown_key_rejected() {
         // {99: 0, 2: 4096}
         let mut data = vec![0xa2];
         data.extend(cbor_uint(99));
@@ -5206,8 +5344,204 @@ mod tests {
         data.extend(cbor_uint(2));
         data.extend(cbor_uint(4096));
         let mut r = Reader::new(&data);
-        let ppu = read_protocol_param_update(&mut r).unwrap();
-        assert_eq!(ppu.max_block_body_size, Some(4096));
+        let result = read_protocol_param_update(&mut r, Era::Conway);
+        assert!(
+            matches!(result, Err(SerializationError::CborDecode(_))),
+            "unknown PPU key 99 must be rejected under Era::Conway, got {result:?}"
+        );
+
+        // Same bytes, indefinite-length map form — `for_each_field_entry`
+        // must reject on both the definite and indefinite paths (#1012's
+        // lesson: a fix that only covers one framing leaves the other silent).
+        let mut data_indef = vec![0xbf]; // indefinite map open
+        data_indef.extend(cbor_uint(99));
+        data_indef.extend(cbor_uint(0));
+        data_indef.extend(cbor_uint(2));
+        data_indef.extend(cbor_uint(4096));
+        data_indef.push(0xff); // break
+        let mut r_indef = Reader::new(&data_indef);
+        let result_indef = read_protocol_param_update(&mut r_indef, Era::Conway);
+        assert!(
+            matches!(result_indef, Err(SerializationError::CborDecode(_))),
+            "unknown PPU key 99 must be rejected on the indefinite-map path too, got {result_indef:?}"
+        );
+    }
+
+    /// Issue #1013: a totally out-of-range key (never valid in any era) must
+    /// reject regardless of era.
+    #[test]
+    fn pparam_update_far_out_of_range_key_rejected_both_eras() {
+        for era in [Era::Conway, Era::Dijkstra] {
+            let mut data = vec![0xa1];
+            data.extend(cbor_uint(1000));
+            data.extend(cbor_uint(0));
+            let mut r = Reader::new(&data);
+            let result = read_protocol_param_update(&mut r, era);
+            assert!(
+                matches!(result, Err(SerializationError::CborDecode(_))),
+                "key 1000 must be rejected under {era:?}, got {result:?}"
+            );
+        }
+    }
+
+    /// Issue #1013: keys 12/13/14/15 are gaps in BOTH Conway and Dijkstra
+    /// (`ppD`/`hkdExtraEntropyL`/`hkdMinUTxOValueCompactL` = `notSupportedInThisEraL`,
+    /// `ppGovProtocolVersion { ppUpdate = Nothing }` — oracle-verified, see the
+    /// function doc comment). Must reject under both eras, not just one.
+    #[test]
+    fn pparam_update_gap_keys_12_13_14_15_rejected_both_eras() {
+        for era in [Era::Conway, Era::Dijkstra] {
+            for key in [12u64, 13, 14, 15] {
+                let mut data = vec![0xa1];
+                data.extend(cbor_uint(key));
+                data.extend(cbor_uint(0));
+                let mut r = Reader::new(&data);
+                let result = read_protocol_param_update(&mut r, era);
+                assert!(
+                    matches!(result, Err(SerializationError::CborDecode(_))),
+                    "gap key {key} must be rejected under {era:?}, got {result:?}"
+                );
+            }
+        }
+    }
+
+    /// Issue #1013: keys 34-37 are Dijkstra-only. Conway's `eraPParams` has
+    /// no entries for them (verified against
+    /// `eras/conway/impl/.../Conway/PParams.hs:862-894`), so a `ParameterChange`
+    /// carrying one of these keys inside a CONWAY (PV9-11) transaction must be
+    /// rejected — accepting it would be accept-where-Haskell-rejects, live on
+    /// mainnet today, not merely an unreleased-era edge case.
+    #[test]
+    fn pparam_update_keys_34_37_rejected_under_conway_accepted_under_dijkstra() {
+        for key in [34u64, 35, 36, 37] {
+            let mut data = vec![0xa1];
+            data.extend(cbor_uint(key));
+            // A value shape valid for all four keys' decoders: uint(1) works
+            // for 34/35/36 (Word32); 37 needs a rational, handled below.
+            if key == 37 {
+                data.extend(cbor_rational(1, 1));
+            } else {
+                data.extend(cbor_uint(1));
+            }
+
+            let mut r_conway = Reader::new(&data);
+            let conway_result = read_protocol_param_update(&mut r_conway, Era::Conway);
+            assert!(
+                matches!(conway_result, Err(SerializationError::CborDecode(_))),
+                "key {key} must be rejected under Era::Conway (Dijkstra-only), got {conway_result:?}"
+            );
+
+            let mut r_dijkstra = Reader::new(&data);
+            let dijkstra_result = read_protocol_param_update(&mut r_dijkstra, Era::Dijkstra);
+            assert!(
+                dijkstra_result.is_ok(),
+                "key {key} must be ACCEPTED under Era::Dijkstra, got {dijkstra_result:?}"
+            );
+        }
+    }
+
+    /// Issue #1013: Dijkstra upstream defines keys 34-39 (six new keys, not
+    /// four — oracle-verified against
+    /// `eras/dijkstra/impl/.../Dijkstra/PParams.hs:490-572`), but
+    /// `ProtocolParamUpdate` has no fields for 38 (`maxPledgeLeverage`) or 39
+    /// (`minPoolMargin`) yet. Document the resulting fail-closed gap: dugite
+    /// rejects what Haskell would accept for these two keys, even under
+    /// `Era::Dijkstra`. Safe direction (never accept-where-Haskell-rejects),
+    /// and Dijkstra is unreleased, but this is NOT full Dijkstra PPU coverage
+    /// — a follow-up needs `dugite-primitives::ProtocolParamUpdate` fields for
+    /// 38/39 before this test's expectation should flip to `is_ok()`.
+    #[test]
+    fn pparam_update_keys_38_39_rejected_under_dijkstra_known_gap() {
+        for key in [38u64, 39] {
+            let mut data = vec![0xa1];
+            data.extend(cbor_uint(key));
+            data.extend(cbor_uint(1));
+            let mut r = Reader::new(&data);
+            let result = read_protocol_param_update(&mut r, Era::Dijkstra);
+            assert!(
+                matches!(result, Err(SerializationError::CborDecode(_))),
+                "key {key} is rejected under Era::Dijkstra today (no ProtocolParamUpdate \
+                 field yet) — if this now passes, dugite gained 38/39 support and this \
+                 test's expectation should flip, got {result:?}"
+            );
+        }
+    }
+
+    /// Issue #1013 boundary: the highest key valid under Conway (33) decodes;
+    /// the next key (34) is rejected under Conway but accepted under Dijkstra.
+    #[test]
+    fn pparam_update_boundary_key_33_34() {
+        let mut data33 = vec![0xa1];
+        data33.extend(cbor_uint(33));
+        data33.extend(cbor_rational(1, 1));
+        let mut r33 = Reader::new(&data33);
+        assert!(
+            read_protocol_param_update(&mut r33, Era::Conway).is_ok(),
+            "key 33 (min_fee_ref_script_cost_per_byte) is the highest Conway key and must decode"
+        );
+
+        let mut data34 = vec![0xa1];
+        data34.extend(cbor_uint(34));
+        data34.extend(cbor_uint(1));
+        let mut r34_conway = Reader::new(&data34);
+        assert!(
+            read_protocol_param_update(&mut r34_conway, Era::Conway).is_err(),
+            "key 34 must be the first REJECTED key under Era::Conway"
+        );
+        let mut r34_dijkstra = Reader::new(&data34);
+        assert!(
+            read_protocol_param_update(&mut r34_dijkstra, Era::Dijkstra).is_ok(),
+            "key 34 must decode under Era::Dijkstra"
+        );
+    }
+
+    /// Issue #1013 boundary: the highest key dugite currently supports under
+    /// Dijkstra (37 — see the 38/39 gap test above) decodes; the next key
+    /// (38) is rejected even under Dijkstra (known gap, not full coverage).
+    #[test]
+    fn pparam_update_boundary_key_37_38() {
+        let mut data37 = vec![0xa1];
+        data37.extend(cbor_uint(37));
+        data37.extend(cbor_rational(1, 1));
+        let mut r37 = Reader::new(&data37);
+        assert!(
+            read_protocol_param_update(&mut r37, Era::Dijkstra).is_ok(),
+            "key 37 (ref_script_cost_multiplier) is the highest dugite-supported \
+             Dijkstra key and must decode"
+        );
+
+        let mut data38 = vec![0xa1];
+        data38.extend(cbor_uint(38));
+        data38.extend(cbor_uint(1));
+        let mut r38 = Reader::new(&data38);
+        assert!(
+            read_protocol_param_update(&mut r38, Era::Dijkstra).is_err(),
+            "key 38 is rejected even under Era::Dijkstra today (known gap — see \
+             pparam_update_keys_38_39_rejected_under_dijkstra_known_gap)"
+        );
+    }
+
+    /// Issue #1013: duplicate PPU key must be rejected (`for_each_field_entry`
+    /// — Haskell's `decodeSparseKeyed`/`SparseKeyed` both track `Set Word` and
+    /// hard-fail on a repeat, un-gated by protocol version — oracle-verified,
+    /// `Decoder.hs:1281` / `Coders.hs`'s `applyField`). This is the "bonus
+    /// finding" from the same oracle lookup that established the unknown-key
+    /// behavior: a fix that only rejects unknown keys and not duplicate keys
+    /// is incomplete relative to Haskell.
+    #[test]
+    fn pparam_update_duplicate_key_rejected() {
+        // {0: 44, 0: 99} — key 0 twice.
+        let mut data = vec![0xa2];
+        data.extend(cbor_uint(0));
+        data.extend(cbor_uint(44));
+        data.extend(cbor_uint(0));
+        data.extend(cbor_uint(99));
+        let mut r = Reader::new(&data);
+        let result = read_protocol_param_update(&mut r, Era::Conway);
+        assert!(
+            matches!(result, Err(SerializationError::CborDecode(_))),
+            "duplicate PPU key 0 must be rejected, got {result:?}"
+        );
     }
 
     // ── Proposal procedure ────────────────────────────────────────────────
@@ -5222,7 +5556,7 @@ mod tests {
         data.extend(cbor_uint(6)); // InfoAction
         data.extend(cbor_anchor("a"));
         let mut r = Reader::new(&data);
-        let pp = read_proposal_procedure(&mut r).unwrap();
+        let pp = read_proposal_procedure(&mut r, Era::Conway).unwrap();
         assert_eq!(pp.deposit.0, 500_000);
         assert!(matches!(pp.gov_action, GovAction::InfoAction));
     }
@@ -5231,7 +5565,7 @@ mod tests {
     fn proposal_procedure_wrong_arity_rejected() {
         let data = [0x83, 0x00, 0x40, 0x81];
         let mut r = Reader::new(&data);
-        assert!(read_proposal_procedure(&mut r).is_err());
+        assert!(read_proposal_procedure(&mut r, Era::Conway).is_err());
     }
 
     // ── Standalone tx (Conway + Dijkstra) ─────────────────────────────────
@@ -5309,7 +5643,7 @@ mod tests {
             data.extend(&rat);
         }
         let mut r = Reader::new(&data);
-        let ppu = read_protocol_param_update(&mut r).unwrap();
+        let ppu = read_protocol_param_update(&mut r, Era::Conway).unwrap();
         assert!(ppu.pvt_motion_no_confidence.is_some());
         assert!(ppu.pvt_pp_security_group.is_some());
     }
@@ -5326,7 +5660,7 @@ mod tests {
             data.extend(&rat);
         }
         let mut r = Reader::new(&data);
-        let ppu = read_protocol_param_update(&mut r).unwrap();
+        let ppu = read_protocol_param_update(&mut r, Era::Conway).unwrap();
         assert!(ppu.dvt_no_confidence.is_some());
     }
 
