@@ -304,9 +304,14 @@ pub(crate) fn encode_query_result_value(
             snap_set,
             snap_go,
             snap_fee,
+            gov,
+            retiring,
+            dreps,
+            committee,
         } => {
             encode_debug_epoch_state(
-                enc, *treasury, *reserves, snap_mark, snap_set, snap_go, *snap_fee,
+                enc, *treasury, *reserves, snap_mark, snap_set, snap_go, *snap_fee, gov, retiring,
+                dreps, committee,
             );
         }
         QueryResult::DebugNewEpochState {
@@ -321,6 +326,10 @@ pub(crate) fn encode_query_result_value(
             snap_fee,
             total_active_stake,
             pool_distr,
+            gov,
+            retiring,
+            dreps,
+            committee,
         } => {
             encode_debug_new_epoch_state(
                 enc,
@@ -335,6 +344,10 @@ pub(crate) fn encode_query_result_value(
                 *snap_fee,
                 *total_active_stake,
                 pool_distr,
+                gov,
+                retiring,
+                dreps,
+                committee,
             );
         }
         QueryResult::DebugChainDepState {
@@ -2046,6 +2059,143 @@ pub(crate) fn encode_snap_shot(
 /// References:
 ///   `cardano-ledger / eras/shelley/impl/src/Cardano/Ledger/Shelley/LedgerState/Types.hs`
 ///   `encCBOR (EpochState acnt ls ss nm) = ... encodeListLen 4 <> ...`
+/// Encode `LedgerState = array(2)[CertState, UTxOState]` (#1027).
+///
+/// Haskell's encoder writes `lsCertState` BEFORE `lsUTxOState` — "encode
+/// delegation state first to improve sharing", `encCBOR LedgerState{..} =
+/// encodeListLen 2 <> encCBOR lsCertState <> encCBOR lsUTxOState` — the
+/// REVERSE of the record's own field declaration order. Getting this order
+/// backwards is invisible if you infer wire order from the Haskell type
+/// definition instead of the `EncCBOR` instance itself.
+///
+/// `CertState = array(3)[VState, PState, DState]`. `UTxOState = array(6)`
+/// — a field (`utxosInstantStake`) was added between `utxosGovState` and
+/// `utxosDonation` since this encoder was last written; the previous
+/// `array(5)` shape (missing that field, AND with `utxosGovState` itself as
+/// a bare `array(0)` placeholder) is why `cardano-cli conway query
+/// ledger-state` could not decode this response at all (#1027, P1).
+///
+/// Every sub-field this codebase does not independently track — the raw
+/// UTxO map, the VRF-hash dedup registry, per-credential account balances,
+/// genesis delegations, MIR pots, pending pool re-registrations, the
+/// instant-stake index, the dormant-epoch counter — is emitted
+/// structurally-correct-but-EMPTY. For `utxosUtxo` specifically this is not
+/// a simplification: real `cardano-node` answers `DebugEpochState`/
+/// `DebugNewEpochState` from an `ExtLedgerState` whose ledger tables were
+/// never loaded (`QFNoTables` in `ouroboros-consensus-cardano`'s
+/// `Shelley/Ledger/Query.hs`), so the UTxO map is unconditionally EMPTY in
+/// the real wire reply too, regardless of how large the live UTxO set is.
+///
+/// Oracle-verified against cardano-ledger `a88b60bdcf3248dfe5a2f9372c188c399233f479`
+/// (the SHA already pinned in `tests/conformance/upstream/sources.toml`):
+/// `eras/shelley/impl/.../LedgerState/Types.hs` (LedgerState, UTxOState),
+/// `eras/conway/impl/.../Conway/State/{CertState,VState}.hs` (CertState,
+/// VState, CommitteeState), `libs/cardano-ledger-core/.../State/CertState.hs`
+/// (PState, DState, InstantaneousRewards).
+fn encode_ledger_state(
+    enc: &mut minicbor::Encoder<&mut Vec<u8>>,
+    gov: &crate::node::n2c_query::types::GovStateSnapshot,
+    retiring: &[(Vec<u8>, u64)],
+    dreps: &[crate::node::n2c_query::types::DRepSnapshot],
+    committee: &crate::node::n2c_query::types::CommitteeSnapshot,
+) {
+    enc.array(2).ok();
+
+    // ── [0] CertState = array(3)[VState, PState, DState] ──
+    enc.array(3).ok();
+
+    // VState = array(3)[vsDReps, vsCommitteeState, vsNumDormantEpochs]
+    enc.array(3).ok();
+    // vsDReps: Map<Credential,DRepState> — the SAME shape `GetDRepState`
+    // (tag 25) answers from, so this cannot drift from that query.
+    encode_drep_state(enc, dreps);
+    encode_vstate_committee_state(enc, committee);
+    enc.u64(0).ok(); // vsNumDormantEpochs — not tracked; 0 whenever governance activity exists
+
+    // PState = array(4)[psVRFKeyHashes, psStakePools, psFutureStakePoolParams, psRetiring]
+    enc.array(4).ok();
+    enc.map(0).ok(); // psVRFKeyHashes — VRF-hash dedup registry, not tracked
+    enc.map(0).ok(); // psStakePools — StakePoolState (array(10), incl. per-pool deposit + delegator set) not tracked at this granularity
+    enc.map(0).ok(); // psFutureStakePoolParams — pending pool re-registrations, not tracked
+    enc.map(retiring.len() as u64).ok(); // psRetiring — REAL data, same source GetPoolState (tag 19) uses
+    for (pool_id, epoch) in retiring {
+        enc.bytes(pool_id).ok();
+        enc.u64(*epoch).ok();
+    }
+
+    // DState = array(4)[dsAccounts, dsFutureGenDelegs, dsGenDelegs, dsIRewards]
+    enc.array(4).ok();
+    enc.map(0).ok(); // dsAccounts (ConwayAccounts) — per-credential balance/deposit/pool-deleg/drep-deleg, not tracked here
+    enc.map(0).ok(); // dsFutureGenDelegs
+    enc.map(0).ok(); // dsGenDelegs
+                     // InstantaneousRewards = array(4)[reserves_map, treasury_map, delta_reserves, delta_treasury].
+                     // Structurally always-present even though MIR certificates were removed
+                     // from Conway's own CDDL (#1023) — always empty/zero on a real Conway chain.
+    enc.array(4).ok();
+    enc.map(0).ok();
+    enc.map(0).ok();
+    enc.i64(0).ok(); // DeltaCoin delta_reserves
+    enc.i64(0).ok(); // DeltaCoin delta_treasury
+
+    // ── [1] UTxOState = array(6)[utxosUtxo, utxosDeposited, utxosFees, utxosGovState, utxosInstantStake, utxosDonation] ──
+    enc.array(6).ok();
+    enc.map(0).ok(); // utxosUtxo — empty; matches the REAL cardano-node answer for these two debug queries (QFNoTables)
+    enc.u64(0).ok(); // utxosDeposited — aggregate deposit pot, not tracked at this layer
+    enc.u64(0).ok(); // utxosFees — accumulated fees, not tracked at this layer
+    encode_gov_state(enc, gov); // utxosGovState = ConwayGovState = array(7) — REAL data (#1027), shared with GetGovState (tag 24)
+    enc.map(0).ok(); // utxosInstantStake — ConwayInstantStake is a bare Map, not tracked
+    enc.u64(0).ok(); // utxosDonation
+}
+
+/// Encode `VState.vsCommitteeState` — a BARE `Map<Credential
+/// ColdCommitteeRole, CommitteeAuthorization>` (newtype-derived from `Map`,
+/// no array wrapper). Genuinely a DIFFERENT type from `ConwayGovState`'s
+/// `Committee` (`array(2)[Map<ColdCred,EpochNo>, threshold]`, already
+/// implemented in [`encode_gov_state`]) — do not conflate them.
+///
+/// `CommitteeAuthorization` is a 2-constructor sum:
+///   `CommitteeHotCredential cred    -> array(2)[0, hotCred]`
+///   `CommitteeMemberResigned anchor -> array(2)[1, StrictMaybe Anchor]`
+///
+/// Members whose hot key was never authorized (`hot_status == 1`,
+/// `MemberNotAuthorized`) have no `CommitteeAuthorization` constructor to
+/// map to and are simply ABSENT from this map — an absent entry is
+/// indistinguishable on the wire from "never seen", so this is a value
+/// simplification, not a decode hazard.
+fn encode_vstate_committee_state(
+    enc: &mut minicbor::Encoder<&mut Vec<u8>>,
+    committee: &crate::node::n2c_query::types::CommitteeSnapshot,
+) {
+    let entries: Vec<_> = committee
+        .members
+        .iter()
+        .filter(|m| m.hot_status == 0 || m.hot_status == 2)
+        .collect();
+    enc.map(entries.len() as u64).ok();
+    for m in entries {
+        enc.array(2).ok();
+        enc.u8(m.cold_credential_type).ok();
+        enc.bytes(&m.cold_credential).ok();
+        if m.hot_status == 0 {
+            // CommitteeHotCredential
+            enc.array(2).ok();
+            enc.u32(0).ok();
+            enc.array(2).ok();
+            enc.u8(m.hot_credential_type).ok();
+            match &m.hot_credential {
+                Some(hot) => enc.bytes(hot).ok(),
+                None => enc.bytes(&[0u8; 28]).ok(),
+            };
+        } else {
+            // CommitteeMemberResigned — no anchor data tracked, SNothing.
+            enc.array(2).ok();
+            enc.u32(1).ok();
+            enc.array(0).ok();
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn encode_debug_epoch_state(
     enc: &mut minicbor::Encoder<&mut Vec<u8>>,
     treasury: u64,
@@ -2054,6 +2204,10 @@ fn encode_debug_epoch_state(
     snap_set: &SnapshotStakeData,
     snap_go: &SnapshotStakeData,
     snap_fee: u64,
+    gov: &crate::node::n2c_query::types::GovStateSnapshot,
+    retiring: &[(Vec<u8>, u64)],
+    dreps: &[crate::node::n2c_query::types::DRepSnapshot],
+    committee: &crate::node::n2c_query::types::CommitteeSnapshot,
 ) {
     // EpochState = array(4) [AccountState, LedgerState, SnapShots, NonMyopic]
     enc.array(4).ok();
@@ -2063,34 +2217,8 @@ fn encode_debug_epoch_state(
     enc.u64(treasury).ok();
     enc.u64(reserves).ok();
 
-    // [1] LedgerState — simplified CBOR-skippable placeholder.
-    //
-    // In Conway, `LedgerState = array(2) [UTxOState, CertState]`.
-    // We emit a minimal but structurally valid representation so that a
-    // strict CBOR parser can decode past it to reach SnapShots at [2].
-    //
-    // UTxOState = array(5) [utxo_map, deposited, fees, gov_state, donation]
-    // CertState = array(3) [VState, PState, DState]
-    //
-    // Haskell references:
-    //   `Cardano.Ledger.Shelley.LedgerState.UTxOState` (encodeListLen 5)
-    //   `Cardano.Ledger.Shelley.LedgerState.CertState` (encodeListLen 3)
-    enc.array(2).ok();
-    // UTxOState: array(5) with all-zero / empty contents
-    enc.array(5).ok();
-    enc.map(0).ok(); // empty UTxO map
-    enc.u64(0).ok(); // deposited lovelace = 0
-    enc.u64(0).ok(); // fees = 0
-                     // GovState placeholder: ConwayGovState = array(7) — emit array(0) as a
-                     // skippable marker; parsers that only read LedgerState[1] (CertState) skip
-                     // this via decodeSkip before reaching CertState.
-    enc.array(0).ok();
-    enc.u64(0).ok(); // donation = 0
-                     // CertState: array(3) [VState, PState, DState] — all empty
-    enc.array(3).ok();
-    enc.array(0).ok(); // VState placeholder
-    enc.array(0).ok(); // PState placeholder
-    enc.array(0).ok(); // DState placeholder
+    // [1] LedgerState — see `encode_ledger_state` (#1027).
+    encode_ledger_state(enc, gov, retiring, dreps, committee);
 
     // [2] SnapShots = array(4) [mark, set, go, fee]
     enc.array(4).ok();
@@ -2123,6 +2251,10 @@ fn encode_debug_new_epoch_state(
     snap_fee: u64,
     total_active_stake: u64,
     pool_distr: &[crate::node::n2c_query::types::StakePoolSnapshot],
+    gov: &crate::node::n2c_query::types::GovStateSnapshot,
+    retiring: &[(Vec<u8>, u64)],
+    dreps: &[crate::node::n2c_query::types::DRepSnapshot],
+    committee: &crate::node::n2c_query::types::CommitteeSnapshot,
 ) {
     // Full Haskell-compatible NewEpochState (array(7)):
     //
@@ -2131,8 +2263,13 @@ fn encode_debug_new_epoch_state(
     //   [2] BlocksMade (cur  epoch) — Map<pool_id_28B, u64>
     //   [3] EpochState — array(4) [AccountState, LedgerState, SnapShots, NonMyopic]
     //   [4] StrictMaybe RewardUpdate — array(0) for Nothing
-    //   [5] PoolDistr — Map<pool_id_28B, IndividualPoolStake>
-    //   [6] Extra — array(0) (Conway-era field, empty)
+    //   [5] PoolDistr — array(2)[Map<pool_id_28B, IndividualPoolStake>, total_active_stake]
+    //   [6] StashedAVVMAddresses — CBOR `null` in every post-Shelley era (`()`, `encodeNull`)
+    //
+    // Oracle-verified against cardano-ledger `a88b60bdcf3248dfe5a2f9372c188c399233f479`,
+    // `eras/shelley/impl/.../LedgerState/Types.hs:397-405` — [6] was
+    // previously `array(0)`, a one-byte divergence (`0x80` vs the correct
+    // `0xf6`) that a strict decoder calling `decodeNull` hard-rejects (#1027).
     //
     // cncli reads [3][2] (SnapShots) to extract the per-credential
     // stake distribution for leader-schedule computation.
@@ -2163,24 +2300,8 @@ fn encode_debug_new_epoch_state(
     enc.u64(treasury).ok();
     enc.u64(reserves).ok();
 
-    // [3][1] LedgerState — simplified empty placeholder.
-    // cncli does not parse this field; it only inspects [3][2].
-    // We encode a minimal valid array(2) [UTxOState, CertState] with
-    // empty contents so that a CBOR parser can skip past it.
-    enc.array(2).ok();
-    // UTxOState = array(5): utxo_map, deposited, fees, gov_state, donation
-    enc.array(5).ok();
-    enc.map(0).ok(); // empty UTxO map
-    enc.u64(0).ok(); // deposited = 0
-    enc.u64(0).ok(); // fees = 0
-                     // GovState placeholder (array(0))
-    enc.array(0).ok();
-    enc.u64(0).ok(); // donation = 0
-                     // CertState = array(3): VState, PState, DState (all empty)
-    enc.array(3).ok();
-    enc.array(0).ok(); // VState placeholder
-    enc.array(0).ok(); // PState placeholder
-    enc.array(0).ok(); // DState placeholder
+    // [3][1] LedgerState — see `encode_ledger_state` (#1027).
+    encode_ledger_state(enc, gov, retiring, dreps, committee);
 
     // [3][2] SnapShots = array(4) [mark, set, go, fee]
     enc.array(4).ok();
@@ -2199,19 +2320,29 @@ fn encode_debug_new_epoch_state(
     // [4] StrictMaybe RewardUpdate = Nothing = array(0)
     enc.array(0).ok();
 
-    // [5] PoolDistr: Map<pool_id(28B), IndividualPoolStake>
-    // IndividualPoolStake = array(2) [tag(30)[num,den], vrf_hash(32B)]
+    // [5] PoolDistr = array(2)[Map<pool_id(28B), IndividualPoolStake>, total_active_stake]
+    //
+    // IndividualPoolStake = array(3)[individualPoolStake :: Rational,
+    // individualTotalPoolStake :: CompactForm Coin, individualPoolStakeVrf].
+    // Was previously a BARE map (no `total_active_stake` wrapper) whose
+    // `IndividualPoolStake` was `array(2)` — missing the middle Coin field
+    // entirely. `individualTotalPoolStake` is the pool's own absolute stake
+    // in lovelace, which is already `pool.stake` (the same value used as the
+    // ratio's numerator) — no new data needed, just the missing field.
     let total = total_active_stake.max(1);
+    enc.array(2).ok();
     enc.map(pool_distr.len() as u64).ok();
     for pool in pool_distr {
         enc.bytes(&pool.pool_id).ok();
-        enc.array(2).ok();
+        enc.array(3).ok();
         encode_tagged_rational(enc, pool.stake, total);
+        enc.u64(pool.stake).ok();
         enc.bytes(&pool.vrf_keyhash).ok();
     }
+    enc.u64(total_active_stake).ok();
 
-    // [6] Extra = array(0)
-    enc.array(0).ok();
+    // [6] StashedAVVMAddresses = () = CBOR null. See the doc comment above.
+    enc.null().ok();
 }
 
 /// Encode `DebugChainDepState` (tag 13) as the Haskell `PraosState` CBOR structure.
@@ -2827,6 +2958,252 @@ mod tests {
         VoteDelegateeEntry,
     };
     use minicbor::Decoder;
+
+    /// #1027 (P1): `cardano-cli conway query ledger-state` was completely
+    /// undecodable — `GetDebugNewEpochState` embedded a bare `array(0)`
+    /// where `ConwayGovState` needs `array(7)`, `LedgerState`'s two halves
+    /// were in the wrong order, `UTxOState` was `array(5)` instead of the
+    /// current `array(6)`, `CertState`'s three sub-records were bare
+    /// `array(0)` placeholders, `PoolDistr` was a bare map missing its
+    /// `total_active_stake` wrapper and its `IndividualPoolStake` entries
+    /// were missing a field, and the top-level `[6]` was `array(0)` instead
+    /// of CBOR `null`.
+    ///
+    /// This test does NOT re-derive its expectations from the encoder under
+    /// test — every array length below is copied from the oracle-verified
+    /// Haskell source cited in `encode_ledger_state`'s doc comment
+    /// (cardano-ledger `a88b60bdcf3248dfe5a2f9372c188c399233f479`), so a
+    /// regression that makes the encoder agree with itself but disagree
+    /// with Haskell still fails this test. A same-process round-trip is
+    /// necessary but not sufficient (see `#[551]`'s standing caveat); the
+    /// decisive check is the live `cardano-cli` round-trip recorded in this
+    /// issue's PR description, not this test.
+    #[test]
+    fn issue_1027_debug_new_epoch_state_has_haskell_exact_arities() {
+        use crate::node::n2c_query::types::{
+            CommitteeMemberSnapshot, GovStateSnapshot, ProtocolParamsSnapshot,
+        };
+
+        let gov = GovStateSnapshot {
+            cur_pparams: Box::new(ProtocolParamsSnapshot::default()),
+            enact_cur_pparams: Box::new(ProtocolParamsSnapshot::default()),
+            prev_pparams: Box::new(ProtocolParamsSnapshot::default()),
+            constitution_hash: vec![0u8; 32],
+            ..GovStateSnapshot::default()
+        };
+        let committee = CommitteeSnapshot {
+            members: vec![CommitteeMemberSnapshot {
+                cold_credential: vec![0xAAu8; 28],
+                cold_credential_type: 0,
+                hot_status: 0,
+                hot_credential: Some(vec![0xBBu8; 28]),
+                hot_credential_type: 0,
+                member_status: 0,
+                expiry_epoch: Some(500),
+            }],
+            threshold: Some((2, 3)),
+            current_epoch: 10,
+        };
+        let dreps = vec![DRepSnapshot {
+            credential_hash: vec![0xCCu8; 28],
+            credential_type: 0,
+            deposit: 500_000_000,
+            anchor_url: None,
+            anchor_hash: None,
+            expiry_epoch: 20,
+            delegator_hashes: vec![],
+        }];
+        let retiring = vec![(vec![0xDDu8; 28], 30u64)];
+        let pool_distr = vec![StakePoolSnapshot {
+            pool_id: vec![0xEEu8; 28],
+            stake: 1_000_000,
+            vrf_keyhash: vec![0xFFu8; 32],
+            total_circulation: 45_000_000_000_000_000,
+        }];
+
+        let result = QueryResult::DebugNewEpochState {
+            epoch: 42,
+            blocks_made_prev: vec![],
+            blocks_made_cur: vec![],
+            treasury: 1_000_000_000,
+            reserves: 10_000_000_000,
+            snap_mark: Box::new(SnapshotStakeData::default()),
+            snap_set: Box::new(SnapshotStakeData::default()),
+            snap_go: Box::new(SnapshotStakeData::default()),
+            snap_fee: 0,
+            total_active_stake: 1_000_000,
+            pool_distr,
+            gov: Box::new(gov),
+            retiring,
+            dreps,
+            committee: Box::new(committee),
+        };
+
+        let encoded = encode_query_result(&result);
+        let mut dec = Decoder::new(&encoded);
+
+        // MsgResult: array(2)[4, ...]
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u32().unwrap(), 4);
+        // HFC EitherMismatch success wrapper: array(1)
+        assert_eq!(dec.array().unwrap(), Some(1));
+
+        // NewEpochState = array(7)
+        assert_eq!(
+            dec.array().unwrap(),
+            Some(7),
+            "NewEpochState must be array(7)"
+        );
+        dec.u64().unwrap(); // [0] EpochNo
+        assert_eq!(dec.map().unwrap(), Some(0)); // [1] BlocksMade prev
+        assert_eq!(dec.map().unwrap(), Some(0)); // [2] BlocksMade cur
+
+        // [3] EpochState = array(4)
+        assert_eq!(dec.array().unwrap(), Some(4), "EpochState must be array(4)");
+        assert_eq!(
+            dec.array().unwrap(),
+            Some(2),
+            "ChainAccountState must be array(2)"
+        );
+        dec.u64().unwrap(); // treasury
+        dec.u64().unwrap(); // reserves
+
+        // [3][1] LedgerState = array(2)[CertState, UTxOState] — CertState FIRST.
+        assert_eq!(
+            dec.array().unwrap(),
+            Some(2),
+            "LedgerState must be array(2)"
+        );
+        assert_eq!(
+            dec.array().unwrap(),
+            Some(3),
+            "CertState must be array(3) and come BEFORE UTxOState"
+        );
+        // CertState[0] VState = array(3)[vsDReps, vsCommitteeState, vsNumDormantEpochs]
+        assert_eq!(dec.array().unwrap(), Some(3), "VState must be array(3)");
+        assert_eq!(
+            dec.map().unwrap(),
+            Some(1),
+            "vsDReps must carry the real DRep"
+        );
+        dec.array().unwrap(); // Credential[2]
+        dec.u8().unwrap();
+        dec.bytes().unwrap();
+        dec.array().unwrap(); // DRepState array(4)
+        dec.u64().unwrap();
+        dec.array().unwrap(); // StrictMaybe anchor = SNothing
+        dec.u64().unwrap();
+        dec.tag().unwrap(); // tag 258 delegs set
+        dec.array().unwrap();
+        assert_eq!(
+            dec.map().unwrap(),
+            Some(1),
+            "vsCommitteeState must be a BARE map (no array wrapper), carrying the real member"
+        );
+        dec.array().unwrap(); // Credential key
+        dec.u8().unwrap();
+        dec.bytes().unwrap();
+        dec.array().unwrap(); // CommitteeAuthorization = array(2)[0, hotCred]
+        dec.u32().unwrap();
+        dec.array().unwrap();
+        dec.u8().unwrap();
+        dec.bytes().unwrap();
+        dec.u64().unwrap(); // vsNumDormantEpochs
+                            // CertState[1] PState = array(4)
+        assert_eq!(dec.array().unwrap(), Some(4), "PState must be array(4)");
+        assert_eq!(dec.map().unwrap(), Some(0)); // psVRFKeyHashes
+        assert_eq!(dec.map().unwrap(), Some(0)); // psStakePools
+        assert_eq!(dec.map().unwrap(), Some(0)); // psFutureStakePoolParams
+        assert_eq!(
+            dec.map().unwrap(),
+            Some(1),
+            "psRetiring must carry the real pending retirement"
+        );
+        dec.bytes().unwrap();
+        dec.u64().unwrap();
+        // CertState[2] DState = array(4)
+        assert_eq!(dec.array().unwrap(), Some(4), "DState must be array(4)");
+        assert_eq!(dec.map().unwrap(), Some(0)); // dsAccounts
+        assert_eq!(dec.map().unwrap(), Some(0)); // dsFutureGenDelegs
+        assert_eq!(dec.map().unwrap(), Some(0)); // dsGenDelegs
+        assert_eq!(
+            dec.array().unwrap(),
+            Some(4),
+            "InstantaneousRewards must be array(4)"
+        );
+        assert_eq!(dec.map().unwrap(), Some(0));
+        assert_eq!(dec.map().unwrap(), Some(0));
+        dec.i64().unwrap();
+        dec.i64().unwrap();
+
+        // LedgerState[1] UTxOState = array(6)
+        assert_eq!(
+            dec.array().unwrap(),
+            Some(6),
+            "UTxOState must be array(6), not the old array(5)"
+        );
+        assert_eq!(dec.map().unwrap(), Some(0)); // utxosUtxo — empty, matches real cardano-node (QFNoTables)
+        dec.u64().unwrap(); // utxosDeposited
+        dec.u64().unwrap(); // utxosFees
+        assert_eq!(
+            dec.array().unwrap(),
+            Some(7),
+            "utxosGovState (ConwayGovState) must be array(7), not a bare array(0) placeholder"
+        );
+        // Skip the rest of GovState's own internals — `encode_gov_state` has
+        // its own dedicated coverage (`golden_future_pparams_...` and the
+        // GetGovState tests below); this test only cares that the SHAPE at
+        // this exact nesting depth is the real one, not a placeholder. The
+        // array(7) header was already consumed above, so all 7 elements
+        // remain to be skipped.
+        for _ in 0..7 {
+            dec.skip().unwrap();
+        }
+        assert_eq!(dec.map().unwrap(), Some(0)); // utxosInstantStake
+        dec.u64().unwrap(); // utxosDonation
+
+        // [3][2] SnapShots = array(4)
+        assert_eq!(dec.array().unwrap(), Some(4));
+        for _ in 0..4 {
+            dec.skip().unwrap();
+        }
+        // [3][3] NonMyopic = array(2)
+        assert_eq!(dec.array().unwrap(), Some(2));
+        dec.skip().unwrap();
+        dec.skip().unwrap();
+
+        // [4] StrictMaybe RewardUpdate = array(0)
+        assert_eq!(dec.array().unwrap(), Some(0));
+
+        // [5] PoolDistr = array(2)[Map, total_active_stake] — was previously
+        // a bare map with no wrapper.
+        assert_eq!(
+            dec.array().unwrap(),
+            Some(2),
+            "PoolDistr must be array(2)[map, total_active_stake]"
+        );
+        assert_eq!(dec.map().unwrap(), Some(1));
+        dec.bytes().unwrap(); // pool_id
+        assert_eq!(
+            dec.array().unwrap(),
+            Some(3),
+            "IndividualPoolStake must be array(3)[rational, coin, vrf] — was missing the coin field"
+        );
+        dec.tag().unwrap(); // tag(30) rational
+        dec.array().unwrap();
+        dec.u64().unwrap();
+        dec.u64().unwrap();
+        dec.u64().unwrap(); // individualTotalPoolStake (Coin)
+        dec.bytes().unwrap(); // vrf hash
+        dec.u64().unwrap(); // total_active_stake
+
+        // [6] StashedAVVMAddresses — CBOR null, not array(0).
+        assert!(
+            dec.datatype().unwrap() == minicbor::data::Type::Null,
+            "StashedAVVMAddresses must be CBOR null (0xf6), not array(0)"
+        );
+        dec.null().unwrap();
+    }
 
     /// GOLDEN (#977): `futurePParams` must encode as a real tagged sum.
     ///

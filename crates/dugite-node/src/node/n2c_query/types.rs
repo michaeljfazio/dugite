@@ -85,9 +85,20 @@ pub enum QueryResult {
     /// Haskell encodes `EpochState` as `array(4)`:
     ///   `[ChainAccountState, LedgerState, SnapShots, NonMyopic]`
     ///
-    /// Tools like db-analyser deserialize this by parsing the well-known
-    /// positional structure, so we must match it even if LedgerState and
-    /// NonMyopic are simplified.
+    /// `LedgerState = array(2)[CertState, UTxOState]` (CertState FIRST — the
+    /// Haskell encoder writes it before `UTxOState` "to improve sharing",
+    /// reversed from the record's own field declaration order — #1027).
+    /// `UTxOState`'s embedded `GovState` and `CertState`'s embedded
+    /// `VState`/`PState` carry real data via [`GovStateSnapshot`] and the
+    /// pool-params/committee/DRep fields below; every OTHER LedgerState
+    /// sub-field this codebase doesn't independently track (the raw UTxO
+    /// map, per-credential account balances, genesis delegations, MIR pots,
+    /// VRF-hash dedup registry, future pool params) is emitted
+    /// structurally-correct-but-empty, which is what real `cardano-node`
+    /// ALSO answers for these two specific debug queries: they're tagged
+    /// `QFNoTables` upstream, so `utxosUtxo` is unconditionally empty even
+    /// on a live mainnet node (oracle-verified against
+    /// `ouroboros-consensus-cardano`'s `Shelley/Ledger/Query.hs`).
     DebugEpochState {
         treasury: u64,
         reserves: u64,
@@ -99,12 +110,26 @@ pub enum QueryResult {
         snap_go: Box<SnapshotStakeData>,
         /// Snapshot fee (lovelace unclaimed at last epoch boundary)
         snap_fee: u64,
+        /// `UTxOState.utxosGovState` — the real `ConwayGovState`, shared with
+        /// `GetGovState` (tag 24) via `gov_state_snapshot()` (#1027).
+        gov: Box<GovStateSnapshot>,
+        /// `PState.psRetiring` — real pending pool retirements.
+        retiring: Vec<(Vec<u8>, u64)>,
+        /// `VState.vsDReps` — real DRep registry, same data `GetDRepState`
+        /// (tag 25) answers from.
+        dreps: Vec<DRepSnapshot>,
+        /// `VState.vsCommitteeState` — derived from the live committee
+        /// registry (see `encode_vstate_committee_state`).
+        committee: Box<CommitteeSnapshot>,
     },
     /// DebugNewEpochState (tag 12): full Haskell-compatible NewEpochState.
     ///
     /// cncli's `snapshot` command parses this response and expects the full
     /// Haskell `NewEpochState` CBOR structure (array(7)).  The critical part
     /// it reads is `[3][2]` — the `SnapShots` containing mark/set/go data.
+    ///
+    /// See [`QueryResult::DebugEpochState`] for the `LedgerState` field
+    /// documentation — `[3][1]` here is byte-identical in shape.
     DebugNewEpochState {
         epoch: u64,
         /// Blocks made in the previous epoch (pool_id_28B → count)
@@ -126,6 +151,14 @@ pub enum QueryResult {
         total_active_stake: u64,
         /// Current pool stake distribution (pool_id_28B → (stake_rational_num, stake_rational_den, vrf_hash_32B))
         pool_distr: Vec<StakePoolSnapshot>,
+        /// See [`QueryResult::DebugEpochState::gov`].
+        gov: Box<GovStateSnapshot>,
+        /// See [`QueryResult::DebugEpochState::retiring`].
+        retiring: Vec<(Vec<u8>, u64)>,
+        /// See [`QueryResult::DebugEpochState::dreps`].
+        dreps: Vec<DRepSnapshot>,
+        /// See [`QueryResult::DebugEpochState::committee`].
+        committee: Box<CommitteeSnapshot>,
     },
     /// DebugChainDepState (tag 13): consensus chain-dependent state.
     ///

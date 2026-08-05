@@ -673,6 +673,58 @@ pub enum TxValidationError {
         script_hashes: Vec<String>,
     },
 
+    // ── #1025: further typed UTXOW/UTXO failures ────────────────────────
+    /// `MissingRequiredDatums` (UTXOW tag 11) —
+    /// `NonEmptySet DataHash` (missing) then `Set DataHash` (every datum
+    /// hash present in the tx's own witness set — `Alonzo/Rules/Utxow.hs`'s
+    /// `missingRequiredDatums`, a pure witness-set derivation with no
+    /// ledger-state join).
+    MissingRequiredDatumsUTXOW {
+        /// Hex-encoded 32-byte datum hashes the tx failed to supply.
+        missing: Vec<String>,
+        /// Hex-encoded 32-byte datum hashes the tx's witness set DOES supply.
+        provided: Vec<String>,
+    },
+    /// `NotAllowedSupplementalDatums` (UTXOW tag 12) —
+    /// `NonEmptySet DataHash` (unneeded) then `Set DataHash` (every datum
+    /// hash referenced by the tx's own outputs — `getSupplementalDataHashes`,
+    /// also a pure tx-body derivation with no ledger-state join).
+    NotAllowedSupplementalDatumsUTXOW {
+        /// Hex-encoded 32-byte datum hashes supplied but not needed.
+        extra: Vec<String>,
+        /// Hex-encoded 32-byte datum hashes referenced by the tx's outputs.
+        allowed: Vec<String>,
+    },
+    /// `OutputBootAddrAttrsTooBig` (UTXO tag 10) — `NonEmpty (TxOut era)`, a
+    /// plain LIST (not a set) of the offending outputs' raw CBOR.
+    OutputBootAddrAttrsTooBigUTXO {
+        /// Raw hex-encoded CBOR of each offending `TxOut`, in tx-body order.
+        outputs_raw_cbor: Vec<String>,
+    },
+    /// `ScriptsNotPaidUTxO` (UTXO tag 13) —
+    /// `NonEmptyMap TxIn (TxOut era)`: collateral inputs at a script-locked
+    /// address, paired with the TxOut they resolve to (looked up against the
+    /// same UTxO view Phase-1 validation already used).
+    ScriptsNotPaidUTxOUTXO {
+        /// `("<txhash>#<index>", raw_hex_cbor_of_txout)` pairs.
+        inputs_outputs: Vec<(String, String)>,
+    },
+    /// `ZeroTreasuryWithdrawals` (GOV tag 15) — `GovAction era` (the WHOLE
+    /// offending `TreasuryWithdrawals` action, not an identifier). Haskell's
+    /// GOV rule raises one of these PER offending proposal in a multi-
+    /// proposal tx, so this variant represents a SINGLE offender; a tx with
+    /// several zero-sum withdrawal proposals produces several of these
+    /// wrapped in [`TxValidationError::Multiple`].
+    ZeroTreasuryWithdrawalsGOV {
+        /// `(account_bytes_hex, coin)` withdrawal map entries — always all
+        /// zero (that's what makes the proposal a zero-sum offender), kept
+        /// here so the wire payload is byte-faithful to the real `GovAction`
+        /// rather than reporting a truncated/summarized map.
+        withdrawals: Vec<(String, u64)>,
+        /// Hex-encoded 28-byte guardrails policy script hash, if any.
+        policy_hash: Option<String>,
+    },
+
     // ── #979: further typed GOV failures (Ledger 3 -> GOV tag) ──────────
     //
     // `AccountAddress` encodes as a byte string of the serialized account
