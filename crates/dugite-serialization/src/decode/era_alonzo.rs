@@ -3162,4 +3162,64 @@ mod tests {
             "raw_cbor must hold the exact original Alonzo output bytes"
         );
     }
+
+    // ── #1023: pre-Conway eras must KEEP decoding MIR (tag 6) and
+    //    GenesisKeyDelegation (tag 5) — the fix is scoped to Conway/Dijkstra
+    //    ONLY. `read_alonzo_certificate` (this file) is the shared decoder
+    //    behind Allegra, Mary, Alonzo AND Babbage (`era_babbage.rs` calls
+    //    `read_alonzo_cert_inner` directly — see that file's key-4 arm), so
+    //    a single test here is the guard for all four. Oracle-verified: all
+    //    four eras alias `type TxCert <Era> = ShelleyTxCert <Era>`
+    //    (`IntersectMBO/cardano-ledger@4849c13d6f70e5ab46add9af6e0ec5c537b61f69`,
+    //    e.g. `eras/alonzo/impl/.../Alonzo/TxCert.hs:12`), whose decoder
+    //    (`Shelley/TxCert.hs:475-487`) accepts both tags unconditionally —
+    //    this is a REAL, still-valid pre-Conway certificate shape, not a
+    //    historical curiosity, and dugite must keep decoding it to replay
+    //    every pre-Conway block on mainnet.
+
+    #[test]
+    fn alonzo_family_certificate_tag5_genesis_key_delegation_still_decodes() {
+        let mut cert = vec![0x84]; // array(4)
+        cert.extend(cbor_uint(5));
+        cert.extend(cbor_bytes(&[0x01; 28])); // genesis key hash
+        cert.extend(cbor_bytes(&[0x02; 28])); // delegate key hash
+        cert.extend(cbor_bytes(&[0x03; 32])); // vrf keyhash
+
+        let mut r = Reader::new(&cert);
+        let decoded = read_alonzo_cert_inner(&mut r)
+            .expect("Allegra/Mary/Alonzo/Babbage must still decode GenesisKeyDelegation (tag 5)");
+        match decoded {
+            Certificate::GenesisKeyDelegation {
+                genesis_hash,
+                genesis_delegate_hash,
+                vrf_keyhash,
+            } => {
+                assert_eq!(&genesis_hash.as_bytes()[..28], &[0x01; 28]);
+                assert_eq!(&genesis_delegate_hash.as_bytes()[..28], &[0x02; 28]);
+                assert_eq!(vrf_keyhash.as_bytes(), &[0x03; 32]);
+            }
+            other => panic!("expected GenesisKeyDelegation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alonzo_family_certificate_tag6_mir_still_decodes() {
+        let mut cert = vec![0x82]; // outer array(2)
+        cert.extend(cbor_uint(6));
+        let mut mir = vec![0x82];
+        mir.extend(cbor_uint(1)); // source = Treasury
+        mir.extend(cbor_uint(9999)); // target = coin
+        cert.extend(&mir);
+
+        let mut r = Reader::new(&cert);
+        let decoded = read_alonzo_cert_inner(&mut r)
+            .expect("Allegra/Mary/Alonzo/Babbage must still decode MIR (tag 6)");
+        match decoded {
+            Certificate::MoveInstantaneousRewards {
+                source: dugite_primitives::transaction::MIRSource::Treasury,
+                target: dugite_primitives::transaction::MIRTarget::OtherAccountingPot(9999),
+            } => {}
+            other => panic!("expected MIR OtherAccountingPot(9999), got {other:?}"),
+        }
+    }
 }

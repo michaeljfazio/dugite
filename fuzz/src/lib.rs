@@ -722,13 +722,26 @@ impl Gen<'_> {
     /// CIP-1694 governance certificates). Generating a Conway certificate in a
     /// Babbage body is rejected at decode — a false positive, not a finding.
     ///
+    /// #1023: the reverse direction also has a hole. Wire tags 5
+    /// (`GenesisKeyDelegation`, variant index 17) and 6
+    /// (`MoveInstantaneousRewards`, variant index 18 — the `_` match arm
+    /// below) are hard-rejected by Conway's `ConwayTxCert` decoder
+    /// (oracle-verified `IntersectMBO/cardano-ledger` at pinned SHA
+    /// `4849c13d6f70e5ab46add9af6e0ec5c537b61f69`,
+    /// `eras/conway/impl/.../TxCert.hs:723-724`: explicit `fail` arms, not
+    /// merely absent). Generating either for `era >= Era::Conway` is the
+    /// same false positive as the pre-Conway case above, just pointed the
+    /// other way: `structured_tx_encode`'s self-decodability assertion would
+    /// misdiagnose it as a #948-shaped encoder bug.
+    ///
     /// The variant indices below are this generator's own; the mapping to wire
-    /// tags is in `encode_certificate`.
+    /// tags is in `encode_certificate`. Indices 0-16 are exactly the tags
+    /// still valid in Conway/Dijkstra (`choice(17)` excludes 17 and 18).
     pub fn certificate_for(&mut self, era: Era) -> Certificate {
         // Indices whose wire tag is <= 6, i.e. representable before Conway.
         const PRE_CONWAY_VARIANTS: [u8; 7] = [0, 1, 4, 5, 6, 17, 18];
         let index = if era >= Era::Conway {
-            self.choice(19)
+            self.choice(17)
         } else {
             PRE_CONWAY_VARIANTS[(self.byte() as usize) % PRE_CONWAY_VARIANTS.len()]
         };
