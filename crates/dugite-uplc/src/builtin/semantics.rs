@@ -94,7 +94,17 @@ impl SemanticsVariant {
     /// mirroring IntersectMBO/plutus EXACTLY:
     ///
     /// * PlutusV1 | PlutusV2 → `A` (pv < 9), `B` (9 ≤ pv < 11), `D` (pv ≥ 11)
-    /// * PlutusV3 → `C` (pv < 11), `E` (pv ≥ 11)
+    /// * PlutusV3 | PlutusV4 → `C` (pv < 11), `E` (pv ≥ 11)
+    ///
+    /// PlutusV4 (Dijkstra): `IntersectMBO/plutus`'s own `PlutusLedgerLanguage`
+    /// sum type has NO `PlutusV4` constructor at all (still-open
+    /// `plutus#7342`), so there is no V4-specific `BuiltinSemanticsVariant` —
+    /// `BuiltinSemanticsVariant DefaultFun` has exactly 5 constructors (A-E),
+    /// no F. cardano-ledger's `PlutusV4` wraps V3's evaluation context
+    /// verbatim, so V4 gets the V3 branch. In practice this is always `E`:
+    /// V4 only exists at PV ≥ 12 (`guardPlutus: PlutusV4 -> natVersion @12`),
+    /// which is always ≥ `VAN_ROSSEM_PV` (11). See `ScriptLanguage`'s doc
+    /// comment (`dugite-uplc/src/redeemer_resolve.rs`) for the full citation.
     pub fn for_script(language: ScriptLanguage, major_pv: u32) -> Self {
         match language {
             ScriptLanguage::PlutusV1 | ScriptLanguage::PlutusV2 => {
@@ -106,7 +116,7 @@ impl SemanticsVariant {
                     SemanticsVariant::D
                 }
             }
-            ScriptLanguage::PlutusV3 => {
+            ScriptLanguage::PlutusV3 | ScriptLanguage::PlutusV4 => {
                 if major_pv < VAN_ROSSEM_PV {
                     SemanticsVariant::C
                 } else {
@@ -194,6 +204,32 @@ mod tests {
             SemanticsVariant::for_script(ScriptLanguage::PlutusV2, 12),
             SemanticsVariant::D
         );
+    }
+
+    /// Issue #1000 (PlutusV4/Dijkstra): V4 must map to EXACTLY the same
+    /// variant as V3 at every PV — `IntersectMBO/plutus`'s
+    /// `BuiltinSemanticsVariant DefaultFun` has exactly 5 constructors
+    /// (A-E), no V4-specific F, and cardano-ledger's `PlutusV4` wraps V3's
+    /// evaluation context verbatim. Also pins that V4's REAL range (PV >=
+    /// 12, Dijkstra's introduction PV) always lands on `E` — V4 can never
+    /// actually observe `C` on a real chain, even though the formula is
+    /// written generally to mirror V3's.
+    #[test]
+    fn for_script_maps_v4_identically_to_v3() {
+        for pv in 0u32..=15 {
+            assert_eq!(
+                SemanticsVariant::for_script(ScriptLanguage::PlutusV3, pv),
+                SemanticsVariant::for_script(ScriptLanguage::PlutusV4, pv),
+                "V3 and V4 must select the identical variant at pv={pv}"
+            );
+        }
+        // V4's real range (PV >= 12) always resolves to E.
+        for pv in 12u32..=15 {
+            assert_eq!(
+                SemanticsVariant::for_script(ScriptLanguage::PlutusV4, pv),
+                SemanticsVariant::E
+            );
+        }
     }
 
     #[test]
