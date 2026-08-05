@@ -275,7 +275,10 @@ pub(crate) fn eval_resolved_redeemer(
                 }
             }
         }
-        ScriptLanguage::PlutusV3 => {
+        // V4 shares V3's single-arg calling convention (see
+        // `ScriptLanguage`'s doc comment — V4 is V3 semantics under a
+        // distinct language tag, upstream-verified).
+        ScriptLanguage::PlutusV3 | ScriptLanguage::PlutusV4 => {
             let ctx_term = data_const_term(ctx_data);
             Term::App(Rc::new(term), Rc::new(ctx_term))
         }
@@ -407,12 +410,15 @@ pub(crate) fn eval_resolved_redeemer(
         _ => Term::Error,
     };
 
-    if matches!(r.language, ScriptLanguage::PlutusV3)
-        && !matches!(&result_term, Term::Const(Constant::Unit))
+    if matches!(
+        r.language,
+        ScriptLanguage::PlutusV3 | ScriptLanguage::PlutusV4
+    ) && !matches!(&result_term, Term::Const(Constant::Unit))
     {
-        // A V3 script that evaluates to a non-Unit value is a SCRIPT
+        // A V3/V4 script that evaluates to a non-Unit value is a SCRIPT
         // failure (the script ran to completion with the wrong result),
-        // not a context error — it legitimises is_valid=false (#734).
+        // not a context error — it legitimises is_valid=false (#734). V4
+        // shares this check with V3 (see `ScriptLanguage`'s doc comment).
         return Err(PhaseTwoError::ScriptEvaluationFailed(
             crate::UplcError::NonUnitReturn,
         ));
@@ -488,6 +494,28 @@ fn resolve_applied_costs(
                     tracing::warn!(
                         error = %e,
                         "PlutusV3 cost model could not be applied; \
+                         falling back to reference model"
+                    );
+                    None
+                }
+            }
+        }
+        // PlutusV4 (Dijkstra): read the wire-slot-3 array but apply it
+        // through the SAME `apply_v3` walk. Oracle-verified —
+        // `IntersectMBO/cardano-ledger`'s `PlutusV4` `Language` instance
+        // literally aliases `mkEvaluationContext lang PlutusV4 =
+        // PV3.mkEvaluationContext` and `plutusVXParamNames PlutusV4 =
+        // P.showParamName <$> [minBound .. maxBound :: PV3.ParamName]` — V4
+        // has no `ParamName` list of its own, so V3's flat-array layout IS
+        // V4's. See `ScriptLanguage`'s doc comment for the full citation.
+        ScriptLanguage::PlutusV4 => {
+            let params = cm.plutus_v4.as_deref()?;
+            match crate::cost_apply::apply_v3(params, major_pv) {
+                Ok(applied) => Some(applied),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "PlutusV4 cost model could not be applied; \
                          falling back to reference model"
                     );
                     None
@@ -635,7 +663,14 @@ fn build_script_context(
             };
             Ok(ctx.to_data(conway_or_later))
         }
-        ScriptLanguage::PlutusV3 => {
+        // V4 reuses the V3 `TxInfo`/`ScriptContext`/`ScriptInfo` builder
+        // wholesale — oracle-verified: cardano-ledger's `PlutusArgs
+        // 'PlutusV4 = PlutusV4Args { unPlutusV4Args :: PV3.ScriptContext }`
+        // wraps the exact same V3-shaped `ScriptContext` Data value (see
+        // `ScriptLanguage`'s doc comment). Sharing `tx_info_cache`'s `v3`
+        // slot here is also correct, not just convenient: a tx mixing V3
+        // and V4 redeemers observes the identical `TxInfo`.
+        ScriptLanguage::PlutusV3 | ScriptLanguage::PlutusV4 => {
             let tx_info = tx_info_cache.get_or_build_v3(tx, resolved, slot_config)?;
             // V3 builds a `ScriptInfo` from the purpose + (for spend)
             // the resolved inline/witness datum.
@@ -1255,6 +1290,330 @@ mod tests {
                 );
             }
             other => panic!("expected ScriptEvaluationFailedWithLogs, got: {other:?}"),
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // PlutusV4 (Dijkstra) — issue #1000
+    //
+    // Oracle-verified (see `ScriptLanguage`'s doc comment in
+    // `redeemer_resolve.rs`): V4 is V3 semantics under a distinct language
+    // tag — single ctx arg, must-return-Unit, same ScriptContext/TxInfo
+    // builder. These tests exercise the language end-to-end via a
+    // REFERENCE script (the only real on-chain V4 surface today — there is
+    // no witness-set slot upstream) and pin the language-availability gate
+    // (V4 only valid at PV >= 12) plus the cost-bracketing property the
+    // project treats as the standard for an evaluation-cost claim (tx-zoo
+    // `17f`: accepted at exactly N, rejected at N-1).
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Build a minimal V4 `ResolvedRedeemer` whose script is resolved via a
+    /// UTxO `script_ref` (NOT the witness set — there is no
+    /// `plutus_v4_scripts` witness-set field upstream, see
+    /// `redeemer_resolve::find_script_bytes`'s doc comment). The witness set
+    /// is deliberately left with all Plutus script lists empty to prove
+    /// resolution goes through the reference-script path alone.
+    #[allow(clippy::type_complexity)]
+    fn minimal_v4_ref_script_setup(
+        script_cbor: Vec<u8>,
+    ) -> (
+        dugite_primitives::transaction::Transaction,
+        Vec<(
+            dugite_primitives::transaction::TransactionInput,
+            dugite_primitives::transaction::TransactionOutput,
+            Vec<u8>,
+        )>,
+        crate::redeemer_resolve::ResolvedRedeemer,
+    ) {
+        use dugite_primitives::address::{Address, EnterpriseAddress};
+        use dugite_primitives::credentials::Credential as PrimCred;
+        use dugite_primitives::era::Era;
+        use dugite_primitives::hash::Hash;
+        use dugite_primitives::network::NetworkId;
+        use dugite_primitives::transaction::{
+            ExUnits, OutputDatum as PrimOutputDatum, PlutusData as PrimPlutusData, Redeemer,
+            RedeemerTag, ScriptRef as PrimScriptRef, Transaction, TransactionBody,
+            TransactionInput, TransactionOutput, TransactionWitnessSet,
+        };
+        use dugite_primitives::value::{Lovelace, Value};
+        use std::collections::BTreeMap;
+
+        // Reference scripts share the same CBOR-bytestring-wrapped-flat wire
+        // shape as witness scripts (#836). Hash prefix 0x04 (Dijkstra V4).
+        let mut buf = vec![4u8];
+        buf.extend_from_slice(&script_cbor);
+        let script_hash = dugite_primitives::hash::blake2b_224(&buf).0;
+        let input = TransactionInput {
+            transaction_id: Hash::<32>([0xdd; 32]),
+            index: 0,
+        };
+        let spent_out = TransactionOutput {
+            address: Address::Enterprise(EnterpriseAddress {
+                network: NetworkId::Testnet,
+                payment: PrimCred::Script(Hash::<28>(script_hash)),
+            }),
+            value: Value::lovelace(1),
+            datum: PrimOutputDatum::None,
+            script_ref: Some(PrimScriptRef::PlutusV4(script_cbor)),
+            is_legacy: false,
+            raw_cbor: None,
+        };
+        let body = TransactionBody {
+            inputs: vec![input.clone()],
+            outputs: vec![],
+            fee: Lovelace(0),
+            ttl: None,
+            certificates: vec![],
+            withdrawals: BTreeMap::new(),
+            auxiliary_data_hash: None,
+            validity_interval_start: None,
+            mint: BTreeMap::new(),
+            script_data_hash: None,
+            collateral: vec![],
+            required_signers: vec![],
+            network_id: None,
+            collateral_return: None,
+            total_collateral: None,
+            reference_inputs: vec![],
+            update: None,
+            voting_procedures: BTreeMap::new(),
+            proposal_procedures: vec![],
+            treasury_value: None,
+            donation: None,
+            sub_transactions: vec![],
+            account_balance_intervals: vec![],
+            direct_deposits: BTreeMap::new(),
+            guards: Vec::new(),
+        };
+        let ws = TransactionWitnessSet {
+            vkey_witnesses: vec![],
+            native_scripts: vec![],
+            bootstrap_witnesses: vec![],
+            // Deliberately empty — the V4 script is NOT a witness-set entry.
+            plutus_v1_scripts: vec![],
+            plutus_v2_scripts: vec![],
+            plutus_v3_scripts: vec![],
+            plutus_data: vec![],
+            redeemers: vec![Redeemer {
+                tag: RedeemerTag::Spend,
+                index: 0,
+                data: PrimPlutusData::Integer(BigInt::from(0)),
+                ex_units: ExUnits {
+                    mem: 1_000_000,
+                    steps: 100_000_000,
+                },
+            }],
+            raw_redeemers_cbor: None,
+            raw_plutus_data_cbor: None,
+            original_script_data_hash: None,
+        };
+        let tx = Transaction {
+            hash: Hash::<32>([0; 32]),
+            era: Era::Dijkstra,
+            body,
+            witness_set: ws,
+            is_valid: true,
+            auxiliary_data: None,
+            raw_cbor: None,
+            raw_body_cbor: None,
+            raw_witness_cbor: None,
+        };
+        let resolved = vec![(input, spent_out, vec![])];
+        let resolved_redeemer = crate::redeemer_resolve::resolve_redeemers(&tx, &resolved)
+            .expect("V4 redeemer resolves via script_ref")
+            .into_iter()
+            .next()
+            .unwrap();
+        (tx, resolved, resolved_redeemer)
+    }
+
+    /// Acceptance criterion 2: "A Dijkstra tx with a V4 REFERENCE script
+    /// resolves and evaluates." Mirrors
+    /// `smoke_v3_unit_script_runs_and_returns_unit` but through the
+    /// reference-script path (the only real on-chain V4 script source) at
+    /// major_pv=12 (Dijkstra — PlutusV4's `ledger_language_introduced_in`).
+    #[test]
+    fn smoke_v4_ref_script_runs_and_returns_unit() {
+        let script_cbor = unit_returning_v3_script(); // shape-identical for V4
+        let (tx, resolved, r) = minimal_v4_ref_script_setup(script_cbor);
+        assert_eq!(
+            r.language,
+            ScriptLanguage::PlutusV4,
+            "resolve_redeemer must resolve the script_ref as PlutusV4, not V3"
+        );
+        let budget = ExBudget {
+            cpu: 100_000_000,
+            mem: 1_000_000,
+        };
+        let outcome = eval_resolved_redeemer(
+            &tx,
+            &resolved,
+            &r,
+            &slot_cfg(),
+            budget,
+            None,
+            12,
+            &mut TxInfoCache::new(),
+        )
+        .expect("V4 reference-script unit script runs");
+        assert!(matches!(outcome.result_term, Term::Const(Constant::Unit)));
+        assert!(outcome.consumed.cpu > 0);
+    }
+
+    /// A V4 script that evaluates to a non-Unit value must be rejected the
+    /// same way a V3 one is (#734's `NonUnitReturn` — legitimises
+    /// `is_valid=false`, not a context error). Proves the
+    /// `matches!(r.language, PlutusV3 | PlutusV4)` classification arm.
+    #[test]
+    fn v4_non_unit_return_is_rejected() {
+        // `lam x. (con integer 7)` — a V4 script returning a non-Unit value.
+        let program = Program {
+            version: ver(1, 0, 0),
+            term: Term::Lam(Rc::new(Term::Const(Constant::Integer(BigInt::from(7))))),
+        };
+        let script_cbor = program.to_cbor().unwrap();
+        let (tx, resolved, r) = minimal_v4_ref_script_setup(script_cbor);
+        let budget = ExBudget {
+            cpu: 100_000_000,
+            mem: 1_000_000,
+        };
+        let err = eval_resolved_redeemer(
+            &tx,
+            &resolved,
+            &r,
+            &slot_cfg(),
+            budget,
+            None,
+            12,
+            &mut TxInfoCache::new(),
+        )
+        .expect_err("V4 non-Unit return must be rejected");
+        match err {
+            PhaseTwoError::ScriptEvaluationFailed(crate::UplcError::NonUnitReturn) => {}
+            other => panic!("expected NonUnitReturn, got: {other:?}"),
+        }
+    }
+
+    /// PlutusV4 is only available from Dijkstra (PV12) —
+    /// `ledger_language_introduced_in(PlutusV4) == 12`, mirroring Haskell's
+    /// `guardPlutus: PlutusV4 -> natVersion @12`. A V4 script evaluated at
+    /// PV11 (pre-Dijkstra) must be rejected BEFORE the flat blob is even
+    /// decoded, exactly like a V3 script is rejected at PV8.
+    #[test]
+    fn v4_script_rejected_before_dijkstra_protocol_version() {
+        let script_cbor = unit_returning_v3_script();
+        let (tx, resolved, r) = minimal_v4_ref_script_setup(script_cbor);
+        let budget = ExBudget {
+            cpu: 100_000_000,
+            mem: 1_000_000,
+        };
+        let err = eval_resolved_redeemer(
+            &tx,
+            &resolved,
+            &r,
+            &slot_cfg(),
+            budget,
+            None,
+            11, // one below PlutusV4's introduction PV (12)
+            &mut TxInfoCache::new(),
+        )
+        .expect_err("V4 script must be rejected before protocol version 12");
+        match err {
+            PhaseTwoError::ScriptEvaluationFailed(crate::UplcError::FlatDecode(msg)) => {
+                assert!(
+                    msg.contains("PlutusV4") && msg.contains("12"),
+                    "error should name the language and the introducing PV: {msg}"
+                );
+            }
+            other => panic!("expected FlatDecode language-availability error, got: {other:?}"),
+        }
+    }
+
+    /// Cost accounting bracketed from BOTH sides (the project's standard for
+    /// proving an evaluation-cost claim, mirroring tx-zoo `17f`): a V4
+    /// script must be ACCEPTED when the declared budget equals exactly its
+    /// consumed cost, and REJECTED (`BudgetExhausted`) when the budget is
+    /// one cpu unit short. `N` is measured empirically (first run with a
+    /// generous budget captures `outcome.consumed.cpu`), not hardcoded —
+    /// the exact figure is asserted below so a future CEK/cost-model change
+    /// that shifts it is caught rather than silently re-measured.
+    #[test]
+    fn v4_cost_bracketed_pass_at_n_fail_at_n_minus_one() {
+        let generous_budget = ExBudget {
+            cpu: 100_000_000,
+            mem: 1_000_000,
+        };
+
+        // First pass: measure the exact consumed budget with headroom.
+        let (tx, resolved, r) = minimal_v4_ref_script_setup(unit_returning_v3_script());
+        let outcome = eval_resolved_redeemer(
+            &tx,
+            &resolved,
+            &r,
+            &slot_cfg(),
+            generous_budget,
+            None,
+            12,
+            &mut TxInfoCache::new(),
+        )
+        .expect("measurement pass must succeed");
+        let n_cpu = outcome.consumed.cpu;
+        let n_mem = outcome.consumed.mem;
+        assert!(n_cpu > 0, "measured cpu cost must be positive");
+        // Pin the exact figure for this minimal script + V3-shared V4
+        // ScriptContext (`lam _. ()` applied to one ctx arg, single-input
+        // Dijkstra spend, reference-model costs). A change here means the
+        // CEK/cost-model/ScriptContext-construction path shifted — worth a
+        // deliberate look, not a silent re-measurement.
+        assert_eq!(
+            n_cpu, 64_100,
+            "V4 minimal-script cpu cost drifted — update deliberately if the \
+             CEK/ScriptContext/cost-model path changed"
+        );
+
+        // Second pass: budget == exactly the consumed cost → must PASS,
+        // with zero cpu/mem remaining (this IS "exactly N").
+        let (tx2, resolved2, r2) = minimal_v4_ref_script_setup(unit_returning_v3_script());
+        let exact_budget = ExBudget {
+            cpu: n_cpu,
+            mem: n_mem,
+        };
+        let outcome_exact = eval_resolved_redeemer(
+            &tx2,
+            &resolved2,
+            &r2,
+            &slot_cfg(),
+            exact_budget,
+            None,
+            12,
+            &mut TxInfoCache::new(),
+        )
+        .expect("budget exactly equal to consumed cost must succeed");
+        assert_eq!(outcome_exact.consumed.cpu, n_cpu);
+        assert_eq!(outcome_exact.consumed.mem, n_mem);
+
+        // Third pass: budget one cpu unit BELOW consumed cost → must FAIL
+        // with BudgetExhausted (never silently accepted, never a different
+        // error class).
+        let (tx3, resolved3, r3) = minimal_v4_ref_script_setup(unit_returning_v3_script());
+        let short_budget = ExBudget {
+            cpu: n_cpu - 1,
+            mem: n_mem,
+        };
+        let err = eval_resolved_redeemer(
+            &tx3,
+            &resolved3,
+            &r3,
+            &slot_cfg(),
+            short_budget,
+            None,
+            12,
+            &mut TxInfoCache::new(),
+        )
+        .expect_err("budget one cpu unit short of consumed cost must fail");
+        match err {
+            PhaseTwoError::ScriptEvaluationFailed(crate::UplcError::BudgetExhausted { .. }) => {}
+            other => panic!("expected BudgetExhausted, got: {other:?}"),
         }
     }
 }

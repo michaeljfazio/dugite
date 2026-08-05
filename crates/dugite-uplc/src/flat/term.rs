@@ -242,13 +242,20 @@ pub fn validate_program_availability(
 
 /// The protocol MAJOR version at which each ledger Plutus language became
 /// available — Haskell `ledgerLanguageIntroducedIn`:
-/// PlutusV1 → Alonzo (5), PlutusV2 → Babbage/Vasil (7), PlutusV3 → Conway/Chang (9).
+/// PlutusV1 → Alonzo (5), PlutusV2 → Babbage/Vasil (7), PlutusV3 → Conway/Chang (9),
+/// PlutusV4 → Dijkstra (12).
 /// (Matches dugite-ledger's own reference-script PV gate in `validation/scripts.rs`.)
+///
+/// PlutusV4: `IntersectMBO/cardano-ledger` @
+/// `c4f649fac4a18929f550ffebf07c9e7371355d9d`,
+/// `libs/cardano-ledger-core/.../Language.hs` `guardPlutus`:
+/// `PlutusV4 -> natVersion @12`.
 pub fn ledger_language_introduced_in(language: ScriptLanguage) -> u32 {
     match language {
         ScriptLanguage::PlutusV1 => 5,
         ScriptLanguage::PlutusV2 => 7,
         ScriptLanguage::PlutusV3 => 9,
+        ScriptLanguage::PlutusV4 => 12,
     }
 }
 
@@ -1091,12 +1098,18 @@ mod tests {
 
     /// #860.1: a script whose ledger language is not yet available at the current
     /// protocol version is rejected; an available one passes. Thresholds V1@5,
-    /// V2@7, V3@9 (`ledgerLanguageIntroducedIn`).
+    /// V2@7, V3@9, V4@12 (`ledgerLanguageIntroducedIn` — V4's 12 is issue
+    /// #1000, oracle-verified `guardPlutus: PlutusV4 -> natVersion @12`).
     #[test]
     fn ledger_language_availability_gate_860_1() {
         use ScriptLanguage::*;
         // Unavailable below the introduction PV.
-        for (lang, introduced) in [(PlutusV1, 5u32), (PlutusV2, 7), (PlutusV3, 9)] {
+        for (lang, introduced) in [
+            (PlutusV1, 5u32),
+            (PlutusV2, 7),
+            (PlutusV3, 9),
+            (PlutusV4, 12),
+        ] {
             assert_eq!(ledger_language_introduced_in(lang), introduced);
             assert!(
                 validate_ledger_language_available(lang, introduced - 1).is_err(),
