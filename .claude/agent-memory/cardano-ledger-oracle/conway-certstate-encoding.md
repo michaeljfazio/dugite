@@ -120,3 +120,72 @@ array(4)
   [2] deltaReserves :: DeltaCoin  (integer, may be negative)
   [3] deltaTreasury :: DeltaCoin
 ```
+
+Still present verbatim in Conway's DState at this commit (survives structurally even though MIR
+certs were removed from the Conway tx-body/cert CDDL — it's always-empty in practice post-Conway
+but still a required wire field, decoded/encoded unconditionally as part of DState's array(4)).
+
+## DRepState = array(4) (leaf value of vsDReps map)
+
+Source: `libs/cardano-ledger-core/src/Cardano/Ledger/DRep.hs`. `Rec DRepState !> To drepExpiry !>
+To drepAnchor !> To drepDeposit !> To drepDelegs`.
+
+```
+array(4)
+  [0] drepExpiry   :: EpochNo
+  [1] drepAnchor   :: StrictMaybe Anchor        -- generic `To` ⇒ DEFAULT encodeStrictMaybe:
+                                                    array(0) SNothing / array(1)[anchor] SJust
+  [2] drepDeposit  :: CompactForm Coin
+  [3] drepDelegs   :: Set (Credential Staking)  -- NOT serialized from vsDReps' perspective on
+                                                    decode-share paths but IS a real array(4)
+                                                    field on the wire
+```
+
+## CommitteeState = BARE MAP, not array-wrapped — DIFFERENT from Governance's Committee type
+
+Source: `libs/cardano-ledger-core/src/Cardano/Ledger/State/CertState.hs`.
+
+```haskell
+newtype CommitteeState era = CommitteeState
+  { csCommitteeCreds :: Map (Credential ColdCommitteeRole) CommitteeAuthorization }
+  deriving (..., EncCBOR, ...)   -- GeneralizedNewtypeDeriving: transparent pass-through
+```
+
+Wire shape: a **bare CBOR map** `{ ColdCommitteeRole credential => CommitteeAuthorization, ... }`
+— NO array(1)/array(2) wrapper of any kind, because the newtype's `EncCBOR` is derived directly
+from the underlying `Map`'s instance. This answers the open question in a prior investigation:
+`VState.vsCommitteeState` is a **genuinely different wire shape** from the `Committee` type
+embedded in `EnactState`/`ConwayGovState` (`array(2)[Map ColdCred EpochNo, UnitInterval
+threshold]`) — they track different concerns (VState's CommitteeState = live
+hot-authorization/resignation registry; Governance's Committee = seated members + term + quorum
+from the last enactment) and share no encoding.
+
+`CommitteeAuthorization` (map value) is a 2-constructor sum, encoded via the `Sum`/`To` coders
+combinator ⇒ `array(2)[tag, field]`:
+```
+CommitteeHotCredential (Credential HotCommitteeRole) -> array(2)[0, hotCred]
+CommitteeMemberResigned (StrictMaybe Anchor)         -> array(2)[1, anchorField]
+                                                          -- anchorField uses generic `To`, so it's
+                                                          -- the DEFAULT encodeStrictMaybe wrapper:
+                                                          -- array(0) or array(1)[anchor], NESTED
+                                                          -- inside this array(2) as element [1]
+```
+
+## PState leaf types: StakePoolState (array 10) vs StakePoolParams (array 9) — confirmed, no psDeposits field
+
+Re-verified @ SHA a88b60bdcf3248dfe5a2f9372c188c399233f479: `PState` really is exactly
+`{psVRFKeyHashes, psStakePools, psFutureStakePoolParams, psRetiring}` (array(4), no 5th
+`psDeposits` field at any position — deposit lives per-pool inside `StakePoolState.spsDeposit`
+instead, field [8] of that array(10)). `StakePoolParams`'s array(9) is produced by
+`withStakePoolParamsFlatEncoding` (a dynamic-length flat encoder, not literally `EncCBORGroup`,
+but wire-identical to a flat array(9)) — its own top-level `EncCBOR` instance wraps that in
+`encodeListLen n <> ...` directly, so a standalone `StakePoolParams` value on the wire is exactly
+`array(9)[id, vrf, pledge, cost, margin, accountAddress, owners, relays, metadata_null]` with
+`metadata` using `encodeNullStrictMaybe` (null-or-bare, not array-wrapped).
+
+## ConwayAccountState field [2]/[3] are `Maybe`, not `StrictMaybe` — minor correction
+
+`casStakePoolDelegation :: Maybe (KeyHash StakePool)` and `casDRepDelegation :: Maybe DRep`
+(`eras/conway/impl/.../State/Account.hs`) are genuinely `Maybe`, encoded via `encodeNullMaybe`, not
+`StrictMaybe`/`encodeNullStrictMaybe` as a prior note said. Wire shape is unaffected (still
+null-or-bare-value, no array wrapper) — see [[unit-strictmaybe-maybe-enccbor-wire-shapes]].

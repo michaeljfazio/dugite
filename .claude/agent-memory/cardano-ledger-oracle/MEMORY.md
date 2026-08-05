@@ -23,12 +23,14 @@
 - [mkPoolRewardInfo zero-block-pool gate](mkpoolrewardinfo-zero-block-pool-gate.md) — gate lives INSIDE mkPoolRewardInfo (`Map.lookup` into BlocksMade), not in startStep's iteration; mkApparentPerformance's `d>=0.8=>1` branch is unreachable for a zero-block pool; zero-block pool gets NO reward at all, leader or member (live-verified 2026-08-05 @ 4849c13d)
 
 ## CBOR Structure Reference
-- [NewEpochState/EpochState/LedgerState/UTxOState encoding](newepochstate-complete-encoding.md) — field order, array sizes
+- [NewEpochState/EpochState/LedgerState/UTxOState encoding](newepochstate-complete-encoding.md) — field order, array sizes. Re-verified verbatim 2026-08-05 @ a88b60bd; corrected a wrong `()`=array(0) claim (see below).
 - [Conway PParams array(31) field order](conway-pparams-field-order.md) — all 31 fields indexed 0-30
-- [Conway CertState/DState/PState/VState encoding](conway-certstate-encoding.md) — array sizes, StakePoolState vs StakePoolParams
+- [Conway CertState/DState/PState/VState encoding](conway-certstate-encoding.md) — array sizes, StakePoolState vs StakePoolParams, DRepState array(4), CommitteeState=bare map, CommitteeAuthorization sum shape (re-verified 2026-08-05 @ a88b60bd)
+- [`()`/StrictMaybe/Maybe EncCBOR wire shapes](unit-strictmaybe-maybe-enccbor-wire-shapes.md) — `()`=CBOR null NOT array(0); 3 distinct optional-value encoders (default StrictMaybe=array-wrapped, encodeNullStrictMaybe/encodeNullMaybe=null-or-bare) — easy to conflate, verified 2026-08-05
+- [UTxOState.utxosUtxo MemPack asymmetry + DebugNewEpochState/DebugEpochState always-empty](utxostate-utxo-mempack-asymmetry-debugquery-empty.md) — EncCBOR wraps entries as MemPack-bstr, DecCBOR reads plain TxIn/TxOut; reconciled because these two LSQ queries are QFNoTables ⇒ utxosUtxo is ALWAYS mempty in real cardano-node replies, regardless of live UTxO size (verified 2026-08-05, cardano-ledger + ouroboros-consensus Query.hs)
 - [SnapShots new vs old format](snapshots-encoding.md) — array(2) new, array(3) old, StakePoolSnapShot array(10)
 - [ConwayGovState encoding](conway-gov-state-encoding-detailed.md) — array(7), nested types
-- [Conway Accounts/ConwayAccountState encoding](conway-accounts-encoding.md) — per-account array(4), nullable delegations
+- [Conway Accounts/ConwayAccountState encoding](conway-accounts-encoding.md) — per-account array(4), nullable delegations (fields [2]/[3] are `Maybe` not `StrictMaybe` — corrected 2026-08-05)
 - [OutputTooBigUTxO/maxValSize mechanics](outputtoobigutxo-maxvalsize-exact-mechanics.md) — fresh re-encode not wire bytes; encodeMap definite/indefinite threshold at 23; strict `>` (live-verified 2026-07-31)
 
 ## JSON Debug-Dump (aeson ToJSON) — separate from CBOR wire format

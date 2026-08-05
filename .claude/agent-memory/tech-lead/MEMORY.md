@@ -1,5 +1,8 @@
 # Tech Lead Agent Memory
 
+## Conway Cert Tags 5/6 Decode Reject (2026-08-05)
+- [#1023 fix + #1029 Dijkstra follow-up](issue-1023-conway-cert-tags-5-6-decode-reject.md) — MIR/GenesisKeyDelegation hard-reject at Conway/Dijkstra decode, clean era-type-swap not PV-gated (unlike #1014 next door); Dijkstra ALSO removes tags 0/1 (filed #1029, not fixed — unreleased era); fuzz generator + encoder-test coverage gaps found and closed. Traps: `;`+bare-echo swallows exit code same as `| tail`; idling on background jobs w/o interim report; merge-tree-diff check validates pre-merge CI run still applies post-merge.
+
 ## Conway Phase-1 Transaction Validation Audit (2026-08-05)
 - [Full Phase-1 audit](issue-1021-1022-1024-1026-1028-conway-phase1-audit.md) — #1021 ProposalCantFollow (GOV tag 10, zero Phase-1 impl) + #1022 TooManyCollateralInputs wrongly gated behind has_plutus_scripts + #1024 ConwayTxRefScriptsSizeTooBig (per-tx 200KiB cap) missing entirely (all 3 FIXED, RED-GREEN verified, 26 new tests); #1026 DisallowedProposalDuringBootstrap (PV9-only, unreachable today) + #1028 InvalidGuardrailsScriptHash None-vs-SNothing ambiguity (unreachable while all 3 genesis configs seed a guardrail) both FILED not fixed. CERTS/DELEG/POOL/GOVCERT and ~17/19 GOV predicates confirmed CORRECT (clean negatives, do not re-audit). Trap: adding ValidationError variants broke an exhaustive match invisible to `cargo build --workspace --lib` — only `--all-targets`/clippy catches it.
 

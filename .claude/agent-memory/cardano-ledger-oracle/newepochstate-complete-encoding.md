@@ -21,11 +21,22 @@ array(7)
   [4] nesRu           :: StrictMaybe PulsingRewUpdate  (array(0)=SNothing, array(1)[x]=SJust)
   [5] nesPd           :: PoolDistr         (map + total)
   [6] stashedAVVMAddresses :: StashedAVVMAddresses era
-                         Conway: encoded as () = array(0)
-                         Shelley only: UTxO
+                         Conway (and every post-Shelley era): () -- CBOR null (0xf6), NOT array(0)!
+                         Shelley only: UTxO ShelleyEra
 ```
 
 CONFIRMED: nesPd (PoolDistr) is at index 5. stashedAVVM is index 6.
+
+CORRECTION (re-verified 2026-08-05 @ pinned SHA a88b60bdcf3248dfe5a2f9372c188c399233f479):
+`instance EncCBOR () where encCBOR = const encodeNull` in cardano-ledger-binary — `()` encodes as
+a bare CBOR `null` simple value (one byte, `0xf6`), NOT `encodeListLen 0` (`0x80`). The line above
+previously (wrongly) said "array(0)". See [[unit-strictmaybe-maybe-enccbor-wire-shapes]] for the
+full breakdown of `()`/`StrictMaybe`/`Maybe` encoders, and [[utxostate-utxo-mempack-asymmetry-debugquery-empty]]
+for the utxosUtxo field's own (unrelated) encoding subtlety.
+
+STATUS: EpochState/LedgerState/UTxOState/NewEpochState/ChainAccountState field lists and encoding
+order in this file were all re-verified VERBATIM against live source @ SHA
+a88b60bdcf3248dfe5a2f9372c188c399233f479 (2026-07-24) on 2026-08-05 — no other drift found.
 
 ## EpochState = array(4)
 
