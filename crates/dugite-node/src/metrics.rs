@@ -1017,7 +1017,17 @@ impl NodeMetrics {
     }
 
     /// Record a protocol-level error by label (e.g. "n2n_handshake_failed").
-    #[allow(dead_code)] // used by networking rewrite
+    ///
+    /// Its only callers are `serve::N2NConnectionMetrics::on_error` and
+    /// `N2CConnectionMetrics::on_error` (implementations of
+    /// `dugite_network::ConnectionMetrics`), and those two bridge structs
+    /// are themselves constructed only in `#[cfg(test)]` (see the comment
+    /// on `N2NConnectionMetrics`) — the real N2N/N2C accept loops never
+    /// construct a `ConnectionMetrics` implementor at all, so real
+    /// protocol-level connection errors are not currently recorded to this
+    /// metric. Not "networking rewrite" debt: a genuine wiring gap, tracked
+    /// as a #1003 follow-up.
+    #[allow(dead_code)]
     pub fn record_protocol_error(&self, label: &str) {
         if let Ok(mut map) = self.protocol_errors.lock() {
             *map.entry(label.to_string()).or_insert(0) += 1;
