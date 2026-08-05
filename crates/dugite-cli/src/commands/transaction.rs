@@ -841,7 +841,12 @@ fn parse_mint_args(mint_args: &[String]) -> Result<Vec<MintEntry>> {
 /// - "atLeast" / "ScriptNOfK": requires N of K sub-scripts
 /// - "after" / "InvalidBefore": valid after slot
 /// - "before" / "InvalidHereafter": valid before slot
-fn parse_json_native_script(
+///
+/// `pub(crate)` so `commands::hash::hash_script_file` (`hash script`, #1008)
+/// can share this exact parser with `transaction policyid` — both compute
+/// the identical `blake2b_224(0x00 || cbor)` native-script hash and must
+/// never drift into two copies that disagree.
+pub(crate) fn parse_json_native_script(
     json: &serde_json::Value,
 ) -> Result<dugite_primitives::transaction::NativeScript> {
     use dugite_primitives::transaction::NativeScript;

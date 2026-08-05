@@ -11,12 +11,31 @@
 # tests/conformance/src/upstream/ledger_rules_replay/mod.rs: "empty or every
 # entry has a tracking issue" (CLAUDE.md).
 #
-# The 82 entries below are the check's first real run against cardano-cli
+# Originally 82 entries from the check's first real run against cardano-cli
 # 11.0.0.0 (97036a66bcf8c89f687ae57a048eecc0389977ef) — see #1008 for the
-# full backlog, grouped and with per-group caveats (several are
-# naming/structure differences rather than true absent capabilities; #1008
-# documents which). Not a commitment to implement all 82 — several are
-# Byron-era ceremony tooling or Peras BLS keys of uncertain present value.
+# full triage (grouped, with per-group/per-item reasoning: genuine gaps vs.
+# naming/structure differences vs. out-of-scope legacy tooling vs. blocked).
+# Not a commitment to implement all of them — several are Byron-era ceremony
+# tooling or Peras BLS keys of uncertain present value.
+#
+# 10 entries closed by #1008's first implementation pass (2026-08-05):
+#   hash anchor-data / hash script / hash genesis-file — new `hash` command
+#     group, offline, golden-tested against real cardano-cli.
+#   governance drep metadata-hash — new subcommand, shares hash.rs's raw-bytes
+#     blake2b_256 + fetch_url_bytes with `hash anchor-data`; golden-tested.
+#   version — new bare subcommand.
+#   stake-pool deregistration-certificate, stake-address
+#     stake-delegation-certificate — cardano-cli's names made PRIMARY (the
+#     prior dugite names are now visible aliases); same underlying
+#     certificate construction, golden-verified byte-identical CBOR body
+#     against real cardano-cli.
+#   query tx-mempool info / next-tx / tx-exists — resolved by a checker
+#     normalization rule (see `collapse_structural_equivalents` in
+#     cli-surface-parity.sh), not new dugite-cli code: cardano-cli's 3
+#     subcommands and dugite-cli's single `query tx-mempool [SUBCMD]` are the
+#     same capability described two different ways. `has-tx` renamed to
+#     `tx-exists` (dugite's original name kept as a back-compat alias) so the
+#     accepted vocabulary is byte-exact with cardano-cli's, not just close.
 
 byron genesis genesis	1008
 byron genesis print-genesis-hash	1008
@@ -59,11 +78,7 @@ governance create-genesis-key-delegation-certificate	1008
 governance create-mir-certificate stake-addresses	1008
 governance create-mir-certificate transfer-to-rewards	1008
 governance create-mir-certificate transfer-to-treasury	1008
-governance drep metadata-hash	1008
 governance vote view	1008
-hash anchor-data	1008
-hash genesis-file	1008
-hash script	1008
 key convert-byron-genesis-vkey	1008
 key convert-byron-key	1008
 key convert-cardano-address-key	1008
@@ -86,17 +101,11 @@ query pool-state	1008
 query ref-script-size	1008
 query spo-stake-distribution	1008
 query stake-pool-default-vote	1008
-query tx-mempool info	1008
-query tx-mempool next-tx	1008
-query tx-mempool tx-exists	1008
 stake-address registration-and-delegation-certificate	1008
 stake-address registration-and-vote-delegation-certificate	1008
 stake-address registration-stake-and-vote-delegation-certificate	1008
 stake-address stake-and-vote-delegation-certificate	1008
-stake-address stake-delegation-certificate	1008
-stake-pool deregistration-certificate	1008
 transaction build-estimate	1008
 transaction calculate-plutus-script-cost offline	1008
 transaction calculate-plutus-script-cost online	1008
 transaction signed-transaction	1008
-version	1008
