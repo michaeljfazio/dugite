@@ -25,7 +25,7 @@
 
 use minicbor::Encoder;
 
-use crate::TxValidationError;
+use crate::{PlutusPurposeItem, TxValidationError};
 
 /// CBOR tag 258 — marks a CBOR array as a mathematical set (sorted, no duplicates).
 /// Required by Conway-era encoding for sets of TxIn, KeyHash, ScriptHash, etc.
@@ -619,6 +619,21 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
             enc.u64(*expected).expect("infallible");
         }
 
+        // GOV tag 1: MalformedProposal (GovAction era) — the whole action is
+        // the single payload item, exactly like tag 8's ProposalProcedure.
+        // Re-encoded with `dugite_serialization::encode_gov_action`, the SAME
+        // encoder used to build governance actions into transaction bodies for
+        // signing, so the two paths stay byte-identical by construction.
+        //
+        // Reference: `Conway/Rules/Gov.hs` (`ConwayGovPredFailure` tag 1).
+        TxValidationError::MalformedProposalGOV { action } => {
+            let raw = dugite_serialization::encode_gov_action(action);
+            encode_gov_failure(enc, 1, |enc| {
+                let writer = enc.writer_mut();
+                writer.extend_from_slice(&raw);
+            });
+        }
+
         TxValidationError::InvalidPrevGovActionId { proposal, .. } => {
             let raw = dugite_serialization::encode_proposal_procedure(proposal);
             encode_gov_failure(enc, 8, |enc| {
@@ -847,6 +862,74 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
         }
 
         // ══ #1025: further typed UTXOW/UTXO failures ═══════════════════
+        // UTXOW tag 10: MissingRedeemers (NonEmpty (PlutusPurpose AsItem era, ScriptHash))
+        //
+        // Each element is a 2-tuple, so `array(2)[purpose, script_hash]`, and
+        // the purpose is itself `array(2)[tag, item]` (EncCBORGroup with
+        // `listLen _ = 2`). `AsItem` encodes the ITEM ONLY — it is a newtype
+        // over the item with a newtype-derived EncCBOR, and the index is a
+        // phantom parameter. Contrast tag 15 ExtraRedeemers above, which is
+        // `AsIx` and therefore writes the index.
+        //
+        // Every item encoder is the SAME one that builds these values into
+        // transaction bodies for signing, so the two paths cannot drift.
+        TxValidationError::MissingRedeemersUTXOW { entries } => {
+            let parsed: Vec<([u8; 28], &PlutusPurposeItem)> = entries
+                .iter()
+                .filter_map(|(purpose, sh)| parse_hex_28(sh).map(|h| (h, purpose)))
+                .collect();
+            // A `Withdrawing` account is a 29-byte reward account, not a hash;
+            // validate it separately so a malformed one falls back rather than
+            // being silently dropped from the list.
+            let accounts_ok = entries.iter().all(|(p, _)| match p {
+                PlutusPurposeItem::Withdrawing { account } => {
+                    hex::decode(account).map(|b| b.len() == 29).unwrap_or(false)
+                }
+                PlutusPurposeItem::Minting { policy_id } => parse_hex_28(policy_id).is_some(),
+                _ => true,
+            });
+            if parsed.len() != entries.len() || parsed.is_empty() || !accounts_ok {
+                partial_fallback(enc, err);
+            } else {
+                encode_utxow_failure(enc, 10, |e| {
+                    list_open(e, parsed.len());
+                    for (script_hash, purpose) in &parsed {
+                        e.array(2).expect("infallible");
+                        // PlutusPurpose AsItem = array(2)[tag, item]
+                        e.array(2).expect("infallible");
+                        match purpose {
+                            PlutusPurposeItem::Minting { policy_id } => {
+                                e.u8(1).expect("infallible");
+                                let h = parse_hex_28(policy_id).expect("validated above");
+                                e.bytes(&h).expect("infallible");
+                            }
+                            PlutusPurposeItem::Certifying(cert) => {
+                                e.u8(2).expect("infallible");
+                                let raw = dugite_serialization::encode_certificate(cert);
+                                e.writer_mut().extend_from_slice(&raw);
+                            }
+                            PlutusPurposeItem::Withdrawing { account } => {
+                                e.u8(3).expect("infallible");
+                                let raw = hex::decode(account).expect("validated above");
+                                e.bytes(&raw).expect("infallible");
+                            }
+                            PlutusPurposeItem::Voting(voter) => {
+                                e.u8(4).expect("infallible");
+                                let raw = dugite_serialization::encode_voter(voter);
+                                e.writer_mut().extend_from_slice(&raw);
+                            }
+                            PlutusPurposeItem::Proposing(proposal) => {
+                                e.u8(5).expect("infallible");
+                                let raw = dugite_serialization::encode_proposal_procedure(proposal);
+                                e.writer_mut().extend_from_slice(&raw);
+                            }
+                        }
+                        e.bytes(script_hash).expect("infallible");
+                    }
+                    list_close(e, parsed.len());
+                });
+            }
+        }
         TxValidationError::MissingRequiredDatumsUTXOW { missing, provided } => {
             let missing_parsed: Vec<[u8; 32]> =
                 missing.iter().filter_map(|h| parse_hex_32(h)).collect();
@@ -3604,6 +3687,193 @@ mod tests {
         assert_eq!(dec.u64().unwrap(), 99_999_999_999, "declared");
         assert_eq!(dec.u64().unwrap(), 100_000_000_000, "expected");
         assert_eq!(dec.position(), buf.len(), "no trailing bytes");
+    }
+
+    // ── #1025: `MissingRedeemers` (Ledger tag 1, UTXOW tag 10) ──
+
+    /// CBOR golden: a single `Minting` purpose.
+    ///
+    /// `MissingRedeemers (NonEmpty (PlutusPurpose AsItem era, ScriptHash))`
+    /// = list of `array(2)[ array(2)[tag, item], bstr28 ]`.
+    ///
+    /// For a minting purpose the item IS the policy id, so the same 28 bytes
+    /// appear twice — once as the purpose's item and once as the script hash.
+    /// That is upstream's shape, not a duplication bug.
+    #[test]
+    fn test_encode_missing_redeemers_minting_golden() {
+        let policy = "ab".repeat(28);
+        let err = TxValidationError::MissingRedeemersUTXOW {
+            entries: vec![(
+                PlutusPurposeItem::Minting {
+                    policy_id: policy.clone(),
+                },
+                policy.clone(),
+            )],
+        };
+
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        encode_conway_ledger_pred_failure(&mut enc, &err);
+
+        let mut expected = vec![
+            0x82, 0x01, // ConwayLedgerPredFailure: array(2)[1, ...] (UtxowFailure)
+            0x82, 0x0a, // ConwayUtxowPredFailure: array(2)[10, ...]
+            0x81, // NonEmpty list of 1
+            0x82, // (purpose, scripthash) pair
+            0x82, 0x01, // PlutusPurpose AsItem: array(2)[1 = ConwayMinting, item]
+            0x58, 0x1c, // bstr(28) policy id
+        ];
+        expected.extend(std::iter::repeat_n(0xABu8, 28));
+        expected.extend([0x58, 0x1c]); // bstr(28) script hash
+        expected.extend(std::iter::repeat_n(0xABu8, 28));
+
+        assert_eq!(buf, expected, "MissingRedeemers must be byte-exact");
+    }
+
+    /// `AsItem` must encode the ITEM ONLY — never the index.
+    ///
+    /// `newtype AsItem ix it = AsItem { unAsItem :: it }` derives EncCBOR via
+    /// the newtype, so `ix` is phantom. `ExtraRedeemers` (tag 15) is the `AsIx`
+    /// counterpart and DOES write an index; encoding one like the other is the
+    /// easiest way to produce a frame cardano-cli cannot decode. This asserts
+    /// the two are shaped differently on purpose.
+    #[test]
+    fn as_item_encodes_no_index_unlike_as_ix() {
+        let account = format!("e1{}", "22".repeat(28)); // 29-byte reward account
+        let sh = "cd".repeat(28);
+        let mut item_buf = Vec::new();
+        encode_conway_ledger_pred_failure(
+            &mut Encoder::new(&mut item_buf),
+            &TxValidationError::MissingRedeemersUTXOW {
+                entries: vec![(
+                    PlutusPurposeItem::Withdrawing {
+                        account: account.clone(),
+                    },
+                    sh.clone(),
+                )],
+            },
+        );
+        // array(2)[3 = ConwayWithdrawing, bstr(29)] — no index between them.
+        assert_eq!(
+            &item_buf[6..9],
+            &[0x82, 0x03, 0x58],
+            "AsItem: tag then straight to the item"
+        );
+
+        let mut ix_buf = Vec::new();
+        encode_conway_ledger_pred_failure(
+            &mut Encoder::new(&mut ix_buf),
+            &TxValidationError::ExtraRedeemersUTXOW {
+                purposes: vec![(3, 7)],
+            },
+        );
+        // array(2)[3, 7] — AsIx writes the index as the second element.
+        assert_eq!(
+            &ix_buf[5..8],
+            &[0x82, 0x03, 0x07],
+            "AsIx: tag then the index"
+        );
+    }
+
+    /// Malformed hex must fall back to the generic reason rather than emit a
+    /// short or wrong list — the repo's standing rule that an unverified arm
+    /// can be worse than the generic one.
+    #[test]
+    fn missing_redeemers_falls_back_on_unparseable_input() {
+        let err = TxValidationError::MissingRedeemersUTXOW {
+            entries: vec![(
+                PlutusPurposeItem::Minting {
+                    policy_id: "not-hex".to_string(),
+                },
+                "ab".repeat(28),
+            )],
+        };
+        let mut buf = Vec::new();
+        encode_conway_ledger_pred_failure(&mut Encoder::new(&mut buf), &err);
+        assert_ne!(
+            &buf[..4],
+            &[0x82, 0x01, 0x82, 0x0a],
+            "an unparseable policy id must NOT produce a tag-10 frame"
+        );
+    }
+
+    // ── #1025: `MalformedProposal` (Ledger tag 3, GOV tag 1) ──
+
+    /// CBOR golden: `MalformedProposal` carries the WHOLE `GovAction`, so a
+    /// `ParameterChange` with a single `maxTxSize = 0` field must reproduce
+    /// the same bytes the transaction-body encoder writes for that action.
+    ///
+    /// `GovAction::ParameterChange = array(4)[0, prev_action_id, ppu, policy]`,
+    /// and the `ProtocolParamUpdate` is a SPARSE integer-keyed map — key 3 is
+    /// `maxTransactionSize` (key 2 is `maxBlockBodySize`). Do not confuse this
+    /// map with the POSITIONAL `array(31)` `GetCurrentPParams` replies with,
+    /// where the two orderings differ.
+    #[test]
+    fn test_encode_malformed_proposal_golden() {
+        use dugite_primitives::transaction::{GovAction, ProtocolParamUpdate};
+
+        let ppu = ProtocolParamUpdate {
+            max_tx_size: Some(0),
+            ..Default::default()
+        };
+        let err = TxValidationError::MalformedProposalGOV {
+            action: Box::new(GovAction::ParameterChange {
+                prev_action_id: None,
+                protocol_param_update: Box::new(ppu),
+                policy_hash: None,
+            }),
+        };
+
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        encode_conway_ledger_pred_failure(&mut enc, &err);
+
+        let expected = vec![
+            0x82, 0x03, // ConwayLedgerPredFailure: array(2)[3, ...]
+            0x82, 0x01, // ConwayGovPredFailure: array(2)[1, ...]
+            0x84, // GovAction: array(4)
+            0x00, // ParameterChange discriminator
+            0xf6, // prev_action_id: null
+            0xa1, 0x03, 0x00, // ppu: {3: 0}  (key 3 = maxTransactionSize)
+            0xf6, // policy_hash: null
+        ];
+        assert_eq!(buf, expected, "MalformedProposal must be byte-exact");
+    }
+
+    /// The payload must be the action from the transaction-body encoder, not a
+    /// re-implementation: assert the frame embeds exactly what
+    /// `encode_gov_action` produces for the same value. A hand-rolled copy in
+    /// the rejection path is how #932/#938 both went wrong.
+    #[test]
+    fn test_malformed_proposal_reuses_the_body_gov_action_encoder() {
+        use dugite_primitives::transaction::{GovAction, ProtocolParamUpdate};
+
+        let action = GovAction::ParameterChange {
+            prev_action_id: None,
+            protocol_param_update: Box::new(ProtocolParamUpdate {
+                max_block_body_size: Some(0),
+                gov_action_lifetime: Some(0),
+                ..Default::default()
+            }),
+            policy_hash: None,
+        };
+        let raw = dugite_serialization::encode_gov_action(&action);
+
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        encode_conway_ledger_pred_failure(
+            &mut enc,
+            &TxValidationError::MalformedProposalGOV {
+                action: Box::new(action),
+            },
+        );
+
+        assert_eq!(
+            &buf[4..],
+            &raw[..],
+            "the GOV tag-1 payload must be byte-identical to the body encoder's output"
+        );
+        assert_eq!(&buf[..4], &[0x82, 0x03, 0x82, 0x01]);
     }
 
     // ── Issue #915: `InvalidPrevGovActionId` (Ledger tag 3, GOV tag 8) ──
