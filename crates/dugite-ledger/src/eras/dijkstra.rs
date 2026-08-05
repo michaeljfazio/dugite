@@ -49,28 +49,44 @@
 //! - **`prevNonce` header field** — consensus-level nonce chaining.
 //! - **PlutusV4 parse + hash** — script-language tag 4, hash prefix `\x04`,
 //!   cost-model wire slot 3. See the caveat below.
+//! - **Sub-transaction SUBUTXO / SUBUTXOW / SUBENTITIES / SUBCERTS /
+//!   SUBDELEG / SUBPOOL / SUBGOVCERT** (#1001, #1010, #1011) —
+//!   `SubTransaction` models the FULL oracle-verified `DijkstraSubTxBodyRaw`
+//!   field set plus its own independent `dstWits` witness set (#1010). The
+//!   fold ORDER/ABORT semantics match upstream `SUBLEDGERS`'s `foldM` (any
+//!   sub-tx failure aborts the WHOLE top-level tx, #1001). Certificates
+//!   (SUBCERTS → SUBCERT → SUBDELEG/SUBPOOL/SUBGOVCERT), withdrawals +
+//!   direct_deposits (SUBENTITIES), `account_balance_intervals` (the
+//!   Dijkstra UTXO `AccountBalanceOutOfRange` predicate) and witness
+//!   sufficiency + real cryptographic signature verification (SUBUTXOW) are
+//!   validated AND applied (#1011) — see the doc comment on
+//!   [`apply_sub_transactions`] and [`validate_sub_certificate`] for the
+//!   full oracle-pinned predicate semantics and what remains unmodelled
+//!   within each of those families (e.g. `WrongNetworkPOOL`,
+//!   `SubWrongNetworkIn{Withdrawals,DirectDeposits}`, the 15 SUBUTXOW
+//!   redeemer/datum/script constructors — a sub-tx has no Plutus fields at
+//!   all yet).
 //!
 //! ## Known gaps (each has an open issue — do not assume these are done)
 //!
-//! - **`SubTransaction` (dugite-primitives) is a strict subset of upstream's
-//!   `DijkstraSubTxBodyRaw` / `DijkstraSubTx`** (residual half of #1001,
-//!   tracked as a dugite-primitives follow-on — see the doc comment on
-//!   `apply_sub_transactions` for the oracle-verified field list). The fold
-//!   ORDER/ABORT semantics are fixed (any sub-tx failure aborts the whole
-//!   top-level tx, matching upstream `SUBLEDGERS`'s `foldM` — see
-//!   `apply_sub_transactions`), and the SUBUTXO-level checks that ARE
-//!   expressible against the currently-modelled fields are implemented
-//!   (`SubBadInputsUTxO`, `SubInputSetEmptyUTxO`,
-//!   `SubOutsideValidityIntervalUTxO`, min-UTxO-value). What remains
-//!   unmodelled — because the wire type carries no data for it —  is
-//!   `SUBUTXOW` (witness/redeemer/datum checks; a sub-tx has its own
-//!   `dstWits :: TxWits era` upstream, which dugite's `SubTransaction` does
-//!   not carry at all) and `SUBENTITIES`/`SUBCERTS`/`SUBCERT`/`SUBDELEG`/
-//!   `SUBPOOL`/`SUBGOV`/`SUBGOVCERT` (a sub-tx body upstream also carries
-//!   `certs` / `withdrawals` / `votingProcedures` / `proposalProcedures` /
-//!   `directDeposits`, none of which `SubTransaction` models). Adding those
-//!   fields is a `dugite-primitives::transaction::SubTransaction` change,
-//!   out of scope here.
+//! - **`SUBGOV`** (votes + proposals inside a sub-tx) **and `mint`** remain
+//!   unmodelled — `apply_sub_transactions` REJECTS any sub-tx declaring
+//!   non-empty `voting_procedures`, `proposal_procedures` or `mint` rather
+//!   than silently dropping those effects (the #1010 shape one layer up).
+//!   SUBGOV is Conway's entire `conwayGovTransition` (19 predicate-failure
+//!   constructors: proposal deposits, guardrail script hash, prev-gov-
+//!   action-id chains, bootstrap-phase gating, ratification-adjacent
+//!   state) and reimplementing it byte-exact for a second, sub-tx-scoped
+//!   call site was judged too large to land safely alongside SUBCERTS/
+//!   SUBENTITIES in one issue (#1011); mint has no established sub-tx
+//!   value-balance-check infrastructure at all (a sub-tx has no fee field
+//!   and no Phase-1 admission path). See the doc comment on
+//!   `apply_sub_transactions` for the exact guard condition.
+//! - **Sub-tx wire key 24 (`required_top_level_guards`)** is unmodelled and
+//!   hard-rejects at decode time — no Conway analog, and the exact wire
+//!   shape (`Map (Credential Guard) (StrictMaybe X)` — the oracle-confirmed
+//!   key type, but not the value type `X`) needs its own oracle pass before
+//!   it can be added.
 //! - **PlutusV4 cannot be evaluated** (#1000). Parse and hash landed; the
 //!   evaluator did not. `ScriptLanguage` has no V4 variant, `WitnessSet` has
 //!   no `plutus_v4_scripts` field, and V4 reference scripts surface a typed
@@ -105,10 +121,11 @@ use std::collections::HashSet;
 
 use dugite_primitives::block::{Block, BlockHeader};
 use dugite_primitives::era::Era;
-use dugite_primitives::hash::Hash28;
+use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::time::EpochNo;
-use dugite_primitives::transaction::Transaction;
+use dugite_primitives::transaction::{Certificate, Transaction};
 
+use super::common;
 use super::conway::ConwayRules;
 use super::{EraRules, RuleContext};
 use crate::state::substates::*;
@@ -588,52 +605,67 @@ impl EraRules for DijkstraRules {
 /// only key 24 (`required_top_level_guards`, a Dijkstra-only concept with
 /// no Conway analog) remains unmodelled and hard-rejects if present.
 ///
-/// **SUBUTXOW implemented (partially): witness sufficiency.** Every
-/// sub-tx's spend inputs / withdrawals / certificates are checked against
-/// its OWN `witness_set` (never the parent's — oracle-confirmed
-/// independence) via `SubMissingVKeyWitnessesUTXOW`, reusing
-/// `ConwayRules::required_witnesses` against a minimal envelope built from
-/// the sub-tx's own fields — "route sub-txs through the existing …
-/// validators with the sub-tx envelope", #1001's own suggested approach.
-/// Presence-only (a required key hash has a matching `blake2b224(vkey)`
-/// witness) — NOT full cryptographic signature verification
-/// (`SubInvalidWitnessesUTXOW`), and NOT the remaining 15 `SUBUTXOW`
+/// **SUBUTXOW implemented: witness sufficiency AND real signature
+/// verification (#1011).** Every sub-tx's spend inputs / withdrawals /
+/// certificates are checked against its OWN `witness_set` (never the
+/// parent's — oracle-confirmed independence): `SubInvalidWitnessesUTXOW`
+/// (every vkey witness present must carry a cryptographically valid
+/// Ed25519 signature over the sub-tx's own `tx_id` —
+/// `dugite_crypto::keys::PaymentVerificationKey::verify`, mirroring the
+/// parent tx's own Rule 14) and `SubMissingVKeyWitnessesUTXOW` (every
+/// required key hash must be COVERED by one of those now-verified
+/// witnesses, reusing `ConwayRules::required_witnesses` against a minimal
+/// envelope built from the sub-tx's own fields — "route sub-txs through
+/// the existing … validators with the sub-tx envelope", #1001's own
+/// suggested approach). NOT modelled: the remaining 15 `SUBUTXOW`
 /// constructors (redeemers, datums, metadata hash, script integrity hash,
-/// well-formed scripts, guard datums). Known limitation: the envelope's
-/// witness computation resolves inputs via `utxo.utxo_set.lookup`, which
-/// does not see this fold's own `overlay` — an input created by an
-/// earlier sibling sub-tx (not yet committed; pass 2 hasn't run)
-/// contributes no witness requirement rather than the correct one. This
-/// under-reports, never over-reports, so it cannot cause a false reject —
-/// only a (currently unreachable, since sub_transactions is empty on
-/// every live network) false accept for that specific chained-input case.
+/// well-formed scripts, guard datums) — a sub-tx has no Plutus fields at
+/// all in dugite's current `SubTransaction`. Known limitation: the
+/// envelope's witness computation resolves inputs via
+/// `utxo.utxo_set.lookup`, which does not see this fold's own UTXO
+/// `overlay` — an input created by an earlier sibling sub-tx (not yet
+/// committed; the UTXO pass 2 commit hasn't run) contributes no witness
+/// requirement rather than the correct one. This under-reports, never
+/// over-reports, so it cannot cause a false reject — only a (currently
+/// unreachable, since sub_transactions is empty on every live network)
+/// false accept for that specific chained-input case.
 ///
-/// **SUBCERTS / SUBDELEG / SUBPOOL / SUBGOVCERT / SUBGOV: data is now
-/// decoded, but NOT YET routed through apply.** `sub.certificates`,
-/// `sub.voting_procedures` and `sub.proposal_procedures` are available on
-/// `SubTransaction` but `apply_sub_transactions` does not yet call
-/// `common::apply_shelley_cert` / `ConwayRules`'s private
-/// `apply_conway_cert` / `process_governance_votes_and_proposals` for
-/// them — those upstream rules are literal, direct reuses of the exact
-/// same functions (`Conway.conwayDelegTransition`, `Shelley.poolTransition`,
-/// `Conway.conwayGovCertTransition`, `Conway.conwayGovTransition`) dugite
-/// already has as `apply_shelley_cert`/`apply_conway_cert`/
-/// `process_governance_votes_and_proposals` for the PARENT tx, so wiring
-/// them is a routing exercise once a REAL two-phase validate/apply split
-/// exists for sub-tx certs (today `apply_*_cert` mutate unconditionally,
-/// trusting Phase-1 already vetted the cert — there is no reusable
-/// "validate this cert without applying it" function to call from pass 1,
-/// and a sub-tx has no Phase-1 admission path at all yet). A sub-tx that
-/// carries certificates or governance procedures today is accepted
-/// (decodes and applies with its UTxO effects) but those specific fields
-/// are silently NOT applied to `certs`/`gov` — tracked as the direct
-/// continuation of #1010.
+/// **SUBCERTS / SUBDELEG / SUBPOOL / SUBGOVCERT: validated AND applied
+/// (#1011).** `sub.certificates` are routed through
+/// [`validate_sub_certificate`] (a new, read-only validate-first step —
+/// see its doc comment for the full oracle-pinned predicate semantics)
+/// followed immediately by the SAME `common::apply_shelley_cert` /
+/// `conway::apply_conway_cert` functions the parent tx's own Conway
+/// pipeline already calls per cert, against a `working_certs`/
+/// `working_gov` clone threaded across the WHOLE fold (see "Certs/gov
+/// fold-threading" below). `sub.withdrawals` / `sub.direct_deposits`
+/// (SUBENTITIES) and `sub.account_balance_intervals` (the Dijkstra UTXO
+/// `AccountBalanceOutOfRange` predicate) are validated and applied the
+/// same way. **`sub.voting_procedures` / `sub.proposal_procedures`
+/// (SUBGOV) and `sub.mint` remain unmodelled** — a sub-tx declaring any of
+/// these is still rejected wholesale (the narrowed `SubEntitiesNotYetApplied`
+/// guard, checked first in the per-sub-tx loop) rather than silently
+/// dropping those effects. See the "Known gaps" section of this file's
+/// module doc comment for why SUBGOV specifically was judged out of scope.
+///
+/// **Certs/gov fold-threading.** `working_certs`/`working_gov` are FULL
+/// clones of the real `certs`/`gov`, taken once before the per-sub-tx loop
+/// and mutated directly by every SUBENTITIES/SUBCERTS check as it runs —
+/// mirroring SUBLEDGERS's `foldM` over the full `LedgerState` accumulator
+/// (a later sub-tx, or a later cert within the SAME sub-tx, observes every
+/// earlier effect). They are committed back to the real `certs`/`gov` in a
+/// single swap at the very end, ONLY if every sub-tx in the fold validated
+/// — matching the same "no mutation of the real state until total success"
+/// invariant the UTXO `overlay` already established for #1001. Full clones
+/// are cheap here: `CertSubState`'s largest fields (`delegations`,
+/// `reward_accounts`, `stake_key_deposits`) are `imbl` persistent maps
+/// (O(1) structural-share clone) and `GovSubState` is an `Arc`.
 fn apply_sub_transactions(
     tx: &Transaction,
     ctx: &RuleContext,
     utxo: &mut UtxoSubState,
     certs: &mut CertSubState,
-    gov: &GovSubState,
+    gov: &mut GovSubState,
     epochs: &mut EpochSubState,
 ) -> Result<UtxoDiff, LedgerError> {
     use crate::state::{stake_routing, StakeRouting};
@@ -643,40 +675,65 @@ fn apply_sub_transactions(
 
     let ptr_stake_excluded = epochs.ptr_stake_excluded;
 
-    // ---- Pass 1: validate (no mutation) --------------------------------
+    // Working clones of certs/gov, threaded across the WHOLE fold (every
+    // sub-tx in `tx.body.sub_transactions`, in order) exactly like
+    // `overlay` below already threads UTXO effects. Mirrors SUBLEDGERS's
+    // `foldM` over the FULL `LedgerState` accumulator (oracle-quoted on
+    // `DijkstraRules::apply_valid_tx`): a later sub-tx's SUBENTITIES/
+    // SUBCERTS sees every earlier SIBLING sub-tx's cert/withdrawal/deposit
+    // effects, and a later CERT within the SAME sub-tx sees every earlier
+    // cert's effects too (matches SUBCERTS's own `gamma :|> txCert` fold).
+    // Mutating the REAL `certs`/`gov` directly here would violate #1001's
+    // all-or-nothing invariant: a failure on sub-tx 2 of 3 must leave ZERO
+    // trace of sub-tx 1's certs, but pass 1 can fail at any point up to
+    // the very last sub-tx. `CertSubState`/`GovSubState` clone cheaply
+    // (`imbl` persistent maps + `Arc<GovernanceState>` — see the field
+    // doc comments on `CertSubState`), so a full clone here (once, not
+    // per-sub-tx) is the same "clone-then-mutate-or-discard" pattern the
+    // codebase already applies at block-validation snapshot boundaries.
+    // Committed back to the REAL `certs`/`gov` only after every sub-tx in
+    // this fold has validated — see the Pass 2 commit at the end.
+    let mut working_certs = certs.clone();
+    let mut working_gov = gov.clone();
+
+    // ---- Pass 1: validate (no mutation of the REAL `certs`/`gov`/`utxo` —
+    // only `working_certs`/`working_gov` and the small UTXO `overlay`
+    // below change) --------------------------------------------------------
     let mut overlay: HashMap<TransactionInput, Option<TransactionOutput>> = HashMap::new();
     let mut planned: Vec<(&SubTransaction, Vec<(TransactionInput, TransactionOutput)>)> =
         Vec::with_capacity(tx.body.sub_transactions.len());
 
     for sub in &tx.body.sub_transactions {
-        // #1010 fail-closed guard: `SubTransaction` now DECODES
-        // certificates/withdrawals/mint/voting_procedures/
-        // proposal_procedures/direct_deposits/account_balance_intervals
-        // (the wire-shape and field-modelling half of #1010), but
-        // `apply_sub_transactions` below only APPLIES the UTxO/stake
-        // effects and checks witness sufficiency — it does not yet route
-        // certs through `apply_shelley_cert`/`apply_conway_cert` or
-        // votes/proposals through `process_governance_votes_and_proposals`
-        // (the SUBCERTS/SUBGOV apply half, still open — see the doc
-        // comment on this function). Applying SOME of a sub-tx's declared
-        // effects while silently ignoring others is exactly the
-        // "decodes fine, diverges silently" shape #1010 was filed to
-        // close, one layer up from the CBOR decoder. Reject rather than
-        // accept a sub-tx whose non-UTxO effects would be dropped.
-        if !sub.certificates.is_empty()
-            || !sub.withdrawals.is_empty()
-            || !sub.mint.is_empty()
+        // #1010/#1011 fail-closed guard, NARROWED as each family lands
+        // (#1011): certificates (SUBCERTS/SUBCERT/SUBDELEG/SUBPOOL/
+        // SUBGOVCERT), withdrawals + direct_deposits (SUBENTITIES) and
+        // account_balance_intervals (the Dijkstra UTXO
+        // `AccountBalanceOutOfRange` predicate) are now validated AND
+        // applied below — see the doc comment on this function for the
+        // oracle-pinned source of each. `mint` and
+        // `voting_procedures`/`proposal_procedures` (SUBGOV) remain
+        // unmodelled: SUBGOV is Conway's entire `conwayGovTransition` (19
+        // predicate-failure constructors — proposal deposits, guardrail
+        // script hash, prev-gov-action-id chains, bootstrap-phase gating,
+        // ratification-adjacent state) and reimplementing it byte-exact
+        // for a second, sub-tx-scoped call site was judged too large to
+        // land safely alongside SUBCERTS/SUBENTITIES in one issue; mint
+        // has no established sub-tx value-balance-check infrastructure at
+        // all (a sub-tx has no fee field and no Phase-1 admission path).
+        // Applying SOME of a sub-tx's declared effects while silently
+        // ignoring others is exactly the "decodes fine, diverges silently"
+        // shape #1010 was filed to close — reject rather than accept a
+        // sub-tx whose mint/voting/proposal effects would be dropped.
+        if !sub.mint.is_empty()
             || !sub.voting_procedures.is_empty()
             || !sub.proposal_procedures.is_empty()
-            || !sub.direct_deposits.is_empty()
-            || !sub.account_balance_intervals.is_empty()
         {
             return Err(LedgerError::InvalidTransaction(format!(
-                "SubEntitiesNotYetApplied: sub-tx {} of parent {} declares certs/\
-                 withdrawals/mint/voting/proposal/direct_deposits/account_balance_intervals \
-                 effects that dugite decodes but does not yet apply (#1010 SUBCERTS/SUBGOV \
-                 apply routing) — rejecting rather than silently dropping those effects; \
-                 aborting the ENTIRE top-level tx",
+                "SubEntitiesNotYetApplied: sub-tx {} of parent {} declares mint/voting/\
+                 proposal effects that dugite decodes but does not yet apply (#1011 SUBGOV \
+                 apply routing is out of scope; mint has no sub-tx balance-check infra) — \
+                 rejecting rather than silently dropping those effects; aborting the ENTIRE \
+                 top-level tx",
                 sub.tx_id.to_hex(),
                 tx.hash.to_hex()
             )));
@@ -774,69 +831,133 @@ fn apply_sub_transactions(
             }
         }
 
-        // SUBUTXOW: SubMissingVKeyWitnessesUTXOW (SubUtxow.hs tag 2) — the
-        // sub-tx's OWN witness set (`sub.witness_set`, never the parent's;
-        // oracle-verified `dstWits` independence, #1010) must cover every
-        // key hash its OWN inputs/withdrawals/certificates require. Reuses
-        // `ConwayRules::required_witnesses` (byte-identical logic to what
-        // the parent tx's own witness sufficiency check runs) against a
-        // minimal envelope carrying just the sub-tx's relevant fields —
-        // "route sub-txs through the existing … validators with the sub-tx
-        // envelope", per #1001's own suggested approach. Presence-only
-        // (matches a required key hash against a witness's blake2b-224):
-        // full cryptographic signature verification
-        // (SubInvalidWitnessesUTXOW, tag 1) is a separate, not-yet-modelled
-        // predicate — see the doc comment on `apply_sub_transactions`.
+        // Dijkstra UTXO predicate `AccountBalanceOutOfRange` for THIS
+        // sub-tx's OWN `account_balance_intervals` (#1011). Reuses
+        // [`check_account_balance_intervals`] verbatim — it is already a
+        // pure, read-only function of `(tx.body.account_balance_intervals,
+        // certs)`, so no new predicate logic is needed, only the envelope
+        // below to carry the sub-tx's own field into it. Checked against
+        // `working_certs` (reflects every EARLIER SIBLING sub-tx's
+        // cert/withdrawal effects, per the fold-threading doc comment
+        // above, but not this sub-tx's own — matching upstream's
+        // per-SUBLEDGER "UTXO checks before SUBENTITIES/SUBCERTS"
+        // ordering: `SubUtxo` runs first, `SubEntities`/`SubCerts` are
+        // sequenced after within one `SUBLEDGER`).
         //
-        // KNOWN LIMITATION: `required_witnesses` resolves each input via
-        // `utxo.utxo_set.lookup`, which does NOT see this fold's own
-        // `overlay` — an input created by an EARLIER sibling sub-tx (not
-        // yet committed to the real UTxO set; pass 2 hasn't run) silently
-        // contributes no witness requirement, rather than the correct
-        // one. This under-reports, never over-reports: it can only make
-        // the check MORE permissive for a chained sub-tx's own input,
-        // never wrongly reject a legitimate one. Tracked as a follow-on
-        // alongside the primitives gap above.
+        // SUBUTXOW checks — the sub-tx's OWN witness set (`sub.witness_set`,
+        // never the parent's; oracle-verified `dstWits` independence,
+        // #1010) — against a minimal envelope carrying the sub-tx's
+        // relevant fields, "route sub-txs through the existing …
+        // validators with the sub-tx envelope" per #1001's own suggested
+        // approach:
+        //
+        //   - `SubInvalidWitnessesUTXOW` (SubUtxow.hs tag 1, #1011 NEW) —
+        //     every vkey witness PRESENT in `sub.witness_set` must carry a
+        //     cryptographically valid Ed25519 signature over `sub.tx_id`
+        //     (mirrors `Shelley.validateVerifiedWits`, and the parent tx's
+        //     own Rule 14 in `validation/phase1.rs`). A presence-only check
+        //     accepts a witness that does not actually sign — this closes
+        //     that gap for sub-txs.
+        //   - `SubMissingVKeyWitnessesUTXOW` (SubUtxow.hs tag 2) — every
+        //     key hash the sub-tx's OWN inputs/withdrawals/certificates
+        //     require must be COVERED by one of those (now verified)
+        //     witnesses. Reuses `ConwayRules::required_witnesses`
+        //     (byte-identical logic to the parent tx's own witness
+        //     sufficiency check), evaluated against `working_certs`/
+        //     `working_gov` for the same fold-threading reason as above.
+        //
+        // The remaining 15 `SUBUTXOW` constructors (redeemers, datums,
+        // metadata hash, script integrity hash, well-formed scripts, guard
+        // datums) are still not modelled — a sub-tx carries no Plutus
+        // fields at all in dugite's current `SubTransaction` (no
+        // `collateral`/`redeemers` routing exists for sub-txs), so those
+        // are out of scope until Plutus-in-sub-tx support lands.
+        //
+        // KNOWN LIMITATION (carried over from #1010): `required_witnesses`
+        // resolves each input via `utxo.utxo_set.lookup`, which does NOT
+        // see this fold's own UTXO `overlay` — an input created by an
+        // EARLIER sibling sub-tx (not yet committed to the real UTxO set;
+        // the UTXO pass 2 commit hasn't run) silently contributes no
+        // witness requirement, rather than the correct one. This
+        // under-reports, never over-reports: it can only make the check
+        // MORE permissive for a chained sub-tx's own input, never wrongly
+        // reject a legitimate one.
+        let envelope = Transaction {
+            era: dugite_primitives::era::Era::Dijkstra,
+            hash: sub.tx_id,
+            body: dugite_primitives::transaction::TransactionBody {
+                inputs: sub.inputs.clone(),
+                outputs: vec![],
+                fee: dugite_primitives::value::Lovelace(0),
+                ttl: None,
+                certificates: sub.certificates.clone(),
+                withdrawals: sub.withdrawals.clone(),
+                auxiliary_data_hash: None,
+                validity_interval_start: None,
+                mint: Default::default(),
+                script_data_hash: None,
+                collateral: vec![],
+                required_signers: vec![],
+                network_id: None,
+                collateral_return: None,
+                total_collateral: None,
+                reference_inputs: vec![],
+                update: None,
+                voting_procedures: Default::default(),
+                proposal_procedures: vec![],
+                treasury_value: None,
+                donation: None,
+                sub_transactions: vec![],
+                account_balance_intervals: sub.account_balance_intervals.clone(),
+                direct_deposits: sub.direct_deposits.clone(),
+                guards: vec![],
+            },
+            witness_set: sub.witness_set.clone(),
+            is_valid: true,
+            auxiliary_data: sub.auxiliary_data.clone(),
+            raw_cbor: None,
+            raw_body_cbor: None,
+            raw_witness_cbor: None,
+        };
+
+        check_account_balance_intervals(&envelope, &working_certs)?;
+
+        // SubInvalidWitnessesUTXOW: cryptographic signature verification.
+        for w in &sub.witness_set.vkey_witnesses {
+            if w.vkey.len() != 32 || w.signature.len() != 64 {
+                return Err(LedgerError::InvalidTransaction(format!(
+                    "SubInvalidWitnessesUTXOW: sub-tx {} of parent {} has a malformed vkey \
+                     witness (vkey {} bytes, signature {} bytes; expected 32/64) — \
+                     aborting the ENTIRE top-level tx",
+                    sub.tx_id.to_hex(),
+                    tx.hash.to_hex(),
+                    w.vkey.len(),
+                    w.signature.len()
+                )));
+            }
+            let verify_result = dugite_crypto::keys::PaymentVerificationKey::from_bytes(&w.vkey)
+                .and_then(|vk| vk.verify(sub.tx_id.as_bytes(), &w.signature));
+            if verify_result.is_err() {
+                return Err(LedgerError::InvalidTransaction(format!(
+                    "SubInvalidWitnessesUTXOW: sub-tx {} of parent {} has a vkey witness \
+                     {:?} whose signature does not verify against the sub-tx's own id — \
+                     aborting the ENTIRE top-level tx",
+                    sub.tx_id.to_hex(),
+                    tx.hash.to_hex(),
+                    &w.vkey[..8.min(w.vkey.len())]
+                )));
+            }
+        }
+
+        // SubMissingVKeyWitnessesUTXOW.
         {
-            let envelope = Transaction {
-                era: dugite_primitives::era::Era::Dijkstra,
-                hash: sub.tx_id,
-                body: dugite_primitives::transaction::TransactionBody {
-                    inputs: sub.inputs.clone(),
-                    outputs: vec![],
-                    fee: dugite_primitives::value::Lovelace(0),
-                    ttl: None,
-                    certificates: sub.certificates.clone(),
-                    withdrawals: sub.withdrawals.clone(),
-                    auxiliary_data_hash: None,
-                    validity_interval_start: None,
-                    mint: Default::default(),
-                    script_data_hash: None,
-                    collateral: vec![],
-                    required_signers: vec![],
-                    network_id: None,
-                    collateral_return: None,
-                    total_collateral: None,
-                    reference_inputs: vec![],
-                    update: None,
-                    voting_procedures: Default::default(),
-                    proposal_procedures: vec![],
-                    treasury_value: None,
-                    donation: None,
-                    sub_transactions: vec![],
-                    account_balance_intervals: vec![],
-                    direct_deposits: Default::default(),
-                    guards: vec![],
-                },
-                witness_set: sub.witness_set.clone(),
-                is_valid: true,
-                auxiliary_data: sub.auxiliary_data.clone(),
-                raw_cbor: None,
-                raw_body_cbor: None,
-                raw_witness_cbor: None,
-            };
-            let required =
-                super::conway::ConwayRules.required_witnesses(&envelope, ctx, utxo, certs, gov);
+            let required = super::conway::ConwayRules.required_witnesses(
+                &envelope,
+                ctx,
+                utxo,
+                &working_certs,
+                &working_gov,
+            );
             let signed: HashSet<Hash28> = sub
                 .witness_set
                 .vkey_witnesses
@@ -858,6 +979,97 @@ fn apply_sub_transactions(
             }
         }
 
+        // SUBENTITIES (Rules/SubEntities.hs, oracle-verified order:
+        // withdrawal/direct-deposit account validation FIRST, THEN
+        // descends into SUBCERTS — `SubCertsFailure` is predicate-failure
+        // tag 0, wrapping whatever SUBCERTS/SUBCERT reports below). dugite
+        // models the subset expressible against `SubTransaction`'s fields:
+        //
+        //   - `SubMissingAccountsInWithdrawals` — every withdrawal account
+        //     must already be registered (checked against `working_certs`,
+        //     i.e. after every EARLIER sibling sub-tx's own registrations).
+        //     Applied via `common::drain_withdrawal_accounts` (same
+        //     drain-to-zero the parent tx's own withdrawals use).
+        //   - `SubMissingAccountsInDirectDeposits` — reuses the EXISTING
+        //     [`validate_direct_deposits_registration`]/
+        //     [`apply_direct_deposits`] pair verbatim (previously only
+        //     wired for the parent tx; the envelope above already carries
+        //     `sub.direct_deposits`).
+        //
+        // `SubMissingOriginalAccountsInWithdrawals` and
+        // `SubWrongNetworkIn{Withdrawals,DirectDeposits}` (batch-withdrawal
+        // and network-id concepts specific to Dijkstra's `Accounts`/
+        // `DirectDeposits` types) are NOT modelled — dugite has no
+        // established "original vs current" batch-withdrawal distinction
+        // or per-entry network-id check at this layer, and inventing one
+        // without an oracle-confirmed wire shape risks a wrong check that
+        // is worse than no check. Left as a documented remaining gap.
+        for reward_account in sub.withdrawals.keys() {
+            let key = reward_account_bytes_to_typed_hash32(reward_account).ok_or_else(|| {
+                LedgerError::InvalidTransaction(format!(
+                    "SubMissingAccountsInWithdrawals: sub-tx {} of parent {} has a malformed \
+                     withdrawal reward_account (expected 29 bytes, got {}) — aborting the \
+                     ENTIRE top-level tx",
+                    sub.tx_id.to_hex(),
+                    tx.hash.to_hex(),
+                    reward_account.len()
+                ))
+            })?;
+            if !working_certs.reward_accounts.contains_key(&key) {
+                return Err(LedgerError::InvalidTransaction(format!(
+                    "SubMissingAccountsInWithdrawals: sub-tx {} of parent {} withdraws from \
+                     unregistered credential {} — aborting the ENTIRE top-level tx",
+                    sub.tx_id.to_hex(),
+                    tx.hash.to_hex(),
+                    key.to_hex()
+                )));
+            }
+        }
+        validate_direct_deposits_registration(&envelope, &working_certs)?;
+        common::drain_withdrawal_accounts(&envelope, &mut working_certs);
+        apply_direct_deposits(&envelope, &mut working_certs);
+
+        // SUBCERTS -> SUBCERT -> SUBDELEG / SUBPOOL / SUBGOVCERT (#1011).
+        // Sequential fold over `sub.certificates`, matching upstream's
+        // `gamma :|> txCert` (each cert validated against, then applied
+        // to, `working_certs`/`working_gov` — so a LATER cert in this SAME
+        // sub-tx observes every EARLIER cert's effect, e.g. a
+        // register-then-delegate pair in one sub-tx). Reuses
+        // `common::apply_shelley_cert`/`conway::apply_conway_cert`
+        // VERBATIM — the exact functions the parent tx's own Conway
+        // pipeline already calls per cert (oracle-confirmed: SUBDELEG/
+        // SUBPOOL/SUBGOVCERT are literal `transitionRules =
+        // [Conway.conway*Transition]` reuses of the SAME functions, not
+        // Dijkstra-bespoke logic) — see [`validate_sub_certificate`]'s
+        // doc comment for the full oracle-pinned predicate semantics.
+        for (cert_index, cert) in sub.certificates.iter().enumerate() {
+            validate_sub_certificate(
+                cert,
+                sub.tx_id,
+                tx.hash,
+                &working_certs,
+                &working_gov,
+                epochs,
+                ctx.current_epoch,
+            )?;
+            common::apply_shelley_cert(
+                cert,
+                cert_index,
+                ctx.current_slot,
+                ctx.tx_index,
+                &mut working_certs,
+                epochs,
+                &mut working_gov,
+            );
+            super::conway::apply_conway_cert(
+                cert,
+                ctx.current_epoch,
+                &mut working_certs,
+                &mut working_gov,
+                epochs,
+            );
+        }
+
         // Thread the live accumulator forward: tombstone consumed inputs so
         // a LATER sibling cannot double-spend them, and materialise this
         // sub-tx's own outputs so a LATER sibling CAN spend them.
@@ -877,6 +1089,21 @@ fn apply_sub_transactions(
 
     // ---- Pass 2: commit (cannot fail — pass 1 already proved every input
     // resolves) ------------------------------------------------------------
+    //
+    // certs/gov: `working_certs`/`working_gov` already hold the FULLY
+    // applied final state — every SUBENTITIES/SUBCERTS check above
+    // mutated them directly as it went (matching upstream's evolving-state
+    // fold), so committing is a single swap now that every sub-tx in this
+    // fold has validated. The UTXO instant-stake bookkeeping below
+    // (`certs.stake_distribution.stake_map`) is untouched by
+    // SUBENTITIES/SUBCERTS (neither `apply_shelley_cert` nor
+    // `apply_conway_cert` reference `stake_distribution`), so swapping
+    // `certs` in now and then mutating it in the loop below is equivalent
+    // to running the loop against the ORIGINAL `certs` — no double-count,
+    // no loss.
+    *certs = working_certs;
+    *gov = working_gov;
+
     let mut diff = UtxoDiff::new();
     for (sub, spent) in planned {
         for (input, output) in &spent {
@@ -927,6 +1154,628 @@ fn apply_sub_transactions(
     }
 
     Ok(diff)
+}
+
+// ---------------------------------------------------------------------------
+// SUBCERT dispatcher: SUBDELEG / SUBPOOL / SUBGOVCERT (#1011)
+// ---------------------------------------------------------------------------
+
+/// Validate a single Dijkstra sub-transaction certificate against the
+/// CURRENT cert/governance state, mirroring upstream's SUBCERT dispatcher
+/// (`Rules/SubCert.hs`, which pattern-matches on `DijkstraTxCert` and routes
+/// to SUBDELEG / SUBPOOL / SUBGOVCERT).
+///
+/// Read-only — never mutates `certs`/`gov`. Called by
+/// [`apply_sub_transactions`] immediately before the existing
+/// `common::apply_shelley_cert`/`conway::apply_conway_cert` mutate the SAME
+/// working clone, so a later cert in the same fold — including one from an
+/// earlier sub-tx already folded — observes every predecessor's effect
+/// (mirrors SUBCERTS's `gamma :|> txCert` sequential semantics with no
+/// separate overlay needed, since the caller already threads one clone
+/// through the whole fold).
+///
+/// # Oracle pin
+///
+/// Verified live against `IntersectMBO/cardano-ledger`
+/// `4849c13d6f70e5ab46add9af6e0ec5c537b61f69` (confirmed current via
+/// `gh api repos/IntersectMBO/cardano-ledger/commits/<sha>`, dated
+/// 2026-08-04). Per `Rules/SubDeleg.hs`/`Rules/SubPool.hs`/
+/// `Rules/SubGovCert.hs`, SUBDELEG/SUBPOOL/SUBGOVCERT set
+/// `transitionRules = [Conway.conwayDelegTransition]` /
+/// `[Shelley.poolTransition]` / `[Conway.conwayGovCertTransition]`
+/// respectively — LITERAL, direct reuses of the exact same top-level
+/// Conway/Shelley functions this crate's parent-tx pipeline already calls
+/// per cert (`eras::common::apply_shelley_cert` /
+/// `eras::conway::apply_conway_cert`, both invoked unconditionally —
+/// #1011's actual gap was that nothing validated FIRST). This function
+/// mirrors those transitions' predicate conditions, quoted verbatim below
+/// from `conwayDelegTransition` (`Deleg.hs:177-301`), `poolTransition`
+/// (`Pool.hs:209-324`) and `conwayGovCertTransition` (`GovCert.hs:170-276`):
+///
+/// **SUBDELEG** (`ConwayDelegPredFailure`, CBOR tags 1-8, no tag 0):
+///   - `ConwayRegCert cred sMayDeposit`: `forM_ sMayDeposit
+///     checkDepositAgainstPParams` (ONLY when a deposit is carried — i.e.
+///     the legacy `StakeRegistration`/tag-0 cert has NO deposit check at
+///     all) then `checkStakeKeyNotRegistered` ->
+///     `StakeKeyRegisteredDELEG` if already registered. Deposit mismatch:
+///     PV<=10 -> `IncorrectDepositDELEG`; PV>=11 -> `DepositIncorrectDELEG`
+///     — Dijkstra is always PV>=12, so only the PV>=11 arm is reachable
+///     here and is the only one implemented.
+///   - `ConwayUnRegCert cred sMayRefund`: `checkInvalidRefund` is
+///     Maybe-gated on the account EXISTING — when unregistered, it (and
+///     the balance check below) compute to `Nothing`/no-failure, and
+///     ONLY `StakeKeyNotRegisteredDELEG` fires. When registered: refund
+///     mismatch (against the account's OWN stored deposit, NOT the live
+///     pparam) -> `RefundIncorrectDELEG` (PV>=11), then
+///     `checkStakeKeyHasZeroRewardBalance` -> non-zero balance ->
+///     `StakeKeyHasNonZeroAccountBalanceDELEG`.
+///   - `ConwayDelegCert cred delegatee` (plain delegation, no
+///     registration): `checkStakeDelegateeRegistered delegatee` FIRST,
+///     THEN an account-existence lookup -> `StakeKeyNotRegisteredDELEG`
+///     if missing. Both independent — a delegation to an unregistered
+///     pool/DRep from an unregistered stake key can, in principle, fire
+///     either; this implementation short-circuits on the delegatee check
+///     first (matches Haskell's own evaluation order, differs only in
+///     whether BOTH accumulate — see the accumulation note below).
+///   - `checkStakeDelegateeRegistered`: `DelegStake pool` ->
+///     `Map.member pools` (unconditional) ->
+///     `DelegateeStakePoolNotRegisteredDELEG`. `DelegVote drep` ->
+///     `checkDRepRegistered`, which is `unless
+///     (hardforkConwayBootstrapPhase pv)` (i.e. SKIPPED exactly at PV9,
+///     active PV>=10 — always active for Dijkstra) ->
+///     `DelegateeDRepNotRegisteredDELEG`. `DelegStakeVote pool drep` ->
+///     BOTH checks (can both fire).
+///   - `ConwayRegDelegCert cred delegatee deposit` (combined
+///     register+delegate): `checkDepositAgainstPParams` (ALWAYS — deposit
+///     is a plain `Coin`, never optional here) -> `checkStakeKeyNotRegistered`
+///     -> `checkStakeDelegateeRegistered`. All three independent checks.
+///
+/// **SUBPOOL** (`ShelleyPoolPredFailure`, reused verbatim by Conway+
+/// POOL too — CBOR encoding is stable across eras):
+///   - `PoolRegistration`: `StakePoolCostTooLowPOOL` (unconditional,
+///     `cost >= minPoolCost`). `VRFKeyHashAlreadyRegistered` (PV>=11 —
+///     `hardforkConwayDisallowDuplicatedVRFKeys`): registry is the GLOBAL
+///     set of every CURRENTLY-registered pool's VRF key
+///     (`certs.pool_params.values()`), with a self-reuse exemption — a
+///     pool re-registering with its OWN already-held key is exempt from
+///     the global-uniqueness check.
+///   - `PoolRetirement`: `StakePoolNotRegisteredOnKeyPOOL` (pool must
+///     already be registered). `StakePoolRetirementWrongEpochPOOL` — exact
+///     range `currentEpoch < retirementEpoch <= currentEpoch + eMax`
+///     (strict lower bound, inclusive upper bound).
+///   - NOT modelled: `WrongNetworkPOOL` (PV>=5 — dugite has no equivalent
+///     check for the PARENT tx's own pool registrations either; adding one
+///     ONLY for sub-tx would be a new, asymmetric, under-tested check —
+///     left as a documented gap alongside the parent-tx one) and
+///     `PoolMedataHashTooBig` (structurally unreachable: dugite's
+///     `PoolMetadata.hash` is a fixed-width `Hash32`, i.e. always exactly
+///     32 bytes, so the `<= 32` predicate can never fail).
+///
+/// **SUBGOVCERT** (`ConwayGovCertPredFailure` relabelled
+/// `DijkstraGovCertPredFailure`, CBOR tags 0-5):
+///   - `RegDRep`: `ConwayDRepAlreadyRegistered` (already in `dreps` map) +
+///     `ConwayDRepIncorrectDeposit` (against the CURRENT `drep_deposit`
+///     pparam — nothing is stored yet at registration time). Both
+///     independent.
+///   - `UnRegDRep`: `ConwayDRepNotRegistered` if absent from `dreps`.
+///     `ConwayDRepIncorrectRefund` (Maybe-gated on being registered —
+///     against the DRep's OWN stored deposit, NOT the live pparam).
+///   - `UpdateDRep`: `ConwayDRepNotRegistered` if not already registered
+///     (no deposit component).
+///   - `AuthCommitteeHotCert`/`ResignCommitteeColdCert`: IDENTICAL shared
+///     check path (`checkAndOverwriteCommitteeMemberState`), differing
+///     only in the state written on success. `ConwayCommitteeHasPreviously
+///     Resigned` checked FIRST (`committee_resigned` map — a resigned cold
+///     credential can never re-authorize a hot key OR resign again,
+///     permanently, nothing clears the entry). `ConwayCommitteeIsUnknown`
+///     checked SECOND, against `committee_auth_eligible_members()` — the
+///     LIVE enacted committee UNION any cold credential named as an
+///     incoming member of a pending `UpdateCommittee` proposal (matches
+///     Haskell's `isCurrentMember || isPotentialFutureMember`; reuses the
+///     SAME method the #996 mempool-context fix already established as
+///     canonical for this exact "eligible for hot-key auth" concept — see
+///     `GovernanceState::committee_auth_eligible_members`). BOTH checks
+///     apply identically to Auth AND Resign.
+///
+/// # Accumulation vs short-circuit (documented divergence, verdict-safe)
+///
+/// The oracle confirmed Haskell's `?!`/`failOnJust` inside one STS rule
+/// body NEVER short-circuits (`libs/small-steps/.../Extended.hs`
+/// `runClause`'s `Predicate` case: on failure it appends to the
+/// accumulated failure list and CONTINUES the do-block) — every applicable
+/// check for one cert runs, and ALL its failures are collected into the
+/// `MsgRejectTx` wire payload together. This function returns on the
+/// FIRST failing check instead, matching the single-message convention
+/// [`apply_sub_transactions`] already uses for every other Dijkstra
+/// predicate in this file (see its own doc comment: "dugite's
+/// `LedgerError` carries a single message anyway"). This affects ONLY
+/// which specific message text is surfaced when multiple predicates fail
+/// on the same cert simultaneously — the accept/reject VERDICT is
+/// unaffected, since Haskell's own top-level accept/reject is already
+/// all-or-nothing regardless of how many failures accumulated
+/// (`applySTSOptsEither`: any non-empty failure list rejects the same
+/// way). Not implemented as a full multi-failure accumulator because no
+/// other predicate check in this file does either, and unifying the
+/// convention was judged out of scope for this issue.
+fn validate_sub_certificate(
+    cert: &Certificate,
+    sub_tx_id: Hash32,
+    parent_tx_hash: Hash32,
+    certs: &CertSubState,
+    gov: &GovSubState,
+    epochs: &EpochSubState,
+    current_epoch: EpochNo,
+) -> Result<(), LedgerError> {
+    use dugite_primitives::transaction::Certificate as C;
+    use dugite_primitives::transaction::DRep;
+
+    let params = &epochs.protocol_params;
+    let governance = &gov.governance;
+
+    let err = |rule: &str, predicate: &str, detail: String| -> LedgerError {
+        LedgerError::InvalidTransaction(format!(
+            "{rule}Failure: {predicate}: sub-tx {} of parent {} — {detail} — aborting the \
+             ENTIRE top-level tx",
+            sub_tx_id.to_hex(),
+            parent_tx_hash.to_hex()
+        ))
+    };
+
+    // `checkDRepRegistered` — `unless (hardforkConwayBootstrapPhase pv)`,
+    // i.e. skipped exactly at PV9. Always active for Dijkstra (PV>=12);
+    // the PV gate is kept for defensive parity with the oracle-quoted
+    // condition rather than assuming it can never matter.
+    let check_drep_target = |drep: &DRep| -> Result<(), LedgerError> {
+        if params.protocol_version_major < 10 {
+            return Ok(());
+        }
+        if let Some(drep_key) = drep.credential_hash32() {
+            if !governance.dreps.contains_key(&drep_key) {
+                return Err(err(
+                    "SubDeleg",
+                    "DelegateeDRepNotRegisteredDELEG",
+                    format!("drep credential {} not registered", drep_key.to_hex()),
+                ));
+            }
+        }
+        Ok(())
+    };
+
+    match cert {
+        // ---- SUBDELEG ---------------------------------------------------
+        C::StakeRegistration(cred) => {
+            let key = cred.to_typed_hash32();
+            if certs.reward_accounts.contains_key(&key) {
+                return Err(err(
+                    "SubDeleg",
+                    "StakeKeyRegisteredDELEG",
+                    format!("credential {} already registered", key.to_hex()),
+                ));
+            }
+        }
+        C::ConwayStakeRegistration {
+            credential,
+            deposit,
+        } => {
+            if deposit.0 != params.key_deposit.0 {
+                return Err(err(
+                    "SubDeleg",
+                    "DepositIncorrectDELEG",
+                    format!(
+                        "declared deposit {} != key_deposit pparam {}",
+                        deposit.0, params.key_deposit.0
+                    ),
+                ));
+            }
+            let key = credential.to_typed_hash32();
+            if certs.reward_accounts.contains_key(&key) {
+                return Err(err(
+                    "SubDeleg",
+                    "StakeKeyRegisteredDELEG",
+                    format!("credential {} already registered", key.to_hex()),
+                ));
+            }
+        }
+        C::StakeDeregistration(cred) => {
+            let key = cred.to_typed_hash32();
+            match certs.reward_accounts.get(&key) {
+                None => {
+                    return Err(err(
+                        "SubDeleg",
+                        "StakeKeyNotRegisteredDELEG",
+                        format!("credential {} not registered", key.to_hex()),
+                    ))
+                }
+                Some(balance) if balance.0 > 0 => {
+                    return Err(err(
+                        "SubDeleg",
+                        "StakeKeyHasNonZeroAccountBalanceDELEG",
+                        format!("credential {} balance {}", key.to_hex(), balance.0),
+                    ))
+                }
+                Some(_) => {}
+            }
+        }
+        C::ConwayStakeDeregistration { credential, refund } => {
+            let key = credential.to_typed_hash32();
+            match certs.reward_accounts.get(&key) {
+                None => {
+                    return Err(err(
+                        "SubDeleg",
+                        "StakeKeyNotRegisteredDELEG",
+                        format!("credential {} not registered", key.to_hex()),
+                    ))
+                }
+                Some(balance) => {
+                    if let Some(stored) = certs.stake_key_deposits.get(&key) {
+                        if refund.0 != *stored {
+                            return Err(err(
+                                "SubDeleg",
+                                "RefundIncorrectDELEG",
+                                format!(
+                                    "declared refund {} != stored deposit {} for {}",
+                                    refund.0,
+                                    stored,
+                                    key.to_hex()
+                                ),
+                            ));
+                        }
+                    }
+                    if balance.0 > 0 {
+                        return Err(err(
+                            "SubDeleg",
+                            "StakeKeyHasNonZeroAccountBalanceDELEG",
+                            format!("credential {} balance {}", key.to_hex(), balance.0),
+                        ));
+                    }
+                }
+            }
+        }
+        C::StakeDelegation {
+            credential,
+            pool_hash,
+        } => {
+            if !certs.pool_params.contains_key(pool_hash) {
+                return Err(err(
+                    "SubDeleg",
+                    "DelegateeStakePoolNotRegisteredDELEG",
+                    format!("pool {} not registered", pool_hash.to_hex()),
+                ));
+            }
+            let key = credential.to_typed_hash32();
+            if !certs.reward_accounts.contains_key(&key) {
+                return Err(err(
+                    "SubDeleg",
+                    "StakeKeyNotRegisteredDELEG",
+                    format!("credential {} not registered", key.to_hex()),
+                ));
+            }
+        }
+        C::VoteDelegation { credential, drep } => {
+            check_drep_target(drep)?;
+            let key = credential.to_typed_hash32();
+            if !certs.reward_accounts.contains_key(&key) {
+                return Err(err(
+                    "SubDeleg",
+                    "StakeKeyNotRegisteredDELEG",
+                    format!("credential {} not registered", key.to_hex()),
+                ));
+            }
+        }
+        C::StakeVoteDelegation {
+            credential,
+            pool_hash,
+            drep,
+        } => {
+            if !certs.pool_params.contains_key(pool_hash) {
+                return Err(err(
+                    "SubDeleg",
+                    "DelegateeStakePoolNotRegisteredDELEG",
+                    format!("pool {} not registered", pool_hash.to_hex()),
+                ));
+            }
+            check_drep_target(drep)?;
+            let key = credential.to_typed_hash32();
+            if !certs.reward_accounts.contains_key(&key) {
+                return Err(err(
+                    "SubDeleg",
+                    "StakeKeyNotRegisteredDELEG",
+                    format!("credential {} not registered", key.to_hex()),
+                ));
+            }
+        }
+        C::RegStakeDeleg {
+            credential,
+            pool_hash,
+            deposit,
+        } => {
+            if deposit.0 != params.key_deposit.0 {
+                return Err(err(
+                    "SubDeleg",
+                    "DepositIncorrectDELEG",
+                    format!(
+                        "declared deposit {} != key_deposit pparam {}",
+                        deposit.0, params.key_deposit.0
+                    ),
+                ));
+            }
+            let key = credential.to_typed_hash32();
+            if certs.reward_accounts.contains_key(&key) {
+                return Err(err(
+                    "SubDeleg",
+                    "StakeKeyRegisteredDELEG",
+                    format!("credential {} already registered", key.to_hex()),
+                ));
+            }
+            if !certs.pool_params.contains_key(pool_hash) {
+                return Err(err(
+                    "SubDeleg",
+                    "DelegateeStakePoolNotRegisteredDELEG",
+                    format!("pool {} not registered", pool_hash.to_hex()),
+                ));
+            }
+        }
+        C::RegStakeVoteDeleg {
+            credential,
+            pool_hash,
+            drep,
+            deposit,
+        } => {
+            if deposit.0 != params.key_deposit.0 {
+                return Err(err(
+                    "SubDeleg",
+                    "DepositIncorrectDELEG",
+                    format!(
+                        "declared deposit {} != key_deposit pparam {}",
+                        deposit.0, params.key_deposit.0
+                    ),
+                ));
+            }
+            let key = credential.to_typed_hash32();
+            if certs.reward_accounts.contains_key(&key) {
+                return Err(err(
+                    "SubDeleg",
+                    "StakeKeyRegisteredDELEG",
+                    format!("credential {} already registered", key.to_hex()),
+                ));
+            }
+            if !certs.pool_params.contains_key(pool_hash) {
+                return Err(err(
+                    "SubDeleg",
+                    "DelegateeStakePoolNotRegisteredDELEG",
+                    format!("pool {} not registered", pool_hash.to_hex()),
+                ));
+            }
+            check_drep_target(drep)?;
+        }
+        C::VoteRegDeleg {
+            credential,
+            drep,
+            deposit,
+        } => {
+            if deposit.0 != params.key_deposit.0 {
+                return Err(err(
+                    "SubDeleg",
+                    "DepositIncorrectDELEG",
+                    format!(
+                        "declared deposit {} != key_deposit pparam {}",
+                        deposit.0, params.key_deposit.0
+                    ),
+                ));
+            }
+            let key = credential.to_typed_hash32();
+            if certs.reward_accounts.contains_key(&key) {
+                return Err(err(
+                    "SubDeleg",
+                    "StakeKeyRegisteredDELEG",
+                    format!("credential {} already registered", key.to_hex()),
+                ));
+            }
+            check_drep_target(drep)?;
+        }
+
+        // ---- SUBPOOL ------------------------------------------------------
+        C::PoolRegistration(pool_params) => {
+            if pool_params.cost.0 < params.min_pool_cost.0 {
+                return Err(err(
+                    "SubPool",
+                    "StakePoolCostTooLowPOOL",
+                    format!(
+                        "cost {} < min_pool_cost {}",
+                        pool_params.cost.0, params.min_pool_cost.0
+                    ),
+                ));
+            }
+            if params.protocol_version_major >= 11 {
+                let self_reuse = certs
+                    .pool_params
+                    .get(&pool_params.operator)
+                    .map(|reg| reg.vrf_keyhash)
+                    == Some(pool_params.vrf_keyhash);
+                if !self_reuse {
+                    if let Some((existing_id, _)) = certs
+                        .pool_params
+                        .iter()
+                        .find(|(_, reg)| reg.vrf_keyhash == pool_params.vrf_keyhash)
+                    {
+                        if *existing_id != pool_params.operator {
+                            return Err(err(
+                                "SubPool",
+                                "VRFKeyHashAlreadyRegistered",
+                                format!(
+                                    "vrf_keyhash {} already held by pool {}",
+                                    pool_params.vrf_keyhash.to_hex(),
+                                    existing_id.to_hex()
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+            // `PoolMedataHashTooBig` is structurally unreachable — see the
+            // doc comment above (`PoolMetadata.hash` is a fixed `Hash32`).
+            // `WrongNetworkPOOL` is not modelled — see the doc comment.
+        }
+        C::PoolRetirement { pool_hash, epoch } => {
+            if !certs.pool_params.contains_key(pool_hash) {
+                return Err(err(
+                    "SubPool",
+                    "StakePoolNotRegisteredOnKeyPOOL",
+                    format!("pool {} not registered", pool_hash.to_hex()),
+                ));
+            }
+            let limit_epoch = current_epoch.0.saturating_add(params.e_max);
+            if !(current_epoch.0 < *epoch && *epoch <= limit_epoch) {
+                return Err(err(
+                    "SubPool",
+                    "StakePoolRetirementWrongEpochPOOL",
+                    format!(
+                        "retirement_epoch={} must satisfy current_epoch={} < e <= \
+                         current_epoch+e_max={}",
+                        epoch, current_epoch.0, limit_epoch
+                    ),
+                ));
+            }
+        }
+
+        // ---- SUBGOVCERT ----------------------------------------------------
+        C::RegDRep {
+            credential,
+            deposit,
+            ..
+        } => {
+            let key = credential.to_typed_hash32();
+            if governance.dreps.contains_key(&key) {
+                return Err(err(
+                    "SubGovCert",
+                    "DijkstraDRepAlreadyRegistered",
+                    format!("drep {} already registered", key.to_hex()),
+                ));
+            }
+            if deposit.0 != params.drep_deposit.0 {
+                return Err(err(
+                    "SubGovCert",
+                    "DijkstraDRepIncorrectDeposit",
+                    format!(
+                        "declared deposit {} != drep_deposit pparam {}",
+                        deposit.0, params.drep_deposit.0
+                    ),
+                ));
+            }
+        }
+        C::UnregDRep { credential, refund } => {
+            let key = credential.to_typed_hash32();
+            match governance.dreps.get(&key) {
+                None => {
+                    return Err(err(
+                        "SubGovCert",
+                        "DijkstraDRepNotRegistered",
+                        format!("drep {} not registered", key.to_hex()),
+                    ))
+                }
+                Some(reg) => {
+                    if refund.0 != reg.deposit.0 {
+                        return Err(err(
+                            "SubGovCert",
+                            "DijkstraDRepIncorrectRefund",
+                            format!(
+                                "declared refund {} != stored deposit {} for drep {}",
+                                refund.0,
+                                reg.deposit.0,
+                                key.to_hex()
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        C::UpdateDRep { credential, .. } => {
+            let key = credential.to_typed_hash32();
+            if !governance.dreps.contains_key(&key) {
+                return Err(err(
+                    "SubGovCert",
+                    "DijkstraDRepNotRegistered",
+                    format!("drep {} not registered", key.to_hex()),
+                ));
+            }
+        }
+        C::CommitteeHotAuth {
+            cold_credential, ..
+        } => {
+            let cold_key = cold_credential.to_typed_hash32();
+            if governance.committee_resigned.contains_key(&cold_key) {
+                return Err(err(
+                    "SubGovCert",
+                    "DijkstraCommitteeHasPreviouslyResigned",
+                    format!(
+                        "cold credential {} has previously resigned",
+                        cold_key.to_hex()
+                    ),
+                ));
+            }
+            if !governance
+                .committee_auth_eligible_members()
+                .contains(&cold_key)
+            {
+                return Err(err(
+                    "SubGovCert",
+                    "DijkstraCommitteeIsUnknown",
+                    format!(
+                        "cold credential {} is not a current or incoming committee member",
+                        cold_key.to_hex()
+                    ),
+                ));
+            }
+        }
+        C::CommitteeColdResign {
+            cold_credential, ..
+        } => {
+            let cold_key = cold_credential.to_typed_hash32();
+            if governance.committee_resigned.contains_key(&cold_key) {
+                return Err(err(
+                    "SubGovCert",
+                    "DijkstraCommitteeHasPreviouslyResigned",
+                    format!(
+                        "cold credential {} has previously resigned",
+                        cold_key.to_hex()
+                    ),
+                ));
+            }
+            if !governance
+                .committee_auth_eligible_members()
+                .contains(&cold_key)
+            {
+                return Err(err(
+                    "SubGovCert",
+                    "DijkstraCommitteeIsUnknown",
+                    format!(
+                        "cold credential {} is not a current or incoming committee member",
+                        cold_key.to_hex()
+                    ),
+                ));
+            }
+        }
+
+        // `DijkstraTxCert` is structurally `Deleg | Pool | Gov` only
+        // (oracle-confirmed) — MIR and GenesisKeyDelegation are pre-Conway
+        // constructs with no Dijkstra sub-tx analog at all. If dugite's
+        // shared `Certificate` decoder ever admits one of these into a
+        // sub-tx's `certificates` list (it structurally could, since the
+        // decoder is not level-aware), reject rather than silently
+        // no-op — Haskell could never decode this into a `DijkstraTxCert`
+        // in the first place.
+        C::GenesisKeyDelegation { .. } | C::MoveInstantaneousRewards { .. } => {
+            return Err(err(
+                "SubCert",
+                "NoSubTxAnalog",
+                format!(
+                    "{cert:?} has no Dijkstra sub-tx analog (DijkstraTxCert is Deleg|Pool|Gov \
+                     only)"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1796,15 +2645,21 @@ mod tests {
             };
 
             // ---- seed the UTxO ---------------------------------------
-            // Real blake2b-224(vkey) hash (not arbitrary bytes) so the
-            // #1010 SUBUTXOW witness check has something genuine to verify
-            // sub A/C's witnesses against.
-            let payment_vkey = [0xAB_u8; 32];
-            let kh = dugite_primitives::hash::blake2b_224(&payment_vkey);
+            // A REAL Ed25519 keypair (not arbitrary bytes) so the #1010/
+            // #1011 SUBUTXOW checks — both `SubMissingVKeyWitnessesUTXOW`
+            // (presence) AND `SubInvalidWitnessesUTXOW` (#1011: real
+            // cryptographic verification) — have something genuine to
+            // verify sub A/C's witnesses against. Each witness signs its
+            // OWN sub-tx's `tx_id` (oracle-confirmed `dstWits`
+            // independence — never the parent's hash).
+            let signing_key = dugite_crypto::keys::PaymentSigningKey::generate();
+            let verification_key = signing_key.verification_key();
+            let payment_vkey = verification_key.to_bytes();
+            let kh = verification_key.hash();
             let addr = make_enterprise_address(kh);
-            let witness_for = |vkey: [u8; 32]| dugite_primitives::transaction::VKeyWitness {
-                vkey: vkey.to_vec(),
-                signature: vec![0u8; 64],
+            let witness_for = |sub_tx_id: Hash32| dugite_primitives::transaction::VKeyWitness {
+                vkey: payment_vkey.to_vec(),
+                signature: signing_key.sign(sub_tx_id.as_bytes()),
             };
 
             // UTxO A — sub A would consume it (it succeeds in isolation).
@@ -1844,7 +2699,7 @@ mod tests {
                 auxiliary_data_hash: None,
                 raw_body_cbor: None,
                 witness_set: TransactionWitnessSet {
-                    vkey_witnesses: vec![witness_for(payment_vkey)],
+                    vkey_witnesses: vec![witness_for(Hash32::from_bytes([0xAA; 32]))],
                     ..Default::default()
                 },
                 ..Default::default()
@@ -1882,7 +2737,7 @@ mod tests {
                 auxiliary_data_hash: None,
                 raw_body_cbor: None,
                 witness_set: TransactionWitnessSet {
-                    vkey_witnesses: vec![witness_for(payment_vkey)],
+                    vkey_witnesses: vec![witness_for(Hash32::from_bytes([0xC3; 32]))],
                     ..Default::default()
                 },
                 ..Default::default()
@@ -2099,27 +2954,34 @@ mod tests {
             // none → `None` (which is why the existing apply test, using only
             // enterprise addresses, never exercised the stake legs).
             //
-            // Both payment credentials are real blake2b-224(vkey) hashes
-            // (not arbitrary bytes) so the #1010 SUBUTXOW witness check
-            // below has something genuine to verify against.
-            let payment_vkey = [0x31u8; 32];
-            let payment_hash = dugite_primitives::hash::blake2b_224(&payment_vkey);
+            // Both payment credentials are backed by REAL Ed25519 keypairs
+            // (not arbitrary bytes) so the #1010/#1011 SUBUTXOW checks —
+            // presence (`SubMissingVKeyWitnessesUTXOW`) AND real
+            // cryptographic verification (`SubInvalidWitnessesUTXOW`) —
+            // have something genuine to verify against. Each witness signs
+            // its OWN sub-tx's `tx_id` (oracle-confirmed `dstWits`
+            // independence).
+            let payment_signing_key = dugite_crypto::keys::PaymentSigningKey::generate();
+            let payment_hash = payment_signing_key.verification_key().hash();
             let base_addr = {
                 let mut b = vec![0x00u8];
                 b.extend_from_slice(payment_hash.as_bytes());
                 b.extend_from_slice(Hash28::from_bytes([0x7d; 28]).as_bytes());
                 Address::from_bytes(&b).expect("base addr")
             };
-            let ent_vkey = [0x32u8; 32];
-            let ent_hash = dugite_primitives::hash::blake2b_224(&ent_vkey);
+            let ent_signing_key = dugite_crypto::keys::PaymentSigningKey::generate();
+            let ent_hash = ent_signing_key.verification_key().hash();
             let enterprise_addr = {
                 let mut b = vec![0x61u8];
                 b.extend_from_slice(ent_hash.as_bytes());
                 Address::from_bytes(&b).expect("enterprise addr")
             };
-            let witness_for = |vkey: [u8; 32]| dugite_primitives::transaction::VKeyWitness {
-                vkey: vkey.to_vec(),
-                signature: vec![0u8; 64],
+            let witness_for = |signing_key: &dugite_crypto::keys::PaymentSigningKey,
+                               sub_tx_id: Hash32| {
+                dugite_primitives::transaction::VKeyWitness {
+                    vkey: signing_key.verification_key().to_bytes().to_vec(),
+                    signature: signing_key.sign(sub_tx_id.as_bytes()),
+                }
             };
             let mk_out = |addr: Address, coin: u64| TransactionOutput {
                 address: addr,
@@ -2185,7 +3047,7 @@ mod tests {
 
             let mut utxo = super::make_utxo_sub();
             let mut certs = super::make_cert_sub();
-            let gov = super::make_gov_sub();
+            let mut gov = super::make_gov_sub();
             let mut epochs = super::make_epoch_sub();
             let params = ProtocolParameters::mainnet_defaults();
             let delegates: HashMap<Hash28, (Hash28, Hash32)> = HashMap::new();
@@ -2203,8 +3065,9 @@ mod tests {
             let ent_in = mk_in(0xA1, 0);
             utxo.utxo_set
                 .insert(ent_in.clone(), mk_out(enterprise_addr.clone(), 10_000_000));
+            let sub_add_tx_id = Hash32::from_bytes([0xAA; 32]);
             let sub_add = SubTransaction {
-                tx_id: Hash32::from_bytes([0xAA; 32]),
+                tx_id: sub_add_tx_id,
                 inputs: vec![ent_in],
                 outputs: vec![mk_out(base_addr.clone(), 4_000_000)],
                 ttl: None,
@@ -2213,7 +3076,7 @@ mod tests {
                 auxiliary_data_hash: None,
                 raw_body_cbor: None,
                 witness_set: TransactionWitnessSet {
-                    vkey_witnesses: vec![witness_for(ent_vkey)],
+                    vkey_witnesses: vec![witness_for(&ent_signing_key, sub_add_tx_id)],
                     ..Default::default()
                 },
                 ..Default::default()
@@ -2223,7 +3086,7 @@ mod tests {
                 &ctx,
                 &mut utxo,
                 &mut certs,
-                &gov,
+                &mut gov,
                 &mut epochs,
             )
             .expect("sub_add must validate and commit");
@@ -2243,8 +3106,9 @@ mod tests {
             // ── SUB leg ──────────────────────────────────────────────────────
             // A second sub-tx spends the base output created above (keyed under
             // the first sub-tx's tx_id) → the spend SUBs the stake back to 0.
+            let sub_spend_tx_id = Hash32::from_bytes([0xBC; 32]);
             let sub_spend = SubTransaction {
-                tx_id: Hash32::from_bytes([0xBC; 32]),
+                tx_id: sub_spend_tx_id,
                 inputs: vec![mk_in(0xAA, 0)],
                 outputs: vec![mk_out(enterprise_addr.clone(), 3_000_000)],
                 ttl: None,
@@ -2253,7 +3117,7 @@ mod tests {
                 auxiliary_data_hash: None,
                 raw_body_cbor: None,
                 witness_set: TransactionWitnessSet {
-                    vkey_witnesses: vec![witness_for(payment_vkey)],
+                    vkey_witnesses: vec![witness_for(&payment_signing_key, sub_spend_tx_id)],
                     ..Default::default()
                 },
                 ..Default::default()
@@ -2263,7 +3127,7 @@ mod tests {
                 &ctx,
                 &mut utxo,
                 &mut certs,
-                &gov,
+                &mut gov,
                 &mut epochs,
             )
             .expect("sub_spend must validate and commit");
@@ -2556,8 +3420,8 @@ mod tests {
             // though the input itself resolves fine and the output clears
             // the min-UTxO floor (so neither of the checks above would
             // catch it).
-            let vkey = [0x77_u8; 32];
-            let vkey_hash = dugite_primitives::hash::blake2b_224(&vkey);
+            let signing_key = dugite_crypto::keys::PaymentSigningKey::generate();
+            let vkey_hash = signing_key.verification_key().hash();
             let vkey_addr = make_enterprise_address(vkey_hash);
             let utxo_in4 = make_input(0x05, 0);
             let utxo_out4 = make_output(vkey_addr.clone(), 10_000_000);
@@ -2591,8 +3455,8 @@ mod tests {
             let mut sub_with_witness = make_sub_no_witness();
             sub_with_witness.witness_set = TransactionWitnessSet {
                 vkey_witnesses: vec![dugite_primitives::transaction::VKeyWitness {
-                    vkey: vkey.to_vec(),
-                    signature: vec![0u8; 64],
+                    vkey: signing_key.verification_key().to_bytes().to_vec(),
+                    signature: signing_key.sign(sub_with_witness.tx_id.as_bytes()),
                 }],
                 ..Default::default()
             };
@@ -2602,21 +3466,34 @@ mod tests {
                  (control for SubMissingVKeyWitnessesUTXOW)",
             );
 
-            // ---- #1010 fail-closed guard: certs decoded but not yet applied ----
-            // A sub-tx declaring a certificate must be REJECTED (not
-            // silently accepted with the cert dropped) until SUBCERTS
-            // apply-routing lands.
+            // ---- #1011: SUBCERTS now routes + applies a plain StakeRegistration ----
+            // Superseded expectation (pre-#1011 this asserted rejection
+            // with `SubEntitiesNotYetApplied` — see
+            // `sub_transactions_subcerts_subpool_subgovcert` below for the
+            // full accept/reject matrix per rule family). A sub-tx
+            // declaring an ordinary, unregistered-credential
+            // `StakeRegistration` cert must now be ACCEPTED and the cert
+            // actually applied — not silently dropped (the #1010 shape)
+            // and not wrongly rejected (the #1011 guard it replaces).
+            // `ConwayRules::required_witnesses` (pre-existing, unrelated to
+            // this issue) reports BOTH the spend input's payment
+            // credential AND the cert's own credential as required, so
+            // this fixture supplies real signatures for both — reuses the
+            // already-real `signing_key`/`vkey_addr` pair from the
+            // `SubMissingVKeyWitnessesUTXOW` case above for the spend, and
+            // a second real key for the cert credential.
+            let cert_signing_key = dugite_crypto::keys::PaymentSigningKey::generate();
+            let cert_key_hash = cert_signing_key.verification_key().hash();
             let utxo_in5 = make_input(0x06, 0);
-            let utxo_out5 = make_output(addr.clone(), 10_000_000);
+            let utxo_out5 = make_output(vkey_addr.clone(), 10_000_000);
+            let sub_with_cert_tx_id = Hash32::from_bytes([0x06; 32]);
             let sub_with_cert = SubTransaction {
-                tx_id: Hash32::from_bytes([0x06; 32]),
+                tx_id: sub_with_cert_tx_id,
                 inputs: vec![utxo_in5.clone()],
-                outputs: vec![make_output(addr.clone(), 5_000_000)],
+                outputs: vec![make_output(vkey_addr.clone(), 5_000_000)],
                 certificates: vec![
                     dugite_primitives::transaction::Certificate::StakeRegistration(
-                        dugite_primitives::credentials::Credential::VerificationKey(
-                            Hash28::from_bytes([0x66; 28]),
-                        ),
+                        dugite_primitives::credentials::Credential::VerificationKey(cert_key_hash),
                     ),
                 ],
                 ttl: None,
@@ -2624,16 +3501,476 @@ mod tests {
                 reference_inputs: vec![],
                 auxiliary_data_hash: None,
                 raw_body_cbor: None,
+                witness_set: TransactionWitnessSet {
+                    vkey_witnesses: vec![
+                        dugite_primitives::transaction::VKeyWitness {
+                            vkey: signing_key.verification_key().to_bytes().to_vec(),
+                            signature: signing_key.sign(sub_with_cert_tx_id.as_bytes()),
+                        },
+                        dugite_primitives::transaction::VKeyWitness {
+                            vkey: cert_signing_key.verification_key().to_bytes().to_vec(),
+                            signature: cert_signing_key.sign(sub_with_cert_tx_id.as_bytes()),
+                        },
+                    ],
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let (result, _) = run_one_sub(sub_with_cert, vec![(utxo_in5, utxo_out5)]);
+            result.expect(
+                "a sub-tx declaring a StakeRegistration for an UNREGISTERED credential must be \
+                 accepted now that SUBCERTS/SUBDELEG apply-routing has landed (#1011)",
+            );
+        }
+
+        /// #1011 — SUBDELEG / SUBPOOL / SUBGOVCERT / SUBENTITIES: each
+        /// landed rule family REJECTS a violating sub-tx with the correct
+        /// predicate name AND ACCEPTS (+ actually applies) a valid one.
+        /// Every section below is a reject/accept PAIR proving the check
+        /// discriminates rather than always-accepting or always-rejecting.
+        #[test]
+        fn sub_transactions_subcerts_subpool_subgovcert_subentities() {
+            use super::super::*;
+            use crate::eras::EraRules;
+            use crate::state::BlockValidationMode;
+            use crate::state::PoolRegistration;
+            use crate::utxo::UtxoSet;
+            use crate::utxo_diff::DiffSeq;
+            use dugite_primitives::address::Address;
+            use dugite_primitives::credentials::Credential;
+            use dugite_primitives::era::Era;
+            use dugite_primitives::hash::{Hash28, Hash32};
+            use dugite_primitives::protocol_params::ProtocolParameters;
+            use dugite_primitives::transaction::{
+                Certificate, OutputDatum, SubTransaction, Transaction, TransactionBody,
+                TransactionInput, TransactionOutput, TransactionWitnessSet, VKeyWitness,
+            };
+            use dugite_primitives::value::{Lovelace, Value};
+            use std::collections::{BTreeMap, HashMap};
+            use std::sync::Arc;
+
+            let make_output = |addr: Address, coin: u64| TransactionOutput {
+                address: addr,
+                value: Value::lovelace(coin),
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: true,
+                raw_cbor: None,
+            };
+            let make_input = |b: u8, idx: u32| TransactionInput {
+                transaction_id: Hash32::from_bytes([b; 32]),
+                index: idx,
+            };
+            let make_enterprise_address = |kh: Hash28| -> Address {
+                let mut b = vec![0x61];
+                b.extend_from_slice(kh.as_bytes());
+                Address::from_bytes(&b).expect("enterprise addr")
+            };
+
+            let params = ProtocolParameters::mainnet_defaults();
+            let delegates: HashMap<Hash28, (Hash28, Hash32)> = HashMap::new();
+            let ctx = super::make_ctx(&params, &delegates, None);
+
+            // A single real Ed25519 identity used to spend the seeded UTXO
+            // in every sub-case below (each sub-tx signs over its OWN
+            // `tx_id`).
+            let signing_key = dugite_crypto::keys::PaymentSigningKey::generate();
+            let payment_hash = signing_key.verification_key().hash();
+            let addr = make_enterprise_address(payment_hash);
+
+            // Runs ONE sub-tx against a FRESH utxo/certs/gov/epochs, after
+            // `seed` has had a chance to pre-populate certs/gov (e.g.
+            // "pool already registered", "stake key already registered").
+            // Returns the apply result plus the (possibly mutated, if the
+            // call succeeded) certs/gov for post-hoc assertions.
+            let run = |sub: SubTransaction, seed: &dyn Fn(&mut CertSubState, &mut GovSubState)| {
+                let spend_in = sub.inputs[0].clone();
+                let mut utxo_set = UtxoSet::new();
+                utxo_set.insert(spend_in, make_output(addr.clone(), 10_000_000));
+                let mut utxo = UtxoSubState {
+                    utxo_set,
+                    diff_seq: DiffSeq::new(),
+                    epoch_fees: Lovelace(0),
+                    pending_donations: Lovelace(0),
+                };
+                let mut certs = super::make_cert_sub();
+                let mut gov = super::make_gov_sub();
+                let mut epochs = super::make_epoch_sub();
+                seed(&mut certs, &mut gov);
+                let parent = Transaction {
+                    era: Era::Dijkstra,
+                    hash: Hash32::from_bytes([0xDE; 32]),
+                    body: TransactionBody {
+                        inputs: vec![],
+                        outputs: vec![],
+                        fee: Lovelace(0),
+                        ttl: None,
+                        certificates: vec![],
+                        withdrawals: BTreeMap::new(),
+                        auxiliary_data_hash: None,
+                        validity_interval_start: None,
+                        mint: BTreeMap::new(),
+                        script_data_hash: None,
+                        collateral: vec![],
+                        required_signers: vec![],
+                        network_id: None,
+                        collateral_return: None,
+                        total_collateral: None,
+                        reference_inputs: vec![],
+                        update: None,
+                        voting_procedures: BTreeMap::new(),
+                        proposal_procedures: vec![],
+                        treasury_value: None,
+                        donation: None,
+                        sub_transactions: vec![sub],
+                        account_balance_intervals: vec![],
+                        direct_deposits: BTreeMap::new(),
+                        guards: Vec::new(),
+                    },
+                    witness_set: TransactionWitnessSet::default(),
+                    is_valid: true,
+                    auxiliary_data: None,
+                    raw_cbor: None,
+                    raw_body_cbor: None,
+                    raw_witness_cbor: None,
+                };
+                let rules = DijkstraRules::new();
+                let result = rules.apply_valid_tx(
+                    &parent,
+                    BlockValidationMode::ApplyOnly,
+                    &ctx,
+                    &mut utxo,
+                    &mut certs,
+                    &mut gov,
+                    &mut epochs,
+                );
+                (result, certs, gov)
+            };
+
+            let witness_for = |tx_id: Hash32| VKeyWitness {
+                vkey: signing_key.verification_key().to_bytes().to_vec(),
+                signature: signing_key.sign(tx_id.as_bytes()),
+            };
+
+            // ================================================================
+            // A) SUBDELEG — DelegateeStakePoolNotRegisteredDELEG
+            // ================================================================
+            let pool_hash = Hash28::from_bytes([0x10; 28]);
+            let stake_signing_key = dugite_crypto::keys::PaymentSigningKey::generate();
+            let stake_cred =
+                Credential::VerificationKey(stake_signing_key.verification_key().hash());
+            let stake_key_typed = stake_cred.to_typed_hash32();
+
+            let deleg_tx_id = Hash32::from_bytes([0xA0; 32]);
+            let deleg_sub = SubTransaction {
+                tx_id: deleg_tx_id,
+                inputs: vec![make_input(0xA0, 0)],
+                outputs: vec![make_output(addr.clone(), 5_000_000)],
+                certificates: vec![Certificate::StakeDelegation {
+                    credential: stake_cred.clone(),
+                    pool_hash,
+                }],
+                witness_set: TransactionWitnessSet {
+                    vkey_witnesses: vec![
+                        witness_for(deleg_tx_id),
+                        VKeyWitness {
+                            vkey: stake_signing_key.verification_key().to_bytes().to_vec(),
+                            signature: stake_signing_key.sign(deleg_tx_id.as_bytes()),
+                        },
+                    ],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let (result, _, _) = run(deleg_sub.clone(), &|_, _| {});
+            let err = result
+                .expect_err("StakeDelegation to a pool that is NOT registered must be rejected");
+            assert!(
+                format!("{err:?}").contains("DelegateeStakePoolNotRegisteredDELEG"),
+                "error must name DelegateeStakePoolNotRegisteredDELEG, got: {err:?}"
+            );
+
+            let seed_pool_and_stake_key = move |certs: &mut CertSubState, _: &mut GovSubState| {
+                Arc::make_mut(&mut certs.pool_params).insert(
+                    pool_hash,
+                    PoolRegistration {
+                        pool_id: pool_hash,
+                        vrf_keyhash: Hash32::from_bytes([0x20; 32]),
+                        pledge: Lovelace(0),
+                        cost: Lovelace(340_000_000),
+                        margin_numerator: 0,
+                        margin_denominator: 1,
+                        reward_account: vec![],
+                        owners: vec![],
+                        relays: vec![],
+                        metadata_url: None,
+                        metadata_hash: None,
+                    },
+                );
+                certs.reward_accounts.insert(stake_key_typed, Lovelace(0));
+            };
+            let (result, certs_after, _) = run(deleg_sub, &seed_pool_and_stake_key);
+            result.expect(
+                "StakeDelegation to a REGISTERED pool from a REGISTERED stake key must succeed",
+            );
+            assert_eq!(
+                certs_after.delegations.get(&stake_key_typed).copied(),
+                Some(pool_hash),
+                "the delegation must actually be applied to certs.delegations"
+            );
+
+            // ================================================================
+            // B) SUBPOOL — StakePoolCostTooLowPOOL
+            // ================================================================
+            let pool_signing_key = dugite_crypto::keys::PaymentSigningKey::generate();
+            let pool_op = pool_signing_key.verification_key().hash();
+            let cheap_pool = dugite_primitives::transaction::PoolParams {
+                operator: pool_op,
+                vrf_keyhash: Hash32::from_bytes([0x31; 32]),
+                pledge: Lovelace(0),
+                cost: Lovelace(0), // below min_pool_cost
+                margin: dugite_primitives::transaction::Rational {
+                    numerator: 0,
+                    denominator: 1,
+                },
+                reward_account: vec![],
+                pool_owners: vec![],
+                relays: vec![],
+                pool_metadata: None,
+            };
+            let pool_tx_id = Hash32::from_bytes([0xB0; 32]);
+            let pool_witness = VKeyWitness {
+                vkey: pool_signing_key.verification_key().to_bytes().to_vec(),
+                signature: pool_signing_key.sign(pool_tx_id.as_bytes()),
+            };
+            let pool_sub_cheap = SubTransaction {
+                tx_id: pool_tx_id,
+                inputs: vec![make_input(0xB0, 0)],
+                outputs: vec![make_output(addr.clone(), 5_000_000)],
+                certificates: vec![Certificate::PoolRegistration(cheap_pool.clone())],
+                witness_set: TransactionWitnessSet {
+                    vkey_witnesses: vec![witness_for(pool_tx_id), pool_witness.clone()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let (result, _, _) = run(pool_sub_cheap, &|_, _| {});
+            let err = result
+                .expect_err("PoolRegistration with cost below min_pool_cost must be rejected");
+            assert!(
+                format!("{err:?}").contains("StakePoolCostTooLowPOOL"),
+                "error must name StakePoolCostTooLowPOOL, got: {err:?}"
+            );
+
+            let mut ok_pool = cheap_pool;
+            ok_pool.cost = params.min_pool_cost;
+            let pool_sub_ok = SubTransaction {
+                tx_id: pool_tx_id,
+                inputs: vec![make_input(0xB0, 0)],
+                outputs: vec![make_output(addr.clone(), 5_000_000)],
+                certificates: vec![Certificate::PoolRegistration(ok_pool)],
+                witness_set: TransactionWitnessSet {
+                    vkey_witnesses: vec![witness_for(pool_tx_id), pool_witness],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let (result, certs_after, _) = run(pool_sub_ok, &|_, _| {});
+            result.expect("PoolRegistration with cost == min_pool_cost must succeed");
+            assert!(
+                certs_after.pool_params.contains_key(&pool_op),
+                "the pool registration must actually be applied to certs.pool_params"
+            );
+
+            // ================================================================
+            // C) SUBGOVCERT — DijkstraDRepIncorrectDeposit
+            // ================================================================
+            let drep_signing_key = dugite_crypto::keys::PaymentSigningKey::generate();
+            let drep_cred = Credential::VerificationKey(drep_signing_key.verification_key().hash());
+            let drep_key = drep_cred.to_typed_hash32();
+            let drep_tx_id = Hash32::from_bytes([0xC0; 32]);
+            let drep_witness = VKeyWitness {
+                vkey: drep_signing_key.verification_key().to_bytes().to_vec(),
+                signature: drep_signing_key.sign(drep_tx_id.as_bytes()),
+            };
+            let wrong_deposit_sub = SubTransaction {
+                tx_id: drep_tx_id,
+                inputs: vec![make_input(0xC0, 0)],
+                outputs: vec![make_output(addr.clone(), 5_000_000)],
+                certificates: vec![Certificate::RegDRep {
+                    credential: drep_cred.clone(),
+                    deposit: Lovelace(1),
+                    anchor: None,
+                }],
+                witness_set: TransactionWitnessSet {
+                    vkey_witnesses: vec![witness_for(drep_tx_id), drep_witness.clone()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let (result, _, _) = run(wrong_deposit_sub, &|_, _| {});
             let err = result.expect_err(
-                "a sub-tx declaring a certificate must be rejected until SUBCERTS \
-                 apply-routing lands (#1010) — not silently accepted with the cert dropped",
+                "RegDRep with a deposit that does not match the drep_deposit pparam must be \
+                 rejected",
             );
             assert!(
-                format!("{err:?}").contains("SubEntitiesNotYetApplied"),
-                "error must name SubEntitiesNotYetApplied, got: {err:?}"
+                format!("{err:?}").contains("DijkstraDRepIncorrectDeposit"),
+                "error must name DijkstraDRepIncorrectDeposit, got: {err:?}"
+            );
+
+            let right_deposit_sub = SubTransaction {
+                tx_id: drep_tx_id,
+                inputs: vec![make_input(0xC0, 0)],
+                outputs: vec![make_output(addr.clone(), 5_000_000)],
+                certificates: vec![Certificate::RegDRep {
+                    credential: drep_cred,
+                    deposit: params.drep_deposit,
+                    anchor: None,
+                }],
+                witness_set: TransactionWitnessSet {
+                    vkey_witnesses: vec![witness_for(drep_tx_id), drep_witness],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let (result, _, gov_after) = run(right_deposit_sub, &|_, _| {});
+            result.expect("RegDRep with the CORRECT deposit must succeed");
+            assert!(
+                gov_after.governance.dreps.contains_key(&drep_key),
+                "the DRep registration must actually be applied to gov.governance.dreps"
+            );
+
+            // ================================================================
+            // D) SUBENTITIES — SubMissingAccountsInWithdrawals
+            // ================================================================
+            let withdrawal_signing_key = dugite_crypto::keys::PaymentSigningKey::generate();
+            let mut withdrawal_account = vec![0xe0u8];
+            withdrawal_account
+                .extend_from_slice(withdrawal_signing_key.verification_key().hash().as_bytes());
+            let withdrawal_key = reward_account_bytes_to_typed_hash32(&withdrawal_account).unwrap();
+            let wd_tx_id = Hash32::from_bytes([0xD0; 32]);
+            let wd_sub = SubTransaction {
+                tx_id: wd_tx_id,
+                inputs: vec![make_input(0xD0, 0)],
+                outputs: vec![make_output(addr.clone(), 5_000_000)],
+                withdrawals: {
+                    let mut m = BTreeMap::new();
+                    m.insert(withdrawal_account.clone(), Lovelace(7_000_000));
+                    m
+                },
+                witness_set: TransactionWitnessSet {
+                    vkey_witnesses: vec![
+                        witness_for(wd_tx_id),
+                        VKeyWitness {
+                            vkey: withdrawal_signing_key
+                                .verification_key()
+                                .to_bytes()
+                                .to_vec(),
+                            signature: withdrawal_signing_key.sign(wd_tx_id.as_bytes()),
+                        },
+                    ],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let (result, _, _) = run(wd_sub.clone(), &|_, _| {});
+            let err = result
+                .expect_err("a withdrawal from an UNREGISTERED reward account must be rejected");
+            assert!(
+                format!("{err:?}").contains("SubMissingAccountsInWithdrawals"),
+                "error must name SubMissingAccountsInWithdrawals, got: {err:?}"
+            );
+
+            let seed_registered_account = move |certs: &mut CertSubState, _: &mut GovSubState| {
+                certs
+                    .reward_accounts
+                    .insert(withdrawal_key, Lovelace(7_000_000));
+            };
+            let (result, certs_after, _) = run(wd_sub, &seed_registered_account);
+            result.expect(
+                "a withdrawal from a REGISTERED reward account must succeed (registration \
+                 existence is the only SUBENTITIES predicate dugite models — see the doc \
+                 comment on apply_sub_transactions)",
+            );
+            assert_eq!(
+                certs_after.reward_accounts.get(&withdrawal_key).copied(),
+                Some(Lovelace(0)),
+                "the withdrawal must actually drain the reward account to zero"
+            );
+
+            // ================================================================
+            // E) Dijkstra UTXO predicate — AccountBalanceOutOfRange (sub-tx)
+            // ================================================================
+            let bal_cred = Credential::VerificationKey(Hash28::from_bytes([0x60; 28]));
+            let bal_key = bal_cred.to_typed_hash32();
+            let bal_tx_id = Hash32::from_bytes([0xE0; 32]);
+            let bal_sub = SubTransaction {
+                tx_id: bal_tx_id,
+                inputs: vec![make_input(0xE0, 0)],
+                outputs: vec![make_output(addr.clone(), 5_000_000)],
+                account_balance_intervals: vec![(
+                    bal_cred,
+                    dugite_primitives::transaction::AccountBalanceInterval::closed_open(
+                        Lovelace(100),
+                        Lovelace(200),
+                    ),
+                )],
+                witness_set: TransactionWitnessSet {
+                    vkey_witnesses: vec![witness_for(bal_tx_id)],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let seed_out_of_range = move |certs: &mut CertSubState, _: &mut GovSubState| {
+                certs.reward_accounts.insert(bal_key, Lovelace(50));
+            };
+            let (result, _, _) = run(bal_sub.clone(), &seed_out_of_range);
+            let err = result.expect_err(
+                "a sub-tx whose declared account_balance_intervals excludes the actual \
+                 balance must be rejected",
+            );
+            assert!(
+                format!("{err:?}").contains("AccountBalanceOutOfRange"),
+                "error must name AccountBalanceOutOfRange, got: {err:?}"
+            );
+            let seed_in_range = move |certs: &mut CertSubState, _: &mut GovSubState| {
+                certs.reward_accounts.insert(bal_key, Lovelace(150));
+            };
+            let (result, _, _) = run(bal_sub, &seed_in_range);
+            result.expect(
+                "a sub-tx whose declared interval CONTAINS the actual balance must succeed",
+            );
+
+            // ================================================================
+            // F) SUBUTXOW — SubInvalidWitnessesUTXOW (real crypto, #1011)
+            // ================================================================
+            let bad_tx_id = Hash32::from_bytes([0xF0; 32]);
+            let tampered_sub = SubTransaction {
+                tx_id: bad_tx_id,
+                inputs: vec![make_input(0xF0, 0)],
+                outputs: vec![make_output(addr.clone(), 5_000_000)],
+                witness_set: TransactionWitnessSet {
+                    // Correct vkey (matches the spent input's credential,
+                    // so `SubMissingVKeyWitnessesUTXOW` would NOT fire),
+                    // but the SIGNATURE is over a DIFFERENT tx_id — a
+                    // real Ed25519 signature that simply does not verify
+                    // against `bad_tx_id`.
+                    vkey_witnesses: vec![VKeyWitness {
+                        vkey: signing_key.verification_key().to_bytes().to_vec(),
+                        signature: signing_key.sign(Hash32::from_bytes([0x99; 32]).as_bytes()),
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let (result, _, _) = run(tampered_sub, &|_, _| {});
+            let err = result.expect_err(
+                "a vkey witness whose signature does not verify against the sub-tx's own id \
+                 must be rejected, even though the vkey ITSELF matches a required credential",
+            );
+            assert!(
+                format!("{err:?}").contains("SubInvalidWitnessesUTXOW"),
+                "error must name SubInvalidWitnessesUTXOW, got: {err:?}"
             );
         }
 
