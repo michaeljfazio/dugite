@@ -318,6 +318,19 @@ stress-relay:
 benchmark-pipeline:
     ./scripts/validation/benchmark-pipeline-depth.sh
 
+# Enumerate cardano-cli's subcommand surface against dugite-cli's, both
+# directions (#1006). Requires cardano-cli on PATH and dugite-cli built
+# (cargo build -p dugite-cli); reports INCONCLUSIVE, never PASS, if either
+# binary can't run. Override binaries with CARDANO_CLI_BIN / DUGITE_CLI_BIN.
+cli-surface-parity:
+    ./scripts/validation/cli-surface-parity.sh
+
+# Self-test the surface-parity walker/parser against fixture stubs (no real
+# binaries needed) — proves the MISSING/SUPERSET/stale-allowlist paths work,
+# including a deliberate RED case.
+cli-surface-parity-selftest:
+    ./scripts/validation/cli-surface-parity-selftest.sh
+
 # ─── Dual-decode validation (M5 pallas-removal infrastructure) ───────────────
 
 # Local smoke run: serialization tests with DUGITE_DUAL_DECODE=panic (mirrors the PR CI job).

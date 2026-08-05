@@ -1,3 +1,52 @@
+//! Governance commands (Conway era): DRep, vote, and governance-action CBOR
+//! builders.
+//!
+//! ## CIP-0094 SPO polls: deliberately NOT implemented (#998)
+//!
+//! `cardano-cli` shipped `governance {create,answer,verify}-poll` from
+//! 2023-04-17 (`input-output-hk/cardano-node` PR #5112, merge
+//! `cf61eb378049f7e9ae854de998c9bff571b3acfe`, "Add new interim governance
+//! commands: {create, answer, verify}-poll"; moved into the
+//! `compatible babbage governance` command tree by cardano-cli PR #322,
+//! merge `4c615c9e25371c1081384732bbfcb57b39ddbbec`, 2023-10-05) until
+//! 2025-05-08, when cardano-cli PR #1178 ("Delete `governance` `poll`
+//! commands", merge `db83e11127092b4c216eed5572c4623b8ac51e79`) deleted them
+//! outright. Last release with them: `cardano-cli-10.8.0.0`
+//! (`685970733dc4ef5838967cb7cfb6d3fe4c2a2b06`); first without:
+//! `cardano-cli-10.9.0.0` (`e13f84d9fc9cafa293e88f017592d994ca1b12a2`). All
+//! four SHAs verified live against the GitHub API, not just quoted from
+//! research. Even while the commands existed, the parser hard-excluded
+//! Conway:
+//!
+//! ```haskell
+//! -- Cardano.CLI.EraBased.Governance.Poll.Option, cardano-cli-10.8.0.0
+//! pGovernanceCreatePoll era = do
+//!   w <- forShelleyBasedEraMaybeEon era
+//!   when ("BabbageEraOnwardsConway" `isInfixOf` show w) Nothing
+//!   pure $ ...
+//! ```
+//!
+//! — the commands were never reachable on the only era dugite targets.
+//!
+//! `cardano-cli 11.0.0.0` (git rev `97036a66bcf8c89f687ae57a048eecc0389977ef`,
+//! the build this project targets for parity) exposes zero poll commands
+//! anywhere in its command tree: verified against a full recursive
+//! `cardano-cli help` dump (7530 lines), zero case-insensitive matches for
+//! "poll". CIP-0094 itself remains `Status: Active` and `cardano-api`'s
+//! `Cardano.Api.Governance.Internal.Poll` module is still exported — the
+//! *library* support outlived the *CLI* front-end — but this project's
+//! standing rule is that cardano-cli's actual implementation wins over CIP
+//! prose when the two disagree (see CLAUDE.md, citing the CIP-0121 /
+//! `plutus` 8192-vs-2^29 precedent). Matching cardano-cli here means
+//! matching its current, poll-less surface: implementing
+//! `create-poll`/`answer-poll`/`verify-poll` would add dugite-cli commands
+//! with no live cardano-cli invocation to golden-test against, and no
+//! reachable era to exercise them in even when cardano-cli last had them.
+//!
+//! `dugite-node` needs no change either way: CIP-0094 polls ride entirely in
+//! ordinary tx metadata (label 94), which the ledger already carries
+//! opaquely regardless of which CLI (if any) produces or consumes it.
+
 use anyhow::Result;
 use clap::{Args, Subcommand};
 use std::path::PathBuf;
