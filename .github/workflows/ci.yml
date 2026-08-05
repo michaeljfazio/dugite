@@ -245,14 +245,19 @@ jobs:
           set -euo pipefail
           ver="11.0.0.0"
           base="https://github.com/IntersectMBO/cardano-cli/releases/download/cardano-cli-${ver}"
-          curl -sSL -o cardano-cli.tar.gz "${base}/cardano-cli-${ver}-x86_64-linux.tar.gz"
-          curl -sSL -o sha256sums.txt "${base}/cardano-cli-${ver}-sha256sums.txt"
+          # Download under the asset's REAL name: sha256sums.txt lists the
+          # original filename, and `sha256sum -c -` resolves that name on
+          # disk. Saving as cardano-cli.tar.gz made the check look for a
+          # file that was never created ("No such file or directory").
+          tarball="cardano-cli-${ver}-x86_64-linux.tar.gz"
+          curl -fsSL -o "${tarball}" "${base}/${tarball}"
+          curl -fsSL -o sha256sums.txt "${base}/cardano-cli-${ver}-sha256sums.txt"
           grep "x86_64-linux.tar.gz" sha256sums.txt | sha256sum -c -
           mkdir -p "$HOME/.local/bin"
           # The archive contains a single file named cardano-cli-x86_64-linux,
           # not cardano-cli — verified by inspecting the real release asset
           # (`tar -tzf`) rather than assumed.
-          tar -xzf cardano-cli.tar.gz -C "$HOME/.local/bin"
+          tar -xzf "${tarball}" -C "$HOME/.local/bin"
           mv "$HOME/.local/bin/cardano-cli-x86_64-linux" "$HOME/.local/bin/cardano-cli"
           chmod +x "$HOME/.local/bin/cardano-cli"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
