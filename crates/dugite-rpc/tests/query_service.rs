@@ -92,20 +92,53 @@ impl LedgerContext for QueryMock {
         })
     }
     async fn era_history(&self) -> Result<EraHistoryView, RpcError> {
+        use dugite_rpc::EraBoundaryView;
         Ok(EraHistoryView {
-            summaries: vec![dugite_rpc::EraSummary {
-                era: Era::Conway,
-                first_slot: 0,
-                slot_length_ms: 1_000,
-                epoch_length_slots: 432_000,
-            }],
+            summaries: vec![
+                // Closed era: both start AND end must round-trip.
+                dugite_rpc::EraSummary {
+                    era: Era::Shelley,
+                    start: EraBoundaryView {
+                        time_ms: 1_596_059_091_000,
+                        slot: 0,
+                        epoch: 208,
+                    },
+                    end: Some(EraBoundaryView {
+                        time_ms: 1_598_051_091_000,
+                        slot: 1_728_000,
+                        epoch: 236,
+                    }),
+                    slot_length_ms: 1_000,
+                    epoch_length_slots: 432_000,
+                },
+                // Open (current) era: end must stay None, not a zeroed boundary.
+                dugite_rpc::EraSummary {
+                    era: Era::Conway,
+                    start: EraBoundaryView {
+                        time_ms: 1_666_656_000_000,
+                        slot: 1_728_000,
+                        epoch: 236,
+                    },
+                    end: None,
+                    slot_length_ms: 1_000,
+                    epoch_length_slots: 432_000,
+                },
+            ],
         })
     }
     async fn genesis(&self) -> Result<GenesisView, RpcError> {
         Ok(GenesisView {
             network_magic: 764_824_073,
+            network_id: "Mainnet".to_string(),
             system_start_unix: 1_596_059_091,
             security_param: 2_160,
+            epoch_length: 432_000,
+            slot_length: 1,
+            max_lovelace_supply: 45_000_000_000_000_000,
+            max_kes_evolutions: 62,
+            slots_per_kes_period: 129_600,
+            update_quorum: 5,
+            active_slots_coeff: Some((1, 20)),
         })
     }
     async fn submit_tx(&self, _: u16, _: &[u8]) -> SubmitOutcome {
@@ -386,6 +419,47 @@ async fn read_genesis_returns_cardano_envelope() {
     server.stop().await;
 }
 
+/// Issue #1009: every Shelley-genesis field GenesisView now carries must
+/// reach the client over the real wire — not just network_magic /
+/// security_param, which were the only ones ever asserted before.
+#[tokio::test]
+async fn read_genesis_populates_full_shelley_section() {
+    use dugite_rpc::proto::v1beta::cardano::big_int;
+    use dugite_rpc::proto::v1beta::query::query_service_client::QueryServiceClient;
+    use dugite_rpc::proto::v1beta::query::read_genesis_response::Config;
+    use dugite_rpc::proto::v1beta::query::ReadGenesisRequest;
+
+    let server = TestServer::start(make_mock()).await;
+    let mut client = QueryServiceClient::new(server.channel().await);
+    let resp = client
+        .read_genesis(ReadGenesisRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    let Config::Cardano(cardano) = resp.config.unwrap();
+
+    assert_eq!(cardano.network_id, "Mainnet");
+    assert_eq!(cardano.system_start, "1596059091");
+    assert_eq!(cardano.epoch_length, 432_000);
+    assert_eq!(cardano.slot_length, 1);
+    assert_eq!(cardano.max_kes_evolutions, 62);
+    assert_eq!(cardano.slots_per_kes_period, 129_600);
+    assert_eq!(cardano.update_quorum, 5);
+
+    let supply = cardano
+        .max_lovelace_supply
+        .expect("max_lovelace_supply set");
+    match supply.big_int.expect("big_int variant set") {
+        big_int::BigInt::Int(v) => assert_eq!(v, 45_000_000_000_000_000),
+        other => panic!("unexpected max_lovelace_supply variant: {other:?}"),
+    }
+
+    let coeff = cardano.active_slots_coeff.expect("active_slots_coeff set");
+    assert_eq!((coeff.numerator, coeff.denominator), (1, 20));
+
+    server.stop().await;
+}
+
 // ─── ReadEraSummary ──────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -403,6 +477,51 @@ async fn read_era_summary_returns_summaries() {
         .into_inner();
     let Summary::Cardano(summaries) = resp.summary.unwrap();
     assert!(!summaries.summaries.is_empty());
+    server.stop().await;
+}
+
+/// Issue #1009: `end` must round-trip for a closed era, and stay unset
+/// for the current (open) one — the mapper previously hardcoded
+/// `end: None` and `start.{time,epoch}: 0` for EVERY era regardless.
+#[tokio::test]
+async fn read_era_summary_populates_start_and_end_boundaries() {
+    use dugite_rpc::proto::v1beta::query::query_service_client::QueryServiceClient;
+    use dugite_rpc::proto::v1beta::query::read_era_summary_response::Summary;
+    use dugite_rpc::proto::v1beta::query::ReadEraSummaryRequest;
+
+    let server = TestServer::start(make_mock()).await;
+    let mut client = QueryServiceClient::new(server.channel().await);
+    let resp = client
+        .read_era_summary(ReadEraSummaryRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    let Summary::Cardano(summaries) = resp.summary.unwrap();
+    assert_eq!(summaries.summaries.len(), 2);
+
+    let shelley = &summaries.summaries[0];
+    assert_eq!(shelley.name, "shelley");
+    let start = shelley.start.as_ref().expect("start set");
+    assert_eq!(
+        (start.time, start.slot, start.epoch),
+        (1_596_059_091_000, 0, 208)
+    );
+    let end = shelley
+        .end
+        .as_ref()
+        .expect("closed era must carry an end boundary");
+    assert_eq!(
+        (end.time, end.slot, end.epoch),
+        (1_598_051_091_000, 1_728_000, 236)
+    );
+
+    let conway = &summaries.summaries[1];
+    assert_eq!(conway.name, "conway");
+    assert!(
+        conway.end.is_none(),
+        "the open (current) era must NOT carry a fabricated end boundary"
+    );
+
     server.stop().await;
 }
 

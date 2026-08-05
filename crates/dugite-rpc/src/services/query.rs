@@ -235,6 +235,14 @@ async fn search_utxos_response_beta(
 
 // ─── shared helpers ──────────────────────────────────────────────────────
 
+fn era_boundary_to_proto(b: &crate::context::EraBoundaryView) -> v1beta::cardano::EraBoundary {
+    v1beta::cardano::EraBoundary {
+        time: b.time_ms,
+        slot: b.slot,
+        epoch: b.epoch,
+    }
+}
+
 async fn ledger_tip_chain_point(
     ctx: &std::sync::Arc<dyn LedgerContext>,
 ) -> Result<v1beta::query::ChainPoint, Status> {
@@ -316,14 +324,32 @@ async fn read_genesis_response_beta(
     mask: &[String],
 ) -> Result<v1beta::query::ReadGenesisResponse, Status> {
     let view = ctx.genesis().await.map_err(Status::from)?;
+    // Byron / Alonzo / Conway sections and Shelley's gen_delegs /
+    // initial_funds / staking are deliberately left at proto-default —
+    // see GenesisView's doc comment for exactly why (real, bounded
+    // follow-up work, not a silent gap: those genesis structs aren't
+    // retained past node startup today).
     let cardano = v1beta::cardano::Genesis {
         network_magic: view.network_magic,
+        network_id: view.network_id,
         system_start: if view.system_start_unix > 0 {
             view.system_start_unix.to_string()
         } else {
             String::new()
         },
         security_param: view.security_param,
+        epoch_length: view.epoch_length,
+        slot_length: view.slot_length,
+        max_lovelace_supply: Some(crate::map::common::coin_bigint(view.max_lovelace_supply)),
+        max_kes_evolutions: view.max_kes_evolutions,
+        slots_per_kes_period: view.slots_per_kes_period,
+        update_quorum: view.update_quorum,
+        active_slots_coeff: view.active_slots_coeff.map(|(numerator, denominator)| {
+            v1beta::cardano::RationalNumber {
+                numerator,
+                denominator,
+            }
+        }),
         ..Default::default()
     };
     let response = v1beta::query::ReadGenesisResponse {
@@ -448,12 +474,12 @@ async fn read_era_summary_response_beta(
         .iter()
         .map(|s| v1beta::cardano::EraSummary {
             name: format!("{:?}", s.era).to_lowercase(),
-            start: Some(v1beta::cardano::EraBoundary {
-                time: 0,
-                slot: s.first_slot,
-                epoch: 0,
-            }),
-            end: None,
+            start: Some(era_boundary_to_proto(&s.start)),
+            end: s.end.as_ref().map(era_boundary_to_proto),
+            // Deliberately unset — see EraHistoryView's doc comment:
+            // dugite's ledger doesn't retain a per-era PParams history,
+            // only the current era's, so there is nothing truthful to
+            // put here for a past era.
             protocol_params: None,
         })
         .collect();
