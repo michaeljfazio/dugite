@@ -540,6 +540,18 @@ pub(crate) fn convert_validation_error(
         VE::TooManyCollateralInputs { max, actual } => {
             TxValidationError::TooManyCollateralInputs { max, actual }
         }
+        // No dedicated wire variant yet (dugite issue #1024, tracked
+        // alongside #979's "generic rejections" backlog) — falls back to the
+        // same generic-reason pattern already used for `MalformedProposal`
+        // below. The transaction is still correctly rejected; only the
+        // MsgRejectTx REASON is generic rather than a byte-exact
+        // `ConwayLedgerPredFailure` tag-6 frame.
+        VE::RefScriptsSizeTooBig { maximum, actual } => TxValidationError::ScriptFailed {
+            reason: format!(
+                "ConwayTxRefScriptsSizeTooBig: total ref-script size {actual} exceeds \
+                 per-transaction maximum {maximum}"
+            ),
+        },
         VE::CollateralNotFound(input) => TxValidationError::CollateralNotFound { input },
         VE::CollateralHasTokens(input) => TxValidationError::CollateralHasTokens { input },
         VE::CollateralMismatch { declared, computed } => {
@@ -885,6 +897,25 @@ pub(crate) fn convert_validation_error(
             action_type: action_type.to_string(),
             prev_action_id: prev_action_id.as_ref().map(gov_action_id_to_string),
             proposal,
+        },
+        // No dedicated wire variant yet (dugite issue #1021, tracked
+        // alongside #979's "generic rejections" backlog) — same
+        // generic-reason fallback pattern as `MalformedProposal` above. The
+        // transaction is still correctly rejected; only the MsgRejectTx
+        // REASON is generic rather than a byte-exact `ConwayGovPredFailure`
+        // tag-10 frame.
+        VE::ProposalCantFollow {
+            action_index,
+            target_major,
+            target_minor,
+            base_major,
+            base_minor,
+            ..
+        } => TxValidationError::ScriptFailed {
+            reason: format!(
+                "ProposalCantFollow: proposal index {action_index} target protocol version \
+                 {target_major}.{target_minor} cannot follow base {base_major}.{base_minor}"
+            ),
         },
         VE::UnelectedCommitteeVoters { hot_keys } => TxValidationError::UnelectedCommitteeVoters {
             // hot_keys are Hash32 (typed: byte 28 = 0x00 key, 0x01 script).
@@ -1416,8 +1447,8 @@ mod tests {
     /// requires removing it from the list — so the set cannot drift in either
     /// direction.
     ///
-    /// The reasons fall into three kinds, and only the third is outstanding
-    /// work:
+    /// The reasons fall into four kinds, and only the third and fourth are
+    /// outstanding work:
     ///
     /// * **Removed in Conway** — the rule that raised the failure no longer
     ///   exists, so the failure is structurally unreachable for a Conway
@@ -1430,6 +1461,11 @@ mod tests {
     ///   invented payload would reach cardano-cli as `DeserialiseFailure`,
     ///   which is strictly worse than the generic error. These need the ledger
     ///   error enriched first, exactly as #979 did for the four that were.
+    /// * **No wire arm yet** — unlike "payload insufficient," the ledger
+    ///   error already carries everything a typed frame would need; only the
+    ///   CBOR encoder arm itself hasn't been written. Newly-added predicates
+    ///   (found by this Conway-Phase-1 validation audit) land here until a
+    ///   follow-up wires the encoder — tracked alongside #979.
     #[test]
     fn remaining_generic_failures_are_a_closed_justified_set() {
         // (variant, why it is still generic)
@@ -1515,6 +1551,15 @@ mod tests {
             (
                 "ProposalProcedureNetworkIdMismatch",
                 "typed unless the offender list is empty",
+            ),
+            // ── No wire arm yet: payload is complete, encoder isn't written ──
+            (
+                "ProposalCantFollow",
+                "GOV 10 newly implemented (#1021); payload complete, no CBOR arm yet",
+            ),
+            (
+                "RefScriptsSizeTooBig",
+                "LEDGER 6 newly implemented (#1024); payload complete, no CBOR arm yet",
             ),
         ];
 
