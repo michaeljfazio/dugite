@@ -158,7 +158,7 @@ fn decode_babbage_block_mode(
     // -------------------------------------------------------------------------
     // 4. auxiliary_data_set
     // -------------------------------------------------------------------------
-    let aux_map = decode_alonzo_aux_data_map(&mut r)?;
+    let aux_map = decode_alonzo_aux_data_map(&mut r, Era::Babbage)?;
 
     // -------------------------------------------------------------------------
     // 5. invalid_transactions (definite OR indefinite)
@@ -1139,7 +1139,7 @@ pub(crate) fn decode_babbage_tx_standalone(cbor: &[u8]) -> Result<Transaction, S
             r.read_null()?;
             None
         } else {
-            Some(decode_alonzo_auxiliary_data(&mut r)?)
+            Some(decode_alonzo_auxiliary_data(&mut r, Era::Babbage)?)
         }
     };
 
