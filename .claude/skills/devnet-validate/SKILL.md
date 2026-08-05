@@ -57,6 +57,8 @@ Do NOT invoke for unit tests (`just test`), public-testnet soak (`scripts/soak/`
 
 A 7-minute round crosses exactly one epoch boundary. See `references/parameters.md` for the math and how to override per-run.
 
+**Per-round genesis overrides (#1036):** `setup.sh` accepts `LD_SHELLEY_SPEC_EXTRA=<path>` and `LD_CONWAY_SPEC_EXTRA=<path>`, each a JSON fragment merged as a THIRD overlay on top of the cardano-cli defaults and the repo spec (`jq -s '.[0] * .[1] * .[2]'`; a top-level `_comment` key in the fragment is stripped). Unset, the generated genesis is identical to the two-layer form. A set-but-missing/unparseable path fails setup loudly — never silently ignored. Checked-in fragments live in `testnet/local-devnet/config/spec/overlays/`: `kes-short.json` (`slotsPerKESPeriod=120`, `maxKESEvolutions=10` — KES death at slot 1200, for the KES round) and `gov-lifetime-2.json` (`govActionLifetime=2`, for the gov-expiry act). Rounds that need an overlay name it explicitly; no other round may assume one is active.
+
 ## Prerequisites — verify before starting
 
 ```bash

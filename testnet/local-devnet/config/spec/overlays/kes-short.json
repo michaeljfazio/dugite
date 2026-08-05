@@ -1,0 +1,5 @@
+{
+  "_comment": "Shelley spec overlay for kes-round.sh (#1036/#1037). Merged as the third layer via LD_SHELLEY_SPEC_EXTRA. slotsPerKESPeriod=120 x maxKESEvolutions=10 => the initial opcert's KES key is exhausted at slot 1200 (epoch 3 at epochLength=400), so KES expiry is reachable inside a ~30 min round. Devnet default (from the cardano-cli defaults layer) is 129600 x 60 — KES structurally never expires.",
+  "slotsPerKESPeriod": 120,
+  "maxKESEvolutions": 10
+}
