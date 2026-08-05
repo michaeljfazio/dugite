@@ -51,8 +51,8 @@ after `v1alpha` was frozen. The spec is pinned in-tree at
 | `SyncService` | `FollowTip` (stream) | ✅ implemented |
 | `QueryService` | `ReadParams` | ✅ implemented |
 | `QueryService` | `ReadUtxos` | ✅ implemented |
-| `QueryService` | `ReadGenesis` | ✅ implemented (minimum-viable envelope) |
-| `QueryService` | `ReadEraSummary` | ✅ implemented |
+| `QueryService` | `ReadGenesis` | ✅ implemented (Shelley-genesis section — see [Limitations](#limitations)) |
+| `QueryService` | `ReadEraSummary` | ✅ implemented (real per-era `start`/`end` boundaries) |
 | `QueryService` | `SearchUtxos` | ✅ implemented (`exact_address` / `payment_part` / `delegation_part` / `asset` plus `not` / `all_of` / `any_of` composites) |
 | `QueryService` | `ReadData` | ✅ implemented (bounded scan: live inline datums + mempool tx witness sets) |
 | `QueryService` | `ReadTx` | ✅ implemented (bounded scan: mempool + last ~43 200 slots of VolatileDB) |
@@ -190,6 +190,22 @@ updated, or vice versa) are caught by code review against the diff.
 
 ## Limitations
 
+* `ReadGenesis` populates the full Shelley-genesis section of
+  `cardano.Genesis` (network_magic, network_id, system_start,
+  security_param, epoch_length, slot_length, max_lovelace_supply,
+  max_kes_evolutions, slots_per_kes_period, update_quorum,
+  active_slots_coeff — 10 of the message's 34 fields). Byron
+  (`avvm_distr`, `boot_stakeholders`, `heavy_delegation`, `vss_certs`,
+  ...), Alonzo (`cost_models`, `execution_prices`, ...), and Conway
+  (`committee`, `constitution`, `drep_voting_thresholds`, ...) sections
+  are unset, as are Shelley's `gen_delegs` / `initial_funds` / `staking`
+  — those genesis structs aren't retained past `dugite-node` startup
+  today. Tracked as
+  [#1009](https://github.com/michaeljfazio/dugite/issues/1009).
+* `ReadEraSummary`'s per-era `protocol_params` is unset: dugite's ledger
+  retains only the CURRENT era's `PParams`, not a per-era history, so
+  there is nothing truthful to report for a past era. `start` / `end`
+  boundaries ARE real (slot, epoch, and absolute wall-clock ms).
 * `SearchUtxos` with a fully-wildcard predicate (no `match` /
   combinators) is rejected with `UNIMPLEMENTED`: dugite refuses to
   materialise the entire UTxO set in a single response. Supply at
