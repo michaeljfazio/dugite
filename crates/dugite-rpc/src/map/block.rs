@@ -11,10 +11,10 @@ use dugite_primitives::block::Block;
 /// Map a `dugite_primitives::Block` to the parsed Cardano protobuf shape.
 ///
 /// `timestamp` is left at zero — populating it requires the era-history
-/// projection (`EraHistoryView`) which lives behind `LedgerContext`.
-/// M2's QueryService work fills it; M1.B sync clients that need the
-/// wall-clock can either re-derive from `header.slot` + ReadEra or
-/// parse `native_bytes` themselves.
+/// projection (`EraHistoryView`, behind `LedgerContext`), which this
+/// pure mapping function does not have access to. Not done; clients
+/// that need the wall-clock can either re-derive from `header.slot` +
+/// `ReadEraSummary` or parse `native_bytes` themselves.
 pub fn block_to_proto(block: &Block) -> pb_cardano::Block {
     let header = pb_cardano::BlockHeader {
         slot: block.header.slot.0,

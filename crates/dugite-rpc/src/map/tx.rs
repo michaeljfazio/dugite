@@ -1,12 +1,10 @@
 //! `dugite_primitives::Transaction` → `utxorpc.v1beta.cardano.Tx` mapping.
 //!
-//! M1.B scope: every field of `Tx` that maps from a single concrete
-//! dugite type — inputs, outputs, fee, mint, withdrawals, validity,
-//! successful, auxiliary-data hash (in `auxiliary.metadata` as a stub
-//! marker), and hash. M2 fills in `certificates`, `witnesses`,
-//! `collateral` (Plutus-redeemer chain), `auxiliary.scripts`,
-//! `proposals`, `votes` — they all need the cross-cutting cert /
-//! governance / script / plutus_data / metadatum mapping modules.
+//! Every `Tx` field is populated: inputs, outputs, fee, mint,
+//! withdrawals, validity, successful, hash, certificates, witnesses,
+//! collateral (Plutus-redeemer chain), proposals, and votes — the last
+//! four via the cross-cutting `cert` / `governance` / `script` /
+//! `plutus_data` mapping modules.
 
 use crate::map::common::{coin_bigint, hash_bytes, signed_bigint};
 use crate::proto::v1beta::cardano as pb;
@@ -17,13 +15,14 @@ use dugite_primitives::value::Value;
 
 /// Map one [`Transaction`] to its [`pb::Tx`] protobuf shape.
 ///
-/// As of the cert/script/plutus_data/metadatum mapping follow-up,
-/// every Tx field with a single-source-of-truth dugite type is
+/// Every `Tx` field with a single-source-of-truth dugite type is
 /// populated: inputs / outputs / certificates / withdrawals / mint /
 /// reference_inputs / witnesses (vkey + scripts + plutus_data) /
 /// collateral / fee / validity / successful / auxiliary (metadata +
-/// scripts) / hash. `proposals` and `votes` (governance) need
-/// dedicated mapping modules and stay empty for now.
+/// scripts) / hash / proposals / votes. `TxInput.as_output` (needs a
+/// ledger lookup — see `tx_input_to_proto`) and `TxOutput.script`
+/// (reference scripts on outputs) remain unmapped; both are documented
+/// at their call sites, not silently dropped.
 pub fn tx_to_proto(tx: &Transaction) -> pb::Tx {
     pb::Tx {
         inputs: tx.body.inputs.iter().map(tx_input_to_proto).collect(),
@@ -166,11 +165,15 @@ fn tx_input_to_proto(input: &TransactionInput) -> pb::TxInput {
         tx_hash: hash_bytes(&input.transaction_id),
         output_index: input.index,
         // `as_output` resolves the spent UTxO content. Populating it
-        // requires a ledger lookup at map time, which couples the
-        // mapper to LedgerContext. Deferred to M2 where the QueryService
-        // path naturally has the UTxO available.
+        // requires a ledger lookup at map time, which would couple this
+        // pure mapping module to `LedgerContext` — not done; a future
+        // caller with UTxO access on hand (e.g. `QueryService`) could
+        // fill it in after the fact instead.
         as_output: None,
-        // Redeemer mapping requires the M2 PlutusData mapper.
+        // Per-input redeemer linkage needs index-matching against
+        // `WitnessSet.redeemers` (`RedeemerTag::Spend` + the input's
+        // position) — not done; `redeemer_to_proto` below already maps
+        // the underlying `PlutusData`, this is purely the linking step.
         redeemer: None,
     }
 }
@@ -181,8 +184,11 @@ pub fn tx_output_to_proto(out: &TransactionOutput) -> pb::TxOutput {
         coin: Some(coin_bigint(out.value.coin.0)),
         assets: assets_from_value(&out.value),
         datum: datum_to_proto(&out.datum),
-        // Reference scripts attached to outputs need the M2 Script
-        // mapper (native vs plutus_v1/v2/v3).
+        // `out.script_ref` (native / plutus_v1-v4) is not mapped to
+        // `pb::Script` here yet, despite `crate::map::script` already
+        // covering the same variants for witness-set scripts — not
+        // done, tracked informally rather than under a stale milestone
+        // name.
         script: None,
         // Pass-through of the verbatim CBOR if the decoder retained it.
         // Clients verifying datum-hash / address bytes can trust this.
@@ -235,37 +241,40 @@ fn mint_to_proto(
 fn datum_to_proto(datum: &OutputDatum) -> Option<pb::Datum> {
     match datum {
         OutputDatum::None => None,
+        // Hash-only datum: no parsed payload was ever received on the
+        // wire, so there is nothing for `plutus_data::plutus_data_to_proto`
+        // to map — `payload`/`original_cbor` stay unset (not a gap;
+        // hash-only datums structurally have neither).
         OutputDatum::DatumHash(h) => Some(pb::Datum {
             hash: hash_bytes(h),
-            // Datum payload + original_cbor land in M2's PlutusData
-            // mapper (inline datums carry a parsed payload; hash-only
-            // datums have neither).
             payload: None,
             original_cbor: None,
         }),
-        OutputDatum::InlineDatum { raw_cbor, .. } => Some(pb::Datum {
+        OutputDatum::InlineDatum { data, raw_cbor } => Some(pb::Datum {
             // The on-chain hash of an inline datum is `blake2b_256` of
             // its CBOR; computing it on the hot path would re-hash on
             // every map. Clients that need the hash can re-derive from
             // `original_cbor`.
             hash: Vec::new(),
-            payload: None, // M2 PlutusData mapper
+            payload: Some(crate::map::plutus_data::plutus_data_to_proto(data)),
             original_cbor: raw_cbor.clone(),
         }),
     }
 }
 
 fn aux_to_proto(tx: &Transaction) -> Option<pb::AuxData> {
-    // M1.B: empty AuxData when there is no auxiliary-data hash. With one,
-    // emit an empty AuxData so downstream clients can detect presence —
-    // M2 fills `metadata` + `scripts` once the metadatum mapper lands.
-    if tx.body.auxiliary_data_hash.is_none() && tx.auxiliary_data.is_none() {
-        None
-    } else {
-        Some(pb::AuxData {
+    // `auxiliary_data` carries the full parsed metadata + scripts (via
+    // `crate::map::metadatum::aux_data_to_proto`); `auxiliary_data_hash`
+    // alone (no parsed witness-set aux data available to this mapping
+    // call) is downgraded to an empty `AuxData` so a client can at
+    // least detect presence.
+    match (&tx.auxiliary_data, &tx.body.auxiliary_data_hash) {
+        (Some(aux), _) => Some(crate::map::metadatum::aux_data_to_proto(aux)),
+        (None, Some(_)) => Some(pb::AuxData {
             metadata: Vec::new(),
             scripts: Vec::new(),
-        })
+        }),
+        (None, None) => None,
     }
 }
 
@@ -357,6 +366,50 @@ mod tests {
             raw_body_cbor: None,
             raw_witness_cbor: None,
         }
+    }
+
+    #[test]
+    fn tx_with_auxiliary_data_maps_metadata_via_metadatum_module() {
+        // `aux_to_proto` previously always emitted an empty `AuxData`
+        // (metadata: [], scripts: []) even when `tx.auxiliary_data` held
+        // real metadata — `crate::map::metadatum::aux_data_to_proto`
+        // existed, fully implemented, but was never called from here.
+        let mut tx = minimal_tx([9u8; 32], 1);
+        let mut metadata = BTreeMap::new();
+        metadata.insert(42u64, TransactionMetadatum::Int(7));
+        tx.auxiliary_data = Some(AuxiliaryData {
+            metadata,
+            native_scripts: vec![],
+            plutus_v1_scripts: vec![],
+            plutus_v2_scripts: vec![],
+            plutus_v3_scripts: vec![],
+            raw_cbor: None,
+        });
+        let pb = tx_to_proto(&tx);
+        let aux = pb
+            .auxiliary
+            .expect("auxiliary set when auxiliary_data present");
+        assert_eq!(
+            aux.metadata.len(),
+            1,
+            "metadata must be mapped, not dropped"
+        );
+        assert_eq!(aux.metadata[0].label, 42);
+    }
+
+    #[test]
+    fn tx_with_only_auxiliary_data_hash_emits_empty_aux_data() {
+        // No parsed `auxiliary_data` (e.g. mempool tx before the witness
+        // set round-trips), but the body declares a hash — still signal
+        // presence with an empty AuxData rather than None.
+        let mut tx = minimal_tx([10u8; 32], 1);
+        tx.body.auxiliary_data_hash = Some(dugite_primitives::hash::Hash32::from_bytes([1u8; 32]));
+        let pb = tx_to_proto(&tx);
+        let aux = pb
+            .auxiliary
+            .expect("auxiliary set when only the hash is known");
+        assert!(aux.metadata.is_empty());
+        assert!(aux.scripts.is_empty());
     }
 
     #[test]

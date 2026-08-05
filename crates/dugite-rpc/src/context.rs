@@ -11,10 +11,12 @@
 //! lets service code map cleanly to gRPC status codes via
 //! `error::RpcError::into::<tonic::Status>()`.
 //!
-//! In M1.A only a handful of methods need a real implementation
-//! (`tip`, `block_by_hash`, `block_at_slot`, `intersect`, `genesis`); the
-//! rest can return `RpcError::Unimplemented` until the relevant service
-//! implementation lands.
+//! Every service (`SyncService` / `QueryService` / `SubmitService` /
+//! `WatchService`) is implemented end-to-end, so a production
+//! `LedgerContext` impl needs every method above to actually work.
+//! `RpcError::Unimplemented` remains for genuinely optional capabilities
+//! a given host may not support (e.g. `utxos_by_payment_credential`
+//! without a payment-credential index).
 
 use async_trait::async_trait;
 use dugite_primitives::address::Address;
@@ -42,9 +44,12 @@ pub struct TipInfo {
 /// A block in its native CBOR form, paired with the indexable metadata
 /// the RPC layer needs without re-decoding.
 ///
-/// `cbor` is borrowed-style ownership: the caller can either hand back the
-/// `ChainDB` slice directly (in M1.B we wrap it in `Bytes` for zero-copy)
-/// or allocate a `Vec`. For M1.A we use `Vec<u8>` for simplicity.
+/// `cbor` is plain `Vec<u8>`, not a zero-copy `bytes::Bytes` handle into
+/// the `ChainDB` slice — deliberately, for simplicity, at the cost of
+/// one extra copy per call. A `LedgerContext` impl that can hand back a
+/// borrowed/`Bytes`-backed slice without copying would need this field
+/// widened; not done, and not a behavioural gap (every field is still
+/// populated correctly), just an unclaimed allocation optimisation.
 #[derive(Clone, Debug)]
 pub struct RawBlock {
     pub slot: u64,
@@ -78,9 +83,9 @@ pub struct UtxoSnapshot {
 
 /// Opaque protocol-params view returned by [`LedgerContext::params_at_tip`].
 ///
-/// Wraps the in-tree `ProtocolParameters` so M1.B mapping can read every
-/// field without `dugite-rpc` re-shaping it. `Arc` so adapter calls are
-/// cheap — params change only at epoch boundaries.
+/// Wraps the in-tree `ProtocolParameters` so `crate::map::pparams` can
+/// read every field without `dugite-rpc` re-shaping it. `Arc` so adapter
+/// calls are cheap — params change only at epoch boundaries.
 #[derive(Clone, Debug)]
 pub struct ParamsView {
     pub params: Arc<dugite_primitives::protocol_params::ProtocolParameters>,
@@ -91,8 +96,12 @@ pub struct ParamsView {
 
 /// Opaque era-history view returned by [`LedgerContext::era_history`].
 ///
-/// Refined into a richer shape in M1.B as the QueryService mapping needs
-/// it; this M1.A placeholder is just enough to compile.
+/// Deliberately minimal today: [`EraSummary`] carries only `start`
+/// (`first_slot`), not an era's `end` boundary or its `PParams` — both
+/// of which `QueryService.ReadEraSummary`'s wire shape has room for and
+/// currently emits unset. Tracked as
+/// <https://github.com/michaeljfazio/dugite/issues/1009> (needs
+/// `dugite-node`-side plumbing outside this crate).
 #[derive(Clone, Debug, Default)]
 pub struct EraHistoryView {
     /// Era boundaries: `(era, first_slot, slot_length_ms, epoch_length_slots)`
@@ -110,10 +119,13 @@ pub struct EraSummary {
 
 /// Opaque genesis view returned by [`LedgerContext::genesis`].
 ///
-/// Currently a placeholder. M1.B fills the fields the QueryService
-/// `ReadGenesis` response needs (system start, network magic, genesis
-/// pool params, security parameter, etc.) without coupling this crate
-/// to `dugite-ledger::CombinedGenesis`.
+/// Deliberately minimal today: `cardano.Genesis` (the utxorpc wire
+/// shape) has 34 fields spanning Byron/Shelley/Alonzo/Conway; this view
+/// carries 3, so `QueryService.ReadGenesis` answers with a near-empty
+/// message. Widening this needs `dugite-ledger::CombinedGenesis`
+/// threaded through the `dugite-node`-side `LedgerContext` impl — outside
+/// this crate. Tracked as
+/// <https://github.com/michaeljfazio/dugite/issues/1009>.
 #[derive(Clone, Debug, Default)]
 pub struct GenesisView {
     pub network_magic: u32,
