@@ -1,0 +1,128 @@
+[
+  {
+    "id": "gr01-txfeeperbyte-below-min",
+    "param_key": "0",
+    "cli_args": ["--min-fee-linear", "0"],
+    "expect": "guardrail-reject",
+    "predicate_class": "min-bound",
+    "bound": "minValue 30 (txFeePerByte must not be lower than 30)",
+    "notes": "Devnet current minFeeA=44. Zero is a legal CLI value (LOVELACE >= 0), so the rejection must come from the guardrail script phase-2 failure, not arg parsing."
+  },
+  {
+    "id": "gr02-txfeefixed-below-min",
+    "param_key": "1",
+    "cli_args": ["--min-fee-constant", "50000"],
+    "expect": "guardrail-reject",
+    "predicate_class": "min-bound",
+    "bound": "minValue 100000 (txFeeFixed must not be lower than 100,000)",
+    "notes": "Devnet current minFeeB=155381."
+  },
+  {
+    "id": "gr03-maxblockbodysize-above-max",
+    "param_key": "2",
+    "cli_args": ["--max-block-body-size", "150000"],
+    "expect": "guardrail-reject",
+    "predicate_class": "max-bound",
+    "bound": "maxValue 122880 (maxBlockBodySize must not exceed 122,880 bytes)",
+    "notes": "Devnet current maxBlockBodySize=90112. 150000 fits WORD32, so CLI accepts it and the script must reject."
+  },
+  {
+    "id": "gr04-maxtxsize-above-max",
+    "param_key": "3",
+    "cli_args": ["--max-tx-size", "40000"],
+    "expect": "guardrail-reject",
+    "predicate_class": "max-bound",
+    "bound": "maxValue 32768 (maxTxSize must not exceed 32,768 bytes)",
+    "notes": "Devnet current maxTxSize=16384."
+  },
+  {
+    "id": "gr05-utxocostperbyte-zero-disabled",
+    "param_key": "17",
+    "cli_args": ["--utxo-cost-per-byte", "0"],
+    "expect": "guardrail-reject",
+    "predicate_class": "disabled",
+    "bound": "notEqual 0 (utxoCostPerByte must not be zero; also violates minValue 3000)",
+    "notes": "Setting the param to 0 disables min-UTxO enforcement; the constitution forbids it with an explicit notEqual predicate. NOTE: the removed pre-Conway params (PPU keys 12-15: d, extraEntropy, protocolVersion, minUTxOValue) are absent from the constitution table AND have no Conway cardano-cli flags, so the absent-key reject path (runRules LT branch) is not producible via CLI; notEqual-0 is the representable 'disabled' form."
+  },
+  {
+    "id": "gr06-committeetermlength-zero-disabled",
+    "param_key": "28",
+    "cli_args": ["--committee-term-length", "0"],
+    "expect": "guardrail-reject",
+    "predicate_class": "disabled",
+    "bound": "notEqual 0 (committeeMaxTermLimit must not be zero; also violates minValue 18)",
+    "notes": "Devnet current committeeMaxTermLength=73. Term length 0 would disable committee rotation."
+  },
+  {
+    "id": "gr07-pricememory-above-max-dependent",
+    "param_key": "19[0]",
+    "cli_args": ["--price-execution-memory", "3000/10000", "--price-execution-steps", "721/10000000"],
+    "expect": "guardrail-reject",
+    "predicate_class": "dependent-pair",
+    "bound": "19[0] maxValue 2000/10000 (priceMemory must not exceed 0.2); paired priceSteps 721/10000000 is inside its own 500/10000000..2000/10000000 range",
+    "notes": "cardano-cli groups these flags: [--price-execution-steps RATIONAL --price-execution-memory RATIONAL] must be supplied together (PPU key 19 is one ExPrices pair). Only the memory half violates; the reject proves the script checks each half of the compound value."
+  },
+  {
+    "id": "gr08-pricesteps-below-min-dependent",
+    "param_key": "19[1]",
+    "cli_args": ["--price-execution-memory", "577/10000", "--price-execution-steps", "400/10000000"],
+    "expect": "guardrail-reject",
+    "predicate_class": "dependent-pair",
+    "bound": "19[1] minValue 500/10000000 (priceSteps must not be lower than 0.00005); paired priceMemory 577/10000 is inside its own 400/10000..2000/10000 range",
+    "notes": "Mirror of gr07 with the violation on the steps half."
+  },
+  {
+    "id": "gr09-monetaryexpansion-above-max",
+    "param_key": "10",
+    "cli_args": ["--monetary-expansion", "1/100"],
+    "expect": "guardrail-reject",
+    "predicate_class": "rational-range",
+    "bound": "maxValue 5/1000 (monetaryExpansion must not exceed 0.005)",
+    "notes": "Devnet current rho=0.003. 1/100=0.01 is a valid unit interval for the CLI, so the reject is the script's."
+  },
+  {
+    "id": "gr10-treasurycut-below-min",
+    "param_key": "11",
+    "cli_args": ["--treasury-expansion", "5/100"],
+    "expect": "guardrail-reject",
+    "predicate_class": "rational-range",
+    "bound": "minValue 10/100 (treasuryCut must not be lower than 0.1)",
+    "notes": "Devnet current tau=0.2."
+  },
+  {
+    "id": "gr11-govdeposit-below-floor",
+    "param_key": "30",
+    "cli_args": ["--new-governance-action-deposit", "500000"],
+    "expect": "guardrail-reject",
+    "predicate_class": "gov-deposit-floor",
+    "bound": "minValue 1000000 (govDeposit must not be lower than 1,000,000 lovelace)",
+    "notes": "Devnet current govActionDeposit=100000000000 (inside the 1M..10T constitution range). Do not confuse the proposed VALUE with the deposit PAID by this proposal, which stays at the current 100000000000."
+  },
+  {
+    "id": "gr12-costmodel-malformed",
+    "param_key": "18",
+    "cli_args": ["--cost-model-file", "COST_MODEL_FILE_PLACEHOLDER"],
+    "expect": "guardrail-reject",
+    "predicate_class": "cost-model-malformed",
+    "bound": "none in the constitution: key 18 (costMdls) is type 'any' -> ParamAny; the guardrail script accepts ANY well-formed cost-model value",
+    "notes": "The round must materialize a malformed cost-model JSON at the placeholder path, e.g. {\"PlutusV3\": \"not-an-array\"} (cardano-cli fails with 'cannot parse value') or an unknown key like {\"PlutusV9\": [0]}. Rejection happens at the CLI/ledger layer (upstream check_invalid_proposals accepts 'cannot parse value' and 'MalformedProposal ... ParameterChange'), NOT as a plutus script failure — a well-formed but zero-valued model would be ACCEPTED by the guardrail (ParamAny). Beware: Conway ledger pads short cost-model arrays for known languages, so a merely-short array may be accepted end-to-end."
+  },
+  {
+    "id": "gr13-valid-txfeeperbyte-tweak",
+    "param_key": "0",
+    "cli_args": ["--min-fee-linear", "50"],
+    "expect": "accept",
+    "predicate_class": "valid",
+    "bound": "inside 30..1000 (all three predicates on key 0 satisfied: >=30, <=1000, >=0)",
+    "notes": "Small tweak from devnet current minFeeA=44. Proposal is only SUBMITTED (lands in gov state) — never voted through, so live devnet fees do not change."
+  },
+  {
+    "id": "gr14-valid-stakeaddressdeposit",
+    "param_key": "5",
+    "cli_args": ["--key-reg-deposit-amt", "3000000"],
+    "expect": "accept",
+    "predicate_class": "valid",
+    "bound": "inside 1000000..5000000 (all three predicates on key 5 satisfied: >=1M, <=5M, >=0)",
+    "notes": "Devnet current keyDeposit=2000000. Accepted means the proposal appears in `query gov-state` proposals after submit; no votes are cast, so the live value stays 2000000."
+  }
+]
