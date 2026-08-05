@@ -33,6 +33,22 @@
 //! #951 was caught only because the two disagreed. Haskell-derived fixtures
 //! remain the oracle; this raises reachability.
 //!
+//! ## Indefinite-length map coverage (#1012)
+//!
+//! `read_protocol_param_update` / `read_pre_conway_protocol_param_update` used
+//! to drive their key loop from `read_map_header()?.unwrap_or(0)`, silently
+//! decoding an INDEFINITE-length CBOR map as zero entries. dugite's own PPU
+//! encoder can never reach that shape to test it: oracle-verified against
+//! `IntersectMBO/cardano-ledger`, Haskell's `encCBOR (PParamsUpdate era)` uses
+//! `encodeMapLen` (always definite), not the size-dependent `encodeMap`
+//! #932/#938 cover — so a `decode(encode(x)) == x` round trip through EITHER
+//! implementation's own encoder can never produce an indefinite-length PPU
+//! map, and could not have caught this. `to_indefinite_map` mechanically
+//! rewrites the (always-definite) encoder output into the indefinite form —
+//! the only way this target can reach it — and asserts it decodes to the
+//! SAME value across the generator's full input space, not just the one
+//! hand-built fixture in `era_conway.rs`'s unit tests.
+//!
 //! Run with: cargo +nightly fuzz run fuzz_structured_pparam_update -- -max_total_time=300
 
 #![no_main]
@@ -111,6 +127,50 @@ fn round_trip(
         hex(&encoded),
         hex(&re_encoded),
     );
+
+    // #1012: an indefinite-length encoding of the exact same entries must
+    // decode to the exact same value. `to_indefinite_map` derives it
+    // mechanically from `encoded` rather than re-deriving the key table by
+    // hand, so this tracks whatever key set/order the generator produced.
+    let indefinite = to_indefinite_map(&encoded);
+    let indefinite_decoded = match decode(&indefinite) {
+        Ok(p) => p,
+        Err(e) => panic!(
+            "{label}: indefinite-length PPU map must decode (#1012): {e}\n\
+             definite   = {}\n\
+             indefinite = {}",
+            hex(&encoded),
+            hex(&indefinite),
+        ),
+    };
+    assert!(
+        decoded == indefinite_decoded,
+        "{label}: indefinite-length PPU map decoded to a DIFFERENT value than \
+         the definite form (#1012 — the pre-fix decoder silently read this as \
+         zero entries).\n\
+         definite-decoded   = {decoded:#?}\n\
+         indefinite-decoded = {indefinite_decoded:#?}",
+    );
+}
+
+/// Rewrite a buffer whose first bytes are a DEFINITE-length CBOR map header
+/// into the equivalent INDEFINITE-length form (`0xbf` ... `0xff`), leaving
+/// every entry byte untouched. `encode_map_header` (`cbor.rs`) only ever
+/// emits the 1-, 2-, 3- or 5-byte definite forms for the key counts a PPU can
+/// have; the 9-byte form is handled for completeness.
+fn to_indefinite_map(definite: &[u8]) -> Vec<u8> {
+    let header_len = match definite[0] {
+        0xa0..=0xb7 => 1,
+        0xb8 => 2,
+        0xb9 => 3,
+        0xba => 5,
+        0xbb => 9,
+        other => panic!("not a definite-length CBOR map header: {other:#x}"),
+    };
+    let mut out = vec![0xbf];
+    out.extend_from_slice(&definite[header_len..]);
+    out.push(0xff);
+    out
 }
 
 fn hex(bytes: &[u8]) -> String {

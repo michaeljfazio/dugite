@@ -2192,9 +2192,31 @@ fn read_protocol_param_update(
     r: &mut Reader<'_>,
 ) -> Result<ProtocolParamUpdate, SerializationError> {
     let mut ppu = ProtocolParamUpdate::default();
-    let map_len = r.read_map_header()?;
-    let n = map_len.unwrap_or(0) as usize;
-    for _ in 0..n {
+    // `for_each_map_entry` handles BOTH definite- and indefinite-length CBOR
+    // maps (issue #1012). The previous `read_map_header()?.unwrap_or(0)`
+    // silently decoded an indefinite-length map as ZERO entries and desynced
+    // the reader for everything after it — this is the tx-body key 6 /
+    // governance `ParameterChange` decoder, so a >23-key update (crossing
+    // `cardano-ledger-binary`'s `encodeMap` indefinite threshold, #932/#938)
+    // installed NO parameters at all while cardano-node installed the real
+    // set: a consensus divergence. Oracle-verified against
+    // `IntersectMBO/cardano-ledger@4849c13d6f70e5ab46add9af6e0ec5c537b61f69`,
+    // `libs/cardano-ledger-core/.../PParams.hs` `DecCBOR (PParamsUpdate era)`:
+    // every released era (PV<=11, including Conway) decodes via
+    // `decode $ SparseKeyed name emptyPParamsUpdate updateField []`, whose
+    // `decodeSparse` calls `decodeMapLenOrIndef` and, on `Nothing`, loops via
+    // `getSparseBlockIndef` until `decodeBreakOr` — i.e. both the definite
+    // and indefinite forms are honored, matching `for_each_map_entry` here
+    // (and the sibling fix already applied to `read_pre_conway_protocol_param_update`
+    // in `era_shelley.rs`, faaaed42d8).
+    //
+    // NOTE (separate, NOT fixed here): the same oracle lookup found that
+    // Haskell hard-rejects a truly unrecognized key (`updateField k` falls
+    // through to `invalidField k` -> `cborError`), where dugite's `_ => skip`
+    // arm below silently tolerates it. That is a second, independent
+    // divergence from the one this function fixes — see the issue tracker
+    // for the follow-up rather than conflating the two here.
+    r.for_each_map_entry(|r| {
         let key = r.read_uint()?;
         match key {
             0 => ppu.min_fee_a = Some(r.read_uint()?),
@@ -2238,11 +2260,11 @@ fn read_protocol_param_update(
             24 => ppu.max_collateral_inputs = Some(r.read_uint()?),
             25 => {
                 // pool_voting_thresholds
-                ppu = read_pool_voting_thresholds(r, ppu)?;
+                read_pool_voting_thresholds(r, &mut ppu)?;
             }
             26 => {
                 // drep_voting_thresholds
-                ppu = read_drep_voting_thresholds(r, ppu)?;
+                read_drep_voting_thresholds(r, &mut ppu)?;
             }
             27 => ppu.min_committee_size = Some(r.read_uint()?),
             28 => ppu.committee_term_limit = Some(r.read_uint()?),
@@ -2286,7 +2308,8 @@ fn read_protocol_param_update(
                 r.skip()?;
             }
         }
-    }
+        Ok(())
+    })?;
     Ok(ppu)
 }
 
@@ -2368,8 +2391,8 @@ pub(crate) fn read_ex_units(r: &mut Reader<'_>) -> Result<ExUnits, Serialization
 
 fn read_pool_voting_thresholds(
     r: &mut Reader<'_>,
-    mut ppu: ProtocolParamUpdate,
-) -> Result<ProtocolParamUpdate, SerializationError> {
+    ppu: &mut ProtocolParamUpdate,
+) -> Result<(), SerializationError> {
     // pool_voting_thresholds = [5 rationals]
     let arr_len = r.read_array_header()?;
     if !matches!(arr_len, Some(5)) {
@@ -2391,13 +2414,13 @@ fn read_pool_voting_thresholds(
     ppu.pvt_committee_no_confidence = Some(cvt(committee_no_confidence));
     ppu.pvt_hard_fork = Some(cvt(hard_fork));
     ppu.pvt_pp_security_group = Some(cvt(security));
-    Ok(ppu)
+    Ok(())
 }
 
 fn read_drep_voting_thresholds(
     r: &mut Reader<'_>,
-    mut ppu: ProtocolParamUpdate,
-) -> Result<ProtocolParamUpdate, SerializationError> {
+    ppu: &mut ProtocolParamUpdate,
+) -> Result<(), SerializationError> {
     // drep_voting_thresholds = [10 rationals]
     let arr_len = r.read_array_header()?;
     if !matches!(arr_len, Some(10)) {
@@ -2429,7 +2452,7 @@ fn read_drep_voting_thresholds(
     ppu.dvt_pp_technical_group = Some(cvt(pp_technical));
     ppu.dvt_pp_gov_group = Some(cvt(pp_governance));
     ppu.dvt_treasury_withdrawal = Some(cvt(treasury));
-    Ok(ppu)
+    Ok(())
 }
 
 // ============================================================================
@@ -4166,6 +4189,191 @@ mod tests {
         assert_eq!(ppu.min_fee_a, Some(44));
         assert_eq!(ppu.min_fee_b, Some(155381));
         assert_eq!(ppu.min_pool_cost, None);
+    }
+
+    // ── #1012: indefinite-length ProtocolParamUpdate maps ──────────────────────
+    //
+    // `read_protocol_param_update` used to drive its key loop from
+    // `read_map_header()?.unwrap_or(0)`, so an indefinite-length map (`None`)
+    // decoded as ZERO entries and left the reader desynced for everything
+    // after it. This is the tx-body key 6 / governance `ParameterChange`
+    // decoder, so a `ParameterChange` proposal spanning more than 23 keys
+    // (crossing `cardano-ledger-binary`'s `encodeMap` indefinite threshold,
+    // #932/#938) would install NO parameters at all — a consensus divergence.
+    //
+    // Oracle-verified against `IntersectMBO/cardano-ledger` at pinned SHA
+    // `4849c13d6f70e5ab46add9af6e0ec5c537b61f69` (confirmed resolving via
+    // `gh api repos/IntersectMBO/cardano-ledger/commits/<sha>`):
+    // `DecCBOR (PParamsUpdate era)` (`libs/cardano-ledger-core/src/Cardano/
+    // Ledger/Core/PParams.hs`) decodes via `decodeSparse`, which calls
+    // `decodeMapLenOrIndef` and, on `Nothing`, loops via `getSparseBlockIndef`
+    // until the CBOR break byte — both forms are honored on the Haskell side.
+    //
+    // These fixtures are HAND-BUILT bytes, not `encode(decode(x))` round
+    // trips: dugite's own PPU encoder (`encode_ppu_map` in
+    // `encode/protocol_params.rs`) is, correctly per the same oracle lookup,
+    // ALWAYS definite-length (`encodeMapLen count` on the Haskell side has no
+    // size-dependent branching, unlike the general `encodeMap` #932/#938
+    // covers) — so a same-process round trip through dugite's own encoder can
+    // NEVER produce an indefinite-length PPU map and could not have caught
+    // this. Only a hand-built or Haskell-derived fixture reaches it, per
+    // CLAUDE.md's standing round-trip caveat.
+
+    /// Every key `read_protocol_param_update` recognizes: the 30 Conway keys
+    /// (0-11, 16-33) plus the 4 Dijkstra additions (34-37) the function also
+    /// accepts unconditionally (see the "Dijkstra-era PParams" comment on the
+    /// decoder). 34 entries total — deliberately past the 23-entry indefinite
+    /// threshold so this fixture crosses it with real (not padding) keys.
+    fn all_ppu_entries() -> Vec<(u64, Vec<u8>)> {
+        let entries: Vec<(u64, Vec<u8>)> = vec![
+            (0, cbor_uint(44)),
+            (1, cbor_uint(155381)),
+            (2, cbor_uint(90112)),
+            (3, cbor_uint(16384)),
+            (4, cbor_uint(1100)),
+            (5, cbor_uint(2_000_000)),
+            (6, cbor_uint(500_000_000)),
+            (7, cbor_uint(18)),
+            (8, cbor_uint(500)),
+            (9, cbor_rational(3, 10)),
+            (10, cbor_rational(3, 1000)),
+            (11, cbor_rational(2, 10)),
+            (16, cbor_uint(340_000_000)),
+            (17, cbor_uint(4310)),
+            (18, cbor_map0()),
+            (
+                19,
+                cbor_arr(&[&cbor_rational(577, 10_000), &cbor_rational(721, 10_000_000)]),
+            ),
+            (
+                20,
+                cbor_arr(&[&cbor_uint(14_000_000), &cbor_uint(10_000_000_000)]),
+            ),
+            (
+                21,
+                cbor_arr(&[&cbor_uint(62_000_000), &cbor_uint(20_000_000_000)]),
+            ),
+            (22, cbor_uint(5000)),
+            (23, cbor_uint(150)),
+            (24, cbor_uint(3)),
+            (
+                25,
+                cbor_arr(&[
+                    &cbor_rational(1, 2),
+                    &cbor_rational(1, 2),
+                    &cbor_rational(1, 2),
+                    &cbor_rational(1, 2),
+                    &cbor_rational(1, 2),
+                ]),
+            ),
+            (
+                26,
+                cbor_arr(&[
+                    &cbor_rational(1, 2),
+                    &cbor_rational(1, 2),
+                    &cbor_rational(1, 2),
+                    &cbor_rational(1, 2),
+                    &cbor_rational(1, 2),
+                    &cbor_rational(1, 2),
+                    &cbor_rational(1, 2),
+                    &cbor_rational(1, 2),
+                    &cbor_rational(1, 2),
+                    &cbor_rational(1, 2),
+                ]),
+            ),
+            (27, cbor_uint(7)),
+            (28, cbor_uint(146)),
+            (29, cbor_uint(6)),
+            (30, cbor_uint(100_000_000_000)),
+            (31, cbor_uint(500_000_000)),
+            (32, cbor_uint(20)),
+            (33, cbor_rational(15, 100)),
+            (34, cbor_uint(200_000)),
+            (35, cbor_uint(1_000_000)),
+            (36, cbor_uint(25_600)),
+            (37, cbor_rational(12, 10)),
+        ];
+        assert!(
+            entries.len() > 23,
+            "fixture must cross the encodeMap indefinite threshold"
+        );
+        entries
+    }
+
+    fn ppu_map_definite(entries: &[(u64, Vec<u8>)]) -> Vec<u8> {
+        // Mirrors `cbor.rs::encode_map_header` for n in [24, 256).
+        let n = entries.len();
+        assert!(n < 256, "fixture helper only covers small map headers");
+        let mut v = if n < 24 {
+            vec![0xa0 | n as u8]
+        } else {
+            vec![0xb8, n as u8]
+        };
+        for (key, value) in entries {
+            v.extend(cbor_uint(*key));
+            v.extend(value.clone());
+        }
+        v
+    }
+
+    fn ppu_map_indefinite(entries: &[(u64, Vec<u8>)]) -> Vec<u8> {
+        let mut v = vec![0xbf]; // indefinite map open
+        for (key, value) in entries {
+            v.extend(cbor_uint(*key));
+            v.extend(value.clone());
+        }
+        v.push(0xff); // break
+        v
+    }
+
+    #[test]
+    fn read_protocol_param_update_accepts_indefinite_length_map_minimal() {
+        // map { 7: 100, 8: 150 } as an indefinite map — parity with the
+        // sibling fix's minimal reproducer (faaaed42d8 /
+        // `pre_conway_ppu_accepts_indefinite_length_map`).
+        let entries = vec![(7u64, cbor_uint(100)), (8u64, cbor_uint(150))];
+        let cbor = ppu_map_indefinite(&entries);
+        let mut r = Reader::new(&cbor);
+        let ppu = read_protocol_param_update(&mut r)
+            .expect("indefinite ProtocolParamUpdate map must decode");
+        assert_eq!(
+            ppu.e_max,
+            Some(100),
+            "PRE-FIX this decoded as None (0 entries read)"
+        );
+        assert_eq!(ppu.n_opt, Some(150));
+    }
+
+    #[test]
+    fn read_protocol_param_update_accepts_indefinite_length_map_over_23_keys() {
+        // The consensus-relevant case: a `ParameterChange` spanning more keys
+        // than the 23-entry `encodeMap` indefinite-form threshold. Assert the
+        // indefinite-form decode equals the definite-form decode of the exact
+        // same logical entries — not merely "decodes without error".
+        let entries = all_ppu_entries();
+
+        let definite_cbor = ppu_map_definite(&entries);
+        let mut dr = Reader::new(&definite_cbor);
+        let definite_ppu =
+            read_protocol_param_update(&mut dr).expect("definite-form >23-key PPU map must decode");
+
+        let indefinite_cbor = ppu_map_indefinite(&entries);
+        let mut ir = Reader::new(&indefinite_cbor);
+        let indefinite_ppu = read_protocol_param_update(&mut ir)
+            .expect("indefinite-form >23-key PPU map must decode");
+
+        assert_eq!(
+            indefinite_ppu,
+            definite_ppu,
+            "PRE-FIX the indefinite form decoded as a near-empty default ProtocolParamUpdate \
+             (every key silently dropped) while the definite form carried all {} entries",
+            entries.len()
+        );
+        // Sanity: this is not a vacuous equality between two empty defaults —
+        // confirm the fixture actually populated the fields both sides agree on.
+        assert_eq!(definite_ppu.min_fee_a, Some(44));
+        assert!(definite_ppu.ref_script_cost_multiplier.is_some());
+        assert_ne!(definite_ppu, ProtocolParamUpdate::default());
     }
 
     // ── Operational cert ──────────────────────────────────────────────────────
