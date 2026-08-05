@@ -33,7 +33,15 @@ pub enum QueryResult {
     StakeDistribution(Vec<StakePoolSnapshot>),
     GovState(Box<GovStateSnapshot>),
     DRepState(Vec<DRepSnapshot>),
-    CommitteeState(CommitteeSnapshot),
+    /// `GetCommitteeMembersState` (tag 27).
+    ///
+    /// Carries BOTH the live committee and the committee this epoch's
+    /// ratification pass will install (`rsEnactState . ensCommitteeL`).
+    /// `NextEpochChange` is defined purely as a comparison between the two, so
+    /// the second element is not optional context — without it the field can
+    /// only ever be `NoChangeExpected`, which is what it was hardcoded to
+    /// (#1020).
+    CommitteeState(CommitteeSnapshot, NextCommittee),
     StakeAddressInfo(Vec<StakeAddressSnapshot>),
     UtxoByAddress(Vec<UtxoSnapshot>),
     StakeSnapshots(StakeSnapshotsResult),
@@ -90,15 +98,20 @@ pub enum QueryResult {
     /// reversed from the record's own field declaration order — #1027).
     /// `UTxOState`'s embedded `GovState` and `CertState`'s embedded
     /// `VState`/`PState` carry real data via [`GovStateSnapshot`] and the
-    /// pool-params/committee/DRep fields below; every OTHER LedgerState
-    /// sub-field this codebase doesn't independently track (the raw UTxO
-    /// map, per-credential account balances, genesis delegations, MIR pots,
-    /// VRF-hash dedup registry, future pool params) is emitted
-    /// structurally-correct-but-empty, which is what real `cardano-node`
-    /// ALSO answers for these two specific debug queries: they're tagged
-    /// `QFNoTables` upstream, so `utxosUtxo` is unconditionally empty even
-    /// on a live mainnet node (oracle-verified against
-    /// `ouroboros-consensus-cardano`'s `Shelley/Ledger/Query.hs`).
+    /// pool-params/committee/DRep/genesis-delegation fields below; every OTHER
+    /// LedgerState sub-field this codebase doesn't independently track
+    /// (per-credential account balances, MIR pots, VRF-hash dedup registry,
+    /// future pool params) is emitted structurally-correct-but-empty.
+    ///
+    /// `utxosUtxo` is the one field that is empty in the REAL reply too:
+    /// these two queries are tagged `QFNoTables` upstream, so it is
+    /// unconditionally empty even on a live mainnet node (oracle-verified
+    /// against `ouroboros-consensus-cardano`'s `Shelley/Ledger/Query.hs`).
+    /// That exemption does NOT extend to the rest — `dsGenDelegs` was listed
+    /// here as an "also empty upstream" field and is not: a real
+    /// cardano-node at preview genesis answers with all 7 entries, which is
+    /// how the gap was found. Do not add fields to this list without
+    /// diffing against a live node.
     DebugEpochState {
         treasury: u64,
         reserves: u64,
@@ -121,6 +134,8 @@ pub enum QueryResult {
         /// `VState.vsCommitteeState` — derived from the live committee
         /// registry (see `encode_vstate_committee_state`).
         committee: Box<CommitteeSnapshot>,
+        /// `DState.dsGenDelegs` — real genesis delegations (#1027).
+        gen_delegs: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
     },
     /// DebugNewEpochState (tag 12): full Haskell-compatible NewEpochState.
     ///
@@ -159,6 +174,8 @@ pub enum QueryResult {
         dreps: Vec<DRepSnapshot>,
         /// See [`QueryResult::DebugEpochState::committee`].
         committee: Box<CommitteeSnapshot>,
+        /// See [`QueryResult::DebugEpochState::gen_delegs`].
+        gen_delegs: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
     },
     /// DebugChainDepState (tag 13): consensus chain-dependent state.
     ///
@@ -961,6 +978,24 @@ pub struct CommitteeSnapshot {
     pub current_epoch: u64,
 }
 
+/// The committee AFTER this epoch's ratification pass applies — Haskell's
+/// `getNextEpochCommitteeMembers`, i.e. `rsEnactState . ensCommitteeL` read off
+/// the completed DRep pulser.
+///
+/// `None` encodes `SNothing`: a ratified `NoConfidence` clears the committee.
+pub type NextCommittee = Option<NextCommitteeData>;
+
+/// Members + threshold of the post-ratification committee.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NextCommitteeData {
+    /// `(cold_credential_type, cold_credential_hash_28)` -> term expiry epoch.
+    /// Keyed the same way the wire encodes a `Credential` so the two never
+    /// need converting between representations.
+    pub members: std::collections::BTreeMap<(u8, Vec<u8>), u64>,
+    /// Quorum threshold as `(numerator, denominator)`.
+    pub threshold: (u64, u64),
+}
+
 /// Snapshot of a committee member
 #[derive(Debug, Clone)]
 pub struct CommitteeMemberSnapshot {
@@ -1056,6 +1091,14 @@ pub struct NodeStateSnapshot {
     pub enacted_constitution: Option<(Vec<u8>, u32)>,
     /// Committee members
     pub committee: CommitteeSnapshot,
+    /// `DState.dsGenDelegs` — the live genesis-delegation map, as
+    /// `(genesis_key_hash_28, delegate_key_hash_28, vrf_key_hash_32)`.
+    ///
+    /// Real `cardano-node` answers `DebugEpochState`/`DebugNewEpochState` with
+    /// the full map (7 entries on preview), so emitting it empty was a genuine
+    /// content divergence — unlike `utxosUtxo`, which is empty upstream too
+    /// because those queries are tagged `QFNoTables` (#1027).
+    pub gen_delegs: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
     /// Constitution anchor URL
     pub constitution_url: String,
     /// Constitution anchor data hash
@@ -1183,6 +1226,7 @@ impl Default for NodeStateSnapshot {
             enacted_committee: None,
             enacted_constitution: None,
             committee: CommitteeSnapshot::default(),
+            gen_delegs: Vec::new(),
             constitution_url: String::new(),
             constitution_hash: vec![0u8; 32],
             constitution_script: None,

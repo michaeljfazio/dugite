@@ -442,6 +442,7 @@ pub(crate) fn check_script_redeemers(
                 errors.push(ValidationError::MissingRedeemer {
                     tag: "Reward".to_string(),
                     index: idx as u32,
+                    script_hash: sh.to_hex(),
                 });
             }
         }
@@ -471,6 +472,8 @@ pub(crate) fn check_script_redeemers(
             errors.push(ValidationError::MissingRedeemer {
                 tag: "Mint".to_string(),
                 index: idx as u32,
+                // The PolicyID IS the script hash for a minting purpose.
+                script_hash: policy_id.to_hex(),
             });
         }
     }
@@ -579,6 +582,7 @@ pub(crate) fn check_script_redeemers(
                 errors.push(ValidationError::MissingRedeemer {
                     tag: "Cert".to_string(),
                     index: idx as u32,
+                    script_hash: sh.to_hex(),
                 });
             }
         }
@@ -633,6 +637,7 @@ pub(crate) fn check_script_redeemers(
                 errors.push(ValidationError::MissingRedeemer {
                     tag: "Vote".to_string(),
                     index: idx as u32,
+                    script_hash: sh.to_hex(),
                 });
             }
         }
@@ -662,13 +667,16 @@ pub(crate) fn check_script_redeemers(
         .collect();
 
     for (idx, proposal) in body.proposal_procedures.iter().enumerate() {
-        if govaction_has_policy_hash(&proposal.gov_action)
-            && !propose_indices.contains(&(idx as u32))
-        {
-            errors.push(ValidationError::MissingRedeemer {
-                tag: "Propose".to_string(),
-                index: idx as u32,
-            });
+        // The policy hash IS the script hash for a proposing purpose — it is
+        // the constitution guardrail script the action must satisfy.
+        if let Some(policy) = govaction_policy_hash(&proposal.gov_action) {
+            if !propose_indices.contains(&(idx as u32)) {
+                errors.push(ValidationError::MissingRedeemer {
+                    tag: "Propose".to_string(),
+                    index: idx as u32,
+                    script_hash: policy.to_hex(),
+                });
+            }
         }
     }
 }
@@ -906,14 +914,23 @@ pub(crate) fn check_extra_redeemers(
 /// Only `ParameterChange` and `TreasuryWithdrawals` can carry a `policy_hash`.
 /// All other action types never require a Propose redeemer.
 fn govaction_has_policy_hash(action: &GovAction) -> bool {
+    govaction_policy_hash(action).is_some()
+}
+
+/// The guardrail policy hash a governance action must satisfy, if any.
+///
+/// Returned rather than merely tested (`govaction_has_policy_hash`) because
+/// `MissingRedeemer` must pair the purpose with the SCRIPT HASH Haskell's
+/// `MissingRedeemers` payload carries (#1025).
+fn govaction_policy_hash(action: &GovAction) -> Option<&Hash28> {
     match action {
-        GovAction::ParameterChange { policy_hash, .. } => policy_hash.is_some(),
-        GovAction::TreasuryWithdrawals { policy_hash, .. } => policy_hash.is_some(),
+        GovAction::ParameterChange { policy_hash, .. } => policy_hash.as_ref(),
+        GovAction::TreasuryWithdrawals { policy_hash, .. } => policy_hash.as_ref(),
         GovAction::HardForkInitiation { .. }
         | GovAction::NoConfidence { .. }
         | GovAction::UpdateCommittee { .. }
         | GovAction::NewConstitution { .. }
-        | GovAction::InfoAction => false,
+        | GovAction::InfoAction => None,
     }
 }
 
@@ -2355,7 +2372,7 @@ mod tests {
         assert!(
             errors.iter().any(|e| matches!(
                 e,
-                ValidationError::MissingRedeemer { tag, index: 0 } if tag == "Reward"
+                ValidationError::MissingRedeemer { tag, index: 0, .. } if tag == "Reward"
             )),
             "Plutus-script reward account without Reward redeemer must error; got: {errors:?}"
         );
@@ -2427,7 +2444,7 @@ mod tests {
         assert!(
             errors.iter().any(|e| matches!(
                 e,
-                ValidationError::MissingRedeemer { tag, index: 0 } if tag == "Cert"
+                ValidationError::MissingRedeemer { tag, index: 0, .. } if tag == "Cert"
             )),
             "Plutus-script cert credential without Cert redeemer must error; got: {errors:?}"
         );
@@ -2518,7 +2535,7 @@ mod tests {
         assert!(
             errors.iter().any(|e| matches!(
                 e,
-                ValidationError::MissingRedeemer { tag, index: 0 } if tag == "Vote"
+                ValidationError::MissingRedeemer { tag, index: 0, .. } if tag == "Vote"
             )),
             "Plutus-script DRep voter without Vote redeemer must error; got: {errors:?}"
         );

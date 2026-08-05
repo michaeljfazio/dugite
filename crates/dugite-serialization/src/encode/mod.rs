@@ -27,7 +27,7 @@ pub use block::{
     encode_witness_sets_segment,
 };
 pub use certificate::encode_certificate;
-pub use governance::encode_proposal_procedure;
+pub use governance::{encode_gov_action, encode_proposal_procedure, encode_voter};
 pub use protocol_params::{
     encode_cost_models, encode_pre_conway_protocol_param_update, encode_protocol_param_update,
     encode_update_proposal,
