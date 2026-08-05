@@ -261,7 +261,7 @@ impl EraRules for DijkstraRules {
         //    dugite-primitives `SubTransaction` field gap, out of scope
         //    here).
         let sub_diff = if !tx.body.sub_transactions.is_empty() {
-            Some(apply_sub_transactions(tx, ctx, utxo, certs, epochs)?)
+            Some(apply_sub_transactions(tx, ctx, utxo, certs, gov, epochs)?)
         } else {
             None
         };
@@ -572,46 +572,68 @@ impl EraRules for DijkstraRules {
 /// implemented (straightforward additions once needed — none is the
 /// accept-where-Haskell-rejects divergence #1001 was filed for).
 ///
-/// # What is NOT modelled — and why (blocked on dugite-primitives)
+/// # #1010: SubTransaction now models the full DijkstraSubTxBodyRaw + dstWits
 ///
-/// Upstream's per-sub-tx accumulator is the FULL `LedgerState` (UTxOState +
-/// CertState), and `SUBLEDGER` (`Rules/SubLedger.hs`) delegates — always,
-/// with the real Conway/Shelley rule functions, not a reduced subset — to:
+/// `SubTransaction` (`dugite-primitives`) carries the FULL oracle-verified
+/// field set now: `certificates` / `withdrawals` / `mint` /
+/// `script_data_hash` / `guards` / `network_id` / `voting_procedures` /
+/// `proposal_procedures` / `treasury_value` / `donation` /
+/// `direct_deposits` / `account_balance_intervals`, plus its own
+/// independent `witness_set` (`dstWits`) and `auxiliary_data` — see the
+/// doc comment on that struct for the full key table and the
+/// `[body, wits, auxData]` wire-shape fix (a sub-tx was previously decoded
+/// as a bare body map; #1010 confirmed each OMap entry is a 3-element
+/// `DijkstraSubTx` record, matching a top-level `Tx`'s own shape one level
+/// down). `dugite-serialization`'s decoder/encoder for it are complete;
+/// only key 24 (`required_top_level_guards`, a Dijkstra-only concept with
+/// no Conway analog) remains unmodelled and hard-rejects if present.
 ///
-///   - **`SUBUTXOW`** (`Rules/SubUtxow.hs`, 18 predicate-failure
-///     constructors): verified/needed witnesses, missing/extra redeemers,
-///     missing/supplemental datums, metadata hash, script integrity hash,
-///     well-formed scripts, guard datums.
-///   - **`SUBENTITIES` → `SUBCERTS` → `SUBCERT` → `SUBDELEG`/`SUBPOOL`/
-///     `SUBGOVCERT`**: withdrawal-network/account validation, DRep-expiry
-///     updates, certificate processing (delegation/pool/gov-cert — via the
-///     LITERAL unmodified `Conway.conwayDelegTransition` /
-///     `Shelley.poolTransition` / `Conway.conwayGovCertTransition`
-///     functions), direct-deposit validate+apply.
-///   - **`SUBGOV`**: the literal unmodified `Conway.conwayGovTransition` —
-///     a sub-tx can carry its own voting/proposal procedures.
+/// **SUBUTXOW implemented (partially): witness sufficiency.** Every
+/// sub-tx's spend inputs / withdrawals / certificates are checked against
+/// its OWN `witness_set` (never the parent's — oracle-confirmed
+/// independence) via `SubMissingVKeyWitnessesUTXOW`, reusing
+/// `ConwayRules::required_witnesses` against a minimal envelope built from
+/// the sub-tx's own fields — "route sub-txs through the existing …
+/// validators with the sub-tx envelope", #1001's own suggested approach.
+/// Presence-only (a required key hash has a matching `blake2b224(vkey)`
+/// witness) — NOT full cryptographic signature verification
+/// (`SubInvalidWitnessesUTXOW`), and NOT the remaining 15 `SUBUTXOW`
+/// constructors (redeemers, datums, metadata hash, script integrity hash,
+/// well-formed scripts, guard datums). Known limitation: the envelope's
+/// witness computation resolves inputs via `utxo.utxo_set.lookup`, which
+/// does not see this fold's own `overlay` — an input created by an
+/// earlier sibling sub-tx (not yet committed; pass 2 hasn't run)
+/// contributes no witness requirement rather than the correct one. This
+/// under-reports, never over-reports, so it cannot cause a false reject —
+/// only a (currently unreachable, since sub_transactions is empty on
+/// every live network) false accept for that specific chained-input case.
 ///
-/// None of this is reachable today because
-/// [`SubTransaction`](dugite_primitives::transaction::SubTransaction) (the
-/// dugite wire type) carries only `tx_id` / `inputs` / `outputs` / `ttl` /
-/// `validity_interval_start` / `reference_inputs` / `auxiliary_data_hash` —
-/// no witness set, no certificates, no withdrawals, no voting/proposal
-/// procedures, no direct deposits. Upstream's `DijkstraSubTxBodyRaw`
-/// carries `certs` / `withdrawals` / `votingProcedures` /
-/// `proposalProcedures` / `directDeposits` (everything except `fee` /
-/// `collateralReturn` / `totalCollateral` / `collateralInputs`, which
-/// `SUBUTXO` hard-`error`s on as structurally impossible), and the
-/// wrapping `DijkstraSubTx` additionally carries its OWN full
-/// `dstWits :: TxWits era`. Modelling any of `SUBUTXOW`/`SUBCERTS`/`SUBGOV`
-/// therefore requires adding those fields to
-/// `dugite_primitives::transaction::SubTransaction` first — a primitives
-/// change intentionally left out of this fix (see the module doc comment
-/// for why).
+/// **SUBCERTS / SUBDELEG / SUBPOOL / SUBGOVCERT / SUBGOV: data is now
+/// decoded, but NOT YET routed through apply.** `sub.certificates`,
+/// `sub.voting_procedures` and `sub.proposal_procedures` are available on
+/// `SubTransaction` but `apply_sub_transactions` does not yet call
+/// `common::apply_shelley_cert` / `ConwayRules`'s private
+/// `apply_conway_cert` / `process_governance_votes_and_proposals` for
+/// them — those upstream rules are literal, direct reuses of the exact
+/// same functions (`Conway.conwayDelegTransition`, `Shelley.poolTransition`,
+/// `Conway.conwayGovCertTransition`, `Conway.conwayGovTransition`) dugite
+/// already has as `apply_shelley_cert`/`apply_conway_cert`/
+/// `process_governance_votes_and_proposals` for the PARENT tx, so wiring
+/// them is a routing exercise once a REAL two-phase validate/apply split
+/// exists for sub-tx certs (today `apply_*_cert` mutate unconditionally,
+/// trusting Phase-1 already vetted the cert — there is no reusable
+/// "validate this cert without applying it" function to call from pass 1,
+/// and a sub-tx has no Phase-1 admission path at all yet). A sub-tx that
+/// carries certificates or governance procedures today is accepted
+/// (decodes and applies with its UTxO effects) but those specific fields
+/// are silently NOT applied to `certs`/`gov` — tracked as the direct
+/// continuation of #1010.
 fn apply_sub_transactions(
     tx: &Transaction,
     ctx: &RuleContext,
     utxo: &mut UtxoSubState,
     certs: &mut CertSubState,
+    gov: &GovSubState,
     epochs: &mut EpochSubState,
 ) -> Result<UtxoDiff, LedgerError> {
     use crate::state::{stake_routing, StakeRouting};
@@ -627,6 +649,39 @@ fn apply_sub_transactions(
         Vec::with_capacity(tx.body.sub_transactions.len());
 
     for sub in &tx.body.sub_transactions {
+        // #1010 fail-closed guard: `SubTransaction` now DECODES
+        // certificates/withdrawals/mint/voting_procedures/
+        // proposal_procedures/direct_deposits/account_balance_intervals
+        // (the wire-shape and field-modelling half of #1010), but
+        // `apply_sub_transactions` below only APPLIES the UTxO/stake
+        // effects and checks witness sufficiency — it does not yet route
+        // certs through `apply_shelley_cert`/`apply_conway_cert` or
+        // votes/proposals through `process_governance_votes_and_proposals`
+        // (the SUBCERTS/SUBGOV apply half, still open — see the doc
+        // comment on this function). Applying SOME of a sub-tx's declared
+        // effects while silently ignoring others is exactly the
+        // "decodes fine, diverges silently" shape #1010 was filed to
+        // close, one layer up from the CBOR decoder. Reject rather than
+        // accept a sub-tx whose non-UTxO effects would be dropped.
+        if !sub.certificates.is_empty()
+            || !sub.withdrawals.is_empty()
+            || !sub.mint.is_empty()
+            || !sub.voting_procedures.is_empty()
+            || !sub.proposal_procedures.is_empty()
+            || !sub.direct_deposits.is_empty()
+            || !sub.account_balance_intervals.is_empty()
+        {
+            return Err(LedgerError::InvalidTransaction(format!(
+                "SubEntitiesNotYetApplied: sub-tx {} of parent {} declares certs/\
+                 withdrawals/mint/voting/proposal/direct_deposits/account_balance_intervals \
+                 effects that dugite decodes but does not yet apply (#1010 SUBCERTS/SUBGOV \
+                 apply routing) — rejecting rather than silently dropping those effects; \
+                 aborting the ENTIRE top-level tx",
+                sub.tx_id.to_hex(),
+                tx.hash.to_hex()
+            )));
+        }
+
         // SubInputSetEmptyUTxO (SubUtxo.hs tag 3).
         if sub.inputs.is_empty() {
             return Err(LedgerError::InvalidTransaction(format!(
@@ -715,6 +770,90 @@ fn apply_sub_transactions(
                     tx.hash.to_hex(),
                     output.value.coin.0,
                     min_utxo.0
+                )));
+            }
+        }
+
+        // SUBUTXOW: SubMissingVKeyWitnessesUTXOW (SubUtxow.hs tag 2) — the
+        // sub-tx's OWN witness set (`sub.witness_set`, never the parent's;
+        // oracle-verified `dstWits` independence, #1010) must cover every
+        // key hash its OWN inputs/withdrawals/certificates require. Reuses
+        // `ConwayRules::required_witnesses` (byte-identical logic to what
+        // the parent tx's own witness sufficiency check runs) against a
+        // minimal envelope carrying just the sub-tx's relevant fields —
+        // "route sub-txs through the existing … validators with the sub-tx
+        // envelope", per #1001's own suggested approach. Presence-only
+        // (matches a required key hash against a witness's blake2b-224):
+        // full cryptographic signature verification
+        // (SubInvalidWitnessesUTXOW, tag 1) is a separate, not-yet-modelled
+        // predicate — see the doc comment on `apply_sub_transactions`.
+        //
+        // KNOWN LIMITATION: `required_witnesses` resolves each input via
+        // `utxo.utxo_set.lookup`, which does NOT see this fold's own
+        // `overlay` — an input created by an EARLIER sibling sub-tx (not
+        // yet committed to the real UTxO set; pass 2 hasn't run) silently
+        // contributes no witness requirement, rather than the correct
+        // one. This under-reports, never over-reports: it can only make
+        // the check MORE permissive for a chained sub-tx's own input,
+        // never wrongly reject a legitimate one. Tracked as a follow-on
+        // alongside the primitives gap above.
+        {
+            let envelope = Transaction {
+                era: dugite_primitives::era::Era::Dijkstra,
+                hash: sub.tx_id,
+                body: dugite_primitives::transaction::TransactionBody {
+                    inputs: sub.inputs.clone(),
+                    outputs: vec![],
+                    fee: dugite_primitives::value::Lovelace(0),
+                    ttl: None,
+                    certificates: sub.certificates.clone(),
+                    withdrawals: sub.withdrawals.clone(),
+                    auxiliary_data_hash: None,
+                    validity_interval_start: None,
+                    mint: Default::default(),
+                    script_data_hash: None,
+                    collateral: vec![],
+                    required_signers: vec![],
+                    network_id: None,
+                    collateral_return: None,
+                    total_collateral: None,
+                    reference_inputs: vec![],
+                    update: None,
+                    voting_procedures: Default::default(),
+                    proposal_procedures: vec![],
+                    treasury_value: None,
+                    donation: None,
+                    sub_transactions: vec![],
+                    account_balance_intervals: vec![],
+                    direct_deposits: Default::default(),
+                    guards: vec![],
+                },
+                witness_set: sub.witness_set.clone(),
+                is_valid: true,
+                auxiliary_data: sub.auxiliary_data.clone(),
+                raw_cbor: None,
+                raw_body_cbor: None,
+                raw_witness_cbor: None,
+            };
+            let required =
+                super::conway::ConwayRules.required_witnesses(&envelope, ctx, utxo, certs, gov);
+            let signed: HashSet<Hash28> = sub
+                .witness_set
+                .vkey_witnesses
+                .iter()
+                .filter(|w| w.vkey.len() == 32)
+                .map(|w| dugite_primitives::hash::blake2b_224(&w.vkey))
+                .collect();
+            let missing: Vec<Hash28> = required.difference(&signed).copied().collect();
+            if !missing.is_empty() {
+                let mut missing_hex: Vec<String> = missing.iter().map(|h| h.to_hex()).collect();
+                missing_hex.sort();
+                return Err(LedgerError::InvalidTransaction(format!(
+                    "SubMissingVKeyWitnessesUTXOW: sub-tx {} of parent {} is missing vkey \
+                     witnesses for {:?} — aborting the ENTIRE top-level tx",
+                    sub.tx_id.to_hex(),
+                    tx.hash.to_hex(),
+                    missing_hex
                 )));
             }
         }
@@ -1657,8 +1796,16 @@ mod tests {
             };
 
             // ---- seed the UTxO ---------------------------------------
-            let kh = Hash28::from_bytes([0xAB; 28]);
+            // Real blake2b-224(vkey) hash (not arbitrary bytes) so the
+            // #1010 SUBUTXOW witness check has something genuine to verify
+            // sub A/C's witnesses against.
+            let payment_vkey = [0xAB_u8; 32];
+            let kh = dugite_primitives::hash::blake2b_224(&payment_vkey);
             let addr = make_enterprise_address(kh);
+            let witness_for = |vkey: [u8; 32]| dugite_primitives::transaction::VKeyWitness {
+                vkey: vkey.to_vec(),
+                signature: vec![0u8; 64],
+            };
 
             // UTxO A — sub A would consume it (it succeeds in isolation).
             let utxo_a_in = make_input(0xA1, 0);
@@ -1696,6 +1843,11 @@ mod tests {
                 reference_inputs: vec![],
                 auxiliary_data_hash: None,
                 raw_body_cbor: None,
+                witness_set: TransactionWitnessSet {
+                    vkey_witnesses: vec![witness_for(payment_vkey)],
+                    ..Default::default()
+                },
+                ..Default::default()
             };
 
             // Sub B (2nd): always fails — references UTxO B, which is NOT
@@ -1711,6 +1863,7 @@ mod tests {
                 reference_inputs: vec![],
                 auxiliary_data_hash: None,
                 raw_body_cbor: None,
+                ..Default::default()
             };
 
             // Sub C (3rd): would ALSO succeed alone — consumes UTxO C,
@@ -1728,6 +1881,11 @@ mod tests {
                 reference_inputs: vec![],
                 auxiliary_data_hash: None,
                 raw_body_cbor: None,
+                witness_set: TransactionWitnessSet {
+                    vkey_witnesses: vec![witness_for(payment_vkey)],
+                    ..Default::default()
+                },
+                ..Default::default()
             };
 
             // ---- build the parent tx ---------------------------------
@@ -1940,16 +2098,28 @@ mod tests {
             // `stake_routing` → `Credential`; an enterprise address (0x61) has
             // none → `None` (which is why the existing apply test, using only
             // enterprise addresses, never exercised the stake legs).
+            //
+            // Both payment credentials are real blake2b-224(vkey) hashes
+            // (not arbitrary bytes) so the #1010 SUBUTXOW witness check
+            // below has something genuine to verify against.
+            let payment_vkey = [0x31u8; 32];
+            let payment_hash = dugite_primitives::hash::blake2b_224(&payment_vkey);
             let base_addr = {
                 let mut b = vec![0x00u8];
-                b.extend_from_slice(Hash28::from_bytes([0x11; 28]).as_bytes());
+                b.extend_from_slice(payment_hash.as_bytes());
                 b.extend_from_slice(Hash28::from_bytes([0x7d; 28]).as_bytes());
                 Address::from_bytes(&b).expect("base addr")
             };
+            let ent_vkey = [0x32u8; 32];
+            let ent_hash = dugite_primitives::hash::blake2b_224(&ent_vkey);
             let enterprise_addr = {
                 let mut b = vec![0x61u8];
-                b.extend_from_slice(Hash28::from_bytes([0xEE; 28]).as_bytes());
+                b.extend_from_slice(ent_hash.as_bytes());
                 Address::from_bytes(&b).expect("enterprise addr")
+            };
+            let witness_for = |vkey: [u8; 32]| dugite_primitives::transaction::VKeyWitness {
+                vkey: vkey.to_vec(),
+                signature: vec![0u8; 64],
             };
             let mk_out = |addr: Address, coin: u64| TransactionOutput {
                 address: addr,
@@ -2015,6 +2185,7 @@ mod tests {
 
             let mut utxo = super::make_utxo_sub();
             let mut certs = super::make_cert_sub();
+            let gov = super::make_gov_sub();
             let mut epochs = super::make_epoch_sub();
             let params = ProtocolParameters::mainnet_defaults();
             let delegates: HashMap<Hash28, (Hash28, Hash32)> = HashMap::new();
@@ -2041,12 +2212,18 @@ mod tests {
                 reference_inputs: vec![],
                 auxiliary_data_hash: None,
                 raw_body_cbor: None,
+                witness_set: TransactionWitnessSet {
+                    vkey_witnesses: vec![witness_for(ent_vkey)],
+                    ..Default::default()
+                },
+                ..Default::default()
             };
             apply_sub_transactions(
                 &mk_parent(vec![sub_add]),
                 &ctx,
                 &mut utxo,
                 &mut certs,
+                &gov,
                 &mut epochs,
             )
             .expect("sub_add must validate and commit");
@@ -2075,12 +2252,18 @@ mod tests {
                 reference_inputs: vec![],
                 auxiliary_data_hash: None,
                 raw_body_cbor: None,
+                witness_set: TransactionWitnessSet {
+                    vkey_witnesses: vec![witness_for(payment_vkey)],
+                    ..Default::default()
+                },
+                ..Default::default()
             };
             apply_sub_transactions(
                 &mk_parent(vec![sub_spend]),
                 &ctx,
                 &mut utxo,
                 &mut certs,
+                &gov,
                 &mut epochs,
             )
             .expect("sub_spend must validate and commit");
@@ -2288,6 +2471,7 @@ mod tests {
                 reference_inputs: vec![],
                 auxiliary_data_hash: None,
                 raw_body_cbor: None,
+                ..Default::default()
             };
             let (result, _) = run_one_sub(sub_empty, vec![]);
             let err = result.expect_err("a sub-tx with zero inputs must be rejected");
@@ -2308,6 +2492,7 @@ mod tests {
                 reference_inputs: vec![],
                 auxiliary_data_hash: None,
                 raw_body_cbor: None,
+                ..Default::default()
             };
             let (result, utxo_after) =
                 run_one_sub(sub_ttl_expired, vec![(utxo_in.clone(), utxo_out.clone())]);
@@ -2334,6 +2519,7 @@ mod tests {
                 reference_inputs: vec![],
                 auxiliary_data_hash: None,
                 raw_body_cbor: None,
+                ..Default::default()
             };
             let (result, _) = run_one_sub(sub_not_yet_valid, vec![(utxo_in2, utxo_out2)]);
             let err = result.expect_err("a not-yet-valid sub-tx must be rejected");
@@ -2354,6 +2540,7 @@ mod tests {
                 reference_inputs: vec![],
                 auxiliary_data_hash: None,
                 raw_body_cbor: None,
+                ..Default::default()
             };
             let (result, _) = run_one_sub(sub_tiny_output, vec![(utxo_in3, utxo_out3)]);
             let err =
@@ -2361,6 +2548,92 @@ mod tests {
             assert!(
                 format!("{err:?}").contains("SubBabbageOutputTooSmallUTxO"),
                 "error must name SubBabbageOutputTooSmallUTxO, got: {err:?}"
+            );
+
+            // ---- SUBUTXOW: SubMissingVKeyWitnessesUTXOW (#1010) --------
+            // A sub-tx whose OWN witness set does not cover the vkey
+            // credential its spent input requires must be rejected — even
+            // though the input itself resolves fine and the output clears
+            // the min-UTxO floor (so neither of the checks above would
+            // catch it).
+            let vkey = [0x77_u8; 32];
+            let vkey_hash = dugite_primitives::hash::blake2b_224(&vkey);
+            let vkey_addr = make_enterprise_address(vkey_hash);
+            let utxo_in4 = make_input(0x05, 0);
+            let utxo_out4 = make_output(vkey_addr.clone(), 10_000_000);
+            let make_sub_no_witness = || SubTransaction {
+                tx_id: Hash32::from_bytes([0x05; 32]),
+                inputs: vec![utxo_in4.clone()],
+                outputs: vec![make_output(vkey_addr.clone(), 5_000_000)],
+                ttl: None,
+                validity_interval_start: None,
+                reference_inputs: vec![],
+                auxiliary_data_hash: None,
+                raw_body_cbor: None,
+                ..Default::default()
+            };
+            let (result, _) = run_one_sub(
+                make_sub_no_witness(),
+                vec![(utxo_in4.clone(), utxo_out4.clone())],
+            );
+            let err = result.expect_err(
+                "a sub-tx spending a vkey-credentialed input with no matching witness \
+                 must be rejected",
+            );
+            assert!(
+                format!("{err:?}").contains("SubMissingVKeyWitnessesUTXOW"),
+                "error must name SubMissingVKeyWitnessesUTXOW, got: {err:?}"
+            );
+
+            // Control: the SAME sub-tx, this time WITH a matching vkey
+            // witness, must succeed — proves the check is discriminating
+            // (rejecting absence, not everything).
+            let mut sub_with_witness = make_sub_no_witness();
+            sub_with_witness.witness_set = TransactionWitnessSet {
+                vkey_witnesses: vec![dugite_primitives::transaction::VKeyWitness {
+                    vkey: vkey.to_vec(),
+                    signature: vec![0u8; 64],
+                }],
+                ..Default::default()
+            };
+            let (result, _) = run_one_sub(sub_with_witness, vec![(utxo_in4, utxo_out4)]);
+            result.expect(
+                "the SAME sub-tx WITH a matching vkey witness must be accepted \
+                 (control for SubMissingVKeyWitnessesUTXOW)",
+            );
+
+            // ---- #1010 fail-closed guard: certs decoded but not yet applied ----
+            // A sub-tx declaring a certificate must be REJECTED (not
+            // silently accepted with the cert dropped) until SUBCERTS
+            // apply-routing lands.
+            let utxo_in5 = make_input(0x06, 0);
+            let utxo_out5 = make_output(addr.clone(), 10_000_000);
+            let sub_with_cert = SubTransaction {
+                tx_id: Hash32::from_bytes([0x06; 32]),
+                inputs: vec![utxo_in5.clone()],
+                outputs: vec![make_output(addr.clone(), 5_000_000)],
+                certificates: vec![
+                    dugite_primitives::transaction::Certificate::StakeRegistration(
+                        dugite_primitives::credentials::Credential::VerificationKey(
+                            Hash28::from_bytes([0x66; 28]),
+                        ),
+                    ),
+                ],
+                ttl: None,
+                validity_interval_start: None,
+                reference_inputs: vec![],
+                auxiliary_data_hash: None,
+                raw_body_cbor: None,
+                ..Default::default()
+            };
+            let (result, _) = run_one_sub(sub_with_cert, vec![(utxo_in5, utxo_out5)]);
+            let err = result.expect_err(
+                "a sub-tx declaring a certificate must be rejected until SUBCERTS \
+                 apply-routing lands (#1010) — not silently accepted with the cert dropped",
+            );
+            assert!(
+                format!("{err:?}").contains("SubEntitiesNotYetApplied"),
+                "error must name SubEntitiesNotYetApplied, got: {err:?}"
             );
         }
 
