@@ -1,7 +1,7 @@
 //! `SyncService` — block retrieval + chain following.
 //!
-//! M1.B (this commit): all four methods implemented end-to-end against
-//! [`LedgerContext`] + [`TipFeed`].
+//! All four methods are implemented end-to-end against [`LedgerContext`]
+//! + [`TipFeed`].
 //!
 //! * `ReadTip`: returns the current tip as a `BlockRef`.
 //! * `FetchBlock`: per-ref lookup via `block_by_hash` (preferred) or
@@ -20,6 +20,16 @@
 //! the implementation is intentionally duplicated rather than abstracted
 //! — keeps each impl readable, and a future `pb_recode!` macro can
 //! collapse them if needed without rewriting the logic.
+//!
+//! Every response is run through `masking::apply` (issue #1004) using
+//! the request's `FieldMask`. `FollowTip` applies it once per emitted
+//! `FollowTipResponse` (apply / undo / reset alike) inside
+//! `spawn_follow_tip_stream_beta`, which is shared by both API versions —
+//! `v1alpha` never masks natively there, it re-pipes the already-masked
+//! `v1beta` stream. `FetchBlock` / `DumpHistory` build their `v1alpha`
+//! response directly (element-wise block recode, not a whole-response
+//! recode of a masked `v1beta` value), so those two mask against a
+//! `v1alpha`-specific message name — see `crate::map::message_names`.
 
 use std::sync::Arc;
 
@@ -31,10 +41,12 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::warn;
 
-use super::ServiceState;
+use super::{mask_paths, send_masked, ServiceState};
 use crate::context::{LedgerContext, RawBlock, TipInfo};
 use crate::error::RpcError;
 use crate::map::block::{any_chain_block, block_ref_from_raw, block_ref_from_tip};
+use crate::map::message_names;
+use crate::masking;
 use crate::proto::{v1alpha, v1beta};
 use crate::tip_feed::TipRollback;
 use tokio::sync::broadcast;
@@ -199,25 +211,29 @@ async fn spawn_follow_tip_stream_beta(
     ctx: Arc<dyn LedgerContext>,
     buffer: usize,
     intersection: Option<Point>,
+    mask: Vec<String>,
     mut apply_rx: broadcast::Receiver<TipInfo>,
     mut rollback_rx: broadcast::Receiver<TipRollback>,
 ) -> mpsc::Receiver<Result<v1beta::sync::FollowTipResponse, Status>> {
     let (tx, rx) = mpsc::channel(buffer);
     if let Some(point) = intersection {
         let (slot, hash) = point_to_block_ref(&point);
-        let _ = tx
-            .send(Ok(v1beta::sync::FollowTipResponse {
-                action: Some(v1beta::sync::follow_tip_response::Action::Reset(
-                    v1beta::sync::BlockRef {
-                        slot,
-                        hash,
-                        height: 0,
-                        timestamp: 0,
-                    },
-                )),
-                tip: None,
-            }))
-            .await;
+        let resp = v1beta::sync::FollowTipResponse {
+            action: Some(v1beta::sync::follow_tip_response::Action::Reset(
+                v1beta::sync::BlockRef {
+                    slot,
+                    hash,
+                    height: 0,
+                    timestamp: 0,
+                },
+            )),
+            tip: None,
+        };
+        send_masked(
+            &tx,
+            masking::apply(&mask, resp, message_names::FOLLOW_TIP_RESPONSE),
+        )
+        .await;
     }
     tokio::spawn(async move {
         loop {
@@ -235,7 +251,8 @@ async fn spawn_follow_tip_stream_beta(
                                     timestamp: 0,
                                 }),
                             };
-                            if tx.send(Ok(resp)).await.is_err() {
+                            let masked = masking::apply(&mask, resp, message_names::FOLLOW_TIP_RESPONSE);
+                            if send_masked(&tx, masked).await {
                                 break;
                             }
                         }
@@ -257,7 +274,7 @@ async fn spawn_follow_tip_stream_beta(
                 rb = rollback_rx.recv() => {
                     match rb {
                         Ok(ev) => {
-                            if tx.send(Ok(v1beta::sync::FollowTipResponse {
+                            let resp = v1beta::sync::FollowTipResponse {
                                 action: Some(v1beta::sync::follow_tip_response::Action::Reset(
                                     v1beta::sync::BlockRef {
                                         slot: ev.slot,
@@ -267,7 +284,9 @@ async fn spawn_follow_tip_stream_beta(
                                     },
                                 )),
                                 tip: None,
-                            })).await.is_err() {
+                            };
+                            let masked = masking::apply(&mask, resp, message_names::FOLLOW_TIP_RESPONSE);
+                            if send_masked(&tx, masked).await {
                                 break;
                             }
                         }
@@ -304,6 +323,7 @@ impl v1alpha::sync::sync_service_server::SyncService for SyncSvcAlpha {
             .metrics
             .request_started(SERVICE_LABEL, "fetch_block");
         let req = request.into_inner();
+        let mask = mask_paths(req.field_mask);
         let raws = fetch_blocks_for_refs(
             &self.state.context,
             &req.r#ref,
@@ -327,9 +347,11 @@ impl v1alpha::sync::sync_service_server::SyncService for SyncSvcAlpha {
                 }
             })
             .collect();
-        Ok(Response::new(v1alpha::sync::FetchBlockResponse {
-            block: blocks,
-        }))
+        let response = v1alpha::sync::FetchBlockResponse { block: blocks };
+        Ok(Response::new(
+            masking::apply(&mask, response, message_names::FETCH_BLOCK_RESPONSE_ALPHA)
+                .map_err(Status::from)?,
+        ))
     }
 
     async fn dump_history(
@@ -337,6 +359,7 @@ impl v1alpha::sync::sync_service_server::SyncService for SyncSvcAlpha {
         request: Request<v1alpha::sync::DumpHistoryRequest>,
     ) -> Result<Response<v1alpha::sync::DumpHistoryResponse>, Status> {
         let req = request.into_inner();
+        let mask = mask_paths(req.field_mask);
         let start_slot = req.start_token.as_ref().map(|r| r.slot).unwrap_or(0);
         let raws = dump_history_impl(&self.state.context, start_slot, req.max_items)
             .await
@@ -365,10 +388,14 @@ impl v1alpha::sync::sync_service_server::SyncService for SyncSvcAlpha {
                 }
             })
             .collect();
-        Ok(Response::new(v1alpha::sync::DumpHistoryResponse {
+        let response = v1alpha::sync::DumpHistoryResponse {
             block: blocks,
             next_token,
-        }))
+        };
+        Ok(Response::new(
+            masking::apply(&mask, response, message_names::DUMP_HISTORY_RESPONSE_ALPHA)
+                .map_err(Status::from)?,
+        ))
     }
 
     type FollowTipStream = ReceiverStream<Result<v1alpha::sync::FollowTipResponse, Status>>;
@@ -381,6 +408,7 @@ impl v1alpha::sync::sync_service_server::SyncService for SyncSvcAlpha {
             .metrics
             .stream_started(SERVICE_LABEL, "follow_tip");
         let req = request.into_inner();
+        let mask = mask_paths(req.field_mask);
         let intersection_refs: Vec<(Vec<u8>, u64)> = req
             .intersect
             .into_iter()
@@ -397,6 +425,7 @@ impl v1alpha::sync::sync_service_server::SyncService for SyncSvcAlpha {
             self.state.context.clone(),
             self.state.config.stream_buffer,
             intersection,
+            mask,
             apply_rx,
             rollback_rx,
         )
@@ -482,6 +511,7 @@ impl v1beta::sync::sync_service_server::SyncService for SyncSvcBeta {
         request: Request<v1beta::sync::FetchBlockRequest>,
     ) -> Result<Response<v1beta::sync::FetchBlockResponse>, Status> {
         let req = request.into_inner();
+        let mask = mask_paths(req.field_mask);
         let raws = fetch_blocks_for_refs(
             &self.state.context,
             &req.r#ref,
@@ -494,9 +524,11 @@ impl v1beta::sync::sync_service_server::SyncService for SyncSvcBeta {
             .iter()
             .map(|raw| any_chain_block(raw, parse_block(raw).as_ref()))
             .collect();
-        Ok(Response::new(v1beta::sync::FetchBlockResponse {
-            block: blocks,
-        }))
+        let response = v1beta::sync::FetchBlockResponse { block: blocks };
+        Ok(Response::new(
+            masking::apply(&mask, response, message_names::FETCH_BLOCK_RESPONSE)
+                .map_err(Status::from)?,
+        ))
     }
 
     async fn dump_history(
@@ -504,6 +536,7 @@ impl v1beta::sync::sync_service_server::SyncService for SyncSvcBeta {
         request: Request<v1beta::sync::DumpHistoryRequest>,
     ) -> Result<Response<v1beta::sync::DumpHistoryResponse>, Status> {
         let req = request.into_inner();
+        let mask = mask_paths(req.field_mask);
         let start_slot = req.start_token.as_ref().map(|r| r.slot).unwrap_or(0);
         let raws = dump_history_impl(&self.state.context, start_slot, req.max_items)
             .await
@@ -513,10 +546,14 @@ impl v1beta::sync::sync_service_server::SyncService for SyncSvcBeta {
             .iter()
             .map(|raw| any_chain_block(raw, parse_block(raw).as_ref()))
             .collect();
-        Ok(Response::new(v1beta::sync::DumpHistoryResponse {
+        let response = v1beta::sync::DumpHistoryResponse {
             block: blocks,
             next_token,
-        }))
+        };
+        Ok(Response::new(
+            masking::apply(&mask, response, message_names::DUMP_HISTORY_RESPONSE)
+                .map_err(Status::from)?,
+        ))
     }
 
     type FollowTipStream = ReceiverStream<Result<v1beta::sync::FollowTipResponse, Status>>;
@@ -529,6 +566,7 @@ impl v1beta::sync::sync_service_server::SyncService for SyncSvcBeta {
             .metrics
             .stream_started(SERVICE_LABEL, "follow_tip");
         let req = request.into_inner();
+        let mask = mask_paths(req.field_mask);
         let intersection_refs: Vec<(Vec<u8>, u64)> = req
             .intersect
             .into_iter()
@@ -545,6 +583,7 @@ impl v1beta::sync::sync_service_server::SyncService for SyncSvcBeta {
             self.state.context.clone(),
             self.state.config.stream_buffer,
             intersection,
+            mask,
             apply_rx,
             rollback_rx,
         )
@@ -571,5 +610,5 @@ fn recode_block_to_alpha(beta: v1beta::cardano::Block) -> v1alpha::cardano::Bloc
     use prost::Message;
     let bytes = beta.encode_to_vec();
     v1alpha::cardano::Block::decode(bytes.as_slice())
-        .expect("v1alpha and v1beta Cardano Block messages are wire-compatible for M1.B fields")
+        .expect("v1alpha and v1beta Cardano Block messages are wire-compatible")
 }

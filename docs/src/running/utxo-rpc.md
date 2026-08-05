@@ -60,9 +60,15 @@ after `v1alpha` was frozen. The spec is pinned in-tree at
 | `SubmitService` | `SubmitTx` | ✅ implemented |
 | `SubmitService` | `ReadMempool` | ✅ implemented |
 | `SubmitService` | `WaitForTx` (stream) | ✅ implemented |
-| `SubmitService` | `WatchMempool` (stream) | ✅ implemented |
+| `SubmitService` | `WatchMempool` (stream) | ✅ implemented (full `TxPredicate` filtering, same matcher as `WatchTx`) |
 | `SubmitService` | `EvalTx` | ✅ implemented (per-redeemer `ex_units` + Plutus traces) |
-| `WatchService` | `WatchTx` (stream) | ✅ implemented (full `TxPredicate` filtering: address / asset / mint / `not` / `all_of` / `any_of`) |
+| `WatchService` | `WatchTx` (stream) | ✅ implemented (full `TxPredicate` filtering: address / asset / mint / `not` / `all_of` / `any_of`) — mempool-sourced, see [Limitations](#limitations) |
+
+Every method above honours a request's `google.protobuf.FieldMask` (issue
+#1004): unselected fields are pruned from the response, recursively,
+including into repeated fields like `FetchBlockResponse.block` — see
+`crates/dugite-rpc/src/masking.rs` for the exact semantics (a mask that's
+absent or empty returns everything, matching the canonical FieldMask doc).
 
 ## Configuration
 
@@ -206,10 +212,20 @@ updated, or vice versa) are caught by code review against the diff.
   is *conservative* (over-approximates) and therefore safe for
   fee-estimation use cases but may diverge slightly from cardano-node
   on the high end.
-* `WatchTx` filters on tx output fields (`produces` / `has_address`
-  / `moves_asset`) and minting (`mints_asset`) — but not on
-  *resolved* inputs (`consumes` / `has_certificate`) since those
+* `WatchTx` / `WatchMempool` filter on tx output fields (`produces` /
+  `has_address` / `moves_asset`) and minting (`mints_asset`) — but not
+  on *resolved* inputs (`consumes` / `has_certificate`) since those
   require live UTxO lookups against pending mempool txs.
+* `WatchTx` is **mempool-sourced**, not chain-sourced: it streams
+  `MempoolEvent::Added` (pre-confirmation), matching
+  `SubmitService.WatchMempool`'s semantics rather than the proto's own
+  "stream transactions from the chain" comment. Two consequences:
+  `AnyChainTx.block` is always unset (a mempool tx has no confirming
+  block yet), and the `undo` / `idle` `WatchTxResponse` variants are
+  never emitted (both are block-scoped concepts). Tracked as
+  [#1007](https://github.com/michaeljfazio/dugite/issues/1007) — the
+  fix needs `TipRollback` to carry the rolled-back block's transactions,
+  which today it does not.
 * `FollowTip` apply events carry `AnyChainBlock.native_bytes` (the
   raw block CBOR); clients that only need tip metadata can ignore
   the payload.

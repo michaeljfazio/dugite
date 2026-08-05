@@ -15,16 +15,24 @@
 //! asserting the first received message is the sentinel: the forwarding
 //! task processes broadcast events strictly in order.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use dugite_primitives::address::Address;
+use dugite_primitives::address::{Address, EnterpriseAddress};
 use dugite_primitives::block::Point;
-use dugite_primitives::hash::{Hash32, TransactionHash};
-use dugite_primitives::transaction::TransactionInput;
+use dugite_primitives::credentials::Credential;
+use dugite_primitives::hash::{Hash28, Hash32, TransactionHash};
+use dugite_primitives::network::NetworkId;
+use dugite_primitives::time::SlotNo;
+use dugite_primitives::transaction::{
+    OutputDatum, Transaction, TransactionBody, TransactionInput, TransactionOutput,
+    TransactionWitnessSet,
+};
+use dugite_primitives::value::{Lovelace, Value};
+use dugite_primitives::Era;
 use dugite_rpc::context::{
     EraHistoryView, GenesisView, ParamsView, RedeemerPurpose, RedeemerReport,
 };
@@ -35,6 +43,124 @@ use dugite_rpc::{
 use tokio::sync::{broadcast, watch};
 use tokio_stream::StreamExt;
 use tonic::transport::Channel;
+
+// ─── Conway tx fixtures (mirrors tests/watch_service.rs) ───────────────────
+//
+// Duplicated rather than shared: integration test binaries in this crate
+// are each self-contained (see watch_service.rs's own copy) and this is a
+// small enough fixture that a `tests/common` module would be more
+// machinery than the two call sites warrant.
+
+fn addr_with_payment(byte: u8) -> Address {
+    Address::Enterprise(EnterpriseAddress {
+        network: NetworkId::Mainnet,
+        payment: Credential::VerificationKey(Hash28::from_bytes([byte; 28])),
+    })
+}
+
+fn empty_witness_set() -> TransactionWitnessSet {
+    TransactionWitnessSet {
+        vkey_witnesses: vec![],
+        native_scripts: vec![],
+        bootstrap_witnesses: vec![],
+        plutus_v1_scripts: vec![],
+        plutus_v2_scripts: vec![],
+        plutus_v3_scripts: vec![],
+        plutus_data: vec![],
+        redeemers: vec![],
+        raw_redeemers_cbor: None,
+        raw_plutus_data_cbor: None,
+        original_script_data_hash: None,
+    }
+}
+
+fn conway_body(fee: u64, payment_byte: u8) -> TransactionBody {
+    TransactionBody {
+        inputs: vec![TransactionInput {
+            transaction_id: Hash32::ZERO,
+            index: 0,
+        }],
+        outputs: vec![TransactionOutput {
+            address: addr_with_payment(payment_byte),
+            value: Value::lovelace(2_000_000),
+            datum: OutputDatum::None,
+            script_ref: None,
+            is_legacy: false,
+            raw_cbor: None,
+        }],
+        fee: Lovelace(fee),
+        ttl: Some(SlotNo(999_999)),
+        certificates: vec![],
+        withdrawals: BTreeMap::new(),
+        auxiliary_data_hash: None,
+        validity_interval_start: None,
+        mint: BTreeMap::new(),
+        script_data_hash: None,
+        collateral: vec![],
+        required_signers: vec![],
+        network_id: None,
+        collateral_return: None,
+        total_collateral: None,
+        reference_inputs: vec![],
+        update: None,
+        voting_procedures: BTreeMap::new(),
+        proposal_procedures: vec![],
+        treasury_value: None,
+        donation: None,
+        sub_transactions: vec![],
+        account_balance_intervals: vec![],
+        direct_deposits: BTreeMap::new(),
+        guards: Vec::new(),
+    }
+}
+
+/// Encode a minimal Conway tx paying `fee` to an enterprise address whose
+/// payment credential is `[payment_byte; 28]`. Asserts the bytes decode
+/// through the same path the service uses.
+fn conway_tx_cbor(fee: u64, payment_byte: u8) -> Vec<u8> {
+    let tx = Transaction {
+        hash: Hash32::ZERO,
+        era: Era::Conway,
+        body: conway_body(fee, payment_byte),
+        witness_set: empty_witness_set(),
+        is_valid: true,
+        auxiliary_data: None,
+        raw_cbor: None,
+        raw_body_cbor: None,
+        raw_witness_cbor: None,
+    };
+    let cbor = dugite_serialization::encode::encode_transaction(&tx);
+    dugite_serialization::decode_transaction(6, &cbor)
+        .expect("fixture must decode as a Conway transaction");
+    cbor
+}
+
+/// Build a v1beta `TxPredicate` (submit.proto's local shape) with a
+/// `has_address(payment_part)` leaf — the local sibling of
+/// `watch_service.rs`'s `payment_part_predicate`, over `submit`'s own
+/// (structurally identical) generated `TxPredicate` type.
+fn payment_part_predicate_submit(
+    payment_byte: u8,
+) -> dugite_rpc::proto::v1beta::submit::TxPredicate {
+    use dugite_rpc::proto::v1beta::submit::{any_chain_tx_pattern, AnyChainTxPattern, TxPredicate};
+    TxPredicate {
+        r#match: Some(AnyChainTxPattern {
+            chain: Some(any_chain_tx_pattern::Chain::Cardano(
+                dugite_rpc::proto::v1beta::cardano::TxPattern {
+                    has_address: Some(dugite_rpc::proto::v1beta::cardano::AddressPattern {
+                        exact_address: None,
+                        payment_part: Some(vec![payment_byte; 28]),
+                        delegation_part: None,
+                    }),
+                    ..Default::default()
+                },
+            )),
+        }),
+        not: vec![],
+        all_of: vec![],
+        any_of: vec![],
+    }
+}
 
 // ─── SubmitMock ──────────────────────────────────────────────────────────
 
@@ -909,6 +1035,184 @@ async fn watch_mempool_alpha_streams_added_events() {
     assert_eq!(item.r#ref, vec![0x09; 32]);
     assert_eq!(item.native_bytes, vec![0x0A]);
     assert_eq!(item.stage, Stage::Mempool as i32);
+
+    drop(stream);
+    server.stop().await;
+}
+
+/// Issue #1004: `WatchMempool`'s `TxPredicate` was accepted on the wire
+/// and completely ignored — every mempool tx matched regardless of the
+/// filter. A client subscribing with an address filter must receive
+/// ONLY matching txs.
+#[tokio::test]
+async fn watch_mempool_predicate_filters_on_payment_part() {
+    use dugite_rpc::proto::v1beta::submit::submit_service_client::SubmitServiceClient;
+    use dugite_rpc::proto::v1beta::submit::WatchMempoolRequest;
+
+    let mock = Arc::new(SubmitMock::rejecting("unused"));
+    let server = TestServer::start(mock).await;
+    let mut client = SubmitServiceClient::new(server.channel().await);
+    let mut stream = client
+        .watch_mempool(WatchMempoolRequest {
+            predicate: Some(payment_part_predicate_submit(0x11)),
+            field_mask: None,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    // Pays 0x22 → filtered out.
+    server
+        .mempool_tx
+        .send(MempoolEvent::Added {
+            tx_hash: hash32(0x01),
+            raw_cbor: Some(conway_tx_cbor(111_111, 0x22)),
+        })
+        .unwrap();
+    // Pays 0x11 → must be the first delivered message.
+    server
+        .mempool_tx
+        .send(MempoolEvent::Added {
+            tx_hash: hash32(0x02),
+            raw_cbor: Some(conway_tx_cbor(444_444, 0x11)),
+        })
+        .unwrap();
+
+    let msg = stream.next().await.expect("added msg").unwrap();
+    let item = msg.tx.expect("tx set");
+    assert_eq!(
+        item.r#ref,
+        vec![0x02; 32],
+        "non-matching tx must be filtered by the predicate, not delivered first"
+    );
+    let parsed_state = item.parsed_state.expect("parsed_state populated on match");
+    match parsed_state {
+        dugite_rpc::proto::v1beta::submit::tx_in_mempool::ParsedState::Cardano(tx) => {
+            assert_eq!(tx.outputs.len(), 1);
+        }
+    }
+
+    drop(stream);
+    server.stop().await;
+}
+
+/// Companion negative case: an event with NO raw bytes cannot be
+/// verified against a predicate, so it must be dropped rather than
+/// treated as a match "just in case" — the reject/skip-over-silent-pass
+/// rule.
+#[tokio::test]
+async fn watch_mempool_predicate_drops_events_with_no_bytes_to_evaluate() {
+    use dugite_rpc::proto::v1beta::submit::submit_service_client::SubmitServiceClient;
+    use dugite_rpc::proto::v1beta::submit::WatchMempoolRequest;
+
+    let mock = Arc::new(SubmitMock::rejecting("unused"));
+    let server = TestServer::start(mock).await;
+    let mut client = SubmitServiceClient::new(server.channel().await);
+    let mut stream = client
+        .watch_mempool(WatchMempoolRequest {
+            predicate: Some(payment_part_predicate_submit(0x11)),
+            field_mask: None,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    // No bytes → cannot evaluate the predicate → must be dropped.
+    server
+        .mempool_tx
+        .send(MempoolEvent::Added {
+            tx_hash: hash32(0x01),
+            raw_cbor: None,
+        })
+        .unwrap();
+    // Sentinel: matches and has bytes.
+    server
+        .mempool_tx
+        .send(MempoolEvent::Added {
+            tx_hash: hash32(0x02),
+            raw_cbor: Some(conway_tx_cbor(222_222, 0x11)),
+        })
+        .unwrap();
+
+    let msg = stream.next().await.expect("added msg").unwrap();
+    assert_eq!(msg.tx.expect("tx set").r#ref, vec![0x02; 32]);
+
+    drop(stream);
+    server.stop().await;
+}
+
+/// No predicate at all → unfiltered pass-through is preserved, including
+/// events with no raw bytes (pre-existing behaviour;
+/// `watch_mempool_streams_added_events_and_skips_removals` above already
+/// covers most of this — this test isolates the "no predicate at all"
+/// branch specifically against the new filter/decode helper).
+#[tokio::test]
+async fn watch_mempool_no_predicate_is_unfiltered() {
+    use dugite_rpc::proto::v1beta::submit::submit_service_client::SubmitServiceClient;
+    use dugite_rpc::proto::v1beta::submit::WatchMempoolRequest;
+
+    let mock = Arc::new(SubmitMock::rejecting("unused"));
+    let server = TestServer::start(mock).await;
+    let mut client = SubmitServiceClient::new(server.channel().await);
+    let mut stream = client
+        .watch_mempool(WatchMempoolRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+
+    server
+        .mempool_tx
+        .send(MempoolEvent::Added {
+            tx_hash: hash32(0x01),
+            raw_cbor: None,
+        })
+        .unwrap();
+
+    let msg = stream.next().await.expect("added msg").unwrap();
+    let item = msg.tx.expect("tx set");
+    assert_eq!(item.r#ref, vec![0x01; 32]);
+    assert!(item.native_bytes.is_empty());
+    assert!(item.parsed_state.is_none());
+
+    drop(stream);
+    server.stop().await;
+}
+
+/// FieldMask (issue #1004): a mask naming only `stage` must prune
+/// `native_bytes` / `parsed_state` from every streamed item.
+#[tokio::test]
+async fn watch_mempool_field_mask_prunes_streamed_items() {
+    use dugite_rpc::proto::v1beta::submit::submit_service_client::SubmitServiceClient;
+    use dugite_rpc::proto::v1beta::submit::{Stage, WatchMempoolRequest};
+    use prost_types::FieldMask;
+
+    let mock = Arc::new(SubmitMock::rejecting("unused"));
+    let server = TestServer::start(mock).await;
+    let mut client = SubmitServiceClient::new(server.channel().await);
+    let mut stream = client
+        .watch_mempool(WatchMempoolRequest {
+            predicate: None,
+            field_mask: Some(FieldMask {
+                paths: vec!["tx.stage".to_string()],
+            }),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    server
+        .mempool_tx
+        .send(MempoolEvent::Added {
+            tx_hash: hash32(0x02),
+            raw_cbor: Some(vec![0xFE, 0xED]),
+        })
+        .unwrap();
+
+    let msg = stream.next().await.expect("added msg").unwrap();
+    let item = msg.tx.expect("tx kept (named by mask)");
+    assert_eq!(item.stage, Stage::Mempool as i32, "masked leaf kept");
+    assert!(item.native_bytes.is_empty(), "unmasked leaf cleared");
+    assert!(item.r#ref.is_empty(), "unmasked leaf cleared");
 
     drop(stream);
     server.stop().await;

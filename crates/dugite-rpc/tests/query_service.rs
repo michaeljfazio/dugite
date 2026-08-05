@@ -406,6 +406,109 @@ async fn read_era_summary_returns_summaries() {
     server.stop().await;
 }
 
+// ─── FieldMask (issue #1004) ───────────────────────────────────────────────
+//
+// masking.rs's own unit tests cover the pruning algorithm in isolation;
+// these prove the mask actually reaches the server's real response types
+// over a live gRPC connection — the wiring, not just the mechanism.
+
+#[tokio::test]
+async fn read_params_field_mask_selects_ledger_tip_only() {
+    use dugite_rpc::proto::v1beta::query::query_service_client::QueryServiceClient;
+    use dugite_rpc::proto::v1beta::query::ReadParamsRequest;
+    use prost_types::FieldMask;
+
+    let server = TestServer::start(make_mock()).await;
+    let mut client = QueryServiceClient::new(server.channel().await);
+    let resp = client
+        .read_params(ReadParamsRequest {
+            field_mask: Some(FieldMask {
+                paths: vec!["ledger_tip".to_string()],
+            }),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(
+        resp.values.is_none(),
+        "the full PParams payload must be pruned when only ledger_tip is masked in"
+    );
+    let tip = resp
+        .ledger_tip
+        .expect("ledger_tip kept — named by the mask");
+    assert_eq!(tip.slot, 12_345);
+    assert_eq!(tip.height, 99);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn read_params_no_field_mask_is_unpruned() {
+    // Sanity companion to the test above: omitting the mask entirely
+    // must still return everything (the documented "no FieldMask ->
+    // all fields" default), so the masked test isn't just measuring an
+    // empty mock.
+    use dugite_rpc::proto::v1beta::query::query_service_client::QueryServiceClient;
+    use dugite_rpc::proto::v1beta::query::ReadParamsRequest;
+
+    let server = TestServer::start(make_mock()).await;
+    let mut client = QueryServiceClient::new(server.channel().await);
+    let resp = client
+        .read_params(ReadParamsRequest { field_mask: None })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(resp.values.is_some());
+    assert!(resp.ledger_tip.is_some());
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn read_utxos_field_mask_prunes_nested_chain_point_fields() {
+    use dugite_rpc::proto::v1beta::query::query_service_client::QueryServiceClient;
+    use dugite_rpc::proto::v1beta::query::{ReadUtxosRequest, TxoRef};
+    use prost_types::FieldMask;
+
+    let mut mock = make_mock();
+    let tx_hash = Hash32::from_bytes([7u8; 32]);
+    mock.utxos.insert(
+        (tx_hash, 0),
+        TransactionOutput {
+            address: Address::Byron(ByronAddress {
+                payload: vec![1, 2, 3],
+            }),
+            value: Value::lovelace(2_500_000),
+            datum: OutputDatum::None,
+            script_ref: None,
+            is_legacy: false,
+            raw_cbor: None,
+        },
+    );
+    let server = TestServer::start(mock).await;
+    let mut client = QueryServiceClient::new(server.channel().await);
+    let resp = client
+        .read_utxos(ReadUtxosRequest {
+            keys: vec![TxoRef {
+                hash: tx_hash.as_ref().to_vec(),
+                index: 0,
+            }],
+            // Nested path: keep items whole, but only `slot` under
+            // ledger_tip — proves the mask reaches past the top level
+            // over the real wire, not just in the unit tests.
+            field_mask: Some(FieldMask {
+                paths: vec!["items".to_string(), "ledger_tip.slot".to_string()],
+            }),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.items.len(), 1, "named field kept whole");
+    let tip = resp.ledger_tip.expect("ledger_tip present (named by mask)");
+    assert_eq!(tip.slot, 12_345, "masked leaf kept");
+    assert_eq!(tip.height, 0, "unmasked leaf cleared");
+    server.stop().await;
+}
+
 // ─── SearchUtxos by exact address ─────────────────────────────────────────
 
 #[tokio::test]

@@ -418,6 +418,146 @@ async fn fetch_block_multiple_refs_in_order() {
     server.stop().await;
 }
 
+// ─── FieldMask (issue #1004) ───────────────────────────────────────────────
+//
+// `FetchBlockResponse.block` is exactly the "block bodies" bandwidth
+// example from the issue: a repeated field a mask must be able to prune
+// INTO (elementwise), not just clear wholesale. masking.rs's unit tests
+// already cover the algorithm; these prove it end-to-end over the real
+// SyncService wire.
+
+#[tokio::test]
+async fn fetch_block_field_mask_unnamed_top_level_field_clears_whole_list() {
+    use dugite_rpc::proto::v1beta::sync::sync_service_client::SyncServiceClient;
+    use dugite_rpc::proto::v1beta::sync::{BlockRef, FetchBlockRequest};
+    use prost_types::FieldMask;
+
+    let server =
+        TestServer::start(SyncMock::new(vec![entry(10, 0x01, 1), entry(20, 0x02, 2)])).await;
+    let mut client = SyncServiceClient::new(server.channel().await);
+    let mut hash = [0u8; 32];
+    hash[0] = 0x02;
+
+    // A mask naming a field that doesn't exist on FetchBlockResponse at
+    // all ("bogus") selects nothing — the real `block` field (the only
+    // payload) must be cleared entirely, proving the mask reached the
+    // live response rather than being silently dropped on the floor.
+    let resp = client
+        .fetch_block(FetchBlockRequest {
+            r#ref: vec![BlockRef {
+                slot: 0,
+                hash: hash.to_vec(),
+                height: 0,
+                timestamp: 0,
+            }],
+            field_mask: Some(FieldMask {
+                paths: vec!["bogus".to_string()],
+            }),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        resp.block.is_empty(),
+        "the mock DID find the block (see fetch_block_by_hash_returns_native_bytes); \
+         an empty result here can only come from the mask pruning the unnamed `block` field"
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn fetch_block_field_mask_prunes_repeated_block_elements() {
+    use dugite_rpc::proto::v1beta::sync::sync_service_client::SyncServiceClient;
+    use dugite_rpc::proto::v1beta::sync::{BlockRef, FetchBlockRequest};
+    use prost_types::FieldMask;
+
+    let server =
+        TestServer::start(SyncMock::new(vec![entry(10, 0x01, 1), entry(20, 0x02, 2)])).await;
+    let mut client = SyncServiceClient::new(server.channel().await);
+    let mut h1 = [0u8; 32];
+    h1[0] = 0x01;
+    let mut h2 = [0u8; 32];
+    h2[0] = 0x02;
+
+    // "block.native_bytes" — the repeated `block` field is kept (it's
+    // named), and the mask continues past it: every element must be
+    // pruned down to just native_bytes (elementwise, per masking.rs's
+    // documented repeated-field extension).
+    let resp = client
+        .fetch_block(FetchBlockRequest {
+            r#ref: vec![
+                BlockRef {
+                    slot: 0,
+                    hash: h1.to_vec(),
+                    height: 0,
+                    timestamp: 0,
+                },
+                BlockRef {
+                    slot: 0,
+                    hash: h2.to_vec(),
+                    height: 0,
+                    timestamp: 0,
+                },
+            ],
+            field_mask: Some(FieldMask {
+                paths: vec!["block.native_bytes".to_string()],
+            }),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.block.len(), 2, "the named repeated field survives");
+    assert_eq!(resp.block[0].native_bytes, vec![0xDE, 0xAD, 0x01]);
+    assert_eq!(resp.block[1].native_bytes, vec![0xDE, 0xAD, 0x02]);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn follow_tip_field_mask_applies_to_every_streamed_response() {
+    use dugite_rpc::proto::v1beta::sync::sync_service_client::SyncServiceClient;
+    use dugite_rpc::proto::v1beta::sync::FollowTipRequest;
+    use prost_types::FieldMask;
+    use tokio_stream::StreamExt;
+
+    let server = TestServer::start(SyncMock::new(vec![entry(700, 0x77, 7)])).await;
+    let publisher = server.tip_feed.publisher();
+    let mut client = SyncServiceClient::new(server.channel().await);
+
+    // Mask selects only `tip` — the `action` oneof (the actual block
+    // payload) must be cleared on every emitted message, streamed or
+    // not.
+    let stream = client
+        .follow_tip(FollowTipRequest {
+            intersect: vec![],
+            field_mask: Some(FieldMask {
+                paths: vec!["tip".to_string()],
+            }),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut stream = stream;
+
+    let mut h = [0u8; 32];
+    h[0] = 0x77;
+    publisher.announce_apply(TipInfo {
+        slot: 700,
+        hash: h,
+        block_number: 7,
+        era: Era::Conway,
+    });
+
+    let msg = stream.next().await.expect("apply msg").unwrap();
+    assert!(
+        msg.action.is_none(),
+        "action must be pruned — the mask names only `tip`"
+    );
+    assert_eq!(msg.tip.expect("tip kept").slot, 700);
+
+    drop(stream);
+    server.stop().await;
+}
+
 // ─── DumpHistory ─────────────────────────────────────────────────────────
 
 #[tokio::test]

@@ -363,6 +363,47 @@ async fn watch_tx_streams_apply_event_with_parsed_tx() {
     server.stop().await;
 }
 
+/// FieldMask (issue #1004): a mask naming only `action` (the outer
+/// oneof field, itself untouchable further without descending into the
+/// Cardano `Tx` type — proto3 oneofs are not addressable by field name
+/// the way a plain message is) proves the mask reaches every streamed
+/// `WatchTxResponse`. Masking down INTO the tx body is exercised by
+/// `masking.rs`'s own unit tests + the sync-service integration tests
+/// (`fetch_block_field_mask_prunes_repeated_block_elements`); this test
+/// is about the wiring being live on this particular stream.
+#[tokio::test]
+async fn watch_tx_field_mask_prunes_streamed_responses() {
+    use v1beta::watch::watch_service_client::WatchServiceClient;
+    use v1beta::watch::WatchTxRequest;
+
+    let server = TestServer::start().await;
+    let mut client = WatchServiceClient::new(server.channel().await);
+    let mut stream = client
+        .watch_tx(WatchTxRequest {
+            predicate: None,
+            field_mask: Some(prost_types::FieldMask {
+                paths: vec!["bogus_field_name".to_string()],
+            }),
+            intersect: vec![],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    server.added(0x01, Some(conway_tx_cbor(171_111, 0x11)));
+
+    let msg = stream.next().await.expect("msg").unwrap();
+    assert!(
+        msg.action.is_none(),
+        "the only real field (`action`) must be pruned when the mask names \
+         something else entirely — proves the mask reached this stream, not \
+         just the isolated masking::apply function"
+    );
+
+    drop(stream);
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn watch_tx_skips_undecodable_cbor_then_delivers_next_valid() {
     use v1beta::watch::watch_service_client::WatchServiceClient;

@@ -1,22 +1,44 @@
 //! `SubmitService` — transaction submission + mempool inspection.
 //!
-//! M3 (this commit): SubmitTx, ReadMempool, WaitForTx, WatchMempool all
-//! implemented against `LedgerContext::submit_tx` /
-//! `mempool_snapshot` + `MempoolFeed`. EvalTx remains UNIMPLEMENTED —
-//! it needs a non-committing UPLC evaluation helper extracted from
-//! `dugite_ledger::plutus::eval_phase_two_raw` (deferred follow-up).
+//! `SubmitTx` / `ReadMempool` / `WaitForTx` implemented against
+//! `LedgerContext::submit_tx` / `mempool_snapshot` + `MempoolFeed`.
+//! `EvalTx` runs non-committing Phase-1 + Phase-2 validation via
+//! `LedgerContext::eval_tx` and maps the per-redeemer report into
+//! `TxEval` (fee / ex_units / traces / errors).
+//!
+//! `WatchMempool` streams `MempoolEvent::Added` filtered through the
+//! same `TxPredicate` matcher `WatchService::WatchTx` uses
+//! (`crate::map::patterns::matches_tx_predicate`) — issue #1004: the
+//! predicate was previously accepted on the wire and silently ignored
+//! (every mempool tx matched, regardless of what the client asked for).
+//! An event with no raw CBOR is emitted unfiltered only when the
+//! request carries NO predicate (matching prior behaviour, since there
+//! is nothing to filter); with a predicate set, an event lacking bytes
+//! to evaluate it against is dropped rather than guessed at — the same
+//! reject/skip-over-silent-pass-through rule `WatchTx` already follows.
 //!
 //! Tx era inference: SubmitTx infers the era from the SubmitTxRequest's
 //! oneof variant — only `raw` is defined at v1beta v0.19.2, so we
-//! default to Conway era id (6). M2.B+ may add explicit era hints.
+//! default to Conway era id (6). A future spec revision adding explicit
+//! era hints would replace this.
+//!
+//! Every emitted response is run through `masking::apply` (issue #1004)
+//! using the request's `FieldMask`.
 
 use dugite_mempool::{MempoolEvent, MempoolRemoveReason};
+use dugite_primitives::hash::TransactionHash;
+use dugite_serialization::decode_transaction;
 use std::collections::HashSet;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
+use tracing::warn;
 
-use super::ServiceState;
+use super::{mask_paths, send_masked, ServiceState};
+use crate::map::message_names;
+use crate::map::patterns::matches_tx_predicate;
+use crate::map::tx::tx_to_proto;
+use crate::masking;
 use crate::proto::{v1alpha, v1beta};
 use crate::{EvalOutcome, SubmitOutcome};
 
@@ -24,6 +46,70 @@ const SERVICE_LABEL: &str = "submit";
 
 /// Conway-era CBOR tag the spec uses for txs at PV9+ today.
 const DEFAULT_ERA_ID: u16 = 6;
+
+/// Decide whether a `WatchMempool` event should reach the client, and
+/// what to emit if so — shared by the `v1alpha` and `v1beta` streams.
+///
+/// * No `predicate`: emit unconditionally (matches prior behaviour —
+///   nothing to filter, so no reason to pay a decode cost nobody asked
+///   for). `native_bytes` is the raw CBOR or empty; `parsed_state` stays
+///   unset.
+/// * `predicate` set: the event MUST decode and match, or it is
+///   dropped. An event with no bytes (or bytes that fail to decode)
+///   cannot be verified against the predicate, so it is filtered out —
+///   never treated as a match "just in case". On a match, `parsed_state`
+///   is populated from the same decode (already paid for).
+///
+/// Returns `None` when the event must not be emitted.
+fn filter_and_decode_beta(
+    predicate: Option<&v1beta::watch::TxPredicate>,
+    tx_hash: &TransactionHash,
+    raw_cbor: Option<Vec<u8>>,
+) -> Option<(Vec<u8>, Option<v1beta::submit::tx_in_mempool::ParsedState>)> {
+    match predicate {
+        None => Some((raw_cbor.unwrap_or_default(), None)),
+        Some(pred) => {
+            let cbor = raw_cbor?;
+            let decoded = match decode_transaction(DEFAULT_ERA_ID, &cbor) {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(
+                        hash = %hex::encode(tx_hash.as_ref()),
+                        error = %e,
+                        "WatchMempool: tx decode failed; skipping event"
+                    );
+                    return None;
+                }
+            };
+            if !matches_tx_predicate(Some(pred), &decoded) {
+                return None;
+            }
+            let beta_tx = tx_to_proto(&decoded);
+            Some((
+                cbor,
+                Some(v1beta::submit::tx_in_mempool::ParsedState::Cardano(beta_tx)),
+            ))
+        }
+    }
+}
+
+/// `v1alpha` wrapper over [`filter_and_decode_beta`] — recodes the
+/// parsed `Tx` into the `v1alpha` shape when present.
+fn filter_and_decode_alpha(
+    predicate: Option<&v1beta::watch::TxPredicate>,
+    tx_hash: &TransactionHash,
+    raw_cbor: Option<Vec<u8>>,
+) -> Option<(Vec<u8>, Option<v1alpha::submit::tx_in_mempool::ParsedState>)> {
+    let (native_bytes, parsed_beta) = filter_and_decode_beta(predicate, tx_hash, raw_cbor)?;
+    let parsed_alpha = parsed_beta.map(|p| {
+        use prost::Message;
+        let v1beta::submit::tx_in_mempool::ParsedState::Cardano(beta_tx) = p;
+        let alpha_tx = v1alpha::cardano::Tx::decode(beta_tx.encode_to_vec().as_slice())
+            .expect("v1alpha Tx subset-compatible with v1beta");
+        v1alpha::submit::tx_in_mempool::ParsedState::Cardano(alpha_tx)
+    });
+    Some((native_bytes, parsed_alpha))
+}
 
 /// Build the v1beta TxEval envelope from an [`EvalOutcome`].
 fn eval_outcome_to_proto_beta(outcome: EvalOutcome) -> v1beta::cardano::TxEval {
@@ -267,7 +353,14 @@ impl v1alpha::submit::submit_service_server::SubmitService for SubmitSvcAlpha {
                 r#ref: raw_tx.hash.as_ref().to_vec(),
                 native_bytes: raw_tx.cbor,
                 stage: v1alpha::submit::Stage::Mempool as i32,
-                parsed_state: None, // M4 may populate; clients can decode native_bytes
+                // Not decoded: `ReadMempool` returns a point-in-time
+                // snapshot of the WHOLE mempool, so decoding every item
+                // (unlike `WatchMempool`, which only decodes on a
+                // predicate match) would pay a CBOR-decode cost per tx
+                // on every call regardless of whether the caller wants
+                // it. Clients that need the parsed shape can decode
+                // `native_bytes` themselves.
+                parsed_state: None,
             })
             .collect();
         Ok(Response::new(v1alpha::submit::ReadMempoolResponse {
@@ -279,30 +372,46 @@ impl v1alpha::submit::submit_service_server::SubmitService for SubmitSvcAlpha {
 
     async fn watch_mempool(
         &self,
-        _request: Request<v1alpha::submit::WatchMempoolRequest>,
+        request: Request<v1alpha::submit::WatchMempoolRequest>,
     ) -> Result<Response<Self::WatchMempoolStream>, Status> {
         self.state
             .metrics
             .stream_started(SERVICE_LABEL, "watch_mempool");
         let mut events = self.state.mempool_feed.subscribe();
         let (tx, rx) = mpsc::channel(self.state.config.stream_buffer);
+        let req = request.into_inner();
+        let mask = mask_paths(req.field_mask);
+        // Recode the v1alpha predicate to v1beta — same shape at
+        // v0.19.2, so prost re-encoding round-trips exactly (mirrors
+        // `WatchService::watch_tx`).
+        let predicate_beta: Option<v1beta::watch::TxPredicate> = {
+            use prost::Message;
+            req.predicate
+                .map(|p| p.encode_to_vec())
+                .and_then(|b| v1beta::watch::TxPredicate::decode(b.as_slice()).ok())
+        };
         tokio::spawn(async move {
             loop {
                 match events.recv().await {
-                    Ok(MempoolEvent::Added {
-                        tx_hash, raw_cbor, ..
-                    }) => {
+                    Ok(MempoolEvent::Added { tx_hash, raw_cbor }) => {
+                        let Some((native_bytes, parsed_state)) =
+                            filter_and_decode_alpha(predicate_beta.as_ref(), &tx_hash, raw_cbor)
+                        else {
+                            continue;
+                        };
                         let item = v1alpha::submit::TxInMempool {
                             r#ref: tx_hash.as_ref().to_vec(),
-                            native_bytes: raw_cbor.unwrap_or_default(),
+                            native_bytes,
                             stage: v1alpha::submit::Stage::Mempool as i32,
-                            parsed_state: None,
+                            parsed_state,
                         };
-                        if tx
-                            .send(Ok(v1alpha::submit::WatchMempoolResponse { tx: Some(item) }))
-                            .await
-                            .is_err()
-                        {
+                        let resp = v1alpha::submit::WatchMempoolResponse { tx: Some(item) };
+                        let masked = masking::apply(
+                            &mask,
+                            resp,
+                            message_names::WATCH_MEMPOOL_RESPONSE_ALPHA,
+                        );
+                        if send_masked(&tx, masked).await {
                             break;
                         }
                     }
@@ -460,30 +569,44 @@ impl v1beta::submit::submit_service_server::SubmitService for SubmitSvcBeta {
 
     async fn watch_mempool(
         &self,
-        _request: Request<v1beta::submit::WatchMempoolRequest>,
+        request: Request<v1beta::submit::WatchMempoolRequest>,
     ) -> Result<Response<Self::WatchMempoolStream>, Status> {
         self.state
             .metrics
             .stream_started(SERVICE_LABEL, "watch_mempool");
         let mut events = self.state.mempool_feed.subscribe();
         let (tx, rx) = mpsc::channel(self.state.config.stream_buffer);
+        let req = request.into_inner();
+        let mask = mask_paths(req.field_mask);
+        // `submit.proto` declares its own `TxPredicate` (identical shape
+        // to `watch.proto`'s, field-for-field, but a distinct generated
+        // Rust type) — recode into `v1beta::watch::TxPredicate` so the
+        // one shared `matches_tx_predicate` matcher can evaluate it.
+        let predicate: Option<v1beta::watch::TxPredicate> = {
+            use prost::Message;
+            req.predicate
+                .map(|p| p.encode_to_vec())
+                .and_then(|b| v1beta::watch::TxPredicate::decode(b.as_slice()).ok())
+        };
         tokio::spawn(async move {
             loop {
                 match events.recv().await {
-                    Ok(MempoolEvent::Added {
-                        tx_hash, raw_cbor, ..
-                    }) => {
+                    Ok(MempoolEvent::Added { tx_hash, raw_cbor }) => {
+                        let Some((native_bytes, parsed_state)) =
+                            filter_and_decode_beta(predicate.as_ref(), &tx_hash, raw_cbor)
+                        else {
+                            continue;
+                        };
                         let item = v1beta::submit::TxInMempool {
                             r#ref: tx_hash.as_ref().to_vec(),
-                            native_bytes: raw_cbor.unwrap_or_default(),
+                            native_bytes,
                             stage: v1beta::submit::Stage::Mempool as i32,
-                            parsed_state: None,
+                            parsed_state,
                         };
-                        if tx
-                            .send(Ok(v1beta::submit::WatchMempoolResponse { tx: Some(item) }))
-                            .await
-                            .is_err()
-                        {
+                        let resp = v1beta::submit::WatchMempoolResponse { tx: Some(item) };
+                        let masked =
+                            masking::apply(&mask, resp, message_names::WATCH_MEMPOOL_RESPONSE_BETA);
+                        if send_masked(&tx, masked).await {
                             break;
                         }
                     }
