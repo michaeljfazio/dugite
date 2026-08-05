@@ -128,6 +128,24 @@ enum DRepSubcommand {
         #[arg(long)]
         out_file: PathBuf,
     },
+    /// Calculate the hash of a DRep metadata file
+    ///
+    /// #1008: same `blake2b_256(raw bytes)` computation as `hash
+    /// anchor-data` (oracle-verified against cardano-api's
+    /// `hashDRepMetadata` = `Crypto.hashWith id bs` directly — no JSON
+    /// parsing or canonicalization despite what the upstream doc comment
+    /// implies). Shares `fetch_url_bytes` with `hash anchor-data` for the
+    /// `--drep-metadata-url` path.
+    MetadataHash {
+        #[arg(long, conflicts_with = "drep_metadata_url")]
+        drep_metadata_file: Option<PathBuf>,
+        #[arg(long, conflicts_with = "drep_metadata_file")]
+        drep_metadata_url: Option<String>,
+        #[arg(long, conflicts_with = "out_file")]
+        expected_hash: Option<String>,
+        #[arg(long)]
+        out_file: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -496,6 +514,55 @@ impl GovernanceCmd {
 
                     std::fs::write(&out_file, serde_json::to_string_pretty(&cert_env)?)?;
                     println!("DRep update certificate written to: {}", out_file.display());
+                    Ok(())
+                }
+                DRepSubcommand::MetadataHash {
+                    drep_metadata_file,
+                    drep_metadata_url,
+                    expected_hash,
+                    out_file,
+                } => {
+                    let bytes: Vec<u8> = if let Some(p) = drep_metadata_file {
+                        std::fs::read(&p)
+                            .map_err(|e| anyhow::anyhow!("failed to read '{}': {e}", p.display()))?
+                    } else if let Some(u) = drep_metadata_url {
+                        crate::commands::hash::fetch_url_bytes(&u)?
+                    } else {
+                        anyhow::bail!(
+                            "one of --drep-metadata-file or --drep-metadata-url is required"
+                        );
+                    };
+
+                    let hash = dugite_primitives::hash::blake2b_256(&bytes);
+                    let hex_str = hash.to_hex();
+
+                    if let Some(expected) = expected_hash {
+                        let expected_norm = expected.trim().to_lowercase();
+                        let expected_hash32 =
+                            dugite_primitives::hash::Hash32::from_hex(&expected_norm).map_err(
+                                |e| anyhow::anyhow!("--expected-hash: unable to read hash: {e}"),
+                            )?;
+                        if expected_hash32.to_hex() != hex_str {
+                            anyhow::bail!(
+                                "Hashes do not match!\nExpected: \"{expected_norm}\"\n  Actual: \"{hex_str}\""
+                            );
+                        }
+                        println!("Hashes match!");
+                        return Ok(());
+                    }
+
+                    match out_file {
+                        Some(p) => std::fs::write(&p, &hex_str).map_err(|e| {
+                            anyhow::anyhow!("failed to write '{}': {e}", p.display())
+                        })?,
+                        None => {
+                            use std::io::Write;
+                            let stdout = std::io::stdout();
+                            let mut handle = stdout.lock();
+                            handle.write_all(hex_str.as_bytes())?;
+                            handle.flush()?;
+                        }
+                    }
                     Ok(())
                 }
             },
