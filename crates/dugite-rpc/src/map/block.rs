@@ -6,15 +6,16 @@ use crate::map::common::hash_bytes;
 use crate::map::tx::tx_to_proto;
 use crate::proto::v1beta::cardano as pb_cardano;
 use crate::proto::v1beta::sync as pb_sync;
+use crate::proto::v1beta::watch as pb_watch;
 use dugite_primitives::block::Block;
 
 /// Map a `dugite_primitives::Block` to the parsed Cardano protobuf shape.
 ///
 /// `timestamp` is left at zero — populating it requires the era-history
-/// projection (`EraHistoryView`) which lives behind `LedgerContext`.
-/// M2's QueryService work fills it; M1.B sync clients that need the
-/// wall-clock can either re-derive from `header.slot` + ReadEra or
-/// parse `native_bytes` themselves.
+/// projection (`EraHistoryView`, behind `LedgerContext`), which this
+/// pure mapping function does not have access to. Not done; clients
+/// that need the wall-clock can either re-derive from `header.slot` +
+/// `ReadEraSummary` or parse `native_bytes` themselves.
 pub fn block_to_proto(block: &Block) -> pb_cardano::Block {
     let header = pb_cardano::BlockHeader {
         slot: block.header.slot.0,
@@ -43,6 +44,20 @@ pub fn any_chain_block(raw: &RawBlock, parsed: Option<&Block>) -> pb_sync::AnyCh
     pb_sync::AnyChainBlock {
         native_bytes: raw.cbor.clone(),
         chain: parsed.map(|b| pb_sync::any_chain_block::Chain::Cardano(block_to_proto(b))),
+    }
+}
+
+/// Same envelope as [`any_chain_block`], but `watch.proto`'s own
+/// `AnyChainBlock` message — a distinct generated Rust type from
+/// `sync.proto`'s, field-for-field identical, because utxorpc declares
+/// the envelope separately per package. Shares [`block_to_proto`] so the
+/// only duplication is the unavoidable per-package wrapper, not the
+/// mapping logic. Used by `WatchService::WatchTx` (issue #1007) to
+/// populate `AnyChainTx.block`.
+pub fn any_chain_block_watch(raw: &RawBlock, parsed: Option<&Block>) -> pb_watch::AnyChainBlock {
+    pb_watch::AnyChainBlock {
+        native_bytes: raw.cbor.clone(),
+        chain: parsed.map(|b| pb_watch::any_chain_block::Chain::Cardano(block_to_proto(b))),
     }
 }
 

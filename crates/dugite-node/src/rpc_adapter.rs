@@ -1,8 +1,8 @@
 //! `NodeRpcAdapter` — the bridge from `dugite-node` internals to the
 //! `dugite-rpc` server's [`LedgerContext`] trait.
 //!
-//! M1.B (this commit): all chain/blocks methods are implemented end-to-end
-//! against [`ChainDB`] + [`Mempool`]:
+//! Every method is implemented against [`ChainDB`] / [`LedgerState`] /
+//! [`Mempool`] / the retained genesis + era-history state:
 //!
 //! * `tip` — reads from `chain_db.get_tip()` and looks up the matching
 //!   block's era via a minimal CBOR decode.
@@ -14,13 +14,20 @@
 //!   the first that exists on-chain.
 //! * `blocks_range` — `chain_db.get_blocks_in_slot_range()` then decodes
 //!   identity per block for the carrier fields.
-//!
-//! `utxo_* / params_at_tip / era_history / genesis / submit_tx /
-//! mempool_snapshot` remain `Unimplemented` pending M2 / M3.
+//! * `era_history` — issue #1009: real per-era `start`/`end` boundaries
+//!   from `dugite_consensus::EraHistory::entries()`, the same source of
+//!   truth the N2C `GetEraHistory` query uses
+//!   (`Node::build_era_summaries`). `protocol_params` per era stays
+//!   unset — see `dugite_rpc::EraHistoryView`'s doc comment for why.
+//! * `genesis` — issue #1009: the Shelley-genesis section of
+//!   `GenesisView` from the retained `ShelleyGenesis`. Byron/Alonzo/Conway
+//!   sections stay unset — those genesis structs aren't retained past
+//!   `Node::new()` today; see `dugite_rpc::GenesisView`'s doc comment.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use dugite_consensus::{Bound, EraHistory};
 use dugite_ledger::LedgerState;
 use dugite_mempool::Mempool;
 use dugite_network::TxValidator;
@@ -30,13 +37,72 @@ use dugite_primitives::hash::{Hash32, TransactionHash};
 use dugite_primitives::time::SlotNo;
 use dugite_primitives::transaction::TransactionInput;
 use dugite_rpc::{
-    LedgerContext, ParamsView, RawBlock, RawTx, RpcError, SubmitOutcome, TipFeed, TipInfo,
-    TipPublisher, TipRollback, UtxoSnapshot,
+    EraBoundaryView, EraHistoryView, EraSummary, GenesisView, LedgerContext, ParamsView, RawBlock,
+    RawTx, RpcError, SubmitOutcome, TipFeed, TipInfo, TipPublisher, TipRollback, UtxoSnapshot,
 };
 use dugite_serialization::decode::decode_block_minimal;
 use dugite_storage::ChainDB;
 use tokio::sync::{watch, RwLock};
 use tracing::debug;
+
+/// Reconstruct a `(numerator, denominator)` rational from a genesis
+/// JSON decimal like `activeSlotsCoeff: 0.05`. Deliberately narrow to
+/// the genesis-file use case, NOT a general float-to-rational algorithm
+/// (those don't terminate for values without a short decimal
+/// expansion): every real Cardano genesis file (mainnet/preview/preprod
+/// = 0.05; devnets typically 0.1/0.2/1.0) has at most a few significant
+/// decimal digits, so scaling to 9 digits of precision and reducing by
+/// the GCD recovers the exact value rather than an approximation.
+fn decimal_to_rational(x: f64) -> Option<(i32, u32)> {
+    if !x.is_finite() || x < 0.0 || x > i32::MAX as f64 {
+        return None;
+    }
+    const SCALE: i64 = 1_000_000_000;
+    let scaled = (x * SCALE as f64).round() as i64;
+    if scaled <= 0 {
+        return None;
+    }
+    let divisor = gcd(scaled, SCALE);
+    let numerator = scaled / divisor;
+    let denominator = SCALE / divisor;
+    i32::try_from(numerator)
+        .ok()
+        .and_then(|n| u32::try_from(denominator).ok().map(|d| (n, d)))
+}
+
+fn gcd(a: i64, b: i64) -> i64 {
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
+    }
+}
+
+/// Convert an `EraHistory` `Bound` (slot/epoch + picoseconds RELATIVE to
+/// system start) into an absolute-wall-clock `EraBoundaryView`, as the
+/// `EraBoundary.time` proto field (ms since Unix epoch) requires. 1 ms =
+/// 1_000_000_000 picoseconds (see `Bound::time_pico`'s own doc: 1 second
+/// = 1_000_000_000_000 picoseconds).
+fn era_boundary_view(b: &Bound, system_start_unix_ms: u128) -> EraBoundaryView {
+    let relative_ms = b.time_pico / 1_000_000_000;
+    let absolute_ms = system_start_unix_ms.saturating_add(relative_ms);
+    EraBoundaryView {
+        time_ms: absolute_ms.min(u64::MAX as u128) as u64,
+        slot: b.slot,
+        epoch: b.epoch,
+    }
+}
+
+/// Parse a genesis `system_start` (RFC3339, e.g. `"2017-09-23T21:44:51Z"`)
+/// into Unix seconds. Mirrors the parsing already used for slot-config
+/// derivation (`genesis.rs::ShelleyGenesis::slot_config`) and tip-age
+/// estimation (`node/mod.rs`) — one parse behavior, not a third copy.
+/// Returns 0 on a malformed string (matches those call sites' fallback).
+fn system_start_unix_seconds(system_start: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(system_start)
+        .map(|dt| dt.timestamp())
+        .unwrap_or(0)
+}
 
 use crate::node::tip_broadcast::{TipApply, TipBroadcaster};
 
@@ -63,15 +129,28 @@ pub struct NodeRpcAdapter {
     pub(crate) mempool: Arc<Mempool>,
     pub(crate) tx_validator: Arc<dyn TxValidator>,
     pub(crate) slot_config: dugite_ledger::plutus::SlotConfig,
+    /// Retained for `LedgerContext::genesis` (issue #1009) — `None` on
+    /// networks/configs that don't supply a Shelley genesis file (should
+    /// not happen in practice; `genesis()` falls back to a
+    /// network_magic/security_param-only response in that case, same as
+    /// before this field existed).
+    pub(crate) shelley_genesis: Option<crate::genesis::ShelleyGenesis>,
+    /// Retained for `LedgerContext::era_history` (issue #1009) — same
+    /// `Arc<RwLock<_>>` `Node` itself holds, so era-boundary updates
+    /// (hard forks) are visible here too without a second copy.
+    pub(crate) era_history: Arc<RwLock<EraHistory>>,
 }
 
 impl NodeRpcAdapter {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         chain_db: Arc<RwLock<ChainDB>>,
         ledger_state: Arc<RwLock<LedgerState>>,
         mempool: Arc<Mempool>,
         tx_validator: Arc<dyn TxValidator>,
         slot_config: dugite_ledger::plutus::SlotConfig,
+        shelley_genesis: Option<crate::genesis::ShelleyGenesis>,
+        era_history: Arc<RwLock<EraHistory>>,
     ) -> Self {
         Self {
             chain_db,
@@ -79,6 +158,8 @@ impl NodeRpcAdapter {
             mempool,
             tx_validator,
             slot_config,
+            shelley_genesis,
+            era_history,
         }
     }
 
@@ -322,40 +403,65 @@ impl LedgerContext for NodeRpcAdapter {
         })
     }
 
-    async fn era_history(&self) -> Result<dugite_rpc::EraHistoryView, RpcError> {
-        // M2.A: minimal era-history projection. We project the era of
-        // the current tip as a single EraSummary entry, derived from
-        // protocol_version_major. Full era-boundary mapping requires
-        // the era-history projection from `node/n2c_query/protocol.rs`
-        // which is a sequel commit.
-        let ledger = self.ledger_state.read().await;
-        let pv = ledger.epochs.protocol_params.protocol_version_major;
-        let era = dugite_primitives::block::ProtocolVersion {
-            major: pv,
-            minor: 0,
-        }
-        .era();
-        Ok(dugite_rpc::EraHistoryView {
-            summaries: vec![dugite_rpc::EraSummary {
-                era,
-                first_slot: 0,
-                slot_length_ms: 1_000,
-                epoch_length_slots: 432_000,
-            }],
-        })
+    async fn era_history(&self) -> Result<EraHistoryView, RpcError> {
+        // Issue #1009: real per-era boundaries from the SAME EraHistory
+        // `Node` maintains for the N2C GetEraHistory query
+        // (`Node::build_era_summaries`) — one source of truth, not a
+        // second derivation. `entries()` carries the era tag directly
+        // (unlike `to_era_summary_exports()`, which drops it), so no
+        // separate protocol-version-to-era guess is needed.
+        let eh = self.era_history.read().await;
+        // System start (ms) needed to turn each boundary's
+        // system-start-relative `time_pico` into an absolute wall-clock
+        // ms timestamp, as `EraBoundary.time` requires.
+        let system_start_ms = self
+            .shelley_genesis
+            .as_ref()
+            .map(|sg| system_start_unix_seconds(&sg.system_start).saturating_mul(1_000) as u128)
+            .unwrap_or(0);
+        let summaries = eh
+            .entries()
+            .iter()
+            .map(|entry| EraSummary {
+                era: entry.era,
+                start: era_boundary_view(&entry.start, system_start_ms),
+                end: entry
+                    .end
+                    .as_ref()
+                    .map(|b| era_boundary_view(b, system_start_ms)),
+                slot_length_ms: entry.params.slot_length_ms as u32,
+                epoch_length_slots: entry.params.epoch_size as u32,
+            })
+            .collect();
+        Ok(EraHistoryView { summaries })
     }
 
-    async fn genesis(&self) -> Result<dugite_rpc::GenesisView, RpcError> {
-        // M2.A: emit network_magic + the conventional Shelley start
-        // time (1596059091 s for mainnet — overridden per-network at
-        // M2.B when the genesis files are wired through). security_param
-        // mirrors the ledger's k.
-        let ledger = self.ledger_state.read().await;
-        let _ = ledger; // security_param k lives in node config; surfaced fully in M2.B
-        Ok(dugite_rpc::GenesisView {
-            network_magic: 0,
-            system_start_unix: 0,
-            security_param: 0,
+    async fn genesis(&self) -> Result<GenesisView, RpcError> {
+        // Issue #1009: the Shelley-genesis section, from the genesis
+        // struct `Node` retains for its own startup (`Node::shelley_genesis`).
+        // Byron/Alonzo/Conway sections are NOT populated — those genesis
+        // structs are parsed once during `Node::new()` and dropped rather
+        // than retained; see `dugite_rpc::GenesisView`'s doc comment for
+        // the full accounting of what's deliberately left out and why.
+        let Some(sg) = self.shelley_genesis.as_ref() else {
+            // No Shelley genesis file configured — should not happen for
+            // a real network, but fail open to an empty-but-valid
+            // response rather than Err, matching this method's
+            // pre-#1009 behaviour for missing data.
+            return Ok(GenesisView::default());
+        };
+        Ok(GenesisView {
+            network_magic: sg.network_magic as u32,
+            network_id: sg.network_id.clone(),
+            system_start_unix: system_start_unix_seconds(&sg.system_start),
+            security_param: sg.security_param as u32,
+            epoch_length: sg.epoch_length as u32,
+            slot_length: sg.slot_length as u32,
+            max_lovelace_supply: sg.max_lovelace_supply,
+            max_kes_evolutions: sg.max_k_e_s_evolutions as u32,
+            slots_per_kes_period: sg.slots_per_k_e_s_period as u32,
+            update_quorum: sg.update_quorum as u32,
+            active_slots_coeff: decimal_to_rational(sg.active_slots_coeff),
         })
     }
 
@@ -731,4 +837,93 @@ pub fn build_tip_feed() -> (TipFeed, TipPublisher) {
     let feed = TipFeed::new();
     let publisher = feed.publisher();
     (feed, publisher)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── decimal_to_rational (issue #1009) ─────────────────────────────
+
+    #[test]
+    fn decimal_to_rational_matches_real_genesis_values() {
+        // mainnet / preview / preprod all use exactly this value.
+        assert_eq!(decimal_to_rational(0.05), Some((1, 20)));
+        // Common devnet values.
+        assert_eq!(decimal_to_rational(0.1), Some((1, 10)));
+        assert_eq!(decimal_to_rational(0.2), Some((1, 5)));
+        assert_eq!(decimal_to_rational(1.0), Some((1, 1)));
+    }
+
+    #[test]
+    fn decimal_to_rational_rejects_invalid_input() {
+        assert_eq!(decimal_to_rational(-0.05), None, "negative is invalid");
+        assert_eq!(
+            decimal_to_rational(0.0),
+            None,
+            "zero has no meaningful rational form here"
+        );
+        assert_eq!(decimal_to_rational(f64::NAN), None);
+        assert_eq!(decimal_to_rational(f64::INFINITY), None);
+    }
+
+    #[test]
+    fn gcd_matches_expected_values() {
+        assert_eq!(gcd(50_000_000, 1_000_000_000), 50_000_000);
+        assert_eq!(gcd(6, 4), 2);
+        assert_eq!(gcd(7, 5), 1);
+    }
+
+    // ─── system_start_unix_seconds ─────────────────────────────────────
+
+    #[test]
+    fn system_start_unix_seconds_parses_real_genesis_timestamps() {
+        // Mainnet shelley-genesis.json systemStart.
+        assert_eq!(
+            system_start_unix_seconds("2019-07-24T20:20:16Z"),
+            1_563_999_616
+        );
+        // Preview.
+        assert_eq!(
+            system_start_unix_seconds("2022-10-25T00:00:00Z"),
+            1_666_656_000
+        );
+    }
+
+    #[test]
+    fn system_start_unix_seconds_falls_back_to_zero_on_malformed_input() {
+        assert_eq!(system_start_unix_seconds("not a date"), 0);
+        assert_eq!(system_start_unix_seconds(""), 0);
+    }
+
+    // ─── era_boundary_view ──────────────────────────────────────────────
+
+    #[test]
+    fn era_boundary_view_adds_system_start_to_relative_time() {
+        let bound = Bound {
+            time_pico: 4_492_800u128 * 20_000 * 1_000_000_000, // 4,492,800 Byron slots @ 20s
+            slot: 4_492_800,
+            epoch: 208,
+        };
+        // Mainnet system start, ms.
+        let system_start_ms = 1_506_203_091_000u128;
+        let view = era_boundary_view(&bound, system_start_ms);
+        // relative_ms = 4_492_800 * 20_000 = 89_856_000_000 ms
+        assert_eq!(view.time_ms, 1_506_203_091_000 + 89_856_000_000);
+        assert_eq!(view.slot, 4_492_800);
+        assert_eq!(view.epoch, 208);
+    }
+
+    #[test]
+    fn era_boundary_view_at_system_start_is_the_system_start_time() {
+        let bound = Bound {
+            time_pico: 0,
+            slot: 0,
+            epoch: 0,
+        };
+        let view = era_boundary_view(&bound, 1_666_656_000_000);
+        assert_eq!(view.time_ms, 1_666_656_000_000);
+        assert_eq!(view.slot, 0);
+        assert_eq!(view.epoch, 0);
+    }
 }

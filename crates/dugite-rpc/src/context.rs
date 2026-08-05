@@ -11,10 +11,12 @@
 //! lets service code map cleanly to gRPC status codes via
 //! `error::RpcError::into::<tonic::Status>()`.
 //!
-//! In M1.A only a handful of methods need a real implementation
-//! (`tip`, `block_by_hash`, `block_at_slot`, `intersect`, `genesis`); the
-//! rest can return `RpcError::Unimplemented` until the relevant service
-//! implementation lands.
+//! Every service (`SyncService` / `QueryService` / `SubmitService` /
+//! `WatchService`) is implemented end-to-end, so a production
+//! `LedgerContext` impl needs every method above to actually work.
+//! `RpcError::Unimplemented` remains for genuinely optional capabilities
+//! a given host may not support (e.g. `utxos_by_payment_credential`
+//! without a payment-credential index).
 
 use async_trait::async_trait;
 use dugite_primitives::address::Address;
@@ -42,9 +44,12 @@ pub struct TipInfo {
 /// A block in its native CBOR form, paired with the indexable metadata
 /// the RPC layer needs without re-decoding.
 ///
-/// `cbor` is borrowed-style ownership: the caller can either hand back the
-/// `ChainDB` slice directly (in M1.B we wrap it in `Bytes` for zero-copy)
-/// or allocate a `Vec`. For M1.A we use `Vec<u8>` for simplicity.
+/// `cbor` is plain `Vec<u8>`, not a zero-copy `bytes::Bytes` handle into
+/// the `ChainDB` slice — deliberately, for simplicity, at the cost of
+/// one extra copy per call. A `LedgerContext` impl that can hand back a
+/// borrowed/`Bytes`-backed slice without copying would need this field
+/// widened; not done, and not a behavioural gap (every field is still
+/// populated correctly), just an unclaimed allocation optimisation.
 #[derive(Clone, Debug)]
 pub struct RawBlock {
     pub slot: u64,
@@ -78,9 +83,9 @@ pub struct UtxoSnapshot {
 
 /// Opaque protocol-params view returned by [`LedgerContext::params_at_tip`].
 ///
-/// Wraps the in-tree `ProtocolParameters` so M1.B mapping can read every
-/// field without `dugite-rpc` re-shaping it. `Arc` so adapter calls are
-/// cheap — params change only at epoch boundaries.
+/// Wraps the in-tree `ProtocolParameters` so `crate::map::pparams` can
+/// read every field without `dugite-rpc` re-shaping it. `Arc` so adapter
+/// calls are cheap — params change only at epoch boundaries.
 #[derive(Clone, Debug)]
 pub struct ParamsView {
     pub params: Arc<dugite_primitives::protocol_params::ProtocolParameters>,
@@ -91,34 +96,76 @@ pub struct ParamsView {
 
 /// Opaque era-history view returned by [`LedgerContext::era_history`].
 ///
-/// Refined into a richer shape in M1.B as the QueryService mapping needs
-/// it; this M1.A placeholder is just enough to compile.
+/// Issue #1009: `EraSummary` now carries both the `start` AND `end`
+/// boundary (previously `end` was always unset, and `start` itself was
+/// missing `epoch`/`time_ms` — the mapper hardcoded both to zero). The
+/// one field still deliberately absent is `protocol_params` (the
+/// `PParams` in force during that era): dugite's ledger only retains the
+/// CURRENT era's params, not a per-era history, so there is nothing
+/// truthful to populate for past eras. Left `None` — a documented
+/// absence, not a silent one; see `crate::map::pparams` for the current
+/// live view (`QueryService.ReadParams`, which does not have this gap).
 #[derive(Clone, Debug, Default)]
 pub struct EraHistoryView {
-    /// Era boundaries: `(era, first_slot, slot_length_ms, epoch_length_slots)`
-    /// for each era the chain has crossed, in chronological order.
     pub summaries: Vec<EraSummary>,
+}
+
+/// One era boundary (used for both `EraSummary::start` and `::end`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EraBoundaryView {
+    /// Milliseconds since the Unix epoch (wall-clock), not relative to
+    /// system start — the proto field (`EraBoundary.time`) is an
+    /// absolute ms timestamp.
+    pub time_ms: u64,
+    pub slot: u64,
+    pub epoch: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct EraSummary {
     pub era: Era,
-    pub first_slot: u64,
+    pub start: EraBoundaryView,
+    /// `None` for the current (open) era — matches
+    /// `dugite_consensus::era_history::EraSummaryEntry::end`.
+    pub end: Option<EraBoundaryView>,
     pub slot_length_ms: u32,
     pub epoch_length_slots: u32,
 }
 
 /// Opaque genesis view returned by [`LedgerContext::genesis`].
 ///
-/// Currently a placeholder. M1.B fills the fields the QueryService
-/// `ReadGenesis` response needs (system start, network magic, genesis
-/// pool params, security parameter, etc.) without coupling this crate
-/// to `dugite-ledger::CombinedGenesis`.
+/// Issue #1009: carries the full Shelley-genesis section of
+/// `cardano.Genesis` (14 of its 34 fields) — the Shelley genesis struct
+/// is retained for the node's lifetime (`Node::shelley_genesis`), so
+/// this is real data, not derived/guessed. Byron (9 fields: `avvm_distr`,
+/// `boot_stakeholders`, `heavy_delegation`, `vss_certs`, ...), Alonzo (7:
+/// `cost_models`, `execution_prices`, ...), and Conway (10: `committee`,
+/// `constitution`, `drep_voting_thresholds`, ...) sections remain
+/// unpopulated — DELIBERATELY, not silently: those genesis structs are
+/// parsed once during `Node::new()` and dropped rather than retained,
+/// which is real additional lifecycle plumbing (mirroring what
+/// `shelley_genesis` already does) beyond this issue's scope. `gen_delegs`
+/// / `initial_funds` / `staking` (Shelley genesis fields that exist but
+/// are `HashMap`-shaped, mostly empty on real networks, and only
+/// meaningful for custom devnets) are also left out for the same reason
+/// — real, bounded follow-up work, not implemented here.
 #[derive(Clone, Debug, Default)]
 pub struct GenesisView {
     pub network_magic: u32,
+    pub network_id: String,
     pub system_start_unix: i64,
     pub security_param: u32,
+    pub epoch_length: u32,
+    pub slot_length: u32,
+    pub max_lovelace_supply: u64,
+    pub max_kes_evolutions: u32,
+    pub slots_per_kes_period: u32,
+    pub update_quorum: u32,
+    /// `(numerator, denominator)` reconstructed from the genesis JSON's
+    /// decimal `activeSlotsCoeff` (e.g. `0.05` -> `(1, 20)`) — see
+    /// `dugite-node`'s `rpc_adapter.rs` for the conversion. `None` if the
+    /// value couldn't be reconstructed as a clean rational.
+    pub active_slots_coeff: Option<(i32, u32)>,
 }
 
 /// Outcome of a transaction submission.

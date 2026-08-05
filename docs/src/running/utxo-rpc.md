@@ -51,8 +51,8 @@ after `v1alpha` was frozen. The spec is pinned in-tree at
 | `SyncService` | `FollowTip` (stream) | ✅ implemented |
 | `QueryService` | `ReadParams` | ✅ implemented |
 | `QueryService` | `ReadUtxos` | ✅ implemented |
-| `QueryService` | `ReadGenesis` | ✅ implemented (minimum-viable envelope) |
-| `QueryService` | `ReadEraSummary` | ✅ implemented |
+| `QueryService` | `ReadGenesis` | ✅ implemented (Shelley-genesis section — see [Limitations](#limitations)) |
+| `QueryService` | `ReadEraSummary` | ✅ implemented (real per-era `start`/`end` boundaries) |
 | `QueryService` | `SearchUtxos` | ✅ implemented (`exact_address` / `payment_part` / `delegation_part` / `asset` plus `not` / `all_of` / `any_of` composites) |
 | `QueryService` | `ReadData` | ✅ implemented (bounded scan: live inline datums + mempool tx witness sets) |
 | `QueryService` | `ReadTx` | ✅ implemented (bounded scan: mempool + last ~43 200 slots of VolatileDB) |
@@ -60,9 +60,15 @@ after `v1alpha` was frozen. The spec is pinned in-tree at
 | `SubmitService` | `SubmitTx` | ✅ implemented |
 | `SubmitService` | `ReadMempool` | ✅ implemented |
 | `SubmitService` | `WaitForTx` (stream) | ✅ implemented |
-| `SubmitService` | `WatchMempool` (stream) | ✅ implemented |
+| `SubmitService` | `WatchMempool` (stream) | ✅ implemented (full `TxPredicate` filtering, same matcher as `WatchTx`) |
 | `SubmitService` | `EvalTx` | ✅ implemented (per-redeemer `ex_units` + Plutus traces) |
-| `WatchService` | `WatchTx` (stream) | ✅ implemented (full `TxPredicate` filtering: address / asset / mint / `not` / `all_of` / `any_of`) |
+| `WatchService` | `WatchTx` (stream) | ✅ implemented (full `TxPredicate` filtering: address / asset / mint / `not` / `all_of` / `any_of`; chain-sourced with `apply` / `undo` / `idle`) — see [Limitations](#limitations) |
+
+Every method above honours a request's `google.protobuf.FieldMask` (issue
+#1004): unselected fields are pruned from the response, recursively,
+including into repeated fields like `FetchBlockResponse.block` — see
+`crates/dugite-rpc/src/masking.rs` for the exact semantics (a mask that's
+absent or empty returns everything, matching the canonical FieldMask doc).
 
 ## Configuration
 
@@ -184,6 +190,22 @@ updated, or vice versa) are caught by code review against the diff.
 
 ## Limitations
 
+* `ReadGenesis` populates the full Shelley-genesis section of
+  `cardano.Genesis` (network_magic, network_id, system_start,
+  security_param, epoch_length, slot_length, max_lovelace_supply,
+  max_kes_evolutions, slots_per_kes_period, update_quorum,
+  active_slots_coeff — 10 of the message's 34 fields). Byron
+  (`avvm_distr`, `boot_stakeholders`, `heavy_delegation`, `vss_certs`,
+  ...), Alonzo (`cost_models`, `execution_prices`, ...), and Conway
+  (`committee`, `constitution`, `drep_voting_thresholds`, ...) sections
+  are unset, as are Shelley's `gen_delegs` / `initial_funds` / `staking`
+  — those genesis structs aren't retained past `dugite-node` startup
+  today. Tracked as
+  [#1009](https://github.com/michaeljfazio/dugite/issues/1009).
+* `ReadEraSummary`'s per-era `protocol_params` is unset: dugite's ledger
+  retains only the CURRENT era's `PParams`, not a per-era history, so
+  there is nothing truthful to report for a past era. `start` / `end`
+  boundaries ARE real (slot, epoch, and absolute wall-clock ms).
 * `SearchUtxos` with a fully-wildcard predicate (no `match` /
   combinators) is rejected with `UNIMPLEMENTED`: dugite refuses to
   materialise the entire UTxO set in a single response. Supply at
@@ -206,10 +228,26 @@ updated, or vice versa) are caught by code review against the diff.
   is *conservative* (over-approximates) and therefore safe for
   fee-estimation use cases but may diverge slightly from cardano-node
   on the high end.
-* `WatchTx` filters on tx output fields (`produces` / `has_address`
-  / `moves_asset`) and minting (`mints_asset`) — but not on
-  *resolved* inputs (`consumes` / `has_certificate`) since those
-  require live UTxO lookups against pending mempool txs.
+* `WatchTx` / `WatchMempool` filter on tx output fields (`produces` /
+  `has_address` / `moves_asset`) and minting (`mints_asset`). Two
+  `TxPattern` leaves are not implemented: `consumes` (needs resolved-input
+  UTxO data the watch paths don't have) and `has_certificate` (needs a
+  certificate-type matcher not yet built). A request naming either —
+  anywhere, including nested under `not` / `all_of` / `any_of` — is
+  **rejected** with `UNIMPLEMENTED` before it ever subscribes, rather than
+  silently accepted and under-filtered.
+* `WatchTx` is **chain-sourced**, matching the proto's own "stream
+  transactions from the chain" comment (`SubmitService.WatchMempool` is
+  the pre-confirmation counterpart). It subscribes to the same
+  `TipFeed`/`TipRollback` broadcast `FollowTip` uses: each applied block
+  yields one `apply` `WatchTxResponse` per matching tx (with
+  `AnyChainTx.block` populated) or a single `idle` if the block matched
+  nothing, and a rolled-back block replays its cached matches as `undo`,
+  most-recent-first. The replay data comes from a per-subscriber bounded
+  history (`HISTORY_CAP` = 4,320 blocks, above mainnet `k` = 2,160) built
+  from the subscriber's own apply-time observations — `TipRollback` does
+  not need to carry the rolled-back block's contents. Was
+  [#1007](https://github.com/michaeljfazio/dugite/issues/1007).
 * `FollowTip` apply events carry `AnyChainBlock.native_bytes` (the
   raw block CBOR); clients that only need tip metadata can ignore
   the payload.

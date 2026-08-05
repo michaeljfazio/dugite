@@ -4283,14 +4283,14 @@ impl Node {
             self.tip_broadcaster = Some(Arc::new(tip_broadcast::TipBroadcaster::new()));
         }
 
-        // ─── UTxO RPC server (#672 M1.A) ───────────────────────────────────
+        // ─── UTxO RPC server (#672) ─────────────────────────────────────────
         //
         // Starts here so the tip_broadcaster + mempool feeds are both
         // guaranteed initialised (the broadcaster fallback above ensures
         // it). Gated entirely on RpcConfig.is_some() — when the operator
         // hasn't enabled RPC the gRPC stack and listener are never
-        // touched. Service stubs return UNIMPLEMENTED in M1.A; M1.B+
-        // fills SyncService / QueryService / SubmitService / WatchService.
+        // touched. SyncService / QueryService / SubmitService /
+        // WatchService are all implemented end-to-end.
         if let Some(rpc_cfg) = self.rpc_config.clone() {
             let adapter = Arc::new(crate::rpc_adapter::NodeRpcAdapter::new(
                 self.chain_db.clone(),
@@ -4298,6 +4298,8 @@ impl Node {
                 self.mempool.clone(),
                 n2c_tx_validator.clone() as Arc<dyn dugite_network::TxValidator>,
                 n2c_slot_config,
+                self.shelley_genesis.clone(),
+                self.era_history.clone(),
             ));
             let (tip_feed, tip_publisher) = crate::rpc_adapter::build_tip_feed();
             // Spawn forwarder: subscribes to the node-side TipBroadcaster

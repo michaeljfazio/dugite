@@ -5,17 +5,18 @@
 //! the gRPC stack in its direct compile graph, keeping the node binary
 //! small when the RPC server is disabled (the default).
 //!
-//! See `.claude/plans/create-a-detailed-plan-adaptive-pretzel.md` for the
-//! multi-milestone implementation plan. M1.A (this scaffold) ships:
+//! Ships:
 //!
-//! * Vendored proto from `utxorpc/spec v0.19.2` + tonic-build codegen.
+//! * Vendored proto from `utxorpc/spec` (pinned tag in `proto/VERSION`) +
+//!   tonic-build codegen.
 //! * `RpcServer::start` with gRPC reflection + gRPC-Web + TLS + cooperative
 //!   shutdown.
 //! * `LedgerContext` async trait abstraction over the node — no
 //!   `dugite-node` symbols leak into this crate's public API.
-//! * Service stubs for `SyncService` / `QueryService` / `SubmitService` /
-//!   `WatchService` in both `v1alpha` and `v1beta` — every method returns
-//!   `UNIMPLEMENTED` until M1.B and later milestones land.
+//! * `SyncService` / `QueryService` / `SubmitService` / `WatchService`,
+//!   both `v1alpha` and `v1beta`, implemented end-to-end — see
+//!   `docs/src/running/utxo-rpc.md` for the per-method status table and
+//!   documented (not silently missing) limitations.
 //!
 //! Spec-bump workflow: `just bump-utxorpc-spec <tag>` rewrites
 //! `crates/dugite-rpc/proto/` from the upstream and updates the VERSION
@@ -38,9 +39,9 @@ pub mod tip_feed;
 
 pub use config::{RpcConfig, RpcTlsConfig};
 pub use context::{
-    EraHistoryView, EraSummary, EvalOutcome, GenesisView, LedgerContext, LedgerStateView,
-    ParamsView, RawBlock, RawTx, RedeemerPurpose, RedeemerReport, SubmitOutcome, TipInfo,
-    UtxoSnapshot,
+    EraBoundaryView, EraHistoryView, EraSummary, EvalOutcome, GenesisView, LedgerContext,
+    LedgerStateView, ParamsView, RawBlock, RawTx, RedeemerPurpose, RedeemerReport, SubmitOutcome,
+    TipInfo, UtxoSnapshot,
 };
 pub use error::RpcError;
 pub use mempool_feed::{MempoolEvent, MempoolFeed, MempoolRemoveReason};

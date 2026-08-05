@@ -1,29 +1,43 @@
 //! `QueryService` — read-only ledger queries.
 //!
-//! M2 (this commit) implements:
-//!
 //! * `ReadParams` — `LedgerContext::params_at_tip` + `pparams_to_proto`
 //!   + `tip` for the ledger_tip ChainPoint.
 //! * `ReadUtxos` — `utxo_by_ref` for each requested `TxoRef`. Returns
 //!   the parsed Cardano `TxOutput` + a `ChainPoint` ledger tip.
+//! * `SearchUtxos` — `UtxoPredicate` matcher (`crate::map::patterns`)
+//!   with an index-friendly seed (exact_address / payment_part / asset)
+//!   plus a full post-filter for composite predicates. Rejects an
+//!   unbounded full-scan with no usable predicate (see `query.rs:119` —
+//!   deliberate, not a gap; issue #1004 leaves this as-is).
+//! * `ReadData` — bounded scan of inline datums via `datum_by_hash`.
+//! * `ReadTx` — bounded scan via `tx_by_hash` (mempool + recent volatile
+//!   blocks).
 //! * `ReadGenesis` — `LedgerContext::genesis` minimum-viable envelope
-//!   with network_magic / start_time / security_param. Full Genesis
-//!   message (Byron + Shelley + Alonzo + Conway fields) lands in M2.B
-//!   alongside the full mapping modules.
+//!   with network_magic / start_time / security_param. The full Genesis
+//!   message (Byron + Shelley + Alonzo + Conway fields) is a documented
+//!   follow-up, not wired.
 //! * `ReadEraSummary` — projects `EraHistoryView` into the proto
 //!   EraSummaries shape.
+//! * `ReadState` (`v1beta`-only) — minimal envelope (ledger_tip only);
+//!   the `cardano` sub-message inside `AnyChainStateData` is left unset.
 //!
-//! `SearchUtxos`, `ReadData`, `ReadTx`, `ReadState` remain
-//! `UNIMPLEMENTED` until M2.B fills the remaining mapping modules.
+//! Every response here is run through `masking::apply` (issue #1004)
+//! using the request's `FieldMask`, via the shared `mask_paths` helper
+//! below. `v1alpha` requests carry their own `FieldMask` but are masked
+//! through the *v1beta* message name — see `crate::map::message_names`
+//! for why that's safe (v1alpha is a byte-compatible field-name subset
+//! of v1beta throughout this crate).
 
 use tonic::{Request, Response, Status};
 
-use super::ServiceState;
+use super::{mask_paths, ServiceState};
 use crate::context::LedgerContext;
 use crate::map::block::block_ref_from_tip;
+use crate::map::message_names;
 use crate::map::patterns::matches_utxo_predicate;
 use crate::map::pparams::pparams_to_proto;
 use crate::map::tx::tx_output_to_proto;
+use crate::masking;
 use crate::proto::{v1alpha, v1beta};
 
 /// Hard cap on UTxOs returned per SearchUtxos request — protects the
@@ -102,6 +116,7 @@ async fn search_utxos_response_beta(
         .unwrap_or(SEARCH_UTXOS_HARD_CAP)
         .max(1);
 
+    let mask = mask_paths(request.field_mask.clone());
     let predicate = request.predicate.clone();
     let seed = pick_index_seed(predicate.as_ref());
 
@@ -207,16 +222,26 @@ async fn search_utxos_response_beta(
         })
         .collect();
 
-    Ok(v1beta::query::SearchUtxosResponse {
+    let response = v1beta::query::SearchUtxosResponse {
         items,
         ledger_tip: Some(ledger_tip),
-        // Pagination (next_token) is M3-of-Search; the hard cap above
-        // bounds memory for the single-page response.
+        // Pagination is not implemented — `next_token` always unset; the
+        // hard cap above bounds memory for the single-page response
+        // instead.
         next_token: None,
-    })
+    };
+    masking::apply(&mask, response, message_names::SEARCH_UTXOS_RESPONSE).map_err(Status::from)
 }
 
 // ─── shared helpers ──────────────────────────────────────────────────────
+
+fn era_boundary_to_proto(b: &crate::context::EraBoundaryView) -> v1beta::cardano::EraBoundary {
+    v1beta::cardano::EraBoundary {
+        time: b.time_ms,
+        slot: b.slot,
+        epoch: b.epoch,
+    }
+}
 
 async fn ledger_tip_chain_point(
     ctx: &std::sync::Arc<dyn LedgerContext>,
@@ -233,21 +258,24 @@ async fn ledger_tip_chain_point(
 
 async fn read_params_response_beta(
     ctx: &std::sync::Arc<dyn LedgerContext>,
+    mask: &[String],
 ) -> Result<v1beta::query::ReadParamsResponse, Status> {
     let params_view = ctx.params_at_tip().await.map_err(Status::from)?;
     let cardano = pparams_to_proto(&params_view.params);
     let ledger_tip = ledger_tip_chain_point(ctx).await?;
-    Ok(v1beta::query::ReadParamsResponse {
+    let response = v1beta::query::ReadParamsResponse {
         values: Some(v1beta::query::AnyChainParams {
             params: Some(v1beta::query::any_chain_params::Params::Cardano(cardano)),
         }),
         ledger_tip: Some(ledger_tip),
-    })
+    };
+    masking::apply(mask, response, message_names::READ_PARAMS_RESPONSE).map_err(Status::from)
 }
 
 async fn read_utxos_response_beta(
     ctx: &std::sync::Arc<dyn LedgerContext>,
     refs: Vec<v1beta::query::TxoRef>,
+    mask: &[String],
 ) -> Result<v1beta::query::ReadUtxosResponse, Status> {
     // Map TxoRef → TransactionInput, ALL OR NOTHING.
     //
@@ -284,38 +312,60 @@ async fn read_utxos_response_beta(
         })
         .collect();
 
-    Ok(v1beta::query::ReadUtxosResponse {
+    let response = v1beta::query::ReadUtxosResponse {
         items,
         ledger_tip: Some(ledger_tip),
-    })
+    };
+    masking::apply(mask, response, message_names::READ_UTXOS_RESPONSE).map_err(Status::from)
 }
 
 async fn read_genesis_response_beta(
     ctx: &std::sync::Arc<dyn LedgerContext>,
+    mask: &[String],
 ) -> Result<v1beta::query::ReadGenesisResponse, Status> {
     let view = ctx.genesis().await.map_err(Status::from)?;
+    // Byron / Alonzo / Conway sections and Shelley's gen_delegs /
+    // initial_funds / staking are deliberately left at proto-default —
+    // see GenesisView's doc comment for exactly why (real, bounded
+    // follow-up work, not a silent gap: those genesis structs aren't
+    // retained past node startup today).
     let cardano = v1beta::cardano::Genesis {
         network_magic: view.network_magic,
+        network_id: view.network_id,
         system_start: if view.system_start_unix > 0 {
             view.system_start_unix.to_string()
         } else {
             String::new()
         },
         security_param: view.security_param,
+        epoch_length: view.epoch_length,
+        slot_length: view.slot_length,
+        max_lovelace_supply: Some(crate::map::common::coin_bigint(view.max_lovelace_supply)),
+        max_kes_evolutions: view.max_kes_evolutions,
+        slots_per_kes_period: view.slots_per_kes_period,
+        update_quorum: view.update_quorum,
+        active_slots_coeff: view.active_slots_coeff.map(|(numerator, denominator)| {
+            v1beta::cardano::RationalNumber {
+                numerator,
+                denominator,
+            }
+        }),
         ..Default::default()
     };
-    Ok(v1beta::query::ReadGenesisResponse {
+    let response = v1beta::query::ReadGenesisResponse {
         genesis: Vec::new(),
         caip2: String::new(),
         config: Some(v1beta::query::read_genesis_response::Config::Cardano(
             cardano,
         )),
-    })
+    };
+    masking::apply(mask, response, message_names::READ_GENESIS_RESPONSE).map_err(Status::from)
 }
 
 async fn read_data_response_beta(
     ctx: &std::sync::Arc<dyn LedgerContext>,
     keys: Vec<Vec<u8>>,
+    mask: &[String],
 ) -> Result<v1beta::query::ReadDataResponse, Status> {
     let ledger_tip = ledger_tip_chain_point(ctx).await?;
     let mut values: Vec<v1beta::query::AnyChainDatum> = Vec::with_capacity(keys.len());
@@ -342,15 +392,17 @@ async fn read_data_response_beta(
             parsed_state: None,
         });
     }
-    Ok(v1beta::query::ReadDataResponse {
+    let response = v1beta::query::ReadDataResponse {
         values,
         ledger_tip: Some(ledger_tip),
-    })
+    };
+    masking::apply(mask, response, message_names::READ_DATA_RESPONSE).map_err(Status::from)
 }
 
 async fn read_tx_response_beta(
     ctx: &std::sync::Arc<dyn LedgerContext>,
     hash_bytes: Vec<u8>,
+    mask: &[String],
 ) -> Result<v1beta::query::ReadTxResponse, Status> {
     if hash_bytes.len() != 32 {
         return Err(Status::invalid_argument(format!(
@@ -374,18 +426,20 @@ async fn read_tx_response_beta(
         Ok(tx) => Some(crate::map::tx::tx_to_proto(&tx)),
         Err(_) => None,
     };
-    Ok(v1beta::query::ReadTxResponse {
+    let response = v1beta::query::ReadTxResponse {
         tx: Some(v1beta::query::AnyChainTx {
             native_bytes: raw.cbor,
             chain: cardano_tx.map(v1beta::query::any_chain_tx::Chain::Cardano),
             block_ref: None,
         }),
         ledger_tip: Some(ledger_tip),
-    })
+    };
+    masking::apply(mask, response, message_names::READ_TX_RESPONSE).map_err(Status::from)
 }
 
 async fn read_state_response_beta(
     ctx: &std::sync::Arc<dyn LedgerContext>,
+    mask: &[String],
 ) -> Result<v1beta::query::ReadStateResponse, Status> {
     let state = ctx.ledger_state().await.map_err(Status::from)?;
     let ledger_tip = v1beta::query::ChainPoint {
@@ -399,18 +453,20 @@ async fn read_state_response_beta(
     // `ledger_tip` field. Richer per-query state projections (stake-
     // pool distribution, DRep info, etc.) layer on top of this stub
     // once the dedicated chain-specific queries are wired.
-    Ok(v1beta::query::ReadStateResponse {
+    let response = v1beta::query::ReadStateResponse {
         result: Some(v1beta::query::AnyChainStateData {
             result: Some(v1beta::query::any_chain_state_data::Result::Cardano(
                 v1beta::cardano::StateData::default(),
             )),
         }),
         ledger_tip: Some(ledger_tip),
-    })
+    };
+    masking::apply(mask, response, message_names::READ_STATE_RESPONSE).map_err(Status::from)
 }
 
 async fn read_era_summary_response_beta(
     ctx: &std::sync::Arc<dyn LedgerContext>,
+    mask: &[String],
 ) -> Result<v1beta::query::ReadEraSummaryResponse, Status> {
     let view = ctx.era_history().await.map_err(Status::from)?;
     let summaries: Vec<v1beta::cardano::EraSummary> = view
@@ -418,20 +474,21 @@ async fn read_era_summary_response_beta(
         .iter()
         .map(|s| v1beta::cardano::EraSummary {
             name: format!("{:?}", s.era).to_lowercase(),
-            start: Some(v1beta::cardano::EraBoundary {
-                time: 0,
-                slot: s.first_slot,
-                epoch: 0,
-            }),
-            end: None,
+            start: Some(era_boundary_to_proto(&s.start)),
+            end: s.end.as_ref().map(era_boundary_to_proto),
+            // Deliberately unset — see EraHistoryView's doc comment:
+            // dugite's ledger doesn't retain a per-era PParams history,
+            // only the current era's, so there is nothing truthful to
+            // put here for a past era.
             protocol_params: None,
         })
         .collect();
-    Ok(v1beta::query::ReadEraSummaryResponse {
+    let response = v1beta::query::ReadEraSummaryResponse {
         summary: Some(v1beta::query::read_era_summary_response::Summary::Cardano(
             v1beta::cardano::EraSummaries { summaries },
         )),
-    })
+    };
+    masking::apply(mask, response, message_names::READ_ERA_SUMMARY_RESPONSE).map_err(Status::from)
 }
 
 // ─── v1alpha-specific recoders ───────────────────────────────────────────
@@ -476,9 +533,10 @@ impl QuerySvcAlpha {
 impl v1alpha::query::query_service_server::QueryService for QuerySvcAlpha {
     async fn read_params(
         &self,
-        _request: Request<v1alpha::query::ReadParamsRequest>,
+        request: Request<v1alpha::query::ReadParamsRequest>,
     ) -> Result<Response<v1alpha::query::ReadParamsResponse>, Status> {
-        let beta = read_params_response_beta(&self.state.context).await?;
+        let mask = mask_paths(request.into_inner().field_mask);
+        let beta = read_params_response_beta(&self.state.context, &mask).await?;
         let cardano = beta
             .values
             .and_then(|v| v.params)
@@ -498,8 +556,9 @@ impl v1alpha::query::query_service_server::QueryService for QuerySvcAlpha {
         &self,
         request: Request<v1alpha::query::ReadUtxosRequest>,
     ) -> Result<Response<v1alpha::query::ReadUtxosResponse>, Status> {
-        let beta_refs: Vec<v1beta::query::TxoRef> = request
-            .into_inner()
+        let req = request.into_inner();
+        let mask = mask_paths(req.field_mask);
+        let beta_refs: Vec<v1beta::query::TxoRef> = req
             .keys
             .into_iter()
             .map(|r| v1beta::query::TxoRef {
@@ -507,7 +566,7 @@ impl v1alpha::query::query_service_server::QueryService for QuerySvcAlpha {
                 index: r.index,
             })
             .collect();
-        let beta = read_utxos_response_beta(&self.state.context, beta_refs).await?;
+        let beta = read_utxos_response_beta(&self.state.context, beta_refs, &mask).await?;
         let items = beta
             .items
             .into_iter()
@@ -556,7 +615,9 @@ impl v1alpha::query::query_service_server::QueryService for QuerySvcAlpha {
         &self,
         request: Request<v1alpha::query::ReadDataRequest>,
     ) -> Result<Response<v1alpha::query::ReadDataResponse>, Status> {
-        let beta = read_data_response_beta(&self.state.context, request.into_inner().keys).await?;
+        let req = request.into_inner();
+        let mask = mask_paths(req.field_mask);
+        let beta = read_data_response_beta(&self.state.context, req.keys, &mask).await?;
         use prost::Message;
         let bytes = beta.encode_to_vec();
         let alpha = v1alpha::query::ReadDataResponse::decode(bytes.as_slice())
@@ -568,7 +629,9 @@ impl v1alpha::query::query_service_server::QueryService for QuerySvcAlpha {
         &self,
         request: Request<v1alpha::query::ReadTxRequest>,
     ) -> Result<Response<v1alpha::query::ReadTxResponse>, Status> {
-        let beta = read_tx_response_beta(&self.state.context, request.into_inner().hash).await?;
+        let req = request.into_inner();
+        let mask = mask_paths(req.field_mask);
+        let beta = read_tx_response_beta(&self.state.context, req.hash, &mask).await?;
         use prost::Message;
         let bytes = beta.encode_to_vec();
         let alpha = v1alpha::query::ReadTxResponse::decode(bytes.as_slice())
@@ -578,9 +641,10 @@ impl v1alpha::query::query_service_server::QueryService for QuerySvcAlpha {
 
     async fn read_genesis(
         &self,
-        _request: Request<v1alpha::query::ReadGenesisRequest>,
+        request: Request<v1alpha::query::ReadGenesisRequest>,
     ) -> Result<Response<v1alpha::query::ReadGenesisResponse>, Status> {
-        let beta = read_genesis_response_beta(&self.state.context).await?;
+        let mask = mask_paths(request.into_inner().field_mask);
+        let beta = read_genesis_response_beta(&self.state.context, &mask).await?;
         let cardano_alpha = beta
             .config
             .map(|c| match c {
@@ -590,7 +654,7 @@ impl v1alpha::query::query_service_server::QueryService for QuerySvcAlpha {
                 use prost::Message;
                 let bytes = g.encode_to_vec();
                 v1alpha::cardano::Genesis::decode(bytes.as_slice())
-                    .expect("v1alpha Genesis subset of v1beta for M2.A fields")
+                    .expect("v1alpha Genesis subset of v1beta")
             });
         Ok(Response::new(v1alpha::query::ReadGenesisResponse {
             genesis: beta.genesis,
@@ -601,9 +665,10 @@ impl v1alpha::query::query_service_server::QueryService for QuerySvcAlpha {
 
     async fn read_era_summary(
         &self,
-        _request: Request<v1alpha::query::ReadEraSummaryRequest>,
+        request: Request<v1alpha::query::ReadEraSummaryRequest>,
     ) -> Result<Response<v1alpha::query::ReadEraSummaryResponse>, Status> {
-        let beta = read_era_summary_response_beta(&self.state.context).await?;
+        let mask = mask_paths(request.into_inner().field_mask);
+        let beta = read_era_summary_response_beta(&self.state.context, &mask).await?;
         let alpha = beta
             .summary
             .map(|s| match s {
@@ -638,10 +703,11 @@ impl QuerySvcBeta {
 impl v1beta::query::query_service_server::QueryService for QuerySvcBeta {
     async fn read_params(
         &self,
-        _request: Request<v1beta::query::ReadParamsRequest>,
+        request: Request<v1beta::query::ReadParamsRequest>,
     ) -> Result<Response<v1beta::query::ReadParamsResponse>, Status> {
+        let mask = mask_paths(request.into_inner().field_mask);
         Ok(Response::new(
-            read_params_response_beta(&self.state.context).await?,
+            read_params_response_beta(&self.state.context, &mask).await?,
         ))
     }
 
@@ -649,8 +715,10 @@ impl v1beta::query::query_service_server::QueryService for QuerySvcBeta {
         &self,
         request: Request<v1beta::query::ReadUtxosRequest>,
     ) -> Result<Response<v1beta::query::ReadUtxosResponse>, Status> {
+        let req = request.into_inner();
+        let mask = mask_paths(req.field_mask);
         Ok(Response::new(
-            read_utxos_response_beta(&self.state.context, request.into_inner().keys).await?,
+            read_utxos_response_beta(&self.state.context, req.keys, &mask).await?,
         ))
     }
 
@@ -667,8 +735,10 @@ impl v1beta::query::query_service_server::QueryService for QuerySvcBeta {
         &self,
         request: Request<v1beta::query::ReadDataRequest>,
     ) -> Result<Response<v1beta::query::ReadDataResponse>, Status> {
+        let req = request.into_inner();
+        let mask = mask_paths(req.field_mask);
         Ok(Response::new(
-            read_data_response_beta(&self.state.context, request.into_inner().keys).await?,
+            read_data_response_beta(&self.state.context, req.keys, &mask).await?,
         ))
     }
 
@@ -676,36 +746,41 @@ impl v1beta::query::query_service_server::QueryService for QuerySvcBeta {
         &self,
         request: Request<v1beta::query::ReadTxRequest>,
     ) -> Result<Response<v1beta::query::ReadTxResponse>, Status> {
+        let req = request.into_inner();
+        let mask = mask_paths(req.field_mask);
         Ok(Response::new(
-            read_tx_response_beta(&self.state.context, request.into_inner().hash).await?,
+            read_tx_response_beta(&self.state.context, req.hash, &mask).await?,
         ))
     }
 
     async fn read_genesis(
         &self,
-        _request: Request<v1beta::query::ReadGenesisRequest>,
+        request: Request<v1beta::query::ReadGenesisRequest>,
     ) -> Result<Response<v1beta::query::ReadGenesisResponse>, Status> {
+        let mask = mask_paths(request.into_inner().field_mask);
         Ok(Response::new(
-            read_genesis_response_beta(&self.state.context).await?,
+            read_genesis_response_beta(&self.state.context, &mask).await?,
         ))
     }
 
     async fn read_era_summary(
         &self,
-        _request: Request<v1beta::query::ReadEraSummaryRequest>,
+        request: Request<v1beta::query::ReadEraSummaryRequest>,
     ) -> Result<Response<v1beta::query::ReadEraSummaryResponse>, Status> {
+        let mask = mask_paths(request.into_inner().field_mask);
         Ok(Response::new(
-            read_era_summary_response_beta(&self.state.context).await?,
+            read_era_summary_response_beta(&self.state.context, &mask).await?,
         ))
     }
 
     /// `v1beta`-only — ad-hoc CBOR-shaped state queries.
     async fn read_state(
         &self,
-        _request: Request<v1beta::query::ReadStateRequest>,
+        request: Request<v1beta::query::ReadStateRequest>,
     ) -> Result<Response<v1beta::query::ReadStateResponse>, Status> {
+        let mask = mask_paths(request.into_inner().field_mask);
         Ok(Response::new(
-            read_state_response_beta(&self.state.context).await?,
+            read_state_response_beta(&self.state.context, &mask).await?,
         ))
     }
 }
