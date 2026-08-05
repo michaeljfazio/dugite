@@ -1271,7 +1271,7 @@ mod tests {
     /// chain back to genesis. Run manually with:
     ///   cargo nextest run -p dugite-node -E 'test(verify_preview_certificate_chain)' -- --ignored
     #[tokio::test]
-    #[ignore]
+    #[ignore = "network — hits the live Mithril preview aggregator"]
     async fn test_verify_preview_certificate_chain() {
         let aggregator = aggregator_url(2); // preview
         let genesis_vkey = genesis_verification_key(2).unwrap();
