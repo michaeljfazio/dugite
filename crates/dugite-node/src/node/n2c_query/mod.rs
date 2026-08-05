@@ -565,9 +565,19 @@ impl QueryHandler {
                 governance::handle_ratify_state(&self.state)
             }
             33 => {
-                // Tag 33: GetFuturePParams — returns Maybe PParams (Nothing)
+                // Tag 33: GetFuturePParams — returns Maybe PParams, collapsed
+                // from the ledger's 3-way `futurePParams` per Haskell's
+                // `queryFuturePParams` (oracle-verified):
+                //   NoPParamsUpdate          -> Nothing
+                //   DefinitePParamsUpdate pp -> Just pp
+                //   PotentialPParamsUpdate m -> m (pass the inner Maybe through)
                 debug!("Query: GetFuturePParams");
-                QueryResult::NoFuturePParams
+                let payload = match self.state.future_pparams_tag {
+                    1 => self.state.future_pparams.clone(),
+                    2 => self.state.future_pparams.clone(),
+                    _ => None,
+                };
+                QueryResult::FuturePParamsResult(payload)
             }
             34 => {
                 // Tag 34: GetLedgerPeerSnapshot

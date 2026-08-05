@@ -259,8 +259,32 @@ pub enum QueryResult {
         /// Whether ratification is delayed (a "delaying action" was ratified)
         delayed: bool,
     },
-    /// GetFuturePParams (tag 33): returns Nothing (no future params)
-    NoFuturePParams,
+    /// GetFuturePParams (tag 33).
+    ///
+    /// Oracle-verified (ouroboros-consensus-cardano
+    /// `Ouroboros/Consensus/Shelley/Ledger/Query.hs`): the GADT constructor is
+    /// `GetFuturePParams :: BlockQuery .. (Maybe (PParams era))` — a BARE
+    /// `Maybe`, encoded with the generic `EncCBOR (Maybe a)` instance
+    /// (`array(0)` for `Nothing`, `array(1)[pp]` for `Just pp`). This is a
+    /// DIFFERENT shape from the 3-way `FuturePParams` sum
+    /// (`NoPParamsUpdate`/`DefinitePParamsUpdate`/`PotentialPParamsUpdate`)
+    /// embedded in `GetGovState` (tag 24, field [5]) — do not reuse that
+    /// encoder here.
+    ///
+    /// The ledger-side collapse (`queryFuturePParams`,
+    /// `cardano-ledger-api/.../State/Query.hs`) is:
+    /// ```text
+    /// NoPParamsUpdate          -> Nothing
+    /// DefinitePParamsUpdate pp -> Just pp
+    /// PotentialPParamsUpdate m -> m   -- passes the inner Maybe through as-is
+    /// ```
+    /// Before this fix the handler was hardcoded to always answer `Nothing`
+    /// regardless of state — undetected by the `future-pparams` cli-parity
+    /// check because every recorded devnet sample happened to be genuinely
+    /// empty (two implementations agreeing that nothing is pending is not
+    /// evidence; see the #977/#992 postmortems for the same trap on the
+    /// embedded copy of this field).
+    FuturePParamsResult(Option<Box<ProtocolParamsSnapshot>>),
     /// GetDRepDelegations (tag 39, V23+): Map<DRep, Set<Credential Staking>>.
     ///
     /// The N2C request is a `Set<DRep>` (the DReps the client wants to look up);
