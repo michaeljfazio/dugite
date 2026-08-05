@@ -3550,6 +3550,46 @@ mod tests {
         );
     }
 
+    /// Issue #1000 (PlutusV4/Dijkstra): the SAME key-8 probe rejected for
+    /// Conway above, but decoded under `Era::Dijkstra`. Oracle-verified
+    /// (`IntersectMBO/cardano-ledger` @
+    /// `c4f649fac4a18929f550ffebf07c9e7371355d9d`): Dijkstra's `TxWits`
+    /// is literally `type TxWits DijkstraEra = AlonzoTxWits DijkstraEra` and
+    /// its `natVersion @12`-gated `decoderByKey` still enumerates ONLY keys
+    /// 0-7 — there is no `plutus_v4_scripts` witness-set field upstream (the
+    /// Dijkstra CDDL spec generator has a literal
+    /// `-- TODO: Add plutus_v4_script at index 8 …` marking it unimplemented,
+    /// and the era's own test fixtures document that including one "would
+    /// cause a roundtrip failure as they get silently dropped during
+    /// serialization"). A real cardano-node peer can neither emit nor decode
+    /// a V4 witness-set script, so dugite must not either — key 8 stays
+    /// rejected under Dijkstra exactly as it is under Conway. See
+    /// `dugite_uplc::redeemer_resolve::ScriptLanguage`'s doc comment and
+    /// `find_script_bytes`'s doc comment for the full citation and the
+    /// evaluator-side consequence (V4 only resolves via `script_ref`).
+    #[test]
+    fn dijkstra_witness_set_hypothetical_plutus_v4_key_still_rejected() {
+        let script_bytes = cbor_bytes(&[0xde, 0xad, 0xbe, 0xef]);
+        let scripts_arr = {
+            let mut v = vec![0x81]; // array(1)
+            v.extend(&script_bytes);
+            v
+        };
+        let mut data = vec![0xa2]; // map(2)
+        data.extend(cbor_uint(7)); // key 7 = plutus_v3_scripts (valid)
+        data.extend(&scripts_arr);
+        data.extend(cbor_uint(8)); // key 8 = hypothetical plutus_v4_scripts
+        data.extend(&scripts_arr);
+
+        let mut r = Reader::new(&data);
+        let result = decode_conway_witness_set(&mut r, Era::Dijkstra);
+        assert!(
+            matches!(result, Err(SerializationError::CborDecode(_))),
+            "Dijkstra witness-set key 8 (no plutus_v4_scripts slot upstream) \
+             must be rejected exactly like Conway, got {result:?}"
+        );
+    }
+
     // ── SparseKeyed duplicate field-key rejection (backlog #31-D) ──────────────
 
     #[test]
