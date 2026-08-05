@@ -33,7 +33,15 @@ pub enum QueryResult {
     StakeDistribution(Vec<StakePoolSnapshot>),
     GovState(Box<GovStateSnapshot>),
     DRepState(Vec<DRepSnapshot>),
-    CommitteeState(CommitteeSnapshot),
+    /// `GetCommitteeMembersState` (tag 27).
+    ///
+    /// Carries BOTH the live committee and the committee this epoch's
+    /// ratification pass will install (`rsEnactState . ensCommitteeL`).
+    /// `NextEpochChange` is defined purely as a comparison between the two, so
+    /// the second element is not optional context — without it the field can
+    /// only ever be `NoChangeExpected`, which is what it was hardcoded to
+    /// (#1020).
+    CommitteeState(CommitteeSnapshot, NextCommittee),
     StakeAddressInfo(Vec<StakeAddressSnapshot>),
     UtxoByAddress(Vec<UtxoSnapshot>),
     StakeSnapshots(StakeSnapshotsResult),
@@ -968,6 +976,24 @@ pub struct CommitteeSnapshot {
     pub threshold: Option<(u64, u64)>,
     /// Current epoch
     pub current_epoch: u64,
+}
+
+/// The committee AFTER this epoch's ratification pass applies — Haskell's
+/// `getNextEpochCommitteeMembers`, i.e. `rsEnactState . ensCommitteeL` read off
+/// the completed DRep pulser.
+///
+/// `None` encodes `SNothing`: a ratified `NoConfidence` clears the committee.
+pub type NextCommittee = Option<NextCommitteeData>;
+
+/// Members + threshold of the post-ratification committee.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NextCommitteeData {
+    /// `(cold_credential_type, cold_credential_hash_28)` -> term expiry epoch.
+    /// Keyed the same way the wire encodes a `Credential` so the two never
+    /// need converting between representations.
+    pub members: std::collections::BTreeMap<(u8, Vec<u8>), u64>,
+    /// Quorum threshold as `(numerator, denominator)`.
+    pub threshold: (u64, u64),
 }
 
 /// Snapshot of a committee member

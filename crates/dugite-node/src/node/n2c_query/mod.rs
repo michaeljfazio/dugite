@@ -1174,7 +1174,7 @@ mod tests {
         });
 
         match query(&handler, 27) {
-            QueryResult::CommitteeState(committee) => {
+            QueryResult::CommitteeState(committee, _) => {
                 assert_eq!(committee.members.len(), 2);
                 assert_eq!(committee.members[0].cold_credential, vec![0x01; 28]);
                 assert_eq!(committee.members[0].hot_status, 0); // Authorized
