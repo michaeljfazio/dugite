@@ -27,8 +27,10 @@
 //! - **`direct_deposits`** (TxBody key 25) — ADA flowing directly into reward
 //!   accounts; applied by `apply_direct_deposits` before sub-transactions.
 //! - **Sub-transactions** (TxBody key 23) — wire surface plus the UTxO and
-//!   incremental `stake_map` / `ptr_stake` effects (`apply_sub_transactions`).
-//!   See the caveat below.
+//!   incremental `stake_map` / `ptr_stake` effects (`apply_sub_transactions`),
+//!   applied with the same all-or-nothing failure semantics as upstream
+//!   `SUBLEDGERS` (#1001, fixed). See the caveat below for what is still
+//!   unmodelled.
 //! - **`account_balance_intervals`** (TxBody key 26) — UTXO predicate gating a
 //!   tx on reward-account balance ranges.
 //! - **`guards`** (TxBody key 14, semantic upgrade) — credential-based guards,
@@ -50,27 +52,54 @@
 //!
 //! ## Known gaps (each has an open issue — do not assume these are done)
 //!
-//! - **Sub-transaction failure semantics diverge from Haskell** (#1001).
-//!   Upstream `Cardano.Ledger.Dijkstra.Rules.SubLedgers` folds the OMap via
-//!   `foldM`, so any sub-tx failure aborts the WHOLE top-level tx. Dugite
-//!   validates each sub-tx in isolation and drops only the failing one's
-//!   effects, so successful siblings still apply — accept-where-Haskell-
-//!   rejects. `SUBUTXOW` / `SUBCERTS` / `SUBGOV` pre-conditions are also
-//!   unmodelled. See the comment in `apply_tx` below.
+//! - **`SubTransaction` (dugite-primitives) is a strict subset of upstream's
+//!   `DijkstraSubTxBodyRaw` / `DijkstraSubTx`** (residual half of #1001,
+//!   tracked as a dugite-primitives follow-on — see the doc comment on
+//!   `apply_sub_transactions` for the oracle-verified field list). The fold
+//!   ORDER/ABORT semantics are fixed (any sub-tx failure aborts the whole
+//!   top-level tx, matching upstream `SUBLEDGERS`'s `foldM` — see
+//!   `apply_sub_transactions`), and the SUBUTXO-level checks that ARE
+//!   expressible against the currently-modelled fields are implemented
+//!   (`SubBadInputsUTxO`, `SubInputSetEmptyUTxO`,
+//!   `SubOutsideValidityIntervalUTxO`, min-UTxO-value). What remains
+//!   unmodelled — because the wire type carries no data for it —  is
+//!   `SUBUTXOW` (witness/redeemer/datum checks; a sub-tx has its own
+//!   `dstWits :: TxWits era` upstream, which dugite's `SubTransaction` does
+//!   not carry at all) and `SUBENTITIES`/`SUBCERTS`/`SUBCERT`/`SUBDELEG`/
+//!   `SUBPOOL`/`SUBGOV`/`SUBGOVCERT` (a sub-tx body upstream also carries
+//!   `certs` / `withdrawals` / `votingProcedures` / `proposalProcedures` /
+//!   `directDeposits`, none of which `SubTransaction` models). Adding those
+//!   fields is a `dugite-primitives::transaction::SubTransaction` change,
+//!   out of scope here.
 //! - **PlutusV4 cannot be evaluated** (#1000). Parse and hash landed; the
 //!   evaluator did not. `ScriptLanguage` has no V4 variant, `WitnessSet` has
 //!   no `plutus_v4_scripts` field, and V4 reference scripts surface a typed
 //!   `PhaseTwoError::Internal`. Every path fails closed, so there is no silent
 //!   divergence — but no V4 script can be validated.
-//! - **CIP-0167 `isValid` removal is decoder-only** (#1002). The restructured
-//!   collateral-on-invalid-tx flow is not implemented; `apply_invalid_tx`
-//!   still delegates to Conway.
-//! - **`peras_certificate`** in the block body (`array(3)` third element) —
-//!   blocked upstream, tracked in #607. The wire shape has settled but the
-//!   certificate CONTENT is an explicit upstream stub (`PerasCert ByteArray`,
-//!   `validatePerasCert _ _ _ = True`), so byte-exact validation is not yet
-//!   definable. Pinned as the one `#[ignore]` placeholder in the
-//!   `dijkstra_unimplemented` module below.
+//! - **`peras_certificate`** in the block body — blocked upstream, tracked in
+//!   #607. The field itself is stable (`StrictMaybe PerasCert`, a real
+//!   record field in `DijkstraBlockBodyRaw`), but the certificate CONTENT is
+//!   an explicit upstream stub on BOTH sides (`cardano-ledger`'s
+//!   `newtype PerasCert = PerasCert ByteArray` /
+//!   `validatePerasCert _ _ _ = True`, and `cardano-base`'s
+//!   `cardano-crypto-peras` package independently stubs its own `PerasCert`
+//!   with a `NOTE: this will be fleshed out in the future`), so byte-exact
+//!   validation is not yet definable. Pinned as the one `#[ignore]`
+//!   placeholder in the `dijkstra_unimplemented` module below.
+//!
+//! `apply_invalid_tx` **permanently** delegates to [`ConwayRules`] — this is
+//! not a stopgap. #1002 confirmed upstream `Cardano.Ledger.Dijkstra.Rules.
+//! Utxos` has zero `transitionRules` of its own; it is pure type-family
+//! wiring (`type instance EraRuleFailure "UTXOS" DijkstraEra =
+//! Conway.ConwayUtxosPredFailure DijkstraEra`) that inherits Conway's
+//! `UTXOS` instance — including `babbageEvalScriptsTxInvalid`, the actual
+//! collateral-consumption logic — byte-for-byte, unmodified. CIP-0167's
+//! landed change (merged cardano-ledger PR #5480) is narrower than its name
+//! suggests: it only drops the standalone-tx-envelope `isValid` bool (a
+//! submitter can no longer claim `false`); the block-embedded invalid-tx
+//! mechanism (a separate invalid-index list in the block body) and its
+//! collateral semantics are untouched. See the doc comment on
+//! `apply_invalid_tx` below for the pinned SHA and quoted source.
 
 use std::collections::HashSet;
 
@@ -184,15 +213,75 @@ impl EraRules for DijkstraRules {
         //     the registration check and the post-Conway crediting step.
         validate_direct_deposits_registration(tx, certs)?;
 
-        // 1) Run the parent (top-level) Conway pipeline. This consumes the
-        //    parent tx's inputs, creates its outputs, processes its certs,
-        //    governance actions and withdrawals. The returned diff is the
-        //    parent contribution to the UtxoSubState delta.
+        // 1) Apply nested sub-transactions through the dugite SUB pipeline —
+        //    BEFORE the parent's own Conway pipeline.
+        //
+        //    Oracle-verified against `IntersectMBO/cardano-ledger` pinned SHA
+        //    `4849c13d6f70e5ab46add9af6e0ec5c537b61f69`,
+        //    `eras/dijkstra/impl/src/Cardano/Ledger/Dijkstra/Rules/Ledger.hs`
+        //    (`dijkstraLedgerTransition`):
+        //
+        //      LedgerState utxoStateAfterSubLedgers certStateAfterSubLedgers <-
+        //        trans @(EraRule "SUBLEDGERS" era) $
+        //          TRC (SubLedgerEnv slot mbCurEpochNo pp chainAccountState
+        //                 originalUtxo ..., ledgerState, subStAnnTxs)
+        //      ... certStateAfterENTITIES <- trans @(EraRule "ENTITIES" era) $
+        //            TRC (..., certStateAfterSubLedgers, ...)
+        //      ... proposalsState <- trans @(EraRule "GOV" era) $ TRC (...)
+        //      utxoStateFinal <- trans @(EraRule "UTXOW" era) $
+        //        TRC (DijkstraUtxoEnv slot pp (lsCertState ledgerState)
+        //               originalUtxo, utxoStateBeforeUtxow, stAnnTx)
+        //
+        //    `SUBLEDGERS` runs FIRST, against the *original* ledger state
+        //    (before the parent tx's own effects); the parent's own
+        //    ENTITIES/GOV/UTXOW steps run AFTER, consuming
+        //    `certStateAfterSubLedgers` / `utxoStateAfterSubLedgers`. So a
+        //    sub-tx can spend an output an EARLIER sibling sub-tx created,
+        //    but never anything the PARENT tx itself produces or consumes —
+        //    the reverse of dugite's pre-#1001 ordering (parent-then-subs),
+        //    which was silently backwards relative to upstream in addition
+        //    to the isolated-snapshot divergence #1001 was filed for.
+        //
+        //    `SUBLEDGERS` folds via `foldM` over the full `LedgerState`
+        //    accumulator (`Rules/SubLedgers.hs`); ANY sub-tx failure fails
+        //    the whole `SUBLEDGERS` transition, and because
+        //    `applySTSOptsEither` discards the internally-threaded state on
+        //    any accumulated predicate failure (`libs/small-steps/.../
+        //    Extended.hs`), NO effect from ANY sub-tx — including ones
+        //    earlier in the OMap than the failing one — becomes visible,
+        //    and the parent's own ENTITIES/GOV/UTXOW never even run (they
+        //    are sequenced strictly after `SUBLEDGERS` in the `do`-block).
+        //    `apply_sub_transactions` below reproduces exactly that:
+        //    returning `Err` here means `self.conway().apply_valid_tx(..)`
+        //    is never called, so the parent's own effects are provably
+        //    absent too — full top-level-tx atomicity, not just
+        //    sub-tx-loop atomicity. See its doc comment for what upstream's
+        //    `SUBUTXOW`/`SUBENTITIES`/`SUBCERTS`/`SUBGOV` pre-conditions
+        //    this does and does not yet reproduce (blocked on a
+        //    dugite-primitives `SubTransaction` field gap, out of scope
+        //    here).
+        let sub_diff = if !tx.body.sub_transactions.is_empty() {
+            Some(apply_sub_transactions(tx, ctx, utxo, certs, gov, epochs)?)
+        } else {
+            None
+        };
+
+        // 2) Run the parent (top-level) Conway pipeline. Only reached once
+        //    every sub-tx has validated AND committed for real (step 1's
+        //    `?` above returns before this if any sub-tx failed, so the
+        //    parent's own effects are provably never applied in that case
+        //    either). This consumes the parent tx's inputs, creates its
+        //    outputs, processes its certs, governance actions and
+        //    withdrawals. The returned diff is the parent contribution to
+        //    the UtxoSubState delta.
         let mut diff = self
             .conway()
             .apply_valid_tx(tx, mode, ctx, utxo, certs, gov, epochs)?;
+        if let Some(sub_diff) = sub_diff {
+            diff.merge(&sub_diff);
+        }
 
-        // 1b) Credit `direct_deposits` onto reward-account balances
+        // 2b) Credit `direct_deposits` onto reward-account balances
         //     (issue #475 Phase 3.4).
         //
         //     The pre-check at step 0b has already guaranteed every target
@@ -211,30 +300,6 @@ impl EraRules for DijkstraRules {
             apply_direct_deposits(tx, certs);
         }
 
-        // 2) Apply nested sub-transactions through the dugite SUB pipeline.
-        //
-        //    Upstream `Cardano.Ledger.Dijkstra.Rules.SubLedgers` folds the
-        //    OMap via `foldM` over `EraRule "SUBLEDGER"`, meaning each
-        //    sub-tx runs against the live accumulator and any failure
-        //    aborts the whole top-level tx. Dugite Phase 3.1 takes a
-        //    permissive variant: each sub-tx is validated in isolation
-        //    against the current UTxO snapshot and a failure drops only
-        //    that sub-tx's would-be effects. This matches the task spec
-        //    (issue #475) — successful siblings of a failing sub-tx still
-        //    take effect — and lets us land the wire surface + a real
-        //    apply test without first wiring SUBUTXOW/SUBCERTS/SUBGOV
-        //    pre-condition checks. The strict `foldM` variant is tracked
-        //    as a follow-on once those upstream sub-rules are modelled.
-        //
-        //    Invariant: a sub-tx that tries to spend an input the parent
-        //    tx already consumed (in step 1) MUST fail — the parent's
-        //    consumption is visible in the UTxO set by the time we get
-        //    here, so the `contains(input)` check below catches it.
-        if !tx.body.sub_transactions.is_empty() {
-            let sub_diff = apply_sub_transactions(tx, utxo, certs, epochs);
-            diff.merge(&sub_diff);
-        }
-
         Ok(diff)
     }
 
@@ -247,12 +312,58 @@ impl EraRules for DijkstraRules {
         certs: &mut CertSubState,
         epochs: &mut EpochSubState,
     ) -> Result<UtxoDiff, LedgerError> {
-        // CIP-0167 removes the top-level `isValid` flag in Dijkstra. Until
-        // the upstream spec exposes the restructured invalid-tx flow we keep the
-        // Conway path — the on-the-wire Dijkstra blocks observed during
-        // preview activation (2026-05-07 onwards) still round-trip through
-        // the Conway invalid-tx semantics via the multi_era byte-patch
-        // shim, so this is conservative-correct.
+        // Permanent delegation to Conway — confirmed, not a stopgap (#1002).
+        //
+        // Oracle-verified against `IntersectMBO/cardano-ledger` pinned SHA
+        // `4849c13d6f70e5ab46add9af6e0ec5c537b61f69`,
+        // `eras/dijkstra/impl/src/Cardano/Ledger/Dijkstra/Rules/Utxos.hs`,
+        // in full:
+        //
+        //   module Cardano.Ledger.Dijkstra.Rules.Utxos () where
+        //   type instance EraRuleFailure "UTXOS" DijkstraEra =
+        //     Conway.ConwayUtxosPredFailure DijkstraEra
+        //   type instance EraRuleEvent "UTXOS" DijkstraEra =
+        //     Conway.ConwayUtxosEvent DijkstraEra
+        //   instance InjectRuleFailure "UTXOS" Conway.ConwayUtxosPredFailure DijkstraEra
+        //   instance InjectRuleEvent "UTXOS" Conway.ConwayUtxosEvent DijkstraEra
+        //   ...
+        //
+        // Zero `transitionRules` — pure type-family wiring. Conway's own
+        // `STS (UTXOS era)` instance is era-polymorphic
+        // (`eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Utxos.hs`) and
+        // Dijkstra inherits it, dispatch included:
+        //
+        //   utxosTransition = ... case tx ^. isPhase2ValidTxL of
+        //     Phase2Valid   -> conwayEvalScriptsTxValid
+        //     Phase2Invalid -> Babbage.babbageEvalScriptsTxInvalid @era stAnnTx
+        //
+        // `Babbage.babbageEvalScriptsTxInvalid` — collateral consumed,
+        // `collateralReturn` inserted, regular inputs/outputs skipped — is
+        // reused byte-for-byte through this chain, untouched by Dijkstra.
+        // Delegating to `ConwayRules::apply_invalid_tx` (which itself
+        // shares `common::apply_collateral_consumption` with Babbage) is
+        // therefore not an approximation of Dijkstra's rule; it IS
+        // Dijkstra's rule.
+        //
+        // CIP-0167 (merged cardano-ledger PR #5480, 2025-12-22) does NOT
+        // touch this path. It is narrower than its "isValid removal" name
+        // suggests: `DijkstraSubTx`/`DijkstraTx`'s standalone-envelope
+        // encoder (`toCBORForMempoolSubmission`) drops the `isValid` bool
+        // from the wire (`OmitC dtIsPhase2Valid`) and the decoder hard-fails
+        // on a literal `false` (`decodeDijkstraTopTx`) — a *submitter* can no
+        // longer claim their own tx is invalid. The block-embedded mechanism
+        // (a separate per-block invalid-tx-index list, decoded with the
+        // bool disallowed entirely and patched back in per-index) is
+        // structurally identical to Alonzo/Babbage/Conway and unchanged by
+        // Dijkstra. `DijkstraSubTx` (sub-transactions) has no validity flag
+        // of its own at all — see `Rules/SubUtxo.hs`
+        // (`sueTopTxIsPhase2Valid`): a sub-tx's own UTxO effects are
+        // skipped wholesale, gated on the *parent* tx's phase-2 result, and
+        // its `DijkstraSubUtxoPredFailure` has zero collateral-related
+        // constructors (every Babbage/Conway collateral constructor maps to
+        // `error "Impossible: ... for SUBUTXO"` in
+        // `dijkstraUtxoToDijkstraSubUtxoPredFailure`) — consistent with
+        // `apply_sub_transactions` below never calling `apply_invalid_tx`.
         self.conway()
             .apply_invalid_tx(tx, mode, ctx, utxo, certs, epochs)
     }
@@ -379,91 +490,398 @@ impl EraRules for DijkstraRules {
 }
 
 // ---------------------------------------------------------------------------
-// SUB-rule pipeline (Phase 3.1)
+// SUB-rule pipeline (#1001)
 // ---------------------------------------------------------------------------
 
 /// Apply the parent tx's `sub_transactions` field through the dugite SUB
-/// pipeline.
+/// pipeline, matching upstream's all-or-nothing `SUBLEDGERS` `foldM`
+/// (oracle-verified against `IntersectMBO/cardano-ledger` pinned SHA
+/// `4849c13d6f70e5ab46add9af6e0ec5c537b61f69` — see the citation on
+/// [`DijkstraRules::apply_valid_tx`] for the full `Rules/Ledger.hs` /
+/// `Rules/SubLedgers.hs` quotes).
 ///
-/// Each sub-tx is validated independently against the current `UtxoSubState`
-/// snapshot. The pipeline mirrors the (relevant fragment of the) Haskell
-/// `Cardano.Ledger.Dijkstra.Rules.SubLedger` rule:
+/// # Atomicity (the #1001 fix)
 ///
-///   1. **Pre-condition (SUBUTXO `inputsExist`).** Every spend input must
-///      resolve in the *current* UTxO set, which already reflects the
-///      parent tx's consumption and the cumulative effects of every prior
-///      successful sub-tx in this same call. A miss => the sub-tx is
-///      dropped (Phase 3.1 isolation; see [`DijkstraRules::apply_valid_tx`]
-///      for the deliberate divergence from upstream's `foldM` semantics).
-///   2. **Consume inputs.** Remove from UTxO set, record deletes in the
-///      shared `UtxoDiff` so rollback/diff_seq remains exact.
-///   3. **Insert outputs.** Newly-created UTxOs are keyed under
-///      `(sub.tx_id, idx)` — the sub-tx's own TxId, NOT the parent's —
-///      matching upstream Haskell's per-sub-tx output insertion.
+/// Implemented as two passes so a mid-fold failure needs no unwind/rollback:
 ///
-/// Witnesses, scripts, certs, withdrawals, mint, governance procedures and
-/// the new Dijkstra-only fields (`required_top_level_guards`,
-/// `direct_deposits`, `account_balance_intervals`) are out of scope for
-/// Phase 3.1 — each is being modelled in its own sub-phase of issue #475
-/// and folded into this helper one at a time. Until that work lands, a
-/// Dijkstra sub-tx that depends on (e.g.) certificate processing is a no-op
-/// at the cert layer; its UTxO effect is still applied correctly.
+///   - **Pass 1 (validate).** Walks `sub_transactions` in order, resolving
+///     every spend input against a small in-memory `overlay` layered over
+///     the real `utxo.utxo_set` — `overlay[input] == Some(output)` means an
+///     EARLIER sibling in this same fold materialised it,
+///     `overlay[input] == None` means an earlier sibling already consumed
+///     it, and a miss in the overlay falls through to the real, on-chain
+///     UTxO set. This reproduces `foldM`'s live-accumulator semantics (a
+///     later sub-tx CAN spend an earlier sibling's own output) while never
+///     touching `utxo`/`certs`/`epochs` — real mutation is deferred to pass
+///     2. The **first** sub-tx whose preconditions fail returns `Err`
+///     immediately, with zero mutation having occurred; `DijkstraRules::
+///     apply_valid_tx` propagates that `Err` before EVER calling
+///     `self.conway().apply_valid_tx(..)` for the parent's own effects, so
+///     the whole top-level tx — parent included — has no partial effects.
+///     (A nuance worth being precise about: whether upstream's `foldM`
+///     itself short-circuits at the first failing sub-tx's nested `trans`
+///     call, or continues folding to accumulate a `NonEmpty` list of ALL
+///     sub-tx failures, is NOT independently confirmed here. `foldM`
+///     requires a lawful `Monad`, which rules out a pure
+///     accumulating-`Validation` semantics for the fold's own bind chain —
+///     but `SUBLEDGER`'s internal rule composition could still batch
+///     multiple predicate failures PER sub-tx before that bind ever sees
+///     them. Which of these is true is immaterial to correctness here:
+///     Haskell's STS state is a pure value threaded through `foldM`'s
+///     accumulator, so a `Left` from `SUBLEDGERS` — triggered by ANY
+///     sub-tx's `trans` failing, under ANY internal accumulation scheme —
+///     means the CALLER (`dijkstraLedgerTransition`) never receives an
+///     updated `LedgerState` at all; every sub-tx's effect is equally
+///     absent whether it was "evaluated then discarded" or "never
+///     evaluated". dugite's pass 1 chooses the simpler short-circuit
+///     behaviour for exactly that reason — the two are externally
+///     indistinguishable from outside `SUBLEDGERS`, and dugite's
+///     `LedgerError` carries a single message anyway, matching this
+///     file's existing single-message convention for every other Dijkstra
+///     predicate failure.)
+///   - **Pass 2 (commit).** Only reached if every sub-tx validated. Replays
+///     the exact same sequence for real against `utxo.utxo_set` /
+///     `certs.stake_distribution.stake_map` / `epochs.ptr_stake`, mirroring
+///     `eras::common::apply_utxo_changes`'s incremental instant-stake
+///     replay (`stake_routing`, shared with the live path) so `stake_map`
+///     never goes stale after a sub-tx (#7). Cannot fail — pass 1 already
+///     proved every input resolves.
+///
+/// Outputs are keyed under `(sub.tx_id, idx)` — the sub-tx's own TxId, NOT
+/// the parent's — matching upstream's per-sub-tx `TxIn` namespace.
+///
+/// # SUBUTXO checks implemented
+///
+/// The subset of `Cardano.Ledger.Dijkstra.Rules.SubUtxo`'s 10-constructor
+/// `DijkstraSubUtxoPredFailure` that is expressible against the fields
+/// [`SubTransaction`](dugite_primitives::transaction::SubTransaction)
+/// currently models:
+///
+///   - `SubBadInputsUTxO` — every input must resolve (above).
+///   - `SubInputSetEmptyUTxO` — a sub-tx must declare at least one input.
+///   - `SubOutsideValidityIntervalUTxO` — `sub.ttl` / `sub.validity_interval_start`
+///     checked against `ctx.current_slot` with the SAME `>=` / `<` bounds as
+///     the top-level tx's own Rules 7/8 in `validation/phase1.rs`.
+///   - A `SubBabbageOutputTooSmallUTxO`-equivalent minimum-UTxO-value floor
+///     on `sub.outputs`, reusing `ProtocolParameters::min_coin_for_output`
+///     (the same PV>=7 serialized-size formula the parent tx's own Rule 5
+///     uses — Dijkstra is PV>=12).
+///
+/// `SubMaxTxSizeUTxO`, `SubWrongNetwork(InTxBody)`, `SubOutputTooBigUTxO`,
+/// `SubOutsideForecast` and `SubOutputBootAddrAttrsTooBig` are NOT yet
+/// implemented (straightforward additions once needed — none is the
+/// accept-where-Haskell-rejects divergence #1001 was filed for).
+///
+/// # #1010: SubTransaction now models the full DijkstraSubTxBodyRaw + dstWits
+///
+/// `SubTransaction` (`dugite-primitives`) carries the FULL oracle-verified
+/// field set now: `certificates` / `withdrawals` / `mint` /
+/// `script_data_hash` / `guards` / `network_id` / `voting_procedures` /
+/// `proposal_procedures` / `treasury_value` / `donation` /
+/// `direct_deposits` / `account_balance_intervals`, plus its own
+/// independent `witness_set` (`dstWits`) and `auxiliary_data` — see the
+/// doc comment on that struct for the full key table and the
+/// `[body, wits, auxData]` wire-shape fix (a sub-tx was previously decoded
+/// as a bare body map; #1010 confirmed each OMap entry is a 3-element
+/// `DijkstraSubTx` record, matching a top-level `Tx`'s own shape one level
+/// down). `dugite-serialization`'s decoder/encoder for it are complete;
+/// only key 24 (`required_top_level_guards`, a Dijkstra-only concept with
+/// no Conway analog) remains unmodelled and hard-rejects if present.
+///
+/// **SUBUTXOW implemented (partially): witness sufficiency.** Every
+/// sub-tx's spend inputs / withdrawals / certificates are checked against
+/// its OWN `witness_set` (never the parent's — oracle-confirmed
+/// independence) via `SubMissingVKeyWitnessesUTXOW`, reusing
+/// `ConwayRules::required_witnesses` against a minimal envelope built from
+/// the sub-tx's own fields — "route sub-txs through the existing …
+/// validators with the sub-tx envelope", #1001's own suggested approach.
+/// Presence-only (a required key hash has a matching `blake2b224(vkey)`
+/// witness) — NOT full cryptographic signature verification
+/// (`SubInvalidWitnessesUTXOW`), and NOT the remaining 15 `SUBUTXOW`
+/// constructors (redeemers, datums, metadata hash, script integrity hash,
+/// well-formed scripts, guard datums). Known limitation: the envelope's
+/// witness computation resolves inputs via `utxo.utxo_set.lookup`, which
+/// does not see this fold's own `overlay` — an input created by an
+/// earlier sibling sub-tx (not yet committed; pass 2 hasn't run)
+/// contributes no witness requirement rather than the correct one. This
+/// under-reports, never over-reports, so it cannot cause a false reject —
+/// only a (currently unreachable, since sub_transactions is empty on
+/// every live network) false accept for that specific chained-input case.
+///
+/// **SUBCERTS / SUBDELEG / SUBPOOL / SUBGOVCERT / SUBGOV: data is now
+/// decoded, but NOT YET routed through apply.** `sub.certificates`,
+/// `sub.voting_procedures` and `sub.proposal_procedures` are available on
+/// `SubTransaction` but `apply_sub_transactions` does not yet call
+/// `common::apply_shelley_cert` / `ConwayRules`'s private
+/// `apply_conway_cert` / `process_governance_votes_and_proposals` for
+/// them — those upstream rules are literal, direct reuses of the exact
+/// same functions (`Conway.conwayDelegTransition`, `Shelley.poolTransition`,
+/// `Conway.conwayGovCertTransition`, `Conway.conwayGovTransition`) dugite
+/// already has as `apply_shelley_cert`/`apply_conway_cert`/
+/// `process_governance_votes_and_proposals` for the PARENT tx, so wiring
+/// them is a routing exercise once a REAL two-phase validate/apply split
+/// exists for sub-tx certs (today `apply_*_cert` mutate unconditionally,
+/// trusting Phase-1 already vetted the cert — there is no reusable
+/// "validate this cert without applying it" function to call from pass 1,
+/// and a sub-tx has no Phase-1 admission path at all yet). A sub-tx that
+/// carries certificates or governance procedures today is accepted
+/// (decodes and applies with its UTxO effects) but those specific fields
+/// are silently NOT applied to `certs`/`gov` — tracked as the direct
+/// continuation of #1010.
 fn apply_sub_transactions(
     tx: &Transaction,
+    ctx: &RuleContext,
     utxo: &mut UtxoSubState,
     certs: &mut CertSubState,
+    gov: &GovSubState,
     epochs: &mut EpochSubState,
-) -> UtxoDiff {
+) -> Result<UtxoDiff, LedgerError> {
     use crate::state::{stake_routing, StakeRouting};
-    use dugite_primitives::transaction::TransactionInput;
+    use dugite_primitives::transaction::{SubTransaction, TransactionInput, TransactionOutput};
     use dugite_primitives::value::Lovelace;
+    use std::collections::HashMap;
 
-    // #7: a Dijkstra sub-transaction's UTxO changes must replay the incremental
-    // instant-stake on `stake_map` / `ptr_stake` exactly like the top-level
-    // `eras::common::apply_utxo_changes` (Phase 2/5) and the reconstruction-path
-    // `ledger_seq::apply_utxo_diff` (#6). Without this the FORWARD path mutates
-    // `utxo_set` (below) but leaves `stake_map` stale after a sub-tx — the
-    // forward-path mirror of the #6 reconstruction bug. The routing
-    // (`stake_routing`, shared with the live path) keys identically by
-    // construction.
     let ptr_stake_excluded = epochs.ptr_stake_excluded;
-    let mut diff = UtxoDiff::new();
+
+    // ---- Pass 1: validate (no mutation) --------------------------------
+    let mut overlay: HashMap<TransactionInput, Option<TransactionOutput>> = HashMap::new();
+    let mut planned: Vec<(&SubTransaction, Vec<(TransactionInput, TransactionOutput)>)> =
+        Vec::with_capacity(tx.body.sub_transactions.len());
 
     for sub in &tx.body.sub_transactions {
-        // Step 1: pre-condition check. If any spend input is missing in
-        // the current snapshot (already spent by the parent tx or a prior
-        // sub-tx, or never existed), abandon this sub-tx WITHOUT mutating
-        // either the UTxO set or the accumulator diff. Upstream's SUBUTXO
-        // rule raises a `BadInputsUTxO`/`UTxONotInForward` failure here;
-        // we silently drop because the SUBLEDGERS-as-foldM equivalence is
-        // a follow-on (see note in `DijkstraRules::apply_valid_tx`).
-        let mut all_inputs_present = true;
-        let mut spent_outputs: Vec<(TransactionInput, _)> = Vec::with_capacity(sub.inputs.len());
+        // #1010 fail-closed guard: `SubTransaction` now DECODES
+        // certificates/withdrawals/mint/voting_procedures/
+        // proposal_procedures/direct_deposits/account_balance_intervals
+        // (the wire-shape and field-modelling half of #1010), but
+        // `apply_sub_transactions` below only APPLIES the UTxO/stake
+        // effects and checks witness sufficiency — it does not yet route
+        // certs through `apply_shelley_cert`/`apply_conway_cert` or
+        // votes/proposals through `process_governance_votes_and_proposals`
+        // (the SUBCERTS/SUBGOV apply half, still open — see the doc
+        // comment on this function). Applying SOME of a sub-tx's declared
+        // effects while silently ignoring others is exactly the
+        // "decodes fine, diverges silently" shape #1010 was filed to
+        // close, one layer up from the CBOR decoder. Reject rather than
+        // accept a sub-tx whose non-UTxO effects would be dropped.
+        if !sub.certificates.is_empty()
+            || !sub.withdrawals.is_empty()
+            || !sub.mint.is_empty()
+            || !sub.voting_procedures.is_empty()
+            || !sub.proposal_procedures.is_empty()
+            || !sub.direct_deposits.is_empty()
+            || !sub.account_balance_intervals.is_empty()
+        {
+            return Err(LedgerError::InvalidTransaction(format!(
+                "SubEntitiesNotYetApplied: sub-tx {} of parent {} declares certs/\
+                 withdrawals/mint/voting/proposal/direct_deposits/account_balance_intervals \
+                 effects that dugite decodes but does not yet apply (#1010 SUBCERTS/SUBGOV \
+                 apply routing) — rejecting rather than silently dropping those effects; \
+                 aborting the ENTIRE top-level tx",
+                sub.tx_id.to_hex(),
+                tx.hash.to_hex()
+            )));
+        }
+
+        // SubInputSetEmptyUTxO (SubUtxo.hs tag 3).
+        if sub.inputs.is_empty() {
+            return Err(LedgerError::InvalidTransaction(format!(
+                "SubInputSetEmptyUTxO: sub-tx {} of parent {} declares zero inputs — \
+                 aborting the ENTIRE top-level tx",
+                sub.tx_id.to_hex(),
+                tx.hash.to_hex()
+            )));
+        }
+
+        // SubOutsideValidityIntervalUTxO (SubUtxo.hs tag 1) — mirrors the
+        // top-level tx's own Rules 7/8 (`validation/phase1.rs`): valid iff
+        // `slot < ttl` and `slot >= validity_interval_start`.
+        if let Some(ttl) = sub.ttl {
+            if ctx.current_slot >= ttl.0 {
+                return Err(LedgerError::InvalidTransaction(format!(
+                    "SubOutsideValidityIntervalUTxO: sub-tx {} of parent {} ttl={} \
+                     <= current_slot={} — aborting the ENTIRE top-level tx",
+                    sub.tx_id.to_hex(),
+                    tx.hash.to_hex(),
+                    ttl.0,
+                    ctx.current_slot
+                )));
+            }
+        }
+        if let Some(start) = sub.validity_interval_start {
+            if ctx.current_slot < start.0 {
+                return Err(LedgerError::InvalidTransaction(format!(
+                    "SubOutsideValidityIntervalUTxO: sub-tx {} of parent {} not yet \
+                     valid (validity_interval_start={} > current_slot={}) — aborting \
+                     the ENTIRE top-level tx",
+                    sub.tx_id.to_hex(),
+                    tx.hash.to_hex(),
+                    start.0,
+                    ctx.current_slot
+                )));
+            }
+        }
+
+        // SubBadInputsUTxO (SubUtxo.hs tag 0). Resolve against the overlay
+        // (this fold's own live accumulator) first, then the real,
+        // on-chain UTxO set.
+        let mut spent = Vec::with_capacity(sub.inputs.len());
         for input in &sub.inputs {
-            match utxo.utxo_set.lookup(input) {
-                Some(output) => spent_outputs.push((input.clone(), output)),
+            let resolved = match overlay.get(input) {
+                Some(Some(output)) => Some(output.clone()),
+                Some(None) => None,
+                None => utxo.utxo_set.lookup(input),
+            };
+            match resolved {
+                Some(output) => spent.push((input.clone(), output)),
                 None => {
-                    tracing::debug!(
-                        parent = %tx.hash.to_hex(),
-                        sub = %sub.tx_id.to_hex(),
-                        input = %input,
-                        "SUB rule: input missing — dropping sub-tx (Phase 3.1 isolated mode)"
-                    );
-                    all_inputs_present = false;
-                    break;
+                    return Err(LedgerError::InvalidTransaction(format!(
+                        "SubBadInputsUTxO: sub-tx {} of parent {} input {} not found \
+                         — aborting the ENTIRE top-level tx (Dijkstra SUBLEDGERS \
+                         foldM: any sub-tx failure fails the whole tx, no partial \
+                         sibling effects)",
+                        sub.tx_id.to_hex(),
+                        tx.hash.to_hex(),
+                        input
+                    )));
                 }
             }
         }
-        if !all_inputs_present {
-            continue;
+
+        // Minimum-UTxO-value floor on this sub-tx's own outputs.
+        for output in &sub.outputs {
+            let has_datum_hash = matches!(
+                output.datum,
+                dugite_primitives::transaction::OutputDatum::DatumHash(_)
+            );
+            let output_size_bytes = match &output.raw_cbor {
+                Some(cbor) => cbor.len() as u64,
+                None => {
+                    dugite_serialization::encode::encode_transaction_output(output).len() as u64
+                }
+            };
+            let min_utxo =
+                ctx.params
+                    .min_coin_for_output(&output.value, has_datum_hash, output_size_bytes);
+            if output.value.coin.0 < min_utxo.0 {
+                return Err(LedgerError::InvalidTransaction(format!(
+                    "SubBabbageOutputTooSmallUTxO: sub-tx {} of parent {} output \
+                     value {} below minimum {} — aborting the ENTIRE top-level tx",
+                    sub.tx_id.to_hex(),
+                    tx.hash.to_hex(),
+                    output.value.coin.0,
+                    min_utxo.0
+                )));
+            }
         }
 
-        // Step 2: consume the sub-tx's spend inputs. The mutation is
-        // applied immediately so a later sibling sub-tx can correctly see
-        // (and fail on) double-spend attempts against the same parent.
-        for (input, output) in &spent_outputs {
+        // SUBUTXOW: SubMissingVKeyWitnessesUTXOW (SubUtxow.hs tag 2) — the
+        // sub-tx's OWN witness set (`sub.witness_set`, never the parent's;
+        // oracle-verified `dstWits` independence, #1010) must cover every
+        // key hash its OWN inputs/withdrawals/certificates require. Reuses
+        // `ConwayRules::required_witnesses` (byte-identical logic to what
+        // the parent tx's own witness sufficiency check runs) against a
+        // minimal envelope carrying just the sub-tx's relevant fields —
+        // "route sub-txs through the existing … validators with the sub-tx
+        // envelope", per #1001's own suggested approach. Presence-only
+        // (matches a required key hash against a witness's blake2b-224):
+        // full cryptographic signature verification
+        // (SubInvalidWitnessesUTXOW, tag 1) is a separate, not-yet-modelled
+        // predicate — see the doc comment on `apply_sub_transactions`.
+        //
+        // KNOWN LIMITATION: `required_witnesses` resolves each input via
+        // `utxo.utxo_set.lookup`, which does NOT see this fold's own
+        // `overlay` — an input created by an EARLIER sibling sub-tx (not
+        // yet committed to the real UTxO set; pass 2 hasn't run) silently
+        // contributes no witness requirement, rather than the correct
+        // one. This under-reports, never over-reports: it can only make
+        // the check MORE permissive for a chained sub-tx's own input,
+        // never wrongly reject a legitimate one. Tracked as a follow-on
+        // alongside the primitives gap above.
+        {
+            let envelope = Transaction {
+                era: dugite_primitives::era::Era::Dijkstra,
+                hash: sub.tx_id,
+                body: dugite_primitives::transaction::TransactionBody {
+                    inputs: sub.inputs.clone(),
+                    outputs: vec![],
+                    fee: dugite_primitives::value::Lovelace(0),
+                    ttl: None,
+                    certificates: sub.certificates.clone(),
+                    withdrawals: sub.withdrawals.clone(),
+                    auxiliary_data_hash: None,
+                    validity_interval_start: None,
+                    mint: Default::default(),
+                    script_data_hash: None,
+                    collateral: vec![],
+                    required_signers: vec![],
+                    network_id: None,
+                    collateral_return: None,
+                    total_collateral: None,
+                    reference_inputs: vec![],
+                    update: None,
+                    voting_procedures: Default::default(),
+                    proposal_procedures: vec![],
+                    treasury_value: None,
+                    donation: None,
+                    sub_transactions: vec![],
+                    account_balance_intervals: vec![],
+                    direct_deposits: Default::default(),
+                    guards: vec![],
+                },
+                witness_set: sub.witness_set.clone(),
+                is_valid: true,
+                auxiliary_data: sub.auxiliary_data.clone(),
+                raw_cbor: None,
+                raw_body_cbor: None,
+                raw_witness_cbor: None,
+            };
+            let required =
+                super::conway::ConwayRules.required_witnesses(&envelope, ctx, utxo, certs, gov);
+            let signed: HashSet<Hash28> = sub
+                .witness_set
+                .vkey_witnesses
+                .iter()
+                .filter(|w| w.vkey.len() == 32)
+                .map(|w| dugite_primitives::hash::blake2b_224(&w.vkey))
+                .collect();
+            let missing: Vec<Hash28> = required.difference(&signed).copied().collect();
+            if !missing.is_empty() {
+                let mut missing_hex: Vec<String> = missing.iter().map(|h| h.to_hex()).collect();
+                missing_hex.sort();
+                return Err(LedgerError::InvalidTransaction(format!(
+                    "SubMissingVKeyWitnessesUTXOW: sub-tx {} of parent {} is missing vkey \
+                     witnesses for {:?} — aborting the ENTIRE top-level tx",
+                    sub.tx_id.to_hex(),
+                    tx.hash.to_hex(),
+                    missing_hex
+                )));
+            }
+        }
+
+        // Thread the live accumulator forward: tombstone consumed inputs so
+        // a LATER sibling cannot double-spend them, and materialise this
+        // sub-tx's own outputs so a LATER sibling CAN spend them.
+        for (input, _) in &spent {
+            overlay.insert(input.clone(), None);
+        }
+        for (idx, output) in sub.outputs.iter().enumerate() {
+            let new_input = TransactionInput {
+                transaction_id: sub.tx_id,
+                index: idx as u32,
+            };
+            overlay.insert(new_input, Some(output.clone()));
+        }
+
+        planned.push((sub, spent));
+    }
+
+    // ---- Pass 2: commit (cannot fail — pass 1 already proved every input
+    // resolves) ------------------------------------------------------------
+    let mut diff = UtxoDiff::new();
+    for (sub, spent) in planned {
+        for (input, output) in &spent {
             // SUB the spent output's instant-stake (mirrors apply_utxo_changes
-            // Phase 2 / apply_utxo_diff delete leg).
+            // Phase 2 / apply_utxo_diff delete leg — #7).
             let coin = output.value.coin.0;
             match stake_routing(&output.address, ptr_stake_excluded) {
                 StakeRouting::Credential(cred_hash) => {
@@ -482,16 +900,13 @@ fn apply_sub_transactions(
             diff.record_delete(input.clone(), output.clone());
         }
 
-        // Step 3: insert the sub-tx's outputs, keyed under the sub-tx's
-        // OWN TxId (not the parent's). This matches upstream where each
-        // sub-tx has its own TxIn-namespace.
         for (idx, output) in sub.outputs.iter().enumerate() {
             let new_input = TransactionInput {
                 transaction_id: sub.tx_id,
                 index: idx as u32,
             };
             // ADD the new output's instant-stake (mirrors apply_utxo_changes
-            // Phase 5 / apply_utxo_diff insert leg).
+            // Phase 5 / apply_utxo_diff insert leg — #7).
             let coin = output.value.coin.0;
             match stake_routing(&output.address, ptr_stake_excluded) {
                 StakeRouting::Credential(cred_hash) => {
@@ -511,7 +926,7 @@ fn apply_sub_transactions(
         }
     }
 
-    diff
+    Ok(diff)
 }
 
 // ---------------------------------------------------------------------------
@@ -1309,37 +1724,40 @@ mod tests {
 
         /// TxBody key 23 — `sub_transactions`: nested transactions with
         /// their own bodies/witnesses processed through the SUB rule
-        /// hierarchy. Phase 3.1 of issue #475 — see
-        /// `Cardano.Ledger.Dijkstra.Rules.SubLedger`.
+        /// hierarchy. #1001 acceptance test — see
+        /// `Cardano.Ledger.Dijkstra.Rules.SubLedger`/`SubLedgers`.
         ///
-        /// This test pins the Phase 3.1 contract:
+        /// Pins the #1001 fix directly against its own acceptance criterion:
+        /// **"A tx whose 2nd of 3 sub-txs fails leaves NO effects from
+        /// sub-txs 1 or 3 and fails the top-level tx."**
         ///
-        ///   1. **Wire** — a CBOR-encoded Dijkstra tx body carrying key 23
-        ///      (`OMap TxId (Tx SubTx era)`) decodes into
-        ///      `TransactionBody.sub_transactions` with the OMap key
-        ///      preserved AND verifies the `key == blake2b_256(body)`
-        ///      invariant exactly (a forged key on the wire is rejected).
-        ///   2. **Apply** — `DijkstraRules::apply_valid_tx` runs each
-        ///      sub-tx in isolation against the current UTxO snapshot.
-        ///      Successful sub-txs commit their UTxO updates; sub-txs
-        ///      whose inputs cannot be resolved are dropped silently
-        ///      (dugite's permissive Phase 3.1 variant — see the doc
-        ///      comment on `apply_sub_transactions`). Sibling sub-txs are
-        ///      unaffected by a sibling's failure.
+        /// Fixture: a parent tx with no spend inputs of its own (so any
+        /// UTxO effect observed below comes solely from SUB execution) and
+        /// THREE sub-txs, in OMap order:
+        ///   * sub A (1st) — spends UTxO A (present), creates output OA.
+        ///     Would succeed on its own.
+        ///   * sub B (2nd) — spends UTxO B, which is NOT in the seeded set.
+        ///     Always fails (`SubBadInputsUTxO`).
+        ///   * sub C (3rd) — spends UTxO C (present), creates output OC.
+        ///     Would ALSO succeed on its own — this is what proves the fix
+        ///     is real: pre-#1001 code applied sub A unconditionally
+        ///     (isolated-snapshot semantics) and never even reached sub C's
+        ///     position in a way this test could distinguish from "sub C
+        ///     also happened to fail"; a THIRD, independently-succeeding
+        ///     sub-tx AFTER the failure point is required to prove no
+        ///     partial commit happened on either side of it.
         ///
-        /// Fixture: a parent tx with no spend inputs (so the parent
-        /// pipeline applies as a no-op on UTxO) and two sub-txs:
-        ///   * sub A — spends UTxO A (present), creates output OA
-        ///   * sub B — spends UTxO B (NOT present in the seeded set),
-        ///     creates output OB
-        ///
-        /// Final UTxO must contain:
-        ///   * OA (sub A's output, keyed under sub A's TxId)
-        ///   * NOT OB (sub B was dropped)
-        ///   * NOT UTxO A (consumed)
-        ///   * UTxO C (untouched control entry)
+        /// Required outcome (matches upstream `SUBLEDGERS`'s `foldM`: any
+        /// sub-tx failure discards the whole fold's accumulated state, and
+        /// `DijkstraRules::apply_valid_tx` never even calls
+        /// `self.conway().apply_valid_tx` once sub-tx validation fails):
+        ///   * `apply_valid_tx` returns `Err` naming `SubBadInputsUTxO`.
+        ///   * UTxO A is UNCONSUMED (sub A's effects did not land).
+        ///   * UTxO C is UNCONSUMED (sub C's effects did not land, even
+        ///     though sub C individually would have succeeded).
+        ///   * Neither OA nor OC exists in the UTxO set.
         #[test]
-        fn sub_transactions_round_trip_and_apply() {
+        fn sub_transactions_second_of_three_fails_aborts_whole_tx() {
             use super::super::*;
             use crate::eras::EraRules;
             use crate::state::{BlockValidationMode, StakeDistributionState};
@@ -1378,17 +1796,26 @@ mod tests {
             };
 
             // ---- seed the UTxO ---------------------------------------
-            let kh = Hash28::from_bytes([0xAB; 28]);
+            // Real blake2b-224(vkey) hash (not arbitrary bytes) so the
+            // #1010 SUBUTXOW witness check has something genuine to verify
+            // sub A/C's witnesses against.
+            let payment_vkey = [0xAB_u8; 32];
+            let kh = dugite_primitives::hash::blake2b_224(&payment_vkey);
             let addr = make_enterprise_address(kh);
+            let witness_for = |vkey: [u8; 32]| dugite_primitives::transaction::VKeyWitness {
+                vkey: vkey.to_vec(),
+                signature: vec![0u8; 64],
+            };
 
-            // UTxO A — will be consumed by sub A.
+            // UTxO A — sub A would consume it (it succeeds in isolation).
             let utxo_a_in = make_input(0xA1, 0);
             let utxo_a_out = make_output(addr.clone(), 10_000_000);
-            // UTxO C — untouched control.
+            // UTxO C — sub C would ALSO consume it (it succeeds in
+            // isolation too — this is the whole point of the test).
             let utxo_c_in = make_input(0xCC, 0);
             let utxo_c_out = make_output(addr.clone(), 5_000_000);
             // Note: there is NO UTxO B in the set — sub B's input is
-            // deliberately unresolved.
+            // deliberately unresolved, so sub B always fails.
 
             let mut utxo_set = UtxoSet::new();
             utxo_set.insert(utxo_a_in.clone(), utxo_a_out.clone());
@@ -1401,14 +1828,13 @@ mod tests {
                 pending_donations: Lovelace(0),
             };
 
-            // ---- build sub-txs ---------------------------------------
-            // Sub A: valid — consumes UTxO A, creates OA (4 ADA).
+            // ---- build sub-txs (in OMap order: A, B, C) --------------
+            // Sub A (1st): would succeed alone — consumes UTxO A, creates OA.
             let sub_a_output = make_output(addr.clone(), 4_000_000);
-            let mut sub_a = SubTransaction {
-                // Pin a known tx_id for output keying. In Phase 3.1's
-                // tests the OMap-key invariant is verified at the wire
-                // layer; here we exercise the apply-only path, so a
-                // fabricated `tx_id` is fine.
+            let sub_a = SubTransaction {
+                // Fabricated tx_id — the OMap key == blake2b256(body)
+                // invariant is pinned separately at the wire layer; this
+                // test exercises the apply-only path.
                 tx_id: Hash32::from_bytes([0xAA; 32]),
                 inputs: vec![utxo_a_in.clone()],
                 outputs: vec![sub_a_output.clone()],
@@ -1417,11 +1843,15 @@ mod tests {
                 reference_inputs: vec![],
                 auxiliary_data_hash: None,
                 raw_body_cbor: None,
+                witness_set: TransactionWitnessSet {
+                    vkey_witnesses: vec![witness_for(payment_vkey)],
+                    ..Default::default()
+                },
+                ..Default::default()
             };
 
-            // Sub B: invalid — references UTxO B which is NOT in the
-            // set. Per Phase 3.1 isolation it must be dropped, NOT
-            // poison the parent or sub A's effects.
+            // Sub B (2nd): always fails — references UTxO B, which is NOT
+            // in the set (`SubBadInputsUTxO`).
             let sub_b_missing_in = make_input(0xBB, 0);
             let sub_b_output = make_output(addr.clone(), 2_000_000);
             let sub_b = SubTransaction {
@@ -1433,24 +1863,30 @@ mod tests {
                 reference_inputs: vec![],
                 auxiliary_data_hash: None,
                 raw_body_cbor: None,
+                ..Default::default()
             };
 
-            // The Haskell decoder enforces OMap key invariant; here we
-            // also pin it by computing the real body hash and stamping
-            // it into sub_a.tx_id so a wire-level round-trip would also
-            // succeed. The apply-only test does not require this, but
-            // it documents the convention.
-            use dugite_serialization::encode::encode_transaction_body;
-            // Pre-fill raw_body_cbor & recompute tx_id from canonical
-            // encoding of a SubTx body. We don't have a public
-            // `encode_sub_tx_body`; instead, use the parent encoder's
-            // emission of an equivalent body shape as a proxy and
-            // re-stamp the OMap key. This is purely for end-to-end
-            // documentation of the wire shape; the apply-only contract
-            // tested below is independent of it.
-            let _ = encode_transaction_body; // referenced to assert it
-                                             // is the canonical entry.
-            sub_a.tx_id = Hash32::from_bytes([0xAA; 32]);
+            // Sub C (3rd): would ALSO succeed alone — consumes UTxO C,
+            // creates OC. Comes AFTER the failing sub B in OMap order.
+            let sub_c_output = make_output(addr.clone(), 3_000_000);
+            let sub_c = SubTransaction {
+                // Deliberately distinct from `utxo_c_in`'s transaction_id
+                // (0xCC) — reusing it would make `oc_in` alias `utxo_c_in`
+                // and silently pass a key-collision test.
+                tx_id: Hash32::from_bytes([0xC3; 32]),
+                inputs: vec![utxo_c_in.clone()],
+                outputs: vec![sub_c_output.clone()],
+                ttl: None,
+                validity_interval_start: None,
+                reference_inputs: vec![],
+                auxiliary_data_hash: None,
+                raw_body_cbor: None,
+                witness_set: TransactionWitnessSet {
+                    vkey_witnesses: vec![witness_for(payment_vkey)],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
 
             // ---- build the parent tx ---------------------------------
             // Parent has no spend inputs of its own — we want the test
@@ -1477,7 +1913,7 @@ mod tests {
                 proposal_procedures: vec![],
                 treasury_value: None,
                 donation: None,
-                sub_transactions: vec![sub_a.clone(), sub_b.clone()],
+                sub_transactions: vec![sub_a.clone(), sub_b.clone(), sub_c.clone()],
                 account_balance_intervals: vec![],
                 direct_deposits: ::std::collections::BTreeMap::new(),
                 guards: Vec::new(),
@@ -1572,9 +2008,9 @@ mod tests {
                 max_lovelace_supply: crate::state::MAX_LOVELACE_SUPPLY,
             };
 
-            // ---- apply ----------------------------------------------
+            // ---- apply ------------------------------------------------
             let rules = DijkstraRules::new();
-            let diff = rules
+            let err = rules
                 .apply_valid_tx(
                     &parent_tx,
                     BlockValidationMode::ApplyOnly,
@@ -1584,38 +2020,46 @@ mod tests {
                     &mut gov,
                     &mut epochs,
                 )
-                .expect("Dijkstra apply must succeed (parent + sub A; sub B silently dropped)");
-
-            // ---- assertions ------------------------------------------
-            // UTxO A consumed.
+                .expect_err(
+                    "sub B's failure must fail the WHOLE top-level tx (#1001 foldM semantics)",
+                );
+            let msg = format!("{err:?}");
             assert!(
-                utxo.utxo_set.lookup(&utxo_a_in).is_none(),
-                "sub A must have consumed UTxO A"
+                msg.contains("SubBadInputsUTxO"),
+                "error must name the predicate, got: {msg}"
             );
-            // UTxO C survived (control).
+
+            // ---- assertions: NO effects from sub A or sub C -----------
+            // UTxO A must be UNCONSUMED — sub A's effects did not land.
+            assert_eq!(
+                utxo.utxo_set.lookup(&utxo_a_in),
+                Some(utxo_a_out.clone()),
+                "sub A's effects MUST NOT land: UTxO A must still be spendable"
+            );
+            // UTxO C must be UNCONSUMED — sub C's effects did not land,
+            // even though sub C individually would have succeeded and
+            // comes AFTER the failing sub B in OMap order.
             assert_eq!(
                 utxo.utxo_set.lookup(&utxo_c_in),
                 Some(utxo_c_out.clone()),
-                "untouched UTxO C must survive"
+                "sub C's effects MUST NOT land: UTxO C must still be spendable"
             );
-            // Sub A's output present, keyed under sub A's TxId at index 0.
+            // Neither OA nor OC exists.
             let oa_in = TransactionInput {
                 transaction_id: sub_a.tx_id,
                 index: 0,
             };
-            assert_eq!(
-                utxo.utxo_set.lookup(&oa_in),
-                Some(sub_a_output.clone()),
-                "sub A's output must be inserted under (sub_a.tx_id, 0)"
+            assert!(
+                utxo.utxo_set.lookup(&oa_in).is_none(),
+                "sub A's output OA MUST NOT appear — its effects were discarded"
             );
-            // Sub B's output absent — sub B was dropped.
-            let ob_in = TransactionInput {
-                transaction_id: sub_b.tx_id,
+            let oc_in = TransactionInput {
+                transaction_id: sub_c.tx_id,
                 index: 0,
             };
             assert!(
-                utxo.utxo_set.lookup(&ob_in).is_none(),
-                "sub B was dropped — its output must NOT appear in the UTxO set"
+                utxo.utxo_set.lookup(&oc_in).is_none(),
+                "sub C's output OC MUST NOT appear — its effects were discarded"
             );
             // Also not under the parent's hash (sub outputs are NEVER
             // keyed by the parent's TxId).
@@ -1628,13 +2072,6 @@ mod tests {
                     .is_none(),
                 "parent-keyed outputs MUST NOT appear (parent had no outputs)"
             );
-
-            // Diff invariants: exactly 1 delete (UTxO A) and 1 insert (OA).
-            // Sub B contributed nothing.
-            assert_eq!(diff.deletes.len(), 1, "exactly UTxO A must be deleted");
-            assert_eq!(diff.deletes[0].0, utxo_a_in);
-            assert_eq!(diff.inserts.len(), 1, "exactly OA must be inserted");
-            assert_eq!(diff.inserts[0].0, oa_in);
         }
 
         /// #7 — a Dijkstra sub-transaction's UTxO changes must replay the
@@ -1649,27 +2086,40 @@ mod tests {
             use dugite_primitives::address::Address;
             use dugite_primitives::era::Era;
             use dugite_primitives::hash::{Hash28, Hash32};
+            use dugite_primitives::protocol_params::ProtocolParameters;
             use dugite_primitives::transaction::{
                 OutputDatum, SubTransaction, Transaction, TransactionBody, TransactionInput,
                 TransactionOutput, TransactionWitnessSet,
             };
             use dugite_primitives::value::{Lovelace, Value};
-            use std::collections::BTreeMap;
+            use std::collections::{BTreeMap, HashMap};
 
             // A base address (type 0, testnet) carries a STAKE credential →
             // `stake_routing` → `Credential`; an enterprise address (0x61) has
             // none → `None` (which is why the existing apply test, using only
             // enterprise addresses, never exercised the stake legs).
+            //
+            // Both payment credentials are real blake2b-224(vkey) hashes
+            // (not arbitrary bytes) so the #1010 SUBUTXOW witness check
+            // below has something genuine to verify against.
+            let payment_vkey = [0x31u8; 32];
+            let payment_hash = dugite_primitives::hash::blake2b_224(&payment_vkey);
             let base_addr = {
                 let mut b = vec![0x00u8];
-                b.extend_from_slice(Hash28::from_bytes([0x11; 28]).as_bytes());
+                b.extend_from_slice(payment_hash.as_bytes());
                 b.extend_from_slice(Hash28::from_bytes([0x7d; 28]).as_bytes());
                 Address::from_bytes(&b).expect("base addr")
             };
+            let ent_vkey = [0x32u8; 32];
+            let ent_hash = dugite_primitives::hash::blake2b_224(&ent_vkey);
             let enterprise_addr = {
                 let mut b = vec![0x61u8];
-                b.extend_from_slice(Hash28::from_bytes([0xEE; 28]).as_bytes());
+                b.extend_from_slice(ent_hash.as_bytes());
                 Address::from_bytes(&b).expect("enterprise addr")
+            };
+            let witness_for = |vkey: [u8; 32]| dugite_primitives::transaction::VKeyWitness {
+                vkey: vkey.to_vec(),
+                signature: vec![0u8; 64],
             };
             let mk_out = |addr: Address, coin: u64| TransactionOutput {
                 address: addr,
@@ -1735,7 +2185,11 @@ mod tests {
 
             let mut utxo = super::make_utxo_sub();
             let mut certs = super::make_cert_sub();
+            let gov = super::make_gov_sub();
             let mut epochs = super::make_epoch_sub();
+            let params = ProtocolParameters::mainnet_defaults();
+            let delegates: HashMap<Hash28, (Hash28, Hash32)> = HashMap::new();
+            let ctx = super::make_ctx(&params, &delegates, None);
 
             // The stake_map key for the base credential, via the SAME routing the fix uses.
             let cred_key = match stake_routing(&base_addr, epochs.ptr_stake_excluded) {
@@ -1758,13 +2212,21 @@ mod tests {
                 reference_inputs: vec![],
                 auxiliary_data_hash: None,
                 raw_body_cbor: None,
+                witness_set: TransactionWitnessSet {
+                    vkey_witnesses: vec![witness_for(ent_vkey)],
+                    ..Default::default()
+                },
+                ..Default::default()
             };
             apply_sub_transactions(
                 &mk_parent(vec![sub_add]),
+                &ctx,
                 &mut utxo,
                 &mut certs,
+                &gov,
                 &mut epochs,
-            );
+            )
+            .expect("sub_add must validate and commit");
             // PRE-FIX stake_map was empty here (apply_sub_transactions never touched
             // it) → this FAILS pre-fix / PASSES post-fix.
             assert_eq!(
@@ -1790,13 +2252,21 @@ mod tests {
                 reference_inputs: vec![],
                 auxiliary_data_hash: None,
                 raw_body_cbor: None,
+                witness_set: TransactionWitnessSet {
+                    vkey_witnesses: vec![witness_for(payment_vkey)],
+                    ..Default::default()
+                },
+                ..Default::default()
             };
             apply_sub_transactions(
                 &mk_parent(vec![sub_spend]),
+                &ctx,
                 &mut utxo,
                 &mut certs,
+                &gov,
                 &mut epochs,
-            );
+            )
+            .expect("sub_spend must validate and commit");
             assert_eq!(
                 certs.stake_distribution.stake_map.get(&cred_key).copied(),
                 Some(Lovelace(0)),
@@ -1804,10 +2274,373 @@ mod tests {
             );
         }
 
-        /// CIP-0167 — `isValid` flag removed at top level; collateral flow
-        /// restructured. Phase 3.2 of issue #475.
-        ///
-        /// Two-part assertion:
+        /// #1001 — the SUBUTXO checks expressible against the currently
+        /// modelled `SubTransaction` fields (see the doc comment on
+        /// `apply_sub_transactions`): `SubInputSetEmptyUTxO`,
+        /// `SubOutsideValidityIntervalUTxO`, and a
+        /// `SubBabbageOutputTooSmallUTxO`-equivalent minimum-UTxO-value
+        /// floor. Each sub-case constructs a single-sub-tx parent and
+        /// asserts `apply_valid_tx` rejects it by predicate name, with zero
+        /// state mutation.
+        #[test]
+        fn sub_transactions_subutxo_checks() {
+            use super::super::*;
+            use crate::eras::EraRules;
+            use crate::state::{BlockValidationMode, StakeDistributionState};
+            use crate::utxo::UtxoSet;
+            use crate::utxo_diff::DiffSeq;
+            use dugite_primitives::address::Address;
+            use dugite_primitives::era::Era;
+            use dugite_primitives::hash::{Hash28, Hash32};
+            use dugite_primitives::protocol_params::ProtocolParameters;
+            use dugite_primitives::time::{EpochNo, SlotNo};
+            use dugite_primitives::transaction::{
+                OutputDatum, SubTransaction, Transaction, TransactionBody, TransactionInput,
+                TransactionOutput, TransactionWitnessSet,
+            };
+            use dugite_primitives::value::{Lovelace, Value};
+            use std::collections::{BTreeMap, HashMap, HashSet};
+            use std::sync::Arc;
+
+            let make_enterprise_address = |kh: Hash28| -> Address {
+                let mut b = vec![0x61];
+                b.extend_from_slice(kh.as_bytes());
+                Address::from_bytes(&b).expect("enterprise addr")
+            };
+            let make_output = |addr: Address, coin: u64| TransactionOutput {
+                address: addr,
+                value: Value::lovelace(coin),
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: true,
+                raw_cbor: None,
+            };
+            let make_input = |tx_id_byte: u8, idx: u32| TransactionInput {
+                transaction_id: Hash32::from_bytes([tx_id_byte; 32]),
+                index: idx,
+            };
+            let kh = Hash28::from_bytes([0xAB; 28]);
+            let addr = make_enterprise_address(kh);
+
+            // Shared harness: build a parent carrying exactly ONE sub-tx,
+            // apply it, and return the `Err` (or panic if it unexpectedly
+            // succeeds).
+            let run_one_sub =
+                |sub: SubTransaction, seed: Vec<(TransactionInput, TransactionOutput)>| {
+                    let mut utxo_set = UtxoSet::new();
+                    for (i, o) in &seed {
+                        utxo_set.insert(i.clone(), o.clone());
+                    }
+                    let mut utxo = UtxoSubState {
+                        utxo_set,
+                        diff_seq: DiffSeq::new(),
+                        epoch_fees: Lovelace(0),
+                        pending_donations: Lovelace(0),
+                    };
+                    let mut certs = CertSubState {
+                        delegations: imbl::HashMap::new(),
+                        pool_params: Arc::new(HashMap::new()),
+                        future_pool_params: HashMap::new(),
+                        pending_retirements: HashMap::new(),
+                        reward_accounts: imbl::HashMap::new(),
+                        stake_key_deposits: imbl::HashMap::new(),
+                        pool_deposits: HashMap::new(),
+                        total_stake_key_deposits: 0,
+                        pointer_map: HashMap::new(),
+                        stake_distribution: StakeDistributionState {
+                            stake_map: HashMap::new(),
+                        },
+                        script_stake_credentials: HashSet::new(),
+                        pending_mir_reserves: std::collections::HashMap::new(),
+                        pending_mir_treasury: std::collections::HashMap::new(),
+                        pending_mir_delta_reserves: 0,
+                        pending_mir_delta_treasury: 0,
+                    };
+                    let mut gov = super::make_gov_sub();
+                    let mut epochs = EpochSubState {
+                        snapshots: crate::state::EpochSnapshots::default(),
+                        treasury: Lovelace(0),
+                        reserves: Lovelace(0),
+                        pending_reward_update: None,
+                        last_applied_rupd: None,
+                        pending_pp_updates: BTreeMap::new(),
+                        future_pp_updates: BTreeMap::new(),
+                        needs_stake_rebuild: false,
+                        ptr_stake: HashMap::new(),
+                        ptr_stake_excluded: true,
+                        protocol_params: ProtocolParameters::mainnet_defaults(),
+                        prev_protocol_params: ProtocolParameters::mainnet_defaults(),
+                        prev_protocol_version_major: 12,
+                        prev_d: dugite_primitives::transaction::Rational {
+                            numerator: 0,
+                            denominator: 1,
+                        },
+                        rupd_addrs_rew: None,
+                        pending_avvm_return: 0,
+                    };
+                    let params = ProtocolParameters::mainnet_defaults();
+                    let delegates: HashMap<Hash28, (Hash28, Hash32)> = HashMap::new();
+                    let ctx = RuleContext {
+                        params: &params,
+                        current_slot: 2_000_000,
+                        current_epoch: EpochNo(700),
+                        era: Era::Dijkstra,
+                        slot_config: None,
+                        node_network: None,
+                        genesis_delegates: &delegates,
+                        update_quorum: 5,
+                        epoch_length: 432_000,
+                        shelley_transition_epoch: 0,
+                        byron_epoch_length: 21_600,
+                        stability_window: 129_600,
+                        stability_window_3kf: 129_600,
+                        randomness_stabilisation_window: 129_600,
+                        tx_index: 0,
+                        conway_genesis: None,
+                        max_lovelace_supply: crate::state::MAX_LOVELACE_SUPPLY,
+                    };
+                    let parent_tx = Transaction {
+                        era: Era::Dijkstra,
+                        hash: Hash32::from_bytes([0xDE; 32]),
+                        body: TransactionBody {
+                            inputs: vec![],
+                            outputs: vec![],
+                            fee: Lovelace(0),
+                            ttl: None,
+                            certificates: vec![],
+                            withdrawals: BTreeMap::new(),
+                            auxiliary_data_hash: None,
+                            validity_interval_start: None,
+                            mint: BTreeMap::new(),
+                            script_data_hash: None,
+                            collateral: vec![],
+                            required_signers: vec![],
+                            network_id: None,
+                            collateral_return: None,
+                            total_collateral: None,
+                            reference_inputs: vec![],
+                            update: None,
+                            voting_procedures: BTreeMap::new(),
+                            proposal_procedures: vec![],
+                            treasury_value: None,
+                            donation: None,
+                            sub_transactions: vec![sub],
+                            account_balance_intervals: vec![],
+                            direct_deposits: BTreeMap::new(),
+                            guards: Vec::new(),
+                        },
+                        witness_set: TransactionWitnessSet {
+                            vkey_witnesses: vec![],
+                            native_scripts: vec![],
+                            bootstrap_witnesses: vec![],
+                            plutus_v1_scripts: vec![],
+                            plutus_v2_scripts: vec![],
+                            plutus_v3_scripts: vec![],
+                            plutus_data: vec![],
+                            redeemers: vec![],
+                            raw_redeemers_cbor: None,
+                            raw_plutus_data_cbor: None,
+                            original_script_data_hash: None,
+                        },
+                        is_valid: true,
+                        auxiliary_data: None,
+                        raw_cbor: None,
+                        raw_body_cbor: None,
+                        raw_witness_cbor: None,
+                    };
+                    let rules = DijkstraRules::new();
+                    let result = rules.apply_valid_tx(
+                        &parent_tx,
+                        BlockValidationMode::ApplyOnly,
+                        &ctx,
+                        &mut utxo,
+                        &mut certs,
+                        &mut gov,
+                        &mut epochs,
+                    );
+                    (result, utxo)
+                };
+
+            // ---- SubInputSetEmptyUTxO ---------------------------------
+            let sub_empty = SubTransaction {
+                tx_id: Hash32::from_bytes([0x01; 32]),
+                inputs: vec![],
+                outputs: vec![make_output(addr.clone(), 10_000_000)],
+                ttl: None,
+                validity_interval_start: None,
+                reference_inputs: vec![],
+                auxiliary_data_hash: None,
+                raw_body_cbor: None,
+                ..Default::default()
+            };
+            let (result, _) = run_one_sub(sub_empty, vec![]);
+            let err = result.expect_err("a sub-tx with zero inputs must be rejected");
+            assert!(
+                format!("{err:?}").contains("SubInputSetEmptyUTxO"),
+                "error must name SubInputSetEmptyUTxO, got: {err:?}"
+            );
+
+            // ---- SubOutsideValidityIntervalUTxO (ttl expired) ----------
+            let utxo_in = make_input(0x02, 0);
+            let utxo_out = make_output(addr.clone(), 10_000_000);
+            let sub_ttl_expired = SubTransaction {
+                tx_id: Hash32::from_bytes([0x02; 32]),
+                inputs: vec![utxo_in.clone()],
+                outputs: vec![make_output(addr.clone(), 5_000_000)],
+                ttl: Some(SlotNo(2_000_000)), // == current_slot: expired (>=)
+                validity_interval_start: None,
+                reference_inputs: vec![],
+                auxiliary_data_hash: None,
+                raw_body_cbor: None,
+                ..Default::default()
+            };
+            let (result, utxo_after) =
+                run_one_sub(sub_ttl_expired, vec![(utxo_in.clone(), utxo_out.clone())]);
+            let err = result.expect_err("a sub-tx whose ttl == current_slot must be rejected");
+            assert!(
+                format!("{err:?}").contains("SubOutsideValidityIntervalUTxO"),
+                "error must name SubOutsideValidityIntervalUTxO, got: {err:?}"
+            );
+            assert_eq!(
+                utxo_after.utxo_set.lookup(&utxo_in),
+                Some(utxo_out),
+                "expired sub-tx must not mutate the UTxO set"
+            );
+
+            // ---- SubOutsideValidityIntervalUTxO (not yet valid) --------
+            let utxo_in2 = make_input(0x03, 0);
+            let utxo_out2 = make_output(addr.clone(), 10_000_000);
+            let sub_not_yet_valid = SubTransaction {
+                tx_id: Hash32::from_bytes([0x03; 32]),
+                inputs: vec![utxo_in2.clone()],
+                outputs: vec![make_output(addr.clone(), 5_000_000)],
+                ttl: None,
+                validity_interval_start: Some(SlotNo(2_000_001)), // > current_slot
+                reference_inputs: vec![],
+                auxiliary_data_hash: None,
+                raw_body_cbor: None,
+                ..Default::default()
+            };
+            let (result, _) = run_one_sub(sub_not_yet_valid, vec![(utxo_in2, utxo_out2)]);
+            let err = result.expect_err("a not-yet-valid sub-tx must be rejected");
+            assert!(
+                format!("{err:?}").contains("SubOutsideValidityIntervalUTxO"),
+                "error must name SubOutsideValidityIntervalUTxO, got: {err:?}"
+            );
+
+            // ---- min-UTxO-value floor (SubBabbageOutputTooSmallUTxO) ----
+            let utxo_in3 = make_input(0x04, 0);
+            let utxo_out3 = make_output(addr.clone(), 10_000_000);
+            let sub_tiny_output = SubTransaction {
+                tx_id: Hash32::from_bytes([0x04; 32]),
+                inputs: vec![utxo_in3.clone()],
+                outputs: vec![make_output(addr.clone(), 1)], // 1 lovelace — far below min
+                ttl: None,
+                validity_interval_start: None,
+                reference_inputs: vec![],
+                auxiliary_data_hash: None,
+                raw_body_cbor: None,
+                ..Default::default()
+            };
+            let (result, _) = run_one_sub(sub_tiny_output, vec![(utxo_in3, utxo_out3)]);
+            let err =
+                result.expect_err("a sub-tx output below the min-UTxO floor must be rejected");
+            assert!(
+                format!("{err:?}").contains("SubBabbageOutputTooSmallUTxO"),
+                "error must name SubBabbageOutputTooSmallUTxO, got: {err:?}"
+            );
+
+            // ---- SUBUTXOW: SubMissingVKeyWitnessesUTXOW (#1010) --------
+            // A sub-tx whose OWN witness set does not cover the vkey
+            // credential its spent input requires must be rejected — even
+            // though the input itself resolves fine and the output clears
+            // the min-UTxO floor (so neither of the checks above would
+            // catch it).
+            let vkey = [0x77_u8; 32];
+            let vkey_hash = dugite_primitives::hash::blake2b_224(&vkey);
+            let vkey_addr = make_enterprise_address(vkey_hash);
+            let utxo_in4 = make_input(0x05, 0);
+            let utxo_out4 = make_output(vkey_addr.clone(), 10_000_000);
+            let make_sub_no_witness = || SubTransaction {
+                tx_id: Hash32::from_bytes([0x05; 32]),
+                inputs: vec![utxo_in4.clone()],
+                outputs: vec![make_output(vkey_addr.clone(), 5_000_000)],
+                ttl: None,
+                validity_interval_start: None,
+                reference_inputs: vec![],
+                auxiliary_data_hash: None,
+                raw_body_cbor: None,
+                ..Default::default()
+            };
+            let (result, _) = run_one_sub(
+                make_sub_no_witness(),
+                vec![(utxo_in4.clone(), utxo_out4.clone())],
+            );
+            let err = result.expect_err(
+                "a sub-tx spending a vkey-credentialed input with no matching witness \
+                 must be rejected",
+            );
+            assert!(
+                format!("{err:?}").contains("SubMissingVKeyWitnessesUTXOW"),
+                "error must name SubMissingVKeyWitnessesUTXOW, got: {err:?}"
+            );
+
+            // Control: the SAME sub-tx, this time WITH a matching vkey
+            // witness, must succeed — proves the check is discriminating
+            // (rejecting absence, not everything).
+            let mut sub_with_witness = make_sub_no_witness();
+            sub_with_witness.witness_set = TransactionWitnessSet {
+                vkey_witnesses: vec![dugite_primitives::transaction::VKeyWitness {
+                    vkey: vkey.to_vec(),
+                    signature: vec![0u8; 64],
+                }],
+                ..Default::default()
+            };
+            let (result, _) = run_one_sub(sub_with_witness, vec![(utxo_in4, utxo_out4)]);
+            result.expect(
+                "the SAME sub-tx WITH a matching vkey witness must be accepted \
+                 (control for SubMissingVKeyWitnessesUTXOW)",
+            );
+
+            // ---- #1010 fail-closed guard: certs decoded but not yet applied ----
+            // A sub-tx declaring a certificate must be REJECTED (not
+            // silently accepted with the cert dropped) until SUBCERTS
+            // apply-routing lands.
+            let utxo_in5 = make_input(0x06, 0);
+            let utxo_out5 = make_output(addr.clone(), 10_000_000);
+            let sub_with_cert = SubTransaction {
+                tx_id: Hash32::from_bytes([0x06; 32]),
+                inputs: vec![utxo_in5.clone()],
+                outputs: vec![make_output(addr.clone(), 5_000_000)],
+                certificates: vec![
+                    dugite_primitives::transaction::Certificate::StakeRegistration(
+                        dugite_primitives::credentials::Credential::VerificationKey(
+                            Hash28::from_bytes([0x66; 28]),
+                        ),
+                    ),
+                ],
+                ttl: None,
+                validity_interval_start: None,
+                reference_inputs: vec![],
+                auxiliary_data_hash: None,
+                raw_body_cbor: None,
+                ..Default::default()
+            };
+            let (result, _) = run_one_sub(sub_with_cert, vec![(utxo_in5, utxo_out5)]);
+            let err = result.expect_err(
+                "a sub-tx declaring a certificate must be rejected until SUBCERTS \
+                 apply-routing lands (#1010) — not silently accepted with the cert dropped",
+            );
+            assert!(
+                format!("{err:?}").contains("SubEntitiesNotYetApplied"),
+                "error must name SubEntitiesNotYetApplied, got: {err:?}"
+            );
+        }
+
+        /// CIP-0167 — `isValid` flag removed from the standalone-tx
+        /// envelope (#1002, CLOSED — see the doc comment on
+        /// `DijkstraRules::apply_invalid_tx` for the pinned-SHA source
+        /// citation). Two-part assertion:
         ///
         /// 1. **Wire shape** — `encode_transaction` on a Dijkstra-era tx
         ///    produces a 3-element CBOR array (body, witness_set, aux_data)
@@ -1823,12 +2656,18 @@ mod tests {
         ///      - does NOT insert the regular outputs,
         ///      - collects the collateral fee.
         ///
+        ///    This is Conway's `UTXOS`/collateral logic verbatim (permanent
+        ///    delegation, oracle-confirmed — NOT a restructured Dijkstra
+        ///    flow), so this test is really pinning that the delegation
+        ///    target behaves correctly for a Dijkstra-tagged tx, not
+        ///    exercising anything Dijkstra-specific.
+        ///
         /// References:
-        /// - CIP-0167
+        /// - CIP-0167 (cardano-ledger PR #5480, merged 2025-12-22)
         /// - `eras/dijkstra/impl/src/Cardano/Ledger/Dijkstra/Tx.hs`
-        ///   (`toCBORForMempoolSubmission`, `OmitC dtIsValid`)
-        /// - `eras/dijkstra/impl/src/Cardano/Ledger/Dijkstra/Rules.hs`
-        ///   (UTXOS rule restructuring)
+        ///   (`toCBORForMempoolSubmission`, `OmitC dtIsPhase2Valid`)
+        /// - `eras/dijkstra/impl/src/Cardano/Ledger/Dijkstra/Rules/Utxos.hs`
+        ///   (zero `transitionRules` — pure Conway type-family wiring)
         #[test]
         fn cip_0167_top_level_is_valid_removed() {
             use super::super::*;
