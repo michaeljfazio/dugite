@@ -28,17 +28,32 @@
 //!
 //! `undo` / `idle` are now emitted too: each subscriber keeps a bounded
 //! (`HISTORY_CAP` blocks — comfortably above mainnet's security
-//! parameter k=2160) history of the matching txs it has told THIS
-//! client about, keyed by slot. On a rollback, every history entry past
-//! the rollback point is popped and re-emitted as `undo` (most recent
-//! first) using the exact envelope already built for `apply` — no
-//! second ChainDB lookup, and no dependency on `TipRollback` carrying
-//! anything beyond the rollback point (`slot`, `hash`) it already does.
-//! A block with zero matching txs emits `idle(BlockRef)` so a client can
-//! tell "no match" from "stalled". A rollback deeper than this
-//! subscriber's own history is not a bug: it just means the client was
-//! never told about those blocks as `apply` in the first place, so
-//! there is nothing to undo for that portion.
+//! parameter k=2160) history of which blocks it has told THIS client
+//! about, keyed by slot. The history retains only `(slot, hash)` per
+//! entry, NOT the matching txs or block content — those are re-resolved
+//! from `ChainDB` (the same `resolve_matches` apply uses) when a
+//! rollback actually needs them. This is deliberate: rollbacks are rare
+//! and bounded (a handful a day, capped by k), so paying one extra
+//! `ChainDB` lookup on that rare path beats retaining a full block's
+//! content — CBOR bytes AND the expanded proto, per matching tx — for
+//! every applied block, forever, per subscriber, with no cap on
+//! concurrent subscribers. The earlier design cached the full envelope;
+//! at `HISTORY_CAP` blocks that was order-of-GB per stream, an
+//! unauthenticated memory-exhaustion vector this project's own
+//! "adversarial-deployment" posture exists to rule out. A block with
+//! zero matching txs emits `idle(BlockRef)` so a client can tell "no
+//! match" from "stalled".
+//!
+//! A rollback whose target predates everything this subscriber has ever
+//! been told about is not an error: nothing was ever asserted for that
+//! range, so there is nothing to undo. A rollback that needs to undo an
+//! entry this subscriber's bounded history has since evicted (or whose
+//! re-resolution fails — the block's `ChainDB` retention window elapsed
+//! before the rollback arrived) is different: the client WAS told about
+//! that tx as `apply` and we can no longer prove it's been undone. That
+//! case terminates the stream with `Status::data_loss` rather than
+//! silently emitting a partial (and therefore wrong) undo sequence — the
+//! #1004 failure mode of a stream that looks correct and isn't.
 //!
 //! Every emitted `WatchTxResponse` is run through `masking::apply`
 //! (issue #1004) using the request's `FieldMask`, captured once at
@@ -66,49 +81,67 @@ use crate::tip_feed::TipRollback;
 
 const SERVICE_LABEL: &str = "watch";
 
-/// Bound on how many blocks' worth of matching-tx history each `WatchTx`
-/// subscriber retains for `undo` — comfortably above mainnet's security
-/// parameter (k=2160), so any rollback the chain-selection layer would
-/// actually allow is covered. Purely a memory bound, not a correctness
-/// one: see the module doc for what happens past it.
+/// Bound on how many blocks' worth of history each `WatchTx` subscriber
+/// retains for `undo` — comfortably above mainnet's security parameter
+/// (k=2160), so any rollback the chain-selection layer would actually
+/// allow is covered. Each entry is `(slot, hash)` only (~40 bytes), so
+/// the whole history is a ~200KB rounding error per subscriber — see the
+/// module doc for why content is NOT cached here.
 const HISTORY_CAP: usize = 4_320;
 
-/// One block's worth of matching txs already mapped to their `v1beta`
-/// wire shape, cached so a later rollback can re-emit them as `undo`
-/// without a second `ChainDB` round trip.
+/// One applied block's identity — enough to re-resolve it from `ChainDB`
+/// on rollback, and nothing more. See the module doc for why this does
+/// NOT cache the block or its matching txs.
 struct HistoryEntry {
     slot: u64,
-    block: v1beta::watch::AnyChainBlock,
-    matches: Vec<v1beta::cardano::Tx>,
+    hash: [u8; 32],
 }
 
-/// Resolve one applied tip into its matching transactions (v1beta shape)
-/// plus the block envelope they share. Returns `None` when the block
-/// can't be resolved or decoded — logged, and the caller should skip the
-/// event entirely (no apply, no idle, no history entry) rather than
-/// guess.
+/// Whether a rollback to `target_slot` needs to undo history entries
+/// this subscriber's bounded cache has already evicted.
+///
+/// `history_truncated` is true once any entry has ever been popped off
+/// the front for exceeding `HISTORY_CAP`; `oldest_retained_slot` is the
+/// current `history.front()` slot, or `None` when the cache is empty
+/// right now. Once truncation has ever happened, an empty-or-shallow
+/// remaining history can no longer prove there's nothing left to undo —
+/// so "empty after truncation" counts as a gap too, rather than assuming
+/// the best.
+fn rollback_has_coverage_gap(
+    history_truncated: bool,
+    oldest_retained_slot: Option<u64>,
+    target_slot: u64,
+) -> bool {
+    history_truncated && oldest_retained_slot.unwrap_or(u64::MAX) > target_slot
+}
+
+/// Resolve one applied block (by `slot`/`hash`) into its matching
+/// transactions (v1beta shape) plus the block envelope they share.
+/// Returns `None` when the block can't be resolved or decoded — logged,
+/// and the caller should treat the event as unresolvable rather than
+/// guess. Used both for a live apply and for re-resolving a history
+/// entry when a rollback needs to undo it.
 async fn resolve_matches(
     ctx: &Arc<dyn LedgerContext>,
-    tip: &TipInfo,
+    slot: u64,
+    hash: [u8; 32],
     predicate: Option<&v1beta::watch::TxPredicate>,
 ) -> Option<(v1beta::watch::AnyChainBlock, Vec<v1beta::cardano::Tx>)> {
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&tip.hash);
-    let hash32 = Hash32::from_bytes(arr);
+    let hash32 = Hash32::from_bytes(hash);
     let raw = match ctx.block_by_hash(&hash32).await {
         Ok(Some(raw)) => raw,
         Ok(None) => {
             warn!(
-                slot = tip.slot,
-                hash = %hex::encode(tip.hash),
-                "WatchTx: applied block not found in ChainDB; skipping event"
+                slot,
+                hash = %hex::encode(hash),
+                "WatchTx: block not found in ChainDB; skipping event"
             );
             return None;
         }
         Err(e) => {
             warn!(
-                slot = tip.slot,
-                hash = %hex::encode(tip.hash),
+                slot,
+                hash = %hex::encode(hash),
                 error = ?e,
                 "WatchTx: block_by_hash failed; skipping event"
             );
@@ -119,8 +152,8 @@ async fn resolve_matches(
         Ok(b) => b,
         Err(e) => {
             warn!(
-                slot = tip.slot,
-                hash = %hex::encode(tip.hash),
+                slot,
+                hash = %hex::encode(hash),
                 error = %e,
                 "WatchTx: block decode failed; skipping event"
             );
@@ -153,13 +186,14 @@ async fn spawn_watch_tx_stream_beta(
     let (tx, rx) = mpsc::channel(buffer);
     tokio::spawn(async move {
         let mut history: VecDeque<HistoryEntry> = VecDeque::new();
+        let mut history_truncated = false;
         loop {
             tokio::select! {
                 applied = apply_rx.recv() => {
                     match applied {
                         Ok(tip) => {
                             let Some((block, matches)) =
-                                resolve_matches(&ctx, &tip, predicate.as_ref()).await
+                                resolve_matches(&ctx, tip.slot, tip.hash, predicate.as_ref()).await
                             else {
                                 continue;
                             };
@@ -182,9 +216,9 @@ async fn spawn_watch_tx_stream_beta(
                                     return;
                                 }
                             } else {
-                                for m in &matches {
+                                for m in matches {
                                     let item = v1beta::watch::AnyChainTx {
-                                        chain: Some(v1beta::watch::any_chain_tx::Chain::Cardano(m.clone())),
+                                        chain: Some(v1beta::watch::any_chain_tx::Chain::Cardano(m)),
                                         block: Some(block.clone()),
                                     };
                                     let resp = v1beta::watch::WatchTxResponse {
@@ -200,13 +234,10 @@ async fn spawn_watch_tx_stream_beta(
                                     }
                                 }
                             }
-                            history.push_back(HistoryEntry {
-                                slot: tip.slot,
-                                block,
-                                matches,
-                            });
+                            history.push_back(HistoryEntry { slot: tip.slot, hash: tip.hash });
                             if history.len() > HISTORY_CAP {
                                 history.pop_front();
+                                history_truncated = true;
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -227,12 +258,47 @@ async fn spawn_watch_tx_stream_beta(
                 rb = rollback_rx.recv() => {
                     match rb {
                         Ok(ev) => {
+                            let oldest_retained_slot = history.front().map(|e| e.slot);
+                            if rollback_has_coverage_gap(history_truncated, oldest_retained_slot, ev.slot) {
+                                let _ = tx
+                                    .send(Err(Status::data_loss(format!(
+                                        "WatchTx: rollback to slot {} needs to undo applied txs \
+                                         this subscriber's retained history (cap={HISTORY_CAP} \
+                                         blocks) has already evicted; reconnect and resync from \
+                                         the new tip",
+                                        ev.slot
+                                    ))))
+                                    .await;
+                                return;
+                            }
                             while history.back().is_some_and(|e| e.slot > ev.slot) {
                                 let entry = history.pop_back().expect("checked Some above");
-                                for m in entry.matches.into_iter().rev() {
+                                let Some((block, matches)) =
+                                    resolve_matches(&ctx, entry.slot, entry.hash, predicate.as_ref())
+                                        .await
+                                else {
+                                    // We told the client about this block's
+                                    // matching txs as `apply`; we can no
+                                    // longer resolve it to prove they've
+                                    // been undone (e.g. ChainDB's retention
+                                    // window elapsed before this rollback
+                                    // arrived). Fail loud rather than
+                                    // silently drop the rest of the undo
+                                    // sequence — the #1004 failure mode of
+                                    // a stream that looks correct and isn't.
+                                    let _ = tx
+                                        .send(Err(Status::data_loss(format!(
+                                            "WatchTx: rolled-back block at slot {} could not be \
+                                             re-resolved for undo; reconnect and resync",
+                                            entry.slot
+                                        ))))
+                                        .await;
+                                    return;
+                                };
+                                for m in matches.into_iter().rev() {
                                     let item = v1beta::watch::AnyChainTx {
                                         chain: Some(v1beta::watch::any_chain_tx::Chain::Cardano(m)),
-                                        block: Some(entry.block.clone()),
+                                        block: Some(block.clone()),
                                     };
                                     let resp = v1beta::watch::WatchTxResponse {
                                         action: Some(v1beta::watch::watch_tx_response::Action::Undo(item)),
@@ -263,6 +329,45 @@ async fn spawn_watch_tx_stream_beta(
         }
     });
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rollback_has_coverage_gap;
+
+    #[test]
+    fn gap_when_truncated_and_target_predates_retained_window() {
+        assert!(rollback_has_coverage_gap(true, Some(500), 100));
+    }
+
+    #[test]
+    fn no_gap_when_truncated_but_target_within_retained_window() {
+        assert!(!rollback_has_coverage_gap(true, Some(50), 100));
+    }
+
+    #[test]
+    fn no_gap_when_truncated_and_target_exactly_at_retained_window_edge() {
+        // front().slot == target_slot: the oldest retained entry is not
+        // strictly greater than target_slot, so it (and everything after)
+        // is still coverable by the normal drain loop.
+        assert!(!rollback_has_coverage_gap(true, Some(100), 100));
+    }
+
+    #[test]
+    fn no_gap_when_never_truncated_even_if_target_predates_everything() {
+        // Rollback target older than anything ever recorded, but nothing
+        // was ever evicted: the client was simply never told about
+        // anything in that range, so there's nothing to undo.
+        assert!(!rollback_has_coverage_gap(false, Some(500), 100));
+        assert!(!rollback_has_coverage_gap(false, None, 100));
+    }
+
+    #[test]
+    fn truncated_and_currently_empty_history_is_treated_as_a_gap() {
+        // Can't prove there's nothing left to undo once eviction has
+        // happened and the cache no longer holds anything to check.
+        assert!(rollback_has_coverage_gap(true, None, 100));
+    }
 }
 
 fn recode_watch_tx_response_to_alpha(

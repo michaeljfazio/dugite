@@ -46,15 +46,29 @@ use tonic::transport::Channel;
 // ─── Mock — resolves blocks registered up front, everything else stays
 // out of scope for WatchTx ──────────────────────────────────────────────
 
+// `Arc<Mutex<..>>`, not a plain map: #1007's review round needs a way to
+// simulate a block becoming unresolvable AFTER it was applied (e.g.
+// ChainDB's VolatileDB retention window elapsing before a rollback
+// arrives) without tearing the server down, so `TestServer` keeps a
+// clone of the same handle the running service reads through.
+#[derive(Clone)]
 struct WatchMock {
-    by_hash: BTreeMap<[u8; 32], RawBlock>,
+    by_hash: Arc<std::sync::Mutex<BTreeMap<[u8; 32], RawBlock>>>,
 }
 
 impl WatchMock {
     fn new(blocks: Vec<RawBlock>) -> Self {
         Self {
-            by_hash: blocks.into_iter().map(|b| (b.hash, b)).collect(),
+            by_hash: Arc::new(std::sync::Mutex::new(
+                blocks.into_iter().map(|b| (b.hash, b)).collect(),
+            )),
         }
+    }
+
+    /// Make a previously-registered block unresolvable, as if its
+    /// `ChainDB` retention window had elapsed.
+    fn evict(&self, hash: [u8; 32]) {
+        self.by_hash.lock().unwrap().remove(&hash);
     }
 }
 
@@ -66,7 +80,7 @@ impl LedgerContext for WatchMock {
     async fn block_by_hash(&self, hash: &Hash32) -> Result<Option<RawBlock>, RpcError> {
         let mut arr = [0u8; 32];
         arr.copy_from_slice(hash.as_ref());
-        Ok(self.by_hash.get(&arr).cloned())
+        Ok(self.by_hash.lock().unwrap().get(&arr).cloned())
     }
     async fn block_at_slot(&self, _: u64) -> Result<Option<RawBlock>, RpcError> {
         Ok(None)
@@ -146,6 +160,7 @@ struct TestServer {
     shutdown_tx: watch::Sender<bool>,
     join: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
     tip_feed: TipFeed,
+    mock: WatchMock,
 }
 
 impl TestServer {
@@ -160,6 +175,7 @@ impl TestServer {
         let mempool_feed = MempoolFeed::new(mempool_tx);
         let tip_feed = TipFeed::new();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mock_handle = mock.clone();
         let handle = RpcServer::start(
             Arc::new(config),
             Arc::new(mock),
@@ -175,6 +191,7 @@ impl TestServer {
             shutdown_tx,
             join: handle.join,
             tip_feed,
+            mock: mock_handle,
         }
     }
 
@@ -682,7 +699,12 @@ async fn watch_tx_emits_idle_for_block_with_no_matching_tx() {
 }
 
 #[tokio::test]
-async fn watch_tx_emits_undo_on_rollback_reusing_the_apply_envelope() {
+async fn watch_tx_emits_undo_on_rollback_by_reresolving_the_original_block() {
+    // The undo path does NOT replay a cached copy of the apply — it
+    // re-resolves the block from ChainDB by (slot, hash) (see the
+    // memory-exhaustion fix noted in watch.rs's module doc) and
+    // re-derives the same matching txs. This asserts that re-derivation
+    // is byte-for-byte the same content the client already saw at apply.
     use v1beta::watch::watch_service_client::WatchServiceClient;
     use v1beta::watch::WatchTxRequest;
 
@@ -704,7 +726,9 @@ async fn watch_tx_emits_undo_on_rollback_reusing_the_apply_envelope() {
     assert_eq!(fee_of(cardano_tx(&applied_item)), 444_444);
     assert!(applied_item.block.is_some());
 
-    // Roll back to before this block's slot -> must undo it.
+    // Roll back to before this block's slot -> must undo it. The mock
+    // still resolves `block`'s hash (it was never evicted), so this
+    // exercises the ordinary, always-succeeds re-resolution path.
     server.rollback(50, [0x00; 32]);
 
     let undone = stream.next().await.expect("undo msg").unwrap();
@@ -712,7 +736,7 @@ async fn watch_tx_emits_undo_on_rollback_reusing_the_apply_envelope() {
     assert_eq!(
         fee_of(cardano_tx(&undone_item)),
         444_444,
-        "undo must re-emit the SAME tx that was applied"
+        "undo must re-derive the SAME tx that was applied"
     );
     assert!(
         undone_item.block.is_some(),
@@ -720,6 +744,49 @@ async fn watch_tx_emits_undo_on_rollback_reusing_the_apply_envelope() {
     );
 
     drop(stream);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn watch_tx_rollback_terminates_stream_with_data_loss_when_block_unresolvable() {
+    // Coordinator review round on #1007: the history entry now retains
+    // only (slot, hash), not the block content, so undo depends on
+    // ChainDB still being able to resolve it. If that resolution fails —
+    // e.g. VolatileDB's retention window elapsed before the rollback
+    // arrived — the client was already told about this tx as `apply`,
+    // and we can no longer prove it's been undone. That must be a loud,
+    // typed, stream-terminating error, never a silently-missing undo.
+    use v1beta::watch::watch_service_client::WatchServiceClient;
+    use v1beta::watch::WatchTxRequest;
+
+    let block = conway_block(100, 1, 0x01, vec![conway_tx(777_777, 0x11)]);
+    let server = TestServer::start(WatchMock::new(vec![block.clone()])).await;
+    let mut client = WatchServiceClient::new(server.channel().await);
+    let mut stream = client
+        .watch_tx(WatchTxRequest {
+            predicate: Some(payment_part_predicate(0x11)),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    server.apply(&block);
+    let applied = stream.next().await.expect("apply msg").unwrap();
+    assert_eq!(fee_of(cardano_tx(&apply_tx(applied))), 777_777);
+
+    // Simulate the block's ChainDB retention window elapsing between
+    // apply and rollback.
+    server.mock.evict(block.hash);
+    server.rollback(50, [0x00; 32]);
+
+    let next = tokio::time::timeout(Duration::from_secs(3), stream.next())
+        .await
+        .expect("stream must terminate promptly, not hang")
+        .expect("stream must yield a terminal message, not close silently");
+    let status = next.expect_err("must be a typed error, not a silently-missing undo");
+    assert_eq!(status.code(), tonic::Code::DataLoss);
+
     server.stop().await;
 }
 
