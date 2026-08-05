@@ -1,4 +1,5 @@
-//! Encode-first round-trip over `ProtocolParamUpdate` keys 0-37 (issue #974).
+//! Encode-first round-trip over every era's `ProtocolParamUpdate` key set
+//! (issue #974), plus unknown-key rejection (issue #1013).
 //!
 //! ## Why this target exists
 //!
@@ -20,9 +21,9 @@
 //! decoder is detected the moment two of the ten thresholds differ, which the
 //! generator arranges by drawing all ten independently.
 //!
-//! ## Properties
+//! ## Properties (per era)
 //!
-//! - **self-decodability** `ppu_from_cbor(encode(ppu))` must succeed
+//! - **self-decodability** `ppu_from_cbor(encode(ppu), era)` must succeed
 //! - **structural fixpoint** the decoded update equals the generated one,
 //!   field for field — this is what separates a wrong ORDER from a wrong value
 //! - **idempotence** re-encoding the decoded update reproduces the bytes
@@ -49,52 +50,73 @@
 //! SAME value across the generator's full input space, not just the one
 //! hand-built fixture in `era_conway.rs`'s unit tests.
 //!
+//! ## Era-gated key sets + unknown-key rejection (#1013)
+//!
+//! The decoder used to silently SKIP an unrecognized key (Haskell hard-
+//! rejects the whole decode — accept-where-Haskell-rejects, the dangerous
+//! direction: a Haskell peer rejects the same bytes at decode and never
+//! recovers). It also treated the pre-Conway and Conway+ key sets each as one
+//! flat "union" range, when the real per-era `eraPParams` lists (oracle-
+//! verified) have gaps that differ Shelley/Allegra/Mary vs Alonzo vs Babbage
+//! vs Conway vs Dijkstra. `PpuShape` now has one variant per era family
+//! (`Gen::ppu_for`), and this target exercises TWO properties per shape:
+//! every valid key still round-trips (above), and a key from OUTSIDE that
+//! shape's exact key set is REJECTED, not silently accepted or skipped.
+//!
 //! Run with: cargo +nightly fuzz run fuzz_structured_pparam_update -- -max_total_time=300
 
 #![no_main]
 
 use dugite_fuzz::{Gen, PpuShape};
 use dugite_primitives::transaction::ProtocolParamUpdate;
+use dugite_primitives::Era;
 use dugite_serialization::decode::{ppu_from_cbor, pre_conway_ppu_from_cbor};
 use dugite_serialization::SerializationError;
 use dugite_serialization::{encode_pre_conway_protocol_param_update, encode_protocol_param_update};
 use libfuzzer_sys::fuzz_target;
 
+const SHAPES: [PpuShape; 5] = [
+    PpuShape::ShelleyFamily,
+    PpuShape::Alonzo,
+    PpuShape::Babbage,
+    PpuShape::Conway,
+    PpuShape::Dijkstra,
+];
+
+type PpuEncodeFn = fn(&ProtocolParamUpdate) -> Vec<u8>;
+type PpuDecodeFn = fn(&[u8], Era) -> Result<ProtocolParamUpdate, SerializationError>;
+
 fuzz_target!(|data: &[u8]| {
     let mut gen = Gen::new(data);
 
-    // Conway+ key set: 0-11, 16-33, plus the Dijkstra additions 34-37.
-    let conway = gen.ppu_for(PpuShape::Conway);
-    round_trip(
-        "Conway",
-        &conway,
-        encode_protocol_param_update,
-        ppu_from_cbor,
-    );
-
-    // Shelley..Babbage key set: 0-24, including 12 (d), 13 (extra_entropy),
-    // 14 (protocol_version) and 15 (min_utxo_value). These four have no
-    // counterpart in the Conway type, and until this target existed nothing
-    // encoded them at all — tx-body key 6 carried a decoded update proposal
-    // straight into a re-encode that dropped it, changing the transaction id.
-    let pre_conway = gen.ppu_for(PpuShape::PreConway);
-    round_trip(
-        "pre-Conway",
-        &pre_conway,
-        encode_pre_conway_protocol_param_update,
-        pre_conway_ppu_from_cbor,
-    );
+    for shape in SHAPES {
+        let era = shape.era();
+        let ppu = gen.ppu_for(shape);
+        let (encode, decode): (PpuEncodeFn, PpuDecodeFn) =
+            if matches!(shape, PpuShape::Conway | PpuShape::Dijkstra) {
+                (encode_protocol_param_update, ppu_from_cbor)
+            } else {
+                (
+                    encode_pre_conway_protocol_param_update,
+                    pre_conway_ppu_from_cbor,
+                )
+            };
+        round_trip(shape, era, &ppu, encode, decode);
+        reject_unknown_key(&mut gen, shape, era, decode);
+    }
 });
 
 fn round_trip(
-    label: &str,
+    shape: PpuShape,
+    era: Era,
     ppu: &ProtocolParamUpdate,
     encode: fn(&ProtocolParamUpdate) -> Vec<u8>,
-    decode: fn(&[u8]) -> Result<ProtocolParamUpdate, SerializationError>,
+    decode: fn(&[u8], Era) -> Result<ProtocolParamUpdate, SerializationError>,
 ) {
+    let label = format!("{shape:?}");
     let encoded = encode(ppu);
 
-    let decoded = match decode(&encoded) {
+    let decoded = match decode(&encoded, era) {
         Ok(p) => p,
         Err(e) => panic!(
             "{label}: the PPU encoder emitted bytes its own decoder rejects: {e}\n\
@@ -133,7 +155,7 @@ fn round_trip(
     // mechanically from `encoded` rather than re-deriving the key table by
     // hand, so this tracks whatever key set/order the generator produced.
     let indefinite = to_indefinite_map(&encoded);
-    let indefinite_decoded = match decode(&indefinite) {
+    let indefinite_decoded = match decode(&indefinite, era) {
         Ok(p) => p,
         Err(e) => panic!(
             "{label}: indefinite-length PPU map must decode (#1012): {e}\n\
@@ -151,6 +173,91 @@ fn round_trip(
          definite-decoded   = {decoded:#?}\n\
          indefinite-decoded = {indefinite_decoded:#?}",
     );
+}
+
+/// Issue #1013: a key OUTSIDE `shape`'s exact valid set must be REJECTED —
+/// never silently skipped (the pre-fix behavior) and never accepted as if it
+/// belonged to a different era's key set.
+///
+/// The candidate lists below are hand-picked from the SAME oracle-verified
+/// per-era table the decoder itself cites (`read_protocol_param_update` /
+/// `read_pre_conway_protocol_param_update` doc comments) rather than derived
+/// from a second, independent "is this key valid" predicate — a drifted
+/// duplicate of the validity rule is exactly the trap #1012's `for_each_*`
+/// consolidation removed elsewhere in this codebase, and reintroducing it
+/// here (in the harness that is supposed to CATCH drift) would defeat the
+/// point.
+fn invalid_keys_for(shape: PpuShape) -> &'static [u64] {
+    match shape {
+        // Shelley/Allegra/Mary: 0-16, no gaps. 17-24 (Plutus-era) and 25+
+        // (Conway governance / Dijkstra ref-script) don't exist yet.
+        PpuShape::ShelleyFamily => &[17, 18, 20, 22, 24, 25, 30, 33, 34, 37, 999],
+        // Alonzo: 0-14, 16-24. Gap: 15 (min_utxo_value).
+        PpuShape::Alonzo => &[15, 25, 30, 34, 999],
+        // Babbage: 0-11, 14, 16-24. Gaps: 12, 13, 15.
+        PpuShape::Babbage => &[12, 13, 15, 25, 34, 999],
+        // Conway: 0-11, 16-33. Gaps: 12, 13, 14, 15. 34+ is Dijkstra-only.
+        PpuShape::Conway => &[12, 13, 14, 15, 34, 35, 36, 37, 999],
+        // Dijkstra (dugite-supported subset): 0-11, 16-37. Same four gaps as
+        // Conway; 38/39 exist upstream but dugite has no fields yet.
+        PpuShape::Dijkstra => &[12, 13, 14, 15, 38, 39, 999],
+    }
+}
+
+fn reject_unknown_key(
+    gen: &mut Gen<'_>,
+    shape: PpuShape,
+    era: Era,
+    decode: fn(&[u8], Era) -> Result<ProtocolParamUpdate, SerializationError>,
+) {
+    let candidates = invalid_keys_for(shape);
+    let key = candidates[gen.choice(candidates.len() as u8) as usize];
+
+    // {key: 0} — a single-entry map. Rejection must fire on the KEY, before
+    // any attempt to decode a value, so the value's own shape is irrelevant;
+    // uint(0) is valid CBOR and keeps the fixture minimal.
+    let definite = single_entry_ppu_map(key);
+    let definite_result = decode(&definite, era);
+    assert!(
+        definite_result.is_err(),
+        "{shape:?}: key {key} must be REJECTED (definite map), got {definite_result:?}\n\
+         bytes = {}",
+        hex(&definite),
+    );
+
+    // Same probe through the indefinite-length path — #1012's lesson is that
+    // a fix covering only one framing leaves the other framing's behavior
+    // unverified.
+    let indefinite = to_indefinite_map(&definite);
+    let indefinite_result = decode(&indefinite, era);
+    assert!(
+        indefinite_result.is_err(),
+        "{shape:?}: key {key} must be REJECTED on the indefinite-map path too, \
+         got {indefinite_result:?}\nbytes = {}",
+        hex(&indefinite),
+    );
+}
+
+/// Build `{key: 0}` as a definite-length CBOR map(1).
+fn single_entry_ppu_map(key: u64) -> Vec<u8> {
+    let mut v = vec![0xa1]; // map(1)
+    v.extend(encode_cbor_uint(key));
+    v.push(0x00); // uint(0) — never actually decoded on the reject path
+    v
+}
+
+fn encode_cbor_uint(n: u64) -> Vec<u8> {
+    if n <= 23 {
+        vec![n as u8]
+    } else if n <= 0xff {
+        vec![0x18, n as u8]
+    } else if n <= 0xffff {
+        let b = (n as u16).to_be_bytes();
+        vec![0x19, b[0], b[1]]
+    } else {
+        let b = (n as u32).to_be_bytes();
+        vec![0x1a, b[0], b[1], b[2], b[3]]
+    }
 }
 
 /// Rewrite a buffer whose first bytes are a DEFINITE-length CBOR map header

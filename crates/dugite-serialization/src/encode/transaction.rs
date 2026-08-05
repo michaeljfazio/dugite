@@ -3643,7 +3643,14 @@ mod tests {
 
         let tx = Transaction {
             hash: Default::default(),
-            era: Era::Babbage,
+            // Issue #1013: `d` (key 12) is Shelley/Allegra/Mary/Alonzo only —
+            // Babbage's `eraPParams` has NO entry for it
+            // (`hkdDL = notSupportedInThisEraL`, oracle-verified). This test
+            // used `Era::Babbage` before #1013's era-gating existed; keep the
+            // PPU content (this test's actual subject — tx-body key 6 must
+            // round-trip) and use the era the comment above already claims:
+            // Shelley, where `d` genuinely lived on mainnet.
+            era: Era::Shelley,
             body,
             witness_set: empty_witness_set(),
             is_valid: true,
@@ -3654,8 +3661,8 @@ mod tests {
         };
 
         let encoded = encode_transaction(&tx);
-        // HFC era id 5 == Babbage in `decode_transaction`.
-        let decoded = crate::decode::decode_transaction(5, &encoded).expect("tx must decode");
+        // HFC era id 1 == Shelley in `decode_transaction`.
+        let decoded = crate::decode::decode_transaction(1, &encoded).expect("tx must decode");
 
         assert_eq!(
             decoded.body.update, tx.body.update,
